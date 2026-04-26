@@ -81,15 +81,11 @@ std::string check_native_scan_operator_gates(op::sirius_physical_duckdb_scan con
     return "extra_info.sample_options present (sampling pushed into scan)";
   }
 
-  // (3) Virtual columns. Includes rowid (commit #4 implements synthesis;
-  // commit #3 still escapes) and COLUMN_IDENTIFIER_EMPTY. Any non-storage
-  // column that lands in the projection means DuckDB expects the scan to
-  // synthesize values; native can't.
+  // (3) Virtual columns other than rowid. Rowid is synthesized on GPU via
+  // per-RG (start, count) ranges; non-rowid virtual columns (e.g.
+  // COLUMN_IDENTIFIER_EMPTY) we don't synthesize, so refuse those.
   for (auto const& col_id : scan_op.column_ids) {
-    if (col_id.IsRowIdColumn()) { return "row-id projection (late_materialization rewrite)"; }
-    // GetPrimaryIndex() returns COLUMN_IDENTIFIER_EMPTY for the empty
-    // virtual column; any value at or above the storage column count is
-    // a virtual column we don't synthesize.
+    if (col_id.IsRowIdColumn()) { continue; }
     if (col_id.GetPrimaryIndex() == duckdb::COLUMN_IDENTIFIER_EMPTY) {
       return "non-rowid virtual column projection";
     }
@@ -159,24 +155,32 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
             "[task_creator] duckdb_native_scan refused (operator gate): {} — falling back",
             gate_failure);
         } else {
-          // Extract projected storage columns + types. After the gates above,
-          // every column_ids entry is a real storage column.
-          std::vector<duckdb::StorageIndex> projected_cols;
+          // Extract projected columns + types. Rowid columns get an
+          // is_rowid marker; the walker synthesizes per-RG ranges for them
+          // instead of pinning segments. Non-rowid virtual columns are
+          // refused above so every other entry is a real storage column.
+          std::vector<op::scan::projected_column> projected_cols;
           std::vector<sirius::logical_type> projected_types;
+          auto add_col = [&](std::size_t column_ids_idx, std::size_t scanned_types_idx) {
+            auto const& col_id = scan_op->column_ids[column_ids_idx];
+            op::scan::projected_column pc;
+            pc.is_rowid    = col_id.IsRowIdColumn();
+            pc.storage_idx = pc.is_rowid ? duckdb::StorageIndex(0)
+                                         : duckdb::StorageIndex(col_id.GetPrimaryIndex());
+            projected_cols.push_back(pc);
+            projected_types.push_back(scan_op->scanned_types[scanned_types_idx]);
+          };
           if (!scan_op->projection_ids.empty()) {
             projected_cols.reserve(scan_op->projection_ids.size());
             projected_types.reserve(scan_op->projection_ids.size());
             for (size_t i = 0; i < scan_op->projection_ids.size(); ++i) {
-              auto pid = scan_op->projection_ids[i];
-              projected_cols.emplace_back(scan_op->column_ids[pid].GetPrimaryIndex());
-              projected_types.push_back(scan_op->scanned_types[i]);
+              add_col(scan_op->projection_ids[i], i);
             }
           } else {
             projected_cols.reserve(scan_op->column_ids.size());
             projected_types.reserve(scan_op->column_ids.size());
             for (size_t ci = 0; ci < scan_op->column_ids.size(); ++ci) {
-              projected_cols.emplace_back(scan_op->column_ids[ci].GetPrimaryIndex());
-              projected_types.push_back(scan_op->scanned_types[ci]);
+              add_col(ci, ci);
             }
           }
 
@@ -186,18 +190,26 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
           auto& storage   = table.GetStorage();
 
           std::vector<duckdb::RowGroup*> all_row_groups;
+          std::vector<duckdb::idx_t> all_row_group_starts;
           {
             auto& rg_collection = *storage.GetRowGroupCollectionRef();
             auto rg_tree        = rg_collection.GetRowGroupsDirect();
             auto rg_node        = rg_tree->GetRootSegment();
             while (rg_node) {
               all_row_groups.push_back(&rg_node->GetNode());
+              // GetRowStart() is on the segment-tree node wrapper, not on
+              // RowGroup itself — capture here while we have the wrapper.
+              all_row_group_starts.push_back(rg_node->GetRowStart());
               rg_node = rg_tree->GetNextSegment(*rg_node);
             }
           }
 
-          auto metadata = op::scan::walk_duckdb_native_metadata(
-            storage, projected_cols, projected_types, all_row_groups, *_client_context);
+          auto metadata = op::scan::walk_duckdb_native_metadata(storage,
+                                                                projected_cols,
+                                                                projected_types,
+                                                                all_row_groups,
+                                                                all_row_group_starts,
+                                                                *_client_context);
 
           if (metadata.viable) {
             auto state = std::make_shared<op::scan::duckdb_native_scan_global_state>(

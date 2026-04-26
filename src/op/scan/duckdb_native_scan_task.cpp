@@ -95,9 +95,10 @@ bool segment_validity_compression_viable(duckdb::ColumnSegment const& segment)
 
 partitioned_duckdb_native_metadata walk_duckdb_native_metadata(
   duckdb::DataTable& storage,
-  std::vector<duckdb::StorageIndex> const& projected_cols,
+  std::vector<projected_column> const& projected_cols,
   std::vector<sirius::logical_type> const& projected_types,
   std::vector<duckdb::RowGroup*> const& row_groups,
+  std::vector<duckdb::idx_t> const& row_group_starts,
   duckdb::ClientContext& context)
 {
   partitioned_duckdb_native_metadata md;
@@ -107,16 +108,28 @@ partitioned_duckdb_native_metadata walk_duckdb_native_metadata(
     md.viability_failure_reason = "no row groups or no projected columns";
     return md;
   }
+  if (row_groups.size() != row_group_starts.size()) {
+    md.viable                   = false;
+    md.viability_failure_reason = "internal: row_groups and row_group_starts size mismatch";
+    return md;
+  }
 
   // Per-segment viability + per-RG decode-byte budget. Single pass over the
   // segment tree per (rg, col); the column_scans population happens after
-  // viability succeeds via direct_block_scan_column_range.
+  // viability succeeds via direct_block_scan_column_range. Synthetic rowid
+  // columns skip segment walking — their decode cost is a tiny GPU kernel.
   md.rg_decoded_bytes.assign(row_groups.size(), 0);
 
   for (std::size_t rg_idx = 0; rg_idx < row_groups.size(); ++rg_idx) {
     auto* rg = row_groups[rg_idx];
     for (std::size_t ci = 0; ci < projected_cols.size(); ++ci) {
-      auto& col_data  = rg->GetColumnDirect(projected_cols[ci]);
+      if (projected_cols[ci].is_rowid) {
+        // Rowid is BIGINT (8 bytes per row). No segment tree to walk.
+        md.rg_decoded_bytes[rg_idx] += rg->count.load() * sizeof(std::int64_t);
+        continue;
+      }
+
+      auto& col_data  = rg->GetColumnDirect(projected_cols[ci].storage_idx);
       auto& seg_tree  = col_data.GetSegmentTree();
       auto seg_node   = seg_tree.GetRootSegment();
       bool is_varchar = projected_types[ci].is_varchar();
@@ -126,9 +139,10 @@ partitioned_duckdb_native_metadata walk_duckdb_native_metadata(
         auto row_count = segment.count.load();
 
         if (!segment_data_compression_viable(segment, is_varchar)) {
-          md.viable                   = false;
-          md.viability_failure_reason = "unsupported data compression on column " +
-                                        std::to_string(projected_cols[ci].GetPrimaryIndex());
+          md.viable = false;
+          md.viability_failure_reason =
+            "unsupported data compression on column " +
+            std::to_string(projected_cols[ci].storage_idx.GetPrimaryIndex());
           SIRIUS_LOG_INFO("[duckdb_native_scan] not viable: {}", md.viability_failure_reason);
           return md;
         }
@@ -156,9 +170,10 @@ partitioned_duckdb_native_metadata walk_duckdb_native_metadata(
       auto vnode     = vtree.GetRootSegment();
       while (vnode) {
         if (!segment_validity_compression_viable(vnode->GetNode())) {
-          md.viable                   = false;
-          md.viability_failure_reason = "unsupported validity compression on column " +
-                                        std::to_string(projected_cols[ci].GetPrimaryIndex());
+          md.viable = false;
+          md.viability_failure_reason =
+            "unsupported validity compression on column " +
+            std::to_string(projected_cols[ci].storage_idx.GetPrimaryIndex());
           SIRIUS_LOG_INFO("[duckdb_native_scan] not viable: {}", md.viability_failure_reason);
           return md;
         }
@@ -167,15 +182,33 @@ partitioned_duckdb_native_metadata walk_duckdb_native_metadata(
     }
   }
 
-  // Now pin the segments — column-major. direct_block_scan_column_range
-  // walks data + validity for one column across the row-group range.
+  // Pin segments for real columns; build per-RG ranges for rowid columns.
+  // direct_block_scan_column_range walks data + validity for one column
+  // across the row-group range; rowid synthesis only needs rg->start +
+  // rg->count, which the GPU kernel later turns into BIGINT [start, end).
   md.column_scans.reserve(projected_cols.size());
-  for (auto const& storage_idx : projected_cols) {
-    md.column_scans.push_back(
-      direct_block_scan_column_range(storage, storage_idx, context, row_groups));
+  for (auto const& proj : projected_cols) {
+    if (proj.is_rowid) {
+      column_scan_result rowid_scan;
+      rowid_scan.rowid_ranges.reserve(row_groups.size());
+      std::size_t total_rows = 0;
+      for (std::size_t i = 0; i < row_groups.size(); ++i) {
+        auto count = row_groups[i]->count.load();
+        rowid_scan.rowid_ranges.push_back({row_group_starts[i], count});
+        total_rows += count;
+      }
+      // Mirror real columns' total_rows so the dispatcher's batch sizing
+      // and downstream null-count logic stays consistent.
+      rowid_scan.data.total_rows = total_rows;
+      md.column_scans.push_back(std::move(rowid_scan));
+    } else {
+      md.column_scans.push_back(
+        direct_block_scan_column_range(storage, proj.storage_idx, context, row_groups));
+    }
   }
-  md.row_groups = row_groups;
-  md.viable     = true;
+  md.row_groups       = row_groups;
+  md.row_group_starts = row_group_starts;
+  md.viable           = true;
   return md;
 }
 
@@ -200,18 +233,29 @@ duckdb_native_scan_global_state::duckdb_native_scan_global_state(
   auto& table     = bind_data.table.Cast<duckdb::DuckTableEntry>();
   storage_        = &table.GetStorage();
 
-  // Project column indices and types from the scan operator. Caller has
-  // already filtered virtual columns (rowid + others) via the operator-level
-  // escape gates, so every entry here is a real storage column.
+  // Project column indices, types, and rowid markers from the scan operator.
+  // Rowid columns have no real storage_idx — `IsRowIdColumn()` is the
+  // discriminator. The scan task handles them via `column_scan_result::
+  // rowid_ranges` instead of the segment walker. Non-rowid virtual columns
+  // (e.g. COLUMN_IDENTIFIER_EMPTY) are filtered upstream by the operator-
+  // level escape gate in task_creator.
   if (!op_.projection_ids.empty()) {
     for (std::size_t i = 0; i < op_.projection_ids.size(); ++i) {
-      auto pid = op_.projection_ids[i];
-      col_indices_.emplace_back(op_.column_ids[pid].GetPrimaryIndex());
+      auto pid         = op_.projection_ids[i];
+      bool const rowid = op_.column_ids[pid].IsRowIdColumn();
+      auto storage_idx = rowid ? duckdb::StorageIndex(0)
+                               : duckdb::StorageIndex(op_.column_ids[pid].GetPrimaryIndex());
+      col_indices_.emplace_back(storage_idx);
+      col_is_rowid_.push_back(rowid);
       col_types_.push_back(op_.scanned_types[i]);
     }
   } else {
     for (std::size_t ci = 0; ci < op_.column_ids.size(); ++ci) {
-      col_indices_.emplace_back(op_.column_ids[ci].GetPrimaryIndex());
+      bool const rowid = op_.column_ids[ci].IsRowIdColumn();
+      auto storage_idx = rowid ? duckdb::StorageIndex(0)
+                               : duckdb::StorageIndex(op_.column_ids[ci].GetPrimaryIndex());
+      col_indices_.emplace_back(storage_idx);
+      col_is_rowid_.push_back(rowid);
       col_types_.push_back(op_.scanned_types[ci]);
     }
   }
@@ -228,6 +272,7 @@ duckdb_native_scan_global_state::duckdb_native_scan_global_state(
   gpu_space_      = const_cast<cucascade::memory::memory_space*>(gpu_spaces[0]);
 
   row_groups_       = std::move(metadata.row_groups);
+  row_group_starts_ = std::move(metadata.row_group_starts);
   rg_decoded_bytes_ = std::move(metadata.rg_decoded_bytes);
   viable_           = true;
 
@@ -254,17 +299,21 @@ void duckdb_native_scan_global_state::prune_row_groups()
     filter_info.Initialize(client_ctx_, *op_.table_filters, all_col_ids);
 
     std::vector<duckdb::RowGroup*> surviving_rgs;
+    std::vector<duckdb::idx_t> surviving_starts;
     std::vector<std::size_t> surviving_bytes;
     surviving_rgs.reserve(row_groups_.size());
+    surviving_starts.reserve(row_groups_.size());
     surviving_bytes.reserve(row_groups_.size());
 
     for (std::size_t i = 0; i < row_groups_.size(); ++i) {
       if (!row_groups_[i]->CheckZonemap(filter_info)) { continue; }
       surviving_rgs.push_back(row_groups_[i]);
+      surviving_starts.push_back(row_group_starts_[i]);
       surviving_bytes.push_back(rg_decoded_bytes_[i]);
     }
 
     row_groups_       = std::move(surviving_rgs);
+    row_group_starts_ = std::move(surviving_starts);
     rg_decoded_bytes_ = std::move(surviving_bytes);
   }
 
@@ -356,11 +405,13 @@ std::unique_ptr<op::operator_data> duckdb_native_scan_task::compute_task(
 {
   auto& g = _global_state->cast<duckdb_native_scan_global_state>();
 
-  auto& row_groups     = g.row_groups();
-  auto& col_indices    = g.col_indices();
-  auto& col_types      = g.col_types();
-  std::size_t num_cols = col_indices.size();
-  auto mr              = g.gpu_space()->get_default_allocator();
+  auto& row_groups       = g.row_groups();
+  auto& row_group_starts = g.row_group_starts();
+  auto& col_indices      = g.col_indices();
+  auto& col_is_rowid     = g.col_is_rowid();
+  auto& col_types        = g.col_types();
+  std::size_t num_cols   = col_indices.size();
+  auto mr                = g.gpu_space()->get_default_allocator();
 
   using clock = std::chrono::steady_clock;
   auto us     = [](clock::time_point a, clock::time_point b) {
@@ -390,13 +441,28 @@ std::unique_ptr<op::operator_data> duckdb_native_scan_task::compute_task(
 
     auto t0 = clock::now();
 
+    std::vector<duckdb::RowGroup*> batch_rgs(row_groups.begin() + range->start_idx,
+                                             row_groups.begin() + range->start_idx + range->count);
+
     std::vector<column_scan_result> col_scans(num_cols);
     for (std::size_t ci = 0; ci < num_cols; ++ci) {
-      std::vector<duckdb::RowGroup*> batch_rgs(
-        row_groups.begin() + range->start_idx,
-        row_groups.begin() + range->start_idx + range->count);
-      col_scans[ci] =
-        direct_block_scan_column_range(g.storage(), col_indices[ci], g.context(), batch_rgs);
+      if (col_is_rowid[ci]) {
+        // Synthetic rowid: build per-RG (start, count) ranges. The dispatcher
+        // turns these into a BIGINT column via thrust::sequence.
+        column_scan_result rowid_scan;
+        rowid_scan.rowid_ranges.reserve(batch_rgs.size());
+        std::size_t total = 0;
+        for (std::size_t bi = 0; bi < batch_rgs.size(); ++bi) {
+          auto count = batch_rgs[bi]->count.load();
+          rowid_scan.rowid_ranges.push_back({row_group_starts[range->start_idx + bi], count});
+          total += count;
+        }
+        rowid_scan.data.total_rows = total;
+        col_scans[ci]              = std::move(rowid_scan);
+      } else {
+        col_scans[ci] =
+          direct_block_scan_column_range(g.storage(), col_indices[ci], g.context(), batch_rgs);
+      }
     }
 
     auto t1_pin = clock::now();

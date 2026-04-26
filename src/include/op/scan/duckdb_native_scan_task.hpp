@@ -102,8 +102,18 @@ class duckdb_native_scan_global_state : public pipeline::sirius_pipeline_task_gl
   {
     return col_indices_;
   }
+  /// @brief Parallel to `col_indices()`; true means the column is a synthetic
+  /// rowid (DuckDB's late_materialization rewrite). The scan task synthesizes
+  /// `[rg.start, rg.start + rg.row_count)` instead of walking segments.
+  [[nodiscard]] std::vector<bool> const& col_is_rowid() const { return col_is_rowid_; }
   [[nodiscard]] std::vector<sirius::logical_type> const& col_types() const { return col_types_; }
   [[nodiscard]] std::vector<duckdb::RowGroup*> const& row_groups() const { return row_groups_; }
+  /// @brief Parallel to `row_groups()`; absolute row index of each row group's
+  /// first row within the table. Used by rowid synthesis.
+  [[nodiscard]] std::vector<duckdb::idx_t> const& row_group_starts() const
+  {
+    return row_group_starts_;
+  }
   [[nodiscard]] cucascade::memory::memory_space* gpu_space() { return gpu_space_; }
   [[nodiscard]] pipeline::task_scheduler& scheduler() { return task_scheduler_; }
   [[nodiscard]] sirius_physical_duckdb_scan& scan_op() { return op_; }
@@ -131,10 +141,12 @@ class duckdb_native_scan_global_state : public pipeline::sirius_pipeline_task_gl
   bool viable_ = false;
   std::string viability_failure_reason_;
   std::vector<duckdb::StorageIndex> col_indices_;
+  std::vector<bool> col_is_rowid_;  // parallel to col_indices_
   std::vector<sirius::logical_type> col_types_;
 
   // Row group management — pointers + per-RG decode bytes from metadata
   std::vector<duckdb::RowGroup*> row_groups_;
+  std::vector<duckdb::idx_t> row_group_starts_;  // parallel to row_groups_
   std::vector<std::size_t> rg_decoded_bytes_;
   std::atomic<std::size_t> next_claim_idx_{0};
   std::size_t row_groups_per_batch_ = 0;

@@ -64,6 +64,11 @@ struct partitioned_duckdb_native_metadata {
   /// segment vectors inside each `column_scan_result`).
   std::vector<duckdb::RowGroup*> row_groups;
 
+  /// @brief Absolute row index of each `row_groups[i]`'s first row within the
+  /// table — captured from the segment-tree node wrapper at walk time.
+  /// Parallel to `row_groups`. Used by rowid synthesis.
+  std::vector<duckdb::idx_t> row_group_starts;
+
   /// @brief Per-row-group decoded-byte budget summed across projected columns.
   /// Drives batch sizing in the consumer; not used for viability.
   std::vector<std::size_t> rg_decoded_bytes;
@@ -94,11 +99,19 @@ struct partitioned_duckdb_native_metadata {
 /// @param projected_types  Logical types of `projected_cols`, parallel.
 /// @param row_groups       Row groups to visit; non-empty.
 /// @param context          DuckDB client context (for `BufferManager` access).
+/// @brief A single projected column. Either a real storage column
+/// (`storage_idx`) or a synthetic rowid (when `is_rowid` is true).
+struct projected_column {
+  duckdb::StorageIndex storage_idx;  // unused when is_rowid is true
+  bool is_rowid = false;
+};
+
 partitioned_duckdb_native_metadata walk_duckdb_native_metadata(
   duckdb::DataTable& storage,
-  std::vector<duckdb::StorageIndex> const& projected_cols,
+  std::vector<projected_column> const& projected_cols,
   std::vector<sirius::logical_type> const& projected_types,
   std::vector<duckdb::RowGroup*> const& row_groups,
+  std::vector<duckdb::idx_t> const& row_group_starts,
   duckdb::ClientContext& context);
 
 }  // namespace sirius::op::scan

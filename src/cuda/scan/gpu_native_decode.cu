@@ -39,8 +39,10 @@
 #include <cudf/types.hpp>
 
 #include <rmm/device_buffer.hpp>
+#include <rmm/exec_policy.hpp>
 
 #include <cuda_runtime.h>
+#include <thrust/sequence.h>
 
 #include <duckdb/common/types.hpp>
 
@@ -587,6 +589,50 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(column_scan_result& col_
                                         null_count);
 }
 
+//===----------------------------------------------------------------------===//
+// Synthetic rowid column.
+//
+// DuckDB's late_materialization optimizer rewrites bounded LIMIT/TOP_N/SAMPLE
+// queries into `SEMI-JOIN(rowid-scan, full-scan)`, projecting the table's
+// `COLUMN_IDENTIFIER_ROW_ID` virtual column. The walker has no segments to
+// pin for that column — instead it records per-RG `(start, count)` ranges
+// (RowGroup::start is the absolute row index of the RG's first row).
+//
+// Output: a BIGINT cudf column whose values, concatenated across the input
+// ranges, are `[r0.start, r0.start+r0.count) ++ [r1.start, r1.start+r1.count)
+// ++ ...`. One thrust::sequence per range, all enqueued on a single stream;
+// the caller's existing single-sync at end-of-decode covers correctness.
+//===----------------------------------------------------------------------===//
+
+std::unique_ptr<cudf::column> synthesize_rowid_column(
+  std::vector<sirius::op::scan::rowid_range> const& ranges,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  std::size_t total_rows = 0;
+  for (auto const& r : ranges) {
+    total_rows += r.row_count;
+  }
+  if (total_rows == 0) { return cudf::make_empty_column(cudf::data_type{cudf::type_id::INT64}); }
+
+  auto col = cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::INT64},
+                                           static_cast<cudf::size_type>(total_rows),
+                                           cudf::mask_state::UNALLOCATED,
+                                           stream,
+                                           mr);
+
+  auto* data         = col->mutable_view().data<std::int64_t>();
+  std::size_t offset = 0;
+  for (auto const& r : ranges) {
+    if (r.row_count == 0) { continue; }
+    auto begin = data + offset;
+    auto end   = begin + r.row_count;
+    thrust::sequence(rmm::exec_policy(stream), begin, end, static_cast<std::int64_t>(r.start));
+    offset += r.row_count;
+  }
+  return col;
+}
+
 }  // anonymous namespace
 
 //===----------------------------------------------------------------------===//
@@ -640,7 +686,10 @@ std::unique_ptr<cudf::table> gpu_decode_table(std::vector<column_scan_result>& c
   for (size_t ci = 0; ci < num_cols; ++ci) {
     uint32_t* nc_slot = (col_to_slot[ci] >= 0) ? d_valid_counts + col_to_slot[ci] : nullptr;
     auto col_start    = clock::now();
-    if (col_types[ci].id() == duckdb::LogicalTypeId::VARCHAR) {
+    if (!col_scans[ci].rowid_ranges.empty()) {
+      // Synthetic rowid column: no segment data, just per-RG ranges.
+      columns.push_back(synthesize_rowid_column(col_scans[ci].rowid_ranges, stream, mr));
+    } else if (col_types[ci].id() == duckdb::LogicalTypeId::VARCHAR) {
       columns.push_back(decode_string_column_batched(
         col_scans[ci], stream, mr, &blocks.offsets, d_staging, nc_slot));
       us_string +=

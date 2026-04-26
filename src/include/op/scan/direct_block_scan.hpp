@@ -45,11 +45,27 @@ struct direct_block_scan_result {
   int64_t pin_time_us       = 0;
 };
 
-/// @brief Full column scan result including both data and validity segments.
+/// @brief Per-row-group synthetic rowid range: emit `[start, start+row_count)`
+/// as the column's BIGINT values. Used for late-materialization plans where
+/// DuckDB rewrites `LIMIT/TOP_N/SAMPLE` into `SEMI-JOIN(rowid-scan, full-scan)`
+/// — the rowid-scan side projects `COLUMN_IDENTIFIER_ROW_ID`, which has no
+/// real storage. RowGroup::start is the absolute row index of the row group's
+/// first row within the table.
+struct rowid_range {
+  duckdb::idx_t start;
+  duckdb::idx_t row_count;
+};
+
+/// @brief Full column scan result. Either stores real segments (data + validity
+/// trees walked from DuckDB storage) OR is a synthetic rowid column whose
+/// values are computed from per-RG `rowid_ranges` — the two are mutually
+/// exclusive: when `rowid_ranges` is non-empty, `data` and `validity` are
+/// unused and the dispatcher emits a BIGINT column from the ranges directly.
 struct column_scan_result {
   direct_block_scan_result data;
   direct_block_scan_result validity;
   bool has_nulls = false;  // True if any data segment reports HasNull()
+  std::vector<rowid_range> rowid_ranges;
 };
 
 /// @brief Pin data and validity segments for a specific subset of row groups.
