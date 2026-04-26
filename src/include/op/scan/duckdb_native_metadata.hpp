@@ -30,6 +30,7 @@
 
 #pragma once
 
+#include "helper/logical_type.hpp"
 #include "op/scan/direct_block_scan.hpp"
 
 #include <duckdb/common/types.hpp>
@@ -96,7 +97,7 @@ struct partitioned_duckdb_native_metadata {
 partitioned_duckdb_native_metadata walk_duckdb_native_metadata(
   duckdb::DataTable& storage,
   std::vector<duckdb::StorageIndex> const& projected_cols,
-  std::vector<duckdb::LogicalType> const& projected_types,
+  std::vector<sirius::logical_type> const& projected_types,
   std::vector<duckdb::RowGroup*> const& row_groups,
   duckdb::ClientContext& context);
 

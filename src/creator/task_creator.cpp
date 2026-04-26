@@ -18,6 +18,8 @@
 
 #include "log/logging.hpp"
 #include "op/scan/cpu_source_task.hpp"
+#include "op/scan/duckdb_native_metadata.hpp"
+#include "op/scan/duckdb_native_scan_task.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
 #include "op/scan/iceberg_scan_task.hpp"
@@ -31,12 +33,72 @@
 #include "planner/query.hpp"
 #include "sirius_context.hpp"
 
+#include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/execution/execution_context.hpp>
+#include <duckdb/function/table/table_scan.hpp>
 #include <duckdb/parallel/thread_context.hpp>
+#include <duckdb/storage/table/row_group_collection.hpp>
 
+#include <algorithm>
+#include <cstdlib>
 #include <optional>
+#include <string>
+#include <vector>
 
 namespace sirius::creator {
+
+namespace {
+
+//------------------------------------------------------------------------------
+// Default-deny escape gates for the DuckDB-native scan path.
+//
+// duckdb_native_scan bypasses DuckDB's `init_global` entirely, so it inherits
+// none of the implicit handling (sampling pushdown, virtual-column synthesis,
+// dynamic-filter consumption) that the standard table function gives the
+// CPU and parquet paths. The CPU path's `duckdb_scan_task` either forwards
+// these to `init_global` or throws on them; we mirror that behavior here by
+// refusing the GPU-native fast path when any non-default surface is present.
+//
+// Any future LogicalGet field that represents a pushdown should add a check
+// here so silent wrong-results don't sneak in across DuckDB versions.
+//
+// Returned string is empty when accepted; non-empty otherwise (logged).
+//------------------------------------------------------------------------------
+std::string check_native_scan_operator_gates(op::sirius_physical_duckdb_scan const& scan_op)
+{
+  // (1) Dynamic join filters. CPU path throws NotImplementedException; native
+  // path historically silently ignored — that's a wrong-results bug because
+  // Sirius does not run DuckDB's JoinFilterPushdown operator above the scan.
+  if (scan_op.dynamic_filters) {
+    return "dynamic_filters set (Sirius does not consume DynamicTableFilterSet)";
+  }
+
+  // (2) TABLESAMPLE pushed into scan via sampling_pushdown=true. CPU path
+  // forwards `extra_info.sample_options` to init_global so DuckDB samples
+  // correctly. Native bypasses init_global, so this would scan all rows and
+  // return too many.
+  if (scan_op.extra_info.sample_options) {
+    return "extra_info.sample_options present (sampling pushed into scan)";
+  }
+
+  // (3) Virtual columns. Includes rowid (commit #4 implements synthesis;
+  // commit #3 still escapes) and COLUMN_IDENTIFIER_EMPTY. Any non-storage
+  // column that lands in the projection means DuckDB expects the scan to
+  // synthesize values; native can't.
+  for (auto const& col_id : scan_op.column_ids) {
+    if (col_id.IsRowIdColumn()) { return "row-id projection (late_materialization rewrite)"; }
+    // GetPrimaryIndex() returns COLUMN_IDENTIFIER_EMPTY for the empty
+    // virtual column; any value at or above the storage column count is
+    // a virtual column we don't synthesize.
+    if (col_id.GetPrimaryIndex() == duckdb::COLUMN_IDENTIFIER_EMPTY) {
+      return "non-rowid virtual column projection";
+    }
+  }
+
+  return {};
+}
+
+}  // namespace
 
 //------------------------------------------------------------------------------
 // task_creator
@@ -68,6 +130,7 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
   std::lock_guard<std::mutex> lock(_global_state_mutex);
 
   _scan_operator_global_state_map.clear();
+  _duckdb_native_scan_global_state_map.clear();
   _gpu_operator_global_state_map.clear();
 
   const auto& pipelines = query.get_pipelines();
@@ -82,13 +145,85 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
     size_t operator_id = source_operator->get_operator_id();
 
     if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
-      _scan_operator_global_state_map.emplace(
-        operator_id,
-        std::make_shared<op::scan::duckdb_scan_task_global_state>(
-          pipeline,
-          *_task_scheduler,
-          *_client_context,
-          &source_operator->Cast<op::sirius_physical_duckdb_scan>()));
+      auto* scan_op = &source_operator->Cast<op::sirius_physical_duckdb_scan>();
+
+      // Try the GPU-native fast path. Falls back to standard duckdb_scan_task
+      // when any escape gate fires, when the metadata walk reports unsupported
+      // compression, or when SIRIUS_DISABLE_GPU_NATIVE_SCAN is set.
+      bool native_dispatched     = false;
+      char const* disable_native = std::getenv("SIRIUS_DISABLE_GPU_NATIVE_SCAN");
+      if (disable_native == nullptr || disable_native[0] == '0') {
+        auto gate_failure = check_native_scan_operator_gates(*scan_op);
+        if (!gate_failure.empty()) {
+          SIRIUS_LOG_INFO(
+            "[task_creator] duckdb_native_scan refused (operator gate): {} — falling back",
+            gate_failure);
+        } else {
+          // Extract projected storage columns + types. After the gates above,
+          // every column_ids entry is a real storage column.
+          std::vector<duckdb::StorageIndex> projected_cols;
+          std::vector<sirius::logical_type> projected_types;
+          if (!scan_op->projection_ids.empty()) {
+            projected_cols.reserve(scan_op->projection_ids.size());
+            projected_types.reserve(scan_op->projection_ids.size());
+            for (size_t i = 0; i < scan_op->projection_ids.size(); ++i) {
+              auto pid = scan_op->projection_ids[i];
+              projected_cols.emplace_back(scan_op->column_ids[pid].GetPrimaryIndex());
+              projected_types.push_back(scan_op->scanned_types[i]);
+            }
+          } else {
+            projected_cols.reserve(scan_op->column_ids.size());
+            projected_types.reserve(scan_op->column_ids.size());
+            for (size_t ci = 0; ci < scan_op->column_ids.size(); ++ci) {
+              projected_cols.emplace_back(scan_op->column_ids[ci].GetPrimaryIndex());
+              projected_types.push_back(scan_op->scanned_types[ci]);
+            }
+          }
+
+          // Walk row groups and metadata via the Level-1 free function.
+          auto& bind_data = scan_op->bind_data->Cast<duckdb::TableScanBindData>();
+          auto& table     = bind_data.table.Cast<duckdb::DuckTableEntry>();
+          auto& storage   = table.GetStorage();
+
+          std::vector<duckdb::RowGroup*> all_row_groups;
+          {
+            auto& rg_collection = *storage.GetRowGroupCollectionRef();
+            auto rg_tree        = rg_collection.GetRowGroupsDirect();
+            auto rg_node        = rg_tree->GetRootSegment();
+            while (rg_node) {
+              all_row_groups.push_back(&rg_node->GetNode());
+              rg_node = rg_tree->GetNextSegment(*rg_node);
+            }
+          }
+
+          auto metadata = op::scan::walk_duckdb_native_metadata(
+            storage, projected_cols, projected_types, all_row_groups, *_client_context);
+
+          if (metadata.viable) {
+            auto state = std::make_shared<op::scan::duckdb_native_scan_global_state>(
+              pipeline, *_task_scheduler, *_client_context, scan_op, std::move(metadata));
+            if (state->viable()) {
+              _duckdb_native_scan_global_state_map.emplace(operator_id, std::move(state));
+              native_dispatched = true;
+            } else {
+              SIRIUS_LOG_INFO(
+                "[task_creator] duckdb_native_scan global-state init non-viable: {} — falling back",
+                state->viability_failure_reason());
+            }
+          } else {
+            SIRIUS_LOG_INFO(
+              "[task_creator] duckdb_native_scan metadata non-viable: {} — falling back",
+              metadata.viability_failure_reason);
+          }
+        }
+      }
+
+      if (!native_dispatched) {
+        _scan_operator_global_state_map.emplace(
+          operator_id,
+          std::make_shared<op::scan::duckdb_scan_task_global_state>(
+            pipeline, *_task_scheduler, *_client_context, scan_op));
+      }
     } else if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::CPU_SOURCE) {
       _cpu_source_operator_global_state_map.emplace(
         operator_id,
@@ -120,8 +255,9 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
       _gpu_operator_global_state_map.emplace(operator_id, std::move(gs));
     }
   }
-  _num_scans_in_plan =
-    _scan_operator_global_state_map.size() + _parquet_scan_operator_global_state_map.size();
+  _num_scans_in_plan = _scan_operator_global_state_map.size() +
+                       _duckdb_native_scan_global_state_map.size() +
+                       _parquet_scan_operator_global_state_map.size();
 }
 
 void task_creator::drain_pending_tasks()
@@ -136,6 +272,7 @@ void task_creator::reset(bool keep_parquet_metadata)
 {
   std::lock_guard<std::mutex> lock(_global_state_mutex);
   _scan_operator_global_state_map.clear();
+  _duckdb_native_scan_global_state_map.clear();
   if (!keep_parquet_metadata) { _parquet_scan_operator_global_state_map.clear(); }
   _gpu_operator_global_state_map.clear();
   _cpu_source_operator_global_state_map.clear();
@@ -173,9 +310,19 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
     // task creator should never schedule additional scans from downstream.
     // (Parquet scans are fine — they use partition indices that self-limit.)
     if (producer != nullptr && producer->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
-      auto& global_state = _scan_operator_global_state_map.at(producer->get_operator_id());
-      if (global_state->is_source_drained() || !global_state->can_create_more_tasks()) {
+      // GPU-native scan self-manages via continuations once started. Until
+      // it has started (i.e., before the initial fan-out is dispatched),
+      // let the request through so manager_loop creates the first task.
+      auto native_it = _duckdb_native_scan_global_state_map.find(producer->get_operator_id());
+      if (native_it != _duckdb_native_scan_global_state_map.end() &&
+          native_it->second->has_started()) {
         return nullptr;
+      }
+      auto cpu_it = _scan_operator_global_state_map.find(producer->get_operator_id());
+      if (cpu_it != _scan_operator_global_state_map.end()) {
+        if (cpu_it->second->is_source_drained() || !cpu_it->second->can_create_more_tasks()) {
+          return nullptr;
+        }
       }
     }
     return get_operator_for_next_task(producer);
@@ -280,33 +427,48 @@ void task_creator::manager_loop()
         }
         // scheduling scan task
         if (node->type == ::sirius::op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
-          // Check to see if you need to create a new global s for this scan operator
-          size_t operator_id          = node->get_operator_id();
-          auto scan_task_global_state = _scan_operator_global_state_map.at(operator_id);
-
-          const auto& op_params =
-            _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
-              ->get_config()
-              .get_operator_params();
-          auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
-            *scan_task_global_state,
-            *_execution_context,
-            op_params.scan_task_batch_size,
-            op_params.default_scan_task_varchar_size);
+          size_t operator_id = node->get_operator_id();
           if (destination_data_repositories.empty()) {
             throw std::runtime_error(
               "No destination data repositories provided for scan task creation.");
           }
-          auto scan_task = std::make_unique<op::scan::duckdb_scan_task>(
-            get_next_task_id(),
-            destination_data_repositories[0],  // WSM amin TODO: is this correct? there probably
-                                               // needs to be multiple possible destination data
-                                               // repositories
-            std::move(scan_task_local_state),
-            scan_task_global_state);
-          pipeline->mark_task_created();  // WSM TODO: this needs to be done atomically
-                                          // with the task creation
-          _task_scheduler->schedule(std::move(scan_task));
+
+          // GPU-native fast path: launch N initial tasks (N = scan executor
+          // thread count); each task self-continues until row groups exhaust.
+          auto native_it = _duckdb_native_scan_global_state_map.find(operator_id);
+          if (native_it != _duckdb_native_scan_global_state_map.end()) {
+            auto& native_state = native_it->second;
+            int num_initial    = _task_scheduler->get_scan_executor().get_num_threads();
+            num_initial = std::min(num_initial, static_cast<int>(native_state->total_row_groups()));
+            num_initial = std::max(num_initial, 1);
+            for (int i = 0; i < num_initial; ++i) {
+              auto scan_task = std::make_unique<op::scan::duckdb_native_scan_task>(
+                get_next_task_id(), destination_data_repositories[0], native_state);
+              pipeline->mark_task_created();
+              _task_scheduler->schedule(std::move(scan_task));
+            }
+          } else {
+            // Fallback: standard duckdb_scan_task (CPU path, materializes
+            // through DuckDB's table function).
+            auto scan_task_global_state = _scan_operator_global_state_map.at(operator_id);
+
+            const auto& op_params =
+              _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                ->get_config()
+                .get_operator_params();
+            auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
+              *scan_task_global_state,
+              *_execution_context,
+              op_params.scan_task_batch_size,
+              op_params.default_scan_task_varchar_size);
+            auto scan_task = std::make_unique<op::scan::duckdb_scan_task>(
+              get_next_task_id(),
+              destination_data_repositories[0],  // WSM amin TODO: multiple destinations?
+              std::move(scan_task_local_state),
+              scan_task_global_state);
+            pipeline->mark_task_created();  // WSM TODO: atomic with task creation
+            _task_scheduler->schedule(std::move(scan_task));
+          }
         } else if (node->type == ::sirius::op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
           size_t operator_id             = node->get_operator_id();
           auto parquet_task_global_state = _parquet_scan_operator_global_state_map.at(operator_id);

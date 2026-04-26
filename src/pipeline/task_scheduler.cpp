@@ -22,6 +22,7 @@
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/cpu_source_task.hpp"
+#include "op/scan/duckdb_native_scan_task.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
 #include "op/scan/parquet_scan_task.hpp"
@@ -86,6 +87,8 @@ task_scheduler::~task_scheduler() { stop(); }
 void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
   if (task->is<sirius::op::scan::duckdb_scan_task>()) {
+    _scan_executor->schedule(std::move(task));
+  } else if (task->is<sirius::op::scan::duckdb_native_scan_task>()) {
     _scan_executor->schedule(std::move(task));
   } else if (task->is<sirius::op::scan::parquet_scan_task>()) {
     _scan_executor->schedule(std::move(task));

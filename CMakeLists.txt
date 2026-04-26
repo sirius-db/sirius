@@ -169,6 +169,7 @@ set(EXTENSION_SOURCES
     src/op/scan/duckdb_scan_executor.cpp
     src/op/scan/cpu_source_task.cpp
     src/op/scan/direct_block_scan.cpp
+    src/op/scan/duckdb_native_scan_task.cpp
     src/op/scan/duckdb_scan_task.cpp
     src/op/scan/equality_delete_filter.cpp
     src/op/scan/hive_partition.cpp

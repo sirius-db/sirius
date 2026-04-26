@@ -47,6 +47,7 @@ class sirius_pipeline_task_global_state;
 namespace sirius::op::scan {
 class cpu_source_task_global_state;
 class duckdb_scan_task_global_state;
+class duckdb_native_scan_global_state;
 class parquet_scan_task_global_state;
 class iceberg_scan_task_global_state;
 }  // namespace sirius::op::scan
@@ -193,6 +194,12 @@ class task_creator {
   // Map of operator ID to global state for scan operators
   std::map<size_t, std::shared_ptr<op::scan::duckdb_scan_task_global_state>>
     _scan_operator_global_state_map;
+  // GPU-native fast path for DuckDB-native tables. Populated only when the
+  // operator-level escape gates pass AND the metadata walk reports viable.
+  // Falling back means leaving this entry absent and using the standard
+  // _scan_operator_global_state_map dispatch.
+  std::map<size_t, std::shared_ptr<op::scan::duckdb_native_scan_global_state>>
+    _duckdb_native_scan_global_state_map;
   std::map<size_t, std::shared_ptr<op::scan::parquet_scan_task_global_state>>
     _parquet_scan_operator_global_state_map;
   std::map<size_t, std::shared_ptr<op::scan::cpu_source_task_global_state>>

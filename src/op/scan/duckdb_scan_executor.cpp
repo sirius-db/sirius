@@ -293,7 +293,13 @@ void duckdb_scan_executor::manager_loop()
           auto consumers = scan_task->get_output_consumers();
           {
             auto output_data = get_scan_output(scan_task, stream);
-            stream->synchronize();
+            // Sync is only needed when the cache path enqueued async clone
+            // work (batch->clone on `stream` runs H2D copies). In the NONE
+            // path, compute_task's implementations either sync internally
+            // (duckdb_native/parquet) or do no GPU work (duckdb_scan), so
+            // this sync was redundant. publish_output is CPU-only for every
+            // scan task type.
+            if (_cache_level != cache_level::NONE) { stream->synchronize(); }
             scan_task->publish_output(*output_data, stream);
           }
 
