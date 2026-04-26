@@ -135,7 +135,15 @@ inline void bounce_h2d_async(void* d_dst, const void* src, size_t bytes, cudaStr
   }
   auto& slot = ring.slots[ring.next];
   ring.next  = (ring.next + 1) % detail::pinned_bounce_ring::NUM_SLOTS;
-  if (slot.in_use) { ::cudaEventSynchronize(slot.ev); }
+  if (slot.in_use) {
+    // Query before sync: with the 2-slot ring on healthy hardware the
+    // prior DMA has typically already drained by the time we cycle back,
+    // so cudaEventQuery returns cudaSuccess and we skip the cudaEvent-
+    // Synchronize driver round-trip entirely.  Any non-success status
+    // (including cudaErrorNotReady) falls through to sync, which is the
+    // correct behaviour for both pending events and surfacing errors.
+    if (::cudaEventQuery(slot.ev) != cudaSuccess) { ::cudaEventSynchronize(slot.ev); }
+  }
   std::memcpy(slot.buf, src, bytes);
   ::cudaMemcpyAsync(d_dst, slot.buf, bytes, cudaMemcpyHostToDevice, stream);
   ::cudaEventRecord(slot.ev, stream);
