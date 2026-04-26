@@ -25,6 +25,7 @@
 
 #include "cuda/scan/device_scratch.cuh"
 #include "cuda/scan/gpu_decode.cuh"
+#include "cuda/scan/gpu_decode_batched_string.cuh"
 #include "cuda/scan/gpu_decode_validity.cuh"
 #include "cuda/scan/gpu_native_decode.cuh"
 #include "cuda/scan/pinned_bounce.cuh"
@@ -564,19 +565,25 @@ std::unique_ptr<cudf::table> gpu_decode_table(std::vector<column_scan_result>& c
   // 3. Decode every column — all work enqueued on one stream, no syncs.
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.reserve(num_cols);
+  size_t n_fixed = 0, n_string = 0;
+  double us_fixed = 0, us_string = 0;
 
   for (size_t ci = 0; ci < num_cols; ++ci) {
     uint32_t* nc_slot = (col_to_slot[ci] >= 0) ? d_valid_counts + col_to_slot[ci] : nullptr;
+    auto col_start    = clock::now();
     if (col_types[ci].id() == duckdb::LogicalTypeId::VARCHAR) {
-      // String codecs ship in PR A2.  Reaching here means the upstream
-      // viability check did not refuse this column — defensive assert.
-      throw std::runtime_error(
-        "gpu_native_decode: viability invariant violated — VARCHAR columns "
-        "are not supported by this dispatcher (string decode arrives in PR A2); "
-        "PR E's check_viability must refuse them upstream");
+      columns.push_back(decode_string_column_batched(
+        col_scans[ci], stream, mr, &blocks.offsets, d_staging, nc_slot));
+      us_string +=
+        std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - col_start).count();
+      ++n_string;
+    } else {
+      columns.push_back(decode_fixed_width_column(
+        col_scans[ci], col_types[ci], blocks, d_staging, stream, mr, nc_slot));
+      us_fixed +=
+        std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - col_start).count();
+      ++n_fixed;
     }
-    columns.push_back(decode_fixed_width_column(
-      col_scans[ci], col_types[ci], blocks, d_staging, stream, mr, nc_slot));
   }
 
   auto t_decode = clock::now();
@@ -609,13 +616,18 @@ std::unique_ptr<cudf::table> gpu_decode_table(std::vector<column_scan_result>& c
     return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
   };
   SIRIUS_LOG_INFO(
-    "[gpu_native_decode] table: {} cols, {} rows, {} blocks | "
-    "stage={:.1f}ms enqueue={:.1f}ms sync+nulls={:.1f}ms total={:.1f}ms",
+    "[gpu_native_decode] table: {} cols ({} fixed + {} str), {} rows, {} blocks | "
+    "stage={:.1f}ms enqueue={:.1f}ms (fixed={:.1f}ms str={:.1f}ms) "
+    "sync+nulls={:.1f}ms total={:.1f}ms",
     num_cols,
+    n_fixed,
+    n_string,
     total_rows,
     blocks.offsets.size(),
     us(t_start, t_stage) / 1000.0,
     us(t_stage, t_decode) / 1000.0,
+    us_fixed / 1000.0,
+    us_string / 1000.0,
     us(t_decode, t_end) / 1000.0,
     us(t_start, t_end) / 1000.0);
 
