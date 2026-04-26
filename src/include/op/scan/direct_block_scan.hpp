@@ -52,7 +52,20 @@ struct column_scan_result {
   bool has_nulls = false;  // True if any data segment reports HasNull()
 };
 
-/// @brief Pin data and validity segments for a specific subset of row groups.
+/// @brief Pin data segments for a specific subset of row groups and return
+/// each segment's on-disk byte layout.
+///
+/// On return, `column_scan_result.data` is populated with one segment_info
+/// per data segment in the requested row groups. `column_scan_result.has_nulls`
+/// reflects only data-side segment statistics (`CanHaveNull()`), not a walk
+/// of the validity tree.
+///
+/// IMPORTANT: until PR E lands, `column_scan_result.validity` is intentionally
+/// left empty (the validity walk requires `StandardColumnData::GetValidityData`
+/// which D does not call). Callers must NOT consume `validity.segments` from
+/// D's output. PR E adds the validity walk + ROARING host decode and gates
+/// viability so any column with potential nulls is correctly handled
+/// (or refused) before reaching the GPU decoder.
 column_scan_result direct_block_scan_column_range(duckdb::DataTable& storage,
                                                   duckdb::StorageIndex col_idx,
                                                   duckdb::ClientContext& context,
