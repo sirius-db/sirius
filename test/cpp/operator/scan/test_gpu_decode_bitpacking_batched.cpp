@@ -8,13 +8,12 @@
  *     http://www.apache.org/licenses/LICENSE-2.0
  */
 
+#include "cuda/scan/gpu_decode.cuh"
 #include "operator/scan/decode_test_utils.hpp"
 
-#include "cuda/scan/gpu_decode.cuh"
+#include <cudf/utilities/default_stream.hpp>
 
 #include <catch.hpp>
-
-#include <cudf/utilities/default_stream.hpp>
 
 #include <cstdint>
 #include <vector>
@@ -71,16 +70,18 @@ TEST_CASE("bitpacking batched: CONSTANT mode broadcasts the constant",
     auto block = make_constant_block<int32_t>(42);
     auto out   = decode_one_segment<int32_t>(block, 100, /*is_signed=*/true);
     REQUIRE(out.size() == 100);
-    for (auto v : out) REQUIRE(v == 42);
+    for (auto v : out)
+      REQUIRE(v == 42);
   }
 
   SECTION("int64, value 5'000'000'000, 256 rows")
   {
-    int64_t v = 5'000'000'000LL;
+    int64_t v  = 5'000'000'000LL;
     auto block = make_constant_block<int64_t>(v);
     auto out   = decode_one_segment<int64_t>(block, 256, /*is_signed=*/true);
     REQUIRE(out.size() == 256);
-    for (auto x : out) REQUIRE(x == v);
+    for (auto x : out)
+      REQUIRE(x == v);
   }
 
   SECTION("uint8, value 200, 33 rows (non-warp-aligned)")
@@ -88,7 +89,8 @@ TEST_CASE("bitpacking batched: CONSTANT mode broadcasts the constant",
     auto block = make_constant_block<uint8_t>(200);
     auto out   = decode_one_segment<uint8_t>(block, 33, /*is_signed=*/false);
     REQUIRE(out.size() == 33);
-    for (auto v : out) REQUIRE(v == 200);
+    for (auto v : out)
+      REQUIRE(v == 200);
   }
 }
 
@@ -100,7 +102,8 @@ TEST_CASE("bitpacking batched: CONSTANT_DELTA mode produces an arithmetic progre
     auto block = make_constant_delta_block<int32_t>(10, 3);
     auto out   = decode_one_segment<int32_t>(block, 50, /*is_signed=*/true);
     REQUIRE(out.size() == 50);
-    for (uint32_t i = 0; i < 50; ++i) REQUIRE(out[i] == 10 + 3 * static_cast<int32_t>(i));
+    for (uint32_t i = 0; i < 50; ++i)
+      REQUIRE(out[i] == 10 + 3 * static_cast<int32_t>(i));
   }
 }
 
@@ -110,33 +113,39 @@ TEST_CASE("bitpacking batched: FOR mode unpacks frame + packed values",
   SECTION("int32, width=5, frame=100, 32 rows (one warp)")
   {
     std::vector<int32_t> packed_values(32);
-    for (int32_t i = 0; i < 32; ++i) packed_values[i] = i;  // 0..31, fits in 5 bits
+    for (int32_t i = 0; i < 32; ++i)
+      packed_values[i] = i;  // 0..31, fits in 5 bits
     auto block = make_for_block<int32_t>(/*frame=*/100, /*width=*/5, packed_values);
     auto out   = decode_one_segment<int32_t>(block, 32, /*is_signed=*/true);
     REQUIRE(out.size() == 32);
-    for (uint32_t i = 0; i < 32; ++i) REQUIRE(out[i] == 100 + static_cast<int32_t>(i));
+    for (uint32_t i = 0; i < 32; ++i)
+      REQUIRE(out[i] == 100 + static_cast<int32_t>(i));
   }
 
   SECTION("int32, width=12, 100 rows (multi-warp, non-aligned tail)")
   {
     std::vector<int32_t> packed_values(100);
-    for (int32_t i = 0; i < 100; ++i) packed_values[i] = i * 7 % 4096;  // fits in 12 bits
+    for (int32_t i = 0; i < 100; ++i)
+      packed_values[i] = i * 7 % 4096;  // fits in 12 bits
     auto block = make_for_block<int32_t>(/*frame=*/-50, /*width=*/12, packed_values);
     auto out   = decode_one_segment<int32_t>(block, 100, /*is_signed=*/true);
     REQUIRE(out.size() == 100);
-    for (uint32_t i = 0; i < 100; ++i) REQUIRE(out[i] == -50 + (i * 7 % 4096));
+    for (uint32_t i = 0; i < 100; ++i)
+      REQUIRE(out[i] == -50 + (i * 7 % 4096));
   }
 
   SECTION("int64, width=33, 64 rows (3-word unpack path)")
   {
     // width > 32 with non-zero bit_off forces unpack_value's third-word read.
     std::vector<int64_t> packed_values(64);
-    for (int64_t i = 0; i < 64; ++i) packed_values[i] = (i * 0x1234567LL) & ((1LL << 33) - 1);
+    for (int64_t i = 0; i < 64; ++i)
+      packed_values[i] = (i * 0x1234567LL) & ((1LL << 33) - 1);
     auto block = make_for_block<int64_t>(/*frame=*/1'000'000LL, /*width=*/33, packed_values);
     auto out   = decode_one_segment<int64_t>(block, 64, /*is_signed=*/true);
     REQUIRE(out.size() == 64);
     for (uint32_t i = 0; i < 64; ++i) {
-      int64_t expected = 1'000'000LL + ((static_cast<int64_t>(i) * 0x1234567LL) & ((1LL << 33) - 1));
+      int64_t expected =
+        1'000'000LL + ((static_cast<int64_t>(i) * 0x1234567LL) & ((1LL << 33) - 1));
       REQUIRE(out[i] == expected);
     }
   }
@@ -153,7 +162,7 @@ TEST_CASE("bitpacking batched: DELTA_FOR mode prefix-sums packed deltas",
                                                /*delta_offset=*/10,
                                                /*width=*/4,
                                                packed_values);
-    auto out = decode_one_segment<int32_t>(block, 16, /*is_signed=*/true);
+    auto out   = decode_one_segment<int32_t>(block, 16, /*is_signed=*/true);
     REQUIRE(out.size() == 16);
     int32_t running = 10;
     for (uint32_t i = 0; i < 16; ++i) {
@@ -168,12 +177,12 @@ TEST_CASE("bitpacking batched: multi-segment dispatch packs distinct outputs",
 {
   // Two CONSTANT segments with different values; verify each writes to its own
   // output region via global_row_offset.
-  auto stream   = cudf::get_default_stream();
-  auto cstream  = stream.value();
-  auto block_a  = make_constant_block<int32_t>(7);
-  auto block_b  = make_constant_block<int32_t>(99);
-  auto d_a      = upload(block_a, cstream);
-  auto d_b      = upload(block_b, cstream);
+  auto stream  = cudf::get_default_stream();
+  auto cstream = stream.value();
+  auto block_a = make_constant_block<int32_t>(7);
+  auto block_b = make_constant_block<int32_t>(99);
+  auto d_a     = upload(block_a, cstream);
+  auto d_b     = upload(block_b, cstream);
 
   constexpr uint32_t rows_a = 50;
   constexpr uint32_t rows_b = 70;
@@ -192,6 +201,8 @@ TEST_CASE("bitpacking batched: multi-segment dispatch packs distinct outputs",
                                 stream);
 
   auto out = download<int32_t>(d_output.ptr, rows_a + rows_b, cstream);
-  for (uint32_t i = 0; i < rows_a; ++i) REQUIRE(out[i] == 7);
-  for (uint32_t i = 0; i < rows_b; ++i) REQUIRE(out[rows_a + i] == 99);
+  for (uint32_t i = 0; i < rows_a; ++i)
+    REQUIRE(out[i] == 7);
+  for (uint32_t i = 0; i < rows_b; ++i)
+    REQUIRE(out[rows_a + i] == 99);
 }

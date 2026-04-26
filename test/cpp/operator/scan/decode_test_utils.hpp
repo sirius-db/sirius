@@ -117,8 +117,8 @@ inline std::vector<uint8_t> make_for_block(T frame, uint32_t width, std::vector<
   //   [8+2T..8+2T+packed)  packed bytes
   //   [M-4..M)             encoded entry
   size_t packed_bytes = packed.size() * sizeof(uint32_t);
-  size_t M_min = 8 + 2 * sizeof(T) + packed_bytes + 4;  // +4 for encoded entry slot
-  size_t block_size = std::max<size_t>(M_min, 64);
+  size_t M_min        = 8 + 2 * sizeof(T) + packed_bytes + 4;  // +4 for encoded entry slot
+  size_t block_size   = std::max<size_t>(M_min, 64);
   std::vector<uint8_t> block(block_size, 0);
   uint64_t metadata_end = M_min - 4 + 4;  // include space for the encoded entry
   std::memcpy(block.data(), &metadata_end, sizeof(metadata_end));
@@ -126,8 +126,7 @@ inline std::vector<uint8_t> make_for_block(T frame, uint32_t width, std::vector<
   std::memcpy(block.data() + 8, &frame, sizeof(T));
   std::memcpy(block.data() + 8 + sizeof(T), &width_t, sizeof(T));
   std::memcpy(block.data() + 8 + 2 * sizeof(T), packed.data(), packed_bytes);
-  uint32_t encoded =
-    (static_cast<uint32_t>(::sirius::cuda::scan::BitpackingMode::FOR) << 24) | 8;
+  uint32_t encoded = (static_cast<uint32_t>(::sirius::cuda::scan::BitpackingMode::FOR) << 24) | 8;
   std::memcpy(block.data() + metadata_end - 4, &encoded, sizeof(encoded));
   return block;
 }
@@ -138,10 +137,10 @@ inline std::vector<uint8_t> make_delta_for_block(T frame,
                                                  uint32_t width,
                                                  std::vector<T> const& packed_values)
 {
-  auto packed = pack_values<T>(packed_values, width);
+  auto packed         = pack_values<T>(packed_values, width);
   size_t packed_bytes = packed.size() * sizeof(uint32_t);
   // Layout adds a third T (delta_offset) before the packed bytes.
-  size_t M_min = 8 + 3 * sizeof(T) + packed_bytes + 4;
+  size_t M_min      = 8 + 3 * sizeof(T) + packed_bytes + 4;
   size_t block_size = std::max<size_t>(M_min, 64);
   std::vector<uint8_t> block(block_size, 0);
   uint64_t metadata_end = M_min;
@@ -171,7 +170,7 @@ struct device_alloc {
   {
     if (bytes > 0) ::cudaMalloc(&ptr, bytes);
   }
-  device_alloc(device_alloc const&) = delete;
+  device_alloc(device_alloc const&)            = delete;
   device_alloc& operator=(device_alloc const&) = delete;
   device_alloc(device_alloc&& o) noexcept : ptr(o.ptr), size(o.size)
   {
@@ -197,8 +196,7 @@ struct device_alloc {
 inline device_alloc upload(std::vector<uint8_t> const& host_bytes, cudaStream_t stream)
 {
   device_alloc d(host_bytes.size());
-  ::cudaMemcpyAsync(d.ptr, host_bytes.data(), host_bytes.size(),
-                    ::cudaMemcpyHostToDevice, stream);
+  ::cudaMemcpyAsync(d.ptr, host_bytes.data(), host_bytes.size(), ::cudaMemcpyHostToDevice, stream);
   return d;
 }
 
@@ -206,8 +204,7 @@ template <typename T>
 inline std::vector<T> download(void const* d_ptr, size_t count, cudaStream_t stream)
 {
   std::vector<T> out(count);
-  ::cudaMemcpyAsync(out.data(), d_ptr, count * sizeof(T),
-                    ::cudaMemcpyDeviceToHost, stream);
+  ::cudaMemcpyAsync(out.data(), d_ptr, count * sizeof(T), ::cudaMemcpyDeviceToHost, stream);
   ::cudaStreamSynchronize(stream);
   return out;
 }

@@ -20,6 +20,7 @@
 //===----------------------------------------------------------------------===//
 
 #include <cuda_runtime.h>
+
 #include <cstdint>
 
 namespace sirius::cuda::scan {

@@ -53,10 +53,9 @@ namespace sirius::cuda::scan {
 /// At SF100 Q1, this replaces ~24K launches with ~1K launches while
 /// maintaining the same GPU occupancy and compute efficiency.
 template <typename T>
-__global__ void kernel_decode_bitpacking_batched(
-  const batched_bp_seg_desc* __restrict__ descs,
-  T* __restrict__ d_output,
-  uint32_t num_groups)
+__global__ void kernel_decode_bitpacking_batched(const batched_bp_seg_desc* __restrict__ descs,
+                                                 T* __restrict__ d_output,
+                                                 uint32_t num_groups)
 {
   uint32_t gid = blockIdx.x;
   if (gid >= num_groups) return;
@@ -78,8 +77,7 @@ __global__ void kernel_decode_bitpacking_batched(
     uint64_t metadata_end;
     memcpy(&metadata_end, block_base, sizeof(uint64_t));
 
-    const uint8_t* entry_addr =
-      block_base + metadata_end - (desc.group_idx + 1) * sizeof(uint32_t);
+    const uint8_t* entry_addr = block_base + metadata_end - (desc.group_idx + 1) * sizeof(uint32_t);
     uint32_t encoded;
     memcpy(&encoded, entry_addr, sizeof(uint32_t));
 
@@ -156,8 +154,8 @@ __global__ void kernel_decode_bitpacking_batched(
   }
 
   //--- FOR or DELTA_FOR: load packed data into shared memory ---
-  uint32_t width          = sm_width;
-  T frame                 = sm_frame;
+  uint32_t width = sm_width;
+  T frame        = sm_frame;
 
   extern __shared__ uint32_t shmem[];
   const uint8_t* packed_bytes = desc.d_block + sm_data_offset;
@@ -229,15 +227,14 @@ static void decode_typed_batched(const batched_bp_seg_desc* descs,
   auto* d_descs     = static_cast<batched_bp_seg_desc*>(desc_alloc.ptr);
   bounce_h2d_async(d_descs, descs, desc_bytes, stream.value());
 
-  constexpr uint32_t BLOCK_DIM       = 256;
-  constexpr uint32_t max_width       = sizeof(T) * 8;
+  constexpr uint32_t BLOCK_DIM = 256;
+  constexpr uint32_t max_width = sizeof(T) * 8;
   // +1 guard word for 3-word unpack_value reads on 64-bit types.
   constexpr uint32_t max_packed_words = (BP_META_GROUP_SIZE * max_width + 31) / 32 + 1;
-  constexpr size_t shmem_bytes       = max_packed_words * sizeof(uint32_t);
+  constexpr size_t shmem_bytes        = max_packed_words * sizeof(uint32_t);
 
-  kernel_decode_bitpacking_batched<T>
-    <<<num_segments, BLOCK_DIM, shmem_bytes, stream.value()>>>(
-      d_descs, static_cast<T*>(d_output), num_segments);
+  kernel_decode_bitpacking_batched<T><<<num_segments, BLOCK_DIM, shmem_bytes, stream.value()>>>(
+    d_descs, static_cast<T*>(d_output), num_segments);
 
   if (desc_alloc.needs_free) { cudaFreeAsync(d_descs, stream.value()); }
 }

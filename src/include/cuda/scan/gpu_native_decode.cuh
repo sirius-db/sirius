@@ -29,12 +29,13 @@
 // ALP / ALPRD floats arrive in PR A2 and PR A3.
 //===----------------------------------------------------------------------===//
 
-#include <op/scan/direct_block_scan.hpp>
-
 #include <cudf/table/table.hpp>
-#include <duckdb/common/types.hpp>
+
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <duckdb/common/types.hpp>
+#include <op/scan/direct_block_scan.hpp>
 
 #include <memory>
 #include <vector>

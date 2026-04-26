@@ -78,7 +78,7 @@ struct bp_group_meta {
 /// The batched kernel launches one CTA per group (matching the original
 /// per-segment kernel's parallelism) while eliminating launch overhead.
 struct alignas(8) batched_bp_seg_desc {
-  const uint8_t* d_block;     ///< Device pointer to 256KB block data
+  const uint8_t* d_block;      ///< Device pointer to 256KB block data
   uint32_t block_offset;       ///< Offset within block to segment start
   uint32_t group_idx;          ///< Metadata group index within the segment (0-based)
   uint32_t group_row_count;    ///< Rows in this group (last group may be < 2048)

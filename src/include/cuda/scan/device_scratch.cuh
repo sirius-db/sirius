@@ -43,14 +43,14 @@
 namespace sirius::cuda::scan {
 
 struct arena_alloc {
-  void* ptr;          ///< Device pointer (arena slice or malloc'd).
-  bool needs_free;    ///< True if ptr was allocated via cudaMallocAsync fallback.
+  void* ptr;        ///< Device pointer (arena slice or malloc'd).
+  bool needs_free;  ///< True if ptr was allocated via cudaMallocAsync fallback.
 };
 
 namespace detail {
 
 struct device_scratch_arena {
-  void*  buf      = nullptr;
+  void* buf       = nullptr;
   size_t capacity = 0;
   size_t offset   = 0;
   size_t peak     = 0;
@@ -70,10 +70,7 @@ inline device_scratch_arena& get_tls_arena()
 }
 
 /// Round up `v` to the next multiple of `align` (power-of-two alignment).
-inline size_t align_up(size_t v, size_t align)
-{
-  return (v + align - 1) & ~(align - 1);
-}
+inline size_t align_up(size_t v, size_t align) { return (v + align - 1) & ~(align - 1); }
 
 }  // namespace detail
 
@@ -86,7 +83,7 @@ inline arena_alloc arena_allocate(size_t bytes, cudaStream_t stream, size_t alig
 {
   if (bytes == 0) return {nullptr, false};
 
-  auto& a = detail::get_tls_arena();
+  auto& a            = detail::get_tls_arena();
   size_t aligned_off = detail::align_up(a.offset, align);
   if (aligned_off + bytes <= a.capacity) {
     void* p  = static_cast<uint8_t*>(a.buf) + aligned_off;
@@ -97,7 +94,7 @@ inline arena_alloc arena_allocate(size_t bytes, cudaStream_t stream, size_t alig
 
   // Arena too small for this request — record for next-reset grow and
   // fall back to stream-ordered malloc. The caller will free on teardown.
-  a.peak = std::max(a.peak, aligned_off + bytes);
+  a.peak  = std::max(a.peak, aligned_off + bytes);
   void* p = nullptr;
   ::cudaMallocAsync(&p, bytes, stream);
   return {p, true};
@@ -119,12 +116,12 @@ inline void arena_reset(cudaStream_t stream)
     target        = std::max<size_t>(target, 1ULL << 20);  // floor at 1 MB
     target        = detail::align_up(target, 1ULL << 20);  // round to 1 MB
     if (a.buf) ::cudaFreeAsync(a.buf, stream);
-    a.buf = nullptr;
+    a.buf          = nullptr;
     cudaError_t rc = ::cudaMallocAsync(&a.buf, target, stream);
     if (rc != cudaSuccess) {
       ::cudaGetLastError();
-      SIRIUS_LOG_WARN("[decode_arena] grow to {} bytes failed: {}", target,
-                      ::cudaGetErrorString(rc));
+      SIRIUS_LOG_WARN(
+        "[decode_arena] grow to {} bytes failed: {}", target, ::cudaGetErrorString(rc));
       a.buf      = nullptr;
       a.capacity = 0;
     } else {
