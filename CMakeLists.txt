@@ -352,8 +352,10 @@ set(TEST_SOURCES
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
     test/cpp/helper/test_logical_type.cpp
+    test/cpp/integration/test_gpu_execution_alp.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
+    test/cpp/integration/test_gpu_execution_native_scan.cpp
     test/cpp/integration/test_transparent_execution.cpp
     test/cpp/memory/test_host_table_utils.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
