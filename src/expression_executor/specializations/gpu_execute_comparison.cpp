@@ -17,7 +17,6 @@
 // sirius
 #include <duckdb/common/enums/expression_type.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
-#include <operator/empty_str_check.cuh>
 #include <sirius/exception.hpp>
 
 // duckdb

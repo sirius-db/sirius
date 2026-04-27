@@ -8,10 +8,11 @@
 option(ENABLE_LEGACY_SIRIUS
        "Enable legacy Sirius code path (gpu_processing table function)" OFF)
 
-# Sources that are always compiled (shared types used by expression executor and
-# CUDA kernels: GPUColumn, GPUPipeline, GPUExecutor, operators, etc.)
-# cmake-format: off
+if(ENABLE_LEGACY_SIRIUS)
+  # Sources compiled only when the legacy entry point is enabled.
+  # cmake-format: off
 set(SIRIUS_LEGACY_SOURCES
+    ${CMAKE_CURRENT_LIST_DIR}/cpu_cache.cpp
     ${CMAKE_CURRENT_LIST_DIR}/expression_executor/gpu_expression_executor.cpp
     ${CMAKE_CURRENT_LIST_DIR}/expression_executor/gpu_expression_executor_state.cpp
     ${CMAKE_CURRENT_LIST_DIR}/expression_executor/specializations/gpu_execute_between.cpp
@@ -23,7 +24,9 @@ set(SIRIUS_LEGACY_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/expression_executor/specializations/gpu_execute_function.cpp
     ${CMAKE_CURRENT_LIST_DIR}/expression_executor/specializations/gpu_execute_operator.cpp
     ${CMAKE_CURRENT_LIST_DIR}/expression_executor/specializations/gpu_execute_reference.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/fallback.cpp
     ${CMAKE_CURRENT_LIST_DIR}/gpu_columns.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/gpu_buffer_manager.cpp
     ${CMAKE_CURRENT_LIST_DIR}/gpu_executor.cpp
     ${CMAKE_CURRENT_LIST_DIR}/gpu_meta_pipeline.cpp
     ${CMAKE_CURRENT_LIST_DIR}/gpu_physical_operator.cpp
@@ -53,42 +56,69 @@ set(SIRIUS_LEGACY_SOURCES
     PARENT_SCOPE)
 
 set(SIRIUS_LEGACY_CUDA_SOURCES
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/allocator.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/communication.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/print.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/utils.cu
     ${CMAKE_CURRENT_LIST_DIR}/cuda/expression_executor/gpu_dispatch_materialize.cu
     ${CMAKE_CURRENT_LIST_DIR}/cuda/expression_executor/gpu_dispatch_select.cu
     ${CMAKE_CURRENT_LIST_DIR}/cuda/expression_executor/gpu_dispatch_string.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/cudf/cudf_aggregate.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/cudf/cudf_duplicate_elimination.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/cudf/cudf_groupby.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/cudf/cudf_join.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/cudf/cudf_orderby.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/cudf/cudf_utils.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/operator/arbitrary_expression.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/operator/comparison_expression.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/operator/empty_str_check.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/operator/hash_join_inner.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/operator/hash_join_right.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/operator/hash_join_single.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/operator/materialize.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/operator/nested_loop_join.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/operator/strings_matching.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/operator/strlen_from_offsets.cu
+    ${CMAKE_CURRENT_LIST_DIR}/cuda/operator/substring.cu
     PARENT_SCOPE)
 
-# Sources only compiled when the legacy entry point is enabled
-if(ENABLE_LEGACY_SIRIUS)
-  set(SIRIUS_LEGACY_CONDITIONAL_SOURCES
-      ${CMAKE_CURRENT_LIST_DIR}/gpu_context.cpp
-      ${CMAKE_CURRENT_LIST_DIR}/gpu_physical_plan_generator.cpp
-      ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_aggregate.cpp
-      ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_column_data_get.cpp
-      ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_comparison_join.cpp
-      ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_cte.cpp
-      ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_delim_get.cpp
-      ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_delim_join.cpp
-      ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_dummy_scan.cpp
-      ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_empty_result.cpp
-      ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_expression_get.cpp
-      ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_filter.cpp
-      ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_get.cpp
-      ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_limit.cpp
-      ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_order.cpp
-      ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_projection.cpp
-      ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_recursive_cte.cpp
-      ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_top_n.cpp
-      PARENT_SCOPE)
-  set(SIRIUS_LEGACY_COMPILE_DEFINITIONS SIRIUS_ENABLE_LEGACY PARENT_SCOPE)
-  message(STATUS "Legacy Sirius code path (gpu_processing) is ENABLED")
-else()
-  set(SIRIUS_LEGACY_CONDITIONAL_SOURCES "" PARENT_SCOPE)
-  set(SIRIUS_LEGACY_COMPILE_DEFINITIONS "" PARENT_SCOPE)
-  message(STATUS "Legacy Sirius code path (gpu_processing) is DISABLED")
-endif()
-# cmake-format: on
+set(SIRIUS_LEGACY_CONDITIONAL_SOURCES
+    ${CMAKE_CURRENT_LIST_DIR}/gpu_context.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/gpu_physical_plan_generator.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_aggregate.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_column_data_get.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_comparison_join.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_cte.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_delim_get.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_delim_join.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_dummy_scan.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_empty_result.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_expression_get.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_filter.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_get.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_limit.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_order.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_projection.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_recursive_cte.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_top_n.cpp
+    PARENT_SCOPE)
+
+set(SIRIUS_LEGACY_TEST_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../test/cpp/memory_management/test_cpu_cache.cpp
+    PARENT_SCOPE)
 
 set(SIRIUS_LEGACY_INCLUDE_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/../include/legacy"
     PARENT_SCOPE)
+set(SIRIUS_LEGACY_COMPILE_DEFINITIONS SIRIUS_ENABLE_LEGACY PARENT_SCOPE)
+message(STATUS "Legacy Sirius code path (gpu_processing) is ENABLED")
+else()
+  set(SIRIUS_LEGACY_SOURCES "" PARENT_SCOPE)
+  set(SIRIUS_LEGACY_CUDA_SOURCES "" PARENT_SCOPE)
+  set(SIRIUS_LEGACY_CONDITIONAL_SOURCES "" PARENT_SCOPE)
+  set(SIRIUS_LEGACY_TEST_SOURCES "" PARENT_SCOPE)
+  set(SIRIUS_LEGACY_INCLUDE_DIR "" PARENT_SCOPE)
+  set(SIRIUS_LEGACY_COMPILE_DEFINITIONS "" PARENT_SCOPE)
+  message(STATUS "Legacy Sirius code path (gpu_processing) is DISABLED")
+endif()
+# cmake-format: on

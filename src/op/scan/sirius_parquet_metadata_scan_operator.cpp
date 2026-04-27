@@ -18,7 +18,7 @@
 #include <log/logging.hpp>
 #include <op/scan/hive_partition.hpp>  // build_partition_inject_fn
 #include <op/scan/parquet_scan_operator_data.hpp>
-#include <op/scan/parquet_scan_task.hpp>  // detail::make_selected_column_indices, detail::projected_columns_are_flat
+#include <op/scan/parquet_scan_task.hpp>       // detail::make_selected_column_indices
 #include <op/scan/parquet_schema_mapping.hpp>  // detail::leaf_indices_for_column
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_parquet_scan_operator.hpp>
@@ -200,35 +200,36 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
   // Filter
   std::shared_ptr<translated_expression> ast_filter;
   if (_has_filter) {
-    /// KEVIN: there is a bug hiding here that I haven't been able to find yet...
-    // if (!_column_name_by_ref.empty()) {
-    //   gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
-    //   auto name_resolver = [this](duckdb::idx_t ref_index) -> std::string {
-    //     return _column_name_by_ref.at(ref_index);
-    //   };
-    //   auto optional_filter =
-    //     translator.translate_expression_with_names(*_duckdb_filter_expression, name_resolver);
-    //   if (optional_filter) {
-    //     ast_filter = std::make_shared<translated_expression>(std::move(*optional_filter));
-    //     result->reader_options->set_filter(ast_filter->back());
-    //     result->filter_expression = ast_filter;
-    //     SIRIUS_LOG_DEBUG(
-    //       "[sirius_parquet_metadata_scan_operator] Successfully translated filter expression for
-    //       " "pushdown.");
-    //   } else {
-    //     result->filter_expression = _duckdb_filter_expression;
-    //     SIRIUS_LOG_DEBUG(
-    //       "[sirius_parquet_metadata_scan_operator] Failed to translate filter expression for "
-    //       "pushdown. Filter will be applied in the GPU scan operator.");
-    //   }
-    // } else {
-    //   // Column names were not provided; AST translation requires column name references.
-    //   result->filter_expression = _duckdb_filter_expression;
-    //   SIRIUS_LOG_DEBUG(
-    //     "[sirius_parquet_metadata_scan_operator] Column names not available for AST filter "
-    //     "translation. Filter will be applied in the GPU scan operator.");
-    // }
-    result->filter_expression          = _duckdb_filter_expression;
+    if (!_column_name_by_ref.empty()) {
+      gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
+      auto name_resolver = [this](duckdb::idx_t ref_index) -> std::string {
+        return _column_name_by_ref.at(ref_index);
+      };
+      auto optional_filter =
+        translator.translate_expression_with_names(*_duckdb_filter_expression, name_resolver);
+      if (optional_filter) {
+        stream.synchronize();  // Ensure scalars are materialized for downstream operators executing
+                               // in other streams.
+        ast_filter = std::make_shared<translated_expression>(std::move(*optional_filter));
+        result->reader_options->set_filter(ast_filter->back());
+        result->filter_expression = ast_filter;
+        SIRIUS_LOG_DEBUG(
+          "[sirius_parquet_metadata_scan_operator] Successfully translated filter expression for "
+          "pushdown ({} scalar literals).",
+          ast_filter->owned_literals.size());
+      } else {
+        result->filter_expression = _duckdb_filter_expression;
+        SIRIUS_LOG_DEBUG(
+          "[sirius_parquet_metadata_scan_operator] Failed to translate filter expression for "
+          "pushdown. Filter will be applied in the GPU scan operator.");
+      }
+    } else {
+      // Column names were not provided; AST translation requires column name references.
+      result->filter_expression = _duckdb_filter_expression;
+      SIRIUS_LOG_DEBUG(
+        "[sirius_parquet_metadata_scan_operator] Column names not available for AST filter "
+        "translation. Filter will be applied in the GPU scan operator.");
+    }
     result->post_filter_projection_ids = _post_filter_projection_ids;
   }
 
@@ -247,12 +248,6 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
       cudf::host_span<uint8_t const>(footer_buffer->data(), footer_buffer->size()),
       *result->reader_options);
     auto metadata = reader.parquet_metadata();
-    if (_is_projected && !detail::projected_columns_are_flat(metadata, _projected_column_names)) {
-      /// TODO: Support nested column schemas with projection.
-      throw std::runtime_error(
-        "[sirius_parquet_metadata_scan_operator] Parquet scans with projections currently only "
-        "support flat projected columns.");
-    }
 
     //===----------Resolve selected DuckDB columns to parquet column chunk indices----------===//
     // row_group.columns is indexed in parquet schema-leaf order (preorder), which can differ from
@@ -261,19 +256,18 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
     std::vector<std::size_t> selected_chunk_indices;
     std::unordered_set<std::size_t> pure_filter_chunk_indices;
     if (_is_projected) {
-      selected_chunk_indices.reserve(_projected_column_names.size());
       for (std::size_t k = 0; k < _projected_column_names.size(); ++k) {
         auto leaves = detail::leaf_indices_for_column(metadata, _projected_column_names[k]);
-        // projected_columns_are_flat (checked above) guarantees exactly one leaf per name.
-        if (leaves.size() != 1) {
-          throw std::runtime_error(
-            "[sirius_parquet_metadata_scan_operator] Projected column '" +
-            _projected_column_names[k] +
-            "' did not resolve to exactly one parquet leaf in file: " + file_path);
+        if (leaves.empty()) {
+          throw std::runtime_error("[sirius_parquet_metadata_scan_operator] Projected column '" +
+                                   _projected_column_names[k] +
+                                   "' not found in parquet file: " + file_path);
         }
-        selected_chunk_indices.push_back(leaves.front());
-        if (_pure_filter_column_indices.contains(_selected_column_indices[k])) {
-          pure_filter_chunk_indices.insert(leaves.front());
+        bool const is_pure_filter =
+          _pure_filter_column_indices.contains(_selected_column_indices[k]);
+        for (auto const leaf : leaves) {
+          selected_chunk_indices.push_back(leaf);
+          if (is_pure_filter) { pure_filter_chunk_indices.insert(leaf); }
         }
       }
     }
@@ -380,11 +374,6 @@ void sirius_parquet_metadata_scan_operator::sink(const operator_data& input_data
       "expected partitioned_parquet_metadata.");
   }
   _gpu_scan->accumulate_metadata(*metadata);
-}
-
-void sirius_parquet_metadata_scan_operator::finalize_operator()
-{
-  _gpu_scan->finalize_partitions();
 }
 
 }  // namespace sirius::op::scan

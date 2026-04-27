@@ -140,7 +140,6 @@ add_subdirectory(rust/crates/telemetry/bridge)
 set(EXTENSION_SOURCES
     src/config.cpp
     src/helper/type_conversions.cpp
-    src/cpu_cache.cpp
     src/debug_utils.cpp
     src/creator/task_creator.cpp
     src/data/host_parquet_representation.cpp
@@ -161,8 +160,6 @@ set(EXTENSION_SOURCES
     src/expression_executor/specializations/gpu_execute_function.cpp
     src/expression_executor/specializations/gpu_execute_operator.cpp
     src/expression_executor/specializations/gpu_execute_reference.cpp
-    src/fallback.cpp
-    src/gpu_buffer_manager.cpp
     src/memory/defragmenter_oom_policy.cpp
     src/memory/sirius_memory_reservation_manager.cpp
     src/op/aggregate/aggregate_op_util.cpp
@@ -182,6 +179,7 @@ set(EXTENSION_SOURCES
     src/op/scan/iceberg_metadata_reader.cpp
     src/op/scan/iceberg_scan_task.cpp
     src/op/scan/positional_delete_filter.cpp
+    src/op/scan/puffin_reader.cpp
     src/op/scan/parquet_scan_task.cpp
     src/op/scan/parquet_schema_mapping.cpp
     src/op/scan/prefetched_data_source.cpp
@@ -254,41 +252,15 @@ set(EXTENSION_SOURCES
     src/transparent/sirius_optimizer_extension.cpp
     src/util/stream_check_wrapper.cpp
     src/util/segfault_backtrace_handler.cpp)
+# cmake-format: on
 
-# Legacy Sirius — all config lives in src/legacy/CMakeLists.txt.
+# Legacy Sirius — all legacy-specific config lives in src/legacy/CMakeLists.txt.
 # Deleting src/legacy/ cleanly removes legacy build support.
+set(CUDA_SOURCES src/op/scan/equality_delete_mask.cu)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
   add_subdirectory(src/legacy)
   list(APPEND EXTENSION_SOURCES ${SIRIUS_LEGACY_SOURCES}
        ${SIRIUS_LEGACY_CONDITIONAL_SOURCES})
-endif()
-
-set(CUDA_SOURCES
-    src/cuda/allocator.cu
-    src/cuda/communication.cu
-    src/cuda/iceberg/equality_delete_mask.cu
-    src/cuda/cudf/cudf_aggregate.cu
-    src/cuda/cudf/cudf_duplicate_elimination.cu
-    src/cuda/cudf/cudf_groupby.cu
-    src/cuda/cudf/cudf_join.cu
-    src/cuda/cudf/cudf_orderby.cu
-    src/cuda/cudf/cudf_utils.cu
-    src/cuda/operator/arbitrary_expression.cu
-    src/cuda/operator/comparison_expression.cu
-    src/cuda/operator/hash_join_inner.cu
-    src/cuda/operator/hash_join_right.cu
-    src/cuda/operator/hash_join_single.cu
-    src/cuda/operator/materialize.cu
-    src/cuda/operator/nested_loop_join.cu
-    src/cuda/operator/strings_matching.cu
-    src/cuda/operator/substring.cu
-    src/cuda/operator/strlen_from_offsets.cu
-    src/cuda/operator/empty_str_check.cu
-    src/cuda/print.cu
-    src/cuda/utils.cu)
-# cmake-format: on
-
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
   list(APPEND CUDA_SOURCES ${SIRIUS_LEGACY_CUDA_SOURCES})
 endif()
 
@@ -382,7 +354,6 @@ set(TEST_SOURCES
     test/cpp/integration/test_transparent_execution.cpp
     test/cpp/memory/test_host_table_utils.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
-    test/cpp/memory_management/test_cpu_cache.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_count_distinct.cpp
@@ -421,6 +392,10 @@ set(TEST_SOURCES
     test/cpp/utils/utils.cpp)
 # cmake-format: on
 
+if(SIRIUS_LEGACY_TEST_SOURCES)
+  list(APPEND TEST_SOURCES ${SIRIUS_LEGACY_TEST_SOURCES})
+endif()
+
 add_executable(sirius_unittest ${TEST_SOURCES})
 
 if(VCPKG_BUILD)
@@ -456,3 +431,8 @@ target_compile_definitions(
     $<BUILD_INTERFACE:SIRIUS_DEFAULT_LOG_DIR="${CMAKE_BINARY_DIR}/log">
     $<BUILD_INTERFACE:SIRIUS_UNITTEST_LOG_DIR="${CMAKE_CURRENT_BINARY_DIR}/test/cpp/log">
     $<BUILD_INTERFACE:SIRIUS_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}">)
+
+if(SIRIUS_LEGACY_COMPILE_DEFINITIONS)
+  target_compile_definitions(sirius_unittest
+                             PRIVATE ${SIRIUS_LEGACY_COMPILE_DEFINITIONS})
+endif()

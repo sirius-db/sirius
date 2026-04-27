@@ -275,6 +275,79 @@ inline cudf::data_type GetCudfType(const LogicalType& logical_type)
   }
 }
 
+/**
+ * @brief Convert a DuckDB Value to a cudf scalar.
+ *
+ * This is the shared type-conversion bridge between DuckDB's type system
+ * and cudf's scalar types. Used by:
+ *   - Partition column injection (constant columns from hive path values)
+ *   - Expression translator (AST literal nodes) — can be refactored to use this
+ *
+ * @param val          The DuckDB value to convert.
+ * @param logical_type The DuckDB logical type (determines cudf type via GetCudfType).
+ * @param stream       CUDA stream for device operations.
+ * @return A cudf scalar holding the same value.
+ * @throws InvalidInputException if the type is not supported by GetCudfType.
+ */
+inline std::unique_ptr<cudf::scalar> DuckDBValueToCudfScalar(Value const& val,
+                                                             LogicalType const& logical_type,
+                                                             rmm::cuda_stream_view stream)
+{
+  auto cudf_type = GetCudfType(logical_type);
+
+  switch (cudf_type.id()) {
+    case cudf::type_id::INT8:
+      return std::make_unique<cudf::numeric_scalar<int8_t>>(val.GetValue<int8_t>(), true, stream);
+    case cudf::type_id::INT16:
+      return std::make_unique<cudf::numeric_scalar<int16_t>>(val.GetValue<int16_t>(), true, stream);
+    case cudf::type_id::INT32:
+      return std::make_unique<cudf::numeric_scalar<int32_t>>(val.GetValue<int32_t>(), true, stream);
+    case cudf::type_id::INT64:
+      return std::make_unique<cudf::numeric_scalar<int64_t>>(val.GetValue<int64_t>(), true, stream);
+    case cudf::type_id::UINT8:
+      return std::make_unique<cudf::numeric_scalar<uint8_t>>(val.GetValue<uint8_t>(), true, stream);
+    case cudf::type_id::UINT16:
+      return std::make_unique<cudf::numeric_scalar<uint16_t>>(
+        val.GetValue<uint16_t>(), true, stream);
+    case cudf::type_id::UINT32:
+      return std::make_unique<cudf::numeric_scalar<uint32_t>>(
+        val.GetValue<uint32_t>(), true, stream);
+    case cudf::type_id::UINT64:
+      return std::make_unique<cudf::numeric_scalar<uint64_t>>(
+        val.GetValue<uint64_t>(), true, stream);
+    case cudf::type_id::FLOAT32:
+      return std::make_unique<cudf::numeric_scalar<float>>(val.GetValue<float>(), true, stream);
+    case cudf::type_id::FLOAT64:
+      return std::make_unique<cudf::numeric_scalar<double>>(val.GetValue<double>(), true, stream);
+    case cudf::type_id::BOOL8:
+      return std::make_unique<cudf::numeric_scalar<bool>>(val.GetValue<bool>(), true, stream);
+    case cudf::type_id::STRING:
+      return std::make_unique<cudf::string_scalar>(val.GetValue<std::string>(), true, stream);
+    case cudf::type_id::TIMESTAMP_DAYS:
+      return std::make_unique<cudf::numeric_scalar<int32_t>>(val.GetValue<int32_t>(), true, stream);
+    case cudf::type_id::TIMESTAMP_SECONDS:
+    case cudf::type_id::TIMESTAMP_MILLISECONDS:
+    case cudf::type_id::TIMESTAMP_MICROSECONDS:
+    case cudf::type_id::TIMESTAMP_NANOSECONDS:
+      return std::make_unique<cudf::numeric_scalar<int64_t>>(val.GetValue<int64_t>(), true, stream);
+    case cudf::type_id::DECIMAL32:
+      return std::make_unique<cudf::fixed_point_scalar<numeric::decimal32>>(
+        val.GetValueUnsafe<typename numeric::decimal32::rep>(),
+        numeric::scale_type{-DecimalType::GetScale(logical_type)},
+        true,
+        stream);
+    case cudf::type_id::DECIMAL64:
+      return std::make_unique<cudf::fixed_point_scalar<numeric::decimal64>>(
+        val.GetValueUnsafe<typename numeric::decimal64::rep>(),
+        numeric::scale_type{-DecimalType::GetScale(logical_type)},
+        true,
+        stream);
+    // For unsupported types (DECIMAL128, STRUCT, etc.), fall back to string.
+    // Better than crashing — the column will be STRING instead of native type.
+    default: return std::make_unique<cudf::string_scalar>(val.ToString(), true, stream);
+  }
+}
+
 inline std::unique_ptr<cudf::table> make_empty_like(cudf::table_view input)
 {
   std::vector<std::unique_ptr<cudf::column>> empty_cols;

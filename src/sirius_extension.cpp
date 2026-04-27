@@ -42,8 +42,8 @@ extern "C" int cudaProfilerStop();
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 // #include "from_substrait.hpp"
-#include "gpu_buffer_manager.hpp"
 #ifdef SIRIUS_ENABLE_LEGACY
+#include "gpu_buffer_manager.hpp"
 #include "gpu_context.hpp"
 #include "gpu_physical_plan_generator.hpp"
 #endif
@@ -58,8 +58,10 @@ extern "C" int cudaProfilerStop();
 
 namespace duckdb {
 
-const std::string PINNED_MEMORY_PARAM_KEY   = "pinned_memory_size";
+const std::string PINNED_MEMORY_PARAM_KEY = "pinned_memory_size";
+#ifdef SIRIUS_ENABLE_LEGACY
 bool SiriusExtension::buffer_is_initialized = false;
+#endif
 
 constexpr std::string QUERY_LABEL_PARAM_KEY = "query_label";
 
@@ -535,6 +537,7 @@ static unique_ptr<LogicalOperator> OptimizePlan(ClientContext& context,
   return plan;
 }
 
+#ifdef SIRIUS_ENABLE_LEGACY
 struct GPUBufferInitFunctionData : public TableFunctionData {
   GPUBufferInitFunctionData() {}
   bool finished = false;
@@ -646,6 +649,7 @@ void SiriusExtension::GPUBufferInitFunction(ClientContext& context,
   }
   data.finished = true;
 }
+#endif  // SIRIUS_ENABLE_LEGACY
 
 static unique_ptr<FunctionData> ProfilerBind(ClientContext& context,
                                              TableFunctionBindInput& input,
@@ -732,6 +736,8 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
 {
   auto transaction = CatalogTransaction::GetSystemTransaction(instance);
   auto& catalog    = Catalog::GetSystemCatalog(instance);
+
+#ifdef SIRIUS_ENABLE_LEGACY
   TableFunction gpu_buffer_init("gpu_buffer_init",
                                 {LogicalType::VARCHAR, LogicalType::VARCHAR},
                                 GPUBufferInitFunction,
@@ -740,7 +746,6 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   CreateTableFunctionInfo gpu_buffer_init_info(gpu_buffer_init);
   catalog.CreateTableFunction(transaction, gpu_buffer_init_info);
 
-#ifdef SIRIUS_ENABLE_LEGACY
   RegisterLegacyGPUFunctions(transaction, catalog);
 #endif
 
