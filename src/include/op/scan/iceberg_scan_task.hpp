@@ -71,6 +71,7 @@ class iceberg_scan_task_global_state : public parquet_scan_task_global_state {
   struct init_data {
     std::vector<std::string> file_paths;
     std::vector<size_t> selected_column_indices;
+    size_t extra_eq_delete_columns = 0;  ///< columns force-added for eq delete key matching
   };
 
   /// Extract file paths and column indices from the scan operator.
@@ -91,7 +92,8 @@ class iceberg_scan_task_global_state : public parquet_scan_task_global_state {
    * @brief Read the delete files listed on @p scan_op, build filters, and
    * install the pipeline's post-convert hook if there are any deletes to apply.
    */
-  void build_delete_pipeline(sirius_physical_iceberg_scan* scan_op);
+  void build_delete_pipeline(sirius_physical_iceberg_scan* scan_op,
+                             size_t extra_eq_delete_columns = 0);
 
   // -------------------------------------------------------------------------
   // Fields
