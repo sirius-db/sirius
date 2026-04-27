@@ -148,6 +148,7 @@ set(EXTENSION_SOURCES
     src/downgrade/downgrade_executor.cpp
     src/expression/expression.cpp
     src/expression/join_condition.cpp
+    src/expression/value.cpp
     src/expression_executor/expression_executor_strategy.cpp
     src/expression_executor/gpu_expression_executor.cpp
     src/expression_executor/gpu_expression_translator.cpp
