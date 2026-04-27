@@ -201,19 +201,15 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
   std::shared_ptr<translated_expression> ast_filter;
   if (_has_filter) {
     if (!_column_name_by_ref.empty()) {
-      // Allocate scalar literals on the task stream but synchronize before returning
-      // to ensure all device allocations are complete and visible to other streams.
-      // Without this, downstream GPU_PARQUET_SCAN tasks that access the scalars on a
-      // different stream may hit cudaErrorIllegalAddress due to CUDA stream-ordering
-      // semantics in the async memory allocator.
       gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
       auto name_resolver = [this](duckdb::idx_t ref_index) -> std::string {
         return _column_name_by_ref.at(ref_index);
       };
       auto optional_filter =
         translator.translate_expression_with_names(*_duckdb_filter_expression, name_resolver);
-      stream.synchronize();
       if (optional_filter) {
+        stream.synchronize();  // Ensure scalars are materialized for downstream operators executing
+                               // in other streams.
         ast_filter = std::make_shared<translated_expression>(std::move(*optional_filter));
         result->reader_options->set_filter(ast_filter->back());
         result->filter_expression = ast_filter;

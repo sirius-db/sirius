@@ -96,13 +96,14 @@ bool sirius_gpu_parquet_scan_operator::all_ports_empty()
 std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::get_next_task_input_data()
 {
   std::size_t idx;
+  partition_entry entry;
   {
     std::lock_guard<std::mutex> lock(_metadata_mutex);
     if (_next_partition_idx >= _partition_index.size()) { return nullptr; }
-    idx = _next_partition_idx++;
+    idx   = _next_partition_idx++;
+    entry = _partition_index[idx];
   }
 
-  auto const& entry    = _partition_index[idx];
   auto meta            = entry.metadata;
   auto const& rg_range = meta->row_group_partitions[entry.partition_idx];
 
