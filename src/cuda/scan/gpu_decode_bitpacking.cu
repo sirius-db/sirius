@@ -29,10 +29,11 @@
 //   ~24K → ~1K kernel launches; same per-CTA decode rate, no launch tail.
 //===----------------------------------------------------------------------===//
 
-#include "cuda/scan/device_scratch.cuh"
 #include "cuda/scan/gpu_decode.cuh"
 #include "cuda/scan/pinned_bounce.cuh"
 #include "log/logging.hpp"
+
+#include <rmm/device_buffer.hpp>
 
 #include <cub/cub.cuh>
 #include <cuda_runtime.h>
@@ -261,25 +262,22 @@ template <typename T>
 static void decode_typed_batched(const batched_bp_seg_desc* descs,
                                  uint32_t num_segments,
                                  void* d_output,
-                                 rmm::cuda_stream_view stream)
+                                 rmm::cuda_stream_view stream,
+                                 rmm::device_async_resource_ref mr)
 {
   if (num_segments == 0) return;
 
-  // Upload descriptors to device via thread-local scratch arena. After the
-  // first few batches the arena is sized to hold this and we skip
-  // malloc/free entirely.
+  // Stage descriptors on device through the supplied memory resource so the
+  // allocation is tracked by the reservation/spill system. mr is pool-backed,
+  // so the per-call cost is amortized across the pipeline's lifetime.
   //
   // bounce_h2d_async exists because pageable→device cudaMemcpyAsync is
   // silently synchronous via the driver's internal pinned bounce buffer
   // (~450 µs/call on A100). We user-space-bounce through TLS pinned slots
   // so the DMA hits the true async fast path. See pinned_bounce.cuh.
-  //
-  // TODO: descriptor allocations should sub-allocate from cucascade's
-  // fixed_size_host_memory_resource (1 MB blocks) so they're tracked by
-  // the reservation system. The arena is a stop-gap that bypasses that.
   size_t desc_bytes = num_segments * sizeof(batched_bp_seg_desc);
-  auto desc_alloc   = arena_allocate(desc_bytes, stream.value());
-  auto* d_descs     = static_cast<batched_bp_seg_desc*>(desc_alloc.ptr);
+  rmm::device_buffer desc_buf(desc_bytes, stream, mr);
+  auto* d_descs = static_cast<batched_bp_seg_desc*>(desc_buf.data());
   bounce_h2d_async(d_descs, descs, desc_bytes, stream.value());
 
   // BLOCK_DIM=256 was tuned empirically on SM75/80: 8 warps fully covers
@@ -308,8 +306,6 @@ static void decode_typed_batched(const batched_bp_seg_desc* descs,
 
   kernel_decode_bitpacking_batched<T><<<num_segments, BLOCK_DIM, shmem_bytes, stream.value()>>>(
     d_descs, static_cast<T*>(d_output), num_segments);
-
-  if (desc_alloc.needs_free) { cudaFreeAsync(d_descs, stream.value()); }
 }
 
 void gpu_decode_bitpacking_batched(const batched_bp_seg_desc* descs,
@@ -317,24 +313,25 @@ void gpu_decode_bitpacking_batched(const batched_bp_seg_desc* descs,
                                    void* d_output,
                                    uint32_t type_size,
                                    bool is_signed,
-                                   rmm::cuda_stream_view stream)
+                                   rmm::cuda_stream_view stream,
+                                   rmm::device_async_resource_ref mr)
 {
   switch (type_size) {
     case 1:
-      is_signed ? decode_typed_batched<int8_t>(descs, num_segments, d_output, stream)
-                : decode_typed_batched<uint8_t>(descs, num_segments, d_output, stream);
+      is_signed ? decode_typed_batched<int8_t>(descs, num_segments, d_output, stream, mr)
+                : decode_typed_batched<uint8_t>(descs, num_segments, d_output, stream, mr);
       break;
     case 2:
-      is_signed ? decode_typed_batched<int16_t>(descs, num_segments, d_output, stream)
-                : decode_typed_batched<uint16_t>(descs, num_segments, d_output, stream);
+      is_signed ? decode_typed_batched<int16_t>(descs, num_segments, d_output, stream, mr)
+                : decode_typed_batched<uint16_t>(descs, num_segments, d_output, stream, mr);
       break;
     case 4:
-      is_signed ? decode_typed_batched<int32_t>(descs, num_segments, d_output, stream)
-                : decode_typed_batched<uint32_t>(descs, num_segments, d_output, stream);
+      is_signed ? decode_typed_batched<int32_t>(descs, num_segments, d_output, stream, mr)
+                : decode_typed_batched<uint32_t>(descs, num_segments, d_output, stream, mr);
       break;
     case 8:
-      is_signed ? decode_typed_batched<int64_t>(descs, num_segments, d_output, stream)
-                : decode_typed_batched<uint64_t>(descs, num_segments, d_output, stream);
+      is_signed ? decode_typed_batched<int64_t>(descs, num_segments, d_output, stream, mr)
+                : decode_typed_batched<uint64_t>(descs, num_segments, d_output, stream, mr);
       break;
     default:
       // Match the dispatcher's pattern: an unsupported width here means

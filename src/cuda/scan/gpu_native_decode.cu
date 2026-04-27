@@ -464,8 +464,13 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(column_scan_result& col_
       }
     }
 
-    gpu_decode_bitpacking_batched(
-      descs.data(), static_cast<uint32_t>(descs.size()), d_output, type_size, is_signed, stream);
+    gpu_decode_bitpacking_batched(descs.data(),
+                                  static_cast<uint32_t>(descs.size()),
+                                  d_output,
+                                  type_size,
+                                  is_signed,
+                                  stream,
+                                  mr);
 
     if (d_fb_staging) cudaFreeAsync(d_fb_staging, stream.value());
   }

@@ -12,6 +12,7 @@
 #include "operator/scan/decode_test_utils.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <catch.hpp>
 
@@ -55,7 +56,8 @@ std::vector<T> decode_one_segment(std::vector<uint8_t> const& block_bytes,
                                 d_output.ptr,
                                 static_cast<uint32_t>(sizeof(T)),
                                 is_signed,
-                                stream);
+                                stream,
+                                cudf::get_current_device_resource_ref());
 
   return download<T>(d_output.ptr, row_count, cstream);
 }
@@ -213,8 +215,13 @@ TEST_CASE("bitpacking batched: INVALID mode in metadata writes nothing",
   desc.global_row_offset = 0;
 
   std::vector<batched_bp_seg_desc> descs{desc};
-  gpu_decode_bitpacking_batched(
-    descs.data(), 1, d_output.ptr, sizeof(int32_t), /*is_signed=*/true, stream);
+  gpu_decode_bitpacking_batched(descs.data(),
+                                1,
+                                d_output.ptr,
+                                sizeof(int32_t),
+                                /*is_signed=*/true,
+                                stream,
+                                cudf::get_current_device_resource_ref());
 
   auto out = sirius::test::decode::download<int32_t>(d_output.ptr, row_count, cstream);
   for (auto v : out)
@@ -248,8 +255,13 @@ TEST_CASE("bitpacking batched: corrupt metadata_end bails out without OOB read",
   desc.group_row_count = row_count;
   std::vector<batched_bp_seg_desc> descs{desc};
 
-  gpu_decode_bitpacking_batched(
-    descs.data(), 1, d_output.ptr, sizeof(int32_t), /*is_signed=*/true, stream);
+  gpu_decode_bitpacking_batched(descs.data(),
+                                1,
+                                d_output.ptr,
+                                sizeof(int32_t),
+                                /*is_signed=*/true,
+                                stream,
+                                cudf::get_current_device_resource_ref());
   auto out = sirius::test::decode::download<int32_t>(d_output.ptr, row_count, cstream);
   for (auto v : out)
     REQUIRE(static_cast<uint32_t>(v) == 0x5A5A5A5A);
@@ -285,8 +297,13 @@ TEST_CASE("bitpacking batched: width > sizeof(T)*8 bails out without OOB read",
   desc.group_row_count = row_count;
   std::vector<batched_bp_seg_desc> descs{desc};
 
-  gpu_decode_bitpacking_batched(
-    descs.data(), 1, d_output.ptr, sizeof(int32_t), /*is_signed=*/true, stream);
+  gpu_decode_bitpacking_batched(descs.data(),
+                                1,
+                                d_output.ptr,
+                                sizeof(int32_t),
+                                /*is_signed=*/true,
+                                stream,
+                                cudf::get_current_device_resource_ref());
   auto out = sirius::test::decode::download<int32_t>(d_output.ptr, row_count, cstream);
   for (auto v : out)
     REQUIRE(v == -1);
@@ -310,8 +327,13 @@ TEST_CASE("bitpacking batched: unsupported type_size throws viability invariant"
   desc.group_row_count = 8;
   std::vector<batched_bp_seg_desc> descs{desc};
 
-  REQUIRE_THROWS_AS(gpu_decode_bitpacking_batched(
-                      descs.data(), 1, d_output.ptr, /*type_size=*/3, /*is_signed=*/true, stream),
+  REQUIRE_THROWS_AS(gpu_decode_bitpacking_batched(descs.data(),
+                                                  1,
+                                                  d_output.ptr,
+                                                  /*type_size=*/3,
+                                                  /*is_signed=*/true,
+                                                  stream,
+                                                  cudf::get_current_device_resource_ref()),
                     std::runtime_error);
 }
 
@@ -341,7 +363,8 @@ TEST_CASE("bitpacking batched: multi-segment dispatch packs distinct outputs",
                                 d_output.ptr,
                                 /*type_size=*/4,
                                 /*is_signed=*/true,
-                                stream);
+                                stream,
+                                cudf::get_current_device_resource_ref());
 
   auto out = download<int32_t>(d_output.ptr, rows_a + rows_b, cstream);
   for (uint32_t i = 0; i < rows_a; ++i)

@@ -26,6 +26,7 @@
 //===----------------------------------------------------------------------===//
 
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <cuda_runtime.h>
 
@@ -80,12 +81,17 @@ struct alignas(8) batched_bp_seg_desc {
 /// @param type_size     Size of the output type in bytes (1, 2, 4, or 8)
 /// @param is_signed     Whether the type is signed
 /// @param stream        CUDA stream
+/// @param mr            Device memory resource — used for the descriptor
+///                      staging buffer so the allocation is tracked by the
+///                      reservation system rather than going through bare
+///                      cudaMallocAsync
 void gpu_decode_bitpacking_batched(const batched_bp_seg_desc* descs,
                                    uint32_t num_segments,
                                    void* d_output,
                                    uint32_t type_size,
                                    bool is_signed,
-                                   rmm::cuda_stream_view stream);
+                                   rmm::cuda_stream_view stream,
+                                   rmm::device_async_resource_ref mr);
 
 //===----------------------------------------------------------------------===//
 // Device functions: inline bitpacking extraction (for future operator fusion)
