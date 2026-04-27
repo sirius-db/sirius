@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: Multi-GPU SQL Pipeline Fix
-status: verifying
-stopped_at: "Completed 09-04-PLAN.md (VERDICT: PARTIAL - SF100 ship-gate PASS, unit-test regression scoped to Phase 10)"
-last_updated: "2026-04-24T15:18:22.534Z"
-last_activity: 2026-04-24
+status: executing
+stopped_at: "Completed 10-01-PLAN.md (bisect: regressing_commit=NONE, SIGSEGV test-ordering dependent)"
+last_updated: "2026-04-27T15:16:52.173Z"
+last_activity: 2026-04-27
 progress:
-  total_phases: 2
-  completed_phases: 0
-  total_plans: 14
-  completed_plans: 11
+  total_phases: 3
+  completed_phases: 1
+  total_plans: 18
+  completed_plans: 13
   percent: 100
 ---
 
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-21)
 
 **Core value:** Any query can transparently execute across every GPU on the node — tasks are scheduled to the GPU where their input data already resides, memory pressure is absorbed by downgrading to the correct NUMA domain, and parquet I/O is routed through a multi-GPU-safe backend.
-**Current focus:** Phase 09 — scan-task-distributor-batch-ownership-affinity
+**Current focus:** Phase 10 — table-function-form-gpu-execution-sigsegv-fix
 
 ## Current Position
 
-Phase: 09 (scan-task-distributor-batch-ownership-affinity) — EXECUTING
-Plan: 4 of 4
-Status: Phase complete — ready for verification
-Last activity: 2026-04-24
+Phase: 10 (table-function-form-gpu-execution-sigsegv-fix) — EXECUTING
+Plan: 2 of 4
+Status: Ready to execute
+Last activity: 2026-04-27
 
 Progress: [██████████] 100% (6/6 plans complete)
 Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gpu-sql-pipeline-fix/08-SUMMARY.md`
@@ -48,6 +48,7 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 | Phase 09 P02 | 4min | 3 tasks | 3 files |
 | Phase 09 P03 | 5min | 1 tasks | 1 files |
 | Phase 09 P04 | 2h | 4 tasks | 2 files |
+| Phase 10 P01 | 26min | 3 tasks | 1 files |
 
 ## Decisions
 
@@ -80,6 +81,8 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 - [Phase 09]: [09-04] SF100 Q1 num_gpus=2 ship-gate PASSES — byte-identical to 1-GPU baseline, 71 scan batches dispatched disjointly across GPUs (GPU0=45, GPU1=26, intersect=0), wall-clock 5.86s, zero cudaErrorInvalidValue/SIGSEGV/fallback. Plans 09-01 (preferred_device_id), 09-02 (batch affinity), 09-03 (disjointness REQUIRE) all proven live at runtime.
 - [Phase 09]: [09-04] Verdict: PARTIAL. v1.2 ship BLOCKED on new regression (unrelated to distributor): SIGSEGV in 'SELECT * FROM gpu_execution(...)' TABLE-FUNCTION-form result materialization path. CALL-form works (SF100 passes); TABLE_FUNCTION-form crashes. Scoped to Phase 10.
 - [Phase 09]: [09-04] MCP unit-tests wrapper does not pass agent shell env to child process; SIRIUS_TEST_SF10_PATH and SIRIUS_LOG_DIR had to be set via direct binary invocation (Rule 3 auto-fix). MCP build gate still used for build verification.
+- [Phase 10]: regressing_commit=NONE: all 5 Phase-9 source commits (3b58258..c0e12f3) pass isolated test; SIGSEGV is test-ordering dependent
+- [Phase 10]: FU17 partial fix changes at HEAD change SIGSEGV to cudaErrorContextIsDestroyed; Plan 10-02 should gdb clean state (c0e12f3) with full-suite --abort ~[hive_partition] to reproduce original SIGSEGV
 
 ## Accumulated Context
 
@@ -123,6 +126,6 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 
 ## Session Continuity
 
-Last session: 2026-04-24T15:18:06.455Z
-Stopped at: Completed 09-04-PLAN.md (VERDICT: PARTIAL - SF100 ship-gate PASS, unit-test regression scoped to Phase 10)
+Last session: 2026-04-27T15:16:52.171Z
+Stopped at: Completed 10-01-PLAN.md (bisect: regressing_commit=NONE, SIGSEGV test-ordering dependent)
 Resume file: None
