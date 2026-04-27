@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: Multi-GPU SQL Pipeline Fix
 status: executing
-stopped_at: "Completed 10-02-PLAN.md (GDB analysis: H1 confirmed, stream-ordered race in parquet filter translation)"
-last_updated: "2026-04-27T16:04:29.862Z"
+stopped_at: "Completed 10-03: fix stream use-after-destroy SIGSEGV in parquet filter translation"
+last_updated: "2026-04-27T18:44:27.908Z"
 last_activity: 2026-04-27
 progress:
   total_phases: 3
   completed_phases: 1
   total_plans: 18
-  completed_plans: 14
+  completed_plans: 15
   percent: 100
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-04-21)
 ## Current Position
 
 Phase: 10 (table-function-form-gpu-execution-sigsegv-fix) — EXECUTING
-Plan: 3 of 4
+Plan: 4 of 4
 Status: Ready to execute
 Last activity: 2026-04-27
 
@@ -50,6 +50,7 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 | Phase 09 P04 | 2h | 4 tasks | 2 files |
 | Phase 10 P01 | 26min | 3 tasks | 1 files |
 | Phase 10 P02 | 46min | 3 tasks | 1 files |
+| Phase 10-table-function-form-gpu-execution-sigsegv-fix P03 | 55 | 2 tasks | 2 files |
 
 ## Decisions
 
@@ -87,6 +88,8 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 - [Phase 10]: H1 confirmed: SIGSEGV is stream-ordered race in sirius_physical_parquet_scan.cpp using rmm::cuda_stream_default for gpu_expression_translator; scalars race with planning_stream in parquet_scan_task.cpp:492
 - [Phase 10]: GDB Heisenbug: Catch2 sigsetjmp/siglongjmp signal handler causes SIGSEGV to be swallowed under GDB (test completes normally). Static analysis + FU17 diff developer comment used as primary fault-frame evidence source
 - [Phase 10]: H2 (TABLE_FUNCTION vs PROCEDURE divergence) ruled out: both CALL and SELECT * FROM gpu_execution() use same GPUExecutionBind/GPUExecutionFunction; crash is parquet-fixture-specific, not TABLE_FUNCTION-form-specific
+- [Phase 10-table-function-form-gpu-execution-sigsegv-fix]: Root cause is use-after-destroy: translation_stream destroyed at for-loop scope exit while scalars retain stale cudaStream_t handle; fix: move stream into translated_expression::owned_stream
+- [Phase 10-table-function-form-gpu-execution-sigsegv-fix]: std::optional<rmm::cuda_stream> owned_stream declared BEFORE owned_literals in translated_expression struct — C++ reverse-destruction order ensures stream outlives scalars for cudaFreeAsync
 
 ## Accumulated Context
 
@@ -130,6 +133,6 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 
 ## Session Continuity
 
-Last session: 2026-04-27T16:04:29.859Z
-Stopped at: Completed 10-02-PLAN.md (GDB analysis: H1 confirmed, stream-ordered race in parquet filter translation)
+Last session: 2026-04-27T18:44:27.906Z
+Stopped at: Completed 10-03: fix stream use-after-destroy SIGSEGV in parquet filter translation
 Resume file: None
