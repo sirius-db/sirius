@@ -134,6 +134,12 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// @brief True when this join runs in build-then-probe mode (see `update_join_exec_mode`).
   [[nodiscard]] bool is_build_probe_mode();
 
+  /// @brief True when this join uses cuDF's mixed_join APIs (equality + inequality
+  /// predicates). MIXED_JOIN's per-partition working memory is roughly 2-3x a regular
+  /// hash join's because both full input tables stay resident for the AST predicate;
+  /// budget-aware sizing must allow more partitions to keep each one small.
+  [[nodiscard]] bool is_mixed_join_mode();
+
   std::unique_ptr<operator_data> get_next_task_input_data_for_build_probe();
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 

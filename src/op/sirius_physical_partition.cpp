@@ -247,15 +247,25 @@ std::pair<int, uint64_t> sirius_physical_partition::determine_num_partitions()
   //
   // The 1.5× factor accounts for cuco's hash-table memory on top of the build keys themselves.
   // kAbsoluteMaxPartitions is a final safety cap so a tiny budget can't explode partition count.
+  //
+  // MIXED_JOIN exception: cuDF's mixed_join APIs need both LEFT and RIGHT input tables fully
+  // resident for the AST predicate, plus per-row evaluation buffers. Empirically per-partition
+  // memory is ~2-3x a regular hash-join partition. Falling back to the static s_partition_size
+  // formula keeps partition count high enough that each one fits, avoiding SF=300 q19 OOM.
+  const bool downstream_is_mixed_join =
+    _hash_join_op != nullptr && _hash_join_op->type == SiriusPhysicalOperatorType::HASH_JOIN &&
+    _hash_join_op->Cast<sirius_physical_hash_join>().is_mixed_join_mode();
   constexpr int kAbsoluteMaxPartitions  = 64;
   constexpr int kPipelineThreadEstimate = 8;  // matches default executor.pipeline.num_threads
-  const auto budget                     = sirius::memory::snapshot_build_budget_default();
   uint64_t partition_size               = s_partition_size;
-  if (budget.for_build > 0) {
-    const uint64_t per_partition_target = budget.for_build / kPipelineThreadEstimate;
-    // Reserve ~33% of each partition's slice for the hash table itself (1.5× capacity factor).
-    const uint64_t per_partition_build_capacity = (per_partition_target * 2) / 3;
-    partition_size = std::max(s_partition_size, per_partition_build_capacity);
+  if (!downstream_is_mixed_join) {
+    const auto budget = sirius::memory::snapshot_build_budget_default();
+    if (budget.for_build > 0) {
+      const uint64_t per_partition_target = budget.for_build / kPipelineThreadEstimate;
+      // Reserve ~33% of each partition's slice for the hash table itself (1.5× capacity factor).
+      const uint64_t per_partition_build_capacity = (per_partition_target * 2) / 3;
+      partition_size = std::max(s_partition_size, per_partition_build_capacity);
+    }
   }
   int num_partitions =
     static_cast<int>(std::max(uint64_t{1}, total_bytes / partition_size));

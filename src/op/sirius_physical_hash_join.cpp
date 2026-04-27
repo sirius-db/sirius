@@ -406,6 +406,12 @@ bool sirius_physical_hash_join::is_build_probe_mode()
   return _join_mode == HASH_JOIN_MODE::BUILD_PROBE;
 }
 
+bool sirius_physical_hash_join::is_mixed_join_mode()
+{
+  std::lock_guard<std::mutex> lg(op_state_mutex);
+  return _join_mode == HASH_JOIN_MODE::MIXED_JOIN;
+}
+
 std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint()
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
@@ -496,10 +502,17 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     // Coalesce up to `kProbeCoalesceTargetBytes` of probe batches into a single task. The hash
     // table is already built, so we want each probe task to carry enough rows to keep the cuco
     // probe kernel SM-utilized rather than launch-overhead-bound.
+    //
+    // pop_data_batch is blocking when a batch is present but in a transient state (in_transit
+    // etc) — to avoid stalling task creation while the scan side is still producing, snapshot
+    // the available count first and bound the loop by it. The next BUILT-state task creation
+    // will pick up anything that became poppable in the meantime.
     constexpr uint64_t kProbeCoalesceTargetBytes = 1ULL << 30;  // 1 GiB
     std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
-    uint64_t accumulated_bytes = 0;
-    while (accumulated_bytes < kProbeCoalesceTargetBytes) {
+    uint64_t accumulated_bytes      = 0;
+    const std::size_t initial_count = probe_port->repo->total_size();
+    for (std::size_t i = 0;
+         i < initial_count && accumulated_bytes < kProbeCoalesceTargetBytes; ++i) {
       auto batch = probe_port->repo->pop_data_batch(::cucascade::batch_state::task_created);
       if (!batch) { break; }
       const uint64_t batch_bytes =
