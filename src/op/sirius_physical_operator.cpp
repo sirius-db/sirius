@@ -61,7 +61,11 @@ std::vector<::cucascade::read_only_data_batch> pipelineable_operator_data::get_r
     std::vector<::cucascade::read_only_data_batch> ro_batches;
     ro_batches.reserve(_data_batches->size());
     for (const auto& batch : *_data_batches) {
-      ro_batches.push_back(batch->to_read_only());
+      if (batch) {
+        ro_batches.push_back(batch->to_read_only());
+      } else {
+        SIRIUS_LOG_WARN("pipelineable_operator_data: null batch encountered, skipping");
+      }
     }
     if (leave_locked) {
       _read_only_data_batches = std::move(ro_batches);
