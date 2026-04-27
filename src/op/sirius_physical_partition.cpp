@@ -250,22 +250,27 @@ std::pair<int, uint64_t> sirius_physical_partition::determine_num_partitions()
   //
   // MIXED_JOIN exception: cuDF's mixed_join APIs need both LEFT and RIGHT input tables fully
   // resident for the AST predicate, plus per-row evaluation buffers. Empirically per-partition
-  // memory is ~2-3x a regular hash-join partition. Falling back to the static s_partition_size
-  // formula keeps partition count high enough that each one fits, avoiding SF=300 q19 OOM.
+  // memory is ~2-3x a regular hash-join partition, so we divide the build budget by a larger
+  // factor (kMixedJoinThreadEstimate vs kPipelineThreadEstimate) and let more, smaller
+  // partitions absorb the same total work without OOMing.
   const bool downstream_is_mixed_join =
     _hash_join_op != nullptr && _hash_join_op->type == SiriusPhysicalOperatorType::HASH_JOIN &&
     _hash_join_op->Cast<sirius_physical_hash_join>().is_mixed_join_mode();
   constexpr int kAbsoluteMaxPartitions  = 64;
   constexpr int kPipelineThreadEstimate = 8;  // matches default executor.pipeline.num_threads
-  uint64_t partition_size               = s_partition_size;
-  if (!downstream_is_mixed_join) {
-    const auto budget = sirius::memory::snapshot_build_budget_default();
-    if (budget.for_build > 0) {
-      const uint64_t per_partition_target = budget.for_build / kPipelineThreadEstimate;
-      // Reserve ~33% of each partition's slice for the hash table itself (1.5× capacity factor).
-      const uint64_t per_partition_build_capacity = (per_partition_target * 2) / 3;
-      partition_size = std::max(s_partition_size, per_partition_build_capacity);
-    }
+  // 3x for_build over-subscription for MIXED_JOIN: caps each partition at ~1/3 of a regular
+  // hash-join partition. Empirical: avoids SF=300 q19 OOM in feature without falling all the
+  // way back to the static 100 MB s_partition_size.
+  constexpr int kMixedJoinThreadEstimate = kPipelineThreadEstimate * 3;
+  uint64_t partition_size                = s_partition_size;
+  const auto budget = sirius::memory::snapshot_build_budget_default();
+  if (budget.for_build > 0) {
+    const int divisor =
+      downstream_is_mixed_join ? kMixedJoinThreadEstimate : kPipelineThreadEstimate;
+    const uint64_t per_partition_target = budget.for_build / divisor;
+    // Reserve ~33% of each partition's slice for the hash table itself (1.5× capacity factor).
+    const uint64_t per_partition_build_capacity = (per_partition_target * 2) / 3;
+    partition_size = std::max(s_partition_size, per_partition_build_capacity);
   }
   int num_partitions =
     static_cast<int>(std::max(uint64_t{1}, total_bytes / partition_size));
