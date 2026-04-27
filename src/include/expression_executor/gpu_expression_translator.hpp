@@ -39,6 +39,7 @@
 #include <cudf/types.hpp>
 
 // rmm
+#include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
 
 // standard library
@@ -88,6 +89,16 @@ class gpu_expression_translator {
    */
   struct translated_expression {
     cudf::ast::tree tree{};
+    /// Owning stream whose lifetime covers all async scalar allocations.
+    /// DECLARATION ORDER MATTERS: owned_stream is declared BEFORE owned_literals
+    /// so its destructor runs AFTER the scalar destructors (C++ destroys members
+    /// in reverse declaration order — last declared is destroyed first).
+    /// This ensures cudaStreamDestroy fires AFTER all scalars in owned_literals
+    /// are freed via cudaFreeAsync — the scalars' cudaFreeAsync calls reference
+    /// this stream handle so it must be valid throughout scalar destruction.
+    /// Optional: set only by callers that allocate scalars on a temporary
+    /// stream; leave empty when scalars use a persistent stream (or none).
+    std::optional<rmm::cuda_stream> owned_stream{};
     std::vector<std::unique_ptr<cudf::scalar>> owned_literals{};
 
     [[nodiscard]] cudf::ast::expression const& back() const { return tree.back(); }

@@ -22,6 +22,7 @@
 #include "op/sirius_physical_table_scan.hpp"
 
 #include <rmm/cuda_device.hpp>
+#include <rmm/cuda_stream.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
 namespace sirius {
@@ -115,15 +116,38 @@ sirius_physical_parquet_scan::sirius_physical_parquet_scan(
       bool all_translations_ok = true;
       for (int device_id : device_ids_for_translation) {
         rmm::cuda_set_device_raii device_raii{rmm::cuda_device_id{device_id}};
+        // FU17 root-cause fix: translate on an explicit per-device stream,
+        // then synchronize it before handing the translated AST off. The
+        // translator materializes cudf::string_scalar / numeric_scalar device
+        // buffers via cudaMallocAsync on whatever stream it's given; if it
+        // uses the default stream, later kernels running on *other* streams
+        // (e.g. filter_row_groups_with_stats using a throwaway
+        // `planning_stream` in parquet_scan_task.cpp:492) can launch before
+        // the alloc event has fired, yielding a use-before-alloc
+        // stream-ordered race (surfaces as cudaErrorIllegalAddress inside
+        // cudf::detail::compute_column_kernel reading the 'GERMANY' scalar).
+        // Confirmed by compute-sanitizer --track-stream-ordered-races=all.
+        rmm::cuda_stream translation_stream;
         gpu_expression_translator translator(
-          rmm::cuda_stream_default,
+          translation_stream.view(),
           rmm::mr::get_per_device_resource_ref(rmm::cuda_device_id{device_id}));
         auto translated =
           translator.translate_expression_with_names(*duckdb_expression, name_resolver);
+        // Synchronize BEFORE storing into translated_filter_by_device so any
+        // future reader — on any stream, on any device after peer-access — is
+        // guaranteed to observe the scalar allocations as already completed.
+        translation_stream.synchronize();
         if (!translated) {
           all_translations_ok = false;
           break;
         }
+        // Transfer ownership of the stream into the translated_expression so
+        // it lives exactly as long as the cudf::scalar device buffers that
+        // were allocated on it.  Without this, the stream is destroyed here
+        // (end of for-loop body) while the scalars still reference its handle
+        // for future cudaFreeAsync deallocation — causing a use-after-destroy
+        // SIGSEGV when the translated_expression is eventually torn down.
+        translated->owned_stream = std::move(translation_stream);
         translated_filter_by_device.emplace(device_id, std::move(*translated));
       }
 
