@@ -815,8 +815,6 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
 
   cudf::table_view left_full, right_full;
   std::unique_ptr<rmm::device_uvector<cudf::size_type>> left_indices, right_indices;
-  // Holds read lock on _build_table for the BUILD_PROBE path; must outlive right_full.
-  std::optional<::cucascade::read_only_data_batch> build_table_ro_holder;
 
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
     if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::SCHEDULED) {
@@ -838,9 +836,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       {
         std::lock_guard<std::mutex> lg(op_state_mutex);
         _built_table_cast_columns = std::move(build_keys_result.owned_cast_columns);
-        // Clone the build batch into an idle shared_ptr so it stays alive for probe lookups.
-        // clone() on read_only_data_batch returns an already-idle shared_ptr<data_batch>.
-        _build_table = build_batch_ro.clone(sirius::get_next_batch_id(), stream);
+        _build_table              = build_batch_ro;
         if (unique_build_keys &&
             (join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::LEFT)) {
           _distinct_hash_table = std::make_unique<cudf::distinct_hash_join>(
@@ -868,9 +864,9 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                                  stream);
       cudf::table_view probe_keys = probe_keys_result.keys;
 
-      left_full             = get_cudf_table_view(input_batches[0]);
-      build_table_ro_holder = _build_table->to_read_only();
-      right_full            = build_table_ro_holder->get_data()
+      left_full  = get_cudf_table_view(input_batches[0]);
+      right_full = _build_table.value()
+                     .get_data()
                      ->cast<cucascade::gpu_table_representation>()
                      .get_table_view();
 
@@ -1173,7 +1169,7 @@ void sirius_physical_hash_join::finalize_operator()
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
     _hash_table.reset();
     _distinct_hash_table.reset();
-    _build_table.reset();
+    _build_table = std::nullopt;
     _built_table_cast_columns.clear();
     _hash_table_build_state = BUILD_HASH_TABLE_STATE::DESTROYED;
   }
