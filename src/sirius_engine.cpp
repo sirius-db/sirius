@@ -16,6 +16,7 @@
 
 #include "sirius_engine.hpp"
 
+#include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/parallel/thread_context.hpp"
@@ -187,11 +188,11 @@ void sirius_engine::initialize(duckdb::unique_ptr<op::sirius_physical_operator> 
   SIRIUS_LOG_DEBUG("Initializing sirius_engine");
   reset();
   sirius_owned_plan = std::move(plan);
-  // Pre-fetch iceberg delete-file metadata before initialize_internal() assigns
-  // operator IDs to pipeline-breaker operators (PARTITION, CONCAT, etc.).
-  // The DuckDB metadata connection is opened under InternalQueryGuard so that
+  // Pre-fetch and fully materialize iceberg delete data before initialize_internal()
+  // assigns operator IDs to pipeline-breaker operators (PARTITION, CONCAT, etc.).
+  // All DuckDB connections are opened under InternalQueryGuard so that
   // QueryBegin/QueryEnd side-effects on the shared SiriusContext are suppressed.
-  prefetch_iceberg_metadata(*sirius_owned_plan);
+  prefetch_iceberg_delete_data(*sirius_owned_plan);
   initialize_internal(*sirius_owned_plan);
 }
 
@@ -256,60 +257,91 @@ duckdb::unique_ptr<op::sirius_physical_operator> sirius_engine::construct_sirius
   }
 }
 
+/// Resolve the Iceberg table path from the scan operator.
+/// For file-based scans: parameters[0] contains the path.
+/// For REST catalog scans: parameters is empty; derive path from bind_data's
+/// first data file (strip /data/filename.parquet to get the table root).
+static std::string resolve_iceberg_table_path(op::sirius_physical_table_scan& scan_op)
+{
+  if (!scan_op.parameters.empty()) { return scan_op.parameters[0].ToString(); }
+
+  // REST catalog: derive from bind_data file list.
+  if (scan_op.bind_data) {
+    auto& bind_data = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
+    if (bind_data.file_list && !bind_data.file_list->IsEmpty()) {
+      auto files = bind_data.file_list->GetAllFiles();
+      if (!files.empty()) {
+        auto const& first_path = files[0].path;
+        // Strip "/data/<filename>" to get table root.
+        auto data_pos = first_path.rfind("/data/");
+        if (data_pos != std::string::npos) { return first_path.substr(0, data_pos); }
+      }
+    }
+  }
+  return {};
+}
+
 duckdb::unique_ptr<op::sirius_physical_operator> sirius_engine::construct_iceberg_scan_operator(
   op::sirius_physical_table_scan& scan_op)
 {
   auto iceberg_scan = duckdb::make_uniq<op::sirius_physical_iceberg_scan>(&scan_op);
 
-  if (!scan_op.parameters.empty()) {
-    std::string const table_path = scan_op.parameters[0].ToString();
-    auto it                      = iceberg_metadata_cache_.find(table_path);
-    if (it != iceberg_metadata_cache_.end()) {
-      iceberg_scan->positional_delete_files = it->second.positional_delete_files;
-      iceberg_scan->equality_delete_files   = it->second.equality_delete_files;
-    }
+  auto table_path = resolve_iceberg_table_path(scan_op);
+  if (!table_path.empty()) {
+    auto it = iceberg_delete_data_cache_.find(table_path);
+    if (it != iceberg_delete_data_cache_.end()) { iceberg_scan->delete_data = it->second; }
   }
 
   return iceberg_scan;
 }
 
-void sirius_engine::prefetch_iceberg_metadata(op::sirius_physical_operator& plan)
+void sirius_engine::prefetch_iceberg_delete_data(op::sirius_physical_operator& plan)
 {
-  // Walk the plan tree and fetch delete-file metadata for every iceberg scan.
+  // Walk the plan tree and fully materialize delete data for every iceberg scan.
   // This runs in initialize() BEFORE initialize_internal() so that operator IDs
   // for pipeline-breaker nodes (PARTITION, CONCAT, …) haven't been assigned yet.
+  // All DuckDB connections (for positional-delete reads, snapshot queries) are
+  // opened under a single InternalQueryGuard to prevent transaction side-effects.
 
   if (plan.type != op::SiriusPhysicalOperatorType::TABLE_SCAN) {
     if (plan.type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
       auto& collector = plan.Cast<op::sirius_physical_result_collector>();
-      prefetch_iceberg_metadata(collector.plan);
+      prefetch_iceberg_delete_data(collector.plan);
     } else {
       for (auto& child : plan.children) {
-        prefetch_iceberg_metadata(*child);
+        prefetch_iceberg_delete_data(*child);
       }
     }
     return;
   }
 
   auto& scan_op = plan.Cast<op::sirius_physical_table_scan>();
-  if (scan_op.function.name != "iceberg_scan" || scan_op.parameters.empty()) { return; }
+  if (scan_op.function.name != "iceberg_scan") { return; }
 
-  std::string const table_path = scan_op.parameters[0].ToString();
-  if (iceberg_metadata_cache_.count(table_path)) { return; }  // already fetched
+  std::string const table_path = resolve_iceberg_table_path(scan_op);
+  if (table_path.empty()) { return; }
+  if (iceberg_delete_data_cache_.count(table_path)) { return; }  // already fetched
 
-  // Opening a secondary connection triggers QueryBegin/QueryEnd on the shared
+  // Extract snapshot parameters if present (for snapshot-aware delete discovery).
+  std::optional<uint64_t> snapshot_id;
+  auto sid_it = scan_op.named_parameters.find("snapshot_from_id");
+  if (sid_it != scan_op.named_parameters.end() && !sid_it->second.IsNull()) {
+    snapshot_id = sid_it->second.GetValue<uint64_t>();
+  }
+
+  // Opening secondary connections triggers QueryBegin/QueryEnd on the shared
   // SiriusContext.  InternalQueryGuard suppresses those side-effects.
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) {
     SIRIUS_LOG_WARN("[sirius_engine] SiriusContext not available; treating iceberg '{}' as V1.",
                     table_path);
-    iceberg_metadata_cache_.emplace(table_path, op::scan::IcebergDeleteFiles{});
+    iceberg_delete_data_cache_.emplace(table_path, std::make_shared<op::scan::IcebergDeleteData>());
     return;
   }
 
   duckdb::SiriusContext::InternalQueryGuard guard(*sirius_ctx);
-  auto files = op::scan::read_iceberg_delete_metadata(context, table_path);
-  iceberg_metadata_cache_.emplace(table_path, std::move(files));
+  auto data = op::scan::read_iceberg_delete_data(context, table_path, snapshot_id);
+  iceberg_delete_data_cache_.emplace(table_path, std::move(data));
 }
 
 void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)

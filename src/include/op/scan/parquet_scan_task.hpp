@@ -66,7 +66,7 @@ namespace detail {
  * @brief Compute the parquet column indices to read given column and projection id vectors.
  *
  * Applies projection_ids / column_ids to select only the needed columns.
- * Virtual columns and duplicates are excluded/deduplicated.
+ * Virtual columns, duplicates, and hive partition columns are excluded.
  * Defined in parquet_scan_task.cpp.
  *
  * Note: the returned indices are DuckDB primary indices. Hive partition columns
@@ -207,7 +207,17 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    */
   [[nodiscard]] std::unique_ptr<hybrid_scan_reader> make_reader(std::size_t file_idx) const
   {
-    return std::make_unique<hybrid_scan_reader>(_file_metadatas[file_idx], _reader_options);
+    auto opts = _reader_options;
+    // Per-file column projection for schema evolution: each file may have
+    // a different subset of the requested columns.
+    if (!_per_file_column_names.empty() && file_idx < _per_file_column_names.size()) {
+#if CUDF_VERSION_NUM >= 2604
+      opts.set_column_names(_per_file_column_names[file_idx]);
+#else
+      opts.set_columns(_per_file_column_names[file_idx]);
+#endif
+    }
+    return std::make_unique<hybrid_scan_reader>(_file_metadatas[file_idx], opts);
   }
 
   /**
@@ -311,12 +321,36 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
     return _selected_column_indices;
   }
 
+  /**
+   * @brief Return the parquet FileMetaData for the given data file index.
+   *
+   * Used by iceberg_scan_task_global_state to extract Iceberg field IDs
+   * from data file schemas for schema-evolution-safe column matching.
+   */
+  [[nodiscard]] cudf::io::parquet::FileMetaData const& get_file_metadata(size_t file_idx) const
+  {
+    return _file_metadatas[file_idx];
+  }
+
+  /// Return the number of data files.
+  [[nodiscard]] size_t num_files() const { return _file_paths.size(); }
+
   // -------------------------------------------------------------------------
   // Hive partition column support
   // -------------------------------------------------------------------------
 
   /// True if this scan involves hive-partitioned files.
   [[nodiscard]] bool has_hive_partitions() const { return !_hive_partition_columns.empty(); }
+
+  /// True if a partition_inject_fn was installed (hive partitioning OR schema
+  /// reconciliation). Schema evolution can install one even when there are no
+  /// hive partition columns, so callers that propagate the fn down to
+  /// host_parquet_representation should gate on this rather than
+  /// has_hive_partitions().
+  [[nodiscard]] bool has_partition_inject_fn() const
+  {
+    return static_cast<bool>(_partition_inject_fn);
+  }
 
   /// Return the partition injection function (may be null).
   [[nodiscard]] partition_inject_fn_t const& get_partition_inject_fn() const
@@ -344,6 +378,28 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    */
   void init_hive_partitions(duckdb::MultiFileBindData const& bind_data,
                             sirius_physical_parquet_scan* scan_op);
+
+  /**
+   * @brief Detect missing/schema-evolution columns and set up per-file projection.
+   *
+   * Scans all file metadatas to find columns missing from ALL files (→ partition
+   * columns) vs missing from SOME files (→ schema evolution, per-file projection).
+   * Also applies column-name projection to reader options.
+   *
+   * Called from both constructors after file metadata is available.
+   */
+  void detect_columns_and_apply_projection(sirius_physical_parquet_scan* scan_op);
+
+  /**
+   * @brief Build a schema reconciliation function for schema evolution.
+   *
+   * When files have different column sets (e.g., column added in later snapshot),
+   * this builds a partition_inject_fn that injects typed NULL columns for columns
+   * missing from specific files, producing a consistent output schema.
+   *
+   * Must be called AFTER init_hive_partitions (chains with any existing inject fn).
+   */
+  void build_schema_reconciliation(sirius_physical_parquet_scan* scan_op);
 
  protected:
   /**
@@ -412,6 +468,10 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
 
   /// Optional partition column injection (null unless hive-partitioned).
   partition_inject_fn_t _partition_inject_fn;
+
+  /// Per-file column names for cuDF projection (schema evolution support).
+  /// Empty if all files share the same schema; otherwise one entry per file.
+  std::vector<std::vector<std::string>> _per_file_column_names;
 
   /// Hive partition columns (not present in parquet files).
   std::vector<hive_partition_column> _hive_partition_columns;

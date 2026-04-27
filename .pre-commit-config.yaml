@@ -35,7 +35,8 @@ repos:
         exclude: |
           (?x)^(
             ^legacy/queries/.*|
-            ^python/cudf/cudf/tests/data/vocab.txt
+            ^python/cudf/cudf/tests/data/vocab.txt|
+            .*version-hint\.text$
           )
       - id: mixed-line-ending
       - id: pretty-format-json

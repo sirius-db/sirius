@@ -162,6 +162,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       std::move(op.extra_info),
       std::move(op.parameters),
       std::move(op.virtual_columns));
+    node->named_parameters = std::move(op.named_parameters);
     // first check if an additional projection is necessary
     if (column_ids.size() == op.returned_types.size()) {
       bool projection_necessary = false;
@@ -221,7 +222,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     std::move(op.extra_info),
     std::move(op.parameters),
     std::move(op.virtual_columns));
-  node->dynamic_filters = op.dynamic_filters;
+  node->named_parameters = std::move(op.named_parameters);
+  node->dynamic_filters  = op.dynamic_filters;
   if (filter) {
     filter->children.push_back(std::move(node));
     return std::move(filter);
