@@ -172,6 +172,141 @@ TEST_CASE("bitpacking batched: DELTA_FOR mode prefix-sums packed deltas",
   }
 }
 
+//===----------------------------------------------------------------------===//
+// Defensive-guard tests — these lock in the kernel/dispatcher behaviour when
+// metadata is corrupt or upstream viability has fallen out of sync. They are
+// the only thing keeping the guards from silently becoming dead code if
+// upstream filtering ever changes.
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("bitpacking batched: INVALID mode in metadata writes nothing",
+          "[scan][bitpacking][gpu_decode][defensive]")
+{
+  // Hand-craft a block whose metadata entry encodes BitpackingMode::INVALID.
+  // The kernel must treat this as a no-op (sentinel canary survives in the
+  // output buffer, proving no writes occurred).
+  std::vector<uint8_t> block(64, 0);
+  uint64_t metadata_end = 32;
+  std::memcpy(block.data(), &metadata_end, sizeof(metadata_end));
+  uint32_t encoded =
+    (static_cast<uint32_t>(::sirius::cuda::scan::BitpackingMode::INVALID) << 24) | 8;
+  std::memcpy(block.data() + metadata_end - 4, &encoded, sizeof(encoded));
+
+  auto stream  = cudf::get_default_stream();
+  auto cstream = stream.value();
+  auto d_block = upload(block, cstream);
+
+  constexpr uint32_t row_count = 32;
+  std::vector<int32_t> canary(row_count, 0xDEADBEEF);
+  sirius::test::decode::device_alloc d_output(row_count * sizeof(int32_t));
+  ::cudaMemcpyAsync(
+    d_output.ptr, canary.data(), canary.size() * sizeof(int32_t), ::cudaMemcpyHostToDevice, cstream);
+
+  batched_bp_seg_desc desc{};
+  desc.d_block           = static_cast<const uint8_t*>(d_block.ptr);
+  desc.block_offset      = 0;
+  desc.group_idx         = 0;
+  desc.group_row_count   = row_count;
+  desc.global_row_offset = 0;
+
+  std::vector<batched_bp_seg_desc> descs{desc};
+  gpu_decode_bitpacking_batched(
+    descs.data(), 1, d_output.ptr, sizeof(int32_t), /*is_signed=*/true, stream);
+
+  auto out = sirius::test::decode::download<int32_t>(d_output.ptr, row_count, cstream);
+  for (auto v : out)
+    REQUIRE(static_cast<uint32_t>(v) == 0xDEADBEEF);
+}
+
+TEST_CASE("bitpacking batched: corrupt metadata_end bails out without OOB read",
+          "[scan][bitpacking][gpu_decode][defensive]")
+{
+  // metadata_end set past DUCKDB_BLOCK_SIZE — kernel must bail to INVALID
+  // rather than read past the block.
+  std::vector<uint8_t> block(64, 0);
+  uint64_t bogus_end = sirius::cuda::scan::DUCKDB_BLOCK_SIZE + 1024;
+  std::memcpy(block.data(), &bogus_end, sizeof(bogus_end));
+
+  auto stream  = cudf::get_default_stream();
+  auto cstream = stream.value();
+  auto d_block = upload(block, cstream);
+
+  constexpr uint32_t row_count = 16;
+  std::vector<int32_t> canary(row_count, 0x5A5A5A5A);
+  sirius::test::decode::device_alloc d_output(row_count * sizeof(int32_t));
+  ::cudaMemcpyAsync(
+    d_output.ptr, canary.data(), canary.size() * sizeof(int32_t), ::cudaMemcpyHostToDevice, cstream);
+
+  batched_bp_seg_desc desc{};
+  desc.d_block         = static_cast<const uint8_t*>(d_block.ptr);
+  desc.group_row_count = row_count;
+  std::vector<batched_bp_seg_desc> descs{desc};
+
+  gpu_decode_bitpacking_batched(
+    descs.data(), 1, d_output.ptr, sizeof(int32_t), /*is_signed=*/true, stream);
+  auto out = sirius::test::decode::download<int32_t>(d_output.ptr, row_count, cstream);
+  for (auto v : out)
+    REQUIRE(static_cast<uint32_t>(v) == 0x5A5A5A5A);
+}
+
+TEST_CASE("bitpacking batched: width > sizeof(T)*8 bails out without OOB read",
+          "[scan][bitpacking][gpu_decode][defensive]")
+{
+  // Build a FOR block, then patch the width field on disk to 100 (wider
+  // than int32). Kernel must bail to INVALID rather than read past the
+  // packed stream.
+  std::vector<int32_t> values(8, 1);
+  auto block = make_for_block<int32_t>(/*frame=*/0, /*width=*/5, values);
+  // width is the second T after metadata_end (offset 8 + sizeof(int32_t) = 12).
+  int32_t bogus_width = 100;
+  std::memcpy(block.data() + 8 + sizeof(int32_t), &bogus_width, sizeof(int32_t));
+
+  auto stream  = cudf::get_default_stream();
+  auto cstream = stream.value();
+  auto d_block = upload(block, cstream);
+
+  constexpr uint32_t row_count = 8;
+  std::vector<int32_t> canary(row_count, -1);
+  sirius::test::decode::device_alloc d_output(row_count * sizeof(int32_t));
+  ::cudaMemcpyAsync(
+    d_output.ptr, canary.data(), canary.size() * sizeof(int32_t), ::cudaMemcpyHostToDevice, cstream);
+
+  batched_bp_seg_desc desc{};
+  desc.d_block         = static_cast<const uint8_t*>(d_block.ptr);
+  desc.group_row_count = row_count;
+  std::vector<batched_bp_seg_desc> descs{desc};
+
+  gpu_decode_bitpacking_batched(
+    descs.data(), 1, d_output.ptr, sizeof(int32_t), /*is_signed=*/true, stream);
+  auto out = sirius::test::decode::download<int32_t>(d_output.ptr, row_count, cstream);
+  for (auto v : out)
+    REQUIRE(v == -1);
+}
+
+TEST_CASE("bitpacking batched: unsupported type_size throws viability invariant",
+          "[scan][bitpacking][gpu_decode][defensive]")
+{
+  // type_size=3 is not a width the dispatcher template-instantiates for —
+  // upstream check_viability is supposed to keep it out. If it leaks
+  // through anyway, the kernel must throw rather than leave the output
+  // buffer uninitialized.
+  auto stream  = cudf::get_default_stream();
+  auto cstream = stream.value();
+  auto block   = make_constant_block<int32_t>(0);
+  auto d_block = upload(block, cstream);
+
+  sirius::test::decode::device_alloc d_output(64);
+  batched_bp_seg_desc desc{};
+  desc.d_block         = static_cast<const uint8_t*>(d_block.ptr);
+  desc.group_row_count = 8;
+  std::vector<batched_bp_seg_desc> descs{desc};
+
+  REQUIRE_THROWS_AS(
+    gpu_decode_bitpacking_batched(
+      descs.data(), 1, d_output.ptr, /*type_size=*/3, /*is_signed=*/true, stream),
+    std::runtime_error);
+}
+
 TEST_CASE("bitpacking batched: multi-segment dispatch packs distinct outputs",
           "[scan][bitpacking][gpu_decode]")
 {
