@@ -38,8 +38,7 @@ using sirius::to_duckdb_function_name;
 // Compile-time invariants (D-01 — locked ABI)
 // ============================================================================
 
-static_assert(std::is_enum_v<function_id>,
-              "sirius::function_id must be an enum class.");
+static_assert(std::is_enum_v<function_id>, "sirius::function_id must be an enum class.");
 static_assert(sizeof(function_id) == 2,
               "sirius::function_id is uint16_t-backed (D-01 — locked ABI).");
 static_assert(static_cast<uint16_t>(function_id::error) + 1 == 27,
@@ -307,8 +306,9 @@ TEST_CASE("ast_function_id - substring and substr both resolve to function_id::s
   REQUIRE(*id_short == function_id::substring);
 }
 
-TEST_CASE("ast_function_id - to_duckdb_function_name(substring) returns the canonical \"substring\"",
-          "[ast_function_id]")
+TEST_CASE(
+  "ast_function_id - to_duckdb_function_name(substring) returns the canonical \"substring\"",
+  "[ast_function_id]")
 {
   REQUIRE(to_duckdb_function_name(function_id::substring) == "substring");
 }

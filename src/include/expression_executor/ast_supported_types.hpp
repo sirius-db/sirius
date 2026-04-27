@@ -36,8 +36,11 @@ inline constexpr std::array<duckdb::LogicalTypeId, 3> supported_ast_cast_types{
   {duckdb::LogicalTypeId::UBIGINT, duckdb::LogicalTypeId::BIGINT, duckdb::LogicalTypeId::DOUBLE}};
 
 /// BOUND_FUNCTION names that are currently safe to lower into a cuDF AST.
-inline constexpr std::array<function_id, 6> supported_ast_functions{
-  function_id::add, function_id::sub, function_id::mul,
-  function_id::div, function_id::int_div, function_id::mod};
+inline constexpr std::array<function_id, 6> supported_ast_functions{function_id::add,
+                                                                    function_id::sub,
+                                                                    function_id::mul,
+                                                                    function_id::div,
+                                                                    function_id::int_div,
+                                                                    function_id::mod};
 
 }  // namespace sirius
