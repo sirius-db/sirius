@@ -23,11 +23,11 @@
 // null-count readbacks can be applied to columns; no per-column syncs.
 //===----------------------------------------------------------------------===//
 
-#include "cudf/cudf_utils.hpp"
 #include "cuda/scan/device_scratch.cuh"
 #include "cuda/scan/gpu_decode.cuh"
 #include "cuda/scan/gpu_native_decode.cuh"
 #include "cuda/scan/pinned_bounce.cuh"
+#include "cudf/cudf_utils.hpp"
 #include "log/logging.hpp"
 
 #include <cudf/column/column.hpp>
@@ -89,9 +89,8 @@ cudf::data_type to_cudf_type(const duckdb::LogicalType& type)
     case duckdb::LogicalTypeId::MAP:
     case duckdb::LogicalTypeId::ARRAY:
       // Nested types — fixed-width decoder cannot handle them.
-      throw std::runtime_error(
-        "gpu_native_decode: viability invariant violated — nested type " + type.ToString() +
-        " is not supported by the fixed-width decoder");
+      throw std::runtime_error("gpu_native_decode: viability invariant violated — nested type " +
+                               type.ToString() + " is not supported by the fixed-width decoder");
     default: break;
   }
   try {

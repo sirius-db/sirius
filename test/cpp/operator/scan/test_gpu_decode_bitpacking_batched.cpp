@@ -199,8 +199,11 @@ TEST_CASE("bitpacking batched: INVALID mode in metadata writes nothing",
   constexpr uint32_t row_count = 32;
   std::vector<int32_t> canary(row_count, 0xDEADBEEF);
   sirius::test::decode::device_alloc d_output(row_count * sizeof(int32_t));
-  ::cudaMemcpyAsync(
-    d_output.ptr, canary.data(), canary.size() * sizeof(int32_t), ::cudaMemcpyHostToDevice, cstream);
+  ::cudaMemcpyAsync(d_output.ptr,
+                    canary.data(),
+                    canary.size() * sizeof(int32_t),
+                    ::cudaMemcpyHostToDevice,
+                    cstream);
 
   batched_bp_seg_desc desc{};
   desc.d_block           = static_cast<const uint8_t*>(d_block.ptr);
@@ -234,8 +237,11 @@ TEST_CASE("bitpacking batched: corrupt metadata_end bails out without OOB read",
   constexpr uint32_t row_count = 16;
   std::vector<int32_t> canary(row_count, 0x5A5A5A5A);
   sirius::test::decode::device_alloc d_output(row_count * sizeof(int32_t));
-  ::cudaMemcpyAsync(
-    d_output.ptr, canary.data(), canary.size() * sizeof(int32_t), ::cudaMemcpyHostToDevice, cstream);
+  ::cudaMemcpyAsync(d_output.ptr,
+                    canary.data(),
+                    canary.size() * sizeof(int32_t),
+                    ::cudaMemcpyHostToDevice,
+                    cstream);
 
   batched_bp_seg_desc desc{};
   desc.d_block         = static_cast<const uint8_t*>(d_block.ptr);
@@ -268,8 +274,11 @@ TEST_CASE("bitpacking batched: width > sizeof(T)*8 bails out without OOB read",
   constexpr uint32_t row_count = 8;
   std::vector<int32_t> canary(row_count, -1);
   sirius::test::decode::device_alloc d_output(row_count * sizeof(int32_t));
-  ::cudaMemcpyAsync(
-    d_output.ptr, canary.data(), canary.size() * sizeof(int32_t), ::cudaMemcpyHostToDevice, cstream);
+  ::cudaMemcpyAsync(d_output.ptr,
+                    canary.data(),
+                    canary.size() * sizeof(int32_t),
+                    ::cudaMemcpyHostToDevice,
+                    cstream);
 
   batched_bp_seg_desc desc{};
   desc.d_block         = static_cast<const uint8_t*>(d_block.ptr);
@@ -301,10 +310,9 @@ TEST_CASE("bitpacking batched: unsupported type_size throws viability invariant"
   desc.group_row_count = 8;
   std::vector<batched_bp_seg_desc> descs{desc};
 
-  REQUIRE_THROWS_AS(
-    gpu_decode_bitpacking_batched(
-      descs.data(), 1, d_output.ptr, /*type_size=*/3, /*is_signed=*/true, stream),
-    std::runtime_error);
+  REQUIRE_THROWS_AS(gpu_decode_bitpacking_batched(
+                      descs.data(), 1, d_output.ptr, /*type_size=*/3, /*is_signed=*/true, stream),
+                    std::runtime_error);
 }
 
 TEST_CASE("bitpacking batched: multi-segment dispatch packs distinct outputs",

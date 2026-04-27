@@ -101,18 +101,17 @@ __global__ void kernel_decode_bitpacking_batched(const batched_bp_seg_desc* __re
 
     // metadata_end must reach far enough to contain its own (group_idx+1)
     // encoded entry, and the segment must fit within the 256 KB DuckDB block.
-    bool metadata_ok =
-      metadata_end >= sizeof(uint64_t) + (desc.group_idx + 1) * sizeof(uint32_t) &&
-      static_cast<uint64_t>(desc.block_offset) + metadata_end <= DUCKDB_BLOCK_SIZE;
+    bool metadata_ok = metadata_end >= sizeof(uint64_t) + (desc.group_idx + 1) * sizeof(uint32_t) &&
+                       static_cast<uint64_t>(desc.block_offset) + metadata_end <= DUCKDB_BLOCK_SIZE;
 
     if (metadata_ok) {
       const uint8_t* entry_addr =
         block_base + metadata_end - (desc.group_idx + 1) * sizeof(uint32_t);
       uint32_t encoded;
       memcpy(&encoded, entry_addr, sizeof(uint32_t));
-      uint32_t data_off    = encoded & 0x00FFFFFF;
-      uint8_t parsed_mode  = (encoded >> 24) & 0xFF;
-      sm_row_count         = desc.group_row_count;
+      uint32_t data_off   = encoded & 0x00FFFFFF;
+      uint8_t parsed_mode = (encoded >> 24) & 0xFF;
+      sm_row_count        = desc.group_row_count;
 
       // data_off is a within-segment offset; reading frame/width/v2 starts
       // there and consumes up to 3*sizeof(T) bytes before the packed stream.
