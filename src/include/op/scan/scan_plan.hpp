@@ -177,6 +177,8 @@ struct scan_plan {
 /// @param output_types_size   The scan operator's types.size() — used to split
 ///                            projection_ids into output vs pure-filter.
 /// @param partition_indices   Hive partition indices advertised by the bind data.
+///                            TODO: other partition indices may need to be supported for other
+///                            formats.
 scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
                           duckdb::vector<duckdb::idx_t> const& projection_ids,
                           duckdb::vector<std::string> const& names,

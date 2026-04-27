@@ -59,6 +59,12 @@ std::vector<std::string> scan_plan::data_column_names() const
 
 std::vector<duckdb::idx_t> scan_plan::make_batch_column_map() const
 {
+  // This is a shim for the existing @c convert_table_filters_to_expression API,
+  // which uses @c idx_t(-1) as a "not in batch" sentinel. The canonical form
+  // is the @c vector<optional<size_t>> already stored in
+  // @c batch_position_by_column_id; once the filter-translator API is updated
+  // to consume the optional form directly, this conversion (and the sentinel)
+  // can be deleted.
   constexpr auto NOT_PROJECTED = static_cast<duckdb::idx_t>(-1);
   std::vector<duckdb::idx_t> map(batch_position_by_column_id.size(), NOT_PROJECTED);
   for (std::size_t c = 0; c < batch_position_by_column_id.size(); ++c) {
