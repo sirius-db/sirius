@@ -81,59 +81,93 @@ __global__ void kernel_decode_bitpacking_batched(const batched_bp_seg_desc* __re
   __shared__ T sm_aux;
 
   // --- Thread 0: parse this group's metadata from block data ---
+  //
+  // Defensive bounds: block bytes come from disk and could in principle be
+  // corrupted/truncated. A bogus metadata_end / data_off / width would read
+  // undefined GPU memory or write OOB. Each check below sets sm_mode to
+  // INVALID — the per-mode branches further down treat INVALID as a no-op.
   if (threadIdx.x == 0) {
+    // Defaults — every code path either keeps these or overwrites with parsed
+    // values, so a bail-out path leaves the kernel in a safe no-op state.
+    sm_mode        = static_cast<uint8_t>(BitpackingMode::INVALID);
+    sm_width       = 0;
+    sm_frame       = T(0);
+    sm_aux         = T(0);
+    sm_data_offset = 0;
+    sm_row_count   = 0;
+
     uint64_t metadata_end;
     memcpy(&metadata_end, block_base, sizeof(uint64_t));
 
-    const uint8_t* entry_addr = block_base + metadata_end - (desc.group_idx + 1) * sizeof(uint32_t);
-    uint32_t encoded;
-    memcpy(&encoded, entry_addr, sizeof(uint32_t));
+    // metadata_end must reach far enough to contain its own (group_idx+1)
+    // encoded entry, and the segment must fit within the 256 KB DuckDB block.
+    bool metadata_ok =
+      metadata_end >= sizeof(uint64_t) + (desc.group_idx + 1) * sizeof(uint32_t) &&
+      static_cast<uint64_t>(desc.block_offset) + metadata_end <= DUCKDB_BLOCK_SIZE;
 
-    sm_mode           = (encoded >> 24) & 0xFF;
-    uint32_t data_off = encoded & 0x00FFFFFF;
-    sm_row_count      = desc.group_row_count;
+    if (metadata_ok) {
+      const uint8_t* entry_addr =
+        block_base + metadata_end - (desc.group_idx + 1) * sizeof(uint32_t);
+      uint32_t encoded;
+      memcpy(&encoded, entry_addr, sizeof(uint32_t));
+      uint32_t data_off    = encoded & 0x00FFFFFF;
+      uint8_t parsed_mode  = (encoded >> 24) & 0xFF;
+      sm_row_count         = desc.group_row_count;
 
-    const uint8_t* dp = block_base + data_off;
-    T v0{}, v1{};
-    memcpy(&v0, dp, sizeof(T));
-    memcpy(&v1, dp + sizeof(T), sizeof(T));
+      // data_off is a within-segment offset; reading frame/width/v2 starts
+      // there and consumes up to 3*sizeof(T) bytes before the packed stream.
+      bool data_off_ok = data_off + 3 * sizeof(T) <= metadata_end;
+      if (data_off_ok) {
+        const uint8_t* dp = block_base + data_off;
+        T v0{}, v1{};
+        memcpy(&v0, dp, sizeof(T));
+        memcpy(&v1, dp + sizeof(T), sizeof(T));
 
-    auto mode = static_cast<BitpackingMode>(sm_mode);
-    switch (mode) {
-      case BitpackingMode::CONSTANT:
-        sm_frame       = v0;
-        sm_aux         = v0;
-        sm_width       = 0;
-        sm_data_offset = 0;
-        break;
-      case BitpackingMode::CONSTANT_DELTA:
-        sm_frame       = v0;
-        sm_aux         = v1;
-        sm_width       = 0;
-        sm_data_offset = 0;
-        break;
-      case BitpackingMode::FOR:
-        sm_frame       = v0;
-        sm_width       = static_cast<uint32_t>(v1);
-        sm_aux         = T(0);
-        sm_data_offset = desc.block_offset + data_off + 2 * sizeof(T);
-        break;
-      case BitpackingMode::DELTA_FOR: {
-        T v2{};
-        memcpy(&v2, dp + 2 * sizeof(T), sizeof(T));
-        sm_frame       = v0;
-        sm_width       = static_cast<uint32_t>(v1);
-        sm_aux         = v2;
-        sm_data_offset = desc.block_offset + data_off + 3 * sizeof(T);
-        break;
+        auto mode = static_cast<BitpackingMode>(parsed_mode);
+        switch (mode) {
+          case BitpackingMode::CONSTANT:
+            sm_mode        = parsed_mode;
+            sm_frame       = v0;
+            sm_aux         = v0;
+            sm_width       = 0;
+            sm_data_offset = 0;
+            break;
+          case BitpackingMode::CONSTANT_DELTA:
+            sm_mode        = parsed_mode;
+            sm_frame       = v0;
+            sm_aux         = v1;
+            sm_width       = 0;
+            sm_data_offset = 0;
+            break;
+          case BitpackingMode::FOR:
+            sm_mode        = parsed_mode;
+            sm_frame       = v0;
+            sm_width       = static_cast<uint32_t>(v1);
+            sm_aux         = T(0);
+            sm_data_offset = desc.block_offset + data_off + 2 * sizeof(T);
+            break;
+          case BitpackingMode::DELTA_FOR: {
+            T v2{};
+            memcpy(&v2, dp + 2 * sizeof(T), sizeof(T));
+            sm_mode        = parsed_mode;
+            sm_frame       = v0;
+            sm_width       = static_cast<uint32_t>(v1);
+            sm_aux         = v2;
+            sm_data_offset = desc.block_offset + data_off + 3 * sizeof(T);
+            break;
+          }
+          default:
+            // Unknown mode — leave sm_mode as INVALID.
+            break;
+        }
+
+        // sizeof(T)*8 is the kernel's hard upper bound for unpack_value;
+        // a wider width would read packed words OOB.
+        if (sm_width > sizeof(T) * 8) {
+          sm_mode  = static_cast<uint8_t>(BitpackingMode::INVALID);
+          sm_width = 0;
+        }
       }
-      default:
-        sm_mode        = static_cast<uint8_t>(BitpackingMode::INVALID);
-        sm_width       = 0;
-        sm_frame       = T(0);
-        sm_aux         = T(0);
-        sm_data_offset = 0;
-        break;
     }
   }
   __syncthreads();
