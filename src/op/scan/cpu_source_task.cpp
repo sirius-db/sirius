@@ -369,7 +369,7 @@ void cpu_source_task::publish_output(op::operator_data& output_data, rmm::cuda_s
       auto ro = batch->to_read_only();
       if (!ro.get_data()) { continue; }
     }
-    _data_repo->add_data_batch(std::move(batch));
+    _data_repo->add_data_batch(batch);
   }
 }
 

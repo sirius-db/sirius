@@ -135,7 +135,10 @@ class operator_data {
  */
 class pipelineable_operator_data : public operator_data {
  public:
-  pipelineable_operator_data() = default;
+  pipelineable_operator_data()
+  {
+    _data_batches = std::vector<std::shared_ptr<::cucascade::data_batch>>();
+  }
   explicit pipelineable_operator_data(
     std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
     : _data_batches(std::move(data_batches))

@@ -37,6 +37,9 @@ const std::vector<std::shared_ptr<::cucascade::data_batch>>&
 pipelineable_operator_data::get_data_batches() const
 {
   if (!_data_batches) {
+    if (!_read_only_data_batches) {
+      throw std::runtime_error("pipelineable_operator_data:get_data_batches no data batches");
+    }
     std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
     batches.reserve(_read_only_data_batches->size());
     for (const auto& ro : *_read_only_data_batches) {
@@ -52,6 +55,9 @@ std::vector<::cucascade::read_only_data_batch> pipelineable_operator_data::get_r
   bool leave_locked) const
 {
   if (!_read_only_data_batches) {
+    if (!_data_batches) {
+      throw std::runtime_error("pipelineable_operator_data:get_read_only_batches no data batches");
+    }
     std::vector<::cucascade::read_only_data_batch> ro_batches;
     ro_batches.reserve(_data_batches->size());
     for (const auto& batch : *_data_batches) {
@@ -69,17 +75,19 @@ std::vector<::cucascade::read_only_data_batch> pipelineable_operator_data::get_r
 bool pipelineable_operator_data::prepare_for_processing(
   const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
 {
-  std::vector<::cucascade::read_only_data_batch> handles;
-  handles.reserve(_data_batches->size());
+  remove_read_only_lock();
+  auto data_batches = get_data_batches();
+  std::vector<::cucascade::read_only_data_batch> ro_batches;
+  ro_batches.reserve(data_batches.size());
 
-  for (const auto& batch : *_data_batches) {
+  for (const auto& batch : data_batches) {
     if (!batch) {
       SIRIUS_LOG_ERROR("pipelineable_operator_data: null batch encountered, skipping");
       return false;
     }
-    std::optional<::cucascade::read_only_data_batch> handle;
+    std::optional<::cucascade::read_only_data_batch> ro_batch;
     try {
-      handle = pipeline::lock_or_prepare_batch(batch, requested_memory_space, stream);
+      ro_batch = pipeline::lock_or_prepare_batch(batch, requested_memory_space, stream);
     } catch (const rmm::out_of_memory&) {
       SIRIUS_LOG_ERROR(
         "pipelineable_operator_data: OOM at batch {} preparing for processing, state: {}",
@@ -95,11 +103,11 @@ bool pipelineable_operator_data::prepare_for_processing(
         e.what());
       throw;
     }
-    if (!handle) { return false; }
-    handles.emplace_back(std::move(*handle));
+    if (!ro_batch) { return false; }
+    ro_batches.emplace_back(std::move(*ro_batch));
   }
 
-  _read_only_data_batches = std::move(handles);
+  _read_only_data_batches = std::move(ro_batches);
   return true;
 }
 
