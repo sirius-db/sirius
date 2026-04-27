@@ -23,6 +23,7 @@
 // null-count readbacks can be applied to columns; no per-column syncs.
 //===----------------------------------------------------------------------===//
 
+#include "cudf/cudf_utils.hpp"
 #include "cuda/scan/device_scratch.cuh"
 #include "cuda/scan/gpu_decode.cuh"
 #include "cuda/scan/gpu_native_decode.cuh"
@@ -59,76 +60,46 @@ using sirius::op::scan::column_scan_result;
 
 namespace {
 
-/// Map DuckDB LogicalType to cudf data_type.
+/// Map DuckDB LogicalType to cudf data_type for the native-scan path.
+///
+/// Delegates to `duckdb::GetCudfType` (cudf_utils.hpp) so we don't drift from
+/// the rest of Sirius. We pre-filter the 128-bit integer types because
+/// `GetCudfType` silently narrows HUGEINT/UHUGEINT to INT64/UINT64 (FIXME
+/// noted in cudf_utils.hpp), and the decoder allocates by *physical* width
+/// (16 B), so a narrowed cudf type would be a buffer/declared-width mismatch
+/// — silent corruption. PR E's check_viability owns keeping these columns
+/// out of the dispatcher; the throw here is a defensive assert.
 cudf::data_type to_cudf_type(const duckdb::LogicalType& type)
 {
+  // Pre-filter types where duckdb::GetCudfType either silently narrows or
+  // produces a cuDF type the fixed-width dispatcher cannot honour. PR E's
+  // check_viability owns keeping these out; the throw is a defensive assert.
   switch (type.id()) {
-    case duckdb::LogicalTypeId::TINYINT: return cudf::data_type(cudf::type_id::INT8);
-    case duckdb::LogicalTypeId::SMALLINT: return cudf::data_type(cudf::type_id::INT16);
-    case duckdb::LogicalTypeId::INTEGER: return cudf::data_type(cudf::type_id::INT32);
-    case duckdb::LogicalTypeId::BIGINT: return cudf::data_type(cudf::type_id::INT64);
-    case duckdb::LogicalTypeId::UTINYINT: return cudf::data_type(cudf::type_id::UINT8);
-    case duckdb::LogicalTypeId::USMALLINT: return cudf::data_type(cudf::type_id::UINT16);
-    case duckdb::LogicalTypeId::UINTEGER: return cudf::data_type(cudf::type_id::UINT32);
-    case duckdb::LogicalTypeId::UBIGINT: return cudf::data_type(cudf::type_id::UINT64);
-    case duckdb::LogicalTypeId::FLOAT: return cudf::data_type(cudf::type_id::FLOAT32);
-    case duckdb::LogicalTypeId::DOUBLE: return cudf::data_type(cudf::type_id::FLOAT64);
-    case duckdb::LogicalTypeId::BOOLEAN: return cudf::data_type(cudf::type_id::BOOL8);
-    case duckdb::LogicalTypeId::DATE: return cudf::data_type(cudf::type_id::TIMESTAMP_DAYS);
-    case duckdb::LogicalTypeId::TIMESTAMP:
-      return cudf::data_type(cudf::type_id::TIMESTAMP_MICROSECONDS);
-    case duckdb::LogicalTypeId::VARCHAR: return cudf::data_type(cudf::type_id::STRING);
-    // HUGEINT is signed 128-bit in DuckDB; cuDF has no int128 column type.
-    // Fall through to the viability-invariant throw below — PR E's
-    // check_viability must refuse HUGEINT columns until cuDF gains support.
-    case duckdb::LogicalTypeId::DECIMAL: {
-      switch (type.InternalType()) {
-        case duckdb::PhysicalType::INT32:
-          return cudf::data_type(cudf::type_id::DECIMAL32, -duckdb::DecimalType::GetScale(type));
-        case duckdb::PhysicalType::INT64:
-          return cudf::data_type(cudf::type_id::DECIMAL64, -duckdb::DecimalType::GetScale(type));
-        case duckdb::PhysicalType::INT128:
-          return cudf::data_type(cudf::type_id::DECIMAL128, -duckdb::DecimalType::GetScale(type));
-        default: break;
-      }
-    }
+    case duckdb::LogicalTypeId::HUGEINT:
+    case duckdb::LogicalTypeId::UHUGEINT:
+      // GetCudfType narrows to INT64/UINT64 (FIXME in cudf_utils.hpp), but the
+      // decoder allocates by physical width (16 B) — narrowed cudf type would
+      // be a buffer/declared-width mismatch.
+      throw std::runtime_error(
+        "gpu_native_decode: viability invariant violated — 128-bit integer "
+        "type " +
+        type.ToString() + " has no cuDF column type");
+    case duckdb::LogicalTypeId::STRUCT:
+    case duckdb::LogicalTypeId::LIST:
+    case duckdb::LogicalTypeId::MAP:
+    case duckdb::LogicalTypeId::ARRAY:
+      // Nested types — fixed-width decoder cannot handle them.
+      throw std::runtime_error(
+        "gpu_native_decode: viability invariant violated — nested type " + type.ToString() +
+        " is not supported by the fixed-width decoder");
     default: break;
   }
-  // Defensive assert: PR E's check_viability owns keeping unsupported types
-  // out of this dispatcher.  Reaching here means viability fell out of sync.
-  throw std::runtime_error(
-    "gpu_native_decode: viability invariant violated — unsupported DuckDB type " + type.ToString());
-}
-
-/// Get byte size of a DuckDB physical type.
-uint32_t get_type_size(duckdb::PhysicalType pt)
-{
-  switch (pt) {
-    case duckdb::PhysicalType::BOOL:
-    case duckdb::PhysicalType::INT8:
-    case duckdb::PhysicalType::UINT8: return 1;
-    case duckdb::PhysicalType::INT16:
-    case duckdb::PhysicalType::UINT16: return 2;
-    case duckdb::PhysicalType::INT32:
-    case duckdb::PhysicalType::UINT32:
-    case duckdb::PhysicalType::FLOAT: return 4;
-    case duckdb::PhysicalType::INT64:
-    case duckdb::PhysicalType::UINT64:
-    case duckdb::PhysicalType::DOUBLE: return 8;
-    case duckdb::PhysicalType::INT128: return 16;
-    default: return 0;
-  }
-}
-
-bool is_signed_type(duckdb::PhysicalType pt)
-{
-  switch (pt) {
-    case duckdb::PhysicalType::INT8:
-    case duckdb::PhysicalType::INT16:
-    case duckdb::PhysicalType::INT32:
-    case duckdb::PhysicalType::INT64:
-    case duckdb::PhysicalType::INT128: return true;
-    default: return false;
+  try {
+    return duckdb::GetCudfType(type);
+  } catch (const duckdb::InvalidInputException& e) {
+    throw std::runtime_error(
+      "gpu_native_decode: viability invariant violated — unsupported DuckDB type " +
+      type.ToString() + " (" + e.what() + ")");
   }
 }
 
@@ -388,8 +359,8 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(column_scan_result& col_
 {
   auto cudf_type     = to_cudf_type(type);
   auto physical_type = type.InternalType();
-  uint32_t type_size = get_type_size(physical_type);
-  bool is_signed     = is_signed_type(physical_type);
+  uint32_t type_size = static_cast<uint32_t>(duckdb::GetTypeIdSize(physical_type));
+  bool is_signed     = type.IsSigned();
   size_t total_rows  = col_scan.data.total_rows;
   if (type_size == 0 || total_rows == 0) return cudf::make_empty_column(cudf_type);
 
