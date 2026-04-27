@@ -115,7 +115,7 @@ struct sirius_config {
   exec::thread_pool_config _task_creator_config{.num_threads        = 2,
                                                 .thread_name_prefix = "task_creator"};
   exec::thread_pool_config _scan_manager_config{.num_threads        = 2,
-                                                  .thread_name_prefix = "scan_manager"};
+                                                .thread_name_prefix = "scan_manager"};
   exec::thread_pool_config _gpu_pipeline_executor_config{.num_threads        = 4,
                                                          .thread_name_prefix = "gpu_pipeline"};
   exec::downgrade_executor_config _downgrade_executor_config;

@@ -21,7 +21,6 @@
 #include <op/scan/parquet_scan_operator_data.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <op/sirius_physical_operator_type.hpp>
-#include <scan_manager/split_connector.hpp>
 
 // cucascade
 #include <cucascade/memory/memory_space.hpp>
@@ -31,10 +30,13 @@
 #include <optional>
 
 namespace sirius::scan_manager {
-class split_provider;
+class split_connector;
+class sirius_scan_manager;
 }  // namespace sirius::scan_manager
 
 namespace sirius::op::scan {
+
+struct parquet_scan_info;
 
 //===----------------------------------------------------------------------===//
 // Parquet scan operator
@@ -43,12 +45,13 @@ namespace sirius::op::scan {
  * @brief Operator that reads parquet byte ranges for a batch of row groups and produces
  *        gpu_table_representation data batches for downstream GPU operators.
  *
- * This operator is the source of the GPU parquet scan pipeline. Its splits — one
- * parquet_scan_data per row-group partition — are produced by a parquet_split_provider
- * driven by the scan_manager on its own thread pool, and pushed into the operator's
- * bound split_connector. The operator pulls splits from the connector via
- * get_next_task_input_data(); get_next_task_hint() reports READY (self) until the
- * connector is closed and drained, then nullopt.
+ * The operator carries a parquet_scan_info populated by the pipeline converter; the
+ * scan_manager reads it during prepare_for_query to construct a parquet_split_provider
+ * for this operator. Splits — one parquet_scan_data per row-group partition — are
+ * pushed into the operator's bound split_connector by the provider on the scan_manager
+ * thread pool. The operator pulls splits via get_next_task_input_data(), which blocks
+ * inside split_connector::get_next_split until a split arrives or the connector is
+ * closed.
  */
 class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
  public:
@@ -58,59 +61,14 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
   /**
    * @param types                  Output column types (forwarded from the parquet scan operator).
    * @param estimated_cardinality  Estimated row count.
+   * @param scan_info              Bind-data extracted by the pipeline converter, consumed
+   *                               by the scan_manager during prepare_for_query.
    */
   sirius_gpu_parquet_scan_operator(duckdb::vector<sirius::logical_type> types,
-                                   duckdb::idx_t estimated_cardinality);
+                                   duckdb::idx_t estimated_cardinality,
+                                   std::unique_ptr<parquet_scan_info> scan_info);
 
   ~sirius_gpu_parquet_scan_operator() override;
-
-  //===----------Split-connector binding----------===//
-  /**
-   * @brief Replace the bound split_connector. Intended for the scan_manager to install
-   *        its own connector during query preparation; before this is called, the
-   *        operator uses an internally-allocated default connector.
-   */
-  void set_split_connector(std::unique_ptr<scan_manager::split_connector> connector);
-
-  /**
-   * @brief Get the bound split_connector for split production. Never null — the
-   *        operator default-allocates a connector at construction.
-   */
-  scan_manager::split_connector* get_split_connector() noexcept
-  {
-    return _split_connector.get();
-  }
-
-  //===----------Split-provider handoff to scan_manager----------===//
-  /**
-   * @brief Attach the split provider constructed during plan generation.
-   *
-   * The pipeline converter extracts bind_data and builds a parquet_split_provider
-   * here so the scan_manager can take ownership during prepare_for_query and
-   * start it on the scan-manager thread pool.
-   */
-  void attach_split_provider(std::unique_ptr<scan_manager::split_provider> provider);
-
-  /**
-   * @brief Take ownership of the attached split provider. Returns nullptr if
-   *        none was attached.
-   */
-  std::unique_ptr<scan_manager::split_provider> take_split_provider();
-
-  /**
-   * @brief Install a hive-partition injection function.
-   *
-   * Called once by the paired split provider during plan generation when the scan
-   * involves hive partition columns. The closure, built by build_partition_inject_fn(),
-   * is invoked by execute() after the data columns have been read from the parquet file,
-   * to interleave partition-column values parsed from the file path into the output table.
-   *
-   * No-op (leaves _hive_partition_inject_fn null) for non-partitioned scans.
-   */
-  void set_hive_partition_inject_fn(partition_inject_fn_t fn)
-  {
-    _hive_partition_inject_fn = std::move(fn);
-  }
 
   //===----------Source interface----------===//
   bool is_source() const override { return true; }
@@ -130,11 +88,10 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
   /**
    * @brief Pull the next parquet_scan_data from the bound split_connector.
    *
-   * @return the next split, or nullptr when no split is currently available
-   *         (either the connector is empty-but-open, or it has been closed and
-   *         drained). Returning nullptr does not imply the scan is finished —
-   *         the caller must consult get_next_task_hint() / all_ports_empty()
-   *         for that.
+   * Blocks inside split_connector::get_next_split until a split is available or
+   * the connector is closed.
+   *
+   * @return the next split, or nullptr when the connector is closed and drained.
    */
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
@@ -153,9 +110,31 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
                                          rmm::cuda_stream_view stream) override;
 
  private:
+  // The scan_manager owns the wiring between this operator and its split_provider.
+  // No other code should reach into scan_info / connector / hive-inject installation,
+  // so those entry points are private and exposed only through this friend.
+  friend class scan_manager::sirius_scan_manager;
+
+  /// \brief Take ownership of the bind-data so the scan_manager's factory can build a
+  ///        split provider. Called once per query; subsequent calls return nullptr.
+  std::unique_ptr<parquet_scan_info> take_scan_info();
+
+  /// \brief Install the split connector that the scan_manager will feed.
+  void set_split_connector(std::unique_ptr<scan_manager::split_connector> connector);
+
+  /// \brief Connector accessor for the scan_manager driver.
+  scan_manager::split_connector* get_split_connector() noexcept { return _split_connector.get(); }
+
+  /// \brief Install a hive-partition injection closure used by execute() to interleave
+  ///        partition-column values into the output table. No-op for non-partitioned scans.
+  void set_hive_partition_inject_fn(partition_inject_fn_t fn)
+  {
+    _hive_partition_inject_fn = std::move(fn);
+  }
+
   partition_inject_fn_t _hive_partition_inject_fn;
   std::unique_ptr<scan_manager::split_connector> _split_connector;
-  std::unique_ptr<scan_manager::split_provider> _split_provider;
+  std::unique_ptr<parquet_scan_info> _scan_info;
 };
 
 }  // namespace sirius::op::scan

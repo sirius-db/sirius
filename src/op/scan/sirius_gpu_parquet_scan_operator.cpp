@@ -18,12 +18,12 @@
 #include <data/data_batch_utils.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <log/logging.hpp>
+#include <op/scan/parquet_scan_info.hpp>
 #include <op/scan/parquet_scan_operator_data.hpp>
 #include <op/scan/sirius_gpu_parquet_scan_operator.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <pipeline/sirius_meta_pipeline.hpp>
 #include <scan_manager/split_connector.hpp>
-#include <scan_manager/split_provider.hpp>
 
 // cudf
 #include <cudf/io/parquet.hpp>
@@ -43,37 +43,30 @@ namespace sirius::op::scan {
 // Constructor
 //===----------------------------------------------------------------------===//
 sirius_gpu_parquet_scan_operator::sirius_gpu_parquet_scan_operator(
-  duckdb::vector<sirius::logical_type> types, duckdb::idx_t estimated_cardinality)
+  duckdb::vector<sirius::logical_type> types,
+  duckdb::idx_t estimated_cardinality,
+  std::unique_ptr<parquet_scan_info> scan_info)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::GPU_PARQUET_SCAN, std::move(types), estimated_cardinality),
-    _split_connector(std::make_unique<scan_manager::split_connector>())
+    _split_connector(std::make_unique<scan_manager::split_connector>()),
+    _scan_info(std::move(scan_info))
 {
 }
 
 sirius_gpu_parquet_scan_operator::~sirius_gpu_parquet_scan_operator() = default;
 
 //===----------------------------------------------------------------------===//
-// Split-connector binding
+// Friend access — wired by sirius_scan_manager during prepare_for_query.
 //===----------------------------------------------------------------------===//
+std::unique_ptr<parquet_scan_info> sirius_gpu_parquet_scan_operator::take_scan_info()
+{
+  return std::move(_scan_info);
+}
+
 void sirius_gpu_parquet_scan_operator::set_split_connector(
   std::unique_ptr<scan_manager::split_connector> connector)
 {
   _split_connector = std::move(connector);
-}
-
-//===----------------------------------------------------------------------===//
-// Split-provider handoff
-//===----------------------------------------------------------------------===//
-void sirius_gpu_parquet_scan_operator::attach_split_provider(
-  std::unique_ptr<scan_manager::split_provider> provider)
-{
-  _split_provider = std::move(provider);
-}
-
-std::unique_ptr<scan_manager::split_provider>
-sirius_gpu_parquet_scan_operator::take_split_provider()
-{
-  return std::move(_split_provider);
 }
 
 //===----------------------------------------------------------------------===//

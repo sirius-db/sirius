@@ -55,8 +55,8 @@ parquet_split_provider::parquet_split_provider(
     _max_file_processed(max_file_processed),
     _total_files(file_paths.size())
 {
-  _selected_column_indices = op::scan::detail::make_selected_column_indices(column_ids,
-                                                                            projection_ids);
+  _selected_column_indices =
+    op::scan::detail::make_selected_column_indices(column_ids, projection_ids);
 
   // Hive partition columns live in the DuckDB schema but not in parquet files.
   // Drop them from the selected indices and stash them so the gpu scan op can
@@ -85,13 +85,9 @@ parquet_split_provider::parquet_split_provider(
   // deferred to the metadata-scan task so a per-task CUDA stream can be used.
   _has_filter = false;
   if (table_filter_set && !table_filter_set->filters.empty()) {
-    auto batch_column_map = op::build_batch_column_map(projection_ids, column_ids.size());
-    auto duckdb_expression =
-      op::convert_table_filters_to_expression(*table_filter_set,
-                                              column_ids,
-                                              returned_types,
-                                              batch_column_map,
-                                              _hive_partition_index_set);
+    auto batch_column_map  = op::build_batch_column_map(projection_ids, column_ids.size());
+    auto duckdb_expression = op::convert_table_filters_to_expression(
+      *table_filter_set, column_ids, returned_types, batch_column_map, _hive_partition_index_set);
     if (duckdb_expression) {
       _has_filter               = true;
       _duckdb_filter_expression = std::move(duckdb_expression);
@@ -152,8 +148,7 @@ std::optional<parquet_split_provider::file_batch> parquet_split_provider::next_t
   return batch;
 }
 
-std::future<void> parquet_split_provider::start(exec::thread_pool& pool,
-                                                split_connector& connector)
+std::future<void> parquet_split_provider::start(exec::thread_pool& pool, split_connector& connector)
 {
   // Drain all batches up-front so we can size the remaining-task counter
   // precisely; the connector closes when the last batch lands.
@@ -199,9 +194,7 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
   std::variant<std::shared_ptr<op::scan::parquet_scan_data::translated_expression>,
                std::shared_ptr<duckdb::Expression>>
     filter_expression;
-  if (_has_filter) {
-    filter_expression = _duckdb_filter_expression;
-  }
+  if (_has_filter) { filter_expression = _duckdb_filter_expression; }
 
   std::size_t file_idx = 0;
   for (auto const& file_path : batch.file_paths) {
@@ -228,10 +221,9 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
         auto leaves =
           op::scan::detail::leaf_indices_for_column(metadata, _projected_column_names[k]);
         if (leaves.size() != 1) {
-          throw std::runtime_error("[parquet_split_provider] Projected column '" +
-                                   _projected_column_names[k] +
-                                   "' did not resolve to exactly one parquet leaf in file: " +
-                                   file_path);
+          throw std::runtime_error(
+            "[parquet_split_provider] Projected column '" + _projected_column_names[k] +
+            "' did not resolve to exactly one parquet leaf in file: " + file_path);
         }
         selected_chunk_indices.push_back(leaves.front());
         if (_pure_filter_column_indices.contains(_selected_column_indices[k])) {
@@ -258,7 +250,7 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
       partition_rg_indices         = {};
       partition_uncompressed_bytes = 0;
       partition_compressed_bytes   = 0;
-      auto split = std::make_unique<op::scan::parquet_scan_data>(file_path,
+      auto split                   = std::make_unique<op::scan::parquet_scan_data>(file_path,
                                                                  std::move(rg),
                                                                  reader_options,
                                                                  filter_expression,

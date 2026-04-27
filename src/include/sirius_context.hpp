@@ -23,8 +23,8 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "planner/query.hpp"
-#include "sirius_config.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
+#include "sirius_config.hpp"
 
 #include <rmm/resource_ref.hpp>
 

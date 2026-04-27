@@ -18,8 +18,8 @@
 
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "log/logging.hpp"
+#include "op/scan/parquet_scan_info.hpp"
 #include "op/scan/sirius_gpu_parquet_scan_operator.hpp"
-#include "scan_manager/parquet_split_provider.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cpu_source.hpp"
@@ -189,28 +189,19 @@ void sirius_pipeline_converter::split_parquet_scan_source(
   }
   auto const& partition_indices = bind_data.reader_bind.hive_partitioning_indexes;
 
-  auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_parquet_scan_operator>(
-    scan_op.types, scan_op.estimated_cardinality);
-  auto provider = std::make_unique<scan_manager::parquet_split_provider>(
-    scan_op.returned_types,
-    file_paths,
-    scan_op.column_ids,
-    scan_op.projection_ids,
-    scan_op.names,
-    scan_op.types.size(),
-    std::move(scan_op.table_filters),
-    partition_indices);
+  auto scan_info               = std::make_unique<op::scan::parquet_scan_info>();
+  scan_info->returned_types    = scan_op.returned_types;
+  scan_info->file_paths        = std::move(file_paths);
+  scan_info->column_ids        = scan_op.column_ids;
+  scan_info->projection_ids    = scan_op.projection_ids;
+  scan_info->names             = scan_op.names;
+  scan_info->table_filters     = std::move(scan_op.table_filters);
+  scan_info->partition_indices = partition_indices;
 
-  // Install hive-partition injection on gpu_scan_op (was previously done from
-  // inside the metadata scan operator's constructor).
-  if (auto inject_fn = provider->take_hive_partition_inject_fn()) {
-    gpu_scan_op->set_hive_partition_inject_fn(std::move(inject_fn));
-  }
+  auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_parquet_scan_operator>(
+    scan_op.types, scan_op.estimated_cardinality, std::move(scan_info));
 
   auto* gpu_scan_ptr = gpu_scan_op.get();
-
-  // Park the provider on gpu_scan_op so the scan_manager can take and start it.
-  gpu_scan_op->attach_split_provider(std::move(provider));
 
   // gpu_scan_op replaces the table scan as the new source. finalize_pipeline_structure()
   // will set current_pipeline->source = &operators[0] = gpu_scan_op.
@@ -350,7 +341,7 @@ void sirius_pipeline_converter::split_intermediate_joins(
       pipeline_breakers_.push_back(std::move(partition_op));
     }
 
-    op::sirius_physical_partition* partition_ptr =
+    auto* partition_ptr =
       static_cast<op::sirius_physical_partition*>(pipeline_breakers_.back().get());
 
     if (join_pos > 0) {
@@ -397,8 +388,7 @@ void sirius_pipeline_converter::split_intermediate_joins(
     concat_pipeline->sink   = concat_op.get();
 
     pipeline_breakers_.push_back(std::move(concat_op));
-    op::sirius_physical_concat* concat_ptr =
-      static_cast<op::sirius_physical_concat*>(pipeline_breakers_.back().get());
+    auto* concat_ptr = static_cast<op::sirius_physical_concat*>(pipeline_breakers_.back().get());
 
     scheduled_.push_back(concat_pipeline);
 
@@ -456,8 +446,7 @@ void sirius_pipeline_converter::split_join_sink(
       op_params_.hash_partition_bytes);
   }
 
-  op::sirius_physical_partition* partition_ptr =
-    static_cast<op::sirius_physical_partition*>(partition_op.get());
+  auto* partition_ptr = static_cast<op::sirius_physical_partition*>(partition_op.get());
 
   if (current_pipeline->operators.size() > 0) {
     // Last op before HASH_JOIN becomes the sink
@@ -510,7 +499,7 @@ void sirius_pipeline_converter::split_group_aggregate_sink(
                                                op_params_.hash_partition_bytes);
     pipeline_breakers_.push_back(std::move(partition_op));
 
-    op::sirius_physical_partition* partition_ptr =
+    auto* partition_ptr =
       static_cast<op::sirius_physical_partition*>(pipeline_breakers_.back().get());
 
     // Keep GROUP_BY as the sink (don't move it to operators)
@@ -727,7 +716,7 @@ void sirius_pipeline_converter::split_delim_join_sink(
                                              distinct_op.get(),
                                              false,
                                              op_params_.hash_partition_bytes);
-  op::sirius_physical_partition* partition_distinct_ptr =
+  auto* partition_distinct_ptr =
     static_cast<op::sirius_physical_partition*>(partition_distinct.get());
 
   // The pipeline that contains the delim join as sink
