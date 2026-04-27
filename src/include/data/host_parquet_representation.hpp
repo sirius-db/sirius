@@ -64,6 +64,16 @@ using post_convert_fn_t =
                                              rmm::cuda_stream_view)>;
 
 /**
+ * @brief Function that injects hive partition columns into a GPU table.
+ *
+ * Called after post_convert (if any) to add constant partition columns
+ * (whose values come from the file path, not the parquet data) at the
+ * correct positions in the output table.
+ */
+using partition_inject_fn_t = std::function<std::unique_ptr<cudf::table>(
+  std::unique_ptr<cudf::table>, std::string const& data_file_path, rmm::cuda_stream_view)>;
+
+/**
  * @brief A host representation of Parquet data for use in a hybrid scan.
  *
  * This class encapsulates the necessary components to decompress a slice and/or projection of

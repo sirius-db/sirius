@@ -57,10 +57,9 @@ namespace sirius::op::scan {
  *     sirius_gpu_parquet_scan_operator via its accumulate_metadata() entry point.
  *     This is a direct handoff — no inter-pipeline port or data repository is
  *     involved; the metadata never flows through the generic pipeline data path.
- *   - finalize_operator() (invoked once after pipeline 1 completes) calls
- *     gpu_scan::finalize_partitions(), which freezes the partition index and
- *     unblocks the downstream scan pipeline (pipeline 2), where gpu_scan serves
- *     as the source.
+ *   - Completion of this pipeline is detected by the downstream gpu_scan operator
+ *     via the standard "handoff" port / is_pipeline_finished() mechanism — no
+ *     explicit finalize callback is needed.
  *
  * @pre The caller must validate before construction that:
  *   - The table function is NOT an in-out function (in_out_function == false).
@@ -185,17 +184,6 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
    */
   void sink(const operator_data& input_data, rmm::cuda_stream_view stream) override;
 
-  /**
-   * @brief Finalize the paired gpu_scan's partition index, unblocking the downstream pipeline.
-   *
-   * Invoked by the pipeline framework exactly once, after every sink() call for this pipeline
-   * has returned. Delegates to gpu_scan::finalize_partitions(), which freezes the accumulated
-   * metadata into a flat partition index and publishes it with release semantics. Until this
-   * call completes, gpu_scan's source methods report "not ready" and the downstream scan
-   * pipeline cannot begin dispatching tasks.
-   */
-  void finalize_operator() override;
-
   //===----------Accessors----------===//
   [[nodiscard]] std::size_t get_total_files() const { return _total_files; }
   [[nodiscard]] std::size_t get_max_file_processed() const { return _max_file_processed; }
@@ -219,8 +207,7 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
   std::atomic<std::size_t> _next_file_idx{0};
 
   /// Paired GPU parquet scan operator — the source of the downstream pipeline. sink() forwards
-  /// accumulated metadata into it; finalize_operator() freezes its partition index. Set at
-  /// construction; never null.
+  /// accumulated metadata into it via accumulate_metadata(). Set at construction; never null.
   sirius_gpu_parquet_scan_operator* _gpu_scan;
 };
 

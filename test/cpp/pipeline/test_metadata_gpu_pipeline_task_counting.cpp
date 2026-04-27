@@ -293,11 +293,6 @@ TEST_CASE("pipeline task counting - single file, default max_file_processed (one
   REQUIRE(metadata_pipeline->get_tasks_completed() == 1);
   REQUIRE(metadata_pipeline->is_pipeline_finished());
 
-  // Hand off to pipeline 2. In production this runs off the sink's
-  // finalize_operator(); update_pipeline_status() only walks get_operators(),
-  // so a single-op self-pipeline needs the engine to invoke it.
-  metadata_op.finalize_operator();
-
   // ----------- pipeline 2: gpu parquet scan -----------
   std::size_t gpu_tasks =
     simulate_task_creator_loop(*gpu_pipeline, gpu_op, [&](sirius::op::operator_data& input) {
@@ -379,12 +374,8 @@ TEST_CASE("pipeline task counting - multi-file metadata scan with max_file_proce
   REQUIRE(metadata_pipeline->get_tasks_completed() == NUM_FILES);
   REQUIRE(metadata_pipeline->is_pipeline_finished());
 
-  // Bridge to pipeline 2 (see note in the single-file test).
-  metadata_op.finalize_operator();
-
-  // Before finalize the gpu op must have been "waiting" on the metadata
-  // pipeline via the handoff port; now that metadata is done,
-  // is_source_pipeline_finished() on gpu_op should report true.
+  // The metadata pipeline is finished; the gpu op detects this via the
+  // handoff port's src_pipeline->is_pipeline_finished().
   REQUIRE(gpu_op.is_source_pipeline_finished());
 
   // ----------- pipeline 2: gpu scan over all accumulated partitions -----------

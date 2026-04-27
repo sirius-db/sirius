@@ -16,39 +16,101 @@
 
 #pragma once
 
-#include <duckdb/main/client_context.hpp>
+#include <cudf/io/parquet_schema.hpp>
+#include <cudf/join/distinct_hash_join.hpp>
+#include <cudf/table/table.hpp>
 
+#include <duckdb/main/client_context.hpp>
+#include <op/scan/iceberg_avro_reader.hpp>
+
+#include <memory>
+#include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace sirius::op::scan {
 
 /**
- * @brief Discovered Iceberg delete-file metadata for one table.
+ * @brief Fully materialized Iceberg delete data for one table.
+ *
+ * All I/O (positional deletes, deletion vectors, equality deletes) is
+ * performed once during sirius_engine::initialize() under a single
+ * InternalQueryGuard.  This struct is immutable after construction and
+ * is shared (via shared_ptr<const>) across the operator, task creator,
+ * and delete filters.
  */
-struct IcebergDeleteFiles {
-  std::vector<std::string> positional_delete_files;
-  std::vector<std::string> equality_delete_files;
+/// One group of equality-delete files sharing the same key column schema.
+struct EqualityDeleteGroup {
+  /// GPU-resident deduplicated key table.
+  std::unique_ptr<cudf::table> delete_table;
+  /// Column names (parallel to table columns).
+  std::vector<std::string> key_names;
+  /// Iceberg field IDs for each key column (populated when available).
+  std::vector<std::optional<int32_t>> key_field_ids;
+  /// Pre-built GPU hash join (build side = delete_table).
+  std::unique_ptr<cudf::distinct_hash_join> hash_join;
+  /// Sequence number of the delete file(s) in this group.
+  /// Per Iceberg spec, this group only applies to data files with
+  /// data_file_sequence_number < this value (strictly lower).
+  int64_t sequence_number{0};
+};
+
+struct IcebergDeleteData {
+  /// V2 positional deletes + V3 deletion vectors (merged, sorted).
+  /// Key: data_file_path, Value: sorted deleted row positions.
+  /// Stored on CPU (tiny metadata).
+  std::unordered_map<std::string, std::vector<int64_t>> positional_deletes;
+
+  /// V2 equality-delete groups (one per unique key-column schema).
+  /// Supports heterogeneous delete files (e.g., delete by "name" vs "name+bir").
+  std::vector<EqualityDeleteGroup> equality_delete_groups;
+
+  /// Per-data-file sequence numbers (for equality delete seq filtering).
+  /// Key: data_file_path, Value: sequence number from manifest entry.
+  std::unordered_map<std::string, int64_t> data_file_sequence_numbers;
+
+  /// True if there are no deletes to apply (V1 table or empty manifests).
+  [[nodiscard]] bool empty() const
+  {
+    return positional_deletes.empty() && equality_delete_groups.empty();
+  }
 };
 
 /**
- * @brief Read Iceberg delete-file metadata for the given table path.
+ * @brief Read and fully materialize Iceberg delete data for the given table.
  *
- * Uses a single discovery path:
- *   1. iceberg_snapshots() → manifest_list path
- *   2. Avro manifest-list reader → list of manifests with content types
- *   3. Avro manifest reader → delete file paths per content type
+ * Consolidates all delete-related I/O into one call:
+ *   1. Discovers delete file paths via iceberg_snapshots() + Avro manifests.
+ *   2. Reads V2 positional-delete parquet files (CPU via DuckDB).
+ *   3. Reads V3 deletion vectors from Puffin files (CPU).
+ *   4. Reads V2 equality-delete parquet files (GPU via cuDF).
+ *   5. Deduplicates equality deletes and builds the GPU hash join.
  *
- * This avoids DuckDB's iceberg_metadata() which fails on tables with
- * equality-delete manifests in DuckDB 1.4.4.
+ * Caller must ensure DuckDB side-effects are suppressed (InternalQueryGuard).
+ * Falls back gracefully on errors (returns empty data, treated as V1).
  *
- * Falls back gracefully on errors (treats as V1 with no deletes).
- *
- * @param context    DuckDB client context for running iceberg_snapshots().
+ * @param context    DuckDB client context for running iceberg_snapshots()
+ *                   and reading positional-delete parquet files.
  * @param table_path The Iceberg table path passed to iceberg_scan().
- * @return Delete file metadata (both vectors empty for V1 tables).
+ * @return Shared pointer to immutable delete data.
  */
-IcebergDeleteFiles read_iceberg_delete_metadata(duckdb::ClientContext& context,
-                                                std::string const& table_path);
+std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
+  duckdb::ClientContext& context,
+  std::string const& table_path,
+  std::optional<uint64_t> snapshot_id = std::nullopt);
+
+/**
+ * @brief Extract a column_name → field_id map from a parquet FileMetaData.
+ *
+ * Walks the flattened schema depth-first and collects field IDs for leaf
+ * columns (num_children == 0).  Columns without a field_id are omitted.
+ *
+ * @param file_meta  Parquet file metadata (from read_parquet_footers or
+ *                   parquet_scan_task_global_state::_file_metadatas).
+ * @return Map of column name to Iceberg field ID.
+ */
+std::unordered_map<std::string, int32_t> extract_field_id_map(
+  cudf::io::parquet::FileMetaData const& file_meta);
 
 }  // namespace sirius::op::scan

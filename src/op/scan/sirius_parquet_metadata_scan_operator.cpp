@@ -18,7 +18,7 @@
 #include <log/logging.hpp>
 #include <op/scan/hive_partition.hpp>  // build_partition_inject_fn
 #include <op/scan/parquet_scan_operator_data.hpp>
-#include <op/scan/parquet_scan_task.hpp>  // detail::make_selected_column_indices, detail::projected_columns_are_flat
+#include <op/scan/parquet_scan_task.hpp>       // detail::make_selected_column_indices
 #include <op/scan/parquet_schema_mapping.hpp>  // detail::leaf_indices_for_column
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_parquet_scan_operator.hpp>
@@ -163,30 +163,26 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
     // parquet column name. scan_plan::batch_column_name is the single source of truth for
     // this D→name mapping; the previously-cached _column_name_by_ref was C-indexed and
     // silently wrong whenever projection reordered or dropped columns.
-
-    /// KEVIN: There is a stream/concurrency bug in the AST filter at large scale factors. Looking
-    /// into it.
-
-    // gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
-    // auto name_resolver = [this](duckdb::idx_t ref_index) -> std::string {
-    //   return _plan.batch_column_name(ref_index);
-    // };
-    // auto optional_filter =
-    //   translator.translate_expression_with_names(*_duckdb_filter_expression, name_resolver);
-    // stream.synchronize();
-    // if (optional_filter) {
-    //   ast_filter = std::make_shared<translated_expression>(std::move(*optional_filter));
-    //   result->reader_options->set_filter(ast_filter->back());
-    //   result->filter_expression = ast_filter;
-    //   SIRIUS_LOG_DEBUG(
-    //     "[sirius_parquet_metadata_scan_operator] Translated filter expression for pushdown.");
-    // } else {
-    //   result->filter_expression = _duckdb_filter_expression;
-    //   SIRIUS_LOG_DEBUG(
-    //     "[sirius_parquet_metadata_scan_operator] AST translation failed; filter will be applied "
-    //     "post-read by the GPU scan operator.");
-    // }
-    result->filter_expression = _duckdb_filter_expression;
+    auto name_resolver = [this](duckdb::idx_t ref_index) -> std::string {
+      return _plan.batch_column_name(ref_index);
+    };
+    gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
+    auto optional_filter =
+      translator.translate_expression_with_names(*_duckdb_filter_expression, name_resolver);
+    if (optional_filter) {
+      stream.synchronize();  // Ensure scalars are materialized for downstream operators executing
+                             // in other streams.
+      ast_filter = std::make_shared<translated_expression>(std::move(*optional_filter));
+      result->reader_options->set_filter(ast_filter->back());
+      result->filter_expression = ast_filter;
+      SIRIUS_LOG_DEBUG(
+        "[sirius_parquet_metadata_scan_operator] Translated filter expression for pushdown.");
+    } else {
+      result->filter_expression = _duckdb_filter_expression;
+      SIRIUS_LOG_DEBUG(
+        "[sirius_parquet_metadata_scan_operator] AST translation failed; filter will be applied "
+        "post-read by the GPU scan operator.");
+    }
   }
   // post_filter_projection_ids is intentionally left empty: the scan_plan-backed inject
   // closure handles output assembly (data + partition + pure-filter drop) in one pass, so
@@ -207,12 +203,6 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
       cudf::host_span<uint8_t const>(footer_buffer->data(), footer_buffer->size()),
       *result->reader_options);
     auto metadata = reader.parquet_metadata();
-    if (_plan.is_projected() && !detail::projected_columns_are_flat(metadata, data_column_names)) {
-      /// TODO: Support nested column schemas with projection.
-      throw std::runtime_error(
-        "[sirius_parquet_metadata_scan_operator] Parquet scans with projections currently only "
-        "support flat projected columns.");
-    }
 
     //===----------Resolve selected DuckDB columns to parquet column chunk indices----------===//
     // row_group.columns is indexed in parquet schema-leaf order (preorder), which can differ from
@@ -225,14 +215,16 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
       selected_chunk_indices.reserve(data_column_names.size());
       for (std::size_t k = 0; k < data_column_names.size(); ++k) {
         auto leaves = detail::leaf_indices_for_column(metadata, data_column_names[k]);
-        // projected_columns_are_flat (checked above) guarantees exactly one leaf per name.
-        if (leaves.size() != 1) {
-          throw std::runtime_error(
-            "[sirius_parquet_metadata_scan_operator] Projected column '" + data_column_names[k] +
-            "' did not resolve to exactly one parquet leaf in file: " + file_path);
+        if (leaves.empty()) {
+          throw std::runtime_error("[sirius_parquet_metadata_scan_operator] Projected column '" +
+                                   data_column_names[k] +
+                                   "' not found in parquet file: " + file_path);
         }
-        selected_chunk_indices.push_back(leaves.front());
-        if (pure_filter_positions.count(k)) { pure_filter_chunk_indices.insert(leaves.front()); }
+        bool const is_pure_filter = pure_filter_positions.count(k);
+        for (auto const leaf : leaves) {
+          selected_chunk_indices.push_back(leaf);
+          if (is_pure_filter) { pure_filter_chunk_indices.insert(leaf); }
+        }
       }
     }
 
@@ -338,11 +330,6 @@ void sirius_parquet_metadata_scan_operator::sink(const operator_data& input_data
       "expected partitioned_parquet_metadata.");
   }
   _gpu_scan->accumulate_metadata(*metadata);
-}
-
-void sirius_parquet_metadata_scan_operator::finalize_operator()
-{
-  _gpu_scan->finalize_partitions();
 }
 
 }  // namespace sirius::op::scan
