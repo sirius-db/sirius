@@ -75,7 +75,7 @@ Full details: `.planning/milestones/v1.1-ROADMAP.md`
 **Requirements**: CRIT-1, CRIT-2, CRIT-6 (inherited v1.2 ship-gate IDs still open after Phase 9; CRIT-4 closed by Plan 09-03 disjointness REQUIRE)
 **Evidence source**: `.planning/phases/09-scan-task-distributor-batch-ownership-affinity/09-VERIFICATION.md` (`gaps`, `open_issue_carryforward`, `hypotheses` H1–H4) + `09-04-VALIDATION.md` Open Issue section
 **Success Criteria**: (1) `./build/release/extension/sirius/test/cpp/sirius_unittest 'gpu_execution - filter equality parquet'` exits 0 on both 1-GPU and 2-GPU envs. (2) Full MCP unit-tests suite exits 0 with `integration.yaml` at `num_gpus: 2` (88 SF1 variants + SF10 Q1/Q6/Q12 all green). (3) Re-running the 09-04-PLAN.md ship-gate procedure produces `verdict: PASS` in a new VALIDATION.md (SF100 Q1 num_gpus=2 byte-identical vs 1-GPU baseline AND unit-tests green). (4) HYG-02 baseline preserved (`grep -c 'rmm::cuda_stream_default' src/` ≤ 41). (5) Feature branch `feature/single-node-multi-gpu2` preserved; fix scoped (< 100 LOC expected).
-**Plans:** 1/4 plans executed
+**Plans:** 2/4 plans executed
 
 Plans:
 - [ ] TBD (run /gsd:plan-phase 10 to break down)

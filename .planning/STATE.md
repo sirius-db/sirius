@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: Multi-GPU SQL Pipeline Fix
 status: executing
-stopped_at: "Completed 10-01-PLAN.md (bisect: regressing_commit=NONE, SIGSEGV test-ordering dependent)"
-last_updated: "2026-04-27T15:16:52.173Z"
+stopped_at: "Completed 10-02-PLAN.md (GDB analysis: H1 confirmed, stream-ordered race in parquet filter translation)"
+last_updated: "2026-04-27T16:04:29.862Z"
 last_activity: 2026-04-27
 progress:
   total_phases: 3
   completed_phases: 1
   total_plans: 18
-  completed_plans: 13
+  completed_plans: 14
   percent: 100
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-04-21)
 ## Current Position
 
 Phase: 10 (table-function-form-gpu-execution-sigsegv-fix) — EXECUTING
-Plan: 2 of 4
+Plan: 3 of 4
 Status: Ready to execute
 Last activity: 2026-04-27
 
@@ -49,6 +49,7 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 | Phase 09 P03 | 5min | 1 tasks | 1 files |
 | Phase 09 P04 | 2h | 4 tasks | 2 files |
 | Phase 10 P01 | 26min | 3 tasks | 1 files |
+| Phase 10 P02 | 46min | 3 tasks | 1 files |
 
 ## Decisions
 
@@ -83,6 +84,9 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 - [Phase 09]: [09-04] MCP unit-tests wrapper does not pass agent shell env to child process; SIRIUS_TEST_SF10_PATH and SIRIUS_LOG_DIR had to be set via direct binary invocation (Rule 3 auto-fix). MCP build gate still used for build verification.
 - [Phase 10]: regressing_commit=NONE: all 5 Phase-9 source commits (3b58258..c0e12f3) pass isolated test; SIGSEGV is test-ordering dependent
 - [Phase 10]: FU17 partial fix changes at HEAD change SIGSEGV to cudaErrorContextIsDestroyed; Plan 10-02 should gdb clean state (c0e12f3) with full-suite --abort ~[hive_partition] to reproduce original SIGSEGV
+- [Phase 10]: H1 confirmed: SIGSEGV is stream-ordered race in sirius_physical_parquet_scan.cpp using rmm::cuda_stream_default for gpu_expression_translator; scalars race with planning_stream in parquet_scan_task.cpp:492
+- [Phase 10]: GDB Heisenbug: Catch2 sigsetjmp/siglongjmp signal handler causes SIGSEGV to be swallowed under GDB (test completes normally). Static analysis + FU17 diff developer comment used as primary fault-frame evidence source
+- [Phase 10]: H2 (TABLE_FUNCTION vs PROCEDURE divergence) ruled out: both CALL and SELECT * FROM gpu_execution() use same GPUExecutionBind/GPUExecutionFunction; crash is parquet-fixture-specific, not TABLE_FUNCTION-form-specific
 
 ## Accumulated Context
 
@@ -126,6 +130,6 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 
 ## Session Continuity
 
-Last session: 2026-04-27T15:16:52.171Z
-Stopped at: Completed 10-01-PLAN.md (bisect: regressing_commit=NONE, SIGSEGV test-ordering dependent)
+Last session: 2026-04-27T16:04:29.859Z
+Stopped at: Completed 10-02-PLAN.md (GDB analysis: H1 confirmed, stream-ordered race in parquet filter translation)
 Resume file: None
