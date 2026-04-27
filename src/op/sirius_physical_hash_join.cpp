@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_hash_join.hpp"
 
+#include "cudf/concatenate.hpp"
 #include "cudf/copying.hpp"
 #include "cudf/join/distinct_hash_join.hpp"
 #include "cudf/join/filtered_join.hpp"
@@ -492,13 +493,21 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
         "partition in operator " +
         std::to_string(this->get_operator_id()));
     }
-    // If the hash table has already been build, we only send the probe side. The hash table should
-    // already be built and we can perform the join with the probe side batches.
+    // Coalesce up to `kProbeCoalesceTargetBytes` of probe batches into a single task. The hash
+    // table is already built, so we want each probe task to carry enough rows to keep the cuco
+    // probe kernel SM-utilized rather than launch-overhead-bound.
+    constexpr uint64_t kProbeCoalesceTargetBytes = 1ULL << 30;  // 1 GiB
     std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
-    auto batch = probe_port->repo->pop_data_batch(::cucascade::batch_state::task_created);
-    if (batch) {
+    uint64_t accumulated_bytes = 0;
+    while (accumulated_bytes < kProbeCoalesceTargetBytes) {
+      auto batch = probe_port->repo->pop_data_batch(::cucascade::batch_state::task_created);
+      if (!batch) { break; }
+      const uint64_t batch_bytes =
+        batch->get_data() ? batch->get_data()->get_size_in_bytes() : 0;
+      accumulated_bytes += batch_bytes;
       input_batch.push_back(std::move(batch));
-    } else {
+    }
+    if (input_batch.empty()) {
       SIRIUS_LOG_WARN(
         "In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: expected to pop a "
         "batch from the default port but got none in operator " +
@@ -828,6 +837,11 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
 
   cudf::table_view left_full, right_full;
   std::unique_ptr<rmm::device_uvector<cudf::size_type>> left_indices, right_indices;
+  // Smart-batched probe coalesces multiple input probe batches into a transient table.
+  // That table is owned by a function-local data_batch (probe_input) which would otherwise
+  // destruct before async cuco probe + gather work on `stream` completes — see end of
+  // function for the matched stream synchronize that closes the lifetime gap.
+  std::shared_ptr<cucascade::data_batch> coalesced_probe_keepalive;
 
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
     if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::SCHEDULED) {
@@ -867,9 +881,35 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       }
     }
     if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::BUILT) {
+      // Smart-batched probe: when get_next_task_input_data_for_build_probe coalesced several
+      // probe batches into one task, concatenate them on this stream before probing so cuco
+      // sees a single large probe table (better SM utilization than N small probes).
+      // The concat is allocated on the consumer's pipeline stream and the input batches are
+      // dropped on the same stream when this scope ends — keeps alloc/dealloc paired.
+      //
+      // Skip the concat on the first task (SCHEDULED→BUILT in the same execute()): in that
+      // path input_batches = [probe, build], where index 1 is the build relation that was just
+      // consumed to build the hash table — concatenating it as if it were probe data is wrong.
+      // Subsequent tasks reach BUILT state via get_next_task_input_data_for_build_probe and
+      // contain only probe batches.
+      const bool just_built_this_task = (input_batches.size() == 2 && _build_table != nullptr &&
+                                         input_batches[1].get() == _build_table.get());
+      std::shared_ptr<cucascade::data_batch> probe_input = input_batches[0];
+      if (input_batches.size() > 1 && !just_built_this_task) {
+        std::vector<cudf::table_view> probe_views;
+        probe_views.reserve(input_batches.size());
+        for (const auto& batch : input_batches) {
+          probe_views.push_back(get_cudf_table_view(*batch));
+        }
+        auto& memory_space = *input_batches[0]->get_memory_space();
+        auto coalesced     = cudf::concatenate(
+          probe_views, stream, memory_space.get_default_allocator());
+        probe_input               = make_data_batch(std::move(coalesced), memory_space);
+        coalesced_probe_keepalive = probe_input;
+      }
       // Hash table is built, we can process probe batches. The probe-side keys will be processed in
       // the same way as the mixed join path, but with an equality-only predicate.
-      auto probe_keys_result      = prepare_join_keys(input_batches[0],
+      auto probe_keys_result      = prepare_join_keys(probe_input,
                                                  left_key_col_indices,
                                                  cast_necessary,
                                                  key_casts,
@@ -877,7 +917,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                                  stream);
       cudf::table_view probe_keys = probe_keys_result.keys;
 
-      left_full = get_cudf_table_view(*input_batches[0]);
+      left_full = get_cudf_table_view(*probe_input);
       right_full =
         _build_table->get_data()->cast<cucascade::gpu_table_representation>().get_table().view();
 
@@ -895,7 +935,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                                   lhs_output_columns.col_idxs,
                                                   rhs_output_columns.col_idxs,
                                                   std::move(build_indices),
-                                                  *input_batches[0]->get_memory_space(),
+                                                  *probe_input->get_memory_space(),
                                                   stream);
         }
       } else {
@@ -1163,15 +1203,21 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
     }
   }
 
-  return gather_join_output(join_type,
-                            left_full,
-                            right_full,
-                            lhs_output_columns.col_idxs,
-                            rhs_output_columns.col_idxs,
-                            std::move(left_indices),
-                            std::move(right_indices),
-                            *input_batches[0]->get_memory_space(),
-                            stream);
+  auto out = gather_join_output(join_type,
+                                left_full,
+                                right_full,
+                                lhs_output_columns.col_idxs,
+                                rhs_output_columns.col_idxs,
+                                std::move(left_indices),
+                                std::move(right_indices),
+                                *input_batches[0]->get_memory_space(),
+                                stream);
+  // When smart-batching coalesced multiple probe batches into a transient data_batch,
+  // synchronize before that batch's local destructor would otherwise free its memory
+  // while async gather work on `stream` is still reading from it. Cheap (microseconds)
+  // and only paid on the smart-batched path.
+  if (coalesced_probe_keepalive) { stream.synchronize(); }
+  return out;
 }
 
 void sirius_physical_hash_join::finalize_operator()
