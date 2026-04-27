@@ -66,7 +66,13 @@ __global__ void kernel_decode_bitpacking_batched(const batched_bp_seg_desc* __re
   const uint8_t* block_base = desc.d_block + desc.block_offset;
   T* out                    = d_output + desc.global_row_offset;
 
-  // Shared metadata — written by thread 0, read by all after barrier
+  // Shared metadata — written by thread 0, read by all after the barrier.
+  //
+  // sm_aux is overloaded by mode and is read in the per-mode branch below:
+  //   CONSTANT       → the constant value (broadcast to every output row)
+  //   CONSTANT_DELTA → the per-row delta (output[i] = frame + i*delta)
+  //   FOR            → unused (left zero)
+  //   DELTA_FOR      → delta_offset (initial prefix-sum bias)
   __shared__ uint8_t sm_mode;
   __shared__ uint32_t sm_data_offset;
   __shared__ uint32_t sm_width;
@@ -229,16 +235,43 @@ static void decode_typed_batched(const batched_bp_seg_desc* descs,
   // Upload descriptors to device via thread-local scratch arena. After the
   // first few batches the arena is sized to hold this and we skip
   // malloc/free entirely.
+  //
+  // bounce_h2d_async exists because pageable→device cudaMemcpyAsync is
+  // silently synchronous via the driver's internal pinned bounce buffer
+  // (~450 µs/call on A100). We user-space-bounce through TLS pinned slots
+  // so the DMA hits the true async fast path. See pinned_bounce.cuh.
+  //
+  // TODO: descriptor allocations should sub-allocate from cucascade's
+  // fixed_size_host_memory_resource (1 MB blocks) so they're tracked by
+  // the reservation system. The arena is a stop-gap that bypasses that.
   size_t desc_bytes = num_segments * sizeof(batched_bp_seg_desc);
   auto desc_alloc   = arena_allocate(desc_bytes, stream.value());
   auto* d_descs     = static_cast<batched_bp_seg_desc*>(desc_alloc.ptr);
   bounce_h2d_async(d_descs, descs, desc_bytes, stream.value());
 
+  // BLOCK_DIM=256 was tuned empirically on SM75/80: 8 warps fully covers
+  // the 2048-row group with VPT=8 (one value per thread per iteration),
+  // matching the original per-segment kernel's occupancy. Revisit on SM90+.
   constexpr uint32_t BLOCK_DIM = 256;
-  constexpr uint32_t max_width = sizeof(T) * 8;
-  // +1 guard word for 3-word unpack_value reads on 64-bit types.
+
+  // Live packed-data size for one metadata group, in 32-bit words:
+  //   BP_META_GROUP_SIZE values × max_width bits / 32, rounded up.
+  // The +1 guard word satisfies unpack_value's 3-word read contract for
+  // 64-bit types when the value spans words [w, w+1, w+2] — see
+  // gpu_decode.cuh:101. Output kernel zeroes this guard word at thread 0.
+  constexpr uint32_t max_width        = sizeof(T) * 8;
   constexpr uint32_t max_packed_words = (BP_META_GROUP_SIZE * max_width + 31) / 32 + 1;
   constexpr size_t shmem_bytes        = max_packed_words * sizeof(uint32_t);
+
+  // Default per-block dynamic shmem cap on Turing/Ampere is 48 KB. For the
+  // codecs in this PR shmem_bytes peaks at ~16 KB (int64). A static_assert
+  // catches future BP_META_GROUP_SIZE / wider-T regressions at compile time
+  // rather than at kernel-launch time (where the failure surfaces only on
+  // the next stream sync as "previous unspecified launch failure").
+  static_assert(shmem_bytes <= 48u * 1024u,
+                "kernel_decode_bitpacking_batched dynamic shmem exceeds the 48 KB default; "
+                "either reduce BP_META_GROUP_SIZE / max_width, or call "
+                "cudaFuncSetAttribute(MaxDynamicSharedMemorySize) before launch");
 
   kernel_decode_bitpacking_batched<T><<<num_segments, BLOCK_DIM, shmem_bytes, stream.value()>>>(
     d_descs, static_cast<T*>(d_output), num_segments);
