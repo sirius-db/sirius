@@ -23,7 +23,7 @@ Full details: `.planning/milestones/v1.1-ROADMAP.md`
 ### 🚧 v1.2 — Active
 
 - [~] **Phase 8: Multi-GPU SQL Pipeline Fix** — 6/6 original plans + 2 gap-closure plans (08-07 probes landed, 08-08 diagnosis returned **hypothesis E**). Criteria 3 + 5 PASS (HYG + Pattern 2 grep); criteria 1/2/4/6 handed off to Phase 9. Plans 08-09/10 HALTED (see `08-09-HALT.md`).
-- [ ] **Phase 9: Scan-Task Distributor + Batch-Ownership Affinity** — fix the real bug identified by 08-08: scan-task distributor dispatches the same `batch_id` (already resident on one GPU) to a task on a different GPU, causing memspace-match failure → SIGSEGV. Plus `preferred_device_id=-1` plumbing bug at `parquet_scan_task::compute_task` entry. Ship-gate = v1.2 original Success Criteria 1/2/4/6 (SF1 + SF10 + SF100 Q1 on num_gpus=2, `[mgpu-audit]` ≥ 5 per GPU).
+- [~] **Phase 9: Scan-Task Distributor + Batch-Ownership Affinity** — 4/4 plans. Fix the real bug identified by 08-08: scan-task distributor dispatches the same `batch_id` (already resident on one GPU) to a task on a different GPU, causing memspace-match failure → SIGSEGV. Plus `preferred_device_id=-1` plumbing bug at `parquet_scan_task::compute_task` entry. Ship-gate = v1.2 original Success Criteria 1/2/4/6 (SF1 + SF10 + SF100 Q1 on num_gpus=2, `[mgpu-audit]` ≥ 5 per GPU). **VERDICT: PARTIAL** (SF100 + disjointness PASS; `SELECT * FROM gpu_execution(...)` SIGSEGV deferred to Phase 10).
 
 ## Phase Details
 
@@ -55,7 +55,8 @@ Full details: `.planning/milestones/v1.1-ROADMAP.md`
 | 6. Multi-GPU Gap Closure | v1.1 | 4/4 | Complete | 2026-04-21 |
 | 7. P2P Direct Transfer + Adaptive Scan | v1.1 | 4/4 | Complete | 2026-04-21 |
 | 8. Multi-GPU SQL Pipeline Fix | v1.2 | 6/6 | Complete (ship-blocked) | 2026-04-22 |
-| 9. Scan-Task Distributor + Batch-Ownership Affinity | v1.2 | 3/4 | In Progress|  |
+| 9. Scan-Task Distributor + Batch-Ownership Affinity | v1.2 | 4/4 | PARTIAL | 2026-04-24 |
+| 10. TABLE_FUNCTION-form gpu_execution SIGSEGV fix | v1.2 | 4/4 | PARTIAL | 2026-04-27 |
 
 ### Phase 9: Scan-Task Distributor + Batch-Ownership Affinity
 **Goal**: Fix the scan-task distributor so a batch with `batch_device_id=N` is only ever dispatched to tasks with `target_device_id=N`. Fix `preferred_device_id=-1` plumbing at `parquet_scan_task::compute_task` entry. Close v1.2's original ship-gate (Criteria 1/2/4/6) that Phase 8 deferred.
@@ -75,7 +76,8 @@ Full details: `.planning/milestones/v1.1-ROADMAP.md`
 **Requirements**: CRIT-1, CRIT-2, CRIT-6 (inherited v1.2 ship-gate IDs still open after Phase 9; CRIT-4 closed by Plan 09-03 disjointness REQUIRE)
 **Evidence source**: `.planning/phases/09-scan-task-distributor-batch-ownership-affinity/09-VERIFICATION.md` (`gaps`, `open_issue_carryforward`, `hypotheses` H1–H4) + `09-04-VALIDATION.md` Open Issue section
 **Success Criteria**: (1) `./build/release/extension/sirius/test/cpp/sirius_unittest 'gpu_execution - filter equality parquet'` exits 0 on both 1-GPU and 2-GPU envs. (2) Full MCP unit-tests suite exits 0 with `integration.yaml` at `num_gpus: 2` (88 SF1 variants + SF10 Q1/Q6/Q12 all green). (3) Re-running the 09-04-PLAN.md ship-gate procedure produces `verdict: PASS` in a new VALIDATION.md (SF100 Q1 num_gpus=2 byte-identical vs 1-GPU baseline AND unit-tests green). (4) HYG-02 baseline preserved (`grep -c 'rmm::cuda_stream_default' src/` ≤ 41). (5) Feature branch `feature/single-node-multi-gpu2` preserved; fix scoped (< 100 LOC expected).
-**Plans:** 3/4 plans executed
-
-Plans:
-- [ ] TBD (run /gsd:plan-phase 10 to break down)
+**Plans:** 4 plans
+  - [x] 10-01-PLAN.md — Bisect Phase 9 span (`3b58258..c0e12f3`): regressing_commit=NONE, SIGSEGV is test-ordering dependent
+  - [x] 10-02-PLAN.md — GDB analysis: H1 confirmed — stream-ordered race in parquet filter translation; fault frame in sirius_physical_parquet_scan.cpp
+  - [x] 10-03-PLAN.md — Fix: move `translation_stream` into `translated_expression::owned_stream`; C++ reverse-destruction order ensures stream outlives scalars; HYG-02 40 (improved from 41)
+  - [x] 10-04-PLAN.md — Ship-gate validation: SF100 Q1 num_gpus=2 PASS (5.70s, byte-identical); filter equality parquet + tpch_q1_sf10_2gpu GREEN; **VERDICT: PARTIAL** (pre-existing [mgpu-audit] SIGSEGV unrelated to Phase 10 fix; Phase 11 candidate)
