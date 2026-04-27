@@ -92,7 +92,17 @@ inline pinned_bounce_ring& get_tls_bounce_ring()
         all_ok = false;
         break;
       }
-      ::cudaEventCreateWithFlags(&s.ev, cudaEventDisableTiming);
+      // cudaEventCreate can fail on driver/device exhaustion; ignoring the
+      // status leaves s.ev null and a later cudaEventRecord/Query corrupts the
+      // stream silently. Treat it the same as a host-alloc failure.
+      cudaError_t ev_rc = ::cudaEventCreateWithFlags(&s.ev, cudaEventDisableTiming);
+      if (ev_rc != cudaSuccess) {
+        ::cudaGetLastError();
+        s.ev = nullptr;
+        SIRIUS_LOG_WARN("[pinned_bounce] event create failed: {}", ::cudaGetErrorString(ev_rc));
+        all_ok = false;
+        break;
+      }
     }
     if (!all_ok) {
       // Release any slots we did manage to allocate before the failure so a

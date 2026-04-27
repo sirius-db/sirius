@@ -38,6 +38,8 @@
 #include <cuda_runtime.h>
 
 #include <cstring>
+#include <stdexcept>
+#include <string>
 
 namespace sirius::cuda::scan {
 
@@ -268,7 +270,14 @@ void gpu_decode_bitpacking_batched(const batched_bp_seg_desc* descs,
       is_signed ? decode_typed_batched<int64_t>(descs, num_segments, d_output, stream)
                 : decode_typed_batched<uint64_t>(descs, num_segments, d_output, stream);
       break;
-    default: SIRIUS_LOG_ERROR("[gpu_decode] batched: unsupported type_size={}", type_size); return;
+    default:
+      // Match the dispatcher's pattern: an unsupported width here means
+      // upstream viability fell out of sync with the kernels we ship —
+      // throw rather than leave the output buffer uninitialized.
+      throw std::runtime_error(
+        "gpu_decode_bitpacking_batched: viability invariant violated — unsupported "
+        "type_size " +
+        std::to_string(type_size));
   }
 }
 
