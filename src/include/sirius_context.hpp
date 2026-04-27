@@ -116,7 +116,9 @@ class SiriusContext : public ClientContextState {
    */
   struct InternalQueryGuard {
     explicit InternalQueryGuard(SiriusContext& ctx) noexcept : ctx_(ctx)
-    { ctx_.enter_internal_query(); }
+    {
+      ctx_.enter_internal_query();
+    }
     ~InternalQueryGuard() noexcept { ctx_.exit_internal_query(); }
     InternalQueryGuard(const InternalQueryGuard&)            = delete;
     InternalQueryGuard& operator=(const InternalQueryGuard&) = delete;
@@ -126,17 +128,25 @@ class SiriusContext : public ClientContextState {
   };
 
   void enter_internal_query() noexcept
-  { _internal_query_depth.fetch_add(1, std::memory_order_relaxed); }
+  {
+    _internal_query_depth.fetch_add(1, std::memory_order_relaxed);
+  }
   void exit_internal_query() noexcept
-  { _internal_query_depth.fetch_sub(1, std::memory_order_relaxed); }
+  {
+    _internal_query_depth.fetch_sub(1, std::memory_order_relaxed);
+  }
   [[nodiscard]] bool is_internal_query_active() const noexcept
-  { return _internal_query_depth.load(std::memory_order_relaxed) > 0; }
+  {
+    return _internal_query_depth.load(std::memory_order_relaxed) > 0;
+  }
 
   /// \brief Terminate the Sirius context, releasing all resources.
   void terminate();
 
   [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept
-  { return config_.get_hw_topology(); }
+  {
+    return config_.get_hw_topology();
+  }
 
   /// \brief Get the memory reservation manager.
   [[nodiscard]] sirius::memory::sirius_memory_reservation_manager& get_memory_manager();
@@ -193,6 +203,15 @@ class SiriusContext : public ClientContextState {
   /// Called by OnFinalizePrepare to generate the Sirius physical plan.
   duckdb::unique_ptr<duckdb::LogicalOperator> take_captured_logical_plan();
 
+  /// \brief Stash a label for the next query to pick up and use as a telemetry
+  /// label for easy identification. Set by the `sirius_set_query_label` SQL
+  /// function; consumed once by the next sirius_interface construction
+  /// (transparent path or gpu_execution).
+  void set_pending_query_label(std::string label);
+
+  /// \brief Take and clear the stashed pending query label.
+  [[nodiscard]] std::optional<std::string> take_pending_query_label();
+
   /// \brief Save the connection's disabled optimizer set before transparent execution mutates it.
   void set_transparent_original_disabled_optimizers(std::set<duckdb::OptimizerType> disabled);
 
@@ -246,6 +265,10 @@ class SiriusContext : public ClientContextState {
   /// Captured optimized logical plan for transparent GPU execution.
   /// Set by the optimizer extension hook, consumed by OnFinalizePrepare.
   duckdb::unique_ptr<duckdb::LogicalOperator> captured_logical_plan_;
+
+  /// Label set by the `sirius_set_query_label` SQL function, consumed at the
+  /// next sirius_interface construction site. Cleared on take.
+  std::optional<std::string> pending_query_label_;
 
   /// Snapshot of the connection's disabled optimizer set before the transparent
   /// optimizer hook mutates it.

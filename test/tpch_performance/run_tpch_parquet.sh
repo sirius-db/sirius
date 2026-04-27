@@ -109,6 +109,21 @@ DUCKDB="$SIRIUS_DUCKDB"
 # Both engines use the same plain SQL queries — transparent execution
 # routes queries through GPU when SiriusContext is initialized.
 QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/orig"
+
+# Benchmark name is baked into per-query telemetry labels so events from
+# different benchmarks (tpch, tpcds, ...) can be filtered apart.
+BENCHMARK_NAME="tpch"
+
+# Optional RUN_NOTE is prepended to every per-query telemetry label so a run
+# can be tagged with a free-form annotation (e.g. "before_pinned_mem_change").
+# Single quotes are SQL-escaped by doubling.
+RUN_NOTE_RAW="${RUN_NOTE:-}"
+RUN_NOTE_ESCAPED="${RUN_NOTE_RAW//\'/\'\'}"
+LABEL_PREFIX=""
+if [ -n "${RUN_NOTE_ESCAPED}" ]; then
+    LABEL_PREFIX="${RUN_NOTE_ESCAPED}_"
+fi
+LABEL_PREFIX="${LABEL_PREFIX}${BENCHMARK_NAME}_"
 if [ "$ENGINE" != "sirius" ]; then
     # Disable Sirius so the extension doesn't initialize (CPU-only).
     export SIRIUS_DISABLE=1
@@ -240,6 +255,10 @@ run_single_session() {
         echo ".print ${MARKER_PREFIX} ${q}" >> "$TEMP_SQL"
         # N iterations back-to-back — nothing between them.
         for ((iter = 0; iter < NUM_ITERATIONS; iter++)); do
+            if [ "$ENGINE" = "sirius" ]; then
+                printf "CALL sirius_set_query_label('%sq%d_iter%d');\n" \
+                    "$LABEL_PREFIX" "$q" "$((iter + 1))" >> "$TEMP_SQL"
+            fi
             cat "$QUERY_FILE" >> "$TEMP_SQL"
             printf '\n' >> "$TEMP_SQL"
         done
@@ -414,6 +433,10 @@ run_multi_session() {
             fi
             printf ".timer on\n"
             for ((iter = 0; iter < NUM_ITERATIONS; iter++)); do
+                if [ "$ENGINE" = "sirius" ]; then
+                    printf "CALL sirius_set_query_label('%sq%d_iter%d');\n" \
+                        "$LABEL_PREFIX" "$q" "$((iter + 1))"
+                fi
                 cat "$QUERY_FILE"
                 printf '\n'
             done

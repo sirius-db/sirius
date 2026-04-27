@@ -63,9 +63,11 @@ PhysicalSiriusExecution::PhysicalSiriusExecution(
 duckdb::unique_ptr<duckdb::GlobalSourceState> PhysicalSiriusExecution::GetGlobalSourceState(
   duckdb::ClientContext& context) const
 {
-  auto state            = duckdb::make_uniq<SiriusGlobalSourceState>();
-  state->iface          = duckdb::make_uniq<sirius::sirius_interface>(context);
-  auto sirius_ctx       = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  auto state      = duckdb::make_uniq<SiriusGlobalSourceState>();
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  auto query_label =
+    sirius_ctx ? sirius_ctx->take_pending_query_label() : std::optional<std::string>{};
+  state->iface = duckdb::make_uniq<sirius::sirius_interface>(context, std::move(query_label));
   state->sirius_context = sirius_ctx.get();
   return std::move(state);
 }

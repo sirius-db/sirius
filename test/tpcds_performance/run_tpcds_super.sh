@@ -25,6 +25,21 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DUCKDB="$PROJECT_DIR/build/release/duckdb"
 QUERY_DIR="$SCRIPT_DIR/queries"
 
+# Benchmark name is baked into per-query telemetry labels so events from
+# different benchmarks (tpch, tpcds, ...) can be filtered apart.
+BENCHMARK_NAME="tpcds"
+
+# Optional RUN_NOTE is prepended to every per-query telemetry label so a run
+# can be tagged with a free-form annotation (e.g. "before_pinned_mem_change").
+# Single quotes are SQL-escaped by doubling.
+RUN_NOTE_RAW="${RUN_NOTE:-}"
+RUN_NOTE_ESCAPED="${RUN_NOTE_RAW//\'/\'\'}"
+LABEL_PREFIX=""
+if [ -n "${RUN_NOTE_ESCAPED}" ]; then
+    LABEL_PREFIX="${RUN_NOTE_ESCAPED}_"
+fi
+LABEL_PREFIX="${LABEL_PREFIX}${BENCHMARK_NAME}_"
+
 # --- Parse arguments ---
 if [ $# -lt 1 ]; then
     echo "Usage: $0 <parquet_dir> [--queries N...] [--output-dir path]"
@@ -170,7 +185,9 @@ for q in "${QUERIES[@]}"; do
     {
         printf '%s\n' "$VIEW_SQL"
         printf ".timer on\n"
+        printf "CALL sirius_set_query_label('%sq%d_iter1');\n" "$LABEL_PREFIX" "$q"
         printf '%s;\n' "$CLEANED_SQL"
+        printf "CALL sirius_set_query_label('%sq%d_iter2');\n" "$LABEL_PREFIX" "$q"
         printf '%s;\n' "$CLEANED_SQL"
     } > "$TEMP_SQL"
 

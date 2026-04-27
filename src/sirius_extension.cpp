@@ -409,11 +409,19 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   result->enable_optimizer = true;
 
   std::optional<std::string> query_label = std::nullopt;
+  // take any query_label that was set using sirius_set_query_label SQL call.
+  if (auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+      sirius_ctx) {
+    query_label = sirius_ctx->take_pending_query_label();
+  }
+  // however, give precedence to a query_label that was set inline in with
+  // gpu_execution SQL call.
   if (auto it = input.named_parameters.find(QUERY_LABEL_PARAM_KEY);
       it != input.named_parameters.end() && not it->second.IsNull()) {
     query_label = it->second.ToString();
   }
-  result->sirius_iface = make_uniq<::sirius::sirius_interface>(context, query_label);
+
+  result->sirius_iface = make_uniq<::sirius::sirius_interface>(context, std::move(query_label));
 
   if (input.inputs[0].IsNull()) {
     throw BinderException("gpu_execution cannot be called with a NULL parameter");
@@ -683,6 +691,43 @@ static void ProfilerStopFunction(ClientContext& context,
   data.finished = true;
 }
 
+struct SiriusSetQueryLabelData : public TableFunctionData {
+  std::string label;
+  bool finished = false;
+};
+
+static unique_ptr<FunctionData> SiriusSetQueryLabelBind(ClientContext& context,
+                                                        TableFunctionBindInput& input,
+                                                        vector<LogicalType>& return_types,
+                                                        vector<string>& names)
+{
+  if (input.inputs.empty() || input.inputs[0].IsNull()) {
+    throw BinderException("sirius_set_query_label requires a non-NULL VARCHAR argument");
+  }
+  auto result   = make_uniq<SiriusSetQueryLabelData>();
+  result->label = input.inputs[0].ToString();
+  return_types.push_back(LogicalType::BOOLEAN);
+  names.push_back("ok");
+  return std::move(result);
+}
+
+static void SiriusSetQueryLabelFunction(ClientContext& context,
+                                        TableFunctionInput& data_p,
+                                        DataChunk& output)
+{
+  auto& data = data_p.bind_data->CastNoConst<SiriusSetQueryLabelData>();
+  if (data.finished) { return; }
+
+  if (auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+      sirius_ctx) {
+    sirius_ctx->set_pending_query_label(data.label);
+  }
+
+  output.SetCardinality(1);
+  output.SetValue(0, 0, Value::BOOLEAN(true));
+  data.finished = true;
+}
+
 void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
 {
   auto transaction = CatalogTransaction::GetSystemTransaction(instance);
@@ -707,6 +752,13 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   gpu_execution.named_parameters[QUERY_LABEL_PARAM_KEY] = LogicalType::VARCHAR;
   CreateTableFunctionInfo gpu_execution_info(gpu_execution);
   catalog.CreateTableFunction(transaction, gpu_execution_info);
+
+  TableFunction set_query_label("sirius_set_query_label",
+                                {LogicalType::VARCHAR},
+                                SiriusSetQueryLabelFunction,
+                                SiriusSetQueryLabelBind);
+  CreateTableFunctionInfo set_query_label_info(set_query_label);
+  catalog.CreateTableFunction(transaction, set_query_label_info);
 
   // Profiler control functions for nsys --capture-range=cudaProfilerApi
   TableFunction profiler_start(

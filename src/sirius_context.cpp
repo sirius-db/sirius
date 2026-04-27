@@ -429,6 +429,18 @@ unique_ptr<LogicalOperator> SiriusContext::take_captured_logical_plan()
   return std::move(captured_logical_plan_);
 }
 
+void SiriusContext::set_pending_query_label(std::string label)
+{
+  pending_query_label_ = std::move(label);
+}
+
+std::optional<std::string> SiriusContext::take_pending_query_label()
+{
+  std::optional<std::string> out;
+  out.swap(pending_query_label_);
+  return out;
+}
+
 void SiriusContext::set_transparent_original_disabled_optimizers(std::set<OptimizerType> disabled)
 {
   std::lock_guard lock(mutex_);

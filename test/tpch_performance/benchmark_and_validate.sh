@@ -324,6 +324,10 @@ while [ $# -gt 1 ]; do
             DROP_OS_CACHE=true
             shift
             ;;
+        --note)
+            export RUN_NOTE="$2"
+            shift 2
+            ;;
         *)
             break
             ;;
@@ -335,7 +339,7 @@ QUERY_TIMEOUT="${QUERY_TIMEOUT:-1200}"
 
 if [ $# -ne 1 ]; then
     echo "Usage: $0 [--config <config_file>] [--data-source parquet|duckdb] [--parquet-dir <path>] [--duckdb-file <path>]"
-    echo "          [--engines 'sirius duckdb'] [--iterations N] [--timeout <seconds>] [--duckdb-results <run_dir>] [--multi-session] [--drop-os-cache] <scale_factor>"
+    echo "          [--engines 'sirius duckdb'] [--iterations N] [--timeout <seconds>] [--duckdb-results <run_dir>] [--multi-session] [--drop-os-cache] [--note <text>] <scale_factor>"
     echo "       $0 --report <run_dir>"
     echo "  --data-source parquet  (default) → run_tpch_parquet.sh + test_datasets/tpch_parquet_sf<SF> or --parquet-dir"
     echo "  --data-source duckdb             → run_tpch_duckdb.sh + performance_test.duckdb or --duckdb-file"
@@ -464,8 +468,10 @@ echo "=== Collecting run info and filesystem benchmark ==="
     fi
 
     echo "--- Benchmark settings ---"
+    echo "benchmark: tpch"
     echo "multi_session: $MULTI_SESSION"
     echo "drop_os_cache: $DROP_OS_CACHE"
+    echo "note: ${RUN_NOTE:-}"
     echo ""
 
     echo "--- Benchmark input ---"

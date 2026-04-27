@@ -38,3 +38,4 @@ compile_commands.json
 
 runs/
 telemetry_data/
+log/
