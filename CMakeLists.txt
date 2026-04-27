@@ -148,6 +148,7 @@ set(EXTENSION_SOURCES
     src/data/host_parquet_representation_converters.cpp
     src/downgrade/downgrade_executor.cpp
     src/expression/expression.cpp
+    src/expression/function_id.cpp
     src/expression/join_condition.cpp
     src/expression/value.cpp
     src/expression_executor/expression_executor_strategy.cpp
