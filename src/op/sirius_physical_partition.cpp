@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_partition.hpp"
 
+#include "memory/sirius_gpu_budget.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression/expression_internal.hpp"
@@ -234,7 +235,31 @@ std::pair<int, uint64_t> sirius_physical_partition::determine_num_partitions()
     auto batch = repo->get_data_batch_by_id(batch_id, std::nullopt, 0);
     if (batch && batch->get_data()) { total_bytes += batch->get_data()->get_size_in_bytes(); }
   }
-  int num_partitions = static_cast<int>(std::max(uint64_t{1}, total_bytes / s_partition_size));
+  // Partition sizing target: each concurrent partition's hash table + build slice should
+  // fit in the GPU build budget partitioned across pipeline threads. Falls back to the
+  // static s_partition_size config when no live budget is available (registry not set yet
+  // or zero pool capacity), which preserves baseline behavior.
+  //
+  // Formula:
+  //   per_partition_target = gpu_for_build / pipeline_threads
+  //   partition_size       = max(s_partition_size, per_partition_target / 1.5)   // hash overhead
+  //   num_partitions       = ceil(total_bytes / partition_size), >= 1
+  //
+  // The 1.5× factor accounts for cuco's hash-table memory on top of the build keys themselves.
+  // kAbsoluteMaxPartitions is a final safety cap so a tiny budget can't explode partition count.
+  constexpr int kAbsoluteMaxPartitions  = 64;
+  constexpr int kPipelineThreadEstimate = 8;  // matches default executor.pipeline.num_threads
+  const auto budget                     = sirius::memory::snapshot_build_budget_default();
+  uint64_t partition_size               = s_partition_size;
+  if (budget.for_build > 0) {
+    const uint64_t per_partition_target = budget.for_build / kPipelineThreadEstimate;
+    // Reserve ~33% of each partition's slice for the hash table itself (1.5× capacity factor).
+    const uint64_t per_partition_build_capacity = (per_partition_target * 2) / 3;
+    partition_size = std::max(s_partition_size, per_partition_build_capacity);
+  }
+  int num_partitions =
+    static_cast<int>(std::max(uint64_t{1}, total_bytes / partition_size));
+  if (num_partitions > kAbsoluteMaxPartitions) { num_partitions = kAbsoluteMaxPartitions; }
   return std::make_pair(num_partitions, total_bytes);
 }
 

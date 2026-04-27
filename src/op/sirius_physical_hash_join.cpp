@@ -26,6 +26,7 @@
 #include "cudf/unary.hpp"
 #include "cudf/utilities/memory_resource.hpp"
 #include "data/data_batch_utils.hpp"
+#include "memory/sirius_gpu_budget.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
@@ -370,7 +371,19 @@ void sirius_physical_hash_join::build_pipelines(pipeline::sirius_pipeline& curre
 void sirius_physical_hash_join::update_join_exec_mode(int num_partitions, uint64_t build_side_bytes)
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
-  if (num_partitions == 1 && build_side_bytes < _max_build_hash_table_bytes &&
+  // Effective BUILD_PROBE threshold: take the larger of the static config cap and the
+  // live GPU build budget (after subtracting probe-queue reservation + cucascade headroom).
+  // The static cap remains as a floor so user overrides via SET still apply.
+  const auto budget = sirius::memory::snapshot_build_budget_default();
+  const std::uint64_t effective_threshold =
+    budget.for_build > 0
+      ? std::max<std::uint64_t>(_max_build_hash_table_bytes, budget.for_build)
+      : _max_build_hash_table_bytes;
+  // Account for cuco hash table overhead — capacity = build_rows / load_factor (0.5),
+  // each slot ~16 bytes; for typical narrow keys this lands around 50-100% of build_table size.
+  // 1.5× is a conservative midpoint.
+  const std::uint64_t predicted_build_memory = build_side_bytes + (build_side_bytes / 2);
+  if (num_partitions == 1 && predicted_build_memory < effective_threshold &&
       join_type != duckdb::JoinType::SEMI && join_type != duckdb::JoinType::RIGHT_SEMI &&
       join_type != duckdb::JoinType::ANTI && join_type != duckdb::JoinType::RIGHT_ANTI &&
       join_type != duckdb::JoinType::RIGHT && join_type != duckdb::JoinType::MARK &&

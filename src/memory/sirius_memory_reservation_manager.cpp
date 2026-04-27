@@ -18,6 +18,7 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 
 #include "cucascade/memory/common.hpp"
+#include "memory/sirius_gpu_budget.hpp"
 
 #include <cudf/utilities/memory_resource.hpp>
 
@@ -42,10 +43,12 @@ sirius_memory_reservation_manager::sirius_memory_reservation_manager(
     prev_device_mrs_.push_back(cudf::get_current_device_resource_ref());
     cudf::set_current_device_resource_ref(device_mr);
   }
+  gpu_budget_registry::set_current(this);
 }
 
 sirius_memory_reservation_manager::~sirius_memory_reservation_manager()
 {
+  if (gpu_budget_registry::current() == this) { gpu_budget_registry::set_current(nullptr); }
   auto gpu_spaces = this->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   // Restore the previous cuDF device resources saved in the constructor.
   // Calling reset_current_device_resource_ref() would leave cuDF with a null/invalid
