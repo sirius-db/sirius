@@ -415,7 +415,12 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(column_scan_result& col_
   arena_alloc rle_alloc{nullptr, false};
   for (auto const& seg : col_scan.data.segments) {
     if (seg.compression == duckdb::CompressionType::COMPRESSION_RLE) {
-      rle_alloc    = arena_allocate(RLE_CUMSUM_CAP, stream.value());
+      rle_alloc = arena_allocate(RLE_CUMSUM_CAP, stream.value());
+      if (!rle_alloc.ptr) {
+        throw std::runtime_error(
+          "gpu_decode_table: RLE cumsum allocation failed under arena "
+          "pressure (cudaMallocAsync overflow returned null)");
+      }
       d_rle_cumsum = static_cast<uint32_t*>(rle_alloc.ptr);
       break;
     }
@@ -669,7 +674,12 @@ std::unique_ptr<cudf::table> gpu_decode_table(std::vector<column_scan_result>& c
   uint32_t* d_valid_counts = nullptr;
   arena_alloc vc_alloc{nullptr, false};
   if (!null_col_indices.empty()) {
-    vc_alloc       = arena_allocate(null_col_indices.size() * sizeof(uint32_t), stream.value());
+    vc_alloc = arena_allocate(null_col_indices.size() * sizeof(uint32_t), stream.value());
+    if (!vc_alloc.ptr) {
+      throw std::runtime_error(
+        "gpu_decode_table: valid-count slot allocation failed under arena "
+        "pressure (cudaMallocAsync overflow returned null)");
+    }
     d_valid_counts = static_cast<uint32_t*>(vc_alloc.ptr);
   }
   std::vector<int> col_to_slot(num_cols, -1);

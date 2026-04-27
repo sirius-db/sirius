@@ -27,10 +27,12 @@
 #include <duckdb.hpp>
 #include <utils/sirius_test_env.hpp>
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -86,6 +88,36 @@ class NativeScanFixture {
 
     REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
     REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
+
+    // Per-row value comparison — counts alone could pass with wrong rowids
+    // or wrong projected values. Sort client-side because LIMIT/TOP_N row
+    // ordering is plan-dependent. (See test_gpu_execution_alp.cpp for why
+    // we can't use `SELECT * FROM gpu_execution(...) ORDER BY ...`.)
+    auto materialize_rows = [](duckdb::MaterializedQueryResult& r) {
+      std::vector<std::vector<std::string>> rows;
+      rows.reserve(r.RowCount());
+      for (duckdb::idx_t i = 0; i < r.RowCount(); ++i) {
+        std::vector<std::string> row;
+        row.reserve(r.ColumnCount());
+        for (duckdb::idx_t c = 0; c < r.ColumnCount(); ++c) {
+          row.push_back(r.GetValue(c, i).ToString());
+        }
+        rows.push_back(std::move(row));
+      }
+      std::sort(rows.begin(), rows.end());
+      return rows;
+    };
+    auto gpu_rows = materialize_rows(*gpu_result);
+    auto cpu_rows = materialize_rows(*cpu_result);
+    for (std::size_t r = 0; r < gpu_rows.size(); ++r) {
+      for (std::size_t c = 0; c < gpu_rows[r].size(); ++c) {
+        if (gpu_rows[r][c] != cpu_rows[r][c]) {
+          UNSCOPED_INFO("Row " << r << " Col " << c << " mismatch: GPU=[" << gpu_rows[r][c]
+                               << "] CPU=[" << cpu_rows[r][c] << "]");
+        }
+        REQUIRE(gpu_rows[r][c] == cpu_rows[r][c]);
+      }
+    }
   }
 
  protected:

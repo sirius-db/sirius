@@ -56,12 +56,8 @@ struct partitioned_duckdb_native_metadata {
   struct io_object_placeholder {};
   std::optional<io_object_placeholder> io_object;
 
-  /// @brief One entry per projected column, in projection order. Each contains
-  /// data + validity segment scans across all `row_groups` below.
-  std::vector<column_scan_result> column_scans;
-
-  /// @brief Row groups visited for `column_scans` (parallel to the per-column
-  /// segment vectors inside each `column_scan_result`).
+  /// @brief Row groups visited; consumer pins them per-batch in compute_task
+  /// via `direct_block_scan_column_range` (no up-front pinning).
   std::vector<duckdb::RowGroup*> row_groups;
 
   /// @brief Absolute row index of each `row_groups[i]`'s first row within the

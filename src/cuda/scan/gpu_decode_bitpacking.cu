@@ -229,7 +229,12 @@ static void decode_typed_batched(const batched_bp_seg_desc* descs,
   // malloc/free entirely.
   size_t desc_bytes = num_segments * sizeof(batched_bp_seg_desc);
   auto desc_alloc   = arena_allocate(desc_bytes, stream.value());
-  auto* d_descs     = static_cast<batched_bp_seg_desc*>(desc_alloc.ptr);
+  if (!desc_alloc.ptr) {
+    throw std::runtime_error(
+      "decode_typed_batched: descriptor allocation failed under arena pressure "
+      "(cudaMallocAsync overflow returned null)");
+  }
+  auto* d_descs = static_cast<batched_bp_seg_desc*>(desc_alloc.ptr);
   bounce_h2d_async(d_descs, descs, desc_bytes, stream.value());
 
   constexpr uint32_t BLOCK_DIM = 256;

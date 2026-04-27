@@ -54,10 +54,13 @@ bool segment_data_compression_viable(duckdb::ColumnSegment const& segment, bool 
 {
   auto compression = segment.GetCompressionType();
   switch (compression) {
+    // Numeric / uniform codecs the dispatcher decodes directly.
     case duckdb::CompressionType::COMPRESSION_BITPACKING:
     case duckdb::CompressionType::COMPRESSION_CONSTANT:
     case duckdb::CompressionType::COMPRESSION_UNCOMPRESSED:
-    case duckdb::CompressionType::COMPRESSION_RLE: return true;
+    case duckdb::CompressionType::COMPRESSION_RLE:
+    case duckdb::CompressionType::COMPRESSION_ALP:
+    case duckdb::CompressionType::COMPRESSION_ALPRD: return true;
 
     case duckdb::CompressionType::COMPRESSION_DICTIONARY:
     case duckdb::CompressionType::COMPRESSION_FSST:
@@ -182,30 +185,10 @@ partitioned_duckdb_native_metadata walk_duckdb_native_metadata(
     }
   }
 
-  // Pin segments for real columns; build per-RG ranges for rowid columns.
-  // direct_block_scan_column_range walks data + validity for one column
-  // across the row-group range; rowid synthesis only needs rg->start +
-  // rg->count, which the GPU kernel later turns into BIGINT [start, end).
-  md.column_scans.reserve(projected_cols.size());
-  for (auto const& proj : projected_cols) {
-    if (proj.is_rowid) {
-      column_scan_result rowid_scan;
-      rowid_scan.rowid_ranges.reserve(row_groups.size());
-      std::size_t total_rows = 0;
-      for (std::size_t i = 0; i < row_groups.size(); ++i) {
-        auto count = row_groups[i]->count.load();
-        rowid_scan.rowid_ranges.push_back({row_group_starts[i], count});
-        total_rows += count;
-      }
-      // Mirror real columns' total_rows so the dispatcher's batch sizing
-      // and downstream null-count logic stays consistent.
-      rowid_scan.data.total_rows = total_rows;
-      md.column_scans.push_back(std::move(rowid_scan));
-    } else {
-      md.column_scans.push_back(
-        direct_block_scan_column_range(storage, proj.storage_idx, context, row_groups));
-    }
-  }
+  // Metadata-only — no segment pinning here. The per-batch loop in
+  // compute_task pins fresh slices via direct_block_scan_column_range, so
+  // pinning the entire table at prepare_for_query time would be wasted work.
+  // PR H may revisit if sirius_io's prefetching cache wants up-front pins.
   md.row_groups       = row_groups;
   md.row_group_starts = row_group_starts;
   md.viable           = true;
@@ -426,13 +409,19 @@ std::unique_ptr<op::operator_data> duckdb_native_scan_task::compute_task(
   //   4: bounded memory, amortizes scheduling — works for both workloads
   constexpr std::size_t MAX_BATCHES_PER_TASK = 4;
 
+  // RAII: decrement_tasks must run on every exit path including exception
+  // unwind. Without this, a throw from direct_block_scan_column_range or
+  // gpu_decode_table leaves active_tasks_ inflated, op_.exhausted never
+  // fires, and the query stalls instead of surfacing the error.
+  struct active_task_guard {
+    duckdb_native_scan_global_state& g;
+    ~active_task_guard() { g.decrement_tasks(); }
+  } task_guard{g};
+
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
 
   auto first_range = g.claim_next_batch();
-  if (!first_range) {
-    g.decrement_tasks();
-    return std::make_unique<op::pipelineable_operator_data>(std::move(batches));
-  }
+  if (!first_range) { return std::make_unique<op::pipelineable_operator_data>(std::move(batches)); }
 
   std::optional<decltype(first_range)::value_type> current_range = first_range;
   std::size_t batches_this_task                                  = 0;
@@ -480,7 +469,9 @@ std::unique_ptr<op::operator_data> duckdb_native_scan_task::compute_task(
     std::size_t total_rows = col_scans.empty() ? 0 : col_scans[0].data.total_rows;
     batches.push_back(sirius::make_data_batch(std::move(gpu_table), *g.gpu_space()));
 
-    SIRIUS_LOG_INFO(
+    // DEBUG-level: per-batch line in a hot loop; INFO would dominate logs
+    // on large scans. Matches parquet_scan_task's log policy.
+    SIRIUS_LOG_DEBUG(
       "[duckdb_native_scan] task {}: {} rows, {} cols | "
       "pin={:.1f}ms decode={:.1f}ms total={:.1f}ms (rg {}-{})",
       task_id_,
@@ -522,9 +513,8 @@ std::unique_ptr<op::operator_data> duckdb_native_scan_task::compute_task(
     }
   }
 
-  g.decrement_tasks();
-
   return std::make_unique<op::pipelineable_operator_data>(std::move(batches));
+  // task_guard's destructor runs decrement_tasks on the way out.
 }
 
 void duckdb_native_scan_task::publish_output(op::operator_data& output_data,

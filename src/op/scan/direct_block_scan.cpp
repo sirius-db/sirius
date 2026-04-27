@@ -121,8 +121,14 @@ struct block_layout_info {
 
 struct mmap_file_state {
   duckdb::BlockManager* owner = nullptr;
-  uint8_t* base               = nullptr;
-  size_t size                 = 0;
+  // File path captured at mmap time. Re-queried from the live storage on
+  // every cache lookup and compared — if they differ, a database has been
+  // detached and a new BlockManager allocated at the same address (memory
+  // reuse), and the cached mmap points at a stale file. Eviction is the
+  // only safe option since DuckDB doesn't notify us of detach.
+  std::string path;
+  uint8_t* base = nullptr;
+  size_t size   = 0;
   // Block layout is keyed per-BlockManager — see file-level comment.
   std::once_flag layout_once;
   block_layout_info layout;
@@ -154,32 +160,42 @@ static mmap_file_state* try_get_mmap_for_table(duckdb::DataTable& storage)
   }
 
   duckdb::BlockManager* bm = nullptr;
+  std::string live_path;
   try {
-    bm = &storage.GetAttached().GetStorageManager().GetBlockManager();
+    auto& sm  = storage.GetAttached().GetStorageManager();
+    bm        = &sm.GetBlockManager();
+    live_path = sm.GetDBPath();
   } catch (...) {
     return nullptr;
   }
-  if (!bm) { return nullptr; }
+  if (!bm || live_path.empty()) { return nullptr; }
 
   // Fast path: lock-free acquire load + identity check.
+  // Path comparison detects the dangling-BlockManager-pointer case: when a
+  // database is detached and a new one happens to allocate its BlockManager
+  // at the same address, we'd otherwise read bytes from the (still-mapped)
+  // old file using the new file's segment offsets, producing garbage data.
   auto* last = g_mmap_last.load(std::memory_order_acquire);
-  if (last && last->owner == bm) { return last; }
+  if (last && last->owner == bm && last->path == live_path) { return last; }
 
   // Slow path: register/init under mutex.
   std::lock_guard<std::mutex> lock(g_mmap_mutex);
   auto it = g_mmap_cache.find(bm);
   if (it != g_mmap_cache.end()) {
-    g_mmap_last.store(it->second.get(), std::memory_order_release);
-    return it->second.get();
+    if (it->second->path == live_path) {
+      g_mmap_last.store(it->second.get(), std::memory_order_release);
+      return it->second.get();
+    }
+    // Stale entry: same address, different path → evict and re-create.
+    SIRIUS_LOG_INFO(
+      "[direct_block_scan] mmap cache stale (BlockManager* reused: was {}, now {}) — evicting",
+      it->second->path,
+      live_path);
+    mmap_file_state* expected = it->second.get();
+    g_mmap_last.compare_exchange_strong(
+      expected, nullptr, std::memory_order_release, std::memory_order_relaxed);
+    g_mmap_cache.erase(it);
   }
-
-  std::string path;
-  try {
-    path = storage.GetAttached().GetStorageManager().GetDBPath();
-  } catch (...) {
-    return nullptr;
-  }
-  if (path.empty()) { return nullptr; }
 
   // Allocate the state holder before mmap so that any later allocation
   // failure (e.g. unordered_map::emplace bad_alloc) leaves cleanup to
@@ -188,8 +204,9 @@ static mmap_file_state* try_get_mmap_for_table(duckdb::DataTable& storage)
   // between mmap and the cache insert would leak the mapping.
   auto state   = std::make_unique<mmap_file_state>();
   state->owner = bm;
+  state->path  = live_path;
 
-  int fd = ::open(path.c_str(), O_RDONLY);
+  int fd = ::open(live_path.c_str(), O_RDONLY);
   if (fd < 0) { return nullptr; }
 
   struct stat st;
@@ -211,7 +228,7 @@ static mmap_file_state* try_get_mmap_for_table(duckdb::DataTable& storage)
   g_mmap_last.store(state_ptr, std::memory_order_release);
 
   SIRIUS_LOG_INFO("[direct_block_scan] mmap'd {} ({:.1f} MB) — atomic fast path",
-                  path,
+                  live_path,
                   static_cast<double>(file_size) / 1e6);
   return state_ptr;
 }
