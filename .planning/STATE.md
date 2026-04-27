@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: Multi-GPU SQL Pipeline Fix
-status: executing
-stopped_at: "Completed 10-03: fix stream use-after-destroy SIGSEGV in parquet filter translation"
-last_updated: "2026-04-27T18:44:27.908Z"
+status: verifying
+stopped_at: "Completed 10-04: ship-gate validation — PARTIAL verdict"
+last_updated: "2026-04-27T20:46:42.775Z"
 last_activity: 2026-04-27
 progress:
   total_phases: 3
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 18
-  completed_plans: 15
+  completed_plans: 16
   percent: 100
 ---
 
@@ -27,7 +27,7 @@ See: .planning/PROJECT.md (updated 2026-04-21)
 
 Phase: 10 (table-function-form-gpu-execution-sigsegv-fix) — EXECUTING
 Plan: 4 of 4
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-04-27
 
 Progress: [██████████] 100% (6/6 plans complete)
@@ -51,6 +51,7 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 | Phase 10 P01 | 26min | 3 tasks | 1 files |
 | Phase 10 P02 | 46min | 3 tasks | 1 files |
 | Phase 10-table-function-form-gpu-execution-sigsegv-fix P03 | 55 | 2 tasks | 2 files |
+| Phase 10 P04 | 115min | 4 tasks | 3 files |
 
 ## Decisions
 
@@ -90,6 +91,8 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 - [Phase 10]: H2 (TABLE_FUNCTION vs PROCEDURE divergence) ruled out: both CALL and SELECT * FROM gpu_execution() use same GPUExecutionBind/GPUExecutionFunction; crash is parquet-fixture-specific, not TABLE_FUNCTION-form-specific
 - [Phase 10-table-function-form-gpu-execution-sigsegv-fix]: Root cause is use-after-destroy: translation_stream destroyed at for-loop scope exit while scalars retain stale cudaStream_t handle; fix: move stream into translated_expression::owned_stream
 - [Phase 10-table-function-form-gpu-execution-sigsegv-fix]: std::optional<rmm::cuda_stream> owned_stream declared BEFORE owned_literals in translated_expression struct — C++ reverse-destruction order ensures stream outlives scalars for cudaFreeAsync
+- [Phase 10]: [10-04] Verdict PARTIAL: Phase 10 fix objective (filter equality parquet + tpch_q1_sf10_2gpu GREEN) COMPLETE; pre-existing [mgpu-audit] SIGSEGV prevents All tests passed
+- [Phase 10]: [10-04] SF100 Q1 2-GPU ship-gate PASS: exit 0, 5.70s, 4 rows, byte-identical vs 1-GPU baseline, GPU0=42 GPU1=29 intersection=0
 
 ## Accumulated Context
 
@@ -133,6 +136,6 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 
 ## Session Continuity
 
-Last session: 2026-04-27T18:44:27.906Z
-Stopped at: Completed 10-03: fix stream use-after-destroy SIGSEGV in parquet filter translation
+Last session: 2026-04-27T20:46:42.773Z
+Stopped at: Completed 10-04: ship-gate validation — PARTIAL verdict
 Resume file: None
