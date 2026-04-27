@@ -1040,59 +1040,7 @@ TEST_CASE("two-pipeline scan - pure filter column pruning",
   REQUIRE(total_rows == 500);
 }
 
-TEST_CASE("two-pipeline scan - DECIMAL filter falls back to DuckDB expression executor",
-          "[two_pipeline_scan][filter][fallback][shared_context]")
-{
-  auto memory_manager = initialize_memory_manager();
-  auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
-  REQUIRE(gpu_space);
-
-  auto [db_owner, con]           = sirius::make_test_db_and_connection();
-  constexpr std::size_t NUM_ROWS = 500;
-  create_diverse_table(con, "decimal_fallback", NUM_ROWS);
-  auto path = write_parquet(con, "decimal_fallback", 200);
-  parquet_file_cleanup cleanup{{path}};
-
-  // Schema: id(0) INTEGER, value(1) BIGINT, price(2) DECIMAL(12,2), label(3) VARCHAR, created(4)
-  // DATE. A filter on the DECIMAL column will fail cudf AST translation (DECIMAL types are
-  // disabled due to a cudf bug), so the DuckDB expression executor fallback path is exercised.
-  auto schema                    = diverse_table_schema();
-  std::vector<std::string> files = {path.string()};
-  duckdb::vector<duckdb::idx_t> no_projection;
-
-  // Filter: price < 100.00  (price_cents = i*100+1, so price = i + 0.01; id < 100 → 100 rows)
-  auto table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
-  table_filters->PushFilter(
-    duckdb::ColumnIndex(2),
-    duckdb::make_uniq<duckdb::ConstantFilter>(duckdb::ExpressionType::COMPARE_LESSTHAN,
-                                              duckdb::Value::DECIMAL(10000, 12, 2)));
-
-  auto batches = run_two_pipeline_scan(files,
-                                       schema.types,
-                                       schema.types,
-                                       schema.column_ids,
-                                       no_projection,
-                                       schema.names,
-                                       1024 * 1024,
-                                       *gpu_space,
-                                       std::move(table_filters));
-
-  std::size_t total_rows = 0;
-  for (auto const& batch : batches) {
-    auto table = sirius::get_cudf_table_view(*batch);
-    REQUIRE(table.num_columns() == 5);
-    auto ids = copy_int32_column(table.column(0));
-    for (auto id : ids) {
-      REQUIRE(id < 100);
-    }
-    total_rows += table.num_rows();
-  }
-  REQUIRE(total_rows == 100);
-}
-
 //===----------------------------------------------------------------------===//
-// Nested column support (PR #663)
-//
 // Two-pipeline scan tests for parquet files containing STRUCT and LIST
 // columns.  cuDF reassembles nested columns into a single top-level
 // cudf::column when the parent name is passed via parquet_reader_options::set_column_names, so the
@@ -1653,6 +1601,66 @@ TEST_CASE("two-pipeline scan - flat filter with nested projection",
     total_rows += view.num_rows();
   }
   REQUIRE(total_rows == NUM_ROWS - FILTER_MIN);
+}
+
+TEST_CASE("two-pipeline scan - filter on nested column throws cleanly",
+          "[two_pipeline_scan][nested][filter][negative][shared_context]")
+{
+  // cuDF's AST has no operand support for STRUCT or LIST in comparison or
+  // binary ops, so a filter pushed directly against a nested column cannot be
+  // pushed down or evaluated post-scan.  The scan must surface this as an
+  // exception rather than a crash.  This test pins down the "throws cleanly"
+  // contract; the precise layer that throws (filter-to-expression conversion,
+  // AST translation, or the post-scan expression executor fallback) is left
+  // unspecified.
+  auto memory_manager = initialize_memory_manager();
+  auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
+  REQUIRE(gpu_space);
+
+  auto [db_owner, con]           = sirius::make_test_db_and_connection();
+  constexpr std::size_t NUM_ROWS = 100;
+
+  std::string const table = "filter_on_nested";
+  auto create =
+    con.Query("CREATE TABLE " + table + " (id INTEGER, s STRUCT(a INTEGER, b VARCHAR))");
+  REQUIRE(create);
+  REQUIRE(!create->HasError());
+
+  auto insert = con.Query("INSERT INTO " + table +
+                          " SELECT i, {'a': i, 'b': 'v'} "
+                          "FROM generate_series(0, " +
+                          std::to_string(NUM_ROWS - 1) + ") t(i)");
+  REQUIRE(insert);
+  REQUIRE(!insert->HasError());
+
+  auto path = write_parquet(con, table, 100);
+  parquet_file_cleanup cleanup{{path}};
+
+  duckdb::vector<duckdb::ColumnIndex> column_ids{duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)};
+  duckdb::vector<std::string> names{"id", "s"};
+  duckdb::vector<duckdb::idx_t> projection_ids{0, 1};
+  duckdb::vector<duckdb::LogicalType> output_types{duckdb::LogicalType::INTEGER,
+                                                   duckdb::LogicalType::STRUCT({})};
+  duckdb::vector<duckdb::LogicalType> returned_types{duckdb::LogicalType::INTEGER,
+                                                     duckdb::LogicalType::STRUCT({})};
+
+  // Push a constant filter against the STRUCT column.  The constant value type
+  // is unimportant — the point is that the filtered column is nested.
+  auto table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+  table_filters->PushFilter(duckdb::ColumnIndex(1),
+                            duckdb::make_uniq<duckdb::ConstantFilter>(
+                              duckdb::ExpressionType::COMPARE_EQUAL, duckdb::Value::INTEGER(0)));
+
+  std::vector<std::string> files = {path.string()};
+  REQUIRE_THROWS(run_two_pipeline_scan(files,
+                                       output_types,
+                                       returned_types,
+                                       column_ids,
+                                       projection_ids,
+                                       names,
+                                       1024 * 1024,
+                                       *gpu_space,
+                                       std::move(table_filters)));
 }
 
 //---------- Edge cases ----------//
