@@ -35,10 +35,14 @@
 #include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/traits.hpp>
+#include <cudf/utilities/type_dispatcher.hpp>
 
 #include <rmm/device_buffer.hpp>
+#include <rmm/exec_policy.hpp>
 
 #include <cuda_runtime.h>
+#include <thrust/fill.h>
 
 #include <duckdb/common/types.hpp>
 
@@ -102,61 +106,44 @@ cudf::data_type to_cudf_type(const duckdb::LogicalType& type)
   }
 }
 
-/// CUDA kernel to fill a buffer with a constant value (for CONSTANT segments).
-template <typename T>
-__global__ void kernel_fill_constant(T* output, T value, uint32_t count)
-{
-  uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < count) { output[idx] = value; }
-}
+/// Functor for cudf::type_dispatcher: fills `row_count` rows at `d_dest`
+/// with the value at `val_src`, dispatching on the cudf data_type so we
+/// pick up DECIMAL128 / timestamps / fixed_point widths automatically.
+struct fill_constant_dispatch {
+  template <typename T>
+  std::enable_if_t<cudf::is_fixed_width<T>(), void> operator()(uint8_t* d_dest,
+                                                               const uint8_t* val_src,
+                                                               uint32_t row_count,
+                                                               rmm::cuda_stream_view stream) const
+  {
+    T value;
+    std::memcpy(&value, val_src, sizeof(T));
+    thrust::fill_n(rmm::exec_policy_nosync(stream), reinterpret_cast<T*>(d_dest), row_count, value);
+  }
 
-/// Launch kernel_fill_constant with the right type based on type_size.
-/// Reads the constant value from val_src (host pointer).
+  template <typename T>
+  std::enable_if_t<!cudf::is_fixed_width<T>(), void> operator()(uint8_t*,
+                                                                const uint8_t*,
+                                                                uint32_t,
+                                                                rmm::cuda_stream_view) const
+  {
+    // Non-fixed-width (string, list, struct) — dispatcher should never have
+    // routed here. Treat as a viability invariant violation.
+    throw std::runtime_error(
+      "gpu_native_decode: viability invariant violated — fill_constant called "
+      "on non-fixed-width type");
+  }
+};
+
+/// Fill `row_count` elements of `d_dest` with the constant at `val_src`,
+/// dispatching the typed thrust::fill_n through cudf::type_dispatcher.
 void launch_fill_constant(uint8_t* d_dest,
                           const uint8_t* val_src,
-                          uint32_t type_size,
+                          cudf::data_type cudf_type,
                           uint32_t row_count,
-                          cudaStream_t stream)
+                          rmm::cuda_stream_view stream)
 {
-  uint32_t blocks = (row_count + 255) / 256;
-  switch (type_size) {
-    case 1: {
-      int8_t v;
-      std::memcpy(&v, val_src, 1);
-      kernel_fill_constant<<<blocks, 256, 0, stream>>>(
-        reinterpret_cast<int8_t*>(d_dest), v, row_count);
-      break;
-    }
-    case 2: {
-      int16_t v;
-      std::memcpy(&v, val_src, 2);
-      kernel_fill_constant<<<blocks, 256, 0, stream>>>(
-        reinterpret_cast<int16_t*>(d_dest), v, row_count);
-      break;
-    }
-    case 4: {
-      int32_t v;
-      std::memcpy(&v, val_src, 4);
-      kernel_fill_constant<<<blocks, 256, 0, stream>>>(
-        reinterpret_cast<int32_t*>(d_dest), v, row_count);
-      break;
-    }
-    case 8: {
-      int64_t v;
-      std::memcpy(&v, val_src, 8);
-      kernel_fill_constant<<<blocks, 256, 0, stream>>>(
-        reinterpret_cast<int64_t*>(d_dest), v, row_count);
-      break;
-    }
-    default: {
-      // Fallback: expand on host and memcpy
-      std::vector<uint8_t> host_buf(static_cast<size_t>(row_count) * type_size);
-      for (uint32_t r = 0; r < row_count; ++r)
-        std::memcpy(host_buf.data() + r * type_size, val_src, type_size);
-      bounce_h2d_async(d_dest, host_buf.data(), host_buf.size(), stream);
-      break;
-    }
-  }
+  cudf::type_dispatcher(cudf_type, fill_constant_dispatch{}, d_dest, val_src, row_count, stream);
 }
 
 //===----------------------------------------------------------------------===//
@@ -410,7 +397,7 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(column_scan_result& col_
       }
       case duckdb::CompressionType::COMPRESSION_CONSTANT: {
         const uint8_t* vs = seg.data_ptr ? seg.data_ptr : seg.constant_data;
-        launch_fill_constant(d_dest, vs, type_size, seg.row_count, stream.value());
+        launch_fill_constant(d_dest, vs, cudf_type, seg.row_count, stream);
         break;
       }
       case duckdb::CompressionType::COMPRESSION_BITPACKING: {
