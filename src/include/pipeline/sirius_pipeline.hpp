@@ -168,7 +168,7 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   //! Set the task_creator pointer so this pipeline can schedule downstream consumers on finish.
   void set_task_creator(sirius::creator::task_creator* tc);
 
-  uuid::UUID pipeline_uuid() const { return _pipeline_uuid; }
+  [[nodiscard]] uuid::UUID pipeline_uuid() const { return _pipeline_uuid; }
 
  private:
   //! Whether or not the pipeline has been readied

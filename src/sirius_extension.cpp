@@ -61,8 +61,9 @@ namespace duckdb {
 const std::string PINNED_MEMORY_PARAM_KEY   = "pinned_memory_size";
 bool SiriusExtension::buffer_is_initialized = false;
 
-namespace {
+constexpr std::string QUERY_LABEL_PARAM_KEY = "query_label";
 
+namespace {
 unique_ptr<QueryResult> run_internal_cpu_fallback_query(ClientContext& context,
                                                         Connection& connection,
                                                         const string& query)
@@ -406,7 +407,14 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   result->conn             = make_uniq<Connection>(*context.db);
   result->query            = input.inputs[0].ToString();
   result->enable_optimizer = true;
-  result->sirius_iface     = make_uniq<::sirius::sirius_interface>(context);
+
+  std::optional<std::string> query_label = std::nullopt;
+  if (auto it = input.named_parameters.find(QUERY_LABEL_PARAM_KEY);
+      it != input.named_parameters.end() && not it->second.IsNull()) {
+    query_label = it->second.ToString();
+  }
+  result->sirius_iface = make_uniq<::sirius::sirius_interface>(context, query_label);
+
   if (input.inputs[0].IsNull()) {
     throw BinderException("gpu_execution cannot be called with a NULL parameter");
   }
@@ -695,7 +703,8 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
                               {LogicalType::VARCHAR},
                               GPUExecutionFunction,
                               SiriusExtension::GPUExecutionBind);
-  gpu_execution.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
+  gpu_execution.named_parameters["enable_optimizer"]    = LogicalType::BOOLEAN;
+  gpu_execution.named_parameters[QUERY_LABEL_PARAM_KEY] = LogicalType::VARCHAR;
   CreateTableFunctionInfo gpu_execution_info(gpu_execution);
   catalog.CreateTableFunction(transaction, gpu_execution_info);
 

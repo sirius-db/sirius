@@ -60,23 +60,24 @@ namespace sirius {
 sirius_engine::sirius_engine(duckdb::ClientContext& context, sirius_interface& sirius_iface)
   : context(context),
     sirius_iface(sirius_iface),
-    query_group_uuid(uuid::now_v7()),
-    query_group_observer(quent::query_group::create_observer(sirius_iface.telemetry.context())),
-    query_handle(quent::query::create(sirius_iface.telemetry.context(),
-                                      quent::query::Init{
-                                        .instance_name  = "",
-                                        .query_group_id = query_group_uuid,
-                                      }))
+    query_group_uuid_(uuid::now_v7()),
+    query_group_observer_(quent::query_group::create_observer(sirius_iface.telemetry.context())),
+    query_handle_(quent::query::create(
+      sirius_iface.telemetry.context(),
+      quent::query::Init{
+        .instance_name  = sirius_iface.telemetry.query_label().value_or("unnamed_query"),
+        .query_group_id = query_group_uuid_,
+      }))
 {
   // Declare the query group under this engine
-  query_group_observer->declaration(query_group_uuid,
-                                    quent::query_group::Declaration{
-                                      .instance_name = "default",
-                                      .engine_id     = sirius_iface.telemetry.engine_id(),
-                                    });
+  query_group_observer_->declaration(query_group_uuid_,
+                                     quent::query_group::Declaration{
+                                       .instance_name = "default_group",
+                                       .engine_id     = sirius_iface.telemetry.engine_id(),
+                                     });
 }
 
-sirius_engine::~sirius_engine() { query_handle->exit(); }
+sirius_engine::~sirius_engine() { query_handle_->exit(); }
 
 void sirius_engine::reset()
 {
@@ -188,7 +189,9 @@ duckdb::shared_ptr<pipeline::sirius_pipeline> sirius_engine::create_child_pipeli
 }
 
 bool sirius_engine::has_result_collector()
-{ return sirius_physical_plan->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR; }
+{
+  return sirius_physical_plan->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR;
+}
 
 duckdb::unique_ptr<duckdb::QueryResult> sirius_engine::get_result()
 {
@@ -205,7 +208,7 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_engine::get_result()
 void sirius_engine::initialize(duckdb::unique_ptr<op::sirius_physical_operator> physical_plan)
 {
   SIRIUS_LOG_DEBUG("Initializing sirius_engine");
-  query_handle->planning();
+  query_handle_->planning();
   reset();
   sirius_owned_plan = std::move(physical_plan);
   // Pre-fetch iceberg delete-file metadata before initialize_internal() assigns
@@ -219,7 +222,7 @@ void sirius_engine::initialize(duckdb::unique_ptr<op::sirius_physical_operator> 
 void sirius_engine::execute()
 {
   nvtx3::scoped_range nvtx_range{"sirius::query"};
-  query_handle->executing();
+  query_handle_->executing();
 
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (sirius_ctx == nullptr) {
@@ -230,7 +233,7 @@ void sirius_engine::execute()
   sirius_ctx->create_query(std::move(new_scheduled),
                            sirius_iface.telemetry.context(),
                            telemetry::query_telemetry_info{
-                             .query_id  = query_handle->uuid(),
+                             .query_id  = query_handle_->uuid(),
                              .worker_id = sirius_iface.telemetry.worker_id(),
                            });
   auto future = sirius_ctx->get_task_scheduler().start_query();

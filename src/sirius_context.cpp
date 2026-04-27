@@ -184,7 +184,9 @@ void SiriusContext::QueryEnd(ClientContext& context)
 }
 
 void SiriusContext::QueryEnd(ClientContext& context, optional_ptr<ErrorData> error)
-{ QueryEnd(context); }
+{
+  QueryEnd(context);
+}
 
 void SiriusContext::initialize(const sirius::sirius_config& config)
 {
@@ -418,10 +420,14 @@ bool SiriusContext::is_query_lifecycle_active() const noexcept
 }
 
 void SiriusContext::set_captured_logical_plan(unique_ptr<LogicalOperator> plan)
-{ captured_logical_plan_ = std::move(plan); }
+{
+  captured_logical_plan_ = std::move(plan);
+}
 
 unique_ptr<LogicalOperator> SiriusContext::take_captured_logical_plan()
-{ return std::move(captured_logical_plan_); }
+{
+  return std::move(captured_logical_plan_);
+}
 
 void SiriusContext::set_transparent_original_disabled_optimizers(std::set<OptimizerType> disabled)
 {
@@ -455,13 +461,19 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
 }
 
 void SiriusContext::record_transparent_rebind_success() noexcept
-{ transparent_rebind_success_count_.fetch_add(1, std::memory_order_relaxed); }
+{
+  transparent_rebind_success_count_.fetch_add(1, std::memory_order_relaxed);
+}
 
 void SiriusContext::record_transparent_fallback() noexcept
-{ transparent_fallback_count_.fetch_add(1, std::memory_order_relaxed); }
+{
+  transparent_fallback_count_.fetch_add(1, std::memory_order_relaxed);
+}
 
 void SiriusContext::record_transparent_execution() noexcept
-{ transparent_execution_count_.fetch_add(1, std::memory_order_relaxed); }
+{
+  transparent_execution_count_.fetch_add(1, std::memory_order_relaxed);
+}
 
 RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
                                                  PreparedStatementData& prepared,
@@ -564,15 +576,21 @@ void SiriusContextExtensionCallback::OnConnectionClosed(ClientContext& context)
 }
 
 void SiriusContextExtensionCallback::OnExtensionLoaded(DatabaseInstance& db, const string& name)
-{ spdlog::info("Extension loaded: {}", name); }
+{
+  spdlog::info("Extension loaded: {}", name);
+}
 
 void SiriusContextExtensionCallback::OnBeginExtensionLoad(DatabaseInstance& db, const string& name)
-{ spdlog::info("Beginning to load extension: {}", name); }
+{
+  spdlog::info("Beginning to load extension: {}", name);
+}
 
 void SiriusContextExtensionCallback::OnExtensionLoadFail(DatabaseInstance& db,
                                                          const string& name,
                                                          const ErrorData& error)
-{ spdlog::error("Failed to load extension: {}. Error: {}", name, error.RawMessage()); }
+{
+  spdlog::error("Failed to load extension: {}. Error: {}", name, error.RawMessage());
+}
 
 void SiriusContextExtensionCallback::read_config_file_if_exists()
 {

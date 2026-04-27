@@ -128,10 +128,11 @@ class sirius_engine {
   // initialize_internal() runs.  Keyed by iceberg table path string.
   // ---------------------------------------------------------------------------
   std::unordered_map<std::string, op::scan::IcebergDeleteFiles> iceberg_metadata_cache_;
-  
-  uuid::UUID query_group_uuid;
-  rust::Box<quent::query_group::QueryGroupObserver> query_group_observer;
-  rust::Box<quent::query::QueryHandle> query_handle;
+
+ private:
+  uuid::UUID query_group_uuid_;
+  rust::Box<quent::query_group::QueryGroupObserver> query_group_observer_;
+  rust::Box<quent::query::QueryHandle> query_handle_;
 };
 
 }  // namespace sirius
