@@ -200,35 +200,36 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
   // Filter
   std::shared_ptr<translated_expression> ast_filter;
   if (_has_filter) {
-    /// KEVIN: there is a bug hiding here that I haven't been able to find yet...
-    // if (!_column_name_by_ref.empty()) {
-    //   gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
-    //   auto name_resolver = [this](duckdb::idx_t ref_index) -> std::string {
-    //     return _column_name_by_ref.at(ref_index);
-    //   };
-    //   auto optional_filter =
-    //     translator.translate_expression_with_names(*_duckdb_filter_expression, name_resolver);
-    //   if (optional_filter) {
-    //     ast_filter = std::make_shared<translated_expression>(std::move(*optional_filter));
-    //     result->reader_options->set_filter(ast_filter->back());
-    //     result->filter_expression = ast_filter;
-    //     SIRIUS_LOG_DEBUG(
-    //       "[sirius_parquet_metadata_scan_operator] Successfully translated filter expression for
-    //       " "pushdown.");
-    //   } else {
-    //     result->filter_expression = _duckdb_filter_expression;
-    //     SIRIUS_LOG_DEBUG(
-    //       "[sirius_parquet_metadata_scan_operator] Failed to translate filter expression for "
-    //       "pushdown. Filter will be applied in the GPU scan operator.");
-    //   }
-    // } else {
-    //   // Column names were not provided; AST translation requires column name references.
-    //   result->filter_expression = _duckdb_filter_expression;
-    //   SIRIUS_LOG_DEBUG(
-    //     "[sirius_parquet_metadata_scan_operator] Column names not available for AST filter "
-    //     "translation. Filter will be applied in the GPU scan operator.");
-    // }
-    result->filter_expression          = _duckdb_filter_expression;
+    if (!_column_name_by_ref.empty()) {
+      gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
+      auto name_resolver = [this](duckdb::idx_t ref_index) -> std::string {
+        return _column_name_by_ref.at(ref_index);
+      };
+      auto optional_filter =
+        translator.translate_expression_with_names(*_duckdb_filter_expression, name_resolver);
+      if (optional_filter) {
+        stream.synchronize();  // Ensure scalars are materialized for downstream operators executing
+                               // in other streams.
+        ast_filter = std::make_shared<translated_expression>(std::move(*optional_filter));
+        result->reader_options->set_filter(ast_filter->back());
+        result->filter_expression = ast_filter;
+        SIRIUS_LOG_DEBUG(
+          "[sirius_parquet_metadata_scan_operator] Successfully translated filter expression for "
+          "pushdown ({} scalar literals).",
+          ast_filter->owned_literals.size());
+      } else {
+        result->filter_expression = _duckdb_filter_expression;
+        SIRIUS_LOG_DEBUG(
+          "[sirius_parquet_metadata_scan_operator] Failed to translate filter expression for "
+          "pushdown. Filter will be applied in the GPU scan operator.");
+      }
+    } else {
+      // Column names were not provided; AST translation requires column name references.
+      result->filter_expression = _duckdb_filter_expression;
+      SIRIUS_LOG_DEBUG(
+        "[sirius_parquet_metadata_scan_operator] Column names not available for AST filter "
+        "translation. Filter will be applied in the GPU scan operator.");
+    }
     result->post_filter_projection_ids = _post_filter_projection_ids;
   }
 
@@ -373,11 +374,6 @@ void sirius_parquet_metadata_scan_operator::sink(const operator_data& input_data
       "expected partitioned_parquet_metadata.");
   }
   _gpu_scan->accumulate_metadata(*metadata);
-}
-
-void sirius_parquet_metadata_scan_operator::finalize_operator()
-{
-  _gpu_scan->finalize_partitions();
 }
 
 }  // namespace sirius::op::scan

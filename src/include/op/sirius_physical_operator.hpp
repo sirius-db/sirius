@@ -119,6 +119,16 @@ class operator_data {
   {
     return std::vector<::cucascade::data_batch_processing_handle>{};
   };
+
+  /**
+   * @brief Estimate the uncompressed GPU memory footprint of this data.
+   *
+   * Used by the reservation system to size memory reservations before a task
+   * executes. The default returns 0, which is appropriate for metadata-only
+   * subclasses (e.g. parquet_metadata_input). Subclasses that carry or
+   * represent GPU-resident data should override to return a meaningful estimate.
+   */
+  [[nodiscard]] virtual std::size_t get_estimated_size_in_bytes() const { return 0; }
 };
 
 /**
@@ -173,6 +183,17 @@ class pipelineable_operator_data : public operator_data {
   std::optional<std::vector<::cucascade::data_batch_processing_handle>> prepare_for_processing(
     const ::cucascade::memory::memory_space* requested_memory_space,
     rmm::cuda_stream_view stream) override;
+
+  [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
+  {
+    std::size_t total = 0;
+    for (auto const& batch : _data_batches) {
+      if (batch && batch->get_data()) {
+        total += batch->get_data()->get_uncompressed_data_size_in_bytes();
+      }
+    }
+    return total;
+  }
 
  private:
   std::vector<std::shared_ptr<::cucascade::data_batch>> _data_batches;
