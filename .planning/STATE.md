@@ -1,16 +1,16 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.2
-milestone_name: Multi-GPU SQL Pipeline Fix
-status: verifying
+milestone: v1.1
+milestone_name: milestone
+status: executing
 stopped_at: "Completed 10-04: ship-gate validation — PARTIAL verdict"
-last_updated: "2026-04-28T12:40:05.262Z"
-last_activity: 2026-04-28
+last_updated: "2026-04-28T14:18:01.939Z"
+last_activity: 2026-04-28 -- Phase 11 execution started
 progress:
-  total_phases: 3
-  completed_phases: 2
-  total_plans: 18
-  completed_plans: 16
+  total_phases: 11
+  completed_phases: 7
+  total_plans: 39
+  completed_plans: 40
   percent: 100
 ---
 
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-21)
 
 **Core value:** Any query can transparently execute across every GPU on the node — tasks are scheduled to the GPU where their input data already resides, memory pressure is absorbed by downgrading to the correct NUMA domain, and parquet I/O is routed through a multi-GPU-safe backend.
-**Current focus:** Phase 10 — table-function-form-gpu-execution-sigsegv-fix
+**Current focus:** Phase 11 — mgpu-audit-attach-sigsegv
 
 ## Current Position
 
-Phase: 10 (table-function-form-gpu-execution-sigsegv-fix) — EXECUTING
-Plan: 4 of 4
-Status: Phase complete — ready for verification
-Last activity: 2026-04-28
+Phase: 11 (mgpu-audit-attach-sigsegv) — EXECUTING
+Plan: 1 of 2
+Status: Executing Phase 11
+Last activity: 2026-04-28 -- Phase 11 execution started
 
 Progress: [██████████] 100% (6/6 plans complete)
 Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gpu-sql-pipeline-fix/08-SUMMARY.md`
