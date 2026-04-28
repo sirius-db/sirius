@@ -187,11 +187,9 @@ class pipelineable_operator_data : public operator_data {
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
   {
     std::size_t total = 0;
-    for (auto const& batch : _data_batches) {
-      if (batch) {
-        auto ro = batch->to_read_only();
-        total += ro.get_data()->get_uncompressed_data_size_in_bytes();
-      }
+    auto ro_batches   = get_read_only_batches(false);
+    for (auto const& ro : ro_batches) {
+      if (ro.get_data()) { total += ro.get_data()->get_uncompressed_data_size_in_bytes(); }
     }
     return total;
   }
