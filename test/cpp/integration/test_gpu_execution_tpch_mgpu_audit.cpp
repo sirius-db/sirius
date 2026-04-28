@@ -152,6 +152,21 @@ TEST_CASE("gpu_execution - [mgpu-audit] per-GPU distribution on TPC-H Q1",
   auto* env = sirius::test::acquire_integration_env_for(2);
   REQUIRE(env != nullptr);
 
+  // Honor the "only one integration env active at a time" invariant declared
+  // in unittest.cpp:103. The shared_env_listener resumes g_integration_env
+  // (1-GPU) for tests tagged [integration], so without this pause the 1-GPU
+  // SiriusContext stays alive while we resume the 2-GPU env below — two
+  // SiriusContexts then share the extension's global operator-id space and
+  // HASH_GROUP_BY ends up with a corrupted output schema (column count
+  // mismatch: got 13, expected 10) leading to a SIGSEGV mid-execution. The
+  // [tpch] tests sidestep this naturally via RUN_TPCH_MGPU's bind_env /
+  // release_env transitions; the AUDIT TEST_CASE acquires the 2-GPU env
+  // directly so we must pause the 1-GPU env explicitly. Phase 11-01 record:
+  // .planning/phases/11-mgpu-audit-attach-sigsegv/11-01-FIX.md.
+  if (sirius::test::g_integration_env != nullptr && sirius::test::g_integration_env->is_active()) {
+    sirius::test::g_integration_env->pause();
+  }
+
   // Route Sirius logging into a unique tmp dir owned by this TEST_CASE. Must
   // be done while the env is paused so that create_db() re-triggers the
   // extension callback's SIRIUS_LOG_DIR read (src/sirius_context.cpp:569).

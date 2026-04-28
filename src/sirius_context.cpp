@@ -157,6 +157,16 @@ void SiriusContext::QueryEnd()
         info.count);
     }
   }
+
+  // Drop per-query global states held by task_creator. These include
+  // duckdb_scan_task_global_state, which transitively owns a
+  // duckdb::DuckTableScanState referencing BufferManager-owned BlockHandles.
+  // If we leave this state alive past QueryEnd, ~task_creator at SiriusContext
+  // teardown ends up releasing those BlockHandles after parts of DuckDB's
+  // DatabaseInstance have already been torn down (~DBConfig fires ~SiriusContext
+  // mid-DB destruction), which SIGSEGVs in ~BlockMemory. Phase 11-01 record:
+  // .planning/phases/11-mgpu-audit-attach-sigsegv/11-01-FIX.md.
+  if (task_creator_) { task_creator_->reset(/*keep_parquet_metadata=*/true); }
 }
 
 void SiriusContext::QueryEnd(ClientContext& context) { QueryEnd(); }
