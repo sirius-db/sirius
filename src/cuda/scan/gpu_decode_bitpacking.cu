@@ -211,9 +211,13 @@ __global__ void kernel_decode_bitpacking_batched(const batched_bp_seg_desc* __re
   __syncthreads();
 
   if (mode == BitpackingMode::FOR) {
+    // Striped (not blocked) write layout: in iteration v, all blockDim.x
+    // threads write consecutive positions [v*blockDim.x .. v*blockDim.x+255]
+    // — one coalesced cache-line transaction per warp instead of the
+    // strided 8-element gap that the blocked layout produced.
     constexpr uint32_t VPT = 8;
     for (uint32_t v = 0; v < VPT; ++v) {
-      uint32_t idx = threadIdx.x * VPT + v;
+      uint32_t idx = v * blockDim.x + threadIdx.x;
       if (idx >= rc) break;
       out[idx] = frame + unpack_value<T>(shmem, idx, width);
     }
@@ -226,6 +230,12 @@ __global__ void kernel_decode_bitpacking_batched(const batched_bp_seg_desc* __re
   if (mode != BitpackingMode::DELTA_FOR) return;
 
   //--- DELTA_FOR: unpack, prefix sum ---
+  //
+  // Algorithm runs in blocked layout (each thread holds VPT consecutive
+  // values) so cub::BlockScan's InclusiveSum across thread aggregates
+  // gives the right per-thread prefix.  Final values are then exchanged
+  // through shmem (reusing the packed-data buffer) into striped layout
+  // so the global write is coalesced — same win as FOR above.
   constexpr uint32_t BLOCK_DIM = 256;
   constexpr uint32_t VPT       = 8;
   typedef cub::BlockScan<T, BLOCK_DIM> BlockScanT;
@@ -248,9 +258,23 @@ __global__ void kernel_decode_bitpacking_batched(const batched_bp_seg_desc* __re
   T delta_offset = sm_aux;
   T prefix       = (scanned_agg - thread_agg) + delta_offset;
 
+  // Stage final values into shmem in blocked layout (thread t writes
+  // positions [t*VPT .. t*VPT+VPT-1]). All threads have finished reading
+  // the packed-bytes buffer above (the unpack loop is per-thread and the
+  // BlockScan barrier covers the in-register reduction), so reusing the
+  // buffer here is safe.
+  __syncthreads();
+  T* shmem_t = reinterpret_cast<T*>(shmem);
   for (uint32_t v = 0; v < VPT; ++v) {
     uint32_t idx = threadIdx.x * VPT + v;
-    if (idx < rc) { out[idx] = thread_data[v] + prefix; }
+    if (idx < rc) shmem_t[idx] = thread_data[v] + prefix;
+  }
+  __syncthreads();
+
+  // Read+write in striped layout for coalesced global stores.
+  for (uint32_t v = 0; v < VPT; ++v) {
+    uint32_t idx = v * blockDim.x + threadIdx.x;
+    if (idx < rc) out[idx] = shmem_t[idx];
   }
 }
 
