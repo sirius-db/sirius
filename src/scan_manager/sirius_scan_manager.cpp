@@ -26,6 +26,7 @@
 #include "scan_manager/split_connector.hpp"
 #include "scan_manager/split_provider.hpp"
 
+#include <algorithm>
 #include <exception>
 #include <utility>
 
@@ -51,8 +52,10 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
     if (!source) { continue; }
     if (source->type != ::sirius::op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN) { continue; }
 
-    auto* op = &source->Cast<op::scan::sirius_gpu_parquet_scan_operator>();
-    if (_providers_by_op.find(op) != _providers_by_op.end()) { continue; }
+    auto* op                = &source->Cast<op::scan::sirius_gpu_parquet_scan_operator>();
+    auto already_registered = std::any_of(
+      _providers.begin(), _providers.end(), [op](auto const& entry) { return entry.first == op; });
+    if (already_registered) { continue; }
 
     auto provider = create_provider_for(op);
     if (!provider) {
@@ -61,14 +64,13 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
       continue;
     }
     op->set_split_connector(std::make_unique<split_connector>());
-    _providers_by_op.emplace(op, std::move(provider));
-    _scan_op_order.push_back(op);
+    _providers.emplace_back(op, std::move(provider));
 
     SIRIUS_LOG_DEBUG("[sirius_scan_manager::prepare_for_query] registered op_id={}",
                      op->get_operator_id());
   }
 
-  if (_scan_op_order.empty()) { return; }
+  if (_providers.empty()) { return; }
 
   if (!_thread_pool) {
     throw std::runtime_error("[sirius_scan_manager::prepare_for_query] thread pool not started");
@@ -102,18 +104,17 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
 
 void sirius_scan_manager::run_driver_loop()
 {
-  for (auto* op : _scan_op_order) {
-    auto it = _providers_by_op.find(op);
-    if (it == _providers_by_op.end()) { continue; }
+  for (auto& [op, provider] : _providers) {
     auto* connector = op->get_split_connector();
     if (connector == nullptr) { continue; }
 
     try {
-      auto future = it->second->start(*_thread_pool, *connector);
-      future.wait();
+      auto future = provider->start(*_thread_pool, *connector);
+      future.get();
     } catch (const std::exception& e) {
       SIRIUS_LOG_ERROR("[sirius_scan_manager] driver: provider failed: {}", e.what());
-      // Make sure the consumer is unblocked even on failure.
+      // Provider already closed the connector before setting the exception;
+      // closing again here is idempotent and covers synchronous start() throws.
       connector->close();
     }
   }
@@ -122,8 +123,7 @@ void sirius_scan_manager::run_driver_loop()
 void sirius_scan_manager::reset()
 {
   if (_driver_thread.joinable()) { _driver_thread.join(); }
-  _scan_op_order.clear();
-  _providers_by_op.clear();
+  _providers.clear();
 }
 
 void sirius_scan_manager::start()
@@ -135,6 +135,8 @@ void sirius_scan_manager::start()
 
 void sirius_scan_manager::stop()
 {
+  /// KEVIN: if the split_provider fails to deliver its future (e.g., unresponsive remote storage),
+  /// stop() will hang here on the join().
   if (_driver_thread.joinable()) { _driver_thread.join(); }
   if (!_thread_pool) { return; }
   _thread_pool->stop();

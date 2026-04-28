@@ -18,6 +18,7 @@
 
 #include "op/sirius_physical_operator.hpp"
 
+#include <cassert>
 #include <utility>
 
 namespace sirius::scan_manager {
@@ -27,8 +28,10 @@ split_connector::~split_connector() = default;
 
 void split_connector::push_split(std::unique_ptr<op::operator_data> split)
 {
+  assert(split != nullptr && "push_split requires a non-null split");
   {
     std::lock_guard<std::mutex> lock(_mutex);
+    assert(!_closed && "push_split after close() is forbidden");
     _splits.push_back(std::move(split));
   }
   _cv.notify_one();

@@ -28,6 +28,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -43,10 +44,9 @@ namespace sirius::scan_manager {
  * @brief Split provider that parses parquet metadata and emits one
  *        @c parquet_scan_data per row-group partition.
  *
- * This provider replaces the previous sirius_parquet_metadata_scan_operator:
- * its constructor performs the same up-front filter / projection / hive
- * partition setup, and start() drives the metadata-scan iteration on the
- * provided thread pool, pushing parquet_scan_data into the connector.
+ * This provider performs up-front filter / projection / hive partition setup, and start() drives
+ * the metadata-scan iteration on the provided thread pool, pushing parquet_scan_data into the
+ * connector.
  */
 class parquet_split_provider : public split_provider {
  public:

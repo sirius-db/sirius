@@ -33,6 +33,7 @@
 #include <atomic>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <utility>
 
@@ -166,17 +167,45 @@ std::future<void> parquet_split_provider::start(exec::thread_pool& pool, split_c
     return future;
   }
 
-  auto remaining = std::make_shared<std::atomic<std::size_t>>(batches.size());
+  auto remaining   = std::make_shared<std::atomic<std::size_t>>(batches.size());
+  auto first_error = std::make_shared<std::atomic<bool>>(false);
+  auto error_ptr   = std::make_shared<std::exception_ptr>();
+  auto error_mutex = std::make_shared<std::mutex>();
+
   for (auto& batch : batches) {
-    pool.schedule([this, batch = std::move(batch), &connector, remaining, promise]() {
+    pool.schedule([this,
+                   batch = std::move(batch),
+                   &connector,
+                   remaining,
+                   promise,
+                   first_error,
+                   error_ptr,
+                   error_mutex]() {
       try {
         run_batch(batch, connector);
       } catch (const std::exception& e) {
         SIRIUS_LOG_ERROR("[parquet_split_provider] metadata scan task failed: {}", e.what());
+        bool expected = false;
+        if (first_error->compare_exchange_strong(expected, true)) {
+          std::lock_guard<std::mutex> lock(*error_mutex);
+          *error_ptr = std::current_exception();
+        }
+      } catch (...) {
+        SIRIUS_LOG_ERROR("[parquet_split_provider] metadata scan task failed (unknown)");
+        bool expected = false;
+        if (first_error->compare_exchange_strong(expected, true)) {
+          std::lock_guard<std::mutex> lock(*error_mutex);
+          *error_ptr = std::current_exception();
+        }
       }
       if (remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
         connector.close();
-        promise->set_value();
+        if (first_error->load(std::memory_order_acquire)) {
+          std::lock_guard<std::mutex> lock(*error_mutex);
+          promise->set_exception(*error_ptr);
+        } else {
+          promise->set_value();
+        }
       }
     });
   }

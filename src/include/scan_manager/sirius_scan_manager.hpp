@@ -22,7 +22,7 @@
 
 #include <memory>
 #include <thread>
-#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace sirius::op::scan {
@@ -62,17 +62,18 @@ class sirius_scan_manager {
   ///
   /// Walks @p query 's pipelines in scan-operator order. For each GPU parquet
   /// scan source, the factory builds a split_provider from the operator's
-  /// scan_info, installs a fresh split_connector on the operator, and stores
-  /// the provider in a map keyed by the operator. A driver thread then runs
-  /// the providers SEQUENTIALLY in registration order: provider[0] starts,
-  /// when its future completes provider[1] starts, and so on. Consumers (the
-  /// gpu scan operators) block in split_connector::get_next_split until splits
+  /// scan_info, installs a fresh split_connector on the operator, and appends
+  /// the (op, provider) pair to _providers in registration order. A driver
+  /// thread then runs the providers SEQUENTIALLY: providers[0] starts, when
+  /// its future completes providers[1] starts, and so on. Consumers (the gpu
+  /// scan operators) block in split_connector::get_next_split until splits
   /// arrive or the connector is closed, so no separate wake-up channel is
   /// needed.
   void prepare_for_query(const sirius::planner::query& query);
 
-  /// \brief Clear the providers map and join the driver thread if it is
-  ///        still running.
+  /// \brief Clear the providers list and join the driver thread if it is
+  ///        still running. Connectors are operator-owned; their cleanup is
+  ///        the operator's responsibility.
   void reset();
 
   /// \brief Start the worker thread pool. Idempotent.
@@ -93,9 +94,9 @@ class sirius_scan_manager {
 
   exec::thread_pool_config _config;
   std::unique_ptr<exec::thread_pool> _thread_pool;
-  std::unordered_map<op::scan::sirius_gpu_parquet_scan_operator*, std::unique_ptr<split_provider>>
-    _providers_by_op;
-  std::vector<op::scan::sirius_gpu_parquet_scan_operator*> _scan_op_order;
+  std::vector<
+    std::pair<op::scan::sirius_gpu_parquet_scan_operator*, std::unique_ptr<split_provider>>>
+    _providers;
   std::thread _driver_thread;
 };
 

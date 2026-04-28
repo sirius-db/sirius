@@ -51,6 +51,7 @@ sirius_gpu_parquet_scan_operator::sirius_gpu_parquet_scan_operator(
     _split_connector(std::make_unique<scan_manager::split_connector>()),
     _scan_info(std::move(scan_info))
 {
+  _split_connector->close();
 }
 
 sirius_gpu_parquet_scan_operator::~sirius_gpu_parquet_scan_operator() = default;
@@ -75,6 +76,10 @@ void sirius_gpu_parquet_scan_operator::set_split_connector(
 std::optional<task_creation_hint> sirius_gpu_parquet_scan_operator::get_next_task_hint()
 {
   if (_split_connector->is_closed()) { return std::nullopt; }
+  // Returns READY even when the queue is empty (but not yet closed()) — get_next_task_input_data()
+  // will block on the connector's cv. This parks a worker but avoids needing a scheduler-visible
+  // wake-up signal from the scan_manager.
+  // TODO(scan_manager): wake-up via `on_push` callback when scheduler can re-poll.
   return task_creation_hint{TaskCreationHint::READY, this};
 }
 

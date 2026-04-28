@@ -41,8 +41,8 @@ using hybrid_scan_reader = cudf::io::parquet::experimental::hybrid_scan_reader;
 /**
  * @brief Represents a set of row groups within a single parquet file.
  *
- * Used as the unit of work for both the metadata scan (partitioning) and the
- * GPU scan (byte-range preloading).
+ * Used as the unit of work for both the parquet split provider (partitioning) and
+ * the GPU scan (byte-range preloading).
  */
 struct row_group_range {
   row_group_range(std::size_t file_idx,
@@ -69,8 +69,9 @@ struct row_group_range {
  * @brief Input to a GPU parquet scan task.
  *
  * Contains all per-partition data needed to read a single row_group_range from
- * a parquet file.  Fields are extracted from partitioned_parquet_metadata by
- * get_next_task_input_data() so that each task is self-contained.
+ * a parquet file. Each instance is constructed by parquet_split_provider::run_batch
+ * and pushed into the gpu scan operator's split_connector; the operator pulls one
+ * via get_next_task_input_data() per task so each task is self-contained.
  */
 class parquet_scan_data : public op::operator_data {
  public:
