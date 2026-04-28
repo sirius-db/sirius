@@ -12,6 +12,6 @@ cxx = "1"
 instrumentation-model = { path = "../model" }
 
 [build-dependencies]
-quent-codegen = { path = "/home/dvats/repos/quent/crates/codegen" }
 cxx-build = "1"
 instrumentation-model = { path = "../model" }
+quent-codegen = { path = "/home/dvats/repos/quent/crates/codegen" }
