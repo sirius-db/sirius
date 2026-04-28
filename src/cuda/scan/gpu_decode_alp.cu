@@ -43,6 +43,9 @@
 
 #include <cuda_runtime.h>
 
+#include <stdexcept>
+#include <string>
+
 namespace sirius::cuda::scan {
 
 //===----------------------------------------------------------------------===//
@@ -556,13 +559,19 @@ void gpu_decode_alp(const uint8_t* d_seg,
   if (type_size == 4) {
     kernel_alp_decode_f32<<<grid, block, 0, stream.value()>>>(
       d_seg, row_count, static_cast<float*>(d_output));
-  } else {
+  } else if (type_size == 8) {
     kernel_alp_decode_f64<<<grid, block, 0, stream.value()>>>(
       d_seg, row_count, static_cast<double*>(d_output));
+  } else {
+    throw std::runtime_error(
+      "gpu_decode_alp: viability invariant violated — ALP only "
+      "supports type_size 4 (FLOAT) or 8 (DOUBLE), got " +
+      std::to_string(type_size));
   }
 }
 
 void gpu_decode_alprd(const uint8_t* d_seg,
+                      const uint8_t* h_seg,
                       uint32_t row_count,
                       uint32_t type_size,
                       void* d_output,
@@ -570,15 +579,14 @@ void gpu_decode_alprd(const uint8_t* d_seg,
 {
   if (row_count == 0) return;
 
-  // Read the 7-byte segment-level header + dictionary from device.
-  // Single cheap sync — happens once per ALPRD *segment*, not per vector.
-  uint8_t h_hdr[ALPRD_HEADER_SIZE + ALPRD_MAX_DICT_SIZE * 2];
-  cudaMemcpyAsync(h_hdr, d_seg, sizeof(h_hdr), cudaMemcpyDeviceToHost, stream.value());
-  stream.synchronize();
-
-  const uint8_t right_bw  = h_hdr[4];
-  const uint8_t left_bw   = h_hdr[5];
-  const uint8_t dict_size = h_hdr[6];
+  // The 7-byte segment header (metadata_end + right_bw + left_bw + dict_size)
+  // is segment-wide and already on the host — read it directly from h_seg
+  // instead of bouncing it through the GPU and stream-syncing once per
+  // segment.  The dispatcher's batched-decode contract is "minimal syncs";
+  // a per-segment sync here would defeat that on ALPRD-heavy columns.
+  const uint8_t right_bw  = h_seg[4];
+  const uint8_t left_bw   = h_seg[5];
+  const uint8_t dict_size = h_seg[6];
 
   const uint32_t num_vecs = (row_count + ALP_VECTOR_SIZE - 1) / ALP_VECTOR_SIZE;
   const dim3 grid(num_vecs);
@@ -587,9 +595,14 @@ void gpu_decode_alprd(const uint8_t* d_seg,
   if (type_size == 4) {
     kernel_alprd_decode_f32<<<grid, block, 0, stream.value()>>>(
       d_seg, row_count, static_cast<float*>(d_output), right_bw, left_bw, dict_size);
-  } else {
+  } else if (type_size == 8) {
     kernel_alprd_decode_f64<<<grid, block, 0, stream.value()>>>(
       d_seg, row_count, static_cast<double*>(d_output), right_bw, left_bw, dict_size);
+  } else {
+    throw std::runtime_error(
+      "gpu_decode_alprd: viability invariant violated — ALPRD only "
+      "supports type_size 4 (FLOAT) or 8 (DOUBLE), got " +
+      std::to_string(type_size));
   }
 }
 

@@ -10,6 +10,8 @@
 #include <cuda_runtime.h>
 
 #include <cstring>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace sirius::cuda::scan {
@@ -133,7 +135,12 @@ void gpu_decode_rle(const uint8_t* segment_data,
     d_block = static_cast<uint8_t*>(d_scratch);
     if (!skip_block_copy) { bounce_h2d_async(d_block, segment_data, segment_size, stream.value()); }
   } else {
-    cudaMallocAsync(&d_block, segment_size, stream.value());
+    auto rc = cudaMallocAsync(&d_block, segment_size, stream.value());
+    if (rc != cudaSuccess) {
+      throw std::runtime_error(std::string("gpu_decode_rle: cudaMallocAsync failed for "
+                                           "segment block (") +
+                               std::to_string(segment_size) + " bytes): " + cudaGetErrorString(rc));
+    }
     bounce_h2d_async(d_block, segment_data, segment_size, stream.value());
     owns_block = true;
   }
@@ -145,7 +152,13 @@ void gpu_decode_rle(const uint8_t* segment_data,
   if (d_cumsum_scratch && cumsum_bytes <= cumsum_scratch_capacity) {
     d_cumsum = d_cumsum_scratch;
   } else {
-    cudaMallocAsync(&d_cumsum, cumsum_bytes, stream.value());
+    auto rc = cudaMallocAsync(&d_cumsum, cumsum_bytes, stream.value());
+    if (rc != cudaSuccess) {
+      if (owns_block) cudaFreeAsync(d_block, stream.value());
+      throw std::runtime_error(std::string("gpu_decode_rle: cudaMallocAsync failed for "
+                                           "cumsum scratch (") +
+                               std::to_string(cumsum_bytes) + " bytes): " + cudaGetErrorString(rc));
+    }
     owns_cumsum = true;
   }
   bounce_h2d_async(d_cumsum, h_cumsum.data(), cumsum_bytes, stream.value());

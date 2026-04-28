@@ -40,14 +40,21 @@ void gpu_decode_alp(const uint8_t* d_seg,
 ///   per-vector: exceptions_count, bitpacked left indices, bitpacked right parts,
 ///               exception left values, exception positions
 ///
+/// The 7-byte segment header is parsed from `h_seg` on the host (no D2H sync)
+/// to extract `right_bw`, `left_bw`, and `dict_size` for the kernel launch.
+///
 /// Fully async — caller must sync the stream.
 ///
 /// @param d_seg     Device pointer to segment start (d_block + block_offset)
+/// @param h_seg     Host pointer to the same segment start (segment_info::data_ptr).
+///                  Read on the host to extract the segment-wide right_bw/left_bw/
+///                  dict_size — avoids a per-segment device-to-host stream sync.
 /// @param row_count Total rows in segment
 /// @param type_size 4 for FLOAT, 8 for DOUBLE
 /// @param d_output  Pre-offset device output buffer
 /// @param stream    CUDA stream
 void gpu_decode_alprd(const uint8_t* d_seg,
+                      const uint8_t* h_seg,
                       uint32_t row_count,
                       uint32_t type_size,
                       void* d_output,

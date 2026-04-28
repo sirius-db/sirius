@@ -523,7 +523,8 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(column_scan_result& col_
           throw std::runtime_error(
             "gpu_native_decode: ALPRD segment missing staged block — unexpected");
         }
-        gpu_decode_alprd(d_block + seg.block_offset, seg.row_count, type_size, d_dest, stream);
+        gpu_decode_alprd(
+          d_block + seg.block_offset, seg.data_ptr, seg.row_count, type_size, d_dest, stream);
         break;
       }
       default:
