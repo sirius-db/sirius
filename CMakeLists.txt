@@ -183,6 +183,7 @@ set(EXTENSION_SOURCES
     src/op/scan/parquet_scan_task.cpp
     src/op/scan/parquet_schema_mapping.cpp
     src/op/scan/prefetched_data_source.cpp
+    src/op/scan/scan_plan.cpp
     src/op/scan/scan_utils.cpp
     src/op/scan/sirius_parquet_metadata_scan_operator.cpp
     src/op/scan/sirius_gpu_parquet_scan_operator.cpp
