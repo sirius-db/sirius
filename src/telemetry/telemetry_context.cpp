@@ -16,6 +16,7 @@
 
 #include "telemetry/telemetry_context.hpp"
 
+#include "config.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_operator.hpp"
@@ -27,7 +28,6 @@
 
 #include <unistd.h>
 
-#include <cstdlib>
 #include <ranges>
 #include <string>
 
@@ -36,14 +36,14 @@ namespace sirius::telemetry {
 telemetry_context::telemetry_context(std::optional<std::string> query_label)
   : engine_uuid_(uuid::now_v7()),
     worker_uuid_(uuid::now_v7()),
-    context_(quent::create_context(uuid::now_v7(), "ndjson", "telemetry_data")),
+    context_(quent::create_context(uuid::now_v7(),
+                                   duckdb::Config::ENABLE_QUENT ? "ndjson" : "noop",
+                                   duckdb::Config::QUENT_OUTPUT_DIRECTORY)),
     engine_observer_(quent::engine::create_observer(*context_)),
     worker_observer_(quent::worker::create_observer(*context_)),
     query_label_(std::move(query_label))
 {
-  // Engine init
-  const char* env_name          = std::getenv("SIRIUS_ENGINE_NAME");
-  const std::string engine_name = env_name ? env_name : "siriusDB";
+  const std::string& engine_name = duckdb::Config::QUENT_ENGINE_NAME;
 
   engine_observer_->init(engine_uuid_,
                          quent::engine::Init{

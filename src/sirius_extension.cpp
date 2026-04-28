@@ -960,6 +960,24 @@ static void SetLogFlushSeconds(ClientContext& context, SetScope scope, Value& pa
   SIRIUS_LOG_DEBUG("Updated config LOG_FLUSH_SECONDS to {}", Config::LOG_FLUSH_SECONDS);
 }
 
+static void SetEnableQuent(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::ENABLE_QUENT = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_QUENT to {}", Config::ENABLE_QUENT);
+}
+
+static void SetQuentOutputDirectory(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::QUENT_OUTPUT_DIRECTORY = StringValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config QUENT_OUTPUT_DIRECTORY to {}", Config::QUENT_OUTPUT_DIRECTORY);
+}
+
+static void SetQuentEngineName(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::QUENT_ENGINE_NAME = StringValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config QUENT_ENGINE_NAME to {}", Config::QUENT_ENGINE_NAME);
+}
+
 static void SetMaxBuildHashTableBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -1103,6 +1121,24 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::INTEGER,
                             Value::INTEGER(Config::LOG_FLUSH_SECONDS),
                             SetLogFlushSeconds);
+
+  // Quent telemetry configuration
+  config.AddExtensionOption(
+    "enable_quent",
+    "Whether to emit quent telemetry (false uses the noop exporter; true uses ndjson)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(Config::ENABLE_QUENT),
+    SetEnableQuent);
+  config.AddExtensionOption("quent_output_directory",
+                            "Output directory for quent telemetry exports",
+                            LogicalType::VARCHAR,
+                            Value(Config::QUENT_OUTPUT_DIRECTORY),
+                            SetQuentOutputDirectory);
+  config.AddExtensionOption("quent_engine_name",
+                            "Engine name reported via quent telemetry",
+                            LogicalType::VARCHAR,
+                            Value(Config::QUENT_ENGINE_NAME),
+                            SetQuentEngineName);
 
   config.AddExtensionOption("hash_partition_bytes",
                             "Target size in bytes per hash partition",

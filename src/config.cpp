@@ -50,4 +50,8 @@ std::string Config::LOG_LEVEL = "info";
 std::string Config::LOG_DIR   = "log";
 int Config::LOG_FLUSH_SECONDS = 3;
 
+bool Config::ENABLE_QUENT                  = false;
+std::string Config::QUENT_OUTPUT_DIRECTORY = "telemetry_data";
+std::string Config::QUENT_ENGINE_NAME      = "siriusDB";
+
 }  // namespace duckdb
