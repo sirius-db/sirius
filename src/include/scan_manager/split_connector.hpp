@@ -64,6 +64,8 @@ class split_connector {
   /// \brief True iff close() has been called and the queue is drained.
   [[nodiscard]] bool is_closed() const;
 
+  [[nodiscard]] bool has_more_splits() const;
+
  private:
   mutable std::mutex _mutex;
   std::condition_variable _cv;

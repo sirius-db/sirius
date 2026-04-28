@@ -82,7 +82,10 @@ std::optional<task_creation_hint> sirius_gpu_parquet_scan_operator::get_next_tas
   return task_creation_hint{TaskCreationHint::READY, this};
 }
 
-bool sirius_gpu_parquet_scan_operator::all_ports_empty() { return _split_connector->is_closed(); }
+bool sirius_gpu_parquet_scan_operator::all_ports_empty()
+{
+  return _split_connector->is_closed() && !_split_connector->has_more_splits();
+}
 
 std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::get_next_task_input_data()
 {

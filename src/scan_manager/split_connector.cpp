@@ -64,4 +64,10 @@ bool split_connector::is_closed() const
   return _closed && _splits.empty();
 }
 
+[[nodiscard]] bool split_connector::has_more_splits() const
+{
+  std::lock_guard<std::mutex> lock(_mutex);
+  return !_splits.empty();
+}
+
 }  // namespace sirius::scan_manager
