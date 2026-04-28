@@ -46,9 +46,9 @@ SIRIUS_DUCKDB="$PROJECT_DIR/build/release/duckdb"
 PARQUET_DIR=""
 NUM_ITERATIONS=2
 SESSION_TIMEOUT=1200
-SCAN_CACHE_LEVEL=""
+DROP_OS_CACHE=false
 MULTI_SESSION=false
-while [ "${1:-}" = "--parquet-dir" ] || [ "${1:-}" = "--iterations" ] || [ "${1:-}" = "--timeout" ] || [ "${1:-}" = "--cache-level" ] || [ "${1:-}" = "--multi-session" ]; do
+while [ "${1:-}" = "--parquet-dir" ] || [ "${1:-}" = "--iterations" ] || [ "${1:-}" = "--timeout" ] || [ "${1:-}" = "--drop-os-cache" ] || [ "${1:-}" = "--multi-session" ]; do
     if [ "$1" = "--parquet-dir" ]; then
         PARQUET_DIR="$2"
         shift 2
@@ -58,9 +58,9 @@ while [ "${1:-}" = "--parquet-dir" ] || [ "${1:-}" = "--iterations" ] || [ "${1:
     elif [ "$1" = "--timeout" ]; then
         SESSION_TIMEOUT="$2"
         shift 2
-    elif [ "$1" = "--cache-level" ]; then
-        SCAN_CACHE_LEVEL="$2"
-        shift 2
+    elif [ "$1" = "--drop-os-cache" ]; then
+        DROP_OS_CACHE=true
+        shift
     elif [ "$1" = "--multi-session" ]; then
         MULTI_SESSION=true
         shift
@@ -68,12 +68,27 @@ while [ "${1:-}" = "--parquet-dir" ] || [ "${1:-}" = "--iterations" ] || [ "${1:
 done
 
 if [ $# -lt 3 ]; then
-    echo "Usage: $0 [--parquet-dir <path>] [--iterations <N>] [--timeout <seconds>] [--multi-session] <engine> <scale_factor> <query_numbers...>"
+    echo "Usage: $0 [--parquet-dir <path>] [--iterations <N>] [--timeout <seconds>] [--multi-session] [--drop-os-cache] <engine> <scale_factor> <query_numbers...>"
     echo "Example: $0 sirius 100 \`seq 1 22\`"
     echo "  --iterations N    Number of iterations per query (default: 2, 1 cold + N-1 warm)"
     echo "  --timeout N       Kill the DuckDB session after N seconds (default: 1200, 0 = no timeout)"
     echo "  --multi-session   Run each query in its own DuckDB process (fresh state per query)"
+    echo "  --drop-os-cache   Drop OS filesystem cache before each query (requires --multi-session and sudo)"
     exit 1
+fi
+
+if [ "$DROP_OS_CACHE" = true ] && [ "$MULTI_SESSION" = false ]; then
+    echo "ERROR: --drop-os-cache requires --multi-session (each query must run in its own process)"
+    exit 1
+fi
+
+if [ "$DROP_OS_CACHE" = true ]; then
+    if ! sudo -n -l /usr/bin/tee /proc/sys/vm/drop_caches > /dev/null 2>&1; then
+        echo "ERROR: --drop-os-cache requires passwordless sudo for /usr/bin/tee."
+        echo "Configure it with:"
+        echo "  echo '\$(whoami) ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches' | sudo tee /etc/sudoers.d/drop_caches"
+        exit 1
+    fi
 fi
 
 ENGINE="$1"
@@ -90,20 +105,53 @@ if [ "$ENGINE" != "sirius" ] && [ "$ENGINE" != "duckdb" ]; then
     echo "Unknown engine, please use sirius or duckdb"
     exit 1
 fi
-if [ "$ENGINE" == "sirius" ]; then
-    DUCKDB="$SIRIUS_DUCKDB"
-    QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/gpu"
-else
-    # Use the same binary but disable Sirius so the extension doesn't initialize.
-    DUCKDB="$SIRIUS_DUCKDB"
+DUCKDB="$SIRIUS_DUCKDB"
+# Both engines use the same plain SQL queries — transparent execution
+# routes queries through GPU when SiriusContext is initialized.
+QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/orig"
+if [ "$ENGINE" != "sirius" ]; then
+    # Disable Sirius so the extension doesn't initialize (CPU-only).
     export SIRIUS_DISABLE=1
-    QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/orig"
 fi
 
-if [ ! -d "$PARQUET_DIR" ]; then
+has_parquet_data() {
+    local parquet_dir="$1"
+    local parquet_file
+    for parquet_file in "$parquet_dir"/*.parquet "$parquet_dir"/*/*.parquet; do
+        [ -f "$parquet_file" ] && return 0
+    done
+    return 1
+}
+
+ensure_parquet_data() {
+    if [ -d "$PARQUET_DIR" ] && has_parquet_data "$PARQUET_DIR"; then
+        return 0
+    fi
+
     echo "Parquet directory not found: $PARQUET_DIR"
-    echo "Generating TPC-H SF${SF} dataset using tpchgen-rs..."
-    (cd "$SCRIPT_DIR" && pixi run bash generate_tpch_data.sh "$SF" "$PARQUET_DIR")
+    echo "Generating TPC-H SF${SF} dataset..."
+    (
+        cd "$SCRIPT_DIR" &&
+            env -u PIXI_PROJECT_MANIFEST -u PIXI_ENVIRONMENT_NAME \
+                pixi run --manifest-path "$SCRIPT_DIR/pixi.toml" \
+                bash generate_tpch_data.sh "$SF" "$PARQUET_DIR"
+    )
+    local status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "ERROR: failed to generate parquet data for SF${SF} (exit code ${status})."
+        return "$status"
+    fi
+
+    if ! [ -d "$PARQUET_DIR" ] || ! has_parquet_data "$PARQUET_DIR"; then
+        echo "ERROR: parquet data is still unavailable after generation: $PARQUET_DIR"
+        return 1
+    fi
+}
+
+ensure_parquet_data
+status=$?
+if [ "$status" -ne 0 ]; then
+    exit "$status"
 fi
 
 # Build CREATE VIEW statements.
@@ -126,15 +174,17 @@ if [ -n "${TIMING_CSV:-}" ]; then
     echo "query,seconds" > "$TIMING_CSV"
 fi
 
-# Load per-query scan cache level overrides from config file.
-# Format: <query_number> <cache_level> (one per line, # comments ignored).
-# Queries not listed use the default (table_gpu).
-CACHE_CONFIG="$SCRIPT_DIR/scan_cache_levels.conf"
+# Load per-query scan cache level overrides from YAML config.
+# Used in multi-session mode only — in single-session, the Sirius config YAML controls cache level.
+# Format: <query_number>: <cache_level> (one per line, # comments ignored).
+CACHE_CONFIG="$SCRIPT_DIR/scan_cache_levels.yaml"
 declare -A QUERY_CACHE_LEVEL
-if [ "$SF" -ge 1000 ] 2>/dev/null && [ -f "$CACHE_CONFIG" ]; then
-    while IFS=' ' read -r qnum level; do
-        [[ -z "$qnum" || "$qnum" == \#* ]] && continue
-        QUERY_CACHE_LEVEL[$qnum]="$level"
+if [ -f "$CACHE_CONFIG" ]; then
+    while IFS=': ' read -r key value; do
+        [[ -z "$key" || "$key" == \#* ]] && continue
+        value="${value## }"
+        [[ -z "$value" ]] && continue
+        QUERY_CACHE_LEVEL[$key]="$value"
     done < "$CACHE_CONFIG"
 fi
 
@@ -158,6 +208,9 @@ echo "Running TPC-H queries against SF${SF} parquet data"
 echo "Engine: $ENGINE"
 echo "Parquet dir: $PARQUET_DIR"
 echo "Session: $SESSION_MODE"
+if [ "$DROP_OS_CACHE" = true ]; then
+    echo "Drop OS cache: enabled"
+fi
 echo "Iterations: $NUM_ITERATIONS (1 cold + $((NUM_ITERATIONS - 1)) warm)"
 echo "Queries: ${QUERIES[*]}"
 if [ "$SESSION_TIMEOUT" -gt 0 ] 2>/dev/null; then
@@ -184,12 +237,6 @@ run_single_session() {
 
     for q in "${VALID_QUERIES[@]}"; do
         local QUERY_FILE="$QUERY_DIR/q${q}.sql"
-        # Set per-query scan cache level.  Bracket the SET with .timer off/on
-        # so it doesn't produce a spurious "Run Time" line in the output.
-        if [ "$ENGINE" = "sirius" ]; then
-            local qlevel="${SCAN_CACHE_LEVEL:-${QUERY_CACHE_LEVEL[$q]:-table_gpu}}"
-            printf ".timer off\nSET scan_cache_level = '%s';\n.timer on\n" "$qlevel" >> "$TEMP_SQL"
-        fi
         echo ".print ${MARKER_PREFIX} ${q}" >> "$TEMP_SQL"
         # N iterations back-to-back — nothing between them.
         for ((iter = 0; iter < NUM_ITERATIONS; iter++)); do
@@ -228,10 +275,13 @@ run_single_session() {
     TOTAL_ELAPSED=$(echo "$END_TIME - $START_TIME" | bc)
     echo "Total wall-clock time: ${TOTAL_ELAPSED}s"
 
+    local RUN_STATUS=0
     if [ "$SESSION_EXIT" -eq 124 ]; then
         echo "SESSION TIMEOUT: DuckDB was killed after ${SESSION_TIMEOUT}s"
+        RUN_STATUS=124
     elif [ "$SESSION_EXIT" -ne 0 ]; then
         echo "SESSION FAILED: DuckDB exited with code $SESSION_EXIT"
+        RUN_STATUS=$SESSION_EXIT
     fi
 
     rm -f "$TEMP_SQL"
@@ -269,13 +319,14 @@ run_single_session() {
 
         if [ -z "$SECTION" ]; then
             echo "  NO OUTPUT (session may have timed out or crashed before this query)"
-            echo "no output" > "$RESULT_FILE"
+            echo "error: no output (session may have timed out or crashed before this query)" > "$RESULT_FILE"
             {
                 echo "step,runtime_s"
                 for ((i = 0; i < NUM_ITERATIONS; i++)); do
                     echo "iter_$((i + 1)),N/A"
                 done
             } > "$TIMING_FILE"
+            [ "$RUN_STATUS" -eq 0 ] && RUN_STATUS=1
             echo "  Timings written to $TIMING_FILE"
             continue
         fi
@@ -314,12 +365,14 @@ run_single_session() {
     done
 
     rm -f "$TEMP_OUTPUT"
+    return "$RUN_STATUS"
 }
 
 # =============================================================================
 # Multi-session mode: each query in its own fresh DuckDB process (duckdb only)
 # =============================================================================
 run_multi_session() {
+    local RUN_STATUS=0
     for q in "${VALID_QUERIES[@]}"; do
         local QUERY_FILE="$QUERY_DIR/q${q}.sql"
 
@@ -338,14 +391,26 @@ run_multi_session() {
         echo ""
         echo "========== Q${q} =========="
 
+        # Drop OS filesystem cache for true cold-run benchmarking.
+        if [ "$DROP_OS_CACHE" = true ]; then
+            echo "  Dropping OS filesystem cache..."
+            sync
+            if echo 3 | sudo -n /usr/bin/tee /proc/sys/vm/drop_caches > /dev/null 2>&1; then
+                echo "  OS cache dropped."
+            else
+                echo "  ERROR: Failed to drop OS cache. Configure passwordless sudo:"
+                echo "    echo '\$(whoami) ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches' | sudo tee /etc/sudoers.d/drop_caches"
+                exit 1
+            fi
+        fi
+
         # Build per-query SQL: views + scan cache level (sirius) + timer + N iterations.
         local TEMP_SQL
         TEMP_SQL=$(mktemp /tmp/tpch_q${q}_XXXXXX.sql)
         {
             printf '%s\n' "$VIEW_SQL"
-            if [ "$ENGINE" = "sirius" ]; then
-                local qlevel="${SCAN_CACHE_LEVEL:-${QUERY_CACHE_LEVEL[$q]:-table_gpu}}"
-                printf "SET scan_cache_level = '%s';\n" "$qlevel"
+            if [ "$ENGINE" = "sirius" ] && [ -n "${QUERY_CACHE_LEVEL[$q]:-}" ]; then
+                printf "SET scan_cache_level = '%s';\n" "${QUERY_CACHE_LEVEL[$q]}"
             fi
             printf ".timer on\n"
             for ((iter = 0; iter < NUM_ITERATIONS; iter++)); do
@@ -372,8 +437,10 @@ run_multi_session() {
 
         if [ "$Q_EXIT" -eq 124 ]; then
             echo "  TIMEOUT: killed after ${SESSION_TIMEOUT}s"
+            RUN_STATUS=124
         elif [ "$Q_EXIT" -ne 0 ]; then
             echo "  FAILED: DuckDB exited with code $Q_EXIT"
+            [ "$RUN_STATUS" -eq 0 ] && RUN_STATUS=$Q_EXIT
         fi
 
         # Check for errors in output.
@@ -427,15 +494,17 @@ run_multi_session() {
 
         echo "  Timings written to $TIMING_FILE"
     done
+    return "$RUN_STATUS"
 }
 
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
+RUN_STATUS=0
 if [ "$MULTI_SESSION" = true ]; then
-    run_multi_session
+    run_multi_session || RUN_STATUS=$?
 else
-    run_single_session
+    run_single_session || RUN_STATUS=$?
 fi
 
 # ---------------------------------------------------------------------------
@@ -487,3 +556,4 @@ else
     echo "Results saved as result_${ENGINE}_sf${SF}_q*.txt"
     echo "Timings saved as timings_${ENGINE}_sf${SF}_q*.csv"
 fi
+exit "$RUN_STATUS"

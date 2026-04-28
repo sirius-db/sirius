@@ -17,7 +17,8 @@
 #pragma once
 
 // sirius
-#include <expression_executor/gpu_expression_translator.hpp>
+#include <expression_executor/gpu_expression_translator_internal.hpp>
+#include <op/scan/hive_partition.hpp>  // For partition_inject_fn_t
 
 // cucascade
 #include <cucascade/data/common.hpp>
@@ -39,6 +40,7 @@
 #include <vector>
 
 namespace sirius {
+using partition_inject_fn_t = op::scan::partition_inject_fn_t;
 
 /**
  * @brief Function called after a parquet batch is decompressed to a GPU cuDF table.

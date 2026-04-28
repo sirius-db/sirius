@@ -21,6 +21,7 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "expression/expression.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 namespace sirius {
@@ -90,6 +91,8 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   duckdb::ExtraOperatorInfo extra_info;
   //! Parameters
   duckdb::vector<duckdb::Value> parameters;
+  //! Named parameters (e.g., snapshot_from_id for iceberg_scan)
+  duckdb::named_parameter_map_t named_parameters;
   //! Contains a reference to dynamically generated table filters (through e.g. a join up in the
   //! tree)
   duckdb::shared_ptr<duckdb::DynamicTableFilterSet> dynamic_filters;
@@ -123,7 +126,7 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   bool passthrough = false;
 
   //! The composite filter expression from the table filter set, if any
-  duckdb::unique_ptr<duckdb::Expression> filter_expr = nullptr;
+  sirius::expression filter_expr;
 
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 

@@ -82,7 +82,7 @@ jobs:
       fail-fast: false
     runs-on: >-
       ${{ matrix.environment == 'vcpkg'
-        && fromJSON('["self-hosted", "ubuntu-22.04", "cuda-13", "cpu-xl"]')
+        && fromJSON('["self-hosted", "ubuntu-24.04", "cuda-13", "cpu-xl-spot"]')
         || format('ubuntu-24.04{0}', case(matrix.arch == 'arm64', '-arm', '')) }}
     timeout-minutes: ${{ case(matrix.environment == 'vcpkg', 240, 60) }}
     continue-on-error: ${{ matrix.cudf-channel == 'nightly' }}
@@ -104,14 +104,16 @@ jobs:
             ${{ matrix.cudf-channel == 'nightly' && 'nightly-runner'
               || matrix.environment }}
 
-      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
 
       - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         if: matrix.environment == 'vcpkg'
         with:
           path: ~/.cache/vcpkg/archives
-          key: vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vcpkg.json', 'vcpkg/versions/baseline.json', 'vcpkg_ports/**') }}
-          restore-keys: vcpkg-${{ runner.os }}-${{ runner.arch }}-
+          key: vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ matrix.environment }}-${{ hashFiles('vcpkg.json', 'vcpkg/versions/baseline.json', 'vcpkg_ports/**', 'vcpkg_triplets/**', 'cmake/CMakePresets.json', 'pixi.lock') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ matrix.environment }}-
+            vcpkg-${{ runner.os }}-${{ runner.arch }}-
 
       - run: ${{ case(matrix.cudf-channel == 'nightly', 'pixi run -e nightly-runner nightly-run', '') }} make ${{ matrix.variant == 'legacy' && format('legacy-{0}', matrix.build-type) || case(matrix.compiler == 'gcc', matrix.build-type, format('clang-{0}', matrix.build-type)) }} -j$(nproc)
         if: matrix.environment != 'vcpkg'
@@ -122,7 +124,7 @@ jobs:
         if: matrix.environment == 'vcpkg'
         run: |
           pixi run -e vcpkg cmake -S duckdb --preset vcpkg-release
-          pixi run -e vcpkg cmake --build build/vcpkg-release
+          pixi run -e vcpkg cmake --build build/vcpkg-release --target duckdb duckdb_local_extension_repo sirius_unittest
 
   check:
     runs-on: ubuntu-slim

@@ -16,7 +16,7 @@
 
 // sirius
 #include <expression_executor/gpu_expression_executor.hpp>
-#include <expression_executor/gpu_expression_executor_state.hpp>
+#include <sirius/exception.hpp>
 
 // duckdb
 #include <duckdb/common/exception.hpp>
@@ -24,14 +24,15 @@
 #include <duckdb/planner/expression/bound_function_expression.hpp>
 
 // cudf
-#include <cudf/column/column_factories.hpp>
+#include <cudf/ast/expressions.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/cudf_utils.hpp>
 #include <cudf/reduction.hpp>
 
 // We need to handle implicit error checks inserted as CASE statements by DuckDB
 #define ERROR_FUNC_STR "error"
 
-namespace sirius::experimental {
+namespace sirius {
 using execute_result = gpu_expression_executor::execute_result;
 execute_result gpu_expression_executor::execute(duckdb::BoundCaseExpression const& expr,
                                                 execution_mode mode)
@@ -46,8 +47,10 @@ execute_result gpu_expression_executor::execute(duckdb::BoundCaseExpression cons
   auto current_result = execute(*expr.else_expr, execution_mode::MATERIALIZE);
 
   // Loop backwards, so that the THEN of the first true WHEN is copied to the output column
-  auto num_checks = static_cast<int32_t>(
+  auto const num_checks = static_cast<int32_t>(
     expr.case_checks.size());  // This is sane, and needed for the descending loop index
+  D_ASSERT(num_checks > 0);
+
   for (int32_t i = num_checks - 1; i >= 0; --i) {
     auto& case_check = expr.case_checks[i];
 
@@ -74,7 +77,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundCaseExpression cons
       }
       if (throw_error) {
         // Assume that this arises for the stated error
-        throw duckdb::InternalException(
+        throw internal_exception(
           "[gpu_expression_executor:case]: More than one row returned by a subquery used as an "
           "expression.");
       }
@@ -114,96 +117,15 @@ execute_result gpu_expression_executor::execute(duckdb::BoundCaseExpression cons
     current_result = execute_result(std::move(output));
   }
   if (mode == execution_mode::AST) {
-    // The caller wants an AST node. Materialize the CASE result into a temp column and return an
-    // ast_result with a column_reference to it.
-    std::unique_ptr<cudf::column> result_column;
-    if (current_result.is_scalar()) {
-      result_column = cudf::make_column_from_scalar(
-        current_result.get_scalar(), _input_table.num_rows(), _stream, _mr);
-    } else {
-      result_column =
-        std::make_unique<cudf::column>(current_result.get_column_view(), _stream, _mr);
+    // The caller wants an AST node.
+    // Since at least one copy_if_else has been executed, current_result must have an owned column.
+    if (!current_result.is_owned_column()) {
+      throw internal_exception(
+        "[gpu_expression_executor:case]: Expected an owned column after executing CASE "
+        "expression.");
     }
-    return materialize_as_ast_column(std::move(result_column));
+    return materialize_as_ast_column(std::move(current_result.release_column()));
   }
   return current_result;
 }
-}  // namespace sirius::experimental
-
-namespace duckdb {
-namespace sirius {
-
-std::unique_ptr<GpuExpressionState> GpuExpressionExecutor::InitializeState(
-  const BoundCaseExpression& expr, GpuExpressionExecutorState& root)
-{
-  // auto result = make_uniq<GpuCaseExpressionState>(expr, root);
-  auto result = std::make_unique<GpuExpressionState>(expr, root);
-  for (auto& case_check : expr.case_checks) {
-    result->AddChild(*case_check.when_expr);
-    result->AddChild(*case_check.then_expr);
-  }
-  result->AddChild(*expr.else_expr);
-  return result;
-}
-
-/**
- * Executing CASE expression is tricky, especially in device code. I do not follow DuckDB here,
- * which emits row ids when evaluating the WHEN expressions, selectively executes the THEN
- * expressions with the given row ids, scatters the results to the output, and then continues
- * evaluating the next WHEN with the leftover rowids. This has the effect of not doing wasted
- * computation for the ELSE expressions and succeeding WHEN expressions. However, compacting,
- * gathering, and scattering is more expensive on GPU, and CuDF does not provide conditional
- * execution APIs, which leaves me with executing the WHEN and THEN expressions on all input data.
- * Moreover, following CuDF in using unique_ptr semantics forces me to emit a new output column
- * for every case. However, if there are few CASE statements (as is the case in TPC-H), this should
- * be fine, if not optimal.
- */
-std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundCaseExpression& expr,
-                                                             GpuExpressionState* state)
-{
-  // First, execute the ELSE
-  auto else_state     = state->child_states.back().get();
-  auto current_output = Execute(*expr.else_expr, else_state);
-
-  // Loop backwards, so that the THEN of the first true WHEN is copied to the output column
-  auto num_checks = static_cast<int32_t>(
-    expr.case_checks.size());  // This is sane, and needed for the descending loop index
-  for (int32_t i = num_checks - 1; i >= 0; --i) {
-    auto& case_check  = expr.case_checks[i];
-    auto* check_state = state->child_states[2 * i].get();
-    auto* then_state  = state->child_states[2 * i + 1].get();
-
-    // Fist, execute the WHEN expression to get boolean array intermediate
-    auto current_mask = Execute(*case_check.when_expr, check_state);
-
-    // Check for error functions
-    if (case_check.then_expr->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION &&
-        case_check.then_expr->Cast<BoundFunctionExpression>().function.name == ERROR_FUNC_STR) {
-      // If the THEN is true anywhere, throw error()
-      auto any_result = cudf::reduce(current_mask->view(),
-                                     *cudf::make_any_aggregation<cudf::reduce_aggregation>(),
-                                     cudf::data_type(cudf::type_id::BOOL8),
-                                     execution_stream,
-                                     resource_ref);
-      if (static_cast<cudf::scalar_type_t<bool>*>(any_result.get())->value()) {
-        // Assume that this arises for the stated error
-        throw InternalException(
-          "Execute[Case]: More than one row returned by a subquery used as "
-          "an expression.");
-      }
-      continue;
-    }
-
-    // Otherwise, execute the THEN and selectively copy to the output
-    auto current_then = Execute(*case_check.then_expr, then_state);
-    current_output    = cudf::copy_if_else(current_then->view(),
-                                        current_output->view(),
-                                        current_mask->view(),
-                                        execution_stream,
-                                        resource_ref);
-  }
-  return current_output;
-}
-
 }  // namespace sirius
-}  // namespace duckdb

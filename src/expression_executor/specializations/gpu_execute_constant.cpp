@@ -15,9 +15,8 @@
  */
 
 // sirius
-
 #include <expression_executor/gpu_expression_executor.hpp>
-#include <expression_executor/gpu_expression_executor_state.hpp>
+#include <sirius/exception.hpp>
 
 // duckdb
 #include <duckdb/common/exception.hpp>
@@ -33,13 +32,10 @@
 // rmm
 #include <rmm/cuda_stream_view.hpp>
 
-// standard library
-#include <type_traits>
-
 namespace {
-using execute_result = ::sirius::experimental::gpu_expression_executor::execute_result;
-using ast_node       = ::sirius::experimental::gpu_expression_executor::ast_result;
-using execution_mode = ::sirius::experimental::gpu_expression_executor::execution_mode;
+using execute_result = ::sirius::gpu_expression_executor::execute_result;
+using ast_node       = ::sirius::gpu_expression_executor::ast_result;
+using execution_mode = ::sirius::gpu_expression_executor::execution_mode;
 
 template <typename T>
 execute_result make_execute_result_from_scalar(
@@ -59,7 +55,7 @@ execute_result make_execute_result_from_scalar(
 
 }  // namespace
 
-namespace sirius::experimental {
+namespace sirius {
 using execute_result = gpu_expression_executor::execute_result;
 
 execute_result gpu_expression_executor::execute(duckdb::BoundConstantExpression const& expr,
@@ -175,89 +171,9 @@ execute_result gpu_expression_executor::execute(duckdb::BoundConstantExpression 
       return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
     }
     default:
-      throw duckdb::NotImplementedException("[gpu_expression_executor] Unsupported scalar type: %s",
-                                            expr.return_type.ToString());
-  }
-}
-
-}  // namespace sirius::experimental
-
-namespace duckdb {
-namespace sirius {
-
-std::unique_ptr<GpuExpressionState> GpuExpressionExecutor::InitializeState(
-  const BoundConstantExpression& expr, GpuExpressionExecutorState& root)
-{
-  return std::make_unique<GpuExpressionState>(expr, root);
-}
-
-// Helper template functor to reduce bloat
-template <typename T>
-struct MakeColumnFromConstant {
-  static std::unique_ptr<cudf::column> Do(const BoundConstantExpression& expr,
-                                          cudf::size_type count,
-                                          rmm::device_async_resource_ref mr,
-                                          rmm::cuda_stream_view stream)
-  {
-    if constexpr (std::is_same<T, std::string>()) {
-      cudf::string_scalar scalar(expr.value.GetValue<std::string>(), true, stream, mr);
-      return cudf::make_column_from_scalar(scalar, count, stream, mr);
-    } else if constexpr (std::is_same_v<T, numeric::decimal32> ||
-                         std::is_same_v<T, numeric::decimal64>) {
-      auto type = expr.value.type();
-      if (type.id() != LogicalTypeId::DECIMAL) {
-        throw InternalException("Invalid duckdb type for decimal constant: %d",
-                                static_cast<int>(type.id()));
-      }
-      // cudf decimal type uses negative scale
-      auto scalar = cudf::fixed_point_scalar<T>(expr.value.GetValueUnsafe<typename T::rep>(),
-                                                numeric::scale_type{-DecimalType::GetScale(type)},
-                                                true,
-                                                stream,
-                                                mr);
-      return cudf::make_column_from_scalar(scalar, count, stream, mr);
-    } else {
-      auto scalar = cudf::numeric_scalar<T>(expr.value.GetValue<T>(), true, stream, mr);
-      return cudf::make_column_from_scalar(scalar, count, stream, mr);
-    }
-  }
-};
-
-std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundConstantExpression& expr,
-                                                             GpuExpressionState* state)
-{
-  D_ASSERT(expr.value.type() == expr.return_type);
-
-  // In many cases, this column materialization is pruned away
-  auto cudf_type = GetCudfType(expr.return_type);
-  switch (cudf_type.id()) {
-    case cudf::type_id::INT16:
-      return MakeColumnFromConstant<int16_t>::Do(expr, input_count, resource_ref, execution_stream);
-    case cudf::type_id::INT32:
-      return MakeColumnFromConstant<int32_t>::Do(expr, input_count, resource_ref, execution_stream);
-    case cudf::type_id::INT64:
-      return MakeColumnFromConstant<int64_t>::Do(expr, input_count, resource_ref, execution_stream);
-    case cudf::type_id::FLOAT32:
-      return MakeColumnFromConstant<float_t>::Do(expr, input_count, resource_ref, execution_stream);
-    case cudf::type_id::FLOAT64:
-      return MakeColumnFromConstant<double_t>::Do(
-        expr, input_count, resource_ref, execution_stream);
-    case cudf::type_id::BOOL8:
-      return MakeColumnFromConstant<bool>::Do(expr, input_count, resource_ref, execution_stream);
-    case cudf::type_id::STRING:
-      return MakeColumnFromConstant<std::string>::Do(
-        expr, input_count, resource_ref, execution_stream);
-    case cudf::type_id::DECIMAL32:
-      return MakeColumnFromConstant<numeric::decimal32>::Do(
-        expr, input_count, resource_ref, execution_stream);
-    case cudf::type_id::DECIMAL64:
-      return MakeColumnFromConstant<numeric::decimal64>::Do(
-        expr, input_count, resource_ref, execution_stream);
-    default:
-      throw InternalException("Execute[Constant]: Unknown cudf type: %d",
-                              static_cast<int>(cudf_type.id()));
+      throw not_implemented_exception("[gpu_expression_executor] Unsupported scalar type: %s",
+                                      expr.return_type.ToString());
   }
 }
 
 }  // namespace sirius
-}  // namespace duckdb

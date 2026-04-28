@@ -91,7 +91,7 @@ Only applies to INNER and LEFT joins with pure equality conditions (excludes IS 
 1. At query startup, at most 2 scans are scheduled initially
 2. In `task_creator::manager_loop`, scan exhaustion (continuous creation) only runs when `_num_scans_in_plan == 1`. For 2+ scans, the `get_next_task_hint()` topology-driven mechanism controls task creation instead.
 
-**Code path:** `src/creator/task_creator.cpp` — `manager_loop()`, `src/pipeline/pipeline_executor.cpp` — `schedule_next_scan_tasks()`
+**Code path:** `src/creator/task_creator.cpp` — `manager_loop()`, `src/pipeline/task_scheduler.cpp` — `schedule_next_scan_tasks()`
 
 **Config:** `max_build_hash_table_bytes` (default: 500 MB) — now independent from `concat_batch_bytes`, enabling larger build sides in BUILD_PROBE mode without affecting other joins.
 
@@ -151,9 +151,9 @@ Data is moved from GPU to HOST tier via converter registry.
 
 **Motivation:** The previous downgrade retry loop over-freed memory and caused contention between concurrent downgrade requests competing for the same batches.
 
-**Mechanism:** `request_downgrade(target_bytes, predicate)` enqueues a `downgrade_request` struct onto an MPMC queue. A single processing thread handles requests sequentially, collecting `weak_ptr` candidates up to `target_bytes`, dispatching them to a thread pool one-by-one, and evaluating the caller-supplied `predicate` after each completion. The predicate defines "done" (e.g., "memory reservation succeeded") — no retry loop, no over-freeing.
+**Mechanism:** `request_downgrade(predicate)` enqueues a `downgrade_request` struct onto an MPMC queue. A single processing thread handles requests sequentially, lazily fetching candidates from data repositories, then task queues, dispatching them to a thread pool one-by-one via `convertible_data::convert()`, and evaluating the caller-supplied `predicate` after each completion. The predicate defines "done" (e.g., "memory reservation succeeded") -- no retry loop, no over-freeing.
 
-**Code path:** `src/downgrade/downgrade_executor.cpp` — `request_downgrade()`, `process_request()`
+**Code path:** `src/downgrade/downgrade_executor.cpp` -- `request_downgrade()`, `processing_loop()`
 
 ### Pinned Host Memory Caching (PR #437)
 
@@ -194,7 +194,7 @@ Query hash matching detects cache hits. On cache hit (PRELOAD mode), data is loa
 2. The AST is set on `parquet_reader_options` via `set_filter()`, pushing filtering into the cuDF reader
 3. `TABLE_SCAN` is set to passthrough (no GPU expression evaluation needed)
 
-If translation fails, filtering falls back to `GpuExpressionExecutor` on the decoded batch.
+If translation fails, filtering falls back to `gpu_expression_executor` on the decoded batch.
 
 **Code path:**
 - `src/op/scan/scan_utils.cpp` — `convert_table_filters_to_expression()`, `filter_row_groups_with_stats()`

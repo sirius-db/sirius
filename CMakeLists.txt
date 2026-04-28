@@ -85,13 +85,19 @@ endif()
 set(BUILD_TESTS
     OFF
     CACHE BOOL "" FORCE)
+set(CUCASCADE_BUILD_TESTS
+    OFF
+    CACHE BOOL "" FORCE)
+set(CUCASCADE_BUILD_BENCHMARKS
+    OFF
+    CACHE BOOL "" FORCE)
 set(CUCASCADE_BUILD_SHARED_LIBS
     OFF
     CACHE BOOL "" FORCE)
 set(CUCASCADE_BUILD_STATIC_LIBS
     ON
     CACHE BOOL "" FORCE)
-set(WARNINGS_AS_ERRORS
+set(CUCASCADE_WARNINGS_AS_ERRORS
     OFF
     CACHE BOOL "" FORCE)
 add_subdirectory(cucascade "${CMAKE_BINARY_DIR}/cucascade" EXCLUDE_FROM_ALL)
@@ -131,15 +137,15 @@ endif()
 set(EXTENSION_SOURCES
     src/config.cpp
     src/helper/type_conversions.cpp
-    src/cpu_cache.cpp
     src/debug_utils.cpp
     src/creator/task_creator.cpp
     src/data/host_parquet_representation.cpp
     src/data/host_parquet_representation_converters.cpp
     src/downgrade/downgrade_executor.cpp
-    src/downgrade/downgrade_task.cpp
+    src/expression/expression.cpp
+    src/expression/join_condition.cpp
+    src/expression_executor/expression_executor_strategy.cpp
     src/expression_executor/gpu_expression_executor.cpp
-    src/expression_executor/gpu_expression_executor_state.cpp
     src/expression_executor/gpu_expression_translator.cpp
     src/expression_executor/regex/regex_playground.cpp
     src/expression_executor/specializations/gpu_execute_between.cpp
@@ -151,9 +157,7 @@ set(EXTENSION_SOURCES
     src/expression_executor/specializations/gpu_execute_function.cpp
     src/expression_executor/specializations/gpu_execute_operator.cpp
     src/expression_executor/specializations/gpu_execute_reference.cpp
-    src/fallback.cpp
-    src/gpu_buffer_manager.cpp
-    # I/O adapters (Phase 5 — cucascade-backed parquet)
+    # I/O adapters (Phase 5 — cucascade-backed parquet; not yet upstreamed)
     src/io/cucascade_datasource.cpp
     src/memory/defragmenter_oom_policy.cpp
     src/memory/sirius_memory_reservation_manager.cpp
@@ -168,13 +172,17 @@ set(EXTENSION_SOURCES
     src/op/scan/cpu_source_task.cpp
     src/op/scan/duckdb_scan_task.cpp
     src/op/scan/equality_delete_filter.cpp
+    src/op/scan/hive_partition.cpp
     src/op/scan/iceberg_avro_reader.cpp
     src/op/scan/iceberg_delete_pipeline.cpp
     src/op/scan/iceberg_metadata_reader.cpp
     src/op/scan/iceberg_scan_task.cpp
     src/op/scan/positional_delete_filter.cpp
+    src/op/scan/puffin_reader.cpp
     src/op/scan/parquet_scan_task.cpp
+    src/op/scan/parquet_schema_mapping.cpp
     src/op/scan/prefetched_data_source.cpp
+    src/op/scan/scan_plan.cpp
     src/op/scan/scan_utils.cpp
     src/op/scan/sirius_parquet_metadata_scan_operator.cpp
     src/op/scan/sirius_gpu_parquet_scan_operator.cpp
@@ -209,10 +217,8 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_ungrouped_aggregate.cpp
     src/parallel/task_executor.cpp
     src/pipeline/gpu_pipeline_executor.cpp
-    src/pipeline/gpu_pipeline_queue.cpp
     src/pipeline/gpu_pipeline_task.cpp
-    src/pipeline/pipeline_executor.cpp
-    src/pipeline/pipeline_queue.cpp
+    src/pipeline/task_scheduler.cpp
     src/pipeline/sirius_meta_pipeline.cpp
     src/pipeline/sirius_pipeline.cpp
     src/pipeline/sirius_pipeline_converter.cpp
@@ -241,44 +247,21 @@ set(EXTENSION_SOURCES
     src/sirius_engine.cpp
     src/sirius_extension.cpp
     src/sirius_interface.cpp
+    src/transparent/physical_sirius_execution.cpp
+    src/transparent/sirius_optimizer_extension.cpp
     src/util/stream_check_wrapper.cpp
     src/util/segfault_backtrace_handler.cpp)
+# cmake-format: on
 
-# Legacy Sirius — all config lives in src/legacy/CMakeLists.txt.
+# Legacy Sirius — all legacy-specific config lives in src/legacy/CMakeLists.txt.
 # Deleting src/legacy/ cleanly removes legacy build support.
+set(CUDA_SOURCES src/op/scan/equality_delete_mask.cu)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
   add_subdirectory(src/legacy)
   list(APPEND EXTENSION_SOURCES ${SIRIUS_LEGACY_SOURCES}
        ${SIRIUS_LEGACY_CONDITIONAL_SOURCES})
+  list(APPEND CUDA_SOURCES ${SIRIUS_LEGACY_CUDA_SOURCES})
 endif()
-
-set(CUDA_SOURCES
-    src/cuda/allocator.cu
-    src/cuda/communication.cu
-    src/cuda/iceberg/equality_delete_mask.cu
-    src/cuda/cudf/cudf_aggregate.cu
-    src/cuda/cudf/cudf_duplicate_elimination.cu
-    src/cuda/cudf/cudf_groupby.cu
-    src/cuda/cudf/cudf_join.cu
-    src/cuda/cudf/cudf_orderby.cu
-    src/cuda/cudf/cudf_utils.cu
-    src/cuda/expression_executor/gpu_dispatch_materialize.cu
-    src/cuda/expression_executor/gpu_dispatch_select.cu
-    src/cuda/expression_executor/gpu_dispatch_string.cu
-    src/cuda/operator/arbitrary_expression.cu
-    src/cuda/operator/comparison_expression.cu
-    src/cuda/operator/hash_join_inner.cu
-    src/cuda/operator/hash_join_right.cu
-    src/cuda/operator/hash_join_single.cu
-    src/cuda/operator/materialize.cu
-    src/cuda/operator/nested_loop_join.cu
-    src/cuda/operator/strings_matching.cu
-    src/cuda/operator/substring.cu
-    src/cuda/operator/strlen_from_offsets.cu
-    src/cuda/operator/empty_str_check.cu
-    src/cuda/print.cu
-    src/cuda/utils.cu)
-# cmake-format: on
 
 build_static_extension(sirius ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 build_loadable_extension(sirius CPP ${EXTENSION_SOURCES} ${CUDA_SOURCES})
@@ -351,12 +334,17 @@ endif()
 set(TEST_SOURCES
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
+    test/cpp/data/test_convertible_data_batch.cpp
+    test/cpp/data/test_convertible_gpu_pipeline_task.cpp
     test/cpp/data/test_host_parquet_representation.cpp
-    test/cpp/debug/test_debug_utils.cpp
+    test/cpp/downgrade/test_downgrade_disk.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
+    test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
+    test/cpp/expression/test_expression.cpp
+    test/cpp/expression/test_join_condition.cpp
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
     test/cpp/helper/test_logical_type.cpp
@@ -366,12 +354,12 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
+    test/cpp/integration/test_transparent_execution.cpp
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
     test/cpp/operator/test_physical_hash_join_mgpu.cpp
     test/cpp/operator/test_physical_order_mgpu.cpp
     test/cpp/memory/test_host_table_utils.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
-    test/cpp/memory_management/test_cpu_cache.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_count_distinct.cpp
@@ -396,16 +384,23 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_oom_reschedule.cpp
     test/cpp/pipeline/test_pipeline_memory_history.cpp
     test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
+    test/cpp/pipeline/test_metadata_gpu_pipeline_task_counting.cpp
+    test/cpp/pipeline/test_gpu_pipeline_disk_readback.cpp
     test/cpp/pipeline/test_plan_printer.cpp
-    test/cpp/pipeline/test_pipeline_executor.cpp
+    test/cpp/pipeline/test_task_scheduler.cpp
     test/cpp/scan/test_column_builder.cpp
     test/cpp/scan/test_metadata_gpu_scan_operators.cpp
+    test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_scan_task.cpp
     test/cpp/scan/test_scan_executor.cpp
     test/cpp/unittest.cpp
     test/cpp/utils/sirius_test_env.cpp
     test/cpp/utils/utils.cpp)
 # cmake-format: on
+
+if(SIRIUS_LEGACY_TEST_SOURCES)
+  list(APPEND TEST_SOURCES ${SIRIUS_LEGACY_TEST_SOURCES})
+endif()
 
 add_executable(sirius_unittest ${TEST_SOURCES})
 
@@ -442,3 +437,8 @@ target_compile_definitions(
     $<BUILD_INTERFACE:SIRIUS_DEFAULT_LOG_DIR="${CMAKE_BINARY_DIR}/log">
     $<BUILD_INTERFACE:SIRIUS_UNITTEST_LOG_DIR="${CMAKE_CURRENT_BINARY_DIR}/test/cpp/log">
     $<BUILD_INTERFACE:SIRIUS_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}">)
+
+if(SIRIUS_LEGACY_COMPILE_DEFINITIONS)
+  target_compile_definitions(sirius_unittest
+                             PRIVATE ${SIRIUS_LEGACY_COMPILE_DEFINITIONS})
+endif()

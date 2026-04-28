@@ -20,7 +20,7 @@
 #include <data/host_parquet_representation.hpp>
 #include <data/host_parquet_representation_converters.hpp>
 #include <data/sirius_converter_registry.hpp>
-#include <expression_executor/gpu_expression_translator.hpp>
+#include <expression_executor/gpu_expression_translator_internal.hpp>
 #include <helper/type_conversions.hpp>
 #include <io/cucascade_datasource.hpp>
 #include <log/logging.hpp>
@@ -384,31 +384,35 @@ void parquet_scan_task_global_state::initialize_from_files()
   // -----------------------------------------------------------------------
   // Detect hive partition columns from the parquet schema.
   //
-  // Columns that appear in the DuckDB schema (scan_op->names) but NOT in the
-  // parquet file's leaf columns are treated as hive partition columns. This
-  // catches the case where bind_data did not advertise them (e.g. iceberg).
+  // Columns that appear in the DuckDB schema (scan_op->names) but NOT in ANY
+  // of the data file's leaf columns are treated as hive partition columns
+  // (their values come from the directory path or bind data). Columns missing
+  // from SOME but not ALL files are schema-evolution columns — they stay in
+  // the projection and are NULL-injected per file by build_schema_reconciliation.
+  //
   // Detected partition columns are removed from _selected_column_indices and
   // recorded in _hive_partition_columns for injection after GPU read.
   // -----------------------------------------------------------------------
   if (!_file_metadatas.empty() && !_selected_column_indices.empty() && !_scan_op->names.empty()) {
-    auto const& first_meta = _file_metadatas[0];
-    std::unordered_set<std::string> parquet_col_names;
-    for (size_t i = 1; i < first_meta.schema.size(); ++i) {
-      if (first_meta.schema[i].num_children == 0) {
-        parquet_col_names.insert(first_meta.schema[i].name);
+    std::unordered_set<std::string> union_parquet_col_names;
+    for (auto const& meta : _file_metadatas) {
+      for (size_t i = 1; i < meta.schema.size(); ++i) {
+        if (meta.schema[i].num_children == 0) {
+          union_parquet_col_names.insert(meta.schema[i].name);
+        }
       }
     }
 
     std::vector<size_t> filtered_indices;
     filtered_indices.reserve(_selected_column_indices.size());
     for (auto idx : _selected_column_indices) {
-      if (idx < _scan_op->names.size() && parquet_col_names.count(_scan_op->names[idx])) {
+      if (idx < _scan_op->names.size() && union_parquet_col_names.count(_scan_op->names[idx])) {
         filtered_indices.push_back(idx);
       } else if (idx < _scan_op->names.size()) {
         _hive_partition_index_set.insert(idx);
         _hive_partition_columns.push_back(hive_partition_column{_scan_op->names[idx], idx});
         SIRIUS_LOG_DEBUG(
-          "[parquet_scan] Column '{}' (idx={}) not in parquet schema — "
+          "[parquet_scan] Column '{}' (idx={}) not in any parquet file — "
           "treating as partition column.",
           _scan_op->names[idx],
           idx);
@@ -420,16 +424,78 @@ void parquet_scan_task_global_state::initialize_from_files()
     }
   }
 
+  //===----------Schema Evolution Detection----------===//
+  // Build per-file column sets and detect schema evolution (columns missing
+  // from SOME but not ALL files). If detected, populate _per_file_column_names
+  // for the schema reconciliation injection function.
+  if (_file_metadatas.size() > 1 && !_selected_column_indices.empty() && !_scan_op->names.empty()) {
+    std::vector<std::unordered_set<std::string>> per_file_cols(_file_metadatas.size());
+    for (size_t f = 0; f < _file_metadatas.size(); ++f) {
+      for (size_t i = 1; i < _file_metadatas[f].schema.size(); ++i) {
+        if (_file_metadatas[f].schema[i].num_children == 0) {
+          per_file_cols[f].insert(_file_metadatas[f].schema[i].name);
+        }
+      }
+    }
+
+    bool has_schema_evolution = false;
+    for (size_t f = 0; f < per_file_cols.size() && !has_schema_evolution; ++f) {
+      for (auto idx : _selected_column_indices) {
+        if (idx < _scan_op->names.size() && !per_file_cols[f].count(_scan_op->names[idx])) {
+          has_schema_evolution = true;
+          break;
+        }
+      }
+    }
+    if (has_schema_evolution) {
+      _per_file_column_names.resize(_file_metadatas.size());
+      for (size_t f = 0; f < _file_metadatas.size(); ++f) {
+        for (auto idx : _selected_column_indices) {
+          if (idx < _scan_op->names.size()) {
+            auto const& name = _scan_op->names[idx];
+            if (per_file_cols[f].count(name)) { _per_file_column_names[f].push_back(name); }
+          }
+        }
+      }
+      SIRIUS_LOG_INFO(
+        "[parquet_scan] Schema evolution detected — using per-file column projection.");
+    }
+  }
+
   //===----------Projections----------===//
   std::unordered_set<std::size_t> pure_filter_column_indices;
   std::vector<std::string> projected_column_names;
-  if (is_projected) {
-    projected_column_names.reserve(_selected_column_indices.size());
-    std::for_each(_selected_column_indices.begin(),
-                  _selected_column_indices.end(),
-                  [this, &projected_column_names](std::size_t col_idx) {
-                    projected_column_names.push_back(_scan_op->names[col_idx]);
-                  });
+  bool selected_row_count_carrier = false;
+  if (_selected_column_indices.empty() && !_file_metadatas.empty() && !_scan_op->names.empty()) {
+    auto const& first_meta = _file_metadatas[0];
+    for (size_t i = 1; i < first_meta.schema.size(); ++i) {
+      if (first_meta.schema[i].num_children != 0) { continue; }
+      auto const& leaf_name = first_meta.schema[i].name;
+      auto it               = std::find(_scan_op->names.begin(), _scan_op->names.end(), leaf_name);
+      if (it == _scan_op->names.end()) { continue; }
+
+      auto const duckdb_idx = static_cast<size_t>(std::distance(_scan_op->names.begin(), it));
+      _selected_column_indices.push_back(duckdb_idx);
+      projected_column_names.push_back(leaf_name);
+      selected_row_count_carrier = true;
+      SIRIUS_LOG_DEBUG(
+        "[parquet_scan] Selected carrier column '{}' (idx={}) to preserve row counts for a "
+        "no-output-column scan.",
+        leaf_name,
+        duckdb_idx);
+      break;
+    }
+  }
+
+  if (is_projected || selected_row_count_carrier) {
+    if (projected_column_names.empty()) {
+      projected_column_names.reserve(_selected_column_indices.size());
+      std::for_each(_selected_column_indices.begin(),
+                    _selected_column_indices.end(),
+                    [this, &projected_column_names](std::size_t col_idx) {
+                      projected_column_names.push_back(_scan_op->names[col_idx]);
+                    });
+    }
 #if CUDF_VERSION_NUM >= 2604
     _reader_options.set_column_names(projected_column_names);
 #else
@@ -467,9 +533,15 @@ void parquet_scan_task_global_state::initialize_from_files()
   }
 
   // Verify projected columns are flat (we don't support nested projections yet).
+  // Under schema evolution, each file may have a different subset of the projected
+  // columns — check against the per-file projection rather than the global one,
+  // otherwise files missing an evolved column trip the "missing column" path
+  // inside projected_columns_are_flat().
   if (is_projected) {
-    for (auto const& meta : _file_metadatas) {
-      if (!detail::projected_columns_are_flat(meta, projected_column_names)) {
+    for (size_t f = 0; f < _file_metadatas.size(); ++f) {
+      auto const& cols_to_check =
+        _per_file_column_names.empty() ? projected_column_names : _per_file_column_names[f];
+      if (!detail::projected_columns_are_flat(_file_metadatas[f], cols_to_check)) {
         throw std::runtime_error(
           "[parquet_scan_task_global_state] Parquet scans with projections currently only support "
           "flat projected columns");
@@ -609,86 +681,106 @@ void parquet_scan_task_global_state::init_hive_partitions(
 
   if (_hive_partition_columns.empty()) return;
 
-  // Build the output column map in the order the pipeline expects.
-  //
-  // cuDF returns data columns in _selected_column_indices order (which
-  // follows column_ids order). We build a DuckDB-index → cuDF-position
-  // map, then iterate column_ids to produce the output in the order
-  // DuckDB's pipeline operators expect.
-  struct col_source {
-    bool is_partition;
-    size_t data_col_idx;
-    std::string partition_name;
-    sirius::logical_type type;
-  };
+  _partition_inject_fn = build_partition_inject_fn(scan_op->column_ids,
+                                                   scan_op->names,
+                                                   scan_op->returned_types,
+                                                   _selected_column_indices,
+                                                   _hive_partition_columns,
+                                                   _hive_partition_index_set);
+}
 
-  // Map DuckDB primary index → cuDF column position.
-  std::unordered_map<size_t, size_t> duckdb_to_cudf;
-  for (size_t i = 0; i < _selected_column_indices.size(); ++i) {
-    duckdb_to_cudf[_selected_column_indices[i]] = i;
+void parquet_scan_task_global_state::build_schema_reconciliation(
+  sirius_physical_parquet_scan* scan_op)
+{
+  // Builds a UNIFIED inject fn that handles:
+  //   1. Hive partition columns (always from file path)
+  //   2. Schema evolution (missing columns → NULL)
+  //   3. Partition evolution (column is data in some files, partition in others)
+  //
+  // It REPLACES the hive partition inject fn (not chains after it) because
+  // the two can't be composed independently — the hive fn's data_col_idx
+  // assumes a fixed column count, but partition evolution changes it per file.
+  //
+  // Only activates when schema evolution is present (per-file column
+  // differences). For plain hive partitions without schema evolution, the
+  // init_hive_partitions fn handles everything correctly.
+  if (_per_file_column_names.empty()) return;
+
+  // Build per-file column name sets keyed by file path.
+  std::unordered_map<std::string, std::unordered_set<std::string>> file_col_sets;
+  for (size_t f = 0; f < _file_paths.size(); ++f) {
+    file_col_sets[_file_paths[f]] = std::unordered_set<std::string>(
+      _per_file_column_names[f].begin(), _per_file_column_names[f].end());
   }
 
-  // Build output_map in column_ids order (the order the pipeline expects).
-  std::vector<col_source> output_map;
-  std::unordered_set<size_t> seen;
-  for (auto const& col_id : scan_op->column_ids) {
-    auto primary_idx = col_id.GetPrimaryIndex();
-    if (duckdb::IsVirtualColumn(primary_idx)) continue;
-    if (!seen.insert(primary_idx).second) continue;
+  struct OutputCol {
+    std::string name;
+    duckdb::LogicalType type;
+    bool always_partition;  // true if never in any parquet file
+  };
 
-    if (_hive_partition_index_set.count(primary_idx)) {
-      output_map.push_back(col_source{/* is_partition */ true,
-                                      /* data_col_idx */ 0,
-                                      scan_op->names[primary_idx],
-                                      scan_op->returned_types[primary_idx]});
-    } else {
-      auto it = duckdb_to_cudf.find(primary_idx);
-      if (it != duckdb_to_cudf.end()) {
-        output_map.push_back(col_source{/* is_partition */ false,
-                                        /* data_col_idx */ it->second,
-                                        /* partition_name */ {},
-                                        /* type */ {}});
+  // Build output_cols in the same order as init_hive_partitions:
+  // iterate column_ids to match DuckDB's query-specific column ordering.
+  std::vector<OutputCol> output_cols;
+  {
+    std::unordered_set<size_t> seen;
+    for (auto const& cid : scan_op->column_ids) {
+      auto idx = cid.GetPrimaryIndex();
+      if (duckdb::IsVirtualColumn(idx)) continue;
+      if (!seen.insert(idx).second) continue;
+      bool is_partition = _hive_partition_index_set.count(idx) > 0;
+      bool is_selected  = false;
+      for (auto si : _selected_column_indices) {
+        if (si == idx) {
+          is_selected = true;
+          break;
+        }
+      }
+      if (is_selected || is_partition) {
+        auto duckdb_type = sirius::to_duckdb(scan_op->returned_types[idx]);
+        output_cols.push_back({scan_op->names[idx], duckdb_type, is_partition});
       }
     }
   }
 
-  SIRIUS_LOG_INFO(
-    "[parquet_scan] Hive partitions detected: {} partition col(s), {} data col(s), "
-    "{} output col(s).",
-    _hive_partition_columns.size(),
-    duckdb_to_cudf.size(),
-    output_map.size());
-
-  _partition_inject_fn = [output_map = std::move(output_map)](
+  _partition_inject_fn = [file_col_sets = std::move(file_col_sets),
+                          output_cols   = std::move(output_cols)](
                            std::unique_ptr<cudf::table> tbl,
                            std::string const& file_path,
                            rmm::cuda_stream_view stream) -> std::unique_ptr<cudf::table> {
     if (!tbl || tbl->num_rows() == 0) return tbl;
 
-    auto partitions     = duckdb::HivePartitioning::Parse(file_path);
-    auto const num_rows = tbl->num_rows();
-    auto data_columns   = tbl->release();  // move columns out, no GPU copy
+    auto partitions   = duckdb::HivePartitioning::Parse(file_path);
+    auto const n_rows = tbl->num_rows();
 
-    std::vector<std::unique_ptr<cudf::column>> output_columns;
-    output_columns.reserve(output_map.size());
+    std::unordered_set<std::string> const* file_cols = nullptr;
+    auto it                                          = file_col_sets.find(file_path);
+    if (it != file_col_sets.end()) { file_cols = &it->second; }
 
-    for (auto const& src : output_map) {
-      if (!src.is_partition) {
-        output_columns.push_back(std::move(data_columns[src.data_col_idx]));
+    std::vector<std::unique_ptr<cudf::column>> out;
+    out.reserve(output_cols.size());
+
+    cudf::size_type data_col = 0;
+    for (auto const& col : output_cols) {
+      bool in_parquet =
+        col.always_partition ? false : (file_cols ? file_cols->count(col.name) > 0 : true);
+
+      if (in_parquet) {
+        out.push_back(std::make_unique<cudf::column>(tbl->get_column(data_col++), stream));
       } else {
-        auto it = partitions.find(src.partition_name);
-        if (it == partitions.end()) {
-          throw std::runtime_error("[parquet_scan] Missing hive partition key '" +
-                                   src.partition_name + "' in file path: " + file_path);
+        auto pit = partitions.find(col.name);
+        if (pit != partitions.end()) {
+          auto val    = duckdb::Value(pit->second).DefaultCastAs(col.type);
+          auto scalar = duckdb::DuckDBValueToCudfScalar(val, col.type, stream);
+          out.push_back(cudf::make_column_from_scalar(*scalar, n_rows, stream));
+        } else {
+          auto scalar = duckdb::DuckDBValueToCudfScalar(duckdb::Value(col.type), col.type, stream);
+          out.push_back(cudf::make_column_from_scalar(*scalar, n_rows, stream));
         }
-        // DefaultCastAs requires a DuckDB type; the scalar factory takes the sirius type.
-        auto duckdb_val = duckdb::Value(it->second).DefaultCastAs(sirius::to_duckdb(src.type));
-        auto scalar     = sirius::value_to_cudf_scalar(duckdb_val, src.type, stream);
-        output_columns.push_back(cudf::make_column_from_scalar(*scalar, num_rows, stream));
       }
     }
 
-    return std::make_unique<cudf::table>(std::move(output_columns));
+    return std::make_unique<cudf::table>(std::move(out));
   };
 }
 
@@ -888,10 +980,10 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
   if (g_state.has_post_convert_fn()) {
     parquet_representation->set_post_convert_fn(g_state.get_post_convert_fn());
   }
-  if (g_state.has_hive_partitions()) {
+  if (g_state.has_partition_inject_fn()) {
     parquet_representation->set_partition_inject_fn(g_state.get_partition_inject_fn());
   }
-  if (g_state.has_post_convert_fn() || g_state.has_hive_partitions()) {
+  if (g_state.has_post_convert_fn() || g_state.has_partition_inject_fn()) {
     parquet_representation->set_data_file_path(g_state.get_file_path(l_state.get_file_idx()));
   }
 

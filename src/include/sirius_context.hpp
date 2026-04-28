@@ -18,9 +18,10 @@
 
 #include "creator/task_creator.hpp"
 #include "downgrade/downgrade_executor.hpp"
+#include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
-#include "pipeline/pipeline_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "pipeline/task_scheduler.hpp"
 #include "planner/query.hpp"
 #include "sirius_config.hpp"
 
@@ -28,14 +29,21 @@
 
 #include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/data/io_backend_registry.hpp>
+#include <duckdb/common/enums/optimizer_type.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/client_context_state.hpp>
+#include <duckdb/main/prepared_statement_data.hpp>
 #include <duckdb/planner/extension_callback.hpp>
+#include <duckdb/planner/logical_operator.hpp>
 
+#include <atomic>
+#include <condition_variable>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -50,6 +58,12 @@ namespace duckdb {
 /// \brief Manages the lifetime of the sirius_context within a DuckDB ClientContext.
 class SiriusContext : public ClientContextState {
  public:
+  struct transparent_execution_stats {
+    uint64_t successful_rebinds = 0;
+    uint64_t fallbacks          = 0;
+    uint64_t executions         = 0;
+  };
+
   SiriusContext();
   ~SiriusContext() noexcept override;
 
@@ -74,6 +88,15 @@ class SiriusContext : public ClientContextState {
   /// \param context The client context.
   /// \param error Optional error data.
   void QueryEnd(ClientContext& context, optional_ptr<ErrorData> error) final;
+
+  /// \brief Must return true for OnFinalizePrepare to be called by DuckDB.
+  bool CanRequestRebind() final { return true; }
+
+  /// \brief Called after physical plan generation, before execution.
+  /// Replaces the DuckDB physical plan with a Sirius GPU plan when possible.
+  RebindQueryInfo OnFinalizePrepare(ClientContext& context,
+                                    PreparedStatementData& prepared_statement,
+                                    PreparedStatementMode mode) final;
 
   /// \brief Initialize the Sirius context with the given configuration.
   void initialize(const sirius::sirius_config& config);
@@ -112,6 +135,10 @@ class SiriusContext : public ClientContextState {
   {
     _internal_query_depth.fetch_sub(1, std::memory_order_relaxed);
   }
+  [[nodiscard]] bool is_internal_query_active() const noexcept
+  {
+    return _internal_query_depth.load(std::memory_order_relaxed) > 0;
+  }
 
   /// \brief Terminate the Sirius context, releasing all resources.
   void terminate();
@@ -129,8 +156,8 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] const cucascade::shared_data_repository_manager& get_data_repository_manager()
     const;
 
-  [[nodiscard]] sirius::pipeline::pipeline_executor& get_pipeline_executor();
-  [[nodiscard]] const sirius::pipeline::pipeline_executor& get_pipeline_executor() const;
+  [[nodiscard]] sirius::pipeline::task_scheduler& get_task_scheduler();
+  [[nodiscard]] const sirius::pipeline::task_scheduler& get_task_scheduler() const;
 
   /// \brief Get the downgrade executor for a specific memory space.
   [[nodiscard]] sirius::parallel::downgrade_executor& get_downgrade_executor(
@@ -206,12 +233,53 @@ class SiriusContext : public ClientContextState {
   /// \brief Get the current Sirius configuration (mutable, e.g. for SET command callbacks).
   [[nodiscard]] sirius::sirius_config& get_config() noexcept { return config_; }
 
+  /// \brief Whether the Sirius context has been initialized (config loaded, GPU ready).
+  [[nodiscard]] bool is_initialized() const noexcept { return is_initialized_; }
+
+  /// \brief Whether the shared query lifecycle slot is currently held by any connection.
+  [[nodiscard]] bool is_query_lifecycle_active() const noexcept;
+
+  /// \brief Store a captured logical plan for transparent GPU execution.
+  /// Called by the optimizer extension hook after copying the optimized logical plan.
+  void set_captured_logical_plan(duckdb::unique_ptr<duckdb::LogicalOperator> plan);
+
+  /// \brief Take ownership of the captured logical plan (moves it out).
+  /// Called by OnFinalizePrepare to generate the Sirius physical plan.
+  duckdb::unique_ptr<duckdb::LogicalOperator> take_captured_logical_plan();
+
+  /// \brief Save the connection's disabled optimizer set before transparent execution mutates it.
+  void set_transparent_original_disabled_optimizers(std::set<duckdb::OptimizerType> disabled);
+
+  /// \brief Restore the connection's disabled optimizer set after transparent optimization.
+  void restore_transparent_disabled_optimizers(ClientContext& context);
+
+  /// \brief Snapshot counters for transparent execution observability.
+  [[nodiscard]] transparent_execution_stats get_transparent_execution_stats() const noexcept;
+
+  /// \brief Record a successful transparent rebind to Sirius.
+  void record_transparent_rebind_success() noexcept;
+
+  /// \brief Record a transparent fallback back to DuckDB.
+  void record_transparent_fallback() noexcept;
+
+  /// \brief Record that a transparently rebound query actually executed through Sirius.
+  void record_transparent_execution() noexcept;
+
  private:
   void throw_if_not_initialized() const;
+  void acquire_query_lifecycle_slot();
+  void release_query_lifecycle_slot();
 
   mutable std::mutex mutex_;
   std::atomic<int> _internal_query_depth{0};
-  bool is_initialized_ = false;
+  // The current Super Sirius runtime is shared across connections, so query
+  // lifecycle callbacks and engine execution must be serialized to avoid
+  // cross-connection state corruption.
+  mutable std::mutex query_lifecycle_mutex_;
+  std::condition_variable query_lifecycle_cv_;
+  std::thread::id active_query_owner_{};
+  std::size_t active_query_depth_ = 0;
+  bool is_initialized_            = false;
   sirius::sirius_config config_;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;
   // Cucascade disk I/O backend registry + per-GPU cache of idisk_io_backend
@@ -237,15 +305,30 @@ class SiriusContext : public ClientContextState {
   std::unordered_set<std::pair<int, int>, peer_pair_hash> peer_access_enabled_pairs_;
   // Destroyed before memory_manager_ (declared after it — reverse destruction order).
   std::unique_ptr<cucascade::memory::small_pinned_host_memory_resource> small_pinned_allocator_;
-  // Previous cuDF pinned resource and threshold — restored in terminate() before
-  // small_pinned_allocator_ is destroyed to prevent dangling references.
+  std::optional<
+    sirius::memory::host_device_resource_view<cucascade::memory::small_pinned_host_memory_resource>>
+    small_pinned_allocator_view_{};
+  // Previous cuDF pinned resource and threshold — restored in terminate() before the view and
+  // allocator are destroyed to prevent dangling references.
   std::optional<rmm::host_device_async_resource_ref> prev_pinned_mr_{};
   std::size_t prev_pinned_threshold_{0};
   std::unique_ptr<cucascade::shared_data_repository_manager> data_repository_manager_;
-  std::unique_ptr<sirius::pipeline::pipeline_executor> pipeline_executor_;
+  std::unique_ptr<sirius::pipeline::task_scheduler> task_scheduler_;
   std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;
   std::unique_ptr<sirius::creator::task_creator> task_creator_;
   duckdb::shared_ptr<sirius::planner::query> query_;
+
+  /// Captured optimized logical plan for transparent GPU execution.
+  /// Set by the optimizer extension hook, consumed by OnFinalizePrepare.
+  duckdb::unique_ptr<duckdb::LogicalOperator> captured_logical_plan_;
+
+  /// Snapshot of the connection's disabled optimizer set before the transparent
+  /// optimizer hook mutates it.
+  std::optional<std::set<duckdb::OptimizerType>> transparent_original_disabled_optimizers_;
+
+  std::atomic<uint64_t> transparent_rebind_success_count_{0};
+  std::atomic<uint64_t> transparent_fallback_count_{0};
+  std::atomic<uint64_t> transparent_execution_count_{0};
 };
 
 /// todo(amin): when duckdb is updated, we need to enable OnExtensionLoaded to support sirius

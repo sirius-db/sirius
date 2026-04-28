@@ -18,6 +18,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "config.hpp"
+#include "expression_executor/expression_executor_strategy.hpp"
 
 // Forward-declare CUDA profiler API functions (linked via libcudart).
 extern "C" int cudaProfilerStart();
@@ -39,9 +40,10 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "transparent/sirius_optimizer_extension.hpp"
 // #include "from_substrait.hpp"
-#include "gpu_buffer_manager.hpp"
 #ifdef SIRIUS_ENABLE_LEGACY
+#include "gpu_buffer_manager.hpp"
 #include "gpu_context.hpp"
 #include "gpu_physical_plan_generator.hpp"
 #endif
@@ -56,8 +58,25 @@ extern "C" int cudaProfilerStop();
 
 namespace duckdb {
 
-const std::string PINNED_MEMORY_PARAM_KEY   = "pinned_memory_size";
+const std::string PINNED_MEMORY_PARAM_KEY = "pinned_memory_size";
+#ifdef SIRIUS_ENABLE_LEGACY
 bool SiriusExtension::buffer_is_initialized = false;
+#endif
+
+namespace {
+
+unique_ptr<QueryResult> run_internal_cpu_fallback_query(ClientContext& context,
+                                                        Connection& connection,
+                                                        const string& query)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return connection.Query(query); }
+
+  duckdb::SiriusContext::InternalQueryGuard guard(*sirius_ctx);
+  return connection.Query(query);
+}
+
+}  // namespace
 
 struct SiriusTableFunctionData : public TableFunctionData {
   SiriusTableFunctionData() = default;
@@ -326,19 +345,19 @@ void SiriusExtension::GPUProcessingFunction(ClientContext& context,
       printf(
         "=============================================\nError in GPUExecuteQuery, fallback to "
         "DuckDB\n=============================================\n");
-      data.res = data.conn->Query(data.query);
+      data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
     } else if (data.plan_error) {
       printf(
         "=============================================\nError in GPUExecuteQuery, fallback to "
         "DuckDB\n=============================================\n");
-      data.res = data.conn->Query(data.query);
+      data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
     } else {
       data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
       if (data.res->HasError()) {
         printf(
           "=============================================\nError in GPUExecuteQuery, fallback to "
           "DuckDB\n=============================================\n");
-        data.res = data.conn->Query(data.query);
+        data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
       }
     }
     auto end      = std::chrono::high_resolution_clock::now();
@@ -450,7 +469,7 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
       printf(
         "=============================================\nError in SiriusExecuteQuery, fallback to "
         "DuckDB\n=============================================\n");
-      data.res = data.conn->Query(data.query);
+      data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
     } else {
       data.res =
         data.sirius_iface->sirius_execute_query(context, data.query, data.gpu_prepared, {});
@@ -460,7 +479,7 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
           printf(
             "=============================================\nError in SiriusExecuteQuery, fallback "
             "to DuckDB\n=============================================\n");
-          data.res = data.conn->Query(data.query);
+          data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
         } else {
           throw std::runtime_error("SiriusExecuteQuery error: " + data.res->GetError());
           return;
@@ -502,6 +521,7 @@ static unique_ptr<LogicalOperator> OptimizePlan(ClientContext& context,
   return plan;
 }
 
+#ifdef SIRIUS_ENABLE_LEGACY
 struct GPUBufferInitFunctionData : public TableFunctionData {
   GPUBufferInitFunctionData() {}
   bool finished = false;
@@ -613,6 +633,7 @@ void SiriusExtension::GPUBufferInitFunction(ClientContext& context,
   }
   data.finished = true;
 }
+#endif  // SIRIUS_ENABLE_LEGACY
 
 static unique_ptr<FunctionData> ProfilerBind(ClientContext& context,
                                              TableFunctionBindInput& input,
@@ -662,6 +683,8 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
 {
   auto transaction = CatalogTransaction::GetSystemTransaction(instance);
   auto& catalog    = Catalog::GetSystemCatalog(instance);
+
+#ifdef SIRIUS_ENABLE_LEGACY
   TableFunction gpu_buffer_init("gpu_buffer_init",
                                 {LogicalType::VARCHAR, LogicalType::VARCHAR},
                                 GPUBufferInitFunction,
@@ -670,7 +693,6 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   CreateTableFunctionInfo gpu_buffer_init_info(gpu_buffer_init);
   catalog.CreateTableFunction(transaction, gpu_buffer_init_info);
 
-#ifdef SIRIUS_ENABLE_LEGACY
   RegisterLegacyGPUFunctions(transaction, catalog);
 #endif
 
@@ -716,15 +738,16 @@ static void SetUseCudfExpr(ClientContext& context, SetScope scope, Value& parame
 static void SetExpressionExecutorStrategy(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto value = StringValue::Get(parameter);
-  if (value != "materialize" && value != "ast_interpret" && value != "ast_jit") {
+  sirius::expression_executor_strategy parsed;
+  if (!sirius::string_to_strategy(value, parsed)) {
     throw InvalidInputException(
       "Invalid expression_executor_strategy '{}'. Valid values: materialize, ast_interpret, "
       "ast_jit",
       value);
   }
-  Config::EXPRESSION_EXECUTOR_STRATEGY = std::move(value);
+  Config::EXPRESSION_EXECUTOR_STRATEGY = parsed;
   SIRIUS_LOG_DEBUG("Updated config EXPRESSION_EXECUTOR_STRATEGY to {}",
-                   Config::EXPRESSION_EXECUTOR_STRATEGY);
+                   sirius::strategy_to_string(Config::EXPRESSION_EXECUTOR_STRATEGY));
 }
 
 static void SetUseCustomTopN(ClientContext& context, SetScope scope, Value& parameter)
@@ -885,6 +908,11 @@ static void SetMaxBuildHashTableBytes(ClientContext& context, SetScope scope, Va
                    params->max_build_hash_table_bytes);
 }
 
+static void SetEnableGpuExecution(ClientContext& context, SetScope scope, Value& parameter)
+{
+  SIRIUS_LOG_DEBUG("Updated gpu_execution to {}", BooleanValue::Get(parameter));
+}
+
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 {
   // Add in config option for gpu buffer manager
@@ -910,10 +938,10 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 
   config.AddExtensionOption(
     "expression_executor_strategy",
-    "Strategy for the experimental gpu_expression_executor: 'materialize', 'ast_interpret', or "
+    "Strategy for the gpu_expression_executor: 'materialize', 'ast_interpret', or "
     "'ast_jit'",
     LogicalType::VARCHAR,
-    Value(Config::EXPRESSION_EXECUTOR_STRATEGY),
+    Value(std::string(sirius::strategy_to_string(Config::EXPRESSION_EXECUTOR_STRATEGY))),
     SetExpressionExecutorStrategy);
 
   // Add in config option for top-N
@@ -1039,6 +1067,13 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::UBIGINT,
                             Value::UBIGINT(sirius::operator_params{}.max_build_hash_table_bytes),
                             SetMaxBuildHashTableBytes);
+
+  config.AddExtensionOption(
+    "gpu_execution",
+    "Whether to transparently intercept SQL queries and execute them on GPU",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(true),
+    SetEnableGpuExecution);
 }
 
 static void LoadInternal(ExtensionLoader& loader)
@@ -1053,6 +1088,13 @@ static void LoadInternal(ExtensionLoader& loader)
   sirius::converter_registry::initialize();
   SiriusExtension::InitialGPUConfigs(config);
   SiriusExtension::RegisterGPUFunctions(db);
+
+  // Register optimizer extension for transparent GPU execution.
+  // Pre-hook disables incompatible optimizers; post-hook captures the plan.
+  OptimizerExtension opt_ext;
+  opt_ext.pre_optimize_function = sirius::transparent::sirius_pre_optimizer_hook;
+  opt_ext.optimize_function     = sirius::transparent::sirius_optimizer_hook;
+  OptimizerExtension::Register(config, std::move(opt_ext));
 
   // Register SiriusContext on connections that were opened before the extension
   // was loaded (e.g. when loaded via LOAD in Python or the CLI).

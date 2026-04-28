@@ -198,8 +198,7 @@ Output: `reports/<label>_<YYYYMMDD_HHMMSS>/` containing `report.md`, `summary.js
 
 ## Query Files
 
-- `tpch_queries/orig/q*.sql` — Plain SQL queries
-- `tpch_queries/gpu/q*.sql` — Queries wrapped in `call gpu_execution('...');` for Sirius
+- `tpch_queries/orig/q*.sql` — Plain SQL queries used by both Sirius and DuckDB runners
 
 ## Key Files
 
@@ -229,7 +228,13 @@ The Sirius config file (`test/cpp/integration/integration.yaml`) controls:
 - **Host memory**: `capacity_bytes`, `initial_number_pools`, `pool_size`, `block_size`
   - Initial allocation = `initial_number_pools * pool_size * block_size`
 - **Thread pools**: `pipeline`, `duckdb_scan`, `task_creator`, `downgrade` thread counts
-- **Scan cache**: `duckdb_scan.cache = true` enables caching
+- **Scan cache**: `duckdb_scan.cache` controls cache level (default: `none`, valid: `none`, `parquet`, `table_host`, `table_gpu`)
+  - In single-session benchmarks, the config YAML controls the cache level directly
+  - In multi-session benchmarks, per-query overrides can be set in `scan_cache_levels.yaml`
+- **Cold-run benchmarking**: Use `--multi-session --drop-os-cache` to drop OS filesystem cache between queries. Requires one-time passwordless sudo setup:
+  ```bash
+  echo "$(whoami) ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches" | sudo tee /etc/sudoers.d/drop_caches
+  ```
 
 ## Parquet Format Notes
 

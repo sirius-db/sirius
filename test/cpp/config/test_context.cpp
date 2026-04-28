@@ -494,3 +494,43 @@ TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-0
   manager->shutdown();
   sirius::converter_registry::shutdown();
 }
+
+TEST_CASE("Internal query guard preserves transparent execution state",
+          "[sirius][context][isolated_context]")
+{
+  finally cleanup_env{[]() {
+    unsetenv("SIRIUS_CONFIG_FILE");
+    setenv("SIRIUS_DISABLE", "1", 1);
+  }};
+
+  std::source_location loc = std::source_location::current();
+  fs::path cfg             = fs::path(loc.file_name()).parent_path() / "data" / "configurator.yaml";
+
+  unsetenv("SIRIUS_DISABLE");
+  setenv("SIRIUS_CONFIG_FILE", cfg.string().c_str(), 1);
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+
+  auto& client_ctx = *con.context;
+  auto sirius_ctx  = client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+
+  auto plan = con.ExtractPlan("SELECT 42;");
+  REQUIRE(plan != nullptr);
+  sirius_ctx->set_captured_logical_plan(std::move(plan));
+
+  auto expected_disabled =
+    std::set<duckdb::OptimizerType>{duckdb::OptimizerType::COMPRESSED_MATERIALIZATION};
+  duckdb::DBConfig::GetConfig(client_ctx).options.disabled_optimizers = expected_disabled;
+  sirius_ctx->set_transparent_original_disabled_optimizers({duckdb::OptimizerType::IN_CLAUSE});
+
+  {
+    duckdb::SiriusContext::InternalQueryGuard guard(*sirius_ctx);
+    sirius_ctx->QueryBegin(client_ctx);
+    sirius_ctx->QueryEnd(client_ctx);
+  }
+
+  REQUIRE(duckdb::DBConfig::GetConfig(client_ctx).options.disabled_optimizers == expected_disabled);
+  REQUIRE(sirius_ctx->take_captured_logical_plan() != nullptr);
+}

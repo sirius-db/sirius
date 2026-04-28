@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <expression_executor/expression_executor_strategy.hpp>
+
 #include <cstdint>
 #include <string>
 
@@ -32,11 +34,11 @@ struct Config {
 
   // For expression executor
   static bool USE_CUDF_EXPR;  // use_cudf_expr
-  // Strategy used by sirius::experimental::gpu_expression_executor.
-  // Valid values: "materialize", "ast_interpret", "ast_jit".
+  // Strategy used by sirius::gpu_expression_executor.
   // TODO: this should eventually be selected adaptively per-call by the executor based on
   // expression shape and operator statistics; the config knob will become a policy override.
-  static std::string EXPRESSION_EXECUTOR_STRATEGY;  // expression_executor_strategy
+  static ::sirius::expression_executor_strategy
+    EXPRESSION_EXECUTOR_STRATEGY;  // expression_executor_strategy
 
   // For gpu physical top-N
   static bool USE_CUSTOM_TOP_N;  // use_custom_top_n

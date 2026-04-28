@@ -27,7 +27,7 @@
 #include "op/sirius_physical_iceberg_scan.hpp"
 #include "op/sirius_physical_parquet_scan.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
-#include "pipeline/pipeline_executor.hpp"
+#include "pipeline/task_scheduler.hpp"
 #include "planner/query.hpp"
 #include "sirius_context.hpp"
 
@@ -82,9 +82,9 @@ void task_creator::set_client_context(::duckdb::ClientContext& client_context)
     std::make_unique<duckdb::ExecutionContext>(client_context, *_thread_context, nullptr);
 }
 
-void task_creator::set_pipeline_executor(sirius::pipeline::pipeline_executor& pipeline_executor)
+void task_creator::set_task_scheduler(sirius::pipeline::task_scheduler& task_scheduler)
 {
-  _pipeline_executor = &pipeline_executor;
+  _task_scheduler = &task_scheduler;
 }
 
 void task_creator::prepare_for_query(const sirius::planner::query& query)
@@ -110,7 +110,7 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
         operator_id,
         std::make_shared<op::scan::duckdb_scan_task_global_state>(
           pipeline,
-          *_pipeline_executor,
+          *_task_scheduler,
           *_client_context,
           &source_operator->Cast<op::sirius_physical_duckdb_scan>()));
     } else if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
@@ -168,8 +168,8 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
             std::move(gpu_io_backends)));
       }
     } else {
-      _gpu_operator_global_state_map.emplace(
-        operator_id, std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline));
+      auto gs = std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline);
+      _gpu_operator_global_state_map.emplace(operator_id, std::move(gs));
     }
   }
   _num_scans_in_plan =
@@ -200,8 +200,7 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
 {
   if (node == nullptr) { return nullptr; }
 
-  if (node->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN ||
-      node->type == ::sirius::op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
+  if (node->type == ::sirius::op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
     size_t operator_id             = node->get_operator_id();
     auto parquet_task_global_state = _parquet_scan_operator_global_state_map.at(operator_id);
     if (parquet_task_global_state->has_more_partitions()) {
@@ -359,9 +358,8 @@ void task_creator::manager_loop()
             scan_task_global_state);
           pipeline->mark_task_created();  // WSM TODO: this needs to be done atomically
                                           // with the task creation
-          _pipeline_executor->schedule(std::move(scan_task));
-        } else if (node->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN ||
-                   node->type == ::sirius::op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
+          _task_scheduler->schedule(std::move(scan_task));
+        } else if (node->type == ::sirius::op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
           size_t operator_id             = node->get_operator_id();
           auto parquet_task_global_state = _parquet_scan_operator_global_state_map.at(operator_id);
           // ICEBERG_SCAN inherits from PARQUET_SCAN; Cast<> is type-checked by enum so use
@@ -399,7 +397,7 @@ void task_creator::manager_loop()
                                                             destination_data_repositories[0],
                                                             std::move(parquet_task_local_state),
                                                             parquet_task_global_state);
-            _pipeline_executor->schedule(std::move(parquet_task));
+            _task_scheduler->schedule(std::move(parquet_task));
 
             // If there is only a single scan in the plan, continue creating scan tasks to create
             // I/O parallelism. Otherwise, let the plan drive the creation of more tasks.
@@ -426,7 +424,7 @@ void task_creator::manager_loop()
                                                                   *_client_context);
           SIRIUS_LOG_DEBUG("Task Creator: scheduling cpu_source_task, dest_repos={}",
                            destination_data_repositories.size());
-          _pipeline_executor->schedule(std::move(task));
+          _task_scheduler->schedule(std::move(task));
         } else {
           // need to exhaust input batches until all ports are empty
           while (!node->all_ports_empty()) {
@@ -547,12 +545,12 @@ void task_creator::manager_loop()
                                                             destination_data_repositories,
                                                             std::move(local_state),
                                                             gpu_pipeline_task_global_state);
-            _pipeline_executor->schedule(std::move(task));
+            _task_scheduler->schedule(std::move(task));
           }
         }
       } catch (const std::exception& e) {
         SIRIUS_LOG_ERROR("Task Creator: Exception during task creation: {}", e.what());
-        _pipeline_executor->terminate_query(std::current_exception());
+        _task_scheduler->terminate_query(std::current_exception());
         stop();
       }
     });

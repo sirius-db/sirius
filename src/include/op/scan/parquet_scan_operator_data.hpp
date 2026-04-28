@@ -17,7 +17,7 @@
 #pragma once
 
 // sirius
-#include <expression_executor/gpu_expression_translator.hpp>
+#include <expression_executor/gpu_expression_translator_internal.hpp>
 #include <op/sirius_physical_operator.hpp>
 
 // cudf
@@ -140,6 +140,39 @@ class parquet_scan_data : public op::operator_data {
   {
   }
 
+  /**
+   * @brief Capture the task's reserved memory space so that
+   *        sirius_gpu_parquet_scan_operator::execute() can tag its output batches with it.
+   *
+   * parquet_scan_data is the input to a source task: it owns no upstream data batches
+   * that need locking or conversion, so the handle vector is always empty. Its only
+   * preparation responsibility is to record @p requested_memory_space into
+   * @ref gpu_memory_space, where sirius_gpu_parquet_scan_operator::execute() will read
+   * it when wrapping the freshly-read cudf::table in a data_batch via make_data_batch().
+   *
+   * The recorded pointer is valid for the lifetime of the task's memory reservation —
+   * from when gpu_pipeline_executor sets the reservation on the task local state
+   * (see gpu_pipeline_executor::manager_loop) through the end of execute().
+   *
+   * @param requested_memory_space  Memory space associated with the task reservation;
+   *                                stored into gpu_memory_space for use during execute().
+   * @param stream                  Unused — no data movement occurs during preparation
+   *                                for this source input.
+   * @return  Always an empty handle vector; there are no batches to keep locked.
+   */
+  std::optional<std::vector<::cucascade::data_batch_processing_handle>> prepare_for_processing(
+    const ::cucascade::memory::memory_space* requested_memory_space,
+    rmm::cuda_stream_view stream) override
+  {
+    gpu_memory_space = const_cast<cucascade::memory::memory_space*>(requested_memory_space);
+    return std::vector<::cucascade::data_batch_processing_handle>{};
+  };
+
+  [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
+  {
+    return rg_range.reserved_uncompressed_bytes;
+  }
+
   std::string file_path;
   row_group_range rg_range;
   std::shared_ptr<cudf::io::parquet_reader_options> reader_options;
@@ -152,6 +185,8 @@ class parquet_scan_data : public op::operator_data {
   std::vector<std::size_t> post_filter_projection_ids;
   /// Datasource for the parquet file, shared with other partitions of the same file.
   std::shared_ptr<cudf::io::datasource> datasource;
+  /// GPU memory space for allocating output tables produced by execute().
+  cucascade::memory::memory_space* gpu_memory_space = nullptr;
 };
 
 }  // namespace sirius::op::scan
