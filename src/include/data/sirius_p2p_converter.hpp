@@ -16,11 +16,11 @@
 
 #pragma once
 
+#include <rmm/cuda_stream_view.hpp>
+
 #include <cucascade/data/common.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
-
-#include <rmm/cuda_stream_view.hpp>
 
 #include <memory>
 
@@ -40,7 +40,8 @@ namespace sirius::data {
  * dereference not-yet-landed bytes (cudaErrorIllegalAddress surfaces in
  * the next kernel launch, typically thrust::reduce_by_key inside the table
  * constructor). Pattern 2 in
- * .planning/phases/07-p2p-direct-transfer-adaptive-scan-partitioning/07-RESEARCH.md documents this fix.
+ * .planning/phases/07-p2p-direct-transfer-adaptive-scan-partitioning/07-RESEARCH.md documents this
+ * fix.
  *
  * This factory issues the peer copy on target_stream (same stream used to
  * allocate the destination buffer AND to construct the target cudf::table),

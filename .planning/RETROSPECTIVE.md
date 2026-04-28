@@ -13,7 +13,7 @@
 - Per-GPU filter translation at plan time — one `translated_expression` per configured GPU, scalars allocated on the correct device resource (Phase 8 residual closure 93fea6f)
 - `_batch_gpu_affinity` map in `duckdb_scan_executor` recording batch→GPU ownership atomically with `[mgpu-audit]` log emission, reset per query
 - `preferred_device_id` plumbing in `parquet_scan_task_local_state` with two-tier local-wins-over-global lookup mirroring `gpu_pipeline_task.hpp`
-- `std::set_intersection` cross-GPU disjointness REQUIRE in AUDIT TEST_CASE (substantive regression gate)
+- `std::set_intersection` cross-GPU disjointedness REQUIRE in AUDIT TEST_CASE (substantive regression gate)
 - `translated_expression::owned_stream` declared before `owned_literals` so reverse-destruction order keeps the stream alive past `cudf::scalar` `cudaFreeAsync` calls (Phase 10-03 stream use-after-destroy fix, 36 LOC)
 - `integration-2gpu.yaml` fixture + `RUN_TPCH_MGPU(GENERATE(1, 2))` Catch2 macro across 45 TEST_CASE call sites
 - SF100 TPC-H Q1 num_gpus=2 ship-gate: 5.70s wall-clock, byte-identical to 1-GPU baseline, 71 scan batches GPU0=42 / GPU1=29 with cross-GPU intersection=0
@@ -36,7 +36,7 @@
 - **HALT plans authored against rejected hypotheses.** When evidence rejects the plan's assumed cause, write a `XX-YY-HALT.md` superseded-by record and rescope rather than forcing the original plan through.
 - **3-phase debug pattern: bisect → gdb → fix.** Phase 10's structure (10-01 bisect, 10-02 GDB, 10-03 targeted fix, 10-04 validate) is reusable for any "regression of unknown origin" scenario.
 - **C++ destruction-order discipline for CUDA stream-allocated objects.** When a `cudf::scalar` (or any RMM-allocated object) holds a stream handle, the stream object must outlive it. Declare the stream BEFORE the allocations in the same struct/class to leverage reverse-destruction order. This is now a documented Sirius pattern via Phase 10's `translated_expression::owned_stream`.
-- **Disjointness REQUIRE as canonical multi-GPU regression gate.** `std::set_intersection(counts[0].scan_ids, counts[1].scan_ids).empty()` is a one-line assertion that catches every cross-GPU double-dispatch shape going forward — keep it in any future multi-GPU AUDIT TEST_CASE.
+- **Disjointedness REQUIRE as canonical multi-GPU regression gate.** `std::set_intersection(counts[0].scan_ids, counts[1].scan_ids).empty()` is a one-line assertion that catches every cross-GPU double-dispatch shape going forward — keep it in any future multi-GPU AUDIT TEST_CASE.
 
 ### Key Lessons
 1. **Goal-backward honesty unblocks faster than "passing" verdicts.** Phase 9 marking PARTIAL (not PASS) is what made Phase 10's deterministic 4-plan structure possible. A "PASS with caveats" verdict would have hidden the work needed.

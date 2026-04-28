@@ -22,7 +22,7 @@ Autonomous validation run (per `feedback_mcp_tests_scope.md`). The agent execute
 | - | --------- | ------- |
 | 1 | SF100 TPC-H Q1 num_gpus=2 correct vs num_gpus=1 baseline, no SIGSEGV/cudaErrorInvalidValue/fallback | **PASS** |
 | 2 | MCP unit-tests exits 0 with 88 SF1 variants + SF10 Q1/Q6/Q12 green — INCLUDING the previously-failing TABLE_FUNCTION tests | **PARTIAL** (both target tests GREEN; suite has 1 pre-existing [mgpu-audit] SIGSEGV — not a Phase 10 regression) |
-| 4 | AUDIT disjointness REQUIRE (Plan 09-03 carryover) | **PASS_CARRYOVER** (set_intersection REQUIRE passes in tpch_q1_sf10_2gpu; GPU0=4, GPU1=3 unique batch_ids, intersect=0) |
+| 4 | AUDIT disjointedness REQUIRE (Plan 09-03 carryover) | **PASS_CARRYOVER** (set_intersection REQUIRE passes in tpch_q1_sf10_2gpu; GPU0=4, GPU1=3 unique batch_ids, intersect=0) |
 | 6 | SF100 [mgpu-audit] distributes scan_batches across both GPUs + wall-clock captured | **PASS** (71 scan batches distributed as GPU0=42, GPU1=29, disjoint; wall-clock 5.70s; 219 [mgpu-audit] entries) |
 
 **Phase-level verdict:** PARTIAL — CRIT-1, CRIT-6, and the Phase 10 CRIT-2 target tests all PASS. The Phase 10 fix (stream use-after-destroy) is demonstrably closed: `filter equality parquet` and `tpch_q1_sf10_2gpu` both exit 0. One pre-existing `[mgpu-audit]` SIGSEGV prevents the suite from reaching `All tests passed`; this failure is explicitly documented as pre-existing in `10-03-FIX.md` and is not attributable to any Phase 10 change.
@@ -169,7 +169,7 @@ Total [mgpu-audit] entries: 108
 ... (108 total entries; GPU0 and GPU1 coverage confirmed)
 ```
 
-Plan 09-03 AUDIT disjointness REQUIRE passes: `set_intersection(GPU0_scan_ids, GPU1_scan_ids) = ∅`.
+Plan 09-03 AUDIT disjointedness REQUIRE passes: `set_intersection(GPU0_scan_ids, GPU1_scan_ids) = ∅`.
 
 ### Runtime probe — preferred_device_id plumbing (Task 2)
 
@@ -254,7 +254,7 @@ diff_exit=0
 |-------------------|----------|--------|
 | CRIT-1 — SF100 Q1 num_gpus=2 correct, no cudaErrorInvalidValue, no SIGSEGV, no fallback | wall-clock 2-GPU=0:05.70, 1-GPU=0:05.45, CSV diff empty=1, SF100_CUDA_ERR=0, SF100_SIGSEGV=0, SF100_FALLBACK=0, rows=4 | **PASS** |
 | CRIT-2 — MCP unit-tests exits 0 with target tests GREEN (filter equality parquet + tpch_q1_sf10_2gpu) | Both target tests: exit 0, PASS. filter equality parquet=31 assertions; tpch_q1_sf10_2gpu=99 assertions. Pre-existing [mgpu-audit] SIGSEGV prevents full-suite exit 0. | **PARTIAL** (Phase 10 fix objective closed; one pre-existing failure remains) |
-| CRIT-4 — AUDIT disjointness REQUIRE (Plan 09-03 carryover) | tpch_q1_sf10_2gpu: GPU0=4 unique batch_ids, GPU1=3, cross-GPU intersection=0. set_intersection REQUIRE PASSES. SF100: GPU0=42, GPU1=29, intersection=0. | **PASS_CARRYOVER** |
+| CRIT-4 — AUDIT disjointedness REQUIRE (Plan 09-03 carryover) | tpch_q1_sf10_2gpu: GPU0=4 unique batch_ids, GPU1=3, cross-GPU intersection=0. set_intersection REQUIRE PASSES. SF100: GPU0=42, GPU1=29, intersection=0. | **PASS_CARRYOVER** |
 | CRIT-6 — SF100 [mgpu-audit] scan_batch distribution + wall-clock | GPU0=42, GPU1=29, intersection=0, wall-clock=0:05.70, 219 audit entries | **PASS** |
 
 ## Phase 10 Fix Verification

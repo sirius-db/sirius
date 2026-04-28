@@ -22,12 +22,11 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
-#include <cucascade/data/disk_io_backend.hpp>
-
 #include <rmm/detail/error.hpp>
 
 #include <cuda_runtime_api.h>
 
+#include <cucascade/data/disk_io_backend.hpp>
 #include <duckdb/common/multi_file/multi_file_states.hpp>
 #include <io/cucascade_datasource.hpp>
 #include <log/logging.hpp>
@@ -72,8 +71,7 @@ void read_positional_delete_file(std::string const& delete_file_path,
   sirius::io::cucascade_datasource ds{
     std::move(backend), std::filesystem::path{delete_file_path}, file_size};
 
-  auto opts =
-    cudf::io::parquet_reader_options::builder(cudf::io::source_info{&ds}).build();
+  auto opts   = cudf::io::parquet_reader_options::builder(cudf::io::source_info{&ds}).build();
   auto result = cudf::io::read_parquet(opts, stream);
 
   if (!result.tbl || result.tbl->num_rows() == 0) { return; }
@@ -150,8 +148,7 @@ std::pair<std::unique_ptr<cudf::table>, std::vector<std::string>> read_equality_
   sirius::io::cucascade_datasource ds{
     std::move(backend), std::filesystem::path{delete_file_path}, file_size};
 
-  auto opts =
-    cudf::io::parquet_reader_options::builder(cudf::io::source_info{&ds}).build();
+  auto opts   = cudf::io::parquet_reader_options::builder(cudf::io::source_info{&ds}).build();
   auto result = cudf::io::read_parquet(opts, stream);
 
   if (!result.tbl) {

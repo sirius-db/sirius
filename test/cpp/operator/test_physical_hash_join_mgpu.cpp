@@ -45,14 +45,15 @@
 
 #include "mgpu_test_utils.hpp"
 
-#include <catch.hpp>
 #include <cuda_runtime.h>
+
+#include <catch.hpp>
 #include <duckdb.hpp>
+#include <unistd.h>
 
 #include <cstdlib>
 #include <filesystem>
 #include <string>
-#include <unistd.h>
 
 namespace fs = std::filesystem;
 
@@ -132,11 +133,11 @@ TEST_CASE("physical_hash_join - BUILD_PROBE probe-heavy join across two GPUs",
   scoped_log_dir logs(tmp / "log");
 
   mgpu_env_params params{};
-  params.cache                       = "none";
-  params.hash_partition_bytes        = 1'000'000;
-  params.pipeline_num_threads        = 4;
-  params.task_creator_num_threads    = 4;
-  auto yaml_path = tmp / "fu17-hj.yaml";
+  params.cache                    = "none";
+  params.hash_partition_bytes     = 1'000'000;
+  params.pipeline_num_threads     = 4;
+  params.task_creator_num_threads = 4;
+  auto yaml_path                  = tmp / "fu17-hj.yaml";
   write_mgpu_yaml(yaml_path, params);
 
   scoped_mgpu_env env(yaml_path);
@@ -147,8 +148,12 @@ TEST_CASE("physical_hash_join - BUILD_PROBE probe-heavy join across two GPUs",
   // well under the threshold.
   auto inner_query =
     "SELECT probe.k, probe.v, build.v AS build_v "
-    "FROM read_parquet('" + parquet_glob(probe_dir) + "') AS probe "
-    "JOIN read_parquet('" + parquet_glob(build_dir) + "') AS build "
+    "FROM read_parquet('" +
+    parquet_glob(probe_dir) +
+    "') AS probe "
+    "JOIN read_parquet('" +
+    parquet_glob(build_dir) +
+    "') AS build "
     "  ON probe.k = build.k "
     "ORDER BY probe.k, probe.v "
     "LIMIT 100";
@@ -165,11 +170,10 @@ TEST_CASE("physical_hash_join - BUILD_PROBE probe-heavy join across two GPUs",
   // results. require_gpu_matches_cpu above would have failed in that case;
   // we still parse the log for both-GPU visibility as a secondary signal.
   auto counts = parse_audit_log(logs.path());
-  INFO("per-GPU audit counts: "
-       << "GPU0{pipeline=" << counts[0].pipeline_ids.size()
-       << ", scan=" << counts[0].scan_ids.size() << "} "
-       << "GPU1{pipeline=" << counts[1].pipeline_ids.size()
-       << ", scan=" << counts[1].scan_ids.size() << "}");
+  INFO("per-GPU audit counts: " << "GPU0{pipeline=" << counts[0].pipeline_ids.size()
+                                << ", scan=" << counts[0].scan_ids.size() << "} "
+                                << "GPU1{pipeline=" << counts[1].pipeline_ids.size()
+                                << ", scan=" << counts[1].scan_ids.size() << "}");
 
   // Both GPUs saw SOME scan work (scan is RR-distributed regardless of
   // BUILD_PROBE pinning). We don't require both GPUs to see pipeline
@@ -207,22 +211,26 @@ TEST_CASE("physical_hash_join - MIXED_JOIN large-vs-large join distributes parti
   scoped_log_dir logs(tmp / "log");
 
   mgpu_env_params params{};
-  params.cache                       = "none";
-  params.hash_partition_bytes        = 1'000'000;
+  params.cache                = "none";
+  params.hash_partition_bytes = 1'000'000;
   // Force MIXED_JOIN by lowering max_build_hash_table_bytes below our
   // 64 MiB per-side surface.
-  params.max_build_hash_table_bytes  = 1'000'000;
-  params.pipeline_num_threads        = 4;
-  params.task_creator_num_threads    = 4;
-  auto yaml_path = tmp / "fu17-mj.yaml";
+  params.max_build_hash_table_bytes = 1'000'000;
+  params.pipeline_num_threads       = 4;
+  params.task_creator_num_threads   = 4;
+  auto yaml_path                    = tmp / "fu17-mj.yaml";
   write_mgpu_yaml(yaml_path, params);
 
   scoped_mgpu_env env(yaml_path);
 
   auto inner_query =
     "SELECT l.k, COUNT(*) AS n "
-    "FROM read_parquet('" + parquet_glob(left_dir) + "') AS l "
-    "JOIN read_parquet('" + parquet_glob(right_dir) + "') AS r "
+    "FROM read_parquet('" +
+    parquet_glob(left_dir) +
+    "') AS l "
+    "JOIN read_parquet('" +
+    parquet_glob(right_dir) +
+    "') AS r "
     "  ON l.k = r.k "
     "GROUP BY l.k "
     "ORDER BY l.k "
@@ -234,11 +242,10 @@ TEST_CASE("physical_hash_join - MIXED_JOIN large-vs-large join distributes parti
   }
 
   auto counts = parse_audit_log(logs.path());
-  INFO("per-GPU audit counts: "
-       << "GPU0{pipeline=" << counts[0].pipeline_ids.size()
-       << ", scan=" << counts[0].scan_ids.size() << "} "
-       << "GPU1{pipeline=" << counts[1].pipeline_ids.size()
-       << ", scan=" << counts[1].scan_ids.size() << "}");
+  INFO("per-GPU audit counts: " << "GPU0{pipeline=" << counts[0].pipeline_ids.size()
+                                << ", scan=" << counts[0].scan_ids.size() << "} "
+                                << "GPU1{pipeline=" << counts[1].pipeline_ids.size()
+                                << ", scan=" << counts[1].scan_ids.size() << "}");
 
   // MIXED_JOIN with >=2 partitions (enforced by the num_gpus floor in
   // sirius_physical_partition::determine_num_partitions) must schedule
@@ -273,19 +280,23 @@ TEST_CASE("physical_hash_join - repeated BUILD_PROBE queries don't wedge on left
   scoped_log_dir logs(tmp / "log");
 
   mgpu_env_params params{};
-  params.cache                       = "none";
-  params.hash_partition_bytes        = 1'000'000;
-  params.pipeline_num_threads        = 4;
-  params.task_creator_num_threads    = 4;
-  auto yaml_path = tmp / "fu17-hj-repeat.yaml";
+  params.cache                    = "none";
+  params.hash_partition_bytes     = 1'000'000;
+  params.pipeline_num_threads     = 4;
+  params.task_creator_num_threads = 4;
+  auto yaml_path                  = tmp / "fu17-hj-repeat.yaml";
   write_mgpu_yaml(yaml_path, params);
 
   scoped_mgpu_env env(yaml_path);
 
   auto inner_query =
     "SELECT probe.k, build.v AS build_v "
-    "FROM read_parquet('" + parquet_glob(probe_dir) + "') AS probe "
-    "JOIN read_parquet('" + parquet_glob(build_dir) + "') AS build "
+    "FROM read_parquet('" +
+    parquet_glob(probe_dir) +
+    "') AS probe "
+    "JOIN read_parquet('" +
+    parquet_glob(build_dir) +
+    "') AS build "
     "  ON probe.k = build.k "
     "ORDER BY probe.k "
     "LIMIT 50";
@@ -356,18 +367,16 @@ bisect_surface make_bisect_surface(std::string const& tag, std::string const& ca
   // (0..49999), and ps_supplycost is `range` cast to double so SUM is unique
   // per partkey — needed so ORDER BY value DESC has no ties and the
   // comparison oracle can deterministically match top-N row sets against CPU.
-  generate_parquet_surface(
-    s.ps_dir,
-    "SELECT range AS ps_partkey, (range % 50000) AS ps_suppkey, "
-    "       CAST(range AS DOUBLE) AS ps_supplycost, "
-    "       CAST(1 AS DOUBLE) AS ps_availqty "
-    "FROM range(2000000)",
-    /*num_files=*/8);
-  generate_parquet_surface(
-    s.s_dir,
-    "SELECT range AS s_suppkey, (range % 25) AS s_nationkey "
-    "FROM range(50000)",
-    /*num_files=*/4);
+  generate_parquet_surface(s.ps_dir,
+                           "SELECT range AS ps_partkey, (range % 50000) AS ps_suppkey, "
+                           "       CAST(range AS DOUBLE) AS ps_supplycost, "
+                           "       CAST(1 AS DOUBLE) AS ps_availqty "
+                           "FROM range(2000000)",
+                           /*num_files=*/8);
+  generate_parquet_surface(s.s_dir,
+                           "SELECT range AS s_suppkey, (range % 25) AS s_nationkey "
+                           "FROM range(50000)",
+                           /*num_files=*/4);
   generate_parquet_surface(
     s.n_dir,
     "SELECT range AS n_nationkey, CASE WHEN range = 7 THEN 'GERMANY' "
@@ -379,13 +388,13 @@ bisect_surface make_bisect_surface(std::string const& tag, std::string const& ca
   s.logs    = std::make_unique<scoped_log_dir>(s.log_dir);
 
   mgpu_env_params params{};
-  params.cache                       = cache;
-  params.hash_partition_bytes        = 10'000'000;
-  params.max_build_hash_table_bytes  = 90'000'000;
-  params.pipeline_num_threads        = 8;
-  params.task_creator_num_threads    = 4;
-  params.duckdb_scan_num_threads     = 4;
-  s.yaml_path = s.tmp / "bisect.yaml";
+  params.cache                      = cache;
+  params.hash_partition_bytes       = 10'000'000;
+  params.max_build_hash_table_bytes = 90'000'000;
+  params.pipeline_num_threads       = 8;
+  params.task_creator_num_threads   = 4;
+  params.duckdb_scan_num_threads    = 4;
+  s.yaml_path                       = s.tmp / "bisect.yaml";
   write_mgpu_yaml(s.yaml_path, params);
 
   s.glob_ps = parquet_glob(s.ps_dir);
@@ -404,14 +413,21 @@ TEST_CASE("hash_join bisect 1 - simple JOIN+GROUP BY+ORDER BY, cache=none",
   if (!require_two_gpus()) return;
   auto s = make_bisect_surface("1", "none");
 
-  auto q = "SELECT ps_partkey, SUM(ps_supplycost * ps_availqty) AS value "
-           "FROM read_parquet('" + s.glob_ps + "') ps "
-           "JOIN read_parquet('" + s.glob_s + "') sup ON ps.ps_suppkey = sup.s_suppkey "
-           "JOIN read_parquet('" + s.glob_n + "') n ON sup.s_nationkey = n.n_nationkey "
-           "WHERE n.n_name = 'GERMANY' "
-           "GROUP BY ps_partkey "
-           "ORDER BY value DESC "
-           "LIMIT 20";
+  auto q =
+    "SELECT ps_partkey, SUM(ps_supplycost * ps_availqty) AS value "
+    "FROM read_parquet('" +
+    s.glob_ps +
+    "') ps "
+    "JOIN read_parquet('" +
+    s.glob_s +
+    "') sup ON ps.ps_suppkey = sup.s_suppkey "
+    "JOIN read_parquet('" +
+    s.glob_n +
+    "') n ON sup.s_nationkey = n.n_nationkey "
+    "WHERE n.n_name = 'GERMANY' "
+    "GROUP BY ps_partkey "
+    "ORDER BY value DESC "
+    "LIMIT 20";
   {
     auto con = s.env->make_connection();
     require_gpu_matches_cpu(con, q);
@@ -428,14 +444,21 @@ TEST_CASE("hash_join bisect 2 - simple JOIN+GROUP BY+ORDER BY, cache=table_gpu",
   if (!require_two_gpus()) return;
   auto s = make_bisect_surface("2", "table_gpu");
 
-  auto q = "SELECT ps_partkey, SUM(ps_supplycost * ps_availqty) AS value "
-           "FROM read_parquet('" + s.glob_ps + "') ps "
-           "JOIN read_parquet('" + s.glob_s + "') sup ON ps.ps_suppkey = sup.s_suppkey "
-           "JOIN read_parquet('" + s.glob_n + "') n ON sup.s_nationkey = n.n_nationkey "
-           "WHERE n.n_name = 'GERMANY' "
-           "GROUP BY ps_partkey "
-           "ORDER BY value DESC "
-           "LIMIT 20";
+  auto q =
+    "SELECT ps_partkey, SUM(ps_supplycost * ps_availqty) AS value "
+    "FROM read_parquet('" +
+    s.glob_ps +
+    "') ps "
+    "JOIN read_parquet('" +
+    s.glob_s +
+    "') sup ON ps.ps_suppkey = sup.s_suppkey "
+    "JOIN read_parquet('" +
+    s.glob_n +
+    "') n ON sup.s_nationkey = n.n_nationkey "
+    "WHERE n.n_name = 'GERMANY' "
+    "GROUP BY ps_partkey "
+    "ORDER BY value DESC "
+    "LIMIT 20";
   {
     auto con = s.env->make_connection();
     require_gpu_matches_cpu(con, q);
@@ -452,21 +475,34 @@ TEST_CASE("hash_join bisect 3 - Q11 shape with HAVING subquery, cache=none",
   if (!require_two_gpus()) return;
   auto s = make_bisect_surface("3", "none");
 
-  auto q = "SELECT ps_partkey, SUM(ps_supplycost * ps_availqty) AS value "
-           "FROM read_parquet('" + s.glob_ps + "') ps "
-           "JOIN read_parquet('" + s.glob_s + "') sup ON ps.ps_suppkey = sup.s_suppkey "
-           "JOIN read_parquet('" + s.glob_n + "') n ON sup.s_nationkey = n.n_nationkey "
-           "WHERE n.n_name = 'GERMANY' "
-           "GROUP BY ps_partkey "
-           "HAVING SUM(ps_supplycost * ps_availqty) > ("
-           "  SELECT SUM(ps_supplycost * ps_availqty) * 0.00001 "
-           "  FROM read_parquet('" + s.glob_ps + "') ps "
-           "  JOIN read_parquet('" + s.glob_s + "') sup ON ps.ps_suppkey = sup.s_suppkey "
-           "  JOIN read_parquet('" + s.glob_n + "') n ON sup.s_nationkey = n.n_nationkey "
-           "  WHERE n.n_name = 'GERMANY'"
-           ") "
-           "ORDER BY value DESC "
-           "LIMIT 20";
+  auto q =
+    "SELECT ps_partkey, SUM(ps_supplycost * ps_availqty) AS value "
+    "FROM read_parquet('" +
+    s.glob_ps +
+    "') ps "
+    "JOIN read_parquet('" +
+    s.glob_s +
+    "') sup ON ps.ps_suppkey = sup.s_suppkey "
+    "JOIN read_parquet('" +
+    s.glob_n +
+    "') n ON sup.s_nationkey = n.n_nationkey "
+    "WHERE n.n_name = 'GERMANY' "
+    "GROUP BY ps_partkey "
+    "HAVING SUM(ps_supplycost * ps_availqty) > ("
+    "  SELECT SUM(ps_supplycost * ps_availqty) * 0.00001 "
+    "  FROM read_parquet('" +
+    s.glob_ps +
+    "') ps "
+    "  JOIN read_parquet('" +
+    s.glob_s +
+    "') sup ON ps.ps_suppkey = sup.s_suppkey "
+    "  JOIN read_parquet('" +
+    s.glob_n +
+    "') n ON sup.s_nationkey = n.n_nationkey "
+    "  WHERE n.n_name = 'GERMANY'"
+    ") "
+    "ORDER BY value DESC "
+    "LIMIT 20";
   {
     auto con = s.env->make_connection();
     require_gpu_matches_cpu(con, q);
@@ -524,18 +560,16 @@ TEST_CASE("physical_hash_join - follow-up #17 scale-up: Q11-like BUILD_PROBE wit
   // ps_supplycost = range, ps_availqty = 1.0 → SUM per partkey is `range` and
   // thus unique; ORDER BY value DESC has no ties so the comparison oracle
   // matches row sets deterministically.
-  generate_parquet_surface(
-    ps_dir,
-    "SELECT range AS ps_partkey, (range % 50000) AS ps_suppkey, "
-    "       CAST(range AS DOUBLE) AS ps_supplycost, "
-    "       CAST(1 AS DOUBLE) AS ps_availqty "
-    "FROM range(2000000)",
-    /*num_files=*/8);
-  generate_parquet_surface(
-    s_dir,
-    "SELECT range AS s_suppkey, (range % 25) AS s_nationkey "
-    "FROM range(50000)",
-    /*num_files=*/4);
+  generate_parquet_surface(ps_dir,
+                           "SELECT range AS ps_partkey, (range % 50000) AS ps_suppkey, "
+                           "       CAST(range AS DOUBLE) AS ps_supplycost, "
+                           "       CAST(1 AS DOUBLE) AS ps_availqty "
+                           "FROM range(2000000)",
+                           /*num_files=*/8);
+  generate_parquet_surface(s_dir,
+                           "SELECT range AS s_suppkey, (range % 25) AS s_nationkey "
+                           "FROM range(50000)",
+                           /*num_files=*/4);
   generate_parquet_surface(
     n_dir,
     "SELECT range AS n_nationkey, CASE WHEN range = 7 THEN 'GERMANY' "
@@ -546,13 +580,13 @@ TEST_CASE("physical_hash_join - follow-up #17 scale-up: Q11-like BUILD_PROBE wit
   scoped_log_dir logs(tmp / "log");
 
   mgpu_env_params params{};
-  params.cache                       = "table_gpu";
-  params.hash_partition_bytes        = 10'000'000;
-  params.max_build_hash_table_bytes  = 90'000'000;
-  params.pipeline_num_threads        = 8;
-  params.task_creator_num_threads    = 4;
-  params.duckdb_scan_num_threads     = 4;
-  auto yaml_path = tmp / "fu17-scaleup.yaml";
+  params.cache                      = "table_gpu";
+  params.hash_partition_bytes       = 10'000'000;
+  params.max_build_hash_table_bytes = 90'000'000;
+  params.pipeline_num_threads       = 8;
+  params.task_creator_num_threads   = 4;
+  params.duckdb_scan_num_threads    = 4;
+  auto yaml_path                    = tmp / "fu17-scaleup.yaml";
   write_mgpu_yaml(yaml_path, params);
 
   scoped_mgpu_env env(yaml_path);
@@ -567,16 +601,28 @@ TEST_CASE("physical_hash_join - follow-up #17 scale-up: Q11-like BUILD_PROBE wit
   //   - the SCHEDULED state race window while the build task is running
   auto inner_query =
     "SELECT ps_partkey, SUM(ps_supplycost * ps_availqty) AS value "
-    "FROM read_parquet('" + parquet_glob(ps_dir) + "') ps "
-    "JOIN read_parquet('" + parquet_glob(s_dir) + "') s ON ps.ps_suppkey = s.s_suppkey "
-    "JOIN read_parquet('" + parquet_glob(n_dir) + "') n ON s.s_nationkey = n.n_nationkey "
+    "FROM read_parquet('" +
+    parquet_glob(ps_dir) +
+    "') ps "
+    "JOIN read_parquet('" +
+    parquet_glob(s_dir) +
+    "') s ON ps.ps_suppkey = s.s_suppkey "
+    "JOIN read_parquet('" +
+    parquet_glob(n_dir) +
+    "') n ON s.s_nationkey = n.n_nationkey "
     "WHERE n.n_name = 'GERMANY' "
     "GROUP BY ps_partkey "
     "HAVING SUM(ps_supplycost * ps_availqty) > ("
     "  SELECT SUM(ps_supplycost * ps_availqty) * 0.00001 "
-    "  FROM read_parquet('" + parquet_glob(ps_dir) + "') ps "
-    "  JOIN read_parquet('" + parquet_glob(s_dir) + "') s ON ps.ps_suppkey = s.s_suppkey "
-    "  JOIN read_parquet('" + parquet_glob(n_dir) + "') n ON s.s_nationkey = n.n_nationkey "
+    "  FROM read_parquet('" +
+    parquet_glob(ps_dir) +
+    "') ps "
+    "  JOIN read_parquet('" +
+    parquet_glob(s_dir) +
+    "') s ON ps.ps_suppkey = s.s_suppkey "
+    "  JOIN read_parquet('" +
+    parquet_glob(n_dir) +
+    "') n ON s.s_nationkey = n.n_nationkey "
     "  WHERE n.n_name = 'GERMANY'"
     ") "
     "ORDER BY value DESC "
@@ -596,11 +642,10 @@ TEST_CASE("physical_hash_join - follow-up #17 scale-up: Q11-like BUILD_PROBE wit
   }
 
   auto counts = parse_audit_log(logs.path());
-  INFO("per-GPU audit counts: "
-       << "GPU0{pipeline=" << counts[0].pipeline_ids.size()
-       << ", scan=" << counts[0].scan_ids.size() << "} "
-       << "GPU1{pipeline=" << counts[1].pipeline_ids.size()
-       << ", scan=" << counts[1].scan_ids.size() << "}");
+  INFO("per-GPU audit counts: " << "GPU0{pipeline=" << counts[0].pipeline_ids.size()
+                                << ", scan=" << counts[0].scan_ids.size() << "} "
+                                << "GPU1{pipeline=" << counts[1].pipeline_ids.size()
+                                << ", scan=" << counts[1].scan_ids.size() << "}");
   REQUIRE(counts[0].scan_ids.size() >= 1);
   REQUIRE(counts[1].scan_ids.size() >= 1);
 

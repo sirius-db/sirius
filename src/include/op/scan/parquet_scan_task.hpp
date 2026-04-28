@@ -435,10 +435,10 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
 
   std::shared_ptr<std::unordered_map<int, gpu_expression_translator::translated_expression>>
     _translated_filter_by_device;  ///< Per-GPU translated filter expressions, keyed by
-                                    ///< device_id. Each entry's cudf::scalar device buffers
-                                    ///< live on that specific device so tasks dispatched
-                                    ///< across GPUs can evaluate the AST against memory
-                                    ///< accessible from the task's current device.
+                                   ///< device_id. Each entry's cudf::scalar device buffers
+                                   ///< live on that specific device so tasks dispatched
+                                   ///< across GPUs can evaluate the AST against memory
+                                   ///< accessible from the task's current device.
   std::vector<std::size_t>
     _post_filter_projection_ids;  ///< The indices of projected columns in the reader output
 
@@ -572,10 +572,7 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_task_loca
    * scan tasks for the same pipeline on different GPUs.
    */
   void set_preferred_device_id(int device_id) { _preferred_device_id = device_id; }
-  [[nodiscard]] std::optional<int> get_preferred_device_id() const
-  {
-    return _preferred_device_id;
-  }
+  [[nodiscard]] std::optional<int> get_preferred_device_id() const { return _preferred_device_id; }
 
  private:
   parquet_scan_task_global_state::row_group_range _partition;  ///< Assigned row-group partition

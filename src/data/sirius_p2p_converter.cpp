@@ -24,10 +24,11 @@
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 
+#include <cuda_runtime_api.h>
+
 #include <spdlog/spdlog.h>
 
 #include <cstdint>
-#include <cuda_runtime_api.h>
 #include <stdexcept>
 
 namespace sirius::data {
@@ -86,21 +87,19 @@ std::unique_ptr<cucascade::idata_representation> sirius_p2p_converter_factory(
   //
   // cudaMemcpyPeerAsync accepts src/dst pointers from different device
   // contexts; the current device does not need to match src or dst.
-  cudaError_t peer_err = cudaMemcpyPeerAsync(
-    dst_uvector.data(),
-    target_device_id,
-    static_cast<const uint8_t*>(packed.gpu_data->data()),
-    source_device_id,
-    bytes_to_copy,
-    target_stream.value());
+  cudaError_t peer_err = cudaMemcpyPeerAsync(dst_uvector.data(),
+                                             target_device_id,
+                                             static_cast<const uint8_t*>(packed.gpu_data->data()),
+                                             source_device_id,
+                                             bytes_to_copy,
+                                             target_stream.value());
   if (peer_err != cudaSuccess) {
     // Consume any sticky state before reporting.
     (void)cudaGetLastError();
     throw std::runtime_error(
-      std::string("sirius_p2p_converter: cudaMemcpyPeerAsync ")
-      + std::to_string(source_device_id) + " -> " + std::to_string(target_device_id)
-      + " failed: " + cudaGetErrorString(peer_err)
-      + " (MGPU-06; verify driver-level peer access is enabled for this pair)");
+      std::string("sirius_p2p_converter: cudaMemcpyPeerAsync ") + std::to_string(source_device_id) +
+      " -> " + std::to_string(target_device_id) + " failed: " + cudaGetErrorString(peer_err) +
+      " (MGPU-06; verify driver-level peer access is enabled for this pair)");
   }
 
   // Sync target_stream so the peer-copied bytes are stable on target_device
@@ -121,8 +120,7 @@ std::unique_ptr<cucascade::idata_representation> sirius_p2p_converter_factory(
   target_stream.synchronize();
 
   return std::make_unique<cucascade::gpu_table_representation>(
-    std::move(new_table),
-    *const_cast<cucascade::memory::memory_space*>(target_memory_space));
+    std::move(new_table), *const_cast<cucascade::memory::memory_space*>(target_memory_space));
 }
 
 }  // namespace sirius::data

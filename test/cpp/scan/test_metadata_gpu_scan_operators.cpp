@@ -70,8 +70,7 @@ inline std::shared_ptr<cucascade::idisk_io_backend> make_test_io_backend()
 {
   static cucascade::io_backend_registry registry;
   static std::once_flag registry_init_flag;
-  std::call_once(registry_init_flag,
-                 [&] { cucascade::register_builtin_io_backends(registry); });
+  std::call_once(registry_init_flag, [&] { cucascade::register_builtin_io_backends(registry); });
   return registry.create_default_backend();
 }
 

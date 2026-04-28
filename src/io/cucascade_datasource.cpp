@@ -54,8 +54,8 @@ struct pinned_host_buffer {
   explicit pinned_host_buffer(std::size_t n) : _bytes(n)
   {
     if (n == 0) { return; }
-    void* p         = nullptr;
-    auto const err  = cudaMallocHost(&p, n);
+    void* p        = nullptr;
+    auto const err = cudaMallocHost(&p, n);
     if (err != cudaSuccess) {
       throw std::runtime_error(std::string("cucascade_datasource: cudaMallocHost failed: ") +
                                cudaGetErrorString(err));
@@ -71,8 +71,7 @@ struct pinned_host_buffer {
   pinned_host_buffer(pinned_host_buffer const&)            = delete;
   pinned_host_buffer& operator=(pinned_host_buffer const&) = delete;
 
-  pinned_host_buffer(pinned_host_buffer&& other) noexcept
-    : _ptr(other._ptr), _bytes(other._bytes)
+  pinned_host_buffer(pinned_host_buffer&& other) noexcept : _ptr(other._ptr), _bytes(other._bytes)
   {
     other._ptr   = nullptr;
     other._bytes = 0;
@@ -190,8 +189,8 @@ std::future<std::size_t> cucascade_datasource::host_read_async(std::size_t offse
   });
 }
 
-std::future<std::unique_ptr<cudf::io::datasource::buffer>>
-cucascade_datasource::host_read_async(std::size_t offset, std::size_t size)
+std::future<std::unique_ptr<cudf::io::datasource::buffer>> cucascade_datasource::host_read_async(
+  std::size_t offset, std::size_t size)
 {
   return std::async(std::launch::async,
                     [this, offset, size]() -> std::unique_ptr<cudf::io::datasource::buffer> {

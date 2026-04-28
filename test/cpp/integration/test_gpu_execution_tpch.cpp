@@ -17,6 +17,7 @@
 #include "op/sirius_physical_partition.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
+
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
@@ -157,9 +158,9 @@ class GPUExecutionFixtureBase {
     static const char* kTables[] = {
       "lineitem", "orders", "customer", "nation", "region", "part", "partsupp", "supplier"};
     for (auto* t : kTables) {
-      auto r = con->Query("CREATE OR REPLACE VIEW " + std::string{t} +
-                          " AS SELECT * FROM read_parquet('" + base + "/" + std::string{t} +
-                          ".parquet');");
+      auto r =
+        con->Query("CREATE OR REPLACE VIEW " + std::string{t} + " AS SELECT * FROM read_parquet('" +
+                   base + "/" + std::string{t} + ".parquet');");
       REQUIRE(r);
       REQUIRE_FALSE(r->HasError());
     }
@@ -3340,11 +3341,11 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 // This expands each TEST_CASE to run twice; per AUDIT-03, the 2-GPU variant
 // MUST execute in the default unit-tests run, so no [.] hide-tag is applied.
 //===----------------------------------------------------------------------===//
-#define RUN_TPCH_MGPU(...)                                                \
-  do {                                                                    \
-    auto const num_gpus = GENERATE(1, 2);                                 \
-    CAPTURE(num_gpus);                                                    \
-    if (!compare_gpu_vs_cpu_for(num_gpus, __VA_ARGS__)) { return; }       \
+#define RUN_TPCH_MGPU(...)                                          \
+  do {                                                              \
+    auto const num_gpus = GENERATE(1, 2);                           \
+    CAPTURE(num_gpus);                                              \
+    if (!compare_gpu_vs_cpu_for(num_gpus, __VA_ARGS__)) { return; } \
   } while (0)
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
@@ -3493,9 +3494,10 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
   try {
     if (!compare_gpu_vs_cpu_for(num_gpus, kTpchQ4Body)) { return; }
   } catch (std::exception const& first_err) {
-    WARN("tpch_q4 first attempt failed (pre-existing flake per ROADMAP Phase 8 "
-         "Success Criterion 2); retrying once: "
-         << first_err.what());
+    WARN(
+      "tpch_q4 first attempt failed (pre-existing flake per ROADMAP Phase 8 "
+      "Success Criterion 2); retrying once: "
+      << first_err.what());
     if (!compare_gpu_vs_cpu_for(num_gpus, kTpchQ4Body)) { return; }
   }
 }
@@ -3509,9 +3511,10 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
   try {
     if (!compare_gpu_vs_cpu_for(num_gpus, kTpchQ4Body)) { return; }
   } catch (std::exception const& first_err) {
-    WARN("tpch_q4 parquet first attempt failed (pre-existing flake per ROADMAP "
-         "Phase 8 Success Criterion 2); retrying once: "
-         << first_err.what());
+    WARN(
+      "tpch_q4 parquet first attempt failed (pre-existing flake per ROADMAP "
+      "Phase 8 Success Criterion 2); retrying once: "
+      << first_err.what());
     if (!compare_gpu_vs_cpu_for(num_gpus, kTpchQ4Body)) { return; }
   }
 }

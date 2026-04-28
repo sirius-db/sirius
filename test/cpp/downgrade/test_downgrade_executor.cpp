@@ -153,7 +153,7 @@ inline bool enable_p2p_for_test(int num_gpus)
  * CUCASCADE_CUDA_TRY) per test-code convention.
  */
 uint64_t compute_batch_checksum_fnv1a64(const cucascade::data_batch& batch,
-                                         rmm::cuda_stream_view stream)
+                                        rmm::cuda_stream_view stream)
 {
   auto const& gpu_rep = batch.get_data()->cast<cucascade::gpu_table_representation>();
   auto packed         = cudf::pack(gpu_rep.get_table(), stream);
@@ -161,11 +161,8 @@ uint64_t compute_batch_checksum_fnv1a64(const cucascade::data_batch& batch,
 
   auto const bytes = packed.gpu_data->size();
   std::vector<uint8_t> host_buf(bytes);
-  cudaMemcpyAsync(host_buf.data(),
-                  packed.gpu_data->data(),
-                  bytes,
-                  cudaMemcpyDeviceToHost,
-                  stream.value());
+  cudaMemcpyAsync(
+    host_buf.data(), packed.gpu_data->data(), bytes, cudaMemcpyDeviceToHost, stream.value());
   stream.synchronize();
 
   uint64_t h = 0xcbf29ce484222325ULL;
@@ -642,7 +639,7 @@ TEST_CASE("gpu_to_gpu_transfer_via_converter", "[multi_gpu_transfer]")
   // Hopper/Blackwell GPUs (which fix the PCIe write-ordering dependency).
   auto checksum_post = compute_batch_checksum_fnv1a64(*batch, stream);
   INFO("MGPU-06 data integrity: checksum_pre=" << checksum_pre
-                                                << " checksum_post=" << checksum_post);
+                                               << " checksum_post=" << checksum_post);
   REQUIRE(checksum_post == checksum_pre);
 
   sirius::converter_registry::shutdown();
@@ -987,8 +984,7 @@ TEST_CASE("p2p_transfer_converter_round_trip", "[mem_04_p2p_transfer][multi_gpu]
   // fails on an Ada Lovelace + Intel Xeon Sapphire Rapids (or later) host,
   // see Pitfall 2 in .planning/phases/07-*/07-RESEARCH.md.
   auto checksum_post = compute_batch_checksum_fnv1a64(*batch, stream);
-  INFO("MGPU-06 P2P round-trip checksum: pre=" << checksum_pre
-                                                << " post=" << checksum_post);
+  INFO("MGPU-06 P2P round-trip checksum: pre=" << checksum_pre << " post=" << checksum_post);
   REQUIRE(checksum_post == checksum_pre);
 
   sirius::converter_registry::shutdown();
@@ -1051,9 +1047,8 @@ TEST_CASE("scan_distribution_memory_proportional (MGPU-07)",
   // (get_available_memory = capacity - allocated).
   // RAII: std::unique_ptr<cucascade::memory::reservation> releases on scope exit.
   const size_t gpu0_max_reservable = gpu0->get_max_memory();
-  const size_t preload_bytes =
-    static_cast<size_t>(0.9 * static_cast<double>(gpu0_max_reservable));
-  auto preload_reservation = gpu0->make_reservation_or_null(preload_bytes);
+  const size_t preload_bytes = static_cast<size_t>(0.9 * static_cast<double>(gpu0_max_reservable));
+  auto preload_reservation   = gpu0->make_reservation_or_null(preload_bytes);
   REQUIRE(preload_reservation != nullptr);
 
   // Re-query free memory on both GPUs. GPU 1 should have >= 2x the free memory
@@ -1062,12 +1057,11 @@ TEST_CASE("scan_distribution_memory_proportional (MGPU-07)",
   const size_t free1 = gpu1->get_available_memory();
   REQUIRE(free0 > 0);  // should have ~20% remaining
   REQUIRE(free1 > 0);
-  const double free_ratio_gpu1_over_gpu0 =
-    static_cast<double>(free1) / static_cast<double>(free0);
+  const double free_ratio_gpu1_over_gpu0 = static_cast<double>(free1) / static_cast<double>(free0);
   INFO("MGPU-07 preload: gpu0_initial=" << gpu0_initial << " gpu1_initial=" << gpu1_initial
-                                         << " preload=" << preload_bytes << " free0=" << free0
-                                         << " free1=" << free1
-                                         << " free_ratio_gpu1_over_gpu0=" << free_ratio_gpu1_over_gpu0);
+                                        << " preload=" << preload_bytes << " free0=" << free0
+                                        << " free1=" << free1 << " free_ratio_gpu1_over_gpu0="
+                                        << free_ratio_gpu1_over_gpu0);
   REQUIRE(free_ratio_gpu1_over_gpu0 >= 2.0);
 
   // Run a histogram over 32 distribution decisions using the SAME weighted-pick
@@ -1089,7 +1083,7 @@ TEST_CASE("scan_distribution_memory_proportional (MGPU-07)",
   // large query's batch stream (the production code expects many thousands of
   // calls).
   std::vector<cucascade::memory::memory_space*> spaces = {gpu0, gpu1};
-  size_t total_available                                = 0;
+  size_t total_available                               = 0;
   for (auto* s : spaces) {
     total_available += s->get_available_memory();
   }
@@ -1124,11 +1118,10 @@ TEST_CASE("scan_distribution_memory_proportional (MGPU-07)",
     static_cast<double>(count_gpu1) / static_cast<double>(std::max(count_gpu0, 1));
   REQUIRE(batch_ratio >= 2.0);  // CONTEXT success criterion 3: skew >= 2x
 
-  const double delta = std::abs(batch_ratio - free_ratio_gpu1_over_gpu0) /
-                       free_ratio_gpu1_over_gpu0;
-  INFO("MGPU-07 ratio check: batch_ratio=" << batch_ratio
-                                            << " expected=" << free_ratio_gpu1_over_gpu0
-                                            << " delta=" << delta);
+  const double delta =
+    std::abs(batch_ratio - free_ratio_gpu1_over_gpu0) / free_ratio_gpu1_over_gpu0;
+  INFO("MGPU-07 ratio check: batch_ratio=" << batch_ratio << " expected="
+                                           << free_ratio_gpu1_over_gpu0 << " delta=" << delta);
   REQUIRE(delta <= 0.10);  // within 10% tolerance (CONTEXT lock)
 
   sirius::converter_registry::shutdown();

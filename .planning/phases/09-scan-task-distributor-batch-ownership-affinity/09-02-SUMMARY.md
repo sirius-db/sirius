@@ -203,7 +203,7 @@ Function signature, try/catch block, and all existing control flow UNCHANGED. Bo
 
 **4. [Acceptance Criteria Clarification] grep -c '[mgpu-audit] scan_batch' returns 2, not 1**
 
-- **Found during:** Task 2 post-edit verification  
+- **Found during:** Task 2 post-edit verification
 - **Issue:** The plan's criterion requires count = 1 for `grep -c '\[mgpu-audit\] scan_batch assigned to GPU' src/op/scan/duckdb_scan_executor.cpp`. The actual result is 2 because a comment block at line ~232 contains the text `"[mgpu-audit] scan_batch assigned to GPU N" substring is preserved`. The actual SIRIUS_LOG_INFO emission is the only call site (line 243). The criterion used an unescaped grep pattern that matches both the comment and the real log line.
 - **Impact:** Zero — the real log payload is unchanged. Plan 09-03's regex depends on the runtime log output, not the source code grep count.
 
@@ -216,7 +216,7 @@ Function signature, try/catch block, and all existing control flow UNCHANGED. Bo
 The affinity map (`_batch_gpu_affinity`) is **written** at dispatch time but is **not yet consulted** at dispatch time to re-route tasks. That is:
 
 - If `batch_id=3` was dispatched to GPU 0 (recorded in the map), and a second task attempts to dispatch the same logical batch to GPU 1, the `select_target_gpu()` call will NOT currently read the map to detect the conflict.
-- The map provides the **data structure** for Plan 09-03's disjointness assertion: the test can parse the `[mgpu-audit]` log, extract `batch_id` per GPU, and REQUIRE that the sets are disjoint. If they're not disjoint, the bug is still present at the dispatch level.
+- The map provides the **data structure** for Plan 09-03's disjointedness assertion: the test can parse the `[mgpu-audit]` log, extract `batch_id` per GPU, and REQUIRE that the sets are disjoint. If they're not disjoint, the bug is still present at the dispatch level.
 - The structural prevention of cross-GPU dispatch (reading the map at dispatch time) is deferred to future work (Phase 10+) if Plan 09-04's validation run shows residual cross-GPU collisions after the combined 09-01 (preferred_device_id plumbing) + 09-02 (affinity recording) fixes.
 
 ### Pitfall 3 Compliance

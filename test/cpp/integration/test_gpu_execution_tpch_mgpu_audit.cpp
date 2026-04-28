@@ -38,12 +38,14 @@
 // Single-GPU hosts hit the WARN+return path via cudaGetDeviceCount<2 (per
 // Catch2 v2 convention; mirrors test/cpp/downgrade/test_downgrade_executor.cpp).
 
-#include <catch.hpp>
 #include <cuda_runtime.h>
+
+#include <catch.hpp>
 #include <duckdb.hpp>
+#include <unistd.h>
 #include <utils/sirius_test_env.hpp>
 
-#include <algorithm>  // Phase 9: std::set_intersection for cross-GPU batch_id disjointness
+#include <algorithm>  // Phase 9: std::set_intersection for cross-GPU batch_id disjointedness
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -53,7 +55,6 @@
 #include <regex>
 #include <set>
 #include <string>
-#include <unistd.h>
 
 namespace fs = std::filesystem;
 
@@ -76,8 +77,7 @@ std::map<int, AuditCounts> parse_audit_log(const fs::path& log_dir)
   // Payload examples (verbatim from running code):
   //   [mgpu-audit] pipeline_task dispatched to GPU 0 task_id=17
   //   [mgpu-audit] scan_batch assigned to GPU 1 batch_id=42 (available: 23068672000 bytes)
-  std::regex pipeline_re(
-    R"(\[mgpu-audit\] pipeline_task dispatched to GPU (\d+) task_id=(\S+))");
+  std::regex pipeline_re(R"(\[mgpu-audit\] pipeline_task dispatched to GPU (\d+) task_id=(\S+))");
   std::regex scan_re(R"(\[mgpu-audit\] scan_batch assigned to GPU (\d+) batch_id=(\S+))");
 
   if (!fs::exists(log_dir)) { return by_gpu; }
@@ -143,8 +143,9 @@ TEST_CASE("gpu_execution - [mgpu-audit] per-GPU distribution on TPC-H Q1",
   int device_count = 0;
   cudaGetDeviceCount(&device_count);
   if (device_count < 2) {
-    WARN("[mgpu-audit] AUDIT-01/02/03 requires >=2 GPUs; single-GPU host — skipping "
-         "(per Catch2 v2 WARN+return convention)");
+    WARN(
+      "[mgpu-audit] AUDIT-01/02/03 requires >=2 GPUs; single-GPU host — skipping "
+      "(per Catch2 v2 WARN+return convention)");
     return;
   }
 
@@ -265,7 +266,9 @@ TEST_CASE("gpu_execution - [mgpu-audit] per-GPU distribution on TPC-H Q1",
   INFO("cross-GPU scan_batch intersection size: " << cross_gpu_intersection.size());
   if (!cross_gpu_intersection.empty()) {
     std::string overlap_list;
-    for (auto const& id : cross_gpu_intersection) { overlap_list += id + " "; }
+    for (auto const& id : cross_gpu_intersection) {
+      overlap_list += id + " ";
+    }
     INFO("overlapping batch_ids (GPU 0 ∩ GPU 1): " << overlap_list);
   }
   REQUIRE(cross_gpu_intersection.empty());

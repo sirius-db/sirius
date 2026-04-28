@@ -62,7 +62,7 @@ class mock_io_backend : public cucascade::idisk_io_backend {
     read_host_count.fetch_add(1);
     last_size.store(size);
     last_offset.store(file_offset);
-    last_path = path.string();
+    last_path   = path.string();
     auto* bytes = static_cast<uint8_t*>(host_ptr);
     for (std::size_t i = 0; i < size; ++i) {
       bytes[i] = static_cast<uint8_t>((file_offset + i) & 0xff);
@@ -70,11 +70,8 @@ class mock_io_backend : public cucascade::idisk_io_backend {
   }
 
   // Device read — unused; adapter reports supports_device_read() == false.
-  void read(std::filesystem::path const&,
-            void*,
-            std::size_t,
-            std::size_t,
-            rmm::cuda_stream_view) override
+  void read(
+    std::filesystem::path const&, void*, std::size_t, std::size_t, rmm::cuda_stream_view) override
   {
     read_device_count.fetch_add(1);
   }
@@ -144,8 +141,7 @@ TEST_CASE("cucascade_datasource: constructor rejects invalid inputs",
   SECTION("local path succeeds")
   {
     auto mock = std::make_shared<mock_io_backend>();
-    REQUIRE_NOTHROW(
-      cucascade_datasource(mock, std::filesystem::path{"/tmp/file.parquet"}, 1024));
+    REQUIRE_NOTHROW(cucascade_datasource(mock, std::filesystem::path{"/tmp/file.parquet"}, 1024));
   }
 }
 
@@ -153,8 +149,7 @@ TEST_CASE("cucascade_datasource: constructor rejects invalid inputs",
 // size() + device-read flags (IO-02 contract)
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("cucascade_datasource: size and device-read flags",
-          "[io_backend][cucascade_datasource]")
+TEST_CASE("cucascade_datasource: size and device-read flags", "[io_backend][cucascade_datasource]")
 {
   auto mock = std::make_shared<mock_io_backend>();
   cucascade_datasource ds{mock, std::filesystem::path{"/tmp/f.parquet"}, 8192};
@@ -195,8 +190,7 @@ TEST_CASE("cucascade_datasource: host_read dst overload delegates to backend",
   // Pattern check: mock fills dst with (offset + i) & 0xff.
   REQUIRE(dst[0] == static_cast<uint8_t>(100 & 0xff));
   REQUIRE(dst[1] == static_cast<uint8_t>(101 & 0xff));
-  REQUIRE(dst[dst.size() - 1] ==
-          static_cast<uint8_t>((100 + dst.size() - 1) & 0xff));
+  REQUIRE(dst[dst.size() - 1] == static_cast<uint8_t>((100 + dst.size() - 1) & 0xff));
 }
 
 //===----------------------------------------------------------------------===//
@@ -300,8 +294,8 @@ TEST_CASE("cucascade_datasource: concurrent host_read_async calls both execute",
   cucascade_datasource ds{mock, std::filesystem::path{"/tmp/f.parquet"}, 8192};
 
   std::vector<uint8_t> dst1(128), dst2(128);
-  auto f1      = ds.host_read_async(0, dst1.size(), dst1.data());
-  auto f2      = ds.host_read_async(128, dst2.size(), dst2.data());
+  auto f1       = ds.host_read_async(0, dst1.size(), dst1.data());
+  auto f2       = ds.host_read_async(128, dst2.size(), dst2.data());
   auto const r1 = f1.get();
   auto const r2 = f2.get();
 

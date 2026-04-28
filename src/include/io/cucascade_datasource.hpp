@@ -16,10 +16,11 @@
 
 #pragma once
 
-#include <cucascade/data/disk_io_backend.hpp>
-
 #include <cudf/io/datasource.hpp>
+
 #include <rmm/cuda_stream_view.hpp>
+
+#include <cucascade/data/disk_io_backend.hpp>
 
 #include <cstddef>
 #include <cstdint>

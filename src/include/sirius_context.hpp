@@ -231,8 +231,7 @@ class SiriusContext : public ClientContextState {
   struct peer_pair_hash {
     size_t operator()(std::pair<int, int> const& p) const noexcept
     {
-      return (static_cast<size_t>(p.first) << 32)
-             ^ static_cast<size_t>(p.second);
+      return (static_cast<size_t>(p.first) << 32) ^ static_cast<size_t>(p.second);
     }
   };
   std::unordered_set<std::pair<int, int>, peer_pair_hash> peer_access_enabled_pairs_;

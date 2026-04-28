@@ -63,9 +63,9 @@ absl::AnyInvocable<void() noexcept> gpu_pipeline_executor::get_per_thread_init()
     // Pitfall 3) — inline the check instead.
     cudaError_t err = cudaSetDevice(device_id);
     if (err != cudaSuccess) {
-      spdlog::error(
-        "gpu_pipeline_executor per-thread init: cudaSetDevice({}) failed: {}",
-        device_id, cudaGetErrorString(err));
+      spdlog::error("gpu_pipeline_executor per-thread init: cudaSetDevice({}) failed: {}",
+                    device_id,
+                    cudaGetErrorString(err));
     }
     sirius::util::enable_log_on_default_stream();
   };

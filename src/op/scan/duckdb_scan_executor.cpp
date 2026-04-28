@@ -69,10 +69,9 @@ duckdb_scan_executor::duckdb_scan_executor(
   for (auto* space : _gpu_memory_spaces) {
     auto const dev_id = space->get_device_id();
     rmm::cuda_set_device_raii guard{rmm::cuda_device_id{dev_id}};
-    _gpu_stream_pools.emplace(
-      dev_id,
-      std::make_unique<cucascade::memory::exclusive_stream_pool>(
-        rmm::cuda_device_id{dev_id}, config.num_threads));
+    _gpu_stream_pools.emplace(dev_id,
+                              std::make_unique<cucascade::memory::exclusive_stream_pool>(
+                                rmm::cuda_device_id{dev_id}, config.num_threads));
   }
 }
 
@@ -194,7 +193,7 @@ int duckdb_scan_executor::select_target_gpu()
     auto idx              = fallback_counter % _gpu_memory_spaces.size();
     auto device_id        = _gpu_memory_spaces[idx]->get_device_id();
     // Phase 9 FIX-B: record affinity in the fallback branch too — a stale
-    // entry from this path would otherwise cause a disjointness assert to
+    // entry from this path would otherwise cause a disjointedness assert to
     // pass by accident (counter not in map → not counted in intersection).
     {
       std::lock_guard<std::mutex> lock(_batch_affinity_mutex);
@@ -240,10 +239,11 @@ int duckdb_scan_executor::select_target_gpu()
         std::lock_guard<std::mutex> lock(_batch_affinity_mutex);
         _batch_gpu_affinity[counter] = space->get_device_id();
       }
-      SIRIUS_LOG_INFO("[mgpu-audit] scan_batch assigned to GPU {} batch_id={} (available: {} bytes)",
-                      space->get_device_id(),
-                      counter,
-                      space->get_available_memory());
+      SIRIUS_LOG_INFO(
+        "[mgpu-audit] scan_batch assigned to GPU {} batch_id={} (available: {} bytes)",
+        space->get_device_id(),
+        counter,
+        space->get_available_memory());
       return space->get_device_id();
     }
   }
@@ -361,8 +361,8 @@ void duckdb_scan_executor::manager_loop()
       // Must happen BEFORE _bounded_pool->dispatch(...) below (Pitfall 5): once
       // compute_task runs, _datasource is cached on the task and the preferred
       // lookup is skipped on subsequent calls.
-      if (auto* parquet_local_state = dynamic_cast<parquet_scan_task_local_state*>(
-            scan_task->local_state())) {
+      if (auto* parquet_local_state =
+            dynamic_cast<parquet_scan_task_local_state*>(scan_task->local_state())) {
         parquet_local_state->set_preferred_device_id(target_gpu_id);
       } else {
         SIRIUS_LOG_ERROR(

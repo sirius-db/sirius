@@ -211,7 +211,7 @@ However this requires knowing the batch_id before `compute_task` executes. The c
 
 ---
 
-### Q6: AUDIT extension — cross-GPU batch disjointness
+### Q6: AUDIT extension — cross-GPU batch disjointedness
 
 **Where the AUDIT harness lives:**
 
@@ -308,7 +308,7 @@ grep '\[mgpu-audit\] scan_batch' $SIRIUS_LOG_DIR/*.log | \
 
 2. SCHED-00 (partition pinning, `task_creator.cpp:479-486`) is for `gpu_pipeline_task` creation, not for `parquet_scan_task` creation. Phase 9 does NOT touch the partition pinning path. No regression risk there.
 
-3. The 1f80c2a commit's `select_target_gpu()` produces the `_scan_round_robin` counter which is ALSO used as the `batch_id` in the audit log (`[mgpu-audit] scan_batch assigned to GPU N batch_id=K`). Phase 9 must preserve the fact that the counter value = batch_id, because the AUDIT TEST_CASE's `parse_audit_log` regex parses `batch_id=K` as a unique identifier and the new disjointness assert depends on it.
+3. The 1f80c2a commit's `select_target_gpu()` produces the `_scan_round_robin` counter which is ALSO used as the `batch_id` in the audit log (`[mgpu-audit] scan_batch assigned to GPU N batch_id=K`). Phase 9 must preserve the fact that the counter value = batch_id, because the AUDIT TEST_CASE's `parse_audit_log` regex parses `batch_id=K` as a unique identifier and the new disjointedness assert depends on it.
 
 **Masking regression hypothesis (from 08-09-HALT.md):** 1f80c2a may have caused the failure mode to shift from `cudaErrorInvalidValue @ cuda_memcpy.cu:42` (v1.1 / 08-06 baseline) to SIGSEGV (08-08 observation). The most likely reason: before 1f80c2a, `select_target_gpu()` was broken (always picked GPU 0), so both tasks ended up on GPU 0, avoiding the cross-GPU dispatch. After 1f80c2a, tasks genuinely distribute to GPU 1, which surfaces the pre-existing double-dispatch race. The old cudaErrorInvalidValue was a DIFFERENT bug (Pattern 2 converter sites) that happened to co-occur with the distributor being single-GPU-only.
 
@@ -355,7 +355,7 @@ No. The OOM retry budget covers a legitimate pattern: at SF100 with `cache=table
 | `src/op/scan/duckdb_scan_executor.cpp` | Add batch→GPU affinity record in `select_target_gpu()` + plumb `target_gpu_id` to local state | HIGH |
 | `src/include/op/scan/duckdb_scan_executor.hpp` | Add `_batch_gpu_affinity` map member (+ mutex) | HIGH |
 | `src/include/op/scan/parquet_scan_task.hpp` | Add `preferred_device_id` field to `parquet_scan_task_local_state` | HIGH |
-| `test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp` | Add disjointness REQUIRE (cross-GPU batch_ids ∩ == ∅) | HIGH |
+| `test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp` | Add disjointedness REQUIRE (cross-GPU batch_ids ∩ == ∅) | HIGH |
 
 ### Files Phase 9 Should NOT Modify (regression risk)
 
@@ -454,7 +454,7 @@ This is a more invasive design change but eliminates the race entirely.
 | Problem | Don't Build | Use Instead | Why |
 |---------|-------------|-------------|-----|
 | Thread-safe batch→GPU map | Custom lock-free structure | `std::unordered_map` + `std::mutex` | Bounded # batches per query; lock contention negligible vs. I/O cost |
-| Set intersection for disjointness | Manual loops | `std::set_intersection` (existing in `<algorithm>`) | Already available; `AuditCounts.scan_ids` is `std::set<std::string>` |
+| Set intersection for disjointedness | Manual loops | `std::set_intersection` (existing in `<algorithm>`) | Already available; `AuditCounts.scan_ids` is `std::set<std::string>` |
 | Preferred-GPU two-tier lookup | Duplicating `gpu_pipeline_task::get_preferred_device_id()` logic | Mirror the same `local → global` fallback pattern from `gpu_pipeline_task.hpp:188-194` | Precedent already established |
 
 ---
@@ -538,14 +538,14 @@ Phase 9 is a code/test change only. External dependencies are the existing CUDA/
 | ROADMAP crit. 1 (SF100 Q1 correct on 2-GPU) | SF100 Q1 returns correct results, no crash | manual SF100 run | user-delegated | N/A |
 | ROADMAP crit. 2 (22 SF1 queries + SF10 smoke on 2-GPU) | unit-tests exits 0 with 2-GPU parameterization | integration | `mcp__project-commands__run_command unit-tests` | ✅ existing (08-04/05) |
 | ROADMAP crit. 4 (pipeline_task ≥ 5 AND scan_batch ≥ 5 per GPU) | AUDIT TEST_CASE asserts ≥ 5 per GPU | unit | `mcp__project-commands__run_command unit-tests filter='"[mgpu-audit]"'` | ✅ existing (08-05) |
-| Phase 9 new (batch disjointness: ∅ intersection) | `counts[0].scan_ids ∩ counts[1].scan_ids == ∅` | unit | same as crit. 4 | ❌ Wave 0 — add to audit test |
+| Phase 9 new (batch disjointedness: ∅ intersection) | `counts[0].scan_ids ∩ counts[1].scan_ids == ∅` | unit | same as crit. 4 | ❌ Wave 0 — add to audit test |
 | ROADMAP crit. 6 (SF100 bench evidence) | [mgpu-audit] log shows both GPUs + wall-clock | manual | user-delegated | N/A |
 
 ### What Fires in unit-tests (MCP, Autonomous)
 
 1. All 22 TPC-H SF1 queries × {DuckDB, parquet} × {num_gpus=1, num_gpus=2} = 88 variants (from 08-04 integration test parameterization, `test_gpu_execution_tpch.cpp`)
 2. SF10 Q1/Q6/Q12 × {num_gpus=2} (gated on `SIRIUS_TEST_SF10_PATH` env var)
-3. AUDIT TEST_CASE: `gpu_execution - [mgpu-audit] per-GPU distribution on TPC-H Q1` (from `test_gpu_execution_tpch_mgpu_audit.cpp`) — asserts pipeline_task ≥ min_count AND scan_batch ≥ min_count per GPU AND **NEW: disjointness REQUIRE**
+3. AUDIT TEST_CASE: `gpu_execution - [mgpu-audit] per-GPU distribution on TPC-H Q1` (from `test_gpu_execution_tpch_mgpu_audit.cpp`) — asserts pipeline_task ≥ min_count AND scan_batch ≥ min_count per GPU AND **NEW: disjointedness REQUIRE**
 
 ### What Must Be Delegated to the User
 
@@ -572,7 +572,7 @@ Evidence file path: `.planning/phases/09-scan-task-distributor-batch-ownership-a
 
 ### Wave 0 Gaps (before main implementation)
 
-- [ ] Add `REQUIRE(intersection.empty())` to `test_gpu_execution_tpch_mgpu_audit.cpp` after the existing `scan_ids.size() >= min_count` checks — covers new disjointness requirement
+- [ ] Add `REQUIRE(intersection.empty())` to `test_gpu_execution_tpch_mgpu_audit.cpp` after the existing `scan_ids.size() >= min_count` checks — covers new disjointedness requirement
 - No framework install needed (Catch2 already in place)
 - No new test files needed (amend existing AUDIT TEST_CASE)
 
@@ -585,7 +585,7 @@ Evidence file path: `.planning/phases/09-scan-task-distributor-batch-ownership-a
 | `select_target_gpu()` is memory-weighted RR (no batch affinity) | `select_target_gpu()` records batch→GPU sticky assignment |
 | `preferred_device_id=-1` at `parquet_scan_task::compute_task` entry | `preferred_device_id=N` (real GPU) at entry |
 | Same `batch_id` can be dispatched to two tasks on different GPUs → SIGSEGV | Each `batch_id` is pinned to exactly one GPU; cross-GPU dispatch is blocked |
-| AUDIT TEST_CASE asserts ≥ 5 per GPU (no disjointness check) | AUDIT TEST_CASE additionally asserts `counts[0].scan_ids ∩ counts[1].scan_ids == ∅` |
+| AUDIT TEST_CASE asserts ≥ 5 per GPU (no disjointedness check) | AUDIT TEST_CASE additionally asserts `counts[0].scan_ids ∩ counts[1].scan_ids == ∅` |
 
 ---
 
@@ -661,7 +661,7 @@ Evidence file path: `.planning/phases/09-scan-task-distributor-batch-ownership-a
 
 2. **Bug 2 (preferred_device_id=-1):** `target_gpu_id` from `select_target_gpu()` is captured by the dispatch lambda for stream/device-guard purposes only. It is never written to `parquet_scan_task_local_state` or `parquet_scan_task_global_state`. `compute_task` reads `g_state.get_preferred_device_id()` → `nullopt` → falls back to `backends.begin()` (GPU 0) for `_datasource` construction, even when running on GPU 1. Fix: add `preferred_device_id` field to `parquet_scan_task_local_state` and set it from `manager_loop` before dispatch.
 
-3. **AUDIT disjointness extension:** The new REQUIRE (`counts[0].scan_ids ∩ counts[1].scan_ids == ∅`) requires adding a single `std::set_intersection` check to the existing `test_gpu_execution_tpch_mgpu_audit.cpp` AUDIT TEST_CASE. The log format already emits `batch_id=K` and the parser already collects `std::set<std::string> scan_ids` per GPU.
+3. **AUDIT disjointedness extension:** The new REQUIRE (`counts[0].scan_ids ∩ counts[1].scan_ids == ∅`) requires adding a single `std::set_intersection` check to the existing `test_gpu_execution_tpch_mgpu_audit.cpp` AUDIT TEST_CASE. The log format already emits `batch_id=K` and the parser already collects `std::set<std::string> scan_ids` per GPU.
 
 4. **Commit 1f80c2a is adjacent but safe:** Its `select_target_gpu()` stride fix is correct and must be preserved. Phase 9 adds affinity logic ON TOP of it. It also explains why the failure mode changed from `cudaErrorInvalidValue` to SIGSEGV (before 1f80c2a, everything went to GPU 0 and the race was latent).
 
@@ -692,5 +692,5 @@ Evidence file path: `.planning/phases/09-scan-task-distributor-batch-ownership-a
 Research complete. Planner can decompose Phase 9 into plans covering:
 - Wave A: `preferred_device_id` plumbing (Bug 2) — header + local state + compute_task two-tier lookup + manager_loop set call
 - Wave B: batch-ownership affinity map (Bug 1) — sticky map in executor + memspace_mismatch caller handling
-- Wave C: AUDIT disjointness REQUIRE (test extension)
+- Wave C: AUDIT disjointedness REQUIRE (test extension)
 - Wave D: Phase 9 ship-gate (user-delegated SF100 Q1 + SF10 + full SF1 22-query validation)

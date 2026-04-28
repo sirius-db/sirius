@@ -34,9 +34,11 @@
 // invocations so the cache_scan_results_for_query hash match triggers
 // preload_mode on every call after the first.
 
-#include <catch.hpp>
 #include <cuda_runtime.h>
+
+#include <catch.hpp>
 #include <duckdb.hpp>
+#include <unistd.h>
 #include <utils/sirius_test_env.hpp>
 
 #include <cstdlib>
@@ -44,7 +46,6 @@
 #include <fstream>
 #include <memory>
 #include <string>
-#include <unistd.h>
 
 namespace fs = std::filesystem;
 
@@ -132,8 +133,9 @@ TEST_CASE("gpu_execution - table_gpu cache warm cross-GPU hazard (follow-up #17)
   int device_count = 0;
   cudaGetDeviceCount(&device_count);
   if (device_count < 2) {
-    WARN("follow-up #17 repro requires >=2 GPUs; single-GPU host — skipping "
-         "(per Catch2 v2 WARN+return convention)");
+    WARN(
+      "follow-up #17 repro requires >=2 GPUs; single-GPU host — skipping "
+      "(per Catch2 v2 WARN+return convention)");
     return;
   }
 
@@ -147,8 +149,7 @@ TEST_CASE("gpu_execution - table_gpu cache warm cross-GPU hazard (follow-up #17)
   if (sirius::test::g_integration_env && sirius::test::g_integration_env->is_active()) {
     sirius::test::g_integration_env->pause();
   }
-  if (sirius::test::g_integration_env_2gpu &&
-      sirius::test::g_integration_env_2gpu->is_active()) {
+  if (sirius::test::g_integration_env_2gpu && sirius::test::g_integration_env_2gpu->is_active()) {
     sirius::test::g_integration_env_2gpu->pause();
   }
 
@@ -160,8 +161,8 @@ TEST_CASE("gpu_execution - table_gpu cache warm cross-GPU hazard (follow-up #17)
   // 8 files × 500k rows × 16 B/row ≈ 64 MiB total — comfortably above the
   // 32 MiB (num_gpus * 16 MiB) multi-partition floor so the hash-join
   // partitioner produces at least 2 partitions routed across both GPUs.
-  constexpr int kNumFiles     = 8;
-  constexpr int kRowsPerFile  = 500000;
+  constexpr int kNumFiles    = 8;
+  constexpr int kRowsPerFile = 500000;
   generate_parquet_surface(tmp, kNumFiles, kRowsPerFile);
 
   auto yaml_path = tmp / "fu17.yaml";
@@ -175,8 +176,12 @@ TEST_CASE("gpu_execution - table_gpu cache warm cross-GPU hazard (follow-up #17)
   auto glob = (tmp / "*.parquet").string();
   auto inner_query =
     "SELECT t1.k, count(*) "
-    "FROM read_parquet('" + glob + "') t1 "
-    "JOIN read_parquet('" + glob + "') t2 ON t1.k = t2.v "
+    "FROM read_parquet('" +
+    glob +
+    "') t1 "
+    "JOIN read_parquet('" +
+    glob +
+    "') t2 ON t1.k = t2.v "
     "GROUP BY t1.k "
     "ORDER BY t1.k "
     "LIMIT 10;";
@@ -195,7 +200,7 @@ TEST_CASE("gpu_execution - table_gpu cache warm cross-GPU hazard (follow-up #17)
   std::vector<bool> warm_ok(kWarmIterations, false);
   {
     auto con = std::make_unique<duckdb::Connection>(local_env.make_connection());
-    auto fb = con->Query("SET enable_duckdb_fallback = false;");
+    auto fb  = con->Query("SET enable_duckdb_fallback = false;");
     REQUIRE(fb);
     REQUIRE_FALSE(fb->HasError());
 

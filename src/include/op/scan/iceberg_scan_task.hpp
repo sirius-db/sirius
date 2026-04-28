@@ -16,11 +16,10 @@
 
 #pragma once
 
+#include <cucascade/data/disk_io_backend.hpp>
 #include <op/scan/iceberg_delete_filter.hpp>
 #include <op/scan/parquet_scan_task.hpp>
 #include <op/sirius_physical_iceberg_scan.hpp>
-
-#include <cucascade/data/disk_io_backend.hpp>
 
 #include <memory>
 #include <string>

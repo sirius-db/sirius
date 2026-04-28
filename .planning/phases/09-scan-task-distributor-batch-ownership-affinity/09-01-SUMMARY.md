@@ -168,9 +168,9 @@ With:
   - Line 764: `auto const local_preferred_probe = l_state.get_preferred_device_id();`
   - Line 783: `// so the two-tier local_state/global_state get_preferred_device_id() helper` — this does NOT contain `l_state.get_preferred_device_id()`
   - Line 803: `auto const local_preferred = l_state.get_preferred_device_id();`
-  
+
   Re-running grep confirms 3 results. The third result must be something else. Checking: `grep -n 'l_state.get_preferred_device_id()' parquet_scan_task.cpp` showed lines 764, 783, 803. The pre-existing comment at line 783 actually does contain `l_state/global_state get_preferred_device_id()` after some edit — but the text in the file says `local_state/global_state get_preferred_device_id()`. Grep for `l_state.get_preferred_device_id()` with the period will match `l_state/global_state get_preferred_device_id()` because `.` in grep matches any character. The `.` in the pattern matches `/` in the comment text.
-  
+
 - **Root cause:** The plan's grep pattern uses `.` (any char in grep) not `\.` (literal period). The existing comment `local_state/global_state get_preferred_device_id()` at line 783 matches `l_state.get_preferred_device_id()` because `.` = any character. So the 3rd match is from a pre-existing comment, not from the new code.
 - **Impact:** Zero — the 2 actual call sites are correct. The plan's acceptance criterion used an unescaped `.` in grep which makes it a false positive.
 - **Functional correctness:** Unaffected. Two real call sites exist (probe block + datasource block).

@@ -32,15 +32,16 @@
 
 #include "mgpu_test_utils.hpp"
 
-#include <catch.hpp>
 #include <cuda_runtime.h>
+
+#include <catch.hpp>
 #include <duckdb.hpp>
+#include <unistd.h>
 
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
 #include <string>
-#include <unistd.h>
 
 namespace fs = std::filesystem;
 using namespace sirius::test::mgpu;
@@ -59,8 +60,8 @@ mgpu_env_params make_params()
 
 fs::path make_tmp_dir(std::string const& tag)
 {
-  auto tmp = fs::temp_directory_path() /
-             ("sirius-mgpu-order-" + std::to_string(::getpid()) + "-" + tag);
+  auto tmp =
+    fs::temp_directory_path() / ("sirius-mgpu-order-" + std::to_string(::getpid()) + "-" + tag);
   std::error_code ec;
   fs::remove_all(tmp, ec);
   fs::create_directories(tmp);
@@ -84,20 +85,18 @@ TEST_CASE("physical_order - large sort distributes across two GPUs",
   // hash_partition_bytes=1 MiB.
   constexpr int kNumFiles    = 8;
   constexpr int kRowsPerFile = 500000;
-  generate_parquet_surface(
-    tmp,
-    "SELECT (range * 37) % 1000000 AS k, range AS v FROM range(" +
-      std::to_string(kRowsPerFile) + ")",
-    kNumFiles);
+  generate_parquet_surface(tmp,
+                           "SELECT (range * 37) % 1000000 AS k, range AS v FROM range(" +
+                             std::to_string(kRowsPerFile) + ")",
+                           kNumFiles);
 
   write_mgpu_yaml(yaml, make_params());
   REQUIRE(fs::exists(yaml));
 
   scoped_log_dir logs(log_dir);
 
-  auto glob = parquet_glob(tmp);
-  auto inner_query =
-    "SELECT k, v FROM read_parquet('" + glob + "') ORDER BY k DESC LIMIT 100";
+  auto glob        = parquet_glob(tmp);
+  auto inner_query = "SELECT k, v FROM read_parquet('" + glob + "') ORDER BY k DESC LIMIT 100";
 
   {
     scoped_mgpu_env env(yaml);
@@ -132,11 +131,10 @@ TEST_CASE("physical_order - small sort stays single-GPU",
   // one GPU; we assert correctness only here, not distribution.
   constexpr int kNumFiles    = 8;
   constexpr int kRowsPerFile = 1000;
-  generate_parquet_surface(
-    tmp,
-    "SELECT (range * 37) % 1000000 AS k, range AS v FROM range(" +
-      std::to_string(kRowsPerFile) + ")",
-    kNumFiles);
+  generate_parquet_surface(tmp,
+                           "SELECT (range * 37) % 1000000 AS k, range AS v FROM range(" +
+                             std::to_string(kRowsPerFile) + ")",
+                           kNumFiles);
 
   write_mgpu_yaml(yaml, make_params());
   REQUIRE(fs::exists(yaml));
@@ -171,11 +169,10 @@ TEST_CASE("physical_order - order by with limit over large input",
   // top-N runs then merge to a single final top-5 on the consumer GPU.
   constexpr int kNumFiles    = 8;
   constexpr int kRowsPerFile = 500000;
-  generate_parquet_surface(
-    tmp,
-    "SELECT (range * 37) % 1000000 AS k, range AS v FROM range(" +
-      std::to_string(kRowsPerFile) + ")",
-    kNumFiles);
+  generate_parquet_surface(tmp,
+                           "SELECT (range * 37) % 1000000 AS k, range AS v FROM range(" +
+                             std::to_string(kRowsPerFile) + ")",
+                           kNumFiles);
 
   write_mgpu_yaml(yaml, make_params());
   REQUIRE(fs::exists(yaml));

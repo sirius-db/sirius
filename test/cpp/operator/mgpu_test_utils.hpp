@@ -32,9 +32,11 @@
 
 #include "utils/sirius_test_env.hpp"
 
-#include <catch.hpp>
 #include <cuda_runtime.h>
+
+#include <catch.hpp>
 #include <duckdb.hpp>
+#include <unistd.h>
 
 #include <cstdlib>
 #include <filesystem>
@@ -44,7 +46,6 @@
 #include <regex>
 #include <set>
 #include <string>
-#include <unistd.h>
 
 namespace sirius::test::mgpu {
 
@@ -76,10 +77,14 @@ inline void write_mgpu_yaml(std::filesystem::path const& yaml_path,
   std::ofstream f(yaml_path);
   f << "sirius:\n"
        "  topology:\n"
-       "    num_gpus: " << params.num_gpus << "\n"
+       "    num_gpus: "
+    << params.num_gpus
+    << "\n"
        "  memory:\n"
        "    gpu:\n"
-       "      usage_limit_fraction: " << params.usage_limit_fraction << "\n"
+       "      usage_limit_fraction: "
+    << params.usage_limit_fraction
+    << "\n"
        "      reservation_limit_fraction: 1.0\n"
        "    host:\n"
        "      capacity_bytes: 32000000000\n"
@@ -88,22 +93,37 @@ inline void write_mgpu_yaml(std::filesystem::path const& yaml_path,
        "      block_size: 1048576\n"
        "  executor:\n"
        "    pipeline:\n"
-       "      num_threads: " << params.pipeline_num_threads << "\n"
+       "      num_threads: "
+    << params.pipeline_num_threads
+    << "\n"
        "    duckdb_scan:\n"
-       "      num_threads: " << params.duckdb_scan_num_threads << "\n"
-       "      cache: " << params.cache << "\n"
+       "      num_threads: "
+    << params.duckdb_scan_num_threads
+    << "\n"
+       "      cache: "
+    << params.cache
+    << "\n"
        "    task_creator:\n"
-       "      num_threads: " << params.task_creator_num_threads << "\n"
+       "      num_threads: "
+    << params.task_creator_num_threads
+    << "\n"
        "    downgrade:\n"
        "      num_threads: 1\n"
        "      monitor_period_ms: 10\n"
        "  operator_params:\n"
-       "    scan_task_batch_size: " << params.scan_task_batch_size << "\n"
+       "    scan_task_batch_size: "
+    << params.scan_task_batch_size
+    << "\n"
        "    default_scan_task_varchar_size: 256\n"
        "    max_sort_partition_bytes: 0\n"
-       "    hash_partition_bytes: " << params.hash_partition_bytes << "\n"
-       "    concat_batch_bytes: " << params.concat_batch_bytes << "\n"
-       "    max_build_hash_table_bytes: " << params.max_build_hash_table_bytes << "\n";
+       "    hash_partition_bytes: "
+    << params.hash_partition_bytes
+    << "\n"
+       "    concat_batch_bytes: "
+    << params.concat_batch_bytes
+    << "\n"
+       "    max_build_hash_table_bytes: "
+    << params.max_build_hash_table_bytes << "\n";
 }
 
 /**
@@ -141,8 +161,7 @@ class scoped_mgpu_env {
     if (sirius::test::g_integration_env && sirius::test::g_integration_env->is_active()) {
       sirius::test::g_integration_env->pause();
     }
-    if (sirius::test::g_integration_env_2gpu &&
-        sirius::test::g_integration_env_2gpu->is_active()) {
+    if (sirius::test::g_integration_env_2gpu && sirius::test::g_integration_env_2gpu->is_active()) {
       sirius::test::g_integration_env_2gpu->pause();
     }
     _env = std::make_unique<sirius::test::shared_test_env>(yaml_path);
@@ -178,9 +197,9 @@ inline void generate_parquet_surface(std::filesystem::path const& dir,
     REQUIRE(create);
     REQUIRE_FALSE(create->HasError());
     for (int i = 0; i < num_files; ++i) {
-      auto copy = gen.Query("COPY t TO '" +
-                            (dir / ("p" + std::to_string(i) + ".parquet")).string() +
-                            "' (FORMAT PARQUET);");
+      auto copy =
+        gen.Query("COPY t TO '" + (dir / ("p" + std::to_string(i) + ".parquet")).string() +
+                  "' (FORMAT PARQUET);");
       REQUIRE(copy);
       REQUIRE_FALSE(copy->HasError());
     }
@@ -219,10 +238,8 @@ struct audit_counts {
 inline std::map<int, audit_counts> parse_audit_log(std::filesystem::path const& log_dir)
 {
   std::map<int, audit_counts> by_gpu;
-  std::regex pipeline_re(
-    R"(\[mgpu-audit\] pipeline_task dispatched to GPU (\d+) task_id=(\S+))");
-  std::regex scan_re(
-    R"(\[mgpu-audit\] scan_batch assigned to GPU (\d+) batch_id=(\S+))");
+  std::regex pipeline_re(R"(\[mgpu-audit\] pipeline_task dispatched to GPU (\d+) task_id=(\S+))");
+  std::regex scan_re(R"(\[mgpu-audit\] scan_batch assigned to GPU (\d+) batch_id=(\S+))");
 
   if (!std::filesystem::exists(log_dir)) return by_gpu;
   for (auto const& entry : std::filesystem::directory_iterator(log_dir)) {
@@ -314,16 +331,13 @@ inline void require_gpu_matches_cpu(duckdb::Connection& con, std::string const& 
   REQUIRE_FALSE(fb->HasError());
 
   auto clean_query = inner_query;
-  while (!clean_query.empty() &&
-         (clean_query.back() == ';' || clean_query.back() == ' ')) {
+  while (!clean_query.empty() && (clean_query.back() == ';' || clean_query.back() == ' ')) {
     clean_query.pop_back();
   }
 
   auto gpu_result = con.Query("CALL gpu_execution(\"" + clean_query + "\")");
   REQUIRE(gpu_result);
-  if (gpu_result->HasError()) {
-    UNSCOPED_INFO("gpu_execution error: " << gpu_result->GetError());
-  }
+  if (gpu_result->HasError()) { UNSCOPED_INFO("gpu_execution error: " << gpu_result->GetError()); }
   REQUIRE_FALSE(gpu_result->HasError());
 
   auto cpu_result = con.Query(clean_query + ";");
@@ -342,8 +356,7 @@ inline void require_gpu_matches_cpu(duckdb::Connection& con, std::string const& 
 
   auto gpu_sorted =
     con.Query("SELECT * FROM gpu_execution(\"" + clean_query + "\")" + order_clause);
-  auto cpu_sorted =
-    con.Query("SELECT * FROM (" + clean_query + ") t" + order_clause);
+  auto cpu_sorted = con.Query("SELECT * FROM (" + clean_query + ") t" + order_clause);
   REQUIRE(gpu_sorted);
   REQUIRE_FALSE(gpu_sorted->HasError());
   REQUIRE(cpu_sorted);
@@ -354,8 +367,8 @@ inline void require_gpu_matches_cpu(duckdb::Connection& con, std::string const& 
       auto gpu_str = gpu_sorted->GetValue(c, r).ToString();
       auto cpu_str = cpu_sorted->GetValue(c, r).ToString();
       if (gpu_str != cpu_str) {
-        UNSCOPED_INFO("Row " << r << " Col " << c << " mismatch: GPU=["
-                             << gpu_str << "] CPU=[" << cpu_str << "]");
+        UNSCOPED_INFO("Row " << r << " Col " << c << " mismatch: GPU=[" << gpu_str << "] CPU=["
+                             << cpu_str << "]");
       }
       REQUIRE(gpu_str == cpu_str);
     }

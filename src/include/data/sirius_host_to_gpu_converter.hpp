@@ -16,10 +16,10 @@
 
 #pragma once
 
+#include <rmm/cuda_stream_view.hpp>
+
 #include <cucascade/data/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
-
-#include <rmm/cuda_stream_view.hpp>
 
 #include <memory>
 

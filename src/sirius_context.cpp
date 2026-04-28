@@ -25,13 +25,14 @@
 
 #include <cudf/utilities/pinned_memory.hpp>
 
+#include <rmm/cuda_device.hpp>
+
 #include <cuda_runtime_api.h>
 
 #include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/data/io_backend_registry.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
-#include <rmm/cuda_device.hpp>
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/spdlog.h>
 
@@ -187,12 +188,12 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
       "SiriusContext::initialize: cucascade::topology_discovery reported 0 GPUs — "
       "refusing to initialize on stub topology (MGPU-01 fail-hard).");
   }
-  spdlog::info(
-    "SiriusContext: topology summary — {} GPU(s), {} NUMA node(s), host='{}'",
-    topo.num_gpus, topo.num_numa_nodes, topo.hostname);
+  spdlog::info("SiriusContext: topology summary — {} GPU(s), {} NUMA node(s), host='{}'",
+               topo.num_gpus,
+               topo.num_numa_nodes,
+               topo.hostname);
   for (auto const& gpu : topo.gpus) {
-    spdlog::info("  GPU {}: {} (numa={}, pci={})",
-                 gpu.id, gpu.name, gpu.numa_node, gpu.pci_bus_id);
+    spdlog::info("  GPU {}: {} (numa={}, pci={})", gpu.id, gpu.name, gpu.numa_node, gpu.pci_bus_id);
   }
 
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
@@ -210,17 +211,18 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   {
     auto const mgpu05_host_spaces =
       memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
-    spdlog::info(
-      "SiriusContext: {} host memory space(s) created for {} NUMA node(s)",
-      mgpu05_host_spaces.size(), topo.num_numa_nodes);
-    if (topo.num_numa_nodes > 0
-        && mgpu05_host_spaces.size() != static_cast<size_t>(topo.num_numa_nodes)) {
+    spdlog::info("SiriusContext: {} host memory space(s) created for {} NUMA node(s)",
+                 mgpu05_host_spaces.size(),
+                 topo.num_numa_nodes);
+    if (topo.num_numa_nodes > 0 &&
+        mgpu05_host_spaces.size() != static_cast<size_t>(topo.num_numa_nodes)) {
       spdlog::warn(
         "SiriusContext: host space count ({}) != NUMA node count ({}) — "
         "MGPU-05 expects one host space per NUMA domain. Check "
         "sirius_config apply_defaults (.use_host_per_numa()) or YAML host "
         "configuration.",
-        mgpu05_host_spaces.size(), topo.num_numa_nodes);
+        mgpu05_host_spaces.size(),
+        topo.num_numa_nodes);
     }
   }
 
@@ -234,8 +236,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // ownership" and Phase 5 RESEARCH.md Pitfall 1.
   cucascade::register_builtin_io_backends(io_backend_registry_);
   {
-    auto gpu_spaces = memory_manager_->get_memory_spaces_for_tier(
-      cucascade::memory::Tier::GPU);
+    auto gpu_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
     gpu_io_backends_.reserve(gpu_spaces.size());
     for (auto* gpu_space : gpu_spaces) {
       auto const device_id = gpu_space->get_device_id();
@@ -245,10 +246,9 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
       // device at the moment the backend was created. These should match.
       int readback = -1;
       cudaGetDevice(&readback);
-      spdlog::info(
-        "SiriusContext: io_backend created for GPU {} (cudaGetDevice readback={})",
-        device_id,
-        readback);
+      spdlog::info("SiriusContext: io_backend created for GPU {} (cudaGetDevice readback={})",
+                   device_id,
+                   readback);
       gpu_io_backends_[device_id] = std::move(backend);
     }
   }
@@ -266,26 +266,27 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   {
     auto const& mgpu06_topo = config_.get_hw_topology();
     if (mgpu06_topo.num_gpus >= 2) {
-      peer_access_enabled_pairs_.reserve(
-        static_cast<size_t>(mgpu06_topo.num_gpus) * (mgpu06_topo.num_gpus - 1));
+      peer_access_enabled_pairs_.reserve(static_cast<size_t>(mgpu06_topo.num_gpus) *
+                                         (mgpu06_topo.num_gpus - 1));
       for (unsigned i = 0; i < mgpu06_topo.num_gpus; ++i) {
         rmm::cuda_set_device_raii guard_i{rmm::cuda_device_id{static_cast<int>(i)}};
         for (unsigned j = 0; j < mgpu06_topo.num_gpus; ++j) {
           if (i == j) continue;
-          int can_access        = 0;
-          cudaError_t probe_err = cudaDeviceCanAccessPeer(&can_access,
-                                                          static_cast<int>(i),
-                                                          static_cast<int>(j));
+          int can_access = 0;
+          cudaError_t probe_err =
+            cudaDeviceCanAccessPeer(&can_access, static_cast<int>(i), static_cast<int>(j));
           if (probe_err != cudaSuccess) {
-            spdlog::error(
-              "SiriusContext: cudaDeviceCanAccessPeer({},{}) failed: {} (MGPU-06)",
-              i, j, cudaGetErrorString(probe_err));
+            spdlog::error("SiriusContext: cudaDeviceCanAccessPeer({},{}) failed: {} (MGPU-06)",
+                          i,
+                          j,
+                          cudaGetErrorString(probe_err));
             continue;
           }
           if (can_access == 0) {
             spdlog::info(
               "SiriusContext: no P2P access {} -> {} -- falling back to host staging (MGPU-06)",
-              i, j);
+              i,
+              j);
             continue;
           }
           cudaError_t enable_err = cudaDeviceEnablePeerAccess(static_cast<int>(j), 0);
@@ -294,15 +295,15 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
           // cudaGetLastError() is called, which would make the NEXT CUDA API
           // call fail spuriously in unrelated code (e.g., thrust::exclusive_scan).
           (void)cudaGetLastError();
-          if (enable_err == cudaSuccess
-              || enable_err == cudaErrorPeerAccessAlreadyEnabled) {
-            peer_access_enabled_pairs_.emplace(static_cast<int>(i),
-                                               static_cast<int>(j));
+          if (enable_err == cudaSuccess || enable_err == cudaErrorPeerAccessAlreadyEnabled) {
+            peer_access_enabled_pairs_.emplace(static_cast<int>(i), static_cast<int>(j));
             spdlog::info("SiriusContext: P2P enabled {} -> {} (MGPU-06)", i, j);
           } else {
             spdlog::error(
               "SiriusContext: cudaDeviceEnablePeerAccess({}) from ctx {} failed: {} (MGPU-06)",
-              j, i, cudaGetErrorString(enable_err));
+              j,
+              i,
+              cudaGetErrorString(enable_err));
           }
         }
       }

@@ -461,9 +461,9 @@ void parquet_scan_task_global_state::initialize_from_files()
     // specific tree here would bind everyone to one device. Instead, each converter
     // call selects the right per-device tree and calls set_filter on its own opts
     // copy under target_device_raii.
-    _translated_filter_by_device = std::make_shared<
-      std::unordered_map<int, gpu_expression_translator::translated_expression>>(
-      std::move(_scan_op->translated_filter_by_device));
+    _translated_filter_by_device =
+      std::make_shared<std::unordered_map<int, gpu_expression_translator::translated_expression>>(
+        std::move(_scan_op->translated_filter_by_device));
   }
 
   // Verify projected columns are flat (we don't support nested projections yet).
@@ -762,10 +762,9 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
     // Mirrors gpu_pipeline_task::get_preferred_device_id (gpu_pipeline_task.hpp:188-194).
     // Probe reports the EFFECTIVE value that _datasource construction below will see.
     auto const local_preferred_probe = l_state.get_preferred_device_id();
-    auto const preferred_probe       = local_preferred_probe.has_value()
-      ? local_preferred_probe
-      : g_state.get_preferred_device_id();
-    auto* memspace_probe       = l_state.get_memory_space();
+    auto const preferred_probe =
+      local_preferred_probe.has_value() ? local_preferred_probe : g_state.get_preferred_device_id();
+    auto* memspace_probe = l_state.get_memory_space();
     SIRIUS_LOG_INFO(
       "[mgpu-probe] parquet_scan_task::compute_task entry current_device={} stream={} "
       "preferred_device_id={} memspace_device_id={}",
@@ -801,15 +800,12 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
     // same idiom in the [mgpu-probe] entry breadcrumb above — both must
     // produce the SAME value for the probe log to match the actual routing.
     auto const local_preferred = l_state.get_preferred_device_id();
-    auto const preferred       = local_preferred.has_value()
-      ? local_preferred
-      : g_state.get_preferred_device_id();
-    auto backend_it =
-      preferred.has_value() ? backends.find(*preferred) : backends.begin();
+    auto const preferred =
+      local_preferred.has_value() ? local_preferred : g_state.get_preferred_device_id();
+    auto backend_it = preferred.has_value() ? backends.find(*preferred) : backends.begin();
     if (backend_it == backends.end()) {
-      throw std::out_of_range(
-        "[parquet_scan_task::compute_task] no io_backend for device_id=" +
-        std::to_string(preferred.value_or(-1)));
+      throw std::out_of_range("[parquet_scan_task::compute_task] no io_backend for device_id=" +
+                              std::to_string(preferred.value_or(-1)));
     }
     auto const& file_path = g_state.get_file_path(l_state.get_file_idx());
     auto const file_size  = g_state.get_file_size(l_state.get_file_idx());

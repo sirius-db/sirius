@@ -111,8 +111,7 @@ make_test_gpu_io_backends()
 {
   static cucascade::io_backend_registry registry;
   static std::once_flag registry_init_flag;
-  std::call_once(registry_init_flag,
-                 [&] { cucascade::register_builtin_io_backends(registry); });
+  std::call_once(registry_init_flag, [&] { cucascade::register_builtin_io_backends(registry); });
   std::unordered_map<int, std::shared_ptr<cucascade::idisk_io_backend>> backends;
   backends.emplace(0, registry.create_default_backend());
   return backends;

@@ -190,8 +190,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next
     // task to partition_idx % num_gpus. merge_group_by materializes a cuco
     // hash table to combine its input batches, so — like hash_join — every
     // task of a given partition must stay on a single GPU.
-    return std::make_unique<partitioned_operator_data>(std::move(input_batch),
-                                                       this_partition_id);
+    return std::make_unique<partitioned_operator_data>(std::move(input_batch), this_partition_id);
   } else {
     return nullptr;
   }

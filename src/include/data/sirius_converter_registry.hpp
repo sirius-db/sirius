@@ -22,7 +22,6 @@
 #include <data/host_parquet_representation_converters.hpp>
 #include <data/sirius_host_to_gpu_converter.hpp>
 #include <data/sirius_p2p_converter.hpp>
-
 #include <spdlog/spdlog.h>
 
 #include <memory>
@@ -68,17 +67,15 @@ class converter_registry {
     // copy on target_stream so the subsequent unpack observes in-order
     // completion without a manual cross-stream event. See
     // .planning/phases/07-*/07-RESEARCH.md Pattern 2 + Plan 07-02 SUMMARY.
-    auto const removed = instance_->unregister_converter<
-      cucascade::gpu_table_representation,
-      cucascade::gpu_table_representation>();
+    auto const removed = instance_->unregister_converter<cucascade::gpu_table_representation,
+                                                         cucascade::gpu_table_representation>();
     if (!removed) {
       spdlog::warn(
         "sirius: expected cucascade built-in gpu->gpu converter to be "
         "registered before MGPU-06 override but unregister returned false");
     }
-    instance_->register_converter<
-      cucascade::gpu_table_representation,
-      cucascade::gpu_table_representation>(
+    instance_->register_converter<cucascade::gpu_table_representation,
+                                  cucascade::gpu_table_representation>(
       &sirius::data::sirius_p2p_converter_factory);
     spdlog::info("sirius: MGPU-06 P2P converter override registered");
 
@@ -94,18 +91,17 @@ class converter_registry {
     // The Sirius override acquires a target-bound stream via
     // target_memory_space->acquire_stream() and issues every H2D copy on
     // that stream under a target-device RAII guard (Pattern 2 shape).
-    auto const host_removed = instance_->unregister_converter<
-      cucascade::host_data_representation,
-      cucascade::gpu_table_representation>();
+    auto const host_removed =
+      instance_->unregister_converter<cucascade::host_data_representation,
+                                      cucascade::gpu_table_representation>();
     if (!host_removed) {
       spdlog::warn(
         "sirius: expected cucascade built-in host_data_representation -> "
         "gpu_table_representation converter to be registered before FIX-02 "
         "override but unregister returned false");
     }
-    instance_->register_converter<
-      cucascade::host_data_representation,
-      cucascade::gpu_table_representation>(
+    instance_->register_converter<cucascade::host_data_representation,
+                                  cucascade::gpu_table_representation>(
       &sirius::data::sirius_host_fast_to_gpu_factory);
     spdlog::info("sirius: FIX-02 host->gpu converter override registered");
   }

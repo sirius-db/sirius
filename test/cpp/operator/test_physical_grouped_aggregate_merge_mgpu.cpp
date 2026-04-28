@@ -35,15 +35,16 @@
 
 #include "mgpu_test_utils.hpp"
 
-#include <catch.hpp>
 #include <cuda_runtime.h>
+
+#include <catch.hpp>
 #include <duckdb.hpp>
+#include <unistd.h>
 
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
 #include <string>
-#include <unistd.h>
 
 namespace fs = std::filesystem;
 using namespace sirius::test::mgpu;
@@ -65,8 +66,8 @@ mgpu_env_params make_params()
 
 fs::path make_tmp_dir(std::string const& tag)
 {
-  auto tmp = fs::temp_directory_path() /
-             ("sirius-mgpu-gagg-" + std::to_string(::getpid()) + "-" + tag);
+  auto tmp =
+    fs::temp_directory_path() / ("sirius-mgpu-gagg-" + std::to_string(::getpid()) + "-" + tag);
   std::error_code ec;
   fs::remove_all(tmp, ec);
   fs::create_directories(tmp);
@@ -80,17 +81,18 @@ TEST_CASE("grouped_aggregate_merge - group by with high cardinality distributes 
 {
   if (!require_two_gpus()) return;
 
-  auto tmp      = make_tmp_dir("highcard");
-  auto log_dir  = tmp / "log";
-  auto yaml     = tmp / "mgpu.yaml";
+  auto tmp     = make_tmp_dir("highcard");
+  auto log_dir = tmp / "log";
+  auto yaml    = tmp / "mgpu.yaml";
 
   // Independent keys across files: range(0..500000) each — total ~4M rows
   // with ~500k distinct keys. At ~16 B/row that is ~64 MiB input; with
   // hash_partition_bytes=1 MiB sirius_physical_partition produces many
   // partitions (>= num_gpus floor of 2).
-  generate_parquet_surface(tmp, "SELECT range AS k, range * 2 AS v FROM range(" +
-                                  std::to_string(kRowsPerFile) + ")",
-                           kNumFiles);
+  generate_parquet_surface(
+    tmp,
+    "SELECT range AS k, range * 2 AS v FROM range(" + std::to_string(kRowsPerFile) + ")",
+    kNumFiles);
 
   write_mgpu_yaml(yaml, make_params());
   REQUIRE(fs::exists(yaml));
@@ -100,7 +102,9 @@ TEST_CASE("grouped_aggregate_merge - group by with high cardinality distributes 
   auto glob = parquet_glob(tmp);
   auto inner_query =
     "SELECT k, SUM(v) AS sum_v, COUNT(*) AS cnt "
-    "FROM read_parquet('" + glob + "') "
+    "FROM read_parquet('" +
+    glob +
+    "') "
     "GROUP BY k "
     "ORDER BY k "
     "LIMIT 50";
@@ -135,19 +139,22 @@ TEST_CASE("grouped_aggregate_merge - group by with single key forces single-GPU 
   // small-table-bytes threshold where the num_gpus floor is skipped, so
   // only one partition exists and the merge runs on a single GPU. We just
   // assert correctness here, not distribution.
-  generate_parquet_surface(tmp, "SELECT 0 AS k, range * 2 AS v FROM range(" +
-                                  std::to_string(kRowsPerFile) + ")",
-                           kNumFiles);
+  generate_parquet_surface(
+    tmp,
+    "SELECT 0 AS k, range * 2 AS v FROM range(" + std::to_string(kRowsPerFile) + ")",
+    kNumFiles);
 
   write_mgpu_yaml(yaml, make_params());
   REQUIRE(fs::exists(yaml));
 
   scoped_log_dir logs(log_dir);
 
-  auto glob        = parquet_glob(tmp);
+  auto glob = parquet_glob(tmp);
   auto inner_query =
     "SELECT k, SUM(v) AS sum_v, COUNT(*) AS cnt "
-    "FROM read_parquet('" + glob + "') "
+    "FROM read_parquet('" +
+    glob +
+    "') "
     "GROUP BY k "
     "ORDER BY k";
 
@@ -174,19 +181,22 @@ TEST_CASE("grouped_aggregate_merge - count(*)-only aggregate across two GPUs",
   // Same high-cardinality surface as test #1 so we hit the multi-partition
   // MGPU path, but the aggregate is COUNT(*) only — catches cudf
   // aggregation-type enum dispatch issues that SUM would otherwise mask.
-  generate_parquet_surface(tmp, "SELECT range AS k, range * 2 AS v FROM range(" +
-                                  std::to_string(kRowsPerFile) + ")",
-                           kNumFiles);
+  generate_parquet_surface(
+    tmp,
+    "SELECT range AS k, range * 2 AS v FROM range(" + std::to_string(kRowsPerFile) + ")",
+    kNumFiles);
 
   write_mgpu_yaml(yaml, make_params());
   REQUIRE(fs::exists(yaml));
 
   scoped_log_dir logs(log_dir);
 
-  auto glob        = parquet_glob(tmp);
+  auto glob = parquet_glob(tmp);
   auto inner_query =
     "SELECT k, COUNT(*) AS cnt "
-    "FROM read_parquet('" + glob + "') "
+    "FROM read_parquet('" +
+    glob +
+    "') "
     "GROUP BY k "
     "ORDER BY k "
     "LIMIT 50";

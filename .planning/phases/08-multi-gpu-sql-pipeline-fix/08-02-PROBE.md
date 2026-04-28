@@ -423,6 +423,6 @@ Site C above.
 ## Cleanup
 
 - `/tmp/claude-1002/sirius-fix02-probe.yaml` — 2-GPU yaml config (left in
-  place for 08-06 re-use; not committed to the repo).
+  place for 08-06 reuse; not committed to the repo).
 - `/tmp/claude-1002/fix02-probe-log/` — probe-attempt log directory
   (contains the NVML/0-GPUs error transcript). Not committed.

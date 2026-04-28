@@ -24,12 +24,9 @@ commands:
       output_parser: gtest
       args:
         - name: filter
-          description: "Catch2 test-spec filter (e.g. '*per-GPU distribution*'). Empty string runs all tests."
+          description: "Catch2 test-spec filter (e.g. '[followup-17]'). Empty string runs all tests."
           type: string
           default: ""
-      # command IS the binary here, so debug_command is not needed.
-      # valgrind will wrap it directly:
-      #   valgrind ./build/release/extension/sirius/test/cpp/sirius_unittest --abort
 
   benchmark:
     - name: tpch-benchmark
@@ -42,6 +39,40 @@ commands:
           type: number
           default: 1
 
+    - name: tpch-parquet
+      description: "Run TPC-H queries against Parquet files. Set SIRIUS_CONFIG_FILE in the environment before starting Claude."
+      command: "./test/tpch_performance/run_tpch_parquet.sh --parquet-dir {parquet_dir} --iterations {iterations} --timeout {timeout} {engine} {scale_factor} $(seq {first_query} {last_query})"
+      timeout: 7200
+      args:
+        - name: engine
+          description: "Engine to benchmark (sirius or duckdb)"
+          type: string
+          default: "sirius"
+        - name: scale_factor
+          description: "TPC-H scale factor (1, 10, 100)"
+          type: number
+          default: 100
+        - name: parquet_dir
+          description: "Directory containing TPC-H parquet files"
+          type: string
+          default: "/home/felipe/sirius/test_datasets/tpch/sf100"
+        - name: first_query
+          description: "First query number in range"
+          type: number
+          default: 1
+        - name: last_query
+          description: "Last query number in range"
+          type: number
+          default: 22
+        - name: iterations
+          description: "Number of iterations per query (1 cold + N-1 warm)"
+          type: number
+          default: 2
+        - name: timeout
+          description: "Per-session timeout in seconds (0 = no timeout)"
+          type: number
+          default: 1200
+
     - name: tpch-report
       description: "Generate report from existing benchmark results"
       command: "./test/tpch_performance/benchmark_and_validate.sh --report {run_dir}"
@@ -50,6 +81,22 @@ commands:
         - name: run_dir
           description: "Path to previous benchmark run directory"
           type: string
+
+  diagnostics:
+    - name: nvidia-smi
+      description: "Show GPU status, utilization, memory, and processes"
+      command: "nvidia-smi"
+      timeout: 30
+
+    - name: gpu-monitor
+      description: "Monitor GPU utilization for a given duration (1-second samples)"
+      command: "timeout {duration} nvidia-smi dmon -s pucvmet -d 1"
+      timeout: 120
+      args:
+        - name: duration
+          description: "Monitoring duration in seconds"
+          type: number
+          default: 10
 
   lint:
     - name: pre-commit

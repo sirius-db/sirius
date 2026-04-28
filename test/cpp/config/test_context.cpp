@@ -17,6 +17,11 @@
 #include "catch.hpp"
 #include "sirius_context.hpp"
 
+#include <cudf/contiguous_split.hpp>
+#include <cudf/utilities/default_stream.hpp>
+
+#include <rmm/cuda_stream.hpp>
+
 #include <cuda_runtime_api.h>
 
 #include <cucascade/data/data_batch.hpp>
@@ -24,14 +29,11 @@
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
-#include <cudf/contiguous_split.hpp>
-#include <cudf/utilities/default_stream.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <duckdb.hpp>
 #include <duckdb/execution/execution_context.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
-#include <rmm/cuda_stream.hpp>
 #include <utils/utils.hpp>
 
 #include <cstdint>
@@ -82,7 +84,7 @@ bool enable_p2p_for_test(int num_gpus)
 // equivalent helper in test/cpp/downgrade/test_downgrade_executor.cpp lives
 // in an anonymous namespace and is not reachable from this TU.
 uint64_t compute_batch_checksum_fnv1a64(const cucascade::data_batch& batch,
-                                         rmm::cuda_stream_view stream)
+                                        rmm::cuda_stream_view stream)
 {
   auto const& gpu_rep = batch.get_data()->cast<cucascade::gpu_table_representation>();
   auto packed         = cudf::pack(gpu_rep.get_table(), stream);
@@ -90,11 +92,8 @@ uint64_t compute_batch_checksum_fnv1a64(const cucascade::data_batch& batch,
 
   auto const bytes = packed.gpu_data->size();
   std::vector<uint8_t> host_buf(bytes);
-  cudaMemcpyAsync(host_buf.data(),
-                  packed.gpu_data->data(),
-                  bytes,
-                  cudaMemcpyDeviceToHost,
-                  stream.value());
+  cudaMemcpyAsync(
+    host_buf.data(), packed.gpu_data->data(), bytes, cudaMemcpyDeviceToHost, stream.value());
   stream.synchronize();
 
   uint64_t h = 0xcbf29ce484222325ULL;
@@ -340,8 +339,7 @@ TEST_CASE("converter_registry exposes gpu_to_gpu converter after initialize() (M
 
   bool has_gpu_to_gpu =
     registry
-      .has_converter<cucascade::gpu_table_representation,
-                     cucascade::gpu_table_representation>();
+      .has_converter<cucascade::gpu_table_representation, cucascade::gpu_table_representation>();
   REQUIRE(has_gpu_to_gpu);
 
   sirius::converter_registry::shutdown();
@@ -420,8 +418,8 @@ TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-0
     .set_reservation_fraction_per_host(limit_ratio);
 
   auto space_configs = builder.build();
-  auto manager = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
-    std::move(space_configs));
+  auto manager =
+    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(std::move(space_configs));
 
   sirius::converter_registry::initialize();
   auto& registry = sirius::converter_registry::get();
@@ -445,12 +443,12 @@ TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-0
   // reachable from this TU; replicate its body inline using the
   // sirius::create_cudf_table_with_random_data + sirius::make_data_batch
   // primitives (same helpers the downgrade test uses).
-  auto build_stream = cudf::get_default_stream();
-  auto mr           = gpu0->get_default_allocator();
+  auto build_stream                                      = cudf::get_default_stream();
+  auto mr                                                = gpu0->get_default_allocator();
   std::vector<cudf::data_type> col_types                 = {cudf::data_type{cudf::type_id::INT32}};
   std::vector<std::optional<std::pair<int, int>>> ranges = {std::make_pair(0, 100000)};
-  auto table =
-    sirius::create_cudf_table_with_random_data(/*num_rows=*/1024, col_types, ranges, build_stream, mr);
+  auto table = sirius::create_cudf_table_with_random_data(
+    /*num_rows=*/1024, col_types, ranges, build_stream, mr);
   auto batch = sirius::make_data_batch(std::move(table), *gpu0);
   REQUIRE(batch != nullptr);
   auto const original_bytes = batch->get_data()->get_size_in_bytes();
@@ -490,8 +488,7 @@ TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-0
   // in .planning/phases/07-*/07-RESEARCH.md for the NVIDIA-documented
   // mitigation (disable P2P on affected platforms, or use Hopper/Blackwell).
   auto checksum_post = compute_batch_checksum_fnv1a64(*batch, stream.view());
-  INFO("MGPU-04 + MGPU-06 round-trip checksum: pre=" << checksum_pre
-                                                      << " post=" << checksum_post);
+  INFO("MGPU-04 + MGPU-06 round-trip checksum: pre=" << checksum_pre << " post=" << checksum_post);
   REQUIRE(checksum_post == checksum_pre);
 
   manager->shutdown();

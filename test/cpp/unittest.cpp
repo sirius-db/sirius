@@ -72,8 +72,7 @@ struct shared_env_listener : Catch::TestEventListenerBase {
     // The 2-GPU integration env is switched on/off by the TEST_CASE body via
     // acquire_integration_env_for(2); the listener only ensures it's paused
     // between tests so it never holds the extension lock unexpectedly.
-    if (sirius::test::g_integration_env_2gpu &&
-        sirius::test::g_integration_env_2gpu->is_active()) {
+    if (sirius::test::g_integration_env_2gpu && sirius::test::g_integration_env_2gpu->is_active()) {
       sirius::test::g_integration_env_2gpu->pause();
     }
 

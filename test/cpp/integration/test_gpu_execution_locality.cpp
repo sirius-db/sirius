@@ -19,13 +19,12 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
 
-#include <data/sirius_converter_registry.hpp>
-
 #include <cuda_runtime_api.h>
 
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
+#include <data/sirius_converter_registry.hpp>
 
 #include <atomic>
 #include <cmath>
@@ -251,9 +250,8 @@ TEST_CASE("scan batches distributed across multiple GPUs", "[.][data_locality][m
 // evidence point on the full integration surface.
 //===----------------------------------------------------------------------===//
 
-TEST_CASE(
-  "adaptive scan + P2P path distributes asymmetric preload (MGPU-07)",
-  "[data_locality][multi_gpu][mgpu_07_adaptive_scan]")
+TEST_CASE("adaptive scan + P2P path distributes asymmetric preload (MGPU-07)",
+          "[data_locality][multi_gpu][mgpu_07_adaptive_scan]")
 {
   int device_count = 0;
   cudaGetDeviceCount(&device_count);
@@ -276,8 +274,8 @@ TEST_CASE(
     .use_host_per_gpu()
     .set_reservation_fraction_per_host(0.75);
   auto space_configs = builder.build();
-  auto mem_mgr = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
-    std::move(space_configs));
+  auto mem_mgr =
+    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(std::move(space_configs));
   sirius::converter_registry::initialize();
 
   auto gpu_spaces = mem_mgr->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
@@ -296,24 +294,19 @@ TEST_CASE(
   REQUIRE(gpu0_initial > 0);
   REQUIRE(gpu1_initial > 0);
 
-  const size_t preload_bytes =
-    static_cast<size_t>(0.9 * static_cast<double>(gpu0_max_reservable));
-  auto preload_reservation = gpu0->make_reservation_or_null(preload_bytes);
+  const size_t preload_bytes = static_cast<size_t>(0.9 * static_cast<double>(gpu0_max_reservable));
+  auto preload_reservation   = gpu0->make_reservation_or_null(preload_bytes);
   REQUIRE(preload_reservation != nullptr);
 
   const size_t free0 = gpu0->get_available_memory();
   const size_t free1 = gpu1->get_available_memory();
   REQUIRE(free0 > 0);
   REQUIRE(free1 > 0);
-  const double free_ratio_gpu1_over_gpu0 =
-    static_cast<double>(free1) / static_cast<double>(free0);
-  INFO("MGPU-07 integration preload: gpu0_initial=" << gpu0_initial
-                                                     << " gpu1_initial=" << gpu1_initial
-                                                     << " preload=" << preload_bytes
-                                                     << " free0=" << free0
-                                                     << " free1=" << free1
-                                                     << " free_ratio_gpu1_over_gpu0="
-                                                     << free_ratio_gpu1_over_gpu0);
+  const double free_ratio_gpu1_over_gpu0 = static_cast<double>(free1) / static_cast<double>(free0);
+  INFO("MGPU-07 integration preload: gpu0_initial="
+       << gpu0_initial << " gpu1_initial=" << gpu1_initial << " preload=" << preload_bytes
+       << " free0=" << free0 << " free1=" << free1
+       << " free_ratio_gpu1_over_gpu0=" << free_ratio_gpu1_over_gpu0);
   REQUIRE(free_ratio_gpu1_over_gpu0 >= 2.0);
 
   // Histogram over 32 distribution decisions using the same weighted-pick
@@ -325,7 +318,7 @@ TEST_CASE(
   // uniformly across [0, total_available) via stride scaling to reproduce the
   // same long-run distribution the production code produces.
   std::vector<cucascade::memory::memory_space*> spaces = {gpu0, gpu1};
-  size_t total_available                                = 0;
+  size_t total_available                               = 0;
   for (auto* s : spaces) {
     total_available += s->get_available_memory();
   }
@@ -360,11 +353,10 @@ TEST_CASE(
     static_cast<double>(count_gpu1) / static_cast<double>(std::max(count_gpu0, 1));
   REQUIRE(batch_ratio >= 2.0);  // CONTEXT success criterion 3
 
-  const double delta = std::abs(batch_ratio - free_ratio_gpu1_over_gpu0) /
-                       free_ratio_gpu1_over_gpu0;
-  INFO("MGPU-07 integration ratio check: batch_ratio=" << batch_ratio
-                                                        << " expected=" << free_ratio_gpu1_over_gpu0
-                                                        << " delta=" << delta);
+  const double delta =
+    std::abs(batch_ratio - free_ratio_gpu1_over_gpu0) / free_ratio_gpu1_over_gpu0;
+  INFO("MGPU-07 integration ratio check: batch_ratio="
+       << batch_ratio << " expected=" << free_ratio_gpu1_over_gpu0 << " delta=" << delta);
   REQUIRE(delta <= 0.10);
 
   sirius::converter_registry::shutdown();

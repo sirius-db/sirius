@@ -16,10 +16,6 @@
 
 #include "data/sirius_host_to_gpu_converter.hpp"
 
-#include <cucascade/data/cpu_data_representation.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
-#include <cucascade/memory/host_table.hpp>
-
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/dictionary/dictionary_factories.hpp>
@@ -31,9 +27,12 @@
 #include <rmm/cuda_device.hpp>
 #include <rmm/device_buffer.hpp>
 
-#include <spdlog/spdlog.h>
-
 #include <cuda_runtime_api.h>
+
+#include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/memory/host_table.hpp>
+#include <spdlog/spdlog.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -89,9 +88,9 @@ rmm::device_buffer alloc_and_copy_h2d(cucascade::memory::fixed_multiple_blocks_a
       // Consume sticky state before reporting.
       (void)cudaGetLastError();
       throw std::runtime_error(
-        std::string("sirius_host_to_gpu_converter: cudaMemcpyAsync H2D failed: ")
-        + cudaGetErrorString(cerr)
-        + " (FIX-02; verify target_stream is bound to the current target device)");
+        std::string("sirius_host_to_gpu_converter: cudaMemcpyAsync H2D failed: ") +
+        cudaGetErrorString(cerr) +
+        " (FIX-02; verify target_stream is bound to the current target device)");
     }
     dst_off += bytes_to_copy;
     block_off += bytes_to_copy;
@@ -135,15 +134,14 @@ std::unique_ptr<cudf::column> reconstruct_column_target_stream(
         "sirius_host_to_gpu_converter: STRING column metadata must have at least one child "
         "(offsets)");
     }
-    auto offsets_col =
-      reconstruct_column_target_stream(meta.children[0], alloc, target_stream, mr);
+    auto offsets_col = reconstruct_column_target_stream(meta.children[0], alloc, target_stream, mr);
     if (offsets_col->type().id() == cudf::type_id::INT32) {
       // cudf's make_strings_column requires INT64 offsets for large-string
       // support. Sync before cast so the freshly-copied INT32 offsets buffer
       // is stable on device.
       target_stream.synchronize();
-      offsets_col = cudf::cast(
-        offsets_col->view(), cudf::data_type{cudf::type_id::INT64}, target_stream, mr);
+      offsets_col =
+        cudf::cast(offsets_col->view(), cudf::data_type{cudf::type_id::INT64}, target_stream, mr);
     }
     rmm::device_buffer chars_buf{};
     if (meta.has_data && meta.data_size > 0) {
@@ -162,15 +160,13 @@ std::unique_ptr<cudf::column> reconstruct_column_target_stream(
         "sirius_host_to_gpu_converter: LIST column metadata must have two children (offsets, "
         "values)");
     }
-    auto offsets_col =
-      reconstruct_column_target_stream(meta.children[0], alloc, target_stream, mr);
+    auto offsets_col = reconstruct_column_target_stream(meta.children[0], alloc, target_stream, mr);
     if (offsets_col->type().id() == cudf::type_id::INT32) {
       target_stream.synchronize();
-      offsets_col = cudf::cast(
-        offsets_col->view(), cudf::data_type{cudf::type_id::INT64}, target_stream, mr);
+      offsets_col =
+        cudf::cast(offsets_col->view(), cudf::data_type{cudf::type_id::INT64}, target_stream, mr);
     }
-    auto values_col =
-      reconstruct_column_target_stream(meta.children[1], alloc, target_stream, mr);
+    auto values_col = reconstruct_column_target_stream(meta.children[1], alloc, target_stream, mr);
     return cudf::make_lists_column(meta.num_rows,
                                    std::move(offsets_col),
                                    std::move(values_col),
@@ -203,9 +199,8 @@ std::unique_ptr<cudf::column> reconstruct_column_target_stream(
     }
     // cucascade encoding: children[0] = indices, children[1] = keys.
     // cudf::make_dictionary_column signature: (keys, indices, null_mask, null_count).
-    auto indices_col =
-      reconstruct_column_target_stream(meta.children[0], alloc, target_stream, mr);
-    auto keys_col = reconstruct_column_target_stream(meta.children[1], alloc, target_stream, mr);
+    auto indices_col = reconstruct_column_target_stream(meta.children[0], alloc, target_stream, mr);
+    auto keys_col    = reconstruct_column_target_stream(meta.children[1], alloc, target_stream, mr);
     return cudf::make_dictionary_column(
       std::move(keys_col), std::move(indices_col), std::move(null_mask), null_count);
   }

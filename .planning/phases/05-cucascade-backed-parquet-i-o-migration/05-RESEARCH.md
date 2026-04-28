@@ -273,7 +273,7 @@ _datasource = std::make_shared<sirius::io::cucascade_datasource>(
 
 Open question — how `parquet_scan_task` accesses `SiriusContext`: the scan task currently doesn't hold a context pointer. Options:
 1. **Inject backend directly**: look up the backend at task-creation time (in `task_creator`) and pass it into `parquet_scan_task` via the local_state. Preserves current separation of concerns.
-2. **Global accessor**: add a `SiriusContext::current()` or equivalent process-singleton pointer. CLAUDE.md / STATE.md don't explicitly forbid this, but the existing pattern (extension callback stores `context_` on `ClientContext::registered_state`) argues against global statics.
+2. **Global accessor**: add a `SiriusContext::current()` or equivalent process-singleton pointer. CLAUDE.md / STATE.md don't explicitly forbid this, but the existing pattern (extension callback stores `context_` on `ClientContext::registered_state`) argues against global statistics.
 3. **Plumb via task_creator**: `task_creator_` in SiriusContext already exists; `task_creator` could accept a reference to the per-GPU backend cache and seed each parquet_scan_task's local_state with its resolved backend.
 
 **Recommendation for planner:** Option 3 — `task_creator` seeds local_state with the resolved backend, keeping SiriusContext reference out of the scan task. This also matches how `preferred_device_id` is resolved at task-creation time (Phase 4 locked pattern).

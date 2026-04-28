@@ -14,7 +14,7 @@ ship_gate: closed
 
 Autonomous validation run (per 2026-04-24 memory `feedback_mcp_tests_scope.md`). The agent executed the build, unit-tests, SF100 ship-gate, and VALIDATION authoring without user delegation.
 
-**Net outcome:** SF100 Q1 num_gpus=2 ship-gate PASSES with byte-identical result vs 1-GPU baseline, cross-GPU batch_id intersection=0 across 71 scan batches, 5.86s wall-clock, zero fallbacks, zero cudaErrorInvalidValue, zero SIGSEGV. AUDIT TEST_CASE disjointness REQUIRE (Plan 09-03) holds. Plan 09-01 `preferred_device_id=-1` sentinel plumbing is provably gone. However, a REGRESSION in the unit-test suite (NOT related to the distributor fix) surfaced: the SF1-scale TPC-H parquet fixture (`gpu_execution - filter equality parquet`) and the SF10 Q1 2-GPU test (`gpu_execution - tpch_q1_sf10_2gpu`) both SIGSEGV during `compare_gpu_vs_cpu`'s second `SELECT * FROM gpu_execution(...)` invocation — a code path that IS NOT exercised by the SF100 CLI run (which uses only the `CALL gpu_execution(...)` form). The distributor itself works across SF1/SF10/SF100 scales; the regression is in downstream `SELECT * FROM gpu_execution(...)` result-materialization, which scopes to a follow-up Phase 10.
+**Net outcome:** SF100 Q1 num_gpus=2 ship-gate PASSES with byte-identical result vs 1-GPU baseline, cross-GPU batch_id intersection=0 across 71 scan batches, 5.86s wall-clock, zero fallbacks, zero cudaErrorInvalidValue, zero SIGSEGV. AUDIT TEST_CASE disjointedness REQUIRE (Plan 09-03) holds. Plan 09-01 `preferred_device_id=-1` sentinel plumbing is provably gone. However, a REGRESSION in the unit-test suite (NOT related to the distributor fix) surfaced: the SF1-scale TPC-H parquet fixture (`gpu_execution - filter equality parquet`) and the SF10 Q1 2-GPU test (`gpu_execution - tpch_q1_sf10_2gpu`) both SIGSEGV during `compare_gpu_vs_cpu`'s second `SELECT * FROM gpu_execution(...)` invocation — a code path that IS NOT exercised by the SF100 CLI run (which uses only the `CALL gpu_execution(...)` form). The distributor itself works across SF1/SF10/SF100 scales; the regression is in downstream `SELECT * FROM gpu_execution(...)` result-materialization, which scopes to a follow-up Phase 10.
 
 ## ROADMAP Criterion-by-Criterion Verdict Summary
 
@@ -22,7 +22,7 @@ Autonomous validation run (per 2026-04-24 memory `feedback_mcp_tests_scope.md`).
 | - | --------- | ------- |
 | 1 | SF100 TPC-H Q1 num_gpus=2 correct vs num_gpus=1 baseline, no SIGSEGV/cudaErrorInvalidValue/fallback | **PASS** |
 | 2 | MCP unit-tests exits 0 with 88 SF1 variants (GENERATE(1,2)) + SF10 Q1/Q6/Q12 green | **FAIL** (SIGSEGV in `filter equality parquet` + `tpch_q1_sf10_2gpu` — regression in `SELECT * FROM gpu_execution` result-materialization path, unrelated to distributor fix) |
-| 4 | AUDIT TEST_CASE: pipeline_task>=5 AND scan_batch>=5 per GPU AND cross-GPU disjointness==∅ | **PARTIAL** (disjointness REQUIRE PASSES; the SF1-DuckDB AUDIT fixture produces only 2 scan_ids per GPU, failing the SF10-strict >=5 threshold — pre-existing test-design mismatch, not a Phase 9 regression) |
+| 4 | AUDIT TEST_CASE: pipeline_task>=5 AND scan_batch>=5 per GPU AND cross-GPU disjointedness==∅ | **PARTIAL** (disjointedness REQUIRE PASSES; the SF1-DuckDB AUDIT fixture produces only 2 scan_ids per GPU, failing the SF10-strict >=5 threshold — pre-existing test-design mismatch, not a Phase 9 regression) |
 | 6 | SF100 [mgpu-audit] distributes scan_batches across both GPUs + wall-clock captured | **PASS** (71 scan batches distributed as GPU0=45, GPU1=26, disjoint; wall-clock 5.86s; 217 [mgpu-audit] entries) |
 
 **Phase-level verdict:** PARTIAL — CRIT-1 and CRIT-6 PASS outright; CRIT-4 distributor-disjointness REQUIRE passes; CRIT-2 fails on a regression that was not in the distributor plumbing but in a downstream `SELECT * FROM gpu_execution` code path (result-materialization), scoped as Phase 10.
@@ -119,7 +119,7 @@ per-GPU audit counts: GPU0{pipeline=6, scan=2} GPU1{pipeline=4, scan=2}
 
 # RUN 4 — AUDIT TEST_CASE with relaxed threshold (no SIRIUS_TEST_SF10_PATH):
 All tests passed (16 assertions in 1 test case)
-  — distributor REQUIREs (Plan 09-03 cross-GPU scan_batch disjointness) PASS.
+  — distributor REQUIREs (Plan 09-03 cross-GPU scan_batch disjointedness) PASS.
 ```
 
 #### Q4 parquet retry (v1.1 precedent flake policy)
@@ -143,7 +143,7 @@ per-GPU audit counts from /tmp/sirius-mgpu-audit-997554: GPU0{pipeline=6, scan=2
 [2026-04-24 10:04:19.790] [mgpu-audit] pipeline_task dispatched to GPU 1 task_id=7
 (10 more pipeline_task lines, GPU 0 ∪ GPU 1 coverage confirmed)
 
-# Cross-GPU disjointness:
+# Cross-GPU disjointedness:
 AUDIT run (SF1-DuckDB data): GPU0=2 unique batch_ids, GPU1=2 unique batch_ids, intersect=0
 cross-GPU scan_batch intersection size: 0
 UT cross-GPU batch_id intersection (log-derived): 0
@@ -248,7 +248,7 @@ All Phase 9 source invariants are PRESERVED. No net-new `rmm::cuda_stream_defaul
 
 ## Verdict
 
-**PARTIAL** — Plans 09-01 (preferred_device_id plumbing), 09-02 (batch→GPU affinity map), and 09-03 (cross-GPU disjointness REQUIRE) are all demonstrably live, correct, and effective at the SF100 scale (CRIT-1 + CRIT-6 PASS outright with byte-identical results and disjoint batch dispatch). The AUDIT disjointness REQUIRE (Plan 09-03) passes. However, an unrelated REGRESSION in the unit-test suite's `compare_gpu_vs_cpu` helper second-form path (`SELECT * FROM gpu_execution(...)` vs `CALL gpu_execution(...)`) causes SIGSEGV in multiple TPC-H parquet TEST_CASEs on both 1-GPU and 2-GPU envs. This regression is not in the Plan 09-01/02/03 distributor changes — it surfaces a distinct bug in downstream result-materialization that Phase 10 must diagnose. The v1.2 SF100 ship-gate (ROADMAP Criteria 1 + 6) PASSES, but the unit-test coverage gate (Criterion 2) does not.
+**PARTIAL** — Plans 09-01 (preferred_device_id plumbing), 09-02 (batch→GPU affinity map), and 09-03 (cross-GPU disjointedness REQUIRE) are all demonstrably live, correct, and effective at the SF100 scale (CRIT-1 + CRIT-6 PASS outright with byte-identical results and disjoint batch dispatch). The AUDIT disjointedness REQUIRE (Plan 09-03) passes. However, an unrelated REGRESSION in the unit-test suite's `compare_gpu_vs_cpu` helper second-form path (`SELECT * FROM gpu_execution(...)` vs `CALL gpu_execution(...)`) causes SIGSEGV in multiple TPC-H parquet TEST_CASEs on both 1-GPU and 2-GPU envs. This regression is not in the Plan 09-01/02/03 distributor changes — it surfaces a distinct bug in downstream result-materialization that Phase 10 must diagnose. The v1.2 SF100 ship-gate (ROADMAP Criteria 1 + 6) PASSES, but the unit-test coverage gate (Criterion 2) does not.
 
 ## Open Issue
 
@@ -267,7 +267,7 @@ Both SIGSEGV at the same call-site pattern: after the first `CALL gpu_execution`
 
 - **H1 — residual `_datasource` caching on compute_task re-dispatch (RESEARCH.md Open Questions #1):** `_datasource` is a `std::shared_ptr` member of `parquet_scan_task`, set inside `if (!_datasource)` in `compute_task`. It persists across calls to the same task object. When the test issues the second `SELECT * FROM gpu_execution(...)`, Sirius constructs fresh tasks with fresh global_state. But if the backing `prefetched_data_source` (cucascade) or the cached parquet view context from the first query's `CREATE OR REPLACE VIEW` is reused with stale device-binding, the second call can dereference a freed allocation. Confirm by adding `[mgpu-probe]` at the `_datasource` construction site + reset points.
 - **H2 — TABLE_FUNCTION-form result materialization vs PROCEDURE-form (`CALL`) (most likely, new hypothesis):** The first form `CALL gpu_execution("...")` returns a Sirius-produced result directly. The second form `SELECT * FROM gpu_execution("...")` wraps it in a DuckDB table function binding, which may hit a different result-passing code path (copy vs move, different lifetime for `GPUResult` proxy). This is a Sirius-layer bug in the table-function output shaping, not in the distributor. File to audit: `src/sirius_extension.cpp` around the `gpu_execution` table function registration + `src/sirius_interface.cpp`.
-- **H3 — `_batch_gpu_affinity` map lifecycle on second query (RESEARCH.md Q5 Candidate 2):** The Plan 09-02 map is reset on `prepare_cache_for_scan_operators` (query start). If the second query re-uses cache but the map reset races with dispatch thread observation of the map, a stale affinity could be read. Unlikely at single-threaded dispatch within one process, but worth verifying with a trace.
+- **H3 — `_batch_gpu_affinity` map lifecycle on second query (RESEARCH.md Q5 Candidate 2):** The Plan 09-02 map is reset on `prepare_cache_for_scan_operators` (query start). If the second query reuses cache but the map reset races with dispatch thread observation of the map, a stale affinity could be read. Unlikely at single-threaded dispatch within one process, but worth verifying with a trace.
 - **H4 — build or unit-tests regression unrelated to distributor (fallback hypothesis):** Bisect 09-01/02/03 commits (`3b58258`, `863cc6c`, `0c8068e`, `a8a7985`, `c0e12f3`) to find which one introduces the SIGSEGV. Could be `_batch_gpu_affinity` allocation corruption, a use-after-free in the `unordered_map` mutation path, or a data race.
 
 ### Suggested next actions (Phase 10 scope)
@@ -281,7 +281,7 @@ Both SIGSEGV at the same call-site pattern: after the first `CALL gpu_execution`
 
 ## Next Steps
 
-- **v1.2 ship-gate status:** BLOCKED on CRIT-2 (unit-test regression). CRIT-1, CRIT-4 (partial), CRIT-6 are green. The distributor win is REAL: SF100 Q1 num_gpus=2 executes in 5.86s with correct results and cross-GPU batch disjointness.
+- **v1.2 ship-gate status:** BLOCKED on CRIT-2 (unit-test regression). CRIT-1, CRIT-4 (partial), CRIT-6 are green. The distributor win is REAL: SF100 Q1 num_gpus=2 executes in 5.86s with correct results and cross-GPU batch disjointedness.
 - **Phase 10 scope:** Isolate the `SELECT * FROM gpu_execution` SIGSEGV via the bisect + gdb + instrumentation plan above. Most-likely root cause is H2 (TABLE_FUNCTION-form result-materialization divergence from CALL-form), not the distributor.
 - **No changes required to Plans 09-01, 09-02, 09-03** — their code is correct and their runtime behavior is proven at SF1, SF10, and SF100 scales.
 - **ROADMAP.md:** Phase 9 marks plan 09-04 complete; v1.2 milestone remains BLOCKED pending Phase 10.

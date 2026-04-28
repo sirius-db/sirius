@@ -480,8 +480,8 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     // task for this join. All such tasks must land on the same GPU, so we tag
     // them with operator_id as the partition index (hash joins get spread
     // across GPUs at the query level, but each individual join stays pinned).
-    return std::make_unique<partitioned_operator_data>(
-      std::move(input_batch), this->get_operator_id());
+    return std::make_unique<partitioned_operator_data>(std::move(input_batch),
+                                                       this->get_operator_id());
 
   } else if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::BUILT) {
     if (probe_port->repo->num_partitions() != 1) {
@@ -580,8 +580,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
           // join must live on one device, and without the tag task dispatch
           // falls back to data locality, which can route the probe side to a
           // different GPU than the build side for the same partition.
-          return std::make_unique<partitioned_operator_data>(input_batch,
-                                                             partition_idx);
+          return std::make_unique<partitioned_operator_data>(input_batch, partition_idx);
         }
         right_counter++;
         counter++;

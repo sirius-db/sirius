@@ -105,20 +105,19 @@ class host_parquet_representation : public cucascade::idata_representation {
    * @param[in] fallback_datasource An optional fallback datasource for uncached byte ranges.
    * @param[in]
    */
-  host_parquet_representation(
-    cucascade::memory::memory_space* memory_space,
-    cucascade::memory::fixed_multiple_blocks_allocation column_chunks,
-    std::shared_ptr<hybrid_scan_reader> parquet_reader,
-    cudf::io::parquet_reader_options reader_options,
-    std::vector<cudf::size_type> row_group_indices,
-    std::vector<cudf::io::text::byte_range_info> column_chunk_byte_ranges,
-    std::size_t size_in_bytes,
-    std::size_t uncompressed_size_in_bytes,
-    std::size_t file_size,
-    std::shared_ptr<cudf::io::datasource> fallback_datasource,
-    std::shared_ptr<std::unordered_map<int, translated_expression>> filter_expression_by_device =
-      nullptr,
-    std::vector<std::size_t> post_filter_projection_ids = {})
+  host_parquet_representation(cucascade::memory::memory_space* memory_space,
+                              cucascade::memory::fixed_multiple_blocks_allocation column_chunks,
+                              std::shared_ptr<hybrid_scan_reader> parquet_reader,
+                              cudf::io::parquet_reader_options reader_options,
+                              std::vector<cudf::size_type> row_group_indices,
+                              std::vector<cudf::io::text::byte_range_info> column_chunk_byte_ranges,
+                              std::size_t size_in_bytes,
+                              std::size_t uncompressed_size_in_bytes,
+                              std::size_t file_size,
+                              std::shared_ptr<cudf::io::datasource> fallback_datasource,
+                              std::shared_ptr<std::unordered_map<int, translated_expression>>
+                                filter_expression_by_device                       = nullptr,
+                              std::vector<std::size_t> post_filter_projection_ids = {})
     : idata_representation(*memory_space),
       _column_chunks(std::move(column_chunks)),
       _parquet_reader(std::move(parquet_reader)),

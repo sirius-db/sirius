@@ -131,14 +131,14 @@ Every field consumed in Plan 02 (push-model routing reads `topo.gpus[i].numa_nod
   - `src/op/scan/duckdb_scan_executor.cpp` — Plan 04-02 Task 4
   - `test/cpp/downgrade/test_downgrade_executor.cpp` — Plan 04-03 re-author (commits 8159a0f, b5e2e36, a3cbecb)
   - `test/cpp/integration/test_gpu_execution_locality.cpp` — Plan 04-02 Task 5 (commit 2c28d4f)
-- `codespell`: 1 file (`.planning/research/CUDF-DATASOURCE.md`; "Re-use" → "Reuse")
+- `codespell`: 1 file (`.planning/research/CUDF-DATASOURCE.md`; "Reuse" → "Reuse")
 
 **Step 2 — verified purity:** `git diff` on each file showed:
 
 - `end-of-file-fixer`: appends a single newline to files lacking trailing `\n`
 - `trailing-whitespace`: strips trailing spaces on heading lines (markdown)
 - `clang-format`: alignment widening on struct-initializer `=` columns (test_downgrade_executor.cpp), single-line collapse of `TEST_CASE(name, tags)` that fit on one line (test_downgrade_executor.cpp:802, :872), include-order reshuffle from `<cuda_runtime_api.h>` before `<cucascade/...>` (test_gpu_execution_locality.cpp:18-22), line-break injections for over-width expressions (test_gpu_execution_locality.cpp:75, :93, :105, :157, :274), comment continuation alignment (duckdb_scan_executor.hpp:188, duckdb_scan_executor.cpp:168)
-- `codespell`: identifier "Re-use" → "Reuse" in markdown prose
+- `codespell`: identifier "Reuse" → "Reuse" in markdown prose
 
 **Zero semantic changes.** All files committed together in `style(04-04): apply pre-commit fixups across Phase 4 changes` (f5afde1) because the tree cannot be split — pre-commit is all-or-nothing on tree cleanliness, and the out-of-scope drift must be committed before the pre-commit re-run can pass.
 

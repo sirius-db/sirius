@@ -52,21 +52,21 @@ plans:
       - "src/op/sirius_physical_operator.cpp:47,75 — [mgpu-probe] breadcrumbs on prepare_for_processing nullopt paths"
       - "VALIDATION.md SF100 evidence: 71 batches dispatched, GPU0=45 unique, GPU1=26 unique, cross-GPU intersection=0"
   - id: 09-03
-    scope: "Cross-GPU disjointness REQUIRE"
+    scope: "Cross-GPU disjointedness REQUIRE"
     authoring: complete
     runtime: pass
     evidence:
       - "test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp:46 — #include <algorithm> for std::set_intersection"
       - "test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp:260 — std::set_intersection(counts[0].scan_ids, counts[1].scan_ids)"
       - "test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp:271 — REQUIRE(cross_gpu_intersection.empty())"
-      - "VALIDATION.md RUN 4: 'All tests passed (16 assertions in 1 test case)' with disjointness REQUIRE firing"
+      - "VALIDATION.md RUN 4: 'All tests passed (16 assertions in 1 test case)' with disjointedness REQUIRE firing"
       - "AUDIT-fixture runtime: GPU0=2 unique batch_ids, GPU1=2 unique, intersect=0"
   - id: 09-04
     scope: "Ship-gate validation on 2-GPU hardware"
     authoring: complete
     runtime: partial
     evidence:
-      - "09-04-VALIDATION.md verdict: PARTIAL (CRIT-1/CRIT-6 PASS on SF100 PROCEDURE-form; CRIT-4 PASS on disjointness REQUIRE; CRIT-2 FAIL on TABLE_FUNCTION SIGSEGV)"
+      - "09-04-VALIDATION.md verdict: PARTIAL (CRIT-1/CRIT-6 PASS on SF100 PROCEDURE-form; CRIT-4 PASS on disjointedness REQUIRE; CRIT-2 FAIL on TABLE_FUNCTION SIGSEGV)"
       - "SF100 Q1 num_gpus=2: exit 0, wall-clock 0:05.86, byte-identical CSV vs num_gpus=1 baseline (0:05.54)"
       - "MCP unit-tests exit 139 (SIGSEGV in 'gpu_execution - filter equality parquet' + 'tpch_q1_sf10_2gpu'); H1-H4 hypotheses seeded for Phase 10"
 
@@ -83,7 +83,7 @@ criteria:
   4:
     name: "AUDIT TEST_CASE: pipeline_task>=5 AND scan_batch>=5 per GPU AND cross-GPU scan_ids intersection == empty"
     verdict: PASS_PARTIAL
-    detail: "Disjointness REQUIRE (the Phase 9 regression gate) PASSES. The `>=5` threshold per GPU fails on the AUDIT TEST_CASE's SF1-DuckDB fixture (only 2 scan_ids per GPU) — pre-existing Plan 08-05 test-design choice, not a Phase 9 regression. The distributor-correctness claim the REQUIRE was designed to lock in is GREEN."
+    detail: "Disjointedness REQUIRE (the Phase 9 regression gate) PASSES. The `>=5` threshold per GPU fails on the AUDIT TEST_CASE's SF1-DuckDB fixture (only 2 scan_ids per GPU) — pre-existing Plan 08-05 test-design choice, not a Phase 9 regression. The distributor-correctness claim the REQUIRE was designed to lock in is GREEN."
   6:
     name: "SF100 [mgpu-audit] scan_batch distributes across both GPUs + wall-clock captured"
     verdict: PASS
@@ -138,7 +138,7 @@ open_issue_carryforward:
         - "src/sirius_extension.cpp"
         - "src/sirius_interface.cpp"
     - id: H3
-      description: "_batch_gpu_affinity map lifecycle on second query (RESEARCH.md Q5 Candidate 2). Map reset on prepare_cache_for_scan_operators — if second query re-uses cache with stale map, potential race."
+      description: "_batch_gpu_affinity map lifecycle on second query (RESEARCH.md Q5 Candidate 2). Map reset on prepare_cache_for_scan_operators — if second query reuses cache with stale map, potential race."
       probe: "Trace _batch_gpu_affinity access across consecutive queries"
     - id: H4
       description: "Build or unit-tests regression unrelated to distributor (fallback). Could be unordered_map allocation corruption, use-after-free, or data race introduced by one of 3b58258/863cc6c/0c8068e/a8a7985/c0e12f3."
@@ -163,7 +163,7 @@ open_issue_carryforward:
 
 Phase 9 is a **split verdict**:
 
-- **Distributor fix (narrow goal):** **ACHIEVED**. All three distributor plans (09-01 preferred_device_id plumbing, 09-02 batch→GPU affinity map, 09-03 cross-GPU disjointness REQUIRE) are authoring-complete, code-review-verifiable in-tree, and runtime-proven at SF100 scale. The SF100 Q1 num_gpus=2 ship-gate CLI run executes in 5.86s, produces a byte-identical result vs num_gpus=1 baseline, and distributes 71 scan batches disjointly across both GPUs (GPU0=45 unique, GPU1=26 unique, cross-GPU intersection=0). The Plan 09-03 disjointness REQUIRE fires and PASSES on the AUDIT TEST_CASE runtime fixture.
+- **Distributor fix (narrow goal):** **ACHIEVED**. All three distributor plans (09-01 preferred_device_id plumbing, 09-02 batch→GPU affinity map, 09-03 cross-GPU disjointedness REQUIRE) are authoring-complete, code-review-verifiable in-tree, and runtime-proven at SF100 scale. The SF100 Q1 num_gpus=2 ship-gate CLI run executes in 5.86s, produces a byte-identical result vs num_gpus=1 baseline, and distributes 71 scan batches disjointly across both GPUs (GPU0=45 unique, GPU1=26 unique, cross-GPU intersection=0). The Plan 09-03 disjointedness REQUIRE fires and PASSES on the AUDIT TEST_CASE runtime fixture.
 
 - **Ship-gate closure (broad goal):** **NOT ACHIEVED**. Phase 9's stated goal includes closing inherited v1.2 Success Criteria 1/2/4/6. CRIT-1/4/6 are in the PASS/PASS_PARTIAL column on their narrow metrics, but CRIT-2 (MCP unit-tests exit 0 with 88 SF1 variants + SF10 smoke on num_gpus=2 pass) outright FAILS due to a SIGSEGV in the `SELECT * FROM gpu_execution(...)` TABLE_FUNCTION-form result-materialization code path. The regression is **orthogonal to the distributor** (SF100 CLI uses PROCEDURE form and passes cleanly) but is a real blocker for the ship-gate as written. STATE.md blockers section explicitly records this as "v1.2 SHIP BLOCKER — 09-04 CRIT-2".
 
@@ -208,7 +208,7 @@ Phase 9 is a **split verdict**:
 | 2 | SF100 [mgpu-audit] log shows non-empty scan_batch distribution on both GPU 0 and GPU 1 and cross-GPU batch_id intersection == 0 | **VERIFIED** | VALIDATION.md: 217 audit entries, 71 unique batch_ids, GPU0=45 unique, GPU1=26 unique, intersection=0 |
 | 3 | Plan 09-01 preferred_device_id plumbing is confirmed live: grep for `preferred_device_id=-1` on compute_task entry returns zero matches; both 0 and 1 observed | **VERIFIED** | VALIDATION.md runtime probe: `compute_task entry with preferred_device_id=-1: 0`; 4 × `preferred_device_id=0` + 3 × `preferred_device_id=1` |
 | 4 | AUDIT TEST_CASE cross-GPU scan_ids intersection REQUIRE fires and passes on the AUDIT runtime fixture | **VERIFIED** | VALIDATION.md RUN 4: 16 assertions, all pass; "cross-GPU scan_batch intersection size: 0" |
-| 5 | AUDIT TEST_CASE strict per-GPU counts (pipeline_task >= 5 AND scan_batch >= 5) fire when SIRIUS_TEST_SF10_PATH set | **FAILED (pre-existing)** | RUN 3: pipeline GPU0=6, GPU1=4 (fails 4>=5); scan GPU0=2, GPU1=2 (fails 2>=5). Pre-existing Plan 08-05 test-design choice: AUDIT fixture uses SF1-DuckDB ATTACH path, not SF10 data — only 2 scan_ids possible per GPU on SF1. Not a Phase 9 regression; the distributor-correctness claim (disjointness REQUIRE) is the substantive gate and it passes. |
+| 5 | AUDIT TEST_CASE strict per-GPU counts (pipeline_task >= 5 AND scan_batch >= 5) fire when SIRIUS_TEST_SF10_PATH set | **FAILED (pre-existing)** | RUN 3: pipeline GPU0=6, GPU1=4 (fails 4>=5); scan GPU0=2, GPU1=2 (fails 2>=5). Pre-existing Plan 08-05 test-design choice: AUDIT fixture uses SF1-DuckDB ATTACH path, not SF10 data — only 2 scan_ids possible per GPU on SF1. Not a Phase 9 regression; the distributor-correctness claim (disjointedness REQUIRE) is the substantive gate and it passes. |
 | 6 | 88 SF1 variants × {num_gpus=1, num_gpus=2} all pass via MCP unit-tests with Q4 retry-once flake policy | **FAILED** | RUN 1: exit 139 (SIGSEGV) in `gpu_execution - filter equality parquet` during compare_gpu_vs_cpu's second `SELECT * FROM gpu_execution(...)` call. Q4 retry policy NOT triggered (no Q4 failure observed; a different earlier SIGSEGV halts the run). |
 | 7 | SF10 Q1/Q6/Q12 × num_gpus=2 pass when SIRIUS_TEST_SF10_PATH is set | **FAILED** | RUN 2: exit 139 (SIGSEGV) in `gpu_execution - tpch_q1_sf10_2gpu` at the same TABLE_FUNCTION-form call-site |
 | 8 | Static invariants preserved (HYG-02 ≤ 41, Pattern 2 idiom preserved, Plans 09-01/02/03 source greps green) | **VERIFIED** | All 5 static-invariant rows in VALIDATION.md "Static Invariants" table PASS; independently re-grepped by this verification |
@@ -225,10 +225,10 @@ Phase 9 is a **split verdict**:
 |---------|-------------|---------|----------|
 | **CRIT-1** | SF100 Q1 on num_gpus=2 correct vs num_gpus=1 baseline, no cudaErrorInvalidValue / no SIGSEGV / no fallback | **PASS (narrow ship-gate)** / **PARTIAL (phase-level)** | SF100 CLI PROCEDURE-form: exit 0, byte-identical CSV, 5.86s wall-clock, 217 audit entries, zero SIGSEGV, zero cudaErrorInvalidValue, zero fallbacks. The TABLE_FUNCTION-form regression exists on the same `gpu_execution` SQL surface but is not exercised by the SF100 ship-gate. 09-04-SUMMARY.md `requirements-completed` does NOT list CRIT-1 → plan author concurs this is not fully closed. |
 | **CRIT-2** | MCP unit-tests exits 0 with 88 SF1 variants (GENERATE(1,2)) + SF10 Q1/Q6/Q12 green | **FAIL** | MCP unit-tests exit 139 on `gpu_execution - filter equality parquet` (1-GPU env) + `tpch_q1_sf10_2gpu` (2-GPU env). SIGSEGV in compare_gpu_vs_cpu's second `SELECT * FROM gpu_execution(...)` TABLE_FUNCTION call. Not distributor; scoped to Phase 10. |
-| **CRIT-4** | AUDIT TEST_CASE: pipeline_task>=5 AND scan_batch>=5 per GPU AND cross-GPU scan_ids intersection == empty | **PASS (distributor-correctness gate) / PARTIAL (strict threshold)** | Disjointness REQUIRE (Plan 09-03) PASSES: intersection=0. Strict ≥5 threshold fails on SF1-DuckDB fixture (2 scan_ids per GPU) — pre-existing Plan 08-05 choice. The distributor-correctness substantive claim is GREEN; only the strict-threshold decoration (which requires SF10-scale data the AUDIT fixture doesn't generate) is amber. 09-04-SUMMARY.md `requirements-completed` lists CRIT-4 as complete. |
+| **CRIT-4** | AUDIT TEST_CASE: pipeline_task>=5 AND scan_batch>=5 per GPU AND cross-GPU scan_ids intersection == empty | **PASS (distributor-correctness gate) / PARTIAL (strict threshold)** | Disjointedness REQUIRE (Plan 09-03) PASSES: intersection=0. Strict ≥5 threshold fails on SF1-DuckDB fixture (2 scan_ids per GPU) — pre-existing Plan 08-05 choice. The distributor-correctness substantive claim is GREEN; only the strict-threshold decoration (which requires SF10-scale data the AUDIT fixture doesn't generate) is amber. 09-04-SUMMARY.md `requirements-completed` lists CRIT-4 as complete. |
 | **CRIT-6** | SF100 [mgpu-audit] scan_batch distributes across both GPUs + wall-clock captured | **PASS** | GPU0=45 unique batch_ids, GPU1=26 unique batch_ids, intersection=0, wall-clock 0:05.86, 217 [mgpu-audit] entries in SIRIUS_LOG_DIR. 09-04-SUMMARY.md `requirements-completed` does NOT list CRIT-6 because phase-level gating on CRIT-2 keeps the ship-gate amber overall. |
 
-**Phase-level criterion rollup:** 2/4 outright PASS (CRIT-6 + CRIT-4 disjointness); 1/4 PASS_PARTIAL (CRIT-1 on ship-gate path, TABLE_FUNCTION amber); 1/4 FAIL (CRIT-2). The ship-gate closure goal is not met.
+**Phase-level criterion rollup:** 2/4 outright PASS (CRIT-6 + CRIT-4 disjointedness); 1/4 PASS_PARTIAL (CRIT-1 on ship-gate path, TABLE_FUNCTION amber); 1/4 FAIL (CRIT-2). The ship-gate closure goal is not met.
 
 ---
 
@@ -257,7 +257,7 @@ Phase 9 is a **split verdict**:
 | `compute_task` (parquet_scan_task.cpp) | backends lookup | `backends.find(*preferred)` at line 808 (two-tier fallback) | WIRED | VALIDATION.md runtime: distinct positive preferred_device_id values = 2; routing is active on the target |
 | `select_target_gpu` (duckdb_scan_executor.cpp) | `_batch_gpu_affinity` map | `_batch_gpu_affinity[counter] = space->get_device_id()` atomic-with-audit-log at line 241 | WIRED | SF100 runtime: 71 unique batch_ids recorded with GPU0/GPU1 distribution matching log emission; cross-GPU intersection=0 proves affinity is coherent |
 | `prepare_cache_for_scan_operators` | `_batch_gpu_affinity.clear()` | Line 143, before cache_level::NONE early return | WIRED | VALIDATION.md: second SF100 query run would see clean map (not directly exercised in single-query test, but RUN 3/4 AUDIT TEST_CASE reruns prove reset doesn't corrupt state) |
-| AUDIT TEST_CASE | Plan 09-03 disjointness REQUIRE | `std::set_intersection` on parse_audit_log output | WIRED | VALIDATION.md RUN 4: REQUIRE fires and passes (16 assertions); regex unchanged from 08-03 — log payload → parse_audit_log → counts[gpu].scan_ids → set_intersection → REQUIRE chain intact |
+| AUDIT TEST_CASE | Plan 09-03 disjointedness REQUIRE | `std::set_intersection` on parse_audit_log output | WIRED | VALIDATION.md RUN 4: REQUIRE fires and passes (16 assertions); regex unchanged from 08-03 — log payload → parse_audit_log → counts[gpu].scan_ids → set_intersection → REQUIRE chain intact |
 | `[mgpu-audit] scan_batch` log | parse_audit_log regex in AUDIT TEST_CASE | Regex literal at test_gpu_execution_tpch_mgpu_audit.cpp:79 (unchanged from Phase 8) | WIRED | Payload at duckdb_scan_executor.cpp:243 matches regex verbatim; SF100 log shows 71 entries successfully parsed |
 | SF100 CLI `build/release/duckdb` + SIRIUS_CONFIG_FILE=integration-2gpu.yaml | SF100 ship-gate CSV output | SiriusContext init from YAML at src/sirius_context.cpp:54 | WIRED | Exit 0, byte-identical CSV diff vs 1-GPU baseline (4 data rows, 10 columns) |
 
@@ -328,7 +328,7 @@ Bash-sandbox static checks all re-verified. Runtime failures documented by VALID
 
 - **H1 — residual `_datasource` caching on compute_task re-dispatch** (RESEARCH.md Open Questions #1). `_datasource` is a `std::shared_ptr` member of `parquet_scan_task`, set inside `if (!_datasource)`. Second gpu_execution call may reuse stale device-bound `prefetched_data_source` with freed allocation. Probe: `[mgpu-probe]` at `_datasource` construction + reset.
 - **H2 — TABLE_FUNCTION-form vs PROCEDURE-form (`CALL`) result materialization divergence** (LEADING HYPOTHESIS). CALL-form returns Sirius result directly. SELECT * FROM wraps it in a DuckDB table function binding → different result-passing code path (copy vs move, GPUResult proxy lifetime). Sirius-layer bug in table-function output shaping. Audit: `src/sirius_extension.cpp` + `src/sirius_interface.cpp`.
-- **H3 — `_batch_gpu_affinity` map lifecycle on second query** (RESEARCH.md Q5 Candidate 2). Reset on `prepare_cache_for_scan_operators`. If second query re-uses cache but reset races with dispatch-thread observation, stale affinity read. Unlikely at single-threaded dispatch but verifiable with trace.
+- **H3 — `_batch_gpu_affinity` map lifecycle on second query** (RESEARCH.md Q5 Candidate 2). Reset on `prepare_cache_for_scan_operators`. If second query reuses cache but reset races with dispatch-thread observation, stale affinity read. Unlikely at single-threaded dispatch but verifiable with trace.
 - **H4 — unrelated regression in the 5-commit span** (fallback). `unordered_map` use-after-free, allocator corruption, or data race. Bisect 3b58258 / 863cc6c / 0c8068e / a8a7985 / c0e12f3 + run `'gpu_execution - filter equality parquet'` at each.
 
 **Suggested sequence for closure (Phase 10 scope):**
@@ -346,7 +346,7 @@ Bash-sandbox static checks all re-verified. Runtime failures documented by VALID
 
 **Root cause:** AUDIT TEST_CASE (Plan 08-05) uses `attach_integration_duckdb` to decouple from the Phase 8 host_parquet bug. SF1-DuckDB fixture produces only 2 scan_ids per GPU after round-robin; the `>=5` strict threshold (from ROADMAP Phase 8 Criterion 4) is designed for SF10-parquet scale.
 
-**Why this is not a Phase 9 regression:** Pre-existing Plan 08-05 test-design choice, inherited. The **substantive** distributor-correctness claim the threshold was designed to lock in is the **disjointness REQUIRE** (Plan 09-03's addition), which PASSES. The strict count is a decorative belt-and-suspenders gate that the current fixture simply can't satisfy. Not a ship-blocker; flagged here as a cleanup target for future work (e.g., switch AUDIT fixture to SF10-parquet once the host_parquet bug from Phase 8 is closed, or drop the strict threshold in favor of disjointness-only gating).
+**Why this is not a Phase 9 regression:** Pre-existing Plan 08-05 test-design choice, inherited. The **substantive** distributor-correctness claim the threshold was designed to lock in is the **disjointedness REQUIRE** (Plan 09-03's addition), which PASSES. The strict count is a decorative belt-and-suspenders gate that the current fixture simply can't satisfy. Not a ship-blocker; flagged here as a cleanup target for future work (e.g., switch AUDIT fixture to SF10-parquet once the host_parquet bug from Phase 8 is closed, or drop the strict threshold in favor of disjointedness-only gating).
 
 ---
 

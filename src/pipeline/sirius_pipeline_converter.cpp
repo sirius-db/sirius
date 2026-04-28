@@ -778,13 +778,12 @@ void sirius_pipeline_converter::configure_partition_min_partitions()
   if (num_gpus <= 1) return;
   // Heuristic threshold: below ~16 MiB per GPU the partition overhead
   // dominates. Configurable later if we find a workload where this matters.
-  const uint64_t small_table_bytes =
-    static_cast<uint64_t>(num_gpus) * uint64_t{16} * 1024 * 1024;
+  const uint64_t small_table_bytes = static_cast<uint64_t>(num_gpus) * uint64_t{16} * 1024 * 1024;
 
   auto apply_to_op = [&](op::sirius_physical_operator* op) {
     if (op && op->type == op::SiriusPhysicalOperatorType::PARTITION) {
-      static_cast<op::sirius_physical_partition*>(op)->set_min_num_partitions(
-        num_gpus, small_table_bytes);
+      static_cast<op::sirius_physical_partition*>(op)->set_min_num_partitions(num_gpus,
+                                                                              small_table_bytes);
     }
   };
   for (auto& breaker : pipeline_breakers_) {

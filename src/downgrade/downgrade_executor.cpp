@@ -65,9 +65,9 @@ void downgrade_executor::start()
       // rather than use CUCASCADE_CUDA_TRY (RESEARCH.md Pitfall 3).
       cudaError_t err = cudaSetDevice(device_id);
       if (err != cudaSuccess) {
-        spdlog::error(
-          "downgrade_executor per-thread init: cudaSetDevice({}) failed: {}",
-          device_id, cudaGetErrorString(err));
+        spdlog::error("downgrade_executor per-thread init: cudaSetDevice({}) failed: {}",
+                      device_id,
+                      cudaGetErrorString(err));
       }
     };
   }

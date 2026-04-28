@@ -2,7 +2,7 @@
 phase: 09-scan-task-distributor-batch-ownership-affinity
 plan: 03
 subsystem: test-audit
-tags: [test, regression-gate, multi-gpu, disjointness, set_intersection]
+tags: [test, regression-gate, multi-gpu, disjointedness, set_intersection]
 requires: [09-02]
 provides: [cross-gpu-batch-disjointness-require]
 affects: [test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp]
@@ -29,7 +29,7 @@ metrics:
 requirements: [CRIT-4]
 ---
 
-# Phase 09 Plan 03: Cross-GPU Batch Disjointness REQUIRE Summary
+# Phase 09 Plan 03: Cross-GPU Batch Disjointedness REQUIRE Summary
 
 **One-liner:** `REQUIRE(cross_gpu_intersection.empty())` using `std::set_intersection` on per-GPU scan_batch ID sets added to `test_gpu_execution_tpch_mgpu_audit.cpp` as the permanent regression gate for Bug 1 (hypothesis E cross-GPU double-dispatch).
 
@@ -37,22 +37,22 @@ requirements: [CRIT-4]
 
 ## What Was Done
 
-### Task 1 — Add cross-GPU batch_id disjointness REQUIRE to the AUDIT TEST_CASE
+### Task 1 — Add cross-GPU batch_id disjointedness REQUIRE to the AUDIT TEST_CASE
 
-**Commit:** `452feeb test(09-03): add cross-GPU batch_id disjointness REQUIRE to AUDIT TEST_CASE`
+**Commit:** `452feeb test(09-03): add cross-GPU batch_id disjointedness REQUIRE to AUDIT TEST_CASE`
 
 **File:** `test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp`
 
 **Edit 1 — Includes added** (after existing `#include` block, alphabetically between existing headers):
 
 ```cpp
-#include <algorithm>  // Phase 9: std::set_intersection for cross-GPU batch_id disjointness
+#include <algorithm>  // Phase 9: std::set_intersection for cross-GPU batch_id disjointedness
 #include <iterator>   // Phase 9: std::back_inserter
 ```
 
 Placed at the top of the `<c...>` / `<f...>` / `<i...>` alphabetical sequence, between the copyright header and the existing `<cstdlib>` include.
 
-**Edit 2 — Disjointness REQUIRE block** (inserted after line 246 `REQUIRE(counts[1].scan_ids.size() >= min_count)`, before the cleanup tail):
+**Edit 2 — Disjointedness REQUIRE block** (inserted after line 246 `REQUIRE(counts[1].scan_ids.size() >= min_count)`, before the cleanup tail):
 
 ```cpp
   // Phase 9 FIX-B regression gate (08-08-DIAGNOSIS.md hypothesis E):
@@ -156,12 +156,12 @@ None — plan executed exactly as written. The only note is that `grep -c 'std::
 
 ## Known Stubs
 
-None. The disjointness assertion is fully wired to the existing parse_audit_log output and existing AuditCounts.scan_ids data structure. No placeholder or TODO logic introduced.
+None. The disjointedness assertion is fully wired to the existing parse_audit_log output and existing AuditCounts.scan_ids data structure. No placeholder or TODO logic introduced.
 
 ## Self-Check
 
 Verified commit exists:
-- 452feeb: `test(09-03): add cross-GPU batch_id disjointness REQUIRE to AUDIT TEST_CASE`
+- 452feeb: `test(09-03): add cross-GPU batch_id disjointedness REQUIRE to AUDIT TEST_CASE`
 
 Verified file exists and is modified:
 - `test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp` — 25 lines inserted

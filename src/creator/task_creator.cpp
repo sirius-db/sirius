@@ -65,10 +65,9 @@ task_creator::task_creator(exec::thread_pool_config config,
   // topology entry reports -1.
   if (_sys_topology) {
     for (size_t i = 0; i < _sys_topology->gpus.size(); ++i) {
-      auto raw_numa        = _sys_topology->gpus[i].numa_node;
-      int normalized_numa  = (raw_numa < 0) ? 0 : raw_numa;
-      _numa_to_gpu[normalized_numa].push_back(
-        static_cast<int>(_sys_topology->gpus[i].id));
+      auto raw_numa       = _sys_topology->gpus[i].numa_node;
+      int normalized_numa = (raw_numa < 0) ? 0 : raw_numa;
+      _numa_to_gpu[normalized_numa].push_back(static_cast<int>(_sys_topology->gpus[i].id));
     }
   }
 }
@@ -125,8 +124,8 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
         // for their preferred_device_id in compute_task().
         auto* sirius_ctx =
           _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state").get();
-        const auto& op_params  = sirius_ctx->get_config().get_operator_params();
-        auto gpu_io_backends   = sirius_ctx->get_gpu_io_backends();
+        const auto& op_params = sirius_ctx->get_config().get_operator_params();
+        auto gpu_io_backends  = sirius_ctx->get_gpu_io_backends();
         _parquet_scan_operator_global_state_map.emplace(
           operator_id,
           std::make_shared<op::scan::parquet_scan_task_global_state>(
@@ -476,13 +475,12 @@ void task_creator::manager_loop()
               // trips cudaErrorInvalidValue at counter_storage.cuh. Routing on
               // partition_idx keeps every task of a given partition on one GPU
               // while still spreading partitions across GPUs.
-              if (auto* partitioned = dynamic_cast<op::partitioned_operator_data*>(
-                    pipelineable_input);
+              if (auto* partitioned =
+                    dynamic_cast<op::partitioned_operator_data*>(pipelineable_input);
                   partitioned && _sys_topology && !_sys_topology->gpus.empty()) {
-                auto n_gpus = _sys_topology->gpus.size();
-                auto idx    = partitioned->get_partition_idx() % n_gpus;
-                preferred_device_id =
-                  static_cast<int>(_sys_topology->gpus[idx].id);
+                auto n_gpus         = _sys_topology->gpus.size();
+                auto idx            = partitioned->get_partition_idx() % n_gpus;
+                preferred_device_id = static_cast<int>(_sys_topology->gpus[idx].id);
               }
               if (!preferred_device_id.has_value() && pipelineable_input &&
                   !pipelineable_input->get_data_batches().empty()) {
@@ -528,7 +526,7 @@ void task_creator::manager_loop()
                                     ->first;
                   auto it = _numa_to_gpu.find(top_host);
                   if (it != _numa_to_gpu.end() && !it->second.empty()) {
-                    auto idx = _numa_to_gpu_rr.fetch_add(1) % it->second.size();
+                    auto idx            = _numa_to_gpu_rr.fetch_add(1) % it->second.size();
                     preferred_device_id = it->second[idx];
                   }
                 }
