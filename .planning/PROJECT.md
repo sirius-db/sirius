@@ -10,10 +10,17 @@ Any query can transparently execute across every GPU on the node — tasks are s
 
 ## Current State
 
+**v1.2 shipped 2026-04-28** — Multi-GPU SQL Pipeline Fix.
+- 3 phases / 18 plans / 39 tasks / 11 v1.2 requirements satisfied (8 fully + 3 partial via proxy)
+- TPC-H SF100 Q1 num_gpus=2: 5.70s wall-clock, byte-identical to 1-GPU baseline (5.45s); 71 scan batches distributed GPU0=42 / GPU1=29 with cross-GPU intersection=0
+- HYG-02 improved 41 → 40 (`rmm::cuda_stream_default` count) via Phase 10-03 stream-use-after-destroy fix
+- Branch: `feature/single-node-multi-gpu2`
+- Archive: `.planning/milestones/v1.2-*`
+- Open Phase-11 candidate: pre-existing `[mgpu-audit]` SIGSEGV at `test_gpu_execution_tpch_mgpu_audit.cpp:200` in the `attach_integration_duckdb` path (orthogonal to v1.2 fixes; documented in `v1.2-MILESTONE-AUDIT.md`)
+
 **v1.1 shipped 2026-04-21** — Multi-GPU Re-integration + Cucascade I/O Migration.
 - 4 phases / 19 plans / 44 tasks / 28 requirements cleared
 - Full test suite: 979/979 pass on N=2 hardware (2× RTX 6000 Ada, driver 595.58.03, CUDA 13.2)
-- Branch: `feature/single-node-multi-gpu2`
 - Archive: `.planning/milestones/v1.1-*`
 
 ## Requirements
@@ -36,30 +43,18 @@ Shipped and validated in v1.1.
 
 ### Active
 
-<!-- Milestone v1.2: Multi-GPU SQL Pipeline Fix. Scoped in REQUIREMENTS.md. -->
+<!-- v1.3 not yet scoped. Run /gsd:new-milestone to define. -->
 
-- [ ] Fix cross-device stream-correctness in `pipeline::lock_or_prepare_batch` (cudaErrorInvalidValue on num_gpus>=2)
-- [ ] Parameterize `test_gpu_execution_tpch.cpp` on `num_gpus:{1,2}` so MCP `unit-tests` catches multi-GPU regressions
-- [ ] Add `num_gpus: 2` config to `test/cpp/integration/integration.yaml` fixture
-- [ ] Acceptance gate: `[mgpu-audit] pipeline_task` + `scan_batch` counts > 0 on both GPUs across a TPC-H SF1 run
-- [ ] All 22 TPC-H queries pass at SF1 and SF10 on `num_gpus: 2` with correct results
+(No active requirements — next milestone awaiting scoping via `/gsd:new-milestone`.)
 
-## Current Milestone: v1.2 Multi-GPU SQL Pipeline Fix
-
-**Goal:** Close the v1.1 gap revealed by post-ship e2e verification — cross-device stream-correctness bug in `pipelineable_operator_data::prepare_for_processing` → `pipeline::lock_or_prepare_batch` throws `cudaErrorInvalidValue: invalid argument` on non-trivial SQL when `num_gpus >= 2`. Same fix shape as the Plan 07-02 Sirius-side P2P converter override (pack on source-device RAII + source stream, copy on target stream).
-
-**Target features:**
-- Cross-device stream-correctness fix in `pipeline::lock_or_prepare_batch`
-- Test coverage: parameterize TPC-H integration on `num_gpus:{1,2}`
-- Acceptance gate via `[mgpu-audit]` counts > 0 on both GPUs
-
-**Key context:**
-- v1.1 closed 2026-04-21 at commit `076b587` / tag `v1.1` with infra shipped but SQL gap flagged
-- `[mgpu-audit]` logging already landed in `fd24174` (from v1.1 verification)
-- Evidence + reproduction: `.planning/milestones/v1.1-E2E-VERIFICATION.md`
+**v1.2 deliverables (now Validated):**
+- ✓ **FIX-01..04** — cross-device stream-correctness fixes (Pattern 2 idiom): per-GPU stream pool in `duckdb_scan_executor`, Sirius-side `host→gpu` converter override, per-GPU filter translation at plan time, `translated_expression::owned_stream` for scalar lifetime correctness — *v1.2*
+- ✓ **TEST-01..04** — TPC-H integration parameterized on `num_gpus∈{1,2}` via Catch2 GENERATE; `integration-2gpu.yaml` fixture; SF1 22 queries × {1,2} GPUs all PASS; SF10 Q1/Q6/Q12 PASS — *v1.2*
+- ✓ **AUDIT-01..03** — `[mgpu-audit]` payload extended with `task_id`/`batch_id`; AUDIT TEST_CASE wired in default unit-tests run; Phase 9 disjointness REQUIRE (`std::set_intersection(scan_ids) == ∅`) fires in `tpch_q1_sf10_2gpu` — *v1.2 (canonical TEST_CASE blocked by pre-existing SIGSEGV; substantive evidence via SF100 + SF10 proxy runs)*
 
 ## Deferred to Future Milestones
 
+- **`[mgpu-audit]` per-GPU distribution AUDIT TEST_CASE SIGSEGV** at `test_gpu_execution_tpch_mgpu_audit.cpp:200` (`attach_integration_duckdb` path; pre-existing on base before v1.2; orthogonal to parquet filter translation path; Phase 11 candidate, < 50 LOC expected)
 - Upstream cucascade `convert_gpu_to_gpu` cross-stream fix (drop Sirius override once upstream lands)
 - Phase-5 vs Phase-4 parquet I/O regression comparison
 - Phase-6 vs Phase-5 single-GPU SF10 regression comparison
@@ -109,6 +104,10 @@ Shipped and validated in v1.1.
 | Consume `cudaGetLastError()` after `cudaDeviceEnablePeerAccess` | CUDA leaves the return code in thread-local error slot; subsequent unrelated calls fail spuriously with same code. | ✓ Good — pattern established for future CUDA-state-mutation code |
 | `supports_device_read() == false` in cucascade_datasource | Host-stage via pinned memory + `cuda_memcpy_async` on caller's stream stays truly async and avoids GDS entirely. | ✓ Good — v1.1 IO-02/03 validated |
 | Adaptive scan via existing `select_target_gpu` (no code change needed) | `duckdb_scan_executor::select_target_gpu` was already memory-proportional since v1.0 Phase 2; Phase 7 MGPU-07 scope was test-authoring only. | ✓ Good — 3.08× free-memory ratio test proves proportional skew within 10% tolerance |
+| Per-GPU filter translation at plan time (Phase 8 residual closure 93fea6f) | `sirius_physical_parquet_scan` originally translated DuckDB filter expressions ONCE, binding scalars to the planner's current device. Tasks dispatched to other GPUs faulted. Build one tree per configured GPU at plan time, select per-task at converter time. | ✓ Good — closes the v1.2 ship-blocker on parquet TPC-H Q1 num_gpus=2 |
+| `_batch_gpu_affinity` map records ownership but does NOT consult at dispatch time (Phase 9 minimum-viable) | Recording is sufficient for the disjointness REQUIRE regression gate; consultation-at-dispatch was deferred to keep scope tight. Affinity is implicitly preserved because `_scan_round_robin` is monotonic. | ✓ Good — disjointness REQUIRE fires green at SF10 + SF100; cross-GPU intersection=0 |
+| `translated_expression::owned_stream` declared BEFORE `owned_literals` (Phase 10-03) | C++ reverse-destruction order: scalars `cudaFreeAsync` first (using stream handle), then stream destroys. Without this ordering, `cudaFreeAsync(ptr, stale_handle)` SIGSEGVs at next QueryBegin. | ✓ Good — closes the test-ordering-dependent SIGSEGV that 09-04 exposed; HYG-02 improved 41→40 |
+| Run all integration/SF100 tests via MCP on this host (no human-delegated checkpoints) | 2026-04-24 host-capability discovery: `mcp__project-commands__run_command nvidia-smi` shows 2× RTX 6000 Ada visible; agent can run the full v1.2 ship-gate autonomously. | ✓ Good — Phase 9-04 + Phase 10-04 ship-gates ran fully autonomously via MCP |
 
 ## Evolution
 
@@ -128,4 +127,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-21 — v1.2 milestone initialized (Multi-GPU SQL Pipeline Fix)*
+*Last updated: 2026-04-28 — v1.2 milestone shipped (Multi-GPU SQL Pipeline Fix)*

@@ -4,8 +4,8 @@ milestone: v1.2
 milestone_name: Multi-GPU SQL Pipeline Fix
 status: verifying
 stopped_at: "Completed 10-04: ship-gate validation — PARTIAL verdict"
-last_updated: "2026-04-27T20:46:42.775Z"
-last_activity: 2026-04-27
+last_updated: "2026-04-28T12:40:05.262Z"
+last_activity: 2026-04-28
 progress:
   total_phases: 3
   completed_phases: 2
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-04-21)
 Phase: 10 (table-function-form-gpu-execution-sigsegv-fix) — EXECUTING
 Plan: 4 of 4
 Status: Phase complete — ready for verification
-Last activity: 2026-04-27
+Last activity: 2026-04-28
 
 Progress: [██████████] 100% (6/6 plans complete)
 Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gpu-sql-pipeline-fix/08-SUMMARY.md`

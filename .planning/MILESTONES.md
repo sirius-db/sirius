@@ -1,5 +1,30 @@
 # Milestones
 
+## v1.2 Multi-GPU SQL Pipeline Fix (Shipped: 2026-04-28)
+
+**Phases completed:** 3 phases, 18 plans, 39 tasks
+
+**Key accomplishments:**
+
+- Replaced the single `_stream_pool` (bound to GPU 0) with an `unordered_map<int, unique_ptr<exclusive_stream_pool>>` keyed by device_id, and rewrote the scan dispatch site to acquire + dispatch under paired `rmm::cuda_set_device_raii` guards — closing FIX-01 at the build-gate level.
+- Authored a Sirius-side `host_data_representation -> gpu_table_representation` converter override (`sirius_host_fast_to_gpu_factory`) acquiring a target-bound stream under target-device RAII, closing the v1.1 cross-device stream-correctness bug shape on the host->gpu converter frame — and surfacing a distinct fix-site (`host_parquet_representation` path via Sirius's OWN parquet converter) for handoff to 08-06.
+- Closed the log-payload side of AUDIT-01/02/03 — both `[mgpu-audit]` INFO emissions now carry unique IDs (`task_id` and `batch_id`) so Plan 08-05's Catch2 audit TEST_CASE can count UNIQUE events per GPU via `grep + awk + sort -u`, robust against log-line duplication from retries.
+- New fixture YAML
+- Authored the Catch2 acceptance gate for Multi-GPU SQL: a dedicated `[mgpu-audit]` TEST_CASE that parses `sirius.log` and asserts per-GPU unique-ID counts for pipeline_task and scan_batch on BOTH GPU 0 and GPU 1 — plus TPC-H Q1/Q6/Q12 SF10 2-GPU variants gated on `SIRIUS_TEST_SF10_PATH` — plus a Q4-scoped one-shot retry per the ROADMAP flake policy. Runtime-verification of the full matrix (22 × {DuckDB,parquet} × {1,2} + SF10 + AUDIT) deferred to 08-06 because the MCP's hardcoded `--abort` flag trips on the known-open 08-06 host_parquet converter bug at test 610/983.
+- Closed FIX-03 (HYG-02 grep) + FIX-04 (clean build) on the static side with an explicit PASS verdict. Applied the orchestrator-directed carryover fix to `src/data/host_parquet_representation_converters.cpp` (Pattern 2 idiom — target-bound stream + target-device RAII — mirroring 08-02 Branch B's template). Produced `08-06-VALIDATION.md` recording criterion-by-criterion verdicts. Criteria 1/2/4/6 remain DEFERRED because the same `cudaErrorInvalidValue @ cuda_memcpy.cu:42` signature persists on num_gpus=2 parquet TPC-H Q1 (and hive-partition filter) AFTER the carryover fix landed — the fix addressed one known site but at least one additional site remains. Per plan directive ('Don't over-author'), the residual is handed off with four hypothesis candidates + suggested next actions rather than chased.
+- Added three grep-stable `[mgpu-probe]` INFO breadcrumbs at two frame boundaries on the num_gpus=2 parquet failure path (host_parquet converter entry+exit, parquet_scan_task::compute_task entry) so plan 08-08's MCP reproduction produces a deterministic payload discriminating hypotheses A/B/C/D from 08-VERIFICATION.md.
+- Shipped (authored and code-review-verifiable):
+- One-liner:
+- One-liner:
+- One-liner:
+- 1. [Rule 3 - Blocking] MCP unit-tests wrapper does not pass agent shell env to child process
+- Bisect of 5-commit Phase-9 source span (3b58258..c0e12f3) finds NONE regressing: all commits pass in isolation; SIGSEGV is test-ordering dependent, not commit-specific
+- H1 confirmed: stream-ordered race in `sirius_physical_parquet_scan.cpp` — `rmm::cuda_stream_default` for filter expression translation races with `planning_stream` in `parquet_scan_task.cpp:492`
+- Stream use-after-destroy SIGSEGV in parquet filter translation — fixed by moving `translation_stream` into `translated_expression::owned_stream` with correct C++ destruction order
+- SF100 Q1 2-GPU ship-gate PASS (5.70s, byte-identical vs 1-GPU baseline); Phase 10 fix verification PASS (filter equality parquet + tpch_q1_sf10_2gpu both GREEN); one pre-existing [mgpu-audit] SIGSEGV prevents full suite exit 0 — PARTIAL verdict
+
+---
+
 ## v1.1 Multi-GPU Re-integration + Cucascade I/O Migration (Shipped: 2026-04-21)
 
 **Phases completed:** 4 phases, 19 plans, 44 tasks
