@@ -35,3 +35,6 @@ compile_commands.json
 
 # Zed editor settings
 .zed
+
+# GSD planning artifacts — local-only, not tracked in git
+.planning/
