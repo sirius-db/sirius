@@ -176,11 +176,16 @@ __global__ void kernel_decode_bitpacking_batched(const batched_bp_seg_desc* __re
   uint32_t rc = sm_row_count;
   auto mode   = static_cast<BitpackingMode>(sm_mode);
 
+  // Output is written once and never reread by this kernel; route every
+  // global store through `__stwt` (PTX `st.global.wt`) so it bypasses L1
+  // and goes straight to L2.  Frees up L1 capacity for the unpack reads
+  // that share the SM's unified L1/shmem partition (Turing+).
+
   //--- CONSTANT ---
   if (mode == BitpackingMode::CONSTANT) {
     T val = sm_aux;
     for (uint32_t i = threadIdx.x; i < rc; i += blockDim.x) {
-      out[i] = val;
+      __stwt(out + i, val);
     }
     return;
   }
@@ -190,7 +195,7 @@ __global__ void kernel_decode_bitpacking_batched(const batched_bp_seg_desc* __re
     T frame = sm_frame;
     T delta = sm_aux;
     for (uint32_t i = threadIdx.x; i < rc; i += blockDim.x) {
-      out[i] = frame + static_cast<T>(i) * delta;
+      __stwt(out + i, static_cast<T>(frame + static_cast<T>(i) * delta));
     }
     return;
   }
@@ -219,7 +224,7 @@ __global__ void kernel_decode_bitpacking_batched(const batched_bp_seg_desc* __re
     for (uint32_t v = 0; v < VPT; ++v) {
       uint32_t idx = v * blockDim.x + threadIdx.x;
       if (idx >= rc) break;
-      out[idx] = frame + unpack_value<T>(shmem, idx, width);
+      __stwt(out + idx, static_cast<T>(frame + unpack_value<T>(shmem, idx, width)));
     }
     return;
   }
@@ -274,7 +279,7 @@ __global__ void kernel_decode_bitpacking_batched(const batched_bp_seg_desc* __re
   // Read+write in striped layout for coalesced global stores.
   for (uint32_t v = 0; v < VPT; ++v) {
     uint32_t idx = v * blockDim.x + threadIdx.x;
-    if (idx < rc) out[idx] = shmem_t[idx];
+    if (idx < rc) __stwt(out + idx, shmem_t[idx]);
   }
 }
 
