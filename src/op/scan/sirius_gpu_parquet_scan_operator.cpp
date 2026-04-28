@@ -18,10 +18,12 @@
 #include <data/data_batch_utils.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <log/logging.hpp>
+#include <op/scan/parquet_scan_info.hpp>
 #include <op/scan/parquet_scan_operator_data.hpp>
 #include <op/scan/sirius_gpu_parquet_scan_operator.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <pipeline/sirius_meta_pipeline.hpp>
+#include <scan_manager/split_connector.hpp>
 
 // cudf
 #include <cudf/io/parquet.hpp>
@@ -32,7 +34,6 @@
 #include <cucascade/data/gpu_data_representation.hpp>
 
 // standard library
-#include <mutex>
 #include <stdexcept>
 #include <utility>
 
@@ -42,23 +43,31 @@ namespace sirius::op::scan {
 // Constructor
 //===----------------------------------------------------------------------===//
 sirius_gpu_parquet_scan_operator::sirius_gpu_parquet_scan_operator(
-  duckdb::vector<sirius::logical_type> types, duckdb::idx_t estimated_cardinality)
+  duckdb::vector<sirius::logical_type> types,
+  duckdb::idx_t estimated_cardinality,
+  std::unique_ptr<parquet_scan_info> scan_info)
   : sirius_physical_operator(
-      SiriusPhysicalOperatorType::GPU_PARQUET_SCAN, std::move(types), estimated_cardinality)
+      SiriusPhysicalOperatorType::GPU_PARQUET_SCAN, std::move(types), estimated_cardinality),
+    _split_connector(std::make_unique<scan_manager::split_connector>()),
+    _scan_info(std::move(scan_info))
 {
+  _split_connector->close();
 }
 
+sirius_gpu_parquet_scan_operator::~sirius_gpu_parquet_scan_operator() = default;
+
 //===----------------------------------------------------------------------===//
-// Metadata handoff (invoked from metadata_scan pipeline)
+// Friend access — wired by sirius_scan_manager during prepare_for_query.
 //===----------------------------------------------------------------------===//
-void sirius_gpu_parquet_scan_operator::accumulate_metadata(
-  const partitioned_parquet_metadata& metadata)
+std::unique_ptr<parquet_scan_info> sirius_gpu_parquet_scan_operator::take_scan_info()
 {
-  auto metadata_ptr = std::make_shared<partitioned_parquet_metadata>(metadata);
-  std::lock_guard<std::mutex> lock(_metadata_mutex);
-  for (std::size_t i = 0; i < metadata.row_group_partitions.size(); ++i) {
-    _partition_index.emplace_back(metadata_ptr, i);
-  }
+  return std::move(_scan_info);
+}
+
+void sirius_gpu_parquet_scan_operator::set_split_connector(
+  std::unique_ptr<scan_manager::split_connector> connector)
+{
+  _split_connector = std::move(connector);
 }
 
 //===----------------------------------------------------------------------===//
@@ -66,60 +75,20 @@ void sirius_gpu_parquet_scan_operator::accumulate_metadata(
 //===----------------------------------------------------------------------===//
 std::optional<task_creation_hint> sirius_gpu_parquet_scan_operator::get_next_task_hint()
 {
-  std::lock_guard<std::mutex> lock(_metadata_mutex);
-
-  // 1. Work available? Dispatch immediately, even if metadata pipeline
-  //    is still producing.
-  if (_next_partition_idx < _partition_index.size()) {
-    return task_creation_hint{TaskCreationHint::READY, this};
-  }
-
-  // 2. Metadata pipeline still running? Wait on it.
-  auto it = ports.find("handoff");
-  if (it != ports.end() && it->second && it->second->src_pipeline &&
-      !it->second->src_pipeline->is_pipeline_finished()) {
-    if (auto upstream = it->second->src_pipeline->get_source()) {
-      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, upstream.get()};
-    }
-  }
-
-  // 3. No work, pipeline done — finished.
-  return std::nullopt;
+  if (_split_connector->is_closed()) { return std::nullopt; }
+  // Will return READY even when the queue is empty but not yet closed — get_next_task_input_data()
+  // will block on the connector's cv. This parks a worker but avoids needing a scheduler-visible
+  // wake-up signal from the scan_manager.
+  return task_creation_hint{TaskCreationHint::READY, this};
 }
 
-bool sirius_gpu_parquet_scan_operator::all_ports_empty()
-{
-  std::lock_guard<std::mutex> lock(_metadata_mutex);
-  return _next_partition_idx >= _partition_index.size();
-}
+bool sirius_gpu_parquet_scan_operator::all_ports_empty() { return _split_connector->is_closed(); }
 
 std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::get_next_task_input_data()
 {
-  std::size_t idx;
-  partition_entry entry;
-  {
-    std::lock_guard<std::mutex> lock(_metadata_mutex);
-    if (_next_partition_idx >= _partition_index.size()) { return nullptr; }
-    idx   = _next_partition_idx++;
-    entry = _partition_index[idx];
-  }
-
-  auto meta            = entry.metadata;
-  auto const& rg_range = meta->row_group_partitions[entry.partition_idx];
-
-  SIRIUS_LOG_DEBUG(
-    "[sirius_gpu_parquet_scan_operator] Creating parquet_scan_data for partition {} "
-    "(file_idx={}, {} row groups)",
-    idx,
-    rg_range.file_idx,
-    rg_range.row_group_indices.size());
-
-  return std::make_unique<parquet_scan_data>(meta->file_paths[rg_range.file_idx],
-                                             rg_range,
-                                             meta->reader_options,
-                                             meta->filter_expression,
-                                             meta->post_filter_projection_ids,
-                                             meta->datasources[rg_range.file_idx]);
+  auto next = _split_connector->get_next_split();
+  if (!next.has_value()) { return nullptr; }
+  return std::move(*next);
 }
 
 //===----------------------------------------------------------------------===//
@@ -139,15 +108,36 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
       "[sirius_gpu_parquet_scan_operator] execute() called with null gpu_memory_space in "
       "input_data.");
   }
-  auto datasource = scan_data->datasource;
-  auto& mem_space = *scan_data->gpu_memory_space;
+  auto datasource        = scan_data->datasource;
+  auto& mem_space        = *scan_data->gpu_memory_space;
+  auto filter_expression = scan_data->filter_expression;
 
   // Build reader options for this partition's row groups.
   auto opts = *scan_data->reader_options;
   opts.set_source(cudf::io::source_info{datasource.get()});
   opts.set_row_groups({scan_data->rg_range.row_group_indices});
 
-  // Read the parquet data onto the GPU.
+  // Try to translate the filter to a *stream-local* cudf AST for filter pushdown. If not
+  // successful, fall back to post-read DuckDB-expression evaluation.
+  std::optional<gpu_expression_translator::translated_expression> ast_expression = std::nullopt;
+  if (filter_expression) {
+    auto name_resolver = [plan = scan_data->plan](duckdb::idx_t ref_index) -> std::string {
+      return plan->batch_column_name(ref_index);
+    };
+    gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
+    ast_expression = translator.translate_expression_with_names(*filter_expression, name_resolver);
+    if (ast_expression) {
+      opts.set_filter(ast_expression->back());
+      SIRIUS_LOG_DEBUG(
+        "[sirius_gpu_parquet_scan_operator] Translated filter expression for parquet reader filter "
+        "pushdown.");
+    } else {
+      SIRIUS_LOG_DEBUG(
+        "[sirius_gpu_parquet_scan_operator] AST translation failed for parquet reader filter "
+        "pushdown.");
+    }
+  }
+
   auto [table, metadata] = cudf::io::read_parquet(opts, stream);
 
   SIRIUS_LOG_DEBUG("[sirius_gpu_parquet_scan_operator] Read {} — {} rows, {} columns",
@@ -156,43 +146,26 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
                    table->num_columns());
 
   // Apply the filter if it was not pushed down into the parquet scan.
-  if (std::holds_alternative<std::shared_ptr<duckdb::Expression>>(scan_data->filter_expression)) {
-    auto& duckdb_expr = std::get<std::shared_ptr<duckdb::Expression>>(scan_data->filter_expression);
-    if (duckdb_expr) {
-      sirius::gpu_expression_executor gpu_expression_executor(
-        duckdb_expr.get(), cudf::get_current_device_resource_ref(), stream);
-      auto input_batch  = sirius::make_data_batch(std::move(table), mem_space);
-      auto output_batch = gpu_expression_executor.select(input_batch);
-      if (!output_batch) {
-        return std::make_unique<pipelineable_operator_data>(
-          std::vector<std::shared_ptr<cucascade::data_batch>>());
-      }
-      table = output_batch->get_data()->cast<cucascade::gpu_table_representation>().release_table();
-      SIRIUS_LOG_DEBUG(
-        "[sirius_gpu_parquet_scan_operator] Applied duckdb filter expression post parquet scan.");
+  if (filter_expression && !ast_expression) {
+    sirius::gpu_expression_executor gpu_expression_executor(
+      filter_expression.get(), cudf::get_current_device_resource_ref(), stream);
+    auto input_batch  = sirius::make_data_batch(std::move(table), mem_space);
+    auto output_batch = gpu_expression_executor.select(input_batch);
+    if (!output_batch) {
+      return std::make_unique<pipelineable_operator_data>(
+        std::vector<std::shared_ptr<cucascade::data_batch>>());
     }
-  }
-
-  // Prune pure filter columns if necessary.
-  auto const& post_filter_projection_ids = scan_data->post_filter_projection_ids;
-  if (!post_filter_projection_ids.empty()) {
-    auto columns = table->release();
-    std::vector<std::unique_ptr<cudf::column>> projected_columns;
-    projected_columns.reserve(post_filter_projection_ids.size());
-    for (auto const col_idx : post_filter_projection_ids) {
-      projected_columns.push_back(std::move(columns[col_idx]));
-    }
-    table = std::make_unique<cudf::table>(std::move(projected_columns));
+    table = output_batch->get_data()->cast<cucascade::gpu_table_representation>().release_table();
     SIRIUS_LOG_DEBUG(
-      "[sirius_gpu_parquet_scan_operator] Pruned pure filter columns; post-filter projection has "
-      "{} columns",
-      table->num_columns());
+      "[sirius_gpu_parquet_scan_operator] Applied duckdb filter expression post parquet scan.");
   }
 
-  // Inject hive partition columns, if necessary
-  if (_hive_partition_inject_fn) {
-    table = _hive_partition_inject_fn(std::move(table), scan_data->file_path, stream);
-    SIRIUS_LOG_DEBUG("[sirius_gpu_parquet_scan_operator] Injected hive partition columns.");
+  // Reshape the reader's output to the scan_plan's D-order layout: reorder data
+  // columns, drop pure-filter columns, inject hive-partition columns. No-op when
+  // the scan is a trivial identity (no partitions, 1:1 data layout).
+  if (_partition_inject_fn) {
+    table = _partition_inject_fn(std::move(table), scan_data->file_path, stream);
+    SIRIUS_LOG_DEBUG("[sirius_gpu_parquet_scan_operator] Applied partition_inject_fn.");
   }
 
   // Wrap the GPU table in operator_data for the downstream pipeline.
