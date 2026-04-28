@@ -136,8 +136,6 @@ set(EXTENSION_SOURCES
     src/creator/task_creator.cpp
     src/data/host_parquet_representation.cpp
     src/data/host_parquet_representation_converters.cpp
-    src/data/sirius_host_to_gpu_converter.cpp
-    src/data/sirius_p2p_converter.cpp
     src/downgrade/downgrade_executor.cpp
     src/downgrade/downgrade_task.cpp
     src/expression_executor/gpu_expression_executor.cpp

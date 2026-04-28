@@ -56,17 +56,16 @@ namespace detail {
 /**
  * @brief Convert host_parquet_representation to gpu_table_representation
  *
- * FIX-02 carryover (Plan 08-06): the prior implementation set
+ * Multi-GPU stream-correctness pattern: the prior implementation set
  *   rmm::cuda_set_device_raii target_device_raii(target_device_id)
  * but then called `cudf::io::read_parquet(opts, stream, mr_ref)` using the
  * CALLER-supplied `stream`. Under `num_gpus == 2`, the caller's stream may be
  * bound to a non-target device (e.g. the pipeline-executor's GPU-0 stream
  * while `target_device_id == 1`), producing `cudaErrorInvalidValue` inside
- * cudf's internal H2D path. Same bug shape as 08-02 Branch B's
- * `sirius_host_to_gpu_converter.cpp` before the fix; template for this site
- * is that file.
+ * cudf's internal H2D path. Same root cause as cucascade's built-in
+ * convert_host_fast_to_gpu / convert_gpu_to_gpu before they were fixed.
  *
- * Fix pattern (mirrors sirius_host_to_gpu_converter.cpp):
+ * Fix pattern:
  *   1. Sync caller's stream so any upstream work on it is flushed.
  *   2. Enter `rmm::cuda_set_device_raii` for the target device.
  *   3. Acquire a target-bound stream from `target_memory_space->acquire_stream()`.

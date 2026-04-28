@@ -22,7 +22,7 @@
 // lock_or_prepare_batch (batch_lock_utils.hpp:87). The cache stores the
 // same shared_ptr; on warm, task_creator's SCHED-00/01/02 can route the
 // next consumer to a different GPU, triggering a cross-device p2p
-// conversion through sirius_p2p_converter_factory. If any step in that
+// conversion through cucascade's convert_gpu_to_gpu. If any step in that
 // chain dereferences a pointer while the current device is wrong, the
 // next stream sync surfaces as cudaErrorIllegalAddress at
 // sirius_physical_operator.cpp:59.
