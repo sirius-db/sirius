@@ -27,6 +27,7 @@
 
 // standard library
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -109,6 +110,20 @@ class partitioned_parquet_metadata : public op::operator_data {
   std::variant<std::shared_ptr<translated_expression>, std::shared_ptr<duckdb::Expression>>
     filter_expression;
   std::vector<std::size_t> post_filter_projection_ids;
+
+  /// Original duckdb filter expression carried through verbatim so that
+  /// sirius_gpu_parquet_scan_operator::execute() can re-translate it on the
+  /// scan task's CURRENT device. The metadata scan's translated AST has its
+  /// scalars allocated on the metadata-scan task's device; if the scan task
+  /// runs on a different GPU (multi-GPU distribution) those scalars are
+  /// invisible to cudf and every row group gets pruned silently → 0 rows.
+  /// May be nullptr when the original logical-plan had no filter expression.
+  std::shared_ptr<duckdb::Expression> retranslation_filter;
+  /// Name resolver used to translate BoundReferenceExpression batch positions
+  /// into parquet column names. Captured from scan_plan::batch_column_name at
+  /// metadata-scan time and reused here so the re-translation does not need
+  /// to know about scan_plan internals.
+  std::function<std::string(duckdb::idx_t)> filter_name_resolver;
 };
 
 //===----------------------------------------------------------------------===//
@@ -130,13 +145,17 @@ class parquet_scan_data : public op::operator_data {
                     std::variant<std::shared_ptr<translated_expression>,
                                  std::shared_ptr<duckdb::Expression>> filter_expression,
                     std::vector<std::size_t> post_filter_projection_ids,
-                    std::shared_ptr<cudf::io::datasource> datasource)
+                    std::shared_ptr<cudf::io::datasource> datasource,
+                    std::shared_ptr<duckdb::Expression> retranslation_filter,
+                    std::function<std::string(duckdb::idx_t)> filter_name_resolver)
     : file_path(std::move(file_path)),
       rg_range(std::move(rg_range)),
       reader_options(std::move(reader_options)),
       filter_expression(std::move(filter_expression)),
       post_filter_projection_ids(std::move(post_filter_projection_ids)),
-      datasource(std::move(datasource))
+      datasource(std::move(datasource)),
+      retranslation_filter(std::move(retranslation_filter)),
+      filter_name_resolver(std::move(filter_name_resolver))
   {
   }
 
@@ -187,6 +206,12 @@ class parquet_scan_data : public op::operator_data {
   std::shared_ptr<cudf::io::datasource> datasource;
   /// GPU memory space for allocating output tables produced by execute().
   cucascade::memory::memory_space* gpu_memory_space = nullptr;
+  /// Original duckdb filter expression for current-device re-translation; see
+  /// partitioned_parquet_metadata::retranslation_filter.
+  std::shared_ptr<duckdb::Expression> retranslation_filter;
+  /// Name resolver paired with retranslation_filter; see
+  /// partitioned_parquet_metadata::filter_name_resolver.
+  std::function<std::string(duckdb::idx_t)> filter_name_resolver;
 };
 
 }  // namespace sirius::op::scan

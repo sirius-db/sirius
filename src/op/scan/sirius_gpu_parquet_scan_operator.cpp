@@ -17,6 +17,7 @@
 // sirius
 #include <data/data_batch_utils.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
+#include <expression_executor/gpu_expression_translator_internal.hpp>
 #include <log/logging.hpp>
 #include <op/scan/parquet_scan_operator_data.hpp>
 #include <op/scan/sirius_gpu_parquet_scan_operator.hpp>
@@ -119,7 +120,9 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::get_next_task_i
                                              meta->reader_options,
                                              meta->filter_expression,
                                              meta->post_filter_projection_ids,
-                                             meta->datasources[rg_range.file_idx]);
+                                             meta->datasources[rg_range.file_idx],
+                                             meta->retranslation_filter,
+                                             meta->filter_name_resolver);
 }
 
 //===----------------------------------------------------------------------===//
@@ -147,9 +150,32 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
   opts.set_source(cudf::io::source_info{datasource.get()});
   opts.set_row_groups({scan_data->rg_range.row_group_indices});
 
+  // Multi-GPU correctness: the AST filter currently set on opts (if any) was
+  // built by the metadata-scan task on its own CURRENT device. cudf::ast
+  // scalars are device-resident, so evaluating that AST on a different GPU
+  // silently prunes every row → 0 rows. Re-translate the original duckdb
+  // expression here on this scan task's current device + stream so the AST
+  // scalars live where the read happens. The freshly-translated AST is held
+  // in a local shared_ptr; cudf borrows it by reference until read_parquet
+  // returns, which is why this MUST stay in scope through the call.
+  std::shared_ptr<gpu_expression_translator::translated_expression> local_ast_filter;
+  if (scan_data->retranslation_filter && scan_data->filter_name_resolver) {
+    gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
+    auto optional_filter = translator.translate_expression_with_names(
+      *scan_data->retranslation_filter, scan_data->filter_name_resolver);
+    if (optional_filter) {
+      stream.synchronize();
+      local_ast_filter = std::make_shared<gpu_expression_translator::translated_expression>(
+        std::move(*optional_filter));
+      opts.set_filter(local_ast_filter->back());
+    }
+    // If translation now fails (it shouldn't, since metadata-scan succeeded), fall through
+    // to the post-read duckdb path below — opts retains the metadata-device AST, but
+    // we'll skip pushdown semantics by relying on the post-filter step.
+  }
+
   // Read the parquet data onto the GPU.
   auto [table, metadata] = cudf::io::read_parquet(opts, stream);
-
   SIRIUS_LOG_DEBUG("[sirius_gpu_parquet_scan_operator] Read {} — {} rows, {} columns",
                    scan_data->file_path,
                    table->num_rows(),

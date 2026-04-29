@@ -161,15 +161,22 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
   // Translate the filter to a cudf AST for reader-side pushdown, falling back to a post-read
   // DuckDB-expression evaluation when translation isn't possible. Partition-column filters
   // have already been dropped at construction; anything remaining references data columns.
+  //
+  // Multi-GPU note: the AST translation here happens on the metadata-scan task's CURRENT
+  // device. cudf::ast scalars are device-resident, so this AST is only valid for evaluation
+  // on the same device. We use it locally for stats-based row-group pruning further down
+  // in this function (hybrid_scan_reader takes the filter via reader_options), and we ALSO
+  // surface the original duckdb expression + name resolver via
+  // result->retranslation_filter so that sirius_gpu_parquet_scan_operator::execute() can
+  // translate FRESH on its own device. Without this, a GPU_PARQUET_SCAN task running on a
+  // different GPU silently prunes every row group → 0 rows (no error).
+  auto name_resolver = [this](duckdb::idx_t ref_index) -> std::string {
+    return _plan.batch_column_name(ref_index);
+  };
+  result->filter_name_resolver  = name_resolver;
+  result->retranslation_filter  = _duckdb_filter_expression;
   std::shared_ptr<translated_expression> ast_filter;
   if (_duckdb_filter_expression) {
-    // Resolver maps the BoundReferenceExpression's batch position (D) to the corresponding
-    // parquet column name. scan_plan::batch_column_name is the single source of truth for
-    // this D→name mapping; the previously-cached _column_name_by_ref was C-indexed and
-    // silently wrong whenever projection reordered or dropped columns.
-    auto name_resolver = [this](duckdb::idx_t ref_index) -> std::string {
-      return _plan.batch_column_name(ref_index);
-    };
     gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
     auto optional_filter =
       translator.translate_expression_with_names(*_duckdb_filter_expression, name_resolver);
@@ -183,6 +190,9 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
         "[sirius_parquet_metadata_scan_operator] Translated filter expression for pushdown.");
     } else {
       result->filter_expression = _duckdb_filter_expression;
+      // Re-translation also will fail on the scan device — clear retranslation_filter so
+      // execute() falls through to the post-read duckdb evaluation path.
+      result->retranslation_filter.reset();
       SIRIUS_LOG_DEBUG(
         "[sirius_parquet_metadata_scan_operator] AST translation failed; filter will be applied "
         "post-read by the GPU scan operator.");
