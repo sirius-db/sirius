@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Multi-GPU Distribution
 status: executing
-stopped_at: "Completed 12-02: bound-checked key_col_indices in prepare_join_keys; failing test now passes"
-last_updated: "2026-04-29T19:24:13.291Z"
+stopped_at: "Completed 12-03: regression TEST_CASE for small-sort _M_range_check off-by-one with stash-roundtrip empirical proof"
+last_updated: "2026-04-29T19:32:00.163Z"
 last_activity: 2026-04-29
 progress:
   total_phases: 15
   completed_phases: 7
   total_plans: 45
-  completed_plans: 42
+  completed_plans: 43
   percent: 100
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-04-21)
 ## Current Position
 
 Phase: 12 (small-sort-vector-rangecheck-fix) — EXECUTING
-Plan: 3 of 4
+Plan: 4 of 4
 Status: Ready to execute
 Last activity: 2026-04-29
 
@@ -54,6 +54,7 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 | Phase 10 P04 | 115min | 4 tasks | 3 files |
 | Phase 12 P01 | 10min | 1 tasks | 1 files |
 | Phase 12 P02 | 6min | 1 tasks | 1 files |
+| Phase 12 P03 | 3min | 1 tasks | 1 files |
 
 ## Decisions
 
@@ -99,6 +100,8 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 - [Phase 12]: [12-01] Bare-shell GDB cannot reach SORT plan under agent sandbox (NVML driver isolation -> cucascade::topology_discovery=0 GPUs). Use mcp__project-commands__run_debug mode=gdb instead — the project-commands daemon has driver visibility on this host.
 - [Phase 12]: [12-01] Plan's verbatim 'catch throw std::out_of_range' GDB syntax does not filter by exception type — uses generic throw catchpoint. Replaced with 'catch throw' + Python guard inspecting __cxa_throw tinfo arg to skip past unrelated std::runtime_error throws (extension load + test setup) before reaching target std::out_of_range. Reusable pattern for future catchpoint triage.
 - [Phase 12]: [12-02] Bound-checked key_col_indices in sirius::op::prepare_join_keys (no-cast fast path) at src/op/sirius_physical_hash_join.cpp:622-637 with INVARIANT comment naming vector and valid range [0, table.num_columns()). Failing test 'physical_order - small sort stays single-GPU' now passes (27 assertions, 5.2s, exit 0). HYG baseline preserved at 40 occurrences. Did NOT widen to upstream planner fix per minimal-patch constraint; slow path (cast_necessary=true) deferred per scope-boundary rule.
+- [Phase 12]: [12-03] Added regression TEST_CASE 'physical_order - small sort rangecheck regression' (test_physical_order_mgpu.cpp:120-165) reusing scoped_mgpu_env+require_gpu_matches_cpu helpers. Final tuned constants: kNumFiles=4, kRowsPerFile=256, hash_partition_bytes=1024 (first try).
+- [Phase 12]: [12-03] Empirical regression-gate proof via git checkout-and-stash round-trip on src/op/sirius_physical_hash_join.cpp: pre-12-02 tree fails with verbatim 12-stack-trace.txt message 'vector::_M_range_check: __n (which is 2) >= this->size() (which is 2)'; post-restore PASS. Plan recipe (bare git stash) substituted with git checkout 289d6d2^ -- <file> + git checkout HEAD -- <file>; semantic outcome identical.
 
 ## Accumulated Context
 
@@ -147,6 +150,6 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 
 ## Session Continuity
 
-Last session: 2026-04-29T19:24:13.288Z
-Stopped at: Completed 12-02: bound-checked key_col_indices in prepare_join_keys; failing test now passes
+Last session: 2026-04-29T19:32:00.160Z
+Stopped at: Completed 12-03: regression TEST_CASE for small-sort _M_range_check off-by-one with stash-roundtrip empirical proof
 Resume file: None

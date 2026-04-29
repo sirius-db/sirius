@@ -77,7 +77,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 | 9. Scan-Task Distributor + Batch-Ownership Affinity | v1.2 | 4/4 | Complete (PARTIAL) | 2026-04-24 |
 | 10. TABLE_FUNCTION-form gpu_execution SIGSEGV fix | v1.2 | 4/4 | Complete (PARTIAL) | 2026-04-27 |
 | 11. AUDIT TEST_CASE attach-path SIGSEGV hotfix | v1.2 patch | 2/2 | Complete (PARTIAL) | 2026-04-28 |
-| 12. Fix vector::at(2) in small-sort plan path | v1.3 | 2/4 | In Progress|  |
+| 12. Fix vector::at(2) in small-sort plan path | v1.3 | 3/4 | In Progress|  |
 | 13. Fix Q11 multi-GPU hang/illegal-address | v1.3 | 0 | Not planned | — |
 | 14. Land SCHED-RR distribution | v1.3 | 0 | Not planned | — |
 | 15. Cross-GPU operator-colocation audit | v1.3 | 0 | Not planned | — |
