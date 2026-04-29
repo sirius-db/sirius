@@ -132,7 +132,7 @@ class duckdb_scan_task_global_state : public pipeline::sirius_pipeline_task_glob
   std::vector<sirius_physical_operator*> get_output_consumers() const noexcept
   {
     std::vector<sirius_physical_operator*> output_consumers;
-    auto ports = _op.get_next_port_after_sink();
+    auto ports = _op.get_next_ports_after_sink();
     for (auto& next_port : ports) {
       output_consumers.push_back(next_port.next_operator);
     }
