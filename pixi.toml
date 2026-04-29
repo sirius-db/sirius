@@ -18,7 +18,7 @@ cuda-nvml-dev = "*"
 cxx-compiler = "*"
 make = "*"
 ninja = "*"
-sccache = "*"
+sccache = "=0.15.0" # Version must match sccache version installed by mozilla-actions/sccache-action in GH workflows
 unzip = "*"
 clang = "21.*"
 wget = "*"
