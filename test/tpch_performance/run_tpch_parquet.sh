@@ -248,6 +248,9 @@ run_single_session() {
     local TEMP_SQL
     TEMP_SQL=$(mktemp /tmp/tpch_all_XXXXXX.sql)
     printf '%s\n' "$VIEW_SQL" > "$TEMP_SQL"
+    if [ "$ENGINE" = "sirius" ]; then
+        echo "SET enable_quent = true;" >> "$TEMP_SQL"
+    fi
     echo ".timer on" >> "$TEMP_SQL"
 
     for q in "${VALID_QUERIES[@]}"; do
@@ -428,6 +431,9 @@ run_multi_session() {
         TEMP_SQL=$(mktemp /tmp/tpch_q${q}_XXXXXX.sql)
         {
             printf '%s\n' "$VIEW_SQL"
+            if [ "$ENGINE" = "sirius" ]; then
+                printf "SET enable_quent = true;\n"
+            fi
             if [ "$ENGINE" = "sirius" ] && [ -n "${QUERY_CACHE_LEVEL[$q]:-}" ]; then
                 printf "SET scan_cache_level = '%s';\n" "${QUERY_CACHE_LEVEL[$q]}"
             fi
