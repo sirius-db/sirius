@@ -156,20 +156,14 @@ std::unique_ptr<operator_data> sirius_physical_top_n::execute(const operator_dat
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
-  const ::cucascade::read_only_data_batch* input_batch_ptr = nullptr;
-  for (auto const& batch : input_batches) {
-    if (input_batch_ptr != nullptr) {
-      throw internal_exception("TopN expects a single input batch per execution");
-    }
-    input_batch_ptr = &batch;
-  }
-  if (input_batch_ptr == nullptr) {
-    return std::make_unique<pipelineable_operator_data>(
-      std::vector<std::shared_ptr<cucascade::data_batch>>{});
+  if (input_batches.empty()) {
+    return std::make_unique<pipelineable_operator_data>();
+  } else if (input_batches.size() > 1) {
+    throw internal_exception("TopN expects a single input batch per execution");
   }
 
-  auto const& input_batch = *input_batch_ptr;
-  auto* space             = input_batch.get_memory_space();
+  auto input_batch = input_batches[0];
+  auto* space      = input_batch.get_memory_space();
   if (space == nullptr) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{});

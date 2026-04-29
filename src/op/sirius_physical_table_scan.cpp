@@ -114,14 +114,10 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   // Also, only parquet file tails are small due to the partitioning logic, so batch concatenation
   // is not needed.
   if (passthrough) {
-    auto ro_vec = input.get_read_only_batches();
-    std::vector<std::shared_ptr<::cucascade::data_batch>> idle_batches;
-    idle_batches.reserve(ro_vec.size());
-    for (auto& ro : ro_vec) {
-      idle_batches.push_back(::cucascade::data_batch::to_idle(std::move(ro)));
-    }
-    return std::make_unique<pipelineable_operator_data>(std::move(idle_batches));
+    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
   }
+
+  if (raw_input_batches.empty()) { return std::make_unique<pipelineable_operator_data>(); }
 
   // Build the column_ids index → batch position mapping once.
   // Both filter expression construction and post-filter projection use this.
@@ -151,14 +147,9 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
 
   // After concatenation (or if only one batch), work with a single batch.
   // For a concatenated batch (new idle), acquire read lock. For a single input batch, use directly.
-  std::optional<::cucascade::read_only_data_batch> single_batch_ro;
-  if (single_batch) { single_batch_ro = single_batch->to_read_only(); }
-  const ::cucascade::read_only_data_batch* batch_ref_ptr =
-    single_batch_ro.has_value() ? &single_batch_ro.value()
-                                : (!raw_input_batches.empty() ? &raw_input_batches[0] : nullptr);
-  if (!batch_ref_ptr || !batch_ref_ptr->get_data()) {
-    return std::make_unique<pipelineable_operator_data>();
-  }
+  ::cucascade::read_only_data_batch batch_ref =
+    single_batch ? single_batch->to_read_only() : raw_input_batches[0];
+  if (!batch_ref.get_data()) { return std::make_unique<pipelineable_operator_data>(); }
 
   // Apply table filters as a GPU expression if present.
   std::shared_ptr<cucascade::data_batch> output_batch;
@@ -171,11 +162,10 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   if (static_cast<bool>(local_filter_expr)) {
     sirius::gpu_expression_executor gpu_expression_executor(
       local_filter_expr, cudf::get_current_device_resource_ref(), stream);
-    output_batch = gpu_expression_executor.select(*batch_ref_ptr);
+    output_batch = gpu_expression_executor.select(batch_ref);
     if (!output_batch) { return std::make_unique<pipelineable_operator_data>(); }
   } else {
-    // No filter: clone the read_only batch; clone() returns an already-idle shared_ptr<data_batch>
-    output_batch = batch_ref_ptr->clone(sirius::get_next_batch_id(), stream);
+    output_batch = ::cucascade::data_batch::to_idle(std::move(batch_ref));
   }
 
   // After filtering, project away filter-only columns if the batch has more

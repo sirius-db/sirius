@@ -62,13 +62,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
     SIRIUS_LOG_DEBUG("Sort partition: passthrough ({} batches, {} partitions)",
                      input_batches.size(),
                      _sample_op ? _sample_op->get_num_partitions() : 1);
-    auto ro_vec = input.get_read_only_batches();
-    std::vector<std::shared_ptr<::cucascade::data_batch>> idle_batches;
-    idle_batches.reserve(ro_vec.size());
-    for (auto& ro : ro_vec) {
-      idle_batches.push_back(::cucascade::data_batch::to_idle(std::move(ro)));
-    }
-    return std::make_unique<pipelineable_operator_data>(std::move(idle_batches));
+    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
   }
 
   auto start           = std::chrono::high_resolution_clock::now();
