@@ -125,7 +125,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     for (const auto& batch : raw_input_batches) {
       if (batch && batch->get_data()) {
         auto& gpu_rep = batch->get_data()->cast<cucascade::gpu_table_representation>();
-        table_views.push_back(gpu_rep.get_table().view());
+        table_views.push_back(gpu_rep.get_table_view());
         if (!space) { space = batch->get_memory_space(); }
       }
     }
@@ -164,15 +164,15 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   // After filtering, project away filter-only columns if the batch has more
   // columns than the operator's output type list expects.
   std::size_t expected_output_columns = types.size();
-  auto& gpu_rep   = output_batch->get_data()->cast<cucascade::gpu_table_representation>();
-  auto& out_table = gpu_rep.get_table();
+  auto& gpu_rep      = output_batch->get_data()->cast<cucascade::gpu_table_representation>();
+  auto out_table_view = gpu_rep.get_table_view();
 
   if (expected_output_columns == 0) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(output_batch)});
   }
 
-  if (static_cast<std::size_t>(out_table.num_columns()) > expected_output_columns) {
+  if (static_cast<std::size_t>(out_table_view.num_columns()) > expected_output_columns) {
     SIRIUS_LOG_DEBUG(
       "TABLE_SCAN projection: expected_output_columns={}, projection_ids.size()={}, "
       "column_ids.size()={}",
@@ -188,7 +188,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
                     projection_ids.size()));
     }
 
-    auto table   = gpu_rep.release_table();
+    auto table   = gpu_rep.release_table(stream);
     auto columns = table->release();
 
     // Select output columns using the batch column map.

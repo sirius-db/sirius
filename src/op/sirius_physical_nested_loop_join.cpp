@@ -503,9 +503,8 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
       if (!get_column_index(expr, source_idx)) {
         sirius::gpu_expression_executor executor(&expr, mr, stream);
         auto expr_result_batch = executor.execute(batch);
-        auto& expr_table =
-          expr_result_batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
-        auto expr_view = expr_table.view();
+        auto expr_view =
+          expr_result_batch->get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
         if (expr_view.num_columns() != 1) {
           throw std::runtime_error(std::string("sirius_physical_nested_loop_join: expression on ") +
                                    side + " should produce one column");
