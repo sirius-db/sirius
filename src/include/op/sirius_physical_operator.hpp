@@ -16,12 +16,7 @@
 
 #pragma once
 
-#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/common.hpp"
-#include "duckdb/common/enums/operator_result_type.hpp"
-#include "duckdb/common/optional_idx.hpp"
-#include "duckdb/common/types/data_chunk.hpp"
-#include "duckdb/optimizer/join_order/join_node.hpp"
 #include "helper/logical_type.hpp"
 #include "helper/types.hpp"
 #include "op/sirius_physical_operator_type.hpp"
@@ -394,7 +389,7 @@ class sirius_physical_operator {
   //! Add a next port after sink
   void add_next_port_after_sink(next_port_info port_info);
   //! Get the next ports after sink
-  std::vector<sirius_physical_operator::next_port_info>& get_next_port_after_sink();
+  const std::vector<sirius_physical_operator::next_port_info>& get_next_ports_after_sink() const;
 
   //! Get the next task hint
   virtual std::optional<task_creation_hint> get_next_task_hint();

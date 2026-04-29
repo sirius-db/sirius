@@ -16,19 +16,19 @@
 
 #pragma once
 
-#include "duckdb/common/atomic.hpp"
-#include "duckdb/common/set.hpp"
-#include "duckdb/common/unordered_set.hpp"
-#include "duckdb/function/table_function.hpp"
-#include "duckdb/parallel/task_scheduler.hpp"
-#include "op/sirius_physical_operator.hpp"
-// #include "duckdb/parallel/executor_task.hpp"
 #include "common/optional_ptr.hpp"
 #include "common/reference_map.hpp"
 #include "duckdb/parallel/pipeline.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
+#include "op/sirius_physical_delim_join.hpp"
+#include "op/sirius_physical_operator.hpp"
+#include "op/sirius_physical_operator_type.hpp"
 #include "telemetry-bridge/gen/uuid.rs.h"
 
 #include <nvtx3/nvtx3.hpp>
+
+#include <ranges>
+
 namespace sirius {
 
 class sirius_engine;
@@ -127,6 +127,29 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   sirius::optional_ptr<op::sirius_physical_operator> get_source() { return source; }
 
   sirius::optional_ptr<op::sirius_physical_operator> get_source() const noexcept { return source; }
+
+  // Returns an iterable view over next_port_infos, representing the next ports of the sink operator
+  // in the pipeline, handling special-cased composite operators like left and right delim joins.
+  // Returns an empty view if the pipeline sink is not present.
+  [[nodiscard]] auto get_next_ports_after_sink() const noexcept
+  {
+    using span_over_ports = std::span<const op::sirius_physical_operator::next_port_info>;
+    span_over_ports part_1{}, part_2{};
+    if (sink) {
+      if (sink->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
+        auto& right_delim_join = sink->Cast<op::sirius_physical_right_delim_join>();
+        part_1 = span_over_ports{right_delim_join.partition_join->get_next_ports_after_sink()};
+        part_2 = span_over_ports{right_delim_join.distinct->get_next_ports_after_sink()};
+      } else if (sink->type == op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
+        auto& left_delim_join = sink->Cast<op::sirius_physical_left_delim_join>();
+        part_1 = span_over_ports{left_delim_join.column_data_scan->get_next_ports_after_sink()};
+        part_2 = span_over_ports{left_delim_join.distinct->get_next_ports_after_sink()};
+      } else {
+        part_1 = span_over_ports{sink->get_next_ports_after_sink()};
+      }
+    }
+    return std::views::join(std::array{part_1, part_2});
+  }
 
   //! Set the pipeline ID
   void set_pipeline_id(size_t id) { pipeline_id = id; }
