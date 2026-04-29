@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Multi-GPU Distribution
 status: executing
-stopped_at: "Completed 12-01: GDB stack trace pinned _M_range_check fix-site to src/op/sirius_physical_hash_join.cpp:623"
-last_updated: "2026-04-29T19:13:54.744Z"
+stopped_at: "Completed 12-02: bound-checked key_col_indices in prepare_join_keys; failing test now passes"
+last_updated: "2026-04-29T19:24:13.291Z"
 last_activity: 2026-04-29
 progress:
   total_phases: 15
   completed_phases: 7
   total_plans: 45
-  completed_plans: 41
+  completed_plans: 42
   percent: 100
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-04-21)
 ## Current Position
 
 Phase: 12 (small-sort-vector-rangecheck-fix) — EXECUTING
-Plan: 2 of 4
+Plan: 3 of 4
 Status: Ready to execute
 Last activity: 2026-04-29
 
@@ -53,6 +53,7 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 | Phase 10-table-function-form-gpu-execution-sigsegv-fix P03 | 55 | 2 tasks | 2 files |
 | Phase 10 P04 | 115min | 4 tasks | 3 files |
 | Phase 12 P01 | 10min | 1 tasks | 1 files |
+| Phase 12 P02 | 6min | 1 tasks | 1 files |
 
 ## Decisions
 
@@ -97,6 +98,7 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 - [Phase 12]: [12-01] Fix-site identified: src/op/sirius_physical_hash_join.cpp:623 — sirius::op::prepare_join_keys -> cudf::table_view::select(key_col_indices) throws std::out_of_range when key_col_indices contains 2 on a 2-column table_view. HASH_JOIN appears here because Sirius's distributed-sort plan uses HASH_JOIN as a partitioner. Bug is upstream in left/right_key_col_indices construction. cucascade fully ruled out (no partition_idx out of range text).
 - [Phase 12]: [12-01] Bare-shell GDB cannot reach SORT plan under agent sandbox (NVML driver isolation -> cucascade::topology_discovery=0 GPUs). Use mcp__project-commands__run_debug mode=gdb instead — the project-commands daemon has driver visibility on this host.
 - [Phase 12]: [12-01] Plan's verbatim 'catch throw std::out_of_range' GDB syntax does not filter by exception type — uses generic throw catchpoint. Replaced with 'catch throw' + Python guard inspecting __cxa_throw tinfo arg to skip past unrelated std::runtime_error throws (extension load + test setup) before reaching target std::out_of_range. Reusable pattern for future catchpoint triage.
+- [Phase 12]: [12-02] Bound-checked key_col_indices in sirius::op::prepare_join_keys (no-cast fast path) at src/op/sirius_physical_hash_join.cpp:622-637 with INVARIANT comment naming vector and valid range [0, table.num_columns()). Failing test 'physical_order - small sort stays single-GPU' now passes (27 assertions, 5.2s, exit 0). HYG baseline preserved at 40 occurrences. Did NOT widen to upstream planner fix per minimal-patch constraint; slow path (cast_necessary=true) deferred per scope-boundary rule.
 
 ## Accumulated Context
 
@@ -145,6 +147,6 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 
 ## Session Continuity
 
-Last session: 2026-04-29T19:13:54.742Z
-Stopped at: Completed 12-01: GDB stack trace pinned _M_range_check fix-site to src/op/sirius_physical_hash_join.cpp:623
+Last session: 2026-04-29T19:24:13.288Z
+Stopped at: Completed 12-02: bound-checked key_col_indices in prepare_join_keys; failing test now passes
 Resume file: None
