@@ -171,13 +171,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
   auto* space                = input_batch_ro.get_memory_space();
 
   if (_num_partitions.value() < 2 || _partition_keys.empty()) {
-    auto ro_vec = input.get_read_only_batches();
-    std::vector<std::shared_ptr<::cucascade::data_batch>> idle_batches;
-    idle_batches.reserve(ro_vec.size());
-    for (auto& ro : ro_vec) {
-      idle_batches.push_back(::cucascade::data_batch::to_idle(std::move(ro)));
-    }
-    return std::make_unique<pipelineable_operator_data>(std::move(idle_batches));
+    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
   }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> partitioned_results;

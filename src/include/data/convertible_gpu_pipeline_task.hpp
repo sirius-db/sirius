@@ -110,10 +110,10 @@ class convertible_gpu_pipeline_task : public convertible_data {
     sirius::memory::sirius_memory_reservation_manager& res_mgr,
     bool blocking = true) override
   {
-    auto* pipelineable = get_pipelineable_data();
-    if (!pipelineable) { return std::nullopt; }
+    auto* operator_data = get_pipelineable_data();
+    if (!operator_data) { return std::nullopt; }
 
-    const auto& batches = pipelineable->get_data_batches();
+    const auto& batches = operator_data->get_data_batches();
     std::vector<std::size_t> totals(target_spaces.size(), 0);
     bool any_converted = false;
 
@@ -161,11 +161,11 @@ class convertible_gpu_pipeline_task : public convertible_data {
    */
   std::size_t bytes_in_space(cucascade::memory::memory_space* space) const override
   {
-    auto* pipelineable = get_pipelineable_data();
-    if (!pipelineable) { return 0; }
+    auto* operator_data = get_pipelineable_data();
+    if (!operator_data) { return 0; }
 
     std::size_t total = 0;
-    for (const auto& ro : pipelineable->get_read_only_batches(false)) {
+    for (const auto& ro : operator_data->get_read_only_batches(false)) {
       if (ro.get_memory_space() == space) { total += ro.get_data()->get_size_in_bytes(); }
     }
     return total;
@@ -177,7 +177,7 @@ class convertible_gpu_pipeline_task : public convertible_data {
    * The chain is: itask -> gpu_pipeline_task -> local_state ->
    * gpu_pipeline_task_local_state -> _input_data -> pipelineable_operator_data.
    * Returns nullptr at any point if the cast fails (e.g., the task is not a
-   * gpu_pipeline_task, or has no pipelineable input data).
+   * gpu_pipeline_task, or has no pipelineable operator_data input data).
    *
    * Public and static so that both the wrapper and the provider can share this
    * logic without duplicating the dynamic_cast chain.
@@ -296,10 +296,10 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
   static bool has_matching_batches(sirius::parallel::itask& task,
                                    cucascade::memory::memory_space* space)
   {
-    auto* pipelineable = convertible_gpu_pipeline_task::get_pipelineable_data(task);
-    if (!pipelineable) { return false; }
+    auto* operator_data = convertible_gpu_pipeline_task::get_pipelineable_data(task);
+    if (!operator_data) { return false; }
 
-    for (const auto& batch : pipelineable->get_data_batches()) {
+    for (const auto& batch : operator_data->get_data_batches()) {
       if (!batch) { continue; }
       if (batch->get_state() != cucascade::batch_state::idle) { continue; }
       auto ro = batch->to_read_only();
