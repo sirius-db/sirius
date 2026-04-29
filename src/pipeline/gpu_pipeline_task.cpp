@@ -357,10 +357,8 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     throw std::runtime_error("gpu_pipeline_task::execute: input_data is null");
   }
 
-  bool prepare_success = false;
   try {
-    prepare_success =
-      local_state._input_data->prepare_for_processing(requested_memory_space, stream);
+    local_state._input_data->prepare_for_processing(requested_memory_space, stream);
   } catch (const rmm::out_of_memory& oom) {
     auto peak_bytes  = allocator->get_peak_allocated_bytes(stream);
     auto input_basis = local_state.get_task_consumption_basis();
@@ -378,11 +376,6 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
                      pipeline->get_pipeline_id(),
                      e.what());
     throw;
-  }
-
-  if (!prepare_success) {
-    throw oom_reschedule_exception(
-      std::move(local_state._input_data), 0, "Failed to lock or prepare batches for processing");
   }
 
   auto const prepare_end = std::chrono::high_resolution_clock::now();

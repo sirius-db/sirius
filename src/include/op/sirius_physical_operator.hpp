@@ -93,21 +93,16 @@ class operator_data {
    *                                current space (see pipelineable_operator_data).
    * @param stream                  CUDA stream available for any data-movement
    *                                kernels triggered by preparation.
-   * @return  true on success (internal state populated as side effect), false if
-   *          preparation failed and the caller should reschedule or retry.
-   *          Overrides may throw for some errors; pipelineable_operator_data rethrows
-   *          rmm::out_of_memory after logging.
+   * Throws on failure.
+   * pipelineable_operator_data rethrows rmm::out_of_memory after logging,
+   * and throws sirius::internal_exception for unrecoverable preparation errors.
    *
-   * The default implementation is a no-op that returns true.
-   * It is appropriate for operator_data subclasses that own no data requiring
-   * locking and need no per-task setup. Override when either condition changes.
+   * The default implementation is a no-op appropriate for operator_data subclasses
+   * that own no data requiring locking and need no per-task setup.
+   * Override when either condition changes.
    */
-
-  // WSM TODO: this should be void and throw an exception if preparation fails
-  virtual bool prepare_for_processing(
-    const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
-  {
-    return true;
+  virtual void prepare_for_processing(
+    const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream) {
   };
 
   /**
@@ -178,10 +173,10 @@ class pipelineable_operator_data : public operator_data {
    * @brief Lock all data batches for processing in the requested memory space.
    *
    * Iterates over all idle batches and locks (or converts then locks) each one,
-   * storing the results in _read_only_data_batches. Returns false if any batch
-   * pointer is null or any batch fails to lock. Propagates rmm::out_of_memory.
+   * storing the results in _read_only_data_batches. Throws sirius::internal_exception
+   * if any batch pointer is null or any batch fails to lock. Propagates rmm::out_of_memory.
    */
-  bool prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
+  void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
                               rmm::cuda_stream_view stream) override;
 
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override

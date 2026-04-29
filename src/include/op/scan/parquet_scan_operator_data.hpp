@@ -110,13 +110,11 @@ class parquet_scan_data : public op::operator_data {
    *                                stored into gpu_memory_space for use during execute().
    * @param stream                  Unused — no data movement occurs during preparation
    *                                for this source input.
-   * @return  Always true — there are no upstream batches to lock.
    */
-  bool prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
+  void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
                               rmm::cuda_stream_view stream) override
   {
     gpu_memory_space = const_cast<cucascade::memory::memory_space*>(requested_memory_space);
-    return true;
   };
 
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override

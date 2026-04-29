@@ -20,6 +20,7 @@
 #include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "sirius/exception.hpp"
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/error.hpp>
@@ -76,7 +77,7 @@ std::vector<::cucascade::read_only_data_batch> pipelineable_operator_data::get_r
   return *_read_only_data_batches;
 }
 
-bool pipelineable_operator_data::prepare_for_processing(
+void pipelineable_operator_data::prepare_for_processing(
   const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
 {
   remove_read_only_lock();
@@ -86,8 +87,8 @@ bool pipelineable_operator_data::prepare_for_processing(
 
   for (const auto& batch : data_batches) {
     if (!batch) {
-      SIRIUS_LOG_ERROR("pipelineable_operator_data: null batch encountered, skipping");
-      return false;
+      throw sirius::internal_exception(
+        "pipelineable_operator_data: null batch encountered during prepare_for_processing");
     }
     std::optional<::cucascade::read_only_data_batch> ro_batch;
     try {
@@ -107,12 +108,16 @@ bool pipelineable_operator_data::prepare_for_processing(
         e.what());
       throw;
     }
-    if (!ro_batch) { return false; }
+    if (!ro_batch) {
+      throw sirius::internal_exception(
+        "pipelineable_operator_data: failed to lock batch {} for processing, state: {}",
+        batch->get_batch_id(),
+        static_cast<int>(batch->get_state()));
+    }
     ro_batches.emplace_back(std::move(*ro_batch));
   }
 
   _read_only_data_batches = std::move(ro_batches);
-  return true;
 }
 
 std::string sirius_physical_operator::get_name() const
