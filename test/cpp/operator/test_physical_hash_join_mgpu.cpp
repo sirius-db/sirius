@@ -175,12 +175,19 @@ TEST_CASE("physical_hash_join - BUILD_PROBE probe-heavy join across two GPUs",
                                 << "GPU1{pipeline=" << counts[1].pipeline_ids.size()
                                 << ", scan=" << counts[1].scan_ids.size() << "}");
 
-  // Both GPUs saw SOME scan work (scan is RR-distributed regardless of
-  // BUILD_PROBE pinning). We don't require both GPUs to see pipeline
-  // work for this TEST_CASE because BUILD_PROBE explicitly pins every
-  // join task to one GPU.
-  REQUIRE(counts[0].scan_ids.size() >= 1);
-  REQUIRE(counts[1].scan_ids.size() >= 1);
+  // Both GPUs saw SOME pipeline work — under the PARQUET_METADATA_SCAN
+  // → GPU_PARQUET_SCAN pipeline architecture, parquet reads dispatch as
+  // gpu_pipeline_task entries (logged via [mgpu-audit] pipeline_task
+  // dispatched) rather than scan_executor scan_batch entries (which are
+  // reserved for the duckdb_scan_task / cpu_source_task / legacy
+  // PARQUET_SCAN path through duckdb_scan_executor::select_target_gpu).
+  // BUILD_PROBE pins post-partition probe tasks to one GPU via SCHED-00,
+  // but the metadata + GPU_PARQUET_SCAN pipelines upstream of the join
+  // are not partition-pinned and distribute across both GPUs, so
+  // pipeline_ids >= 1 on both GPUs is the correct cross-GPU signal —
+  // the same metric MIXED_JOIN below uses.
+  REQUIRE(counts[0].pipeline_ids.size() >= 1);
+  REQUIRE(counts[1].pipeline_ids.size() >= 1);
 
   fs::remove_all(tmp, ec);
 }
@@ -646,8 +653,12 @@ TEST_CASE("physical_hash_join - follow-up #17 scale-up: Q11-like BUILD_PROBE wit
                                 << ", scan=" << counts[0].scan_ids.size() << "} "
                                 << "GPU1{pipeline=" << counts[1].pipeline_ids.size()
                                 << ", scan=" << counts[1].scan_ids.size() << "}");
-  REQUIRE(counts[0].scan_ids.size() >= 1);
-  REQUIRE(counts[1].scan_ids.size() >= 1);
+  // Use pipeline_ids: scan reads dispatch as gpu_pipeline_task under the
+  // PARQUET_METADATA_SCAN → GPU_PARQUET_SCAN architecture, not as
+  // scan_executor scan_batch entries. cache=table_gpu also collapses
+  // scan_executor traffic on warm iterations. See BUILD_PROBE comment above.
+  REQUIRE(counts[0].pipeline_ids.size() >= 1);
+  REQUIRE(counts[1].pipeline_ids.size() >= 1);
 
   fs::remove_all(tmp, ec);
 }
