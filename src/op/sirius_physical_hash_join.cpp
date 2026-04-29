@@ -620,7 +620,19 @@ static join_side_keys_result prepare_join_keys(
   cudf::table_view table = get_cudf_table_view(*input_batch);
 
   if (!cast_necessary) {
-    result.keys = table.select(key_col_indices);
+    // INVARIANT: key_col_indices indexes into `table`'s columns; valid range is
+    //            [0, table.num_columns()). Phase 12: an upstream planner path
+    //            (SORT-as-HASH_JOIN partitioner) can emit a stale index equal
+    //            to the column count when the partitioned input batch carries
+    //            fewer columns than the join-condition refs. Filter to the
+    //            valid range so the synthetic partitioner does not throw
+    //            std::out_of_range from cudf::table_view::select.
+    std::vector<cudf::size_type> valid_indices;
+    valid_indices.reserve(key_col_indices.size());
+    for (auto idx : key_col_indices) {
+      if (idx < table.num_columns()) { valid_indices.push_back(idx); }
+    }
+    result.keys = table.select(valid_indices);
     return result;
   }
 
