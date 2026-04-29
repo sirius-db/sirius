@@ -278,7 +278,9 @@ std::shared_ptr<data_batch> gpu_expression_executor::execute(
 
   // Get the table_view from the input_batch
   auto* input_data = input_batch.get_data();
-  if (!input_data) { return nullptr; }
+  if (!input_data) {
+    throw sirius::internal_exception("gpu_expression_executor::execute: input batch was nullptr");
+  }
   auto const& input_rep = input_data->cast<cucascade::gpu_table_representation>();
   _input_table          = input_rep.get_table_view();
 
@@ -345,7 +347,9 @@ std::shared_ptr<data_batch> gpu_expression_executor::select(
 
   // Call execute(input_batch) to set _input_table and produce the boolean mask as a single column
   auto mask_batch = execute(input_batch);
-  if (!mask_batch) { return nullptr; }
+  if (!mask_batch) {
+    throw sirius::internal_exception("gpu_expression_executor::select: mask batch was nullptr");
+  }
   auto mask_ro    = mask_batch->to_read_only();
   auto& mask_repr = mask_ro.get_data()->cast<cucascade::gpu_table_representation>();
   auto mask_view  = mask_repr.get_table_view().column(0);

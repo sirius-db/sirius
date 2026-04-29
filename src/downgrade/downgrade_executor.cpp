@@ -128,23 +128,6 @@ void downgrade_executor::processing_loop()
 
     auto& req = request;
 
-    SIRIUS_LOG_TRACE(
-      "[downgrade] {} processing request (monitor={}): amount_to_downgrade={} bytes ({:.2f} MB), "
-      "available={} bytes ({:.2f} MB), total_reserved={} bytes ({:.2f} MB)",
-      _source_label,
-      req->is_monitor_request,
-      _memory_space ? _memory_space->get_amount_to_downgrade() : 0,
-      _memory_space
-        ? static_cast<double>(_memory_space->get_amount_to_downgrade()) / (1024.0 * 1024.0)
-        : 0.0,
-      _memory_space ? _memory_space->get_available_memory() : 0,
-      _memory_space ? static_cast<double>(_memory_space->get_available_memory()) / (1024.0 * 1024.0)
-                    : 0.0,
-      _memory_space ? _memory_space->get_total_reserved_memory() : 0,
-      _memory_space
-        ? static_cast<double>(_memory_space->get_total_reserved_memory()) / (1024.0 * 1024.0)
-        : 0.0);
-
     auto t_start = std::chrono::steady_clock::now();
 
     // Per-source tracking (repos vs pipeline_queue)
