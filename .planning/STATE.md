@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Multi-GPU Distribution
-status: executing
-stopped_at: "Completed 12-03: regression TEST_CASE for small-sort _M_range_check off-by-one with stash-roundtrip empirical proof"
-last_updated: "2026-04-29T19:32:00.163Z"
+status: verifying
+stopped_at: "Completed 12-04: Phase 12 ship-gate validation PASS; ready for Phase 13"
+last_updated: "2026-04-29T19:42:48.607Z"
 last_activity: 2026-04-29
 progress:
   total_phases: 15
-  completed_phases: 7
+  completed_phases: 8
   total_plans: 45
-  completed_plans: 43
+  completed_plans: 44
   percent: 100
 ---
 
@@ -27,7 +27,7 @@ See: .planning/PROJECT.md (updated 2026-04-21)
 
 Phase: 12 (small-sort-vector-rangecheck-fix) — EXECUTING
 Plan: 4 of 4
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-04-29
 
 Progress: [██████████] 100% (6/6 plans complete)
@@ -55,6 +55,7 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 | Phase 12 P01 | 10min | 1 tasks | 1 files |
 | Phase 12 P02 | 6min | 1 tasks | 1 files |
 | Phase 12 P03 | 3min | 1 tasks | 1 files |
+| Phase 12 P04 | 10min | 1 tasks | 2 files |
 
 ## Decisions
 
@@ -102,6 +103,7 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 - [Phase 12]: [12-02] Bound-checked key_col_indices in sirius::op::prepare_join_keys (no-cast fast path) at src/op/sirius_physical_hash_join.cpp:622-637 with INVARIANT comment naming vector and valid range [0, table.num_columns()). Failing test 'physical_order - small sort stays single-GPU' now passes (27 assertions, 5.2s, exit 0). HYG baseline preserved at 40 occurrences. Did NOT widen to upstream planner fix per minimal-patch constraint; slow path (cast_necessary=true) deferred per scope-boundary rule.
 - [Phase 12]: [12-03] Added regression TEST_CASE 'physical_order - small sort rangecheck regression' (test_physical_order_mgpu.cpp:120-165) reusing scoped_mgpu_env+require_gpu_matches_cpu helpers. Final tuned constants: kNumFiles=4, kRowsPerFile=256, hash_partition_bytes=1024 (first try).
 - [Phase 12]: [12-03] Empirical regression-gate proof via git checkout-and-stash round-trip on src/op/sirius_physical_hash_join.cpp: pre-12-02 tree fails with verbatim 12-stack-trace.txt message 'vector::_M_range_check: __n (which is 2) >= this->size() (which is 2)'; post-restore PASS. Plan recipe (bare git stash) substituted with git checkout 289d6d2^ -- <file> + git checkout HEAD -- <file>; semantic outcome identical.
+- [Phase 12]: [12-04] Phase 12 ship-gate validation PASS — all 4 CONTEXT.md acceptance criteria verified via real MCP runs: small-sort test (27 assertions), regression test (19 assertions), [mgpu] suite 12/15 pass with 2 failures classified Phase 14 territory by 'gpu0 pipelines=0 gpu1 pipelines=N' shape, TPC-H × 2-GPU integration 48/48 pass (71608 assertions). No new regressions. TPC-H × 2-GPU MCP command DISCOVERED (not guessed): no dedicated tpch-mgpu command exists; used unit-tests filter='[integration][TPC-H]' + filter='[mgpu-audit][TPC-H]'. Orchestrator advances to Phase 13.
 
 ## Accumulated Context
 
@@ -150,6 +152,6 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 
 ## Session Continuity
 
-Last session: 2026-04-29T19:32:00.160Z
-Stopped at: Completed 12-03: regression TEST_CASE for small-sort _M_range_check off-by-one with stash-roundtrip empirical proof
+Last session: 2026-04-29T19:42:48.605Z
+Stopped at: Completed 12-04: Phase 12 ship-gate validation PASS; ready for Phase 13
 Resume file: None
