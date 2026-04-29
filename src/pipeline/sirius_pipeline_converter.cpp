@@ -48,6 +48,7 @@
 #include "sirius_engine.hpp"
 
 #include <cucascade/data/data_repository_manager.hpp>
+#include <cucascade/data/disk_io_backend.hpp>
 
 #include <stdexcept>
 
@@ -206,6 +207,20 @@ void sirius_pipeline_converter::split_parquet_scan_source(
   // accumulate_metadata() handoff.
   auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_parquet_scan_operator>(
     scan_op.types, scan_op.estimated_cardinality);
+
+  // Resolve the cucascade io_backend for the metadata scan from SiriusContext.
+  // Phase 5 Plan 04 wires per-GPU backends; the metadata scan is planning-only
+  // (footer reads), so picking the first backend is correctness-neutral. When
+  // SiriusContext or its backend map is unavailable (e.g. in legacy contexts
+  // without transparent execution), pass nullptr — the operator's execute path
+  // throws if it actually needs the backend at run time.
+  std::shared_ptr<cucascade::idisk_io_backend> metadata_io_backend;
+  if (auto sirius_ctx =
+        engine_.context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
+    auto const& gpu_io_backends = sirius_ctx->get_gpu_io_backends();
+    if (!gpu_io_backends.empty()) { metadata_io_backend = gpu_io_backends.begin()->second; }
+  }
+
   auto metadata_scan_op = duckdb::make_uniq<op::scan::sirius_parquet_metadata_scan_operator>(
     gpu_scan_op.get(),
     scan_op.types,
@@ -216,7 +231,10 @@ void sirius_pipeline_converter::split_parquet_scan_source(
     scan_op.projection_ids,
     scan_op.names,
     std::move(scan_op.table_filters),
-    partition_indices);
+    partition_indices,
+    sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE,
+    op::scan::sirius_parquet_metadata_scan_operator::DEFAULT_MAX_FILE_PROCESSED,
+    std::move(metadata_io_backend));
 
   auto* gpu_scan_ptr      = gpu_scan_op.get();
   auto* metadata_scan_ptr = metadata_scan_op.get();
