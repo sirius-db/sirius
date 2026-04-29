@@ -38,6 +38,7 @@
 #include <duckdb.hpp>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -46,6 +47,7 @@
 #include <regex>
 #include <set>
 #include <string>
+#include <vector>
 
 namespace sirius::test::mgpu {
 
@@ -347,25 +349,37 @@ inline void require_gpu_matches_cpu(duckdb::Connection& con, std::string const& 
   REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
   REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
 
-  auto ncols               = gpu_result->ColumnCount();
-  std::string order_clause = " ORDER BY ";
-  for (duckdb::idx_t c = 0; c < ncols; c++) {
-    if (c > 0) order_clause += ", ";
-    order_clause += std::to_string(c + 1);
+  // Materialize both result sets into row vectors of stringified cells, sort
+  // lexicographically, and compare. We do the sort client-side because sirius
+  // registers `gpu_execution` as a CALL/pragma function only — not as a scan
+  // function — so `SELECT * FROM gpu_execution(...) ORDER BY ...` is rejected
+  // by DuckDB ("Unsupported scan function: gpu_execution") before any GPU code
+  // runs. Sorting in C++ also avoids re-executing the GPU query just to sort.
+  auto const ncols = gpu_result->ColumnCount();
+  auto const nrows = gpu_result->RowCount();
+  std::vector<std::vector<std::string>> gpu_rows;
+  std::vector<std::vector<std::string>> cpu_rows;
+  gpu_rows.reserve(nrows);
+  cpu_rows.reserve(nrows);
+  for (duckdb::idx_t r = 0; r < nrows; ++r) {
+    std::vector<std::string> g_row;
+    std::vector<std::string> c_row;
+    g_row.reserve(ncols);
+    c_row.reserve(ncols);
+    for (duckdb::idx_t c = 0; c < ncols; ++c) {
+      g_row.push_back(gpu_result->GetValue(c, r).ToString());
+      c_row.push_back(cpu_result->GetValue(c, r).ToString());
+    }
+    gpu_rows.push_back(std::move(g_row));
+    cpu_rows.push_back(std::move(c_row));
   }
+  std::sort(gpu_rows.begin(), gpu_rows.end());
+  std::sort(cpu_rows.begin(), cpu_rows.end());
 
-  auto gpu_sorted =
-    con.Query("SELECT * FROM gpu_execution(\"" + clean_query + "\")" + order_clause);
-  auto cpu_sorted = con.Query("SELECT * FROM (" + clean_query + ") t" + order_clause);
-  REQUIRE(gpu_sorted);
-  REQUIRE_FALSE(gpu_sorted->HasError());
-  REQUIRE(cpu_sorted);
-  REQUIRE_FALSE(cpu_sorted->HasError());
-
-  for (duckdb::idx_t r = 0; r < gpu_sorted->RowCount(); r++) {
-    for (duckdb::idx_t c = 0; c < gpu_sorted->ColumnCount(); c++) {
-      auto gpu_str = gpu_sorted->GetValue(c, r).ToString();
-      auto cpu_str = cpu_sorted->GetValue(c, r).ToString();
+  for (duckdb::idx_t r = 0; r < nrows; ++r) {
+    for (duckdb::idx_t c = 0; c < ncols; ++c) {
+      auto const& gpu_str = gpu_rows[r][c];
+      auto const& cpu_str = cpu_rows[r][c];
       if (gpu_str != cpu_str) {
         UNSCOPED_INFO("Row " << r << " Col " << c << " mismatch: GPU=[" << gpu_str << "] CPU=["
                              << cpu_str << "]");
