@@ -63,7 +63,7 @@ TEMPLATE_TEST_CASE(
   auto [input_table, expected_table] =
     sirius::test::make_test_data_for_grouped_aggregate<Traits>(num_groups, 1, stream, mr);
 
-  std::shared_ptr<data_batch> input_batch = sirius::make_data_batch(std::move(input_table), *space);
+  std::shared_ptr<data_batch> input_batch = sirius::make_data_batch(std::move(input_table), *space, stream);
 
   // Create DuckDB context for aggregate function binding
   duckdb::DuckDB db(nullptr);
@@ -121,7 +121,7 @@ TEMPLATE_TEST_CASE("sirius_physical_grouped_aggregate grouped aggregates with AV
   auto [input_table, expected_table] =
     sirius::test::make_test_data_for_grouped_aggregate_with_avg<Traits>(num_groups, 1, stream, mr);
 
-  std::shared_ptr<data_batch> input_batch = sirius::make_data_batch(std::move(input_table), *space);
+  std::shared_ptr<data_batch> input_batch = sirius::make_data_batch(std::move(input_table), *space, stream);
 
   duckdb::DuckDB db(nullptr);
   duckdb::Connection con(db);
@@ -182,7 +182,7 @@ TEMPLATE_TEST_CASE(
   auto [input_table, expected_table] =
     sirius::test::make_test_data_for_grouped_aggregate<Traits>(num_groups, 2, stream, mr);
 
-  std::shared_ptr<data_batch> input_batch = sirius::make_data_batch(std::move(input_table), *space);
+  std::shared_ptr<data_batch> input_batch = sirius::make_data_batch(std::move(input_table), *space, stream);
 
   // Create DuckDB context for aggregate function binding
   duckdb::DuckDB db(nullptr);

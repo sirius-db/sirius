@@ -73,7 +73,8 @@ batches_with_handles create_batches_with_random_data(
                                                     ranges,
                                                     cudf::get_default_stream(),
                                                     mem_space.get_default_allocator());
-    auto batch = sirius::make_data_batch(std::move(table), mem_space);
+    auto batch =
+      sirius::make_data_batch(std::move(table), mem_space, cudf::get_default_stream());
 
     // Acquire processing handle (like the old pin() call)
     REQUIRE(batch->try_to_create_task());
