@@ -26,6 +26,9 @@
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
 
+// cucascade
+#include <cucascade/data/data_batch.hpp>
+
 // standard library
 #include <cstddef>
 #include <memory>
@@ -137,6 +140,44 @@ class parquet_scan_data : public op::operator_data {
   std::shared_ptr<scan_plan const> plan;
   /// GPU memory space for allocating output tables produced by execute().
   cucascade::memory::memory_space* gpu_memory_space = nullptr;
+};
+
+//===----------------------------------------------------------------------===//
+// scan_cached_operator_data
+//===----------------------------------------------------------------------===//
+/**
+ * @brief Input to a GPU parquet scan task served from a pinned (cached) entry.
+ *
+ * The cached_split_provider produces one of these per cached batch. It carries
+ * a zero-copy data_batch (whose gpu_table_representation is a view over pinned
+ * columns) plus the post-filter / projection metadata that the scan operator
+ * applies in execute(). The gpu_memory_space lives on the wrapped data_batch.
+ */
+class scan_cached_operator_data : public op::operator_data {
+ public:
+  using translated_expression = gpu_expression_translator::translated_expression;
+
+  scan_cached_operator_data(
+    std::shared_ptr<cucascade::data_batch> batch,
+    std::variant<std::shared_ptr<translated_expression>, std::shared_ptr<duckdb::Expression>>
+      filter_expression,
+    std::vector<std::size_t> post_filter_projection_ids)
+    : batch(std::move(batch)),
+      filter_expression(std::move(filter_expression)),
+      post_filter_projection_ids(std::move(post_filter_projection_ids))
+  {
+  }
+
+  /// Cached data batch viewed by the scan. Owning shared_ptr keeps the pinned
+  /// columns alive for the lifetime of the task.
+  std::shared_ptr<cucascade::data_batch> batch;
+  /// Filter expression, same shape as parquet_scan_data::filter_expression. May
+  /// be empty (i.e. variant default) when no filter applies.
+  std::variant<std::shared_ptr<translated_expression>, std::shared_ptr<duckdb::Expression>>
+    filter_expression;
+  /// Indices into the cached table's columns (in selected_indices order) that
+  /// remain after pruning pure-filter columns. Empty means no projection prune.
+  std::vector<std::size_t> post_filter_projection_ids;
 };
 
 }  // namespace sirius::op::scan
