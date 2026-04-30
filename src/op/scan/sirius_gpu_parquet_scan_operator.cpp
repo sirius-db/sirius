@@ -50,9 +50,7 @@ sirius_gpu_parquet_scan_operator::sirius_gpu_parquet_scan_operator(
       SiriusPhysicalOperatorType::GPU_PARQUET_SCAN, std::move(types), estimated_cardinality),
     _split_connector(std::make_unique<scan_manager::split_connector>()),
     _scan_info(std::move(scan_info))
-{
-  _split_connector->close();
-}
+{ _split_connector->close(); }
 
 sirius_gpu_parquet_scan_operator::~sirius_gpu_parquet_scan_operator() = default;
 
@@ -60,15 +58,11 @@ sirius_gpu_parquet_scan_operator::~sirius_gpu_parquet_scan_operator() = default;
 // Friend access — wired by sirius_scan_manager during prepare_for_query.
 //===----------------------------------------------------------------------===//
 std::unique_ptr<parquet_scan_info> sirius_gpu_parquet_scan_operator::take_scan_info()
-{
-  return std::move(_scan_info);
-}
+{ return std::move(_scan_info); }
 
 void sirius_gpu_parquet_scan_operator::set_split_connector(
   std::unique_ptr<scan_manager::split_connector> connector)
-{
-  _split_connector = std::move(connector);
-}
+{ _split_connector = std::move(connector); }
 
 //===----------------------------------------------------------------------===//
 // Scheduling interface
@@ -76,16 +70,22 @@ void sirius_gpu_parquet_scan_operator::set_split_connector(
 std::optional<task_creation_hint> sirius_gpu_parquet_scan_operator::get_next_task_hint()
 {
   if (_split_connector->is_closed()) { return std::nullopt; }
-  // Will return READY even when the queue is empty but not yet closed — get_next_task_input_data()
-  // will block on the connector's cv. This parks a worker but avoids needing a scheduler-visible
-  // wake-up signal from the scan_manager.
+  // Returns READY even when the split queue is empty but not yet closed. The dispatched worker
+  // then parks inside split_connector::get_next_split's cv until the scan_manager pushes a split
+  // or closes the connector. This trades one parked worker per active scan for not needing a
+  // scheduler-visible wake-up signal from the scan_manager — the task_creator schedules the scan
+  // op once and the worker self-perpetuates inside task_creator's "loop until all_ports_empty"
+  // branch (see task_creator::manager_loop default else-branch).
+  //
+  // Lifecycle requirement: any error/drain path that joins task_creator's worker pool MUST first
+  // close the operator's split_connector (e.g. via sirius_scan_manager::close_all_connectors());
+  // otherwise the parked worker hangs forever and bounded_pool::wait_all deadlocks. Normal
+  // completion is fine — the split_provider closes the connector when it has no more splits.
   return task_creation_hint{TaskCreationHint::READY, this};
 }
 
 bool sirius_gpu_parquet_scan_operator::all_ports_empty()
-{
-  return _split_connector->is_closed() && !_split_connector->has_more_splits();
-}
+{ return _split_connector->is_closed() && !_split_connector->has_more_splits(); }
 
 std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::get_next_task_input_data()
 {
@@ -158,7 +158,8 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
       return std::make_unique<pipelineable_operator_data>(
         std::vector<std::shared_ptr<cucascade::data_batch>>());
     }
-    table = output_batch->get_data()->cast<cucascade::gpu_table_representation>().release_table();
+    table =
+      output_batch->get_data()->cast<cucascade::gpu_table_representation>().release_table(stream);
     SIRIUS_LOG_DEBUG(
       "[sirius_gpu_parquet_scan_operator] Applied duckdb filter expression post parquet scan.");
   }

@@ -22,8 +22,7 @@
 #include <scan_manager/split_connector.hpp>
 
 // standard library
-#include <atomic>
-#include <chrono>
+#include <mutex>
 #include <future>
 #include <memory>
 #include <thread>

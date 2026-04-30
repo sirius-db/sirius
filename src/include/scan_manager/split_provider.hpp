@@ -31,8 +31,17 @@ class split_connector;
  *
  * A concrete provider, when started, dispatches tasks onto a worker pool that
  * compute split metadata and push it (as @c operator_data instances) into the
- * supplied @ref split_connector. The provider must call @c connector.close()
- * exactly once after it has no more splits to produce (including failure paths).
+ * supplied @ref split_connector.
+ *
+ * Lifecycle contract: the connector must be closed on every termination path so
+ * that consumers blocked in @c get_next_split() can wake. @c split_connector::close()
+ * is idempotent, and the contract is shared between provider and driver:
+ *   - On the success path and on failures observed by background tasks, the provider
+ *     closes the connector before completing its returned future.
+ *   - If @c start() throws synchronously (e.g. precondition failure before any task
+ *     is scheduled), the driver closes the connector in its exception handler.
+ * Implementations may rely on the driver's safety-net close, but should still close
+ * eagerly when they own the failure to avoid stranding consumers.
  */
 class split_provider {
  public:
@@ -42,12 +51,13 @@ class split_provider {
    * @brief Begin producing splits.
    *
    * May dispatch work onto @p pool and return immediately; production may
-   * continue asynchronously. Implementations must eventually close
-   * @p connector exactly once.
+   * continue asynchronously. See the class-level lifecycle contract for who
+   * closes @p connector on each termination path.
    *
-   * @return a future that completes once the connector has been closed
-   *         (i.e. all production tasks finished). Allows a sequential driver
-   *         to wait on one provider before starting the next.
+   * @return a future that completes once the provider has finished pushing
+   *         splits and closed the connector (success path) or surfaced a
+   *         background-task exception. Allows a sequential driver to wait on
+   *         one provider before starting the next.
    */
   virtual std::future<void> start(exec::thread_pool& pool, split_connector& connector) = 0;
 };

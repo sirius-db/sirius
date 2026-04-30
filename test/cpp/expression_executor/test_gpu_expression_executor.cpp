@@ -392,7 +392,7 @@ exec_result run_execute(memory_space& space,
   REQUIRE(output_batch != nullptr);
   auto& in_repr  = input_batch->get_data()->cast<gpu_table_representation>();
   auto& out_repr = output_batch->get_data()->cast<gpu_table_representation>();
-  return {input_batch, output_batch, in_repr.get_table().view(), out_repr.get_table().view()};
+  return {input_batch, output_batch, in_repr.get_table_view(), out_repr.get_table_view()};
 }
 
 exec_result run_select(memory_space& space,
@@ -406,7 +406,7 @@ exec_result run_select(memory_space& space,
   REQUIRE(output_batch != nullptr);
   auto& in_repr  = input_batch->get_data()->cast<gpu_table_representation>();
   auto& out_repr = output_batch->get_data()->cast<gpu_table_representation>();
-  return {input_batch, output_batch, in_repr.get_table().view(), out_repr.get_table().view()};
+  return {input_batch, output_batch, in_repr.get_table_view(), out_repr.get_table_view()};
 }
 
 // Helper: make a BoundFunctionExpression with the given name, arg types, return type, and children.

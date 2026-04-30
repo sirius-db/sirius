@@ -117,7 +117,7 @@ class parquet_split_provider : public split_provider {
   /// and C→D filter map. Held as a shared_ptr<const> so each parquet_scan_data can
   /// carry it to the GPU scan operator's per-task AST translation without copying.
   std::shared_ptr<op::scan::scan_plan const> _plan;
-  /// The coalesced DuckDB filter expression (AST translation attempted in execute()).
+  /// The coalesced DuckDB filter expression (AST translation attempted in run_batch()).
   /// Empty when no filters were translatable (after skipping partition-column filters).
   std::shared_ptr<duckdb::Expression> _duckdb_filter_expression;
   /// The post-read assembly closure for converting the read output to final output layout.
