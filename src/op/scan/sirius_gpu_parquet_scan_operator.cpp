@@ -167,7 +167,8 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
         return std::make_unique<pipelineable_operator_data>(
           std::vector<std::shared_ptr<cucascade::data_batch>>());
       }
-      table = output_batch->get_data()->cast<cucascade::gpu_table_representation>().release_table();
+      table =
+        output_batch->get_data()->cast<cucascade::gpu_table_representation>().release_table(stream);
       SIRIUS_LOG_DEBUG(
         "[sirius_gpu_parquet_scan_operator] Applied duckdb filter expression post parquet scan.");
     }

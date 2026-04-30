@@ -202,8 +202,8 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
                  .get_data_batches()[0]
                  ->get_data()
                  ->template cast<gpu_table_representation>()
-                 .get_table();
-  auto view = table.view();
+                 .get_table_view();
+  auto view = table;
 
   REQUIRE(view.num_columns() == 5);
   REQUIRE(view.num_rows() == 1);
@@ -333,8 +333,8 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate resolves AVG in merge",
                  .get_data_batches()[0]
                  ->get_data()
                  ->template cast<gpu_table_representation>()
-                 .get_table();
-  auto view = table.view();
+                 .get_table_view();
+  auto view = table;
   REQUIRE(view.num_columns() == 1);
   REQUIRE(view.num_rows() == 1);
 

@@ -520,9 +520,9 @@ TEST_CASE("host_parquet_representation converts to gpu_table_representation",
 
   REQUIRE(gpu_result != nullptr);
   REQUIRE(gpu_result->get_current_tier() == Tier::GPU);
-  REQUIRE(gpu_result->get_table().num_rows() == 500);
+  REQUIRE(gpu_result->get_table_view().num_rows() == 500);
   // 3 columns: id (INT32), value (BIGINT), price (DOUBLE)
-  REQUIRE(gpu_result->get_table().num_columns() == 3);
+  REQUIRE(gpu_result->get_table_view().num_columns() == 3);
   REQUIRE(gpu_result->get_size_in_bytes() > 0);
 
   // Explicitly destroy GPU result and representation before the memory manager
@@ -624,8 +624,8 @@ TEST_CASE("host_parquet_representation converts to GPU with projected columns",
   stream.synchronize();
 
   REQUIRE(gpu_result != nullptr);
-  REQUIRE(gpu_result->get_table().num_rows() == 200);
-  REQUIRE(gpu_result->get_table().num_columns() == 2);  // only "id" and "price"
+  REQUIRE(gpu_result->get_table_view().num_rows() == 200);
+  REQUIRE(gpu_result->get_table_view().num_columns() == 2);  // only "id" and "price"
 
   // Explicitly destroy GPU result and representation before the memory manager
   gpu_result.reset();
@@ -686,7 +686,7 @@ TEST_CASE("host_parquet_representation converts to GPU with post-filter projecte
   stream.synchronize();
 
   REQUIRE(gpu_result != nullptr);
-  auto table_view = gpu_result->get_table().view();
+  auto table_view = gpu_result->get_table_view();
   REQUIRE(table_view.num_rows() == 200);
   REQUIRE(table_view.num_columns() == 2);
   REQUIRE(table_view.column(0).type().id() == cudf::type_id::INT32);
@@ -749,9 +749,9 @@ TEST_CASE("host_parquet_representation clone then convert to GPU",
   REQUIRE(gpu_cloned != nullptr);
 
   // Both GPU representations should have the same shape and data
-  REQUIRE(gpu_orig->get_table().num_rows() == gpu_cloned->get_table().num_rows());
-  REQUIRE(gpu_orig->get_table().num_columns() == gpu_cloned->get_table().num_columns());
-  REQUIRE(gpu_orig->get_table().num_rows() == 300);
+  REQUIRE(gpu_orig->get_table_view().num_rows() == gpu_cloned->get_table_view().num_rows());
+  REQUIRE(gpu_orig->get_table_view().num_columns() == gpu_cloned->get_table_view().num_columns());
+  REQUIRE(gpu_orig->get_table_view().num_rows() == 300);
 
   // Explicitly destroy GPU results and representations before the memory manager
   gpu_orig.reset();

@@ -204,16 +204,16 @@ TEMPLATE_TEST_CASE("sirius_physical_concat concatenates multiple data_batches",
 
   // Verify: single output batch with correct total rows
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
-  auto& out_table = dynamic_cast<const pipelineable_operator_data&>(*outputs)
-                      .get_data_batches()[0]
-                      ->get_data()
-                      ->cast<cucascade::gpu_table_representation>()
-                      .get_table();
+  auto out_table = dynamic_cast<const pipelineable_operator_data&>(*outputs)
+                     .get_data_batches()[0]
+                     ->get_data()
+                     ->cast<cucascade::gpu_table_representation>()
+                     .get_table_view();
   REQUIRE(static_cast<std::size_t>(out_table.num_rows()) == total_rows);
   REQUIRE(out_table.num_columns() == 1);
 
   // Verify data content
-  auto host_data = copy_column_to_host<typename Traits::type>(out_table.view().column(0));
+  auto host_data = copy_column_to_host<typename Traits::type>(out_table.column(0));
   REQUIRE(host_data.size() == all_values.size());
   for (std::size_t i = 0; i < all_values.size(); ++i) {
     REQUIRE(host_data[i] == all_values[i]);
@@ -283,14 +283,14 @@ TEST_CASE("sirius_physical_concat filters null batches", "[physical_concat]")
   auto outputs = concat_op.execute(partitioned_operator_data(input, 0), default_stream());
 
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
-  auto& out_table = dynamic_cast<const pipelineable_operator_data&>(*outputs)
-                      .get_data_batches()[0]
-                      ->get_data()
-                      ->cast<cucascade::gpu_table_representation>()
-                      .get_table();
+  auto out_table = dynamic_cast<const pipelineable_operator_data&>(*outputs)
+                     .get_data_batches()[0]
+                     ->get_data()
+                     ->cast<cucascade::gpu_table_representation>()
+                     .get_table_view();
   REQUIRE(out_table.num_rows() == 6);
 
-  auto host_data                = copy_column_to_host<int32_t>(out_table.view().column(0));
+  auto host_data                = copy_column_to_host<int32_t>(out_table.column(0));
   std::vector<int32_t> expected = {1, 2, 3, 4, 5, 6};
   REQUIRE(host_data == expected);
 }
@@ -783,8 +783,10 @@ TEST_CASE("sirius_physical_concat execute is thread-safe with independent stream
   // Verify each thread's output
   for (int t = 0; t < num_threads; ++t) {
     REQUIRE(thread_outputs[t].size() == 1);
-    auto& out_table =
-      thread_outputs[t][0]->get_data()->cast<cucascade::gpu_table_representation>().get_table();
+    auto out_table = thread_outputs[t][0]
+                       ->get_data()
+                       ->cast<cucascade::gpu_table_representation>()
+                       .get_table_view();
     REQUIRE(static_cast<std::size_t>(out_table.num_rows()) == rows_per_batch * batches_per_thread);
   }
 }
