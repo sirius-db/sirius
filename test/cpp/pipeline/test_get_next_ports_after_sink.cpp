@@ -228,4 +228,3 @@ TEST_CASE("LEFT_DELIM_JOIN: concatenates column_data_scan then distinct ports",
   CHECK(ports[2].next_operator == &distinct_consumer_q);
   CHECK(ports[2].next_operator_port_name == "distinct_q");
 }
-
