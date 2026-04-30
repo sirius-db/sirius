@@ -74,6 +74,30 @@ constexpr uint32_t COPY_CHUNK_BYTES = 64u << 10;
 constexpr uint32_t MAX_ROWS_PER_COLUMN =
   static_cast<uint32_t>(std::numeric_limits<cudf::size_type>::max());
 
+/// Validates that every segment in `runs` covers a row range inside
+/// `[0, total_rows)`. The dispatcher allocates output buffers sized to
+/// `total_rows`; a segment overshooting that range would produce an
+/// out-of-bounds write in the codec memcpy/kernel. The viability walker
+/// upstream is supposed to guarantee this, but we re-check here so a
+/// malformed descriptor surfaces as a thrown exception rather than a CUDA
+/// fault or silent corruption.
+void validate_segment_bounds(std::vector<gpu_codec_run> const& runs,
+                             uint32_t total_rows,
+                             char const* what)
+{
+  for (auto const& run : runs) {
+    for (auto const& seg : run.segments) {
+      size_t end = size_t{seg.row_offset} + size_t{seg.row_count};
+      if (end > total_rows) {
+        throw std::runtime_error(std::string("gpu_decode_table: ") + what +
+                                 " segment row_offset (" + std::to_string(seg.row_offset) +
+                                 ") + row_count (" + std::to_string(seg.row_count) +
+                                 ") > total_rows (" + std::to_string(total_rows) + ")");
+      }
+    }
+  }
+}
+
 //===----------------------------------------------------------------------===//
 // CONSTANT broadcast.
 //
@@ -103,9 +127,12 @@ constexpr uint32_t MAX_ROWS_PER_COLUMN =
 //===----------------------------------------------------------------------===//
 
 /// Reads a single value from `*src` (already on device) and writes it to
-/// every position in `dest[0..rows)`. When `sizeof(T)` divides 16 we pack
-/// the value into an `int4` and store 16 bytes per thread; otherwise we fall
-/// back to scalar stores (covers e.g. the int128 backing decimal128).
+/// every position in `dest[0..rows)`. When `sizeof(T)` divides 16 AND `dest`
+/// is 16-byte aligned, we pack the value into an `int4` and store 16 bytes
+/// per thread; otherwise we fall back to scalar stores (covers misaligned
+/// destinations, e.g. an odd `row_offset` for a small type, plus types that
+/// don't divide 16 such as decimal128's 16-byte storage where TPV would be 1
+/// anyway).
 template <typename T>
 __global__ void kernel_broadcast_constant(T* __restrict__ dest,
                                           T const* __restrict__ src,
@@ -116,26 +143,29 @@ __global__ void kernel_broadcast_constant(T* __restrict__ dest,
   uint32_t stride = gridDim.x * blockDim.x;
 
   if constexpr (sizeof(T) <= 8 && 16u % sizeof(T) == 0) {
-    constexpr uint32_t TPV = 16u / sizeof(T);  // Ts per int4
-    int4 vpacked;
-    T* lanes = reinterpret_cast<T*>(&vpacked);
+    if ((reinterpret_cast<uintptr_t>(dest) & 15u) == 0) {
+      constexpr uint32_t TPV = 16u / sizeof(T);  // Ts per int4
+      int4 vpacked;
+      T* lanes = reinterpret_cast<T*>(&vpacked);
 #pragma unroll
-    for (uint32_t i = 0; i < TPV; ++i)
-      lanes[i] = val;
+      for (uint32_t i = 0; i < TPV; ++i)
+        lanes[i] = val;
 
-    uint32_t v_rows = rows / TPV;
-    int4* d4        = reinterpret_cast<int4*>(dest);
-    for (uint32_t i = tid; i < v_rows; i += stride)
-      d4[i] = vpacked;
+      uint32_t v_rows = rows / TPV;
+      int4* d4        = reinterpret_cast<int4*>(dest);
+      for (uint32_t i = tid; i < v_rows; i += stride)
+        d4[i] = vpacked;
 
-    // Tail rows that didn't fit a full int4.
-    uint32_t tail_start = v_rows * TPV;
-    for (uint32_t i = tail_start + tid; i < rows; i += stride)
-      dest[i] = val;
-  } else {
-    for (uint32_t i = tid; i < rows; i += stride)
-      dest[i] = val;
+      // Tail rows that didn't fit a full int4.
+      uint32_t tail_start = v_rows * TPV;
+      for (uint32_t i = tail_start + tid; i < rows; i += stride)
+        dest[i] = val;
+      return;
+    }
+    // dest is not 16-byte aligned; fall through to scalar stores below.
   }
+  for (uint32_t i = tid; i < rows; i += stride)
+    dest[i] = val;
 }
 
 /// Functor for `cudf::type_dispatcher`. We project each cudf type to its
@@ -236,6 +266,18 @@ void decode_uncompressed_data(gpu_codec_run const& run,
                               rmm::cuda_stream_view stream,
                               rmm::device_async_resource_ref mr)
 {
+  // Each live segment must own at least row_count * type_size bytes — the
+  // memcpy below would otherwise read past the end of the source buffer.
+  for (auto const& seg : run.segments) {
+    if (seg.row_count == 0) continue;
+    size_t needed = size_t{seg.row_count} * type_size;
+    if (size_t{seg.bytes_size} < needed) {
+      throw std::runtime_error("gpu_decode_table: UNCOMPRESSED segment bytes_size (" +
+                               std::to_string(seg.bytes_size) + ") < required " +
+                               std::to_string(needed));
+    }
+  }
+
   // First-pass: see whether we have zero / one / many live (non-empty)
   // segments. Stops at the second hit so we don't walk the full vector when
   // we already know it's a multi-segment run.
@@ -349,6 +391,11 @@ void dispatch_validity_run(gpu_codec_run const& run, uint8_t* d_mask, rmm::cuda_
                                std::to_string(seg.row_offset) + ") not byte-aligned");
     }
     size_t bytes = (size_t{seg.row_count} + 7) / 8;
+    if (size_t{seg.bytes_size} < bytes) {
+      throw std::runtime_error("gpu_decode_table: validity segment bytes_size (" +
+                               std::to_string(seg.bytes_size) + ") < required " +
+                               std::to_string(bytes));
+    }
     RMM_CUDA_TRY(cudaMemcpyAsync(
       d_mask + seg.row_offset / 8, seg.d_bytes, bytes, cudaMemcpyDeviceToDevice, stream.value()));
   }
@@ -378,6 +425,7 @@ rmm::device_buffer decode_column_data(gpu_column_decode_input const& col,
       std::to_string(static_cast<int>(col.out_type.id())));
   }
   auto type_size = static_cast<uint32_t>(cudf::size_of(col.out_type));
+  validate_segment_bounds(col.data, col.total_rows, "data");
 
   rmm::device_buffer data_buf(size_t{col.total_rows} * type_size, stream, mr);
   auto* d_output = static_cast<uint8_t*>(data_buf.data());
@@ -401,6 +449,7 @@ rmm::device_buffer decode_column_validity(gpu_column_decode_input const& col,
   if (!col.has_nulls || col.total_rows == 0 || col.validity.empty()) {
     return rmm::device_buffer{};
   }
+  validate_segment_bounds(col.validity, col.total_rows, "validity");
 
   // create_null_mask gives us a buffer pre-filled with all-1s, sized to
   // cudf's bitmask layout (Arrow-compatible 64-byte padding). Validity

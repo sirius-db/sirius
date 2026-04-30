@@ -303,6 +303,83 @@ TEST_CASE_METHOD(decode_env,
 }
 
 TEST_CASE_METHOD(decode_env,
+                 "gpu_decode_table - throws on UNCOMPRESSED segment too small for row_count",
+                 "[scan][decode]")
+{
+  // Segment claims 16 rows but the source buffer only holds 4 int32s
+  // (16 bytes vs the 64 needed). Without the bytes_size check the dispatcher
+  // would memcpy past end-of-buffer.
+  std::vector<int32_t> small_buffer = {1, 2, 3, 4};
+  auto d                            = upload(small_buffer, stream.view());
+  auto col =
+    one_codec_column(I32, 16, CompressionType::COMPRESSION_UNCOMPRESSED, {segment(d, 0, 16)});
+
+  REQUIRE_THROWS_WITH(decode({col}), Catch::Contains("UNCOMPRESSED segment bytes_size"));
+}
+
+TEST_CASE_METHOD(decode_env,
+                 "gpu_decode_table - throws on validity segment too small for row_count",
+                 "[scan][decode]")
+{
+  // Claims 64 rows of validity but only one byte (8 bits) is staged.
+  std::vector<int32_t> values(64, 0);
+  std::vector<uint8_t> too_small_validity = {0xFFu};
+  auto d_data                             = upload(values, stream.view());
+  rmm::device_buffer d_validity(
+    too_small_validity.data(), too_small_validity.size(), stream.view());
+
+  auto col = one_codec_column(I32,
+                              values.size(),
+                              CompressionType::COMPRESSION_UNCOMPRESSED,
+                              {segment(d_data, 0, values.size())},
+                              /*has_nulls=*/true);
+  col.validity.push_back({CompressionType::COMPRESSION_UNCOMPRESSED,
+                          {segment(d_validity, /*row_offset=*/0, /*row_count=*/64)}});
+
+  REQUIRE_THROWS_WITH(decode({col}), Catch::Contains("validity segment bytes_size"));
+}
+
+TEST_CASE_METHOD(decode_env,
+                 "gpu_decode_table - throws on segment row_offset+row_count beyond total_rows",
+                 "[scan][decode]")
+{
+  // Claims a segment covering [50..150) but the column only has 100 rows.
+  // Without the bounds check the codec would write 50 rows past end-of-buffer.
+  std::vector<int32_t> data(100, 7);
+  auto d   = upload(data, stream.view());
+  auto col = one_codec_column(
+    I32, 100, CompressionType::COMPRESSION_UNCOMPRESSED, {segment(d, /*row_offset=*/50, 100)});
+
+  REQUIRE_THROWS_WITH(decode({col}), Catch::Contains("> total_rows"));
+}
+
+TEST_CASE_METHOD(decode_env,
+                 "gpu_decode_table - CONSTANT broadcast tolerates misaligned destination",
+                 "[scan][decode]")
+{
+  // Two CONSTANT runs on an int16 column: the first segment ends at row 4,
+  // putting the second segment's destination at base + 8 bytes — 8-byte
+  // aligned but NOT 16-byte aligned. The kernel must fall back to scalar
+  // stores rather than emit a misaligned int4 store (UB in C++ and an actual
+  // perf/fault risk on some GPUs).
+  cudf::data_type const I16{cudf::type_id::INT16};
+  std::vector<int16_t> va = {111}, vb = {-222};
+  auto da  = upload(va, stream.view());
+  auto db  = upload(vb, stream.view());
+  auto col = one_codec_column(I16,
+                              12,
+                              CompressionType::COMPRESSION_CONSTANT,
+                              {segment(da, /*row_offset=*/0, /*row_count=*/4),
+                               segment(db, /*row_offset=*/4, /*row_count=*/8)});
+  auto t   = decode({col});
+  auto out = download<int16_t>(t->get_column(0).view().data<int16_t>(), 12, stream.value());
+  for (size_t i = 0; i < 4; ++i)
+    REQUIRE(out[i] == 111);
+  for (size_t i = 4; i < 12; ++i)
+    REQUIRE(out[i] == -222);
+}
+
+TEST_CASE_METHOD(decode_env,
                  "gpu_decode_table - throws on row count beyond cudf::size_type max",
                  "[scan][decode]")
 {

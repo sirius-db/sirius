@@ -50,7 +50,7 @@ double bench_seconds(rmm::cuda_stream& stream,
                      int warmup = 3)
 {
   for (int i = 0; i < warmup; ++i)
-    (void)gpu_decode_table(cols, stream.view(), &mr);
+    (void)gpu_decode_table(cols, stream.view(), mr);
   cudaStreamSynchronize(stream.value());
 
   cudaEvent_t s, e;
@@ -58,7 +58,7 @@ double bench_seconds(rmm::cuda_stream& stream,
   cudaEventCreate(&e);
   cudaEventRecord(s, stream.value());
   for (int i = 0; i < iters; ++i)
-    (void)gpu_decode_table(cols, stream.view(), &mr);
+    (void)gpu_decode_table(cols, stream.view(), mr);
   cudaEventRecord(e, stream.value());
   cudaEventSynchronize(e);
   float ms = 0.0f;

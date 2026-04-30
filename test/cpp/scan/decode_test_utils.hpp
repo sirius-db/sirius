@@ -97,7 +97,7 @@ struct decode_env {
   std::unique_ptr<cudf::table> decode(
     std::vector<::sirius::cuda::scan::gpu_column_decode_input> const& cols)
   {
-    return ::sirius::cuda::scan::gpu_decode_table(cols, stream.view(), &mr);
+    return ::sirius::cuda::scan::gpu_decode_table(cols, stream.view(), mr);
   }
 };
 
