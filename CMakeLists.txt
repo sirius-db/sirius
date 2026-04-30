@@ -252,7 +252,8 @@ set(EXTENSION_SOURCES
 
 # Legacy Sirius — all legacy-specific config lives in src/legacy/CMakeLists.txt.
 # Deleting src/legacy/ cleanly removes legacy build support.
-set(CUDA_SOURCES src/op/scan/equality_delete_mask.cu)
+set(CUDA_SOURCES src/op/scan/equality_delete_mask.cu
+                 src/cuda/scan/gpu_native_decode.cu)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
   add_subdirectory(src/legacy)
   list(APPEND EXTENSION_SOURCES ${SIRIUS_LEGACY_SOURCES}
@@ -378,7 +379,9 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_gpu_pipeline_disk_readback.cpp
     test/cpp/pipeline/test_plan_printer.cpp
     test/cpp/pipeline/test_task_scheduler.cpp
+    test/cpp/scan/bench_decode_codecs.cpp
     test/cpp/scan/test_column_builder.cpp
+    test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_metadata_gpu_scan_operators.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_scan_task.cpp
