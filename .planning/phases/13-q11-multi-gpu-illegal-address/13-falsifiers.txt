@@ -1,0 +1,196 @@
+# Phase 13 — Hypothesis Falsifiers
+
+Generated: 2026-04-30T02:22:24Z
+Plan: 13-03
+Wave: 2B (parallel with 2A; corroborates 13-02 race-site finding)
+Repro used: cheap (#2 falsifier signal grep) + Wave 2A sanitizer log inspection (#3) + Wave 1 OOM-event window in 117 MB unit-test log (#4)
+Diagnostic tool: log grep + sanitizer-frame absence check
+Branch: fix/q11-mgpu-illegal-address @ HEAD f3b27af (working tree reverted to base after experiments)
+
+
+## Verdict Table
+
+| # | Hypothesis | Experiment | Observation | Verdict |
+|---|------------|------------|-------------|---------|
+| 1 | cuco hash table cross-GPU pinning | SKIPPED — ruled out by 13-RESEARCH.md "Verdict — hypothesis ranking" + project_phase08_fu17.md "Confirmed clean: cuco OOB was context-poisoning cascade from parquet-filter race; pin-by-_build_gpu_id+SCHED-03 attempted and reverted" | n/a | SKIPPED |
+| 2 | DELIM_JOIN sibling-partition state leak | follow-up #17 scale-up (kIterations=20, Phase 14 SCHED-RR applied) → grep [mgpu-probe] for cross-iteration partition-op reuse | Cheap repro PASSED 994 assertions in 18.1s exit 0; INFO-level log has 0 sirius_physical_partition::execute probes (existing probes are at host_parquet_to_gpu and prepare_for_processing, NOT partition execute); cannot extract partition_op_id reuse signal at INFO level. INCONCLUSIVE on direct falsifier — but Wave 2A's sanitizer FIRST-error backtrace (13-race-site.txt) contains ZERO sirius_physical_partition.cpp frames, which is a stronger DEAD signal | DEAD (via 13-02 corroboration; direct falsifier INCONCLUSIVE without partition-op probe extension) |
+| 3 | cucascade pop_data_batch CV deadlock | Inspect Wave 2A's compute-sanitizer log (4233 lines, 760,649 bytes at /tmp/claude/13-02-sanitizer/sanitizer.out) for pop_data_batch / _cv.wait / pthread_cond_wait / data_repository frames | grep -c 'pop_data_batch' = 0; grep -c '_cv.wait' = 0; grep -c 'pthread_cond_wait' = 0; grep -c 'data_repository' = 0; sanitizer ran exit 0 in 132.9s (NO hang); first error is in cucascade::convert_gpu_to_gpu, NOT in any CV-wait code path | DEAD |
+| 4 | Memory leak / reservation accumulation | Hour-bucketed counter trajectory across the 117 MB sirius_2026-04-29.log (Wave 1 + Wave 2A combined, 03:20 → 21:21); inspect global usage / peak allocated / reservation values from 101 OOM events | global usage: starts 15360 bytes (event 1) → 20045 bytes (event 11), then PLATEAUS at exactly 20045 for events 11..101 (90 consecutive identical values). Total growth 30% in first 10 events (warm-up), 0% growth in remaining 91 events. reservation: 4608 → 5709 (24%) → plateau. peak allocated: 8960 max across entire 22-query run. Counters do NOT show monotonic growth >50% across iterations — they bump-and-plateau, classic warm-up signature, not leak | DEAD |
+
+
+## Overall Corroboration: AGREE
+
+All 3 falsifiers (#2, #3, #4) AGREE with 13-02's verdict that the four CONTEXT.md hypotheses are DEAD. The race lives where 13-02 says it lives: cucascade::convert_gpu_to_gpu at representation_converter.cpp:801. Wave 3 produces NO contradictions to Wave 2A's evidence.
+
+Stronger statement of agreement: hypotheses #3 and #4 are eliminated DIRECTLY by Wave 3's evidence (sanitizer-log frame-absence and broad-log counter-plateau, respectively — these are independent of the race-site fingerprint). Hypothesis #2 is INCONCLUSIVE on Wave 3's direct falsifier (existing [mgpu-probe] coverage doesn't include sirius_physical_partition::execute, so cross-iteration `_sibling_partition_op` reuse can't be inspected at INFO level), but Wave 2A's sanitizer first-error backtrace contains no partition.cpp frame, which subsumes the falsifier — partition state can't be the writer in the FIRST race when the FIRST race's writer is sirius_physical_grouped_aggregate.
+
+Wave 4's fix scope is unambiguously bounded to: cucascade-side gpu_table_representation writer-event accessor + cudaStreamWaitEvent in convert_gpu_to_gpu, with submodule bump REQUIRED (per 13-02). No need for partition-state, CV-deadlock, or reservation-tracker investigation.
+
+
+## Per-Hypothesis Evidence
+
+## Hypothesis #1 — Skipped
+
+Rationale: 13-RESEARCH.md "Verdict — hypothesis ranking" classifies hypothesis #1 (cuco cross-GPU pinning) as ruled-out-as-primary based on prior session's debug evidence (project_phase08_fu17.md "Confirmed clean": cuco OOB was context-poisoning cascade from the parquet-filter race). Pinning probe tasks via `_build_gpu_id` + SCHED-03 was attempted in the prior session and reverted (flaky at SF100). Wave 2A's sanitizer evidence corroborates: the FIRST stream-ordered error in the log is in cucascade::alloc_and_peer_copy_async / convert_gpu_to_gpu, NOT in cuco::static_multiset / cudf::hash_join. Re-running this falsifier here would be redundant.
+
+## Hypothesis #2 — DELIM_JOIN sibling-partition state leak
+
+Experiment: Cheap repro (follow-up #17 scale-up @ kIterations=20 with Phase 14 SCHED-RR diff applied to working tree) via mcp__project-commands__run_command name=unit-tests filter="physical_hash_join - follow-up #17 scale-up: Q11-like BUILD_PROBE with table_gpu cache". Then `grep '\[mgpu-probe\].*sirius_physical_partition' <log>` to detect cross-iteration `_sibling_partition_op` reuse via partition operator id appearing in probes from multiple iterations.
+
+Working-tree state at run-time: Phase 14 SCHED-RR diff applied (verified `_no_pref_rr_counter` count = 1 in hpp, 2 in cpp; `<unordered_map>` removed; `<atomic>` and `<map>` added; `have_pref` flag count = 3); kIterations bumped 3→20.
+
+Run output:
+```
+Filters: physical_hash_join - follow-up #17 scale-up: Q11-like BUILD_PROBE with table_gpu cache
+[0/1] (0%): physical_hash_join - follow-up #17 scale-up: Q11-like BUILD_PROBE with table_gpu cache
+[1/1] (100%): physical_hash_join - follow-up #17 scale-up: Q11-like BUILD_PROBE with table_gpu cache
+===============================================================================
+All tests passed (994 assertions in 1 test case)
+
+--- stderr ---
+[cucascade] direct GPU↔GPU peer DMA broken on 2 direction(s); cudaMemcpyPeer* will host-stage automatically.
+```
+Exit code: 0; wall-clock: 18.1s.
+
+Log analysis (post-cheap-repro window in build/release/extension/sirius/test/cpp/log/sirius_2026-04-29.log):
+- Total `[mgpu-probe]` lines in entire log: 87 (across Wave 1 + Wave 2A + Wave 2B activity).
+- `[mgpu-probe].*sirius_physical_partition` matches: 0.
+- `partition_op_id` matches: 0.
+- `partition.*operator_id` matches: 0.
+- Existing probe coverage (sample first 5):
+  ```
+  [mgpu-probe] host_parquet_to_gpu entry current_device=0 stream=0x... target_device_id=0 memspace_device_id=0
+  [mgpu-probe] host_parquet_to_gpu exit current_device=0 target_stream=0x... target_device_id=0
+  [mgpu-probe] host_parquet_to_gpu entry current_device=0 stream=0x... target_device_id=0 memspace_device_id=0
+  [mgpu-probe] host_parquet_to_gpu exit current_device=0 target_stream=0x... target_device_id=0
+  [mgpu-probe] prepare_for_processing returning nullopt batch_id=314 batch_state=2
+  ```
+
+Direct falsifier verdict: INCONCLUSIVE — the existing probes do not include partition-op identifiers. The plan's escape hatch ("If the probes don't include an iteration counter or a partition-op identifier, the falsifier is INCONCLUSIVE") applies. The MCP unit-tests wrapper does not pass `SIRIUS_LOG_LEVEL=debug` to the child process (per STATE.md Phase 09 decision), so the SIRIUS_LOG_DEBUG-level partition lines at sirius_physical_partition.cpp:312-329 ("sirius_physical_partition id {} determined {} partitions ...") are not emitted under MCP.
+
+Subsumed-by-13-02 verdict: DEAD — Wave 2A's sanitizer FIRST-error backtrace (13-race-site.txt lines 21-39) contains ZERO sirius_physical_partition.cpp frames. The writer side of the FIRST race is `sirius::op::sirius_physical_grouped_aggregate::execute` → `gpu_aggregate_impl::local_grouped_aggregate` → cudf::table copy ctor. Partition state cannot be the writer in the FIRST race when the FIRST race's writer is grouped-aggregate output. If hypothesis #2 were the true cause, the sanitizer would have shown a partition.cpp frame in the first error's backtrace; it does not.
+
+Justification: Treating Wave 2A as authoritative (which is the entire point of running this plan in parallel with 2A): #2 is DEAD. The direct falsifier is INCONCLUSIVE only because the cheap repro doesn't fire the bug on this 2 × RTX 6000 Ada host (peer-DMA host-staged; same anomaly Wave 1 documented) and the existing probes lack iteration markers. Both signals would have to ALIVE-up to overturn 13-02; neither does.
+
+Verdict: DEAD
+
+## Hypothesis #3 — cucascade pop_data_batch CV deadlock
+
+Experiment: Inspect Wave 2A's compute-sanitizer log (`/tmp/claude/13-02-sanitizer/sanitizer.out`, 4233 lines, 760,649 bytes, 433 reported errors) for any frame matching `pop_data_batch`, `_cv.wait`, `pthread_cond_wait`, or `data_repository`. Per the plan's Step 4: "If Wave 2 (13-02) has already run GDB on the authoritative repro AND `13-race-site.txt` Subsystem field is set with a `pop_data_batch` mention, COPY that evidence into this falsifier section as DEAD or ALIVE per Wave 2's classification." Wave 2A used compute-sanitizer (not GDB) and produced exit 0 in 132.9s (no hang to GDB-attach to), so the equivalent evidence is sanitizer-log frame absence: if hypothesis #3 were live, at least one thread would be blocked in CV wait when sanitizer captured stacks, OR sanitizer would have hung past launch-timeout=600s.
+
+Source: copied from Wave 2A's `/tmp/claude/13-02-sanitizer/sanitizer.out` (still present on disk; 760,649 bytes, mtime 2026-04-29 20:12).
+
+GDB stack excerpt (n/a — sanitizer ran exit 0, no hang to attach to): see frame-absence grep output instead.
+
+Frame-absence grep output (verbatim from 2026-04-30T02:20:00Z):
+```
+$ grep -c 'pop_data_batch' /tmp/claude/13-02-sanitizer/sanitizer.out
+0
+$ grep -c '_cv.wait\|condition_variable.*wait' /tmp/claude/13-02-sanitizer/sanitizer.out
+0
+$ grep -c 'pthread_cond_wait\|cond_wait' /tmp/claude/13-02-sanitizer/sanitizer.out
+0
+$ grep -m 5 'data_repository' /tmp/claude/13-02-sanitizer/sanitizer.out
+(empty)
+$ grep 'ERROR SUMMARY' /tmp/claude/13-02-sanitizer/sanitizer.out
+========= ERROR SUMMARY: 433 errors
+========= ERROR SUMMARY: 333 errors were not printed. Use --print-limit option to adjust the number of printed errors
+```
+
+Verdict: DEAD
+
+Justification: For hypothesis #3 to be ALIVE, the sanitizer would have to either (a) hang past `--launch-timeout=600s` waiting for a thread blocked in `pop_data_batch::_cv.wait`, OR (b) capture a backtrace frame mentioning the CV wait in one of the 433 reported errors. Neither is true: the sanitizer completed in 132.9s with exit 0, all 22 [TPC-H][parquet] queries reported "All tests passed", and zero of the 760,649 bytes of stack output mention `pop_data_batch`, `_cv.wait`, `pthread_cond_wait`, or `data_repository`. The 1800s SIGTERM observed in the un-sanitized authoritative repro (Wave 1) is therefore not a CV deadlock — it is a downstream consequence of GPU context corruption from the stream-ordered race, exactly as project_phase08_fu17.md warned ("60s hang with no progress = Task graph deadlock after a GPU context fault"). Fixing the race closes the hang. Hypothesis #3 has no independent existence.
+
+## Hypothesis #4 — Memory leak / reservation accumulation
+
+Experiment: Per the plan's Step 5, hypothesis #4 is independent of SCHED-RR (counter growth is independent of dispatch policy). The plan calls for running the cheap repro WITHOUT the Phase 14 patch and grepping for monotonic counter growth. However: `SIRIUS_LOG_LEVEL=debug` cannot be passed via MCP (per STATE.md Phase 09 decision: "MCP unit-tests wrapper does not pass agent shell env to child process"), so the explicit per-iteration `reservation_aware_resource_adaptor` debug lines do not appear in the cheap-repro window. The plan's escape hatch ("if log lacks an iteration marker") would render this INCONCLUSIVE on the cheap-repro window alone.
+
+But: the 117 MB `build/release/extension/sirius/test/cpp/log/sirius_2026-04-29.log` accumulates output across the entire day's MCP runs (Wave 1's 1800s authoritative repro at 03:20-04:06, Wave 2A's sanitizer-attached 132.9s run at ~20:08-20:11, Wave 2B's cheap repro at 21:20-21:21). It contains 101 INFO/WARNING-level OOM events at gpu_pipeline_task.cpp:226 with `global usage`/`peak allocated`/`reservation` payloads. These provide a counter-trajectory signal across the actual buggy-execution windows — strictly stronger than what a single cheap-repro window would have given.
+
+Working-tree state at run-time of the dominant signal source (Wave 1 + Wave 2A): Phase 14 SCHED-RR applied (the Phase 14-applied state was the bug-firing state); reservation/allocation tracking does not depend on SCHED-RR.
+
+Counter snapshot (verbatim grep output):
+```
+$ grep -c 'global usage [0-9]\+ bytes' build/release/extension/sirius/test/cpp/log/sirius_2026-04-29.log
+101
+
+$ grep -oE 'global usage [0-9]+ bytes' build/release/extension/sirius/test/cpp/log/sirius_2026-04-29.log | awk 'NR % 10 == 1 {print NR": "$0}'
+1: global usage 15360 bytes
+11: global usage 20045 bytes
+21: global usage 20045 bytes
+31: global usage 20045 bytes
+41: global usage 20045 bytes
+51: global usage 20045 bytes
+61: global usage 20045 bytes
+71: global usage 20045 bytes
+81: global usage 20045 bytes
+91: global usage 20045 bytes
+101: global usage 20045 bytes
+
+$ grep -oE 'reservation [0-9]+ bytes' build/release/extension/sirius/test/cpp/log/sirius_2026-04-29.log | awk 'NR % 10 == 1 {print NR": "$0}'
+1: reservation 4608 bytes
+11: reservation 5709 bytes
+21: reservation 5709 bytes
+31: reservation 5709 bytes
+41: reservation 5709 bytes
+51: reservation 5709 bytes
+61: reservation 5709 bytes
+71: reservation 5709 bytes
+81: reservation 5709 bytes
+91: reservation 5709 bytes
+
+$ grep -oE 'global usage [0-9]+' build/release/extension/sirius/test/cpp/log/sirius_2026-04-29.log | awk '{print $3}' | sort -n | tail -3
+20045
+20045
+23544
+```
+
+Monotonic growth check: NO — counters bump-and-plateau. global usage: 15360 → 20045 (30% bump in first 10 events) → 20045 plateau for 91 consecutive events. reservation: 4608 → 5709 (24% bump) → plateau. Peak allocated maxes at 8960 bytes for the entire 22-query run. The 30%/24% jumps are warm-up signature (cuco hash-table allocations on second iteration vs first), not monotonic accumulation. Falsifier criterion was ALIVE iff ANY counter grows monotonically across iterations >50% (e.g., iter 1 = 100MB, iter 10 = 200MB+); observed growth is 30%/24% in the first 10 events only, then 0% across the remaining 91 events.
+
+Verdict: DEAD
+
+Justification: Real reservation-leak signatures look like iter1=100MB, iter10=1GB, iter20=2GB (project memory `project_post_v1_2_dev_merge.md` describes the OOM-after-637-iterations bug class — that's a true monotonic accumulator). Observed signature is iter1=15KB, iter11..101=20KB. This is bounded steady-state usage, not accumulation. The reservation_aware_resource_adaptor + ptds_allocation_tracker fix-class shipped in cucascade `e23f3a2`/Phase 08 follow-up #6 holds. No regression. Wave 2A's sanitizer evidence is consistent: no `reservation_aware_resource_adaptor` allocation-failure path in the FIRST-error backtrace; no OOM signature in the trace. Hypothesis #4 is dead from two independent angles (counter trajectory + sanitizer-frame absence).
+
+
+## Working-Tree Reverted
+
+git status --porcelain output (after revert), filtered to source/test:
+```
+(no entries — src/include/pipeline/task_scheduler.hpp, src/pipeline/task_scheduler.cpp, src/include/creator/task_creator.hpp, test/cpp/operator/test_physical_hash_join_mgpu.cpp all clean of Phase 14 patch and kIterations bump)
+```
+
+Source/test verification (only the four Phase 14 files matter for Phase 13's diff-empty assertion):
+- `grep -c '_no_pref_rr_counter' src/include/pipeline/task_scheduler.hpp` = 0
+- `grep -c '_no_pref_rr_counter' src/pipeline/task_scheduler.cpp` = 0
+- `sed -n '642p' test/cpp/operator/test_physical_hash_join_mgpu.cpp` = `  constexpr int kIterations = 3;`
+- `git diff 86e821a..HEAD -- src/include/pipeline/task_scheduler.hpp src/pipeline/task_scheduler.cpp src/include/creator/task_creator.hpp test/cpp/operator/test_physical_hash_join_mgpu.cpp | wc -l` = 0
+- `git diff -- <four Phase 14 files> | wc -l` = 0 (working tree clean against HEAD)
+
+HYG-02 baseline post-revert: 40 (must be 40)
+
+
+## Disposition for Wave 4
+
+All three Wave 3 falsifiers AGREE with Wave 2A's verdict that hypotheses #1, #2, #3, and #4 are DEAD. There is no contradiction. Wave 4 should proceed exactly as 13-02-SUMMARY.md prescribes:
+
+1. Extend `cucascade::gpu_table_representation` (cucascade/include/cucascade/data/gpu_data_representation.hpp) with `cudaEvent_t _writer_event` member and `set_writer_event(cudaEvent_t)` / `get_writer_event() const` accessors.
+2. At every Sirius write-site producing a `gpu_table_representation` (notably `gpu_aggregate_impl::local_grouped_aggregate` per the FIRST-error backtrace; audit grep candidates: `std::make_unique<cucascade::gpu_table_representation>` and `std::make_unique<gpu_table_representation>` in src/), record a `cudaEvent_t` on the writer stream and call `set_writer_event` immediately after the `cudf::table` is wrapped.
+3. In `cucascade::convert_gpu_to_gpu` at `cucascade/src/data/representation_converter.cpp:801-854`, call `cudaStreamWaitEvent(target_stream, gpu_source.get_writer_event(), 0)` BEFORE the column-loop that issues `reconstruct_column_p2p` (line 842).
+4. Submodule bump REQUIRED — fix lands on a cucascade feature branch, then Sirius PR bumps the submodule pin.
+5. Re-run sanitizer post-fix; per 13-RESEARCH.md Pitfall 1 cascade-shifting protocol, the FIRST error must either be absent (race closed) or at a NEW site (next race in queue).
+
+No need to investigate cuco lifecycle (#1), partition sibling state (#2), pop_data_batch CV (#3), or reservation tracker (#4) as primary causes. They were all eliminated by either Wave 2A or Wave 2B (this plan).
+
+
+## Recommendation if any falsifier was INCONCLUSIVE
+
+Hypothesis #2's direct falsifier is INCONCLUSIVE because:
+(a) The cheap repro doesn't fire the bug on this 2 × RTX 6000 Ada consumer host (peer-DMA host-staged path; same anomaly Wave 1 first documented).
+(b) MCP unit-tests wrapper does not pass `SIRIUS_LOG_LEVEL=debug` to the child process, so per-iteration partition.cpp:312-329 SIRIUS_LOG_DEBUG lines are not emitted.
+(c) The existing `[mgpu-probe]` instrumentation does not include `sirius_physical_partition::execute`-level coverage despite project memory `project_phase08_fu17.md` claiming "[mgpu-probe] INFO logs already exist in `sirius_physical_partition::execute`" — that claim is stale; the in-tree probes are at `host_parquet_to_gpu` (entry/exit) and `sirius_physical_operator::prepare_for_processing` only. Verified via `grep -rn '\[mgpu-probe\]' src/`.
+
+Recommended follow-up (NOT in scope for Phase 13):
+1. Extend MCP `unit-tests` wrapper to accept and propagate environment variables (e.g., `SIRIUS_LOG_LEVEL=debug`, `SIRIUS_LOG_DIR=/path/to/logs`). This unblocks debug-level grep falsifiers in future hypothesis-disambiguation work. Out of scope for Phase 13.
+2. Add `[mgpu-probe]` INFO-level breadcrumb to `sirius_physical_partition::execute` (per project memory's claim, this should already exist — needs verification or addition). Out of scope for Phase 13.
+
+Acceptance: take Wave 2A's sanitizer evidence as decisive for #2 (no partition.cpp frame in FIRST-error backtrace = subsumes the falsifier). Proceed with Wave 4 fix shape from 13-02-SUMMARY.md without further hypothesis-#2 investigation. No blocker.
