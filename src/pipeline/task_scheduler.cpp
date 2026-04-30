@@ -153,6 +153,11 @@ void task_scheduler::prepare_for_query(duckdb::shared_ptr<planner::query> query)
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->drain_leftover_tasks();
   }
+  // Reset SCHED-RR counter so the round-robin walk is reproducible across
+  // iterations of the same query (cache=table_gpu warm path keys cache
+  // entries by device_id; without this reset the second iteration's source
+  // tasks would assign to a different GPU and miss the cache entries).
+  _no_pref_rr_counter.store(0, std::memory_order_relaxed);
 
   auto scans = query->get_scan_operators();
   _scan_executor->prepare_cache_for_scan_operators(scans);
@@ -234,14 +239,29 @@ void task_scheduler::management_eventloop()
     }
 
     // Determine target GPU from task's data locality preference (SCHED-01/02/04).
-    int target_device_id = _gpu_executors.begin()->first;  // default: first GPU
+    int target_device_id = _gpu_executors.begin()->first;
     uint64_t task_id     = 0;
+    bool have_pref       = false;
     if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
       auto pref = gpu_task->get_preferred_device_id();
       if (pref.has_value() && _gpu_executors.count(pref.value())) {
         target_device_id = pref.value();
+        have_pref        = true;
       }
       task_id = gpu_task->get_task_id();
+    }
+    // SCHED-RR: distribute preference-less source tasks (metadata scan,
+    // GPU_PARQUET_SCAN) round-robin so they don't all pile onto begin().
+    // Downstream merge operators rely on lock_or_prepare_batch (in
+    // batch_lock_utils.hpp) to convert cross-GPU input to the consumer's
+    // target memory space via cucascade::convert_gpu_to_gpu (which uses
+    // peer-DMA where supported and host-staging on consumer hardware).
+    if (!have_pref && _gpu_executors.size() > 1) {
+      auto idx = _no_pref_rr_counter.fetch_add(1, std::memory_order_relaxed) %
+                 _gpu_executors.size();
+      auto it = _gpu_executors.begin();
+      std::advance(it, idx);
+      target_device_id = it->first;
     }
 
     SIRIUS_LOG_DEBUG("management_eventloop: routing task to GPU {}", target_device_id);

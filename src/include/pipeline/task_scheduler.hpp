@@ -32,9 +32,10 @@
 
 #include <cucascade/memory/topology_discovery.hpp>
 
+#include <atomic>
 #include <future>
+#include <map>
 #include <queue>
-#include <unordered_map>
 
 namespace sirius::op::scan {
 class duckdb_scan_executor;
@@ -200,8 +201,11 @@ class task_scheduler {
   std::thread _management_thread;
   std::atomic<bool> _running{false};
 
-  std::unordered_map<int, std::unique_ptr<gpu_pipeline_executor>>
-    _gpu_executors;  ///< Map of device_id to GPU executor
+  /// device_id -> GPU executor. std::map (not unordered_map) so iteration
+  /// order is deterministic (ascending by device_id) — keeps preference-less
+  /// task dispatch reproducible across runs.
+  std::map<int, std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;
+  std::atomic<size_t> _no_pref_rr_counter{0};
 
   sirius::creator::task_creator* _task_creator{nullptr};
   std::unique_ptr<sirius::op::scan::duckdb_scan_executor> _scan_executor;
