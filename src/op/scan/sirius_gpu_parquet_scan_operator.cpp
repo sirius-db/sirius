@@ -50,7 +50,9 @@ sirius_gpu_parquet_scan_operator::sirius_gpu_parquet_scan_operator(
       SiriusPhysicalOperatorType::GPU_PARQUET_SCAN, std::move(types), estimated_cardinality),
     _split_connector(std::make_unique<scan_manager::split_connector>()),
     _scan_info(std::move(scan_info))
-{ _split_connector->close(); }
+{
+  _split_connector->close();
+}
 
 sirius_gpu_parquet_scan_operator::~sirius_gpu_parquet_scan_operator() = default;
 
@@ -58,11 +60,15 @@ sirius_gpu_parquet_scan_operator::~sirius_gpu_parquet_scan_operator() = default;
 // Friend access — wired by sirius_scan_manager during prepare_for_query.
 //===----------------------------------------------------------------------===//
 std::unique_ptr<parquet_scan_info> sirius_gpu_parquet_scan_operator::take_scan_info()
-{ return std::move(_scan_info); }
+{
+  return std::move(_scan_info);
+}
 
 void sirius_gpu_parquet_scan_operator::set_split_connector(
   std::unique_ptr<scan_manager::split_connector> connector)
-{ _split_connector = std::move(connector); }
+{
+  _split_connector = std::move(connector);
+}
 
 //===----------------------------------------------------------------------===//
 // Scheduling interface
@@ -85,7 +91,9 @@ std::optional<task_creation_hint> sirius_gpu_parquet_scan_operator::get_next_tas
 }
 
 bool sirius_gpu_parquet_scan_operator::all_ports_empty()
-{ return _split_connector->is_closed() && !_split_connector->has_more_splits(); }
+{
+  return _split_connector->is_closed() && !_split_connector->has_more_splits();
+}
 
 std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::get_next_task_input_data()
 {

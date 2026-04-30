@@ -22,9 +22,9 @@
 #include <scan_manager/split_connector.hpp>
 
 // standard library
-#include <mutex>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <unordered_set>
 #include <vector>
