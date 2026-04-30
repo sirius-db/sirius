@@ -1,0 +1,171 @@
+# Phase 13 — Repro Evidence
+
+Generated: 2026-04-30T01:01:15Z
+Plan: 13-01
+Branch: fix/q11-mgpu-illegal-address
+Base: feature/single-node-multi-gpu2 @ 86e821a
+HEAD: 86e821a (artifact-only commit pending — no source changes)
+
+## Working-Tree Changes Applied (NOT committed on this branch)
+
+1. Phase 14 SCHED-RR diff from 14-CONTEXT.md lines 19-79 (extracted via awk between ```diff fences;
+   the extracted patch lacked --- a/.../+++ b/... headers for `git apply`, so the diff was applied
+   via direct file edits matching the unified-diff intent verbatim).
+   - src/include/pipeline/task_scheduler.hpp: added `<atomic>`, `<map>`; dropped `<unordered_map>`;
+     replaced `std::unordered_map<int, std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;`
+     with `std::map<int, std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;` plus
+     `std::atomic<size_t> _no_pref_rr_counter{0};`
+     (verified mid-repro: `grep -c '_no_pref_rr_counter' src/include/pipeline/task_scheduler.hpp` = 1)
+   - src/pipeline/task_scheduler.cpp: added `_no_pref_rr_counter.store(0, std::memory_order_relaxed);`
+     in `prepare_for_query` after the per-GPU `drain_leftover_tasks` loop; added the 7-line SCHED-RR
+     block in `management_eventloop` that round-robins preference-less tasks via
+     `_no_pref_rr_counter.fetch_add(1) % _gpu_executors.size()` + `std::advance(it, idx)`.
+     (verified mid-repro: `grep -c '_no_pref_rr_counter' src/pipeline/task_scheduler.cpp` = 2)
+
+2. test/cpp/operator/test_physical_hash_join_mgpu.cpp:642: kIterations 3 -> 20
+   (verified mid-repro: `sed -n '642p' ...` = `  constexpr int kIterations = 20;`)
+   The unrelated `kIterations = 4` at line 311 was preserved unchanged.
+
+HYG-02 baseline check (during repro, with working-tree changes applied):
+rmm::cuda_stream_default count in src/ = 40 (matches HYG baseline of 40; SCHED-RR diff adds zero new occurrences)
+
+## Build
+
+Command: mcp__project-commands__run_command name=build
+Exit code: 0
+Wall clock: 27.1 seconds
+Notes: Incremental build — 42 ninja targets re-built (changed compile units: task_scheduler.cpp,
+task_scheduler.hpp consumers, test_physical_hash_join_mgpu.cpp) + final link of sirius_unittest.
+Final line: `[42/42] Linking CXX executable extension/sirius/test/cpp/sirius_unittest`.
+
+## Cheap Repro
+
+Filter: "physical_hash_join - follow-up #17 scale-up: Q11-like BUILD_PROBE with table_gpu cache"
+Exit code: 0
+Wall clock: 17.8 seconds
+Verdict: UNEXPECTEDLY-PASSED
+Last 30 lines of MCP output:
+```
+Filters: physical_hash_join - follow-up #17 scale-up: Q11-like BUILD_PROBE with table_gpu cache
+
+[0/1] (0%): physical_hash_join - follow-up #17 scale-up: Q11-like BUILD_PROBE with table_gpu cache
+[1/1] (100%): physical_hash_join - follow-up #17 scale-up: Q11-like BUILD_PROBE with table_gpu cache
+===============================================================================
+All tests passed (994 assertions in 1 test case)
+
+--- stderr ---
+[cucascade] direct GPU↔GPU peer DMA broken on 2 direction(s); cudaMemcpyPeer* will host-stage automatically.
+```
+
+### Anomaly: Cheap Repro Did Not Reproduce
+
+Cheap repro (kIterations=20 + Phase 14 SCHED-RR patch applied) PASSED 994 assertions exit 0 in
+17.8s — the operator-level loop in test_physical_hash_join_mgpu.cpp:541-664 does NOT reproduce
+the Q11 multi-GPU bug at iteration count 20. Possible causes:
+
+1. The bug requires cross-test state accumulation from Q1-Q10 (per CONTEXT.md: "Q11 parquet passes
+   in isolation — it only hangs when batched after Q1-Q10 parquet"). The follow-up #17 scale-up
+   loop reuses ONE Catch2 TEST_CASE; cross-test connection/repository state from prior queries
+   never enters this code path.
+2. The hardware peer-DMA-broken fallback on this 2 x RTX 6000 Ada host (consumer chipset behavior
+   per project_tpch_q1_mgpu_string_bug.md) routes cross-GPU transfers through host-staging, which
+   may suppress the stream-ordered race that fires under direct peer DMA on server hardware.
+3. kIterations=20 may be insufficient — research_focus open question #3 raises this; project memory
+   says SF100 needs aggressive iteration count. Could try 50+ in a follow-up wave.
+
+This is a NEGATIVE result for the cheap-repro path. Wave 2 must escalate to the authoritative
+`[TPC-H][parquet]` repro for compute-sanitizer attachment. The cheap repro is NOT viable as the
+diagnostic vehicle on this host.
+
+## Authoritative Repro
+
+Filter: "[TPC-H][parquet]"
+Exit code: -1 (test runner SIGTERMed at 1800s timeout)
+Wall clock: 1800.6 seconds
+Verdict: SIGTERM-AT-Q11
+Hang location (test progress line, verbatim):
+```
+[10/22] (45%): gpu_execution - TPC-H Query 11 parquet
+```
+Last 50 lines of MCP output before SIGTERM/timeout:
+```
+Filters: [TPC-H][parquet]
+
+[0/22] (0%): gpu_execution - TPC-H Query 1 parquet
+[1/22] (4%): gpu_execution - TPC-H Query 2 parquet
+[2/22] (9%): gpu_execution - TPC-H Query 3 parquet
+[3/22] (13%): gpu_execution - TPC-H Query 4 parquet
+[4/22] (18%): gpu_execution - TPC-H Query 5 parquet
+[5/22] (22%): gpu_execution - TPC-H Query 6 parquet
+[6/22] (27%): gpu_execution - TPC-H Query 7 parquet
+[7/22] (31%): gpu_execution - TPC-H Query 8 parquet
+[8/22] (36%): gpu_execution - TPC-H Query 9 parquet
+[9/22] (40%): gpu_execution - TPC-H Query 10 parquet
+[10/22] (45%): gpu_execution - TPC-H Query 11 parquet
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+sirius_unittest is a Catch v2.13.7 host application.
+Run with -? for options
+
+-------------------------------------------------------------------------------
+gpu_execution - TPC-H Query 11 parquet
+-------------------------------------------------------------------------------
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/test/cpp/integration/test_gpu_execution_tpch.cpp:3673
+...............................................................................
+
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/test/cpp/utils/transparent_execution_test_utils.hpp:30: FAILED:
+  {Unknown expression after the reported line}
+due to a fatal error condition:
+  num_gpus := 2
+  SIGTERM - Termination request signal
+
+===============================================================================
+test cases:   11 |   10 passed | 1 failed
+assertions: 7814 | 7813 passed | 1 failed
+
+--- stderr ---
+[cucascade] direct GPU↔GPU peer DMA broken on 2 direction(s); cudaMemcpyPeer* will host-stage automatically.
+```
+
+## Match vs CONTEXT.md Expected Signature
+
+CONTEXT.md prescribes: SIGTERM at Q11 in batch mode under SCHED-RR.
+Observed: MATCH
+Justification: The authoritative repro reproduces the exact CONTEXT.md log shape verbatim — Q1-Q10
+pass in batch (10/22), Q11 enters and hangs, the test runner fires SIGTERM at the 1800s timeout,
+and the assertion site (test_gpu_execution_tpch.cpp:3673) plus the failure reason banner
+(`num_gpus := 2 / SIGTERM - Termination request signal`) match the prescribed signature line for
+line. 7814 assertions completed (Q1-Q10 + 1 Q11 partial) before SIGTERM, with only the Q11 case
+recorded as failed. This is the bug exactly as documented.
+
+## Working-Tree Reverted
+
+git status --porcelain output (after revert, BEFORE artifact commit), filtered to source/test:
+```
+(no entries — src/ and test/ are clean of all Phase 14 patch and kIterations bump artifacts)
+```
+
+Full git status --porcelain shows only:
+- M duckdb / M duckdb-python / M substrait — pre-existing submodule pointer drift (worktree-creation
+  artifact, present before Phase 13 began; NOT in any of the four Phase 14 files)
+- ?? various untracked dotfiles + log/ + test_datasets/ + planning artifacts — all unrelated to
+  Phase 14 source files
+
+Source/test verification (only the four Phase 14 files matter for Phase 13's diff-empty assertion):
+- grep -c '_no_pref_rr_counter' src/include/pipeline/task_scheduler.hpp = 0
+- grep -c '_no_pref_rr_counter' src/pipeline/task_scheduler.cpp = 0
+- sed -n '642p' test/cpp/operator/test_physical_hash_join_mgpu.cpp = "  constexpr int kIterations = 3;"
+- sed -n '311p' test/cpp/operator/test_physical_hash_join_mgpu.cpp = "  constexpr int kIterations = 4;" (untouched)
+- HYG after revert: 40 (== HYG before == HYG during repro)
+
+## Phase 13 Diff-Empty Source Assertion
+
+Branch: fix/q11-mgpu-illegal-address (based off feature/single-node-multi-gpu2)
+Base merge-base: 86e821afe2355f833eecf7bed5eee69e2fcf10d7
+
+Phase 14 file diff (must be empty for Phase 13's commits):
+```
+(empty — `git diff 86e821a..HEAD -- src/include/pipeline/task_scheduler.hpp src/pipeline/task_scheduler.cpp src/include/creator/task_creator.hpp test/cpp/operator/test_physical_hash_join_mgpu.cpp | wc -l` returns 0)
+```
+
+PASS: zero source/test diff against the base for the four Phase 14 files. Phase 13's commits are
+artifact-only.
