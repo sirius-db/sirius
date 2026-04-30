@@ -323,6 +323,7 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
     if (auto exec_node = r.optional_node("executor")) {
       yaml::reader er(*exec_node, "sirius.executor");
       if (auto n = er.optional_node("task_creator")) from_yaml(*n, _task_creator_config);
+      if (auto n = er.optional_node("scan_manager")) from_yaml(*n, _scan_manager_config);
       if (auto n = er.optional_node("pipeline")) from_yaml(*n, _gpu_pipeline_executor_config);
       if (auto n = er.optional_node("downgrade")) from_yaml(*n, _downgrade_executor_config);
       if (auto n = er.optional_node("duckdb_scan")) sirius::from_yaml(*n, _scan_executor_config);
@@ -400,6 +401,11 @@ const exec::downgrade_executor_config& sirius_config::get_downgrade_executor_con
 const exec::thread_pool_config& sirius_config::get_task_creator_config() const noexcept
 {
   return _task_creator_config;
+}
+
+const exec::thread_pool_config& sirius_config::get_scan_manager_config() const noexcept
+{
+  return _scan_manager_config;
 }
 
 const exec::thread_pool_config& sirius_config::get_duckdb_scan_executor_config() const noexcept

@@ -23,6 +23,7 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "planner/query.hpp"
+#include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_config.hpp"
 
 #include <rmm/resource_ref.hpp>
@@ -36,7 +37,6 @@
 
 #include <atomic>
 #include <condition_variable>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -167,6 +167,9 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] sirius::creator::task_creator& get_task_creator();
   [[nodiscard]] const sirius::creator::task_creator& get_task_creator() const;
 
+  [[nodiscard]] sirius::scan_manager::sirius_scan_manager& get_scan_manager();
+  [[nodiscard]] const sirius::scan_manager::sirius_scan_manager& get_scan_manager() const;
+
   /// \brief Start a query with its pipelines.
   /// \param pipelines The ordered pipelines for the query.
   void create_query(
@@ -244,6 +247,7 @@ class SiriusContext : public ClientContextState {
   std::unique_ptr<sirius::pipeline::task_scheduler> task_scheduler_;
   std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;
   std::unique_ptr<sirius::creator::task_creator> task_creator_;
+  std::unique_ptr<sirius::scan_manager::sirius_scan_manager> scan_manager_;
   duckdb::shared_ptr<sirius::planner::query> query_;
 
   /// Captured optimized logical plan for transparent GPU execution.

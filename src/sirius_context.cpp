@@ -259,6 +259,9 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   task_creator_->set_task_scheduler(*task_scheduler_);
   task_scheduler_->set_task_creator(*task_creator_);
 
+  scan_manager_ =
+    std::make_unique<sirius::scan_manager::sirius_scan_manager>(config_.get_scan_manager_config());
+
   // Wire the pipeline task queue into downgrade executors now that task_scheduler_
   // has been constructed.
   for (auto& executor : downgrade_executors_) {
@@ -270,6 +273,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     executor->start();
   }
   task_creator_->start_thread_pool();
+  scan_manager_->start();
   task_scheduler_->start();
 
   // Configure scan caching based on config
@@ -284,6 +288,10 @@ void SiriusContext::terminate()
 
   task_scheduler_->stop();
   task_scheduler_.reset();
+  if (scan_manager_) {
+    scan_manager_->stop();
+    scan_manager_->reset();
+  }
   task_creator_->stop_thread_pool();
   task_creator_.reset();
   for (auto& executor : downgrade_executors_) {
@@ -392,6 +400,18 @@ const sirius::creator::task_creator& SiriusContext::get_task_creator() const
   return *task_creator_;
 }
 
+sirius::scan_manager::sirius_scan_manager& SiriusContext::get_scan_manager()
+{
+  throw_if_not_initialized();
+  return *scan_manager_;
+}
+
+const sirius::scan_manager::sirius_scan_manager& SiriusContext::get_scan_manager() const
+{
+  throw_if_not_initialized();
+  return *scan_manager_;
+}
+
 void SiriusContext::create_query(
   duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines)
 {
@@ -399,6 +419,7 @@ void SiriusContext::create_query(
   query_ = duckdb::make_shared_ptr<sirius::planner::query>(std::move(pipelines));
   task_scheduler_->prepare_for_query(query_);
   task_creator_->prepare_for_query(*query_);
+  scan_manager_->prepare_for_query(*query_);
 }
 
 duckdb::shared_ptr<sirius::planner::query> SiriusContext::get_query()
