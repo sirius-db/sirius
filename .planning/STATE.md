@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Multi-GPU Distribution
 status: executing
-stopped_at: "Completed 13-04 PARTIAL: cucascade writer-event lineage landed + 7 producers migrated; Q11 cumulative-state under SCHED-RR still hangs (sanitizer 433->328); ~22 producer sites remain — Plan 13-05 needed."
-last_updated: "2026-04-30T07:30:07.397Z"
+stopped_at: "Completed 14-01-PLAN.md: SCHED-RR distribution patch landed (commit d4009e2 on feat/sched-rr-distribution); MCP build exit 0; follow-up #17 scale-up exit 0 in 7.3s (178 assertions); HYG=40. Ready for Plan 14-02 acceptance-criteria validation."
+last_updated: "2026-04-30T21:36:32.271Z"
 last_activity: 2026-04-30
 progress:
   total_phases: 15
-  completed_phases: 7
-  total_plans: 50
-  completed_plans: 44
+  completed_phases: 8
+  total_plans: 52
+  completed_plans: 46
   percent: 100
 ---
 
@@ -21,12 +21,12 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-21)
 
 **Core value:** Any query can transparently execute across every GPU on the node — tasks are scheduled to the GPU where their input data already resides, memory pressure is absorbed by downgrading to the correct NUMA domain, and parquet I/O is routed through a multi-GPU-safe backend.
-**Current focus:** Phase 13 — q11-multi-gpu-illegal-address
+**Current focus:** Phase 14 — sched-rr-distribution
 
 ## Current Position
 
-Phase: 13 (q11-multi-gpu-illegal-address) — EXECUTING
-Plan: 5 of 5
+Phase: 14 (sched-rr-distribution) — EXECUTING
+Plan: 2 of 2
 Status: Ready to execute
 Last activity: 2026-04-30
 
@@ -60,6 +60,7 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 | Phase 13 P02 | 10min | 1 tasks | 2 files |
 | Phase 13 P03 | 30min | 1 tasks | 2 files |
 | Phase 13 P04 | 60min | 1 tasks | 9 files |
+| Phase 14 P01 | 2 min | 1 tasks | 2 files |
 
 ## Decisions
 
@@ -119,6 +120,10 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 - [Phase 13]: [13-03] MCP env-passing limitation reconfirmed at Wave 3: unit-tests command accepts only filter= per list_commands schema; cannot propagate SIRIUS_LOG_LEVEL=debug. Cheap repro doesn't fire bug on consumer 2 x RTX 6000 Ada host (peer-DMA host-staged; same Wave 1 anomaly). Existing [mgpu-probe] coverage at host_parquet_to_gpu + prepare_for_processing only — NOT at sirius_physical_partition::execute despite stale claim in project_phase08_fu17.md. Recommended follow-ups (out of Phase 13 scope): extend MCP wrapper for env passthrough; add partition-execute probe; refresh memory entry.
 - [Phase 13]: [13-03] Wave 4 fix scope unambiguously bounded by combining 13-race-site.txt + 13-falsifiers.txt: cucascade-side gpu_table_representation extension with set_writer_event/get_writer_event accessor + cudaStreamWaitEvent in convert_gpu_to_gpu before peer copies; submodule bump REQUIRED. No need to investigate cuco lifecycle, partition sibling state, pop_data_batch CV, or reservation tracker as primary causes — all DEAD.
 - [Phase 13]: [13-04] PARTIAL fix: cucascade pin bumped to 7409c60 (writer-event lineage in convert_gpu_to_gpu) + 7 Sirius producer sites migrated to make_data_batch(writer_stream) overload. Sanitizer 433->328 errors (24% reduction); Q11-alone PASS (9011 assertions, 7s); Q1-Q22 cumulative under SCHED-RR STILL SIGTERMs at Q11 (1800s timeout). ~22 producer sites remain un-migrated (left_delim_join::sink confirmed; compute_task generic-frame writers unconfirmed). Plan 13-05 needed to complete migration. Phase 14 BLOCKED until 13-05 closes residual writer-event coverage gap.
+- [Phase 14-01]: std::unordered_map -> std::map for _gpu_executors so begin()->first is ascending-by-device_id deterministic, not hash-bucket-order
+- [Phase 14-01]: Atomic round-robin counter (_no_pref_rr_counter) gated on \!have_pref && size>1 so preference-bearing tasks keep SCHED-01/02/04 locality and 1-GPU configurations are untouched
+- [Phase 14-01]: Per-query reset of _no_pref_rr_counter in prepare_for_query (store(0, std::memory_order_relaxed)) so cache=table_gpu warm-path stays correct across same-query iterations
+- [Phase 14-01]: Patch applied via Edit tool, not git apply — diff in 14-CONTEXT.md is documentation-style without --- a/.../+++ b/... headers; Phase 13 Wave 1 + Wave 4 both proved git apply rejects
 
 ## Accumulated Context
 
@@ -168,6 +173,6 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 
 ## Session Continuity
 
-Last session: 2026-04-30T07:30:07.395Z
-Stopped at: Completed 13-04 PARTIAL: cucascade writer-event lineage landed + 7 producers migrated; Q11 cumulative-state under SCHED-RR still hangs (sanitizer 433->328); ~22 producer sites remain — Plan 13-05 needed.
+Last session: 2026-04-30T21:36:32.268Z
+Stopped at: Completed 14-01-PLAN.md: SCHED-RR distribution patch landed (commit d4009e2 on feat/sched-rr-distribution); MCP build exit 0; follow-up #17 scale-up exit 0 in 7.3s (178 assertions); HYG=40. Ready for Plan 14-02 acceptance-criteria validation.
 Resume file: None
