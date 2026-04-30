@@ -116,10 +116,9 @@ sirius_pipeline_converter::schedule_and_copy_pipelines(sirius_meta_pipeline& roo
     if (should_schedule) {
       duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> pipeline_inside;
       to_schedule[to_schedule.size() - 1 - meta]->get_pipelines(pipeline_inside, false);
-      for (auto& pipeline_idx : pipeline_inside) {
-        auto& pipeline = pipeline_idx;
-        if (pipeline_idx->source->type == op::SiriusPhysicalOperatorType::HASH_JOIN) {
-          auto& temp = pipeline_idx->source.get()->Cast<op::sirius_physical_hash_join>();
+      for (auto& pipeline : pipeline_inside) {
+        if (pipeline->source->type == op::SiriusPhysicalOperatorType::HASH_JOIN) {
+          auto& temp = pipeline->source.get()->Cast<op::sirius_physical_hash_join>();
           if (temp.join_type == duckdb::JoinType::RIGHT ||
               temp.join_type == duckdb::JoinType::RIGHT_SEMI ||
               temp.join_type == duckdb::JoinType::RIGHT_ANTI) {
@@ -1242,11 +1241,10 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
                       port_id.data());
 
       // Print the port details if it exists
-      if (auto* port = next_op->get_port(port_id)) {
-        SIRIUS_LOG_INFO("      Port barrier_type={}, repo={}",
-                        static_cast<int>(port->type),
-                        static_cast<void*>(port->repo));
-      }
+      auto* port = next_op->get_port(port_id);
+      SIRIUS_LOG_INFO("      Port barrier_type={}, repo={}",
+                      static_cast<int>(port->type),
+                      static_cast<void*>(port->repo));
     }
 
     SIRIUS_LOG_INFO("");  // Blank line between pipelines

@@ -663,8 +663,7 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
   {
     auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
     std::vector<sirius_physical_operator*> output_consumers;
-    auto ports = g_state.get_operator().get_next_ports_after_sink();
-    for (auto& next_port : ports) {
+    for (const auto& next_port : g_state.get_operator().get_next_ports_after_sink()) {
       output_consumers.push_back(next_port.next_operator);
     }
     return output_consumers;
