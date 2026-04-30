@@ -78,6 +78,8 @@ struct sirius_config {
 
   [[nodiscard]] const exec::thread_pool_config& get_task_creator_config() const noexcept;
 
+  [[nodiscard]] const exec::thread_pool_config& get_scan_manager_config() const noexcept;
+
   [[nodiscard]] const exec::thread_pool_config& get_gpu_pipeline_executor_config() const noexcept;
 
   [[nodiscard]] const exec::downgrade_executor_config& get_downgrade_executor_config()
@@ -112,6 +114,8 @@ struct sirius_config {
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   exec::thread_pool_config _task_creator_config{.num_threads        = 2,
                                                 .thread_name_prefix = "task_creator"};
+  exec::thread_pool_config _scan_manager_config{.num_threads        = 2,
+                                                .thread_name_prefix = "scan_manager"};
   exec::thread_pool_config _gpu_pipeline_executor_config{.num_threads        = 4,
                                                          .thread_name_prefix = "gpu_pipeline"};
   exec::downgrade_executor_config _downgrade_executor_config;
