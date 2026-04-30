@@ -57,24 +57,6 @@ std::vector<std::string> scan_plan::data_column_names() const
   return names;
 }
 
-std::vector<duckdb::idx_t> scan_plan::make_batch_column_map() const
-{
-  // This is a shim for the existing @c convert_table_filters_to_expression API,
-  // which uses @c idx_t(-1) as a "not in batch" sentinel. The canonical form
-  // is the @c vector<optional<size_t>> already stored in
-  // @c batch_position_by_column_id; once the filter-translator API is updated
-  // to consume the optional form directly, this conversion (and the sentinel)
-  // can be deleted.
-  constexpr auto NOT_PROJECTED = static_cast<duckdb::idx_t>(-1);
-  std::vector<duckdb::idx_t> map(batch_position_by_column_id.size(), NOT_PROJECTED);
-  for (std::size_t c = 0; c < batch_position_by_column_id.size(); ++c) {
-    if (batch_position_by_column_id[c]) {
-      map[c] = static_cast<duckdb::idx_t>(*batch_position_by_column_id[c]);
-    }
-  }
-  return map;
-}
-
 std::string scan_plan::batch_column_name(duckdb::idx_t batch_position) const
 {
   return data_columns.at(batch_position).name;
@@ -125,12 +107,10 @@ partition_inject_fn_t scan_plan::build_inject_fn() const
 
   return [layout = std::move(layout), partitions = std::move(partitions)](
            std::unique_ptr<cudf::table> tbl,
-           std::string const& file_path,
+           std::vector<std::string> const& partition_values,
            rmm::cuda_stream_view stream) -> std::unique_ptr<cudf::table> {
     if (!tbl) return tbl;
 
-    // Parse once; the closure is called per scan task (per file).
-    auto path_parts     = duckdb::HivePartitioning::Parse(file_path);
     auto const num_rows = tbl->num_rows();
     auto data_cols      = tbl->release();  // move columns out, no GPU copy
 
@@ -142,15 +122,18 @@ partition_inject_fn_t scan_plan::build_inject_fn() const
         out_cols.push_back(std::move(data_cols.at(entry.idx)));
       } else {
         auto const& pcol = partitions.at(entry.idx);
-        auto it          = path_parts.find(pcol.name);
-        if (it == path_parts.end()) {
+        // partition_values is in partition_columns order, so entry.idx indexes it directly.
+        if (entry.idx >= partition_values.size()) {
           throw sirius::internal_exception(
-            "[scan_plan::inject] missing hive partition key '{}' in file path: {}",
+            "[scan_plan::inject] partition_values too short ({}) for partition column '{}' at "
+            "index {}.",
+            partition_values.size(),
             pcol.name,
-            file_path);
+            entry.idx);
         }
-        auto duckdb_val = duckdb::Value(it->second).DefaultCastAs(sirius::to_duckdb(pcol.type));
-        auto scalar     = sirius::value_to_cudf_scalar(duckdb_val, pcol.type, stream);
+        auto duckdb_val =
+          duckdb::Value(partition_values[entry.idx]).DefaultCastAs(sirius::to_duckdb(pcol.type));
+        auto scalar = sirius::value_to_cudf_scalar(duckdb_val, pcol.type, stream);
         out_cols.push_back(cudf::make_column_from_scalar(*scalar, num_rows, stream));
       }
     }

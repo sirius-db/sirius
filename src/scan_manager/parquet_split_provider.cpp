@@ -30,15 +30,32 @@
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
+#include <duckdb/common/hive_partitioning.hpp>
+
 #include <algorithm>
 #include <atomic>
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
 namespace sirius::scan_manager {
+
+namespace {
+
+struct rg_accumulator {
+  std::vector<op::scan::row_group_slice> slices;
+  std::size_t total_uncompressed_bytes = 0;
+  // Partition values for the files currently bundled, in scan_plan::partition_columns order.
+  // nullopt until the first file is added. Bundling is only safe across files with identical
+  // values: partition_inject_fn synthesizes constant scalar columns from one representative file
+  // path, so all files in the bundle must share those values.
+  std::optional<std::vector<std::string>> partition_values;
+};
+
+}  // namespace
 
 parquet_split_provider::parquet_split_provider(
   duckdb::vector<sirius::logical_type> const& returned_types,
@@ -85,12 +102,11 @@ parquet_split_provider::parquet_split_provider(
   // task-local CUDA stream can be used. Filters on hive-partition columns are dropped because
   // those columns aren't in the parquet file (DuckDB prunes them at the file-list level).
   if (table_filter_set && !table_filter_set->filters.empty()) {
-    auto batch_column_map = _plan->make_batch_column_map();
     auto duckdb_expression =
       op::convert_table_filters_to_expression(*table_filter_set,
                                               column_ids,
                                               returned_types,
-                                              batch_column_map,
+                                              _plan->batch_position_by_column_id,
                                               _plan->partition_primary_indices);
     if (duckdb_expression) { _duckdb_filter_expression = std::move(duckdb_expression); }
   }
@@ -216,10 +232,45 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
   }
 
   // Loop over files to read footers, parse metadata, and compute row-group partitions.
-  std::size_t file_idx = 0;
+  rg_accumulator accum;
+  // flush() pushes the bundled slices but does NOT reset partition_values. The file loop owns
+  // partition_values and re-seeds it on every file iteration; clearing it here would orphan the
+  // post-flush tail of a mid-file overflow (the rest of the same file would land in an
+  // accumulator with nullopt partition_values, then get re-tagged with the NEXT file's values
+  // when the file loop advances — silently mislabeling rows).
+  auto flush = [&]() {
+    if (accum.slices.empty()) { return; }
+    connector.push_split(std::make_unique<op::scan::parquet_scan_data>(
+      std::move(accum.slices),
+      reader_options,
+      _duckdb_filter_expression,
+      _plan,
+      accum.partition_values.value_or(std::vector<std::string>{})));
+    accum.slices.clear();
+    accum.total_uncompressed_bytes = 0;
+  };
+
   for (auto const& file_path : batch.file_paths) {
+    // Partition compatibility: if the current accumulator already holds files with different
+    // partition values, flush before starting this file. partition_inject_fn synthesizes
+    // constants from one path on behalf of the whole bundle, so mixing partitions would produce
+    // wrong rows. Always (re-)seed partition_values for this file afterward — the previous
+    // iteration may have flushed mid-file (byte-budget overflow), leaving accum.partition_values
+    // intact but accum.slices empty; either way, this file's values are what's authoritative now.
+    if (!_plan->partition_columns.empty()) {
+      std::vector<std::string> file_partition_values;
+      file_partition_values.reserve(_plan->partition_columns.size());
+      auto parsed = duckdb::HivePartitioning::Parse(file_path);
+      for (auto const& pc : _plan->partition_columns) {
+        auto it = parsed.find(pc.name);
+        file_partition_values.push_back(it != parsed.end() ? it->second : std::string{});
+      }
+      if (accum.partition_values && *accum.partition_values != file_partition_values) { flush(); }
+      accum.partition_values = std::move(file_partition_values);
+    }
+
     //===----------Read metadata footers----------===//
-    auto datasource = cudf::io::datasource::create(file_path);
+    auto datasource = std::shared_ptr(cudf::io::datasource::create(file_path));
 
     std::unique_ptr<cudf::io::datasource::buffer> footer_buffer;
     footer_buffer = cudf::io::parquet::fetch_footer_to_host(*datasource);
@@ -277,29 +328,14 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
       // clang-format on
     }
 
-    std::size_t partition_uncompressed_bytes = 0;
-    std::size_t partition_compressed_bytes   = 0;
-    std::vector<cudf::size_type> partition_rg_indices;
-    partition_rg_indices.reserve(row_group_indices.size());
+    std::vector<cudf::size_type> cur_rgs;
+    std::size_t cur_uncompressed_bytes = 0;
+    std::size_t cur_compressed_bytes   = 0;
 
-    auto datasource_shared = std::shared_ptr<cudf::io::datasource>(std::move(datasource));
-
-    auto flush_partition = [&]() {
-      if (partition_rg_indices.empty()) { return; }
-      op::scan::row_group_range rg{file_idx,
-                                   std::move(partition_rg_indices),
-                                   partition_uncompressed_bytes,
-                                   partition_compressed_bytes};
-      partition_rg_indices         = {};
-      partition_uncompressed_bytes = 0;
-      partition_compressed_bytes   = 0;
-      auto split                   = std::make_unique<op::scan::parquet_scan_data>(file_path,
-                                                                 std::move(rg),
-                                                                 reader_options,
-                                                                 _duckdb_filter_expression,
-                                                                 datasource_shared,
-                                                                 _plan);
-      connector.push_split(std::move(split));
+    auto seal_current_file = [&]() {
+      if (cur_rgs.empty()) { return; }
+      accum.slices.emplace_back(
+        datasource, file_path, std::move(cur_rgs), cur_uncompressed_bytes, cur_compressed_bytes);
     };
 
     auto accumulate_chunk = [&](cudf::io::parquet::ColumnChunk const& chunk, bool is_pure_filter) {
@@ -307,19 +343,15 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
       // Pure filter columns are not part of the scan result, so we omit them from the
       // uncompressed byte count used for sizing partitions.
       if (column_metadata.total_uncompressed_size > 0 && !is_pure_filter) {
-        partition_uncompressed_bytes +=
-          static_cast<std::size_t>(column_metadata.total_uncompressed_size);
+        cur_uncompressed_bytes += static_cast<std::size_t>(column_metadata.total_uncompressed_size);
       }
       if (column_metadata.total_compressed_size > 0) {
-        partition_compressed_bytes +=
-          static_cast<std::size_t>(column_metadata.total_compressed_size);
+        cur_compressed_bytes += static_cast<std::size_t>(column_metadata.total_compressed_size);
       }
     };
 
     for (auto const rg_idx : row_group_indices) {
       auto const& row_group = metadata.row_groups[rg_idx];
-      partition_rg_indices.push_back(rg_idx);
-
       if (_plan->is_projected()) {
         for (auto const chunk_idx : selected_chunk_indices) {
           accumulate_chunk(row_group.columns[chunk_idx],
@@ -332,14 +364,17 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
         }
       }
 
-      if (partition_uncompressed_bytes >= _approximate_batch_size) { flush_partition(); }
+      if (!accum.slices.empty() || !cur_rgs.empty()) {
+        if (accum.total_uncompressed_bytes + cur_uncompressed_bytes > _approximate_batch_size) {
+          seal_current_file();
+          flush();
+        }
+      }
+      cur_rgs.push_back(rg_idx);
     }
-
-    // Emit any trailing partition smaller than the target size.
-    flush_partition();
-
-    ++file_idx;
+    seal_current_file();
   }
+  flush();
 }
 
 }  // namespace sirius::scan_manager

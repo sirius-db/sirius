@@ -37,6 +37,36 @@ namespace sirius::op::scan {
 using hybrid_scan_reader = cudf::io::parquet::experimental::hybrid_scan_reader;
 
 //===----------------------------------------------------------------------===//
+// row_group_slice
+//===----------------------------------------------------------------------===//
+/**
+ * @brief Represents a set of row groups within a single parquet file.
+ *
+ * Multiple slices can be bundled together to form a single parquet partition corresponding to a
+ * data batch.
+ */
+struct row_group_slice {
+  row_group_slice(std::shared_ptr<cudf::io::datasource> datasource,
+                  std::string file_path,
+                  std::vector<cudf::size_type> row_group_indices,
+                  std::size_t reserved_uncompressed_bytes,
+                  std::size_t reserved_compressed_bytes)
+    : datasource(datasource),
+      file_path(file_path),
+      row_group_indices(std::move(row_group_indices)),
+      reserved_compressed_bytes(reserved_uncompressed_bytes),
+      reserved_uncompressed_bytes(reserved_compressed_bytes)
+  {
+  }
+  /// Datasource for the parquet file, shared with other partitions of the same file.
+  std::shared_ptr<cudf::io::datasource> datasource;
+  std::string file_path;
+  std::vector<cudf::size_type> row_group_indices;
+  std::size_t reserved_uncompressed_bytes;
+  std::size_t reserved_compressed_bytes;
+};
+
+//===----------------------------------------------------------------------===//
 // row_group_range
 //===----------------------------------------------------------------------===//
 /**
@@ -77,18 +107,16 @@ struct row_group_range {
 class parquet_scan_data : public op::operator_data {
  public:
   using translated_expression = gpu_expression_translator::translated_expression;
-  parquet_scan_data(std::string file_path,
-                    row_group_range rg_range,
+  parquet_scan_data(std::vector<row_group_slice> rg_slices,
                     std::shared_ptr<cudf::io::parquet_reader_options> reader_options,
                     std::shared_ptr<duckdb::Expression> filter_expression,
-                    std::shared_ptr<cudf::io::datasource> datasource,
-                    std::shared_ptr<scan_plan const> plan)
-    : file_path(std::move(file_path)),
-      rg_range(std::move(rg_range)),
+                    std::shared_ptr<scan_plan const> plan,
+                    std::vector<std::string> partition_values)
+    : rg_slices(std::move(rg_slices)),
       reader_options(std::move(reader_options)),
       filter_expression(std::move(filter_expression)),
-      datasource(std::move(datasource)),
-      plan(std::move(plan))
+      plan(std::move(plan)),
+      partition_values(std::move(partition_values))
   {
   }
 
@@ -114,7 +142,7 @@ class parquet_scan_data : public op::operator_data {
    */
   std::optional<std::vector<::cucascade::data_batch_processing_handle>> prepare_for_processing(
     const ::cucascade::memory::memory_space* requested_memory_space,
-    rmm::cuda_stream_view stream) override
+    rmm::cuda_stream_view /*stream*/) override
   {
     gpu_memory_space = const_cast<cucascade::memory::memory_space*>(requested_memory_space);
     return std::vector<::cucascade::data_batch_processing_handle>{};
@@ -122,19 +150,25 @@ class parquet_scan_data : public op::operator_data {
 
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
   {
-    return rg_range.reserved_uncompressed_bytes;
+    return std::accumulate(
+      rg_slices.begin(), rg_slices.end(), std::size_t{0}, [](auto acc, auto const& s) {
+        return acc + s.reserved_uncompressed_bytes;
+      });
   }
 
-  std::string file_path;
-  row_group_range rg_range;
+  /// The row group slices (potentially across multiple files)
+  std::vector<row_group_slice> rg_slices;
+  /// The reader options to apply in the parquet reader
   std::shared_ptr<cudf::io::parquet_reader_options> reader_options;
   /// The coalesced duckdb filter expression.
   std::shared_ptr<duckdb::Expression> filter_expression;
-  /// Datasource for the parquet file, shared with other partitions of the same file.
-  std::shared_ptr<cudf::io::datasource> datasource;
   /// Scan plan shared across all splits of this scan. Carries the D-order column name
   /// table used by execute()'s per-task AST translation, plus the post-read assembly layout.
   std::shared_ptr<scan_plan const> plan;
+  /// Hive partition values shared by every file in @ref rg_slices, in scan_plan::partition_columns
+  /// order. Empty when the table has no hive partitions. partition_inject_fn consumes this directly
+  /// instead of re-parsing a file path at execute time.
+  std::vector<std::string> partition_values;
   /// GPU memory space for allocating output tables produced by execute().
   cucascade::memory::memory_space* gpu_memory_space = nullptr;
 };

@@ -111,17 +111,25 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
       "[sirius_gpu_parquet_scan_operator] execute() called with null gpu_memory_space in "
       "input_data.");
   }
-  auto datasource        = scan_data->datasource;
-  auto& mem_space        = *scan_data->gpu_memory_space;
-  auto filter_expression = scan_data->filter_expression;
 
-  // Build reader options for this partition's row groups.
+  auto& mem_space = *scan_data->gpu_memory_space;
+
+  // Build reader options for this partition's files and corresponding row groups
+  std::vector<cudf::io::datasource*> src_ptrs;
+  std::vector<std::vector<cudf::size_type>> rg_per_src;
+  src_ptrs.reserve(scan_data->rg_slices.size());
+  rg_per_src.reserve(scan_data->rg_slices.size());
+  for (auto const& slice : scan_data->rg_slices) {
+    src_ptrs.push_back(slice.datasource.get());
+    rg_per_src.push_back(std::move(slice.row_group_indices));
+  }
   auto opts = *scan_data->reader_options;
-  opts.set_source(cudf::io::source_info{datasource.get()});
-  opts.set_row_groups({scan_data->rg_range.row_group_indices});
+  opts.set_source(cudf::io::source_info{src_ptrs});
+  opts.set_row_groups(std::move(rg_per_src));
 
   // Try to translate the filter to a *stream-local* cudf AST for filter pushdown. If not
   // successful, fall back to post-read DuckDB-expression evaluation.
+  auto filter_expression = scan_data->filter_expression;
   std::optional<gpu_expression_translator::translated_expression> ast_expression = std::nullopt;
   if (filter_expression) {
     auto name_resolver = [plan = scan_data->plan](duckdb::idx_t ref_index) -> std::string {
@@ -143,10 +151,13 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
 
   auto [table, metadata] = cudf::io::read_parquet(opts, stream);
 
-  SIRIUS_LOG_DEBUG("[sirius_gpu_parquet_scan_operator] Read {} — {} rows, {} columns",
-                   scan_data->file_path,
-                   table->num_rows(),
-                   table->num_columns());
+  SIRIUS_LOG_DEBUG(
+    "[sirius_gpu_parquet_scan_operator] Read {} file(s) (first: {}) — {} rows, {} "
+    "columns",
+    scan_data->rg_slices.size(),
+    scan_data->rg_slices.empty() ? "<none>" : scan_data->rg_slices.front().file_path,
+    table->num_rows(),
+    table->num_columns());
 
   // Apply the filter if it was not pushed down into the parquet scan.
   if (filter_expression && !ast_expression) {
@@ -167,7 +178,7 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
   // columns, drop pure-filter columns, inject hive-partition columns. No-op when
   // the scan is a trivial identity (no partitions, 1:1 data layout).
   if (_partition_inject_fn) {
-    table = _partition_inject_fn(std::move(table), scan_data->file_path, stream);
+    table = _partition_inject_fn(std::move(table), scan_data->partition_values, stream);
     SIRIUS_LOG_DEBUG("[sirius_gpu_parquet_scan_operator] Applied partition_inject_fn.");
   }
 

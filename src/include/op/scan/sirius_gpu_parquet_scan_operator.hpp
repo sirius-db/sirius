@@ -127,8 +127,9 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
 
   /// \brief Install the closure that reshapes the reader's output to the scan_plan's
   ///        D-order layout: reorders data columns, drops pure-filter columns, and
-  ///        injects hive-partition columns synthesized from the file path. No-op
-  ///        when the scan is a trivial identity (no partitions, 1:1 data layout).
+  ///        injects hive-partition columns from the per-split @c partition_values
+  ///        carried on @c parquet_scan_data. No-op when the scan is a trivial identity
+  ///        (no partitions, 1:1 data layout).
   void set_partition_inject_fn(partition_inject_fn_t fn) { _partition_inject_fn = std::move(fn); }
 
   //===----------Fields----------===//

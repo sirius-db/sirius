@@ -18,7 +18,7 @@
 
 // sirius
 #include <helper/logical_type.hpp>
-#include <op/scan/hive_partition.hpp>  // partition_inject_fn_t
+#include <op/scan/hive_partition.hpp>
 
 // duckdb
 #include <duckdb/common/column_index.hpp>
@@ -118,10 +118,6 @@ struct scan_plan {
   /// and as the D-indexed resolver for AST filter translation.
   [[nodiscard]] std::vector<std::string> data_column_names() const;
 
-  /// C → D map in the sentinel form expected by @c convert_table_filters_to_expression
-  /// (@c idx_t(-1) = not in batch).
-  [[nodiscard]] std::vector<duckdb::idx_t> make_batch_column_map() const;
-
   /// Resolve a D-space index to a parquet column name, for use as the AST
   /// translator's name resolver.
   [[nodiscard]] std::string batch_column_name(duckdb::idx_t batch_position) const;
@@ -155,7 +151,8 @@ struct scan_plan {
   ///
   /// Otherwise returns a closure that, per scan task, walks @c output_layout:
   /// DATA entries move the corresponding data column out of the batch;
-  /// PARTITION entries synthesize a scalar-backed column from the file path.
+  /// PARTITION entries synthesize a scalar-backed column from the @c partition_values vector
+  /// supplied by the caller (indexed by @c output_entry::idx into @c partition_columns).
   /// Pure-filter data columns (present in @c data_columns but not referenced
   /// by @c output_layout) are implicitly freed when the batch goes out of scope.
   ///

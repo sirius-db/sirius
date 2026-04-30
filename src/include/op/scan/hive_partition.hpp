@@ -43,20 +43,56 @@ struct hive_partition_column {
 };
 
 /**
- * @brief Function that injects hive partition columns into a GPU table.
+ * @brief Operator-path closure: inject constant hive-partition columns into a GPU table.
  *
- * Add constant partition columns (whose values come from the file path, not the parquet data) at
- * the correct positions in the output table.
+ * Used by the new operator-based scan (@c sirius_gpu_parquet_scan_operator) via
+ * @c scan_plan::build_inject_fn. The split provider pre-computes @p partition_values once per
+ * split (per hive bucket), so the closure does not need a file path at execute time.
+ *
+ * @p partition_values is in @c scan_plan::partition_columns order. Empty when the table has no
+ *    hive partitions — the closure then handles only column-shape concerns (reorder, drop pure-
+ *    filter columns).
  */
-using partition_inject_fn_t = std::function<std::unique_ptr<cudf::table>(
-  std::unique_ptr<cudf::table>, std::string const& data_file_path, rmm::cuda_stream_view)>;
+using partition_inject_fn_t =
+  std::function<std::unique_ptr<cudf::table>(std::unique_ptr<cudf::table>,
+                                             std::vector<std::string> const& partition_values,
+                                             rmm::cuda_stream_view)>;
 
+}  // namespace sirius::op::scan
+
+namespace sirius {
+
+/**
+ * @brief Legacy-path closure: inject constant columns into a GPU table.
+ *
+ * Used by @c host_parquet_representation and @c parquet_scan_task (and through them, the iceberg
+ * scan path). Carries @p file_path because the schema-reconciliation closure
+ * (@c parquet_scan_task_global_state::build_schema_reconciliation) keys per-file column-set
+ * lookups by path. Simple closures (the standard hive-injection one built by
+ * @c build_partition_inject_fn) accept the @p file_path argument but ignore it.
+ *
+ * @p partition_values is in @c hive_partition_columns order; empty when the table has no
+ *    hive partitions.
+ */
+using partition_inject_fn_t =
+  std::function<std::unique_ptr<cudf::table>(std::unique_ptr<cudf::table>,
+                                             std::string const& file_path,
+                                             std::vector<std::string> const& partition_values,
+                                             rmm::cuda_stream_view)>;
+
+/**
+ * @brief Build the legacy hive-partition injection closure.
+ *
+ * Returns a closure conforming to the legacy @c sirius::partition_inject_fn_t signature so it can
+ * coexist with the schema-reconciliation closure on the same storage slot. The closure ignores
+ * its @c file_path argument; partition values come from the supplied vector.
+ */
 partition_inject_fn_t build_partition_inject_fn(
   duckdb::vector<duckdb::ColumnIndex> const& column_ids,
   duckdb::vector<std::string> const& names,
   duckdb::vector<sirius::logical_type> const& returned_types,
   std::vector<size_t> const& selected_column_indices,
-  std::vector<hive_partition_column> const& hive_partition_columns,
+  std::vector<sirius::op::scan::hive_partition_column> const& hive_partition_columns,
   std::unordered_set<size_t> const& hive_partition_index_set);
 
-}  // namespace sirius::op::scan
+}  // namespace sirius

@@ -197,17 +197,17 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     std::vector<std::unique_ptr<cudf::column>> selected;
     selected.reserve(expected_output_columns);
     for (std::size_t i = 0; i < expected_output_columns; i++) {
-      auto batch_idx = batch_column_map[projection_ids[i]];
-      if (batch_idx == static_cast<std::size_t>(-1) || batch_idx >= columns.size()) {
+      auto const& batch_idx_opt = batch_column_map[projection_ids[i]];
+      if (!batch_idx_opt.has_value() || *batch_idx_opt >= columns.size()) {
         throw std::runtime_error(
           std::format("TABLE_SCAN projection OOB: projection_ids[{}]={} → batch_idx={} >= "
                       "columns.size()={}",
                       i,
                       projection_ids[i],
-                      batch_idx,
+                      batch_idx_opt.has_value() ? std::to_string(*batch_idx_opt) : "(nullopt)",
                       columns.size()));
       }
-      selected.push_back(std::move(columns[batch_idx]));
+      selected.push_back(std::move(columns[*batch_idx_opt]));
     }
 
     auto projected_table = std::make_unique<cudf::table>(std::move(selected));
