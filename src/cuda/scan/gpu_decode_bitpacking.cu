@@ -52,14 +52,12 @@
 #include "cuda/scan/gpu_decode_bitpacking.cuh"
 
 #include <rmm/detail/error.hpp>
-#include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 
 #include <cub/block/block_scan.cuh>
 #include <cuda_runtime.h>
 
 #include <cstdint>
-#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -258,6 +256,11 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
 
   //===--------------------------------------------------------------------===//
   // CONSTANT — broadcast `sm_aux` to every row.
+  //
+  // We don't go through `cudf::type_dispatcher` like the UNCOMPRESSED-CONSTANT
+  // path does, because the constant value is parsed *inside this kernel* from
+  // the segment's metadata; reaching for a separate dispatcher launch would
+  // require staging the parsed value back to a device scalar and re-launching.
   //===--------------------------------------------------------------------===//
   if (mode == BitpackingMode::CONSTANT) {
     T const val = sm_aux;
@@ -473,6 +476,11 @@ void launch_typed(bp_group_desc const* h_descs,
 
 //===----------------------------------------------------------------------===//
 // Public entry.
+//
+// `type` is unused: bit-level decode is endianness- and signedness-independent,
+// and the only mode-specific arithmetic (`frame + delta`, prefix sum) wraps
+// correctly in two's complement, so the kernel routes by `type_size` alone.
+// Kept in the signature for parity with the dispatcher's other codec entries.
 //===----------------------------------------------------------------------===//
 
 void decode_bitpacking_data(gpu_codec_run const& run,
