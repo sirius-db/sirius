@@ -78,7 +78,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 | 10. TABLE_FUNCTION-form gpu_execution SIGSEGV fix | v1.2 | 4/4 | Complete (PARTIAL) | 2026-04-27 |
 | 11. AUDIT TEST_CASE attach-path SIGSEGV hotfix | v1.2 patch | 2/2 | Complete (PARTIAL) | 2026-04-28 |
 | 12. Fix vector::at(2) in small-sort plan path | v1.3 | 4/4 | Complete    | 2026-04-29 |
-| 13. Fix Q11 multi-GPU hang/illegal-address | v1.3 | 3/5 | In Progress|  |
+| 13. Fix Q11 multi-GPU hang/illegal-address | v1.3 | 4/5 | In Progress|  |
 | 14. Land SCHED-RR distribution | v1.3 | 0 | Not planned | — |
 | 15. Cross-GPU operator-colocation audit | v1.3 | 0 | Not planned | — |
 

@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Multi-GPU Distribution
 status: executing
-stopped_at: "Completed 13-03: 3 falsifiers AGREE with 13-02; all 4 hypotheses DEAD; Wave 4 unblocked with single-valued fix scope (cucascade gpu_table_representation writer-event extension)."
-last_updated: "2026-04-30T02:31:49.862Z"
+stopped_at: "Completed 13-04 PARTIAL: cucascade writer-event lineage landed + 7 producers migrated; Q11 cumulative-state under SCHED-RR still hangs (sanitizer 433->328); ~22 producer sites remain — Plan 13-05 needed."
+last_updated: "2026-04-30T07:30:07.397Z"
 last_activity: 2026-04-30
 progress:
   total_phases: 15
   completed_phases: 7
   total_plans: 50
-  completed_plans: 43
+  completed_plans: 44
   percent: 100
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-04-21)
 ## Current Position
 
 Phase: 13 (q11-multi-gpu-illegal-address) — EXECUTING
-Plan: 4 of 5
+Plan: 5 of 5
 Status: Ready to execute
 Last activity: 2026-04-30
 
@@ -59,6 +59,7 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 | Phase 13 P01 | 33min | 1 tasks | 1 files |
 | Phase 13 P02 | 10min | 1 tasks | 2 files |
 | Phase 13 P03 | 30min | 1 tasks | 2 files |
+| Phase 13 P04 | 60min | 1 tasks | 9 files |
 
 ## Decisions
 
@@ -117,6 +118,7 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 - [Phase 13]: [13-03] All 3 Wave 3 falsifiers (#2/#3/#4) AGREE with Wave 2A's verdict that all 4 CONTEXT.md hypotheses are DEAD. #3 DEAD direct: zero pop_data_batch/_cv.wait/pthread_cond_wait frames in 760KB sanitizer log. #4 DEAD direct: 101 OOM events show global usage 15360→20045 bytes (30% warm-up bump in first 10 events) → plateau at 20045 for next 91 events; bounded steady-state, not monotonic accumulation. #2 DEAD via Wave 2A subsumption (no partition.cpp frame in FIRST-error backtrace); direct falsifier INCONCLUSIVE due to MCP env-passing limitation + probe coverage gap. #1 SKIPPED per RESEARCH ranking. Overall Corroboration: AGREE.
 - [Phase 13]: [13-03] MCP env-passing limitation reconfirmed at Wave 3: unit-tests command accepts only filter= per list_commands schema; cannot propagate SIRIUS_LOG_LEVEL=debug. Cheap repro doesn't fire bug on consumer 2 x RTX 6000 Ada host (peer-DMA host-staged; same Wave 1 anomaly). Existing [mgpu-probe] coverage at host_parquet_to_gpu + prepare_for_processing only — NOT at sirius_physical_partition::execute despite stale claim in project_phase08_fu17.md. Recommended follow-ups (out of Phase 13 scope): extend MCP wrapper for env passthrough; add partition-execute probe; refresh memory entry.
 - [Phase 13]: [13-03] Wave 4 fix scope unambiguously bounded by combining 13-race-site.txt + 13-falsifiers.txt: cucascade-side gpu_table_representation extension with set_writer_event/get_writer_event accessor + cudaStreamWaitEvent in convert_gpu_to_gpu before peer copies; submodule bump REQUIRED. No need to investigate cuco lifecycle, partition sibling state, pop_data_batch CV, or reservation tracker as primary causes — all DEAD.
+- [Phase 13]: [13-04] PARTIAL fix: cucascade pin bumped to 7409c60 (writer-event lineage in convert_gpu_to_gpu) + 7 Sirius producer sites migrated to make_data_batch(writer_stream) overload. Sanitizer 433->328 errors (24% reduction); Q11-alone PASS (9011 assertions, 7s); Q1-Q22 cumulative under SCHED-RR STILL SIGTERMs at Q11 (1800s timeout). ~22 producer sites remain un-migrated (left_delim_join::sink confirmed; compute_task generic-frame writers unconfirmed). Plan 13-05 needed to complete migration. Phase 14 BLOCKED until 13-05 closes residual writer-event coverage gap.
 
 ## Accumulated Context
 
@@ -162,9 +164,10 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 - **[v1.2 SHIP BLOCKER — 08-06]** Residual `cudaErrorInvalidValue @ cuda_memcpy.cu:42` on num_gpus=2 parquet path. Failing tests: `gpu_execution hive partition - filter on data column` and `gpu_execution - TPC-H Query 1 parquet`. The 08-06 carryover fix at `convert_host_parquet_to_gpu_with_prefetched_data_source` (Pattern 2 idiom mirroring 08-02 Branch B template) was applied and build+HYG pass, but the same bug signature persists — indicating at least one additional fix-site. 4 hypothesis candidates and concrete suggested next actions documented in `.planning/phases/08-multi-gpu-sql-pipeline-fix/08-06-VALIDATION.md` "Open Issue — Residual Carryover-Fix Incompleteness" section. Blocks ROADMAP criteria 1 + 2 + 4 + 6 (criteria 3 + 5 pass as static invariants).
 - **Integration fixture scope:** TPC-H fixture currently hard-codes `num_gpus: 1` via `setenv` inside the test fixture. Flipping globally may uncover other multi-GPU bugs not exposed by the unit-test suite today. Phase 8 plans should parameterize TPC-H specifically (per TEST-01) rather than flip the default globally — the parameterization approach is what AUDIT-03 requires anyway (2-GPU variant MUST execute in default unit-tests run, but the 1-GPU variant need not be removed).
 - **[v1.2 SHIP BLOCKER — 09-04 CRIT-2]** `SELECT * FROM gpu_execution("...")` TABLE_FUNCTION-form materialization path SIGSEGVs in unit tests (both 1-GPU and 2-GPU envs). The `CALL gpu_execution("...")` PROCEDURE-form works fine — SF100 Q1 num_gpus=2 ship-gate PASSES with byte-identical result vs 1-GPU baseline and disjoint cross-GPU batch dispatch. Distributor fixes (Plans 09-01/02/03) are all proven correct at runtime (`preferred_device_id=-1` count=0, cross-GPU intersection=0 at SF100 scale). Regression scoped to Phase 10: bisect across commits `3b58258`/`863cc6c`/`0c8068e`/`a8a7985`/`c0e12f3` + gdb on `gpu_execution - filter equality parquet` test. See `.planning/phases/09-scan-task-distributor-batch-ownership-affinity/09-04-VALIDATION.md` Open Issue section H1-H4 (H2 TABLE_FUNCTION vs CALL-form result shaping is the leading hypothesis).
+- **[v1.3 SHIP BLOCKER — 13-04 PARTIAL]** Phase 13-04 landed cucascade writer-event lineage infrastructure (`cucascade @ 7409c60`) and migrated 7 Sirius producer sites to `make_data_batch(table, mem_space, writer_stream)`. Sanitizer error count dropped 433 → 328 (24% reduction); Q11-alone PASSES (9011 assertions, 7s). However, **Q1-Q22 cumulative under SCHED-RR STILL SIGTERMs at Q11 (1800s timeout)** — the cumulative-state hang persists. ~22 producer sites remain un-migrated (e.g. `sirius_physical_left_delim_join::sink` confirmed; many `compute_task` generic-frame writers unconfirmed). **Plan 13-05 needed** to complete the writer-event migration; Phase 14 (SCHED-RR distribution) BLOCKED until Plan 13-05 closes residual coverage. Audit recipe: `grep -rn "make_data_batch\\|std::make_shared<cucascade::data_batch>\\|std::make_unique<cucascade::gpu_table_representation>" src/`. Detail: `.planning/phases/13-q11-multi-gpu-illegal-address/13-04-SUMMARY.md`.
 
 ## Session Continuity
 
-Last session: 2026-04-30T02:31:49.859Z
-Stopped at: Completed 13-03: 3 falsifiers AGREE with 13-02; all 4 hypotheses DEAD; Wave 4 unblocked with single-valued fix scope (cucascade gpu_table_representation writer-event extension).
+Last session: 2026-04-30T07:30:07.395Z
+Stopped at: Completed 13-04 PARTIAL: cucascade writer-event lineage landed + 7 producers migrated; Q11 cumulative-state under SCHED-RR still hangs (sanitizer 433->328); ~22 producer sites remain — Plan 13-05 needed.
 Resume file: None
