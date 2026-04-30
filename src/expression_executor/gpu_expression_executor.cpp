@@ -321,10 +321,14 @@ std::shared_ptr<data_batch> gpu_expression_executor::execute(
   }
 
   // Create the data representation
-  std::unique_ptr<cucascade::idata_representation> output_data_rep =
-    std::make_unique<cucascade::gpu_table_representation>(
-      std::make_unique<cudf::table>(std::move(_output_columns), _stream, _mr),
-      *input_batch->get_memory_space());
+  // STREAM-LINEAGE: cudf::table ctor + cast/expression kernels write on
+  // `_stream`; record the writer event for downstream cross-device readers
+  // (Phase 13-02).
+  auto output_repr = std::make_unique<cucascade::gpu_table_representation>(
+    std::make_unique<cudf::table>(std::move(_output_columns), _stream, _mr),
+    *input_batch->get_memory_space());
+  output_repr->record_writer_event(_stream);
+  std::unique_ptr<cucascade::idata_representation> output_data_rep = std::move(output_repr);
 
   // Create the data batch and return
   auto const batch_id = ::sirius::get_next_batch_id();
@@ -344,9 +348,12 @@ std::shared_ptr<data_batch> gpu_expression_executor::select(std::shared_ptr<data
 
   // Apply the boolean mask to filter the input batch
   auto output_table = cudf::apply_boolean_mask(_input_table, mask_view, _stream, _mr);
-  std::unique_ptr<cucascade::idata_representation> output_data_rep =
-    std::make_unique<cucascade::gpu_table_representation>(std::move(output_table),
-                                                          *input_batch->get_memory_space());
+  // STREAM-LINEAGE: cudf::apply_boolean_mask wrote on `_stream`; record the
+  // writer event for downstream cross-device readers (Phase 13-02).
+  auto output_repr = std::make_unique<cucascade::gpu_table_representation>(
+    std::move(output_table), *input_batch->get_memory_space());
+  output_repr->record_writer_event(_stream);
+  std::unique_ptr<cucascade::idata_representation> output_data_rep = std::move(output_repr);
 
   // Create the data batch and return
   auto const batch_id = ::sirius::get_next_batch_id();

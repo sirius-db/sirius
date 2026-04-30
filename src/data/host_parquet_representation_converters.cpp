@@ -198,8 +198,16 @@ convert_host_parquet_to_gpu_with_prefetched_data_source(
     table = std::make_unique<cudf::table>(std::move(projected_columns));
   }
 
-  return std::make_unique<cucascade::gpu_table_representation>(
+  // STREAM-LINEAGE: read_parquet + apply_post_convert + apply_partition_inject
+  // all wrote on `target_stream`. The target_stream.synchronize() above flushes
+  // their work in-stream order, but the target stream itself is the writer
+  // identity that any cross-device reader (cucascade::convert_gpu_to_gpu) must
+  // observe — record the writer event so the subsequent reader's
+  // cudaStreamWaitEvent receives a real ordering primitive (Phase 13-02).
+  auto repr = std::make_unique<cucascade::gpu_table_representation>(
     std::move(table), *const_cast<cucascade::memory::memory_space*>(target_memory_space));
+  repr->record_writer_event(target_stream);
+  return repr;
 }
 
 /**

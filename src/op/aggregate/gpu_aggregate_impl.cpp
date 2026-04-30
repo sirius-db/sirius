@@ -107,7 +107,11 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_ungrouped_aggre
   auto output_table = std::make_unique<cudf::table>(
     std::move(output_cols), stream, memory_space.get_default_allocator());
 
-  return make_data_batch(std::move(output_table), memory_space);
+  // STREAM-LINEAGE: record `stream` as the writer of `output_table` so any
+  // downstream cross-device reader (e.g. cucascade::convert_gpu_to_gpu) can
+  // wait on the writer event before peer-copying — closes the cross-mempool
+  // stream-ordered race localized in Phase 13-02.
+  return make_data_batch(std::move(output_table), memory_space, stream);
 }
 
 std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggregate(
@@ -313,7 +317,9 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   // Create the output data batch
   auto output_table = std::make_unique<cudf::table>(
     std::move(output_cols), stream, memory_space.get_default_allocator());
-  return make_data_batch(std::move(output_table), memory_space);
+  // STREAM-LINEAGE: record `stream` as the writer of `output_table` (Phase 13-02
+  // race site fix — see make_data_batch overload doc).
+  return make_data_batch(std::move(output_table), memory_space, stream);
 }
 
 }  // namespace op
