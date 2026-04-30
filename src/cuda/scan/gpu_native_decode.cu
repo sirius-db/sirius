@@ -18,14 +18,14 @@
 // GPU-native decode dispatcher.
 //
 // Top-down structure of this file:
-//   1. Validity-mask kernels (fill all-valid; popcount valid bits).
-//   2. CONSTANT broadcast (cudf::type_dispatcher → typed kernel).
-//   3. UNCOMPRESSED data copy (single-segment DMA fast path; multi-segment
+//   1. CONSTANT broadcast (cudf::type_dispatcher → typed kernel).
+//   2. UNCOMPRESSED data copy (single-segment DMA fast path; multi-segment
 //      batched-memcpy kernel).
-//   4. Per-run dispatcher switches (data, validity).
-//   5. Per-column helpers (decode_column_data, decode_column_validity).
-//   6. Public `gpu_decode_table` entry — drives the per-column loop, then
-//      issues a single stream sync + bulk D2H readback for null counts.
+//   3. Per-run dispatcher switches (data, validity).
+//   4. Per-column helpers (decode_column_data, decode_column_validity).
+//   5. Public `gpu_decode_table` entry — drives the per-column loop, then
+//      issues one batched cudf::batch_null_count to compute every null mask's
+//      null count in a single call.
 //
 // Kernel-launch errors are caught at the end via `cudaPeekAtLastError`;
 // every synchronous CUDA API call is individually wrapped in `RMM_CUDA_TRY`.
@@ -57,20 +57,16 @@ namespace sirius::cuda::scan {
 
 namespace {
 
-/// Block dim used by every kernel in this file. The popcount kernel's
-/// shared-mem reduction width is hard-coded to this value; a `static_assert`
-/// inside the kernel guards the coupling.
+/// Block dim used by every kernel in this file. Arch-portable (a multiple
+/// of warp size on every supported arch).
 constexpr uint32_t BLOCK_DIM = 256;
 
-/// Block-count cap for the popcount kernel. Past this point we'd just be
-/// adding scheduling cost — the kernel grid-strides over the remainder.
-/// Sized to saturate the SM count of the smallest target arch.
-constexpr uint32_t MAX_POPCOUNT_BLOCKS = 512;
-
-/// Maximum bytes one block of `kernel_batched_memcpy` will copy. Splitting
-/// large segments into chunks of this size keeps per-block work uniform so
-/// the grid doesn't end up with stragglers. Tuned empirically; if you change
-/// it, re-run the [!benchmark][scan][decode] cases.
+/// Maximum bytes one block of `kernel_batched_memcpy` will copy.
+///
+/// Tuned empirically on Turing (sm_75); the kernels themselves are
+/// arch-portable, but the chunk size that maximises bandwidth varies with
+/// L2 capacity and DRAM scheduling. If you target Ampere/Hopper as the
+/// primary, re-run the [!benchmark][scan][decode] cases and update this.
 constexpr uint32_t COPY_CHUNK_BYTES = 64u << 10;
 
 /// `cudf::size_type` is signed int32. Catch a `total_rows` overflow before
@@ -79,58 +75,31 @@ constexpr uint32_t MAX_ROWS_PER_COLUMN =
   static_cast<uint32_t>(std::numeric_limits<cudf::size_type>::max());
 
 //===----------------------------------------------------------------------===//
-// Validity mask kernels.
-//===----------------------------------------------------------------------===//
-
-/// Initialises the bitmask to all-valid. Validity segments later overlay
-/// their bytes onto specific row ranges; rows that no segment covers stay
-/// implicit-valid.
-__global__ void kernel_fill_valid(uint64_t* mask, uint32_t num_words)
-{
-  uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < num_words) mask[idx] = ~0ULL;
-}
-
-/// Counts set bits in `mask[0..num_words)` and atomic-adds the total into
-/// `*d_valid_count`. The caller must zero `*d_valid_count` before launch.
-///
-/// The last word may contain padding bits past `total_rows`; those are
-/// masked out so they don't inflate the count.
-__global__ void kernel_count_valid_bits(uint64_t const* __restrict__ mask,
-                                        uint32_t num_words,
-                                        uint32_t total_rows,
-                                        uint32_t* __restrict__ d_valid_count)
-{
-  static_assert(BLOCK_DIM == 256, "shared-mem reduction width is hard-coded to 256");
-  __shared__ uint32_t s_counts[BLOCK_DIM];
-  uint32_t tid    = blockIdx.x * blockDim.x + threadIdx.x;
-  uint32_t stride = gridDim.x * blockDim.x;
-  uint32_t valid  = 0;
-  for (uint32_t i = tid; i < num_words; i += stride) {
-    uint64_t word = mask[i];
-    if (i == num_words - 1) {
-      uint32_t tail = total_rows & 63;
-      if (tail > 0) word &= (1ULL << tail) - 1;
-    }
-    valid += __popcll(word);
-  }
-  s_counts[threadIdx.x] = valid;
-  __syncthreads();
-  for (uint32_t s = blockDim.x / 2; s > 0; s >>= 1) {
-    if (threadIdx.x < s) s_counts[threadIdx.x] += s_counts[threadIdx.x + s];
-    __syncthreads();
-  }
-  if (threadIdx.x == 0) atomicAdd(d_valid_count, s_counts[0]);
-}
-
-//===----------------------------------------------------------------------===//
 // CONSTANT broadcast.
 //
-// We do NOT use `cudf::make_column_from_scalar` here. That path does a D2H
-// `device_scalar::value(stream)` read internally to feed `thrust::fill_n`,
-// which would add one synchronisation per CONSTANT segment. Our value is
-// already on device; the kernel below dereferences the device pointer
-// directly so the broadcast stays stream-async.
+// The constant value arrives as raw bytes already on device (the I/O layer
+// staged them there). The kernel below dereferences the device pointer on
+// every thread and writes it across the column.
+//
+// The cudf-native alternative is `cudf::make_column_from_scalar`. We don't
+// use it because its fill path does ≥3 D2H syncs per call (verified against
+// libcudf source on the version we link). Each sync answers a question that
+// our code does not need to ask:
+//   - column_factories.cu:30  `is_valid(stream)` — "is the whole scalar
+//                              NULL?". For us, per-row nullness lives in the
+//                              `validity` runs; a CONSTANT segment always
+//                              carries a real value.
+//   - fill.cu:41              `value(stream)`    — "host T for thrust::fill_n".
+//                              We bypass thrust and dereference the device
+//                              pointer on every thread instead.
+//   - fill.cu:42              `is_valid(stream)` — "validity iterator for
+//                              copy_range". Not applicable; we don't go
+//                              through copy_range.
+//
+// We keep one safety check cudf can skip: the segment-size guard in
+// `decode_constant_data` rejects bytes_size < type_size. cudf's scalar
+// storage is sized at construction; our segment bytes are external input
+// that has to be checked.
 //===----------------------------------------------------------------------===//
 
 /// Reads a single value from `*src` (already on device) and writes it to
@@ -419,37 +388,26 @@ rmm::device_buffer decode_column_data(gpu_column_decode_input const& col,
   return data_buf;
 }
 
-/// Allocates the null mask (sized for `total_rows`), pre-fills it all-valid,
-/// then overlays each validity codec_run onto it. The popcount kernel writes
-/// the live count into `*d_valid_count_slot`; the public entry reads all
-/// slots back together after a single stream sync.
+/// Builds the column's null mask: starts from an all-valid bitmask, then
+/// overlays each validity codec_run onto it. Null counting is deferred to a
+/// single batched `cudf::batch_null_count` call in `gpu_decode_table`.
 ///
-/// Returns an empty buffer when the column has no nulls or no rows; in that
-/// case the slot is left untouched and the public entry skips reading it.
+/// Returns an empty buffer when the column has no nulls or no rows.
 rmm::device_buffer decode_column_validity(gpu_column_decode_input const& col,
-                                          uint32_t* d_valid_count_slot,
                                           rmm::cuda_stream_view stream,
                                           rmm::device_async_resource_ref mr)
 {
   if (!col.has_nulls || col.total_rows == 0) return rmm::device_buffer{};
 
-  size_t mask_bytes =
-    cudf::bitmask_allocation_size_bytes(static_cast<cudf::size_type>(col.total_rows));
-  rmm::device_buffer null_mask(mask_bytes, stream, mr);
-  uint32_t num_words = static_cast<uint32_t>((col.total_rows + 63) / 64);
-  auto* d_mask_words = static_cast<uint64_t*>(null_mask.data());
-
-  uint32_t fill_blocks = (num_words + BLOCK_DIM - 1) / BLOCK_DIM;
-  kernel_fill_valid<<<fill_blocks, BLOCK_DIM, 0, stream.value()>>>(d_mask_words, num_words);
+  // create_null_mask gives us a buffer pre-filled with all-1s, sized to
+  // cudf's bitmask layout (Arrow-compatible 64-byte padding). Validity
+  // segments overwrite specific byte ranges below; rows no segment covers
+  // remain implicitly valid.
+  rmm::device_buffer null_mask = cudf::create_null_mask(
+    static_cast<cudf::size_type>(col.total_rows), cudf::mask_state::ALL_VALID, stream, mr);
   for (auto const& run : col.validity) {
     dispatch_validity_run(run, static_cast<uint8_t*>(null_mask.data()), stream);
   }
-
-  RMM_CUDA_TRY(cudaMemsetAsync(d_valid_count_slot, 0, sizeof(uint32_t), stream.value()));
-  uint32_t cnt_blocks =
-    std::min(MAX_POPCOUNT_BLOCKS, std::max(1u, (num_words + BLOCK_DIM - 1) / BLOCK_DIM));
-  kernel_count_valid_bits<<<cnt_blocks, BLOCK_DIM, 0, stream.value()>>>(
-    d_mask_words, num_words, col.total_rows, d_valid_count_slot);
   return null_mask;
 }
 
@@ -464,64 +422,50 @@ std::unique_ptr<cudf::table> gpu_decode_table(std::vector<gpu_column_decode_inpu
                                               rmm::device_async_resource_ref mr)
 {
   size_t num_cols = cols.size();
+  if (num_cols == 0) {
+    return std::make_unique<cudf::table>(std::vector<std::unique_ptr<cudf::column>>{});
+  }
 
-  // Deferred-readback bookkeeping. Each null-bearing column gets one device
-  // uint32 that the popcount kernel atomic-adds into. After all per-column
-  // work is queued we sync once and read every slot back in a single D2H —
-  // the alternative is one sync per column, which would serialise the work.
-  //
-  //   null_idx     : indices (into `cols`) of columns with has_nulls=true.
-  //   col_to_slot  : reverse map from column index to slot index, -1 if the
-  //                  column has no nulls.
-  std::vector<size_t> null_idx;
-  for (size_t i = 0; i < num_cols; ++i)
-    if (cols[i].has_nulls) null_idx.push_back(i);
-  rmm::device_uvector<uint32_t> d_valid_counts_buf(null_idx.size(), stream, mr);
-  uint32_t* d_valid_counts = null_idx.empty() ? nullptr : d_valid_counts_buf.data();
-  std::vector<int> col_to_slot(num_cols, -1);
-  for (size_t i = 0; i < null_idx.size(); ++i)
-    col_to_slot[null_idx[i]] = static_cast<int>(i);
+  // A `gpu_decode_table` call decodes one row-group slice — every column
+  // covers the same row range. `cudf::batch_null_count` (used below to
+  // compute null counts in one batched call) takes a single uniform
+  // [start, stop), so this is the natural place to enforce the invariant.
+  uint32_t common_rows = cols[0].total_rows;
+  for (size_t ci = 1; ci < num_cols; ++ci) {
+    if (cols[ci].total_rows != common_rows) {
+      throw std::runtime_error("gpu_decode_table: all columns must share the same total_rows");
+    }
+  }
 
   std::vector<rmm::device_buffer> data_bufs;
   std::vector<rmm::device_buffer> null_masks;
   data_bufs.reserve(num_cols);
   null_masks.reserve(num_cols);
-
   for (size_t ci = 0; ci < num_cols; ++ci) {
-    auto const& col = cols[ci];
-    data_bufs.emplace_back(decode_column_data(col, ci, stream, mr));
-
-    uint32_t* slot = (col_to_slot[ci] >= 0) ? d_valid_counts + col_to_slot[ci] : nullptr;
-    null_masks.emplace_back(decode_column_validity(col, slot, stream, mr));
+    data_bufs.emplace_back(decode_column_data(cols[ci], ci, stream, mr));
+    null_masks.emplace_back(decode_column_validity(cols[ci], stream, mr));
   }
 
-  // Bulk D2H of all valid-count slots, then one stream sync for the whole
-  // batch — both the kernel work and this memcpy land before we proceed.
-  std::vector<uint32_t> h_valid_counts(null_idx.size(), 0);
-  if (!null_idx.empty()) {
-    RMM_CUDA_TRY(cudaMemcpyAsync(h_valid_counts.data(),
-                                 d_valid_counts,
-                                 null_idx.size() * sizeof(uint32_t),
-                                 cudaMemcpyDeviceToHost,
-                                 stream.value()));
+  // One batched popcount across every null mask in the table. Columns that
+  // didn't allocate a mask (no nulls or zero rows) pass nullptr; cudf's
+  // batch_null_count returns 0 for those without launching kernel work for
+  // them. The call also performs the single D2H sync we need before
+  // building the cudf::table.
+  std::vector<cudf::bitmask_type const*> mask_ptrs(num_cols, nullptr);
+  for (size_t ci = 0; ci < num_cols; ++ci) {
+    mask_ptrs[ci] = static_cast<cudf::bitmask_type const*>(null_masks[ci].data());
   }
-  RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+  std::vector<cudf::size_type> null_counts =
+    cudf::batch_null_count(mask_ptrs, 0, static_cast<cudf::size_type>(common_rows), stream);
 
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.reserve(num_cols);
   for (size_t ci = 0; ci < num_cols; ++ci) {
-    auto const& col            = cols[ci];
-    cudf::size_type null_count = 0;
-    // `decode_column_validity` skips writing the slot when total_rows == 0,
-    // so don't read it in that case.
-    if (col_to_slot[ci] >= 0 && col.total_rows > 0) {
-      null_count = static_cast<cudf::size_type>(col.total_rows - h_valid_counts[col_to_slot[ci]]);
-    }
-    columns.push_back(std::make_unique<cudf::column>(col.out_type,
-                                                     static_cast<cudf::size_type>(col.total_rows),
+    columns.push_back(std::make_unique<cudf::column>(cols[ci].out_type,
+                                                     static_cast<cudf::size_type>(common_rows),
                                                      std::move(data_bufs[ci]),
                                                      std::move(null_masks[ci]),
-                                                     null_count));
+                                                     null_counts[ci]));
   }
 
   // Catch any sticky kernel-launch error from the work above. Synchronous
