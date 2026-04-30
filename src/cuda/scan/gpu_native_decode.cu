@@ -361,18 +361,17 @@ void dispatch_validity_run(gpu_codec_run const& run, uint8_t* d_mask, rmm::cuda_
 /// Allocates the column's data buffer, validates type metadata, and runs
 /// every codec_run in `col.data` into the buffer.
 rmm::device_buffer decode_column_data(gpu_column_decode_input const& col,
-                                      size_t column_index,
                                       rmm::cuda_stream_view stream,
                                       rmm::device_async_resource_ref mr)
 {
-  if (col.total_rows > MAX_ROWS_PER_COLUMN) {
-    throw std::runtime_error("gpu_decode_table: column " + std::to_string(column_index) + " has " +
-                             std::to_string(col.total_rows) + " rows > cudf::size_type max");
-  }
-  // Refuse non-fixed-width types here — `cudf::size_of` itself throws on
+  // Refuse non-fixed-width types up front — `cudf::size_of` itself throws on
   // strings/lists/structs, so the diagnostic must fire before we call it.
-  // Also catches DuckDB → cudf type narrowing (e.g. HUGEINT → INT64) where
-  // the cudf physical width would not match the segment bytes.
+  //
+  // This is NOT a catch-all for DuckDB → cudf type narrowing. A HUGEINT that
+  // upstream maps to INT64 still satisfies `is_fixed_width`; the resulting
+  // 8-byte stride would mismatch the 16-byte segment layout. The viability
+  // walker upstream is responsible for refusing those columns; this throw
+  // only catches the obvious cases (variable-width types).
   if (!cudf::is_fixed_width(col.out_type)) {
     throw std::runtime_error(
       "gpu_decode_table: viability invariant violated — non-fixed-width type id " +
@@ -392,12 +391,16 @@ rmm::device_buffer decode_column_data(gpu_column_decode_input const& col,
 /// overlays each validity codec_run onto it. Null counting is deferred to a
 /// single batched `cudf::batch_null_count` call in `gpu_decode_table`.
 ///
-/// Returns an empty buffer when the column has no nulls or no rows.
+/// Returns an empty buffer when the column has no rows, doesn't carry nulls,
+/// or carries no validity runs (the empty buffer signals "no nulls" downstream
+/// and avoids an unnecessary mask allocation + popcount).
 rmm::device_buffer decode_column_validity(gpu_column_decode_input const& col,
                                           rmm::cuda_stream_view stream,
                                           rmm::device_async_resource_ref mr)
 {
-  if (!col.has_nulls || col.total_rows == 0) return rmm::device_buffer{};
+  if (!col.has_nulls || col.total_rows == 0 || col.validity.empty()) {
+    return rmm::device_buffer{};
+  }
 
   // create_null_mask gives us a buffer pre-filled with all-1s, sized to
   // cudf's bitmask layout (Arrow-compatible 64-byte padding). Validity
@@ -436,13 +439,19 @@ std::unique_ptr<cudf::table> gpu_decode_table(std::vector<gpu_column_decode_inpu
       throw std::runtime_error("gpu_decode_table: all columns must share the same total_rows");
     }
   }
+  // `cudf::size_type` is signed int32. With uniformity established above,
+  // one check covers every column.
+  if (common_rows > MAX_ROWS_PER_COLUMN) {
+    throw std::runtime_error("gpu_decode_table: total_rows (" + std::to_string(common_rows) +
+                             ") > cudf::size_type max");
+  }
 
   std::vector<rmm::device_buffer> data_bufs;
   std::vector<rmm::device_buffer> null_masks;
   data_bufs.reserve(num_cols);
   null_masks.reserve(num_cols);
   for (size_t ci = 0; ci < num_cols; ++ci) {
-    data_bufs.emplace_back(decode_column_data(cols[ci], ci, stream, mr));
+    data_bufs.emplace_back(decode_column_data(cols[ci], stream, mr));
     null_masks.emplace_back(decode_column_validity(cols[ci], stream, mr));
   }
 

@@ -19,23 +19,23 @@
 #include <cudf/column/column.hpp>
 #include <cudf/types.hpp>
 
-#include <rmm/cuda_stream.hpp>
-#include <rmm/mr/cuda_async_memory_resource.hpp>
-
 #include <catch.hpp>
 #include <duckdb/common/enums/compression_type.hpp>
 
 #include <cstdint>
+#include <limits>
 #include <numeric>
 #include <vector>
 
 using duckdb::CompressionType;
 using sirius::cuda::scan::gpu_column_decode_input;
-using sirius::cuda::scan::gpu_decode_table;
 using sirius::cuda::scan::gpu_segment_desc;
+using sirius::test::decode::decode_env;
 using sirius::test::decode::download;
 using sirius::test::decode::one_codec_column;
 using sirius::test::decode::pack_validity;
+using sirius::test::decode::require_constant_broadcast;
+using sirius::test::decode::require_uncompressed_roundtrip;
 using sirius::test::decode::segment;
 using sirius::test::decode::upload;
 
@@ -49,37 +49,39 @@ auto const DEC128 =
   cudf::data_type{cudf::type_id::DECIMAL128, /*scale=*/-2};  // 16-byte physical width
 }  // namespace
 
-TEST_CASE("gpu_decode_table - empty input yields empty table", "[scan][decode]")
+TEST_CASE_METHOD(decode_env, "gpu_decode_table - empty input yields empty table", "[scan][decode]")
 {
-  rmm::cuda_stream stream;
-  rmm::mr::cuda_async_memory_resource mr;
-  auto t = gpu_decode_table({}, stream.view(), &mr);
+  auto t = decode({});
   REQUIRE(t->num_columns() == 0);
   REQUIRE(t->num_rows() == 0);
 }
 
-TEST_CASE("gpu_decode_table - UNCOMPRESSED single segment int32", "[scan][decode]")
+TEST_CASE_METHOD(decode_env,
+                 "gpu_decode_table - UNCOMPRESSED single segment int32",
+                 "[scan][decode]")
 {
-  rmm::cuda_stream stream;
-  rmm::mr::cuda_async_memory_resource mr;
   std::vector<int32_t> values(1024);
   std::iota(values.begin(), values.end(), -512);
-  auto d = upload(values, stream.view());
-
-  auto col = one_codec_column(
-    I32, values.size(), CompressionType::COMPRESSION_UNCOMPRESSED, {segment(d, 0, values.size())});
-  auto t = gpu_decode_table({col}, stream.view(), &mr);
-
-  REQUIRE(t->num_rows() == static_cast<cudf::size_type>(values.size()));
-  REQUIRE(t->get_column(0).null_count() == 0);
-  REQUIRE(download<int32_t>(
-            t->get_column(0).view().data<int32_t>(), values.size(), stream.value()) == values);
+  require_uncompressed_roundtrip(*this, I32, values);
 }
 
-TEST_CASE("gpu_decode_table - UNCOMPRESSED multi-segment int64", "[scan][decode]")
+TEST_CASE_METHOD(decode_env, "gpu_decode_table - UNCOMPRESSED float", "[scan][decode]")
 {
-  rmm::cuda_stream stream;
-  rmm::mr::cuda_async_memory_resource mr;
+  require_uncompressed_roundtrip<float>(*this, F32, {1.5f, -2.25f, 3.75f, 0.0f, -1.0f});
+}
+
+TEST_CASE_METHOD(decode_env, "gpu_decode_table - UNCOMPRESSED double", "[scan][decode]")
+{
+  require_uncompressed_roundtrip<double>(*this, F64, {1.5, -2.25, 3.75, 0.0, -1.0});
+}
+
+TEST_CASE_METHOD(decode_env,
+                 "gpu_decode_table - UNCOMPRESSED multi-segment int64",
+                 "[scan][decode]")
+{
+  // Two segments tiling the column [0..800) and [800..2000). The dispatcher's
+  // multi-segment path (batched-memcpy kernel) handles this differently from
+  // the single-segment fast path, so it gets its own test.
   std::vector<int64_t> a(800), b(1200);
   std::iota(a.begin(), a.end(), 0);
   std::iota(b.begin(), b.end(), 800);
@@ -90,7 +92,7 @@ TEST_CASE("gpu_decode_table - UNCOMPRESSED multi-segment int64", "[scan][decode]
                               CompressionType::COMPRESSION_UNCOMPRESSED,
                               {segment(da, 0, a.size()), segment(db, a.size(), b.size())});
 
-  auto t = gpu_decode_table({col}, stream.view(), &mr);
+  auto t = decode({col});
   auto out =
     download<int64_t>(t->get_column(0).view().data<int64_t>(), col.total_rows, stream.value());
   std::vector<int64_t> expected(a);
@@ -98,31 +100,8 @@ TEST_CASE("gpu_decode_table - UNCOMPRESSED multi-segment int64", "[scan][decode]
   REQUIRE(out == expected);
 }
 
-TEST_CASE("gpu_decode_table - UNCOMPRESSED float and double", "[scan][decode]")
+TEST_CASE_METHOD(decode_env, "gpu_decode_table - UNCOMPRESSED with nulls", "[scan][decode]")
 {
-  rmm::cuda_stream stream;
-  rmm::mr::cuda_async_memory_resource mr;
-  std::vector<float> fv  = {1.5f, -2.25f, 3.75f, 0.0f, -1.0f};
-  std::vector<double> dv = {1.5, -2.25, 3.75, 0.0, -1.0};
-  auto df                = upload(fv, stream.view());
-  auto dd                = upload(dv, stream.view());
-
-  std::vector<gpu_column_decode_input> cols = {
-    one_codec_column(
-      F32, fv.size(), CompressionType::COMPRESSION_UNCOMPRESSED, {segment(df, 0, fv.size())}),
-    one_codec_column(
-      F64, dv.size(), CompressionType::COMPRESSION_UNCOMPRESSED, {segment(dd, 0, dv.size())})};
-
-  auto t = gpu_decode_table(cols, stream.view(), &mr);
-  REQUIRE(download<float>(t->get_column(0).view().data<float>(), fv.size(), stream.value()) == fv);
-  REQUIRE(download<double>(t->get_column(1).view().data<double>(), dv.size(), stream.value()) ==
-          dv);
-}
-
-TEST_CASE("gpu_decode_table - UNCOMPRESSED with nulls", "[scan][decode]")
-{
-  rmm::cuda_stream stream;
-  rmm::mr::cuda_async_memory_resource mr;
   std::vector<int32_t> values = {10, 20, 30, 40, 50, 60, 70, 80};
   std::vector<bool> valid     = {true, true, false, true, false, false, true, true};
   auto valid_bytes            = pack_validity(valid);
@@ -137,7 +116,7 @@ TEST_CASE("gpu_decode_table - UNCOMPRESSED with nulls", "[scan][decode]")
   col.validity.push_back(
     {CompressionType::COMPRESSION_UNCOMPRESSED, {segment(d_validity, 0, values.size())}});
 
-  auto t = gpu_decode_table({col}, stream.view(), &mr);
+  auto t = decode({col});
   auto out =
     download<int32_t>(t->get_column(0).view().data<int32_t>(), values.size(), stream.value());
   REQUIRE(t->get_column(0).null_count() == 3);
@@ -145,12 +124,12 @@ TEST_CASE("gpu_decode_table - UNCOMPRESSED with nulls", "[scan][decode]")
     if (valid[i]) REQUIRE(out[i] == values[i]);
 }
 
-TEST_CASE("gpu_decode_table - UNCOMPRESSED multi-segment validity", "[scan][decode]")
+TEST_CASE_METHOD(decode_env,
+                 "gpu_decode_table - UNCOMPRESSED multi-segment validity",
+                 "[scan][decode]")
 {
   // Validity arrives as multiple byte-aligned runs; each segment's row_offset
   // is a multiple of 8, and runs cover disjoint row ranges.
-  rmm::cuda_stream stream;
-  rmm::mr::cuda_async_memory_resource mr;
   constexpr uint32_t N = 32;
   std::vector<int32_t> values(N);
   std::iota(values.begin(), values.end(), 0);
@@ -172,36 +151,32 @@ TEST_CASE("gpu_decode_table - UNCOMPRESSED multi-segment validity", "[scan][deco
   col.validity.push_back(
     {CompressionType::COMPRESSION_UNCOMPRESSED, {segment(d_va, 0, 16), segment(d_vb, 16, 16)}});
 
-  auto t            = gpu_decode_table({col}, stream.view(), &mr);
+  auto t            = decode({col});
   size_t null_count = 0;
   for (uint32_t i = 0; i < N; ++i)
     if (!all_valid[i]) ++null_count;
   REQUIRE(t->get_column(0).null_count() == static_cast<cudf::size_type>(null_count));
 }
 
-TEST_CASE("gpu_decode_table - CONSTANT single segment", "[scan][decode]")
+TEST_CASE_METHOD(decode_env, "gpu_decode_table - CONSTANT int32 single segment", "[scan][decode]")
 {
-  rmm::cuda_stream stream;
-  rmm::mr::cuda_async_memory_resource mr;
-  std::vector<int32_t> v = {42};
-  auto d                 = upload(v, stream.view());
-  auto col =
-    one_codec_column(I32, 2048, CompressionType::COMPRESSION_CONSTANT, {segment(d, 0, 2048)});
-  auto t   = gpu_decode_table({col}, stream.view(), &mr);
-  auto out = download<int32_t>(t->get_column(0).view().data<int32_t>(), 2048, stream.value());
-  for (auto x : out)
-    REQUIRE(x == 42);
+  require_constant_broadcast<int32_t>(*this, I32, /*value=*/42, /*rows=*/2048);
 }
 
-TEST_CASE("gpu_decode_table - CONSTANT multi-segment different values", "[scan][decode]")
+TEST_CASE_METHOD(decode_env, "gpu_decode_table - CONSTANT double", "[scan][decode]")
 {
-  rmm::cuda_stream stream;
-  rmm::mr::cuda_async_memory_resource mr;
+  require_constant_broadcast<double>(*this, F64, /*value=*/3.14159, /*rows=*/100);
+}
+
+TEST_CASE_METHOD(decode_env,
+                 "gpu_decode_table - CONSTANT multi-segment different values",
+                 "[scan][decode]")
+{
   std::vector<int64_t> va = {7}, vb = {-3};
   auto da = upload(va, stream.view()), db = upload(vb, stream.view());
   auto col = one_codec_column(
     I64, 1500, CompressionType::COMPRESSION_CONSTANT, {segment(da, 0, 800), segment(db, 800, 700)});
-  auto t   = gpu_decode_table({col}, stream.view(), &mr);
+  auto t   = decode({col});
   auto out = download<int64_t>(t->get_column(0).view().data<int64_t>(), 1500, stream.value());
   for (size_t i = 0; i < 800; ++i)
     REQUIRE(out[i] == 7);
@@ -209,27 +184,13 @@ TEST_CASE("gpu_decode_table - CONSTANT multi-segment different values", "[scan][
     REQUIRE(out[i] == -3);
 }
 
-TEST_CASE("gpu_decode_table - CONSTANT double type", "[scan][decode]")
-{
-  rmm::cuda_stream stream;
-  rmm::mr::cuda_async_memory_resource mr;
-  std::vector<double> v = {3.14159};
-  auto d                = upload(v, stream.view());
-  auto col =
-    one_codec_column(F64, 100, CompressionType::COMPRESSION_CONSTANT, {segment(d, 0, 100)});
-  auto t   = gpu_decode_table({col}, stream.view(), &mr);
-  auto out = download<double>(t->get_column(0).view().data<double>(), 100, stream.value());
-  for (auto x : out)
-    REQUIRE(x == Approx(3.14159));
-}
-
-TEST_CASE("gpu_decode_table - CONSTANT 16-byte decimal128 (scalar fallback path)", "[scan][decode]")
+TEST_CASE_METHOD(decode_env,
+                 "gpu_decode_table - CONSTANT 16-byte decimal128 (scalar fallback path)",
+                 "[scan][decode]")
 {
   // Exercises the kernel's `else` branch (sizeof(T) > 8) — the int4 vectorized
   // path is gated on sizeof(T) <= 8. Compared as raw bytes so the test does
   // not depend on cudf's decimal128 type-check on .data<T>().
-  rmm::cuda_stream stream;
-  rmm::mr::cuda_async_memory_resource mr;
   std::vector<uint8_t> pattern(16);
   for (uint32_t i = 0; i < 16; ++i)
     pattern[i] = static_cast<uint8_t>(0xA0u + i);
@@ -238,7 +199,7 @@ TEST_CASE("gpu_decode_table - CONSTANT 16-byte decimal128 (scalar fallback path)
   constexpr uint32_t ROWS = 257;
   auto col                = one_codec_column(
     DEC128, ROWS, CompressionType::COMPRESSION_CONSTANT, {segment(d_val, 0, ROWS)});
-  auto t = gpu_decode_table({col}, stream.view(), &mr);
+  auto t = decode({col});
 
   auto bytes = download<uint8_t>(
     static_cast<uint8_t const*>(t->get_column(0).view().head()), ROWS * 16, stream.value());
@@ -247,10 +208,8 @@ TEST_CASE("gpu_decode_table - CONSTANT 16-byte decimal128 (scalar fallback path)
       REQUIRE(bytes[r * 16 + i] == pattern[i]);
 }
 
-TEST_CASE("gpu_decode_table - mixed codecs across columns", "[scan][decode]")
+TEST_CASE_METHOD(decode_env, "gpu_decode_table - mixed codecs across columns", "[scan][decode]")
 {
-  rmm::cuda_stream stream;
-  rmm::mr::cuda_async_memory_resource mr;
   std::vector<int32_t> a(500), b(500);
   std::iota(a.begin(), a.end(), 0);
   std::iota(b.begin(), b.end(), 500);
@@ -267,7 +226,7 @@ TEST_CASE("gpu_decode_table - mixed codecs across columns", "[scan][decode]")
     one_codec_column(I64, 1000, CompressionType::COMPRESSION_CONSTANT, {segment(dk, 0, 1000)}),
     one_codec_column(F64, 1000, CompressionType::COMPRESSION_UNCOMPRESSED, {segment(dd, 0, 1000)})};
 
-  auto t = gpu_decode_table(cols, stream.view(), &mr);
+  auto t = decode(cols);
   REQUIRE(t->num_columns() == 3);
   auto o0 = download<int32_t>(t->get_column(0).view().data<int32_t>(), 1000, stream.value());
   auto o1 = download<int64_t>(t->get_column(1).view().data<int64_t>(), 1000, stream.value());
@@ -279,41 +238,35 @@ TEST_CASE("gpu_decode_table - mixed codecs across columns", "[scan][decode]")
   }
 }
 
-TEST_CASE("gpu_decode_table - throws on unsupported codec", "[scan][decode]")
+TEST_CASE_METHOD(decode_env, "gpu_decode_table - throws on unsupported codec", "[scan][decode]")
 {
-  rmm::cuda_stream stream;
-  rmm::mr::cuda_async_memory_resource mr;
   std::vector<int32_t> dummy = {0};
   auto d                     = upload(dummy, stream.view());
-  // BITPACKING is a real DuckDB codec that this dispatcher doesn't yet
-  // implement — picking it gives us a concrete "unimplemented codec" path
-  // without inventing a fake enum.
+  // BITPACKING is a real DuckDB codec the dispatcher doesn't yet implement —
+  // picking it gives us a concrete "unimplemented codec" path without
+  // inventing a fake enum.
   auto col = one_codec_column(I32, 1, CompressionType::COMPRESSION_BITPACKING, {segment(d, 0, 1)});
 
-  REQUIRE_THROWS_WITH(gpu_decode_table({col}, stream.view(), &mr),
-                      Catch::Contains("viability invariant violated"));
+  REQUIRE_THROWS_WITH(decode({col}), Catch::Contains("viability invariant violated"));
 }
 
-TEST_CASE("gpu_decode_table - throws on non-fixed-width type", "[scan][decode]")
+TEST_CASE_METHOD(decode_env, "gpu_decode_table - throws on non-fixed-width type", "[scan][decode]")
 {
   // STRING is variable-width, so `cudf::size_of` would itself throw if we
   // ever reached it. The dispatcher must refuse the type *before* asking cudf
   // for its size; this test pins that ordering.
-  rmm::cuda_stream stream;
-  rmm::mr::cuda_async_memory_resource mr;
   std::vector<uint8_t> bytes = {0};
   auto d                     = upload(bytes, stream.view());
   auto col =
     one_codec_column(STR, 1, CompressionType::COMPRESSION_UNCOMPRESSED, {segment(d, 0, 1)});
 
-  REQUIRE_THROWS_WITH(gpu_decode_table({col}, stream.view(), &mr),
-                      Catch::Contains("non-fixed-width type"));
+  REQUIRE_THROWS_WITH(decode({col}), Catch::Contains("non-fixed-width type"));
 }
 
-TEST_CASE("gpu_decode_table - throws on unaligned validity row_offset", "[scan][decode]")
+TEST_CASE_METHOD(decode_env,
+                 "gpu_decode_table - throws on unaligned validity row_offset",
+                 "[scan][decode]")
 {
-  rmm::cuda_stream stream;
-  rmm::mr::cuda_async_memory_resource mr;
   std::vector<int32_t> values(16, 0);
   std::vector<uint8_t> v_bytes = {0xFFu, 0xFFu};
   auto d_data                  = upload(values, stream.view());
@@ -329,14 +282,13 @@ TEST_CASE("gpu_decode_table - throws on unaligned validity row_offset", "[scan][
   col.validity.push_back({CompressionType::COMPRESSION_UNCOMPRESSED,
                           {segment(d_validity, /*row_offset=*/4, /*row_count=*/12)}});
 
-  REQUIRE_THROWS_WITH(gpu_decode_table({col}, stream.view(), &mr),
-                      Catch::Contains("not byte-aligned"));
+  REQUIRE_THROWS_WITH(decode({col}), Catch::Contains("not byte-aligned"));
 }
 
-TEST_CASE("gpu_decode_table - has_nulls with zero rows produces empty mask", "[scan][decode]")
+TEST_CASE_METHOD(decode_env,
+                 "gpu_decode_table - has_nulls with zero rows produces empty mask",
+                 "[scan][decode]")
 {
-  rmm::cuda_stream stream;
-  rmm::mr::cuda_async_memory_resource mr;
   gpu_column_decode_input col;
   col.out_type   = I32;
   col.total_rows = 0;
@@ -344,8 +296,27 @@ TEST_CASE("gpu_decode_table - has_nulls with zero rows produces empty mask", "[s
   // No data runs, no validity runs — the dispatcher must still produce a valid
   // 0-row column rather than launching kernels on an empty mask.
 
-  auto t = gpu_decode_table({col}, stream.view(), &mr);
+  auto t = decode({col});
   REQUIRE(t->num_rows() == 0);
   REQUIRE(t->get_column(0).size() == 0);
   REQUIRE(t->get_column(0).null_count() == 0);
+}
+
+TEST_CASE_METHOD(decode_env,
+                 "gpu_decode_table - throws on row count beyond cudf::size_type max",
+                 "[scan][decode]")
+{
+  // The throw fires from the row-count value alone, before any device
+  // allocation — no need for the dummy segment to actually back that many
+  // rows. Pins the guard so a future edit doesn't silently drop it.
+  std::vector<int32_t> dummy = {0};
+  auto d                     = upload(dummy, stream.view());
+
+  gpu_column_decode_input col;
+  col.out_type   = I32;
+  col.total_rows = static_cast<uint32_t>(std::numeric_limits<int32_t>::max()) + 1u;
+  col.has_nulls  = false;
+  col.data.push_back({CompressionType::COMPRESSION_UNCOMPRESSED, {segment(d, 0, 1)}});
+
+  REQUIRE_THROWS_WITH(decode({col}), Catch::Contains("cudf::size_type max"));
 }
