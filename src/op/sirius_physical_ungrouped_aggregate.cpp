@@ -479,8 +479,8 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate_merge::execute"};
-  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_read_only_batches();
+  auto& input        = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  auto input_batches = input.get_read_only_batches();
   if (aggregates.empty()) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
@@ -500,7 +500,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   auto layout = build_aggregate_layout(aggregates);
   std::shared_ptr<cucascade::data_batch> merged_batch;
   if (input_batches.size() == 1) {
-    merged_batch = ::cucascade::data_batch::to_idle(std::move(input_batches[0]));
+    merged_batch = cucascade::data_batch::to_idle(std::move(input_batches[0]));
   } else {
     merged_batch = gpu_merge_impl::merge_ungrouped_aggregate(
       input_batches, layout.merge_kinds, layout.merge_nth_index, stream, *space);

@@ -135,6 +135,8 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
     }
     if (data->get_size_in_bytes() == 0) { return; }
 
+    std::optional<cucascade::read_only_data_batch> result_ro_opt;
+
     if (data->get_current_tier() == cucascade::memory::Tier::GPU) {
       // Use clone_to to clone directly into HOST representation
       auto sirius_ctx  = _client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -157,9 +159,10 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       auto result_batch = ro.clone_to<cucascade::host_data_representation>(
         registry, next_batch_id, &mem_space, stream);
 
-      // Access the result batch's data (it's a new idle batch, needs read lock)
-      auto result_ro = result_batch->to_read_only();
-      data           = result_ro.get_data();
+      // Access the result batch's data. Declared outside the if-block so result_ro outlives
+      // the branch — data points into it and must not dangle when we reach the assert below.
+      result_ro_opt = result_batch->to_read_only();
+      data          = result_ro_opt->get_data();
 
     } else if (data->get_current_tier() != cucascade::memory::Tier::HOST) {
       // Data must be in HOST tier (i.e., cannot currently reside in DISK tier)
