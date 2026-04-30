@@ -127,8 +127,7 @@ TEST_CASE("sirius_physical_hash_join mark join - partial match", "[physical_mark
                     .get_data_batches()[0]
                     ->get_data()
                     ->cast<gpu_table_representation>()
-                    .get_table()
-                    .view();
+                    .get_table_view();
   REQUIRE(out_view.num_columns() == 3);
   REQUIRE(out_view.num_rows() == static_cast<cudf::size_type>(left_ids.size()));
 
@@ -162,8 +161,7 @@ TEST_CASE("sirius_physical_hash_join mark join - all rows match", "[physical_mar
                     .get_data_batches()[0]
                     ->get_data()
                     ->cast<gpu_table_representation>()
-                    .get_table()
-                    .view();
+                    .get_table_view();
   REQUIRE(out_view.num_rows() == static_cast<cudf::size_type>(left_ids.size()));
 
   REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == left_ids);
@@ -195,8 +193,7 @@ TEST_CASE("sirius_physical_hash_join mark join - no rows match", "[physical_mark
                     .get_data_batches()[0]
                     ->get_data()
                     ->cast<gpu_table_representation>()
-                    .get_table()
-                    .view();
+                    .get_table_view();
   REQUIRE(out_view.num_rows() == static_cast<cudf::size_type>(left_ids.size()));
 
   REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == left_ids);
@@ -228,8 +225,7 @@ TEST_CASE("sirius_physical_hash_join mark join - empty right side", "[physical_m
                     .get_data_batches()[0]
                     ->get_data()
                     ->cast<gpu_table_representation>()
-                    .get_table()
-                    .view();
+                    .get_table_view();
   REQUIRE(out_view.num_rows() == static_cast<cudf::size_type>(left_ids.size()));
 
   REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == left_ids);
@@ -262,8 +258,7 @@ TEST_CASE("sirius_physical_hash_join mark join - duplicate keys on right side",
                     .get_data_batches()[0]
                     ->get_data()
                     ->cast<gpu_table_representation>()
-                    .get_table()
-                    .view();
+                    .get_table_view();
   REQUIRE(out_view.num_rows() == static_cast<cudf::size_type>(left_ids.size()));
 
   REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == left_ids);

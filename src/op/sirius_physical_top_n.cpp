@@ -176,10 +176,10 @@ std::unique_ptr<operator_data> sirius_physical_top_n::execute(const operator_dat
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
-  auto& input_table =
-    input_batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
-  auto output_table =
-    compute_top_n_table(input_table, orders, limit, offset, stream, space->get_default_allocator());
+  auto input_table_view =
+    input_batch->get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+  auto output_table = compute_top_n_table(
+    input_table_view, orders, limit, offset, stream, space->get_default_allocator());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
   std::unique_ptr<cucascade::idata_representation> output_data =
@@ -247,7 +247,7 @@ std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operat
   for (auto const& batch : input_batches) {
     if (!batch) { continue; }
     concat_views.push_back(
-      batch->get_data()->cast<cucascade::gpu_table_representation>().get_table().view());
+      batch->get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
   }
 
   if (concat_views.empty()) {

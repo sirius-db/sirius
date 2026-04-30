@@ -99,8 +99,8 @@ TEMPLATE_TEST_CASE("sirius_physical_filter executes on data_batch for multiple n
                         .get_data_batches()[0]
                         ->get_data()
                         ->cast<gpu_table_representation>()
-                        .get_table();
-  auto out_view    = output_table.view();
+                        .get_table_view();
+  auto out_view    = output_table;
   auto host_vals   = copy_column_to_host<typename Traits::type>(out_view.column(1));
   auto host_filter = copy_column_to_host<int64_t>(out_view.column(0));
 
