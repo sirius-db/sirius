@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Multi-GPU Distribution
 status: executing
-stopped_at: "Completed 13-01: Q11 mgpu reproduction baseline locked in; authoritative [TPC-H][parquet] repro is the diagnostic vehicle for Wave 2."
-last_updated: "2026-04-30T01:05:47.494Z"
+stopped_at: "Completed 13-02: race-site identified at cucascade::convert_gpu_to_gpu (representation_converter.cpp:801); cucascade-side fix shape with submodule bump; all 4 hypotheses DEAD."
+last_updated: "2026-04-30T01:19:57.392Z"
 last_activity: 2026-04-30
 progress:
   total_phases: 15
   completed_phases: 7
   total_plans: 50
-  completed_plans: 41
+  completed_plans: 42
   percent: 100
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-04-21)
 ## Current Position
 
 Phase: 13 (q11-multi-gpu-illegal-address) — EXECUTING
-Plan: 2 of 5
+Plan: 3 of 5
 Status: Ready to execute
 Last activity: 2026-04-30
 
@@ -57,6 +57,7 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 | Phase 12 P03 | 3min | 1 tasks | 1 files |
 | Phase 12 P04 | 10min | 1 tasks | 2 files |
 | Phase 13 P01 | 33min | 1 tasks | 1 files |
+| Phase 13 P02 | 10min | 1 tasks | 2 files |
 
 ## Decisions
 
@@ -108,6 +109,10 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 - [Phase 13]: [13-01] Reproduction PASS: authoritative [TPC-H][parquet] repro reproduced CONTEXT.md SIGTERM-at-Q11 verbatim (10/22 progress, 1800s timeout, num_gpus=2). Cheap follow-up #17 scale-up at kIterations=20 + Phase 14 SCHED-RR did NOT reproduce on this 2 x RTX 6000 Ada host (peer-DMA host-staged); cheap repro is dead, Wave 2 must use authoritative repro for compute-sanitizer attachment.
 - [Phase 13]: [13-01] Phase 14 patch in 14-CONTEXT.md is documentation-style (missing --- a/.../+++ b/... headers); git apply rejects. Future Phase 14 land must produce a proper unified diff. Workaround: apply via direct file edits matching diff verbatim — applied here in working tree, reverted before commit.
 - [Phase 13]: [13-01] Branch base correctly transitioned: fix/q11-mgpu-illegal-address off feature/single-node-multi-gpu2 @ 86e821a. Diff-empty against base for the four Phase 14 files (task_scheduler.hpp/cpp, task_creator.hpp, test_physical_hash_join_mgpu.cpp) = 0 lines. HYG-02 baseline preserved at 40.
+- [Phase 13]: [13-02] FIRST stream-ordered race localized to cucascade::convert_gpu_to_gpu at cucascade/src/data/representation_converter.cpp:801; race shape is peer-copy reader reads source memory before writer stream's cudaMallocAsync event propagates to reader stream (brute-force source-device cudaDeviceSynchronize at line 827 is insufficient for cross-mempool stream-ordering).
+- [Phase 13]: [13-02] Recommended fix shape: cucascade-side gpu_table_representation extension with set_writer_event/get_writer_event accessor + cudaStreamWaitEvent in convert_gpu_to_gpu before peer copies; submodule bump REQUIRED. All 4 CONTEXT.md hypotheses (#1-#4) DEAD on this evidence — Wave 3's per-hypothesis falsifier is now redundant.
+- [Phase 13]: [13-02] Sanitizer wall-clock anomaly: under compute-sanitizer all 22 [TPC-H][parquet] queries PASS exit 0 in 132.9s with 433 stream-ordered-race errors detected — sanitizer's stream-ordering checks serialize launches enough to mask the un-sanitized 1800s SIGTERM. Errors are still definitive proof of the race; the deadlock is just a downstream consequence of GPU context corruption from the race.
+- [Phase 13]: [13-02] MCP compute-sanitizer flag-passing pitfall: runner injects --tool memcheck --leak-check full automatically; user-supplied --tool memcheck causes 'option cannot be specified more than once' CLI error. Pass only discriminating flags (--track-stream-ordered-races=all, --show-backtrace, --launch-timeout, --print-limit, --log-file). Pattern documented for future sanitizer plans.
 
 ## Accumulated Context
 
@@ -156,6 +161,6 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 
 ## Session Continuity
 
-Last session: 2026-04-30T01:05:47.490Z
-Stopped at: Completed 13-01: Q11 mgpu reproduction baseline locked in; authoritative [TPC-H][parquet] repro is the diagnostic vehicle for Wave 2.
+Last session: 2026-04-30T01:19:41.324Z
+Stopped at: Completed 13-02: race-site identified at cucascade::convert_gpu_to_gpu (representation_converter.cpp:801); cucascade-side fix shape with submodule bump; all 4 hypotheses DEAD.
 Resume file: None
