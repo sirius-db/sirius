@@ -41,6 +41,7 @@
 #include <duckdb/planner/table_filter.hpp>
 
 // standard library
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -166,7 +167,7 @@ schema_info diverse_table_schema()
   return info;
 }
 
-/// Run the full two-pipeline scan: metadata scan → sink → finalize → GPU scan.
+/// Run the full two-pipeline scan: metadata scan → sink → GPU scan.
 /// Returns all output data_batches.
 std::vector<std::shared_ptr<cucascade::data_batch>> run_two_pipeline_scan(
   std::vector<std::string> const& file_paths,
@@ -205,9 +206,6 @@ std::vector<std::shared_ptr<cucascade::data_batch>> run_two_pipeline_scan(
     REQUIRE(output);
     metadata_op.sink(*output, stream);
   }
-
-  // --- Pipeline 1 → Pipeline 2 transition ---
-  metadata_op.finalize_operator();
 
   // --- Pipeline 2: GPU scan ---
   std::vector<std::shared_ptr<cucascade::data_batch>> all_batches;
@@ -806,7 +804,7 @@ TEST_CASE("two-pipeline scan - small batch size creates multiple partitions",
   REQUIRE(total_rows == NUM_ROWS);
 }
 
-TEST_CASE("gpu_scan_operator - sink and finalize lifecycle", "[gpu_scan_operator][shared_context]")
+TEST_CASE("gpu_scan_operator - idle without handoff port", "[gpu_scan_operator][shared_context]")
 {
   auto memory_manager = initialize_memory_manager();
   auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
@@ -824,11 +822,6 @@ TEST_CASE("gpu_scan_operator - sink and finalize lifecycle", "[gpu_scan_operator
   REQUIRE(op.all_ports_empty());
   REQUIRE(op.get_next_task_hint() == std::nullopt);
   REQUIRE(op.get_next_task_input_data() == nullptr);
-
-  // Finalize with no metadata → no partitions, still idle.
-  op.finalize_partitions();
-  REQUIRE(op.all_ports_empty());
-  REQUIRE(op.get_next_task_hint() == std::nullopt);
 }
 
 TEST_CASE("two-pipeline scan - diverse types with filter on INTEGER",
@@ -1039,52 +1032,735 @@ TEST_CASE("two-pipeline scan - pure filter column pruning",
   REQUIRE(total_rows == 500);
 }
 
-TEST_CASE("two-pipeline scan - DECIMAL filter falls back to DuckDB expression executor",
-          "[two_pipeline_scan][filter][fallback][shared_context]")
+//===----------------------------------------------------------------------===//
+// Two-pipeline scan tests for parquet files containing STRUCT and LIST
+// columns.  cuDF reassembles nested columns into a single top-level
+// cudf::column when the parent name is passed via parquet_reader_options::set_column_names, so the
+// metadata-scan operator need only (a) push every leaf chunk into selected_chunk_indices for byte
+// accounting and (b) accept that a single DuckDB column may resolve to multiple parquet leaves.
+//
+// Out of scope (not tested here):
+//   - Filter on a sub-field (e.g. WHERE s.a > 10): requires a
+//     duckdb::Expression referencing a struct field rather than a column-level
+//     TableFilter, and depends on GpuExpressionExecutor sub-field support.
+//   - Pure-filter nested columns: TableFilter does not naturally express a
+//     filter on a STRUCT/LIST column at the column level.
+//===----------------------------------------------------------------------===//
+
+//---------- Basic nested projection ----------//
+
+TEST_CASE("two-pipeline scan - project STRUCT column",
+          "[two_pipeline_scan][nested][shared_context]")
 {
   auto memory_manager = initialize_memory_manager();
   auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
   REQUIRE(gpu_space);
 
   auto [db_owner, con]           = sirius::make_test_db_and_connection();
-  constexpr std::size_t NUM_ROWS = 500;
-  create_diverse_table(con, "decimal_fallback", NUM_ROWS);
-  auto path = write_parquet(con, "decimal_fallback", 200);
+  constexpr std::size_t NUM_ROWS = 300;
+
+  std::string const table = "nested_struct_scan";
+  auto create =
+    con.Query("CREATE TABLE " + table + " (id INTEGER, s STRUCT(a INTEGER, b VARCHAR))");
+  REQUIRE(create);
+  REQUIRE(!create->HasError());
+
+  auto insert = con.Query("INSERT INTO " + table +
+                          " SELECT i, {'a': i, 'b': 'row_' || cast(i AS VARCHAR)} "
+                          "FROM generate_series(0, " +
+                          std::to_string(NUM_ROWS - 1) + ") t(i)");
+  REQUIRE(insert);
+  REQUIRE(!insert->HasError());
+
+  auto path = write_parquet(con, table, 100);
   parquet_file_cleanup cleanup{{path}};
 
-  // Schema: id(0) INTEGER, value(1) BIGINT, price(2) DECIMAL(12,2), label(3) VARCHAR, created(4)
-  // DATE. A filter on the DECIMAL column will fail cudf AST translation (DECIMAL types are
-  // disabled due to a cudf bug), so the DuckDB expression executor fallback path is exercised.
-  auto schema                    = diverse_table_schema();
-  std::vector<std::string> files = {path.string()};
-  duckdb::vector<duckdb::idx_t> no_projection;
+  duckdb::vector<duckdb::ColumnIndex> column_ids{duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)};
+  duckdb::vector<std::string> names{"id", "s"};
+  duckdb::vector<duckdb::idx_t> projection_ids{1};
+  duckdb::vector<duckdb::LogicalType> output_types{duckdb::LogicalType::STRUCT({})};
+  duckdb::vector<duckdb::LogicalType> returned_types{duckdb::LogicalType::INTEGER,
+                                                     duckdb::LogicalType::STRUCT({})};
 
-  // Filter: price < 100.00  (price_cents = i*100+1, so price = i + 0.01; id < 100 → 100 rows)
-  auto table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
-  table_filters->PushFilter(
-    duckdb::ColumnIndex(2),
-    duckdb::make_uniq<duckdb::ConstantFilter>(duckdb::ExpressionType::COMPARE_LESSTHAN,
-                                              duckdb::Value::DECIMAL(10000, 12, 2)));
+  std::vector<std::string> files = {path.string()};
+  auto batches                   = run_two_pipeline_scan(files,
+                                       output_types,
+                                       returned_types,
+                                       column_ids,
+                                       projection_ids,
+                                       names,
+                                       1024 * 1024,
+                                       *gpu_space);
+
+  REQUIRE_FALSE(batches.empty());
+  std::vector<int32_t> all_a;
+  std::size_t total_rows = 0;
+  for (auto const& batch : batches) {
+    auto view = sirius::get_cudf_table_view(*batch);
+    REQUIRE(view.num_columns() == 1);
+    auto const struct_col = view.column(0);
+    REQUIRE(struct_col.type().id() == cudf::type_id::STRUCT);
+    REQUIRE(struct_col.num_children() == 2);
+    REQUIRE(struct_col.child(0).type().id() == cudf::type_id::INT32);
+    REQUIRE(struct_col.child(1).type().id() == cudf::type_id::STRING);
+
+    // Child values must be paired: s.b == "row_" || cast(s.a AS VARCHAR).
+    auto a = copy_int32_column(struct_col.child(0));
+    auto b = copy_string_column(struct_col.child(1));
+    REQUIRE(a.size() == b.size());
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      REQUIRE(b[i] == "row_" + std::to_string(a[i]));
+    }
+    all_a.insert(all_a.end(), a.begin(), a.end());
+    total_rows += view.num_rows();
+  }
+  REQUIRE(total_rows == NUM_ROWS);
+
+  // Every expected id must appear exactly once across batches.
+  std::sort(all_a.begin(), all_a.end());
+  REQUIRE(all_a.size() == NUM_ROWS);
+  for (std::size_t i = 0; i < NUM_ROWS; ++i) {
+    REQUIRE(all_a[i] == static_cast<int32_t>(i));
+  }
+}
+
+TEST_CASE("two-pipeline scan - project LIST column", "[two_pipeline_scan][nested][shared_context]")
+{
+  auto memory_manager = initialize_memory_manager();
+  auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
+  REQUIRE(gpu_space);
+
+  auto [db_owner, con]           = sirius::make_test_db_and_connection();
+  constexpr std::size_t NUM_ROWS = 300;
+
+  std::string const table = "nested_list_scan";
+  auto create             = con.Query("CREATE TABLE " + table + " (id INTEGER, l INTEGER[])");
+  REQUIRE(create);
+  REQUIRE(!create->HasError());
+
+  auto insert =
+    con.Query("INSERT INTO " + table + " SELECT i, [i, i+1, i+2] FROM generate_series(0, " +
+              std::to_string(NUM_ROWS - 1) + ") t(i)");
+  REQUIRE(insert);
+  REQUIRE(!insert->HasError());
+
+  auto path = write_parquet(con, table, 100);
+  parquet_file_cleanup cleanup{{path}};
+
+  duckdb::vector<duckdb::ColumnIndex> column_ids{duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)};
+  duckdb::vector<std::string> names{"id", "l"};
+  duckdb::vector<duckdb::idx_t> projection_ids{1};
+  duckdb::vector<duckdb::LogicalType> output_types{
+    duckdb::LogicalType::LIST(duckdb::LogicalType::INTEGER)};
+  duckdb::vector<duckdb::LogicalType> returned_types{
+    duckdb::LogicalType::INTEGER, duckdb::LogicalType::LIST(duckdb::LogicalType::INTEGER)};
+
+  std::vector<std::string> files = {path.string()};
+  auto batches                   = run_two_pipeline_scan(files,
+                                       output_types,
+                                       returned_types,
+                                       column_ids,
+                                       projection_ids,
+                                       names,
+                                       1024 * 1024,
+                                       *gpu_space);
+
+  REQUIRE_FALSE(batches.empty());
+  std::size_t total_rows = 0;
+  for (auto const& batch : batches) {
+    auto view = sirius::get_cudf_table_view(*batch);
+    REQUIRE(view.num_columns() == 1);
+    REQUIRE(view.column(0).type().id() == cudf::type_id::LIST);
+    total_rows += view.num_rows();
+  }
+  REQUIRE(total_rows == NUM_ROWS);
+}
+
+TEST_CASE("two-pipeline scan - table with nested column, project flat only",
+          "[two_pipeline_scan][nested][shared_context]")
+{
+  // Regression: the mere presence of a STRUCT column in the table's schema
+  // should not affect a scan that projects only flat columns.
+  auto memory_manager = initialize_memory_manager();
+  auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
+  REQUIRE(gpu_space);
+
+  auto [db_owner, con]           = sirius::make_test_db_and_connection();
+  constexpr std::size_t NUM_ROWS = 200;
+
+  std::string const table = "mixed_nested_scan";
+  auto create             = con.Query("CREATE TABLE " + table +
+                          " (id INTEGER, s STRUCT(a INTEGER, b VARCHAR), tail INTEGER)");
+  REQUIRE(create);
+  REQUIRE(!create->HasError());
+
+  auto insert = con.Query("INSERT INTO " + table +
+                          " SELECT i, {'a': i, 'b': 'x'}, i * 2 "
+                          "FROM generate_series(0, " +
+                          std::to_string(NUM_ROWS - 1) + ") t(i)");
+  REQUIRE(insert);
+  REQUIRE(!insert->HasError());
+
+  auto path = write_parquet(con, table, 100);
+  parquet_file_cleanup cleanup{{path}};
+
+  duckdb::vector<duckdb::ColumnIndex> column_ids{
+    duckdb::ColumnIndex(0), duckdb::ColumnIndex(1), duckdb::ColumnIndex(2)};
+  duckdb::vector<std::string> names{"id", "s", "tail"};
+  duckdb::vector<duckdb::idx_t> projection_ids{0, 2};
+  duckdb::vector<duckdb::LogicalType> output_types{duckdb::LogicalType::INTEGER,
+                                                   duckdb::LogicalType::INTEGER};
+  duckdb::vector<duckdb::LogicalType> returned_types{
+    duckdb::LogicalType::INTEGER, duckdb::LogicalType::STRUCT({}), duckdb::LogicalType::INTEGER};
+
+  std::vector<std::string> files = {path.string()};
+  auto batches                   = run_two_pipeline_scan(files,
+                                       output_types,
+                                       returned_types,
+                                       column_ids,
+                                       projection_ids,
+                                       names,
+                                       1024 * 1024,
+                                       *gpu_space);
+
+  REQUIRE_FALSE(batches.empty());
+  std::size_t total_rows = 0;
+  for (auto const& batch : batches) {
+    auto view = sirius::get_cudf_table_view(*batch);
+    REQUIRE(view.num_columns() == 2);
+    REQUIRE(view.column(0).type().id() == cudf::type_id::INT32);
+    REQUIRE(view.column(1).type().id() == cudf::type_id::INT32);
+    total_rows += view.num_rows();
+  }
+  REQUIRE(total_rows == NUM_ROWS);
+}
+
+//---------- Mixed and multi-file ----------//
+
+TEST_CASE("two-pipeline scan - mixed flat and nested projection",
+          "[two_pipeline_scan][nested][shared_context]")
+{
+  // Project one flat column alongside one nested column.  Verifies that
+  // output-column ordering is preserved when the projection spans both.
+  auto memory_manager = initialize_memory_manager();
+  auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
+  REQUIRE(gpu_space);
+
+  auto [db_owner, con]           = sirius::make_test_db_and_connection();
+  constexpr std::size_t NUM_ROWS = 200;
+
+  std::string const table = "mixed_flat_nested";
+  auto create =
+    con.Query("CREATE TABLE " + table + " (id INTEGER, s STRUCT(a INTEGER, b VARCHAR))");
+  REQUIRE(create);
+  REQUIRE(!create->HasError());
+
+  auto insert = con.Query("INSERT INTO " + table +
+                          " SELECT i, {'a': i, 'b': 'v'} "
+                          "FROM generate_series(0, " +
+                          std::to_string(NUM_ROWS - 1) + ") t(i)");
+  REQUIRE(insert);
+  REQUIRE(!insert->HasError());
+
+  auto path = write_parquet(con, table, 100);
+  parquet_file_cleanup cleanup{{path}};
+
+  duckdb::vector<duckdb::ColumnIndex> column_ids{duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)};
+  duckdb::vector<std::string> names{"id", "s"};
+  duckdb::vector<duckdb::idx_t> projection_ids{0, 1};
+  duckdb::vector<duckdb::LogicalType> output_types{duckdb::LogicalType::INTEGER,
+                                                   duckdb::LogicalType::STRUCT({})};
+  duckdb::vector<duckdb::LogicalType> returned_types{duckdb::LogicalType::INTEGER,
+                                                     duckdb::LogicalType::STRUCT({})};
+
+  std::vector<std::string> files = {path.string()};
+  auto batches                   = run_two_pipeline_scan(files,
+                                       output_types,
+                                       returned_types,
+                                       column_ids,
+                                       projection_ids,
+                                       names,
+                                       1024 * 1024,
+                                       *gpu_space);
+
+  REQUIRE_FALSE(batches.empty());
+  std::size_t total_rows = 0;
+  for (auto const& batch : batches) {
+    auto view = sirius::get_cudf_table_view(*batch);
+    REQUIRE(view.num_columns() == 2);
+    REQUIRE(view.column(0).type().id() == cudf::type_id::INT32);
+    REQUIRE(view.column(1).type().id() == cudf::type_id::STRUCT);
+    total_rows += view.num_rows();
+  }
+  REQUIRE(total_rows == NUM_ROWS);
+}
+
+TEST_CASE("two-pipeline scan - nested column across multiple files",
+          "[two_pipeline_scan][nested][multi_file][shared_context]")
+{
+  // Two files with identical schemas; name-based resolution must work per file.
+  auto memory_manager = initialize_memory_manager();
+  auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
+  REQUIRE(gpu_space);
+
+  auto [db_owner, con]            = sirius::make_test_db_and_connection();
+  constexpr std::size_t ROWS_EACH = 150;
+
+  std::vector<std::filesystem::path> paths;
+  for (auto const& name : {"multi_nested_a", "multi_nested_b"}) {
+    auto create = con.Query(std::string("CREATE TABLE ") + name +
+                            " (id INTEGER, s STRUCT(a INTEGER, b VARCHAR))");
+    REQUIRE(create);
+    REQUIRE(!create->HasError());
+
+    auto insert = con.Query(std::string("INSERT INTO ") + name +
+                            " SELECT i, {'a': i, 'b': 'y'} "
+                            "FROM generate_series(0, " +
+                            std::to_string(ROWS_EACH - 1) + ") t(i)");
+    REQUIRE(insert);
+    REQUIRE(!insert->HasError());
+
+    paths.push_back(write_parquet(con, name, 50));
+  }
+  parquet_file_cleanup cleanup{paths};
+
+  duckdb::vector<duckdb::ColumnIndex> column_ids{duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)};
+  duckdb::vector<std::string> names{"id", "s"};
+  duckdb::vector<duckdb::idx_t> projection_ids{1};
+  duckdb::vector<duckdb::LogicalType> output_types{duckdb::LogicalType::STRUCT({})};
+  duckdb::vector<duckdb::LogicalType> returned_types{duckdb::LogicalType::INTEGER,
+                                                     duckdb::LogicalType::STRUCT({})};
+
+  std::vector<std::string> files;
+  for (auto const& p : paths) {
+    files.push_back(p.string());
+  }
 
   auto batches = run_two_pipeline_scan(files,
-                                       schema.types,
-                                       schema.types,
-                                       schema.column_ids,
-                                       no_projection,
-                                       schema.names,
+                                       output_types,
+                                       returned_types,
+                                       column_ids,
+                                       projection_ids,
+                                       names,
+                                       1024 * 1024,
+                                       *gpu_space);
+
+  REQUIRE_FALSE(batches.empty());
+  std::size_t total_rows = 0;
+  for (auto const& batch : batches) {
+    auto view = sirius::get_cudf_table_view(*batch);
+    REQUIRE(view.num_columns() == 1);
+    REQUIRE(view.column(0).type().id() == cudf::type_id::STRUCT);
+    total_rows += view.num_rows();
+  }
+  REQUIRE(total_rows == 2 * ROWS_EACH);
+}
+
+//---------- Deeper nesting ----------//
+
+TEST_CASE("two-pipeline scan - STRUCT inside STRUCT", "[two_pipeline_scan][nested][shared_context]")
+{
+  auto memory_manager = initialize_memory_manager();
+  auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
+  REQUIRE(gpu_space);
+
+  auto [db_owner, con]           = sirius::make_test_db_and_connection();
+  constexpr std::size_t NUM_ROWS = 100;
+
+  std::string const table = "struct_in_struct";
+  auto create             = con.Query("CREATE TABLE " + table +
+                          " (id INTEGER, s STRUCT(a INTEGER, b STRUCT(c INTEGER, d VARCHAR)))");
+  REQUIRE(create);
+  REQUIRE(!create->HasError());
+
+  auto insert = con.Query("INSERT INTO " + table +
+                          " SELECT i, {'a': i, 'b': {'c': i * 10, 'd': 'inner'}} "
+                          "FROM generate_series(0, " +
+                          std::to_string(NUM_ROWS - 1) + ") t(i)");
+  REQUIRE(insert);
+  REQUIRE(!insert->HasError());
+
+  auto path = write_parquet(con, table);
+  parquet_file_cleanup cleanup{{path}};
+
+  duckdb::vector<duckdb::ColumnIndex> column_ids{duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)};
+  duckdb::vector<std::string> names{"id", "s"};
+  duckdb::vector<duckdb::idx_t> projection_ids{1};
+  duckdb::vector<duckdb::LogicalType> output_types{duckdb::LogicalType::STRUCT({})};
+  duckdb::vector<duckdb::LogicalType> returned_types{duckdb::LogicalType::INTEGER,
+                                                     duckdb::LogicalType::STRUCT({})};
+
+  std::vector<std::string> files = {path.string()};
+  auto batches                   = run_two_pipeline_scan(files,
+                                       output_types,
+                                       returned_types,
+                                       column_ids,
+                                       projection_ids,
+                                       names,
+                                       1024 * 1024,
+                                       *gpu_space);
+
+  REQUIRE_FALSE(batches.empty());
+  std::size_t total_rows = 0;
+  for (auto const& batch : batches) {
+    auto view = sirius::get_cudf_table_view(*batch);
+    REQUIRE(view.num_columns() == 1);
+    REQUIRE(view.column(0).type().id() == cudf::type_id::STRUCT);
+    REQUIRE(view.column(0).num_children() == 2);
+    REQUIRE(view.column(0).child(1).type().id() == cudf::type_id::STRUCT);
+    total_rows += view.num_rows();
+  }
+  REQUIRE(total_rows == NUM_ROWS);
+}
+
+TEST_CASE("two-pipeline scan - LIST of LIST", "[two_pipeline_scan][nested][shared_context]")
+{
+  auto memory_manager = initialize_memory_manager();
+  auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
+  REQUIRE(gpu_space);
+
+  auto [db_owner, con]           = sirius::make_test_db_and_connection();
+  constexpr std::size_t NUM_ROWS = 100;
+
+  std::string const table = "list_of_list";
+  auto create             = con.Query("CREATE TABLE " + table + " (id INTEGER, ll INTEGER[][])");
+  REQUIRE(create);
+  REQUIRE(!create->HasError());
+
+  auto insert = con.Query("INSERT INTO " + table +
+                          " SELECT i, [[i, i+1], [i+2]] "
+                          "FROM generate_series(0, " +
+                          std::to_string(NUM_ROWS - 1) + ") t(i)");
+  REQUIRE(insert);
+  REQUIRE(!insert->HasError());
+
+  auto path = write_parquet(con, table);
+  parquet_file_cleanup cleanup{{path}};
+
+  duckdb::vector<duckdb::ColumnIndex> column_ids{duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)};
+  duckdb::vector<std::string> names{"id", "ll"};
+  duckdb::vector<duckdb::idx_t> projection_ids{1};
+  duckdb::vector<duckdb::LogicalType> output_types{
+    duckdb::LogicalType::LIST(duckdb::LogicalType::LIST(duckdb::LogicalType::INTEGER))};
+  duckdb::vector<duckdb::LogicalType> returned_types{
+    duckdb::LogicalType::INTEGER,
+    duckdb::LogicalType::LIST(duckdb::LogicalType::LIST(duckdb::LogicalType::INTEGER))};
+
+  std::vector<std::string> files = {path.string()};
+  auto batches                   = run_two_pipeline_scan(files,
+                                       output_types,
+                                       returned_types,
+                                       column_ids,
+                                       projection_ids,
+                                       names,
+                                       1024 * 1024,
+                                       *gpu_space);
+
+  REQUIRE_FALSE(batches.empty());
+  std::size_t total_rows = 0;
+  for (auto const& batch : batches) {
+    auto view = sirius::get_cudf_table_view(*batch);
+    REQUIRE(view.num_columns() == 1);
+    REQUIRE(view.column(0).type().id() == cudf::type_id::LIST);
+    total_rows += view.num_rows();
+  }
+  REQUIRE(total_rows == NUM_ROWS);
+}
+
+TEST_CASE("two-pipeline scan - LIST inside STRUCT", "[two_pipeline_scan][nested][shared_context]")
+{
+  auto memory_manager = initialize_memory_manager();
+  auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
+  REQUIRE(gpu_space);
+
+  auto [db_owner, con]           = sirius::make_test_db_and_connection();
+  constexpr std::size_t NUM_ROWS = 100;
+
+  std::string const table = "list_in_struct";
+  auto create =
+    con.Query("CREATE TABLE " + table + " (id INTEGER, s STRUCT(a INTEGER, l INTEGER[]))");
+  REQUIRE(create);
+  REQUIRE(!create->HasError());
+
+  auto insert = con.Query("INSERT INTO " + table +
+                          " SELECT i, {'a': i, 'l': [i, i+1, i+2]} "
+                          "FROM generate_series(0, " +
+                          std::to_string(NUM_ROWS - 1) + ") t(i)");
+  REQUIRE(insert);
+  REQUIRE(!insert->HasError());
+
+  auto path = write_parquet(con, table);
+  parquet_file_cleanup cleanup{{path}};
+
+  duckdb::vector<duckdb::ColumnIndex> column_ids{duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)};
+  duckdb::vector<std::string> names{"id", "s"};
+  duckdb::vector<duckdb::idx_t> projection_ids{1};
+  duckdb::vector<duckdb::LogicalType> output_types{duckdb::LogicalType::STRUCT({})};
+  duckdb::vector<duckdb::LogicalType> returned_types{duckdb::LogicalType::INTEGER,
+                                                     duckdb::LogicalType::STRUCT({})};
+
+  std::vector<std::string> files = {path.string()};
+  auto batches                   = run_two_pipeline_scan(files,
+                                       output_types,
+                                       returned_types,
+                                       column_ids,
+                                       projection_ids,
+                                       names,
+                                       1024 * 1024,
+                                       *gpu_space);
+
+  REQUIRE_FALSE(batches.empty());
+  std::size_t total_rows = 0;
+  for (auto const& batch : batches) {
+    auto view = sirius::get_cudf_table_view(*batch);
+    REQUIRE(view.num_columns() == 1);
+    REQUIRE(view.column(0).type().id() == cudf::type_id::STRUCT);
+    REQUIRE(view.column(0).num_children() == 2);
+    REQUIRE(view.column(0).child(1).type().id() == cudf::type_id::LIST);
+    total_rows += view.num_rows();
+  }
+  REQUIRE(total_rows == NUM_ROWS);
+}
+
+//---------- Filter interaction ----------//
+
+TEST_CASE("two-pipeline scan - flat filter with nested projection",
+          "[two_pipeline_scan][nested][filter][shared_context]")
+{
+  // Filter pushdown on a flat column while the projection includes a nested
+  // column.  The filter runs at scan time; the nested column is projected as
+  // a single top-level cudf::column.
+  auto memory_manager = initialize_memory_manager();
+  auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
+  REQUIRE(gpu_space);
+
+  auto [db_owner, con]           = sirius::make_test_db_and_connection();
+  constexpr std::size_t NUM_ROWS = 500;
+  constexpr int32_t FILTER_MIN   = 100;
+
+  std::string const table = "filter_with_nested";
+  auto create =
+    con.Query("CREATE TABLE " + table + " (id INTEGER, s STRUCT(a INTEGER, b VARCHAR))");
+  REQUIRE(create);
+  REQUIRE(!create->HasError());
+
+  auto insert = con.Query("INSERT INTO " + table +
+                          " SELECT i, {'a': i, 'b': 'v'} "
+                          "FROM generate_series(0, " +
+                          std::to_string(NUM_ROWS - 1) + ") t(i)");
+  REQUIRE(insert);
+  REQUIRE(!insert->HasError());
+
+  auto path = write_parquet(con, table, 100);
+  parquet_file_cleanup cleanup{{path}};
+
+  duckdb::vector<duckdb::ColumnIndex> column_ids{duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)};
+  duckdb::vector<std::string> names{"id", "s"};
+  duckdb::vector<duckdb::idx_t> projection_ids{0, 1};
+  duckdb::vector<duckdb::LogicalType> output_types{duckdb::LogicalType::INTEGER,
+                                                   duckdb::LogicalType::STRUCT({})};
+  duckdb::vector<duckdb::LogicalType> returned_types{duckdb::LogicalType::INTEGER,
+                                                     duckdb::LogicalType::STRUCT({})};
+
+  auto table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+  table_filters->PushFilter(
+    duckdb::ColumnIndex(0),
+    duckdb::make_uniq<duckdb::ConstantFilter>(duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO,
+                                              duckdb::Value::INTEGER(FILTER_MIN)));
+
+  std::vector<std::string> files = {path.string()};
+  auto batches                   = run_two_pipeline_scan(files,
+                                       output_types,
+                                       returned_types,
+                                       column_ids,
+                                       projection_ids,
+                                       names,
                                        1024 * 1024,
                                        *gpu_space,
                                        std::move(table_filters));
 
+  REQUIRE_FALSE(batches.empty());
   std::size_t total_rows = 0;
   for (auto const& batch : batches) {
-    auto table = sirius::get_cudf_table_view(*batch);
-    REQUIRE(table.num_columns() == 5);
-    auto ids = copy_int32_column(table.column(0));
+    auto view = sirius::get_cudf_table_view(*batch);
+    REQUIRE(view.num_columns() == 2);
+    REQUIRE(view.column(0).type().id() == cudf::type_id::INT32);
+    REQUIRE(view.column(1).type().id() == cudf::type_id::STRUCT);
+    auto ids = copy_int32_column(view.column(0));
     for (auto id : ids) {
-      REQUIRE(id < 100);
+      REQUIRE(id >= FILTER_MIN);
     }
-    total_rows += table.num_rows();
+    total_rows += view.num_rows();
   }
-  REQUIRE(total_rows == 100);
+  REQUIRE(total_rows == NUM_ROWS - FILTER_MIN);
+}
+
+TEST_CASE("two-pipeline scan - filter on nested column throws cleanly",
+          "[two_pipeline_scan][nested][filter][negative][shared_context]")
+{
+  // cuDF's AST has no operand support for STRUCT or LIST in comparison or
+  // binary ops, so a filter pushed directly against a nested column cannot be
+  // pushed down or evaluated post-scan.  The scan must surface this as an
+  // exception rather than a crash.  This test pins down the "throws cleanly"
+  // contract; the precise layer that throws (filter-to-expression conversion,
+  // AST translation, or the post-scan expression executor fallback) is left
+  // unspecified.
+  auto memory_manager = initialize_memory_manager();
+  auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
+  REQUIRE(gpu_space);
+
+  auto [db_owner, con]           = sirius::make_test_db_and_connection();
+  constexpr std::size_t NUM_ROWS = 100;
+
+  std::string const table = "filter_on_nested";
+  auto create =
+    con.Query("CREATE TABLE " + table + " (id INTEGER, s STRUCT(a INTEGER, b VARCHAR))");
+  REQUIRE(create);
+  REQUIRE(!create->HasError());
+
+  auto insert = con.Query("INSERT INTO " + table +
+                          " SELECT i, {'a': i, 'b': 'v'} "
+                          "FROM generate_series(0, " +
+                          std::to_string(NUM_ROWS - 1) + ") t(i)");
+  REQUIRE(insert);
+  REQUIRE(!insert->HasError());
+
+  auto path = write_parquet(con, table, 100);
+  parquet_file_cleanup cleanup{{path}};
+
+  duckdb::vector<duckdb::ColumnIndex> column_ids{duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)};
+  duckdb::vector<std::string> names{"id", "s"};
+  duckdb::vector<duckdb::idx_t> projection_ids{0, 1};
+  duckdb::vector<duckdb::LogicalType> output_types{duckdb::LogicalType::INTEGER,
+                                                   duckdb::LogicalType::STRUCT({})};
+  duckdb::vector<duckdb::LogicalType> returned_types{duckdb::LogicalType::INTEGER,
+                                                     duckdb::LogicalType::STRUCT({})};
+
+  // Push a constant filter against the STRUCT column.  The constant value type
+  // is unimportant — the point is that the filtered column is nested.
+  auto table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+  table_filters->PushFilter(duckdb::ColumnIndex(1),
+                            duckdb::make_uniq<duckdb::ConstantFilter>(
+                              duckdb::ExpressionType::COMPARE_EQUAL, duckdb::Value::INTEGER(0)));
+
+  std::vector<std::string> files = {path.string()};
+  REQUIRE_THROWS(run_two_pipeline_scan(files,
+                                       output_types,
+                                       returned_types,
+                                       column_ids,
+                                       projection_ids,
+                                       names,
+                                       1024 * 1024,
+                                       *gpu_space,
+                                       std::move(table_filters)));
+}
+
+//---------- Edge cases ----------//
+
+TEST_CASE("two-pipeline scan - LIST with empty and populated rows",
+          "[two_pipeline_scan][nested][edge][shared_context]")
+{
+  auto memory_manager = initialize_memory_manager();
+  auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
+  REQUIRE(gpu_space);
+
+  auto [db_owner, con]           = sirius::make_test_db_and_connection();
+  constexpr std::size_t NUM_ROWS = 100;
+
+  std::string const table = "empty_list_scan";
+  auto create             = con.Query("CREATE TABLE " + table + " (id INTEGER, l INTEGER[])");
+  REQUIRE(create);
+  REQUIRE(!create->HasError());
+
+  auto insert = con.Query("INSERT INTO " + table +
+                          " SELECT i, CASE WHEN i % 2 = 0 THEN [] ELSE [i, i+1] END "
+                          "FROM generate_series(0, " +
+                          std::to_string(NUM_ROWS - 1) + ") t(i)");
+  REQUIRE(insert);
+  REQUIRE(!insert->HasError());
+
+  auto path = write_parquet(con, table);
+  parquet_file_cleanup cleanup{{path}};
+
+  duckdb::vector<duckdb::ColumnIndex> column_ids{duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)};
+  duckdb::vector<std::string> names{"id", "l"};
+  duckdb::vector<duckdb::idx_t> projection_ids{1};
+  duckdb::vector<duckdb::LogicalType> output_types{
+    duckdb::LogicalType::LIST(duckdb::LogicalType::INTEGER)};
+  duckdb::vector<duckdb::LogicalType> returned_types{
+    duckdb::LogicalType::INTEGER, duckdb::LogicalType::LIST(duckdb::LogicalType::INTEGER)};
+
+  std::vector<std::string> files = {path.string()};
+  auto batches                   = run_two_pipeline_scan(files,
+                                       output_types,
+                                       returned_types,
+                                       column_ids,
+                                       projection_ids,
+                                       names,
+                                       1024 * 1024,
+                                       *gpu_space);
+
+  REQUIRE_FALSE(batches.empty());
+  std::size_t total_rows = 0;
+  for (auto const& batch : batches) {
+    auto view = sirius::get_cudf_table_view(*batch);
+    REQUIRE(view.num_columns() == 1);
+    REQUIRE(view.column(0).type().id() == cudf::type_id::LIST);
+    total_rows += view.num_rows();
+  }
+  REQUIRE(total_rows == NUM_ROWS);
+}
+
+TEST_CASE("two-pipeline scan - STRUCT with NULL rows",
+          "[two_pipeline_scan][nested][edge][shared_context]")
+{
+  auto memory_manager = initialize_memory_manager();
+  auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
+  REQUIRE(gpu_space);
+
+  auto [db_owner, con]           = sirius::make_test_db_and_connection();
+  constexpr std::size_t NUM_ROWS = 100;
+
+  std::string const table = "null_struct_scan";
+  auto create =
+    con.Query("CREATE TABLE " + table + " (id INTEGER, s STRUCT(a INTEGER, b VARCHAR))");
+  REQUIRE(create);
+  REQUIRE(!create->HasError());
+
+  auto insert = con.Query("INSERT INTO " + table +
+                          " SELECT i, CASE WHEN i % 3 = 0 THEN NULL ELSE {'a': i, 'b': 'v'} END "
+                          "FROM generate_series(0, " +
+                          std::to_string(NUM_ROWS - 1) + ") t(i)");
+  REQUIRE(insert);
+  REQUIRE(!insert->HasError());
+
+  auto path = write_parquet(con, table);
+  parquet_file_cleanup cleanup{{path}};
+
+  duckdb::vector<duckdb::ColumnIndex> column_ids{duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)};
+  duckdb::vector<std::string> names{"id", "s"};
+  duckdb::vector<duckdb::idx_t> projection_ids{1};
+  duckdb::vector<duckdb::LogicalType> output_types{duckdb::LogicalType::STRUCT({})};
+  duckdb::vector<duckdb::LogicalType> returned_types{duckdb::LogicalType::INTEGER,
+                                                     duckdb::LogicalType::STRUCT({})};
+
+  std::vector<std::string> files = {path.string()};
+  auto batches                   = run_two_pipeline_scan(files,
+                                       output_types,
+                                       returned_types,
+                                       column_ids,
+                                       projection_ids,
+                                       names,
+                                       1024 * 1024,
+                                       *gpu_space);
+
+  REQUIRE_FALSE(batches.empty());
+  std::size_t total_rows = 0;
+  for (auto const& batch : batches) {
+    auto view = sirius::get_cudf_table_view(*batch);
+    REQUIRE(view.num_columns() == 1);
+    REQUIRE(view.column(0).type().id() == cudf::type_id::STRUCT);
+    total_rows += view.num_rows();
+  }
+  REQUIRE(total_rows == NUM_ROWS);
 }

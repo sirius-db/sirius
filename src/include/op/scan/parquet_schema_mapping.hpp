@@ -40,8 +40,14 @@ namespace sirius::op::scan::detail {
  * the named top-level column — e.g. a STRUCT with three fields yields three
  * leaf indices, all sharing the same path_in_schema[0].
  *
- * Matching is case-sensitive; parquet writers and cuDF's reader treat column
- * names as case-sensitive identifiers.
+ * Matching is case-sensitive by design. @p column_name is expected to come
+ * from DuckDB's parquet bind, which already extracted the name verbatim from
+ * the file's schema — so we are comparing a file-schema name to itself and
+ * exact equality is sufficient. DuckDB's SQL-layer case-insensitivity is
+ * resolved upstream of this call and is not relevant here. Parquet and cuDF
+ * both treat column names as case-sensitive, so broadening the match would
+ * silently collapse the pathological (but legal) case of two file-schema
+ * columns differing only in case.
  *
  * Returns an empty vector if @p metadata has no row groups (the file is empty
  * and has no chunk-ordering information to report).

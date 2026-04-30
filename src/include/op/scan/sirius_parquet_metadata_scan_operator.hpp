@@ -19,6 +19,7 @@
 // sirius
 #include <config.hpp>
 #include <expression_executor/gpu_expression_translator_internal.hpp>
+#include <op/scan/scan_plan.hpp>
 #include <op/scan/sirius_gpu_parquet_scan_operator.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <op/sirius_physical_operator_type.hpp>
@@ -56,10 +57,9 @@ namespace sirius::op::scan {
  *     sirius_gpu_parquet_scan_operator via its accumulate_metadata() entry point.
  *     This is a direct handoff — no inter-pipeline port or data repository is
  *     involved; the metadata never flows through the generic pipeline data path.
- *   - finalize_operator() (invoked once after pipeline 1 completes) calls
- *     gpu_scan::finalize_partitions(), which freezes the partition index and
- *     unblocks the downstream scan pipeline (pipeline 2), where gpu_scan serves
- *     as the source.
+ *   - Completion of this pipeline is detected by the downstream gpu_scan operator
+ *     via the standard "handoff" port / is_pipeline_finished() mechanism — no
+ *     explicit finalize callback is needed.
  *
  * @pre The caller must validate before construction that:
  *   - The table function is NOT an in-out function (in_out_function == false).
@@ -184,17 +184,6 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
    */
   void sink(const operator_data& input_data, rmm::cuda_stream_view stream) override;
 
-  /**
-   * @brief Finalize the paired gpu_scan's partition index, unblocking the downstream pipeline.
-   *
-   * Invoked by the pipeline framework exactly once, after every sink() call for this pipeline
-   * has returned. Delegates to gpu_scan::finalize_partitions(), which freezes the accumulated
-   * metadata into a flat partition index and publishes it with release semantics. Until this
-   * call completes, gpu_scan's source methods report "not ready" and the downstream scan
-   * pipeline cannot begin dispatching tasks.
-   */
-  void finalize_operator() override;
-
   //===----------Accessors----------===//
   [[nodiscard]] std::size_t get_total_files() const { return _total_files; }
   [[nodiscard]] std::size_t get_max_file_processed() const { return _max_file_processed; }
@@ -203,33 +192,12 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
  private:
   /// The list of parquet files to scan.
   std::vector<std::string> _file_paths;
-  /// DuckDB primary indices of the columns to read, in column_ids order (virtuals and
-  /// duplicates removed). Parallel to _projected_column_names when _is_projected; used to
-  /// translate _pure_filter_column_indices (keyed by DuckDB primary index) into parquet
-  /// chunk indices at execute() time after name-based schema resolution.
-  std::vector<std::size_t> _selected_column_indices;
-  /// Whether projection is applied.
-  bool _is_projected;
-  /// Column names for the projected columns, in column_ids order.
-  std::vector<std::string> _projected_column_names;
-  /// Whether there is a filter expression (AST translation is deferred to execute()).
-  bool _has_filter;
+  /// Canonical scan plan — data columns (D order), partition columns, output layout,
+  /// and C→D filter map. Replaces the scattered bookkeeping that used to live here.
+  scan_plan _plan;
   /// The coalesced DuckDB filter expression (AST translation attempted in execute()).
+  /// Empty when no filters were translatable (after skipping partition-column filters).
   std::shared_ptr<duckdb::Expression> _duckdb_filter_expression;
-  /// Pre-computed column name lookup for AST translation (ref_index -> column name).
-  std::vector<std::string> _column_name_by_ref;
-  /// The projection ids corresponding to columns that remain after pruning pure filter columns.
-  /// These are passed forward to the GPU scan operator to apply as a post-filter projection after
-  /// filter pushdown.
-  std::vector<std::size_t> _post_filter_projection_ids;
-  /// The set of column indices corresponding to columns that will be pruned after filtering.
-  /// For the metadata scan operator, this is used to prune bytes from the accumulated uncompressed
-  /// byte count for partitioning purposes.
-  std::unordered_set<std::size_t> _pure_filter_column_indices;
-  /// The set of indexes into names/column_ids for hive partition columns
-  std::unordered_set<std::size_t> _hive_partition_index_set;
-  /// The (name, index) pairs for hive partition columns
-  std::vector<hive_partition_column> _hive_partition_columns;
 
   std::size_t _approximate_batch_size;
   std::size_t _max_file_processed;
@@ -239,8 +207,7 @@ class sirius_parquet_metadata_scan_operator : public sirius_physical_operator {
   std::atomic<std::size_t> _next_file_idx{0};
 
   /// Paired GPU parquet scan operator — the source of the downstream pipeline. sink() forwards
-  /// accumulated metadata into it; finalize_operator() freezes its partition index. Set at
-  /// construction; never null.
+  /// accumulated metadata into it via accumulate_metadata(). Set at construction; never null.
   sirius_gpu_parquet_scan_operator* _gpu_scan;
 };
 

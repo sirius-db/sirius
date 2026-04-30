@@ -168,6 +168,11 @@ class parquet_scan_data : public op::operator_data {
     return std::vector<::cucascade::data_batch_processing_handle>{};
   };
 
+  [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
+  {
+    return rg_range.reserved_uncompressed_bytes;
+  }
+
   std::string file_path;
   row_group_range rg_range;
   std::shared_ptr<cudf::io::parquet_reader_options> reader_options;
