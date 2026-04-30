@@ -90,6 +90,13 @@ class sirius_scan_manager {
   /// thread pool while a worker is parked there would otherwise hang
   /// indefinitely. close() is idempotent on the connector, so racing with the
   /// driver's own close on success is safe.
+  ///
+  /// Lifetime caveat: connectors are operator-owned (unique_ptr). Callers MUST
+  /// invoke this BEFORE the gpu scan operators are destroyed — typically from
+  /// the engine's catch handler before drain_after_error joins the task pools.
+  /// Calling it from SiriusContext::terminate() is unsafe because DuckDB tears
+  /// down the physical plan first, so the operator pointers in _providers
+  /// would dangle.
   void close_all_connectors();
 
   /// \brief Move out the first exception caught by run_driver_loop, if any.

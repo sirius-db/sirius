@@ -289,7 +289,12 @@ void SiriusContext::terminate()
   task_scheduler_->stop();
   task_scheduler_.reset();
   if (scan_manager_) {
-    scan_manager_->close_all_connectors();
+    // Deliberately do NOT call close_all_connectors() here — connectors are
+    // owned by the gpu scan operators (unique_ptr), and DuckDB tears down the
+    // physical plan before terminate() runs, so the operator pointers in
+    // _providers dangle. The wake-up responsibility belongs to the engine
+    // paths: success drains via the split_provider closing on completion, and
+    // sirius_engine.cpp's catch handler closes connectors before drain.
     scan_manager_->stop();
     scan_manager_->reset();
   }
