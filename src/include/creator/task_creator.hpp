@@ -20,10 +20,8 @@
 #include "exec/bounded_thread_pool.hpp"
 #include "exec/config.hpp"
 #include "exec/interruptible_mpmc.hpp"
-#include "helper/helper.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/sirius_physical_operator.hpp"
-#include "parallel/task_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
 #include <blockingconcurrentqueue.h>
@@ -31,13 +29,10 @@
 #include <cucascade/data/data_repository.hpp>
 
 #include <atomic>
-#include <condition_variable>
-#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
-#include <variant>
 
 namespace sirius::pipeline {
 class task_scheduler;

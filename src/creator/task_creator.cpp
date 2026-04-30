@@ -25,7 +25,6 @@
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
 #include "op/sirius_physical_iceberg_scan.hpp"
-#include "op/sirius_physical_parquet_scan.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "planner/query.hpp"
@@ -245,39 +244,12 @@ void task_creator::manager_loop()
         // Get what we need to create the task
         auto pipeline = node->get_pipeline();
         std::vector<cucascade::shared_data_repository*> destination_data_repositories;
-        // special handling for delim joins
-        if (pipeline->get_sink()->type ==
-            ::sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
-          auto& delim_join    = pipeline->get_sink()->Cast<op::sirius_physical_right_delim_join>();
-          auto partition_join = delim_join.partition_join;
-          auto distinct_op    = delim_join.distinct.get();
-          for (auto& next_port : partition_join->get_next_port_after_sink()) {
-            destination_data_repositories.push_back(
-              next_port.next_operator->get_port(next_port.next_operator_port_name)->repo);
-          }
-          for (auto& next_port : distinct_op->get_next_port_after_sink()) {
-            destination_data_repositories.push_back(
-              next_port.next_operator->get_port(next_port.next_operator_port_name)->repo);
-          }
-        } else if (pipeline->get_sink()->type ==
-                   ::sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
-          auto& delim_join      = pipeline->get_sink()->Cast<op::sirius_physical_left_delim_join>();
-          auto distinct_op      = delim_join.distinct.get();
-          auto column_data_scan = delim_join.column_data_scan;
-          for (auto& next_port : column_data_scan->get_next_port_after_sink()) {
-            destination_data_repositories.push_back(
-              next_port.next_operator->get_port(next_port.next_operator_port_name)->repo);
-          }
-          for (auto& next_port : distinct_op->get_next_port_after_sink()) {
-            destination_data_repositories.push_back(
-              next_port.next_operator->get_port(next_port.next_operator_port_name)->repo);
-          }
-        } else {
-          for (auto& next_port : pipeline->get_sink()->get_next_port_after_sink()) {
-            destination_data_repositories.push_back(
-              next_port.next_operator->get_port(next_port.next_operator_port_name)->repo);
-          }
+
+        for (const auto& port_info : pipeline->get_next_ports_after_sink()) {
+          destination_data_repositories.push_back(
+            port_info.next_operator->get_port(port_info.next_operator_port_name)->repo);
         }
+
         // scheduling scan task
         if (node->type == ::sirius::op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
           // Check to see if you need to create a new global s for this scan operator

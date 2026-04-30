@@ -108,7 +108,7 @@ void place_node(render_tree& tree,
   if (parent) {
     auto parent_sink = parent->get_sink();
     if (parent_sink) {
-      for (auto& np : parent_sink->get_next_port_after_sink()) {
+      for (auto& np : parent_sink->get_next_ports_after_sink()) {
         if (!np.next_operator) { continue; }
         auto* port = np.next_operator->get_port(np.next_operator_port_name);
         if (port && port->src_pipeline &&
@@ -375,7 +375,7 @@ std::string sirius_plan_printer::render_pipelines() const
 
     // Show output connections from sink
     if (sink) {
-      auto& next_ports = sink->get_next_port_after_sink();
+      auto& next_ports = sink->get_next_ports_after_sink();
       for (auto& np : next_ports) {
         if (!np.next_operator) { continue; }
         ss << "  Output: -> " << np.next_operator->get_name();
