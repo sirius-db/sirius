@@ -154,7 +154,8 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single 
   std::size_t total_num_rows = 0;
   for (auto& output :
        dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()) {
-    total_num_rows += output->get_data()->cast<gpu_table_representation>().get_table_view().num_rows();
+    total_num_rows +=
+      output->get_data()->cast<gpu_table_representation>().get_table_view().num_rows();
   }
   REQUIRE(total_num_rows == num_values);
 }

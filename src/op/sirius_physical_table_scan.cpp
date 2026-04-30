@@ -164,7 +164,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   // After filtering, project away filter-only columns if the batch has more
   // columns than the operator's output type list expects.
   std::size_t expected_output_columns = types.size();
-  auto& gpu_rep      = output_batch->get_data()->cast<cucascade::gpu_table_representation>();
+  auto& gpu_rep       = output_batch->get_data()->cast<cucascade::gpu_table_representation>();
   auto out_table_view = gpu_rep.get_table_view();
 
   if (expected_output_columns == 0) {

@@ -339,8 +339,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
     auto* space = batch->get_memory_space();
     if (!space) { continue; }
 
-    auto view =
-      batch->get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+    auto view = batch->get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
 
     std::vector<std::unique_ptr<cudf::column>> cols;
     cols.reserve(layout.local_types.size());

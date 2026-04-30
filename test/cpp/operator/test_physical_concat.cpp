@@ -783,8 +783,10 @@ TEST_CASE("sirius_physical_concat execute is thread-safe with independent stream
   // Verify each thread's output
   for (int t = 0; t < num_threads; ++t) {
     REQUIRE(thread_outputs[t].size() == 1);
-    auto out_table =
-      thread_outputs[t][0]->get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+    auto out_table = thread_outputs[t][0]
+                       ->get_data()
+                       ->cast<cucascade::gpu_table_representation>()
+                       .get_table_view();
     REQUIRE(static_cast<std::size_t>(out_table.num_rows()) == rows_per_batch * batches_per_thread);
   }
 }
