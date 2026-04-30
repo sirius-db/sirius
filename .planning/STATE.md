@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Multi-GPU Distribution
 status: executing
-stopped_at: "Completed 13-02: race-site identified at cucascade::convert_gpu_to_gpu (representation_converter.cpp:801); cucascade-side fix shape with submodule bump; all 4 hypotheses DEAD."
-last_updated: "2026-04-30T01:19:57.392Z"
+stopped_at: "Completed 13-03: 3 falsifiers AGREE with 13-02; all 4 hypotheses DEAD; Wave 4 unblocked with single-valued fix scope (cucascade gpu_table_representation writer-event extension)."
+last_updated: "2026-04-30T02:31:49.862Z"
 last_activity: 2026-04-30
 progress:
   total_phases: 15
   completed_phases: 7
   total_plans: 50
-  completed_plans: 42
+  completed_plans: 43
   percent: 100
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-04-21)
 ## Current Position
 
 Phase: 13 (q11-multi-gpu-illegal-address) — EXECUTING
-Plan: 3 of 5
+Plan: 4 of 5
 Status: Ready to execute
 Last activity: 2026-04-30
 
@@ -58,6 +58,7 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 | Phase 12 P04 | 10min | 1 tasks | 2 files |
 | Phase 13 P01 | 33min | 1 tasks | 1 files |
 | Phase 13 P02 | 10min | 1 tasks | 2 files |
+| Phase 13 P03 | 30min | 1 tasks | 2 files |
 
 ## Decisions
 
@@ -113,6 +114,9 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 - [Phase 13]: [13-02] Recommended fix shape: cucascade-side gpu_table_representation extension with set_writer_event/get_writer_event accessor + cudaStreamWaitEvent in convert_gpu_to_gpu before peer copies; submodule bump REQUIRED. All 4 CONTEXT.md hypotheses (#1-#4) DEAD on this evidence — Wave 3's per-hypothesis falsifier is now redundant.
 - [Phase 13]: [13-02] Sanitizer wall-clock anomaly: under compute-sanitizer all 22 [TPC-H][parquet] queries PASS exit 0 in 132.9s with 433 stream-ordered-race errors detected — sanitizer's stream-ordering checks serialize launches enough to mask the un-sanitized 1800s SIGTERM. Errors are still definitive proof of the race; the deadlock is just a downstream consequence of GPU context corruption from the race.
 - [Phase 13]: [13-02] MCP compute-sanitizer flag-passing pitfall: runner injects --tool memcheck --leak-check full automatically; user-supplied --tool memcheck causes 'option cannot be specified more than once' CLI error. Pass only discriminating flags (--track-stream-ordered-races=all, --show-backtrace, --launch-timeout, --print-limit, --log-file). Pattern documented for future sanitizer plans.
+- [Phase 13]: [13-03] All 3 Wave 3 falsifiers (#2/#3/#4) AGREE with Wave 2A's verdict that all 4 CONTEXT.md hypotheses are DEAD. #3 DEAD direct: zero pop_data_batch/_cv.wait/pthread_cond_wait frames in 760KB sanitizer log. #4 DEAD direct: 101 OOM events show global usage 15360→20045 bytes (30% warm-up bump in first 10 events) → plateau at 20045 for next 91 events; bounded steady-state, not monotonic accumulation. #2 DEAD via Wave 2A subsumption (no partition.cpp frame in FIRST-error backtrace); direct falsifier INCONCLUSIVE due to MCP env-passing limitation + probe coverage gap. #1 SKIPPED per RESEARCH ranking. Overall Corroboration: AGREE.
+- [Phase 13]: [13-03] MCP env-passing limitation reconfirmed at Wave 3: unit-tests command accepts only filter= per list_commands schema; cannot propagate SIRIUS_LOG_LEVEL=debug. Cheap repro doesn't fire bug on consumer 2 x RTX 6000 Ada host (peer-DMA host-staged; same Wave 1 anomaly). Existing [mgpu-probe] coverage at host_parquet_to_gpu + prepare_for_processing only — NOT at sirius_physical_partition::execute despite stale claim in project_phase08_fu17.md. Recommended follow-ups (out of Phase 13 scope): extend MCP wrapper for env passthrough; add partition-execute probe; refresh memory entry.
+- [Phase 13]: [13-03] Wave 4 fix scope unambiguously bounded by combining 13-race-site.txt + 13-falsifiers.txt: cucascade-side gpu_table_representation extension with set_writer_event/get_writer_event accessor + cudaStreamWaitEvent in convert_gpu_to_gpu before peer copies; submodule bump REQUIRED. No need to investigate cuco lifecycle, partition sibling state, pop_data_batch CV, or reservation tracker as primary causes — all DEAD.
 
 ## Accumulated Context
 
@@ -161,6 +165,6 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 
 ## Session Continuity
 
-Last session: 2026-04-30T01:19:41.324Z
-Stopped at: Completed 13-02: race-site identified at cucascade::convert_gpu_to_gpu (representation_converter.cpp:801); cucascade-side fix shape with submodule bump; all 4 hypotheses DEAD.
+Last session: 2026-04-30T02:31:49.859Z
+Stopped at: Completed 13-03: 3 falsifiers AGREE with 13-02; all 4 hypotheses DEAD; Wave 4 unblocked with single-valued fix scope (cucascade gpu_table_representation writer-event extension).
 Resume file: None
