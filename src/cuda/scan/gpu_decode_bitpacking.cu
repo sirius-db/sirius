@@ -25,22 +25,22 @@
 // fields through shared memory; the remaining decode runs zero-divergent.
 //
 // Per-mode store strategy:
-//   CONSTANT, CONSTANT_DELTA  — vectorise to int4 (16-byte) streaming stores
-//                               when the type fits; this matches the
-//                               type_dispatcher path UNCOMPRESSED's CONSTANT
-//                               broadcast uses, so a same-shape segment runs
-//                               at the GDDR fill ceiling instead of the
-//                               scalar-store ceiling.
-//   FOR, DELTA_FOR            — striped scalar `__stwt`. Striped layout keeps
-//                               each warp's 32 stores on one cache line;
-//                               vectorised int4 in this layout would scatter
-//                               the warp across 4 cache lines and lose the
-//                               coalescing win.
+//   CONSTANT, CONSTANT_DELTA  — vectorise to int4 (16-byte) stores when the
+//                               type fits, mirroring the UNCOMPRESSED CONSTANT
+//                               broadcast. Doesn't reach that path's GDDR
+//                               fill rate (per-CTA metadata parse + sync caps
+//                               us below it) but closes most of the gap vs a
+//                               scalar-store baseline.
+//   FOR, DELTA_FOR            — striped scalar `__stwt`. Striped + scalar is
+//                               the simplest correct layout; a blocked + int4
+//                               variant is plausible follow-up work but has
+//                               not been measured.
 //
-// Output is written once and never reread within a single kernel, so every
-// global store goes through `__stwt` (PTX `st.global.wt`) — the L1 capacity
-// stays free for the unpack reads that share the SM's unified L1/shmem
-// partition on Turing/Ampere.
+// Output is written once and never reread within a single kernel, so global
+// stores go through `__stwt` (PTX `st.global.wt`). Empirically a no-op on
+// sm_75 (Turing's L1 doesn't cache global stores for reuse anyway) but kept
+// for sm_80+ where the L1 partition is more aggressive and the bypass hint
+// is a measured win on similar workloads in cudf.
 //
 // Defensive metadata bounds: `metadata_end` and `data_off` come from disk
 // and could be malformed. Each parse step that would produce an OOB read or
@@ -186,10 +186,12 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
       uint8_t parsed_mode = (encoded >> 24) & 0xFFu;
       sm_row_count        = desc.group_row_count;
 
-      // `data_off` is a within-segment offset; the per-mode header reads up
-      // to 3*sizeof(T) bytes starting there before the packed stream. The
-      // header must lie strictly before the metadata trailer.
-      bool data_off_ok = uint64_t{data_off} + 3u * sizeof(T) <= metadata_end;
+      // `data_off` is a within-segment offset; the kernel reads v0 and v1
+      // unconditionally (2*sizeof(T)) for every mode below, then reads a
+      // third T only for DELTA_FOR. Bound the unconditional read here and
+      // re-bound for DELTA_FOR's third T inside its case to avoid falsely
+      // rejecting tight CONSTANT / FOR segments.
+      bool data_off_ok = uint64_t{data_off} + 2u * sizeof(T) <= metadata_end;
 
       if (data_off_ok) {
         uint8_t const* dp = seg_base + data_off;
@@ -215,6 +217,10 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
             sm_data_offset = data_off + 2u * sizeof(T);
             break;
           case BitpackingMode::DELTA_FOR: {
+            // DELTA_FOR adds a third T (delta_offset) before the packed
+            // stream — re-bound to catch tight segments where the third
+            // read would alias the metadata trailer.
+            if (uint64_t{data_off} + 3u * sizeof(T) > metadata_end) break;
             T v2{};
             memcpy(&v2, dp + 2u * sizeof(T), sizeof(T));
             sm_mode        = parsed_mode;
@@ -263,27 +269,25 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
   // require staging the parsed value back to a device scalar and re-launching.
   //===--------------------------------------------------------------------===//
   if (mode == BitpackingMode::CONSTANT) {
-    T const val = sm_aux;
-    if constexpr (sizeof(T) <= 8 && 16u % sizeof(T) == 0u) {
-      constexpr uint32_t TPV = 16u / sizeof(T);
-      uint32_t vec_count     = rc / TPV;
-      int4* out4             = reinterpret_cast<int4*>(out);
-      int4 packed;
-      T* lanes = reinterpret_cast<T*>(&packed);
+    static_assert(sizeof(T) <= 8 && 16u % sizeof(T) == 0u,
+                  "BITPACKING kernel only instantiates for type sizes in {1,2,4,8}; "
+                  "extending the dispatcher to a non-conforming type needs a scalar "
+                  "fallback path here");
+    T const val            = sm_aux;
+    constexpr uint32_t TPV = 16u / sizeof(T);
+    uint32_t vec_count     = rc / TPV;
+    int4* out4             = reinterpret_cast<int4*>(out);
+    int4 packed;
+    T* lanes = reinterpret_cast<T*>(&packed);
 #pragma unroll
-      for (uint32_t i = 0; i < TPV; ++i)
-        lanes[i] = val;
-      for (uint32_t v = threadIdx.x; v < vec_count; v += blockDim.x) {
-        __stwt(out4 + v, packed);
-      }
-      uint32_t tail_start = vec_count * TPV;
-      for (uint32_t i = tail_start + threadIdx.x; i < rc; i += blockDim.x) {
-        __stwt(out + i, val);
-      }
-    } else {
-      for (uint32_t i = threadIdx.x; i < rc; i += blockDim.x) {
-        __stwt(out + i, val);
-      }
+    for (uint32_t i = 0; i < TPV; ++i)
+      lanes[i] = val;
+    for (uint32_t v = threadIdx.x; v < vec_count; v += blockDim.x) {
+      __stwt(out4 + v, packed);
+    }
+    uint32_t tail_start = vec_count * TPV;
+    for (uint32_t i = tail_start + threadIdx.x; i < rc; i += blockDim.x) {
+      __stwt(out + i, val);
     }
     return;
   }
@@ -292,30 +296,26 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
   // CONSTANT_DELTA — out[i] = frame + i*delta.
   //===--------------------------------------------------------------------===//
   if (mode == BitpackingMode::CONSTANT_DELTA) {
-    T const frame = sm_frame;
-    T const delta = sm_aux;
-    if constexpr (sizeof(T) <= 8 && 16u % sizeof(T) == 0u) {
-      constexpr uint32_t TPV = 16u / sizeof(T);
-      uint32_t vec_count     = rc / TPV;
-      int4* out4             = reinterpret_cast<int4*>(out);
-      for (uint32_t v = threadIdx.x; v < vec_count; v += blockDim.x) {
-        int4 packed;
-        T* lanes        = reinterpret_cast<T*>(&packed);
-        uint32_t base_v = v * TPV;
+    // sizeof(T) constraint enforced by the static_assert in the CONSTANT
+    // branch above — reach here only via the same template instantiations.
+    T const frame          = sm_frame;
+    T const delta          = sm_aux;
+    constexpr uint32_t TPV = 16u / sizeof(T);
+    uint32_t vec_count     = rc / TPV;
+    int4* out4             = reinterpret_cast<int4*>(out);
+    for (uint32_t v = threadIdx.x; v < vec_count; v += blockDim.x) {
+      int4 packed;
+      T* lanes        = reinterpret_cast<T*>(&packed);
+      uint32_t base_v = v * TPV;
 #pragma unroll
-        for (uint32_t i = 0; i < TPV; ++i) {
-          lanes[i] = static_cast<T>(frame + static_cast<T>(base_v + i) * delta);
-        }
-        __stwt(out4 + v, packed);
+      for (uint32_t i = 0; i < TPV; ++i) {
+        lanes[i] = static_cast<T>(frame + static_cast<T>(base_v + i) * delta);
       }
-      uint32_t tail_start = vec_count * TPV;
-      for (uint32_t i = tail_start + threadIdx.x; i < rc; i += blockDim.x) {
-        __stwt(out + i, static_cast<T>(frame + static_cast<T>(i) * delta));
-      }
-    } else {
-      for (uint32_t i = threadIdx.x; i < rc; i += blockDim.x) {
-        __stwt(out + i, static_cast<T>(frame + static_cast<T>(i) * delta));
-      }
+      __stwt(out4 + v, packed);
+    }
+    uint32_t tail_start = vec_count * TPV;
+    for (uint32_t i = tail_start + threadIdx.x; i < rc; i += blockDim.x) {
+      __stwt(out + i, static_cast<T>(frame + static_cast<T>(i) * delta));
     }
     return;
   }

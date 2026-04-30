@@ -26,9 +26,11 @@
 //
 // Modes covered: CONSTANT, CONSTANT_DELTA, FOR, DELTA_FOR. AUTO is a meta-
 // mode that DuckDB resolves to one of the four concrete modes per segment;
-// it never appears at this layer. INVALID metadata is treated as a no-op
-// (the popcount kernel sees the pre-allocated buffer as-is) — viability is
-// expected to keep malformed segments out of this dispatcher.
+// it never appears at this layer. INVALID metadata is treated as a no-op:
+// the kernel returns without writing, leaving the column's data buffer in
+// its uninitialised post-allocation state for that group's row range.
+// Viability is expected to keep malformed segments out of this dispatcher;
+// the no-op behaviour is a defensive backstop, not a runtime fallback.
 //
 // The constants and enum below are public so test fixtures can synthesise
 // segment bytes without standing up a DuckDB connection.

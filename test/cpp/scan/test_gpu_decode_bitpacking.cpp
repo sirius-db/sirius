@@ -481,6 +481,31 @@ TEST_CASE("gpu_decode_table BITPACKING - width > sizeof(T)*8 is a no-op",
   REQUIRE_NOTHROW(gpu_decode_table({col}, stream.view(), &mr));
 }
 
+TEST_CASE("gpu_decode_table BITPACKING - packed stream past metadata_end is a no-op",
+          "[scan][decode][bitpacking][defensive]")
+{
+  // Build a FOR block whose declared row_count would require packed_words
+  // that overflow past metadata_end. The kernel must catch the packed-stream
+  // bound check and bail to INVALID rather than reading past the segment.
+  // We construct a minimal FOR block (8 packed values, width=4) and lie to
+  // the dispatcher that the segment carries 2048 rows — packed_words for
+  // 2048 rows at width=4 is 256 words = 1024 bytes, well past the segment.
+  auto bytes = make_for_block<int32_t>(/*frame=*/0, /*width=*/4, std::vector<int32_t>(8, 1));
+
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+
+  gpu_column_decode_input col;
+  col.out_type   = I32;
+  col.total_rows = 2048;
+  col.data.push_back(
+    {CompressionType::COMPRESSION_BITPACKING,
+     {gpu_segment_desc{
+       static_cast<uint8_t const*>(d_seg.data()), static_cast<uint32_t>(d_seg.size()), 0, 2048}}});
+  REQUIRE_NOTHROW(gpu_decode_table({col}, stream.view(), &mr));
+}
+
 TEST_CASE("gpu_decode_table BITPACKING - unsupported type_size throws",
           "[scan][decode][bitpacking][defensive]")
 {
