@@ -141,8 +141,7 @@ TEST_CASE("scan_plan::build_inject_fn returns null when output_layout is empty",
   REQUIRE(plan.build_inject_fn() == nullptr);
 }
 
-TEST_CASE("scan_plan::build_inject_fn returns null on identity layout",
-          "[scan][partition_inject]")
+TEST_CASE("scan_plan::build_inject_fn returns null on identity layout", "[scan][partition_inject]")
 {
   // No partitions, output_layout is 1:1 over data_columns in order — the reader's
   // natural output is what downstream wants. No reshaping needed.
@@ -331,7 +330,7 @@ TEST_CASE("build_partition_inject_fn injects partition values by precomputed ind
 
   // partition_values follows hive_partition_columns order: [year, month] = [2024, 11].
   // file_path is required by the legacy typedef but ignored by this closure.
-  auto input  = make_table({{42, 43}});
+  auto input = make_table({{42, 43}});
   auto output =
     fn(std::move(input), "/data/year=2024/month=11/p.parquet", {"2024", "11"}, k_stream);
 
@@ -386,11 +385,7 @@ TEST_CASE("parquet_scan_data preserves partition_values through construction",
 
   std::vector<std::string> partition_values{"2024", "11", "us-west"};
 
-  sscan::parquet_scan_data data(std::move(slices),
-                                reader_options,
-                                filter,
-                                plan,
-                                partition_values);
+  sscan::parquet_scan_data data(std::move(slices), reader_options, filter, plan, partition_values);
 
   REQUIRE(data.partition_values == std::vector<std::string>{"2024", "11", "us-west"});
 }
