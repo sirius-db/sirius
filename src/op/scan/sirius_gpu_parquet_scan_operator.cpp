@@ -187,7 +187,7 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
     if (duckdb_expr) {
       sirius::gpu_expression_executor gpu_expression_executor(
         duckdb_expr.get(), cudf::get_current_device_resource_ref(), stream);
-      auto input_batch  = sirius::make_data_batch(std::move(table), mem_space);
+      auto input_batch  = sirius::make_data_batch(std::move(table), mem_space, stream);
       auto output_batch = gpu_expression_executor.select(input_batch);
       if (!output_batch) {
         return std::make_unique<pipelineable_operator_data>(
@@ -222,7 +222,7 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
   }
 
   // Wrap the GPU table in operator_data for the downstream pipeline.
-  auto batch = sirius::make_data_batch(std::move(table), mem_space);
+  auto batch = sirius::make_data_batch(std::move(table), mem_space, stream);
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
   batches.push_back(std::move(batch));
   return std::make_unique<pipelineable_operator_data>(std::move(batches));

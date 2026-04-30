@@ -149,7 +149,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
       if (partition_views[i].num_rows() == 0) { continue; }
       auto partition_table =
         std::make_unique<cudf::table>(partition_views[i], stream, space->get_default_allocator());
-      output_batches.push_back(make_data_batch(std::move(partition_table), *space));
+      output_batches.push_back(make_data_batch(std::move(partition_table), *space, stream));
     }
   }
 

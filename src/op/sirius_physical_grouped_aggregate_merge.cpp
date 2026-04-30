@@ -263,7 +263,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   }
 
   auto output_table = std::make_unique<cudf::table>(std::move(output_cols), stream, mr);
-  auto result       = sirius::make_data_batch(std::move(output_table), *space);
+  auto result       = sirius::make_data_batch(std::move(output_table), *space, stream);
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<::cucascade::data_batch>>{result});
 }

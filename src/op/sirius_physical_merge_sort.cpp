@@ -110,7 +110,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
     }
     auto projected_table = std::make_unique<cudf::table>(
       cudf::table_view(projected_cols), stream, space->get_default_allocator());
-    return sirius::make_data_batch(std::move(projected_table), *space);
+    return sirius::make_data_batch(std::move(projected_table), *space, stream);
   };
 
   // Single batch: no merge needed

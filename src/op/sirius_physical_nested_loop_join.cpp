@@ -440,7 +440,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
     SIRIUS_LOG_DEBUG("Pipeline {}: nested loop join, 1 empty output batches", pipeline_id);
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{
-        make_data_batch(std::move(empty_table), *space)});
+        make_data_batch(std::move(empty_table), *space, stream)});
   }
 
   std::unique_ptr<cudf::table> result_table;
@@ -609,7 +609,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
         SIRIUS_LOG_DEBUG("Pipeline {}: nested loop join, 1 output batches", pipeline_id);
         return std::make_unique<pipelineable_operator_data>(
           std::vector<std::shared_ptr<cucascade::data_batch>>{
-            make_data_batch(std::move(gathered), *space)});
+            make_data_batch(std::move(gathered), *space, stream)});
       }
       case duckdb::JoinType::ANTI: {
         auto left_indices = cudf::conditional_left_anti_join(
@@ -626,7 +626,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
         SIRIUS_LOG_DEBUG("Pipeline {}: nested loop join, 1 output batches", pipeline_id);
         return std::make_unique<pipelineable_operator_data>(
           std::vector<std::shared_ptr<cucascade::data_batch>>{
-            make_data_batch(std::move(gathered), *space)});
+            make_data_batch(std::move(gathered), *space, stream)});
       }
       case duckdb::JoinType::OUTER:
         join_result =
@@ -682,7 +682,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
   SIRIUS_LOG_DEBUG("Pipeline {}: nested loop join, 1 output batches", pipeline_id);
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<cucascade::data_batch>>{
-      make_data_batch(std::move(result_table), *space)});
+      make_data_batch(std::move(result_table), *space, stream)});
 }
 
 }  // namespace op

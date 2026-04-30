@@ -60,49 +60,21 @@ inline cudf::table_view get_cudf_table_view(const cucascade::data_batch& batch)
 }
 
 /**
- * @brief Create a shared_ptr<data_batch> from a cudf::table.
+ * @brief Create a shared_ptr<data_batch> from a cudf::table, recording the writer event.
  *
- * @param table The cudf table (will be moved from).
- * @param memory_space The memory space where the table resides.
- * @return std::shared_ptr<cucascade::data_batch> The new data batch.
- */
-inline std::shared_ptr<cucascade::data_batch> make_data_batch(
-  cudf::table&& table, cucascade::memory::memory_space& memory_space)
-{
-  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
-    std::make_unique<cudf::table>(std::move(table)), memory_space);
-  return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(gpu_repr));
-}
-
-/**
- * @brief Create a shared_ptr<data_batch> from a unique_ptr<cudf::table>.
- *
- * @param table The cudf table (will be moved from).
- * @param memory_space The memory space where the table resides.
- * @return std::shared_ptr<cucascade::data_batch> The new data batch.
- */
-inline std::shared_ptr<cucascade::data_batch> make_data_batch(
-  std::unique_ptr<cudf::table> table, cucascade::memory::memory_space& memory_space)
-{
-  auto gpu_repr =
-    std::make_unique<cucascade::gpu_table_representation>(std::move(table), memory_space);
-  return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(gpu_repr));
-}
-
-/**
- * @brief Create a shared_ptr<data_batch> from a cudf::table, recording a writer event.
- *
- * STREAM-LINEAGE: this overload should be used by any operator producing GPU
- * output on a writer stream that may later be consumed by a peer-device
- * reader. Recording the writer event allows
- * cucascade::convert_gpu_to_gpu() to call
- * cudaStreamWaitEvent(reader_stream, writer_event, 0) before peer-copying source
- * buffers, closing the cross-mempool stream-ordered race that compute-sanitizer
- * flagged on every GPU->GPU conversion in TPC-H multi-GPU runs (Phase 13-02).
+ * STREAM-LINEAGE (Phase 13-04 Path-2): @p writer_stream is REQUIRED. Every
+ * data_batch carrying a gpu_table_representation is born with a recorded
+ * writer event so cucascade::convert_gpu_to_gpu() can call
+ * cudaStreamWaitEvent(reader_stream, writer_event, 0) before peer-copying
+ * source buffers. This closes the cross-mempool stream-ordered race that
+ * compute-sanitizer flagged on every GPU->GPU conversion in TPC-H multi-GPU
+ * runs (Phase 13-02).
  *
  * @param table The cudf table (will be moved from).
  * @param memory_space The memory space where the table resides.
  * @param writer_stream The stream on which @p table's data was last written.
+ *                      MUST be the actual writer stream — passing the wrong
+ *                      stream re-opens the race this contract closes.
  * @return std::shared_ptr<cucascade::data_batch> The new data batch.
  */
 inline std::shared_ptr<cucascade::data_batch> make_data_batch(
@@ -111,13 +83,12 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
   rmm::cuda_stream_view writer_stream)
 {
   auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
-    std::make_unique<cudf::table>(std::move(table)), memory_space);
-  gpu_repr->record_writer_event(writer_stream);
+    std::make_unique<cudf::table>(std::move(table)), memory_space, writer_stream);
   return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(gpu_repr));
 }
 
 /**
- * @brief Create a shared_ptr<data_batch> from a unique_ptr<cudf::table>, recording a writer event.
+ * @brief Create a shared_ptr<data_batch> from a unique_ptr<cudf::table>, recording the writer event.
  *
  * @copydoc make_data_batch(cudf::table&&, cucascade::memory::memory_space&,
  *                          rmm::cuda_stream_view)
@@ -127,9 +98,8 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
   cucascade::memory::memory_space& memory_space,
   rmm::cuda_stream_view writer_stream)
 {
-  auto gpu_repr =
-    std::make_unique<cucascade::gpu_table_representation>(std::move(table), memory_space);
-  gpu_repr->record_writer_event(writer_stream);
+  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
+    std::move(table), memory_space, writer_stream);
   return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(gpu_repr));
 }
 

@@ -112,11 +112,11 @@ std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(
     // cudf::slice returns a vector of table_views; materialize into a table
     auto sliced_table = std::make_unique<cudf::table>(
       slices.front(), stream, batch->get_memory_space()->get_default_allocator());
-    // STREAM-LINEAGE: cudf::table copy-ctor writes on `stream`; record the
-    // writer event for downstream cross-device readers (Phase 13-02).
+    // STREAM-LINEAGE: cudf::table copy-ctor writes on `stream`; the constructor
+    // records the writer event for downstream cross-device readers (Phase 13-02
+    // / 13-04 Path-2).
     auto sliced_repr = std::make_unique<cucascade::gpu_table_representation>(
-      std::move(sliced_table), *batch->get_memory_space());
-    sliced_repr->record_writer_event(stream);
+      std::move(sliced_table), *batch->get_memory_space(), stream);
     std::unique_ptr<cucascade::idata_representation> output_data = std::move(sliced_repr);
 
     auto const batch_id = ::sirius::get_next_batch_id();

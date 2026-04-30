@@ -286,11 +286,14 @@ std::shared_ptr<cucascade::data_batch> GpuExpressionExecutor::execute(
   }
 
   // Create the data representation
+  // STREAM-LINEAGE: writes happened on execution_stream; the constructor
+  // records the writer event for cross-device readers (Phase 13-04 Path-2).
   std::unique_ptr<cucascade::idata_representation> output_data_rep =
     std::make_unique<cucascade::gpu_table_representation>(
       std::move(
         std::make_unique<cudf::table>(std::move(output_columns), execution_stream, resource_ref)),
-      *input_batch->get_memory_space());
+      *input_batch->get_memory_space(),
+      execution_stream);
 
   // Create the data batch and return
   auto const batch_id = ::sirius::get_next_batch_id();
@@ -354,9 +357,11 @@ std::shared_ptr<cucascade::data_batch> GpuExpressionExecutor::select(
   // Apply the bitmap
   auto output_table =
     cudf::apply_boolean_mask(input_table, bitmap->view(), execution_stream, resource_ref);
+  // STREAM-LINEAGE: writes happened on execution_stream; the constructor
+  // records the writer event for cross-device readers (Phase 13-04 Path-2).
   std::unique_ptr<cucascade::idata_representation> output_data_rep =
-    std::make_unique<cucascade::gpu_table_representation>(std::move(output_table),
-                                                          *input_batch->get_memory_space());
+    std::make_unique<cucascade::gpu_table_representation>(
+      std::move(output_table), *input_batch->get_memory_space(), execution_stream);
 
   // Create the data batch and return
   auto const batch_id = ::sirius::get_next_batch_id();

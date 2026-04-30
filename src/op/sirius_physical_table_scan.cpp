@@ -131,11 +131,11 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     }
     if (table_views.size() > 1 && space) {
       auto concatenated = cudf::concatenate(table_views, stream, space->get_default_allocator());
-      auto concat_rep =
-        std::make_unique<cucascade::gpu_table_representation>(std::move(concatenated), *space);
-      // STREAM-LINEAGE: cudf::concatenate writes to `stream`; record it so
-      // cross-device readers honor the producer-consumer ordering (Phase 13-02).
-      concat_rep->record_writer_event(stream);
+      // STREAM-LINEAGE: cudf::concatenate writes to `stream`; the constructor
+      // records it so cross-device readers honor the producer-consumer ordering
+      // (Phase 13-02 / 13-04 Path-2).
+      auto concat_rep = std::make_unique<cucascade::gpu_table_representation>(
+        std::move(concatenated), *space, stream);
       single_batch = std::make_shared<cucascade::data_batch>(0, std::move(concat_rep));
     }
   }
@@ -215,13 +215,12 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
 
     auto projected_table = std::make_unique<cudf::table>(std::move(selected));
     auto* space          = output_batch->get_memory_space();
-    auto projected_rep =
-      std::make_unique<cucascade::gpu_table_representation>(std::move(projected_table), *space);
     // STREAM-LINEAGE: projection is a metadata-only column re-shuffle on top
     // of the upstream cudf table; the relevant write completion is on `stream`
-    // (the operator's compute stream), so record it here for downstream
-    // cross-device readers (Phase 13-02).
-    projected_rep->record_writer_event(stream);
+    // (the operator's compute stream), so the constructor records it here for
+    // downstream cross-device readers (Phase 13-02 / 13-04 Path-2).
+    auto projected_rep = std::make_unique<cucascade::gpu_table_representation>(
+      std::move(projected_table), *space, stream);
     output_batch = std::make_shared<cucascade::data_batch>(output_batch->get_batch_id(),
                                                            std::move(projected_rep));
   }

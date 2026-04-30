@@ -709,7 +709,7 @@ static std::unique_ptr<operator_data> gather_join_output(
   auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols), stream);
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<::cucascade::data_batch>>{
-      make_data_batch(std::move(output_cudf_table), memory_space)});
+      make_data_batch(std::move(output_cudf_table), memory_space, stream)});
 }
 
 /// Assemble output for a distinct_hash_join left_join.
@@ -750,7 +750,7 @@ static std::unique_ptr<operator_data> gather_distinct_left_join_output(
   auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols), stream);
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<::cucascade::data_batch>>{
-      make_data_batch(std::move(output_cudf_table), memory_space)});
+      make_data_batch(std::move(output_cudf_table), memory_space, stream)});
 }
 
 /// @brief the MARK join output from the semi_join matching row indices.
@@ -811,7 +811,7 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
   auto output_cudf_table = std::make_unique<cudf::table>(std::move(mark_out_cols), stream);
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<::cucascade::data_batch>>{
-      make_data_batch(std::move(output_cudf_table), *left_batch->get_memory_space())});
+      make_data_batch(std::move(output_cudf_table), *left_batch->get_memory_space(), stream)});
 }
 
 std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator_data& input_data,
