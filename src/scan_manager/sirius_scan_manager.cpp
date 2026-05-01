@@ -205,7 +205,7 @@ void sirius_scan_manager::run_driver_loop()
 
     try {
       auto future = it->second->start(*_thread_pool, *connector);
-      future.wait();
+      future.get();
     } catch (const std::exception& e) {
       SIRIUS_LOG_ERROR("[sirius_scan_manager] driver: provider failed: {}", e.what());
       // Make sure the consumer is unblocked even on failure.
