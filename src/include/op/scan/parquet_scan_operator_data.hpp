@@ -74,6 +74,8 @@ struct row_group_slice {
  *
  * Used as the unit of work for both the parquet split provider (partitioning) and
  * the GPU scan (byte-range preloading).
+ *
+ * @todo This needs to be deleted once Iceberg is integrated into scan manager framework.
  */
 struct row_group_range {
   row_group_range(std::size_t file_idx,

@@ -288,6 +288,10 @@ void SiriusContext::terminate()
 
   task_scheduler_->stop();
   task_scheduler_.reset();
+  if (scan_manager_) {
+    scan_manager_->stop();
+    scan_manager_->reset();
+  }
   task_creator_->stop_thread_pool();
   task_creator_.reset();
   if (scan_manager_) {

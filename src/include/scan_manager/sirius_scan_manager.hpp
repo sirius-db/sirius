@@ -20,6 +20,7 @@
 #include "exec/thread_pool.hpp"
 #include "scan_manager/split_provider.hpp"
 
+#include <exception>
 #include <memory>
 #include <thread>
 #include <utility>
@@ -82,6 +83,35 @@ class sirius_scan_manager {
   /// \brief Stop the worker thread pool and the driver. Idempotent.
   void stop();
 
+  /// \brief Close every registered operator's split_connector.
+  ///
+  /// Used by error/drain paths to wake task_creator workers that are parked
+  /// inside split_connector::get_next_split. Calling join on the task_creator
+  /// thread pool while a worker is parked there would otherwise hang
+  /// indefinitely. close() is idempotent on the connector, so racing with the
+  /// driver's own close on success is safe.
+  ///
+  /// Lifetime caveat: connectors are operator-owned (unique_ptr). Callers MUST
+  /// invoke this BEFORE the gpu scan operators are destroyed — typically from
+  /// the engine's catch handler before drain_after_error joins the task pools.
+  /// Calling it from SiriusContext::terminate() is unsafe because DuckDB tears
+  /// down the physical plan first, so the operator pointers in _providers
+  /// would dangle.
+  void close_all_connectors();
+
+  /// \brief Move out the first exception caught by run_driver_loop, if any.
+  ///
+  /// The driver loop captures a provider failure, closes all remaining
+  /// connectors so downstream consumers drain immediately, and stops
+  /// dispatching subsequent providers. Without this hook the failure would be
+  /// silently swallowed: closed connectors look like a normal end-of-stream to
+  /// the gpu scan operator, so the query would return undercount results.
+  ///
+  /// The engine should call this after task_scheduler's completion future
+  /// resolves and rethrow the captured exception so the standard
+  /// drain_after_error path runs.
+  std::exception_ptr take_driver_error();
+
  private:
   /// \brief Build a split_provider for @p op by reading its parquet scan_info
   ///        and installing the resulting hive-partition inject_fn (if any) on
@@ -98,6 +128,10 @@ class sirius_scan_manager {
     std::pair<op::scan::sirius_gpu_parquet_scan_operator*, std::unique_ptr<split_provider>>>
     _providers;
   std::thread _driver_thread;
+  /// First exception caught by run_driver_loop, if any. Picked up by the engine after
+  /// task_scheduler's future resolves so a partial scan failure surfaces instead of
+  /// silently undercounting. Cleared by reset() and by take_driver_error().
+  std::exception_ptr _driver_error;
 };
 
 }  // namespace sirius::scan_manager

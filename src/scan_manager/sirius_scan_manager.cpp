@@ -59,8 +59,13 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
 
     auto provider = create_provider_for(op);
     if (!provider) {
-      // No scan_info parked on the operator (e.g. tests construct the operator
-      // directly). Skip — caller is responsible for the connector.
+      // No scan_info parked on the operator. Expected in tests that construct the operator
+      // directly; in production the pipeline converter always parks scan_info on every
+      // GPU_PARQUET_SCAN source, so a hit here is a wiring bug. Warn so it gets noticed.
+      SIRIUS_LOG_WARN(
+        "[sirius_scan_manager::prepare_for_query] op_id={} has no scan_info; skipping. "
+        "Expected only in tests — caller is responsible for the connector.",
+        op->get_operator_id());
       continue;
     }
     op->set_split_connector(std::make_unique<split_connector>());
@@ -113,9 +118,15 @@ void sirius_scan_manager::run_driver_loop()
       future.get();
     } catch (const std::exception& e) {
       SIRIUS_LOG_ERROR("[sirius_scan_manager] driver: provider failed: {}", e.what());
-      // Provider already closed the connector before setting the exception;
-      // closing again here is idempotent and covers synchronous start() throws.
-      connector->close();
+      // Capture the failure so the engine can rethrow it after task_scheduler's future
+      // resolves — otherwise the closed-but-undercount connector looks like normal end-of-stream
+      // to the gpu scan operator and the query returns wrong results silently.
+      _driver_error = std::current_exception();
+      // Provider already closed its own connector before setting the exception; close all
+      // remaining connectors so any other in-flight gpu scan ops drain immediately rather
+      // than blocking on dead providers we will not start. close() is idempotent.
+      close_all_connectors();
+      return;
     }
   }
 }
@@ -124,6 +135,7 @@ void sirius_scan_manager::reset()
 {
   if (_driver_thread.joinable()) { _driver_thread.join(); }
   _providers.clear();
+  _driver_error = nullptr;
 }
 
 void sirius_scan_manager::start()
@@ -137,10 +149,28 @@ void sirius_scan_manager::stop()
 {
   /// KEVIN: if the split_provider fails to deliver its future (e.g., unresponsive remote storage),
   /// stop() will hang here on the join().
+  /// TODO: need to propagate cancellation token to scheduled lambdas so each one decrements the
+  /// `remaining` count even though cancelled, and then close the connector once the cancellation is
+  /// observed.
   if (_driver_thread.joinable()) { _driver_thread.join(); }
   if (!_thread_pool) { return; }
   _thread_pool->stop();
   _thread_pool.reset();
+}
+
+void sirius_scan_manager::close_all_connectors()
+{
+  for (auto& [op, provider] : _providers) {
+    if (op == nullptr) { continue; }
+    if (auto* connector = op->get_split_connector()) { connector->close(); }
+  }
+}
+
+std::exception_ptr sirius_scan_manager::take_driver_error()
+{
+  std::exception_ptr err;
+  std::swap(err, _driver_error);
+  return err;
 }
 
 }  // namespace sirius::scan_manager

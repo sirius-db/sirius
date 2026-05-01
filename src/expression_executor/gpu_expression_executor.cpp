@@ -279,7 +279,7 @@ std::shared_ptr<data_batch> gpu_expression_executor::execute(
 
   // Get the table_view from the input_batch
   auto const& input_rep = input_batch->get_data()->cast<cucascade::gpu_table_representation>();
-  _input_table          = input_rep.get_table().view();
+  _input_table          = input_rep.get_table_view();
 
   // Execute the expressions and emit results into _output_columns
   for (auto& _expression : _expressions) {
@@ -340,7 +340,7 @@ std::shared_ptr<data_batch> gpu_expression_executor::select(std::shared_ptr<data
   // Call execute(input_batch) to set _input_table and produce the boolean mask as a single column
   auto mask_batch = execute(input_batch);
   auto& mask_repr = mask_batch->get_data()->cast<cucascade::gpu_table_representation>();
-  auto mask_view  = mask_repr.get_table().view().column(0);
+  auto mask_view  = mask_repr.get_table_view().column(0);
 
   // Apply the boolean mask to filter the input batch
   auto output_table = cudf::apply_boolean_mask(_input_table, mask_view, _stream, _mr);

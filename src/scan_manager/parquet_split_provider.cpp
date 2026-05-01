@@ -115,9 +115,7 @@ parquet_split_provider::parquet_split_provider(
 parquet_split_provider::~parquet_split_provider() = default;
 
 op::scan::partition_inject_fn_t parquet_split_provider::take_partition_inject_fn()
-{
-  return std::move(_partition_inject_fn);
-}
+{ return std::move(_partition_inject_fn); }
 
 std::optional<parquet_split_provider::file_batch> parquet_split_provider::next_task_input()
 {
@@ -235,9 +233,7 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
   rg_accumulator accum;
   // flush() pushes the bundled slices but does NOT reset partition_values. The file loop owns
   // partition_values and re-seeds it on every file iteration; clearing it here would orphan the
-  // post-flush tail of a mid-file overflow (the rest of the same file would land in an
-  // accumulator with nullopt partition_values, then get re-tagged with the NEXT file's values
-  // when the file loop advances — silently mislabeling rows).
+  // post-flush tail of a mid-file overflow.
   auto flush = [&]() {
     if (accum.slices.empty()) { return; }
     connector.push_split(std::make_unique<op::scan::parquet_scan_data>(
@@ -256,7 +252,7 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
     // constants from one path on behalf of the whole bundle, so mixing partitions would produce
     // wrong rows. Always (re-)seed partition_values for this file afterward — the previous
     // iteration may have flushed mid-file (byte-budget overflow), leaving accum.partition_values
-    // intact but accum.slices empty; either way, this file's values are what's authoritative now.
+    // intact but accum.slices empty.
     if (!_plan->partition_columns.empty()) {
       std::vector<std::string> file_partition_values;
       file_partition_values.reserve(_plan->partition_columns.size());
