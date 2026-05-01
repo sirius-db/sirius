@@ -89,6 +89,11 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
   cucascade::memory::memory_space* space = nullptr;
   for (auto const& batch : input_batches) {
     if (!batch) { continue; }
+    // INVARIANT (SCHED-RR contract): all input batches arrive on target_space
+    // via gpu_pipeline_task::execute_pipeline_task_round ->
+    // pipelineable_operator_data::prepare_for_processing -> lock_or_prepare_batch.
+    // batches[0]->get_memory_space() == target_space here.
+    // See .planning/phases/15-mgpu-operator-colocation-audit/15-AUDIT-LOG.md.
     if (!space) { space = batch->get_memory_space(); }
     valid_batches.push_back(batch);
   }

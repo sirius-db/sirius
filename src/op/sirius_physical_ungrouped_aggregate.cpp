@@ -336,6 +336,11 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
 
   for (auto const& batch : input_batches) {
     if (!batch) { continue; }
+    // INVARIANT (SCHED-RR contract): all input batches arrive on target_space
+    // via gpu_pipeline_task::execute_pipeline_task_round ->
+    // pipelineable_operator_data::prepare_for_processing -> lock_or_prepare_batch.
+    // batches[0]->get_memory_space() == target_space here.
+    // See .planning/phases/15-mgpu-operator-colocation-audit/15-AUDIT-LOG.md.
     auto* space = batch->get_memory_space();
     if (!space) { continue; }
 
@@ -502,6 +507,11 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
+  // INVARIANT (SCHED-RR contract): all input batches arrive on target_space
+  // via gpu_pipeline_task::execute_pipeline_task_round ->
+  // pipelineable_operator_data::prepare_for_processing -> lock_or_prepare_batch.
+  // batches[0]->get_memory_space() == target_space here.
+  // See .planning/phases/15-mgpu-operator-colocation-audit/15-AUDIT-LOG.md.
   cucascade::memory::memory_space* space = valid_batches[0]->get_memory_space();
   if (space == nullptr) {
     return std::make_unique<pipelineable_operator_data>(

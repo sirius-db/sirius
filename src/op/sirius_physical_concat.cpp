@@ -190,6 +190,11 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
       std::vector<std::shared_ptr<cucascade::data_batch>>{}, partition_idx);
   }
 
+  // INVARIANT (SCHED-RR contract): all input batches arrive on target_space
+  // via gpu_pipeline_task::execute_pipeline_task_round ->
+  // pipelineable_operator_data::prepare_for_processing -> lock_or_prepare_batch.
+  // batches[0]->get_memory_space() == target_space here.
+  // See .planning/phases/15-mgpu-operator-colocation-audit/15-AUDIT-LOG.md.
   cucascade::memory::memory_space* space = valid_batches[0]->get_memory_space();
   if (space == nullptr) { throw std::runtime_error("sirius_physical_concat: space is nullptr"); }
 

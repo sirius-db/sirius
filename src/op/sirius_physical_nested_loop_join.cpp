@@ -412,6 +412,11 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
   cudf::table_view left  = get_cudf_table_view(*left_batch);
   cudf::table_view right = get_cudf_table_view(*right_batch);
 
+  // INVARIANT (SCHED-RR contract): all input batches arrive on target_space
+  // via gpu_pipeline_task::execute_pipeline_task_round ->
+  // pipelineable_operator_data::prepare_for_processing -> lock_or_prepare_batch.
+  // batches[0]->get_memory_space() == target_space here.
+  // See .planning/phases/15-mgpu-operator-colocation-audit/15-AUDIT-LOG.md.
   cucascade::memory::memory_space* space = left_batch->get_memory_space();
   if (!space) {
     SIRIUS_LOG_DEBUG(

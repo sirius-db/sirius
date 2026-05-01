@@ -126,6 +126,11 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
       if (batch && batch->get_data()) {
         auto& gpu_rep = batch->get_data()->cast<cucascade::gpu_table_representation>();
         table_views.push_back(gpu_rep.get_table().view());
+        // INVARIANT (SCHED-RR contract): all input batches arrive on target_space
+        // via gpu_pipeline_task::execute_pipeline_task_round ->
+        // pipelineable_operator_data::prepare_for_processing -> lock_or_prepare_batch.
+        // batches[0]->get_memory_space() == target_space here.
+        // See .planning/phases/15-mgpu-operator-colocation-audit/15-AUDIT-LOG.md.
         if (!space) { space = batch->get_memory_space(); }
       }
     }
