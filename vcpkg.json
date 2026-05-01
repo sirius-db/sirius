@@ -13,7 +13,8 @@
     "cudf",
     "yaml-cpp",
     "abseil",
-    "numactl"
+    "numactl",
+    "liburing"
   ],
   "overrides": [
     {
