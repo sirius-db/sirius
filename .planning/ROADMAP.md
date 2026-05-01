@@ -80,7 +80,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 | 12. Fix vector::at(2) in small-sort plan path | v1.3 | 4/4 | Complete    | 2026-04-29 |
 | 13. Fix Q11 multi-GPU hang/illegal-address | v1.3 | 4/5 | Complete    | 2026-04-30 |
 | 14. Land SCHED-RR distribution | v1.3 | 2/2 | Complete    | 2026-04-30 |
-| 15. Cross-GPU operator-colocation audit | v1.3 | 2/4 | In Progress|  |
+| 15. Cross-GPU operator-colocation audit | v1.3 | 3/4 | In Progress|  |
 
 ## Phase context
 
