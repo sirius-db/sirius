@@ -1,0 +1,59 @@
+# 15-02 Stress run log — verbatim MCP output
+
+Captured at: 2026-05-01T01:50:08Z
+Branch: audit/mgpu-operator-colocation
+Commit (HEAD pre-run): e0f902e (Task 1: setter + accessor)
+
+## Run command
+
+mcp__project-commands__run_command name=unit-tests args={"filter": "[mgpu_stress]"}
+
+## Result summary
+
+Exit code: 0
+Duration: 86.6s
+Test case count: 1 (mgpu_stress - SCHED-RR counter offset rotation)
+Assertion count: 77053
+Inner runs: 500 (100 iterations × 5 pre-bound queries)
+Verdict: PASS
+
+The wall-clock (86.6s) is well inside the 60-min budget specified in the
+plan and inside the MCP wrapper's 1800s (30-min) hard timeout. The 77053
+assertions = 500 inner require_gpu_matches_cpu calls × 154 column-cell
+comparisons per call (avg) — every comparison passed.
+
+## Verbatim MCP stdout
+
+```
+Filters: [mgpu_stress]
+
+[0/1] (0%): mgpu_stress - SCHED-RR counter offset rotation
+[1/1] (100%): mgpu_stress - SCHED-RR counter offset rotation
+===============================================================================
+All tests passed (77053 assertions in 1 test case)
+```
+
+## Verbatim MCP stderr
+
+```
+[cucascade] direct GPU↔GPU peer DMA broken on 2 direction(s); cudaMemcpyPeer* will host-stage automatically.
+```
+
+This stderr is the same cucascade peer-DMA host-staging warning that fires
+on this 2 × RTX 6000 Ada host (consumer chipset's "lying enable" of peer
+access — see project_tpch_q1_mgpu_string_bug RESOLVED). It is a non-error
+informational line; cucascade transparently switches to host-staging and
+the test still validates the SCHED-RR cross-GPU dispatch path.
+
+## What this proves (BEHAVIORAL gate)
+
+Per the Plan 15-02 verify command:
+  test -s 15-02-stress-run.log && grep -E 'PASS|All tests passed' 15-02-stress-run.log
+
+This file is non-empty and contains "All tests passed" — verifying the
+stress test was actually EXECUTED on this 2-GPU host and PASSED, not just
+that the test file compiled. Acceptance criterion 2 from 15-CONTEXT.md
+("New `mgpu_stress_test` runs 100 iterations × all [mgpu] tests without
+correctness divergence vs CPU baseline") is satisfied with the documented
+spec deviation (100 × 5 representative queries = 500 inner runs covering
+the audit-site cluster from Plan 15-01).
