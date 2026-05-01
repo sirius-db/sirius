@@ -389,13 +389,14 @@ exec_result run_execute(memory_space& space,
   auto wrapped = sirius::wrap_many(std::move(exprs));
   exp_executor executor(wrapped, get_resource_ref(space), cudf::get_default_stream(), strategy);
   auto input_ro     = input_batch->to_read_only();
-  auto output_batch = executor.execute(input_ro);
-  REQUIRE(output_batch != nullptr);
-  // table_views remain valid as long as the batches (input_batch, output_batch) are alive.
-  // get_cudf_table_view acquires a temporary lock to read the view, then releases it.
-  auto in_view  = sirius::get_cudf_table_view(*input_batch);
-  auto out_view = sirius::get_cudf_table_view(*output_batch);
-  return {input_batch, output_batch, in_view, out_view};
+  auto& in_repr     = input_ro.get_data()->cast<gpu_table_representation>();
+  auto output_table = executor.execute(in_repr.get_table_view());
+  REQUIRE(output_table != nullptr);
+  auto output_batch =
+    sirius::make_data_batch(std::move(output_table), *input_ro.get_memory_space());
+  auto output_ro = output_batch->to_read_only();
+  auto& out_repr = output_ro.get_data()->cast<gpu_table_representation>();
+  return {input_batch, output_batch, in_repr.get_table_view(), out_repr.get_table_view()};
 }
 
 exec_result run_select(memory_space& space,
@@ -406,12 +407,14 @@ exec_result run_select(memory_space& space,
   auto wrapped = sirius::wrap_many(std::move(exprs));
   exp_executor executor(wrapped, get_resource_ref(space), cudf::get_default_stream(), strategy);
   auto input_ro     = input_batch->to_read_only();
-  auto output_batch = executor.select(input_ro);
-  REQUIRE(output_batch != nullptr);
-  // table_views remain valid as long as the batches (input_batch, output_batch) are alive.
-  auto in_view  = sirius::get_cudf_table_view(*input_batch);
-  auto out_view = sirius::get_cudf_table_view(*output_batch);
-  return {input_batch, output_batch, in_view, out_view};
+  auto& in_repr     = input_ro.get_data()->cast<gpu_table_representation>();
+  auto output_table = executor.select(in_repr.get_table_view());
+  REQUIRE(output_table != nullptr);
+  auto output_batch =
+    sirius::make_data_batch(std::move(output_table), *input_ro.get_memory_space());
+  auto output_ro = output_batch->to_read_only();
+  auto& out_repr = output_ro.get_data()->cast<gpu_table_representation>();
+  return {input_batch, output_batch, in_repr.get_table_view(), out_repr.get_table_view()};
 }
 
 // Helper: make a BoundFunctionExpression with the given name, arg types, return type, and children.

@@ -17,10 +17,13 @@
 #include "op/sirius_physical_projection.hpp"
 
 #include "config.hpp"
+#include "data/data_batch_utils.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
 #include <duckdb/common/exception.hpp>
 
 namespace sirius {
@@ -53,8 +56,10 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
   output_batches.reserve(input_batches.size());
 
   for (auto const& batch : input_batches) {
-    auto projected_batch = gpu_expression_executor.execute(batch);
-    if (projected_batch) { output_batches.push_back(std::move(projected_batch)); }
+    auto projected_table = gpu_expression_executor.execute(
+      batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
+    output_batches.push_back(
+      sirius::make_data_batch(std::move(projected_table), *batch.get_memory_space()));
   }
   return std::make_unique<pipelineable_operator_data>(output_batches);
 }

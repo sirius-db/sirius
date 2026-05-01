@@ -326,7 +326,7 @@ class gpu_expression_executor {
    * @param input_batch The read-only locked input batch against which to evaluate expressions.
    * @return A new idle batch containing the results of expression evaluation.
    */
-  std::shared_ptr<data_batch> execute(const ::cucascade::read_only_data_batch& input_batch);
+  std::unique_ptr<cudf::table> execute(cudf::table_view input);
 
   /**
    * @brief Selects rows from the input batch based on the executor's (singular) expression.
@@ -334,7 +334,7 @@ class gpu_expression_executor {
    * @param input_batch The read-only locked input batch from which to select rows.
    * @return A new idle batch containing the selected rows.
    */
-  std::shared_ptr<data_batch> select(const ::cucascade::read_only_data_batch& input_batch);
+  std::unique_ptr<cudf::table> select(cudf::table_view input);
 
  private:
   std::vector<duckdb::Expression const*> _expressions;  ///< The expressions to execute

@@ -18,7 +18,17 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "config.hpp"
+#include "data/data_batch_utils.hpp"
+#include "duckdb/common/file_system.hpp"
+#include "duckdb/common/open_file_info.hpp"
 #include "expression_executor/expression_executor_strategy.hpp"
+
+#include <cudf/io/parquet.hpp>
+#include <cudf/io/types.hpp>
+
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 // Forward-declare CUDA profiler API functions (linked via libcudart).
 extern "C" int cudaProfilerStart();
@@ -49,6 +59,7 @@ extern "C" int cudaProfilerStop();
 #endif
 #include "duckdb/main/connection_manager.hpp"
 #include "log/logging.hpp"
+#include "pin_table.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "sirius_interface.hpp"
@@ -645,6 +656,198 @@ static unique_ptr<FunctionData> ProfilerBind(ClientContext& context,
   return nullptr;
 }
 
+struct PinTableFunctionData : public TableFunctionData {
+  PinTableArgs args;
+  bool finished = false;
+};
+
+unique_ptr<FunctionData> SiriusExtension::PinTableBind(ClientContext& context,
+                                                       TableFunctionBindInput& input,
+                                                       vector<LogicalType>& return_types,
+                                                       vector<string>& names)
+{
+  auto result = make_uniq<PinTableFunctionData>();
+
+  if (input.inputs.empty() || input.inputs[0].IsNull()) {
+    throw BinderException("pin_table requires a non-null path argument");
+  }
+  result->args.path = input.inputs[0].ToString();
+
+  auto tier_it = input.named_parameters.find("tier");
+  if (tier_it == input.named_parameters.end() || tier_it->second.IsNull()) {
+    throw BinderException("pin_table requires a 'tier' named parameter");
+  }
+  result->args.tier = tier_it->second.ToString();
+  if (result->args.tier == "host") {
+    throw NotImplementedException("pin_table tier='host' is not yet supported");
+  }
+
+  auto name_it = input.named_parameters.find("name");
+  if (name_it == input.named_parameters.end() || name_it->second.IsNull()) {
+    throw BinderException("pin_table requires a 'name' named parameter");
+  }
+  result->args.name = name_it->second.ToString();
+
+  auto cols_it = input.named_parameters.find("cols");
+  if (cols_it != input.named_parameters.end() && !cols_it->second.IsNull()) {
+    vector<string> cols;
+    for (auto& val : ListValue::GetChildren(cols_it->second)) {
+      if (val.IsNull()) {
+        throw BinderException("pin_table 'cols' list cannot contain NULL entries");
+      }
+      cols.push_back(val.ToString());
+    }
+    result->args.cols = std::move(cols);
+  }
+
+  auto n_rows_it = input.named_parameters.find("n_rows");
+  if (n_rows_it != input.named_parameters.end() && !n_rows_it->second.IsNull()) {
+    result->args.n_rows = n_rows_it->second.GetValue<int64_t>();
+  }
+
+  return_types.emplace_back(LogicalType::BOOLEAN);
+  names.emplace_back("Success");
+  return std::move(result);
+}
+
+void SiriusExtension::PinTableFunction(ClientContext& context,
+                                       TableFunctionInput& data_p,
+                                       DataChunk& output)
+{
+  auto& data = data_p.bind_data->CastNoConst<PinTableFunctionData>();
+  if (data.finished) { return; }
+
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    std::cerr << "what the fuck is going on" << std::endl;
+    throw InvalidInputException("pin_table requires the Sirius context to be initialized");
+  }
+
+  // The cudf reader places the table on GPU; pick the first GPU memory space so the
+  // scan_manager can later wrap copies of these columns as data_batch instances.
+  auto& memory_manager = sirius_ctx->get_memory_manager();
+  auto gpu_spaces      = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  if (gpu_spaces.empty()) {
+    throw InvalidInputException("pin_table: no GPU memory space available");
+  }
+  auto& mem_space = const_cast<cucascade::memory::memory_space&>(*gpu_spaces[0]);
+
+  // Glob the user-supplied path into concrete files.
+  auto& fs   = FileSystem::GetFileSystem(context);
+  auto files = fs.GlobFiles(data.args.path);
+  std::vector<std::string> file_paths;
+  file_paths.reserve(files.size());
+  for (auto& f : files) {
+    file_paths.push_back(f.path);
+  }
+
+  // Only parquet files are supported. Validate by extension before reading.
+  auto has_parquet_ext = [](std::string const& p) {
+    constexpr std::string_view kExt = ".parquet";
+    if (p.size() < kExt.size()) { return false; }
+    auto tail = p.substr(p.size() - kExt.size());
+    std::transform(
+      tail.begin(), tail.end(), tail.begin(), [](unsigned char c) { return std::tolower(c); });
+    return tail == kExt;
+  };
+  for (auto const& path : file_paths) {
+    if (!has_parquet_ext(path)) {
+      throw InvalidInputException("pin_table only supports parquet files, got non-parquet path: " +
+                                  path);
+    }
+  }
+
+  std::vector<std::string> cols =
+    data.args.cols.has_value() ? *data.args.cols : std::vector<std::string>{};
+
+  // Chunk read limit (target bytes per emitted batch) comes from operator_params.
+  std::size_t const chunk_read_limit =
+    sirius_ctx->get_config().get_operator_params().scan_task_batch_size;
+
+  // Read each file via cudf::chunked_parquet_reader so each emitted batch stays within
+  // chunk_read_limit bytes. The optional n_rows budget caps the cumulative row count
+  // across files; once exhausted, stop early.
+  std::vector<std::unique_ptr<cudf::table>> tables;
+  std::vector<std::string> read_column_names;  // captured from parquet metadata
+  int64_t remaining_rows = data.args.n_rows.value_or(-1);
+  for (auto const& path : file_paths) {
+    if (data.args.n_rows.has_value() && remaining_rows <= 0) { break; }
+
+    auto opts = cudf::io::parquet_reader_options::builder(
+                  cudf::io::source_info{std::vector<std::string>{path}})
+                  .build();
+    if (!cols.empty()) { opts.set_column_names(cols); }
+    if (data.args.n_rows.has_value()) { opts.set_num_rows(remaining_rows); }
+
+    cudf::io::chunked_parquet_reader reader(chunk_read_limit, opts);
+    int64_t file_rows_read = 0;
+    while (reader.has_next()) {
+      auto chunk      = reader.read_chunk();
+      auto chunk_rows = static_cast<int64_t>(chunk.tbl->num_rows());
+      if (chunk_rows == 0) { break; }
+      if (read_column_names.empty()) {
+        read_column_names.reserve(chunk.metadata.schema_info.size());
+        for (auto const& col_info : chunk.metadata.schema_info) {
+          read_column_names.push_back(col_info.name);
+        }
+      }
+      file_rows_read += chunk_rows;
+      tables.emplace_back(std::move(chunk.tbl));
+    }
+    if (data.args.n_rows.has_value()) { remaining_rows -= file_rows_read; }
+  }
+
+  sirius_ctx->get_scan_manager().insert_pinned_entry(data.args.name,
+                                                     std::move(read_column_names),
+                                                     std::move(file_paths),
+                                                     std::move(tables),
+                                                     mem_space);
+
+  output.SetCardinality(1);
+  output.SetValue(0, 0, Value::BOOLEAN(true));
+  data.finished = true;
+}
+
+struct UnpinTableFunctionData : public TableFunctionData {
+  std::string name;
+  bool finished = false;
+};
+
+unique_ptr<FunctionData> SiriusExtension::UnpinTableBind(ClientContext& context,
+                                                         TableFunctionBindInput& input,
+                                                         vector<LogicalType>& return_types,
+                                                         vector<string>& names)
+{
+  auto result = make_uniq<UnpinTableFunctionData>();
+
+  if (input.inputs.empty() || input.inputs[0].IsNull()) {
+    throw BinderException("unpin_table requires a non-null name argument");
+  }
+  result->name = input.inputs[0].ToString();
+
+  return_types.emplace_back(LogicalType::BOOLEAN);
+  names.emplace_back("Success");
+  return std::move(result);
+}
+
+void SiriusExtension::UnpinTableFunction(ClientContext& context,
+                                         TableFunctionInput& data_p,
+                                         DataChunk& output)
+{
+  auto& data = data_p.bind_data->CastNoConst<UnpinTableFunctionData>();
+  if (data.finished) { return; }
+
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    throw InvalidInputException("unpin_table requires the Sirius context to be initialized");
+  }
+  sirius_ctx->get_scan_manager().remove_pinned_entry(data.name);
+
+  output.SetCardinality(1);
+  output.SetValue(0, 0, Value::BOOLEAN(true));
+  data.finished = true;
+}
+
 struct ProfilerFunctionData : public GlobalTableFunctionState {
   bool finished = false;
 };
@@ -714,6 +917,19 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     "profiler_stop", {}, ProfilerStopFunction, ProfilerBind, ProfilerInit);
   CreateTableFunctionInfo profiler_stop_info(profiler_stop);
   catalog.CreateTableFunction(transaction, profiler_stop_info);
+
+  TableFunction pin_table("pin_table", {LogicalType::VARCHAR}, PinTableFunction, PinTableBind);
+  pin_table.named_parameters["tier"]   = LogicalType::VARCHAR;
+  pin_table.named_parameters["name"]   = LogicalType::VARCHAR;
+  pin_table.named_parameters["cols"]   = LogicalType::LIST(LogicalType::VARCHAR);
+  pin_table.named_parameters["n_rows"] = LogicalType::BIGINT;
+  CreateTableFunctionInfo pin_table_info(pin_table);
+  catalog.CreateTableFunction(transaction, pin_table_info);
+
+  TableFunction unpin_table(
+    "unpin_table", {LogicalType::VARCHAR}, UnpinTableFunction, UnpinTableBind);
+  CreateTableFunctionInfo unpin_table_info(unpin_table);
+  catalog.CreateTableFunction(transaction, unpin_table_info);
 }
 
 static void SetUsePinMemory(ClientContext& context, SetScope scope, Value& parameter)
