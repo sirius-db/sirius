@@ -93,6 +93,15 @@ class convertible_data_batch : public convertible_data {
     }
     auto& mut = *mut_opt;
 
+    // Check if the batch is already in the target space
+    auto cur_space = mut.get_memory_space();
+    for (std::size_t idx = 0; idx < target_spaces.size(); ++idx) {
+      const auto* space = target_spaces[idx];
+      if (cur_space == space) {
+        return std::nullopt;
+      }
+    }
+
     auto data_size = mut.get_data()->get_size_in_bytes();
 
     for (std::size_t idx = 0; idx < target_spaces.size(); ++idx) {

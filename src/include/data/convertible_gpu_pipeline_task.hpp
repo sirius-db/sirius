@@ -302,8 +302,9 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
     for (const auto& batch : operator_data->get_data_batches()) {
       if (!batch) { continue; }
       if (batch->get_state() != cucascade::batch_state::idle) { continue; }
-      auto ro = batch->to_read_only();
-      if (ro.get_memory_space() == space) { return true; }
+      auto ro = batch->try_to_read_only();
+      if (!ro) { continue; }
+      if (ro->get_memory_space() == space) { return true; }
     }
 
     return false;
