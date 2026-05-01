@@ -160,7 +160,7 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
   if (filter_expression && !ast_expression) {
     sirius::gpu_expression_executor gpu_expression_executor(
       filter_expression.get(), cudf::get_current_device_resource_ref(), stream);
-    auto input_batch  = sirius::make_data_batch(std::move(table), mem_space);
+    auto input_batch    = sirius::make_data_batch(std::move(table), mem_space);
     auto input_batch_ro = input_batch->to_read_only();
     auto output_batch   = gpu_expression_executor.select(input_batch_ro);
     if (!output_batch) {
@@ -168,7 +168,8 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
         std::vector<std::shared_ptr<cucascade::data_batch>>());
     }
     auto output_mut = output_batch->to_mutable();
-      table = output_mut.get_data()->cast<cucascade::gpu_table_representation>().release_table(stream);
+    table =
+      output_mut.get_data()->cast<cucascade::gpu_table_representation>().release_table(stream);
     SIRIUS_LOG_DEBUG(
       "[sirius_gpu_parquet_scan_operator] Applied duckdb filter expression post parquet scan.");
   }

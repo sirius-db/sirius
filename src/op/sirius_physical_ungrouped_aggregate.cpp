@@ -514,7 +514,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   // Acquire read access to merged batch to extract table
   auto merged_ro = merged_batch->to_read_only();
   auto merged_view =
-    merged_ro.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();  
+    merged_ro.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
 
   std::vector<std::unique_ptr<cudf::column>> output_cols;
   output_cols.reserve(layout.aggregates.size());

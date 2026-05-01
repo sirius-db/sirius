@@ -234,7 +234,7 @@ void downgrade_executor::processing_loop()
     // === TIER 2: task_scheduler task queue ===
     if (!req->satisfied.load() && _pipeline_task_queue) {
       size_t max_tasks_to_convert = _pipeline_task_queue->size();
-      size_t tasks_converted = 0;
+      size_t tasks_converted      = 0;
       convertible_gpu_pipeline_task_provider pipeline_provider(*_pipeline_task_queue);
       while (!req->satisfied.load() && tasks_converted < max_tasks_to_convert) {
         auto candidate =
