@@ -183,6 +183,7 @@ set(EXTENSION_SOURCES
     src/op/scan/scan_plan.cpp
     src/op/scan/scan_utils.cpp
     src/op/scan/sirius_gpu_parquet_scan_operator.cpp
+    src/op/sirius_dynamic_filter.cpp
     src/op/sirius_physical_column_data_scan.cpp
     src/op/sirius_physical_cpu_source.cpp
     src/op/sirius_physical_concat.cpp
@@ -371,6 +372,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_table_scan.cpp
     test/cpp/operator/test_physical_top_n.cpp
     test/cpp/operator/test_physical_ungrouped_aggregate.cpp
+    test/cpp/operator/test_sirius_dynamic_filter.cpp
     test/cpp/parallel/test_task_executor.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
