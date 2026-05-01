@@ -3,7 +3,7 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Multi-GPU Distribution
 status: verifying
-stopped_at: "FU-A: merged fix/order-small-sort-rangecheck (Phase 12) into Phase 15 tip; [mgpu] expected 14/14. Phase 15 PASS, [integration][TPC-H] reconciled PASS, 13-04 verdict reconciled PASS."
+stopped_at: "FU-A complete: merged fix/order-small-sort-rangecheck (Phase 12) into Phase 15 tip. Post-merge [mgpu] 16/16 PASS, 79091 assertions, exit 0, 120.3s. v1.3 release-branch tip ready; only FU-B (speedup gate) remains open."
 last_updated: "2026-05-01T04:10:00.000Z"
 last_activity: 2026-05-01
 progress:
@@ -142,6 +142,7 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 - [Phase 15-03]: last-updated-commit marker bumped from 662eb28d to 75392110 (HEAD-at-edit-time = parent of new commit). Convention preserved: marker records tree state docs were reviewed against, not the new commit itself.
 - [Phase 15]: [15-04] Phase 15 ship-gate: Overall PASS via 4 MCP runs + 3 bash runs. C1 (audit) PASS — 11 INVARIANT comments, SAFE=11 NEEDS-PATCH=0 UNCLEAR=0. C2 (stress) PASS — exit 0, 87.1s, 77053 assertions (in-noise vs Wave 2's 86.6s). C3 (docs) PASS — per-task-device contract documented in pipeline-execution.md (4 hits) + README.md ToC (1 hit). Regression: [mgpu] PASS-with-Phase-12-note (12/13, identical Phase-12 single failure as Phase 14 baseline; resolved by FU-A merge below); [TPC-H][parquet] PASS — 22/22 in 81.6s, +1.6% vs Phase 14, Q11 specifically clean (CRITICAL Q11 home filter); [integration][TPC-H] reconciled PASS — 48/48 in 2:43, 71608 assertions (the earlier 1800s MCP timeout was a transient on this consumer host; 13-04 verdict reconciled PARTIAL → PASS). HYG-02 = 40 preserved. Phase 15 ships PASS.
 - [FU-A]: Merged `fix/order-small-sort-rangecheck` (Phase 12) into the v1.3 release-branch tip (`audit/mgpu-operator-colocation`). Source-conflict-free auto-merge of `src/op/sirius_physical_hash_join.cpp` (Phase 12 touched `prepare_join_keys` line ~622; Phase 13-04 touched constructor signatures elsewhere). Test addition in `test_physical_order_mgpu.cpp` integrates cleanly. STATE.md and ROADMAP.md conflicts resolved by keeping the post-Phase-15 view; Phase 12 planning files (12-01..12-04 SUMMARY, 12-VALIDATION, 12-stack-trace.txt) added.
+- [FU-A]: Post-merge MCP `[mgpu]` run 16/16 PASS, 79091 assertions, exit 0, 120.3s — was 12/13 pre-merge. The Phase 12 fix (bound-check on `key_col_indices` in `prepare_join_keys`) flipped `physical_order - small sort stays single-GPU` from FAIL → PASS, and the new `physical_order - small sort rangecheck regression` TEST_CASE (Phase 12 wave 3) joins the suite. The previously-reported 12/13 baseline lift target (14/14) was conservative; actual is 16/16 because the same filter now also captures the Phase 15 `mgpu_stress - SCHED-RR counter offset rotation` test (already passing on Phase 15 alone).
 
 ## Accumulated Context
 
@@ -192,5 +193,5 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 ## Session Continuity
 
 Last session: 2026-05-01T04:10:00.000Z
-Stopped at: FU-A — merged fix/order-small-sort-rangecheck into Phase 15 tip; resolved STATE.md and ROADMAP.md conflicts by keeping post-Phase-15 view. [mgpu] expected to lift from 12/13 to 14/14.
+Stopped at: FU-A complete — merged fix/order-small-sort-rangecheck into Phase 15 tip; resolved STATE.md and ROADMAP.md conflicts by keeping post-Phase-15 view. [mgpu] lifted 12/13 → 16/16 (79091 assertions, 120.3s, exit 0).
 Resume file: None
