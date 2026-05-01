@@ -32,7 +32,7 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Physical Plan Generation](physical-plan-generation.md) | Logical-to-physical mapping, pipeline construction, splitting rules |
 | [Operators](operators.md) | All physical operators: interface, GPU implementation, cuDF APIs |
 | [Expression Executor](expression-executor.md) | gpu_expression_executor, GPU expression translator, cuDF AST |
-| [Pipeline Execution](pipeline-execution.md) | GPU executor, task scheduling, completion, OOM handling |
+| [Pipeline Execution](pipeline-execution.md) | GPU executor, task scheduling, completion, OOM handling, per-task-device contract under SCHED-RR |
 | [Task Creator](task-creator.md) | Task creation: hint chain, per-operator scheduling behavior |
 | [Scan](scan.md) | Scan subsystem: parquet scan, DuckDB scan, caching, prefetched data source |
 | [Memory Management](memory-management.md) | cuCascade tiers, reservations, downgrade executor |
@@ -55,4 +55,4 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 11. **Configuration** — tuning knobs and runtime settings
 12. **Optimizations** — performance improvements and their mechanisms
 
-<!-- last-updated-commit: 662eb28df59609c188bec5ea1adae9388325f660 -->
+<!-- last-updated-commit: 75392110240075a4152dbc6c1fcefa9dfab01f3d -->
