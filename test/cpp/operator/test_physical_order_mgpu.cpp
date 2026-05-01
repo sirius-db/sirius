@@ -117,6 +117,53 @@ TEST_CASE("physical_order - large sort distributes across two GPUs",
   fs::remove_all(tmp, ec);
 }
 
+// Phase 12 regression: ORDER BY ... LIMIT over a tiny parquet surface MUST NOT
+// throw std::out_of_range / vector::_M_range_check when the partitioner yields
+// a 2-element partition vector. See 12-CONTEXT.md and 12-stack-trace.txt for
+// the original off-by-one site at sirius_physical_hash_join.cpp:622-637.
+TEST_CASE("physical_order - small sort rangecheck regression",
+          "[mgpu][operator-mgpu][order][gpu_execution][regression]")
+{
+  if (!require_two_gpus()) return;
+
+  auto tmp     = make_tmp_dir("rangecheck");
+  auto log_dir = tmp / "log";
+  auto yaml    = tmp / "mgpu.yaml";
+
+  // Tiny surface (4 files x 256 rows). Combined with hash_partition_bytes=1024
+  // below, this forces the partitioner into the 2-element vector shape that
+  // originally tripped vector::_M_range_check on the small-sort plan path.
+  constexpr int kNumFiles    = 4;
+  constexpr int kRowsPerFile = 256;
+  generate_parquet_surface(tmp,
+                           "SELECT (range * 17) % 1024 AS k, range AS v FROM range(" +
+                             std::to_string(kRowsPerFile) + ")",
+                           kNumFiles);
+
+  auto params                 = make_params();
+  params.hash_partition_bytes = 1024;  // force multi-partition on tiny data
+  write_mgpu_yaml(yaml, params);
+  REQUIRE(fs::exists(yaml));
+
+  scoped_log_dir logs(log_dir);
+
+  auto glob        = parquet_glob(tmp);
+  auto inner_query = "SELECT * FROM read_parquet('" + glob + "') ORDER BY k LIMIT 5";
+
+  {
+    scoped_mgpu_env env(yaml);
+    auto con = std::make_unique<duckdb::Connection>(env.make_connection());
+    // The actual regression assertion: this used to throw
+    // std::vector::_M_range_check inside gpu_execution. Post-12-02 it must
+    // round-trip cleanly and match CPU output row-for-row.
+    require_gpu_matches_cpu(*con, inner_query);
+    con.reset();
+  }
+
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+}
+
 TEST_CASE("physical_order - small sort stays single-GPU",
           "[mgpu][operator-mgpu][order][gpu_execution]")
 {
