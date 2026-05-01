@@ -37,7 +37,6 @@
 // standard library
 #include <stdexcept>
 #include <utility>
-#include <variant>
 
 namespace sirius::op::scan {
 
@@ -192,56 +191,48 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
     auto& gpu_rep    = cached->batch->get_data()->cast<cucascade::gpu_table_representation>();
     auto cached_view = gpu_rep.get_table_view();
 
-    // Apply the filter (only the duckdb::Expression variant is currently produced by
-    // sirius_scan_manager; the by-name translated_expression form is reserved for parquet
-    // reader pushdown and not applicable to an already-materialized cached table).
-    auto const* duckdb_filter =
-      std::get_if<std::shared_ptr<duckdb::Expression>>(&cached->filter_expression);
-    bool const has_filter     = (duckdb_filter != nullptr) && static_cast<bool>(*duckdb_filter);
-    bool const has_projection = !cached->post_filter_projection_ids.empty();
+    // The cached path carries only a DuckDB-expression filter (AST translation /
+    // reader pushdown is not applicable to an already-materialized cached table).
+    auto const has_filter = static_cast<bool>(cached->filter_expression);
+    auto const has_inject = static_cast<bool>(cached->inject_fn);
 
-    if (!has_filter && !has_projection) {
+    if (!has_filter && !has_inject) {
       // Fast path: forward the cached batch unchanged. Avoids any allocation or copy
       // since the cached batch's gpu_table_representation already views the pinned
-      // columns and co-owns them via the shared_ptr<column> chunks.
+      // columns and co-owns them via the shared_ptr<column> chunks. inject_fn is null
+      // exactly when the scan_plan's output_layout is identity over data_columns.
       std::vector<std::shared_ptr<cucascade::data_batch>> batches;
       batches.push_back(cached->batch);
       return std::make_unique<pipelineable_operator_data>(std::move(batches));
     }
 
     if (has_filter) {
+      // select() consumes the view and produces an owning table containing every D-column
+      // (filter columns included) restricted to the rows that pass the predicate.
       sirius::gpu_expression_executor gpu_expression_executor(
-        duckdb_filter->get(), cudf::get_current_device_resource_ref(), stream);
+        cached->filter_expression.get(), cudf::get_current_device_resource_ref(), stream);
       table = gpu_expression_executor.select(cached_view);
       SIRIUS_LOG_DEBUG(
         "[sirius_gpu_parquet_scan_operator] Applied duckdb filter expression on cached batch.");
+    } else {
+      // No filter but inject_fn is non-null (the plan permutes / drops columns relative to
+      // data_columns). Materialize the cached view into an owning table so inject_fn can
+      // release the columns by D-position and reassemble them in output_layout order.
+      std::vector<std::unique_ptr<cudf::column>> owned_cols;
+      owned_cols.reserve(cached_view.num_columns());
+      for (cudf::size_type i = 0; i < cached_view.num_columns(); ++i) {
+        owned_cols.push_back(std::make_unique<cudf::column>(
+          cached_view.column(i), stream, cudf::get_current_device_resource_ref()));
+      }
+      table = std::make_unique<cudf::table>(std::move(owned_cols));
     }
 
-    if (has_projection) {
-      auto columns = has_filter ? table->release() : std::vector<std::unique_ptr<cudf::column>>{};
-      std::vector<std::unique_ptr<cudf::column>> selected;
-      selected.reserve(cached->post_filter_projection_ids.size());
-      if (has_filter) {
-        for (auto const idx : cached->post_filter_projection_ids) {
-          if (idx >= columns.size()) {
-            throw std::runtime_error(
-              "[sirius_gpu_parquet_scan_operator] post_filter_projection_ids out of range");
-          }
-          selected.push_back(std::move(columns[idx]));
-        }
-      } else {
-        // No filter: deep-copy the projected columns out of the cached view so the
-        // emitted batch owns its memory independently of the pinned cache entry.
-        for (auto const idx : cached->post_filter_projection_ids) {
-          if (idx >= static_cast<std::size_t>(cached_view.num_columns())) {
-            throw std::runtime_error(
-              "[sirius_gpu_parquet_scan_operator] post_filter_projection_ids out of range");
-          }
-          selected.push_back(std::make_unique<cudf::column>(
-            cached_view.column(idx), stream, cudf::get_current_device_resource_ref()));
-        }
-      }
-      table = std::make_unique<cudf::table>(std::move(selected));
+    if (has_inject) {
+      // The cached path is gated upstream against hive partitions, so file_path is unused
+      // by the closure (it only matters for PARTITION entries). Pass an empty string.
+      table = cached->inject_fn(std::move(table), /*file_path=*/{}, stream);
+      SIRIUS_LOG_DEBUG(
+        "[sirius_gpu_parquet_scan_operator] Applied scan_plan inject_fn on cached batch.");
     }
 
     mem_space = cached->batch->get_memory_space();

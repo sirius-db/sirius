@@ -18,8 +18,8 @@
 
 #include "log/logging.hpp"
 #include "op/scan/parquet_scan_info.hpp"
-#include "op/scan/parquet_scan_task.hpp"  // detail::make_selected_column_indices
-#include "op/scan/scan_utils.hpp"  // build_batch_column_map, convert_table_filters_to_expression
+#include "op/scan/scan_plan.hpp"
+#include "op/scan/scan_utils.hpp"  // convert_table_filters_to_expression
 #include "op/scan/sirius_gpu_parquet_scan_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -87,10 +87,10 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
   auto info = op->take_scan_info();
   if (!info) { return nullptr; }
 
-  // If a pinned entry's file paths match this operator's scan_info, derive the
-  // columns this scan needs from the scan_info and look them up in the entry's
-  // per-column map. Hand the (column-by-column) chunks to a cached_split_provider
-  // which will assemble each batch on demand.
+  // If a pinned entry's file paths match this operator's scan_info, build the same
+  // scan_plan the parquet path would build and serve the scan from cache. The plan
+  // gives us the canonical D-space column layout, the C→D map for the filter, and
+  // the post-read assembly closure — same source of truth as parquet_split_provider.
   auto matches_scan_info = [&info](const pinned_entry& entry) {
     if (entry.file_paths.size() != info->file_paths.size()) { return false; }
     auto sorted_a = entry.file_paths;
@@ -107,76 +107,75 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
                                  pinned_name + "' has no memory_space");
       }
 
-      // Resolve the columns the scan reads, in column_ids order — same logic as
-      // parquet_split_provider's setup so the consumer sees identical column layout.
-      auto selected_indices =
-        op::scan::detail::make_selected_column_indices(info->column_ids, info->projection_ids);
+      // Build the canonical scan_plan once. Everything downstream — cached column
+      // layout, filter pushdown indices, post-read assembly — reads from this.
+      auto plan = op::scan::build_scan_plan(info->column_ids,
+                                            info->projection_ids,
+                                            info->names,
+                                            info->returned_types,
+                                            op->get_types().size(),
+                                            info->partition_indices);
 
+      // Hive partitions on a cached scan would require per-chunk file_path metadata
+      // that pinned entries don't carry today. Fall through to the parquet path,
+      // which extracts partition values per file at read time.
+      if (plan.has_partitions()) {
+        SIRIUS_LOG_DEBUG(
+          "[sirius_scan_manager::create_provider_for] pinned entry '{}' matches op_id={} but "
+          "scan has hive partitions; falling through to parquet_split_provider",
+          pinned_name,
+          op->get_operator_id());
+        break;
+      }
+
+      // Look up the pinned chunks for each D-position by name. data_columns is in
+      // D-order, so columns_per_request[d] is the chunk vector for D-position d.
       std::vector<std::vector<std::shared_ptr<cudf::column>>> columns_per_request;
-      columns_per_request.reserve(selected_indices.size());
-      for (auto idx : selected_indices) {
-        auto const& col_name = info->names[idx];
-        auto it              = entry.data_batches_by_column.find(col_name);
+      columns_per_request.reserve(plan.data_columns.size());
+      for (auto const& dc : plan.data_columns) {
+        auto it = entry.data_batches_by_column.find(dc.name);
         if (it == entry.data_batches_by_column.end()) {
           throw std::runtime_error("[sirius_scan_manager::create_provider_for] pinned entry '" +
-                                   pinned_name + "' missing column '" + col_name +
+                                   pinned_name + "' missing column '" + dc.name +
                                    "' required by scan op");
         }
         columns_per_request.push_back(it->second);
       }
 
-      // Replicate parquet_split_provider's filter / post-filter-projection setup so
-      // the cached scan sees the same downstream contract as the parquet path.
-      std::unordered_set<std::size_t> hive_partition_index_set;
-      for (auto const& hp : info->partition_indices) {
-        hive_partition_index_set.insert(hp.index);
-      }
-
-      std::variant<std::shared_ptr<cached_split_provider::translated_expression>,
-                   std::shared_ptr<duckdb::Expression>>
-        filter_expression;
-      bool has_filter = false;
+      // Filter expression: BoundReferences are in D-space, via plan.make_batch_column_map.
+      // Same recipe parquet_split_provider uses, so the filter evaluates correctly against
+      // the cached batch (which is in D-order by construction above).
+      std::shared_ptr<duckdb::Expression> filter_expression;
       if (info->table_filters && !info->table_filters->filters.empty()) {
-        auto batch_column_map =
-          op::build_batch_column_map(info->projection_ids, info->column_ids.size());
-        auto duckdb_expression = op::convert_table_filters_to_expression(*info->table_filters,
-                                                                         info->column_ids,
-                                                                         info->returned_types,
-                                                                         batch_column_map,
-                                                                         hive_partition_index_set);
+        auto batch_column_map = plan.make_batch_column_map();
+        auto duckdb_expression =
+          op::convert_table_filters_to_expression(*info->table_filters,
+                                                  info->column_ids,
+                                                  info->returned_types,
+                                                  batch_column_map,
+                                                  plan.partition_primary_indices);
         if (duckdb_expression) {
-          has_filter        = true;
           filter_expression = std::shared_ptr<duckdb::Expression>(std::move(duckdb_expression));
         }
       }
 
-      std::vector<std::size_t> post_filter_projection_ids;
-      if (has_filter && !info->projection_ids.empty()) {
-        std::vector<std::size_t> candidate;
-        bool has_pure_filter_cols     = false;
-        std::size_t scan_output_arity = op->get_types().size();
-        for (std::size_t i = 0; i < info->projection_ids.size(); ++i) {
-          auto const pid = info->projection_ids[i];
-          if (i < scan_output_arity) {
-            candidate.push_back(pid);
-          } else {
-            has_pure_filter_cols = true;
-          }
-        }
-        if (has_pure_filter_cols) { post_filter_projection_ids = std::move(candidate); }
-      }
+      // Post-read assembly closure. Returns null when the layout is identity over
+      // data_columns (no permute, no prune) — execute() then forwards the cached
+      // batch (or the filter result) without re-permuting.
+      auto inject_fn = plan.build_inject_fn();
 
       SIRIUS_LOG_DEBUG(
         "[sirius_scan_manager::create_provider_for] using cached_split_provider for op_id={} "
-        "(pinned='{}' requested_cols={})",
+        "(pinned='{}' data_cols={} inject_fn={})",
         op->get_operator_id(),
         pinned_name,
-        columns_per_request.size());
+        columns_per_request.size(),
+        static_cast<bool>(inject_fn) ? "non-null" : "null");
 
       return std::make_unique<cached_split_provider>(std::move(columns_per_request),
                                                      *entry.memory_space,
                                                      std::move(filter_expression),
-                                                     std::move(post_filter_projection_ids));
+                                                     std::move(inject_fn));
     }
   } catch (...) {
     SIRIUS_LOG_TRACE("not all the columns are pinned for this query");
