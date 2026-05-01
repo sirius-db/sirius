@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_table_scan.hpp"
 
+#include "data/data_batch_utils.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "log/logging.hpp"
 #include "op/scan/scan_utils.hpp"
@@ -155,8 +156,10 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   if (static_cast<bool>(local_filter_expr)) {
     sirius::gpu_expression_executor gpu_expression_executor(
       local_filter_expr, cudf::get_current_device_resource_ref(), stream);
-    output_batch = gpu_expression_executor.select(batch_ref);
-    if (!output_batch) { return std::make_unique<pipelineable_operator_data>(); }
+    auto filtered_table = gpu_expression_executor.select(
+      batch_ref->get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
+    output_batch =
+      sirius::make_data_batch(std::move(filtered_table), *batch_ref->get_memory_space());
   } else {
     output_batch = batch_ref;
   }
