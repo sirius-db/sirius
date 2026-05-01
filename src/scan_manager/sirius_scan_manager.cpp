@@ -99,85 +99,88 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
     std::sort(sorted_b.begin(), sorted_b.end());
     return sorted_a == sorted_b;
   };
-  for (auto const& [pinned_name, entry] : _pinned_entries) {
-    if (!matches_scan_info(entry)) { continue; }
-    if (entry.memory_space == nullptr) {
-      throw std::runtime_error("[sirius_scan_manager::create_provider_for] pinned entry '" +
-                               pinned_name + "' has no memory_space");
-    }
-
-    // Resolve the columns the scan reads, in column_ids order — same logic as
-    // parquet_split_provider's setup so the consumer sees identical column layout.
-    auto selected_indices =
-      op::scan::detail::make_selected_column_indices(info->column_ids, info->projection_ids);
-
-    std::vector<std::vector<std::shared_ptr<cudf::column>>> columns_per_request;
-    columns_per_request.reserve(selected_indices.size());
-    for (auto idx : selected_indices) {
-      auto const& col_name = info->names[idx];
-      auto it              = entry.data_batches_by_column.find(col_name);
-      if (it == entry.data_batches_by_column.end()) {
+  try {
+    for (auto const& [pinned_name, entry] : _pinned_entries) {
+      if (!matches_scan_info(entry)) { continue; }
+      if (entry.memory_space == nullptr) {
         throw std::runtime_error("[sirius_scan_manager::create_provider_for] pinned entry '" +
-                                 pinned_name + "' missing column '" + col_name +
-                                 "' required by scan op");
+                                 pinned_name + "' has no memory_space");
       }
-      columns_per_request.push_back(it->second);
-    }
 
-    // Replicate parquet_split_provider's filter / post-filter-projection setup so
-    // the cached scan sees the same downstream contract as the parquet path.
-    std::unordered_set<std::size_t> hive_partition_index_set;
-    for (auto const& hp : info->partition_indices) {
-      hive_partition_index_set.insert(hp.index);
-    }
+      // Resolve the columns the scan reads, in column_ids order — same logic as
+      // parquet_split_provider's setup so the consumer sees identical column layout.
+      auto selected_indices =
+        op::scan::detail::make_selected_column_indices(info->column_ids, info->projection_ids);
 
-    std::variant<std::shared_ptr<cached_split_provider::translated_expression>,
-                 std::shared_ptr<duckdb::Expression>>
-      filter_expression;
-    bool has_filter = false;
-    if (info->table_filters && !info->table_filters->filters.empty()) {
-      auto batch_column_map =
-        op::build_batch_column_map(info->projection_ids, info->column_ids.size());
-      auto duckdb_expression = op::convert_table_filters_to_expression(*info->table_filters,
-                                                                       info->column_ids,
-                                                                       info->returned_types,
-                                                                       batch_column_map,
-                                                                       hive_partition_index_set);
-      if (duckdb_expression) {
-        has_filter        = true;
-        filter_expression = std::shared_ptr<duckdb::Expression>(std::move(duckdb_expression));
+      std::vector<std::vector<std::shared_ptr<cudf::column>>> columns_per_request;
+      columns_per_request.reserve(selected_indices.size());
+      for (auto idx : selected_indices) {
+        auto const& col_name = info->names[idx];
+        auto it              = entry.data_batches_by_column.find(col_name);
+        if (it == entry.data_batches_by_column.end()) {
+          throw std::runtime_error("[sirius_scan_manager::create_provider_for] pinned entry '" +
+                                   pinned_name + "' missing column '" + col_name +
+                                   "' required by scan op");
+        }
+        columns_per_request.push_back(it->second);
       }
-    }
 
-    std::vector<std::size_t> post_filter_projection_ids;
-    if (has_filter && !info->projection_ids.empty()) {
-      std::vector<std::size_t> candidate;
-      bool has_pure_filter_cols     = false;
-      std::size_t scan_output_arity = op->get_types().size();
-      for (std::size_t i = 0; i < info->projection_ids.size(); ++i) {
-        auto const pid = info->projection_ids[i];
-        if (i < scan_output_arity) {
-          candidate.push_back(pid);
-        } else {
-          has_pure_filter_cols = true;
+      // Replicate parquet_split_provider's filter / post-filter-projection setup so
+      // the cached scan sees the same downstream contract as the parquet path.
+      std::unordered_set<std::size_t> hive_partition_index_set;
+      for (auto const& hp : info->partition_indices) {
+        hive_partition_index_set.insert(hp.index);
+      }
+
+      std::variant<std::shared_ptr<cached_split_provider::translated_expression>,
+                   std::shared_ptr<duckdb::Expression>>
+        filter_expression;
+      bool has_filter = false;
+      if (info->table_filters && !info->table_filters->filters.empty()) {
+        auto batch_column_map =
+          op::build_batch_column_map(info->projection_ids, info->column_ids.size());
+        auto duckdb_expression = op::convert_table_filters_to_expression(*info->table_filters,
+                                                                         info->column_ids,
+                                                                         info->returned_types,
+                                                                         batch_column_map,
+                                                                         hive_partition_index_set);
+        if (duckdb_expression) {
+          has_filter        = true;
+          filter_expression = std::shared_ptr<duckdb::Expression>(std::move(duckdb_expression));
         }
       }
-      if (has_pure_filter_cols) { post_filter_projection_ids = std::move(candidate); }
+
+      std::vector<std::size_t> post_filter_projection_ids;
+      if (has_filter && !info->projection_ids.empty()) {
+        std::vector<std::size_t> candidate;
+        bool has_pure_filter_cols     = false;
+        std::size_t scan_output_arity = op->get_types().size();
+        for (std::size_t i = 0; i < info->projection_ids.size(); ++i) {
+          auto const pid = info->projection_ids[i];
+          if (i < scan_output_arity) {
+            candidate.push_back(pid);
+          } else {
+            has_pure_filter_cols = true;
+          }
+        }
+        if (has_pure_filter_cols) { post_filter_projection_ids = std::move(candidate); }
+      }
+
+      SIRIUS_LOG_DEBUG(
+        "[sirius_scan_manager::create_provider_for] using cached_split_provider for op_id={} "
+        "(pinned='{}' requested_cols={})",
+        op->get_operator_id(),
+        pinned_name,
+        columns_per_request.size());
+
+      return std::make_unique<cached_split_provider>(std::move(columns_per_request),
+                                                     *entry.memory_space,
+                                                     std::move(filter_expression),
+                                                     std::move(post_filter_projection_ids));
     }
-
-    SIRIUS_LOG_DEBUG(
-      "[sirius_scan_manager::create_provider_for] using cached_split_provider for op_id={} "
-      "(pinned='{}' requested_cols={})",
-      op->get_operator_id(),
-      pinned_name,
-      columns_per_request.size());
-
-    return std::make_unique<cached_split_provider>(std::move(columns_per_request),
-                                                   *entry.memory_space,
-                                                   std::move(filter_expression),
-                                                   std::move(post_filter_projection_ids));
+  } catch (...) {
+    SIRIUS_LOG_TRACE("not all the columns are pinned for this query");
   }
-
   auto provider = std::make_unique<parquet_split_provider>(info->returned_types,
                                                            info->file_paths,
                                                            info->column_ids,

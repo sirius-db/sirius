@@ -240,6 +240,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_recursive_cte.cpp
     src/planner/sirius_plan_top_n.cpp
     src/scan_manager/cached_split_provider.cpp
+    src/pin_table.cpp
     src/scan_manager/parquet_split_provider.cpp
     src/scan_manager/sirius_scan_manager.cpp
     src/scan_manager/split_connector.cpp
@@ -389,6 +390,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_split_connector.cpp
     test/cpp/unittest.cpp
     test/cpp/utils/sirius_test_env.cpp
+    test/cpp/extension/test_pin_table.cpp
     test/cpp/utils/utils.cpp)
 # cmake-format: on
 

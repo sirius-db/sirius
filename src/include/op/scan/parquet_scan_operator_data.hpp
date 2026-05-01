@@ -17,6 +17,8 @@
 #pragma once
 
 // sirius
+#include "cucascade/data/gpu_data_representation.hpp"
+
 #include <expression_executor/gpu_expression_translator_internal.hpp>
 #include <op/scan/scan_plan.hpp>
 #include <op/sirius_physical_operator.hpp>
@@ -165,6 +167,11 @@ class scan_cached_operator_data : public op::operator_data {
       filter_expression(std::move(filter_expression)),
       post_filter_projection_ids(std::move(post_filter_projection_ids))
   {
+  }
+
+  [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
+  {
+    return batch->get_data()->cast<cucascade::gpu_table_representation>().get_size_in_bytes();
   }
 
   /// Cached data batch viewed by the scan. Owning shared_ptr keeps the pinned
