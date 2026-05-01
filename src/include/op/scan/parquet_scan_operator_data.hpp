@@ -54,8 +54,8 @@ struct row_group_slice {
     : datasource(datasource),
       file_path(file_path),
       row_group_indices(std::move(row_group_indices)),
-      reserved_compressed_bytes(reserved_uncompressed_bytes),
-      reserved_uncompressed_bytes(reserved_compressed_bytes)
+      reserved_uncompressed_bytes(reserved_uncompressed_bytes),
+      reserved_compressed_bytes(reserved_compressed_bytes)
   {
   }
   /// Datasource for the parquet file, shared with other partitions of the same file.

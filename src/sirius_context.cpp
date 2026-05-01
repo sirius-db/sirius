@@ -294,10 +294,6 @@ void SiriusContext::terminate()
   }
   task_creator_->stop_thread_pool();
   task_creator_.reset();
-  if (scan_manager_) {
-    scan_manager_->stop();
-    scan_manager_->reset();
-  }
   for (auto& executor : downgrade_executors_) {
     executor->stop();
   }

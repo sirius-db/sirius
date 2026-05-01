@@ -18,10 +18,12 @@
 #include <data/data_batch_utils.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <log/logging.hpp>
+#include <op/scan/parquet_scan_info.hpp>
 #include <op/scan/parquet_scan_operator_data.hpp>
 #include <op/scan/sirius_gpu_parquet_scan_operator.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <pipeline/sirius_meta_pipeline.hpp>
+#include <scan_manager/split_connector.hpp>
 
 // cudf
 #include <cudf/io/parquet.hpp>
@@ -41,31 +43,24 @@ namespace sirius::op::scan {
 // Constructor
 //===----------------------------------------------------------------------===//
 sirius_gpu_parquet_scan_operator::sirius_gpu_parquet_scan_operator(
-  duckdb::vector<sirius::logical_type> types, duckdb::idx_t estimated_cardinality)
+  duckdb::vector<sirius::logical_type> types,
+  duckdb::idx_t estimated_cardinality,
+  std::unique_ptr<parquet_scan_info> scan_info)
   : sirius_physical_operator(
-      SiriusPhysicalOperatorType::GPU_PARQUET_SCAN, std::move(types), estimated_cardinality)
+      SiriusPhysicalOperatorType::GPU_PARQUET_SCAN, std::move(types), estimated_cardinality),
+    _split_connector(std::make_unique<scan_manager::split_connector>()),
+    _scan_info(std::move(scan_info))
 {
   _split_connector->close();
 }
 
 sirius_gpu_parquet_scan_operator::~sirius_gpu_parquet_scan_operator() = default;
 
-sirius_gpu_parquet_scan_operator::~sirius_gpu_parquet_scan_operator() = default;
-
 //===----------------------------------------------------------------------===//
-// Friend access — wired by sirius_scan_manager during prepare_for_query.
 // Friend access — wired by sirius_scan_manager during prepare_for_query.
 //===----------------------------------------------------------------------===//
 std::unique_ptr<parquet_scan_info> sirius_gpu_parquet_scan_operator::take_scan_info()
-std::unique_ptr<parquet_scan_info> sirius_gpu_parquet_scan_operator::take_scan_info()
 {
-  return std::move(_scan_info);
-}
-
-void sirius_gpu_parquet_scan_operator::set_split_connector(
-  std::unique_ptr<scan_manager::split_connector> connector)
-{
-  _split_connector = std::move(connector);
   return std::move(_scan_info);
 }
 
@@ -98,14 +93,10 @@ std::optional<task_creation_hint> sirius_gpu_parquet_scan_operator::get_next_tas
 bool sirius_gpu_parquet_scan_operator::all_ports_empty()
 {
   return _split_connector->is_closed() && !_split_connector->has_more_splits();
-  return _split_connector->is_closed() && !_split_connector->has_more_splits();
 }
 
 std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::get_next_task_input_data()
 {
-  auto next = _split_connector->get_next_split();
-  if (!next.has_value()) { return nullptr; }
-  return std::move(*next);
   auto next = _split_connector->get_next_split();
   if (!next.has_value()) { return nullptr; }
   return std::move(*next);
@@ -186,7 +177,8 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
       return std::make_unique<pipelineable_operator_data>(
         std::vector<std::shared_ptr<cucascade::data_batch>>());
     }
-    table = output_batch->get_data()->cast<cucascade::gpu_table_representation>().release_table();
+    table =
+      output_batch->get_data()->cast<cucascade::gpu_table_representation>().release_table(stream);
     SIRIUS_LOG_DEBUG(
       "[sirius_gpu_parquet_scan_operator] Applied duckdb filter expression post parquet scan.");
   }

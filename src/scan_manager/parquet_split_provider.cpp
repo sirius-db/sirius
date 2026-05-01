@@ -115,7 +115,9 @@ parquet_split_provider::parquet_split_provider(
 parquet_split_provider::~parquet_split_provider() = default;
 
 op::scan::partition_inject_fn_t parquet_split_provider::take_partition_inject_fn()
-{ return std::move(_partition_inject_fn); }
+{
+  return std::move(_partition_inject_fn);
+}
 
 std::optional<parquet_split_provider::file_batch> parquet_split_provider::next_task_input()
 {
