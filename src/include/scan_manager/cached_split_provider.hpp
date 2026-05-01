@@ -22,7 +22,6 @@
 #include <cudf/column/column.hpp>
 
 #include <cucascade/memory/memory_space.hpp>
-
 #include <duckdb/planner/expression.hpp>
 
 #include <memory>
@@ -53,15 +52,13 @@ namespace sirius::scan_manager {
  */
 class cached_split_provider : public split_provider {
  public:
-  using translated_expression =
-    sirius::gpu_expression_translator::translated_expression;
+  using translated_expression = sirius::gpu_expression_translator::translated_expression;
 
-  cached_split_provider(
-    std::vector<std::vector<std::shared_ptr<cudf::column>>> columns_per_request,
-    cucascade::memory::memory_space& memory_space,
-    std::variant<std::shared_ptr<translated_expression>, std::shared_ptr<duckdb::Expression>>
-      filter_expression,
-    std::vector<std::size_t> post_filter_projection_ids);
+  cached_split_provider(std::vector<std::vector<std::shared_ptr<cudf::column>>> columns_per_request,
+                        cucascade::memory::memory_space& memory_space,
+                        std::variant<std::shared_ptr<translated_expression>,
+                                     std::shared_ptr<duckdb::Expression>> filter_expression,
+                        std::vector<std::size_t> post_filter_projection_ids);
 
   std::future<void> start(exec::thread_pool& pool, split_connector& connector) override;
 

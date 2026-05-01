@@ -742,15 +742,14 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     constexpr std::string_view kExt = ".parquet";
     if (p.size() < kExt.size()) { return false; }
     auto tail = p.substr(p.size() - kExt.size());
-    std::transform(tail.begin(), tail.end(), tail.begin(), [](unsigned char c) {
-      return std::tolower(c);
-    });
+    std::transform(
+      tail.begin(), tail.end(), tail.begin(), [](unsigned char c) { return std::tolower(c); });
     return tail == kExt;
   };
   for (auto const& path : file_paths) {
     if (!has_parquet_ext(path)) {
-      throw InvalidInputException(
-        "pin_table only supports parquet files, got non-parquet path: " + path);
+      throw InvalidInputException("pin_table only supports parquet files, got non-parquet path: " +
+                                  path);
     }
   }
 

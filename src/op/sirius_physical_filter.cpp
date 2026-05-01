@@ -20,11 +20,10 @@
 #include "data/data_batch_utils.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
 
-#include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
-
 #include <nvtx3/nvtx3.hpp>
 
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
 #include <duckdb/common/exception.hpp>
 
 namespace sirius {

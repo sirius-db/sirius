@@ -157,11 +157,10 @@ class scan_cached_operator_data : public op::operator_data {
  public:
   using translated_expression = gpu_expression_translator::translated_expression;
 
-  scan_cached_operator_data(
-    std::shared_ptr<cucascade::data_batch> batch,
-    std::variant<std::shared_ptr<translated_expression>, std::shared_ptr<duckdb::Expression>>
-      filter_expression,
-    std::vector<std::size_t> post_filter_projection_ids)
+  scan_cached_operator_data(std::shared_ptr<cucascade::data_batch> batch,
+                            std::variant<std::shared_ptr<translated_expression>,
+                                         std::shared_ptr<duckdb::Expression>> filter_expression,
+                            std::vector<std::size_t> post_filter_projection_ids)
     : batch(std::move(batch)),
       filter_expression(std::move(filter_expression)),
       post_filter_projection_ids(std::move(post_filter_projection_ids))

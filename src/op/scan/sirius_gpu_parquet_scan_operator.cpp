@@ -189,7 +189,7 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
     table     = read_table_from_metadata(*scan_data, stream);
     mem_space = scan_data->gpu_memory_space;
   } else if (auto const* cached = dynamic_cast<const scan_cached_operator_data*>(&input_data)) {
-    auto& gpu_rep = cached->batch->get_data()->cast<cucascade::gpu_table_representation>();
+    auto& gpu_rep    = cached->batch->get_data()->cast<cucascade::gpu_table_representation>();
     auto cached_view = gpu_rep.get_table_view();
 
     // Apply the filter (only the duckdb::Expression variant is currently produced by
@@ -218,8 +218,7 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
     }
 
     if (has_projection) {
-      auto columns =
-        has_filter ? table->release() : std::vector<std::unique_ptr<cudf::column>>{};
+      auto columns = has_filter ? table->release() : std::vector<std::unique_ptr<cudf::column>>{};
       std::vector<std::unique_ptr<cudf::column>> selected;
       selected.reserve(cached->post_filter_projection_ids.size());
       if (has_filter) {
