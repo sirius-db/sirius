@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Multi-GPU Distribution
-status: verifying
-stopped_at: "Completed 14-02-PLAN.md: Phase 14 ship-gate validation Overall PASS (commit 76c3342); all four 14-CONTEXT.md acceptance criteria evaluated via real MCP runs; 14-VALIDATION.md captures verbatim per-criterion output. Phase 14 ships PASS-with-Phase-12-note + Criterion-3-DEFERRED. Phase 15 (cross-GPU operator-colocation audit) unblocked."
-last_updated: "2026-04-30T21:48:32.069Z"
-last_activity: 2026-04-30
+status: executing
+stopped_at: "Completed 15-01-PLAN.md: cross-GPU operator-colocation audit comment-only commit b91afc3 with all 11 sites SAFE under SCHED-RR contract; smoking-gun assumption-language string removed; build clean; [mgpu] 12/13 + [TPC-H][parquet] 22/22 PASS matching Phase 14 baseline; HYG-02=40 preserved."
+last_updated: "2026-05-01T01:41:18.466Z"
+last_activity: 2026-05-01
 progress:
   total_phases: 15
   completed_phases: 9
-  total_plans: 52
-  completed_plans: 47
+  total_plans: 56
+  completed_plans: 48
   percent: 100
 ---
 
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-21)
 
 **Core value:** Any query can transparently execute across every GPU on the node — tasks are scheduled to the GPU where their input data already resides, memory pressure is absorbed by downgrading to the correct NUMA domain, and parquet I/O is routed through a multi-GPU-safe backend.
-**Current focus:** Phase 14 — sched-rr-distribution
+**Current focus:** Phase 15 — mgpu-operator-colocation-audit
 
 ## Current Position
 
-Phase: 14 (sched-rr-distribution) — EXECUTING
-Plan: 2 of 2
-Status: Phase complete — ready for verification
-Last activity: 2026-04-30
+Phase: 15 (mgpu-operator-colocation-audit) — EXECUTING
+Plan: 2 of 4
+Status: Ready to execute
+Last activity: 2026-05-01
 
 Progress: [██████████] 100% (6/6 plans complete)
 Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gpu-sql-pipeline-fix/08-SUMMARY.md`
@@ -62,6 +62,7 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 | Phase 13 P04 | 60min | 1 tasks | 9 files |
 | Phase 14 P01 | 2 min | 1 tasks | 2 files |
 | Phase 14 P02 | 7 min | 1 tasks | 2 files |
+| Phase 15 P01 | 6min | 4 tasks | 10 files |
 
 ## Decisions
 
@@ -126,6 +127,10 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 - [Phase 14-01]: Per-query reset of _no_pref_rr_counter in prepare_for_query (store(0, std::memory_order_relaxed)) so cache=table_gpu warm-path stays correct across same-query iterations
 - [Phase 14-01]: Patch applied via Edit tool, not git apply — diff in 14-CONTEXT.md is documentation-style without --- a/.../+++ b/... headers; Phase 13 Wave 1 + Wave 4 both proved git apply rejects
 - [Phase 14]: [14-02] Phase 14 ship-gate VALIDATION: Overall PASS via 4 MCP runs against committed Plan 14-01 (d4009e2). C1 [mgpu] 12/13 PASS-with-Phase-12-note (small-sort vector::_M_range_check is fix/order-small-sort-rangecheck @ 289d6d2 territory, NOT in feat/sched-rr-distribution ancestry — same precedent as 13-VALIDATION.md). C2 [TPC-H][parquet] 22/22 PASS in 80.3s (in-noise vs Phase 13's 75.9s; Q11 specifically clean). C4 follow-up #17 scale-up PASS in 7.3s (kIterations=3 satisfies criterion). C3 SF1 1-GPU vs 2-GPU DEFERRED — neither tpch-benchmark nor tpch-parquet expose num_gpus arg, MCP wrapper env-passthrough limit per [13-03], bare-bash workaround forbidden by feedback_use_mcp_build memory. Regression [integration][TPC-H] 48/48, 71608 assertions, 151.8s. HYG-02=40 preserved. Phase 15 unblocked.
+- [Phase 15-01]: All 11 audited operator sites classified SAFE: each operator's execute() dynamic-casts its input to pipelineable_operator_data (or derived partitioned_operator_data); the input vector is the same _data_batches that gpu_pipeline_task::execute (gpu_pipeline_task.cpp:332) lock-converted onto target_space via prepare_for_processing -> lock_or_prepare_batch. POSTCONDITION batches[0]->get_memory_space() == target_space holds at every site.
+- [Phase 15-01]: Smoking-gun replacement (top_n.cpp:240): replaced 'all batches are expected to share the same space in practice' with verified INVARIANT (SCHED-RR contract) phrasing rather than augmenting; original phrasing was exactly the unverified-assumption-language this audit removes.
+- [Phase 15-01]: Plan 15-01 verify-vs-must_have inconsistency resolved per orchestrator's success_criteria: the structured summary line '## Classification: SAFE=11 NEEDS-PATCH=0 UNCLEAR=0' is mandatory and contains the literal tokens that the strict '\! grep -F' rule would forbid. Followed orchestrator's interpretation; no per-site row carries a non-SAFE verdict.
+- [Phase 15-01]: Branch audit/mgpu-operator-colocation off current Phase 15 docs HEAD 11d20b9; ancestry verified via git merge-base --is-ancestor 0ee3166 HEAD = true (descends from Phase 14 HEAD). Comment-only commit b91afc3 lands 9 operator files + 15-AUDIT-LOG.md.
 
 ## Accumulated Context
 
@@ -175,6 +180,6 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 
 ## Session Continuity
 
-Last session: 2026-04-30T21:48:32.066Z
-Stopped at: Completed 14-02-PLAN.md: Phase 14 ship-gate validation Overall PASS (commit 76c3342); all four 14-CONTEXT.md acceptance criteria evaluated via real MCP runs; 14-VALIDATION.md captures verbatim per-criterion output. Phase 14 ships PASS-with-Phase-12-note + Criterion-3-DEFERRED. Phase 15 (cross-GPU operator-colocation audit) unblocked.
+Last session: 2026-05-01T01:41:03.133Z
+Stopped at: Completed 15-01-PLAN.md: cross-GPU operator-colocation audit comment-only commit b91afc3 with all 11 sites SAFE under SCHED-RR contract; smoking-gun assumption-language string removed; build clean; [mgpu] 12/13 + [TPC-H][parquet] 22/22 PASS matching Phase 14 baseline; HYG-02=40 preserved.
 Resume file: None
