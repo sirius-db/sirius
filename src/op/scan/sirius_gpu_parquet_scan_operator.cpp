@@ -119,8 +119,9 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
       "[sirius_gpu_parquet_scan_operator] execute() called with null gpu_memory_space in "
       "input_data.");
   }
-  auto datasource        = scan_data->datasource;
-  auto& mem_space        = *scan_data->gpu_memory_space;
+  auto datasource = scan_data->datasource;
+  auto& mem_space = *scan_data->gpu_memory_space;
+  rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
   auto filter_expression = scan_data->filter_expression;
 
   // Build reader options for this partition's row groups.
@@ -149,7 +150,7 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
     }
   }
 
-  auto [table, metadata] = cudf::io::read_parquet(opts, stream);
+  auto [table, metadata] = cudf::io::read_parquet(opts, stream, mr_ref);
 
   SIRIUS_LOG_DEBUG("[sirius_gpu_parquet_scan_operator] Read {} — {} rows, {} columns",
                    scan_data->file_path,
