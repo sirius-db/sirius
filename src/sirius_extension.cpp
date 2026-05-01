@@ -678,6 +678,9 @@ unique_ptr<FunctionData> SiriusExtension::PinTableBind(ClientContext& context,
     throw BinderException("pin_table requires a 'tier' named parameter");
   }
   result->args.tier = tier_it->second.ToString();
+  if (result->args.tier == "host") {
+    throw NotImplementedException("pin_table tier='host' is not yet supported");
+  }
 
   auto name_it = input.named_parameters.find("name");
   if (name_it == input.named_parameters.end() || name_it->second.IsNull()) {
@@ -716,6 +719,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
 
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) {
+    std::cerr << "what the fuck is going on" << std::endl;
     throw InvalidInputException("pin_table requires the Sirius context to be initialized");
   }
 

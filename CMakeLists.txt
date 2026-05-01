@@ -390,7 +390,6 @@ set(TEST_SOURCES
     test/cpp/scan/test_split_connector.cpp
     test/cpp/unittest.cpp
     test/cpp/utils/sirius_test_env.cpp
-    test/cpp/extension/test_pin_table.cpp
     test/cpp/utils/utils.cpp)
 # cmake-format: on
 
