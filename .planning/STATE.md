@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Multi-GPU Distribution
-status: executing
-stopped_at: "Completed 15-03-PLAN.md: per-task-device contract documented in docs/super-sirius/pipeline-execution.md (+186 lines new section) and cross-linked from README.md ToC. Commit abe5cdb on audit/mgpu-operator-colocation. CONTEXT.md acceptance criterion 3 closed; Plan 15-04 unblocked."
-last_updated: "2026-05-01T02:03:41.337Z"
+status: verifying
+stopped_at: "Completed 15-04-PLAN.md: Phase 15 ship-gate validation Overall PASS (commit a159762). All 3 acceptance criteria PASS via real MCP runs; 15-VALIDATION.md captures verbatim per-criterion output. [TPC-H][parquet] regression PASS (Q11 home filter clean). [integration][TPC-H] PARTIAL is pre-existing 13-04 blocker, NOT a Phase 15 regression. Phase 15 ships PASS; v1.3 closure additionally requires Plan 13-05."
+last_updated: "2026-05-01T02:48:03.505Z"
 last_activity: 2026-05-01
 progress:
   total_phases: 15
-  completed_phases: 9
+  completed_phases: 10
   total_plans: 56
-  completed_plans: 50
+  completed_plans: 51
   percent: 100
 ---
 
@@ -27,7 +27,7 @@ See: .planning/PROJECT.md (updated 2026-04-21)
 
 Phase: 15 (mgpu-operator-colocation-audit) — EXECUTING
 Plan: 4 of 4
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-05-01
 
 Progress: [██████████] 100% (6/6 plans complete)
@@ -65,6 +65,7 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 | Phase 15 P01 | 6min | 4 tasks | 10 files |
 | Phase 15 P02 | 8min | 2 tasks | 5 files |
 | Phase 15 P03 | 4min | 2 tasks | 2 files |
+| Phase 15 P04 | 39min | 2 tasks | 1 files |
 
 ## Decisions
 
@@ -139,6 +140,7 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 - [Phase 15-03]: Inserted per-task-device contract section between Tasks (line 113 baseline) and Pipeline Executor (line 114 baseline) in pipeline-execution.md. New section spans 186 lines with 4-layer enforcement walkthrough (gpu_pipeline_task::execute -> prepare_for_processing -> lock_or_prepare_batch) plus SCHED-RR distribution policy quotes.
 - [Phase 15-03]: Single-commit pattern (abe5cdb) covers both docs/super-sirius/pipeline-execution.md and docs/super-sirius/README.md atomically. Direct git commit --no-verify used because gsd-tools commit short-circuits with skipped_gitignored on this repo (.planning/ is gitignored — same blocker as Plan 15-01).
 - [Phase 15-03]: last-updated-commit marker bumped from 662eb28d to 75392110 (HEAD-at-edit-time = parent of new commit). Convention preserved: marker records tree state docs were reviewed against, not the new commit itself.
+- [Phase 15]: [15-04] Phase 15 ship-gate: Overall PASS via 4 MCP runs + 3 bash runs. C1 (audit) PASS — 11 INVARIANT comments, SAFE=11 NEEDS-PATCH=0 UNCLEAR=0. C2 (stress) PASS — exit 0, 87.1s, 77053 assertions (in-noise vs Wave 2's 86.6s). C3 (docs) PASS — per-task-device contract documented in pipeline-execution.md (4 hits) + README.md ToC (1 hit). Regression: [mgpu] PASS-with-Phase-12-note (12/13, identical Phase-12 single failure as Phase 14 baseline); [TPC-H][parquet] PASS — 22/22 in 81.6s, +1.6% vs Phase 14, Q11 specifically clean (CRITICAL Q11 home filter); [integration][TPC-H] PARTIAL — pre-existing v1.3 ship blocker (13-04 PARTIAL: 1800s SIGTERM at Q11 parquet under cumulative state, ~22 producer sites un-migrated to writer_stream, Plan 13-05 owns), NOT a Phase 15 regression (source diff comment-only, cucascade pin unchanged). HYG-02 = 40 preserved. Phase 15 ships PASS; v1.3 closure additionally requires Plan 13-05.
 
 ## Accumulated Context
 
@@ -188,6 +190,6 @@ Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gp
 
 ## Session Continuity
 
-Last session: 2026-05-01T02:03:41.335Z
-Stopped at: Completed 15-03-PLAN.md: per-task-device contract documented in docs/super-sirius/pipeline-execution.md (+186 lines new section) and cross-linked from README.md ToC. Commit abe5cdb on audit/mgpu-operator-colocation. CONTEXT.md acceptance criterion 3 closed; Plan 15-04 unblocked.
+Last session: 2026-05-01T02:48:03.502Z
+Stopped at: Completed 15-04-PLAN.md: Phase 15 ship-gate validation Overall PASS (commit a159762). All 3 acceptance criteria PASS via real MCP runs; 15-VALIDATION.md captures verbatim per-criterion output. [TPC-H][parquet] regression PASS (Q11 home filter clean). [integration][TPC-H] PARTIAL is pre-existing 13-04 blocker, NOT a Phase 15 regression. Phase 15 ships PASS; v1.3 closure additionally requires Plan 13-05.
 Resume file: None
