@@ -210,19 +210,8 @@ void sirius_engine::execute()
   auto future = sirius_ctx->get_task_scheduler().start_query();
   try {
     future.get();
-    // A scan_manager driver-loop failure closes its connector, which looks like normal
-    // end-of-stream to the gpu scan operator and lets the pipeline finish "successfully" with
-    // missing rows. Rethrow the captured exception so the catch handlers below run the same
-    // drain_after_error path as a top-level failure.
-    if (auto err = sirius_ctx->get_scan_manager().take_driver_error()) {
-      std::rethrow_exception(err);
-    }
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
-    // Wake any GPU parquet scan workers parked inside split_connector::get_next_split before
-    // joining the task_creator pool — otherwise drain_after_error's bounded_pool::wait_all
-    // deadlocks. close() is idempotent, so racing the scan_manager's own close on success is safe.
-    sirius_ctx->get_scan_manager().close_all_connectors();
     // Drain all in-flight GPU tasks before returning.  QueryEnd() will call
     // clear_all_repositories() immediately after execute() throws; without
     // this drain, tasks still running in the thread pool hold raw pointers to
@@ -231,7 +220,6 @@ void sirius_engine::execute()
     throw;
   } catch (...) {
     SIRIUS_LOG_ERROR("Unknown error executing query");
-    sirius_ctx->get_scan_manager().close_all_connectors();
     sirius_ctx->get_task_scheduler().drain_after_error();
     throw;
   }

@@ -17,6 +17,8 @@
 #pragma once
 
 // sirius
+#include "cucascade/data/gpu_data_representation.hpp"
+
 #include <expression_executor/gpu_expression_translator_internal.hpp>
 #include <op/scan/scan_plan.hpp>
 #include <op/sirius_physical_operator.hpp>
@@ -25,6 +27,9 @@
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
+
+// cucascade
+#include <cucascade/data/data_batch.hpp>
 
 // standard library
 #include <cstddef>
@@ -137,6 +142,53 @@ class parquet_scan_data : public op::operator_data {
   std::shared_ptr<scan_plan const> plan;
   /// GPU memory space for allocating output tables produced by execute().
   cucascade::memory::memory_space* gpu_memory_space = nullptr;
+};
+
+//===----------------------------------------------------------------------===//
+// scan_cached_operator_data
+//===----------------------------------------------------------------------===//
+/**
+ * @brief Input to a GPU parquet scan task served from a pinned (cached) entry.
+ *
+ * The cached_split_provider produces one of these per cached batch. It carries
+ * a zero-copy data_batch (whose gpu_table_representation is a view over the
+ * pinned data columns in scan_plan D-order) plus the filter expression and the
+ * post-read assembly closure that the scan operator applies in execute(). The
+ * gpu_memory_space lives on the wrapped data_batch.
+ *
+ * The cached path is gated upstream so it never sees hive partitions, so
+ * @ref inject_fn — when non-null — only ever performs DATA-source permutation
+ * and pure-filter-column pruning. It is null exactly when scan_plan's output
+ * layout is identity over data_columns (no permute, no prune).
+ */
+class scan_cached_operator_data : public op::operator_data {
+ public:
+  scan_cached_operator_data(std::shared_ptr<cucascade::data_batch> batch,
+                            std::shared_ptr<duckdb::Expression> filter_expression,
+                            partition_inject_fn_t inject_fn)
+    : batch(std::move(batch)),
+      filter_expression(std::move(filter_expression)),
+      inject_fn(std::move(inject_fn))
+  {
+  }
+
+  [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
+  {
+    return batch->get_data()->cast<cucascade::gpu_table_representation>().get_size_in_bytes();
+  }
+
+  /// Cached data batch viewed by the scan. Owning shared_ptr keeps the pinned
+  /// columns alive for the lifetime of the task.
+  std::shared_ptr<cucascade::data_batch> batch;
+  /// Coalesced DuckDB filter expression, evaluated post-read in execute() against
+  /// the cached batch. Null when no filter applies. The cached path does not carry
+  /// an AST-translated filter — pushdown is a parquet-reader concern, and the
+  /// cached batch is already materialized.
+  std::shared_ptr<duckdb::Expression> filter_expression;
+  /// Post-read assembly closure produced by scan_plan::build_inject_fn(). Null
+  /// when the plan's output layout is identity over data_columns — execute()
+  /// then forwards the cached batch (or filter result) without re-permuting.
+  partition_inject_fn_t inject_fn;
 };
 
 }  // namespace sirius::op::scan
