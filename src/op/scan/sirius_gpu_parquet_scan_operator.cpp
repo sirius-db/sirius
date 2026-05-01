@@ -50,9 +50,7 @@ sirius_gpu_parquet_scan_operator::sirius_gpu_parquet_scan_operator(
       SiriusPhysicalOperatorType::GPU_PARQUET_SCAN, std::move(types), estimated_cardinality),
     _split_connector(std::make_unique<scan_manager::split_connector>()),
     _scan_info(std::move(scan_info))
-{
-  _split_connector->close();
-}
+{ _split_connector->close(); }
 
 sirius_gpu_parquet_scan_operator::~sirius_gpu_parquet_scan_operator() = default;
 
@@ -60,15 +58,11 @@ sirius_gpu_parquet_scan_operator::~sirius_gpu_parquet_scan_operator() = default;
 // Friend access — wired by sirius_scan_manager during prepare_for_query.
 //===----------------------------------------------------------------------===//
 std::unique_ptr<parquet_scan_info> sirius_gpu_parquet_scan_operator::take_scan_info()
-{
-  return std::move(_scan_info);
-}
+{ return std::move(_scan_info); }
 
 void sirius_gpu_parquet_scan_operator::set_split_connector(
   std::unique_ptr<scan_manager::split_connector> connector)
-{
-  _split_connector = std::move(connector);
-}
+{ _split_connector = std::move(connector); }
 
 //===----------------------------------------------------------------------===//
 // Scheduling interface
@@ -91,9 +85,7 @@ std::optional<task_creation_hint> sirius_gpu_parquet_scan_operator::get_next_tas
 }
 
 bool sirius_gpu_parquet_scan_operator::all_ports_empty()
-{
-  return _split_connector->is_closed() && !_split_connector->has_more_splits();
-}
+{ return _split_connector->is_closed() && !_split_connector->has_more_splits(); }
 
 std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::get_next_task_input_data()
 {
@@ -123,16 +115,19 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
   auto& mem_space = *scan_data->gpu_memory_space;
 
   // Build reader options for this partition's files and corresponding row groups
-  std::vector<cudf::io::datasource*> src_ptrs;
+  std::vector<std::unique_ptr<cudf::io::datasource>> sources;
+  std::vector<cudf::io::parquet::FileMetaData> metadatas;
   std::vector<std::vector<cudf::size_type>> rg_per_src;
-  src_ptrs.reserve(scan_data->rg_slices.size());
+  sources.reserve(scan_data->rg_slices.size());
+  metadatas.reserve(scan_data->rg_slices.size());
   rg_per_src.reserve(scan_data->rg_slices.size());
+
   for (auto const& slice : scan_data->rg_slices) {
-    src_ptrs.push_back(slice.datasource.get());
-    rg_per_src.push_back(std::move(slice.row_group_indices));
+    sources.push_back(cudf::io::datasource::create(slice.file_path));
+    metadatas.push_back(*slice.file_metadata);  // copy unavoidable
+    rg_per_src.push_back(slice.row_group_indices);
   }
   auto opts = *scan_data->reader_options;
-  opts.set_source(cudf::io::source_info{src_ptrs});
   opts.set_row_groups(std::move(rg_per_src));
 
   // Try to translate the filter to a *stream-local* cudf AST for filter pushdown. If not
@@ -157,7 +152,8 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
     }
   }
 
-  auto [table, metadata] = cudf::io::read_parquet(opts, stream);
+  auto [table, metadata] =
+    cudf::io::read_parquet(std::move(sources), std::move(metadatas), opts, stream);
 
   SIRIUS_LOG_DEBUG(
     "[sirius_gpu_parquet_scan_operator] Read {} file(s) (first: {}) — {} rows, {} "

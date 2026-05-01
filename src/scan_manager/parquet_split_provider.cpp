@@ -27,6 +27,7 @@
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
+#include <cudf/io/parquet_schema.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
@@ -115,9 +116,7 @@ parquet_split_provider::parquet_split_provider(
 parquet_split_provider::~parquet_split_provider() = default;
 
 op::scan::partition_inject_fn_t parquet_split_provider::take_partition_inject_fn()
-{
-  return std::move(_partition_inject_fn);
-}
+{ return std::move(_partition_inject_fn); }
 
 std::optional<parquet_split_provider::file_batch> parquet_split_provider::next_task_input()
 {
@@ -268,16 +267,16 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
     }
 
     //===----------Read metadata footers----------===//
-    auto datasource = std::shared_ptr(cudf::io::datasource::create(file_path));
-
-    std::unique_ptr<cudf::io::datasource::buffer> footer_buffer;
-    footer_buffer = cudf::io::parquet::fetch_footer_to_host(*datasource);
+    auto datasource    = cudf::io::datasource::create(file_path);
+    auto footer_buffer = cudf::io::parquet::fetch_footer_to_host(*datasource);
 
     //===----------Parse metadata----------===//
     op::scan::hybrid_scan_reader reader(
       cudf::host_span<uint8_t const>(footer_buffer->data(), footer_buffer->size()),
       *reader_options);
-    auto metadata = reader.parquet_metadata();
+    auto file_metadata =
+      std::make_shared<cudf::io::parquet::FileMetaData const>(reader.parquet_metadata());
+    auto const& metadata = *file_metadata;
 
     //===----------Resolve selected DuckDB columns to parquet column chunk indices----------===//
     // row_group.columns is indexed in parquet schema-leaf order (preorder), which can differ from
@@ -333,7 +332,7 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
     auto seal_current_file = [&]() {
       if (cur_rgs.empty()) { return; }
       accum.slices.emplace_back(
-        datasource, file_path, std::move(cur_rgs), cur_uncompressed_bytes, cur_compressed_bytes);
+        file_metadata, file_path, std::move(cur_rgs), cur_uncompressed_bytes, cur_compressed_bytes);
     };
 
     auto accumulate_chunk = [&](cudf::io::parquet::ColumnChunk const& chunk, bool is_pure_filter) {

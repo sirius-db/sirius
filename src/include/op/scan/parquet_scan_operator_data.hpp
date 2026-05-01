@@ -25,6 +25,7 @@
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
+#include <cudf/io/parquet_schema.hpp>
 
 // standard library
 #include <cstddef>
@@ -46,20 +47,19 @@ using hybrid_scan_reader = cudf::io::parquet::experimental::hybrid_scan_reader;
  * data batch.
  */
 struct row_group_slice {
-  row_group_slice(std::shared_ptr<cudf::io::datasource> datasource,
+  row_group_slice(std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata,
                   std::string file_path,
                   std::vector<cudf::size_type> row_group_indices,
                   std::size_t reserved_uncompressed_bytes,
                   std::size_t reserved_compressed_bytes)
-    : datasource(datasource),
+    : file_metadata(file_metadata),
       file_path(file_path),
       row_group_indices(std::move(row_group_indices)),
       reserved_uncompressed_bytes(reserved_uncompressed_bytes),
       reserved_compressed_bytes(reserved_compressed_bytes)
   {
   }
-  /// Datasource for the parquet file, shared with other partitions of the same file.
-  std::shared_ptr<cudf::io::datasource> datasource;
+  std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
   std::string file_path;
   std::vector<cudf::size_type> row_group_indices;
   std::size_t reserved_uncompressed_bytes;
@@ -88,7 +88,6 @@ struct row_group_range {
       reserved_compressed_bytes(reserved_compressed_bytes)
   {
   }
-
   std::size_t file_idx;
   std::vector<cudf::size_type> row_group_indices;
   std::size_t reserved_uncompressed_bytes;
