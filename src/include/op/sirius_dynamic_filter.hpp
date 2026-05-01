@@ -149,7 +149,9 @@ class sirius_dynamic_zone_map_filter final : public sirius_dynamic_filter,
                                           bool inclusive_max = true);
 
   [[nodiscard]] sirius_dynamic_filter_kind kind() const override
-  { return sirius_dynamic_filter_kind::ZONE_MAP; }
+  {
+    return sirius_dynamic_filter_kind::ZONE_MAP;
+  }
 
   [[nodiscard]] cudf::ast::expression const& to_ast(
     cudf::ast::tree& tree, cudf::ast::expression const& column_ref) const override;

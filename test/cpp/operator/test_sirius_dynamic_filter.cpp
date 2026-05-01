@@ -16,11 +16,12 @@
 
 #include "op/sirius_dynamic_filter.hpp"
 
-#include <catch.hpp>
 #include <cudf/ast/expressions.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
+
+#include <catch.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -151,7 +152,9 @@ TEST_CASE("sirius_dynamic_filter_set::push_filter is thread-safe", "[dynamic_fil
       }
     });
   }
-  for (auto& th : threads) { th.join(); }
+  for (auto& th : threads) {
+    th.join();
+  }
 
   std::size_t total = 0;
   for (std::size_t col = 0; col < kColumnCount; ++col) {
@@ -193,8 +196,7 @@ TEST_CASE("sirius_dynamic_zone_map_filter::to_ast emits a single bounded conjunc
   REQUIRE(&root == &tree.back());
 }
 
-TEST_CASE("sirius_dynamic_zone_map_filter::to_ast OR-conjoins multiple zones",
-          "[dynamic_filter]")
+TEST_CASE("sirius_dynamic_zone_map_filter::to_ast OR-conjoins multiple zones", "[dynamic_filter]")
 {
   std::vector<zone_map_entry> zones;
   zones.push_back(make_zone(0, 10));
@@ -244,8 +246,9 @@ TEST_CASE("merge_ast_dynamic_filters_into_tree returns existing_root unchanged f
   REQUIRE(tree.size() == 1);
 }
 
-TEST_CASE("merge_ast_dynamic_filters_into_tree AND-conjoins per-column fragments with existing root",
-          "[dynamic_filter]")
+TEST_CASE(
+  "merge_ast_dynamic_filters_into_tree AND-conjoins per-column fragments with existing root",
+  "[dynamic_filter]")
 {
   sirius_dynamic_filter_set set;
   set.push_filter(0, make_single_zone_filter(0, 100));
@@ -314,8 +317,9 @@ TEST_CASE("merge_ast_dynamic_filters_into_tree skips filters lacking the AST cap
   REQUIRE(tree.size() == 1);     // only the base remains
 }
 
-TEST_CASE("merge_ast_dynamic_filters_into_tree mixes AST-capable and non-capable filters per column",
-          "[dynamic_filter]")
+TEST_CASE(
+  "merge_ast_dynamic_filters_into_tree mixes AST-capable and non-capable filters per column",
+  "[dynamic_filter]")
 {
   sirius_dynamic_filter_set set;
   set.push_filter(0, std::make_unique<stub_runtime_only_filter>());

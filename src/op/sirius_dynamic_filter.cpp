@@ -34,12 +34,16 @@ namespace {
 cudf::ast::expression const& and_join(cudf::ast::tree& tree,
                                       cudf::ast::expression const& lhs,
                                       cudf::ast::expression const& rhs)
-{ return tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::LOGICAL_AND, lhs, rhs); }
+{
+  return tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::LOGICAL_AND, lhs, rhs);
+}
 
 cudf::ast::expression const& or_join(cudf::ast::tree& tree,
                                      cudf::ast::expression const& lhs,
                                      cudf::ast::expression const& rhs)
-{ return tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::LOGICAL_OR, lhs, rhs); }
+{
+  return tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::LOGICAL_OR, lhs, rhs);
+}
 
 // cudf::ast::literal only has typed constructors; dispatch on type_id to downcast a type-erased
 // cudf::scalar to the correct concrete subtype before emplacing.
