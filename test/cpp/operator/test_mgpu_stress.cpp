@@ -78,10 +78,8 @@
 #include <duckdb.hpp>
 #include <unistd.h>
 
-#include <array>
 #include <cstdlib>
 #include <filesystem>
-#include <memory>
 #include <string>
 #include <vector>
 
