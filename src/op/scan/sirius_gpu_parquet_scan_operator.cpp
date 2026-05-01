@@ -150,7 +150,12 @@ std::unique_ptr<cudf::table> sirius_gpu_parquet_scan_operator::read_table_from_m
   if (filter_expression && !ast_expression) {
     sirius::gpu_expression_executor gpu_expression_executor(
       filter_expression.get(), cudf::get_current_device_resource_ref(), stream);
-    table = gpu_expression_executor.select(table->view());
+    // Hold the source table in a separate variable so its destruction (and the
+    // stream-ordered dealloc of its buffers) is sequenced after select()'s kernels
+    // have been queued. Assigning select()'s result directly back to `table` would
+    // destruct the source synchronously before the queued kernels read from it.
+    auto input_table = std::move(table);
+    table            = gpu_expression_executor.select(input_table->view());
     SIRIUS_LOG_DEBUG(
       "[sirius_gpu_parquet_scan_operator] Applied duckdb filter expression post parquet scan.");
   }
