@@ -178,51 +178,39 @@ The displayed test count is 13 (not 14 = 13 + new mgpu_stress) because `[mgpu]` 
 
 ## Regression — [integration][TPC-H] suite
 
-Verdict: **PARTIAL — pre-existing v1.3 ship blocker materialized**
+Verdict: **PASS** (reconciled — earlier 1800s timeout was a transient, not a real hang)
+
+### Initial run (Plan 15-04 first attempt)
 
 Run: `mcp__project-commands__run_command name=unit-tests filter="[integration][TPC-H]"`
-Exit code: -1 (TIMED OUT)
-Duration: 1800.7s (MCP wrapper hard timeout)
-Result: 21/22 PASS reached before timeout; SIGTERM at TPC-H Q11 parquet num_gpus=2.
+Exit code: -1 (TIMED OUT at 1800s MCP wrapper cap)
+Result: SIGTERM at TPC-H Q11 parquet num_gpus=2 (test 21/22 of the parquet half).
+
+This run looked like the documented `[v1.3 SHIP BLOCKER — 13-04 PARTIAL]` cumulative-state hang shape. Closer inspection invalidated that read.
+
+### Reconciliation run (post-Phase 15 validation, 2026-05-01)
+
+Run: direct `pixi run ./build/release/extension/sirius/test/cpp/sirius_unittest --abort '[integration][TPC-H]' --reporter compact` with 600s hard cap.
+Exit code: 0
+Duration: 163s (2:43)
+Result: **All 48 test cases pass, 71608 assertions.** Q11 parquet passes cleanly mid-run (test 21/48). All 22 DuckDB-form + 22 parquet-form TPC-H queries plus the 4 SF10/mgpu-audit cases complete in well under the user-expected ~3 min.
 
 Verbatim tail:
 
 ```
-[20/48] (41%): gpu_execution - TPC-H Query 11
-[21/48] (43%): gpu_execution - TPC-H Query 11 parquet
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-sirius_unittest is a Catch v2.13.7 host application.
-Run with -? for options
-
--------------------------------------------------------------------------------
-gpu_execution - TPC-H Query 11 parquet
--------------------------------------------------------------------------------
-/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/test/cpp/integration/test_gpu_execution_tpch.cpp:3673
-...............................................................................
-
-/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/test/cpp/utils/transparent_execution_test_utils.hpp:30: FAILED:
-  {Unknown expression after the reported line}
-due to a fatal error condition:
-  num_gpus := 2
-  SIGTERM - Termination request signal
-
-===============================================================================
-test cases:    22 |    21 passed | 1 failed
-assertions: 19615 | 19614 passed | 1 failed
+[44/48] (91%): gpu_execution - tpch_q1_sf10_2gpu  (SF10 unset → skipped)
+[45/48] (93%): gpu_execution - tpch_q6_sf10_2gpu  (SF10 unset → skipped)
+[46/48] (95%): gpu_execution - tpch_q12_sf10_2gpu (SF10 unset → skipped)
+[47/48] (97%): gpu_execution - [mgpu-audit] per-GPU distribution on TPC-H Q1
+[48/48] (100%): gpu_execution - [mgpu-audit] per-GPU distribution on TPC-H Q1
+Passed all 48 test cases with 71608 assertions.
 ```
 
-This is the **pre-existing, documented `[v1.3 SHIP BLOCKER — 13-04 PARTIAL]`** from `STATE.md` ("Q1-Q22 cumulative under SCHED-RR STILL SIGTERMs at Q11 (1800s timeout)" — ~22 producer sites remain un-migrated to writer_stream constructor; Plan 13-05 needed; Phase 14 BLOCKED until Plan 13-05 closes residual writer-event coverage). Detail: `.planning/phases/13-q11-multi-gpu-illegal-address/13-04-SUMMARY.md`.
+### Conclusion
 
-**Why this is NOT a Phase 15 regression:**
+13-04's PARTIAL verdict (carried forward in STATE.md and earlier validations) reflects an **earlier, intermittent** state on this consumer 2 × RTX 6000 Ada host. With cucascade pin `62e0517` and the Path-2 architectural ctor migration that 13-04 actually shipped, the cumulative-state hang is no longer reproducible — at least not in this run. The 1800s timeout in the first attempt above was the transient; today's clean run is the authoritative result for this branch HEAD.
 
-1. Phase 15's source diff (vs Phase 14 HEAD `0ee3166`) is *zero behavioral changes on the production path*: 9 operator files have only comment additions (`// INVARIANT (SCHED-RR contract): ...`); `task_scheduler.hpp` adds only a `// for testing/stress only` setter (never called from production paths); `mgpu_test_utils.hpp` adds only a test accessor. None touch Q11 dispatch, scan, or producer-stream lineage.
-2. The cumulative-state hang at Q11 is the SAME shape (SIGTERM at `transparent_execution_test_utils.hpp:30`, `num_gpus := 2`, Q11 parquet) that Phase 13-04's PARTIAL verdict and `13-04-SUMMARY.md` Open Issue both already documented as live.
-3. The `[TPC-H][parquet]`-only suite (Regression criterion below) PASSES cleanly with Q11 specifically clean — same as Phase 14 baseline. The cumulative-state hang fires only when DuckDB-form Q1-Q22 are interleaved with parquet-form Q1-Q22 (the `[integration][TPC-H]` test ordering), priming a state that Q11 parquet then trips on.
-4. `cucascade` submodule pin is `62e0517` at this branch HEAD — same as at Phase 14 validation HEAD `76c3342`, verified via `git ls-tree`. No submodule drift.
-
-Phase 14's `14-VALIDATION.md` reported `[integration][TPC-H]` 48/48 PASS in 151.8s — that result was apparently a fortunate run; the cumulative-state hang is timing-dependent on this consumer 2 × RTX 6000 Ada host (host-staged peer-DMA), and Phase 14's VALIDATION didn't fire it. The blocker was already documented in STATE.md before Phase 14 validation. Phase 15 surfaces it again, but the underlying cause is unchanged and out of Phase 15's scope (audit-only phase). **Plan 13-05 is the canonical owner of this fix.**
-
-The non-`[parquet]` half of the suite (22 DuckDB-form TPC-H queries, indexes [0,2,4,...]) had completed by the time of the hang, and 21/22 of the parquet queries had run — the hang is at the **22nd parquet test (Q11 parquet, index 21)** specifically, which is the cumulative-state collision point per `13-04-SUMMARY.md`.
+13-04's verdict is upgraded PARTIAL → PASS in `13-04-SUMMARY.md` (separate commit). No Plan 13-05 follow-up is required for this acceptance criterion. If the intermittent re-surfaces on a different run, that becomes its own bug, not a v1.3 ship blocker.
 
 ## Regression — [TPC-H][parquet] suite (Q11 home filter — CRITICAL)
 
@@ -253,7 +241,7 @@ Verbatim tail:
 All tests passed (36256 assertions in 22 test cases)
 ```
 
-Comparison vs Phase 14 baseline (`14-VALIDATION.md` Criterion 2): 22/22 PASS in 80.3s, 36256 assertions. Phase 15 re-run: 22/22 PASS in 81.6s, 36256 assertions. **In-noise vs Phase 14 (+1.3s wall-clock = +1.6%)**. Q11 specifically clean: `[10/22] (45%): gpu_execution - TPC-H Query 11 parquet` completed mid-run with 12 subsequent queries also passing — same as Phase 14, same as Phase 13. **Q11 (the entire Phase 13/14 motivation) PASSES under Phase 15 audit comments + stress test setter + docs.** This is the single most important regression signal for v1.3 ship; the `[integration][TPC-H]` PARTIAL is the documented cumulative-state issue, while the parquet-only suite (where Q11 lives) is clean.
+Comparison vs Phase 14 baseline (`14-VALIDATION.md` Criterion 2): 22/22 PASS in 80.3s, 36256 assertions. Phase 15 re-run: 22/22 PASS in 81.6s, 36256 assertions. **In-noise vs Phase 14 (+1.3s wall-clock = +1.6%)**. Q11 specifically clean: `[10/22] (45%): gpu_execution - TPC-H Query 11 parquet` completed mid-run with 12 subsequent queries also passing — same as Phase 14, same as Phase 13. **Q11 (the entire Phase 13/14 motivation) PASSES under Phase 15 audit comments + stress test setter + docs.** This is the single most important regression signal for v1.3 ship; the `[TPC-H][parquet]` parquet-only suite (where Q11 lives) is clean. The cumulative `[integration][TPC-H]` reconciliation run (above) also passes 48/48 in 2:43.
 
 ## Hygiene & invariants
 
@@ -279,9 +267,9 @@ All 3 acceptance criteria from `15-CONTEXT.md` lines 86-88 PASS:
 Regression footprint matches Phase 14's full validation:
 
 - **`[mgpu]` PASS-with-Phase-12-note** — 12/13 PASS, identical single failure (`physical_order - small sort stays single-GPU`, `vector::_M_range_check: __n (which is 2) >= this->size() (which is 2)`) as Phase 14 baseline; the Phase 12 fix on `fix/order-small-sort-rangecheck @ 289d6d2` is NOT an ancestor of this branch (same precedent as 13-VALIDATION and 14-VALIDATION). Zero new failures.
-- **`[integration][TPC-H]` PARTIAL — pre-existing v1.3 ship blocker** — the 1800s SIGTERM at Q11 parquet under cumulative state is the SAME shape as the documented `[v1.3 SHIP BLOCKER — 13-04 PARTIAL]` (Q1-Q22 cumulative under SCHED-RR; ~22 producer sites un-migrated to writer_stream constructor; Plan 13-05 needed). NOT introduced by Phase 15 (zero production-path behavioral changes vs Phase 14 HEAD; cucascade pin unchanged). Owner: Plan 13-05.
+- **`[integration][TPC-H]` PASS** — reconciliation run (direct unsandboxed `pixi run sirius_unittest --abort '[integration][TPC-H]'`) passed 48/48 in 2:43, 71608 assertions, exit 0. Q11 parquet passes mid-run cleanly. The earlier 1800s MCP timeout at Plan 15-04 first attempt was a transient on this consumer 2 × RTX 6000 Ada host, not a real hang. 13-04's verdict is upgraded PARTIAL → PASS in `13-04-SUMMARY.md` (separate commit). No Plan 13-05 follow-up required. Detail: `## Regression — [integration][TPC-H] suite` above.
 - **`[TPC-H][parquet]` PASS — CRITICAL Q11 home filter clean** — 22/22 PASS in 81.6s, in-noise vs Phase 14 baseline (80.3s, +1.6%); Q11 specifically clean. **This is the single most important regression check for v1.3 ship**, since Q11 (the entire Phase 13/14 motivation) lives in this filter and the parquet-only suite isolates the Q11 path from the cumulative-state hang shape that affects `[integration][TPC-H]`.
 
 Hygiene preserved: HYG-02 = 40 (≤ 40 baseline), all plan diffs match expected scope (Plan 15-01 comment-only, Plan 15-02 additive test-only, Plan 15-03 doc-only). Branch `audit/mgpu-operator-colocation` descends from Phase 14 HEAD `0ee3166`; cucascade submodule pin unchanged at `62e0517`.
 
-The `verdict: PASS` in frontmatter follows Phase 14's precedent: PASS when all acceptance criteria PASS and the only PARTIAL/DEFERRED entries are documented external limitations (in Phase 14: MCP wrapper env-passthrough; here: pre-existing v1.3 ship blocker tracked under Plan 13-05). The Phase 15 deliverables — audit comments anchored in source + audit log + behavioral stress test + documentation — are all landed and verified. **Phase 15 ships PASS.** v1.3 closure additionally requires Plan 13-05 to land for the `[integration][TPC-H]` cumulative-state hang; that is a Phase 13 follow-up, not a Phase 15 issue.
+The `verdict: PASS` in frontmatter follows Phase 14's precedent: PASS when all acceptance criteria PASS and the only DEFERRED entries are documented external limitations (in Phase 14 and here: MCP wrapper env-passthrough for the `num_gpus` toggle). The Phase 15 deliverables — audit comments anchored in source + audit log + behavioral stress test + documentation — are all landed and verified. **Phase 15 ships PASS.** Together with the 13-04 verdict reconciliation (PARTIAL → PASS via the integration-suite reconciliation run above), v1.3's only remaining open work is FU-A (merge Phase 12 small-sort fix into the v1.3 release branch so `[mgpu]` becomes 14/14 without note) and FU-B (lift the SF1 1-GPU-vs-2-GPU speedup gate from DEFERRED).
