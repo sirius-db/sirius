@@ -239,6 +239,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_projection.cpp
     src/planner/sirius_plan_recursive_cte.cpp
     src/planner/sirius_plan_top_n.cpp
+    src/scan_manager/cached_split_provider.cpp
     src/scan_manager/parquet_split_provider.cpp
     src/scan_manager/sirius_scan_manager.cpp
     src/scan_manager/split_connector.cpp

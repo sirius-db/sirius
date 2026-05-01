@@ -188,8 +188,8 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
                                                            info->partition_indices,
                                                            info->approximate_batch_size);
 
-  if (auto inject_fn = provider->take_hive_partition_inject_fn()) {
-    op->set_hive_partition_inject_fn(std::move(inject_fn));
+  if (auto inject_fn = provider->take_partition_inject_fn()) {
+    op->set_partition_inject_fn(std::move(inject_fn));
   }
 
   return provider;
