@@ -30,6 +30,8 @@
 
 #pragma once
 
+#include "pipeline/task_scheduler.hpp"
+#include "sirius_context.hpp"
 #include "utils/sirius_test_env.hpp"
 
 #include <cuda_runtime.h>
@@ -173,6 +175,31 @@ class scoped_mgpu_env {
   scoped_mgpu_env& operator=(scoped_mgpu_env const&) = delete;
 
   duckdb::Connection make_connection() { return _env->make_connection(); }
+
+  /**
+   * @brief Test-only accessor for the underlying task_scheduler.
+   *
+   * Returns a non-owning reference to the task_scheduler instance owned
+   * by the SiriusContext that this fixture wraps. Intended for tests
+   * that need to call test-only mutators (e.g.,
+   * `set_no_pref_rr_counter_for_testing`) between query setup and
+   * execution. Lifetime: the returned reference is valid for the
+   * lifetime of the scoped_mgpu_env instance (the SiriusContext is
+   * shared across every connection opened against this env via the
+   * extension callback's `OnConnectionOpened`).
+   *
+   * The connection argument is the route into the `registered_state`
+   * map where the SiriusContext is registered under "sirius_state";
+   * `scoped_mgpu_env` itself does not own a connection so the caller
+   * passes one (typically the one already created via
+   * `make_connection()`).
+   */
+  sirius::pipeline::task_scheduler& get_task_scheduler(duckdb::Connection& con)
+  {
+    auto sirius_ctx =
+      con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    return sirius_ctx->get_task_scheduler();
+  }
 
  private:
   std::unique_ptr<sirius::test::shared_test_env> _env;
