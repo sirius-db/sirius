@@ -27,6 +27,7 @@ identify = ">=2.6"
 clang-tools = "21.*"
 pkg-config = "*"
 mold = "*"
+pyarrow = ">=24.0.0,<25"
 
 [feature.dev-libs.dependencies]
 librmm = "*"

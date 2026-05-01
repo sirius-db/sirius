@@ -257,7 +257,7 @@ std::shared_ptr<cucascade::data_batch> GpuExpressionExecutor::execute(
   output_columns.resize(expressions.size());
 
   // Retrieve the table_view from the data_batch
-  auto input_ro = input_batch->to_read_only();
+  auto input_ro        = input_batch->to_read_only();
   auto& input_data_rep = input_ro.get_data()->cast<cucascade::gpu_table_representation>();
   input_table          = input_data_rep.get_table_view();
   input_count          = static_cast<cudf::size_type>(input_table.num_rows());
