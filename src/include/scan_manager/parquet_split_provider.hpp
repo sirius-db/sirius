@@ -22,15 +22,19 @@
 #include "scan_manager/split_provider.hpp"
 #include "sirius_config.hpp"
 
+#include <cudf/io/datasource.hpp>
+
 #include <duckdb/common/column_index.hpp>
 #include <duckdb/common/multi_file/multi_file_data.hpp>
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/vector.hpp>
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace duckdb {
@@ -70,7 +74,20 @@ class parquet_split_provider : public split_provider {
    *                                partition.
    * @param max_file_processed      Maximum number of files handled by one
    *                                metadata task.
+   * @param open_datasource         Per-URI datasource builder. When non-empty,
+   *                                each file's metadata read is opened through
+   *                                this closure (engine path: dispatches via
+   *                                @c datasource_factory::create_for_parquet_scan
+   *                                so scheme-qualified URIs reach their ioctx
+   *                                and relative bare paths go to cudf default).
+   *                                Empty closure → @c run_batch falls back to
+   *                                @c cudf::io::datasource::create(uri)
+   *                                directly, preserving the pre-PR behavior
+   *                                for tests and standalone use.
    */
+  using open_datasource_fn =
+    std::function<std::unique_ptr<cudf::io::datasource>(std::string_view)>;
+
   parquet_split_provider(
     duckdb::vector<sirius::logical_type> const& returned_types,
     std::vector<std::string> const& file_paths,
@@ -81,7 +98,8 @@ class parquet_split_provider : public split_provider {
     duckdb::unique_ptr<duckdb::TableFilterSet> table_filter_set            = nullptr,
     duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices = {},
     std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE,
-    std::size_t max_file_processed     = DEFAULT_MAX_FILE_PROCESSED);
+    std::size_t max_file_processed     = DEFAULT_MAX_FILE_PROCESSED,
+    open_datasource_fn open_datasource = {});
 
   ~parquet_split_provider() override;
 
@@ -127,6 +145,10 @@ class parquet_split_provider : public split_provider {
   std::size_t _max_file_processed;
   std::size_t _total_files;
   std::size_t _next_file_idx{0};
+  /// Optional. When set, each file's metadata read goes through this closure
+  /// (typically captures the engine to dispatch by URI scheme); when empty,
+  /// run_batch falls back to cudf::io::datasource::create(file_path).
+  open_datasource_fn _open_datasource;
 };
 
 }  // namespace sirius::scan_manager

@@ -20,6 +20,8 @@
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/parallel/thread_context.hpp"
+#include "io/datasource_factory.hpp"
+#include "io/s3/s3_ioctx.hpp"
 #include "log/logging.hpp"
 #include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/sirius_physical_concat.hpp"
@@ -56,6 +58,72 @@
 #include <stdexcept>
 
 namespace sirius {
+
+sirius_engine::sirius_engine(duckdb::ClientContext& context, sirius_interface& sirius_iface)
+  : context(context),
+    sirius_iface(sirius_iface),
+    datasource_registry_(std::make_shared<io::datasource_registry>())
+{
+  // No eager backends: local file paths bypass the registry entirely
+  // (datasource_factory routes them to cudf's default datasource), and
+  // object-store backends (s3) are registered lazily on first
+  // datasource_registry() access once SiriusContext is attached.
+}
+
+sirius_engine::~sirius_engine()
+{
+  // Explicit shutdown before dropping the registry so any in-flight
+  // rings/reactors get a chance to quiesce while the ioctx is still alive.
+  if (datasource_registry_) {
+    for (auto const& scheme : datasource_registry_->schemes()) {
+      if (auto ioctx = datasource_registry_->lookup(scheme)) { ioctx->shutdown(); }
+    }
+    datasource_registry_->clear();
+  }
+}
+
+io::datasource_registry& sirius_engine::datasource_registry()
+{
+  // Lazily register object-store backends the first time the registry is
+  // accessed *after* SiriusContext has been attached. Engine ctor runs before
+  // registered_state is populated, so we can't do this eagerly there.
+  if (context.registered_state) {
+    auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    if (sirius_ctx) {
+      auto const& osc = sirius_ctx->get_config().get_object_store_config();
+      if (!osc.endpoint.empty() && !datasource_registry_->lookup("s3")) {
+        try {
+          io::s3::s3_ioctx_config scfg;
+          scfg.endpoint   = osc.endpoint;
+          scfg.region     = osc.region.empty() ? "us-east-1" : osc.region;
+          scfg.access_key = osc.access_key;
+          scfg.secret_key = osc.secret_key;
+          datasource_registry_->register_ioctx("s3",
+                                               std::make_shared<io::s3::s3_ioctx>(std::move(scfg)));
+        } catch (std::exception const& e) {
+          SIRIUS_LOG_WARN("sirius_engine: failed to register s3 backend: {}", e.what());
+        }
+      }
+    }
+  }
+  return *datasource_registry_;
+}
+
+sirius_config const& sirius_engine::config() const
+{
+  // Fall back to a process-wide default when no SiriusContext is attached:
+  // unit-test fixtures that exercise scan tasks construct a sirius_engine
+  // directly off a ClientContext without registering a SiriusContext, and
+  // datasource_factory::create only ever consults the object_store_config
+  // (empty by default). The lazy s3 ioctx registration in datasource_registry()
+  // already guards on context.registered_state and sirius_ctx, so a default
+  // config here is semantically equivalent to "no s3 endpoint configured."
+  static const sirius_config kDefault{};
+  if (!context.registered_state) { return kDefault; }
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return kDefault; }
+  return sirius_ctx->get_config();
+}
 
 void sirius_engine::reset()
 {
@@ -230,7 +298,11 @@ duckdb::unique_ptr<op::sirius_physical_operator> sirius_engine::construct_sirius
 {
   if (op->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
     auto& scan_physical_op = op->Cast<op::sirius_physical_table_scan>();
-    if (scan_physical_op.function.name == "iceberg_scan") {
+    if (scan_physical_op.function.name == "parquet_scan" ||
+        scan_physical_op.function.name == "read_parquet" ||
+        scan_physical_op.function.name == "sirius_read_parquet") {
+      return duckdb::make_uniq<op::sirius_physical_parquet_scan>(&scan_physical_op);
+    } else if (scan_physical_op.function.name == "iceberg_scan") {
       return construct_iceberg_scan_operator(scan_physical_op);
     } else if (scan_physical_op.function.name == "seq_scan") {
       return duckdb::make_uniq<op::sirius_physical_duckdb_scan>(&scan_physical_op);

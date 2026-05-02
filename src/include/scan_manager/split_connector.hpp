@@ -18,6 +18,7 @@
 
 #include <condition_variable>
 #include <deque>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -38,6 +39,11 @@ namespace sirius::scan_manager {
  *
  *   - returns std::nullopt           → connector is closed and drained, no more will arrive.
  *   - returns a non-null unique_ptr  → next split.
+ *
+ * Failure path: if the producer cannot complete the scan, it calls @c set_error to
+ * record the exception and then @c close() to wake consumers. A consumer waiting in
+ * (or arriving at) @c get_next_split observes the stored exception and rethrows it,
+ * so the failure surfaces as a thrown exception rather than a silent end-of-stream.
  */
 class split_connector {
  public:
@@ -56,9 +62,18 @@ class split_connector {
   ///        Wakes all waiting consumers.
   void close();
 
+  /// \brief Record a producer-side failure. Subsequent (and currently waiting)
+  ///        @c get_next_split calls rethrow this exception instead of returning
+  ///        @c std::nullopt. Idempotent: only the first error is kept; later
+  ///        calls are dropped on the floor (one is enough to fail the query).
+  ///        Callers should follow this with @c close() so consumers wake.
+  void set_error(std::exception_ptr err);
+
   /// \brief Pull the next split, blocking until one is available or the connector
   ///        is closed and drained.
-  /// \return std::nullopt when closed and drained; the next split otherwise.
+  /// \return std::nullopt when closed and drained without errors; the next split
+  ///         otherwise.
+  /// \throws The exception passed to @c set_error if the producer recorded one.
   std::optional<std::unique_ptr<op::operator_data>> get_next_split();
 
   /// \brief True iff close() has been called and the queue is drained.
@@ -71,6 +86,10 @@ class split_connector {
   std::condition_variable _cv;
   std::deque<std::unique_ptr<op::operator_data>> _splits;
   bool _closed{false};
+  /// First producer-side failure, if any. Cleared by get_next_split when it
+  /// rethrows so the same exception is delivered exactly once and the
+  /// connector behaves like a closed-empty queue afterwards.
+  std::exception_ptr _stored_error;
 };
 
 }  // namespace sirius::scan_manager

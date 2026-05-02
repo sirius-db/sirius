@@ -68,8 +68,10 @@ find_package(spdlog REQUIRED CONFIG)
 find_package(yaml-cpp REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
+find_package(OpenSSL REQUIRED)
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
+pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
 
 # cuCascade - GPU Memory Reservation Library (submodule) cucascade links `numa`
 # as a bare library name (-lnuma). In the vcpkg build the static libnuma.a lives
@@ -255,6 +257,10 @@ set(EXTENSION_SOURCES
     src/sirius_engine.cpp
     src/sirius_extension.cpp
     src/sirius_interface.cpp
+    src/io/datasource_factory.cpp
+    src/io/s3/s3_ioctx.cpp
+    src/io/s3/sigv4.cpp
+    src/io/uri_parser.cpp
     src/transparent/physical_sirius_execution.cpp
     src/transparent/sirius_optimizer_extension.cpp
     src/util/stream_check_wrapper.cpp
@@ -317,10 +323,17 @@ foreach(_target sirius_extension sirius_loadable_extension)
 endforeach()
 
 # Additional libraries only needed by the static extension
-target_link_libraries(sirius_extension PkgConfig::NUMA PkgConfig::LIBURING
-                      yaml-cpp::yaml-cpp absl::any_invocable)
+target_link_libraries(
+  sirius_extension
+  PkgConfig::NUMA
+  PkgConfig::LIBURING
+  PkgConfig::CURL
+  OpenSSL::Crypto
+  yaml-cpp::yaml-cpp
+  absl::any_invocable)
 
-target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING)
+target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING PkgConfig::CURL
+                      OpenSSL::Crypto)
 
 # Required by DuckDB's export set (duckdb_static -> sirius_extension ->
 # cucascade_static)
@@ -345,12 +358,14 @@ endif()
 set(TEST_SOURCES
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
+    test/cpp/config/test_object_store_config.cpp
     test/cpp/data/test_convertible_data_batch.cpp
     test/cpp/data/test_convertible_gpu_pipeline_task.cpp
     test/cpp/data/test_host_parquet_representation.cpp
     test/cpp/downgrade/test_downgrade_disk.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
+    test/cpp/engine/test_registry_bootstrap.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
@@ -360,8 +375,17 @@ set(TEST_SOURCES
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
     test/cpp/helper/test_logical_type.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
+    test/cpp/integration/test_gpu_execution_s3.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/integration/test_transparent_execution.cpp
+    test/cpp/io/s3/test_s3_integration.cpp
+    test/cpp/io/s3/test_s3_ioctx.cpp
+    test/cpp/io/s3/test_s3_parquet_integration.cpp
+    test/cpp/io/s3/test_sigv4.cpp
+    test/cpp/io/test_datasource_factory.cpp
+    test/cpp/io/test_device_read_flags.cpp
+    test/cpp/io/test_uri_parser.cpp
+    test/cpp/io/test_uring_link.cpp
     test/cpp/memory/test_host_table_utils.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
@@ -370,6 +394,7 @@ set(TEST_SOURCES
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_merge.cpp
     test/cpp/operator/test_gpu_partition_impl.cpp
     test/cpp/operator/test_host_table_chunk_reader.cpp
+    test/cpp/operator/test_parquet_scan_via_factory.cpp
     test/cpp/operator/test_physical_concat.cpp
     test/cpp/operator/test_physical_filter.cpp
     test/cpp/operator/test_physical_limit.cpp

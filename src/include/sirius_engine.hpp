@@ -29,6 +29,7 @@
 
 #include <cucascade/data/data_repository_manager.hpp>
 
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -41,9 +42,14 @@ namespace sirius::op {
 class sirius_physical_table_scan;
 }  // namespace sirius::op
 
+namespace sirius::io {
+class datasource_registry;
+}  // namespace sirius::io
+
 namespace sirius {
 
 struct operator_params;
+struct sirius_config;
 class sirius_interface;
 
 class sirius_engine {
@@ -52,9 +58,8 @@ class sirius_engine {
   friend class pipeline::sirius_meta_pipeline;
 
  public:
-  explicit sirius_engine(duckdb::ClientContext& context, sirius_interface& sirius_iface)
-    : context(context), sirius_iface(sirius_iface) {};
-  ~sirius_engine() {}
+  sirius_engine(duckdb::ClientContext& context, sirius_interface& sirius_iface);
+  ~sirius_engine();
 
   duckdb::ClientContext& context;
   sirius_interface& sirius_iface;
@@ -127,6 +132,22 @@ class sirius_engine {
   // ---------------------------------------------------------------------------
   std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>
     iceberg_delete_data_cache_;
+
+  //! Registry of per-scheme sirius_ioctx instances (s3, future gds, ...).
+  //! Object-store backends are registered lazily from the active sirius_config
+  //! on first access once a SiriusContext is attached. Local file paths bypass
+  //! the registry and go through cudf's default datasource (see
+  //! datasource_factory::create file branch).
+  [[nodiscard]] io::datasource_registry& datasource_registry();
+
+  //! Returns the sirius_config attached to this engine's SiriusContext.
+  //! Required by datasource_factory::create so per-scheme backends (s3, gds,
+  //! ...) can consume object-store / tuning settings. If SiriusContext is not
+  //! registered on the ClientContext, returns a process-wide default config.
+  [[nodiscard]] sirius_config const& config() const;
+
+ private:
+  std::shared_ptr<io::datasource_registry> datasource_registry_;
 };
 
 }  // namespace sirius

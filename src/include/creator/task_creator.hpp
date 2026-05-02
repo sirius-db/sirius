@@ -17,6 +17,10 @@
 #pragma once
 
 #include "duckdb/main/client_context.hpp"
+// BlockingConcurrentQueue uses BLOCK_SIZE as a variable name, which conflicts with
+// macros defined in some system headers (like liburing or duckdb)
+#undef BLOCK_SIZE
+
 #include "exec/bounded_thread_pool.hpp"
 #include "exec/config.hpp"
 #include "exec/interruptible_mpmc.hpp"

@@ -63,6 +63,7 @@ using namespace cucascade::memory;
 inline std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> initialize_memory_manager(
   std::size_t n_gpus = 1)
 {
+  cudaDeviceSynchronize();
   // Reset converter registry to avoid cross-test leakage
   sirius::converter_registry::reset_for_testing();
 

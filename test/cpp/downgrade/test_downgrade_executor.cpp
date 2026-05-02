@@ -51,6 +51,7 @@ const auto GPU_SPACE_ID = cucascade::memory::memory_space_id(cucascade::memory::
 
 std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> make_test_memory_manager()
 {
+  cudaDeviceSynchronize();
   sirius::converter_registry::reset_for_testing();
 
   cucascade::memory::reservation_manager_configurator builder;

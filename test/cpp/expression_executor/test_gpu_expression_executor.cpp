@@ -58,6 +58,7 @@ namespace {
 
 std::unique_ptr<memory_mgr> initialize_memory_manager()
 {
+  cudaDeviceSynchronize();
   ::sirius::converter_registry::reset_for_testing();
   reservation_manager_configurator builder;
   auto constexpr gpu_capacity  = 256ull << 20;  // 256MB
