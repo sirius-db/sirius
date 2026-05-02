@@ -35,3 +35,9 @@ compile_commands.json
 
 # Zed editor settings
 .zed
+.claude/
+test/cpp/integration/s3/fixtures
+log/sirius*.log
+CLAUDE.local.md
+AGENTS.md
+newplan.md

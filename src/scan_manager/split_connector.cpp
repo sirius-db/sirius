@@ -46,28 +46,50 @@ void split_connector::close()
   _cv.notify_all();
 }
 
+void split_connector::set_error(std::exception_ptr err)
+{
+  if (!err) { return; }
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (_stored_error) { return; }
+    _stored_error = std::move(err);
+    _splits.clear();
+  }
+  // Caller is expected to follow up with close(); notify here too so consumers
+  // already waiting wake up immediately even if the caller forgets.
+  _cv.notify_all();
+}
+
 std::optional<std::unique_ptr<op::operator_data>> split_connector::get_next_split()
 {
-  std::unique_lock<std::mutex> lock(_mutex);
-  _cv.wait(lock, [this] { return !_splits.empty() || _closed; });
-  if (!_splits.empty()) {
-    auto split = std::move(_splits.front());
-    _splits.pop_front();
-    return std::optional<std::unique_ptr<op::operator_data>>{std::move(split)};
+  std::exception_ptr to_rethrow;
+  {
+    std::unique_lock<std::mutex> lock(_mutex);
+    _cv.wait(lock, [this] { return !_splits.empty() || _closed || _stored_error; });
+    if (_stored_error) {
+      to_rethrow    = std::move(_stored_error);
+      _stored_error = nullptr;
+      _splits.clear();
+    } else if (!_splits.empty()) {
+      auto split = std::move(_splits.front());
+      _splits.pop_front();
+      return std::optional<std::unique_ptr<op::operator_data>>{std::move(split)};
+    }
   }
+  if (to_rethrow) { std::rethrow_exception(to_rethrow); }
   return std::nullopt;
 }
 
 bool split_connector::is_closed() const
 {
   std::lock_guard<std::mutex> lock(_mutex);
-  return _closed && _splits.empty();
+  return _closed && _splits.empty() && !_stored_error;
 }
 
 [[nodiscard]] bool split_connector::has_more_splits() const
 {
   std::lock_guard<std::mutex> lock(_mutex);
-  return !_splits.empty();
+  return !_splits.empty() || _stored_error != nullptr;
 }
 
 }  // namespace sirius::scan_manager

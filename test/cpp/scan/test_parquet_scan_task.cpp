@@ -25,6 +25,9 @@
 #include <op/scan/parquet_scan_task.hpp>
 #include <op/sirius_physical_parquet_scan.hpp>
 #include <parallel/task_executor.hpp>
+#include <pipeline/sirius_pipeline.hpp>
+#include <sirius_engine.hpp>
+#include <sirius_interface.hpp>
 
 // cucascade
 #include <cucascade/memory/memory_reservation_manager.hpp>
@@ -49,8 +52,15 @@
 
 // standard library
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
+#include <cstdlib>
+#include <exception>
 #include <filesystem>
+#include <iostream>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -67,6 +77,59 @@ using batch_validator_t = void (*)(const std::vector<std::shared_ptr<cucascade::
                                    cucascade::memory::memory_reservation_manager&,
                                    rmm::cuda_stream_view);
 
+class scan_test_watchdog {
+ public:
+  explicit scan_test_watchdog(std::chrono::seconds timeout) : _timeout(timeout)
+  {
+    _thread = std::thread([this] { run(); });
+  }
+
+  ~scan_test_watchdog()
+  {
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      _done = true;
+    }
+    _cv.notify_all();
+    if (_thread.joinable()) { _thread.join(); }
+  }
+
+  void phase(std::string phase)
+  {
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      _phase       = std::move(phase);
+      _phase_start = std::chrono::steady_clock::now();
+    }
+    _cv.notify_all();
+  }
+
+ private:
+  void run()
+  {
+    std::unique_lock<std::mutex> lock(_mutex);
+    while (!_done) {
+      auto const deadline = _phase_start + _timeout;
+      if (_cv.wait_until(lock, deadline, [this] { return _done; })) { return; }
+      if (_done || std::chrono::steady_clock::now() < deadline) { continue; }
+
+      auto phase = _phase;
+      lock.unlock();
+      std::cerr << "[parquet_scan_task_test] timed out after " << _timeout.count() << "s while "
+                << phase << std::endl;
+      std::abort();
+    }
+  }
+
+  std::chrono::seconds _timeout;
+  std::mutex _mutex;
+  std::condition_variable _cv;
+  bool _done{false};
+  std::string _phase{"initializing"};
+  std::chrono::steady_clock::time_point _phase_start{std::chrono::steady_clock::now()};
+  std::thread _thread;
+};
+
 /**
  * Minimal concrete executor for scan task tests.
  */
@@ -77,6 +140,23 @@ class scan_test_executor : public sirius::parallel::itask_executor {
   {
   }
 
+  [[nodiscard]] size_t completed_tasks() const
+  {
+    return _completed_tasks.load(std::memory_order_acquire);
+  }
+
+  [[nodiscard]] bool has_worker_exception() const
+  {
+    std::lock_guard<std::mutex> lock(_exception_mutex);
+    return _worker_exception != nullptr;
+  }
+
+  void rethrow_worker_exception() const
+  {
+    std::lock_guard<std::mutex> lock(_exception_mutex);
+    if (_worker_exception) { std::rethrow_exception(_worker_exception); }
+  }
+
  protected:
   void manager_loop() override
   {
@@ -85,11 +165,57 @@ class scan_test_executor : public sirius::parallel::itask_executor {
       if (!slot) { break; }
       auto task = _task_queue.pop();
       if (!task) { break; }
-      _bounded_pool->dispatch(std::move(slot), [t = std::move(task)]() mutable {
-        t->execute(cudf::get_default_stream());
+      _bounded_pool->dispatch(std::move(slot), [this, t = std::move(task)]() mutable {
+        try {
+          t->execute(cudf::get_default_stream());
+        } catch (...) {
+          std::lock_guard<std::mutex> lock(_exception_mutex);
+          if (!_worker_exception) { _worker_exception = std::current_exception(); }
+        }
+        _completed_tasks.fetch_add(1, std::memory_order_release);
       });
     }
   }
+
+ private:
+  std::atomic<size_t> _completed_tasks{0};
+  mutable std::mutex _exception_mutex;
+  std::exception_ptr _worker_exception;
+};
+
+static void wait_for_scan_tasks(scan_test_executor& executor, size_t scheduled)
+{
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+  while (executor.completed_tasks() < scheduled) {
+    if (executor.has_worker_exception()) { break; }
+    if (std::chrono::steady_clock::now() >= deadline) { break; }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  if (executor.completed_tasks() != scheduled && !executor.has_worker_exception()) {
+    std::cerr << "[parquet_scan_task_test] timed out waiting for parquet scan tasks: completed "
+              << executor.completed_tasks() << " of " << scheduled << std::endl;
+    std::abort();
+  }
+
+  executor.stop();
+  executor.rethrow_worker_exception();
+  if (executor.completed_tasks() != scheduled) {
+    FAIL("Timed out waiting for parquet scan tasks to finish");
+  }
+}
+
+struct parquet_scan_task_pipeline_fixture {
+  explicit parquet_scan_task_pipeline_fixture(duckdb::ClientContext& ctx)
+    : iface(ctx),
+      engine(ctx, iface),
+      pipeline(duckdb::make_shared_ptr<pipeline::sirius_pipeline>(engine))
+  {
+  }
+
+  sirius_interface iface;
+  sirius_engine engine;
+  duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline;
 };
 
 static std::unique_ptr<sirius::op::sirius_physical_parquet_scan> make_parquet_scan(
@@ -351,11 +477,15 @@ static void run_parquet_scan_test(std::string const& table_name,
                                   batch_validator_t validator   = validate_scanned_batches,
                                   table_creator_t table_creator = create_synthetic_table)
 {
+  scan_test_watchdog watchdog(std::chrono::seconds(120));
+  watchdog.phase("creating parquet scan test table");
   auto [db_owner, con] = sirius::make_test_db_and_connection();
 
   table_creator(con, table_name, num_rows);
+  watchdog.phase("writing parquet scan test file");
   auto parquet_path = write_parquet_from_table(con, table_name, row_group_size);
 
+  watchdog.phase("initializing parquet scan test context");
   auto& client_ctx = *con.context;
   auto sirius_ctx  = sirius::get_sirius_context(con, get_test_config_path());
   auto& mem_mgr    = sirius_ctx->get_memory_manager();
@@ -371,8 +501,10 @@ static void run_parquet_scan_test(std::string const& table_name,
     make_parquet_scan(client_ctx, parquet_path.string(), std::move(projection_indices));
   REQUIRE(physical_scan);
 
+  watchdog.phase("initializing parquet scan global state");
+  parquet_scan_task_pipeline_fixture pipeline_fixture(client_ctx);
   auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr, physical_scan.get(), batch_size);
+    pipeline_fixture.pipeline, physical_scan.get(), batch_size);
 
   cucascade::shared_data_repository data_repo;
 
@@ -397,11 +529,7 @@ static void run_parquet_scan_test(std::string const& table_name,
       executor.schedule(std::move(task));
       ++scheduled;
     }
-    while (data_repo.total_size() < scheduled) {
-      std::this_thread::yield();
-    }
-
-    executor.stop();
+    wait_for_scan_tasks(executor, scheduled);
     auto batches = drain_data_repo(data_repo);
     REQUIRE(batches.size() == scheduled);
     return batches;
@@ -409,9 +537,12 @@ static void run_parquet_scan_test(std::string const& table_name,
 
   // The stream must be declared before batches so it outlives GPU data allocated on it.
   rmm::cuda_stream stream;
+  watchdog.phase("running parquet scan tasks");
   auto batches = run_scan();
+  watchdog.phase("validating parquet scan batches");
   validator(batches, num_rows, mem_mgr, stream);
 
+  watchdog.phase("cleaning up parquet scan test");
   // End the transaction.
   auto commit_result = con.Query("COMMIT");
   REQUIRE(commit_result);
@@ -432,10 +563,13 @@ static void run_multi_file_parquet_scan_test(
   duckdb::vector<duckdb::idx_t> const& projection_indices = {},
   batch_validator_t validator                             = validate_scanned_batches)
 {
+  scan_test_watchdog watchdog(std::chrono::seconds(120));
+  watchdog.phase("creating multi-file parquet scan test tables");
   REQUIRE(!file_row_counts.empty());
 
   auto [db_owner, con] = sirius::make_test_db_and_connection();
 
+  watchdog.phase("writing multi-file parquet scan test files");
   auto parquet_dir = std::filesystem::temp_directory_path() / (table_prefix + "_multi_file");
   std::filesystem::remove_all(parquet_dir);
   std::filesystem::create_directories(parquet_dir);
@@ -455,6 +589,7 @@ static void run_multi_file_parquet_scan_test(
     total_rows += row_count;
   }
 
+  watchdog.phase("initializing multi-file parquet scan test context");
   auto& client_ctx = *con.context;
   auto sirius_ctx  = sirius::get_sirius_context(con, get_test_config_path());
   auto& mem_mgr    = sirius_ctx->get_memory_manager();
@@ -469,8 +604,10 @@ static void run_multi_file_parquet_scan_test(
     client_ctx, (parquet_dir / "*.parquet").string(), std::move(projection_indices));
   REQUIRE(physical_scan);
 
+  watchdog.phase("initializing multi-file parquet scan global state");
+  parquet_scan_task_pipeline_fixture pipeline_fixture(client_ctx);
   auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr, physical_scan.get(), batch_size);
+    pipeline_fixture.pipeline, physical_scan.get(), batch_size);
 
   cucascade::shared_data_repository data_repo;
 
@@ -495,11 +632,7 @@ static void run_multi_file_parquet_scan_test(
       executor.schedule(std::move(task));
       ++scheduled;
     }
-    while (data_repo.total_size() < scheduled) {
-      std::this_thread::yield();
-    }
-
-    executor.stop();
+    wait_for_scan_tasks(executor, scheduled);
     auto batches = drain_data_repo(data_repo);
     REQUIRE(batches.size() == scheduled);
     return batches;
@@ -507,9 +640,12 @@ static void run_multi_file_parquet_scan_test(
 
   // The stream must be declared before batches so it outlives GPU data allocated on it.
   rmm::cuda_stream stream;
+  watchdog.phase("running multi-file parquet scan tasks");
   auto batches = run_scan();
+  watchdog.phase("validating multi-file parquet scan batches");
   validator(batches, total_rows, mem_mgr, stream);
 
+  watchdog.phase("cleaning up multi-file parquet scan test");
   auto commit_result = con.Query("COMMIT");
   REQUIRE(commit_result);
   REQUIRE(!commit_result->HasError());
@@ -533,12 +669,16 @@ static void run_parquet_scan_test_with_filter(
   duckdb::vector<duckdb::idx_t> const& projection_indices = {},
   batch_validator_t validator                             = validate_scanned_batches)
 {
+  scan_test_watchdog watchdog(std::chrono::seconds(120));
+  watchdog.phase("creating filtered parquet scan test table");
   duckdb::DuckDB db(nullptr);
   duckdb::Connection con(db);
 
   create_synthetic_table(con, table_name, num_rows);
+  watchdog.phase("writing filtered parquet scan test file");
   auto parquet_path = write_parquet_from_table(con, table_name, row_group_size);
 
+  watchdog.phase("initializing filtered parquet scan test context");
   auto& client_ctx = *con.context;
   auto sirius_ctx  = sirius::get_sirius_context(con, get_test_config_path());
   auto& mem_mgr    = sirius_ctx->get_memory_manager();
@@ -553,8 +693,10 @@ static void run_parquet_scan_test_with_filter(
     client_ctx, parquet_path.string(), std::move(projection_indices), std::move(table_filters));
   REQUIRE(physical_scan);
 
+  watchdog.phase("initializing filtered parquet scan global state");
+  parquet_scan_task_pipeline_fixture pipeline_fixture(client_ctx);
   auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr, physical_scan.get(), batch_size);
+    pipeline_fixture.pipeline, physical_scan.get(), batch_size);
 
   cucascade::shared_data_repository data_repo;
 
@@ -579,19 +721,18 @@ static void run_parquet_scan_test_with_filter(
       executor.schedule(std::move(task));
       ++scheduled;
     }
-    while (data_repo.total_size() < scheduled) {
-      std::this_thread::yield();
-    }
-
-    executor.stop();
+    wait_for_scan_tasks(executor, scheduled);
     auto batches = drain_data_repo(data_repo);
     REQUIRE(batches.size() == scheduled);
     return batches;
   };
 
+  watchdog.phase("running filtered parquet scan tasks");
   auto batches = run_scan();
+  watchdog.phase("validating filtered parquet scan batches");
   validator(batches, expected_rows, mem_mgr, rmm::cuda_stream_default);
 
+  watchdog.phase("cleaning up filtered parquet scan test");
   auto commit_result = con.Query("COMMIT");
   REQUIRE(commit_result);
   REQUIRE(!commit_result->HasError());
@@ -613,8 +754,9 @@ static size_t count_row_group_partitions(
     client_ctx, parquet_path, std::move(projection_indices), std::move(table_filters));
   REQUIRE(physical_scan);
 
+  parquet_scan_task_pipeline_fixture pipeline_fixture(client_ctx);
   auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr, physical_scan.get(), batch_size);
+    pipeline_fixture.pipeline, physical_scan.get(), batch_size);
   return global_state->get_num_row_group_partitions();
 }
 
@@ -659,6 +801,46 @@ static void run_row_group_pruning_test(std::string const& table_name,
 //------------------------------------------------------------------------------//
 // Test cases
 //------------------------------------------------------------------------------//
+
+TEST_CASE("parquet_scan_task - sirius_read_parquet reads uri from parameters",
+          "[parquet_scan_task][sirius_read_parquet][shared_context]")
+{
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+
+  create_synthetic_table(con, "sirius_read_parquet_param", 1000);
+  auto parquet_path = write_parquet_from_table(con, "sirius_read_parquet_param", 250);
+
+  auto& client_ctx = *con.context;
+  auto sirius_ctx  = sirius::get_sirius_context(con, get_test_config_path());
+  REQUIRE(sirius_ctx != nullptr);
+
+  auto begin_result = con.Query("BEGIN TRANSACTION");
+  REQUIRE(begin_result);
+  REQUIRE(!begin_result->HasError());
+
+  auto physical_scan = make_parquet_scan(client_ctx, parquet_path.string());
+  REQUIRE(physical_scan);
+  physical_scan->function.name = "sirius_read_parquet";
+  physical_scan->bind_data.reset();
+  physical_scan->parameters.clear();
+  physical_scan->parameters.emplace_back(parquet_path.string());
+
+  parquet_scan_task_pipeline_fixture pipeline_fixture(client_ctx);
+  auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
+    pipeline_fixture.pipeline, physical_scan.get(), 1024 * 1024);
+
+  REQUIRE(global_state->get_file_path(0) == parquet_path.string());
+  REQUIRE(global_state->get_num_row_group_partitions() > 0);
+
+  auto commit_result = con.Query("COMMIT");
+  REQUIRE(commit_result);
+  REQUIRE(!commit_result->HasError());
+
+  auto drop_result = con.Query("DROP TABLE sirius_read_parquet_param");
+  REQUIRE(drop_result);
+  REQUIRE(!drop_result->HasError());
+  std::filesystem::remove(parquet_path);
+}
 
 TEST_CASE("parquet_scan_task - single threaded small table",
           "[parquet_scan_task][single_thread][shared_context]")

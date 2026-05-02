@@ -106,6 +106,7 @@ std::vector<std::unique_ptr<cucascade::memory::reservation>> exhaust_host_capaci
 
 TEST_CASE("Downgrade task falls back to DISK when HOST is full", "[downgrade_disk]")
 {
+  cudaDeviceSynchronize();
   // Set HOST capacity small (2MB, limit = 1.5MB after 0.75 fraction).
   // Pre-exhaust HOST so make_reservation_or_null returns null gracefully.
   // DISK (4GB) must then be chosen by any_memory_space_in_tiers{HOST, DISK}.
@@ -161,6 +162,7 @@ TEST_CASE("Downgrade task falls back to DISK when HOST is full", "[downgrade_dis
 
 TEST_CASE("Downgrade task uses HOST when HOST has capacity", "[downgrade_disk]")
 {
+  cudaDeviceSynchronize();
   // HOST (4GB) and DISK (4GB) both available — HOST is listed first in tier preference,
   // so any_memory_space_in_tiers{HOST, DISK} must pick HOST.
   sirius::converter_registry::reset_for_testing();
@@ -210,6 +212,7 @@ TEST_CASE("Downgrade task uses HOST when HOST has capacity", "[downgrade_disk]")
 
 TEST_CASE("Downgrade task returns false when HOST full and no DISK tier", "[downgrade_disk]")
 {
+  cudaDeviceSynchronize();
   // HOST exhausted, no DISK tier configured.
   // The non-blocking reservation probe must return false (skip) rather than
   // blocking forever or throwing, so the scheduler can retry later.

@@ -180,15 +180,18 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
   } catch (...) {
     SIRIUS_LOG_TRACE("not all the columns are pinned for this query");
   }
-  auto provider = std::make_unique<parquet_split_provider>(info->returned_types,
-                                                           info->file_paths,
-                                                           info->column_ids,
-                                                           info->projection_ids,
-                                                           info->names,
-                                                           op->get_types().size(),
-                                                           std::move(info->table_filters),
-                                                           info->partition_indices,
-                                                           info->approximate_batch_size);
+  auto provider =
+    std::make_unique<parquet_split_provider>(info->returned_types,
+                                             info->file_paths,
+                                             info->column_ids,
+                                             info->projection_ids,
+                                             info->names,
+                                             op->get_types().size(),
+                                             std::move(info->table_filters),
+                                             info->partition_indices,
+                                             info->approximate_batch_size,
+                                             parquet_split_provider::DEFAULT_MAX_FILE_PROCESSED,
+                                             std::move(info->open_datasource));
 
   if (auto inject_fn = provider->take_partition_inject_fn()) {
     op->set_partition_inject_fn(std::move(inject_fn));
@@ -208,9 +211,21 @@ void sirius_scan_manager::run_driver_loop()
     try {
       auto future = it->second->start(*_thread_pool, *connector);
       future.get();
-    } catch (const std::exception& e) {
-      SIRIUS_LOG_ERROR("[sirius_scan_manager] driver: provider failed: {}", e.what());
-      // Make sure the consumer is unblocked even on failure.
+    } catch (...) {
+      // Capture once so we can both log a readable message and forward the live
+      // exception_ptr to the consumer. Without set_error(), close() alone would
+      // make the consumer treat the failure as a clean end-of-stream and the
+      // downstream GPU pipeline would block forever waiting on metadata that
+      // never arrives.
+      auto err = std::current_exception();
+      try {
+        std::rethrow_exception(err);
+      } catch (const std::exception& e) {
+        SIRIUS_LOG_ERROR("[sirius_scan_manager] driver: provider failed: {}", e.what());
+      } catch (...) {
+        SIRIUS_LOG_ERROR("[sirius_scan_manager] driver: provider failed: <non-std exception>");
+      }
+      connector->set_error(err);
       connector->close();
     }
   }

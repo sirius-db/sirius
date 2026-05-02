@@ -50,11 +50,13 @@ parquet_split_provider::parquet_split_provider(
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filter_set,
   duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
   std::size_t approximate_batch_size,
-  std::size_t max_file_processed)
+  std::size_t max_file_processed,
+  open_datasource_fn open_datasource)
   : _file_paths(file_paths),
     _approximate_batch_size(approximate_batch_size),
     _max_file_processed(max_file_processed),
-    _total_files(file_paths.size())
+    _total_files(file_paths.size()),
+    _open_datasource(std::move(open_datasource))
 {
   // Any non-trivial scan shape — reader-side projection, filter pushdown, or hive-partition
   // injection — needs column names for reader set_column_names / AST name resolution /
@@ -219,7 +221,14 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
   std::size_t file_idx = 0;
   for (auto const& file_path : batch.file_paths) {
     //===----------Read metadata footers----------===//
-    auto datasource = cudf::io::datasource::create(file_path);
+    // When the engine path supplied an open_datasource closure, route through the
+    // sirius IO factory so non-file URIs (s3://, etc.) reach the right ioctx
+    // instead of cudf's default — sirius's vcpkg build of KvikIO disables
+    // KvikIO_REMOTE_SUPPORT, so cudf default throws "Unsupported URL scheme" on
+    // any remote path. Tests / standalone callers leave the closure empty and
+    // stay on cudf default.
+    auto datasource =
+      _open_datasource ? _open_datasource(file_path) : cudf::io::datasource::create(file_path);
 
     std::unique_ptr<cudf::io::datasource::buffer> footer_buffer;
     footer_buffer = cudf::io::parquet::fetch_footer_to_host(*datasource);

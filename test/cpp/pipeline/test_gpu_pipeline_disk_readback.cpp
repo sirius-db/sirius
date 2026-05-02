@@ -60,6 +60,7 @@ cucascade::memory::memory_space* get_space(sirius::memory::sirius_memory_reserva
 std::pair<std::unique_ptr<sirius::memory::sirius_memory_reservation_manager>, std::filesystem::path>
 make_test_memory_manager_with_disk()
 {
+  cudaDeviceSynchronize();
   sirius::converter_registry::reset_for_testing();
 
   auto tmp_dir = std::filesystem::temp_directory_path() / "sirius_test_disk_readback";

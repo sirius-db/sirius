@@ -18,6 +18,7 @@
 
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/common/shared_ptr_ipp.hpp"
+#include "io/datasource_factory.hpp"
 #include "log/logging.hpp"
 #include "op/scan/parquet_scan_info.hpp"
 #include "op/scan/sirius_gpu_parquet_scan_operator.hpp"
@@ -167,17 +168,28 @@ void sirius_pipeline_converter::split_parquet_scan_source(
 {
   auto& scan_op = current_pipeline->get_source()->Cast<op::sirius_physical_table_scan>();
 
-  // Extract file paths from the DuckDB scan's bind data.
-  auto const& bind_data = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
-  if (!bind_data.file_list || bind_data.file_list->IsEmpty()) {
-    throw std::runtime_error(
-      "[sirius_pipeline_converter::split_parquet_scan_source] No input files to scan");
-  }
   std::vector<std::string> file_paths;
-  for (auto const& file : bind_data.file_list->GetAllFiles()) {
-    file_paths.push_back(file.path);
+  duckdb::vector<duckdb::HivePartitioningIndex> partition_indices;
+  // sirius_read_parquet binds only schema and stores the S3 URI in parameters,
+  // so it has no MultiFileBindData to read here.
+  if (scan_op.function.name == "sirius_read_parquet") {
+    if (scan_op.parameters.empty()) {
+      throw std::runtime_error(
+        "[sirius_pipeline_converter::split_parquet_scan_source] sirius_read_parquet scan is "
+        "missing input parameters");
+    }
+    file_paths.push_back(scan_op.parameters.front().GetValue<std::string>());
+  } else {
+    auto const& bind_data = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
+    if (!bind_data.file_list || bind_data.file_list->IsEmpty()) {
+      throw std::runtime_error(
+        "[sirius_pipeline_converter::split_parquet_scan_source] No input files to scan");
+    }
+    for (auto const& file : bind_data.file_list->GetAllFiles()) {
+      file_paths.push_back(file.path);
+    }
+    partition_indices = bind_data.reader_bind.hive_partitioning_indexes;
   }
-  auto const& partition_indices = bind_data.reader_bind.hive_partitioning_indexes;
 
   auto scan_info               = std::make_unique<op::scan::parquet_scan_info>();
   scan_info->returned_types    = scan_op.returned_types;
@@ -187,6 +199,19 @@ void sirius_pipeline_converter::split_parquet_scan_source(
   scan_info->names             = scan_op.names;
   scan_info->table_filters     = std::move(scan_op.table_filters);
   scan_info->partition_indices = partition_indices;
+
+  // Capture the engine by reference so the provider can route s3:// (and future
+  // object-store schemes) through the registry+config without scan_manager or
+  // SiriusContext having to know about either. The engine outlives the plan it
+  // owns, so the reference is valid for any call to the closure.
+  //
+  // Dispatch (relative bare path → cudf default; everything else → strict factory)
+  // is centralized in datasource_factory::create_for_parquet_scan so all parquet
+  // scan-IO call sites share one rule.
+  scan_info->open_datasource = [&engine = engine_](std::string_view uri) {
+    return io::datasource_factory::create_for_parquet_scan(
+      uri, engine.datasource_registry(), engine.config());
+  };
 
   auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_parquet_scan_operator>(
     scan_op.types, scan_op.estimated_cardinality, std::move(scan_info));
@@ -207,7 +232,8 @@ void sirius_pipeline_converter::split_table_scan_source(
   auto& scan_op = current_pipeline->get_source()->Cast<op::sirius_physical_table_scan>();
 
   // If parquet scan, route to metadata scan + gpu scan operator pipeline
-  if (scan_op.function.name == "parquet_scan" || scan_op.function.name == "read_parquet") {
+  if (scan_op.function.name == "parquet_scan" || scan_op.function.name == "read_parquet" ||
+      scan_op.function.name == "sirius_read_parquet") {
     split_parquet_scan_source(current_pipeline);
     return;
   }
@@ -1098,7 +1124,7 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
       } else if (first_op.type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
         const auto& scan_name = first_op.Cast<op::sirius_physical_table_scan>().function.name;
         if (scan_name != "seq_scan" && scan_name != "parquet_scan" && scan_name != "read_parquet" &&
-            scan_name != "iceberg_scan") {
+            scan_name != "sirius_read_parquet" && scan_name != "iceberg_scan") {
           throw std::runtime_error("Unsupported scan function: " + scan_name);
         }
         // Scans have "scan" port

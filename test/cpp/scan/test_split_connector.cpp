@@ -25,6 +25,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -116,6 +117,58 @@ TEST_CASE("split_connector - close is idempotent", "[scan_manager][split_connect
   connector.close();
   connector.close();  // second call must not deadlock or throw
   REQUIRE(connector.is_closed());
+  REQUIRE_FALSE(connector.get_next_split().has_value());
+}
+
+TEST_CASE("split_connector - set_error and close wakes waiting consumer with exception",
+          "[scan_manager][split_connector]")
+{
+  split_connector connector;
+
+  auto fut = std::async(std::launch::async, [&] { return connector.get_next_split(); });
+  REQUIRE(fut.wait_for(50ms) == std::future_status::timeout);
+
+  connector.set_error(std::make_exception_ptr(std::runtime_error("metadata scan failed")));
+  connector.close();
+
+  REQUIRE(fut.wait_for(1s) == std::future_status::ready);
+  REQUIRE_THROWS_AS(fut.get(), std::runtime_error);
+  REQUIRE(connector.is_closed());
+  REQUIRE_FALSE(connector.has_more_splits());
+}
+
+TEST_CASE("split_connector - pending error prevents closed-drained state until consumed",
+          "[scan_manager][split_connector]")
+{
+  split_connector connector;
+
+  connector.set_error(std::make_exception_ptr(std::logic_error("provider failed")));
+  connector.close();
+
+  REQUIRE_FALSE(connector.is_closed());
+  REQUIRE(connector.has_more_splits());
+
+  REQUIRE_THROWS_AS(connector.get_next_split(), std::logic_error);
+  REQUIRE(connector.is_closed());
+  REQUIRE_FALSE(connector.has_more_splits());
+  REQUIRE_FALSE(connector.get_next_split().has_value());
+}
+
+TEST_CASE("split_connector - producer error takes precedence over queued splits",
+          "[scan_manager][split_connector]")
+{
+  split_connector connector;
+
+  connector.push_split(std::make_unique<tagged_split>(42));
+  connector.set_error(std::make_exception_ptr(std::runtime_error("provider failed after push")));
+  connector.close();
+
+  REQUIRE_FALSE(connector.is_closed());
+  REQUIRE(connector.has_more_splits());
+
+  REQUIRE_THROWS_AS(connector.get_next_split(), std::runtime_error);
+  REQUIRE(connector.is_closed());
+  REQUIRE_FALSE(connector.has_more_splits());
   REQUIRE_FALSE(connector.get_next_split().has_value());
 }
 

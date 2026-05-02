@@ -38,9 +38,10 @@ using namespace duckdb;
  * tests of the same type share a single DuckDB/SiriusContext instance without
  * any intermediate teardown.
  *
- *   [shared_context]  → g_shared_env      (scan/operator unit tests)
- *   [integration]     → g_integration_env (GPU execution integration tests)
- *   anything else     → no env active     (isolated / standalone tests)
+ *   [isolated_context] → no env active     (isolated / standalone tests)
+ *   [shared_context]   → g_shared_env      (scan/operator unit tests)
+ *   [integration]      → g_integration_env (GPU execution integration tests)
+ *   anything else      → no env active
  */
 struct shared_env_listener : Catch::TestEventListenerBase {
   using TestEventListenerBase::TestEventListenerBase;
@@ -49,6 +50,9 @@ struct shared_env_listener : Catch::TestEventListenerBase {
 
   static env_need classify(Catch::TestCaseInfo const& info)
   {
+    for (auto const& tag : info.tags) {
+      if (tag == "isolated_context") return env_need::NONE;
+    }
     for (auto const& tag : info.tags) {
       if (tag == "shared_context") return env_need::SHARED;
       if (tag == "integration") return env_need::INTEGRATION;
