@@ -15,8 +15,8 @@
 
 ### CC — Cucascade Submodule Rebase + Pin Recovery
 
-- [ ] **CC-01**: Cucascade submodule pin advanced to a commit descended from `73d00c4` (cucascade `origin/main` tip including PR #117 DataBatch RAII + PR #112 bandwidth profiler + PR #116 `gpu_data_representation` from `cudf::table_view`).
-- [ ] **CC-02**: All 11 local Sirius-side cucascade fixes preserved on the new pin: (a) `writer_stream` ctor requirement on `gpu_table_representation`, (b) `record_writer_event`/`get_writer_event` accessors, (c) peer-DMA probe at init, (d) `cudaStreamWaitEvent` in `convert_gpu_to_gpu`, (e) Sirius-side P2P converter override (target-bound stream in host→gpu / gpu→gpu), (f) `io_worker` member-init-order fix, (g) per-instance `ptds_allocation_tracker`, (h) `cudaHostAllocPortable`/`Mapped` flags on every pinned-host allocation, (i) cudf::pack stream argument + default-pool peer access, (j) cross-device pool peer access, (k) drop pool priming. Re-applied where original commits collide with PR #117's RAII model.
+- [x] **CC-01**: Cucascade submodule pin advanced to a commit descended from `73d00c4` (cucascade `origin/main` tip including PR #117 DataBatch RAII + PR #112 bandwidth profiler + PR #116 `gpu_data_representation` from `cudf::table_view`).
+- [x] **CC-02**: All 11 local Sirius-side cucascade fixes preserved on the new pin: (a) `writer_stream` ctor requirement on `gpu_table_representation`, (b) `record_writer_event`/`get_writer_event` accessors, (c) peer-DMA probe at init, (d) `cudaStreamWaitEvent` in `convert_gpu_to_gpu`, (e) Sirius-side P2P converter override (target-bound stream in host→gpu / gpu→gpu), (f) `io_worker` member-init-order fix, (g) per-instance `ptds_allocation_tracker`, (h) `cudaHostAllocPortable`/`Mapped` flags on every pinned-host allocation, (i) cudf::pack stream argument + default-pool peer access, (j) cross-device pool peer access, (k) drop pool priming. Re-applied where original commits collide with PR #117's RAII model.
 - [ ] **CC-03**: Phase 13 stream-lineage semantics re-attached under PR #117's RAII accessor model. `record_writer_event` is callable with appropriate lock-scope; `convert_gpu_to_gpu` performs `cudaStreamWaitEvent` on `get_writer_event()` of the source batch before issuing peer copy.
 - [ ] **CC-04**: Cucascade unit-test suite passes on the rebased pin (`ctest` inside `cucascade/build`). Grep gates green: `grep -rn "record_writer_event\|get_writer_event" include/cucascade/data/` non-empty; `grep -rn "cudaHostAllocPortable" src/memory/` non-empty; `grep -rn "task_created\|in_transit" src/data/` returns zero (state-machine fully removed by #117).
 
@@ -95,8 +95,8 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| CC-01 | 16 | Pending |
-| CC-02 | 16 | Pending |
+| CC-01 | 16 | Complete |
+| CC-02 | 16 | Complete |
 | CC-03 | 16 | Pending |
 | CC-04 | 16 | Pending |
 | MERGE-01 | 17 | Pending |

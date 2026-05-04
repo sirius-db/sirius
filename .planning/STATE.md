@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Rebase After DataBatch Changes
-status: planning
-stopped_at: Phase 16 context gathered
-last_updated: "2026-05-04T21:32:01.794Z"
-last_activity: 2026-05-04 — ROADMAP.md created, 6 phases and 32 requirements mapped, STATE.md initialized
+status: executing
+stopped_at: Completed 16-01-PLAN.md
+last_updated: "2026-05-04T23:12:19.867Z"
+last_activity: 2026-05-04
 progress:
   total_phases: 6
   completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
+  total_plans: 5
+  completed_plans: 1
 ---
 
 # Project State
@@ -20,14 +20,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-05-04)
 
 **Core value:** Any query can transparently execute across every GPU on the node — tasks are scheduled to the GPU where their input data already resides, memory pressure is absorbed by downgrading to the correct NUMA domain, and parquet I/O is routed through a multi-GPU-safe backend.
-**Current focus:** v1.4 — rebase Sirius (`feature/single-node-multi-gpu2`) onto cucascade `origin/main` (PR #117 DataBatch RAII refactor + #112 + #116) and Sirius `origin/dev` (#675 IO Framework, #731 Scan Manager, #721 Pin Tables, #739 cucascade-compat, #733/#734/#735) while preserving all v1.1+v1.2+v1.3 multi-GPU behavior.
+**Current focus:** Phase 16 — Cucascade Submodule Rebase + Pin Recovery
 
 ## Current Position
 
-Phase: 16 (next plannable)
-Plan: — (not yet planned)
-Status: Phase planning ready; run `/gsd:plan-phase 16` to begin
-Last activity: 2026-05-04 — ROADMAP.md created, 6 phases and 32 requirements mapped, STATE.md initialized
+Phase: 16 (Cucascade Submodule Rebase + Pin Recovery) — EXECUTING
+Plan: 2 of 5
+Status: Ready to execute
+Last activity: 2026-05-04
 
 ```
 v1.4 Progress: [                    ] 0/6 phases | 0/32 requirements | 0 plans
@@ -77,6 +77,7 @@ v1.4 Progress: [                    ] 0/6 phases | 0/32 requirements | 0 plans
 | Phase 15 P02 | 8min | 2 tasks | 5 files |
 | Phase 15 P03 | 4min | 2 tasks | 2 files |
 | Phase 15 P04 | 39min | 2 tasks | 1 files |
+| Phase 16 P01 | 3 | 3 tasks | 1 files |
 
 ## Decisions
 
@@ -133,6 +134,7 @@ v1.4 Progress: [                    ] 0/6 phases | 0/32 requirements | 0 plans
 - **[v1.4 ROADMAP]** 2026-05-04: 6 phases (16-21) created. 32 requirements mapped 100%. Phase 16 is the first plannable phase. Compile-graph dependency chain: 16 → 17 → 18 → 19 → 20 → 21. Verification policy: light gates per phase 16-20 (grep + targeted unit tests + SF1 smoke); full v1.3 gauntlet at Phase 21 only.
 - **[v1.4 ROADMAP]** Key ordering constraint: Phase 19 (IO Framework) must precede Phase 20 (Scan Manager) because `parquet_split_provider::run_batch` calls `sirius_datasource` — compile-graph dependency. This overrides FEATURES.md's original Scan Manager-first proposal; ARCHITECTURE.md's ordering is adopted.
 - **[v1.4 ROADMAP]** Phase 17 expected build errors: 26+ `batch->get_data() is private` errors + RAII compile errors. These are EXPECTED and do not constitute a phase failure. Documented in MERGE-05.
+- [Phase 16-01]: Squash commit reordering: e23f3a2 (Group 1 memory) and eda349a (Group 3 pipeline) reordered in rebase todo to match D-A1 logical grouping; 2-pass rebase (squash then reword) used for clean separation of concerns
 
 ## Accumulated Context
 
@@ -168,6 +170,6 @@ None at roadmap creation. Phase 16 is ready to plan.
 
 ## Session Continuity
 
-Last session: 2026-05-04T21:32:01.791Z
-Stopped at: Phase 16 context gathered
-Resume file: .planning/phases/16-cucascade-submodule-rebase-pin-recovery/16-CONTEXT.md
+Last session: 2026-05-04T23:12:19.864Z
+Stopped at: Completed 16-01-PLAN.md
+Resume file: None

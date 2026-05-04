@@ -90,7 +90,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
   4. `_thread` is the last-declared member in the `io_worker` class in `cucascade/src/data/pipeline_io_backend.cpp` (P8 destruction-order gate); confirmed by visual inspection of the post-conflict file.
   5. Cucascade unit-test suite passes (`ctest` inside `cucascade/build`); `grep -rn "task_created\|in_transit" cucascade/include/` returns zero (old FSM state machine fully removed per CC-04).
 **Plans**: 5 plans
-- [ ] 16-01-PLAN.md — Squash 11 cucascade commits into 4 group commits + initialize audit log
+- [x] 16-01-PLAN.md — Squash 11 cucascade commits into 4 group commits + initialize audit log
 - [ ] 16-02-PLAN.md — Rebase Group 1 (memory hygiene) + Group 3 (io_worker) onto 73d00c4
 - [ ] 16-03-PLAN.md — Rebase Group 2 (P2P override + DMA probe) onto Group 1+3 tip
 - [ ] 16-04-PLAN.md — Rebase Group 4 (Phase 13 stream-lineage); re-implement gpu_data_representation + convert_gpu_to_gpu under #117 RAII; build compile-clean
@@ -199,7 +199,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 | 13. Fix Q11 multi-GPU hang/illegal-address | v1.3 | 4/5 | Complete | 2026-04-30 |
 | 14. Land SCHED-RR distribution | v1.3 | 2/2 | Complete | 2026-04-30 |
 | 15. Cross-GPU operator-colocation audit | v1.3 | 4/4 | Complete | 2026-05-01 |
-| 16. Cucascade Submodule Rebase + Pin Recovery | v1.4 | 0/5 | Planning complete | - |
+| 16. Cucascade Submodule Rebase + Pin Recovery | v1.4 | 1/5 | In Progress|  |
 | 17. Sirius origin/dev Merge — Base Layer | v1.4 | 0/? | Not started | - |
 | 18. DataBatch RAII Migration | v1.4 | 0/? | Not started | - |
 | 19. IO Framework Adoption | v1.4 | 0/? | Not started | - |
