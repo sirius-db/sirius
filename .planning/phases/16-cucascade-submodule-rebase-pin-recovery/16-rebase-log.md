@@ -43,9 +43,19 @@ Backup ref: `phase16-pre-squash-backup` -> 62e0517
   - Time spent: ~5 min
 
 ### Round 3 (Group 2 — stream/converter) — 16-03
-- Files: `src/data/representation_converter.cpp`
-- Status: pending
-- Resolution notes: (filled by 16-03)
+- Files: `src/memory/common.cpp`, `src/data/representation_converter.cpp`, `include/cucascade/memory/common.hpp`
+- Status: applied (provisional convert_gpu_to_gpu — finalized in 16-04)
+- Resulting commit: `995bf4e` (cherry-pick of phase16-squashed-group2 onto Group 3 tip a1778f9)
+- Resolution notes:
+  - `src/memory/common.cpp`: Auto-merged correctly by git. Group 2's P2P probe block (`run_p2p_probe_locked`, `p2p_dma_works_cached`, `ensure_p2p_probed`, `probe_peer_dma_works`) added alongside 16-02's `enable_pool_peer_access_for_all_visible_devices` helper. No manual intervention needed for this file.
+  - `include/cucascade/memory/common.hpp`: Auto-merged correctly. `probe_peer_dma_works(int, int)` declaration added to the memory namespace header.
+  - `src/data/representation_converter.cpp`: ONE conflict at lines 145–202. HEAD had the old cudf::pack-based `convert_gpu_to_gpu` full implementation; Group 2 had only a forward declaration (the column-tree-walk implementation is defined later in the file below `convert_gpu_to_host_fast`). Resolved by taking Group 2's forward declaration form (`rmm::cuda_stream_view stream);`) and discarding HEAD's old cudf::pack body. The full column-tree-walk implementation auto-merged in below `convert_gpu_to_host_fast`.
+  - API rename: `get_table().view()` at line 838 (in the auto-merged `convert_gpu_to_gpu` body) changed to `get_table_view()` per #117 API surface (D-D2 — `get_table()` is gone at 73d00c4).
+  - 3-arg ctor wiring: All 4 `gpu_table_representation` construction sites updated to pass stream as 3rd arg (Option B per Round 2 note in 16-03 PLAN): `convert_host_to_gpu` → `stream`, `convert_gpu_to_gpu` → `target_stream`, `convert_host_fast_to_gpu` → `target_stream`, `convert_disk_to_gpu` → `stream`.
+  - Provisional convert_gpu_to_gpu: uses the column-tree walk from Group 2 + `probe_peer_dma_works` routing via `alloc_and_peer_copy_async`. Group 4 (16-04) will finalize this with `cudaStreamWaitEvent(target_stream, writer_event)` and the `writer_stream` ctor arg.
+  - Build state at end of 16-03: NOT compile-clean. The `gpu_data_representation.hpp` header still has the 2-arg ctor from 73d00c4; all 4 construction sites now pass 3 args. 16-04 fixes the build by adding `writer_stream` as a REQUIRED 3rd ctor arg to the header.
+  - Apply order on rebased branch: Group 1 → Group 3 → Group 2 (different from original chronological 1 → 2 → 3 → 4). Acceptable per CC-02 "preserves carry as 4 group commits" — the order within the rebased branch is permitted to differ from original chronology.
+  - Time spent: ~15 min
 
 ### Round 4 (Group 4 — Phase 13 stream-lineage) — 16-04
 - Files: `include/cucascade/data/gpu_data_representation.hpp`, `src/data/gpu_data_representation.cpp`, `src/data/representation_converter.cpp`, `include/cucascade/data/data_batch.hpp` (proxy add), `test/data/test_data_batch.cpp` (ctor call updates)
