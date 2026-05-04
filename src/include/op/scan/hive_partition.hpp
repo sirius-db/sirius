@@ -42,22 +42,6 @@ struct hive_partition_column {
   std::size_t duckdb_column_index;  ///< Index into scan_op->names / column_ids
 };
 
-/**
- * @brief Operator-path closure: inject constant hive-partition columns into a GPU table.
- *
- * Used by the new operator-based scan (@c sirius_gpu_parquet_scan_operator) via
- * @c scan_plan::build_inject_fn. The split provider pre-computes @p partition_values once per
- * split (per hive bucket), so the closure does not need a file path at execute time.
- *
- * @p partition_values is in @c scan_plan::partition_columns order. Empty when the table has no
- *    hive partitions — the closure then handles only column-shape concerns (reorder, drop pure-
- *    filter columns).
- */
-using partition_inject_fn_t =
-  std::function<std::unique_ptr<cudf::table>(std::unique_ptr<cudf::table>,
-                                             std::vector<std::string> const& partition_values,
-                                             rmm::cuda_stream_view)>;
-
 }  // namespace sirius::op::scan
 
 namespace sirius {

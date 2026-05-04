@@ -51,8 +51,8 @@ struct rg_accumulator {
   std::size_t total_uncompressed_bytes = 0;
   // Partition values for the files currently bundled, in scan_plan::partition_columns order.
   // nullopt until the first file is added. Bundling is only safe across files with identical
-  // values: partition_inject_fn synthesizes constant scalar columns from one representative file
-  // path, so all files in the bundle must share those values.
+  // values: assemble_scan_output synthesizes constant scalar columns from this single vector on
+  // behalf of every file in the bundle, so all files in the bundle must share those values.
   std::optional<std::vector<std::string>> partition_values;
 };
 
@@ -86,18 +86,9 @@ parquet_split_provider::parquet_split_provider(
       "require column names to be provided.");
   }
 
-  // One canonical plan: data columns (D-order), hive partitions, output layout, C→D map.
-  // Everything downstream (reader projection, filter expression, post-read injection, row-group
-  // byte accounting) reads from this single structure. Held by shared_ptr so each
-  // parquet_scan_data can carry it to the GPU scan operator without copying.
+  // Build the canonical scan plan
   _plan = std::make_shared<op::scan::scan_plan const>(op::scan::build_scan_plan(
     column_ids, projection_ids, names, returned_types, scan_output_arity, partition_indices));
-
-  // Install the post-read assembly closure. The closure handles both hive-partition injection
-  // and pure-filter-column pruning by consuming scan_plan::output_layout; it returns a nullptr
-  // closure when the plan is an identity (no partitions and no pure-filter columns), in which
-  // case the GPU scan operator skips the assembly step altogether.
-  if (auto inject_fn = _plan->build_inject_fn()) { _partition_inject_fn = std::move(inject_fn); }
 
   // Build the DuckDB filter expression. AST translation is deferred to execute() so that a
   // task-local CUDA stream can be used. Filters on hive-partition columns are dropped because
@@ -114,11 +105,6 @@ parquet_split_provider::parquet_split_provider(
 }
 
 parquet_split_provider::~parquet_split_provider() = default;
-
-op::scan::partition_inject_fn_t parquet_split_provider::take_partition_inject_fn()
-{
-  return std::move(_partition_inject_fn);
-}
 
 std::optional<parquet_split_provider::file_batch> parquet_split_provider::next_task_input()
 {
@@ -251,11 +237,11 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
 
   for (auto const& file_path : batch.file_paths) {
     // Partition compatibility: if the current accumulator already holds files with different
-    // partition values, flush before starting this file. partition_inject_fn synthesizes
-    // constants from one path on behalf of the whole bundle, so mixing partitions would produce
-    // wrong rows. Always (re-)seed partition_values for this file afterward — the previous
-    // iteration may have flushed mid-file (byte-budget overflow), leaving accum.partition_values
-    // intact but accum.slices empty.
+    // partition values, flush before starting this file. assemble_scan_output synthesizes
+    // constants from one partition_values vector on behalf of the whole bundle, so mixing
+    // partitions would produce wrong rows. Always (re-)seed partition_values for this file
+    // afterward — the previous iteration may have flushed mid-file (byte-budget overflow),
+    // leaving accum.partition_values intact but accum.slices empty.
     if (!_plan->partition_columns.empty()) {
       std::vector<std::string> file_partition_values;
       file_partition_values.reserve(_plan->partition_columns.size());

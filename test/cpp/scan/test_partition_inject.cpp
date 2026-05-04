@@ -14,11 +14,11 @@
  * limitations under the License.
  */
 
-// Tests for the partition_inject_fn_t plumbing introduced when parquet_split_provider
-// gained multi-file split bundling. The closures used to parse the file path on every
-// invocation; they now consume a pre-computed partition_values vector instead. These
-// tests verify that contract end-to-end on the GPU using cudf, plus a smoke test for
-// the parquet_scan_data plumbing.
+// Tests for the scan_plan output-assembly free functions and the legacy partition_inject_fn_t
+// closure. The new operator path consumes a shared scan_plan plus a per-split
+// partition_values vector through needs_output_assembly() / assemble_scan_output(). These
+// tests verify that contract end-to-end on the GPU using cudf, plus a smoke test for the
+// parquet_scan_data plumbing.
 
 // test
 #include <catch.hpp>
@@ -126,22 +126,22 @@ sscan::scan_plan::output_entry partition_entry(std::size_t idx)
 }  // namespace
 
 //===----------------------------------------------------------------------===//
-// scan_plan::build_inject_fn — null-closure cases
+// needs_output_assembly — short-circuit cases
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("scan_plan::build_inject_fn returns null when output_layout is empty",
-          "[scan][partition_inject]")
+TEST_CASE("needs_output_assembly is false when output_layout is empty", "[scan][partition_inject]")
 {
-  // SELECT count(*) shape: no output columns. The closure must be null so the
-  // reader's row-count-bearing batch flows through untouched.
+  // SELECT count(*) shape: no output columns. assemble_scan_output would emit a
+  // 0-column table and erase the row count, so the operator should skip assembly
+  // entirely and forward the reader's row-count-bearing batch.
   sscan::scan_plan plan;
   plan.data_columns      = {data_col(0, "a")};
   plan.partition_columns = {};
   plan.output_layout     = {};
-  REQUIRE(plan.build_inject_fn() == nullptr);
+  REQUIRE_FALSE(needs_output_assembly(plan));
 }
 
-TEST_CASE("scan_plan::build_inject_fn returns null on identity layout", "[scan][partition_inject]")
+TEST_CASE("needs_output_assembly is false on identity layout", "[scan][partition_inject]")
 {
   // No partitions, output_layout is 1:1 over data_columns in order — the reader's
   // natural output is what downstream wants. No reshaping needed.
@@ -149,28 +149,44 @@ TEST_CASE("scan_plan::build_inject_fn returns null on identity layout", "[scan][
   plan.data_columns      = {data_col(0, "a"), data_col(1, "b")};
   plan.partition_columns = {};
   plan.output_layout     = {data_entry(0), data_entry(1)};
-  REQUIRE(plan.build_inject_fn() == nullptr);
+  REQUIRE_FALSE(needs_output_assembly(plan));
+}
+
+TEST_CASE("needs_output_assembly is true when output_layout permutes data_columns",
+          "[scan][partition_inject]")
+{
+  sscan::scan_plan plan;
+  plan.data_columns      = {data_col(0, "a"), data_col(1, "b")};
+  plan.partition_columns = {};
+  plan.output_layout     = {data_entry(1), data_entry(0)};
+  REQUIRE(needs_output_assembly(plan));
+}
+
+TEST_CASE("needs_output_assembly is true when partitions are present", "[scan][partition_inject]")
+{
+  sscan::scan_plan plan;
+  plan.data_columns      = {data_col(0, "a")};
+  plan.partition_columns = {partition_col(1, "year", sirius::type_id::INTEGER)};
+  plan.output_layout     = {data_entry(0), partition_entry(0)};
+  REQUIRE(needs_output_assembly(plan));
 }
 
 //===----------------------------------------------------------------------===//
-// scan_plan::build_inject_fn — partition value injection
+// assemble_scan_output — partition value injection
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("scan_plan::build_inject_fn injects integer partition column from values vector",
+TEST_CASE("assemble_scan_output injects integer partition column from values vector",
           "[scan][partition_inject]")
 {
   // 1 data column + 1 partition column. partition_values supplies the constant value
-  // for the partition column; the closure should turn it into a per-row constant column.
+  // for the partition column; assemble_scan_output should turn it into a per-row constant.
   sscan::scan_plan plan;
   plan.data_columns      = {data_col(0, "a")};
   plan.partition_columns = {partition_col(1, "year", sirius::type_id::INTEGER)};
   plan.output_layout     = {data_entry(0), partition_entry(0)};
 
-  auto fn = plan.build_inject_fn();
-  REQUIRE(fn != nullptr);
-
   auto input  = make_table({{10, 20, 30, 40}});
-  auto output = fn(std::move(input), {"2024"}, k_stream);
+  auto output = sscan::assemble_scan_output(plan, std::move(input), {"2024"}, k_stream);
   REQUIRE(output != nullptr);
   REQUIRE(output->num_columns() == 2);
   REQUIRE(output->num_rows() == 4);
@@ -183,21 +199,17 @@ TEST_CASE("scan_plan::build_inject_fn injects integer partition column from valu
   REQUIRE(part_vals == std::vector<int32_t>{2024, 2024, 2024, 2024});
 }
 
-TEST_CASE("scan_plan::build_inject_fn places partition column at any output position",
+TEST_CASE("assemble_scan_output places partition column at any output position",
           "[scan][partition_inject]")
 {
   // PARTITION may appear before or interleaved with DATA in output_layout.
-  // Verify the closure honors the requested position rather than appending.
   sscan::scan_plan plan;
   plan.data_columns      = {data_col(0, "a")};
   plan.partition_columns = {partition_col(1, "year", sirius::type_id::INTEGER)};
   plan.output_layout     = {partition_entry(0), data_entry(0)};
 
-  auto fn = plan.build_inject_fn();
-  REQUIRE(fn != nullptr);
-
   auto input  = make_table({{7, 8, 9}});
-  auto output = fn(std::move(input), {"1999"}, k_stream);
+  auto output = sscan::assemble_scan_output(plan, std::move(input), {"1999"}, k_stream);
   REQUIRE(output->num_columns() == 2);
 
   // First column is the partition (constant), second is the data.
@@ -207,50 +219,44 @@ TEST_CASE("scan_plan::build_inject_fn places partition column at any output posi
   REQUIRE(second == std::vector<int32_t>{7, 8, 9});
 }
 
-TEST_CASE("scan_plan::build_inject_fn drops pure-filter data columns absent from output_layout",
+TEST_CASE("assemble_scan_output drops pure-filter data columns absent from output_layout",
           "[scan][partition_inject]")
 {
   // data_columns has 2 columns ("a", "b"), but output_layout only references "a".
-  // "b" was read for filter evaluation only; the closure must drop it from the result.
+  // "b" was read for filter evaluation only; assembly must drop it from the result.
   sscan::scan_plan plan;
   plan.data_columns      = {data_col(0, "a"), data_col(1, "b")};
   plan.partition_columns = {};
   plan.output_layout     = {data_entry(0)};
 
-  auto fn = plan.build_inject_fn();
-  REQUIRE(fn != nullptr);
-
   auto input  = make_table({{1, 2, 3}, {100, 200, 300}});
-  auto output = fn(std::move(input), {}, k_stream);
+  auto output = sscan::assemble_scan_output(plan, std::move(input), {}, k_stream);
   REQUIRE(output->num_columns() == 1);
   REQUIRE(copy_int32_column(output->view().column(0)) == std::vector<int32_t>{1, 2, 3});
 }
 
-TEST_CASE("scan_plan::build_inject_fn supports two partitions indexed by partition_values order",
+TEST_CASE("assemble_scan_output supports two partitions indexed by partition_values order",
           "[scan][partition_inject]")
 {
-  // Two partition columns: closure should index partition_values directly with entry.idx
-  // (which is the index into partition_columns). Verify both come through correctly.
+  // Two partition columns: assembly should index partition_values with entry.idx
+  // (which is the index into partition_columns).
   sscan::scan_plan plan;
   plan.data_columns      = {data_col(0, "a")};
   plan.partition_columns = {partition_col(1, "year", sirius::type_id::INTEGER),
                             partition_col(2, "month", sirius::type_id::INTEGER)};
   plan.output_layout     = {data_entry(0), partition_entry(0), partition_entry(1)};
 
-  auto fn = plan.build_inject_fn();
-  REQUIRE(fn != nullptr);
-
   auto input  = make_table({{1, 2}});
-  auto output = fn(std::move(input), {"2024", "11"}, k_stream);
+  auto output = sscan::assemble_scan_output(plan, std::move(input), {"2024", "11"}, k_stream);
   REQUIRE(output->num_columns() == 3);
   REQUIRE(copy_int32_column(output->view().column(1)) == std::vector<int32_t>{2024, 2024});
   REQUIRE(copy_int32_column(output->view().column(2)) == std::vector<int32_t>{11, 11});
 }
 
-TEST_CASE("scan_plan::build_inject_fn throws when partition_values shorter than required",
+TEST_CASE("assemble_scan_output throws when partition_values shorter than required",
           "[scan][partition_inject]")
 {
-  // Caller bug: closure expects 2 partition values but only 1 is provided. Must throw,
+  // Caller bug: assembly expects 2 partition values but only 1 is provided. Must throw,
   // not silently read past the end.
   sscan::scan_plan plan;
   plan.data_columns      = {};
@@ -258,27 +264,20 @@ TEST_CASE("scan_plan::build_inject_fn throws when partition_values shorter than 
                             partition_col(1, "month", sirius::type_id::INTEGER)};
   plan.output_layout     = {partition_entry(0), partition_entry(1)};
 
-  auto fn = plan.build_inject_fn();
-  REQUIRE(fn != nullptr);
-
   auto input = std::make_unique<cudf::table>(std::vector<std::unique_ptr<cudf::column>>{});
-  REQUIRE_THROWS(fn(std::move(input), {"2024"}, k_stream));
+  REQUIRE_THROWS(sscan::assemble_scan_output(plan, std::move(input), {"2024"}, k_stream));
 }
 
-TEST_CASE("scan_plan::build_inject_fn handles VARCHAR partition columns",
-          "[scan][partition_inject]")
+TEST_CASE("assemble_scan_output handles VARCHAR partition columns", "[scan][partition_inject]")
 {
-  // Non-numeric partition: closure must produce a STRING-typed constant column.
+  // Non-numeric partition: assembly must produce a STRING-typed constant column.
   sscan::scan_plan plan;
   plan.data_columns      = {data_col(0, "a")};
   plan.partition_columns = {partition_col(1, "region", sirius::type_id::VARCHAR)};
   plan.output_layout     = {data_entry(0), partition_entry(0)};
 
-  auto fn = plan.build_inject_fn();
-  REQUIRE(fn != nullptr);
-
   auto input  = make_table({{1, 2, 3}});
-  auto output = fn(std::move(input), {"us-west"}, k_stream);
+  auto output = sscan::assemble_scan_output(plan, std::move(input), {"us-west"}, k_stream);
   REQUIRE(output->num_columns() == 2);
   REQUIRE(output->view().column(1).type().id() == cudf::type_id::STRING);
   REQUIRE(output->view().column(1).size() == 3);
@@ -375,8 +374,8 @@ TEST_CASE("parquet_scan_data preserves partition_values through construction",
           "[scan][partition_inject]")
 {
   // Smoke test the new field on parquet_scan_data: the split provider populates it once
-  // per split (per hive bucket), and the GPU scan operator hands it straight to the
-  // partition_inject_fn. Verify it round-trips faithfully.
+  // per split (per hive bucket), and the GPU scan operator hands it straight to
+  // assemble_scan_output. Verify it round-trips faithfully.
   std::vector<sscan::row_group_slice> slices;  // empty is fine for a constructor smoke test
   auto reader_options = std::make_shared<cudf::io::parquet_reader_options>(
     cudf::io::parquet_reader_options::builder().build());

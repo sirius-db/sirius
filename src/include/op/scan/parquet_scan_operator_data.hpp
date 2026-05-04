@@ -17,8 +17,6 @@
 #pragma once
 
 // sirius
-#include "cucascade/data/gpu_data_representation.hpp"
-
 #include <expression_executor/gpu_expression_translator_internal.hpp>
 #include <op/scan/scan_plan.hpp>
 #include <op/sirius_physical_operator.hpp>
@@ -31,6 +29,7 @@
 
 // cucascade
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
 
 // standard library
 #include <cstddef>
@@ -172,8 +171,8 @@ class parquet_scan_data : public op::operator_data {
   /// table used by execute()'s per-task AST translation, plus the post-read assembly layout.
   std::shared_ptr<scan_plan const> plan;
   /// Hive partition values shared by every file in @ref rg_slices, in scan_plan::partition_columns
-  /// order. Empty when the table has no hive partitions. partition_inject_fn consumes this directly
-  /// instead of re-parsing a file path at execute time.
+  /// order. Empty when the table has no hive partitions. assemble_scan_output consumes this
+  /// directly instead of re-parsing a file path at execute time.
   std::vector<std::string> partition_values;
   /// GPU memory space for allocating output tables produced by execute().
   cucascade::memory::memory_space* gpu_memory_space = nullptr;
@@ -187,23 +186,23 @@ class parquet_scan_data : public op::operator_data {
  *
  * The cached_split_provider produces one of these per cached batch. It carries
  * a zero-copy data_batch (whose gpu_table_representation is a view over the
- * pinned data columns in scan_plan D-order) plus the filter expression and the
- * post-read assembly closure that the scan operator applies in execute(). The
- * gpu_memory_space lives on the wrapped data_batch.
+ * pinned data columns in scan_plan D-order) plus the filter expression and a
+ * shared scan_plan that execute() consults via @c needs_output_assembly /
+ * @c assemble_scan_output. The gpu_memory_space lives on the wrapped data_batch.
  *
- * The cached path is gated upstream so it never sees hive partitions, so
- * @ref inject_fn — when non-null — only ever performs DATA-source permutation
- * and pure-filter-column pruning. It is null exactly when scan_plan's output
- * layout is identity over data_columns (no permute, no prune).
+ * The cached path is gated upstream so it never sees hive partitions: when
+ * assembly is needed, it only performs DATA-source permutation and pure-filter-
+ * column pruning. When @c needs_output_assembly(*plan) is false, execute()
+ * forwards the cached batch (or the filter result) without re-permuting.
  */
 class scan_cached_operator_data : public op::operator_data {
  public:
   scan_cached_operator_data(std::shared_ptr<cucascade::data_batch> batch,
                             std::shared_ptr<duckdb::Expression> filter_expression,
-                            partition_inject_fn_t inject_fn)
+                            std::shared_ptr<scan_plan const> plan)
     : batch(std::move(batch)),
       filter_expression(std::move(filter_expression)),
-      inject_fn(std::move(inject_fn))
+      plan(std::move(plan))
   {
   }
 
@@ -220,10 +219,10 @@ class scan_cached_operator_data : public op::operator_data {
   /// an AST-translated filter — pushdown is a parquet-reader concern, and the
   /// cached batch is already materialized.
   std::shared_ptr<duckdb::Expression> filter_expression;
-  /// Post-read assembly closure produced by scan_plan::build_inject_fn(). Null
-  /// when the plan's output layout is identity over data_columns — execute()
-  /// then forwards the cached batch (or filter result) without re-permuting.
-  partition_inject_fn_t inject_fn;
+  /// Shared scan plan describing the output layout. execute() queries
+  /// @c needs_output_assembly to decide whether to call @c assemble_scan_output
+  /// on the filter result (or, when no filter applies, the cached batch).
+  std::shared_ptr<scan_plan const> plan;
 };
 
 }  // namespace sirius::op::scan

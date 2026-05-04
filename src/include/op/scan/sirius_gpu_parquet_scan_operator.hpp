@@ -102,10 +102,10 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
    * Two input shapes are supported:
    *   - parquet_scan_data: the byte ranges described by the split are read from disk via
    *     read_table_from_metadata(), with optional filter pushdown / post-read filtering
-   *     and the operator's partition_inject_fn applied.
-   *   - scan_cached_operator_data: the table is already pinned in GPU memory; the
-   *     filter expression and inject closure carried on the split are applied to it.
-   *     When neither is present the cached batch is forwarded unchanged.
+   *     and (when scan_plan needs assembly) a final reshape to the plan's output layout.
+   *   - scan_cached_operator_data: the table is already pinned in GPU memory; the filter
+   *     expression on the split is applied, then the plan's output assembly is applied
+   *     when needed. When neither is needed the cached batch is forwarded unchanged.
    *
    * @param input_data  Must be either parquet_scan_data or scan_cached_operator_data.
    * @param stream      CUDA stream.
@@ -118,14 +118,14 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
 
  private:
   /// Read the parquet byte ranges described by @p scan_data and apply the post-read
-  /// filter (when not pushed down) and partition_inject_fn. Used by execute() when
-  /// the input split is a parquet_scan_data.
+  /// filter (when not pushed down) and the scan_plan's output assembly. Used by
+  /// execute() when the input split is a parquet_scan_data.
   std::unique_ptr<cudf::table> read_table_from_metadata(const parquet_scan_data& scan_data,
                                                         rmm::cuda_stream_view stream);
 
   // The scan_manager owns the wiring between this operator and its split_provider.
-  // No other code should reach into scan_info / connector / hive-inject installation,
-  // so those entry points are private and exposed only through this friend.
+  // No other code should reach into scan_info / connector, so those entry points
+  // are private and exposed only through this friend.
   friend class scan_manager::sirius_scan_manager;
 
   /// \brief Take ownership of the bind-data so the scan_manager's factory can build a
@@ -138,15 +138,7 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
   /// \brief Connector accessor for the scan_manager driver.
   scan_manager::split_connector* get_split_connector() noexcept { return _split_connector.get(); }
 
-  /// \brief Install the closure that reshapes the reader's output to the scan_plan's
-  ///        D-order layout: reorders data columns, drops pure-filter columns, and
-  ///        injects hive-partition columns from the per-split @c partition_values
-  ///        carried on @c parquet_scan_data. No-op when the scan is a trivial identity
-  ///        (no partitions, 1:1 data layout).
-  void set_partition_inject_fn(partition_inject_fn_t fn) { _partition_inject_fn = std::move(fn); }
-
   //===----------Fields----------===//
-  partition_inject_fn_t _partition_inject_fn;
   std::unique_ptr<scan_manager::split_connector> _split_connector;
   std::unique_ptr<parquet_scan_info> _scan_info;
 };
