@@ -23,7 +23,7 @@
 #include <optional>
 #include <vector>
 
-// Forward declarations — avoid pulling in heavy headers
+// Forward declarations -- avoid pulling in heavy headers
 namespace cucascade {
 namespace memory {
 class memory_space;
@@ -41,14 +41,13 @@ namespace sirius {
 /**
  * @brief Abstract interface for a single unit of data that can be converted between memory tiers.
  *
- * Generalizes the save-prev_state / lock-for-in_transit / convert / restore pattern. Concrete
+ * Generalizes the RAII mutable lock / convert / auto-release pattern. Concrete
  * implementations wrap either a data_batch or a gpu_pipeline_task.
  *
  * Implementations are responsible for:
- * - Acquiring any necessary locks (e.g., in_transit lock on data_batch)
- * - Performing the actual data conversion via the converter registry
- * - Restoring the original state on failure (exception safety)
- * - Releasing locks on success
+ * - Acquiring mutable_data_batch via to_mutable() (blocking) or try_to_mutable() (non-blocking)
+ * - Performing the actual data conversion via convert_to on the mutable accessor
+ * - RAII automatic state restoration on all exit paths (success, failure, exception)
  */
 class convertible_data {
  public:
@@ -59,19 +58,24 @@ class convertible_data {
    *
    * The implementation chooses the first available target space for which a reservation
    * can be obtained. On success the underlying data representation changes to the new
-   * tier. On failure or exception the data retains its original representation and state.
+   * tier. On all exit paths the mutable_data_batch RAII destructor automatically
+   * restores the batch to idle state.
    *
    * @param target_spaces  Candidate memory spaces to convert into (tried in order).
    * @param stream         CUDA stream for asynchronous memory operations.
    * @param res_mgr        Reservation manager for acquiring memory in the target space.
+   * @param blocking       When true, uses to_mutable() (blocks until exclusive lock acquired).
+   *                       When false, uses try_to_mutable() (returns nullopt immediately if
+   *                       the lock is unavailable).
    * @return A vector of bytes converted per target space index on success, or nullopt if
    *         no conversion occurred.
-   * @throws std::exception on unrecoverable conversion errors (state is still restored).
+   * @throws std::exception on unrecoverable conversion errors (RAII handles state restore).
    */
   virtual std::optional<std::vector<std::size_t>> convert(
     const std::vector<const cucascade::memory::memory_space*>& target_spaces,
     rmm::cuda_stream_view stream,
-    sirius::memory::sirius_memory_reservation_manager& res_mgr) = 0;
+    sirius::memory::sirius_memory_reservation_manager& res_mgr,
+    bool blocking) = 0;
 
   /**
    * @brief Get the size in bytes of this data unit in the specified memory space.

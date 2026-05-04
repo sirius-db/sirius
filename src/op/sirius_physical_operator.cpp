@@ -20,6 +20,7 @@
 #include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "sirius/exception.hpp"
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/error.hpp>
@@ -33,21 +34,65 @@ namespace op {
 // operator_data
 //===--------------------------------------------------------------------===//
 
-std::optional<std::vector<::cucascade::data_batch_processing_handle>>
-pipelineable_operator_data::prepare_for_processing(
+const std::vector<std::shared_ptr<::cucascade::data_batch>>&
+pipelineable_operator_data::get_data_batches() const
+{
+  if (!_data_batches) {
+    if (!_read_only_data_batches) {
+      throw std::runtime_error("pipelineable_operator_data:get_data_batches no data batches");
+    }
+    std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
+    batches.reserve(_read_only_data_batches->size());
+    for (const auto& ro : *_read_only_data_batches) {
+      auto copy = ro;
+      batches.push_back(::cucascade::data_batch::to_idle(std::move(copy)));
+    }
+    _data_batches = std::move(batches);
+  }
+  return *_data_batches;
+}
+
+std::vector<::cucascade::read_only_data_batch> pipelineable_operator_data::get_read_only_batches(
+  bool leave_locked) const
+{
+  if (!_read_only_data_batches) {
+    if (!_data_batches) {
+      throw std::runtime_error("pipelineable_operator_data:get_read_only_batches no data batches");
+    }
+    std::vector<::cucascade::read_only_data_batch> ro_batches;
+    ro_batches.reserve(_data_batches->size());
+    for (const auto& batch : *_data_batches) {
+      if (batch) {
+        ro_batches.push_back(batch->to_read_only());
+      } else {
+        SIRIUS_LOG_WARN("pipelineable_operator_data: null batch encountered, skipping");
+      }
+    }
+    if (leave_locked) {
+      _read_only_data_batches = std::move(ro_batches);
+    } else {
+      return std::move(ro_batches);
+    }
+  }
+  return *_read_only_data_batches;
+}
+
+void pipelineable_operator_data::prepare_for_processing(
   const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
 {
-  std::vector<::cucascade::data_batch_processing_handle> handles;
-  handles.reserve(_data_batches.size());
+  remove_read_only_lock();
+  auto data_batches = get_data_batches();
+  std::vector<::cucascade::read_only_data_batch> ro_batches;
+  ro_batches.reserve(data_batches.size());
 
-  for (const auto& batch : _data_batches) {
+  for (const auto& batch : data_batches) {
     if (!batch) {
-      SIRIUS_LOG_ERROR("pipelineable_operator_data: null batch encountered, skipping");
-      return std::nullopt;
+      throw sirius::internal_exception(
+        "pipelineable_operator_data: null batch encountered during prepare_for_processing");
     }
-    std::optional<::cucascade::data_batch_processing_handle> handle;
+    std::optional<::cucascade::read_only_data_batch> ro_batch;
     try {
-      handle = pipeline::lock_or_prepare_batch(batch, requested_memory_space, stream);
+      ro_batch = pipeline::lock_or_prepare_batch(batch, requested_memory_space, stream);
     } catch (const rmm::out_of_memory&) {
       SIRIUS_LOG_ERROR(
         "pipelineable_operator_data: OOM at batch {} preparing for processing, state: {}",
@@ -63,11 +108,16 @@ pipelineable_operator_data::prepare_for_processing(
         e.what());
       throw;
     }
-    if (!handle) { return std::nullopt; }
-    handles.emplace_back(std::move(*handle));
+    if (!ro_batch) {
+      throw sirius::internal_exception(
+        "pipelineable_operator_data: failed to lock batch {} for processing, state: {}",
+        batch->get_batch_id(),
+        static_cast<int>(batch->get_state()));
+    }
+    ro_batches.emplace_back(std::move(*ro_batch));
   }
 
-  return handles;
+  _read_only_data_batches = std::move(ro_batches);
 }
 
 std::string sirius_physical_operator::get_name() const
@@ -271,7 +321,7 @@ std::unique_ptr<operator_data> sirius_physical_operator::get_next_task_input_dat
     if (!port_ptr->repo) { continue; }  // dependency-only port; nothing to pop
     // For Pipeline barrier: need at least one data batch in the port's repository
     // TODO: later on we will adjust to the new data repository interface in cuCascade
-    auto batch_and_handle = port_ptr->repo->pop_data_batch(::cucascade::batch_state::task_created);
+    auto batch_and_handle = port_ptr->repo->pop_next_data_batch();
     if (batch_and_handle) { input_batch.push_back(std::move(batch_and_handle)); }
   }
   if (input_batch.empty()) { return nullptr; }

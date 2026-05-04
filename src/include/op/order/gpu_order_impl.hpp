@@ -49,7 +49,7 @@ class gpu_order_impl {
    * @return The output data batch.
    */
   static std::shared_ptr<cucascade::data_batch> local_order_by(
-    std::shared_ptr<cucascade::data_batch> input,
+    const cucascade::read_only_data_batch& input,
     const std::vector<int>& order_key_idx,
     const std::vector<cudf::order>& column_order,
     const std::vector<cudf::null_order>& null_precedence,

@@ -46,7 +46,7 @@ std::unique_ptr<Base> get_local_aggregation(cudf::aggregation::Kind kind)
 }
 
 std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_ungrouped_aggregate(
-  std::shared_ptr<cucascade::data_batch> input,
+  const cucascade::read_only_data_batch& input,
   const std::vector<cudf::aggregation::Kind>& aggregates,
   const std::vector<int>& aggregate_idx,
   rmm::cuda_stream_view stream,
@@ -58,7 +58,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_ungrouped_aggre
       "`local_ungrouped_aggregate()`");
   }
   std::vector<std::unique_ptr<cudf::column>> output_cols;
-  auto input_table = get_cudf_table_view(*input);
+  auto input_table = get_cudf_table_view(input);
   for (size_t i = 0; i < aggregates.size(); ++i) {
     const auto& input_col       = input_table.column(aggregate_idx[i]);
     auto reduce_aggregation     = get_local_aggregation<cudf::reduce_aggregation>(aggregates[i]);
@@ -111,7 +111,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_ungrouped_aggre
 }
 
 std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggregate(
-  std::shared_ptr<cucascade::data_batch> input,
+  const cucascade::read_only_data_batch& input,
   const std::vector<int>& group_idx,
   const std::vector<cudf::aggregation::Kind>& aggregates,
   const std::vector<int>& aggregate_idx,
@@ -128,7 +128,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
 
   const bool has_struct_col_indices = !aggregate_struct_col_indices.empty();
 
-  auto input_table = get_cudf_table_view(*input);
+  auto input_table = get_cudf_table_view(input);
   auto mr          = memory_space.get_default_allocator();
 
   // Dictionary-encode STRING group keys when:

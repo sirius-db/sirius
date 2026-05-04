@@ -215,8 +215,11 @@ host_data_representation const& convert_to_host_table(
   std::shared_ptr<data_batch> const& batch,
   rmm::cuda_stream_view stream)
 {
-  auto* data = batch->get_data();
-  if (!data) { throw std::runtime_error("data_batch has no data representation"); }
+  // Verify batch has data (use read-only accessor to check).
+  {
+    auto ro = batch->to_read_only();
+    if (!ro.get_data()) { throw std::runtime_error("data_batch has no data representation"); }
+  }
 
   auto& manager = sirius_ctx->get_memory_manager();
 
@@ -231,11 +234,14 @@ host_data_representation const& convert_to_host_table(
   if (!host_space) { throw std::runtime_error("Invalid host memory space in test"); }
 
   auto& registry = sirius::converter_registry::get();
-  batch->convert_to<host_data_representation>(registry, host_space, stream);
+  {
+    auto mut = batch->to_mutable();
+    mut.convert_to<host_data_representation>(registry, host_space, stream);
+  }
 
-  data = batch->get_data();
-  if (!data) { throw std::runtime_error("data_batch has no data after conversion"); }
-  return data->cast<host_data_representation>();
+  auto ro = batch->to_read_only();
+  if (!ro.get_data()) { throw std::runtime_error("data_batch has no data after conversion"); }
+  return ro.get_data()->cast<host_data_representation>();
 }
 
 }  // namespace
@@ -263,11 +269,6 @@ TEST_CASE("host_table_chunk_reader produces correct DataChunks",
   expected_table_data expected;
   std::vector<std::string> expected_strings;
   {
-    REQUIRE(batch->try_to_create_task());
-    auto lock_result = batch->try_to_lock_for_processing(gpu_space->get_id());
-    REQUIRE(lock_result.success);
-    auto handle = std::move(lock_result.handle);
-
     auto const gpu_view = sirius::get_cudf_table_view(*batch);
     expected            = extract_expected_data(gpu_view);
     expected_strings    = build_expected_strings(expected);
@@ -349,11 +350,6 @@ TEST_CASE("host_table_chunk_reader handles null masks",
   std::vector<bool> expected_int64_valid;
   std::vector<bool> expected_string_valid;
   {
-    REQUIRE(batch->try_to_create_task());
-    auto lock_result = batch->try_to_lock_for_processing(gpu_space->get_id());
-    REQUIRE(lock_result.success);
-    auto handle = std::move(lock_result.handle);
-
     auto const gpu_view   = sirius::get_cudf_table_view(*batch);
     expected              = extract_expected_data(gpu_view);
     expected_strings      = build_expected_strings(expected);

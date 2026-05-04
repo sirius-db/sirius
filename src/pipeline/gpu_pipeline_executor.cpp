@@ -273,16 +273,12 @@ void gpu_pipeline_executor::manager_loop()
           // The rescheduled task will handle completion instead.
           gpu_task->mark_as_rescheduled();
 
-          // Prepare intermediate data batches for re-processing.
-          // Operator outputs are in idle state; transition to task_created so
-          // lock_or_prepare_batch() can lock them for the rescheduled task.
           auto intermediate_data = oom.release_intermediate_data();
-          auto* pipelineable_intermediate =
-            dynamic_cast<op::pipelineable_operator_data*>(intermediate_data.get());
-          if (pipelineable_intermediate) {
-            for (auto& batch : pipelineable_intermediate->get_data_batches()) {
-              if (batch) { batch->try_to_create_task(); }
-            }
+          if (auto pipelineable_data =
+                dynamic_cast<op::pipelineable_operator_data*>(intermediate_data.get())) {
+            // We want to release the read-only lock on the data so that when its added back to the
+            // task queue it could be downgraded if needed.
+            pipelineable_data->remove_read_only_lock();
           }
 
           // Build the rescheduled task via virtual factory (preserves derived type).
@@ -331,9 +327,15 @@ void gpu_pipeline_executor::manager_loop()
         }
 
         if (!query_complete && _task_creator) {
+          // If the pipeline just finished, notify_downstream_pipelines() (called from
+          // mark_task_completed() above) already scheduled the consumers. Skip the
+          // explicit schedule to avoid a duplicate request that races with operator
+          // teardown after mark_completed().
           bool pipeline_done = pipeline && pipeline->is_pipeline_finished();
-          for (auto* consumer : consumers) {
-            if (consumer) { _task_creator->schedule(consumer); }
+          if (!pipeline_done) {
+            for (auto* consumer : consumers) {
+              if (consumer) { _task_creator->schedule(consumer); }
+            }
           }
         }
 

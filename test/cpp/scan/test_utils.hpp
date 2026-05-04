@@ -154,7 +154,7 @@ inline std::vector<std::shared_ptr<cucascade::data_batch>> drain_data_repo(
 {
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
   while (true) {
-    auto batch = data_repo.pop_data_batch(cucascade::batch_state::task_created);
+    auto batch = data_repo.pop_next_data_batch();
     if (!batch) { break; }
     batches.push_back(std::move(batch));
   }
@@ -203,7 +203,10 @@ inline void validate_scanned_batches(
 
   for (auto const& batch : batches) {
     REQUIRE(batch != nullptr);
-    batch->convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
+    {
+      auto mut = batch->to_mutable();
+      mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
+    }
     auto table_view = sirius::get_cudf_table_view(*batch);
 
     REQUIRE(table_view.num_columns() == 4);
@@ -289,7 +292,10 @@ inline void validate_projected_id_price_batches(
 
   for (auto const& batch : batches) {
     REQUIRE(batch != nullptr);
-    batch->convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
+    {
+      auto mut = batch->to_mutable();
+      mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
+    }
     auto table_view = sirius::get_cudf_table_view(*batch);
 
     REQUIRE(table_view.num_columns() == 2);

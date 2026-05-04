@@ -58,7 +58,7 @@ host_column_nulls copy_null_mask_to_host(cudf::column_view const& col,
  * @param stream    CUDA stream for synchronization (per INFRA-01)
  * @param col_names Optional column names (cudf::table_view has no names)
  */
-void debug_schema(cucascade::data_batch const& batch,
+void debug_schema(cucascade::data_batch& batch,
                   rmm::cuda_stream_view stream,
                   std::vector<std::string> const& col_names = {});
 
@@ -72,7 +72,7 @@ void debug_schema(cucascade::data_batch const& batch,
  * @param stream    CUDA stream for synchronization (per INFRA-01)
  * @param col_names Optional column names
  */
-void debug_nulls(cucascade::data_batch const& batch,
+void debug_nulls(cucascade::data_batch& batch,
                  rmm::cuda_stream_view stream,
                  std::vector<std::string> const& col_names = {});
 
@@ -99,7 +99,7 @@ enum class DebugFormat { ALIGNED, CSV };
  *                       strings truncated with '...' suffix. Pass 0 for no
  *                       truncation (per D-02).
  */
-void debug_head(cucascade::data_batch const& batch,
+void debug_head(cucascade::data_batch& batch,
                 cudf::size_type n,
                 rmm::cuda_stream_view stream,
                 DebugFormat format                        = DebugFormat::ALIGNED,
@@ -118,7 +118,7 @@ void debug_head(cucascade::data_batch const& batch,
  * @param stream    CUDA stream for GPU reduction operations
  * @param col_names Optional column names (falls back to col[N])
  */
-void debug_stats(cucascade::data_batch const& batch,
+void debug_stats(cucascade::data_batch& batch,
                  rmm::cuda_stream_view stream,
                  std::vector<std::string> const& col_names = {});
 
@@ -136,7 +136,7 @@ void debug_stats(cucascade::data_batch const& batch,
  * @param stream    CUDA stream for GPU operations
  * @param col_names Optional column names (falls back to col[N])
  */
-void debug_checksum(cucascade::data_batch const& batch,
+void debug_checksum(cucascade::data_batch& batch,
                     rmm::cuda_stream_view stream,
                     std::vector<std::string> const& col_names = {});
 
@@ -155,8 +155,8 @@ void debug_checksum(cucascade::data_batch const& batch,
  * @param max_rows      Skip value comparison if either batch exceeds this (default 10M)
  * @param col_names     Optional column names
  */
-void debug_diff(cucascade::data_batch const& batch_a,
-                cucascade::data_batch const& batch_b,
+void debug_diff(cucascade::data_batch& batch_a,
+                cucascade::data_batch& batch_b,
                 rmm::cuda_stream_view stream,
                 cudf::size_type max_diff_rows             = 10,
                 cudf::size_type max_rows                  = 10'000'000,
@@ -177,7 +177,7 @@ void debug_diff(cucascade::data_batch const& batch_a,
  * @param max_string_len Maximum display length for STRING values (0 = no limit)
  * @param seed           Optional RNG seed for reproducible sampling
  */
-void debug_sample(cucascade::data_batch const& batch,
+void debug_sample(cucascade::data_batch& batch,
                   cudf::size_type n,
                   rmm::cuda_stream_view stream,
                   DebugFormat format                        = DebugFormat::ALIGNED,

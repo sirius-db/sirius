@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_order.hpp"
 
+#include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "op/order/gpu_order_impl.hpp"
 #include "sirius/exception.hpp"
@@ -43,7 +44,7 @@ std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_dat
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_order::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_data_batches();
+  const auto& input_batches = input.get_read_only_batches();
 
   // Build cudf order vectors from BoundOrderByNode
   std::vector<int> order_key_idx;
@@ -72,8 +73,7 @@ std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_dat
   output_batches.reserve(input_batches.size());
 
   for (auto const& batch : input_batches) {
-    if (!batch) { continue; }
-    auto* space = batch->get_memory_space();
+    auto* space = batch.get_memory_space();
     if (!space) { continue; }
 
     auto sorted_batch = gpu_order_impl::local_order_by(
