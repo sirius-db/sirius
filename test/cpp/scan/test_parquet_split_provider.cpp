@@ -63,13 +63,13 @@ std::filesystem::path write_parquet_file(duckdb::Connection& con,
     " AS SELECT (range)::INTEGER AS id, ((range)*100)::BIGINT AS value, "
     "((range)*1.5)::DOUBLE AS price, ('item_' || range) AS name "
     "FROM range(" +
-    std::to_string(start_id) + ", " + std::to_string(start_id + static_cast<std::int64_t>(num_rows)) +
-    ")";
+    std::to_string(start_id) + ", " +
+    std::to_string(start_id + static_cast<std::int64_t>(num_rows)) + ")";
   auto result = con.Query(create_sql);
   REQUIRE(result);
   REQUIRE(!result->HasError());
 
-  auto const path = dir / (name + ".parquet");
+  auto const path            = dir / (name + ".parquet");
   std::string const copy_sql = "COPY " + table + " TO '" + path.string() +
                                "' (FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE " +
                                std::to_string(row_group_size) + ")";
@@ -116,8 +116,8 @@ std::vector<std::unique_ptr<parquet_scan_data>> drive_provider(parquet_split_pro
     auto next = connector.get_next_split();
     if (!next.has_value()) { break; }
     std::unique_ptr<op::operator_data> base = std::move(*next);
-    auto* raw = base.release();
-    auto* parquet = dynamic_cast<parquet_scan_data*>(raw);
+    auto* raw                               = base.release();
+    auto* parquet                           = dynamic_cast<parquet_scan_data*>(raw);
     REQUIRE(parquet != nullptr);
     drained.emplace_back(std::unique_ptr<parquet_scan_data>(parquet));
   }
@@ -160,12 +160,12 @@ TEST_CASE("parquet_split_provider - max_file_processed bounds files per emitted 
 {
   // Generate 8 small files, set a tiny max_file_processed and a generous byte budget.
   // No single accumulated push should ever bundle more files than the cap allows.
-  auto const dir = fresh_tmp_dir("max_files");
+  auto const dir       = fresh_tmp_dir("max_files");
   auto [db_owner, con] = sirius::make_test_db_and_connection();
 
-  constexpr std::size_t k_files          = 8;
-  constexpr std::size_t k_rows_per_file  = 1000;
-  constexpr std::size_t k_rg_size        = 1000;  // one row group per file
+  constexpr std::size_t k_files         = 8;
+  constexpr std::size_t k_rows_per_file = 1000;
+  constexpr std::size_t k_rg_size       = 1000;  // one row group per file
 
   std::vector<std::string> file_paths;
   file_paths.reserve(k_files);
@@ -222,7 +222,7 @@ TEST_CASE("parquet_split_provider - max_file_processed=1 emits one file per spli
 {
   // The strictest setting: each file should land in its own parquet_scan_data, regardless of
   // byte budget. Verifies that the per-task batching cap is propagated as a per-push cap.
-  auto const dir = fresh_tmp_dir("max_files_one");
+  auto const dir       = fresh_tmp_dir("max_files_one");
   auto [db_owner, con] = sirius::make_test_db_and_connection();
 
   constexpr std::size_t k_files = 5;
@@ -230,12 +230,8 @@ TEST_CASE("parquet_split_provider - max_file_processed=1 emits one file per spli
   std::vector<std::string> file_paths;
   file_paths.reserve(k_files);
   for (std::size_t i = 0; i < k_files; ++i) {
-    auto path = write_parquet_file(con,
-                                   dir,
-                                   "f" + std::to_string(i),
-                                   500,
-                                   500,
-                                   static_cast<std::int64_t>(i * 500));
+    auto path = write_parquet_file(
+      con, dir, "f" + std::to_string(i), 500, 500, static_cast<std::int64_t>(i * 500));
     file_paths.push_back(path.string());
   }
 
@@ -269,12 +265,12 @@ TEST_CASE(
   // budget, but two files' worth of bytes exceeds it. With the bug, accum.total_uncompressed_bytes
   // is never updated, so the provider bundles all files in a batch into one split, blowing past
   // the budget. After the fix, the accumulated bytes flush each time the budget is crossed.
-  auto const dir = fresh_tmp_dir("batch_size");
+  auto const dir       = fresh_tmp_dir("batch_size");
   auto [db_owner, con] = sirius::make_test_db_and_connection();
 
-  constexpr std::size_t k_files          = 4;
-  constexpr std::size_t k_rows_per_file  = 5000;
-  constexpr std::size_t k_rg_size        = 5000;  // single row group per file
+  constexpr std::size_t k_files         = 4;
+  constexpr std::size_t k_rows_per_file = 5000;
+  constexpr std::size_t k_rg_size       = 5000;  // single row group per file
 
   std::vector<std::string> file_paths;
   file_paths.reserve(k_files);
@@ -364,11 +360,11 @@ TEST_CASE(
   // A single file with many row groups, and a budget that is below ~3 row groups' bytes.
   // Verifies the within-file overflow path: each emitted split's bytes stay near the budget
   // rather than carrying the whole file into one push.
-  auto const dir = fresh_tmp_dir("batch_size_intra_file");
+  auto const dir       = fresh_tmp_dir("batch_size_intra_file");
   auto [db_owner, con] = sirius::make_test_db_and_connection();
 
-  constexpr std::size_t k_rg_size           = 1000;
-  constexpr std::size_t k_rows_in_one_file  = k_rg_size * 8;  // 8 row groups
+  constexpr std::size_t k_rg_size          = 1000;
+  constexpr std::size_t k_rows_in_one_file = k_rg_size * 8;  // 8 row groups
 
   auto path = write_parquet_file(con, dir, "single", k_rows_in_one_file, k_rg_size, 0);
 
