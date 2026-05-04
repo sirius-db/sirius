@@ -352,8 +352,9 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
     return static_cast<bool>(_partition_inject_fn);
   }
 
-  /// Return the partition injection function (may be null).
-  [[nodiscard]] partition_inject_fn_t const& get_partition_inject_fn() const
+  /// Return the partition injection function (may be null). Legacy typedef — carries file_path
+  /// so the schema-reconciliation closure can do per-file column-set lookups.
+  [[nodiscard]] sirius::partition_inject_fn_t const& get_partition_inject_fn() const
   {
     return _partition_inject_fn;
   }
@@ -466,8 +467,10 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   /// Null for plain parquet scans; set by iceberg_scan_task_global_state.
   post_convert_fn_t _post_convert_fn;
 
-  /// Optional partition column injection (null unless hive-partitioned).
-  partition_inject_fn_t _partition_inject_fn;
+  /// Optional partition column injection (null unless hive-partitioned). Legacy typedef so the
+  /// schema-reconciliation closure (which needs file_path for per-file column-set lookups) can
+  /// share this storage with the simple hive-injection closure.
+  sirius::partition_inject_fn_t _partition_inject_fn;
 
   /// Per-file column names for cuDF projection (schema evolution support).
   /// Empty if all files share the same schema; otherwise one entry per file.

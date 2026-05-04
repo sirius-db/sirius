@@ -57,24 +57,6 @@ std::vector<std::string> scan_plan::data_column_names() const
   return names;
 }
 
-std::vector<duckdb::idx_t> scan_plan::make_batch_column_map() const
-{
-  // This is a shim for the existing @c convert_table_filters_to_expression API,
-  // which uses @c idx_t(-1) as a "not in batch" sentinel. The canonical form
-  // is the @c vector<optional<size_t>> already stored in
-  // @c batch_position_by_column_id; once the filter-translator API is updated
-  // to consume the optional form directly, this conversion (and the sentinel)
-  // can be deleted.
-  constexpr auto NOT_PROJECTED = static_cast<duckdb::idx_t>(-1);
-  std::vector<duckdb::idx_t> map(batch_position_by_column_id.size(), NOT_PROJECTED);
-  for (std::size_t c = 0; c < batch_position_by_column_id.size(); ++c) {
-    if (batch_position_by_column_id[c]) {
-      map[c] = static_cast<duckdb::idx_t>(*batch_position_by_column_id[c]);
-    }
-  }
-  return map;
-}
-
 std::string scan_plan::batch_column_name(duckdb::idx_t batch_position) const
 {
   return data_columns.at(batch_position).name;
@@ -93,72 +75,71 @@ std::unordered_set<std::size_t> scan_plan::pure_filter_batch_positions() const
 }
 
 //===----------------------------------------------------------------------===//
-// scan_plan::build_inject_fn
+// needs_output_assembly / assemble_scan_output
 //===----------------------------------------------------------------------===//
 
-partition_inject_fn_t scan_plan::build_inject_fn() const
+bool needs_output_assembly(scan_plan const& plan)
 {
-  // If there are no output columns (e.g. SELECT count(*), with or without a
-  // filter that pulls in pure-filter data columns), the reader's natural batch
-  // is what downstream needs: count-style aggregations propagate row counts
-  // from the batch they receive. Projecting it down to a 0-column table would
-  // erase the row count. Output partitions are only recorded when they appear
-  // in the output, so an empty output_layout also implies no partitions to
-  // inject — nothing to do, return a null closure.
-  if (output_layout.empty()) { return nullptr; }
+  // SELECT count(*) shape (with or without a filter that pulls in pure-filter
+  // data columns): the reader's natural batch is what downstream needs —
+  // count-style aggregations propagate row counts from the batch they receive,
+  // so projecting down to a 0-column table would erase the row count. Output
+  // partitions are only recorded when they appear in the output, so an empty
+  // output_layout also implies no partitions to inject.
+  if (plan.output_layout.empty()) { return false; }
 
-  // If assembly is a trivial identity — no partitions and output_layout covers
-  // data_columns 1:1 in order — return a null closure so the GPU scan operator
-  // skips the assembly step and the reader's output flows through untouched.
-  bool identity = !has_partitions() && output_layout.size() == data_columns.size();
-  for (std::size_t i = 0; identity && i < output_layout.size(); ++i) {
-    if (output_layout[i].source != output_entry::DATA || output_layout[i].idx != i) {
-      identity = false;
+  // Trivial identity: no partitions and output_layout covers data_columns 1:1
+  // in order. The reader's natural output already matches what the pipeline
+  // expects.
+  if (plan.has_partitions() || plan.output_layout.size() != plan.data_columns.size()) {
+    return true;
+  }
+  for (std::size_t i = 0; i < plan.output_layout.size(); ++i) {
+    if (plan.output_layout[i].source != scan_plan::output_entry::DATA ||
+        plan.output_layout[i].idx != i) {
+      return true;
     }
   }
-  if (identity) { return nullptr; }
+  return false;
+}
 
-  // Capture everything the closure needs by value, so it survives moves of
-  // the scan_plan.
-  auto layout     = output_layout;
-  auto partitions = partition_columns;
+std::unique_ptr<cudf::table> assemble_scan_output(scan_plan const& plan,
+                                                  std::unique_ptr<cudf::table> reader_output,
+                                                  std::vector<std::string> const& partition_values,
+                                                  rmm::cuda_stream_view stream)
+{
+  if (!reader_output) return reader_output;
 
-  return [layout = std::move(layout), partitions = std::move(partitions)](
-           std::unique_ptr<cudf::table> tbl,
-           std::string const& file_path,
-           rmm::cuda_stream_view stream) -> std::unique_ptr<cudf::table> {
-    if (!tbl) return tbl;
+  auto const num_rows = reader_output->num_rows();
+  auto data_cols      = reader_output->release();  // move columns out, no GPU copy
 
-    // Parse once; the closure is called per scan task (per file).
-    auto path_parts     = duckdb::HivePartitioning::Parse(file_path);
-    auto const num_rows = tbl->num_rows();
-    auto data_cols      = tbl->release();  // move columns out, no GPU copy
+  std::vector<std::unique_ptr<cudf::column>> out_cols;
+  out_cols.reserve(plan.output_layout.size());
 
-    std::vector<std::unique_ptr<cudf::column>> out_cols;
-    out_cols.reserve(layout.size());
-
-    for (auto const& entry : layout) {
-      if (entry.source == scan_plan::output_entry::DATA) {
-        out_cols.push_back(std::move(data_cols.at(entry.idx)));
-      } else {
-        auto const& pcol = partitions.at(entry.idx);
-        auto it          = path_parts.find(pcol.name);
-        if (it == path_parts.end()) {
-          throw sirius::internal_exception(
-            "[scan_plan::inject] missing hive partition key '{}' in file path: {}",
-            pcol.name,
-            file_path);
-        }
-        auto duckdb_val = duckdb::Value(it->second).DefaultCastAs(sirius::to_duckdb(pcol.type));
-        auto scalar     = sirius::value_to_cudf_scalar(duckdb_val, pcol.type, stream);
-        out_cols.push_back(cudf::make_column_from_scalar(*scalar, num_rows, stream));
+  for (auto const& entry : plan.output_layout) {
+    if (entry.source == scan_plan::output_entry::DATA) {
+      out_cols.push_back(std::move(data_cols.at(entry.idx)));
+    } else {
+      auto const& pcol = plan.partition_columns.at(entry.idx);
+      // partition_values is in partition_columns order, so entry.idx indexes it directly.
+      if (entry.idx >= partition_values.size()) {
+        throw sirius::internal_exception(
+          "[assemble_scan_output] partition_values too short ({}) for partition column '{}' at "
+          "index {}.",
+          partition_values.size(),
+          pcol.name,
+          entry.idx);
       }
+      auto duckdb_val =
+        duckdb::Value(partition_values[entry.idx]).DefaultCastAs(sirius::to_duckdb(pcol.type));
+      auto scalar = sirius::value_to_cudf_scalar(duckdb_val, pcol.type, stream);
+      out_cols.push_back(cudf::make_column_from_scalar(*scalar, num_rows, stream));
     }
+  }
 
-    // Unused data columns (pure-filter columns not in output_layout) fall out
-    // of scope with data_cols and are freed.
-    return std::make_unique<cudf::table>(std::move(out_cols));
-  };
+  // Unused data columns (pure-filter columns not in output_layout) fall out
+  // of scope with data_cols and are freed.
+  return std::make_unique<cudf::table>(std::move(out_cols));
 }
 
 //===----------------------------------------------------------------------===//
@@ -220,25 +201,24 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
       // level and our filter builder will skip them. We only materialize
       // partition metadata for output columns.
       if (!is_output) { return; }
-      // names.at / returned_types.at guard against planner inputs where the
-      // primary index exceeds the schema (empty names, schema mismatch, etc.).
+      auto const partition_cols_idx = plan.partition_columns.size();
       plan.partition_columns.push_back(scan_plan::partition_column{
         primary_idx, names.at(primary_idx), returned_types.at(primary_idx)});
-      plan.output_layout.push_back(scan_plan::output_entry{scan_plan::output_entry::PARTITION,
-                                                           plan.partition_columns.size() - 1});
+      plan.output_layout.push_back(
+        scan_plan::output_entry{scan_plan::output_entry::PARTITION, partition_cols_idx});
     } else {
       // Data column — always added to the batch (even if filter-only, we need
       // it for filter evaluation). Store an empty name when @c names is empty:
       // the caller's guard only forces non-empty names for name-dependent paths
       // (projection, filter, partitions), and the plain-read case populates
       // data_columns without ever consuming the name downstream.
-      std::size_t const batch_pos = plan.data_columns.size();
-      std::string col_name        = names.empty() ? std::string{} : names.at(primary_idx);
+      auto const batch_idx = plan.data_columns.size();
+      std::string col_name = names.empty() ? std::string{} : names.at(primary_idx);
       plan.data_columns.push_back(scan_plan::data_column{primary_idx, std::move(col_name)});
-      primary_to_batch[primary_idx] = batch_pos;
+      primary_to_batch[primary_idx] = batch_idx;
       if (is_output) {
         plan.output_layout.push_back(
-          scan_plan::output_entry{scan_plan::output_entry::DATA, batch_pos});
+          scan_plan::output_entry{scan_plan::output_entry::DATA, batch_idx});
       }
     }
   };

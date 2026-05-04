@@ -976,23 +976,12 @@ TEST_CASE("two-pipeline scan - pure filter column pruning",
   std::vector<std::string> files = {path.string()};
 
   // Output only id(0) and price(2).  value(1) is a pure filter column: it appears
-  // in projection_ids but not in output_types, so it should be pruned after filtering.
+  // in projection_ids but not in output_types, so scan_plan classifies it as
+  // pure-filter and assemble_scan_output prunes it after filtering.
   //
   // DuckDB convention: projection_ids are indices into column_ids.  The first
   // output_types.size() entries are the real output columns; the rest are pure
-  // filter columns.  make_selected_column_indices collects the union of all
-  // referenced column_ids indices into a projected_set, then iterates column_ids
-  // in order, emitting only those in the set.  post_filter_projection_ids stores
-  // the raw projection_id values and uses them to index into the reader output.
-  //
-  // This only works when the projected_set forms a contiguous range {0..N-1},
-  // so that column_ids index == reader output position.  DuckDB's planner
-  // guarantees this: column_ids only contains referenced columns, and
-  // projection_ids (output + filter-only) covers all of them.
-  //
-  // With projection_ids = {0, 2, 1}, projected_set = {0, 1, 2} (contiguous),
-  // the reader produces 3 columns in column_ids order [id, value, price], and
-  // post_filter_projection_ids = {0, 2} selects columns[0]=id and columns[2]=price.
+  // filter columns.
   duckdb::vector<duckdb::LogicalType> output_types;
   output_types.push_back(schema.types[0]);  // id    INTEGER
   output_types.push_back(schema.types[2]);  // price DOUBLE

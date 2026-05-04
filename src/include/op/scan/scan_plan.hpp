@@ -18,7 +18,7 @@
 
 // sirius
 #include <helper/logical_type.hpp>
-#include <op/scan/hive_partition.hpp>  // partition_inject_fn_t
+#include <op/scan/hive_partition.hpp>
 
 // duckdb
 #include <duckdb/common/column_index.hpp>
@@ -118,10 +118,6 @@ struct scan_plan {
   /// and as the D-indexed resolver for AST filter translation.
   [[nodiscard]] std::vector<std::string> data_column_names() const;
 
-  /// C → D map in the sentinel form expected by @c convert_table_filters_to_expression
-  /// (@c idx_t(-1) = not in batch).
-  [[nodiscard]] std::vector<duckdb::idx_t> make_batch_column_map() const;
-
   /// Resolve a D-space index to a parquet column name, for use as the AST
   /// translator's name resolver.
   [[nodiscard]] std::string batch_column_name(duckdb::idx_t batch_position) const;
@@ -131,38 +127,46 @@ struct scan_plan {
   /// pure-filter columns from the uncompressed-byte accounting that drives
   /// row-group partitioning.
   [[nodiscard]] std::unordered_set<std::size_t> pure_filter_batch_positions() const;
-
-  //===--------------------------------------------------------------------===//
-  // Primary operations
-  //===--------------------------------------------------------------------===//
-
-  /// Build a post-read assembly closure that turns the reader's D-order batch
-  /// into the final output layout (data + partition columns in column_ids order,
-  /// with pure-filter data columns dropped).
-  ///
-  /// Returns @c nullptr — telling the GPU scan operator to let the reader's
-  /// output flow through untouched — in two cases:
-  ///
-  ///   1. @c output_layout is empty. This is the SELECT count(*) shape
-  ///      (with or without a filter that pulls in pure-filter data columns).
-  ///      Emitting a 0-column table here would erase the row count that
-  ///      count-style aggregations downstream rely on, so we return the raw
-  ///      batch instead.
-  ///
-  ///   2. The plan is a trivial identity: no partitions, and @c output_layout
-  ///      covers @c data_columns 1:1 in order. In that case the reader's
-  ///      natural output already matches what the pipeline expects.
-  ///
-  /// Otherwise returns a closure that, per scan task, walks @c output_layout:
-  /// DATA entries move the corresponding data column out of the batch;
-  /// PARTITION entries synthesize a scalar-backed column from the file path.
-  /// Pure-filter data columns (present in @c data_columns but not referenced
-  /// by @c output_layout) are implicitly freed when the batch goes out of scope.
-  ///
-  /// The returned closure captures @c output_layout and @c partition_columns
-  /// by value, so it remains valid after the @c scan_plan is moved.
-  [[nodiscard]] partition_inject_fn_t build_inject_fn() const;
 };
+
+//===--------------------------------------------------------------------===//
+// Output assembly — free functions
+//===--------------------------------------------------------------------===//
+
+/// True when the reader's natural batch needs to be reshaped to match the plan's
+/// final output layout — i.e. when @ref assemble_scan_output should be called.
+///
+/// Returns @c false in two short-circuit cases where the reader's output flows
+/// through to the pipeline unchanged:
+///   1. @c output_layout is empty (SELECT count(*) — emitting a 0-column table
+///      would erase the row count downstream count-style aggregations consume).
+///   2. The plan is a trivial identity: no partitions, and @c output_layout
+///      covers @c data_columns 1:1 in order.
+[[nodiscard]] bool needs_output_assembly(scan_plan const& plan);
+
+/// Reshape the reader's D-order batch to the plan's output layout: walk
+/// @c output_layout, moving DATA columns out of the batch and synthesizing
+/// PARTITION columns from @p partition_values. Pure-filter data columns
+/// (present in @c data_columns but not referenced by @c output_layout) are
+/// implicitly freed when the released batch goes out of scope.
+///
+/// Callers should gate the call on @ref needs_output_assembly to avoid the
+/// release/rebuild round-trip when assembly is a no-op. When called regardless,
+/// the function still produces a correct output but performs unnecessary work
+/// in the identity case.
+///
+/// @param plan              The scan plan describing the layout.
+/// @param reader_output     The reader's D-order batch to reshape.
+/// @param partition_values  Partition values for this split, in
+///                          @c partition_columns order. Empty when the plan has
+///                          no partition columns.
+/// @param stream            CUDA stream for any GPU work (scalar-backed column
+///                          construction).
+[[nodiscard]] std::unique_ptr<cudf::table> assemble_scan_output(
+  scan_plan const& plan,
+  std::unique_ptr<cudf::table> reader_output,
+  std::vector<std::string> const& partition_values,
+  rmm::cuda_stream_view stream);
 
 /// Build a scan_plan from DuckDB planner inputs. See @c scan_plan for semantics.
 ///

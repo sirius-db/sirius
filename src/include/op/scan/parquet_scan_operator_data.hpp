@@ -17,8 +17,6 @@
 #pragma once
 
 // sirius
-#include "cucascade/data/gpu_data_representation.hpp"
-
 #include <expression_executor/gpu_expression_translator_internal.hpp>
 #include <op/scan/scan_plan.hpp>
 #include <op/sirius_physical_operator.hpp>
@@ -27,9 +25,11 @@
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
+#include <cudf/io/parquet_schema.hpp>
 
 // cucascade
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
 
 // standard library
 #include <cstddef>
@@ -42,6 +42,35 @@ namespace sirius::op::scan {
 using hybrid_scan_reader = cudf::io::parquet::experimental::hybrid_scan_reader;
 
 //===----------------------------------------------------------------------===//
+// row_group_slice
+//===----------------------------------------------------------------------===//
+/**
+ * @brief Represents a set of row groups within a single parquet file.
+ *
+ * Multiple slices can be bundled together to form a single parquet partition corresponding to a
+ * data batch.
+ */
+struct row_group_slice {
+  row_group_slice(std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata,
+                  std::string file_path,
+                  std::vector<cudf::size_type> row_group_indices,
+                  std::size_t reserved_uncompressed_bytes,
+                  std::size_t reserved_compressed_bytes)
+    : file_metadata(file_metadata),
+      file_path(file_path),
+      row_group_indices(std::move(row_group_indices)),
+      reserved_uncompressed_bytes(reserved_uncompressed_bytes),
+      reserved_compressed_bytes(reserved_compressed_bytes)
+  {
+  }
+  std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
+  std::string file_path;
+  std::vector<cudf::size_type> row_group_indices;
+  std::size_t reserved_uncompressed_bytes;
+  std::size_t reserved_compressed_bytes;
+};
+
+//===----------------------------------------------------------------------===//
 // row_group_range
 //===----------------------------------------------------------------------===//
 /**
@@ -49,6 +78,8 @@ using hybrid_scan_reader = cudf::io::parquet::experimental::hybrid_scan_reader;
  *
  * Used as the unit of work for both the parquet split provider (partitioning) and
  * the GPU scan (byte-range preloading).
+ *
+ * @todo This needs to be deleted once Iceberg is integrated into scan manager framework.
  */
 struct row_group_range {
   row_group_range(std::size_t file_idx,
@@ -61,7 +92,6 @@ struct row_group_range {
       reserved_compressed_bytes(reserved_compressed_bytes)
   {
   }
-
   std::size_t file_idx;
   std::vector<cudf::size_type> row_group_indices;
   std::size_t reserved_uncompressed_bytes;
@@ -82,18 +112,16 @@ struct row_group_range {
 class parquet_scan_data : public op::operator_data {
  public:
   using translated_expression = gpu_expression_translator::translated_expression;
-  parquet_scan_data(std::string file_path,
-                    row_group_range rg_range,
+  parquet_scan_data(std::vector<row_group_slice> rg_slices,
                     std::shared_ptr<cudf::io::parquet_reader_options> reader_options,
                     std::shared_ptr<duckdb::Expression> filter_expression,
-                    std::shared_ptr<cudf::io::datasource> datasource,
-                    std::shared_ptr<scan_plan const> plan)
-    : file_path(std::move(file_path)),
-      rg_range(std::move(rg_range)),
+                    std::shared_ptr<scan_plan const> plan,
+                    std::vector<std::string> partition_values)
+    : rg_slices(std::move(rg_slices)),
       reader_options(std::move(reader_options)),
       filter_expression(std::move(filter_expression)),
-      datasource(std::move(datasource)),
-      plan(std::move(plan))
+      plan(std::move(plan)),
+      partition_values(std::move(partition_values))
   {
   }
 
@@ -119,7 +147,7 @@ class parquet_scan_data : public op::operator_data {
    */
   std::optional<std::vector<::cucascade::data_batch_processing_handle>> prepare_for_processing(
     const ::cucascade::memory::memory_space* requested_memory_space,
-    rmm::cuda_stream_view stream) override
+    rmm::cuda_stream_view /*stream*/) override
   {
     gpu_memory_space = const_cast<cucascade::memory::memory_space*>(requested_memory_space);
     return std::vector<::cucascade::data_batch_processing_handle>{};
@@ -127,19 +155,25 @@ class parquet_scan_data : public op::operator_data {
 
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
   {
-    return rg_range.reserved_uncompressed_bytes;
+    return std::accumulate(
+      rg_slices.begin(), rg_slices.end(), std::size_t{0}, [](auto acc, auto const& s) {
+        return acc + s.reserved_uncompressed_bytes;
+      });
   }
 
-  std::string file_path;
-  row_group_range rg_range;
+  /// The row group slices (potentially across multiple files)
+  std::vector<row_group_slice> rg_slices;
+  /// The reader options to apply in the parquet reader
   std::shared_ptr<cudf::io::parquet_reader_options> reader_options;
   /// The coalesced duckdb filter expression.
   std::shared_ptr<duckdb::Expression> filter_expression;
-  /// Datasource for the parquet file, shared with other partitions of the same file.
-  std::shared_ptr<cudf::io::datasource> datasource;
   /// Scan plan shared across all splits of this scan. Carries the D-order column name
   /// table used by execute()'s per-task AST translation, plus the post-read assembly layout.
   std::shared_ptr<scan_plan const> plan;
+  /// Hive partition values shared by every file in @ref rg_slices, in scan_plan::partition_columns
+  /// order. Empty when the table has no hive partitions. assemble_scan_output consumes this
+  /// directly instead of re-parsing a file path at execute time.
+  std::vector<std::string> partition_values;
   /// GPU memory space for allocating output tables produced by execute().
   cucascade::memory::memory_space* gpu_memory_space = nullptr;
 };
@@ -152,23 +186,23 @@ class parquet_scan_data : public op::operator_data {
  *
  * The cached_split_provider produces one of these per cached batch. It carries
  * a zero-copy data_batch (whose gpu_table_representation is a view over the
- * pinned data columns in scan_plan D-order) plus the filter expression and the
- * post-read assembly closure that the scan operator applies in execute(). The
- * gpu_memory_space lives on the wrapped data_batch.
+ * pinned data columns in scan_plan D-order) plus the filter expression and a
+ * shared scan_plan that execute() consults via @c needs_output_assembly /
+ * @c assemble_scan_output. The gpu_memory_space lives on the wrapped data_batch.
  *
- * The cached path is gated upstream so it never sees hive partitions, so
- * @ref inject_fn — when non-null — only ever performs DATA-source permutation
- * and pure-filter-column pruning. It is null exactly when scan_plan's output
- * layout is identity over data_columns (no permute, no prune).
+ * The cached path is gated upstream so it never sees hive partitions: when
+ * assembly is needed, it only performs DATA-source permutation and pure-filter-
+ * column pruning. When @c needs_output_assembly(*plan) is false, execute()
+ * forwards the cached batch (or the filter result) without re-permuting.
  */
 class scan_cached_operator_data : public op::operator_data {
  public:
   scan_cached_operator_data(std::shared_ptr<cucascade::data_batch> batch,
                             std::shared_ptr<duckdb::Expression> filter_expression,
-                            partition_inject_fn_t inject_fn)
+                            std::shared_ptr<scan_plan const> plan)
     : batch(std::move(batch)),
       filter_expression(std::move(filter_expression)),
-      inject_fn(std::move(inject_fn))
+      plan(std::move(plan))
   {
   }
 
@@ -185,10 +219,10 @@ class scan_cached_operator_data : public op::operator_data {
   /// an AST-translated filter — pushdown is a parquet-reader concern, and the
   /// cached batch is already materialized.
   std::shared_ptr<duckdb::Expression> filter_expression;
-  /// Post-read assembly closure produced by scan_plan::build_inject_fn(). Null
-  /// when the plan's output layout is identity over data_columns — execute()
-  /// then forwards the cached batch (or filter result) without re-permuting.
-  partition_inject_fn_t inject_fn;
+  /// Shared scan plan describing the output layout. execute() queries
+  /// @c needs_output_assembly to decide whether to call @c assemble_scan_output
+  /// on the filter result (or, when no filter applies, the cached batch).
+  std::shared_ptr<scan_plan const> plan;
 };
 
 }  // namespace sirius::op::scan

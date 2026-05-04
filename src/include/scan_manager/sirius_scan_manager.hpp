@@ -141,9 +141,10 @@ class sirius_scan_manager {
   void remove_pinned_entry(const std::string& name);
 
  private:
-  /// \brief Build a split_provider for @p op by reading its parquet scan_info
-  ///        and installing the resulting hive-partition inject_fn (if any) on
-  ///        the operator.
+  /// \brief Build a split_provider for @p op by reading its parquet scan_info.
+  ///        Returns a cached_split_provider when a pinned entry matches, otherwise
+  ///        a parquet_split_provider; in both cases the provider carries the
+  ///        scan_plan that the operator's execute() consults for output assembly.
   std::unique_ptr<split_provider> create_provider_for(
     op::scan::sirius_gpu_parquet_scan_operator* op);
 

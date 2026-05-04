@@ -38,11 +38,11 @@ cached_split_provider::cached_split_provider(
   std::vector<std::vector<std::shared_ptr<cudf::column>>> columns_per_request,
   cucascade::memory::memory_space& memory_space,
   std::shared_ptr<duckdb::Expression> filter_expression,
-  op::scan::partition_inject_fn_t inject_fn)
+  std::shared_ptr<op::scan::scan_plan const> plan)
   : _columns_per_request(std::move(columns_per_request)),
     _memory_space(&memory_space),
     _filter_expression(std::move(filter_expression)),
-    _inject_fn(std::move(inject_fn))
+    _plan(std::move(plan))
 {
 }
 
@@ -86,7 +86,7 @@ std::future<void> cached_split_provider::start(exec::thread_pool& /*pool*/,
       std::make_shared<cucascade::data_batch>(::sirius::get_next_batch_id(), std::move(gpu_repr));
 
     connector.push_split(std::make_unique<op::scan::scan_cached_operator_data>(
-      std::move(batch), _filter_expression, _inject_fn));
+      std::move(batch), _filter_expression, _plan));
   }
 
   connector.close();
