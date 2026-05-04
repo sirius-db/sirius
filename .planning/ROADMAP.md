@@ -84,12 +84,17 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 **Depends on**: Nothing (first phase of v1.4)
 **Requirements**: CC-01, CC-02, CC-03, CC-04
 **Success Criteria** (what must be TRUE):
-  1. `git -C cucascade log --oneline origin/main..HEAD` shows 11 commits (our local fixes) on top of `73d00c4`-descendant ancestry; `cat cucascade/.git/HEAD` (or equivalent) resolves to the new pin.
+  1. `git -C cucascade log --oneline origin/main..HEAD` shows 4 group commits (squashed from 11 per D-A1; each commit body cites original hashes for archaeology) on top of `73d00c4`-descendant ancestry; `cat cucascade/.git/HEAD` (or equivalent) resolves to the new pin.
   2. `grep -n "writer_stream\|cudaStreamWaitEvent" cucascade/src/data/representation_converter.cpp` returns non-zero at every `convert_gpu_to_gpu` / `convert_host_to_gpu` construction site (P2 writer_stream survival gate).
   3. `grep -n "cudaHostAllocPortable" cucascade/src/memory/common.cpp cucascade/src/memory/memory_space.cpp` returns non-zero at every pinned allocation site (P9 Portable/Mapped flag gate).
-  4. `_thread` is the last-declared member in the `io_worker` class in `cucascade/src/pipeline/pipeline_io_backend.cpp` (P8 destruction-order gate); confirmed by visual inspection of the post-conflict file.
+  4. `_thread` is the last-declared member in the `io_worker` class in `cucascade/src/data/pipeline_io_backend.cpp` (P8 destruction-order gate); confirmed by visual inspection of the post-conflict file.
   5. Cucascade unit-test suite passes (`ctest` inside `cucascade/build`); `grep -rn "task_created\|in_transit" cucascade/include/` returns zero (old FSM state machine fully removed per CC-04).
-**Plans**: TBD
+**Plans**: 5 plans
+- [ ] 16-01-PLAN.md — Squash 11 cucascade commits into 4 group commits + initialize audit log
+- [ ] 16-02-PLAN.md — Rebase Group 1 (memory hygiene) + Group 3 (io_worker) onto 73d00c4
+- [ ] 16-03-PLAN.md — Rebase Group 2 (P2P override + DMA probe) onto Group 1+3 tip
+- [ ] 16-04-PLAN.md — Rebase Group 4 (Phase 13 stream-lineage); re-implement gpu_data_representation + convert_gpu_to_gpu under #117 RAII; build compile-clean
+- [ ] 16-05-PLAN.md — Run cucascade ctest + 8 grep gates; advance submodule pin in parent worktree
 **Pitfalls**:
   - P2 (writer_stream lost in representation_converter.cpp conflict): treat `representation_converter.cpp` as a re-implementation from `73d00c4` shape, not a three-way merge. Verify with grep gate before proceeding.
   - P7 (PR #739 x #117 ordering mismatch): complete cucascade rebase first; use #739 only as a file-list reference during Phase 18. Do NOT cherry-pick #739 here.
@@ -194,7 +199,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 | 13. Fix Q11 multi-GPU hang/illegal-address | v1.3 | 4/5 | Complete | 2026-04-30 |
 | 14. Land SCHED-RR distribution | v1.3 | 2/2 | Complete | 2026-04-30 |
 | 15. Cross-GPU operator-colocation audit | v1.3 | 4/4 | Complete | 2026-05-01 |
-| 16. Cucascade Submodule Rebase + Pin Recovery | v1.4 | 0/? | Not started | - |
+| 16. Cucascade Submodule Rebase + Pin Recovery | v1.4 | 0/5 | Planning complete | - |
 | 17. Sirius origin/dev Merge — Base Layer | v1.4 | 0/? | Not started | - |
 | 18. DataBatch RAII Migration | v1.4 | 0/? | Not started | - |
 | 19. IO Framework Adoption | v1.4 | 0/? | Not started | - |
