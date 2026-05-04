@@ -97,19 +97,32 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
 
   //===----------Execution----------===//
   /**
-   * @brief Read the byte ranges described by @p input_data from disk and produce a
-   *        gpu_table_representation data batch.
+   * @brief Produce a gpu_table_representation data batch from @p input_data.
    *
-   * @param input_data  Must be a parquet_scan_data instance.
+   * Two input shapes are supported:
+   *   - parquet_scan_data: the byte ranges described by the split are read from disk via
+   *     read_table_from_metadata(), with optional filter pushdown / post-read filtering
+   *     and the operator's partition_inject_fn applied.
+   *   - scan_cached_operator_data: the table is already pinned in GPU memory; the
+   *     filter expression and inject closure carried on the split are applied to it.
+   *     When neither is present the cached batch is forwarded unchanged.
+   *
+   * @param input_data  Must be either parquet_scan_data or scan_cached_operator_data.
    * @param stream      CUDA stream.
-   * @return gpu_table_representation data batch wrapped as pipelineable_operator_data
-   * @throws std::runtime_error if the input_data is not parquet_scan_data, or the parquet_scan_data
-   *         does not have an associated gpu memory space
+   * @return gpu_table_representation data batch wrapped as pipelineable_operator_data.
+   * @throws std::runtime_error if @p input_data is of an unsupported type, or if a
+   *         parquet_scan_data does not have an associated gpu memory space.
    */
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
  private:
+  /// Read the parquet byte ranges described by @p scan_data and apply the post-read
+  /// filter (when not pushed down) and partition_inject_fn. Used by execute() when
+  /// the input split is a parquet_scan_data.
+  std::unique_ptr<cudf::table> read_table_from_metadata(const parquet_scan_data& scan_data,
+                                                        rmm::cuda_stream_view stream);
+
   // The scan_manager owns the wiring between this operator and its split_provider.
   // No other code should reach into scan_info / connector / hive-inject installation,
   // so those entry points are private and exposed only through this friend.

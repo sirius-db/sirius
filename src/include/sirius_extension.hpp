@@ -61,6 +61,22 @@ class SiriusExtension : public Extension {
                                                    vector<LogicalType>& return_types,
                                                    vector<string>& names);
 
+  static void PinTableFunction(ClientContext& context,
+                               TableFunctionInput& data_p,
+                               DataChunk& output);
+  static unique_ptr<FunctionData> PinTableBind(ClientContext& context,
+                                               TableFunctionBindInput& input,
+                                               vector<LogicalType>& return_types,
+                                               vector<string>& names);
+
+  static void UnpinTableFunction(ClientContext& context,
+                                 TableFunctionInput& data_p,
+                                 DataChunk& output);
+  static unique_ptr<FunctionData> UnpinTableBind(ClientContext& context,
+                                                 TableFunctionBindInput& input,
+                                                 vector<LogicalType>& return_types,
+                                                 vector<string>& names);
+
 #ifdef SIRIUS_ENABLE_LEGACY
   static bool buffer_is_initialized;
 #endif
