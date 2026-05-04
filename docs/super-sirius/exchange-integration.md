@@ -1,41 +1,13 @@
 # Exchange Integration
 
-This document proposes moving the distributed exchange path from the Rust backend into Sirius Core as a first-class executor, enabling overlap between GPU compute and network communication.
+This document specifies the distributed exchange path as a first-class executor in Sirius Core, with overlap between GPU compute and network communication. The design introduces **two composable abstraction layers** plus a thin abstract `communicator` base with `point_to_point_communicator` derived from it, so that the transport library (UCXX day-1, NIXL day-2) can be swapped without touching orchestrator code.
 
 > **Status:** Design proposal — not yet implemented.
 
-## Motivation
+## Goals
 
-The current exchange architecture has three fundamental problems:
-
-### 1. No Overlap Between Compute and Communication
-
-After each fragment's GPU execution completes, there is a **blocking boundary** before exchange begins. The C++ engine finishes, hands packed data to Rust via C API (`sirius_exchange_c_api.cpp`), and Rust handles the entire NIXL transfer lifecycle. The GPU sits idle during transfers, and transfers wait for compute to finish.
-
-```
-TIME ═══> [  GPU compute  ][ BLOCKING ][ NIXL transfer ][ BLOCKING ][ GPU compute ]
-```
-
-### 2. Partitioning Happens Outside the Execution Pipeline
-
-Hash partitioning (`cudf::hash_partition`) and packing (`cudf::pack`) currently happen inside `sirius_physical_result_collector.cpp` (lines 282-490) as a post-processing step during result collection. This is not a streaming pipeline operator — it runs after the GPU pipeline completes and cannot overlap with upstream computation. Partitioning is tightly coupled to the result collector rather than being a composable operator in the pipeline graph.
-
-### 3. Boundary Crossing and Duplicated Systems
-
-The data path crosses four boundaries per transfer:
-
-```
-C++ engine → C API → Rust staging (bump allocator) → NIXL → Rust gRPC → remote Rust → C API → C++ engine
-```
-
-The Rust bump allocator (`gpu_staging_buffer.rs`) manages staging memory independently of cuCascade's reservation system. This means:
-- Staging memory is invisible to the GPU memory pressure manager
-- The downgrade executor cannot reclaim staging buffers under memory pressure
-- The task creator cannot schedule downstream work until Rust completes the transfer
-
-### Goal
-
-Make partitioning and communication first-class pipeline operators that overlap with GPU compute, using cuCascade-managed memory throughout.
+- Hash partitioning (`cudf::hash_partition`) and packing (`cudf::pack`) execute as a streaming pipeline sink that consumes batches as upstream produces them, so partitioning + packing + network transfer of batch N overlap with GPU compute of batch N+1.
+- The transport library is swappable without orchestrator changes: orchestrator code never imports transport-specific headers, and transports are added as additional `point_to_point_communicator` implementations.
 
 ```
 TIME ═══> [ GPU compute+partition batch 1 ][ GPU compute+partition batch 2 ][ ... ]
@@ -43,100 +15,771 @@ TIME ═══> [ GPU compute+partition batch 1 ][ GPU compute+partition batch 2
                           ^^^ OVERLAPPED: compute, partition, transfer ^^^
 ```
 
-## Architecture Overview
+## Architecture
 
-### Current Architecture (Blocking)
+### Two layers + an abstract Communicator base
+
+The design has three orthogonal seams. **Layer 1** is what the orchestrator (communication_executor, pipeline operators) sees. **Layer 2** is a thin abstract `communicator` base for what's universal across transports (lifecycle, peer enumeration, diagnostics), with `point_to_point_communicator` derived from it. The base exists so future communicator categories — if and when a use case requires them — can slot in as siblings without restructuring orchestrator code; none ship day-1. The bounce buffer is a separate, optional helper composed only with point-to-point communicators that need explicit per-buffer registration.
 
 ```mermaid
-graph LR
-    FE["Doris/StarRocks FE"] -->|TPlan| rust
-
-    subgraph rust["Sirius Backend (Rust)"]
-        PT["Plan Translator\n(TPlan → Substrait)"] --> ENG["Execute via FFI"]
-        GRPC["gRPC Service"] --> NIXL["NIXL Exchange"] --> BUMP["Staging Bump\nAllocator"]
+graph TB
+    subgraph orch["Orchestrator (transport-agnostic)"]
+        EXP["sirius_physical_exchange_partition\n(hash_partition + pack)"]
+        CE["communication_executor\n(manager loop + worker pool)"]
+        BS["batch_subscriber daemons\n(receive loop)"]
     end
-    subgraph core["Sirius Core (C++)"]
-        GPU["GPU Pipeline\nExecutor"] --> RC["Result Collector\n(partitions + packs)"] --> CAPI["C API\n(blocking)"]
+
+    subgraph L1["Layer 1: data_batch streaming API"]
+        BP["batch_publisher.publish(batch, dst, partition)"]
+        BSI["batch_subscriber.start(repo_manager)"]
     end
-    ENG -->|"Substrait plan"| GPU
-    CAPI -->|"blocking FFI"| GRPC
+
+    subgraph L2["Layer 2: Communicator base + current child"]
+        COMM["communicator\n(abstract base — lifecycle + peer enumeration)"]
+        PP["point_to_point_communicator\n(send / exchange_metadata / recv)"]
+        UCXX["ucxx_communicator\n(day 1, real)"]
+        SINGLE["single_communicator\n(day 1, in-proc test)"]
+        NIXL_C["nixl_communicator\n(future)"]
+    end
+
+    subgraph helper["Bounce-buffer helper"]
+        EBR["exchange_buffer_resource\n(cuCascade memory_space)"]
+    end
+
+    EXP -->|publish| BP
+    CE -->|drives| BP
+    BS -->|drives| BSI
+    BP --> PP
+    BSI --> PP
+
+    COMM --> PP
+    PP --> UCXX
+    PP --> SINGLE
+    PP --> NIXL_C
+
+    UCXX -.composes.-> EBR
+    NIXL_C -.composes.-> EBR
 ```
 
-```
-TIME ═══> [  GPU compute  ][  BLOCKING  ][  NIXL transfer  ][  BLOCKING  ]
-```
+The base is intentionally thin: lifecycle, peer enumeration, diagnostic identity. Operational shape (`send` / `exchange_metadata` / `recv`) lives on `point_to_point_communicator`. Keeping the base separate from its current sole child costs almost nothing today and makes any future extension purely additive — a new sibling class plus its impls, no orchestrator changes.
 
-### Proposed Architecture (Overlapped)
+Layer 2 classes are agnostic to the data_batch streaming API. They deal in raw `comm_buffer` (ptr + size + memory kind); the streaming-API layer above is what packs `data_batch` into `comm_buffer` and routes via the communicator.
+
+### Reference patterns
+
+The design mirrors two existing Sirius patterns:
+
+- **PR #675 (sirius IO subsystem)** — `templated_ioctx<Reactor>` parameterized over a backend reactor; cache lives in the base, backends never see cache.
+- **PR #731 (Sirius Scan Manager)** — `split_provider` virtual base with a documented lifecycle contract; `parquet_split_provider` is one of N possible implementations.
+
+The two-layer streaming-API + Communicator structure also matches the canonical RAPIDS shuffle library (`rapidsmpf`): a high-level `Shuffler.insert/extract` API on top of a low-level `Communicator.send/recv` virtual base, swapped via `shared_ptr<Communicator>` at construction.
+
+### Why UCXX day-1 (not NIXL)
+
+| Property | NIXL | UCXX tag-matching |
+|---|---|---|
+| Adapter LOC | ~600 | ~250-400 (with bounce buffer) |
+| Bounce buffer needed | Yes | Yes — same rationale (cuCascade allocator, see [Bounce Buffer](#bounce-buffer-orthogonal-helper-driven-by-cucascades-allocator)) |
+| Rust FFI on hot path | Yes (gRPC client + server callbacks) | **No** (UCX active messages are in-band, all C++) |
+| Memory registration burden | Explicit `registerMem` | Explicit `memMap` |
+| Control plane for size discovery | gRPC `ExchangeMetadata` over Rust FFI | UCX active messages, in-band |
+| STRING column wire format | At-risk (NIXL RDMA-writes cudf offsets, known to corrupt) | Safe (different wire format) |
+| Industry validation | Limited | Strong (rapidsmpf, dask-cuda, all surveyed GPU shuffle systems) |
+
+UCXX day-1 wins on adapter simplicity and eliminates the Rust-FFI hot path. NIXL day-2 then validates the abstraction's compatibility with the explicit-metadata-RPC pattern.
+
+### End-to-end layout
 
 ```mermaid
 graph TB
     subgraph rust["Sirius Backend (Rust)"]
         PT["Plan Translator\n(Doris/StarRocks TPlan\n→ Substrait plan)"]
-        TC["tonic gRPC Client\n(ExchangeMetadata,\nTransferComplete)"]
-        TS["tonic gRPC Server\n→ FFI into C++:\nreserve_recv_buffer()\ningest_transfer()"]
     end
 
     subgraph core["Sirius Core (C++)"]
-        GPU["GPU Pipeline Executor\noperators → exchange_partition (sink)"]
-        GPU -->|publish| REPO["shared_data_repo\n(per-partition)"]
-        REPO -->|"task_creator\nschedules"| COMM
-
-        subgraph COMM["Communication Executor"]
-            ML["Manager Loop\n(bounce buffer sub-alloc)"] -->|dispatch| WP["Worker Pool"]
+        subgraph orch["Orchestrator"]
+            GPU["GPU Pipeline Executor\noperators → exchange_partition (sink)"]
+            REPO_S["per-partition data_repo\n(sender side)"]
+            CE["Communication Executor\n(manager loop + worker pool)"]
+            REPO_R["per-partition data_repo\n(receiver side)"]
+            BS["batch_subscriber daemons\n(2-4 threads)"]
         end
 
-        WP -->|"Phase 1: pack into bounce buffer"| WP
-        WP -->|"Phase 3: RDMA transfer"| NIXL_CPP["NIXL C++ API\n(direct call)"]
+        subgraph L1["Layer 1: streaming API"]
+            BP["batch_publisher"]
+            BSI["batch_subscriber"]
+        end
+
+        subgraph L2["Layer 2: Communicator"]
+            UCXX_C["ucxx_communicator\n(point_to_point_communicator)"]
+        end
+
+        subgraph helper["Bounce-buffer helper"]
+            EBR["exchange_buffer_resource"]
+        end
     end
 
-    PT -->|"Substrait plan\n(FFI)"| GPU
-    WP -->|"Phase 2: send metadata\nPhase 4: send complete\n(FFI)"| TC
-    TS -->|"FFI"| core
+    PT -->|"Substrait plan (FFI)"| GPU
+    GPU --> REPO_S --> CE
+    CE -->|publish| BP --> UCXX_C
+    UCXX_C -.composes.-> EBR
+    BS --> BSI --> UCXX_C
+    BS --> REPO_R
 ```
 
+The Rust backend handles plan translation only; the data path stays in Sirius Core with no Rust FFI on the hot path. UCX active messages handle size discovery in-band.
+
+The orchestrator (everything in `core` except `ucxx_communicator` and `exchange_buffer_resource`) **never imports `ucxx.h` or any transport-specific header**. Adding NIXL day-2 is a new `nixl_communicator` deriving from `point_to_point_communicator`; no other code changes.
+
+### Component ownership
+
+| Component | Layer | Location | Notes |
+|---|---|---|---|
+| `batch_publisher` / `batch_subscriber` (interfaces) | 1 | `src/include/pipeline/` | |
+| `communicator_batch_publisher` (impl) | 1 | `src/pipeline/` | wraps any `point_to_point_communicator` |
+| `communicator_batch_subscriber` (impl) | 1 | `src/pipeline/` | wraps any `point_to_point_communicator` |
+| `communicator` (abstract base) | 2 | `src/include/transport/communicator.hpp` | lifecycle + peer enumeration only |
+| `point_to_point_communicator` (abstract child) | 2 | `src/include/transport/point_to_point_communicator.hpp` | operational interface for shuffle |
+| `ucxx_communicator` (impl) | 2 | `src/transport/ucxx/` | **Day-1 real backend**; derives from `point_to_point_communicator`; uses UCXX C++ API directly; no Rust FFI |
+| `single_communicator` (impl) | 2 | `src/transport/single/` | Day-1 testing seam; derives from `point_to_point_communicator` |
+| `nixl_communicator` (impl) | 2 | `src/transport/nixl/` | Future — derives from `point_to_point_communicator` |
+| `exchange_buffer_resource` | helper | `src/include/transport/exchange_buffer_resource.hpp` | composed with point-to-point communicators that register explicitly |
+| `communication_executor` | exec | `src/include/pipeline/communication_executor.hpp` | uses `batch_publisher`, never imports `ucxx.h` |
+| `communication_task` | exec | `src/include/pipeline/communication_task.hpp` | |
+| `sirius_physical_exchange_partition` | op | `src/include/op/sirius_physical_exchange_partition.hpp` | |
+| UCXX | — | pixi/conda environment | build dependency |
+
+## Layer 1: data_batch Streaming API (orchestrator-facing)
+
+The orchestrator publishes packed `data_batch` instances to remote peers and consumes incoming batches as if they were locally produced. It does not see registration, transports, peers, or tags — those are entirely Layer 2 concerns.
+
+```cpp
+namespace sirius::pipeline {
+
+// Sender side — communication_task calls publish() per partition per batch.
+class batch_publisher {
+ public:
+  virtual ~batch_publisher() = default;
+
+  // Publish a data_batch to a destination peer for a partition.
+  // Implementation owns: packing, staging, control plane, transport call,
+  // and lifetime of the batch until the receiver acknowledges.
+  // Future completes when the remote receiver has the data in its
+  // data_repository (i.e., downstream is unblocked).
+  virtual std::future<void> publish(
+    std::shared_ptr<cucascade::data_batch> batch,
+    peer_id dst_peer,
+    int32_t partition_id) = 0;
+
+  virtual void shutdown() = 0;
+};
+
+// Receiver side — runs subscriber daemons. Each incoming batch lands in the
+// existing data_repository for the partition; the consumer operator
+// pops it via pop_data_batch() exactly like a local batch.
+class batch_subscriber {
+ public:
+  virtual ~batch_subscriber() = default;
+
+  virtual void start(cucascade::data_repository_manager& repo_manager) = 0;
+  virtual void shutdown() = 0;
+};
+
+}  // namespace sirius::pipeline
 ```
-TIME ═══> [ GPU compute+partition batch1 ][ GPU compute+partition batch2 ]
-                  [ staging+RDMA batch1  ][ staging+RDMA batch2  ]
-                          ^^^ OVERLAPPED ^^^
+
+Day-1 implementations (`communicator_batch_publisher`, `communicator_batch_subscriber`) delegate to a `point_to_point_communicator`. The streaming API is shaped for point-to-point shuffle; orchestrator shapes for other patterns (if and when a use case requires them) would be added as separate Layer-1 surfaces, not by extending `batch_publisher`.
+
+The two sides have asymmetric ownership of their threading. The receiver-side worker pool — the **subscriber daemons** — is owned by `batch_subscriber` and described in the following subsection. The sender-side worker pool is owned by `communication_executor`, which sits in the Sirius task-executor framework rather than in Layer 1; see [Pipeline integration → communication_executor](#communication_executor) for that side, and [Composition flows → Sender path](#sender-path-ucxx-day-1) for the runtime loop.
+
+**Why this is the right level**: the local pipeline pattern is `producer → push_data_batch(port, batch) → repo.add_data_batch(batch) → CV notify → consumer pop_data_batch`. The remote case looks identical end-to-end: a remote partition arrives, the subscriber calls `repo.add_data_batch(batch)`, CV notifies the local consumer.
+
+### Subscriber daemons
+
+`batch_subscriber::start()` spawns a small pool of long-running threads — the **subscriber daemons** — that pull inbound transfers off the wire and land them as `data_batch` instances in the `data_repository`. They are the receiver-side analog of the sender's [`communication_executor`](#communication_executor) workers.
+
+The receive loop:
+
+```cpp
+while (running) {
+  auto msg = pp_communicator.exchange_metadata();   // blocks for next header
+  if (!msg) break;                                   // shutdown
+  comm_buffer buf = exchange_buffer_resource.try_allocate(msg->size);
+  auto fut = pp_communicator.recv(buf, msg->src, msg->tag);
+  fut.wait();
+  auto batch = unpack(buf);                          // cudf::unpack
+  repo_manager.repository_for(partition_id).add_data_batch(batch);
+}
 ```
 
-### Component Ownership
+#### Why pull-style with daemons
 
-| Component | Location | Notes |
-|-----------|----------|-------|
-| `sirius_physical_exchange_partition` | Sirius Core (C++) | New pipeline operator for hash partitioning + pack |
-| `communication_executor` | Sirius Core (C++) | New sender-side executor (manager loop + worker pool) |
-| `communication_task` | Sirius Core (C++) | New per-partition transfer task |
-| NIXL agent (direct C++ calls) | Sirius Core (C++) | New C++ wrapper — NIXL is a native C++ library |
-| Bounce buffers (send + recv) | Sirius Core (C++) | Pre-allocated from cuCascade (GPU or HOST tier), pre-registered with NIXL at startup, bump-allocated per transfer |
-| Receiver C API | Sirius Core (C++) | New `extern "C"` functions for reserve + ingest |
-| Hash partitioning | Sirius Core (C++) | Moved from result_collector post-processing to pipeline operator |
-| gRPC client (sender) | Sirius Backend (Rust) | Stays — tonic client, called from C++ via FFI |
-| gRPC server (receiver) | Sirius Backend (Rust) | Stays — tonic server, handlers FFI into C++ |
-| NIXL Rust bindings (`nixl_sys`) | Sirius Backend (Rust) | **Removed** — C++ calls NIXL directly |
-| `nixl_exchange.rs` | Sirius Backend (Rust) | **Removed** — NIXL calls move to C++ |
-| `nixl_integration.rs` | Sirius Backend (Rust) | **Refactored** — orchestration moves to C++; gRPC wrappers remain |
-| `nixl_service.rs` | Sirius Backend (Rust) | **Simplified** — handlers become thin FFI shims into C++ |
-| `gpu_staging_buffer.rs` | Sirius Backend (Rust) | **Removed** — cuCascade replaces Rust bump allocator |
-| `sirius_exchange_c_api.cpp` | Sirius Core (C++) | **Replaced** — old capture API replaced by new receiver C API |
-| Exchange code in `result_collector` | Sirius Core (C++) | **Removed** — partitioning moves to exchange_partition operator |
-| Fragment execution + plan translation | Sirius Backend (Rust) | Unchanged — receives Doris/StarRocks TPlan, translates to Substrait plan, dispatches to C++ engine via FFI |
-| bRPC exchange | Sirius Backend (Rust) | Unchanged — remains as CPU fallback path |
+`exchange_metadata()` and `recv()` are orchestrator-facing pull operations on the `point_to_point_communicator`; **someone has to call them**. The daemons are that someone.
 
-## Sender Side: `communication_executor`
+A push-style alternative (Communicator invokes a registered callback on data arrival, no daemon) was considered and rejected:
 
-### Class Design
+- The callback would run on the transport's internal thread — UCX progress thread (single-threaded, shared across all transfers).
+- Doing `cudf::unpack` and `data_repository.add_data_batch` inline on those threads stalls transport progress.
+- Backpressure under memory pressure becomes awkward — the transport thread blocks until the repo accepts the batch.
 
-**Files:** `src/include/pipeline/communication_executor.hpp`, `src/pipeline/communication_executor.cpp`
+The pull pattern matches the local pipeline pattern (consumer operators pop from `data_repository` on their own threads). The daemon is the remote analog of any other consumer thread. `rapidsmpf` uses the same pull pattern.
 
-Extends `itask_executor` following the same pattern as `gpu_pipeline_executor`:
+#### Lifecycle and pool sizing
+
+- **Spawned** by `batch_subscriber::start()` during `SiriusContext::initialize()`, after the communicator is constructed.
+- **Runs** for the lifetime of `SiriusContext`. Multiplexed across all queries; demuxed by `tag` (which encodes `query_id`).
+- **Shut down** via `batch_subscriber::shutdown()`. The communicator's `shutdown()` causes `exchange_metadata()` to return `nullopt`; daemon loops exit; threads join.
+- **Pool size** default 2-4 threads, configurable. A pool runs `(exchange_metadata → recv → unpack → push)` pipelines in parallel sharing one Communicator. Demultiplexing by `(src, tag)` is what makes parallel daemons safe.
+
+#### Daemon overhead
+
+- **Threads**: 2–4 daemon threads.
+- **Per-transfer latency**: ~2 µs thread-handoff. Sub-1% on a 1 ms partition transfer.
+- **Memory**: one in-process queue holding incoming-message headers (~32 bytes per entry).
+
+## Layer 2: Communicator base + current child (transport-facing)
+
+An abstract base plus its current child. The base is thin and captures what's universal across transports; the child captures the operational interface for streaming shuffle.
+
+### Abstract base — `communicator`
+
+```cpp
+namespace sirius::transport {
+
+using rank_t = int32_t;
+using tag_t  = uint64_t;  // encodes (query_id, partition_id, sender_rank)
+
+enum class memory_kind { device, host_pinned };
+
+struct comm_buffer {
+  void* ptr;
+  size_t size;
+  memory_kind kind;
+  int device_id;  // -1 for host
+};
+
+struct endpoint {
+  std::string host;
+  uint16_t    port;
+  rank_t      rank;
+};
+
+class transfer_future {
+ public:
+  virtual ~transfer_future() = default;
+  virtual bool poll() = 0;            // non-blocking; true = done
+  virtual void wait() = 0;            // blocks until done
+  virtual std::error_code error() const = 0;
+};
+
+// Generic and minimal: lifecycle + peer enumeration. No transfer methods.
+class communicator {
+ public:
+  virtual ~communicator() = default;
+
+  virtual void startup(rank_t local_rank,
+                       std::vector<endpoint> peers) = 0;
+  virtual void shutdown() = 0;
+
+  virtual rank_t local_rank() const = 0;
+  virtual size_t world_size() const = 0;
+
+  // Diagnostic: e.g., "ucxx", "single", "nixl".
+  virtual std::string_view name() const = 0;
+};
+
+}  // namespace sirius::transport
+```
+
+The base is intentionally **thin**. It captures only what every transport has in common: lifecycle, peer enumeration, diagnostic identity.
+
+#### Why the abstract base earns its keep
+
+1. **Documents conceptual unity.** Every transport has lifecycle and a notion of "world." Encoding that in the type system is honest.
+2. **Uniform shutdown.** `SiriusContext` can hold a `vector<unique_ptr<communicator>>` for clean teardown via one shutdown loop.
+3. **Diagnostics / introspection.** Logging, metrics, and runtime configuration display can iterate over all active communicators uniformly.
+4. **Future-proofing.** If a future transport category requires an operational shape that doesn't fit `point_to_point_communicator` (e.g., barrier-aligned, stream-coupled, or one-sided primitives), it can slot in as a sibling without restructuring orchestrator code.
+
+What the base does **not** do:
+
+- Define a `transfer()` method or any operational primitive — that would over-unify.
+- Assume memory registration semantics. Each child decides — `point_to_point_communicator` impls register per buffer (e.g., UCXX `memMap`); future siblings may register at communicator scope.
+- Carry transfer futures or message types in operational signatures — those are operationally-shaped and live on the children.
+
+### Day-1 child — `point_to_point_communicator`
+
+The operational interface for shuffle.
+
+```cpp
+namespace sirius::transport {
+
+struct incoming_message {
+  rank_t  src;
+  tag_t   tag;
+  size_t  size;          // declared; receiver allocates accordingly
+};
+
+class point_to_point_communicator : public communicator {
+ public:
+  virtual std::unique_ptr<transfer_future>
+  send(comm_buffer src, rank_t dst, tag_t tag) = 0;
+
+  // Receiver-side metadata exchange — block until the next incoming message
+  // header arrives. Returns (src, tag, size) so the caller can allocate a
+  // correctly-sized buffer. Returns nullopt on shutdown.
+  // See "What is a valid point-to-point Communicator?" below for the contract.
+  virtual std::optional<incoming_message> exchange_metadata() = 0;
+
+  virtual std::unique_ptr<transfer_future>
+  recv(comm_buffer dst, rank_t src, tag_t tag) = 0;
+};
+
+}  // namespace sirius::transport
+```
+
+**Selection**: factory `make_point_to_point_communicator(config)` returns `unique_ptr<point_to_point_communicator>` based on `exchange.transport: ucxx | single`. The communication_executor receives it at construction; it never imports `ucxx.h` or any transport-specific header.
+
+### What is a valid point-to-point Communicator?
+
+The `point_to_point_communicator` interface is more than a set of method signatures — it is a **contract** about what every point-to-point transport must do. The non-trivial constraint is **per-message size discovery on the receiver side**.
+
+The orchestrator does not know incoming partition sizes ahead of time (partitions are irregular per-peer per-query, depending on upstream pipeline runtime data). The receiver-side flow is therefore split into two steps:
+
+1. `exchange_metadata()` — block until the next message header arrives. Header carries `(src, tag, size)`. **No payload yet.**
+2. Subscriber allocates `buf` of `msg.size` bytes from the local `memory_space`.
+3. `recv(buf, src, tag)` — land the actual payload into the allocated buffer.
+
+**Every valid `point_to_point_communicator` MUST guarantee:**
+
+- **Size discovery before payload transfer.** `exchange_metadata()` returns the size; `recv()` lands the payload into a caller-provided buffer of that size. The wire-level mechanism is implementation-specific.
+- **Tolerance of delay between `exchange_metadata()` and `recv()`.** The orchestrator may take time to allocate. Implementations may need to park senders or pre-stage data in the meantime.
+- **Demultiplexing by `(src, tag)`.** Tags are 64-bit and encode `(query_id, partition_id, sender_rank)`. A `recv(buf, src, tag)` call must land the payload of the matching message, not any other.
+- **Clean shutdown.** `exchange_metadata()` returns `nullopt`; any pending `recv()` futures resolve with an error.
+
+### Concrete implementations
+
+`point_to_point_communicator` implementations:
+
+| Communicator | Day 1? | How `exchange_metadata` works | How `send`/`recv` works |
+|---|---|---|---|
+| `ucxx_communicator` (tag-matching) | **Yes (real)** | UCX active messages: receiver pre-posts an AM handler at startup; sender prepends a small AM with `(tag, size)` before `tag_send`. The AM handler enqueues the header. **No gRPC, no Rust FFI.** | `send`: bounce-buffer lease (UCX-registered via `memMap`) + `amSend(size_announce)` + `tagSend(payload)`. `recv`: bounce-buffer lease + `tagRecv(buf, src, tag)`. UCX matches by tag; rendezvous protocol uses one-sided RDMA on the wire for large messages. |
+| `single_communicator` | **Yes (test)** | Same-process queue: `send()` pushes `(buf, src, tag, size)`; `exchange_metadata()` peeks the next entry to surface the header. No RPC, no parking. | `send` pushes onto in-process queue keyed by dst rank. `recv` `cudaMemcpyAsync`s the staged buffer into the caller-provided buffer. |
+| `nixl_communicator` (future) | Future | Internal gRPC server receives `ExchangeMetadata` RPC carrying `tag` + `size`; pushes header into incoming queue and **parks the gRPC handler on a promise indexed by tag**. Requires Rust FFI for tonic gRPC. | `send`: bounce-buffer lease + gRPC `ExchangeMetadata` (Rust FFI) for dst addr + NIXL `postXferReq` + `getXferStatus` polling + final `TransferComplete` RPC. `recv`: resolves parked handler with buffer addr + recv NIXL metadata. |
+| `ucxx_rma_communicator` (future) | Future | gRPC `ExchangeMetadata` RPC mirroring NIXL. Same parking-promise pattern. | `send` issues `memPut` for one-sided RDMA WRITE; `recv` polls completion. Memory registration explicit, with the same bounce buffer. |
+
+### Tag matching at two layers
+
+Even `nixl_communicator` does tag matching, but at a different layer than UCX. The "tag" in the `point_to_point_communicator` interface serves as a **demultiplexing key** for concurrent in-flight transfers:
+
+- Multiple `ExchangeMetadata`-equivalent events can be in flight at once, parked at different promises.
+- Multiple subscriber daemons can call `recv(buf, src, tag)` concurrently.
+- The communicator looks up the right parked promise / pre-posted recv by tag.
+
+For NIXL this happens in the shim layer (gRPC server's parking-promise map). For UCX tag-matching, UCX library itself does it at the transport. The orchestrator-facing API is the same.
+
+## Bounce Buffer (orthogonal helper, driven by cuCascade's allocator)
+
+A bounce buffer is required when **all three** of the following are true for a transport:
+
+1. The transport's API requires the caller to register memory before each transfer (rather than registering implicitly or once at communicator setup).
+2. Each registration is **expensive** — kernel-level page pinning, RDMA key creation, agent locking. Easily >100 µs per call.
+3. The transport's internal caches don't catch the memory we actually use (RMM's `cuda_async_memory_resource`, i.e. `cudaMallocAsync`).
+
+For Sirius today, condition (3) holds for any UCX-backed transport because UCX classifies `cudaMallocAsync` pointers as `UCS_MEMORY_TYPE_CUDA_MANAGED` (`cuda_copy_md.c` lines 658-668). This classification feeds **both** UCX rcache and `MEMTYPE_REG_WHOLE_ALLOC_TYPES`. Neither cache kicks in.
+
+**The bounce buffer is therefore needed for any point-to-point transport that registers buffers explicitly — UCXX (tag-matching), NIXL, UCXX one-sided RMA — as long as cuCascade uses `cuda_async_memory_resource`.**
+
+| Communicator | Day 1? | Explicit registration | Pool-level cache catches RMM-async | Needs bounce buffer |
+|---|---|---|---|---|
+| `ucxx_communicator` (tag-matching) | **Yes (real)** | Yes (`memMap`) | No | **Yes** |
+| `single_communicator` | **Yes (test)** | No (in-process `cudaMemcpyAsync`) | N/A | No |
+| `nixl_communicator` (future) | Future | Yes (`registerMem`) | No | Yes |
+| `ucxx_rma_communicator` (future) | Future | Yes (`memMap`) | No | Yes |
+
+```cpp
+namespace sirius::transport {
+
+class exchange_buffer_resource {
+ public:
+  // memory_space* selects GPU (Tier::GPU) vs HOST (Tier::HOST) — config-driven.
+  exchange_buffer_resource(cucascade::memory::memory_space* space,
+                           size_t size_bytes);
+
+  // Bump-alloc lease from the pre-registered region.
+  std::optional<bounce_buffer_lease> try_allocate(size_t size);
+};
+
+}  // namespace sirius::transport
+```
+
+`ucxx_communicator` constructor takes `exchange_buffer_resource*` and registers the buffer with UCX once at startup via `memMap`. `single_communicator` takes nothing.
+
+### GPU vs Host placement
+
+The bounce buffer can reside in GPU memory or host-pinned memory. The optimal choice depends on hardware:
+
+| System | Recommended | Why |
+|---|---|---|
+| **NVL72 / GB200** | GPU (`vram`) | NVSwitch provides 1.8 TB/s GPU-to-GPU. GPUDirect RDMA sends directly from GPU memory via dedicated per-GPU NIC. Copying to host wastes bandwidth. |
+| **A100 / H100** | GPU (`vram`) | Large BAR1 (16+ GB) supports GPUDirect RDMA for large registrations. GPU-to-NIC path bypasses CPU entirely. |
+| **T4** | Host (`dram`) | BAR1 is only 256 MB — too small for large GPU RDMA registrations. Host-pinned memory avoids the BAR1 constraint. |
+| **L4** | Host (`dram`) | PCIe-only, constrained BAR1. Same rationale as T4. |
+| **No RDMA NIC** | Host (`dram`) | Must stage through host for TCP/socket transport. |
+
+Placement is config-driven via `memory_space*` (see [Configuration](#configuration)).
+
+### Lifecycle
+
+```mermaid
+flowchart TD
+    INIT["SiriusContext::initialize()"]
+    INIT --> CHECK{exchange.bounce_buffer.location?}
+
+    CHECK -->|vram| GPU_ALLOC["cuCascade GPU tier\nmemory_space→make_reservation(size)"]
+    CHECK -->|dram| HOST_ALLOC["cuCascade HOST tier\nmemory_space→make_reservation(size)"]
+
+    GPU_ALLOC --> GPU_REG["ucxx::Endpoint::memMap(ptr, MEMTYPE_CUDA)\n+ cache UCX memh"]
+    HOST_ALLOC --> HOST_REG["ucxx::Endpoint::memMap(ptr, MEMTYPE_HOST)\n+ cache UCX memh"]
+
+    GPU_REG --> READY["Bounce buffer ready\n(send + recv)"]
+    HOST_REG --> READY
+
+    READY -->|per-transfer| BUMP["Bump allocator sub-allocates\n(mutex + offset increment,\nno cuCascade calls)"]
+    BUMP -->|all leases released| RESET["Offset resets to 0"]
+    RESET --> BUMP
+
+    READY -->|SiriusContext::terminate| CLEANUP["Deregister from UCX\nRelease cuCascade reservation"]
+```
+
+The cuCascade reservation is held for the process lifetime and is **not reclaimable** by the downgrade executor.
+
+### Sender and receiver bounce buffers
+
+`ucxx_communicator` allocates **two** bounce buffers at startup — one for sending and one for receiving:
+
+| Buffer | Purpose | Used by |
+|---|---|---|
+| **Send bounce buffer** | Holds packed data before transfer | `communicator_batch_publisher` packing path |
+| **Recv bounce buffer** | Destination for incoming transfers | Subscriber daemons via `exchange_buffer_resource.try_allocate` |
+
+Both are pre-registered with UCX at startup. UCX memh handles are cached once and reused for all transfers.
+
+### Bump allocator
+
+A single bounce buffer is shared across all concurrent transfers. To support multiple concurrent leases, sub-allocation uses a bump allocator — independent of cuCascade's reservation system.
+
+```mermaid
+block-beta
+    columns 6
+    block:header:6
+        columns 1
+        h["Bounce Buffer (4 GB) — 1 cuCascade reservation, 1 UCX memMap at startup"]
+    end
+    w1["Lease 1\n(transfer in-flight)"]:1
+    w2["Lease 2\n(packing)"]:1
+    w3["Lease 3\n(transfer in-flight)"]:1
+    free["Free"]:3
+
+    style w1 fill:#4a9,color:#fff
+    style w2 fill:#49a,color:#fff
+    style w3 fill:#4a9,color:#fff
+    style free fill:#ddd,color:#333
+```
+
+- 256-byte aligned sub-allocations, managed by bump pointer (mutex + offset increment).
+- Epoch-based reset: when all active leases release → offset resets to 0.
+- Overflow: fall back to per-transfer cuCascade reservation + UCX `memMap` (slow path).
+
+### Future: dropping the bounce buffer
+
+If cuCascade is migrated to `pool_memory_resource{cuda_memory_resource}` (synchronous `cudaMalloc`-backed), UCX classifies allocations correctly as `UCS_MEMORY_TYPE_CUDA`, rcache amortizes registrations across same-pool allocations, and the bounce buffer becomes unnecessary. That's a separate cuCascade-level change, not a transport-level decision.
+
+## Composition flows
+
+### Sender path (UCXX day-1)
+
+```mermaid
+sequenceDiagram
+    participant CT as communication_task
+    participant BP as batch_publisher
+    participant EBR as exchange_buffer_resource
+    participant UC as ucxx_communicator
+    participant UCX as UCXX C++ API
+    participant RX as Remote receiver
+
+    CT->>BP: publish(batch, dst, partition_id)
+    BP->>EBR: try_allocate(packed_bytes)
+    EBR-->>BP: lease (UCX-registered)
+    BP->>BP: cudf::chunked_pack into lease
+    BP->>UC: send(buf, dst_rank, tag)
+    UC->>UCX: amSend(AM_SIZE_ANNOUNCE, {tag, size})
+    UCX->>RX: AM (in-band)
+    UC->>UCX: tagSend(buf, size, tag)
+    UCX->>RX: payload (rendezvous → RDMA WRITE for large messages)
+    UC-->>BP: transfer_future
+    loop poll
+        BP->>UCX: Request::isCompleted
+    end
+    BP->>EBR: release lease
+    BP-->>CT: future complete
+```
+
+#### Step-by-step
+
+1. **Task arrival.** `task_creator` detects a partition's data is ready in an exchange data_repository (populated by `sirius_physical_exchange_partition`), creates a `communication_task(batch, dst_peer, partition_id)`, and enqueues it on `communication_executor`.
+2. **Worker dispatch.** The manager loop reserves a worker slot, pops the task, dispatches the worker function on a thread.
+3. **`publish()` invoked.** The worker calls `_publisher->publish(batch, dst_peer, partition_id)`. The publisher: (a) calls `EBR.try_allocate(packed_bytes)` for a sender-side bounce-buffer lease, (b) runs `cudf::chunked_pack(batch)` into the lease, (c) calls `ucxx_communicator::send(buf, dst_rank, tag)` where `tag = encode(query_id, partition_id, sender_rank)`, (d) returns an outer future to the worker.
+4. **`ucxx_communicator::send`** issues two UCX operations: `amSend(AM_SIZE_ANNOUNCE, {tag, size})` — a small active message announcing the upcoming payload (the receiver's pre-posted AM handler enqueues this for `exchange_metadata()` to surface) — followed by `tagSend(buf, size, tag)` for the payload, which returns a `ucxx::Request` wrapped in a `transfer_future`.
+5. **Worker blocks.** The worker calls `outer_fut.wait()`.
+6. **Rendezvous executes.** UCX progress (driven by the UCXX progress thread) advances the rendezvous protocol once the receiver posts the matching `tagRecv`: memory keys are exchanged, and the receiver-side NIC RDMA-writes the payload directly into the receiver's bounce-buffer lease.
+7. **UCX request completes.** Once the rendezvous handshake is done and bytes have landed at the receiver, UCX marks `Request::isCompleted = true`. The publisher releases the sender's bounce-buffer lease and signals the outer future.
+8. **Worker unblocks.** `outer_fut.wait()` returns. Worker calls `mark_task_complete()`, slot is freed, manager loop moves on.
+
+#### Pseudocode
+
+Two cooperating threads — a manager thread and a pool of worker threads. Both are permanently in a loop blocked at well-defined points.
+
+```cpp
+// Manager thread (one per communication_executor)
+void communication_executor::manager_loop() {
+  while (_running) {
+    auto slot = _bounded_pool->reserve();   // BLOCKS until a worker slot is free
+    auto task = _task_queue.pop();          // BLOCKS until task_creator enqueues a task
+    if (!task) break;                       // shutdown sentinel
+
+    // Lightweight bookkeeping — no transport touch, no GPU touch.
+    estimate_costs(*task);
+    attach_local_state(*task);
+
+    _bounded_pool->dispatch(slot, [this, task = std::move(task)]() mutable {
+      worker_fn(std::move(task));
+    });
+  }
+}
+
+// Worker thread (one of N in the pool — transport-agnostic)
+void communication_executor::worker_fn(std::unique_ptr<communication_task> task) {
+  auto fut = _publisher->publish(task->batch, task->dst_peer, task->partition_id);
+  try {
+    fut.get();                              // BLOCKS until rendezvous done + lease released
+    mark_task_complete(*task);
+  } catch (const transport_error& e) {
+    handle_retry(std::move(task), e);       // re-enqueue with backoff
+  }
+}
+```
+
+Inside `publish()` (Layer 1 impl):
+
+```cpp
+std::future<void> communicator_batch_publisher::publish(
+    std::shared_ptr<cucascade::data_batch> batch,
+    peer_id dst,
+    int32_t partition_id) {
+  auto promise   = std::make_shared<std::promise<void>>();
+  auto outer_fut = promise->get_future();
+
+  auto lease = _ebr->try_allocate(estimated_packed_size(batch));
+  cudf::chunked_pack(batch->view(), lease.ptr());
+
+  auto tag       = encode_tag(_query_id, partition_id, _sender_rank);
+  auto inner_fut = _pp_comm->send({lease.ptr(), lease.size()}, dst.rank, tag);
+
+  // Hook the inner future's completion to fulfill the outer one. The callback
+  // runs on whichever thread fulfills inner_fut — typically the UCX progress thread.
+  inner_fut->on_complete(
+    [promise, lease = std::move(lease)](std::error_code ec) mutable {
+      lease.release();                      // bounce-buffer lease back to pool
+      if (ec) promise->set_exception(make_exception(ec));
+      else    promise->set_value();
+    });
+
+  return outer_fut;
+}
+```
+
+Inside `send()` (Layer 2 impl, UCXX):
+
+```cpp
+std::unique_ptr<transfer_future>
+ucxx_communicator::send(comm_buffer src, rank_t dst, tag_t tag) {
+  auto& ep = _endpoints[dst];
+
+  size_announce_header hdr{tag, src.size};
+  ep.amSend(AM_SIZE_ANNOUNCE, &hdr, sizeof(hdr));     // doorbell — no payload
+
+  auto req = ep.tagSend(src.ptr, src.size, tag);      // posts payload, returns ucxx::Request
+  return std::make_unique<ucxx_transfer_future>(std::move(req));
+}
+```
+
+Threads, blocking points, and how each gets unstuck:
+
+| Thread | Blocked at | Unstuck by |
+|---|---|---|
+| Manager | `_bounded_pool->reserve()` | A worker finishing and releasing its slot |
+| Manager | `_task_queue.pop()` | `task_creator` enqueuing a task (CV-notify on the queue) |
+| Worker | `outer_fut.get()` | UCX progress thread firing `inner_fut->on_complete` → `promise.set_value()` → CV-notify |
+| UCX progress (per UCP worker) | nothing — runs `ucp_worker_progress` in a tight loop forever | n/a |
+
+#### Futures in flight
+
+Three futures exist per transfer — two on the sender, one on the receiver:
+
+| # | Future | Type | Created by | Waited on by | Resolves when |
+|---|---|---|---|---|---|
+| 1 | Sender inner | `transfer_future` (Layer 2) | `ucxx_communicator::send()` | Publisher, via UCX progress callback | UCX rendezvous completes — bytes at receiver's bounce buffer |
+| 2 | Sender outer | `std::future<void>` (Layer 1) | `batch_publisher::publish()` | `communication_executor` worker thread | Inner future done + sender lease released + error packaged |
+| 3 | Receiver | `transfer_future` (Layer 2) | `ucxx_communicator::recv()` | Subscriber daemon thread | UCX matches + payload landed in receiver's lease |
+
+The worker thread sees only the **sender outer** future; it never touches `transfer_future` or `ucxx::Request` directly. That's the seam between Layer 1 and Layer 2 — the worker is transport-agnostic, the inner future is transport-specific. The hop from inner to outer is implemented as a completion callback registered with the UCX progress thread: when progress sees `Request::isCompleted`, it fulfills the outer promise. No spinning thread per transfer.
+
+Futures 1 and 3 are paired by the UCX rendezvous protocol: they resolve at the same wire moment (the handshake doesn't complete until both sides are present).
+
+The receiver has no Layer-1 outer future because the daemon thread does all the post-transfer work — unpack, release, `add_data_batch` — inline in its loop body. There's no async handoff, so wrapping it in an outer future would be redundant.
+
+#### Sender completion semantics
+
+Step 7's "done" means **bytes are in the receiver's bounce buffer** — UCX rendezvous has fully completed at the wire level. It does *not* mean the receiver's daemon has called `cudf::unpack` and `add_data_batch`. Those happen asynchronously on the daemon thread and are not signaled back to the sender. End-to-end "data is in repo" semantics would require an extra ACK message; the design intentionally omits it (extra round-trip + longer bounce-buffer lease hold = worse throughput).
+
+Backpressure works without an explicit ACK because of the receiver-side bounce-buffer pool: if the receiver can't allocate (pool exhausted), the daemon can't post `tagRecv`, the rendezvous stalls, and the sender's UCX request stays pending. The worker thread sits in `outer_fut.wait()` until the receiver's pool frees up.
+
+The publisher implementation is **transport-agnostic** — it composes with any `point_to_point_communicator`. UCXX-specific behavior (active messages, tag matching) lives entirely inside `ucxx_communicator::send()`. **No Rust FFI on the hot path.**
+
+For `single_communicator`, the same `publish()` flow ends in a `send()` call that pushes onto an in-process queue — no UCX, no AM, no bounce-buffer registration.
+
+### Receiver path (UCXX day-1)
+
+```mermaid
+sequenceDiagram
+    participant S as Sender (remote)
+    participant UC as ucxx_communicator
+    participant BS as Subscriber daemon
+    participant EBR as exchange_buffer_resource
+    participant REPO as data_repository
+
+    S->>UC: AM (size_announce: tag, size)
+    UC->>UC: AM handler enqueues (src, tag, size)
+
+    BS->>UC: exchange_metadata()
+    UC-->>BS: incoming_message{src, tag, size}
+    BS->>EBR: try_allocate(size)
+    EBR-->>BS: lease (UCX-registered addr)
+    BS->>UC: recv(buf, src, tag)
+    UC->>UC: tagRecv(buf, size, tag) — UCX matches sender's tagSend
+
+    Note over S,EBR: Rendezvous protocol uses one-sided RDMA WRITE for large messages
+
+    UC-->>BS: fut.wait() returns
+    BS->>BS: cudf::unpack(buf) → data_batch
+    BS->>EBR: release lease
+    BS->>REPO: add_data_batch(batch)
+    Note over REPO: CV-notify wakes consumer operator
+```
+
+#### Step-by-step
+
+Subscriber daemons run a long-lived loop (2–4 threads). Each iteration:
+
+1. **Header arrives.** While the daemon is waiting in step 2, the sender's `amSend(AM_SIZE_ANNOUNCE)` arrives at the receiver's UCX worker. The pre-posted AM handler enqueues `(src, tag, size)`.
+2. **`exchange_metadata()` returns.** The daemon calls `pp_communicator.exchange_metadata()`, which blocks until a header is available, then returns `incoming_message{src, tag, size}`. Returns `nullopt` on shutdown.
+3. **Allocate recv buffer.** Daemon calls `EBR.try_allocate(msg.size)` for a receive-side bounce-buffer lease. If the pool is full, the daemon retries — this is the implicit backpressure point that throttles senders (see [Sender completion semantics](#sender-completion-semantics)).
+4. **Post recv.** Daemon calls `ucxx_communicator::recv(buf=lease, src, tag)`, which posts a `tagRecv` matching the sender's pending `tagSend`. Returns a `transfer_future`.
+5. **Rendezvous completes.** UCX matches the tags, exchanges memory keys, and the sender-side NIC RDMA-writes the payload into the lease. Bytes are now in receiver memory.
+6. **`recv_fut.wait()` returns.** The daemon thread unblocks.
+7. **Unpack.** Daemon calls `cudf::unpack(buf)` to materialize an owning `data_batch` from the packed columns. The unpack must produce an owning copy (deep copy out of the bounce buffer into permanent cuCascade-tier memory) so the bounce-buffer lease can be released next without dangling references.
+8. **Release lease.** Daemon returns the bounce-buffer lease to the pool. This frees a slot for the next inbound transfer — and unblocks any sender whose rendezvous was stalled on receiver-pool pressure.
+9. **Hand to repo.** Daemon calls `repo_manager.repository_for(partition_id).add_data_batch(batch)`. The CV inside the repository wakes any consumer operator blocked on `pop_data_batch`.
+10. **Loop.** Daemon goes back to step 2.
+
+#### Pseudocode
+
+A single thread type — the subscriber daemon — runs an infinite loop. 2-4 daemons share the same `_incoming_metadata` queue and CV; `notify_one` distributes work among them.
+
+```cpp
+void subscriber_daemon::run() {
+  while (_running) {
+    auto msg = _pp_comm->exchange_metadata();    // BLOCKS until a header is queued (or shutdown)
+    if (!msg) break;                              // exchange_metadata returned nullopt — shutdown
+
+    auto lease = _ebr->try_allocate(msg->size);   // may block briefly under bounce-buffer pressure
+    auto fut   = _pp_comm->recv(lease, msg->src, msg->tag);
+    fut->wait();                                  // BLOCKS until rendezvous lands bytes in lease
+
+    auto batch = cudf::unpack(lease);             // owning copy out of lease
+    lease.release();                              // lease back to pool — frees a slot for the next inbound transfer
+    _repo_manager->repository_for(msg->partition_id).add_data_batch(batch);
+  }
+}
+```
+
+Inside `exchange_metadata()` and the AM handler (Layer 2 impl, UCXX):
+
+```cpp
+std::optional<incoming_message> ucxx_communicator::exchange_metadata() {
+  std::unique_lock lk(_metadata_mutex);
+  _metadata_cv.wait(lk, [this] {
+    return !_incoming_metadata.empty() || _shutdown_requested;
+  });
+  if (_incoming_metadata.empty()) return std::nullopt;
+  auto msg = _incoming_metadata.front();
+  _incoming_metadata.pop_front();
+  return msg;
+}
+
+// Registered once at startup; fires on the UCX progress thread when an AM arrives.
+void ucxx_communicator::am_handler(const Header& header) {
+  auto [src, tag, size] = decode(header);
+  {
+    std::lock_guard lk(_metadata_mutex);
+    _incoming_metadata.push_back({src, tag, size});
+  }
+  _metadata_cv.notify_one();
+}
+```
+
+Threads, blocking points, and how each gets unstuck:
+
+| Thread | Blocked at | Unstuck by |
+|---|---|---|
+| Daemon | `exchange_metadata()` (CV on `_incoming_metadata`) | AM handler push + `cv.notify_one()` (handler runs on UCX progress) |
+| Daemon | `_ebr->try_allocate()` | Another daemon completing step "lease release" — frees a slot in the bounce-buffer pool |
+| Daemon | `recv_fut->wait()` | UCX progress thread firing the recv's completion callback → `promise.set_value()` → CV-notify |
+| UCX progress (per UCP worker) | nothing — runs `ucp_worker_progress` in a tight loop forever | n/a (also dispatches inbound AMs to `am_handler` and runs recv-future callbacks) |
+
+The structural symmetry with the sender: each side has a permanent-loop application thread (worker on sender, daemon on receiver) blocked on a CV, and a UCX progress thread silently driving completions. The asymmetry is just that the sender separates manager and worker (cuCascade reservation logic warrants the split), while the receiver fuses them into one daemon (no reservation step before posting recv — backpressure happens at `try_allocate`).
+
+The subscriber daemon is **transport-agnostic**. Whether bytes arrived via UCX rendezvous-RDMA into a pre-registered bounce buffer or via in-process `cudaMemcpyAsync` from `single_communicator`, the unpack-and-publish step is identical.
+
+## Pipeline integration
+
+### `sirius_physical_exchange_partition`
+
+**Files**: `src/include/op/sirius_physical_exchange_partition.hpp`, `src/op/sirius_physical_exchange_partition.cpp`
+
+A dedicated pipeline operator that runs hash partitioning and packing inside the GPU pipeline:
+
+- Extends `sirius_physical_operator`.
+- Registered in `sirius_physical_plan_generator` for exchange sink plans.
+- Acts as a pipeline sink (barrier), in the same shape as `sirius_physical_partition`.
+- During `execute()`: runs `cudf::hash_partition` on the input data.
+- During `sink()`: packs each partition via `cudf::pack` and publishes per-partition packed data to exchange data repositories.
+- Each partition's data repository feeds into a `communication_task` routed to `communication_executor`.
+
+Partitioning overlaps with upstream GPU compute — as batch N is being partitioned, batch N+1 can already be computing in the GPU pipeline executor.
+
+### `communication_executor`
+
+**Files**: `src/include/pipeline/communication_executor.hpp`, `src/pipeline/communication_executor.cpp`
+
+Extends `itask_executor`, following the same pattern as `gpu_pipeline_executor`. It does not know about UCX, NIXL, or bounce buffers — it composes with a `batch_publisher`:
 
 ```cpp
 class communication_executor : public sirius::parallel::itask_executor {
  public:
   explicit communication_executor(
     exec::thread_pool_config config,
-    cucascade::memory::memory_space* staging_mem_space,
+    std::unique_ptr<sirius::pipeline::batch_publisher> publisher,
     sirius::parallel::downgrade_executor* downgrade_executor = nullptr);
 
   void set_task_creator(sirius::creator::task_creator* task_creator);
@@ -147,197 +790,19 @@ class communication_executor : public sirius::parallel::itask_executor {
   absl::AnyInvocable<void() noexcept> get_per_thread_init() override;
 
  private:
-  cucascade::memory::exclusive_stream_pool _stream_pool;  // For cudf::chunked_pack
-  cucascade::memory::memory_space* _staging_mem_space;
+  std::unique_ptr<sirius::pipeline::batch_publisher> _publisher;
   sirius::parallel::downgrade_executor* _downgrade_executor{nullptr};
-  sirius::creator::task_creator* _task_creator{nullptr};
-  completion_handler* _completion_handler{nullptr};
+  // … task_creator, completion_handler, queue …
 };
 ```
 
-Key differences from `gpu_pipeline_executor`:
-- Stream pool is used **only for packing** (`cudf::chunked_pack` in Phase 1) — NIXL transfers are stream-agnostic (driven by the RDMA NIC, not GPU kernels)
-- No `task_request_publisher` — communication tasks do not compete for GPU compute slots
-- Uses a staging-dedicated `memory_space` (or a carved-out region of the GPU memory space)
-- `get_per_thread_init()` sets the CUDA device per worker thread (same as GPU executor)
+The manager loop is lightweight (reservation + dispatch only) and the worker function is transport-agnostic — for the runtime loop in detail, including blocking points and how each thread gets unstuck, see [Sender path → Pseudocode](#pseudocode). For the semantic meaning of `fut.wait()` returning, see [Sender completion semantics](#sender-completion-semantics).
 
-### Manager Loop
+Whether `_publisher` was constructed against a `ucxx_communicator` or `single_communicator` is invisible at this layer.
 
-The manager loop stays lightweight — it only reserves memory and dispatches work. This follows the same pattern as `gpu_pipeline_executor::manager_loop()` (see [Pipeline Execution](pipeline-execution.md)):
+### `communication_task`
 
-```
-while (_running):
-  1. slot = _bounded_pool->reserve()          // Block until worker slot available
-  2. task = _task_queue.pop()                  // Block until communication task queued
-  3. estimate packed_bytes from task input     // Size of cudf::chunked_pack output
-  4. lease = _send_bounce_buffer->try_allocate(packed_bytes)
-     // Bump allocator within pre-registered bounce buffer
-     // NOT a cuCascade reservation — just mutex + offset increment
-  5. if lease fails (bounce buffer full):
-       option A: block until leases are released, retry
-       option B: fall back to per-transfer cuCascade reservation + NIXL registration (slow path)
-  6. attach lease to task local state
-  7. _bounded_pool->dispatch(slot, worker_fn)  // Hand off to worker thread
-```
-
-The manager does **not** pack data — packing happens in the worker thread so the manager stays responsive for the next task. The bounce buffer sub-allocation is lightweight (bump pointer increment under a mutex) — no cuCascade reservation or NIXL registration on the per-transfer path.
-
-### Worker Thread Protocol
-
-Each worker thread executes a 4-phase transfer lifecycle:
-
-```mermaid
-sequenceDiagram
-    participant W as Worker Thread (C++)
-    participant BB as Bounce Buffer<br/>(pre-registered)
-    participant NIXL as NIXL C++ API
-    participant R as Rust tonic (FFI)
-    participant RX as Remote Receiver
-
-    Note over W,BB: Phase 1 — Pack (CUDA stream)
-    W->>BB: cudf::chunked_pack into sub-region
-    Note right of BB: GPU bounce: D2D pack<br/>Host bounce: pack + cudaMemcpyDtoH
-    W->>W: cudaStreamSynchronize
-
-    Note over W,R: Phase 2 — Metadata Exchange (FFI → Rust)
-    W->>R: sirius_exchange_send_metadata()
-    R->>RX: ExchangeMetadata gRPC
-    RX-->>R: dst addresses + NIXL metadata
-    R-->>W: response
-
-    Note over W,NIXL: Phase 3 — RDMA Transfer (C++ direct)
-    W->>NIXL: createXferReq() + postXferReq()
-    loop Poll
-        W->>NIXL: getXferStatus()
-    end
-    Note right of NIXL: NIC-driven, no GPU involved
-
-    Note over W,R: Phase 4 — Completion (FFI → Rust)
-    W->>R: sirius_exchange_send_complete()
-    R->>RX: TransferComplete gRPC
-    W->>BB: release lease (no deregistration)
-```
-
-**Key points:**
-- Only Phase 1 uses a CUDA stream. NIXL is stream-agnostic (RDMA NIC-driven).
-- No per-transfer NIXL registration — bounce buffer is pre-registered at startup.
-- NIXL (phases 1, 3) called directly from C++. gRPC (phases 2, 4) crosses FFI into Rust.
-
-### FFI Surface (C++ → Rust, sender side)
-
-New `extern "C"` functions exported by the Rust `doris-rpc` crate for the sender:
-
-```c
-// Send ExchangeMetadata gRPC and block until response.
-// Called by C++ worker thread in Phase 2.
-int sirius_exchange_send_metadata(
-    const char* dest_addr,              // Receiver gRPC endpoint
-    const sirius_exchange_metadata* req, // Buffer descriptors + NIXL metadata
-    sirius_exchange_metadata_response* resp); // Out: dst addresses + receiver NIXL meta
-
-// Send TransferComplete gRPC notification.
-// Called by C++ worker thread in Phase 4.
-int sirius_exchange_send_complete(
-    const char* dest_addr,
-    const sirius_transfer_complete* req);
-```
-
-These functions block the calling C++ thread. Since each worker thread handles one transfer at a time and the worker pool is bounded, this is acceptable — the tonic runtime handles the async gRPC underneath.
-
-### Retry Mechanism
-
-Three retry triggers, following the OOM reschedule pattern from `gpu_pipeline_task.cpp` (lines 225-312):
-
-| Trigger | Where | Behavior |
-|---------|-------|----------|
-| **Reservation failure** | Manager loop | Back off 5ms, trigger downgrade, retry. Max 10 retries per task. |
-| **Receiver NACK** | Phase 2 (metadata) | Receiver returns `status_code != 0` (insufficient memory). Re-enqueue task with exponential backoff. |
-| **RDMA failure** | Phase 3 (transfer) | NIXL transfer timeout or error. Retry with fresh metadata exchange (addresses may have changed). After N failures, fall back to bRPC CPU transfer. |
-
-Retry tracking uses the same `retry_count` + `original_task_id` pattern as `gpu_pipeline_task_local_state`.
-
-## Receiver Side
-
-### gRPC Service (Rust)
-
-The gRPC server stays in Rust as `NixlMetadataService` in `nixl_service.rs`. It continues to use tonic and the existing proto interface (`nixl_service.proto`). The handlers become thin FFI shims that delegate memory management and data ingestion to C++.
-
-### ExchangeMetadata Handler
-
-```
-1. Rust receives ExchangeMetadata gRPC request
-2. Parse buffer descriptors and sender NIXL metadata
-3. FFI into C++: sirius_exchange_reserve_recv_buffer()
-   ├── lease = _recv_bounce_buffer->try_allocate(total_recv_size)
-   ├── If lease fails (bounce buffer full):
-   │     fall back to per-transfer reservation + registration (slow path)
-   ├── Return pre-registered bounce buffer addresses (no NIXL registration)
-   └── Return pre-cached NIXL metadata through FFI
-4. Rust loads sender NIXL metadata (cached per peer)
-5. Return gRPC response with dst addresses + local NIXL metadata
-```
-
-### TransferComplete Handler
-
-```
-1. Rust receives TransferComplete gRPC notification
-2. FFI into C++: sirius_exchange_ingest_transfer()
-   ├── cudf::unpack() from bounce buffer sub-region → cuDF table
-   ├── Wrap as cucascade::data_batch (data copied out of bounce buffer)
-   ├── Push into shared_data_repository
-   ├── Release bounce buffer lease
-   └── task_creator->schedule(output_consumer)
-3. Return gRPC success response
-```
-
-### FFI Surface (Rust → C++, receiver side)
-
-New `extern "C"` functions exposed by Sirius Core:
-
-```c
-// Called by Rust on ExchangeMetadata RPC.
-// Reserves GPU memory and allocates a receive buffer.
-int sirius_exchange_reserve_recv_buffer(
-    uint64_t query_id_hi,
-    uint64_t query_id_lo,
-    int32_t node_id,
-    size_t total_size,
-    const uint8_t* packed_cudf_metadata,   // For cudf::unpack schema
-    size_t packed_cudf_metadata_size,
-    sirius_recv_buffer_info* out);         // Out: GPU addr, NIXL agent metadata
-
-// Called by Rust on TransferComplete RPC.
-// Unpacks transferred data and pushes to the data repository.
-int sirius_exchange_ingest_transfer(
-    uint64_t query_id_hi,
-    uint64_t query_id_lo,
-    int32_t node_id,
-    int32_t sender_id,
-    uint32_t num_rows,
-    const uint8_t* packed_cudf_metadata,
-    size_t packed_cudf_metadata_size);
-```
-
-## Exchange as Pipeline Operator
-
-### `sirius_physical_exchange_partition`
-
-**Files:** `src/include/op/sirius_physical_exchange_partition.hpp`, `src/op/sirius_physical_exchange_partition.cpp`
-
-Currently, hash partitioning lives in `sirius_physical_result_collector.cpp` as post-processing (lines 282-490). In the new design, this becomes a dedicated pipeline operator:
-
-- Extends `sirius_physical_operator`
-- Registered in `sirius_physical_plan_generator` for exchange sink plans
-- Acts as a pipeline sink (barrier) — similar to the existing `sirius_physical_partition` operator (`src/op/sirius_physical_partition.cpp`)
-- During `execute()`: runs `cudf::hash_partition` on the input data
-- During `sink()`: packs each partition via `cudf::pack` and publishes per-partition packed data to exchange data repositories
-- Each partition's data repository feeds into a `communication_task`
-
-This design means partitioning overlaps with upstream GPU compute — as batch N is being partitioned, batch N+1 can already be computing in the GPU pipeline executor.
-
-### Communication Task
-
-**Files:** `src/include/pipeline/communication_task.hpp`, `src/pipeline/communication_task.cpp`
+**Files**: `src/include/pipeline/communication_task.hpp`, `src/pipeline/communication_task.cpp`
 
 ```cpp
 class communication_task : public sirius::parallel::sirius_pipeline_itask {
@@ -345,264 +810,164 @@ class communication_task : public sirius::parallel::sirius_pipeline_itask {
   void execute(rmm::cuda_stream_view stream) override;
 
  private:
-  // Local state
-  std::unique_ptr<cucascade::data_batch> _packed_data;  // From exchange_partition
-  std::string _dest_addr;                                // Receiver gRPC endpoint
-  int _partition_id;
-  int _retry_count{0};
+  std::shared_ptr<cucascade::data_batch> _batch;
+  peer_id  _dst_peer;
+  int32_t  _partition_id;
+  int      _retry_count{0};
   uint64_t _original_task_id;
-  bounce_buffer_lease _bounce_lease;                     // Sub-region in pre-registered bounce buffer
-
-  // Global state (shared across tasks for same query)
-  nixl_agent* _nixl_agent;    // NIXL C++ agent handle
-  // gRPC goes through Rust FFI, no C++ channel needed
+  // Note: no bounce_buffer_lease, no transport handles — those live inside the publisher.
 };
 ```
 
-### Task Creation
+### `task_creator` integration
 
 In `task_creator` (`src/creator/task_creator.cpp`):
 
-- `task_creator` watches exchange data repositories for ready partitions
-- When a partition's data is available, creates a `communication_task`
-- One task per partition per batch (or per destination node)
-- Routes the task to `communication_executor` instead of `gpu_pipeline_executor`
-
-Data flow:
+- Watches exchange data repositories for ready partitions (populated by `sirius_physical_exchange_partition`).
+- When a partition's data is available, creates a `communication_task`.
+- Routes the task to `communication_executor` instead of `gpu_pipeline_executor`.
 
 ```mermaid
 graph LR
     GPU["GPU pipeline task"] --> EXP["exchange_partition\n(hash_partition + pack)"]
     EXP --> REPO["exchange data repos\n(per-partition)"]
     REPO -->|"task_creator\ndetects ready"| CT["communication_task"]
-    CT --> CE["communication_executor\n(bounce buffer → RDMA)"]
+    CT --> CE["communication_executor"]
+    CE -->|"publish (transport-agnostic)"| BP["batch_publisher"]
 ```
 
-## Integration Points
+### Retry mechanism
 
-| Component | File | Change |
-|-----------|------|--------|
-| `pipeline_executor` | `src/pipeline/pipeline_executor.hpp` | Add `communication_executor` alongside `_gpu_executors` |
-| `task_creator` | `src/creator/task_creator.cpp` | New branch: exchange data repo ready → create `communication_task` |
-| `completion_handler` | `src/pipeline/completion_handler.hpp` | Track per-partition per-destination completion |
-| `SiriusContext` | `src/sirius_context.cpp` | Initialize NIXL agent, allocate + register bounce buffers at startup |
-| `sirius_config` | `src/config.cpp` / `src/include/config.hpp` | New config: bounce buffer location/size, comm executor threads, retry policy |
-| `sirius_physical_plan_generator` | `src/planner/sirius_physical_plan_generator.cpp` | Register `exchange_partition` for exchange sink plans |
+Retry triggers follow the OOM reschedule pattern from `gpu_pipeline_task.cpp` (lines 225-312). All retries happen at the `communication_task` level, not inside the publisher or communicator:
 
-## Memory Architecture
+| Trigger | Where | Behavior |
+|---|---|---|
+| **Sender reservation failure** | Manager loop (sender's cuCascade reservation for staging) | Back off 5 ms, trigger downgrade, retry. Max 10 retries per task. |
+| **Transport timeout / failure** | `transfer_future.error()` after `wait()` | For UCXX day-1, this covers both genuine network failure and prolonged receiver-side bounce-buffer pressure (rendezvous never completed) — the two are indistinguishable from the sender at this layer. Retry with fresh metadata exchange. After N failures, fall back to bRPC CPU transfer. |
+| **Receiver NACK (NIXL day-2 only)** | `transfer_future.error()` after explicit NACK from receiver's `ExchangeMetadata` RPC | Receiver responded with insufficient-memory. Re-enqueue with exponential backoff. Distinguishes backpressure from hard failure (capability not available in UCXX day-1). |
 
-### Bounce Buffer Design
+UCXX day-1 has no explicit receiver-NACK channel; receiver OOM presents as transport timeout and is handled identically to a network failure. NIXL day-2 adds the explicit NACK because its `ExchangeMetadata` RPC gives the receiver a synchronous decision point before payload transfer.
 
-A **bounce buffer** is a memory region **pre-allocated from cuCascade** and **pre-registered with NIXL** at `SiriusContext` startup, eliminating per-transfer NIXL registration overhead. The bounce buffer is allocated from cuCascade's GPU tier (`memory_space` for VRAM) or HOST tier (`memory_space` for pinned DRAM) depending on configuration, ensuring it participates in cuCascade's memory accounting. Once allocated, it is registered with NIXL once and stays registered for the process lifetime. Data is packed (or copied) into the bounce buffer, then RDMA'd from there — matching the pattern established in PR #652 (`ExchangeMemoryManager`) and the current Rust staging buffer (`gpu_staging_buffer.rs`).
-
-#### GPU vs Host Bounce Buffer
-
-The bounce buffer can reside in GPU memory (`VRAM_SEG`) or host-pinned memory (`DRAM_SEG`). The optimal choice depends on the hardware architecture:
-
-| System | Recommended | Why |
-|--------|-------------|-----|
-| **NVL72 / GB200** | GPU (`vram`) | NVSwitch provides 1.8 TB/s GPU-to-GPU. GPUDirect RDMA sends directly from GPU memory via dedicated per-GPU NIC. Copying to host wastes bandwidth. |
-| **A100 / H100** | GPU (`vram`) | Large BAR1 (16+ GB) supports GPUDirect RDMA for large registrations. GPU-to-NIC path bypasses CPU entirely. |
-| **T4** | Host (`dram`) | BAR1 is only 256 MB — too small for large GPU RDMA registrations. Host-pinned memory avoids the BAR1 constraint. |
-| **L4** | Host (`dram`) | PCIe-only, constrained BAR1. Same rationale as T4. |
-| **No RDMA NIC** | Host (`dram`) | Must stage through host for TCP/socket transport. |
-
-This is configurable via `sirius.yaml` so deployments can tune per-cluster.
-
-#### Bounce Buffer Lifecycle
-
-```mermaid
-flowchart TD
-    INIT["SiriusContext::initialize()"]
-    INIT --> CHECK{bounce_buffer.location?}
-
-    CHECK -->|vram| GPU_ALLOC["cuCascade GPU tier\nmemory_space→make_reservation(size)"]
-    CHECK -->|dram| HOST_ALLOC["cuCascade HOST tier\nmemory_space→make_reservation(size)"]
-
-    GPU_ALLOC --> GPU_REG["nixl_agent→registerMem(ptr, VRAM_SEG)\n+ cache NIXL metadata"]
-    HOST_ALLOC --> HOST_REG["nixl_agent→registerMem(ptr, DRAM_SEG)\n+ cache NIXL metadata"]
-
-    GPU_REG --> READY["Bounce buffer ready\n(send + recv)"]
-    HOST_REG --> READY
-
-    READY -->|per-transfer| BUMP["Bump allocator sub-allocates\n(mutex + offset increment,\nno cuCascade calls)"]
-    BUMP -->|all leases released| RESET["Offset resets to 0"]
-    RESET --> BUMP
-
-    READY -->|SiriusContext::terminate| CLEANUP["Deregister from NIXL\nRelease cuCascade reservation"]
-```
-
-The cuCascade reservation is held for the process lifetime and is **not reclaimable** by the downgrade executor.
-
-#### Sender and Receiver Bounce Buffers
-
-Following PR #652's pattern, the system allocates **two** bounce buffers at startup — one for sending and one for receiving:
-
-| Buffer | Purpose | Used by |
-|--------|---------|---------|
-| **Send bounce buffer** | Holds packed data before RDMA write to remote | `communication_executor` worker threads (Phase 1: pack into bounce buffer) |
-| **Recv bounce buffer** | Destination for incoming RDMA writes | `exchange_receiver_service` (ExchangeMetadata handler allocates sub-region) |
-
-Both are pre-registered with NIXL at startup. NIXL metadata is cached once and reused for all transfers.
-
-#### Bump Allocator (per-transfer sub-allocation within the bounce buffer)
-
-A single bounce buffer is shared across all worker threads in the communication executor. To support multiple concurrent transfers, each transfer sub-allocates a region from the bounce buffer using a **bump allocator** — a separate, lightweight allocation mechanism independent of cuCascade's reservation system.
-
-Per-transfer sub-allocation does **not** go through cuCascade reservations. The bounce buffer is reserved from cuCascade once at startup; after that, the bump allocator manages space within the bounce buffer directly (mutex + offset increment).
-
-```mermaid
-block-beta
-    columns 6
-    block:header:6
-        columns 1
-        h["Bounce Buffer (4 GB) — 1 cuCascade reservation, 1 NIXL registration at startup"]
-    end
-    w1["Worker 1\n(RDMA in-flight)"]:1
-    w2["Worker 2\n(packing)"]:1
-    w3["Worker 3\n(RDMA in-flight)"]:1
-    free["Free"]:3
-
-    style w1 fill:#4a9,color:#fff
-    style w2 fill:#49a,color:#fff
-    style w3 fill:#4a9,color:#fff
-    style free fill:#ddd,color:#333
-```
-
-- 256-byte aligned sub-allocations, managed by bump pointer (mutex + offset increment)
-- Epoch-based reset: when all active leases release → offset resets to 0
-- Overflow: fall back to per-transfer cuCascade reservation + NIXL registration (slow path)
-
-### Sender Flow (with bounce buffer)
-
-```mermaid
-sequenceDiagram
-    participant TC as task_creator
-    participant ML as Manager Loop
-    participant BB as Send Bounce Buffer
-    participant W as Worker Thread
-
-    TC->>ML: communication_task (packed partition)
-    ML->>BB: try_allocate(packed_bytes)
-    alt bounce buffer has space
-        BB-->>ML: lease
-    else overflow
-        Note over ML: fall back to per-transfer<br/>cuCascade reservation + NIXL reg
-    end
-    ML->>W: dispatch(task + lease)
-    W->>BB: cudf::chunked_pack into sub-region
-    W->>W: NIXL transfer (pre-registered, no reg needed)
-    W->>BB: release lease
-```
-
-### Receiver Flow (with bounce buffer)
-
-```mermaid
-sequenceDiagram
-    participant S as Sender (remote)
-    participant R as Rust gRPC Server
-    participant CPP as C++ (FFI)
-    participant BB as Recv Bounce Buffer
-    participant REPO as shared_data_repo
-
-    S->>R: ExchangeMetadata gRPC
-    R->>CPP: sirius_exchange_reserve_recv_buffer()
-    CPP->>BB: try_allocate(total_size)
-    BB-->>CPP: lease (pre-registered addr)
-    CPP-->>R: dst addresses + cached NIXL metadata
-    R-->>S: response
-
-    Note over S,BB: RDMA writes directly into bounce buffer sub-region
-
-    S->>R: TransferComplete gRPC
-    R->>CPP: sirius_exchange_ingest_transfer()
-    CPP->>CPP: cudf::unpack() → data_batch
-    CPP->>REPO: push data_batch
-    CPP->>BB: release lease
-    CPP->>CPP: task_creator→schedule(downstream)
-```
+Retry tracking uses the same `retry_count` + `original_task_id` pattern as `gpu_pipeline_task_local_state`.
 
 ## Configuration
 
-New entries in `sirius.yaml`:
-
 ```yaml
-communication:
-  # Worker thread count for the communication executor
-  thread_count: 4
-  # Retry limits
-  max_reservation_retries: 10
-  max_receiver_nack_retries: 5
-  max_rdma_retries: 3
-  # Backoff
-  reservation_retry_backoff_ms: 5
-  nack_retry_initial_backoff_ms: 10
-  nack_retry_max_backoff_ms: 1000
+exchange:
+  # Transport selection — one Communicator implementation runs per process.
+  # ucxx   — production UCX-backed RDMA via UCXX (day 1)
+  # single — in-process loopback for testing (day 1)
+  # nixl   — future
+  transport: ucxx
 
-bounce_buffer:
-  # Where the bounce buffer is allocated.
-  #   "vram" — GPU memory, pre-registered as NIXL VRAM_SEG
-  #            Best for NVL72, A100, H100 (GPUDirect RDMA, large BAR1)
-  #   "dram" — Host-pinned memory, pre-registered as NIXL DRAM_SEG
-  #            Best for T4, L4 (small BAR1), or systems without RDMA NICs
-  location: vram
+  # Subscriber daemon pool — drives the receiver pull loop.
+  subscriber:
+    thread_count: 4
 
-  # Size of the send bounce buffer (bytes). Default 1GB.
-  send_size: 4294967296
+  # Communication executor (sender-side worker pool).
+  executor:
+    thread_count: 4
+    max_reservation_retries: 10
+    max_receiver_nack_retries: 5
+    max_transport_retries: 3
+    reservation_retry_backoff_ms: 5
+    nack_retry_initial_backoff_ms: 10
+    nack_retry_max_backoff_ms: 1000
 
-  # Size of the recv bounce buffer (bytes). Default 4GB.
-  recv_size: 4294967296
+  # Bounce buffer — used by transports needing explicit per-buffer registration.
+  bounce_buffer:
+    # vram — GPU memory.  Best for NVL72, A100, H100 (GPUDirect RDMA, large BAR1).
+    # dram — Host-pinned memory.  Best for T4, L4 (small BAR1), or systems without RDMA NICs.
+    location: vram
+    send_size:  4294967296    # 4 GB
+    recv_size:  4294967296    # 4 GB
 
-nixl:
-  # NIXL transport backend
-  transport: ucx
-  # gRPC port for the receiver metadata service
-  receiver_grpc_port: 9099
+ucxx:
+  # UCX listener port for OOB worker-address exchange at startup.
+  listener_port: 9098
+  # Optional UCX env knobs override.
+  # tls: "cuda_copy,cuda_ipc,rc,tcp"
 ```
 
 The `bounce_buffer.location` setting controls which cuCascade memory tier is used:
-- `vram`: Allocates from the GPU tier `memory_space`, registers as `VRAM_SEG` with NIXL. Data is packed directly into GPU bounce buffer via `cudf::chunked_pack`, then RDMA'd via GPUDirect RDMA.
-- `dram`: Allocates from the HOST tier `memory_space` (pinned memory via `fixed_size_host_memory_resource`), registers as `DRAM_SEG` with NIXL. Data is packed on GPU, then `cudaMemcpyDtoH` to the host bounce buffer before RDMA.
 
-## Migration Path
+- `vram`: allocates from the GPU tier `memory_space`, registers with UCX as device memory. Data is packed directly into GPU bounce buffer via `cudf::chunked_pack`, then transferred via UCX rendezvous (one-sided RDMA on the wire for large messages).
+- `dram`: allocates from the HOST tier `memory_space` (pinned memory via `fixed_size_host_memory_resource`). Data is packed on GPU, then `cudaMemcpyDtoH` to the host bounce buffer before UCX send.
 
-1. **Phase 1**: Implement `communication_executor`, `communication_task`, and `sirius_physical_exchange_partition` in C++. Implement NIXL C++ agent wrapper. Implement sender-side FFI functions (`sirius_exchange_send_metadata`, `sirius_exchange_send_complete`).
+## Day-1 Implementation Plan
 
-2. **Phase 2**: Implement receiver-side FFI functions (`sirius_exchange_reserve_recv_buffer`, `sirius_exchange_ingest_transfer`). Simplify `nixl_service.rs` handlers to thin FFI shims.
+Six phases:
 
-3. **Phase 3**: Wire into `pipeline_executor` and `task_creator`. Remove exchange code from `result_collector`. Register `exchange_partition` in the plan generator.
+1. **Phase 1 — Layer 1 interfaces.** `batch_publisher`, `batch_subscriber` headers. `communicator_batch_publisher`/`_subscriber` impls (transport-agnostic, take `point_to_point_communicator&`). Wire into `communication_executor`.
 
-4. **Phase 4**: Integration testing with existing NIXL proto format (reuse `nixl_service.proto`, `nixl_exchange.proto`).
+2. **Phase 2 — Layer 2 hierarchy: abstract base + point-to-point base + `single_communicator`.**
+   - `communicator` (abstract base — lifecycle + peer enumeration + name).
+   - `point_to_point_communicator` (derives from `communicator`; adds `send`/`exchange_metadata`/`recv`).
+   - `single_communicator` (in-process loopback; derives from `point_to_point_communicator`).
+   - End-to-end smoke test: single-process query with hash-partition + exchange + collect, using `single_communicator`. **Abstraction-boundary test** — if the orchestrator code needs modification to switch from `single` to UCXX later, the seam is wrong.
 
-5. **Phase 5**: Remove deprecated Rust code (`nixl_exchange.rs`, `gpu_staging_buffer.rs`, NIXL Rust bindings). Replace `sirius_exchange_c_api.cpp` with new receiver C API.
+3. **Phase 3 — `exchange_buffer_resource`.** cuCascade-backed bounce buffer; bump allocator + epoch reset; transport-agnostic (no UCX-specific code).
 
-## NIXL Registration Overhead Analysis
+4. **Phase 4 — `ucxx_communicator` (real day-1 backend).**
+   - Add UCXX as a build dependency (pixi/conda + CMake integration).
+   - UCXX worker setup, peer endpoint creation via OOB worker-address exchange (small bootstrap RPC at startup; no per-transfer involvement).
+   - AM receiver callback for `size_announce` → enqueue header.
+   - `send`: bounce-buffer lease + `amSend(size_announce)` + `tagSend(payload)`. Future polls `ucxx::Request::isCompleted`.
+   - `recv`: bounce-buffer lease + `tagRecv(buf, src, tag)`. Future polls UCX request.
+   - `ucxx_communicator` registers the bounce buffer with UCX via `memMap` once at construction.
 
-The bounce buffer design resolves the per-transfer registration overhead. For reference, here is the analysis that motivated this approach:
+5. **Phase 5 — Pre-deployment benchmark.** Measure UCX registration cost on cuCascade-allocated buffers without the bounce buffer (confirms the rcache miss rate matches research). Verification of the bounce-buffer rationale, not a blocker for day-1 ship.
 
-**Registration cost per call** (all under exclusive agent lock, `nixl_agent.cpp:427`):
-- `ucp_mem_map()` — kernel-level page pinning and RDMA memory key creation
-- `ucp_mem_query()` — additional syscall to verify GPU VRAM type
-- `ucp_rkey_pack()` — serialize the remote access key into a transferable blob
-- NIXL bookkeeping — section maps, metadata allocation
+6. **Phase 6 — Integration.** Register `sirius_physical_exchange_partition` in the plan generator. Run integration tests against TPC-H exchange workloads.
 
-The exclusive agent lock serializes all concurrent registrations. UCX's RCACHE (configured with 1024 entries at `ucx_utils.cpp:458`) only hits on exact `(addr, size)` matches — dynamic allocations give different addresses each time.
+`single_communicator` is the second-impl-on-day-one validating the seam. Adding new `point_to_point_communicator` impls later (e.g., `nixl_communicator`, `ucxx_rma_communicator`) is purely additive — no orchestrator code changes.
 
-UCX's pool-level registration cache (`UCX_MEMTYPE_REG_WHOLE_ALLOC_TYPES=cuda`) cannot help either: cuCascade uses RMM's `cuda_async_memory_resource` (`cudaMallocAsync`), which UCX classifies as `UCS_MEMORY_TYPE_CUDA_MANAGED` — the bitmap only matches `UCS_MEMORY_TYPE_CUDA`, so the optimization is silently skipped.
+### Day-2+ future work
 
-**Solution**: The bounce buffer is pre-registered once at startup. All transfers sub-allocate from the pre-registered region — zero `ucp_mem_map()` calls during the transfer hot path.
+- **NIXL day-2 PR**: `nixl_communicator` deriving from `point_to_point_communicator`. Adds a slim Rust gRPC shim for `ExchangeMetadata`/`TransferComplete` RPCs (the shim does only FFI back into `nixl_communicator`). Composes with the same `exchange_buffer_resource` from day-1. Validates the abstraction's compatibility with the explicit-metadata-RPC pattern.
+- **UCXX one-sided RMA experiment**: alternative `ucxx_rma_communicator` deriving from `point_to_point_communicator`. Apples-to-apples comparison with NIXL on the same wire operation; isolates "library overhead" from "registration strategy".
+- **cuCascade allocator change** (orthogonal): if cuCascade migrates to `pool_memory_resource{cuda_memory_resource}`, UCX classifies correctly, the bounce buffer can be retired. Significant change to cuCascade itself; not in scope here.
 
-## Open Questions
+## Out of scope
 
-1. **Avoiding dedicated pre-partitioned NIXL memory**: The current design reserves a fixed 4GB send + 4GB recv bounce buffer at startup, which is memory that cannot be used for compute. Is there a way to avoid dedicating memory to NIXL — for example, by leveraging cuCascade's memory pool directly with a registration caching layer, or by using a transport that doesn't require explicit pre-registration?
+- **Collective transports.** No collective communicator (broadcast / all-reduce / all-to-all) ships in this design. The abstract `communicator` base is structured so that a future collective sibling can slot in additively when a concrete use case triggers it; no interface or implementation is sketched here.
+- **bRPC migration.** Existing bRPC fallback stays in Rust as a separate path. Migrating it is orthogonal to this PR.
+- **Stream-aware `send` on point-to-point.** The `point_to_point_communicator` API is intentionally not CUDA-stream-coupled — UCXX completes async off-stream. Pack-into-bounce-buffer is the only stream-using step and lives inside the publisher impl.
 
-2. **Is NIXL the right transfer library?**: NIXL provides one-sided RDMA semantics with explicit memory registration. Alternatives worth evaluating:
-   - **UCXX**: Tag-based API avoids explicit registration entirely — UCX handles it internally via rcache. Two-sided (requires matching send/recv), but may be simpler. Already used by RAPIDS/Dask-CUDA for GPU shuffle.
-   - **NCCL**: Optimized for collective communication. Supports user buffer registration (`ncclCommRegister`) for zero-copy. Well-tuned for NVLink/NVSwitch topologies. But designed for collectives, not point-to-point exchange.
-   - Each has different trade-offs around registration overhead, API model (one-sided vs two-sided), and hardware optimization. Experimentation would clarify which fits the exchange pattern best.
+NIXL and UCXX one-sided RMA are **future work**, not out-of-scope. The hierarchy explicitly accommodates each.
 
-3. **Adaptive bounce buffer placement (CPU vs GPU)**: The optimal bounce buffer location depends on hardware topology and workload — GPU for NVL72/A100 (GPUDirect RDMA, large BAR1), host for T4/L4 (small BAR1). Currently this is a static config (`bounce_buffer.location`). Could we make it adaptive — for example, by querying BAR1 size and NIC topology at startup to auto-select, or by dynamically switching based on transfer patterns and memory pressure at runtime?
+## Open questions
 
-4. **STRING column offset corruption**: The known NIXL RDMA bug that corrupts STRING column offsets (see `.planning/codebase/CONCERNS.md`) needs to be addressed regardless of C++ vs Rust. The current workaround uses `cudf::pack` instead of `cudf::chunked_pack` for STRING columns — this workaround carries over to the C++ implementation.
+1. **Avoiding dedicated pre-partitioned NIXL/UCX memory.** The design reserves a fixed 4 GB send + 4 GB recv bounce buffer at startup — memory that cannot be used for compute. Two paths to avoid this: (a) migrate cuCascade to a synchronous `cudaMalloc`-backed pool so UCX classifies correctly; (b) try `UCX_CUDA_COPY_ASYNC_MEM_TYPE=cuda` to override the classification (untested in our workload; UCX upstream comments suggest the override is suboptimal). Both are orthogonal to the abstraction.
+2. **Adaptive bounce buffer placement.** The optimal bounce buffer location depends on hardware topology and workload — GPU for NVL72/A100, host for T4/L4. The design uses a static config. Could `SiriusContext` query BAR1 size and NIC topology at startup to auto-select, or dynamically switch based on transfer patterns and memory pressure at runtime?
+3. **STRING column offset corruption.** NIXL's wire format RDMA-writes cudf offsets and can corrupt them under certain access patterns (see `.planning/codebase/CONCERNS.md`). UCXX day-1 uses a different wire format and is unaffected. When NIXL day-2 lands, `nixl_communicator`'s packing path will need to use `cudf::pack` instead of `cudf::chunked_pack` for STRING columns.
+4. **bRPC fallback.** Should the bRPC CPU fallback path eventually move under the Communicator hierarchy (a `brpc_communicator` impl deriving from `point_to_point_communicator`) or remain in Rust as a separate code path?
 
-5. **bRPC fallback**: Should the bRPC CPU fallback path also move to C++ eventually, or remain in Rust as a separate code path?
+## Appendix: UCX rcache + cudaMallocAsync — why the bounce buffer exists
+
+The bounce buffer's existence is driven by a UCX memory-type classification that misclassifies `cudaMallocAsync` allocations.
+
+UCX has two registration-amortization mechanisms:
+
+- **rcache**: a registration cache keyed by `(addr, size)` range. When a transfer needs a buffer registered, UCX checks rcache; on hit, no driver call. On miss, calls `ucp_mem_map` (kernel-level page pinning + RDMA key creation, easily >100 µs, serialized).
+- **`UCX_MEMTYPE_REG_WHOLE_ALLOC_TYPES`**: registers an entire pool extent on first touch, so all sub-allocations from inside that extent inherit registration.
+
+**Both mechanisms consult the same memory-type classification**, in `cuda_copy_md.c` lines 658-668:
+
+```c
+} else if ((cuda_mem_ctx == NULL) && md->config.cuda_async_managed) {
+    /* Currently virtual/stream-ordered CUDA allocations are typed as
+     * `UCS_MEMORY_TYPE_CUDA_MANAGED`. ... */
+    mem_info->type = UCS_MEMORY_TYPE_CUDA_MANAGED;
+} else {
+    mem_info->type = UCS_MEMORY_TYPE_CUDA;
+}
+```
+
+cuCascade uses RMM's `cuda_async_memory_resource` (`cudaMallocAsync` underneath). UCX classifies these allocations as `UCS_MEMORY_TYPE_CUDA_MANAGED` because they have no associated CUDA context. The `UCX_MEMTYPE_REG_WHOLE_ALLOC_TYPES=cuda` bitmap matches only `UCS_MEMORY_TYPE_CUDA` — the bitmap test fails, whole-allocation registration is silently skipped, and rcache (which uses the same classification) doesn't help either.
+
+**Net effect**: every transfer pays the full registration cost. The bounce buffer is the standard fix: register one large region once, bump-allocate sub-leases from it. Zero `ucp_mem_map` calls during the transfer hot path.
+
+This is documented behavior — UCX has open issues tracking the misclassification — but no fix has shipped. The dask-cuda docs also acknowledge this: their pool-size knob "has no effect with `rmm_async=True`".
+
+The bounce buffer is therefore not a NIXL artifact; it is a workaround for cuCascade's `cuda_async_memory_resource` choice combined with UCX's classification heuristic. It applies equally to UCXX and NIXL. It does not apply to `single_communicator` (no UCX).
