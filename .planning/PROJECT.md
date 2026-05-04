@@ -10,13 +10,21 @@ Any query can transparently execute across every GPU on the node — tasks are s
 
 ## Current State
 
-**v1.3 in progress** — Multi-GPU Distribution.
-- Phase 15 complete 2026-05-01 — Cross-GPU operator-colocation audit. 11 INVARIANT (SCHED-RR contract) comments across 9 operator files; per-site classification SAFE=11 NEEDS-PATCH=0 UNCLEAR=0 in `15-AUDIT-LOG.md` (every audited site downstream of `gpu_pipeline_task::execute → prepare_for_processing(target_space, stream)`, so `batches[0]->get_memory_space() == target_space` is invariant). New `[mgpu_stress]` test runs 100 iterations × 5 representative [mgpu] queries × varied SCHED-RR counter offsets = 500 inner runs, 77053 assertions, exit 0 (test-only setter on `task_scheduler::_no_pref_rr_counter`). `docs/super-sirius/pipeline-execution.md` gained "Per-task-device contract under SCHED-RR" section (line 114, 186 lines, 6 subsections). Branch `audit/mgpu-operator-colocation` descended from Phase 14 HEAD `0ee3166`. Comment-only diff to operator files; HYG-02 baseline preserved at 40. [TPC-H][parquet] 22/22 in 81.6s; [integration][TPC-H] 48/48 in 2:43 with 71608 assertions on the post-Phase-15 reconciliation run (the earlier 1800s MCP timeout was a transient — 13-04 verdict reconciled PARTIAL → PASS). FU-A merged 2026-05-01: `fix/order-small-sort-rangecheck` (Phase 12) integrated into the v1.3 release-branch tip; **[mgpu] now 16/16 in 120.3s, 79091 assertions, exit 0** (was 12/13 with Phase-12-territory note). Only FU-B remains open (lift SF1 1-vs-2-GPU speedup gate from DEFERRED).
-- Phase 14 complete 2026-04-30 — SCHED-RR distribution landed. `_gpu_executors` switched from `std::unordered_map` to `std::map` for deterministic iteration; `std::atomic<size_t> _no_pref_rr_counter` added; preference-less source-pipeline tasks now distribute round-robin (`fetch_add modulo size + std::advance`) across GPUs in `task_scheduler::management_eventloop`; counter resets per-query in `prepare_for_query` so cache=table_gpu warm path stays reproducible. Branch `feat/sched-rr-distribution` based off Phase 13's branch (must merge after Phase 13). Validation under SCHED-RR: `[TPC-H][parquet]` 22/22 in 80.3s, `follow-up #17 scale-up` 178 assertions in 7.3s, `[integration][TPC-H]` 48/48 in 151.8s (Phase 14) and 48/48 in 2:43 (Phase 15 reconciliation). C1 [mgpu] 12/13 PASS with Phase-12-territory note (small-sort `_M_range_check` fix lives on `fix/order-small-sort-rangecheck`, not yet merged into 14's ancestry). C3 SF1 1-GPU vs 2-GPU >1.2× speedup DEFERRED — MCP wrapper doesn't expose `num_gpus` toggle (Phase 13 [13-03] precedent). Phase 15 unblocked and now complete.
-- Phase 13 complete 2026-04-30 — Q11 multi-GPU illegal-address closed via cucascade-side stream-event lineage (writer event recorded at gpu_table_representation construction; `cudaStreamWaitEvent` in `convert_gpu_to_gpu` before peer copy). Path-2 architectural fix (compiler-enforced ctor signature requiring `writer_stream`) succeeded after Path-1 (per-site grep migration) left ~22 producers un-migrated. Cucascade pin: e4db3d8 → 7409c60 → 62e0517 on `fix/q11-mgpu-stream-event-lineage`.
-- Phase 12 complete 2026-04-29 — small-sort `vector::at(2)` correctness fix in `prepare_join_keys` at `src/op/sirius_physical_hash_join.cpp:622-637` (consumer-side guard against SORT-as-HASH_JOIN partitioner emitting stale `key_col_indices` ≥ `num_columns()`); new regression TEST_CASE locks the bug class; HYG-02 baseline preserved at 40
-- Branches (all ready for PR, with merge ordering): `fix/order-small-sort-rangecheck` (Phase 12, independent), `fix/q11-mgpu-illegal-address` (Phase 13), `feat/sched-rr-distribution` (Phase 14, must merge after Phase 13)
-- Open follow-ups: (FU-A) ✓ DONE 2026-05-01 — Phase 12 merged into v1.3 release tip, [mgpu] 16/16 (79091 assertions); (FU-B) extend MCP wrapper for env-passthrough OR add `num_gpus` arg to `tpch-benchmark` to lift C3 from DEFERRED
+**v1.4 in progress** — Rebase After DataBatch Changes.
+- Goal: land cucascade `origin/main` (PR #117 DataBatch RAII refactor + #112 + #116) and Sirius `origin/dev` (#675 IO Framework, #731 Scan Manager, #721 Pin Tables, #739 cucascade-compat, #733/#734/#735) onto `feature/single-node-multi-gpu2`, preserving all v1.1+v1.2+v1.3 multi-GPU behavior.
+- Conflict surface (measured 2026-05-04 via `git merge-tree`): cucascade rebase = 6 conflict files (gpu_data_representation.{hpp,cpp}, representation_converter.cpp, pipeline_io_backend.cpp, memory/{common,memory_space}.cpp); Sirius dev merge = 11 conflict files + 33 auto-merges.
+- Key adoption decisions: (1) cucascade strategy = rebase our 11 local fixes onto `origin/main` (no upstream PRs this milestone); (2) IO Framework = retire `sirius::io::cucascade_datasource` and adopt `sirius::io::sirius_datasource` (#675), adapting it to multi-GPU; (3) branch = in-place on `feature/single-node-multi-gpu2`; (4) phase numbering continues from 16.
+- Regression bar: v1.3 ship-gate must pass on rebased shape — `[mgpu]` 16/16, `[TPC-H][parquet]` 22/22, `[integration][TPC-H]` 48/48, SF100 Q1 num_gpus=2 ≤ 5.7s, mgpu_stress 500-iter, HYG-02 ≤ 40.
+
+**v1.3 shipped 2026-05-01** — Multi-GPU Distribution.
+- 4 phases / 12 plans / 5 phases of work delivered (Phases 12-15)
+- SCHED-RR round-robin distribution for preference-less source-pipeline tasks landed
+- Q11 multi-GPU illegal-address closed via cucascade-side stream-event lineage (writer_event in `gpu_table_representation` ctor; `cudaStreamWaitEvent` in `convert_gpu_to_gpu`)
+- Cross-GPU operator-colocation audit: 11 INVARIANT (SCHED-RR contract) comments across 9 operator files, per-site classification SAFE=11 NEEDS-PATCH=0 UNCLEAR=0
+- New `[mgpu_stress]` test: 100 iterations × 5 [mgpu] queries × varied SCHED-RR counter offsets = 500 inner runs, 77053 assertions, exit 0
+- Test gauntlet: `[mgpu]` 16/16 in 120.3s (79091 assertions); `[TPC-H][parquet]` 22/22 in 81.6s; `[integration][TPC-H]` 48/48 in 2:43 (71608 assertions); HYG-02 baseline preserved at 40
+- Branch: `feature/single-node-multi-gpu2` (release tip; FU-A merged)
+- Open follow-up carry: FU-B (extend MCP wrapper for env-passthrough OR add `num_gpus` arg to `tpch-benchmark` to lift C3 SF1 1-vs-2-GPU speedup gate from DEFERRED)
 
 **v1.2 shipped 2026-04-28** — Multi-GPU SQL Pipeline Fix.
 - 3 phases / 18 plans / 39 tasks / 11 v1.2 requirements satisfied (8 fully + 3 partial via proxy)
@@ -30,6 +38,19 @@ Any query can transparently execute across every GPU on the node — tasks are s
 - 4 phases / 19 plans / 44 tasks / 28 requirements cleared
 - Full test suite: 979/979 pass on N=2 hardware (2× RTX 6000 Ada, driver 595.58.03, CUDA 13.2)
 - Archive: `.planning/milestones/v1.1-*`
+
+## Current Milestone: v1.4 Rebase After DataBatch Changes
+
+**Goal:** Land cucascade `origin/main` (PR #117 DataBatch RAII refactor + #112 + #116) and Sirius `origin/dev` (#675 IO Framework, #731 Scan Manager, #721 Pin Tables, #739 cucascade-compat, #733/#734/#735) onto `feature/single-node-multi-gpu2` while preserving every v1.1+v1.2+v1.3 multi-GPU behavior.
+
+**Target features:**
+- Cucascade rebase: 11 local Sirius-side fixes (writer_stream/writer_event, peer-DMA probe, io_worker member-order, pinned-host Portable/Mapped, ptds tracker, pool peer access, cudf::pack stream) re-applied on top of cucascade `origin/main` against PR #117's RAII accessor model (`read_only_data_batch` / `mutable_data_batch`). New pin descended from `73d00c4`.
+- DataBatch API migration: ~12 Sirius operators + ~16 tests adapted from the pre-#117 `gpu_data_representation` shape to the post-#117 RAII-locked accessors. Mechanical-but-deep migration of every site that reads or mutates batch data.
+- IO Framework adoption: retire stopgap `sirius::io::cucascade_datasource` and adopt `sirius::io::sirius_datasource` (#675 — uring reactor + prefetching cache + admission control), adapting it to multi-GPU (per-GPU reactor pools / per-GPU prefetching-cache scoping / `cudaSetDevice` RAII at device-read sites).
+- Scan Manager + Pin Tables integration: port Phase 14 SCHED-RR distribution, Phase 9 `_batch_gpu_affinity`, MGPU-07 adaptive scan, Phase 13 stream-lineage (currently in deleted `sirius_parquet_metadata_scan_operator.hpp`) into `parquet_split_provider` / `sirius_scan_manager` / `split_connector`.
+- Regression preservation: v1.3 ship-gate passes on the rebased shape — `[mgpu]` 16/16, `[TPC-H][parquet]` 22/22, `[integration][TPC-H]` 48/48, SF100 Q1 num_gpus=2 ≤ 5.7s, mgpu_stress 500-iter, HYG-02 ≤ 40.
+
+**Key context:** Phase numbering continues from 16 (v1.3 ended at 15). All work in-place on `feature/single-node-multi-gpu2`. No upstream cucascade PRs this milestone — local pin carries the 11 fixes. v1.3 FU-B (SF1 1-vs-2-GPU speedup gate from DEFERRED) is carried forward; not blocking v1.4 ship.
 
 ## Requirements
 
@@ -51,9 +72,15 @@ Shipped and validated in v1.1.
 
 ### Active
 
-<!-- v1.3 not yet scoped. Run /gsd:new-milestone to define. -->
+<!-- v1.4 requirements scoped during this /gsd:new-milestone run. See REQUIREMENTS.md once written. -->
 
-(No active requirements — next milestone awaiting scoping via `/gsd:new-milestone`.)
+(No active requirements yet — `/gsd:new-milestone` mid-flight; REQUIREMENTS.md is written next.)
+
+**v1.3 deliverables (now Validated):**
+- ✓ **SORT-01** — Phase 12 small-sort `vector::at(2)` correctness fix in `prepare_join_keys` (`src/op/sirius_physical_hash_join.cpp:622-637`); consumer-side guard against SORT-as-HASH_JOIN partitioner emitting stale `key_col_indices` ≥ `num_columns()`; regression TEST_CASE locks the bug class — *v1.3*
+- ✓ **Q11-01** — Phase 13 Q11 multi-GPU illegal-address closed via cucascade-side stream-event lineage (`writer_event` recorded at `gpu_table_representation` ctor; `cudaStreamWaitEvent` in `convert_gpu_to_gpu` before peer copy). Path-2 architectural fix (compiler-enforced ctor signature requiring `writer_stream`). Cucascade pin advanced to `62e0517` — *v1.3*
+- ✓ **SCHED-RR-01** — Phase 14 round-robin distribution for preference-less source-pipeline tasks. `_gpu_executors` switched to `std::map`; `std::atomic<size_t> _no_pref_rr_counter` distributes via `fetch_add modulo size + std::advance` in `task_scheduler::management_eventloop`; counter resets per-query for cache=table_gpu warm-path reproducibility — *v1.3*
+- ✓ **AUDIT-MGPU-01** — Phase 15 cross-GPU operator-colocation audit: 11 INVARIANT (SCHED-RR contract) comments across 9 operator files; per-site classification SAFE=11 NEEDS-PATCH=0 UNCLEAR=0; new `[mgpu_stress]` test (500 inner runs, 77053 assertions, exit 0); `docs/super-sirius/pipeline-execution.md` "Per-task-device contract under SCHED-RR" section — *v1.3*
 
 **v1.2 deliverables (now Validated):**
 - ✓ **FIX-01..04** — cross-device stream-correctness fixes (Pattern 2 idiom): per-GPU stream pool in `duckdb_scan_executor`, Sirius-side `host→gpu` converter override, per-GPU filter translation at plan time, `translated_expression::owned_stream` for scalar lifetime correctness — *v1.2*
@@ -116,6 +143,9 @@ Shipped and validated in v1.1.
 | `_batch_gpu_affinity` map records ownership but does NOT consult at dispatch time (Phase 9 minimum-viable) | Recording is sufficient for the disjointedness REQUIRE regression gate; consultation-at-dispatch was deferred to keep scope tight. Affinity is implicitly preserved because `_scan_round_robin` is monotonic. | ✓ Good — disjointedness REQUIRE fires green at SF10 + SF100; cross-GPU intersection=0 |
 | `translated_expression::owned_stream` declared BEFORE `owned_literals` (Phase 10-03) | C++ reverse-destruction order: scalars `cudaFreeAsync` first (using stream handle), then stream destroys. Without this ordering, `cudaFreeAsync(ptr, stale_handle)` SIGSEGVs at next QueryBegin. | ✓ Good — closes the test-ordering-dependent SIGSEGV that 09-04 exposed; HYG-02 improved 41→40 |
 | Run all integration/SF100 tests via MCP on this host (no human-delegated checkpoints) | 2026-04-24 host-capability discovery: `mcp__project-commands__run_command nvidia-smi` shows 2× RTX 6000 Ada visible; agent can run the full v1.2 ship-gate autonomously. | ✓ Good — Phase 9-04 + Phase 10-04 ship-gates ran fully autonomously via MCP |
+| v1.4 cucascade strategy: rebase 11 local fixes onto `origin/main` (no upstream PRs this milestone) | Upstreaming would block the rebase on review cycles; PR #117 already touches the same surface as our writer_stream/event work, so the conflict resolution is the same regardless. Carry the local pin and revisit upstreaming separately. | Pending v1.4 |
+| v1.4 IO Framework: retire `sirius::io::cucascade_datasource`, adopt `sirius::io::sirius_datasource` (#675) and adapt to multi-GPU | The cucascade_datasource was a v1.1 stopgap to dodge kvikio's single-CUDA-context binding; the new sirius_datasource (uring + prefetching cache + admission control) is the going-forward I/O surface. Adapting it for multi-GPU (per-GPU reactor pools, cudaSetDevice RAII) is cheaper than maintaining two parallel datasources. | Pending v1.4 |
+| v1.4 in-place rebase on `feature/single-node-multi-gpu2` (no fresh branch) | Branch already carries v1.1+v1.2+v1.3 history and the cucascade pin with 11 local fixes; cutting a fresh branch would lose merge history. Phase numbering continues from 16. | Pending v1.4 |
 
 ## Evolution
 
@@ -135,4 +165,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-05-01 — Phase 15 complete (cross-GPU operator-colocation audit, SAFE=11); FU-A merged (Phase 12 fix, [mgpu] 16/16); 13-04 verdict reconciled PARTIAL → PASS via clean [integration][TPC-H] reconciliation run (48/48 in 2:43); v1.3 has 4/4 phases shipped, only FU-B (speedup gate) remains*
+*Last updated: 2026-05-04 — v1.3 closed (Phases 12-15 shipped; deliverables moved to Validated). v1.4 "Rebase After DataBatch Changes" started — cucascade origin/main (PR #117 DataBatch RAII refactor + #112 + #116) and Sirius origin/dev (#675 IO Framework, #731 Scan Manager, #721 Pin Tables, #739 cucascade-compat) targeted onto feature/single-node-multi-gpu2. Conflict surface measured 2026-05-04: cucascade rebase = 6 conflict files; Sirius dev merge = 11 conflict files + 33 auto-merges. Phase numbering continues from 16. v1.3 FU-B (speedup gate) carried forward.*

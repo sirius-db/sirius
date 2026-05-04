@@ -1,37 +1,34 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.3
-milestone_name: Multi-GPU Distribution
-status: verifying
-stopped_at: "FU-A complete: merged fix/order-small-sort-rangecheck (Phase 12) into Phase 15 tip. Post-merge [mgpu] 16/16 PASS, 79091 assertions, exit 0, 120.3s. v1.3 release-branch tip ready; only FU-B (speedup gate) remains open."
-last_updated: "2026-05-01T04:10:00.000Z"
-last_activity: 2026-05-01
+milestone: v1.4
+milestone_name: Rebase After DataBatch Changes
+status: defining_requirements
+stopped_at: "v1.4 started 2026-05-04 — milestone summary confirmed (cucascade origin/main rebase + Sirius origin/dev rebase, in-place on feature/single-node-multi-gpu2). PROJECT.md updated; REQUIREMENTS.md is next."
+last_updated: "2026-05-04T00:00:00.000Z"
+last_activity: 2026-05-04
 progress:
-  total_phases: 15
-  completed_phases: 10
-  total_plans: 56
-  completed_plans: 51
-  percent: 100
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-04-21)
+See: .planning/PROJECT.md (updated 2026-05-04)
 
 **Core value:** Any query can transparently execute across every GPU on the node — tasks are scheduled to the GPU where their input data already resides, memory pressure is absorbed by downgrading to the correct NUMA domain, and parquet I/O is routed through a multi-GPU-safe backend.
-**Current focus:** v1.3 release-branch assembly (FU-A merge in progress)
+**Current focus:** v1.4 — rebase Sirius (`feature/single-node-multi-gpu2`) onto cucascade `origin/main` and Sirius `origin/dev` after the cucascade DataBatch RAII refactor (PR #117) and the dev-side IO Framework / Scan Manager / Pin Tables / cucascade-compat work landed.
 
 ## Current Position
 
-Phase: 15 (mgpu-operator-colocation-audit) — COMPLETE
-Plan: All complete
-Status: FU-A merge integrating Phase 12 fix into the v1.3 release branch
-Last activity: 2026-05-01
-
-Progress: [██████████] 100% (6/6 plans complete)
-Ship verdict: BLOCKED_ON_RESIDUAL_FIX_SITE — see `.planning/phases/08-multi-gpu-sql-pipeline-fix/08-SUMMARY.md`
+Phase: Not started (defining requirements)
+Plan: —
+Status: Defining requirements
+Last activity: 2026-05-04 — Milestone v1.4 started
 
 ## Performance Metrics
 
