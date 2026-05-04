@@ -181,16 +181,10 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
 
   // Read batch column count under read-only lock, then release lock before mutation
   std::size_t num_batch_cols = 0;
-  std::vector<std::unique_ptr<cudf::column>> columns;
-  auto batch_id                          = output_batch->get_batch_id();
-  cucascade::memory::memory_space* space = nullptr;
   {
-    auto output_mut = output_batch->to_mutable();
-    space           = output_mut.get_memory_space();
-    auto& gpu_rep   = output_mut.get_data()->cast<cucascade::gpu_table_representation>();
-    num_batch_cols  = static_cast<std::size_t>(gpu_rep.get_table_view().num_columns());
-    auto table      = gpu_rep.release_table(stream);
-    columns         = table->release();
+    auto output_ro = output_batch->to_read_only();
+    auto& gpu_rep  = output_ro.get_data()->cast<cucascade::gpu_table_representation>();
+    num_batch_cols = static_cast<std::size_t>(gpu_rep.get_table_view().num_columns());
   }  // read lock released here
 
   if (num_batch_cols > expected_output_columns) {
@@ -208,6 +202,16 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
                     expected_output_columns,
                     projection_ids.size()));
     }
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    auto batch_id                          = output_batch->get_batch_id();
+    cucascade::memory::memory_space* space = nullptr;
+    {
+      auto output_ro = output_batch->to_read_only();
+      space          = output_ro.get_memory_space();
+      auto& gpu_rep  = output_ro.get_data()->cast<cucascade::gpu_table_representation>();
+      auto table     = gpu_rep.release_table(stream);
+      columns        = table->release();
+    }  // read lock released here
 
     // Select output columns using the batch column map.
     // projection_ids[0..expected_output_columns) are the output columns
