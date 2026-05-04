@@ -696,6 +696,7 @@ void parquet_scan_task_global_state::build_schema_reconciliation(
                           output_cols   = std::move(output_cols)](
                            std::unique_ptr<cudf::table> tbl,
                            std::string const& file_path,
+                           std::vector<std::string> const& /*partition_values*/,
                            rmm::cuda_stream_view stream) -> std::unique_ptr<cudf::table> {
     if (!tbl || tbl->num_rows() == 0) return tbl;
 
@@ -871,6 +872,20 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
   }
   if (g_state.has_partition_inject_fn()) {
     parquet_representation->set_partition_inject_fn(g_state.get_partition_inject_fn());
+    // Compute partition values once per task from the file path. The inject closure indexes
+    // them in hive_partition_columns order rather than re-parsing the path at each call.
+    auto const& file_path         = g_state.get_file_path(l_state.get_file_idx());
+    auto const& partition_columns = g_state.get_hive_partition_columns();
+    std::vector<std::string> partition_values;
+    partition_values.reserve(partition_columns.size());
+    if (!partition_columns.empty()) {
+      auto parsed = duckdb::HivePartitioning::Parse(file_path);
+      for (auto const& pc : partition_columns) {
+        auto it = parsed.find(pc.column_name);
+        partition_values.push_back(it != parsed.end() ? it->second : std::string{});
+      }
+    }
+    parquet_representation->set_partition_values(std::move(partition_values));
   }
   if (g_state.has_post_convert_fn() || g_state.has_partition_inject_fn()) {
     parquet_representation->set_data_file_path(g_state.get_file_path(l_state.get_file_idx()));

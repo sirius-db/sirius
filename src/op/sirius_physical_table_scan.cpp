@@ -106,8 +106,8 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
                                                                    rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_table_scan::execute"};
-  auto& input                   = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& raw_input_batches = input.get_read_only_batches();
+  auto& input                  = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& ro_input_batches = input.get_read_only_batches();
 
   // For parquet scan pipelines, filter and projection are already applied in
   // parquet_scan_task and the host_parquet_representation converters.
@@ -117,7 +117,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
   }
 
-  if (raw_input_batches.empty()) { return std::make_unique<pipelineable_operator_data>(); }
+  if (ro_input_batches.empty()) { return std::make_unique<pipelineable_operator_data>(); }
 
   // Build the column_ids index → batch position mapping once.
   // Both filter expression construction and post-filter projection use this.
@@ -126,11 +126,11 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   // When multiple small batches were coalesced by get_next_task_input_data(),
   // concatenate their GPU tables into one to issue fewer, larger kernel launches.
   std::shared_ptr<cucascade::data_batch> single_batch;
-  if (raw_input_batches.size() > 1) {
+  if (ro_input_batches.size() > 1) {
     std::vector<cudf::table_view> table_views;
-    table_views.reserve(raw_input_batches.size());
+    table_views.reserve(ro_input_batches.size());
     cucascade::memory::memory_space* space = nullptr;
-    for (const auto& batch : raw_input_batches) {
+    for (const auto& batch : ro_input_batches) {
       if (batch.get_data()) {
         auto& gpu_rep = batch.get_data()->cast<cucascade::gpu_table_representation>();
         table_views.push_back(gpu_rep.get_table_view());
@@ -148,7 +148,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   // After concatenation (or if only one batch), work with a single batch.
   // For a concatenated batch (new idle), acquire read lock. For a single input batch, use directly.
   ::cucascade::read_only_data_batch batch_ref =
-    single_batch ? single_batch->to_read_only() : raw_input_batches[0];
+    single_batch ? single_batch->to_read_only() : ro_input_batches[0];
   if (!batch_ref.get_data()) { return std::make_unique<pipelineable_operator_data>(); }
 
   // Apply table filters as a GPU expression if present.
@@ -179,66 +179,59 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
       std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(output_batch)});
   }
 
+  // Read batch column count under read-only lock, then release lock before mutation
+  std::size_t num_batch_cols = 0;
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  auto batch_id                          = output_batch->get_batch_id();
+  cucascade::memory::memory_space* space = nullptr;
   {
-    // Read batch column count under read-only lock, then release lock before mutation
-    std::size_t num_batch_cols = 0;
-    {
-      auto output_ro = output_batch->to_read_only();
-      auto& gpu_rep  = output_ro.get_data()->cast<cucascade::gpu_table_representation>();
-      num_batch_cols = static_cast<std::size_t>(gpu_rep.get_table_view().num_columns());
-    }  // read lock released here
+    auto output_mut = output_batch->to_mutable();
+    space           = output_mut.get_memory_space();
+    auto& gpu_rep   = output_mut.get_data()->cast<cucascade::gpu_table_representation>();
+    num_batch_cols  = static_cast<std::size_t>(gpu_rep.get_table_view().num_columns());
+    auto table      = gpu_rep.release_table(stream);
+    columns         = table->release();
+  }  // read lock released here
 
-    if (num_batch_cols > expected_output_columns) {
-      SIRIUS_LOG_DEBUG(
-        "TABLE_SCAN projection: expected_output_columns={}, projection_ids.size()={}, "
-        "column_ids.size()={}",
-        expected_output_columns,
-        projection_ids.size(),
-        column_ids.size());
+  if (num_batch_cols > expected_output_columns) {
+    SIRIUS_LOG_DEBUG(
+      "TABLE_SCAN projection: expected_output_columns={}, projection_ids.size()={}, "
+      "column_ids.size()={}",
+      expected_output_columns,
+      projection_ids.size(),
+      column_ids.size());
 
-      if (expected_output_columns > projection_ids.size()) {
-        throw std::runtime_error(
-          std::format("TABLE_SCAN projection error: expected_output_columns ({}) > "
-                      "projection_ids.size() ({})",
-                      expected_output_columns,
-                      projection_ids.size()));
-      }
-
-      // Acquire EXCLUSIVE lock since release_table() is a mutating operation
-      auto batch_id                          = output_batch->get_batch_id();
-      cucascade::memory::memory_space* space = nullptr;
-      std::unique_ptr<cudf::table> table;
-      {
-        auto output_mut = output_batch->to_mutable();
-        auto& gpu_rep   = output_mut.get_data()->cast<cucascade::gpu_table_representation>();
-        space           = output_mut.get_memory_space();
-        table           = gpu_rep.release_table(stream);
-      }  // exclusive lock released here
-
-      auto columns = table->release();
-
-      // Select output columns using the batch column map.
-      std::vector<std::unique_ptr<cudf::column>> selected;
-      selected.reserve(expected_output_columns);
-      for (std::size_t i = 0; i < expected_output_columns; i++) {
-        auto batch_idx = batch_column_map[projection_ids[i]];
-        if (batch_idx == static_cast<std::size_t>(-1) || batch_idx >= columns.size()) {
-          throw std::runtime_error(
-            std::format("TABLE_SCAN projection OOB: projection_ids[{}]={} → batch_idx={} >= "
-                        "columns.size()={}",
-                        i,
-                        projection_ids[i],
-                        batch_idx,
-                        columns.size()));
-        }
-        selected.push_back(std::move(columns[batch_idx]));
-      }
-
-      auto projected_table = std::make_unique<cudf::table>(std::move(selected));
-      auto projected_rep =
-        std::make_unique<cucascade::gpu_table_representation>(std::move(projected_table), *space);
-      output_batch = std::make_shared<cucascade::data_batch>(batch_id, std::move(projected_rep));
+    if (expected_output_columns > projection_ids.size()) {
+      throw std::runtime_error(
+        std::format("TABLE_SCAN projection error: expected_output_columns ({}) > "
+                    "projection_ids.size() ({})",
+                    expected_output_columns,
+                    projection_ids.size()));
     }
+
+    // Select output columns using the batch column map.
+    // projection_ids[0..expected_output_columns) are the output columns
+    // in the order the downstream operator expects.
+    std::vector<std::unique_ptr<cudf::column>> selected;
+    selected.reserve(expected_output_columns);
+    for (std::size_t i = 0; i < expected_output_columns; i++) {
+      auto const& batch_idx_opt = batch_column_map[projection_ids[i]];
+      if (!batch_idx_opt.has_value() || *batch_idx_opt >= columns.size()) {
+        throw std::runtime_error(
+          std::format("TABLE_SCAN projection OOB: projection_ids[{}]={} → batch_idx={} >= "
+                      "columns.size()={}",
+                      i,
+                      projection_ids[i],
+                      batch_idx_opt.has_value() ? std::to_string(*batch_idx_opt) : "(nullopt)",
+                      columns.size()));
+      }
+      selected.push_back(std::move(columns[*batch_idx_opt]));
+    }
+
+    auto projected_table = std::make_unique<cudf::table>(std::move(selected));
+    auto projected_rep =
+      std::make_unique<cucascade::gpu_table_representation>(std::move(projected_table), *space);
+    output_batch = std::make_shared<cucascade::data_batch>(batch_id, std::move(projected_rep));
   }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;

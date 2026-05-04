@@ -17,7 +17,6 @@
 #pragma once
 
 #include "helper/logical_type.hpp"
-#include "op/scan/hive_partition.hpp"
 #include "op/scan/scan_plan.hpp"
 #include "scan_manager/split_provider.hpp"
 #include "sirius_config.hpp"
@@ -62,8 +61,9 @@ class parquet_split_provider : public split_provider {
    * @param names                   Column names in schema order.
    * @param scan_output_arity       Number of output columns the gpu scan
    *                                operator will return (== types.size() in
-   *                                the original operator). Used to derive the
-   *                                post-filter projection ids.
+   *                                the original operator). Used to split
+   *                                @p projection_ids into output vs pure-filter
+   *                                columns when building the scan_plan.
    * @param table_filter_set        Filter set for row-group pruning / pushdown.
    * @param partition_indices       Hive partition indices, if any.
    * @param approximate_batch_size  Target uncompressed bytes per row-group
@@ -90,13 +90,6 @@ class parquet_split_provider : public split_provider {
   parquet_split_provider(parquet_split_provider&&)                 = delete;
   parquet_split_provider& operator=(parquet_split_provider&&)      = delete;
 
-  /// \brief Take ownership of the closure that reshapes the reader's output to
-  ///        the scan_plan's D-order layout (reorder data columns, drop pure-filter
-  ///        columns, inject hive-partition columns). The caller installs it on
-  ///        the gpu scan operator. Returns an empty function when the scan plan
-  ///        is a trivial identity (no partitions, 1:1 data layout).
-  op::scan::partition_inject_fn_t take_partition_inject_fn();
-
   std::future<void> start(exec::thread_pool& pool, split_connector& connector) override;
 
  private:
@@ -120,8 +113,6 @@ class parquet_split_provider : public split_provider {
   /// The coalesced DuckDB filter expression (AST translation attempted in run_batch()).
   /// Empty when no filters were translatable (after skipping partition-column filters).
   std::shared_ptr<duckdb::Expression> _duckdb_filter_expression;
-  /// The post-read assembly closure for converting the read output to final output layout.
-  op::scan::partition_inject_fn_t _partition_inject_fn;
 
   std::size_t _approximate_batch_size;
   std::size_t _max_file_processed;
