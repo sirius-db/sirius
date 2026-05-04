@@ -32,12 +32,26 @@ using namespace sirius::op::scan;
 
 namespace {
 
+// `Connection::Query` returns a non-null QueryResult even on failure (the
+// error sits inside `result->HasError()`). A bare `REQUIRE(con.Query(...))`
+// silently passes when the query failed; this helper checks correctly and
+// surfaces the upstream error message in Catch2's INFO context.
+void exec_ok(duckdb::Connection& con, const std::string& q)
+{
+  auto result = con.Query(q);
+  REQUIRE(result);
+  if (result->HasError()) {
+    INFO("query failed: " << q << "\n  error: " << result->GetError());
+    REQUIRE_FALSE(result->HasError());
+  }
+}
+
 // Catalog access requires an active transaction. Each test case calls this
 // after table creation; the transaction stays open for the rest of the case
 // (DuckDB rolls it back on connection destruction).
 duckdb::DataTable& get_storage(duckdb::Connection& con, const std::string& table_name)
 {
-  REQUIRE(con.Query("BEGIN TRANSACTION"));
+  exec_ok(con, "BEGIN TRANSACTION");
   auto& ctx     = *con.context;
   auto& catalog = duckdb::Catalog::GetCatalog(ctx, "");
   duckdb::CatalogTransaction txn(catalog, ctx);
@@ -67,8 +81,8 @@ projected_column rowid_col()
 TEST_CASE("walker refuses empty projection", "[scan][duckdb_native_walker]")
 {
   auto [db_owner, con] = sirius::make_test_db_and_connection();
-  REQUIRE(con.Query("CREATE TABLE t(a INTEGER)"));
-  REQUIRE(con.Query("INSERT INTO t SELECT range FROM range(0, 100)"));
+  exec_ok(con, "CREATE TABLE t(a INTEGER)");
+  exec_ok(con, "INSERT INTO t SELECT range FROM range(0, 100)");
   auto& storage = get_storage(con, "t");
 
   auto md = walk_duckdb_native_metadata(storage, *con.context, {}, {});
@@ -79,7 +93,7 @@ TEST_CASE("walker refuses empty projection", "[scan][duckdb_native_walker]")
 TEST_CASE("walker refuses parallel-vector mismatch", "[scan][duckdb_native_walker]")
 {
   auto [db_owner, con] = sirius::make_test_db_and_connection();
-  REQUIRE(con.Query("CREATE TABLE t(a INTEGER)"));
+  exec_ok(con, "CREATE TABLE t(a INTEGER)");
   auto& storage = get_storage(con, "t");
 
   std::vector<projected_column> cols   = {real_col(0)};
@@ -92,8 +106,8 @@ TEST_CASE("walker refuses parallel-vector mismatch", "[scan][duckdb_native_walke
 TEST_CASE("walker refuses HUGEINT type", "[scan][duckdb_native_walker]")
 {
   auto [db_owner, con] = sirius::make_test_db_and_connection();
-  REQUIRE(con.Query("CREATE TABLE t(a HUGEINT)"));
-  REQUIRE(con.Query("INSERT INTO t VALUES (1), (2), (3)"));
+  exec_ok(con, "CREATE TABLE t(a HUGEINT)");
+  exec_ok(con, "INSERT INTO t VALUES (1), (2), (3)");
   auto& storage = get_storage(con, "t");
 
   std::vector<projected_column> cols   = {real_col(0)};
@@ -106,12 +120,12 @@ TEST_CASE("walker refuses HUGEINT type", "[scan][duckdb_native_walker]")
 TEST_CASE("walker emits descriptors for INTEGER table", "[scan][duckdb_native_walker]")
 {
   auto [db_owner, con] = sirius::make_test_db_and_connection();
-  REQUIRE(con.Query("CREATE TABLE t(a INTEGER)"));
+  exec_ok(con, "CREATE TABLE t(a INTEGER)");
   // 3000 rows ensures we cross a vector boundary; whether they materialise
   // into multiple segments depends on the storage path, but we get at
   // least one segment to inspect.
-  REQUIRE(con.Query("INSERT INTO t SELECT range FROM range(0, 3000)"));
-  REQUIRE(con.Query("CHECKPOINT"));  // force segment materialisation
+  exec_ok(con, "INSERT INTO t SELECT range FROM range(0, 3000)");
+  exec_ok(con, "CHECKPOINT");  // force segment materialisation
   auto& storage = get_storage(con, "t");
 
   std::vector<projected_column> cols   = {real_col(0)};
@@ -139,9 +153,9 @@ TEST_CASE("walker emits descriptors for INTEGER table", "[scan][duckdb_native_wa
 TEST_CASE("walker emits rowid sentinels with no segments", "[scan][duckdb_native_walker]")
 {
   auto [db_owner, con] = sirius::make_test_db_and_connection();
-  REQUIRE(con.Query("CREATE TABLE t(a INTEGER)"));
-  REQUIRE(con.Query("INSERT INTO t SELECT range FROM range(0, 100)"));
-  REQUIRE(con.Query("CHECKPOINT"));
+  exec_ok(con, "CREATE TABLE t(a INTEGER)");
+  exec_ok(con, "INSERT INTO t SELECT range FROM range(0, 100)");
+  exec_ok(con, "CHECKPOINT");
   auto& storage = get_storage(con, "t");
 
   std::vector<projected_column> cols   = {real_col(0), rowid_col()};
@@ -165,16 +179,47 @@ TEST_CASE("walker emits rowid sentinels with no segments", "[scan][duckdb_native
   }
 }
 
+TEST_CASE("walker rowid-only projection gets row_count from PartitionStats",
+          "[scan][duckdb_native_walker]")
+{
+  // Without partition_stats as a row_count source, a rowid-only projection
+  // (e.g. SELECT rowid FROM t) would produce row_count=0 for every row group
+  // because compute_row_counts has no non-rowid data segments to sum. That
+  // would silently zero out decoded_bytes_budget and break rowid synthesis.
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  exec_ok(con, "CREATE TABLE t(a INTEGER)");
+  exec_ok(con, "INSERT INTO t SELECT range FROM range(0, 1500)");
+  exec_ok(con, "CHECKPOINT");
+  auto& storage = get_storage(con, "t");
+
+  std::vector<projected_column> cols   = {rowid_col()};
+  std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::BIGINT)};
+  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  REQUIRE(md.viable);
+  REQUIRE_FALSE(md.row_groups.empty());
+
+  duckdb::idx_t total_rows = 0;
+  for (const auto& rg : md.row_groups) {
+    REQUIRE(rg.columns.size() == 1);
+    REQUIRE(rg.columns[0].is_rowid);
+    REQUIRE(rg.row_count > 0);
+    REQUIRE(rg.decoded_bytes_budget ==
+            static_cast<std::size_t>(rg.row_count) * sizeof(std::int64_t));
+    total_rows += rg.row_count;
+  }
+  REQUIRE(total_rows == 1500);
+}
+
 TEST_CASE("walker separates data and validity segments by column_path",
           "[scan][duckdb_native_walker]")
 {
   auto [db_owner, con] = sirius::make_test_db_and_connection();
-  REQUIRE(con.Query("CREATE TABLE t(a INTEGER)"));
+  exec_ok(con, "CREATE TABLE t(a INTEGER)");
   // Mix of values + nulls so the validity segment is non-trivial.
-  REQUIRE(
-    con.Query("INSERT INTO t SELECT CASE WHEN range % 7 = 0 THEN NULL ELSE range END "
-              "FROM range(0, 2000)"));
-  REQUIRE(con.Query("CHECKPOINT"));
+  exec_ok(con,
+          "INSERT INTO t SELECT CASE WHEN range % 7 = 0 THEN NULL ELSE range END "
+          "FROM range(0, 2000)");
+  exec_ok(con, "CHECKPOINT");
   auto& storage = get_storage(con, "t");
 
   std::vector<projected_column> cols   = {real_col(0)};
@@ -197,10 +242,10 @@ TEST_CASE("walker walks VARCHAR (Uncompressed) table without max-length stat nee
           "[scan][duckdb_native_walker]")
 {
   auto [db_owner, con] = sirius::make_test_db_and_connection();
-  REQUIRE(con.Query("CREATE TABLE t(s VARCHAR)"));
+  exec_ok(con, "CREATE TABLE t(s VARCHAR)");
   // Few enough rows + small dictionary cardinality to keep storage simple.
-  REQUIRE(con.Query("INSERT INTO t SELECT 'hello' FROM range(0, 200)"));
-  REQUIRE(con.Query("CHECKPOINT"));
+  exec_ok(con, "INSERT INTO t SELECT 'hello' FROM range(0, 200)");
+  exec_ok(con, "CHECKPOINT");
   auto& storage = get_storage(con, "t");
 
   std::vector<projected_column> cols   = {real_col(0)};
@@ -234,8 +279,8 @@ TEST_CASE("walker walks VARCHAR (Uncompressed) table without max-length stat nee
 TEST_CASE("walker refuses DECIMAL128 (precision > 18)", "[scan][duckdb_native_walker]")
 {
   auto [db_owner, con] = sirius::make_test_db_and_connection();
-  REQUIRE(con.Query("CREATE TABLE t(a DECIMAL(38, 0))"));
-  REQUIRE(con.Query("INSERT INTO t VALUES (1), (2), (3)"));
+  exec_ok(con, "CREATE TABLE t(a DECIMAL(38, 0))");
+  exec_ok(con, "INSERT INTO t VALUES (1), (2), (3)");
   auto& storage = get_storage(con, "t");
 
   std::vector<projected_column> cols   = {real_col(0)};
@@ -248,9 +293,9 @@ TEST_CASE("walker refuses DECIMAL128 (precision > 18)", "[scan][duckdb_native_wa
 TEST_CASE("walker accepts DECIMAL64 (precision <= 18)", "[scan][duckdb_native_walker]")
 {
   auto [db_owner, con] = sirius::make_test_db_and_connection();
-  REQUIRE(con.Query("CREATE TABLE t(a DECIMAL(18, 2))"));
-  REQUIRE(con.Query("INSERT INTO t VALUES (1.50), (2.25), (3.00)"));
-  REQUIRE(con.Query("CHECKPOINT"));
+  exec_ok(con, "CREATE TABLE t(a DECIMAL(18, 2))");
+  exec_ok(con, "INSERT INTO t VALUES (1.50), (2.25), (3.00)");
+  exec_ok(con, "CHECKPOINT");
   auto& storage = get_storage(con, "t");
 
   std::vector<projected_column> cols   = {real_col(0)};
@@ -266,8 +311,8 @@ TEST_CASE("walker refuses STRUCT projected type", "[scan][duckdb_native_walker]"
   // table that exists so storage access doesn't crash; the column we project
   // is a synthetic STRUCT logical_type that the walker is asked about.
   auto [db_owner, con] = sirius::make_test_db_and_connection();
-  REQUIRE(con.Query("CREATE TABLE t(a INTEGER)"));
-  REQUIRE(con.Query("INSERT INTO t VALUES (1)"));
+  exec_ok(con, "CREATE TABLE t(a INTEGER)");
+  exec_ok(con, "INSERT INTO t VALUES (1)");
   auto& storage = get_storage(con, "t");
 
   std::vector<projected_column> cols   = {real_col(0)};
@@ -280,8 +325,8 @@ TEST_CASE("walker refuses STRUCT projected type", "[scan][duckdb_native_walker]"
 TEST_CASE("walker refuses LIST projected type", "[scan][duckdb_native_walker]")
 {
   auto [db_owner, con] = sirius::make_test_db_and_connection();
-  REQUIRE(con.Query("CREATE TABLE t(a INTEGER)"));
-  REQUIRE(con.Query("INSERT INTO t VALUES (1)"));
+  exec_ok(con, "CREATE TABLE t(a INTEGER)");
+  exec_ok(con, "INSERT INTO t VALUES (1)");
   auto& storage = get_storage(con, "t");
 
   std::vector<projected_column> cols   = {real_col(0)};
@@ -295,12 +340,12 @@ TEST_CASE("walker refuses unsupported data compression (force ZSTD)",
           "[scan][duckdb_native_walker]")
 {
   auto [db_owner, con] = sirius::make_test_db_and_connection();
-  REQUIRE(con.Query("PRAGMA force_compression='zstd'"));
-  REQUIRE(con.Query("CREATE TABLE t(a INTEGER)"));
+  exec_ok(con, "PRAGMA force_compression='zstd'");
+  exec_ok(con, "CREATE TABLE t(a INTEGER)");
   // Enough rows so ZSTD actually applies (it bails to Uncompressed for
   // very small segments).
-  REQUIRE(con.Query("INSERT INTO t SELECT range FROM range(0, 5000)"));
-  REQUIRE(con.Query("CHECKPOINT"));
+  exec_ok(con, "INSERT INTO t SELECT range FROM range(0, 5000)");
+  exec_ok(con, "CHECKPOINT");
   auto& storage = get_storage(con, "t");
 
   std::vector<projected_column> cols   = {real_col(0)};

@@ -216,11 +216,19 @@ duckdb_segment_descriptor build_segment_descriptor(const duckdb::ColumnSegmentIn
   return desc;
 }
 
-// Every non-rowid column in a row group covers the same row range, so the
-// segment_counts on any one column give the row count.
-void compute_row_counts(duckdb_native_metadata& md)
+// PartitionStatistics::count is the source of truth — it's correct even when
+// the projection is rowid-only (no data segments to sum) or when every
+// projected non-rowid column happens to have zero data segments. Falls back
+// to summing data segments only when partition stats don't cover this row
+// group (shouldn't happen at v1.5.2 but defensive).
+void compute_row_counts(duckdb_native_metadata& md,
+                        const std::vector<duckdb::PartitionStatistics>& partition_stats)
 {
   for (auto& rg_md : md.row_groups) {
+    if (rg_md.row_group_index < partition_stats.size()) {
+      rg_md.row_count = partition_stats[rg_md.row_group_index].count;
+      continue;
+    }
     duckdb::idx_t row_count = 0;
     for (const auto& col_md : rg_md.columns) {
       if (col_md.is_rowid) { continue; }
@@ -427,7 +435,7 @@ duckdb_native_metadata walk_duckdb_native_metadata(
     }
   }
 
-  compute_row_counts(md);
+  compute_row_counts(md, partition_stats);
   compute_decoded_byte_budgets(md, projected_types);
   drop_empty_trailing_row_groups(md);
 
