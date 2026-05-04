@@ -99,6 +99,8 @@ size_t copy_pinned_slices_to_device(
     copied += n;
   }
 
+#if CUDA_VERSION >= 12080
+  // cudaMemcpyBatchAsync available since CUDA 12.8 — issue all copies in one driver call.
   cudaMemcpyAttributes attrs{};
   attrs.srcAccessOrder  = cudaMemcpySrcAccessOrderStream;
   attrs.srcLocHint.type = cudaMemLocationTypeHost;
@@ -112,6 +114,15 @@ size_t copy_pinned_slices_to_device(
   if (err != cudaSuccess)
     throw std::runtime_error(std::string("sirius_ioctx: cudaMemcpyBatchAsync failed at idx ") +
                              std::to_string(fail_idx) + ": " + cudaGetErrorString(err));
+#else
+  // Fallback for CUDA < 12.8: sequential stream-ordered copies.
+  for (size_t i = 0; i < n_nonempty; ++i) {
+    auto err = cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyHostToDevice, stream.value());
+    if (err != cudaSuccess)
+      throw std::runtime_error(std::string("sirius_ioctx: cudaMemcpyAsync failed at idx ") +
+                               std::to_string(i) + ": " + cudaGetErrorString(err));
+  }
+#endif
   return copied;
 }
 
