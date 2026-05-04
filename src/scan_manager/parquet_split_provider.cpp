@@ -321,40 +321,54 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
       if (cur_rgs.empty()) { return; }
       accum.slices.emplace_back(
         file_metadata, file_path, std::move(cur_rgs), cur_uncompressed_bytes, cur_compressed_bytes);
+      // Promote the just-sealed slice's uncompressed bytes into the cross-file accumulator.
+      accum.total_uncompressed_bytes += cur_uncompressed_bytes;
+      cur_rgs.clear();
+      cur_uncompressed_bytes = 0;
+      cur_compressed_bytes   = 0;
     };
 
-    auto accumulate_chunk = [&](cudf::io::parquet::ColumnChunk const& chunk, bool is_pure_filter) {
-      auto const& column_metadata = chunk.meta_data;
-      // Pure filter columns are not part of the scan result, so we omit them from the
-      // uncompressed byte count used for sizing partitions.
-      if (column_metadata.total_uncompressed_size > 0 && !is_pure_filter) {
-        cur_uncompressed_bytes += static_cast<std::size_t>(column_metadata.total_uncompressed_size);
-      }
-      if (column_metadata.total_compressed_size > 0) {
-        cur_compressed_bytes += static_cast<std::size_t>(column_metadata.total_compressed_size);
-      }
-    };
-
-    for (auto const rg_idx : row_group_indices) {
-      auto const& row_group = metadata.row_groups[rg_idx];
+    // Compute the row group's contribution
+    auto rg_contribution = [&](cudf::io::parquet::RowGroup const& row_group) {
+      std::size_t rg_uncompressed = 0;
+      std::size_t rg_compressed   = 0;
+      auto add_chunk = [&](cudf::io::parquet::ColumnChunk const& chunk, bool is_pure_filter) {
+        auto const& column_metadata = chunk.meta_data;
+        // Pure-filter columns are not part of the scan result, so omit them from the
+        // uncompressed byte count used for sizing partitions.
+        if (!is_pure_filter) {
+          rg_uncompressed += static_cast<std::size_t>(column_metadata.total_uncompressed_size);
+        }
+        rg_compressed += static_cast<std::size_t>(column_metadata.total_compressed_size);
+      };
       if (_plan->is_projected()) {
         for (auto const chunk_idx : selected_chunk_indices) {
-          accumulate_chunk(row_group.columns[chunk_idx],
-                           pure_filter_chunk_indices.contains(chunk_idx));
+          add_chunk(row_group.columns[chunk_idx], pure_filter_chunk_indices.contains(chunk_idx));
         }
       } else {
         // Non-projected: all chunks contribute, no pure-filter pruning.
         for (auto const& chunk : row_group.columns) {
-          accumulate_chunk(chunk, false);
+          add_chunk(chunk, false);
         }
       }
+      return std::pair{rg_uncompressed, rg_compressed};
+    };
 
+    for (auto const rg_idx : row_group_indices) {
+      auto const& row_group        = metadata.row_groups[rg_idx];
+      auto const [rg_unc, rg_comp] = rg_contribution(row_group);
+
+      // Ensure that a single oversized rg/file still gets through.
       if (!accum.slices.empty() || !cur_rgs.empty()) {
-        if (accum.total_uncompressed_bytes + cur_uncompressed_bytes > _approximate_batch_size) {
+        if (accum.total_uncompressed_bytes + cur_uncompressed_bytes + rg_unc >
+            _approximate_batch_size) {
           seal_current_file();
           flush();
         }
       }
+
+      cur_uncompressed_bytes += rg_unc;
+      cur_compressed_bytes += rg_comp;
       cur_rgs.push_back(rg_idx);
     }
     seal_current_file();
