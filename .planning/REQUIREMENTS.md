@@ -128,8 +128,8 @@
 | REG-05 | 21 | Pending |
 | REG-06 | 21 | Pending |
 
-**Coverage:** 32 / 32 requirements mapped to phases. Roadmapper to fill in plan-level traceability once ROADMAP.md is written.
+**Coverage:** 32 / 32 requirements mapped to phases. Validated by roadmapper 2026-05-04. Phase assignments confirmed against compile-graph dependency order: 16 → 17 → 18 → 19 → 20 → 21. Plan-level traceability will be filled in by /gsd:plan-phase as each phase is planned.
 
 ---
 
-*Defined: 2026-05-04 — v1.4 milestone scoped via `/gsd:new-milestone`. 6 phases (16-21). Light gates per phase + full gauntlet at Phase 21.*
+*Defined: 2026-05-04 — v1.4 milestone scoped via `/gsd:new-milestone`. 6 phases (16-21). Light gates per phase + full gauntlet at Phase 21. ROADMAP.md written 2026-05-04 — traceability validated.*

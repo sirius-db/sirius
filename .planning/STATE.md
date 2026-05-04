@@ -2,15 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Rebase After DataBatch Changes
-status: defining_requirements
-stopped_at: "v1.4 started 2026-05-04 — milestone summary confirmed (cucascade origin/main rebase + Sirius origin/dev rebase, in-place on feature/single-node-multi-gpu2). PROJECT.md updated; REQUIREMENTS.md is next."
+status: phase_planning_ready
+stopped_at: "v1.4 ROADMAP created 2026-05-04 — 6 phases (16-21), 32 requirements mapped. Phase 16 is the next plannable phase. Run /gsd:plan-phase 16 to begin."
 last_updated: "2026-05-04T00:00:00.000Z"
 last_activity: 2026-05-04
 progress:
-  total_phases: 0
+  total_phases: 6
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
+  total_requirements: 32
   percent: 0
 ---
 
@@ -21,14 +22,29 @@ progress:
 See: .planning/PROJECT.md (updated 2026-05-04)
 
 **Core value:** Any query can transparently execute across every GPU on the node — tasks are scheduled to the GPU where their input data already resides, memory pressure is absorbed by downgrading to the correct NUMA domain, and parquet I/O is routed through a multi-GPU-safe backend.
-**Current focus:** v1.4 — rebase Sirius (`feature/single-node-multi-gpu2`) onto cucascade `origin/main` and Sirius `origin/dev` after the cucascade DataBatch RAII refactor (PR #117) and the dev-side IO Framework / Scan Manager / Pin Tables / cucascade-compat work landed.
+**Current focus:** v1.4 — rebase Sirius (`feature/single-node-multi-gpu2`) onto cucascade `origin/main` (PR #117 DataBatch RAII refactor + #112 + #116) and Sirius `origin/dev` (#675 IO Framework, #731 Scan Manager, #721 Pin Tables, #739 cucascade-compat, #733/#734/#735) while preserving all v1.1+v1.2+v1.3 multi-GPU behavior.
 
 ## Current Position
 
-Phase: Not started (defining requirements)
-Plan: —
-Status: Defining requirements
-Last activity: 2026-05-04 — Milestone v1.4 started
+Phase: 16 (next plannable)
+Plan: — (not yet planned)
+Status: Phase planning ready; run `/gsd:plan-phase 16` to begin
+Last activity: 2026-05-04 — ROADMAP.md created, 6 phases and 32 requirements mapped, STATE.md initialized
+
+```
+v1.4 Progress: [                    ] 0/6 phases | 0/32 requirements | 0 plans
+```
+
+## Phase Overview (v1.4)
+
+| Phase | Name | Requirements | Status |
+|-------|------|--------------|--------|
+| 16 | Cucascade Submodule Rebase + Pin Recovery | CC-01..04 | Not started |
+| 17 | Sirius origin/dev Merge — Base Layer | MERGE-01..05 | Not started |
+| 18 | DataBatch RAII Migration | DB-01..05 | Not started |
+| 19 | IO Framework Adoption | IO-12..17 | Not started |
+| 20 | Scan Manager + Pin Tables Port | SM-01..06 | Not started |
+| 21 | v1.4 Ship Gate | REG-01..06 | Not started |
 
 ## Performance Metrics
 
@@ -104,42 +120,21 @@ Last activity: 2026-05-04 — Milestone v1.4 started
 - [Phase 10-table-function-form-gpu-execution-sigsegv-fix]: std::optional<rmm::cuda_stream> owned_stream declared BEFORE owned_literals in translated_expression struct — C++ reverse-destruction order ensures stream outlives scalars for cudaFreeAsync
 - [Phase 10]: [10-04] Verdict PARTIAL: Phase 10 fix objective (filter equality parquet + tpch_q1_sf10_2gpu GREEN) COMPLETE; pre-existing [mgpu-audit] SIGSEGV prevents All tests passed
 - [Phase 10]: [10-04] SF100 Q1 2-GPU ship-gate PASS: exit 0, 5.70s, 4 rows, byte-identical vs 1-GPU baseline, GPU0=42 GPU1=29 intersection=0
-- [Phase 12]: [12-01] Fix-site identified: src/op/sirius_physical_hash_join.cpp:623 — sirius::op::prepare_join_keys -> cudf::table_view::select(key_col_indices) throws std::out_of_range when key_col_indices contains 2 on a 2-column table_view. HASH_JOIN appears here because Sirius's distributed-sort plan uses HASH_JOIN as a partitioner. Bug is upstream in left/right_key_col_indices construction. cucascade fully ruled out (no partition_idx out of range text).
-- [Phase 12]: [12-01] Bare-shell GDB cannot reach SORT plan under agent sandbox (NVML driver isolation -> cucascade::topology_discovery=0 GPUs). Use mcp__project-commands__run_debug mode=gdb instead — the project-commands daemon has driver visibility on this host.
-- [Phase 12]: [12-01] Plan's verbatim 'catch throw std::out_of_range' GDB syntax does not filter by exception type — uses generic throw catchpoint. Replaced with 'catch throw' + Python guard inspecting __cxa_throw tinfo arg to skip past unrelated std::runtime_error throws (extension load + test setup) before reaching target std::out_of_range. Reusable pattern for future catchpoint triage.
-- [Phase 12]: [12-02] Bound-checked key_col_indices in sirius::op::prepare_join_keys (no-cast fast path) at src/op/sirius_physical_hash_join.cpp:622-637 with INVARIANT comment naming vector and valid range [0, table.num_columns()). Failing test 'physical_order - small sort stays single-GPU' now passes (27 assertions, 5.2s, exit 0). HYG baseline preserved at 40 occurrences. Did NOT widen to upstream planner fix per minimal-patch constraint; slow path (cast_necessary=true) deferred per scope-boundary rule.
-- [Phase 12]: [12-03] Added regression TEST_CASE 'physical_order - small sort rangecheck regression' (test_physical_order_mgpu.cpp:120-165) reusing scoped_mgpu_env+require_gpu_matches_cpu helpers. Final tuned constants: kNumFiles=4, kRowsPerFile=256, hash_partition_bytes=1024 (first try).
-- [Phase 12]: [12-03] Empirical regression-gate proof via git checkout-and-stash round-trip on src/op/sirius_physical_hash_join.cpp: pre-12-02 tree fails with verbatim 12-stack-trace.txt message 'vector::_M_range_check: __n (which is 2) >= this->size() (which is 2)'; post-restore PASS. Plan recipe (bare git stash) substituted with git checkout 289d6d2^ -- <file> + git checkout HEAD -- <file>; semantic outcome identical.
-- [Phase 12]: [12-04] Phase 12 ship-gate validation PASS — all 4 CONTEXT.md acceptance criteria verified via real MCP runs: small-sort test (27 assertions), regression test (19 assertions), [mgpu] suite 12/15 pass with 2 failures classified Phase 14 territory by 'gpu0 pipelines=0 gpu1 pipelines=N' shape, TPC-H × 2-GPU integration 48/48 pass (71608 assertions). No new regressions. TPC-H × 2-GPU MCP command DISCOVERED (not guessed): no dedicated tpch-mgpu command exists; used unit-tests filter='[integration][TPC-H]' + filter='[mgpu-audit][TPC-H]'. Orchestrator advances to Phase 13.
-- [Phase 13]: [13-01] Reproduction PASS: authoritative [TPC-H][parquet] repro reproduced CONTEXT.md SIGTERM-at-Q11 verbatim (10/22 progress, 1800s timeout, num_gpus=2). Cheap follow-up #17 scale-up at kIterations=20 + Phase 14 SCHED-RR did NOT reproduce on this 2 x RTX 6000 Ada host (peer-DMA host-staged); cheap repro is dead, Wave 2 must use authoritative repro for compute-sanitizer attachment.
-- [Phase 13]: [13-01] Phase 14 patch in 14-CONTEXT.md is documentation-style (missing --- a/.../+++ b/... headers); git apply rejects. Future Phase 14 land must produce a proper unified diff. Workaround: apply via direct file edits matching diff verbatim — applied here in working tree, reverted before commit.
-- [Phase 13]: [13-01] Branch base correctly transitioned: fix/q11-mgpu-illegal-address off feature/single-node-multi-gpu2 @ 86e821a. Diff-empty against base for the four Phase 14 files (task_scheduler.hpp/cpp, task_creator.hpp, test_physical_hash_join_mgpu.cpp) = 0 lines. HYG-02 baseline preserved at 40.
-- [Phase 13]: [13-02] FIRST stream-ordered race localized to cucascade::convert_gpu_to_gpu at cucascade/src/data/representation_converter.cpp:801; race shape is peer-copy reader reads source memory before writer stream's cudaMallocAsync event propagates to reader stream (brute-force source-device cudaDeviceSynchronize at line 827 is insufficient for cross-mempool stream-ordering).
-- [Phase 13]: [13-02] Recommended fix shape: cucascade-side gpu_table_representation extension with set_writer_event/get_writer_event accessor + cudaStreamWaitEvent in convert_gpu_to_gpu before peer copies; submodule bump REQUIRED. All 4 CONTEXT.md hypotheses (#1-#4) DEAD on this evidence — Wave 3's per-hypothesis falsifier is now redundant.
-- [Phase 13]: [13-02] Sanitizer wall-clock anomaly: under compute-sanitizer all 22 [TPC-H][parquet] queries PASS exit 0 in 132.9s with 433 stream-ordered-race errors detected — sanitizer's stream-ordering checks serialize launches enough to mask the un-sanitized 1800s SIGTERM. Errors are still definitive proof of the race; the deadlock is just a downstream consequence of GPU context corruption from the race.
-- [Phase 13]: [13-02] MCP compute-sanitizer flag-passing pitfall: runner injects --tool memcheck --leak-check full automatically; user-supplied --tool memcheck causes 'option cannot be specified more than once' CLI error. Pass only discriminating flags (--track-stream-ordered-races=all, --show-backtrace, --launch-timeout, --print-limit, --log-file). Pattern documented for future sanitizer plans.
-- [Phase 13]: [13-03] All 3 Wave 3 falsifiers (#2/#3/#4) AGREE with Wave 2A's verdict that all 4 CONTEXT.md hypotheses are DEAD. #3 DEAD direct: zero pop_data_batch/_cv.wait/pthread_cond_wait frames in 760KB sanitizer log. #4 DEAD direct: 101 OOM events show global usage 15360→20045 bytes (30% warm-up bump in first 10 events) → plateau at 20045 for next 91 events; bounded steady-state, not monotonic accumulation. #2 DEAD via Wave 2A subsumption (no partition.cpp frame in FIRST-error backtrace); direct falsifier INCONCLUSIVE due to MCP env-passing limitation + probe coverage gap. #1 SKIPPED per RESEARCH ranking. Overall Corroboration: AGREE.
-- [Phase 13]: [13-03] MCP env-passing limitation reconfirmed at Wave 3: unit-tests command accepts only filter= per list_commands schema; cannot propagate SIRIUS_LOG_LEVEL=debug. Cheap repro doesn't fire bug on consumer 2 x RTX 6000 Ada host (peer-DMA host-staged; same Wave 1 anomaly). Existing [mgpu-probe] coverage at host_parquet_to_gpu + prepare_for_processing only — NOT at sirius_physical_partition::execute despite stale claim in project_phase08_fu17.md. Recommended follow-ups (out of Phase 13 scope): extend MCP wrapper for env passthrough; add partition-execute probe; refresh memory entry.
-- [Phase 13]: [13-03] Wave 4 fix scope unambiguously bounded by combining 13-race-site.txt + 13-falsifiers.txt: cucascade-side gpu_table_representation extension with set_writer_event/get_writer_event accessor + cudaStreamWaitEvent in convert_gpu_to_gpu before peer copies; submodule bump REQUIRED. No need to investigate cuco lifecycle, partition sibling state, pop_data_batch CV, or reservation tracker as primary causes — all DEAD.
-- [Phase 13]: [13-04] PARTIAL fix: cucascade pin bumped to 7409c60 (writer-event lineage in convert_gpu_to_gpu) + 7 Sirius producer sites migrated to make_data_batch(writer_stream) overload. Sanitizer 433->328 errors (24% reduction); Q11-alone PASS (9011 assertions, 7s); Q1-Q22 cumulative under SCHED-RR STILL SIGTERMs at Q11 (1800s timeout). ~22 producer sites remain un-migrated (left_delim_join::sink confirmed; compute_task generic-frame writers unconfirmed). Plan 13-05 needed to complete migration. Phase 14 BLOCKED until 13-05 closes residual writer-event coverage gap.
-- [Phase 14-01]: std::unordered_map -> std::map for _gpu_executors so begin()->first is ascending-by-device_id deterministic, not hash-bucket-order
-- [Phase 14-01]: Atomic round-robin counter (_no_pref_rr_counter) gated on \!have_pref && size>1 so preference-bearing tasks keep SCHED-01/02/04 locality and 1-GPU configurations are untouched
-- [Phase 14-01]: Per-query reset of _no_pref_rr_counter in prepare_for_query (store(0, std::memory_order_relaxed)) so cache=table_gpu warm-path stays correct across same-query iterations
-- [Phase 14-01]: Patch applied via Edit tool, not git apply — diff in 14-CONTEXT.md is documentation-style without --- a/.../+++ b/... headers; Phase 13 Wave 1 + Wave 4 both proved git apply rejects
-- [Phase 14]: [14-02] Phase 14 ship-gate VALIDATION: Overall PASS via 4 MCP runs against committed Plan 14-01 (d4009e2). C1 [mgpu] 12/13 PASS-with-Phase-12-note (small-sort vector::_M_range_check is fix/order-small-sort-rangecheck @ 289d6d2 territory, NOT in feat/sched-rr-distribution ancestry — same precedent as 13-VALIDATION.md). C2 [TPC-H][parquet] 22/22 PASS in 80.3s (in-noise vs Phase 13's 75.9s; Q11 specifically clean). C4 follow-up #17 scale-up PASS in 7.3s (kIterations=3 satisfies criterion). C3 SF1 1-GPU vs 2-GPU DEFERRED — neither tpch-benchmark nor tpch-parquet expose num_gpus arg, MCP wrapper env-passthrough limit per [13-03], bare-bash workaround forbidden by feedback_use_mcp_build memory. Regression [integration][TPC-H] 48/48, 71608 assertions, 151.8s. HYG-02=40 preserved. Phase 15 unblocked.
-- [Phase 15-01]: All 11 audited operator sites classified SAFE: each operator's execute() dynamic-casts its input to pipelineable_operator_data (or derived partitioned_operator_data); the input vector is the same _data_batches that gpu_pipeline_task::execute (gpu_pipeline_task.cpp:332) lock-converted onto target_space via prepare_for_processing -> lock_or_prepare_batch. POSTCONDITION batches[0]->get_memory_space() == target_space holds at every site.
-- [Phase 15-01]: Smoking-gun replacement (top_n.cpp:240): replaced 'all batches are expected to share the same space in practice' with verified INVARIANT (SCHED-RR contract) phrasing rather than augmenting; original phrasing was exactly the unverified-assumption-language this audit removes.
-- [Phase 15-01]: Plan 15-01 verify-vs-must_have inconsistency resolved per orchestrator's success_criteria: the structured summary line '## Classification: SAFE=11 NEEDS-PATCH=0 UNCLEAR=0' is mandatory and contains the literal tokens that the strict '\! grep -F' rule would forbid. Followed orchestrator's interpretation; no per-site row carries a non-SAFE verdict.
-- [Phase 15-01]: Branch audit/mgpu-operator-colocation off current Phase 15 docs HEAD 11d20b9; ancestry verified via git merge-base --is-ancestor 0ee3166 HEAD = true (descends from Phase 14 HEAD). Comment-only commit b91afc3 lands 9 operator files + 15-AUDIT-LOG.md.
-- [Phase 15]: [15-02] Test-only setter task_scheduler::set_no_pref_rr_counter_for_testing(size_t) added header-inline (gated by '// for testing/stress only' comment) so stress tests inject arbitrary SCHED-RR counter starting offsets. Setter is canonical because warm-up cannot persist counter state — prepare_for_query resets to 0 every query for cache=table_gpu correctness.
-- [Phase 15]: [15-02] scoped_mgpu_env::get_task_scheduler(duckdb::Connection&) takes a Connection arg rather than holding one — the env doesn't own a connection (callers create via make_connection()), and SiriusContext is shared across all connections via OnConnectionOpened. Slight signature deviation from plan template; semantically equivalent.
-- [Phase 15]: [15-02] Stress test: 100 iterations × 5 pre-bound representative [mgpu] queries = 500 inner runs; verbatim MCP run-log captured at .planning/phases/15-mgpu-operator-colocation-audit/15-02-stress-run.log proves BEHAVIORAL gate (test EXECUTED + PASSED, not just compiled). 86.6s wall-clock, 77053 assertions, exit 0 — 21x under the MCP 30-min wrapper budget. Input scale reduced ~10x vs source [mgpu] tests to fit MCP wrapper timeout (Rule 3 deviation); SQL shape is verbatim from source.
-- [Phase 15-03]: Inserted per-task-device contract section between Tasks (line 113 baseline) and Pipeline Executor (line 114 baseline) in pipeline-execution.md. New section spans 186 lines with 4-layer enforcement walkthrough (gpu_pipeline_task::execute -> prepare_for_processing -> lock_or_prepare_batch) plus SCHED-RR distribution policy quotes.
-- [Phase 15-03]: Single-commit pattern (abe5cdb) covers both docs/super-sirius/pipeline-execution.md and docs/super-sirius/README.md atomically. Direct git commit --no-verify used because gsd-tools commit short-circuits with skipped_gitignored on this repo (.planning/ is gitignored — same blocker as Plan 15-01).
-- [Phase 15-03]: last-updated-commit marker bumped from 662eb28d to 75392110 (HEAD-at-edit-time = parent of new commit). Convention preserved: marker records tree state docs were reviewed against, not the new commit itself.
-- [Phase 15]: [15-04] Phase 15 ship-gate: Overall PASS via 4 MCP runs + 3 bash runs. C1 (audit) PASS — 11 INVARIANT comments, SAFE=11 NEEDS-PATCH=0 UNCLEAR=0. C2 (stress) PASS — exit 0, 87.1s, 77053 assertions (in-noise vs Wave 2's 86.6s). C3 (docs) PASS — per-task-device contract documented in pipeline-execution.md (4 hits) + README.md ToC (1 hit). Regression: [mgpu] PASS-with-Phase-12-note (12/13, identical Phase-12 single failure as Phase 14 baseline; resolved by FU-A merge below); [TPC-H][parquet] PASS — 22/22 in 81.6s, +1.6% vs Phase 14, Q11 specifically clean (CRITICAL Q11 home filter); [integration][TPC-H] reconciled PASS — 48/48 in 2:43, 71608 assertions (the earlier 1800s MCP timeout was a transient on this consumer host; 13-04 verdict reconciled PARTIAL → PASS). HYG-02 = 40 preserved. Phase 15 ships PASS.
-- [FU-A]: Merged `fix/order-small-sort-rangecheck` (Phase 12) into the v1.3 release-branch tip (`audit/mgpu-operator-colocation`). Source-conflict-free auto-merge of `src/op/sirius_physical_hash_join.cpp` (Phase 12 touched `prepare_join_keys` line ~622; Phase 13-04 touched constructor signatures elsewhere). Test addition in `test_physical_order_mgpu.cpp` integrates cleanly. STATE.md and ROADMAP.md conflicts resolved by keeping the post-Phase-15 view; Phase 12 planning files (12-01..12-04 SUMMARY, 12-VALIDATION, 12-stack-trace.txt) added.
-- [FU-A]: Post-merge MCP `[mgpu]` run 16/16 PASS, 79091 assertions, exit 0, 120.3s — was 12/13 pre-merge. The Phase 12 fix (bound-check on `key_col_indices` in `prepare_join_keys`) flipped `physical_order - small sort stays single-GPU` from FAIL → PASS, and the new `physical_order - small sort rangecheck regression` TEST_CASE (Phase 12 wave 3) joins the suite. The previously-reported 12/13 baseline lift target (14/14) was conservative; actual is 16/16 because the same filter now also captures the Phase 15 `mgpu_stress - SCHED-RR counter offset rotation` test (already passing on Phase 15 alone).
+- [Phase 12]: [12-01] Fix-site identified: src/op/sirius_physical_hash_join.cpp:623 — sirius::op::prepare_join_keys -> cudf::table_view::select(key_col_indices) throws std::out_of_range when key_col_indices contains 2 on a 2-column table_view.
+- [Phase 12]: [12-02] Bound-checked key_col_indices in sirius::op::prepare_join_keys at src/op/sirius_physical_hash_join.cpp:622-637. HYG baseline preserved at 40.
+- [Phase 12]: [12-03] Added regression TEST_CASE 'physical_order - small sort rangecheck regression' (test_physical_order_mgpu.cpp:120-165).
+- [Phase 12]: [12-04] Phase 12 ship-gate validation PASS — all 4 CONTEXT.md acceptance criteria verified. TPC-H × 2-GPU integration 48/48 pass (71608 assertions).
+- [Phase 13]: [13-02] FIRST stream-ordered race localized to cucascade::convert_gpu_to_gpu at cucascade/src/data/representation_converter.cpp:801; fix shape: cucascade-side gpu_table_representation extension with set_writer_event/get_writer_event accessor + cudaStreamWaitEvent.
+- [Phase 13]: [13-04] PARTIAL fix: cucascade pin bumped to 7409c60; Q11-alone PASS (9011 assertions, 7s). Residual ~22 producer sites migrated via Path-2 architectural fix in subsequent work.
+- [Phase 14-01]: std::unordered_map -> std::map for _gpu_executors for deterministic iteration; Atomic round-robin counter (_no_pref_rr_counter) gated on !have_pref && size>1; Per-query reset of _no_pref_rr_counter in prepare_for_query.
+- [Phase 14]: [14-02] Phase 14 ship-gate PASS via 4 MCP runs. C1 [mgpu] 12/13 PASS-with-Phase-12-note. C2 [TPC-H][parquet] 22/22. [integration][TPC-H] 48/48, 71608 assertions. HYG-02=40.
+- [Phase 15-01]: All 11 audited operator sites classified SAFE — SCHED-RR INVARIANT contract holds. SAFE=11 NEEDS-PATCH=0 UNCLEAR=0.
+- [Phase 15]: [15-02] [mgpu_stress] test: 100 iterations × 5 representative [mgpu] queries = 500 inner runs; 86.6s, 77053 assertions, exit 0.
+- [Phase 15]: [15-04] Phase 15 ship-gate PASS. All gauntlet criteria green. [mgpu] 16/16 post-FU-A merge.
+- [FU-A]: Merged fix/order-small-sort-rangecheck into Phase 15 tip. [mgpu] lifted 12/13 → 16/16 (79091 assertions, 120.3s, exit 0).
+- **[v1.4 ROADMAP]** 2026-05-04: 6 phases (16-21) created. 32 requirements mapped 100%. Phase 16 is the first plannable phase. Compile-graph dependency chain: 16 → 17 → 18 → 19 → 20 → 21. Verification policy: light gates per phase 16-20 (grep + targeted unit tests + SF1 smoke); full v1.3 gauntlet at Phase 21 only.
+- **[v1.4 ROADMAP]** Key ordering constraint: Phase 19 (IO Framework) must precede Phase 20 (Scan Manager) because `parquet_split_provider::run_batch` calls `sirius_datasource` — compile-graph dependency. This overrides FEATURES.md's original Scan Manager-first proposal; ARCHITECTURE.md's ordering is adopted.
+- **[v1.4 ROADMAP]** Phase 17 expected build errors: 26+ `batch->get_data() is private` errors + RAII compile errors. These are EXPECTED and do not constitute a phase failure. Documented in MERGE-05.
 
 ## Accumulated Context
 
@@ -148,47 +143,33 @@ Last activity: 2026-05-04 — Milestone v1.4 started
 - **Bug site:** `pipelineable_operator_data::prepare_for_processing` → `pipeline::lock_or_prepare_batch` → `cuda_memcpy.cu:42`
 - **Error:** `cudaErrorInvalidValue: invalid argument`
 - **Trigger:** non-trivial SQL (filter+sort, aggregation, join, TPC-H Q1/Q6/Q12) when `num_gpus >= 2`
-- **Not triggered:** trivial SQL (`SELECT count(*) FROM nation`) — pipeline tasks distribute to both GPUs, returns correct result
-- **Root cause signal:** cross-device stream-correctness. Same shape as the Sirius-side P2P converter override (`src/data/sirius_p2p_converter.cpp`) — pack on source-device RAII + source stream, copy on target stream.
-- **Reproduction:** set `num_gpus: 2` in `test/cpp/integration/integration.yaml`, run any TPC-H parquet/join integration test → fails. Same tests pass on `num_gpus: 1`.
-- **Existing observability:** `[mgpu-audit]` info-level dispatch logs in `src/pipeline/pipeline_executor.cpp:247-249` + `src/op/scan/duckdb_scan_executor.cpp:180-184` (from commit `fd24174`).
-- **Evidence:** `.planning/milestones/v1.1-E2E-VERIFICATION.md` (full report: 389 lines, reproduction steps, v1.2 recommendations).
+- **Root cause signal:** cross-device stream-correctness. Same shape as the Sirius-side P2P converter override.
+- **Existing observability:** `[mgpu-audit]` info-level dispatch logs in `src/pipeline/pipeline_executor.cpp:247-249` + `src/op/scan/duckdb_scan_executor.cpp:180-184`.
+- **Evidence:** `.planning/milestones/v1.1-E2E-VERIFICATION.md`.
 
 ### Decisions carried from v1.1
 
-- **Sirius-side converter override is the fix pattern** for cross-device stream-correctness bugs (Pattern 2 from Plan 07 research). Same approach applies to `lock_or_prepare_batch`.
+- **Sirius-side converter override is the fix pattern** for cross-device stream-correctness bugs (Pattern 2 from Plan 07 research).
 - **Sticky `cudaGetLastError()` consume** is required after any cuda* call that can leave state in the thread-local slot.
 
-### Roadmap Evolution
+### v1.4 Critical Context
 
-- Phase 10 added (2026-04-24): TABLE_FUNCTION-form gpu_execution SIGSEGV fix — closes v1.2 ship-gate CRIT-1/2/6 after Phase 9 distributor fix proved correct at SF100 but unit-test SIGSEGV in `SELECT * FROM gpu_execution(...)` result-materialization path blocked the ship. Scope: bisect `3b58258..c0e12f3` → gdb → targeted fix → re-run 09-04 ship-gate. Evidence in `.planning/phases/09-scan-task-distributor-batch-ownership-affinity/09-VERIFICATION.md`.
-- v1.3 milestone scoped (2026-04-29): "Multi-GPU Distribution" — deliver real source-pipeline parallelism across GPUs. Architectural unblock landed as `86e821a fix(parquet scan): re-translate AST filter on the scan task's current device` (cudf::ast scalars are device-resident; metadata-scan-built filter would silently prune all row groups when read on a different GPU). Four follow-up phases scoped:
-  - Phase 12 added (2026-04-29): Fix `vector::at(2)` correctness bug in small-sort plan path. Reproduces independent of distribution policy. User-relaxed: only correctness matters, can distribute or not. Context: `.planning/phases/12-small-sort-vector-rangecheck-fix/12-CONTEXT.md`.
-  - Phase 13 added (2026-04-29): Fix Q11 multi-GPU hang/illegal-address. Cross-references `project_phase08_fu17.md`. Blocks Phase 14. Context: `.planning/phases/13-q11-multi-gpu-illegal-address/13-CONTEXT.md`.
-  - Phase 14 added (2026-04-29): Land SCHED-RR distribution. Patch tested working in isolation, rolled back from session due to Phase 13 dependency (Q11 hang in batch). Context: `.planning/phases/14-sched-rr-distribution/14-CONTEXT.md` (includes the literal diff for fast reapply).
-  - Phase 15 added (2026-04-29): Cross-GPU operator-colocation audit. Audit 9 operator sites that use `batches[0]->get_memory_space()` as authoritative target. Blocked by Phase 14. Context: `.planning/phases/15-mgpu-operator-colocation-audit/15-CONTEXT.md`.
-
-### Roadmap Decisions (v1.2)
-
-- **Single phase (Phase 8)** — user explicitly chose single-phase scoping during new-milestone questioning; granularity `coarse` in config.json reinforces this. All 11 requirements form one coherent delivery with internal dependencies (can't meaningfully test without fix; can't audit without both).
-- **Phase numbering continues from v1.1** — Phase 8 follows v1.1's Phase 7, keeping the milestone history linear rather than resetting.
-- **Integration fixture strategy (per FIX+TEST+AUDIT coupling):** scope the `num_gpus: 2` flip to TPC-H integration parameterization first, rather than flipping every fixture globally. Other fixtures can follow in later milestones if the pattern proves stable (per REQUIREMENTS.md Out of Scope note).
+- **Phase 17 expected compile errors:** 26+ `batch->get_data() is private` errors from the new cucascade RAII model. These are expected and document that Phase 18 work is needed. Do not attempt to fix them in Phase 17.
+- **PR #739 handling:** Never cherry-pick PR #739 as-is. It targets cucascade `0cd4a6a` (pre-#117). Use it only as a file-list reference during Phase 18 DataBatch migration; the actual API recipe follows the #117 RAII pattern.
+- **`sirius_parquet_metadata_scan_operator.hpp` deletion:** The Phase 13 stream-lineage work lives in this file which PR #731 deletes. MERGE-03 requires extracting the attachment points BEFORE accepting the deletion. Re-attachment happens in Phase 20.
+- **Phase 19 prerequisite:** Install `liburing-dev` (`sudo apt-get install -y liburing-dev`) BEFORE the first build attempt after Phase 19 source changes land. Runtime library (`liburing2:amd64 2.5`) is already present on the host; headers are not.
+- **SF100 Q11 2-GPU:** Must be run explicitly at Phase 20 and Phase 21 — not just `[mgpu]` suite at SF1. The stream-ordering race (P2) only manifests at SF100 data volume.
 
 ### Pending Todos
 
-- Plan Phase 8 (`/gsd:plan-phase 8`) — decompose into plans covering FIX → TEST → AUDIT.
-- Execute Phase 8 plans.
-- Validate against all 5 success criteria on real N=2 hardware (2 × RTX 6000 Ada).
+- Plan Phase 16 (`/gsd:plan-phase 16`) — decompose cucascade rebase into plans covering the 6 conflict files.
 
 ### Blockers / Concerns
 
-- **[v1.2 SHIP BLOCKER — 08-06]** Residual `cudaErrorInvalidValue @ cuda_memcpy.cu:42` on num_gpus=2 parquet path. Failing tests: `gpu_execution hive partition - filter on data column` and `gpu_execution - TPC-H Query 1 parquet`. The 08-06 carryover fix at `convert_host_parquet_to_gpu_with_prefetched_data_source` (Pattern 2 idiom mirroring 08-02 Branch B template) was applied and build+HYG pass, but the same bug signature persists — indicating at least one additional fix-site. 4 hypothesis candidates and concrete suggested next actions documented in `.planning/phases/08-multi-gpu-sql-pipeline-fix/08-06-VALIDATION.md` "Open Issue — Residual Carryover-Fix Incompleteness" section. Blocks ROADMAP criteria 1 + 2 + 4 + 6 (criteria 3 + 5 pass as static invariants).
-- **Integration fixture scope:** TPC-H fixture currently hard-codes `num_gpus: 1` via `setenv` inside the test fixture. Flipping globally may uncover other multi-GPU bugs not exposed by the unit-test suite today. Phase 8 plans should parameterize TPC-H specifically (per TEST-01) rather than flip the default globally — the parameterization approach is what AUDIT-03 requires anyway (2-GPU variant MUST execute in default unit-tests run, but the 1-GPU variant need not be removed).
-- **[v1.2 SHIP BLOCKER — 09-04 CRIT-2]** `SELECT * FROM gpu_execution("...")` TABLE_FUNCTION-form materialization path SIGSEGVs in unit tests (both 1-GPU and 2-GPU envs). The `CALL gpu_execution("...")` PROCEDURE-form works fine — SF100 Q1 num_gpus=2 ship-gate PASSES with byte-identical result vs 1-GPU baseline and disjoint cross-GPU batch dispatch. Distributor fixes (Plans 09-01/02/03) are all proven correct at runtime (`preferred_device_id=-1` count=0, cross-GPU intersection=0 at SF100 scale). Regression scoped to Phase 10: bisect across commits `3b58258`/`863cc6c`/`0c8068e`/`a8a7985`/`c0e12f3` + gdb on `gpu_execution - filter equality parquet` test. See `.planning/phases/09-scan-task-distributor-batch-ownership-affinity/09-04-VALIDATION.md` Open Issue section H1-H4 (H2 TABLE_FUNCTION vs CALL-form result shaping is the leading hypothesis).
-- **[v1.3 13-04 PARTIAL — RECONCILED 2026-05-01]** Phase 13-04 landed cucascade writer-event lineage infrastructure plus the Path-2 architectural ctor migration that requires `writer_stream` on every `gpu_table_representation`. The cumulative-state hang documented here was empirically reconciled by the post-Phase-15 reconciliation run (direct unsandboxed `pixi run sirius_unittest --abort '[integration][TPC-H]'`, 600s cap, 48/48 PASS in 2:43, 71608 assertions). The earlier 1800s MCP timeout was a transient on this consumer 2 × RTX 6000 Ada host; 13-04's verdict was upgraded PARTIAL → PASS in `13-04-SUMMARY.md`. No Plan 13-05 needed.
+None at roadmap creation. Phase 16 is ready to plan.
 
 ## Session Continuity
 
-Last session: 2026-05-01T04:10:00.000Z
-Stopped at: FU-A complete — merged fix/order-small-sort-rangecheck into Phase 15 tip; resolved STATE.md and ROADMAP.md conflicts by keeping post-Phase-15 view. [mgpu] lifted 12/13 → 16/16 (79091 assertions, 120.3s, exit 0).
+Last session: 2026-05-04T00:00:00.000Z
+Stopped at: ROADMAP.md and STATE.md written for v1.4. 32/32 requirements mapped. Phase 16 is the next plannable phase.
 Resume file: None
