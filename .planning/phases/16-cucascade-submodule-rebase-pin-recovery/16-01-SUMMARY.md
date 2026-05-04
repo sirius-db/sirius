@@ -116,6 +116,17 @@ None — this plan is pure git history surgery; no source code was written or mo
 - `phase16-pre-squash-backup` is available for D-A4 abort recovery if any downstream rebase round fails catastrophically
 - `16-rebase-log.md` has pre-allocated slots for Rounds 1-4 and pin advance; 16-02..16-05 should append their results
 
+## Self-Check: PASSED
+
+- FOUND: `.planning/phases/16-cucascade-submodule-rebase-pin-recovery/16-rebase-log.md`
+- FOUND: `.planning/phases/16-cucascade-submodule-rebase-pin-recovery/16-01-SUMMARY.md`
+- FOUND: `phase16-pre-squash-backup` (3147ecf -> 62e0517)
+- FOUND: `phase16-squashed-group1` (3147ecf)
+- FOUND: `phase16-squashed-group2` (2c1c844)
+- FOUND: `phase16-squashed-group3` (d52a67e)
+- FOUND: `phase16-squashed-group4` (4930652)
+- FOUND: commit count edd6f03..HEAD == 4
+
 ---
 *Phase: 16-cucascade-submodule-rebase-pin-recovery*
 *Completed: 2026-05-04*
