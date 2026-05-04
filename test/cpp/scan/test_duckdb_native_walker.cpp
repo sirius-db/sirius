@@ -32,10 +32,9 @@ using namespace sirius::op::scan;
 
 namespace {
 
-// `Connection::Query` returns a non-null QueryResult even on failure (the
-// error sits inside `result->HasError()`). A bare `REQUIRE(con.Query(...))`
-// silently passes when the query failed; this helper checks correctly and
-// surfaces the upstream error message in Catch2's INFO context.
+// `Connection::Query` returns a non-null QueryResult on failure (error
+// lives in `result->HasError()`), so `REQUIRE(con.Query(...))` silently
+// passes failed queries.
 void exec_ok(duckdb::Connection& con, const std::string& q)
 {
   auto result = con.Query(q);
@@ -182,10 +181,9 @@ TEST_CASE("walker emits rowid sentinels with no segments", "[scan][duckdb_native
 TEST_CASE("walker rowid-only projection gets row_count from PartitionStats",
           "[scan][duckdb_native_walker]")
 {
-  // Without partition_stats as a row_count source, a rowid-only projection
-  // (e.g. SELECT rowid FROM t) would produce row_count=0 for every row group
-  // because compute_row_counts has no non-rowid data segments to sum. That
-  // would silently zero out decoded_bytes_budget and break rowid synthesis.
+  // Regression guard: without PartitionStats as the row_count source,
+  // SELECT rowid FROM t lands row_count=0 → decoded_bytes_budget=0 →
+  // broken rowid synthesis.
   auto [db_owner, con] = sirius::make_test_db_and_connection();
   exec_ok(con, "CREATE TABLE t(a INTEGER)");
   exec_ok(con, "INSERT INTO t SELECT range FROM range(0, 1500)");

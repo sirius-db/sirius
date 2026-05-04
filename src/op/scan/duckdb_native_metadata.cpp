@@ -216,11 +216,8 @@ duckdb_segment_descriptor build_segment_descriptor(const duckdb::ColumnSegmentIn
   return desc;
 }
 
-// PartitionStatistics::count is the source of truth — it's correct even when
-// the projection is rowid-only (no data segments to sum) or when every
-// projected non-rowid column happens to have zero data segments. Falls back
-// to summing data segments only when partition stats don't cover this row
-// group (shouldn't happen at v1.5.2 but defensive).
+// PartitionStatistics::count is the source of truth: a rowid-only
+// projection has no data segments to sum, so segment-sum would land at 0.
 void compute_row_counts(duckdb_native_metadata& md,
                         const std::vector<duckdb::PartitionStatistics>& partition_stats)
 {
