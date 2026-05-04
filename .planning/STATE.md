@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Rebase After DataBatch Changes
 status: executing
-stopped_at: Completed 16-01-PLAN.md
-last_updated: "2026-05-04T23:12:19.867Z"
+stopped_at: Completed 16-02-PLAN.md
+last_updated: "2026-05-04T23:21:26.662Z"
 last_activity: 2026-05-04
 progress:
   total_phases: 6
   completed_phases: 0
   total_plans: 5
-  completed_plans: 1
+  completed_plans: 2
 ---
 
 # Project State
@@ -25,7 +25,7 @@ See: .planning/PROJECT.md (updated 2026-05-04)
 ## Current Position
 
 Phase: 16 (Cucascade Submodule Rebase + Pin Recovery) — EXECUTING
-Plan: 2 of 5
+Plan: 3 of 5
 Status: Ready to execute
 Last activity: 2026-05-04
 
@@ -78,6 +78,7 @@ v1.4 Progress: [                    ] 0/6 phases | 0/32 requirements | 0 plans
 | Phase 15 P03 | 4min | 2 tasks | 2 files |
 | Phase 15 P04 | 39min | 2 tasks | 1 files |
 | Phase 16 P01 | 3 | 3 tasks | 1 files |
+| Phase 16 P02 | 4min | 3 tasks | 8 files |
 
 ## Decisions
 
@@ -135,6 +136,8 @@ v1.4 Progress: [                    ] 0/6 phases | 0/32 requirements | 0 plans
 - **[v1.4 ROADMAP]** Key ordering constraint: Phase 19 (IO Framework) must precede Phase 20 (Scan Manager) because `parquet_split_provider::run_batch` calls `sirius_datasource` — compile-graph dependency. This overrides FEATURES.md's original Scan Manager-first proposal; ARCHITECTURE.md's ordering is adopted.
 - **[v1.4 ROADMAP]** Phase 17 expected build errors: 26+ `batch->get_data() is private` errors + RAII compile errors. These are EXPECTED and do not constitute a phase failure. Documented in MERGE-05.
 - [Phase 16-01]: Squash commit reordering: e23f3a2 (Group 1 memory) and eda349a (Group 3 pipeline) reordered in rebase todo to match D-A1 logical grouping; 2-pass rebase (squash then reword) used for clean separation of concerns
+- [Phase 16]: Cherry-pick Group 1 pipeline_io_backend.cpp: git auto-merged inconsistently (ctor from ours, bodies from 73d00c4); wrote complete Group 1 tree version per D-D1 (prefer-ours for additive changes)
+- [Phase 16]: MUST-be-last inline comment added to _thread declaration in io_worker: original eda349a used block comment; acceptance criteria required inline // MUST be last on _thread line; Group 3 commit amended
 
 ## Accumulated Context
 
@@ -170,6 +173,6 @@ None at roadmap creation. Phase 16 is ready to plan.
 
 ## Session Continuity
 
-Last session: 2026-05-04T23:12:19.864Z
-Stopped at: Completed 16-01-PLAN.md
+Last session: 2026-05-04T23:21:26.659Z
+Stopped at: Completed 16-02-PLAN.md
 Resume file: None
