@@ -58,6 +58,28 @@ test_env& env()
   return e;
 }
 
+/// Helper: get the tier of a data_batch using a temporary read-only lock.
+inline cucascade::memory::Tier get_batch_tier(cucascade::data_batch& batch)
+{
+  auto ro = batch.to_read_only();
+  return ro.get_memory_space()->get_tier();
+}
+
+/// Helper: get the size in bytes of a data_batch's data using a temporary read-only lock.
+inline size_t get_batch_size(cucascade::data_batch& batch)
+{
+  auto ro = batch.to_read_only();
+  return ro.get_data()->get_size_in_bytes();
+}
+
+/// Helper: compare batch's memory_space pointer (returns true if same as given space).
+inline bool batch_in_space(cucascade::data_batch& batch,
+                           const cucascade::memory::memory_space* space)
+{
+  auto ro = batch.to_read_only();
+  return ro.get_memory_space() == space;
+}
+
 }  // anonymous namespace
 
 TEST_CASE("convertible_data_batch converts GPU batch to HOST", "[convertible_data_batch]")
@@ -67,16 +89,16 @@ TEST_CASE("convertible_data_batch converts GPU batch to HOST", "[convertible_dat
   auto batch = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{1, 2, 3, 4, 5}, cudf::type_id::INT32);
 
-  REQUIRE(batch->get_memory_space() == e.gpu_space);
+  REQUIRE(batch_in_space(*batch, e.gpu_space));
   REQUIRE(batch->get_state() == cucascade::batch_state::idle);
 
   sirius::convertible_data_batch wrapper(batch);
-  auto result = wrapper.convert({e.host_space}, e.stream(), *e.mgr);
+  auto result = wrapper.convert({e.host_space}, e.stream(), *e.mgr, true);
 
   REQUIRE(result.has_value());
   REQUIRE((*result).size() == 1);
   REQUIRE((*result)[0] > 0);
-  REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+  REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::HOST);
   REQUIRE(batch->get_state() == cucascade::batch_state::idle);
 }
 
@@ -88,14 +110,14 @@ TEST_CASE("convertible_data_batch returns nullopt with empty target_spaces",
   auto batch = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{10, 20, 30}, cudf::type_id::INT32);
 
-  REQUIRE(batch->get_memory_space() == e.gpu_space);
+  REQUIRE(batch_in_space(*batch, e.gpu_space));
   REQUIRE(batch->get_state() == cucascade::batch_state::idle);
 
   sirius::convertible_data_batch wrapper(batch);
-  auto result = wrapper.convert({}, e.stream(), *e.mgr);
+  auto result = wrapper.convert({}, e.stream(), *e.mgr, false);
 
   REQUIRE_FALSE(result.has_value());
-  REQUIRE(batch->get_memory_space() == e.gpu_space);
+  REQUIRE(batch_in_space(*batch, e.gpu_space));
   REQUIRE(batch->get_state() == cucascade::batch_state::idle);
 }
 
@@ -114,11 +136,10 @@ TEST_CASE("convertible_data_batch_provider get_next_convertible returns last idl
   auto batch3 = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{6, 7, 8, 9}, cudf::type_id::INT32);
 
-  auto batch2_size = batch2->get_data()->get_size_in_bytes();
+  auto batch2_size = get_batch_size(*batch2);
 
-  // Make batch3 non-idle by creating a task on it
-  REQUIRE(batch3->try_to_create_task());
-  REQUIRE(batch3->get_state() == cucascade::batch_state::task_created);
+  // Make batch3 non-idle by holding a read-only lock on it
+  auto batch3_lock = batch3->to_read_only();
 
   repo.add_data_batch(batch1);
   repo.add_data_batch(batch2);
@@ -128,7 +149,7 @@ TEST_CASE("convertible_data_batch_provider get_next_convertible returns last idl
   auto cd = provider.get_next_convertible(e.gpu_space, false);
 
   REQUIRE(cd != nullptr);
-  // Last-to-first: batch3 is task_created so skipped, batch2 is the last idle batch
+  // Last-to-first: batch3 is locked (non-idle) so skipped, batch2 is the last idle batch
   REQUIRE(cd->bytes_in_space(e.gpu_space) == batch2_size);
 }
 
@@ -146,8 +167,8 @@ TEST_CASE("convertible_data_batch_provider get_all_convertible returns all idle 
   auto batch3 = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{6, 7, 8, 9}, cudf::type_id::INT32);
 
-  // Make batch3 non-idle
-  REQUIRE(batch3->try_to_create_task());
+  // Make batch3 non-idle by holding a read-only lock on it
+  auto batch3_lock = batch3->to_read_only();
 
   repo.add_data_batch(batch1);
   repo.add_data_batch(batch2);
@@ -156,7 +177,7 @@ TEST_CASE("convertible_data_batch_provider get_all_convertible returns all idle 
   sirius::convertible_data_batch_provider provider(&repo);
   auto all = provider.get_all_convertible(e.gpu_space, false);
 
-  // batch1 and batch2 are idle, batch3 is task_created -> only 2 returned
+  // batch1 and batch2 are idle, batch3 is locked -> only 2 returned
   REQUIRE(all.size() == 2);
 }
 
@@ -173,7 +194,7 @@ TEST_CASE("convertible_data_batch_provider iterates multi-partition last-to-firs
   auto batch_p1 = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{3, 4, 5, 6, 7}, cudf::type_id::INT32);
 
-  auto batch_p1_size = batch_p1->get_data()->get_size_in_bytes();
+  auto batch_p1_size = get_batch_size(*batch_p1);
 
   repo.add_data_batch(batch_p0, 0);
   repo.add_data_batch(batch_p1, 1);
@@ -186,7 +207,7 @@ TEST_CASE("convertible_data_batch_provider iterates multi-partition last-to-firs
   REQUIRE(cd->bytes_in_space(e.gpu_space) == batch_p1_size);
 }
 
-TEST_CASE("convertible_data_batch convert fails when batch already in_transit",
+TEST_CASE("convertible_data_batch convert fails when batch exclusively locked",
           "[convertible_data_batch]")
 {
   auto& e = env();
@@ -194,19 +215,19 @@ TEST_CASE("convertible_data_batch convert fails when batch already in_transit",
   auto batch = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
 
-  // Manually lock for in_transit
-  REQUIRE(batch->try_to_lock_for_in_transit());
-  REQUIRE(batch->get_state() == cucascade::batch_state::in_transit);
+  // Hold an exclusive (mutable) lock so that try_to_mutable() inside convert() fails
+  auto exclusive_lock = batch->to_mutable();
 
   sirius::convertible_data_batch wrapper(batch);
-  auto result = wrapper.convert({e.host_space}, e.stream(), *e.mgr);
+  // Non-blocking convert: uses try_to_mutable() internally, must return nullopt
+  auto result = wrapper.convert({e.host_space}, e.stream(), *e.mgr, /*blocking=*/false);
 
   REQUIRE_FALSE(result.has_value());
-  // State is preserved as in_transit
-  REQUIRE(batch->get_state() == cucascade::batch_state::in_transit);
 
-  // Clean up: release in_transit so batch can be destroyed cleanly
-  batch->try_to_release_in_transit();
+  // Release exclusive lock so batch can be destroyed cleanly
+  {
+    auto discard = std::move(exclusive_lock);
+  }
 }
 
 TEST_CASE("convertible_data_batch bytes_in_space returns correct size", "[convertible_data_batch]")
@@ -220,7 +241,7 @@ TEST_CASE("convertible_data_batch bytes_in_space returns correct size", "[conver
 
   auto size = wrapper.bytes_in_space(e.gpu_space);
   REQUIRE(size > 0);
-  REQUIRE(size == batch->get_data()->get_size_in_bytes());
+  REQUIRE(size == get_batch_size(*batch));
   REQUIRE(wrapper.bytes_in_space(e.host_space) == 0);
 }
 
@@ -236,8 +257,8 @@ TEST_CASE("convertible_data_batch_provider get_bytes_in_space sums batch sizes",
   auto batch2 = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{4, 5, 6, 7, 8}, cudf::type_id::INT32);
 
-  auto batch1_size = batch1->get_data()->get_size_in_bytes();
-  auto batch2_size = batch2->get_data()->get_size_in_bytes();
+  auto batch1_size = get_batch_size(*batch1);
+  auto batch2_size = get_batch_size(*batch2);
 
   repo.add_data_batch(batch1);
   repo.add_data_batch(batch2);

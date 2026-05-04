@@ -143,14 +143,11 @@ class parquet_scan_data : public op::operator_data {
    *                                stored into gpu_memory_space for use during execute().
    * @param stream                  Unused — no data movement occurs during preparation
    *                                for this source input.
-   * @return  Always an empty handle vector; there are no batches to keep locked.
    */
-  std::optional<std::vector<::cucascade::data_batch_processing_handle>> prepare_for_processing(
-    const ::cucascade::memory::memory_space* requested_memory_space,
-    rmm::cuda_stream_view /*stream*/) override
+  void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
+                              rmm::cuda_stream_view stream) override
   {
     gpu_memory_space = const_cast<cucascade::memory::memory_space*>(requested_memory_space);
-    return std::vector<::cucascade::data_batch_processing_handle>{};
   };
 
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
@@ -208,7 +205,8 @@ class scan_cached_operator_data : public op::operator_data {
 
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
   {
-    return batch->get_data()->cast<cucascade::gpu_table_representation>().get_size_in_bytes();
+    auto ro = batch->to_read_only();
+    return ro.get_data()->cast<cucascade::gpu_table_representation>().get_size_in_bytes();
   }
 
   /// Cached data batch viewed by the scan. Owning shared_ptr keeps the pinned

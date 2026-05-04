@@ -89,12 +89,8 @@ TEMPLATE_TEST_CASE("sirius_physical_projection executes on data_batch for multip
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = projection.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
-  auto output_table = dynamic_cast<const pipelineable_operator_data&>(*outputs)
-                        .get_data_batches()[0]
-                        ->get_data()
-                        ->cast<gpu_table_representation>()
-                        .get_table_view();
-  auto out_view = output_table;
+  auto out_view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
 
   auto host_data = copy_column_to_host<typename Traits::type>(out_view.column(0));
   auto host_keys = copy_column_to_host<int64_t>(out_view.column(1));
@@ -138,12 +134,8 @@ TEMPLATE_TEST_CASE("sirius_physical_projection can drop columns",
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = projection.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
-  auto output_table = dynamic_cast<const pipelineable_operator_data&>(*outputs)
-                        .get_data_batches()[0]
-                        ->get_data()
-                        ->template cast<gpu_table_representation>()
-                        .get_table_view();
-  auto out_view = output_table;
+  auto out_view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
 
   auto host_data = copy_column_to_host<typename Traits::type>(out_view.column(0));
   REQUIRE(host_data == data_vals);
@@ -188,12 +180,8 @@ TEMPLATE_TEST_CASE("sirius_physical_projection can duplicate/reorder columns",
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = projection.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
-  auto output_table = dynamic_cast<const pipelineable_operator_data&>(*outputs)
-                        .get_data_batches()[0]
-                        ->get_data()
-                        ->template cast<gpu_table_representation>()
-                        .get_table_view();
-  auto out_view = output_table;
+  auto out_view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
 
   auto host_key0 = copy_column_to_host<int64_t>(out_view.column(0));
   auto host_data = copy_column_to_host<typename Traits::type>(out_view.column(1));
