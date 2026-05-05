@@ -195,9 +195,14 @@ inline bool expect_data_batches_equivalent(const std::shared_ptr<cucascade::data
     return false;
   }
 
-  // Extract the GPU table representations from the data batches
-  auto* lhs_data = lhs->get_data();
-  auto* rhs_data = rhs->get_data();
+  // Phase 18 / DB-03 Recipe R1: scoped read-only accessors per batch held
+  // for the lifetime of the derived table_views. Both views consumed by
+  // cudf::sort or expect_tables_equivalent_impl below — the accessors must
+  // outlive every read.
+  auto lhs_ro    = lhs->to_read_only();
+  auto rhs_ro    = rhs->to_read_only();
+  auto* lhs_data = lhs_ro.get_data();
+  auto* rhs_data = rhs_ro.get_data();
 
   if (!lhs_data || !rhs_data) {
     std::cout << "Cannot compare data_batch with null data representation" << std::endl;
@@ -252,8 +257,10 @@ inline bool expect_data_batch_equivalent_to_table(
     return false;
   }
 
-  // Extract the GPU table representation from the data batch
-  auto* batch_data = batch->get_data();
+  // Phase 18 / DB-03 Recipe R1: scoped read-only accessor held for the
+  // lifetime of the derived batch_view (non-owning).
+  auto batch_ro    = batch->to_read_only();
+  auto* batch_data = batch_ro.get_data();
 
   if (!batch_data) {
     std::cout << "Cannot compare data_batch with null data representation" << std::endl;

@@ -154,7 +154,12 @@ inline std::vector<std::shared_ptr<cucascade::data_batch>> drain_data_repo(
 {
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
   while (true) {
-    auto batch = data_repo.pop_data_batch(cucascade::batch_state::task_created);
+    // Phase 18 / DB-03 Recipe R6: pop_data_batch(state) is gone under #117;
+    // pop_next_data_batch returns the front batch in the partition (or
+    // nullptr if empty). The previous state-filter is unnecessary because
+    // every batch in the repo is already in the matching state by
+    // construction (the FSM was removed — see Pitfall 5).
+    auto batch = data_repo.pop_next_data_batch(/*partition_idx=*/0);
     if (!batch) { break; }
     batches.push_back(std::move(batch));
   }
