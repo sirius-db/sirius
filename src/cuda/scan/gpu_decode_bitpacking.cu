@@ -77,6 +77,9 @@ constexpr uint32_t BLOCK_DIM = 256;
 constexpr uint32_t VPT = BP_META_GROUP_SIZE / BLOCK_DIM;
 static_assert(BLOCK_DIM * VPT == BP_META_GROUP_SIZE,
               "BLOCK_DIM and VPT must tile the metadata group exactly");
+static_assert(BLOCK_DIM % 32 == 0,
+              "BLOCK_DIM must be a multiple of warpSize for the DELTA_FOR "
+              "warp-aggregate scan");
 
 /// One CTA's unit of work: one metadata group within one segment.
 struct bp_group_desc {
@@ -381,15 +384,11 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
   // (reusing the packed-data buffer, no longer read after the unpack loop)
   // into striped layout for coalesced global stores.
   //
-  // Why not `cub::BlockScan<T, 256>`? Both correctness paths exist (mirror
-  // logic), but BlockScan's TempStorage costs ~10 extra registers/thread
-  // and ~1.2 KiB of static shmem per CTA on sm_80 — enough to drop
-  // occupancy from 8 CTAs/SM to 6 (uint32) and from 6 to 4 (uint64). The
-  // WarpScan + warp-aggregate variant lifts uint32 paths to 100% occupancy
-  // and uint64 to 75%. Pattern mirrors cudf's parquet delta-binary decode
-  // (see `cpp/src/io/parquet/delta_binary.cuh`), and the ablation lift on
-  // A100 is real (DELTA_FOR int32 w=8: +27%; FOR int32 w=16: +20% from
-  // the freed resources alone).
+  // Why not `cub::BlockScan<T, 256>`? Its TempStorage costs measurable
+  // extra registers and static shmem per CTA on sm_80, dropping CTA-per-SM
+  // occupancy. WarpScan + serial warp-aggregate avoids both. Pattern
+  // mirrors cudf's parquet delta-binary decode (`cpp/src/io/parquet/
+  // delta_binary.cuh`).
   T thread_data[VPT];
 #pragma unroll
   for (uint32_t v = 0; v < VPT; ++v) {
