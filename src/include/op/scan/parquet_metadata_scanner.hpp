@@ -66,23 +66,41 @@ struct file_metadata_scan_result {
  *        the caller bundles them under whatever budget policy fits its scan
  *        type.
  *
+ * Filter-pushdown gating is derived from @p reader_options: row-group stats
+ * pruning runs iff @c reader_options.get_filter().has_value(). The caller is
+ * expected to install (or omit) the AST filter via @c set_filter before
+ * calling this helper.
+ *
  * @param file_path             Parquet file to scan.
- * @param plan                  Canonical scan plan; controls projection and
+ * @param plan                  Canonical scan plan; drives projection /
  *                              pure-filter accounting.
  * @param reader_options        Reader options carrying any AST filter
- *                              already installed via set_filter().
- * @param has_filter_pushdown   True iff @p reader_options has an active AST
- *                              filter — gates row-group stats pruning.
+ *                              already installed via @c set_filter.
+ * @param data_column_names     Projected data-column names in @c scan_plan
+ *                              D-order. Pass once per call site rather than
+ *                              rebuilding per file (the caller typically
+ *                              hoists @c plan.data_column_names() out of its
+ *                              file loop).
+ * @param pure_filter_positions Pure-filter D-positions from @c
+ *                              plan.pure_filter_batch_positions(). Hoisted
+ *                              for the same reason.
  * @param stream                Stream used by row-group stats pruning.
  *
  * @throws std::runtime_error if a projected column from @p plan is not
  *                            found in the file.
+ *
+ * @note A second per-file metadata scan still lives in
+ *       @c parquet_scan_task_global_state::initialize_from_files (legacy
+ *       task-based path); consolidating that caller is gated on legacy
+ *       parquet_scan_task removal and is intentionally out of scope for the
+ *       initial extraction.
  */
 file_metadata_scan_result scan_parquet_file_metadata(
   std::string const& file_path,
   scan_plan const& plan,
   cudf::io::parquet_reader_options const& reader_options,
-  bool has_filter_pushdown,
+  std::vector<std::string> const& data_column_names,
+  std::unordered_set<std::size_t> const& pure_filter_positions,
   rmm::cuda_stream_view stream);
 
 /// Per-row-group byte accounting for budget-based partition bundling.

@@ -183,8 +183,11 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
   auto stream = cudf::get_default_stream();
 
   //===----------Build reader options----------===//
-  auto const data_column_names = _plan->data_column_names();
-  auto reader_options          = std::make_shared<cudf::io::parquet_reader_options>(
+  // Hoisted out of the file loop: scan_plan rebuilds these on every call, so passing them into
+  // the per-file helper avoids N copies of the projected name vector / pure-filter set.
+  auto const data_column_names     = _plan->data_column_names();
+  auto const pure_filter_positions = _plan->pure_filter_batch_positions();
+  auto reader_options              = std::make_shared<cudf::io::parquet_reader_options>(
     cudf::io::parquet_reader_options::builder().build());
 
   // Tell the parquet reader which columns to produce. Required whenever the scan
@@ -252,7 +255,7 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
 
     //===----------Per-file metadata scan + row-group pruning + projection resolution----------===//
     auto file_md = op::scan::scan_parquet_file_metadata(
-      file_path, *_plan, *reader_options, ast_expression.has_value(), stream);
+      file_path, *_plan, *reader_options, data_column_names, pure_filter_positions, stream);
 
     //===----------Row Group Partitioning----------===//
     std::vector<cudf::size_type> cur_rgs;
@@ -282,8 +285,7 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
 
       // Ensure that a single oversized rg/file still gets through.
       if (!accum.slices.empty() || !cur_rgs.empty()) {
-        if (accum.total_uncompressed_bytes + cur_uncompressed_bytes +
-              rg_bytes.uncompressed_bytes >
+        if (accum.total_uncompressed_bytes + cur_uncompressed_bytes + rg_bytes.uncompressed_bytes >
             _approximate_batch_size) {
           seal_current_file();
           flush();

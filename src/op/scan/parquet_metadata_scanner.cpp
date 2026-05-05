@@ -31,7 +31,8 @@ file_metadata_scan_result scan_parquet_file_metadata(
   std::string const& file_path,
   scan_plan const& plan,
   cudf::io::parquet_reader_options const& reader_options,
-  bool has_filter_pushdown,
+  std::vector<std::string> const& data_column_names,
+  std::unordered_set<std::size_t> const& pure_filter_positions,
   rmm::cuda_stream_view stream)
 {
   file_metadata_scan_result result;
@@ -51,8 +52,6 @@ file_metadata_scan_result scan_parquet_file_metadata(
   // DuckDB's logical column order. Resolve by name per file (chunk order is consistent across row
   // groups in a single file, but can vary across files).
   if (plan.is_projected()) {
-    auto const data_column_names     = plan.data_column_names();
-    auto const pure_filter_positions = plan.pure_filter_batch_positions();
     result.selected_chunk_indices.reserve(data_column_names.size());
     for (std::size_t k = 0; k < data_column_names.size(); ++k) {
       auto leaves = detail::leaf_indices_for_column(*result.file_metadata, data_column_names[k]);
@@ -70,8 +69,10 @@ file_metadata_scan_result scan_parquet_file_metadata(
   }
 
   //===----------Row Group Pruning----------===//
+  // Single source of truth for "is filter-pushdown active": the AST filter installed on
+  // reader_options. Avoids the caller passing a redundant boolean that could drift out of sync.
   result.selected_row_group_indices = reader.all_row_groups(reader_options);
-  if (has_filter_pushdown) {
+  if (reader_options.get_filter().has_value()) {
     auto const before = result.selected_row_group_indices.size();
     // clang-format off
     SIRIUS_LOG_DEBUG("[scan_parquet_file_metadata] Row group pruning: file: {}\n" \
