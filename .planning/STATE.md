@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Rebase After DataBatch Changes
 status: executing
-stopped_at: Completed 18-04-PLAN.md
-last_updated: "2026-05-05T16:11:43.347Z"
+stopped_at: Completed 18-05-PLAN.md
+last_updated: "2026-05-05T18:35:39.697Z"
 last_activity: 2026-05-05
 progress:
   total_phases: 6
   completed_phases: 2
   total_plans: 15
-  completed_plans: 13
+  completed_plans: 14
 ---
 
 # Project State
@@ -25,7 +25,7 @@ See: .planning/PROJECT.md (updated 2026-05-04)
 ## Current Position
 
 Phase: 18 (DataBatch RAII Migration (cucascade #117 surface)) — EXECUTING
-Plan: 5 of 6
+Plan: 6 of 6
 Status: Ready to execute
 Last activity: 2026-05-05
 
@@ -90,6 +90,7 @@ v1.4 Progress: [######              ] 2/6 phases | 9/32 requirements | 9 plans
 | Phase 18 P02 | 7min | 3 tasks | 7 files |
 | Phase 18 P03 | 13min | 3 tasks | 9 files |
 | Phase 18 P04 | 16min | 3 tasks | 14 files |
+| Phase 18 P05 | 65min | 4 tasks | 31 files |
 
 ## Decisions
 
@@ -170,6 +171,12 @@ v1.4 Progress: [######              ] 2/6 phases | 9/32 requirements | 9 plans
 - [Phase 18]: [18-03] DB-02 + DB-03 closed for 8 stateful operator .cpp files (table_scan, hash_join, nested_loop_join, concat, top_n, grouped_aggregate_merge, ungrouped_aggregate, merge_sort): all FSM-pop sites replaced with pop_next_data_batch; all pop_data_batch_by_id 3-arg sites converted to 2-arg; read paths use scoped to_read_only(); the one mutable-write path (grouped_aggregate_merge release_table) uses to_mutable. hash_join's prepare_join_keys + resolve_mark_join_result signatures flipped to take const read_only_data_batch& and memory_space&. Build errors 47 -> 21.
 - [Phase 18]: [18-03] P1 deadlock risk surfaced: 18-02's R5 lock-and-hold in gpu_pipeline_task::processing_handles holds vector<mutable_data_batch> across op->execute(); operator code in execute() now takes scoped to_read_only/to_mutable accessors on the same input batches, which is technically UB on non-recursive std::shared_mutex. Documented in SUMMARY P1 section. Compile-only acceptance gates pass; runtime audit deferred to 18-05 with two follow-up resolution paths (architectural accessor exposure OR drop R5 lock-and-hold).
 - [Phase 18]: [18-04] DB-02/DB-03 closed for read-only operators + scan layer + task_creator + debug_utils. 4 known Pitfall 4 sites (2-arg make_data_batch) all closed in src/: filter:60, projection:63, table_scan:176 (via 18-03), gpu_parquet_scan_operator:252. HYG-02 baseline preserved at 0. Rule 3 deviations: debug_utils.hpp const drop (to_read_only is non-const) and ->clone() migration (clone moved off data_batch onto accessors under #117). 8 inventory-miss src/ files surfaced (sort_partition, grouped_aggregate, order, gpu_aggregate_impl, gpu_merge_impl, gpu_order_impl, gpu_partition_impl, cached_split_provider) — logged in deferred-items.md for orchestrator triage.
+- [Phase 18]: [18-05] PRELUDE: 8 inventory-miss src/ files (deferred-items.md option 3) folded into Task 0 — all R1 + cached_split_provider Pitfall 4 closure (default-constructed cuda_stream_view{} per cucascade legacy/no-stream pattern; NOT rmm::cuda_stream_default — preserves HYG-02 baseline).
+- [Phase 18]: [18-05] DB-03 closed: 23 test/cpp/ files migrated to scoped read_only_data_batch / mutable_data_batch (~95 get_data + 16 try_to_*_in_transit + 8 try_to_lock_for_processing + 6 try_to_create_task drops + 1 data_batch_processing_handle decl + 1 vector<handle> + 1 FSM-pop).
+- [Phase 18]: [18-05] DB-04 partial: src/-side build is clean within DB-01..05 scope; only blocker is 6 pre-existing liburing-dev errors in src/io/uring/uring_reactor.cpp (Phase 19 / IO-12 territory per CONTEXT.md, NOT in DB-01..05 scope). Strict 'build exits 0' deferred to Phase 19 closure.
+- [Phase 18]: [18-05] Pitfall 5 wrapper-state migration: under cucascade #117 fresh batches are 'idle' on construction. convertible_data_batch_provider predicate matches idle directly; pre-#117 try_to_create_task() calls dropped from test fixtures (set_task_created parameter inverted to non_idle_state).
+- [Phase 18]: [18-05] Convert helper R1+R3 split: convert_*_to_host helpers split into ro -> drop -> mut -> drop -> ro_post 3-phase pattern to enforce P1 (never overlap shared+exclusive on same batch). Established in result_collector + host_table_chunk_reader + host_table_utils tests.
+- [Phase 18]: [18-05] data_batch_processing_handle replaced with mutable_data_batch in test fixture types: test_gpu_partition_impl + test_gpu_merge_impl. RAII accessor serves identical lock semantics; auto-destructured by callers so type change is transparent.
 
 ## Accumulated Context
 
@@ -205,6 +212,6 @@ None at roadmap creation. Phase 16 is ready to plan.
 
 ## Session Continuity
 
-Last session: 2026-05-05T16:11:43.339Z
-Stopped at: Completed 18-04-PLAN.md
+Last session: 2026-05-05T18:35:39.694Z
+Stopped at: Completed 18-05-PLAN.md
 Resume file: None
