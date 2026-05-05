@@ -17,13 +17,19 @@
 #pragma once
 
 // sirius
+#include "cucascade/data/gpu_data_representation.hpp"
+
 #include <expression_executor/gpu_expression_translator_internal.hpp>
+#include <op/scan/scan_plan.hpp>
 #include <op/sirius_physical_operator.hpp>
 
 // cudf
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
+
+// cucascade
+#include <cucascade/data/data_batch.hpp>
 
 // standard library
 #include <cstddef>
@@ -42,8 +48,8 @@ using hybrid_scan_reader = cudf::io::parquet::experimental::hybrid_scan_reader;
 /**
  * @brief Represents a set of row groups within a single parquet file.
  *
- * Used as the unit of work for both the metadata scan (partitioning) and the
- * GPU scan (byte-range preloading).
+ * Used as the unit of work for both the parquet split provider (partitioning) and
+ * the GPU scan (byte-range preloading).
  */
 struct row_group_range {
   row_group_range(std::size_t file_idx,
@@ -64,98 +70,32 @@ struct row_group_range {
 };
 
 //===----------------------------------------------------------------------===//
-// parquet_metadata_input
-//===----------------------------------------------------------------------===//
-/**
- * @brief Input to a parquet metadata scan task.
- *
- * Carries a batch of file paths (up to max_file_processed) along with the
- * target approximate batch size used when partitioning row groups.
- */
-class parquet_metadata_input : public op::operator_data {
- public:
-  parquet_metadata_input(std::vector<std::string> file_paths, std::size_t approximate_batch_size)
-    : file_paths(std::move(file_paths)), approximate_batch_size(approximate_batch_size)
-  {
-  }
-
-  std::vector<std::string> file_paths;
-  std::size_t approximate_batch_size;
-};
-
-//===----------------------------------------------------------------------===//
-// partitioned_parquet_metadata
-//===----------------------------------------------------------------------===//
-/**
- * @brief Output of a parquet metadata scan task.
- *
- * Contains the parsed parquet file metadata and the row-group partitions
- * computed from it, ready for consumption by sirius_gpu_parquet_scan_operator.
- */
-class partitioned_parquet_metadata : public op::operator_data {
- public:
-  using translated_expression = gpu_expression_translator::translated_expression;
-
-  partitioned_parquet_metadata() = default;
-
-  std::vector<std::string> file_paths;
-  std::vector<std::shared_ptr<cudf::io::datasource>> datasources;  ///< Parallel to file_paths.
-  std::vector<row_group_range> row_group_partitions;
-
-  std::shared_ptr<cudf::io::parquet_reader_options> reader_options;
-  /// Either a) the translated filter expression for row-group pruning and filter pushdown, or
-  ///        b) the coalesced duckdb expression if filter translation failed.
-  /// Shared ownership of the translated filter expression is used so that
-  /// the cuDF AST nodes referenced by reader_options remain alive.
-  std::variant<std::shared_ptr<translated_expression>, std::shared_ptr<duckdb::Expression>>
-    filter_expression;
-  std::vector<std::size_t> post_filter_projection_ids;
-
-  /// Original duckdb filter expression carried through verbatim so that
-  /// sirius_gpu_parquet_scan_operator::execute() can re-translate it on the
-  /// scan task's CURRENT device. The metadata scan's translated AST has its
-  /// scalars allocated on the metadata-scan task's device; if the scan task
-  /// runs on a different GPU (multi-GPU distribution) those scalars are
-  /// invisible to cudf and every row group gets pruned silently → 0 rows.
-  /// May be nullptr when the original logical-plan had no filter expression.
-  std::shared_ptr<duckdb::Expression> retranslation_filter;
-  /// Name resolver used to translate BoundReferenceExpression batch positions
-  /// into parquet column names. Captured from scan_plan::batch_column_name at
-  /// metadata-scan time and reused here so the re-translation does not need
-  /// to know about scan_plan internals.
-  std::function<std::string(duckdb::idx_t)> filter_name_resolver;
-};
-
-//===----------------------------------------------------------------------===//
 // parquet_scan_data
 //===----------------------------------------------------------------------===//
 /**
  * @brief Input to a GPU parquet scan task.
  *
  * Contains all per-partition data needed to read a single row_group_range from
- * a parquet file.  Fields are extracted from partitioned_parquet_metadata by
- * get_next_task_input_data() so that each task is self-contained.
+ * a parquet file. Each instance is constructed by parquet_split_provider::run_batch
+ * and pushed into the gpu scan operator's split_connector; the operator pulls one
+ * via get_next_task_input_data() per task so each task is self-contained.
  */
 class parquet_scan_data : public op::operator_data {
  public:
   using translated_expression = gpu_expression_translator::translated_expression;
+  // TODO(v1.4 Phase 20 — SM-02): re-attach _batch_gpu_affinity recording in scan-manager-driven scan path
   parquet_scan_data(std::string file_path,
                     row_group_range rg_range,
                     std::shared_ptr<cudf::io::parquet_reader_options> reader_options,
-                    std::variant<std::shared_ptr<translated_expression>,
-                                 std::shared_ptr<duckdb::Expression>> filter_expression,
-                    std::vector<std::size_t> post_filter_projection_ids,
+                    std::shared_ptr<duckdb::Expression> filter_expression,
                     std::shared_ptr<cudf::io::datasource> datasource,
-                    std::shared_ptr<duckdb::Expression> retranslation_filter,
-                    std::function<std::string(duckdb::idx_t)> filter_name_resolver)
+                    std::shared_ptr<scan_plan const> plan)
     : file_path(std::move(file_path)),
       rg_range(std::move(rg_range)),
       reader_options(std::move(reader_options)),
       filter_expression(std::move(filter_expression)),
-      post_filter_projection_ids(std::move(post_filter_projection_ids)),
       datasource(std::move(datasource)),
-      retranslation_filter(std::move(retranslation_filter)),
-      filter_name_resolver(std::move(filter_name_resolver))
+      plan(std::move(plan))
   {
   }
 
@@ -195,23 +135,67 @@ class parquet_scan_data : public op::operator_data {
   std::string file_path;
   row_group_range rg_range;
   std::shared_ptr<cudf::io::parquet_reader_options> reader_options;
-  /// Either a) the translated filter expression for row-group pruning and filter pushdown, or
-  ///        b) the coalesced duckdb expression if filter translation failed.
-  /// Shared ownership of the translated filter expression is used so that
-  /// the cuDF AST nodes referenced by reader_options remain alive.
-  std::variant<std::shared_ptr<translated_expression>, std::shared_ptr<duckdb::Expression>>
-    filter_expression;
-  std::vector<std::size_t> post_filter_projection_ids;
+  /// The coalesced duckdb filter expression.
+  std::shared_ptr<duckdb::Expression> filter_expression;
   /// Datasource for the parquet file, shared with other partitions of the same file.
   std::shared_ptr<cudf::io::datasource> datasource;
+  /// Scan plan shared across all splits of this scan. Carries the D-order column name
+  /// table used by execute()'s per-task AST translation, plus the post-read assembly layout.
+  std::shared_ptr<scan_plan const> plan;
   /// GPU memory space for allocating output tables produced by execute().
   cucascade::memory::memory_space* gpu_memory_space = nullptr;
-  /// Original duckdb filter expression for current-device re-translation; see
-  /// partitioned_parquet_metadata::retranslation_filter.
-  std::shared_ptr<duckdb::Expression> retranslation_filter;
-  /// Name resolver paired with retranslation_filter; see
-  /// partitioned_parquet_metadata::filter_name_resolver.
-  std::function<std::string(duckdb::idx_t)> filter_name_resolver;
+  // TODO(v1.4 Phase 20 — SM-02): re-attach per-device filter re-translation fields once
+  // scan-manager world supports multi-GPU task distribution. Fields removed by PR #731:
+  //   std::shared_ptr<duckdb::Expression> retranslation_filter;
+  //   std::function<std::string(duckdb::idx_t)> filter_name_resolver;
+  // See .planning/phases/17-sirius-origin-dev-merge-base-layer/17-PHASE-13-EXTRACT.md
+};
+
+//===----------------------------------------------------------------------===//
+// scan_cached_operator_data
+//===----------------------------------------------------------------------===//
+/**
+ * @brief Input to a GPU parquet scan task served from a pinned (cached) entry.
+ *
+ * The cached_split_provider produces one of these per cached batch. It carries
+ * a zero-copy data_batch (whose gpu_table_representation is a view over the
+ * pinned data columns in scan_plan D-order) plus the filter expression and the
+ * post-read assembly closure that the scan operator applies in execute(). The
+ * gpu_memory_space lives on the wrapped data_batch.
+ *
+ * The cached path is gated upstream so it never sees hive partitions, so
+ * @ref inject_fn — when non-null — only ever performs DATA-source permutation
+ * and pure-filter-column pruning. It is null exactly when scan_plan's output
+ * layout is identity over data_columns (no permute, no prune).
+ */
+class scan_cached_operator_data : public op::operator_data {
+ public:
+  scan_cached_operator_data(std::shared_ptr<cucascade::data_batch> batch,
+                            std::shared_ptr<duckdb::Expression> filter_expression,
+                            partition_inject_fn_t inject_fn)
+    : batch(std::move(batch)),
+      filter_expression(std::move(filter_expression)),
+      inject_fn(std::move(inject_fn))
+  {
+  }
+
+  [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
+  {
+    return batch->get_data()->cast<cucascade::gpu_table_representation>().get_size_in_bytes();
+  }
+
+  /// Cached data batch viewed by the scan. Owning shared_ptr keeps the pinned
+  /// columns alive for the lifetime of the task.
+  std::shared_ptr<cucascade::data_batch> batch;
+  /// Coalesced DuckDB filter expression, evaluated post-read in execute() against
+  /// the cached batch. Null when no filter applies. The cached path does not carry
+  /// an AST-translated filter — pushdown is a parquet-reader concern, and the
+  /// cached batch is already materialized.
+  std::shared_ptr<duckdb::Expression> filter_expression;
+  /// Post-read assembly closure produced by scan_plan::build_inject_fn(). Null
+  /// when the plan's output layout is identity over data_columns — execute()
+  /// then forwards the cached batch (or filter result) without re-permuting.
+  partition_inject_fn_t inject_fn;
 };
 
 }  // namespace sirius::op::scan

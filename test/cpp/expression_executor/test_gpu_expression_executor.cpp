@@ -388,11 +388,13 @@ exec_result run_execute(memory_space& space,
 {
   auto wrapped = sirius::wrap_many(std::move(exprs));
   exp_executor executor(wrapped, get_resource_ref(space), cudf::get_default_stream(), strategy);
-  auto output_batch = executor.execute(input_batch);
-  REQUIRE(output_batch != nullptr);
-  auto& in_repr  = input_batch->get_data()->cast<gpu_table_representation>();
+  auto& in_repr     = input_batch->get_data()->cast<gpu_table_representation>();
+  auto output_table = executor.execute(in_repr.get_table_view());
+  REQUIRE(output_table != nullptr);
+  auto output_batch =
+    sirius::make_data_batch(std::move(output_table), *input_batch->get_memory_space());
   auto& out_repr = output_batch->get_data()->cast<gpu_table_representation>();
-  return {input_batch, output_batch, in_repr.get_table().view(), out_repr.get_table().view()};
+  return {input_batch, output_batch, in_repr.get_table_view(), out_repr.get_table_view()};
 }
 
 exec_result run_select(memory_space& space,
@@ -402,11 +404,13 @@ exec_result run_select(memory_space& space,
 {
   auto wrapped = sirius::wrap_many(std::move(exprs));
   exp_executor executor(wrapped, get_resource_ref(space), cudf::get_default_stream(), strategy);
-  auto output_batch = executor.select(input_batch);
-  REQUIRE(output_batch != nullptr);
-  auto& in_repr  = input_batch->get_data()->cast<gpu_table_representation>();
+  auto& in_repr     = input_batch->get_data()->cast<gpu_table_representation>();
+  auto output_table = executor.select(in_repr.get_table_view());
+  REQUIRE(output_table != nullptr);
+  auto output_batch =
+    sirius::make_data_batch(std::move(output_table), *input_batch->get_memory_space());
   auto& out_repr = output_batch->get_data()->cast<gpu_table_representation>();
-  return {input_batch, output_batch, in_repr.get_table().view(), out_repr.get_table().view()};
+  return {input_batch, output_batch, in_repr.get_table_view(), out_repr.get_table_view()};
 }
 
 // Helper: make a BoundFunctionExpression with the given name, arg types, return type, and children.

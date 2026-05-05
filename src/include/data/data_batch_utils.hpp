@@ -56,7 +56,7 @@ inline cudf::table_view get_cudf_table_view(const cucascade::data_batch& batch)
 {
   auto* data = batch.get_data();
   if (data == nullptr) { throw std::runtime_error("data_batch has no data representation"); }
-  return data->cast<cucascade::gpu_table_representation>().get_table();
+  return data->cast<cucascade::gpu_table_representation>().get_table_view();
 }
 
 /**

@@ -258,7 +258,7 @@ std::shared_ptr<cucascade::data_batch> GpuExpressionExecutor::execute(
 
   // Retrieve the table_view from the data_batch
   auto& input_data_rep = input_batch->get_data()->cast<cucascade::gpu_table_representation>();
-  input_table          = input_data_rep.get_table().view();
+  input_table          = input_data_rep.get_table_view();
   input_count          = static_cast<cudf::size_type>(input_table.num_rows());
 
   for (size_t i = 0; i < expressions.size(); ++i) {
@@ -346,7 +346,7 @@ std::shared_ptr<cucascade::data_batch> GpuExpressionExecutor::select(
 
   // Retrieve the table_view from the data_batch
   auto& input_data_rep = input_batch->get_data()->cast<cucascade::gpu_table_representation>();
-  input_table          = input_data_rep.get_table().view();
+  input_table          = input_data_rep.get_table_view();
   input_count          = static_cast<cudf::size_type>(input_table.num_rows());
 
   // Get the bitmap

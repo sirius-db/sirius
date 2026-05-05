@@ -69,6 +69,7 @@ find_package(yaml-cpp REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
+pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
 
 # cuCascade - GPU Memory Reservation Library (submodule) cucascade links `numa`
 # as a bare library name (-lnuma). In the vcpkg build the static libnuma.a lives
@@ -159,6 +160,11 @@ set(EXTENSION_SOURCES
     src/expression_executor/specializations/gpu_execute_reference.cpp
     # I/O adapters (Phase 5 — cucascade-backed parquet; not yet upstreamed)
     src/io/cucascade_datasource.cpp
+    src/io/admission_control.cpp
+    src/io/prefetching_cache.cpp
+    src/io/sirius_datasource.cpp
+    src/io/uring/uring_ioctx.cpp
+    src/io/uring/uring_reactor.cpp
     src/memory/defragmenter_oom_policy.cpp
     src/memory/sirius_memory_reservation_manager.cpp
     src/op/aggregate/aggregate_op_util.cpp
@@ -184,7 +190,6 @@ set(EXTENSION_SOURCES
     src/op/scan/prefetched_data_source.cpp
     src/op/scan/scan_plan.cpp
     src/op/scan/scan_utils.cpp
-    src/op/scan/sirius_parquet_metadata_scan_operator.cpp
     src/op/scan/sirius_gpu_parquet_scan_operator.cpp
     src/op/sirius_physical_column_data_scan.cpp
     src/op/sirius_physical_cpu_source.cpp
@@ -242,6 +247,11 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_projection.cpp
     src/planner/sirius_plan_recursive_cte.cpp
     src/planner/sirius_plan_top_n.cpp
+    src/scan_manager/cached_split_provider.cpp
+    src/pin_table.cpp
+    src/scan_manager/parquet_split_provider.cpp
+    src/scan_manager/sirius_scan_manager.cpp
+    src/scan_manager/split_connector.cpp
     src/sirius_config.cpp
     src/sirius_context.cpp
     src/sirius_engine.cpp
@@ -309,7 +319,10 @@ foreach(_target sirius_extension sirius_loadable_extension)
 endforeach()
 
 # Additional libraries only needed by the static extension
-target_link_libraries(sirius_extension PkgConfig::NUMA absl::any_invocable)
+target_link_libraries(sirius_extension PkgConfig::NUMA PkgConfig::LIBURING
+                      yaml-cpp::yaml-cpp absl::any_invocable)
+
+target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING)
 
 # Required by DuckDB's export set (duckdb_static -> sirius_extension ->
 # cucascade_static)
@@ -385,15 +398,15 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_oom_reschedule.cpp
     test/cpp/pipeline/test_pipeline_memory_history.cpp
     test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
-    test/cpp/pipeline/test_metadata_gpu_pipeline_task_counting.cpp
     test/cpp/pipeline/test_gpu_pipeline_disk_readback.cpp
+    test/cpp/pipeline/test_get_next_ports_after_sink.cpp
     test/cpp/pipeline/test_plan_printer.cpp
     test/cpp/pipeline/test_task_scheduler.cpp
     test/cpp/scan/test_column_builder.cpp
-    test/cpp/scan/test_metadata_gpu_scan_operators.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_scan_task.cpp
     test/cpp/scan/test_scan_executor.cpp
+    test/cpp/scan/test_split_connector.cpp
     test/cpp/unittest.cpp
     test/cpp/utils/sirius_test_env.cpp
     test/cpp/utils/utils.cpp)

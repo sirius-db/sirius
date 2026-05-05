@@ -92,7 +92,7 @@ void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> task)
   } else if (task->is<sirius::op::scan::cpu_source_task>()) {
     _scan_executor->schedule(std::move(task));
   } else {
-    _task_queue.push(std::move(task));
+    [[maybe_unused]] auto _ = _task_queue.push(std::move(task));
   }
 }
 

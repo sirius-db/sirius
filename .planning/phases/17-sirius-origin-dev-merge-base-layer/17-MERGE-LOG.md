@@ -9,11 +9,12 @@
 
 ## Pre-merge state (filled by plan 17-01)
 
-- HEAD SHA at merge time: `<filled by plan 17-02 step A>`
+- HEAD SHA at merge time: `5aee3143f60d66201bb82095166c69cba145d30f`
 - Backup ref: `phase17-pre-merge-backup` -> SHA `98cdea20691a53a84c03eb2463ffc5d1027fe2df`
 - Cucascade pin at HEAD: `1c1e648a282a06747328c78f62d2d676ce51a8ce` (per Phase 16 ship verdict)
-- origin/dev tip SHA: `<filled by plan 17-02 step A>`
-- Conflict surface inventory (from `git merge-tree --write-tree --merge-base="$(git merge-base HEAD origin/dev)" HEAD origin/dev` — per CONTEXT.md): 11 conflict files + 33 auto-merges (158 total touched files per `git diff origin/dev...HEAD --stat`)
+- origin/dev tip SHA: `cdd6864cabbbd0bebca93167af4d5964104cad93`
+- Pre-merge HYG-02 count (rmm::cuda_stream_default in src/): 40 (matches Phase 14 baseline)
+- Conflict surface inventory: 10 conflicting source files (UU) + 1 modify/delete (UD) = 11 conflict files total; cucascade was auto-resolved by git to `1c1e648` (fast-forward to our pin) without manual intervention
 
 ***
 
@@ -23,54 +24,52 @@ Order matches CONTEXT.md domain inventory.
 
 ### A.1 — `CMakeLists.txt`
 - Resolution policy: D-D1 (keep both — multi-GPU runtime config + scan-manager config)
-- Resolution outcome: `<filled>`
-- TODOs added: `<filled>`
+- Resolution outcome: Combined per D-D1. Kept our `src/io/cucascade_datasource.cpp` (Phase 5 adapter, not yet upstreamed) + accepted dev's new io source files: `src/io/admission_control.cpp`, `src/io/prefetching_cache.cpp`, `src/io/sirius_datasource.cpp`, `src/io/uring/uring_ioctx.cpp`, `src/io/uring/uring_reactor.cpp`. Single conflict block resolved. Markers removed.
+- TODOs added: None (EXTENSION_SOURCES list merge was purely additive)
 
 ### A.2 — `cucascade` (submodule)
 - Resolution policy: D-B1/B2 (keep ours unconditionally — pin must remain `1c1e648`)
-- Resolution command: `git checkout --ours cucascade && git add cucascade`
-- Verification: `git ls-tree HEAD cucascade` returns `1c1e648a282a06747328c78f62d2d676ce51a8ce`
-- Resolution outcome: `<filled>`
+- Resolution command: NOT NEEDED — git auto-resolved via "Fast-forwarding submodule cucascade to 1c1e648a282a06747328c78f62d2d676ce51a8ce" (git detected our commit was already ahead of dev's pin along the same lineage). Staged automatically at `160000 1c1e648a282a06747328c78f62d2d676ce51a8ce 0`.
+- Verification: `git ls-files --stage cucascade` returns `160000 1c1e648a282a06747328c78f62d2d676ce51a8ce 0\tcucascade`. Phase 16 pin defended.
 
 ### A.3 — `src/expression_executor/gpu_expression_executor.cpp`
 - Resolution policy: D-D5 (take dev's version; flag any post-#731 stream changes for Phase 18)
-- Resolution outcome: `<filled>`
+- Resolution outcome: Took dev's version via `git checkout --theirs`. Audited for `get_data()`, `pop_data_batch`, `cudaSetDevice` patterns — zero hits found. No Phase 18 TODOs needed in this file.
 
 ### A.4 — `src/include/creator/task_creator.hpp`
 - Resolution policy: D-D4 (combine — preserve our `_no_pref_rr_counter`-related context; accept dev's other changes)
-- Resolution outcome: `<filled>`
+- Resolution outcome: Combined per D-D4. Single conflict block: our side added `#include <unordered_map>` (required for `_numa_to_gpu` field at line ~217) and `#include <variant>`. Dev removed both. Kept `<unordered_map>` (actively used by `std::unordered_map<int, std::vector<int>> _numa_to_gpu`), dropped `<variant>` (included but unused in header body per grep audit). `_no_pref_rr_counter` itself lives in `task_scheduler.hpp` (not this file — confirmed). SCHED-RR context in the header's comments at lines 213-219 (SCHED-02 round-robin doc) survived the merge via auto-merge. No TODO needed.
 
 ### A.5 — `src/include/exec/config.hpp`
 - Resolution policy: D-D1 (keep both — multi-GPU runtime config + scan-manager config)
-- Resolution outcome: `<filled>`
+- Resolution outcome: Combined per D-D1. Single conflict block: our side added `#include <optional>` (for `std::optional<int> preferred_numa_node` field); dev's side added `#include <cstdint>` (for `uint64_t monitor_period_ms`). Kept both includes: `#include <cstdint>` (first, alphabetical) + `#include <optional>`. Both fields were preserved in the non-conflicted body via auto-merge. Markers removed.
 
 ### A.6 — `src/include/op/scan/parquet_scan_operator_data.hpp`
 - Resolution policy: D-D4 (combine — preserve our `_batch_gpu_affinity`-related context if present; accept dev's other changes)
-  - Note: `_batch_gpu_affinity` itself lives in `src/include/op/scan/duckdb_scan_executor.hpp:218`; this file is the operator-data carrier, not the affinity-map owner. Verify any conflict here is structural, not affinity-specific.
-- Resolution outcome: `<filled>`
+- Resolution outcome: Combined per D-D4. Two conflict blocks: (1) Our side had `parquet_metadata_input` and `partitioned_parquet_metadata` classes — accepted dev's removal since `sirius_parquet_metadata_scan_operator.hpp` was deleted (these were its data types). (2) Constructor signature for `parquet_scan_data` — took dev's simplified version (duckdb::Expression filter + scan_plan). Our multi-GPU fields `retranslation_filter` and `filter_name_resolver` were in the non-conflicted body (auto-merged in); replaced them with a `TODO(v1.4 Phase 20 — SM-02)` comment block. Added `TODO(v1.4 Phase 20 — SM-02)` above constructor. `_batch_gpu_affinity` confirmed to live in `duckdb_scan_executor.hpp:218` (not this file — not conflicted).
 
 ### A.7 — `src/include/op/scan/sirius_parquet_metadata_scan_operator.hpp` (modify/delete)
 - Resolution policy: D-D6 — accept deletion AFTER 17-PHASE-13-EXTRACT.md is committed (plan 17-01 prereq).
 - Resolution command: `git rm src/include/op/scan/sirius_parquet_metadata_scan_operator.hpp`
 - Re-attachment target documented in: `17-PHASE-13-EXTRACT.md` (Phase 20 SM-03)
-- Resolution outcome: `<filled>`
+- Resolution outcome: Accepted deletion via `git rm`. Phase 13 stream-lineage extraction confirmed in `17-PHASE-13-EXTRACT.md` (commit `2f3a786`). Re-attachment scheduled for Phase 20 SM-03 in `src/op/scan/sirius_gpu_parquet_scan_operator.cpp::execute()`. File is absent from working tree post-merge.
 
 ### A.8 — `src/op/scan/sirius_gpu_parquet_scan_operator.cpp`
 - Resolution policy: D-D3 (take dev's; add TODOs for Phase 20 mgpu re-integration: `_batch_gpu_affinity` recording, writer_stream forwarding, per-task filter translation under SCHED-RR)
-- Resolution outcome: `<filled>`
+- Resolution outcome: Took dev's version via `git checkout --theirs`. Phase 20 SM-01/02/03/04 TODO block inserted above `execute()` (4 sub-items: SCHED-RR, _batch_gpu_affinity, writer_stream, per-task filter translation). Phase 18 DB-02 TODO inserted above `batch->get_data()` call in cached path at line ~191. Total: 1 Phase 20 block + 1 Phase 18 TODO.
 
 ### A.9 — `src/op/sirius_physical_table_scan.cpp`
 - Resolution policy: D-D3 (take dev's; add TODOs for Phase 20)
-- Resolution outcome: `<filled>`
+- Resolution outcome: Took dev's version via `git checkout --theirs`. Phase 20 SM-01..06 TODO inserted above `execute()`. Phase 18 DB-02 TODOs inserted above 4 `get_data()` calls (lines ~89, ~127-128, ~144, ~160). Phase 18 DB-03 TODO inserted above `pop_data_batch` call (line ~86). Total: 1 Phase 20 TODO + 5 Phase 18 TODOs.
 
 ### A.10 — `src/pipeline/sirius_pipeline_converter.cpp`
 - Resolution policy: D-D3 (take dev's; add TODOs for Phase 20)
-- Resolution outcome: `<filled>`
+- Resolution outcome: Took dev's version via `git checkout --theirs`. Audited for `get_data()`, `pop_data_batch`, `cudaSetDevice` — zero hits. Phase 18 DB-01 and Phase 20 SM-03 TODO block inserted above first function definition `split_parquet_scan_source()`. Total: 2 TODOs.
 
 ### A.11 — `src/scan_manager/parquet_split_provider.cpp` (net-new)
 - Resolution policy: D-D2 (take dev's version as-is; net-new on dev, no local version exists)
 - Verification: `ls src/scan_manager` should NOT exist before merge; should exist after
-- Resolution outcome: `<filled>`
+- Resolution outcome: Took dev's net-new file via `git checkout --theirs`. Note: git detected a rename conflict (HEAD path = `src/op/scan/sirius_parquet_metadata_scan_operator.cpp`, dev path = `src/scan_manager/parquet_split_provider.cpp`). Resolved by taking dev's theirs version. File LOC: 345 lines. No TODOs added — Phase 20 SM-01..03 will integrate v1.3 multi-GPU semantics (SCHED-RR, _batch_gpu_affinity, writer_stream) into this file.
 
 ***
 

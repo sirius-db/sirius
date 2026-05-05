@@ -298,7 +298,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
           hash_join.is_build_probe_mode()) {
         // Either sibling may run this block first; configure the build-side CONCAT only.
         auto enable_build_concat_all = [](sirius_physical_operator& part_op) {
-          for (auto& next_port : part_op.get_next_port_after_sink()) {
+          for (auto& next_port : part_op.get_next_ports_after_sink()) {
             if (next_port.next_operator->type != SiriusPhysicalOperatorType::CONCAT) { continue; }
             auto& concat = next_port.next_operator->Cast<sirius_physical_concat>();
             if (concat.is_build_concat()) { concat.set_concat_all(true); }
