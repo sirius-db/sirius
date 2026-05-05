@@ -134,7 +134,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
   5. `[mgpu_stress]` 1-iter smoke (100 iterations × 5 queries but only 1 repetition) exits 0 — SCHED-RR survival after RAII migration; 500-iter deferred to Phase 21.
 **Plans**: 6 plans
 - [x] 18-01-PLAN.md — Rewrite batch_lock_utils.hpp + ripple prepare_for_processing return type + get_cudf_table_view signature (DB-01)
-- [ ] 18-02-PLAN.md — Migrate convertible_* wrappers + sirius_physical_operator base impl + gpu_pipeline_task storage (DB-02, DB-03)
+- [x] 18-02-PLAN.md — Migrate convertible_* wrappers + sirius_physical_operator base impl + gpu_pipeline_task storage (DB-02, DB-03)
 - [ ] 18-03-PLAN.md — Migrate stateful operators with FSM-pop / 3-arg pop-by-id: table_scan, hash_join, nested_loop_join, concat, top_n, grouped_aggregate_merge, ungrouped_aggregate, merge_sort (DB-02, DB-03)
 - [ ] 18-04-PLAN.md — Migrate read-only operators + scan layer + close 4 sites of 2-arg make_data_batch (Pitfall 4) (DB-02, DB-03)
 - [ ] 18-05-PLAN.md — Migrate 23 test files; reach build-clean (DB-03, DB-04)
@@ -211,7 +211,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 | 15. Cross-GPU operator-colocation audit | v1.3 | 4/4 | Complete | 2026-05-01 |
 | 16. Cucascade Submodule Rebase + Pin Recovery | v1.4 | 5/5 | Complete    | 2026-05-05 |
 | 17. Sirius origin/dev Merge — Base Layer | v1.4 | 4/4 | Complete    | 2026-05-05 |
-| 18. DataBatch RAII Migration | v1.4 | 1/6 | In Progress|  |
+| 18. DataBatch RAII Migration | v1.4 | 2/6 | In Progress|  |
 | 19. IO Framework Adoption | v1.4 | 0/? | Not started | - |
 | 20. Scan Manager + Pin Tables Port | v1.4 | 0/? | Not started | - |
 | 21. v1.4 Ship Gate | v1.4 | 0/? | Not started | - |

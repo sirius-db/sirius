@@ -31,8 +31,8 @@
 ### DB — DataBatch RAII Migration (cucascade #117 surface)
 
 - [x] **DB-01**: `src/include/data/batch_lock_utils.hpp` (129 LOC) rewritten for the post-#117 RAII model. Public helpers express lock acquisition via `to_read_only()` / `to_mutable()` / `try_to_*()` patterns; no remaining references to deleted FSM states (`task_created`, `processing`, `in_transit`, `idle`).
-- [ ] **DB-02**: All 26 `batch->get_data()` call sites (and any `pop_data_batch(state)` / `data_batch_processing_handle` usages) migrated to RAII accessors. `grep -rn "->get_data()\|pop_data_batch.*task_created\|data_batch_processing_handle" src/ test/` returns zero hits.
-- [ ] **DB-03**: ~12 operators + ~16 tests adapted using PR #739 as the file-list reference (NOT a cherry-pick; #739 targets cucascade #112 not #117). Lock scopes correct: read-only access uses `to_read_only()` for the duration of the read; mutation uses `to_mutable()` and releases before yielding to other consumers.
+- [x] **DB-02**: All 26 `batch->get_data()` call sites (and any `pop_data_batch(state)` / `data_batch_processing_handle` usages) migrated to RAII accessors. `grep -rn "->get_data()\|pop_data_batch.*task_created\|data_batch_processing_handle" src/ test/` returns zero hits.
+- [x] **DB-03**: ~12 operators + ~16 tests adapted using PR #739 as the file-list reference (NOT a cherry-pick; #739 targets cucascade #112 not #117). Lock scopes correct: read-only access uses `to_read_only()` for the duration of the read; mutation uses `to_mutable()` and releases before yielding to other consumers.
 - [ ] **DB-04**: Compile-clean state on the rebased branch — `mcp__project-commands__run_command build` exits 0 with no remaining migration TODOs. HYG-02 baseline ≤ 40.
 - [ ] **DB-05**: Targeted regression — `[mgpu]` filter passes 16/16 on the rebased shape (proxy for "DataBatch migration didn't break multi-GPU correctness"). Run `[mgpu_stress]` 1-iter (not 500) to smoke-test SCHED-RR survival; 500-iter is REG-05 in Phase 21. Compute-sanitizer racecheck on `[mgpu_foundation]` clean.
 
@@ -105,8 +105,8 @@
 | MERGE-04 | 17 | Complete |
 | MERGE-05 | 17 | Complete |
 | DB-01 | 18 | Complete |
-| DB-02 | 18 | Pending |
-| DB-03 | 18 | Pending |
+| DB-02 | 18 | Complete |
+| DB-03 | 18 | Complete |
 | DB-04 | 18 | Pending |
 | DB-05 | 18 | Pending |
 | IO-12 | 19 | Pending |
