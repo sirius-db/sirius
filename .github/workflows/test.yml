@@ -70,6 +70,8 @@ jobs:
 
   test:
     runs-on: [self-hosted, ubuntu-24.04, cuda-13, gpu-t4]
+    env:
+      SIRIUS_LOG_LEVEL: true
     needs: build
     timeout-minutes: 60
     steps:
