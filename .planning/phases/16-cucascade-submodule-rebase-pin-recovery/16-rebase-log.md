@@ -17,7 +17,7 @@ Backup ref: `phase16-pre-squash-backup` -> 62e0517
 | 1 | 3147ecf | 1fff85d, 3743621, 2dcab24, ff14ff4, e23f3a2 | 6236494 |
 | 2 | 2c1c844 | 7ed84f2, cc2a53d, e4db3d8 | (pending — 16-03) |
 | 3 | d52a67e | eda349a | a1778f9 |
-| 4 | 4930652 | 7409c60, 62e0517 | (pending — 16-04) |
+| 4 | 4930652 | 7409c60, 62e0517 | 1c1e648 |
 
 ## Conflict Resolution Rounds
 
@@ -58,9 +58,20 @@ Backup ref: `phase16-pre-squash-backup` -> 62e0517
   - Time spent: ~15 min
 
 ### Round 4 (Group 4 — Phase 13 stream-lineage) — 16-04
-- Files: `include/cucascade/data/gpu_data_representation.hpp`, `src/data/gpu_data_representation.cpp`, `src/data/representation_converter.cpp`, `include/cucascade/data/data_batch.hpp` (proxy add), `test/data/test_data_batch.cpp` (ctor call updates)
-- Status: pending
-- Resolution notes: (filled by 16-04)
+- Files: `include/cucascade/data/gpu_data_representation.hpp`, `src/data/gpu_data_representation.cpp`, `src/data/representation_converter.cpp`, `include/cucascade/data/data_batch.hpp` (proxy add), `test/data/test_data_batch.cpp`, `test/data/test_representation_converter.cpp`, `test/data/test_disk_host_converters.cpp`, `test/data/test_gpu_disk_converters.cpp`, `test/data/test_data_representation.cpp`, `src/data/bandwidth_profiler.cpp`, `benchmark/benchmark_disk_converter.cpp`, `benchmark/benchmark_representation_converter.cpp`
+- Status: applied
+- Resulting commit: `1c1e648` (amended from initial 9dddf77 to include missed ctor sites)
+- Resolution notes:
+  - **Approach:** Full re-implementation per D-D2 (not a merge/cherry-pick conflict resolution). The prior session applied the cherry-pick and resolved all conflicts manually, then committed as 9dddf77. The wrap-up session (16-04 execution) amended this commit after build verification revealed missed ctor sites.
+  - **gpu_data_representation.hpp:** Clean rewrite merging #117's owning_table_view variant shell (struct owning_table_view {std::any owner; size_t alloc_size; cudf::table_view view}; std::variant<unique_ptr<cudf::table>, owning_table_view> _table) with Group 4's writer_stream REQUIRED on both ctors (D-B2): 3-arg simple ctor + 5-arg template ctor for PR #116 cudf::table_view path. Added: record_writer_event(rmm::cuda_stream_view), [[nodiscard]] cudaEvent_t get_writer_event() const, ~gpu_table_representation() override, cudaEvent_t _writer_event{nullptr} member appended after _table. Includes: union of #117 (any, variant, cudf/table_view) + Group 4 (rmm/cuda_stream_view.hpp, cuda_runtime.h).
+  - **gpu_data_representation.cpp:** Simple ctor body: init idata_representation + _table(std::move(table)) then record_writer_event(writer_stream). Template ctor: defined inline in header, initializes owning_table_view then calls record_writer_event. Destructor: if (_writer_event != nullptr) { cudaEventDestroy(_writer_event); }. record_writer_event impl: cudaEventCreateWithFlags + cudaEventRecord. get_writer_event: returns _writer_event. All variant-dispatch methods (get_size_in_bytes, get_uncompressed_data_size_in_bytes, get_table_view, release_table, clone) preserved verbatim from 73d00c4.
+  - **representation_converter.cpp:** convert_gpu_to_gpu finalized: cudaStreamWaitEvent(target_stream.value(), source_repr.get_writer_event(), 0) added before issuing peer copies (Phase 13 STREAM-LINEAGE pass-1). Group 2's p2p_dma_supported routing via alloc_and_peer_copy_async preserved. Column-tree walk (not cudf::pack) from Group 2 retained. Other 3 converter functions (convert_host_to_gpu, convert_host_fast_to_gpu, convert_disk_to_gpu) retain their 16-03 3-arg ctor wiring.
+  - **data_batch.hpp:** read_only_data_batch::get_writer_event() const proxy added per D-B3: auto* repr = get_data(); if (!repr) return nullptr; auto* gpu_repr = dynamic_cast<gpu_table_representation*>(repr); if (!gpu_repr) return nullptr; return gpu_repr->get_writer_event(). Added #include <cuda_runtime.h> at top. No circular include (gpu_data_representation.hpp does not include data_batch.hpp).
+  - **Test files (~10 ctor sites):** test_data_batch.cpp (5 sites), test_representation_converter.cpp, test_disk_host_converters.cpp, test_gpu_disk_converters.cpp (4 sites) — all updated to 3-arg form with rmm::cuda_stream_view{} as writer_stream. test_data_representation.cpp: wrap_column helper updated to accept optional rmm::cuda_stream_view writer_stream = rmm::cuda_stream_view{} parameter; internal ctor call updated; all wrap_column call sites updated.
+  - **Missed sites (caught by build verification):** bandwidth_profiler.cpp (1 site — uses bootstrap_stream), benchmark_disk_converter.cpp (11 sites — use stream.view() from local rmm::cuda_stream; 1 site in write_table_to_disk takes rmm::cuda_stream_view so uses stream directly), benchmark_representation_converter.cpp (6 sites — push_back loop sites use rmm::cuda_stream_view{}, warmup sites use warmup_stream.view(), setup-loop sites use setup_stream.view()). All caught in first build pass and amended into the commit.
+  - **Build state at end of 16-04:** COMPILE-CLEAN. cmake --build exits 0 for library + tests + benchmarks. ctest deferred to 16-05 (sandboxed shell has no CUDA device in env; host has 2x RTX 6000 Ada).
+  - **Time budget:** ~45 min total (source work in prior session ~30 min; wrap-up: .bak cleanup + build verify + fixes + SUMMARY + log + state updates ~15 min). Within D-A4 budget.
+  - **4 commits on top of 73d00c4 confirmed:** 6236494 (Group 1), a1778f9 (Group 3), 995bf4e (Group 2), 1c1e648 (Group 4)
 
 ## Pin Advance (16-05)
 

@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Rebase After DataBatch Changes
 status: executing
-stopped_at: Completed 16-03-PLAN.md
-last_updated: "2026-05-04T23:28:57.577Z"
-last_activity: 2026-05-04
+stopped_at: Completed 16-04-PLAN.md — Group 4 stream-lineage cherry-pick wrap-up, build compile-clean
+last_updated: "2026-05-05T06:43:55.676Z"
+last_activity: 2026-05-05
 progress:
   total_phases: 6
   completed_phases: 0
   total_plans: 5
-  completed_plans: 3
+  completed_plans: 4
 ---
 
 # Project State
@@ -25,9 +25,9 @@ See: .planning/PROJECT.md (updated 2026-05-04)
 ## Current Position
 
 Phase: 16 (Cucascade Submodule Rebase + Pin Recovery) — EXECUTING
-Plan: 4 of 5
+Plan: 5 of 5
 Status: Ready to execute
-Last activity: 2026-05-04
+Last activity: 2026-05-05
 
 ```
 v1.4 Progress: [                    ] 0/6 phases | 0/32 requirements | 0 plans
@@ -80,6 +80,7 @@ v1.4 Progress: [                    ] 0/6 phases | 0/32 requirements | 0 plans
 | Phase 16 P01 | 3 | 3 tasks | 1 files |
 | Phase 16 P02 | 4min | 3 tasks | 8 files |
 | Phase 16 P03 | 15 | 2 tasks | 4 files |
+| Phase 16-cucascade-submodule-rebase-pin-recovery P04 | 45 | 5 tasks | 12 files |
 
 ## Decisions
 
@@ -142,6 +143,9 @@ v1.4 Progress: [                    ] 0/6 phases | 0/32 requirements | 0 plans
 - [Phase 16]: Conflict at convert_gpu_to_gpu forward-decl: took Group 2's forward-decl, discarded HEAD's old cudf::pack body; column-tree-walk implementation auto-merged
 - [Phase 16]: 3-arg ctor Option B: stream arg added to all 4 construction sites in representation_converter.cpp now; build NOT clean until 16-04 adds writer_stream to header
 - [Phase 16]: get_table().view() in auto-merged convert_gpu_to_gpu body changed to get_table_view() per #117 API removal (D-D2)
+- [Phase 16-04]: D-D2 full re-implementation: gpu_data_representation.hpp/cpp rewritten against #117 RAII shape with Group 4 writer_stream REQUIRED on both ctors grafted in
+- [Phase 16-04]: read_only_data_batch::get_writer_event() proxy via dynamic_cast (D-B3): returns nullptr for non-GPU repr, no deadlock risk
+- [Phase 16-04]: Benchmark ctor sites: stream.view() from local rmm::cuda_stream for setup/warmup; rmm::cuda_stream_view{} for thread-pool reprs created before streams are assigned
 
 ## Accumulated Context
 
@@ -177,6 +181,6 @@ None at roadmap creation. Phase 16 is ready to plan.
 
 ## Session Continuity
 
-Last session: 2026-05-04T23:28:57.574Z
-Stopped at: Completed 16-03-PLAN.md
+Last session: 2026-05-05T06:43:55.673Z
+Stopped at: Completed 16-04-PLAN.md — Group 4 stream-lineage cherry-pick wrap-up, build compile-clean
 Resume file: None

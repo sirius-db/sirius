@@ -93,7 +93,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 - [x] 16-01-PLAN.md — Squash 11 cucascade commits into 4 group commits + initialize audit log
 - [x] 16-02-PLAN.md — Rebase Group 1 (memory hygiene) + Group 3 (io_worker) onto 73d00c4
 - [x] 16-03-PLAN.md — Rebase Group 2 (P2P override + DMA probe) onto Group 1+3 tip
-- [ ] 16-04-PLAN.md — Rebase Group 4 (Phase 13 stream-lineage); re-implement gpu_data_representation + convert_gpu_to_gpu under #117 RAII; build compile-clean
+- [x] 16-04-PLAN.md — Rebase Group 4 (Phase 13 stream-lineage); re-implement gpu_data_representation + convert_gpu_to_gpu under #117 RAII; build compile-clean
 - [ ] 16-05-PLAN.md — Run cucascade ctest + 8 grep gates; advance submodule pin in parent worktree
 **Pitfalls**:
   - P2 (writer_stream lost in representation_converter.cpp conflict): treat `representation_converter.cpp` as a re-implementation from `73d00c4` shape, not a three-way merge. Verify with grep gate before proceeding.
@@ -199,7 +199,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 | 13. Fix Q11 multi-GPU hang/illegal-address | v1.3 | 4/5 | Complete | 2026-04-30 |
 | 14. Land SCHED-RR distribution | v1.3 | 2/2 | Complete | 2026-04-30 |
 | 15. Cross-GPU operator-colocation audit | v1.3 | 4/4 | Complete | 2026-05-01 |
-| 16. Cucascade Submodule Rebase + Pin Recovery | v1.4 | 3/5 | In Progress|  |
+| 16. Cucascade Submodule Rebase + Pin Recovery | v1.4 | 4/5 | In Progress|  |
 | 17. Sirius origin/dev Merge — Base Layer | v1.4 | 0/? | Not started | - |
 | 18. DataBatch RAII Migration | v1.4 | 0/? | Not started | - |
 | 19. IO Framework Adoption | v1.4 | 0/? | Not started | - |
