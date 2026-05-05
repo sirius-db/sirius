@@ -1,0 +1,614 @@
+[1/422] Building CXX object third_party/libpg_query/CMakeFiles/duckdb_pg_query.dir/src_backend_parser_parser.cpp.o
+[2/422] Building CXX object third_party/libpg_query/CMakeFiles/duckdb_pg_query.dir/pg_functions.cpp.o
+[3/422] Building CXX object third_party/libpg_query/CMakeFiles/duckdb_pg_query.dir/postgres_parser.cpp.o
+[4/422] Building CXX object third_party/hyperloglog/CMakeFiles/duckdb_hyperloglog.dir/sds.cpp.o
+[5/422] Building CXX object third_party/libpg_query/CMakeFiles/duckdb_pg_query.dir/src_backend_nodes_list.cpp.o
+[6/422] Building CXX object third_party/libpg_query/CMakeFiles/duckdb_pg_query.dir/src_backend_parser_scansup.cpp.o
+[7/422] Building CXX object third_party/libpg_query/CMakeFiles/duckdb_pg_query.dir/src_backend_nodes_makefuncs.cpp.o
+[8/422] Building CXX object third_party/libpg_query/CMakeFiles/duckdb_pg_query.dir/src_backend_nodes_value.cpp.o
+[9/422] Building CXX object third_party/libpg_query/CMakeFiles/duckdb_pg_query.dir/src_common_keywords.cpp.o
+[10/422] Building CXX object third_party/hyperloglog/CMakeFiles/duckdb_hyperloglog.dir/hyperloglog.cpp.o
+[11/422] Building CXX object third_party/mbedtls/CMakeFiles/duckdb_mbedtls.dir/library/aes.cpp.o
+[12/422] Building CXX object third_party/mbedtls/CMakeFiles/duckdb_mbedtls.dir/library/asn1parse.cpp.o
+[13/422] Building CXX object third_party/fsst/CMakeFiles/duckdb_fsst.dir/libfsst.cpp.o
+[14/422] Building CXX object third_party/libpg_query/CMakeFiles/duckdb_pg_query.dir/src_backend_parser_scan.cpp.o
+[15/422] Building CXX object third_party/mbedtls/CMakeFiles/duckdb_mbedtls.dir/library/base64.cpp.o
+[16/422] Building CXX object third_party/mbedtls/CMakeFiles/duckdb_mbedtls.dir/library/asn1write.cpp.o
+[17/422] Building CXX object third_party/mbedtls/CMakeFiles/duckdb_mbedtls.dir/library/cipher_wrap.cpp.o
+[18/422] Building CXX object third_party/mbedtls/CMakeFiles/duckdb_mbedtls.dir/library/cipher.cpp.o
+[19/422] Building CXX object third_party/mbedtls/CMakeFiles/duckdb_mbedtls.dir/library/constant_time.cpp.o
+[20/422] Building CXX object third_party/mbedtls/CMakeFiles/duckdb_mbedtls.dir/library/bignum_core.cpp.o
+[21/422] Building CXX object third_party/mbedtls/CMakeFiles/duckdb_mbedtls.dir/library/gcm.cpp.o
+[22/422] Building CXX object third_party/mbedtls/CMakeFiles/duckdb_mbedtls.dir/library/md.cpp.o
+[23/422] Building CXX object third_party/mbedtls/CMakeFiles/duckdb_mbedtls.dir/library/oid.cpp.o
+[24/422] Building CXX object third_party/mbedtls/CMakeFiles/duckdb_mbedtls.dir/library/pem.cpp.o
+[25/422] Building CXX object third_party/mbedtls/CMakeFiles/duckdb_mbedtls.dir/library/pk_wrap.cpp.o
+[26/422] Building CXX object third_party/mbedtls/CMakeFiles/duckdb_mbedtls.dir/library/platform.cpp.o
+[27/422] Building CXX object third_party/mbedtls/CMakeFiles/duckdb_mbedtls.dir/library/pk.cpp.o
+[28/422] Building CXX object third_party/mbedtls/CMakeFiles/duckdb_mbedtls.dir/library/platform_util.cpp.o
+[29/422] Building CXX object third_party/mbedtls/CMakeFiles/duckdb_mbedtls.dir/library/pkparse.cpp.o
+[30/422] Building CXX object third_party/mbedtls/CMakeFiles/duckdb_mbedtls.dir/library/rsa_alt_helpers.cpp.o
+[31/422] Building CXX object third_party/mbedtls/CMakeFiles/duckdb_mbedtls.dir/library/bignum.cpp.o
+[32/422] Building CXX object third_party/mbedtls/CMakeFiles/duckdb_mbedtls.dir/library/sha1.cpp.o
+[33/422] Building CXX object third_party/mbedtls/CMakeFiles/duckdb_mbedtls.dir/library/sha256.cpp.o
+[34/422] Building CXX object third_party/mbedtls/CMakeFiles/duckdb_mbedtls.dir/library/rsa.cpp.o
+[35/422] Building CXX object third_party/re2/CMakeFiles/duckdb_re2.dir/re2/bitmap256.cc.o
+[36/422] Building CXX object third_party/libpg_query/CMakeFiles/duckdb_pg_query.dir/src_backend_parser_gram.cpp.o
+[37/422] Building CXX object third_party/re2/CMakeFiles/duckdb_re2.dir/re2/bitstate.cc.o
+[38/422] Building CXX object third_party/re2/CMakeFiles/duckdb_re2.dir/re2/filtered_re2.cc.o
+[39/422] Building CXX object third_party/re2/CMakeFiles/duckdb_re2.dir/re2/mimics_pcre.cc.o
+[40/422] Building CXX object third_party/re2/CMakeFiles/duckdb_re2.dir/re2/compile.cc.o
+[41/422] Building CXX object third_party/mbedtls/CMakeFiles/duckdb_mbedtls.dir/mbedtls_wrapper.cpp.o
+[42/422] Building CXX object third_party/re2/CMakeFiles/duckdb_re2.dir/re2/perl_groups.cc.o
+[43/422] Building CXX object third_party/re2/CMakeFiles/duckdb_re2.dir/re2/nfa.cc.o
+[44/422] Building CXX object third_party/re2/CMakeFiles/duckdb_re2.dir/re2/onepass.cc.o
+[45/422] Building CXX object third_party/miniz/CMakeFiles/duckdb_miniz.dir/miniz.cpp.o
+[46/422] Building CXX object third_party/re2/CMakeFiles/duckdb_re2.dir/re2/dfa.cc.o
+[47/422] Building CXX object third_party/re2/CMakeFiles/duckdb_re2.dir/re2/prefilter.cc.o
+[48/422] Building CXX object third_party/re2/CMakeFiles/duckdb_re2.dir/re2/parse.cc.o
+[49/422] Building CXX object third_party/re2/CMakeFiles/duckdb_re2.dir/re2/re2.cc.o
+[50/422] Building CXX object third_party/re2/CMakeFiles/duckdb_re2.dir/re2/prefilter_tree.cc.o
+[51/422] Building CXX object third_party/re2/CMakeFiles/duckdb_re2.dir/re2/prog.cc.o
+[52/422] Building CXX object third_party/re2/CMakeFiles/duckdb_re2.dir/re2/unicode_casefold.cc.o
+[53/422] Building CXX object third_party/re2/CMakeFiles/duckdb_re2.dir/re2/unicode_groups.cc.o
+[54/422] Building CXX object third_party/re2/CMakeFiles/duckdb_re2.dir/util/rune.cc.o
+[55/422] Building CXX object third_party/re2/CMakeFiles/duckdb_re2.dir/re2/set.cc.o
+[56/422] Building CXX object third_party/re2/CMakeFiles/duckdb_re2.dir/re2/stringpiece.cc.o
+[57/422] Building CXX object third_party/re2/CMakeFiles/duckdb_re2.dir/re2/simplify.cc.o
+[58/422] Building CXX object third_party/re2/CMakeFiles/duckdb_re2.dir/util/strutil.cc.o
+[59/422] Building CXX object third_party/re2/CMakeFiles/duckdb_re2.dir/re2/tostring.cc.o
+[60/422] Building CXX object third_party/re2/CMakeFiles/duckdb_re2.dir/re2/regexp.cc.o
+[61/422] Building CXX object third_party/skiplist/CMakeFiles/duckdb_skiplistlib.dir/SkipList.cpp.o
+[62/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/compress/zstd_compress_superblock.cpp.o
+[63/422] Building CXX object third_party/utf8proc/CMakeFiles/duckdb_utf8proc.dir/utf8proc.cpp.o
+[64/422] Building CXX object third_party/utf8proc/CMakeFiles/duckdb_utf8proc.dir/utf8proc_wrapper.cpp.o
+[65/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/compress/zstdmt_compress.cpp.o
+[66/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/compress/hist.cpp.o
+[67/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/compress/zstd_compress_sequences.cpp.o
+[68/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/compress/zstd_ldm.cpp.o
+[69/422] Building CXX object third_party/fastpforlib/CMakeFiles/duckdb_fastpforlib.dir/bitpacking.cpp.o
+[70/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/compress/zstd_compress_literals.cpp.o
+[71/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/compress/huf_compress.cpp.o
+[72/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/compress/fse_compress.cpp.o
+[73/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/decompress/zstd_ddict.cpp.o
+[74/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/compress/zstd_fast.cpp.o
+[75/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/compress/zstd_double_fast.cpp.o
+[76/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/compress/zstd_compress.cpp.o
+[77/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/decompress/zstd_decompress.cpp.o
+[78/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/common/entropy_common.cpp.o
+[79/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/common/debug.cpp.o
+[80/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/common/xxhash.cpp.o
+[81/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/common/fse_decompress.cpp.o
+[82/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/common/threading.cpp.o
+[83/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/compress/zstd_opt.cpp.o
+[84/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/common/pool.cpp.o
+[85/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/common/error_private.cpp.o
+[86/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/common/zstd_common.cpp.o
+[87/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/dict/fastcover.cpp.o
+[88/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/dict/cover.cpp.o
+[89/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/deprecated/zbuff_common.cpp.o
+[90/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/deprecated/zbuff_decompress.cpp.o
+[91/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/deprecated/zbuff_compress.cpp.o
+[92/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/decompress/zstd_decompress_block.cpp.o
+[93/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/decompress/huf_decompress.cpp.o
+[94/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/dict/zdict.cpp.o
+[95/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/dict/divsufsort.cpp.o
+[96/422] Building CXX object third_party/fmt/CMakeFiles/duckdb_fmt.dir/format.cc.o
+[97/422] Building CXX object cucascade/CMakeFiles/cucascade_objects.dir/src/memory/disk_access_limiter.cpp.o
+[98/422] Building CXX object cucascade/CMakeFiles/cucascade_objects.dir/src/memory/memory_reservation.cpp.o
+[99/422] Building CXX object cucascade/CMakeFiles/cucascade_objects.dir/src/memory/common.cpp.o
+[100/422] Building CXX object cucascade/CMakeFiles/cucascade_objects.dir/src/memory/notification_channel.cpp.o
+[101/422] Building CXX object cucascade/CMakeFiles/cucascade_objects.dir/src/memory/fixed_size_host_memory_resource.cpp.o
+[102/422] Building CXX object cucascade/CMakeFiles/cucascade_objects.dir/src/memory/memory_reservation_manager.cpp.o
+[103/422] Building CXX object third_party/yyjson/CMakeFiles/duckdb_yyjson.dir/yyjson.cpp.o
+[104/422] Building CXX object cucascade/CMakeFiles/cucascade_objects.dir/src/memory/oom_handling_policy.cpp.o
+[105/422] Building CXX object third_party/zstd/CMakeFiles/duckdb_zstd.dir/compress/zstd_lazy.cpp.o
+[106/422] Building CXX object cucascade/CMakeFiles/cucascade_objects.dir/src/memory/error.cpp.o
+[107/422] Building CXX object cucascade/CMakeFiles/cucascade_objects.dir/src/memory/null_device_memory_resource.cpp.o
+[108/422] Building CXX object cucascade/CMakeFiles/cucascade_objects.dir/src/memory/numa_region_pinned_host_allocator.cpp.o
+[109/422] Building CXX object cucascade/CMakeFiles/cucascade_objects.dir/src/memory/memory_space.cpp.o
+[110/422] Building CXX object cucascade/CMakeFiles/cucascade_objects.dir/src/memory/stream_pool.cpp.o
+[111/422] Building CXX object cucascade/CMakeFiles/cucascade_objects.dir/src/memory/reservation_aware_resource_adaptor.cpp.o
+[112/422] Building CXX object cucascade/CMakeFiles/cucascade_objects.dir/src/memory/small_pinned_host_memory_resource.cpp.o
+[113/422] Building CXX object cucascade/CMakeFiles/cucascade_objects.dir/src/data/io_backend_registry.cpp.o
+[114/422] Building CXX object cucascade/CMakeFiles/cucascade_objects.dir/src/memory/reservation_manager_configurator.cpp.o
+[115/422] Building CXX object cucascade/CMakeFiles/cucascade_objects.dir/src/memory/topology_discovery.cpp.o
+[116/422] Building CXX object cucascade/CMakeFiles/cucascade_objects.dir/src/data/cpu_data_representation.cpp.o
+[117/422] Building CXX object cucascade/CMakeFiles/cucascade_objects.dir/src/data/disk_data_representation.cpp.o
+[118/422] Building CXX object cucascade/CMakeFiles/cucascade_objects.dir/src/data/pipeline_io_backend.cpp.o
+[119/422] Building CXX object cucascade/CMakeFiles/cucascade_objects.dir/src/data/bandwidth_profiler.cpp.o
+[120/422] Building CXX object src/optimizer/compressed_materialization/CMakeFiles/duckdb_optimizer_compressed_materialization.dir/ub_duckdb_optimizer_compressed_materialization.cpp.o
+[121/422] Building CXX object cucascade/CMakeFiles/cucascade_objects.dir/src/data/data_batch.cpp.o
+[122/422] Building CXX object cucascade/CMakeFiles/cucascade_objects.dir/src/data/data_repository.cpp.o
+[123/422] Building CXX object src/optimizer/pullup/CMakeFiles/duckdb_optimizer_pullup.dir/ub_duckdb_optimizer_pullup.cpp.o
+[124/422] Building CXX object cucascade/CMakeFiles/cucascade_objects.dir/src/data/gpu_data_representation.cpp.o
+[125/422] Building CXX object src/optimizer/matcher/CMakeFiles/duckdb_optimizer_matcher.dir/ub_duckdb_optimizer_matcher.cpp.o
+[126/422] Building CXX object cucascade/CMakeFiles/cucascade_objects.dir/src/data/data_repository_manager.cpp.o
+[127/422] Building CXX object cucascade/CMakeFiles/cucascade_objects.dir/src/data/representation_converter.cpp.o
+[128/422] Building CXX object src/optimizer/statistics/expression/CMakeFiles/duckdb_optimizer_statistics_expr.dir/ub_duckdb_optimizer_statistics_expr.cpp.o
+[129/422] Building CXX object src/optimizer/pushdown/CMakeFiles/duckdb_optimizer_pushdown.dir/ub_duckdb_optimizer_pushdown.cpp.o
+[130/422] Building CXX object src/optimizer/statistics/operator/CMakeFiles/duckdb_optimizer_statistics_op.dir/ub_duckdb_optimizer_statistics_op.cpp.o
+[131/422] Building CXX object src/optimizer/rule/CMakeFiles/duckdb_optimizer_rules.dir/ub_duckdb_optimizer_rules.cpp.o
+[132/422] Building CXX object src/optimizer/join_order/CMakeFiles/duckdb_optimizer_join_order.dir/ub_duckdb_optimizer_join_order.cpp.o
+[133/422] Building CXX object src/planner/expression/CMakeFiles/duckdb_planner_expression.dir/ub_duckdb_planner_expression.cpp.o
+[134/422] Building CXX object src/planner/binder/expression/CMakeFiles/duckdb_bind_expression.dir/ub_duckdb_bind_expression.cpp.o
+[135/422] Building CXX object src/planner/expression_binder/CMakeFiles/duckdb_expression_binders.dir/ub_duckdb_expression_binders.cpp.o
+[136/422] Building CXX object src/planner/filter/CMakeFiles/duckdb_planner_filter.dir/ub_duckdb_planner_filter.cpp.o
+[137/422] Building CXX object src/planner/CMakeFiles/duckdb_planner.dir/ub_duckdb_planner.cpp.o
+[138/422] Building CXX object src/planner/binder/query_node/CMakeFiles/duckdb_bind_query_node.dir/ub_duckdb_bind_query_node.cpp.o
+[139/422] Building CXX object src/parser/constraints/CMakeFiles/duckdb_constraints.dir/ub_duckdb_constraints.cpp.o
+[140/422] Building CXX object src/planner/binder/tableref/CMakeFiles/duckdb_bind_tableref.dir/ub_duckdb_bind_tableref.cpp.o
+[141/422] Building CXX object src/optimizer/CMakeFiles/duckdb_optimizer.dir/ub_duckdb_optimizer.cpp.o
+[142/422] Building CXX object src/planner/subquery/CMakeFiles/duckdb_planner_subquery.dir/ub_duckdb_planner_subquery.cpp.o
+[143/422] Building CXX object src/parser/expression/CMakeFiles/duckdb_expression.dir/ub_duckdb_expression.cpp.o
+[144/422] Building CXX object src/planner/operator/CMakeFiles/duckdb_planner_operator.dir/ub_duckdb_planner_operator.cpp.o
+[145/422] Building CXX object src/parser/CMakeFiles/duckdb_parser.dir/ub_duckdb_parser.cpp.o
+[146/422] Building CXX object src/parser/query_node/CMakeFiles/duckdb_query_node.dir/ub_duckdb_query_node.cpp.o
+[147/422] Building CXX object src/planner/binder/statement/CMakeFiles/duckdb_bind_statement.dir/ub_duckdb_bind_statement.cpp.o
+[148/422] Building CXX object src/parser/parsed_data/CMakeFiles/duckdb_parsed_data.dir/ub_duckdb_parsed_data.cpp.o
+[149/422] Building CXX object src/parser/transform/constraint/CMakeFiles/duckdb_transformer_constraint.dir/ub_duckdb_transformer_constraint.cpp.o
+[150/422] Building CXX object src/parser/tableref/CMakeFiles/duckdb_parser_tableref.dir/ub_duckdb_parser_tableref.cpp.o
+[151/422] Building CXX object src/parser/statement/CMakeFiles/duckdb_statement.dir/ub_duckdb_statement.cpp.o
+[152/422] Building CXX object src/parser/transform/helpers/CMakeFiles/duckdb_transformer_helpers.dir/ub_duckdb_transformer_helpers.cpp.o
+[153/422] Building CXX object src/parser/transform/tableref/CMakeFiles/duckdb_transformer_tableref.dir/ub_duckdb_transformer_tableref.cpp.o
+[154/422] Building CXX object src/function/cast/union/CMakeFiles/duckdb_union_cast.dir/ub_duckdb_union_cast.cpp.o
+[155/422] Building CXX object src/parser/transform/expression/CMakeFiles/duckdb_transformer_expression.dir/ub_duckdb_transformer_expression.cpp.o
+[156/422] Building CXX object src/function/aggregate/CMakeFiles/duckdb_func_aggr.dir/ub_duckdb_func_aggr.cpp.o
+[157/422] Building CXX object src/function/pragma/CMakeFiles/duckdb_func_pragma.dir/ub_duckdb_func_pragma.cpp.o
+[158/422] Building CXX object src/function/CMakeFiles/duckdb_function.dir/ub_duckdb_function.cpp.o
+[159/422] Building CXX object src/parser/transform/statement/CMakeFiles/duckdb_transformer_statement.dir/ub_duckdb_transformer_statement.cpp.o
+[160/422] Building CXX object src/function/scalar/CMakeFiles/duckdb_func_scalar.dir/ub_duckdb_func_scalar.cpp.o
+[161/422] Building CXX object src/function/scalar/generic/CMakeFiles/duckdb_func_generic_main.dir/ub_duckdb_func_generic_main.cpp.o
+[162/422] Building CXX object src/function/cast/variant/CMakeFiles/duckdb_variant_cast.dir/ub_duckdb_variant_cast.cpp.o
+[163/422] Building CXX object src/function/scalar/date/CMakeFiles/duckdb_func_date.dir/ub_duckdb_func_date.cpp.o
+[164/422] Building CXX object src/function/scalar/map/CMakeFiles/duckdb_function_map.dir/ub_duckdb_function_map.cpp.o
+[165/422] Building CXX object src/function/scalar/compressed_materialization/CMakeFiles/duckdb_func_compressed_materialization.dir/ub_duckdb_func_compressed_materialization.cpp.o
+[166/422] Building CXX object src/function/scalar/list/CMakeFiles/duckdb_func_list_nested.dir/ub_duckdb_func_list_nested.cpp.o
+[167/422] Building CXX object src/function/aggregate/distributive/CMakeFiles/duckdb_aggr_distr.dir/ub_duckdb_aggr_distr.cpp.o
+[168/422] Building CXX object src/function/scalar/sequence/CMakeFiles/duckdb_func_seq.dir/ub_duckdb_func_seq.cpp.o
+[169/422] Building CXX object src/function/scalar/string/regexp/CMakeFiles/duckdb_func_string_regexp.dir/ub_duckdb_func_string_regexp.cpp.o
+[170/422] Building CXX object src/function/scalar/geometry/CMakeFiles/duckdb_func_geometry.dir/ub_duckdb_func_geometry.cpp.o
+[171/422] Building CXX object src/function/scalar/variant/CMakeFiles/duckdb_func_variant_main.dir/ub_duckdb_func_variant_main.cpp.o
+[172/422] Building CXX object src/function/scalar/system/CMakeFiles/duckdb_func_system.dir/ub_duckdb_func_system.cpp.o
+[173/422] Building CXX object src/function/scalar/string/CMakeFiles/duckdb_func_string_main.dir/ub_duckdb_func_string_main.cpp.o
+[174/422] Building CXX object src/function/scalar/struct/CMakeFiles/duckdb_func_struct_main.dir/ub_duckdb_func_struct_main.cpp.o
+[175/422] Building CXX object src/function/table/version/CMakeFiles/duckdb_func_table_version.dir/ub_duckdb_func_table_version.cpp.o
+[176/422] Building CXX object src/function/variant/CMakeFiles/duckdb_function_variant.dir/ub_duckdb_function_variant.cpp.o
+[177/422] Building CXX object src/function/table/arrow/CMakeFiles/duckdb_arrow_conversion.dir/ub_duckdb_arrow_conversion.cpp.o
+[178/422] Building CXX object src/catalog/catalog_entry/dependency/CMakeFiles/duckdb_catalog_entries_dependency.dir/ub_duckdb_catalog_entries_dependency.cpp.o
+[179/422] Building CXX object src/catalog/default/CMakeFiles/duckdb_catalog_default_entries.dir/ub_duckdb_catalog_default_entries.cpp.o
+[180/422] Building CXX object src/catalog/CMakeFiles/duckdb_catalog.dir/ub_duckdb_catalog.cpp.o
+[181/422] Building CXX object src/function/window/CMakeFiles/duckdb_func_window.dir/ub_duckdb_func_window.cpp.o
+[182/422] Building CXX object src/function/scalar/operator/CMakeFiles/duckdb_func_ops_main.dir/ub_duckdb_func_ops_main.cpp.o
+[183/422] Building CXX object src/function/table/system/CMakeFiles/duckdb_table_func_system.dir/ub_duckdb_table_func_system.cpp.o
+[184/422] Building CXX object src/catalog/catalog_entry/CMakeFiles/duckdb_catalog_entries.dir/ub_duckdb_catalog_entries.cpp.o
+[185/422] Building CXX object src/function/table/CMakeFiles/duckdb_func_table.dir/ub_duckdb_func_table.cpp.o
+[186/422] Building CXX object src/common/arrow/appender/CMakeFiles/duckdb_common_arrow_appender.dir/ub_duckdb_common_arrow_appender.cpp.o
+[187/422] Building CXX object src/common/adbc/nanoarrow/CMakeFiles/duckdb_adbc_nanoarrow.dir/ub_duckdb_adbc_nanoarrow.cpp.o
+[188/422] Building CXX object src/common/adbc/CMakeFiles/duckdb_adbc.dir/ub_duckdb_adbc.cpp.o
+[189/422] Building CXX object src/common/crypto/CMakeFiles/duckdb_common_crypto.dir/ub_duckdb_common_crypto.cpp.o
+[190/422] Building CXX object src/common/exception/CMakeFiles/duckdb_common_exception.dir/ub_duckdb_common_exception.cpp.o
+[191/422] Building CXX object src/function/cast/CMakeFiles/duckdb_func_cast.dir/ub_duckdb_func_cast.cpp.o
+[192/422] Building CXX object src/common/enums/CMakeFiles/duckdb_common_enums.dir/ub_duckdb_common_enums.cpp.o
+[193/422] Building CXX object src/common/progress_bar/CMakeFiles/duckdb_progress_bar.dir/ub_duckdb_progress_bar.cpp.o
+[194/422] Building CXX object src/common/arrow/CMakeFiles/duckdb_common_arrow.dir/ub_duckdb_common_arrow.cpp.o
+[195/422] Building CXX object src/common/serializer/CMakeFiles/duckdb_common_serializer.dir/ub_duckdb_common_serializer.cpp.o
+[196/422] Building CXX object src/common/tree_renderer/CMakeFiles/duckdb_common_tree_renderer.dir/ub_duckdb_common_tree_renderer.cpp.o
+[197/422] Building CXX object src/common/multi_file/CMakeFiles/duckdb_common_multi_file.dir/ub_duckdb_common_multi_file.cpp.o
+[198/422] Building CXX object src/common/types/variant/CMakeFiles/duckdb_common_variant.dir/ub_duckdb_common_variant.cpp.o
+[199/422] Building CXX object src/common/operator/CMakeFiles/duckdb_common_operators.dir/ub_duckdb_common_operators.cpp.o
+[200/422] Building CXX object src/common/value_operations/CMakeFiles/duckdb_value_operations.dir/ub_duckdb_value_operations.cpp.o
+[201/422] Building CXX object src/common/vector_operations/CMakeFiles/duckdb_vector_operations.dir/boolean_operators.cpp.o
+[202/422] Building CXX object src/common/types/column/CMakeFiles/duckdb_common_types_column.dir/ub_duckdb_common_types_column.cpp.o
+[203/422] Building CXX object src/common/vector_operations/CMakeFiles/duckdb_vector_operations.dir/vector_cast.cpp.o
+[204/422] Building CXX object src/common/vector_operations/CMakeFiles/duckdb_vector_operations.dir/generators.cpp.o
+[205/422] Building CXX object src/common/vector_operations/CMakeFiles/duckdb_vector_operations.dir/vector_copy.cpp.o
+[206/422] Building CXX object src/common/vector_operations/CMakeFiles/duckdb_vector_operations.dir/vector_storage.cpp.o
+[207/422] Building CXX object src/common/vector_operations/CMakeFiles/duckdb_vector_operations.dir/null_operations.cpp.o
+[208/422] Building CXX object src/common/vector_operations/CMakeFiles/duckdb_vector_operations.dir/vector_hash.cpp.o
+[209/422] Building CXX object src/common/vector_operations/CMakeFiles/duckdb_vector_operations.dir/numeric_inplace_operators.cpp.o
+[210/422] Building CXX object src/common/row_operations/CMakeFiles/duckdb_row_operations.dir/ub_duckdb_row_operations.cpp.o
+[211/422] Building CXX object src/common/types/row/CMakeFiles/duckdb_common_types_row.dir/ub_duckdb_common_types_row.cpp.o
+[212/422] Building CXX object src/common/vector_operations/CMakeFiles/duckdb_vector_operations.dir/comparison_operators.cpp.o
+[213/422] Building CXX object src/common/CMakeFiles/duckdb_common.dir/ub_duckdb_common.cpp.o
+[214/422] Building CXX object src/logging/CMakeFiles/duckdb_logging.dir/ub_duckdb_logging.cpp.o
+[215/422] Building CXX object src/execution/nested_loop_join/CMakeFiles/duckdb_nested_loop_join.dir/ub_duckdb_nested_loop_join.cpp.o
+[216/422] Building CXX object src/common/types/CMakeFiles/duckdb_common_types.dir/ub_duckdb_common_types.cpp.o
+[217/422] Building CXX object src/execution/CMakeFiles/duckdb_execution.dir/ub_duckdb_execution.cpp.o
+[218/422] Building CXX object src/execution/operator/csv_scanner/buffer_manager/CMakeFiles/duckdb_csv_buffer_manager.dir/ub_duckdb_csv_buffer_manager.cpp.o
+[219/422] Building CXX object src/execution/operator/csv_scanner/encode/CMakeFiles/duckdb_csv_encode.dir/ub_duckdb_csv_encode.cpp.o
+[220/422] Building CXX object src/execution/operator/aggregate/CMakeFiles/duckdb_operator_aggregate.dir/ub_duckdb_operator_aggregate.cpp.o
+[221/422] Building CXX object src/common/sort/CMakeFiles/duckdb_sort.dir/ub_duckdb_sort.cpp.o
+[222/422] Building CXX object src/execution/operator/csv_scanner/state_machine/CMakeFiles/duckdb_csv_state_machine.dir/ub_duckdb_csv_state_machine.cpp.o
+[223/422] Building CXX object src/common/vector_operations/CMakeFiles/duckdb_vector_operations.dir/is_distinct_from.cpp.o
+[224/422] Building CXX object src/execution/operator/filter/CMakeFiles/duckdb_operator_filter.dir/ub_duckdb_operator_filter.cpp.o
+[225/422] Building CXX object src/execution/operator/csv_scanner/table_function/CMakeFiles/duckdb_operator_csv_table_function.dir/ub_duckdb_operator_csv_table_function.cpp.o
+[226/422] Building CXX object src/execution/operator/csv_scanner/scanner/CMakeFiles/duckdb_csv_scanner.dir/ub_duckdb_csv_scanner.cpp.o
+[227/422] Building CXX object src/execution/operator/csv_scanner/util/CMakeFiles/duckdb_csv_util.dir/ub_duckdb_csv_util.cpp.o
+[228/422] Building CXX object src/execution/operator/csv_scanner/sniffer/CMakeFiles/duckdb_csv_sniffer.dir/ub_duckdb_csv_sniffer.cpp.o
+[229/422] Building CXX object src/execution/operator/order/CMakeFiles/duckdb_operator_order.dir/ub_duckdb_operator_order.cpp.o
+[230/422] Building CXX object src/execution/operator/helper/CMakeFiles/duckdb_operator_helper.dir/ub_duckdb_operator_helper.cpp.o
+[231/422] Building CXX object src/execution/operator/projection/CMakeFiles/duckdb_operator_projection.dir/ub_duckdb_operator_projection.cpp.o
+[232/422] Building CXX object src/execution/operator/scan/CMakeFiles/duckdb_operator_scan.dir/ub_duckdb_operator_scan.cpp.o
+[233/422] Building CXX object src/execution/operator/schema/CMakeFiles/duckdb_operator_schema.dir/ub_duckdb_operator_schema.cpp.o
+[234/422] Building CXX object src/execution/operator/set/CMakeFiles/duckdb_operator_set.dir/ub_duckdb_operator_set.cpp.o
+[235/422] Building CXX object src/execution/sample/CMakeFiles/duckdb_sample.dir/ub_duckdb_sample.cpp.o
+[236/422] Building CXX object src/execution/index/CMakeFiles/duckdb_execution_index.dir/ub_duckdb_execution_index.cpp.o
+[237/422] Building CXX object src/execution/operator/join/CMakeFiles/duckdb_operator_join.dir/ub_duckdb_operator_join.cpp.o
+[238/422] Building CXX object src/execution/operator/persistent/CMakeFiles/duckdb_operator_persistent.dir/ub_duckdb_operator_persistent.cpp.o
+[239/422] Building CXX object src/main/capi/cast/CMakeFiles/duckdb_main_capi_cast.dir/ub_duckdb_main_capi_cast.cpp.o
+[240/422] Building CXX object src/execution/physical_plan/CMakeFiles/duckdb_physical_plan.dir/ub_duckdb_physical_plan.cpp.o
+[241/422] Building CXX object src/execution/index/art/CMakeFiles/duckdb_execution_index_art.dir/ub_duckdb_execution_index_art.cpp.o
+[242/422] Building CXX object src/execution/expression_executor/CMakeFiles/duckdb_expression_executor.dir/ub_duckdb_expression_executor.cpp.o
+[243/422] Building CXX object src/main/extension/CMakeFiles/duckdb_main_extension.dir/extension_alias.cpp.o
+[244/422] Building CXX object src/main/extension/CMakeFiles/duckdb_main_extension.dir/extension_helper.cpp.o
+[245/422] Building CXX object src/main/extension/CMakeFiles/duckdb_main_extension.dir/extension_install.cpp.o
+[246/422] Building CXX object src/main/extension/CMakeFiles/duckdb_main_extension.dir/extension_load.cpp.o
+[247/422] Building CXX object src/main/extension/CMakeFiles/duckdb_main_extension.dir/extension_loader.cpp.o
+[248/422] Building CXX object src/main/capi/CMakeFiles/duckdb_main_capi.dir/ub_duckdb_main_capi.cpp.o
+[249/422] Building CXX object src/main/chunk_scan_state/CMakeFiles/duckdb_main_chunk_scan_state.dir/ub_duckdb_main_chunk_scan_state.cpp.o
+[250/422] Building CXX object src/main/buffered_data/CMakeFiles/duckdb_main_buffered_data.dir/ub_duckdb_main_buffered_data.cpp.o
+[251/422] Building CXX object src/main/secret/CMakeFiles/duckdb_main_secret.dir/ub_duckdb_main_secret.cpp.o
+[252/422] Building CXX object src/main/http/CMakeFiles/duckdb_common_http.dir/ub_duckdb_common_http.cpp.o
+[253/422] Building CXX object src/main/settings/CMakeFiles/duckdb_main_settings.dir/ub_duckdb_main_settings.cpp.o
+[254/422] Building CXX object src/main/relation/CMakeFiles/duckdb_main_relation.dir/ub_duckdb_main_relation.cpp.o
+[255/422] Building CXX object src/storage/buffer/CMakeFiles/duckdb_storage_buffer.dir/ub_duckdb_storage_buffer.cpp.o
+[256/422] Building CXX object src/storage/compression/chimp/CMakeFiles/duckdb_storage_compression_chimp.dir/ub_duckdb_storage_compression_chimp.cpp.o
+[257/422] Building CXX object src/storage/checkpoint/CMakeFiles/duckdb_storage_checkpoint.dir/ub_duckdb_storage_checkpoint.cpp.o
+[258/422] Building CXX object src/parallel/CMakeFiles/duckdb_parallel.dir/ub_duckdb_parallel.cpp.o
+[259/422] Building CXX object src/storage/compression/alp/CMakeFiles/duckdb_storage_compression_alp.dir/ub_duckdb_storage_compression_alp.cpp.o
+[260/422] Building CXX object src/storage/compression/roaring/CMakeFiles/duckdb_storage_compression_roaring.dir/ub_duckdb_storage_compression_roaring.cpp.o
+[261/422] Building CXX object src/storage/metadata/CMakeFiles/duckdb_storage_metadata.dir/ub_duckdb_storage_metadata.cpp.o
+[262/422] Building CXX object src/storage/compression/dictionary/CMakeFiles/duckdb_storage_compression_dictionary.dir/ub_duckdb_storage_compression_dictionary.cpp.o
+[263/422] Building CXX object src/storage/compression/dict_fsst/CMakeFiles/duckdb_storage_compression_dict_fsst.dir/ub_duckdb_storage_compression_dict_fsst.cpp.o
+[264/422] Building CXX object src/main/CMakeFiles/duckdb_main.dir/ub_duckdb_main.cpp.o
+[265/422] Building CXX object src/storage/table/variant/CMakeFiles/duckdb_storage_table_variant.dir/ub_duckdb_storage_table_variant.cpp.o
+[266/422] Building CXX object src/verification/CMakeFiles/duckdb_verification.dir/copied_statement_verifier.cpp.o
+[267/422] Building CXX object src/storage/statistics/CMakeFiles/duckdb_storage_statistics.dir/ub_duckdb_storage_statistics.cpp.o
+[268/422] Building CXX object src/verification/CMakeFiles/duckdb_verification.dir/external_statement_verifier.cpp.o
+[269/422] Building CXX object src/verification/CMakeFiles/duckdb_verification.dir/fetch_row_verifier.cpp.o
+[270/422] Building CXX object src/transaction/CMakeFiles/duckdb_transaction.dir/ub_duckdb_transaction.cpp.o
+[271/422] Building CXX object src/storage/CMakeFiles/duckdb_storage.dir/ub_duckdb_storage.cpp.o
+In file included from /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/build/release/src/storage/ub_duckdb_storage.cpp:29:
+In lambda function,
+    inlined from 'void duckdb::Deserializer::ReadListInternal(FUNC) [with FUNC = duckdb::WriteAheadLogDeserializer::ReplayVersion()::<lambda(List&, duckdb::idx_t)>]' at /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/src/include/duckdb/common/serializer/deserializer.hpp:189:8,
+    inlined from 'void duckdb::Deserializer::ReadOptionalList(duckdb::field_id_t, const char*, FUNC) [with FUNC = duckdb::WriteAheadLogDeserializer::ReplayVersion()::<lambda(List&, duckdb::idx_t)>]' at /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/src/include/duckdb/common/serializer/deserializer.hpp:207:19,
+    inlined from 'void duckdb::WriteAheadLogDeserializer::ReplayVersion()' at /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/src/storage/wal_replay.cpp:667:31:
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/src/storage/wal_replay.cpp:668:34: warning: writing 1 byte into a region of size 0 [-Wstringop-overflow=]
+  668 |                 db_identifier[i] = list.ReadElement<uint8_t>();
+      |                 ~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/src/storage/wal_replay.cpp: In member function 'void duckdb::WriteAheadLogDeserializer::ReplayVersion()':
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/src/storage/wal_replay.cpp:665:16: note: at offset 16 into destination object 'db_identifier' of size 16
+  665 |         data_t db_identifier[MainHeader::DB_IDENTIFIER_LEN];
+      |                ^~~~~~~~~~~~~
+[272/422] Building CXX object src/verification/CMakeFiles/duckdb_verification.dir/prepared_statement_verifier.cpp.o
+[273/422] Building CXX object src/verification/CMakeFiles/duckdb_verification.dir/explain_statement_verifier.cpp.o
+[274/422] Building CXX object src/verification/CMakeFiles/duckdb_verification.dir/statement_verifier.cpp.o
+[275/422] Building CXX object src/verification/CMakeFiles/duckdb_verification.dir/deserialized_statement_verifier.cpp.o
+[276/422] Linking CXX static library third_party/fastpforlib/libduckdb_fastpforlib.a
+[277/422] Linking CXX static library third_party/fsst/libduckdb_fsst.a
+[278/422] Linking CXX static library third_party/fmt/libduckdb_fmt.a
+[279/422] Linking CXX static library third_party/hyperloglog/libduckdb_hyperloglog.a
+[280/422] Linking CXX static library third_party/libpg_query/libduckdb_pg_query.a
+[281/422] Linking CXX static library third_party/mbedtls/libduckdb_mbedtls.a
+[282/422] Linking CXX static library third_party/miniz/libduckdb_miniz.a
+[283/422] Linking CXX static library third_party/skiplist/libduckdb_skiplistlib.a
+[284/422] Linking CXX static library third_party/re2/libduckdb_re2.a
+[285/422] Linking CXX static library third_party/utf8proc/libduckdb_utf8proc.a
+[286/422] Linking CXX static library third_party/yyjson/libduckdb_yyjson.a
+[287/422] Linking CXX static library third_party/zstd/libduckdb_zstd.a
+[288/422] Building CXX object extension/sirius/CMakeFiles/sirius_extension.dir/src/config.cpp.o
+[289/422] Building CXX object src/verification/CMakeFiles/duckdb_verification.dir/parsed_statement_verifier.cpp.o
+[290/422] Building CXX object src/storage/compression/CMakeFiles/duckdb_storage_compression.dir/ub_duckdb_storage_compression.cpp.o
+[291/422] Building CXX object extension/sirius/CMakeFiles/sirius_extension.dir/src/helper/type_conversions.cpp.o
+[292/422] Building CXX object src/verification/CMakeFiles/duckdb_verification.dir/no_operator_caching_verifier.cpp.o
+[293/422] Building CXX object src/verification/CMakeFiles/duckdb_verification.dir/unoptimized_statement_verifier.cpp.o
+[294/422] Building CXX object extension/sirius/CMakeFiles/sirius_extension.dir/src/expression/expression.cpp.o
+[295/422] Building CXX object extension/sirius/CMakeFiles/sirius_extension.dir/src/expression/join_condition.cpp.o
+[296/422] Building CXX object extension/sirius/CMakeFiles/sirius_extension.dir/src/expression_executor/expression_executor_strategy.cpp.o
+[297/422] Building CXX object extension/sirius/CMakeFiles/sirius_extension.dir/src/debug_utils.cpp.o
+FAILED: [code=1] extension/sirius/CMakeFiles/sirius_extension.dir/src/debug_utils.cpp.o 
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/.pixi/envs/default/bin/x86_64-conda-linux-gnu-c++ -DCCCL_DISABLE_PDL -DCUB_DISABLE_NAMESPACE_MAGIC -DCUB_IGNORE_NAMESPACE_MAGIC_ERROR -DDUCKDB_BUILD_LIBRARY -DEXT_VERSION_SIRIUS=\"dev\" -DFMT_SHARED -DSPDLOG_COMPILED_LIB -DSPDLOG_SHARED_LIB -DTHRUST_DEVICE_SYSTEM=THRUST_DEVICE_SYSTEM_CUDA -DTHRUST_DISABLE_ABI_NAMESPACE -DTHRUST_HOST_SYSTEM=THRUST_HOST_SYSTEM_CPP -DTHRUST_IGNORE_ABI_NAMESPACE_ERROR -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/src/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/fsst -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/fmt/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/hyperloglog -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/fastpforlib -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/skiplist -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/ska_sort -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/fast_float -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/re2 -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/miniz -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/utf8proc/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/concurrentqueue -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/pcg -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/pdqsort -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/tdigest -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/mbedtls/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/jaro_winkler -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/vergesort -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/yyjson/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/zstd/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/.pixi/envs/default/include/rapids -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include -isystem /tmp/claude-1002/fake-uring-include -fvisibility-inlines-hidden -fmessage-length=0 -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/.pixi/envs/default/include  -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/.pixi/envs/default/targets/x86_64-linux/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/.pixi/envs/default/targets/x86_64-linux/include/cccl -rdynamic -O3 -DNDEBUG -ffunction-sections -fdata-sections -O3 -DNDEBUG   -std=c++20 -fPIC -pthread -MD -MT extension/sirius/CMakeFiles/sirius_extension.dir/src/debug_utils.cpp.o -MF extension/sirius/CMakeFiles/sirius_extension.dir/src/debug_utils.cpp.o.d -o extension/sirius/CMakeFiles/sirius_extension.dir/src/debug_utils.cpp.o -c /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/debug_utils.cpp
+In file included from /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/debug_utils.cpp:8:
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/data_batch_utils.hpp: In function 'cudf::table_view sirius::get_cudf_table_view(const cucascade::data_batch&)':
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/data_batch_utils.hpp:57:30: error: 'cucascade::idata_representation* cucascade::data_batch::get_data() const' is private within this context
+   57 |   auto* data = batch.get_data();
+      |                ~~~~~~~~~~~~~~^~
+In file included from /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/data_batch_utils.hpp:21:
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include/cucascade/data/data_batch.hpp:246:25: note: declared private here
+  246 |   idata_representation* get_data() const;
+      |                         ^~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/debug_utils.cpp: In function 'bool sirius::{anonymous}::is_gpu_tier(const cucascade::data_batch&, const char*)':
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/debug_utils.cpp:75:30: error: 'cucascade::idata_representation* cucascade::data_batch::get_data() const' is private within this context
+   75 |   auto* data = batch.get_data();
+      |                ~~~~~~~~~~~~~~^~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include/cucascade/data/data_batch.hpp:246:25: note: declared private here
+  246 |   idata_representation* get_data() const;
+      |                         ^~~~~~~~
+[298/422] Building CXX object src/storage/serialization/CMakeFiles/duckdb_storage_serialization.dir/ub_duckdb_storage_serialization.cpp.o
+[299/422] Building CXX object extension/sirius/CMakeFiles/sirius_extension.dir/src/expression_executor/gpu_expression_executor.cpp.o
+FAILED: [code=1] extension/sirius/CMakeFiles/sirius_extension.dir/src/expression_executor/gpu_expression_executor.cpp.o 
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/.pixi/envs/default/bin/x86_64-conda-linux-gnu-c++ -DCCCL_DISABLE_PDL -DCUB_DISABLE_NAMESPACE_MAGIC -DCUB_IGNORE_NAMESPACE_MAGIC_ERROR -DDUCKDB_BUILD_LIBRARY -DEXT_VERSION_SIRIUS=\"dev\" -DFMT_SHARED -DSPDLOG_COMPILED_LIB -DSPDLOG_SHARED_LIB -DTHRUST_DEVICE_SYSTEM=THRUST_DEVICE_SYSTEM_CUDA -DTHRUST_DISABLE_ABI_NAMESPACE -DTHRUST_HOST_SYSTEM=THRUST_HOST_SYSTEM_CPP -DTHRUST_IGNORE_ABI_NAMESPACE_ERROR -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/src/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/fsst -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/fmt/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/hyperloglog -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/fastpforlib -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/skiplist -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/ska_sort -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/fast_float -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/re2 -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/miniz -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/utf8proc/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/concurrentqueue -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/pcg -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/pdqsort -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/tdigest -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/mbedtls/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/jaro_winkler -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/vergesort -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/yyjson/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/zstd/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/.pixi/envs/default/include/rapids -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include -isystem /tmp/claude-1002/fake-uring-include -fvisibility-inlines-hidden -fmessage-length=0 -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/.pixi/envs/default/include  -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/.pixi/envs/default/targets/x86_64-linux/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/.pixi/envs/default/targets/x86_64-linux/include/cccl -rdynamic -O3 -DNDEBUG -ffunction-sections -fdata-sections -O3 -DNDEBUG   -std=c++20 -fPIC -pthread -MD -MT extension/sirius/CMakeFiles/sirius_extension.dir/src/expression_executor/gpu_expression_executor.cpp.o -MF extension/sirius/CMakeFiles/sirius_extension.dir/src/expression_executor/gpu_expression_executor.cpp.o.d -o extension/sirius/CMakeFiles/sirius_extension.dir/src/expression_executor/gpu_expression_executor.cpp.o -c /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/expression_executor/gpu_expression_executor.cpp
+In file included from /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/expression_executor/gpu_expression_executor.cpp:26:
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/data_batch_utils.hpp: In function 'cudf::table_view sirius::get_cudf_table_view(const cucascade::data_batch&)':
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/data_batch_utils.hpp:57:30: error: 'cucascade::idata_representation* cucascade::data_batch::get_data() const' is private within this context
+   57 |   auto* data = batch.get_data();
+      |                ~~~~~~~~~~~~~~^~
+In file included from /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/expression_executor/gpu_expression_executor.hpp:25,
+                 from /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/expression_executor/gpu_expression_executor.cpp:22:
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include/cucascade/data/data_batch.hpp:246:25: note: declared private here
+  246 |   idata_representation* get_data() const;
+      |                         ^~~~~~~~
+[300/422] Building CXX object extension/sirius/CMakeFiles/sirius_extension.dir/src/data/host_parquet_representation.cpp.o
+[301/422] Building CXX object extension/sirius/CMakeFiles/sirius_extension.dir/src/data/host_parquet_representation_converters.cpp.o
+[302/422] Building CXX object extension/sirius/CMakeFiles/sirius_extension.dir/src/downgrade/downgrade_executor.cpp.o
+FAILED: [code=1] extension/sirius/CMakeFiles/sirius_extension.dir/src/downgrade/downgrade_executor.cpp.o 
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/.pixi/envs/default/bin/x86_64-conda-linux-gnu-c++ -DCCCL_DISABLE_PDL -DCUB_DISABLE_NAMESPACE_MAGIC -DCUB_IGNORE_NAMESPACE_MAGIC_ERROR -DDUCKDB_BUILD_LIBRARY -DEXT_VERSION_SIRIUS=\"dev\" -DFMT_SHARED -DSPDLOG_COMPILED_LIB -DSPDLOG_SHARED_LIB -DTHRUST_DEVICE_SYSTEM=THRUST_DEVICE_SYSTEM_CUDA -DTHRUST_DISABLE_ABI_NAMESPACE -DTHRUST_HOST_SYSTEM=THRUST_HOST_SYSTEM_CPP -DTHRUST_IGNORE_ABI_NAMESPACE_ERROR -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/src/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/fsst -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/fmt/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/hyperloglog -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/fastpforlib -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/skiplist -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/ska_sort -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/fast_float -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/re2 -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/miniz -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/utf8proc/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/concurrentqueue -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/pcg -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/pdqsort -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/tdigest -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/mbedtls/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/jaro_winkler -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/vergesort -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/yyjson/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/zstd/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/.pixi/envs/default/include/rapids -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include -isystem /tmp/claude-1002/fake-uring-include -fvisibility-inlines-hidden -fmessage-length=0 -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/.pixi/envs/default/include  -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/.pixi/envs/default/targets/x86_64-linux/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/.pixi/envs/default/targets/x86_64-linux/include/cccl -rdynamic -O3 -DNDEBUG -ffunction-sections -fdata-sections -O3 -DNDEBUG   -std=c++20 -fPIC -pthread -MD -MT extension/sirius/CMakeFiles/sirius_extension.dir/src/downgrade/downgrade_executor.cpp.o -MF extension/sirius/CMakeFiles/sirius_extension.dir/src/downgrade/downgrade_executor.cpp.o.d -o extension/sirius/CMakeFiles/sirius_extension.dir/src/downgrade/downgrade_executor.cpp.o -c /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/downgrade/downgrade_executor.cpp
+In file included from /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/downgrade/downgrade_executor.cpp:20:
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_data_batch.hpp: In member function 'virtual std::optional<std::vector<long unsigned int> > sirius::convertible_data_batch::convert(const std::vector<const cucascade::memory::memory_space*>&, rmm::cuda_stream_view, sirius::memory::sirius_memory_reservation_manager&)':
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_data_batch.hpp:83:18: error: 'using std::__shared_ptr_access<cucascade::data_batch, __gnu_cxx::_S_atomic, false, false>::element_type = class cucascade::data_batch' {aka 'class cucascade::data_batch'} has no member named 'try_to_lock_for_in_transit'
+   83 |     if (!_batch->try_to_lock_for_in_transit()) { return std::nullopt; }
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_data_batch.hpp:86:40: error: 'cucascade::idata_representation* cucascade::data_batch::get_data() const' is private within this context
+   86 |       auto data_size = _batch->get_data()->get_size_in_bytes();
+      |                        ~~~~~~~~~~~~~~~~^~
+In file included from /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include/cucascade/data/data_repository.hpp:20,
+                 from /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/downgrade/downgrade_executor.hpp:26,
+                 from /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/downgrade/downgrade_executor.cpp:17:
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include/cucascade/data/data_batch.hpp:246:25: note: declared private here
+  246 |   idata_representation* get_data() const;
+      |                         ^~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_data_batch.hpp:102:21: error: 'using std::__shared_ptr_access<cucascade::data_batch, __gnu_cxx::_S_atomic, false, false>::element_type = class cucascade::data_batch' {aka 'class cucascade::data_batch'} has no member named 'convert_to'
+  102 |             _batch->convert_to<cucascade::gpu_table_representation>(
+      |                     ^~~~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_data_batch.hpp:102:67: error: expected primary-expression before '>' token
+  102 |             _batch->convert_to<cucascade::gpu_table_representation>(
+      |                                                                   ^
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_data_batch.hpp:106:21: error: 'using std::__shared_ptr_access<cucascade::data_batch, __gnu_cxx::_S_atomic, false, false>::element_type = class cucascade::data_batch' {aka 'class cucascade::data_batch'} has no member named 'convert_to'
+  106 |             _batch->convert_to<cucascade::host_data_representation>(
+      |                     ^~~~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_data_batch.hpp:106:67: error: expected primary-expression before '>' token
+  106 |             _batch->convert_to<cucascade::host_data_representation>(
+      |                                                                   ^
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_data_batch.hpp:110:21: error: 'using std::__shared_ptr_access<cucascade::data_batch, __gnu_cxx::_S_atomic, false, false>::element_type = class cucascade::data_batch' {aka 'class cucascade::data_batch'} has no member named 'convert_to'
+  110 |             _batch->convert_to<cucascade::disk_data_representation>(
+      |                     ^~~~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_data_batch.hpp:110:67: error: expected primary-expression before '>' token
+  110 |             _batch->convert_to<cucascade::disk_data_representation>(
+      |                                                                   ^
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_data_batch.hpp:116:17: error: 'using std::__shared_ptr_access<cucascade::data_batch, __gnu_cxx::_S_atomic, false, false>::element_type = class cucascade::data_batch' {aka 'class cucascade::data_batch'} has no member named 'try_to_release_in_transit'
+  116 |         _batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
+      |                 ^~~~~~~~~~~~~~~~~~~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_data_batch.hpp:123:15: error: 'using std::__shared_ptr_access<cucascade::data_batch, __gnu_cxx::_S_atomic, false, false>::element_type = class cucascade::data_batch' {aka 'class cucascade::data_batch'} has no member named 'try_to_release_in_transit'
+  123 |       _batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
+      |               ^~~~~~~~~~~~~~~~~~~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_data_batch.hpp:126:15: error: 'using std::__shared_ptr_access<cucascade::data_batch, __gnu_cxx::_S_atomic, false, false>::element_type = class cucascade::data_batch' {aka 'class cucascade::data_batch'} has no member named 'try_to_release_in_transit'
+  126 |       _batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
+      |               ^~~~~~~~~~~~~~~~~~~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_data_batch.hpp: In member function 'virtual std::size_t sirius::convertible_data_batch::bytes_in_space(cucascade::memory::memory_space*) const':
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_data_batch.hpp:139:33: error: 'cucascade::memory::memory_space* cucascade::data_batch::get_memory_space() const' is private within this context
+  139 |     if (_batch->get_memory_space() == space) { return _batch->get_data()->get_size_in_bytes(); }
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~^~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include/cucascade/data/data_batch.hpp:252:25: note: declared private here
+  252 |   memory::memory_space* get_memory_space() const;
+      |                         ^~~~~~~~~~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_data_batch.hpp:139:71: error: 'cucascade::idata_representation* cucascade::data_batch::get_data() const' is private within this context
+  139 |     if (_batch->get_memory_space() == space) { return _batch->get_data()->get_size_in_bytes(); }
+      |                                                       ~~~~~~~~~~~~~~~~^~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include/cucascade/data/data_batch.hpp:246:25: note: declared private here
+  246 |   idata_representation* get_data() const;
+      |                         ^~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_data_batch.hpp: In member function 'std::size_t sirius::convertible_data_batch_provider::get_bytes_in_space(cucascade::memory::memory_space*) const':
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_data_batch.hpp:258:49: error: no matching function for call to 'cucascade::idata_repository<std::shared_ptr<cucascade::data_batch> >::get_data_batch_by_id(long unsigned int&, const std::nullopt_t&, std::size_t&)'
+  258 |         auto batch = _repo->get_data_batch_by_id(batch_id, std::nullopt, p);
+      |                      ~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include/cucascade/data/data_repository.hpp:166:19: note: candidate: 'PtrType cucascade::idata_repository<PtrType>::get_data_batch_by_id(uint64_t, size_t) [with PtrType = std::shared_ptr<cucascade::data_batch>; uint64_t = long unsigned int; size_t = long unsigned int]'
+  166 |   virtual PtrType get_data_batch_by_id(uint64_t batch_id, size_t partition_idx = 0);
+      |                   ^~~~~~~~~~~~~~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include/cucascade/data/data_repository.hpp:166:19: note:   candidate expects 2 arguments, 3 provided
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_data_batch.hpp: In member function 'std::unique_ptr<sirius::convertible_data> sirius::convertible_data_batch_provider::try_get_batch(uint64_t, std::size_t, cucascade::memory::memory_space*) const':
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_data_batch.hpp:281:45: error: no matching function for call to 'cucascade::idata_repository<std::shared_ptr<cucascade::data_batch> >::get_data_batch_by_id(uint64_t&, const std::nullopt_t&, std::size_t&)'
+  281 |     auto batch = _repo->get_data_batch_by_id(batch_id, std::nullopt, partition_idx);
+      |                  ~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include/cucascade/data/data_repository.hpp:166:19: note: candidate: 'PtrType cucascade::idata_repository<PtrType>::get_data_batch_by_id(uint64_t, size_t) [with PtrType = std::shared_ptr<cucascade::data_batch>; uint64_t = long unsigned int; size_t = long unsigned int]'
+  166 |   virtual PtrType get_data_batch_by_id(uint64_t batch_id, size_t partition_idx = 0);
+      |                   ^~~~~~~~~~~~~~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include/cucascade/data/data_repository.hpp:166:19: note:   candidate expects 2 arguments, 3 provided
+In file included from /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_gpu_pipeline_task.hpp:24,
+                 from /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/downgrade/downgrade_executor.cpp:21:
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/sirius_physical_operator.hpp: At global scope:
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/sirius_physical_operator.hpp:111:50: error: 'data_batch_processing_handle' is not a member of 'cucascade'
+  111 |   virtual std::optional<std::vector<::cucascade::data_batch_processing_handle>>
+      |                                                  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/sirius_physical_operator.hpp:111:50: error: template argument 1 is invalid
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/sirius_physical_operator.hpp:111:50: error: template argument 2 is invalid
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/sirius_physical_operator.hpp:111:78: error: template argument 1 is invalid
+  111 |   virtual std::optional<std::vector<::cucascade::data_batch_processing_handle>>
+      |                                                                              ^~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/sirius_physical_operator.hpp:111:16: error: '<expression error>' in namespace 'std' does not name a type
+  111 |   virtual std::optional<std::vector<::cucascade::data_batch_processing_handle>>
+      |                ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/sirius_physical_operator.hpp:178:42: error: 'data_batch_processing_handle' is not a member of 'cucascade'
+  178 |   std::optional<std::vector<::cucascade::data_batch_processing_handle>> prepare_for_processing(
+      |                                          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/sirius_physical_operator.hpp:178:42: error: template argument 1 is invalid
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/sirius_physical_operator.hpp:178:42: error: template argument 2 is invalid
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/sirius_physical_operator.hpp:178:70: error: template argument 1 is invalid
+  178 |   std::optional<std::vector<::cucascade::data_batch_processing_handle>> prepare_for_processing(
+      |                                                                      ^~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/sirius_physical_operator.hpp:178:8: error: '<expression error>' in namespace 'std' does not name a type
+  178 |   std::optional<std::vector<::cucascade::data_batch_processing_handle>> prepare_for_processing(
+      |        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/sirius_physical_operator.hpp: In member function 'virtual std::size_t sirius::op::pipelineable_operator_data::get_estimated_size_in_bytes() const':
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/sirius_physical_operator.hpp:186:35: error: 'cucascade::idata_representation* cucascade::data_batch::get_data() const' is private within this context
+  186 |       if (batch && batch->get_data()) {
+      |                    ~~~~~~~~~~~~~~~^~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include/cucascade/data/data_batch.hpp:246:25: note: declared private here
+  246 |   idata_representation* get_data() const;
+      |                         ^~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/sirius_physical_operator.hpp:187:33: error: 'cucascade::idata_representation* cucascade::data_batch::get_data() const' is private within this context
+  187 |         total += batch->get_data()->get_uncompressed_data_size_in_bytes();
+      |                  ~~~~~~~~~~~~~~~^~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include/cucascade/data/data_batch.hpp:246:25: note: declared private here
+  246 |   idata_representation* get_data() const;
+      |                         ^~~~~~~~
+In file included from /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_gpu_pipeline_task.hpp:26:
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/pipeline/gpu_pipeline_task.hpp: In member function 'std::size_t sirius::pipeline::gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_input() const':
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/pipeline/gpu_pipeline_task.hpp:124:37: error: 'cucascade::idata_representation* cucascade::data_batch::get_data() const' is private within this context
+  124 |         if (batch && batch->get_data() &&
+      |                      ~~~~~~~~~~~~~~~^~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include/cucascade/data/data_batch.hpp:246:25: note: declared private here
+  246 |   idata_representation* get_data() const;
+      |                         ^~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/pipeline/gpu_pipeline_task.hpp:125:28: error: 'cucascade::idata_representation* cucascade::data_batch::get_data() const' is private within this context
+  125 |             batch->get_data()->get_current_tier() != cucascade::memory::Tier::GPU) {
+      |             ~~~~~~~~~~~~~~~^~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include/cucascade/data/data_batch.hpp:246:25: note: declared private here
+  246 |   idata_representation* get_data() const;
+      |                         ^~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/pipeline/gpu_pipeline_task.hpp:126:40: error: 'cucascade::idata_representation* cucascade::data_batch::get_data() const' is private within this context
+  126 |           input_size += batch->get_data()->get_uncompressed_data_size_in_bytes();
+      |                         ~~~~~~~~~~~~~~~^~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include/cucascade/data/data_batch.hpp:246:25: note: declared private here
+  246 |   idata_representation* get_data() const;
+      |                         ^~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_gpu_pipeline_task.hpp: In member function 'virtual std::optional<std::vector<long unsigned int> > sirius::convertible_gpu_pipeline_task::convert(const std::vector<const cucascade::memory::memory_space*>&, rmm::cuda_stream_view, sirius::memory::sirius_memory_reservation_manager&)':
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_gpu_pipeline_task.hpp:126:55: error: 'cucascade::memory::memory_space* cucascade::data_batch::get_memory_space() const' is private within this context
+  126 |       auto* batch_space      = batch->get_memory_space();
+      |                                ~~~~~~~~~~~~~~~~~~~~~~~^~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include/cucascade/data/data_batch.hpp:252:25: note: declared private here
+  252 |   memory::memory_space* get_memory_space() const;
+      |                         ^~~~~~~~~~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_gpu_pipeline_task.hpp:137:57: error: 'task_created' is not a member of 'cucascade::batch_state'
+  137 |       if (batch->get_state() != cucascade::batch_state::task_created) { continue; }
+      |                                                         ^~~~~~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_gpu_pipeline_task.hpp: In member function 'virtual std::size_t sirius::convertible_gpu_pipeline_task::bytes_in_space(cucascade::memory::memory_space*) const':
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_gpu_pipeline_task.hpp:169:43: error: 'cucascade::memory::memory_space* cucascade::data_batch::get_memory_space() const' is private within this context
+  169 |       if (batch && batch->get_memory_space() == space) {
+      |                    ~~~~~~~~~~~~~~~~~~~~~~~^~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include/cucascade/data/data_batch.hpp:252:25: note: declared private here
+  252 |   memory::memory_space* get_memory_space() const;
+      |                         ^~~~~~~~~~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_gpu_pipeline_task.hpp:170:33: error: 'cucascade::idata_representation* cucascade::data_batch::get_data() const' is private within this context
+  170 |         total += batch->get_data()->get_size_in_bytes();
+      |                  ~~~~~~~~~~~~~~~^~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include/cucascade/data/data_batch.hpp:246:25: note: declared private here
+  246 |   idata_representation* get_data() const;
+      |                         ^~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_gpu_pipeline_task.hpp: In static member function 'static bool sirius::convertible_gpu_pipeline_task_provider::has_matching_batches(sirius::parallel::itask&, cucascade::memory::memory_space*)':
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_gpu_pipeline_task.hpp:308:43: error: 'cucascade::memory::memory_space* cucascade::data_batch::get_memory_space() const' is private within this context
+  308 |       if (batch && batch->get_memory_space() == space &&
+      |                    ~~~~~~~~~~~~~~~~~~~~~~~^~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include/cucascade/data/data_batch.hpp:252:25: note: declared private here
+  252 |   memory::memory_space* get_memory_space() const;
+      |                         ^~~~~~~~~~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/data/convertible_gpu_pipeline_task.hpp:309:57: error: 'task_created' is not a member of 'cucascade::batch_state'
+  309 |           batch->get_state() == cucascade::batch_state::task_created) {
+      |                                                         ^~~~~~~~~~~~
+[303/422] Building CXX object extension/sirius/CMakeFiles/sirius_extension.dir/src/creator/task_creator.cpp.o
+FAILED: [code=1] extension/sirius/CMakeFiles/sirius_extension.dir/src/creator/task_creator.cpp.o 
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/.pixi/envs/default/bin/x86_64-conda-linux-gnu-c++ -DCCCL_DISABLE_PDL -DCUB_DISABLE_NAMESPACE_MAGIC -DCUB_IGNORE_NAMESPACE_MAGIC_ERROR -DDUCKDB_BUILD_LIBRARY -DEXT_VERSION_SIRIUS=\"dev\" -DFMT_SHARED -DSPDLOG_COMPILED_LIB -DSPDLOG_SHARED_LIB -DTHRUST_DEVICE_SYSTEM=THRUST_DEVICE_SYSTEM_CUDA -DTHRUST_DISABLE_ABI_NAMESPACE -DTHRUST_HOST_SYSTEM=THRUST_HOST_SYSTEM_CPP -DTHRUST_IGNORE_ABI_NAMESPACE_ERROR -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/src/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/fsst -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/fmt/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/hyperloglog -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/fastpforlib -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/skiplist -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/ska_sort -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/fast_float -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/re2 -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/miniz -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/utf8proc/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/concurrentqueue -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/pcg -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/pdqsort -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/tdigest -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/mbedtls/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/jaro_winkler -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/vergesort -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/yyjson/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/duckdb/third_party/zstd/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/.pixi/envs/default/include/rapids -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include -isystem /tmp/claude-1002/fake-uring-include -fvisibility-inlines-hidden -fmessage-length=0 -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/.pixi/envs/default/include  -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/.pixi/envs/default/targets/x86_64-linux/include -I/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/.pixi/envs/default/targets/x86_64-linux/include/cccl -rdynamic -O3 -DNDEBUG -ffunction-sections -fdata-sections -O3 -DNDEBUG   -std=c++20 -fPIC -pthread -MD -MT extension/sirius/CMakeFiles/sirius_extension.dir/src/creator/task_creator.cpp.o -MF extension/sirius/CMakeFiles/sirius_extension.dir/src/creator/task_creator.cpp.o.d -o extension/sirius/CMakeFiles/sirius_extension.dir/src/creator/task_creator.cpp.o -c /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/creator/task_creator.cpp
+In file included from /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/creator/task_creator.hpp:24,
+                 from /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/creator/task_creator.cpp:17:
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/sirius_physical_operator.hpp:111:50: error: 'data_batch_processing_handle' is not a member of 'cucascade'
+  111 |   virtual std::optional<std::vector<::cucascade::data_batch_processing_handle>>
+      |                                                  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/sirius_physical_operator.hpp:111:50: error: template argument 1 is invalid
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/sirius_physical_operator.hpp:111:50: error: template argument 2 is invalid
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/sirius_physical_operator.hpp:111:78: error: template argument 1 is invalid
+  111 |   virtual std::optional<std::vector<::cucascade::data_batch_processing_handle>>
+      |                                                                              ^~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/sirius_physical_operator.hpp:111:16: error: '<expression error>' in namespace 'std' does not name a type
+  111 |   virtual std::optional<std::vector<::cucascade::data_batch_processing_handle>>
+      |                ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/sirius_physical_operator.hpp:178:42: error: 'data_batch_processing_handle' is not a member of 'cucascade'
+  178 |   std::optional<std::vector<::cucascade::data_batch_processing_handle>> prepare_for_processing(
+      |                                          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/sirius_physical_operator.hpp:178:42: error: template argument 1 is invalid
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/sirius_physical_operator.hpp:178:42: error: template argument 2 is invalid
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/sirius_physical_operator.hpp:178:70: error: template argument 1 is invalid
+  178 |   std::optional<std::vector<::cucascade::data_batch_processing_handle>> prepare_for_processing(
+      |                                                                      ^~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/sirius_physical_operator.hpp:178:8: error: '<expression error>' in namespace 'std' does not name a type
+  178 |   std::optional<std::vector<::cucascade::data_batch_processing_handle>> prepare_for_processing(
+      |        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/sirius_physical_operator.hpp: In member function 'virtual std::size_t sirius::op::pipelineable_operator_data::get_estimated_size_in_bytes() const':
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/sirius_physical_operator.hpp:186:35: error: 'cucascade::idata_representation* cucascade::data_batch::get_data() const' is private within this context
+  186 |       if (batch && batch->get_data()) {
+      |                    ~~~~~~~~~~~~~~~^~
+In file included from /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/sirius_physical_operator.hpp:25:
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include/cucascade/data/data_batch.hpp:246:25: note: declared private here
+  246 |   idata_representation* get_data() const;
+      |                         ^~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/sirius_physical_operator.hpp:187:33: error: 'cucascade::idata_representation* cucascade::data_batch::get_data() const' is private within this context
+  187 |         total += batch->get_data()->get_uncompressed_data_size_in_bytes();
+      |                  ~~~~~~~~~~~~~~~^~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include/cucascade/data/data_batch.hpp:246:25: note: declared private here
+  246 |   idata_representation* get_data() const;
+      |                         ^~~~~~~~
+In file included from /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/pipeline/task_scheduler.hpp:29,
+                 from /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/scan/cpu_source_task.hpp:30,
+                 from /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/creator/task_creator.cpp:20:
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/pipeline/gpu_pipeline_task.hpp: In member function 'std::size_t sirius::pipeline::gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_input() const':
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/pipeline/gpu_pipeline_task.hpp:124:37: error: 'cucascade::idata_representation* cucascade::data_batch::get_data() const' is private within this context
+  124 |         if (batch && batch->get_data() &&
+      |                      ~~~~~~~~~~~~~~~^~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include/cucascade/data/data_batch.hpp:246:25: note: declared private here
+  246 |   idata_representation* get_data() const;
+      |                         ^~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/pipeline/gpu_pipeline_task.hpp:125:28: error: 'cucascade::idata_representation* cucascade::data_batch::get_data() const' is private within this context
+  125 |             batch->get_data()->get_current_tier() != cucascade::memory::Tier::GPU) {
+      |             ~~~~~~~~~~~~~~~^~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include/cucascade/data/data_batch.hpp:246:25: note: declared private here
+  246 |   idata_representation* get_data() const;
+      |                         ^~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/pipeline/gpu_pipeline_task.hpp:126:40: error: 'cucascade::idata_representation* cucascade::data_batch::get_data() const' is private within this context
+  126 |           input_size += batch->get_data()->get_uncompressed_data_size_in_bytes();
+      |                         ~~~~~~~~~~~~~~~^~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include/cucascade/data/data_batch.hpp:246:25: note: declared private here
+  246 |   idata_representation* get_data() const;
+      |                         ^~~~~~~~
+In file included from /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/scan/parquet_scan_task.hpp:51,
+                 from /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/scan/iceberg_scan_task.hpp:21,
+                 from /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/creator/task_creator.cpp:23:
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/scan/parquet_scan_operator_data.hpp: At global scope:
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/scan/parquet_scan_operator_data.hpp:122:42: error: 'data_batch_processing_handle' is not a member of 'cucascade'
+  122 |   std::optional<std::vector<::cucascade::data_batch_processing_handle>> prepare_for_processing(
+      |                                          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/scan/parquet_scan_operator_data.hpp:122:42: error: template argument 1 is invalid
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/scan/parquet_scan_operator_data.hpp:122:42: error: template argument 2 is invalid
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/scan/parquet_scan_operator_data.hpp:122:70: error: template argument 1 is invalid
+  122 |   std::optional<std::vector<::cucascade::data_batch_processing_handle>> prepare_for_processing(
+      |                                                                      ^~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/scan/parquet_scan_operator_data.hpp:122:8: error: '<expression error>' in namespace 'std' does not name a type
+  122 |   std::optional<std::vector<::cucascade::data_batch_processing_handle>> prepare_for_processing(
+      |        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/scan/parquet_scan_operator_data.hpp: In member function 'virtual std::size_t sirius::op::scan::scan_cached_operator_data::get_estimated_size_in_bytes() const':
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/include/op/scan/parquet_scan_operator_data.hpp:184:27: error: 'cucascade::idata_representation* cucascade::data_batch::get_data() const' is private within this context
+  184 |     return batch->get_data()->cast<cucascade::gpu_table_representation>().get_size_in_bytes();
+      |            ~~~~~~~~~~~~~~~^~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include/cucascade/data/data_batch.hpp:246:25: note: declared private here
+  246 |   idata_representation* get_data() const;
+      |                         ^~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/creator/task_creator.cpp: In lambda function:
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/creator/task_creator.cpp:460:56: error: 'cucascade::memory::memory_space* cucascade::data_batch::get_memory_space() const' is private within this context
+  460 |                   auto* space = batch->get_memory_space();
+      |                                 ~~~~~~~~~~~~~~~~~~~~~~~^~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include/cucascade/data/data_batch.hpp:252:25: note: declared private here
+  252 |   memory::memory_space* get_memory_space() const;
+      |                         ^~~~~~~~~~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/creator/task_creator.cpp:461:49: error: 'cucascade::idata_representation* cucascade::data_batch::get_data() const' is private within this context
+  461 |                   if (!space || !batch->get_data()) { continue; }
+      |                                  ~~~~~~~~~~~~~~~^~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include/cucascade/data/data_batch.hpp:246:25: note: declared private here
+  246 |   idata_representation* get_data() const;
+      |                         ^~~~~~~~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/src/creator/task_creator.cpp:462:46: error: 'cucascade::idata_representation* cucascade::data_batch::get_data() const' is private within this context
+  462 |                   auto size = batch->get_data()->get_size_in_bytes();
+      |                               ~~~~~~~~~~~~~~~^~
+/home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/include/cucascade/data/data_batch.hpp:246:25: note: declared private here
+  246 |   idata_representation* get_data() const;
+      |                         ^~~~~~~~
+[304/422] Building CXX object src/storage/table/CMakeFiles/duckdb_storage_table.dir/ub_duckdb_storage_table.cpp.o
+ninja: build stopped: subcommand failed.
+Build exit: 0
