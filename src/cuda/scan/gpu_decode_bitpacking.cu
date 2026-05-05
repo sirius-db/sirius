@@ -289,11 +289,11 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
     for (uint32_t i = 0; i < TPV; ++i)
       lanes[i] = val;
     for (uint32_t v = threadIdx.x; v < vec_count; v += blockDim.x) {
-      __stwt(out4 + v, packed);
+      __stcs(out4 + v, packed);
     }
     uint32_t tail_start = vec_count * TPV;
     for (uint32_t i = tail_start + threadIdx.x; i < rc; i += blockDim.x) {
-      __stwt(out + i, val);
+      __stcs(out + i, val);
     }
     return;
   }
@@ -317,11 +317,11 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
       for (uint32_t i = 0; i < TPV; ++i) {
         lanes[i] = static_cast<T>(frame + static_cast<T>(base_v + i) * delta);
       }
-      __stwt(out4 + v, packed);
+      __stcs(out4 + v, packed);
     }
     uint32_t tail_start = vec_count * TPV;
     for (uint32_t i = tail_start + threadIdx.x; i < rc; i += blockDim.x) {
-      __stwt(out + i, static_cast<T>(frame + static_cast<T>(i) * delta));
+      __stcs(out + i, static_cast<T>(frame + static_cast<T>(i) * delta));
     }
     return;
   }
@@ -339,7 +339,7 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
   if (mode != BitpackingMode::FOR && mode != BitpackingMode::DELTA_FOR) {
     uint32_t const fill_rows = desc.group_row_count;
     for (uint32_t i = threadIdx.x; i < fill_rows; i += blockDim.x) {
-      __stwt(out + i, T(0));
+      __stcs(out + i, T(0));
     }
     return;
   }
@@ -385,7 +385,7 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
     for (uint32_t v = 0; v < VPT; ++v) {
       uint32_t idx = v * blockDim.x + threadIdx.x;
       if (idx >= rc) break;
-      __stwt(out + idx, static_cast<T>(frame + unpack_value<T>(shmem, idx, width)));
+      __stcs(out + idx, static_cast<T>(frame + unpack_value<T>(shmem, idx, width)));
     }
     return;
   }
@@ -471,7 +471,7 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
 #pragma unroll
   for (uint32_t v = 0; v < VPT; ++v) {
     uint32_t idx = v * blockDim.x + threadIdx.x;
-    if (idx < rc) __stwt(out + idx, shmem_t[idx]);
+    if (idx < rc) __stcs(out + idx, shmem_t[idx]);
   }
 }
 
