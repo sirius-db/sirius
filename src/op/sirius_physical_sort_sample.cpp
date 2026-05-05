@@ -27,8 +27,6 @@
 
 #include <nvtx3/nvtx3.hpp>
 
-#include <functional>
-
 namespace sirius {
 namespace op {
 
@@ -84,12 +82,12 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_sort_sample::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_read_only_batches();
+  const auto& input_batches = input.get_data_batches();
 
   // Fast path: boundaries already computed — just pass through.
   if (_boundary_state.load(std::memory_order_acquire) == 2) {
     SIRIUS_LOG_DEBUG("Sort sample: passthrough ({} batches)", input_batches.size());
-    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
+    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
   // Elect exactly one winner via CAS (0=not started → 1=computing).
@@ -99,7 +97,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   int expected = 0;
   if (!_boundary_state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
     SIRIUS_LOG_DEBUG("Sort sample: passthrough ({} batches)", input_batches.size());
-    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
+    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
   SIRIUS_LOG_DEBUG("Sort sample: computing partition boundaries from {} batches",
@@ -107,16 +105,17 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   auto start = std::chrono::high_resolution_clock::now();
 
   // 1. Collect valid batches and find memory space
-  std::vector<::cucascade::read_only_data_batch> valid_batches;
+  std::vector<std::shared_ptr<cucascade::data_batch>> valid_batches;
   cucascade::memory::memory_space* space = nullptr;
   for (auto const& batch : input_batches) {
-    if (!space) { space = batch.get_memory_space(); }
+    if (!batch) { continue; }
+    if (!space) { space = batch->get_memory_space(); }
     valid_batches.push_back(batch);
   }
 
   if (valid_batches.empty() || !space) {
     _boundary_state.store(2, std::memory_order_release);
-    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
+    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
   // Wrap GPU work in try/catch: if any allocation throws (e.g. rmm::out_of_memory),
@@ -127,9 +126,9 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
     size_t total_sample_bytes = 0;
     sample_views.reserve(valid_batches.size());
     for (auto const& batch : valid_batches) {
-      auto view = get_cudf_table_view(batch);
+      auto view = get_cudf_table_view(*batch);
       sample_views.push_back(view);
-      total_sample_bytes += batch.get_data()->get_size_in_bytes();
+      total_sample_bytes += batch->get_data()->get_size_in_bytes();
     }
 
     auto concat_table = cudf::concatenate(sample_views, stream, space->get_default_allocator());
@@ -276,7 +275,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
                    _partition_boundaries ? _partition_boundaries->num_rows() : 0,
                    duration.count() / 1000.0);
 
-  return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
+  return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
 }
 
 }  // namespace op

@@ -151,9 +151,8 @@ std::unique_ptr<cudf::table> sirius_gpu_parquet_scan_operator::read_table_from_m
     }
   }
 
-  rmm::device_async_resource_ref mr_ref(scan_data.gpu_memory_space->get_default_allocator());
   auto [table, metadata] =
-    cudf::io::read_parquet(std::move(sources), std::move(metadatas), opts, stream, mr_ref);
+    cudf::io::read_parquet(std::move(sources), std::move(metadatas), opts, stream);
 
   SIRIUS_LOG_DEBUG(
     "[sirius_gpu_parquet_scan_operator] Read {} file(s) (first: {}) — {} rows, {} columns",
@@ -207,8 +206,7 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
     table     = read_table_from_metadata(*scan_data, stream);
     mem_space = scan_data->gpu_memory_space;
   } else if (auto const* cached = dynamic_cast<const scan_cached_operator_data*>(&input_data)) {
-    auto ro_batch    = cached->batch->to_read_only();
-    auto& gpu_rep    = ro_batch.get_data()->cast<cucascade::gpu_table_representation>();
+    auto& gpu_rep    = cached->batch->get_data()->cast<cucascade::gpu_table_representation>();
     auto cached_view = gpu_rep.get_table_view();
 
     // The cached path carries only a DuckDB-expression filter (AST translation /
@@ -258,7 +256,7 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
       SIRIUS_LOG_DEBUG("[sirius_gpu_parquet_scan_operator] Assembled cached batch to plan layout.");
     }
 
-    mem_space = ro_batch.get_memory_space();
+    mem_space = cached->batch->get_memory_space();
   } else {
     throw std::runtime_error(
       "[sirius_gpu_parquet_scan_operator] execute() called with unexpected operator_data type; "

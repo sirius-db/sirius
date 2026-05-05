@@ -131,8 +131,11 @@ TEST_CASE("sirius_physical_merge_sort merges 2 sorted 1-column batches ascending
   auto out = op.execute(pipelineable_operator_data({batch1, batch2}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto table = sirius::get_cudf_table_view(
-    *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
+  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
+                 .get_data_batches()[0]
+                 ->get_data()
+                 ->cast<gpu_table_representation>()
+                 .get_table_view();
   auto col0 = copy_column_to_host<int64_t>(table.column(0));
 
   std::vector<int64_t> expected{1, 2, 3, 4, 5, 6, 7, 8};
@@ -165,8 +168,11 @@ TEST_CASE("sirius_physical_merge_sort merges 3 sorted 1-column batches descendin
     op.execute(pipelineable_operator_data({batch1, batch2, batch3}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto table = sirius::get_cudf_table_view(
-    *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
+  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
+                 .get_data_batches()[0]
+                 ->get_data()
+                 ->cast<gpu_table_representation>()
+                 .get_table_view();
   auto col0 = copy_column_to_host<int64_t>(table.column(0));
 
   std::vector<int64_t> expected{9, 8, 7, 6, 5, 4, 3, 2, 1};
@@ -203,8 +209,12 @@ TEST_CASE("sirius_physical_merge_sort merges 2 sorted 2-column batches by col0 a
   auto out = op.execute(pipelineable_operator_data({batch1, batch2}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto view = sirius::get_cudf_table_view(
-    *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
+  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
+                 .get_data_batches()[0]
+                 ->get_data()
+                 ->cast<gpu_table_representation>()
+                 .get_table_view();
+  auto view   = table;
   auto out_c0 = copy_column_to_host<int64_t>(view.column(0));
   auto out_c1 = copy_column_to_host<int64_t>(view.column(1));
 
@@ -247,8 +257,12 @@ TEST_CASE("sirius_physical_merge_sort merges 2-column batches sorted by 2 keys",
   auto out = op.execute(pipelineable_operator_data({sorted1, sorted2}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto view = sirius::get_cudf_table_view(
-    *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
+  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
+                 .get_data_batches()[0]
+                 ->get_data()
+                 ->cast<gpu_table_representation>()
+                 .get_table_view();
+  auto view   = table;
   auto out_c0 = copy_column_to_host<int64_t>(view.column(0));
   auto out_c1 = copy_column_to_host<int64_t>(view.column(1));
 
@@ -288,8 +302,12 @@ TEST_CASE("sirius_physical_merge_sort merges 3-column batches sorted by col0, re
   auto out = op.execute(pipelineable_operator_data({batch1, batch2}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto view = sirius::get_cudf_table_view(
-    *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
+  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
+                 .get_data_batches()[0]
+                 ->get_data()
+                 ->cast<gpu_table_representation>()
+                 .get_table_view();
+  auto view   = table;
   auto out_c0 = copy_column_to_host<int64_t>(view.column(0));
   auto out_c1 = copy_column_to_host<int64_t>(view.column(1));
   auto out_c2 = copy_column_to_host<int64_t>(view.column(2));
@@ -335,8 +353,12 @@ TEST_CASE("sirius_physical_merge_sort 3 columns sorted by col0 asc + col1 desc",
   auto out = op.execute(pipelineable_operator_data({sorted1, sorted2}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto view = sirius::get_cudf_table_view(
-    *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
+  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
+                 .get_data_batches()[0]
+                 ->get_data()
+                 ->cast<gpu_table_representation>()
+                 .get_table_view();
+  auto view   = table;
   auto out_c0 = copy_column_to_host<int64_t>(view.column(0));
   auto out_c1 = copy_column_to_host<int64_t>(view.column(1));
   auto out_c2 = copy_column_to_host<int64_t>(view.column(2));
@@ -374,8 +396,11 @@ TEST_CASE("sirius_physical_merge_sort single batch passthrough", "[physical_merg
   auto out = op.execute(pipelineable_operator_data({batch}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto table = sirius::get_cudf_table_view(
-    *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
+  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
+                 .get_data_batches()[0]
+                 ->get_data()
+                 ->cast<gpu_table_representation>()
+                 .get_table_view();
   auto col0 = copy_column_to_host<int64_t>(table.column(0));
   REQUIRE(col0 == std::vector<int64_t>{1, 2, 3});
 }
@@ -404,8 +429,11 @@ TEST_CASE("sirius_physical_merge_sort skips null batches", "[physical_merge_sort
   auto out = op.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto table = sirius::get_cudf_table_view(
-    *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
+  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
+                 .get_data_batches()[0]
+                 ->get_data()
+                 ->cast<gpu_table_representation>()
+                 .get_table_view();
   auto col0 = copy_column_to_host<int64_t>(table.column(0));
   REQUIRE(col0 == std::vector<int64_t>{1, 2, 3, 4, 5, 6});
 }
@@ -458,8 +486,11 @@ TEST_CASE("sirius_physical_merge_sort constructed from sirius_physical_order",
   auto out = op.execute(pipelineable_operator_data({batch1, batch2}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto table = sirius::get_cudf_table_view(
-    *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
+  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
+                 .get_data_batches()[0]
+                 ->get_data()
+                 ->cast<gpu_table_representation>()
+                 .get_table_view();
   auto col0 = copy_column_to_host<int64_t>(table.column(0));
   REQUIRE(col0 == std::vector<int64_t>{1, 2, 3, 4, 5, 6});
 }

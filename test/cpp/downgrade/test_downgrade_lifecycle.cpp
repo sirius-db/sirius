@@ -53,13 +53,6 @@ namespace {
 
 const auto GPU_SPACE_ID = cucascade::memory::memory_space_id(cucascade::memory::Tier::GPU, 0);
 
-/// Helper: get the tier of a data_batch using a temporary read-only lock.
-inline cucascade::memory::Tier get_batch_tier(cucascade::data_batch& batch)
-{
-  auto ro = batch.to_read_only();
-  return ro.get_memory_space()->get_tier();
-}
-
 std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> make_test_memory_manager()
 {
   sirius::converter_registry::reset_for_testing();
@@ -180,9 +173,9 @@ TEST_CASE("drain_clears_pending_requests", "[downgrade_lifecycle]")
   // Wait for batches to reach HOST
   auto deadline = std::chrono::steady_clock::now() + 10s;
   while (std::chrono::steady_clock::now() < deadline) {
-    if (get_batch_tier(*batch1) == cucascade::memory::Tier::HOST &&
-        get_batch_tier(*batch2) == cucascade::memory::Tier::HOST &&
-        get_batch_tier(*batch3) == cucascade::memory::Tier::HOST)
+    if (batch1->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST &&
+        batch2->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST &&
+        batch3->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST)
       break;
     std::this_thread::sleep_for(50ms);
   }
@@ -201,10 +194,10 @@ TEST_CASE("drain_clears_pending_requests", "[downgrade_lifecycle]")
 
   deadline = std::chrono::steady_clock::now() + 10s;
   while (std::chrono::steady_clock::now() < deadline) {
-    if (get_batch_tier(*batch4) == cucascade::memory::Tier::HOST) break;
+    if (batch4->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST) break;
     std::this_thread::sleep_for(50ms);
   }
-  REQUIRE(get_batch_tier(*batch4) == cucascade::memory::Tier::HOST);
+  REQUIRE(batch4->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
 
   executor.stop();
 }
@@ -223,7 +216,7 @@ TEST_CASE("drain_releases_batch_references", "[downgrade_lifecycle]")
   repo->add_data_batch(batch);
   repo_mgr.add_new_repository(1, "out", std::move(repo));
 
-  REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::GPU);
+  REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
 
   auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
   executor.start();
@@ -238,10 +231,10 @@ TEST_CASE("drain_releases_batch_references", "[downgrade_lifecycle]")
   // Wait for downgrade to complete
   auto deadline = std::chrono::steady_clock::now() + 10s;
   while (std::chrono::steady_clock::now() < deadline) {
-    if (get_batch_tier(*batch) == cucascade::memory::Tier::HOST) break;
+    if (batch->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST) break;
     std::this_thread::sleep_for(50ms);
   }
-  REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::HOST);
+  REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
 
   // Call drain to ensure all internal references are released
   // drain() calls stop() which waits for pool->wait_all(), releasing all shared_ptr captures
@@ -272,9 +265,9 @@ TEST_CASE("monitor_loop_triggers_downgrade", "[downgrade_lifecycle]")
   repo->add_data_batch(batch3);
   repo_mgr.add_new_repository(42, "default", std::move(repo));
 
-  REQUIRE(get_batch_tier(*batch1) == cucascade::memory::Tier::GPU);
-  REQUIRE(get_batch_tier(*batch2) == cucascade::memory::Tier::GPU);
-  REQUIRE(get_batch_tier(*batch3) == cucascade::memory::Tier::GPU);
+  REQUIRE(batch1->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+  REQUIRE(batch2->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+  REQUIRE(batch3->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
 
   // Start executor with monitor enabled (non-zero period)
   auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr, /*monitor_period_ms=*/10);
@@ -287,9 +280,9 @@ TEST_CASE("monitor_loop_triggers_downgrade", "[downgrade_lifecycle]")
   auto deadline       = std::chrono::steady_clock::now() + 2s;
   bool any_downgraded = false;
   while (std::chrono::steady_clock::now() < deadline) {
-    if (get_batch_tier(*batch1) == cucascade::memory::Tier::HOST ||
-        get_batch_tier(*batch2) == cucascade::memory::Tier::HOST ||
-        get_batch_tier(*batch3) == cucascade::memory::Tier::HOST) {
+    if (batch1->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST ||
+        batch2->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST ||
+        batch3->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST) {
       any_downgraded = true;
       break;
     }
@@ -304,10 +297,10 @@ TEST_CASE("monitor_loop_triggers_downgrade", "[downgrade_lifecycle]")
 
     deadline = std::chrono::steady_clock::now() + 10s;
     while (std::chrono::steady_clock::now() < deadline) {
-      if (get_batch_tier(*batch1) == cucascade::memory::Tier::HOST) break;
+      if (batch1->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST) break;
       std::this_thread::sleep_for(50ms);
     }
-    REQUIRE(get_batch_tier(*batch1) == cucascade::memory::Tier::HOST);
+    REQUIRE(batch1->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
   }
 
   executor.stop();
@@ -342,7 +335,7 @@ TEST_CASE("concurrent_api_safety", "[downgrade_lifecycle]")
         // Wait for the batch to be downgraded
         auto deadline = std::chrono::steady_clock::now() + 10s;
         while (std::chrono::steady_clock::now() < deadline) {
-          if (get_batch_tier(*batch) == cucascade::memory::Tier::HOST) break;
+          if (batch->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST) break;
           std::this_thread::sleep_for(50ms);
         }
       } catch (const std::exception&) {
@@ -375,10 +368,10 @@ TEST_CASE("concurrent_api_safety", "[downgrade_lifecycle]")
 
   auto deadline = std::chrono::steady_clock::now() + 10s;
   while (std::chrono::steady_clock::now() < deadline) {
-    if (get_batch_tier(*final_batch) == cucascade::memory::Tier::HOST) break;
+    if (final_batch->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST) break;
     std::this_thread::sleep_for(50ms);
   }
-  REQUIRE(get_batch_tier(*final_batch) == cucascade::memory::Tier::HOST);
+  REQUIRE(final_batch->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
 
   executor.stop();
 }
@@ -472,10 +465,10 @@ TEST_CASE("cuda_stream_lifecycle", "[downgrade_lifecycle]")
 
   auto deadline = std::chrono::steady_clock::now() + 10s;
   while (std::chrono::steady_clock::now() < deadline) {
-    if (get_batch_tier(*batch1) == cucascade::memory::Tier::HOST) break;
+    if (batch1->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST) break;
     std::this_thread::sleep_for(50ms);
   }
-  REQUIRE(get_batch_tier(*batch1) == cucascade::memory::Tier::HOST);
+  REQUIRE(batch1->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
 
   // Stop -- stream should be destroyed (on_stopped)
   executor.stop();
@@ -494,10 +487,10 @@ TEST_CASE("cuda_stream_lifecycle", "[downgrade_lifecycle]")
 
   deadline = std::chrono::steady_clock::now() + 10s;
   while (std::chrono::steady_clock::now() < deadline) {
-    if (get_batch_tier(*batch2) == cucascade::memory::Tier::HOST) break;
+    if (batch2->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST) break;
     std::this_thread::sleep_for(50ms);
   }
-  REQUIRE(get_batch_tier(*batch2) == cucascade::memory::Tier::HOST);
+  REQUIRE(batch2->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
 
   executor.stop();
 }

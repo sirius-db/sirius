@@ -25,7 +25,7 @@ namespace sirius {
 namespace op {
 
 std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_partition(
-  const cucascade::read_only_data_batch& input,
+  const std::shared_ptr<cucascade::data_batch>& input,
   const std::vector<int>& partition_key_idx,
   const std::vector<cudf::data_type>& partition_key_cast_types,
   int num_partitions,
@@ -37,7 +37,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
     throw std::runtime_error("`num_partitions` in `hash_partition()` should be at least 2");
   }
 
-  auto input_table = get_cudf_table_view(input);
+  auto input_table = get_cudf_table_view(*input);
 
   // When a join condition has mixed key types (e.g. INT32 vs INT64), cuDF's murmur3 hash
   // produces different values for the same integer in different representations. We apply the
@@ -101,7 +101,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
 }
 
 std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::evenly_partition(
-  const cucascade::read_only_data_batch& input,
+  const std::shared_ptr<cucascade::data_batch>& input,
   int num_partitions,
   rmm::cuda_stream_view stream,
   cucascade::memory::memory_space& memory_space)
@@ -112,7 +112,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::evenly_p
   }
 
   // Compute slice indices
-  auto input_table                        = get_cudf_table_view(input);
+  auto input_table                        = get_cudf_table_view(*input);
   cudf::size_type partition_num_rows_base = input_table.num_rows() / num_partitions;
   cudf::size_type remainder               = input_table.num_rows() % num_partitions;
   std::vector<cudf::size_type> slice_indices;

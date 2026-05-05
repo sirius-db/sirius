@@ -65,21 +65,12 @@ legacy-release: build/legacy-release/build.ninja
 
 clang-release: build/clang-release/build.ninja
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-release --target $(MAIN_BUILD_TARGETS)
-ifneq ($(TEST_BUILD_TARGET),)
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-release --target $(TEST_BUILD_TARGET)
-endif
 
 clang-debug: build/clang-debug/build.ninja
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-debug --target $(MAIN_BUILD_TARGETS)
-ifneq ($(TEST_BUILD_TARGET),)
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-debug --target $(TEST_BUILD_TARGET)
-endif
 
 clang-relwithdebinfo: build/clang-relwithdebinfo/build.ninja
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-relwithdebinfo --target $(MAIN_BUILD_TARGETS)
-ifneq ($(TEST_BUILD_TARGET),)
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-relwithdebinfo --target $(TEST_BUILD_TARGET)
-endif
 
 ci-release: build/ci-release/build.ninja
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset ci-release --target $(MAIN_BUILD_TARGETS)

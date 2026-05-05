@@ -51,7 +51,7 @@ class gpu_partition_impl {
    * @return The output data batches.
    */
   static std::vector<std::shared_ptr<cucascade::data_batch>> hash_partition(
-    const cucascade::read_only_data_batch& input,
+    const std::shared_ptr<cucascade::data_batch>& input,
     const std::vector<int>& partition_key_idx,
     const std::vector<cudf::data_type>& partition_key_cast_types,
     int num_partitions,
@@ -60,7 +60,7 @@ class gpu_partition_impl {
 
   /// Overload without cast types (all keys hashed as-is). Kept for backward compatibility.
   static std::vector<std::shared_ptr<cucascade::data_batch>> hash_partition(
-    const cucascade::read_only_data_batch& input,
+    const std::shared_ptr<cucascade::data_batch>& input,
     const std::vector<int>& partition_key_idx,
     int num_partitions,
     rmm::cuda_stream_view stream,
@@ -80,7 +80,7 @@ class gpu_partition_impl {
    * @return The output data batches.
    */
   static std::vector<std::shared_ptr<cucascade::data_batch>> evenly_partition(
-    const cucascade::read_only_data_batch& input,
+    const std::shared_ptr<cucascade::data_batch>& input,
     int num_partitions,
     rmm::cuda_stream_view stream,
     cucascade::memory::memory_space& memory_space);

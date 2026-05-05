@@ -43,40 +43,16 @@ inline std::atomic<uint64_t> g_next_batch_id{0};
 inline uint64_t get_next_batch_id() { return g_next_batch_id++; }
 
 /**
- * @brief Get a cudf::table_view from a read_only_data_batch.
+ * @brief Get a cudf::table_view from a data_batch.
  *
- * Assumes the batch contains a gpu_table_representation.
+ * Assumes the data_batch contains a gpu_table_representation.
  *
- * @param batch The read-only locked data batch to extract the table view from.
+ * @param batch The data batch to extract the table view from.
  * @return cudf::table_view The underlying cudf table view.
  */
-inline cudf::table_view get_cudf_table_view(const cucascade::read_only_data_batch& batch)
+inline cudf::table_view get_cudf_table_view(const cucascade::data_batch& batch)
 {
   auto* data = batch.get_data();
-  if (data == nullptr) { throw std::runtime_error("data_batch has no data representation"); }
-  return data->cast<cucascade::gpu_table_representation>().get_table_view();
-}
-
-/**
- * @brief Get a cudf::table_view from an idle data_batch (convenience overload).
- *
- * Acquires a temporary read-only lock, extracts the table_view, then releases the lock.
- *
- * @warning The returned table_view references GPU memory that is only guaranteed stable while a
- * read-only lock is held. Since this function releases the lock before returning, the view can
- * become dangling if another thread downgrades or mutates the batch concurrently. Only use this
- * overload in contexts where the caller has exclusive ownership of the batch (e.g., diagnostic
- * functions running synchronously within a pipeline task). Prefer the
- * get_cudf_table_view(const read_only_data_batch&) overload when the caller can hold the lock.
- *
- * @param batch The idle data batch to extract the table view from.
- * @return cudf::table_view The underlying cudf table view.
- */
-// NOLINTNEXTLINE(readability-non-const-parameter) -- to_read_only() is non-const
-inline cudf::table_view get_cudf_table_view(cucascade::data_batch& batch)
-{
-  auto ro    = batch.to_read_only();
-  auto* data = ro.get_data();
   if (data == nullptr) { throw std::runtime_error("data_batch has no data representation"); }
   return data->cast<cucascade::gpu_table_representation>().get_table_view();
 }

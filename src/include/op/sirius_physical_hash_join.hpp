@@ -166,7 +166,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   std::unique_ptr<cudf::hash_join> _hash_table;  // hash object to be used in BUILD_PROBE mode
   std::unique_ptr<cudf::distinct_hash_join>
     _distinct_hash_table;  // used instead of _hash_table when build keys are proven unique
-  std::optional<::cucascade::read_only_data_batch>
+  std::shared_ptr<::cucascade::data_batch>
     _build_table;  // owned build table for BUILD_PROBE mode, to materialize build side results
   std::vector<std::unique_ptr<cudf::column>>
     _built_table_cast_columns;  // scope holder for any columns that may have had to be cast for the

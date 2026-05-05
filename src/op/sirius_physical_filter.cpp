@@ -44,7 +44,7 @@ std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_da
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_filter::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_read_only_batches();
+  const auto& input_batches = input.get_data_batches();
 
   sirius::gpu_expression_executor gpu_expression_executor(
     expression, cudf::get_current_device_resource_ref(), stream);
@@ -53,10 +53,11 @@ std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_da
   output_batches.reserve(input_batches.size());
 
   for (auto const& batch : input_batches) {
+    if (!batch) { continue; }
     auto filtered_table = gpu_expression_executor.select(
-      batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
+      batch->get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
     output_batches.push_back(
-      sirius::make_data_batch(std::move(filtered_table), *batch.get_memory_space()));
+      sirius::make_data_batch(std::move(filtered_table), *batch->get_memory_space()));
   }
   return std::make_unique<pipelineable_operator_data>(output_batches);
 }

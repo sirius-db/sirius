@@ -50,7 +50,7 @@ class gpu_aggregate_impl {
    * @return The output data batch.
    */
   static std::shared_ptr<cucascade::data_batch> local_ungrouped_aggregate(
-    const cucascade::read_only_data_batch& input,
+    std::shared_ptr<cucascade::data_batch> input,
     const std::vector<cudf::aggregation::Kind>& aggregates,
     const std::vector<int>& aggregate_idx,
     rmm::cuda_stream_view stream,
@@ -74,7 +74,7 @@ class gpu_aggregate_impl {
    * @return The output data batch.
    */
   static std::shared_ptr<cucascade::data_batch> local_grouped_aggregate(
-    const cucascade::read_only_data_batch& input,
+    std::shared_ptr<cucascade::data_batch> input,
     const std::vector<int>& group_idx,
     const std::vector<cudf::aggregation::Kind>& aggregates,
     const std::vector<int>& aggregate_idx,

@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "data/sirius_converter_registry.hpp"
 #include "log/logging.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
@@ -24,7 +25,6 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
-#include <data/sirius_converter_registry.hpp>
 
 #include <memory>
 #include <optional>
@@ -35,57 +35,94 @@ namespace pipeline {
 /**
  * @brief Lock or prepare a single data batch for processing in the requested memory space.
  *
- * Acquires a read-only (shared) lock on the batch. If the batch resides in a different memory
- * space than requested, it is first upgraded to a mutable (exclusive) lock, converted in-place
- * to the target representation, then downgraded back to a read-only lock.
+ * If the batch is already in the requested memory space it is locked in place. If it resides
+ * elsewhere the batch is first converted (moved) to the requested space and then locked.
  *
  * @param batch                   The batch to lock/prepare.
  * @param requested_memory_space  Target memory space; may be nullptr to use the batch's current
  *                                space.
  * @param stream                  CUDA stream used for any data-movement kernels.
- * @return A read_only_data_batch holding the shared lock, or std::nullopt on failure.
+ * @return A processing handle that keeps the batch locked, or std::nullopt on failure.
  * @throws rmm::out_of_memory  If a GPU memory allocation fails during the conversion.
  */
-inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
+inline std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_batch(
   const std::shared_ptr<cucascade::data_batch>& batch,
   const cucascade::memory::memory_space* requested_memory_space,
   rmm::cuda_stream_view stream)
 {
-  if (!batch) { return std::nullopt; }
-
-  // Acquire a read-only lock
-  auto read_accessor = batch->to_read_only();
-
-  // Determine the target memory space
+  using status = cucascade::lock_for_processing_status;
   const auto* target_space =
-    requested_memory_space != nullptr ? requested_memory_space : read_accessor.get_memory_space();
+    requested_memory_space != nullptr ? requested_memory_space : batch->get_memory_space();
   if (target_space == nullptr) { return std::nullopt; }
 
-  // Memory space matches — return the read-only accessor directly
-  if (read_accessor.get_memory_space() != nullptr &&
-      read_accessor.get_memory_space()->get_id() == target_space->get_id()) {
-    return std::move(read_accessor);
+  // NOTE: only works in single gpu setup
+  // wait for processing in case a shared batch is in transit in another thread.
+  auto lock_result = batch->wait_to_lock_for_processing(target_space->get_id());
+
+  auto cancel_task_if_needed = [&batch]() {
+    SIRIUS_LOG_ERROR(
+      "gpu_pipeline_task: failed to lock batch {} for processing and cannot prepare batch for "
+      "processing. This likely means the batch is in transit and there is a bug in "
+      "the in-transit locking logic. Cancelling task to avoid deadlock.",
+      batch->get_batch_id());
+  };
+
+  while (!lock_result.success && lock_result.status == status::memory_space_mismatch) {
+    try {
+      auto& registry = sirius::converter_registry::get();
+      switch (target_space->get_tier()) {
+        case cucascade::memory::Tier::GPU: {
+          auto prev_state = batch->get_state();
+          if (!batch->try_to_lock_for_in_transit()) {
+            auto current_state = batch->get_state();
+            if (current_state == cucascade::batch_state::in_transit) {
+              // If another thread has taken the in_transit lock, wait to acquire the processing
+              // lock.
+              lock_result = batch->wait_to_lock_for_processing(target_space->get_id());
+              continue;
+            }
+            cancel_task_if_needed();
+            return std::nullopt;
+          }
+          try {
+            batch->convert_to<cucascade::gpu_table_representation>(registry, target_space, stream);
+          } catch (...) {
+            batch->try_to_release_in_transit();
+            throw;
+          }
+          batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
+          break;
+        }
+        case cucascade::memory::Tier::HOST: {
+          auto prev_state = batch->get_state();
+          if (!batch->try_to_lock_for_in_transit()) {
+            cancel_task_if_needed();
+            return std::nullopt;
+          }
+          try {
+            batch->convert_to<cucascade::host_data_representation>(registry, target_space, stream);
+          } catch (...) {
+            batch->try_to_release_in_transit();
+            throw;
+          }
+          batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
+          break;
+        }
+        default: cancel_task_if_needed(); return std::nullopt;
+      }
+
+      lock_result = batch->try_to_lock_for_processing(target_space->get_id());
+    } catch (...) {
+      throw;
+    }
   }
 
-  // Memory space mismatch — go to mutable, convert in-place, go back to read-only
-  auto& registry    = sirius::converter_registry::get();
-  auto mut_accessor = cucascade::data_batch::readonly_to_mutable(std::move(read_accessor));
-
-  switch (target_space->get_tier()) {
-    case cucascade::memory::Tier::GPU:
-      mut_accessor.convert_to<cucascade::gpu_table_representation>(registry, target_space, stream);
-      break;
-    case cucascade::memory::Tier::HOST:
-      mut_accessor.convert_to<cucascade::host_data_representation>(registry, target_space, stream);
-      break;
-    default:
-      SIRIUS_LOG_ERROR("lock_or_prepare_batch: unsupported target tier for batch {}",
-                       mut_accessor.get_batch_id());
-      return std::nullopt;
+  if (!lock_result.success) {
+    cancel_task_if_needed();
+    return std::nullopt;
   }
 
-  // Downgrade the exclusive lock back to a shared read-only lock
-  return cucascade::data_batch::mutable_to_readonly(std::move(mut_accessor));
+  return std::move(lock_result.handle);
 }
 
 }  // namespace pipeline

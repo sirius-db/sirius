@@ -7,40 +7,28 @@ This document covers data batches, data repositories, ports, barrier semantics, 
 A data batch flows through the system in these stages:
 
 ```
-1. Scan Phase:     scan_task creates data_batch (idle) with host/parquet representation
-2. Repository:     idle batch stored in shared_data_repository
-3. Consumption:    task_creator calls pop_next_data_batch(); batch is still idle
-4. Preparation:    prepare_for_processing() acquires read_only_data_batch handles,
-                   converting to GPU memory space if needed (lock_or_prepare_batch)
-5. Execution:      GPU task reads data through read_only_data_batch accessors
-6. Output:         operators produce new idle batches, pushed to downstream repositories
-7. Downgrade:      if GPU memory pressure, downgrade executor upgrades to mutable,
-                   converts representation to HOST, releases back to idle
-8. Cleanup:        batch destroyed when shared_ptr ref count reaches zero
+1. Scan Phase:     scan_task creates data_batch with host/parquet representation
+2. Repository:     batch is stored in shared_data_repository
+3. Consumption:    task_creator pops batch, transitions to task_created state
+4. Execution:      GPU task locks batch, converts to GPU, executes operator chain
+5. Output:         operators produce new batches, pushed to downstream repositories
+6. Downgrade:      if GPU memory pressure, batch moved to host (optional)
+7. Cleanup:        batch destroyed when no longer referenced
 ```
 
 ### Batch State Machine
 
-Each `data_batch` (from cuCascade) uses a 3-class reader-writer locking model. Data is only
-accessible through RAII accessor objects — the idle `shared_ptr<data_batch>` grants no data access.
+Each `data_batch` (from cuCascade) maintains a state:
 
 ```
-idle ←→ read_only      (shared lock; multiple concurrent readers)
-idle ←→ mutable_locked (exclusive lock; one writer, no readers)
-read_only ←→ mutable_locked (upgrade/downgrade)
+idle → task_created → processing → idle
+                   ↘ in_transit (downgrade) → idle
 ```
 
-- **`idle`**: No active locks. Available for locking, cloning, or tier movement.
-- **`read_only`**: One or more `read_only_data_batch` shared locks active. Concurrent reads allowed.
-- **`mutable_locked`**: One `mutable_data_batch` exclusive lock active. Data can be read and mutated.
-
-Key methods on `data_batch`:
-- `batch->to_read_only()` — blocking shared lock → `read_only_data_batch`
-- `batch->to_mutable()` — blocking exclusive lock → `mutable_data_batch`
-- `batch->try_to_read_only()` / `try_to_mutable()` — non-blocking variants returning `std::optional`
-- `data_batch::to_idle(std::move(accessor))` — release lock, return `shared_ptr<data_batch>`
-- `data_batch::readonly_to_mutable(std::move(ro))` — upgrade shared → exclusive
-- `data_batch::mutable_to_readonly(std::move(mut))` — downgrade exclusive → shared
+- **idle**: available for consumption or downgrade
+- **task_created**: claimed by task creator, not yet executing
+- **processing**: locked by a GPU task during execution
+- **in_transit**: locked by downgrade executor during tier migration
 
 ## Data Repositories
 
@@ -48,7 +36,7 @@ Data repositories are thread-safe containers managed by the `shared_data_reposit
 
 - Keyed by `(operator_id, port_id)` pairs
 - Support partitioned storage (multiple partitions per repository)
-- Provide `add_data_batch()` for producers and `pop_next_data_batch()` for consumers (non-blocking; returns `nullptr` if empty)
+- Provide `add_data_batch()` for producers and `pop_data_batch()` for consumers
 - Track total size and per-partition sizes
 - Registered centrally in `shared_data_repository_manager` for downgrade candidate selection
 
@@ -109,18 +97,12 @@ Minimal empty base class. Provides a generic extension point for any type of ope
 
 ### `pipelineable_operator_data`
 
-Extends `operator_data` with batch-based data flow. Holds two optional internal stores that are
-lazily populated from each other on demand:
-- `_data_batches` — `std::vector<shared_ptr<data_batch>>` (idle pointers)
-- `_read_only_data_batches` — `std::vector<read_only_data_batch>` (shared-locked accessors)
-
-Key methods:
-- `get_data_batches()` — returns idle batch pointers; if only `_read_only_data_batches` exist, calls `data_batch::to_idle()` on copies to populate `_data_batches`.
-- `get_read_only_batches(bool leave_locked)` — acquires `to_read_only()` on each idle batch; if `leave_locked=true`, caches result in `_read_only_data_batches`.
-- `prepare_for_processing(memory_space*, stream)` — **void**, throws on failure. Calls `lock_or_prepare_batch()` for each batch (converts to the target memory space if needed, then acquires a shared lock). Stores resulting `read_only_data_batch` handles in `_read_only_data_batches`. Called by the GPU pipeline executor before `execute()`.
-- `remove_read_only_lock()` — releases `_read_only_data_batches` while ensuring `_data_batches` is populated first (so the data stays alive).
-- Created by `get_next_task_input_data()` from port pops.
-- Passed through the operator chain during `execute()`.
+Extends `operator_data` with batch-based data flow (previously this logic lived directly in `operator_data`):
+- `std::vector<shared_ptr<data_batch>>` — the batch vector
+- `get_data_batches()` / `release_data_batches()` — access and ownership transfer
+- `prepare_for_processing()` — virtual hook for pre-execution preparation
+- Created by `get_next_task_input_data()` from port pops
+- Passed through the operator chain during `execute()`
 
 ### `partitioned_operator_data`
 

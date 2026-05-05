@@ -28,7 +28,7 @@
 
 namespace duckdb {
 enum class ExpressionType : uint8_t;
-struct JoinCondition;
+class JoinCondition;
 }  // namespace duckdb
 
 namespace sirius {

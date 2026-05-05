@@ -181,7 +181,9 @@ void convert_batch_to_host(duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx,
                            std::shared_ptr<data_batch> const& batch,
                            rmm::cuda_stream_view stream)
 {
-  // Use get_cudf_table_view which internally acquires a read-only lock.
+  auto* data = batch->get_data();
+  if (!data) { throw std::runtime_error("data_batch has no data representation"); }
+
   auto const view       = sirius::get_cudf_table_view(*batch);
   auto const data_bytes = estimate_packed_data_bytes(view);
 
@@ -194,10 +196,7 @@ void convert_batch_to_host(duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx,
   if (!host_space) { throw std::runtime_error("Invalid host memory space for test"); }
 
   auto& registry = sirius::converter_registry::get();
-  {
-    auto mut = batch->to_mutable();
-    mut.convert_to<cucascade::host_data_representation>(registry, host_space, stream);
-  }
+  batch->convert_to<cucascade::host_data_representation>(registry, host_space, stream);
 }
 
 }  // namespace
@@ -225,6 +224,11 @@ TEST_CASE("sirius_physical_materialized_collector sink with host input",
   expected_table_data expected;
   std::vector<std::string> expected_strings;
   {
+    REQUIRE(batch->try_to_create_task());
+    auto lock_result = batch->try_to_lock_for_processing(gpu_space->get_id());
+    REQUIRE(lock_result.success);
+    auto handle = std::move(lock_result.handle);
+
     auto const gpu_view = sirius::get_cudf_table_view(*batch);
     expected            = extract_expected_data(gpu_view);
     expected_strings    = build_expected_strings(expected);
@@ -290,6 +294,11 @@ TEST_CASE("sirius_physical_materialized_collector sink converts GPU input",
 
   expected_table_data expected;
   {
+    REQUIRE(batch->try_to_create_task());
+    auto lock_result = batch->try_to_lock_for_processing(gpu_space->get_id());
+    REQUIRE(lock_result.success);
+    auto handle = std::move(lock_result.handle);
+
     auto const gpu_view = sirius::get_cudf_table_view(*batch);
     expected            = extract_expected_data(gpu_view);
   }

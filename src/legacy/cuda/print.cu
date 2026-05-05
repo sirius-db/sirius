@@ -227,8 +227,7 @@ void print_table_contents(cudf::table_view const& table, cudf::size_type max_row
   }
 }
 
-// NOLINTNEXTLINE(readability-non-const-parameter)
-void print_data_batch_contents(cucascade::data_batch& batch, cudf::size_type max_rows)
+void print_data_batch_contents(cucascade::data_batch const& batch, cudf::size_type max_rows)
 {
   cudf::table_view tv = get_cudf_table_view(batch);
   std::printf("data_batch (id=%llu):\n", static_cast<unsigned long long>(batch.get_batch_id()));

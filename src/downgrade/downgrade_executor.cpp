@@ -126,8 +126,7 @@ void downgrade_executor::processing_loop()
     auto request = _request_queue.pop();
     if (!request) break;  // interrupted
 
-    auto& req = request;
-
+    auto& req    = request;
     auto t_start = std::chrono::steady_clock::now();
 
     // Per-source tracking (repos vs pipeline_queue)
@@ -205,7 +204,7 @@ void downgrade_executor::processing_loop()
            &host_target_stats,
            &disk_target_stats]() mutable {
             try {
-              auto result = cand->convert(targets, exc_stream, res_mgr, false);
+              auto result = cand->convert(targets, exc_stream, res_mgr);
               if (result) {
                 req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
                 req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
@@ -233,14 +232,11 @@ void downgrade_executor::processing_loop()
 
     // === TIER 2: task_scheduler task queue ===
     if (!req->satisfied.load() && _pipeline_task_queue) {
-      size_t max_tasks_to_convert = _pipeline_task_queue->size();
-      size_t tasks_converted      = 0;
       convertible_gpu_pipeline_task_provider pipeline_provider(*_pipeline_task_queue);
-      while (!req->satisfied.load() && tasks_converted < max_tasks_to_convert) {
+      while (!req->satisfied.load()) {
         auto candidate =
           pipeline_provider.get_next_convertible(source_space, /*front_to_back=*/false);
         if (!candidate) break;
-        tasks_converted++;
 
         auto candidate_bytes = candidate->bytes_in_space(source_space);
 
@@ -265,7 +261,7 @@ void downgrade_executor::processing_loop()
            &host_target_stats,
            &disk_target_stats]() mutable {
             try {
-              auto result = cand->convert(targets, exc_stream, res_mgr, false);
+              auto result = cand->convert(targets, exc_stream, res_mgr);
               if (result) {
                 req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
                 req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);

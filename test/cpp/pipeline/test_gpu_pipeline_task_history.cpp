@@ -136,18 +136,15 @@ struct pipeline_task_history_fixture {
 
     auto batch = sirius::make_data_batch(std::move(gpu_table), *gpu_space);
 
+    REQUIRE(batch->try_to_lock_for_in_transit());
     auto& registry = sirius::converter_registry::get();
-    {
-      auto mut = batch->to_mutable();
-      mut.convert_to<cucascade::host_data_representation>(registry, host_space, stream);
-    }
+    batch->convert_to<cucascade::host_data_representation>(registry, host_space, stream);
+    batch->try_to_release_in_transit();
     stream.synchronize();
 
-    {
-      auto ro = batch->to_read_only();
-      REQUIRE(ro.get_data() != nullptr);
-      REQUIRE(ro.get_data()->get_current_tier() == cucascade::memory::Tier::HOST);
-    }
+    REQUIRE(batch->get_data() != nullptr);
+    REQUIRE(batch->get_data()->get_current_tier() == cucascade::memory::Tier::HOST);
+    REQUIRE(batch->try_to_create_task());
     return batch;
   }
 
@@ -165,6 +162,7 @@ struct pipeline_task_history_fixture {
     stream.synchronize();
 
     auto batch = sirius::make_data_batch(std::move(gpu_table), *gpu_space);
+    REQUIRE(batch->try_to_create_task());
     return batch;
   }
 };

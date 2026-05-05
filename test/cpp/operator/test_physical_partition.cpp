@@ -154,7 +154,8 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single 
   std::size_t total_num_rows = 0;
   for (auto& output :
        dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()) {
-    total_num_rows += sirius::get_cudf_table_view(*output).num_rows();
+    total_num_rows +=
+      output->get_data()->cast<gpu_table_representation>().get_table_view().num_rows();
   }
   REQUIRE(total_num_rows == num_values);
 }
@@ -284,7 +285,8 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with two par
   std::size_t total_num_rows = 0;
   for (auto& output :
        dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()) {
-    std::size_t num_rows_out = sirius::get_cudf_table_view(*output).num_rows();
+    std::size_t num_rows_out =
+      output->get_data()->cast<gpu_table_representation>().get_table_view().num_rows();
     REQUIRE(num_rows_out % prime_repeater ==
             0);  // each group was created to have prime_repeater rows, so each partition should
                  // have a multiple of that
@@ -361,7 +363,10 @@ TEST_CASE(
 
   auto outputs = partitioner.execute(pipelineable_operator_data({input_batch}), default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
-  REQUIRE(sirius::get_cudf_table_view(
-            *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0])
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs)
+            .get_data_batches()[0]
+            ->get_data()
+            ->cast<gpu_table_representation>()
+            .get_table_view()
             .num_rows() == num_values);
 }

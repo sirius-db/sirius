@@ -91,8 +91,12 @@ TEST_CASE("sirius_physical_top_n single-key uses top_k per batch", "[physical_to
   auto out = topn.execute(pipelineable_operator_data({batches[0]}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto view = sirius::get_cudf_table_view(
-    *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
+  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
+                 .get_data_batches()[0]
+                 ->get_data()
+                 ->cast<gpu_table_representation>()
+                 .get_table_view();
+  auto view        = table;
   auto orders_out  = copy_column_to_host<int64_t>(view.column(0));
   auto payload_out = copy_column_to_host<int64_t>(view.column(1));
 
@@ -131,8 +135,12 @@ TEST_CASE("sirius_physical_top_n multi-key falls back to sort_by_key", "[physica
   auto out = topn.execute(pipelineable_operator_data({batches[0]}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto view = sirius::get_cudf_table_view(
-    *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
+  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
+                 .get_data_batches()[0]
+                 ->get_data()
+                 ->cast<gpu_table_representation>()
+                 .get_table_view();
+  auto view        = table;
   auto orders_out  = copy_column_to_host<int64_t>(view.column(0));
   auto payload_out = copy_column_to_host<int64_t>(view.column(1));
 
@@ -172,8 +180,12 @@ TEST_CASE("sirius_physical_top_n_merge applies offset and limit", "[physical_top
   auto out = topn_merge.execute(pipelineable_operator_data(batches), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto view = sirius::get_cudf_table_view(
-    *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
+  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
+                 .get_data_batches()[0]
+                 ->get_data()
+                 ->cast<gpu_table_representation>()
+                 .get_table_view();
+  auto view        = table;
   auto orders_out  = copy_column_to_host<int64_t>(view.column(0));
   auto payload_out = copy_column_to_host<int64_t>(view.column(1));
 
@@ -239,7 +251,10 @@ TEST_CASE("sirius_physical_top_n_merge handles empty batches", "[physical_top_n_
   auto out = topn_merge.execute(pipelineable_operator_data(batches), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto view = sirius::get_cudf_table_view(
-    *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
-  REQUIRE(view.num_rows() == 0);
+  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
+                 .get_data_batches()[0]
+                 ->get_data()
+                 ->cast<gpu_table_representation>()
+                 .get_table_view();
+  REQUIRE(table.num_rows() == 0);
 }
