@@ -43,10 +43,12 @@ namespace sirius {
 /**
  * @brief Concrete convertible_data wrapping a cucascade::data_batch.
  *
- * Generalizes the pattern for converting a data_batch: saves batch state, locks for
- * in_transit, iterates target memory spaces requesting reservations, converts via
- * the converter registry, and restores the previous state on all paths (success,
- * failure, exception).
+ * Generalizes the pattern for converting a data_batch to a target memory space
+ * via the post-#117 RAII accessor model. Acquires an exclusive accessor on the
+ * batch (which represents the equivalent of the pre-#117 in-transit lock),
+ * iterates target memory spaces requesting reservations, and converts via the
+ * converter registry. The exclusive lock is released automatically when the
+ * accessor goes out of scope (success, failure, or exception).
  */
 class convertible_data_batch : public convertible_data {
  public:
@@ -64,8 +66,14 @@ class convertible_data_batch : public convertible_data {
    *
    * Iterates target_spaces in order, requesting a reservation in each via
    * specific_memory_space. On the first successful reservation + conversion the batch
-   * is moved to the new tier and true is returned. On failure or exception the batch
-   * retains its original representation and state.
+   * is moved to the new tier and a vector of bytes per target space is returned.
+   * On failure the batch retains its original representation.
+   *
+   * Lock semantics (post-#117): a non-blocking exclusive accessor is taken via
+   * try_to_mutable(). If the batch is currently locked by another consumer
+   * (read_only or mutable), this call returns std::nullopt without converting.
+   * On success, the exclusive lock is held for the duration of the conversion
+   * and released when the local accessor goes out of scope (RAII).
    *
    * @param target_spaces  Candidate memory spaces to convert into (tried in order).
    * @param stream         CUDA stream for asynchronous memory operations.
@@ -78,54 +86,56 @@ class convertible_data_batch : public convertible_data {
     rmm::cuda_stream_view stream,
     sirius::memory::sirius_memory_reservation_manager& res_mgr) override
   {
-    auto prev_state = _batch->get_state();
+    if (!_batch) { return std::nullopt; }
 
-    if (!_batch->try_to_lock_for_in_transit()) { return std::nullopt; }
+    // Non-blocking exclusive lock: equivalent to the pre-#117 transit-lock
+    // gate. If another consumer (read_only_data_batch or mutable_data_batch) is
+    // currently holding the batch, skip conversion. RAII destruction of `mut`
+    // releases the exclusive lock on every exit path (success, failure, exception).
+    auto mut_opt = _batch->try_to_mutable();
+    if (!mut_opt) { return std::nullopt; }
+    auto& mut = *mut_opt;
 
-    try {
-      auto data_size = _batch->get_data()->get_size_in_bytes();
+    auto* data = mut.get_data();
+    if (!data) { return std::nullopt; }
+    auto data_size = data->get_size_in_bytes();
 
-      for (std::size_t idx = 0; idx < target_spaces.size(); ++idx) {
-        const auto* space = target_spaces[idx];
-        auto* mem_space   = res_mgr.get_memory_space(space->get_tier(), space->get_id().device_id);
-        if (!mem_space) { continue; }
+    for (std::size_t idx = 0; idx < target_spaces.size(); ++idx) {
+      const auto* space = target_spaces[idx];
+      auto* mem_space   = res_mgr.get_memory_space(space->get_tier(), space->get_id().device_id);
+      if (!mem_space) { continue; }
 
-        // Non-blocking reservation
-        auto reservation = mem_space->make_reservation_or_null(data_size);
+      // Non-blocking reservation
+      auto reservation = mem_space->make_reservation_or_null(data_size);
 
-        if (!reservation) { continue; }
+      if (!reservation) { continue; }
 
-        auto& converter_registry = sirius::converter_registry::get();
+      auto& converter_registry = sirius::converter_registry::get();
 
-        switch (space->get_tier()) {
-          case cucascade::memory::Tier::GPU:
-            _batch->convert_to<cucascade::gpu_table_representation>(
-              converter_registry, mem_space, stream);
-            break;
-          case cucascade::memory::Tier::HOST:
-            _batch->convert_to<cucascade::host_data_representation>(
-              converter_registry, mem_space, stream);
-            break;
-          case cucascade::memory::Tier::DISK:
-            _batch->convert_to<cucascade::disk_data_representation>(
-              converter_registry, mem_space, stream);
-            break;
-          default: continue;
-        }
-
-        _batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
-        std::vector<std::size_t> bytes_per_target(target_spaces.size(), 0);
-        bytes_per_target[idx] = data_size;
-        return bytes_per_target;
+      switch (space->get_tier()) {
+        case cucascade::memory::Tier::GPU:
+          mut.convert_to<cucascade::gpu_table_representation>(
+            converter_registry, mem_space, stream);
+          break;
+        case cucascade::memory::Tier::HOST:
+          mut.convert_to<cucascade::host_data_representation>(
+            converter_registry, mem_space, stream);
+          break;
+        case cucascade::memory::Tier::DISK:
+          mut.convert_to<cucascade::disk_data_representation>(
+            converter_registry, mem_space, stream);
+          break;
+        default: continue;
       }
 
-      // No target space succeeded
-      _batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
-      return std::nullopt;
-    } catch (...) {
-      _batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
-      throw;
+      std::vector<std::size_t> bytes_per_target(target_spaces.size(), 0);
+      bytes_per_target[idx] = data_size;
+      return bytes_per_target;
+      // mut destroyed here → exclusive lock released
     }
+
+    // No target space succeeded; mut destroyed → exclusive lock released
+    return std::nullopt;
   }
 
   /**
@@ -136,7 +146,12 @@ class convertible_data_batch : public convertible_data {
    */
   std::size_t bytes_in_space(cucascade::memory::memory_space* space) const override
   {
-    if (_batch->get_memory_space() == space) { return _batch->get_data()->get_size_in_bytes(); }
+    if (!_batch) { return 0; }
+    // R2 read-only accessor scoped to this single read.
+    auto ro = _batch->to_read_only();
+    if (ro.get_memory_space() == space && ro.get_data() != nullptr) {
+      return ro.get_data()->get_size_in_bytes();
+    }
     return 0;
   }
 
@@ -151,8 +166,10 @@ class convertible_data_batch : public convertible_data {
  * state and matching memory_space. The default iteration order is last-to-first
  * (back-to-front) for both partitions and batches, matching the downgrade eviction
  * pattern of preferring the most recently added data.
- * NOTE: We can technically convert data_batches that have had a task created, but those
- * data_batches should be pulled from the task queue
+ *
+ * Note (post-#117): "idle" here means batch_state::idle — i.e. no reader or writer
+ * accessor is currently held. A locked batch is not eligible for downgrade until
+ * its accessor is released; downstream code path handles polling.
  */
 class convertible_data_batch_provider : public convertible_data_provider {
  public:
@@ -242,7 +259,9 @@ class convertible_data_batch_provider : public convertible_data_provider {
    * @brief Get the total byte size of all batches in the given memory space.
    *
    * Iterates all partitions front-to-back, summing bytes for batches residing
-   * in the specified space.
+   * in the specified space. Each access is mediated through a scoped read-only
+   * accessor (R2): the shared lock is held only for the duration of the size
+   * read on that single batch.
    *
    * @param space The memory space to query.
    * @return Total size in bytes.
@@ -255,10 +274,13 @@ class convertible_data_batch_provider : public convertible_data_provider {
     for (std::size_t p = 0; p < num_parts; ++p) {
       auto batch_ids = _repo->get_batch_ids(p);
       for (auto batch_id : batch_ids) {
-        auto batch = _repo->get_data_batch_by_id(batch_id, std::nullopt, p);
-        if (batch && batch->get_memory_space() == space) {
-          total += batch->get_data()->get_size_in_bytes();
+        auto batch = _repo->get_data_batch_by_id(batch_id, p);
+        if (!batch) { continue; }
+        auto ro = batch->to_read_only();
+        if (ro.get_memory_space() == space && ro.get_data() != nullptr) {
+          total += ro.get_data()->get_size_in_bytes();
         }
+        // ro destroyed → shared lock released
       }
     }
 
@@ -269,6 +291,12 @@ class convertible_data_batch_provider : public convertible_data_provider {
   /**
    * @brief Try to get a matching batch by id, checking idle state and memory space.
    *
+   * Lock-free state probe via data_batch::get_state() (lock-free public API);
+   * memory-space check via a scoped read-only accessor (R2). The accessor is
+   * dropped before constructing the convertible_data_batch wrapper so the
+   * downstream convert() call can take its own exclusive accessor without
+   * contending against this transient shared lock.
+   *
    * @param batch_id       The batch ID to retrieve.
    * @param partition_idx  The partition containing the batch.
    * @param space          The target memory space to match.
@@ -278,14 +306,19 @@ class convertible_data_batch_provider : public convertible_data_provider {
                                                   std::size_t partition_idx,
                                                   cucascade::memory::memory_space* space) const
   {
-    auto batch = _repo->get_data_batch_by_id(batch_id, std::nullopt, partition_idx);
+    auto batch = _repo->get_data_batch_by_id(batch_id, partition_idx);
     if (!batch) { return nullptr; }
 
-    if (batch->get_state() == cucascade::batch_state::idle && batch->get_memory_space() == space) {
-      return std::make_unique<convertible_data_batch>(std::move(batch));
-    }
+    // Lock-free state probe.
+    if (batch->get_state() != cucascade::batch_state::idle) { return nullptr; }
 
-    return nullptr;
+    // Scoped read-only accessor for memory_space probe.
+    {
+      auto ro = batch->to_read_only();
+      if (ro.get_memory_space() != space) { return nullptr; }
+    }  // ro released here before constructing the wrapper
+
+    return std::make_unique<convertible_data_batch>(std::move(batch));
   }
 
   cucascade::shared_data_repository* _repo;
