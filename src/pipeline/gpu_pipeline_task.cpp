@@ -50,7 +50,9 @@ void validate_operator_output_types(const op::operator_data* data,
   for (size_t batch_index = 0; batch_index < batches.size(); batch_index++) {
     const auto& batch = batches[batch_index];
     if (!batch) { continue; }
-    cudf::table_view tbl = get_cudf_table_view(*batch);
+    // R2 read-only accessor scoped to this single inspection of the batch's columns.
+    auto ro              = batch->to_read_only();
+    cudf::table_view tbl = get_cudf_table_view(ro);
     if (static_cast<size_t>(tbl.num_columns()) != expected_types.size()) {
       // bobbi (todo): delim join will return this warning for now, but there is no bug here, so we
       // can ignore it. we can do something about this after gtc
@@ -102,9 +104,12 @@ void log_operator_data(const op::sirius_physical_operator& op,
   std::string batch_rows = "";
   size_t total_bytes     = 0;
   for (auto& batch : pipelineable_data->get_data_batches()) {
-    auto view = get_cudf_table_view(*batch);
+    if (!batch) { continue; }
+    // R2 read-only accessor scoped to this single batch.
+    auto ro    = batch->to_read_only();
+    auto view  = get_cudf_table_view(ro);
     batch_rows += std::to_string(view.num_rows()) + "  ";
-    total_bytes += batch->get_data()->get_size_in_bytes();
+    if (ro.get_data()) { total_bytes += ro.get_data()->get_size_in_bytes(); }
   }
   SIRIUS_LOG_TRACE(
     "Pipeline {}: operator {} (id={}) {} {} batches, num rows: {}, "
@@ -326,7 +331,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
 
   auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
 
-  std::optional<std::vector<cucascade::data_batch_processing_handle>> handles_opt;
+  std::optional<std::vector<::cucascade::mutable_data_batch>> handles_opt;
   try {
     handles_opt =
       local_state._input_data.get()->prepare_for_processing(requested_memory_space, stream);
@@ -352,7 +357,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     throw oom_reschedule_exception(
       std::move(local_state._input_data), 0, "Failed to lock or prepare batches for processing");
   }
-  std::vector<cucascade::data_batch_processing_handle> processing_handles = std::move(*handles_opt);
+  std::vector<::cucascade::mutable_data_batch> processing_handles = std::move(*handles_opt);
 
   auto const prepare_end = std::chrono::high_resolution_clock::now();
   auto const prepare_duration =
@@ -387,7 +392,10 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
       dynamic_cast<const op::pipelineable_operator_data*>(output_data.get());
     if (pipelineable_output) {
       for (const auto& batch : pipelineable_output->get_data_batches()) {
-        if (batch && batch->get_data()) { output_bytes += batch->get_data()->get_size_in_bytes(); }
+        if (!batch) { continue; }
+        // R2 read-only accessor scoped to this single output-size read.
+        auto ro = batch->to_read_only();
+        if (ro.get_data()) { output_bytes += ro.get_data()->get_size_in_bytes(); }
       }
     }
     global.get_memory_history().record({input_basis, peak_bytes, output_bytes});
@@ -416,8 +424,10 @@ std::size_t gpu_pipeline_task::get_input_size() const
     dynamic_cast<const op::pipelineable_operator_data*>(local_state._input_data.get());
   if (!pipelineable_input) { return 0; }
   for (const auto& batch : pipelineable_input->get_data_batches()) {
-    if (!batch || !batch->get_data()) { continue; }
-    input_size += batch->get_data()->get_size_in_bytes();
+    if (!batch) { continue; }
+    // R2 read-only accessor scoped to this single input-size read.
+    auto ro = batch->to_read_only();
+    if (ro.get_data()) { input_size += ro.get_data()->get_size_in_bytes(); }
   }
   return input_size;
 }

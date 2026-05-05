@@ -183,7 +183,11 @@ class scan_cached_operator_data : public op::operator_data {
 
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
   {
-    return batch->get_data()->cast<cucascade::gpu_table_representation>().get_size_in_bytes();
+    if (!batch) { return 0; }
+    // R2 read-only accessor scoped to the single size read on the cached batch.
+    auto ro = batch->to_read_only();
+    if (!ro.get_data()) { return 0; }
+    return ro.get_data()->cast<cucascade::gpu_table_representation>().get_size_in_bytes();
   }
 
   /// Cached data batch viewed by the scan. Owning shared_ptr keeps the pinned

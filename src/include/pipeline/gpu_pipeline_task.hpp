@@ -121,10 +121,13 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
       dynamic_cast<const op::pipelineable_operator_data*>(_input_data.get());
     if (pipelineable_input) {
       for (const auto& batch : pipelineable_input->get_data_batches()) {
-        if (batch && batch->get_data() &&
-            batch->get_data()->get_current_tier() != cucascade::memory::Tier::GPU) {
-          input_size += batch->get_data()->get_uncompressed_data_size_in_bytes();
+        if (!batch) { continue; }
+        // R2 read-only accessor scoped to this single batch's size read.
+        auto ro = batch->to_read_only();
+        if (ro.get_data() && ro.get_data()->get_current_tier() != cucascade::memory::Tier::GPU) {
+          input_size += ro.get_data()->get_uncompressed_data_size_in_bytes();
         }
+        // ro released at end of loop iteration
       }
     }
     return input_size;

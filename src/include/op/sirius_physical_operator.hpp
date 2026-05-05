@@ -188,9 +188,11 @@ class pipelineable_operator_data : public operator_data {
   {
     std::size_t total = 0;
     for (auto const& batch : _data_batches) {
-      if (batch && batch->get_data()) {
-        total += batch->get_data()->get_uncompressed_data_size_in_bytes();
-      }
+      if (!batch) { continue; }
+      // R2 read-only accessor scoped to this single batch's size read.
+      auto ro = batch->to_read_only();
+      if (ro.get_data()) { total += ro.get_data()->get_uncompressed_data_size_in_bytes(); }
+      // ro released at end of loop iteration
     }
     return total;
   }
