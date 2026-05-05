@@ -113,7 +113,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
   4. Phase 13 stream-lineage extraction is complete: `17-MERGE-LOG.md` documents the extracted attachment points for `writer_stream` / `writer_event` from the deleted `sirius_parquet_metadata_scan_operator.hpp`, with re-attachment target identified as `parquet_split_provider.cpp` or `sirius_gpu_parquet_scan_operator.cpp` (MERGE-03).
   5. Build error count is bounded and recorded in `17-MERGE-LOG.md`: expected 26+ `batch->get_data() is private` errors plus RAII compile errors; zero unrelated build errors outside the DataBatch migration surface (MERGE-05).
 **Plans**: 4 plans
-- [ ] 17-01-PLAN.md — Pre-merge setup: backup ref + Phase 13 stream-lineage extraction + audit log skeleton (MERGE-03)
+- [x] 17-01-PLAN.md — Pre-merge setup: backup ref + Phase 13 stream-lineage extraction + audit log skeleton (MERGE-03)
 - [ ] 17-02-PLAN.md — Execute git merge --no-ff origin/dev + resolve 11 conflict files per D-D1..D-D6 + cucascade pin defense (MERGE-01, MERGE-02, MERGE-04)
 - [ ] 17-03-PLAN.md — Auto-merge audit (33 files) + SCHED-RR survival + build error bounding (MERGE-05)
 - [ ] 17-04-PLAN.md — Run all 6 D-G verification gates + final Phase 17 Verdict (MERGE-01..05 final)
@@ -204,7 +204,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 | 14. Land SCHED-RR distribution | v1.3 | 2/2 | Complete | 2026-04-30 |
 | 15. Cross-GPU operator-colocation audit | v1.3 | 4/4 | Complete | 2026-05-01 |
 | 16. Cucascade Submodule Rebase + Pin Recovery | v1.4 | 5/5 | Complete    | 2026-05-05 |
-| 17. Sirius origin/dev Merge — Base Layer | v1.4 | 0/4 | Planned | - |
+| 17. Sirius origin/dev Merge — Base Layer | v1.4 | 1/4 | In Progress|  |
 | 18. DataBatch RAII Migration | v1.4 | 0/? | Not started | - |
 | 19. IO Framework Adoption | v1.4 | 0/? | Not started | - |
 | 20. Scan Manager + Pin Tables Port | v1.4 | 0/? | Not started | - |

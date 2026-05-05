@@ -24,7 +24,7 @@
 
 - [ ] **MERGE-01**: `origin/dev` merged into `feature/single-node-multi-gpu2` (7 commits absorbed: #739 cucascade-compat, #675 IO Framework, #731 Scan Manager, #721 Pin Tables, #733 dedup, #734/#735 CI). Land as one or more atomic commits with clear conflict-resolution attribution.
 - [ ] **MERGE-02**: All 11 conflict files resolved mechanically (CMakeLists.txt, `cucascade` submodule pin, `src/expression_executor/gpu_expression_executor.cpp`, `src/include/creator/task_creator.hpp`, `src/include/exec/config.hpp`, `src/include/op/scan/parquet_scan_operator_data.hpp`, `src/op/scan/sirius_gpu_parquet_scan_operator.cpp`, `src/op/sirius_physical_table_scan.cpp`, `src/pipeline/sirius_pipeline_converter.cpp`, `src/scan_manager/parquet_split_provider.cpp`). 33 auto-merge files inspected for semantic conflict and either accepted or annotated with TODOs scoped to Phase 18-20.
-- [ ] **MERGE-03**: `sirius_parquet_metadata_scan_operator.hpp` modify/delete conflict: Phase 13 stream-lineage hooks (writer_stream wiring, writer_event acquisition) extracted to a holding location (e.g., a comment stub in `parquet_split_provider.cpp` or a temporary `phase13-extract.md` planning doc) BEFORE accepting the deletion. Re-attachment scheduled for SM-03.
+- [x] **MERGE-03**: `sirius_parquet_metadata_scan_operator.hpp` modify/delete conflict: Phase 13 stream-lineage hooks (writer_stream wiring, writer_event acquisition) extracted to a holding location (e.g., a comment stub in `parquet_split_provider.cpp` or a temporary `phase13-extract.md` planning doc) BEFORE accepting the deletion. Re-attachment scheduled for SM-03.
 - [ ] **MERGE-04**: PR #739 cherry-pick is NOT performed in this phase. `git log --oneline --grep "Compat/update cucascade"` post-merge shows the dev commit absorbed, but its file changes are still TODO until DB-03 lands them on the post-#117 RAII shape.
 - [ ] **MERGE-05**: Build error count is bounded and documented (expected: 26+ `batch->get_data()` private-access errors + new RAII compile errors); zero unrelated build errors. Recorded in `17-MERGE-LOG.md`.
 
@@ -101,7 +101,7 @@
 | CC-04 | 16 | Complete |
 | MERGE-01 | 17 | Pending |
 | MERGE-02 | 17 | Pending |
-| MERGE-03 | 17 | Pending |
+| MERGE-03 | 17 | Complete |
 | MERGE-04 | 17 | Pending |
 | MERGE-05 | 17 | Pending |
 | DB-01 | 18 | Pending |

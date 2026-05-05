@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Rebase After DataBatch Changes
 status: verifying
-stopped_at: Completed 16-05-PLAN.md — ctest PASS, 8 grep gates green, pin confirmed at 1c1e648, Phase 16 COMPLETE
-last_updated: "2026-05-05T13:10:56.045Z"
+stopped_at: Completed 17-01-PLAN.md — backup ref + Phase 13 extract + merge log skeleton seeded
+last_updated: "2026-05-05T13:43:04.633Z"
 last_activity: 2026-05-05
 progress:
   total_phases: 6
   completed_phases: 1
-  total_plans: 5
-  completed_plans: 5
+  total_plans: 9
+  completed_plans: 6
 ---
 
 # Project State
@@ -82,6 +82,7 @@ v1.4 Progress: [                    ] 0/6 phases | 0/32 requirements | 0 plans
 | Phase 16 P03 | 15 | 2 tasks | 4 files |
 | Phase 16-cucascade-submodule-rebase-pin-recovery P04 | 45 | 5 tasks | 12 files |
 | Phase 16 P05 | 15min | 3 tasks | 2 files |
+| Phase 17 P01 | 8min | 2 tasks | 2 files |
 
 ## Decisions
 
@@ -149,6 +150,9 @@ v1.4 Progress: [                    ] 0/6 phases | 0/32 requirements | 0 plans
 - [Phase 16-04]: Benchmark ctor sites: stream.view() from local rmm::cuda_stream for setup/warmup; rmm::cuda_stream_view{} for thread-pool reprs created before streams are assigned
 - [Phase 16-05]: Pin advance was pre-committed in 16-04 docs commit (5d1a8e0): gitlink 995bf4e -> 1c1e648; no separate pin-advance commit needed in 16-05
 - [Phase 16-05]: All 8 grep gates and 5 ROADMAP Phase 16 success criteria confirmed PASS; cucascade ctest 100% passed (1/1, 13.91s, exit 0); CC-01..04 all satisfied; Phase 16 ship gate CLOSED
+- [Phase 17]: D-A2: Created phase17-pre-merge-backup ref at 98cdea20 as the D-A4 abort lifeline before origin/dev merge
+- [Phase 17]: D-C1/C2: Extracted full sirius_parquet_metadata_scan_operator.hpp (232 lines) with stream-lineage context into 17-PHASE-13-EXTRACT.md; re-attachment targets identified for Phase 20 SM-03
+- [Phase 17]: D-G5: Seeded 17-MERGE-LOG.md with Sections A-E covering 11 conflict files, 33 auto-merge audit, build error bounding, 8 verification gates, and PR #739 bookkeeping note
 
 ## Accumulated Context
 
@@ -184,6 +188,6 @@ None at roadmap creation. Phase 16 is ready to plan.
 
 ## Session Continuity
 
-Last session: 2026-05-05T12:34:12.918Z
-Stopped at: Completed 16-05-PLAN.md — ctest PASS, 8 grep gates green, pin confirmed at 1c1e648, Phase 16 COMPLETE
+Last session: 2026-05-05T13:43:04.630Z
+Stopped at: Completed 17-01-PLAN.md — backup ref + Phase 13 extract + merge log skeleton seeded
 Resume file: None
