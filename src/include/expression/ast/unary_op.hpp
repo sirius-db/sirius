@@ -36,14 +36,20 @@ struct node;
  * (`coalesce`, `in_list`) because their operand structure differs.
  */
 struct unary_op {
+  /// `invalid` is the default-constructed value so a unary_op whose `op` was
+  /// never set is detectable rather than silently behaving as IS NULL.
+  /// Real operators carry an `op_` prefix; this avoids C++ keyword collisions
+  /// (`not`, `try` are alternative tokens) without resorting to a trailing
+  /// underscore on only some values, and keeps every operator visually uniform.
   enum class kind : uint8_t {
-    not_,
-    is_null,
-    is_not_null,
-    try_,
+    invalid,
+    op_not,
+    op_is_null,
+    op_is_not_null,
+    op_try,
   };
 
-  kind op{kind::is_null};
+  kind op{kind::invalid};
   std::unique_ptr<node> child;
 };
 

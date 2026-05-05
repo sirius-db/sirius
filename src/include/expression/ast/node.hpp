@@ -24,20 +24,6 @@
 
 namespace sirius::ast {
 
-// Forward declarations of each node kind. Each per-node header
-// defines its struct and may hold std::unique_ptr<node> members.
-struct reference;
-struct constant;
-struct comparison;
-struct conjunction;
-struct between;
-struct case_expr;
-struct cast;
-struct unary_op;
-struct coalesce;
-struct in_list;
-struct function_call;
-
 // Forward declaration of node as a struct (not a type alias).
 // std::variant cannot contain an incomplete type, so `node` must wrap the
 // variant inside a struct that CAN be forward-declared. The per-node headers
@@ -47,10 +33,9 @@ struct node;
 
 }  // namespace sirius::ast
 
-// Completing includes — each per-node header defines its struct. Structs that
-// hold std::unique_ptr<node> or std::vector<std::unique_ptr<node>> work with
-// the forward declaration above because unique_ptr<T> does not require T to be
-// a complete type at member-declaration time.
+// Per-node headers complete each alternative type below. Each header carries
+// its own `struct node;` forward declaration so it can hold
+// std::unique_ptr<node> children without depending on this file's ordering.
 #include "expression/ast/between.hpp"
 #include "expression/ast/case_expr.hpp"
 #include "expression/ast/cast.hpp"
@@ -77,8 +62,10 @@ namespace sirius::ast {
  *      the variant is instantiated. Since the variant is defined here — after
  *      all per-node headers are included — every alternative is complete.
  *
- * The alternative order is part of the public ABI — std::variant indexes by
- * position and Phase 5's std::visit dispatch depends on this ordering.
+ * The alternative order is part of the public ABI: std::variant indexes its
+ * alternatives by position, and downstream std::visit dispatch (added by the
+ * dual-path executor work, sirius-db/sirius#698) depends on this ordering.
+ * Inserting a new alternative MUST happen at the end to preserve the index.
  */
 struct node {
   using variant_t = std::variant<reference,

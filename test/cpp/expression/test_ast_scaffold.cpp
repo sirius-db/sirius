@@ -25,6 +25,7 @@
 #include "catch.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/join_condition.hpp"
+#include "helper/logical_type.hpp"
 
 #include <memory>
 #include <type_traits>
@@ -93,13 +94,19 @@ TEST_CASE("ast_scaffold - comparison holds recursive children", "[ast_scaffold]"
 TEST_CASE("ast_scaffold - conjunction holds N-ary children", "[ast_scaffold]")
 {
   conjunction conj;
-  conj.op = conjunction::kind::and_;
+  conj.op = conjunction::kind::op_and;
   conj.children.push_back(std::make_unique<node>(reference{0}));
   conj.children.push_back(std::make_unique<node>(reference{1}));
   conj.children.push_back(std::make_unique<node>(reference{2}));
   REQUIRE(conj.children.size() == 3);
   node n{std::move(conj)};
   REQUIRE(n.holds<conjunction>());
+}
+
+TEST_CASE("ast_scaffold - conjunction op defaults to invalid sentinel", "[ast_scaffold]")
+{
+  conjunction conj;
+  REQUIRE(conj.op == conjunction::kind::invalid);
 }
 
 TEST_CASE("ast_scaffold - between holds three children and inclusivity flags", "[ast_scaffold]")
@@ -138,24 +145,39 @@ TEST_CASE("ast_scaffold - case_expr holds when/then pairs and an else clause", "
 TEST_CASE("ast_scaffold - cast holds child, target type, and try flag", "[ast_scaffold]")
 {
   cast cst;
-  cst.child    = std::make_unique<node>(reference{0});
-  cst.try_cast = true;
-  // target_type default-constructs to type_id::SQLNULL (see helper/logical_type.hpp).
+  cst.child       = std::make_unique<node>(reference{0});
+  cst.try_cast    = true;
+  cst.target_type = sirius::logical_type::make(sirius::type_id::BIGINT);
   REQUIRE(cst.child);
   REQUIRE(cst.try_cast);
+  REQUIRE(cst.target_type.id() == sirius::type_id::BIGINT);
   node n{std::move(cst)};
   REQUIRE(n.holds<cast>());
+  REQUIRE(n.get<cast>().target_type.id() == sirius::type_id::BIGINT);
+}
+
+TEST_CASE("ast_scaffold - cast target_type defaults to SQLNULL placeholder", "[ast_scaffold]")
+{
+  cast cst;
+  REQUIRE(cst.target_type.id() == sirius::type_id::SQLNULL);
+  REQUIRE_FALSE(cst.try_cast);
 }
 
 TEST_CASE("ast_scaffold - unary_op wraps a single child", "[ast_scaffold]")
 {
   unary_op u;
-  u.op    = unary_op::kind::is_null;
+  u.op    = unary_op::kind::op_is_null;
   u.child = std::make_unique<node>(reference{0});
-  REQUIRE(u.op == unary_op::kind::is_null);
+  REQUIRE(u.op == unary_op::kind::op_is_null);
   REQUIRE(u.child);
   node n{std::move(u)};
   REQUIRE(n.holds<unary_op>());
+}
+
+TEST_CASE("ast_scaffold - unary_op op defaults to invalid sentinel", "[ast_scaffold]")
+{
+  unary_op u;
+  REQUIRE(u.op == unary_op::kind::invalid);
 }
 
 TEST_CASE("ast_scaffold - coalesce holds N-ary children", "[ast_scaffold]")
@@ -220,7 +242,7 @@ TEST_CASE("ast_scaffold - deeper tree (conjunction of comparisons) destructs cle
           "[ast_scaffold]")
 {
   conjunction conj;
-  conj.op = conjunction::kind::or_;
+  conj.op = conjunction::kind::op_or;
   for (uint32_t i = 0; i < 3; ++i) {
     comparison c;
     c.op    = sirius::comparison_type::equal;

@@ -31,12 +31,18 @@ struct node;
  * Matches DuckDB's N-ary structure — do not collapse to a binary tree.
  */
 struct conjunction {
+  /// `invalid` is the default-constructed value so a conjunction whose `op`
+  /// was never set is detectable rather than silently behaving as AND.
+  /// Real operators carry an `op_` prefix; this avoids C++ keyword collisions
+  /// (`and`, `or` are alternative tokens) without resorting to a trailing
+  /// underscore on only some values, and keeps every operator visually uniform.
   enum class kind : uint8_t {
-    and_,
-    or_,
+    invalid,
+    op_and,
+    op_or,
   };
 
-  kind op{kind::and_};
+  kind op{kind::invalid};
   std::vector<std::unique_ptr<node>> children;
 };
 
