@@ -39,10 +39,33 @@
       "rows": 4194304,
       "type": "int64",
       "write_throughput_gib_s": 252.7
+    },
+    "rle_long_runs_int64": {
+      "_note": "Pending measurement on sm_75. PR 3 will populate.",
+      "rows": 0,
+      "type": "int64",
+      "entries_per_seg": 16,
+      "write_throughput_gib_s": null
+    },
+    "rle_medium_runs_int64": {
+      "_note": "Pending measurement on sm_75. PR 3 will populate. cumsum fits in shmem (4 KiB).",
+      "rows": 0,
+      "type": "int64",
+      "entries_per_seg": 1024,
+      "write_throughput_gib_s": null
+    },
+    "rle_short_runs_int32_gmem": {
+      "_note": "Pending measurement on sm_75. PR 3 will populate. cumsum > RLE_SMEM_MAX_ENTRIES → gmem-binary-search path.",
+      "rows": 0,
+      "type": "int32",
+      "entries_per_seg": 8192,
+      "write_throughput_gib_s": null
     }
   },
   "tunables": {
     "COPY_CHUNK_BYTES": 65536,
-    "_note": "Per-CTA work bound for the chunked memcpy kernel. Tuned on Turing; re-measure on Ampere/Hopper if those become primary."
+    "RLE_ROWS_PER_CHUNK": 2048,
+    "RLE_SMEM_MAX_ENTRIES": 4096,
+    "_note": "Per-CTA work bound for the chunked memcpy kernel. Tuned on Turing; re-measure on Ampere/Hopper if those become primary. RLE_SMEM_MAX_ENTRIES caps per-CTA shmem cumsum cache at 16 KiB; chunks above this fall back to gmem-binary-search."
   }
 }
