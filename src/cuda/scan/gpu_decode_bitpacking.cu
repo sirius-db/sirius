@@ -56,7 +56,8 @@
 #include <rmm/detail/error.hpp>
 #include <rmm/device_uvector.hpp>
 
-#include <cub/block/block_scan.cuh>
+#include <cub/warp/warp_scan.cuh>
+#include <cuda_pipeline.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -350,13 +351,30 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
   uint8_t const* packed_bytes = seg_base + sm_data_offset;
   uint32_t packed_words       = (rc * width + 31u) / 32u;
 
-  for (uint32_t i = threadIdx.x; i < packed_words; i += blockDim.x) {
-    memcpy(&shmem[i], packed_bytes + i * sizeof(uint32_t), sizeof(uint32_t));
+  // Stage the packed-bytes slice into shmem via `cp.async.ca.shared.global`
+  // (sm_80+) instead of scalar memcpy through registers. Try 16-byte loads
+  // when both source and destination are 16-byte aligned and the word count
+  // is a multiple of 4; fall back to 4-byte loads otherwise. The branch is
+  // uniform across the CTA (sm_data_offset is broadcast through shmem) so
+  // there's no warp divergence.
+  uintptr_t const src_addr = reinterpret_cast<uintptr_t>(packed_bytes);
+  bool const can_use_16b   = (src_addr & 15u) == 0 && (packed_words & 3u) == 0;
+  if (can_use_16b) {
+    uint32_t const quad_count = packed_words >> 2;  // packed_words / 4
+    for (uint32_t i = threadIdx.x; i < quad_count; i += blockDim.x) {
+      __pipeline_memcpy_async(
+        &shmem[i * 4], packed_bytes + i * 16u, 16);
+    }
+  } else {
+    for (uint32_t i = threadIdx.x; i < packed_words; i += blockDim.x) {
+      __pipeline_memcpy_async(
+        &shmem[i], packed_bytes + i * sizeof(uint32_t), sizeof(uint32_t));
+    }
   }
-  // Guard word so 3-word `unpack_value` reads don't pull garbage past the
-  // packed stream (the segment may have less than 4 bytes of trailing slack
-  // in the worst case of width close to sizeof(T)*8).
+  // Guard word — set after async-copy issue; wait below covers both.
   if (threadIdx.x == 0) shmem[packed_words] = 0u;
+  __pipeline_commit();
+  __pipeline_wait_prior(0);
   __syncthreads();
 
   if (mode == BitpackingMode::FOR) {
