@@ -90,7 +90,16 @@ jobs:
         run: tar -xf build.tar
 
       - name: Run C++ unit tests
-        run: ./build/release/extension/sirius/test/cpp/sirius_unittest --abort
+        run: timeout 45m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort
+
+      - name: Upload unit test logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unittest-logs-${{ github.run_id }}
+          path: build/release/extension/sirius/test/cpp/log/
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Prepare SQL test datasets
         run: |
