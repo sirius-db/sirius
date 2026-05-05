@@ -289,7 +289,11 @@ std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
     cloned_batches.reserve(batches.size());
     if (is_duckdb_scan) {
       for (auto& batch : batches) {
-        cloned_batches.push_back(batch->clone(get_next_batch_id(), stream));
+        // Phase 18 / DB-02 Recipe R1: clone() moved off data_batch onto the
+        // accessors under cucascade #117. Take a scoped read-only accessor
+        // (concurrent shared locks are permitted) and clone through it.
+        auto ro = batch->to_read_only();
+        cloned_batches.push_back(ro.clone(get_next_batch_id(), stream));
       }
     } else if (is_parquet_scan) {
       for (auto& batch : batches) {

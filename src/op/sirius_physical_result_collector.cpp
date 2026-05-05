@@ -169,7 +169,14 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       auto& mem_space     = reservation->get_memory_space();
       auto& data_repo_mgr = sirius_ctx->get_data_repository_manager();
       auto next_batch_id  = data_repo_mgr.get_next_data_batch_id();
-      clone_batch         = input_batch->clone(next_batch_id, stream);
+      // Recipe R1: clone() moved off data_batch onto the accessors under
+      // cucascade #117. Take a scoped read-only accessor on input_batch and
+      // clone through it. The accessor is dropped before the to_mutable() on
+      // the freshly-cloned batch (P1: distinct batch, no lock overlap).
+      {
+        auto ro_clone_src = input_batch->to_read_only();
+        clone_batch       = ro_clone_src.clone(next_batch_id, stream);
+      }  // ro_clone_src destroyed -> shared lock on input_batch released.
       // Recipe R3: post-clone in-place conversion. `clone_batch` is brand-new
       // (idle, no lock contention), so to_mutable() succeeds immediately. The
       // pre-#117 `data_batch::convert_to` moved to mutable_data_batch under
