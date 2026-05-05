@@ -31,6 +31,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
@@ -71,15 +72,28 @@ class dummy_task : public sirius::parallel::itask {
 };
 
 /// Helper: create a gpu_pipeline_task with the given data batches.
-/// If set_task_created is true, calls try_to_create_task() on each batch.
+///
+/// Phase 18 / DB-03 — Pitfall 5: cucascade #117 removed the FSM
+/// (idle/task_created/processing); only idle/read_only/mutable_locked remain.
+/// The pre-#117 try_to_create_task() FSM transition is gone — fresh batches
+/// are already in `idle` state by construction. The
+/// convertible_gpu_pipeline_task predicate now matches `idle` directly
+/// (see src/include/data/convertible_gpu_pipeline_task.hpp:128). The
+/// `non_idle_state` parameter (formerly `set_task_created`) lets a test
+/// hold a mutable accessor on each batch to make them non-idle and verify
+/// the predicate skips them.
 std::unique_ptr<sirius::pipeline::gpu_pipeline_task> make_test_gpu_task(
   uint64_t task_id,
   std::vector<std::shared_ptr<cucascade::data_batch>> batches,
-  bool set_task_created = true)
+  bool non_idle_state                                            = false,
+  std::vector<std::optional<cucascade::mutable_data_batch>>* mut_holder = nullptr)
 {
-  if (set_task_created) {
+  if (non_idle_state) {
     for (auto& b : batches) {
-      b->try_to_create_task();
+      auto opt = b->try_to_mutable();
+      if (mut_holder && opt.has_value()) {
+        mut_holder->emplace_back(std::move(*opt));
+      }
     }
   }
 
@@ -151,8 +165,11 @@ TEST_CASE("RAII returns task after successful convert", "[convertible_gpu_pipeli
   auto* pod = dynamic_cast<sirius::op::pipelineable_operator_data*>(ls->_input_data.get());
   REQUIRE(pod != nullptr);
   REQUIRE(pod->get_data_batches().size() == 1);
-  REQUIRE(pod->get_data_batches()[0]->get_memory_space()->get_tier() ==
-          cucascade::memory::Tier::HOST);
+  // Phase 18 / DB-03: get_memory_space is private under #117; access via accessor.
+  {
+    auto ro = pod->get_data_batches()[0]->to_read_only();
+    REQUIRE(ro.get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+  }
 }
 
 TEST_CASE("RAII returns task on exception", "[convertible_gpu_pipeline_task]")
@@ -219,16 +236,23 @@ TEST_CASE("wrong batch_state skipped by predicate", "[convertible_gpu_pipeline_t
   auto& e = env();
 
   sirius::exec::inspectable_mpsc<sirius::parallel::itask> queue;
-  // Create GPU task with batch in idle state (set_task_created=false)
+  // Phase 18 / DB-03 — Pitfall 5: under cucascade #117 the convertible
+  // predicate matches `idle`. To get a non-matching state we hold a
+  // mutable accessor on the batch (state -> mutable_locked) for the
+  // duration of the test. mut_holder keeps the accessor alive.
+  std::vector<std::optional<cucascade::mutable_data_batch>> mut_holder;
   auto batch = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{7, 8, 9}, cudf::type_id::INT32);
-  auto task = make_test_gpu_task(1, {batch}, false);  // idle state
+  auto task = make_test_gpu_task(1, {batch}, true, &mut_holder);
   queue.push(std::move(task));
 
   sirius::convertible_gpu_pipeline_task_provider provider(queue);
   auto cd = provider.get_next_convertible(e.gpu_space, false);
   REQUIRE(cd == nullptr);
   REQUIRE(queue.size() == 1);
+
+  // Release the mutable accessor so the test can clean up cleanly.
+  mut_holder.clear();
 }
 
 TEST_CASE("matching task selected by predicate", "[convertible_gpu_pipeline_task]")
@@ -263,8 +287,14 @@ TEST_CASE("convert GPU task to HOST", "[convertible_gpu_pipeline_task]")
 
   auto result = cd->convert({e.host_space}, e.stream(), *e.mgr);
   REQUIRE(result.has_value());
-  REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
-  REQUIRE(batch->get_state() == cucascade::batch_state::task_created);
+  // Phase 18 / DB-03: get_memory_space is private under #117; access via
+  // accessor. Pitfall 5: post-conversion state is `idle` (the FSM is gone;
+  // mutable accessor used internally was released after the convert).
+  {
+    auto ro = batch->to_read_only();
+    REQUIRE(ro.get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+  }
+  REQUIRE(batch->get_state() == cucascade::batch_state::idle);
 }
 
 TEST_CASE("bytes_in_space returns correct size", "[convertible_gpu_pipeline_task]")
@@ -277,8 +307,17 @@ TEST_CASE("bytes_in_space returns correct size", "[convertible_gpu_pipeline_task
   auto batch2 = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{4, 5, 6, 7, 8}, cudf::type_id::INT32);
 
-  auto batch1_size = batch1->get_data()->get_size_in_bytes();
-  auto batch2_size = batch2->get_data()->get_size_in_bytes();
+  // Phase 18 / DB-03: get_data is private under #117; access via accessor.
+  std::size_t batch1_size = 0;
+  std::size_t batch2_size = 0;
+  {
+    auto ro1    = batch1->to_read_only();
+    batch1_size = ro1.get_data()->get_size_in_bytes();
+  }
+  {
+    auto ro2    = batch2->to_read_only();
+    batch2_size = ro2.get_data()->get_size_in_bytes();
+  }
 
   auto task = make_test_gpu_task(1, {batch1, batch2});
   queue.push(std::move(task));

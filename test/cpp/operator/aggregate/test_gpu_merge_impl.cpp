@@ -48,15 +48,16 @@ memory_space* get_shared_mem_space()
 }
 
 /**
- * @brief Container for batches with their processing handles.
+ * @brief Container for batches with their RAII mutable accessors.
  *
- * In production, tasks hold processing handles while operating on batches
- * to prevent them from being downgraded. This struct keeps batches and handles
- * together so the handles remain in scope during processing.
+ * Phase 18 / DB-03 — Pitfall 5: cucascade #117 replaces
+ * data_batch_processing_handle with mutable_data_batch (RAII). Holding
+ * the accessor in scope is the equivalent of the old pinned-handle
+ * contract — prevents concurrent mutation / downgrade.
  */
 struct batches_with_handles {
   std::vector<std::shared_ptr<data_batch>> batches;
-  std::vector<data_batch_processing_handle> handles;
+  std::vector<cucascade::mutable_data_batch> handles;
 };
 
 batches_with_handles create_batches_with_random_data(
@@ -76,11 +77,11 @@ batches_with_handles create_batches_with_random_data(
     auto batch =
       sirius::make_data_batch(std::move(table), mem_space, cudf::get_default_stream());
 
-    // Acquire processing handle (like the old pin() call)
-    REQUIRE(batch->try_to_create_task());
-    auto lock_result = batch->try_to_lock_for_processing(mem_space.get_id());
-    REQUIRE(lock_result.success);
-    result.handles.emplace_back(std::move(lock_result.handle));
+    // Phase 18 / DB-03 Recipe R8: scoped mutable accessor replaces
+    // pre-#117 try_to_create_task + try_to_lock_for_processing pair.
+    auto mut_opt = batch->try_to_mutable();
+    REQUIRE(mut_opt.has_value());
+    result.handles.emplace_back(std::move(*mut_opt));
     result.batches.push_back(std::move(batch));
   }
   return result;
@@ -277,11 +278,11 @@ batches_with_handles create_batches_with_local_ungrouped_agg_result(
   for (int i = 0; i < num_batches; ++i) {
     auto batch = gpu_aggregate_impl::local_ungrouped_aggregate(
       base_input.batches[i], aggregates, aggregate_idx, cudf::get_default_stream(), mem_space);
-    // Acquire processing handle for the output batch
-    REQUIRE(batch->try_to_create_task());
-    auto lock_result = batch->try_to_lock_for_processing(mem_space.get_id());
-    REQUIRE(lock_result.success);
-    result.handles.emplace_back(std::move(lock_result.handle));
+    // Phase 18 / DB-03 Recipe R8: scoped mutable accessor replaces
+    // pre-#117 try_to_create_task + try_to_lock_for_processing pair.
+    auto mut_opt = batch->try_to_mutable();
+    REQUIRE(mut_opt.has_value());
+    result.handles.emplace_back(std::move(*mut_opt));
     result.batches.push_back(std::move(batch));
   }
   // base_input.handles will release when going out of scope (base batches no longer needed)
@@ -530,10 +531,11 @@ batches_with_handles create_batches_with_local_grouped_agg_result(
                                                              {},
                                                              cudf::get_default_stream(),
                                                              mem_space);
-    REQUIRE(batch->try_to_create_task());
-    auto lock_result = batch->try_to_lock_for_processing(mem_space.get_id());
-    REQUIRE(lock_result.success);
-    result.handles.emplace_back(std::move(lock_result.handle));
+    // Phase 18 / DB-03 Recipe R8: scoped mutable accessor replaces
+    // pre-#117 try_to_create_task + try_to_lock_for_processing pair.
+    auto mut_opt = batch->try_to_mutable();
+    REQUIRE(mut_opt.has_value());
+    result.handles.emplace_back(std::move(*mut_opt));
     result.batches.push_back(std::move(batch));
   }
 
@@ -816,10 +818,11 @@ batches_with_handles create_batches_with_local_orderby_result(
                                                 projections,
                                                 cudf::get_default_stream(),
                                                 mem_space);
-    REQUIRE(batch->try_to_create_task());
-    auto lock_result = batch->try_to_lock_for_processing(mem_space.get_id());
-    REQUIRE(lock_result.success);
-    result.handles.emplace_back(std::move(lock_result.handle));
+    // Phase 18 / DB-03 Recipe R8: scoped mutable accessor replaces
+    // pre-#117 try_to_create_task + try_to_lock_for_processing pair.
+    auto mut_opt = batch->try_to_mutable();
+    REQUIRE(mut_opt.has_value());
+    result.handles.emplace_back(std::move(*mut_opt));
     result.batches.push_back(std::move(batch));
   }
   return result;

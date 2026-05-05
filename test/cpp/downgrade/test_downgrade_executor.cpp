@@ -44,6 +44,7 @@
 #include <cmath>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <set>
 #include <unordered_map>
 #include <vector>
@@ -151,10 +152,16 @@ inline bool enable_p2p_for_test(int num_gpus)
  * Test-only; uses inline cudaMemcpyAsync + stream.synchronize() (not
  * CUCASCADE_CUDA_TRY) per test-code convention.
  */
-uint64_t compute_batch_checksum_fnv1a64(const cucascade::data_batch& batch,
+// Phase 18 / DB-03: const dropped from data_batch& parameter (mirrors the
+// debug_utils.hpp pattern from plan 18-04). cucascade::data_batch::to_read_only
+// is non-const under #117 — required to access the now-private get_data().
+uint64_t compute_batch_checksum_fnv1a64(cucascade::data_batch& batch,
                                         rmm::cuda_stream_view stream)
 {
-  auto const& gpu_rep = batch.get_data()->cast<cucascade::gpu_table_representation>();
+  // Phase 18 / DB-03 Recipe R1: scoped read-only accessor; gpu_rep, packed,
+  // and host_buf all live within the accessor's shared-lock window.
+  auto ro             = batch.to_read_only();
+  auto const& gpu_rep = ro.get_data()->cast<cucascade::gpu_table_representation>();
   auto packed         = cudf::pack(gpu_rep.get_table(), stream);
   stream.synchronize();
 
@@ -236,9 +243,18 @@ TEST_CASE("request_free_memory_and_wait downgrades GPU batches to HOST", "[downg
   repo->add_data_batch(batch3);
   repo_mgr.add_new_repository(1, "out", std::move(repo));
 
-  REQUIRE(batch1->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
-  REQUIRE(batch2->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
-  REQUIRE(batch3->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+  {
+    auto __ro_1 = batch1->to_read_only();
+    REQUIRE(__ro_1.get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+  }
+  {
+    auto __ro_2 = batch2->to_read_only();
+    REQUIRE(__ro_2.get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+  }
+  {
+    auto __ro_3 = batch3->to_read_only();
+    REQUIRE(__ro_3.get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+  }
 
   auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
   executor.start();
@@ -246,9 +262,18 @@ TEST_CASE("request_free_memory_and_wait downgrades GPU batches to HOST", "[downg
   size_t freed = executor.request_free_memory_and_wait(1ull << 30);
   REQUIRE(freed > 0);
 
-  REQUIRE(batch1->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
-  REQUIRE(batch2->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
-  REQUIRE(batch3->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+  {
+    auto __ro_4 = batch1->to_read_only();
+    REQUIRE(__ro_4.get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+  }
+  {
+    auto __ro_5 = batch2->to_read_only();
+    REQUIRE(__ro_5.get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+  }
+  {
+    auto __ro_6 = batch3->to_read_only();
+    REQUIRE(__ro_6.get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+  }
 
   executor.stop();
 }
@@ -269,7 +294,11 @@ TEST_CASE("request_free_memory respects byte target via predicate", "[downgrade_
   }
   repo_mgr.add_new_repository(1, "out", std::move(repo));
 
-  size_t one_batch_size = batches[0]->get_data()->get_size_in_bytes();
+  size_t one_batch_size = 0;
+  {
+    auto __ro_7    = batches[0]->to_read_only();
+    one_batch_size = __ro_7.get_data()->get_size_in_bytes();
+  }
   REQUIRE(one_batch_size > 0);
 
   auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
@@ -280,7 +309,10 @@ TEST_CASE("request_free_memory respects byte target via predicate", "[downgrade_
 
   size_t host_count = 0;
   for (auto& b : batches) {
-    if (b->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST) ++host_count;
+    {
+      auto __ro_8 = b->to_read_only();
+      if (__ro_8.get_memory_space()->get_tier() == cucascade::memory::Tier::HOST) ++host_count;
+    }
   }
   REQUIRE(host_count >= 1);
 
@@ -316,7 +348,11 @@ TEST_CASE("request_free_memory downgrades across multiple repos", "[downgrade_ex
   repo_mgr.add_new_repository(1, "out", std::move(repo_non_partitioned));
   repo_mgr.add_new_repository(2, "out", std::move(repo_partitioned));
 
-  size_t one_batch_size = batch_p0->get_data()->get_size_in_bytes();
+  size_t one_batch_size = 0;
+  {
+    auto __ro_9    = batch_p0->to_read_only();
+    one_batch_size = __ro_9.get_data()->get_size_in_bytes();
+  }
 
   auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
   executor.start();
@@ -328,7 +364,10 @@ TEST_CASE("request_free_memory downgrades across multiple repos", "[downgrade_ex
   // At least one batch should have been downgraded
   size_t host_count = 0;
   for (auto* b : {&batch_np1, &batch_np2, &batch_p0, &batch_p1, &batch_p2}) {
-    if ((*b)->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST) ++host_count;
+    {
+      auto __ro_10 = (*b)->to_read_only();
+      if (__ro_10.get_memory_space()->get_tier() == cucascade::memory::Tier::HOST) ++host_count;
+    }
   }
   REQUIRE(host_count >= 1);
 
@@ -353,7 +392,11 @@ TEST_CASE("request_free_memory iterates partitions from last to first", "[downgr
   repo->add_data_batch(batch_p3, 3);
   repo_mgr.add_new_repository(1, "out", std::move(repo));
 
-  size_t two_batches = batch_p0->get_data()->get_size_in_bytes() * 2;
+  size_t two_batches = 0;
+  {
+    auto __ro_11    = batch_p0->to_read_only();
+    two_batches = __ro_11.get_data()->get_size_in_bytes() * 2;
+  }
 
   auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
   executor.start();
@@ -361,10 +404,22 @@ TEST_CASE("request_free_memory iterates partitions from last to first", "[downgr
   size_t freed = executor.request_free_memory_and_wait(two_batches);
   REQUIRE(freed >= two_batches);
 
-  REQUIRE(batch_p3->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
-  REQUIRE(batch_p2->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
-  REQUIRE(batch_p0->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
-  REQUIRE(batch_p1->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+  {
+    auto __ro_12 = batch_p3->to_read_only();
+    REQUIRE(__ro_12.get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+  }
+  {
+    auto __ro_13 = batch_p2->to_read_only();
+    REQUIRE(__ro_13.get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+  }
+  {
+    auto __ro_14 = batch_p0->to_read_only();
+    REQUIRE(__ro_14.get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+  }
+  {
+    auto __ro_15 = batch_p1->to_read_only();
+    REQUIRE(__ro_15.get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+  }
 
   executor.stop();
 }
@@ -384,10 +439,22 @@ TEST_CASE("request_free_memory skips active partitions in first pass", "[downgra
   repo->add_data_batch(batch_p1, 1);
   repo->add_data_batch(batch_p2, 2);
 
-  REQUIRE(batch_p1->try_to_create_task());
+  // Phase 18 / DB-03 — Pitfall 5: pre-#117 try_to_create_task is gone.
+  // Hold a mutable accessor on batch_p1 to mark it non-idle so the
+  // downgrade executor skips it. Released after the test finishes asserting.
+  std::optional<cucascade::mutable_data_batch> batch_p1_mut;
+  {
+    auto opt = batch_p1->try_to_mutable();
+    REQUIRE(opt.has_value());
+    batch_p1_mut = std::move(*opt);
+  }
   repo_mgr.add_new_repository(1, "out", std::move(repo));
 
-  size_t three_batches = batch_p0->get_data()->get_size_in_bytes() * 3;
+  size_t three_batches = 0;
+  {
+    auto __ro_16    = batch_p0->to_read_only();
+    three_batches = __ro_16.get_data()->get_size_in_bytes() * 3;
+  }
 
   auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
   executor.start();
@@ -395,11 +462,22 @@ TEST_CASE("request_free_memory skips active partitions in first pass", "[downgra
   size_t freed = executor.request_free_memory_and_wait(three_batches);
   REQUIRE(freed > 0);
 
-  REQUIRE(batch_p2->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
-  REQUIRE(batch_p0->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
-  REQUIRE(batch_p1->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+  {
+    auto __ro_17 = batch_p2->to_read_only();
+    REQUIRE(__ro_17.get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+  }
+  {
+    auto __ro_18 = batch_p0->to_read_only();
+    REQUIRE(__ro_18.get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+  }
+  {
+    auto __ro_19 = batch_p1->to_read_only();
+    REQUIRE(__ro_19.get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+  }
 
-  batch_p1->try_to_cancel_task();
+  // Phase 18 / DB-03 — Pitfall 5: try_to_cancel_task is gone; release the
+  // mutable accessor instead.
+  batch_p1_mut.reset();
   executor.stop();
 }
 
@@ -425,10 +503,16 @@ TEST_CASE("request_free_memory skips batches already on HOST", "[downgrade_execu
     host_space = const_cast<cucascade::memory::memory_space*>(host_spaces.front());
   }
   rmm::cuda_stream conv_stream;
-  REQUIRE(gpu_batch->try_to_lock_for_in_transit());
-  gpu_batch->convert_to<cucascade::host_data_representation>(registry, host_space, conv_stream);
-  gpu_batch->try_to_release_in_transit();
-  REQUIRE(gpu_batch->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+  {
+    // Phase 18 / DB-03 Recipe R8 + R3: scoped mutable accessor replaces
+    // pre-#117 try_to_lock_for_in_transit + try_to_release_in_transit pair.
+    auto mut = gpu_batch->to_mutable();
+    mut.convert_to<cucascade::host_data_representation>(registry, host_space, conv_stream);
+  }
+  {
+    auto __ro_20 = gpu_batch->to_read_only();
+    REQUIRE(__ro_20.get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+  }
 
   repo_mgr.add_new_repository(1, "out", std::move(repo));
 
@@ -437,7 +521,10 @@ TEST_CASE("request_free_memory skips batches already on HOST", "[downgrade_execu
 
   size_t freed = executor.request_free_memory_and_wait(1ull << 30);
   REQUIRE(freed > 0);
-  REQUIRE(gpu_batch2->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+  {
+    auto __ro_21 = gpu_batch2->to_read_only();
+    REQUIRE(__ro_21.get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+  }
 
   executor.stop();
 }
@@ -462,7 +549,10 @@ TEST_CASE("request_free_memory returns future that resolves to bytes freed", "[d
   auto future  = executor.request_free_memory(1ull << 30);
   size_t freed = future.get();
   REQUIRE(freed > 0);
-  REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+  {
+    auto __ro_22 = batch->to_read_only();
+    REQUIRE(__ro_22.get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+  }
 
   executor.stop();
 }
@@ -500,7 +590,10 @@ TEST_CASE("request_downgrade with custom predicate stops when satisfied", "[down
   // With pool width=1 and predicate satisfied immediately, at most 1-2 batches downgraded
   size_t host_count = 0;
   for (auto& b : batches) {
-    if (b->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST) ++host_count;
+    {
+      auto __ro_23 = b->to_read_only();
+      if (__ro_23.get_memory_space()->get_tier() == cucascade::memory::Tier::HOST) ++host_count;
+    }
   }
   REQUIRE(host_count >= 1);
   REQUIRE(host_count <= 2);
@@ -518,7 +611,11 @@ TEST_CASE("request_free_memory partial fulfillment returns actual bytes freed",
   cucascade::shared_data_repository_manager repo_mgr;
   auto repo         = std::make_unique<cucascade::shared_data_repository>();
   auto batch        = make_gpu_batch(*gpu_space);
-  size_t batch_size = batch->get_data()->get_size_in_bytes();
+  size_t batch_size = 0;
+  {
+    auto __ro_24    = batch->to_read_only();
+    batch_size = __ro_24.get_data()->get_size_in_bytes();
+  }
   repo->add_data_batch(batch);
   repo_mgr.add_new_repository(1, "out", std::move(repo));
 
@@ -529,7 +626,10 @@ TEST_CASE("request_free_memory partial fulfillment returns actual bytes freed",
   size_t freed = executor.request_free_memory_and_wait(1ull << 40);
   // Should get only the one batch's worth
   REQUIRE(freed == batch_size);
-  REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+  {
+    auto __ro_25 = batch->to_read_only();
+    REQUIRE(__ro_25.get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+  }
 
   executor.stop();
 }
@@ -587,8 +687,14 @@ TEST_CASE("gpu_to_gpu_transfer_via_converter", "[multi_gpu_transfer]")
 
   // Create a batch on GPU 0.
   auto batch = make_gpu_batch(*gpu0, 500);
-  REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
-  REQUIRE(batch->get_memory_space()->get_device_id() == gpu0->get_device_id());
+  {
+    auto __ro_26 = batch->to_read_only();
+    REQUIRE(__ro_26.get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+  }
+  {
+    auto __ro_27 = batch->to_read_only();
+    REQUIRE(__ro_27.get_memory_space()->get_device_id() == gpu0->get_device_id());
+  }
 
   // Convert GPU 0 -> GPU 1 via the converter registry.
   auto& registry = sirius::converter_registry::get();
@@ -601,24 +707,46 @@ TEST_CASE("gpu_to_gpu_transfer_via_converter", "[multi_gpu_transfer]")
   // AFTER the return leg; a mismatch = silent data corruption.
   auto checksum_pre = compute_batch_checksum_fnv1a64(*batch, stream);
 
-  REQUIRE(batch->try_to_lock_for_in_transit());
-  batch->convert_to<cucascade::gpu_table_representation>(registry, gpu1, stream);
-  batch->try_to_release_in_transit();
+  {
+    // Phase 18 / DB-03 Recipe R8 + R3: scoped mutable accessor replaces
+    // pre-#117 try_to_lock_for_in_transit + try_to_release_in_transit pair.
+    auto mut = batch->to_mutable();
+    mut.convert_to<cucascade::gpu_table_representation>(registry, gpu1, stream);
+  }
 
-  REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
-  REQUIRE(batch->get_memory_space()->get_device_id() == gpu1->get_device_id());
+  {
+    auto __ro_28 = batch->to_read_only();
+    REQUIRE(__ro_28.get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+  }
+  {
+    auto __ro_29 = batch->to_read_only();
+    REQUIRE(__ro_29.get_memory_space()->get_device_id() == gpu1->get_device_id());
+  }
 
   // Round-trip GPU 1 -> GPU 0.
-  REQUIRE(batch->try_to_lock_for_in_transit());
-  batch->convert_to<cucascade::gpu_table_representation>(registry, gpu0, stream);
-  batch->try_to_release_in_transit();
+  {
+    // Phase 18 / DB-03 Recipe R8 + R3: scoped mutable accessor replaces
+    // pre-#117 try_to_lock_for_in_transit + try_to_release_in_transit pair.
+    auto mut = batch->to_mutable();
+    mut.convert_to<cucascade::gpu_table_representation>(registry, gpu0, stream);
+  }
 
-  REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
-  REQUIRE(batch->get_memory_space()->get_device_id() == gpu0->get_device_id());
+  {
+    auto __ro_30 = batch->to_read_only();
+    REQUIRE(__ro_30.get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+  }
+  {
+    auto __ro_31 = batch->to_read_only();
+    REQUIRE(__ro_31.get_memory_space()->get_device_id() == gpu0->get_device_id());
+  }
 
   // Data integrity check: batch still has a non-empty payload after the round-trip.
-  REQUIRE(batch->get_data() != nullptr);
-  REQUIRE(batch->get_data()->get_size_in_bytes() > 0);
+  // Phase 18 / DB-03: get_data is private under #117; access via accessor.
+  {
+    auto ro = batch->to_read_only();
+    REQUIRE(ro.get_data() != nullptr);
+    REQUIRE(ro.get_data()->get_size_in_bytes() > 0);
+  }
 
   // MGPU-06 Pitfall 2 / Sapphire Rapids silent data corruption guard:
   // the post-round-trip checksum must equal the pre-round-trip checksum.
@@ -741,7 +869,10 @@ TEST_CASE("numa_aware_downgrade_executor_passes_numa_node", "[downgrade][numa_aw
 
   size_t freed = executor.request_free_memory_and_wait(1ull << 30);
   REQUIRE(freed > 0);
-  REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+  {
+    auto __ro_32 = batch->to_read_only();
+    REQUIRE(__ro_32.get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+  }
 
   executor.stop();
 }
@@ -766,7 +897,10 @@ TEST_CASE("downgrade_executor_default_numa_node_is_nullopt", "[downgrade][numa_a
 
   size_t freed = executor.request_free_memory_and_wait(1ull << 30);
   REQUIRE(freed > 0);
-  REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+  {
+    auto __ro_33 = batch->to_read_only();
+    REQUIRE(__ro_33.get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+  }
 
   executor.stop();
 }
@@ -852,7 +986,10 @@ TEST_CASE("numa_downgrade_prefers_local_host_space",
   auto batch = make_gpu_batch(*gpu0);
   repo->add_data_batch(batch);
   repo_mgr.add_new_repository(1, "out", std::move(repo));
-  REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+  {
+    auto __ro_34 = batch->to_read_only();
+    REQUIRE(__ro_34.get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+  }
 
   auto gpu0_space_id = cucascade::memory::memory_space_id(cucascade::memory::Tier::GPU, 0);
   sirius::exec::downgrade_executor_config config{
@@ -864,9 +1001,15 @@ TEST_CASE("numa_downgrade_prefers_local_host_space",
 
   size_t freed = executor.request_free_memory_and_wait(1ull << 30);
   REQUIRE(freed > 0);
-  REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+  {
+    auto __ro_35 = batch->to_read_only();
+    REQUIRE(__ro_35.get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+  }
   // NUMA-local HOST space was selected (device_id matches preference).
-  REQUIRE(batch->get_memory_space()->get_device_id() == 0);
+  {
+    auto __ro_36 = batch->to_read_only();
+    REQUIRE(__ro_36.get_memory_space()->get_device_id() == 0);
+  }
 
   executor.stop();
   sirius::converter_registry::shutdown();
@@ -938,8 +1081,15 @@ TEST_CASE("p2p_transfer_converter_round_trip", "[mem_04_p2p_transfer][multi_gpu]
   enable_p2p_for_test(2);
 
   auto batch = make_gpu_batch(*gpu0, 500);
-  REQUIRE(batch->get_memory_space()->get_device_id() == gpu0->get_device_id());
-  size_t original_size = batch->get_data()->get_size_in_bytes();
+  {
+    auto __ro_37 = batch->to_read_only();
+    REQUIRE(__ro_37.get_memory_space()->get_device_id() == gpu0->get_device_id());
+  }
+  size_t original_size = 0;
+  {
+    auto __ro_38    = batch->to_read_only();
+    original_size = __ro_38.get_data()->get_size_in_bytes();
+  }
 
   auto& registry = sirius::converter_registry::get();
   rmm::cuda_stream stream;
@@ -952,21 +1102,33 @@ TEST_CASE("p2p_transfer_converter_round_trip", "[mem_04_p2p_transfer][multi_gpu]
   // GPU0 -> GPU1 via converter (MGPU-06: cudaMemcpyPeerAsync when the
   // peer-access enable loop at SiriusContext::initialize() successfully
   // enabled the pair; host-staged fallback otherwise).
-  REQUIRE(batch->try_to_lock_for_in_transit());
-  batch->convert_to<cucascade::gpu_table_representation>(registry, gpu1, stream);
-  batch->try_to_release_in_transit();
-  REQUIRE(batch->get_memory_space()->get_device_id() == gpu1->get_device_id());
-  REQUIRE(batch->get_data()->get_size_in_bytes() == original_size);
+  {
+    // Phase 18 / DB-03 Recipe R8 + R3: scoped mutable accessor replaces
+    // pre-#117 try_to_lock_for_in_transit + try_to_release_in_transit pair.
+    auto mut = batch->to_mutable();
+    mut.convert_to<cucascade::gpu_table_representation>(registry, gpu1, stream);
+  }
+  {
+    auto __ro_39 = batch->to_read_only();
+    REQUIRE(__ro_39.get_memory_space()->get_device_id() == gpu1->get_device_id());
+    REQUIRE(__ro_39.get_data()->get_size_in_bytes() == original_size);
+  }
 
   // Round-trip GPU1 -> GPU0. Phase 4 Plan 04-05 Task 2 found this return leg
   // failed on the N=2 verification host; Phase 7 Plan 07-01's peer-access
   // enable loop closes that bug by registering driver-level P2P mappings
   // once at SiriusContext init.
-  REQUIRE(batch->try_to_lock_for_in_transit());
-  batch->convert_to<cucascade::gpu_table_representation>(registry, gpu0, stream);
-  batch->try_to_release_in_transit();
-  REQUIRE(batch->get_memory_space()->get_device_id() == gpu0->get_device_id());
-  REQUIRE(batch->get_data()->get_size_in_bytes() == original_size);
+  {
+    // Phase 18 / DB-03 Recipe R8 + R3: scoped mutable accessor replaces
+    // pre-#117 try_to_lock_for_in_transit + try_to_release_in_transit pair.
+    auto mut = batch->to_mutable();
+    mut.convert_to<cucascade::gpu_table_representation>(registry, gpu0, stream);
+  }
+  {
+    auto __ro_40 = batch->to_read_only();
+    REQUIRE(__ro_40.get_memory_space()->get_device_id() == gpu0->get_device_id());
+    REQUIRE(__ro_40.get_data()->get_size_in_bytes() == original_size);
+  }
 
   // MGPU-06 Pitfall 2 / Sapphire Rapids silent data corruption guard:
   // post-round-trip checksum must equal the pre-round-trip checksum. If this

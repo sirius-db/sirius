@@ -136,15 +136,23 @@ struct pipeline_task_history_fixture {
 
     auto batch = sirius::make_data_batch(std::move(gpu_table), *gpu_space, stream);
 
-    REQUIRE(batch->try_to_lock_for_in_transit());
     auto& registry = sirius::converter_registry::get();
-    batch->convert_to<cucascade::host_data_representation>(registry, host_space, stream);
-    batch->try_to_release_in_transit();
+    // Phase 18 / DB-03 Recipe R8 + R3: scoped mutable accessor for the
+    // host-tier conversion.
+    {
+      auto mut = batch->to_mutable();
+      mut.convert_to<cucascade::host_data_representation>(registry, host_space, stream);
+    }
     stream.synchronize();
 
-    REQUIRE(batch->get_data() != nullptr);
-    REQUIRE(batch->get_data()->get_current_tier() == cucascade::memory::Tier::HOST);
-    REQUIRE(batch->try_to_create_task());
+    {
+      auto ro = batch->to_read_only();
+      REQUIRE(ro.get_data() != nullptr);
+      REQUIRE(ro.get_data()->get_current_tier() == cucascade::memory::Tier::HOST);
+    }
+    // Phase 18 / DB-03 — Pitfall 5: try_to_create_task is gone; under #117
+    // the FSM transition is unnecessary — a fresh batch is already idle. The
+    // pipeline machinery now acquires a mutable accessor when it dispatches.
     return batch;
   }
 
@@ -162,7 +170,8 @@ struct pipeline_task_history_fixture {
     stream.synchronize();
 
     auto batch = sirius::make_data_batch(std::move(gpu_table), *gpu_space, stream);
-    REQUIRE(batch->try_to_create_task());
+    // Phase 18 / DB-03 — Pitfall 5: try_to_create_task is gone (no FSM under
+    // #117); the batch is already idle by construction.
     return batch;
   }
 };

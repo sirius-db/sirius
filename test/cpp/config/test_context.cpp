@@ -83,10 +83,16 @@ bool enable_p2p_for_test(int num_gpus)
 // checksum over a packed batch payload. Duplicated here because the
 // equivalent helper in test/cpp/downgrade/test_downgrade_executor.cpp lives
 // in an anonymous namespace and is not reachable from this TU.
-uint64_t compute_batch_checksum_fnv1a64(const cucascade::data_batch& batch,
+// Phase 18 / DB-03: const dropped from data_batch& parameter (mirrors
+// debug_utils.hpp pattern from plan 18-04). cucascade #117's to_read_only is
+// non-const because it acquires the shared lock.
+uint64_t compute_batch_checksum_fnv1a64(cucascade::data_batch& batch,
                                         rmm::cuda_stream_view stream)
 {
-  auto const& gpu_rep = batch.get_data()->cast<cucascade::gpu_table_representation>();
+  // Phase 18 / DB-03 Recipe R1: scoped read-only accessor for the lifetime
+  // of gpu_rep, packed, and host_buf — released at function exit.
+  auto ro             = batch.to_read_only();
+  auto const& gpu_rep = ro.get_data()->cast<cucascade::gpu_table_representation>();
   auto packed         = cudf::pack(gpu_rep.get_table(), stream);
   stream.synchronize();
 
@@ -451,9 +457,16 @@ TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-0
     /*num_rows=*/1024, col_types, ranges, build_stream, mr);
   auto batch = sirius::make_data_batch(std::move(table), *gpu0, build_stream);
   REQUIRE(batch != nullptr);
-  auto const original_bytes = batch->get_data()->get_size_in_bytes();
+  auto const original_bytes = 0;
+  {
+    auto __ro_1    = batch->to_read_only();
+    original_bytes = __ro_1.get_data()->get_size_in_bytes();
+  }
   REQUIRE(original_bytes > 0);
-  REQUIRE(batch->get_memory_space()->get_device_id() == 0);
+  {
+    auto __ro_2 = batch->to_read_only();
+    REQUIRE(__ro_2.get_memory_space()->get_device_id() == 0);
+  }
 
   rmm::cuda_stream stream;
 
@@ -463,24 +476,34 @@ TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-0
   auto checksum_pre = compute_batch_checksum_fnv1a64(*batch, stream.view());
 
   // GPU0 -> GPU1 forward leg.
-  REQUIRE(batch->try_to_lock_for_in_transit());
-  batch->convert_to<cucascade::gpu_table_representation>(registry, gpu1, stream.view());
-  batch->try_to_release_in_transit();
+  // Phase 18 / DB-03 Recipe R8 + R3: scoped mutable accessor.
+  {
+    auto mut = batch->to_mutable();
+    mut.convert_to<cucascade::gpu_table_representation>(registry, gpu1, stream.view());
+  }
 
-  REQUIRE(batch->get_memory_space()->get_device_id() == 1);
-  REQUIRE(batch->get_data()->get_size_in_bytes() == original_bytes);
+  {
+    auto __ro_3 = batch->to_read_only();
+    REQUIRE(__ro_3.get_memory_space()->get_device_id() == 1);
+    REQUIRE(__ro_3.get_data()->get_size_in_bytes() == original_bytes);
+  }
 
   // MGPU-06 return leg: Phase 7 Plan 07-01's peer-access enable loop at
   // SiriusContext::initialize() closes the Phase-4-deferred GPU1 -> GPU0
   // bug. Checksum integrity guard per RESEARCH.md Pitfall 2 (silent data
   // corruption on Ada Lovelace + Sapphire Rapids).
-  REQUIRE(batch->try_to_lock_for_in_transit());
-  batch->convert_to<cucascade::gpu_table_representation>(registry, gpu0, stream.view());
-  batch->try_to_release_in_transit();
+  // Phase 18 / DB-03 Recipe R8 + R3: scoped mutable accessor.
+  {
+    auto mut = batch->to_mutable();
+    mut.convert_to<cucascade::gpu_table_representation>(registry, gpu0, stream.view());
+  }
 
-  REQUIRE(batch->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
-  REQUIRE(batch->get_memory_space()->get_device_id() == gpu0->get_device_id());
-  REQUIRE(batch->get_data()->get_size_in_bytes() == original_bytes);
+  {
+    auto __ro_4 = batch->to_read_only();
+    REQUIRE(__ro_4.get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+    REQUIRE(__ro_4.get_memory_space()->get_device_id() == gpu0->get_device_id());
+    REQUIRE(__ro_4.get_data()->get_size_in_bytes() == original_bytes);
+  }
 
   // Final data-integrity gate: post-round-trip checksum must equal
   // pre-round-trip checksum. Failure here on an Ada Lovelace + Intel Xeon

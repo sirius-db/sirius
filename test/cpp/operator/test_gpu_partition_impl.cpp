@@ -37,19 +37,22 @@ memory_space* get_shared_mem_space()
 }
 
 /**
- * @brief Create a batch with random data and acquire a processing handle.
+ * @brief Create a batch with random data and acquire a mutable accessor.
  *
- * In production, tasks hold processing handles while operating on batches
- * to prevent them from being downgraded. This helper creates the batch and
- * returns both the batch and its processing handle.
+ * Phase 18 / DB-03 — Pitfall 5: cucascade #117 replaces the FSM-based
+ * data_batch_processing_handle with the RAII mutable_data_batch accessor.
+ * The test helper now returns the batch alongside a mutable accessor;
+ * keeping the accessor in scope serves the same purpose as the old
+ * processing-handle (prevents downgrades / concurrent mutation).
  *
- * @return A pair of (batch, processing_handle) - keep the handle in scope while processing.
+ * @return A pair of (batch, mutable_data_batch) — keep the accessor in
+ *         scope while processing.
  */
-std::pair<std::shared_ptr<data_batch>, data_batch_processing_handle> create_batch_with_random_data(
-  const int num_rows,
-  const std::vector<cudf::data_type>& column_types,
-  std::vector<std::optional<std::pair<int, int>>>& ranges,
-  memory_space& mem_space)
+std::pair<std::shared_ptr<data_batch>, cucascade::mutable_data_batch>
+create_batch_with_random_data(const int num_rows,
+                              const std::vector<cudf::data_type>& column_types,
+                              std::vector<std::optional<std::pair<int, int>>>& ranges,
+                              memory_space& mem_space)
 {
   // Base input batches, make value ranges small so that we have duplicated partition keys
   for (size_t i = 0; i < ranges.size(); ++i) {
@@ -60,10 +63,11 @@ std::pair<std::shared_ptr<data_batch>, data_batch_processing_handle> create_batc
   auto batch =
     sirius::make_data_batch(std::move(table), mem_space, cudf::get_default_stream());
 
-  REQUIRE(batch->try_to_create_task());
-  auto lock_result = batch->try_to_lock_for_processing(mem_space.get_id());
-  REQUIRE(lock_result.success);
-  data_batch_processing_handle handle = std::move(lock_result.handle);
+  // Phase 18 / DB-03 Recipe R8: scoped mutable accessor replaces the
+  // pre-#117 try_to_create_task + try_to_lock_for_processing pair.
+  auto mut_opt = batch->try_to_mutable();
+  REQUIRE(mut_opt.has_value());
+  cucascade::mutable_data_batch handle = std::move(*mut_opt);
 
   return {std::move(batch), std::move(handle)};
 }
