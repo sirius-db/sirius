@@ -114,7 +114,7 @@ void emit_plan_telemetry(
       }
     }
 
-    // Sender ports on pipline sink(last) operators.
+    // Sender ports on pipeline sink(last) operators.
     for (const auto& [next_operator, next_operator_port_name, pseudo_sink_port_uuid] :
          pipeline->get_next_ports_after_sink()) {
       // Declare the pseudo-sink port

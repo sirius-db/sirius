@@ -360,7 +360,7 @@ class sirius_physical_operator {
     sirius_physical_operator* next_operator;
     //! The port name on the downstream operator to push data into
     std::string_view next_operator_port_name;
-    //! A UUID to encode the concept of a pseudo port, to comform to the model of quent,
+    //! A UUID to encode the concept of a pseudo port, to conform to the model of quent,
     // that sits on an operator, at the end of a pipeline, sending data to a downstream
     // pipeline's first operator's receiving port, forming a directed edge from the current
     // operator's pipeline to the next_operator's pipeline:

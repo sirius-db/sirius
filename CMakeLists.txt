@@ -314,8 +314,14 @@ foreach(_target sirius_extension sirius_loadable_extension)
                                PRIVATE ${SIRIUS_LEGACY_COMPILE_DEFINITIONS})
   endif()
 
-  target_link_libraries(${_target} cudf::cudf rmm::rmm spdlog::spdlog
-          cuCascade::cucascade yaml-cpp::yaml-cpp telemetry_bridge)
+  target_link_libraries(
+    ${_target}
+    cudf::cudf
+    rmm::rmm
+    spdlog::spdlog
+    cuCascade::cucascade
+    yaml-cpp::yaml-cpp
+    telemetry_bridge)
 
   add_dependencies(${_target} duckdb_static)
 endforeach()
