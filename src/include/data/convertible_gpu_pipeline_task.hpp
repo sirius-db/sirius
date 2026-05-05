@@ -51,10 +51,10 @@ namespace sirius {
  * (shutdown). This enables temporary extraction from the queue for conversion, with
  * guaranteed return on all code paths.
  *
- * The convert() method follows the same save/lock/convert/restore pattern as
- * convertible_data_batch: for each data_batch in the task's input data, it saves the
- * previous state, locks for in_transit, attempts conversion to a target memory space,
- * and restores state on all paths (success, failure, exception).
+ * The convert() method follows the same iteration pattern as convertible_data_batch:
+ * for each data_batch in the task's input data, it filters by current memory space
+ * and idle state, then delegates to convertible_data_batch::convert which acquires
+ * a non-blocking exclusive accessor (try_to_mutable) and releases it via RAII.
  */
 class convertible_gpu_pipeline_task : public convertible_data {
  public:
@@ -97,9 +97,9 @@ class convertible_gpu_pipeline_task : public convertible_data {
    * Iterates the data_batches from the task's pipelineable_operator_data input.
    * For each batch:
    * - Skips batches already in a target space (no conversion needed)
-   * - Skips batches not in task_created state (busy or already processing)
-   * - Locks for in_transit, requests a reservation in each target space, converts
-   * - Restores the previous batch state on all paths
+   * - Skips batches not in idle state (currently locked by another consumer)
+   * - Delegates to convertible_data_batch::convert which takes a non-blocking
+   *   exclusive accessor and releases it via RAII.
    *
    * @param target_spaces  Candidate destination memory spaces (tried in order).
    * @param stream         CUDA stream for asynchronous memory operations.
@@ -122,19 +122,26 @@ class convertible_gpu_pipeline_task : public convertible_data {
     for (const auto& batch : batches) {
       if (!batch) { continue; }
 
-      // Skip batches already at a target space — no conversion needed
-      auto* batch_space      = batch->get_memory_space();
-      bool already_at_target = false;
-      for (const auto* ts : target_spaces) {
-        if (batch_space == ts) {
-          already_at_target = true;
-          break;
-        }
-      }
-      if (already_at_target) { continue; }
+      // Per Pitfall 5: under #117 the only state eligible for conversion is
+      // batch_state::idle (no reader or writer accessor currently held).
+      // Lock-free state probe.
+      if (batch->get_state() != cucascade::batch_state::idle) { continue; }
 
-      // Only convert batches in task_created state
-      if (batch->get_state() != cucascade::batch_state::task_created) { continue; }
+      // Memory-space probe via scoped read-only accessor (R2). Drop before
+      // delegating to convertible_data_batch::convert (which takes its own
+      // exclusive accessor) — P1 lock-scope discipline.
+      bool already_at_target = false;
+      {
+        auto ro           = batch->to_read_only();
+        auto* batch_space = ro.get_memory_space();
+        for (const auto* ts : target_spaces) {
+          if (batch_space == ts) {
+            already_at_target = true;
+            break;
+          }
+        }
+      }  // ro released here
+      if (already_at_target) { continue; }
 
       sirius::convertible_data_batch batch_converter(batch);
       auto result = batch_converter.convert(target_spaces, stream, res_mgr);
@@ -154,7 +161,9 @@ class convertible_gpu_pipeline_task : public convertible_data {
    * @brief Get the size in bytes of this task's data in the specified memory space.
    *
    * Sums bytes across all data_batches in the task's input that reside in the
-   * given memory space.
+   * given memory space. Each access is mediated through a scoped read-only
+   * accessor (R2): the shared lock is held only for the duration of the read on
+   * that single batch.
    *
    * @param space The memory space to query.
    * @return Total size in bytes, or 0 if no data resides in that space.
@@ -166,9 +175,12 @@ class convertible_gpu_pipeline_task : public convertible_data {
 
     std::size_t total = 0;
     for (const auto& batch : pipelineable->get_data_batches()) {
-      if (batch && batch->get_memory_space() == space) {
-        total += batch->get_data()->get_size_in_bytes();
+      if (!batch) { continue; }
+      auto ro = batch->to_read_only();
+      if (ro.get_memory_space() == space && ro.get_data() != nullptr) {
+        total += ro.get_data()->get_size_in_bytes();
       }
+      // ro released here at end of loop iteration
     }
     return total;
   }
@@ -218,7 +230,7 @@ class convertible_gpu_pipeline_task : public convertible_data {
  *        inspectable_mpsc queue.
  *
  * Uses mutable_pop_if to extract tasks whose data_batches match a given memory space
- * and batch_state::task_created. Each extracted task is wrapped in a
+ * and are in batch_state::idle. Each extracted task is wrapped in a
  * convertible_gpu_pipeline_task, which returns the task to the queue on destruction
  * via RAII.
  *
@@ -241,7 +253,7 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
    * @brief Get the next task whose data_batches match the given memory space.
    *
    * Calls mutable_pop_if with a predicate that navigates the dynamic_cast chain
-   * and checks for data_batches in the target space with batch_state::task_created.
+   * and checks for data_batches in the target space with batch_state::idle.
    *
    * @param space           The memory space to filter by.
    * @param front_to_back   Iteration direction.
@@ -288,10 +300,11 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
 
  private:
   /**
-   * @brief Predicate: does this task contain data_batches in the given space with
-   *        batch_state::task_created?
+   * @brief Predicate: does this task contain data_batches in the given space and
+   *        in batch_state::idle?
    *
-   * Lightweight — only performs dynamic_casts and state checks. Suitable for use
+   * Lightweight — only performs dynamic_casts, lock-free state probes, and a
+   * scoped read_only accessor for the memory_space probe. Suitable for use
    * under the queue mutex per inspectable_mpsc contract (T-07-01 mitigation).
    *
    * @param task  The task to inspect (mutable reference from mutable_pop_if).
@@ -305,10 +318,13 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
     if (!pipelineable) { return false; }
 
     for (const auto& batch : pipelineable->get_data_batches()) {
-      if (batch && batch->get_memory_space() == space &&
-          batch->get_state() == cucascade::batch_state::task_created) {
-        return true;
-      }
+      if (!batch) { continue; }
+      // Lock-free state probe.
+      if (batch->get_state() != cucascade::batch_state::idle) { continue; }
+      // Scoped read-only accessor for memory_space probe.
+      auto ro = batch->to_read_only();
+      if (ro.get_memory_space() == space) { return true; }
+      // ro released at end of loop iteration
     }
 
     return false;

@@ -33,12 +33,16 @@ namespace op {
 // operator_data
 //===--------------------------------------------------------------------===//
 
-std::optional<std::vector<::cucascade::data_batch_processing_handle>>
+std::optional<std::vector<::cucascade::mutable_data_batch>>
 pipelineable_operator_data::prepare_for_processing(
   const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
 {
-  std::vector<::cucascade::data_batch_processing_handle> handles;
-  handles.reserve(_data_batches.size());
+  // R5 lock-and-hold: each accessor returned by prepare_and_acquire_mutable holds an
+  // exclusive lock on its parent data_batch for the duration of the operator's
+  // execute() call. The vector is destroyed by the caller (gpu_pipeline_task)
+  // after execute() returns, releasing all locks via RAII.
+  std::vector<::cucascade::mutable_data_batch> accessors;
+  accessors.reserve(_data_batches.size());
 
   for (const auto& batch : _data_batches) {
     if (!batch) {
@@ -46,9 +50,9 @@ pipelineable_operator_data::prepare_for_processing(
       SIRIUS_LOG_INFO("[mgpu-probe] prepare_for_processing returning nullopt null_batch=true");
       return std::nullopt;
     }
-    std::optional<::cucascade::data_batch_processing_handle> handle;
+    std::optional<::cucascade::mutable_data_batch> acc;
     try {
-      handle = pipeline::lock_or_prepare_batch(batch, requested_memory_space, stream);
+      acc = pipeline::prepare_and_acquire_mutable(batch, requested_memory_space, stream);
     } catch (const rmm::out_of_memory&) {
       SIRIUS_LOG_ERROR(
         "pipelineable_operator_data: OOM at batch {} preparing for processing, state: {}",
@@ -64,11 +68,10 @@ pipelineable_operator_data::prepare_for_processing(
         e.what());
       throw;
     }
-    if (!handle) {
+    if (!acc) {
       // Phase 9 FIX-B observability: breadcrumb confirms nullopt propagates
-      // out of the loop cleanly, so the caller (gpu_pipeline_task::run_pipeline_task_round
-      // at gpu_pipeline_task.cpp:325) can handle it via `handles_opt.has_value()`.
-      // If the SIGSEGV reported in 08-08-DIAGNOSIS.md is a null-deref downstream,
+      // out of the loop cleanly, so the caller can handle it via
+      // `accessors_opt.has_value()`. If a SIGSEGV is a null-deref downstream,
       // the fix site is in the caller, not here — this log helps correlate.
       SIRIUS_LOG_INFO(
         "[mgpu-probe] prepare_for_processing returning nullopt batch_id={} batch_state={}",
@@ -76,10 +79,10 @@ pipelineable_operator_data::prepare_for_processing(
         static_cast<int>(batch->get_state()));
       return std::nullopt;
     }
-    handles.emplace_back(std::move(*handle));
+    accessors.emplace_back(std::move(*acc));
   }
 
-  return handles;
+  return accessors;
 }
 
 std::string sirius_physical_operator::get_name() const
@@ -281,10 +284,12 @@ std::unique_ptr<operator_data> sirius_physical_operator::get_next_task_input_dat
   std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
   for (auto& [port_name, port_ptr] : ports) {
     if (!port_ptr->repo) { continue; }  // dependency-only port; nothing to pop
-    // For Pipeline barrier: need at least one data batch in the port's repository
-    // TODO: later on we will adjust to the new data repository interface in cuCascade
-    auto batch_and_handle = port_ptr->repo->pop_data_batch(::cucascade::batch_state::task_created);
-    if (batch_and_handle) { input_batch.push_back(std::move(batch_and_handle)); }
+    // For Pipeline barrier: need at least one data batch in the port's repository.
+    // Post-#117: pop_next_data_batch returns the front batch of partition 0 (or
+    // nullptr if empty); the pre-#117 batch_state filter is gone — consumers
+    // acquire RAII accessors as needed when they process the batch.
+    auto popped_batch = port_ptr->repo->pop_next_data_batch(0);
+    if (popped_batch) { input_batch.push_back(std::move(popped_batch)); }
   }
   if (input_batch.empty()) { return nullptr; }
   return std::make_unique<pipelineable_operator_data>(input_batch);
