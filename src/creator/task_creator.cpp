@@ -457,9 +457,16 @@ void task_creator::manager_loop()
                 std::unordered_map<int, size_t> gpu_bytes;
                 std::unordered_map<int, size_t> host_bytes;
                 for (const auto& batch : pipelineable_input->get_data_batches()) {
-                  auto* space = batch->get_memory_space();
-                  if (!space || !batch->get_data()) { continue; }
-                  auto size = batch->get_data()->get_size_in_bytes();
+                  if (!batch) { continue; }
+                  // Phase 18 / DB-02 Recipe R2: scoped read-only accessor
+                  // per loop iteration for the affinity/sizing probe.
+                  // Destroyed at end-of-iteration -> shared lock released.
+                  // Called pre-task-dispatch from manager_loop, so no other
+                  // accessor is held on these batches (no P1 overlap).
+                  auto ro     = batch->to_read_only();
+                  auto* space = ro.get_memory_space();
+                  if (!space || !ro.get_data()) { continue; }
+                  auto size = ro.get_data()->get_size_in_bytes();
                   if (space->get_tier() == cucascade::memory::Tier::GPU) {
                     gpu_bytes[space->get_device_id()] += size;
                   } else if (space->get_tier() == cucascade::memory::Tier::HOST) {
