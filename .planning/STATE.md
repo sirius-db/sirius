@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Rebase After DataBatch Changes
-status: completed
-stopped_at: Completed 17-03-PLAN.md
-last_updated: "2026-05-05T14:28:18.023Z"
+status: executing
+stopped_at: Completed 18-01-PLAN.md
+last_updated: "2026-05-05T15:39:04.058Z"
 last_activity: 2026-05-05
 progress:
   total_phases: 6
   completed_phases: 2
-  total_plans: 9
-  completed_plans: 9
+  total_plans: 15
+  completed_plans: 10
 ---
 
 # Project State
@@ -20,13 +20,13 @@ progress:
 See: .planning/PROJECT.md (updated 2026-05-04)
 
 **Core value:** Any query can transparently execute across every GPU on the node — tasks are scheduled to the GPU where their input data already resides, memory pressure is absorbed by downgrading to the correct NUMA domain, and parquet I/O is routed through a multi-GPU-safe backend.
-**Current focus:** Phase 16 — Cucascade Submodule Rebase + Pin Recovery
+**Current focus:** Phase 18 — DataBatch RAII Migration (cucascade #117 surface)
 
 ## Current Position
 
-Phase: 18
-Plan: Not started
-Status: Phase 17 complete — Final Verdict PASS (all 5 MERGE-XX satisfied); proceed to Phase 18
+Phase: 18 (DataBatch RAII Migration (cucascade #117 surface)) — EXECUTING
+Plan: 2 of 6
+Status: Ready to execute
 Last activity: 2026-05-05
 
 ```
@@ -86,6 +86,7 @@ v1.4 Progress: [######              ] 2/6 phases | 9/32 requirements | 9 plans
 | Phase 17-sirius-origin-dev-merge-base-layer P02 | 45min | 3 tasks | 11 files |
 | Phase 17-sirius-origin-dev-merge-base-layer P03 | 45 | 2 tasks | 2 files |
 | Phase 17-sirius-origin-dev-merge-base-layer P04 | 15min | 1 tasks | 1 files |
+| Phase 18 P01 | 5min | 3 tasks | 4 files |
 
 ## Decisions
 
@@ -160,6 +161,8 @@ v1.4 Progress: [######              ] 2/6 phases | 9/32 requirements | 9 plans
 - [Phase 17-sirius-origin-dev-merge-base-layer]: 17-03: D-G3 PASS — all 62 src/+47 test/ FSM grep hits are fully-qualified cucascade API calls; 0 bare FSM enum names from merge
 - [Phase 17-sirius-origin-dev-merge-base-layer]: 17-03: MERGE-05 PASS — 63 build errors all Phase 18 DB-02/DB-03; 0 unrelated errors; liburing-dev missing is IO-12 territory (Bucket 5, not blocking)
 - [Phase 17-sirius-origin-dev-merge-base-layer]: 17-04: All 6 D-G gates PASS; Phase 17 Final Verdict PASS (all 5 MERGE-XX satisfied); cucascade pin 1c1e648 intact; phase17-pre-merge-backup preserved
+- [Phase 18]: [18-01] DB-01 closed: batch_lock_utils.hpp rewritten with three RAII helpers (prepare_and_acquire_mutable, try_acquire_mutable, acquire_read_only); operator-data prepare_for_processing returns optional<vector<mutable_data_batch>>; get_cudf_table_view takes const read_only_data_batch&. Build errors 63 -> 58. HYG-02 = 0 in all 4 modified files.
+- [Phase 18]: [18-01] Acceptance criterion 'build error count <= 50' partial-met (actual: 58). 5-error gap is R2 size-estimator inline body content in modified headers (sirius_physical_operator.hpp:191-192, parquet_scan_operator_data.hpp:186) — RESEARCH.md classifies these as plan 18-02 territory. Plus 6 pre-existing liburing errors in src/io/uring/uring_reactor.cpp (Phase 19 / IO-12 territory, not in DB-01..05 scope per CONTEXT.md). Strict per-task acceptance criteria all PASS.
 
 ## Accumulated Context
 
@@ -195,6 +198,6 @@ None at roadmap creation. Phase 16 is ready to plan.
 
 ## Session Continuity
 
-Last session: 2026-05-05T14:19:14.680Z
-Stopped at: Completed 17-03-PLAN.md
+Last session: 2026-05-05T15:39:04.055Z
+Stopped at: Completed 18-01-PLAN.md
 Resume file: None
