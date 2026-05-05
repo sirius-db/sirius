@@ -273,7 +273,7 @@ class SiriusContext : public ClientContextState {
 
   /// Label set by the `sirius_set_query_label` SQL function, consumed at the
   /// next sirius_interface construction site. Cleared on take.
-  std::optional<std::string> pending_query_label_;
+  std::optional<std::string> pending_query_label_{std::nullopt};
 
   /// Snapshot of the connection's disabled optimizer set before the transparent
   /// optimizer hook mutates it.

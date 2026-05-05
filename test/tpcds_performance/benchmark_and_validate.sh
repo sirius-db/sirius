@@ -280,10 +280,6 @@ while [ $# -gt 0 ]; do
             DUCKDB_RESULTS_DIR="$2"
             shift 2
             ;;
-        --note)
-            export RUN_NOTE="$2"
-            shift 2
-            ;;
         --)
             shift
             break
@@ -305,7 +301,6 @@ if [ $# -ne 1 ]; then
     echo "  --gpu-only                Run only the GPU-compatible query subset"
     echo "  --queries <N...> --       Specific query numbers (use -- before scale_factor)"
     echo "  --duckdb-results <dir>    Reuse previously stored DuckDB results"
-    echo "  --note <text>             Free-form annotation prepended to telemetry labels"
     echo ""
     echo "Examples:"
     echo "  $0 1"
@@ -408,12 +403,10 @@ echo "=== Collecting run info ==="
     echo ""
 
     echo "--- Benchmark ---"
-    echo "benchmark: tpcds"
     echo "suite: TPC-DS"
     echo "scale_factor: $SF"
     echo "query_mode: $QUERY_MODE"
     echo "queries: ${QUERIES[*]}"
-    echo "note: ${RUN_NOTE:-}"
     echo ""
 
     if [ -n "${DUCKDB_RESULTS_DIR:-}" ]; then
