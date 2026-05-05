@@ -43,6 +43,8 @@
 using duckdb::CompressionType;
 using sirius::cuda::scan::BitpackingMode;
 using sirius::cuda::scan::BP_META_GROUP_SIZE;
+using sirius::cuda::scan::decode_bitpacking_data;
+using sirius::cuda::scan::gpu_codec_run;
 using sirius::cuda::scan::gpu_column_decode_input;
 using sirius::cuda::scan::gpu_decode_table;
 using sirius::cuda::scan::gpu_segment_desc;
@@ -184,7 +186,7 @@ std::vector<T> decode_one(std::vector<uint8_t> const& bytes,
                                         0,
                                         row_count}}});
 
-  auto t = gpu_decode_table({col}, stream.view(), &mr);
+  auto t = gpu_decode_table({col}, stream.view(), mr);
   REQUIRE(t->num_rows() == static_cast<cudf::size_type>(row_count));
   return download<T>(t->get_column(0).view().data<T>(), row_count, stream.value());
 }
@@ -339,7 +341,7 @@ TEST_CASE("gpu_decode_table BITPACKING - multi-segment column", "[scan][decode][
       gpu_segment_desc{
         static_cast<uint8_t const*>(d_b.data()), static_cast<uint32_t>(d_b.size()), 50, 50}}});
 
-  auto t   = gpu_decode_table({col}, stream.view(), &mr);
+  auto t   = gpu_decode_table({col}, stream.view(), mr);
   auto out = download<int32_t>(t->get_column(0).view().data<int32_t>(), 100, stream.value());
   for (uint32_t i = 0; i < 50; ++i)
     REQUIRE(out[i] == 7);
@@ -371,9 +373,8 @@ TEST_CASE("gpu_decode_table BITPACKING - multi-group segment", "[scan][decode][b
   std::memcpy(bytes.data() + 8 + sizeof(T), &v1, sizeof(T));
   uint32_t entry0 = (static_cast<uint32_t>(BitpackingMode::CONSTANT) << 24) | 8u;
   uint32_t entry1 = (static_cast<uint32_t>(BitpackingMode::CONSTANT) << 24) | (8u + sizeof(T));
-  // group 0 entry sits at metadata_end - 2*4 (for group_idx=0 → offset
-  // metadata_end - 1*4; for group_idx=1 → offset metadata_end - 2*4). The
-  // kernel reads entry K at metadata_end - (K+1)*4.
+  // Trailer: kernel reads entry K at metadata_end - (K+1)*4.
+  // Group 0 → metadata_end - 4 (entry0); group 1 → metadata_end - 8 (entry1).
   std::memcpy(bytes.data() + metadata_end - 4, &entry0, sizeof(uint32_t));
   std::memcpy(bytes.data() + metadata_end - 8, &entry1, sizeof(uint32_t));
 
@@ -390,7 +391,7 @@ TEST_CASE("gpu_decode_table BITPACKING - multi-group segment", "[scan][decode][b
                                         0,
                                         total_rows}}});
 
-  auto t   = gpu_decode_table({col}, stream.view(), &mr);
+  auto t   = gpu_decode_table({col}, stream.view(), mr);
   auto out = download<int32_t>(t->get_column(0).view().data<int32_t>(), total_rows, stream.value());
   for (uint32_t i = 0; i < group_rows; ++i)
     REQUIRE(out[i] == 7);
@@ -399,12 +400,27 @@ TEST_CASE("gpu_decode_table BITPACKING - multi-group segment", "[scan][decode][b
 }
 
 //===----------------------------------------------------------------------===//
-// Defensive guards. Assert the kernel treats malformed metadata as a no-op
-// rather than writing garbage. Each test pre-fills the output with a canary
-// value the kernel must not overwrite.
+// Defensive guards. Each test pre-fills the output with a 0xCC canary and
+// invokes `decode_bitpacking_data` directly (bypassing the dispatcher's
+// allocate-fresh path) so we can prove the kernel deterministically zero-
+// fills on malformed metadata, rather than relying on REQUIRE_NOTHROW alone.
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("gpu_decode_table BITPACKING - INVALID mode is a no-op",
+namespace {
+inline std::vector<int32_t> decode_invalid_with_canary(rmm::cuda_stream& stream,
+                                                       rmm::mr::cuda_async_memory_resource& mr,
+                                                       gpu_codec_run const& run,
+                                                       uint32_t total_rows)
+{
+  std::vector<uint8_t> canary(size_t{total_rows} * sizeof(int32_t), 0xCC);
+  rmm::device_buffer d_out(canary.data(), canary.size(), stream.view());
+  decode_bitpacking_data(
+    run, static_cast<uint8_t*>(d_out.data()), I32, sizeof(int32_t), stream.view(), mr);
+  return download<int32_t>(d_out.data(), total_rows, stream.value());
+}
+}  // namespace
+
+TEST_CASE("gpu_decode_table BITPACKING - INVALID mode zero-fills",
           "[scan][decode][bitpacking][defensive]")
 {
   std::vector<uint8_t> bytes(64, 0);
@@ -417,30 +433,22 @@ TEST_CASE("gpu_decode_table BITPACKING - INVALID mode is a no-op",
   rmm::mr::cuda_async_memory_resource mr;
   rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
 
-  // Pre-fill the dispatcher's output with a canary. We achieve this by
-  // running a CONSTANT codec column for a different value first, then
-  // overwriting with BITPACKING — the kernel must leave the canary intact.
-  // Simpler approach: treat untouched bytes as the kernel's fingerprint.
-  // The dispatcher's `decode_column_data` allocates raw uninitialised
-  // device memory, so we can't read a canary back; instead, assert
-  // `null_count` and `num_rows` survive without a CUDA error from the
-  // kernel.
-  gpu_column_decode_input col;
-  col.out_type   = I32;
-  col.total_rows = 32;
-  col.data.push_back(
-    {CompressionType::COMPRESSION_BITPACKING,
-     {gpu_segment_desc{
-       static_cast<uint8_t const*>(d_seg.data()), static_cast<uint32_t>(d_seg.size()), 0, 32}}});
-  REQUIRE_NOTHROW(gpu_decode_table({col}, stream.view(), &mr));
+  uint32_t const total_rows = 32;
+  gpu_codec_run run{CompressionType::COMPRESSION_BITPACKING,
+                    {gpu_segment_desc{static_cast<uint8_t const*>(d_seg.data()),
+                                      static_cast<uint32_t>(d_seg.size()),
+                                      0,
+                                      total_rows}}};
+  auto out = decode_invalid_with_canary(stream, mr, run, total_rows);
+  for (uint32_t i = 0; i < total_rows; ++i) REQUIRE(out[i] == 0);
 }
 
-TEST_CASE("gpu_decode_table BITPACKING - corrupt metadata_end is a no-op",
+TEST_CASE("gpu_decode_table BITPACKING - corrupt metadata_end zero-fills",
           "[scan][decode][bitpacking][defensive]")
 {
   std::vector<uint8_t> bytes(64, 0);
-  // metadata_end past the segment buffer — the kernel must bail to INVALID
-  // rather than read past d_seg.
+  // metadata_end past the segment buffer — kernel demotes to INVALID and
+  // zero-fills rather than read past d_seg.
   uint64_t bogus_end = 1ULL << 30;
   std::memcpy(bytes.data(), &bogus_end, sizeof(bogus_end));
 
@@ -448,21 +456,21 @@ TEST_CASE("gpu_decode_table BITPACKING - corrupt metadata_end is a no-op",
   rmm::mr::cuda_async_memory_resource mr;
   rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
 
-  gpu_column_decode_input col;
-  col.out_type   = I32;
-  col.total_rows = 16;
-  col.data.push_back(
-    {CompressionType::COMPRESSION_BITPACKING,
-     {gpu_segment_desc{
-       static_cast<uint8_t const*>(d_seg.data()), static_cast<uint32_t>(d_seg.size()), 0, 16}}});
-  REQUIRE_NOTHROW(gpu_decode_table({col}, stream.view(), &mr));
+  uint32_t const total_rows = 16;
+  gpu_codec_run run{CompressionType::COMPRESSION_BITPACKING,
+                    {gpu_segment_desc{static_cast<uint8_t const*>(d_seg.data()),
+                                      static_cast<uint32_t>(d_seg.size()),
+                                      0,
+                                      total_rows}}};
+  auto out = decode_invalid_with_canary(stream, mr, run, total_rows);
+  for (uint32_t i = 0; i < total_rows; ++i) REQUIRE(out[i] == 0);
 }
 
-TEST_CASE("gpu_decode_table BITPACKING - width > sizeof(T)*8 is a no-op",
+TEST_CASE("gpu_decode_table BITPACKING - width > sizeof(T)*8 zero-fills",
           "[scan][decode][bitpacking][defensive]")
 {
-  // Build a FOR block, then patch the width field to 100 (wider than int32).
-  // The kernel must bail to INVALID rather than read past the packed stream.
+  // FOR block with width patched to 100 (wider than int32) — kernel must
+  // demote to INVALID and zero-fill rather than read past the packed stream.
   auto bytes          = make_for_block<int32_t>(0, 5, std::vector<int32_t>(8, 1));
   int32_t bogus_width = 100;
   std::memcpy(bytes.data() + 8 + sizeof(int32_t), &bogus_width, sizeof(int32_t));
@@ -471,39 +479,36 @@ TEST_CASE("gpu_decode_table BITPACKING - width > sizeof(T)*8 is a no-op",
   rmm::mr::cuda_async_memory_resource mr;
   rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
 
-  gpu_column_decode_input col;
-  col.out_type   = I32;
-  col.total_rows = 8;
-  col.data.push_back(
-    {CompressionType::COMPRESSION_BITPACKING,
-     {gpu_segment_desc{
-       static_cast<uint8_t const*>(d_seg.data()), static_cast<uint32_t>(d_seg.size()), 0, 8}}});
-  REQUIRE_NOTHROW(gpu_decode_table({col}, stream.view(), &mr));
+  uint32_t const total_rows = 8;
+  gpu_codec_run run{CompressionType::COMPRESSION_BITPACKING,
+                    {gpu_segment_desc{static_cast<uint8_t const*>(d_seg.data()),
+                                      static_cast<uint32_t>(d_seg.size()),
+                                      0,
+                                      total_rows}}};
+  auto out = decode_invalid_with_canary(stream, mr, run, total_rows);
+  for (uint32_t i = 0; i < total_rows; ++i) REQUIRE(out[i] == 0);
 }
 
-TEST_CASE("gpu_decode_table BITPACKING - packed stream past metadata_end is a no-op",
+TEST_CASE("gpu_decode_table BITPACKING - packed stream past metadata_end zero-fills",
           "[scan][decode][bitpacking][defensive]")
 {
-  // Build a FOR block whose declared row_count would require packed_words
-  // that overflow past metadata_end. The kernel must catch the packed-stream
-  // bound check and bail to INVALID rather than reading past the segment.
-  // We construct a minimal FOR block (8 packed values, width=4) and lie to
-  // the dispatcher that the segment carries 2048 rows — packed_words for
-  // 2048 rows at width=4 is 256 words = 1024 bytes, well past the segment.
+  // FOR block with declared row_count that would push packed_words past
+  // metadata_end. Kernel catches the packed-stream bound check, demotes to
+  // INVALID, and zero-fills.
   auto bytes = make_for_block<int32_t>(/*frame=*/0, /*width=*/4, std::vector<int32_t>(8, 1));
 
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
   rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
 
-  gpu_column_decode_input col;
-  col.out_type   = I32;
-  col.total_rows = 2048;
-  col.data.push_back(
-    {CompressionType::COMPRESSION_BITPACKING,
-     {gpu_segment_desc{
-       static_cast<uint8_t const*>(d_seg.data()), static_cast<uint32_t>(d_seg.size()), 0, 2048}}});
-  REQUIRE_NOTHROW(gpu_decode_table({col}, stream.view(), &mr));
+  uint32_t const total_rows = 2048;
+  gpu_codec_run run{CompressionType::COMPRESSION_BITPACKING,
+                    {gpu_segment_desc{static_cast<uint8_t const*>(d_seg.data()),
+                                      static_cast<uint32_t>(d_seg.size()),
+                                      0,
+                                      total_rows}}};
+  auto out = decode_invalid_with_canary(stream, mr, run, total_rows);
+  for (uint32_t i = 0; i < total_rows; ++i) REQUIRE(out[i] == 0);
 }
 
 TEST_CASE("gpu_decode_table BITPACKING - unsupported type_size throws",
@@ -525,6 +530,6 @@ TEST_CASE("gpu_decode_table BITPACKING - unsupported type_size throws",
     {CompressionType::COMPRESSION_BITPACKING,
      {gpu_segment_desc{
        static_cast<uint8_t const*>(d_seg.data()), static_cast<uint32_t>(d_seg.size()), 0, 8}}});
-  REQUIRE_THROWS_WITH(gpu_decode_table({col}, stream.view(), &mr),
+  REQUIRE_THROWS_WITH(gpu_decode_table({col}, stream.view(), mr),
                       Catch::Contains("viability invariant violated"));
 }

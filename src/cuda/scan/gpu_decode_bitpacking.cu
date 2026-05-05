@@ -44,9 +44,11 @@
 //
 // Defensive metadata bounds: `metadata_end` and `data_off` come from disk
 // and could be malformed. Each parse step that would produce an OOB read or
-// write demotes `sm_mode` to INVALID; the per-mode branches treat INVALID
-// as a no-op rather than falling through to a default decode path (the
-// silent-zero-fill bug Copilot caught on the original kernel).
+// write demotes `sm_mode` to INVALID; INVALID then deterministically
+// zero-fills the group's output range (using the trusted descriptor row
+// count, not the parsed metadata) so the column buffer never carries
+// uninitialised device contents downstream — addresses the information-
+// disclosure concern that the prior return-without-writing path created.
 //===----------------------------------------------------------------------===//
 
 #include "cuda/scan/gpu_decode_bitpacking.cuh"
@@ -324,10 +326,19 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
   // FOR / DELTA_FOR — load packed bytes into shmem, then unpack-and-store.
   //===--------------------------------------------------------------------===//
 
-  // Anything other than FOR / DELTA_FOR at this point is INVALID metadata
-  // or a future-added mode the kernel does not understand. Bail rather than
-  // fall through and write zeros silently — Copilot pattern #9.
-  if (mode != BitpackingMode::FOR && mode != BitpackingMode::DELTA_FOR) return;
+  // Anything other than FOR / DELTA_FOR is INVALID metadata or an unknown
+  // mode. Deterministic zero-fill of the descriptor's row range — leaving
+  // the buffer uninitialised would expose prior device contents (the
+  // information-disclosure concern Copilot flagged). Use desc.group_row_count
+  // (always trusted; comes from the host descriptor) rather than sm_row_count,
+  // which is only set on a successful metadata parse.
+  if (mode != BitpackingMode::FOR && mode != BitpackingMode::DELTA_FOR) {
+    uint32_t const fill_rows = desc.group_row_count;
+    for (uint32_t i = threadIdx.x; i < fill_rows; i += blockDim.x) {
+      __stwt(out + i, T(0));
+    }
+    return;
+  }
 
   uint32_t const width = sm_width;
   T const frame        = sm_frame;
