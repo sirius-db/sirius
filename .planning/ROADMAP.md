@@ -132,7 +132,13 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
   3. `grep -c "rmm::cuda_stream_default" src/` returns <= 40 (HYG-02 baseline preserved).
   4. `[mgpu]` filter passes 16/16 (DB-05 light regression gate — DataBatch migration did not break multi-GPU correctness).
   5. `[mgpu_stress]` 1-iter smoke (100 iterations × 5 queries but only 1 repetition) exits 0 — SCHED-RR survival after RAII migration; 500-iter deferred to Phase 21.
-**Plans**: TBD
+**Plans**: 6 plans
+- [ ] 18-01-PLAN.md — Rewrite batch_lock_utils.hpp + ripple prepare_for_processing return type + get_cudf_table_view signature (DB-01)
+- [ ] 18-02-PLAN.md — Migrate convertible_* wrappers + sirius_physical_operator base impl + gpu_pipeline_task storage (DB-02, DB-03)
+- [ ] 18-03-PLAN.md — Migrate stateful operators with FSM-pop / 3-arg pop-by-id: table_scan, hash_join, nested_loop_join, concat, top_n, grouped_aggregate_merge, ungrouped_aggregate, merge_sort (DB-02, DB-03)
+- [ ] 18-04-PLAN.md — Migrate read-only operators + scan layer + close 4 sites of 2-arg make_data_batch (Pitfall 4) (DB-02, DB-03)
+- [ ] 18-05-PLAN.md — Migrate 23 test files; reach build-clean (DB-03, DB-04)
+- [ ] 18-06-PLAN.md — Run all grep gates + [mgpu] 16/16 + [mgpu_stress] 1-iter + racecheck; write 18-VERDICT.md (DB-04, DB-05)
 **Pitfalls**:
   - P1 (RAII lock scope self-deadlock): scope every `read_only_data_batch` / `mutable_data_batch` accessor to the narrowest possible block; never hold a `to_read_only()` accessor while calling any function that internally acquires `to_mutable()` on the same batch. Use `readonly_to_mutable(std::move(ro))` for upgrade paths.
   - P3 (pop_next_data_batch non-blocking semantics): every old `pop_data_batch(target_state)` call site must be replaced with a proper wait loop, not a bare `pop_next_data_batch()` that discards `nullptr`. Run `[TPC-H][parquet]` correctness check to detect silent data loss.
@@ -205,7 +211,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 | 15. Cross-GPU operator-colocation audit | v1.3 | 4/4 | Complete | 2026-05-01 |
 | 16. Cucascade Submodule Rebase + Pin Recovery | v1.4 | 5/5 | Complete    | 2026-05-05 |
 | 17. Sirius origin/dev Merge — Base Layer | v1.4 | 4/4 | Complete    | 2026-05-05 |
-| 18. DataBatch RAII Migration | v1.4 | 0/? | Not started | - |
+| 18. DataBatch RAII Migration | v1.4 | 0/6 | Not started | - |
 | 19. IO Framework Adoption | v1.4 | 0/? | Not started | - |
 | 20. Scan Manager + Pin Tables Port | v1.4 | 0/? | Not started | - |
 | 21. v1.4 Ship Gate | v1.4 | 0/? | Not started | - |
