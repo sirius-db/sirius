@@ -54,10 +54,17 @@ std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_da
 
   for (auto const& batch : input_batches) {
     if (!batch) { continue; }
+    // Phase 18 / DB-02 Recipe R1: scoped read-only accessor for the duration of
+    // the read; the accessor is destroyed at end-of-iteration -> shared lock
+    // released. P1: never spans a call that re-locks the same batch.
+    auto ro             = batch->to_read_only();
     auto filtered_table = gpu_expression_executor.select(
-      batch->get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
+      ro.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
+    // Pitfall 4 closure: 3-arg make_data_batch with the operator's actual
+    // execution stream (writer_stream) so the produced batch records the right
+    // writer event for downstream cross-device readers.
     output_batches.push_back(
-      sirius::make_data_batch(std::move(filtered_table), *batch->get_memory_space()));
+      sirius::make_data_batch(std::move(filtered_table), *ro.get_memory_space(), stream));
   }
   return std::make_unique<pipelineable_operator_data>(output_batches);
 }

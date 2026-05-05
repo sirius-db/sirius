@@ -57,10 +57,15 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
 
   for (auto const& batch : input_batches) {
     if (!batch) { continue; }
+    // Phase 18 / DB-02 Recipe R1: scoped read-only accessor; destroyed at
+    // end-of-iteration -> shared lock released. P1: no nested re-lock on this
+    // batch in the same scope.
+    auto ro              = batch->to_read_only();
     auto projected_table = gpu_expression_executor.execute(
-      batch->get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
+      ro.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
+    // Pitfall 4 closure: 3-arg make_data_batch with the operator's stream.
     output_batches.push_back(
-      sirius::make_data_batch(std::move(projected_table), *batch->get_memory_space()));
+      sirius::make_data_batch(std::move(projected_table), *ro.get_memory_space(), stream));
   }
   return std::make_unique<pipelineable_operator_data>(output_batches);
 }

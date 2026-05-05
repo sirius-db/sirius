@@ -114,7 +114,15 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
     // pipelineable_operator_data::prepare_for_processing -> lock_or_prepare_batch.
     // batches[0]->get_memory_space() == target_space here.
     // See .planning/phases/15-mgpu-operator-colocation-audit/15-AUDIT-LOG.md.
-    if (!space) { space = batch->get_memory_space(); }
+    //
+    // Phase 18 / DB-02 Recipe R1: scoped read-only accessor for the
+    // memory-space probe; destroyed at end-of-iteration -> shared lock
+    // released. The `space` pointer is to a long-lived memory_space owned by
+    // the reservation manager so it stays valid after the accessor drops.
+    if (!space) {
+      auto ro = batch->to_read_only();
+      space   = ro.get_memory_space();
+    }
     valid_batches.push_back(batch);
   }
 
@@ -128,12 +136,21 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   try {
     // 2. Concatenate all sample batches into one table
     std::vector<cudf::table_view> sample_views;
+    // Phase 18 / DB-02 Recipe R1: hold one read_only_data_batch per source
+    // batch in `accessors` for the LIFETIME of `sample_views`. table_view is
+    // a non-owning view into the accessor's representation — if the accessor
+    // dropped here (per-iteration scope), the underlying gpu_table_representation
+    // could (in principle) be freed before cudf::concatenate runs below. Keep
+    // every shared lock alive until after the concatenate completes.
+    std::vector<cucascade::read_only_data_batch> accessors;
+    accessors.reserve(valid_batches.size());
     size_t total_sample_bytes = 0;
     sample_views.reserve(valid_batches.size());
     for (auto const& batch : valid_batches) {
-      auto view = get_cudf_table_view(*batch);
+      accessors.push_back(batch->to_read_only());
+      auto view = get_cudf_table_view(accessors.back());
       sample_views.push_back(view);
-      total_sample_bytes += batch->get_data()->get_size_in_bytes();
+      total_sample_bytes += accessors.back().get_data()->get_size_in_bytes();
     }
 
     auto concat_table = cudf::concatenate(sample_views, stream, space->get_default_allocator());

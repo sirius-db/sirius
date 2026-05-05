@@ -89,7 +89,11 @@ std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(
     // Check if limit is already exhausted
     if (_remaining_limit.load(std::memory_order_acquire) <= 0) { break; }
 
-    auto view     = batch->get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+    // Phase 18 / DB-02 Recipe R1: scoped read-only accessor for the read +
+    // memory-space probe + slice construction. Destroyed at end-of-iteration
+    // -> shared lock released.
+    auto ro       = batch->to_read_only();
+    auto view     = ro.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
     auto num_rows = static_cast<int64_t>(view.num_rows());
 
     if (num_rows == 0) { continue; }
@@ -110,12 +114,12 @@ std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(
 
     // cudf::slice returns a vector of table_views; materialize into a table
     auto sliced_table = std::make_unique<cudf::table>(
-      slices.front(), stream, batch->get_memory_space()->get_default_allocator());
+      slices.front(), stream, ro.get_memory_space()->get_default_allocator());
     // STREAM-LINEAGE: cudf::table copy-ctor writes on `stream`; the constructor
     // records the writer event for downstream cross-device readers (Phase 13-02
     // / 13-04 Path-2).
     auto sliced_repr = std::make_unique<cucascade::gpu_table_representation>(
-      std::move(sliced_table), *batch->get_memory_space(), stream);
+      std::move(sliced_table), *ro.get_memory_space(), stream);
     std::unique_ptr<cucascade::idata_representation> output_data = std::move(sliced_repr);
 
     auto const batch_id = ::sirius::get_next_batch_id();
