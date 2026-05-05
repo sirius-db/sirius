@@ -136,7 +136,7 @@ parsed_uri parse(std::string_view uri)
 
   // Bare absolute path -> file scheme.
   // Relative bare paths are rejected: callers must pass an absolute POSIX path
-  // or a scheme-qualified URI. (Spec: PR8 normalization rule.)
+  // or a scheme-qualified URI.
   if (uri.front() == '/') {
     out.scheme = std::string{kFileScheme};
     // Split off query.

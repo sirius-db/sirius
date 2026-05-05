@@ -37,3 +37,9 @@ compile_commands.json
 
 # Zed editor settings
 .zed
+
+# Local-only AI assistant + planning artifacts (per-machine, not for upstream)
+.claude/worktrees/
+AGENTS.md
+CLAUDE.local.md
+newplan.md

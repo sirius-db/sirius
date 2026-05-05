@@ -72,7 +72,7 @@ constexpr std::string_view kFileScheme = "file";
 }  // namespace
 
 // Retained for compatibility with PR1 callsites/tests; prefer sirius::io::parse()
-// for new code. PR8 routes both through the real URI parser.
+// for new code. Both helpers route through the real URI parser.
 std::string datasource_factory::extract_scheme(std::string_view uri) { return parse(uri).scheme; }
 
 std::string datasource_factory::extract_path(std::string_view uri) { return parse(uri).path; }

@@ -22,8 +22,9 @@
 
 namespace sirius::io {
 
-/// Runtime-configurable parameters for remote object-store backends.
-/// Plumbed through in PR7; the S3 backend that consumes these lands in PR9.
+/// Inert configuration carrier for remote object-store backends.
+/// PR1 only exposes the POD fields and enum/string helpers; runtime plumbing and
+/// backend consumption live in the integration/backend PRs.
 /// Empty strings are valid and mean "no value configured".
 struct object_store_config {
   std::string endpoint;
@@ -31,8 +32,8 @@ struct object_store_config {
   std::string access_key;
   std::string secret_key;
 
-  /// Which transport the factory should use when building an S3 datasource.
-  /// AUTO lets the factory pick based on URI scheme and endpoint capabilities.
+  /// Requested S3 transport. AUTO leaves the concrete backend/integration code
+  /// to choose based on URI scheme and endpoint capabilities.
   enum class transport { AUTO, HTTP, RDMA };
   transport s3_transport = transport::AUTO;
 };

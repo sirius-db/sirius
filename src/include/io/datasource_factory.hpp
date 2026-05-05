@@ -87,11 +87,12 @@ class datasource_registry {
 /**
  * @brief Factory that constructs an @c io_datasource from a URI.
  *
- * Dispatch is by URI scheme: the factory extracts the scheme, looks up the
- * registered @c sirius_ioctx, and asks it to construct a datasource for the
- * corresponding @c sirius_io_object.
+ * Dispatch is by URI scheme: the factory extracts the scheme and looks up the
+ * registered @c sirius_ioctx. PR1 intentionally ships only the backend-neutral
+ * skeleton; backend-specific object construction (for example S3 bucket/key
+ * handles) lands with the corresponding backend PR.
  *
- * URI forms supported (parsing is delegated to @c sirius::io::parse in PR8):
+ * URI forms supported (parsing is delegated to @c sirius::io::parse):
  *   - <tt>/absolute/path</tt>      — treated as scheme @c "file"
  *   - <tt>file:///abs/path</tt>    — scheme @c "file"
  *   - <tt>s3://bucket/key</tt>,
@@ -111,11 +112,10 @@ class datasource_factory {
    *   - Local file paths (@c "/data/foo.parquet", @c "file:///data/foo.parquet")
    *     return cudf's default datasource (@c cudf::io::datasource::create) —
    *     pre-PR3 baseline. The registry is not consulted for file scheme.
-   *   - Object-store schemes (@c s3://, etc.) go through the registry → ioctx
-   *     and produce a @c sirius_datasource (which is an @c io_datasource and
-   *     thus also a @c cudf::io::datasource). Callers that need the extended
-   *     @c io_datasource API must @c dynamic_cast — or, for s3-only paths,
-   *     call the ioctx directly.
+   *   - Object-store schemes (@c s3://, etc.) first go through the registry
+   *     lookup. In PR1, a registered object-store scheme still throws
+   *     "object construction is not yet implemented"; the backend PR that owns
+   *     the concrete @c sirius_io_object wires the final construction step.
    *
    * The wider return type is deliberate: it lets the file branch keep using
    * cudf's proven default reader without forcing a sirius-specific adapter,
@@ -131,8 +131,8 @@ class datasource_factory {
    *
    * @throw std::invalid_argument if the URI is empty or malformed.
    * @throw std::runtime_error    if an object-store scheme has no backend
-   *                              registered, or if the backend's
-   *                              @c make_datasource fails.
+   *                              registered, or if backend-specific object
+   *                              construction has not landed yet.
    */
   static std::unique_ptr<cudf::io::datasource> create(std::string_view uri,
                                                       datasource_registry const& registry,
@@ -154,8 +154,7 @@ class datasource_factory {
    *     stores to the registered @c sirius_ioctx.
    *
    * The strict @c create keeps its parser-strict contract — prefer it for
-   * callers that should reject unscheme'd input as a real bug (e.g., the
-   * @c sirius_read_parquet S3 materializer in @c sirius_extension.cpp).
+   * callers that should reject unscheme'd input as a real bug.
    *
    * @throw std::invalid_argument if the URI is empty (preserves strict
    *                              @c create's empty-URI rejection).
