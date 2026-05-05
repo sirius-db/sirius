@@ -34,6 +34,7 @@
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
+#include <data/data_batch_utils.hpp>
 
 #include <iostream>
 #include <memory>
@@ -195,26 +196,9 @@ inline bool expect_data_batches_equivalent(const std::shared_ptr<cucascade::data
     return false;
   }
 
-  // Extract the GPU table representations from the data batches
-  auto* lhs_data = lhs->get_data();
-  auto* rhs_data = rhs->get_data();
-
-  if (!lhs_data || !rhs_data) {
-    std::cout << "Cannot compare data_batch with null data representation" << std::endl;
-    return false;
-  }
-
-  // Cast to gpu_table_representation
-  auto& lhs_gpu_repr = lhs_data->cast<cucascade::gpu_table_representation>();
-  auto& rhs_gpu_repr = rhs_data->cast<cucascade::gpu_table_representation>();
-
-  // Get the cuDF tables
-  auto& lhs_table = lhs_gpu_repr.get_table();
-  auto& rhs_table = rhs_gpu_repr.get_table();
-
-  // Get table views for comparison
-  auto lhs_view = lhs_table.view();
-  auto rhs_view = rhs_table.view();
+  // Extract GPU table views from data batches via RAII read-only accessors
+  auto lhs_view = sirius::get_cudf_table_view(*lhs);
+  auto rhs_view = sirius::get_cudf_table_view(*rhs);
 
   // If sort is requested, sort both tables by all columns
   if (sort) {
@@ -256,22 +240,8 @@ inline bool expect_data_batch_equivalent_to_table(
     return false;
   }
 
-  // Extract the GPU table representation from the data batch
-  auto* batch_data = batch->get_data();
-
-  if (!batch_data) {
-    std::cout << "Cannot compare data_batch with null data representation" << std::endl;
-    return false;
-  }
-
-  // Cast to gpu_table_representation
-  auto& batch_gpu_repr = batch_data->cast<cucascade::gpu_table_representation>();
-
-  // Get the cuDF table
-  auto& batch_table = batch_gpu_repr.get_table();
-
-  // Get table view for comparison
-  auto batch_view = batch_table.view();
+  // Extract GPU table view from the data batch via RAII read-only accessor
+  auto batch_view = sirius::get_cudf_table_view(*batch);
 
   // If sort is requested, sort both tables by all columns
   if (sort) {

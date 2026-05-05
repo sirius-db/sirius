@@ -27,7 +27,9 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <array>
 #include <ranges>
+#include <span>
 
 namespace sirius {
 

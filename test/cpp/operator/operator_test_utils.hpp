@@ -113,8 +113,7 @@ inline std::shared_ptr<cucascade::data_batch> concatenate_batches_horizontal(
   std::vector<std::unique_ptr<cudf::column>> all_columns;
 
   for (const auto& batch : batches) {
-    auto& table     = batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
-    auto table_view = table.view();
+    auto table_view = sirius::get_cudf_table_view(*batch);
 
     // Release and collect each column from this table
     for (cudf::size_type i = 0; i < table_view.num_columns(); ++i) {

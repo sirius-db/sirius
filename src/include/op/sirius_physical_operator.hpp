@@ -35,10 +35,6 @@
 
 namespace sirius {
 
-namespace memory {
-class sirius_memory_reservation_manager;
-}  // namespace memory
-
 namespace op {
 class sirius_physical_operator;
 }  // namespace op
@@ -98,22 +94,16 @@ class operator_data {
    *                                current space (see pipelineable_operator_data).
    * @param stream                  CUDA stream available for any data-movement
    *                                kernels triggered by preparation.
-   * @return  A vector of data_batch_processing_handles that must remain alive for
-   *          the duration of the task; these handles keep locked batches locked
-   *          until processing completes. An empty vector is valid and appropriate
-   *          when there is nothing to lock. Returns std::nullopt to signal a
-   *          preparation failure that should trigger task reschedule/retry
-   *          (for example, a batch lock that returned null).
+   * Throws on failure.
+   * pipelineable_operator_data rethrows rmm::out_of_memory after logging,
+   * and throws sirius::internal_exception for unrecoverable preparation errors.
    *
-   * The default implementation is a no-op that returns an empty handle vector.
-   * It is appropriate for operator_data subclasses that own no data requiring
-   * locking and need no per-task setup. Override when either condition changes.
+   * The default implementation is a no-op appropriate for operator_data subclasses
+   * that own no data requiring locking and need no per-task setup.
+   * Override when either condition changes.
    */
-  virtual std::optional<std::vector<::cucascade::data_batch_processing_handle>>
-  prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
-                         rmm::cuda_stream_view stream)
-  {
-    return std::vector<::cucascade::data_batch_processing_handle>{};
+  virtual void prepare_for_processing(
+    const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream) {
   };
 
   /**
@@ -128,71 +118,81 @@ class operator_data {
 };
 
 /**
- * @brief Operator data carrying a collection of data batches for pipeline execution.
+ * @brief Operator data carrying data batches for pipeline execution.
  *
- * This is the standard data container used by pipeline operators. It wraps a
- * vector of data batches that flow between operators in a pipeline.
+ * Unifies idle and read-only-locked batch access in a single container. Holds an
+ * optional vector of idle data_batch shared_ptrs and/or an optional vector of
+ * read_only_data_batch RAII accessors. Lazy conversion is performed on demand:
+ *   - get_data_batches() populates _data_batches from _read_only_data_batches if needed
+ *   - get_read_only_batches() populates _read_only_data_batches from _data_batches if needed
+ *
+ * prepare_for_processing() locks idle batches and stores the result in
+ * _read_only_data_batches. remove_read_only_lock() releases all shared locks.
  */
 class pipelineable_operator_data : public operator_data {
  public:
-  pipelineable_operator_data() = default;
+  pipelineable_operator_data()
+  {
+    _data_batches = std::vector<std::shared_ptr<::cucascade::data_batch>>();
+  }
   explicit pipelineable_operator_data(
     std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
     : _data_batches(std::move(data_batches))
   {
   }
-
-  /**
-   * @brief Get the data batches.
-   * @return Const reference to vector of data batch pointers
-   */
-  [[nodiscard]] const std::vector<std::shared_ptr<::cucascade::data_batch>>& get_data_batches()
-    const
+  explicit pipelineable_operator_data(
+    std::vector<::cucascade::read_only_data_batch> read_only_data_batches)
+    : _read_only_data_batches(std::move(read_only_data_batches))
   {
-    return _data_batches;
   }
 
   /**
-   * @brief Move the data batches out of this container, leaving it empty.
-   * @return Vector of data batch pointers (moved out).
+   * @brief Get idle data batch pointers, lazily populating from read-only batches if needed.
    */
-  std::vector<std::shared_ptr<::cucascade::data_batch>> release_data_batches()
+  [[nodiscard]] const std::vector<std::shared_ptr<::cucascade::data_batch>>& get_data_batches()
+    const;
+
+  /**
+   * @brief Get read-only locked batches, lazily populating from idle batches if needed.
+   */
+  [[nodiscard]] std::vector<::cucascade::read_only_data_batch> get_read_only_batches(
+    bool leave_locked = false) const;
+
+  /**
+   * @brief Release all read-only locks by resetting _read_only_data_batches.
+   */
+  void remove_read_only_lock()
   {
-    return std::move(_data_batches);
+    // Releasing the lock means getting rid of any _read_only_data_batches that we may have cached.
+    // But we want to make sure we do keep the data alive. So we ensure that the data_batches are
+    // populated.
+    if (!_data_batches) { auto _ = get_data_batches(); }
+    _read_only_data_batches = std::nullopt;
   }
 
   /**
    * @brief Lock all data batches for processing in the requested memory space.
    *
-   * Iterates over all batches and locks (or converts then locks) each one into the
-   * requested memory space. Returns the processing handles that keep the batches locked
-   * until they go out of scope.
-   *
-   * Returns std::nullopt if any batch fails to lock (triggers a retry/reschedule).
-   * Propagates rmm::out_of_memory so the caller can record metrics and reschedule.
-   *
-   * @param requested_memory_space  Target memory space; may be nullptr to use each batch's
-   *                                current space.
-   * @param stream                  CUDA stream used for any data-movement kernels.
-   * @return Processing handles for all batches, or std::nullopt on lock failure.
+   * Iterates over all idle batches and locks (or converts then locks) each one,
+   * storing the results in _read_only_data_batches. Throws sirius::internal_exception
+   * if any batch pointer is null or any batch fails to lock. Propagates rmm::out_of_memory.
    */
-  std::optional<std::vector<::cucascade::data_batch_processing_handle>> prepare_for_processing(
-    const ::cucascade::memory::memory_space* requested_memory_space,
-    rmm::cuda_stream_view stream) override;
+  void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
+                              rmm::cuda_stream_view stream) override;
 
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
   {
     std::size_t total = 0;
-    for (auto const& batch : _data_batches) {
-      if (batch && batch->get_data()) {
-        total += batch->get_data()->get_uncompressed_data_size_in_bytes();
-      }
+    auto ro_batches   = get_read_only_batches(false);
+    for (auto const& ro : ro_batches) {
+      if (ro.get_data()) { total += ro.get_data()->get_uncompressed_data_size_in_bytes(); }
     }
     return total;
   }
 
  private:
-  std::vector<std::shared_ptr<::cucascade::data_batch>> _data_batches;
+  mutable std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> _data_batches;
+  mutable std::optional<std::vector<::cucascade::read_only_data_batch>> _read_only_data_batches;
 };
 
 /**
@@ -401,13 +401,7 @@ class sirius_physical_operator {
   {
     // WSM TODO implement this
     throw std::runtime_error("can_create_more_tasks not implemented for operator " + get_name());
-  }
-
-  /// \brief check if all tasks have been processed
-  virtual bool has_processed_all_tasks() const
-  {
-    // WSM TODO implement this
-    throw std::runtime_error("has_processed_all_tasks not implemented for operator " + get_name());
+    return true;
   }
 
   /// \brief check if this operator has exhausted its limit, allowing the pipeline to finish early
@@ -417,6 +411,8 @@ class sirius_physical_operator {
   virtual std::unique_ptr<operator_data> get_next_task_input_data();
   //! Check if all ports are empty
   [[nodiscard]] virtual bool all_ports_empty();
+  //! Check if the pipeline is finished
+  bool check_pipeline_finished();
 
   //! Get pipeline
   duckdb::shared_ptr<pipeline::sirius_pipeline> get_pipeline() const noexcept;

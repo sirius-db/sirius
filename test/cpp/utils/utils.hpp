@@ -25,6 +25,8 @@
 #include "sirius_context.hpp"
 #include "sirius_test_env.hpp"
 
+#include <cudf/table/table.hpp>
+
 #include <data/sirius_converter_registry.hpp>
 #include <duckdb.hpp>
 

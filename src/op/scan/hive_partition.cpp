@@ -19,9 +19,6 @@
 #include <log/logging.hpp>
 #include <op/scan/hive_partition.hpp>
 
-// duckdb
-#include <duckdb/common/hive_partitioning.hpp>
-
 // cudf
 #include <cudf/column/column_factories.hpp>
 #include <cudf/cudf_utils.hpp>
@@ -32,14 +29,14 @@
 #include <unordered_set>
 #include <utility>
 
-namespace sirius::op::scan {
+namespace sirius {
 
 partition_inject_fn_t build_partition_inject_fn(
   duckdb::vector<duckdb::ColumnIndex> const& column_ids,
   duckdb::vector<std::string> const& names,
   duckdb::vector<sirius::logical_type> const& returned_types,
   std::vector<size_t> const& selected_column_indices,
-  std::vector<hive_partition_column> const& hive_partition_columns,
+  std::vector<sirius::op::scan::hive_partition_column> const& hive_partition_columns,
   std::unordered_set<size_t> const& hive_partition_index_set)
 {
   // Build the output column map in the order the pipeline expects.
@@ -50,7 +47,7 @@ partition_inject_fn_t build_partition_inject_fn(
   struct col_source {
     bool is_partition;
     size_t data_col_idx;
-    std::string partition_name;
+    size_t partition_values_idx;  ///< Index into the partition_values vector passed at call time.
     sirius::logical_type type;
   };
 
@@ -58,6 +55,14 @@ partition_inject_fn_t build_partition_inject_fn(
   std::unordered_map<size_t, size_t> duckdb_to_cudf;
   for (size_t i = 0; i < selected_column_indices.size(); ++i) {
     duckdb_to_cudf[selected_column_indices[i]] = i;
+  }
+
+  // Map partition-column name → index into hive_partition_columns. Callers are required to pass
+  // partition_values in this same order, so the closure can index without name lookup at runtime.
+  std::unordered_map<std::string, size_t> partition_name_to_idx;
+  partition_name_to_idx.reserve(hive_partition_columns.size());
+  for (size_t i = 0; i < hive_partition_columns.size(); ++i) {
+    partition_name_to_idx.emplace(hive_partition_columns[i].column_name, i);
   }
 
   // Build output_map in column_ids order (the order the pipeline expects).
@@ -69,16 +74,21 @@ partition_inject_fn_t build_partition_inject_fn(
     if (!seen.insert(primary_idx).second) continue;
 
     if (hive_partition_index_set.count(primary_idx)) {
+      auto pname_it = partition_name_to_idx.find(names[primary_idx]);
+      if (pname_it == partition_name_to_idx.end()) {
+        throw std::runtime_error("[hive_partition] Partition column '" + names[primary_idx] +
+                                 "' not found in hive_partition_columns; cannot build inject fn.");
+      }
       output_map.push_back(col_source{/* is_partition */ true,
                                       /* data_col_idx */ 0,
-                                      names[primary_idx],
+                                      /* partition_values_idx */ pname_it->second,
                                       returned_types[primary_idx]});
     } else {
       auto it = duckdb_to_cudf.find(primary_idx);
       if (it != duckdb_to_cudf.end()) {
         output_map.push_back(col_source{/* is_partition */ false,
                                         /* data_col_idx */ it->second,
-                                        /* partition_name */ {},
+                                        /* partition_values_idx */ 0,
                                         /* type */ {}});
       }
     }
@@ -93,11 +103,11 @@ partition_inject_fn_t build_partition_inject_fn(
 
   return [output_map = std::move(output_map)](
            std::unique_ptr<cudf::table> tbl,
-           std::string const& file_path,
+           std::string const& /*file_path*/,
+           std::vector<std::string> const& partition_values,
            rmm::cuda_stream_view stream) -> std::unique_ptr<cudf::table> {
     if (!tbl) return tbl;
 
-    auto partitions     = duckdb::HivePartitioning::Parse(file_path);
     auto const num_rows = tbl->num_rows();
     auto data_columns   = tbl->release();  // move columns out, no GPU copy
 
@@ -108,13 +118,13 @@ partition_inject_fn_t build_partition_inject_fn(
       if (!src.is_partition) {
         output_columns.push_back(std::move(data_columns[src.data_col_idx]));
       } else {
-        auto it = partitions.find(src.partition_name);
-        if (it == partitions.end()) {
-          throw std::runtime_error("[hive_partition] Missing hive partition key '" +
-                                   src.partition_name + "' in file path: " + file_path);
+        if (src.partition_values_idx >= partition_values.size()) {
+          throw std::runtime_error(
+            "[hive_partition] partition_values vector too short for required partition column.");
         }
+        auto const& value = partition_values[src.partition_values_idx];
         // DefaultCastAs requires a DuckDB type; the scalar factory takes the sirius type.
-        auto duckdb_val = duckdb::Value(it->second).DefaultCastAs(sirius::to_duckdb(src.type));
+        auto duckdb_val = duckdb::Value(value).DefaultCastAs(sirius::to_duckdb(src.type));
         auto scalar     = sirius::value_to_cudf_scalar(duckdb_val, src.type, stream);
         output_columns.push_back(cudf::make_column_from_scalar(*scalar, num_rows, stream));
       }
@@ -124,4 +134,4 @@ partition_inject_fn_t build_partition_inject_fn(
   };
 }
 
-}  // namespace sirius::op::scan
+}  // namespace sirius

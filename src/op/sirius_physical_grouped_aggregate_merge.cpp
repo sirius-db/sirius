@@ -147,8 +147,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next
     std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
     bool found_batch = true;
     while (found_batch) {
-      auto batch = ports.begin()->second->repo->pop_data_batch(
-        ::cucascade::batch_state::task_created, current_partition_index);
+      auto batch = ports.begin()->second->repo->pop_next_data_batch(current_partition_index);
       if (batch) {
         input_batch.push_back(std::move(batch));
       } else {
@@ -168,7 +167,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_grouped_aggregate_merge::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_data_batches();
+  const auto& input_batches = input.get_read_only_batches();
   if (input_batches.size() == 0) {
     throw std::runtime_error(
       "We expect at least one input batch for grouped aggregate merge operator");
@@ -176,19 +175,19 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
 
   // Fast path: single batch with no post-processing needed
   if (input_batches.size() == 1 && !has_avg && !has_count_distinct) {
-    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
+    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
   }
 
   // Merge multiple batches, or use single batch directly if only one
   std::shared_ptr<::cucascade::data_batch> merged;
   if (input_batches.size() == 1) {
-    merged = input_batches[0];
+    merged = input_batches[0].clone(sirius::get_next_batch_id(), stream);
   } else {
     merged = gpu_merge_impl::merge_grouped_aggregate(input_batches,
                                                      group_idx.size(),
                                                      cudf_aggregates,
                                                      stream,
-                                                     *input_batches[0]->get_memory_space());
+                                                     *input_batches[0].get_memory_space());
   }
 
   // If no post-processing needed, return merged result directly
@@ -199,10 +198,12 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
 
   // Post-merge projection: handle AVG (SUM/COUNT) and COUNT DISTINCT (list element count).
   // Release ownership of the merged table's columns so we can move (not copy) them.
-  auto* space        = merged->get_memory_space();
+  // Acquire EXCLUSIVE lock since release_table() is a mutating operation
+  auto merged_mut    = merged->to_mutable();
+  auto* space        = merged_mut.get_memory_space();
   auto mr            = space->get_default_allocator();
-  auto& gpu_rep      = merged->get_data()->cast<cucascade::gpu_table_representation>();
-  auto merged_cols   = gpu_rep.release_table()->release();
+  auto& gpu_rep      = merged_mut.get_data()->cast<cucascade::gpu_table_representation>();
+  auto merged_cols   = gpu_rep.release_table(stream)->release();
   int num_group_cols = static_cast<int>(group_idx.size());
 
   std::vector<std::unique_ptr<cudf::column>> output_cols;

@@ -279,7 +279,7 @@ std::vector<std::string> sirius_plan_printer::get_operator_detail_lines(
 {
   std::vector<std::string> lines;
 
-  // Join type annotation (D-02: "  type: INNER")
+  // Join type annotation ("  type: INNER")
   if (op.type == op::SiriusPhysicalOperatorType::HASH_JOIN) {
     lines.push_back("  type: " +
                     duckdb::JoinTypeToString(op.Cast<op::sirius_physical_hash_join>().join_type));
@@ -288,7 +288,7 @@ std::vector<std::string> sirius_plan_printer::get_operator_detail_lines(
                                    op.Cast<op::sirius_physical_nested_loop_join>().join_type));
   }
 
-  // Scan function name annotation (D-02: "  scan: seq_scan")
+  // Scan function name annotation ("  scan: seq_scan")
   std::string scan_name;
   switch (op.type) {
     case op::SiriusPhysicalOperatorType::TABLE_SCAN:
