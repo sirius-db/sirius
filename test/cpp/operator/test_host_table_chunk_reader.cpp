@@ -215,14 +215,19 @@ host_data_representation const& convert_to_host_table(
   std::shared_ptr<data_batch> const& batch,
   rmm::cuda_stream_view stream)
 {
-  auto* data = batch->get_data();
-  if (!data) { throw std::runtime_error("data_batch has no data representation"); }
+  // Phase 18 / DB-03 Recipe R1 + R3: scoped read for size estimation;
+  // release shared lock before taking exclusive (P1 — never overlap).
+  std::size_t reserve_bytes = 0;
+  {
+    auto ro = batch->to_read_only();
+    if (!ro.get_data()) { throw std::runtime_error("data_batch has no data representation"); }
+    reserve_bytes = estimate_packed_data_bytes(sirius::get_cudf_table_view(ro));
+  }
 
   auto& manager = sirius_ctx->get_memory_manager();
 
   auto reservation =
-    manager.request_reservation(any_memory_space_in_tier{Tier::HOST},
-                                estimate_packed_data_bytes(sirius::get_cudf_table_view(*batch)));
+    manager.request_reservation(any_memory_space_in_tier{Tier::HOST}, reserve_bytes);
 
   if (!reservation) { throw std::runtime_error("Failed to reserve host memory for test"); }
 
@@ -231,9 +236,20 @@ host_data_representation const& convert_to_host_table(
   if (!host_space) { throw std::runtime_error("Invalid host memory space in test"); }
 
   auto& registry = sirius::converter_registry::get();
-  batch->convert_to<host_data_representation>(registry, host_space, stream);
+  // Phase 18 / DB-03 Recipe R3: scoped mutable accessor for conversion;
+  // released before taking another to_read_only() to read the post-convert data.
+  {
+    auto mut = batch->to_mutable();
+    mut.convert_to<host_data_representation>(registry, host_space, stream);
+  }
 
-  data = batch->get_data();
+  // Re-acquire read access to obtain the post-conversion host_data_representation.
+  // The returned reference's lifetime requires the batch (and its representation)
+  // to outlive every consumer call. Since the data_batch holds the representation
+  // via unique_ptr, dropping the accessor here does not destroy the representation;
+  // the caller is responsible for keeping `batch` alive while using the returned ref.
+  auto ro_post = batch->to_read_only();
+  auto* data   = ro_post.get_data();
   if (!data) { throw std::runtime_error("data_batch has no data after conversion"); }
   return data->cast<host_data_representation>();
 }
@@ -263,12 +279,10 @@ TEST_CASE("host_table_chunk_reader produces correct DataChunks",
   expected_table_data expected;
   std::vector<std::string> expected_strings;
   {
-    REQUIRE(batch->try_to_create_task());
-    auto lock_result = batch->try_to_lock_for_processing(gpu_space->get_id());
-    REQUIRE(lock_result.success);
-    auto handle = std::move(lock_result.handle);
-
-    auto const gpu_view = sirius::get_cudf_table_view(*batch);
+    // Phase 18 / DB-03 Recipe R8: scoped read-only accessor replaces the
+    // pre-#117 try_to_create_task + try_to_lock_for_processing pair.
+    auto ro             = batch->to_read_only();
+    auto const gpu_view = sirius::get_cudf_table_view(ro);
     expected            = extract_expected_data(gpu_view);
     expected_strings    = build_expected_strings(expected);
   }
@@ -349,12 +363,10 @@ TEST_CASE("host_table_chunk_reader handles null masks",
   std::vector<bool> expected_int64_valid;
   std::vector<bool> expected_string_valid;
   {
-    REQUIRE(batch->try_to_create_task());
-    auto lock_result = batch->try_to_lock_for_processing(gpu_space->get_id());
-    REQUIRE(lock_result.success);
-    auto handle = std::move(lock_result.handle);
-
-    auto const gpu_view   = sirius::get_cudf_table_view(*batch);
+    // Phase 18 / DB-03 Recipe R8: scoped read-only accessor replaces the
+    // pre-#117 try_to_create_task + try_to_lock_for_processing pair.
+    auto ro               = batch->to_read_only();
+    auto const gpu_view   = sirius::get_cudf_table_view(ro);
     expected              = extract_expected_data(gpu_view);
     expected_strings      = build_expected_strings(expected);
     expected_int64_valid  = extract_validity(gpu_view.column(1));

@@ -111,11 +111,10 @@ TEST_CASE("sirius_physical_order sorts 1 column ascending", "[physical_order]")
   auto out = op.execute(pipelineable_operator_data({batch}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
-                 .get_data_batches()[0]
-                 ->get_data()
-                 ->cast<gpu_table_representation>()
-                 .get_table_view();
+  // Phase 18 / DB-03 Recipe R1: scoped read-only accessor; table_view is non-owning,
+  // must outlive every read of table below. Released at end of enclosing scope.
+  auto __ro_table = dynamic_cast<const pipelineable_operator_data&>(*out) .get_data_batches()[0]->to_read_only();
+  auto table    = __ro_table.get_data()->cast<gpu_table_representation>().get_table_view();
   auto col0 = copy_column_to_host<int64_t>(table.column(0));
 
   std::vector<int64_t> expected{1, 2, 3, 5, 7, 8, 9};
@@ -144,11 +143,10 @@ TEST_CASE("sirius_physical_order sorts 1 column descending", "[physical_order]")
   auto out = op.execute(pipelineable_operator_data({batch}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
-                 .get_data_batches()[0]
-                 ->get_data()
-                 ->cast<gpu_table_representation>()
-                 .get_table_view();
+  // Phase 18 / DB-03 Recipe R1: scoped read-only accessor; table_view is non-owning,
+  // must outlive every read of table below. Released at end of enclosing scope.
+  auto __ro_table = dynamic_cast<const pipelineable_operator_data&>(*out) .get_data_batches()[0]->to_read_only();
+  auto table    = __ro_table.get_data()->cast<gpu_table_representation>().get_table_view();
   auto col0 = copy_column_to_host<int64_t>(table.column(0));
 
   std::vector<int64_t> expected{9, 8, 7, 5, 3, 2, 1};
@@ -183,11 +181,10 @@ TEST_CASE("sirius_physical_order sorts by col0, returns both columns", "[physica
   auto out = op.execute(pipelineable_operator_data({batch}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
-                 .get_data_batches()[0]
-                 ->get_data()
-                 ->cast<gpu_table_representation>()
-                 .get_table_view();
+  // Phase 18 / DB-03 Recipe R1: scoped read-only accessor; table_view is non-owning,
+  // must outlive every read of table below. Released at end of enclosing scope.
+  auto __ro_table = dynamic_cast<const pipelineable_operator_data&>(*out) .get_data_batches()[0]->to_read_only();
+  auto table    = __ro_table.get_data()->cast<gpu_table_representation>().get_table_view();
   auto view   = table;
   auto out_c0 = copy_column_to_host<int64_t>(view.column(0));
   auto out_c1 = copy_column_to_host<int64_t>(view.column(1));
@@ -224,11 +221,10 @@ TEST_CASE("sirius_physical_order sorts by 2 keys (asc, desc)", "[physical_order]
   auto out = op.execute(pipelineable_operator_data({batch}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
-                 .get_data_batches()[0]
-                 ->get_data()
-                 ->cast<gpu_table_representation>()
-                 .get_table_view();
+  // Phase 18 / DB-03 Recipe R1: scoped read-only accessor; table_view is non-owning,
+  // must outlive every read of table below. Released at end of enclosing scope.
+  auto __ro_table = dynamic_cast<const pipelineable_operator_data&>(*out) .get_data_batches()[0]->to_read_only();
+  auto table    = __ro_table.get_data()->cast<gpu_table_representation>().get_table_view();
   auto view   = table;
   auto out_c0 = copy_column_to_host<int64_t>(view.column(0));
   auto out_c1 = copy_column_to_host<int64_t>(view.column(1));
@@ -263,11 +259,10 @@ TEST_CASE("sirius_physical_order projects only col1 when sorting by col0", "[phy
   auto out = op.execute(pipelineable_operator_data({batch}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
-                 .get_data_batches()[0]
-                 ->get_data()
-                 ->cast<gpu_table_representation>()
-                 .get_table_view();
+  // Phase 18 / DB-03 Recipe R1: scoped read-only accessor; table_view is non-owning,
+  // must outlive every read of table below. Released at end of enclosing scope.
+  auto __ro_table = dynamic_cast<const pipelineable_operator_data&>(*out) .get_data_batches()[0]->to_read_only();
+  auto table    = __ro_table.get_data()->cast<gpu_table_representation>().get_table_view();
   auto view = table;
   REQUIRE(view.num_columns() == 1);
 
@@ -304,11 +299,10 @@ TEST_CASE("sirius_physical_order 3 columns, sort by col0 asc, return all", "[phy
   auto out = op.execute(pipelineable_operator_data({batch}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
-                 .get_data_batches()[0]
-                 ->get_data()
-                 ->cast<gpu_table_representation>()
-                 .get_table_view();
+  // Phase 18 / DB-03 Recipe R1: scoped read-only accessor; table_view is non-owning,
+  // must outlive every read of table below. Released at end of enclosing scope.
+  auto __ro_table = dynamic_cast<const pipelineable_operator_data&>(*out) .get_data_batches()[0]->to_read_only();
+  auto table    = __ro_table.get_data()->cast<gpu_table_representation>().get_table_view();
   auto view   = table;
   auto out_c0 = copy_column_to_host<int64_t>(view.column(0));
   auto out_c1 = copy_column_to_host<int64_t>(view.column(1));
@@ -353,11 +347,10 @@ TEST_CASE("sirius_physical_order 3 columns, sort by col0 asc + col1 desc, return
   auto out = op.execute(pipelineable_operator_data({batch}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
-                 .get_data_batches()[0]
-                 ->get_data()
-                 ->cast<gpu_table_representation>()
-                 .get_table_view();
+  // Phase 18 / DB-03 Recipe R1: scoped read-only accessor; table_view is non-owning,
+  // must outlive every read of table below. Released at end of enclosing scope.
+  auto __ro_table = dynamic_cast<const pipelineable_operator_data&>(*out) .get_data_batches()[0]->to_read_only();
+  auto table    = __ro_table.get_data()->cast<gpu_table_representation>().get_table_view();
   auto view   = table;
   auto out_c0 = copy_column_to_host<int64_t>(view.column(0));
   auto out_c1 = copy_column_to_host<int64_t>(view.column(1));
@@ -393,11 +386,10 @@ TEST_CASE("sirius_physical_order 3 columns, sort by col0, project col1 and col2 
   auto out = op.execute(pipelineable_operator_data({batch}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
-                 .get_data_batches()[0]
-                 ->get_data()
-                 ->cast<gpu_table_representation>()
-                 .get_table_view();
+  // Phase 18 / DB-03 Recipe R1: scoped read-only accessor; table_view is non-owning,
+  // must outlive every read of table below. Released at end of enclosing scope.
+  auto __ro_table = dynamic_cast<const pipelineable_operator_data&>(*out) .get_data_batches()[0]->to_read_only();
+  auto table    = __ro_table.get_data()->cast<gpu_table_representation>().get_table_view();
   auto view = table;
   REQUIRE(view.num_columns() == 2);
 
@@ -436,19 +428,17 @@ TEST_CASE("sirius_physical_order handles multiple batches", "[physical_order]")
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 2);
 
   // Each batch is independently sorted
-  auto t1 = dynamic_cast<const pipelineable_operator_data&>(*out)
-              .get_data_batches()[0]
-              ->get_data()
-              ->cast<gpu_table_representation>()
-              .get_table_view();
+  // Phase 18 / DB-03 Recipe R1: scoped read-only accessor; table_view is non-owning,
+  // must outlive every read of t1 below. Released at end of enclosing scope.
+  auto __ro_t1 = dynamic_cast<const pipelineable_operator_data&>(*out) .get_data_batches()[0]->to_read_only();
+  auto t1    = __ro_t1.get_data()->cast<gpu_table_representation>().get_table_view();
   auto col1 = copy_column_to_host<int64_t>(t1.column(0));
   REQUIRE(col1 == std::vector<int64_t>{1, 3, 5});
 
-  auto t2 = dynamic_cast<const pipelineable_operator_data&>(*out)
-              .get_data_batches()[1]
-              ->get_data()
-              ->cast<gpu_table_representation>()
-              .get_table_view();
+  // Phase 18 / DB-03 Recipe R1: scoped read-only accessor; table_view is non-owning,
+  // must outlive every read of t2 below. Released at end of enclosing scope.
+  auto __ro_t2 = dynamic_cast<const pipelineable_operator_data&>(*out) .get_data_batches()[1]->to_read_only();
+  auto t2    = __ro_t2.get_data()->cast<gpu_table_representation>().get_table_view();
   auto col2 = copy_column_to_host<int64_t>(t2.column(0));
   REQUIRE(col2 == std::vector<int64_t>{2, 4, 6});
 }
@@ -476,11 +466,10 @@ TEST_CASE("sirius_physical_order handles null input batches", "[physical_order]"
   auto out = op.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
-                 .get_data_batches()[0]
-                 ->get_data()
-                 ->cast<gpu_table_representation>()
-                 .get_table_view();
+  // Phase 18 / DB-03 Recipe R1: scoped read-only accessor; table_view is non-owning,
+  // must outlive every read of table below. Released at end of enclosing scope.
+  auto __ro_table = dynamic_cast<const pipelineable_operator_data&>(*out) .get_data_batches()[0]->to_read_only();
+  auto table    = __ro_table.get_data()->cast<gpu_table_representation>().get_table_view();
   auto col0 = copy_column_to_host<int64_t>(table.column(0));
   REQUIRE(col0 == std::vector<int64_t>{1, 2, 3});
 }

@@ -113,8 +113,13 @@ inline std::shared_ptr<cucascade::data_batch> concatenate_batches_horizontal(
   std::vector<std::unique_ptr<cudf::column>> all_columns;
 
   for (const auto& batch : batches) {
+    // Phase 18 / DB-03 Recipe R1: scoped read-only accessor for the iteration.
+    // table_view is non-owning; make_unique<cudf::column>(table_view.column(i),
+    // stream, mr) reads from the column inside the loop body, so the accessor
+    // must outlive every read. Released at end of iteration.
+    auto ro = batch->to_read_only();
     auto table_view =
-      batch->get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+      ro.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
 
     // Release and collect each column from this table
     for (cudf::size_type i = 0; i < table_view.num_columns(); ++i) {

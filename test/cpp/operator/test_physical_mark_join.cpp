@@ -123,11 +123,10 @@ TEST_CASE("sirius_physical_hash_join mark join - partial match", "[physical_mark
     f.hash_join->execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
 
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
-  auto out_view = dynamic_cast<const pipelineable_operator_data&>(*outputs)
-                    .get_data_batches()[0]
-                    ->get_data()
-                    ->cast<gpu_table_representation>()
-                    .get_table_view();
+  // Phase 18 / DB-03 Recipe R1: scoped read-only accessor; table_view is non-owning,
+  // must outlive every read of out_view below. Released at end of enclosing scope.
+  auto __ro_out_view = dynamic_cast<const pipelineable_operator_data&>(*outputs) .get_data_batches()[0]->to_read_only();
+  auto out_view    = __ro_out_view.get_data()->cast<gpu_table_representation>().get_table_view();
   REQUIRE(out_view.num_columns() == 3);
   REQUIRE(out_view.num_rows() == static_cast<cudf::size_type>(left_ids.size()));
 
@@ -157,11 +156,10 @@ TEST_CASE("sirius_physical_hash_join mark join - all rows match", "[physical_mar
     f.hash_join->execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
 
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
-  auto out_view = dynamic_cast<const pipelineable_operator_data&>(*outputs)
-                    .get_data_batches()[0]
-                    ->get_data()
-                    ->cast<gpu_table_representation>()
-                    .get_table_view();
+  // Phase 18 / DB-03 Recipe R1: scoped read-only accessor; table_view is non-owning,
+  // must outlive every read of out_view below. Released at end of enclosing scope.
+  auto __ro_out_view = dynamic_cast<const pipelineable_operator_data&>(*outputs) .get_data_batches()[0]->to_read_only();
+  auto out_view    = __ro_out_view.get_data()->cast<gpu_table_representation>().get_table_view();
   REQUIRE(out_view.num_rows() == static_cast<cudf::size_type>(left_ids.size()));
 
   REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == left_ids);
@@ -189,11 +187,10 @@ TEST_CASE("sirius_physical_hash_join mark join - no rows match", "[physical_mark
     f.hash_join->execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
 
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
-  auto out_view = dynamic_cast<const pipelineable_operator_data&>(*outputs)
-                    .get_data_batches()[0]
-                    ->get_data()
-                    ->cast<gpu_table_representation>()
-                    .get_table_view();
+  // Phase 18 / DB-03 Recipe R1: scoped read-only accessor; table_view is non-owning,
+  // must outlive every read of out_view below. Released at end of enclosing scope.
+  auto __ro_out_view = dynamic_cast<const pipelineable_operator_data&>(*outputs) .get_data_batches()[0]->to_read_only();
+  auto out_view    = __ro_out_view.get_data()->cast<gpu_table_representation>().get_table_view();
   REQUIRE(out_view.num_rows() == static_cast<cudf::size_type>(left_ids.size()));
 
   REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == left_ids);
@@ -221,11 +218,10 @@ TEST_CASE("sirius_physical_hash_join mark join - empty right side", "[physical_m
     f.hash_join->execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
 
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
-  auto out_view = dynamic_cast<const pipelineable_operator_data&>(*outputs)
-                    .get_data_batches()[0]
-                    ->get_data()
-                    ->cast<gpu_table_representation>()
-                    .get_table_view();
+  // Phase 18 / DB-03 Recipe R1: scoped read-only accessor; table_view is non-owning,
+  // must outlive every read of out_view below. Released at end of enclosing scope.
+  auto __ro_out_view = dynamic_cast<const pipelineable_operator_data&>(*outputs) .get_data_batches()[0]->to_read_only();
+  auto out_view    = __ro_out_view.get_data()->cast<gpu_table_representation>().get_table_view();
   REQUIRE(out_view.num_rows() == static_cast<cudf::size_type>(left_ids.size()));
 
   REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == left_ids);
@@ -254,11 +250,10 @@ TEST_CASE("sirius_physical_hash_join mark join - duplicate keys on right side",
     f.hash_join->execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
 
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
-  auto out_view = dynamic_cast<const pipelineable_operator_data&>(*outputs)
-                    .get_data_batches()[0]
-                    ->get_data()
-                    ->cast<gpu_table_representation>()
-                    .get_table_view();
+  // Phase 18 / DB-03 Recipe R1: scoped read-only accessor; table_view is non-owning,
+  // must outlive every read of out_view below. Released at end of enclosing scope.
+  auto __ro_out_view = dynamic_cast<const pipelineable_operator_data&>(*outputs) .get_data_batches()[0]->to_read_only();
+  auto out_view    = __ro_out_view.get_data()->cast<gpu_table_representation>().get_table_view();
   REQUIRE(out_view.num_rows() == static_cast<cudf::size_type>(left_ids.size()));
 
   REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == left_ids);

@@ -154,8 +154,10 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single 
   std::size_t total_num_rows = 0;
   for (auto& output :
        dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()) {
+    // Phase 18 / DB-03 Recipe R1: scoped read-only accessor per iteration.
+    auto ro = output->to_read_only();
     total_num_rows +=
-      output->get_data()->cast<gpu_table_representation>().get_table_view().num_rows();
+      ro.get_data()->cast<gpu_table_representation>().get_table_view().num_rows();
   }
   REQUIRE(total_num_rows == num_values);
 }
@@ -285,8 +287,10 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with two par
   std::size_t total_num_rows = 0;
   for (auto& output :
        dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()) {
+    // Phase 18 / DB-03 Recipe R1: scoped read-only accessor per iteration.
+    auto ro = output->to_read_only();
     std::size_t num_rows_out =
-      output->get_data()->cast<gpu_table_representation>().get_table_view().num_rows();
+      ro.get_data()->cast<gpu_table_representation>().get_table_view().num_rows();
     REQUIRE(num_rows_out % prime_repeater ==
             0);  // each group was created to have prime_repeater rows, so each partition should
                  // have a multiple of that
@@ -363,10 +367,11 @@ TEST_CASE(
 
   auto outputs = partitioner.execute(pipelineable_operator_data({input_batch}), default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
-  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs)
-            .get_data_batches()[0]
-            ->get_data()
-            ->cast<gpu_table_representation>()
-            .get_table_view()
-            .num_rows() == num_values);
+  // Phase 18 / DB-03 Recipe R1: scoped read-only accessor for the verification.
+  auto __ro_partition = dynamic_cast<const pipelineable_operator_data&>(*outputs)
+                          .get_data_batches()[0]
+                          ->to_read_only();
+  REQUIRE(
+    __ro_partition.get_data()->cast<gpu_table_representation>().get_table_view().num_rows() ==
+    num_values);
 }

@@ -198,11 +198,9 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
   auto out = merge_op.execute(pipelineable_operator_data(merge_inputs), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
-                 .get_data_batches()[0]
-                 ->get_data()
-                 ->template cast<gpu_table_representation>()
-                 .get_table_view();
+  // Phase 18 / DB-03 Recipe R1: scoped read-only accessor.
+  auto __ro_table = dynamic_cast<const pipelineable_operator_data&>(*out) .get_data_batches()[0]->to_read_only();
+  auto table    = __ro_table.get_data()->template cast<gpu_table_representation>().get_table_view();
   auto view = table;
 
   REQUIRE(view.num_columns() == 5);
@@ -329,11 +327,9 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate resolves AVG in merge",
   auto out = merge_op.execute(pipelineable_operator_data(merge_inputs), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
-                 .get_data_batches()[0]
-                 ->get_data()
-                 ->template cast<gpu_table_representation>()
-                 .get_table_view();
+  // Phase 18 / DB-03 Recipe R1: scoped read-only accessor.
+  auto __ro_table = dynamic_cast<const pipelineable_operator_data&>(*out) .get_data_batches()[0]->to_read_only();
+  auto table    = __ro_table.get_data()->template cast<gpu_table_representation>().get_table_view();
   auto view = table;
   REQUIRE(view.num_columns() == 1);
   REQUIRE(view.num_rows() == 1);
