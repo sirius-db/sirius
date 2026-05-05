@@ -83,11 +83,13 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::get_next_task_input_d
   // whose representation bytes understate their actual GPU processing cost.
   constexpr size_t max_batches_per_task = 32;
   while (true) {
-    // TODO(v1.4 Phase 18 — DB-03): replace with proper wait-loop or split_connector subscriber model (Pitfall P3)
-    auto batch = port_ptr->repo->pop_data_batch(::cucascade::batch_state::task_created);
+    auto batch = port_ptr->repo->pop_next_data_batch(/* partition_idx */ 0);
     if (!batch) { break; }
     uint64_t batch_bytes = 0;
-    if (batch->get_data()) { batch_bytes = batch->get_data()->get_size_in_bytes(); }
+    {
+      auto ro = batch->to_read_only();
+      if (ro.get_data()) { batch_bytes = ro.get_data()->get_size_in_bytes(); }
+    }  // ro destroyed → shared lock released
     accumulated_bytes += batch_bytes;
     input_batch.push_back(std::move(batch));
     ++batch_count;
@@ -125,29 +127,37 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     std::vector<cudf::table_view> table_views;
     table_views.reserve(raw_input_batches.size());
     cucascade::memory::memory_space* space = nullptr;
+    // Hold the read-only accessors for the duration of the concatenate call so
+    // the underlying cudf::table_views remain valid (R1 — read-only single-shot).
+    std::vector<cucascade::read_only_data_batch> read_accessors;
+    read_accessors.reserve(raw_input_batches.size());
     for (const auto& batch : raw_input_batches) {
-      // TODO(v1.4 Phase 18 — DB-02): wrap in to_read_only() / to_mutable() RAII accessor (private after cucascade #117)
-      if (batch && batch->get_data()) {
-        auto& gpu_rep = batch->get_data()->cast<cucascade::gpu_table_representation>();
+      if (!batch) { continue; }
+      auto ro = batch->to_read_only();
+      if (ro.get_data()) {
+        auto& gpu_rep = ro.get_data()->cast<cucascade::gpu_table_representation>();
         table_views.push_back(gpu_rep.get_table_view());
-        if (!space) { space = batch->get_memory_space(); }
+        if (!space) { space = ro.get_memory_space(); }
+        read_accessors.push_back(std::move(ro));
       }
-    }
+    }  // accessors live until end of this `if` block
     if (table_views.size() > 1 && space) {
       auto concatenated = cudf::concatenate(table_views, stream, space->get_default_allocator());
-      auto concat_rep =
-        std::make_unique<cucascade::gpu_table_representation>(std::move(concatenated), *space);
+      auto concat_rep   = std::make_unique<cucascade::gpu_table_representation>(
+        std::move(concatenated), *space, stream);
       single_batch = std::make_shared<cucascade::data_batch>(0, std::move(concat_rep));
     }
+    // read_accessors destroyed here → all input shared locks released
   }
 
   // After concatenation (or if only one batch), work with a single batch.
   const auto& batch_ref =
     single_batch ? single_batch : (!raw_input_batches.empty() ? raw_input_batches[0] : nullptr);
-  // TODO(v1.4 Phase 18 — DB-02): wrap in to_read_only() / to_mutable() RAII accessor (private after cucascade #117)
-  if (!batch_ref || !batch_ref->get_data()) {
-    return std::make_unique<pipelineable_operator_data>();
-  }
+  if (!batch_ref) { return std::make_unique<pipelineable_operator_data>(); }
+  {
+    auto ro_check = batch_ref->to_read_only();
+    if (!ro_check.get_data()) { return std::make_unique<pipelineable_operator_data>(); }
+  }  // ro_check released
 
   // Apply table filters as a GPU expression if present.
   std::shared_ptr<cucascade::data_batch> output_batch;
@@ -160,11 +170,13 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   if (static_cast<bool>(local_filter_expr)) {
     sirius::gpu_expression_executor gpu_expression_executor(
       local_filter_expr, cudf::get_current_device_resource_ref(), stream);
+    // Scoped read-only accessor for filter input read + output memory space (R1).
+    auto ro_in = batch_ref->to_read_only();
     auto filtered_table = gpu_expression_executor.select(
-      // TODO(v1.4 Phase 18 — DB-02): wrap in to_read_only() / to_mutable() RAII accessor (private after cucascade #117)
-      batch_ref->get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
+      ro_in.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
     output_batch =
-      sirius::make_data_batch(std::move(filtered_table), *batch_ref->get_memory_space());
+      sirius::make_data_batch(std::move(filtered_table), *ro_in.get_memory_space(), stream);
+    // ro_in destroyed at end of `if` block → shared lock released
   } else {
     output_batch = batch_ref;
   }
@@ -172,16 +184,23 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   // After filtering, project away filter-only columns if the batch has more
   // columns than the operator's output type list expects.
   std::size_t expected_output_columns = types.size();
-  // TODO(v1.4 Phase 18 — DB-02): wrap in to_read_only() / to_mutable() RAII accessor (private after cucascade #117)
-  auto& gpu_rep       = output_batch->get_data()->cast<cucascade::gpu_table_representation>();
-  auto out_table_view = gpu_rep.get_table_view();
+
+  // Scoped read-only probe: read num_columns to decide whether the projection
+  // branch fires. Accessor is released BEFORE the mutable upgrade below to
+  // avoid a P1 self-deadlock (shared lock held while taking exclusive).
+  cudf::size_type out_num_columns = 0;
+  {
+    auto ro_probe   = output_batch->to_read_only();
+    auto& gpu_rep_r = ro_probe.get_data()->cast<cucascade::gpu_table_representation>();
+    out_num_columns = gpu_rep_r.get_table_view().num_columns();
+  }  // ro_probe released
 
   if (expected_output_columns == 0) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(output_batch)});
   }
 
-  if (static_cast<std::size_t>(out_table_view.num_columns()) > expected_output_columns) {
+  if (static_cast<std::size_t>(out_num_columns) > expected_output_columns) {
     SIRIUS_LOG_DEBUG(
       "TABLE_SCAN projection: expected_output_columns={}, projection_ids.size()={}, "
       "column_ids.size()={}",
@@ -197,7 +216,17 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
                     projection_ids.size()));
     }
 
-    auto table   = gpu_rep.release_table(stream);
+    // Mutable accessor (R3 — write/release path). release_table mutates the
+    // representation, so we need exclusive access. The accessor lives only for
+    // this projection branch.
+    std::unique_ptr<cudf::table> table;
+    cucascade::memory::memory_space* space = nullptr;
+    {
+      auto mut    = output_batch->to_mutable();
+      auto& gpu_w = mut.get_data()->cast<cucascade::gpu_table_representation>();
+      table       = gpu_w.release_table(stream);
+      space       = mut.get_memory_space();
+    }  // mut released
     auto columns = table->release();
 
     // Select output columns using the batch column map.
@@ -220,9 +249,8 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     }
 
     auto projected_table = std::make_unique<cudf::table>(std::move(selected));
-    auto* space          = output_batch->get_memory_space();
-    auto projected_rep =
-      std::make_unique<cucascade::gpu_table_representation>(std::move(projected_table), *space);
+    auto projected_rep   = std::make_unique<cucascade::gpu_table_representation>(
+      std::move(projected_table), *space, stream);
     output_batch = std::make_shared<cucascade::data_batch>(output_batch->get_batch_id(),
                                                            std::move(projected_rep));
   }
