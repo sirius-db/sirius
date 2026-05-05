@@ -15,7 +15,7 @@
 
 Goal: land cucascade `origin/main` (PR #117 DataBatch RAII refactor + #112 + #116) and Sirius `origin/dev` (#675 IO Framework, #731 Scan Manager, #721 Pin Tables, #739 cucascade-compat, #733/#734/#735) onto `feature/single-node-multi-gpu2`, preserving all v1.1+v1.2+v1.3 multi-GPU behavior. The v1.3 ship-gate (`[mgpu]` 16/16, `[TPC-H][parquet]` 22/22, `[integration][TPC-H]` 48/48, SF100 Q1 num_gpus=2 <= 5.7s, mgpu_stress 500-iter, HYG-02 <= 40) must pass bitwise on the rebased branch.
 
-- [ ] **Phase 16: Cucascade Submodule Rebase + Pin Recovery** — Rebase 11 local Sirius-side cucascade fixes onto `73d00c4` (origin/main tip with #117 DataBatch RAII + #112 + #116). Highest conflict density; no Sirius compile gate here — cucascade-internal verification only.
+- [x] **Phase 16: Cucascade Submodule Rebase + Pin Recovery** — Rebase 11 local Sirius-side cucascade fixes onto `73d00c4` (origin/main tip with #117 DataBatch RAII + #112 + #116). Highest conflict density; no Sirius compile gate here — cucascade-internal verification only. **COMPLETE** (2026-05-05): 4 group commits on top of 73d00c4, ctest 100% PASS, all 8 grep gates green, CC-01..04 satisfied.
 - [ ] **Phase 17: Sirius origin/dev Merge — Base Layer** — Absorb `origin/dev` CI/CMake/config PRs (#739 compat, #675, #731, #721, #733, #734, #735) as a base-layer merge. Expected to produce 26+ `batch->get_data()` private-access build errors — DOCUMENTED as expected, not a phase failure. SCHED-RR block survival verified.
 - [ ] **Phase 18: DataBatch RAII Migration (cucascade #117 surface)** — Migrate all `batch->get_data()` call sites and `pop_data_batch(state)` usages to RAII accessors; rewrite `batch_lock_utils.hpp`. Phase ends with a compile-clean build.
 - [ ] **Phase 19: IO Framework Adoption (PR #675)** — Retire `sirius::io::cucascade_datasource`; adopt `sirius::io::sirius_datasource` with per-GPU `uring_ioctx` instances. Install `liburing-dev` before first build attempt.
@@ -94,7 +94,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 - [x] 16-02-PLAN.md — Rebase Group 1 (memory hygiene) + Group 3 (io_worker) onto 73d00c4
 - [x] 16-03-PLAN.md — Rebase Group 2 (P2P override + DMA probe) onto Group 1+3 tip
 - [x] 16-04-PLAN.md — Rebase Group 4 (Phase 13 stream-lineage); re-implement gpu_data_representation + convert_gpu_to_gpu under #117 RAII; build compile-clean
-- [ ] 16-05-PLAN.md — Run cucascade ctest + 8 grep gates; advance submodule pin in parent worktree
+- [x] 16-05-PLAN.md — Run cucascade ctest + 8 grep gates; advance submodule pin in parent worktree
 **Pitfalls**:
   - P2 (writer_stream lost in representation_converter.cpp conflict): treat `representation_converter.cpp` as a re-implementation from `73d00c4` shape, not a three-way merge. Verify with grep gate before proceeding.
   - P7 (PR #739 x #117 ordering mismatch): complete cucascade rebase first; use #739 only as a file-list reference during Phase 18. Do NOT cherry-pick #739 here.
@@ -199,7 +199,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 | 13. Fix Q11 multi-GPU hang/illegal-address | v1.3 | 4/5 | Complete | 2026-04-30 |
 | 14. Land SCHED-RR distribution | v1.3 | 2/2 | Complete | 2026-04-30 |
 | 15. Cross-GPU operator-colocation audit | v1.3 | 4/4 | Complete | 2026-05-01 |
-| 16. Cucascade Submodule Rebase + Pin Recovery | v1.4 | 4/5 | In Progress|  |
+| 16. Cucascade Submodule Rebase + Pin Recovery | v1.4 | 5/5 | Complete   | 2026-05-05 |
 | 17. Sirius origin/dev Merge — Base Layer | v1.4 | 0/? | Not started | - |
 | 18. DataBatch RAII Migration | v1.4 | 0/? | Not started | - |
 | 19. IO Framework Adoption | v1.4 | 0/? | Not started | - |

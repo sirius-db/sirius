@@ -75,22 +75,69 @@ Backup ref: `phase16-pre-squash-backup` -> 62e0517
 
 ## Pin Advance (16-05)
 
-- Old pin: 62e0517 (HEAD before rebase)
-- New pin: (filled by 16-05)
-- Parent commit: (filled by 16-05)
+- **Old pin:** `62e0517` (HEAD before Phase 16 rebase; pre-squash backup ref `phase16-pre-squash-backup`)
+- **New pin:** `1c1e648a282a06747328c78f62d2d676ce51a8ce` (4 commits on top of `73d00c4`)
+- **Intermediate pin:** `995bf4e` (3 groups: 1, 3, 2; advanced by 16-03 docs commit)
+- **Final parent commit:** `5d1a8e0` (`docs(16-04): complete Group 4 stream-lineage plan — SUMMARY + audit log + STATE + ROADMAP`) — this commit also advanced the pin from `995bf4e` → `1c1e648` as part of the 16-04 metadata commit
+- **Date:** 2026-05-05
+- **Verification:** `git ls-tree HEAD cucascade` = `1c1e648a282a06747328c78f62d2d676ce51a8ce` ✓; `git submodule status cucascade` shows no leading `+` (clean state) ✓
+- **Per D-A3:** Local-only pin — not pushed to `felipe` fork or upstream. Future re-clones must redo the rebase locally OR receive a patch series. Documented in this file.
+- **Note:** The 16-04 docs commit (`5d1a8e0`) staged and committed `cucascade` gitlink as part of completing plan 16-04. Plan 16-05 Task 3 confirms the pin is already at the correct new SHA and no additional parent commit is needed.
+
+## Phase 16 Final Status (16-05)
+
+- **Phase:** COMPLETE
+- **Date:** 2026-05-05
+- **Requirements closed:** CC-01 (pin advanced), CC-02 (11 fixes as 4 group commits), CC-03 (writer_event re-attached), CC-04 (ctest + 8 grep gates green)
+- **Cucascade branch:** `phase16-rebase-wip` at `1c1e648` (4 commits above `73d00c4`)
+- **ctest:** PASSED (100% tests passed, 1/1, 13.91s)
+- **Grep gates:** All 8 PASS
+- **ROADMAP criteria:** All 5 PASS
+- **D-A3 honored:** No push to any remote
+- **D-A4 abort criterion:** NOT triggered (all 4 groups applied cleanly within budget)
+- **Next phase:** Phase 17 — Sirius origin/dev merge (MERGE-01..05)
 
 ## CC-04 Grep Gate Outcomes (16-05)
 
+All 8 grep gates run on 2026-05-05. All PASS.
+
 | Gate | Command | Expected | Actual | Status |
 |------|---------|----------|--------|--------|
-| 1 | `grep -rn "record_writer_event\|get_writer_event" cucascade/include/cucascade/data/` | non-empty | (16-05) | pending |
-| 2 | `grep -rn "cudaHostAllocPortable" cucascade/src/memory/` | non-empty | (16-05) | pending |
-| 3 | `grep -rn "task_created\|in_transit" cucascade/src/data/` | zero | (16-05) | pending |
-| 4 | `git -C cucascade merge-base --is-ancestor 73d00c4 HEAD` | exit 0 | (16-05) | pending |
-| 5 | `git -C cucascade rev-list --count 73d00c4..HEAD` | 4 | (16-05) | pending |
+| 1 | `grep -rn "record_writer_event\|get_writer_event" cucascade/include/cucascade/data/` | non-empty | 11 matches (data_batch.hpp + gpu_data_representation.hpp) | PASS |
+| 2 | `grep -rn "cudaHostAllocPortable" cucascade/src/memory/` | non-empty | 2 matches (numa_region_pinned_host_allocator.cpp:45, small_pinned_host_memory_resource.cpp:57) | PASS |
+| 3 | `grep -rn "task_created\|in_transit" cucascade/src/data/` AND `cucascade/include/cucascade/` | zero in BOTH | src/data/: 0, include/cucascade/: 0 (total: 0) | PASS |
+| 4 | `git -C cucascade merge-base --is-ancestor 73d00c4 HEAD` | exit 0 | exit 0 | PASS |
+| 5 | `git -C cucascade rev-list --count 73d00c4..HEAD` | 4 | 4 | PASS |
+| 6 | `grep -nE "make_unique<gpu_table_representation>" cucascade/src/data/representation_converter.cpp` | >= 4 sites | 4 sites (lines 243, 886, 1136, 1738) | PASS |
+| 7 | `_thread` is last-declared member in `io_worker` class (pipeline_io_backend.cpp) | _thread last | `std::thread _thread;  // MUST be last` at line 119, after _mutex (113) and _cv (114) | PASS |
+| 8 | `grep -rn ".get_table()" cucascade/src/ cucascade/include/` | zero | 0 matches | PASS |
+
+## ROADMAP Success Criteria (16-05)
+
+All 5 ROADMAP Phase 16 success criteria PASS.
+
+| Criterion | Description | Result |
+|-----------|-------------|--------|
+| ROADMAP-1 | 4 group commits with original-hash trailers | PASS (4 trailer/hash references in commit messages) |
+| ROADMAP-2 | P2 writer_stream/cudaStreamWaitEvent survival in converter | PASS (cudaStreamWaitEvent at line 855; 4 ctor sites all pass writer_stream) |
+| ROADMAP-3 | P9 Portable flag in memory pinning sites | PASS (2 matches: numa_region_pinned + small_pinned_host) |
+| ROADMAP-4 | P8 io_worker _thread last member | PASS (_thread at line 119 after _mutex/114, _cv/114) |
+| ROADMAP-5 | ctest passes + FSM removal across src/data/ + include/cucascade/ | PASS (ctest=100%, FSM hits=0 in both locations) |
 
 ## ctest Outcome (16-05)
 
-- Run: pending
-- Result: pending
-- Build dir: pending
+- **Run:** 2026-05-05
+- **Result:** PASS — 100% tests passed (1/1 test)
+- **Build dir:** `cucascade/build/` (CTestTestfile.cmake present; built in plan 16-04)
+- **Runtime:** 13.91s
+- **Exit code:** 0
+- **Log tail:**
+  ```
+  Test project /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/cucascade/build
+      Start 1: cucascade_tests
+  1/1 Test #1: cucascade_tests ..................   Passed   13.91 sec
+
+  100% tests passed, 0 tests failed out of 1
+
+  Total Test time (real) =  13.91 sec
+  ```
