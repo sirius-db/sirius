@@ -115,41 +115,22 @@ void emit_plan_telemetry(
     }
 
     // Sender ports on pipline sink(last) operators.
-    if (auto sink = pipeline->get_sink()) {
-      // Delim joins are composite: pipeline wiring attaches next_port_after_sink to their
-      // internal sub-operators, not the delim join itself. Mirror the special-casing in
-      // sirius_pipeline_converter::setup_pipeline_parents() so telemetry sees all edges.
-      std::vector<op::sirius_physical_operator*> next_port_sources;
-      if (sink->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
-        auto& right_delim = sink->Cast<op::sirius_physical_right_delim_join>();
-        next_port_sources = {right_delim.partition_join, right_delim.distinct.get()};
-      } else if (sink->type == op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
-        auto& left_delim  = sink->Cast<op::sirius_physical_left_delim_join>();
-        next_port_sources = {left_delim.column_data_scan, left_delim.distinct.get()};
-      } else {
-        next_port_sources = {sink.get()};
-      }
+    for (const auto& [next_operator, next_operator_port_name, pseudo_sink_port_uuid] :
+         pipeline->get_next_ports_after_sink()) {
+      // Declare the pseudo-sink port
+      port_obs->declaration(pseudo_sink_port_uuid,
+                            quent::port::Declaration{
+                              .operator_id   = pipeline_uuid,
+                              .instance_name = fmt::format("{}_sender", next_operator_port_name),
+                            });
 
-      for (op::sirius_physical_operator* next_port_source : next_port_sources) {
-        for (const auto& [next_operator, next_operator_port_name, pseudo_sink_port_uuid] :
-             next_port_source->get_next_port_after_sink()) {
-          // Declare the pseudo-sink port
-          port_obs->declaration(
-            pseudo_sink_port_uuid,
-            quent::port::Declaration{
-              .operator_id   = pipeline_uuid,
-              .instance_name = fmt::format("{}_sender", next_operator_port_name),
-            });
-
-          // Find the target port on the downstream operator
-          if (const op::sirius_physical_operator::port* target_port =
-                next_operator->get_port(next_operator_port_name)) {
-            edges.push_back(quent::plan::Edges{
-              .source = pseudo_sink_port_uuid,
-              .target = target_port->source_port_uuid,
-            });
-          }
-        }
+      // Find the target port on the downstream operator
+      if (const op::sirius_physical_operator::port* target_port =
+            next_operator->get_port(next_operator_port_name)) {
+        edges.push_back(quent::plan::Edges{
+          .source = pseudo_sink_port_uuid,
+          .target = target_port->source_port_uuid,
+        });
       }
     }
   }

@@ -206,12 +206,12 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_engine::get_result()
   return res;
 }
 
-void sirius_engine::initialize(duckdb::unique_ptr<op::sirius_physical_operator> physical_plan)
+void sirius_engine::initialize(duckdb::unique_ptr<op::sirius_physical_operator> plan)
 {
   SIRIUS_LOG_DEBUG("Initializing sirius_engine");
   query_handle_->planning();
   reset();
-  sirius_owned_plan = std::move(physical_plan);
+  sirius_owned_plan = std::move(plan);
   // Pre-fetch and fully materialize iceberg delete data before initialize_internal()
   // assigns operator IDs to pipeline-breaker operators (PARTITION, CONCAT, etc.).
   // All DuckDB connections are opened under InternalQueryGuard so that
