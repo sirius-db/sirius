@@ -208,8 +208,15 @@ inline void validate_scanned_batches(
 
   for (auto const& batch : batches) {
     REQUIRE(batch != nullptr);
-    batch->convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
-    auto table_view = sirius::get_cudf_table_view(*batch);
+    // Phase 18 / DB-03 Recipe R3 + R1: scoped mutable accessor for in-place
+    // conversion (released before the read-only accessor is taken below to
+    // enforce P1 — never overlap shared+exclusive on the same batch).
+    {
+      auto mut = batch->to_mutable();
+      mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
+    }
+    auto __ro       = batch->to_read_only();
+    auto table_view = sirius::get_cudf_table_view(__ro);
 
     REQUIRE(table_view.num_columns() == 4);
     REQUIRE(table_view.column(0).type().id() == cudf::type_id::INT32);
@@ -294,8 +301,15 @@ inline void validate_projected_id_price_batches(
 
   for (auto const& batch : batches) {
     REQUIRE(batch != nullptr);
-    batch->convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
-    auto table_view = sirius::get_cudf_table_view(*batch);
+    // Phase 18 / DB-03 Recipe R3 + R1: scoped mutable accessor for in-place
+    // conversion (released before the read-only accessor is taken below to
+    // enforce P1 — never overlap shared+exclusive on the same batch).
+    {
+      auto mut = batch->to_mutable();
+      mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
+    }
+    auto __ro       = batch->to_read_only();
+    auto table_view = sirius::get_cudf_table_view(__ro);
 
     REQUIRE(table_view.num_columns() == 2);
     REQUIRE(table_view.column(0).type().id() == cudf::type_id::INT32);

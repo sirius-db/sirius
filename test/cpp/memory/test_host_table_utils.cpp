@@ -492,9 +492,14 @@ TEST_CASE("host_table_utils - pack metadata with gaps across multiple blocks",
     std::make_shared<cucascade::data_batch>(sirius::get_next_batch_id(), std::move(host_table));
 
   auto& registry = sirius::converter_registry::get();
-  batch->convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
-
-  cudf::table_view table_view = sirius::get_cudf_table_view(*batch);
+  // Phase 18 / DB-03 Recipe R3 + R1: scoped mutable for in-place conversion;
+  // released before scoped read-only is taken (P1 — never overlap shared+exclusive).
+  {
+    auto mut = batch->to_mutable();
+    mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
+  }
+  auto __ro                   = batch->to_read_only();
+  cudf::table_view table_view = sirius::get_cudf_table_view(__ro);
   REQUIRE(table_view.num_rows() == static_cast<cudf::size_type>(num_rows));
   REQUIRE(table_view.num_columns() == 3);
   REQUIRE(table_view.column(0).type().id() == cudf::type_id::INT32);
@@ -619,9 +624,14 @@ TEST_CASE("host_table_utils - underfilled varchar column truncates rows",
     std::make_shared<cucascade::data_batch>(sirius::get_next_batch_id(), std::move(host_table));
 
   auto& registry = sirius::converter_registry::get();
-  batch->convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
-
-  cudf::table_view table_view = sirius::get_cudf_table_view(*batch);
+  // Phase 18 / DB-03 Recipe R3 + R1: scoped mutable for in-place conversion;
+  // released before scoped read-only is taken (P1 — never overlap shared+exclusive).
+  {
+    auto mut = batch->to_mutable();
+    mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
+  }
+  auto __ro                   = batch->to_read_only();
+  cudf::table_view table_view = sirius::get_cudf_table_view(__ro);
   REQUIRE(table_view.num_rows() == static_cast<cudf::size_type>(rows_fit));
   REQUIRE(table_view.num_columns() == 2);
   REQUIRE(table_view.column(0).type().id() == cudf::type_id::INT32);

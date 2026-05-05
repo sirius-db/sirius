@@ -93,7 +93,7 @@ uint64_t compute_batch_checksum_fnv1a64(cucascade::data_batch& batch,
   // of gpu_rep, packed, and host_buf — released at function exit.
   auto ro             = batch.to_read_only();
   auto const& gpu_rep = ro.get_data()->cast<cucascade::gpu_table_representation>();
-  auto packed         = cudf::pack(gpu_rep.get_table(), stream);
+  auto packed         = cudf::pack(gpu_rep.get_table_view(), stream);
   stream.synchronize();
 
   auto const bytes = packed.gpu_data->size();
@@ -457,7 +457,7 @@ TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-0
     /*num_rows=*/1024, col_types, ranges, build_stream, mr);
   auto batch = sirius::make_data_batch(std::move(table), *gpu0, build_stream);
   REQUIRE(batch != nullptr);
-  auto const original_bytes = 0;
+  size_t original_bytes = 0;
   {
     auto __ro_1    = batch->to_read_only();
     original_bytes = __ro_1.get_data()->get_size_in_bytes();

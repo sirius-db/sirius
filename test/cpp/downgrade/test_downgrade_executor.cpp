@@ -162,7 +162,7 @@ uint64_t compute_batch_checksum_fnv1a64(cucascade::data_batch& batch,
   // and host_buf all live within the accessor's shared-lock window.
   auto ro             = batch.to_read_only();
   auto const& gpu_rep = ro.get_data()->cast<cucascade::gpu_table_representation>();
-  auto packed         = cudf::pack(gpu_rep.get_table(), stream);
+  auto packed         = cudf::pack(gpu_rep.get_table_view(), stream);
   stream.synchronize();
 
   auto const bytes = packed.gpu_data->size();

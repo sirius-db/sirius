@@ -114,14 +114,20 @@ void copy_data_to_host_by_rows(cudf::table_view table, std::vector<std::vector<i
   }
 }
 
-void validate_hash_partition(const data_batch& input_batch,
+void validate_hash_partition(data_batch& input_batch,
                              const std::vector<std::shared_ptr<data_batch>>& output_batches,
                              int num_partitions)
 {
-  cudf::table_view input_table_view = sirius::get_cudf_table_view(input_batch);
+  // Phase 18 / DB-03: scoped read-only accessors held for lifetime of derived
+  // table_view objects (mirrors debug_utils.hpp const-drop pattern from 18-04).
+  auto __ro_in                      = input_batch.to_read_only();
+  cudf::table_view input_table_view = sirius::get_cudf_table_view(__ro_in);
+  std::vector<cucascade::read_only_data_batch> __ro_outs;
   std::vector<cudf::table_view> output_table_views;
+  __ro_outs.reserve(output_batches.size());
   for (const auto& output_batch : output_batches) {
-    output_table_views.push_back(sirius::get_cudf_table_view(*output_batch));
+    __ro_outs.push_back(output_batch->to_read_only());
+    output_table_views.push_back(sirius::get_cudf_table_view(__ro_outs.back()));
   }
 
   // Check metadata
@@ -261,14 +267,20 @@ TEST_CASE("Hash partition with num partitions larger than input size", "[operato
 
 namespace {
 
-void validate_evenly_partition(const data_batch& input_batch,
+void validate_evenly_partition(data_batch& input_batch,
                                const std::vector<std::shared_ptr<data_batch>>& output_batches,
                                int num_partitions)
 {
-  cudf::table_view input_table_view = sirius::get_cudf_table_view(input_batch);
+  // Phase 18 / DB-03: scoped read-only accessors held for lifetime of derived
+  // table_view objects (mirrors debug_utils.hpp const-drop pattern from 18-04).
+  auto __ro_in                      = input_batch.to_read_only();
+  cudf::table_view input_table_view = sirius::get_cudf_table_view(__ro_in);
+  std::vector<cucascade::read_only_data_batch> __ro_outs;
   std::vector<cudf::table_view> output_table_views;
+  __ro_outs.reserve(output_batches.size());
   for (const auto& output_batch : output_batches) {
-    output_table_views.push_back(sirius::get_cudf_table_view(*output_batch));
+    __ro_outs.push_back(output_batch->to_read_only());
+    output_table_views.push_back(sirius::get_cudf_table_view(__ro_outs.back()));
   }
 
   // Check metadata

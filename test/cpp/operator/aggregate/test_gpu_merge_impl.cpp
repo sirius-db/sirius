@@ -88,15 +88,21 @@ batches_with_handles create_batches_with_random_data(
 }
 
 void validate_concat(const std::vector<std::shared_ptr<data_batch>>& input_batches,
-                     const data_batch& output)
+                     data_batch& output)
 {
+  // Phase 18 / DB-03: scoped read-only accessors held for lifetime of derived
+  // table_view objects (mirrors debug_utils.hpp const-drop pattern from 18-04).
+  std::vector<cucascade::read_only_data_batch> __ro_inputs;
   std::vector<cudf::table_view> input_table_views;
   int expected_num_rows = 0;
+  __ro_inputs.reserve(input_batches.size());
   for (const auto& input_batch : input_batches) {
-    input_table_views.push_back(sirius::get_cudf_table_view(*input_batch));
+    __ro_inputs.push_back(input_batch->to_read_only());
+    input_table_views.push_back(sirius::get_cudf_table_view(__ro_inputs.back()));
     expected_num_rows += input_table_views.back().num_rows();
   }
-  cudf::table_view output_table_view = sirius::get_cudf_table_view(output);
+  auto __ro_out                      = output.to_read_only();
+  cudf::table_view output_table_view = sirius::get_cudf_table_view(__ro_out);
 
   REQUIRE(expected_num_rows == output_table_view.num_rows());
   REQUIRE(input_table_views[0].num_columns() == output_table_view.num_columns());
@@ -363,14 +369,20 @@ void validate_ungrouped_aggregate_numeric(const std::vector<cudf::table_view>& i
 }
 
 void validate_ungrouped_aggregate(const std::vector<std::shared_ptr<data_batch>>& input_batches,
-                                  const data_batch& output,
+                                  data_batch& output,
                                   const std::vector<cudf::aggregation::Kind>& aggregates)
 {
+  // Phase 18 / DB-03: scoped read-only accessors held for lifetime of derived
+  // table_view objects (mirrors debug_utils.hpp const-drop pattern from 18-04).
+  std::vector<cucascade::read_only_data_batch> __ro_inputs;
   std::vector<cudf::table_view> input_table_views;
+  __ro_inputs.reserve(input_batches.size());
   for (const auto& input_batch : input_batches) {
-    input_table_views.push_back(sirius::get_cudf_table_view(*input_batch));
+    __ro_inputs.push_back(input_batch->to_read_only());
+    input_table_views.push_back(sirius::get_cudf_table_view(__ro_inputs.back()));
   }
-  cudf::table_view output_table_view = sirius::get_cudf_table_view(output);
+  auto __ro_out                      = output.to_read_only();
+  cudf::table_view output_table_view = sirius::get_cudf_table_view(__ro_out);
 
   REQUIRE(output_table_view.num_rows() == 1);
 
@@ -577,15 +589,21 @@ void copy_data_to_host(cudf::table_view table, std::vector<std::vector<int64_t>>
 }
 
 void validate_grouped_aggregate(const std::vector<std::shared_ptr<data_batch>>& input_batches,
-                                const data_batch& output,
+                                data_batch& output,
                                 int num_group_cols,
                                 const std::vector<cudf::aggregation::Kind>& aggregates)
 {
+  // Phase 18 / DB-03: scoped read-only accessors held for lifetime of derived
+  // table_view objects (mirrors debug_utils.hpp const-drop pattern from 18-04).
+  std::vector<cucascade::read_only_data_batch> __ro_inputs;
   std::vector<cudf::table_view> input_table_views;
+  __ro_inputs.reserve(input_batches.size());
   for (const auto& input_batch : input_batches) {
-    input_table_views.push_back(sirius::get_cudf_table_view(*input_batch));
+    __ro_inputs.push_back(input_batch->to_read_only());
+    input_table_views.push_back(sirius::get_cudf_table_view(__ro_inputs.back()));
   }
-  cudf::table_view output_table_view = sirius::get_cudf_table_view(output);
+  auto __ro_out                      = output.to_read_only();
+  cudf::table_view output_table_view = sirius::get_cudf_table_view(__ro_out);
 
   // Compute expected results
   std::vector<std::vector<int64_t>> h_input_data(input_table_views[0].num_columns());
@@ -829,17 +847,23 @@ batches_with_handles create_batches_with_local_orderby_result(
 }
 
 void validate_order_by(const std::vector<std::shared_ptr<data_batch>>& input_batches,
-                       const data_batch& output,
+                       data_batch& output,
                        const std::vector<int>& order_key_idx,
                        const std::vector<cudf::order>& column_order)
 {
+  // Phase 18 / DB-03: scoped read-only accessors held for lifetime of derived
+  // table_view objects (mirrors debug_utils.hpp const-drop pattern from 18-04).
+  std::vector<cucascade::read_only_data_batch> __ro_inputs;
   std::vector<cudf::table_view> input_table_views;
   int expected_num_rows = 0;
+  __ro_inputs.reserve(input_batches.size());
   for (const auto& input_batch : input_batches) {
-    input_table_views.push_back(sirius::get_cudf_table_view(*input_batch));
+    __ro_inputs.push_back(input_batch->to_read_only());
+    input_table_views.push_back(sirius::get_cudf_table_view(__ro_inputs.back()));
     expected_num_rows += input_table_views.back().num_rows();
   }
-  cudf::table_view output_table_view = sirius::get_cudf_table_view(output);
+  auto __ro_out                      = output.to_read_only();
+  cudf::table_view output_table_view = sirius::get_cudf_table_view(__ro_out);
 
   REQUIRE(output_table_view.num_rows() == expected_num_rows);
   REQUIRE(output_table_view.num_columns() == input_table_views[0].num_columns());
