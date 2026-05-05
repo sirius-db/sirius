@@ -23,6 +23,7 @@
 // changes — the kernel must treat malformed input as a no-op.
 //===----------------------------------------------------------------------===//
 
+#include "scan/bitpacking_synth.hpp"
 #include "scan/decode_test_utils.hpp"
 
 #include <cudf/types.hpp>
@@ -51,6 +52,11 @@ using sirius::cuda::scan::gpu_segment_desc;
 using sirius::test::decode::download;
 using sirius::test::decode::one_codec_column;
 using sirius::test::decode::segment;
+using sirius::test::decode::bitpacking::make_constant_block;
+using sirius::test::decode::bitpacking::make_constant_delta_block;
+using sirius::test::decode::bitpacking::make_delta_for_block;
+using sirius::test::decode::bitpacking::make_for_block;
+using sirius::test::decode::bitpacking::pack_values;
 
 namespace {
 
@@ -58,113 +64,8 @@ auto const I32 = cudf::data_type{cudf::type_id::INT32};
 auto const I64 = cudf::data_type{cudf::type_id::INT64};
 auto const U16 = cudf::data_type{cudf::type_id::UINT16};
 
-//===----------------------------------------------------------------------===//
-// Synthetic-segment builders.
-//
-// Layout (matches the kernel's parse in gpu_decode_bitpacking.cu):
-//   [0..8)               metadata_end (uint64)
-//   [8..)                per-mode header
-//   [data_off..)         packed stream (FOR / DELTA_FOR only)
-//   [metadata_end-4*N..  per-group metadata trailer
-//    metadata_end)        (one uint32 per group, last entry first)
-//
-// Each helper builds a single-group segment at data_off=8 with the metadata
-// entry at metadata_end-4. Multi-group segments are constructed manually in
-// the multi-group test case.
-//===----------------------------------------------------------------------===//
-
-template <typename T>
-std::vector<uint32_t> pack_values(std::vector<T> const& values, uint32_t width)
-{
-  if (width == 0 || values.empty()) return std::vector<uint32_t>(1, 0u);
-  size_t total_bits  = static_cast<size_t>(values.size()) * width;
-  size_t total_words = (total_bits + 31u) / 32u + 1u;  // +1 guard word
-  std::vector<uint32_t> packed(total_words, 0u);
-  for (size_t i = 0; i < values.size(); ++i) {
-    uint64_t v = static_cast<uint64_t>(values[i]);
-    if (width < 64) v &= ((uint64_t{1} << width) - 1);
-    size_t bit_pos  = i * width;
-    size_t word_idx = bit_pos / 32;
-    size_t bit_off  = bit_pos % 32;
-    packed[word_idx] |= static_cast<uint32_t>(v << bit_off);
-    if (bit_off + width > 32) {
-      packed[word_idx + 1] |= static_cast<uint32_t>(v >> (32 - bit_off));
-    }
-    if (sizeof(T) > 4 && bit_off > 0 && bit_off + width > 64) {
-      packed[word_idx + 2] |= static_cast<uint32_t>(v >> (64 - bit_off));
-    }
-  }
-  return packed;
-}
-
-template <typename T>
-std::vector<uint8_t> make_constant_block(T value)
-{
-  std::vector<uint8_t> block(64, 0);
-  uint64_t metadata_end = 32;
-  std::memcpy(block.data(), &metadata_end, sizeof(metadata_end));
-  std::memcpy(block.data() + 8, &value, sizeof(T));
-  uint32_t encoded = (static_cast<uint32_t>(BitpackingMode::CONSTANT) << 24) | 8u;
-  std::memcpy(block.data() + metadata_end - 4, &encoded, sizeof(encoded));
-  return block;
-}
-
-template <typename T>
-std::vector<uint8_t> make_constant_delta_block(T frame, T delta)
-{
-  std::vector<uint8_t> block(64, 0);
-  uint64_t metadata_end = 32;
-  std::memcpy(block.data(), &metadata_end, sizeof(metadata_end));
-  std::memcpy(block.data() + 8, &frame, sizeof(T));
-  std::memcpy(block.data() + 8 + sizeof(T), &delta, sizeof(T));
-  uint32_t encoded = (static_cast<uint32_t>(BitpackingMode::CONSTANT_DELTA) << 24) | 8u;
-  std::memcpy(block.data() + metadata_end - 4, &encoded, sizeof(encoded));
-  return block;
-}
-
-template <typename T>
-std::vector<uint8_t> make_for_block(T frame, uint32_t width, std::vector<T> const& values)
-{
-  auto packed         = pack_values<T>(values, width);
-  size_t packed_bytes = packed.size() * sizeof(uint32_t);
-  // [metadata_end][frame:T][width:T][packed_bytes][...trailer:uint32]
-  size_t header_end     = 8 + 2 * sizeof(T) + packed_bytes;
-  size_t metadata_end_v = header_end + 4;
-  size_t block_size     = std::max<size_t>(metadata_end_v, 64);
-  std::vector<uint8_t> block(block_size, 0);
-  std::memcpy(block.data(), &metadata_end_v, sizeof(uint64_t));
-  T width_t = static_cast<T>(width);
-  std::memcpy(block.data() + 8, &frame, sizeof(T));
-  std::memcpy(block.data() + 8 + sizeof(T), &width_t, sizeof(T));
-  std::memcpy(block.data() + 8 + 2 * sizeof(T), packed.data(), packed_bytes);
-  uint32_t encoded = (static_cast<uint32_t>(BitpackingMode::FOR) << 24) | 8u;
-  std::memcpy(block.data() + metadata_end_v - 4, &encoded, sizeof(encoded));
-  return block;
-}
-
-template <typename T>
-std::vector<uint8_t> make_delta_for_block(T frame,
-                                          T delta_offset,
-                                          uint32_t width,
-                                          std::vector<T> const& packed_values)
-{
-  auto packed         = pack_values<T>(packed_values, width);
-  size_t packed_bytes = packed.size() * sizeof(uint32_t);
-  // [metadata_end][frame:T][width:T][delta_offset:T][packed_bytes][trailer:uint32]
-  size_t header_end     = 8 + 3 * sizeof(T) + packed_bytes;
-  size_t metadata_end_v = header_end + 4;
-  size_t block_size     = std::max<size_t>(metadata_end_v, 64);
-  std::vector<uint8_t> block(block_size, 0);
-  std::memcpy(block.data(), &metadata_end_v, sizeof(uint64_t));
-  T width_t = static_cast<T>(width);
-  std::memcpy(block.data() + 8, &frame, sizeof(T));
-  std::memcpy(block.data() + 8 + sizeof(T), &width_t, sizeof(T));
-  std::memcpy(block.data() + 8 + 2 * sizeof(T), &delta_offset, sizeof(T));
-  std::memcpy(block.data() + 8 + 3 * sizeof(T), packed.data(), packed_bytes);
-  uint32_t encoded = (static_cast<uint32_t>(BitpackingMode::DELTA_FOR) << 24) | 8u;
-  std::memcpy(block.data() + metadata_end_v - 4, &encoded, sizeof(encoded));
-  return block;
-}
+// Synthetic-segment builders moved to scan/bitpacking_synth.hpp so the
+// codec microbenches can use them too.
 
 /// Wrap one block's bytes into a single-segment column and decode it.
 template <typename T>

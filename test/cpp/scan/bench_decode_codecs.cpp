@@ -19,6 +19,7 @@
 // skip it. Numbers paste into test/data/decode_baselines/<arch>.json.
 //===----------------------------------------------------------------------===//
 
+#include "scan/bitpacking_synth.hpp"
 #include "scan/decode_test_utils.hpp"
 
 #include <rmm/cuda_stream.hpp>
@@ -291,7 +292,7 @@ std::vector<uint8_t> bp_constant_segment(T value)
 
 }  // namespace
 
-TEST_CASE("bench BITPACKING int64 FOR width=8 4M rows", "[!benchmark][scan][decode]")
+TEST_CASE("bench BITPACKING int64 FOR width=8 128M rows", "[!benchmark][scan][decode]")
 {
   // Production shape: one segment per metadata group, ~2K segments per 4M
   // rows. Width=8 — 8x compression vs UNCOMPRESSED, exercises the unpack
@@ -299,7 +300,7 @@ TEST_CASE("bench BITPACKING int64 FOR width=8 4M rows", "[!benchmark][scan][deco
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
   constexpr uint32_t SEG_ROWS = ::sirius::cuda::scan::BP_META_GROUP_SIZE;
-  constexpr uint32_t N_SEGS   = (4u << 20) / SEG_ROWS;
+  constexpr uint32_t N_SEGS   = (128u << 20) / SEG_ROWS;
   std::vector<int64_t> deltas(SEG_ROWS);
   for (uint32_t i = 0; i < SEG_ROWS; ++i)
     deltas[i] = i & 0xFF;
@@ -320,17 +321,17 @@ TEST_CASE("bench BITPACKING int64 FOR width=8 4M rows", "[!benchmark][scan][deco
 
   double sec     = bench_seconds(stream, {col}, mr);
   double bytes_w = double(size_t{N_SEGS} * SEG_ROWS * sizeof(int64_t));
-  std::printf("[bench] BITPACKING   int64 FOR w=8 4M rows: %.6fs  write=%.1f GiB/s\n",
+  std::printf("[bench] BITPACKING   int64 FOR w=8 128M rows: %.6fs  write=%.1f GiB/s\n",
               sec,
               bytes_w / sec / GIB);
 }
 
-TEST_CASE("bench BITPACKING int32 FOR width=12 4M rows", "[!benchmark][scan][decode]")
+TEST_CASE("bench BITPACKING int32 FOR width=12 128M rows", "[!benchmark][scan][decode]")
 {
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
   constexpr uint32_t SEG_ROWS = ::sirius::cuda::scan::BP_META_GROUP_SIZE;
-  constexpr uint32_t N_SEGS   = (4u << 20) / SEG_ROWS;
+  constexpr uint32_t N_SEGS   = (128u << 20) / SEG_ROWS;
   std::vector<int32_t> deltas(SEG_ROWS);
   for (uint32_t i = 0; i < SEG_ROWS; ++i)
     deltas[i] = (i * 7) & 0xFFF;
@@ -351,12 +352,12 @@ TEST_CASE("bench BITPACKING int32 FOR width=12 4M rows", "[!benchmark][scan][dec
 
   double sec     = bench_seconds(stream, {col}, mr);
   double bytes_w = double(size_t{N_SEGS} * SEG_ROWS * sizeof(int32_t));
-  std::printf("[bench] BITPACKING   int32 FOR w=12 4M rows: %.6fs  write=%.1f GiB/s\n",
+  std::printf("[bench] BITPACKING   int32 FOR w=12 128M rows: %.6fs  write=%.1f GiB/s\n",
               sec,
               bytes_w / sec / GIB);
 }
 
-TEST_CASE("bench BITPACKING int64 CONSTANT 4M rows", "[!benchmark][scan][decode]")
+TEST_CASE("bench BITPACKING int64 CONSTANT 128M rows", "[!benchmark][scan][decode]")
 {
   // Vectorised int4 store path — should track UNCOMPRESSED CONSTANT (which
   // hits the GDDR fill ceiling). Confirms the L1-bypass + 16-byte store
@@ -364,7 +365,7 @@ TEST_CASE("bench BITPACKING int64 CONSTANT 4M rows", "[!benchmark][scan][decode]
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
   constexpr uint32_t SEG_ROWS = ::sirius::cuda::scan::BP_META_GROUP_SIZE;
-  constexpr uint32_t N_SEGS   = (4u << 20) / SEG_ROWS;
+  constexpr uint32_t N_SEGS   = (128u << 20) / SEG_ROWS;
   auto seg_bytes              = bp_constant_segment<int64_t>(12345);
 
   std::vector<rmm::device_buffer> bufs;
@@ -382,7 +383,119 @@ TEST_CASE("bench BITPACKING int64 CONSTANT 4M rows", "[!benchmark][scan][decode]
 
   double sec     = bench_seconds(stream, {col}, mr);
   double bytes_w = double(size_t{N_SEGS} * SEG_ROWS * sizeof(int64_t));
-  std::printf("[bench] BITPACKING   int64 CONSTANT 4M rows: %.6fs  write=%.1f GiB/s\n",
+  std::printf("[bench] BITPACKING   int64 CONSTANT 128M rows: %.6fs  write=%.1f GiB/s\n",
+              sec,
+              bytes_w / sec / GIB);
+}
+
+//===----------------------------------------------------------------------===//
+// Phase-2 perf coverage: natural-width FOR (the per-natural-width template
+// optimisation target), narrow non-natural width, and DELTA_FOR (the
+// BlockScan path). Uses the shared bitpacking_synth.hpp builders.
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("bench BITPACKING int32 FOR width=16 128M rows", "[!benchmark][scan][decode]")
+{
+  // Natural width 16 — every value aligns on a 16-bit boundary; an unpack
+  // that's branch-free on aligned reads should beat the runtime-shift path.
+  // Use this as the per-natural-width-template before/after target.
+  using ::sirius::test::decode::bitpacking::make_for_block;
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+  constexpr uint32_t SEG_ROWS = ::sirius::cuda::scan::BP_META_GROUP_SIZE;
+  constexpr uint32_t N_SEGS   = (128u << 20) / SEG_ROWS;
+  std::vector<int32_t> deltas(SEG_ROWS);
+  for (uint32_t i = 0; i < SEG_ROWS; ++i)
+    deltas[i] = (i * 13) & 0xFFFF;
+  auto seg_bytes = make_for_block<int32_t>(/*frame=*/0, /*width=*/16, deltas);
+
+  std::vector<rmm::device_buffer> bufs;
+  std::vector<gpu_segment_desc> segs;
+  bufs.reserve(N_SEGS);
+  segs.reserve(N_SEGS);
+  for (uint32_t i = 0; i < N_SEGS; ++i) {
+    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream.view());
+    segs.push_back(segment(bufs.back(), i * SEG_ROWS, SEG_ROWS));
+  }
+  auto col = one_codec_column(cudf::data_type{cudf::type_id::INT32},
+                              N_SEGS * SEG_ROWS,
+                              CompressionType::COMPRESSION_BITPACKING,
+                              segs);
+
+  double sec     = bench_seconds(stream, {col}, mr);
+  double bytes_w = double(size_t{N_SEGS} * SEG_ROWS * sizeof(int32_t));
+  std::printf("[bench] BITPACKING   int32 FOR w=16 128M rows: %.6fs  write=%.1f GiB/s\n",
+              sec,
+              bytes_w / sec / GIB);
+}
+
+TEST_CASE("bench BITPACKING int32 FOR width=5 128M rows", "[!benchmark][scan][decode]")
+{
+  // Very narrow width — exercises crossing 32-bit boundaries on most reads.
+  // Validates that any cp.async / vector-load optimisation doesn't regress
+  // the cross-boundary unpack path.
+  using ::sirius::test::decode::bitpacking::make_for_block;
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+  constexpr uint32_t SEG_ROWS = ::sirius::cuda::scan::BP_META_GROUP_SIZE;
+  constexpr uint32_t N_SEGS   = (128u << 20) / SEG_ROWS;
+  std::vector<int32_t> deltas(SEG_ROWS);
+  for (uint32_t i = 0; i < SEG_ROWS; ++i)
+    deltas[i] = i & 0x1F;
+  auto seg_bytes = make_for_block<int32_t>(/*frame=*/0, /*width=*/5, deltas);
+
+  std::vector<rmm::device_buffer> bufs;
+  std::vector<gpu_segment_desc> segs;
+  bufs.reserve(N_SEGS);
+  segs.reserve(N_SEGS);
+  for (uint32_t i = 0; i < N_SEGS; ++i) {
+    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream.view());
+    segs.push_back(segment(bufs.back(), i * SEG_ROWS, SEG_ROWS));
+  }
+  auto col = one_codec_column(cudf::data_type{cudf::type_id::INT32},
+                              N_SEGS * SEG_ROWS,
+                              CompressionType::COMPRESSION_BITPACKING,
+                              segs);
+
+  double sec     = bench_seconds(stream, {col}, mr);
+  double bytes_w = double(size_t{N_SEGS} * SEG_ROWS * sizeof(int32_t));
+  std::printf("[bench] BITPACKING   int32 FOR w=5 128M rows:  %.6fs  write=%.1f GiB/s\n",
+              sec,
+              bytes_w / sec / GIB);
+}
+
+TEST_CASE("bench BITPACKING int32 DELTA_FOR width=8 128M rows", "[!benchmark][scan][decode]")
+{
+  // DELTA_FOR exercises cub::BlockScan + blocked->striped shmem exchange.
+  // Target for the WarpScan optimisation (cudf delta_binary.cuh:260-261
+  // pattern). All deltas are tiny so width=8 is sufficient.
+  using ::sirius::test::decode::bitpacking::make_delta_for_block;
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+  constexpr uint32_t SEG_ROWS = ::sirius::cuda::scan::BP_META_GROUP_SIZE;
+  constexpr uint32_t N_SEGS   = (128u << 20) / SEG_ROWS;
+  std::vector<int32_t> deltas(SEG_ROWS);
+  for (uint32_t i = 0; i < SEG_ROWS; ++i)
+    deltas[i] = (i & 0xFF);
+  auto seg_bytes =
+    make_delta_for_block<int32_t>(/*frame=*/100, /*delta_offset=*/0, /*width=*/8, deltas);
+
+  std::vector<rmm::device_buffer> bufs;
+  std::vector<gpu_segment_desc> segs;
+  bufs.reserve(N_SEGS);
+  segs.reserve(N_SEGS);
+  for (uint32_t i = 0; i < N_SEGS; ++i) {
+    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream.view());
+    segs.push_back(segment(bufs.back(), i * SEG_ROWS, SEG_ROWS));
+  }
+  auto col = one_codec_column(cudf::data_type{cudf::type_id::INT32},
+                              N_SEGS * SEG_ROWS,
+                              CompressionType::COMPRESSION_BITPACKING,
+                              segs);
+
+  double sec     = bench_seconds(stream, {col}, mr);
+  double bytes_w = double(size_t{N_SEGS} * SEG_ROWS * sizeof(int32_t));
+  std::printf("[bench] BITPACKING   int32 DELTA_FOR w=8 128M rows: %.6fs  write=%.1f GiB/s\n",
               sec,
               bytes_w / sec / GIB);
 }
