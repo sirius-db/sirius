@@ -293,7 +293,13 @@ std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
       }
     } else if (is_parquet_scan) {
       for (auto& batch : batches) {
-        auto* idata_rep = batch->get_data();
+        // Phase 18 / DB-02 Recipe R1: scoped read-only accessor on the
+        // source batch for the dynamic_cast probe + shallow_clone() call.
+        // The shallow_clone produces a NEW idata_representation owned by a
+        // brand-new data_batch — its lifetime is independent of the source
+        // accessor, so dropping `ro` at end-of-iteration is safe.
+        auto ro         = batch->to_read_only();
+        auto* idata_rep = ro.get_data();
         if (auto* host_data = dynamic_cast<cached_host_data_representation*>(idata_rep);
             host_data) {
           cloned_batches.push_back(std::make_shared<cucascade::data_batch>(

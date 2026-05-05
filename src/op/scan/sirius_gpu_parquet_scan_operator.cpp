@@ -170,10 +170,9 @@ std::unique_ptr<cudf::table> sirius_gpu_parquet_scan_operator::read_table_from_m
   return std::move(table);
 }
 
-// TODO(v1.4 Phase 20 — SM-01/SM-02/SM-03/SM-04): re-attach v1.3 multi-GPU semantics in execute():
+// TODO(v1.4 Phase 20 — SM-01/SM-02/SM-04): re-attach v1.3 multi-GPU semantics in execute():
 //   - SM-01 (SCHED-RR): verify split assignment is round-robin across GPUs (or port _no_pref_rr_counter to parquet_split_provider)
 //   - SM-02 (_batch_gpu_affinity): record batch_id -> device_id at scan completion (was in v1.3 sirius_gpu_parquet_scan_operator.hpp)
-//   - SM-03 (writer_stream / Phase 13 stream-lineage): pass `stream` as third arg to gpu_table_representation(table, mem_space, stream) — see .planning/phases/17-sirius-origin-dev-merge-base-layer/17-PHASE-13-EXTRACT.md
 //   - SM-04 (per-task filter translation): gpu_expression_translator(stream, cudf::get_current_device_resource_ref()) at task time, not plan time
 //===----------------------------------------------------------------------===//
 // execute()
@@ -193,8 +192,14 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
     table     = read_table_from_metadata(*scan_data, stream);
     mem_space = scan_data->gpu_memory_space;
   } else if (auto const* cached = dynamic_cast<const scan_cached_operator_data*>(&input_data)) {
-    // TODO(v1.4 Phase 18 — DB-02): wrap in to_read_only() / to_mutable() RAII accessor (private after cucascade #117)
-    auto& gpu_rep    = cached->batch->get_data()->cast<cucascade::gpu_table_representation>();
+    // Phase 18 / DB-02 Recipe R1: scoped read-only accessor for the cached
+    // path. The accessor lives long enough to:
+    //   1. produce `cached_view` and consume it via select() / make_unique<table>
+    //      (cudf table_view is a non-owning ref into ro's representation), and
+    //   2. resolve the batch's memory_space for downstream wrapping.
+    // Dropped at end of else-if scope -> shared lock released.
+    auto ro          = cached->batch->to_read_only();
+    auto& gpu_rep    = ro.get_data()->cast<cucascade::gpu_table_representation>();
     auto cached_view = gpu_rep.get_table_view();
 
     // The cached path carries only a DuckDB-expression filter (AST translation /
@@ -241,7 +246,9 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
         "[sirius_gpu_parquet_scan_operator] Applied scan_plan inject_fn on cached batch.");
     }
 
-    mem_space = cached->batch->get_memory_space();
+    // mem_space is owned by the reservation manager (long-lived); the read-only
+    // accessor `ro` declared at top of else-if branch is still alive here.
+    mem_space = ro.get_memory_space();
   } else {
     throw std::runtime_error(
       "[sirius_gpu_parquet_scan_operator] execute() called with unexpected operator_data type; "
@@ -249,7 +256,11 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
   }
 
   // Wrap the GPU table in operator_data for the downstream pipeline.
-  auto batch = sirius::make_data_batch(std::move(table), *mem_space);
+  // Pitfall 4 closure (Phase 18): 3-arg make_data_batch with the operator's
+  // execution stream as writer_stream — preserves Phase 13-04 Path-2
+  // stream-lineage so cucascade::convert_gpu_to_gpu can call cudaStreamWaitEvent
+  // on the recorded writer event before peer-copying.
+  auto batch = sirius::make_data_batch(std::move(table), *mem_space, stream);
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
   batches.push_back(std::move(batch));
   return std::make_unique<pipelineable_operator_data>(std::move(batches));
