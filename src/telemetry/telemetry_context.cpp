@@ -87,10 +87,17 @@ void emit_plan_telemetry(
   for (const auto& pipeline : pipelines) {
     const auto pipeline_uuid         = pipeline->pipeline_uuid();
     const auto operators             = pipeline->get_operators();
-    auto op_names                    = operators | std::views::transform([](const auto& op) {
-                      return fmt::format("{}({})", op.get().get_name(), op.get().operator_id);
-                    });
-    const std::string operator_chain = fmt::format("{}", fmt::join(op_names, " -> "));
+    const std::string operator_chain = [&operators]() {
+      std::string chain{};
+      for (const auto& name : operators | std::views::transform([](const auto& op) {
+                                return fmt::format(
+                                  "{}({})", op.get().get_name(), op.get().operator_id);
+                              })) {
+        chain = fmt::format("{} -> {}", chain, name);
+      }
+      return chain;
+    }();
+
     operator_obs->declaration(
       pipeline_uuid,
       quent::operator_::Declaration{
