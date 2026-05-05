@@ -17,7 +17,7 @@ Goal: land cucascade `origin/main` (PR #117 DataBatch RAII refactor + #112 + #11
 
 - [x] **Phase 16: Cucascade Submodule Rebase + Pin Recovery** — Rebase 11 local Sirius-side cucascade fixes onto `73d00c4` (origin/main tip with #117 DataBatch RAII + #112 + #116). Highest conflict density; no Sirius compile gate here — cucascade-internal verification only. **COMPLETE** (2026-05-05): 4 group commits on top of 73d00c4, ctest 100% PASS, all 8 grep gates green, CC-01..04 satisfied.
 - [x] **Phase 17: Sirius origin/dev Merge — Base Layer** — Absorb `origin/dev` CI/CMake/config PRs (#739 compat, #675, #731, #721, #733, #734, #735) as a base-layer merge. Expected to produce 26+ `batch->get_data()` private-access build errors — DOCUMENTED as expected, not a phase failure. SCHED-RR block survival verified. **COMPLETE** (2026-05-05): All 5 MERGE-XX requirements PASS; 63 expected build errors classified as Phase 18 DB-02/DB-03; cucascade pin 1c1e648 preserved; D-G1..G6 all PASS.
-- [x] **Phase 18: DataBatch RAII Migration (cucascade #117 surface)** — Migrate all `batch->get_data()` call sites and `pop_data_batch(state)` usages to RAII accessors; rewrite `batch_lock_utils.hpp`. Phase ends with a compile-clean build. **COMPLETE (PARTIAL) 2026-05-05**: 6/6 plans shipped. DB-01..04 PASS (static infrastructure: rewrite, MCP build exit 0, HYG-02 ≤ 40, all grep gates clean). DB-05 FAIL — P1 RAII lock-scope self-deadlock fires at runtime (glibc EDEADLK from R5 lock-and-hold across `op->execute()` + scoped accessors); resolution path is architectural — carried into Phase 19+ as a runtime blocker. See 18-VERDICT.md.
+- [x] **Phase 18: DataBatch RAII Migration (cucascade #117 surface)** — Migrate all `batch->get_data()` call sites and `pop_data_batch(state)` usages to RAII accessors; rewrite `batch_lock_utils.hpp`. Phase ends with a compile-clean build. **COMPLETE 2026-05-05**: 7/7 plans shipped (added gap-closure plan 18-07). DB-01..05 PASS. Path A architectural fix landed in 18-07 (drop R5 lock-and-hold from `gpu_pipeline_task::compute_task`; `pipelineable_operator_data::prepare_for_processing` performs eager memory-space conversion under SHORT-scoped accessors and returns empty vector; operators inside `execute()` take per-call accessors at narrowest scope). [mgpu] 16/16 PASS in 103.5s (79091 assertions); [mgpu_stress] default-mode PASS in 75.5s (77053 assertions); compute-sanitizer racecheck 0 hazards on [downgrade_lifecycle] proxy. HYG-02 baseline preserved at 40 (0 non-legacy). See 18-VERDICT-V2.md (supersedes 18-VERDICT.md PARTIAL).
 - [ ] **Phase 19: IO Framework Adoption (PR #675)** — Retire `sirius::io::cucascade_datasource`; adopt `sirius::io::sirius_datasource` with per-GPU `uring_ioctx` instances. Install `liburing-dev` before first build attempt.
 - [ ] **Phase 20: Scan Manager + Pin Tables Port (PR #731 + #721)** — Integrate `parquet_split_provider` / `sirius_scan_manager` / `split_connector`; re-plant `_batch_gpu_affinity` (Phase 9) and stream-lineage hooks (Phase 13); port SCHED-RR counter to `parquet_split_provider`.
 - [ ] **Phase 21: v1.4 Ship Gate (Full v1.3 Gauntlet on Rebased Branch)** — Full regression: `[mgpu]` 16/16, `[TPC-H][parquet]` 22/22, `[integration][TPC-H]` 48/48, SF100 Q1 num_gpus=2 <= 5.7s, mgpu_stress 500-iter, HYG-02 <= 40.
@@ -132,13 +132,14 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
   3. `grep -c "rmm::cuda_stream_default" src/` returns <= 40 (HYG-02 baseline preserved).
   4. `[mgpu]` filter passes 16/16 (DB-05 light regression gate — DataBatch migration did not break multi-GPU correctness).
   5. `[mgpu_stress]` 1-iter smoke (100 iterations × 5 queries but only 1 repetition) exits 0 — SCHED-RR survival after RAII migration; 500-iter deferred to Phase 21.
-**Plans**: 6 plans
+**Plans**: 7 plans (gap-closure 18-07 added in Wave 6 after 18-06 surfaced DB-05 P1 deadlock)
 - [x] 18-01-PLAN.md — Rewrite batch_lock_utils.hpp + ripple prepare_for_processing return type + get_cudf_table_view signature (DB-01)
 - [x] 18-02-PLAN.md — Migrate convertible_* wrappers + sirius_physical_operator base impl + gpu_pipeline_task storage (DB-02, DB-03)
 - [x] 18-03-PLAN.md — Migrate stateful operators with FSM-pop / 3-arg pop-by-id: table_scan, hash_join, nested_loop_join, concat, top_n, grouped_aggregate_merge, ungrouped_aggregate, merge_sort (DB-02, DB-03)
 - [x] 18-04-PLAN.md — Migrate read-only operators + scan layer + close 4 sites of 2-arg make_data_batch (Pitfall 4) (DB-02, DB-03)
 - [x] 18-05-PLAN.md — Migrate 23 test files; reach build-clean (DB-03, DB-04)
-- [x] 18-06-PLAN.md — Run all grep gates + [mgpu] 16/16 + [mgpu_stress] 1-iter + racecheck; write 18-VERDICT.md (DB-04, DB-05)
+- [x] 18-06-PLAN.md — Run all grep gates + [mgpu] 16/16 + [mgpu_stress] 1-iter + racecheck; write 18-VERDICT.md (DB-04, DB-05) — landed PARTIAL with DB-05 deadlock evidence
+- [x] 18-07-PLAN.md — Gap closure: drop R5 lock-and-hold (Path A); audit batch_lock_utils.hpp; rerun gauntlet; write 18-VERDICT-V2.md (DB-05) — flips Phase 18 to PASS
 **Pitfalls**:
   - P1 (RAII lock scope self-deadlock): scope every `read_only_data_batch` / `mutable_data_batch` accessor to the narrowest possible block; never hold a `to_read_only()` accessor while calling any function that internally acquires `to_mutable()` on the same batch. Use `readonly_to_mutable(std::move(ro))` for upgrade paths.
   - P3 (pop_next_data_batch non-blocking semantics): every old `pop_data_batch(target_state)` call site must be replaced with a proper wait loop, not a bare `pop_next_data_batch()` that discards `nullptr`. Run `[TPC-H][parquet]` correctness check to detect silent data loss.
@@ -211,7 +212,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 | 15. Cross-GPU operator-colocation audit | v1.3 | 4/4 | Complete | 2026-05-01 |
 | 16. Cucascade Submodule Rebase + Pin Recovery | v1.4 | 5/5 | Complete    | 2026-05-05 |
 | 17. Sirius origin/dev Merge — Base Layer | v1.4 | 4/4 | Complete    | 2026-05-05 |
-| 18. DataBatch RAII Migration | v1.4 | 6/6 | Complete (PARTIAL) | 2026-05-05 |
+| 18. DataBatch RAII Migration | v1.4 | 7/7 | Complete | 2026-05-05 |
 | 19. IO Framework Adoption | v1.4 | 0/? | Not started | - |
 | 20. Scan Manager + Pin Tables Port | v1.4 | 0/? | Not started | - |
 | 21. v1.4 Ship Gate | v1.4 | 0/? | Not started | - |

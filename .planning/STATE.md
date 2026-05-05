@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Rebase After DataBatch Changes
 status: verifying
-stopped_at: Completed 18-06-PLAN.md (Phase 18 PARTIAL — DB-05 P1 deadlock)
-last_updated: "2026-05-05T21:24:53.962Z"
+stopped_at: Completed 18-07-PLAN.md (Phase 18 PASS — DB-05 closed via Path A)
+last_updated: "2026-05-05T23:34:11.640Z"
 last_activity: 2026-05-05
 progress:
   total_phases: 6
   completed_phases: 3
-  total_plans: 15
-  completed_plans: 15
+  total_plans: 16
+  completed_plans: 16
 ---
 
 # Project State
@@ -20,26 +20,26 @@ progress:
 See: .planning/PROJECT.md (updated 2026-05-04)
 
 **Core value:** Any query can transparently execute across every GPU on the node — tasks are scheduled to the GPU where their input data already resides, memory pressure is absorbed by downgrading to the correct NUMA domain, and parquet I/O is routed through a multi-GPU-safe backend.
-**Current focus:** Phase 18 — DataBatch RAII Migration (cucascade #117 surface)
+**Current focus:** Phase 18 complete (PASS 2026-05-05) — next up is Phase 19 IO Framework Adoption
 
 ## Current Position
 
-Phase: 18 (DataBatch RAII Migration (cucascade #117 surface)) — EXECUTING
-Plan: 6 of 6
-Status: Phase complete — ready for verification
+Phase: 18 (DataBatch RAII Migration (cucascade #117 surface)) — COMPLETE (PASS)
+Plan: 7 of 7 (gap-closure plan 18-07 added in Wave 6)
+Status: Phase complete (PASS) — ready for next phase (Phase 19 IO Framework)
 Last activity: 2026-05-05
 
 ```
-v1.4 Progress: [######              ] 2/6 phases | 9/32 requirements | 9 plans
+v1.4 Progress: [##########          ] 3/6 phases | 10/32 requirements | 16 plans
 ```
 
 ## Phase Overview (v1.4)
 
 | Phase | Name | Requirements | Status |
 |-------|------|--------------|--------|
-| 16 | Cucascade Submodule Rebase + Pin Recovery | CC-01..04 | Not started |
+| 16 | Cucascade Submodule Rebase + Pin Recovery | CC-01..04 | Complete (5/5 plans, PASS) |
 | 17 | Sirius origin/dev Merge — Base Layer | MERGE-01..05 | Complete (4/4 plans, PASS) |
-| 18 | DataBatch RAII Migration | DB-01..05 | Complete (6/6 plans, PARTIAL — DB-01..04 PASS; DB-05 FAIL on P1 deadlock) |
+| 18 | DataBatch RAII Migration | DB-01..05 | Complete (7/7 plans, PASS) |
 | 19 | IO Framework Adoption | IO-12..17 | Not started |
 | 20 | Scan Manager + Pin Tables Port | SM-01..06 | Not started |
 | 21 | v1.4 Ship Gate | REG-01..06 | Not started |
@@ -92,6 +92,7 @@ v1.4 Progress: [######              ] 2/6 phases | 9/32 requirements | 9 plans
 | Phase 18 P04 | 16min | 3 tasks | 14 files |
 | Phase 18 P05 | 65min | 4 tasks | 31 files |
 | Phase 18 P06 | 164min | 3 tasks | 11 files |
+| Phase 18 P07 | 111min | 3 tasks | 8 files |
 
 ## Decisions
 
@@ -179,6 +180,7 @@ v1.4 Progress: [######              ] 2/6 phases | 9/32 requirements | 9 plans
 - [Phase 18]: [18-05] Convert helper R1+R3 split: convert_*_to_host helpers split into ro -> drop -> mut -> drop -> ro_post 3-phase pattern to enforce P1 (never overlap shared+exclusive on same batch). Established in result_collector + host_table_chunk_reader + host_table_utils tests.
 - [Phase 18]: [18-05] data_batch_processing_handle replaced with mutable_data_batch in test fixture types: test_gpu_partition_impl + test_gpu_merge_impl. RAII accessor serves identical lock semantics; auto-destructured by callers so type change is transparent.
 - [Phase 18]: Phase 18 verdict PARTIAL — DB-01..04 PASS (static infrastructure: rewrite, MCP build exit 0, HYG-02 ≤ 40, all grep gates clean). DB-05 FAIL — P1 RAII lock-scope self-deadlock fires at runtime exactly as 18-03 SUMMARY forecast. [mgpu] tests fail with 'Resource deadlock avoided' (glibc EDEADLK). Resolution path is architectural — out of Phase 18 scope per Rule 4. Cucascade pin 1c1e648 preserved. Phase 19 unblocked at compile-time; runtime gates inherit P1 blocker.
+- [Phase 18]: [18-07] Path A architectural fix landed: dropped R5 lock-and-hold from gpu_pipeline_task::compute_task; pipelineable_operator_data::prepare_for_processing now performs eager memory-space conversion under SHORT-scoped accessors (released BEFORE return); operators inside execute() take their own per-call accessors. Closes DB-05 P1 deadlock. [mgpu] 16/16 PASS, [mgpu_stress] PASS, racecheck 0 hazards. Phase 18 verdict flipped from PARTIAL to PASS.
 
 ## Accumulated Context
 
@@ -210,10 +212,10 @@ v1.4 Progress: [######              ] 2/6 phases | 9/32 requirements | 9 plans
 
 ### Blockers / Concerns
 
-- **Phase 18 P1 RAII lock-scope self-deadlock (carried into Phase 19+):** `gpu_pipeline_task::compute_task`'s R5 lock-and-hold (vector<mutable_data_batch> processing_handles held across `op->execute()`) is incompatible with operator-side scoped `to_read_only`/`to_mutable` accessors on the same batches — glibc EDEADLK fires (`Resource deadlock avoided`). Architectural fix required before any [mgpu] runtime gates (or Phase 21 REG-XX) can pass. Resolution: drop R5 lock-and-hold semantics OR expose accessors via `pipelineable_operator_data::get_locked_accessors()`. Tracked for pre-Phase-21 closure. See 18-VERDICT.md + 18-03 SUMMARY P1 section.
+- **None.** Phase 18 P1 RAII lock-scope self-deadlock RESOLVED by plan 18-07 Path A architectural fix (commits `0575b0a` + `99e6765`). [mgpu] 16/16 PASS, [mgpu_stress] PASS, racecheck 0 hazards. See 18-VERDICT-V2.md + 18-07-SUMMARY.md.
 
 ## Session Continuity
 
-Last session: 2026-05-05T21:24:53.959Z
-Stopped at: Completed 18-06-PLAN.md (Phase 18 PARTIAL — DB-05 P1 deadlock)
+Last session: 2026-05-05T23:34:04.264Z
+Stopped at: Completed 18-07-PLAN.md (Phase 18 PASS — DB-05 closed via Path A)
 Resume file: None

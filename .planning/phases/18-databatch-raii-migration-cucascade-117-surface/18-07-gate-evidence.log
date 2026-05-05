@@ -1,0 +1,70 @@
+============================================================
+Phase 18 Plan 07 — Gate Evidence Log
+Generated: 2026-05-05T22:56:36Z
+Branch: feature/single-node-multi-gpu2
+HEAD: 99e6765
+============================================================
+
+==== STATIC GATES (preserved from 18-06 + Path A drop) ====
+
+-- DELETED_FSM_GREP_HITS (live, non-comment):
+0
+
+-- HYG02_TOTAL:
+40
+-- HYG02_NON_LEGACY:
+0
+
+-- PROCESSING_HANDLES_LIVE (Path A drop verification):
+0
+-- PROCESSING_HANDLES_ALL (incl. archival comments):
+src/op/sirius_physical_grouped_aggregate_merge.cpp:211:  // Path A (Phase 18-07): gpu_pipeline_task no longer holds processing_handles
+
+-- FSM_STATE_LITERAL_HITS:
+0
+
+-- THREE_ARG_POPID_HITS:
+0
+
+
+==== DYNAMIC GATES (DB-05 primary closure target) ====
+Captured: 2026-05-05T23:01:18Z
+
+-- MCP build (final): exit 0 (verified post-Task 1 + Task 2)
+
+-- MCP unit-tests --filter [mgpu]:
+   Exit: 0
+   Duration: 103.5s (budget 240s)
+   Result: All tests passed (79091 assertions in 16 test cases)
+   16/16 PASS — DB-05 PRIMARY GATE CLOSED
+   Sub-tests:
+     [0]  gpu_execution - table_gpu cache warm cross-GPU hazard (follow-up #17)
+     [1]  grouped_aggregate_merge - high-cardinality across both GPUs
+     [2]  grouped_aggregate_merge - single-key forces single-GPU
+     [3]  grouped_aggregate_merge - count(*)-only across two GPUs
+     [4]  physical_hash_join - BUILD_PROBE probe-heavy across two GPUs
+     [5]  physical_hash_join - MIXED_JOIN large-vs-large
+     [6]  physical_hash_join - repeated BUILD_PROBE no wedge
+     [7]  hash_join bisect 1 - JOIN+GROUP BY+ORDER BY, cache=none
+     [8]  hash_join bisect 2 - JOIN+GROUP BY+ORDER BY, cache=table_gpu
+     [9]  hash_join bisect 3 - Q11 shape with HAVING subquery, cache=none
+     [10] physical_hash_join - follow-up #17 scale-up Q11-like
+     [11] physical_order - large sort across two GPUs
+     [12] physical_order - small sort rangecheck regression
+     [13] physical_order - small sort stays single-GPU
+     [14] physical_order - order by with limit
+     [15] mgpu_stress - SCHED-RR counter offset rotation
+
+-- MCP unit-tests --filter [mgpu_stress]:
+   Exit: 0
+   Duration: 75.5s (budget 360s, expected ≤ 180s)
+   Result: All tests passed (77053 assertions in 1 test case)
+
+-- compute-sanitizer racecheck (Bash + timeout 600 per project memory):
+   Tool path: /usr/local/cuda-13.0/bin/compute-sanitizer
+   Tag: [downgrade_lifecycle] (proxy — [mgpu_foundation] tag does not exist; matches 18-06 finding)
+   Exit: 0
+   Tests: 8/8 PASS (53 assertions)
+   RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)
+
+==== ALL GATES PASSED — Phase 18 PASS ====
