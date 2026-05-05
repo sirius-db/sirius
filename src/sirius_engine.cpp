@@ -352,7 +352,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   root_pipeline_idx = 0;
 
   // Convert meta-pipelines into execution-ready pipelines
-  pipeline::sirius_pipeline_converter converter(build_ctx, op_params, &iceberg_metadata_cache_);
+  pipeline::sirius_pipeline_converter converter(build_ctx, op_params, &iceberg_delete_data_cache_);
   auto result = converter.convert(*root_pipeline, *this);
 
   new_scheduled         = std::move(result.scheduled_pipelines);
