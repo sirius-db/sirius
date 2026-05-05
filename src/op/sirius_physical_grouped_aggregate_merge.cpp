@@ -148,8 +148,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next
     bool found_batch       = true;
     auto this_partition_id = current_partition_index;
     while (found_batch) {
-      auto batch = ports.begin()->second->repo->pop_data_batch(
-        ::cucascade::batch_state::task_created, current_partition_index);
+      auto batch = ports.begin()->second->repo->pop_next_data_batch(current_partition_index);
       if (batch) {
         input_batch.push_back(std::move(batch));
       } else {
@@ -184,16 +183,20 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
     return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
+  // R1 — read-only accessor on input_batches[0] for the merge memory_space probe.
+  cucascade::memory::memory_space* input_space = nullptr;
+  {
+    auto ro_first = input_batches[0]->to_read_only();
+    input_space   = ro_first.get_memory_space();
+  }  // ro_first released before merge_grouped_aggregate, which takes its own accessors.
+
   // Merge multiple batches, or use single batch directly if only one
   std::shared_ptr<::cucascade::data_batch> merged;
   if (input_batches.size() == 1) {
     merged = input_batches[0];
   } else {
-    merged = gpu_merge_impl::merge_grouped_aggregate(input_batches,
-                                                     group_idx.size(),
-                                                     cudf_aggregates,
-                                                     stream,
-                                                     *input_batches[0]->get_memory_space());
+    merged = gpu_merge_impl::merge_grouped_aggregate(
+      input_batches, group_idx.size(), cudf_aggregates, stream, *input_space);
   }
 
   // If no post-processing needed, return merged result directly
@@ -204,10 +207,14 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
 
   // Post-merge projection: handle AVG (SUM/COUNT) and COUNT DISTINCT (list element count).
   // Release ownership of the merged table's columns so we can move (not copy) them.
-  auto* space        = merged->get_memory_space();
-  auto mr            = space->get_default_allocator();
-  auto& gpu_rep      = merged->get_data()->cast<cucascade::gpu_table_representation>();
-  auto merged_cols   = gpu_rep.release_table(stream)->release();
+  // R3 — mutable accessor on `merged`; release_table mutates the representation.
+  // For the size==1 path, merged == input_batches[0]; gpu_pipeline_task's
+  // processing_handles holds a separate mutable accessor — see SUMMARY P1 note.
+  auto mut         = merged->to_mutable();
+  auto* space      = mut.get_memory_space();
+  auto mr          = space->get_default_allocator();
+  auto& gpu_rep    = mut.get_data()->cast<cucascade::gpu_table_representation>();
+  auto merged_cols = gpu_rep.release_table(stream)->release();
   int num_group_cols = static_cast<int>(group_idx.size());
 
   std::vector<std::unique_ptr<cudf::column>> output_cols;

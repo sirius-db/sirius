@@ -62,8 +62,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
   if (_current_partition_index < repo->num_partitions()) {
     std::vector<std::shared_ptr<cucascade::data_batch>> all_batches;
     while (true) {
-      auto batch =
-        repo->pop_data_batch(cucascade::batch_state::task_created, _current_partition_index);
+      auto batch = repo->pop_next_data_batch(_current_partition_index);
       if (!batch) { break; }
       all_batches.push_back(std::move(batch));
     }
@@ -94,7 +93,10 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
     // pipelineable_operator_data::prepare_for_processing -> lock_or_prepare_batch.
     // batches[0]->get_memory_space() == target_space here.
     // See .planning/phases/15-mgpu-operator-colocation-audit/15-AUDIT-LOG.md.
-    if (!space) { space = batch->get_memory_space(); }
+    if (!space) {
+      auto ro = batch->to_read_only();
+      space   = ro.get_memory_space();
+    }  // ro released
     valid_batches.push_back(batch);
   }
 
@@ -103,12 +105,15 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
-  // Helper lambda to apply final projection to a batch (removes sort-key-only columns)
+  // Helper lambda to apply final projection to a batch (removes sort-key-only columns).
+  // R1 — read-only accessor scoped per call so the table_view alias remains valid
+  // while building the projected table.
   auto apply_final_projection =
     [this, stream, space](
       std::shared_ptr<cucascade::data_batch> batch) -> std::shared_ptr<cucascade::data_batch> {
     if (_final_projections.empty() || !batch) { return batch; }
-    auto table_view = sirius::get_cudf_table_view(*batch);
+    auto ro              = batch->to_read_only();
+    auto table_view      = sirius::get_cudf_table_view(ro);
     std::vector<cudf::column_view> projected_cols;
     for (auto idx : _final_projections) {
       projected_cols.push_back(table_view.column(static_cast<cudf::size_type>(idx)));
@@ -116,6 +121,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
     auto projected_table = std::make_unique<cudf::table>(
       cudf::table_view(projected_cols), stream, space->get_default_allocator());
     return sirius::make_data_batch(std::move(projected_table), *space, stream);
+    // ro released at lambda return
   };
 
   // Single batch: no merge needed
