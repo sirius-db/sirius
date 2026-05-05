@@ -78,7 +78,19 @@ std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_dat
     // pipelineable_operator_data::prepare_for_processing -> lock_or_prepare_batch.
     // batches[0]->get_memory_space() == target_space here.
     // See .planning/phases/15-mgpu-operator-colocation-audit/15-AUDIT-LOG.md.
-    auto* space = batch->get_memory_space();
+    //
+    // Phase 18 / DB-02 Recipe R1: scoped read-only accessor to resolve the
+    // memory_space pointer through the public RAII surface (#117 makes
+    // data_batch::get_memory_space private). The memory_space object is
+    // owned by the long-lived reservation manager, so the pointer remains
+    // valid after the accessor drops. We drop the accessor before calling
+    // gpu_order_impl::local_order_by because that impl itself takes its
+    // own scoped accessor on the same batch (P1 discipline).
+    cucascade::memory::memory_space* space = nullptr;
+    {
+      auto ro = batch->to_read_only();
+      space   = ro.get_memory_space();
+    }
     if (!space) { continue; }
 
     auto sorted_batch = gpu_order_impl::local_order_by(

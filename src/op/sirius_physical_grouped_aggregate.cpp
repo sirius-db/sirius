@@ -174,13 +174,22 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
   const auto& input_batches = input.get_data_batches();
   std::vector<std::shared_ptr<::cucascade::data_batch>> results;
   for (auto& input_batch : input_batches) {
+    // Phase 18 / DB-02 Recipe R1: scoped read-only accessor to resolve the
+    // memory_space pointer through the public RAII surface (#117 makes
+    // data_batch::get_memory_space private). The memory_space object is
+    // owned by the long-lived reservation manager, so the pointer remains
+    // valid after `ro` drops at end of iteration.
+    auto* space = [&]() {
+      auto ro = input_batch->to_read_only();
+      return ro.get_memory_space();
+    }();
     auto result = gpu_aggregate_impl::local_grouped_aggregate(input_batch,
                                                               group_idx,
                                                               cudf_aggregates,
                                                               cudf_aggregate_idx,
                                                               cudf_aggregate_struct_col_indices,
                                                               stream,
-                                                              *input_batch->get_memory_space());
+                                                              *space);
     results.push_back(std::move(result));
   }
   return std::make_unique<pipelineable_operator_data>(results);

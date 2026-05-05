@@ -80,8 +80,24 @@ std::future<void> cached_split_provider::start(exec::thread_pool& /*pool*/,
     }
 
     cudf::table_view view(col_views);
+    // Phase 18 / DB-04: cucascade #117 makes writer_stream REQUIRED on all
+    // gpu_table_representation constructors (Phase 13-04 Path-2 stream-lineage
+    // contract). The cached path wraps already-pinned data: the underlying
+    // GPU memory was written long ago by whichever pipeline originally
+    // populated the pinned cache, on a stream that no longer exists at this
+    // call site. Passing a default-constructed cuda_stream_view records no
+    // writer event — documented as the "legacy, no-stream" pattern in
+    // cucascade/include/cucascade/data/gpu_data_representation.hpp:60-66:
+    // "passing a default-constructed cuda_stream_view records no event
+    // (legacy, only acceptable for paths whose data was never produced on
+    // any stream)". The cached pinned data is exactly such a path — any
+    // downstream cross-device reader that needs ordering must obtain it
+    // via record_writer_event() at the actual writing site. This is NOT
+    // the legacy default-stream wrapper (which would violate HYG-02);
+    // cuda_stream_view{} is a null stream view.
+    rmm::cuda_stream_view const no_writer_stream{};
     auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
-      view, std::move(owner), alloc_size, *_memory_space);
+      view, std::move(owner), alloc_size, *_memory_space, no_writer_stream);
     auto batch =
       std::make_shared<cucascade::data_batch>(::sirius::get_next_batch_id(), std::move(gpu_repr));
 

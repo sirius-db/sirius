@@ -100,9 +100,15 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
     // pipelineable_operator_data::prepare_for_processing -> lock_or_prepare_batch.
     // batches[0]->get_memory_space() == target_space here.
     // See .planning/phases/15-mgpu-operator-colocation-audit/15-AUDIT-LOG.md.
-    auto* space = batch->get_memory_space();
+    //
+    // Phase 18 / DB-02 Recipe R1: scoped read-only accessor held for the
+    // duration of this iteration. The cudf::table_view derived from the
+    // accessor is non-owning; the accessor must outlive every read of
+    // input_table within this loop body. Lock released at end of iteration.
+    auto ro          = batch->to_read_only();
+    auto* space      = ro.get_memory_space();
     if (!space) { continue; }
-    auto input_table = get_cudf_table_view(*batch);
+    auto input_table = get_cudf_table_view(ro);
     auto num_rows    = input_table.num_rows();
 
     if (num_rows == 0) { continue; }

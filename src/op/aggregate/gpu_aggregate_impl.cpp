@@ -58,7 +58,11 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_ungrouped_aggre
       "`local_ungrouped_aggregate()`");
   }
   std::vector<std::unique_ptr<cudf::column>> output_cols;
-  auto input_table = get_cudf_table_view(*input);
+  // Phase 18 / DB-02 Recipe R1: scoped read-only accessor held for the
+  // lifetime of the derived input_table view (cudf::table_view is non-owning
+  // — it must outlive every column read below). Released at function exit.
+  auto ro          = input->to_read_only();
+  auto input_table = get_cudf_table_view(ro);
   for (size_t i = 0; i < aggregates.size(); ++i) {
     const auto& input_col       = input_table.column(aggregate_idx[i]);
     auto reduce_aggregation     = get_local_aggregation<cudf::reduce_aggregation>(aggregates[i]);
@@ -132,7 +136,12 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
 
   const bool has_struct_col_indices = !aggregate_struct_col_indices.empty();
 
-  auto input_table = get_cudf_table_view(*input);
+  // Phase 18 / DB-02 Recipe R1: scoped read-only accessor for the lifetime
+  // of input_table (non-owning cudf::table_view) and any column_view objects
+  // derived from it. Released at function exit; long-running cudf calls
+  // below run while the shared lock is held.
+  auto ro          = input->to_read_only();
+  auto input_table = get_cudf_table_view(ro);
   auto mr          = memory_space.get_default_allocator();
 
   // Dictionary-encode STRING group keys when:
