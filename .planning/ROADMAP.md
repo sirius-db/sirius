@@ -115,7 +115,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 **Plans**: 4 plans
 - [x] 17-01-PLAN.md — Pre-merge setup: backup ref + Phase 13 stream-lineage extraction + audit log skeleton (MERGE-03)
 - [x] 17-02-PLAN.md — Execute git merge --no-ff origin/dev + resolve 11 conflict files per D-D1..D-D6 + cucascade pin defense (MERGE-01, MERGE-02, MERGE-04)
-- [ ] 17-03-PLAN.md — Auto-merge audit (33 files) + SCHED-RR survival + build error bounding (MERGE-05)
+- [x] 17-03-PLAN.md — Auto-merge audit (33 files) + SCHED-RR survival + build error bounding (MERGE-05)
 - [ ] 17-04-PLAN.md — Run all 6 D-G verification gates + final Phase 17 Verdict (MERGE-01..05 final)
 **Pitfalls**:
   - P7 (PR #739 x #117 ordering mismatch): #739's cucascade submodule bump must be discarded during merge conflict resolution — the cucascade pin is already handled by Phase 16. Accept #739's Sirius operator file changes only as an indication of what files need touching; actual RAII recipe applied in Phase 18.
@@ -204,7 +204,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 | 14. Land SCHED-RR distribution | v1.3 | 2/2 | Complete | 2026-04-30 |
 | 15. Cross-GPU operator-colocation audit | v1.3 | 4/4 | Complete | 2026-05-01 |
 | 16. Cucascade Submodule Rebase + Pin Recovery | v1.4 | 5/5 | Complete    | 2026-05-05 |
-| 17. Sirius origin/dev Merge — Base Layer | v1.4 | 2/4 | In Progress|  |
+| 17. Sirius origin/dev Merge — Base Layer | v1.4 | 3/4 | In Progress|  |
 | 18. DataBatch RAII Migration | v1.4 | 0/? | Not started | - |
 | 19. IO Framework Adoption | v1.4 | 0/? | Not started | - |
 | 20. Scan Manager + Pin Tables Port | v1.4 | 0/? | Not started | - |

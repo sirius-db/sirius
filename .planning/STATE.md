@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Rebase After DataBatch Changes
 status: verifying
-stopped_at: Completed 17-02-PLAN.md (origin/dev merge conflict resolution)
-last_updated: "2026-05-05T13:54:57.574Z"
+stopped_at: Completed 17-03-PLAN.md
+last_updated: "2026-05-05T14:19:14.683Z"
 last_activity: 2026-05-05
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 9
-  completed_plans: 7
+  completed_plans: 8
 ---
 
 # Project State
@@ -84,6 +84,7 @@ v1.4 Progress: [                    ] 0/6 phases | 0/32 requirements | 0 plans
 | Phase 16 P05 | 15min | 3 tasks | 2 files |
 | Phase 17 P01 | 8min | 2 tasks | 2 files |
 | Phase 17-sirius-origin-dev-merge-base-layer P02 | 45min | 3 tasks | 11 files |
+| Phase 17-sirius-origin-dev-merge-base-layer P03 | 45 | 2 tasks | 2 files |
 
 ## Decisions
 
@@ -155,6 +156,8 @@ v1.4 Progress: [                    ] 0/6 phases | 0/32 requirements | 0 plans
 - [Phase 17]: D-C1/C2: Extracted full sirius_parquet_metadata_scan_operator.hpp (232 lines) with stream-lineage context into 17-PHASE-13-EXTRACT.md; re-attachment targets identified for Phase 20 SM-03
 - [Phase 17]: D-G5: Seeded 17-MERGE-LOG.md with Sections A-E covering 11 conflict files, 33 auto-merge audit, build error bounding, 8 verification gates, and PR #739 bookkeeping note
 - [Phase 17-sirius-origin-dev-merge-base-layer]: cucascade pin 1c1e648 auto-defended by git fast-forward; all 11 conflict files resolved per D-D1..D-D6 + D-B1/B2; build expected to fail with get_data() private errors (Phase 18 closure)
+- [Phase 17-sirius-origin-dev-merge-base-layer]: 17-03: D-G3 PASS — all 62 src/+47 test/ FSM grep hits are fully-qualified cucascade API calls; 0 bare FSM enum names from merge
+- [Phase 17-sirius-origin-dev-merge-base-layer]: 17-03: MERGE-05 PASS — 63 build errors all Phase 18 DB-02/DB-03; 0 unrelated errors; liburing-dev missing is IO-12 territory (Bucket 5, not blocking)
 
 ## Accumulated Context
 
@@ -190,6 +193,6 @@ None at roadmap creation. Phase 16 is ready to plan.
 
 ## Session Continuity
 
-Last session: 2026-05-05T13:54:57.571Z
-Stopped at: Completed 17-02-PLAN.md (origin/dev merge conflict resolution)
+Last session: 2026-05-05T14:19:14.680Z
+Stopped at: Completed 17-03-PLAN.md
 Resume file: None
