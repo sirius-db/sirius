@@ -109,8 +109,20 @@ size_t copy_pinned_slices_to_device(
   size_t attrs_idx      = 0;
   size_t fail_idx       = 0;
 
+#if CUDART_VERSION < 13000
+  auto err = cudaMemcpyBatchAsync(dsts.data(),
+                                  srcs.data(),
+                                  sizes.data(),
+                                  n_nonempty,
+                                  &attrs,
+                                  &attrs_idx,
+                                  1,
+                                  nullptr,
+                                  stream.value());
+#else
   auto err = cudaMemcpyBatchAsync(
     dsts.data(), srcs.data(), sizes.data(), n_nonempty, &attrs, &attrs_idx, 1, stream.value());
+#endif
   if (err != cudaSuccess)
     throw std::runtime_error(std::string("sirius_ioctx: cudaMemcpyBatchAsync failed at idx ") +
                              std::to_string(fail_idx) + ": " + cudaGetErrorString(err));
