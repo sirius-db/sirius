@@ -56,14 +56,16 @@ struct pipeline_conversion_result {
 //! This is a pure factory function with no engine/context dependency.
 duckdb::unique_ptr<op::sirius_physical_operator> construct_sirius_specific_operator(
   op::sirius_physical_operator& physical_op,
-  const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>* iceberg_cache);
+  const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>*
+    iceberg_cache);
 
 class sirius_pipeline_converter {
  public:
   sirius_pipeline_converter(
     const pipeline_build_context& ctx,
     const sirius::operator_params& op_params,
-    const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>* iceberg_cache = nullptr);
+    const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>*
+      iceberg_cache = nullptr);
 
   //! Convert meta-pipelines into execution-ready pipelines.
   //! The engine reference is only needed for wire_data_repositories (runtime wiring).
@@ -108,7 +110,8 @@ class sirius_pipeline_converter {
 
   const pipeline_build_context build_ctx_;
   const sirius::operator_params& op_params_;
-  const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>* iceberg_cache_;
+  const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>*
+    iceberg_cache_;
 
   // Internal state built during convert(), moved into result
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> scheduled_;
