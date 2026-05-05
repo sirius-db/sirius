@@ -317,18 +317,18 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::get_next_task_i
       for (auto& right_batch_id : right_batch_ids[partition_idx]) {
         if (counter == batch_index) {
           if (right_counter == right_batch_ids[partition_idx].size() - 1) {
-            input_batch.push_back(default_port->repo->pop_data_batch_by_id(
-              left_batch_id, cucascade::batch_state::task_created, partition_idx));
+            input_batch.push_back(
+              default_port->repo->pop_data_batch_by_id(left_batch_id, partition_idx));
           } else {
-            input_batch.push_back(default_port->repo->get_data_batch_by_id(
-              left_batch_id, cucascade::batch_state::task_created, partition_idx));
+            input_batch.push_back(
+              default_port->repo->get_data_batch_by_id(left_batch_id, partition_idx));
           }
           if (left_counter == left_batch_ids[partition_idx].size() - 1) {
-            input_batch.push_back(build_port->repo->pop_data_batch_by_id(
-              right_batch_id, cucascade::batch_state::task_created, partition_idx));
+            input_batch.push_back(
+              build_port->repo->pop_data_batch_by_id(right_batch_id, partition_idx));
           } else {
-            input_batch.push_back(build_port->repo->get_data_batch_by_id(
-              right_batch_id, cucascade::batch_state::task_created, partition_idx));
+            input_batch.push_back(
+              build_port->repo->get_data_batch_by_id(right_batch_id, partition_idx));
           }
           return std::make_unique<pipelineable_operator_data>(input_batch);
         }
@@ -409,15 +409,20 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
-  cudf::table_view left  = get_cudf_table_view(*left_batch);
-  cudf::table_view right = get_cudf_table_view(*right_batch);
+  // R1 — read-only accessors held for the entire body so the cudf::table_views
+  // remain valid through every code path (cross_join, conditional_join, gather,
+  // make_data_batch). Both accessors are released when this function returns.
+  auto left_ro           = left_batch->to_read_only();
+  auto right_ro          = right_batch->to_read_only();
+  cudf::table_view left  = get_cudf_table_view(left_ro);
+  cudf::table_view right = get_cudf_table_view(right_ro);
 
   // INVARIANT (SCHED-RR contract): all input batches arrive on target_space
   // via gpu_pipeline_task::execute_pipeline_task_round ->
   // pipelineable_operator_data::prepare_for_processing -> lock_or_prepare_batch.
   // batches[0]->get_memory_space() == target_space here.
   // See .planning/phases/15-mgpu-operator-colocation-audit/15-AUDIT-LOG.md.
-  cucascade::memory::memory_space* space = left_batch->get_memory_space();
+  cucascade::memory::memory_space* space = left_ro.get_memory_space();
   if (!space) {
     SIRIUS_LOG_DEBUG(
       "Pipeline {}: nested loop join, 0 output batches because left batch had no memory space",

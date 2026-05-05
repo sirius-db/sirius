@@ -99,8 +99,12 @@ std::optional<task_creation_hint> sirius_physical_concat::get_next_task_hint()
     size_t total_batch_size = 0;
     size_t pulled_count     = 0;
     for (auto& batch_id : batch_ids) {
-      auto batch      = port_ptr->repo->get_data_batch_by_id(batch_id, std::nullopt, i);
-      auto batch_size = batch->get_data()->get_size_in_bytes();
+      auto batch = port_ptr->repo->get_data_batch_by_id(batch_id, i);
+      uint64_t batch_size = 0;
+      {
+        auto ro = batch->to_read_only();
+        if (ro.get_data()) { batch_size = ro.get_data()->get_size_in_bytes(); }
+      }  // ro released
       total_batch_size += batch_size;
       if (!_concat_all && total_batch_size > _concat_batch_bytes) {
         // This batch pushes us over the threshold — the loop would stop here.
@@ -139,8 +143,12 @@ std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data(
     auto batch_ids          = port_ptr->repo->get_batch_ids(i);
     size_t total_batch_size = 0;
     for (auto& batch_id : batch_ids) {
-      auto batch      = port_ptr->repo->get_data_batch_by_id(batch_id, std::nullopt, i);
-      auto batch_size = batch->get_data()->get_size_in_bytes();
+      auto batch          = port_ptr->repo->get_data_batch_by_id(batch_id, i);
+      uint64_t batch_size = 0;
+      {
+        auto ro = batch->to_read_only();
+        if (ro.get_data()) { batch_size = ro.get_data()->get_size_in_bytes(); }
+      }  // ro released
       total_batch_size += batch_size;
       // Check if the batch size is already exceed the threshold
       if (!_concat_all && total_batch_size > _concat_batch_bytes) {
@@ -149,16 +157,14 @@ std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data(
         if (input_batch.size() == 0) {
           // this mean that there is a batch that is bigger than the threshold, then we just output
           // that batch right away
-          auto popped_batch = port_ptr->repo->pop_data_batch_by_id(
-            batch_id, ::cucascade::batch_state::task_created, i);
+          auto popped_batch = port_ptr->repo->pop_data_batch_by_id(batch_id, i);
           input_batch.push_back(std::move(popped_batch));
         }
         break;
       } else {
         // if the batch size does not exceed the threshold, then we need to add the batch to the
         // input batch
-        auto popped_batch =
-          port_ptr->repo->pop_data_batch_by_id(batch_id, ::cucascade::batch_state::task_created, i);
+        auto popped_batch = port_ptr->repo->pop_data_batch_by_id(batch_id, i);
         input_batch.push_back(std::move(popped_batch));
       }
     }
@@ -195,7 +201,11 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
   // pipelineable_operator_data::prepare_for_processing -> lock_or_prepare_batch.
   // batches[0]->get_memory_space() == target_space here.
   // See .planning/phases/15-mgpu-operator-colocation-audit/15-AUDIT-LOG.md.
-  cucascade::memory::memory_space* space = valid_batches[0]->get_memory_space();
+  cucascade::memory::memory_space* space = nullptr;
+  {
+    auto ro = valid_batches[0]->to_read_only();
+    space   = ro.get_memory_space();
+  }  // ro released
   if (space == nullptr) { throw std::runtime_error("sirius_physical_concat: space is nullptr"); }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
