@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Rebase After DataBatch Changes
 status: executing
-stopped_at: Completed 18-02-PLAN.md
-last_updated: "2026-05-05T15:51:16.511Z"
+stopped_at: Completed 18-04-PLAN.md
+last_updated: "2026-05-05T16:11:43.347Z"
 last_activity: 2026-05-05
 progress:
   total_phases: 6
   completed_phases: 2
   total_plans: 15
-  completed_plans: 11
+  completed_plans: 13
 ---
 
 # Project State
@@ -25,7 +25,7 @@ See: .planning/PROJECT.md (updated 2026-05-04)
 ## Current Position
 
 Phase: 18 (DataBatch RAII Migration (cucascade #117 surface)) — EXECUTING
-Plan: 3 of 6
+Plan: 5 of 6
 Status: Ready to execute
 Last activity: 2026-05-05
 
@@ -88,6 +88,8 @@ v1.4 Progress: [######              ] 2/6 phases | 9/32 requirements | 9 plans
 | Phase 17-sirius-origin-dev-merge-base-layer P04 | 15min | 1 tasks | 1 files |
 | Phase 18 P01 | 5min | 3 tasks | 4 files |
 | Phase 18 P02 | 7min | 3 tasks | 7 files |
+| Phase 18 P03 | 13min | 3 tasks | 9 files |
+| Phase 18 P04 | 16min | 3 tasks | 14 files |
 
 ## Decisions
 
@@ -165,6 +167,9 @@ v1.4 Progress: [######              ] 2/6 phases | 9/32 requirements | 9 plans
 - [Phase 18]: [18-01] DB-01 closed: batch_lock_utils.hpp rewritten with three RAII helpers (prepare_and_acquire_mutable, try_acquire_mutable, acquire_read_only); operator-data prepare_for_processing returns optional<vector<mutable_data_batch>>; get_cudf_table_view takes const read_only_data_batch&. Build errors 63 -> 58. HYG-02 = 0 in all 4 modified files.
 - [Phase 18]: [18-01] Acceptance criterion 'build error count <= 50' partial-met (actual: 58). 5-error gap is R2 size-estimator inline body content in modified headers (sirius_physical_operator.hpp:191-192, parquet_scan_operator_data.hpp:186) — RESEARCH.md classifies these as plan 18-02 territory. Plus 6 pre-existing liburing errors in src/io/uring/uring_reactor.cpp (Phase 19 / IO-12 territory, not in DB-01..05 scope per CONTEXT.md). Strict per-task acceptance criteria all PASS.
 - [Phase 18]: [18-02] DB-02 + DB-03 closed at the operator-base layer: convertible_data_batch + convertible_gpu_pipeline_task wrappers migrated to RAII (try_to_mutable for non-blocking exclusive in convert; lock-free state probe + scoped to_read_only for memory-space probe). pipelineable_operator_data::prepare_for_processing implementation uses pipeline::prepare_and_acquire_mutable; get_next_task_input_data uses pop_next_data_batch(0). gpu_pipeline_task storage type flipped to vector<mutable_data_batch>. R2 size-estimator inline bodies in operator-data + scan-cached-data headers also migrated (Rule 3 deviation — same translation-unit cascade). Build errors 58 -> 47.
+- [Phase 18]: [18-03] DB-02 + DB-03 closed for 8 stateful operator .cpp files (table_scan, hash_join, nested_loop_join, concat, top_n, grouped_aggregate_merge, ungrouped_aggregate, merge_sort): all FSM-pop sites replaced with pop_next_data_batch; all pop_data_batch_by_id 3-arg sites converted to 2-arg; read paths use scoped to_read_only(); the one mutable-write path (grouped_aggregate_merge release_table) uses to_mutable. hash_join's prepare_join_keys + resolve_mark_join_result signatures flipped to take const read_only_data_batch& and memory_space&. Build errors 47 -> 21.
+- [Phase 18]: [18-03] P1 deadlock risk surfaced: 18-02's R5 lock-and-hold in gpu_pipeline_task::processing_handles holds vector<mutable_data_batch> across op->execute(); operator code in execute() now takes scoped to_read_only/to_mutable accessors on the same input batches, which is technically UB on non-recursive std::shared_mutex. Documented in SUMMARY P1 section. Compile-only acceptance gates pass; runtime audit deferred to 18-05 with two follow-up resolution paths (architectural accessor exposure OR drop R5 lock-and-hold).
+- [Phase 18]: [18-04] DB-02/DB-03 closed for read-only operators + scan layer + task_creator + debug_utils. 4 known Pitfall 4 sites (2-arg make_data_batch) all closed in src/: filter:60, projection:63, table_scan:176 (via 18-03), gpu_parquet_scan_operator:252. HYG-02 baseline preserved at 0. Rule 3 deviations: debug_utils.hpp const drop (to_read_only is non-const) and ->clone() migration (clone moved off data_batch onto accessors under #117). 8 inventory-miss src/ files surfaced (sort_partition, grouped_aggregate, order, gpu_aggregate_impl, gpu_merge_impl, gpu_order_impl, gpu_partition_impl, cached_split_provider) — logged in deferred-items.md for orchestrator triage.
 
 ## Accumulated Context
 
@@ -200,6 +205,6 @@ None at roadmap creation. Phase 16 is ready to plan.
 
 ## Session Continuity
 
-Last session: 2026-05-05T15:51:16.508Z
-Stopped at: Completed 18-02-PLAN.md
+Last session: 2026-05-05T16:11:43.339Z
+Stopped at: Completed 18-04-PLAN.md
 Resume file: None
