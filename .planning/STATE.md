@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Rebase After DataBatch Changes
 status: verifying
-stopped_at: Completed 17-03-PLAN.md
-last_updated: "2026-05-05T14:19:14.683Z"
+stopped_at: Completed 17-04-PLAN.md
+last_updated: "2026-05-05T14:45:00.000Z"
 last_activity: 2026-05-05
 progress:
   total_phases: 6
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 9
-  completed_plans: 8
+  completed_plans: 9
 ---
 
 # Project State
@@ -25,12 +25,12 @@ See: .planning/PROJECT.md (updated 2026-05-04)
 ## Current Position
 
 Phase: 17
-Plan: Not started
-Status: Phase complete — ready for verification
+Plan: 04 (complete)
+Status: Phase 17 complete — Final Verdict PASS (all 5 MERGE-XX satisfied); proceed to Phase 18
 Last activity: 2026-05-05
 
 ```
-v1.4 Progress: [                    ] 0/6 phases | 0/32 requirements | 0 plans
+v1.4 Progress: [######              ] 2/6 phases | 9/32 requirements | 9 plans
 ```
 
 ## Phase Overview (v1.4)
@@ -38,7 +38,7 @@ v1.4 Progress: [                    ] 0/6 phases | 0/32 requirements | 0 plans
 | Phase | Name | Requirements | Status |
 |-------|------|--------------|--------|
 | 16 | Cucascade Submodule Rebase + Pin Recovery | CC-01..04 | Not started |
-| 17 | Sirius origin/dev Merge — Base Layer | MERGE-01..05 | Not started |
+| 17 | Sirius origin/dev Merge — Base Layer | MERGE-01..05 | Complete (4/4 plans, PASS) |
 | 18 | DataBatch RAII Migration | DB-01..05 | Not started |
 | 19 | IO Framework Adoption | IO-12..17 | Not started |
 | 20 | Scan Manager + Pin Tables Port | SM-01..06 | Not started |
@@ -85,6 +85,7 @@ v1.4 Progress: [                    ] 0/6 phases | 0/32 requirements | 0 plans
 | Phase 17 P01 | 8min | 2 tasks | 2 files |
 | Phase 17-sirius-origin-dev-merge-base-layer P02 | 45min | 3 tasks | 11 files |
 | Phase 17-sirius-origin-dev-merge-base-layer P03 | 45 | 2 tasks | 2 files |
+| Phase 17-sirius-origin-dev-merge-base-layer P04 | 15min | 1 tasks | 1 files |
 
 ## Decisions
 
@@ -158,6 +159,7 @@ v1.4 Progress: [                    ] 0/6 phases | 0/32 requirements | 0 plans
 - [Phase 17-sirius-origin-dev-merge-base-layer]: cucascade pin 1c1e648 auto-defended by git fast-forward; all 11 conflict files resolved per D-D1..D-D6 + D-B1/B2; build expected to fail with get_data() private errors (Phase 18 closure)
 - [Phase 17-sirius-origin-dev-merge-base-layer]: 17-03: D-G3 PASS — all 62 src/+47 test/ FSM grep hits are fully-qualified cucascade API calls; 0 bare FSM enum names from merge
 - [Phase 17-sirius-origin-dev-merge-base-layer]: 17-03: MERGE-05 PASS — 63 build errors all Phase 18 DB-02/DB-03; 0 unrelated errors; liburing-dev missing is IO-12 territory (Bucket 5, not blocking)
+- [Phase 17-sirius-origin-dev-merge-base-layer]: 17-04: All 6 D-G gates PASS; Phase 17 Final Verdict PASS (all 5 MERGE-XX satisfied); cucascade pin 1c1e648 intact; phase17-pre-merge-backup preserved
 
 ## Accumulated Context
 

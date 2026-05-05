@@ -16,7 +16,7 @@
 Goal: land cucascade `origin/main` (PR #117 DataBatch RAII refactor + #112 + #116) and Sirius `origin/dev` (#675 IO Framework, #731 Scan Manager, #721 Pin Tables, #739 cucascade-compat, #733/#734/#735) onto `feature/single-node-multi-gpu2`, preserving all v1.1+v1.2+v1.3 multi-GPU behavior. The v1.3 ship-gate (`[mgpu]` 16/16, `[TPC-H][parquet]` 22/22, `[integration][TPC-H]` 48/48, SF100 Q1 num_gpus=2 <= 5.7s, mgpu_stress 500-iter, HYG-02 <= 40) must pass bitwise on the rebased branch.
 
 - [x] **Phase 16: Cucascade Submodule Rebase + Pin Recovery** — Rebase 11 local Sirius-side cucascade fixes onto `73d00c4` (origin/main tip with #117 DataBatch RAII + #112 + #116). Highest conflict density; no Sirius compile gate here — cucascade-internal verification only. **COMPLETE** (2026-05-05): 4 group commits on top of 73d00c4, ctest 100% PASS, all 8 grep gates green, CC-01..04 satisfied.
-- [ ] **Phase 17: Sirius origin/dev Merge — Base Layer** — Absorb `origin/dev` CI/CMake/config PRs (#739 compat, #675, #731, #721, #733, #734, #735) as a base-layer merge. Expected to produce 26+ `batch->get_data()` private-access build errors — DOCUMENTED as expected, not a phase failure. SCHED-RR block survival verified.
+- [x] **Phase 17: Sirius origin/dev Merge — Base Layer** — Absorb `origin/dev` CI/CMake/config PRs (#739 compat, #675, #731, #721, #733, #734, #735) as a base-layer merge. Expected to produce 26+ `batch->get_data()` private-access build errors — DOCUMENTED as expected, not a phase failure. SCHED-RR block survival verified. **COMPLETE** (2026-05-05): All 5 MERGE-XX requirements PASS; 63 expected build errors classified as Phase 18 DB-02/DB-03; cucascade pin 1c1e648 preserved; D-G1..G6 all PASS.
 - [ ] **Phase 18: DataBatch RAII Migration (cucascade #117 surface)** — Migrate all `batch->get_data()` call sites and `pop_data_batch(state)` usages to RAII accessors; rewrite `batch_lock_utils.hpp`. Phase ends with a compile-clean build.
 - [ ] **Phase 19: IO Framework Adoption (PR #675)** — Retire `sirius::io::cucascade_datasource`; adopt `sirius::io::sirius_datasource` with per-GPU `uring_ioctx` instances. Install `liburing-dev` before first build attempt.
 - [ ] **Phase 20: Scan Manager + Pin Tables Port (PR #731 + #721)** — Integrate `parquet_split_provider` / `sirius_scan_manager` / `split_connector`; re-plant `_batch_gpu_affinity` (Phase 9) and stream-lineage hooks (Phase 13); port SCHED-RR counter to `parquet_split_provider`.
@@ -116,7 +116,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 - [x] 17-01-PLAN.md — Pre-merge setup: backup ref + Phase 13 stream-lineage extraction + audit log skeleton (MERGE-03)
 - [x] 17-02-PLAN.md — Execute git merge --no-ff origin/dev + resolve 11 conflict files per D-D1..D-D6 + cucascade pin defense (MERGE-01, MERGE-02, MERGE-04)
 - [x] 17-03-PLAN.md — Auto-merge audit (33 files) + SCHED-RR survival + build error bounding (MERGE-05)
-- [ ] 17-04-PLAN.md — Run all 6 D-G verification gates + final Phase 17 Verdict (MERGE-01..05 final)
+- [x] 17-04-PLAN.md — Run all 6 D-G verification gates + final Phase 17 Verdict (MERGE-01..05 final)
 **Pitfalls**:
   - P7 (PR #739 x #117 ordering mismatch): #739's cucascade submodule bump must be discarded during merge conflict resolution — the cucascade pin is already handled by Phase 16. Accept #739's Sirius operator file changes only as an indication of what files need touching; actual RAII recipe applied in Phase 18.
   - P6 (SCHED-RR counter stale): verify `_no_pref_rr_counter` field and the SCHED-RR block in `task_scheduler.cpp` both survive the merge (grep gate in criterion 2). If a conflict exists, resolve by keeping Phase 14's SCHED-RR block plus #739's one-line change.
@@ -204,7 +204,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 | 14. Land SCHED-RR distribution | v1.3 | 2/2 | Complete | 2026-04-30 |
 | 15. Cross-GPU operator-colocation audit | v1.3 | 4/4 | Complete | 2026-05-01 |
 | 16. Cucascade Submodule Rebase + Pin Recovery | v1.4 | 5/5 | Complete    | 2026-05-05 |
-| 17. Sirius origin/dev Merge — Base Layer | v1.4 | 3/4 | In Progress|  |
+| 17. Sirius origin/dev Merge — Base Layer | v1.4 | 4/4 | Complete | 2026-05-05 |
 | 18. DataBatch RAII Migration | v1.4 | 0/? | Not started | - |
 | 19. IO Framework Adoption | v1.4 | 0/? | Not started | - |
 | 20. Scan Manager + Pin Tables Port | v1.4 | 0/? | Not started | - |
