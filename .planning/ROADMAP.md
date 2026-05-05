@@ -112,7 +112,11 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
   3. `grep -rn "task_created\|in_transit\|data_batch_processing_handle\|idata_batch_probe" src/` returns zero — no old FSM enum values were re-introduced by auto-merged files.
   4. Phase 13 stream-lineage extraction is complete: `17-MERGE-LOG.md` documents the extracted attachment points for `writer_stream` / `writer_event` from the deleted `sirius_parquet_metadata_scan_operator.hpp`, with re-attachment target identified as `parquet_split_provider.cpp` or `sirius_gpu_parquet_scan_operator.cpp` (MERGE-03).
   5. Build error count is bounded and recorded in `17-MERGE-LOG.md`: expected 26+ `batch->get_data() is private` errors plus RAII compile errors; zero unrelated build errors outside the DataBatch migration surface (MERGE-05).
-**Plans**: TBD
+**Plans**: 4 plans
+- [ ] 17-01-PLAN.md — Pre-merge setup: backup ref + Phase 13 stream-lineage extraction + audit log skeleton (MERGE-03)
+- [ ] 17-02-PLAN.md — Execute git merge --no-ff origin/dev + resolve 11 conflict files per D-D1..D-D6 + cucascade pin defense (MERGE-01, MERGE-02, MERGE-04)
+- [ ] 17-03-PLAN.md — Auto-merge audit (33 files) + SCHED-RR survival + build error bounding (MERGE-05)
+- [ ] 17-04-PLAN.md — Run all 6 D-G verification gates + final Phase 17 Verdict (MERGE-01..05 final)
 **Pitfalls**:
   - P7 (PR #739 x #117 ordering mismatch): #739's cucascade submodule bump must be discarded during merge conflict resolution — the cucascade pin is already handled by Phase 16. Accept #739's Sirius operator file changes only as an indication of what files need touching; actual RAII recipe applied in Phase 18.
   - P6 (SCHED-RR counter stale): verify `_no_pref_rr_counter` field and the SCHED-RR block in `task_scheduler.cpp` both survive the merge (grep gate in criterion 2). If a conflict exists, resolve by keeping Phase 14's SCHED-RR block plus #739's one-line change.
@@ -200,7 +204,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 | 14. Land SCHED-RR distribution | v1.3 | 2/2 | Complete | 2026-04-30 |
 | 15. Cross-GPU operator-colocation audit | v1.3 | 4/4 | Complete | 2026-05-01 |
 | 16. Cucascade Submodule Rebase + Pin Recovery | v1.4 | 5/5 | Complete    | 2026-05-05 |
-| 17. Sirius origin/dev Merge — Base Layer | v1.4 | 0/? | Not started | - |
+| 17. Sirius origin/dev Merge — Base Layer | v1.4 | 0/4 | Planned | - |
 | 18. DataBatch RAII Migration | v1.4 | 0/? | Not started | - |
 | 19. IO Framework Adoption | v1.4 | 0/? | Not started | - |
 | 20. Scan Manager + Pin Tables Port | v1.4 | 0/? | Not started | - |
