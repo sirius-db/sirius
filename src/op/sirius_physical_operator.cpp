@@ -37,52 +37,65 @@ std::optional<std::vector<::cucascade::mutable_data_batch>>
 pipelineable_operator_data::prepare_for_processing(
   const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
 {
-  // R5 lock-and-hold: each accessor returned by prepare_and_acquire_mutable holds an
-  // exclusive lock on its parent data_batch for the duration of the operator's
-  // execute() call. The vector is destroyed by the caller (gpu_pipeline_task)
-  // after execute() returns, releasing all locks via RAII.
-  std::vector<::cucascade::mutable_data_batch> accessors;
-  accessors.reserve(_data_batches.size());
-
+  // Path A (Phase 18-07 gap closure): conversion happens under short-scoped
+  // accessors released before return; operators inside execute() acquire their
+  // own per-call accessors at narrowest scope. R5 lock-and-hold dropped per
+  // 18-VERIFICATION.md (DB-05 deadlock fix). The previous design returned a
+  // vector of mutable_data_batch held across op->execute(); under glibc
+  // std::shared_mutex this triggered EDEADLK ("Resource deadlock avoided")
+  // when operator code in execute() re-acquired to_read_only/to_mutable on
+  // the same batches. We now eagerly perform any required memory-space
+  // conversion inside this function under a `{}` block — the exclusive
+  // accessor is destroyed before the next iteration — and return an empty
+  // vector. Operators take their own per-call accessors during execute().
   for (const auto& batch : _data_batches) {
     if (!batch) {
       SIRIUS_LOG_ERROR("pipelineable_operator_data: null batch encountered, skipping");
       SIRIUS_LOG_INFO("[mgpu-probe] prepare_for_processing returning nullopt null_batch=true");
       return std::nullopt;
     }
-    std::optional<::cucascade::mutable_data_batch> acc;
-    try {
-      acc = pipeline::prepare_and_acquire_mutable(batch, requested_memory_space, stream);
-    } catch (const rmm::out_of_memory&) {
-      SIRIUS_LOG_ERROR(
-        "pipelineable_operator_data: OOM at batch {} preparing for processing, state: {}",
-        batch->get_batch_id(),
-        static_cast<int>(batch->get_state()));
-      throw;
-    } catch (const std::exception& e) {
-      SIRIUS_LOG_ERROR(
-        "pipelineable_operator_data: Unknown error at batch {} preparing for processing, "
-        "state: {}: {}",
-        batch->get_batch_id(),
-        static_cast<int>(batch->get_state()),
-        e.what());
-      throw;
+    {
+      // Short-scoped exclusive accessor: conversion happens here, lock is
+      // released at end of `{}` block before the next iteration. Path A
+      // discipline — never hold the accessor across a downstream call that
+      // re-acquires on the same batch.
+      std::optional<::cucascade::mutable_data_batch> acc;
+      try {
+        acc = pipeline::prepare_and_acquire_mutable(batch, requested_memory_space, stream);
+      } catch (const rmm::out_of_memory&) {
+        SIRIUS_LOG_ERROR(
+          "pipelineable_operator_data: OOM at batch {} preparing for processing, state: {}",
+          batch->get_batch_id(),
+          static_cast<int>(batch->get_state()));
+        throw;
+      } catch (const std::exception& e) {
+        SIRIUS_LOG_ERROR(
+          "pipelineable_operator_data: Unknown error at batch {} preparing for processing, "
+          "state: {}: {}",
+          batch->get_batch_id(),
+          static_cast<int>(batch->get_state()),
+          e.what());
+        throw;
+      }
+      if (!acc) {
+        // Phase 9 FIX-B observability: breadcrumb confirms nullopt propagates
+        // out cleanly, so the caller can handle it via the optional.
+        SIRIUS_LOG_INFO(
+          "[mgpu-probe] prepare_for_processing returning nullopt batch_id={} batch_state={}",
+          batch->get_batch_id(),
+          static_cast<int>(batch->get_state()));
+        return std::nullopt;
+      }
+      // RAII drop of `acc` here — exclusive lock on this batch is released
+      // before we move on to the next batch. The conversion side effect
+      // (memory-space migration if requested) persists in the underlying
+      // data_batch. This is the only state we need from the helper.
     }
-    if (!acc) {
-      // Phase 9 FIX-B observability: breadcrumb confirms nullopt propagates
-      // out of the loop cleanly, so the caller can handle it via
-      // `accessors_opt.has_value()`. If a SIGSEGV is a null-deref downstream,
-      // the fix site is in the caller, not here — this log helps correlate.
-      SIRIUS_LOG_INFO(
-        "[mgpu-probe] prepare_for_processing returning nullopt batch_id={} batch_state={}",
-        batch->get_batch_id(),
-        static_cast<int>(batch->get_state()));
-      return std::nullopt;
-    }
-    accessors.emplace_back(std::move(*acc));
   }
 
-  return accessors;
+  // Path A: return EMPTY vector. No accessors are held across op->execute().
+  // Operators take their own per-call accessors via to_read_only / to_mutable.
+  return std::vector<::cucascade::mutable_data_batch>{};
 }
 
 std::string sirius_physical_operator::get_name() const

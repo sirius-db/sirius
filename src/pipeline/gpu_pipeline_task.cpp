@@ -331,9 +331,17 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
 
   auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
 
-  std::optional<std::vector<::cucascade::mutable_data_batch>> handles_opt;
+  // Path A (Phase 18-07): prepare_for_processing performs eager memory-space
+  // conversion under short-scoped exclusive accessors that are RELEASED before
+  // it returns; the returned vector is always empty on success. We no longer
+  // store a vector<mutable_data_batch> across op->execute() — operators inside
+  // execute() acquire their own per-call to_read_only / to_mutable accessors
+  // at narrowest scope (matches CONTEXT.md P1 mitigation; see
+  // 18-VERIFICATION.md for the gap analysis that drove the R5 revert). The
+  // optional is retained to preserve OOM/lock-failure detection semantics.
+  std::optional<std::vector<::cucascade::mutable_data_batch>> prepare_result;
   try {
-    handles_opt =
+    prepare_result =
       local_state._input_data.get()->prepare_for_processing(requested_memory_space, stream);
   } catch (const rmm::out_of_memory& oom) {
     auto peak_bytes  = allocator->get_peak_allocated_bytes(stream);
@@ -353,11 +361,13 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     throw;
   }
 
-  if (!handles_opt) {
+  if (!prepare_result) {
     throw oom_reschedule_exception(
       std::move(local_state._input_data), 0, "Failed to lock or prepare batches for processing");
   }
-  std::vector<::cucascade::mutable_data_batch> processing_handles = std::move(*handles_opt);
+  // The returned vector is empty under Path A; conversion has already happened
+  // and locks have already been released. Drop the temporary explicitly.
+  prepare_result.reset();
 
   auto const prepare_end = std::chrono::high_resolution_clock::now();
   auto const prepare_duration =
@@ -368,8 +378,11 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
                    first_op.get_operator_id(),
                    prepare_duration.count() / 1000.0);
 
-  // At this point, all input batches are locked for processing.
-  // They will remain locked until the processing_handles go out of scope.
+  // Path A: prepare_for_processing has eagerly converted any batches into the
+  // requested memory space using short-scoped exclusive locks. Locks are NOT
+  // held across compute_task / op->execute() — operators inside execute()
+  // take their own per-call to_read_only / to_mutable accessors as migrated
+  // in plans 18-03/18-04.
 
   // 2. Set reservation_aware_memory_resource_ref as the default cudf allocator
   // 3. Execute cudf operators on the pipeline
@@ -412,7 +425,8 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
 
   if (output_data) { publish_output(*output_data, stream); }
 
-  // Processing handles are automatically released here when they go out of scope
+  // Path A: no held accessors to release — operators acquired and dropped
+  // their own per-call accessors during execute().
 }
 
 std::size_t gpu_pipeline_task::get_input_size() const

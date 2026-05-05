@@ -208,8 +208,10 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   // Post-merge projection: handle AVG (SUM/COUNT) and COUNT DISTINCT (list element count).
   // Release ownership of the merged table's columns so we can move (not copy) them.
   // R3 — mutable accessor on `merged`; release_table mutates the representation.
-  // For the size==1 path, merged == input_batches[0]; gpu_pipeline_task's
-  // processing_handles holds a separate mutable accessor — see SUMMARY P1 note.
+  // Path A (Phase 18-07): gpu_pipeline_task no longer holds processing_handles
+  // across op->execute(); this scoped to_mutable is the ONLY exclusive lock on
+  // the batch. For the size==1 path, merged == input_batches[0]; the lock is
+  // released when `mut` leaves this scope.
   auto mut         = merged->to_mutable();
   auto* space      = mut.get_memory_space();
   auto mr          = space->get_default_allocator();

@@ -110,9 +110,17 @@ class operator_data {
    * requiring locking and need no per-task setup. Override when either
    * condition changes.
    *
-   * R5 lock-and-hold (Phase 18 / DB-01): the returned mutable_data_batch
-   * accessors hold exclusive locks on their parent batches for the full
-   * execute() lifetime, replacing the pre-#117 processing-handle vector.
+   * Path A semantics (Phase 18-07): the returned vector is EMPTY for non-source
+   * operator data (eager memory-space conversion done under short-scoped
+   * accessors that are released BEFORE this function returns); for source-input
+   * data (parquet_scan_data, scan_cached_operator_data) it is also empty.
+   * Operators inside execute() acquire their own per-call read_only_data_batch
+   * / mutable_data_batch accessors via the cucascade #117 RAII API; locks are
+   * scoped to the narrowest block per CONTEXT.md P1 mitigation guidance.
+   * The previous Phase 18-02 R5 lock-and-hold design (vector held across
+   * op->execute()) was reverted in 18-07 after it triggered glibc EDEADLK on
+   * std::shared_mutex re-lock attempts. See 18-VERIFICATION.md for the full
+   * gap analysis and 18-07-SUMMARY.md for the closure record.
    */
   virtual std::optional<std::vector<::cucascade::mutable_data_batch>> prepare_for_processing(
     const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
