@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Rebase After DataBatch Changes
-status: executing
-stopped_at: Completed 18-05-PLAN.md
-last_updated: "2026-05-05T18:35:39.697Z"
+status: verifying
+stopped_at: Completed 18-06-PLAN.md (Phase 18 PARTIAL — DB-05 P1 deadlock)
+last_updated: "2026-05-05T21:24:53.962Z"
 last_activity: 2026-05-05
 progress:
   total_phases: 6
-  completed_phases: 2
+  completed_phases: 3
   total_plans: 15
-  completed_plans: 14
+  completed_plans: 15
 ---
 
 # Project State
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-05-04)
 
 Phase: 18 (DataBatch RAII Migration (cucascade #117 surface)) — EXECUTING
 Plan: 6 of 6
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-05-05
 
 ```
@@ -39,7 +39,7 @@ v1.4 Progress: [######              ] 2/6 phases | 9/32 requirements | 9 plans
 |-------|------|--------------|--------|
 | 16 | Cucascade Submodule Rebase + Pin Recovery | CC-01..04 | Not started |
 | 17 | Sirius origin/dev Merge — Base Layer | MERGE-01..05 | Complete (4/4 plans, PASS) |
-| 18 | DataBatch RAII Migration | DB-01..05 | Not started |
+| 18 | DataBatch RAII Migration | DB-01..05 | Complete (6/6 plans, PARTIAL — DB-01..04 PASS; DB-05 FAIL on P1 deadlock) |
 | 19 | IO Framework Adoption | IO-12..17 | Not started |
 | 20 | Scan Manager + Pin Tables Port | SM-01..06 | Not started |
 | 21 | v1.4 Ship Gate | REG-01..06 | Not started |
@@ -91,6 +91,7 @@ v1.4 Progress: [######              ] 2/6 phases | 9/32 requirements | 9 plans
 | Phase 18 P03 | 13min | 3 tasks | 9 files |
 | Phase 18 P04 | 16min | 3 tasks | 14 files |
 | Phase 18 P05 | 65min | 4 tasks | 31 files |
+| Phase 18 P06 | 164min | 3 tasks | 11 files |
 
 ## Decisions
 
@@ -177,6 +178,7 @@ v1.4 Progress: [######              ] 2/6 phases | 9/32 requirements | 9 plans
 - [Phase 18]: [18-05] Pitfall 5 wrapper-state migration: under cucascade #117 fresh batches are 'idle' on construction. convertible_data_batch_provider predicate matches idle directly; pre-#117 try_to_create_task() calls dropped from test fixtures (set_task_created parameter inverted to non_idle_state).
 - [Phase 18]: [18-05] Convert helper R1+R3 split: convert_*_to_host helpers split into ro -> drop -> mut -> drop -> ro_post 3-phase pattern to enforce P1 (never overlap shared+exclusive on same batch). Established in result_collector + host_table_chunk_reader + host_table_utils tests.
 - [Phase 18]: [18-05] data_batch_processing_handle replaced with mutable_data_batch in test fixture types: test_gpu_partition_impl + test_gpu_merge_impl. RAII accessor serves identical lock semantics; auto-destructured by callers so type change is transparent.
+- [Phase 18]: Phase 18 verdict PARTIAL — DB-01..04 PASS (static infrastructure: rewrite, MCP build exit 0, HYG-02 ≤ 40, all grep gates clean). DB-05 FAIL — P1 RAII lock-scope self-deadlock fires at runtime exactly as 18-03 SUMMARY forecast. [mgpu] tests fail with 'Resource deadlock avoided' (glibc EDEADLK). Resolution path is architectural — out of Phase 18 scope per Rule 4. Cucascade pin 1c1e648 preserved. Phase 19 unblocked at compile-time; runtime gates inherit P1 blocker.
 
 ## Accumulated Context
 
@@ -208,10 +210,10 @@ v1.4 Progress: [######              ] 2/6 phases | 9/32 requirements | 9 plans
 
 ### Blockers / Concerns
 
-None at roadmap creation. Phase 16 is ready to plan.
+- **Phase 18 P1 RAII lock-scope self-deadlock (carried into Phase 19+):** `gpu_pipeline_task::compute_task`'s R5 lock-and-hold (vector<mutable_data_batch> processing_handles held across `op->execute()`) is incompatible with operator-side scoped `to_read_only`/`to_mutable` accessors on the same batches — glibc EDEADLK fires (`Resource deadlock avoided`). Architectural fix required before any [mgpu] runtime gates (or Phase 21 REG-XX) can pass. Resolution: drop R5 lock-and-hold semantics OR expose accessors via `pipelineable_operator_data::get_locked_accessors()`. Tracked for pre-Phase-21 closure. See 18-VERDICT.md + 18-03 SUMMARY P1 section.
 
 ## Session Continuity
 
-Last session: 2026-05-05T18:35:39.694Z
-Stopped at: Completed 18-05-PLAN.md
+Last session: 2026-05-05T21:24:53.959Z
+Stopped at: Completed 18-06-PLAN.md (Phase 18 PARTIAL — DB-05 P1 deadlock)
 Resume file: None
