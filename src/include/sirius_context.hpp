@@ -177,6 +177,7 @@ class SiriusContext : public ClientContextState {
 
   /// \brief Start a query with its pipelines.
   /// \param pipelines The ordered pipelines for the query.
+  /// \param context Quent telemetry context to enable emitting telemetry.
   /// \param telemetry_info Info useful for emitting identifiable telemetry.
   void create_query(duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
                     const quent::Context& context,

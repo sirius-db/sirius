@@ -185,6 +185,7 @@ for q in "${QUERIES[@]}"; do
     {
         printf '%s\n' "$VIEW_SQL"
         printf ".timer on\n"
+        printf "SET enable_quent = true;\n"
         printf "CALL sirius_set_query_label('%sq%d_iter1');\n" "$LABEL_PREFIX" "$q"
         printf '%s;\n' "$CLEANED_SQL"
         printf "CALL sirius_set_query_label('%sq%d_iter2');\n" "$LABEL_PREFIX" "$q"

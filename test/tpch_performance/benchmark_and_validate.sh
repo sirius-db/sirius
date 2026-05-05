@@ -443,7 +443,10 @@ if [ -n "${DUCKDB_RESULTS_DIR:-}" ]; then
 fi
 echo "=========================================="
 echo ""
-read -r -p "Optional note about this run (press Enter to skip): " RUN_NOTE
+if [ -z "${RUN_NOTE:-}" ]; then
+    read -r -p "Optional note about this run (press Enter to skip): " RUN_NOTE
+fi
+export RUN_NOTE
 echo ""
 
 # ---------- Run info and environment ----------

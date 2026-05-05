@@ -63,7 +63,9 @@ void query::build_indices()
 }
 
 const duckdb::vector<op::sirius_physical_operator*>& query::get_scan_operators() const
-{ return _scan_operators; }
+{
+  return _scan_operators;
+}
 
 duckdb::shared_ptr<pipeline::sirius_pipeline> query::get_pipeline(op::sirius_physical_operator* op)
 {
@@ -73,6 +75,8 @@ duckdb::shared_ptr<pipeline::sirius_pipeline> query::get_pipeline(op::sirius_phy
 }
 
 const duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& query::get_pipelines() const
-{ return _pipelines; }
+{
+  return _pipelines;
+}
 
 }  // namespace sirius::planner
