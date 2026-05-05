@@ -159,8 +159,10 @@ set(EXTENSION_SOURCES
     src/expression_executor/specializations/gpu_execute_operator.cpp
     src/expression_executor/specializations/gpu_execute_reference.cpp
     src/io/admission_control.cpp
+    src/io/datasource_factory.cpp
     src/io/prefetching_cache.cpp
     src/io/sirius_datasource.cpp
+    src/io/uri_parser.cpp
     src/io/uring/uring_ioctx.cpp
     src/io/uring/uring_reactor.cpp
     src/memory/defragmenter_oom_policy.cpp
