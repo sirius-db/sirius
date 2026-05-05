@@ -117,14 +117,16 @@ class parquet_scan_data : public op::operator_data {
    *                                stored into gpu_memory_space for use during execute().
    * @param stream                  Unused — no data movement occurs during preparation
    *                                for this source input.
-   * @return  Always an empty handle vector; there are no batches to keep locked.
+   * @return  Always an empty accessor vector; there are no batches to keep locked.
+   *          The vector is typed on cucascade::mutable_data_batch (post-#117
+   *          RAII) but is always empty for this source-input override.
    */
-  std::optional<std::vector<::cucascade::data_batch_processing_handle>> prepare_for_processing(
+  std::optional<std::vector<::cucascade::mutable_data_batch>> prepare_for_processing(
     const ::cucascade::memory::memory_space* requested_memory_space,
     rmm::cuda_stream_view stream) override
   {
     gpu_memory_space = const_cast<cucascade::memory::memory_space*>(requested_memory_space);
-    return std::vector<::cucascade::data_batch_processing_handle>{};
+    return std::vector<::cucascade::mutable_data_batch>{};
   };
 
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
