@@ -169,14 +169,14 @@ Verdict (D-F3 gate): `<PASS / INVESTIGATE>`
 
 | Gate | Command | Expected | Actual |
 |---|---|---|---|
-| D-G1 (merge commit) | `git log --oneline --merges -1` | dev-merge commit | `<filled>` |
+| D-G1 (merge commit) | `git log --oneline --merges -1` | dev-merge commit | `626cae8 merge(17-02): origin/dev into feature/single-node-multi-gpu2 (MERGE-01, MERGE-02, MERGE-04)` |
 | D-G2 (SCHED-RR survival) | `grep -c "_no_pref_rr_counter" src/include/pipeline/task_scheduler.hpp` | >= 1 | `<filled>` |
 | D-G2 (SCHED-RR block) | `grep "SCHED-RR" src/pipeline/task_scheduler.cpp` | non-empty | `<filled>` |
 | D-G3 (no old FSM names src/) | `grep -rn "task_created\|in_transit\|data_batch_processing_handle\|idata_batch_probe" src/ \| wc -l` | 0 | `<filled>` |
 | D-G3 (no old FSM names test/) | `grep -rn "task_created\|in_transit\|data_batch_processing_handle\|idata_batch_probe" test/ \| wc -l` | 0 | `<filled>` |
 | D-G4 (extract file exists) | `test -f .planning/phases/17-sirius-origin-dev-merge-base-layer/17-PHASE-13-EXTRACT.md` | exit 0 | `<filled>` |
 | D-G5 (this log exists + populated) | `test -f .planning/phases/17-sirius-origin-dev-merge-base-layer/17-MERGE-LOG.md` | exit 0 | `<filled>` |
-| D-G6 (cucascade pin defended) | `git ls-tree HEAD cucascade \| awk '{print $3}'` | `1c1e648a282a06747328c78f62d2d676ce51a8ce` | `<filled>` |
+| D-G6 (cucascade pin defended) | `git ls-tree HEAD cucascade \| awk '{print $3}'` | `1c1e648a282a06747328c78f62d2d676ce51a8ce` | `1c1e648a282a06747328c78f62d2d676ce51a8ce` (matches expected — PASS) |
 
 ***
 
