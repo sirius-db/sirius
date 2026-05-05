@@ -977,23 +977,6 @@ void sirius_pipeline_converter::wire_data_repositories()
       }
     } else if (pipeline->sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
       // No action needed for RESULT_COLLECTOR sinks
-    } else if (pipeline->sink->type == op::SiriusPhysicalOperatorType::PARQUET_METADATA_SCAN) {
-      // Scheduling and completion-detection port. The metadata handoff itself happens
-      // through accumulate_metadata(); no data batches flow through this port (repo is
-      // null). setup_pipeline_parents() walks metadata_scan's next_port_after_sink list
-      // and reads this port's dest_pipeline to register current_pipeline as a parent of
-      // metadata_pipeline. gpu_scan_op's get_next_task_hint() also reads this port's
-      // src_pipeline->is_pipeline_finished() to detect when all metadata has arrived.
-      for (auto const& dependent_pipeline : source_to_pipelines[pipeline->get_sink().get()]) {
-        auto* next_op            = dependent_pipeline->get_operators().size() == 0
-                                     ? dependent_pipeline->get_sink().get()
-                                     : &dependent_pipeline->get_operators()[0].get();
-        std::string_view port_id = "handoff";
-        next_op->add_port(port_id,
-                          std::make_unique<op::sirius_physical_operator::port>(
-                            op::MemoryBarrierType::PARTIAL, nullptr, pipeline, dependent_pipeline));
-        pipeline->get_sink()->add_next_port_after_sink({next_op, port_id});
-      }
     } else {
       // Intermediate operators acting as pipeline sinks (e.g., filter, projection, join
       // placed as sink before a PARTITION pipeline). Use the base class sink() which
