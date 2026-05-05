@@ -244,6 +244,7 @@ void sirius_pipeline_converter::insert_parquet_scan_operator(
   scan_info->names             = scan_op.names;
   scan_info->table_filters     = std::move(scan_op.table_filters);
   scan_info->partition_indices = partition_indices;
+  scan_info->scan_output_arity = scan_op.types.size();
 
   auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_parquet_scan_operator>(
     scan_op.types, scan_op.estimated_cardinality, std::move(scan_info));

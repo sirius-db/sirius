@@ -44,6 +44,7 @@ class buffer_pool;
 
 namespace sirius::op::scan {
 class sirius_gpu_parquet_scan_operator;
+struct scan_info;
 }  // namespace sirius::op::scan
 
 namespace sirius::planner {
@@ -92,7 +93,7 @@ struct scan_manager_config {
 struct pinned_entry {
   std::vector<std::string> column_names;
   /// Resolved (globbed) file paths captured at pin time. The scan_manager uses
-  /// this list to match an incoming scan operator's parquet_scan_info::file_paths
+  /// this list to match an incoming scan operator's scan_info::file_paths
   /// against this entry, so it can swap in a cached split provider.
   std::vector<std::string> file_paths;
   /// GPU-tier storage: one chunk vector per pinned column name. Populated by
@@ -221,13 +222,32 @@ class sirius_scan_manager {
   ///        @c use_sirius_datasource=false.
   [[nodiscard]] sirius::io::sirius_ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
 
+  /// \brief Same ioctx as @ref io_ctx(), shared so format-specific scan_info
+  ///        subclasses can attach it to a split_provider's emitted slices.
+  [[nodiscard]] std::shared_ptr<sirius::io::sirius_ioctx> shared_io_ctx() const noexcept
+  {
+    return _io_ctx;
+  }
+
  private:
-  /// \brief Build a split_provider for @p op by reading its parquet scan_info.
-  ///        Returns a cached_split_provider when a pinned entry matches, otherwise
-  ///        a parquet_split_provider; in both cases the provider carries the
-  ///        scan_plan that the operator's execute() consults for output assembly.
+  /// \brief Build a split_provider for @p op by reading its scan_info.
+  ///        Tries the pinned-cache short-circuit (format-agnostic; uses only
+  ///        the common scan_info fields) and otherwise dispatches through
+  ///        scan_info::make_provider() to the format-specific provider.
   std::unique_ptr<split_provider> create_provider_for(
     op::scan::sirius_gpu_parquet_scan_operator* op);
+
+  /// \brief Try to short-circuit @p info to a cached_split_provider when a
+  ///        pinned entry matches the scan's file paths. Returns nullptr on
+  ///        miss so the caller can fall through to per-format dispatch.
+  ///        Format-agnostic: uses only fields on the scan_info base.
+  ///
+  /// @param info   Scan bind-data — file_paths, column_ids, names, types,
+  ///               projection_ids, partition_indices, table_filters,
+  ///               scan_output_arity. Read-only; not consumed.
+  /// @param op_id  Operator id for diagnostic logging.
+  std::unique_ptr<split_provider> try_cached_for(op::scan::scan_info const& info,
+                                                 std::size_t op_id);
 
   /// \brief Run providers sequentially: start each, wait on its future, advance.
   void start_metadata_processing();

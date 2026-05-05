@@ -18,8 +18,8 @@
 #include <data/data_batch_utils.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <log/logging.hpp>
-#include <op/scan/parquet_scan_info.hpp>
 #include <op/scan/parquet_scan_operator_data.hpp>
+#include <op/scan/scan_info.hpp>
 #include <op/scan/scan_plan.hpp>
 #include <op/scan/sirius_gpu_parquet_scan_operator.hpp>
 #include <op/sirius_physical_operator.hpp>
@@ -47,7 +47,7 @@ namespace sirius::op::scan {
 sirius_gpu_parquet_scan_operator::sirius_gpu_parquet_scan_operator(
   duckdb::vector<sirius::logical_type> types,
   duckdb::idx_t estimated_cardinality,
-  std::unique_ptr<parquet_scan_info> scan_info)
+  std::unique_ptr<scan_info> scan_info)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::GPU_PARQUET_SCAN, std::move(types), estimated_cardinality),
     _split_connector(std::make_unique<scan_manager::split_connector>()),
@@ -61,7 +61,7 @@ sirius_gpu_parquet_scan_operator::~sirius_gpu_parquet_scan_operator() = default;
 //===----------------------------------------------------------------------===//
 // Friend access — wired by sirius_scan_manager during prepare_for_query.
 //===----------------------------------------------------------------------===//
-std::unique_ptr<parquet_scan_info> sirius_gpu_parquet_scan_operator::take_scan_info()
+std::unique_ptr<scan_info> sirius_gpu_parquet_scan_operator::take_scan_info()
 {
   return std::move(_scan_info);
 }
