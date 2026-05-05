@@ -45,14 +45,23 @@ inline std::atomic<uint64_t> g_next_batch_id{0};
 inline uint64_t get_next_batch_id() { return g_next_batch_id++; }
 
 /**
- * @brief Get a cudf::table_view from a data_batch.
+ * @brief Get a cudf::table_view from a read-only data_batch accessor.
  *
- * Assumes the data_batch contains a gpu_table_representation.
+ * Assumes the underlying data_batch contains a gpu_table_representation.
+ * The caller MUST already hold the read_only_data_batch (shared lock) — this
+ * helper deliberately does NOT internally call batch.to_read_only() because
+ * doing so would let a misuse pattern hide a P1 self-deadlock (acquiring a
+ * read lock on a batch that the caller is about to upgrade to mutable).
  *
- * @param batch The data batch to extract the table view from.
+ * Phase 18 / DB-01: signature flipped from (const cucascade::data_batch&) to
+ * (const cucascade::read_only_data_batch&) — get_data() / get_memory_space()
+ * are now PRIVATE on data_batch in cucascade pin 1c1e648 and only reachable
+ * through the accessor classes.
+ *
+ * @param batch The read-only accessor to extract the table view from.
  * @return cudf::table_view The underlying cudf table view.
  */
-inline cudf::table_view get_cudf_table_view(const cucascade::data_batch& batch)
+inline cudf::table_view get_cudf_table_view(const cucascade::read_only_data_batch& batch)
 {
   auto* data = batch.get_data();
   if (data == nullptr) { throw std::runtime_error("data_batch has no data representation"); }
