@@ -31,15 +31,27 @@
  * The helpers below wrap the common Sirius patterns:
  *   - prepare_and_acquire_mutable: blocking exclusive lock + in-place
  *     conversion to a target memory space.
- *   - try_acquire_mutable: non-blocking variant.
  *   - acquire_read_only: shared lock, NO conversion (caller asserts the
  *     batch is already in the requested space).
  *
- * P1 lock-scope warning: every accessor returned by these helpers must be
- * scoped to the narrowest possible block. NEVER hold an accessor across a
- * function call that re-acquires on the same batch — the second acquisition
- * blocks on the first, and the first cannot release because it is still on
- * the call stack. For upgrade paths, use
+ * The previous Phase 18-01 version exported a non-blocking try_acquire_mutable
+ * helper alongside the blocking one. It had zero production callers and was
+ * removed in 18-07 — its only function in the original design was to support
+ * the R5 lock-and-hold pattern that 18-VERIFICATION.md confirmed deadlocks
+ * under glibc EDEADLK. Restore it only if a future plan finds a non-lock-and-
+ * hold use case.
+ *
+ * P1 lock-scope warning (Path A — Phase 18-07 gap closure):
+ * Every accessor returned by these helpers must be scoped to the narrowest
+ * possible block. NEVER hold an accessor across a function call that
+ * re-acquires on the same batch — glibc std::shared_mutex detects same-thread
+ * re-lock attempts and aborts with "Resource deadlock avoided" (POSIX
+ * EDEADLK), not just blocks. The Phase 18-02 R5 lock-and-hold design that
+ * held a vector<mutable_data_batch> across op->execute() was reverted in
+ * 18-07 after this exact failure mode fired on every [mgpu] test (see
+ * .planning/phases/18-databatch-raii-migration-cucascade-117-surface/
+ * 18-VERIFICATION.md for the gap analysis and 18-07-SUMMARY.md for the
+ * closure record). For upgrade paths, use
  * cucascade::data_batch::readonly_to_mutable(std::move(ro)) instead of
  * acquiring both directly.
  */
@@ -69,14 +81,19 @@ namespace pipeline {
  * cucascade::mutable_data_batch by value — destruction releases the
  * exclusive lock; lifetime IS the lock guard.
  *
- * P1 lock-scope warning: caller MUST scope the returned accessor to the
- * narrowest block; NEVER hold the accessor across a call that re-acquires on
- * the same batch (would self-deadlock — second writer blocks on the first
- * exclusive lock; first writer is stuck on the call stack).
+ * Path A (Phase 18-07 gap closure): callers MUST scope the returned accessor
+ * to a narrow `{}` block. The previous Phase 18-02 R5 lock-and-hold pattern
+ * (vector<mutable_data_batch> held across op->execute()) was confirmed to
+ * deadlock under glibc EDEADLK on shared_mutex re-lock and was reverted in
+ * 18-07. The single production caller is now
+ * pipelineable_operator_data::prepare_for_processing, which iterates batches
+ * and acquires/drops this accessor under a `{}` block per iteration so the
+ * exclusive lock is released BEFORE the function returns.
  *
  * Blocking semantics: this helper calls cucascade::data_batch::to_mutable(),
- * which blocks until the exclusive lock is acquired. Use try_acquire_mutable
- * for non-blocking variant.
+ * which blocks until the exclusive lock is acquired. Restore a non-blocking
+ * try_-prefixed variant only if a Path-A-compatible use case appears (see
+ * file-level doc block).
  *
  * @param batch                   Batch to lock/prepare. nullptr -> nullopt.
  * @param requested_memory_space  Target memory space; nullptr -> use the
@@ -124,54 +141,20 @@ namespace pipeline {
   return std::move(acc);
 }
 
-/**
- * @brief Non-blocking variant of prepare_and_acquire_mutable.
- *
- * Returns std::nullopt without conversion if the exclusive lock is
- * unavailable. Otherwise behaves identically.
- *
- * @param batch                   Batch to lock/prepare. nullptr -> nullopt.
- * @param requested_memory_space  Target memory space; nullptr -> use the
- *                                batch's current space (no conversion).
- * @param stream                  CUDA stream for any conversion kernels.
- * @return cucascade::mutable_data_batch on success; std::nullopt if the
- *         exclusive lock could not be acquired immediately, or on the same
- *         failure conditions as prepare_and_acquire_mutable.
- */
-[[nodiscard]] inline std::optional<cucascade::mutable_data_batch> try_acquire_mutable(
-  const std::shared_ptr<cucascade::data_batch>& batch,
-  const cucascade::memory::memory_space* requested_memory_space,
-  rmm::cuda_stream_view stream)
-{
-  if (!batch) { return std::nullopt; }
-
-  auto try_acc = batch->try_to_mutable();
-  if (!try_acc) { return std::nullopt; }
-
-  cucascade::mutable_data_batch acc = std::move(*try_acc);
-
-  const auto* target_space =
-    requested_memory_space != nullptr ? requested_memory_space : acc.get_memory_space();
-  if (target_space == nullptr) { return std::move(acc); }
-
-  if (acc.get_memory_space() == target_space) { return std::move(acc); }
-
-  auto& registry = sirius::converter_registry::get();
-  switch (target_space->get_tier()) {
-    case cucascade::memory::Tier::GPU:
-      acc.convert_to<cucascade::gpu_table_representation>(registry, target_space, stream);
-      break;
-    case cucascade::memory::Tier::HOST:
-      acc.convert_to<cucascade::host_data_representation>(registry, target_space, stream);
-      break;
-    default:
-      return std::nullopt;
-  }
-  return std::move(acc);
-}
+// Phase 18-07 (Path A): try_acquire_mutable removed. The non-blocking variant
+// of prepare_and_acquire_mutable had ZERO production callers and existed only
+// to support patterns conceptually adjacent to the now-reverted R5 lock-and-
+// hold design. Callers that need a non-blocking exclusive accessor today
+// should call cucascade::data_batch::try_to_mutable() directly and perform
+// any required memory-space conversion inline. Restore this helper if a
+// future plan finds a Path-A-compatible use case (i.e. one that scopes the
+// returned accessor to a narrow `{}` block — see file-level doc).
 
 /**
  * @brief Acquire a read-only (shared) accessor on @p batch.
+ *
+ * Path A (Phase 18-07): scope the returned accessor to a narrow `{}` block
+ * — never hold across a downstream call that re-acquires on the same batch.
  *
  * ASSUMES the batch is already in @p requested_memory_space — does NOT
  * convert. Callers that need conversion must use prepare_and_acquire_mutable
