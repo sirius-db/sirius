@@ -178,7 +178,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
   4. `[integration][TPC-H]` 48/48 PASS at SF1 with `num_gpus: 2`; TPC-H Q1/Q6/Q12 PASS at SF10 on `num_gpus: 2` (SM-06 smoke regression).
   5. `CALL pin_table(...)` executes without error on a single-GPU query; `20-STREAM-LINEAGE-REATTACH.md` and `20-SCHED-RR-PORT.md` document the porting decisions (SM-04, SM-05 documentation gates).
 **Plans**: 4 plans
-- [ ] 20-01-PLAN.md — Empirical verification gates: [mgpu_stress] 500-iter + [mgpu-audit] disjointedness + grep gates → 20-01-EVIDENCE.md (SM-01/SM-02/SM-03)
+- [x] 20-01-PLAN.md — Empirical verification gates: [mgpu_stress] 500-iter + [mgpu-audit] disjointedness + grep gates → 20-01-EVIDENCE.md (SM-01/SM-02/SM-03)
 - [ ] 20-02-PLAN.md — TODO cleanup (Pitfall 1) + author 20-SCHED-RR-PORT.md + 20-STREAM-LINEAGE-REATTACH.md + resolve Open Q1 (SM-01/SM-02/SM-03 docs)
 - [x] 20-03-PLAN.md — Document pin_table single-GPU residency in PROJECT.md Deferred + register PIN-MGPU-01 in REQUIREMENTS.md (SM-05)
 - [ ] 20-04-PLAN.md — SF1 [integration][TPC-H] 48/48 + SF10 Q1/Q6/Q12 num_gpus=2 + SM-04 source-inspection + 20-VERDICT.md (SM-04/SM-06)
@@ -224,7 +224,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 | 17. Sirius origin/dev Merge — Base Layer | v1.4 | 4/4 | Complete    | 2026-05-05 |
 | 18. DataBatch RAII Migration | v1.4 | 7/7 | Complete | 2026-05-05 |
 | 19. IO Framework Adoption | v1.4 | 5/6 | In Progress|  |
-| 20. Scan Manager + Pin Tables Port | v1.4 | 1/4 | In Progress|  |
+| 20. Scan Manager + Pin Tables Port | v1.4 | 2/4 | In Progress|  |
 | 21. v1.4 Ship Gate | v1.4 | 0/? | Not started | - |
 
 ## Phase context

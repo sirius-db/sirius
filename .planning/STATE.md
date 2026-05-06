@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Rebase After DataBatch Changes
 status: executing
-stopped_at: Completed 20-03-PLAN.md (SM-05 documentation gate closed - PROJECT.md Deferred + REQUIREMENTS.md PIN-MGPU-01 augmented)
-last_updated: "2026-05-06T10:05:47.603Z"
-last_activity: 2026-05-06 -- Phase 20 execution started
+stopped_at: Completed 20-01-PLAN.md (SM-01 Option A PASS, SM-03 PASS, SM-02 PARTIAL — handed to 20-02/20-04)
+last_updated: "2026-05-06T10:10:55.336Z"
+last_activity: 2026-05-06
 progress:
   total_phases: 6
   completed_phases: 4
   total_plans: 26
-  completed_plans: 23
+  completed_plans: 24
 ---
 
 # Project State
@@ -25,9 +25,9 @@ See: .planning/PROJECT.md (updated 2026-05-04)
 ## Current Position
 
 Phase: 20 (Scan Manager + Pin Tables Port (PR #731 + #721)) — EXECUTING
-Plan: 1 of 4
-Status: Executing Phase 20
-Last activity: 2026-05-06 -- Phase 20 execution started
+Plan: 2 of 4
+Status: Ready to execute
+Last activity: 2026-05-06
 
 ```
 v1.4 Progress: [#############       ] 4/6 phases | 16/32 requirements | 22 plans
@@ -100,6 +100,7 @@ v1.4 Progress: [#############       ] 4/6 phases | 16/32 requirements | 22 plans
 | Phase 19 P05 | 33min | 3 tasks | 11 files |
 | Phase 19 P06 | 36min | 2 tasks | 3 files |
 | Phase 20 P03 | 2min | 2 tasks | 2 files |
+| Phase 20 P01 | 6min | 3 tasks | 1 files |
 
 ## Decisions
 
@@ -206,6 +207,10 @@ v1.4 Progress: [#############       ] 4/6 phases | 16/32 requirements | 22 plans
 - [Phase 19]: [19-06] Phase 19 closing verdict PASS - all 6 IO-12..17 closed. [TPC-H][parquet] 22/22 PASS at num_gpus=2 (36256 assertions, 78.6s). compute-sanitizer memcheck on [multi_gpu_foundation] (7/7) and [integration][gpu_execution][parquet][join] (42/42, 1.92M assertions): 0 memcheck violations. nvidia-smi dmon confirms non-zero PCIe rxpci on BOTH GPU 0 (63/120 samples; max 2892 MB/s) AND GPU 1 (54/120 samples; max 453 MB/s).
 - [Phase 19]: [19-06] Sanitizer error classification: 8+9 reported errors are CUDA API status returns (cudaErrorPeerAccessAlreadyEnabled from cucascade peer-access probe + cudaErrorInvalidDevice from bounded_thread_pool worker init) - NOT memcheck violations. Phase 5/6 sanitizer baseline (0 errors / 1.92M assertions) preserved.
 - [Phase 20]: [20-03] SM-05 documentation gate closed: PROJECT.md Deferred bullet for pin_table single-GPU residency cites src/sirius_extension.cpp:733; REQUIREMENTS.md PIN-MGPU-01 augmented (Branch B) with src cite + Phase 13 re-attach site + bidirectional PROJECT.md backref
+- [Phase 20]: [20-01] SM-01 Option A applies empirically: [mgpu_stress] 500-iter PASS at 77053 assertions / 73.8s confirms task_scheduler::management_eventloop:260 is the canonical RR site for GPU_PARQUET_SCAN source tasks; no _no_pref_rr_counter port to parquet_split_provider needed.
+- [Phase 20]: [20-01] SM-02 PARTIAL: AUDIT TEST_CASE FAILS at min_count REQUIRE line 262 (counts[1].pipeline_ids.size() == 0) — preempts disjointedness REQUIRE on line 289. Empirical scan_batch IS multi-GPU disjoint (GPU0=2, GPU1=1) — only test fixture's pipeline_task threshold is misaligned with post-#731 single-composite-gpu_pipeline_task pattern. Resolution path handed to 20-02 / 20-04.
+- [Phase 20]: [20-01] SM-03 PASS: writer_stream token survives at sirius_gpu_parquet_scan_operator.cpp:260 in canonical Phase 13-04 Path-2 comment block; the operative make_data_batch(table, mem_space, stream) call at line 263 records writer_event via cucascade::gpu_table_representation ctor.
+- [Phase 20]: [20-01] HYG-02 baseline preserved at 40 / 0 non-legacy; cucascade_datasource retirement (Phase 19-05) holds at 0 hits across src/ + test/.
 
 ## Accumulated Context
 
@@ -241,6 +246,6 @@ v1.4 Progress: [#############       ] 4/6 phases | 16/32 requirements | 22 plans
 
 ## Session Continuity
 
-Last session: 2026-05-06T10:05:44.926Z
-Stopped at: Completed 20-03-PLAN.md (SM-05 documentation gate closed - PROJECT.md Deferred + REQUIREMENTS.md PIN-MGPU-01 augmented)
+Last session: 2026-05-06T10:10:55.333Z
+Stopped at: Completed 20-01-PLAN.md (SM-01 Option A PASS, SM-03 PASS, SM-02 PARTIAL — handed to 20-02/20-04)
 Resume file: None
