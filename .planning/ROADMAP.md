@@ -199,7 +199,8 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
   4. SF100 TPC-H Q1 `num_gpus=2` wall-clock <= 5.7s; result byte-identical to 1-GPU baseline; cross-GPU scan-id intersection = 0 (REG-04).
   5. `[mgpu_stress]` 500-iter PASS — 100 iterations × 5 representative `[mgpu]` queries × varied SCHED-RR counter offsets; >= 77053 assertions, exit 0 (REG-05).
   6. `grep -c "rmm::cuda_stream_default" src/` <= 40; compute-sanitizer memcheck clean on `[multi_gpu_foundation]` + `[integration][gpu_execution][parquet][join]` (REG-06 HYG-02 gate).
-**Plans**: TBD
+**Plans**: 1 plan
+- [ ] 21-01-PLAN.md — Run REG-01..06 ship-gate gauntlet, decide SM-02 fixture path, author 21-VERDICT.md, update STATE/ROADMAP/REQUIREMENTS/PROJECT
 **Pitfalls**:
   - All P1-P11 should be resolved by this phase. This is final confirmation, not a place to discover new issues.
   - P2 (writer_stream): SF100 Q11 `num_gpus=2` must be run explicitly — this is the only query/scale combination that reliably triggers the cross-GPU stream-ordering race. `[mgpu]` suite at SF1 is insufficient for this specific gate.
@@ -226,7 +227,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 | 18. DataBatch RAII Migration | v1.4 | 7/7 | Complete | 2026-05-05 |
 | 19. IO Framework Adoption | v1.4 | 5/6 | In Progress|  |
 | 20. Scan Manager + Pin Tables Port | v1.4 | 5/5 | Complete (PARTIAL — SM-06 SF1 escalated to Phase 21 REG-03; status human_needed) | 2026-05-06 |
-| 21. v1.4 Ship Gate | v1.4 | 0/? | Not started | - |
+| 21. v1.4 Ship Gate | v1.4 | 0/1 | In Progress | - |
 
 ## Phase context
 
