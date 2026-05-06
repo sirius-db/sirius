@@ -135,7 +135,8 @@ jobs:
         if: matrix.environment == 'vcpkg' && always()
         run: |
           [ -f /tmp/vcpkg.log ] || exit 0
-          RESTORED=$(grep -oP 'Restored \K\d+(?= package)' /tmp/vcpkg.log | paste -sd+ | bc 2>/dev/null || echo 0)
+          RESTORED=$(grep -oP 'Restored \K\d+(?= package)' /tmp/vcpkg.log | head -1)
+          RESTORED=${RESTORED:-0}
           TOTAL=$(grep -oP 'Installing \d+/\K\d+' /tmp/vcpkg.log | tail -1)
           BUILT=$((${TOTAL:-0} - ${RESTORED:-0}))
           {
