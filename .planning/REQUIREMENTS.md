@@ -38,7 +38,7 @@
 
 ### IO — IO Framework Adoption (PR #675)
 
-- [ ] **IO-12**: `liburing-dev` apt package installed on the build host; CMakeLists.txt adds `pkg_check_modules(LIBURING REQUIRED liburing)`. vcpkg.json gains liburing entry IF the vcpkg path is exercised (`liburing` baseline resolution verified or custom port added).
+- [x] **IO-12**: `liburing-dev` apt package installed on the build host; CMakeLists.txt adds `pkg_check_modules(LIBURING REQUIRED liburing)`. vcpkg.json gains liburing entry IF the vcpkg path is exercised (`liburing` baseline resolution verified or custom port added).
 - [ ] **IO-13**: `SiriusContext::initialize()` constructs ONE `sirius_ioctx` per GPU (per-GPU instance), each under `rmm::cuda_set_device_raii` for its target device. Replaces `_gpu_io_backends` map from v1.1.
 - [ ] **IO-14**: `uring_ioctx` / `uring_reactor` instances bound to a single GPU's CUDA context — no shared ioctx across GPUs (avoids the v1.1 kvikio single-CUDA-context anti-pattern). `device_read_req.device_id` matches the ioctx's device for every request.
 - [ ] **IO-15**: `sirius::io::cucascade_datasource` retired — header file deleted, implementation file deleted, every include site replaced with `sirius::io::sirius_datasource`. `grep -rn "cucascade_datasource" src/ test/` returns zero hits. v1.1 IO-01..11 functionality preserved at the new datasource.
@@ -109,7 +109,7 @@
 | DB-03 | 18 | Complete |
 | DB-04 | 18 | Complete |
 | DB-05 | 18 | Complete |
-| IO-12 | 19 | Pending |
+| IO-12 | 19 | Complete |
 | IO-13 | 19 | Pending |
 | IO-14 | 19 | Pending |
 | IO-15 | 19 | Pending |

@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Rebase After DataBatch Changes
-status: verifying
-stopped_at: Completed 18-07-PLAN.md (Phase 18 PASS — DB-05 closed via Path A)
-last_updated: "2026-05-05T23:34:11.640Z"
-last_activity: 2026-05-05
+status: executing
+stopped_at: Completed 19-01-PLAN.md (Wave 0 inventory — IO-12 PASS, Q3+Q4 resolved)
+last_updated: "2026-05-06T00:11:25.028Z"
+last_activity: 2026-05-06
 progress:
   total_phases: 6
   completed_phases: 3
-  total_plans: 16
-  completed_plans: 16
+  total_plans: 22
+  completed_plans: 17
 ---
 
 # Project State
@@ -20,14 +20,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-05-04)
 
 **Core value:** Any query can transparently execute across every GPU on the node — tasks are scheduled to the GPU where their input data already resides, memory pressure is absorbed by downgrading to the correct NUMA domain, and parquet I/O is routed through a multi-GPU-safe backend.
-**Current focus:** Phase 18 complete (PASS 2026-05-05) — next up is Phase 19 IO Framework Adoption
+**Current focus:** Phase 19 — IO Framework Adoption (PR #675)
 
 ## Current Position
 
-Phase: 18 (DataBatch RAII Migration (cucascade #117 surface)) — COMPLETE (PASS)
-Plan: 7 of 7 (gap-closure plan 18-07 added in Wave 6)
-Status: Phase complete (PASS) — ready for next phase (Phase 19 IO Framework)
-Last activity: 2026-05-05
+Phase: 19 (IO Framework Adoption (PR #675)) — EXECUTING
+Plan: 2 of 6
+Status: Ready to execute
+Last activity: 2026-05-06
 
 ```
 v1.4 Progress: [##########          ] 3/6 phases | 10/32 requirements | 16 plans
@@ -93,6 +93,7 @@ v1.4 Progress: [##########          ] 3/6 phases | 10/32 requirements | 16 plans
 | Phase 18 P05 | 65min | 4 tasks | 31 files |
 | Phase 18 P06 | 164min | 3 tasks | 11 files |
 | Phase 18 P07 | 111min | 3 tasks | 8 files |
+| Phase 19 P01 | 30min | 2 tasks | 1 files |
 
 ## Decisions
 
@@ -181,6 +182,9 @@ v1.4 Progress: [##########          ] 3/6 phases | 10/32 requirements | 16 plans
 - [Phase 18]: [18-05] data_batch_processing_handle replaced with mutable_data_batch in test fixture types: test_gpu_partition_impl + test_gpu_merge_impl. RAII accessor serves identical lock semantics; auto-destructured by callers so type change is transparent.
 - [Phase 18]: Phase 18 verdict PARTIAL — DB-01..04 PASS (static infrastructure: rewrite, MCP build exit 0, HYG-02 ≤ 40, all grep gates clean). DB-05 FAIL — P1 RAII lock-scope self-deadlock fires at runtime exactly as 18-03 SUMMARY forecast. [mgpu] tests fail with 'Resource deadlock avoided' (glibc EDEADLK). Resolution path is architectural — out of Phase 18 scope per Rule 4. Cucascade pin 1c1e648 preserved. Phase 19 unblocked at compile-time; runtime gates inherit P1 blocker.
 - [Phase 18]: [18-07] Path A architectural fix landed: dropped R5 lock-and-hold from gpu_pipeline_task::compute_task; pipelineable_operator_data::prepare_for_processing now performs eager memory-space conversion under SHORT-scoped accessors (released BEFORE return); operators inside execute() take their own per-call accessors. Closes DB-05 P1 deadlock. [mgpu] 16/16 PASS, [mgpu_stress] PASS, racecheck 0 hazards. Phase 18 verdict flipped from PARTIAL to PASS.
+- [Phase 19]: [19-01] IO-12 verdict PASS: vcpkg.json already declares liburing (line 17); pkg-config probes liburing 2.14 in pixi env; CMakeLists.txt:71-72 + 322-325 wiring confirmed. Zero source changes for IO-12.
+- [Phase 19]: [19-01] Q3 resolution: read_positional_delete_file uses DuckDB read_parquet (CPU); read_equality_delete_file uses cudf::io::datasource::create directly. Neither constructs cucascade_datasource — Plan 19-05 needs no iceberg helper migration.
+- [Phase 19]: [19-01] HYG-02 baseline 40 entirely in src/legacy/ + src/include/legacy/ (frozen namespace duckdb path). Zero rmm::cuda_stream_default in active Super Sirius code. Phase 19 source changes must preserve this.
 
 ## Accumulated Context
 
@@ -216,6 +220,6 @@ v1.4 Progress: [##########          ] 3/6 phases | 10/32 requirements | 16 plans
 
 ## Session Continuity
 
-Last session: 2026-05-05T23:34:04.264Z
-Stopped at: Completed 18-07-PLAN.md (Phase 18 PASS — DB-05 closed via Path A)
+Last session: 2026-05-06T00:11:25.025Z
+Stopped at: Completed 19-01-PLAN.md (Wave 0 inventory — IO-12 PASS, Q3+Q4 resolved)
 Resume file: None
