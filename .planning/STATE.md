@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Rebase After DataBatch Changes
-status: verifying
-stopped_at: Completed 19-06-PLAN.md (Phase 19 verification gauntlet PASS - all 6 IO-12..17 closed)
-last_updated: "2026-05-06T09:34:51.170Z"
-last_activity: 2026-05-06
+status: executing
+stopped_at: Completed 20-03-PLAN.md (SM-05 documentation gate closed - PROJECT.md Deferred + REQUIREMENTS.md PIN-MGPU-01 augmented)
+last_updated: "2026-05-06T10:05:47.603Z"
+last_activity: 2026-05-06 -- Phase 20 execution started
 progress:
   total_phases: 6
   completed_phases: 4
-  total_plans: 22
-  completed_plans: 22
+  total_plans: 26
+  completed_plans: 23
 ---
 
 # Project State
@@ -24,10 +24,10 @@ See: .planning/PROJECT.md (updated 2026-05-04)
 
 ## Current Position
 
-Phase: 19 (IO Framework Adoption (PR #675)) — COMPLETE
-Plan: 6 of 6 (all complete)
-Status: Phase 19 PASS — ready to plan Phase 20
-Last activity: 2026-05-06
+Phase: 20 (Scan Manager + Pin Tables Port (PR #731 + #721)) — EXECUTING
+Plan: 1 of 4
+Status: Executing Phase 20
+Last activity: 2026-05-06 -- Phase 20 execution started
 
 ```
 v1.4 Progress: [#############       ] 4/6 phases | 16/32 requirements | 22 plans
@@ -99,6 +99,7 @@ v1.4 Progress: [#############       ] 4/6 phases | 16/32 requirements | 22 plans
 | Phase 19 P04 | 10min | 2 tasks | 2 files |
 | Phase 19 P05 | 33min | 3 tasks | 11 files |
 | Phase 19 P06 | 36min | 2 tasks | 3 files |
+| Phase 20 P03 | 2min | 2 tasks | 2 files |
 
 ## Decisions
 
@@ -204,6 +205,7 @@ v1.4 Progress: [#############       ] 4/6 phases | 16/32 requirements | 22 plans
 - [Phase 19]: [19-05] test_metadata_gpu_scan_operators.cpp call sites flipped to make_test_ioctx() but file remains OUT of CMakeLists.txt TEST_SOURCES — sirius_parquet_metadata_scan_operator.hpp was deleted in Phase 17 merge (re-attached in Phase 20 SM-03). This is the explicit Phase 20+ deferral per the success criterion's option B; edits keep IO-15 grep gate clean and prepare the file for Phase 20 re-add.
 - [Phase 19]: [19-06] Phase 19 closing verdict PASS - all 6 IO-12..17 closed. [TPC-H][parquet] 22/22 PASS at num_gpus=2 (36256 assertions, 78.6s). compute-sanitizer memcheck on [multi_gpu_foundation] (7/7) and [integration][gpu_execution][parquet][join] (42/42, 1.92M assertions): 0 memcheck violations. nvidia-smi dmon confirms non-zero PCIe rxpci on BOTH GPU 0 (63/120 samples; max 2892 MB/s) AND GPU 1 (54/120 samples; max 453 MB/s).
 - [Phase 19]: [19-06] Sanitizer error classification: 8+9 reported errors are CUDA API status returns (cudaErrorPeerAccessAlreadyEnabled from cucascade peer-access probe + cudaErrorInvalidDevice from bounded_thread_pool worker init) - NOT memcheck violations. Phase 5/6 sanitizer baseline (0 errors / 1.92M assertions) preserved.
+- [Phase 20]: [20-03] SM-05 documentation gate closed: PROJECT.md Deferred bullet for pin_table single-GPU residency cites src/sirius_extension.cpp:733; REQUIREMENTS.md PIN-MGPU-01 augmented (Branch B) with src cite + Phase 13 re-attach site + bidirectional PROJECT.md backref
 
 ## Accumulated Context
 
@@ -239,6 +241,6 @@ v1.4 Progress: [#############       ] 4/6 phases | 16/32 requirements | 22 plans
 
 ## Session Continuity
 
-Last session: 2026-05-06T09:34:51.167Z
-Stopped at: Completed 19-06-PLAN.md (Phase 19 verification gauntlet PASS - all 6 IO-12..17 closed)
+Last session: 2026-05-06T10:05:44.926Z
+Stopped at: Completed 20-03-PLAN.md (SM-05 documentation gate closed - PROJECT.md Deferred + REQUIREMENTS.md PIN-MGPU-01 augmented)
 Resume file: None
