@@ -67,7 +67,7 @@
 
 ## Future Requirements (deferred to v1.5+)
 
-- **PIN-MGPU-01** — Multi-GPU-aware `pin_table`. Place pinned splits on the GPU with the lowest free memory ratio (or distribute across GPUs by table-row count) instead of always GPU 0. Trade-off: P2P copy overhead via `convert_gpu_to_gpu` is acceptable in v1.4 because Phase 13 `cudaStreamWaitEvent` chain ensures correctness; perf gap is small at SF1 but may show at SF100 multi-table workloads.
+- **PIN-MGPU-01** — Multi-GPU-aware `pin_table`. Place pinned splits on the GPU with the lowest free memory ratio (or distribute across GPUs by table-row count) instead of always GPU 0 (`src/sirius_extension.cpp:733` — `auto& mem_space = const_cast<cucascade::memory::memory_space&>(*gpu_spaces[0]);`). Trade-off: P2P copy overhead via `convert_gpu_to_gpu` is acceptable in v1.4 because Phase 13 `cudaStreamWaitEvent` chain (re-attached at `src/op/scan/sirius_gpu_parquet_scan_operator.cpp:263`) ensures correctness; perf gap is small at SF1 but may show at SF100 multi-table workloads. Documented in PROJECT.md Deferred section; registered for v1.5+ scope during Phase 20 (SM-05).
 - **CC-UPSTREAM-01** — Open upstream cucascade PRs for the 11 local fixes so future rebases don't carry an N-commit local pin divergence. Carry the local pin in v1.4 (decision captured in PROJECT.md Key Decisions row 2026-05-04).
 - **FU-B (carry from v1.3)** — Extend `mcp__project-commands__run_command` wrapper for env-passthrough OR add `num_gpus` arg to `tpch-benchmark` to lift v1.3 acceptance criterion C3 (SF1 1-GPU vs 2-GPU > 1.2× speedup) from DEFERRED.
 
