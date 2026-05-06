@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Rebase After DataBatch Changes
 status: executing
-stopped_at: "Completed 19-02-PLAN.md (IO-16 closed: src/io/ has zero raw cudaSetDevice)"
-last_updated: "2026-05-06T00:17:13.739Z"
+stopped_at: "Completed 19-04-PLAN.md (IO-13/IO-14: per-GPU sirius_ioctx in SiriusContext)"
+last_updated: "2026-05-06T00:31:17.829Z"
 last_activity: 2026-05-06
 progress:
   total_phases: 6
   completed_phases: 3
   total_plans: 22
-  completed_plans: 19
+  completed_plans: 20
 ---
 
 # Project State
@@ -25,7 +25,7 @@ See: .planning/PROJECT.md (updated 2026-05-04)
 ## Current Position
 
 Phase: 19 (IO Framework Adoption (PR #675)) — EXECUTING
-Plan: 4 of 6
+Plan: 5 of 6
 Status: Ready to execute
 Last activity: 2026-05-06
 
@@ -96,6 +96,7 @@ v1.4 Progress: [##########          ] 3/6 phases | 10/32 requirements | 16 plans
 | Phase 19 P01 | 30min | 2 tasks | 1 files |
 | Phase 19 P03 | 2min | 2 tasks | 2 files |
 | Phase 19 P02 | 10min | 1 tasks | 1 files |
+| Phase 19 P04 | 10min | 2 tasks | 2 files |
 
 ## Decisions
 
@@ -191,6 +192,10 @@ v1.4 Progress: [##########          ] 3/6 phases | 10/32 requirements | 16 plans
 - [Phase 19]: [19-03] uring_ioctx ctor defaults locked to host_ring_depth=16, ring_entries=64, n_reactors=4, bounce_slot_size=sirius::io::CHUNK_SIZE per uring_ioctx.hpp:85-88; cudaGetDeviceCount clamp keeps make_test_gpu_ioctxs safe on 1-GPU hosts
 - [Phase 19]: [19-03] test_metadata_gpu_scan_operators.cpp not currently in CMakeLists.txt TEST_SOURCES (orphaned from build graph); helper added with inline linkage; plan 19-05 must re-add to TEST_SOURCES when flipping the 3 metadata-scan call sites
 - [Phase 19]: [19-02] IO-16 closed: uring_reactor.cpp:276 raw cudaSetDevice replaced with std::optional<rmm::cuda_set_device_raii> + .emplace() under preserved if (req.device_id >= 0) guard. RESEARCH.md Pattern 3 anti-patterns all avoided (guard preserved, scope tight to H2D if-block, branch unchanged). HYG-02 baseline 40 preserved. Build exit 0.
+- [Phase 19]: [19-04] IO-13 + IO-14 closed at SiriusContext layer: per-GPU sirius::io::uring_ioctx instances constructed under rmm::cuda_set_device_raii in SiriusContext::initialize(); each ioctx default-allocates its own admission_control budget (P5); teardown gpu_ioctxs_.clear() runs BEFORE memory_manager_->shutdown() (Pitfall 3). Old cucascade gpu_io_backends_ map preserved live for plan 19-05 to retire.
+- [Phase 19]: [19-04] Coexistence (alongside, not replace) keeps Wave 2 narrow to one file pair (sirius_context.cpp+.hpp). Two independent gpu_spaces walks instead of hoisting into a shared loop — keeps each milestone independently grep-locatable; iteration cost negligible.
+- [Phase 19]: [19-04] initialize_cache() NOT called per RESEARCH.md Open Q2 — sirius_datasource device_read falls through to device_read_io when _cache==nullptr; v1.1 baseline correctness feasible without prefetching cache; cache enablement deferred to Phase 20+ (avoids per-GPU buffer_pool ownership question).
+- [Phase 19]: [19-04] Smoke verification under 2-GPU host: [multi_gpu_foundation] 7/7 PASS (38 assertions, 4.3s); [mgpu] 16/16 PASS (79091 assertions, 105.9s). HYG-02 baseline preserved at 40; IO-16 raw cudaSetDevice in src/io/ still 0. No regression of Phase 18 DB-01..05 or earlier multi-GPU correctness gates.
 
 ## Accumulated Context
 
@@ -226,6 +231,6 @@ v1.4 Progress: [##########          ] 3/6 phases | 10/32 requirements | 16 plans
 
 ## Session Continuity
 
-Last session: 2026-05-06T00:17:13.736Z
-Stopped at: Completed 19-02-PLAN.md (IO-16 closed: src/io/ has zero raw cudaSetDevice)
+Last session: 2026-05-06T00:31:02.784Z
+Stopped at: Completed 19-04-PLAN.md (IO-13/IO-14: per-GPU sirius_ioctx in SiriusContext)
 Resume file: None
