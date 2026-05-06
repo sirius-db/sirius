@@ -31,6 +31,8 @@
 #include <catch.hpp>
 #include <duckdb/common/enums/compression_type.hpp>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <numeric>
@@ -424,4 +426,154 @@ TEST_CASE("gpu_decode_table RLE - unsupported type_size throws",
        static_cast<uint8_t const*>(d_seg.data()), static_cast<uint32_t>(d_seg.size()), 0, 8}}});
   REQUIRE_THROWS_WITH(gpu_decode_table({col}, stream.view(), mr),
                       Catch::Contains("viability invariant violated"));
+}
+
+// Bench-scale correctness checks. The microbenches discard their output, so
+// these run the same shapes as `bench RLE *` and assert the decoded values
+// match an expected expansion. Tagged so they run with the default suite,
+// not just the bench filter.
+
+namespace {
+
+template <typename T>
+void verify_uniform_runs(uint32_t n_runs,
+                         uint16_t run_len,
+                         uint32_t n_segs,
+                         cudf::data_type type)
+{
+  using ::sirius::test::decode::rle::make_uniform_runs;
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+  uint32_t const seg_rows = n_runs * run_len;
+
+  std::vector<rmm::device_buffer> bufs;
+  std::vector<gpu_segment_desc> segs;
+  bufs.reserve(n_segs);
+  segs.reserve(n_segs);
+  auto seg_bytes = make_uniform_runs<T>(n_runs, run_len);
+  for (uint32_t i = 0; i < n_segs; ++i) {
+    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream.view());
+    segs.push_back({static_cast<uint8_t const*>(bufs.back().data()),
+                    static_cast<uint32_t>(bufs.back().size()),
+                    i * seg_rows,
+                    seg_rows});
+  }
+
+  gpu_column_decode_input col;
+  col.out_type   = type;
+  col.total_rows = n_segs * seg_rows;
+  col.has_nulls  = false;
+  col.data.push_back({CompressionType::COMPRESSION_RLE, segs});
+
+  auto t   = gpu_decode_table({col}, stream.view(), mr);
+  auto out = download<T>(t->get_column(0).view().template data<T>(),
+                         col.total_rows,
+                         stream.value());
+
+  // Each segment is a copy of the same uniform-runs block, so expected
+  // value at row r is (r/run_len) % n_runs (within the segment).
+  for (uint32_t s = 0; s < n_segs; ++s) {
+    uint32_t base = s * seg_rows;
+    for (uint32_t i = 0; i < seg_rows; ++i) {
+      uint32_t entry  = i / run_len;
+      T const expected = static_cast<T>(entry);
+      if (out[base + i] != expected) {
+        FAIL("seg=" << s << " row=" << i << " entry=" << entry
+                    << " expected=" << static_cast<int64_t>(expected)
+                    << " got=" << static_cast<int64_t>(out[base + i]));
+      }
+    }
+  }
+}
+
+}  // namespace
+
+TEST_CASE("gpu_decode_table RLE bench-scale - long_runs verify",
+          "[scan][decode][rle][verify]")
+{
+  // Mirrors `bench RLE int64 long_runs`: 1092 segments × 16 entries × 7680.
+  verify_uniform_runs<int64_t>(/*n_runs=*/16, /*run_len=*/7680, /*n_segs=*/1092, I64);
+}
+
+TEST_CASE("gpu_decode_table RLE bench-scale - medium_runs verify",
+          "[scan][decode][rle][verify]")
+{
+  verify_uniform_runs<int64_t>(/*n_runs=*/1024, /*run_len=*/120, /*n_segs=*/1092, I64);
+}
+
+TEST_CASE("gpu_decode_table RLE bench-scale - short_runs verify (gmem path)",
+          "[scan][decode][rle][verify]")
+{
+  // Bench shape with 4096 entries fits in shmem; bump to 5000 so the
+  // verification covers the gmem-cumsum expand path as well.
+  verify_uniform_runs<int32_t>(/*n_runs=*/5000, /*run_len=*/24, /*n_segs=*/200, I32);
+}
+
+TEST_CASE("gpu_decode_table RLE bench-scale - pareto_runs verify",
+          "[scan][decode][rle][verify]")
+{
+  using ::sirius::test::decode::rle::make_pareto_runs;
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+  constexpr uint32_t SEG_ROWS = 122880;
+  constexpr uint32_t N_SEGS   = 32;  // smaller than bench to keep test time
+
+  std::vector<rmm::device_buffer> bufs;
+  std::vector<gpu_segment_desc> segs;
+  std::vector<std::vector<int64_t>> expected_per_seg(N_SEGS);
+  bufs.reserve(N_SEGS);
+  segs.reserve(N_SEGS);
+
+  for (uint32_t s = 0; s < N_SEGS; ++s) {
+    // Reproduce the same Pareto realisation the bench uses (seed = s+1) so
+    // we can compare against an expected expansion.
+    uint32_t entries = 0;
+    auto seg_bytes   = make_pareto_runs<int64_t>(SEG_ROWS, /*seed=*/s + 1, 400.0,
+                                                  /*cap_max=*/2048, &entries);
+    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream.view());
+    segs.push_back({static_cast<uint8_t const*>(bufs.back().data()),
+                    static_cast<uint32_t>(bufs.back().size()),
+                    s * SEG_ROWS,
+                    SEG_ROWS});
+
+    // Reconstruct the expected expansion by re-running the same generator
+    // path on host.
+    std::vector<int64_t> expected;
+    expected.reserve(SEG_ROWS);
+    uint32_t lcg            = (s + 1) ? (s + 1) : 0x9E3779B9u;
+    uint32_t emitted        = 0;
+    int64_t next_value      = 0;
+    while (emitted < SEG_ROWS) {
+      lcg            = lcg * 1664525u + 1013904223u;
+      double const u = static_cast<double>(lcg) / static_cast<double>(0xFFFFFFFFu);
+      double const x = 400.0 / std::pow(1.0 - 0.999 * u, 1.0 / 1.5);
+      uint16_t run_len =
+        static_cast<uint16_t>(std::min<double>(2048.0, std::max(1.0, x)));
+      if (emitted + run_len > SEG_ROWS) run_len = static_cast<uint16_t>(SEG_ROWS - emitted);
+      for (uint16_t k = 0; k < run_len; ++k) expected.push_back(next_value);
+      ++next_value;
+      emitted += run_len;
+    }
+    expected_per_seg[s] = std::move(expected);
+  }
+
+  gpu_column_decode_input col;
+  col.out_type   = I64;
+  col.total_rows = N_SEGS * SEG_ROWS;
+  col.has_nulls  = false;
+  col.data.push_back({CompressionType::COMPRESSION_RLE, segs});
+
+  auto t = gpu_decode_table({col}, stream.view(), mr);
+  auto out =
+    download<int64_t>(t->get_column(0).view().data<int64_t>(), col.total_rows, stream.value());
+
+  for (uint32_t s = 0; s < N_SEGS; ++s) {
+    for (uint32_t i = 0; i < SEG_ROWS; ++i) {
+      if (out[s * SEG_ROWS + i] != expected_per_seg[s][i]) {
+        FAIL("seg=" << s << " row=" << i
+                    << " expected=" << expected_per_seg[s][i]
+                    << " got=" << out[s * SEG_ROWS + i]);
+      }
+    }
+  }
 }
