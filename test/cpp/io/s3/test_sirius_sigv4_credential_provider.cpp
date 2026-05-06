@@ -176,6 +176,9 @@ TEST_CASE("sirius_sigv4_credential_provider encodes bucket and key path componen
   CHECK(starts_with(nested, "https://s3.us-east-1.amazonaws.com/bucket/a/b/c.parquet?"));
   CHECK_FALSE(contains(nested, "a%2Fb%2Fc.parquet"));
 
+  auto leading = provider.get_presigned_url({"bucket", "/foo"}, presign_method::GET);
+  CHECK(starts_with(leading, "https://s3.us-east-1.amazonaws.com/bucket//foo?"));
+
   auto unicode_key =
     provider.get_presigned_url({"bucket", "\xE4\xB8\xAD\xE6\x96\x87.parquet"}, presign_method::GET);
   CHECK(starts_with(unicode_key,
