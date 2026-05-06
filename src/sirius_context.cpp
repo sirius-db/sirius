@@ -637,7 +637,7 @@ void SiriusContext::create_query(
   task_creator_->prepare_for_query(*query_);
   // Phase 20.6 IO-MGPU-02: pass per-GPU sirius_ioctx map to scan_manager so
   // parquet_split_provider can construct sirius_datasources via
-  // ioctx->make_datasource(io_object) instead of cudf::io::datasource::create.
+  // ioctx->make_datasource(io_object) instead of cudf's bundled file_source factory.
   scan_manager_->prepare_for_query(*query_, gpu_ioctxs_);
 }
 

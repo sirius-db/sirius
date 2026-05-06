@@ -155,8 +155,9 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
         // parquet_scan_task_global_state so the data-file footer pre-reads
         // can resolve datasources via get_gpu_ioctxs(). Delete-file reads
         // (build_delete_pipeline) bypass sirius_datasource — Q3 audit
-        // confirmed they use DuckDB read_parquet / cudf::io::datasource::create
-        // directly.
+        // confirmed they use DuckDB read_parquet / cudf's bundled file_source
+        // factory directly. Tracked under IO-MGPU-02 for v1.5+ multi-GPU
+        // residency on iceberg metadata + delete-file reads.
         auto* sirius_ctx =
           _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state").get();
         const auto& op_params = sirius_ctx->get_config().get_operator_params();

@@ -85,7 +85,7 @@ class parquet_split_provider : public split_provider {
    *                                Phase 20.6 (IO-MGPU-02): used in run_batch
    *                                to construct sirius_datasources via
    *                                ioctx->make_datasource(io_object) instead
-   *                                of cudf::io::datasource::create — the
+   *                                of cudf's bundled file_source factory — the
    *                                latter routes through kvikio and bypasses
    *                                the io_uring + per-GPU CUDA-context binding
    *                                established in Phase 19.

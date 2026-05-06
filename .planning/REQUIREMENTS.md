@@ -42,6 +42,16 @@
 - [x] **IO-13**: `SiriusContext::initialize()` constructs ONE `sirius_ioctx` per GPU (per-GPU instance), each under `rmm::cuda_set_device_raii` for its target device. Replaces `_gpu_io_backends` map from v1.1.
 - [x] **IO-14**: `uring_ioctx` / `uring_reactor` instances bound to a single GPU's CUDA context — no shared ioctx across GPUs (avoids the v1.1 kvikio single-CUDA-context anti-pattern). `device_read_req.device_id` matches the ioctx's device for every request.
 - [x] **IO-15**: `sirius::io::cucascade_datasource` retired — header file deleted, implementation file deleted, every include site replaced with `sirius::io::sirius_datasource`. `grep -rn "cucascade_datasource" src/ test/` returns zero hits. v1.1 IO-01..11 functionality preserved at the new datasource.
+- [x] **IO-15B** (Phase 20.6 strengthened): No production code path constructs cudf-bundled file_source datasources outside the two known-deferred sites. Strengthened grep:
+  ```bash
+  grep -rn "cudf::io::datasource::create" src/ \
+    | grep -v "src/op/scan/iceberg_metadata_reader.cpp" \
+    | grep -v "src/op/scan/iceberg_scan_task.cpp"
+  ```
+  must return 0 hits. Known-deferred sites tracked under `IO-MGPU-02` for v1.5+:
+  - `src/op/scan/iceberg_metadata_reader.cpp:227` — iceberg metadata reads (single-GPU at present)
+  - `src/op/scan/iceberg_scan_task.cpp:159` — iceberg equality-delete reads (single-GPU at present)
+  Closed by plan 20-06: `parquet_split_provider::run_batch` flipped from kvikio bypass to `sirius_ioctx::make_datasource(io_object)` (Sirius-side bypass eliminated; Phase 20.5 sanitizer Cluster A root cause).
 - [x] **IO-16**: HYG-02 gate — raw `cudaSetDevice` calls in `uring_reactor.cpp` are wrapped in `rmm::cuda_set_device_raii` or guarded such that `rmm::cuda_stream_default` count does not regress beyond 40.
 - [x] **IO-17**: SF1 smoke regression — `[TPC-H][parquet]` filter passes 22/22 on the new datasource. `[multi_gpu_foundation]` compute-sanitizer memcheck clean. **Closed by plan 19-06**: `[TPC-H][parquet]` 22/22 PASS at num_gpus=2 (36256 assertions, 78.6s, exit 0); compute-sanitizer memcheck on `[multi_gpu_foundation]` (7/7, 38 assertions) and `[integration][gpu_execution][parquet][join]` (42/42, 1.92M assertions) report 0 memcheck violations. See 19-VERDICT.md Section A + Section C.
 
@@ -68,6 +78,10 @@
 ## Future Requirements (deferred to v1.5+)
 
 - **PIN-MGPU-01** — Multi-GPU-aware `pin_table`. Place pinned splits on the GPU with the lowest free memory ratio (or distribute across GPUs by table-row count) instead of always GPU 0 (`src/sirius_extension.cpp:733` — `auto& mem_space = const_cast<cucascade::memory::memory_space&>(*gpu_spaces[0]);`). Trade-off: P2P copy overhead via `convert_gpu_to_gpu` is acceptable in v1.4 because Phase 13 `cudaStreamWaitEvent` chain (re-attached at `src/op/scan/sirius_gpu_parquet_scan_operator.cpp:263`) ensures correctness; perf gap is small at SF1 but may show at SF100 multi-table workloads. Documented in PROJECT.md Deferred section; registered for v1.5+ scope during Phase 20 (SM-05).
+- **IO-MGPU-02** — Multi-GPU-aware iceberg metadata + equality-delete reads. Two sites still construct cudf-bundled file_source datasources directly, bypassing the per-GPU `sirius_ioctx` framework established in Phase 19 / extended in Phase 20.6:
+  - `src/op/scan/iceberg_metadata_reader.cpp:227` — iceberg manifest/manifest-list reads
+  - `src/op/scan/iceberg_scan_task.cpp:159` — iceberg equality-delete file reads (data-file reads already route through `sirius_ioctx::make_datasource`)
+  Both sites are currently single-GPU correct (planning-time / pre-execution reads on GPU 0). Multi-GPU residency for iceberg metadata/delete files would require: (1) plumbing `gpu_ioctxs` into `iceberg_metadata_reader` and `iceberg_scan_task::read_equality_delete_file`, (2) constructing per-call `uring_io_object` instances, (3) routing through the appropriate ioctx by the consumer's preferred device. Trade-off: identical to PIN-MGPU-01 — kvikio's single-CUDA-context binding currently poses no correctness risk because these reads are not on the multi-GPU column-chunk hot path; perf gap is negligible. Strengthened IO-15B grep gate (Phase 20.6) excludes these two sites; tracked here so they're not lost when iceberg multi-GPU residency lands. Created during Phase 20 plan 20-06.
 - **CC-UPSTREAM-01** — Open upstream cucascade PRs for the 11 local fixes so future rebases don't carry an N-commit local pin divergence. Carry the local pin in v1.4 (decision captured in PROJECT.md Key Decisions row 2026-05-04).
 - **FU-B (carry from v1.3)** — Extend `mcp__project-commands__run_command` wrapper for env-passthrough OR add `num_gpus` arg to `tpch-benchmark` to lift v1.3 acceptance criterion C3 (SF1 1-GPU vs 2-GPU > 1.2× speedup) from DEFERRED.
 
