@@ -32,6 +32,13 @@
 #include <cucascade/data/io_backend_registry.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
+// sirius IO framework (Phase 19 IO-15 helper preparation)
+#include <io/types.hpp>
+#include <io/uring/uring_ioctx.hpp>
+
+// rmm
+#include <rmm/cuda_device.hpp>
+
 // cudf
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -73,6 +80,28 @@ inline std::shared_ptr<cucascade::idisk_io_backend> make_test_io_backend()
   static std::once_flag registry_init_flag;
   std::call_once(registry_init_flag, [&] { cucascade::register_builtin_io_backends(registry); });
   return registry.create_default_backend();
+}
+
+/// Construct a single @c sirius_ioctx instance for tests that directly
+/// instantiate sirius_parquet_metadata_scan_operator with the new IO
+/// framework (Phase 19 IO-15). Mirrors the per-GPU pattern in
+/// @c SiriusContext::initialize() (src/sirius_context.cpp:283) — the
+/// @c uring_ioctx is constructed under @c rmm::cuda_set_device_raii so its
+/// pinned bounce slots bind to the right CUDA context (CONTEXT.md P11 lock).
+///
+/// This helper is added ALONGSIDE @c make_test_io_backend. The cucascade
+/// helper is preserved for the existing call sites until plan 19-05 retires
+/// @c cucascade_datasource and flips the call sites to use this helper.
+inline std::shared_ptr<sirius::io::sirius_ioctx> make_test_ioctx(int device_id = 0)
+{
+  rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
+  // Defaults match src/include/io/uring/uring_ioctx.hpp:85-88 (host_ring_depth=16,
+  // ring_entries=64, n_reactors=4, bounce_slot_size=CHUNK_SIZE=1MiB).
+  return std::make_shared<sirius::io::uring_ioctx>(
+    /*host_ring_depth=*/static_cast<unsigned>(16),
+    /*ring_entries=*/static_cast<unsigned>(64),
+    /*n_reactors=*/static_cast<size_t>(4),
+    /*bounce_slot_size=*/sirius::io::CHUNK_SIZE);
 }
 
 /// Write a DuckDB table to a parquet file.  Returns the path.
