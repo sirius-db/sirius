@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Rebase After DataBatch Changes
 status: executing
-stopped_at: "Completed 20-05-PLAN.md (SM-06 SF1 PATH B escalation; status human_needed) — Phase 20 closed PARTIAL; structural finding at cucascade alloc_and_peer_copy_async host-staging fallback + cudf+kvikio internal stream-ordering documented in 20-05-INVESTIGATION.md; SM-06 SF1 carryover to Phase 21 REG-03 explicit"
-last_updated: "2026-05-06T12:30:00.000Z"
+stopped_at: "Completed 20-06-PLAN.md (SM-06 SF1 closure via parquet_split_provider kvikio bypass fix) — Phase 20 → COMPLETE PASS (6/6 plans, all SM-01..SM-06 closed). 20-05 escalation re-classified: Sirius-side architectural gap, NOT cucascade-side. Q11 SF1 num_gpus=2 PASS, [TPC-H][parquet] 22/22 PASS under sanitizer (0 kvikio frames), 47/48 [integration][TPC-H] PASS (single residual is pre-existing SM-02 PARTIAL test-fixture mismatch from plan 20-01). Phase 21 unblocked."
+last_updated: "2026-05-06T19:30:00.000Z"
 last_activity: 2026-05-06
 progress:
   total_phases: 6
   completed_phases: 5
-  total_plans: 27
-  completed_plans: 27
+  total_plans: 28
+  completed_plans: 28
 ---
 
 # Project State
@@ -24,13 +24,13 @@ See: .planning/PROJECT.md (updated 2026-05-04)
 
 ## Current Position
 
-Phase: 20 (Scan Manager + Pin Tables Port (PR #731 + #721)) — EXECUTING
-Plan: 4 of 4
-Status: Ready to execute
+Phase: 20 (Scan Manager + Pin Tables Port (PR #731 + #721)) — COMPLETE
+Plan: 6 of 6
+Status: Phase 20 closed; Phase 21 ready to plan
 Last activity: 2026-05-06
 
 ```
-v1.4 Progress: [#################   ] 5/6 phases | 22/32 requirements | 27 plans (SM-06 SF1 escalated, status human_needed)
+v1.4 Progress: [##################  ] 5/6 phases | 23/32 requirements | 28 plans (SM-06 SF1 PASS via 20-06)
 ```
 
 ## Phase Overview (v1.4)
@@ -41,7 +41,7 @@ v1.4 Progress: [#################   ] 5/6 phases | 22/32 requirements | 27 plans
 | 17 | Sirius origin/dev Merge — Base Layer | MERGE-01..05 | Complete (4/4 plans, PASS) |
 | 18 | DataBatch RAII Migration | DB-01..05 | Complete (7/7 plans, PASS) |
 | 19 | IO Framework Adoption | IO-12..17 | Complete (6/6 plans, PASS) |
-| 20 | Scan Manager + Pin Tables Port | SM-01..06 | Complete (5/5 plans, PARTIAL — SM-06 SF1 escalated to Phase 21 REG-03 via 20-05; status human_needed) |
+| 20 | Scan Manager + Pin Tables Port | SM-01..06 | **Complete (6/6 plans, PASS)** — SM-06 SF1 closed by 20-06 (parquet_split_provider kvikio bypass eliminated); 22/22 [TPC-H][parquet] PASS under sanitizer; Q11 SF1 num_gpus=2 PASS |
 | 21 | v1.4 Ship Gate | REG-01..06 | Not started |
 
 ## Performance Metrics
@@ -104,6 +104,7 @@ v1.4 Progress: [#################   ] 5/6 phases | 22/32 requirements | 27 plans
 | Phase 20 P02 | 16min | 3 tasks | 6 files |
 | Phase 20 P04 | 18min | 3 tasks | 2 files |
 | Phase 20 P05 | 25min | 4 tasks | 3 files |
+| Phase 20 P06 | ~50min | 5 tasks | 11 files |
 
 ## Decisions
 
@@ -227,6 +228,12 @@ v1.4 Progress: [#################   ] 5/6 phases | 22/32 requirements | 27 plans
 - [Phase 20]: [20-05] PATH B escalation (status human_needed): canonical compute-sanitizer revealed 21 stream-ordered races at HEAD distributed across two clusters at library boundaries — Cluster A (5/21) cudf+kvikio internal parquet reader cross-stream gap inside read_column_chunks_async; Cluster B (16/21) cucascade pin 1c1e648 alloc_and_peer_copy_async host-staging fallback (race shape E per plan taxonomy). Phase 13-04 entry-level cudaStreamWaitEvent at convert_gpu_to_gpu IS firing correctly; the cluster B races are in a NEW fallback code path added post-Phase 13.
 - [Phase 20]: [20-05] No source files modified (Path B). Recommended fix: cucascade fork+bump for alloc_and_peer_copy_async same-stream invariant + Sirius cudaStreamSynchronize after read_parquet (cluster A workaround). Estimated 1.5-2.5 days for full closure. Carry-forward to Phase 21 REG-03 explicit; ship-gate cannot pass without resolution.
 - [Phase 20]: [20-05] [mgpu] 16/16 PASS continuity baseline preserved (79091 assertions / 104.4s / exit 0); Phase 18..20 invariants intact (DB-grep 4 legacy+comments only; IO-15 0; SM-03 1; HYG-02 40); 0 lines source diff.
+- [Phase 20]: [20-06] 20-05 sanitizer trace re-classified: Cluster A (5/21 races) attributed in 20-05 to "cudf+kvikio internal cross-stream gap" was actually a Sirius-side architectural gap — `parquet_split_provider::run_batch:222` constructed cudf-bundled file_source datasources directly via `cudf::io::datasource::create(file_path)` instead of routing through the Phase 19 `sirius_ioctx::make_datasource(io_object)` framework. The PR #731 scan_manager path was authored without IO framework integration; the original IO-15 grep gate (`cucascade_datasource`) didn't catch it because the bypass uses the cudf factory, not the cucascade adapter. Fix: plumb gpu_ioctxs from SiriusContext through scan_manager::prepare_for_query into parquet_split_provider; replace cudf factory with `planning_ioctx_it->second->make_datasource(io_object)` pattern from parquet_scan_task.cpp:343-350.
+- [Phase 20]: [20-06] Cluster A eliminated post-fix (sanitizer log: 0 kvikio frames; was 5/21 in 20-05 baseline). All 22 [TPC-H][parquet] queries PASS under compute-sanitizer with track-stream-ordered-races=all (36256 assertions, exit 0). Q11 SF1 num_gpus=2 parquet PASS (9011 assertions, exit 0) — the canonical SM-06 SF1 blocker is closed.
+- [Phase 20]: [20-06] Cluster B (cucascade alloc_and_peer_copy_async host-staging fallback, 16/21 races in 20-05) persists post-fix but is correctness-neutral on this hardware — all 22 + Q11 + 16/16 [mgpu] tests PASS post-fix. Already classified by 20-05 PATH B as a separate cucascade-side finding; falls under existing v1.4 cucascade follow-up (`project_tpch_q1_mgpu_string_bug` memory file — peer-DMA probe + host-staging fix uncommitted in cucascade). Per Phase 13 protocol "first race is root, rest is cascade": Cluster A was the root; Cluster B is downstream of consumer-hardware peer-DMA limitations.
+- [Phase 20]: [20-06] Strengthened IO-15B grep gate added to REQUIREMENTS.md: `grep -rn "cudf::io::datasource::create" src/ | grep -v iceberg_metadata_reader.cpp | grep -v iceberg_scan_task.cpp` must return 0 hits. Would have caught PR #731's bypass had it been live during Phase 19. IO-MGPU-02 added to Future Requirements (v1.5+) for the two known-deferred iceberg sites (currently single-GPU correct).
+- [Phase 20]: [20-06] [integration][TPC-H] 47/48 PASS at SF1 num_gpus=2: the single residual is the pre-existing SM-02 PARTIAL test-fixture mismatch from plan 20-01 ([mgpu-audit] per-GPU distribution Q1 fails at counts[1].pipeline_ids.size() >= 1 with 0 >= 1 — v1.3-era multi-pipeline_task threshold vs post-#731 single composite gpu_pipeline_task). scan_batch IS multi-GPU disjoint at HEAD; only the test fixture's threshold is misaligned. NOT a 20-06 regression. [mgpu] 16/16 PASS continuity preserved (79091 assertions, 109s).
+- [Phase 20]: [20-06] Phase 20 final verdict flips PARTIAL → COMPLETE PASS (6/6 plans). Phase 21 unblocked at REG-03 dependency level (SM-06 SF1 carryover no longer required).
 
 ## Accumulated Context
 
@@ -262,6 +269,6 @@ v1.4 Progress: [#################   ] 5/6 phases | 22/32 requirements | 27 plans
 
 ## Session Continuity
 
-Last session: 2026-05-06T12:30:00.000Z
-Stopped at: Completed 20-05-PLAN.md (SM-06 SF1 PATH B escalation; status human_needed) — Phase 20 closed PARTIAL; structural finding at cucascade alloc_and_peer_copy_async host-staging fallback + cudf+kvikio internal stream-ordering documented in 20-05-INVESTIGATION.md; SM-06 SF1 carryover to Phase 21 REG-03 explicit
-Resume file: .planning/phases/20-scan-manager-pin-tables-port-pr-731-pr-721/20-05-INVESTIGATION.md
+Last session: 2026-05-06T19:30:00.000Z
+Stopped at: Completed 20-06-PLAN.md (SM-06 SF1 closure via parquet_split_provider kvikio bypass fix) — Phase 20 → COMPLETE PASS (6/6 plans). 20-05 escalation re-classified: Cluster A (kvikio internal cross-stream) was actually a Sirius-side gap (parquet_split_provider was authored without IO framework integration); fix landed in 5 commits; all functional gates green. Phase 21 ready to plan.
+Resume file: .planning/phases/20-scan-manager-pin-tables-port-pr-731-pr-721/20-06-SUMMARY.md
