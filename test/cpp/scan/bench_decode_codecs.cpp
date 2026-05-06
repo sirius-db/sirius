@@ -305,6 +305,44 @@ TEST_CASE("bench RLE int64 medium_runs (1024 entries/seg) 122M rows",
               bytes_w / sec / GIB);
 }
 
+TEST_CASE("bench RLE int64 pareto_runs (skewed distribution) ~120M rows",
+          "[!benchmark][scan][decode]")
+{
+  // Realistic shape: Pareto-distributed run lengths. Many short runs +
+  // a few long ones, like sorted low-cardinality columns in TPC-H.
+  using ::sirius::test::decode::rle::make_pareto_runs;
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+
+  // 122880 rows per segment with Pareto x_min=400 → mean run ~1200, ~100
+  // entries per segment. Comfortably within the build cap and matches the
+  // shape of TPC-H sorted-low-cardinality columns (l_returnflag-class).
+  constexpr uint32_t SEG_ROWS = 122880;
+  constexpr uint32_t N_SEGS   = (128u << 20) / SEG_ROWS;
+
+  std::vector<rmm::device_buffer> bufs;
+  std::vector<gpu_segment_desc> segs;
+  bufs.reserve(N_SEGS);
+  segs.reserve(N_SEGS);
+  for (uint32_t i = 0; i < N_SEGS; ++i) {
+    auto seg_bytes = make_pareto_runs<int64_t>(
+      SEG_ROWS, /*seed=*/i + 1, /*x_min=*/400.0);
+    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream.view());
+    segs.push_back(segment(bufs.back(), i * SEG_ROWS, SEG_ROWS));
+  }
+  auto col = one_codec_column(cudf::data_type{cudf::type_id::INT64},
+                              N_SEGS * SEG_ROWS,
+                              CompressionType::COMPRESSION_RLE,
+                              segs);
+
+  double sec     = bench_seconds(stream, {col}, mr);
+  double bytes_w = double(size_t{N_SEGS} * SEG_ROWS * sizeof(int64_t));
+  std::printf("[bench] RLE          int64 pareto_runs   %u rows: %.6fs  write=%.1f GiB/s\n",
+              N_SEGS * SEG_ROWS,
+              sec,
+              bytes_w / sec / GIB);
+}
+
 TEST_CASE("bench RLE int32 short_runs (4096 entries/seg) 65M rows",
           "[!benchmark][scan][decode]")
 {

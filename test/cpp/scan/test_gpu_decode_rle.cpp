@@ -243,11 +243,26 @@ inline std::vector<int32_t> decode_invalid_with_canary(rmm::cuda_stream& stream,
 }
 }  // namespace
 
+TEST_CASE("gpu_decode_table RLE - many-entry segment scans correctly",
+          "[scan][decode][rle]")
+{
+  // > BUILD_TILE_ENTRIES (4096) but well below RLE_BUILD_MAX_ENTRIES.
+  // Exercises the multi-tile build path AND the gmem-cumsum expand path.
+  constexpr uint32_t N = 12000;
+  std::vector<int32_t> values(N);
+  std::iota(values.begin(), values.end(), 1);
+  std::vector<uint16_t> counts(N, 1);
+  auto bytes = make_rle_block<int32_t>(values, counts);
+  auto out   = decode_one<int32_t>(bytes, I32, N);
+  for (uint32_t i = 0; i < N; ++i) REQUIRE(out[i] == static_cast<int32_t>(i + 1));
+}
+
 TEST_CASE("gpu_decode_table RLE - over-cap entry count zero-fills",
           "[scan][decode][rle][defensive]")
 {
-  // > 4096 entries exceeds the build kernel's BlockScan cap.
-  constexpr uint32_t N = 5000;
+  // Exceeds RLE_BUILD_MAX_ENTRIES (90112) — a synthetic case beyond what
+  // DuckDB ever writes (max ~87K for T=int8, ~26K for T=int64).
+  constexpr uint32_t N = 100000;
   std::vector<int32_t> values(N);
   std::iota(values.begin(), values.end(), 1);
   std::vector<uint16_t> counts(N, 1);

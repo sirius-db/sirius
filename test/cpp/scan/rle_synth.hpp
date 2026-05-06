@@ -27,6 +27,8 @@
 
 #include <cuda/scan/gpu_decode_rle.cuh>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -73,6 +75,37 @@ inline std::vector<uint8_t> make_uniform_runs(uint32_t n_runs, uint16_t run_len)
   std::vector<T> values(n_runs);
   for (uint32_t i = 0; i < n_runs; ++i) values[i] = static_cast<T>(i);
   std::vector<uint16_t> counts(n_runs, run_len);
+  return make_rle_block<T>(values, counts);
+}
+
+/// Build a block whose run lengths follow a Pareto-like distribution —
+/// many medium runs + a few very long ones, like a sorted low-cardinality
+/// column. `x_min` is the floor run length (mean ≈ α/(α-1) · x_min ≈ 3·x_min
+/// at α=1.5). Tune so total_rows / mean stays well below the build cap.
+template <typename T>
+inline std::vector<uint8_t> make_pareto_runs(uint32_t total_rows,
+                                             uint32_t seed,
+                                             double x_min     = 50.0,
+                                             uint16_t cap_max = 2048,
+                                             uint32_t* out_entries = nullptr)
+{
+  std::vector<T> values;
+  std::vector<uint16_t> counts;
+  uint32_t lcg     = seed ? seed : 0x9E3779B9u;
+  uint32_t emitted = 0;
+  T next_value     = T(0);
+  while (emitted < total_rows) {
+    lcg            = lcg * 1664525u + 1013904223u;
+    double const u = static_cast<double>(lcg) / static_cast<double>(0xFFFFFFFFu);
+    double const x = x_min / std::pow(1.0 - 0.999 * u, 1.0 / 1.5);
+    uint16_t run_len =
+      static_cast<uint16_t>(std::min<double>(cap_max, std::max(1.0, x)));
+    if (emitted + run_len > total_rows) run_len = static_cast<uint16_t>(total_rows - emitted);
+    values.push_back(next_value++);
+    counts.push_back(run_len);
+    emitted += run_len;
+  }
+  if (out_entries) *out_entries = static_cast<uint32_t>(values.size());
   return make_rle_block<T>(values, counts);
 }
 
