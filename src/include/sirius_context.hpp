@@ -30,6 +30,7 @@
 
 #include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/data/io_backend_registry.hpp>
+#include <io/types.hpp>
 #include <duckdb/common/enums/optimizer_type.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/client_context_state.hpp>
@@ -198,6 +199,30 @@ class SiriusContext : public ClientContextState {
     return gpu_io_backends_;
   }
 
+  /// @brief Resolve the per-GPU sirius_ioctx for the given device (Phase 19 IO-13).
+  ///
+  /// Per-GPU sirius_ioctx instances are constructed once per GPU during
+  /// initialize() under rmm::cuda_set_device_raii so the reactor's pinned
+  /// bounce slots and admission_control are bound to the matching CUDA
+  /// context. Coexists with get_io_backend_for() until 19-05 retires the
+  /// cucascade backend map.
+  ///
+  /// @param device_id GPU device id (must match a configured GPU memory space).
+  /// @return Shared pointer to the sirius_ioctx for that device.
+  /// @throws std::out_of_range if no ioctx was registered for device_id.
+  [[nodiscard]] std::shared_ptr<sirius::io::sirius_ioctx> get_ioctx_for(int device_id) const;
+
+  /// @brief Read-only view of the full per-GPU sirius_ioctx cache (Phase 19 IO-13).
+  ///
+  /// Mirrors get_gpu_io_backends() but returns the new sirius_ioctx map.
+  /// Coexists during the migration window; 19-05 will retire the cucascade
+  /// counterpart and consumers will switch to this accessor.
+  [[nodiscard]] std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const&
+  get_gpu_ioctxs() const
+  {
+    return gpu_ioctxs_;
+  }
+
   /// @brief Check whether cudaDeviceEnablePeerAccess succeeded for the given
   ///        (src, dst) GPU pair at SiriusContext::initialize() time (MGPU-06).
   ///
@@ -293,6 +318,16 @@ class SiriusContext : public ClientContextState {
   // have a live CUDA context (mirrors downgrade_executors_ teardown pattern).
   cucascade::io_backend_registry io_backend_registry_;
   std::unordered_map<int, std::shared_ptr<cucascade::idisk_io_backend>> gpu_io_backends_;
+  // Phase 19 IO-13: per-GPU sirius_ioctx; replaces gpu_io_backends_ once 19-05
+  // retires consumers. One ioctx per GPU memory space, constructed under
+  // rmm::cuda_set_device_raii in initialize() so the reactor's pinned bounce
+  // slots (cudaHostAlloc(cudaHostAllocPortable)) bind to the matching CUDA
+  // context. Each ioctx owns its own admission_control budget (P5 mitigation
+  // — default uring_ioctx ctor allocates one admission_control instance per
+  // ioctx). Cleared in terminate() BEFORE memory_manager_->shutdown() so
+  // ~uring_reactor's worker-thread join + cudaFreeHost run against a live
+  // CUDA context (mirrors gpu_io_backends_ teardown ordering).
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs_;
   // MGPU-06 P2P: set of (src, dst) GPU pairs where cudaDeviceEnablePeerAccess
   // succeeded in initialize(). Populated under rmm::cuda_set_device_raii, one
   // call per pair. Consumed by is_peer_access_enabled() + Plan 07-02's
