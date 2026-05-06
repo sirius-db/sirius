@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Rebase After DataBatch Changes
 status: executing
-stopped_at: "Completed 20-04-PLAN.md (SM-04 + SM-06 verdict; Phase 20 PARTIAL — 5/6 SM-XX PASS, SF1 [integration] BLOCKED on follow-up #17 carried to Phase 21 REG-03)"
-last_updated: "2026-05-06T11:49:06.600Z"
+stopped_at: "Completed 20-05-PLAN.md (SM-06 SF1 PATH B escalation; status human_needed) — Phase 20 closed PARTIAL; structural finding at cucascade alloc_and_peer_copy_async host-staging fallback + cudf+kvikio internal stream-ordering documented in 20-05-INVESTIGATION.md; SM-06 SF1 carryover to Phase 21 REG-03 explicit"
+last_updated: "2026-05-06T12:30:00.000Z"
 last_activity: 2026-05-06
 progress:
   total_phases: 6
   completed_phases: 5
-  total_plans: 26
-  completed_plans: 26
+  total_plans: 27
+  completed_plans: 27
 ---
 
 # Project State
@@ -30,7 +30,7 @@ Status: Ready to execute
 Last activity: 2026-05-06
 
 ```
-v1.4 Progress: [#############       ] 4/6 phases | 16/32 requirements | 22 plans
+v1.4 Progress: [#################   ] 5/6 phases | 22/32 requirements | 27 plans (SM-06 SF1 escalated, status human_needed)
 ```
 
 ## Phase Overview (v1.4)
@@ -41,7 +41,7 @@ v1.4 Progress: [#############       ] 4/6 phases | 16/32 requirements | 22 plans
 | 17 | Sirius origin/dev Merge — Base Layer | MERGE-01..05 | Complete (4/4 plans, PASS) |
 | 18 | DataBatch RAII Migration | DB-01..05 | Complete (7/7 plans, PASS) |
 | 19 | IO Framework Adoption | IO-12..17 | Complete (6/6 plans, PASS) |
-| 20 | Scan Manager + Pin Tables Port | SM-01..06 | Not started |
+| 20 | Scan Manager + Pin Tables Port | SM-01..06 | Complete (5/5 plans, PARTIAL — SM-06 SF1 escalated to Phase 21 REG-03 via 20-05; status human_needed) |
 | 21 | v1.4 Ship Gate | REG-01..06 | Not started |
 
 ## Performance Metrics
@@ -103,6 +103,7 @@ v1.4 Progress: [#############       ] 4/6 phases | 16/32 requirements | 22 plans
 | Phase 20 P01 | 6min | 3 tasks | 1 files |
 | Phase 20 P02 | 16min | 3 tasks | 6 files |
 | Phase 20 P04 | 18min | 3 tasks | 2 files |
+| Phase 20 P05 | 25min | 4 tasks | 3 files |
 
 ## Decisions
 
@@ -223,6 +224,9 @@ v1.4 Progress: [#############       ] 4/6 phases | 16/32 requirements | 22 plans
 - [Phase 20]: [20-04] Advisory SF100 Q1 num_gpus=2 PASS at 2.283s cold (well under Phase 21 REG-04 5.7s bar; under Phase 9-04 5.86s + Phase 10-04 5.70s historical baselines). Reduces Phase 21 REG-04 ship-risk substantially.
 - [Phase 20]: [20-04] Advisory [mgpu] 16/16 PASS: 79091 assertions / 106.4s — exact match to Phase 18-VERDICT-V2 + Phase 19-VERDICT baselines. Includes follow-up #17 sentinel TEST_CASE which PASSED. Bounds the SM-06 SF1 failure as Q11-shape + parquet-path specific.
 - [Phase 20]: [20-04] Phase 20 final verdict PARTIAL not FAIL: 5 of 6 SM-XX requirements PASS unconditionally (SM-01..05 + SM-04). SM-06 SF10 PASS captures architecture-level signal Phase 20 was designed to produce. SF1 PARTIAL is pre-existing infrastructure carryover anticipated by Phase 20 scoping (verification + documentation, no code-port). Phase 21 unblocked.
+- [Phase 20]: [20-05] PATH B escalation (status human_needed): canonical compute-sanitizer revealed 21 stream-ordered races at HEAD distributed across two clusters at library boundaries — Cluster A (5/21) cudf+kvikio internal parquet reader cross-stream gap inside read_column_chunks_async; Cluster B (16/21) cucascade pin 1c1e648 alloc_and_peer_copy_async host-staging fallback (race shape E per plan taxonomy). Phase 13-04 entry-level cudaStreamWaitEvent at convert_gpu_to_gpu IS firing correctly; the cluster B races are in a NEW fallback code path added post-Phase 13.
+- [Phase 20]: [20-05] No source files modified (Path B). Recommended fix: cucascade fork+bump for alloc_and_peer_copy_async same-stream invariant + Sirius cudaStreamSynchronize after read_parquet (cluster A workaround). Estimated 1.5-2.5 days for full closure. Carry-forward to Phase 21 REG-03 explicit; ship-gate cannot pass without resolution.
+- [Phase 20]: [20-05] [mgpu] 16/16 PASS continuity baseline preserved (79091 assertions / 104.4s / exit 0); Phase 18..20 invariants intact (DB-grep 4 legacy+comments only; IO-15 0; SM-03 1; HYG-02 40); 0 lines source diff.
 
 ## Accumulated Context
 
@@ -258,6 +262,6 @@ v1.4 Progress: [#############       ] 4/6 phases | 16/32 requirements | 22 plans
 
 ## Session Continuity
 
-Last session: 2026-05-06T11:49:06.597Z
-Stopped at: Completed 20-04-PLAN.md (SM-04 + SM-06 verdict; Phase 20 PARTIAL — 5/6 SM-XX PASS, SF1 [integration] BLOCKED on follow-up #17 carried to Phase 21 REG-03)
-Resume file: None
+Last session: 2026-05-06T12:30:00.000Z
+Stopped at: Completed 20-05-PLAN.md (SM-06 SF1 PATH B escalation; status human_needed) — Phase 20 closed PARTIAL; structural finding at cucascade alloc_and_peer_copy_async host-staging fallback + cudf+kvikio internal stream-ordering documented in 20-05-INVESTIGATION.md; SM-06 SF1 carryover to Phase 21 REG-03 explicit
+Resume file: .planning/phases/20-scan-manager-pin-tables-port-pr-731-pr-721/20-05-INVESTIGATION.md

@@ -19,7 +19,7 @@ Goal: land cucascade `origin/main` (PR #117 DataBatch RAII refactor + #112 + #11
 - [x] **Phase 17: Sirius origin/dev Merge — Base Layer** — Absorb `origin/dev` CI/CMake/config PRs (#739 compat, #675, #731, #721, #733, #734, #735) as a base-layer merge. Expected to produce 26+ `batch->get_data()` private-access build errors — DOCUMENTED as expected, not a phase failure. SCHED-RR block survival verified. **COMPLETE** (2026-05-05): All 5 MERGE-XX requirements PASS; 63 expected build errors classified as Phase 18 DB-02/DB-03; cucascade pin 1c1e648 preserved; D-G1..G6 all PASS.
 - [x] **Phase 18: DataBatch RAII Migration (cucascade #117 surface)** — Migrate all `batch->get_data()` call sites and `pop_data_batch(state)` usages to RAII accessors; rewrite `batch_lock_utils.hpp`. Phase ends with a compile-clean build. **COMPLETE 2026-05-05**: 7/7 plans shipped (added gap-closure plan 18-07). DB-01..05 PASS. Path A architectural fix landed in 18-07 (drop R5 lock-and-hold from `gpu_pipeline_task::compute_task`; `pipelineable_operator_data::prepare_for_processing` performs eager memory-space conversion under SHORT-scoped accessors and returns empty vector; operators inside `execute()` take per-call accessors at narrowest scope). [mgpu] 16/16 PASS in 103.5s (79091 assertions); [mgpu_stress] default-mode PASS in 75.5s (77053 assertions); compute-sanitizer racecheck 0 hazards on [downgrade_lifecycle] proxy. HYG-02 baseline preserved at 40 (0 non-legacy). See 18-VERDICT-V2.md (supersedes 18-VERDICT.md PARTIAL).
 - [x] **Phase 19: IO Framework Adoption (PR #675)** — Retire `sirius::io::cucascade_datasource`; adopt `sirius::io::sirius_datasource` with per-GPU `uring_ioctx` instances. Install `liburing-dev` before first build attempt. **COMPLETE** (2026-05-06): 6/6 plans shipped. All 6 IO-12..17 PASS. `[TPC-H][parquet]` 22/22 PASS at num_gpus=2 (36256 assertions, 78.6s); compute-sanitizer memcheck on `[multi_gpu_foundation]` (7/7) and `[integration][gpu_execution][parquet][join]` (42/42, 1.92M assertions) report 0 memcheck violations. nvidia-smi dmon confirms non-zero PCIe rxpci on BOTH GPU 0 (63/120 samples; max 2892 MB/s) AND GPU 1 (54/120 samples; max 453 MB/s) during multi-GPU workload. HYG-02 = 40 (preserved). See 19-VERDICT.md.
-- [ ] **Phase 20: Scan Manager + Pin Tables Port (PR #731 + #721)** — Integrate `parquet_split_provider` / `sirius_scan_manager` / `split_connector`; re-plant `_batch_gpu_affinity` (Phase 9) and stream-lineage hooks (Phase 13); port SCHED-RR counter to `parquet_split_provider`.
+- [x] **Phase 20: Scan Manager + Pin Tables Port (PR #731 + #721)** — PARTIAL (5/5 plans, SM-01..SM-05 PASS unconditionally; SM-06 SF10 PASS; SM-06 SF1 escalated to Phase 21 REG-03 via 20-05 PATH B with status human_needed — structural finding at cucascade `alloc_and_peer_copy_async` host-staging fallback + cudf+kvikio internal stream-ordering documented in [`20-05-INVESTIGATION.md`](phases/20-scan-manager-pin-tables-port-pr-731-pr-721/20-05-INVESTIGATION.md))
 - [ ] **Phase 21: v1.4 Ship Gate (Full v1.3 Gauntlet on Rebased Branch)** — Full regression: `[mgpu]` 16/16, `[TPC-H][parquet]` 22/22, `[integration][TPC-H]` 48/48, SF100 Q1 num_gpus=2 <= 5.7s, mgpu_stress 500-iter, HYG-02 <= 40.
 
 </details>
@@ -177,11 +177,12 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
   3. AUDIT TEST_CASE disjointedness REQUIRE (`std::set_intersection(scan_ids) == empty`) fires green on `num_gpus: 2` — `_batch_gpu_affinity` re-planted and working (SM-02 gate).
   4. `[integration][TPC-H]` 48/48 PASS at SF1 with `num_gpus: 2`; TPC-H Q1/Q6/Q12 PASS at SF10 on `num_gpus: 2` (SM-06 smoke regression).
   5. `CALL pin_table(...)` executes without error on a single-GPU query; `20-STREAM-LINEAGE-REATTACH.md` and `20-SCHED-RR-PORT.md` document the porting decisions (SM-04, SM-05 documentation gates).
-**Plans**: 4 plans
+**Plans**: 5 plans (5 closed; SM-06 SF1 escalated to Phase 21 REG-03 via 20-05 PATH B; status human_needed)
 - [x] 20-01-PLAN.md — Empirical verification gates: [mgpu_stress] 500-iter + [mgpu-audit] disjointedness + grep gates → 20-01-EVIDENCE.md (SM-01/SM-02/SM-03)
 - [x] 20-02-PLAN.md — TODO cleanup (Pitfall 1) + author 20-SCHED-RR-PORT.md + 20-STREAM-LINEAGE-REATTACH.md + resolve Open Q1 (SM-01/SM-02/SM-03 docs)
 - [x] 20-03-PLAN.md — Document pin_table single-GPU residency in PROJECT.md Deferred + register PIN-MGPU-01 in REQUIREMENTS.md (SM-05)
 - [x] 20-04-PLAN.md — SF1 [integration][TPC-H] 48/48 + SF10 Q1/Q6/Q12 num_gpus=2 + SM-04 source-inspection + 20-VERDICT.md (SM-04/SM-06)
+- [x] 20-05-PLAN.md — Gap closure: PATH B escalation (status human_needed). Sanitizer revealed 21 stream-ordered races at HEAD across 2 clusters at library boundaries: cluster A (5/21) cudf+kvikio internal `read_column_chunks_async`; cluster B (16/21) cucascade pin 1c1e648 `alloc_and_peer_copy_async` host-staging fallback (race shape E). Phase 13-04 entry-level `cudaStreamWaitEvent` IS firing correctly; cluster B is in a NEW post-Phase 13 fallback code path. Recommended fix 1.5-2.5 days (cucascade fork+bump for `alloc_and_peer_copy_async` same-stream invariant + Sirius `cudaStreamSynchronize` after `read_parquet`). Carryover to Phase 21 REG-03 explicit; ship-gate cannot pass without resolution. See [`20-05-INVESTIGATION.md`](phases/20-scan-manager-pin-tables-port-pr-731-pr-721/20-05-INVESTIGATION.md).
 **Pitfalls**:
   - P6 (SCHED-RR counter stale under split_provider): port `_no_pref_rr_counter` increment to `parquet_split_provider`'s split-emission loop — the old `management_eventloop` increment is no longer the split-allocation site. Confirm with `[mgpu_stress]` 500-iter before declaring done.
   - P10 (Phase 13 work in deleted file): the stream-lineage attachment points extracted during MERGE-03 (Phase 17) must be explicitly re-wired here; do not assume `parquet_split_provider` already handles them. The `grep` gate in criterion 1 is mandatory.
@@ -194,7 +195,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 **Success Criteria** (what must be TRUE):
   1. `[mgpu]` filter passes 16/16, exit 0, >= 79091 assertions, runtime <= 130s (REG-01).
   2. `[TPC-H][parquet]` filter passes 22/22, exit 0, runtime <= 90s (REG-02).
-  3. `[integration][TPC-H]` filter passes 48/48, exit 0, >= 71608 assertions, runtime <= 3 min (REG-03).
+  3. `[integration][TPC-H]` filter passes 48/48, exit 0, >= 71608 assertions, runtime <= 3 min (REG-03). **BLOCKED on Phase 20 SM-06 SF1 carryover** — Q11 parquet num_gpus=2 `cudaErrorIllegalAddress` (canonical follow-up #17). Plan 20-05 Path B escalation (status human_needed): structural finding at cucascade `alloc_and_peer_copy_async` host-staging fallback (16/21 races) + cudf+kvikio internal `read_column_chunks_async` stream-ordering (5/21 races). Recommended fix 1.5-2.5 days (cucascade fork+bump + Sirius `cudaStreamSynchronize` workaround). See [`20-05-INVESTIGATION.md`](phases/20-scan-manager-pin-tables-port-pr-731-pr-721/20-05-INVESTIGATION.md). Phase 21 REG-03 cannot pass without resolution OR explicit acceptance-criteria relaxation.
   4. SF100 TPC-H Q1 `num_gpus=2` wall-clock <= 5.7s; result byte-identical to 1-GPU baseline; cross-GPU scan-id intersection = 0 (REG-04).
   5. `[mgpu_stress]` 500-iter PASS — 100 iterations × 5 representative `[mgpu]` queries × varied SCHED-RR counter offsets; >= 77053 assertions, exit 0 (REG-05).
   6. `grep -c "rmm::cuda_stream_default" src/` <= 40; compute-sanitizer memcheck clean on `[multi_gpu_foundation]` + `[integration][gpu_execution][parquet][join]` (REG-06 HYG-02 gate).
@@ -224,7 +225,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 | 17. Sirius origin/dev Merge — Base Layer | v1.4 | 4/4 | Complete    | 2026-05-05 |
 | 18. DataBatch RAII Migration | v1.4 | 7/7 | Complete | 2026-05-05 |
 | 19. IO Framework Adoption | v1.4 | 5/6 | In Progress|  |
-| 20. Scan Manager + Pin Tables Port | v1.4 | 4/4 | Complete   | 2026-05-06 |
+| 20. Scan Manager + Pin Tables Port | v1.4 | 5/5 | Complete (PARTIAL — SM-06 SF1 escalated to Phase 21 REG-03; status human_needed) | 2026-05-06 |
 | 21. v1.4 Ship Gate | v1.4 | 0/? | Not started | - |
 
 ## Phase context

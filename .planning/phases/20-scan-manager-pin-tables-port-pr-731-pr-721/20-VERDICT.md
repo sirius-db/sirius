@@ -231,4 +231,30 @@ The Phase 20 ship-verdict is **PARTIAL**, not FAIL — five of six SM-XX require
 
 ---
 
+## SM-06 SF1 Escalated to Phase 21 REG-03 (plan 20-05)
+
+**Plan 20-05 outcome: PATH B — Escalation. STATUS: human_needed.**
+
+Plan 20-05 was a TIME-BOXED diagnose-fix-or-escalate cycle for the SM-06 SF1 component carryover (`[integration][TPC-H]` Q11 parquet num_gpus=2 `cudaErrorIllegalAddress`). The canonical compute-sanitizer with `--track-stream-ordered-races=all` revealed **21 stream-ordered race blocks** at HEAD, distributed across two clusters at library boundaries Phase 20 cannot trivially modify:
+
+- **Cluster A (5 of 21 races):** `cudf::io::parquet::detail::read_column_chunks_async` + `kvikio::detail::posix_device_io` — INSIDE cudf+kvikio. Sirius passes a single `stream` to `cudf::io::read_parquet`; the cross-stream gap opens inside cudf where it dispatches kvikio thread-pool reads on a different cudaStream than the rmm::device_buffer alloc stream. **Library boundary upstream of all Sirius/cucascade attachment points.**
+
+- **Cluster B (16 of 21 races):** `cucascade::(anonymous namespace)::alloc_and_peer_copy_async` host-staging fallback path — INSIDE cucascade pin `1c1e648`. The producer (`rmm::device_buffer` allocate_async) and consumer (`cudaMemcpyAsync` Device-to-Host for host-staging) are both inside this helper; the helper internally splits work across two streams without an event-wait. This is **race shape E (cucascade-internal lineage gap)** per plan 20-05 taxonomy → Path B (escalate).
+
+The Phase 13-04 entry-level `cudaStreamWaitEvent(target_stream, src.get_writer_event(), 0)` at the top of `convert_gpu_to_gpu` IS firing correctly (preserved through Phase 16 CC-03 re-attach). The 16 cluster-B races fire in the host-staging fallback path that was added POST-Phase 13 to handle broken consumer-hardware peer DMA — that path has its own per-column allocate-then-DtoH-copy structure NOT covered by Phase 13-04's entry-level wait-event.
+
+**Recommended fix (1.5-2.5 days):** cucascade fork+bump to fix `alloc_and_peer_copy_async` same-stream invariant + Sirius-side `cudaStreamSynchronize(stream)` workaround after `cudf::io::read_parquet` returns (cluster A). Full closure unblocks Phase 21 REG-03 ship-gate.
+
+**Authoritative artifacts:**
+- [`20-05-DIAGNOSIS.md`](20-05-DIAGNOSIS.md) — FIRST race fingerprint, race shape classification, hypothesis disposition, PATH: B marker, cluster A/B distribution analysis.
+- [`20-05-INVESTIGATION.md`](20-05-INVESTIGATION.md) — STATUS: human_needed; structural finding; recommended fix shape; estimated effort; carry-forward to Phase 21 REG-03; memory update recommendation.
+- [`20-05-RESULTS.md`](20-05-RESULTS.md) — `[mgpu]` 16/16 PASS continuity baseline (79091 assertions / 104.4s / exit 0); Phase 18..20 invariant gates green (DB-grep 4 legacy+comments; IO-15 0; SM-03 1; HYG-02 40); 0 lines source diff (Path B).
+
+**Phase 20 final verdict UNCHANGED at PARTIAL.** SM-06 SF1 component carries explicit `STATUS: human_needed` annotation; user decides between (a) absorb 1.5-2.5 days for cucascade fork+bump + sync workaround → SM-06 SF1 PASS, full Phase 20 closure, full Phase 21 unblock; (b) ship v1.4 with known limitation + carry SM-06 SF1 + Q11 num_gpus=2 parquet to v1.5; (c) implement alternative-path disable for v1.4 ship + revisit in v1.5.
+
+**Phase 21 REG-03 risk register update:** the structural finding is now documented (was speculative pre-20-05). Phase 21 REG-03 cannot pass cleanly until either path (a) lands or path (b)/(c) modifies REG-03 acceptance criteria.
+
+---
+
 *Verdict authored: 2026-05-06 by plan 20-04 Task 3 executor*
+*SM-06 SF1 carryover escalation appended: 2026-05-06 by plan 20-05 Task 4 executor*

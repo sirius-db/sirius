@@ -52,7 +52,7 @@
 - [x] **SM-03**: Phase 13 stream-lineage hooks (extracted in MERGE-03) re-attached. Either `parquet_split_provider::run_batch` records the writer_event when constructing the data_batch, or `sirius_gpu_parquet_scan_operator::execute` does so post-cudf-call. `cudaStreamWaitEvent` chain preserved on every cross-device peer copy. Documented in `20-STREAM-LINEAGE-REATTACH.md`.
 - [x] **SM-04**: Per-task filter translation under SCHED-RR works on the new architecture — `gpu_expression_translator(stream, cudf::get_current_device_resource_ref())` is called inside `cudaSetDevice` RAII at task execution time. Verify by running TPC-H Q1 SF10 num_gpus=2 with `[mgpu-probe]` traces showing filter expressions instantiated on the dispatch device.
 - [x] **SM-05**: `pin_table` single-GPU-resident behavior documented as a v1.4 limitation in `PROJECT.md` Deferred section. Follow-up requirement `PIN-MGPU-01` added to v1.5+ scope (multi-GPU-aware pinning).
-- [x] **SM-06**: SF10 smoke regression — TPC-H Q1, Q6, Q12 PASS at SF10 on `num_gpus: 2`. `[integration][TPC-H]` 48/48 PASS at SF1.
+- [x] **SM-06**: SF10 smoke regression — TPC-H Q1, Q6, Q12 PASS at SF10 on `num_gpus: 2` (3/3 PASS, 227 assertions, 12.01s — plan 20-04). `[integration][TPC-H]` 48/48 PASS at SF1 — **PARTIAL**: 21/22 ran, Q11 parquet num_gpus=2 FAILS with canonical follow-up #17 `cudaErrorIllegalAddress` at `cuda_stream_view.cpp:45`. Plan 20-05 PATH B escalation (status human_needed): structural finding at cucascade `alloc_and_peer_copy_async` host-staging fallback (16/21 races, race shape E) + cudf+kvikio internal `read_column_chunks_async` stream-ordering (5/21 races). Recommended fix 1.5-2.5 days (cucascade fork+bump for `alloc_and_peer_copy_async` same-stream invariant + Sirius `cudaStreamSynchronize` after `read_parquet`). Carryover to Phase 21 REG-03 explicit; ship-gate cannot pass without resolution OR explicit acceptance-criteria relaxation. See [`20-05-INVESTIGATION.md`](phases/20-scan-manager-pin-tables-port-pr-731-pr-721/20-05-INVESTIGATION.md).
 
 ### REG — v1.4 Ship Gate (Full v1.3 Gauntlet on Rebased Branch)
 
@@ -120,7 +120,7 @@
 | SM-03 | 20 | Complete |
 | SM-04 | 20 | Complete |
 | SM-05 | 20 | Complete |
-| SM-06 | 20 | Complete |
+| SM-06 | 20 | Complete (SF10 PASS; SF1 PARTIAL — Q11 parquet num_gpus=2 escalated to Phase 21 REG-03 via 20-05 PATH B; status human_needed) |
 | REG-01 | 21 | Pending |
 | REG-02 | 21 | Pending |
 | REG-03 | 21 | Pending |
