@@ -43,3 +43,8 @@ compile_commands.json
 AGENTS.md
 CLAUDE.local.md
 newplan.md
+runs/
+telemetry_data/
+log/
+
+.planning/

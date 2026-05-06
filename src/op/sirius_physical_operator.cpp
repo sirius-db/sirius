@@ -262,6 +262,7 @@ void sirius_physical_operator::push_data_batch(std::string_view port_id,
 
 void sirius_physical_operator::add_next_port_after_sink(next_port_info port_info)
 {
+  port_info.pseudo_sink_port_uuid = uuid::now_v7();
   next_port_after_sink.push_back(port_info);
 }
 

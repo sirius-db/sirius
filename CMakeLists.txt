@@ -134,6 +134,9 @@ if(VCPKG_BUILD AND TARGET CUDA::cudart_static)
   endforeach()
 endif()
 
+# Rust telemetry instrumentation (C++ FFI via Corrosion)
+add_subdirectory(rust/crates/telemetry/bridge)
+
 # cmake-format: off
 set(EXTENSION_SOURCES
     src/config.cpp
@@ -257,6 +260,7 @@ set(EXTENSION_SOURCES
     src/sirius_engine.cpp
     src/sirius_extension.cpp
     src/sirius_interface.cpp
+    src/telemetry/telemetry_context.cpp
     src/transparent/physical_sirius_execution.cpp
     src/transparent/sirius_optimizer_extension.cpp
     src/util/stream_check_wrapper.cpp
@@ -312,8 +316,14 @@ foreach(_target sirius_extension sirius_loadable_extension)
                                PRIVATE ${SIRIUS_LEGACY_COMPILE_DEFINITIONS})
   endif()
 
-  target_link_libraries(${_target} cudf::cudf rmm::rmm spdlog::spdlog
-                        cuCascade::cucascade yaml-cpp::yaml-cpp)
+  target_link_libraries(
+    ${_target}
+    cudf::cudf
+    rmm::rmm
+    spdlog::spdlog
+    cuCascade::cucascade
+    yaml-cpp::yaml-cpp
+    telemetry_bridge)
 
   add_dependencies(${_target} duckdb_static)
 endforeach()
@@ -325,9 +335,9 @@ target_link_libraries(sirius_extension PkgConfig::NUMA PkgConfig::LIBURING
 target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING)
 
 # Required by DuckDB's export set (duckdb_static -> sirius_extension ->
-# cucascade_static)
+# cucascade_static / telemetry_bridge)
 install(
-  TARGETS sirius_extension cucascade_static
+  TARGETS sirius_extension cucascade_static telemetry_bridge
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
