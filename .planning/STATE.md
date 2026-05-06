@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Rebase After DataBatch Changes
 status: executing
-stopped_at: Completed 20-01-PLAN.md (SM-01 Option A PASS, SM-03 PASS, SM-02 PARTIAL — handed to 20-02/20-04)
-last_updated: "2026-05-06T10:10:55.336Z"
+stopped_at: Completed 20-02-PLAN.md (SM-01 Option A doc + SM-03 Option B doc + SM-02 ownership doc + Open Q1 RETIRE + Pitfall 1 TODO cleanup)
+last_updated: "2026-05-06T11:05:57.468Z"
 last_activity: 2026-05-06
 progress:
   total_phases: 6
   completed_phases: 4
   total_plans: 26
-  completed_plans: 24
+  completed_plans: 25
 ---
 
 # Project State
@@ -25,7 +25,7 @@ See: .planning/PROJECT.md (updated 2026-05-04)
 ## Current Position
 
 Phase: 20 (Scan Manager + Pin Tables Port (PR #731 + #721)) — EXECUTING
-Plan: 2 of 4
+Plan: 3 of 4
 Status: Ready to execute
 Last activity: 2026-05-06
 
@@ -101,6 +101,7 @@ v1.4 Progress: [#############       ] 4/6 phases | 16/32 requirements | 22 plans
 | Phase 19 P06 | 36min | 2 tasks | 3 files |
 | Phase 20 P03 | 2min | 2 tasks | 2 files |
 | Phase 20 P01 | 6min | 3 tasks | 1 files |
+| Phase 20 P02 | 16min | 3 tasks | 6 files |
 
 ## Decisions
 
@@ -211,6 +212,11 @@ v1.4 Progress: [#############       ] 4/6 phases | 16/32 requirements | 22 plans
 - [Phase 20]: [20-01] SM-02 PARTIAL: AUDIT TEST_CASE FAILS at min_count REQUIRE line 262 (counts[1].pipeline_ids.size() == 0) — preempts disjointedness REQUIRE on line 289. Empirical scan_batch IS multi-GPU disjoint (GPU0=2, GPU1=1) — only test fixture's pipeline_task threshold is misaligned with post-#731 single-composite-gpu_pipeline_task pattern. Resolution path handed to 20-02 / 20-04.
 - [Phase 20]: [20-01] SM-03 PASS: writer_stream token survives at sirius_gpu_parquet_scan_operator.cpp:260 in canonical Phase 13-04 Path-2 comment block; the operative make_data_batch(table, mem_space, stream) call at line 263 records writer_event via cucascade::gpu_table_representation ctor.
 - [Phase 20]: [20-01] HYG-02 baseline preserved at 40 / 0 non-legacy; cucascade_datasource retirement (Phase 19-05) holds at 0 hits across src/ + test/.
+- [Phase 20]: [20-02] Open Q1 RETIRE: test_metadata_gpu_scan_operators.cpp deleted (referenced deleted sirius_parquet_metadata_scan_operator class at 14 sites per Pitfall 3 grep). v1.5+ opportunistic re-author against parquet_split_provider deferred.
+- [Phase 20]: [20-02] SM-01 Option A documented in 20-SCHED-RR-PORT.md (209 lines): no SCHED-RR port to parquet_split_provider; task_scheduler::management_eventloop:260 _no_pref_rr_counter is canonical RR site for GPU_PARQUET_SCAN source tasks; two RR counters at two layers would race / drift. Empirically gated by [mgpu_stress] 500-iter PASS @ 77053 assertions / 73.8s.
+- [Phase 20]: [20-02] SM-02 affinity map ownership documented in 20-SCHED-RR-PORT.md: lives at duckdb_scan_executor.cpp:154-164,213-222,259-262 (DuckDB-attach scan path). PR #731 did not touch this file. The misleading framing in REQUIREMENTS.md SM-02 is documentation drift per Pitfall 1; corrected here. SM-02 PARTIAL test-fixture mismatch handed to Phase 21+ / v1.5+ test-cleanup (NOT Phase 20 scope; underlying scan_batch disjointedness invariant holds).
+- [Phase 20]: [20-02] SM-03 Option B documented in 20-STREAM-LINEAGE-REATTACH.md (173 lines): stream-lineage re-attached at sirius_gpu_parquet_scan_operator.cpp:259 (post-edit; was 263 pre-edit) via 3-arg make_data_batch(table, mem_space, stream); cucascade ctor body auto-records writer_event when writer_stream non-default; no manual record_writer_event call needed. Phase 13-04 Path-2 carried forward through Phases 17/18/19/20.
+- [Phase 20]: [20-02] Pitfall 1 TODO cleanup: 3 misleading TODO blocks deleted (parquet_scan_operator_data.hpp:86 + 149-153 + sirius_gpu_parquet_scan_operator.cpp:173-176) referencing phantom _batch_gpu_affinity re-attach. SM-03 load-bearing block preserved (now lines 255-259, was 258-262 pre-edit; shifted up by 4 lines). Build clean (mcp exit 0, 27.5s); HYG-02 baseline preserved at 40 / 0 non-legacy; SM-03 grep gate non-zero (1 hit, line 256 post-edit).
 
 ## Accumulated Context
 
@@ -246,6 +252,6 @@ v1.4 Progress: [#############       ] 4/6 phases | 16/32 requirements | 22 plans
 
 ## Session Continuity
 
-Last session: 2026-05-06T10:10:55.333Z
-Stopped at: Completed 20-01-PLAN.md (SM-01 Option A PASS, SM-03 PASS, SM-02 PARTIAL — handed to 20-02/20-04)
+Last session: 2026-05-06T11:05:57.465Z
+Stopped at: Completed 20-02-PLAN.md (SM-01 Option A doc + SM-03 Option B doc + SM-02 ownership doc + Open Q1 RETIRE + Pitfall 1 TODO cleanup)
 Resume file: None
