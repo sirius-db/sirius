@@ -24,6 +24,17 @@
 #include "op/scan/scan_utils.hpp"
 #include "scan_manager/split_connector.hpp"
 
+// Phase 20.6 IO-MGPU-02: sirius IO framework includes. sirius_datasource
+// declares the per-ioctx datasource factory; uring_reactor pulls in the
+// concrete uring_io_object construction. uring_reactor MUST be included
+// last among sirius headers — liburing's BLOCK_SIZE macro collides with
+// blockingconcurrentqueue.h's static const BLOCK_SIZE member when both
+// transitively land in the same TU. Mirrors the working include ordering
+// in src/op/scan/parquet_scan_task.cpp:25-35 + sirius_context.cpp.
+#include <io/sirius_datasource.hpp>
+// (other sirius headers above already included)
+#include <io/uring/uring_reactor.hpp>
+
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
@@ -50,11 +61,13 @@ parquet_split_provider::parquet_split_provider(
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filter_set,
   duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
   std::size_t approximate_batch_size,
-  std::size_t max_file_processed)
+  std::size_t max_file_processed,
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs)
   : _file_paths(file_paths),
     _approximate_batch_size(approximate_batch_size),
     _max_file_processed(max_file_processed),
-    _total_files(file_paths.size())
+    _total_files(file_paths.size()),
+    _gpu_ioctxs(std::move(gpu_ioctxs))
 {
   // Any non-trivial scan shape — reader-side projection, filter pushdown, or hive-partition
   // injection — needs column names for reader set_column_names / AST name resolution /

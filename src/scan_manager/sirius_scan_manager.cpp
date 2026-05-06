@@ -42,12 +42,15 @@ sirius_scan_manager::sirius_scan_manager(exec::thread_pool_config config)
 
 sirius_scan_manager::~sirius_scan_manager() { stop(); }
 
-void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
+void sirius_scan_manager::prepare_for_query(
+  const sirius::planner::query& query,
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs)
 {
   reset();
 
-  SIRIUS_LOG_DEBUG("[sirius_scan_manager::prepare_for_query] pipelines={}",
-                   query.get_pipelines().size());
+  SIRIUS_LOG_DEBUG("[sirius_scan_manager::prepare_for_query] pipelines={} gpu_ioctxs={}",
+                   query.get_pipelines().size(),
+                   gpu_ioctxs.size());
 
   for (auto const& pipeline : query.get_pipelines()) {
     if (!pipeline) { continue; }
@@ -58,7 +61,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
     auto* op = &source->Cast<op::scan::sirius_gpu_parquet_scan_operator>();
     if (_providers_by_op.find(op) != _providers_by_op.end()) { continue; }
 
-    auto provider = create_provider_for(op);
+    auto provider = create_provider_for(op, gpu_ioctxs);
     if (!provider) {
       // No scan_info parked on the operator (e.g. tests construct the operator
       // directly). Skip — caller is responsible for the connector.
@@ -82,7 +85,8 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
 }
 
 std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
-  op::scan::sirius_gpu_parquet_scan_operator* op)
+  op::scan::sirius_gpu_parquet_scan_operator* op,
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs)
 {
   auto info = op->take_scan_info();
   if (!info) { return nullptr; }
@@ -180,15 +184,22 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
   } catch (...) {
     SIRIUS_LOG_TRACE("not all the columns are pinned for this query");
   }
-  auto provider = std::make_unique<parquet_split_provider>(info->returned_types,
-                                                           info->file_paths,
-                                                           info->column_ids,
-                                                           info->projection_ids,
-                                                           info->names,
-                                                           op->get_types().size(),
-                                                           std::move(info->table_filters),
-                                                           info->partition_indices,
-                                                           info->approximate_batch_size);
+  // Phase 20.6 IO-MGPU-02: forward gpu_ioctxs to parquet_split_provider so
+  // run_batch() can construct sirius_datasources via ioctx->make_datasource(io_object)
+  // instead of cudf::io::datasource::create (the latter routes through kvikio
+  // and bypasses Phase 19's io_uring + per-GPU CUDA-context binding).
+  auto provider = std::make_unique<parquet_split_provider>(
+    info->returned_types,
+    info->file_paths,
+    info->column_ids,
+    info->projection_ids,
+    info->names,
+    op->get_types().size(),
+    std::move(info->table_filters),
+    info->partition_indices,
+    info->approximate_batch_size,
+    parquet_split_provider::DEFAULT_MAX_FILE_PROCESSED,
+    gpu_ioctxs);
 
   if (auto inject_fn = provider->take_partition_inject_fn()) {
     op->set_partition_inject_fn(std::move(inject_fn));

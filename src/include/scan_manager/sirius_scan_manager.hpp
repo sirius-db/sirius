@@ -20,6 +20,10 @@
 #include "exec/thread_pool.hpp"
 #include "scan_manager/split_provider.hpp"
 
+// Phase 20.6 IO-MGPU-02: forward-declare sirius_ioctx via <io/types.hpp>
+// for the gpu_ioctxs map type used by prepare_for_query / create_provider_for.
+#include <io/types.hpp>
+
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
 
@@ -99,7 +103,19 @@ class sirius_scan_manager {
   /// gpu scan operators) block in split_connector::get_next_split until splits
   /// arrive or the connector is closed, so no separate wake-up channel is
   /// needed.
-  void prepare_for_query(const sirius::planner::query& query);
+  ///
+  /// @param query        The query whose scan operators must be prepared.
+  /// @param gpu_ioctxs   Per-GPU sirius_ioctx instances (Phase 20.6 IO-MGPU-02).
+  ///                     Forwarded to parquet_split_provider so that footer
+  ///                     metadata reads route through io_uring instead of
+  ///                     cudf's bundled kvikio path. Empty map is permitted
+  ///                     for callers (test harnesses) that pre-populate
+  ///                     scan_info another way; production callers
+  ///                     (SiriusContext::create_query) MUST pass the map
+  ///                     from SiriusContext::get_gpu_ioctxs().
+  void prepare_for_query(
+    const sirius::planner::query& query,
+    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs = {});
 
   /// \brief Clear the providers map and join the driver thread if it is
   ///        still running.
@@ -144,8 +160,13 @@ class sirius_scan_manager {
   /// \brief Build a split_provider for @p op by reading its parquet scan_info
   ///        and installing the resulting hive-partition inject_fn (if any) on
   ///        the operator.
+  ///
+  /// @param op           The parquet scan operator.
+  /// @param gpu_ioctxs   Per-GPU sirius_ioctx map forwarded to
+  ///                     parquet_split_provider (Phase 20.6 IO-MGPU-02).
   std::unique_ptr<split_provider> create_provider_for(
-    op::scan::sirius_gpu_parquet_scan_operator* op);
+    op::scan::sirius_gpu_parquet_scan_operator* op,
+    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs);
 
   /// \brief Run providers sequentially: start each, wait on its future, advance.
   void run_driver_loop();

@@ -635,7 +635,10 @@ void SiriusContext::create_query(
   query_ = duckdb::make_shared_ptr<sirius::planner::query>(std::move(pipelines));
   task_scheduler_->prepare_for_query(query_);
   task_creator_->prepare_for_query(*query_);
-  scan_manager_->prepare_for_query(*query_);
+  // Phase 20.6 IO-MGPU-02: pass per-GPU sirius_ioctx map to scan_manager so
+  // parquet_split_provider can construct sirius_datasources via
+  // ioctx->make_datasource(io_object) instead of cudf::io::datasource::create.
+  scan_manager_->prepare_for_query(*query_, gpu_ioctxs_);
 }
 
 duckdb::shared_ptr<sirius::planner::query> SiriusContext::get_query()
