@@ -192,6 +192,9 @@ jobs:
     needs: build-cuda-12
     if: needs.build-cuda-12.result == 'success'
     timeout-minutes: 60
+    env:
+      CUDA_CACHE_PATH: /home/runner/actions-runner/_work/.cuda-cache
+      SIRIUS_LOG_LEVEL: trace
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
