@@ -104,11 +104,12 @@ jobs:
             ${{ matrix.cudf-channel == 'nightly' && 'nightly-runner'
               || matrix.environment }}
 
-      - name: Configure sccache backend
+      - name: Configure cache backends
         run: |
           if [[ -n "${SCCACHE_BUCKET}" ]]; then
-            echo "SCCACHE_BUCKET DEFINED -> Self Hosted Runner, Disable GHA sccache"
+            echo "SCCACHE_BUCKET DEFINED -> Self Hosted Runner, Disable GHA sccache, use S3 vcpkg cache"
             echo "SCCACHE_GHA_ENABLED=false" >> $GITHUB_ENV
+            echo "VCPKG_BINARY_SOURCES=clear;x-aws,s3://${SCCACHE_BUCKET}/vcpkg/,readwrite" >> $GITHUB_ENV
           else
             echo "SCCACHE_BUCKET UNDEFINED -> GitHub Runner, Enable GHA sccache"
             echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
