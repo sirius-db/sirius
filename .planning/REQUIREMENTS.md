@@ -96,7 +96,7 @@
 | **Upstream cucascade PRs for the 11 local fixes** | Decided 2026-05-04 — carry local pin this milestone; revisit upstreaming later. Captured as `CC-UPSTREAM-01` in Future. |
 | **Multi-GPU-aware pin_table placement** | PR #721 is single-GPU-resident by design. Pinned splits go to GPU 0 in v1.4; multi-GPU pinning is `PIN-MGPU-01` in v1.5+. |
 | **`cucascade_datasource` coexistence with `sirius_datasource`** | Decided 2026-05-04 — retire `cucascade_datasource` entirely (it was a v1.1 stopgap to dodge kvikio's CUDA-context binding). Replaced by multi-GPU-adapted `sirius_datasource`. |
-| **Bisecting which dev commit causes any v1.3 regression** | Light gates per phase + full gauntlet at Phase 21. If a regression appears at Phase 21, bisect happens reactively, not pre-emptively per commit. |
+| **Bisecting which dev commit causes any v1.3 regression** | Light gates per phase + full gauntlet at Phase 21. If a regression appears at Phase 21, bisect happens reactively, not preemptively per commit. |
 | **Re-running v1.3 ship-gate at every phase boundary** | Per scoping decision 2026-05-04 — light gates per phase 16-20, full gauntlet at Phase 21 only. Trade-off: faster iteration; defers heavy validation until rebase complete. |
 | **Cucascade `idisk_io_backend` file-handle cache** | Long-standing pitfall (v1.1 P1); not triggered by v1.4 work. Continue to defer. |
 | **`cudaDeviceDisablePeerAccess` on explicit teardown** | Same as v1.2 — process-exit cleanup is adequate. |
