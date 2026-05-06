@@ -39,6 +39,8 @@
 #include <cucascade/data/io_backend_registry.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
+#include <io/types.hpp>
+#include <io/uring/uring_ioctx.hpp>
 #include <duckdb/common/allocator.hpp>
 #include <duckdb/execution/physical_plan_generator.hpp>
 #include <spdlog/sinks/basic_file_sink.h>
@@ -293,6 +295,53 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     }
   }
 
+  // === Phase 19 IO-13: per-GPU sirius_ioctx ===
+  // Hosted alongside gpu_io_backends_ during the migration. Plan 19-05 will
+  // retire the cucascade map (and remove this comment marker). Each
+  // uring_ioctx ctor allocates pinned bounce slots via cudaHostAlloc with
+  // cudaHostAllocPortable bound to the current CUDA context, so the
+  // rmm::cuda_set_device_raii guard is mandatory (P4). Each ioctx also
+  // owns its own admission_control instance — the default ctor of
+  // uring_ioctx → templated_ioctx<uring_reactor> wires this up per-instance,
+  // which satisfies P5 mitigation (per-GPU admission budget; never shared).
+  {
+    auto gpu_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+    gpu_ioctxs_.reserve(gpu_spaces.size());
+    for (auto* gpu_space : gpu_spaces) {
+      auto const device_id = gpu_space->get_device_id();
+      rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{device_id}};
+
+      // Defaults match src/include/io/uring/uring_ioctx.hpp:85-88:
+      //   host_ring_depth=16, ring_entries=64, n_reactors=4,
+      //   bounce_slot_size=sirius::io::CHUNK_SIZE (1 MiB).
+      // Phase 19 RESEARCH.md Pattern 1: uring_ioctx ctor allocates
+      // 32 × 1 MiB pinned bounce slots per reactor via cudaHostAlloc bound
+      // to current context — RAII required.
+      //
+      // RESEARCH.md Open Q2: do NOT call ioctx->initialize_cache() in
+      // Phase 19. sirius_datasource device_read falls through to
+      // device_read_io when _cache==nullptr (sirius_datasource.cpp:122-128).
+      // v1.1 baseline correctness is feasible without the cache; cache
+      // enablement deferred to Phase 20+ per CONTEXT.md.
+      auto ioctx = std::make_shared<sirius::io::uring_ioctx>(
+        /*host_ring_depth=*/16u,
+        /*ring_entries=*/64u,
+        /*n_reactors=*/static_cast<size_t>(4),
+        /*bounce_slot_size=*/sirius::io::CHUNK_SIZE);
+
+      // IO-13 audit: log the device_id we targeted and the actual current
+      // device at the moment the ioctx was created. These should match
+      // (mirror of the cucascade-backend audit above).
+      int readback = -1;
+      cudaGetDevice(&readback);
+      spdlog::info("SiriusContext: sirius_ioctx created for GPU {} (cudaGetDevice readback={})",
+                   device_id,
+                   readback);
+
+      gpu_ioctxs_[device_id] = std::move(ioctx);
+    }
+  }
+
   // ---- MGPU-06: Enable P2P peer access for every available GPU pair ----
   // cucascade::convert_gpu_to_gpu at cucascade/src/data/representation_converter.cpp:173
   // already calls cudaMemcpyPeerAsync on every GPU->GPU conversion. For that
@@ -476,6 +525,13 @@ void SiriusContext::terminate()
   // cudaEventDestroy) runs against a still-live CUDA context. Mirrors
   // the downgrade_executors_ teardown order above.
   gpu_io_backends_.clear();
+  // Phase 19 IO-13: tear down per-GPU sirius_ioctx instances BEFORE
+  // memory_manager_->shutdown() (Pitfall 3). Each ~uring_ioctx joins its
+  // reactor worker thread and frees pinned bounce slots via cudaFreeHost,
+  // which requires the CUDA context to still be live. The cudaDeviceSynchronize
+  // call further down already drains any pending async copies before pinned
+  // slabs are freed by memory_manager_.
+  gpu_ioctxs_.clear();
   // MGPU-06: clear peer-access cache. No cudaDeviceDisablePeerAccess call --
   // CUDA cleans up peer-access mappings at process exit, and explicit disable
   // during shutdown risks tearing down mappings the memory_manager_ teardown
@@ -528,6 +584,18 @@ std::shared_ptr<cucascade::idisk_io_backend> SiriusContext::get_io_backend_for(i
   if (it == gpu_io_backends_.end()) {
     throw std::out_of_range(
       "SiriusContext::get_io_backend_for: no io_backend registered for device_id=" +
+      std::to_string(device_id));
+  }
+  return it->second;
+}
+
+std::shared_ptr<sirius::io::sirius_ioctx> SiriusContext::get_ioctx_for(int device_id) const
+{
+  throw_if_not_initialized();
+  auto it = gpu_ioctxs_.find(device_id);
+  if (it == gpu_ioctxs_.end()) {
+    throw std::out_of_range(
+      "SiriusContext::get_ioctx_for: no sirius_ioctx registered for device_id=" +
       std::to_string(device_id));
   }
   return it->second;
