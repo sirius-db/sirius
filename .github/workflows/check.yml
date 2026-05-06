@@ -130,6 +130,23 @@ jobs:
           pixi run -e vcpkg cmake -S duckdb --preset vcpkg-release
           pixi run -e vcpkg cmake --build build/vcpkg-release --target duckdb duckdb_local_extension_repo sirius_unittest
 
+      - name: vcpkg cache summary
+        if: matrix.environment == 'vcpkg' && always()
+        run: |
+          LOG="build/vcpkg-release/vcpkg-manifest-install.log"
+          [ -f "$LOG" ] || exit 0
+          RESTORED=$(grep -oP 'Restored \K\d+(?= package)' "$LOG" | paste -sd+ | bc 2>/dev/null || echo 0)
+          TOTAL=$(grep -oP 'Installing \d+/\K\d+' "$LOG" | tail -1)
+          BUILT=$((${TOTAL:-0} - ${RESTORED:-0}))
+          {
+            echo "## vcpkg Binary Cache (S3)"
+            echo "| | Count |"
+            echo "|---|---|"
+            echo "| Restored from S3 | **${RESTORED}** |"
+            echo "| Built from source | **${BUILT}** |"
+            echo "| Total packages | **${TOTAL:-?}** |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   check:
     runs-on: ubuntu-slim
     needs: [lint, build]
