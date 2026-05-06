@@ -246,12 +246,51 @@ __global__ void kernel_decode_rle(rle_chunk_desc const* __restrict__ descs,
   T const* values         = reinterpret_cast<T const*>(desc.d_values);
   uint32_t const lr_start = desc.local_row_start;
 
-  // ec is ≤ RLE_BUILD_MAX_ENTRIES = RLE_SMEM_MAX_ENTRIES, so cumsum fits.
   extern __shared__ uint32_t s_cumsum[];
   for (uint32_t i = threadIdx.x; i < ec; i += blockDim.x) {
     s_cumsum[i] = desc.d_cumsum[i];
   }
   __syncthreads();
+
+  // Long-run fast path: when the segment's average run length is at least a
+  // warp-width, lane 0 searches once per warp and broadcasts. Skipping this
+  // for short-run shapes — the bound check fails almost every iteration
+  // and the lane-0 search becomes pure overhead.
+  bool const long_runs_heuristic =
+    rc / 32u >= ec || (rc >= ec && (rc / ec) >= 32u);
+  uint32_t const lane = threadIdx.x & 31u;
+
+  if (long_runs_heuristic) {
+#pragma unroll
+    for (uint32_t v = 0; v < VPT; ++v) {
+      uint32_t const i = v * blockDim.x + threadIdx.x;
+      if (i >= rc) break;
+      uint32_t const warp_first = lr_start + (i & ~31u);
+
+      uint32_t entry_warp = 0;
+      if (lane == 0) {
+        entry_warp = rle_upper_bound(s_cumsum, ec, warp_first);
+        if (entry_warp >= ec) entry_warp = ec - 1;
+      }
+      entry_warp = __shfl_sync(0xFFFFFFFFu, entry_warp, 0);
+
+      uint32_t cumsum_at_entry = 0;
+      if (lane == 0) cumsum_at_entry = s_cumsum[entry_warp];
+      cumsum_at_entry = __shfl_sync(0xFFFFFFFFu, cumsum_at_entry, 0);
+
+      uint32_t const warp_last = warp_first + 31u;
+
+      if (warp_last < cumsum_at_entry) {
+        __stwt(out_chunk + i, __ldg(values + entry_warp));
+      } else {
+        uint32_t const local_row = lr_start + i;
+        uint32_t entry = rle_upper_bound(s_cumsum, ec, local_row);
+        if (entry >= ec) entry = ec - 1;
+        __stwt(out_chunk + i, __ldg(values + entry));
+      }
+    }
+    return;
+  }
 
 #pragma unroll
   for (uint32_t v = 0; v < VPT; ++v) {
@@ -262,6 +301,7 @@ __global__ void kernel_decode_rle(rle_chunk_desc const* __restrict__ descs,
     if (entry >= ec) entry = ec - 1;
     __stwt(out_chunk + i, __ldg(values + entry));
   }
+  (void)lane;
 }
 
 }  // anonymous namespace
