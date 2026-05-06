@@ -31,8 +31,11 @@ namespace sirius::io {
  *     @c ":port" (e.g. `bucket:9000`). Empty for schemes without an authority
  *     (the `file` scheme and bare absolute paths).
  *   - @c path is percent-decoded. For object-store schemes (s3/gs/azure) it
- *     has no leading slash and is the bare object key. For the `file` scheme
- *     it keeps its leading `/`.
+ *     is the object key after stripping exactly one bucket/key separator
+ *     slash; further leading slashes are part of the key per S3 REST
+ *     semantics (e.g. `s3://b/k` -> `k`, `s3://b//k` -> `/k`,
+ *     `s3://b///k` -> `//k`). For the `file` scheme it keeps its leading
+ *     `/`.
  *   - @c query holds percent-decoded values. Duplicate keys are last-wins
  *     (unordered_map cannot represent multi-values; matches AWS SDK behavior).
  */
@@ -52,7 +55,9 @@ struct parsed_uri {
  *   - `file:///abs/path`, bare absolute `/abs/path`
  *   - Uppercase schemes (normalized to lowercase)
  *   - Fragments (`#...`) are silently stripped
- *   - Double-slashes after the authority collapse (`s3://b//k` -> key `k`)
+ *   - Exactly one bucket/key separator slash is consumed; any further
+ *     leading slashes survive into the key (`s3://b/k` -> `k`;
+ *     `s3://b//k` -> `/k`; `s3://b///k` -> `//k`)
  *
  * @throw std::invalid_argument on:
  *   - empty URI

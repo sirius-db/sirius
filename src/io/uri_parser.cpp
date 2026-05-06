@@ -185,13 +185,20 @@ parsed_uri parse(std::string_view uri)
     // change the authority/path boundary after parsing.
     out.host = std::string{host_sv};
 
-    // Collapse any run of leading slashes to 0 slashes.
-    // Why: s3://bucket/key and s3://bucket//key must both yield key="key";
-    // object stores treat them as identical.
-    std::size_t i = 0;
-    while (i < key_sv.size() && key_sv[i] == '/')
-      ++i;
-    key_sv.remove_prefix(i);
+    // Strip the single bucket/key separator slash. Any further leading
+    // slashes are part of the object key — under S3 REST semantics the URL
+    // path "/<bucket>//foo" yields key="/foo", distinct from "/<bucket>/foo"
+    // (key="foo"). Examples after this step:
+    //   s3://bucket/key       -> key
+    //   s3://bucket//key      -> /key
+    //   s3://bucket///key     -> //key
+    //   s3://bucket/a//b      -> a//b   (interior runs already preserved)
+    //   s3://bucket/          -> throws (empty key after stripping separator)
+    // The broader S3 URL surface (region-specific endpoints, virtual-hosted
+    // vs path-style, dual-stack, accelerate, etc.) is intentionally not
+    // modeled by this parser; providing a canonical URI is the caller's
+    // responsibility.
+    if (!key_sv.empty() && key_sv.front() == '/') key_sv.remove_prefix(1);
     if (key_sv.empty()) fail("empty object key", uri);
     out.path = percent_decode(key_sv, uri);
   }

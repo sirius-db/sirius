@@ -21,10 +21,29 @@
 
 #include <cudf/io/datasource.hpp>
 
+#include <cctype>
 #include <stdexcept>
 #include <utility>
 
 namespace sirius::io {
+
+namespace {
+
+// RFC 3986 §3.1: schemes are case-insensitive. uri_parser lowercases the
+// parsed scheme on the read side; registry must normalize the same way on
+// the write side so callers don't need to remember which side does it. Used
+// by both register_ioctx and lookup so a register("S3", ...) is found by a
+// lookup("s3"), and vice versa.
+std::string to_lower_scheme(std::string_view s)
+{
+  std::string out;
+  out.reserve(s.size());
+  for (char c : s)
+    out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+  return out;
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // datasource_registry
@@ -34,6 +53,7 @@ void datasource_registry::register_ioctx(std::string scheme, std::shared_ptr<sir
 {
   if (scheme.empty()) throw std::invalid_argument("datasource_registry: empty scheme");
   if (!ioctx) throw std::invalid_argument("datasource_registry: null ioctx for '" + scheme + "'");
+  scheme = to_lower_scheme(scheme);
   std::unique_lock lk{_mtx};
   _ioctxs[std::move(scheme)] = std::move(ioctx);
 }
@@ -41,7 +61,7 @@ void datasource_registry::register_ioctx(std::string scheme, std::shared_ptr<sir
 std::shared_ptr<sirius_ioctx> datasource_registry::lookup(std::string_view scheme) const
 {
   std::shared_lock lk{_mtx};
-  auto it = _ioctxs.find(std::string{scheme});
+  auto it = _ioctxs.find(to_lower_scheme(scheme));
   return it == _ioctxs.end() ? nullptr : it->second;
 }
 

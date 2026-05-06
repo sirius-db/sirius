@@ -199,6 +199,27 @@ TEST_CASE("datasource_registry supports register lookup replace and clear", "[da
   CHECK(reg.lookup("s3") == nullptr);
 }
 
+TEST_CASE("datasource_registry scheme matching is case-insensitive", "[datasource_factory]")
+{
+  datasource_registry reg;
+  auto ctx         = std::make_shared<mock_ioctx>();
+  auto replacement = std::make_shared<mock_ioctx>();
+
+  reg.register_ioctx("S3", ctx);
+  REQUIRE(reg.lookup("s3") != nullptr);
+  CHECK(reg.lookup("s3").get() == ctx.get());
+  REQUIRE(reg.lookup("S3") != nullptr);
+  CHECK(reg.lookup("S3").get() == ctx.get());
+
+  reg.register_ioctx("s3", replacement);
+  REQUIRE(reg.lookup("S3") != nullptr);
+  CHECK(reg.lookup("S3").get() == replacement.get());
+
+  auto schemes = reg.schemes();
+  REQUIRE(schemes.size() == 1);
+  CHECK(schemes.front() == "s3");
+}
+
 TEST_CASE("datasource_registry rejects invalid registrations", "[datasource_factory]")
 {
   datasource_registry reg;
@@ -280,6 +301,26 @@ TEST_CASE("datasource_factory object-store schemes require registered backend",
                   std::runtime_error);
   CHECK_THROWS_AS(datasource_factory::create_for_parquet_scan("s3://bucket/key.parquet", reg, cfg),
                   std::runtime_error);
+}
+
+TEST_CASE("datasource_factory dispatches mixed-case scheme through registry",
+          "[datasource_factory]")
+{
+  datasource_registry reg;
+  sirius_config cfg;
+  auto ctx = std::make_shared<mock_ioctx>();
+  reg.register_ioctx("s3", ctx);
+
+  try {
+    (void)datasource_factory::create("S3://bucket/key.parquet", reg, cfg);
+    FAIL("expected object-store construction to be deferred");
+  } catch (std::runtime_error const& e) {
+    std::string msg = e.what();
+    CHECK(msg.find("object construction is not yet implemented") != std::string::npos);
+    CHECK(msg.find("no backend registered") == std::string::npos);
+  }
+
+  CHECK(ctx->make_datasource_calls == 0);
 }
 
 TEST_CASE("datasource_factory PR1 does not construct object-store datasources",

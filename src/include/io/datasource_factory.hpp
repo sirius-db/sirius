@@ -42,6 +42,12 @@ namespace sirius::io {
  * @c sirius_ioctx per backend (uring / gds / s3 / rdma_s3). The factory looks
  * up the correct backend by URI scheme at datasource-creation time.
  *
+ * Scheme matching is case-insensitive: @c register_ioctx and @c lookup both
+ * lowercase the scheme before storing / searching, matching the
+ * normalization done by @c sirius::io::parse (RFC 3986 §3.1). Callers may
+ * register / look up with any casing — @c register_ioctx("S3", ...) and
+ * @c lookup("s3") refer to the same entry.
+ *
  * All operations are safe under concurrent reads; mutations take an exclusive
  * lock but are expected only at engine bootstrap / shutdown.
  */
@@ -55,11 +61,18 @@ class datasource_registry {
   /**
    * @brief Register an ioctx for a scheme. Replaces any prior registration
    *        for the same scheme.
+   *
+   * The scheme is lowercased before storage; subsequent @c lookup calls
+   * with any casing of the same scheme resolve to this entry.
    */
   void register_ioctx(std::string scheme, std::shared_ptr<sirius_ioctx> ioctx);
 
   /**
    * @brief Look up the ioctx registered for @p scheme.
+   *
+   * The scheme is lowercased before lookup; @c lookup("S3") and
+   * @c lookup("s3") resolve to the same entry.
+   *
    * @return The ioctx, or @c nullptr if no backend is registered for @p scheme.
    */
   [[nodiscard]] std::shared_ptr<sirius_ioctx> lookup(std::string_view scheme) const;
@@ -177,13 +190,16 @@ class datasource_factory {
   /**
    * @brief Extract the path portion of @p uri. Thin shim over
    *        @c sirius::io::parse; returns the parser's @c path field
-   *        (percent-decoded, no host, no leading slash for object-store
-   *        schemes; leading slash retained for @c file).
+   *        (percent-decoded, no host, exactly one bucket/key separator
+   *        slash stripped for object-store schemes; leading slash retained
+   *        for @c file).
    *
    * Examples:
    *   - @c "/data/f.parquet"          -> @c "/data/f.parquet"
    *   - @c "file:///data/f.parquet"   -> @c "/data/f.parquet"
    *   - @c "s3://bucket/key"          -> @c "key"
+   *   - @c "s3://bucket//key"         -> @c "/key"
+   *   - @c "s3://bucket///key"        -> @c "//key"
    *
    * Throws on relative paths, empty keys, malformed URIs.
    */

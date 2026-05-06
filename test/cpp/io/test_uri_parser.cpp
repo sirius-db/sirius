@@ -49,9 +49,20 @@ TEST_CASE("uri_parser parses object-store URIs", "[uri_parser]")
 
   CHECK(parsed.scheme == "s3");
   CHECK(parsed.host == "bucket-name");
-  CHECK(parsed.path == "path/to/object one.parquet");
+  CHECK(parsed.path == "/path/to/object one.parquet");
   REQUIRE(parsed.query.size() == 1);
   CHECK(parsed.query.at("region") == "us-west-2");
+}
+
+TEST_CASE("uri_parser preserves S3 leading slashes in object key", "[uri_parser]")
+{
+  CHECK(parse("s3://bucket/key").path == "key");
+  CHECK(parse("s3://bucket//key").path == "/key");
+  CHECK(parse("s3://bucket///key").path == "//key");
+  CHECK(parse("s3://bucket/a//b").path == "a//b");
+
+  CHECK_THROWS_AS(parse("s3://bucket"), std::invalid_argument);
+  CHECK_THROWS_AS(parse("s3://bucket/"), std::invalid_argument);
 }
 
 TEST_CASE("uri_parser accepts project-internal schemes", "[uri_parser]")
