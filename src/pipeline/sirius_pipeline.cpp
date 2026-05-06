@@ -299,6 +299,13 @@ void sirius_pipeline::notify_downstream_pipelines()
 
 void sirius_pipeline::update_pipeline_status()
 {
+  SIRIUS_LOG_TRACE(
+    "update_pipeline_status: pipeline_id={}, source={}, sink={}, already_finished={}",
+    pipeline_id,
+    source ? source->get_name() : "?",
+    sink ? sink->get_name() : "?",
+    pipeline_finished.load());
+
   auto end_nvtx_range_if_finished = [this]() {
     if (pipeline_finished.load() && _nvtx_range_started.load()) {
       nvtxRangeEnd(_nvtx_pipeline_range_id);
@@ -312,6 +319,9 @@ void sirius_pipeline::update_pipeline_status()
     auto& table_scan = get_source()->Cast<op::sirius_physical_duckdb_scan>();
     if (table_scan.exhausted) {  // WSM amin TODO: can we use exhausted? how about we use
                                  // get_next_task_hint() to check if the source is ready?
+      SIRIUS_LOG_TRACE(
+        "update_pipeline_status: pipeline_id={} set to completed (DUCKDB_SCAN exhausted)",
+        pipeline_id);
       pipeline_finished.store(true);
       end_nvtx_range_if_finished();
       notify_downstream_pipelines();
@@ -321,6 +331,12 @@ void sirius_pipeline::update_pipeline_status()
     auto& cpu_source = get_source()->Cast<op::sirius_physical_cpu_source>();
     if (cpu_source.exhausted.load()) {
       if (tasks_created.load() == tasks_completed.load()) {
+        SIRIUS_LOG_TRACE(
+          "update_pipeline_status: pipeline_id={} set to completed (CPU_SOURCE exhausted, "
+          "tasks_created={}, tasks_completed={})",
+          pipeline_id,
+          tasks_created.load(),
+          tasks_completed.load());
         pipeline_finished = true;
         notify_downstream_pipelines();
       }
@@ -343,6 +359,13 @@ void sirius_pipeline::update_pipeline_status()
     if (limit_exhausted ||
         (first_node->is_source_pipeline_finished() && first_node->all_ports_empty())) {
       if (tasks_created.load() == tasks_completed.load()) {
+        SIRIUS_LOG_TRACE(
+          "update_pipeline_status: pipeline_id={} set to completed (limit_exhausted={}, "
+          "tasks_created={}, tasks_completed={})",
+          pipeline_id,
+          limit_exhausted,
+          tasks_created.load(),
+          tasks_completed.load());
         pipeline_finished.store(true);
         for (auto& op : get_operators()) {
           op.get().finalize_operator();

@@ -357,6 +357,11 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     throw std::runtime_error("gpu_pipeline_task::execute: input_data is null");
   }
 
+  SIRIUS_LOG_TRACE("Pipeline {}: prepare_for_processing starting for operator {} (id={}) [{}]",
+                   pipeline->get_pipeline_id(),
+                   first_op.get_name(),
+                   first_op.get_operator_id(),
+                   op_chain);
   try {
     local_state._input_data->prepare_for_processing(requested_memory_space, stream);
   } catch (const rmm::out_of_memory& oom) {
@@ -381,11 +386,13 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   auto const prepare_end = std::chrono::high_resolution_clock::now();
   auto const prepare_duration =
     std::chrono::duration_cast<std::chrono::microseconds>(prepare_end - prepare_start);
-  SIRIUS_LOG_TRACE("Pipeline {}: operator {} (id={}) prepare execution time: {:.2f} ms",
-                   pipeline->get_pipeline_id(),
-                   first_op.get_name(),
-                   first_op.get_operator_id(),
-                   prepare_duration.count() / 1000.0);
+  SIRIUS_LOG_TRACE(
+    "Pipeline {}: prepare_for_processing completed for operator {} (id={}) [{}] in {:.2f} ms",
+    pipeline->get_pipeline_id(),
+    first_op.get_name(),
+    first_op.get_operator_id(),
+    op_chain,
+    prepare_duration.count() / 1000.0);
 
   // All input batches are now locked for reading via _read_only_data_batches inside
   // local_state._input_data. The locks are released when the pipelineable_operator_data
