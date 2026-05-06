@@ -20,8 +20,11 @@
 #include <spdlog/spdlog.h>
 #include <sys/stat.h>
 
+#include <rmm/cuda_device.hpp>
+
 #include <algorithm>
 #include <deque>
+#include <optional>
 #include <ranges>
 #include <stdexcept>
 
@@ -273,7 +276,13 @@ void uring_reactor::worker_loop()
           size_t actual = rd > req.data_off ? std::min(req.data_size, rd - req.data_off) : 0;
           if (actual > 0 && !req.ctx->failed.load(std::memory_order_relaxed)) {
             _bounce[si].cuda_done.store(false, std::memory_order_relaxed);
-            if (req.device_id >= 0) cudaSetDevice(req.device_id);
+            // Scoped RAII guard restores the prior current device on scope exit
+            // (HYG-02 / IO-16). The `>= 0` guard is preserved so the
+            // single-GPU fast-path (device_id < 0 sentinel) is unchanged.
+            std::optional<rmm::cuda_set_device_raii> dev_guard;
+            if (req.device_id >= 0) {
+              dev_guard.emplace(rmm::cuda_device_id{req.device_id});
+            }
             cudaMemcpyAsync(req.dst,
                             (uint8_t*)_bounce[si].buf.get() + req.data_off,
                             actual,
