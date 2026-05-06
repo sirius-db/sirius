@@ -1,11 +1,11 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.4
-milestone_name: Rebase After DataBatch Changes
-status: complete
-stopped_at: "Completed 21-01-PLAN.md (v1.4 ship gate, all REG-01..06 PASS). v1.4 milestone shipped."
-last_updated: "2026-05-06T19:30:00.000Z"
-last_activity: 2026-05-06 -- Phase 21 v1.4 ship gate PASSED; milestone shipped
+milestone: v1.3
+milestone_name: Gauntlet on Rebased Branch)
+status: completed
+stopped_at: Completed 21-01-PLAN.md (v1.4 ship gate, all REG-01..06 PASS). v1.4 milestone shipped.
+last_updated: "2026-05-06T19:31:53.925Z"
+last_activity: 2026-05-06
 progress:
   total_phases: 6
   completed_phases: 6
@@ -27,7 +27,7 @@ See: .planning/PROJECT.md (updated 2026-05-04)
 Phase: 21 (v1.4 Ship Gate (Full v1.3 Gauntlet on Rebased Branch)) — COMPLETE
 Plan: 1 of 1 (COMPLETE)
 Status: v1.4 SHIPPED — all 32 requirements (CC-01..04 + MERGE-01..05 + DB-01..05 + IO-12..17 + IO-15B + SM-01..06 + REG-01..06) Complete
-Last activity: 2026-05-06 -- Phase 21 v1.4 ship gate PASSED; milestone shipped
+Last activity: 2026-05-06
 
 ```
 v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans | SHIPPED 2026-05-06

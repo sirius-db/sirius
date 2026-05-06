@@ -1,5 +1,42 @@
 # Milestones
 
+## v1.4 Rebase After DataBatch Changes (Shipped: 2026-05-06)
+
+**Phases completed:** 6 phases, 29 plans, 73 tasks
+
+**Key accomplishments:**
+
+- 11 local cucascade commits squashed to 4 logical group commits on edd6f03 via scripted non-interactive rebase, with named refs and audit trail for downstream 16-02..16-05 conflict-resolution plans
+- Groups 1 (memory hygiene) and 3 (io_worker member-order) cherry-picked onto cucascade origin/main tip 73d00c4 — 3 conflicts resolved (common.cpp, memory_space.cpp, pipeline_io_backend.cpp), 4 non-conflict files auto-applied, and io_worker _thread confirmed last-declared member with MUST-be-last inline comment
+- Group 2 cherry-picked onto phase16-rebase-wip: P2P probe block in common.cpp, target-bound stream in 4 converter construction sites, probe_peer_dma_works routing in alloc_and_peer_copy_async — provisional state (build NOT clean; 16-04 finalizes header)
+- RAII-aware re-implementation of gpu_table_representation writer_stream/writer_event API on top of #117 variant model, with cudaStreamWaitEvent in convert_gpu_to_gpu and read_only_data_batch::get_writer_event() proxy — all 12+ ctor sites compile-clean
+- Cucascade ctest 100% PASS (13.91s) + all 8 grep gates green + submodule pin confirmed at 1c1e648 (4 group commits above 73d00c4) — Phase 16 ship gate closed
+- 1. [Rule 1 - Adaptation] cucascade conflict auto-resolved by git
+- 79 auto-merged files audited (FSM green, HYG-02 delta=0 in src/), SCHED-RR machinery intact, and 63 expected build errors fully classified as Phase 18 DB-02/DB-03 RAII migration scope with 0 unrelated errors (MERGE-05 PASS)
+- All 6 D-G verification gates PASS; all 5 MERGE-XX requirements satisfied; Phase 17 Final Verdict: PASS — ready to ship to Phase 18
+- Replaced cucascade #117's deleted FSM-based lock API with three RAII free functions and rippled the return-type change through the operator-data + cudf-view helper headers — DB-02/DB-03 consumers can now migrate against a stable header surface.
+- 1. [Rule 3 — Blocking] R2 size-estimator inline bodies in operator-data headers
+- Migrated the 8 stateful Sirius operator .cpp files (table_scan, hash_join, nested_loop_join, concat, top_n, grouped_aggregate_merge, ungrouped_aggregate, merge_sort) to the cucascade #117 RAII model — all FSM-pop sites replaced, all `pop_data_batch_by_id` 3-arg sites converted to 2-arg, all read paths use `to_read_only()` and the one mutable-write path (grouped_aggregate_merge release_table) uses `to_mutable()`. Build error count dropped 47 → 21.
+- Migrated 13 production .cpp files (6 read-only operators + 5 scan-layer + task_creator + debug_utils) to the cucascade #117 RAII model, closing all 4 known Pitfall 4 (2-arg make_data_batch) sneak-back sites — every src/ make_data_batch call now passes the operator stream as writer_stream.
+- Migrated all 23 test/cpp/ files to the cucascade #117 RAII accessor model AND closed the 8 inventory-miss src/ files surfaced as prelude scope from deferred-items.md. Final repo-wide grep gates all return zero hits; src/-side build compiles cleanly past every DB-02/03 site. The only remaining build errors are the 6 pre-existing liburing-dev errors in src/io/uring/uring_reactor.cpp, which are Phase 19 / IO-12 territory.
+- Phase 18 closure plan: ran the verification gauntlet (static grep gates + MCP build + [mgpu] runtime + compute-sanitizer racecheck), discovered 8 inventory-miss test files (Rule 3 Blocking — closed in this plan), confirmed DB-04 closure (MCP build exits 0 after pixi-installing liburing), and confirmed DB-05 FAIL: P1 RAII lock-scope self-deadlock fires at runtime exactly as 18-03 SUMMARY forecast. Phase 18 verdict is PARTIAL: static infrastructure PASS; runtime regression BLOCKED on architectural follow-up.
+- Phase 18 closure via Path A architectural fix: dropped 18-02's R5 lock-and-hold from `gpu_pipeline_task::execute` and `pipelineable_operator_data::prepare_for_processing`. The held `std::vector<cucascade::mutable_data_batch> processing_handles` across `op->execute()` is gone; operators inside `execute()` acquire their own per-call accessors at narrowest scope. The glibc EDEADLK ("Resource deadlock avoided") that 18-06 confirmed on every `[mgpu]` test is gone. `[mgpu]` 16/16 PASS in 103.5s; `[mgpu_stress]` PASS in 75.5s; racecheck 0 hazards. Phase 18 verdict flipped from PARTIAL to PASS.
+- Baseline grep snapshot + IO-12 vcpkg/liburing audit — confirms zero source changes needed for IO-12, resolves Q3 (no iceberg helper migration), establishes 4-target delta gate for Plans 19-02..19-06
+- Plan 19-03 unblocked
+- Wave 1 IO-15 preparation — adds make_test_gpu_ioctxs / make_test_ioctx test fixture factories alongside existing cucascade helpers so plan 19-05 can flip 4 + 3 call sites in a single atomic plan after cucascade_datasource retirement.
+- Wave 2 IO-13/IO-14 architectural piece — SiriusContext::initialize() now constructs ONE sirius::io::uring_ioctx per GPU memory space under rmm::cuda_set_device_raii. Each ioctx owns its own admission_control budget (P5). Teardown clears gpu_ioctxs_ BEFORE memory_manager_->shutdown() (Pitfall 3). Coexists with cucascade gpu_io_backends_ map; consumer wiring + cucascade retirement deferred to plan 19-05.
+- Wave 3 — the core migration plan and largest in Phase 19.
+- Wave 4 — the final plan in Phase 19. Verification-only (no source changes). Phase 19 closes PASS with all 6 IO-12..17 requirements green.
+- Three empirical gates run; static grep + [mgpu_stress] 500-iter PASS; [mgpu-audit] reproducibly FAILS at min_count REQUIRE — but scan_batch disjointedness invariant holds (GPU0=2, GPU1=1, no overlap). Establishes plan-of-record evidence baseline for 20-02 / 20-04 design docs and verdict.
+- Three documentation artifacts authored (20-OPEN-Q1-RESOLUTION.md, 20-SCHED-RR-PORT.md, 20-STREAM-LINEAGE-REATTACH.md), three misleading TODO blocks deleted (Pitfall 1 documentation drift), one orphaned test file retired (Open Q1 RETIRE per Pitfall 3). SM-01 Option A + SM-03 Option B documented with empirical citations from 20-01-EVIDENCE.md; SM-02 affinity map ownership clarified; SM-02 PARTIAL test-fixture mismatch handed to Phase 21+ as v1.5+ test-cleanup. Build clean (MCP exit 0, 27.5s); HYG-02 baseline preserved at 40 / 0 non-legacy; SM-03 grep gate still non-zero (1 hit at sirius_gpu_parquet_scan_operator.cpp:256 post-edit).
+- 1. [Rule 3 — Blocking issue] Staging race with parallel 20-01 agent
+- SM-06 SF10 PASS (3/3 cases, 227 assertions, 12.01s); SM-06 SF1 PARTIAL (Q11 parquet 2-GPU canonical Phase 13 P2 fingerprint — pre-existing follow-up #17, carried to Phase 21 REG-03); SM-04 PASS via dual verification (source inspection at sirius_gpu_parquet_scan_operator.cpp:127 + SF10 Q1 num_gpus=2 PASS); advisory [mgpu] 16/16 PASS (79091 assertions, 106.4s — matches Phase 18/19 baseline); advisory SF100 Q1 num_gpus=2 PASS (2.283s cold — reduces Phase 21 REG-04 risk substantially). 20-VERDICT.md authored (234 lines, 7 H2 sections) consolidating SM-01..06 evidence. Phase 20 final verdict: PARTIAL (5 SM-XX PASS + SM-06 SF10 PASS; SF1 PARTIAL on pre-existing infrastructure).
+- 21 stream-ordered races at HEAD across 2 library-boundary clusters (cudf+kvikio internal + cucascade pin 1c1e648 alloc_and_peer_copy_async host-staging fallback) — Path B escalation with status human_needed; Phase 13-04 entry-level fix preserved but cluster B is in a NEW post-Phase 13 fallback code path; cucascade fork+bump 1.5-2.5 days estimated to close.
+- 1. [Rule 2 — Missing critical functionality] Pre-flight check at run_batch entry
+- Phase 21 closes v1.4 milestone with PASS verdict on all 6 REG-01..06 requirements. Substantive content in `21-VERDICT.md` (~360 lines).
+
+---
+
 ## v1.3 Multi-GPU Distribution (Shipped: 2026-05-01)
 
 **Phases completed:** 4 phases (12-15), 12 plans
