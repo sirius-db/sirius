@@ -22,10 +22,12 @@
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_cpu_source.hpp"
+#include "op/sirius_physical_delim_join.hpp"
+#include "op/sirius_physical_duckdb_scan.hpp"
+#include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_parquet_scan.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "sirius/exception.hpp"
-#include "sirius_engine.hpp"
 
 #include <nvtx3/nvtx3.hpp>
 
@@ -34,12 +36,10 @@
 namespace sirius {
 namespace pipeline {
 
-sirius_pipeline::sirius_pipeline(sirius_engine& engine)
-  : engine(engine), ready(false), initialized(false), source(nullptr), sink(nullptr)
+sirius_pipeline::sirius_pipeline(const pipeline_build_context& ctx)
+  : build_ctx_(ctx), ready(false), initialized(false), source(nullptr), sink(nullptr)
 {
 }
-
-duckdb::ClientContext& sirius_pipeline::get_client_context() { return engine.context; }
 
 bool sirius_pipeline::is_order_dependent() const
 {
@@ -53,11 +53,39 @@ bool sirius_pipeline::is_order_dependent() const
     if (op.operator_order() == sirius::OrderPreservationType::NO_ORDER) { return false; }
     if (op.operator_order() == sirius::OrderPreservationType::FIXED_ORDER) { return true; }
   }
-  if (!duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(engine.context)) {
-    return false;
-  }
+  if (!build_ctx_.preserve_insertion_order) { return false; }
   if (sink && sink->sink_order_dependent()) { return true; }
   return false;
+}
+
+std::vector<op::sirius_physical_operator::next_port_info>
+sirius_pipeline::get_next_ports_after_sink() const
+{
+  std::vector<op::sirius_physical_operator::next_port_info> ports;
+  if (!sink) { return ports; }
+
+  auto append = [&ports](const std::vector<op::sirius_physical_operator::next_port_info>& src) {
+    ports.insert(ports.end(), src.begin(), src.end());
+  };
+
+  if (sink->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
+    auto& right_delim_join = sink->Cast<op::sirius_physical_right_delim_join>();
+    const auto& part_1     = right_delim_join.partition_join->get_next_ports_after_sink();
+    const auto& part_2     = right_delim_join.distinct->get_next_ports_after_sink();
+    ports.reserve(part_1.size() + part_2.size());
+    append(part_1);
+    append(part_2);
+  } else if (sink->type == op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
+    auto& left_delim_join = sink->Cast<op::sirius_physical_left_delim_join>();
+    const auto& part_1    = left_delim_join.column_data_scan->get_next_ports_after_sink();
+    const auto& part_2    = left_delim_join.distinct->get_next_ports_after_sink();
+    ports.reserve(part_1.size() + part_2.size());
+    append(part_1);
+    append(part_2);
+  } else {
+    append(sink->get_next_ports_after_sink());
+  }
+  return ports;
 }
 
 void sirius_pipeline::reset_sink()
@@ -262,9 +290,23 @@ void sirius_pipeline_build_state::set_pipeline_operators(
 }
 
 duckdb::shared_ptr<sirius_pipeline> sirius_pipeline_build_state::create_child_pipeline(
-  sirius_engine& engine, sirius_pipeline& pipeline, op::sirius_physical_operator& op)
+  const pipeline_build_context& ctx, sirius_pipeline& pipeline, op::sirius_physical_operator& op)
 {
-  return engine.create_child_pipeline(pipeline, op);
+  D_ASSERT(!pipeline.operators.empty());
+  D_ASSERT(op.is_source());
+  // found another operator that is a source, schedule a child pipeline
+  // 'op' is the source, and the sink is the same
+  auto child_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(ctx);
+  child_pipeline->sink   = pipeline.get_sink();
+  child_pipeline->source = &op;
+
+  // the child pipeline has the same operators up until 'op'
+  for (auto current_op : pipeline.get_operators()) {
+    if (&current_op.get() == &op) { break; }
+    child_pipeline->operators.push_back(current_op);
+  }
+
+  return child_pipeline;
 }
 
 duckdb::vector<std::reference_wrapper<op::sirius_physical_operator>>

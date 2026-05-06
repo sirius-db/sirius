@@ -18,16 +18,14 @@
 
 #include "common/optional_ptr.hpp"
 #include "common/reference_map.hpp"
+#include "duckdb/parallel/pipeline.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
-#include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_operator.hpp"
-#include "op/sirius_physical_operator_type.hpp"
+#include "pipeline/pipeline_build_context.hpp"
 
 #include <nvtx3/nvtx3.hpp>
 
-#include <array>
-#include <ranges>
-#include <span>
+#include <vector>
 
 namespace sirius {
 
@@ -36,10 +34,6 @@ class sirius_engine;
 namespace creator {
 class task_creator;
 }  // namespace creator
-
-namespace op {
-class sirius_physical_operator;
-}  // namespace op
 
 namespace pipeline {
 
@@ -70,7 +64,7 @@ class sirius_pipeline_build_state {
     sirius_pipeline& pipeline,
     duckdb::vector<std::reference_wrapper<op::sirius_physical_operator>> operators);
   void add_pipeline_operator(sirius_pipeline& pipeline, op::sirius_physical_operator& op);
-  duckdb::shared_ptr<sirius_pipeline> create_child_pipeline(sirius_engine& engine,
+  duckdb::shared_ptr<sirius_pipeline> create_child_pipeline(const pipeline_build_context& ctx,
                                                             sirius_pipeline& pipeline,
                                                             op::sirius_physical_operator& op);
 
@@ -88,12 +82,10 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   friend class sirius_pipeline_converter;
 
  public:
-  explicit sirius_pipeline(sirius_engine& engine);
+  explicit sirius_pipeline(const pipeline_build_context& ctx);
   virtual ~sirius_pipeline() = default;
 
  public:
-  duckdb::ClientContext& get_client_context();
-
   void add_dependency(duckdb::shared_ptr<sirius_pipeline>& pipeline);
 
   void is_ready();
@@ -128,28 +120,10 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
 
   sirius::optional_ptr<op::sirius_physical_operator> get_source() const noexcept { return source; }
 
-  // Returns an iterable view over next_port_infos, representing the next ports of the sink operator
-  // in the pipeline, handling special-cased composite operators like left and right delim joins.
-  // Returns an empty view if the pipeline sink is not present.
-  [[nodiscard]] auto get_next_ports_after_sink() const noexcept
-  {
-    using span_over_ports = std::span<const op::sirius_physical_operator::next_port_info>;
-    span_over_ports part_1{}, part_2{};
-    if (sink) {
-      if (sink->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
-        auto& right_delim_join = sink->Cast<op::sirius_physical_right_delim_join>();
-        part_1 = span_over_ports{right_delim_join.partition_join->get_next_ports_after_sink()};
-        part_2 = span_over_ports{right_delim_join.distinct->get_next_ports_after_sink()};
-      } else if (sink->type == op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
-        auto& left_delim_join = sink->Cast<op::sirius_physical_left_delim_join>();
-        part_1 = span_over_ports{left_delim_join.column_data_scan->get_next_ports_after_sink()};
-        part_2 = span_over_ports{left_delim_join.distinct->get_next_ports_after_sink()};
-      } else {
-        part_1 = span_over_ports{sink->get_next_ports_after_sink()};
-      }
-    }
-    return std::views::join(std::array{part_1, part_2});
-  }
+  // Returns the next ports of the pipeline's sink operator, handling special-cased composite
+  // operators like left and right delim joins. Returns an empty vector if the sink is not set.
+  [[nodiscard]] std::vector<op::sirius_physical_operator::next_port_info>
+  get_next_ports_after_sink() const;
 
   //! Set the pipeline ID
   void set_pipeline_id(size_t id) { pipeline_id = id; }
@@ -228,7 +202,8 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
 
   //! The unique ID of this pipeline (assigned based on new_scheduled order)
   size_t pipeline_id = 0;
-  sirius_engine& engine;
+  //! Plan-time context (replaces sirius_engine& for plan-time needs)
+  pipeline_build_context build_ctx_;
 
   //! Whether the pipeline has been finished
   std::atomic<bool> pipeline_finished = false;

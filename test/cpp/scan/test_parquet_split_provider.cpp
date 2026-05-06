@@ -95,12 +95,12 @@ duckdb::vector<duckdb::ColumnIndex> all_column_ids(std::size_t n)
 
 duckdb::vector<sirius::logical_type> default_returned_types()
 {
-  duckdb::vector<sirius::logical_type> types;
-  types.push_back(sirius::logical_type::make(sirius::type_id::INTEGER));
-  types.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
-  types.push_back(sirius::logical_type::make(sirius::type_id::DOUBLE));
-  types.push_back(sirius::logical_type::make(sirius::type_id::VARCHAR));
-  return types;
+  return {
+    sirius::logical_type::make(sirius::type_id::INTEGER),
+    sirius::logical_type::make(sirius::type_id::BIGINT),
+    sirius::logical_type::make(sirius::type_id::DOUBLE),
+    sirius::logical_type::make(sirius::type_id::VARCHAR),
+  };
 }
 
 // Drain every parquet_scan_data the provider emits.

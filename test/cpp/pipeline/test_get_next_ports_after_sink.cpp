@@ -55,7 +55,7 @@ class pipeline_test_env {
       con(std::make_unique<duckdb::Connection>(*db)),
       iface(std::make_unique<sirius_interface>(*con->context)),
       engine(std::make_unique<sirius_engine>(*con->context, *iface)),
-      pipeline(duckdb::make_shared_ptr<sirius_pipeline>(*engine))
+      pipeline(duckdb::make_shared_ptr<sirius_pipeline>(sirius::pipeline::pipeline_build_context{}))
   {
   }
 

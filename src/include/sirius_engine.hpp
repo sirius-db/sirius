@@ -24,6 +24,7 @@
 #include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_result_collector.hpp"
+#include "pipeline/pipeline_build_context.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
