@@ -244,44 +244,18 @@ __device__ __forceinline__ uint32_t rle_upper_bound(uint32_t const* __restrict__
   return lo;
 }
 
+/// Body of the expand kernel, parameterised on the cumsum pointer source.
+/// `__forceinline__` so each call site keeps its own statically-known
+/// address space — see kernel_decode_rle for why merging through a single
+/// pointer would force ld.generic.
 template <typename T>
-__global__ void kernel_decode_rle(rle_chunk_desc const* __restrict__ descs,
-                                  uint32_t const* __restrict__ d_entry_counts,
-                                  T* __restrict__ d_output,
-                                  uint32_t num_chunks)
+__device__ __forceinline__ void rle_decode_chunk_body(uint32_t const* __restrict__ cumsum,
+                                                      T const* __restrict__ values,
+                                                      T* __restrict__ out_chunk,
+                                                      uint32_t ec,
+                                                      uint32_t lr_start,
+                                                      uint32_t rc)
 {
-  uint32_t const cid = blockIdx.x;
-  if (cid >= num_chunks) return;
-
-  auto const desc   = descs[cid];
-  uint32_t const rc = desc.chunk_rows;
-  T* out_chunk      = d_output + desc.base_global_row + desc.local_row_start;
-
-  uint32_t const ec = __ldg(d_entry_counts + desc.seg_id);
-
-  if (ec == MALFORMED_FLAG) {
-    for (uint32_t i = threadIdx.x; i < rc; i += blockDim.x) {
-      __stwt(out_chunk + i, T(0));
-    }
-    return;
-  }
-
-  T const* values         = reinterpret_cast<T const*>(desc.d_values);
-  uint32_t const lr_start = desc.local_row_start;
-
-  // For ec > RLE_SMEM_MAX_ENTRIES the cumsum stays gmem-resident; the L2
-  // caches it well across CTAs of the same segment.
-  bool const cumsum_in_smem = (ec <= RLE_SMEM_MAX_ENTRIES);
-  extern __shared__ uint32_t s_cumsum[];
-  uint32_t const* cumsum = desc.d_cumsum;
-  if (cumsum_in_smem) {
-    for (uint32_t i = threadIdx.x; i < ec; i += blockDim.x) {
-      s_cumsum[i] = desc.d_cumsum[i];
-    }
-    __syncthreads();
-    cumsum = s_cumsum;
-  }
-
   // Narrow the search window to the entry band this chunk actually covers.
   // For typical-shape chunks ec_band << ec, dropping per-thread search
   // depth from log2(ec) to log2(ec_band).
@@ -299,7 +273,7 @@ __global__ void kernel_decode_rle(rle_chunk_desc const* __restrict__ descs,
   uint32_t const band_lo = s_band_lo;
   uint32_t const band_hi = s_band_hi;
 
-  bool const long_runs_heuristic = rc / 32u >= ec || (rc >= ec && (rc / ec) >= 32u);
+  bool const long_runs_heuristic = rc / 32u >= ec;
   uint32_t const lane            = threadIdx.x & 31u;
 
   if (long_runs_heuristic) {
@@ -344,6 +318,49 @@ __global__ void kernel_decode_rle(rle_chunk_desc const* __restrict__ descs,
     __stwt(out_chunk + i, __ldg(values + entry));
   }
   (void)lane;
+}
+
+template <typename T>
+__global__ void kernel_decode_rle(rle_chunk_desc const* __restrict__ descs,
+                                  uint32_t const* __restrict__ d_entry_counts,
+                                  T* __restrict__ d_output,
+                                  uint32_t num_chunks)
+{
+  uint32_t const cid = blockIdx.x;
+  if (cid >= num_chunks) return;
+
+  auto const desc   = descs[cid];
+  uint32_t const rc = desc.chunk_rows;
+  T* out_chunk      = d_output + desc.base_global_row + desc.local_row_start;
+
+  uint32_t const ec = __ldg(d_entry_counts + desc.seg_id);
+
+  if (ec == MALFORMED_FLAG) {
+    for (uint32_t i = threadIdx.x; i < rc; i += blockDim.x) {
+      __stwt(out_chunk + i, T(0));
+    }
+    return;
+  }
+
+  T const* values         = reinterpret_cast<T const*>(desc.d_values);
+  uint32_t const lr_start = desc.local_row_start;
+
+  extern __shared__ uint32_t s_cumsum[];
+
+  // Two textually-distinct branches: each call site passes a pointer with a
+  // statically-known address space, so the compiler emits ld.shared in path A
+  // and ld.global in path B. Merging through a single uint32_t const* would
+  // force ld.generic (slower, runtime address-space check).
+  if (ec <= RLE_SMEM_MAX_ENTRIES) {
+    for (uint32_t i = threadIdx.x; i < ec; i += blockDim.x) {
+      s_cumsum[i] = desc.d_cumsum[i];
+    }
+    __syncthreads();
+    rle_decode_chunk_body<T>(s_cumsum, values, out_chunk, ec, lr_start, rc);
+  } else {
+    // L2 caches the gmem cumsum well across CTAs of the same segment.
+    rle_decode_chunk_body<T>(desc.d_cumsum, values, out_chunk, ec, lr_start, rc);
+  }
 }
 
 }  // anonymous namespace
@@ -401,8 +418,12 @@ void decode_rle_data(gpu_codec_run const& run,
 
   // Build per-CTA chunk descriptors. Cumsum slice + values pointer can be
   // computed on host without observing the build kernel's output.
+  size_t total_chunks = 0;
+  for (auto const* seg : live) {
+    total_chunks += (seg->row_count + RLE_ROWS_PER_CHUNK - 1) / RLE_ROWS_PER_CHUNK;
+  }
   std::vector<rle_chunk_desc> h_descs;
-  h_descs.reserve(n * 2);
+  h_descs.reserve(total_chunks);
   for (size_t i = 0; i < n; ++i) {
     auto const& seg          = *live[i];
     uint32_t const rc        = seg.row_count;

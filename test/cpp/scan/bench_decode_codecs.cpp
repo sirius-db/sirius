@@ -235,7 +235,7 @@ constexpr uint32_t RLE_BENCH_SEG_ROWS = 122880;  // DuckDB row-group max
 
 }  // namespace
 
-TEST_CASE("bench RLE int64 long_runs (16 entries/seg) 122M rows", "[!benchmark][scan][decode]")
+TEST_CASE("bench RLE int64 long_runs (16 entries/seg) 128Mi rows", "[!benchmark][scan][decode]")
 {
   using ::sirius::test::decode::rle::make_uniform_runs;
   rmm::cuda_stream stream;
@@ -269,7 +269,7 @@ TEST_CASE("bench RLE int64 long_runs (16 entries/seg) 122M rows", "[!benchmark][
               bytes_w / sec / GIB);
 }
 
-TEST_CASE("bench RLE int64 medium_runs (1024 entries/seg) 122M rows", "[!benchmark][scan][decode]")
+TEST_CASE("bench RLE int64 medium_runs (1024 entries/seg) 128Mi rows", "[!benchmark][scan][decode]")
 {
   using ::sirius::test::decode::rle::make_uniform_runs;
   rmm::cuda_stream stream;
@@ -303,7 +303,7 @@ TEST_CASE("bench RLE int64 medium_runs (1024 entries/seg) 122M rows", "[!benchma
               bytes_w / sec / GIB);
 }
 
-TEST_CASE("bench RLE int64 pareto_runs (skewed distribution) ~120M rows",
+TEST_CASE("bench RLE int64 pareto_runs (skewed distribution) 128Mi rows",
           "[!benchmark][scan][decode]")
 {
   // Realistic shape: Pareto-distributed run lengths. Many short runs +
