@@ -370,7 +370,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   auto result = converter.convert(*root_pipeline);
 
   new_scheduled         = std::move(result.scheduled_pipelines);
-  new_pipeline_breakers = std::move(result.pipeline_breakers);
+  new_pipeline_breakers = std::move(result.inserted_operators);
   total_pipelines       = result.meta_pipeline_count;
 
   // NOTE: dead code preserved for operator ID numbering stability
