@@ -109,10 +109,12 @@ jobs:
           if [[ -n "${SCCACHE_BUCKET}" ]]; then
             echo "SCCACHE_BUCKET DEFINED -> Self Hosted Runner, Disable GHA sccache, use S3 vcpkg cache"
             echo "SCCACHE_GHA_ENABLED=false" >> $GITHUB_ENV
-            echo "VCPKG_BINARY_SOURCES=clear;x-aws,s3://${SCCACHE_BUCKET}/vcpkg/,readwrite" >> $GITHUB_ENV
           else
             echo "SCCACHE_BUCKET UNDEFINED -> GitHub Runner, Enable GHA sccache"
             echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+          fi
+          if [[ -n "${VCPKG_BUCKET}" ]]; then
+            echo "VCPKG_BINARY_SOURCES=clear;x-aws,s3://${VCPKG_BUCKET}/,readwrite" >> $GITHUB_ENV
           fi
 
       - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
