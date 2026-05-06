@@ -221,6 +221,20 @@ __device__ __forceinline__ uint32_t rle_upper_bound(uint32_t const* __restrict__
   return lo;
 }
 
+__device__ __forceinline__ uint32_t rle_upper_bound_band(
+  uint32_t const* __restrict__ cumsum, uint32_t lo, uint32_t hi, uint32_t key)
+{
+  while (lo < hi) {
+    uint32_t mid = lo + ((hi - lo) >> 1);
+    if (cumsum[mid] <= key) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
 template <typename T>
 __global__ void kernel_decode_rle(rle_chunk_desc const* __restrict__ descs,
                                   uint32_t const* __restrict__ d_entry_counts,
@@ -252,10 +266,23 @@ __global__ void kernel_decode_rle(rle_chunk_desc const* __restrict__ descs,
   }
   __syncthreads();
 
-  // Long-run fast path: when the segment's average run length is at least a
-  // warp-width, lane 0 searches once per warp and broadcasts. Skipping this
-  // for short-run shapes — the bound check fails almost every iteration
-  // and the lane-0 search becomes pure overhead.
+  // Narrow the search window to the entry band this chunk actually covers.
+  // For typical-shape chunks ec_band << ec, dropping per-thread search
+  // depth from log2(ec) to log2(ec_band).
+  __shared__ uint32_t s_band_lo;
+  __shared__ uint32_t s_band_hi;
+  if (threadIdx.x == 0) {
+    uint32_t const last_row = lr_start + rc - 1u;
+    uint32_t const lo       = rle_upper_bound(s_cumsum, ec, lr_start);
+    uint32_t hi             = rle_upper_bound(s_cumsum, ec, last_row);
+    if (hi >= ec) hi = ec - 1;
+    s_band_lo = lo;
+    s_band_hi = hi + 1u;
+  }
+  __syncthreads();
+  uint32_t const band_lo = s_band_lo;
+  uint32_t const band_hi = s_band_hi;
+
   bool const long_runs_heuristic =
     rc / 32u >= ec || (rc >= ec && (rc / ec) >= 32u);
   uint32_t const lane = threadIdx.x & 31u;
@@ -269,7 +296,7 @@ __global__ void kernel_decode_rle(rle_chunk_desc const* __restrict__ descs,
 
       uint32_t entry_warp = 0;
       if (lane == 0) {
-        entry_warp = rle_upper_bound(s_cumsum, ec, warp_first);
+        entry_warp = rle_upper_bound_band(s_cumsum, band_lo, band_hi, warp_first);
         if (entry_warp >= ec) entry_warp = ec - 1;
       }
       entry_warp = __shfl_sync(0xFFFFFFFFu, entry_warp, 0);
@@ -284,7 +311,7 @@ __global__ void kernel_decode_rle(rle_chunk_desc const* __restrict__ descs,
         __stwt(out_chunk + i, __ldg(values + entry_warp));
       } else {
         uint32_t const local_row = lr_start + i;
-        uint32_t entry = rle_upper_bound(s_cumsum, ec, local_row);
+        uint32_t entry = rle_upper_bound_band(s_cumsum, band_lo, band_hi, local_row);
         if (entry >= ec) entry = ec - 1;
         __stwt(out_chunk + i, __ldg(values + entry));
       }
@@ -297,7 +324,7 @@ __global__ void kernel_decode_rle(rle_chunk_desc const* __restrict__ descs,
     uint32_t const i = v * blockDim.x + threadIdx.x;
     if (i >= rc) break;
     uint32_t const local_row = lr_start + i;
-    uint32_t entry           = rle_upper_bound(s_cumsum, ec, local_row);
+    uint32_t entry           = rle_upper_bound_band(s_cumsum, band_lo, band_hi, local_row);
     if (entry >= ec) entry = ec - 1;
     __stwt(out_chunk + i, __ldg(values + entry));
   }
