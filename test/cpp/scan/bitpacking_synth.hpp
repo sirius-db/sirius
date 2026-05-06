@@ -90,8 +90,8 @@ inline std::vector<uint8_t> make_constant_delta_block(T frame, T delta)
 template <typename T>
 inline std::vector<uint8_t> make_for_block(T frame, uint32_t width, std::vector<T> const& values)
 {
-  auto packed         = pack_values<T>(values, width);
-  size_t packed_bytes = packed.size() * sizeof(uint32_t);
+  auto packed           = pack_values<T>(values, width);
+  size_t packed_bytes   = packed.size() * sizeof(uint32_t);
   size_t header_end     = 8 + 2 * sizeof(T) + packed_bytes;
   size_t metadata_end_v = header_end + 4;
   size_t block_size     = std::max<size_t>(metadata_end_v, 64);
@@ -101,8 +101,7 @@ inline std::vector<uint8_t> make_for_block(T frame, uint32_t width, std::vector<
   std::memcpy(block.data() + 8, &frame, sizeof(T));
   std::memcpy(block.data() + 8 + sizeof(T), &width_t, sizeof(T));
   std::memcpy(block.data() + 8 + 2 * sizeof(T), packed.data(), packed_bytes);
-  uint32_t encoded =
-    (static_cast<uint32_t>(::sirius::cuda::scan::BitpackingMode::FOR) << 24) | 8u;
+  uint32_t encoded = (static_cast<uint32_t>(::sirius::cuda::scan::BitpackingMode::FOR) << 24) | 8u;
   std::memcpy(block.data() + metadata_end_v - 4, &encoded, sizeof(encoded));
   return block;
 }
@@ -113,8 +112,8 @@ inline std::vector<uint8_t> make_delta_for_block(T frame,
                                                  uint32_t width,
                                                  std::vector<T> const& packed_values)
 {
-  auto packed         = pack_values<T>(packed_values, width);
-  size_t packed_bytes = packed.size() * sizeof(uint32_t);
+  auto packed           = pack_values<T>(packed_values, width);
+  size_t packed_bytes   = packed.size() * sizeof(uint32_t);
   size_t header_end     = 8 + 3 * sizeof(T) + packed_bytes;
   size_t metadata_end_v = header_end + 4;
   size_t block_size     = std::max<size_t>(metadata_end_v, 64);

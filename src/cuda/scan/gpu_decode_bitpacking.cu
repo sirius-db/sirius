@@ -57,8 +57,9 @@
 #include <rmm/device_uvector.hpp>
 
 #include <cub/warp/warp_scan.cuh>
-#include <cuda_pipeline.h>
 #include <cuda_runtime.h>
+
+#include <cuda_pipeline.h>
 
 #include <cstdint>
 #include <stdexcept>
@@ -362,13 +363,11 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
   if (can_use_16b) {
     uint32_t const quad_count = packed_words >> 2;  // packed_words / 4
     for (uint32_t i = threadIdx.x; i < quad_count; i += blockDim.x) {
-      __pipeline_memcpy_async(
-        &shmem[i * 4], packed_bytes + i * 16u, 16);
+      __pipeline_memcpy_async(&shmem[i * 4], packed_bytes + i * 16u, 16);
     }
   } else {
     for (uint32_t i = threadIdx.x; i < packed_words; i += blockDim.x) {
-      __pipeline_memcpy_async(
-        &shmem[i], packed_bytes + i * sizeof(uint32_t), sizeof(uint32_t));
+      __pipeline_memcpy_async(&shmem[i], packed_bytes + i * sizeof(uint32_t), sizeof(uint32_t));
     }
   }
   // Guard word — set after async-copy issue; wait below covers both.
@@ -421,7 +420,7 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
   // Stage 1 — per-warp inclusive scan of thread aggregates. Each warp's
   // 32 threads scan their thread_agg values via `__shfl` (no shmem, no
   // barriers). Lane 31 of each warp publishes the warp's total to shmem.
-  using WarpScanT  = cub::WarpScan<T>;
+  using WarpScanT              = cub::WarpScan<T>;
   constexpr uint32_t NUM_WARPS = BLOCK_DIM / 32;
   __shared__ typename WarpScanT::TempStorage warp_scan_temp[NUM_WARPS];
   __shared__ T warp_aggregates[NUM_WARPS];

@@ -341,7 +341,8 @@ TEST_CASE("gpu_decode_table BITPACKING - INVALID mode zero-fills",
                                       0,
                                       total_rows}}};
   auto out = decode_invalid_with_canary(stream, mr, run, total_rows);
-  for (uint32_t i = 0; i < total_rows; ++i) REQUIRE(out[i] == 0);
+  for (uint32_t i = 0; i < total_rows; ++i)
+    REQUIRE(out[i] == 0);
 }
 
 TEST_CASE("gpu_decode_table BITPACKING - corrupt metadata_end zero-fills",
@@ -364,7 +365,8 @@ TEST_CASE("gpu_decode_table BITPACKING - corrupt metadata_end zero-fills",
                                       0,
                                       total_rows}}};
   auto out = decode_invalid_with_canary(stream, mr, run, total_rows);
-  for (uint32_t i = 0; i < total_rows; ++i) REQUIRE(out[i] == 0);
+  for (uint32_t i = 0; i < total_rows; ++i)
+    REQUIRE(out[i] == 0);
 }
 
 TEST_CASE("gpu_decode_table BITPACKING - width > sizeof(T)*8 zero-fills",
@@ -387,7 +389,8 @@ TEST_CASE("gpu_decode_table BITPACKING - width > sizeof(T)*8 zero-fills",
                                       0,
                                       total_rows}}};
   auto out = decode_invalid_with_canary(stream, mr, run, total_rows);
-  for (uint32_t i = 0; i < total_rows; ++i) REQUIRE(out[i] == 0);
+  for (uint32_t i = 0; i < total_rows; ++i)
+    REQUIRE(out[i] == 0);
 }
 
 TEST_CASE("gpu_decode_table BITPACKING - packed stream past metadata_end zero-fills",
@@ -409,7 +412,8 @@ TEST_CASE("gpu_decode_table BITPACKING - packed stream past metadata_end zero-fi
                                       0,
                                       total_rows}}};
   auto out = decode_invalid_with_canary(stream, mr, run, total_rows);
-  for (uint32_t i = 0; i < total_rows; ++i) REQUIRE(out[i] == 0);
+  for (uint32_t i = 0; i < total_rows; ++i)
+    REQUIRE(out[i] == 0);
 }
 
 TEST_CASE("gpu_decode_table BITPACKING - unsupported type_size throws",
