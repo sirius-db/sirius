@@ -89,6 +89,7 @@ Shipped and validated in v1.1.
 
 ## Deferred to Future Milestones
 
+- **`pin_table` single-GPU residency (v1.4)**: `CALL pin_table(...)` always pins to GPU 0 in v1.4. The implementation at `src/sirius_extension.cpp:733` uses `gpu_spaces[0]` unconditionally — `auto& mem_space = const_cast<cucascade::memory::memory_space&>(*gpu_spaces[0]);`. Multi-GPU-aware placement is tracked as `PIN-MGPU-01` in `REQUIREMENTS.md` Future Requirements section, deferred to v1.5+. Trade-off: P2P copy overhead via `convert_gpu_to_gpu` is acceptable in v1.4 because Phase 13 `cudaStreamWaitEvent` chain (re-attached at `src/op/scan/sirius_gpu_parquet_scan_operator.cpp:263`) ensures correctness; perf gap is small at SF1 but may show at SF100 multi-table workloads. Documented for SM-05 closure during Phase 20.
 - **`[mgpu-audit]` per-GPU distribution AUDIT TEST_CASE SIGSEGV** at `test_gpu_execution_tpch_mgpu_audit.cpp:200` (`attach_integration_duckdb` path; pre-existing on base before v1.2; orthogonal to parquet filter translation path; Phase 11 candidate, < 50 LOC expected)
 - Upstream cucascade `convert_gpu_to_gpu` cross-stream fix (drop Sirius override once upstream lands)
 - Phase-5 vs Phase-4 parquet I/O regression comparison
