@@ -156,8 +156,7 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single 
        dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()) {
     // Phase 18 / DB-03 Recipe R1: scoped read-only accessor per iteration.
     auto ro = output->to_read_only();
-    total_num_rows +=
-      ro.get_data()->cast<gpu_table_representation>().get_table_view().num_rows();
+    total_num_rows += ro.get_data()->cast<gpu_table_representation>().get_table_view().num_rows();
   }
   REQUIRE(total_num_rows == num_values);
 }
@@ -368,10 +367,8 @@ TEST_CASE(
   auto outputs = partitioner.execute(pipelineable_operator_data({input_batch}), default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
   // Phase 18 / DB-03 Recipe R1: scoped read-only accessor for the verification.
-  auto __ro_partition = dynamic_cast<const pipelineable_operator_data&>(*outputs)
-                          .get_data_batches()[0]
-                          ->to_read_only();
-  REQUIRE(
-    __ro_partition.get_data()->cast<gpu_table_representation>().get_table_view().num_rows() ==
-    num_values);
+  auto __ro_partition =
+    dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]->to_read_only();
+  REQUIRE(__ro_partition.get_data()->cast<gpu_table_representation>().get_table_view().num_rows() ==
+          num_values);
 }

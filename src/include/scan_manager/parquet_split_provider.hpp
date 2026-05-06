@@ -28,12 +28,11 @@
 // uring_io_object concrete type is referenced only in the .cpp via
 // <io/uring/uring_reactor.hpp> (LAST among sirius headers — liburing's
 // BLOCK_SIZE macro collides with blockingconcurrentqueue).
-#include <io/types.hpp>
-
 #include <duckdb/common/column_index.hpp>
 #include <duckdb/common/multi_file/multi_file_data.hpp>
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/vector.hpp>
+#include <io/types.hpp>
 
 #include <cstddef>
 #include <memory>

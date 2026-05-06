@@ -92,8 +92,8 @@ namespace {
 
 fs::path make_tmp_dir(std::string const& tag)
 {
-  auto tmp = fs::temp_directory_path() /
-             ("sirius-mgpu-stress-" + std::to_string(::getpid()) + "-" + tag);
+  auto tmp =
+    fs::temp_directory_path() / ("sirius-mgpu-stress-" + std::to_string(::getpid()) + "-" + tag);
   std::error_code ec;
   fs::remove_all(tmp, ec);
   fs::create_directories(tmp);
@@ -147,22 +147,25 @@ TEST_CASE("mgpu_stress - SCHED-RR counter offset rotation",
   // --- [0] order surface: 4 files x 50k rows ~ 0.6 MiB. Forces multi-
   //         partition sort with hash_partition_bytes = 1 MiB.
   auto order_dir = root / "order";
-  generate_parquet_surface(
-    order_dir, "SELECT (range * 37) % 1000000 AS k, range AS v FROM range(50000)",
-    /*num_files=*/4);
+  generate_parquet_surface(order_dir,
+                           "SELECT (range * 37) % 1000000 AS k, range AS v FROM range(50000)",
+                           /*num_files=*/4);
 
   // --- [1] BUILD_PROBE hash_join surface: small build, larger probe.
   auto probe_dir = root / "probe";
   auto build_dir = root / "build";
-  generate_parquet_surface(probe_dir, "SELECT range AS k, range * 7 AS v FROM range(50000)",
+  generate_parquet_surface(probe_dir,
+                           "SELECT range AS k, range * 7 AS v FROM range(50000)",
                            /*num_files=*/4);
-  generate_parquet_surface(build_dir, "SELECT range AS k, range AS v FROM range(5000)",
+  generate_parquet_surface(build_dir,
+                           "SELECT range AS k, range AS v FROM range(5000)",
                            /*num_files=*/1);
 
   // --- [2] grouped aggregate surface: 4 files x 50k rows, 50k distinct keys
   //         per file -> ~200k distinct keys, multi-partition merge.
   auto gagg_dir = root / "gagg";
-  generate_parquet_surface(gagg_dir, "SELECT range AS k, range * 2 AS v FROM range(50000)",
+  generate_parquet_surface(gagg_dir,
+                           "SELECT range AS k, range * 2 AS v FROM range(50000)",
                            /*num_files=*/4);
 
   // --- [3] Q11-like BUILD_PROBE scaled down. Keeps the partsupp/supplier/
@@ -207,7 +210,7 @@ TEST_CASE("mgpu_stress - SCHED-RR counter offset rotation",
   params.max_build_hash_table_bytes = 90'000'000;
   params.pipeline_num_threads       = 4;
   params.task_creator_num_threads   = 4;
-  auto yaml = root / "stress.yaml";
+  auto yaml                         = root / "stress.yaml";
   write_mgpu_yaml(yaml, params);
   REQUIRE(fs::exists(yaml));
 
@@ -219,15 +222,18 @@ TEST_CASE("mgpu_stress - SCHED-RR counter offset rotation",
   kQueries.reserve(5);
 
   // [0] from test_physical_order_mgpu.cpp:99
-  kQueries.push_back(
-    "SELECT k, v FROM read_parquet('" + parquet_glob(order_dir) +
-    "') ORDER BY k DESC LIMIT 100");
+  kQueries.push_back("SELECT k, v FROM read_parquet('" + parquet_glob(order_dir) +
+                     "') ORDER BY k DESC LIMIT 100");
 
   // [1] from test_physical_hash_join_mgpu.cpp:149-159 (BUILD_PROBE shape)
   kQueries.push_back(
     "SELECT probe.k, probe.v, build.v AS build_v "
-    "FROM read_parquet('" + parquet_glob(probe_dir) + "') AS probe "
-    "JOIN read_parquet('" + parquet_glob(build_dir) + "') AS build "
+    "FROM read_parquet('" +
+    parquet_glob(probe_dir) +
+    "') AS probe "
+    "JOIN read_parquet('" +
+    parquet_glob(build_dir) +
+    "') AS build "
     "  ON probe.k = build.k "
     "ORDER BY probe.k, probe.v "
     "LIMIT 100");
@@ -235,7 +241,9 @@ TEST_CASE("mgpu_stress - SCHED-RR counter offset rotation",
   // [2] from test_physical_grouped_aggregate_merge_mgpu.cpp:103-110
   kQueries.push_back(
     "SELECT k, SUM(v) AS sum_v, COUNT(*) AS cnt "
-    "FROM read_parquet('" + parquet_glob(gagg_dir) + "') "
+    "FROM read_parquet('" +
+    parquet_glob(gagg_dir) +
+    "') "
     "GROUP BY k "
     "ORDER BY k "
     "LIMIT 50");
@@ -243,16 +251,28 @@ TEST_CASE("mgpu_stress - SCHED-RR counter offset rotation",
   // [3] from test_physical_hash_join_mgpu.cpp:609-636 (Q11-like)
   kQueries.push_back(
     "SELECT ps_partkey, SUM(ps_supplycost * ps_availqty) AS value "
-    "FROM read_parquet('" + parquet_glob(ps_dir) + "') ps "
-    "JOIN read_parquet('" + parquet_glob(s_dir) + "') s ON ps.ps_suppkey = s.s_suppkey "
-    "JOIN read_parquet('" + parquet_glob(n_dir) + "') n ON s.s_nationkey = n.n_nationkey "
+    "FROM read_parquet('" +
+    parquet_glob(ps_dir) +
+    "') ps "
+    "JOIN read_parquet('" +
+    parquet_glob(s_dir) +
+    "') s ON ps.ps_suppkey = s.s_suppkey "
+    "JOIN read_parquet('" +
+    parquet_glob(n_dir) +
+    "') n ON s.s_nationkey = n.n_nationkey "
     "WHERE n.n_name = 'GERMANY' "
     "GROUP BY ps_partkey "
     "HAVING SUM(ps_supplycost * ps_availqty) > ("
     "  SELECT SUM(ps_supplycost * ps_availqty) * 0.00001 "
-    "  FROM read_parquet('" + parquet_glob(ps_dir) + "') ps "
-    "  JOIN read_parquet('" + parquet_glob(s_dir) + "') s ON ps.ps_suppkey = s.s_suppkey "
-    "  JOIN read_parquet('" + parquet_glob(n_dir) + "') n ON s.s_nationkey = n.n_nationkey "
+    "  FROM read_parquet('" +
+    parquet_glob(ps_dir) +
+    "') ps "
+    "  JOIN read_parquet('" +
+    parquet_glob(s_dir) +
+    "') s ON ps.ps_suppkey = s.s_suppkey "
+    "  JOIN read_parquet('" +
+    parquet_glob(n_dir) +
+    "') n ON s.s_nationkey = n.n_nationkey "
     "  WHERE n.n_name = 'GERMANY'"
     ") "
     "ORDER BY value DESC "
@@ -268,7 +288,9 @@ TEST_CASE("mgpu_stress - SCHED-RR counter offset rotation",
       "sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) as sum_charge, "
       "avg(l_quantity) as avg_qty, avg(l_extendedprice) as avg_price, "
       "avg(l_discount) as avg_disc, count(*) as count_order "
-      "FROM " + lineitem + " "
+      "FROM " +
+      lineitem +
+      " "
       "WHERE l_shipdate <= date '1995-08-19' "
       "GROUP BY l_returnflag, l_linestatus "
       "ORDER BY l_returnflag, l_linestatus");
@@ -284,7 +306,7 @@ TEST_CASE("mgpu_stress - SCHED-RR counter offset rotation",
   // iterations; only the counter offset changes. This mirrors the
   // followup-17 stress TEST_CASE (kIterations=3 reusing one connection).
   scoped_mgpu_env env(yaml);
-  auto con = env.make_connection();
+  auto con    = env.make_connection();
   auto& sched = env.get_task_scheduler(con);
 
   for (size_t iter = 0; iter < kIterations; ++iter) {

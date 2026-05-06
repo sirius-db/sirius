@@ -257,8 +257,8 @@ void task_scheduler::management_eventloop()
     // target memory space via cucascade::convert_gpu_to_gpu (which uses
     // peer-DMA where supported and host-staging on consumer hardware).
     if (!have_pref && _gpu_executors.size() > 1) {
-      auto idx = _no_pref_rr_counter.fetch_add(1, std::memory_order_relaxed) %
-                 _gpu_executors.size();
+      auto idx =
+        _no_pref_rr_counter.fetch_add(1, std::memory_order_relaxed) % _gpu_executors.size();
       auto it = _gpu_executors.begin();
       std::advance(it, idx);
       target_device_id = it->first;

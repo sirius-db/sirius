@@ -170,14 +170,14 @@ void downgrade_executor::processing_loop()
       // Copy span -> vector before reordering: the span is a view into the manager's
       // internal storage, and stable_partition would otherwise mutate it in place.
       std::vector<const cucascade::memory::memory_space*> host_spaces(host_span.begin(),
-                                                                     host_span.end());
+                                                                      host_span.end());
       if (auto pref = _config.preferred_numa_node; pref.has_value()) {
-        std::stable_partition(
-          host_spaces.begin(),
-          host_spaces.end(),
-          [pref_numa = *pref](const cucascade::memory::memory_space* s) {
-            return s != nullptr && static_cast<int>(s->get_device_id()) == pref_numa;
-          });
+        std::stable_partition(host_spaces.begin(),
+                              host_spaces.end(),
+                              [pref_numa = *pref](const cucascade::memory::memory_space* s) {
+                                return s != nullptr &&
+                                       static_cast<int>(s->get_device_id()) == pref_numa;
+                              });
       }
       for (auto* hs : host_spaces) {
         target_spaces.push_back(hs);

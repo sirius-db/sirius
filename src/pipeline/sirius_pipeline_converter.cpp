@@ -152,8 +152,10 @@ sirius_pipeline_converter::schedule_and_copy_pipelines(sirius_meta_pipeline& roo
   return copied_scheduled;
 }
 
-// TODO(v1.4 Phase 18 — DB-01): batch_lock_utils RAII migration may affect this converter — review when DB-01 lands
-// TODO(v1.4 Phase 20 — SM-03): if writer_event recording happens here, ensure cudaStreamWaitEvent chain remains intact post-Scan-Manager (Phase 13 / Pitfall P2)
+// TODO(v1.4 Phase 18 — DB-01): batch_lock_utils RAII migration may affect this converter — review
+// when DB-01 lands
+// TODO(v1.4 Phase 20 — SM-03): if writer_event recording happens here, ensure cudaStreamWaitEvent
+// chain remains intact post-Scan-Manager (Phase 13 / Pitfall P2)
 //===----------------------------------------------------------------------===//
 // split_parquet_scan_source()
 //

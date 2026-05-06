@@ -18,10 +18,10 @@
 
 #include <cudf/table/table_view.hpp>
 
+#include <rmm/cuda_stream_view.hpp>
+
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
-
-#include <rmm/cuda_stream_view.hpp>
 
 #include <atomic>
 #include <cstdint>
@@ -97,7 +97,8 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
 }
 
 /**
- * @brief Create a shared_ptr<data_batch> from a unique_ptr<cudf::table>, recording the writer event.
+ * @brief Create a shared_ptr<data_batch> from a unique_ptr<cudf::table>, recording the writer
+ * event.
  *
  * @copydoc make_data_batch(cudf::table&&, cucascade::memory::memory_space&,
  *                          rmm::cuda_stream_view)

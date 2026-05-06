@@ -106,8 +106,10 @@ TEMPLATE_TEST_CASE("sirius_physical_streaming_limit limits rows in data_batch",
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
   // Phase 18 / DB-03 Recipe R1: scoped read-only accessor; table_view is non-owning,
   // must outlive every read of output_table below. Released at end of enclosing scope.
-  auto __ro_output_table = dynamic_cast<const pipelineable_operator_data&>(*outputs) .get_data_batches()[0]->to_read_only();
-  auto output_table    = __ro_output_table.get_data()->cast<gpu_table_representation>().get_table_view();
+  auto __ro_output_table =
+    dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]->to_read_only();
+  auto output_table =
+    __ro_output_table.get_data()->cast<gpu_table_representation>().get_table_view();
   auto host_vals = copy_column_to_host<typename Traits::type>(output_table.column(0));
 
   std::vector<typename Traits::type> expected = {values[2], values[3], values[4]};

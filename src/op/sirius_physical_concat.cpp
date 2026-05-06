@@ -99,7 +99,7 @@ std::optional<task_creation_hint> sirius_physical_concat::get_next_task_hint()
     size_t total_batch_size = 0;
     size_t pulled_count     = 0;
     for (auto& batch_id : batch_ids) {
-      auto batch = port_ptr->repo->get_data_batch_by_id(batch_id, i);
+      auto batch          = port_ptr->repo->get_data_batch_by_id(batch_id, i);
       uint64_t batch_size = 0;
       {
         auto ro = batch->to_read_only();

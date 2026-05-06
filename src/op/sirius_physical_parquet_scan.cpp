@@ -21,11 +21,11 @@
 #include "op/scan/scan_utils.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 
-#include <duckdb/common/multi_file/multi_file_states.hpp>
-
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 #include <rmm/mr/per_device_resource.hpp>
+
+#include <duckdb/common/multi_file/multi_file_states.hpp>
 
 #include <unordered_set>
 

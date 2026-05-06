@@ -93,8 +93,9 @@ TEST_CASE("sirius_physical_top_n single-key uses top_k per batch", "[physical_to
 
   // Phase 18 / DB-03 Recipe R1: scoped read-only accessor; table_view is non-owning,
   // must outlive every read of table below. Released at end of enclosing scope.
-  auto __ro_table = dynamic_cast<const pipelineable_operator_data&>(*out) .get_data_batches()[0]->to_read_only();
-  auto table    = __ro_table.get_data()->cast<gpu_table_representation>().get_table_view();
+  auto __ro_table =
+    dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]->to_read_only();
+  auto table       = __ro_table.get_data()->cast<gpu_table_representation>().get_table_view();
   auto view        = table;
   auto orders_out  = copy_column_to_host<int64_t>(view.column(0));
   auto payload_out = copy_column_to_host<int64_t>(view.column(1));
@@ -136,8 +137,9 @@ TEST_CASE("sirius_physical_top_n multi-key falls back to sort_by_key", "[physica
 
   // Phase 18 / DB-03 Recipe R1: scoped read-only accessor; table_view is non-owning,
   // must outlive every read of table below. Released at end of enclosing scope.
-  auto __ro_table = dynamic_cast<const pipelineable_operator_data&>(*out) .get_data_batches()[0]->to_read_only();
-  auto table    = __ro_table.get_data()->cast<gpu_table_representation>().get_table_view();
+  auto __ro_table =
+    dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]->to_read_only();
+  auto table       = __ro_table.get_data()->cast<gpu_table_representation>().get_table_view();
   auto view        = table;
   auto orders_out  = copy_column_to_host<int64_t>(view.column(0));
   auto payload_out = copy_column_to_host<int64_t>(view.column(1));
@@ -180,8 +182,9 @@ TEST_CASE("sirius_physical_top_n_merge applies offset and limit", "[physical_top
 
   // Phase 18 / DB-03 Recipe R1: scoped read-only accessor; table_view is non-owning,
   // must outlive every read of table below. Released at end of enclosing scope.
-  auto __ro_table = dynamic_cast<const pipelineable_operator_data&>(*out) .get_data_batches()[0]->to_read_only();
-  auto table    = __ro_table.get_data()->cast<gpu_table_representation>().get_table_view();
+  auto __ro_table =
+    dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]->to_read_only();
+  auto table       = __ro_table.get_data()->cast<gpu_table_representation>().get_table_view();
   auto view        = table;
   auto orders_out  = copy_column_to_host<int64_t>(view.column(0));
   auto payload_out = copy_column_to_host<int64_t>(view.column(1));
@@ -250,7 +253,8 @@ TEST_CASE("sirius_physical_top_n_merge handles empty batches", "[physical_top_n_
 
   // Phase 18 / DB-03 Recipe R1: scoped read-only accessor; table_view is non-owning,
   // must outlive every read of table below. Released at end of enclosing scope.
-  auto __ro_table = dynamic_cast<const pipelineable_operator_data&>(*out) .get_data_batches()[0]->to_read_only();
-  auto table    = __ro_table.get_data()->cast<gpu_table_representation>().get_table_view();
+  auto __ro_table =
+    dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]->to_read_only();
+  auto table = __ro_table.get_data()->cast<gpu_table_representation>().get_table_view();
   REQUIRE(table.num_rows() == 0);
 }

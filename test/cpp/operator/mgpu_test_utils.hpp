@@ -196,8 +196,7 @@ class scoped_mgpu_env {
    */
   sirius::pipeline::task_scheduler& get_task_scheduler(duckdb::Connection& con)
   {
-    auto sirius_ctx =
-      con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
     return sirius_ctx->get_task_scheduler();
   }
 

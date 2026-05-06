@@ -85,15 +85,13 @@ class dummy_task : public sirius::parallel::itask {
 std::unique_ptr<sirius::pipeline::gpu_pipeline_task> make_test_gpu_task(
   uint64_t task_id,
   std::vector<std::shared_ptr<cucascade::data_batch>> batches,
-  bool non_idle_state                                            = false,
+  bool non_idle_state                                                   = false,
   std::vector<std::optional<cucascade::mutable_data_batch>>* mut_holder = nullptr)
 {
   if (non_idle_state) {
     for (auto& b : batches) {
       auto opt = b->try_to_mutable();
-      if (mut_holder && opt.has_value()) {
-        mut_holder->emplace_back(std::move(*opt));
-      }
+      if (mut_holder && opt.has_value()) { mut_holder->emplace_back(std::move(*opt)); }
     }
   }
 

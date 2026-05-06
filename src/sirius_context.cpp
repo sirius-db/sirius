@@ -37,10 +37,10 @@
 
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
-#include <io/types.hpp>
-#include <io/uring/uring_ioctx.hpp>
 #include <duckdb/common/allocator.hpp>
 #include <duckdb/execution/physical_plan_generator.hpp>
+#include <io/types.hpp>
+#include <io/uring/uring_ioctx.hpp>
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/spdlog.h>
 

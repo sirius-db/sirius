@@ -188,18 +188,18 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
   // run_batch() can construct sirius_datasources via ioctx->make_datasource(io_object)
   // instead of cudf's bundled file_source factory (the latter routes through
   // kvikio and bypasses Phase 19's io_uring + per-GPU CUDA-context binding).
-  auto provider = std::make_unique<parquet_split_provider>(
-    info->returned_types,
-    info->file_paths,
-    info->column_ids,
-    info->projection_ids,
-    info->names,
-    op->get_types().size(),
-    std::move(info->table_filters),
-    info->partition_indices,
-    info->approximate_batch_size,
-    parquet_split_provider::DEFAULT_MAX_FILE_PROCESSED,
-    gpu_ioctxs);
+  auto provider =
+    std::make_unique<parquet_split_provider>(info->returned_types,
+                                             info->file_paths,
+                                             info->column_ids,
+                                             info->projection_ids,
+                                             info->names,
+                                             op->get_types().size(),
+                                             std::move(info->table_filters),
+                                             info->partition_indices,
+                                             info->approximate_batch_size,
+                                             parquet_split_provider::DEFAULT_MAX_FILE_PROCESSED,
+                                             gpu_ioctxs);
 
   if (auto inject_fn = provider->take_partition_inject_fn()) {
     op->set_partition_inject_fn(std::move(inject_fn));

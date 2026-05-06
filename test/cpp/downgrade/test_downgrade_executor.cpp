@@ -155,8 +155,7 @@ inline bool enable_p2p_for_test(int num_gpus)
 // Phase 18 / DB-03: const dropped from data_batch& parameter (mirrors the
 // debug_utils.hpp pattern from plan 18-04). cucascade::data_batch::to_read_only
 // is non-const under #117 — required to access the now-private get_data().
-uint64_t compute_batch_checksum_fnv1a64(cucascade::data_batch& batch,
-                                        rmm::cuda_stream_view stream)
+uint64_t compute_batch_checksum_fnv1a64(cucascade::data_batch& batch, rmm::cuda_stream_view stream)
 {
   // Phase 18 / DB-03 Recipe R1: scoped read-only accessor; gpu_rep, packed,
   // and host_buf all live within the accessor's shared-lock window.
@@ -394,8 +393,8 @@ TEST_CASE("request_free_memory iterates partitions from last to first", "[downgr
 
   size_t two_batches = 0;
   {
-    auto __ro_11    = batch_p0->to_read_only();
-    two_batches = __ro_11.get_data()->get_size_in_bytes() * 2;
+    auto __ro_11 = batch_p0->to_read_only();
+    two_batches  = __ro_11.get_data()->get_size_in_bytes() * 2;
   }
 
   auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
@@ -452,7 +451,7 @@ TEST_CASE("request_free_memory skips active partitions in first pass", "[downgra
 
   size_t three_batches = 0;
   {
-    auto __ro_16    = batch_p0->to_read_only();
+    auto __ro_16  = batch_p0->to_read_only();
     three_batches = __ro_16.get_data()->get_size_in_bytes() * 3;
   }
 
@@ -613,8 +612,8 @@ TEST_CASE("request_free_memory partial fulfillment returns actual bytes freed",
   auto batch        = make_gpu_batch(*gpu_space);
   size_t batch_size = 0;
   {
-    auto __ro_24    = batch->to_read_only();
-    batch_size = __ro_24.get_data()->get_size_in_bytes();
+    auto __ro_24 = batch->to_read_only();
+    batch_size   = __ro_24.get_data()->get_size_in_bytes();
   }
   repo->add_data_batch(batch);
   repo_mgr.add_new_repository(1, "out", std::move(repo));
@@ -1087,7 +1086,7 @@ TEST_CASE("p2p_transfer_converter_round_trip", "[mem_04_p2p_transfer][multi_gpu]
   }
   size_t original_size = 0;
   {
-    auto __ro_38    = batch->to_read_only();
+    auto __ro_38  = batch->to_read_only();
     original_size = __ro_38.get_data()->get_size_in_bytes();
   }
 

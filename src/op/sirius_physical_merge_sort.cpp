@@ -112,8 +112,8 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
     [this, stream, space](
       std::shared_ptr<cucascade::data_batch> batch) -> std::shared_ptr<cucascade::data_batch> {
     if (_final_projections.empty() || !batch) { return batch; }
-    auto ro              = batch->to_read_only();
-    auto table_view      = sirius::get_cudf_table_view(ro);
+    auto ro         = batch->to_read_only();
+    auto table_view = sirius::get_cudf_table_view(ro);
     std::vector<cudf::column_view> projected_cols;
     for (auto idx : _final_projections) {
       projected_cols.push_back(table_view.column(static_cast<cudf::size_type>(idx)));

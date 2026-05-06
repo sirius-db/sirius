@@ -33,13 +33,13 @@
 // in src/op/scan/parquet_scan_task.cpp:25-35 + sirius_context.cpp.
 #include <io/sirius_datasource.hpp>
 // (other sirius headers above already included)
-#include <io/uring/uring_reactor.hpp>
-
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
+
+#include <io/uring/uring_reactor.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -256,9 +256,8 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
     // the datasource (the uring backend stores the shared_ptr in its
     // datasource subclass), so the io_object survives every column-chunk read
     // performed by sirius_gpu_parquet_scan_operator::read_table_from_metadata.
-    auto io_object = std::make_shared<sirius::io::uring_io_object>(file_path);
-    auto datasource =
-      planning_ioctx_it->second->make_datasource(io_object);
+    auto io_object  = std::make_shared<sirius::io::uring_io_object>(file_path);
+    auto datasource = planning_ioctx_it->second->make_datasource(io_object);
 
     std::unique_ptr<cudf::io::datasource::buffer> footer_buffer;
     footer_buffer = cudf::io::parquet::fetch_footer_to_host(*datasource);

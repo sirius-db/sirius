@@ -28,13 +28,13 @@
 
 #include <rmm/resource_ref.hpp>
 
-#include <io/types.hpp>
 #include <duckdb/common/enums/optimizer_type.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/client_context_state.hpp>
 #include <duckdb/main/prepared_statement_data.hpp>
 #include <duckdb/planner/extension_callback.hpp>
 #include <duckdb/planner/logical_operator.hpp>
+#include <io/types.hpp>
 
 #include <atomic>
 #include <condition_variable>

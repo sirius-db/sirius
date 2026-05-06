@@ -63,7 +63,8 @@ TEMPLATE_TEST_CASE(
   auto [input_table, expected_table] =
     sirius::test::make_test_data_for_grouped_aggregate<Traits>(num_groups, 1, stream, mr);
 
-  std::shared_ptr<data_batch> input_batch = sirius::make_data_batch(std::move(input_table), *space, stream);
+  std::shared_ptr<data_batch> input_batch =
+    sirius::make_data_batch(std::move(input_table), *space, stream);
 
   // Create DuckDB context for aggregate function binding
   duckdb::DuckDB db(nullptr);
@@ -121,7 +122,8 @@ TEMPLATE_TEST_CASE("sirius_physical_grouped_aggregate grouped aggregates with AV
   auto [input_table, expected_table] =
     sirius::test::make_test_data_for_grouped_aggregate_with_avg<Traits>(num_groups, 1, stream, mr);
 
-  std::shared_ptr<data_batch> input_batch = sirius::make_data_batch(std::move(input_table), *space, stream);
+  std::shared_ptr<data_batch> input_batch =
+    sirius::make_data_batch(std::move(input_table), *space, stream);
 
   duckdb::DuckDB db(nullptr);
   duckdb::Connection con(db);
@@ -148,8 +150,10 @@ TEMPLATE_TEST_CASE("sirius_physical_grouped_aggregate grouped aggregates with AV
   // (AVG decomposed into SUM + COUNT_VALID). Verify column count = 1 group + 5 aggregates.
   // Phase 18 / DB-03 Recipe R1: scoped read-only accessor; table_view is non-owning,
   // must outlive every read of output_table below. Released at end of enclosing scope.
-  auto __ro_output_table = dynamic_cast<const pipelineable_operator_data&>(*outputs) .get_data_batches()[0]->to_read_only();
-  auto output_table    = __ro_output_table.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+  auto __ro_output_table =
+    dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]->to_read_only();
+  auto output_table =
+    __ro_output_table.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
   REQUIRE(output_table.num_columns() == 6);  // 1 group + 3 non-avg + 2 (sum+count for avg)
 }
 
@@ -181,7 +185,8 @@ TEMPLATE_TEST_CASE(
   auto [input_table, expected_table] =
     sirius::test::make_test_data_for_grouped_aggregate<Traits>(num_groups, 2, stream, mr);
 
-  std::shared_ptr<data_batch> input_batch = sirius::make_data_batch(std::move(input_table), *space, stream);
+  std::shared_ptr<data_batch> input_batch =
+    sirius::make_data_batch(std::move(input_table), *space, stream);
 
   // Create DuckDB context for aggregate function binding
   duckdb::DuckDB db(nullptr);

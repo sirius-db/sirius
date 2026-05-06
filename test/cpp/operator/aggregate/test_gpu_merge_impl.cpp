@@ -74,8 +74,7 @@ batches_with_handles create_batches_with_random_data(
                                                     ranges,
                                                     cudf::get_default_stream(),
                                                     mem_space.get_default_allocator());
-    auto batch =
-      sirius::make_data_batch(std::move(table), mem_space, cudf::get_default_stream());
+    auto batch = sirius::make_data_batch(std::move(table), mem_space, cudf::get_default_stream());
 
     // Phase 18 / DB-03 Recipe R8: scoped mutable accessor replaces
     // pre-#117 try_to_create_task + try_to_lock_for_processing pair.

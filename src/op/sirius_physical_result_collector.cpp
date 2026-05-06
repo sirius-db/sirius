@@ -138,8 +138,8 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       // Recipe R1: scoped read-only accessor on the input batch for the
       // pre-clone size + tier probe. Dropped at end-of-block before any
       // potential to_mutable on the clone.
-      auto ro_in        = input_batch->to_read_only();
-      auto* in_data     = ro_in.get_data();
+      auto ro_in    = input_batch->to_read_only();
+      auto* in_data = ro_in.get_data();
       if (!in_data) {
         throw invalid_input_exception(
           "[GPUPhysicalMaterializedCollector] data_batch has no data representation");

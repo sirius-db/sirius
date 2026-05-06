@@ -102,7 +102,8 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::get_next_task_input_d
   return std::make_unique<pipelineable_operator_data>(input_batch);
 }
 
-// TODO(v1.4 Phase 20 — SM-01..06): verify v1.3 SCHED-RR distribution survives in this operator's task-creation/dispatch path
+// TODO(v1.4 Phase 20 — SM-01..06): verify v1.3 SCHED-RR distribution survives in this operator's
+// task-creation/dispatch path
 std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operator_data& input_data,
                                                                    rmm::cuda_stream_view stream)
 {
@@ -171,7 +172,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     sirius::gpu_expression_executor gpu_expression_executor(
       local_filter_expr, cudf::get_current_device_resource_ref(), stream);
     // Scoped read-only accessor for filter input read + output memory space (R1).
-    auto ro_in = batch_ref->to_read_only();
+    auto ro_in          = batch_ref->to_read_only();
     auto filtered_table = gpu_expression_executor.select(
       ro_in.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
     output_batch =

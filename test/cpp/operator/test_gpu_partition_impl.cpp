@@ -48,11 +48,11 @@ memory_space* get_shared_mem_space()
  * @return A pair of (batch, mutable_data_batch) — keep the accessor in
  *         scope while processing.
  */
-std::pair<std::shared_ptr<data_batch>, cucascade::mutable_data_batch>
-create_batch_with_random_data(const int num_rows,
-                              const std::vector<cudf::data_type>& column_types,
-                              std::vector<std::optional<std::pair<int, int>>>& ranges,
-                              memory_space& mem_space)
+std::pair<std::shared_ptr<data_batch>, cucascade::mutable_data_batch> create_batch_with_random_data(
+  const int num_rows,
+  const std::vector<cudf::data_type>& column_types,
+  std::vector<std::optional<std::pair<int, int>>>& ranges,
+  memory_space& mem_space)
 {
   // Base input batches, make value ranges small so that we have duplicated partition keys
   for (size_t i = 0; i < ranges.size(); ++i) {
@@ -60,8 +60,7 @@ create_batch_with_random_data(const int num_rows,
   }
   auto table = create_cudf_table_with_random_data(
     num_rows, column_types, ranges, cudf::get_default_stream(), mem_space.get_default_allocator());
-  auto batch =
-    sirius::make_data_batch(std::move(table), mem_space, cudf::get_default_stream());
+  auto batch = sirius::make_data_batch(std::move(table), mem_space, cudf::get_default_stream());
 
   // Phase 18 / DB-03 Recipe R8: scoped mutable accessor replaces the
   // pre-#117 try_to_create_task + try_to_lock_for_processing pair.

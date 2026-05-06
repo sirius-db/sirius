@@ -193,8 +193,8 @@ std::unique_ptr<operator_data> sirius_physical_top_n::execute(const operator_dat
   // STREAM-LINEAGE: compute_top_n_table writes the output table on `stream`;
   // the constructor records the writer event so cross-device readers honor the
   // producer-consumer ordering (Phase 13-02 / 13-04 Path-2).
-  auto output_repr = std::make_unique<cucascade::gpu_table_representation>(
-    std::move(output_table), *space, stream);
+  auto output_repr =
+    std::make_unique<cucascade::gpu_table_representation>(std::move(output_table), *space, stream);
   std::unique_ptr<cucascade::idata_representation> output_data = std::move(output_repr);
   outputs.push_back(
     std::make_shared<cucascade::data_batch>(::sirius::get_next_batch_id(), std::move(output_data)));
@@ -300,8 +300,8 @@ std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operat
   // STREAM-LINEAGE: compute_top_n_table + slice write on `stream`; the
   // constructor records the writer event for downstream cross-device readers
   // (Phase 13-02 / 13-04 Path-2).
-  auto output_repr = std::make_unique<cucascade::gpu_table_representation>(
-    std::move(output_table), *space, stream);
+  auto output_repr =
+    std::make_unique<cucascade::gpu_table_representation>(std::move(output_table), *space, stream);
   std::unique_ptr<cucascade::idata_representation> output_data = std::move(output_repr);
   outputs.push_back(
     std::make_shared<cucascade::data_batch>(::sirius::get_next_batch_id(), std::move(output_data)));

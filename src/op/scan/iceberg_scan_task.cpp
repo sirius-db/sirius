@@ -111,11 +111,8 @@ iceberg_scan_task_global_state::iceberg_scan_task_global_state(
   sirius_physical_iceberg_scan* scan_op,
   size_t approximate_batch_size,
   std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs)
-  : iceberg_scan_task_global_state(std::move(pipeline),
-                                   scan_op,
-                                   prepare(scan_op),
-                                   approximate_batch_size,
-                                   std::move(gpu_ioctxs))
+  : iceberg_scan_task_global_state(
+      std::move(pipeline), scan_op, prepare(scan_op), approximate_batch_size, std::move(gpu_ioctxs))
 {
   // Propagate hive partition info to the base class so it can build
   // the partition injection function (same as the public constructor does).

@@ -135,10 +135,10 @@ TEST_CASE("physical_order - small sort rangecheck regression",
   // originally tripped vector::_M_range_check on the small-sort plan path.
   constexpr int kNumFiles    = 4;
   constexpr int kRowsPerFile = 256;
-  generate_parquet_surface(tmp,
-                           "SELECT (range * 17) % 1024 AS k, range AS v FROM range(" +
-                             std::to_string(kRowsPerFile) + ")",
-                           kNumFiles);
+  generate_parquet_surface(
+    tmp,
+    "SELECT (range * 17) % 1024 AS k, range AS v FROM range(" + std::to_string(kRowsPerFile) + ")",
+    kNumFiles);
 
   auto params                 = make_params();
   params.hash_partition_bytes = 1024;  // force multi-partition on tiny data

@@ -212,11 +212,11 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   // across op->execute(); this scoped to_mutable is the ONLY exclusive lock on
   // the batch. For the size==1 path, merged == input_batches[0]; the lock is
   // released when `mut` leaves this scope.
-  auto mut         = merged->to_mutable();
-  auto* space      = mut.get_memory_space();
-  auto mr          = space->get_default_allocator();
-  auto& gpu_rep    = mut.get_data()->cast<cucascade::gpu_table_representation>();
-  auto merged_cols = gpu_rep.release_table(stream)->release();
+  auto mut           = merged->to_mutable();
+  auto* space        = mut.get_memory_space();
+  auto mr            = space->get_default_allocator();
+  auto& gpu_rep      = mut.get_data()->cast<cucascade::gpu_table_representation>();
+  auto merged_cols   = gpu_rep.release_table(stream)->release();
   int num_group_cols = static_cast<int>(group_idx.size());
 
   std::vector<std::unique_ptr<cudf::column>> output_cols;

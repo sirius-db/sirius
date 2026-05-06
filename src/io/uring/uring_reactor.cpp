@@ -16,11 +16,11 @@
 
 #include "io/uring/uring_reactor.hpp"
 
+#include <rmm/cuda_device.hpp>
+
 #include <fcntl.h>
 #include <spdlog/spdlog.h>
 #include <sys/stat.h>
-
-#include <rmm/cuda_device.hpp>
 
 #include <algorithm>
 #include <deque>
@@ -280,9 +280,7 @@ void uring_reactor::worker_loop()
             // (HYG-02 / IO-16). The `>= 0` guard is preserved so the
             // single-GPU fast-path (device_id < 0 sentinel) is unchanged.
             std::optional<rmm::cuda_set_device_raii> dev_guard;
-            if (req.device_id >= 0) {
-              dev_guard.emplace(rmm::cuda_device_id{req.device_id});
-            }
+            if (req.device_id >= 0) { dev_guard.emplace(rmm::cuda_device_id{req.device_id}); }
             cudaMemcpyAsync(req.dst,
                             (uint8_t*)_bounce[si].buf.get() + req.data_off,
                             actual,

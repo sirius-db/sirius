@@ -859,8 +859,8 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       auto build_batch = input_batches[1];
       // R1 — read-only accessor on build batch is held for the whole hash-table-build
       // section; build_keys cudf::table_view depends on its underlying data.
-      auto build_ro          = build_batch->to_read_only();
-      auto build_keys_result = prepare_join_keys(build_ro,
+      auto build_ro               = build_batch->to_read_only();
+      auto build_keys_result      = prepare_join_keys(build_ro,
                                                  right_key_col_indices,
                                                  cast_necessary,
                                                  key_casts,
@@ -894,9 +894,9 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       // the same way as the mixed join path, but with an equality-only predicate.
       // R1 — read-only accessor on probe batch + build table; both held for the
       // duration of the join (cudf::*_join writes index vectors against these views).
-      auto probe_ro          = input_batches[0]->to_read_only();
-      gather_space           = probe_ro.get_memory_space();
-      auto probe_keys_result = prepare_join_keys(probe_ro,
+      auto probe_ro               = input_batches[0]->to_read_only();
+      gather_space                = probe_ro.get_memory_space();
+      auto probe_keys_result      = prepare_join_keys(probe_ro,
                                                  left_key_col_indices,
                                                  cast_necessary,
                                                  key_casts,
@@ -975,13 +975,13 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
     right_full          = get_cudf_table_view(right_ro_mixed);
     // Mixed join: equality conditions drive the hash table; inequality conditions are evaluated
     // via a cuDF AST binary predicate on the full input tables.
-    auto left_keys_result  = prepare_join_keys(left_ro_mixed,
+    auto left_keys_result     = prepare_join_keys(left_ro_mixed,
                                               left_key_col_indices,
                                               cast_necessary,
                                               key_casts,
                                               /*is_left_side=*/true,
                                               stream);
-    auto right_keys_result = prepare_join_keys(right_ro_mixed,
+    auto right_keys_result    = prepare_join_keys(right_ro_mixed,
                                                right_key_col_indices,
                                                cast_necessary,
                                                key_casts,
@@ -1123,18 +1123,18 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
     // R1 — read-only accessors held for the entire body. The
     // table_views (left_full/right_full) and the key view results all alias
     // memory inside the underlying gpu_table_representations.
-    auto left_ro_std  = input_batches[0]->to_read_only();
-    auto right_ro_std = input_batches[1]->to_read_only();
-    gather_space      = left_ro_std.get_memory_space();
-    left_full         = get_cudf_table_view(left_ro_std);
-    right_full        = get_cudf_table_view(right_ro_std);
-    auto left_keys_result  = prepare_join_keys(left_ro_std,
+    auto left_ro_std            = input_batches[0]->to_read_only();
+    auto right_ro_std           = input_batches[1]->to_read_only();
+    gather_space                = left_ro_std.get_memory_space();
+    left_full                   = get_cudf_table_view(left_ro_std);
+    right_full                  = get_cudf_table_view(right_ro_std);
+    auto left_keys_result       = prepare_join_keys(left_ro_std,
                                               left_key_col_indices,
                                               cast_necessary,
                                               key_casts,
                                               /*is_left_side=*/true,
                                               stream);
-    auto right_keys_result = prepare_join_keys(right_ro_std,
+    auto right_keys_result      = prepare_join_keys(right_ro_std,
                                                right_key_col_indices,
                                                cast_necessary,
                                                key_casts,

@@ -22,12 +22,11 @@
 
 // Phase 20.6 IO-MGPU-02: forward-declare sirius_ioctx via <io/types.hpp>
 // for the gpu_ioctxs map type used by prepare_for_query / create_provider_for.
-#include <io/types.hpp>
-
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
 
 #include <cucascade/memory/memory_space.hpp>
+#include <io/types.hpp>
 
 #include <memory>
 #include <string>

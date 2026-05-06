@@ -105,8 +105,8 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
     // duration of this iteration. The cudf::table_view derived from the
     // accessor is non-owning; the accessor must outlive every read of
     // input_table within this loop body. Lock released at end of iteration.
-    auto ro          = batch->to_read_only();
-    auto* space      = ro.get_memory_space();
+    auto ro     = batch->to_read_only();
+    auto* space = ro.get_memory_space();
     if (!space) { continue; }
     auto input_table = get_cudf_table_view(ro);
     auto num_rows    = input_table.num_rows();

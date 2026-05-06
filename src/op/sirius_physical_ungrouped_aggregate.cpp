@@ -443,10 +443,10 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
     // STREAM-LINEAGE: cudf::table ctor + cudf::make_column_from_scalar wrote
     // on `stream`; the constructor records the writer event for downstream
     // cross-device readers (Phase 13-02 / 13-04 Path-2).
-    auto out_repr = std::make_unique<cucascade::gpu_table_representation>(
-      std::move(out_table), *space, stream);
+    auto out_repr =
+      std::make_unique<cucascade::gpu_table_representation>(std::move(out_table), *space, stream);
     std::unique_ptr<cucascade::idata_representation> output_data = std::move(out_repr);
-    auto const batch_id = ::sirius::get_next_batch_id();
+    auto const batch_id                                          = ::sirius::get_next_batch_id();
     outputs.push_back(std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data)));
   }
 
@@ -539,7 +539,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
 
   // R1 — read-only accessor on merged_batch held for the AVG post-processing
   // body so merged_view (cudf::table_view alias) remains valid.
-  auto merged_ro   = merged_batch->to_read_only();
+  auto merged_ro = merged_batch->to_read_only();
   auto merged_view =
     merged_ro.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
 
@@ -562,11 +562,11 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   // STREAM-LINEAGE: cudf::table ctor + make_avg_column write on `stream`;
   // the constructor records the writer event for downstream cross-device
   // readers (Phase 13-02 / 13-04 Path-2).
-  auto out_repr = std::make_unique<cucascade::gpu_table_representation>(
-    std::move(out_table), *space, stream);
+  auto out_repr =
+    std::make_unique<cucascade::gpu_table_representation>(std::move(out_table), *space, stream);
   std::unique_ptr<cucascade::idata_representation> output_data = std::move(out_repr);
-  auto const batch_id = ::sirius::get_next_batch_id();
-  auto output_batch   = std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data));
+  auto const batch_id                                          = ::sirius::get_next_batch_id();
+  auto output_batch = std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data));
 
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(output_batch)});

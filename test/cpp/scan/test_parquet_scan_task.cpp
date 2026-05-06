@@ -114,8 +114,8 @@ class scan_test_executor : public sirius::parallel::itask_executor {
 /// @param n_gpus  Desired GPU count. Clamped down to actual @c cudaGetDeviceCount
 ///                so the helper is safe on 1-GPU hosts (defaults to all visible
 ///                devices, capped at @p n_gpus).
-inline std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>>
-make_test_gpu_ioctxs(int n_gpus = 2)
+inline std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> make_test_gpu_ioctxs(
+  int n_gpus = 2)
 {
   int device_count = 0;
   cudaGetDeviceCount(&device_count);

@@ -106,8 +106,8 @@ void log_operator_data(const op::sirius_physical_operator& op,
   for (auto& batch : pipelineable_data->get_data_batches()) {
     if (!batch) { continue; }
     // R2 read-only accessor scoped to this single batch.
-    auto ro    = batch->to_read_only();
-    auto view  = get_cudf_table_view(ro);
+    auto ro   = batch->to_read_only();
+    auto view = get_cudf_table_view(ro);
     batch_rows += std::to_string(view.num_rows()) + "  ";
     if (ro.get_data()) { total_bytes += ro.get_data()->get_size_in_bytes(); }
   }

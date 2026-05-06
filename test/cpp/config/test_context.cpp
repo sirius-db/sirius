@@ -86,8 +86,7 @@ bool enable_p2p_for_test(int num_gpus)
 // Phase 18 / DB-03: const dropped from data_batch& parameter (mirrors
 // debug_utils.hpp pattern from plan 18-04). cucascade #117's to_read_only is
 // non-const because it acquires the shared lock.
-uint64_t compute_batch_checksum_fnv1a64(cucascade::data_batch& batch,
-                                        rmm::cuda_stream_view stream)
+uint64_t compute_batch_checksum_fnv1a64(cucascade::data_batch& batch, rmm::cuda_stream_view stream)
 {
   // Phase 18 / DB-03 Recipe R1: scoped read-only accessor for the lifetime
   // of gpu_rep, packed, and host_buf — released at function exit.
