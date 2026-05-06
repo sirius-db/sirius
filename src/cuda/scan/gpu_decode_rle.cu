@@ -45,15 +45,45 @@
 // (many threads in a warp hit the same entry within a long run) benefits
 // from the per-SM read-only cache on Turing/Ampere.
 //
-// Phase-2 follow-ups (deferred per ref_decode_kernel_patterns.md):
-//  - Per-CTA narrow-window binary search: each CTA's row range covers far
-//    fewer entries than the whole segment; thread 0 finds the start entry
-//    and broadcasts an [entry_lo, entry_hi] band the warp searches within.
-//    Drops binary-search levels from log2(ec) to log2(ec_per_chunk).
-//  - cp.async stage of cumsum into shmem on sm_80+; uint4 vector loads to
-//    shrink the warmup-load latency.
-//  - Run-coalesced fast path for chunks where one warp's rows all share an
-//    entry — replace the per-thread search with a warp-vote + broadcast.
+// Phase-2 follow-ups, sorted by RLE-specificity:
+//
+// RLE-specific opportunities (high-confidence wins, not in
+// ref_decode_kernel_patterns.md because they exploit run structure):
+//
+//  - Per-CTA narrow-window binary search: a 2048-row chunk spans far fewer
+//    entries than the whole segment (cumsum length). Thread 0 binary-searches
+//    cumsum for `local_row_start`; thread blockDim.x-1 searches for the
+//    chunk's last row; broadcast (entry_lo, entry_hi) via __shfl_sync; all
+//    threads then search inside cumsum[entry_lo..entry_hi]. Drops binary-
+//    search levels from log2(ec) to log2(ec_per_chunk) — typically 12 → 6.
+//
+//  - Run-coalesced warp-vote fast path: when 32 consecutive output rows of a
+//    warp all live in the same RLE entry (long-run shape — booleans, sorted
+//    low-cardinality columns), `__ballot_sync(my_entry == lane_0_entry)`
+//    detects it; one thread looks up the value and `__shfl_sync` broadcasts.
+//    Workload-dependent: a no-op-or-worse on high-entry-count shapes where
+//    runs are <32 rows. Bench-gate before merge — measure entry-sharing
+//    frequency on real TPC-H RLE columns.
+//
+// Inherited from ref_decode_kernel_patterns.md (verified to apply to RLE,
+// alternatives flagged):
+//
+//  - cp.async stage of cumsum on sm_80+ with uint4 vector loads. Caveat:
+//    per-segment cumsum slices may not be 16-byte aligned within the
+//    concatenated buffer (alignment depends on segment_cumsum_offset * 4),
+//    so the uint4 path needs a scalar head/tail fallback or per-segment
+//    pad-rounding.
+//  - For Turing (sm_75, no cp.async): __ldg on the cumsum read inside
+//    rle_upper_bound's gmem path. Binary-search early levels converge across
+//    the warp → broadcast load → texture-cache route is the right cache.
+//  - Three-way ec dispatch instead of the current two-way:
+//      ec ≤ ~128       → __ldg from gmem direct (L1 absorbs the 512 B cumsum,
+//                         skip shmem-load + __syncthreads overhead)
+//      ec ≤ ~4096      → stage to shmem (current code path)
+//      ec >  4096      → __ldg from gmem (current code path)
+//    The tiny-ec case is currently subsumed into the shmem path; for short
+//    cumsums the per-CTA __syncthreads + 1-iter shmem load probably costs
+//    more than direct L1-resident reads would.
 //===----------------------------------------------------------------------===//
 
 #include "cuda/scan/gpu_decode_rle.cuh"
