@@ -428,25 +428,25 @@ TEST_CASE("gpu_decode_table RLE - unsupported type_size throws",
                       Catch::Contains("viability invariant violated"));
 }
 
-// Bench-scale correctness checks. The microbenches discard their output, so
-// these run the same shapes as `bench RLE *` and assert the decoded values
-// match an expected expansion. Tagged so they run with the default suite,
-// not just the bench filter.
+// Bench-scale correctness checks. The microbenches in bench_decode_codecs.cpp
+// discard their output, so a silent miscompile would still report multi-
+// hundred-GiB/s throughput. Each codec PR should ship a verify TEST_CASE
+// per bench shape using `verify_decoded_column` from decode_test_utils.hpp.
+
+using ::sirius::test::decode::verify_decoded_column;
 
 namespace {
 
 template <typename T>
-void verify_uniform_runs(uint32_t n_runs,
-                         uint16_t run_len,
-                         uint32_t n_segs,
-                         cudf::data_type type)
+auto build_uniform_runs_column(uint32_t n_runs,
+                               uint16_t run_len,
+                               uint32_t n_segs,
+                               cudf::data_type type,
+                               rmm::cuda_stream& stream,
+                               std::vector<rmm::device_buffer>& bufs)
 {
   using ::sirius::test::decode::rle::make_uniform_runs;
-  rmm::cuda_stream stream;
-  rmm::mr::cuda_async_memory_resource mr;
   uint32_t const seg_rows = n_runs * run_len;
-
-  std::vector<rmm::device_buffer> bufs;
   std::vector<gpu_segment_desc> segs;
   bufs.reserve(n_segs);
   segs.reserve(n_segs);
@@ -458,32 +458,12 @@ void verify_uniform_runs(uint32_t n_runs,
                     i * seg_rows,
                     seg_rows});
   }
-
   gpu_column_decode_input col;
   col.out_type   = type;
   col.total_rows = n_segs * seg_rows;
   col.has_nulls  = false;
   col.data.push_back({CompressionType::COMPRESSION_RLE, segs});
-
-  auto t   = gpu_decode_table({col}, stream.view(), mr);
-  auto out = download<T>(t->get_column(0).view().template data<T>(),
-                         col.total_rows,
-                         stream.value());
-
-  // Each segment is a copy of the same uniform-runs block, so expected
-  // value at row r is (r/run_len) % n_runs (within the segment).
-  for (uint32_t s = 0; s < n_segs; ++s) {
-    uint32_t base = s * seg_rows;
-    for (uint32_t i = 0; i < seg_rows; ++i) {
-      uint32_t entry  = i / run_len;
-      T const expected = static_cast<T>(entry);
-      if (out[base + i] != expected) {
-        FAIL("seg=" << s << " row=" << i << " entry=" << entry
-                    << " expected=" << static_cast<int64_t>(expected)
-                    << " got=" << static_cast<int64_t>(out[base + i]));
-      }
-    }
-  }
+  return col;
 }
 
 }  // namespace
@@ -492,21 +472,51 @@ TEST_CASE("gpu_decode_table RLE bench-scale - long_runs verify",
           "[scan][decode][rle][verify]")
 {
   // Mirrors `bench RLE int64 long_runs`: 1092 segments × 16 entries × 7680.
-  verify_uniform_runs<int64_t>(/*n_runs=*/16, /*run_len=*/7680, /*n_segs=*/1092, I64);
+  constexpr uint32_t N_RUNS = 16, N_SEGS = 1092;
+  constexpr uint16_t RUN_LEN = 7680;
+  constexpr uint32_t SEG_ROWS = N_RUNS * RUN_LEN;
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+  std::vector<rmm::device_buffer> bufs;
+  auto col = build_uniform_runs_column<int64_t>(N_RUNS, RUN_LEN, N_SEGS, I64, stream, bufs);
+
+  verify_decoded_column<int64_t>(
+    stream.view(), mr, col,
+    [](uint32_t r) -> int64_t { return static_cast<int64_t>((r % SEG_ROWS) / RUN_LEN); });
 }
 
 TEST_CASE("gpu_decode_table RLE bench-scale - medium_runs verify",
           "[scan][decode][rle][verify]")
 {
-  verify_uniform_runs<int64_t>(/*n_runs=*/1024, /*run_len=*/120, /*n_segs=*/1092, I64);
+  constexpr uint32_t N_RUNS = 1024, N_SEGS = 1092;
+  constexpr uint16_t RUN_LEN = 120;
+  constexpr uint32_t SEG_ROWS = N_RUNS * RUN_LEN;
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+  std::vector<rmm::device_buffer> bufs;
+  auto col = build_uniform_runs_column<int64_t>(N_RUNS, RUN_LEN, N_SEGS, I64, stream, bufs);
+
+  verify_decoded_column<int64_t>(
+    stream.view(), mr, col,
+    [](uint32_t r) -> int64_t { return static_cast<int64_t>((r % SEG_ROWS) / RUN_LEN); });
 }
 
 TEST_CASE("gpu_decode_table RLE bench-scale - short_runs verify (gmem path)",
           "[scan][decode][rle][verify]")
 {
-  // Bench shape with 4096 entries fits in shmem; bump to 5000 so the
-  // verification covers the gmem-cumsum expand path as well.
-  verify_uniform_runs<int32_t>(/*n_runs=*/5000, /*run_len=*/24, /*n_segs=*/200, I32);
+  // Bumped to 5000 entries so it exceeds RLE_SMEM_MAX_ENTRIES (4096) and
+  // exercises the gmem-cumsum expand fallback at scale.
+  constexpr uint32_t N_RUNS = 5000, N_SEGS = 200;
+  constexpr uint16_t RUN_LEN = 24;
+  constexpr uint32_t SEG_ROWS = N_RUNS * RUN_LEN;
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+  std::vector<rmm::device_buffer> bufs;
+  auto col = build_uniform_runs_column<int32_t>(N_RUNS, RUN_LEN, N_SEGS, I32, stream, bufs);
+
+  verify_decoded_column<int32_t>(
+    stream.view(), mr, col,
+    [](uint32_t r) -> int32_t { return static_cast<int32_t>((r % SEG_ROWS) / RUN_LEN); });
 }
 
 TEST_CASE("gpu_decode_table RLE bench-scale - pareto_runs verify",
@@ -516,33 +526,27 @@ TEST_CASE("gpu_decode_table RLE bench-scale - pareto_runs verify",
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
   constexpr uint32_t SEG_ROWS = 122880;
-  constexpr uint32_t N_SEGS   = 32;  // smaller than bench to keep test time
+  constexpr uint32_t N_SEGS   = 32;
 
   std::vector<rmm::device_buffer> bufs;
   std::vector<gpu_segment_desc> segs;
-  std::vector<std::vector<int64_t>> expected_per_seg(N_SEGS);
+  std::vector<int64_t> expected;
+  expected.reserve(static_cast<size_t>(SEG_ROWS) * N_SEGS);
   bufs.reserve(N_SEGS);
   segs.reserve(N_SEGS);
 
   for (uint32_t s = 0; s < N_SEGS; ++s) {
-    // Reproduce the same Pareto realisation the bench uses (seed = s+1) so
-    // we can compare against an expected expansion.
-    uint32_t entries = 0;
-    auto seg_bytes   = make_pareto_runs<int64_t>(SEG_ROWS, /*seed=*/s + 1, 400.0,
-                                                  /*cap_max=*/2048, &entries);
+    auto seg_bytes = make_pareto_runs<int64_t>(SEG_ROWS, /*seed=*/s + 1, 400.0);
     bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream.view());
     segs.push_back({static_cast<uint8_t const*>(bufs.back().data()),
                     static_cast<uint32_t>(bufs.back().size()),
                     s * SEG_ROWS,
                     SEG_ROWS});
 
-    // Reconstruct the expected expansion by re-running the same generator
-    // path on host.
-    std::vector<int64_t> expected;
-    expected.reserve(SEG_ROWS);
-    uint32_t lcg            = (s + 1) ? (s + 1) : 0x9E3779B9u;
-    uint32_t emitted        = 0;
-    int64_t next_value      = 0;
+    // Reproduce the bench's LCG path for the expected expansion.
+    uint32_t lcg       = (s + 1) ? (s + 1) : 0x9E3779B9u;
+    uint32_t emitted   = 0;
+    int64_t next_value = 0;
     while (emitted < SEG_ROWS) {
       lcg            = lcg * 1664525u + 1013904223u;
       double const u = static_cast<double>(lcg) / static_cast<double>(0xFFFFFFFFu);
@@ -554,7 +558,6 @@ TEST_CASE("gpu_decode_table RLE bench-scale - pareto_runs verify",
       ++next_value;
       emitted += run_len;
     }
-    expected_per_seg[s] = std::move(expected);
   }
 
   gpu_column_decode_input col;
@@ -563,17 +566,6 @@ TEST_CASE("gpu_decode_table RLE bench-scale - pareto_runs verify",
   col.has_nulls  = false;
   col.data.push_back({CompressionType::COMPRESSION_RLE, segs});
 
-  auto t = gpu_decode_table({col}, stream.view(), mr);
-  auto out =
-    download<int64_t>(t->get_column(0).view().data<int64_t>(), col.total_rows, stream.value());
-
-  for (uint32_t s = 0; s < N_SEGS; ++s) {
-    for (uint32_t i = 0; i < SEG_ROWS; ++i) {
-      if (out[s * SEG_ROWS + i] != expected_per_seg[s][i]) {
-        FAIL("seg=" << s << " row=" << i
-                    << " expected=" << expected_per_seg[s][i]
-                    << " got=" << out[s * SEG_ROWS + i]);
-      }
-    }
-  }
+  verify_decoded_column<int64_t>(
+    stream.view(), mr, col, [&](uint32_t r) -> int64_t { return expected[r]; });
 }
