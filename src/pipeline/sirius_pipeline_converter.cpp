@@ -975,6 +975,27 @@ void sirius_pipeline_converter::wire_data_repositories()
                             dependent_pipeline));
         pipeline->get_sink()->add_next_port_after_sink({next_op, port_id});
       }
+    } else if (pipeline->sink->type == op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN) {
+      // GPU_PARQUET_SCAN streams batches downstream as they arrive (PIPELINE
+      // barrier), but unlike DUCKDB_SCAN/ICEBERG_SCAN there is no intermediate
+      // TABLE_SCAN proxy in the dependent pipeline — the immediate consumer
+      // (e.g. PARTITION) reads from the "default" port directly.
+      for (auto const& dependent_pipeline : source_to_pipelines[pipeline->get_sink().get()]) {
+        auto next_op             = dependent_pipeline->get_operators().size() == 0
+                                     ? dependent_pipeline->get_sink().get()
+                                     : &dependent_pipeline->get_operators()[0].get();
+        size_t op_id             = next_op->operator_id;
+        std::string_view port_id = "default";
+        data_repo_manager.add_new_repository(
+          op_id, port_id, std::make_unique<::cucascade::shared_data_repository>());
+        next_op->add_port(port_id,
+                          std::make_unique<op::sirius_physical_operator::port>(
+                            op::MemoryBarrierType::PIPELINE,
+                            data_repo_manager.get_repository(op_id, port_id).get(),
+                            pipeline,
+                            dependent_pipeline));
+        pipeline->get_sink()->add_next_port_after_sink({next_op, port_id});
+      }
     } else if (pipeline->sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
       // No action needed for RESULT_COLLECTOR sinks
     } else {
