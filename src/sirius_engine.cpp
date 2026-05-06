@@ -19,6 +19,7 @@
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "log/logging.hpp"
 #include "op/scan/iceberg_metadata_reader.hpp"
@@ -167,26 +168,6 @@ void sirius_engine::cancel_tasks()
 {
   sirius_pipelines.clear();
   sirius_root_pipelines.clear();
-}
-
-duckdb::shared_ptr<pipeline::sirius_pipeline> sirius_engine::create_child_pipeline(
-  pipeline::sirius_pipeline& current, op::sirius_physical_operator& op)
-{
-  D_ASSERT(!current.operators.empty());
-  D_ASSERT(op.is_source());
-  // found another operator that is a source, schedule a child pipeline
-  // 'op' is the source, and the sink is the same
-  auto child_pipeline    = duckdb::make_shared_ptr<pipeline::sirius_pipeline>(*this);
-  child_pipeline->sink   = current.get_sink();
-  child_pipeline->source = &op;
-
-  // the child pipeline has the same operators up until 'op'
-  for (auto current_op : current.get_operators()) {
-    if (&current_op.get() == &op) { break; }
-    child_pipeline->operators.push_back(current_op);
-  }
-
-  return child_pipeline;
 }
 
 bool sirius_engine::has_result_collector()
@@ -386,18 +367,23 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 
   sirius_physical_plan = &plan;
 
+  // Create plan-time build context (decoupled from engine)
+  pipeline::pipeline_build_context build_ctx;
+  build_ctx.preserve_insertion_order =
+    duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context);
+
   // Build meta-pipeline tree from operator plan
   pipeline::sirius_pipeline_build_state state;
   auto root_pipeline =
-    duckdb::make_shared_ptr<pipeline::sirius_meta_pipeline>(*this, state, nullptr);
+    duckdb::make_shared_ptr<pipeline::sirius_meta_pipeline>(build_ctx, state, nullptr);
   root_pipeline->build(*sirius_physical_plan);
   root_pipeline->ready();
   root_pipeline->get_pipelines(sirius_root_pipelines, false);
   root_pipeline_idx = 0;
 
   // Convert meta-pipelines into execution-ready pipelines
-  pipeline::sirius_pipeline_converter converter(*this, op_params);
-  auto result = converter.convert(*root_pipeline);
+  pipeline::sirius_pipeline_converter converter(build_ctx, op_params, &iceberg_delete_data_cache_);
+  auto result = converter.convert(*root_pipeline, *this);
 
   new_scheduled         = std::move(result.scheduled_pipelines);
   new_pipeline_breakers = std::move(result.pipeline_breakers);
