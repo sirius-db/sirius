@@ -1,0 +1,126 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+// standard library
+#include <memory>
+#include <type_traits>
+#include <utility>
+#include <variant>
+
+namespace sirius::ast {
+
+// Forward declaration of node as a struct (not a type alias).
+// std::variant cannot contain an incomplete type, so `node` must wrap the
+// variant inside a struct that CAN be forward-declared. The per-node headers
+// store std::unique_ptr<node> with node still incomplete, which is permitted
+// for unique_ptr.
+struct node;
+
+}  // namespace sirius::ast
+
+// Per-node headers complete each alternative type below. Each header carries
+// its own `struct node;` forward declaration so it can hold
+// std::unique_ptr<node> children without depending on this file's ordering.
+#include "expression/ast/between.hpp"
+#include "expression/ast/case_expr.hpp"
+#include "expression/ast/cast.hpp"
+#include "expression/ast/coalesce.hpp"
+#include "expression/ast/comparison.hpp"
+#include "expression/ast/conjunction.hpp"
+#include "expression/ast/constant.hpp"
+#include "expression/ast/function_call.hpp"
+#include "expression/ast/in_list.hpp"
+#include "expression/ast/reference.hpp"
+#include "expression/ast/unary_op.hpp"
+
+namespace sirius::ast {
+
+/**
+ * @brief Sum type over every Sirius AST node kind.
+ *
+ * `node` is a struct wrapping `std::variant<...>` rather than a plain type
+ * alias. A struct is required because:
+ *   1. Recursive children in per-node headers store `std::unique_ptr<node>`,
+ *      which needs `node` to be forward-declarable. Type aliases cannot be
+ *      forward-declared; structs can.
+ *   2. `std::variant<Ts...>` requires every `T` to be complete at the point
+ *      the variant is instantiated. Since the variant is defined here — after
+ *      all per-node headers are included — every alternative is complete.
+ *
+ * The alternative order is part of the public ABI: std::variant indexes its
+ * alternatives by position, and downstream std::visit dispatch (added by the
+ * dual-path executor work, sirius-db/sirius#698) depends on this ordering.
+ * Inserting a new alternative MUST happen at the end to preserve the index.
+ */
+struct node {
+  using variant_t = std::variant<reference,
+                                 constant,
+                                 comparison,
+                                 conjunction,
+                                 between,
+                                 case_expr,
+                                 cast,
+                                 unary_op,
+                                 coalesce,
+                                 in_list,
+                                 function_call>;
+
+  variant_t v;
+
+  node() = default;
+
+  /// Construct a node from any alternative by forwarding into the variant.
+  /// Excluded from overload resolution when T is `node` itself so the copy /
+  /// move special members below are preferred.
+  template <class T, std::enable_if_t<!std::is_same_v<std::decay_t<T>, node>, int> = 0>
+  node(T&& alt) : v(std::forward<T>(alt))
+  {
+  }
+
+  // Move-only. Expression trees own their children via std::unique_ptr, so
+  // copying is neither supported nor intended.
+  node(const node&)                = delete;
+  node& operator=(const node&)     = delete;
+  node(node&&) noexcept            = default;
+  node& operator=(node&&) noexcept = default;
+
+  ~node() = default;
+
+  /// Returns true if this node currently holds an alternative of type T.
+  template <class T>
+  [[nodiscard]] bool holds() const noexcept
+  {
+    return std::holds_alternative<T>(v);
+  }
+
+  /// Returns a reference to the held alternative of type T.
+  /// Throws std::bad_variant_access if the held alternative is a different type.
+  template <class T>
+  [[nodiscard]] T& get()
+  {
+    return std::get<T>(v);
+  }
+
+  template <class T>
+  [[nodiscard]] T const& get() const
+  {
+    return std::get<T>(v);
+  }
+};
+
+}  // namespace sirius::ast
