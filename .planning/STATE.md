@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Rebase After DataBatch Changes
-status: executing
-stopped_at: "Completed 19-05-PLAN.md (IO-14/IO-15: consumer migration to sirius_datasource + cucascade_datasource retirement)"
-last_updated: "2026-05-06T01:16:18.743Z"
+status: verifying
+stopped_at: Completed 19-06-PLAN.md (Phase 19 verification gauntlet PASS - all 6 IO-12..17 closed)
+last_updated: "2026-05-06T09:34:51.170Z"
 last_activity: 2026-05-06
 progress:
   total_phases: 6
-  completed_phases: 3
+  completed_phases: 4
   total_plans: 22
-  completed_plans: 21
+  completed_plans: 22
 ---
 
 # Project State
@@ -20,17 +20,17 @@ progress:
 See: .planning/PROJECT.md (updated 2026-05-04)
 
 **Core value:** Any query can transparently execute across every GPU on the node — tasks are scheduled to the GPU where their input data already resides, memory pressure is absorbed by downgrading to the correct NUMA domain, and parquet I/O is routed through a multi-GPU-safe backend.
-**Current focus:** Phase 19 — IO Framework Adoption (PR #675)
+**Current focus:** Phase 20 — Scan Manager + Pin Tables Port (PR #731 + #721)
 
 ## Current Position
 
-Phase: 19 (IO Framework Adoption (PR #675)) — EXECUTING
-Plan: 6 of 6
-Status: Ready to execute
+Phase: 19 (IO Framework Adoption (PR #675)) — COMPLETE
+Plan: 6 of 6 (all complete)
+Status: Phase 19 PASS — ready to plan Phase 20
 Last activity: 2026-05-06
 
 ```
-v1.4 Progress: [##########          ] 3/6 phases | 10/32 requirements | 16 plans
+v1.4 Progress: [#############       ] 4/6 phases | 16/32 requirements | 22 plans
 ```
 
 ## Phase Overview (v1.4)
@@ -40,7 +40,7 @@ v1.4 Progress: [##########          ] 3/6 phases | 10/32 requirements | 16 plans
 | 16 | Cucascade Submodule Rebase + Pin Recovery | CC-01..04 | Complete (5/5 plans, PASS) |
 | 17 | Sirius origin/dev Merge — Base Layer | MERGE-01..05 | Complete (4/4 plans, PASS) |
 | 18 | DataBatch RAII Migration | DB-01..05 | Complete (7/7 plans, PASS) |
-| 19 | IO Framework Adoption | IO-12..17 | Not started |
+| 19 | IO Framework Adoption | IO-12..17 | Complete (6/6 plans, PASS) |
 | 20 | Scan Manager + Pin Tables Port | SM-01..06 | Not started |
 | 21 | v1.4 Ship Gate | REG-01..06 | Not started |
 
@@ -98,6 +98,7 @@ v1.4 Progress: [##########          ] 3/6 phases | 10/32 requirements | 16 plans
 | Phase 19 P02 | 10min | 1 tasks | 1 files |
 | Phase 19 P04 | 10min | 2 tasks | 2 files |
 | Phase 19 P05 | 33min | 3 tasks | 11 files |
+| Phase 19 P06 | 36min | 2 tasks | 3 files |
 
 ## Decisions
 
@@ -201,6 +202,8 @@ v1.4 Progress: [##########          ] 3/6 phases | 10/32 requirements | 16 plans
 - [Phase 19]: [19-05] Cached _file_io_objects on parquet_scan_task_global_state per RESEARCH.md Open Q1 — populated at planning time inside initialize_from_files(), reused by every per-task hot-path datasource construction. Avoids per-task fd reopens (uring_io_object ctor opens 2 fds: O_RDONLY + O_RDONLY|O_DIRECT). Cleanup is automatic via global_state destruction (initialize_cache() NOT called per Open Q2).
 - [Phase 19]: [19-05] Forward-declare uring_io_object in parquet_scan_task.hpp + include uring_reactor.hpp LAST in parquet_scan_task.cpp's include block — works around liburing.h's BLOCK_SIZE macro colliding with blockingconcurrentqueue.h's static const BLOCK_SIZE member. Mirrors sirius_context.cpp's working pattern (logging.hpp before uring_ioctx.hpp).
 - [Phase 19]: [19-05] test_metadata_gpu_scan_operators.cpp call sites flipped to make_test_ioctx() but file remains OUT of CMakeLists.txt TEST_SOURCES — sirius_parquet_metadata_scan_operator.hpp was deleted in Phase 17 merge (re-attached in Phase 20 SM-03). This is the explicit Phase 20+ deferral per the success criterion's option B; edits keep IO-15 grep gate clean and prepare the file for Phase 20 re-add.
+- [Phase 19]: [19-06] Phase 19 closing verdict PASS - all 6 IO-12..17 closed. [TPC-H][parquet] 22/22 PASS at num_gpus=2 (36256 assertions, 78.6s). compute-sanitizer memcheck on [multi_gpu_foundation] (7/7) and [integration][gpu_execution][parquet][join] (42/42, 1.92M assertions): 0 memcheck violations. nvidia-smi dmon confirms non-zero PCIe rxpci on BOTH GPU 0 (63/120 samples; max 2892 MB/s) AND GPU 1 (54/120 samples; max 453 MB/s).
+- [Phase 19]: [19-06] Sanitizer error classification: 8+9 reported errors are CUDA API status returns (cudaErrorPeerAccessAlreadyEnabled from cucascade peer-access probe + cudaErrorInvalidDevice from bounded_thread_pool worker init) - NOT memcheck violations. Phase 5/6 sanitizer baseline (0 errors / 1.92M assertions) preserved.
 
 ## Accumulated Context
 
@@ -236,6 +239,6 @@ v1.4 Progress: [##########          ] 3/6 phases | 10/32 requirements | 16 plans
 
 ## Session Continuity
 
-Last session: 2026-05-06T01:15:55.328Z
-Stopped at: Completed 19-05-PLAN.md (IO-14/IO-15: consumer migration to sirius_datasource + cucascade_datasource retirement)
+Last session: 2026-05-06T09:34:51.167Z
+Stopped at: Completed 19-06-PLAN.md (Phase 19 verification gauntlet PASS - all 6 IO-12..17 closed)
 Resume file: None

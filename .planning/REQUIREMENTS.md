@@ -43,7 +43,7 @@
 - [x] **IO-14**: `uring_ioctx` / `uring_reactor` instances bound to a single GPU's CUDA context — no shared ioctx across GPUs (avoids the v1.1 kvikio single-CUDA-context anti-pattern). `device_read_req.device_id` matches the ioctx's device for every request.
 - [x] **IO-15**: `sirius::io::cucascade_datasource` retired — header file deleted, implementation file deleted, every include site replaced with `sirius::io::sirius_datasource`. `grep -rn "cucascade_datasource" src/ test/` returns zero hits. v1.1 IO-01..11 functionality preserved at the new datasource.
 - [x] **IO-16**: HYG-02 gate — raw `cudaSetDevice` calls in `uring_reactor.cpp` are wrapped in `rmm::cuda_set_device_raii` or guarded such that `rmm::cuda_stream_default` count does not regress beyond 40.
-- [ ] **IO-17**: SF1 smoke regression — `[TPC-H][parquet]` filter passes 22/22 on the new datasource. `[multi_gpu_foundation]` compute-sanitizer memcheck clean.
+- [x] **IO-17**: SF1 smoke regression — `[TPC-H][parquet]` filter passes 22/22 on the new datasource. `[multi_gpu_foundation]` compute-sanitizer memcheck clean. **Closed by plan 19-06**: `[TPC-H][parquet]` 22/22 PASS at num_gpus=2 (36256 assertions, 78.6s, exit 0); compute-sanitizer memcheck on `[multi_gpu_foundation]` (7/7, 38 assertions) and `[integration][gpu_execution][parquet][join]` (42/42, 1.92M assertions) report 0 memcheck violations. See 19-VERDICT.md Section A + Section C.
 
 ### SM — Scan Manager + Pin Tables Port (PR #731 + #721)
 
@@ -114,7 +114,7 @@
 | IO-14 | 19 | Complete |
 | IO-15 | 19 | Complete |
 | IO-16 | 19 | Complete |
-| IO-17 | 19 | Pending |
+| IO-17 | 19 | Complete |
 | SM-01 | 20 | Pending |
 | SM-02 | 20 | Pending |
 | SM-03 | 20 | Pending |
