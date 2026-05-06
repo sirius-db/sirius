@@ -160,7 +160,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 - [x] 19-02-PLAN.md — IO-16 HYG-02 fix: scoped rmm::cuda_set_device_raii at uring_reactor.cpp:~276
 - [x] 19-03-PLAN.md — Add new test fixture helpers (make_test_gpu_ioctxs / make_test_ioctx) alongside old ones
 - [x] 19-04-PLAN.md — IO-13/14: per-GPU sirius_ioctx init loop in SiriusContext under rmm::cuda_set_device_raii
-- [ ] 19-05-PLAN.md — IO-14/15: flip parquet+iceberg+task_creator+sirius_context consumers; retire cucascade_datasource (delete 3 files)
+- [x] 19-05-PLAN.md — IO-14/15: flip parquet+iceberg+task_creator+sirius_context consumers; retire cucascade_datasource (delete 3 files)
 - [ ] 19-06-PLAN.md — IO-17 verification gauntlet: [TPC-H][parquet] 22/22 + sanitizer memcheck + nvidia-smi dual-GPU PCIe probe + 19-VERDICT.md
 **Pitfalls**:
   - P4 (uring_reactor single CUDA context): create one `uring_ioctx` per GPU in `SiriusContext::initialize()` under `rmm::cuda_set_device_raii`; do NOT create a single shared ioctx for all GPUs — that re-introduces the v1.1 kvikio anti-pattern.
@@ -219,7 +219,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 | 16. Cucascade Submodule Rebase + Pin Recovery | v1.4 | 5/5 | Complete    | 2026-05-05 |
 | 17. Sirius origin/dev Merge — Base Layer | v1.4 | 4/4 | Complete    | 2026-05-05 |
 | 18. DataBatch RAII Migration | v1.4 | 7/7 | Complete | 2026-05-05 |
-| 19. IO Framework Adoption | v1.4 | 4/6 | In Progress|  |
+| 19. IO Framework Adoption | v1.4 | 5/6 | In Progress|  |
 | 20. Scan Manager + Pin Tables Port | v1.4 | 0/? | Not started | - |
 | 21. v1.4 Ship Gate | v1.4 | 0/? | Not started | - |
 

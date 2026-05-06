@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Rebase After DataBatch Changes
 status: executing
-stopped_at: "Completed 19-04-PLAN.md (IO-13/IO-14: per-GPU sirius_ioctx in SiriusContext)"
-last_updated: "2026-05-06T00:31:17.829Z"
+stopped_at: "Completed 19-05-PLAN.md (IO-14/IO-15: consumer migration to sirius_datasource + cucascade_datasource retirement)"
+last_updated: "2026-05-06T01:16:18.743Z"
 last_activity: 2026-05-06
 progress:
   total_phases: 6
   completed_phases: 3
   total_plans: 22
-  completed_plans: 20
+  completed_plans: 21
 ---
 
 # Project State
@@ -25,7 +25,7 @@ See: .planning/PROJECT.md (updated 2026-05-04)
 ## Current Position
 
 Phase: 19 (IO Framework Adoption (PR #675)) — EXECUTING
-Plan: 5 of 6
+Plan: 6 of 6
 Status: Ready to execute
 Last activity: 2026-05-06
 
@@ -97,6 +97,7 @@ v1.4 Progress: [##########          ] 3/6 phases | 10/32 requirements | 16 plans
 | Phase 19 P03 | 2min | 2 tasks | 2 files |
 | Phase 19 P02 | 10min | 1 tasks | 1 files |
 | Phase 19 P04 | 10min | 2 tasks | 2 files |
+| Phase 19 P05 | 33min | 3 tasks | 11 files |
 
 ## Decisions
 
@@ -196,6 +197,10 @@ v1.4 Progress: [##########          ] 3/6 phases | 10/32 requirements | 16 plans
 - [Phase 19]: [19-04] Coexistence (alongside, not replace) keeps Wave 2 narrow to one file pair (sirius_context.cpp+.hpp). Two independent gpu_spaces walks instead of hoisting into a shared loop — keeps each milestone independently grep-locatable; iteration cost negligible.
 - [Phase 19]: [19-04] initialize_cache() NOT called per RESEARCH.md Open Q2 — sirius_datasource device_read falls through to device_read_io when _cache==nullptr; v1.1 baseline correctness feasible without prefetching cache; cache enablement deferred to Phase 20+ (avoids per-GPU buffer_pool ownership question).
 - [Phase 19]: [19-04] Smoke verification under 2-GPU host: [multi_gpu_foundation] 7/7 PASS (38 assertions, 4.3s); [mgpu] 16/16 PASS (79091 assertions, 105.9s). HYG-02 baseline preserved at 40; IO-16 raw cudaSetDevice in src/io/ still 0. No regression of Phase 18 DB-01..05 or earlier multi-GPU correctness gates.
+- [Phase 19]: [19-05] IO-14 + IO-15 closed: parquet/iceberg scan + task_creator + sirius_engine + SiriusContext flipped to sirius_ioctx + sirius_datasource via ioctx->make_datasource(io_object) factory; cucascade_datasource fully retired (header + impl + test deleted; grep gate at 0). Per-GPU CUDA-context binding end-to-end via Phase 9 two-tier preferred_device_id lookup carrying through to per-task ioctx_it lookup.
+- [Phase 19]: [19-05] Cached _file_io_objects on parquet_scan_task_global_state per RESEARCH.md Open Q1 — populated at planning time inside initialize_from_files(), reused by every per-task hot-path datasource construction. Avoids per-task fd reopens (uring_io_object ctor opens 2 fds: O_RDONLY + O_RDONLY|O_DIRECT). Cleanup is automatic via global_state destruction (initialize_cache() NOT called per Open Q2).
+- [Phase 19]: [19-05] Forward-declare uring_io_object in parquet_scan_task.hpp + include uring_reactor.hpp LAST in parquet_scan_task.cpp's include block — works around liburing.h's BLOCK_SIZE macro colliding with blockingconcurrentqueue.h's static const BLOCK_SIZE member. Mirrors sirius_context.cpp's working pattern (logging.hpp before uring_ioctx.hpp).
+- [Phase 19]: [19-05] test_metadata_gpu_scan_operators.cpp call sites flipped to make_test_ioctx() but file remains OUT of CMakeLists.txt TEST_SOURCES — sirius_parquet_metadata_scan_operator.hpp was deleted in Phase 17 merge (re-attached in Phase 20 SM-03). This is the explicit Phase 20+ deferral per the success criterion's option B; edits keep IO-15 grep gate clean and prepare the file for Phase 20 re-add.
 
 ## Accumulated Context
 
@@ -231,6 +236,6 @@ v1.4 Progress: [##########          ] 3/6 phases | 10/32 requirements | 16 plans
 
 ## Session Continuity
 
-Last session: 2026-05-06T00:31:02.784Z
-Stopped at: Completed 19-04-PLAN.md (IO-13/IO-14: per-GPU sirius_ioctx in SiriusContext)
+Last session: 2026-05-06T01:15:55.328Z
+Stopped at: Completed 19-05-PLAN.md (IO-14/IO-15: consumer migration to sirius_datasource + cucascade_datasource retirement)
 Resume file: None
