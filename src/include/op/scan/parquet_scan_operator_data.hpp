@@ -83,7 +83,6 @@ struct row_group_range {
 class parquet_scan_data : public op::operator_data {
  public:
   using translated_expression = gpu_expression_translator::translated_expression;
-  // TODO(v1.4 Phase 20 — SM-02): re-attach _batch_gpu_affinity recording in scan-manager-driven scan path
   parquet_scan_data(std::string file_path,
                     row_group_range rg_range,
                     std::shared_ptr<cudf::io::parquet_reader_options> reader_options,
@@ -146,11 +145,6 @@ class parquet_scan_data : public op::operator_data {
   std::shared_ptr<scan_plan const> plan;
   /// GPU memory space for allocating output tables produced by execute().
   cucascade::memory::memory_space* gpu_memory_space = nullptr;
-  // TODO(v1.4 Phase 20 — SM-02): re-attach per-device filter re-translation fields once
-  // scan-manager world supports multi-GPU task distribution. Fields removed by PR #731:
-  //   std::shared_ptr<duckdb::Expression> retranslation_filter;
-  //   std::function<std::string(duckdb::idx_t)> filter_name_resolver;
-  // See .planning/phases/17-sirius-origin-dev-merge-base-layer/17-PHASE-13-EXTRACT.md
 };
 
 //===----------------------------------------------------------------------===//

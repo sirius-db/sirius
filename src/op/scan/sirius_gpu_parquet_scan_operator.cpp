@@ -170,10 +170,6 @@ std::unique_ptr<cudf::table> sirius_gpu_parquet_scan_operator::read_table_from_m
   return std::move(table);
 }
 
-// TODO(v1.4 Phase 20 — SM-01/SM-02/SM-04): re-attach v1.3 multi-GPU semantics in execute():
-//   - SM-01 (SCHED-RR): verify split assignment is round-robin across GPUs (or port _no_pref_rr_counter to parquet_split_provider)
-//   - SM-02 (_batch_gpu_affinity): record batch_id -> device_id at scan completion (was in v1.3 sirius_gpu_parquet_scan_operator.hpp)
-//   - SM-04 (per-task filter translation): gpu_expression_translator(stream, cudf::get_current_device_resource_ref()) at task time, not plan time
 //===----------------------------------------------------------------------===//
 // execute()
 //===----------------------------------------------------------------------===//
