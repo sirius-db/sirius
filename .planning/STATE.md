@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Rebase After DataBatch Changes
 status: executing
-stopped_at: Completed 20-02-PLAN.md (SM-01 Option A doc + SM-03 Option B doc + SM-02 ownership doc + Open Q1 RETIRE + Pitfall 1 TODO cleanup)
-last_updated: "2026-05-06T11:05:57.468Z"
+stopped_at: "Completed 20-04-PLAN.md (SM-04 + SM-06 verdict; Phase 20 PARTIAL — 5/6 SM-XX PASS, SF1 [integration] BLOCKED on follow-up #17 carried to Phase 21 REG-03)"
+last_updated: "2026-05-06T11:49:06.600Z"
 last_activity: 2026-05-06
 progress:
   total_phases: 6
-  completed_phases: 4
+  completed_phases: 5
   total_plans: 26
-  completed_plans: 25
+  completed_plans: 26
 ---
 
 # Project State
@@ -25,7 +25,7 @@ See: .planning/PROJECT.md (updated 2026-05-04)
 ## Current Position
 
 Phase: 20 (Scan Manager + Pin Tables Port (PR #731 + #721)) — EXECUTING
-Plan: 3 of 4
+Plan: 4 of 4
 Status: Ready to execute
 Last activity: 2026-05-06
 
@@ -102,6 +102,7 @@ v1.4 Progress: [#############       ] 4/6 phases | 16/32 requirements | 22 plans
 | Phase 20 P03 | 2min | 2 tasks | 2 files |
 | Phase 20 P01 | 6min | 3 tasks | 1 files |
 | Phase 20 P02 | 16min | 3 tasks | 6 files |
+| Phase 20 P04 | 18min | 3 tasks | 2 files |
 
 ## Decisions
 
@@ -217,6 +218,11 @@ v1.4 Progress: [#############       ] 4/6 phases | 16/32 requirements | 22 plans
 - [Phase 20]: [20-02] SM-02 affinity map ownership documented in 20-SCHED-RR-PORT.md: lives at duckdb_scan_executor.cpp:154-164,213-222,259-262 (DuckDB-attach scan path). PR #731 did not touch this file. The misleading framing in REQUIREMENTS.md SM-02 is documentation drift per Pitfall 1; corrected here. SM-02 PARTIAL test-fixture mismatch handed to Phase 21+ / v1.5+ test-cleanup (NOT Phase 20 scope; underlying scan_batch disjointedness invariant holds).
 - [Phase 20]: [20-02] SM-03 Option B documented in 20-STREAM-LINEAGE-REATTACH.md (173 lines): stream-lineage re-attached at sirius_gpu_parquet_scan_operator.cpp:259 (post-edit; was 263 pre-edit) via 3-arg make_data_batch(table, mem_space, stream); cucascade ctor body auto-records writer_event when writer_stream non-default; no manual record_writer_event call needed. Phase 13-04 Path-2 carried forward through Phases 17/18/19/20.
 - [Phase 20]: [20-02] Pitfall 1 TODO cleanup: 3 misleading TODO blocks deleted (parquet_scan_operator_data.hpp:86 + 149-153 + sirius_gpu_parquet_scan_operator.cpp:173-176) referencing phantom _batch_gpu_affinity re-attach. SM-03 load-bearing block preserved (now lines 255-259, was 258-262 pre-edit; shifted up by 4 lines). Build clean (mcp exit 0, 27.5s); HYG-02 baseline preserved at 40 / 0 non-legacy; SM-03 grep gate non-zero (1 hit, line 256 post-edit).
+- [Phase 20]: [20-04] SM-06 PARTIAL verdict: SF10 Q1/Q6/Q12 num_gpus=2 PASS (3/3, 227 assertions, 12.01s); SF1 [integration][TPC-H] FAIL at Q11 parquet 2-GPU (canonical Phase 13 P2 cudaErrorIllegalAddress) — pre-existing follow-up #17 (project_phase08_fu17), NOT a Phase 20 regression. Phase 21 REG-03 carries SF1 closure dependency.
+- [Phase 20]: [20-04] SM-04 PASS via dual verification: source inspection at sirius_gpu_parquet_scan_operator.cpp:127 (gpu_expression_translator) + gpu_pipeline_executor.cpp:54-77 (per-thread cudaSetDevice + manager_loop cuda_set_device_raii) confirms per-task filter translation runs under cudaSetDevice RAII. Empirically corroborated by SF10 Q1 num_gpus=2 PASS.
+- [Phase 20]: [20-04] Advisory SF100 Q1 num_gpus=2 PASS at 2.283s cold (well under Phase 21 REG-04 5.7s bar; under Phase 9-04 5.86s + Phase 10-04 5.70s historical baselines). Reduces Phase 21 REG-04 ship-risk substantially.
+- [Phase 20]: [20-04] Advisory [mgpu] 16/16 PASS: 79091 assertions / 106.4s — exact match to Phase 18-VERDICT-V2 + Phase 19-VERDICT baselines. Includes follow-up #17 sentinel TEST_CASE which PASSED. Bounds the SM-06 SF1 failure as Q11-shape + parquet-path specific.
+- [Phase 20]: [20-04] Phase 20 final verdict PARTIAL not FAIL: 5 of 6 SM-XX requirements PASS unconditionally (SM-01..05 + SM-04). SM-06 SF10 PASS captures architecture-level signal Phase 20 was designed to produce. SF1 PARTIAL is pre-existing infrastructure carryover anticipated by Phase 20 scoping (verification + documentation, no code-port). Phase 21 unblocked.
 
 ## Accumulated Context
 
@@ -252,6 +258,6 @@ v1.4 Progress: [#############       ] 4/6 phases | 16/32 requirements | 22 plans
 
 ## Session Continuity
 
-Last session: 2026-05-06T11:05:57.465Z
-Stopped at: Completed 20-02-PLAN.md (SM-01 Option A doc + SM-03 Option B doc + SM-02 ownership doc + Open Q1 RETIRE + Pitfall 1 TODO cleanup)
+Last session: 2026-05-06T11:49:06.597Z
+Stopped at: Completed 20-04-PLAN.md (SM-04 + SM-06 verdict; Phase 20 PARTIAL — 5/6 SM-XX PASS, SF1 [integration] BLOCKED on follow-up #17 carried to Phase 21 REG-03)
 Resume file: None

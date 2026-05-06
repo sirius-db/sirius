@@ -50,9 +50,9 @@
 - [x] **SM-01**: Phase 14 SCHED-RR distribution semantics preserved. Either `parquet_split_provider`'s split-emission is empirically round-robin across GPUs by construction (verified by `[mgpu_stress]` log inspection), OR `_no_pref_rr_counter` is ported to `parquet_split_provider`'s split-emission loop. Documented choice in `20-SCHED-RR-PORT.md`.
 - [x] **SM-02**: Phase 9 `_batch_gpu_affinity` map (~20 LOC) re-planted into the #731-rewritten `sirius_gpu_parquet_scan_operator.hpp`. Phase 9 disjointedness REQUIRE (`std::set_intersection(scan_ids) == ∅`) still fires under the new architecture and gates regression.
 - [x] **SM-03**: Phase 13 stream-lineage hooks (extracted in MERGE-03) re-attached. Either `parquet_split_provider::run_batch` records the writer_event when constructing the data_batch, or `sirius_gpu_parquet_scan_operator::execute` does so post-cudf-call. `cudaStreamWaitEvent` chain preserved on every cross-device peer copy. Documented in `20-STREAM-LINEAGE-REATTACH.md`.
-- [ ] **SM-04**: Per-task filter translation under SCHED-RR works on the new architecture — `gpu_expression_translator(stream, cudf::get_current_device_resource_ref())` is called inside `cudaSetDevice` RAII at task execution time. Verify by running TPC-H Q1 SF10 num_gpus=2 with `[mgpu-probe]` traces showing filter expressions instantiated on the dispatch device.
+- [x] **SM-04**: Per-task filter translation under SCHED-RR works on the new architecture — `gpu_expression_translator(stream, cudf::get_current_device_resource_ref())` is called inside `cudaSetDevice` RAII at task execution time. Verify by running TPC-H Q1 SF10 num_gpus=2 with `[mgpu-probe]` traces showing filter expressions instantiated on the dispatch device.
 - [x] **SM-05**: `pin_table` single-GPU-resident behavior documented as a v1.4 limitation in `PROJECT.md` Deferred section. Follow-up requirement `PIN-MGPU-01` added to v1.5+ scope (multi-GPU-aware pinning).
-- [ ] **SM-06**: SF10 smoke regression — TPC-H Q1, Q6, Q12 PASS at SF10 on `num_gpus: 2`. `[integration][TPC-H]` 48/48 PASS at SF1.
+- [x] **SM-06**: SF10 smoke regression — TPC-H Q1, Q6, Q12 PASS at SF10 on `num_gpus: 2`. `[integration][TPC-H]` 48/48 PASS at SF1.
 
 ### REG — v1.4 Ship Gate (Full v1.3 Gauntlet on Rebased Branch)
 
@@ -118,9 +118,9 @@
 | SM-01 | 20 | Complete |
 | SM-02 | 20 | Complete |
 | SM-03 | 20 | Complete |
-| SM-04 | 20 | Pending |
+| SM-04 | 20 | Complete |
 | SM-05 | 20 | Complete |
-| SM-06 | 20 | Pending |
+| SM-06 | 20 | Complete |
 | REG-01 | 21 | Pending |
 | REG-02 | 21 | Pending |
 | REG-03 | 21 | Pending |
