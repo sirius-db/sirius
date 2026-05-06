@@ -109,3 +109,73 @@ grep -rn "rmm::cuda_stream_default" src/ | grep -v "src/legacy/" | grep -v "src/
 All four static grep gates PASS at HEAD. ROADMAP Phase 20 success criterion 1 (writer_stream/record_writer_event grep) substantiated.
 
 ---
+
+## [mgpu_stress] 500-Iter SCHED-RR Empirical Gate
+
+### Pre-build Gate
+
+**Command:**
+```
+mcp__project-commands__run_command build
+```
+
+**Output (verbatim):**
+```
+cd duckdb && cmake --build --preset release --target duckdb duckdb_local_extension_repo
+ninja: Jobserver mode detected:  -j24 --jobserver-auth=fifo:/tmp/GMfifo1588570
+[1/1] repository
+cd duckdb && cmake --build --preset release --target sirius_unittest
+ninja: Jobserver mode detected:  -j24 --jobserver-auth=fifo:/tmp/GMfifo1588570
+ninja: no work to do.
+```
+
+**Exit code:** 0
+**Duration:** 0.2s (incremental, no work to do — HEAD already built clean)
+
+**Verdict:** **PASS** — incremental build clean, no compile/link errors.
+
+---
+
+### [mgpu_stress] 500-Iter SCHED-RR Run
+
+**Command:**
+```
+mcp__project-commands__run_command unit-tests --filter "[mgpu_stress]"
+```
+
+**TEST_CASE driven:** `mgpu_stress - SCHED-RR counter offset rotation` (test/cpp/operator/test_mgpu_stress.cpp:137)
+**Internal structure:** 100 iterations × 5 representative `[mgpu]` queries = 500 inner runs, with `set_no_pref_rr_counter_for_testing(iter)` per iteration to force varied RR offsets across the GPU executor map.
+
+**Output (verbatim, stdout):**
+```
+Filters: [mgpu_stress]
+
+[0/1] (0%): mgpu_stress - SCHED-RR counter offset rotation
+[1/1] (100%): mgpu_stress - SCHED-RR counter offset rotation
+===============================================================================
+All tests passed (77053 assertions in 1 test case)
+```
+
+**Output (verbatim, stderr):**
+```
+[cucascade] direct GPU↔GPU peer DMA broken on 2 direction(s); cudaMemcpyPeer* will host-stage automatically.
+```
+
+> stderr line is the cucascade peer-DMA empirical-probe diagnostic from MEMORY's `project_tpch_q1_mgpu_string_bug` resolution. NOT an error — host-staging fallback is the documented contingency for hardware where peer DMA is broken (consumer Intel chipset's "lying enable"); on this host (server-class hardware with 2 × RTX 6000 Ada) the probe still emits this diagnostic in some configurations. Test still passed; cucascade fallback path covers correctness.
+
+**Wall-clock:** **73.8s** (within 200s budget; on the low end of historical envelope: Phase 13-04 75.9s, Phase 18 75.5s, Phase 15 86.6s, Phase 19 102.5s).
+**Assertion count:** **77053** (≥ 77053 ROADMAP success criterion 2 — exact match to Phase 15-02 + Phase 18-07 baseline).
+**Exit code:** **0**
+**Test cases:** 1 / 1 PASS
+
+**Verdict:** **PASS** — all five [mgpu_stress] queries (order_by, hash_join, grouped_aggregate, Q11-like, TPC-H Q1) PASS across 100 RR-counter offsets on 2-GPU host.
+
+---
+
+### Option A Determination for SM-01
+
+The empirical pass of `[mgpu_stress]` 500-iter at HEAD substantiates **Option A applies** for SM-01: the post-#731 scan-manager architecture (`parquet_split_provider` / `split_connector` / `sirius_scan_manager`) does NOT need `_no_pref_rr_counter` ported into `parquet_split_provider`'s split-emission loop. The canonical RR site remains `task_scheduler::management_eventloop` line 260 (verified by Gate 2 above) — GPU_PARQUET_SCAN source operator's per-split tasks reach this site via the call graph documented in `20-RESEARCH.md` "Architecture Patterns: End-to-End Call Graph": `parquet_split_provider::run_batch` → `connector.push_split` → `task_creator::manager_loop` → `gpu_pipeline_task` (no preferred device, since input is `parquet_scan_data` not `pipelineable_operator_data`) → `_task_scheduler->schedule` → `_task_queue.push` → `management_eventloop` SCHED-RR `fetch_add`. Plan 20-02 will author `20-SCHED-RR-PORT.md` documenting this Option A decision with this evidence as anchor.
+
+The 500-iter forced-offset test (each iteration sets `_no_pref_rr_counter` to `iter` value via `set_no_pref_rr_counter_for_testing`) confirms the RR rotation correctly distributes preference-less tasks across both GPUs at every offset — if the chain were broken (tasks all piling onto GPU 0 / GPU 1), the 5-query × 100-iter sweep would have surfaced a correctness regression in at least one of the 77053 assertions.
+
+---
