@@ -108,8 +108,8 @@ TEMPLATE_TEST_CASE("sirius_physical_streaming_limit limits rows in data_batch",
                         .get_data_batches()[0]
                         ->get_data()
                         ->cast<gpu_table_representation>()
-                        .get_table();
-  auto host_vals = copy_column_to_host<typename Traits::type>(output_table.view().column(0));
+                        .get_table_view();
+  auto host_vals = copy_column_to_host<typename Traits::type>(output_table.column(0));
 
   std::vector<typename Traits::type> expected = {values[2], values[3], values[4]};
   REQUIRE(host_vals == expected);
@@ -132,8 +132,8 @@ static std::vector<int64_t> collect_all_rows(
 {
   std::vector<int64_t> all_rows;
   for (auto const& b : batches) {
-    auto table = b->get_data()->cast<gpu_table_representation>().get_table();
-    auto col   = sirius::test::operator_utils::copy_column_to_host<int64_t>(table.view().column(0));
+    auto table = b->get_data()->cast<gpu_table_representation>().get_table_view();
+    auto col   = sirius::test::operator_utils::copy_column_to_host<int64_t>(table.column(0));
     all_rows.insert(all_rows.end(), col.begin(), col.end());
   }
   return all_rows;

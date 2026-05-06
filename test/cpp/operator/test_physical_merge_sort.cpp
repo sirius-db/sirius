@@ -135,8 +135,8 @@ TEST_CASE("sirius_physical_merge_sort merges 2 sorted 1-column batches ascending
                  .get_data_batches()[0]
                  ->get_data()
                  ->cast<gpu_table_representation>()
-                 .get_table();
-  auto col0 = copy_column_to_host<int64_t>(table.view().column(0));
+                 .get_table_view();
+  auto col0 = copy_column_to_host<int64_t>(table.column(0));
 
   std::vector<int64_t> expected{1, 2, 3, 4, 5, 6, 7, 8};
   REQUIRE(col0 == expected);
@@ -172,8 +172,8 @@ TEST_CASE("sirius_physical_merge_sort merges 3 sorted 1-column batches descendin
                  .get_data_batches()[0]
                  ->get_data()
                  ->cast<gpu_table_representation>()
-                 .get_table();
-  auto col0 = copy_column_to_host<int64_t>(table.view().column(0));
+                 .get_table_view();
+  auto col0 = copy_column_to_host<int64_t>(table.column(0));
 
   std::vector<int64_t> expected{9, 8, 7, 6, 5, 4, 3, 2, 1};
   REQUIRE(col0 == expected);
@@ -213,8 +213,8 @@ TEST_CASE("sirius_physical_merge_sort merges 2 sorted 2-column batches by col0 a
                  .get_data_batches()[0]
                  ->get_data()
                  ->cast<gpu_table_representation>()
-                 .get_table();
-  auto view   = table.view();
+                 .get_table_view();
+  auto view   = table;
   auto out_c0 = copy_column_to_host<int64_t>(view.column(0));
   auto out_c1 = copy_column_to_host<int64_t>(view.column(1));
 
@@ -261,8 +261,8 @@ TEST_CASE("sirius_physical_merge_sort merges 2-column batches sorted by 2 keys",
                  .get_data_batches()[0]
                  ->get_data()
                  ->cast<gpu_table_representation>()
-                 .get_table();
-  auto view   = table.view();
+                 .get_table_view();
+  auto view   = table;
   auto out_c0 = copy_column_to_host<int64_t>(view.column(0));
   auto out_c1 = copy_column_to_host<int64_t>(view.column(1));
 
@@ -306,8 +306,8 @@ TEST_CASE("sirius_physical_merge_sort merges 3-column batches sorted by col0, re
                  .get_data_batches()[0]
                  ->get_data()
                  ->cast<gpu_table_representation>()
-                 .get_table();
-  auto view   = table.view();
+                 .get_table_view();
+  auto view   = table;
   auto out_c0 = copy_column_to_host<int64_t>(view.column(0));
   auto out_c1 = copy_column_to_host<int64_t>(view.column(1));
   auto out_c2 = copy_column_to_host<int64_t>(view.column(2));
@@ -357,8 +357,8 @@ TEST_CASE("sirius_physical_merge_sort 3 columns sorted by col0 asc + col1 desc",
                  .get_data_batches()[0]
                  ->get_data()
                  ->cast<gpu_table_representation>()
-                 .get_table();
-  auto view   = table.view();
+                 .get_table_view();
+  auto view   = table;
   auto out_c0 = copy_column_to_host<int64_t>(view.column(0));
   auto out_c1 = copy_column_to_host<int64_t>(view.column(1));
   auto out_c2 = copy_column_to_host<int64_t>(view.column(2));
@@ -400,8 +400,8 @@ TEST_CASE("sirius_physical_merge_sort single batch passthrough", "[physical_merg
                  .get_data_batches()[0]
                  ->get_data()
                  ->cast<gpu_table_representation>()
-                 .get_table();
-  auto col0 = copy_column_to_host<int64_t>(table.view().column(0));
+                 .get_table_view();
+  auto col0 = copy_column_to_host<int64_t>(table.column(0));
   REQUIRE(col0 == std::vector<int64_t>{1, 2, 3});
 }
 
@@ -433,8 +433,8 @@ TEST_CASE("sirius_physical_merge_sort skips null batches", "[physical_merge_sort
                  .get_data_batches()[0]
                  ->get_data()
                  ->cast<gpu_table_representation>()
-                 .get_table();
-  auto col0 = copy_column_to_host<int64_t>(table.view().column(0));
+                 .get_table_view();
+  auto col0 = copy_column_to_host<int64_t>(table.column(0));
   REQUIRE(col0 == std::vector<int64_t>{1, 2, 3, 4, 5, 6});
 }
 
@@ -490,7 +490,7 @@ TEST_CASE("sirius_physical_merge_sort constructed from sirius_physical_order",
                  .get_data_batches()[0]
                  ->get_data()
                  ->cast<gpu_table_representation>()
-                 .get_table();
-  auto col0 = copy_column_to_host<int64_t>(table.view().column(0));
+                 .get_table_view();
+  auto col0 = copy_column_to_host<int64_t>(table.column(0));
   REQUIRE(col0 == std::vector<int64_t>{1, 2, 3, 4, 5, 6});
 }

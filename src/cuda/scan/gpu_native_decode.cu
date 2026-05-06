@@ -43,6 +43,7 @@
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 
+#include <cub/cub.cuh>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -203,8 +204,25 @@ void launch_broadcast_constant(uint8_t* d_dest,
                                cudf::data_type type,
                                uint32_t row_count,
                                rmm::cuda_stream_view stream)
+{ cudf::type_dispatcher(type, broadcast_dispatch{}, d_dest, d_val_src, row_count, stream); }
+
+/// @todo [KEVIN]: consider batching to align execution and design here.
+void decode_constant_data(gpu_codec_run const& run,
+                          uint8_t* d_output,
+                          cudf::data_type type,
+                          uint32_t type_size,
+                          rmm::cuda_stream_view stream)
 {
-  cudf::type_dispatcher(type, broadcast_dispatch{}, d_dest, d_val_src, row_count, stream);
+  for (auto const& seg : run.segments) {
+    if (seg.row_count == 0) continue;
+    if (seg.bytes_size < type_size) {
+      throw std::runtime_error("gpu_decode_table: CONSTANT segment bytes_size (" +
+                               std::to_string(seg.bytes_size) + ") < type_size (" +
+                               std::to_string(type_size) + ")");
+    }
+    launch_broadcast_constant(
+      d_output + size_t{seg.row_offset} * type_size, seg.d_bytes, type, seg.row_count, stream);
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -327,22 +345,74 @@ void decode_uncompressed_data(gpu_codec_run const& run,
     d_chunks.data(), static_cast<uint32_t>(n));
 }
 
-void decode_constant_data(gpu_codec_run const& run,
-                          uint8_t* d_output,
-                          cudf::data_type type,
-                          uint32_t type_size,
-                          rmm::cuda_stream_view stream)
+//===----------CUB Uncompressed Decode Alternatvie----------===//
+/// @note [KEVIN] The CUB algorithms provide device tuning automatically, which we are doing
+/// manually here (with, e.g., COPY_CHUNK_BYTES, BLOCK_DIM), and also perform TMA on machines that
+/// support it, making it a more portable alternative to manual kernel writing for batched copies.
+/// It is currently unused, but I expect it may replace the hand-written kernels in the future.
+[[maybe_unused]] void decode_uncompressed_data_cub(gpu_codec_run const& run,
+                                                   uint8_t* d_output,
+                                                   uint32_t type_size,
+                                                   rmm::cuda_stream_view stream,
+                                                   rmm::device_async_resource_ref mr)
 {
+  std::vector<void const*> h_src;
+  std::vector<void*> h_dst;
+  std::vector<size_t> h_sizes;
+  h_src.reserve(run.segments.size());
+  h_dst.reserve(run.segments.size());
+  h_sizes.reserve(run.segments.size());
   for (auto const& seg : run.segments) {
     if (seg.row_count == 0) continue;
-    if (seg.bytes_size < type_size) {
-      throw std::runtime_error("gpu_decode_table: CONSTANT segment bytes_size (" +
-                               std::to_string(seg.bytes_size) + ") < type_size (" +
-                               std::to_string(type_size) + ")");
+    auto const bytes = size_t{seg.row_count} * type_size;
+    if (size_t{seg.bytes_size} < bytes) {
+      throw std::runtime_error("gpu_decode_table: UNCOMPRESSED segment bytes_size (" +
+                               std::to_string(seg.bytes_size) + ") < required " +
+                               std::to_string(bytes));
     }
-    launch_broadcast_constant(
-      d_output + size_t{seg.row_offset} * type_size, seg.d_bytes, type, seg.row_count, stream);
+    h_src.push_back(static_cast<void const*>(seg.d_bytes));
+    h_dst.push_back(static_cast<void*>(d_output + size_t{seg.row_offset} * type_size));
+    h_sizes.push_back(bytes);
   }
+
+  auto const n = h_src.size();
+  //===----------0 live segments----------===//
+  if (n == 0) return;
+
+  //===----------1 live segment----------===//
+  if (n == 1) {
+    RMM_CUDA_TRY(
+      cudaMemcpyAsync(h_dst[0], h_src[0], h_sizes[0], cudaMemcpyDeviceToDevice, stream.value()));
+    return;
+  }
+
+  //===---------->1 live segment----------===//
+  rmm::device_uvector<void const*> d_src(n, stream, mr);
+  rmm::device_uvector<void*> d_dst(n, stream, mr);
+  rmm::device_uvector<size_t> d_sizes(n, stream, mr);
+  RMM_CUDA_TRY(cudaMemcpyAsync(
+    d_src.data(), h_src.data(), n * sizeof(void const*), cudaMemcpyHostToDevice, stream.value()));
+  RMM_CUDA_TRY(cudaMemcpyAsync(
+    d_dst.data(), h_dst.data(), n * sizeof(void*), cudaMemcpyHostToDevice, stream.value()));
+  RMM_CUDA_TRY(cudaMemcpyAsync(
+    d_sizes.data(), h_sizes.data(), n * sizeof(size_t), cudaMemcpyHostToDevice, stream.value()));
+
+  size_t tmp_bytes = 0;
+  RMM_CUDA_TRY(cub::DeviceMemcpy::Batched(nullptr,
+                                          tmp_bytes,
+                                          d_src.data(),
+                                          d_dst.data(),
+                                          d_sizes.data(),
+                                          static_cast<int64_t>(n),
+                                          stream.value()));
+  rmm::device_buffer d_tmp(tmp_bytes, stream, mr);
+  RMM_CUDA_TRY(cub::DeviceMemcpy::Batched(d_tmp.data(),
+                                          tmp_bytes,
+                                          d_src.data(),
+                                          d_dst.data(),
+                                          d_sizes.data(),
+                                          static_cast<int64_t>(n),
+                                          stream.value()));
 }
 
 /// Routes a data run to its codec impl. Adding a codec means adding one case
@@ -375,30 +445,86 @@ void dispatch_data_run(gpu_codec_run const& run,
 // upstream and arrive at this dispatcher as plain validity bytes.
 //===----------------------------------------------------------------------===//
 
-void dispatch_validity_run(gpu_codec_run const& run, uint8_t* d_mask, rmm::cuda_stream_view stream)
+void dispatch_validity_run(gpu_codec_run const& run,
+                           uint8_t* d_mask,
+                           rmm::cuda_stream_view stream,
+                           rmm::device_async_resource_ref mr)
 {
   if (run.codec != duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
     throw std::runtime_error("gpu_decode_table: viability invariant violated — validity codec " +
                              std::to_string(static_cast<int>(run.codec)) + " not implemented");
   }
+
+  std::vector<void const*> h_src;
+  std::vector<void*> h_dst;
+  std::vector<size_t> h_sizes;
+  h_src.reserve(run.segments.size());
+  h_dst.reserve(run.segments.size());
+  h_sizes.reserve(run.segments.size());
   for (auto const& seg : run.segments) {
     if (seg.row_count == 0) continue;
-    // Validity bits pack 8 rows per byte. A non-byte-aligned `row_offset`
-    // would mean a partial-byte memcpy destination, which is meaningless —
-    // treat it as a malformed segment.
     if (seg.row_offset % 8 != 0) {
       throw std::runtime_error("gpu_decode_table: validity row_offset (" +
                                std::to_string(seg.row_offset) + ") not byte-aligned");
     }
-    size_t bytes = (size_t{seg.row_count} + 7) / 8;
-    if (size_t{seg.bytes_size} < bytes) {
+    auto const bytes = ::cuda::ceil_div(seg.row_count, 8);
+    if (seg.bytes_size < bytes) {
       throw std::runtime_error("gpu_decode_table: validity segment bytes_size (" +
                                std::to_string(seg.bytes_size) + ") < required " +
                                std::to_string(bytes));
     }
-    RMM_CUDA_TRY(cudaMemcpyAsync(
-      d_mask + seg.row_offset / 8, seg.d_bytes, bytes, cudaMemcpyDeviceToDevice, stream.value()));
+    h_src.push_back(static_cast<void const*>(seg.d_bytes));
+    h_dst.push_back(static_cast<void*>(d_mask + seg.row_offset / 8));
+    h_sizes.push_back(bytes);
   }
+
+  auto const n_live_segments = h_src.size();
+  //===----------0 live segments----------===//
+  if (n_live_segments == 0) return;
+
+  //===----------1 live segment----------===//
+  if (n_live_segments == 1) {
+    RMM_CUDA_TRY(
+      cudaMemcpyAsync(h_dst[0], h_src[0], h_sizes[0], cudaMemcpyDeviceToDevice, stream.value()));
+    return;
+  }
+
+  //===---------->1 live segments----------===//
+  rmm::device_uvector<void const*> d_src(n_live_segments, stream, mr);
+  rmm::device_uvector<void*> d_dst(n_live_segments, stream, mr);
+  rmm::device_uvector<size_t> d_sizes(n_live_segments, stream, mr);
+  RMM_CUDA_TRY(cudaMemcpyAsync(d_src.data(),
+                               h_src.data(),
+                               n_live_segments * sizeof(void const*),
+                               cudaMemcpyHostToDevice,
+                               stream.value()));
+  RMM_CUDA_TRY(cudaMemcpyAsync(d_dst.data(),
+                               h_dst.data(),
+                               n_live_segments * sizeof(void*),
+                               cudaMemcpyHostToDevice,
+                               stream.value()));
+  RMM_CUDA_TRY(cudaMemcpyAsync(d_sizes.data(),
+                               h_sizes.data(),
+                               n_live_segments * sizeof(size_t),
+                               cudaMemcpyHostToDevice,
+                               stream.value()));
+
+  size_t tmp_bytes = 0;
+  RMM_CUDA_TRY(cub::DeviceMemcpy::Batched(nullptr,
+                                          tmp_bytes,
+                                          d_src.data(),
+                                          d_dst.data(),
+                                          d_sizes.data(),
+                                          static_cast<int64_t>(n_live_segments),
+                                          stream.value()));
+  rmm::device_buffer d_tmp(tmp_bytes, stream, mr);
+  RMM_CUDA_TRY(cub::DeviceMemcpy::Batched(d_tmp.data(),
+                                          tmp_bytes,
+                                          d_src.data(),
+                                          d_dst.data(),
+                                          d_sizes.data(),
+                                          static_cast<int64_t>(n_live_segments),
+                                          stream.value()));
 }
 
 //===----------------------------------------------------------------------===//
@@ -458,7 +584,7 @@ rmm::device_buffer decode_column_validity(gpu_column_decode_input const& col,
   rmm::device_buffer null_mask = cudf::create_null_mask(
     static_cast<cudf::size_type>(col.total_rows), cudf::mask_state::ALL_VALID, stream, mr);
   for (auto const& run : col.validity) {
-    dispatch_validity_run(run, static_cast<uint8_t*>(null_mask.data()), stream);
+    dispatch_validity_run(run, static_cast<uint8_t*>(null_mask.data()), stream, mr);
   }
   return null_mask;
 }

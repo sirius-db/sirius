@@ -482,7 +482,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
     and_chain.reserve(conditions.size() > 1 ? conditions.size() - 1 : 0);
     std::vector<cudf::column_view> left_col_views, right_col_views;
     std::vector<std::unique_ptr<cudf::column>> intermediates_scope_holder;
-    std::vector<std::shared_ptr<cucascade::data_batch>> expression_res_scope_hodler;
+    std::vector<std::unique_ptr<cudf::table>> expression_res_scope_hodler;
     left_col_views.reserve(left.num_columns());
     right_col_views.reserve(right.num_columns());
 
@@ -502,10 +502,8 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
       cudf::size_type source_idx       = 0;
       if (!get_column_index(expr, source_idx)) {
         sirius::gpu_expression_executor executor(&expr, mr, stream);
-        auto expr_result_batch = executor.execute(batch);
-        auto& expr_table =
-          expr_result_batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
-        auto expr_view = expr_table.view();
+        auto expr_result_table = executor.execute(table);
+        auto expr_view         = expr_result_table->view();
         if (expr_view.num_columns() != 1) {
           throw std::runtime_error(std::string("sirius_physical_nested_loop_join: expression on ") +
                                    side + " should produce one column");
@@ -517,7 +515,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
             side + " table");
         }
         col_views.push_back(expr_view.column(0));
-        expression_res_scope_hodler.push_back(std::move(expr_result_batch));
+        expression_res_scope_hodler.push_back(std::move(expr_result_table));
       } else {
         auto target_type = duckdb::GetCudfType(expr.return_type);
 
