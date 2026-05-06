@@ -20,6 +20,7 @@
 #include <log/logging.hpp>
 #include <op/scan/parquet_scan_info.hpp>
 #include <op/scan/parquet_scan_operator_data.hpp>
+#include <op/scan/scan_plan.hpp>
 #include <op/scan/sirius_gpu_parquet_scan_operator.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <pipeline/sirius_meta_pipeline.hpp>
@@ -109,13 +110,25 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::get_next_task_i
 std::unique_ptr<cudf::table> sirius_gpu_parquet_scan_operator::read_table_from_metadata(
   const parquet_scan_data& scan_data, rmm::cuda_stream_view stream)
 {
-  auto datasource        = scan_data.datasource;
   auto filter_expression = scan_data.filter_expression;
 
-  // Build reader options for this partition's row groups.
+  // Build reader options for this partition's files and corresponding row groups. The
+  // FileMetaData on each slice is the cached footer parsed once by parquet_split_provider;
+  // passing it through avoids re-fetching footers from disk for every split of a file.
+  std::vector<std::unique_ptr<cudf::io::datasource>> sources;
+  std::vector<cudf::io::parquet::FileMetaData> metadatas;
+  std::vector<std::vector<cudf::size_type>> rg_per_src;
+  sources.reserve(scan_data.rg_slices.size());
+  metadatas.reserve(scan_data.rg_slices.size());
+  rg_per_src.reserve(scan_data.rg_slices.size());
+
+  for (auto const& slice : scan_data.rg_slices) {
+    sources.push_back(cudf::io::datasource::create(slice.file_path));
+    metadatas.push_back(*slice.file_metadata);  // copy unavoidable: cudf takes by value
+    rg_per_src.push_back(slice.row_group_indices);
+  }
   auto opts = *scan_data.reader_options;
-  opts.set_source(cudf::io::source_info{datasource.get()});
-  opts.set_row_groups({scan_data.rg_range.row_group_indices});
+  opts.set_row_groups(std::move(rg_per_src));
 
   // Try to translate the filter to a *stream-local* cudf AST for filter pushdown. If not
   // successful, fall back to post-read DuckDB-expression evaluation.
@@ -138,12 +151,16 @@ std::unique_ptr<cudf::table> sirius_gpu_parquet_scan_operator::read_table_from_m
     }
   }
 
-  auto [table, metadata] = cudf::io::read_parquet(opts, stream);
+  rmm::device_async_resource_ref mr_ref(scan_data.gpu_memory_space->get_default_allocator());
+  auto [table, metadata] =
+    cudf::io::read_parquet(std::move(sources), std::move(metadatas), opts, stream, mr_ref);
 
-  SIRIUS_LOG_DEBUG("[sirius_gpu_parquet_scan_operator] Read {} — {} rows, {} columns",
-                   scan_data.file_path,
-                   table->num_rows(),
-                   table->num_columns());
+  SIRIUS_LOG_DEBUG(
+    "[sirius_gpu_parquet_scan_operator] Read {} file(s) (first: {}) — {} rows, {} columns",
+    scan_data.rg_slices.size(),
+    scan_data.rg_slices.empty() ? "<none>" : scan_data.rg_slices.front().file_path,
+    table->num_rows(),
+    table->num_columns());
 
   // Apply the filter if it was not pushed down into the parquet scan.
   if (filter_expression && !ast_expression) {
@@ -160,11 +177,13 @@ std::unique_ptr<cudf::table> sirius_gpu_parquet_scan_operator::read_table_from_m
   }
 
   // Reshape the reader's output to the scan_plan's D-order layout: reorder data
-  // columns, drop pure-filter columns, inject hive-partition columns. No-op when
-  // the scan is a trivial identity (no partitions, 1:1 data layout).
-  if (_partition_inject_fn) {
-    table = _partition_inject_fn(std::move(table), scan_data.file_path, stream);
-    SIRIUS_LOG_DEBUG("[sirius_gpu_parquet_scan_operator] Applied partition_inject_fn.");
+  // columns, drop pure-filter columns, inject hive-partition columns. Skipped
+  // when the scan is a trivial identity (no partitions, 1:1 data layout) or a
+  // SELECT count(*) shape — see needs_output_assembly().
+  if (needs_output_assembly(*scan_data.plan)) {
+    table =
+      assemble_scan_output(*scan_data.plan, std::move(table), scan_data.partition_values, stream);
+    SIRIUS_LOG_DEBUG("[sirius_gpu_parquet_scan_operator] Assembled scan output to plan layout.");
   }
 
   return std::move(table);
@@ -188,26 +207,22 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
     table     = read_table_from_metadata(*scan_data, stream);
     mem_space = scan_data->gpu_memory_space;
   } else if (auto const* cached = dynamic_cast<const scan_cached_operator_data*>(&input_data)) {
-    // Phase 18 / DB-02 Recipe R1: scoped read-only accessor for the cached
-    // path. The accessor lives long enough to:
-    //   1. produce `cached_view` and consume it via select() / make_unique<table>
-    //      (cudf table_view is a non-owning ref into ro's representation), and
-    //   2. resolve the batch's memory_space for downstream wrapping.
-    // Dropped at end of else-if scope -> shared lock released.
-    auto ro          = cached->batch->to_read_only();
-    auto& gpu_rep    = ro.get_data()->cast<cucascade::gpu_table_representation>();
+    auto ro_batch    = cached->batch->to_read_only();
+    auto& gpu_rep    = ro_batch.get_data()->cast<cucascade::gpu_table_representation>();
     auto cached_view = gpu_rep.get_table_view();
 
     // The cached path carries only a DuckDB-expression filter (AST translation /
-    // reader pushdown is not applicable to an already-materialized cached table).
-    auto const has_filter = static_cast<bool>(cached->filter_expression);
-    auto const has_inject = static_cast<bool>(cached->inject_fn);
+    // reader pushdown is not applicable to an already-materialized cached table)
+    // and a shared scan_plan that decides whether the cached batch needs to be
+    // reshaped to the plan's output layout.
+    auto const has_filter     = static_cast<bool>(cached->filter_expression);
+    auto const needs_assembly = needs_output_assembly(*cached->plan);
 
-    if (!has_filter && !has_inject) {
+    if (!has_filter && !needs_assembly) {
       // Fast path: forward the cached batch unchanged. Avoids any allocation or copy
       // since the cached batch's gpu_table_representation already views the pinned
-      // columns and co-owns them via the shared_ptr<column> chunks. inject_fn is null
-      // exactly when the scan_plan's output_layout is identity over data_columns.
+      // columns and co-owns them via the shared_ptr<column> chunks. Assembly is a
+      // no-op when the scan_plan's output_layout is identity over data_columns.
       std::vector<std::shared_ptr<cucascade::data_batch>> batches;
       batches.push_back(cached->batch);
       return std::make_unique<pipelineable_operator_data>(std::move(batches));
@@ -222,9 +237,10 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
       SIRIUS_LOG_DEBUG(
         "[sirius_gpu_parquet_scan_operator] Applied duckdb filter expression on cached batch.");
     } else {
-      // No filter but inject_fn is non-null (the plan permutes / drops columns relative to
-      // data_columns). Materialize the cached view into an owning table so inject_fn can
-      // release the columns by D-position and reassemble them in output_layout order.
+      // No filter but assembly is needed (the plan permutes / drops columns relative to
+      // data_columns). Materialize the cached view into an owning table so
+      // assemble_scan_output can release the columns by D-position and reassemble them
+      // in output_layout order.
       std::vector<std::unique_ptr<cudf::column>> owned_cols;
       owned_cols.reserve(cached_view.num_columns());
       for (cudf::size_type i = 0; i < cached_view.num_columns(); ++i) {
@@ -234,17 +250,15 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
       table = std::make_unique<cudf::table>(std::move(owned_cols));
     }
 
-    if (has_inject) {
-      // The cached path is gated upstream against hive partitions, so file_path is unused
-      // by the closure (it only matters for PARTITION entries). Pass an empty string.
-      table = cached->inject_fn(std::move(table), /*file_path=*/{}, stream);
-      SIRIUS_LOG_DEBUG(
-        "[sirius_gpu_parquet_scan_operator] Applied scan_plan inject_fn on cached batch.");
+    if (needs_assembly) {
+      // The cached path is gated upstream against hive partitions, so partition_values is
+      // always empty here — assemble_scan_output's PARTITION branch is never exercised.
+      table =
+        assemble_scan_output(*cached->plan, std::move(table), /*partition_values=*/{}, stream);
+      SIRIUS_LOG_DEBUG("[sirius_gpu_parquet_scan_operator] Assembled cached batch to plan layout.");
     }
 
-    // mem_space is owned by the reservation manager (long-lived); the read-only
-    // accessor `ro` declared at top of else-if branch is still alive here.
-    mem_space = ro.get_memory_space();
+    mem_space = ro_batch.get_memory_space();
   } else {
     throw std::runtime_error(
       "[sirius_gpu_parquet_scan_operator] execute() called with unexpected operator_data type; "
@@ -252,10 +266,6 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
   }
 
   // Wrap the GPU table in operator_data for the downstream pipeline.
-  // Pitfall 4 closure (Phase 18): 3-arg make_data_batch with the operator's
-  // execution stream as writer_stream — preserves Phase 13-04 Path-2
-  // stream-lineage so cucascade::convert_gpu_to_gpu can call cudaStreamWaitEvent
-  // on the recorded writer event before peer-copying.
   auto batch = sirius::make_data_batch(std::move(table), *mem_space, stream);
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
   batches.push_back(std::move(batch));

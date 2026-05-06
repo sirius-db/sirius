@@ -28,7 +28,6 @@
 #include <data/data_batch_utils.hpp>
 
 #include <memory>
-#include <optional>
 #include <vector>
 
 namespace {
@@ -59,6 +58,28 @@ test_env& env()
   return e;
 }
 
+/// Helper: get the tier of a data_batch using a temporary read-only lock.
+inline cucascade::memory::Tier get_batch_tier(cucascade::data_batch& batch)
+{
+  auto ro = batch.to_read_only();
+  return ro.get_memory_space()->get_tier();
+}
+
+/// Helper: get the size in bytes of a data_batch's data using a temporary read-only lock.
+inline size_t get_batch_size(cucascade::data_batch& batch)
+{
+  auto ro = batch.to_read_only();
+  return ro.get_data()->get_size_in_bytes();
+}
+
+/// Helper: compare batch's memory_space pointer (returns true if same as given space).
+inline bool batch_in_space(cucascade::data_batch& batch,
+                           const cucascade::memory::memory_space* space)
+{
+  auto ro = batch.to_read_only();
+  return ro.get_memory_space() == space;
+}
+
 }  // anonymous namespace
 
 TEST_CASE("convertible_data_batch converts GPU batch to HOST", "[convertible_data_batch]")
@@ -68,23 +89,16 @@ TEST_CASE("convertible_data_batch converts GPU batch to HOST", "[convertible_dat
   auto batch = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{1, 2, 3, 4, 5}, cudf::type_id::INT32);
 
-  // Phase 18 / DB-03: get_memory_space is private under #117; access via accessor.
-  {
-    auto ro = batch->to_read_only();
-    REQUIRE(ro.get_memory_space() == e.gpu_space);
-  }
+  REQUIRE(batch_in_space(*batch, e.gpu_space));
   REQUIRE(batch->get_state() == cucascade::batch_state::idle);
 
   sirius::convertible_data_batch wrapper(batch);
-  auto result = wrapper.convert({e.host_space}, e.stream(), *e.mgr);
+  auto result = wrapper.convert({e.host_space}, e.stream(), *e.mgr, true);
 
   REQUIRE(result.has_value());
   REQUIRE((*result).size() == 1);
   REQUIRE((*result)[0] > 0);
-  {
-    auto ro = batch->to_read_only();
-    REQUIRE(ro.get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
-  }
+  REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::HOST);
   REQUIRE(batch->get_state() == cucascade::batch_state::idle);
 }
 
@@ -96,21 +110,14 @@ TEST_CASE("convertible_data_batch returns nullopt with empty target_spaces",
   auto batch = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{10, 20, 30}, cudf::type_id::INT32);
 
-  // Phase 18 / DB-03: get_memory_space is private under #117; access via accessor.
-  {
-    auto ro = batch->to_read_only();
-    REQUIRE(ro.get_memory_space() == e.gpu_space);
-  }
+  REQUIRE(batch_in_space(*batch, e.gpu_space));
   REQUIRE(batch->get_state() == cucascade::batch_state::idle);
 
   sirius::convertible_data_batch wrapper(batch);
-  auto result = wrapper.convert({}, e.stream(), *e.mgr);
+  auto result = wrapper.convert({}, e.stream(), *e.mgr, false);
 
   REQUIRE_FALSE(result.has_value());
-  {
-    auto ro = batch->to_read_only();
-    REQUIRE(ro.get_memory_space() == e.gpu_space);
-  }
+  REQUIRE(batch_in_space(*batch, e.gpu_space));
   REQUIRE(batch->get_state() == cucascade::batch_state::idle);
 }
 
@@ -129,23 +136,10 @@ TEST_CASE("convertible_data_batch_provider get_next_convertible returns last idl
   auto batch3 = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{6, 7, 8, 9}, cudf::type_id::INT32);
 
-  std::size_t batch2_size = 0;
-  {
-    auto ro2    = batch2->to_read_only();
-    batch2_size = ro2.get_data()->get_size_in_bytes();
-  }
+  auto batch2_size = get_batch_size(*batch2);
 
-  // Make batch3 non-idle by holding a mutable accessor — under cucascade #117
-  // try_to_create_task() is gone; the FSM transition was replaced with a
-  // mutable-lock acquire (state = mutable_locked). Hold the accessor via
-  // optional<> so we can release it later in the test.
-  std::optional<cucascade::mutable_data_batch> batch3_mut;
-  {
-    auto opt = batch3->try_to_mutable();
-    REQUIRE(opt.has_value());
-    batch3_mut = std::move(*opt);
-  }
-  REQUIRE(batch3->get_state() == cucascade::batch_state::mutable_locked);
+  // Make batch3 non-idle by holding a read-only lock on it
+  auto batch3_lock = batch3->to_read_only();
 
   repo.add_data_batch(batch1);
   repo.add_data_batch(batch2);
@@ -155,11 +149,8 @@ TEST_CASE("convertible_data_batch_provider get_next_convertible returns last idl
   auto cd = provider.get_next_convertible(e.gpu_space, false);
 
   REQUIRE(cd != nullptr);
-  // Last-to-first: batch3 is mutable_locked so skipped, batch2 is the last idle batch
+  // Last-to-first: batch3 is locked (non-idle) so skipped, batch2 is the last idle batch
   REQUIRE(cd->bytes_in_space(e.gpu_space) == batch2_size);
-
-  // Release batch3's mutable lock so the batch can be destroyed cleanly.
-  batch3_mut.reset();
 }
 
 TEST_CASE("convertible_data_batch_provider get_all_convertible returns all idle batches",
@@ -176,13 +167,8 @@ TEST_CASE("convertible_data_batch_provider get_all_convertible returns all idle 
   auto batch3 = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{6, 7, 8, 9}, cudf::type_id::INT32);
 
-  // Make batch3 non-idle by holding a mutable accessor (Pitfall 5).
-  std::optional<cucascade::mutable_data_batch> batch3_mut;
-  {
-    auto opt = batch3->try_to_mutable();
-    REQUIRE(opt.has_value());
-    batch3_mut = std::move(*opt);
-  }
+  // Make batch3 non-idle by holding a read-only lock on it
+  auto batch3_lock = batch3->to_read_only();
 
   repo.add_data_batch(batch1);
   repo.add_data_batch(batch2);
@@ -191,10 +177,8 @@ TEST_CASE("convertible_data_batch_provider get_all_convertible returns all idle 
   sirius::convertible_data_batch_provider provider(&repo);
   auto all = provider.get_all_convertible(e.gpu_space, false);
 
-  // batch1 and batch2 are idle, batch3 is mutable_locked -> only 2 returned
+  // batch1 and batch2 are idle, batch3 is locked -> only 2 returned
   REQUIRE(all.size() == 2);
-
-  batch3_mut.reset();
 }
 
 TEST_CASE("convertible_data_batch_provider iterates multi-partition last-to-first",
@@ -210,11 +194,7 @@ TEST_CASE("convertible_data_batch_provider iterates multi-partition last-to-firs
   auto batch_p1 = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{3, 4, 5, 6, 7}, cudf::type_id::INT32);
 
-  std::size_t batch_p1_size = 0;
-  {
-    auto ro_p1    = batch_p1->to_read_only();
-    batch_p1_size = ro_p1.get_data()->get_size_in_bytes();
-  }
+  auto batch_p1_size = get_batch_size(*batch_p1);
 
   repo.add_data_batch(batch_p0, 0);
   repo.add_data_batch(batch_p1, 1);
@@ -227,7 +207,7 @@ TEST_CASE("convertible_data_batch_provider iterates multi-partition last-to-firs
   REQUIRE(cd->bytes_in_space(e.gpu_space) == batch_p1_size);
 }
 
-TEST_CASE("convertible_data_batch convert fails when batch already in_transit",
+TEST_CASE("convertible_data_batch convert fails when batch exclusively locked",
           "[convertible_data_batch]")
 {
   auto& e = env();
@@ -235,26 +215,19 @@ TEST_CASE("convertible_data_batch convert fails when batch already in_transit",
   auto batch = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
 
-  // Phase 18 / DB-03 Recipe R8: pre-#117 try_to_lock_for_in_transit() is
-  // gone; under #117 the equivalent is taking a mutable accessor. State
-  // becomes mutable_locked (the only non-idle non-read_only state).
-  std::optional<cucascade::mutable_data_batch> mut;
-  {
-    auto opt = batch->try_to_mutable();
-    REQUIRE(opt.has_value());
-    mut = std::move(*opt);
-  }
-  REQUIRE(batch->get_state() == cucascade::batch_state::mutable_locked);
+  // Hold an exclusive (mutable) lock so that try_to_mutable() inside convert() fails
+  auto exclusive_lock = batch->to_mutable();
 
   sirius::convertible_data_batch wrapper(batch);
-  auto result = wrapper.convert({e.host_space}, e.stream(), *e.mgr);
+  // Non-blocking convert: uses try_to_mutable() internally, must return nullopt
+  auto result = wrapper.convert({e.host_space}, e.stream(), *e.mgr, /*blocking=*/false);
 
   REQUIRE_FALSE(result.has_value());
-  // State is still mutable_locked (the wrapper failed to acquire the lock).
-  REQUIRE(batch->get_state() == cucascade::batch_state::mutable_locked);
 
-  // Release the mutable accessor so batch can be destroyed cleanly.
-  mut.reset();
+  // Release exclusive lock so batch can be destroyed cleanly
+  {
+    auto discard = std::move(exclusive_lock);
+  }
 }
 
 TEST_CASE("convertible_data_batch bytes_in_space returns correct size", "[convertible_data_batch]")
@@ -268,12 +241,7 @@ TEST_CASE("convertible_data_batch bytes_in_space returns correct size", "[conver
 
   auto size = wrapper.bytes_in_space(e.gpu_space);
   REQUIRE(size > 0);
-  std::size_t expected_size = 0;
-  {
-    auto ro       = batch->to_read_only();
-    expected_size = ro.get_data()->get_size_in_bytes();
-  }
-  REQUIRE(size == expected_size);
+  REQUIRE(size == get_batch_size(*batch));
   REQUIRE(wrapper.bytes_in_space(e.host_space) == 0);
 }
 
@@ -289,16 +257,8 @@ TEST_CASE("convertible_data_batch_provider get_bytes_in_space sums batch sizes",
   auto batch2 = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{4, 5, 6, 7, 8}, cudf::type_id::INT32);
 
-  std::size_t batch1_size = 0;
-  std::size_t batch2_size = 0;
-  {
-    auto ro1    = batch1->to_read_only();
-    batch1_size = ro1.get_data()->get_size_in_bytes();
-  }
-  {
-    auto ro2    = batch2->to_read_only();
-    batch2_size = ro2.get_data()->get_size_in_bytes();
-  }
+  auto batch1_size = get_batch_size(*batch1);
+  auto batch2_size = get_batch_size(*batch2);
 
   repo.add_data_batch(batch1);
   repo.add_data_batch(batch2);

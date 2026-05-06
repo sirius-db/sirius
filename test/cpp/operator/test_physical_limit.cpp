@@ -104,12 +104,8 @@ TEMPLATE_TEST_CASE("sirius_physical_streaming_limit limits rows in data_batch",
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = limiter.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
-  // Phase 18 / DB-03 Recipe R1: scoped read-only accessor; table_view is non-owning,
-  // must outlive every read of output_table below. Released at end of enclosing scope.
-  auto __ro_output_table =
-    dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]->to_read_only();
-  auto output_table =
-    __ro_output_table.get_data()->cast<gpu_table_representation>().get_table_view();
+  auto output_table = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
   auto host_vals = copy_column_to_host<typename Traits::type>(output_table.column(0));
 
   std::vector<typename Traits::type> expected = {values[2], values[3], values[4]};
@@ -133,9 +129,7 @@ static std::vector<int64_t> collect_all_rows(
 {
   std::vector<int64_t> all_rows;
   for (auto const& b : batches) {
-    // Phase 18 / DB-03 Recipe R1: scoped read-only accessor per iteration.
-    auto ro    = b->to_read_only();
-    auto table = ro.get_data()->cast<gpu_table_representation>().get_table_view();
+    auto table = sirius::get_cudf_table_view(*b);
     auto col   = sirius::test::operator_utils::copy_column_to_host<int64_t>(table.column(0));
     all_rows.insert(all_rows.end(), col.begin(), col.end());
   }

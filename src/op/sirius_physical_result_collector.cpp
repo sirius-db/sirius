@@ -64,7 +64,7 @@ std::unique_ptr<operator_data> sirius_physical_result_collector::execute(
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_result_collector::execute"};
   return std::make_unique<pipelineable_operator_data>(
-    dynamic_cast<const pipelineable_operator_data&>(input_data).get_data_batches());
+    dynamic_cast<const pipelineable_operator_data&>(input_data).get_read_only_batches());
 }
 
 duckdb::vector<duckdb::const_reference<sirius_physical_operator>>
@@ -116,9 +116,8 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
                                                   rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_materialized_collector::sink"};
-  auto& pipelineable_input      = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches     = pipelineable_input.get_data_batches();
-  using host_table_chunk_reader = ::sirius::op::result::host_table_chunk_reader;
+  auto& pipelineable_input  = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches = pipelineable_input.get_data_batches();
 
   if (input_batches.empty()) {
     return;  // todo(kevin) we should handle this case properly
@@ -126,88 +125,55 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
 
   auto sink_single_batch = [this,
                             stream](std::shared_ptr<cucascade::data_batch> const& input_batch) {
-    // Phase 18 / DB-02: hold the clone (if produced) so its representation
-    // outlives the inner accessor scopes. `data` is set under whichever scope
-    // resolves the active representation (input_batch's or clone_batch's).
-    std::shared_ptr<cucascade::data_batch> clone_batch;
-    cucascade::idata_representation* data = nullptr;
-    std::size_t input_size_in_bytes       = 0;
-    cucascade::memory::Tier input_tier{};
+    // Acquire read-only access to inspect the batch
+    auto ro    = input_batch->to_read_only();
+    auto* data = ro.get_data();
 
-    {
-      // Recipe R1: scoped read-only accessor on the input batch for the
-      // pre-clone size + tier probe. Dropped at end-of-block before any
-      // potential to_mutable on the clone.
-      auto ro_in    = input_batch->to_read_only();
-      auto* in_data = ro_in.get_data();
-      if (!in_data) {
-        throw invalid_input_exception(
-          "[GPUPhysicalMaterializedCollector] data_batch has no data representation");
-      }
-      input_size_in_bytes = in_data->get_size_in_bytes();
-      input_tier          = in_data->get_current_tier();
-    }  // ro_in destroyed -> shared lock released.
+    if (!data) {
+      throw invalid_input_exception(
+        "[GPUPhysicalMaterializedCollector] data_batch has no data representation");
+    }
+    if (data->get_size_in_bytes() == 0) { return; }
 
-    if (input_size_in_bytes == 0) { return; }
+    std::optional<cucascade::read_only_data_batch> result_ro_opt;
 
-    // If data is in GPU tier, convert to HOST tier first
-    if (input_tier == cucascade::memory::Tier::GPU) {
-      // Make the HOST memory reservation
+    if (data->get_current_tier() == cucascade::memory::Tier::GPU) {
+      // Use clone_to to clone directly into HOST representation
       auto sirius_ctx  = _client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state");
       auto& memory_mgr = sirius_ctx->get_memory_manager();
       /// TODO: Find the closest memory space, not just any memory space, in HOST tier
       auto reservation = memory_mgr.request_reservation(
         cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST},
-        input_size_in_bytes);
+        data->get_size_in_bytes());
       if (!reservation) {
         throw internal_exception(
           "[GPUPhysicalMaterializedCollector] Failed to reserve host memory for result collection");
       }
 
-      // Convert to host representation
       auto& registry      = sirius::converter_registry::get();
       auto& mem_space     = reservation->get_memory_space();
       auto& data_repo_mgr = sirius_ctx->get_data_repository_manager();
       auto next_batch_id  = data_repo_mgr.get_next_data_batch_id();
-      // Recipe R1: clone() moved off data_batch onto the accessors under
-      // cucascade #117. Take a scoped read-only accessor on input_batch and
-      // clone through it. The accessor is dropped before the to_mutable() on
-      // the freshly-cloned batch (P1: distinct batch, no lock overlap).
-      {
-        auto ro_clone_src = input_batch->to_read_only();
-        clone_batch       = ro_clone_src.clone(next_batch_id, stream);
-      }  // ro_clone_src destroyed -> shared lock on input_batch released.
-      // Recipe R3: post-clone in-place conversion. `clone_batch` is brand-new
-      // (idle, no lock contention), so to_mutable() succeeds immediately. The
-      // pre-#117 `data_batch::convert_to` moved to mutable_data_batch under
-      // PR #117 — invoke it through the accessor.
-      // todo (bobbi) pass stream to sink
-      auto mut = clone_batch->to_mutable();
-      mut.convert_to<cucascade::host_data_representation>(registry, &mem_space, stream);
-      // mut destroyed at end of statement-list -> exclusive lock released.
-    } else if (input_tier != cucascade::memory::Tier::HOST) {
+
+      // clone_to: creates new batch with data converted to host_data_representation
+      auto result_batch = ro.clone_to<cucascade::host_data_representation>(
+        registry, next_batch_id, &mem_space, stream);
+
+      // Access the result batch's data. Declared outside the if-block so result_ro outlives
+      // the branch — data points into it and must not dangle when we reach the assert below.
+      result_ro_opt = result_batch->to_read_only();
+      data          = result_ro_opt->get_data();
+
+    } else if (data->get_current_tier() != cucascade::memory::Tier::HOST) {
       // Data must be in HOST tier (i.e., cannot currently reside in DISK tier)
       throw invalid_input_exception(
         "[GPUPhysicalMaterializedCollector] Expected host_data_representation in HOST tier");
     }
-
-    // Recipe R1: scoped read-only accessor on whichever batch carries the
-    // host representation (clone_batch if we converted, otherwise input_batch).
-    // The accessor lives for the whole chunk-pushing loop; the host_table
-    // reference is bound from `data` retrieved through the accessor.
-    auto& host_carrier = clone_batch ? *clone_batch : *input_batch;
-    auto ro_host       = host_carrier.to_read_only();
-    data               = ro_host.get_data();
-    if (!data) {
-      throw invalid_input_exception(
-        "[GPUPhysicalMaterializedCollector] data_batch has no data representation");
-    }
-
-    // Only accepting host_data_representation for now
+    // Data already in HOST tier -- read directly through the read_only accessor
     assert(dynamic_cast<cucascade::host_data_representation*>(data) != nullptr);
 
-    // Push chunks to result collection
-    auto const& host_table = data->cast<cucascade::host_data_representation>();
+    using host_table_chunk_reader = ::sirius::op::result::host_table_chunk_reader;
+    auto const& host_table        = data->cast<cucascade::host_data_representation>();
     // host_table_chunk_reader expects get_host_table() and ->allocation to be non-null;
     // otherwise it will dereference a null unique_ptr (e.g. in column_reader::initialize).
     auto const* ht = host_table.get_host_table().get();
@@ -220,14 +186,16 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       throw invalid_input_exception(
         "[GPUPhysicalMaterializedCollector] host_table allocation is null (cannot read chunks)");
     }
+
     host_table_chunk_reader chunk_reader(_client_ctx, host_table, types);
 
     // Push chunks to result collection
     while (true) {
-      // TODO(amin): it is fishy that append take a mutable reference to the chunk reader and we are
-      // passing local variable chunk reader by reference. We should investigate if this can cause
-      // any issues (e.g., if duckdb does not consume all data from the chunk reader in append and
-      // we move to the next chunk reader, then the previous chunk reader's state will be lost).
+      // TODO(amin): it is fishy that append take a mutable reference to the chunk reader and we
+      // are passing local variable chunk reader by reference. We should investigate if this can
+      // cause any issues (e.g., if duckdb does not consume all data from the chunk reader in
+      // append and we move to the next chunk reader, then the previous chunk reader's state will
+      // be lost).
       duckdb::DataChunk chunk;
       if (!chunk_reader.get_next_chunk(chunk)) { break; }
 

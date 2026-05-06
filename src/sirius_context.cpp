@@ -629,10 +629,13 @@ const sirius::scan_manager::sirius_scan_manager& SiriusContext::get_scan_manager
 }
 
 void SiriusContext::create_query(
-  duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines)
+  duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
+  const quent::Context& context,
+  sirius::telemetry::query_telemetry_info telemetry_info)
 {
   throw_if_not_initialized();
-  query_ = duckdb::make_shared_ptr<sirius::planner::query>(std::move(pipelines));
+  query_ =
+    duckdb::make_shared_ptr<sirius::planner::query>(std::move(pipelines), context, telemetry_info);
   task_scheduler_->prepare_for_query(query_);
   task_creator_->prepare_for_query(*query_);
   // Phase 20.6 IO-MGPU-02: pass per-GPU sirius_ioctx map to scan_manager so
@@ -667,6 +670,18 @@ void SiriusContext::set_captured_logical_plan(unique_ptr<LogicalOperator> plan)
 unique_ptr<LogicalOperator> SiriusContext::take_captured_logical_plan()
 {
   return std::move(captured_logical_plan_);
+}
+
+void SiriusContext::set_pending_query_label(std::string label)
+{
+  pending_query_label_ = std::move(label);
+}
+
+std::optional<std::string> SiriusContext::take_pending_query_label()
+{
+  std::optional<std::string> out;
+  out.swap(pending_query_label_);
+  return out;
 }
 
 void SiriusContext::set_transparent_original_disabled_optimizers(std::set<OptimizerType> disabled)

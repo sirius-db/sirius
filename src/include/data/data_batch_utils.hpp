@@ -53,11 +53,6 @@ inline uint64_t get_next_batch_id() { return g_next_batch_id++; }
  * doing so would let a misuse pattern hide a P1 self-deadlock (acquiring a
  * read lock on a batch that the caller is about to upgrade to mutable).
  *
- * Phase 18 / DB-01: signature flipped from (const cucascade::data_batch&) to
- * (const cucascade::read_only_data_batch&) — get_data() / get_memory_space()
- * are now PRIVATE on data_batch in cucascade pin 1c1e648 and only reachable
- * through the accessor classes.
- *
  * @param batch The read-only accessor to extract the table view from.
  * @return cudf::table_view The underlying cudf table view.
  */
@@ -69,15 +64,38 @@ inline cudf::table_view get_cudf_table_view(const cucascade::read_only_data_batc
 }
 
 /**
+ * @brief Get a cudf::table_view from an idle data_batch (convenience overload).
+ *
+ * Acquires a temporary read-only lock, extracts the table_view, then releases the lock.
+ *
+ * @warning The returned table_view references GPU memory that is only guaranteed stable while a
+ * read-only lock is held. Since this function releases the lock before returning, the view can
+ * become dangling if another thread downgrades or mutates the batch concurrently. Only use this
+ * overload in contexts where the caller has exclusive ownership of the batch (e.g., diagnostic
+ * functions running synchronously within a pipeline task). Prefer the
+ * get_cudf_table_view(const read_only_data_batch&) overload when the caller can hold the lock.
+ *
+ * @param batch The idle data batch to extract the table view from.
+ * @return cudf::table_view The underlying cudf table view.
+ */
+// NOLINTNEXTLINE(readability-non-const-parameter) -- to_read_only() is non-const
+inline cudf::table_view get_cudf_table_view(cucascade::data_batch& batch)
+{
+  auto ro    = batch.to_read_only();
+  auto* data = ro.get_data();
+  if (data == nullptr) { throw std::runtime_error("data_batch has no data representation"); }
+  return data->cast<cucascade::gpu_table_representation>().get_table_view();
+}
+
+/**
  * @brief Create a shared_ptr<data_batch> from a cudf::table, recording the writer event.
  *
- * STREAM-LINEAGE (Phase 13-04 Path-2): @p writer_stream is REQUIRED. Every
- * data_batch carrying a gpu_table_representation is born with a recorded
- * writer event so cucascade::convert_gpu_to_gpu() can call
+ * STREAM-LINEAGE: @p writer_stream is REQUIRED. Every data_batch carrying a
+ * gpu_table_representation is born with a recorded writer event so
+ * cucascade::convert_gpu_to_gpu() can call
  * cudaStreamWaitEvent(reader_stream, writer_event, 0) before peer-copying
- * source buffers. This closes the cross-mempool stream-ordered race that
- * compute-sanitizer flagged on every GPU->GPU conversion in TPC-H multi-GPU
- * runs (Phase 13-02).
+ * source buffers. This closes the cross-mempool stream-ordered race in
+ * multi-GPU runs.
  *
  * @param table The cudf table (will be moved from).
  * @param memory_space The memory space where the table resides.

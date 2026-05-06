@@ -290,12 +290,13 @@ void gpu_pipeline_executor::manager_loop()
           // The rescheduled task will handle completion instead.
           gpu_task->mark_as_rescheduled();
 
-          // Prepare intermediate data batches for re-processing.
-          // Under cucascade #117 batches transition to `idle` automatically when
-          // their accessors are released — there is no longer a `try_to_create_task`
-          // FSM transition. The rescheduled task will acquire fresh accessors via
-          // pipelineable_operator_data::prepare_for_processing.
           auto intermediate_data = oom.release_intermediate_data();
+          if (auto pipelineable_data =
+                dynamic_cast<op::pipelineable_operator_data*>(intermediate_data.get())) {
+            // We want to release the read-only lock on the data so that when its added back to the
+            // task queue it could be downgraded if needed.
+            pipelineable_data->remove_read_only_lock();
+          }
 
           // Build the rescheduled task via virtual factory (preserves derived type).
           auto new_local_state = std::make_unique<gpu_pipeline_task_local_state>(
@@ -345,9 +346,15 @@ void gpu_pipeline_executor::manager_loop()
         }
 
         if (!query_complete && _task_creator) {
+          // If the pipeline just finished, notify_downstream_pipelines() (called from
+          // mark_task_completed() above) already scheduled the consumers. Skip the
+          // explicit schedule to avoid a duplicate request that races with operator
+          // teardown after mark_completed().
           bool pipeline_done = pipeline && pipeline->is_pipeline_finished();
-          for (auto* consumer : consumers) {
-            if (consumer) { _task_creator->schedule(consumer); }
+          if (!pipeline_done) {
+            for (auto* consumer : consumers) {
+              if (consumer) { _task_creator->schedule(consumer); }
+            }
           }
         }
 

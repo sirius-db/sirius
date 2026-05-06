@@ -181,16 +181,9 @@ void convert_batch_to_host(duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx,
                            std::shared_ptr<data_batch> const& batch,
                            rmm::cuda_stream_view stream)
 {
-  // Phase 18 / DB-03 Recipe R1 + R3: read for size estimation under
-  // to_read_only(); release the shared lock before taking to_mutable() for
-  // the conversion (P1 — never overlap shared+exclusive on the same batch).
-  std::size_t data_bytes = 0;
-  {
-    auto ro = batch->to_read_only();
-    if (!ro.get_data()) { throw std::runtime_error("data_batch has no data representation"); }
-    auto const view = sirius::get_cudf_table_view(ro);
-    data_bytes      = estimate_packed_data_bytes(view);
-  }
+  // Use get_cudf_table_view which internally acquires a read-only lock.
+  auto const view       = sirius::get_cudf_table_view(*batch);
+  auto const data_bytes = estimate_packed_data_bytes(view);
 
   auto& manager = sirius_ctx->get_memory_manager();
 
@@ -201,9 +194,10 @@ void convert_batch_to_host(duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx,
   if (!host_space) { throw std::runtime_error("Invalid host memory space for test"); }
 
   auto& registry = sirius::converter_registry::get();
-  // Phase 18 / DB-03 Recipe R3: scoped mutable accessor for the conversion.
-  auto mut = batch->to_mutable();
-  mut.convert_to<cucascade::host_data_representation>(registry, host_space, stream);
+  {
+    auto mut = batch->to_mutable();
+    mut.convert_to<cucascade::host_data_representation>(registry, host_space, stream);
+  }
 }
 
 }  // namespace
@@ -231,13 +225,7 @@ TEST_CASE("sirius_physical_materialized_collector sink with host input",
   expected_table_data expected;
   std::vector<std::string> expected_strings;
   {
-    // Phase 18 / DB-03 Recipe R8: scoped read-only accessor replaces the
-    // pre-#117 try_to_create_task + try_to_lock_for_processing pair. Under
-    // cucascade #117 the FSM (idle/task_created/processing) is gone — RAII
-    // accessors directly express read access. Test only reads gpu_view to
-    // extract expected data; to_read_only is the correct fit.
-    auto ro             = batch->to_read_only();
-    auto const gpu_view = sirius::get_cudf_table_view(ro);
+    auto const gpu_view = sirius::get_cudf_table_view(*batch);
     expected            = extract_expected_data(gpu_view);
     expected_strings    = build_expected_strings(expected);
   }
@@ -302,10 +290,7 @@ TEST_CASE("sirius_physical_materialized_collector sink converts GPU input",
 
   expected_table_data expected;
   {
-    // Phase 18 / DB-03 Recipe R8: scoped read-only accessor replaces the
-    // pre-#117 try_to_create_task + try_to_lock_for_processing pair.
-    auto ro             = batch->to_read_only();
-    auto const gpu_view = sirius::get_cudf_table_view(ro);
+    auto const gpu_view = sirius::get_cudf_table_view(*batch);
     expected            = extract_expected_data(gpu_view);
   }
 

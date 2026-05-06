@@ -31,7 +31,7 @@ namespace sirius {
 namespace op {
 
 std::shared_ptr<cucascade::data_batch> gpu_merge_impl::concat(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input,
+  const std::vector<cucascade::read_only_data_batch>& input,
   rmm::cuda_stream_view stream,
   cucascade::memory::memory_space& memory_space)
 {
@@ -41,17 +41,10 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::concat(
   }
 
   // Pull input cudf tables and merge.
-  // Phase 18 / DB-02 Recipe R1: hold one read_only_data_batch per input
-  // batch in `accessors` for the LIFETIME of `input_cudf_table_views`.
-  // cudf::table_view is a non-owning ref into the accessor's representation
-  // — accessors must outlive the cudf::concatenate call below.
-  std::vector<cucascade::read_only_data_batch> accessors;
-  accessors.reserve(input.size());
   std::vector<cudf::table_view> input_cudf_table_views;
   input_cudf_table_views.reserve(input.size());
   for (const auto& batch : input) {
-    accessors.push_back(batch->to_read_only());
-    input_cudf_table_views.push_back(get_cudf_table_view(accessors.back()));
+    input_cudf_table_views.push_back(get_cudf_table_view(batch));
   }
   auto output_cudf_table =
     cudf::concatenate(input_cudf_table_views, stream, memory_space.get_default_allocator());
@@ -61,7 +54,7 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::concat(
 }
 
 std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggregate(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input,
+  const std::vector<cucascade::read_only_data_batch>& input,
   const std::vector<cudf::aggregation::Kind>& aggregates,
   const std::vector<std::optional<cudf::size_type>>& merge_nth_index,
   rmm::cuda_stream_view stream,
@@ -78,15 +71,10 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggregate
   }
 
   // Pull input cudf tables and concatenate.
-  // Phase 18 / DB-02 Recipe R1: accessor vector for the lifetime of
-  // input_cudf_table_views (non-owning).
-  std::vector<cucascade::read_only_data_batch> accessors;
-  accessors.reserve(input.size());
   std::vector<cudf::table_view> input_cudf_table_views;
   input_cudf_table_views.reserve(input.size());
   for (const auto& batch : input) {
-    accessors.push_back(batch->to_read_only());
-    input_cudf_table_views.push_back(get_cudf_table_view(accessors.back()));
+    input_cudf_table_views.push_back(get_cudf_table_view(batch));
   }
   if (input_cudf_table_views[0].num_columns() != static_cast<cudf::size_type>(aggregates.size())) {
     throw std::runtime_error(
@@ -165,7 +153,7 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggregate
 }
 
 std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input,
+  const std::vector<cucascade::read_only_data_batch>& input,
   int num_group_cols,
   const std::vector<cudf::aggregation::Kind>& aggregates,
   rmm::cuda_stream_view stream,
@@ -178,15 +166,10 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
   }
 
   // Pull input cudf tables and concatenate.
-  // Phase 18 / DB-02 Recipe R1: accessor vector for the lifetime of
-  // input_cudf_table_views (non-owning).
-  std::vector<cucascade::read_only_data_batch> accessors;
-  accessors.reserve(input.size());
   std::vector<cudf::table_view> input_cudf_table_views;
   input_cudf_table_views.reserve(input.size());
   for (const auto& batch : input) {
-    accessors.push_back(batch->to_read_only());
-    input_cudf_table_views.push_back(get_cudf_table_view(accessors.back()));
+    input_cudf_table_views.push_back(get_cudf_table_view(batch));
   }
   if (input_cudf_table_views[0].num_columns() !=
       num_group_cols + static_cast<int>(aggregates.size())) {
@@ -315,7 +298,7 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
 }
 
 std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_order_by(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input,
+  const std::vector<cucascade::read_only_data_batch>& input,
   const std::vector<int>& order_key_idx,
   const std::vector<cudf::order>& column_order,
   const std::vector<cudf::null_order>& null_precedence,
@@ -335,15 +318,10 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_order_by(
   }
 
   // Pull input cudf tables and merge.
-  // Phase 18 / DB-02 Recipe R1: accessor vector for the lifetime of
-  // input_tables (non-owning); released after cudf::merge consumes them.
-  std::vector<cucascade::read_only_data_batch> accessors;
-  accessors.reserve(input.size());
   std::vector<cudf::table_view> input_tables;
   input_tables.reserve(input.size());
   for (const auto& batch : input) {
-    accessors.push_back(batch->to_read_only());
-    input_tables.push_back(get_cudf_table_view(accessors.back()));
+    input_tables.push_back(get_cudf_table_view(batch));
   }
   auto output_table = cudf::merge(input_tables,
                                   order_key_idx,

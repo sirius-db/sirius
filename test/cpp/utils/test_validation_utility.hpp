@@ -34,6 +34,7 @@
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
+#include <data/data_batch_utils.hpp>
 
 #include <iostream>
 #include <memory>
@@ -195,27 +196,9 @@ inline bool expect_data_batches_equivalent(const std::shared_ptr<cucascade::data
     return false;
   }
 
-  // Phase 18 / DB-03 Recipe R1: scoped read-only accessors per batch held
-  // for the lifetime of the derived table_views. Both views consumed by
-  // cudf::sort or expect_tables_equivalent_impl below — the accessors must
-  // outlive every read.
-  auto lhs_ro    = lhs->to_read_only();
-  auto rhs_ro    = rhs->to_read_only();
-  auto* lhs_data = lhs_ro.get_data();
-  auto* rhs_data = rhs_ro.get_data();
-
-  if (!lhs_data || !rhs_data) {
-    std::cout << "Cannot compare data_batch with null data representation" << std::endl;
-    return false;
-  }
-
-  // Cast to gpu_table_representation
-  auto& lhs_gpu_repr = lhs_data->cast<cucascade::gpu_table_representation>();
-  auto& rhs_gpu_repr = rhs_data->cast<cucascade::gpu_table_representation>();
-
-  // Get table views for comparison
-  auto lhs_view = lhs_gpu_repr.get_table_view();
-  auto rhs_view = rhs_gpu_repr.get_table_view();
+  // Extract GPU table views from data batches via RAII read-only accessors
+  auto lhs_view = sirius::get_cudf_table_view(*lhs);
+  auto rhs_view = sirius::get_cudf_table_view(*rhs);
 
   // If sort is requested, sort both tables by all columns
   if (sort) {
@@ -257,21 +240,8 @@ inline bool expect_data_batch_equivalent_to_table(
     return false;
   }
 
-  // Phase 18 / DB-03 Recipe R1: scoped read-only accessor held for the
-  // lifetime of the derived batch_view (non-owning).
-  auto batch_ro    = batch->to_read_only();
-  auto* batch_data = batch_ro.get_data();
-
-  if (!batch_data) {
-    std::cout << "Cannot compare data_batch with null data representation" << std::endl;
-    return false;
-  }
-
-  // Cast to gpu_table_representation
-  auto& batch_gpu_repr = batch_data->cast<cucascade::gpu_table_representation>();
-
-  // Get table view for comparison
-  auto batch_view = batch_gpu_repr.get_table_view();
+  // Extract GPU table view from the data batch via RAII read-only accessor
+  auto batch_view = sirius::get_cudf_table_view(*batch);
 
   // If sort is requested, sort both tables by all columns
   if (sort) {

@@ -158,11 +158,14 @@ class sirius_scan_manager {
  private:
   /// \brief Build a split_provider for @p op by reading its parquet scan_info
   ///        and installing the resulting hive-partition inject_fn (if any) on
-  ///        the operator.
+  ///        the operator. Returns a cached_split_provider when a pinned entry
+  ///        matches, otherwise a parquet_split_provider; in both cases the
+  ///        provider carries the scan_plan that the operator's execute()
+  ///        consults for output assembly.
   ///
   /// @param op           The parquet scan operator.
   /// @param gpu_ioctxs   Per-GPU sirius_ioctx map forwarded to
-  ///                     parquet_split_provider (Phase 20.6 IO-MGPU-02).
+  ///                     parquet_split_provider for multi-GPU IO routing.
   std::unique_ptr<split_provider> create_provider_for(
     op::scan::sirius_gpu_parquet_scan_operator* op,
     std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs);

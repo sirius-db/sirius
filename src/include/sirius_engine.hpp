@@ -24,8 +24,12 @@
 #include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_result_collector.hpp"
+#include "pipeline/pipeline_build_context.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "telemetry-bridge/gen/query.rs.h"
+#include "telemetry-bridge/gen/query_group.rs.h"
+#include "telemetry-bridge/gen/uuid.rs.h"
 
 #include <cucascade/data/data_repository_manager.hpp>
 
@@ -52,9 +56,8 @@ class sirius_engine {
   friend class pipeline::sirius_meta_pipeline;
 
  public:
-  explicit sirius_engine(duckdb::ClientContext& context, sirius_interface& sirius_iface)
-    : context(context), sirius_iface(sirius_iface) {};
-  ~sirius_engine() {}
+  explicit sirius_engine(duckdb::ClientContext& context, sirius_interface& sirius_iface);
+  ~sirius_engine();
 
   duckdb::ClientContext& context;
   sirius_interface& sirius_iface;
@@ -127,6 +130,11 @@ class sirius_engine {
   // ---------------------------------------------------------------------------
   std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>
     iceberg_delete_data_cache_;
+
+ private:
+  uuid::UUID query_group_uuid_;
+  rust::Box<quent::query_group::QueryGroupObserver> query_group_observer_;
+  rust::Box<quent::query::QueryHandle> query_handle_;
 };
 
 }  // namespace sirius

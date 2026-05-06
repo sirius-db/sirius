@@ -134,6 +134,9 @@ if(VCPKG_BUILD AND TARGET CUDA::cudart_static)
   endforeach()
 endif()
 
+# Rust telemetry instrumentation (C++ FFI via Corrosion)
+add_subdirectory(rust/crates/telemetry/bridge)
+
 # cmake-format: off
 set(EXTENSION_SOURCES
     src/config.cpp
@@ -160,8 +163,10 @@ set(EXTENSION_SOURCES
     src/expression_executor/specializations/gpu_execute_reference.cpp
     # I/O adapters (Phase 19 — io_uring + sirius_datasource)
     src/io/admission_control.cpp
+    src/io/datasource_factory.cpp
     src/io/prefetching_cache.cpp
     src/io/sirius_datasource.cpp
+    src/io/uri_parser.cpp
     src/io/uring/uring_ioctx.cpp
     src/io/uring/uring_reactor.cpp
     src/memory/defragmenter_oom_policy.cpp
@@ -256,6 +261,7 @@ set(EXTENSION_SOURCES
     src/sirius_engine.cpp
     src/sirius_extension.cpp
     src/sirius_interface.cpp
+    src/telemetry/telemetry_context.cpp
     src/transparent/physical_sirius_execution.cpp
     src/transparent/sirius_optimizer_extension.cpp
     src/util/stream_check_wrapper.cpp
@@ -264,7 +270,8 @@ set(EXTENSION_SOURCES
 
 # Legacy Sirius — all legacy-specific config lives in src/legacy/CMakeLists.txt.
 # Deleting src/legacy/ cleanly removes legacy build support.
-set(CUDA_SOURCES src/op/scan/equality_delete_mask.cu)
+set(CUDA_SOURCES src/op/scan/equality_delete_mask.cu
+                 src/cuda/scan/gpu_native_decode.cu)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
   add_subdirectory(src/legacy)
   list(APPEND EXTENSION_SOURCES ${SIRIUS_LEGACY_SOURCES}
@@ -311,8 +318,14 @@ foreach(_target sirius_extension sirius_loadable_extension)
                                PRIVATE ${SIRIUS_LEGACY_COMPILE_DEFINITIONS})
   endif()
 
-  target_link_libraries(${_target} cudf::cudf rmm::rmm spdlog::spdlog
-                        cuCascade::cucascade yaml-cpp::yaml-cpp)
+  target_link_libraries(
+    ${_target}
+    cudf::cudf
+    rmm::rmm
+    spdlog::spdlog
+    cuCascade::cucascade
+    yaml-cpp::yaml-cpp
+    telemetry_bridge)
 
   add_dependencies(${_target} duckdb_static)
 endforeach()
@@ -324,9 +337,9 @@ target_link_libraries(sirius_extension PkgConfig::NUMA PkgConfig::LIBURING
 target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING)
 
 # Required by DuckDB's export set (duckdb_static -> sirius_extension ->
-# cucascade_static)
+# cucascade_static / telemetry_bridge)
 install(
-  TARGETS sirius_extension cucascade_static
+  TARGETS sirius_extension cucascade_static telemetry_bridge
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
@@ -346,6 +359,7 @@ endif()
 set(TEST_SOURCES
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
+    test/cpp/config/test_object_store_config.cpp
     test/cpp/data/test_convertible_data_batch.cpp
     test/cpp/data/test_convertible_gpu_pipeline_task.cpp
     test/cpp/data/test_host_parquet_representation.cpp
@@ -355,6 +369,7 @@ set(TEST_SOURCES
     test/cpp/exec/test_bounded_thread_pool.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
+    test/cpp/expression/test_ast_scaffold.cpp
     test/cpp/expression/test_expression.cpp
     test/cpp/expression/test_join_condition.cpp
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
@@ -366,6 +381,8 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/integration/test_transparent_execution.cpp
+    test/cpp/io/test_datasource_factory.cpp
+    test/cpp/io/test_uri_parser.cpp
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
     test/cpp/operator/test_physical_hash_join_mgpu.cpp
     test/cpp/operator/test_physical_order_mgpu.cpp
@@ -400,9 +417,13 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_get_next_ports_after_sink.cpp
     test/cpp/pipeline/test_plan_printer.cpp
     test/cpp/pipeline/test_task_scheduler.cpp
+    test/cpp/scan/bench_decode_codecs.cpp
     test/cpp/scan/test_column_builder.cpp
+    test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_scan_task.cpp
+    test/cpp/scan/test_parquet_split_provider.cpp
+    test/cpp/scan/test_partition_inject.cpp
     test/cpp/scan/test_scan_executor.cpp
     test/cpp/scan/test_split_connector.cpp
     test/cpp/unittest.cpp

@@ -19,7 +19,7 @@
 #include "log/logging.hpp"
 #include "op/scan/parquet_scan_info.hpp"
 #include "op/scan/scan_plan.hpp"
-#include "op/scan/scan_utils.hpp"  // convert_table_filters_to_expression
+#include "op/scan/scan_utils.hpp"
 #include "op/scan/sirius_gpu_parquet_scan_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -92,9 +92,7 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
   if (!info) { return nullptr; }
 
   // If a pinned entry's file paths match this operator's scan_info, build the same
-  // scan_plan the parquet path would build and serve the scan from cache. The plan
-  // gives us the canonical D-space column layout, the C→D map for the filter, and
-  // the post-read assembly closure — same source of truth as parquet_split_provider.
+  // scan_plan the parquet path would build and serve the scan from cache.
   auto matches_scan_info = [&info](const pinned_entry& entry) {
     if (entry.file_paths.size() != info->file_paths.size()) { return false; }
     auto sorted_a = entry.file_paths;
@@ -113,12 +111,16 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
 
       // Build the canonical scan_plan once. Everything downstream — cached column
       // layout, filter pushdown indices, post-read assembly — reads from this.
-      auto plan = op::scan::build_scan_plan(info->column_ids,
-                                            info->projection_ids,
-                                            info->names,
-                                            info->returned_types,
-                                            op->get_types().size(),
-                                            info->partition_indices);
+      // Held by shared_ptr<const> so each emitted scan_cached_operator_data can
+      // carry it to the GPU scan operator's per-task assembly check without copying.
+      auto plan_shared = std::make_shared<op::scan::scan_plan const>(
+        op::scan::build_scan_plan(info->column_ids,
+                                  info->projection_ids,
+                                  info->names,
+                                  info->returned_types,
+                                  op->get_types().size(),
+                                  info->partition_indices));
+      auto const& plan = *plan_shared;
 
       // Hive partitions on a cached scan would require per-chunk file_path metadata
       // that pinned entries don't carry today. Fall through to the parquet path,
@@ -146,66 +148,54 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
         columns_per_request.push_back(it->second);
       }
 
-      // Filter expression: BoundReferences are in D-space, via plan.make_batch_column_map.
+      // Filter expression: BoundReferences are in D-space, via plan.batch_position_by_column_id.
       // Same recipe parquet_split_provider uses, so the filter evaluates correctly against
       // the cached batch (which is in D-order by construction above).
       std::shared_ptr<duckdb::Expression> filter_expression;
       if (info->table_filters && !info->table_filters->filters.empty()) {
-        auto batch_column_map = plan.make_batch_column_map();
         auto duckdb_expression =
           op::convert_table_filters_to_expression(*info->table_filters,
                                                   info->column_ids,
                                                   info->returned_types,
-                                                  batch_column_map,
+                                                  plan.batch_position_by_column_id,
                                                   plan.partition_primary_indices);
         if (duckdb_expression) {
           filter_expression = std::shared_ptr<duckdb::Expression>(std::move(duckdb_expression));
         }
       }
 
-      // Post-read assembly closure. Returns null when the layout is identity over
-      // data_columns (no permute, no prune) — execute() then forwards the cached
-      // batch (or the filter result) without re-permuting.
-      auto inject_fn = plan.build_inject_fn();
-
       SIRIUS_LOG_DEBUG(
         "[sirius_scan_manager::create_provider_for] using cached_split_provider for op_id={} "
-        "(pinned='{}' data_cols={} inject_fn={})",
+        "(pinned='{}' data_cols={} needs_assembly={})",
         op->get_operator_id(),
         pinned_name,
         columns_per_request.size(),
-        static_cast<bool>(inject_fn) ? "non-null" : "null");
+        op::scan::needs_output_assembly(plan));
 
       return std::make_unique<cached_split_provider>(std::move(columns_per_request),
                                                      *entry.memory_space,
                                                      std::move(filter_expression),
-                                                     std::move(inject_fn));
+                                                     std::move(plan_shared));
     }
   } catch (...) {
     SIRIUS_LOG_TRACE("not all the columns are pinned for this query");
   }
-  // Phase 20.6 IO-MGPU-02: forward gpu_ioctxs to parquet_split_provider so
-  // run_batch() can construct sirius_datasources via ioctx->make_datasource(io_object)
-  // instead of cudf's bundled file_source factory (the latter routes through
-  // kvikio and bypasses Phase 19's io_uring + per-GPU CUDA-context binding).
-  auto provider =
-    std::make_unique<parquet_split_provider>(info->returned_types,
-                                             info->file_paths,
-                                             info->column_ids,
-                                             info->projection_ids,
-                                             info->names,
-                                             op->get_types().size(),
-                                             std::move(info->table_filters),
-                                             info->partition_indices,
-                                             info->approximate_batch_size,
-                                             parquet_split_provider::DEFAULT_MAX_FILE_PROCESSED,
-                                             gpu_ioctxs);
-
-  if (auto inject_fn = provider->take_partition_inject_fn()) {
-    op->set_partition_inject_fn(std::move(inject_fn));
-  }
-
-  return provider;
+  // Forward gpu_ioctxs to parquet_split_provider so run_batch() can construct
+  // sirius_datasources via ioctx->make_datasource(io_object) instead of cudf's
+  // bundled file_source factory (the latter routes through kvikio and bypasses
+  // io_uring + per-GPU CUDA-context binding established for multi-GPU IO).
+  return std::make_unique<parquet_split_provider>(
+    info->returned_types,
+    info->file_paths,
+    info->column_ids,
+    info->projection_ids,
+    info->names,
+    op->get_types().size(),
+    std::move(info->table_filters),
+    info->partition_indices,
+    info->approximate_batch_size,
+    parquet_split_provider::DEFAULT_MAX_FILE_PROCESSED,
+    gpu_ioctxs);
 }
 
 void sirius_scan_manager::run_driver_loop()

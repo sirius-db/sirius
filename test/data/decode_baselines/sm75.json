@@ -1,0 +1,48 @@
+{
+  "_meta": {
+    "arch": "sm_75",
+    "captured_by": "test/cpp/scan/bench_decode_codecs.cpp",
+    "captured_with": "sirius_unittest \"[!benchmark][scan][decode]\"",
+    "cuda_runtime": "12.9",
+    "device": "Quadro RTX 6000",
+    "device_memory_gib": 24,
+    "purpose": "Per-arch microbench baseline. Codec PRs gate against these numbers (>5% throughput regression blocks merge). Update by re-running the bench."
+  },
+  "codecs": {
+    "constant_32MiB": {
+      "_note": "Write-bandwidth bound near the GDDR6 fill ceiling.",
+      "rows": 4194304,
+      "type": "int64",
+      "write_throughput_gib_s": 539.2
+    },
+    "uncompressed_multi_1024x32KiB": {
+      "read_plus_write_gib_s": 476.8,
+      "rows": 4194304,
+      "type": "int64",
+      "write_throughput_gib_s": 238.4
+    },
+    "uncompressed_multi_1024x32KiB_raw_memcpy_reference": {
+      "_note": "Reference only \u2014 dispatcher bypassed, per-segment cudaMemcpyAsync. Demonstrates why the batched kernel exists.",
+      "read_plus_write_gib_s": 24.0,
+      "rows": 4194304,
+      "type": "int64",
+      "write_throughput_gib_s": 12.0
+    },
+    "uncompressed_multi_16x2MiB": {
+      "read_plus_write_gib_s": 480.6,
+      "rows": 4194304,
+      "type": "int64",
+      "write_throughput_gib_s": 240.3
+    },
+    "uncompressed_single_32MiB": {
+      "read_plus_write_gib_s": 505.4,
+      "rows": 4194304,
+      "type": "int64",
+      "write_throughput_gib_s": 252.7
+    }
+  },
+  "tunables": {
+    "COPY_CHUNK_BYTES": 65536,
+    "_note": "Per-CTA work bound for the chunked memcpy kernel. Tuned on Turing; re-measure on Ampere/Hopper if those become primary."
+  }
+}

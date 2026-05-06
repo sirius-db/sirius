@@ -46,7 +46,7 @@ std::unique_ptr<Base> get_local_aggregation(cudf::aggregation::Kind kind)
 }
 
 std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_ungrouped_aggregate(
-  std::shared_ptr<cucascade::data_batch> input,
+  const cucascade::read_only_data_batch& input,
   const std::vector<cudf::aggregation::Kind>& aggregates,
   const std::vector<int>& aggregate_idx,
   rmm::cuda_stream_view stream,
@@ -58,11 +58,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_ungrouped_aggre
       "`local_ungrouped_aggregate()`");
   }
   std::vector<std::unique_ptr<cudf::column>> output_cols;
-  // Phase 18 / DB-02 Recipe R1: scoped read-only accessor held for the
-  // lifetime of the derived input_table view (cudf::table_view is non-owning
-  // — it must outlive every column read below). Released at function exit.
-  auto ro          = input->to_read_only();
-  auto input_table = get_cudf_table_view(ro);
+  auto input_table = get_cudf_table_view(input);
   for (size_t i = 0; i < aggregates.size(); ++i) {
     const auto& input_col       = input_table.column(aggregate_idx[i]);
     auto reduce_aggregation     = get_local_aggregation<cudf::reduce_aggregation>(aggregates[i]);
@@ -111,15 +107,11 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_ungrouped_aggre
   auto output_table = std::make_unique<cudf::table>(
     std::move(output_cols), stream, memory_space.get_default_allocator());
 
-  // STREAM-LINEAGE: record `stream` as the writer of `output_table` so any
-  // downstream cross-device reader (e.g. cucascade::convert_gpu_to_gpu) can
-  // wait on the writer event before peer-copying — closes the cross-mempool
-  // stream-ordered race localized in Phase 13-02.
   return make_data_batch(std::move(output_table), memory_space, stream);
 }
 
 std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggregate(
-  std::shared_ptr<cucascade::data_batch> input,
+  const cucascade::read_only_data_batch& input,
   const std::vector<int>& group_idx,
   const std::vector<cudf::aggregation::Kind>& aggregates,
   const std::vector<int>& aggregate_idx,
@@ -136,12 +128,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
 
   const bool has_struct_col_indices = !aggregate_struct_col_indices.empty();
 
-  // Phase 18 / DB-02 Recipe R1: scoped read-only accessor for the lifetime
-  // of input_table (non-owning cudf::table_view) and any column_view objects
-  // derived from it. Released at function exit; long-running cudf calls
-  // below run while the shared lock is held.
-  auto ro          = input->to_read_only();
-  auto input_table = get_cudf_table_view(ro);
+  auto input_table = get_cudf_table_view(input);
   auto mr          = memory_space.get_default_allocator();
 
   // Dictionary-encode STRING group keys when:
@@ -326,8 +313,6 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   // Create the output data batch
   auto output_table = std::make_unique<cudf::table>(
     std::move(output_cols), stream, memory_space.get_default_allocator());
-  // STREAM-LINEAGE: record `stream` as the writer of `output_table` (Phase 13-02
-  // race site fix — see make_data_batch overload doc).
   return make_data_batch(std::move(output_table), memory_space, stream);
 }
 

@@ -40,7 +40,6 @@
 #include <vector>
 
 namespace sirius {
-using partition_inject_fn_t = op::scan::partition_inject_fn_t;
 
 /**
  * @brief Function called after a parquet batch is decompressed to a GPU cuDF table.
@@ -63,15 +62,9 @@ using post_convert_fn_t =
                                              int64_t first_row_offset,
                                              rmm::cuda_stream_view)>;
 
-/**
- * @brief Function that injects hive partition columns into a GPU table.
- *
- * Called after post_convert (if any) to add constant partition columns
- * (whose values come from the file path, not the parquet data) at the
- * correct positions in the output table.
- */
-using partition_inject_fn_t = std::function<std::unique_ptr<cudf::table>(
-  std::unique_ptr<cudf::table>, std::string const& data_file_path, rmm::cuda_stream_view)>;
+// partition_inject_fn_t is the legacy typedef declared in <op/scan/hive_partition.hpp>
+// (sirius:: namespace). It carries file_path so the schema-reconciliation closure built by
+// parquet_scan_task_global_state::build_schema_reconciliation can do per-file column-set lookups.
 
 /**
  * @brief A host representation of Parquet data for use in a hybrid scan.
@@ -357,12 +350,24 @@ class host_parquet_representation : public cucascade::idata_representation {
 
   [[nodiscard]] bool has_partition_inject_fn() const { return _partition_inject_fn != nullptr; }
 
+  /// Hive partition values for this representation's file, in hive_partition_columns order.
+  /// Set once per task by the caller that installs the inject fn.
+  void set_partition_values(std::vector<std::string> values)
+  {
+    _partition_values = std::move(values);
+  }
+
+  [[nodiscard]] std::vector<std::string> const& get_partition_values() const
+  {
+    return _partition_values;
+  }
+
   /// Only call after checking has_partition_inject_fn().
   [[nodiscard]] std::unique_ptr<cudf::table> apply_partition_inject(
     std::unique_ptr<cudf::table> tbl, rmm::cuda_stream_view stream)
   {
     D_ASSERT(_partition_inject_fn);
-    return _partition_inject_fn(std::move(tbl), _data_file_path, stream);
+    return _partition_inject_fn(std::move(tbl), _data_file_path, _partition_values, stream);
   }
 
   [[nodiscard]] partition_inject_fn_t const& get_partition_inject_fn() const
@@ -434,5 +439,8 @@ class host_parquet_representation : public cucascade::idata_representation {
   partition_inject_fn_t _partition_inject_fn;
   /// Path of the data file this batch was read from.
   std::string _data_file_path;
+  /// Hive partition values for @ref _data_file_path, in hive_partition_columns order.
+  /// Empty unless the table has hive partitions; consumed by apply_partition_inject().
+  std::vector<std::string> _partition_values;
 };
 }  // namespace sirius

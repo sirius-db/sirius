@@ -331,19 +331,11 @@ cucascade::host_data_representation const& convert_to_host_table(
   std::shared_ptr<cucascade::data_batch> const& batch,
   rmm::cuda_stream_view stream)
 {
-  // Phase 18 / DB-03 Recipe R1 + R3: scoped read for size estimation;
-  // release shared lock before taking exclusive (P1 — never overlap).
-  std::size_t reserve_bytes = 0;
-  {
-    auto ro = batch->to_read_only();
-    if (!ro.get_data()) { throw std::runtime_error("data_batch has no data representation"); }
-    reserve_bytes = estimate_packed_data_bytes(sirius::get_cudf_table_view(ro));
-  }
-
   auto& manager = sirius_ctx->get_memory_manager();
 
   auto reservation =
-    manager.request_reservation(any_memory_space_in_tier{Tier::HOST}, reserve_bytes);
+    manager.request_reservation(any_memory_space_in_tier{Tier::HOST},
+                                estimate_packed_data_bytes(sirius::get_cudf_table_view(*batch)));
 
   if (!reservation) { throw std::runtime_error("Failed to reserve host memory for test"); }
 
@@ -352,17 +344,13 @@ cucascade::host_data_representation const& convert_to_host_table(
   if (!host_space) { throw std::runtime_error("Invalid host memory space in test"); }
 
   auto& registry = sirius::converter_registry::get();
-  // Phase 18 / DB-03 Recipe R3: scoped mutable accessor for conversion.
   {
     auto mut = batch->to_mutable();
     mut.convert_to<cucascade::host_data_representation>(registry, host_space, stream);
   }
 
-  // Re-acquire read access to obtain the post-conversion representation. The
-  // representation lives on data_batch's unique_ptr (outlives the accessor),
-  // so the returned reference remains valid as long as `batch` is held.
-  auto ro_post = batch->to_read_only();
-  auto* data   = ro_post.get_data();
+  auto ro    = batch->to_read_only();
+  auto* data = ro.get_data();
   if (!data) { throw std::runtime_error("data_batch has no data after conversion"); }
   return data->cast<cucascade::host_data_representation>();
 }
@@ -492,14 +480,12 @@ TEST_CASE("host_table_utils - pack metadata with gaps across multiple blocks",
     std::make_shared<cucascade::data_batch>(sirius::get_next_batch_id(), std::move(host_table));
 
   auto& registry = sirius::converter_registry::get();
-  // Phase 18 / DB-03 Recipe R3 + R1: scoped mutable for in-place conversion;
-  // released before scoped read-only is taken (P1 — never overlap shared+exclusive).
   {
     auto mut = batch->to_mutable();
     mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
   }
-  auto __ro                   = batch->to_read_only();
-  cudf::table_view table_view = sirius::get_cudf_table_view(__ro);
+
+  cudf::table_view table_view = sirius::get_cudf_table_view(*batch);
   REQUIRE(table_view.num_rows() == static_cast<cudf::size_type>(num_rows));
   REQUIRE(table_view.num_columns() == 3);
   REQUIRE(table_view.column(0).type().id() == cudf::type_id::INT32);
@@ -624,14 +610,12 @@ TEST_CASE("host_table_utils - underfilled varchar column truncates rows",
     std::make_shared<cucascade::data_batch>(sirius::get_next_batch_id(), std::move(host_table));
 
   auto& registry = sirius::converter_registry::get();
-  // Phase 18 / DB-03 Recipe R3 + R1: scoped mutable for in-place conversion;
-  // released before scoped read-only is taken (P1 — never overlap shared+exclusive).
   {
     auto mut = batch->to_mutable();
     mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
   }
-  auto __ro                   = batch->to_read_only();
-  cudf::table_view table_view = sirius::get_cudf_table_view(__ro);
+
+  cudf::table_view table_view = sirius::get_cudf_table_view(*batch);
   REQUIRE(table_view.num_rows() == static_cast<cudf::size_type>(rows_fit));
   REQUIRE(table_view.num_columns() == 2);
   REQUIRE(table_view.column(0).type().id() == cudf::type_id::INT32);
@@ -671,10 +655,7 @@ TEST_CASE("host_table_utils - metadata offsets match packed data",
   std::vector<uint8_t> expected_int64_mask;
   std::vector<uint8_t> expected_string_mask;
   {
-    // Phase 18 / DB-03 Recipe R8: scoped read-only accessor replaces
-    // pre-#117 try_to_create_task + try_to_lock_for_processing pair.
-    auto ro              = batch->to_read_only();
-    auto const gpu_view  = sirius::get_cudf_table_view(ro);
+    auto const gpu_view  = sirius::get_cudf_table_view(*batch);
     expected             = extract_expected_data(gpu_view);
     expected_int64_mask  = extract_mask_bytes(gpu_view.column(1));
     expected_string_mask = extract_mask_bytes(gpu_view.column(2));

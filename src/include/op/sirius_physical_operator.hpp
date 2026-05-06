@@ -21,6 +21,7 @@
 #include "helper/types.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "sirius/exception.hpp"
+#include "telemetry-bridge/gen/uuid.rs.h"
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
@@ -33,10 +34,6 @@
 #include <vector>
 
 namespace sirius {
-
-namespace memory {
-class sirius_memory_reservation_manager;
-}  // namespace memory
 
 namespace op {
 class sirius_physical_operator;
@@ -97,35 +94,16 @@ class operator_data {
    *                                current space (see pipelineable_operator_data).
    * @param stream                  CUDA stream available for any data-movement
    *                                kernels triggered by preparation.
-   * @return  A vector of cucascade::mutable_data_batch RAII accessors that must
-   *          remain alive for the duration of the task; their destructors
-   *          release the exclusive locks held on the batches. An empty vector
-   *          is valid and appropriate when there is nothing to lock. Returns
-   *          std::nullopt to signal a preparation failure that should trigger
-   *          task reschedule/retry (for example, a batch lock that could not
-   *          be acquired or a conversion that failed).
+   * Throws on failure.
+   * pipelineable_operator_data rethrows rmm::out_of_memory after logging,
+   * and throws sirius::internal_exception for unrecoverable preparation errors.
    *
-   * The default implementation is a no-op that returns an empty accessor
-   * vector. It is appropriate for operator_data subclasses that own no data
-   * requiring locking and need no per-task setup. Override when either
-   * condition changes.
-   *
-   * Path A semantics (Phase 18-07): the returned vector is EMPTY for non-source
-   * operator data (eager memory-space conversion done under short-scoped
-   * accessors that are released BEFORE this function returns); for source-input
-   * data (parquet_scan_data, scan_cached_operator_data) it is also empty.
-   * Operators inside execute() acquire their own per-call read_only_data_batch
-   * / mutable_data_batch accessors via the cucascade #117 RAII API; locks are
-   * scoped to the narrowest block per CONTEXT.md P1 mitigation guidance.
-   * The previous Phase 18-02 R5 lock-and-hold design (vector held across
-   * op->execute()) was reverted in 18-07 after it triggered glibc EDEADLK on
-   * std::shared_mutex re-lock attempts. See 18-VERIFICATION.md for the full
-   * gap analysis and 18-07-SUMMARY.md for the closure record.
+   * The default implementation is a no-op appropriate for operator_data subclasses
+   * that own no data requiring locking and need no per-task setup.
+   * Override when either condition changes.
    */
-  virtual std::optional<std::vector<::cucascade::mutable_data_batch>> prepare_for_processing(
-    const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
-  {
-    return std::vector<::cucascade::mutable_data_batch>{};
+  virtual void prepare_for_processing(
+    const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream) {
   };
 
   /**
@@ -140,73 +118,81 @@ class operator_data {
 };
 
 /**
- * @brief Operator data carrying a collection of data batches for pipeline execution.
+ * @brief Operator data carrying data batches for pipeline execution.
  *
- * This is the standard data container used by pipeline operators. It wraps a
- * vector of data batches that flow between operators in a pipeline.
+ * Unifies idle and read-only-locked batch access in a single container. Holds an
+ * optional vector of idle data_batch shared_ptrs and/or an optional vector of
+ * read_only_data_batch RAII accessors. Lazy conversion is performed on demand:
+ *   - get_data_batches() populates _data_batches from _read_only_data_batches if needed
+ *   - get_read_only_batches() populates _read_only_data_batches from _data_batches if needed
+ *
+ * prepare_for_processing() locks idle batches and stores the result in
+ * _read_only_data_batches. remove_read_only_lock() releases all shared locks.
  */
 class pipelineable_operator_data : public operator_data {
  public:
-  pipelineable_operator_data() = default;
+  pipelineable_operator_data()
+  {
+    _data_batches = std::vector<std::shared_ptr<::cucascade::data_batch>>();
+  }
   explicit pipelineable_operator_data(
     std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
     : _data_batches(std::move(data_batches))
   {
   }
-
-  /**
-   * @brief Get the data batches.
-   * @return Const reference to vector of data batch pointers
-   */
-  [[nodiscard]] const std::vector<std::shared_ptr<::cucascade::data_batch>>& get_data_batches()
-    const
+  explicit pipelineable_operator_data(
+    std::vector<::cucascade::read_only_data_batch> read_only_data_batches)
+    : _read_only_data_batches(std::move(read_only_data_batches))
   {
-    return _data_batches;
   }
 
   /**
-   * @brief Move the data batches out of this container, leaving it empty.
-   * @return Vector of data batch pointers (moved out).
+   * @brief Get idle data batch pointers, lazily populating from read-only batches if needed.
    */
-  std::vector<std::shared_ptr<::cucascade::data_batch>> release_data_batches()
+  [[nodiscard]] const std::vector<std::shared_ptr<::cucascade::data_batch>>& get_data_batches()
+    const;
+
+  /**
+   * @brief Get read-only locked batches, lazily populating from idle batches if needed.
+   */
+  [[nodiscard]] std::vector<::cucascade::read_only_data_batch> get_read_only_batches(
+    bool leave_locked = false) const;
+
+  /**
+   * @brief Release all read-only locks by resetting _read_only_data_batches.
+   */
+  void remove_read_only_lock()
   {
-    return std::move(_data_batches);
+    // Releasing the lock means getting rid of any _read_only_data_batches that we may have cached.
+    // But we want to make sure we do keep the data alive. So we ensure that the data_batches are
+    // populated.
+    if (!_data_batches) { auto _ = get_data_batches(); }
+    _read_only_data_batches = std::nullopt;
   }
 
   /**
    * @brief Lock all data batches for processing in the requested memory space.
    *
-   * Iterates over all batches and locks (or converts then locks) each one into the
-   * requested memory space. Returns mutable_data_batch RAII accessors that keep
-   * the batches exclusively locked until they go out of scope.
-   *
-   * Returns std::nullopt if any batch fails to lock (triggers a retry/reschedule).
-   * Propagates rmm::out_of_memory so the caller can record metrics and reschedule.
-   *
-   * @param requested_memory_space  Target memory space; may be nullptr to use each batch's
-   *                                current space.
-   * @param stream                  CUDA stream used for any data-movement kernels.
-   * @return Mutable accessors for all batches, or std::nullopt on lock failure.
+   * Iterates over all idle batches and locks (or converts then locks) each one,
+   * storing the results in _read_only_data_batches. Throws sirius::internal_exception
+   * if any batch pointer is null or any batch fails to lock. Propagates rmm::out_of_memory.
    */
-  std::optional<std::vector<::cucascade::mutable_data_batch>> prepare_for_processing(
-    const ::cucascade::memory::memory_space* requested_memory_space,
-    rmm::cuda_stream_view stream) override;
+  void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
+                              rmm::cuda_stream_view stream) override;
 
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
   {
     std::size_t total = 0;
-    for (auto const& batch : _data_batches) {
-      if (!batch) { continue; }
-      // R2 read-only accessor scoped to this single batch's size read.
-      auto ro = batch->to_read_only();
+    auto ro_batches   = get_read_only_batches(false);
+    for (auto const& ro : ro_batches) {
       if (ro.get_data()) { total += ro.get_data()->get_uncompressed_data_size_in_bytes(); }
-      // ro released at end of loop iteration
     }
     return total;
   }
 
  private:
-  std::vector<std::shared_ptr<::cucascade::data_batch>> _data_batches;
+  mutable std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> _data_batches;
+  mutable std::optional<std::vector<::cucascade::read_only_data_batch>> _read_only_data_batches;
 };
 
 /**
@@ -257,7 +243,7 @@ class sirius_physical_operator {
 
   //! The physical operator type
   SiriusPhysicalOperatorType type;
-  //! The set of children of the operator
+  //! The set of children of the operator (operators that feed data _into_ the current operator)
   duckdb::vector<duckdb::unique_ptr<sirius_physical_operator>> children;
   //! The types returned by this physical operator
   duckdb::vector<sirius::logical_type> types;
@@ -362,6 +348,10 @@ class sirius_physical_operator {
     ::cucascade::shared_data_repository* repo;
     duckdb::shared_ptr<pipeline::sirius_pipeline> src_pipeline;
     duckdb::shared_ptr<pipeline::sirius_pipeline> dest_pipeline;
+    //! A UUID for a port on an operator at the beginning of a
+    // pipeline. This port receives data from a prior pipeline,
+    // forming an incoming edge from that pipeline.
+    uuid::UUID source_port_uuid{uuid::now_v7()};
   };
 
   /// Describes a downstream operator's port to which data is pushed
@@ -370,6 +360,18 @@ class sirius_physical_operator {
     sirius_physical_operator* next_operator;
     //! The port name on the downstream operator to push data into
     std::string_view next_operator_port_name;
+    //! A UUID to encode the concept of a pseudo port, to conform to the model of quent,
+    // that sits on an operator, at the end of a pipeline, sending data to a downstream
+    // pipeline's first operator's receiving port, forming a directed edge from the current
+    // operator's pipeline to the next_operator's pipeline:
+    // ┌─ pipeline A ──────────────────┐  ┌─ pipeline B ──────────────────┐
+    // │          ┌─ last op ───────┐  │  │  ┌─ first op ──────┐          │
+    // │ ┌────┐   │ ┌─ pseudo ┐     │  │  │  │     ┌─ port ─┐  │   ┌────┐ │
+    // │ │ op │...│ │        *───────────────────────▶      │  │...│ op │ │
+    // │ └────┘   │ └─ port ──┘     │  │  │  │     └────────┘  │   └────┘ │
+    // │          └─────────────────┘  │  │  └─────────────────┘          │
+    // └───────────────────────────────┘  └───────────────────────────────┘
+    uuid::UUID pseudo_sink_port_uuid;
   };
 
   // source pipeline pushed to repo of the ports
@@ -399,13 +401,7 @@ class sirius_physical_operator {
   {
     // WSM TODO implement this
     throw std::runtime_error("can_create_more_tasks not implemented for operator " + get_name());
-  }
-
-  /// \brief check if all tasks have been processed
-  virtual bool has_processed_all_tasks() const
-  {
-    // WSM TODO implement this
-    throw std::runtime_error("has_processed_all_tasks not implemented for operator " + get_name());
+    return true;
   }
 
   /// \brief check if this operator has exhausted its limit, allowing the pipeline to finish early
@@ -415,6 +411,8 @@ class sirius_physical_operator {
   virtual std::unique_ptr<operator_data> get_next_task_input_data();
   //! Check if all ports are empty
   [[nodiscard]] virtual bool all_ports_empty();
+  //! Check if the pipeline is finished
+  bool check_pipeline_finished();
 
   //! Get pipeline
   duckdb::shared_ptr<pipeline::sirius_pipeline> get_pipeline() const noexcept;

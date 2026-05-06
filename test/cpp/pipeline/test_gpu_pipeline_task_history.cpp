@@ -24,8 +24,6 @@
 #include "pipeline/oom_reschedule_exception.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
-#include "sirius_engine.hpp"
-#include "sirius_interface.hpp"
 #include "utils/utils.hpp"
 
 #include <rmm/cuda_stream.hpp>
@@ -137,8 +135,6 @@ struct pipeline_task_history_fixture {
     auto batch = sirius::make_data_batch(std::move(gpu_table), *gpu_space, stream);
 
     auto& registry = sirius::converter_registry::get();
-    // Phase 18 / DB-03 Recipe R8 + R3: scoped mutable accessor for the
-    // host-tier conversion.
     {
       auto mut = batch->to_mutable();
       mut.convert_to<cucascade::host_data_representation>(registry, host_space, stream);
@@ -150,9 +146,6 @@ struct pipeline_task_history_fixture {
       REQUIRE(ro.get_data() != nullptr);
       REQUIRE(ro.get_data()->get_current_tier() == cucascade::memory::Tier::HOST);
     }
-    // Phase 18 / DB-03 — Pitfall 5: try_to_create_task is gone; under #117
-    // the FSM transition is unnecessary — a fresh batch is already idle. The
-    // pipeline machinery now acquires a mutable accessor when it dispatches.
     return batch;
   }
 
@@ -170,20 +163,14 @@ struct pipeline_task_history_fixture {
     stream.synchronize();
 
     auto batch = sirius::make_data_batch(std::move(gpu_table), *gpu_space, stream);
-    // Phase 18 / DB-03 — Pitfall 5: try_to_create_task is gone (no FSM under
-    // #117); the batch is already idle by construction.
     return batch;
   }
 };
 
 //------------------------------------------------------------------------------
-// Pipeline context: DuckDB, engine, pipeline, and stub operator.
+// Pipeline context: minimal pipeline shell and stub operator.
 //------------------------------------------------------------------------------
 struct pipeline_context {
-  std::unique_ptr<duckdb::DuckDB> db;
-  std::unique_ptr<duckdb::Connection> con;
-  std::unique_ptr<sirius::sirius_interface> iface;
-  std::unique_ptr<sirius::sirius_engine> engine;
   duckdb::shared_ptr<sirius::pipeline::sirius_pipeline> pipeline;
   std::unique_ptr<stub_operator> stub_op;
 };
@@ -191,11 +178,8 @@ struct pipeline_context {
 pipeline_context create_pipeline_context()
 {
   pipeline_context ctx;
-  ctx.db       = std::make_unique<duckdb::DuckDB>(nullptr);
-  ctx.con      = std::make_unique<duckdb::Connection>(*ctx.db);
-  ctx.iface    = std::make_unique<sirius::sirius_interface>(*ctx.con->context);
-  ctx.engine   = std::make_unique<sirius::sirius_engine>(*ctx.con->context, *ctx.iface);
-  ctx.pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(*ctx.engine);
+  const sirius::pipeline::pipeline_build_context build_ctx{true};
+  ctx.pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(build_ctx);
   ctx.pipeline->set_pipeline_id(42);
   ctx.stub_op = std::make_unique<stub_operator>();
 

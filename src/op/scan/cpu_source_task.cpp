@@ -363,17 +363,13 @@ void cpu_source_task::publish_output(op::operator_data& output_data, rmm::cuda_s
   // so publish every valid batch rather than filtering on size_in_bytes.
   // Downstream operators still need to see the batch to know a row existed.
   auto& pipelineable_output = dynamic_cast<op::pipelineable_operator_data&>(output_data);
-  for (auto& batch : pipelineable_output.release_data_batches()) {
+  for (auto& batch : pipelineable_output.get_data_batches()) {
     if (!batch) { continue; }
-    // Phase 18 / DB-02 Recipe R1: scoped read-only accessor for the
-    // null-data probe; destroyed before the std::move below so the data_batch
-    // (held by `batch`) carries no live shared lock when it lands in the repo.
-    bool has_data = false;
     {
-      auto ro  = batch->to_read_only();
-      has_data = (ro.get_data() != nullptr);
-    }  // ro destroyed -> shared lock released.
-    if (has_data) { _data_repo->add_data_batch(std::move(batch)); }
+      auto ro = batch->to_read_only();
+      if (!ro.get_data()) { continue; }
+    }
+    _data_repo->add_data_batch(batch);
   }
 }
 

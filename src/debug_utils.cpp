@@ -70,11 +70,9 @@ host_column_nulls copy_null_mask_to_host(cudf::column_view const& col, rmm::cuda
 
 namespace {
 
-// Phase 18 / DB-02 Recipe R1: probe operates on a read-only accessor so
-// get_data() / get_current_tier() are reachable through the accessor's public
-// API (data_batch::get_data() became private under cucascade #117).
-bool is_gpu_tier(cucascade::read_only_data_batch const& ro, const char* func_name)
+bool is_gpu_tier(cucascade::data_batch& batch, const char* func_name)
 {
+  auto ro    = batch.to_read_only();
   auto* data = ro.get_data();
   if (data == nullptr) {
     SIRIUS_LOG_WARN("[SIRIUS_DIAG] {}: batch has no data", func_name);
@@ -696,14 +694,9 @@ void debug_schema(cucascade::data_batch& batch,
                   std::vector<std::string> const& col_names)
 {
   try {
-    // Phase 18 / DB-02 Recipe R1: scoped read-only accessor lives for the
-    // duration of the function body — table_view returned by
-    // get_cudf_table_view is a non-owning ref into the accessor's
-    // representation, so the lock must outlive every read of `tv`.
-    auto ro = batch.to_read_only();
-    if (!is_gpu_tier(ro, "debug_schema")) { return; }
+    if (!is_gpu_tier(batch, "debug_schema")) { return; }
 
-    cudf::table_view tv = get_cudf_table_view(ro);
+    cudf::table_view tv = get_cudf_table_view(batch);
     stream.synchronize();
 
     std::string output;
@@ -754,12 +747,9 @@ void debug_nulls(cucascade::data_batch& batch,
                  std::vector<std::string> const& col_names)
 {
   try {
-    // Phase 18 / DB-02 Recipe R1: scoped read-only accessor for the
-    // function body.
-    auto ro = batch.to_read_only();
-    if (!is_gpu_tier(ro, "debug_nulls")) { return; }
+    if (!is_gpu_tier(batch, "debug_nulls")) { return; }
 
-    cudf::table_view tv = get_cudf_table_view(ro);
+    cudf::table_view tv = get_cudf_table_view(batch);
     stream.synchronize();
 
     std::string output;
@@ -807,11 +797,8 @@ void debug_head(cucascade::data_batch& batch,
                 cudf::size_type max_string_len)
 {
   try {
-    // Phase 18 / DB-02 Recipe R1: scoped read-only accessor; table_view is a
-    // non-owning ref so the lock must outlive every read of `tv`.
-    auto ro = batch.to_read_only();
-    if (!is_gpu_tier(ro, "debug_head")) { return; }
-    cudf::table_view tv = get_cudf_table_view(ro);
+    if (!is_gpu_tier(batch, "debug_head")) { return; }
+    cudf::table_view tv = get_cudf_table_view(batch);
     stream.synchronize();
 
     auto num_cols = tv.num_columns();
@@ -871,10 +858,8 @@ void debug_stats(cucascade::data_batch& batch,
                  std::vector<std::string> const& col_names)
 {
   try {
-    // Phase 18 / DB-02 Recipe R1: scoped read-only accessor.
-    auto ro = batch.to_read_only();
-    if (!is_gpu_tier(ro, "debug_stats")) { return; }
-    cudf::table_view tv = get_cudf_table_view(ro);
+    if (!is_gpu_tier(batch, "debug_stats")) { return; }
+    cudf::table_view tv = get_cudf_table_view(batch);
     stream.synchronize();
 
     auto num_cols = tv.num_columns();
@@ -967,10 +952,8 @@ void debug_checksum(cucascade::data_batch& batch,
                     std::vector<std::string> const& col_names)
 {
   try {
-    // Phase 18 / DB-02 Recipe R1: scoped read-only accessor.
-    auto ro = batch.to_read_only();
-    if (!is_gpu_tier(ro, "debug_checksum")) { return; }
-    cudf::table_view tv = get_cudf_table_view(ro);
+    if (!is_gpu_tier(batch, "debug_checksum")) { return; }
+    cudf::table_view tv = get_cudf_table_view(batch);
     stream.synchronize();
 
     auto mr       = cudf::get_current_device_resource_ref();
@@ -1046,16 +1029,11 @@ void debug_diff(cucascade::data_batch& batch_a,
                 std::vector<std::string> const& col_names)
 {
   try {
-    // Phase 18 / DB-02 Recipe R1: hold both read-only accessors for the
-    // lifetime of the table_views derived from them. P1: the two batches are
-    // distinct objects so concurrent shared locks on each are independent.
-    auto ro_a = batch_a.to_read_only();
-    auto ro_b = batch_b.to_read_only();
-    if (!is_gpu_tier(ro_a, "debug_diff")) { return; }
-    if (!is_gpu_tier(ro_b, "debug_diff")) { return; }
+    if (!is_gpu_tier(batch_a, "debug_diff")) { return; }
+    if (!is_gpu_tier(batch_b, "debug_diff")) { return; }
 
-    cudf::table_view tv_a = get_cudf_table_view(ro_a);
-    cudf::table_view tv_b = get_cudf_table_view(ro_b);
+    cudf::table_view tv_a = get_cudf_table_view(batch_a);
+    cudf::table_view tv_b = get_cudf_table_view(batch_b);
     stream.synchronize();
 
     std::string output;
@@ -1306,13 +1284,8 @@ void debug_sample(cucascade::data_batch& batch,
                   std::optional<uint64_t> seed)
 {
   try {
-    // Phase 18 / DB-02 Recipe R1: scoped read-only accessor; the gather()
-    // result is materialized via stream.synchronize() before this function
-    // returns, so the source representation only needs to outlive the gather
-    // — which it does because `ro` lives the whole function body.
-    auto ro = batch.to_read_only();
-    if (!is_gpu_tier(ro, "debug_sample")) { return; }
-    cudf::table_view tv = get_cudf_table_view(ro);
+    if (!is_gpu_tier(batch, "debug_sample")) { return; }
+    cudf::table_view tv = get_cudf_table_view(batch);
     stream.synchronize();
 
     auto num_cols = tv.num_columns();

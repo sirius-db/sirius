@@ -159,7 +159,9 @@ convert_host_parquet_to_gpu_with_prefetched_data_source(
     table = host_src.apply_post_convert(std::move(table), target_stream);
   }
 
-  // Inject hive partition columns (constant values from file path).
+  // Reshape the cuDF table to the pipeline-expected layout: inject hive partition columns and,
+  // under schema evolution, NULL-fill any columns missing from this file. The closure is built
+  // by parquet_scan_task_global_state (init_hive_partitions / build_schema_reconciliation).
   if (host_src.has_partition_inject_fn()) {
     table = host_src.apply_partition_inject(std::move(table), target_stream);
   }
@@ -279,6 +281,7 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_host_pa
   if (host_src.has_post_convert_fn()) { dst->set_post_convert_fn(host_src.get_post_convert_fn()); }
   if (host_src.has_partition_inject_fn()) {
     dst->set_partition_inject_fn(host_src.get_partition_inject_fn());
+    dst->set_partition_values(host_src.get_partition_values());
   }
   if (!host_src.get_data_file_path().empty()) {
     dst->set_data_file_path(host_src.get_data_file_path());

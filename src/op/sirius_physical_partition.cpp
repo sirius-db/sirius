@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_partition.hpp"
 
+#include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression/expression_internal.hpp"
@@ -156,7 +157,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_partition::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_data_batches();
+  const auto& input_batches = input.get_read_only_batches();
   if (input_batches.size() != 1) {
     throw std::runtime_error("We expect only one input batch for partition operator " +
                              std::to_string(this->get_operator_id()));
@@ -165,39 +166,34 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
     throw std::runtime_error("Num partitions was not set in sirius_physical_partition operator " +
                              std::to_string(this->get_operator_id()));
   }
+
+  auto const& input_batch_ro = input_batches[0];
+  auto* space                = input_batch_ro.get_memory_space();
+
   if (_num_partitions.value() < 2 || _partition_keys.empty()) {
-    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
+    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
   }
 
-  auto input_batch = input_batches[0];
-  // Phase 18 / DB-02 Recipe R1: scoped read-only accessor for the
-  // memory-space probe. The impl functions take their own (shared) accessors
-  // internally — concurrent shared locks are permitted (P1 only deadlocks on
-  // shared+exclusive overlap), so passing input_batch + the resolved
-  // memory_space ref is safe.
-  cucascade::memory::memory_space* mem_space = nullptr;
-  {
-    auto ro   = input_batch->to_read_only();
-    mem_space = ro.get_memory_space();
-  }  // ro destroyed -> shared lock released; mem_space pointer still valid as
-     // it points at a long-lived memory_space owned by the reservation manager.
   std::vector<std::shared_ptr<cucascade::data_batch>> partitioned_results;
   switch (_partition_type) {
     case PartitionType::HASH:
-      partitioned_results = gpu_partition_impl::hash_partition(input_batch,
+      partitioned_results = gpu_partition_impl::hash_partition(input_batch_ro,
                                                                _partition_keys,
                                                                _partition_key_cast_types,
                                                                _num_partitions.value(),
                                                                stream,
-                                                               *mem_space);
+                                                               *space);
       break;
     case PartitionType::RANGE:
       throw std::runtime_error("Range partitioning is not implemented yet");
     case PartitionType::EVENLY:
       partitioned_results = gpu_partition_impl::evenly_partition(
-        input_batch, _num_partitions.value(), stream, *mem_space);
+        input_batch_ro, _num_partitions.value(), stream, *space);
       break;
-    case PartitionType::NONE: partitioned_results = {input_batch}; break;
+    case PartitionType::NONE: {
+      partitioned_results = {input_batch_ro.clone(sirius::get_next_batch_id(), stream)};
+      break;
+    }
     case PartitionType::CUSTOM:
       throw std::runtime_error("Custom partitioning is not implemented yet");
     default:
@@ -243,22 +239,12 @@ std::pair<int, uint64_t> sirius_physical_partition::determine_num_partitions()
   uint64_t total_bytes = 0;
   for (auto batch_id : batch_ids) {
     auto batch = repo->get_data_batch_by_id(batch_id, 0);
-    if (!batch) { continue; }
-    // Phase 18 / DB-02 Recipe R2: scoped read-only accessor for the size
-    // probe; destroyed at end-of-iteration -> shared lock released. R7:
-    // get_data_batch_by_id is now 2-arg (state filter dropped under #117).
-    auto ro = batch->to_read_only();
-    if (ro.get_data()) { total_bytes += ro.get_data()->get_size_in_bytes(); }
+    if (batch) {
+      auto ro = batch->to_read_only();
+      if (ro.get_data()) { total_bytes += ro.get_data()->get_size_in_bytes(); }
+    }
   }
   int num_partitions = static_cast<int>(std::max(uint64_t{1}, total_bytes / s_partition_size));
-  // Multi-GPU floor: if the input is big enough to justify using the second
-  // GPU, force at least num_gpus partitions so partition-based operators
-  // (hash_join, merge_group_by) get work on every GPU. Below the small-table
-  // threshold we keep num_partitions at its natural value — tiny tables run
-  // on a single GPU to avoid cross-device overhead.
-  if (_min_num_partitions > 1 && total_bytes >= _small_table_bytes) {
-    num_partitions = std::max(num_partitions, _min_num_partitions);
-  }
   return std::make_pair(num_partitions, total_bytes);
 }
 

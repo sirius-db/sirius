@@ -154,12 +154,7 @@ inline std::vector<std::shared_ptr<cucascade::data_batch>> drain_data_repo(
 {
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
   while (true) {
-    // Phase 18 / DB-03 Recipe R6: pop_data_batch(state) is gone under #117;
-    // pop_next_data_batch returns the front batch in the partition (or
-    // nullptr if empty). The previous state-filter is unnecessary because
-    // every batch in the repo is already in the matching state by
-    // construction (the FSM was removed — see Pitfall 5).
-    auto batch = data_repo.pop_next_data_batch(/*partition_idx=*/0);
+    auto batch = data_repo.pop_next_data_batch();
     if (!batch) { break; }
     batches.push_back(std::move(batch));
   }
@@ -208,15 +203,11 @@ inline void validate_scanned_batches(
 
   for (auto const& batch : batches) {
     REQUIRE(batch != nullptr);
-    // Phase 18 / DB-03 Recipe R3 + R1: scoped mutable accessor for in-place
-    // conversion (released before the read-only accessor is taken below to
-    // enforce P1 — never overlap shared+exclusive on the same batch).
     {
       auto mut = batch->to_mutable();
       mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
     }
-    auto __ro       = batch->to_read_only();
-    auto table_view = sirius::get_cudf_table_view(__ro);
+    auto table_view = sirius::get_cudf_table_view(*batch);
 
     REQUIRE(table_view.num_columns() == 4);
     REQUIRE(table_view.column(0).type().id() == cudf::type_id::INT32);
@@ -301,15 +292,11 @@ inline void validate_projected_id_price_batches(
 
   for (auto const& batch : batches) {
     REQUIRE(batch != nullptr);
-    // Phase 18 / DB-03 Recipe R3 + R1: scoped mutable accessor for in-place
-    // conversion (released before the read-only accessor is taken below to
-    // enforce P1 — never overlap shared+exclusive on the same batch).
     {
       auto mut = batch->to_mutable();
       mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
     }
-    auto __ro       = batch->to_read_only();
-    auto table_view = sirius::get_cudf_table_view(__ro);
+    auto table_view = sirius::get_cudf_table_view(*batch);
 
     REQUIRE(table_view.num_columns() == 2);
     REQUIRE(table_view.column(0).type().id() == cudf::type_id::INT32);

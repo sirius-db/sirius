@@ -324,7 +324,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_data_batches();
+  const auto& input_batches = input.get_read_only_batches();
   if (aggregates.empty()) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
@@ -335,18 +335,10 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
   outputs.reserve(input_batches.size());
 
   for (auto const& batch : input_batches) {
-    if (!batch) { continue; }
-    // INVARIANT (SCHED-RR contract): all input batches arrive on target_space
-    // via gpu_pipeline_task::execute_pipeline_task_round ->
-    // pipelineable_operator_data::prepare_for_processing -> lock_or_prepare_batch.
-    // batches[0]->get_memory_space() == target_space here.
-    // See .planning/phases/15-mgpu-operator-colocation-audit/15-AUDIT-LOG.md.
-    // R1 — read-only accessor held for the per-batch reduction body.
-    auto ro     = batch->to_read_only();
-    auto* space = ro.get_memory_space();
+    auto* space = batch.get_memory_space();
     if (!space) { continue; }
 
-    auto view = ro.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+    auto view = batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
 
     std::vector<std::unique_ptr<cudf::column>> cols;
     cols.reserve(layout.local_types.size());
@@ -491,33 +483,19 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate_merge::execute"};
-  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_data_batches();
+  auto& input        = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  auto input_batches = input.get_read_only_batches();
   if (aggregates.empty()) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
-  std::vector<std::shared_ptr<cucascade::data_batch>> valid_batches;
-  valid_batches.reserve(input_batches.size());
-  for (auto const& batch : input_batches) {
-    if (batch) { valid_batches.push_back(batch); }
-  }
-  if (valid_batches.empty()) {
+  if (input_batches.empty()) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
-  // INVARIANT (SCHED-RR contract): all input batches arrive on target_space
-  // via gpu_pipeline_task::execute_pipeline_task_round ->
-  // pipelineable_operator_data::prepare_for_processing -> lock_or_prepare_batch.
-  // batches[0]->get_memory_space() == target_space here.
-  // See .planning/phases/15-mgpu-operator-colocation-audit/15-AUDIT-LOG.md.
-  cucascade::memory::memory_space* space = nullptr;
-  {
-    auto ro_first = valid_batches[0]->to_read_only();
-    space         = ro_first.get_memory_space();
-  }  // ro_first released
+  cucascade::memory::memory_space* space = input_batches[0].get_memory_space();
   if (space == nullptr) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
@@ -525,11 +503,11 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
 
   auto layout = build_aggregate_layout(aggregates);
   std::shared_ptr<cucascade::data_batch> merged_batch;
-  if (valid_batches.size() == 1) {
-    merged_batch = valid_batches[0];
+  if (input_batches.size() == 1) {
+    merged_batch = cucascade::data_batch::to_idle(std::move(input_batches[0]));
   } else {
     merged_batch = gpu_merge_impl::merge_ungrouped_aggregate(
-      valid_batches, layout.merge_kinds, layout.merge_nth_index, stream, *space);
+      input_batches, layout.merge_kinds, layout.merge_nth_index, stream, *space);
   }
 
   if (!layout.has_avg) {
@@ -537,8 +515,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
       std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(merged_batch)});
   }
 
-  // R1 — read-only accessor on merged_batch held for the AVG post-processing
-  // body so merged_view (cudf::table_view alias) remains valid.
+  // Acquire read access to merged batch to extract table
   auto merged_ro = merged_batch->to_read_only();
   auto merged_view =
     merged_ro.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
@@ -580,7 +557,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::get_ne
   std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
   bool found_batch = true;
   while (found_batch) {
-    auto batch = ports.begin()->second->repo->pop_next_data_batch(/* partition_idx */ 0);
+    auto batch = ports.begin()->second->repo->pop_next_data_batch();
     if (batch) {
       input_batch.push_back(std::move(batch));
     } else {

@@ -388,7 +388,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_nested_loop_join::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_data_batches();
+  const auto& input_batches = input.get_read_only_batches();
   size_t pipeline_id = (this->get_pipeline() != nullptr) ? this->get_pipeline()->get_pipeline_id()
                                                          : static_cast<size_t>(-1);
   SIRIUS_LOG_DEBUG(
@@ -400,29 +400,13 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
       std::to_string(input_batches.size()));
   }
 
-  auto left_batch  = input_batches[0];
-  auto right_batch = input_batches[1];
+  auto const& left_batch  = input_batches[0];
+  auto const& right_batch = input_batches[1];
 
-  if (!left_batch || !right_batch) {
-    SIRIUS_LOG_DEBUG("Pipeline {}: nested loop join, 0 output batches", pipeline_id);
-    return std::make_unique<pipelineable_operator_data>(
-      std::vector<std::shared_ptr<cucascade::data_batch>>{});
-  }
+  cudf::table_view left  = get_cudf_table_view(left_batch);
+  cudf::table_view right = get_cudf_table_view(right_batch);
 
-  // R1 — read-only accessors held for the entire body so the cudf::table_views
-  // remain valid through every code path (cross_join, conditional_join, gather,
-  // make_data_batch). Both accessors are released when this function returns.
-  auto left_ro           = left_batch->to_read_only();
-  auto right_ro          = right_batch->to_read_only();
-  cudf::table_view left  = get_cudf_table_view(left_ro);
-  cudf::table_view right = get_cudf_table_view(right_ro);
-
-  // INVARIANT (SCHED-RR contract): all input batches arrive on target_space
-  // via gpu_pipeline_task::execute_pipeline_task_round ->
-  // pipelineable_operator_data::prepare_for_processing -> lock_or_prepare_batch.
-  // batches[0]->get_memory_space() == target_space here.
-  // See .planning/phases/15-mgpu-operator-colocation-audit/15-AUDIT-LOG.md.
-  cucascade::memory::memory_space* space = left_ro.get_memory_space();
+  cucascade::memory::memory_space* space = left_batch.get_memory_space();
   if (!space) {
     SIRIUS_LOG_DEBUG(
       "Pipeline {}: nested loop join, 0 output batches because left batch had no memory space",
@@ -500,7 +484,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
     // as needed. Returns the index to use as the cudf::ast::column_reference offset.
     auto resolve_join_col = [&](const duckdb::Expression& expr,
                                 std::map<uint64_t, cudf::size_type>& expr_to_idx,
-                                const std::shared_ptr<cucascade::data_batch>& batch,
+                                const ::cucascade::read_only_data_batch& batch,
                                 const cudf::table_view& table,
                                 std::vector<cudf::column_view>& col_views,
                                 const char* side) -> cudf::size_type {

@@ -165,8 +165,8 @@ std::shared_ptr<data_batch> make_input_batch(
   auto mr    = get_resource_ref(space);
   auto table = ::sirius::create_cudf_table_with_random_data(
     128, column_types, ranges, cudf::get_default_stream(), mr);
-  auto gpu_repr =
-    std::make_unique<gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
+  auto gpu_repr = std::make_unique<gpu_table_representation>(
+    std::move(table), space, cudf::get_default_stream());
   auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
 }
@@ -201,8 +201,8 @@ std::shared_ptr<data_batch> make_int32_batch_with_nulls(memory_space& space,
   cols.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
-  auto gpu_repr =
-    std::make_unique<gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
+  auto gpu_repr = std::make_unique<gpu_table_representation>(
+    std::move(table), space, cudf::get_default_stream());
   auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
 }
@@ -241,8 +241,8 @@ std::shared_ptr<data_batch> make_two_int32_batch_with_nulls(memory_space& space,
   cols.push_back(make_col(values_b, valids_b));
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
-  auto gpu_repr =
-    std::make_unique<gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
+  auto gpu_repr = std::make_unique<gpu_table_representation>(
+    std::move(table), space, cudf::get_default_stream());
   auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
 }
@@ -269,8 +269,8 @@ std::shared_ptr<data_batch> make_decimal64_batch(memory_space& space,
   cols.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
-  auto gpu_repr =
-    std::make_unique<gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
+  auto gpu_repr = std::make_unique<gpu_table_representation>(
+    std::move(table), space, cudf::get_default_stream());
   auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
 }
@@ -302,8 +302,8 @@ std::shared_ptr<data_batch> make_decimal64_two_col_batch(memory_space& space,
   cols.push_back(make_col(values_b));
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
-  auto gpu_repr =
-    std::make_unique<gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
+  auto gpu_repr = std::make_unique<gpu_table_representation>(
+    std::move(table), space, cudf::get_default_stream());
   auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
 }
@@ -330,8 +330,8 @@ std::shared_ptr<data_batch> make_decimal32_batch(memory_space& space,
   cols.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
-  auto gpu_repr =
-    std::make_unique<gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
+  auto gpu_repr = std::make_unique<gpu_table_representation>(
+    std::move(table), space, cudf::get_default_stream());
   auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
 }
@@ -358,8 +358,8 @@ std::shared_ptr<data_batch> make_decimal128_batch(memory_space& space,
   cols.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
-  auto gpu_repr =
-    std::make_unique<gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
+  auto gpu_repr = std::make_unique<gpu_table_representation>(
+    std::move(table), space, cudf::get_default_stream());
   auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
 }
@@ -388,14 +388,6 @@ struct exec_result {
   cudf::table_view output_view;
 };
 
-// Phase 18 / DB-03 Recipe R1: scoped read-only accessors for input + output
-// batches. The returned cudf::table_view objects are non-owning views into
-// the batches' gpu_table_representation. Under cucascade #117 the storage
-// (unique_ptr<idata_representation>) lives on the data_batch and outlives
-// the accessor, so the table_views in `exec_result` remain valid for use
-// by callers as long as input_batch / output_batch are kept alive (both
-// stored as shared_ptr in exec_result). Lock contention is irrelevant in
-// these single-threaded test cases.
 exec_result run_execute(memory_space& space,
                         std::shared_ptr<data_batch> const& input_batch,
                         duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs,
@@ -403,28 +395,15 @@ exec_result run_execute(memory_space& space,
 {
   auto wrapped = sirius::wrap_many(std::move(exprs));
   exp_executor executor(wrapped, get_resource_ref(space), cudf::get_default_stream(), strategy);
-  cudf::table_view in_view;
-  cucascade::memory::memory_space* in_space = nullptr;
-  {
-    auto ro       = input_batch->to_read_only();
-    auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
-    in_view       = in_repr.get_table_view();
-    in_space      = ro.get_memory_space();
-  }
-  auto output_table = executor.execute(in_view);
+  auto input_ro     = input_batch->to_read_only();
+  auto& in_repr     = input_ro.get_data()->cast<gpu_table_representation>();
+  auto output_table = executor.execute(in_repr.get_table_view());
   REQUIRE(output_table != nullptr);
-  // Phase 18 / DB-04: writer_stream is required on make_data_batch (Phase
-  // 13-04 Path-2 stream-lineage contract). The exp_executor was constructed
-  // with cudf::get_default_stream() above, so that's the writer stream.
-  auto output_batch =
-    sirius::make_data_batch(std::move(output_table), *in_space, cudf::get_default_stream());
-  cudf::table_view out_view;
-  {
-    auto ro        = output_batch->to_read_only();
-    auto& out_repr = ro.get_data()->cast<gpu_table_representation>();
-    out_view       = out_repr.get_table_view();
-  }
-  return {input_batch, output_batch, in_view, out_view};
+  auto output_batch = sirius::make_data_batch(
+    std::move(output_table), *input_ro.get_memory_space(), cudf::get_default_stream());
+  auto output_ro = output_batch->to_read_only();
+  auto& out_repr = output_ro.get_data()->cast<gpu_table_representation>();
+  return {input_batch, output_batch, in_repr.get_table_view(), out_repr.get_table_view()};
 }
 
 exec_result run_select(memory_space& space,
@@ -434,28 +413,15 @@ exec_result run_select(memory_space& space,
 {
   auto wrapped = sirius::wrap_many(std::move(exprs));
   exp_executor executor(wrapped, get_resource_ref(space), cudf::get_default_stream(), strategy);
-  cudf::table_view in_view;
-  cucascade::memory::memory_space* in_space = nullptr;
-  {
-    auto ro       = input_batch->to_read_only();
-    auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
-    in_view       = in_repr.get_table_view();
-    in_space      = ro.get_memory_space();
-  }
-  auto output_table = executor.select(in_view);
+  auto input_ro     = input_batch->to_read_only();
+  auto& in_repr     = input_ro.get_data()->cast<gpu_table_representation>();
+  auto output_table = executor.select(in_repr.get_table_view());
   REQUIRE(output_table != nullptr);
-  // Phase 18 / DB-04: writer_stream is required on make_data_batch (Phase
-  // 13-04 Path-2 stream-lineage contract). The exp_executor was constructed
-  // with cudf::get_default_stream() above, so that's the writer stream.
-  auto output_batch =
-    sirius::make_data_batch(std::move(output_table), *in_space, cudf::get_default_stream());
-  cudf::table_view out_view;
-  {
-    auto ro        = output_batch->to_read_only();
-    auto& out_repr = ro.get_data()->cast<gpu_table_representation>();
-    out_view       = out_repr.get_table_view();
-  }
-  return {input_batch, output_batch, in_view, out_view};
+  auto output_batch = sirius::make_data_batch(
+    std::move(output_table), *input_ro.get_memory_space(), cudf::get_default_stream());
+  auto output_ro = output_batch->to_read_only();
+  auto& out_repr = output_ro.get_data()->cast<gpu_table_representation>();
+  return {input_batch, output_batch, in_repr.get_table_view(), out_repr.get_table_view()};
 }
 
 // Helper: make a BoundFunctionExpression with the given name, arg types, return type, and children.

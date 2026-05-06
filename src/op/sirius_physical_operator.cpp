@@ -20,6 +20,7 @@
 #include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "sirius/exception.hpp"
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/error.hpp>
@@ -33,69 +34,90 @@ namespace op {
 // operator_data
 //===--------------------------------------------------------------------===//
 
-std::optional<std::vector<::cucascade::mutable_data_batch>>
-pipelineable_operator_data::prepare_for_processing(
-  const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
+const std::vector<std::shared_ptr<::cucascade::data_batch>>&
+pipelineable_operator_data::get_data_batches() const
 {
-  // Path A (Phase 18-07 gap closure): conversion happens under short-scoped
-  // accessors released before return; operators inside execute() acquire their
-  // own per-call accessors at narrowest scope. R5 lock-and-hold dropped per
-  // 18-VERIFICATION.md (DB-05 deadlock fix). The previous design returned a
-  // vector of mutable_data_batch held across op->execute(); under glibc
-  // std::shared_mutex this triggered EDEADLK ("Resource deadlock avoided")
-  // when operator code in execute() re-acquired to_read_only/to_mutable on
-  // the same batches. We now eagerly perform any required memory-space
-  // conversion inside this function under a `{}` block — the exclusive
-  // accessor is destroyed before the next iteration — and return an empty
-  // vector. Operators take their own per-call accessors during execute().
-  for (const auto& batch : _data_batches) {
-    if (!batch) {
-      SIRIUS_LOG_ERROR("pipelineable_operator_data: null batch encountered, skipping");
-      SIRIUS_LOG_INFO("[mgpu-probe] prepare_for_processing returning nullopt null_batch=true");
-      return std::nullopt;
+  if (!_data_batches) {
+    if (!_read_only_data_batches) {
+      throw std::runtime_error("pipelineable_operator_data:get_data_batches no data batches");
     }
-    {
-      // Short-scoped exclusive accessor: conversion happens here, lock is
-      // released at end of `{}` block before the next iteration. Path A
-      // discipline — never hold the accessor across a downstream call that
-      // re-acquires on the same batch.
-      std::optional<::cucascade::mutable_data_batch> acc;
-      try {
-        acc = pipeline::prepare_and_acquire_mutable(batch, requested_memory_space, stream);
-      } catch (const rmm::out_of_memory&) {
-        SIRIUS_LOG_ERROR(
-          "pipelineable_operator_data: OOM at batch {} preparing for processing, state: {}",
-          batch->get_batch_id(),
-          static_cast<int>(batch->get_state()));
-        throw;
-      } catch (const std::exception& e) {
-        SIRIUS_LOG_ERROR(
-          "pipelineable_operator_data: Unknown error at batch {} preparing for processing, "
-          "state: {}: {}",
-          batch->get_batch_id(),
-          static_cast<int>(batch->get_state()),
-          e.what());
-        throw;
+    std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
+    batches.reserve(_read_only_data_batches->size());
+    for (const auto& ro : *_read_only_data_batches) {
+      auto copy = ro;
+      batches.push_back(::cucascade::data_batch::to_idle(std::move(copy)));
+    }
+    _data_batches = std::move(batches);
+  }
+  return *_data_batches;
+}
+
+std::vector<::cucascade::read_only_data_batch> pipelineable_operator_data::get_read_only_batches(
+  bool leave_locked) const
+{
+  if (!_read_only_data_batches) {
+    if (!_data_batches) {
+      throw std::runtime_error("pipelineable_operator_data:get_read_only_batches no data batches");
+    }
+    std::vector<::cucascade::read_only_data_batch> ro_batches;
+    ro_batches.reserve(_data_batches->size());
+    for (const auto& batch : *_data_batches) {
+      if (batch) {
+        ro_batches.push_back(batch->to_read_only());
+      } else {
+        SIRIUS_LOG_WARN("pipelineable_operator_data: null batch encountered, skipping");
       }
-      if (!acc) {
-        // Phase 9 FIX-B observability: breadcrumb confirms nullopt propagates
-        // out cleanly, so the caller can handle it via the optional.
-        SIRIUS_LOG_INFO(
-          "[mgpu-probe] prepare_for_processing returning nullopt batch_id={} batch_state={}",
-          batch->get_batch_id(),
-          static_cast<int>(batch->get_state()));
-        return std::nullopt;
-      }
-      // RAII drop of `acc` here — exclusive lock on this batch is released
-      // before we move on to the next batch. The conversion side effect
-      // (memory-space migration if requested) persists in the underlying
-      // data_batch. This is the only state we need from the helper.
+    }
+    if (leave_locked) {
+      _read_only_data_batches = std::move(ro_batches);
+    } else {
+      return std::move(ro_batches);
     }
   }
+  return *_read_only_data_batches;
+}
 
-  // Path A: return EMPTY vector. No accessors are held across op->execute().
-  // Operators take their own per-call accessors via to_read_only / to_mutable.
-  return std::vector<::cucascade::mutable_data_batch>{};
+void pipelineable_operator_data::prepare_for_processing(
+  const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
+{
+  remove_read_only_lock();
+  auto data_batches = get_data_batches();
+  std::vector<::cucascade::read_only_data_batch> ro_batches;
+  ro_batches.reserve(data_batches.size());
+
+  for (const auto& batch : data_batches) {
+    if (!batch) {
+      throw sirius::internal_exception(
+        "pipelineable_operator_data: null batch encountered during prepare_for_processing");
+    }
+    std::optional<::cucascade::read_only_data_batch> ro_batch;
+    try {
+      ro_batch = pipeline::lock_or_prepare_batch(batch, requested_memory_space, stream);
+    } catch (const rmm::out_of_memory&) {
+      SIRIUS_LOG_ERROR(
+        "pipelineable_operator_data: OOM at batch {} preparing for processing, state: {}",
+        batch->get_batch_id(),
+        static_cast<int>(batch->get_state()));
+      throw;
+    } catch (const std::exception& e) {
+      SIRIUS_LOG_ERROR(
+        "pipelineable_operator_data: Unknown error at batch {} preparing for processing, "
+        "state: {}: {}",
+        batch->get_batch_id(),
+        static_cast<int>(batch->get_state()),
+        e.what());
+      throw;
+    }
+    if (!ro_batch) {
+      throw sirius::internal_exception(
+        "pipelineable_operator_data: failed to lock batch {} for processing, state: {}",
+        batch->get_batch_id(),
+        static_cast<int>(batch->get_state()));
+    }
+    ro_batches.emplace_back(std::move(*ro_batch));
+  }
+
+  _read_only_data_batches = std::move(ro_batches);
 }
 
 std::string sirius_physical_operator::get_name() const
@@ -240,6 +262,7 @@ void sirius_physical_operator::push_data_batch(std::string_view port_id,
 
 void sirius_physical_operator::add_next_port_after_sink(next_port_info port_info)
 {
+  port_info.pseudo_sink_port_uuid = uuid::now_v7();
   next_port_after_sink.push_back(port_info);
 }
 
@@ -297,12 +320,10 @@ std::unique_ptr<operator_data> sirius_physical_operator::get_next_task_input_dat
   std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
   for (auto& [port_name, port_ptr] : ports) {
     if (!port_ptr->repo) { continue; }  // dependency-only port; nothing to pop
-    // For Pipeline barrier: need at least one data batch in the port's repository.
-    // Post-#117: pop_next_data_batch returns the front batch of partition 0 (or
-    // nullptr if empty); the pre-#117 batch_state filter is gone — consumers
-    // acquire RAII accessors as needed when they process the batch.
-    auto popped_batch = port_ptr->repo->pop_next_data_batch(0);
-    if (popped_batch) { input_batch.push_back(std::move(popped_batch)); }
+    // For Pipeline barrier: need at least one data batch in the port's repository
+    // TODO: later on we will adjust to the new data repository interface in cuCascade
+    auto batch_and_handle = port_ptr->repo->pop_next_data_batch();
+    if (batch_and_handle) { input_batch.push_back(std::move(batch_and_handle)); }
   }
   if (input_batch.empty()) { return nullptr; }
   return std::make_unique<pipelineable_operator_data>(input_batch);

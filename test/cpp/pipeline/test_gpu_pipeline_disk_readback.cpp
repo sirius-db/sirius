@@ -127,23 +127,16 @@ TEST_CASE("DISK->GPU round-trip conversion via converter registry", "[gpu_pipeli
   rmm::cuda_stream stream;
 
   auto batch = make_gpu_batch(*gpu_space);
-  {
-    auto __ro_1 = batch->to_read_only();
-    REQUIRE(__ro_1.get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
-  }
+  REQUIRE(batch->to_read_only().get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
 
   // --- GPU -> DISK ---
-  // Phase 18 / DB-03 Recipe R8 + R3: scoped mutable accessor.
   {
     auto mut = batch->to_mutable();
     REQUIRE_NOTHROW(
       mut.convert_to<cucascade::disk_data_representation>(registry, disk_space, stream));
   }
 
-  {
-    auto __ro_2 = batch->to_read_only();
-    REQUIRE(__ro_2.get_memory_space()->get_tier() == cucascade::memory::Tier::DISK);
-  }
+  REQUIRE(batch->to_read_only().get_memory_space()->get_tier() == cucascade::memory::Tier::DISK);
 
   // --- DISK -> GPU ---
   // This mirrors exactly what lock_or_prepare_batch Tier::GPU arm does when the batch is
@@ -154,10 +147,7 @@ TEST_CASE("DISK->GPU round-trip conversion via converter registry", "[gpu_pipeli
       mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream));
   }
 
-  {
-    auto __ro_3 = batch->to_read_only();
-    REQUIRE(__ro_3.get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
-  }
+  REQUIRE(batch->to_read_only().get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
 }
 
 TEST_CASE("DISK->GPU conversion preserves data correctness", "[gpu_pipeline_disk]")
@@ -176,69 +166,56 @@ TEST_CASE("DISK->GPU conversion preserves data correctness", "[gpu_pipeline_disk
 
   const size_t num_rows = 500;
   auto batch            = make_gpu_batch(*gpu_space, num_rows);
-  {
-    auto __ro_4 = batch->to_read_only();
-    REQUIRE(__ro_4.get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
-  }
+  REQUIRE(batch->to_read_only().get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
 
-  // Snapshot column values before round-trip.
-  // Phase 18 / DB-03 Recipe R1: scoped read-only accessor for the table_view
-  // and the size probe.
-  std::vector<int32_t> values_before;
-  size_t size_before = 0;
-  {
-    auto ro           = batch->to_read_only();
-    auto table_before = sirius::get_cudf_table_view(ro);
-    values_before.resize(static_cast<size_t>(table_before.num_rows()));
-    cudaMemcpy(values_before.data(),
-               table_before.column(0).data<int32_t>(),
-               sizeof(int32_t) * values_before.size(),
-               cudaMemcpyDeviceToHost);
-    size_before = ro.get_data()->get_size_in_bytes();
-  }
+  // Snapshot column values before round-trip
+  auto table_before = sirius::get_cudf_table_view(*batch);
+  std::vector<int32_t> values_before(static_cast<size_t>(table_before.num_rows()));
+  cudaMemcpy(values_before.data(),
+             table_before.column(0).data<int32_t>(),
+             sizeof(int32_t) * values_before.size(),
+             cudaMemcpyDeviceToHost);
+
+  const size_t size_before = [&batch]() {
+    auto ro = batch->to_read_only();
+    return ro.get_data()->get_size_in_bytes();
+  }();
   REQUIRE(size_before > 0);
 
-  // GPU -> DISK (Recipe R8 + R3)
+  // GPU -> DISK
   {
     auto mut = batch->to_mutable();
     REQUIRE_NOTHROW(
       mut.convert_to<cucascade::disk_data_representation>(registry, disk_space, stream));
   }
-  {
-    auto __ro_5 = batch->to_read_only();
-    REQUIRE(__ro_5.get_memory_space()->get_tier() == cucascade::memory::Tier::DISK);
-  }
+  REQUIRE(batch->to_read_only().get_memory_space()->get_tier() == cucascade::memory::Tier::DISK);
 
-  // DISK -> GPU (Recipe R8 + R3)
+  // DISK -> GPU
   {
     auto mut = batch->to_mutable();
     REQUIRE_NOTHROW(
       mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream));
   }
-  {
-    auto __ro_6 = batch->to_read_only();
-    REQUIRE(__ro_6.get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
-  }
+  REQUIRE(batch->to_read_only().get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
 
-  // Verify schema, shape, and per-cell values via a single scoped accessor.
-  std::vector<int32_t> values_after;
-  size_t size_after = 0;
-  {
-    auto ro          = batch->to_read_only();
-    auto table_after = sirius::get_cudf_table_view(ro);
-    REQUIRE(table_after.num_columns() == 1);
-    REQUIRE(table_after.column(0).type() == cudf::data_type{cudf::type_id::INT32});
-    REQUIRE(static_cast<size_t>(table_after.num_rows()) == num_rows);
+  // Verify schema and shape
+  auto table_after = sirius::get_cudf_table_view(*batch);
+  REQUIRE(table_after.num_columns() == 1);
+  REQUIRE(table_after.column(0).type() == cudf::data_type{cudf::type_id::INT32});
+  REQUIRE(static_cast<size_t>(table_after.num_rows()) == num_rows);
 
-    values_after.resize(static_cast<size_t>(table_after.num_rows()));
-    cudaMemcpy(values_after.data(),
-               table_after.column(0).data<int32_t>(),
-               sizeof(int32_t) * values_after.size(),
-               cudaMemcpyDeviceToHost);
-    size_after = ro.get_data()->get_size_in_bytes();
-  }
+  // Verify actual cell values match
+  std::vector<int32_t> values_after(static_cast<size_t>(table_after.num_rows()));
+  cudaMemcpy(values_after.data(),
+             table_after.column(0).data<int32_t>(),
+             sizeof(int32_t) * values_after.size(),
+             cudaMemcpyDeviceToHost);
   REQUIRE(values_before == values_after);
 
   // Size should be unchanged (same data, same GPU format)
+  const size_t size_after = [&batch]() {
+    auto ro = batch->to_read_only();
+    return ro.get_data()->get_size_in_bytes();
+  }();
   REQUIRE(size_after == size_before);
 }

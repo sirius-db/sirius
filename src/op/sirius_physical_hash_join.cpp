@@ -465,17 +465,12 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     // When the hash table is not build yet, we will send both the build and probe side. To build
     // the hash table and perform the first join.
     std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
-    auto probe_batch = probe_port->repo->pop_next_data_batch(/* partition_idx */ 0);
-    auto build_batch = build_port->repo->pop_next_data_batch(/* partition_idx */ 0);
+    auto probe_batch = probe_port->repo->pop_next_data_batch();
+    auto build_batch = build_port->repo->pop_next_data_batch();
     input_batch.push_back(std::move(probe_batch));
     input_batch.push_back(std::move(build_batch));
     _hash_table_build_state = BUILD_HASH_TABLE_STATE::SCHEDULED;
-    // BUILD_PROBE mode uses a single cuco hash table shared across every probe
-    // task for this join. All such tasks must land on the same GPU, so we tag
-    // them with operator_id as the partition index (hash joins get spread
-    // across GPUs at the query level, but each individual join stays pinned).
-    return std::make_unique<partitioned_operator_data>(std::move(input_batch),
-                                                       this->get_operator_id());
+    return std::make_unique<pipelineable_operator_data>(input_batch);
 
   } else if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::BUILT) {
     if (probe_port->repo->num_partitions() != 1) {
@@ -487,7 +482,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     // If the hash table has already been build, we only send the probe side. The hash table should
     // already be built and we can perform the join with the probe side batches.
     std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
-    auto batch = probe_port->repo->pop_next_data_batch(/* partition_idx */ 0);
+    auto batch = probe_port->repo->pop_next_data_batch();
     if (batch) {
       input_batch.push_back(std::move(batch));
     } else {
@@ -496,11 +491,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
         "batch from the default port but got none in operator " +
         std::to_string(this->get_operator_id()));
     }
-    // Subsequent probe-only tasks share the hash table that was built under
-    // the initial SCHEDULING task above. They MUST run on the same GPU, so
-    // tag with the same operator_id partition key used there.
-    return std::make_unique<partitioned_operator_data>(std::move(input_batch),
-                                                       this->get_operator_id());
+    return std::make_unique<pipelineable_operator_data>(input_batch);
   } else {
     SIRIUS_LOG_WARN(fmt::format(
       "In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: invalid hash table "
@@ -569,12 +560,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
             input_batch.push_back(
               ports["build"]->repo->get_data_batch_by_id(right_batch_id, partition_idx));
           }
-          // Tag with partition_idx so task_creator's SCHED-00 pins the whole
-          // task to partition_idx % num_gpus — cuco hash tables inside the
-          // join must live on one device, and without the tag task dispatch
-          // falls back to data locality, which can route the probe side to a
-          // different GPU than the build side for the same partition.
-          return std::make_unique<partitioned_operator_data>(input_batch, partition_idx);
+          return std::make_unique<pipelineable_operator_data>(input_batch);
         }
         right_counter++;
         counter++;
@@ -607,10 +593,8 @@ struct join_side_keys_result {
 /// via cudf::cast before being included in the key table.
 /// @param is_left_side  If true, uses cast_left/left_target_type from key_casts; otherwise uses
 ///                      cast_right/right_target_type.
-/// Caller passes a read-only RAII accessor so the cudf::table_view returned in result.keys
-/// remains valid for the duration of the caller's scope.
 static join_side_keys_result prepare_join_keys(
-  const ::cucascade::read_only_data_batch& input_ro,
+  const ::cucascade::read_only_data_batch& input_batch,
   const std::vector<cudf::size_type>& key_col_indices,
   bool cast_necessary,
   const std::vector<sirius_physical_hash_join::key_cast_info>& key_casts,
@@ -619,22 +603,10 @@ static join_side_keys_result prepare_join_keys(
 {
   join_side_keys_result result;
 
-  cudf::table_view table = get_cudf_table_view(input_ro);
+  cudf::table_view table = get_cudf_table_view(input_batch);
 
   if (!cast_necessary) {
-    // INVARIANT: key_col_indices indexes into `table`'s columns; valid range is
-    //            [0, table.num_columns()). Phase 12: an upstream planner path
-    //            (SORT-as-HASH_JOIN partitioner) can emit a stale index equal
-    //            to the column count when the partitioned input batch carries
-    //            fewer columns than the join-condition refs. Filter to the
-    //            valid range so the synthetic partitioner does not throw
-    //            std::out_of_range from cudf::table_view::select.
-    std::vector<cudf::size_type> valid_indices;
-    valid_indices.reserve(key_col_indices.size());
-    for (auto idx : key_col_indices) {
-      if (idx < table.num_columns()) { valid_indices.push_back(idx); }
-    }
-    result.keys = table.select(valid_indices);
+    result.keys = table.select(key_col_indices);
     return result;
   }
 
@@ -778,14 +750,14 @@ static std::unique_ptr<operator_data> gather_distinct_left_join_output(
 /// @param left_full     Full left-side table view (all columns, all rows) before output projection.
 /// @param lhs_output_col_idxs  Column indices within @p left_full to include in the output.
 ///                             Drives the projection of the left side.
-/// @param left_memory_space  Memory space of the original left-side batch; propagated to the
-///                           returned operator_data.
+/// @param left_batch    The original left-side data batch; used to propagate memory space metadata
+///                      to the returned operator_data.
 /// @param stream        CUDA stream on which all device operations are launched.
 static std::unique_ptr<operator_data> resolve_mark_join_result(
   rmm::device_uvector<cudf::size_type> const& semi_indices,
   cudf::table_view const& left_full,
   std::vector<cudf::size_type> const& lhs_output_col_idxs,
-  cucascade::memory::memory_space& left_memory_space,
+  ::cucascade::read_only_data_batch const& left_batch,
   rmm::cuda_stream_view stream)
 {
   cudf::table_view left_cols_to_output = left_full.select(lhs_output_col_idxs);
@@ -825,7 +797,7 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
   auto output_cudf_table = std::make_unique<cudf::table>(std::move(mark_out_cols), stream);
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<::cucascade::data_batch>>{
-      make_data_batch(std::move(output_cudf_table), left_memory_space, stream)});
+      make_data_batch(std::move(output_cudf_table), *left_batch.get_memory_space(), stream)});
 }
 
 std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator_data& input_data,
@@ -833,7 +805,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_hash_join::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_data_batches();
+  const auto& input_batches = input.get_read_only_batches();
 
   if (is_all_inequality_join) {
     throw std::runtime_error(
@@ -843,9 +815,6 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
 
   cudf::table_view left_full, right_full;
   std::unique_ptr<rmm::device_uvector<cudf::size_type>> left_indices, right_indices;
-  // Captured per-mode for the trailing gather_join_output call. Filled inside
-  // each mode block so it survives the scope-narrowed read-only accessors.
-  cucascade::memory::memory_space* gather_space = nullptr;
 
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
     if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::SCHEDULED) {
@@ -856,11 +825,8 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
           std::to_string(input_batches.size()) + " batches in operator " +
           std::to_string(this->get_operator_id()));
       }
-      auto build_batch = input_batches[1];
-      // R1 — read-only accessor on build batch is held for the whole hash-table-build
-      // section; build_keys cudf::table_view depends on its underlying data.
-      auto build_ro               = build_batch->to_read_only();
-      auto build_keys_result      = prepare_join_keys(build_ro,
+      auto const& build_batch_ro  = input_batches[1];
+      auto build_keys_result      = prepare_join_keys(build_batch_ro,
                                                  right_key_col_indices,
                                                  cast_necessary,
                                                  key_casts,
@@ -870,7 +836,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       {
         std::lock_guard<std::mutex> lg(op_state_mutex);
         _built_table_cast_columns = std::move(build_keys_result.owned_cast_columns);
-        _build_table              = std::move(build_batch);
+        _build_table              = build_batch_ro;
         if (unique_build_keys &&
             (join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::LEFT)) {
           _distinct_hash_table = std::make_unique<cudf::distinct_hash_join>(
@@ -886,17 +852,11 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                // batches to proceed.
         _hash_table_build_state = BUILD_HASH_TABLE_STATE::BUILT;
       }
-      // build_ro destroyed here — shared lock released after the hash table has been
-      // synchronized to `stream`.
     }
     if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::BUILT) {
       // Hash table is built, we can process probe batches. The probe-side keys will be processed in
       // the same way as the mixed join path, but with an equality-only predicate.
-      // R1 — read-only accessor on probe batch + build table; both held for the
-      // duration of the join (cudf::*_join writes index vectors against these views).
-      auto probe_ro               = input_batches[0]->to_read_only();
-      gather_space                = probe_ro.get_memory_space();
-      auto probe_keys_result      = prepare_join_keys(probe_ro,
+      auto probe_keys_result      = prepare_join_keys(input_batches[0],
                                                  left_key_col_indices,
                                                  cast_necessary,
                                                  key_casts,
@@ -904,12 +864,11 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                                  stream);
       cudf::table_view probe_keys = probe_keys_result.keys;
 
-      left_full = get_cudf_table_view(probe_ro);
-      // build_table_ro is bound to a member-held shared_ptr<data_batch> — separate
-      // batch from input_batches, no overlap with held mutable accessors.
-      auto build_table_ro = _build_table->to_read_only();
-      right_full =
-        build_table_ro.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+      left_full  = get_cudf_table_view(input_batches[0]);
+      right_full = _build_table.value()
+                     .get_data()
+                     ->cast<cucascade::gpu_table_representation>()
+                     .get_table_view();
 
       if (_distinct_hash_table) {
         // Distinct hash join path (unique build keys, INNER or LEFT only).
@@ -925,7 +884,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                                   lhs_output_columns.col_idxs,
                                                   rhs_output_columns.col_idxs,
                                                   std::move(build_indices),
-                                                  *probe_ro.get_memory_space(),
+                                                  *input_batches[0].get_memory_space(),
                                                   stream);
         }
       } else {
@@ -946,11 +905,6 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                    duckdb::JoinTypeToString(join_type));
         }
       }
-      // probe_ro and build_table_ro live until end of this `if (_join_mode == BUILD_PROBE)`
-      // block — encloses the entire join. They drop before fall-through to gather_join_output
-      // below, but the gather is fed only result vectors + table_views referenced via
-      // left_full/right_full which are valid only while these accessors are alive.
-      // Therefore the gather_join_output call MUST happen here, before the accessors die.
 
     } else {
       throw std::runtime_error(fmt::format(
@@ -965,23 +919,17 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       throw std::runtime_error("Expected 2 input batches for hash join, got " +
                                std::to_string(input_batches.size()) + " input batches");
     }
-    // R1 — read-only accessors held for the entire mixed-join body so the
-    // table_views and key views remain valid through every cudf::mixed_*_join
-    // call and the eventual gather_join_output / resolve_mark_join_result.
-    auto left_ro_mixed  = input_batches[0]->to_read_only();
-    auto right_ro_mixed = input_batches[1]->to_read_only();
-    gather_space        = left_ro_mixed.get_memory_space();
-    left_full           = get_cudf_table_view(left_ro_mixed);
-    right_full          = get_cudf_table_view(right_ro_mixed);
+    left_full  = get_cudf_table_view(input_batches[0]);
+    right_full = get_cudf_table_view(input_batches[1]);
     // Mixed join: equality conditions drive the hash table; inequality conditions are evaluated
     // via a cuDF AST binary predicate on the full input tables.
-    auto left_keys_result     = prepare_join_keys(left_ro_mixed,
+    auto left_keys_result     = prepare_join_keys(input_batches[0],
                                               left_key_col_indices,
                                               cast_necessary,
                                               key_casts,
                                               /*is_left_side=*/true,
                                               stream);
-    auto right_keys_result    = prepare_join_keys(right_ro_mixed,
+    auto right_keys_result    = prepare_join_keys(input_batches[1],
                                                right_key_col_indices,
                                                cast_necessary,
                                                key_casts,
@@ -1007,11 +955,8 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                                      pred->back(),
                                                      cudf::null_equality::UNEQUAL,
                                                      stream);
-      return resolve_mark_join_result(*semi_indices,
-                                      left_full,
-                                      lhs_output_columns.col_idxs,
-                                      *left_ro_mixed.get_memory_space(),
-                                      stream);
+      return resolve_mark_join_result(
+        *semi_indices, left_full, lhs_output_columns.col_idxs, input_batches[0], stream);
     } else if (join_type == duckdb::JoinType::INNER) {
       auto result   = cudf::mixed_inner_join(left_eq,
                                            right_eq,
@@ -1120,21 +1065,15 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       throw std::runtime_error("Expected 2 input batches for hash join, got " +
                                std::to_string(input_batches.size()) + " input batches");
     }
-    // R1 — read-only accessors held for the entire body. The
-    // table_views (left_full/right_full) and the key view results all alias
-    // memory inside the underlying gpu_table_representations.
-    auto left_ro_std            = input_batches[0]->to_read_only();
-    auto right_ro_std           = input_batches[1]->to_read_only();
-    gather_space                = left_ro_std.get_memory_space();
-    left_full                   = get_cudf_table_view(left_ro_std);
-    right_full                  = get_cudf_table_view(right_ro_std);
-    auto left_keys_result       = prepare_join_keys(left_ro_std,
+    left_full                   = get_cudf_table_view(input_batches[0]);
+    right_full                  = get_cudf_table_view(input_batches[1]);
+    auto left_keys_result       = prepare_join_keys(input_batches[0],
                                               left_key_col_indices,
                                               cast_necessary,
                                               key_casts,
                                               /*is_left_side=*/true,
                                               stream);
-    auto right_keys_result      = prepare_join_keys(right_ro_std,
+    auto right_keys_result      = prepare_join_keys(input_batches[1],
                                                right_key_col_indices,
                                                cast_necessary,
                                                key_casts,
@@ -1161,7 +1100,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                                 lhs_output_columns.col_idxs,
                                                 rhs_output_columns.col_idxs,
                                                 std::move(build_indices),
-                                                *left_ro_std.get_memory_space(),
+                                                *input_batches[0].get_memory_space(),
                                                 stream);
       }
     } else if (join_type == duckdb::JoinType::INNER) {
@@ -1201,11 +1140,8 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       auto filtered_join_object = cudf::filtered_join(
         right_keys, cudf::null_equality::UNEQUAL, cudf::set_as_build_table::RIGHT, stream);
       auto semi_indices = filtered_join_object.semi_join(left_keys, stream);
-      return resolve_mark_join_result(*semi_indices,
-                                      left_full,
-                                      lhs_output_columns.col_idxs,
-                                      *left_ro_std.get_memory_space(),
-                                      stream);
+      return resolve_mark_join_result(
+        *semi_indices, left_full, lhs_output_columns.col_idxs, input_batches[0], stream);
     } else if (join_type == duckdb::JoinType::OUTER) {
       auto join_result =
         cudf::full_join(left_keys, right_keys, cudf::null_equality::UNEQUAL, stream);
@@ -1216,9 +1152,6 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
     }
   }
 
-  if (!gather_space) {
-    throw std::runtime_error("sirius_physical_hash_join::execute: gather_space unset");
-  }
   return gather_join_output(join_type,
                             left_full,
                             right_full,
@@ -1226,7 +1159,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                             rhs_output_columns.col_idxs,
                             std::move(left_indices),
                             std::move(right_indices),
-                            *gather_space,
+                            *input_batches[0].get_memory_space(),
                             stream);
 }
 
@@ -1236,7 +1169,7 @@ void sirius_physical_hash_join::finalize_operator()
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
     _hash_table.reset();
     _distinct_hash_table.reset();
-    _build_table.reset();
+    _build_table = std::nullopt;
     _built_table_cast_columns.clear();
     _hash_table_build_state = BUILD_HASH_TABLE_STATE::DESTROYED;
   }

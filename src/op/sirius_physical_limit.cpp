@@ -70,7 +70,7 @@ std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_streaming_limit::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_data_batches();
+  const auto& input_batches = input.get_read_only_batches();
 
   if (limit_val.Type() != duckdb::LimitNodeType::CONSTANT_VALUE) {
     throw not_implemented_exception("Streaming limit with non-constant limit value");
@@ -84,16 +84,10 @@ std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(
   output_batches.reserve(input_batches.size());
 
   for (auto const& batch : input_batches) {
-    if (!batch) { continue; }
-
     // Check if limit is already exhausted
     if (_remaining_limit.load(std::memory_order_acquire) <= 0) { break; }
 
-    // Phase 18 / DB-02 Recipe R1: scoped read-only accessor for the read +
-    // memory-space probe + slice construction. Destroyed at end-of-iteration
-    // -> shared lock released.
-    auto ro       = batch->to_read_only();
-    auto view     = ro.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+    auto view     = batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
     auto num_rows = static_cast<int64_t>(view.num_rows());
 
     if (num_rows == 0) { continue; }
@@ -114,13 +108,10 @@ std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(
 
     // cudf::slice returns a vector of table_views; materialize into a table
     auto sliced_table = std::make_unique<cudf::table>(
-      slices.front(), stream, ro.get_memory_space()->get_default_allocator());
-    // STREAM-LINEAGE: cudf::table copy-ctor writes on `stream`; the constructor
-    // records the writer event for downstream cross-device readers (Phase 13-02
-    // / 13-04 Path-2).
-    auto sliced_repr = std::make_unique<cucascade::gpu_table_representation>(
-      std::move(sliced_table), *ro.get_memory_space(), stream);
-    std::unique_ptr<cucascade::idata_representation> output_data = std::move(sliced_repr);
+      slices.front(), stream, batch.get_memory_space()->get_default_allocator());
+    std::unique_ptr<cucascade::idata_representation> output_data =
+      std::make_unique<cucascade::gpu_table_representation>(
+        std::move(sliced_table), *batch.get_memory_space(), stream);
 
     auto const batch_id = ::sirius::get_next_batch_id();
     auto output_batch   = std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data));

@@ -22,7 +22,7 @@ namespace sirius {
 namespace op {
 
 std::shared_ptr<cucascade::data_batch> gpu_order_impl::local_order_by(
-  std::shared_ptr<cucascade::data_batch> input,
+  const cucascade::read_only_data_batch& input,
   const std::vector<int>& order_key_idx,
   std::vector<cudf::order> const& column_order,
   std::vector<cudf::null_order> const& null_precedence,
@@ -38,13 +38,7 @@ std::shared_ptr<cucascade::data_batch> gpu_order_impl::local_order_by(
   }
 
   // Get sorted order
-  // Phase 18 / DB-02 Recipe R1: scoped read-only accessor held for the
-  // function lifetime — input_table and the column_view objects derived
-  // from it are non-owning refs into the accessor's representation. The
-  // accessor must outlive every read of those views (cudf::sorted_order
-  // and cudf::gather both consume them).
-  auto ro          = input->to_read_only();
-  auto input_table = get_cudf_table_view(ro);
+  auto input_table = get_cudf_table_view(input);
   std::vector<cudf::column_view> sort_cols;
   for (int idx : order_key_idx) {
     sort_cols.push_back(input_table.column(idx));
