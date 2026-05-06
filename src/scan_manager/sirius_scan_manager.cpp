@@ -186,8 +186,8 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
   }
   // Phase 20.6 IO-MGPU-02: forward gpu_ioctxs to parquet_split_provider so
   // run_batch() can construct sirius_datasources via ioctx->make_datasource(io_object)
-  // instead of cudf::io::datasource::create (the latter routes through kvikio
-  // and bypasses Phase 19's io_uring + per-GPU CUDA-context binding).
+  // instead of cudf's bundled file_source factory (the latter routes through
+  // kvikio and bypasses Phase 19's io_uring + per-GPU CUDA-context binding).
   auto provider = std::make_unique<parquet_split_provider>(
     info->returned_types,
     info->file_paths,

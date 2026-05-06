@@ -228,11 +228,37 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
     }
   }
 
+  // Phase 20.6 IO-MGPU-02: route footer + column-chunk reads through
+  // sirius_datasource (io_uring + per-GPU CUDA-context binding) instead of
+  // the cudf-bundled file_source factory (which routes through libkvikio and
+  // bypasses the IO framework established in Phase 19). Pick a planning ioctx
+  // deterministically — footer reads are small (<1 MiB) and per-GPU residency
+  // for column data is determined later by the scan operator's task affinity,
+  // not by which ioctx the datasource was originally constructed from.
+  // Mirrors parquet_scan_task_global_state::initialize_from_files() (Phase 19).
+  auto const planning_ioctx_it = _gpu_ioctxs.begin();
+  if (planning_ioctx_it == _gpu_ioctxs.end()) {
+    throw std::runtime_error(
+      "[parquet_split_provider] No GPU sirius_ioctxs configured — "
+      "SiriusContext::initialize() must populate at least one and "
+      "sirius_scan_manager::prepare_for_query() must forward the map "
+      "(IO-MGPU-02).");
+  }
+
   // Loop over files to read footers, parse metadata, and compute row-group partitions.
   std::size_t file_idx = 0;
   for (auto const& file_path : batch.file_paths) {
     //===----------Read metadata footers----------===//
-    auto datasource = cudf::io::datasource::create(file_path);
+    // Construct a uring_io_object for the file (opens 2 fds: O_RDONLY +
+    // O_RDONLY|O_DIRECT) and wrap it in a sirius_datasource via the planning
+    // ioctx's make_datasource factory. Both objects flow into parquet_scan_data
+    // via datasource_shared (line ~285); the io_object's lifetime is tied to
+    // the datasource (the uring backend stores the shared_ptr in its
+    // datasource subclass), so the io_object survives every column-chunk read
+    // performed by sirius_gpu_parquet_scan_operator::read_table_from_metadata.
+    auto io_object = std::make_shared<sirius::io::uring_io_object>(file_path);
+    auto datasource =
+      planning_ioctx_it->second->make_datasource(io_object);
 
     std::unique_ptr<cudf::io::datasource::buffer> footer_buffer;
     footer_buffer = cudf::io::parquet::fetch_footer_to_host(*datasource);
