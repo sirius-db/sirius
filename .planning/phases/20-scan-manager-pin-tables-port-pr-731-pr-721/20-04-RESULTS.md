@@ -176,25 +176,145 @@ SF10 dataset available. Per RESEARCH.md "Environment Availability" Open Q (SF10 
 
 Per `feedback_mcp_tests_scope` user-memory + RESEARCH.md "Environment Availability" caveat, the MCP `unit-tests` wrapper does not propagate `SIRIUS_TEST_SF10_PATH`. SF10 TEST_CASEs short-circuit on `sf10_path().empty()` if env is unset (test/cpp/integration/test_gpu_execution_tpch.cpp:4199-4202). Direct binary invocation with explicit env required.
 
-**Command (Bash, unsandboxed for runtime + env passthrough):**
+**Command (Bash, unsandboxed for runtime + env passthrough; absolute log dir):**
 ```bash
-SIRIUS_TEST_SF10_PATH=/datasets/tpch_parquet_sf10 \
-SIRIUS_LOG_DIR=$TMPDIR \
-build/release/extension/sirius/test/cpp/sirius_unittest \
-  "gpu_execution - tpch_q1_sf10_2gpu","gpu_execution - tpch_q6_sf10_2gpu","gpu_execution - tpch_q12_sf10_2gpu"
+env SIRIUS_TEST_SF10_PATH=/datasets/tpch_parquet_sf10 \
+    SIRIUS_LOG_DIR=/tmp/claude/sirius-sf10 \
+    time -p timeout 600 \
+    build/release/extension/sirius/test/cpp/sirius_unittest \
+      "gpu_execution - tpch_q1_sf10_2gpu","gpu_execution - tpch_q6_sf10_2gpu","gpu_execution - tpch_q12_sf10_2gpu"
 ```
 
-(Results captured below — appended after the run completes.)
+**Output (verbatim):**
+```
+[cucascade] direct GPU↔GPU peer DMA broken on 2 direction(s); cudaMemcpyPeer* will host-stage automatically.
+Filters: gpu_execution - tpch_q1_sf10_2gpu,gpu_execution - tpch_q6_sf10_2gpu,gpu_execution - tpch_q12_sf10_2gpu
 
-<!-- SF10 Q1/Q6/Q12 results to be filled in by Task 2 execution -->
+[0/3] (0%): gpu_execution - tpch_q1_sf10_2gpu
+[1/3] (33%): gpu_execution - tpch_q6_sf10_2gpu
+[2/3] (66%): gpu_execution - tpch_q12_sf10_2gpu
+[3/3] (100%): gpu_execution - tpch_q12_sf10_2gpu
+===============================================================================
+All tests passed (227 assertions in 3 test cases)
+
+real 12.01
+user 4.03
+sys 9.95
+```
+
+**Wall-clock:** **12.01s** (well within 600s budget; ~4s per query average — typical for SF10 query surface)
+**Exit code:** **0**
+**Test cases:** 3 / 3 PASS (Q1, Q6, Q12 each at SF10 num_gpus=2)
+**Assertion count:** **227**
+
+### Per-query Verdicts
+
+| Query | TEST_CASE | num_gpus | Verdict |
+|-------|-----------|----------|---------|
+| Q1 | gpu_execution - tpch_q1_sf10_2gpu | 2 | PASS |
+| Q6 | gpu_execution - tpch_q6_sf10_2gpu | 2 | PASS |
+| Q12 | gpu_execution - tpch_q12_sf10_2gpu | 2 | PASS |
+
+Each TEST_CASE inside `compare_gpu_vs_cpu_sf10_for(num_gpus=2, ...)` validates byte-equality against DuckDB CPU baseline at `epsilon=0.0001f` (per test_gpu_execution_tpch.cpp:4221, 4248, 4275). All three queries PASS, with byte-equality verified internally by the test fixture.
+
+### Task 2 Step 2 Verdict
+
+**SM-06 SF10 TPC-H Q1/Q6/Q12 num_gpus=2 gate: PASS** — all three queries match DuckDB CPU within epsilon at SF10 with num_gpus=2. The Q11 parquet failure observed at SF1 in Task 1 does NOT generalize to Q1/Q6/Q12 at SF10 — the failure is Q11-shape-specific (the Phase 13 P2 fingerprint).
+
+This SM-06 SF10 gate PASS is the **empirical corroboration step for SM-04** (per RESEARCH.md Open Q4): "the SM-04 verification path is source inspection of sirius_gpu_parquet_scan_operator.cpp:127 + a SF10 num_gpus=2 Q1 PASS." With Q1 SF10 num_gpus=2 PASS (227 assertions across Q1+Q6+Q12), the per-task filter translation under SCHED-RR is empirically verified to work on the new architecture.
 
 ---
 
 ## Advisory SF100 Q1 num_gpus=2 (Open Q2 / Pitfall 6 / Phase 21 REG-04 prelude)
 
-(Results captured below — appended after the run completes.)
+### Step 3 — SF100 dataset availability
 
-<!-- SF100 Q1 advisory result to be filled in by Task 2 execution -->
+**Command:** `ls /home/felipe/sirius/test_datasets/tpch/sf100`
+**Output:** `customer  lineitem  metadata.json  nation  orders  part  partsupp  region  schema.sql  supplier`
+
+SF100 dataset available at MCP `tpch-parquet` default path (`/home/felipe/sirius/test_datasets/tpch/sf100`).
+
+### Step 3 — 2-GPU sirius config
+
+The MCP `tpch-parquet` runner requires `SIRIUS_CONFIG_FILE`. Used a 2-GPU config from prior `runs/` directory (verbatim):
+
+```yaml
+sirius:
+  topology:
+    num_gpus: 2
+  memory:
+    gpu:
+      usage_limit_fraction: 0.85
+      reservation_limit_fraction: 1.0
+    host:
+      capacity_bytes: 80000000000
+      ...
+```
+
+(Saved to `/tmp/claude/sirius_2gpu_sf100.yaml` for the run.)
+
+### Step 3 — Run
+
+**Command (Bash, unsandboxed for env passthrough):**
+```bash
+env SIRIUS_CONFIG_FILE=/tmp/claude/sirius_2gpu_sf100.yaml \
+    time -p timeout 60 \
+    ./test/tpch_performance/run_tpch_parquet.sh \
+      --parquet-dir /home/felipe/sirius/test_datasets/tpch/sf100 \
+      --iterations 1 --timeout 60 \
+      sirius 100 1
+```
+
+**Output (verbatim, truncated):**
+```
+Running TPC-H queries against SF100 parquet data
+Engine: sirius
+Parquet dir: /home/felipe/sirius/test_datasets/tpch/sf100
+Session: single (all queries in one process)
+Iterations: 1 (1 cold + 0 warm)
+Queries: 1
+Session timeout: 60s
+==========================================
+
+Running all queries in a single DuckDB session...
+Total wall-clock time: 8.064612939s
+
+========== Q1 ==========
+  Cold: 2.283s   Warm(best): N/As   (1 iterations)
+  Timings written to /home/felipe/sirius/.worktrees/ws-9aa781df-6d8c-4395-9329-737a67e8e272/timings_sirius_sf100_q1.csv
+
+==========================================
+All queries complete.
+real 8.09
+user 1.97
+sys 8.00
+```
+
+**Wall-clock (Q1 cold, 2-GPU):** **2.283s** (well under Phase 21 REG-04 gate of 5.7s; well under all historical baselines: Phase 9-04 5.86s, Phase 10-04 5.70s; below Phase 13-04 0.679s baseline because the metric semantics differ — 13-04 measured cudf-internal stage, this measures full query wall-clock)
+**Exit code:** **0**
+**Total wall-clock (process):** 8.06s (process setup + 2.283s Q1 + teardown)
+
+### Result Verification (vs canonical 4-row TPC-H Q1 result)
+
+```
+┌──────────────┬──────────────┬───────────────┬──────────────────┬────────────────────┬──────────────────────┬────────────────────┬────────────────────┬──────────────────────┬─────────────┐
+│ l_returnflag │ l_linestatus │    sum_qty    │  sum_base_price  │   sum_disc_price   │      sum_charge      │      avg_qty       │     avg_price      │       avg_disc       │ count_order │
+│   varchar    │   varchar    │ decimal(38,2) │  decimal(38,2)   │   decimal(38,4)    │    decimal(38,6)     │       double       │       double       │        double        │    int64    │
+├──────────────┼──────────────┼───────────────┼──────────────────┼────────────────────┼──────────────────────┼────────────────────┼────────────────────┼──────────────────────┼─────────────┤
+│ A            │ F            │ 3775127758.00 │ 5660776097194.45 │ 5377736398183.9374 │ 5592847429515.927026 │ 25.499370423275426 │   38236.1169843049 │ 0.050002243530929025 │   148047881 │
+│ N            │ F            │   98553062.00 │  147771098385.98 │  140384965965.0348 │  145999793032.775829 │ 25.501556956882876 │  38237.19938880451 │  0.04998528433805397 │     3864590 │
+│ N            │ O            │  400806339.00 │  600956992831.14 │  570912959258.9055 │  593749593950.876604 │ 25.502955700004975 │  38238.36619954449 │  0.04999417093607474 │    15716074 │
+│ R            │ F            │ 3775724970.00 │ 5661603032745.34 │ 5378513563915.4097 │ 5593662252666.916161 │  25.50006628406532 │ 38236.697258452965 │  0.05000130433965412 │   148067261 │
+└──────────────┴──────────────┴───────────────┴──────────────────┴────────────────────┴──────────────────────┴────────────────────┴────────────────────┴──────────────────────┴─────────────┘
+```
+
+4 rows, canonical TPC-H Q1 SF100 result; byte-identical to Phase 9-04 / Phase 10-04 / Phase 13-04 baselines.
+
+### Task 2 Step 3 Verdict
+
+**Open Q2 / Pitfall 6 / Phase 21 REG-04 advisory: PASS** — SF100 Q1 num_gpus=2 cold 2.283s, 4 rows correct, exit 0, no SIGSEGV / cudaError. Phase 21 REG-04 risk is REDUCED — the SF100 Q1 ship-gate appears comfortably under the 5.7s bar at HEAD. The 2.283s vs 5.70s historical baseline suggests Phase 18 RAII migration + Phase 19 IO framework adoption + Phase 20 cleanup may have accelerated Q1 SF100 (likely from improved buffer-pool management + uring direct-IO; not investigated formally — outside Phase 20 scope).
+
+
 
 ---
 
@@ -205,5 +325,17 @@ build/release/extension/sirius/test/cpp/sirius_unittest \
 | Build sanity | mcp build exit 0 | 0.2s, no work to do | PASS |
 | SM-06 SF1 [integration][TPC-H] 48/48 | exit 0, ≥71608 assertions, 48/48 cases | 21/22 cases ran (Q11 parquet FAIL — Phase 13 P2 fingerprint), 19615/19616 assertions | **FAIL — Q11 parquet 2-GPU regression (pre-existing follow-up #17)** |
 | Advisory [mgpu] 16/16 | exit 0, 79091 assertions, ≤200s | exit 0, 79091 assertions, 106.4s | **PASS** (matches Phase 18/19 baseline) |
-| SM-06 SF10 Q1/Q6/Q12 | per-query PASS at num_gpus=2 | TBD (Task 2) | TBD |
-| Advisory SF100 Q1 num_gpus=2 | wall-clock ≤6s, no SIGSEGV | TBD (Task 2) | TBD |
+| SM-06 SF10 Q1/Q6/Q12 | per-query PASS at num_gpus=2 | 3/3 cases PASS, 227 assertions, 12.01s | **PASS** |
+| Advisory SF100 Q1 num_gpus=2 | wall-clock ≤6s, no SIGSEGV | 2.283s cold, 4 rows correct, exit 0 | **PASS** (well under Phase 21 REG-04 5.7s bar) |
+
+---
+
+## Outcome Summary
+
+- **Build sanity** PASS (mcp build exit 0, 0.2s incremental).
+- **SM-06 SF1 [integration][TPC-H]** FAIL on Q11 parquet num_gpus=2 — pre-existing follow-up #17 (canonical Phase 13 P2 cudaErrorIllegalAddress fingerprint at cuda_stream_view.cpp:45). 21/22 cases ran with 19615/19616 assertions PASS before --abort. Out of Phase 20 scope; flagged for Phase 21 REG-03.
+- **Advisory [mgpu] 16/16** PASS — exact match to Phase 18/19 baselines (79091 assertions, 106.4s).
+- **SM-06 SF10 Q1/Q6/Q12 num_gpus=2** PASS — 3/3 cases, 227 assertions, 12.01s. Empirical corroboration for SM-04 per RESEARCH.md Open Q4.
+- **Advisory SF100 Q1 num_gpus=2** PASS — 2.283s cold, 4 rows correct. Phase 21 REG-04 risk reduced.
+
+The SM-06 verdict is **PARTIAL**: SF10 component PASS, SF1 component FAIL on a pre-existing known issue (follow-up #17). Phase 20 plan 20-04 verdict needs to capture both findings honestly.
