@@ -204,7 +204,9 @@ void launch_broadcast_constant(uint8_t* d_dest,
                                cudf::data_type type,
                                uint32_t row_count,
                                rmm::cuda_stream_view stream)
-{ cudf::type_dispatcher(type, broadcast_dispatch{}, d_dest, d_val_src, row_count, stream); }
+{
+  cudf::type_dispatcher(type, broadcast_dispatch{}, d_dest, d_val_src, row_count, stream);
+}
 
 /// @todo [KEVIN]: consider batching to align execution and design here.
 void decode_constant_data(gpu_codec_run const& run,
