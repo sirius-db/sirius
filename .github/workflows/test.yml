@@ -72,6 +72,9 @@ jobs:
     runs-on: [self-hosted, ubuntu-24.04, cuda-13, gpu-t4]
     needs: build
     timeout-minutes: 60
+    env:
+      CUDA_CACHE_PATH: /home/runner/actions-runner/_work/.cuda-cache
+      SIRIUS_LOG_LEVEL: trace
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -87,7 +90,16 @@ jobs:
         run: tar -xf build.tar
 
       - name: Run C++ unit tests
-        run: ./build/release/extension/sirius/test/cpp/sirius_unittest --abort
+        run: timeout 45m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort
+
+      - name: Upload unit test logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unittest-logs-${{ github.run_id }}
+          path: build/release/extension/sirius/test/cpp/log/
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Prepare SQL test datasets
         run: |
