@@ -14,14 +14,9 @@
  * limitations under the License.
  */
 
-//===----------------------------------------------------------------------===//
-// RLE decode tests. Each happy-path case stages a synthetic segment that
-// matches DuckDB's on-disk layout (rle_count_offset header → values → counts)
-// and asserts the decoded output. Defensive guards (corrupt offset, count
-// underflow / overflow, zero count) are pinned by their own cases so the
-// kernel's deterministic-zero-fill contract doesn't silently regress if
-// upstream filtering ever changes.
-//===----------------------------------------------------------------------===//
+// RLE decode tests. Happy-path cases assert decoded output for synthetic
+// segments matching DuckDB's on-disk layout. Defensive cases pin the
+// zero-fill contract for malformed metadata.
 
 #include "scan/decode_test_utils.hpp"
 #include "scan/rle_synth.hpp"
@@ -59,7 +54,7 @@ auto const I32 = cudf::data_type{cudf::type_id::INT32};
 auto const I64 = cudf::data_type{cudf::type_id::INT64};
 auto const U8  = cudf::data_type{cudf::type_id::UINT8};
 
-/// Wrap one block's bytes into a single-segment column and decode it.
+// Decode a single-segment column from one block of bytes.
 template <typename T>
 std::vector<T> decode_one(std::vector<uint8_t> const& bytes,
                           cudf::data_type type,
@@ -84,8 +79,7 @@ std::vector<T> decode_one(std::vector<uint8_t> const& bytes,
   return download<T>(t->get_column(0).view().data<T>(), row_count, stream.value());
 }
 
-/// Build the expected expanded vector from values + counts. Mirrors the
-/// host-side prefix-sum walk that decode_rle_data does internally.
+// Reference expansion against which kernel output is asserted.
 template <typename T>
 std::vector<T> expand_runs(std::vector<T> const& values,
                            std::vector<uint16_t> const& counts)
@@ -153,10 +147,8 @@ TEST_CASE("gpu_decode_table RLE - multi-entry runs are expanded in order",
 TEST_CASE("gpu_decode_table RLE - cross-CTA boundary (rows > RLE_ROWS_PER_CHUNK)",
           "[scan][decode][rle]")
 {
-  // 12 runs × 256 rows each = 3072 rows → 2 CTAs (RLE_ROWS_PER_CHUNK=2048).
-  // Verifies the binary search is correct across CTA boundaries — the
-  // second CTA's local_row_start = 2048 must still resolve to the right
-  // entry.
+  // 3072 rows → spans 2 CTAs; verifies binary search on the 2nd CTA's
+  // local_row_start = 2048 still resolves to the right entry.
   std::vector<int32_t> values;
   std::vector<uint16_t> counts;
   for (int32_t i = 0; i < 12; ++i) {
@@ -172,8 +164,7 @@ TEST_CASE("gpu_decode_table RLE - cross-CTA boundary (rows > RLE_ROWS_PER_CHUNK)
 TEST_CASE("gpu_decode_table RLE - large entry_count exercises gmem path",
           "[scan][decode][rle]")
 {
-  // 5000 entries > RLE_SMEM_MAX_ENTRIES (4096) → kernel falls through to
-  // gmem-resident cumsum. Each run is 1 row so output is a sequence.
+  // entry_count > shmem cap → exercises the gmem-cumsum path.
   constexpr uint32_t N = 5000;
   std::vector<int32_t> values(N);
   std::iota(values.begin(), values.end(), 1);
@@ -185,8 +176,7 @@ TEST_CASE("gpu_decode_table RLE - large entry_count exercises gmem path",
 
 TEST_CASE("gpu_decode_table RLE - multi-segment column", "[scan][decode][rle]")
 {
-  // Two segments encoded with different run shapes; verify each lands in
-  // its own row range via segment.row_offset.
+  // Two segments with different run shapes land in their own row ranges.
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
 
@@ -214,11 +204,9 @@ TEST_CASE("gpu_decode_table RLE - multi-segment column", "[scan][decode][rle]")
 
 TEST_CASE("gpu_decode_table RLE - segment with on-disk padding", "[scan][decode][rle]")
 {
-  // DuckDB's encoder aligns the values→counts boundary; rle_count_offset
-  // can be greater than 8 + entry_count*sizeof(T). Synthesise that shape
-  // (4 bytes of zero padding between values and counts) to confirm the
-  // host parser reads counts at the offset it finds in the header rather
-  // than computing it from an assumed layout.
+  // DuckDB pads values→counts to alignment, so rle_count_offset can exceed
+  // 8 + entry_count*sizeof(T). The parser must trust the header value, not
+  // compute counts position from values size.
   uint64_t header_size  = RLE_HEADER_SIZE;
   uint64_t values_bytes = 2 * sizeof(int32_t);
   uint64_t pad_bytes    = 4;
@@ -237,12 +225,9 @@ TEST_CASE("gpu_decode_table RLE - segment with on-disk padding", "[scan][decode]
   for (uint32_t i = 0; i < 20; ++i) REQUIRE(out[10 + i] == 88);
 }
 
-//===----------------------------------------------------------------------===//
-// Defensive guards. Each test pre-fills the output with a 0xCC canary and
-// invokes `decode_rle_data` directly (bypassing the dispatcher's allocate-
-// fresh path) so we can prove the kernel deterministically zero-fills on
-// malformed metadata, rather than relying on REQUIRE_NOTHROW alone.
-//===----------------------------------------------------------------------===//
+// Defensive guards: pre-fill output with a 0xCC canary, call decode_rle_data
+// directly (skipping the dispatcher's allocate-fresh path), then assert
+// every byte is zero.
 
 namespace {
 inline std::vector<int32_t> decode_invalid_with_canary(rmm::cuda_stream& stream,
@@ -305,8 +290,7 @@ TEST_CASE("gpu_decode_table RLE - rle_count_offset below header zero-fills",
 TEST_CASE("gpu_decode_table RLE - count walk underflows row_count zero-fills",
           "[scan][decode][rle][defensive]")
 {
-  // counts sum to less than row_count → walk runs out before reaching
-  // row_count. Host parser refuses, kernel zero-fills.
+  // counts sum < row_count → walk runs out, segment refused.
   auto bytes = make_rle_block<int32_t>({1, 2}, {5, 5});  // sum = 10
 
   rmm::cuda_stream stream;
@@ -326,8 +310,7 @@ TEST_CASE("gpu_decode_table RLE - count walk underflows row_count zero-fills",
 TEST_CASE("gpu_decode_table RLE - count walk overflows row_count zero-fills",
           "[scan][decode][rle][defensive]")
 {
-  // counts sum to more than row_count and the last count straddles the
-  // boundary (final total != row_count). Refused.
+  // counts sum overshoots row_count; last count straddles the boundary.
   auto bytes = make_rle_block<int32_t>({1, 2}, {50, 60});  // sum = 110
 
   rmm::cuda_stream stream;
@@ -347,8 +330,7 @@ TEST_CASE("gpu_decode_table RLE - count walk overflows row_count zero-fills",
 TEST_CASE("gpu_decode_table RLE - zero count inside walk zero-fills",
           "[scan][decode][rle][defensive]")
 {
-  // DuckDB's encoder never emits zero counts; if we see one, treat the
-  // segment as malformed instead of infinite-looping or under-filling.
+  // DuckDB never emits zero counts; treat them as malformed.
   auto bytes = make_rle_block<int32_t>({1, 99, 2}, {10, 0, 10});
 
   rmm::cuda_stream stream;
@@ -389,8 +371,7 @@ TEST_CASE("gpu_decode_table RLE - segment too small for header zero-fills",
 TEST_CASE("gpu_decode_table RLE - unsupported type_size throws",
           "[scan][decode][rle][defensive]")
 {
-  // DECIMAL128 is 16-byte storage; RLE on 128-bit values is refused by the
-  // viability walker upstream, kernel throws as a defensive backstop.
+  // 16-byte types are out of scope for this dispatcher.
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
   auto bytes = make_rle_block<int32_t>({1}, {8});

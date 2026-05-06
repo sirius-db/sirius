@@ -226,21 +226,8 @@ TEST_CASE("bench CONSTANT int64 32MiB", "[!benchmark][scan][decode]")
     "[bench] CONSTANT     int64 32MiB:        %.6fs  write=%.1f GiB/s\n", sec, bytes_w / sec / GIB);
 }
 
-//===----------------------------------------------------------------------===//
-// RLE benches.
-//
-// Each bench encodes one segment per row group (DuckDB row-group max 122880
-// rows) and tiles many segments to reach the workload size. The kernel
-// expands one chunk of 2048 rows per CTA, so a 122880-row segment splits
-// into 60 CTAs — well above the launch-overhead floor.
-//
-// Three shapes:
-//   long_runs   — few entries per segment; near-broadcast pattern, exercise
-//                 the shmem cumsum cache + value broadcast.
-//   medium_runs — typical sorted-low-cardinality column.
-//   short_runs  — one row per entry, exercises the gmem-cumsum path when
-//                 entry_count exceeds the shmem cap.
-//===----------------------------------------------------------------------===//
+// RLE benches. Three shapes covering the shmem and gmem cumsum paths plus
+// the long-run / short-run extremes.
 
 namespace {
 
@@ -255,8 +242,7 @@ TEST_CASE("bench RLE int64 long_runs (16 entries/seg) 122M rows",
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
 
-  // 16 entries × 7680 run_len = 122880 rows per segment. Run length sits
-  // well above warp width so the value-broadcast path dominates.
+  // 16 runs of 7680 rows each — long-run / value-broadcast pattern.
   constexpr uint32_t N_RUNS  = 16;
   constexpr uint16_t RUN_LEN = static_cast<uint16_t>(RLE_BENCH_SEG_ROWS / N_RUNS);
   constexpr uint32_t SEG_ROWS = N_RUNS * RUN_LEN;
@@ -291,8 +277,7 @@ TEST_CASE("bench RLE int64 medium_runs (1024 entries/seg) 122M rows",
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
 
-  // 1024 entries × 120 run_len = 122880 rows per segment. cumsum (4 KiB)
-  // fits easily in shmem; binary search is log2(1024) = 10 levels.
+  // 1024 runs of 120 rows — cumsum (4 KiB) fits in shmem.
   constexpr uint32_t N_RUNS  = 1024;
   constexpr uint16_t RUN_LEN = static_cast<uint16_t>(RLE_BENCH_SEG_ROWS / N_RUNS);
   constexpr uint32_t SEG_ROWS = N_RUNS * RUN_LEN;
@@ -327,11 +312,7 @@ TEST_CASE("bench RLE int32 short_runs (8192 entries/seg gmem) 65M rows",
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
 
-  // 8192 entries > RLE_SMEM_MAX_ENTRIES (4096) → gmem-cumsum binary-search
-  // path. 15 run_len keeps run lengths small but >0; segment row count =
-  // 8192 × 15 = 122880 (matches DuckDB row-group max). Segment count cut to
-  // 1/2 of the int64 benches because the gmem path is intentionally slower
-  // and we want bench wall time to stay reasonable.
+  // 8192 runs of 15 rows — exceeds shmem cap so binary search hits gmem.
   constexpr uint32_t N_RUNS  = 8192;
   constexpr uint16_t RUN_LEN = 15;  // 8192*15 = 122880
   constexpr uint32_t SEG_ROWS = N_RUNS * RUN_LEN;

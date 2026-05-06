@@ -16,22 +16,14 @@
 
 #pragma once
 
-//===----------------------------------------------------------------------===//
-// Synthetic RLE-segment builders. Shared by the unit tests and the codec
-// microbenches. Format mirrors the on-disk DuckDB RLE layout the kernel
-// parses (verified against `duckdb/src/storage/compression/rle.cpp`):
-//
+// Synthetic RLE-segment builders shared by unit tests and codec benches.
+// Layout matches duckdb/src/storage/compression/rle.cpp:
 //   [0..8)                            uint64 rle_count_offset
-//   [8 .. 8 + entry_count*sizeof(T))  values (T[entry_count])
+//   [8 .. 8 + entry_count*sizeof(T))  values
 //   [...optional zero padding...]
-//   [rle_count_offset .. end)         counts (uint16_t[entry_count])
-//
-// The header value `rle_count_offset` is the absolute byte offset where the
-// counts array starts; values + padding fill the gap in between. The
-// builder below packs values back-to-back with no padding (sets
-// rle_count_offset = 8 + values_bytes), which is a valid sub-shape of the
-// on-disk format.
-//===----------------------------------------------------------------------===//
+//   [rle_count_offset .. end)         counts (uint16_t)
+// The builder below packs values back-to-back with no padding (a valid
+// sub-shape of the on-disk format).
 
 #include <cuda/scan/gpu_decode_rle.cuh>
 
@@ -42,9 +34,7 @@
 
 namespace sirius::test::decode::rle {
 
-/// Build a self-contained RLE segment block. `values.size()` must equal
-/// `counts.size()`; mismatched sizes are a caller bug — surface it instead
-/// of producing a malformed block that decodes silently wrong.
+/// Build a self-contained RLE segment block. Throws if sizes mismatch.
 template <typename T>
 inline std::vector<uint8_t> make_rle_block(std::vector<T> const& values,
                                            std::vector<uint16_t> const& counts)
@@ -71,9 +61,8 @@ inline std::vector<uint8_t> make_rle_block(std::vector<T> const& values,
   return block;
 }
 
-/// Emit one (value, count) pair repeated `n_runs` times with strictly
-/// increasing values so each output row is unique. Used by benches that
-/// want a known-throughput shape — `run_len` rows per run.
+/// Build a block of `n_runs` runs, each `run_len` rows, with monotonically
+/// increasing values (0, 1, 2, ...).
 template <typename T>
 inline std::vector<uint8_t> make_uniform_runs(uint32_t n_runs, uint16_t run_len)
 {
