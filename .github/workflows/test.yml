@@ -248,3 +248,27 @@ jobs:
           name: tpch-run-${{ github.run_id }}-cuda-12
           path: ${{ steps.tpch.outputs.run_dir }}
           retention-days: 14
+
+  build:
+    runs-on: ubuntu-slim
+    needs: [build-cuda-13, build-cuda-12]
+    if: always()
+    steps:
+      - name: All builds ok
+        if: ${{ !(contains(needs.*.result, 'failure')) }}
+        run: exit 0
+      - name: Some builds failed
+        if: ${{ contains(needs.*.result, 'failure') }}
+        run: exit 1
+
+  test:
+    runs-on: ubuntu-slim
+    needs: [test-cuda-13, test-cuda-12]
+    if: always()
+    steps:
+      - name: All tests ok
+        if: ${{ !(contains(needs.*.result, 'failure')) }}
+        run: exit 0
+      - name: Some tests failed
+        if: ${{ contains(needs.*.result, 'failure') }}
+        run: exit 1
