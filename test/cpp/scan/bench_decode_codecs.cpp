@@ -305,16 +305,16 @@ TEST_CASE("bench RLE int64 medium_runs (1024 entries/seg) 122M rows",
               bytes_w / sec / GIB);
 }
 
-TEST_CASE("bench RLE int32 short_runs (8192 entries/seg gmem) 65M rows",
+TEST_CASE("bench RLE int32 short_runs (4096 entries/seg) 65M rows",
           "[!benchmark][scan][decode]")
 {
   using ::sirius::test::decode::rle::make_uniform_runs;
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
 
-  // 8192 runs of 15 rows — exceeds shmem cap so binary search hits gmem.
-  constexpr uint32_t N_RUNS  = 8192;
-  constexpr uint16_t RUN_LEN = 15;  // 8192*15 = 122880
+  // At the build kernel's max-entry cap; each run is 30 rows.
+  constexpr uint32_t N_RUNS  = 4096;
+  constexpr uint16_t RUN_LEN = 30;  // 4096*30 = 122880
   constexpr uint32_t SEG_ROWS = N_RUNS * RUN_LEN;
   constexpr uint32_t N_SEGS   = (64u << 20) / SEG_ROWS;
   auto seg_bytes              = make_uniform_runs<int32_t>(N_RUNS, RUN_LEN);

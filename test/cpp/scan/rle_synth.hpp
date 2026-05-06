@@ -35,6 +35,9 @@
 namespace sirius::test::decode::rle {
 
 /// Build a self-contained RLE segment block. Throws if sizes mismatch.
+/// rle_count_offset is rounded up to 8 bytes to match DuckDB's
+/// `AlignValue<8>` in `FlushSegment` — keeps `counts[]` naturally aligned
+/// for uint16 device reads.
 template <typename T>
 inline std::vector<uint8_t> make_rle_block(std::vector<T> const& values,
                                            std::vector<uint16_t> const& counts)
@@ -43,10 +46,11 @@ inline std::vector<uint8_t> make_rle_block(std::vector<T> const& values,
     throw std::runtime_error(
       "make_rle_block: values and counts size mismatch (caller error)");
   }
-  size_t entry_count        = values.size();
-  size_t values_bytes       = entry_count * sizeof(T);
-  size_t counts_bytes       = entry_count * sizeof(uint16_t);
-  uint64_t rle_count_offset = ::sirius::cuda::scan::RLE_HEADER_SIZE + values_bytes;
+  size_t entry_count          = values.size();
+  size_t values_bytes         = entry_count * sizeof(T);
+  size_t counts_bytes         = entry_count * sizeof(uint16_t);
+  uint64_t minimal_offset     = ::sirius::cuda::scan::RLE_HEADER_SIZE + values_bytes;
+  uint64_t rle_count_offset   = (minimal_offset + 7u) & ~uint64_t{7u};
 
   std::vector<uint8_t> block(rle_count_offset + counts_bytes, 0);
   std::memcpy(block.data(), &rle_count_offset, sizeof(rle_count_offset));

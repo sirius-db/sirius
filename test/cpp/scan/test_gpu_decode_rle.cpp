@@ -161,11 +161,11 @@ TEST_CASE("gpu_decode_table RLE - cross-CTA boundary (rows > RLE_ROWS_PER_CHUNK)
   REQUIRE(out == expected);
 }
 
-TEST_CASE("gpu_decode_table RLE - large entry_count exercises gmem path",
+TEST_CASE("gpu_decode_table RLE - near-cap entry count",
           "[scan][decode][rle]")
 {
-  // entry_count > shmem cap → exercises the gmem-cumsum path.
-  constexpr uint32_t N = 5000;
+  // Near the build kernel's max-entries cap; each run is 1 row.
+  constexpr uint32_t N = 4000;
   std::vector<int32_t> values(N);
   std::iota(values.begin(), values.end(), 1);
   std::vector<uint16_t> counts(N, 1);
@@ -242,6 +242,28 @@ inline std::vector<int32_t> decode_invalid_with_canary(rmm::cuda_stream& stream,
   return download<int32_t>(d_out.data(), total_rows, stream.value());
 }
 }  // namespace
+
+TEST_CASE("gpu_decode_table RLE - over-cap entry count zero-fills",
+          "[scan][decode][rle][defensive]")
+{
+  // > 4096 entries exceeds the build kernel's BlockScan cap.
+  constexpr uint32_t N = 5000;
+  std::vector<int32_t> values(N);
+  std::iota(values.begin(), values.end(), 1);
+  std::vector<uint16_t> counts(N, 1);
+  auto bytes = make_rle_block<int32_t>(values, counts);
+
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  gpu_codec_run run{CompressionType::COMPRESSION_RLE,
+                    {gpu_segment_desc{static_cast<uint8_t const*>(d_seg.data()),
+                                      static_cast<uint32_t>(d_seg.size()),
+                                      0,
+                                      N}}};
+  auto out = decode_invalid_with_canary(stream, mr, run, N);
+  for (uint32_t i = 0; i < N; ++i) REQUIRE(out[i] == 0);
+}
 
 TEST_CASE("gpu_decode_table RLE - rle_count_offset past segment zero-fills",
           "[scan][decode][rle][defensive]")
