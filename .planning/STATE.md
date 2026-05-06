@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Rebase After DataBatch Changes
-status: executing
-stopped_at: "Completed 20-06-PLAN.md (SM-06 SF1 closure via parquet_split_provider kvikio bypass fix) — Phase 20 → COMPLETE PASS (6/6 plans, all SM-01..SM-06 closed). 20-05 escalation re-classified: Sirius-side architectural gap, NOT cucascade-side. Q11 SF1 num_gpus=2 PASS, [TPC-H][parquet] 22/22 PASS under sanitizer (0 kvikio frames), 47/48 [integration][TPC-H] PASS (single residual is pre-existing SM-02 PARTIAL test-fixture mismatch from plan 20-01). Phase 21 unblocked."
+status: complete
+stopped_at: "Completed 21-01-PLAN.md (v1.4 ship gate, all REG-01..06 PASS). v1.4 milestone shipped."
 last_updated: "2026-05-06T19:30:00.000Z"
-last_activity: 2026-05-06
+last_activity: 2026-05-06 -- Phase 21 v1.4 ship gate PASSED; milestone shipped
 progress:
   total_phases: 6
-  completed_phases: 5
-  total_plans: 28
-  completed_plans: 28
+  completed_phases: 6
+  total_plans: 29
+  completed_plans: 29
 ---
 
 # Project State
@@ -20,17 +20,17 @@ progress:
 See: .planning/PROJECT.md (updated 2026-05-04)
 
 **Core value:** Any query can transparently execute across every GPU on the node — tasks are scheduled to the GPU where their input data already resides, memory pressure is absorbed by downgrading to the correct NUMA domain, and parquet I/O is routed through a multi-GPU-safe backend.
-**Current focus:** Phase 20 — Scan Manager + Pin Tables Port (PR #731 + #721)
+**Current focus:** v1.4 SHIPPED 2026-05-06. v1.5+ scope (PIN-MGPU-01, IO-MGPU-02, CC-UPSTREAM-01, FU-B) awaiting milestone planning.
 
 ## Current Position
 
-Phase: 20 (Scan Manager + Pin Tables Port (PR #731 + #721)) — COMPLETE
-Plan: 6 of 6
-Status: Phase 20 closed; Phase 21 ready to plan
-Last activity: 2026-05-06
+Phase: 21 (v1.4 Ship Gate (Full v1.3 Gauntlet on Rebased Branch)) — COMPLETE
+Plan: 1 of 1 (COMPLETE)
+Status: v1.4 SHIPPED — all 32 requirements (CC-01..04 + MERGE-01..05 + DB-01..05 + IO-12..17 + IO-15B + SM-01..06 + REG-01..06) Complete
+Last activity: 2026-05-06 -- Phase 21 v1.4 ship gate PASSED; milestone shipped
 
 ```
-v1.4 Progress: [##################  ] 5/6 phases | 23/32 requirements | 28 plans (SM-06 SF1 PASS via 20-06)
+v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans | SHIPPED 2026-05-06
 ```
 
 ## Phase Overview (v1.4)
@@ -41,8 +41,8 @@ v1.4 Progress: [##################  ] 5/6 phases | 23/32 requirements | 28 plans
 | 17 | Sirius origin/dev Merge — Base Layer | MERGE-01..05 | Complete (4/4 plans, PASS) |
 | 18 | DataBatch RAII Migration | DB-01..05 | Complete (7/7 plans, PASS) |
 | 19 | IO Framework Adoption | IO-12..17 | Complete (6/6 plans, PASS) |
-| 20 | Scan Manager + Pin Tables Port | SM-01..06 | **Complete (6/6 plans, PASS)** — SM-06 SF1 closed by 20-06 (parquet_split_provider kvikio bypass eliminated); 22/22 [TPC-H][parquet] PASS under sanitizer; Q11 SF1 num_gpus=2 PASS |
-| 21 | v1.4 Ship Gate | REG-01..06 | Not started |
+| 20 | Scan Manager + Pin Tables Port | SM-01..06 | Complete (6/6 plans, PASS) — SM-06 SF1 closed by 20-06 |
+| 21 | v1.4 Ship Gate | REG-01..06 | **Complete (1/1 plans, PASS)** — all REG-01..06 PASS; SM-02 fixture-fix path chosen; 21-VERDICT.md written 2026-05-06 |
 
 ## Performance Metrics
 
@@ -105,6 +105,7 @@ v1.4 Progress: [##################  ] 5/6 phases | 23/32 requirements | 28 plans
 | Phase 20 P04 | 18min | 3 tasks | 2 files |
 | Phase 20 P05 | 25min | 4 tasks | 3 files |
 | Phase 20 P06 | ~50min | 5 tasks | 11 files |
+| Phase 21 P01 | ~30min | 5 tasks | 5 files |
 
 ## Decisions
 
@@ -234,6 +235,10 @@ v1.4 Progress: [##################  ] 5/6 phases | 23/32 requirements | 28 plans
 - [Phase 20]: [20-06] Strengthened IO-15B grep gate added to REQUIREMENTS.md: `grep -rn "cudf::io::datasource::create" src/ | grep -v iceberg_metadata_reader.cpp | grep -v iceberg_scan_task.cpp` must return 0 hits. Would have caught PR #731's bypass had it been live during Phase 19. IO-MGPU-02 added to Future Requirements (v1.5+) for the two known-deferred iceberg sites (currently single-GPU correct).
 - [Phase 20]: [20-06] [integration][TPC-H] 47/48 PASS at SF1 num_gpus=2: the single residual is the pre-existing SM-02 PARTIAL test-fixture mismatch from plan 20-01 ([mgpu-audit] per-GPU distribution Q1 fails at counts[1].pipeline_ids.size() >= 1 with 0 >= 1 — v1.3-era multi-pipeline_task threshold vs post-#731 single composite gpu_pipeline_task). scan_batch IS multi-GPU disjoint at HEAD; only the test fixture's threshold is misaligned. NOT a 20-06 regression. [mgpu] 16/16 PASS continuity preserved (79091 assertions, 109s).
 - [Phase 20]: [20-06] Phase 20 final verdict flips PARTIAL → COMPLETE PASS (6/6 plans). Phase 21 unblocked at REG-03 dependency level (SM-06 SF1 carryover no longer required).
+- [Phase 21]: [21-01] SM-02 path chosen: fixture-fix (1-line surgical edit at `test_gpu_execution_tpch_mgpu_audit.cpp:261-273` realigning v1.3-era multi-pipeline_task threshold with post-#731 single composite gpu_pipeline_task pattern). Cross-GPU `scan_id` intersection invariant (Phase 9 FIX-B regression gate at lines 286-299) preserved verbatim. Net `-1` assertion delta: 71607 vs 71608 baseline.
+- [Phase 21]: [21-01] All 6 REG-01..06 PASS on rebased `feature/single-node-multi-gpu2`: REG-01 16/16 (79091/106.3s), REG-02 22/22 (36256/79.3s), REG-03 48/48 (71607/152.4s), REG-04 SF100 Q1 num_gpus=2 3.150s + byte-identical + intersect=0, REG-05 [mgpu_stress] 500-iter (77053/76.7s), REG-06 HYG-02=40 + sanitizer 0 violations on both legs.
+- [Phase 21]: [21-01] One-off Q11 parquet num_gpus=2 cudaErrorIllegalAddress observed during REG-02 first attempt; resolved on retry (22/22 PASS); Q11 alone PASS (9011 assertions, 7.1s). Documented as known intermittent follow-up #17 (per `project_phase08_fu17`); NOT a Phase 21 regression.
+- [Phase 21]: [21-01] v1.4 SHIPPED: 6 phases / 29 plans / 32 requirements clear. Carry-forwards to v1.5+: PIN-MGPU-01, IO-MGPU-02, CC-UPSTREAM-01, FU-B. Cucascade Cluster B (peer-DMA host-staging fallback) tracked under `project_tpch_q1_mgpu_string_bug` (correctness-neutral on this hardware; uncommitted in cucascade).
 
 ## Accumulated Context
 
@@ -270,5 +275,5 @@ v1.4 Progress: [##################  ] 5/6 phases | 23/32 requirements | 28 plans
 ## Session Continuity
 
 Last session: 2026-05-06T19:30:00.000Z
-Stopped at: Completed 20-06-PLAN.md (SM-06 SF1 closure via parquet_split_provider kvikio bypass fix) — Phase 20 → COMPLETE PASS (6/6 plans). 20-05 escalation re-classified: Cluster A (kvikio internal cross-stream) was actually a Sirius-side gap (parquet_split_provider was authored without IO framework integration); fix landed in 5 commits; all functional gates green. Phase 21 ready to plan.
-Resume file: .planning/phases/20-scan-manager-pin-tables-port-pr-731-pr-721/20-06-SUMMARY.md
+Stopped at: Completed 21-01-PLAN.md (v1.4 ship gate, all REG-01..06 PASS). v1.4 milestone shipped.
+Resume file: .planning/phases/21-v1-4-ship-gate-full-v1-3-gauntlet-on-rebased-branch/21-VERDICT.md

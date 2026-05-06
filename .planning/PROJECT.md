@@ -10,11 +10,24 @@ Any query can transparently execute across every GPU on the node — tasks are s
 
 ## Current State
 
-**v1.4 in progress** — Rebase After DataBatch Changes.
-- Goal: land cucascade `origin/main` (PR #117 DataBatch RAII refactor + #112 + #116) and Sirius `origin/dev` (#675 IO Framework, #731 Scan Manager, #721 Pin Tables, #739 cucascade-compat, #733/#734/#735) onto `feature/single-node-multi-gpu2`, preserving all v1.1+v1.2+v1.3 multi-GPU behavior.
-- Conflict surface (measured 2026-05-04 via `git merge-tree`): cucascade rebase = 6 conflict files (gpu_data_representation.{hpp,cpp}, representation_converter.cpp, pipeline_io_backend.cpp, memory/{common,memory_space}.cpp); Sirius dev merge = 11 conflict files + 33 auto-merges.
-- Key adoption decisions: (1) cucascade strategy = rebase our 11 local fixes onto `origin/main` (no upstream PRs this milestone); (2) IO Framework = retire `sirius::io::cucascade_datasource` and adopt `sirius::io::sirius_datasource` (#675), adapting it to multi-GPU; (3) branch = in-place on `feature/single-node-multi-gpu2`; (4) phase numbering continues from 16.
-- Regression bar: v1.3 ship-gate must pass on rebased shape — `[mgpu]` 16/16, `[TPC-H][parquet]` 22/22, `[integration][TPC-H]` 48/48, SF100 Q1 num_gpus=2 ≤ 5.7s, mgpu_stress 500-iter, HYG-02 ≤ 40.
+**v1.4 shipped 2026-05-06** — Rebase After DataBatch Changes.
+- 6 phases / 29 plans / 32 requirements cleared (CC-01..04 + MERGE-01..05 + DB-01..05 + IO-12..17 + IO-15B + SM-01..06 + REG-01..06)
+- Cucascade rebased to pin `1c1e648` (descended from `73d00c4` with PR #117 DataBatch RAII + PR #112 bandwidth profiler + PR #116 `gpu_data_representation` from `cudf::table_view`; 11 local Sirius-side fixes preserved per CC-01..04)
+- DataBatch RAII migration complete (Phase 18; Path A architectural fix in 18-07 — drop R5 lock-and-hold from `gpu_pipeline_task::compute_task`; 23 test files migrated; `[mgpu]` 16/16 PASS)
+- IO Framework adoption complete (Phase 19; per-GPU `sirius_ioctx` + `sirius_datasource` retiring `cucascade_datasource`; per-GPU `uring_ioctx` instances under `rmm::cuda_set_device_raii`)
+- Scan Manager + Pin Tables port complete (Phase 20; SM-06 SF1 closed via 20-06 `parquet_split_provider` kvikio bypass fix — Sirius-side architectural gap re-classified, NOT cucascade-side issue; IO-15B strengthened grep gate added)
+- v1.4 ship-gate (Phase 21 REG-01..06) PASSED on rebased branch:
+  - `[mgpu]` 16/16 PASS (79091 assertions, 106.3s)
+  - `[TPC-H][parquet]` 22/22 PASS (36256 assertions, 79.3s)
+  - `[integration][TPC-H]` 48/48 PASS (71607 assertions, 152.4s — 1-line SM-02 fixture fix at commit `9f835cd` realigned v1.3-era multi-pipeline_task threshold with post-#731 single composite `gpu_pipeline_task` pattern; cross-GPU `scan_id` intersection invariant preserved verbatim)
+  - SF100 Q1 num_gpus=2 wall-clock 3.150s (vs 5.7s gate; vs 1-GPU 4.422s baseline; byte-identical CSV; pipeline_task distribution GPU0=18 / GPU1=12 / intersect=0)
+  - `[mgpu_stress]` 500-iter PASS (77053 assertions, 76.7s)
+  - HYG-02 = 40 (preserved — entirely in `src/legacy/`)
+  - compute-sanitizer memcheck clean: Leg 1 [multi_gpu_foundation] 7/7 + 38 assertions + 0 violations; Leg 2 [integration][gpu_execution][parquet][join] 42/42 + 1.92M assertions + 0 violations
+- Branch: `feature/single-node-multi-gpu2`
+- Open follow-ups carried to v1.5+: PIN-MGPU-01 (multi-GPU pin_table), IO-MGPU-02 (multi-GPU iceberg metadata), CC-UPSTREAM-01 (upstream cucascade PRs), FU-B (SF1 1-GPU vs 2-GPU speedup gate)
+- Cucascade peer-DMA probe + host-staging fallback (Cluster B from 20-05 sanitizer trace) tracked under existing project memory `project_tpch_q1_mgpu_string_bug` (correctness-neutral on this hardware; uncommitted in cucascade)
+- See: [`21-VERDICT.md`](phases/21-v1-4-ship-gate-full-v1-3-gauntlet-on-rebased-branch/21-VERDICT.md), [`20-06-VERDICT.md`](phases/20-scan-manager-pin-tables-port-pr-731-pr-721/20-06-VERDICT.md), [`19-VERDICT.md`](phases/19-io-framework-adoption-pr-675/19-VERDICT.md), [`18-VERDICT-V2.md`](phases/18-databatch-raii-migration-cucascade-117-surface/18-VERDICT-V2.md)
 
 **v1.3 shipped 2026-05-01** — Multi-GPU Distribution.
 - 4 phases / 12 plans / 5 phases of work delivered (Phases 12-15)

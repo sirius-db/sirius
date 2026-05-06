@@ -6,12 +6,12 @@
 - ✅ **v1.2 Multi-GPU SQL Pipeline Fix** — Phases 8-10 (shipped 2026-04-28) — [archive](milestones/v1.2-ROADMAP.md)
 - 🛠 **v1.2 Patch — AUDIT TEST_CASE attach-path SIGSEGV** — Phase 11 (closed 2026-04-28)
 - ✅ **v1.3 Multi-GPU Distribution** — Phases 12-15 (shipped 2026-05-01)
-- 🚧 **v1.4 Rebase After DataBatch Changes** — Phases 16-21 (in progress, started 2026-05-04)
+- ✅ **v1.4 Rebase After DataBatch Changes** — Phases 16-21 (shipped 2026-05-06)
 
 ## Phases
 
 <details open>
-<summary>🚧 v1.4 Rebase After DataBatch Changes (Phases 16-21) — in progress</summary>
+<summary>✅ v1.4 Rebase After DataBatch Changes (Phases 16-21) — SHIPPED 2026-05-06</summary>
 
 Goal: land cucascade `origin/main` (PR #117 DataBatch RAII refactor + #112 + #116) and Sirius `origin/dev` (#675 IO Framework, #731 Scan Manager, #721 Pin Tables, #739 cucascade-compat, #733/#734/#735) onto `feature/single-node-multi-gpu2`, preserving all v1.1+v1.2+v1.3 multi-GPU behavior. The v1.3 ship-gate (`[mgpu]` 16/16, `[TPC-H][parquet]` 22/22, `[integration][TPC-H]` 48/48, SF100 Q1 num_gpus=2 <= 5.7s, mgpu_stress 500-iter, HYG-02 <= 40) must pass bitwise on the rebased branch.
 
@@ -20,7 +20,7 @@ Goal: land cucascade `origin/main` (PR #117 DataBatch RAII refactor + #112 + #11
 - [x] **Phase 18: DataBatch RAII Migration (cucascade #117 surface)** — Migrate all `batch->get_data()` call sites and `pop_data_batch(state)` usages to RAII accessors; rewrite `batch_lock_utils.hpp`. Phase ends with a compile-clean build. **COMPLETE 2026-05-05**: 7/7 plans shipped (added gap-closure plan 18-07). DB-01..05 PASS. Path A architectural fix landed in 18-07 (drop R5 lock-and-hold from `gpu_pipeline_task::compute_task`; `pipelineable_operator_data::prepare_for_processing` performs eager memory-space conversion under SHORT-scoped accessors and returns empty vector; operators inside `execute()` take per-call accessors at narrowest scope). [mgpu] 16/16 PASS in 103.5s (79091 assertions); [mgpu_stress] default-mode PASS in 75.5s (77053 assertions); compute-sanitizer racecheck 0 hazards on [downgrade_lifecycle] proxy. HYG-02 baseline preserved at 40 (0 non-legacy). See 18-VERDICT-V2.md (supersedes 18-VERDICT.md PARTIAL).
 - [x] **Phase 19: IO Framework Adoption (PR #675)** — Retire `sirius::io::cucascade_datasource`; adopt `sirius::io::sirius_datasource` with per-GPU `uring_ioctx` instances. Install `liburing-dev` before first build attempt. **COMPLETE** (2026-05-06): 6/6 plans shipped. All 6 IO-12..17 PASS. `[TPC-H][parquet]` 22/22 PASS at num_gpus=2 (36256 assertions, 78.6s); compute-sanitizer memcheck on `[multi_gpu_foundation]` (7/7) and `[integration][gpu_execution][parquet][join]` (42/42, 1.92M assertions) report 0 memcheck violations. nvidia-smi dmon confirms non-zero PCIe rxpci on BOTH GPU 0 (63/120 samples; max 2892 MB/s) AND GPU 1 (54/120 samples; max 453 MB/s) during multi-GPU workload. HYG-02 = 40 (preserved). See 19-VERDICT.md.
 - [x] **Phase 20: Scan Manager + Pin Tables Port (PR #731 + #721)** — **COMPLETE** (6/6 plans, SM-01..SM-06 all PASS). Plan 20-06 closed the 20-05 SM-06 SF1 escalation by re-classifying the sanitizer trace: `parquet_split_provider::run_batch` was constructing cudf-bundled file_source datasources directly (kvikio bypass) instead of routing through the Phase 19 `sirius_ioctx::make_datasource` framework — a Sirius-side architectural gap, NOT a cucascade-side cudf+kvikio internal cross-stream issue. After the fix: Q11 SF1 num_gpus=2 parquet PASS (9011 assertions); 22/22 [TPC-H][parquet] PASS under sanitizer (36256 assertions; 0 kvikio frames detected); 47/48 [integration][TPC-H] PASS (1 pre-existing SM-02 PARTIAL test-fixture mismatch — not a regression); 16/16 [mgpu] continuity PASS (79091 assertions). IO-15B strengthened grep gate added to catch this regression class going forward; IO-MGPU-02 created for v1.5+ iceberg metadata residency. Cucascade host-staging fallback (Cluster B from 20-05) persists but is correctness-neutral on this hardware and tracked under the existing v1.4 cucascade follow-up (`project_tpch_q1_mgpu_string_bug`). See [`20-06-VERDICT.md`](phases/20-scan-manager-pin-tables-port-pr-731-pr-721/20-06-VERDICT.md).
-- [ ] **Phase 21: v1.4 Ship Gate (Full v1.3 Gauntlet on Rebased Branch)** — Full regression: `[mgpu]` 16/16, `[TPC-H][parquet]` 22/22, `[integration][TPC-H]` 48/48, SF100 Q1 num_gpus=2 <= 5.7s, mgpu_stress 500-iter, HYG-02 <= 40.
+- [x] **Phase 21: v1.4 Ship Gate (Full v1.3 Gauntlet on Rebased Branch)** — Complete 2026-05-06: REG-01..06 all PASS. 1/1 plan shipped. `[mgpu]` 16/16 PASS (79091 assertions, 106.3s); `[TPC-H][parquet]` 22/22 PASS (36256 assertions, 79.3s); `[integration][TPC-H]` 48/48 PASS (71607 assertions, 152.4s — 1-line SM-02 fixture fix at `9f835cd` realigned v1.3-era multi-pipeline_task threshold with post-#731 single composite gpu_pipeline_task pattern; cross-GPU scan_id intersection invariant preserved); SF100 Q1 num_gpus=2 wall-clock 3.150s (vs 1-GPU 4.422s baseline), byte-identical CSV, pipeline_task intersection=0 (GPU0=18, GPU1=12); `[mgpu_stress]` 500-iter PASS (77053 assertions, 76.7s); HYG-02 = 40 (preserved); compute-sanitizer memcheck Leg 1 7/7 + 38 assertions + 0 violations, Leg 2 42/42 + 1.92M assertions + 0 violations. v1.4 ships. See [`21-VERDICT.md`](phases/21-v1-4-ship-gate-full-v1-3-gauntlet-on-rebased-branch/21-VERDICT.md).
 
 </details>
 
@@ -225,9 +225,9 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 | 16. Cucascade Submodule Rebase + Pin Recovery | v1.4 | 5/5 | Complete    | 2026-05-05 |
 | 17. Sirius origin/dev Merge — Base Layer | v1.4 | 4/4 | Complete    | 2026-05-05 |
 | 18. DataBatch RAII Migration | v1.4 | 7/7 | Complete | 2026-05-05 |
-| 19. IO Framework Adoption | v1.4 | 5/6 | In Progress|  |
-| 20. Scan Manager + Pin Tables Port | v1.4 | 5/5 | Complete (PARTIAL — SM-06 SF1 escalated to Phase 21 REG-03; status human_needed) | 2026-05-06 |
-| 21. v1.4 Ship Gate | v1.4 | 0/1 | In Progress | - |
+| 19. IO Framework Adoption | v1.4 | 6/6 | Complete | 2026-05-06 |
+| 20. Scan Manager + Pin Tables Port | v1.4 | 6/6 | Complete | 2026-05-06 |
+| 21. v1.4 Ship Gate | v1.4 | 1/1 | Complete | 2026-05-06 |
 
 ## Phase context
 
