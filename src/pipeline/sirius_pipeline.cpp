@@ -313,7 +313,10 @@ void sirius_pipeline::update_pipeline_status()
   };
 
   // Skip if already finished — avoids redundant re-evaluation and re-notification.
-  if (pipeline_finished.load()) { return; }
+  if (pipeline_finished.load()) {
+    notify_downstream_pipelines();
+    return;
+  }
 
   if (get_source()->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
     auto& table_scan = get_source()->Cast<op::sirius_physical_duckdb_scan>();
