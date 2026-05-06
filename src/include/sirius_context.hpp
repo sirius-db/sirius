@@ -25,6 +25,7 @@
 #include "planner/query.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_config.hpp"
+#include "telemetry/telemetry_context.hpp"
 
 #include <rmm/resource_ref.hpp>
 
@@ -47,6 +48,10 @@
 namespace cucascade::memory {
 class small_pinned_host_memory_resource;
 }  // namespace cucascade::memory
+
+namespace sirius {
+class sirius_engine;
+}  // namespace sirius
 
 namespace duckdb {
 
@@ -172,8 +177,11 @@ class SiriusContext : public ClientContextState {
 
   /// \brief Start a query with its pipelines.
   /// \param pipelines The ordered pipelines for the query.
-  void create_query(
-    duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines);
+  /// \param context Quent telemetry context to enable emitting telemetry.
+  /// \param telemetry_info Info useful for emitting identifiable telemetry.
+  void create_query(duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
+                    const quent::Context& context,
+                    sirius::telemetry::query_telemetry_info telemetry_info);
 
   /// \brief Get the current query.
   [[nodiscard]] duckdb::shared_ptr<sirius::planner::query> get_query();
@@ -198,6 +206,15 @@ class SiriusContext : public ClientContextState {
   /// \brief Take ownership of the captured logical plan (moves it out).
   /// Called by OnFinalizePrepare to generate the Sirius physical plan.
   duckdb::unique_ptr<duckdb::LogicalOperator> take_captured_logical_plan();
+
+  /// \brief Stash a label for the next query to pick up and use as a telemetry
+  /// label for easy identification. Set by the `sirius_set_query_label` SQL
+  /// function; consumed once by the next sirius_interface construction
+  /// (transparent path or gpu_execution).
+  void set_pending_query_label(std::string label);
+
+  /// \brief Take and clear the stashed pending query label.
+  [[nodiscard]] std::optional<std::string> take_pending_query_label();
 
   /// \brief Save the connection's disabled optimizer set before transparent execution mutates it.
   void set_transparent_original_disabled_optimizers(std::set<duckdb::OptimizerType> disabled);
@@ -253,6 +270,10 @@ class SiriusContext : public ClientContextState {
   /// Captured optimized logical plan for transparent GPU execution.
   /// Set by the optimizer extension hook, consumed by OnFinalizePrepare.
   duckdb::unique_ptr<duckdb::LogicalOperator> captured_logical_plan_;
+
+  /// Label set by the `sirius_set_query_label` SQL function, consumed at the
+  /// next sirius_interface construction site. Cleared on take.
+  std::optional<std::string> pending_query_label_{std::nullopt};
 
   /// Snapshot of the connection's disabled optimizer set before the transparent
   /// optimizer hook mutates it.
