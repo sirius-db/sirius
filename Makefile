@@ -21,7 +21,8 @@ MAIN_BUILD_TARGETS ?= duckdb duckdb_local_extension_repo
 	legacy-release \
 	clang-release clang-debug clang-relwithdebinfo \
 	ci-release configure_ci set_duckdb_version \
-	test test_release test_debug test_reldebug test_ci-release clean list-presets
+	test test_release test_debug test_reldebug test_ci-release clean list-presets \
+	s3-up s3-down s3-test s3-cpp-test
 
 PRESETS_LINK := $(DUCKDB_DIR)/CMakePresets.json
 
@@ -116,3 +117,39 @@ clean:
 
 list-presets: $(PRESETS_LINK)
 	cd $(DUCKDB_DIR) && $(CMAKE) --list-presets
+
+# -----------------------------------------------------------------------------
+# S3 integration test scaffolding
+# -----------------------------------------------------------------------------
+# `make s3-up`        starts the pinned MinIO container and populates fixtures
+#                     (binary blobs plus the standard integration parquet
+#                     fixtures under test/cpp/integration/data/parquet).
+# `make s3-down`      tears it down (including the data volume).
+# `make s3-test`      alias for `s3-cpp-test`; kept for forward compatibility
+#                     if SQL-level integration returns via a new target later.
+# `make s3-cpp-test`  runs the Catch2 [s3][integration] tag, which also
+#                     selects tests tagged [s3][parquet][integration].
+#
+# See test/cpp/integration/s3/README.md for details.
+
+S3_DIR := test/cpp/integration/s3
+S3_COMPOSE := $(S3_DIR)/docker-compose.yml
+S3_TEST_BIN ?= build/release/extension/sirius/test/cpp/sirius_unittest
+
+s3-up:
+	docker compose -f $(S3_COMPOSE) up -d
+	$(S3_DIR)/fixtures.sh
+
+s3-down:
+	docker compose -f $(S3_COMPOSE) down -v
+
+s3-test: SHELL := /bin/bash
+s3-test: s3-cpp-test
+
+s3-cpp-test: SHELL := /bin/bash
+s3-cpp-test:
+	@if [ ! -x $(S3_TEST_BIN) ]; then \
+	  echo "s3-cpp-test: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
+	  exit 1; \
+	fi
+	@source $(S3_DIR)/env.sh && export SIRIUS_TEST_S3_STRICT=1 && $(S3_TEST_BIN) "[s3][integration]"
