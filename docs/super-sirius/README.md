@@ -39,6 +39,7 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Data Management](data-management.md) | Data batches, repositories, ports, barrier semantics |
 | [Configuration](configuration.md) | sirius_config, operator_params, SET variables |
 | [Optimizations](optimizations.md) | Performance optimizations with PRs, code paths, configs |
+| [Communication Subsystem](communication-subsystem.md) | Design proposal: unified comm subsystem, operator-owned pattern handles, multi-GPU-within-process, bounce-buffer strategy |
 
 ## Suggested Reading Order
 
