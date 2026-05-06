@@ -93,6 +93,10 @@ void emit_plan_telemetry(
                                 return fmt::format(
                                   "{}({})", op.get().get_name(), op.get().operator_id);
                               })) {
+        if (chain.empty()) {
+          chain = name;
+          continue;
+        }
         chain = fmt::format("{} -> {}", chain, name);
       }
       return chain;

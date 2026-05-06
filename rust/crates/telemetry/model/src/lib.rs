@@ -9,9 +9,6 @@ model! {
         quent_query_engine_model::plan::Plan,
         quent_query_engine_model::operator::Operator,
         quent_query_engine_model::port::Port,
-        quent_stdlib::memory::Memory,
-        quent_stdlib::processor::Processor,
-        quent_stdlib::channel::Channel,
     }
 }
 
@@ -19,4 +16,3 @@ instrumentation!(Sirius);
 
 // Re-export query engine model modules for bridge codegen
 pub use quent_query_engine_model::{engine, operator, plan, port, query, query_group, worker};
-pub use quent_stdlib::{channel, memory, processor};
