@@ -31,7 +31,12 @@
 #include <cucascade/data/io_backend_registry.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
+// sirius IO framework (Phase 19 IO-15 helper preparation)
+#include <io/types.hpp>
+#include <io/uring/uring_ioctx.hpp>
+
 // rmm
+#include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 
 // cudf
@@ -114,6 +119,43 @@ make_test_gpu_io_backends()
   std::unordered_map<int, std::shared_ptr<cucascade::idisk_io_backend>> backends;
   backends.emplace(0, registry.create_default_backend());
   return backends;
+}
+
+/// Construct per-GPU @c sirius_ioctx instances for tests that directly seed
+/// @c parquet_scan_task_global_state with the new IO framework (Phase 19
+/// IO-15). Mirrors the per-GPU init pattern used in
+/// @c SiriusContext::initialize() (src/sirius_context.cpp:283) — each
+/// @c uring_ioctx is constructed under @c rmm::cuda_set_device_raii so its
+/// pinned bounce slots bind to the right CUDA context (P11 lock).
+///
+/// This helper is added ALONGSIDE @c make_test_gpu_io_backends. The cucascade
+/// helper is preserved for the existing call sites until plan 19-05 retires
+/// @c cucascade_datasource and flips the call sites to use this helper.
+///
+/// @param n_gpus  Desired GPU count. Clamped down to actual @c cudaGetDeviceCount
+///                so the helper is safe on 1-GPU hosts (defaults to all visible
+///                devices, capped at @p n_gpus).
+inline std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>>
+make_test_gpu_ioctxs(int n_gpus = 2)
+{
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  if (device_count < 1) { device_count = 1; }
+  int const effective_n = std::min(n_gpus, device_count);
+
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> ioctxs;
+  ioctxs.reserve(effective_n);
+  for (int dev = 0; dev < effective_n; ++dev) {
+    rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{dev}};
+    // Defaults match src/include/io/uring/uring_ioctx.hpp:85-88 (host_ring_depth=16,
+    // ring_entries=64, n_reactors=4, bounce_slot_size=CHUNK_SIZE=1MiB).
+    ioctxs[dev] = std::make_shared<sirius::io::uring_ioctx>(
+      /*host_ring_depth=*/static_cast<unsigned>(16),
+      /*ring_entries=*/static_cast<unsigned>(64),
+      /*n_reactors=*/static_cast<size_t>(4),
+      /*bounce_slot_size=*/sirius::io::CHUNK_SIZE);
+  }
+  return ioctxs;
 }
 
 static std::unique_ptr<sirius::op::sirius_physical_parquet_scan> make_parquet_scan(
