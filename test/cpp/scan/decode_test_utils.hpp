@@ -149,16 +149,14 @@ inline void require_constant_broadcast(decode_env& env,
 ///
 /// `expected_row` may be any callable taking `uint32_t row -> T`.
 template <typename T, typename ExpectedRow>
-inline void verify_decoded_column(
-  rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr,
-  ::sirius::cuda::scan::gpu_column_decode_input const& col,
-  ExpectedRow expected_row)
+inline void verify_decoded_column(rmm::cuda_stream_view stream,
+                                  rmm::device_async_resource_ref mr,
+                                  ::sirius::cuda::scan::gpu_column_decode_input const& col,
+                                  ExpectedRow expected_row)
 {
-  auto t   = ::sirius::cuda::scan::gpu_decode_table({col}, stream, mr);
-  auto out = download<T>(t->get_column(0).view().template data<T>(),
-                         col.total_rows,
-                         stream.value());
+  auto t = ::sirius::cuda::scan::gpu_decode_table({col}, stream, mr);
+  auto out =
+    download<T>(t->get_column(0).view().template data<T>(), col.total_rows, stream.value());
   for (uint32_t i = 0; i < col.total_rows; ++i) {
     T const want = expected_row(i);
     if (out[i] != want) {

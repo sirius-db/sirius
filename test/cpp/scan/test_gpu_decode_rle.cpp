@@ -83,27 +83,27 @@ std::vector<T> decode_one(std::vector<uint8_t> const& bytes,
 
 // Reference expansion against which kernel output is asserted.
 template <typename T>
-std::vector<T> expand_runs(std::vector<T> const& values,
-                           std::vector<uint16_t> const& counts)
+std::vector<T> expand_runs(std::vector<T> const& values, std::vector<uint16_t> const& counts)
 {
   std::vector<T> out;
   for (size_t i = 0; i < values.size(); ++i) {
-    for (uint16_t c = 0; c < counts[i]; ++c) out.push_back(values[i]);
+    for (uint16_t c = 0; c < counts[i]; ++c)
+      out.push_back(values[i]);
   }
   return out;
 }
 
 }  // namespace
 
-TEST_CASE("gpu_decode_table RLE - single-entry run broadcasts one value",
-          "[scan][decode][rle]")
+TEST_CASE("gpu_decode_table RLE - single-entry run broadcasts one value", "[scan][decode][rle]")
 {
   SECTION("int32 100 rows, value 42")
   {
     auto bytes = make_rle_block<int32_t>({42}, {100});
     auto out   = decode_one<int32_t>(bytes, I32, 100);
     REQUIRE(out.size() == 100);
-    for (auto v : out) REQUIRE(v == 42);
+    for (auto v : out)
+      REQUIRE(v == 42);
   }
 
   SECTION("int64 50 rows, large value")
@@ -111,19 +111,20 @@ TEST_CASE("gpu_decode_table RLE - single-entry run broadcasts one value",
     int64_t v  = 5'000'000'000LL;
     auto bytes = make_rle_block<int64_t>({v}, {50});
     auto out   = decode_one<int64_t>(bytes, I64, 50);
-    for (auto x : out) REQUIRE(x == v);
+    for (auto x : out)
+      REQUIRE(x == v);
   }
 
   SECTION("uint8 33 rows (non-warp-aligned)")
   {
     auto bytes = make_rle_block<uint8_t>({200}, {33});
     auto out   = decode_one<uint8_t>(bytes, U8, 33);
-    for (auto v : out) REQUIRE(v == 200);
+    for (auto v : out)
+      REQUIRE(v == 200);
   }
 }
 
-TEST_CASE("gpu_decode_table RLE - multi-entry runs are expanded in order",
-          "[scan][decode][rle]")
+TEST_CASE("gpu_decode_table RLE - multi-entry runs are expanded in order", "[scan][decode][rle]")
 {
   SECTION("int32 four runs of varying length")
   {
@@ -163,8 +164,7 @@ TEST_CASE("gpu_decode_table RLE - cross-CTA boundary (rows > RLE_ROWS_PER_CHUNK)
   REQUIRE(out == expected);
 }
 
-TEST_CASE("gpu_decode_table RLE - near-cap entry count",
-          "[scan][decode][rle]")
+TEST_CASE("gpu_decode_table RLE - near-cap entry count", "[scan][decode][rle]")
 {
   // Near the build kernel's max-entries cap; each run is 1 row.
   constexpr uint32_t N = 4000;
@@ -173,7 +173,8 @@ TEST_CASE("gpu_decode_table RLE - near-cap entry count",
   std::vector<uint16_t> counts(N, 1);
   auto bytes = make_rle_block<int32_t>(values, counts);
   auto out   = decode_one<int32_t>(bytes, I32, N);
-  for (uint32_t i = 0; i < N; ++i) REQUIRE(out[i] == static_cast<int32_t>(i + 1));
+  for (uint32_t i = 0; i < N; ++i)
+    REQUIRE(out[i] == static_cast<int32_t>(i + 1));
 }
 
 TEST_CASE("gpu_decode_table RLE - multi-segment column", "[scan][decode][rle]")
@@ -199,9 +200,12 @@ TEST_CASE("gpu_decode_table RLE - multi-segment column", "[scan][decode][rle]")
 
   auto t   = gpu_decode_table({col}, stream.view(), mr);
   auto out = download<int32_t>(t->get_column(0).view().data<int32_t>(), 100, stream.value());
-  for (uint32_t i = 0; i < 50; ++i) REQUIRE(out[i] == 7);
-  for (uint32_t i = 0; i < 30; ++i) REQUIRE(out[50 + i] == 100);
-  for (uint32_t i = 0; i < 20; ++i) REQUIRE(out[80 + i] == 200);
+  for (uint32_t i = 0; i < 50; ++i)
+    REQUIRE(out[i] == 7);
+  for (uint32_t i = 0; i < 30; ++i)
+    REQUIRE(out[50 + i] == 100);
+  for (uint32_t i = 0; i < 20; ++i)
+    REQUIRE(out[80 + i] == 200);
 }
 
 TEST_CASE("gpu_decode_table RLE - segment with on-disk padding", "[scan][decode][rle]")
@@ -223,8 +227,10 @@ TEST_CASE("gpu_decode_table RLE - segment with on-disk padding", "[scan][decode]
   std::memcpy(bytes.data() + off, counts, counts_bytes);
 
   auto out = decode_one<int32_t>(bytes, I32, 30);
-  for (uint32_t i = 0; i < 10; ++i) REQUIRE(out[i] == 77);
-  for (uint32_t i = 0; i < 20; ++i) REQUIRE(out[10 + i] == 88);
+  for (uint32_t i = 0; i < 10; ++i)
+    REQUIRE(out[i] == 77);
+  for (uint32_t i = 0; i < 20; ++i)
+    REQUIRE(out[10 + i] == 88);
 }
 
 // Defensive guards: pre-fill output with a 0xCC canary, call decode_rle_data
@@ -245,8 +251,7 @@ inline std::vector<int32_t> decode_invalid_with_canary(rmm::cuda_stream& stream,
 }
 }  // namespace
 
-TEST_CASE("gpu_decode_table RLE - many-entry segment scans correctly",
-          "[scan][decode][rle]")
+TEST_CASE("gpu_decode_table RLE - many-entry segment scans correctly", "[scan][decode][rle]")
 {
   // > BUILD_TILE_ENTRIES (4096) but well below RLE_BUILD_MAX_ENTRIES.
   // Exercises the multi-tile build path AND the gmem-cumsum expand path.
@@ -256,7 +261,8 @@ TEST_CASE("gpu_decode_table RLE - many-entry segment scans correctly",
   std::vector<uint16_t> counts(N, 1);
   auto bytes = make_rle_block<int32_t>(values, counts);
   auto out   = decode_one<int32_t>(bytes, I32, N);
-  for (uint32_t i = 0; i < N; ++i) REQUIRE(out[i] == static_cast<int32_t>(i + 1));
+  for (uint32_t i = 0; i < N; ++i)
+    REQUIRE(out[i] == static_cast<int32_t>(i + 1));
 }
 
 TEST_CASE("gpu_decode_table RLE - over-cap entry count zero-fills",
@@ -273,13 +279,13 @@ TEST_CASE("gpu_decode_table RLE - over-cap entry count zero-fills",
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
   rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
-  gpu_codec_run run{CompressionType::COMPRESSION_RLE,
-                    {gpu_segment_desc{static_cast<uint8_t const*>(d_seg.data()),
-                                      static_cast<uint32_t>(d_seg.size()),
-                                      0,
-                                      N}}};
+  gpu_codec_run run{
+    CompressionType::COMPRESSION_RLE,
+    {gpu_segment_desc{
+      static_cast<uint8_t const*>(d_seg.data()), static_cast<uint32_t>(d_seg.size()), 0, N}}};
   auto out = decode_invalid_with_canary(stream, mr, run, N);
-  for (uint32_t i = 0; i < N; ++i) REQUIRE(out[i] == 0);
+  for (uint32_t i = 0; i < N; ++i)
+    REQUIRE(out[i] == 0);
 }
 
 TEST_CASE("gpu_decode_table RLE - rle_count_offset past segment zero-fills",
@@ -301,7 +307,8 @@ TEST_CASE("gpu_decode_table RLE - rle_count_offset past segment zero-fills",
                                       0,
                                       total_rows}}};
   auto out = decode_invalid_with_canary(stream, mr, run, total_rows);
-  for (uint32_t i = 0; i < total_rows; ++i) REQUIRE(out[i] == 0);
+  for (uint32_t i = 0; i < total_rows; ++i)
+    REQUIRE(out[i] == 0);
 }
 
 TEST_CASE("gpu_decode_table RLE - rle_count_offset below header zero-fills",
@@ -323,7 +330,8 @@ TEST_CASE("gpu_decode_table RLE - rle_count_offset below header zero-fills",
                                       0,
                                       total_rows}}};
   auto out = decode_invalid_with_canary(stream, mr, run, total_rows);
-  for (uint32_t i = 0; i < total_rows; ++i) REQUIRE(out[i] == 0);
+  for (uint32_t i = 0; i < total_rows; ++i)
+    REQUIRE(out[i] == 0);
 }
 
 TEST_CASE("gpu_decode_table RLE - count walk underflows row_count zero-fills",
@@ -343,7 +351,8 @@ TEST_CASE("gpu_decode_table RLE - count walk underflows row_count zero-fills",
                                       0,
                                       total_rows}}};
   auto out = decode_invalid_with_canary(stream, mr, run, total_rows);
-  for (uint32_t i = 0; i < total_rows; ++i) REQUIRE(out[i] == 0);
+  for (uint32_t i = 0; i < total_rows; ++i)
+    REQUIRE(out[i] == 0);
 }
 
 TEST_CASE("gpu_decode_table RLE - count walk overflows row_count zero-fills",
@@ -363,7 +372,8 @@ TEST_CASE("gpu_decode_table RLE - count walk overflows row_count zero-fills",
                                       0,
                                       total_rows}}};
   auto out = decode_invalid_with_canary(stream, mr, run, total_rows);
-  for (uint32_t i = 0; i < total_rows; ++i) REQUIRE(out[i] == 0);
+  for (uint32_t i = 0; i < total_rows; ++i)
+    REQUIRE(out[i] == 0);
 }
 
 TEST_CASE("gpu_decode_table RLE - zero count inside walk zero-fills",
@@ -383,7 +393,8 @@ TEST_CASE("gpu_decode_table RLE - zero count inside walk zero-fills",
                                       0,
                                       total_rows}}};
   auto out = decode_invalid_with_canary(stream, mr, run, total_rows);
-  for (uint32_t i = 0; i < total_rows; ++i) REQUIRE(out[i] == 0);
+  for (uint32_t i = 0; i < total_rows; ++i)
+    REQUIRE(out[i] == 0);
 }
 
 TEST_CASE("gpu_decode_table RLE - segment too small for header zero-fills",
@@ -404,11 +415,11 @@ TEST_CASE("gpu_decode_table RLE - segment too small for header zero-fills",
                                       0,
                                       total_rows}}};
   auto out = decode_invalid_with_canary(stream, mr, run, total_rows);
-  for (uint32_t i = 0; i < total_rows; ++i) REQUIRE(out[i] == 0);
+  for (uint32_t i = 0; i < total_rows; ++i)
+    REQUIRE(out[i] == 0);
 }
 
-TEST_CASE("gpu_decode_table RLE - unsupported type_size throws",
-          "[scan][decode][rle][defensive]")
+TEST_CASE("gpu_decode_table RLE - unsupported type_size throws", "[scan][decode][rle][defensive]")
 {
   // 16-byte types are out of scope for this dispatcher.
   rmm::cuda_stream stream;
@@ -468,37 +479,35 @@ auto build_uniform_runs_column(uint32_t n_runs,
 
 }  // namespace
 
-TEST_CASE("gpu_decode_table RLE bench-scale - long_runs verify",
-          "[scan][decode][rle][verify]")
+TEST_CASE("gpu_decode_table RLE bench-scale - long_runs verify", "[scan][decode][rle][verify]")
 {
   // Mirrors `bench RLE int64 long_runs`: 1092 segments × 16 entries × 7680.
   constexpr uint32_t N_RUNS = 16, N_SEGS = 1092;
-  constexpr uint16_t RUN_LEN = 7680;
+  constexpr uint16_t RUN_LEN  = 7680;
   constexpr uint32_t SEG_ROWS = N_RUNS * RUN_LEN;
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
   std::vector<rmm::device_buffer> bufs;
   auto col = build_uniform_runs_column<int64_t>(N_RUNS, RUN_LEN, N_SEGS, I64, stream, bufs);
 
-  verify_decoded_column<int64_t>(
-    stream.view(), mr, col,
-    [](uint32_t r) -> int64_t { return static_cast<int64_t>((r % SEG_ROWS) / RUN_LEN); });
+  verify_decoded_column<int64_t>(stream.view(), mr, col, [](uint32_t r) -> int64_t {
+    return static_cast<int64_t>((r % SEG_ROWS) / RUN_LEN);
+  });
 }
 
-TEST_CASE("gpu_decode_table RLE bench-scale - medium_runs verify",
-          "[scan][decode][rle][verify]")
+TEST_CASE("gpu_decode_table RLE bench-scale - medium_runs verify", "[scan][decode][rle][verify]")
 {
   constexpr uint32_t N_RUNS = 1024, N_SEGS = 1092;
-  constexpr uint16_t RUN_LEN = 120;
+  constexpr uint16_t RUN_LEN  = 120;
   constexpr uint32_t SEG_ROWS = N_RUNS * RUN_LEN;
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
   std::vector<rmm::device_buffer> bufs;
   auto col = build_uniform_runs_column<int64_t>(N_RUNS, RUN_LEN, N_SEGS, I64, stream, bufs);
 
-  verify_decoded_column<int64_t>(
-    stream.view(), mr, col,
-    [](uint32_t r) -> int64_t { return static_cast<int64_t>((r % SEG_ROWS) / RUN_LEN); });
+  verify_decoded_column<int64_t>(stream.view(), mr, col, [](uint32_t r) -> int64_t {
+    return static_cast<int64_t>((r % SEG_ROWS) / RUN_LEN);
+  });
 }
 
 TEST_CASE("gpu_decode_table RLE bench-scale - short_runs verify (gmem path)",
@@ -507,20 +516,19 @@ TEST_CASE("gpu_decode_table RLE bench-scale - short_runs verify (gmem path)",
   // Bumped to 5000 entries so it exceeds RLE_SMEM_MAX_ENTRIES (4096) and
   // exercises the gmem-cumsum expand fallback at scale.
   constexpr uint32_t N_RUNS = 5000, N_SEGS = 200;
-  constexpr uint16_t RUN_LEN = 24;
+  constexpr uint16_t RUN_LEN  = 24;
   constexpr uint32_t SEG_ROWS = N_RUNS * RUN_LEN;
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
   std::vector<rmm::device_buffer> bufs;
   auto col = build_uniform_runs_column<int32_t>(N_RUNS, RUN_LEN, N_SEGS, I32, stream, bufs);
 
-  verify_decoded_column<int32_t>(
-    stream.view(), mr, col,
-    [](uint32_t r) -> int32_t { return static_cast<int32_t>((r % SEG_ROWS) / RUN_LEN); });
+  verify_decoded_column<int32_t>(stream.view(), mr, col, [](uint32_t r) -> int32_t {
+    return static_cast<int32_t>((r % SEG_ROWS) / RUN_LEN);
+  });
 }
 
-TEST_CASE("gpu_decode_table RLE bench-scale - pareto_runs verify",
-          "[scan][decode][rle][verify]")
+TEST_CASE("gpu_decode_table RLE bench-scale - pareto_runs verify", "[scan][decode][rle][verify]")
 {
   using ::sirius::test::decode::rle::make_pareto_runs;
   rmm::cuda_stream stream;
@@ -548,13 +556,13 @@ TEST_CASE("gpu_decode_table RLE bench-scale - pareto_runs verify",
     uint32_t emitted   = 0;
     int64_t next_value = 0;
     while (emitted < SEG_ROWS) {
-      lcg            = lcg * 1664525u + 1013904223u;
-      double const u = static_cast<double>(lcg) / static_cast<double>(0xFFFFFFFFu);
-      double const x = 400.0 / std::pow(1.0 - 0.999 * u, 1.0 / 1.5);
-      uint16_t run_len =
-        static_cast<uint16_t>(std::min<double>(2048.0, std::max(1.0, x)));
+      lcg              = lcg * 1664525u + 1013904223u;
+      double const u   = static_cast<double>(lcg) / static_cast<double>(0xFFFFFFFFu);
+      double const x   = 400.0 / std::pow(1.0 - 0.999 * u, 1.0 / 1.5);
+      uint16_t run_len = static_cast<uint16_t>(std::min<double>(2048.0, std::max(1.0, x)));
       if (emitted + run_len > SEG_ROWS) run_len = static_cast<uint16_t>(SEG_ROWS - emitted);
-      for (uint16_t k = 0; k < run_len; ++k) expected.push_back(next_value);
+      for (uint16_t k = 0; k < run_len; ++k)
+        expected.push_back(next_value);
       ++next_value;
       emitted += run_len;
     }

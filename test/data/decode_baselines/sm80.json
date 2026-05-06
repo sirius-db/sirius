@@ -1,0 +1,73 @@
+{
+  "_meta": {
+    "arch": "sm_80",
+    "captured_by": "test/cpp/scan/bench_decode_codecs.cpp",
+    "captured_with": "sirius_unittest \"[!benchmark][scan][decode]\"",
+    "cuda_runtime": "12.9",
+    "device": "A100-SXM4-40GB",
+    "device_memory_gib": 40,
+    "purpose": "Per-arch microbench baseline. Codec PRs gate against these numbers (>5% throughput regression blocks merge). Update by re-running the bench."
+  },
+  "codecs": {
+    "constant_int64_32MiB": {
+      "_note": "Vectorised int4 store path; effectively L2/HBM write-bandwidth bound.",
+      "rows": 4194304,
+      "type": "int64",
+      "write_throughput_gib_s": 1144.1
+    },
+    "rle_long_runs_int64": {
+      "_note": "16 entries \u00d7 7680 rows per segment, 1092 segments. Cumsum fits in shmem; warp-vote broadcast fast path fires. Run-to-run variance ~15%.",
+      "entries_per_seg": 16,
+      "rows": 134184960,
+      "type": "int64",
+      "write_throughput_gib_s": 440.0
+    },
+    "rle_medium_runs_int64": {
+      "_note": "1024 entries \u00d7 120 rows per segment, 1092 segments. Cumsum (4 KiB) fits in shmem.",
+      "entries_per_seg": 1024,
+      "rows": 134184960,
+      "type": "int64",
+      "write_throughput_gib_s": 440.0
+    },
+    "rle_pareto_runs_int64": {
+      "_note": "Pareto-distributed run lengths (x_min=400 \u2192 ~100 entries/seg), 1092 segments. Realistic shape for sorted low-cardinality TPC-H columns.",
+      "entries_per_seg": "~100 (distribution-dependent)",
+      "rows": 134184960,
+      "type": "int64",
+      "write_throughput_gib_s": 450.0
+    },
+    "rle_short_runs_int32_gmem": {
+      "_note": "4096 entries \u00d7 30 rows per segment. ec at the shmem cap; chunks where ec > RLE_SMEM_MAX_ENTRIES use the gmem-cumsum path.",
+      "entries_per_seg": 4096,
+      "rows": 67092480,
+      "type": "int32",
+      "write_throughput_gib_s": 245.0
+    },
+    "uncompressed_multi_1024x32KiB": {
+      "read_plus_write_gib_s": 1000.0,
+      "rows": 4194304,
+      "type": "int64",
+      "write_throughput_gib_s": 500.0
+    },
+    "uncompressed_multi_1024x32KiB_raw_memcpy_reference": {
+      "_note": "Reference only \u2014 dispatcher bypassed, per-segment cudaMemcpyAsync. Demonstrates why the batched kernel exists.",
+      "read_plus_write_gib_s": 19.4,
+      "rows": 4194304,
+      "type": "int64",
+      "write_throughput_gib_s": 9.7
+    },
+    "uncompressed_multi_16x2MiB": {
+      "read_plus_write_gib_s": 1028.1,
+      "rows": 4194304,
+      "type": "int64",
+      "write_throughput_gib_s": 514.0
+    }
+  },
+  "tunables": {
+    "COPY_CHUNK_BYTES": 65536,
+    "RLE_BUILD_MAX_ENTRIES": 90112,
+    "RLE_ROWS_PER_CHUNK": 2048,
+    "RLE_SMEM_MAX_ENTRIES": 4096,
+    "_note": "RLE_SMEM_MAX_ENTRIES caps per-CTA shmem cumsum cache at 16 KiB; chunks above this fall back to gmem-cumsum reads (L2 caches across CTAs of the same segment). RLE_BUILD_MAX_ENTRIES bounds the device-side cumsum allocation per segment; covers DuckDB's worst-case ec (~87K for T=int8 segments)."
+  }
+}

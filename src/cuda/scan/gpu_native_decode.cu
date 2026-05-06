@@ -31,9 +31,8 @@
 // every synchronous CUDA API call is individually wrapped in `RMM_CUDA_TRY`.
 //===----------------------------------------------------------------------===//
 
-#include "cuda/scan/gpu_native_decode.cuh"
-
 #include "cuda/scan/gpu_decode_rle.cuh"
+#include "cuda/scan/gpu_native_decode.cuh"
 
 #include <cudf/column/column.hpp>
 #include <cudf/null_mask.hpp>

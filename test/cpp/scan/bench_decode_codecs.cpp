@@ -235,16 +235,15 @@ constexpr uint32_t RLE_BENCH_SEG_ROWS = 122880;  // DuckDB row-group max
 
 }  // namespace
 
-TEST_CASE("bench RLE int64 long_runs (16 entries/seg) 122M rows",
-          "[!benchmark][scan][decode]")
+TEST_CASE("bench RLE int64 long_runs (16 entries/seg) 122M rows", "[!benchmark][scan][decode]")
 {
   using ::sirius::test::decode::rle::make_uniform_runs;
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
 
   // 16 runs of 7680 rows each — long-run / value-broadcast pattern.
-  constexpr uint32_t N_RUNS  = 16;
-  constexpr uint16_t RUN_LEN = static_cast<uint16_t>(RLE_BENCH_SEG_ROWS / N_RUNS);
+  constexpr uint32_t N_RUNS   = 16;
+  constexpr uint16_t RUN_LEN  = static_cast<uint16_t>(RLE_BENCH_SEG_ROWS / N_RUNS);
   constexpr uint32_t SEG_ROWS = N_RUNS * RUN_LEN;
   constexpr uint32_t N_SEGS   = (128u << 20) / SEG_ROWS;
   auto seg_bytes              = make_uniform_runs<int64_t>(N_RUNS, RUN_LEN);
@@ -270,16 +269,15 @@ TEST_CASE("bench RLE int64 long_runs (16 entries/seg) 122M rows",
               bytes_w / sec / GIB);
 }
 
-TEST_CASE("bench RLE int64 medium_runs (1024 entries/seg) 122M rows",
-          "[!benchmark][scan][decode]")
+TEST_CASE("bench RLE int64 medium_runs (1024 entries/seg) 122M rows", "[!benchmark][scan][decode]")
 {
   using ::sirius::test::decode::rle::make_uniform_runs;
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
 
   // 1024 runs of 120 rows — cumsum (4 KiB) fits in shmem.
-  constexpr uint32_t N_RUNS  = 1024;
-  constexpr uint16_t RUN_LEN = static_cast<uint16_t>(RLE_BENCH_SEG_ROWS / N_RUNS);
+  constexpr uint32_t N_RUNS   = 1024;
+  constexpr uint16_t RUN_LEN  = static_cast<uint16_t>(RLE_BENCH_SEG_ROWS / N_RUNS);
   constexpr uint32_t SEG_ROWS = N_RUNS * RUN_LEN;
   constexpr uint32_t N_SEGS   = (128u << 20) / SEG_ROWS;
   auto seg_bytes              = make_uniform_runs<int64_t>(N_RUNS, RUN_LEN);
@@ -325,8 +323,7 @@ TEST_CASE("bench RLE int64 pareto_runs (skewed distribution) ~120M rows",
   bufs.reserve(N_SEGS);
   segs.reserve(N_SEGS);
   for (uint32_t i = 0; i < N_SEGS; ++i) {
-    auto seg_bytes = make_pareto_runs<int64_t>(
-      SEG_ROWS, /*seed=*/i + 1, /*x_min=*/400.0);
+    auto seg_bytes = make_pareto_runs<int64_t>(SEG_ROWS, /*seed=*/i + 1, /*x_min=*/400.0);
     bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream.view());
     segs.push_back(segment(bufs.back(), i * SEG_ROWS, SEG_ROWS));
   }
@@ -343,16 +340,15 @@ TEST_CASE("bench RLE int64 pareto_runs (skewed distribution) ~120M rows",
               bytes_w / sec / GIB);
 }
 
-TEST_CASE("bench RLE int32 short_runs (4096 entries/seg) 65M rows",
-          "[!benchmark][scan][decode]")
+TEST_CASE("bench RLE int32 short_runs (4096 entries/seg) 65M rows", "[!benchmark][scan][decode]")
 {
   using ::sirius::test::decode::rle::make_uniform_runs;
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
 
   // At the build kernel's max-entry cap; each run is 30 rows.
-  constexpr uint32_t N_RUNS  = 4096;
-  constexpr uint16_t RUN_LEN = 30;  // 4096*30 = 122880
+  constexpr uint32_t N_RUNS   = 4096;
+  constexpr uint16_t RUN_LEN  = 30;  // 4096*30 = 122880
   constexpr uint32_t SEG_ROWS = N_RUNS * RUN_LEN;
   constexpr uint32_t N_SEGS   = (64u << 20) / SEG_ROWS;
   auto seg_bytes              = make_uniform_runs<int32_t>(N_RUNS, RUN_LEN);

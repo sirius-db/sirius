@@ -55,25 +55,33 @@ namespace sirius::cuda::scan {
 
 namespace {
 
-constexpr uint32_t BLOCK_DIM             = 256;
-constexpr uint32_t RLE_ROWS_PER_CHUNK    = 2048;
-constexpr uint32_t VPT                   = RLE_ROWS_PER_CHUNK / BLOCK_DIM;
+// 256-thread CTA matches BITPACKING for cross-codec consistency. 2048-row
+// chunk gives VPT=8, enough to amortise per-CTA setup without bloating
+// per-thread register state.
+constexpr uint32_t BLOCK_DIM          = 256;
+constexpr uint32_t RLE_ROWS_PER_CHUNK = 2048;
+constexpr uint32_t VPT                = RLE_ROWS_PER_CHUNK / BLOCK_DIM;
 static_assert(BLOCK_DIM * VPT == RLE_ROWS_PER_CHUNK);
 
 // Build kernel processes counts in tiles of BUILD_TILE_ENTRIES; running
 // total propagates across tiles, so total entry count is unbounded.
-// DuckDB's worst-case ec is ~87K (T=int8 with full 256 KiB segment), but
-// this design imposes no static cap.
-constexpr uint32_t VPT_BUILD             = 16;
-constexpr uint32_t BUILD_TILE_ENTRIES    = BLOCK_DIM * VPT_BUILD;        // 4096
-constexpr uint32_t RLE_SMEM_MAX_ENTRIES  = BUILD_TILE_ENTRIES;
-constexpr uint32_t RLE_SMEM_BYTES        = RLE_SMEM_MAX_ENTRIES * sizeof(uint32_t);
+// VPT_BUILD=16 keeps per-thread register state at ~64 B (16 × uint32 cumsum
+// + 16 × uint16 counts). The shmem cumsum cache in the expand kernel is
+// sized to one tile so chunks with ec ≤ tile_size get the shmem fast path;
+// larger ec falls through to a gmem-resident cumsum read.
+constexpr uint32_t VPT_BUILD            = 16;
+constexpr uint32_t BUILD_TILE_ENTRIES   = BLOCK_DIM * VPT_BUILD;  // 4096
+constexpr uint32_t RLE_SMEM_MAX_ENTRIES = BUILD_TILE_ENTRIES;
+constexpr uint32_t RLE_SMEM_BYTES       = RLE_SMEM_MAX_ENTRIES * sizeof(uint32_t);
 
-// Per-segment cumsum buffer allocation cap. DuckDB's max segment is 256 KiB;
-// per-segment max ec for the narrowest type (T=int8) is 87376. Round up to
-// 90112 (= 22 tiles) so allocation math is exact.
-constexpr uint32_t RLE_BUILD_MAX_ENTRIES = 22u * BUILD_TILE_ENTRIES;     // 90112
+// DuckDB's worst-case ec for an RLE segment is bounded by
+// (block_size - header) / (sizeof(T) + sizeof(rle_count_t)). For block_size
+// = 256 KiB and the narrowest type (T=int8 with rle_count_t=uint16), that's
+// (262144-8)/3 = 87376 entries. Round up to a tile multiple (22 × 4096 =
+// 90112) so the per-segment cumsum slice is tile-aligned.
+constexpr uint32_t RLE_BUILD_MAX_ENTRIES = 22u * BUILD_TILE_ENTRIES;  // 90112
 static_assert(RLE_BUILD_MAX_ENTRIES % BUILD_TILE_ENTRIES == 0);
+static_assert(RLE_BUILD_MAX_ENTRIES >= 87376, "must cover DuckDB's max ec for T=int8 segments");
 
 constexpr uint32_t MALFORMED_FLAG = 0u;
 
@@ -144,11 +152,10 @@ __global__ void kernel_build_cumsum(rle_build_desc const* __restrict__ descs,
     return;
   }
 
-  uint32_t const row_count   = desc.row_count;
-  uint16_t const* counts     = reinterpret_cast<uint16_t const*>(desc.d_bytes + s_offset);
-  uint32_t const capacity    = s_capacity < RLE_BUILD_MAX_ENTRIES
-                                 ? s_capacity : RLE_BUILD_MAX_ENTRIES;
-  uint32_t* cumsum_out       = d_cumsums + size_t{sid} * cumsum_stride_entries;
+  uint32_t const row_count = desc.row_count;
+  uint16_t const* counts   = reinterpret_cast<uint16_t const*>(desc.d_bytes + s_offset);
+  uint32_t const capacity = s_capacity < RLE_BUILD_MAX_ENTRIES ? s_capacity : RLE_BUILD_MAX_ENTRIES;
+  uint32_t* cumsum_out    = d_cumsums + size_t{sid} * cumsum_stride_entries;
 
   // Iterate tiles of BUILD_TILE_ENTRIES counts; running sum propagates
   // through s_running_total. Stops early once we hit row_count.
@@ -218,25 +225,13 @@ __global__ void kernel_build_cumsum(rle_build_desc const* __restrict__ descs,
 // Expand kernel.
 //===----------------------------------------------------------------------===//
 
+/// Upper bound: first index in [lo, hi) where `cumsum[idx] > key`. Pass
+/// (0, ec) for a full search, or a narrower band when the chunk's row
+/// range only covers a slice of the segment.
 __device__ __forceinline__ uint32_t rle_upper_bound(uint32_t const* __restrict__ cumsum,
-                                                    uint32_t n,
+                                                    uint32_t lo,
+                                                    uint32_t hi,
                                                     uint32_t key)
-{
-  uint32_t lo = 0;
-  uint32_t hi = n;
-  while (lo < hi) {
-    uint32_t mid = lo + ((hi - lo) >> 1);
-    if (cumsum[mid] <= key) {
-      lo = mid + 1;
-    } else {
-      hi = mid;
-    }
-  }
-  return lo;
-}
-
-__device__ __forceinline__ uint32_t rle_upper_bound_band(
-  uint32_t const* __restrict__ cumsum, uint32_t lo, uint32_t hi, uint32_t key)
 {
   while (lo < hi) {
     uint32_t mid = lo + ((hi - lo) >> 1);
@@ -258,7 +253,7 @@ __global__ void kernel_decode_rle(rle_chunk_desc const* __restrict__ descs,
   uint32_t const cid = blockIdx.x;
   if (cid >= num_chunks) return;
 
-  auto const desc = descs[cid];
+  auto const desc   = descs[cid];
   uint32_t const rc = desc.chunk_rows;
   T* out_chunk      = d_output + desc.base_global_row + desc.local_row_start;
 
@@ -294,8 +289,8 @@ __global__ void kernel_decode_rle(rle_chunk_desc const* __restrict__ descs,
   __shared__ uint32_t s_band_hi;
   if (threadIdx.x == 0) {
     uint32_t const last_row = lr_start + rc - 1u;
-    uint32_t const lo       = rle_upper_bound(cumsum, ec, lr_start);
-    uint32_t hi             = rle_upper_bound(cumsum, ec, last_row);
+    uint32_t const lo       = rle_upper_bound(cumsum, 0, ec, lr_start);
+    uint32_t hi             = rle_upper_bound(cumsum, 0, ec, last_row);
     if (hi >= ec) hi = ec - 1;
     s_band_lo = lo;
     s_band_hi = hi + 1u;
@@ -304,9 +299,8 @@ __global__ void kernel_decode_rle(rle_chunk_desc const* __restrict__ descs,
   uint32_t const band_lo = s_band_lo;
   uint32_t const band_hi = s_band_hi;
 
-  bool const long_runs_heuristic =
-    rc / 32u >= ec || (rc >= ec && (rc / ec) >= 32u);
-  uint32_t const lane = threadIdx.x & 31u;
+  bool const long_runs_heuristic = rc / 32u >= ec || (rc >= ec && (rc / ec) >= 32u);
+  uint32_t const lane            = threadIdx.x & 31u;
 
   if (long_runs_heuristic) {
 #pragma unroll
@@ -317,7 +311,7 @@ __global__ void kernel_decode_rle(rle_chunk_desc const* __restrict__ descs,
 
       uint32_t entry_warp = 0;
       if (lane == 0) {
-        entry_warp = rle_upper_bound_band(cumsum, band_lo, band_hi, warp_first);
+        entry_warp = rle_upper_bound(cumsum, band_lo, band_hi, warp_first);
         if (entry_warp >= ec) entry_warp = ec - 1;
       }
       entry_warp = __shfl_sync(0xFFFFFFFFu, entry_warp, 0);
@@ -332,7 +326,7 @@ __global__ void kernel_decode_rle(rle_chunk_desc const* __restrict__ descs,
         __stwt(out_chunk + i, __ldg(values + entry_warp));
       } else {
         uint32_t const local_row = lr_start + i;
-        uint32_t entry = rle_upper_bound_band(cumsum, band_lo, band_hi, local_row);
+        uint32_t entry           = rle_upper_bound(cumsum, band_lo, band_hi, local_row);
         if (entry >= ec) entry = ec - 1;
         __stwt(out_chunk + i, __ldg(values + entry));
       }
@@ -345,7 +339,7 @@ __global__ void kernel_decode_rle(rle_chunk_desc const* __restrict__ descs,
     uint32_t const i = v * blockDim.x + threadIdx.x;
     if (i >= rc) break;
     uint32_t const local_row = lr_start + i;
-    uint32_t entry           = rle_upper_bound_band(cumsum, band_lo, band_hi, local_row);
+    uint32_t entry           = rle_upper_bound(cumsum, band_lo, band_hi, local_row);
     if (entry >= ec) entry = ec - 1;
     __stwt(out_chunk + i, __ldg(values + entry));
   }
@@ -366,9 +360,8 @@ void decode_rle_data(gpu_codec_run const& run,
                      rmm::device_async_resource_ref mr)
 {
   if (type_size != 1 && type_size != 2 && type_size != 4 && type_size != 8) {
-    throw std::runtime_error(
-      "gpu_decode_table: viability invariant violated — RLE type_size " +
-      std::to_string(type_size));
+    throw std::runtime_error("gpu_decode_table: viability invariant violated — RLE type_size " +
+                             std::to_string(type_size));
   }
 
   std::vector<gpu_segment_desc const*> live;
@@ -419,14 +412,9 @@ void decode_rle_data(gpu_codec_run const& run,
 
     for (uint32_t c = 0; c < num_cnks; ++c) {
       uint32_t const local_start = c * RLE_ROWS_PER_CHUNK;
-      uint32_t const this_rows   = (c + 1u < num_cnks) ? RLE_ROWS_PER_CHUNK
-                                                       : rc - local_start;
-      h_descs.push_back({d_values,
-                         d_cumsum,
-                         seg.row_offset,
-                         local_start,
-                         this_rows,
-                         static_cast<uint32_t>(i)});
+      uint32_t const this_rows   = (c + 1u < num_cnks) ? RLE_ROWS_PER_CHUNK : rc - local_start;
+      h_descs.push_back(
+        {d_values, d_cumsum, seg.row_offset, local_start, this_rows, static_cast<uint32_t>(i)});
     }
   }
   if (h_descs.empty()) return;
@@ -441,29 +429,23 @@ void decode_rle_data(gpu_codec_run const& run,
   uint32_t const grid = static_cast<uint32_t>(h_descs.size());
   switch (type_size) {
     case 1:
-      kernel_decode_rle<uint8_t>
-        <<<grid, BLOCK_DIM, RLE_SMEM_BYTES, stream.value()>>>(
-          d_descs.data(), d_entry_counts.data(), d_output, grid);
+      kernel_decode_rle<uint8_t><<<grid, BLOCK_DIM, RLE_SMEM_BYTES, stream.value()>>>(
+        d_descs.data(), d_entry_counts.data(), d_output, grid);
       break;
     case 2:
-      kernel_decode_rle<uint16_t>
-        <<<grid, BLOCK_DIM, RLE_SMEM_BYTES, stream.value()>>>(
-          d_descs.data(), d_entry_counts.data(),
-          reinterpret_cast<uint16_t*>(d_output), grid);
+      kernel_decode_rle<uint16_t><<<grid, BLOCK_DIM, RLE_SMEM_BYTES, stream.value()>>>(
+        d_descs.data(), d_entry_counts.data(), reinterpret_cast<uint16_t*>(d_output), grid);
       break;
     case 4:
-      kernel_decode_rle<uint32_t>
-        <<<grid, BLOCK_DIM, RLE_SMEM_BYTES, stream.value()>>>(
-          d_descs.data(), d_entry_counts.data(),
-          reinterpret_cast<uint32_t*>(d_output), grid);
+      kernel_decode_rle<uint32_t><<<grid, BLOCK_DIM, RLE_SMEM_BYTES, stream.value()>>>(
+        d_descs.data(), d_entry_counts.data(), reinterpret_cast<uint32_t*>(d_output), grid);
       break;
     case 8:
-      kernel_decode_rle<uint64_t>
-        <<<grid, BLOCK_DIM, RLE_SMEM_BYTES, stream.value()>>>(
-          d_descs.data(), d_entry_counts.data(),
-          reinterpret_cast<uint64_t*>(d_output), grid);
+      kernel_decode_rle<uint64_t><<<grid, BLOCK_DIM, RLE_SMEM_BYTES, stream.value()>>>(
+        d_descs.data(), d_entry_counts.data(), reinterpret_cast<uint64_t*>(d_output), grid);
       break;
     default:
+      // Unreachable — guarded by the type_size check at function entry.
       break;
   }
 }

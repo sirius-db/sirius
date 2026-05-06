@@ -45,21 +45,18 @@ inline std::vector<uint8_t> make_rle_block(std::vector<T> const& values,
                                            std::vector<uint16_t> const& counts)
 {
   if (values.size() != counts.size()) {
-    throw std::runtime_error(
-      "make_rle_block: values and counts size mismatch (caller error)");
+    throw std::runtime_error("make_rle_block: values and counts size mismatch (caller error)");
   }
-  size_t entry_count          = values.size();
-  size_t values_bytes         = entry_count * sizeof(T);
-  size_t counts_bytes         = entry_count * sizeof(uint16_t);
-  uint64_t minimal_offset     = ::sirius::cuda::scan::RLE_HEADER_SIZE + values_bytes;
-  uint64_t rle_count_offset   = (minimal_offset + 7u) & ~uint64_t{7u};
+  size_t entry_count        = values.size();
+  size_t values_bytes       = entry_count * sizeof(T);
+  size_t counts_bytes       = entry_count * sizeof(uint16_t);
+  uint64_t minimal_offset   = ::sirius::cuda::scan::RLE_HEADER_SIZE + values_bytes;
+  uint64_t rle_count_offset = (minimal_offset + 7u) & ~uint64_t{7u};
 
   std::vector<uint8_t> block(rle_count_offset + counts_bytes, 0);
   std::memcpy(block.data(), &rle_count_offset, sizeof(rle_count_offset));
   if (values_bytes > 0) {
-    std::memcpy(block.data() + ::sirius::cuda::scan::RLE_HEADER_SIZE,
-                values.data(),
-                values_bytes);
+    std::memcpy(block.data() + ::sirius::cuda::scan::RLE_HEADER_SIZE, values.data(), values_bytes);
   }
   if (counts_bytes > 0) {
     std::memcpy(block.data() + rle_count_offset, counts.data(), counts_bytes);
@@ -73,7 +70,8 @@ template <typename T>
 inline std::vector<uint8_t> make_uniform_runs(uint32_t n_runs, uint16_t run_len)
 {
   std::vector<T> values(n_runs);
-  for (uint32_t i = 0; i < n_runs; ++i) values[i] = static_cast<T>(i);
+  for (uint32_t i = 0; i < n_runs; ++i)
+    values[i] = static_cast<T>(i);
   std::vector<uint16_t> counts(n_runs, run_len);
   return make_rle_block<T>(values, counts);
 }
@@ -85,8 +83,8 @@ inline std::vector<uint8_t> make_uniform_runs(uint32_t n_runs, uint16_t run_len)
 template <typename T>
 inline std::vector<uint8_t> make_pareto_runs(uint32_t total_rows,
                                              uint32_t seed,
-                                             double x_min     = 50.0,
-                                             uint16_t cap_max = 2048,
+                                             double x_min          = 50.0,
+                                             uint16_t cap_max      = 2048,
                                              uint32_t* out_entries = nullptr)
 {
   std::vector<T> values;
@@ -95,11 +93,10 @@ inline std::vector<uint8_t> make_pareto_runs(uint32_t total_rows,
   uint32_t emitted = 0;
   T next_value     = T(0);
   while (emitted < total_rows) {
-    lcg            = lcg * 1664525u + 1013904223u;
-    double const u = static_cast<double>(lcg) / static_cast<double>(0xFFFFFFFFu);
-    double const x = x_min / std::pow(1.0 - 0.999 * u, 1.0 / 1.5);
-    uint16_t run_len =
-      static_cast<uint16_t>(std::min<double>(cap_max, std::max(1.0, x)));
+    lcg              = lcg * 1664525u + 1013904223u;
+    double const u   = static_cast<double>(lcg) / static_cast<double>(0xFFFFFFFFu);
+    double const x   = x_min / std::pow(1.0 - 0.999 * u, 1.0 / 1.5);
+    uint16_t run_len = static_cast<uint16_t>(std::min<double>(cap_max, std::max(1.0, x)));
     if (emitted + run_len > total_rows) run_len = static_cast<uint16_t>(total_rows - emitted);
     values.push_back(next_value++);
     counts.push_back(run_len);
