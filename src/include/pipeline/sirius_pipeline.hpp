@@ -21,7 +21,9 @@
 #include "duckdb/parallel/pipeline.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "op/sirius_physical_operator_type.hpp"
 #include "pipeline/pipeline_build_context.hpp"
+#include "telemetry-bridge/gen/uuid.rs.h"
 
 #include <nvtx3/nvtx3.hpp>
 
@@ -165,6 +167,8 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   //! Set the task_creator pointer so this pipeline can schedule downstream consumers on finish.
   void set_task_creator(sirius::creator::task_creator* tc);
 
+  [[nodiscard]] uuid::UUID pipeline_uuid() const { return _pipeline_uuid; }
+
  private:
   //! Whether or not the pipeline has been readied
   bool ready;
@@ -214,6 +218,8 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   //! NVTX process-wide range tracking the pipeline's active lifetime
   std::atomic<bool> _nvtx_range_started{false};
   nvtxRangeId_t _nvtx_pipeline_range_id{0};
+
+  uuid::UUID _pipeline_uuid{uuid::now_v7()};
 };
 
 }  // namespace pipeline

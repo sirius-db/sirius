@@ -74,8 +74,9 @@ const std::string PINNED_MEMORY_PARAM_KEY = "pinned_memory_size";
 bool SiriusExtension::buffer_is_initialized = false;
 #endif
 
-namespace {
+constexpr std::string QUERY_LABEL_PARAM_KEY = "query_label";
 
+namespace {
 unique_ptr<QueryResult> run_internal_cpu_fallback_query(ClientContext& context,
                                                         Connection& connection,
                                                         const string& query)
@@ -419,12 +420,27 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   result->conn             = make_uniq<Connection>(*context.db);
   result->query            = input.inputs[0].ToString();
   result->enable_optimizer = true;
-  result->sirius_iface     = make_uniq<::sirius::sirius_interface>(context);
+
+  std::optional<std::string> query_label = std::nullopt;
+  // take any query_label that was set using sirius_set_query_label SQL call.
+  if (auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+      sirius_ctx) {
+    query_label = sirius_ctx->take_pending_query_label();
+  }
+  // however, give precedence to a query_label that was set inline in with
+  // gpu_execution SQL call.
+  if (auto it = input.named_parameters.find(QUERY_LABEL_PARAM_KEY);
+      it != input.named_parameters.end() && not it->second.IsNull()) {
+    query_label = it->second.ToString();
+  }
+
+  result->sirius_iface = make_uniq<::sirius::sirius_interface>(context, std::move(query_label));
+
   if (input.inputs[0].IsNull()) {
     throw BinderException("gpu_execution cannot be called with a NULL parameter");
   }
 
-  // Parse the query just to get the result type information and to create preparedstatmement data
+  // Parse the query just to get the result type information and to create PreparedStatementData
   Parser parser(context.GetParserOptions());
   parser.ParseQuery(result->query);
   Planner planner(context);
@@ -882,6 +898,43 @@ static void ProfilerStopFunction(ClientContext& context,
   data.finished = true;
 }
 
+struct SiriusSetQueryLabelData : public TableFunctionData {
+  std::string label;
+  bool finished = false;
+};
+
+static unique_ptr<FunctionData> SiriusSetQueryLabelBind(ClientContext& context,
+                                                        TableFunctionBindInput& input,
+                                                        vector<LogicalType>& return_types,
+                                                        vector<string>& names)
+{
+  if (input.inputs.empty() || input.inputs[0].IsNull()) {
+    throw BinderException("sirius_set_query_label requires a non-NULL VARCHAR argument");
+  }
+  auto result   = make_uniq<SiriusSetQueryLabelData>();
+  result->label = input.inputs[0].ToString();
+  return_types.push_back(LogicalType::BOOLEAN);
+  names.push_back("ok");
+  return std::move(result);
+}
+
+static void SiriusSetQueryLabelFunction(ClientContext& context,
+                                        TableFunctionInput& data_p,
+                                        DataChunk& output)
+{
+  auto& data = data_p.bind_data->CastNoConst<SiriusSetQueryLabelData>();
+  if (data.finished) { return; }
+
+  if (auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+      sirius_ctx) {
+    sirius_ctx->set_pending_query_label(data.label);
+  }
+
+  output.SetCardinality(1);
+  output.SetValue(0, 0, Value::BOOLEAN(true));
+  data.finished = true;
+}
+
 void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
 {
   auto transaction = CatalogTransaction::GetSystemTransaction(instance);
@@ -903,9 +956,17 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
                               {LogicalType::VARCHAR},
                               GPUExecutionFunction,
                               SiriusExtension::GPUExecutionBind);
-  gpu_execution.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
+  gpu_execution.named_parameters["enable_optimizer"]    = LogicalType::BOOLEAN;
+  gpu_execution.named_parameters[QUERY_LABEL_PARAM_KEY] = LogicalType::VARCHAR;
   CreateTableFunctionInfo gpu_execution_info(gpu_execution);
   catalog.CreateTableFunction(transaction, gpu_execution_info);
+
+  TableFunction set_query_label("sirius_set_query_label",
+                                {LogicalType::VARCHAR},
+                                SiriusSetQueryLabelFunction,
+                                SiriusSetQueryLabelBind);
+  CreateTableFunctionInfo set_query_label_info(set_query_label);
+  catalog.CreateTableFunction(transaction, set_query_label_info);
 
   // Profiler control functions for nsys --capture-range=cudaProfilerApi
   TableFunction profiler_start(
@@ -1115,6 +1176,24 @@ static void SetLogFlushSeconds(ClientContext& context, SetScope scope, Value& pa
   SIRIUS_LOG_DEBUG("Updated config LOG_FLUSH_SECONDS to {}", Config::LOG_FLUSH_SECONDS);
 }
 
+static void SetEnableQuent(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::ENABLE_QUENT = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_QUENT to {}", Config::ENABLE_QUENT);
+}
+
+static void SetQuentOutputDirectory(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::QUENT_OUTPUT_DIRECTORY = StringValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config QUENT_OUTPUT_DIRECTORY to {}", Config::QUENT_OUTPUT_DIRECTORY);
+}
+
+static void SetQuentEngineName(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::QUENT_ENGINE_NAME = StringValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config QUENT_ENGINE_NAME to {}", Config::QUENT_ENGINE_NAME);
+}
+
 static void SetMaxBuildHashTableBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -1258,6 +1337,24 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::INTEGER,
                             Value::INTEGER(Config::LOG_FLUSH_SECONDS),
                             SetLogFlushSeconds);
+
+  // Quent telemetry configuration
+  config.AddExtensionOption(
+    "enable_quent",
+    "Whether to emit quent telemetry (false uses the noop exporter; true uses ndjson)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(Config::ENABLE_QUENT),
+    SetEnableQuent);
+  config.AddExtensionOption("quent_output_directory",
+                            "Output directory for quent telemetry exports",
+                            LogicalType::VARCHAR,
+                            Value(Config::QUENT_OUTPUT_DIRECTORY),
+                            SetQuentOutputDirectory);
+  config.AddExtensionOption("quent_engine_name",
+                            "Engine name reported via quent telemetry",
+                            LogicalType::VARCHAR,
+                            Value(Config::QUENT_ENGINE_NAME),
+                            SetQuentEngineName);
 
   config.AddExtensionOption("hash_partition_bytes",
                             "Target size in bytes per hash partition",

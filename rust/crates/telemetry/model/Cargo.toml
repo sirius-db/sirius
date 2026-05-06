@@ -1,0 +1,10 @@
+[package]
+name = "instrumentation-model"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+quent-attributes = { git = "https://github.com/rapidsai/quent.git", rev = "871f8f45fd35288945a13636df8cadf50f7dbcc2" }
+quent-model = { git = "https://github.com/rapidsai/quent.git", rev = "871f8f45fd35288945a13636df8cadf50f7dbcc2" }
+quent-query-engine-model = { git = "https://github.com/rapidsai/quent.git", rev = "871f8f45fd35288945a13636df8cadf50f7dbcc2" }
+quent-stdlib = { git = "https://github.com/rapidsai/quent.git", rev = "871f8f45fd35288945a13636df8cadf50f7dbcc2" }

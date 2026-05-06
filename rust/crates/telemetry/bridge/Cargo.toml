@@ -1,0 +1,17 @@
+[package]
+name = "telemetry-bridge"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "telemetry_bridge"
+crate-type = ["staticlib"]
+
+[dependencies]
+cxx = "1"
+instrumentation-model = { path = "../model" }
+
+[build-dependencies]
+cxx-build = "1"
+instrumentation-model = { path = "../model" }
+quent-codegen = { git = "https://github.com/rapidsai/quent.git", rev = "871f8f45fd35288945a13636df8cadf50f7dbcc2" }

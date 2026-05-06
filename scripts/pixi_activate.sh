@@ -22,4 +22,4 @@ if [[ ! -e "$cmake_presets_dst" ]]; then
 fi
 
 mkdir -p build
-pixi shell-hook -s bash > build/sirius_pixi_env_for_clion.sh
+pixi shell-hook -s bash > $project_root/build/sirius_pixi_env_for_clion.sh

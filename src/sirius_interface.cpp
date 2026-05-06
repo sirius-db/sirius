@@ -26,6 +26,9 @@
 #include "duckdb/planner/planner.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
+#include "telemetry/telemetry_context.hpp"
+
+#include <optional>
 
 namespace sirius {
 
@@ -36,8 +39,9 @@ void bind_prepared_statement_parameters(duckdb::PreparedStatementData& statement
   statement.Bind(std::move(owned_values));
 }
 
-sirius_interface::sirius_interface(duckdb::ClientContext& client_context)
-  : client_context(client_context) {};
+sirius_interface::sirius_interface(duckdb::ClientContext& client_context,
+                                   std::optional<std::string> query_label)
+  : client_context(client_context), telemetry(std::move(query_label)) {};
 
 void sirius_interface::sirius_process_error(duckdb::ErrorData& error,
                                             const duckdb::string& query) const
