@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Rebase After DataBatch Changes
 status: executing
-stopped_at: Completed 19-01-PLAN.md (Wave 0 inventory — IO-12 PASS, Q3+Q4 resolved)
-last_updated: "2026-05-06T00:11:25.028Z"
+stopped_at: "Completed 19-02-PLAN.md (IO-16 closed: src/io/ has zero raw cudaSetDevice)"
+last_updated: "2026-05-06T00:17:13.739Z"
 last_activity: 2026-05-06
 progress:
   total_phases: 6
   completed_phases: 3
   total_plans: 22
-  completed_plans: 17
+  completed_plans: 19
 ---
 
 # Project State
@@ -25,7 +25,7 @@ See: .planning/PROJECT.md (updated 2026-05-04)
 ## Current Position
 
 Phase: 19 (IO Framework Adoption (PR #675)) — EXECUTING
-Plan: 2 of 6
+Plan: 4 of 6
 Status: Ready to execute
 Last activity: 2026-05-06
 
@@ -94,6 +94,8 @@ v1.4 Progress: [##########          ] 3/6 phases | 10/32 requirements | 16 plans
 | Phase 18 P06 | 164min | 3 tasks | 11 files |
 | Phase 18 P07 | 111min | 3 tasks | 8 files |
 | Phase 19 P01 | 30min | 2 tasks | 1 files |
+| Phase 19 P03 | 2min | 2 tasks | 2 files |
+| Phase 19 P02 | 10min | 1 tasks | 1 files |
 
 ## Decisions
 
@@ -185,6 +187,10 @@ v1.4 Progress: [##########          ] 3/6 phases | 10/32 requirements | 16 plans
 - [Phase 19]: [19-01] IO-12 verdict PASS: vcpkg.json already declares liburing (line 17); pkg-config probes liburing 2.14 in pixi env; CMakeLists.txt:71-72 + 322-325 wiring confirmed. Zero source changes for IO-12.
 - [Phase 19]: [19-01] Q3 resolution: read_positional_delete_file uses DuckDB read_parquet (CPU); read_equality_delete_file uses cudf::io::datasource::create directly. Neither constructs cucascade_datasource — Plan 19-05 needs no iceberg helper migration.
 - [Phase 19]: [19-01] HYG-02 baseline 40 entirely in src/legacy/ + src/include/legacy/ (frozen namespace duckdb path). Zero rmm::cuda_stream_default in active Super Sirius code. Phase 19 source changes must preserve this.
+- [Phase 19]: [19-03] Test fixture helpers (make_test_gpu_ioctxs / make_test_ioctx) defined alongside cucascade helpers in test_parquet_scan_task.cpp and test_metadata_gpu_scan_operators.cpp; both use rmm::cuda_set_device_raii per P11; 19-05 will flip 4+3 call sites
+- [Phase 19]: [19-03] uring_ioctx ctor defaults locked to host_ring_depth=16, ring_entries=64, n_reactors=4, bounce_slot_size=sirius::io::CHUNK_SIZE per uring_ioctx.hpp:85-88; cudaGetDeviceCount clamp keeps make_test_gpu_ioctxs safe on 1-GPU hosts
+- [Phase 19]: [19-03] test_metadata_gpu_scan_operators.cpp not currently in CMakeLists.txt TEST_SOURCES (orphaned from build graph); helper added with inline linkage; plan 19-05 must re-add to TEST_SOURCES when flipping the 3 metadata-scan call sites
+- [Phase 19]: [19-02] IO-16 closed: uring_reactor.cpp:276 raw cudaSetDevice replaced with std::optional<rmm::cuda_set_device_raii> + .emplace() under preserved if (req.device_id >= 0) guard. RESEARCH.md Pattern 3 anti-patterns all avoided (guard preserved, scope tight to H2D if-block, branch unchanged). HYG-02 baseline 40 preserved. Build exit 0.
 
 ## Accumulated Context
 
@@ -220,6 +226,6 @@ v1.4 Progress: [##########          ] 3/6 phases | 10/32 requirements | 16 plans
 
 ## Session Continuity
 
-Last session: 2026-05-06T00:11:25.025Z
-Stopped at: Completed 19-01-PLAN.md (Wave 0 inventory — IO-12 PASS, Q3+Q4 resolved)
+Last session: 2026-05-06T00:17:13.736Z
+Stopped at: Completed 19-02-PLAN.md (IO-16 closed: src/io/ has zero raw cudaSetDevice)
 Resume file: None

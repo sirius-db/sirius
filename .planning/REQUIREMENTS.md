@@ -42,7 +42,7 @@
 - [ ] **IO-13**: `SiriusContext::initialize()` constructs ONE `sirius_ioctx` per GPU (per-GPU instance), each under `rmm::cuda_set_device_raii` for its target device. Replaces `_gpu_io_backends` map from v1.1.
 - [ ] **IO-14**: `uring_ioctx` / `uring_reactor` instances bound to a single GPU's CUDA context — no shared ioctx across GPUs (avoids the v1.1 kvikio single-CUDA-context anti-pattern). `device_read_req.device_id` matches the ioctx's device for every request.
 - [ ] **IO-15**: `sirius::io::cucascade_datasource` retired — header file deleted, implementation file deleted, every include site replaced with `sirius::io::sirius_datasource`. `grep -rn "cucascade_datasource" src/ test/` returns zero hits. v1.1 IO-01..11 functionality preserved at the new datasource.
-- [ ] **IO-16**: HYG-02 gate — raw `cudaSetDevice` calls in `uring_reactor.cpp` are wrapped in `rmm::cuda_set_device_raii` or guarded such that `rmm::cuda_stream_default` count does not regress beyond 40.
+- [x] **IO-16**: HYG-02 gate — raw `cudaSetDevice` calls in `uring_reactor.cpp` are wrapped in `rmm::cuda_set_device_raii` or guarded such that `rmm::cuda_stream_default` count does not regress beyond 40.
 - [ ] **IO-17**: SF1 smoke regression — `[TPC-H][parquet]` filter passes 22/22 on the new datasource. `[multi_gpu_foundation]` compute-sanitizer memcheck clean.
 
 ### SM — Scan Manager + Pin Tables Port (PR #731 + #721)
@@ -113,7 +113,7 @@
 | IO-13 | 19 | Pending |
 | IO-14 | 19 | Pending |
 | IO-15 | 19 | Pending |
-| IO-16 | 19 | Pending |
+| IO-16 | 19 | Complete |
 | IO-17 | 19 | Pending |
 | SM-01 | 20 | Pending |
 | SM-02 | 20 | Pending |
