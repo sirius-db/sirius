@@ -71,6 +71,7 @@ find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
+pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
 
 # cuCascade - GPU Memory Reservation Library (submodule) cucascade links `numa`
 # as a bare library name (-lnuma). In the vcpkg build the static libnuma.a lives
@@ -166,6 +167,7 @@ set(EXTENSION_SOURCES
     src/io/admission_control.cpp
     src/io/datasource_factory.cpp
     src/io/prefetching_cache.cpp
+    src/io/s3/s3_ioctx.cpp
     src/io/s3/sigv4.cpp
     src/io/s3/sirius_sigv4_credential_provider.cpp
     src/io/sirius_datasource.cpp
@@ -334,11 +336,17 @@ foreach(_target sirius_extension sirius_loadable_extension)
 endforeach()
 
 # Additional libraries only needed by the static extension
-target_link_libraries(sirius_extension PkgConfig::NUMA PkgConfig::LIBURING
-                      OpenSSL::Crypto yaml-cpp::yaml-cpp absl::any_invocable)
+target_link_libraries(
+  sirius_extension
+  PkgConfig::NUMA
+  PkgConfig::LIBURING
+  PkgConfig::CURL
+  OpenSSL::Crypto
+  yaml-cpp::yaml-cpp
+  absl::any_invocable)
 
 target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING
-                      OpenSSL::Crypto)
+                      PkgConfig::CURL OpenSSL::Crypto)
 
 # Required by DuckDB's export set (duckdb_static -> sirius_extension ->
 # cucascade_static / telemetry_bridge)
@@ -381,6 +389,7 @@ set(TEST_SOURCES
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
     test/cpp/helper/test_logical_type.cpp
     test/cpp/io/s3/test_sigv4.cpp
+    test/cpp/io/s3/test_s3_ioctx.cpp
     test/cpp/io/s3/test_sirius_sigv4_credential_provider.cpp
     test/cpp/io/s3/test_static_credentials.cpp
     test/cpp/io/test_datasource_factory.cpp

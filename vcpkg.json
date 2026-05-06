@@ -14,7 +14,9 @@
     "yaml-cpp",
     "abseil",
     "numactl",
-    "liburing"
+    "liburing",
+    "openssl",
+    "curl"
   ],
   "overrides": [
     {
