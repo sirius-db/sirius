@@ -23,7 +23,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULT_FLOAT_TOLERANCE = 1e-5
+DEFAULT_FLOAT_TOLERANCE = 1e-10
 
 
 @dataclass
