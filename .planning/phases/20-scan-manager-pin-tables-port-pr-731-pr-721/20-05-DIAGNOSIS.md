@@ -235,4 +235,26 @@ Estimated effort: 1+ week minimum for any of (1)-(3), and (1)/(2) regress Phase 
 
 ---
 
+## Fix Skipped — Path B Selected
+
+**Task 2 gracefully skipped per plan 20-05 Task 2 path gate.** No source files modified.
+
+**Structural reason (cited from `## Path Recommendation` above):** Both root races are at library boundaries Phase 20 cannot modify in a single fix cycle:
+
+1. **Cluster A (5/21 races):** cudf+kvikio internal parquet reader stream-ordering. Sirius passes a single `stream` to `cudf::io::read_parquet`; the cross-stream gap is INSIDE cudf's parquet reader (uses kvikio's `BS::thread_pool` for filesystem reads on a separate cudaStream from the rmm::device_buffer alloc stream). No Sirius-side single-file edit closes this — it requires either upstream cudf/kvikio fix or a heavyweight Sirius workaround that regresses Phase 19's async-IO gains.
+
+2. **Cluster B (16/21 races):** cucascade host-staging fallback inside `alloc_and_peer_copy_async`. Race shape E per plan's Race-shape taxonomy (cucascade-internal lineage gap), which the plan explicitly directs to Path B: "If Shape == E (cucascade-internal) → Path B (escalate; skip Task 2 fix and proceed to Task 3 INVESTIGATION + Task 4 verify-baseline-only)."
+
+**Phase 18..20 invariants preserved (no source modifications):**
+- DB-grep: 4 (2 legacy + 2 doc comments; matches 20-04 baseline; no live `->get_data()` / `pop_data_batch.*task_created` / `data_batch_processing_handle` introduced)
+- IO-15: 0 (cucascade_datasource retired; no regression)
+- SM-03: 1 (writer_stream comment block at sirius_gpu_parquet_scan_operator.cpp:256; preserved)
+- HYG-02: 40 (rmm::cuda_stream_default count unchanged; no new introductions)
+
+**No new entries to memory's "DEAD trails" list (no re-investigation of ruled-out items).**
+
+Proceeding to Task 3: write 20-05-INVESTIGATION.md as the human-needed escalation document.
+
+---
+
 PATH: B
