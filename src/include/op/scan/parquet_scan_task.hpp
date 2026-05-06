@@ -30,9 +30,21 @@
 
 // cucascade
 #include <cucascade/data/data_repository.hpp>
-#include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
+
+// sirius IO framework (Phase 19 IO-13/IO-15)
+#include <io/types.hpp>
+
+// Forward-declare uring_io_object to avoid pulling in <liburing.h>
+// transitively here. liburing's <io_uring.h> defines a BLOCK_SIZE macro that
+// collides with the BLOCK_SIZE static member in <blockingconcurrentqueue.h>
+// (which is pulled in elsewhere in this translation unit). The full
+// definition lives at src/include/io/uring/uring_reactor.hpp; the .cpp
+// includes that header directly.
+namespace sirius::io {
+class uring_io_object;
+}
 
 // duckdb
 #include <duckdb/common/multi_file/multi_file_states.hpp>
@@ -120,16 +132,17 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    * @param[in] pipeline The pipeline associated with this task
    * @param[in] scan_op The physical table scan operator
    * @param[in] approximate_batch_size The target approximate batch size for the scan tasks
-   * @param[in] gpu_io_backends Per-GPU cucascade io backends indexed by device_id.
-   *            Seeded by task_creator from SiriusContext::get_gpu_io_backends()
-   *            (Approach C, Phase 5 Plan 04). Used for planning-time footer
-   *            pre-reads and hot-path per-task datasource construction.
+   * @param[in] gpu_ioctxs Per-GPU sirius_ioctx instances indexed by device_id.
+   *            Seeded by task_creator from SiriusContext::get_gpu_ioctxs()
+   *            (Approach C, Phase 5 Plan 04 → Phase 19 IO-13). Used for
+   *            planning-time footer pre-reads and hot-path per-task
+   *            sirius_datasource construction.
    */
   parquet_scan_task_global_state(
     duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
     sirius_physical_parquet_scan* scan_op,
     std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE,
-    std::unordered_map<int, std::shared_ptr<cucascade::idisk_io_backend>> gpu_io_backends = {});
+    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs = {});
 
   //===----------Methods----------===//
   /**
@@ -253,21 +266,37 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   }
 
   /**
-   * @brief Access the per-GPU cucascade io backend map (Approach C, Phase 5 Plan 04).
+   * @brief Access the per-GPU sirius_ioctx map (Approach C, Phase 5 Plan 04 → Phase 19 IO-13).
    *
    * Seeded at construction time by task_creator from
-   * SiriusContext::get_gpu_io_backends(). Keyed by device_id; value is a
-   * shared_ptr to the per-GPU cucascade::idisk_io_backend bound to that
+   * SiriusContext::get_gpu_ioctxs(). Keyed by device_id; value is a
+   * shared_ptr to the per-GPU sirius::io::sirius_ioctx bound to that
    * GPU's CUDA context. Used by compute_task() (hot path, routed by
    * preferred_device_id) and by initialize_from_files() (planning-time,
    * first-available GPU).
    *
    * @return A const reference to the map.
    */
-  [[nodiscard]] std::unordered_map<int, std::shared_ptr<cucascade::idisk_io_backend>> const&
-  get_gpu_io_backends() const
+  [[nodiscard]] std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const&
+  get_gpu_ioctxs() const
   {
-    return _gpu_io_backends;
+    return _gpu_ioctxs;
+  }
+
+  /**
+   * @brief Get the cached uring_io_object for the given file index (Phase 19 Open Q1).
+   *
+   * Cached at planning time inside initialize_from_files() so the hot path
+   * (compute_task) does not re-open file descriptors per task. uring_io_object's
+   * ctor opens TWO fds (buffered O_RDONLY + O_RDONLY|O_DIRECT); avoiding per-task
+   * reopens prevents fd-exhaustion at SF100+.
+   *
+   * @return Shared pointer to the cached io_object for @p file_idx.
+   */
+  [[nodiscard]] std::shared_ptr<sirius::io::uring_io_object> get_file_io_object(
+    std::size_t file_idx) const
+  {
+    return _file_io_objects[file_idx];
   }
 
   /**
@@ -448,7 +477,7 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    * @param selected_column_indices Column indices to read (may be widened for
    *                                equality-delete key columns).
    * @param approximate_batch_size  Target uncompressed batch size for partitioning.
-   * @param gpu_io_backends         Per-GPU cucascade io backends indexed by
+   * @param gpu_ioctxs              Per-GPU sirius_ioctx instances indexed by
    *                                device_id (Approach C; see public ctor).
    */
   parquet_scan_task_global_state(
@@ -457,7 +486,7 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
     std::vector<std::string> file_paths,
     std::vector<size_t> selected_column_indices,
     std::size_t approximate_batch_size,
-    std::unordered_map<int, std::shared_ptr<cucascade::idisk_io_backend>> gpu_io_backends = {});
+    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs = {});
 
  private:
   /**
@@ -512,12 +541,19 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   std::vector<hive_partition_column> _hive_partition_columns;
   std::unordered_set<size_t> _hive_partition_index_set;
 
-  /// Per-GPU cucascade io backends keyed by device_id. Seeded by task_creator
-  /// from SiriusContext::get_gpu_io_backends() at global-state construction
-  /// time (Approach C, Phase 5 Plan 04). The adapter layer
-  /// (sirius::io::cucascade_datasource) is constructed here with the backend
-  /// selected by preferred_device_id (hot path) or first-available (planning).
-  std::unordered_map<int, std::shared_ptr<cucascade::idisk_io_backend>> _gpu_io_backends;
+  /// Per-GPU sirius_ioctx instances keyed by device_id. Seeded by task_creator
+  /// from SiriusContext::get_gpu_ioctxs() at global-state construction time
+  /// (Approach C, Phase 5 Plan 04 → Phase 19 IO-13). The adapter layer
+  /// (sirius::io::sirius_datasource) is constructed via
+  /// ioctx->make_datasource(io_object) selected by preferred_device_id (hot
+  /// path) or first-available (planning).
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> _gpu_ioctxs;
+
+  /// Cached uring_io_objects per file (Phase 19 Open Q1). Constructed once at
+  /// planning time inside initialize_from_files(), reused by every per-task
+  /// datasource construction. Avoids per-task fd reopens (uring_io_object ctor
+  /// opens 2 fds via ::open).
+  std::vector<std::shared_ptr<sirius::io::uring_io_object>> _file_io_objects;
 };
 
 //===----------------------------------------------------------------------===//

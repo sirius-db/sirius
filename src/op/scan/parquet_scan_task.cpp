@@ -22,11 +22,17 @@
 #include <data/sirius_converter_registry.hpp>
 #include <expression_executor/gpu_expression_translator_internal.hpp>
 #include <helper/type_conversions.hpp>
-#include <io/cucascade_datasource.hpp>
+#include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
 #include <op/scan/parquet_scan_task.hpp>
 #include <op/sirius_physical_parquet_scan.hpp>
 #include <pipeline/sirius_pipeline.hpp>
+// Phase 19 IO-15: include uring_reactor LAST among sirius headers — liburing.h
+// transitively pulled by uring_reactor.hpp defines a BLOCK_SIZE macro that
+// collides with the BLOCK_SIZE static member in <blockingconcurrentqueue.h>
+// (used by spdlog / pipeline). All consumers of blockingconcurrentqueue.h
+// must precede this include.
+#include <io/uring/uring_reactor.hpp>
 
 // cucascade
 #include <cucascade/data/cpu_data_representation.hpp>
@@ -214,11 +220,11 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
   sirius_physical_parquet_scan* scan_op,
   std::size_t approximate_batch_size,
-  std::unordered_map<int, std::shared_ptr<cucascade::idisk_io_backend>> gpu_io_backends)
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs)
   : pipeline::sirius_pipeline_task_global_state(pipeline),
     _approximate_batch_size(approximate_batch_size),
     _scan_op(scan_op),
-    _gpu_io_backends(std::move(gpu_io_backends))
+    _gpu_ioctxs(std::move(gpu_ioctxs))
 {
   if (scan_op->function.in_out_function) {
     throw std::runtime_error(
@@ -276,13 +282,13 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
   std::vector<std::string> file_paths,
   std::vector<size_t> selected_column_indices,
   std::size_t approximate_batch_size,
-  std::unordered_map<int, std::shared_ptr<cucascade::idisk_io_backend>> gpu_io_backends)
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs)
   : pipeline::sirius_pipeline_task_global_state(pipeline),
     _approximate_batch_size(approximate_batch_size),
     _scan_op(scan_op),
     _selected_column_indices(std::move(selected_column_indices)),
     _file_paths(std::move(file_paths)),
-    _gpu_io_backends(std::move(gpu_io_backends))
+    _gpu_ioctxs(std::move(gpu_ioctxs))
 {
   if (_file_paths.empty()) {
     throw std::runtime_error("[parquet_scan_task_global_state] No input files to scan");
@@ -317,25 +323,32 @@ void parquet_scan_task_global_state::initialize_from_files()
   _file_sizes.reserve(_file_paths.size());
   _metadata_byte_sizes.reserve(_file_paths.size());
   _footer_offsets.reserve(_file_paths.size());
+  _file_io_objects.reserve(_file_paths.size());
 
-  // IO-05: use cucascade-backed datasource instead of kvikio file_source.
-  // Planning-time reads — pick the first available GPU backend deterministically;
-  // the reads are small (footer only) and don't populate per-GPU row-group
-  // allocations, so context mismatch is correctness-neutral (research Pitfall 6).
-  auto const planning_backend_it = _gpu_io_backends.begin();
-  if (planning_backend_it == _gpu_io_backends.end()) {
+  // Phase 19 IO-15: use sirius_datasource (io_uring + per-GPU ioctx) instead
+  // of the retired cucascade-backed adapter. Planning-time reads — pick the
+  // first available GPU ioctx deterministically; the reads are small (footer
+  // only) and don't populate per-GPU row-group allocations, so context
+  // mismatch is correctness-neutral (RESEARCH.md Pitfall 6).
+  auto const planning_ioctx_it = _gpu_ioctxs.begin();
+  if (planning_ioctx_it == _gpu_ioctxs.end()) {
     throw std::runtime_error(
-      "[parquet_scan_task_global_state] No GPU io_backends configured — "
+      "[parquet_scan_task_global_state] No GPU sirius_ioctxs configured — "
       "SiriusContext::initialize() must have populated at least one "
       "(Approach C seeding via task_creator required).");
   }
 
   for (auto const& file_path : _file_paths) {
-    // cucascade::idisk_io_backend has no size() API; use std::filesystem
-    // (research Open Q3). The adapter caches the file_size for size() calls.
-    auto const file_size = std::filesystem::file_size(file_path);
-    auto datasource      = std::make_unique<sirius::io::cucascade_datasource>(
-      planning_backend_it->second, std::filesystem::path{file_path}, file_size);
+    // Cache uring_io_object on global_state per RESEARCH.md Open Q1 — its ctor
+    // opens 2 fds (O_RDONLY + O_RDONLY|O_DIRECT). Reusing across all per-task
+    // datasource constructions avoids per-task fd reopens at SF100+.
+    auto io_object = std::make_shared<sirius::io::uring_io_object>(file_path);
+    auto const file_size = io_object->size();
+    // Phase 19 RESEARCH.md Pattern 2: ioctx->make_datasource(io_object) returns
+    // a unique_ptr<cudf::io::datasource> wrapping a sirius_datasource that
+    // delegates every read to the owning ioctx.
+    auto datasource = planning_ioctx_it->second->make_datasource(io_object);
+    _file_io_objects.push_back(std::move(io_object));
     datasources.push_back(std::move(datasource));
 
 #if CUDF_VERSION_NUM >= 2604
@@ -873,8 +886,8 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
   }
 
   if (!_datasource) {
-    // IO-05 + IO-04: route the per-task datasource construction to the
-    // per-GPU cucascade backend selected by preferred_device_id.
+    // Phase 19 IO-15 + IO-14: route the per-task datasource construction to
+    // the per-GPU sirius_ioctx selected by preferred_device_id.
     //
     // parquet_scan_task is a sirius_pipeline_itask (NOT a gpu_pipeline_task),
     // so the two-tier local_state/global_state get_preferred_device_id() helper
@@ -885,12 +898,12 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
     // executor by default (pipeline_executor.cpp:237-244), so parquet_scan_task
     // effectively runs on the first GPU when no explicit preference is set —
     // we mirror that behavior here by falling back to the first configured
-    // backend. This keeps the adapter construction aligned with the actual
+    // ioctx. This keeps the datasource construction aligned with the actual
     // executor-routing decision and avoids silent context mismatch.
-    auto const& backends = g_state.get_gpu_io_backends();
-    if (backends.empty()) {
+    auto const& ioctxs = g_state.get_gpu_ioctxs();
+    if (ioctxs.empty()) {
       throw std::runtime_error(
-        "[parquet_scan_task::compute_task] no GPU io_backends configured — "
+        "[parquet_scan_task::compute_task] no GPU sirius_ioctxs configured — "
         "SiriusContext::initialize() must have populated at least one "
         "(Approach C seeding via task_creator required)");
     }
@@ -900,15 +913,20 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
     auto const local_preferred = l_state.get_preferred_device_id();
     auto const preferred =
       local_preferred.has_value() ? local_preferred : g_state.get_preferred_device_id();
-    auto backend_it = preferred.has_value() ? backends.find(*preferred) : backends.begin();
-    if (backend_it == backends.end()) {
-      throw std::out_of_range("[parquet_scan_task::compute_task] no io_backend for device_id=" +
+    auto ioctx_it = preferred.has_value() ? ioctxs.find(*preferred) : ioctxs.begin();
+    if (ioctx_it == ioctxs.end()) {
+      throw std::out_of_range("[parquet_scan_task::compute_task] no sirius_ioctx for device_id=" +
                               std::to_string(preferred.value_or(-1)));
     }
-    auto const& file_path = g_state.get_file_path(l_state.get_file_idx());
-    auto const file_size  = g_state.get_file_size(l_state.get_file_idx());
-    _datasource           = std::make_shared<sirius::io::cucascade_datasource>(
-      backend_it->second, std::filesystem::path{file_path}, file_size);
+    // Reuse the cached uring_io_object (RESEARCH.md Open Q1) — populated at
+    // planning time inside initialize_from_files() so we don't re-open fds
+    // per task.
+    auto io_object = g_state.get_file_io_object(l_state.get_file_idx());
+    // make_datasource returns unique_ptr<cudf::io::datasource>; convert to
+    // shared_ptr for the _datasource member which is shared because it may be
+    // observed from multiple downstream representation converters.
+    _datasource = std::shared_ptr<cudf::io::datasource>(
+      ioctx_it->second->make_datasource(std::move(io_object)));
   }
 
   auto reader = g_state.make_reader(l_state.get_file_idx());

@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include <cucascade/data/disk_io_backend.hpp>
+#include <io/types.hpp>
 #include <op/scan/iceberg_delete_filter.hpp>
 #include <op/scan/parquet_scan_task.hpp>
 #include <op/sirius_physical_iceberg_scan.hpp>
@@ -58,20 +58,19 @@ class iceberg_scan_task_global_state : public parquet_scan_task_global_state {
    * @param pipeline             The pipeline for this scan.
    * @param scan_op              The physical iceberg scan operator.
    * @param approximate_batch_size  Target uncompressed batch size.
-   * @param gpu_io_backends      Per-GPU cucascade io backends indexed by
+   * @param gpu_ioctxs           Per-GPU sirius_ioctx instances indexed by
    *                             device_id. Seeded by task_creator from
-   *                             SiriusContext::get_gpu_io_backends() (Approach C,
-   *                             Plan 05-04). Forwarded to the base
-   *                             parquet_scan_task_global_state so that both the
-   *                             data-file footer pre-reads AND the iceberg
-   *                             delete-file reads (build_delete_pipeline) can
-   *                             resolve backends via get_gpu_io_backends().
+   *                             SiriusContext::get_gpu_ioctxs() (Approach C,
+   *                             Plan 05-04 → Phase 19 IO-13). Forwarded to the
+   *                             base parquet_scan_task_global_state so that
+   *                             the data-file footer pre-reads can resolve
+   *                             ioctxs via get_gpu_ioctxs().
    */
   iceberg_scan_task_global_state(
     duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
     sirius_physical_iceberg_scan* scan_op,
     size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE,
-    std::unordered_map<int, std::shared_ptr<cucascade::idisk_io_backend>> gpu_io_backends = {});
+    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs = {});
 
  private:
   // -------------------------------------------------------------------------
@@ -95,7 +94,7 @@ class iceberg_scan_task_global_state : public parquet_scan_task_global_state {
     sirius_physical_iceberg_scan* scan_op,
     init_data init,
     size_t approximate_batch_size,
-    std::unordered_map<int, std::shared_ptr<cucascade::idisk_io_backend>> gpu_io_backends);
+    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs);
 
   // -------------------------------------------------------------------------
   // Delete pipeline construction

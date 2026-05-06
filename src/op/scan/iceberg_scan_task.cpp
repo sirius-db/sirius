@@ -26,9 +26,9 @@
 
 #include <cuda_runtime_api.h>
 
-#include <cucascade/data/disk_io_backend.hpp>
 #include <duckdb/common/multi_file/multi_file_states.hpp>
-#include <io/cucascade_datasource.hpp>
+#include <io/sirius_datasource.hpp>
+#include <io/types.hpp>
 #include <log/logging.hpp>
 #include <op/scan/iceberg_delete_filter.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
@@ -110,12 +110,12 @@ iceberg_scan_task_global_state::iceberg_scan_task_global_state(
   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
   sirius_physical_iceberg_scan* scan_op,
   size_t approximate_batch_size,
-  std::unordered_map<int, std::shared_ptr<cucascade::idisk_io_backend>> gpu_io_backends)
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs)
   : iceberg_scan_task_global_state(std::move(pipeline),
                                    scan_op,
                                    prepare(scan_op),
                                    approximate_batch_size,
-                                   std::move(gpu_io_backends))
+                                   std::move(gpu_ioctxs))
 {
   // Propagate hive partition info to the base class so it can build
   // the partition injection function (same as the public constructor does).
@@ -129,13 +129,13 @@ iceberg_scan_task_global_state::iceberg_scan_task_global_state(
   sirius_physical_iceberg_scan* scan_op,
   init_data init,
   size_t approximate_batch_size,
-  std::unordered_map<int, std::shared_ptr<cucascade::idisk_io_backend>> gpu_io_backends)
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs)
   : parquet_scan_task_global_state(std::move(pipeline),
                                    static_cast<sirius_physical_parquet_scan*>(scan_op),
                                    std::move(init.file_paths),
                                    std::move(init.selected_column_indices),
                                    approximate_batch_size,
-                                   std::move(gpu_io_backends))
+                                   std::move(gpu_ioctxs))
 {
   build_delete_pipeline(scan_op, init.extra_eq_delete_columns);
 }
@@ -153,23 +153,19 @@ void iceberg_scan_task_global_state::build_delete_pipeline(sirius_physical_icebe
     return;
   }
 
-  // Resolve per-GPU cucascade io backend used for stack-local cucascade_datasource
-  // adapters in the delete-file helpers (Approach A — iceberg helper signatures
-  // extended with backend parameter; see Plan 05-05).
-  //
-  // The base parquet_scan_task_global_state owns the map (seeded by task_creator
-  // from SiriusContext::get_gpu_io_backends() — Plan 05-04 Approach C). Delete
-  // files are read here at global-state construction time, so we pick the first
-  // available GPU's backend deterministically (same rationale as planning-time
-  // metadata reads — research Pitfall 6; reads are metadata-only so context
-  // mismatch is correctness-neutral).
-  auto const& gpu_io_backends = this->get_gpu_io_backends();
-  if (gpu_io_backends.empty()) {
+  // Phase 19 IO-15 / Q3 audit: iceberg delete-file helpers DO NOT construct
+  // sirius_datasource (or the retired cucascade adapter) internally —
+  // read_positional_delete_file uses DuckDB read_parquet (CPU), and
+  // read_equality_delete_file uses cudf::io::datasource::create directly. The
+  // ioctx map is therefore not needed here; we still require at least one
+  // ioctx be configured so the base parquet_scan_task_global_state's
+  // planning-time footer reads can resolve a datasource.
+  auto const& gpu_ioctxs = this->get_gpu_ioctxs();
+  if (gpu_ioctxs.empty()) {
     throw std::runtime_error(
-      "[iceberg] No GPU io_backends available for delete-file reads — "
-      "SiriusContext must have registered at least one backend.");
+      "[iceberg] No GPU sirius_ioctxs available — "
+      "SiriusContext must have registered at least one ioctx.");
   }
-  auto iceberg_io_backend = gpu_io_backends.begin()->second;
 
   // -----------------------------------------------------------------------
   // Positional deletes (V2) + Deletion vectors (V3)
