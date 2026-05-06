@@ -27,9 +27,7 @@
 #include <op/scan/sirius_parquet_metadata_scan_operator.hpp>
 
 // cucascade
-#include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
-#include <cucascade/data/io_backend_registry.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
 // sirius IO framework (Phase 19 IO-15 helper preparation)
@@ -67,31 +65,17 @@ namespace {
 // Helpers
 //===----------------------------------------------------------------------===//
 
-/// Construct a standalone cucascade disk-io backend for tests that directly
-/// instantiate sirius_parquet_metadata_scan_operator without a full
-/// SiriusContext in scope. The backend lives for the duration of the test.
-///
-/// IO-05 (Plan 05-05): the metadata scan operator now requires a cucascade
-/// io_backend at construction time. Tests that don't run under a registered
-/// SiriusContext use this helper to produce a registry-owned backend.
-inline std::shared_ptr<cucascade::idisk_io_backend> make_test_io_backend()
-{
-  static cucascade::io_backend_registry registry;
-  static std::once_flag registry_init_flag;
-  std::call_once(registry_init_flag, [&] { cucascade::register_builtin_io_backends(registry); });
-  return registry.create_default_backend();
-}
-
 /// Construct a single @c sirius_ioctx instance for tests that directly
-/// instantiate sirius_parquet_metadata_scan_operator with the new IO
-/// framework (Phase 19 IO-15). Mirrors the per-GPU pattern in
+/// instantiate sirius_parquet_metadata_scan_operator with the IO framework
+/// (Phase 19 IO-15). Mirrors the per-GPU pattern in
 /// @c SiriusContext::initialize() (src/sirius_context.cpp:283) — the
 /// @c uring_ioctx is constructed under @c rmm::cuda_set_device_raii so its
 /// pinned bounce slots bind to the right CUDA context (CONTEXT.md P11 lock).
 ///
-/// This helper is added ALONGSIDE @c make_test_io_backend. The cucascade
-/// helper is preserved for the existing call sites until plan 19-05 retires
-/// @c cucascade_datasource and flips the call sites to use this helper.
+/// NOTE: This file is NOT currently compiled into sirius_unittest because
+/// sirius_parquet_metadata_scan_operator.hpp was deleted in Phase 17 (re-attached
+/// in Phase 20 SM-03). Helper kept for grep-visibility and future Phase 20+
+/// re-add to TEST_SOURCES.
 inline std::shared_ptr<sirius::io::sirius_ioctx> make_test_ioctx(int device_id = 0)
 {
   rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
@@ -246,7 +230,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> run_two_pipeline_scan(
     {},
     approximate_batch_size,
     sirius::op::scan::sirius_parquet_metadata_scan_operator::DEFAULT_MAX_FILE_PROCESSED,
-    make_test_io_backend());
+    make_test_ioctx());
 
   // Execute all metadata tasks and sink results into the GPU operator via metadata_op.sink().
   while (!metadata_op.all_ports_empty()) {
@@ -351,7 +335,7 @@ TEST_CASE("metadata_scan_operator - source interface dispatches all files",
     /*partition_indices=*/{},
     1024 * 1024,
     sirius::op::scan::sirius_parquet_metadata_scan_operator::DEFAULT_MAX_FILE_PROCESSED,
-    make_test_io_backend());
+    make_test_ioctx());
 
   REQUIRE(op.is_source());
   REQUIRE_FALSE(op.all_ports_empty());
@@ -397,7 +381,7 @@ TEST_CASE("metadata_scan_operator - execute produces partitioned metadata",
     /*partition_indices=*/{},
     1024 * 1024,
     sirius::op::scan::sirius_parquet_metadata_scan_operator::DEFAULT_MAX_FILE_PROCESSED,
-    make_test_io_backend());
+    make_test_ioctx());
 
   auto input = op.get_next_task_input_data();
   REQUIRE(input);

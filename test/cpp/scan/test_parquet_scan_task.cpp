@@ -27,8 +27,6 @@
 #include <parallel/task_executor.hpp>
 
 // cucascade
-#include <cucascade/data/disk_io_backend.hpp>
-#include <cucascade/data/io_backend_registry.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
 // sirius IO framework (Phase 19 IO-15 helper preparation)
@@ -102,35 +100,16 @@ class scan_test_executor : public sirius::parallel::itask_executor {
   }
 };
 
-/// Construct a standalone cucascade disk-io backend for tests that directly
-/// instantiate parquet_scan_task_global_state without going through
-/// task_creator (which is the normal Approach-C seeding site).
-///
-/// IO-05 / Plan 05-04 adds a mandatory-backend throw on empty gpu_io_backends
-/// in parquet_scan_task_global_state. Tests constructing the global state
-/// directly must seed the map via this helper (same pattern as
-/// test/cpp/scan/test_metadata_gpu_scan_operators.cpp).
-inline std::unordered_map<int, std::shared_ptr<cucascade::idisk_io_backend>>
-make_test_gpu_io_backends()
-{
-  static cucascade::io_backend_registry registry;
-  static std::once_flag registry_init_flag;
-  std::call_once(registry_init_flag, [&] { cucascade::register_builtin_io_backends(registry); });
-  std::unordered_map<int, std::shared_ptr<cucascade::idisk_io_backend>> backends;
-  backends.emplace(0, registry.create_default_backend());
-  return backends;
-}
-
 /// Construct per-GPU @c sirius_ioctx instances for tests that directly seed
-/// @c parquet_scan_task_global_state with the new IO framework (Phase 19
-/// IO-15). Mirrors the per-GPU init pattern used in
+/// @c parquet_scan_task_global_state with the IO framework (Phase 19 IO-15).
+/// Mirrors the per-GPU init pattern used in
 /// @c SiriusContext::initialize() (src/sirius_context.cpp:283) — each
 /// @c uring_ioctx is constructed under @c rmm::cuda_set_device_raii so its
 /// pinned bounce slots bind to the right CUDA context (P11 lock).
 ///
-/// This helper is added ALONGSIDE @c make_test_gpu_io_backends. The cucascade
-/// helper is preserved for the existing call sites until plan 19-05 retires
-/// @c cucascade_datasource and flips the call sites to use this helper.
+/// IO-05 / Plan 05-04 adds a mandatory-ioctx throw on empty gpu_ioctxs in
+/// parquet_scan_task_global_state. Tests constructing the global state
+/// directly must seed the map via this helper.
 ///
 /// @param n_gpus  Desired GPU count. Clamped down to actual @c cudaGetDeviceCount
 ///                so the helper is safe on 1-GPU hosts (defaults to all visible
@@ -438,7 +417,7 @@ static void run_parquet_scan_test(std::string const& table_name,
   REQUIRE(physical_scan);
 
   auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr, physical_scan.get(), batch_size, make_test_gpu_io_backends());
+    nullptr, physical_scan.get(), batch_size, make_test_gpu_ioctxs());
 
   cucascade::shared_data_repository data_repo;
 
@@ -536,7 +515,7 @@ static void run_multi_file_parquet_scan_test(
   REQUIRE(physical_scan);
 
   auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr, physical_scan.get(), batch_size, make_test_gpu_io_backends());
+    nullptr, physical_scan.get(), batch_size, make_test_gpu_ioctxs());
 
   cucascade::shared_data_repository data_repo;
 
@@ -620,7 +599,7 @@ static void run_parquet_scan_test_with_filter(
   REQUIRE(physical_scan);
 
   auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr, physical_scan.get(), batch_size, make_test_gpu_io_backends());
+    nullptr, physical_scan.get(), batch_size, make_test_gpu_ioctxs());
 
   cucascade::shared_data_repository data_repo;
 
@@ -682,7 +661,7 @@ static size_t count_row_group_partitions(
   REQUIRE(physical_scan);
 
   auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr, physical_scan.get(), batch_size, make_test_gpu_io_backends());
+    nullptr, physical_scan.get(), batch_size, make_test_gpu_ioctxs());
   return global_state->get_num_row_group_partitions();
 }
 

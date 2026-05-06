@@ -35,8 +35,6 @@
 
 #include <cuda_runtime_api.h>
 
-#include <cucascade/data/disk_io_backend.hpp>
-#include <cucascade/data/io_backend_registry.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 #include <io/types.hpp>
@@ -268,42 +266,14 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     }
   }
 
-  // ---- Cucascade disk I/O backend registry + per-GPU backend cache ----
-  // Registers the built-in "pipeline" backend and creates one
-  // idisk_io_backend instance per GPU memory space. Each instance is
-  // constructed under rmm::cuda_set_device_raii so its internal
-  // cudaStreamCreate / cudaMallocHost / cudaEventCreateWithFlags bind
-  // to that GPU's CUDA context. One-per-GPU is required for multi-GPU
-  // safety — see .planning/research/CUCASCADE-IO.md §"Per-GPU backend
-  // ownership" and Phase 5 RESEARCH.md Pitfall 1.
-  cucascade::register_builtin_io_backends(io_backend_registry_);
-  {
-    auto gpu_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
-    gpu_io_backends_.reserve(gpu_spaces.size());
-    for (auto* gpu_space : gpu_spaces) {
-      auto const device_id = gpu_space->get_device_id();
-      rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{device_id}};
-      auto backend = io_backend_registry_.create_default_backend();
-      // IO-11 audit: log the device_id we targeted and the actual current
-      // device at the moment the backend was created. These should match.
-      int readback = -1;
-      cudaGetDevice(&readback);
-      spdlog::info("SiriusContext: io_backend created for GPU {} (cudaGetDevice readback={})",
-                   device_id,
-                   readback);
-      gpu_io_backends_[device_id] = std::move(backend);
-    }
-  }
-
   // === Phase 19 IO-13: per-GPU sirius_ioctx ===
-  // Hosted alongside gpu_io_backends_ during the migration. Plan 19-05 will
-  // retire the cucascade map (and remove this comment marker). Each
-  // uring_ioctx ctor allocates pinned bounce slots via cudaHostAlloc with
-  // cudaHostAllocPortable bound to the current CUDA context, so the
-  // rmm::cuda_set_device_raii guard is mandatory (P4). Each ioctx also
-  // owns its own admission_control instance — the default ctor of
-  // uring_ioctx → templated_ioctx<uring_reactor> wires this up per-instance,
-  // which satisfies P5 mitigation (per-GPU admission budget; never shared).
+  // One ioctx per GPU memory space. Each uring_ioctx ctor allocates pinned
+  // bounce slots via cudaHostAlloc with cudaHostAllocPortable bound to the
+  // current CUDA context, so the rmm::cuda_set_device_raii guard is mandatory
+  // (P4). Each ioctx also owns its own admission_control instance — the
+  // default ctor of uring_ioctx → templated_ioctx<uring_reactor> wires this
+  // up per-instance, which satisfies P5 mitigation (per-GPU admission
+  // budget; never shared).
   {
     auto gpu_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
     gpu_ioctxs_.reserve(gpu_spaces.size());
@@ -520,11 +490,6 @@ void SiriusContext::terminate()
   }
   downgrade_executors_.clear();
 
-  // Destroy per-GPU io_backend instances BEFORE memory_manager_->shutdown()
-  // so each backend's dtor (cudaFreeHost / cudaStreamDestroy /
-  // cudaEventDestroy) runs against a still-live CUDA context. Mirrors
-  // the downgrade_executors_ teardown order above.
-  gpu_io_backends_.clear();
   // Phase 19 IO-13: tear down per-GPU sirius_ioctx instances BEFORE
   // memory_manager_->shutdown() (Pitfall 3). Each ~uring_ioctx joins its
   // reactor worker thread and frees pinned bounce slots via cudaFreeHost,
@@ -537,7 +502,6 @@ void SiriusContext::terminate()
   // during shutdown risks tearing down mappings the memory_manager_ teardown
   // (below) may still traverse for GPU->HOST drains.
   peer_access_enabled_pairs_.clear();
-  io_backend_registry_.clear();
 
   // Ensure all CUDA operations (including async copies from downgrade tasks)
   // are complete before destroying pinned memory pools.  cudaStreamDestroy
@@ -575,18 +539,6 @@ const sirius::memory::sirius_memory_reservation_manager& SiriusContext::get_memo
 {
   throw_if_not_initialized();
   return *memory_manager_;
-}
-
-std::shared_ptr<cucascade::idisk_io_backend> SiriusContext::get_io_backend_for(int device_id) const
-{
-  throw_if_not_initialized();
-  auto it = gpu_io_backends_.find(device_id);
-  if (it == gpu_io_backends_.end()) {
-    throw std::out_of_range(
-      "SiriusContext::get_io_backend_for: no io_backend registered for device_id=" +
-      std::to_string(device_id));
-  }
-  return it->second;
 }
 
 std::shared_ptr<sirius::io::sirius_ioctx> SiriusContext::get_ioctx_for(int device_id) const

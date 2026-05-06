@@ -239,7 +239,7 @@ duckdb::unique_ptr<op::sirius_physical_operator> sirius_engine::construct_sirius
       std::vector<int> gpu_device_ids;
       auto ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
       if (ctx != nullptr) {
-        for (auto const& kv : ctx->get_gpu_io_backends()) {
+        for (auto const& kv : ctx->get_gpu_ioctxs()) {
           gpu_device_ids.push_back(kv.first);
         }
       }
