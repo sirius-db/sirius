@@ -301,10 +301,10 @@ TEST_CASE("ast_value - DECIMAL(18,4) maps to decimal64 (precision 10..18 width c
 TEST_CASE("ast_value - DECIMAL(38,10) maps to decimal128 (precision 19..38 width class)",
           "[ast_value]")
 {
-  auto const t          = logical_type::make_decimal(38, 10);
-  auto const hi_in      = duckdb::hugeint_t{0, 1'000'000'000'000ULL};
-  auto const dv         = duckdb::Value::DECIMAL(hi_in, uint8_t{38}, uint8_t{10});
-  auto const sv         = sirius::from_duckdb(dv, t);
+  auto const t           = logical_type::make_decimal(38, 10);
+  auto const hi_in       = duckdb::hugeint_t{0, 1'000'000'000'000ULL};
+  auto const dv          = duckdb::Value::DECIMAL(hi_in, uint8_t{38}, uint8_t{10});
+  auto const sv          = sirius::from_duckdb(dv, t);
   auto const expected128 = static_cast<__int128_t>(1'000'000'000'000LL);
   REQUIRE(std::holds_alternative<decimal128>(sv));
   REQUIRE(std::get<decimal128>(sv).value == expected128);

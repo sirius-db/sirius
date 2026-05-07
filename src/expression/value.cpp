@@ -105,7 +105,8 @@ duckdb::Value to_duckdb(const value& v, const logical_type& type)
     case type_id::INTEGER: return duckdb::Value::INTEGER(std::get<int32_t>(v));
     case type_id::BIGINT: return duckdb::Value::BIGINT(std::get<int64_t>(v));
     case type_id::HUGEINT:
-      return duckdb::Value::HUGEINT(std::get<int64_t>(v));  // D-03: narrowed alt → widen via factory
+      return duckdb::Value::HUGEINT(
+        std::get<int64_t>(v));  // D-03: narrowed alt → widen via factory
     case type_id::UTINYINT: return duckdb::Value::UTINYINT(std::get<uint8_t>(v));
     case type_id::USMALLINT: return duckdb::Value::USMALLINT(std::get<uint16_t>(v));
     case type_id::UINTEGER: return duckdb::Value::UINTEGER(std::get<uint32_t>(v));
@@ -113,8 +114,7 @@ duckdb::Value to_duckdb(const value& v, const logical_type& type)
     case type_id::UHUGEINT: return duckdb::Value::UHUGEINT(std::get<uint64_t>(v));
     case type_id::FLOAT: return duckdb::Value::FLOAT(std::get<float>(v));
     case type_id::DOUBLE: return duckdb::Value::DOUBLE(std::get<double>(v));
-    case type_id::DATE:
-      return duckdb::Value::DATE(duckdb::date_t{std::get<date_value>(v).days});
+    case type_id::DATE: return duckdb::Value::DATE(duckdb::date_t{std::get<date_value>(v).days});
     case type_id::TIMESTAMP_SEC:
       return duckdb::Value::TIMESTAMPSEC(
         duckdb::timestamp_sec_t{std::get<timestamp_sec_value>(v).value});
@@ -122,8 +122,7 @@ duckdb::Value to_duckdb(const value& v, const logical_type& type)
       return duckdb::Value::TIMESTAMPMS(
         duckdb::timestamp_ms_t{std::get<timestamp_ms_value>(v).value});
     case type_id::TIMESTAMP:
-      return duckdb::Value::TIMESTAMP(
-        duckdb::timestamp_t{std::get<timestamp_us_value>(v).value});
+      return duckdb::Value::TIMESTAMP(duckdb::timestamp_t{std::get<timestamp_us_value>(v).value});
     case type_id::TIMESTAMP_NS:
       return duckdb::Value::TIMESTAMPNS(
         duckdb::timestamp_ns_t{std::get<timestamp_ns_value>(v).value});
