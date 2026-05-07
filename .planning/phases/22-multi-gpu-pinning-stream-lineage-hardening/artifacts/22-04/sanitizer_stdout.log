@@ -1,0 +1,8 @@
+[cucascade] direct GPU↔GPU peer DMA broken on 2 direction(s); cudaMemcpyPeer* will host-stage automatically.
+Filters: gpu_execution - TPC-H Query 11 parquet
+
+[0/1] (0%): gpu_execution - TPC-H Query 11 parquet
+[1/1] (100%): gpu_execution - TPC-H Query 11 parquet
+===============================================================================
+All tests passed (9011 assertions in 1 test case)
+

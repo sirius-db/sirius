@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Gauntlet on Rebased Branch)
 status: executing
-stopped_at: Completed 22-02-PLAN.md (build green again; PIN-MGPU-01 plumbed end-to-end through PinTableFunction + cached_split_provider; Plan 22-01 hand-off sites closed as documented deviation)
-last_updated: "2026-05-07T23:20:08.771Z"
+stopped_at: Completed 22-04-PLAN.md (cucascade pin advanced to c666b21; build green; [mgpu] 16/16 PASS; deferred 22-03 Task 2 sanitizer micro-validation PASSED with Cluster B = 0; HYG-02 src/ = 40 invariant preserved)
+last_updated: "2026-05-07T23:33:55.071Z"
 last_activity: 2026-05-07
 progress:
   total_phases: 7
   completed_phases: 0
   total_plans: 7
-  completed_plans: 3
+  completed_plans: 4
 ---
 
 # Project State
@@ -25,7 +25,7 @@ See: .planning/PROJECT.md (updated 2026-05-04)
 ## Current Position
 
 Phase: 22 (multi-gpu-pinning-stream-lineage-hardening) — EXECUTING
-Plan: 3 of 7
+Plan: 4 of 7
 Status: Ready to execute
 Last activity: 2026-05-07
 
@@ -109,6 +109,7 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 | Phase 22 P01 | 4min | 2 tasks | 2 files |
 | Phase 22 P03 | 4min | 2 tasks | 1 files |
 | Phase 22 P02 | 4min38s | 2 tasks | 4 files |
+| Phase 22 P04 | 7min | 3 tasks | 1 files |
 
 ## Decisions
 
@@ -248,6 +249,9 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 - [Phase 22]: [22-02] PIN-MGPU-01 user-visible plumbing landed: PinTableFunction now distributes parquet chunks via per-call std::size_t round-robin counter (D-02; not atomic) + per-file rmm::cuda_set_device_raii guard around chunked_parquet_reader (D-05) so cudf places columns on the intended GPU; emits parallel std::vector<memory_space*> chunk_memory_spaces consumed by Plan 22-01's new insert_pinned_entry signature.
 - [Phase 22]: [22-02] cached_split_provider migrated to per-chunk memory_space lookup (D-04): constructor takes std::vector<memory_space*>; start() validates size==num_batches and reads _chunk_memory_spaces.at(batch_idx) per batch; no_writer_stream rationale doc-block preserved verbatim; HYG-02 invariant 40 phase-wide preserved.
 - [Phase 22]: [22-02] Documented scope deviation: Plan 22-02's files_modified declared 2 files but the build break Plan 22-01 left also spanned src/scan_manager/sirius_scan_manager.cpp:107,176 (create_provider_for). All three hand-off sites closed in this plan; build is green again ([124/124] linking sirius_unittest, no errors related to pinned_entry::memory_space or chunk_memory_spaces). Plan 22-04 unblocked for cucascade pin bump + sanitizer micro-validation.
+- [Phase 22]: [22-04] Sirius parent gitlink advanced from 42a01c4 to c666b21926dec70b26a1febd509435635bea8deb (Plan 22-03's Cluster B same-stream invariant fix); commit 1211a02 on feature/single-node-multi-gpu2; cucascade fork NOT pushed upstream (D-08 / CC-UPSTREAM-01).
+- [Phase 22]: [22-04] DEFERRED 22-03 Task 2 sanitizer micro-validation PASSED: Cluster B (alloc_and_peer_copy_async) = 0 host frames in SF1 Q11 num_gpus=2 sanitizer log (was 16 pre-fix per 20-05-INVESTIGATION.md). Cluster A advisory carry-forward = 4 race blocks (cudf+kvikio internal cross-stream gap; not a Phase 22 ship blocker per D-09). Closes fu17 Cluster B objective.
+- [Phase 22]: [22-04] Integration smoke PASS: MCP build exit 0 (124/124 link); [mgpu] 16/16 PASS (79091 assertions / 116.2s vs Phase 21 REG-01 baseline 106.3s; well under 130s gate); HYG-02 invariant src/ = 40 unchanged; cucascade-side legacy 19 unchanged (modified file representation_converter.cpp has 0).
 
 ## Accumulated Context
 
@@ -287,6 +291,6 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 
 ## Session Continuity
 
-Last session: 2026-05-07T23:19:55.789Z
-Stopped at: Completed 22-02-PLAN.md (build green again; PIN-MGPU-01 plumbed end-to-end through PinTableFunction + cached_split_provider; Plan 22-01 hand-off sites closed as documented deviation)
+Last session: 2026-05-07T23:33:55.068Z
+Stopped at: Completed 22-04-PLAN.md (cucascade pin advanced to c666b21; build green; [mgpu] 16/16 PASS; deferred 22-03 Task 2 sanitizer micro-validation PASSED with Cluster B = 0; HYG-02 src/ = 40 invariant preserved)
 Resume file: None
