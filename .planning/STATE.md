@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Gauntlet on Rebased Branch)
 status: executing
-stopped_at: Completed 22-03-PLAN.md (Task 1 done; Task 2 deferred to Plan 22-04)
-last_updated: "2026-05-07T23:03:50.956Z"
+stopped_at: Completed 22-02-PLAN.md (build green again; PIN-MGPU-01 plumbed end-to-end through PinTableFunction + cached_split_provider; Plan 22-01 hand-off sites closed as documented deviation)
+last_updated: "2026-05-07T23:20:08.771Z"
 last_activity: 2026-05-07
 progress:
   total_phases: 7
   completed_phases: 0
   total_plans: 7
-  completed_plans: 2
+  completed_plans: 3
 ---
 
 # Project State
@@ -25,7 +25,7 @@ See: .planning/PROJECT.md (updated 2026-05-04)
 ## Current Position
 
 Phase: 22 (multi-gpu-pinning-stream-lineage-hardening) — EXECUTING
-Plan: 2 of 7
+Plan: 3 of 7
 Status: Ready to execute
 Last activity: 2026-05-07
 
@@ -108,6 +108,7 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 | Phase 21 P01 | ~30min | 5 tasks | 5 files |
 | Phase 22 P01 | 4min | 2 tasks | 2 files |
 | Phase 22 P03 | 4min | 2 tasks | 1 files |
+| Phase 22 P02 | 4min38s | 2 tasks | 4 files |
 
 ## Decisions
 
@@ -244,6 +245,9 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 - [Phase 22]: [22-01] PIN-MGPU-01 prerequisite landed: pinned_entry now carries per-chunk std::vector<cucascade::memory::memory_space*> chunk_memory_spaces parallel to data_batches_by_column inner vectors; insert_pinned_entry accepts/stores the vector with precondition (size==data_tables.size) + same-row-count merge invariant (Pitfall 3 closure). Public get_pinned_entries() const accessor for Plan 22-05 [pin_mgpu] test. Build intentionally broken at sirius_scan_manager.cpp:107,176 (create_provider_for) + sirius_extension.cpp:820 (PinTableFunction call site) — Plan 22-02 hand-off.
 - [Phase 22]: [22-03] Cucascade local fork commit c666b21 lands D-07 same-stream invariant fix in alloc_and_peer_copy_async (drop in-function rmm::cuda_stream src_stream; issue DtoH on target_stream under cuda_set_device_raii(src_device); preserve sync-then-cudaFreeHost ordering with cudaStreamSynchronize(target_stream.value()) inside src_guard scope). HYG-02 invariant preserved (0 rmm::cuda_stream_default in modified file). Plan 22-04 advances Sirius parent submodule pin to c666b21 and runs the Task 2 sanitizer micro-validation (deferred from this plan).
 - [Phase 22]: [22-03] Task 2 sanitizer micro-validation DEFERRED to Plan 22-04 due to parallel-wave Plan 22-01 leaving Sirius parent in transient build-broken state (pinned_entry::memory_space rename to chunk_memory_spaces vector; .cpp callers not yet updated). Cucascade compile-correctness verified via parent build's [91/112] cucascade objects + [92/112] libcucascade.a steps both PASS. Cucascade ctest CC-04 gate similarly deferred (standalone cucascade build dir is configured against an incompatible CMake/CUDA toolchain in this worktree). Plan 22-04 runs the sanitizer gate post-bump.
+- [Phase 22]: [22-02] PIN-MGPU-01 user-visible plumbing landed: PinTableFunction now distributes parquet chunks via per-call std::size_t round-robin counter (D-02; not atomic) + per-file rmm::cuda_set_device_raii guard around chunked_parquet_reader (D-05) so cudf places columns on the intended GPU; emits parallel std::vector<memory_space*> chunk_memory_spaces consumed by Plan 22-01's new insert_pinned_entry signature.
+- [Phase 22]: [22-02] cached_split_provider migrated to per-chunk memory_space lookup (D-04): constructor takes std::vector<memory_space*>; start() validates size==num_batches and reads _chunk_memory_spaces.at(batch_idx) per batch; no_writer_stream rationale doc-block preserved verbatim; HYG-02 invariant 40 phase-wide preserved.
+- [Phase 22]: [22-02] Documented scope deviation: Plan 22-02's files_modified declared 2 files but the build break Plan 22-01 left also spanned src/scan_manager/sirius_scan_manager.cpp:107,176 (create_provider_for). All three hand-off sites closed in this plan; build is green again ([124/124] linking sirius_unittest, no errors related to pinned_entry::memory_space or chunk_memory_spaces). Plan 22-04 unblocked for cucascade pin bump + sanitizer micro-validation.
 
 ## Accumulated Context
 
@@ -283,6 +287,6 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 
 ## Session Continuity
 
-Last session: 2026-05-07T23:03:45.632Z
-Stopped at: Completed 22-03-PLAN.md (Task 1 done; Task 2 deferred to Plan 22-04)
+Last session: 2026-05-07T23:19:55.789Z
+Stopped at: Completed 22-02-PLAN.md (build green again; PIN-MGPU-01 plumbed end-to-end through PinTableFunction + cached_split_provider; Plan 22-01 hand-off sites closed as documented deviation)
 Resume file: None
