@@ -470,7 +470,12 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     input_batch.push_back(std::move(probe_batch));
     input_batch.push_back(std::move(build_batch));
     _hash_table_build_state = BUILD_HASH_TABLE_STATE::SCHEDULED;
-    return std::make_unique<pipelineable_operator_data>(input_batch);
+    // BUILD_PROBE mode uses a single cuco hash table shared across every probe
+    // task for this join. All such tasks must land on the same GPU, so we tag
+    // them with operator_id as the partition index (hash joins get spread
+    // across GPUs at the query level, but each individual join stays pinned).
+    return std::make_unique<partitioned_operator_data>(std::move(input_batch),
+                                                       this->get_operator_id());
 
   } else if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::BUILT) {
     if (probe_port->repo->num_partitions() != 1) {
@@ -491,7 +496,10 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
         "batch from the default port but got none in operator " +
         std::to_string(this->get_operator_id()));
     }
-    return std::make_unique<pipelineable_operator_data>(input_batch);
+    // Subsequent probe-only tasks share the hash table built under the initial
+    // SCHEDULING task. They MUST run on the same GPU — tag with operator_id.
+    return std::make_unique<partitioned_operator_data>(std::move(input_batch),
+                                                       this->get_operator_id());
   } else {
     SIRIUS_LOG_WARN(fmt::format(
       "In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: invalid hash table "
@@ -560,7 +568,11 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
             input_batch.push_back(
               ports["build"]->repo->get_data_batch_by_id(right_batch_id, partition_idx));
           }
-          return std::make_unique<pipelineable_operator_data>(input_batch);
+          // MIXED_JOIN distributes per-partition tasks across GPUs via SCHED-00
+          // (partition_idx % num_gpus). Tag with the partition index so the
+          // scheduler can route by partition.
+          return std::make_unique<partitioned_operator_data>(std::move(input_batch),
+                                                             partition_idx);
         }
         right_counter++;
         counter++;
@@ -606,7 +618,15 @@ static join_side_keys_result prepare_join_keys(
   cudf::table_view table = get_cudf_table_view(input_batch);
 
   if (!cast_necessary) {
-    result.keys = table.select(key_col_indices);
+    // Phase 12-02: filter key_col_indices to the valid range [0, num_columns())
+    // so a stale index from the SORT-as-HASH_JOIN partitioner doesn't throw
+    // std::out_of_range from cudf::table_view::select.
+    std::vector<cudf::size_type> valid_indices;
+    valid_indices.reserve(key_col_indices.size());
+    for (auto idx : key_col_indices) {
+      if (idx < table.num_columns()) { valid_indices.push_back(idx); }
+    }
+    result.keys = table.select(valid_indices);
     return result;
   }
 

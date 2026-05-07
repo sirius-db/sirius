@@ -239,14 +239,12 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
   // for column data is determined later by the scan operator's task affinity,
   // not by which ioctx the datasource was originally constructed from.
   // Mirrors parquet_scan_task_global_state::initialize_from_files() (Phase 19).
+  // When _gpu_ioctxs is empty (e.g., unit tests that drive parquet_split_provider in
+  // isolation without a SiriusContext), fall back to cudf's bundled datasource factory.
+  // Production paths populate _gpu_ioctxs from SiriusContext::initialize() and route
+  // through sirius_datasource for per-GPU IO context binding.
   auto const planning_ioctx_it = _gpu_ioctxs.begin();
-  if (planning_ioctx_it == _gpu_ioctxs.end()) {
-    throw std::runtime_error(
-      "[parquet_split_provider] No GPU sirius_ioctxs configured — "
-      "SiriusContext::initialize() must populate at least one and "
-      "sirius_scan_manager::prepare_for_query() must forward the map "
-      "(IO-MGPU-02).");
-  }
+  bool const have_gpu_ioctxs   = (planning_ioctx_it != _gpu_ioctxs.end());
 
   // Loop over files to read footers, parse metadata, and compute row-group partitions.
   rg_accumulator accum;
@@ -285,13 +283,18 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
     }
 
     //===----------Read metadata footers----------===//
-    // Construct a uring_io_object for the file and wrap it in a sirius_datasource via the
-    // planning ioctx's make_datasource factory (multi-GPU IO routing — bypasses cudf's
-    // bundled file_source which would route through libkvikio and skip the io_uring +
-    // per-GPU CUDA-context binding). The io_object's lifetime is tied to the datasource
-    // (the uring backend stores the shared_ptr in its datasource subclass).
-    auto io_object     = std::make_shared<sirius::io::uring_io_object>(file_path);
-    auto datasource    = planning_ioctx_it->second->make_datasource(io_object);
+    // When gpu_ioctxs is configured (production path), route through sirius_datasource
+    // for per-GPU IO context binding (multi-GPU IO routing — bypasses cudf's bundled
+    // file_source which would route through libkvikio and skip the io_uring + per-GPU
+    // CUDA-context binding). Otherwise (unit tests), use cudf's default factory.
+    std::shared_ptr<sirius::io::uring_io_object> io_object;
+    std::unique_ptr<cudf::io::datasource> datasource;
+    if (have_gpu_ioctxs) {
+      io_object  = std::make_shared<sirius::io::uring_io_object>(file_path);
+      datasource = planning_ioctx_it->second->make_datasource(io_object);
+    } else {
+      datasource = cudf::io::datasource::create(file_path);
+    }
     auto footer_buffer = cudf::io::parquet::fetch_footer_to_host(*datasource);
 
     //===----------Parse metadata----------===//

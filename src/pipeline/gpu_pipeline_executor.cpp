@@ -346,15 +346,16 @@ void gpu_pipeline_executor::manager_loop()
         }
 
         if (!query_complete && _task_creator) {
-          // If the pipeline just finished, notify_downstream_pipelines() (called from
-          // mark_task_completed() above) already scheduled the consumers. Skip the
-          // explicit schedule to avoid a duplicate request that races with operator
-          // teardown after mark_completed().
-          bool pipeline_done = pipeline && pipeline->is_pipeline_finished();
-          if (!pipeline_done) {
-            for (auto* consumer : consumers) {
-              if (consumer) { _task_creator->schedule(consumer); }
-            }
+          // Always schedule consumers explicitly. Pre-merge mgpu task distribution
+          // (test_physical_*_mgpu / mgpu-audit) relies on this to fan tasks out
+          // across GPUs via task_scheduler's SCHED-RR counter — schedule() increments
+          // the counter once per call, and the explicit loop here drives the rotation.
+          // notify_downstream_pipelines() (invoked from mark_task_completed in the
+          // task destructor) also schedules these same consumers, but only when the
+          // pipeline is fully drained; the mgpu test fixtures need rotation to begin
+          // before that point so mid-pipeline task batches reach GPU 1 too.
+          for (auto* consumer : consumers) {
+            if (consumer) { _task_creator->schedule(consumer); }
           }
         }
 
