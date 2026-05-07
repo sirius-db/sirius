@@ -355,18 +355,20 @@ void sirius_pipeline::update_pipeline_status()
 
   if (get_source()->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
     auto& table_scan = get_source()->Cast<op::sirius_physical_duckdb_scan>();
-    if (table_scan.exhausted) {  // WSM amin TODO: can we use exhausted? how about we use
-                                 // get_next_task_hint() to check if the source is ready?
-      pipeline_finished.store(true);
+    if (table_scan.exhausted.load()) {  // WSM amin TODO: can we use exhausted? how about we use
+                                        // get_next_task_hint() to check if the source is ready?
+      if (tasks_created.load() == tasks_completed.load()) {
+        pipeline_finished.store(true);
+        notify_downstream_pipelines();
+      }
       end_nvtx_range_if_finished();
-      notify_downstream_pipelines();
       return;
     }
   } else if (get_source()->type == op::SiriusPhysicalOperatorType::CPU_SOURCE) {
     auto& cpu_source = get_source()->Cast<op::sirius_physical_cpu_source>();
     if (cpu_source.exhausted.load()) {
       if (tasks_created.load() == tasks_completed.load()) {
-        pipeline_finished = true;
+        pipeline_finished.store(true);
         notify_downstream_pipelines();
       }
       end_nvtx_range_if_finished();

@@ -340,8 +340,7 @@ void task_creator::manager_loop()
           auto task        = std::make_unique<op::scan::cpu_source_task>(get_next_task_id(),
                                                                   destination_data_repositories[0],
                                                                   std::move(local_state),
-                                                                  cpu_source_global,
-                                                                  *_client_context);
+                                                                  cpu_source_global);
           SIRIUS_LOG_DEBUG("Task Creator: scheduling cpu_source_task, dest_repos={}",
                            destination_data_repositories.size());
           _task_scheduler->schedule(std::move(task));
