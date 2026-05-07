@@ -239,12 +239,24 @@ void sirius_scan_manager::stop()
   _thread_pool.reset();
 }
 
-void sirius_scan_manager::insert_pinned_entry(const std::string& name,
-                                              std::vector<std::string> column_names,
-                                              std::vector<std::string> file_paths,
-                                              std::vector<std::unique_ptr<cudf::table>> data_tables,
-                                              cucascade::memory::memory_space& memory_space)
+void sirius_scan_manager::insert_pinned_entry(
+  const std::string& name,
+  std::vector<std::string> column_names,
+  std::vector<std::string> file_paths,
+  std::vector<std::unique_ptr<cudf::table>> data_tables,
+  std::vector<cucascade::memory::memory_space*> chunk_memory_spaces)
 {
+  // Phase 22 (D-03): chunk_memory_spaces is parallel to data_tables — the caller
+  // (PinTableFunction) emits one memory_space* per chunked_parquet_reader::read_chunk()
+  // result, and there is exactly one cudf::table per chunk in data_tables. Reject any
+  // misalignment loudly rather than silently aliasing chunks to the wrong GPU.
+  if (chunk_memory_spaces.size() != data_tables.size()) {
+    throw std::invalid_argument(
+      "[sirius_scan_manager::insert_pinned_entry] chunk_memory_spaces.size() (" +
+      std::to_string(chunk_memory_spaces.size()) + ") must equal data_tables.size() (" +
+      std::to_string(data_tables.size()) + ")");
+  }
+
   // Compute the total row count of the incoming tables before releasing them
   // (release() empties the table; num_rows() would then return 0).
   std::size_t new_num_rows = 0;
@@ -255,8 +267,32 @@ void sirius_scan_manager::insert_pinned_entry(const std::string& name,
   auto existing_it = _pinned_entries.find(name);
   if (existing_it != _pinned_entries.end()) {
     if (existing_it->second.num_rows == new_num_rows) {
-      // Same row count → merge unique columns into the existing entry.
+      // Phase 22 Pitfall 3: same-row-count merge MUST preserve per-chunk
+      // memory_space alignment between existing and new entry. Per D-02 the
+      // round-robin counter restarts at chunk 0 → GPU 0 per pin_table call,
+      // and (per D-03) chunks at index i across all columns share a memory_space
+      // because they came from the same chunked_parquet_reader::read_chunk()
+      // call. Two pin_table calls of the same file_paths with the same
+      // chunk_read_limit MUST therefore produce identical chunk_memory_spaces
+      // vectors. Reject any mismatch loudly rather than silently aliasing.
       auto& entry = existing_it->second;
+      if (entry.chunk_memory_spaces.size() != chunk_memory_spaces.size()) {
+        throw std::runtime_error(
+          "[sirius_scan_manager::insert_pinned_entry] merge mismatch — "
+          "existing.chunk_memory_spaces.size() (" +
+          std::to_string(entry.chunk_memory_spaces.size()) +
+          ") != new chunk_memory_spaces.size() (" +
+          std::to_string(chunk_memory_spaces.size()) + ")");
+      }
+      for (std::size_t i = 0; i < chunk_memory_spaces.size(); ++i) {
+        if (entry.chunk_memory_spaces[i] != chunk_memory_spaces[i]) {
+          throw std::runtime_error(
+            "[sirius_scan_manager::insert_pinned_entry] merge mismatch — "
+            "chunk_memory_spaces[" +
+            std::to_string(i) + "] differs between existing and new entry");
+        }
+      }
+      // Same row count → merge unique columns into the existing entry.
       for (auto& table : data_tables) {
         if (!table) { continue; }
         auto cols = table->release();
@@ -290,10 +326,10 @@ void sirius_scan_manager::insert_pinned_entry(const std::string& name,
   }
 
   pinned_entry entry;
-  entry.column_names = std::move(column_names);
-  entry.file_paths   = std::move(file_paths);
-  entry.memory_space = &memory_space;
-  entry.num_rows     = new_num_rows;
+  entry.column_names         = std::move(column_names);
+  entry.file_paths           = std::move(file_paths);
+  entry.chunk_memory_spaces  = std::move(chunk_memory_spaces);
+  entry.num_rows             = new_num_rows;
 
   for (auto& table : data_tables) {
     if (!table) { continue; }
