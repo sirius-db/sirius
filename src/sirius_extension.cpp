@@ -26,6 +26,8 @@
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/types.hpp>
 
+#include <rmm/cuda_device.hpp>
+
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -739,14 +741,16 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     throw InvalidInputException("pin_table requires the Sirius context to be initialized");
   }
 
-  // The cudf reader places the table on GPU; pick the first GPU memory space so the
-  // scan_manager can later wrap copies of these columns as data_batch instances.
+  // Phase 22 PIN-MGPU-01 (D-01/D-02/D-05): the cudf reader places parquet
+  // chunks on whichever GPU is current at read_chunk() time; round-robin the
+  // file reads across all GPU memory spaces so multi-file pin_table calls
+  // distribute their chunks evenly. Each file's chunks all bind to the same
+  // GPU (per-file binding — see comment at chunk_idx increment below).
   auto& memory_manager = sirius_ctx->get_memory_manager();
   auto gpu_spaces      = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   if (gpu_spaces.empty()) {
     throw InvalidInputException("pin_table: no GPU memory space available");
   }
-  auto& mem_space = const_cast<cucascade::memory::memory_space&>(*gpu_spaces[0]);
 
   // Glob the user-supplied path into concrete files.
   auto& fs   = FileSystem::GetFileSystem(context);
@@ -784,10 +788,26 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   // chunk_read_limit bytes. The optional n_rows budget caps the cumulative row count
   // across files; once exhausted, stop early.
   std::vector<std::unique_ptr<cudf::table>> tables;
+  // Phase 22 PIN-MGPU-01 (D-03): parallel vector to tables — chunk_memory_spaces[i]
+  // is the memory_space* for the i-th cudf::table in tables. Consumed by
+  // insert_pinned_entry's precondition check (size==data_tables.size).
+  std::vector<cucascade::memory::memory_space*> chunk_memory_spaces;
   std::vector<std::string> read_column_names;  // captured from parquet metadata
   int64_t remaining_rows = data.args.n_rows.value_or(-1);
+  // Phase 22 D-02: per-call local counter (NOT std::atomic, NOT global).
+  // PinTableFunction is single-threaded; new pin_table calls restart at chunk
+  // 0 → GPU 0 for reproducibility (D-02 lock).
+  std::size_t chunk_idx = 0;
   for (auto const& path : file_paths) {
     if (data.args.n_rows.has_value() && remaining_rows <= 0) { break; }
+
+    // Phase 22 D-05: bind device BEFORE constructing chunked_parquet_reader so
+    // the cudf allocator places footer + decompress + column buffers on the
+    // intended GPU. Pitfall 2 closure.
+    auto* target_space = const_cast<cucascade::memory::memory_space*>(
+      gpu_spaces[chunk_idx % gpu_spaces.size()]);
+    int target_gpu_id = target_space->get_device_id();
+    rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{target_gpu_id}};
 
     auto opts = cudf::io::parquet_reader_options::builder(
                   cudf::io::source_info{std::vector<std::string>{path}})
@@ -809,15 +829,23 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
       }
       file_rows_read += chunk_rows;
       tables.emplace_back(std::move(chunk.tbl));
+      chunk_memory_spaces.push_back(target_space);  // parallel to tables (D-03)
     }
     if (data.args.n_rows.has_value()) { remaining_rows -= file_rows_read; }
+    // Phase 22 PIN-MGPU-01 (D-01/D-02): per-call local counter, increments
+    // per file. All chunks within a single chunked_parquet_reader stay on
+    // the same GPU (per D-03 chunks-at-index-i invariant). Cross-file
+    // alternation produces the round-robin. Multi-chunk single-file
+    // distribution requires multi-file fixtures (see Plan 05 distribution
+    // gate test).
+    ++chunk_idx;
   }
 
   sirius_ctx->get_scan_manager().insert_pinned_entry(data.args.name,
                                                      std::move(read_column_names),
                                                      std::move(file_paths),
                                                      std::move(tables),
-                                                     mem_space);
+                                                     std::move(chunk_memory_spaces));
 
   output.SetCardinality(1);
   output.SetValue(0, 0, Value::BOOLEAN(true));
