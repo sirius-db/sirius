@@ -411,6 +411,13 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
       cur_rgs.push_back(rg_idx);
     }
     seal_current_file();
+    // Pre-merge invariant restored: emit at least one split per file so source
+    // pipelines (GPU_PARQUET_SCAN -> ...) generate multiple gpu_pipeline_tasks
+    // when scanning multiple files. task_scheduler's SCHED-RR counter then
+    // distributes those tasks across GPUs. Without this flush, small workloads
+    // (test_physical_*_mgpu fixtures) bundle all files under the
+    // _approximate_batch_size threshold into one split → one task → one GPU.
+    flush();
   }
   flush();
 }
