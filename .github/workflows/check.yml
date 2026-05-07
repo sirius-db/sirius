@@ -141,17 +141,17 @@ jobs:
           TOTAL=$(grep -oP 'Installing \d+/\K\d+' /tmp/vcpkg.log | tail -1)
           BUILT=$((${TOTAL:-0} - ${RESTORED:-0}))
           UPLOADED=$(grep -c 'Starting submission' /tmp/vcpkg.log || true)
-          TOTAL_MS=$(grep -oP 'Elapsed time to handle [^:]+: \K[\d.]+(?= ms)' /tmp/vcpkg.log | awk '{s+=$1} END {printf "%.1f", s/1000}')
+          BUILD_MS=$(grep -oP 'Elapsed time to handle [^:]+: \K[\d.]+(?= ms)' /tmp/vcpkg.log | awk '{s+=$1} END {printf "%.1f", s/1000}')
           HIT_RATE=$(( TOTAL > 0 ? RESTORED * 100 / TOTAL : 0 ))
           {
-            echo "## vcpkg Binary Cache (S3)"
-            echo "| | |"
+            echo "## vcpkg cache stats"
+            echo "| Metric | Value |"
             echo "|---|---|"
-            echo "| Cache hit rate | **${HIT_RATE}%** |"
+            echo "| Cache hit % | **${HIT_RATE}%** |"
             echo "| Restored from S3 | **${RESTORED}** packages${RESTORE_TIME:+ in ${RESTORE_TIME} min} |"
             echo "| Built from source | **${BUILT}** packages |"
             echo "| Uploaded to S3 | **${UPLOADED}** packages |"
-            echo "| Total install time | **${TOTAL_MS}** s |"
+            [ "${BUILT}" -gt 0 ] && echo "| Build time | **${BUILD_MS}** s |"
           } >> "$GITHUB_STEP_SUMMARY"
 
   check:
