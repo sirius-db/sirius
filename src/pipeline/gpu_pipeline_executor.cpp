@@ -269,10 +269,6 @@ void gpu_pipeline_executor::manager_loop()
             orig_task_id,
             oom.get_resume_operator_index());
 
-          // Mark old task as rescheduled so its destructor skips mark_task_completed().
-          // The rescheduled task will handle completion instead.
-          gpu_task->mark_as_rescheduled();
-
           auto intermediate_data = oom.release_intermediate_data();
           if (auto pipelineable_data =
                 dynamic_cast<op::pipelineable_operator_data*>(intermediate_data.get())) {

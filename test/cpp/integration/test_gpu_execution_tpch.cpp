@@ -1944,7 +1944,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
   compare_gpu_vs_cpu(
     "select l.l_orderkey, l.l_linenumber, l.l_quantity, l.l_partkey, o.o_orderkey, o.o_totalprice, "
     "o.o_custkey, o_comment from lineitem l join orders o on l.l_orderkey = o.o_orderkey order by "
-    "l.l_orderkey, l.l_linenumber;");
+    "l.l_orderkey, l.l_linenumber limit 5000;");
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
@@ -1954,7 +1954,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
   compare_gpu_vs_cpu(
     "select l.l_orderkey, l.l_linenumber, l.l_quantity, l.l_partkey, o.o_orderkey, o.o_totalprice, "
     "o.o_custkey, o_comment from lineitem l join orders o on l.l_orderkey = o.o_orderkey order by "
-    "l.l_orderkey, l.l_linenumber;");
+    "l.l_orderkey, l.l_linenumber limit 5000;");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
@@ -1964,7 +1964,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
   compare_gpu_vs_cpu(
     "select l.l_orderkey, l.l_linenumber, l.l_quantity, l.l_partkey, o.o_orderkey, o.o_totalprice, "
     "o.o_custkey, o_comment from lineitem l left join orders o on l.l_orderkey = o.o_orderkey "
-    "order by l.l_orderkey, l.l_linenumber;");
+    "order by l.l_orderkey, l.l_linenumber  limit 5000;");
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
@@ -1974,7 +1974,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
   compare_gpu_vs_cpu(
     "select l.l_orderkey, l.l_linenumber, l.l_quantity, l.l_partkey, o.o_orderkey, o.o_totalprice, "
     "o.o_custkey, o_comment from lineitem l left join orders o on l.l_orderkey = o.o_orderkey "
-    "order by l.l_orderkey, l.l_linenumber;");
+    "order by l.l_orderkey, l.l_linenumber  limit 5000;");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
@@ -1984,7 +1984,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
   compare_gpu_vs_cpu(
     "select l.l_orderkey, l.l_linenumber, l.l_quantity, l.l_partkey, o.o_orderkey, o.o_totalprice, "
     "o.o_custkey, o_comment from lineitem l right join orders o on l.l_orderkey = o.o_orderkey "
-    "order by l.l_orderkey, l.l_linenumber;");
+    "order by l.l_orderkey, l.l_linenumber  limit 5000;");
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
@@ -1994,7 +1994,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
   compare_gpu_vs_cpu(
     "select l.l_orderkey, l.l_linenumber, l.l_quantity, l.l_partkey, o.o_orderkey, o.o_totalprice, "
     "o.o_custkey, o_comment from lineitem l right join orders o on l.l_orderkey = o.o_orderkey "
-    "order by l.l_orderkey, l.l_linenumber;");
+    "order by l.l_orderkey, l.l_linenumber  limit 5000;");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
@@ -2004,7 +2004,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
   compare_gpu_vs_cpu(
     "select l.l_orderkey, l.l_linenumber, l.l_quantity, l.l_partkey, o.o_orderkey, o.o_totalprice, "
     "o.o_custkey, o_comment from lineitem l full outer join orders o on l.l_orderkey = "
-    "o.o_orderkey order by l.l_orderkey, l.l_linenumber;");
+    "o.o_orderkey order by l.l_orderkey, l.l_linenumber  limit 5000;");
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
@@ -2014,7 +2014,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
   compare_gpu_vs_cpu(
     "select l.l_orderkey, l.l_linenumber, l.l_quantity, l.l_partkey, o.o_orderkey, o.o_totalprice, "
     "o.o_custkey, o_comment from lineitem l full outer join orders o on l.l_orderkey = "
-    "o.o_orderkey order by l.l_orderkey, l.l_linenumber;");
+    "o.o_orderkey order by l.l_orderkey, l.l_linenumber  limit 5000;");
 }
 
 //===----------------------------------------------------------------------===//

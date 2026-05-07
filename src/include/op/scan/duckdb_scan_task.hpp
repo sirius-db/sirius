@@ -415,6 +415,7 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
       _data_repo(data_repo)
   {
     g_state->_total_task_count.fetch_add(1);
+    if (g_state->get_pipeline()) { g_state->get_pipeline()->mark_task_created(); }
   };
 
   //===----------Destructor----------===//

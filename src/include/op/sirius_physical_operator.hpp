@@ -315,8 +315,20 @@ class sirius_physical_operator {
   virtual void build_pipelines(pipeline::sirius_pipeline& current,
                                pipeline::sirius_meta_pipeline& meta_pipeline);
 
-  //! Called when the pipeline this operator belongs to finishes. Override to release resources.
-  virtual void finalize_operator() {}
+  //! Called when the pipeline this operator belongs to finishes. Sets finalized=true, then
+  //! dispatches to on_finalize_operator(). Do not override this; override on_finalize_operator().
+  void finalize_operator()
+  {
+    finalized = true;
+    on_finalize_operator();
+  }
+
+  //! True after finalize_operator() has been called on this operator.
+  bool finalized = false;
+
+ protected:
+  //! Override this instead of finalize_operator() to perform cleanup when a pipeline finishes.
+  virtual void on_finalize_operator() {}
 
  public:
   template <class TARGET>
