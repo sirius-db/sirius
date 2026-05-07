@@ -285,7 +285,9 @@ void task_creator::manager_loop()
           auto parquet_task_global_state = _parquet_scan_operator_global_state_map.at(operator_id);
           // ICEBERG_SCAN inherits from PARQUET_SCAN; Cast<> is type-checked by enum so use
           // static_cast for iceberg nodes.
-          auto* parquet_scan = static_cast<op::sirius_physical_parquet_scan*>(node);
+          auto* parquet_scan = (node->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN)
+                                 ? static_cast<op::sirius_physical_parquet_scan*>(node)
+                                 : &node->Cast<op::sirius_physical_parquet_scan>();
 
           while (true) {
             // Hold the pipeline lock across the partition claim and task construction so
@@ -296,7 +298,7 @@ void task_creator::manager_loop()
             auto partition = parquet_task_global_state->claim_next_rg_partition();
             if (!partition.has_value()) { return; }
             if (!parquet_task_global_state->has_more_partitions()) {
-              parquet_scan->has_more_partitions.store(false, std::memory_order_release);
+              parquet_scan->has_more_partitions.store(false);
             }
 
             auto parquet_task_local_state =
@@ -314,8 +316,8 @@ void task_creator::manager_loop()
             task_lock.unlock();
             _task_scheduler->schedule(std::move(parquet_task));
 
-            // For single-scan plans, keep looping to create I/O parallelism.
-            // For multi-scan plans, let the plan re-drive task creation.
+            // If there is only a single scan in the plan, continue creating scan tasks to create
+            // I/O parallelism. Otherwise, let the plan drive the creation of more tasks.
             if (_num_scans_in_plan >= 2) { break; }
           }
 
@@ -341,10 +343,7 @@ void task_creator::manager_loop()
           _task_scheduler->schedule(std::move(task));
 
         } else {
-          // Drain all available port batches, creating one GPU pipeline task per batch.
-          // The pipeline lock is acquired around each port pop + task construction so
-          // that all_ports_empty() / tasks_created checks in update_pipeline_status()
-          // cannot race with task creation.
+          // Create all possible tasks until all ports are empty
           while (!node->all_ports_empty()) {
             auto task_lock  = pipeline->get_task_creation_lock();
             auto input_data = node->get_next_task_input_data();
@@ -352,7 +351,7 @@ void task_creator::manager_loop()
               dynamic_cast<op::pipelineable_operator_data*>(input_data.get());
             if (!input_data ||
                 (pipelineable_input && pipelineable_input->get_data_batches().empty())) {
-              // Port was empty by the time we looked — no task created, counters unchanged.
+              // do data to create task for
               break;
             }
 
