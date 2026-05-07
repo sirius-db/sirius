@@ -228,7 +228,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 | 19. IO Framework Adoption | v1.4 | 6/6 | Complete | 2026-05-06 |
 | 20. Scan Manager + Pin Tables Port | v1.4 | 6/6 | Complete | 2026-05-06 |
 | 21. v1.4 Ship Gate | v1.4 | 1/1 | Complete | 2026-05-06 |
-| 22. Multi-GPU pinning + stream lineage hardening | v1.5+ | 4/7 | In Progress|  |
+| 22. Multi-GPU pinning + stream lineage hardening | v1.5+ | 5/7 | In Progress|  |
 
 ## Phase context
 
@@ -277,13 +277,13 @@ Phase 22 (Multi-GPU pinning + stream lineage hardening)
 **Goal:** `pin_table` distributes parquet chunks round-robin across all available GPU memory spaces (PIN-MGPU-01); cucascade `alloc_and_peer_copy_async` host-staging fallback closes its stream-ordered race (fu17 Cluster B) by collapsing allocator + both memcpy legs onto a single `target_stream`. v1.4 ship-gate gauntlet (REG-01..06) re-passes against the bumped pin; new gates `[pin_mgpu]` distribution + routing + Cluster B sanitizer PASS. HYG-02 = 40 phase-wide invariant preserved.
 **Depends on:** Phase 21
 **Requirements**: PIN-MGPU-01, fu17-cluster-b
-**Plans:** 4/7 plans executed
+**Plans:** 5/7 plans executed
 
 Plans:
 - [x] 22-01-PLAN.md — Refactor `pinned_entry` for per-chunk `memory_space*` vector + add `get_pinned_entries()` accessor
 - [x] 22-02-PLAN.md — `PinTableFunction` round-robin distribution + per-file `cuda_set_device_raii` + `cached_split_provider` per-chunk lookup
 - [x] 22-03-PLAN.md — Cucascade Cluster B same-stream invariant fix in `alloc_and_peer_copy_async` + sanitizer micro-validation
 - [x] 22-04-PLAN.md — Sirius parent submodule pin bump to Plan 03 fix + integration smoke
-- [ ] 22-05-PLAN.md — `[pin_mgpu]` Catch2 distribution + routing tests + CMake registration
+- [x] 22-05-PLAN.md — `[pin_mgpu]` Catch2 distribution + routing tests + CMake registration
 - [ ] 22-06-PLAN.md — `test/scripts/sanitizer_gate_22.sh` Cluster B sanitizer gate (Bash + timeout, exit 0 iff Cluster B = 0)
 - [ ] 22-07-PLAN.md — v1.4 ship-gate gauntlet rerun + Phase 22 new gates + `22-VERDICT.md` + `22-CUCASCADE-DIFF.md` + checkpoint

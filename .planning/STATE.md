@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Gauntlet on Rebased Branch)
 status: executing
-stopped_at: Completed 22-04-PLAN.md (cucascade pin advanced to c666b21; build green; [mgpu] 16/16 PASS; deferred 22-03 Task 2 sanitizer micro-validation PASSED with Cluster B = 0; HYG-02 src/ = 40 invariant preserved)
-last_updated: "2026-05-07T23:33:55.071Z"
+stopped_at: Completed 22-05-PLAN.md ([pin_mgpu] distribution + routing gates 2/2 PASS; [mgpu] 16/16 + [TPC-H][parquet] 22/22 baselines preserved; HYG-02=40)
+last_updated: "2026-05-07T23:43:18.406Z"
 last_activity: 2026-05-07
 progress:
   total_phases: 7
   completed_phases: 0
   total_plans: 7
-  completed_plans: 4
+  completed_plans: 5
 ---
 
 # Project State
@@ -25,7 +25,7 @@ See: .planning/PROJECT.md (updated 2026-05-04)
 ## Current Position
 
 Phase: 22 (multi-gpu-pinning-stream-lineage-hardening) — EXECUTING
-Plan: 4 of 7
+Plan: 5 of 7
 Status: Ready to execute
 Last activity: 2026-05-07
 
@@ -110,6 +110,7 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 | Phase 22 P03 | 4min | 2 tasks | 1 files |
 | Phase 22 P02 | 4min38s | 2 tasks | 4 files |
 | Phase 22 P04 | 7min | 3 tasks | 1 files |
+| Phase 22 P05 | 10min | 2 tasks | 2 files |
 
 ## Decisions
 
@@ -252,6 +253,9 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 - [Phase 22]: [22-04] Sirius parent gitlink advanced from 42a01c4 to c666b21926dec70b26a1febd509435635bea8deb (Plan 22-03's Cluster B same-stream invariant fix); commit 1211a02 on feature/single-node-multi-gpu2; cucascade fork NOT pushed upstream (D-08 / CC-UPSTREAM-01).
 - [Phase 22]: [22-04] DEFERRED 22-03 Task 2 sanitizer micro-validation PASSED: Cluster B (alloc_and_peer_copy_async) = 0 host frames in SF1 Q11 num_gpus=2 sanitizer log (was 16 pre-fix per 20-05-INVESTIGATION.md). Cluster A advisory carry-forward = 4 race blocks (cudf+kvikio internal cross-stream gap; not a Phase 22 ship blocker per D-09). Closes fu17 Cluster B objective.
 - [Phase 22]: [22-04] Integration smoke PASS: MCP build exit 0 (124/124 link); [mgpu] 16/16 PASS (79091 assertions / 116.2s vs Phase 21 REG-01 baseline 106.3s; well under 130s gate); HYG-02 invariant src/ = 40 unchanged; cucascade-side legacy 19 unchanged (modified file representation_converter.cpp has 0).
+- [Phase 22]: [22-05] PIN-MGPU-01 [pin_mgpu] gates landed: distribution (2 distinct GPU device_ids on 4-file × num_gpus=2 pin via get_pinned_entries() accessor + entry.chunk_memory_spaces walk) + routing (>=1 [mgpu-audit] pipeline_task per GPU after CALL pin_table + SELECT through cached split provider). 2/2 PASS, 46 assertions, 6.9s. [mgpu] 16/16 + [TPC-H][parquet] 22/22 baselines preserved. HYG-02=40.
+- [Phase 22]: [22-05] Routing assertion uses pipeline_ids (task_scheduler.cpp:275 emission), not scan_ids — Rule 1 deviation: cached-parquet pin path drives sirius_gpu_parquet_scan_operator -> pipeline_task, NOT duckdb_scan_executor's scan_batch path. Combined pipeline_ids+scan_ids >= 1 retains plan-spec grep gate + forward-compat.
+- [Phase 22]: [22-05] scoped_mgpu_env held in std::unique_ptr + spdlog::default_logger()->flush() before env.reset() — Rule 3 fix: Config::LOG_FLUSH_SECONDS=3s but SF1 query is ~600ms; without explicit flush the [mgpu-audit] emissions stay in spdlog's 8192-byte file_sink buffer. Mirrors test_gpu_execution_tpch_mgpu_audit.cpp:233 env->pause() pattern.
 
 ## Accumulated Context
 
@@ -291,6 +295,6 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 
 ## Session Continuity
 
-Last session: 2026-05-07T23:33:55.068Z
-Stopped at: Completed 22-04-PLAN.md (cucascade pin advanced to c666b21; build green; [mgpu] 16/16 PASS; deferred 22-03 Task 2 sanitizer micro-validation PASSED with Cluster B = 0; HYG-02 src/ = 40 invariant preserved)
+Last session: 2026-05-07T23:43:18.403Z
+Stopped at: Completed 22-05-PLAN.md ([pin_mgpu] distribution + routing gates 2/2 PASS; [mgpu] 16/16 + [TPC-H][parquet] 22/22 baselines preserved; HYG-02=40)
 Resume file: None
