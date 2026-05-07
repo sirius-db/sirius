@@ -69,6 +69,8 @@ CUDAARCHS = "75-real;80-real;86-real;90a-real"
 VCPKG_CUDA_VERSION = "12"
 
 [feature.vcpkg.dependencies]
+# Enable S3 use for vcpkg cache
+awscli = "*"
 bison = "*"
 libnvjitlink-dev = "*"
 cuda-nvrtc-dev = "*"
