@@ -17,6 +17,9 @@ on:
   push:
     branches:
       - dev
+  pull_request:
+    paths:
+      - .github/workflows/distribution.yml
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -29,7 +32,7 @@ jobs:
       duckdb_version: v1.5.1
       ci_tools_version: sirius
       exclude_archs: 'linux_amd64_musl;linux_arm64_musl;osx_amd64;osx_arm64;windows_amd64;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
-      extra_toolchains: 'cuda'
+      extra_toolchains: 'cuda;rust;protobuf'
       vcpkg_url: 'https://github.com/microsoft/vcpkg.git'
       vcpkg_commit: 'ffc071e0c08432c60c9b64f00334c0227667931b'
       skip_tests: true
@@ -51,7 +54,7 @@ jobs:
       duckdb_version: v1.5.1
       ci_tools_version: sirius
       exclude_archs: 'linux_amd64_musl;linux_arm64_musl;osx_amd64;osx_arm64;windows_amd64;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
-      extra_toolchains: 'cuda'
+      extra_toolchains: 'cuda;rust;protobuf'
       vcpkg_url: 'https://github.com/microsoft/vcpkg.git'
       vcpkg_commit: 'ffc071e0c08432c60c9b64f00334c0227667931b'
       skip_tests: true
