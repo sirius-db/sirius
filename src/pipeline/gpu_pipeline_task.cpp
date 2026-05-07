@@ -184,6 +184,9 @@ gpu_pipeline_task::gpu_pipeline_task(
       }
     }
   }
+  if (auto* pipeline = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline()) {
+    pipeline->mark_task_created();
+  }
 }
 
 gpu_pipeline_task::~gpu_pipeline_task()
