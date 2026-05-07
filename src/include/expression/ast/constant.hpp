@@ -16,21 +16,23 @@
 
 #pragma once
 
-namespace sirius::ast {
+// sirius
+#include "expression/value.hpp"     // sirius::value
+#include "helper/logical_type.hpp"  // sirius::logical_type
 
-namespace detail {
-/// Placeholder carrier for the constant payload.
-/// Phase 2 replaces this with sirius::value.
-struct value_placeholder {};
-}  // namespace detail
+namespace sirius::ast {
 
 /**
  * @brief Sirius-native mirror of duckdb::BoundConstantExpression.
  *
- * Carries a literal value. The payload is a placeholder until Phase 2.
+ * Carries a typed literal. `payload` is the typed sum-type holding the
+ * SQL value; `return_type` carries DECIMAL precision (D-06) and the SQL
+ * type of typed NULLs (D-05). Mirrors the shape of cast::target_type
+ * and function_call::return_type.
  */
 struct constant {
-  detail::value_placeholder payload{};
+  sirius::value payload;
+  sirius::logical_type return_type;
 };
 
 }  // namespace sirius::ast

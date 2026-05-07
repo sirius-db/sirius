@@ -149,6 +149,7 @@ set(EXTENSION_SOURCES
     src/downgrade/downgrade_executor.cpp
     src/expression/expression.cpp
     src/expression/join_condition.cpp
+    src/expression/value.cpp
     src/expression_executor/expression_executor_strategy.cpp
     src/expression_executor/gpu_expression_executor.cpp
     src/expression_executor/gpu_expression_translator.cpp
@@ -375,6 +376,7 @@ set(TEST_SOURCES
     test/cpp/expression/test_ast_scaffold.cpp
     test/cpp/expression/test_expression.cpp
     test/cpp/expression/test_join_condition.cpp
+    test/cpp/expression/test_value.cpp
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
     test/cpp/helper/test_logical_type.cpp
