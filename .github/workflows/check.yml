@@ -151,7 +151,7 @@ jobs:
             echo "| Restored from S3 | **${RESTORED}** packages${RESTORE_TIME:+ in ${RESTORE_TIME} min} |"
             echo "| Built from source | **${BUILT}** packages |"
             echo "| Uploaded to S3 | **${UPLOADED}** packages |"
-            [ "${BUILT}" -gt 0 ] && echo "| Build time | **${BUILD_MS}** s |"
+            [ "${BUILT}" -gt 0 ] && echo "| Build time | **${BUILD_MS}** s |" || true
           } >> "$GITHUB_STEP_SUMMARY"
 
   check:
