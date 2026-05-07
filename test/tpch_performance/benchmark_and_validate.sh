@@ -302,6 +302,7 @@ DUCKDB_RESULTS_DIR=""
 DUCKDB_FILE=""
 MULTI_SESSION=false
 DROP_OS_CACHE=false
+PINNING_MODE="none"
 FLOAT_TOL="1e-10"
 while [ $# -gt 1 ]; do
     case "$1" in
@@ -311,6 +312,10 @@ while [ $# -gt 1 ]; do
             ;;
         --float-tolerance)
             FLOAT_TOL="$2"
+            shift 2
+            ;;
+        --pinning-mode)
+            PINNING_MODE="$2"
             shift 2
             ;;
         --data-source)
@@ -366,10 +371,19 @@ done
 NUM_ITERATIONS="${NUM_ITERATIONS:-2}"
 QUERY_TIMEOUT="${QUERY_TIMEOUT:-1200}"
 
+case "$PINNING_MODE" in
+    none|per-query) ;;
+    *)
+        echo "ERROR: --pinning-mode must be 'none' or 'per-query' (got: $PINNING_MODE)"
+        exit 1
+        ;;
+esac
+
 if [ $# -ne 1 ]; then
     echo "Usage: $0 [--config <config_file>] [--data-source parquet|duckdb] [--parquet-dir <path>] [--duckdb-file <path>]"
     echo "          [--engines 'sirius duckdb'] [--iterations N] [--timeout <seconds>] [--duckdb-results <run_dir>]"
-    echo "          [--multi-session] [--drop-os-cache] [--float-tolerance <value>] <scale_factor>"
+    echo "          [--multi-session] [--drop-os-cache] [--pinning-mode none|per-query]"
+    echo "          [--float-tolerance <value>] <scale_factor>"
     echo "       $0 --report [--float-tolerance <value>] <run_dir>"
     echo "  --data-source parquet  (default) → run_tpch_parquet.sh + test_datasets/tpch_parquet_sf<SF> or --parquet-dir"
     echo "  --data-source duckdb             → run_tpch_duckdb.sh + performance_test.duckdb or --duckdb-file"
@@ -500,6 +514,7 @@ echo "=== Collecting run info and filesystem benchmark ==="
     echo "--- Benchmark settings ---"
     echo "multi_session: $MULTI_SESSION"
     echo "drop_os_cache: $DROP_OS_CACHE"
+    echo "pinning_mode: $PINNING_MODE"
     echo ""
 
     echo "--- Benchmark input ---"
@@ -656,6 +671,11 @@ for engine in $ENGINES; do
     fi
     if [ "$DROP_OS_CACHE" = true ]; then
         EXTRA_ARGS+=(--drop-os-cache)
+    fi
+    # Pinning is a Sirius-only feature; the runner ignores it for the duckdb engine,
+    # but we still pass the flag so DuckDB-engine logs reflect the requested mode.
+    if [ "$PINNING_MODE" != "none" ]; then
+        EXTRA_ARGS+=(--pinning-mode "$PINNING_MODE")
     fi
     OUTPUT_DIR="$ENGINE_DIR" "$RUN_SCRIPT" "${EXTRA_ARGS[@]}" "$engine" "$SF" "${QUERIES[@]}" \
         2>&1 | tee "$ENGINE_DIR/run.log"
