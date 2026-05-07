@@ -228,6 +228,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 | 19. IO Framework Adoption | v1.4 | 6/6 | Complete | 2026-05-06 |
 | 20. Scan Manager + Pin Tables Port | v1.4 | 6/6 | Complete | 2026-05-06 |
 | 21. v1.4 Ship Gate | v1.4 | 1/1 | Complete | 2026-05-06 |
+| 22. Multi-GPU pinning + stream lineage hardening | v1.5+ | 0/7 | Planned | — |
 
 ## Phase context
 
@@ -237,6 +238,7 @@ Each phase has a `NN-CONTEXT.md` file in `.planning/phases/NN-*/` capturing rich
 - Phase 13: `.planning/phases/13-q11-multi-gpu-illegal-address/13-CONTEXT.md`
 - Phase 14: `.planning/phases/14-sched-rr-distribution/14-CONTEXT.md`
 - Phase 15: `.planning/phases/15-mgpu-operator-colocation-audit/15-CONTEXT.md`
+- Phase 22: `.planning/phases/22-multi-gpu-pinning-stream-lineage-hardening/22-CONTEXT.md`
 
 ## Phase dependency DAG
 
@@ -257,6 +259,9 @@ Phase 20 (Scan Manager + Pin Tables port)
     |
     v
 Phase 21 (v1.4 Ship Gate)
+    |
+    v
+Phase 22 (Multi-GPU pinning + stream lineage hardening)
 ```
 
 - Phase 16 is the only phase with no predecessor; cucascade API shape governs everything downstream.
@@ -264,14 +269,21 @@ Phase 21 (v1.4 Ship Gate)
 - Phase 18 must follow Phase 17 so the dev-merge auto-merges are committed before RAII rewrites start.
 - Phase 19 must follow Phase 18 so batches created by `sirius_datasource` are accessed via RAII accessors.
 - Phase 20 must follow Phase 19 because `parquet_split_provider::run_batch` calls `sirius_datasource` — compile-graph dependency.
-- Phase 21 is the terminal gate; all migration and porting work must be complete before the full v1.3 gauntlet runs.
+- Phase 21 is the terminal gate for v1.4; all migration and porting work must be complete before the full v1.3 gauntlet runs.
+- Phase 22 is post-v1.4; it lands PIN-MGPU-01 (multi-GPU pinning round-robin) and closes fu17 Cluster B (cucascade `alloc_and_peer_copy_async` same-stream invariant). Re-runs the v1.4 ship-gate gauntlet against the bumped pin to prove no regression.
 
 ### Phase 22: Multi-GPU pinning + stream lineage hardening
 
-**Goal:** [To be planned]
-**Requirements**: TBD
+**Goal:** `pin_table` distributes parquet chunks round-robin across all available GPU memory spaces (PIN-MGPU-01); cucascade `alloc_and_peer_copy_async` host-staging fallback closes its stream-ordered race (fu17 Cluster B) by collapsing allocator + both memcpy legs onto a single `target_stream`. v1.4 ship-gate gauntlet (REG-01..06) re-passes against the bumped pin; new gates `[pin_mgpu]` distribution + routing + Cluster B sanitizer PASS. HYG-02 = 40 phase-wide invariant preserved.
 **Depends on:** Phase 21
-**Plans:** 0 plans
+**Requirements**: PIN-MGPU-01, fu17-cluster-b
+**Plans:** 7 plans
 
 Plans:
-- [ ] TBD (run /gsd:plan-phase 22 to break down)
+- [ ] 22-01-PLAN.md — Refactor `pinned_entry` for per-chunk `memory_space*` vector + add `get_pinned_entries()` accessor
+- [ ] 22-02-PLAN.md — `PinTableFunction` round-robin distribution + per-file `cuda_set_device_raii` + `cached_split_provider` per-chunk lookup
+- [ ] 22-03-PLAN.md — Cucascade Cluster B same-stream invariant fix in `alloc_and_peer_copy_async` + sanitizer micro-validation
+- [ ] 22-04-PLAN.md — Sirius parent submodule pin bump to Plan 03 fix + integration smoke
+- [ ] 22-05-PLAN.md — `[pin_mgpu]` Catch2 distribution + routing tests + CMake registration
+- [ ] 22-06-PLAN.md — `test/scripts/sanitizer_gate_22.sh` Cluster B sanitizer gate (Bash + timeout, exit 0 iff Cluster B = 0)
+- [ ] 22-07-PLAN.md — v1.4 ship-gate gauntlet rerun + Phase 22 new gates + `22-VERDICT.md` + `22-CUCASCADE-DIFF.md` + checkpoint
