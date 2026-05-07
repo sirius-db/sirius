@@ -265,3 +265,13 @@ Phase 21 (v1.4 Ship Gate)
 - Phase 19 must follow Phase 18 so batches created by `sirius_datasource` are accessed via RAII accessors.
 - Phase 20 must follow Phase 19 because `parquet_split_provider::run_batch` calls `sirius_datasource` — compile-graph dependency.
 - Phase 21 is the terminal gate; all migration and porting work must be complete before the full v1.3 gauntlet runs.
+
+### Phase 22: Multi-GPU pinning + stream lineage hardening
+
+**Goal:** [To be planned]
+**Requirements**: TBD
+**Depends on:** Phase 21
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (run /gsd:plan-phase 22 to break down)

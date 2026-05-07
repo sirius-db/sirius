@@ -272,6 +272,10 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 
 - **None.** Phase 18 P1 RAII lock-scope self-deadlock RESOLVED by plan 18-07 Path A architectural fix (commits `0575b0a` + `99e6765`). [mgpu] 16/16 PASS, [mgpu_stress] PASS, racecheck 0 hazards. See 18-VERDICT-V2.md + 18-07-SUMMARY.md.
 
+### Roadmap Evolution
+
+- Phase 22 added: Multi-GPU pinning + stream lineage hardening — round-robin pin distribution (GPU + NUMA-local HOST), cucascade writer-event API, fu17 SF100 Q11 stream-ordered race fix.
+
 ## Session Continuity
 
 Last session: 2026-05-06T19:30:00.000Z
