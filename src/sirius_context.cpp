@@ -150,6 +150,7 @@ void SiriusContext::QueryEnd()
   try {
     spdlog::info("QueryEnd");
     captured_logical_plan_.reset();
+
     query_.reset();
 
     // Drain all downgrade executors before clearing repositories — ensures no downgrade

@@ -27,6 +27,7 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <mutex>
 #include <vector>
 
 namespace sirius {
@@ -167,6 +168,13 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   //! Set the task_creator pointer so this pipeline can schedule downstream consumers on finish.
   void set_task_creator(sirius::creator::task_creator* tc);
 
+  //! Returns a scoped lock on the pipeline status mutex.
+  //! Callers must hold this lock across the operation that consumes pipeline state
+  //! (port data pop, partition claim, etc.) and the task constructor that calls
+  //! mark_task_created(), so that update_pipeline_status() cannot observe an
+  //! empty-port / balanced-counter state while a task is mid-creation.
+  [[nodiscard]] std::unique_lock<std::mutex> get_task_creation_lock();
+
   [[nodiscard]] uuid::UUID pipeline_uuid() const { return _pipeline_uuid; }
 
  private:
@@ -208,6 +216,11 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   size_t pipeline_id = 0;
   //! Plan-time context (replaces sirius_engine& for plan-time needs)
   pipeline_build_context build_ctx_;
+
+  //! Serialises update_pipeline_status() checks against task_creator's port-pop +
+  //! mark_task_created() sequences so neither can observe a transiently-balanced
+  //! counter while the other is mid-operation.
+  mutable std::mutex _status_mutex;
 
   //! Whether the pipeline has been finished
   std::atomic<bool> pipeline_finished = false;

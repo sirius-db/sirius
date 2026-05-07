@@ -51,12 +51,12 @@ cpu_source_task_global_state::cpu_source_task_global_state(
 cpu_source_task::cpu_source_task(uint64_t task_id,
                                  cucascade::shared_data_repository* data_repo,
                                  std::unique_ptr<cpu_source_task_local_state> local_state,
-                                 std::shared_ptr<cpu_source_task_global_state> global_state,
-                                 duckdb::ClientContext& client_ctx)
-  : sirius_pipeline_itask(std::move(local_state), std::move(global_state)),
-    _data_repo(data_repo),
-    _client_ctx(client_ctx)
+                                 std::shared_ptr<cpu_source_task_global_state> global_state)
+  : sirius_pipeline_itask(std::move(local_state), std::move(global_state)), _data_repo(data_repo)
 {
+  if (auto* pipeline = _global_state->cast<cpu_source_task_global_state>().get_pipeline()) {
+    pipeline->mark_task_created();
+  }
 }
 
 cpu_source_task::~cpu_source_task()
@@ -268,38 +268,37 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
   return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(table));
 }
 
+std::size_t cpu_source_task::get_estimated_reservation_size() const
+{
+  constexpr std::size_t kMinBytes = 64ULL * 1024;
+  auto& g_state                   = _global_state->cast<cpu_source_task_global_state>();
+  auto& source                    = g_state.get_source_op();
+  if (source.collection) {
+    auto count = source.collection->Count();
+    if (count > 0) {
+      return std::max(kMinBytes, static_cast<std::size_t>(count) * std::size_t{256});
+    }
+  }
+  return kMinBytes;
+}
+
 std::unique_ptr<op::operator_data> cpu_source_task::compute_task(rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"cpu_source_task::compute_task"};
 
-  auto& g_state    = _global_state->cast<cpu_source_task_global_state>();
-  auto& source     = g_state.get_source_op();
-  auto* sirius_ctx = _client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state").get();
+  auto& g_state = _global_state->cast<cpu_source_task_global_state>();
+  auto& source  = g_state.get_source_op();
 
-  // Request a host memory reservation
-  auto& mem_mgr = sirius_ctx->get_memory_manager();
-  // Use a conservative estimate — ColumnDataCollection is small
-  size_t reserve_size = 64 * 1024;  // 64 KB default
-  if (source.collection) {
-    // Estimate from collection size: count * avg_row_bytes
-    auto count = source.collection->Count();
-    if (count > 0) {
-      reserve_size = std::max(reserve_size, count * 256);  // generous estimate
-    }
-  }
-  auto reservation = mem_mgr.request_reservation(
-    cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST}, reserve_size);
-  if (!reservation) { throw std::runtime_error("[cpu_source_task] Failed to reserve host memory"); }
-  auto& mem_space = const_cast<cucascade::memory::memory_space&>(reservation->get_memory_space());
-
-  // Hand ownership of the reservation to the task's local state. Batches
-  // produced below reference memory backed by this reservation; keeping it
-  // alive on the task (not as a function-local) is what keeps the memory_space
-  // valid until the batches are consumed downstream.
+  // The reservation was acquired by duckdb_scan_executor::manager_loop before
+  // this task was dispatched. Batches produced below reference memory backed
+  // by this reservation, so it must stay alive on the local state until the
+  // batches are consumed downstream.
   auto* local = dynamic_cast<cpu_source_task_local_state*>(local_state());
   if (!local) { throw std::runtime_error("[cpu_source_task] Unexpected local state type"); }
-  local->set_reservation(std::move(reservation));
   auto* reservation_ptr = local->reservation();
+  if (!reservation_ptr) { throw std::runtime_error("[cpu_source_task] No memory reservation set"); }
+  auto& mem_space =
+    const_cast<cucascade::memory::memory_space&>(reservation_ptr->get_memory_space());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
 

@@ -194,7 +194,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   // Sink Interface
   bool is_sink() const override { return true; }
 
-  void finalize_operator() override;
+  void on_finalize_operator() override;
 };
 
 }  // namespace op

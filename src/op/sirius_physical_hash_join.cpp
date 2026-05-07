@@ -1163,7 +1163,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                             stream);
 }
 
-void sirius_physical_hash_join::finalize_operator()
+void sirius_physical_hash_join::on_finalize_operator()
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {

@@ -234,6 +234,21 @@ void sirius_engine::execute()
     sirius_ctx->get_task_scheduler().drain_after_error();
     throw;
   }
+
+  // All tasks completed — operators and pipelines are still alive here.
+  // Warn about any intermediate operators that were never finalized.
+  if (auto query = sirius_ctx->get_query()) {
+    for (const auto& pipeline : query->get_pipelines()) {
+      for (const auto& op_ref : pipeline->get_operators()) {
+        const auto& op = op_ref.get();
+        if (!op.finalized) {
+          SIRIUS_LOG_WARN("[execute] operator '{}' (id={}) was not finalized",
+                          op.get_name(),
+                          op.get_operator_id());
+        }
+      }
+    }
+  }
 }
 
 duckdb::unique_ptr<op::sirius_physical_operator> sirius_engine::construct_sirius_specific_operator(

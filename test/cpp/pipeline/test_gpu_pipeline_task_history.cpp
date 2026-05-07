@@ -172,6 +172,7 @@ struct pipeline_task_history_fixture {
 //------------------------------------------------------------------------------
 struct pipeline_context {
   duckdb::shared_ptr<sirius::pipeline::sirius_pipeline> pipeline;
+  std::unique_ptr<stub_operator> stub_source;
   std::unique_ptr<stub_operator> stub_op;
 };
 
@@ -181,9 +182,11 @@ pipeline_context create_pipeline_context()
   const sirius::pipeline::pipeline_build_context build_ctx{true};
   ctx.pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(build_ctx);
   ctx.pipeline->set_pipeline_id(42);
-  ctx.stub_op = std::make_unique<stub_operator>();
+  ctx.stub_source = std::make_unique<stub_operator>();
+  ctx.stub_op     = std::make_unique<stub_operator>();
 
   sirius::pipeline::sirius_pipeline_build_state build_state;
+  build_state.set_pipeline_source(*ctx.pipeline, *ctx.stub_source);
   build_state.add_pipeline_operator(*ctx.pipeline, *ctx.stub_op);
   build_state.set_pipeline_sink(*ctx.pipeline, *ctx.stub_op, 1);
   return ctx;
@@ -323,8 +326,6 @@ TEST_CASE(
 
   auto task =
     create_pipeline_task(f, global_state, std::move(input_batch), kReservationSize, /*task_id=*/1);
-  // This unit test constructs a minimal pipeline shell, so never run the completion path.
-  task->mark_as_rescheduled();
 
   REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
 
@@ -382,7 +383,6 @@ TEST_CASE("gpu_pipeline_task execute OOM in operator execute records to pipeline
 
   auto task =
     create_pipeline_task(f, global_state, std::move(input_batch), kReservationSize, /*task_id=*/1);
-  task->mark_as_rescheduled();
 
   REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
 
@@ -435,9 +435,6 @@ TEST_CASE("gpu_pipeline_task execute successfully records to pipeline memory his
     create_pipeline_task(f, global_state, std::move(input_batch), kReservationSize1, /*task_id=*/1);
 
   task1->execute(stream);
-  // Mark as rescheduled so the destructor does not call mark_task_completed()
-  // (which would dereference the pipeline's null source operator).
-  task1->mark_as_rescheduled();
 
   // Verify: memory history should have one record with the peak_bytes
   REQUIRE(global_state->get_memory_history().size() == 1);
@@ -464,9 +461,6 @@ TEST_CASE("gpu_pipeline_task execute successfully records to pipeline memory his
   local_state2_ptr->set_reservation(std::move(task_reservation2));
 
   task2->execute(stream);
-  // Mark as rescheduled so the destructor does not call mark_task_completed()
-  // (which would dereference the pipeline's null source operator).
-  task2->mark_as_rescheduled();
 
   // Verify: memory history should have two records with the peak_bytes, and verify that
   // estimates now consider the second tasks history
@@ -550,7 +544,6 @@ TEST_CASE("record_on_failure deduplicates OOM records and keeps max peak",
 
     auto task =
       create_pipeline_task(f, global_state, std::move(batch), kReservationSize, /*task_id=*/1);
-    task->mark_as_rescheduled();
     REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
   }
 
@@ -569,7 +562,6 @@ TEST_CASE("record_on_failure deduplicates OOM records and keeps max peak",
 
     auto task =
       create_pipeline_task(f, global_state, std::move(batch), kReservationSize, /*task_id=*/2);
-    task->mark_as_rescheduled();
     REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
   }
 
@@ -588,7 +580,6 @@ TEST_CASE("record_on_failure deduplicates OOM records and keeps max peak",
 
     auto task =
       create_pipeline_task(f, global_state, std::move(batch), kReservationSize, /*task_id=*/3);
-    task->mark_as_rescheduled();
     REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
   }
 
@@ -607,7 +598,6 @@ TEST_CASE("record_on_failure deduplicates OOM records and keeps max peak",
 
     auto task =
       create_pipeline_task(f, global_state, std::move(batch), kReservationSize, /*task_id=*/4);
-    task->mark_as_rescheduled();
     REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
   }
 

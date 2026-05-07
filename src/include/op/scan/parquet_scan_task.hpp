@@ -619,6 +619,7 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
       _task_id(task_id),
       _data_repo(data_repo)
   {
+    if (auto pipeline = g_state->get_operator().get_pipeline()) { pipeline->mark_task_created(); }
   }
 
   ~parquet_scan_task() override;
