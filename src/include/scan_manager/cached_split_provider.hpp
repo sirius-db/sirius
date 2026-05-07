@@ -43,8 +43,11 @@ namespace sirius::scan_manager {
  *   - @p columns_per_request[d] is the chunk vector for D-position @p d. All
  *     inner vectors must have the same size — that size is the number of
  *     emitted batches.
- *   - @p memory_space is captured into each emitted data_batch so memory
- *     accounting matches where the cached columns reside.
+ *   - @p chunk_memory_spaces is parallel to the inner vectors of
+ *     @p columns_per_request: chunk_memory_spaces[i] is the memory_space*
+ *     for chunk i across all D-positions. Per Phase 22 D-04, each emitted
+ *     data_batch carries the memory_space its data lives on so SCHED-01
+ *     routing fans tasks correctly across GPUs.
  *   - @p filter_expression and @p plan are forwarded unchanged on every
  *     emitted batch, mirroring the parquet path's per-split contract. The scan
  *     operator queries @c needs_output_assembly(*plan) to decide whether to
@@ -54,7 +57,7 @@ namespace sirius::scan_manager {
 class cached_split_provider : public split_provider {
  public:
   cached_split_provider(std::vector<std::vector<std::shared_ptr<cudf::column>>> columns_per_request,
-                        cucascade::memory::memory_space& memory_space,
+                        std::vector<cucascade::memory::memory_space*> chunk_memory_spaces,
                         std::shared_ptr<duckdb::Expression> filter_expression,
                         std::shared_ptr<op::scan::scan_plan const> plan);
 
@@ -62,7 +65,10 @@ class cached_split_provider : public split_provider {
 
  private:
   std::vector<std::vector<std::shared_ptr<cudf::column>>> _columns_per_request;
-  cucascade::memory::memory_space* _memory_space;
+  // Phase 22 D-04: per-chunk memory_space lookup. Replaces entry-level
+  // _memory_space (now gone post-PIN-MGPU-01); each chunk carries the
+  // memory_space its data lives on so SCHED-01 routing fans tasks correctly.
+  std::vector<cucascade::memory::memory_space*> _chunk_memory_spaces;
   std::shared_ptr<duckdb::Expression> _filter_expression;
   std::shared_ptr<op::scan::scan_plan const> _plan;
 };

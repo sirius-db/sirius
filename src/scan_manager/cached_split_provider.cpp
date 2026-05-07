@@ -36,11 +36,11 @@ namespace sirius::scan_manager {
 
 cached_split_provider::cached_split_provider(
   std::vector<std::vector<std::shared_ptr<cudf::column>>> columns_per_request,
-  cucascade::memory::memory_space& memory_space,
+  std::vector<cucascade::memory::memory_space*> chunk_memory_spaces,
   std::shared_ptr<duckdb::Expression> filter_expression,
   std::shared_ptr<op::scan::scan_plan const> plan)
   : _columns_per_request(std::move(columns_per_request)),
-    _memory_space(&memory_space),
+    _chunk_memory_spaces(std::move(chunk_memory_spaces)),
     _filter_expression(std::move(filter_expression)),
     _plan(std::move(plan))
 {
@@ -61,6 +61,17 @@ std::future<void> cached_split_provider::start(exec::thread_pool& /*pool*/,
       throw std::runtime_error(
         "[cached_split_provider] mismatched chunk count across requested columns");
     }
+  }
+
+  // Phase 22 D-04: per-chunk memory_space vector must align with the chunk
+  // count derived from columns_per_request. Reject any caller that passes a
+  // misaligned vector loudly rather than silently dispatching cached batches
+  // to the wrong GPU.
+  if (_chunk_memory_spaces.size() != num_batches) {
+    throw std::runtime_error(
+      "[cached_split_provider] chunk_memory_spaces.size() (" +
+      std::to_string(_chunk_memory_spaces.size()) + ") does not match num_batches (" +
+      std::to_string(num_batches) + ")");
   }
 
   for (std::size_t batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
@@ -96,8 +107,17 @@ std::future<void> cached_split_provider::start(exec::thread_pool& /*pool*/,
     // the legacy default-stream wrapper (which would violate HYG-02);
     // cuda_stream_view{} is a null stream view.
     rmm::cuda_stream_view const no_writer_stream{};
+    // Phase 22 D-04: per-chunk memory_space lookup. Replaces entry-level
+    // _memory_space (now gone post-PIN-MGPU-01); each chunk carries the
+    // memory_space its data lives on so SCHED-01 routing fans tasks correctly.
+    auto* chunk_space = _chunk_memory_spaces.at(batch_idx);
+    if (chunk_space == nullptr) {
+      throw std::runtime_error(
+        "[cached_split_provider] chunk_memory_spaces[" + std::to_string(batch_idx) +
+        "] is null");
+    }
     auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
-      view, std::move(owner), alloc_size, *_memory_space, no_writer_stream);
+      view, std::move(owner), alloc_size, *chunk_space, no_writer_stream);
     auto batch =
       std::make_shared<cucascade::data_batch>(::sirius::get_next_batch_id(), std::move(gpu_repr));
 

@@ -104,9 +104,20 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
   try {
     for (auto const& [pinned_name, entry] : _pinned_entries) {
       if (!matches_scan_info(entry)) { continue; }
-      if (entry.memory_space == nullptr) {
+      // Phase 22 D-04: validate the per-chunk memory_space vector before
+      // building the cached_split_provider. Empty vector means the pinned
+      // entry has no chunks (unusual but legal for empty parquet files);
+      // null entries inside the vector violate D-03 chunks-at-index-i.
+      if (entry.chunk_memory_spaces.empty()) {
         throw std::runtime_error("[sirius_scan_manager::create_provider_for] pinned entry '" +
-                                 pinned_name + "' has no memory_space");
+                                 pinned_name + "' has no chunk_memory_spaces");
+      }
+      for (std::size_t i = 0; i < entry.chunk_memory_spaces.size(); ++i) {
+        if (entry.chunk_memory_spaces[i] == nullptr) {
+          throw std::runtime_error(
+            "[sirius_scan_manager::create_provider_for] pinned entry '" + pinned_name +
+            "' chunk_memory_spaces[" + std::to_string(i) + "] is null");
+        }
       }
 
       // Build the canonical scan_plan once. Everything downstream — cached column
@@ -172,8 +183,13 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
         columns_per_request.size(),
         op::scan::needs_output_assembly(plan));
 
+      // Phase 22 D-04: forward the entry's per-chunk memory_space vector to
+      // cached_split_provider. The provider asserts size == num_batches at
+      // start() time and emits each chunk's data_batch tagged with its actual
+      // memory_space so SCHED-01 routing fans cached-scan tasks correctly
+      // across GPUs.
       return std::make_unique<cached_split_provider>(std::move(columns_per_request),
-                                                     *entry.memory_space,
+                                                     entry.chunk_memory_spaces,
                                                      std::move(filter_expression),
                                                      std::move(plan_shared));
     }
