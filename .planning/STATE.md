@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Gauntlet on Rebased Branch)
-status: completed
-stopped_at: Phase 22 context gathered
-last_updated: "2026-05-07T22:00:17.388Z"
-last_activity: 2026-05-06
+status: executing
+stopped_at: Completed 22-01-PLAN.md
+last_updated: "2026-05-07T23:00:42.623Z"
+last_activity: 2026-05-07
 progress:
   total_phases: 7
   completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
+  total_plans: 7
+  completed_plans: 1
 ---
 
 # Project State
@@ -20,14 +20,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-05-04)
 
 **Core value:** Any query can transparently execute across every GPU on the node — tasks are scheduled to the GPU where their input data already resides, memory pressure is absorbed by downgrading to the correct NUMA domain, and parquet I/O is routed through a multi-GPU-safe backend.
-**Current focus:** v1.4 SHIPPED 2026-05-06. v1.5+ scope (PIN-MGPU-01, IO-MGPU-02, CC-UPSTREAM-01, FU-B) awaiting milestone planning.
+**Current focus:** Phase 22 — multi-gpu-pinning-stream-lineage-hardening
 
 ## Current Position
 
-Phase: 21 (v1.4 Ship Gate (Full v1.3 Gauntlet on Rebased Branch)) — COMPLETE
-Plan: 1 of 1 (COMPLETE)
-Status: v1.4 SHIPPED — all 32 requirements (CC-01..04 + MERGE-01..05 + DB-01..05 + IO-12..17 + IO-15B + SM-01..06 + REG-01..06) Complete
-Last activity: 2026-05-06
+Phase: 22 (multi-gpu-pinning-stream-lineage-hardening) — EXECUTING
+Plan: 2 of 7
+Status: Ready to execute
+Last activity: 2026-05-07
 
 ```
 v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans | SHIPPED 2026-05-06
@@ -106,6 +106,7 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 | Phase 20 P05 | 25min | 4 tasks | 3 files |
 | Phase 20 P06 | ~50min | 5 tasks | 11 files |
 | Phase 21 P01 | ~30min | 5 tasks | 5 files |
+| Phase 22 P01 | 4min | 2 tasks | 2 files |
 
 ## Decisions
 
@@ -239,6 +240,7 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 - [Phase 21]: [21-01] All 6 REG-01..06 PASS on rebased `feature/single-node-multi-gpu2`: REG-01 16/16 (79091/106.3s), REG-02 22/22 (36256/79.3s), REG-03 48/48 (71607/152.4s), REG-04 SF100 Q1 num_gpus=2 3.150s + byte-identical + intersect=0, REG-05 [mgpu_stress] 500-iter (77053/76.7s), REG-06 HYG-02=40 + sanitizer 0 violations on both legs.
 - [Phase 21]: [21-01] One-off Q11 parquet num_gpus=2 cudaErrorIllegalAddress observed during REG-02 first attempt; resolved on retry (22/22 PASS); Q11 alone PASS (9011 assertions, 7.1s). Documented as known intermittent follow-up #17 (per `project_phase08_fu17`); NOT a Phase 21 regression.
 - [Phase 21]: [21-01] v1.4 SHIPPED: 6 phases / 29 plans / 32 requirements clear. Carry-forwards to v1.5+: PIN-MGPU-01, IO-MGPU-02, CC-UPSTREAM-01, FU-B. Cucascade Cluster B (peer-DMA host-staging fallback) tracked under `project_tpch_q1_mgpu_string_bug` (correctness-neutral on this hardware; uncommitted in cucascade).
+- [Phase 22]: [22-01] PIN-MGPU-01 prerequisite landed: pinned_entry now carries per-chunk std::vector<cucascade::memory::memory_space*> chunk_memory_spaces parallel to data_batches_by_column inner vectors; insert_pinned_entry accepts/stores the vector with precondition (size==data_tables.size) + same-row-count merge invariant (Pitfall 3 closure). Public get_pinned_entries() const accessor for Plan 22-05 [pin_mgpu] test. Build intentionally broken at sirius_scan_manager.cpp:107,176 (create_provider_for) + sirius_extension.cpp:820 (PinTableFunction call site) — Plan 22-02 hand-off.
 
 ## Accumulated Context
 
@@ -278,6 +280,6 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 
 ## Session Continuity
 
-Last session: 2026-05-07T22:00:17.385Z
-Stopped at: Phase 22 context gathered
-Resume file: .planning/phases/22-multi-gpu-pinning-stream-lineage-hardening/22-CONTEXT.md
+Last session: 2026-05-07T23:00:42.620Z
+Stopped at: Completed 22-01-PLAN.md
+Resume file: None
