@@ -223,16 +223,27 @@ void sirius_engine::execute()
     future.get();
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
-    // Drain all in-flight GPU tasks before returning.  QueryEnd() will call
-    // clear_all_repositories() immediately after execute() throws; without
-    // this drain, tasks still running in the thread pool hold raw pointers to
-    // those repositories and cause a use-after-free / heap corruption.
     sirius_ctx->get_task_scheduler().drain_after_error();
     throw;
   } catch (...) {
     SIRIUS_LOG_ERROR("Unknown error executing query");
     sirius_ctx->get_task_scheduler().drain_after_error();
     throw;
+  }
+
+  // All tasks completed — operators and pipelines are still alive here.
+  // Warn about any intermediate operators that were never finalized.
+  if (auto query = sirius_ctx->get_query()) {
+    for (const auto& pipeline : query->get_pipelines()) {
+      for (const auto& op_ref : pipeline->get_operators()) {
+        const auto& op = op_ref.get();
+        if (!op.finalized) {
+          SIRIUS_LOG_WARN("[execute] operator '{}' (id={}) was not finalized",
+                          op.get_name(),
+                          op.get_operator_id());
+        }
+      }
+    }
   }
 }
 

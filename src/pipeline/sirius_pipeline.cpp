@@ -365,6 +365,9 @@ void sirius_pipeline::update_pipeline_status()
       if (table_scan.exhausted.load()) {
         if (tasks_created.load() == tasks_completed.load()) {
           pipeline_finished.store(true);
+          for (auto& op : get_operators()) {
+            op.get().finalize_operator();
+          }
           should_notify = true;
         }
         end_nvtx_range_if_finished();
@@ -374,6 +377,9 @@ void sirius_pipeline::update_pipeline_status()
       if (!parquet_scan.has_more_partitions.load()) {
         if (tasks_created.load() == tasks_completed.load()) {
           pipeline_finished.store(true);
+          for (auto& op : get_operators()) {
+            op.get().finalize_operator();
+          }
           should_notify = true;
         }
         end_nvtx_range_if_finished();
@@ -383,6 +389,9 @@ void sirius_pipeline::update_pipeline_status()
       if (cpu_source.exhausted.load()) {
         if (tasks_created.load() == tasks_completed.load()) {
           pipeline_finished.store(true);
+          for (auto& op : get_operators()) {
+            op.get().finalize_operator();
+          }
           should_notify = true;
         }
         end_nvtx_range_if_finished();

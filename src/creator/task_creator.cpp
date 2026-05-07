@@ -258,7 +258,7 @@ void task_creator::manager_loop()
             _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
               ->get_config()
               .get_operator_params();
-          // Local state construction (memory reservation) happens outside the lock.
+
           auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
             *scan_task_global_state,
             *_execution_context,
@@ -283,7 +283,9 @@ void task_creator::manager_loop()
         } else if (node->type == ::sirius::op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
           size_t operator_id             = node->get_operator_id();
           auto parquet_task_global_state = _parquet_scan_operator_global_state_map.at(operator_id);
-          auto* parquet_scan             = static_cast<op::sirius_physical_parquet_scan*>(node);
+          // ICEBERG_SCAN inherits from PARQUET_SCAN; Cast<> is type-checked by enum so use
+          // static_cast for iceberg nodes.
+          auto* parquet_scan = static_cast<op::sirius_physical_parquet_scan*>(node);
 
           while (true) {
             // Hold the pipeline lock across the partition claim and task construction so
@@ -292,10 +294,7 @@ void task_creator::manager_loop()
             // to update_pipeline_status().
             auto task_lock = pipeline->get_task_creation_lock();
             auto partition = parquet_task_global_state->claim_next_rg_partition();
-            if (!partition.has_value()) {
-              // No partitions remain — no task created, counters unchanged.
-              return;
-            }
+            if (!partition.has_value()) { return; }
             if (!parquet_task_global_state->has_more_partitions()) {
               parquet_scan->has_more_partitions.store(false, std::memory_order_release);
             }
