@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Gauntlet on Rebased Branch)
 status: executing
-stopped_at: Completed 22-01-PLAN.md
-last_updated: "2026-05-07T23:00:42.623Z"
+stopped_at: Completed 22-03-PLAN.md (Task 1 done; Task 2 deferred to Plan 22-04)
+last_updated: "2026-05-07T23:03:50.956Z"
 last_activity: 2026-05-07
 progress:
   total_phases: 7
   completed_phases: 0
   total_plans: 7
-  completed_plans: 1
+  completed_plans: 2
 ---
 
 # Project State
@@ -107,6 +107,7 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 | Phase 20 P06 | ~50min | 5 tasks | 11 files |
 | Phase 21 P01 | ~30min | 5 tasks | 5 files |
 | Phase 22 P01 | 4min | 2 tasks | 2 files |
+| Phase 22 P03 | 4min | 2 tasks | 1 files |
 
 ## Decisions
 
@@ -241,6 +242,8 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 - [Phase 21]: [21-01] One-off Q11 parquet num_gpus=2 cudaErrorIllegalAddress observed during REG-02 first attempt; resolved on retry (22/22 PASS); Q11 alone PASS (9011 assertions, 7.1s). Documented as known intermittent follow-up #17 (per `project_phase08_fu17`); NOT a Phase 21 regression.
 - [Phase 21]: [21-01] v1.4 SHIPPED: 6 phases / 29 plans / 32 requirements clear. Carry-forwards to v1.5+: PIN-MGPU-01, IO-MGPU-02, CC-UPSTREAM-01, FU-B. Cucascade Cluster B (peer-DMA host-staging fallback) tracked under `project_tpch_q1_mgpu_string_bug` (correctness-neutral on this hardware; uncommitted in cucascade).
 - [Phase 22]: [22-01] PIN-MGPU-01 prerequisite landed: pinned_entry now carries per-chunk std::vector<cucascade::memory::memory_space*> chunk_memory_spaces parallel to data_batches_by_column inner vectors; insert_pinned_entry accepts/stores the vector with precondition (size==data_tables.size) + same-row-count merge invariant (Pitfall 3 closure). Public get_pinned_entries() const accessor for Plan 22-05 [pin_mgpu] test. Build intentionally broken at sirius_scan_manager.cpp:107,176 (create_provider_for) + sirius_extension.cpp:820 (PinTableFunction call site) — Plan 22-02 hand-off.
+- [Phase 22]: [22-03] Cucascade local fork commit c666b21 lands D-07 same-stream invariant fix in alloc_and_peer_copy_async (drop in-function rmm::cuda_stream src_stream; issue DtoH on target_stream under cuda_set_device_raii(src_device); preserve sync-then-cudaFreeHost ordering with cudaStreamSynchronize(target_stream.value()) inside src_guard scope). HYG-02 invariant preserved (0 rmm::cuda_stream_default in modified file). Plan 22-04 advances Sirius parent submodule pin to c666b21 and runs the Task 2 sanitizer micro-validation (deferred from this plan).
+- [Phase 22]: [22-03] Task 2 sanitizer micro-validation DEFERRED to Plan 22-04 due to parallel-wave Plan 22-01 leaving Sirius parent in transient build-broken state (pinned_entry::memory_space rename to chunk_memory_spaces vector; .cpp callers not yet updated). Cucascade compile-correctness verified via parent build's [91/112] cucascade objects + [92/112] libcucascade.a steps both PASS. Cucascade ctest CC-04 gate similarly deferred (standalone cucascade build dir is configured against an incompatible CMake/CUDA toolchain in this worktree). Plan 22-04 runs the sanitizer gate post-bump.
 
 ## Accumulated Context
 
@@ -280,6 +283,6 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 
 ## Session Continuity
 
-Last session: 2026-05-07T23:00:42.620Z
-Stopped at: Completed 22-01-PLAN.md
+Last session: 2026-05-07T23:03:45.632Z
+Stopped at: Completed 22-03-PLAN.md (Task 1 done; Task 2 deferred to Plan 22-04)
 Resume file: None
