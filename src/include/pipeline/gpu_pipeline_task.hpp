@@ -196,19 +196,6 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
   std::vector<op::sirius_physical_operator*> get_output_consumers() override;
 
   /**
-   * @brief Mark this task as rescheduled due to OOM.
-   *
-   * When set, the destructor will NOT call mark_task_completed() on the pipeline,
-   * since the rescheduled replacement task will handle that instead.
-   */
-  void mark_as_rescheduled() noexcept { _oom_rescheduled = true; }
-
-  /**
-   * @brief Check if this task was rescheduled due to OOM.
-   */
-  [[nodiscard]] bool is_rescheduled() const noexcept { return _oom_rescheduled; }
-
-  /**
    * @brief Get the data repositories for output publishing.
    *
    * Used by the executor to create a rescheduled task with the same output destinations.
@@ -245,7 +232,6 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
  private:
   uint64_t _task_id;
   std::vector<cucascade::shared_data_repository*> _data_repos;
-  bool _oom_rescheduled                                             = false;
   cucascade::memory::reservation_aware_resource_adaptor* _allocator = nullptr;
   /// Input data_batches held for subscribe/unsubscribe lifecycle (LIFE-01/LIFE-02, D-06)
   std::vector<std::shared_ptr<cucascade::data_batch>> _input_batches;

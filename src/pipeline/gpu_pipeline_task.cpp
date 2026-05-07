@@ -204,7 +204,6 @@ gpu_pipeline_task::~gpu_pipeline_task()
     }
   }
 
-  if (_oom_rescheduled) { return; }
   if (_global_state == nullptr ||
       _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline() == nullptr) {
     return;
