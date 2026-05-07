@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Gauntlet on Rebased Branch)
 status: completed
-stopped_at: Completed 21-01-PLAN.md (v1.4 ship gate, all REG-01..06 PASS). v1.4 milestone shipped.
-last_updated: "2026-05-06T19:31:53.925Z"
+stopped_at: Phase 22 context gathered
+last_updated: "2026-05-07T22:00:17.388Z"
 last_activity: 2026-05-06
 progress:
-  total_phases: 6
-  completed_phases: 6
-  total_plans: 29
-  completed_plans: 29
+  total_phases: 7
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
 ---
 
 # Project State
@@ -278,6 +278,6 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 
 ## Session Continuity
 
-Last session: 2026-05-06T19:30:00.000Z
-Stopped at: Completed 21-01-PLAN.md (v1.4 ship gate, all REG-01..06 PASS). v1.4 milestone shipped.
-Resume file: .planning/phases/21-v1-4-ship-gate-full-v1-3-gauntlet-on-rebased-branch/21-VERDICT.md
+Last session: 2026-05-07T22:00:17.385Z
+Stopped at: Phase 22 context gathered
+Resume file: .planning/phases/22-multi-gpu-pinning-stream-lineage-hardening/22-CONTEXT.md
