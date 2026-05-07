@@ -68,6 +68,7 @@ find_package(spdlog REQUIRED CONFIG)
 find_package(yaml-cpp REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
+find_package(OpenSSL REQUIRED)
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
 
@@ -165,6 +166,8 @@ set(EXTENSION_SOURCES
     src/io/admission_control.cpp
     src/io/datasource_factory.cpp
     src/io/prefetching_cache.cpp
+    src/io/s3/sigv4.cpp
+    src/io/s3/sirius_sigv4_credential_provider.cpp
     src/io/sirius_datasource.cpp
     src/io/uri_parser.cpp
     src/io/uring/uring_ioctx.cpp
@@ -332,9 +335,10 @@ endforeach()
 
 # Additional libraries only needed by the static extension
 target_link_libraries(sirius_extension PkgConfig::NUMA PkgConfig::LIBURING
-                      yaml-cpp::yaml-cpp absl::any_invocable)
+                      OpenSSL::Crypto yaml-cpp::yaml-cpp absl::any_invocable)
 
-target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING)
+target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING
+                      OpenSSL::Crypto)
 
 # Required by DuckDB's export set (duckdb_static -> sirius_extension ->
 # cucascade_static / telemetry_bridge)
@@ -381,6 +385,9 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/integration/test_transparent_execution.cpp
+    test/cpp/io/s3/test_sigv4.cpp
+    test/cpp/io/s3/test_sirius_sigv4_credential_provider.cpp
+    test/cpp/io/s3/test_static_credentials.cpp
     test/cpp/io/test_datasource_factory.cpp
     test/cpp/io/test_uri_parser.cpp
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
