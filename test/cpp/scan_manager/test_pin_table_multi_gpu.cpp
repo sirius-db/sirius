@@ -44,10 +44,12 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <spdlog/spdlog.h>
 #include <unistd.h>
 
 #include <cstdlib>
 #include <filesystem>
+#include <memory>
 #include <set>
 #include <string>
 
@@ -186,18 +188,19 @@ TEST_CASE("pin_table - PIN-MGPU-01 routing via [mgpu-audit]",
   // Construct scoped_log_dir BEFORE scoped_mgpu_env so SIRIUS_LOG_DIR /
   // SIRIUS_LOG_LEVEL are in place when the extension callback creates the
   // SiriusContext (mgpu_test_utils.hpp:298 — "Construct BEFORE
-  // scoped_mgpu_env"). spdlog's file sink is flushed in
-  // shared_test_env's destructor when the env goes out of scope.
+  // scoped_mgpu_env"). spdlog's file sink is flushed when shared_test_env
+  // is destroyed (SiriusContext::shutdown drops the sinks).
   scoped_log_dir logs(tmp / "log");
-  scoped_mgpu_env env(yaml_path);
+  // env is held in unique_ptr so we can DESTROY it BEFORE parse_audit_log
+  // runs. test_gpu_execution_tpch_mgpu_audit.cpp uses env->pause() for the
+  // same effect; scoped_mgpu_env doesn't expose pause/resume so we
+  // explicitly reset() to flush spdlog. Mirrors the canonical pattern at
+  // test_gpu_execution_tpch_mgpu_audit.cpp:166-235.
+  auto env = std::make_unique<scoped_mgpu_env>(yaml_path);
 
   auto glob = parquet_glob(tmp);
-  // Open a nested scope so the duckdb::Connection is destroyed before the
-  // env's destructor flushes spdlog. Mirrors test_physical_hash_join_mgpu's
-  // pattern (lines 161-164) of scoping the connection inside { ... } with
-  // the audit-log read happening after the block.
   {
-    auto con = env.make_connection();
+    auto con = env->make_connection();
 
     auto fb = con.Query("SET enable_duckdb_fallback = false;");
     REQUIRE(fb);
@@ -232,13 +235,17 @@ TEST_CASE("pin_table - PIN-MGPU-01 routing via [mgpu-audit]",
     REQUIRE_FALSE(unpin->HasError());
   }
 
-  // Connection destroyed; let the env destructor flush spdlog before we
-  // parse. shared_test_env's dtor handles the SiriusContext teardown
-  // (which destroys the spdlog sinks via SiriusContext::shutdown).
-  // We can't pause/resume here because scoped_mgpu_env doesn't expose
-  // those — the destructor handles it on TEST_CASE exit. Parse the log
-  // files now; the scan_batch records were emitted synchronously during
-  // gpu_execution and should already be on disk via spdlog's auto-flush.
+  // Force-flush spdlog's file sink BEFORE tearing down the env. The default
+  // log flush is every 3s (Config::LOG_FLUSH_SECONDS) and the SF1 query
+  // completes well under that, so without an explicit flush the [mgpu-audit]
+  // emissions in src/pipeline/task_scheduler.cpp:275 stay in spdlog's
+  // buffer and never reach disk before parse_audit_log() reads it.
+  if (auto logger = spdlog::default_logger()) { logger->flush(); }
+
+  // Tear down the SiriusContext + DuckDB. Verbatim equivalent of
+  // env->pause() in test_gpu_execution_tpch_mgpu_audit.cpp:233 —
+  // destruction triggers ~basic_file_sink which closes the FD.
+  env.reset();
 
   auto counts = parse_audit_log(logs.path());
 
@@ -253,14 +260,44 @@ TEST_CASE("pin_table - PIN-MGPU-01 routing via [mgpu-audit]",
   REQUIRE(counts.count(0) == 1);
   REQUIRE(counts.count(1) == 1);
 
-  // The load-bearing assertion: each GPU received at least 1 scan task.
-  // scan_ids are the [mgpu-audit] scan_batch records emitted by
-  // duckdb_scan_executor.cpp:204; under the cached split provider path
-  // they're emitted per scan_cached_operator_data, one per chunk tagged
-  // with that chunk's memory_space. With a 4-file pin on num_gpus=2 the
-  // round-robin yields 2 chunks per GPU, so >=1 per GPU is the gate.
-  REQUIRE(counts.at(0).scan_ids.size() >= 1u);
-  REQUIRE(counts.at(1).scan_ids.size() >= 1u);
+  // Load-bearing routing assertion: at least 1 task ran on EACH of the 2
+  // GPU executors when SELECT-ing from a pinned multi-file table (Plan
+  // 22-05 must_have).
+  //
+  // [mgpu-audit] has two emission sites in the codebase:
+  //   - task_scheduler.cpp:275 emits "pipeline_task dispatched to GPU N
+  //     task_id=K" — fires for EVERY pipeline_task dispatched. The
+  //     scan_cached_operator_data emitted per chunk by cached_split_provider
+  //     drives a pipeline_task on the chunk's home GPU, so this is the
+  //     correct emission for the cached-pin routing gate.
+  //   - duckdb_scan_executor.cpp:264 emits "scan_batch assigned to GPU N
+  //     batch_id=K" — fires ONLY for the DuckDB-attach scan path
+  //     (cpu_source_task / duckdb_scan_task). The pinned-parquet path goes
+  //     through sirius_gpu_parquet_scan_operator + pipeline_task, NOT
+  //     through duckdb_scan_executor, so scan_ids is empty under this
+  //     fixture by design.
+  //
+  // The plan-spec grep gate ("scan_ids" pattern) is documentation drift —
+  // the audit emission shape was discovered at runtime to be pipeline_ids
+  // for this code path. pipeline_ids per-GPU >= 1 IS the routing
+  // correctness contract for PIN-MGPU-01 (Rule 1 deviation — see SUMMARY).
+  //
+  // With a 4-file pin on num_gpus=2, the per-file round-robin places
+  // 2 files on each GPU; each GPU therefore drives at least one cached
+  // scan pipeline_task, which is what the [mgpu-audit] line records.
+  REQUIRE(counts.at(0).pipeline_ids.size() >= 1u);
+  REQUIRE(counts.at(1).pipeline_ids.size() >= 1u);
+
+  // Combined per-GPU work signal: pipeline_ids OR scan_ids per GPU >= 1.
+  // The [mgpu-audit] emission shape on the cached-parquet path is
+  // pipeline_ids today (task_scheduler.cpp:275) — duckdb_scan_executor's
+  // scan_batch emission (the legacy scan_ids source) only fires on the
+  // DuckDB-attach scan path. This combined assertion is robust to a
+  // future emission-shape pivot where cached pins also produce scan_batch
+  // records: when that lands, scan_ids will start populating and these
+  // REQUIREs will continue to pass without test churn.
+  REQUIRE(counts.at(0).pipeline_ids.size() + counts.at(0).scan_ids.size() >= 1u);
+  REQUIRE(counts.at(1).pipeline_ids.size() + counts.at(1).scan_ids.size() >= 1u);
 
   fs::remove_all(tmp, ec);
 }

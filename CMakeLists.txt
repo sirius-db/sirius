@@ -433,6 +433,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_partition_inject.cpp
     test/cpp/scan/test_scan_executor.cpp
     test/cpp/scan/test_split_connector.cpp
+    test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
     test/cpp/unittest.cpp
     test/cpp/utils/sirius_test_env.cpp
     test/cpp/utils/utils.cpp)
