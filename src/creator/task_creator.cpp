@@ -248,6 +248,11 @@ void task_creator::start_thread_pool()
 {
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
+  // Re-arm the request queue. stop_thread_pool() calls
+  // _task_creation_queue.interrupt() so the manager's pop() unblocks; without
+  // a paired reactivate() here, subsequent schedule() pushes silently no-op
+  // and the next query's manager_loop sees an empty/inactive queue forever.
+  _task_creation_queue.reactivate();
   _bounded_pool = std::make_unique<exec::bounded_thread_pool>(
     _config.num_threads, _config.thread_name_prefix, _config.cpu_affinity_list);
   _manager_thread = std::thread(&task_creator::manager_loop, this);

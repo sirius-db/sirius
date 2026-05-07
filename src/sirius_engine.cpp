@@ -234,6 +234,22 @@ void sirius_engine::execute()
     sirius_ctx->get_task_scheduler().drain_after_error();
     throw;
   }
+  // Success path: drain task_creator + executors before returning.
+  // mark_completed() signals the future as soon as the result_collector
+  // pipeline finishes, but other pipelines may still be notifying downstream
+  // consumers (which push task_creation_requests referencing operator
+  // pointers in this engine). Once execute() returns, the engine is
+  // destroyed via sirius_active_query.reset() in cleanup_internal; any
+  // request popped after that point hits a use-after-free in
+  // task_creator::get_operator_for_next_task. Reproduces under multi-thread
+  // sort with many partitions (test "gpu_execution - order by multipartition")
+  // and across consecutive integration tests that share a SiriusContext.
+  // drain_after_error() interrupts + restarts task_creator and every executor,
+  // so leftover dispatch state from this query cannot bleed into the next.
+  // The pairing of stop_thread_pool() + start_thread_pool() now re-arms
+  // _task_creation_queue (see start_thread_pool: reactivate()), so the next
+  // query can enqueue requests cleanly.
+  sirius_ctx->get_task_scheduler().drain_after_error();
 }
 
 duckdb::unique_ptr<op::sirius_physical_operator> sirius_engine::construct_sirius_specific_operator(

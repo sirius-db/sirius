@@ -40,9 +40,8 @@
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
-#include <io/uring/uring_reactor.hpp>
-
 #include <duckdb/common/hive_partitioning.hpp>
+#include <io/uring/uring_reactor.hpp>
 
 #include <algorithm>
 #include <atomic>
