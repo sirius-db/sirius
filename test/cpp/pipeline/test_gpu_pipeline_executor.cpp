@@ -127,7 +127,12 @@ class sirius_pipeline_task : public sirius::pipeline::gpu_pipeline_task {
     global.executed_count.fetch_add(1, std::memory_order_relaxed);
   }
 
-  std::size_t get_estimated_reservation_size() const override { return kReservationBytes; }
+  sirius::pipeline::reservation_size_info get_estimated_reservation_size_info() const override
+  {
+    sirius::pipeline::reservation_size_info info;
+    info.reservation_size = kReservationBytes;
+    return info;
+  }
 
   std::vector<sirius::op::sirius_physical_operator*> get_output_consumers() override { return {}; }
 };

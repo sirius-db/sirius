@@ -62,7 +62,7 @@ class cpu_source_task_local_state : public pipeline::sirius_pipeline_task_local_
 
   // The consumption basis feeds pipeline_memory_history, which cpu_source_task
   // does not use — its reservation size is estimated directly from the
-  // collection row count in get_estimated_reservation_size(), not from
+  // collection row count in get_estimated_reservation_size_info(), not from
   // historical data. Return 0 to satisfy the interface.
   [[nodiscard]] std::size_t get_task_consumption_basis() const override { return 0; }
 };
@@ -87,7 +87,8 @@ class cpu_source_task : public pipeline::sirius_pipeline_itask {
 
   void publish_output(op::operator_data& output_data, rmm::cuda_stream_view stream) override;
 
-  [[nodiscard]] std::size_t get_estimated_reservation_size() const override;
+  [[nodiscard]] pipeline::reservation_size_info get_estimated_reservation_size_info()
+    const override;
 
   std::vector<op::sirius_physical_operator*> get_output_consumers() override;
 

@@ -28,6 +28,20 @@ namespace sirius {
 namespace pipeline {
 
 /**
+ * @brief Breakdown of a task's pre-execution memory reservation estimate.
+ *
+ * Computed by get_estimated_reservation_size_info() and cached on the local state via
+ * set_reservation() so that execute() can access all components without re-computing.
+ */
+struct reservation_size_info {
+  std::size_t input_basis                = 0;  ///< Estimation basis (e.g. input data size)
+  std::size_t bytes_to_materialize_input = 0;  ///< Cost to bring non-GPU input to GPU; 0 for scans
+  std::size_t peak_memory_estimate = 0;  ///< Predicted operator peak; 2*input_basis if no history
+  std::size_t reservation_size     = 0;  ///< peak_memory_estimate + bytes_to_materialize_input
+  bool had_history                 = false;  ///< True if estimate came from pipeline_memory_history
+};
+
+/**
  * @brief Global state shared across all GPU pipeline tasks in an execution context.
  *
  * This class maintains resources and state that are shared among multiple tasks
@@ -122,7 +136,30 @@ class sirius_pipeline_task_local_state : public parallel::itask_local_state {
     }
   }
 
+  /**
+   * @brief Set a memory reservation and cache the pre-computed size breakdown.
+   *
+   * Combines set_reservation() with storing the reservation_size_info produced by
+   * get_estimated_reservation_size_info(), so execute() can read all estimation
+   * components from _reservation_size_info without re-computing them.
+   *
+   * @param res  The memory reservation to set (ownership transferred to the task)
+   * @param info The pre-computed reservation size breakdown
+   */
+  void set_reservation(std::unique_ptr<cucascade::memory::reservation> res,
+                       reservation_size_info info)
+  {
+    set_reservation(std::move(res));
+    _reservation_size_info = info;
+  }
+
   [[nodiscard]] std::size_t get_reservation_bytes() const { return _reservation_bytes; }
+
+  [[nodiscard]] const std::optional<reservation_size_info>& get_reservation_size_info()
+    const noexcept
+  {
+    return _reservation_size_info;
+  }
 
   /**
    * @brief Non-owning accessor for the held reservation.
@@ -154,6 +191,7 @@ class sirius_pipeline_task_local_state : public parallel::itask_local_state {
   std::unique_ptr<cucascade::memory::reservation>
     _reservation;  ///< Memory reservation for GPU resources
   std::size_t _reservation_bytes = 0;
+  std::optional<reservation_size_info> _reservation_size_info;  ///< Cached estimation breakdown
 };
 
 }  // namespace pipeline

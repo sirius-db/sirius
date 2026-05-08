@@ -73,13 +73,26 @@ class sirius_pipeline_itask : public parallel::itask {
   virtual void publish_output(op::operator_data& output_data, rmm::cuda_stream_view stream) = 0;
 
   /**
-   * @brief Get the estimated reservation memory size needed for this task.
+   * @brief Compute the full breakdown of the pre-execution memory reservation estimate.
    *
-   * This method returns the estimated reservation size for this task.
+   * Derived classes implement this to fill all fields of reservation_size_info.
+   * The caller (executor) uses reservation_size_info::reservation_size to acquire a
+   * reservation, then passes the struct to set_reservation() so execute() can read
+   * the components without re-computing them.
    *
-   * @return std::size_t The estimated reservation size
+   * @return reservation_size_info with input_basis, bytes_to_materialize_input,
+   *         peak_memory_estimate, reservation_size, and had_history populated.
    */
-  [[nodiscard]] virtual std::size_t get_estimated_reservation_size() const = 0;
+  [[nodiscard]] virtual pipeline::reservation_size_info get_estimated_reservation_size_info()
+    const = 0;
+
+  /**
+   * @brief Convenience wrapper — returns only the reservation size in bytes.
+   */
+  [[nodiscard]] std::size_t get_estimated_reservation_size() const
+  {
+    return get_estimated_reservation_size_info().reservation_size;
+  }
 
   /// @brief Get the output consumer operators for this task.
   virtual std::vector<op::sirius_physical_operator*> get_output_consumers() = 0;

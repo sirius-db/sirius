@@ -530,7 +530,8 @@ void duckdb_scan_task::process_chunk(duckdb_scan_task_local_state& l_state)
 
 void duckdb_scan_task::execute(rmm::cuda_stream_view stream)
 {
-  auto estimated_bytes = get_estimated_reservation_size();
+  // _reservation_size_info is set by duckdb_scan_executor::manager_loop before dispatch.
+  auto& ls = this->_local_state->cast<duckdb_scan_task_local_state>();
 
   // Record memory metrics for future reservation estimates.
   // Scan tasks don't have peak memory tracking, so use output size as proxy.
@@ -544,10 +545,8 @@ void duckdb_scan_task::execute(rmm::cuda_stream_view stream)
       }
     }
     auto& g_state = _global_state->cast<duckdb_scan_task_global_state>();
-    // Use the raw task consumption basis from local state when recording history
-    auto consumption_basis =
-      this->_local_state->cast<duckdb_scan_task_local_state>().get_task_consumption_basis();
-    g_state.get_memory_history().record({consumption_basis, output_bytes, output_bytes});
+    g_state.get_memory_history().record(
+      {ls.get_reservation_size_info()->input_basis, output_bytes, output_bytes});
 
     publish_output(*output_data, stream);
   }
@@ -621,14 +620,19 @@ void duckdb_scan_task::publish_output(op::operator_data& output_data, rmm::cuda_
   }
 }
 
-std::size_t duckdb_scan_task::get_estimated_reservation_size() const
+pipeline::reservation_size_info duckdb_scan_task::get_estimated_reservation_size_info() const
 {
-  auto current_estimate =
+  std::size_t input_basis =
     this->_local_state->cast<duckdb_scan_task_local_state>().get_task_consumption_basis();
   auto& g_state = this->_global_state->cast<duckdb_scan_task_global_state>();
-  auto refined  = g_state.get_memory_history().estimate_peak_memory(current_estimate);
-  if (refined) { return *refined; }
-  return current_estimate;
+  auto peak_opt = g_state.get_memory_history().estimate_peak_memory(input_basis);
+
+  pipeline::reservation_size_info info;
+  info.input_basis          = input_basis;
+  info.had_history          = peak_opt.has_value();
+  info.peak_memory_estimate = peak_opt.value_or(input_basis);
+  info.reservation_size     = info.peak_memory_estimate;
+  return info;
 }
 
 }  // namespace sirius::op::scan
