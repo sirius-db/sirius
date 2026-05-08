@@ -3,11 +3,11 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Gauntlet on Rebased Branch)
 status: executing
-stopped_at: "Completed 22-06-PLAN.md (Phase 22 D-12 sanitizer gate script test/scripts/sanitizer_gate_22.sh authored + self-tested live: cluster_B=0, cluster_A=14, total_races=5, exit 0; negative-test exit 1; HYG-02=40)"
-last_updated: "2026-05-08T02:38:07.691Z"
+stopped_at: Phase 22.1 context gathered (kvikio removal — 7 bypass sites, 4 gray-area decisions; K.6 reframed as data-size-bound per SF1 experiment)
+last_updated: "2026-05-08T03:18:06.045Z"
 last_activity: 2026-05-08
 progress:
-  total_phases: 7
+  total_phases: 8
   completed_phases: 1
   total_plans: 7
   completed_plans: 7
@@ -300,6 +300,6 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 
 ## Session Continuity
 
-Last session: 2026-05-08T01:23:07.365Z
-Stopped at: Completed 22-06-PLAN.md (Phase 22 D-12 sanitizer gate script test/scripts/sanitizer_gate_22.sh authored + self-tested live: cluster_B=0, cluster_A=14, total_races=5, exit 0; negative-test exit 1; HYG-02=40)
-Resume file: None
+Last session: 2026-05-08T03:18:06.042Z
+Stopped at: Phase 22.1 context gathered (kvikio removal — 7 bypass sites, 4 gray-area decisions; K.6 reframed as data-size-bound per SF1 experiment)
+Resume file: .planning/phases/22.1-remove-kvikio/22.1-CONTEXT.md
