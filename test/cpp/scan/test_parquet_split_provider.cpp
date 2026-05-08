@@ -16,7 +16,6 @@
 
 // test
 #include <catch.hpp>
-#include <scan/test_helpers_ioctx.hpp>
 #include <utils/utils.hpp>
 
 // sirius
@@ -25,6 +24,15 @@
 #include <op/scan/parquet_scan_operator_data.hpp>
 #include <scan_manager/parquet_split_provider.hpp>
 #include <scan_manager/split_connector.hpp>
+
+// Phase 19 IO-15: include test_helpers_ioctx.hpp LAST among sirius/test
+// headers — it transitively pulls liburing.h via uring_ioctx.hpp ->
+// uring_reactor.hpp, and liburing.h defines a BLOCK_SIZE macro that collides
+// with the BLOCK_SIZE static member in <blockingconcurrentqueue.h> (transitively
+// pulled via utils/utils.hpp -> sirius_context.hpp -> task_creator.hpp ->
+// bounded_thread_pool.hpp). All consumers of blockingconcurrentqueue.h must
+// precede this include. Mirrors src/op/scan/parquet_scan_task.cpp:30-35.
+#include <scan/test_helpers_ioctx.hpp>
 
 // duckdb
 #include <duckdb.hpp>

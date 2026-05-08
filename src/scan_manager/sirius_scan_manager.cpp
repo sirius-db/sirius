@@ -91,6 +91,15 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
   auto info = op->take_scan_info();
   if (!info) { return nullptr; }
 
+  // Phase 22.1 D-04: inject the per-GPU sirius_ioctx map into the operator
+  // BEFORE returning any provider (cached or parquet). read_table_from_metadata
+  // requires _gpu_ioctxs to be non-empty before its first invocation. The setter
+  // is idempotent and runs once per query; prepare_for_query (the sole caller of
+  // create_provider_for) runs before any execute(), so the operator sees the
+  // ioctx map well before the parquet scan path needs it for ioctx selection by
+  // scan_data.gpu_memory_space->get_device_id().
+  op->set_gpu_ioctxs(gpu_ioctxs);
+
   // If a pinned entry's file paths match this operator's scan_info, build the same
   // scan_plan the parquet path would build and serve the scan from cache.
   auto matches_scan_info = [&info](const pinned_entry& entry) {
