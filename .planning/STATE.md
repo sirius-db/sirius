@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Gauntlet on Rebased Branch)
 status: executing
-stopped_at: Phase 22.1 context gathered (kvikio removal — 7 bypass sites, 4 gray-area decisions; K.6 reframed as data-size-bound per SF1 experiment)
-last_updated: "2026-05-08T03:18:06.045Z"
+stopped_at: Completed 22.1-01-PLAN.md (kFileScheme registered in datasource_registry_)
+last_updated: "2026-05-08T03:47:08.556Z"
 last_activity: 2026-05-08
 progress:
   total_phases: 8
   completed_phases: 1
-  total_plans: 7
-  completed_plans: 7
+  total_plans: 14
+  completed_plans: 8
 ---
 
 # Project State
@@ -20,12 +20,12 @@ progress:
 See: .planning/PROJECT.md (updated 2026-05-04)
 
 **Core value:** Any query can transparently execute across every GPU on the node — tasks are scheduled to the GPU where their input data already resides, memory pressure is absorbed by downgrading to the correct NUMA domain, and parquet I/O is routed through a multi-GPU-safe backend.
-**Current focus:** Phase 22 — multi-gpu-pinning-stream-lineage-hardening
+**Current focus:** Phase 22.1 — remove-kvikio
 
 ## Current Position
 
-Phase: 22
-Plan: Not started
+Phase: 22.1 (remove-kvikio) — EXECUTING
+Plan: 2 of 7
 Status: Ready to execute
 Last activity: 2026-05-08
 
@@ -112,6 +112,7 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 | Phase 22 P04 | 7min | 3 tasks | 1 files |
 | Phase 22 P05 | 10min | 2 tasks | 2 files |
 | Phase 22 P06 | 8min | 1 tasks | 1 files |
+| Phase 22.1 P01 | 3min | 3 tasks | 2 files |
 
 ## Decisions
 
@@ -260,6 +261,9 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 - [Phase 22]: [22-06] Phase 22 D-12 sanitizer gate script authored at test/scripts/sanitizer_gate_22.sh; runs SF1 Q11 num_gpus=2 under compute-sanitizer memcheck + track-stream-ordered-races=all via Bash + timeout 600 (NOT MCP per feedback_sanitizer_via_bash_not_mcp); Pitfall 5 literal grep -cE filter (NEVER grep -v); D-09 Cluster A advisory-only branch; verbatim Phase 21 21-VERDICT.md Section F sanitizer command shape.
 - [Phase 22]: [22-06] Live self-test on bumped cucascade pin c666b21: exit 0, cluster_B=0, cluster_A=14 frame mentions, total_races=5 race blocks (matches 22-04 micro-validation profile); 9011 assertions PASS in 9s. Negative-test (fake Cluster B frame injected into log copy): exit 1, gate fires correctly. HYG-02 src/=40 unchanged.
 - [Phase 22]: [22-06] Exit code taxonomy beyond plan body 0/1: 2=env error (sanitizer/binary missing), 3=sanitizer crashed pre-log, 124=timeout fired. Distinguishes infrastructure failures from Cluster B regressions in plan 22-07's gauntlet. P22_SKIP_RUN=1 env override for log-replay (used by negative-test); P22_TIMEOUT_SEC parameterized (default 600).
+- [Phase 22.1]: [22.1-01] kFileScheme registered against the lowest-numbered GPU's sirius_ioctx via std::min_element on gpu_ioctxs_ keys; deterministic but arbitrary — per-GPU-aware callers (Plans 22.1-03/04/05) bypass the registry slot via get_ioctx_for(device_id)
+- [Phase 22.1]: [22.1-01] Throw-not-warn on empty gpu_ioctxs_ at registration time — makes the Phase 19 IO-13 invariant (initialize always produces >=1 ioctx) explicit at the registry-population call site rather than implicit via downstream nullptr returns from lookup
+- [Phase 22.1]: [22.1-01] datasource_registry_.clear() placed in terminate() immediately before gpu_ioctxs_.clear() so registry-borrowed shared_ptrs are released before ~uring_ioctx runs against still-live CUDA context (preserves Phase 19 IO-13 Pitfall 3 ordering)
 
 ## Accumulated Context
 
@@ -300,6 +304,6 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 
 ## Session Continuity
 
-Last session: 2026-05-08T03:18:06.042Z
-Stopped at: Phase 22.1 context gathered (kvikio removal — 7 bypass sites, 4 gray-area decisions; K.6 reframed as data-size-bound per SF1 experiment)
-Resume file: .planning/phases/22.1-remove-kvikio/22.1-CONTEXT.md
+Last session: 2026-05-08T03:46:58.365Z
+Stopped at: Completed 22.1-01-PLAN.md (kFileScheme registered in datasource_registry_)
+Resume file: None

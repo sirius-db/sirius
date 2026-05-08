@@ -293,10 +293,10 @@ Plans:
 **Goal:** All Sirius parquet/metadata reads route through `sirius_ioctx::make_datasource(io_object)`; zero `cudf::io::datasource::create(path)` or `cudf::io::source_info{path}` invocations remain in `src/`. Closes the K.1 (Cluster A) sanitizer race and likely K.6 (`cudaSetDevice(-1)` empty-result fallback at SF100 Q11 num_gpus=2). Subsumes IO-MGPU-02. Required for multi-GPU correctness — kvikio's per-FileHandle CUDA-context binding silently breaks when the destination buffer lives on a different GPU than the FileHandle's bound context.
 **Requirements**: IO-MGPU-02 (subsumed), IO-MGPU-03 (new)
 **Depends on:** Phase 22
-**Plans:** 7 plans
+**Plans:** 1/7 plans executed
 
 Plans:
-- [ ] 22.1-01-PLAN.md — Register kFileScheme uring ioctx in SiriusContext; expose datasource_registry accessor
+- [x] 22.1-01-PLAN.md — Register kFileScheme uring ioctx in SiriusContext; expose datasource_registry accessor
 - [ ] 22.1-02-PLAN.md — Flip datasource_factory policy: throw on unknown scheme ("kvikio path is forbidden"); normalize relative paths to file://<absolute>
 - [ ] 22.1-03-PLAN.md — Migrate sirius_gpu_parquet_scan_operator (site #1) to ioctx->make_datasource — closes K.1 (Cluster A) race source
 - [ ] 22.1-04-PLAN.md — Migrate PinTableFunction (site #2) to per-GPU ioctx + pointer-form source_info
