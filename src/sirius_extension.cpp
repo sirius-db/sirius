@@ -32,12 +32,6 @@
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
-// Phase 22.1 D-05 (Plan 22.1-04): PinTableFunction routes parquet reads
-// through the per-GPU sirius_ioctx instead of cudf's bundled file_source
-// factory (which uses kvikio internally and binds to a single CUDA context).
-#include "io/types.hpp"               // sirius::io::sirius_ioctx
-#include "io/uring/uring_reactor.hpp" // sirius::io::uring_io_object
-
 // Forward-declare CUDA profiler API functions (linked via libcudart).
 extern "C" int cudaProfilerStart();
 extern "C" int cudaProfilerStop();
@@ -72,6 +66,19 @@ extern "C" int cudaProfilerStop();
 #include "sirius_extension.hpp"
 #include "sirius_interface.hpp"
 #include "util/segfault_backtrace.hpp"
+
+// Phase 22.1 D-05 (Plan 22.1-04): PinTableFunction routes parquet reads
+// through the per-GPU sirius_ioctx instead of cudf's bundled file_source
+// factory (which uses kvikio internally and binds to a single CUDA context).
+//
+// Phase 19 IO-15 ordering rule: include uring_reactor LAST among sirius
+// headers — liburing.h transitively pulled by uring_reactor.hpp defines a
+// BLOCK_SIZE preprocessor macro that collides with the BLOCK_SIZE static
+// member in <blockingconcurrentqueue.h> (used by spdlog / pipeline / duckdb
+// connection_manager). All consumers of blockingconcurrentqueue.h must
+// precede this include.
+#include "io/types.hpp"               // sirius::io::sirius_ioctx
+#include "io/uring/uring_reactor.hpp" // sirius::io::uring_io_object
 
 #include <cstdlib>
 
