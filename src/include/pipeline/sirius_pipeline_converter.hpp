@@ -19,15 +19,16 @@
 #include "duckdb/common/common.hpp"
 #include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "pipeline/repository_wiring.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
 #include <memory>
 #include <unordered_map>
+#include <vector>
 
 namespace sirius {
 
-class sirius_engine;
 struct operator_params;
 
 namespace pipeline {
@@ -39,6 +40,9 @@ struct pipeline_conversion_result {
   //! Ownership container for operators inserted during splitting (PARTITION, CONCAT, MERGE,
   //! and source-side operators such as DUCKDB_SCAN, GPU_PARQUET_SCAN, CPU_SOURCE).
   duckdb::vector<duckdb::unique_ptr<op::sirius_physical_operator>> inserted_operators;
+  //! Plan-time wiring descriptors. Materialized into runtime repositories and ports by
+  //! `materialize_repository_wiring()` after the converter returns.
+  std::vector<repository_wiring> repository_wirings;
   //! Number of meta-pipelines (used for progress tracking)
   std::size_t meta_pipeline_count;
 };
@@ -48,7 +52,7 @@ struct pipeline_conversion_result {
 //! This class handles the full pipeline conversion process:
 //! 1. Schedule meta-pipelines in dependency order and deep-copy them
 //! 2. Split pipelines by operator type (insert PARTITION/CONCAT/MERGE/SORT operators)
-//! 3. Wire data repositories between pipelines
+//! 3. Compute plan-time wiring descriptors
 //! 4. Set up parent-child pipeline dependencies
 //! 5. Finalize pipeline structure (merge sink into operators vector)
 //! 6. Link hash join sibling partition operators
@@ -69,8 +73,9 @@ class sirius_pipeline_converter {
       iceberg_cache = nullptr);
 
   //! Convert meta-pipelines into execution-ready pipelines.
-  //! The engine reference is only needed for wire_data_repositories (runtime wiring).
-  pipeline_conversion_result convert(sirius_meta_pipeline& root_pipeline, sirius_engine& engine);
+  //! No runtime state required: wiring is emitted as descriptors in the result;
+  //! `materialize_repository_wiring()` performs the runtime side after this returns.
+  pipeline_conversion_result convert(sirius_meta_pipeline& root_pipeline);
 
  private:
   // Phase 1: Schedule and deep-copy
@@ -98,8 +103,10 @@ class sirius_pipeline_converter {
                              duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
                              size_t pipeline_idx);
 
-  // Phase 3: Wire data repositories (requires engine for runtime state)
-  void wire_data_repositories(sirius_engine& engine_);
+  // Phase 3: Compute plan-time wiring descriptors (no engine access).
+  // Runtime materialization is done by `materialize_repository_wiring()` from
+  // `pipeline/repository_wiring_materializer.hpp`.
+  void compute_repository_wiring();
 
   // Phase 4: Set up dependencies
   void setup_pipeline_parents();
@@ -117,6 +124,7 @@ class sirius_pipeline_converter {
   // Internal state built during convert(), moved into result
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> scheduled_;
   duckdb::vector<duckdb::unique_ptr<op::sirius_physical_operator>> inserted_operators_;
+  std::vector<repository_wiring> repository_wirings_;
   std::size_t meta_pipeline_count_ = 0;
 };
 
