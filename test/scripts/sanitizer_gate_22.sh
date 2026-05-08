@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
-# Phase 22 D-12 Cluster B sanitizer gate.
+# Phase 22 D-12 / Phase 22.1 GATE-22.1-B sanitizer gate.
 #
 # Runs SF1 Q11 num_gpus=2 under compute-sanitizer memcheck +
 # track-stream-ordered-races=all and gates exit 0 on:
-#   Cluster B (`alloc_and_peer_copy_async`) race count == 0.
+#   Cluster B (`alloc_and_peer_copy_async`) race count == 0
+#   AND
+#   Cluster A (`read_column_chunks_async` / `posix_device_io`) frame
+#                 mention count == 0 (Phase 22.1 GATE-22.1-B per K.1
+#                 closure trajectory in 22-VERDICT.md K.1; was advisory
+#                 only in Phase 22).
 #
-# Cluster A (cudf+kvikio internal cross-stream gap at
-# `read_column_chunks_async` / `posix_device_io`) is recorded on stdout
-# as advisory only and does NOT affect the exit code (CONTEXT.md D-09).
+# Phase 22 baseline: Cluster A was advisory; SF1 Q11 num_gpus=2 reported
+#   ~6 cudf+kvikio cross-stream race blocks per the Plan 22-04 micro-
+#   validation log. Phase 22.1 removed all kvikio-routed reads from
+#   src/ (sites #1-#7 per 22.1-CONTEXT.md D-01) so the K.1 source frame
+#   no longer exists in tree; Cluster A is now expected to be 0.
 #
 # Per project memory `feedback_sanitizer_via_bash_not_mcp`,
 # compute-sanitizer MUST be invoked via Bash + `timeout` (NOT MCP) on
@@ -24,9 +31,12 @@
 # `grep -cE <pattern>` returns 0; NOT `grep -cv <pattern>` returns N.
 #
 # Exit codes:
-#   0 - PASS: Cluster B = 0
-#   1 - FAIL: Cluster B > 0 (the Phase 22 same-stream invariant fix
-#       did not land or has regressed)
+#   0 - PASS: Cluster B = 0 AND Cluster A = 0
+#   1 - FAIL: Cluster B > 0 OR Cluster A > 0
+#       Cluster B > 0: Phase 22 same-stream invariant fix regressed
+#       Cluster A > 0: Phase 22.1 GATE-22.1-B regressed (a kvikio-routed
+#                      read crept back into src/; check GATE-22.1-A
+#                      bypass-grep)
 #   2 - environment error: compute-sanitizer not found or unittest
 #       binary missing/non-executable
 #   3 - sanitizer crashed before producing log output (distinguishes
@@ -115,7 +125,7 @@ CLUSTER_A=$(grep -cE 'Host Frame:.*(read_column_chunks_async|posix_device_io)' "
 TOTAL_RACES=$(grep -cE 'Use-before-alloc on allocation' "${LOG}" || true)
 
 echo "[p22-sanitizer-gate] cluster_B=${CLUSTER_B} (gate: must be 0)"
-echo "[p22-sanitizer-gate] cluster_A=${CLUSTER_A} (advisory; D-09)"
+echo "[p22-sanitizer-gate] cluster_A=${CLUSTER_A} (gate: must be 0; Phase 22.1 GATE-22.1-B)"
 echo "[p22-sanitizer-gate] total_races=${TOTAL_RACES}"
 echo "[p22-sanitizer-gate] log=${LOG}"
 
@@ -126,5 +136,14 @@ if [[ "${CLUSTER_B}" -ne 0 ]]; then
   exit 1
 fi
 
-echo "[p22-sanitizer-gate] PASS: Cluster B = 0"
+if [[ "${CLUSTER_A}" -ne 0 ]]; then
+  echo "[p22-sanitizer-gate] FAIL: ${CLUSTER_A} Cluster A race-frame mention(s) found (Phase 22.1 GATE-22.1-B)"
+  echo "[p22-sanitizer-gate] First 200 lines of context around the offending Host Frame:.*(read_column_chunks_async|posix_device_io):"
+  grep -B 1 -A 30 -E 'Host Frame:.*(read_column_chunks_async|posix_device_io)' "${LOG}" | head -200 || true
+  echo "[p22-sanitizer-gate] HINT: Phase 22.1 removed all kvikio-routed reads from src/. A non-zero Cluster A means a regression — verify GATE-22.1-A bypass-grep is also 0:"
+  echo "[p22-sanitizer-gate] HINT:   grep -rn 'cudf::io::datasource::create\\|cudf::io::source_info{' src/ | grep -v 'data_source\\.get()\\|datasource\\.get()'"
+  exit 1
+fi
+
+echo "[p22-sanitizer-gate] PASS: Cluster B = 0 AND Cluster A = 0"
 exit 0
