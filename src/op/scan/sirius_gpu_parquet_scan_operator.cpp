@@ -59,6 +59,20 @@ sirius_gpu_parquet_scan_operator::sirius_gpu_parquet_scan_operator(
 sirius_gpu_parquet_scan_operator::~sirius_gpu_parquet_scan_operator() = default;
 
 //===----------------------------------------------------------------------===//
+// Phase 22.1 D-04: per-GPU ioctx map injection
+//===----------------------------------------------------------------------===//
+// Called by sirius_scan_manager::create_provider_for() during prepare_for_query,
+// before any execute() runs. read_table_from_metadata() reads from _gpu_ioctxs to
+// route each parquet open through ioctx->make_datasource(uring_io_object), which
+// replaces the pre-22.1 cudf::io::datasource::create(file_path) call that bypassed
+// the ioctx framework and routed through libkvikio (the K.1 / Cluster A race source).
+void sirius_gpu_parquet_scan_operator::set_gpu_ioctxs(
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> ioctxs)
+{
+  _gpu_ioctxs = std::move(ioctxs);
+}
+
+//===----------------------------------------------------------------------===//
 // Friend access — wired by sirius_scan_manager during prepare_for_query.
 //===----------------------------------------------------------------------===//
 std::unique_ptr<parquet_scan_info> sirius_gpu_parquet_scan_operator::take_scan_info()
