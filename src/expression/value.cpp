@@ -72,10 +72,15 @@ value from_duckdb(const duckdb::Value& v, const logical_type& type)
       // alternative struct. The alt carries only (rep, scale).
       auto const precision = type.decimal_precision();
       auto const scale     = type.decimal_scale();
+      // Sirius has only decimal32/64/128, so DuckDB's narrower physical
+      // widths are widened on read. GetValueUnsafe<T> reinterprets the
+      // value union — it does NOT cast — so each branch must read at the
+      // actual storage width (mirrors to_duckdb above and
+      // gpu_execute_constant.cpp:148-167).
+      if (precision <= logical_type::decimal_max_precision_int16) {
+        return value{decimal32{static_cast<int32_t>(v.GetValueUnsafe<int16_t>()), scale}};
+      }
       if (precision <= logical_type::decimal_max_precision_int32) {
-        // DuckDB stores precision <= 4 as int16_t and 5..9 as int32_t.
-        // Sirius has only decimal32/64/128 (mirrors gpu_execute_constant.cpp:148-167).
-        // GetValueUnsafe<int32_t>() widens int16-storage cleanly.
         return value{decimal32{v.GetValueUnsafe<int32_t>(), scale}};
       }
       if (precision <= logical_type::decimal_max_precision_int64) {
