@@ -421,11 +421,10 @@ TEST_CASE("s3_ioctx async range reads copy caller span descriptors before dispat
     descriptors.emplace_back(first.data(), first.size());
     descriptors.emplace_back(second.data(), second.size());
 
-    ctx->host_read_ranges_async(
-      *obj,
-      ranges,
-      std::span<cudf::host_span<std::byte>>{descriptors},
-      [done](auto bytes, auto ep) { done->set_value({bytes, ep}); });
+    ctx->host_read_ranges_async(*obj,
+                                ranges,
+                                std::span<cudf::host_span<std::byte>>{descriptors},
+                                [done](auto bytes, auto ep) { done->set_value({bytes, ep}); });
 
     auto const entered = provider->wait_until_first_get_entered(5s);
     if (!entered) { provider->release(); }
@@ -441,9 +440,8 @@ TEST_CASE("s3_ioctx async range reads copy caller span descriptors before dispat
   CHECK(bytes == 16);
   require_bytes_equal(first, local, 0);
   require_bytes_equal(second, local, 8);
-  CHECK(std::all_of(poison_second.begin(), poison_second.end(), [](auto b) {
-    return b == std::byte{0xA5};
-  }));
+  CHECK(std::all_of(
+    poison_second.begin(), poison_second.end(), [](auto b) { return b == std::byte{0xA5}; }));
 }
 
 TEST_CASE("s3_ioctx host_read_ranges clips EOF-crossing range before dst validation",
@@ -526,10 +524,9 @@ TEST_CASE("s3_ioctx host_read_ranges rejects dst smaller than clipped size",
   std::vector<cudf::host_span<std::byte>> spans;
   spans.emplace_back(buffer.data(), buffer.size());
 
-  CHECK_THROWS_WITH(ctx->host_read_ranges(*obj,
-                                          ranges,
-                                          std::span<cudf::host_span<std::byte>>{spans}),
-                    "s3_ioctx::host_read_ranges: dst span too small");
+  CHECK_THROWS_WITH(
+    ctx->host_read_ranges(*obj, ranges, std::span<cudf::host_span<std::byte>>{spans}),
+    "s3_ioctx::host_read_ranges: dst span too small");
 }
 
 TEST_CASE("s3_ioctx host_read_ranges clips EOF-crossing ranges independently",
