@@ -23,6 +23,8 @@
 #include <cudf/utilities/default_stream.hpp>
 
 #include <duckdb/main/connection.hpp>
+#include "io/types.hpp"
+#include "io/uring/uring_reactor.hpp"
 #include <log/logging.hpp>
 #include <op/scan/iceberg_avro_reader.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
@@ -203,12 +205,27 @@ struct equality_delete_read_result {
  *
  * Also reads the parquet footer to extract Iceberg field IDs for each key
  * column, enabling schema-evolution-safe matching against data files.
+ *
+ * Phase 22.1 D-06 / D-09: routes both cudf::io::read_parquet (table) and
+ * cudf::io::read_parquet_footers (field-id extraction) through the supplied
+ * sirius_ioctx (single-GPU GPU 0 per D-06). The caller MUST provide a
+ * non-null ioctx — the kvikio bypass path is forbidden phase-wide.
  */
-equality_delete_read_result read_equality_delete_file(std::string const& delete_file_path)
+equality_delete_read_result read_equality_delete_file(std::string const& delete_file_path,
+                                                      sirius::io::sirius_ioctx& ioctx)
 {
   auto stream = cudf::get_default_stream();
+
+  // Phase 22.1 D-06: single-GPU sirius_ioctx (the ioctx parameter — caller
+  // passes GPU 0 per D-06). Both the read_parquet (table data) AND the
+  // read_parquet_footers (field-id extraction) share the same uring_io_object
+  // + sirius_datasource — the io_object opens 2 fds (O_RDONLY + O_RDONLY|O_DIRECT)
+  // so reusing avoids reopening for the footer pass.
+  auto io_object  = std::make_shared<sirius::io::uring_io_object>(delete_file_path);
+  auto datasource = ioctx.make_datasource(io_object);
+
   auto opts =
-    cudf::io::parquet_reader_options::builder(cudf::io::source_info{delete_file_path}).build();
+    cudf::io::parquet_reader_options::builder(cudf::io::source_info{datasource.get()}).build();
   auto result = cudf::io::read_parquet(opts, stream);
 
   if (!result.tbl) {
@@ -224,9 +241,13 @@ equality_delete_read_result read_equality_delete_file(std::string const& delete_
   // Extract Iceberg field IDs from the parquet footer schema.
   std::vector<std::optional<int32_t>> field_ids;
   try {
-    auto ds = cudf::io::datasource::create(delete_file_path);
+    // Reuse the same datasource pointer for the footer pass — datasource and
+    // io_object MUST outlive both reads. Both calls are synchronous so by
+    // function exit both io_object and datasource are dropped together; the
+    // function returns by-value (result.tbl, col_names, field_ids) and
+    // doesn't retain any handle.
     std::vector<std::unique_ptr<cudf::io::datasource>> sources;
-    sources.push_back(std::move(ds));
+    sources.push_back(std::move(datasource));
     auto footers = cudf::io::read_parquet_footers(sources);
 
     if (!footers.empty()) {
@@ -341,7 +362,11 @@ EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
 /// Read equality deletes, group by (schema + sequence number), build per-group hash joins.
 /// This matches DuckDB's approach: each group has exactly one sequence number,
 /// so the scan-time check is a simple CPU comparison (no extra GPU work).
+///
+/// Phase 22.1 D-06: ioctx is the single-GPU sirius_ioctx (GPU 0) used to
+/// route every per-file read through the kvikio-free I/O path.
 void materialize_equality_deletes(std::vector<IcebergDeleteFileEntry> const& eq_entries,
+                                  sirius::io::sirius_ioctx& ioctx,
                                   IcebergDeleteData& data)
 {
   if (eq_entries.empty()) return;
@@ -362,7 +387,7 @@ void materialize_equality_deletes(std::vector<IcebergDeleteFileEntry> const& eq_
     SIRIUS_LOG_DEBUG("[iceberg] Reading equality-delete file: {} (seq={})",
                      eq_entry.file_path,
                      eq_entry.sequence_number);
-    auto read_result = read_equality_delete_file(eq_entry.file_path);
+    auto read_result = read_equality_delete_file(eq_entry.file_path, ioctx);
 
     // Find existing group with same column names AND same sequence number.
     FileGroup* target = nullptr;
