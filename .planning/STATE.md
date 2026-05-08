@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Gauntlet on Rebased Branch)
 status: executing
-stopped_at: Completed 22.1-01-PLAN.md (kFileScheme registered in datasource_registry_)
-last_updated: "2026-05-08T03:47:08.556Z"
+stopped_at: Completed 22.1-02-PLAN.md (datasource_factory policy flip — bypass-grep 0 hits)
+last_updated: "2026-05-08T03:54:48.699Z"
 last_activity: 2026-05-08
 progress:
   total_phases: 8
   completed_phases: 1
   total_plans: 14
-  completed_plans: 8
+  completed_plans: 9
 ---
 
 # Project State
@@ -25,7 +25,7 @@ See: .planning/PROJECT.md (updated 2026-05-04)
 ## Current Position
 
 Phase: 22.1 (remove-kvikio) — EXECUTING
-Plan: 2 of 7
+Plan: 3 of 7
 Status: Ready to execute
 Last activity: 2026-05-08
 
@@ -113,6 +113,7 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 | Phase 22 P05 | 10min | 2 tasks | 2 files |
 | Phase 22 P06 | 8min | 1 tasks | 1 files |
 | Phase 22.1 P01 | 3min | 3 tasks | 2 files |
+| Phase 22.1 P02 | 3min | 3 tasks | 1 files |
 
 ## Decisions
 
@@ -264,6 +265,9 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 - [Phase 22.1]: [22.1-01] kFileScheme registered against the lowest-numbered GPU's sirius_ioctx via std::min_element on gpu_ioctxs_ keys; deterministic but arbitrary — per-GPU-aware callers (Plans 22.1-03/04/05) bypass the registry slot via get_ioctx_for(device_id)
 - [Phase 22.1]: [22.1-01] Throw-not-warn on empty gpu_ioctxs_ at registration time — makes the Phase 19 IO-13 invariant (initialize always produces >=1 ioctx) explicit at the registry-population call site rather than implicit via downstream nullptr returns from lookup
 - [Phase 22.1]: [22.1-01] datasource_registry_.clear() placed in terminate() immediately before gpu_ioctxs_.clear() so registry-borrowed shared_ptrs are released before ~uring_ioctx runs against still-live CUDA context (preserves Phase 19 IO-13 Pitfall 3 ordering)
+- [Phase 22.1]: [22.1-02] datasource_factory policy flip: ALL schemes (including kFileScheme) MUST resolve via registry.lookup or throw verbatim 'kvikio path is forbidden' (D-09); both bypass branches deleted; relative bare paths normalize to file:///<absolute> via std::filesystem::absolute
+- [Phase 22.1]: [22.1-02] kFileScheme constant marked [[maybe_unused]] in anonymous namespace — no longer referenced at runtime in datasource_factory.cpp post-policy-flip; kept as documentation constant for sirius_context.cpp registration site
+- [Phase 22.1]: [22.1-02] Comment-line scrub deviation: removed stray 'cudf::io::datasource::create' textual mention inside a comment so strict bypass-grep returns 0 — sanitizer-gate harness in Plan 22.1-06 greps the bypass token without filtering comments
 
 ## Accumulated Context
 
@@ -304,6 +308,6 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 
 ## Session Continuity
 
-Last session: 2026-05-08T03:46:58.365Z
-Stopped at: Completed 22.1-01-PLAN.md (kFileScheme registered in datasource_registry_)
+Last session: 2026-05-08T03:54:48.695Z
+Stopped at: Completed 22.1-02-PLAN.md (datasource_factory policy flip — bypass-grep 0 hits)
 Resume file: None
