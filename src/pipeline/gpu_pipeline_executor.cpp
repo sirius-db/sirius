@@ -89,7 +89,8 @@ void gpu_pipeline_executor::manager_loop()
       }
       break;
     }
-    auto bytes_needs = gpu_task->get_estimated_reservation_size();
+    auto reservation_info = gpu_task->get_estimated_reservation_size_info();
+    auto bytes_needs      = reservation_info.reservation_size;
     SIRIUS_LOG_TRACE(
       "GPU Pipeline Executor: Acquiring memory reservation for pipeline {} of {} bytes for task "
       "{}. Memory "
@@ -193,7 +194,7 @@ void gpu_pipeline_executor::manager_loop()
     }
     if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
           gpu_task->local_state())) {
-      local_state->set_reservation(std::move(reservation));
+      local_state->set_reservation(std::move(reservation), reservation_info);
     } else {
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast local state for task {}",
                        gpu_task->get_task_id());

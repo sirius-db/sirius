@@ -86,13 +86,15 @@ class pipeline_memory_history {
 
     std::lock_guard<std::mutex> lock(_mutex);
 
-    // Look for an existing failure record with the same estimated_bytes
+    // Look for existing records with the same estimated_bytes
+    bool found = false;
     for (auto& rec : _records) {
-      if (rec.estimated_bytes == estimated_bytes && !rec.output_bytes.has_value()) {
+      if (rec.estimated_bytes == estimated_bytes) {
         rec.peak_memory_bytes = std::max(rec.peak_memory_bytes, peak_memory_bytes);
-        return;
+        found                 = true;
       }
     }
+    if (found) { return; }
 
     // No existing failure record found; insert a new one into the ring buffer
     task_memory_record rec{estimated_bytes, peak_memory_bytes, std::nullopt};
