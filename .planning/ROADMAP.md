@@ -309,7 +309,17 @@ Plans:
 **Goal:** Close fu17 follow-up #17 / K.6 by fixing the HOST-tier `downgrade_executor` worker-init bug. Root cause (empirically isolated by Phase 22.1's advisory check): `src/downgrade/downgrade_executor.cpp:67-89` unconditionally builds a CUDA stream pool keyed to `_memory_space->get_device_id()` and a per-thread init lambda that calls `cudaSetDevice(device_id)`. For HOST-tier (and DISK-tier) executors created in `SiriusContext::initialize` via `create_executors_for_tier(Tier::HOST)`, `get_device_id()` returns the sentinel `-1` (no CUDA device for host memory). At SF1 the failure is silent because the HOST-tier executor never services a downgrade request; at SF100 host pressure triggers a request, the worker thread fails to bind, and the query falls back to empty result. Fix: gate both the stream pool creation and the per-thread init on `_space_id.tier == cucascade::memory::Tier::GPU`. SF100 Q11 num_gpus=2 must return correct non-empty rows post-fix.
 **Requirements**: K.6 (closure of fu17 follow-up #17 / SF100-Q11-MGPU)
 **Depends on:** Phase 22.1 (kvikio removal proves K.6 is independent of kvikio; isolates the failure to downgrade_executor)
-**Plans:** 0/0 plans complete
+**Plans:** 0/0 plans complete (fast-path: single fix commit, no formal plan ceremony)
 
 Plans:
-- [x] TBD (run /gsd:plan-phase 22.2 to break down) (completed 2026-05-08)
+- [x] (fast-path) src/downgrade/downgrade_executor.cpp +13/-3: gate _stream_pool device + per_thread_init on _space_id.tier == GPU (commit 057ba5c, 2026-05-08; verdict in 22.2-VERDICT.md)
+
+### Phase 22.3: Fix CTE operator types declaration (K.7 closure — Q11 SF10+ correctness) (INSERTED)
+
+**Goal:** Close K.7 — the residual cause of Q11 returning 0 rows at any scale ≥ SF10 (regardless of num_gpus). Architectural hypothesis (untested at scaffold time): `src/planner/sirius_plan_cte.cpp:50` constructs `sirius_physical_cte` with `_types = right->types` (the consumer subplan's output types), but `sirius_physical_cte::execute()` at `src/op/sirius_physical_cte.cpp:75-81` is a passthrough that forwards the **producer's** batches unchanged. Result: a CTE operator with declared 3-column types receives and forwards a 5-column batch from its upstream HASH_JOIN. The validation warning at `src/pipeline/gpu_pipeline_task.cpp:56` surfaces the mismatch but doesn't throw; downstream consumers (PROJECTION operators that select columns by index) misread the wrong-shaped batch and produce empty results without raising an error. Q11 is the canary because its HAVING subquery materializes a CTE with both producer and consumer subplans whose output types differ. Likely fix: change `_types` in `sirius_plan_cte.cpp:50` to the producer's output types (need to verify which child of `LogicalMaterializedCTE` is the producer per DuckDB convention). Verification: SF10+ Q11 num_gpus={1,2} returns correct rows matching the SF1 baseline pattern; new SF10 Q11 test added to `[TPC-H][parquet]` Catch2 suite to gate against future regression.
+**Requirements**: K.7 (Q11 SF10+ correctness regression that has been silently shipping; only test gate covers Q11 at SF1)
+**Depends on:** Phase 22.2 (K.6 closure cleared the cudaSetDevice noise that previously masked K.7 in SF100 logs)
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (run /gsd:plan-phase 22.3 to break down)

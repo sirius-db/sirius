@@ -3,11 +3,11 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Gauntlet on Rebased Branch)
 status: executing
-stopped_at: "Completed 22.1-03-PLAN.md (site #1 sirius_gpu_parquet_scan_operator migration; build + [mgpu] 16/16 + [TPC-H][parquet] 22/22 PASS)"
-last_updated: "2026-05-08T16:16:37.186Z"
+stopped_at: "Phase 22.3 scaffolded (K.7 CTE planner fix). Phases 22, 22.1, 22.2 SHIPPED today on feature/single-node-multi-gpu2. K.7 isolated: Q11 returns 0 rows at SF10+ regardless of num_gpus due to sirius_plan_cte.cpp:50 declaring _types from consumer subplan but execute() forwarding producer batches. Resume by reading 22.3-CONTEXT.md."
+last_updated: "2026-05-08T17:29:49.033Z"
 last_activity: 2026-05-08
 progress:
-  total_phases: 9
+  total_phases: 10
   completed_phases: 2
   total_plans: 14
   completed_plans: 14
@@ -317,10 +317,11 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 
 - Phase 22 added: Multi-GPU pinning + stream lineage hardening — round-robin pin distribution (GPU + NUMA-local HOST), cucascade writer-event API, fu17 SF100 Q11 stream-ordered race fix.
 - Phase 22.1 inserted after Phase 22: Remove all kvikio usage — migrate file-path parquet/metadata reads through sirius_ioctx::make_datasource (URGENT). Reason: Phase 22 sanitizer logs (K.1 Cluster A) revealed 7 bypass sites still feeding file paths into cudf's bundled file_source factory (kvikio). Kvikio's per-FileHandle CUDA-context binding silently breaks multi-GPU residency — Phase 22's PIN-MGPU-01 round-robin distribution is necessary but not sufficient on its own. Subsumes IO-MGPU-02 from REQUIREMENTS.md. Shipped 2026-05-08 (HEAD f7d8b45) — REG-01..06 + GATE-22.1-A/B/C all PASS; K.1 closed (6→0 race blocks).
-- Phase 22.2 inserted after Phase 22.1: Fix downgrade_executor cudaSetDevice(-1) (K.6 closure) (URGENT). Reason: Phase 22.1's advisory SF100 Q11 num_gpus=2 check empirically isolated K.6 to HOST-tier downgrade_executor worker-init. Bug location: src/downgrade/downgrade_executor.cpp:67-89 unconditionally calls cudaSetDevice on _memory_space->get_device_id() which returns sentinel -1 for HOST-tier memory spaces. ~15-LOC fix gates both stream pool creation and per_thread_init on _space_id.tier == cucascade::memory::Tier::GPU.
+- Phase 22.2 inserted after Phase 22.1: Fix downgrade_executor cudaSetDevice(-1) (K.6 closure) (URGENT). Reason: Phase 22.1's advisory SF100 Q11 num_gpus=2 check empirically isolated K.6 to HOST-tier downgrade_executor worker-init. Bug location: src/downgrade/downgrade_executor.cpp:67-89 unconditionally calls cudaSetDevice on _memory_space->get_device_id() which returns sentinel -1 for HOST-tier memory spaces. ~15-LOC fix gates both stream pool creation and per_thread_init on _space_id.tier == cucascade::memory::Tier::GPU. Shipped 2026-05-08 (HEAD 7dc47a2) — K.6 closed; SF100 Q11 num_gpus=2 cudaSetDevice errors 1→0.
+- Phase 22.3 inserted after Phase 22.2: Fix CTE operator types declaration (K.7 closure — Q11 SF10+ correctness) (URGENT). Reason: Phase 22.2's K.6 closure cleared the cudaSetDevice noise that was masking K.7. Empirical isolation 2026-05-08: Q11 returns 0 rows at any scale ≥ SF10 regardless of num_gpus (SF10 num_gpus=1 reproduces; not multi-GPU specific, not SF100 specific). Bug location: src/planner/sirius_plan_cte.cpp:50 sets sirius_physical_cte._types = right->types (consumer's output types), but src/op/sirius_physical_cte.cpp:75-81 execute() is a passthrough forwarding the producer's batches unchanged. Likely fix: change to op.children[0]->types (producer side per LogicalMaterializedCTE convention). [TPC-H][parquet] test gate uses SF1 only — SF1 doesn't exercise pipeline_task so the bug never gates. New SF10 Q11 test required.
 
 ## Session Continuity
 
-Last session: 2026-05-08T04:17:39.815Z
-Stopped at: Completed 22.1-03-PLAN.md (site #1 sirius_gpu_parquet_scan_operator migration; build + [mgpu] 16/16 + [TPC-H][parquet] 22/22 PASS)
-Resume file: None
+Last session: 2026-05-08T17:29:49.029Z
+Stopped at: Phase 22.3 scaffolded (K.7 CTE planner fix). Phases 22, 22.1, 22.2 SHIPPED today on feature/single-node-multi-gpu2. K.7 isolated: Q11 returns 0 rows at SF10+ regardless of num_gpus due to sirius_plan_cte.cpp:50 declaring _types from consumer subplan but execute() forwarding producer batches. Resume by reading 22.3-CONTEXT.md.
+Resume file: .planning/phases/22.3-fix-cte-types/22.3-CONTEXT.md
