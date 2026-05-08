@@ -247,21 +247,24 @@ std::unique_ptr<sirius::pipeline::gpu_pipeline_task> create_pipeline_task(
   batches.push_back(std::move(batch));
   auto op_data = std::make_unique<sirius::op::pipelineable_operator_data>(std::move(batches));
 
-  auto local_state =
-    std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(op_data));
+  auto task = std::make_unique<sirius::pipeline::gpu_pipeline_task>(
+    task_id,
+    std::vector<cucascade::shared_data_repository*>{},
+    std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(op_data)),
+    std::move(global_state));
 
   if (reservation_size > 0) {
+    auto info        = task->get_estimated_reservation_size_info();
     auto reservation = f.manager->request_reservation(
       cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::GPU}, reservation_size);
     REQUIRE(reservation != nullptr);
-    local_state->set_reservation(std::move(reservation));
+    auto* ls =
+      dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(task->local_state());
+    REQUIRE(ls != nullptr);
+    ls->set_reservation(std::move(reservation), info);
   }
 
-  return std::make_unique<sirius::pipeline::gpu_pipeline_task>(
-    task_id,
-    std::vector<cucascade::shared_data_repository*>{},
-    std::move(local_state),
-    std::move(global_state));
+  return task;
 }
 }  // namespace
 
@@ -449,7 +452,8 @@ TEST_CASE("gpu_pipeline_task execute successfully records to pipeline memory his
 
   auto task2 = create_pipeline_task(f, global_state, input_batch2, 0, /*task_id=*/2);
 
-  auto estimation2 = task2->get_estimated_reservation_size();
+  auto info2       = task2->get_estimated_reservation_size_info();
+  auto estimation2 = info2.reservation_size;
   REQUIRE(estimation2 ==
           ((float)kInputDataSize2 / (float)kInputDataSize1) * (kExecuteConsumptionSize1));
   auto task_reservation2 = f.manager->request_reservation(
@@ -458,7 +462,7 @@ TEST_CASE("gpu_pipeline_task execute successfully records to pipeline memory his
   auto* local_state2_ptr =
     dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(task2->local_state());
   REQUIRE(local_state2_ptr != nullptr);
-  local_state2_ptr->set_reservation(std::move(task_reservation2));
+  local_state2_ptr->set_reservation(std::move(task_reservation2), info2);
 
   task2->execute(stream);
 

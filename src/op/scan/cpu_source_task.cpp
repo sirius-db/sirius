@@ -268,18 +268,21 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
   return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(table));
 }
 
-std::size_t cpu_source_task::get_estimated_reservation_size() const
+pipeline::reservation_size_info cpu_source_task::get_estimated_reservation_size_info() const
 {
   constexpr std::size_t kMinBytes = 64ULL * 1024;
   auto& g_state                   = _global_state->cast<cpu_source_task_global_state>();
   auto& source                    = g_state.get_source_op();
+  std::size_t reservation_size    = kMinBytes;
   if (source.collection) {
     auto count = source.collection->Count();
     if (count > 0) {
-      return std::max(kMinBytes, static_cast<std::size_t>(count) * std::size_t{256});
+      reservation_size = std::max(kMinBytes, static_cast<std::size_t>(count) * std::size_t{256});
     }
   }
-  return kMinBytes;
+  pipeline::reservation_size_info info;
+  info.reservation_size = reservation_size;
+  return info;
 }
 
 std::unique_ptr<op::operator_data> cpu_source_task::compute_task(rmm::cuda_stream_view stream)
