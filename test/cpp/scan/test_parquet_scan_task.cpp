@@ -16,6 +16,7 @@
 
 // test
 #include <catch.hpp>
+#include <scan/test_helpers_ioctx.hpp>
 #include <scan/test_utils.hpp>
 #include <utils/utils.hpp>
 
@@ -100,42 +101,10 @@ class scan_test_executor : public sirius::parallel::itask_executor {
   }
 };
 
-/// Construct per-GPU @c sirius_ioctx instances for tests that directly seed
-/// @c parquet_scan_task_global_state with the IO framework (Phase 19 IO-15).
-/// Mirrors the per-GPU init pattern used in
-/// @c SiriusContext::initialize() (src/sirius_context.cpp:283) — each
-/// @c uring_ioctx is constructed under @c rmm::cuda_set_device_raii so its
-/// pinned bounce slots bind to the right CUDA context (P11 lock).
-///
-/// IO-05 / Plan 05-04 adds a mandatory-ioctx throw on empty gpu_ioctxs in
-/// parquet_scan_task_global_state. Tests constructing the global state
-/// directly must seed the map via this helper.
-///
-/// @param n_gpus  Desired GPU count. Clamped down to actual @c cudaGetDeviceCount
-///                so the helper is safe on 1-GPU hosts (defaults to all visible
-///                devices, capped at @p n_gpus).
-inline std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> make_test_gpu_ioctxs(
-  int n_gpus = 2)
-{
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  if (device_count < 1) { device_count = 1; }
-  int const effective_n = std::min(n_gpus, device_count);
-
-  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> ioctxs;
-  ioctxs.reserve(effective_n);
-  for (int dev = 0; dev < effective_n; ++dev) {
-    rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{dev}};
-    // Defaults match src/include/io/uring/uring_ioctx.hpp:85-88 (host_ring_depth=16,
-    // ring_entries=64, n_reactors=4, bounce_slot_size=CHUNK_SIZE=1MiB).
-    ioctxs[dev] = std::make_shared<sirius::io::uring_ioctx>(
-      /*host_ring_depth=*/static_cast<unsigned>(16),
-      /*ring_entries=*/static_cast<unsigned>(64),
-      /*n_reactors=*/static_cast<size_t>(4),
-      /*bounce_slot_size=*/sirius::io::CHUNK_SIZE);
-  }
-  return ioctxs;
-}
+// Phase 22.1 D-08: make_test_gpu_ioctxs() lifted into shared header
+// scan/test_helpers_ioctx.hpp so that test_parquet_split_provider.cpp can
+// reuse the same helper. Uses sirius::scan_test_utils::make_test_gpu_ioctxs.
+using sirius::scan_test_utils::make_test_gpu_ioctxs;
 
 static std::unique_ptr<sirius::op::sirius_physical_parquet_scan> make_parquet_scan(
   duckdb::ClientContext& ctx,

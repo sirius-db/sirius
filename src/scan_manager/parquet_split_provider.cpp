@@ -230,20 +230,29 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
     }
   }
 
-  // Phase 20.6 IO-MGPU-02: route footer + column-chunk reads through
-  // sirius_datasource (io_uring + per-GPU CUDA-context binding) instead of
-  // the cudf-bundled file_source factory (which routes through libkvikio and
+  // Phase 20.6 IO-MGPU-02 / Phase 22.1 D-08: route footer + column-chunk reads
+  // through sirius_datasource (io_uring + per-GPU CUDA-context binding) instead
+  // of the cudf-bundled file_source factory (which routes through libkvikio and
   // bypasses the IO framework established in Phase 19). Pick a planning ioctx
   // deterministically — footer reads are small (<1 MiB) and per-GPU residency
   // for column data is determined later by the scan operator's task affinity,
   // not by which ioctx the datasource was originally constructed from.
   // Mirrors parquet_scan_task_global_state::initialize_from_files() (Phase 19).
-  // When _gpu_ioctxs is empty (e.g., unit tests that drive parquet_split_provider in
-  // isolation without a SiriusContext), fall back to cudf's bundled datasource factory.
-  // Production paths populate _gpu_ioctxs from SiriusContext::initialize() and route
-  // through sirius_datasource for per-GPU IO context binding.
+  //
+  // Phase 22.1 D-08 / D-09: gpu_ioctxs MUST be populated. The pre-22.1
+  // unit-test fallback to cudf's default datasource factory routed through
+  // libkvikio internally — that's the kvikio path D-09 forbids. Test
+  // fixtures inject a real ioctx via make_test_gpu_ioctxs() (Phase 19 IO-15
+  // helper, lifted to shared header test/cpp/scan/test_helpers_ioctx.hpp in
+  // Phase 22.1-06).
+  if (_gpu_ioctxs.empty()) {
+    throw std::runtime_error(
+      "parquet_split_provider: gpu_ioctxs is empty — kvikio path is forbidden "
+      "(Phase 22.1 D-08 / D-09). Production callers receive gpu_ioctxs from "
+      "SiriusContext::get_gpu_ioctxs(); test fixtures must inject via "
+      "make_test_gpu_ioctxs() helper (test/cpp/scan/test_helpers_ioctx.hpp).");
+  }
   auto const planning_ioctx_it = _gpu_ioctxs.begin();
-  bool const have_gpu_ioctxs   = (planning_ioctx_it != _gpu_ioctxs.end());
 
   // Loop over files to read footers, parse metadata, and compute row-group partitions.
   rg_accumulator accum;
@@ -282,18 +291,13 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
     }
 
     //===----------Read metadata footers----------===//
-    // When gpu_ioctxs is configured (production path), route through sirius_datasource
-    // for per-GPU IO context binding (multi-GPU IO routing — bypasses cudf's bundled
-    // file_source which would route through libkvikio and skip the io_uring + per-GPU
-    // CUDA-context binding). Otherwise (unit tests), use cudf's default factory.
-    std::shared_ptr<sirius::io::uring_io_object> io_object;
-    std::unique_ptr<cudf::io::datasource> datasource;
-    if (have_gpu_ioctxs) {
-      io_object  = std::make_shared<sirius::io::uring_io_object>(file_path);
-      datasource = planning_ioctx_it->second->make_datasource(io_object);
-    } else {
-      datasource = cudf::io::datasource::create(file_path);
-    }
+    // Phase 22.1 D-08 / D-09: gpu_ioctxs is guaranteed non-empty (precondition
+    // checked above). Route through sirius_datasource for per-GPU IO context
+    // binding (multi-GPU IO routing — bypasses cudf's bundled file_source
+    // which would route through libkvikio and skip the io_uring + per-GPU
+    // CUDA-context binding).
+    auto io_object  = std::make_shared<sirius::io::uring_io_object>(file_path);
+    auto datasource = planning_ioctx_it->second->make_datasource(io_object);
     auto footer_buffer = cudf::io::parquet::fetch_footer_to_host(*datasource);
 
     //===----------Parse metadata----------===//
