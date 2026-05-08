@@ -4284,6 +4284,51 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
   }
 }
 
+// Q11 SF10 exercises materialized CTE with a non-trivial result-set (~8.6K rows).
+// Phase 22.3 rationale: the original SF1 Q11 test exercises the CTE planner but
+// the CTE materialization is small enough that the validator-detected type
+// mismatch (right->types vs producer-shape passthrough) was silently absorbed.
+// SF10 makes the bug user-visible — at SF10 sirius_plan_cte declared 2-col
+// _types while CTE.execute() forwarded 5-col producer batches. The fraction
+// uses 0.0001/SF (= 0.00001 at SF10) per TPC-H spec convention so the result
+// has a non-zero rowset that meaningfully validates GROUP BY + HAVING +
+// NESTED_LOOP_JOIN downstream of the CTE.
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - tpch_q11_sf10_2gpu",
+                 "[integration][tpch_sf10][mgpu-audit][gpu_execution][TPC-H][Q11]")
+{
+  if (sf10_path().empty()) {
+    WARN("SIRIUS_TEST_SF10_PATH unset; skipping SF10 Q11 variant (TEST-04 gate)");
+    return;
+  }
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  if (device_count < 2) {
+    WARN("tpch_q11_sf10_2gpu requires >=2 GPUs; skipping");
+    return;
+  }
+  if (!compare_gpu_vs_cpu_sf10_for(
+        /*num_gpus=*/2,
+        "select ps_partkey, "
+        "sum(ps_supplycost * ps_availqty) as value "
+        "from partsupp, supplier, nation "
+        "where ps_suppkey = s_suppkey "
+        "and s_nationkey = n_nationkey "
+        "and n_name = 'GERMANY' "
+        "group by ps_partkey "
+        "having sum(ps_supplycost * ps_availqty) > ("
+        "  select sum(ps_supplycost * ps_availqty) * 0.00001 "
+        "  from partsupp, supplier, nation "
+        "  where ps_suppkey = s_suppkey "
+        "  and s_nationkey = n_nationkey "
+        "  and n_name = 'GERMANY'"
+        ") "
+        "order by value desc;",
+        0.01f)) {
+    return;
+  }
+}
+
 //===----------------------------------------------------------------------===//
 // cpu_source_task tests — STATISTICS_PROPAGATION / metadata-only queries
 //
