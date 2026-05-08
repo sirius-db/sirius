@@ -261,34 +261,38 @@ TEST_CASE("datasource_factory strict create rejects malformed input", "[datasour
   CHECK_THROWS_AS(datasource_factory::create("relative.parquet", reg, cfg), std::invalid_argument);
 }
 
-TEST_CASE("datasource_factory create uses cudf default for file paths", "[datasource_factory]")
-{
-  constexpr std::string_view expected = "hello sirius factory";
-  scoped_test_file tmp(expected, false);
-  datasource_registry reg;
-  sirius_config cfg;
-
-  auto ds = datasource_factory::create(tmp.path(), reg, cfg);
-  REQUIRE(ds != nullptr);
-  require_datasource_contents(*ds, expected);
-
-  auto file_uri         = "file://" + tmp.path();
-  auto ds_from_file_uri = datasource_factory::create(file_uri, reg, cfg);
-  REQUIRE(ds_from_file_uri != nullptr);
-  require_datasource_contents(*ds_from_file_uri, expected);
-}
-
-TEST_CASE("datasource_factory create_for_parquet_scan accepts relative file paths",
+// Phase 22.1 D-07/D-09/D-10 made datasource_factory::create() strict — every scheme
+// (including kFileScheme) MUST be resolved via the registry. The pre-22.1 cudf-default
+// fallback for file:// paths was removed because it routed through libkvikio which
+// binds a single CUDA context per FileHandle and breaks multi-GPU residency. Production
+// code registers kFileScheme via SiriusContext::initialize (sirius_context.cpp:334);
+// these tests intentionally do NOT register one and assert that strict policy fires.
+TEST_CASE("datasource_factory create rejects file paths without registered file ioctx",
           "[datasource_factory]")
 {
-  constexpr std::string_view expected = "relative parquet scan path";
-  scoped_test_file tmp(expected, true);
+  scoped_test_file tmp("hello sirius factory", false);
   datasource_registry reg;
   sirius_config cfg;
 
-  auto ds = datasource_factory::create_for_parquet_scan(tmp.path(), reg, cfg);
-  REQUIRE(ds != nullptr);
-  require_datasource_contents(*ds, expected);
+  CHECK_THROWS_AS(datasource_factory::create(tmp.path(), reg, cfg), std::runtime_error);
+
+  auto file_uri = "file://" + tmp.path();
+  CHECK_THROWS_AS(datasource_factory::create(file_uri, reg, cfg), std::runtime_error);
+}
+
+// create_for_parquet_scan normalizes relative bare paths to file:///<absolute> and
+// dispatches through create() — so without a registered kFileScheme ioctx, the strict
+// policy fires after normalization.
+TEST_CASE(
+  "datasource_factory create_for_parquet_scan rejects relative paths without registered file ioctx",
+  "[datasource_factory]")
+{
+  scoped_test_file tmp("relative parquet scan path", true);
+  datasource_registry reg;
+  sirius_config cfg;
+
+  CHECK_THROWS_AS(datasource_factory::create_for_parquet_scan(tmp.path(), reg, cfg),
+                  std::runtime_error);
 }
 
 TEST_CASE("datasource_factory object-store schemes require registered backend",
@@ -303,6 +307,16 @@ TEST_CASE("datasource_factory object-store schemes require registered backend",
                   std::runtime_error);
 }
 
+// Phase 22.1 routes every registered scheme through io_object construction. The factory
+// currently builds a uring_io_object regardless of scheme (datasource_factory.cpp:157);
+// for object-store URIs that calls ::open(path) which fails before the ioctx is reached.
+// The contract these tests guard is twofold:
+//   (1) registry lookup IS case-insensitive (S3 resolves to the s3 ioctx — without that
+//       the throw message would be "no ioctx registered for scheme 'S3'");
+//   (2) the object-store ioctx is NOT called yet — make_datasource_calls stays 0 — so a
+//       real s3 ioctx isn't accidentally dispatched against a uring_io_object that has
+//       already failed to open. Lifting (2) requires scheme-specific io_object
+//       construction (out of scope for 22.x).
 TEST_CASE("datasource_factory dispatches mixed-case scheme through registry",
           "[datasource_factory]")
 {
@@ -313,17 +327,16 @@ TEST_CASE("datasource_factory dispatches mixed-case scheme through registry",
 
   try {
     (void)datasource_factory::create("S3://bucket/key.parquet", reg, cfg);
-    FAIL("expected object-store construction to be deferred");
+    FAIL("expected uring_io_object construction to fail before ioctx dispatch");
   } catch (std::runtime_error const& e) {
     std::string msg = e.what();
-    CHECK(msg.find("object construction is not yet implemented") != std::string::npos);
-    CHECK(msg.find("no backend registered") == std::string::npos);
+    CHECK(msg.find("no ioctx registered") == std::string::npos);
   }
 
   CHECK(ctx->make_datasource_calls == 0);
 }
 
-TEST_CASE("datasource_factory PR1 does not construct object-store datasources",
+TEST_CASE("datasource_factory does not dispatch object-store schemes to registered ioctx",
           "[datasource_factory]")
 {
   datasource_registry reg;
@@ -331,13 +344,7 @@ TEST_CASE("datasource_factory PR1 does not construct object-store datasources",
   auto ctx = std::make_shared<mock_ioctx>();
   reg.register_ioctx("s3", ctx);
 
-  try {
-    (void)datasource_factory::create("s3://bucket/key.parquet", reg, cfg);
-    FAIL("expected object-store construction to be deferred");
-  } catch (std::runtime_error const& e) {
-    std::string msg = e.what();
-    CHECK(msg.find("object construction is not yet implemented") != std::string::npos);
-  }
-
+  CHECK_THROWS_AS(datasource_factory::create("s3://bucket/key.parquet", reg, cfg),
+                  std::runtime_error);
   CHECK(ctx->make_datasource_calls == 0);
 }
