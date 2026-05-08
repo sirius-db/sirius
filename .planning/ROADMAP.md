@@ -309,7 +309,7 @@ Plans:
 **Goal:** Close fu17 follow-up #17 / K.6 by fixing the HOST-tier `downgrade_executor` worker-init bug. Root cause (empirically isolated by Phase 22.1's advisory check): `src/downgrade/downgrade_executor.cpp:67-89` unconditionally builds a CUDA stream pool keyed to `_memory_space->get_device_id()` and a per-thread init lambda that calls `cudaSetDevice(device_id)`. For HOST-tier (and DISK-tier) executors created in `SiriusContext::initialize` via `create_executors_for_tier(Tier::HOST)`, `get_device_id()` returns the sentinel `-1` (no CUDA device for host memory). At SF1 the failure is silent because the HOST-tier executor never services a downgrade request; at SF100 host pressure triggers a request, the worker thread fails to bind, and the query falls back to empty result. Fix: gate both the stream pool creation and the per-thread init on `_space_id.tier == cucascade::memory::Tier::GPU`. SF100 Q11 num_gpus=2 must return correct non-empty rows post-fix.
 **Requirements**: K.6 (closure of fu17 follow-up #17 / SF100-Q11-MGPU)
 **Depends on:** Phase 22.1 (kvikio removal proves K.6 is independent of kvikio; isolates the failure to downgrade_executor)
-**Plans:** 0 plans
+**Plans:** 0/0 plans complete
 
 Plans:
-- [ ] TBD (run /gsd:plan-phase 22.2 to break down)
+- [x] TBD (run /gsd:plan-phase 22.2 to break down) (completed 2026-05-08)
