@@ -207,11 +207,25 @@ class s3_ioctx final : public sirius_ioctx {
                        std::uint8_t* dst,
                        io_completion_handler handler) override;
 
+  /// Async multi-range host read. The implementation copies the @p dst span's
+  /// descriptor array into owned storage before launching the async worker,
+  /// so callers may drop the source container immediately after this returns.
+  /// The byte buffers each @c host_span points at remain caller-owned and
+  /// must outlive the completion handler — same contract as the @c uint8_t*
+  /// in @c host_read_async.
   void host_read_ranges_async(sirius_io_object& obj,
                               std::vector<cudf::io::text::byte_range_info> const& ranges,
                               std::span<cudf::host_span<std::byte>> dst,
                               io_completion_handler handler) override;
 
+  /// Synchronous multi-range host read. Each @c ranges[i] is clipped to
+  /// @c min(ranges[i].size(), obj.size() - ranges[i].offset()) before
+  /// validation; the @c dst[i].size() check is against the clipped size, so
+  /// an EOF-crossing range with a dst sized for the actual returned bytes
+  /// does not throw. Ranges starting at or beyond EOF contribute zero bytes.
+  /// Throws @c std::invalid_argument when @c dst[i].size() is smaller than
+  /// the clipped size for any range. Mirrors single-range @c host_read EOF
+  /// semantics.
   std::size_t host_read_ranges(sirius_io_object& obj,
                                std::vector<cudf::io::text::byte_range_info> const& ranges,
                                std::span<cudf::host_span<std::byte>> dst) override;

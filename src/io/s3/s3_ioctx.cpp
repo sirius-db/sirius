@@ -419,9 +419,15 @@ void s3_ioctx::host_read_ranges_async(sirius_io_object& obj,
 {
   auto self      = shared_from_this();
   auto obj_owner = obj.shared_from_this();
-  dispatch_async(std::move(handler), [self, obj_owner, ranges, dst]() {
-    return self->host_read_ranges(*obj_owner, ranges, dst);
-  });
+  // Materialize the dst descriptor array into owned storage. std::span is a
+  // non-owning view: capturing it by value preserves only (ptr, len), not the
+  // underlying host_span entries. The byte buffers each host_span points at
+  // remain caller-owned until the handler fires (standard async-I/O contract).
+  std::vector<cudf::host_span<std::byte>> dst_owned(dst.begin(), dst.end());
+  dispatch_async(std::move(handler),
+                 [self, obj_owner, ranges, dst_owned = std::move(dst_owned)]() mutable {
+                   return self->host_read_ranges(*obj_owner, ranges, dst_owned);
+                 });
 }
 
 std::size_t s3_ioctx::host_read_ranges(sirius_io_object& obj,
@@ -430,13 +436,19 @@ std::size_t s3_ioctx::host_read_ranges(sirius_io_object& obj,
 {
   if (ranges.size() != dst.size())
     throw std::invalid_argument("s3_ioctx::host_read_ranges: ranges/dst size mismatch");
-  std::size_t total = 0;
+  auto& so                 = dynamic_cast<s3_io_object&>(obj);
+  std::size_t const obj_sz = so.size();
+  std::size_t total        = 0;
   for (std::size_t i = 0; i < ranges.size(); ++i) {
     auto offset = static_cast<std::size_t>(ranges[i].offset());
     auto size   = static_cast<std::size_t>(ranges[i].size());
-    if (dst[i].size() < size)
+    // Clip per-range to EOF first (mirrors host_read single-range semantics);
+    // validate dst against the clipped size so an EOF-crossing range with a
+    // dst sized for the actual returned bytes does not spuriously throw.
+    auto clipped = std::min(size, obj_sz > offset ? obj_sz - offset : std::size_t{0});
+    if (dst[i].size() < clipped)
       throw std::invalid_argument("s3_ioctx::host_read_ranges: dst span too small");
-    total += host_read(obj, offset, size, reinterpret_cast<std::uint8_t*>(dst[i].data()));
+    total += host_read(obj, offset, clipped, reinterpret_cast<std::uint8_t*>(dst[i].data()));
   }
   return total;
 }

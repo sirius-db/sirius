@@ -187,6 +187,45 @@ class blocking_throwing_provider final : public credential_provider {
   std::atomic<int> _method{1};
 };
 
+class blocking_first_get_provider final : public credential_provider {
+ public:
+  explicit blocking_first_get_provider(std::shared_ptr<credential_provider> delegate)
+    : _delegate(std::move(delegate)),
+      _entered(_entered_promise.get_future().share()),
+      _release(_release_promise.get_future().share())
+  {
+  }
+
+  std::string get_presigned_url(s3_object_ref const& obj, presign_method method) override
+  {
+    if (method == presign_method::GET && !_blocked_first_get.exchange(true)) {
+      std::call_once(_entered_once, [&] { _entered_promise.set_value(); });
+      _release.wait();
+    }
+    return _delegate->get_presigned_url(obj, method);
+  }
+
+  bool wait_until_first_get_entered(std::chrono::milliseconds timeout) const
+  {
+    return _entered.wait_for(timeout) == std::future_status::ready;
+  }
+
+  void release()
+  {
+    std::call_once(_release_once, [&] { _release_promise.set_value(); });
+  }
+
+ private:
+  std::shared_ptr<credential_provider> _delegate;
+  std::promise<void> _entered_promise;
+  std::shared_future<void> _entered;
+  std::promise<void> _release_promise;
+  std::shared_future<void> _release;
+  mutable std::once_flag _entered_once;
+  std::once_flag _release_once;
+  std::atomic<bool> _blocked_first_get{false};
+};
+
 }  // namespace
 
 TEST_CASE("s3_io_object preserves S3 identity and cache id", "[s3][ioctx]")
@@ -345,4 +384,184 @@ TEST_CASE("s3_ioctx reads multiple MinIO byte ranges", "[s3][ioctx][integration]
   for (std::size_t i = 0; i < ranges.size(); ++i) {
     require_bytes_equal(buffers[i], local, static_cast<std::size_t>(ranges[i].offset()));
   }
+}
+
+TEST_CASE("s3_ioctx async range reads copy caller span descriptors before dispatch",
+          "[s3][ioctx][integration]")
+{
+  auto env = read_s3_test_env();
+  if (!env) {
+    WARN("Skipping live S3 test because SIRIUS_TEST_S3_* environment is not configured");
+    return;
+  }
+
+  std::string const key = "medium.bin";
+  auto local            = read_binary_file(env->local_dir / key);
+  REQUIRE(local.size() >= 32);
+
+  static_credentials creds;
+  creds.access_key_id     = env->access_key;
+  creds.secret_access_key = env->secret_key;
+  auto delegate           = std::make_shared<sirius_sigv4_credential_provider>(
+    std::move(creds), env->region, env->endpoint, 30min);
+  auto provider = std::make_shared<blocking_first_get_provider>(std::move(delegate));
+  auto ctx      = std::make_shared<s3_ioctx>(s3_ioctx_config{provider, 2, 20});
+  auto obj      = std::make_shared<s3_io_object>(env->bucket, key, local.size());
+
+  std::vector<cudf::io::text::byte_range_info> ranges{{0, 8}, {8, 8}};
+  std::vector<std::byte> first(8);
+  std::vector<std::byte> second(8);
+  std::vector<std::byte> poison_second(8, std::byte{0xA5});
+
+  auto done = std::make_shared<std::promise<std::pair<std::size_t, std::exception_ptr>>>();
+  auto fut  = done->get_future();
+
+  {
+    std::vector<cudf::host_span<std::byte>> descriptors;
+    descriptors.emplace_back(first.data(), first.size());
+    descriptors.emplace_back(second.data(), second.size());
+
+    ctx->host_read_ranges_async(
+      *obj,
+      ranges,
+      std::span<cudf::host_span<std::byte>>{descriptors},
+      [done](auto bytes, auto ep) { done->set_value({bytes, ep}); });
+
+    auto const entered = provider->wait_until_first_get_entered(5s);
+    if (!entered) { provider->release(); }
+    REQUIRE(entered);
+    descriptors[1] = cudf::host_span<std::byte>{poison_second.data(), poison_second.size()};
+  }
+
+  provider->release();
+
+  REQUIRE(fut.wait_for(5s) == std::future_status::ready);
+  auto [bytes, ep] = fut.get();
+  REQUIRE(ep == nullptr);
+  CHECK(bytes == 16);
+  require_bytes_equal(first, local, 0);
+  require_bytes_equal(second, local, 8);
+  CHECK(std::all_of(poison_second.begin(), poison_second.end(), [](auto b) {
+    return b == std::byte{0xA5};
+  }));
+}
+
+TEST_CASE("s3_ioctx host_read_ranges clips EOF-crossing range before dst validation",
+          "[s3][ioctx][integration]")
+{
+  auto env = read_s3_test_env();
+  if (!env) {
+    WARN("Skipping live S3 test because SIRIUS_TEST_S3_* environment is not configured");
+    return;
+  }
+
+  std::string const key = "medium.bin";
+  auto local            = read_binary_file(env->local_dir / key);
+  REQUIRE(local.size() >= 200);
+  auto ctx = make_live_ioctx(*env);
+  auto obj = std::make_shared<s3_io_object>(env->bucket, key, local.size());
+
+  auto const offset = local.size() - 100;
+  std::vector<cudf::io::text::byte_range_info> ranges{
+    {static_cast<int64_t>(offset), 200},
+  };
+  std::vector<std::byte> buffer(100);
+  std::vector<cudf::host_span<std::byte>> spans;
+  spans.emplace_back(buffer.data(), buffer.size());
+
+  auto const total =
+    ctx->host_read_ranges(*obj, ranges, std::span<cudf::host_span<std::byte>>{spans});
+
+  CHECK(total == 100);
+  require_bytes_equal(buffer, local, offset);
+}
+
+TEST_CASE("s3_ioctx host_read_ranges returns zero for ranges starting at EOF",
+          "[s3][ioctx][integration]")
+{
+  auto env = read_s3_test_env();
+  if (!env) {
+    WARN("Skipping live S3 test because SIRIUS_TEST_S3_* environment is not configured");
+    return;
+  }
+
+  std::string const key = "medium.bin";
+  auto local            = read_binary_file(env->local_dir / key);
+  auto ctx              = make_live_ioctx(*env);
+  auto obj              = std::make_shared<s3_io_object>(env->bucket, key, local.size());
+
+  std::vector<cudf::io::text::byte_range_info> ranges{
+    {static_cast<int64_t>(local.size()), 50},
+  };
+  std::vector<std::byte> empty;
+  std::vector<cudf::host_span<std::byte>> spans;
+  spans.emplace_back(empty.data(), empty.size());
+
+  auto const total =
+    ctx->host_read_ranges(*obj, ranges, std::span<cudf::host_span<std::byte>>{spans});
+
+  CHECK(total == 0);
+}
+
+TEST_CASE("s3_ioctx host_read_ranges rejects dst smaller than clipped size",
+          "[s3][ioctx][integration]")
+{
+  auto env = read_s3_test_env();
+  if (!env) {
+    WARN("Skipping live S3 test because SIRIUS_TEST_S3_* environment is not configured");
+    return;
+  }
+
+  std::string const key = "medium.bin";
+  auto local            = read_binary_file(env->local_dir / key);
+  REQUIRE(local.size() >= 200);
+  auto ctx = make_live_ioctx(*env);
+  auto obj = std::make_shared<s3_io_object>(env->bucket, key, local.size());
+
+  auto const offset = local.size() - 100;
+  std::vector<cudf::io::text::byte_range_info> ranges{
+    {static_cast<int64_t>(offset), 200},
+  };
+  std::vector<std::byte> buffer(50);
+  std::vector<cudf::host_span<std::byte>> spans;
+  spans.emplace_back(buffer.data(), buffer.size());
+
+  CHECK_THROWS_WITH(ctx->host_read_ranges(*obj,
+                                          ranges,
+                                          std::span<cudf::host_span<std::byte>>{spans}),
+                    "s3_ioctx::host_read_ranges: dst span too small");
+}
+
+TEST_CASE("s3_ioctx host_read_ranges clips EOF-crossing ranges independently",
+          "[s3][ioctx][integration]")
+{
+  auto env = read_s3_test_env();
+  if (!env) {
+    WARN("Skipping live S3 test because SIRIUS_TEST_S3_* environment is not configured");
+    return;
+  }
+
+  std::string const key = "medium.bin";
+  auto local            = read_binary_file(env->local_dir / key);
+  REQUIRE(local.size() >= 150);
+  auto ctx = make_live_ioctx(*env);
+  auto obj = std::make_shared<s3_io_object>(env->bucket, key, local.size());
+
+  auto const eof_crossing_offset = local.size() - 50;
+  std::vector<cudf::io::text::byte_range_info> ranges{
+    {0, 100},
+    {static_cast<int64_t>(eof_crossing_offset), 100},
+  };
+  std::vector<std::byte> head(100);
+  std::vector<std::byte> tail(50);
+  std::vector<cudf::host_span<std::byte>> spans;
+  spans.emplace_back(head.data(), head.size());
+  spans.emplace_back(tail.data(), tail.size());
+
+  auto const total =
+    ctx->host_read_ranges(*obj, ranges, std::span<cudf::host_span<std::byte>>{spans});
+
+  CHECK(total == 150);
+  require_bytes_equal(head, local, 0);
+  require_bytes_equal(tail, local, eof_crossing_offset);
 }
