@@ -519,6 +519,13 @@ void SiriusContext::terminate()
   }
   downgrade_executors_.clear();
 
+  // Phase 22.1 D-10: clear the registry BEFORE gpu_ioctxs_ so the registry's
+  // shared_ptr<sirius_ioctx> entries do not outlive their owners. The
+  // registry itself is value-typed (datasource_registry_ is a member of
+  // SiriusContext), but it holds shared_ptrs — calling clear() drops those
+  // refs first so gpu_ioctxs_.clear() below is the sole remaining owner
+  // when ~uring_ioctx runs.
+  datasource_registry_.clear();
   // Phase 19 IO-13: tear down per-GPU sirius_ioctx instances BEFORE
   // memory_manager_->shutdown() (Pitfall 3). Each ~uring_ioctx joins its
   // reactor worker thread and frees pinned bounce slots via cudaFreeHost,
