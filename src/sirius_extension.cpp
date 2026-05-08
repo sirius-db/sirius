@@ -32,6 +32,12 @@
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+// Phase 22.1 D-05 (Plan 22.1-04): PinTableFunction routes parquet reads
+// through the per-GPU sirius_ioctx instead of cudf's bundled file_source
+// factory (which uses kvikio internally and binds to a single CUDA context).
+#include "io/types.hpp"               // sirius::io::sirius_ioctx
+#include "io/uring/uring_reactor.hpp" // sirius::io::uring_io_object
+
 // Forward-declare CUDA profiler API functions (linked via libcudart).
 extern "C" int cudaProfilerStart();
 extern "C" int cudaProfilerStop();
@@ -809,8 +815,26 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     int target_gpu_id = target_space->get_device_id();
     rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{target_gpu_id}};
 
+    // Phase 22.1 D-05 (Plan 22.1-04): route the chunked_parquet_reader through
+    // the per-GPU sirius_ioctx instead of cudf's bundled file_source factory
+    // (kvikio). The pre-22.1 string-form source_info routed reads through
+    // libkvikio's FileHandle which binds a single CUDA context per file,
+    // breaking multi-GPU residency (the columns end up on the wrong GPU under
+    // sanitizer races; see 22.1-CONTEXT.md "Why kvikio breaks multi-GPU").
+    auto target_ioctx = sirius_ctx->get_ioctx_for(target_gpu_id);
+    if (!target_ioctx) {
+      throw InvalidInputException(
+        "pin_table: no sirius_ioctx for target GPU " + std::to_string(target_gpu_id) +
+        " (Phase 22.1 D-05).");
+    }
+    // Lifetime: io_object MUST outlive datasource MUST outlive reader.
+    // Declared in this order so reverse-destruction order (Pitfall 5)
+    // tears them down safely at end of loop iteration.
+    auto io_object  = std::make_shared<sirius::io::uring_io_object>(path);
+    auto datasource = target_ioctx->make_datasource(io_object);
+
     auto opts = cudf::io::parquet_reader_options::builder(
-                  cudf::io::source_info{std::vector<std::string>{path}})
+                  cudf::io::source_info{datasource.get()})
                   .build();
     if (!cols.empty()) { opts.set_column_names(cols); }
     if (data.args.n_rows.has_value()) { opts.set_num_rows(remaining_rows); }
