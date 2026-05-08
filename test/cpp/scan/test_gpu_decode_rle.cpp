@@ -164,6 +164,24 @@ TEST_CASE("gpu_decode_table RLE - cross-CTA boundary (rows > RLE_ROWS_PER_CHUNK)
   REQUIRE(out == expected);
 }
 
+TEST_CASE("gpu_decode_table RLE - warp-broadcast straddles run boundary",
+          "[scan][decode][rle]")
+{
+  // Avg run 33 ≥ warpSize triggers long_runs_heuristic; runs don't align
+  // with warp boundaries, so warps straddle entries and exercise the
+  // per-lane fallback inside the warp-broadcast branch.
+  constexpr uint32_t N_RUNS  = 64;
+  constexpr uint16_t RUN_LEN = 33;
+  std::vector<int32_t> values(N_RUNS);
+  std::iota(values.begin(), values.end(), 0);
+  std::vector<uint16_t> counts(N_RUNS, RUN_LEN);
+  uint32_t const total_rows = N_RUNS * RUN_LEN;  // 2112
+  auto bytes                = make_rle_block<int32_t>(values, counts);
+  auto out                  = decode_one<int32_t>(bytes, I32, total_rows);
+  auto expected             = expand_runs<int32_t>(values, counts);
+  REQUIRE(out == expected);
+}
+
 TEST_CASE("gpu_decode_table RLE - near-cap entry count", "[scan][decode][rle]")
 {
   // Near the build kernel's max-entries cap; each run is 1 row.

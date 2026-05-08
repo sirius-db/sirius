@@ -32,14 +32,11 @@ namespace sirius::cuda::scan {
 
 /// 8-byte rle_count_offset header at the start of every RLE segment.
 /// See `duckdb/src/storage/compression/rle.cpp::RLEConstants::RLE_HEADER_SIZE`.
-inline constexpr uint32_t RLE_HEADER_SIZE = 8;
+static constexpr uint32_t RLE_HEADER_SIZE = sizeof(uint64_t);
 
-/// Decode an RLE codec run into `d_output`. Two device kernels per call:
-/// `kernel_build_cumsum` (one CTA per segment) reads each segment's header
-/// + counts and writes an inclusive prefix sum to a device-resident buffer;
-/// `kernel_decode_rle` (one CTA per RLE_ROWS_PER_CHUNK-row slice) expands
-/// rows via per-row upper_bound + value gather. Both kernels are launched on
-/// `stream` with no D2H syncs.
+/// Decode an RLE codec run into `d_output`. Two device kernels: a
+/// per-segment cumsum build, and a per-chunk expand via upper_bound +
+/// value gather. No D2H syncs.
 void decode_rle_data(gpu_codec_run const& run,
                      uint8_t* d_output,
                      cudf::data_type type,

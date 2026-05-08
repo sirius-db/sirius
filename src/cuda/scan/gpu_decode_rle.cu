@@ -15,26 +15,19 @@
  */
 
 //===----------------------------------------------------------------------===//
-// RLE decode.
+// RLE decode. On-disk segment layout (DuckDB):
 //
-// Two device kernels per `decode_rle_data` call:
-//   1. kernel_build_cumsum: one CTA per segment. Reads the segment header,
-//      cooperatively scans counts via cub::BlockScan into a device-resident
-//      cumsum buffer. Writes per-segment entry_count (0 = malformed). Host
-//      pays no D2H sync.
-//   2. kernel_decode_rle:   one CTA per RLE_ROWS_PER_CHUNK-row slice. Reads
-//      entry_count from the per-segment array; loads cumsum into shmem and
-//      expands rows via per-row upper_bound + value gather.
+//   byte 0    8                                rle_count_offset    seg_end
+//   │         │                                │                   │
+//   ├─uint64──┼─── values: T[entry_count] ────┼─ 0-padded ──────┼─ counts: u16[ec] ──
+//   │  header │                                │                   │
+//   └─offset where counts begin                                    └─per-entry run lens
 //
-// Segments with > RLE_BUILD_MAX_ENTRIES entries are flagged malformed by
-// the build kernel and zero-filled by the expand kernel. Realistic DuckDB
-// RLE columns stay well below this cap; high-entry-count segments need the
-// hierarchical-cumsum follow-up.
-//
-// Malformed conditions detected by the build kernel: rle_count_offset out
-// of range, count == 0, walk doesn't sum to row_count, walk exceeds the
-// build cap, values area can't hold entry_count values. All collapse to
-// entry_count = 0.
+// `entry_count` (ec) is implicit — walk `counts[]` summing until the total
+// hits `descriptor.row_count`. Padding is real (DuckDB's `AlignValue<8>`):
+// trust the header offset, don't compute it from values size. `rle_count_t
+// = uint16_t` so a single run is ≤ 65535 rows; longer runs split into
+// consecutive same-value entries. DuckDB never emits zero counts.
 //===----------------------------------------------------------------------===//
 
 #include "cuda/scan/gpu_decode_rle.cuh"
@@ -43,6 +36,8 @@
 #include <rmm/device_uvector.hpp>
 
 #include <cub/block/block_scan.cuh>
+#include <cuda/cmath>
+#include <cuda/warp>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -55,33 +50,23 @@ namespace sirius::cuda::scan {
 
 namespace {
 
-// 256-thread CTA matches BITPACKING for cross-codec consistency. 2048-row
-// chunk gives VPT=8, enough to amortise per-CTA setup without bloating
-// per-thread register state.
 constexpr uint32_t BLOCK_DIM          = 256;
 constexpr uint32_t RLE_ROWS_PER_CHUNK = 2048;
-constexpr uint32_t VPT                = RLE_ROWS_PER_CHUNK / BLOCK_DIM;
-static_assert(BLOCK_DIM * VPT == RLE_ROWS_PER_CHUNK);
+constexpr uint32_t VALUES_PER_THREAD  = RLE_ROWS_PER_CHUNK / BLOCK_DIM;
+// Catch silent integer truncation if BLOCK_DIM stops dividing the chunk.
+static_assert(BLOCK_DIM * VALUES_PER_THREAD == RLE_ROWS_PER_CHUNK);
 
 // Build kernel processes counts in tiles of BUILD_TILE_ENTRIES; running
-// total propagates across tiles, so total entry count is unbounded.
-// VPT_BUILD=16 keeps per-thread register state at ~64 B (16 × uint32 cumsum
-// + 16 × uint16 counts). The shmem cumsum cache in the expand kernel is
-// sized to one tile so chunks with ec ≤ tile_size get the shmem fast path;
-// larger ec falls through to a gmem-resident cumsum read.
-constexpr uint32_t VPT_BUILD            = 16;
-constexpr uint32_t BUILD_TILE_ENTRIES   = BLOCK_DIM * VPT_BUILD;  // 4096
-constexpr uint32_t RLE_SMEM_MAX_ENTRIES = BUILD_TILE_ENTRIES;
-constexpr uint32_t RLE_SMEM_BYTES       = RLE_SMEM_MAX_ENTRIES * sizeof(uint32_t);
+// total propagates across tiles.
+constexpr uint32_t BUILD_VALUES_PER_THREAD = 16;
+constexpr uint32_t BUILD_TILE_ENTRIES      = BLOCK_DIM * BUILD_VALUES_PER_THREAD;  // 4096
+constexpr uint32_t RLE_SMEM_MAX_ENTRIES    = BUILD_TILE_ENTRIES;
 
-// DuckDB's worst-case ec for an RLE segment is bounded by
-// (block_size - header) / (sizeof(T) + sizeof(rle_count_t)). For block_size
-// = 256 KiB and the narrowest type (T=int8 with rle_count_t=uint16), that's
-// (262144-8)/3 = 87376 entries. Round up to a tile multiple (22 × 4096 =
-// 90112) so the per-segment cumsum slice is tile-aligned.
-constexpr uint32_t RLE_BUILD_MAX_ENTRIES = 22u * BUILD_TILE_ENTRIES;  // 90112
-static_assert(RLE_BUILD_MAX_ENTRIES % BUILD_TILE_ENTRIES == 0);
-static_assert(RLE_BUILD_MAX_ENTRIES >= 87376, "must cover DuckDB's max ec for T=int8 segments");
+// Worst-case ec = (block_size - header) / (sizeof(T) + sizeof(rle_count_t))
+// = (256 KiB - 8) / 3 for T=int8. Rounded up to a tile multiple.
+constexpr uint32_t RLE_DUCKDB_MAX_EC = 87376;
+constexpr uint32_t RLE_BUILD_MAX_ENTRIES =
+  ::cuda::ceil_div(RLE_DUCKDB_MAX_EC, BUILD_TILE_ENTRIES) * BUILD_TILE_ENTRIES;  // 90112
 
 constexpr uint32_t MALFORMED_FLAG = 0u;
 
@@ -92,10 +77,9 @@ struct rle_build_desc {
   uint32_t row_count;
 };
 
-/// Per-CTA input to the expand kernel. d_cumsum points into the device-
-/// resident concatenated cumsum buffer (one MAX_ENTRIES-slot slice per
-/// segment). entry_count is read indirectly via seg_id from a per-segment
-/// array (build kernel writes it; host can't observe it without a sync).
+/// Per-CTA input to the expand kernel. d_cumsum points into the device
+/// concatenated cumsum buffer; entry_count is read via seg_id from the
+/// per-segment array the build kernel writes.
 struct rle_chunk_desc {
   uint8_t const* d_values;
   uint32_t const* d_cumsum;
@@ -121,6 +105,8 @@ __global__ void kernel_build_cumsum(rle_build_desc const* __restrict__ descs,
   __shared__ uint32_t s_offset;
   __shared__ uint32_t s_capacity;
   __shared__ uint32_t s_malformed;
+  // Smallest entry idx where cumsum == row_count = count of valid entries;
+  // ~0u sentinel at end-of-walk ⇒ counts didn't sum to row_count.
   __shared__ uint32_t s_first_match;
   __shared__ uint32_t s_running_total;
 
@@ -154,18 +140,19 @@ __global__ void kernel_build_cumsum(rle_build_desc const* __restrict__ descs,
 
   uint32_t const row_count = desc.row_count;
   uint16_t const* counts   = reinterpret_cast<uint16_t const*>(desc.d_bytes + s_offset);
-  uint32_t const capacity = s_capacity < RLE_BUILD_MAX_ENTRIES ? s_capacity : RLE_BUILD_MAX_ENTRIES;
-  uint32_t* cumsum_out    = d_cumsums + size_t{sid} * cumsum_stride_entries;
+  uint32_t const max_entries =
+    s_capacity < RLE_BUILD_MAX_ENTRIES ? s_capacity : RLE_BUILD_MAX_ENTRIES;
+  uint32_t* cumsum_out = d_cumsums + size_t{sid} * cumsum_stride_entries;
 
   // Iterate tiles of BUILD_TILE_ENTRIES counts; running sum propagates
   // through s_running_total. Stops early once we hit row_count.
-  for (uint32_t tile = 0; tile < capacity; tile += BUILD_TILE_ENTRIES) {
-    uint32_t my_counts[VPT_BUILD];
+  for (uint32_t tile = 0; tile < max_entries; tile += BUILD_TILE_ENTRIES) {
+    uint32_t my_counts[BUILD_VALUES_PER_THREAD];
     uint32_t local_zero_seen = 0;
 #pragma unroll
-    for (uint32_t v = 0; v < VPT_BUILD; ++v) {
-      uint32_t const i = tile + threadIdx.x * VPT_BUILD + v;
-      if (i < capacity) {
+    for (uint32_t v = 0; v < BUILD_VALUES_PER_THREAD; ++v) {
+      uint32_t const i = tile + threadIdx.x * BUILD_VALUES_PER_THREAD + v;
+      if (i < max_entries) {
         uint16_t c   = counts[i];
         my_counts[v] = c;
         if (c == 0) local_zero_seen = 1;
@@ -175,9 +162,9 @@ __global__ void kernel_build_cumsum(rle_build_desc const* __restrict__ descs,
     }
 
     uint32_t my_aggregate = 0;
-    uint32_t my_local_cumsum[VPT_BUILD];
+    uint32_t my_local_cumsum[BUILD_VALUES_PER_THREAD];
 #pragma unroll
-    for (uint32_t v = 0; v < VPT_BUILD; ++v) {
+    for (uint32_t v = 0; v < BUILD_VALUES_PER_THREAD; ++v) {
       my_aggregate += my_counts[v];
       my_local_cumsum[v] = my_aggregate;
     }
@@ -188,17 +175,17 @@ __global__ void kernel_build_cumsum(rle_build_desc const* __restrict__ descs,
     if (local_zero_seen) atomicOr(&s_malformed, 1u);
 
 #pragma unroll
-    for (uint32_t v = 0; v < VPT_BUILD; ++v) {
-      uint32_t const i  = tile + threadIdx.x * VPT_BUILD + v;
+    for (uint32_t v = 0; v < BUILD_VALUES_PER_THREAD; ++v) {
+      uint32_t const i  = tile + threadIdx.x * BUILD_VALUES_PER_THREAD + v;
       uint32_t const cs = s_running_total + my_prefix + my_local_cumsum[v];
-      if (i < capacity) cumsum_out[i] = cs;
-      if (i < capacity && cs == row_count) atomicMin(&s_first_match, i + 1);
+      if (i < max_entries) cumsum_out[i] = cs;
+      if (i < max_entries && cs == row_count) atomicMin(&s_first_match, i + 1);
     }
 
     // Last thread's last cumsum is the new running total for next tile.
     __syncthreads();
     if (threadIdx.x == BLOCK_DIM - 1) {
-      s_running_total += my_prefix + my_local_cumsum[VPT_BUILD - 1];
+      s_running_total += my_prefix + my_local_cumsum[BUILD_VALUES_PER_THREAD - 1];
     }
     __syncthreads();
 
@@ -225,9 +212,7 @@ __global__ void kernel_build_cumsum(rle_build_desc const* __restrict__ descs,
 // Expand kernel.
 //===----------------------------------------------------------------------===//
 
-/// Upper bound: first index in [lo, hi) where `cumsum[idx] > key`. Pass
-/// (0, ec) for a full search, or a narrower band when the chunk's row
-/// range only covers a slice of the segment.
+/// First index in [lo, hi) where `cumsum[idx] > key`.
 __device__ __forceinline__ uint32_t rle_upper_bound(uint32_t const* __restrict__ cumsum,
                                                     uint32_t lo,
                                                     uint32_t hi,
@@ -244,28 +229,27 @@ __device__ __forceinline__ uint32_t rle_upper_bound(uint32_t const* __restrict__
   return lo;
 }
 
-/// Body of the expand kernel, parameterised on the cumsum pointer source.
-/// `__forceinline__` so each call site keeps its own statically-known
-/// address space — see kernel_decode_rle for why merging through a single
-/// pointer would force ld.generic.
+/// Expand-kernel body, parameterised on the cumsum pointer's address space.
+/// `entry_count`: per-segment ec. `lr_start`: segment-local row index of
+/// this chunk's first row. `rc`: chunk row count.
 template <typename T>
 __device__ __forceinline__ void rle_decode_chunk_body(uint32_t const* __restrict__ cumsum,
                                                       T const* __restrict__ values,
                                                       T* __restrict__ out_chunk,
-                                                      uint32_t ec,
+                                                      uint32_t entry_count,
                                                       uint32_t lr_start,
                                                       uint32_t rc)
 {
-  // Narrow the search window to the entry band this chunk actually covers.
-  // For typical-shape chunks ec_band << ec, dropping per-thread search
-  // depth from log2(ec) to log2(ec_band).
+  // Thread 0 binary-searches the chunk's first and last rows once to find
+  // [band_lo, band_hi); per-thread search depth then drops from
+  // log2(entry_count) to log2(band_hi - band_lo).
   __shared__ uint32_t s_band_lo;
   __shared__ uint32_t s_band_hi;
   if (threadIdx.x == 0) {
     uint32_t const last_row = lr_start + rc - 1u;
-    uint32_t const lo       = rle_upper_bound(cumsum, 0, ec, lr_start);
-    uint32_t hi             = rle_upper_bound(cumsum, 0, ec, last_row);
-    if (hi >= ec) hi = ec - 1;
+    uint32_t const lo       = rle_upper_bound(cumsum, 0, entry_count, lr_start);
+    uint32_t hi             = rle_upper_bound(cumsum, 0, entry_count, last_row);
+    if (hi >= entry_count) hi = entry_count - 1;
     s_band_lo = lo;
     s_band_hi = hi + 1u;
   }
@@ -273,12 +257,15 @@ __device__ __forceinline__ void rle_decode_chunk_body(uint32_t const* __restrict
   uint32_t const band_lo = s_band_lo;
   uint32_t const band_hi = s_band_hi;
 
-  bool const long_runs_heuristic = rc / 32u >= ec;
-  uint32_t const lane            = threadIdx.x & 31u;
+  // Avg run ≥ warpSize ⇒ most warps cover one entry; lane 0 searches once
+  // and broadcasts (cheaper than 32 searches). Short-run shapes skip — the
+  // bound check would miss most iterations.
+  bool const long_runs_heuristic = rc / 32u >= entry_count;
 
   if (long_runs_heuristic) {
+    uint32_t const lane = threadIdx.x & 31u;  // 32 = warpSize
 #pragma unroll
-    for (uint32_t v = 0; v < VPT; ++v) {
+    for (uint32_t v = 0; v < VALUES_PER_THREAD; ++v) {
       uint32_t const i = v * blockDim.x + threadIdx.x;
       if (i >= rc) break;
       uint32_t const warp_first = lr_start + (i & ~31u);
@@ -286,22 +273,25 @@ __device__ __forceinline__ void rle_decode_chunk_body(uint32_t const* __restrict
       uint32_t entry_warp = 0;
       if (lane == 0) {
         entry_warp = rle_upper_bound(cumsum, band_lo, band_hi, warp_first);
-        if (entry_warp >= ec) entry_warp = ec - 1;
+        if (entry_warp >= entry_count) entry_warp = entry_count - 1;
       }
-      entry_warp = __shfl_sync(0xFFFFFFFFu, entry_warp, 0);
+      entry_warp = ::cuda::device::warp_shuffle_idx(entry_warp, 0);
 
       uint32_t cumsum_at_entry = 0;
       if (lane == 0) cumsum_at_entry = cumsum[entry_warp];
-      cumsum_at_entry = __shfl_sync(0xFFFFFFFFu, cumsum_at_entry, 0);
+      cumsum_at_entry = ::cuda::device::warp_shuffle_idx(cumsum_at_entry, 0);
 
       uint32_t const warp_last = warp_first + 31u;
 
       if (warp_last < cumsum_at_entry) {
+        // Whole warp on entry_warp: __ldg goes through the read-only cache
+        // (one broadcast load); __stwt streams past L1 to keep cumsum hot.
         __stwt(out_chunk + i, __ldg(values + entry_warp));
       } else {
+        // Warp straddles an entry boundary — per-lane fallback.
         uint32_t const local_row = lr_start + i;
         uint32_t entry           = rle_upper_bound(cumsum, band_lo, band_hi, local_row);
-        if (entry >= ec) entry = ec - 1;
+        if (entry >= entry_count) entry = entry_count - 1;  // never fires on well-formed input
         __stwt(out_chunk + i, __ldg(values + entry));
       }
     }
@@ -309,15 +299,14 @@ __device__ __forceinline__ void rle_decode_chunk_body(uint32_t const* __restrict
   }
 
 #pragma unroll
-  for (uint32_t v = 0; v < VPT; ++v) {
+  for (uint32_t v = 0; v < VALUES_PER_THREAD; ++v) {
     uint32_t const i = v * blockDim.x + threadIdx.x;
     if (i >= rc) break;
     uint32_t const local_row = lr_start + i;
     uint32_t entry           = rle_upper_bound(cumsum, band_lo, band_hi, local_row);
-    if (entry >= ec) entry = ec - 1;
+    if (entry >= entry_count) entry = entry_count - 1;
     __stwt(out_chunk + i, __ldg(values + entry));
   }
-  (void)lane;
 }
 
 template <typename T>
@@ -345,12 +334,10 @@ __global__ void kernel_decode_rle(rle_chunk_desc const* __restrict__ descs,
   T const* values         = reinterpret_cast<T const*>(desc.d_values);
   uint32_t const lr_start = desc.local_row_start;
 
-  extern __shared__ uint32_t s_cumsum[];
+  __shared__ uint32_t s_cumsum[RLE_SMEM_MAX_ENTRIES];
 
-  // Two textually-distinct branches: each call site passes a pointer with a
-  // statically-known address space, so the compiler emits ld.shared in path A
-  // and ld.global in path B. Merging through a single uint32_t const* would
-  // force ld.generic (slower, runtime address-space check).
+  // Two branches keep each cumsum pointer in a statically-known address
+  // space (ld.shared / ld.global). A merged path would force ld.generic.
   if (ec <= RLE_SMEM_MAX_ENTRIES) {
     for (uint32_t i = threadIdx.x; i < ec; i += blockDim.x) {
       s_cumsum[i] = desc.d_cumsum[i];
@@ -358,7 +345,7 @@ __global__ void kernel_decode_rle(rle_chunk_desc const* __restrict__ descs,
     __syncthreads();
     rle_decode_chunk_body<T>(s_cumsum, values, out_chunk, ec, lr_start, rc);
   } else {
-    // L2 caches the gmem cumsum well across CTAs of the same segment.
+    // L2 caches the gmem cumsum across CTAs of the same segment.
     rle_decode_chunk_body<T>(desc.d_cumsum, values, out_chunk, ec, lr_start, rc);
   }
 }
@@ -389,45 +376,45 @@ void decode_rle_data(gpu_codec_run const& run,
   }
   if (live.empty()) return;
 
-  size_t const n = live.size();
+  size_t const num_live_segments = live.size();
 
   // Build per-segment build descriptors.
-  std::vector<rle_build_desc> h_build(n);
-  for (size_t i = 0; i < n; ++i) {
+  std::vector<rle_build_desc> h_build(num_live_segments);
+  for (size_t i = 0; i < num_live_segments; ++i) {
     h_build[i] = {live[i]->d_bytes, live[i]->bytes_size, live[i]->row_count};
   }
 
-  // Allocate device-side cumsum buffer (one MAX_ENTRIES slot per segment)
-  // and entry-count array.
-  rmm::device_uvector<uint32_t> d_cumsums(n * RLE_BUILD_MAX_ENTRIES, stream, mr);
-  rmm::device_uvector<uint32_t> d_entry_counts(n, stream, mr);
-  rmm::device_uvector<rle_build_desc> d_build_descs(n, stream, mr);
+  // Worst-case allocation: 352 KiB/segment (90112 × uint32). Typical ec
+  // is far smaller, but this lets host compute each segment's slice base
+  // without a D2H sync.
+  rmm::device_uvector<uint32_t> d_cumsums(num_live_segments * RLE_BUILD_MAX_ENTRIES, stream, mr);
+  rmm::device_uvector<uint32_t> d_entry_counts(num_live_segments, stream, mr);
+  rmm::device_uvector<rle_build_desc> d_build_descs(num_live_segments, stream, mr);
   RMM_CUDA_TRY(cudaMemcpyAsync(d_build_descs.data(),
                                h_build.data(),
-                               n * sizeof(rle_build_desc),
+                               num_live_segments * sizeof(rle_build_desc),
                                cudaMemcpyHostToDevice,
                                stream.value()));
 
-  kernel_build_cumsum<<<static_cast<uint32_t>(n), BLOCK_DIM, 0, stream.value()>>>(
+  kernel_build_cumsum<<<static_cast<uint32_t>(num_live_segments), BLOCK_DIM, 0, stream.value()>>>(
     d_build_descs.data(),
     d_cumsums.data(),
     RLE_BUILD_MAX_ENTRIES,
     d_entry_counts.data(),
     type_size,
-    static_cast<uint32_t>(n));
+    static_cast<uint32_t>(num_live_segments));
 
-  // Build per-CTA chunk descriptors. Cumsum slice + values pointer can be
-  // computed on host without observing the build kernel's output.
+  // Per-CTA chunk descriptors; cumsum slice + values pointer computable on host.
   size_t total_chunks = 0;
   for (auto const* seg : live) {
-    total_chunks += (seg->row_count + RLE_ROWS_PER_CHUNK - 1) / RLE_ROWS_PER_CHUNK;
+    total_chunks += ::cuda::ceil_div(seg->row_count, RLE_ROWS_PER_CHUNK);
   }
   std::vector<rle_chunk_desc> h_descs;
   h_descs.reserve(total_chunks);
-  for (size_t i = 0; i < n; ++i) {
+  for (size_t i = 0; i < num_live_segments; ++i) {
     auto const& seg          = *live[i];
     uint32_t const rc        = seg.row_count;
-    uint32_t const num_cnks  = (rc + RLE_ROWS_PER_CHUNK - 1) / RLE_ROWS_PER_CHUNK;
+    uint32_t const num_cnks  = ::cuda::ceil_div(rc, RLE_ROWS_PER_CHUNK);
     uint8_t const* d_values  = seg.d_bytes + RLE_HEADER_SIZE;
     uint32_t const* d_cumsum = d_cumsums.data() + i * RLE_BUILD_MAX_ENTRIES;
 
@@ -450,19 +437,19 @@ void decode_rle_data(gpu_codec_run const& run,
   uint32_t const grid = static_cast<uint32_t>(h_descs.size());
   switch (type_size) {
     case 1:
-      kernel_decode_rle<uint8_t><<<grid, BLOCK_DIM, RLE_SMEM_BYTES, stream.value()>>>(
+      kernel_decode_rle<uint8_t><<<grid, BLOCK_DIM, 0, stream.value()>>>(
         d_descs.data(), d_entry_counts.data(), d_output, grid);
       break;
     case 2:
-      kernel_decode_rle<uint16_t><<<grid, BLOCK_DIM, RLE_SMEM_BYTES, stream.value()>>>(
+      kernel_decode_rle<uint16_t><<<grid, BLOCK_DIM, 0, stream.value()>>>(
         d_descs.data(), d_entry_counts.data(), reinterpret_cast<uint16_t*>(d_output), grid);
       break;
     case 4:
-      kernel_decode_rle<uint32_t><<<grid, BLOCK_DIM, RLE_SMEM_BYTES, stream.value()>>>(
+      kernel_decode_rle<uint32_t><<<grid, BLOCK_DIM, 0, stream.value()>>>(
         d_descs.data(), d_entry_counts.data(), reinterpret_cast<uint32_t*>(d_output), grid);
       break;
     case 8:
-      kernel_decode_rle<uint64_t><<<grid, BLOCK_DIM, RLE_SMEM_BYTES, stream.value()>>>(
+      kernel_decode_rle<uint64_t><<<grid, BLOCK_DIM, 0, stream.value()>>>(
         d_descs.data(), d_entry_counts.data(), reinterpret_cast<uint64_t*>(d_output), grid);
       break;
     default:
