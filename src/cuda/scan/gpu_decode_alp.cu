@@ -430,13 +430,16 @@ __global__ void kernel_decode_alp(alp_vector_desc const* __restrict__ descs,
     T plain     = static_cast<T>(enc) * fact_t * frac_t;
     __stwt(out + i, plain);
   }
-  __syncthreads();
 
   // Bound-check `pos` to refuse a corrupt OOB write — positions are
   // unique by construction at compress time, but the parsed value isn't
   // trusted.
   uint16_t const exc_count = sh_exc_count;
   if (exc_count > 0u) {
+    // Sync only on the exception path: every thread must finish its main-loop
+    // store before any thread overwrites a row with its exception value.
+    // `sh_exc_count` is broadcast-shared, so all threads take the same branch.
+    __syncthreads();
     uint8_t const* exc_base   = packed_bytes + sh_packed_bytes;
     uint8_t const* exc_p_base = exc_base + uint32_t{exc_count} * sizeof(T);
     for (uint32_t e = threadIdx.x; e < exc_count; e += blockDim.x) {
@@ -632,12 +635,15 @@ __global__ void kernel_decode_alprd(alp_vector_desc const* __restrict__ descs,
     memcpy(&v, &bits, sizeof(T));
     __stwt(out + i, v);
   }
-  __syncthreads();
 
   // Exception scatter recovers right-bits via `read_back_after_stwt` —
   // see helper for the L1-invalidate contract.
   uint16_t const exc_count = sh_exc_count;
   if (exc_count > 0u) {
+    // Sync only on the exception path: read_back_after_stwt(out, pos) reads
+    // what other threads wrote in the main loop, so the barrier is required
+    // here. `sh_exc_count` is broadcast-shared — uniform branch is safe.
+    __syncthreads();
     uint8_t const* exc_base   = right_bp + sh_right_bytes;
     uint8_t const* exc_p_base = exc_base + uint32_t{exc_count} * 2u;
 
