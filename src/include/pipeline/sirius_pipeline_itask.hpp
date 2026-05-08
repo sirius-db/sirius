@@ -86,14 +86,6 @@ class sirius_pipeline_itask : public parallel::itask {
   [[nodiscard]] virtual pipeline::reservation_size_info get_estimated_reservation_size_info()
     const = 0;
 
-  /**
-   * @brief Convenience wrapper — returns only the reservation size in bytes.
-   */
-  [[nodiscard]] std::size_t get_estimated_reservation_size() const
-  {
-    return get_estimated_reservation_size_info().reservation_size;
-  }
-
   /// @brief Get the output consumer operators for this task.
   virtual std::vector<op::sirius_physical_operator*> get_output_consumers() = 0;
 
