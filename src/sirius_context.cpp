@@ -44,6 +44,7 @@
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <cstdlib>  // for std::getenv
 #include <filesystem>
 #include <memory>
@@ -310,6 +311,34 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 
       gpu_ioctxs_[device_id] = std::move(ioctx);
     }
+  }
+
+  // === Phase 22.1 D-10: register kFileScheme in datasource_registry_ ===
+  // The factory (Plan 22.1-02) consults this registry on every parquet read;
+  // it will throw if a scheme has no registered ioctx. The registry stores ONE
+  // entry per scheme (not per-GPU); consumers that need per-GPU ioctx
+  // selection use get_ioctx_for(device_id) directly. Picking the
+  // lowest-numbered GPU here is arbitrary — it is correct because
+  // make_datasource on any ioctx returns a sirius_datasource that the
+  // consumer wires up with the right device_id at use site (the registered
+  // ioctx is a fallback for callers that don't know which GPU they want;
+  // Plan 22.1-03/04/05 callers all pass an explicit per-GPU ioctx).
+  if (!gpu_ioctxs_.empty()) {
+    // Match the spelling of `kFileScheme` from datasource_factory.cpp:90
+    // verbatim (anonymous namespace constant).
+    static constexpr std::string_view kFileScheme = "file";
+    auto lowest_gpu                               = std::min_element(
+      gpu_ioctxs_.begin(), gpu_ioctxs_.end(), [](auto const& a, auto const& b) {
+        return a.first < b.first;
+      });
+    datasource_registry_.register_ioctx(std::string{kFileScheme}, lowest_gpu->second);
+    spdlog::info(
+      "SiriusContext: registered kFileScheme -> sirius_ioctx for GPU {} (datasource_registry_)",
+      lowest_gpu->first);
+  } else {
+    throw std::runtime_error(
+      "SiriusContext::initialize: cannot register kFileScheme; no per-GPU sirius_ioctx exists "
+      "(gpu_ioctxs_.empty()). Phase 19 IO-13 must have produced at least one ioctx.");
   }
 
   // ---- MGPU-06: Enable P2P peer access for every available GPU pair ----
