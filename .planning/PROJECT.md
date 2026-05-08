@@ -10,6 +10,18 @@ Any query can transparently execute across every GPU on the node — tasks are s
 
 ## Current State
 
+**Phase 22 shipped 2026-05-08** — Multi-GPU Pinning + Stream Lineage Hardening (post-v1.4).
+- 7 plans / 2 requirements cleared (PIN-MGPU-01, fu17-cluster-b)
+- Cucascade pin advanced from `1c1e648` → `c666b21` (descended from `1c1e648` via intermediate `42a01c4` clang-format cleanup; Plan 22-03 lands `alloc_and_peer_copy_async` same-stream invariant fix)
+- PIN-MGPU-01: `PinTableFunction` distributes parquet chunks round-robin across GPU memory spaces (`idx % gpu_spaces.size()`); `pinned_entry::chunk_memory_spaces` vector parallel to `data_batches_by_column`; `cached_split_provider` per-chunk lookup; `[pin_mgpu]` Catch2 distribution + routing gates PASS
+- fu17 Cluster B closed: cucascade `c666b21` collapses producer + DtoH leg + HtoD leg onto a single `target_stream` in `alloc_and_peer_copy_async`; sanitizer reports `cluster_B=0` post-fix at both SF1 and SF100 scale (was 16 pre-fix per `20-05-INVESTIGATION.md`)
+- v1.4 ship-gate gauntlet (REG-01..06) re-passed against the bumped pin with no regression: `[mgpu]` 16/16 (110.6s); `[TPC-H][parquet]` 22/22 (85.2s); `[integration][TPC-H]` 48/48 (162.4s); SF100 Q1 num_gpus=2 wall-clock 2.807s (faster than Phase 21 baseline 3.150s); `[mgpu_stress]` 500-iter PASS (80.5s); HYG-02 = 40 (preserved); compute-sanitizer 0 violations
+- Phase 22 NEW gates: GATE-07 PIN-MGPU-01 distribution PASS; GATE-08 PIN-MGPU-01 routing PASS; GATE-09 fu17 Cluster B sanitizer PASS
+- Advisory (NOT GATING): SF100 Q11 num_gpus=2 sanitizer recorded — `cluster_B=0` even at SF100 scale; query-level fallback (`downgrade_executor cudaSetDevice(-1)` error) tracked as separate carry-forward (follow-up #17)
+- Branch: `feature/single-node-multi-gpu2` (local-only; no `git push`; no merge to dev)
+- Carry-forwards to v1.6+: CC-UPSTREAM-01 (12 local cucascade fixes; `22-CUCASCADE-DIFF.md` captures the diff for future upstream PR), PIN-MGPU-02 (adaptive free-memory-proportional pin distribution), PIN-MGPU-03 (HOST-tier pin path with NUMA-local round-robin), OOM-RETRY-01 (retry budget restoration 100 → 10), follow-up #17 (SF100 Q11 num_gpus=2 query-level fallback root-cause)
+- See: [`22-VERDICT.md`](phases/22-multi-gpu-pinning-stream-lineage-hardening/22-VERDICT.md), [`22-CUCASCADE-DIFF.md`](phases/22-multi-gpu-pinning-stream-lineage-hardening/22-CUCASCADE-DIFF.md), [`22-07-SUMMARY.md`](phases/22-multi-gpu-pinning-stream-lineage-hardening/22-07-SUMMARY.md)
+
 **v1.4 shipped 2026-05-06** — Rebase After DataBatch Changes.
 - 6 phases / 29 plans / 32 requirements cleared (CC-01..04 + MERGE-01..05 + DB-01..05 + IO-12..17 + IO-15B + SM-01..06 + REG-01..06)
 - Cucascade rebased to pin `1c1e648` (descended from `73d00c4` with PR #117 DataBatch RAII + PR #112 bandwidth profiler + PR #116 `gpu_data_representation` from `cudf::table_view`; 11 local Sirius-side fixes preserved per CC-01..04)
@@ -89,6 +101,10 @@ Shipped and validated in v1.1.
 
 (No active requirements yet — `/gsd:new-milestone` mid-flight; REQUIREMENTS.md is written next.)
 
+**Phase 22 deliverables (now Validated):**
+- ✓ **PIN-MGPU-01** — Multi-GPU-aware `pin_table` (round-robin across GPU memory spaces). `PinTableFunction` distributes parquet chunks via `idx % gpu_spaces.size()` per-call counter + per-file `rmm::cuda_set_device_raii` guard around `chunked_parquet_reader`. `pinned_entry::chunk_memory_spaces` vector + `get_pinned_entries()` accessor. `cached_split_provider` per-chunk memory_space lookup. `[pin_mgpu]` Catch2 distribution + routing gates PASS — *Phase 22 (v1.5+ scope)*
+- ✓ **fu17-cluster-b** — Cucascade `alloc_and_peer_copy_async` host-staging fallback same-stream invariant fix. Cucascade pin advanced `1c1e648` → `c666b21`. Sanitizer `cluster_B=0` post-fix at both SF1 and SF100 scale (was 16 pre-fix). Closes the post-Phase-13 fallback path race that 20-05-INVESTIGATION.md surfaced — *Phase 22 (v1.5+ scope)*
+
 **v1.3 deliverables (now Validated):**
 - ✓ **SORT-01** — Phase 12 small-sort `vector::at(2)` correctness fix in `prepare_join_keys` (`src/op/sirius_physical_hash_join.cpp:622-637`); consumer-side guard against SORT-as-HASH_JOIN partitioner emitting stale `key_col_indices` ≥ `num_columns()`; regression TEST_CASE locks the bug class — *v1.3*
 - ✓ **Q11-01** — Phase 13 Q11 multi-GPU illegal-address closed via cucascade-side stream-event lineage (`writer_event` recorded at `gpu_table_representation` ctor; `cudaStreamWaitEvent` in `convert_gpu_to_gpu` before peer copy). Path-2 architectural fix (compiler-enforced ctor signature requiring `writer_stream`). Cucascade pin advanced to `62e0517` — *v1.3*
@@ -102,7 +118,7 @@ Shipped and validated in v1.1.
 
 ## Deferred to Future Milestones
 
-- **`pin_table` single-GPU residency (v1.4)**: `CALL pin_table(...)` always pins to GPU 0 in v1.4. The implementation at `src/sirius_extension.cpp:733` uses `gpu_spaces[0]` unconditionally — `auto& mem_space = const_cast<cucascade::memory::memory_space&>(*gpu_spaces[0]);`. Multi-GPU-aware placement is tracked as `PIN-MGPU-01` in `REQUIREMENTS.md` Future Requirements section, deferred to v1.5+. Trade-off: P2P copy overhead via `convert_gpu_to_gpu` is acceptable in v1.4 because Phase 13 `cudaStreamWaitEvent` chain (re-attached at `src/op/scan/sirius_gpu_parquet_scan_operator.cpp:263`) ensures correctness; perf gap is small at SF1 but may show at SF100 multi-table workloads. Documented for SM-05 closure during Phase 20.
+- **`pin_table` single-GPU residency** *(closed 2026-05-08 in Phase 22 — PIN-MGPU-01 validated)*: `CALL pin_table(...)` now distributes parquet chunks round-robin across all available GPU memory spaces (`idx % gpu_spaces.size()` in `PinTableFunction`); `pinned_entry::chunk_memory_spaces` vector preserves per-chunk residency information end-to-end through `cached_split_provider`. Adaptive (free-memory-proportional) variant tracked as PIN-MGPU-02 in v1.6+ scope. HOST-tier `pin_table` (NUMA-local round-robin) tracked as PIN-MGPU-03.
 - **`[mgpu-audit]` per-GPU distribution AUDIT TEST_CASE SIGSEGV** at `test_gpu_execution_tpch_mgpu_audit.cpp:200` (`attach_integration_duckdb` path; pre-existing on base before v1.2; orthogonal to parquet filter translation path; Phase 11 candidate, < 50 LOC expected)
 - Upstream cucascade `convert_gpu_to_gpu` cross-stream fix (drop Sirius override once upstream lands)
 - Phase-5 vs Phase-4 parquet I/O regression comparison
@@ -179,4 +195,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-05-04 — v1.3 closed (Phases 12-15 shipped; deliverables moved to Validated). v1.4 "Rebase After DataBatch Changes" started — cucascade origin/main (PR #117 DataBatch RAII refactor + #112 + #116) and Sirius origin/dev (#675 IO Framework, #731 Scan Manager, #721 Pin Tables, #739 cucascade-compat) targeted onto feature/single-node-multi-gpu2. Conflict surface measured 2026-05-04: cucascade rebase = 6 conflict files; Sirius dev merge = 11 conflict files + 33 auto-merges. Phase numbering continues from 16. v1.3 FU-B (speedup gate) carried forward.*
+*Last updated: 2026-05-08 — Phase 22 (Multi-GPU pinning + stream lineage hardening) shipped on `feature/single-node-multi-gpu2`. PIN-MGPU-01 + fu17-cluster-b promoted to Validated. Cucascade pin advanced `1c1e648` → `c666b21` (Plan 22-03 same-stream invariant fix in `alloc_and_peer_copy_async`). v1.4 ship-gate gauntlet (REG-01..06) re-passed against bumped pin with no regression; 3 new gates (GATE-07/08/09) PASS. SF100 Q1 num_gpus=2 wall-clock 2.807s (faster than Phase 21 baseline 3.150s). HYG-02 = 40 invariant preserved phase-wide. Branch local-only; no `git push`; no merge to dev. Carry-forwards to v1.6+: CC-UPSTREAM-01 (now 12 local fixes; `22-CUCASCADE-DIFF.md` captures readable diff for future PR), PIN-MGPU-02 (adaptive distribution), PIN-MGPU-03 (HOST-tier pin path), OOM-RETRY-01, follow-up #17 (SF100 Q11 num_gpus=2 query-level fallback). Phase 22 verdict: PASS. See [`22-VERDICT.md`](phases/22-multi-gpu-pinning-stream-lineage-hardening/22-VERDICT.md).*
