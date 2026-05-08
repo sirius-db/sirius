@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Gauntlet on Rebased Branch)
 status: executing
-stopped_at: Completed 22.1-remove-kvikio plan 05 (iceberg metadata reader migration)
-last_updated: "2026-05-08T04:10:00.025Z"
+stopped_at: "Completed 22.1-03-PLAN.md (site #1 sirius_gpu_parquet_scan_operator migration; build + [mgpu] 16/16 + [TPC-H][parquet] 22/22 PASS)"
+last_updated: "2026-05-08T04:17:39.819Z"
 last_activity: 2026-05-08
 progress:
   total_phases: 8
   completed_phases: 1
   total_plans: 14
-  completed_plans: 12
+  completed_plans: 13
 ---
 
 # Project State
@@ -25,7 +25,7 @@ See: .planning/PROJECT.md (updated 2026-05-04)
 ## Current Position
 
 Phase: 22.1 (remove-kvikio) — EXECUTING
-Plan: 6 of 7
+Plan: 7 of 7
 Status: Ready to execute
 Last activity: 2026-05-08
 
@@ -117,6 +117,7 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 | Phase 22.1 P04 | 5min | 2 tasks | 1 files |
 | Phase 22.1 P06 | 6min | 3 tasks | 4 files |
 | Phase 22.1-remove-kvikio P05 | 8min | 4 tasks | 3 files |
+| Phase 22.1 P03 | 16min | 3 tasks | 5 files |
 
 ## Decisions
 
@@ -277,6 +278,8 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 - [Phase 22.1]: [22.1-06] Lifted make_test_gpu_ioctxs() helper from test_parquet_scan_task.cpp into shared header test/cpp/scan/test_helpers_ioctx.hpp (sirius::scan_test_utils namespace) so multiple TUs can include without ODR violations. Existing 4 call-sites in test_parquet_scan_task.cpp preserve unqualified ergonomics via 'using sirius::scan_test_utils::make_test_gpu_ioctxs;' shim.
 - [Phase 22.1]: [22.1-06] [mgpu] + [TPC-H][parquet] failures observed at this commit are PRE-EXISTING Wave-2 conditions caused by parallel agent 22.1-03's commits 72780f5 + e8ac76d (added throw on empty _gpu_ioctxs in sirius_gpu_parquet_scan_operator::read_table_from_metadata BEFORE wiring through sirius_scan_manager::create_provider_for() was added). Out of scope for Plan 22.1-06 per file ownership boundary; will recover when 22.1-03 wiring lands.
 - [Phase 22.1-remove-kvikio]: Plan 22.1-05: iceberg sites #3 + #4 routed through GPU 0 sirius_ioctx; closes kvikio half of IO-MGPU-02; multi-GPU iceberg residency deferred as IO-MGPU-04 per D-06
+- [Phase 22.1]: [22.1-03] Setter pattern (D-04) for gpu_ioctxs injection on sirius_gpu_parquet_scan_operator — sirius_scan_manager::create_provider_for calls op->set_gpu_ioctxs(gpu_ioctxs) BEFORE returning any provider. Avoids constructor churn through pipeline_converter; mirrors how parquet_scan_task_global_state already accepts the map.
+- [Phase 22.1]: [22.1-03] Single-ioctx-per-scan_data routing (NOT per-slice). All slices in a scan_data share gpu_memory_space (set by prepare_for_processing once per task), so ioctx selection happens once per call. Cross-GPU fan-out is parquet_split_provider's responsibility — it produces per-GPU scan_data instances.
 
 ## Accumulated Context
 
@@ -317,6 +320,6 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 
 ## Session Continuity
 
-Last session: 2026-05-08T04:10:00.021Z
-Stopped at: Completed 22.1-remove-kvikio plan 05 (iceberg metadata reader migration)
+Last session: 2026-05-08T04:17:39.815Z
+Stopped at: Completed 22.1-03-PLAN.md (site #1 sirius_gpu_parquet_scan_operator migration; build + [mgpu] 16/16 + [TPC-H][parquet] 22/22 PASS)
 Resume file: None
