@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Gauntlet on Rebased Branch)
 status: executing
-stopped_at: Completed 22-05-PLAN.md ([pin_mgpu] distribution + routing gates 2/2 PASS; [mgpu] 16/16 + [TPC-H][parquet] 22/22 baselines preserved; HYG-02=40)
-last_updated: "2026-05-07T23:43:18.406Z"
-last_activity: 2026-05-07
+stopped_at: "Completed 22-06-PLAN.md (Phase 22 D-12 sanitizer gate script test/scripts/sanitizer_gate_22.sh authored + self-tested live: cluster_B=0, cluster_A=14, total_races=5, exit 0; negative-test exit 1; HYG-02=40)"
+last_updated: "2026-05-08T01:23:21.114Z"
+last_activity: 2026-05-08
 progress:
   total_phases: 7
   completed_phases: 0
   total_plans: 7
-  completed_plans: 5
+  completed_plans: 6
 ---
 
 # Project State
@@ -25,9 +25,9 @@ See: .planning/PROJECT.md (updated 2026-05-04)
 ## Current Position
 
 Phase: 22 (multi-gpu-pinning-stream-lineage-hardening) — EXECUTING
-Plan: 5 of 7
+Plan: 6 of 7
 Status: Ready to execute
-Last activity: 2026-05-07
+Last activity: 2026-05-08
 
 ```
 v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans | SHIPPED 2026-05-06
@@ -111,6 +111,7 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 | Phase 22 P02 | 4min38s | 2 tasks | 4 files |
 | Phase 22 P04 | 7min | 3 tasks | 1 files |
 | Phase 22 P05 | 10min | 2 tasks | 2 files |
+| Phase 22 P06 | 8min | 1 tasks | 1 files |
 
 ## Decisions
 
@@ -256,6 +257,9 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 - [Phase 22]: [22-05] PIN-MGPU-01 [pin_mgpu] gates landed: distribution (2 distinct GPU device_ids on 4-file × num_gpus=2 pin via get_pinned_entries() accessor + entry.chunk_memory_spaces walk) + routing (>=1 [mgpu-audit] pipeline_task per GPU after CALL pin_table + SELECT through cached split provider). 2/2 PASS, 46 assertions, 6.9s. [mgpu] 16/16 + [TPC-H][parquet] 22/22 baselines preserved. HYG-02=40.
 - [Phase 22]: [22-05] Routing assertion uses pipeline_ids (task_scheduler.cpp:275 emission), not scan_ids — Rule 1 deviation: cached-parquet pin path drives sirius_gpu_parquet_scan_operator -> pipeline_task, NOT duckdb_scan_executor's scan_batch path. Combined pipeline_ids+scan_ids >= 1 retains plan-spec grep gate + forward-compat.
 - [Phase 22]: [22-05] scoped_mgpu_env held in std::unique_ptr + spdlog::default_logger()->flush() before env.reset() — Rule 3 fix: Config::LOG_FLUSH_SECONDS=3s but SF1 query is ~600ms; without explicit flush the [mgpu-audit] emissions stay in spdlog's 8192-byte file_sink buffer. Mirrors test_gpu_execution_tpch_mgpu_audit.cpp:233 env->pause() pattern.
+- [Phase 22]: [22-06] Phase 22 D-12 sanitizer gate script authored at test/scripts/sanitizer_gate_22.sh; runs SF1 Q11 num_gpus=2 under compute-sanitizer memcheck + track-stream-ordered-races=all via Bash + timeout 600 (NOT MCP per feedback_sanitizer_via_bash_not_mcp); Pitfall 5 literal grep -cE filter (NEVER grep -v); D-09 Cluster A advisory-only branch; verbatim Phase 21 21-VERDICT.md Section F sanitizer command shape.
+- [Phase 22]: [22-06] Live self-test on bumped cucascade pin c666b21: exit 0, cluster_B=0, cluster_A=14 frame mentions, total_races=5 race blocks (matches 22-04 micro-validation profile); 9011 assertions PASS in 9s. Negative-test (fake Cluster B frame injected into log copy): exit 1, gate fires correctly. HYG-02 src/=40 unchanged.
+- [Phase 22]: [22-06] Exit code taxonomy beyond plan body 0/1: 2=env error (sanitizer/binary missing), 3=sanitizer crashed pre-log, 124=timeout fired. Distinguishes infrastructure failures from Cluster B regressions in plan 22-07's gauntlet. P22_SKIP_RUN=1 env override for log-replay (used by negative-test); P22_TIMEOUT_SEC parameterized (default 600).
 
 ## Accumulated Context
 
@@ -295,6 +299,6 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 
 ## Session Continuity
 
-Last session: 2026-05-07T23:43:18.403Z
-Stopped at: Completed 22-05-PLAN.md ([pin_mgpu] distribution + routing gates 2/2 PASS; [mgpu] 16/16 + [TPC-H][parquet] 22/22 baselines preserved; HYG-02=40)
+Last session: 2026-05-08T01:23:07.365Z
+Stopped at: Completed 22-06-PLAN.md (Phase 22 D-12 sanitizer gate script test/scripts/sanitizer_gate_22.sh authored + self-tested live: cluster_B=0, cluster_A=14, total_races=5, exit 0; negative-test exit 1; HYG-02=40)
 Resume file: None
