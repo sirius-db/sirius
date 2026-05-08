@@ -25,6 +25,12 @@
 #include <op/sirius_physical_operator.hpp>
 #include <pipeline/sirius_meta_pipeline.hpp>
 #include <scan_manager/split_connector.hpp>
+// Phase 19 IO-15: include uring_reactor LAST among sirius headers — liburing.h
+// transitively pulled by uring_reactor.hpp defines a BLOCK_SIZE macro that
+// collides with the BLOCK_SIZE static member in <blockingconcurrentqueue.h>
+// (used by spdlog / pipeline). All consumers of blockingconcurrentqueue.h
+// must precede this include.
+#include <io/uring/uring_reactor.hpp>
 
 // cudf
 #include <cudf/io/parquet.hpp>
@@ -34,9 +40,11 @@
 // cucascade
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 // standard library
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace sirius::op::scan {
@@ -64,8 +72,8 @@ sirius_gpu_parquet_scan_operator::~sirius_gpu_parquet_scan_operator() = default;
 // Called by sirius_scan_manager::create_provider_for() during prepare_for_query,
 // before any execute() runs. read_table_from_metadata() reads from _gpu_ioctxs to
 // route each parquet open through ioctx->make_datasource(uring_io_object), which
-// replaces the pre-22.1 cudf::io::datasource::create(file_path) call that bypassed
-// the ioctx framework and routed through libkvikio (the K.1 / Cluster A race source).
+// replaces the pre-22.1 cudf-bundled file_source factory that bypassed the ioctx
+// framework and routed through libkvikio (the K.1 / Cluster A race source).
 void sirius_gpu_parquet_scan_operator::set_gpu_ioctxs(
   std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> ioctxs)
 {
@@ -136,8 +144,40 @@ std::unique_ptr<cudf::table> sirius_gpu_parquet_scan_operator::read_table_from_m
   metadatas.reserve(scan_data.rg_slices.size());
   rg_per_src.reserve(scan_data.rg_slices.size());
 
+  // Phase 22.1 D-04: route each parquet file read through the per-GPU
+  // sirius_ioctx selected by the chunk's memory_space->get_device_id().
+  // The pre-22.1 cudf-bundled file_source factory bypassed the ioctx
+  // framework entirely and routed through libkvikio's per-FileHandle CUDA-
+  // context binding, breaking multi-GPU residency (K.1 Cluster A race).
+  if (_gpu_ioctxs.empty()) {
+    throw std::runtime_error(
+      "[sirius_gpu_parquet_scan_operator::read_table_from_metadata] _gpu_ioctxs is empty; "
+      "set_gpu_ioctxs() must be called by sirius_scan_manager::create_provider_for() before "
+      "execute(). Phase 22.1 D-04.");
+  }
+  if (scan_data.gpu_memory_space == nullptr) {
+    throw std::runtime_error(
+      "[sirius_gpu_parquet_scan_operator::read_table_from_metadata] scan_data.gpu_memory_space "
+      "is null; cannot select per-chunk ioctx (Phase 22.1 D-04).");
+  }
+  int const target_device_id = scan_data.gpu_memory_space->get_device_id();
+  auto ioctx_it              = _gpu_ioctxs.find(target_device_id);
+  if (ioctx_it == _gpu_ioctxs.end()) {
+    throw std::out_of_range(
+      "[sirius_gpu_parquet_scan_operator::read_table_from_metadata] no sirius_ioctx for "
+      "device_id=" +
+      std::to_string(target_device_id) + " (Phase 22.1 D-04).");
+  }
+  // Hold uring_io_object shared_ptrs for the duration of the read so the
+  // sirius_datasources keep a valid handle (mirror parquet_scan_task.cpp:341-352
+  // pattern; sirius_datasource holds a raw observer of the io_object).
+  std::vector<std::shared_ptr<sirius::io::uring_io_object>> io_objects;
+  io_objects.reserve(scan_data.rg_slices.size());
   for (auto const& slice : scan_data.rg_slices) {
-    sources.push_back(cudf::io::datasource::create(slice.file_path));
+    auto io_object  = std::make_shared<sirius::io::uring_io_object>(slice.file_path);
+    auto datasource = ioctx_it->second->make_datasource(io_object);
+    io_objects.push_back(std::move(io_object));
+    sources.push_back(std::move(datasource));
     metadatas.push_back(*slice.file_metadata);  // copy unavoidable: cudf takes by value
     rg_per_src.push_back(slice.row_group_indices);
   }
