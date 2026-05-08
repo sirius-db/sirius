@@ -35,6 +35,7 @@
 #include <duckdb/main/prepared_statement_data.hpp>
 #include <duckdb/planner/extension_callback.hpp>
 #include <duckdb/planner/logical_operator.hpp>
+#include <io/datasource_factory.hpp>
 #include <io/types.hpp>
 
 #include <atomic>
@@ -201,6 +202,19 @@ class SiriusContext : public ClientContextState {
     return gpu_ioctxs_;
   }
 
+  /// @brief Read-only access to the datasource registry populated at startup.
+  /// @details Phase 22.1 D-10: kFileScheme is registered at the end of
+  ///          initialize() against the lowest-numbered GPU's sirius_ioctx;
+  ///          object-store schemes (s3://, gs://, azure://) are not yet
+  ///          registered. Plan 22.1-02 will flip
+  ///          datasource_factory::create() to throw on unknown scheme — this
+  ///          accessor is the read-side hook that lets the factory consult
+  ///          the registry at every parquet read.
+  [[nodiscard]] sirius::io::datasource_registry const& get_datasource_registry() const
+  {
+    return datasource_registry_;
+  }
+
   /// @brief Check whether cudaDeviceEnablePeerAccess succeeded for the given
   ///        (src, dst) GPU pair at SiriusContext::initialize() time (MGPU-06).
   ///
@@ -309,6 +323,13 @@ class SiriusContext : public ClientContextState {
   // memory_manager_->shutdown() so ~uring_reactor's worker-thread join +
   // cudaFreeHost run against a live CUDA context (Pitfall 3).
   std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs_;
+  // Phase 22.1 D-10: registry mapping URI scheme -> ioctx, populated by
+  // initialize() with kFileScheme -> gpu_ioctxs_.at(<lowest_gpu_id>).
+  // datasource_factory::create() (Plan 22.1-02) reads this registry to
+  // resolve schemes; throws if no entry exists. Cleared BEFORE
+  // gpu_ioctxs_ in shutdown to avoid dangling shared_ptrs (terminate()
+  // ordering in src/sirius_context.cpp).
+  sirius::io::datasource_registry datasource_registry_;
   // MGPU-06 P2P: set of (src, dst) GPU pairs where cudaDeviceEnablePeerAccess
   // succeeded in initialize(). Populated under rmm::cuda_set_device_raii, one
   // call per pair. Consumed by is_peer_access_enabled() + Plan 07-02's
