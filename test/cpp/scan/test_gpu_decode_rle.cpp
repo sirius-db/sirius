@@ -164,8 +164,7 @@ TEST_CASE("gpu_decode_table RLE - cross-CTA boundary (rows > RLE_ROWS_PER_CHUNK)
   REQUIRE(out == expected);
 }
 
-TEST_CASE("gpu_decode_table RLE - warp-broadcast straddles run boundary",
-          "[scan][decode][rle]")
+TEST_CASE("gpu_decode_table RLE - warp-broadcast straddles run boundary", "[scan][decode][rle]")
 {
   // Avg run 33 ≥ warpSize triggers long_runs_heuristic; runs don't align
   // with warp boundaries, so warps straddle entries and exercise the

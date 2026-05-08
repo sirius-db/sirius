@@ -58,7 +58,7 @@ static_assert(BLOCK_DIM * VALUES_PER_THREAD == RLE_ROWS_PER_CHUNK);
 
 // Build kernel processes counts in tiles of BUILD_TILE_ENTRIES; running
 // total propagates across tiles.
-constexpr uint32_t BUILD_VALUES_PER_THREAD = 16;
+constexpr uint32_t BUILD_VALUES_PER_THREAD = 8;
 constexpr uint32_t BUILD_TILE_ENTRIES      = BLOCK_DIM * BUILD_VALUES_PER_THREAD;  // 4096
 constexpr uint32_t RLE_SMEM_MAX_ENTRIES    = BUILD_TILE_ENTRIES;
 
