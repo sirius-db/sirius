@@ -293,7 +293,7 @@ Plans:
 **Goal:** All Sirius parquet/metadata reads route through `sirius_ioctx::make_datasource(io_object)`; zero `cudf::io::datasource::create(path)` or `cudf::io::source_info{path}` invocations remain in `src/`. Closes the K.1 (Cluster A) sanitizer race and likely K.6 (`cudaSetDevice(-1)` empty-result fallback at SF100 Q11 num_gpus=2). Subsumes IO-MGPU-02. Required for multi-GPU correctness — kvikio's per-FileHandle CUDA-context binding silently breaks when the destination buffer lives on a different GPU than the FileHandle's bound context.
 **Requirements**: IO-MGPU-02 (subsumed), IO-MGPU-03 (new)
 **Depends on:** Phase 22
-**Plans:** 6/7 plans executed
+**Plans:** 7/7 plans complete
 
 Plans:
 - [x] 22.1-01-PLAN.md — Register kFileScheme uring ioctx in SiriusContext; expose datasource_registry accessor
@@ -302,4 +302,4 @@ Plans:
 - [x] 22.1-04-PLAN.md — Migrate PinTableFunction (site #2) to per-GPU ioctx + pointer-form source_info
 - [x] 22.1-05-PLAN.md — Migrate iceberg metadata + equality-delete reads (sites #3 + #4) to GPU 0 ioctx (single-GPU sufficient per D-06)
 - [x] 22.1-06-PLAN.md — Delete unit-test fallback at parquet_split_provider.cpp:295 (site #7); update test fixtures to inject ioctx
-- [ ] 22.1-07-PLAN.md — Verification gauntlet (REG-01..06 + GATE-22.1-A/B/C + K.6 advisory) + sanitizer_gate_22.sh Cluster A gate + 22.1-VERDICT.md + 22.1-CUCASCADE-DIFF.md (autonomous: false)
+- [x] 22.1-07-PLAN.md — Verification gauntlet (REG-01..06 + GATE-22.1-A/B/C + K.6 advisory) + sanitizer_gate_22.sh Cluster A gate + 22.1-VERDICT.md + 22.1-CUCASCADE-DIFF.md (autonomous: false)
