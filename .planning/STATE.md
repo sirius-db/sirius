@@ -296,6 +296,7 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 ### Roadmap Evolution
 
 - Phase 22 added: Multi-GPU pinning + stream lineage hardening — round-robin pin distribution (GPU + NUMA-local HOST), cucascade writer-event API, fu17 SF100 Q11 stream-ordered race fix.
+- Phase 22.1 inserted after Phase 22: Remove all kvikio usage — migrate file-path parquet/metadata reads through sirius_ioctx::make_datasource (URGENT). Reason: Phase 22 sanitizer logs (K.1 Cluster A) revealed 7 bypass sites still feeding file paths into cudf's bundled file_source factory (kvikio). Kvikio's per-FileHandle CUDA-context binding silently breaks multi-GPU residency — Phase 22's PIN-MGPU-01 round-robin distribution is necessary but not sufficient on its own. Subsumes IO-MGPU-02 from REQUIREMENTS.md.
 
 ## Session Continuity
 

@@ -287,3 +287,13 @@ Plans:
 - [x] 22-05-PLAN.md — `[pin_mgpu]` Catch2 distribution + routing tests + CMake registration
 - [x] 22-06-PLAN.md — `test/scripts/sanitizer_gate_22.sh` Cluster B sanitizer gate (Bash + timeout, exit 0 iff Cluster B = 0)
 - [x] 22-07-PLAN.md — v1.4 ship-gate gauntlet rerun + Phase 22 new gates + `22-VERDICT.md` + `22-CUCASCADE-DIFF.md` + checkpoint (completed 2026-05-08)
+
+### Phase 22.1: Remove kvikio (INSERTED)
+
+**Goal:** All Sirius parquet/metadata reads route through `sirius_ioctx::make_datasource(io_object)`; zero `cudf::io::datasource::create(path)` or `cudf::io::source_info{path}` invocations remain in `src/`. Closes the K.1 (Cluster A) sanitizer race and likely K.6 (`cudaSetDevice(-1)` empty-result fallback at SF100 Q11 num_gpus=2). Subsumes IO-MGPU-02. Required for multi-GPU correctness — kvikio's per-FileHandle CUDA-context binding silently breaks when the destination buffer lives on a different GPU than the FileHandle's bound context.
+**Requirements**: IO-MGPU-02 (subsumed), IO-MGPU-03 (new)
+**Depends on:** Phase 22
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (run /gsd:plan-phase 22.1 to break down)
