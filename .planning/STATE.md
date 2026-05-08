@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Gauntlet on Rebased Branch)
 status: executing
-stopped_at: Completed 22.1-02-PLAN.md (datasource_factory policy flip — bypass-grep 0 hits)
-last_updated: "2026-05-08T03:54:48.699Z"
+stopped_at: "Completed 22.1-04-PLAN.md (PinTableFunction site #2 migration; build + [pin_mgpu] 2/2 PASS)"
+last_updated: "2026-05-08T04:06:39.182Z"
 last_activity: 2026-05-08
 progress:
   total_phases: 8
   completed_phases: 1
   total_plans: 14
-  completed_plans: 9
+  completed_plans: 10
 ---
 
 # Project State
@@ -25,7 +25,7 @@ See: .planning/PROJECT.md (updated 2026-05-04)
 ## Current Position
 
 Phase: 22.1 (remove-kvikio) — EXECUTING
-Plan: 3 of 7
+Plan: 4 of 7
 Status: Ready to execute
 Last activity: 2026-05-08
 
@@ -114,6 +114,7 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 | Phase 22 P06 | 8min | 1 tasks | 1 files |
 | Phase 22.1 P01 | 3min | 3 tasks | 2 files |
 | Phase 22.1 P02 | 3min | 3 tasks | 1 files |
+| Phase 22.1 P04 | 5min | 2 tasks | 1 files |
 
 ## Decisions
 
@@ -268,6 +269,8 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 - [Phase 22.1]: [22.1-02] datasource_factory policy flip: ALL schemes (including kFileScheme) MUST resolve via registry.lookup or throw verbatim 'kvikio path is forbidden' (D-09); both bypass branches deleted; relative bare paths normalize to file:///<absolute> via std::filesystem::absolute
 - [Phase 22.1]: [22.1-02] kFileScheme constant marked [[maybe_unused]] in anonymous namespace — no longer referenced at runtime in datasource_factory.cpp post-policy-flip; kept as documentation constant for sirius_context.cpp registration site
 - [Phase 22.1]: [22.1-02] Comment-line scrub deviation: removed stray 'cudf::io::datasource::create' textual mention inside a comment so strict bypass-grep returns 0 — sanitizer-gate harness in Plan 22.1-06 greps the bypass token without filtering comments
+- [Phase 22.1]: [22.1-04] Site #2 (PinTableFunction) eliminated. Pointer-form source_info{datasource.get()} backed by sirius_ioctx::make_datasource(uring_io_object). chunked_parquet_reader open question RESOLVED — pointer-form supported (cudf parquet.hpp:858 + types.hpp:416). Phase 22 chunked-pin design preserved verbatim.
+- [Phase 22.1]: [22.1-04] Phase 19 IO-15 include-ordering rule applied — uring_reactor.hpp included LAST among sirius headers (after duckdb headers) to avoid liburing.h's BLOCK_SIZE preprocessor macro clobbering blockingconcurrentqueue.h's BLOCK_SIZE static member.
 
 ## Accumulated Context
 
@@ -308,6 +311,6 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 
 ## Session Continuity
 
-Last session: 2026-05-08T03:54:48.695Z
-Stopped at: Completed 22.1-02-PLAN.md (datasource_factory policy flip — bypass-grep 0 hits)
+Last session: 2026-05-08T04:06:39.178Z
+Stopped at: Completed 22.1-04-PLAN.md (PinTableFunction site #2 migration; build + [pin_mgpu] 2/2 PASS)
 Resume file: None
