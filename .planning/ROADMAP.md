@@ -303,3 +303,13 @@ Plans:
 - [x] 22.1-05-PLAN.md — Migrate iceberg metadata + equality-delete reads (sites #3 + #4) to GPU 0 ioctx (single-GPU sufficient per D-06)
 - [x] 22.1-06-PLAN.md — Delete unit-test fallback at parquet_split_provider.cpp:295 (site #7); update test fixtures to inject ioctx
 - [x] 22.1-07-PLAN.md — Verification gauntlet (REG-01..06 + GATE-22.1-A/B/C + K.6 advisory) + sanitizer_gate_22.sh Cluster A gate + 22.1-VERDICT.md + 22.1-CUCASCADE-DIFF.md (autonomous: false)
+
+### Phase 22.2: Fix downgrade_executor cudaSetDevice(-1) (K.6 closure) (INSERTED)
+
+**Goal:** Close fu17 follow-up #17 / K.6 by fixing the HOST-tier `downgrade_executor` worker-init bug. Root cause (empirically isolated by Phase 22.1's advisory check): `src/downgrade/downgrade_executor.cpp:67-89` unconditionally builds a CUDA stream pool keyed to `_memory_space->get_device_id()` and a per-thread init lambda that calls `cudaSetDevice(device_id)`. For HOST-tier (and DISK-tier) executors created in `SiriusContext::initialize` via `create_executors_for_tier(Tier::HOST)`, `get_device_id()` returns the sentinel `-1` (no CUDA device for host memory). At SF1 the failure is silent because the HOST-tier executor never services a downgrade request; at SF100 host pressure triggers a request, the worker thread fails to bind, and the query falls back to empty result. Fix: gate both the stream pool creation and the per-thread init on `_space_id.tier == cucascade::memory::Tier::GPU`. SF100 Q11 num_gpus=2 must return correct non-empty rows post-fix.
+**Requirements**: K.6 (closure of fu17 follow-up #17 / SF100-Q11-MGPU)
+**Depends on:** Phase 22.1 (kvikio removal proves K.6 is independent of kvikio; isolates the failure to downgrade_executor)
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (run /gsd:plan-phase 22.2 to break down)
