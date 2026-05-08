@@ -21,6 +21,7 @@
 #include <cudf/table/table.hpp>
 
 #include <duckdb/main/client_context.hpp>
+#include "io/types.hpp"
 #include <op/scan/iceberg_avro_reader.hpp>
 
 #include <memory>
@@ -90,14 +91,23 @@ struct IcebergDeleteData {
  * Caller must ensure DuckDB side-effects are suppressed (InternalQueryGuard).
  * Falls back gracefully on errors (returns empty data, treated as V1).
  *
- * @param context    DuckDB client context for running iceberg_snapshots()
- *                   and reading positional-delete parquet files.
- * @param table_path The Iceberg table path passed to iceberg_scan().
+ * @param context        DuckDB client context for running iceberg_snapshots()
+ *                       and reading positional-delete parquet files.
+ * @param table_path     The Iceberg table path passed to iceberg_scan().
+ * @param metadata_ioctx Single-GPU sirius_ioctx for routing parquet reads
+ *                       (V2 equality-delete files + footer extraction). Per
+ *                       Phase 22.1 D-06, GPU 0 ioctx is sufficient — these
+ *                       are planning-time reads, not on the multi-GPU column-
+ *                       chunk hot path. Multi-GPU residency for iceberg
+ *                       metadata is deferred (IO-MGPU-04). Per D-09, the
+ *                       caller MUST provide a non-null ioctx; nullptr throws.
+ * @param snapshot_id    Optional Iceberg snapshot id (latest if omitted).
  * @return Shared pointer to immutable delete data.
  */
 std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
   duckdb::ClientContext& context,
   std::string const& table_path,
+  std::shared_ptr<sirius::io::sirius_ioctx> metadata_ioctx,
   std::optional<uint64_t> snapshot_id = std::nullopt);
 
 /**
