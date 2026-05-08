@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Gauntlet on Rebased Branch)
 status: executing
-stopped_at: "Completed 22.1-04-PLAN.md (PinTableFunction site #2 migration; build + [pin_mgpu] 2/2 PASS)"
-last_updated: "2026-05-08T04:06:39.182Z"
+stopped_at: "Completed 22.1-06-PLAN.md (parquet_split_provider site #7 eliminated, scan_manager 11/11 PASS)"
+last_updated: "2026-05-08T04:08:40.939Z"
 last_activity: 2026-05-08
 progress:
   total_phases: 8
   completed_phases: 1
   total_plans: 14
-  completed_plans: 10
+  completed_plans: 11
 ---
 
 # Project State
@@ -25,7 +25,7 @@ See: .planning/PROJECT.md (updated 2026-05-04)
 ## Current Position
 
 Phase: 22.1 (remove-kvikio) — EXECUTING
-Plan: 4 of 7
+Plan: 5 of 7
 Status: Ready to execute
 Last activity: 2026-05-08
 
@@ -115,6 +115,7 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 | Phase 22.1 P01 | 3min | 3 tasks | 2 files |
 | Phase 22.1 P02 | 3min | 3 tasks | 1 files |
 | Phase 22.1 P04 | 5min | 2 tasks | 1 files |
+| Phase 22.1 P06 | 6min | 3 tasks | 4 files |
 
 ## Decisions
 
@@ -271,6 +272,9 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 - [Phase 22.1]: [22.1-02] Comment-line scrub deviation: removed stray 'cudf::io::datasource::create' textual mention inside a comment so strict bypass-grep returns 0 — sanitizer-gate harness in Plan 22.1-06 greps the bypass token without filtering comments
 - [Phase 22.1]: [22.1-04] Site #2 (PinTableFunction) eliminated. Pointer-form source_info{datasource.get()} backed by sirius_ioctx::make_datasource(uring_io_object). chunked_parquet_reader open question RESOLVED — pointer-form supported (cudf parquet.hpp:858 + types.hpp:416). Phase 22 chunked-pin design preserved verbatim.
 - [Phase 22.1]: [22.1-04] Phase 19 IO-15 include-ordering rule applied — uring_reactor.hpp included LAST among sirius headers (after duckdb headers) to avoid liburing.h's BLOCK_SIZE preprocessor macro clobbering blockingconcurrentqueue.h's BLOCK_SIZE static member.
+- [Phase 22.1]: [22.1-06] Site #7 (parquet_split_provider:295) eliminated; else-branch fallback replaced with strict precondition throw 'kvikio path is forbidden' (D-09 verbatim). Test fixtures (5 sites in test_parquet_split_provider.cpp) inject make_test_gpu_ioctxs() via new shared header test/cpp/scan/test_helpers_ioctx.hpp.
+- [Phase 22.1]: [22.1-06] Lifted make_test_gpu_ioctxs() helper from test_parquet_scan_task.cpp into shared header test/cpp/scan/test_helpers_ioctx.hpp (sirius::scan_test_utils namespace) so multiple TUs can include without ODR violations. Existing 4 call-sites in test_parquet_scan_task.cpp preserve unqualified ergonomics via 'using sirius::scan_test_utils::make_test_gpu_ioctxs;' shim.
+- [Phase 22.1]: [22.1-06] [mgpu] + [TPC-H][parquet] failures observed at this commit are PRE-EXISTING Wave-2 conditions caused by parallel agent 22.1-03's commits 72780f5 + e8ac76d (added throw on empty _gpu_ioctxs in sirius_gpu_parquet_scan_operator::read_table_from_metadata BEFORE wiring through sirius_scan_manager::create_provider_for() was added). Out of scope for Plan 22.1-06 per file ownership boundary; will recover when 22.1-03 wiring lands.
 
 ## Accumulated Context
 
@@ -311,6 +315,6 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 
 ## Session Continuity
 
-Last session: 2026-05-08T04:06:39.178Z
-Stopped at: Completed 22.1-04-PLAN.md (PinTableFunction site #2 migration; build + [pin_mgpu] 2/2 PASS)
+Last session: 2026-05-08T04:08:40.936Z
+Stopped at: Completed 22.1-06-PLAN.md (parquet_split_provider site #7 eliminated, scan_manager 11/11 PASS)
 Resume file: None
