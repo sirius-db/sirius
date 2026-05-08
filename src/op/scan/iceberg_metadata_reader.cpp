@@ -428,9 +428,20 @@ void materialize_equality_deletes(std::vector<IcebergDeleteFileEntry> const& eq_
 std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
   duckdb::ClientContext& context,
   std::string const& table_path,
+  std::shared_ptr<sirius::io::sirius_ioctx> metadata_ioctx,
   std::optional<uint64_t> snapshot_id)
 {
   auto data = std::make_shared<IcebergDeleteData>();
+
+  // Phase 22.1 D-06 / D-09: kvikio path is forbidden phase-wide. The caller
+  // (sirius_engine::initialize_iceberg_delete_data) MUST provide a non-null
+  // sirius_ioctx — there is no fall-through to cudf's bundled file_source
+  // factory.
+  if (!metadata_ioctx) {
+    throw std::invalid_argument(
+      "[iceberg] read_iceberg_delete_data: metadata_ioctx is null (Phase 22.1 D-06 / D-09 — "
+      "kvikio path is forbidden; caller must provide a sirius_ioctx).");
+  }
 
   try {
     // Single-pass discovery: reads manifest list once, each manifest once.
@@ -450,7 +461,7 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
     }
     if (has_eq_deletes) {
       data->data_file_sequence_numbers = std::move(discovery.data_file_sequence_numbers);
-      materialize_equality_deletes(discovery.equality_delete_entries, *data);
+      materialize_equality_deletes(discovery.equality_delete_entries, *metadata_ioctx, *data);
     }
 
   } catch (std::exception const& e) {
