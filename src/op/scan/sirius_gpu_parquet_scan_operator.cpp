@@ -272,4 +272,10 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
   return std::make_unique<pipelineable_operator_data>(std::move(batches));
 }
 
+std::size_t sirius_gpu_parquet_scan_operator::no_history_peak_memory_estimate(
+  const op::input_stats& stats) const
+{
+  return stats.bytes * 10;
+}
+
 }  // namespace sirius::op::scan

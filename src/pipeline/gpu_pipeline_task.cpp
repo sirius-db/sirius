@@ -465,8 +465,27 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
   info.input_basis                = input_basis;
   info.bytes_to_materialize_input = bytes_to_materialize;
   info.had_history                = peak_opt.has_value();
-  info.peak_memory_estimate       = peak_opt.value_or(input_basis * 2);
-  info.reservation_size           = info.peak_memory_estimate + bytes_to_materialize;
+
+  if (peak_opt.has_value()) {
+    info.peak_memory_estimate = *peak_opt;
+  } else {
+    std::size_t num_batches = 0;
+    if (auto* pd = dynamic_cast<const op::pipelineable_operator_data*>(ls._input_data.get())) {
+      num_batches = pd->get_data_batches().size();
+    }
+    const op::input_stats stats{num_batches, input_basis};
+
+    std::size_t max_estimate = 0;
+    if (auto* pipeline = gs.get_pipeline()) {
+      for (auto& op_ref : pipeline->get_operators()) {
+        max_estimate = std::max(max_estimate, op_ref.get().no_history_peak_memory_estimate(stats));
+      }
+    }
+    // If every operator returned 0 (all pass-throughs), fall back to the 2× default.
+    info.peak_memory_estimate = (max_estimate > 0) ? max_estimate : (input_basis * 2);
+  }
+
+  info.reservation_size = info.peak_memory_estimate + bytes_to_materialize;
   return info;
 }
 

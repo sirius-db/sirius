@@ -335,5 +335,12 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
   return sirius_physical_operator::get_next_task_input_data();
 }
 
+std::size_t sirius_physical_partition::no_history_peak_memory_estimate(
+  const op::input_stats& stats) const
+{
+  if (_num_partitions.has_value() && *_num_partitions == 1) { return 0; }
+  return stats.bytes;
+}
+
 }  // namespace op
 }  // namespace sirius
