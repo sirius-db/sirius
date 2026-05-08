@@ -22,6 +22,7 @@
 #include <cudf/io/datasource.hpp>
 
 #include <cctype>
+#include <filesystem>
 #include <stdexcept>
 #include <utility>
 
@@ -100,14 +101,25 @@ std::string datasource_factory::extract_path(std::string_view uri) { return pars
 std::unique_ptr<cudf::io::datasource> datasource_factory::create_for_parquet_scan(
   std::string_view uri, datasource_registry const& registry, sirius_config const& config)
 {
-  // Relative bare paths (no leading '/' and no scheme://) — DuckDB's iceberg /
-  // hive fixtures still hand these out, and the strict parser deliberately
-  // rejects them. Bypass to cudf default; semantically identical to the pre-PR3
-  // baseline. Anything else (absolute path, file:///..., s3://...) goes through
-  // the strict create() so its parser routes file→cudf and object-store→ioctx
-  // uniformly.
+  // Phase 22.1 D-07: relative bare paths normalize to file:///<absolute>
+  // and dispatch through create(). The pre-22.1 bypass to cudf::io::datasource::create
+  // routed through libkvikio internally; that's the kvikio path D-09 forbids.
+  // DuckDB's iceberg / hive fixtures still hand out paths like
+  // "test/cpp/integration/data/...parquet"; we resolve those against the process
+  // CWD via std::filesystem::absolute (matches pre-22.1 cudf-default semantics
+  // for relative paths) and prepend "file://" so create()'s parser routes them
+  // through the registered kFileScheme ioctx (Plan 22.1-01).
   if (!uri.empty() && uri.front() != '/' && uri.find("://") == std::string_view::npos) {
-    return cudf::io::datasource::create(std::string{uri});
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    auto abs = fs::absolute(fs::path{std::string{uri}}, ec);
+    if (ec) {
+      throw std::runtime_error(
+        "datasource_factory::create_for_parquet_scan: failed to resolve relative path '" +
+        std::string{uri} + "' to absolute: " + ec.message());
+    }
+    std::string normalized = "file://" + abs.string();
+    return create(normalized, registry, config);
   }
   return create(uri, registry, config);
 }
