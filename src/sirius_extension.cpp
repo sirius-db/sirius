@@ -26,7 +26,11 @@
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/types.hpp>
 
+#include <rmm/cuda_stream.hpp>
+
+#include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
@@ -694,8 +698,9 @@ unique_ptr<FunctionData> SiriusExtension::PinTableBind(ClientContext& context,
     throw BinderException("pin_table requires a 'tier' named parameter");
   }
   result->args.tier = tier_it->second.ToString();
-  if (result->args.tier == "host") {
-    throw NotImplementedException("pin_table tier='host' is not yet supported");
+  if (result->args.tier != "gpu" && result->args.tier != "host") {
+    throw NotImplementedException("pin_table tier='" + result->args.tier +
+                                  "' is not supported (only 'gpu' and 'host')");
   }
 
   auto name_it = input.named_parameters.find("name");
@@ -739,14 +744,25 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     throw InvalidInputException("pin_table requires the Sirius context to be initialized");
   }
 
-  // The cudf reader places the table on GPU; pick the first GPU memory space so the
-  // scan_manager can later wrap copies of these columns as data_batch instances.
+  // The cudf reader always places tables on GPU. For tier='gpu' we hand the GPU columns
+  // straight to the scan_manager. For tier='host' we additionally convert each table to
+  // a host_data_representation (via the GPU↔HOST converter) so the pinned data lives in
+  // pinned host memory instead of GPU memory.
   auto& memory_manager = sirius_ctx->get_memory_manager();
   auto gpu_spaces      = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   if (gpu_spaces.empty()) {
     throw InvalidInputException("pin_table: no GPU memory space available");
   }
-  auto& mem_space = const_cast<cucascade::memory::memory_space&>(*gpu_spaces[0]);
+  auto& gpu_mem_space = const_cast<cucascade::memory::memory_space&>(*gpu_spaces[0]);
+
+  cucascade::memory::memory_space* host_mem_space = nullptr;
+  if (data.args.tier == "host") {
+    auto host_spaces = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+    if (host_spaces.empty()) {
+      throw InvalidInputException("pin_table: no HOST memory space available");
+    }
+    host_mem_space = const_cast<cucascade::memory::memory_space*>(host_spaces[0]);
+  }
 
   // Glob the user-supplied path into concrete files.
   auto& fs   = FileSystem::GetFileSystem(context);
@@ -813,11 +829,43 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     if (data.args.n_rows.has_value()) { remaining_rows -= file_rows_read; }
   }
 
-  sirius_ctx->get_scan_manager().insert_pinned_entry(data.args.name,
-                                                     std::move(read_column_names),
-                                                     std::move(file_paths),
-                                                     std::move(tables),
-                                                     mem_space);
+  if (data.args.tier == "host") {
+    // Downgrade each freshly-read GPU table to a host_data_representation. The GPU
+    // table is wrapped in a transient gpu_table_representation just so the converter
+    // registry can dispatch on its concrete type. After conversion, the GPU side
+    // is released — the pinned bytes live in pinned host memory.
+    auto& registry = sirius::converter_registry::get();
+    // The GPU↔HOST converter uses cudaMemcpyBatchAsync which requires a real,
+    // non-default stream. Use a per-call rmm::cuda_stream so we don't accidentally
+    // serialize against other concurrent work on the default stream.
+    rmm::cuda_stream pin_stream;
+    auto stream_view = pin_stream.view();
+    std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;
+    host_chunks.reserve(tables.size());
+    for (auto& table : tables) {
+      if (!table) { continue; }
+      cucascade::gpu_table_representation gpu_repr(std::move(table), gpu_mem_space);
+      auto host_repr = registry.convert<cucascade::host_data_representation>(
+        gpu_repr, host_mem_space, stream_view);
+      host_chunks.emplace_back(std::move(host_repr));
+    }
+    // Conversion enqueues async D2H copies on the stream; sync before the GPU
+    // representations leave scope so we do not free their device buffers while
+    // copies are still in flight.
+    stream_view.synchronize();
+
+    sirius_ctx->get_scan_manager().insert_pinned_entry_host(data.args.name,
+                                                            std::move(read_column_names),
+                                                            std::move(file_paths),
+                                                            std::move(host_chunks),
+                                                            *host_mem_space);
+  } else {
+    sirius_ctx->get_scan_manager().insert_pinned_entry(data.args.name,
+                                                       std::move(read_column_names),
+                                                       std::move(file_paths),
+                                                       std::move(tables),
+                                                       gpu_mem_space);
+  }
 
   output.SetCardinality(1);
   output.SetValue(0, 0, Value::BOOLEAN(true));
