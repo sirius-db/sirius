@@ -24,6 +24,8 @@
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
+#include <unordered_set>
+
 namespace sirius::planner {
 
 duckdb::unique_ptr<duckdb::TableFilterSet> create_table_filter_set(
@@ -52,6 +54,15 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
 {
   auto column_ids = op.GetColumnIds();
+
+  // Only GPU-route known table scan functions; all others (pragma, system catalog
+  // functions, etc.) must fall back to CPU.
+  static const std::unordered_set<std::string> kSupportedScanFunctions = {
+    "seq_scan", "parquet_scan", "read_parquet", "iceberg_scan"};
+  if (kSupportedScanFunctions.find(op.function.name) == kSupportedScanFunctions.end()) {
+    throw duckdb::NotImplementedException("Table function '{}' is not supported in Sirius",
+                                          op.function.name);
+  }
 
   if (!op.children.empty()) {
     throw duckdb::NotImplementedException("Table Input Output functions are not supported yet");
