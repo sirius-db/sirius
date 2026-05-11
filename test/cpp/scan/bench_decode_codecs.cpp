@@ -21,11 +21,17 @@
 
 #include "scan/bitpacking_synth.hpp"
 #include "scan/decode_test_utils.hpp"
+#include "scan/strings_synth.hpp"
+
+#include <cudf/column/column.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 
 #include <rmm/cuda_stream.hpp>
+#include <rmm/device_buffer.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 
 #include <cuda/scan/gpu_decode_bitpacking.cuh>
+#include <cuda/scan/gpu_decode_strings.cuh>
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
@@ -33,7 +39,10 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <string>
 #include <vector>
 
 using duckdb::CompressionType;
@@ -444,4 +453,298 @@ TEST_CASE("bench BITPACKING int32 DELTA_FOR width=8 128M rows", "[!benchmark][sc
   std::printf("[bench] BITPACKING   int32 DELTA_FOR w=8 128M rows: %.6fs  write=%.1f GiB/s\n",
               sec,
               bytes_w / sec / GIB);
+}
+
+//===----------------------------------------------------------------------===//
+// String-codec benches. Segments are synthesized via strings_synth.hpp
+// (FSST / DICT_FSST go through `duckdb_fsst_create`). FSST / DICT_FSST
+// benches accept a fixture override via `SIRIUS_BENCH_<CODEC>_FIXTURE` +
+// `_ROWS` env vars to run against a real DuckDB-extracted segment.
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+double bench_strings_seconds(rmm::cuda_stream& stream,
+                             sirius::cuda::scan::gpu_string_column_decode_input const& col,
+                             rmm::mr::cuda_async_memory_resource& mr,
+                             int iters  = 10,
+                             int warmup = 3)
+{
+  for (int i = 0; i < warmup; ++i)
+    (void)sirius::cuda::scan::gpu_decode_strings_column(col, stream.view(), mr);
+  cudaStreamSynchronize(stream.value());
+
+  cudaEvent_t s, e;
+  cudaEventCreate(&s);
+  cudaEventCreate(&e);
+  cudaEventRecord(s, stream.value());
+  for (int i = 0; i < iters; ++i)
+    (void)sirius::cuda::scan::gpu_decode_strings_column(col, stream.view(), mr);
+  cudaEventRecord(e, stream.value());
+  cudaEventSynchronize(e);
+  float ms = 0.0f;
+  cudaEventElapsedTime(&ms, s, e);
+  cudaEventDestroy(s);
+  cudaEventDestroy(e);
+  return (ms / 1000.0) / iters;
+}
+
+/// Load raw segment bytes from a path in env var `var_name`. Returns empty
+/// vector if the var is unset or the file isn't readable.
+std::vector<uint8_t> load_fixture_bytes(char const* var_name)
+{
+  char const* path = std::getenv(var_name);
+  if (path == nullptr || *path == '\0') return {};
+  std::ifstream f(path, std::ios::binary | std::ios::ate);
+  if (!f) return {};
+  auto sz = f.tellg();
+  if (sz <= 0) return {};
+  f.seekg(0);
+  std::vector<uint8_t> bytes(static_cast<size_t>(sz));
+  f.read(reinterpret_cast<char*>(bytes.data()), sz);
+  return bytes;
+}
+
+}  // namespace
+
+TEST_CASE("bench DICTIONARY 1M rows / 1024 dict / 16-byte avg",
+          "[!benchmark][scan][decode][strings]")
+{
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+
+  constexpr uint32_t DICT_COUNT = 1024;
+  constexpr uint32_t ROWS       = 1u << 20;
+  std::vector<std::string> dict(DICT_COUNT);
+  dict[0] = "";  // index 0 = NULL sentinel
+  for (uint32_t k = 1; k < DICT_COUNT; ++k) {
+    dict[k] = std::string(16, static_cast<char>('a' + (k % 26)));
+  }
+  std::vector<uint32_t> sel(ROWS);
+  for (uint32_t i = 0; i < ROWS; ++i)
+    sel[i] = 1u + (i % (DICT_COUNT - 1u));
+  auto bytes = sirius::test::decode::strings::make_dict_segment(dict, sel);
+
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  sirius::cuda::scan::gpu_string_segment_desc seg{static_cast<uint8_t const*>(d_seg.data()),
+                                                  static_cast<uint32_t>(d_seg.size()),
+                                                  0,
+                                                  ROWS,
+                                                  0,
+                                                  /*max_string_length=*/16u};
+  sirius::cuda::scan::gpu_string_column_decode_input col;
+  col.total_rows = ROWS;
+  col.has_nulls  = false;
+  col.data.push_back({CompressionType::COMPRESSION_DICTIONARY, {seg}});
+
+  double sec           = bench_strings_seconds(stream, col, mr);
+  double bytes_decoded = double(ROWS) * 16.0;
+  std::printf(
+    "[bench] DICTIONARY    1M/1024d/16B:       %.6fs  decode=%.1f Mr/s  write=%.1f GiB/s\n",
+    sec,
+    double(ROWS) / sec / 1e6,
+    bytes_decoded / sec / GIB);
+}
+
+TEST_CASE("bench DICTIONARY low-cardinality / 2 entries × 2000B",
+          "[!benchmark][scan][decode][strings]")
+{
+  // DuckDB caps DICTIONARY at <4096B total dict (DICTIONARY_ENCODE_THRESHOLD,
+  // dict_fsst/compression.cpp:34). Low-cardinality long-string columns
+  // (log-template variants, status descriptions) stay DICTIONARY at
+  // per-entry sizes up to ~2KB. Stresses the gather pattern at lengths the
+  // 16B fixture can't reach.
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+
+  constexpr uint32_t DICT_COUNT = 3;  // [0]=NULL + 2 real entries × 2000B = 4000B < 4096
+  constexpr uint32_t ENTRY_LEN  = 2000;
+  constexpr uint32_t ROWS       = 128u * 1024u;  // 128K × 2000B = 256MB output
+  std::vector<std::string> dict(DICT_COUNT);
+  dict[0] = "";
+  for (uint32_t k = 1; k < DICT_COUNT; ++k) {
+    dict[k] = sirius::test::decode::strings::make_tpch_like_comment(
+      static_cast<uint64_t>(k) * 0x9E3779B97F4A7C15ull, ENTRY_LEN, ENTRY_LEN + 1u);
+  }
+  std::vector<uint32_t> sel(ROWS);
+  for (uint32_t i = 0; i < ROWS; ++i)
+    sel[i] = 1u + (i % (DICT_COUNT - 1u));
+  auto bytes = sirius::test::decode::strings::make_dict_segment(dict, sel);
+
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  sirius::cuda::scan::gpu_string_segment_desc seg{static_cast<uint8_t const*>(d_seg.data()),
+                                                  static_cast<uint32_t>(d_seg.size()),
+                                                  0,
+                                                  ROWS,
+                                                  0,
+                                                  ENTRY_LEN + 1u};
+  sirius::cuda::scan::gpu_string_column_decode_input col;
+  col.total_rows = ROWS;
+  col.has_nulls  = false;
+  col.data.push_back({CompressionType::COMPRESSION_DICTIONARY, {seg}});
+
+  double sec           = bench_strings_seconds(stream, col, mr);
+  double bytes_decoded = double(ROWS) * double(ENTRY_LEN);
+  std::printf(
+    "[bench] DICT-2KB      128K/2d/2000B:        %.6fs  decode=%.1f Mr/s  write=%.1f GiB/s\n",
+    sec,
+    double(ROWS) / sec / 1e6,
+    bytes_decoded / sec / GIB);
+}
+
+TEST_CASE("bench FSST 1M rows / TPC-H-like comments", "[!benchmark][scan][decode][strings]")
+{
+  // TPC-H-style l_comment workload: 5-150 byte comments built from dbgen's
+  // grammar (nouns/verbs/adjectives/adverbs/prepositions). High redundancy
+  // of common words ("the", "carefully", "pending"). FSST symbol-table
+  // coverage and length distribution match what production varchar columns
+  // actually look like — much more demanding of the gather kernel than
+  // structured "row_N_payload_X" strings.
+  // Override with SIRIUS_BENCH_FSST_FIXTURE + SIRIUS_BENCH_FSST_ROWS.
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+
+  uint32_t rows = 1u << 20;
+  std::vector<uint8_t> bytes;
+  size_t total_input_bytes = 0;
+  auto override_bytes      = load_fixture_bytes("SIRIUS_BENCH_FSST_FIXTURE");
+  if (!override_bytes.empty()) {
+    char const* rows_str = std::getenv("SIRIUS_BENCH_FSST_ROWS");
+    if (rows_str != nullptr) rows = static_cast<uint32_t>(std::atol(rows_str));
+    bytes = std::move(override_bytes);
+  } else {
+    std::vector<std::string> synth(rows);
+    for (uint32_t i = 0; i < rows; ++i) {
+      synth[i] = sirius::test::decode::strings::make_tpch_like_comment(
+        static_cast<uint64_t>(i) * 0x9E3779B97F4A7C15ull, 5u, 150u);
+      total_input_bytes += synth[i].size();
+    }
+    bytes = sirius::test::decode::strings::make_fsst_segment(synth);
+  }
+
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  sirius::cuda::scan::gpu_string_segment_desc seg{static_cast<uint8_t const*>(d_seg.data()),
+                                                  static_cast<uint32_t>(d_seg.size()),
+                                                  0,
+                                                  rows,
+                                                  0,
+                                                  /*max_string_length=*/160u};
+  sirius::cuda::scan::gpu_string_column_decode_input col;
+  col.total_rows = rows;
+  col.has_nulls  = false;
+  col.data.push_back({CompressionType::COMPRESSION_FSST, {seg}});
+
+  double sec     = bench_strings_seconds(stream, col, mr);
+  double avg_len = total_input_bytes ? double(total_input_bytes) / rows : 0.0;
+  std::printf(
+    "[bench] FSST          TPC-H-like %.0fB avg: %.6fs  decode=%.1f Mr/s  write=%.1f GiB/s\n",
+    avg_len,
+    sec,
+    double(rows) / sec / 1e6,
+    double(rows) * avg_len / sec / GIB);
+}
+
+TEST_CASE("bench FSST 1M rows / long comments", "[!benchmark][scan][decode][strings]")
+{
+  // Long-row variant: 200-800 byte comments built from the same TPC-H
+  // grammar, mean ~500B. Stress for the per-row warp-cooperative path
+  // where a single warp may spend many chunks of work on one row.
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+
+  uint32_t rows = 1u << 20;
+  std::vector<uint8_t> bytes;
+  size_t total_input_bytes = 0;
+  auto override_bytes      = load_fixture_bytes("SIRIUS_BENCH_FSST_LONG_FIXTURE");
+  if (!override_bytes.empty()) {
+    char const* rows_str = std::getenv("SIRIUS_BENCH_FSST_LONG_ROWS");
+    if (rows_str != nullptr) rows = static_cast<uint32_t>(std::atol(rows_str));
+    bytes = std::move(override_bytes);
+  } else {
+    std::vector<std::string> synth(rows);
+    for (uint32_t i = 0; i < rows; ++i) {
+      synth[i] = sirius::test::decode::strings::make_tpch_like_comment(
+        static_cast<uint64_t>(i) * 0x9E3779B97F4A7C15ull, 200u, 800u);
+      total_input_bytes += synth[i].size();
+    }
+    bytes = sirius::test::decode::strings::make_fsst_segment(synth);
+  }
+
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  sirius::cuda::scan::gpu_string_segment_desc seg{static_cast<uint8_t const*>(d_seg.data()),
+                                                  static_cast<uint32_t>(d_seg.size()),
+                                                  0,
+                                                  rows,
+                                                  0,
+                                                  /*max_string_length=*/800u};
+  sirius::cuda::scan::gpu_string_column_decode_input col;
+  col.total_rows = rows;
+  col.has_nulls  = false;
+  col.data.push_back({CompressionType::COMPRESSION_FSST, {seg}});
+
+  double sec     = bench_strings_seconds(stream, col, mr);
+  double avg_len = total_input_bytes ? double(total_input_bytes) / rows : 0.0;
+  std::printf(
+    "[bench] FSST-long     %.0fB avg:            %.6fs  decode=%.1f Mr/s  write=%.1f GiB/s\n",
+    avg_len,
+    sec,
+    double(rows) / sec / 1e6,
+    double(rows) * avg_len / sec / GIB);
+}
+
+TEST_CASE("bench DICT_FSST mode 1 1M rows / TPC-H-like dict", "[!benchmark][scan][decode][strings]")
+{
+  // DICT_FSST mode 1 with a TPC-H-like dict: ~50K unique l_comments collapse
+  // to a 50K-entry dict in a real lineitem segment, but DuckDB caps a
+  // segment's dict at the bitpacking-width-fits-in-segment limit, so per
+  // segment ~256-2048 entries. We use 1024 entries here. Real comment shape
+  // (5-150 byte words from dbgen grammar) gives realistic FSST behavior.
+  // Override via SIRIUS_BENCH_DICT_FSST_FIXTURE / _ROWS.
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+
+  uint32_t const DICT = 1024;
+  uint32_t rows       = 1u << 20;
+  std::vector<uint8_t> bytes;
+  size_t total_dict_bytes = 0;
+  auto override_bytes     = load_fixture_bytes("SIRIUS_BENCH_DICT_FSST_FIXTURE");
+  if (!override_bytes.empty()) {
+    char const* rows_str = std::getenv("SIRIUS_BENCH_DICT_FSST_ROWS");
+    if (rows_str != nullptr) rows = static_cast<uint32_t>(std::atol(rows_str));
+    bytes = std::move(override_bytes);
+  } else {
+    std::vector<std::string> dict(DICT);
+    dict[0] = "";  // reserved NULL
+    for (uint32_t k = 1; k < DICT; ++k) {
+      dict[k] = sirius::test::decode::strings::make_tpch_like_comment(
+        static_cast<uint64_t>(k) * 0xBF58476D1CE4E5B9ull, 5u, 150u);
+      total_dict_bytes += dict[k].size();
+    }
+    std::vector<uint32_t> sel(rows);
+    for (uint32_t i = 0; i < rows; ++i)
+      sel[i] = (i % (DICT - 1u)) + 1u;
+    bytes = sirius::test::decode::strings::make_dict_fsst_segment(dict, sel, /*mode=*/1);
+  }
+
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  sirius::cuda::scan::gpu_string_segment_desc seg{static_cast<uint8_t const*>(d_seg.data()),
+                                                  static_cast<uint32_t>(d_seg.size()),
+                                                  0,
+                                                  rows,
+                                                  0,
+                                                  /*max_string_length=*/160u};
+  sirius::cuda::scan::gpu_string_column_decode_input col;
+  col.total_rows = rows;
+  col.has_nulls  = false;
+  col.data.push_back({CompressionType::COMPRESSION_DICT_FSST, {seg}});
+
+  double sec          = bench_strings_seconds(stream, col, mr);
+  double avg_dict_len = total_dict_bytes ? double(total_dict_bytes) / (DICT - 1u) : 0.0;
+  std::printf(
+    "[bench] DICT_FSST mode-1 TPC-H-like %.0fB avg dict: %.6fs  decode=%.1f Mr/s  write=%.1f "
+    "GiB/s\n",
+    avg_dict_len,
+    sec,
+    double(rows) / sec / 1e6,
+    double(rows) * avg_dict_len / sec / GIB);
 }
