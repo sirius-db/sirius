@@ -327,16 +327,17 @@ TEST_CASE("walker refuses unsupported data compression (force ZSTD)",
   auto [db_owner, con] = sirius::make_test_db_and_connection();
   exec_ok(con, "PRAGMA force_compression='zstd'");
   exec_ok(con, "CREATE TABLE t(a INTEGER)");
-  // ZSTD bails to Uncompressed for very small segments, so insert enough.
   exec_ok(con, "INSERT INTO t SELECT range FROM range(0, 5000)");
   exec_ok(con, "CHECKPOINT");
 
-  // Inspect what compression actually landed. DuckDB's analyzer picks the
-  // codec per column; force_compression is a hint that may be ignored for
-  // some types (e.g. monotonic INTEGER often stays BitPacking). We only
-  // exercise the walker's ZSTD refusal when a ZSTD segment exists; if none
-  // did, emit a WARN so the skip is visible in test output rather than
-  // silently passing.
+  // `force_compression` does not guarantee the codec lands. DuckDB's
+  // analyzer narrows the candidate set to {Uncompressed, forced} and then
+  // picks by score. For ZSTD specifically, `ZSTDFun::TypeIsSupported`
+  // (duckdb/storage/compression/zstd.cpp) returns true only for
+  // PhysicalType::VARCHAR, so on this INTEGER column ZSTD never enters
+  // the contest at all and the segment lands as BitPacking/Uncompressed.
+  // We exercise the walker's refusal only when a ZSTD segment actually
+  // exists; otherwise emit a WARN so the skip is visible in test output.
   bool zstd_landed = false;
   {
     auto result = con.Query("SELECT compression FROM pragma_storage_info('t')");
