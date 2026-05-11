@@ -124,35 +124,6 @@ bool is_supported_logical_type(const sirius::logical_type& type, std::string& re
   return false;
 }
 
-bool is_supported_data_compression(duckdb::CompressionType c)
-{
-  switch (c) {
-    case duckdb::CompressionType::COMPRESSION_UNCOMPRESSED:
-    case duckdb::CompressionType::COMPRESSION_CONSTANT:
-    case duckdb::CompressionType::COMPRESSION_RLE:
-    case duckdb::CompressionType::COMPRESSION_DICTIONARY:
-    case duckdb::CompressionType::COMPRESSION_BITPACKING:
-    case duckdb::CompressionType::COMPRESSION_FSST:
-    case duckdb::CompressionType::COMPRESSION_DICT_FSST:
-    case duckdb::CompressionType::COMPRESSION_ALP:
-    case duckdb::CompressionType::COMPRESSION_ALPRD: return true;
-    default: return false;
-  }
-}
-
-bool is_supported_validity_compression(duckdb::CompressionType c)
-{
-  switch (c) {
-    // CONSTANT is the all-valid case (all-null columns land in EMPTY).
-    // ROARING is host-decoded to a plain bitmap before the GPU sees it.
-    case duckdb::CompressionType::COMPRESSION_UNCOMPRESSED:
-    case duckdb::CompressionType::COMPRESSION_EMPTY:
-    case duckdb::CompressionType::COMPRESSION_CONSTANT:
-    case duckdb::CompressionType::COMPRESSION_ROARING: return true;
-    default: return false;
-  }
-}
-
 std::uint32_t lookup_max_string_length(duckdb::PartitionRowGroup& prg,
                                        const duckdb::StorageIndex& storage_idx)
 {
@@ -295,6 +266,35 @@ void drop_empty_trailing_row_groups(duckdb_native_metadata& md)
 }
 
 }  // namespace
+
+bool is_supported_data_compression(duckdb::CompressionType c)
+{
+  switch (c) {
+    case duckdb::CompressionType::COMPRESSION_UNCOMPRESSED:
+    case duckdb::CompressionType::COMPRESSION_CONSTANT:
+    case duckdb::CompressionType::COMPRESSION_RLE:
+    case duckdb::CompressionType::COMPRESSION_DICTIONARY:
+    case duckdb::CompressionType::COMPRESSION_BITPACKING:
+    case duckdb::CompressionType::COMPRESSION_FSST:
+    case duckdb::CompressionType::COMPRESSION_DICT_FSST:
+    case duckdb::CompressionType::COMPRESSION_ALP:
+    case duckdb::CompressionType::COMPRESSION_ALPRD: return true;
+    default: return false;
+  }
+}
+
+bool is_supported_validity_compression(duckdb::CompressionType c)
+{
+  switch (c) {
+    // CONSTANT is the all-valid case (all-null columns land in EMPTY).
+    // ROARING is host-decoded to a plain bitmap before the GPU sees it.
+    case duckdb::CompressionType::COMPRESSION_UNCOMPRESSED:
+    case duckdb::CompressionType::COMPRESSION_EMPTY:
+    case duckdb::CompressionType::COMPRESSION_CONSTANT:
+    case duckdb::CompressionType::COMPRESSION_ROARING: return true;
+    default: return false;
+  }
+}
 
 duckdb_native_metadata walk_duckdb_native_metadata(
   duckdb::DataTable& storage,

@@ -321,52 +321,50 @@ TEST_CASE("walker refuses LIST projected type", "[scan][duckdb_native_walker]")
   REQUIRE(md.viability_failure_reason.find("LIST") != std::string::npos);
 }
 
-TEST_CASE("walker refuses unsupported data compression (force ZSTD)",
-          "[scan][duckdb_native_walker]")
+// Driving the walker into an unsupported codec via real DuckDB storage is
+// fragile — ZSTD is the only non-deprecated data codec not in the supported
+// list, and its analyzer is conservative enough that `force_compression`
+// rarely produces a ZSTD segment in unit-test-sized data. Exercise the
+// codec-rejection predicates directly instead.
+TEST_CASE("walker rejects unsupported data codecs", "[scan][duckdb_native_walker]")
 {
-  auto [db_owner, con] = sirius::make_test_db_and_connection();
-  exec_ok(con, "PRAGMA force_compression='zstd'");
-  exec_ok(con, "CREATE TABLE t(a INTEGER)");
-  exec_ok(con, "INSERT INTO t SELECT range FROM range(0, 5000)");
-  exec_ok(con, "CHECKPOINT");
+  using duckdb::CompressionType;
+  REQUIRE(is_supported_data_compression(CompressionType::COMPRESSION_UNCOMPRESSED));
+  REQUIRE(is_supported_data_compression(CompressionType::COMPRESSION_CONSTANT));
+  REQUIRE(is_supported_data_compression(CompressionType::COMPRESSION_RLE));
+  REQUIRE(is_supported_data_compression(CompressionType::COMPRESSION_DICTIONARY));
+  REQUIRE(is_supported_data_compression(CompressionType::COMPRESSION_BITPACKING));
+  REQUIRE(is_supported_data_compression(CompressionType::COMPRESSION_FSST));
+  REQUIRE(is_supported_data_compression(CompressionType::COMPRESSION_DICT_FSST));
+  REQUIRE(is_supported_data_compression(CompressionType::COMPRESSION_ALP));
+  REQUIRE(is_supported_data_compression(CompressionType::COMPRESSION_ALPRD));
 
-  // `force_compression` does not guarantee the codec lands. DuckDB's
-  // analyzer narrows the candidate set to {Uncompressed, forced} and then
-  // picks by score. For ZSTD specifically, `ZSTDFun::TypeIsSupported`
-  // (duckdb/storage/compression/zstd.cpp) returns true only for
-  // PhysicalType::VARCHAR, so on this INTEGER column ZSTD never enters
-  // the contest at all and the segment lands as BitPacking/Uncompressed.
-  // We exercise the walker's refusal only when a ZSTD segment actually
-  // exists; otherwise emit a WARN so the skip is visible in test output.
-  bool zstd_landed = false;
-  {
-    auto result = con.Query("SELECT compression FROM pragma_storage_info('t')");
-    REQUIRE(result);
-    REQUIRE_FALSE(result->HasError());
-    while (auto chunk = result->Fetch()) {
-      for (duckdb::idx_t i = 0; i < chunk->size(); ++i) {
-        if (chunk->GetValue(0, i).ToString() == "ZSTD") {
-          zstd_landed = true;
-          break;
-        }
-      }
-      if (zstd_landed) { break; }
-    }
-  }
+  REQUIRE_FALSE(is_supported_data_compression(CompressionType::COMPRESSION_ZSTD));
+  REQUIRE_FALSE(is_supported_data_compression(CompressionType::COMPRESSION_CHIMP));
+  REQUIRE_FALSE(is_supported_data_compression(CompressionType::COMPRESSION_PATAS));
+  REQUIRE_FALSE(is_supported_data_compression(CompressionType::COMPRESSION_PFOR_DELTA));
+  // ROARING is supported as validity but never as data.
+  REQUIRE_FALSE(is_supported_data_compression(CompressionType::COMPRESSION_ROARING));
+  // EMPTY is the all-null validity sentinel; never appears on a data segment.
+  REQUIRE_FALSE(is_supported_data_compression(CompressionType::COMPRESSION_EMPTY));
+  // COUNT is the sentinel `parse_compression_string` returns for unrecognized
+  // codec names (e.g. a future DuckDB introducing a codec we have not
+  // reviewed) — the walker must refuse it.
+  REQUIRE_FALSE(is_supported_data_compression(CompressionType::COMPRESSION_COUNT));
+}
 
-  auto& storage                        = get_storage(con, "t");
-  std::vector<projected_column> cols   = {real_col(0)};
-  std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::INTEGER)};
-  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
-  if (zstd_landed) {
-    REQUIRE_FALSE(md.viable);
-    REQUIRE(md.viability_failure_reason.find("ZSTD") != std::string::npos);
-  } else {
-    WARN(
-      "force_compression='zstd' produced no ZSTD segment on this DuckDB "
-      "build (likely BitPacking won for monotonic integers); walker "
-      "refusal path not exercised");
-  }
+TEST_CASE("walker rejects unsupported validity codecs", "[scan][duckdb_native_walker]")
+{
+  using duckdb::CompressionType;
+  REQUIRE(is_supported_validity_compression(CompressionType::COMPRESSION_UNCOMPRESSED));
+  REQUIRE(is_supported_validity_compression(CompressionType::COMPRESSION_EMPTY));
+  REQUIRE(is_supported_validity_compression(CompressionType::COMPRESSION_CONSTANT));
+  REQUIRE(is_supported_validity_compression(CompressionType::COMPRESSION_ROARING));
+
+  REQUIRE_FALSE(is_supported_validity_compression(CompressionType::COMPRESSION_ZSTD));
+  REQUIRE_FALSE(is_supported_validity_compression(CompressionType::COMPRESSION_DICTIONARY));
+  REQUIRE_FALSE(is_supported_validity_compression(CompressionType::COMPRESSION_FSST));
+  REQUIRE_FALSE(is_supported_validity_compression(CompressionType::COMPRESSION_COUNT));
 }
 
 // Round-trip guard against DuckDB renaming a codec string (e.g. "Empty

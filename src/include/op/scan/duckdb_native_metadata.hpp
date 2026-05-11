@@ -107,4 +107,10 @@ duckdb_native_metadata walk_duckdb_native_metadata(
   const std::vector<projected_column>& projected_cols,
   const std::vector<sirius::logical_type>& projected_types);
 
+/// Exposed for direct unit-testing of the codec-rejection logic without
+/// going through DuckDB's codec selection (which is hard to drive into
+/// unsupported codecs in a test).
+bool is_supported_data_compression(duckdb::CompressionType c);
+bool is_supported_validity_compression(duckdb::CompressionType c);
+
 }  // namespace sirius::op::scan
