@@ -31,38 +31,35 @@
 
 namespace sirius::op::scan {
 
-/// One projected column. Synthetic rowid columns carry no `storage_idx` —
-/// the walker emits a per-row-group sentinel and the scan operator
-/// synthesises the BIGINT range.
+/// Synthetic rowid columns carry no `storage_idx`.
 struct projected_column {
   duckdb::StorageIndex storage_idx;
   bool is_rowid = false;
 };
 
-/// Mirrors the relevant fields of `duckdb::ColumnSegmentInfo`
-/// (table_storage_info.hpp:19), resolved into engine types.
+/// Mirrors `duckdb::ColumnSegmentInfo` with the compression string resolved
+/// to the enum.
 struct duckdb_segment_descriptor {
-  /// May be -1 for blockless layouts (e.g. Constant segments in stats).
+  /// -1 for blockless layouts (e.g. Constant segments).
   duckdb::block_id_t block_id;
-  /// Additional blocks for variable-width payloads (FSST tables, etc.).
+  /// Overflow blocks for variable-width payloads (FSST tables, etc.).
   std::vector<duckdb::block_id_t> additional_blocks;
   duckdb::idx_t block_offset;
-  /// First row of this segment relative to the row group.
+  /// Row offset within the row group.
   duckdb::idx_t segment_start;
   duckdb::idx_t segment_count;
   duckdb::CompressionType compression;
-  /// 0 = no stat advertised. Dictionary-family VARCHAR codecs are refused
-  /// in that case (need it to size pre-decode buffers); Uncompressed
-  /// VARCHAR accepts 0 and triggers the row group's
-  /// `decoded_bytes_budget_is_lower_bound`.
+  /// 0 means the stat was not advertised. Dictionary-family VARCHAR codecs
+  /// require it; Uncompressed VARCHAR tolerates 0 by flipping the row
+  /// group's `decoded_bytes_budget_is_lower_bound`.
   std::uint32_t max_string_length = 0;
 };
 
 struct duckdb_column_metadata {
   duckdb::idx_t column_id;
-  /// Ordered by `segment_start` ascending. Empty when `is_rowid`.
+  /// Sorted by `segment_start` ascending. Empty when `is_rowid`.
   std::vector<duckdb_segment_descriptor> data_segments;
-  /// Ordered by `segment_start` ascending. Empty when there is no validity
+  /// Sorted by `segment_start` ascending. Empty when there is no validity
   /// column or when `is_rowid`.
   std::vector<duckdb_segment_descriptor> validity_segments;
   bool is_rowid = false;
@@ -70,48 +67,40 @@ struct duckdb_column_metadata {
 
 struct duckdb_row_group_metadata {
   duckdb::idx_t row_group_index;
-  /// Absolute row index of the row group's first row within the table;
-  /// drives rowid synthesis.
+  /// Absolute row index of the row group's first row.
   duckdb::idx_t row_group_start;
   duckdb::idx_t row_count;
   /// Parallel to the walker's `projected_cols` argument.
   std::vector<duckdb_column_metadata> columns;
   std::size_t decoded_bytes_budget = 0;
-  /// Set when the budget used `VARCHAR_UNKNOWN_LENGTH_FALLBACK_BYTES` for
-  /// at least one column. Consumers must treat the budget as a soft lower
-  /// bound — the fallback may over- or under-shoot the actual decoded
-  /// bytes.
+  /// True when at least one column fell back to
+  /// `VARCHAR_UNKNOWN_LENGTH_FALLBACK_BYTES`. Treat the budget as a soft
+  /// lower bound in that case.
   bool decoded_bytes_budget_is_lower_bound = false;
 };
 
-/// Per-row VARCHAR fallback when no max-string-length stat is advertised.
-/// Sized at the threshold above which DuckDB's storage almost always
-/// picks a dictionary-family codec (which carries the stat); using this
-/// flips the row group's `decoded_bytes_budget_is_lower_bound`.
+/// Per-row byte budget used for VARCHAR columns whose row group did not
+/// advertise a max-string-length stat (Uncompressed only — dictionary
+/// codecs refuse in that case).
 inline constexpr std::uint32_t VARCHAR_UNKNOWN_LENGTH_FALLBACK_BYTES = 256;
 
-/// When `viable` is false the walker bailed on the first unsupported
-/// segment / type — `row_groups` may be partially populated and must
-/// not be consumed.
+/// When `viable` is false the walker bailed at the first unsupported
+/// segment or type; `row_groups` is partial and must not be consumed.
 struct duckdb_native_metadata {
   std::vector<duckdb_row_group_metadata> row_groups;
   bool viable = false;
   std::string viability_failure_reason;
 };
 
-/// Metadata-only walker over `storage`'s segment trees, via DuckDB's public
-/// `DataTable::GetColumnSegmentInfo` + `GetPartitionStats`. Reads no bytes
-/// and pins no blocks; I/O + Roaring host-decode are PR #9's job.
+/// Metadata-only walk of `storage` via `DataTable::GetColumnSegmentInfo`
+/// and `GetPartitionStats`. Pins no blocks and reads no bytes.
 ///
-/// On the first viability violation returns `viable = false` and a
-/// populated `viability_failure_reason`. The accept/refuse lists for data
-/// compression, validity compression, and logical type live in
-/// `is_supported_data_compression` / `is_supported_validity_compression` /
-/// `is_supported_logical_type` in the .cpp.
+/// Returns `viable = false` with a populated `viability_failure_reason`
+/// on the first unsupported segment or type.
 ///
-/// Operator-level escape gates (`dynamic_filters`, sample options, virtual
-/// columns, type pushdown rewrites) live on the `LogicalGet` and are the
-/// caller's responsibility to check before invoking the walker.
+/// Caller is responsible for the operator-level escape gates
+/// (`dynamic_filters`, sample options, virtual columns, type pushdown)
+/// on the originating `LogicalGet`.
 duckdb_native_metadata walk_duckdb_native_metadata(
   duckdb::DataTable& storage,
   duckdb::ClientContext& context,

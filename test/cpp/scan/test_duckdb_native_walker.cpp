@@ -32,9 +32,8 @@ using namespace sirius::op::scan;
 
 namespace {
 
-// `Connection::Query` returns a non-null QueryResult on failure (error
-// lives in `result->HasError()`), so `REQUIRE(con.Query(...))` silently
-// passes failed queries.
+// `Connection::Query` returns a non-null result on failure (error lives in
+// `HasError()`), so a bare `REQUIRE(con.Query(...))` would silently pass.
 void exec_ok(duckdb::Connection& con, const std::string& q)
 {
   auto result = con.Query(q);
@@ -45,9 +44,8 @@ void exec_ok(duckdb::Connection& con, const std::string& q)
   }
 }
 
-// Catalog access requires an active transaction. Each test case calls this
-// after table creation; the transaction stays open for the rest of the case
-// (DuckDB rolls it back on connection destruction).
+// Catalog access requires an active transaction. The transaction stays open
+// for the rest of the test case and DuckDB rolls it back when `con` dies.
 duckdb::DataTable& get_storage(duckdb::Connection& con, const std::string& table_name)
 {
   exec_ok(con, "BEGIN TRANSACTION");
@@ -120,11 +118,9 @@ TEST_CASE("walker emits descriptors for INTEGER table", "[scan][duckdb_native_wa
 {
   auto [db_owner, con] = sirius::make_test_db_and_connection();
   exec_ok(con, "CREATE TABLE t(a INTEGER)");
-  // 3000 rows ensures we cross a vector boundary; whether they materialise
-  // into multiple segments depends on the storage path, but we get at
-  // least one segment to inspect.
+  // Crosses a vector boundary so we get at least one materialised segment.
   exec_ok(con, "INSERT INTO t SELECT range FROM range(0, 3000)");
-  exec_ok(con, "CHECKPOINT");  // force segment materialisation
+  exec_ok(con, "CHECKPOINT");
   auto& storage = get_storage(con, "t");
 
   std::vector<projected_column> cols   = {real_col(0)};
@@ -140,7 +136,6 @@ TEST_CASE("walker emits descriptors for INTEGER table", "[scan][duckdb_native_wa
     REQUIRE(rg.columns[0].column_id == 0);
     REQUIRE_FALSE(rg.columns[0].is_rowid);
     REQUIRE_FALSE(rg.columns[0].data_segments.empty());
-    // Each segment lives on a real block (or constant-stored, rare here).
     for (const auto& d : rg.columns[0].data_segments) {
       REQUIRE(d.segment_count > 0);
     }
@@ -181,9 +176,8 @@ TEST_CASE("walker emits rowid sentinels with no segments", "[scan][duckdb_native
 TEST_CASE("walker rowid-only projection gets row_count from PartitionStats",
           "[scan][duckdb_native_walker]")
 {
-  // Regression guard: without PartitionStats as the row_count source,
-  // SELECT rowid FROM t lands row_count=0 → decoded_bytes_budget=0 →
-  // broken rowid synthesis.
+  // Without PartitionStats as the row_count source, a rowid-only projection
+  // would land row_count=0 and break rowid synthesis downstream.
   auto [db_owner, con] = sirius::make_test_db_and_connection();
   exec_ok(con, "CREATE TABLE t(a INTEGER)");
   exec_ok(con, "INSERT INTO t SELECT range FROM range(0, 1500)");
@@ -241,7 +235,6 @@ TEST_CASE("walker walks VARCHAR (Uncompressed) table without max-length stat nee
 {
   auto [db_owner, con] = sirius::make_test_db_and_connection();
   exec_ok(con, "CREATE TABLE t(s VARCHAR)");
-  // Few enough rows + small dictionary cardinality to keep storage simple.
   exec_ok(con, "INSERT INTO t SELECT 'hello' FROM range(0, 200)");
   exec_ok(con, "CHECKPOINT");
   auto& storage = get_storage(con, "t");
@@ -249,16 +242,11 @@ TEST_CASE("walker walks VARCHAR (Uncompressed) table without max-length stat nee
   std::vector<projected_column> cols   = {real_col(0)};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::VARCHAR)};
   auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
-  // Either viable=true (Uncompressed/RLE varchar accepted) or viable=false
-  // with a max_string_length-related reason if DuckDB chose Dictionary/FSST
-  // and didn't advertise the stat. Both outcomes are correct walker
-  // behaviour; what we want to confirm is that walking did not crash and
-  // produced row_groups.
+  // Both outcomes are valid: viable=true (Uncompressed/RLE varchar) or
+  // viable=false with a max_string_length reason (Dictionary/FSST without
+  // the stat). Confirm the walk didn't crash and the budget flag is honest.
   if (md.viable) {
     REQUIRE_FALSE(md.row_groups.empty());
-    // If any varchar segment in any row group landed without an advertised
-    // max-string-length stat, the budget pass must flag that row group as a
-    // lower bound; otherwise the consumer would silently undercount.
     for (const auto& rg : md.row_groups) {
       bool any_varchar_unknown = false;
       for (const auto& d : rg.columns[0].data_segments) {
@@ -305,9 +293,8 @@ TEST_CASE("walker accepts DECIMAL64 (precision <= 18)", "[scan][duckdb_native_wa
 
 TEST_CASE("walker refuses STRUCT projected type", "[scan][duckdb_native_walker]")
 {
-  // The walker rejects on type before walking any segment. We only need a
-  // table that exists so storage access doesn't crash; the column we project
-  // is a synthetic STRUCT logical_type that the walker is asked about.
+  // Type check fires before any segment walk, so an INTEGER table with a
+  // synthetic STRUCT projected type is enough.
   auto [db_owner, con] = sirius::make_test_db_and_connection();
   exec_ok(con, "CREATE TABLE t(a INTEGER)");
   exec_ok(con, "INSERT INTO t VALUES (1)");
@@ -340,28 +327,45 @@ TEST_CASE("walker refuses unsupported data compression (force ZSTD)",
   auto [db_owner, con] = sirius::make_test_db_and_connection();
   exec_ok(con, "PRAGMA force_compression='zstd'");
   exec_ok(con, "CREATE TABLE t(a INTEGER)");
-  // Enough rows so ZSTD actually applies (it bails to Uncompressed for
-  // very small segments).
+  // ZSTD bails to Uncompressed for very small segments, so insert enough.
   exec_ok(con, "INSERT INTO t SELECT range FROM range(0, 5000)");
   exec_ok(con, "CHECKPOINT");
-  auto& storage = get_storage(con, "t");
 
+  // Verify the pragma actually produced a ZSTD segment before checking the
+  // walker. Without this guard, a DuckDB rename or pragma-ignore would let
+  // the walker assertions below pass vacuously.
+  bool zstd_landed = false;
+  {
+    auto result = con.Query("SELECT compression FROM pragma_storage_info('t')");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
+    while (auto chunk = result->Fetch()) {
+      for (duckdb::idx_t i = 0; i < chunk->size(); ++i) {
+        if (chunk->GetValue(0, i).ToString() == "ZSTD") {
+          zstd_landed = true;
+          break;
+        }
+      }
+      if (zstd_landed) { break; }
+    }
+  }
+  INFO(
+    "force_compression='zstd' did not produce any ZSTD segment — DuckDB "
+    "may have renamed the codec or stopped honoring the pragma");
+  REQUIRE(zstd_landed);
+
+  auto& storage                        = get_storage(con, "t");
   std::vector<projected_column> cols   = {real_col(0)};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::INTEGER)};
   auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
-  // If ZSTD landed the walker must refuse with a "ZSTD" diagnostic. If
-  // DuckDB ignored the pragma (e.g. the codec wasn't picked despite the
-  // hint) the walker should still be viable — guard both outcomes.
-  if (!md.viable) { REQUIRE(md.viability_failure_reason.find("ZSTD") != std::string::npos); }
+  REQUIRE_FALSE(md.viable);
+  REQUIRE(md.viability_failure_reason.find("ZSTD") != std::string::npos);
 }
 
-// Round-trip guard: every CompressionType the walker explicitly handles
-// must round-trip through DuckDB's CompressionTypeToString back to the
-// exact string the reverse map in duckdb_native_metadata.cpp keys on.
-// Without this test, a DuckDB upstream rename (e.g. "Empty Validity" →
-// "Empty") would silently funnel every renamed segment through
-// COMPRESSION_AUTO and produce a confusing "unsupported compression"
-// diagnostic instead of a clear "version drift" one.
+// Round-trip guard against DuckDB renaming a codec string (e.g. "Empty
+// Validity" → "Empty"). Without it, a rename funnels every renamed segment
+// through the COMPRESSION_COUNT sentinel with a misleading
+// "unsupported compression" diagnostic.
 TEST_CASE("CompressionTypeToString output matches walker reverse-map keys",
           "[scan][duckdb_native_walker]")
 {
