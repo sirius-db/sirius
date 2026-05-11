@@ -17,38 +17,28 @@
 //===----------------------------------------------------------------------===//
 // BITPACKING decode kernel.
 //
-// One CTA per metadata group (BP_META_GROUP_SIZE = 2048 rows). All groups
-// across every segment of a column are dispatched in one batched kernel —
-// per-CTA work stays uniform regardless of how many segments DuckDB chose
-// for the column. Thread 0 parses the group's metadata directly from the
-// staged segment bytes (no host-side header H2D) and broadcasts the parsed
-// fields through shared memory; the remaining decode runs zero-divergent.
+// A bitpacked column segment is structured as
+//   [metadata header,
+//    data[group_0,..., group_N],
+//    metadata[group_N,...,group_0]]
+// - The metadata header (8B) points to the end of the array of metadata (`metadata_end`).
+// - Each metadata entry (4B) contains a) the group's offset from the segment into its corresponding
+//   data region (`data_off`) and b) the bitpacking mode of the groups, which is one of:
+//     * CONSTANT
+//     * CONSTANT_DELTA
+//     * FOR
+//     * DELTA_FOR
+// - Each data group is structured as [T,T,(T,),packed data], where T is the output type, and the
+//   number and meaning of the Ts depends on the mode.
 //
-// Per-mode store strategy:
-//   CONSTANT, CONSTANT_DELTA  — vectorise to int4 (16-byte) stores when the
-//                               type fits, mirroring the UNCOMPRESSED CONSTANT
-//                               broadcast. Doesn't reach that path's GDDR
-//                               fill rate (per-CTA metadata parse + sync caps
-//                               us below it) but closes most of the gap vs a
-//                               scalar-store baseline.
-//   FOR, DELTA_FOR            — striped scalar `__stwt`. Striped + scalar is
-//                               the simplest correct layout; a blocked + int4
-//                               variant is plausible follow-up work but has
-//                               not been measured.
-//
-// Output is written once and never reread within a single kernel, so global
-// stores go through `__stwt` (PTX `st.global.wt`). Empirically a no-op on
-// sm_75 (Turing's L1 doesn't cache global stores for reuse anyway) but kept
-// for sm_80+ where the L1 partition is more aggressive and the bypass hint
-// is a measured win on similar workloads in cudf.
+// The work partitioning is one CTA per group (BP_META_GROUP_SIZE = 2048 rows). All groups
+// across every segment of a column are dispatched in one batched kernel.
 //
 // Defensive metadata bounds: `metadata_end` and `data_off` come from disk
 // and could be malformed. Each parse step that would produce an OOB read or
 // write demotes `sm_mode` to INVALID; INVALID then deterministically
 // zero-fills the group's output range (using the trusted descriptor row
-// count, not the parsed metadata) so the column buffer never carries
-// uninitialised device contents downstream — addresses the information-
-// disclosure concern that the prior return-without-writing path created.
+// count, not the parsed metadata).
 //===----------------------------------------------------------------------===//
 
 #include "cuda/scan/gpu_decode_bitpacking.cuh"
@@ -56,10 +46,11 @@
 #include <rmm/detail/error.hpp>
 #include <rmm/device_uvector.hpp>
 
+#include <cooperative_groups.h>
+#include <cooperative_groups/memcpy_async.h>
 #include <cub/warp/warp_scan.cuh>
+#include <cuda/std/numeric>
 #include <cuda_runtime.h>
-
-#include <cuda_pipeline.h>
 
 #include <cstdint>
 #include <stdexcept>
@@ -70,12 +61,10 @@ namespace sirius::cuda::scan {
 
 namespace {
 
-/// Block dim used by every bitpacking kernel launch. `BLOCK_SCAN` below is
-/// hard-coded to this width; a `static_assert` guards the coupling.
 constexpr uint32_t BLOCK_DIM = 256;
 
-/// Values per thread for the FOR / DELTA_FOR loop. With BLOCK_DIM=256 this
-/// covers BP_META_GROUP_SIZE in one pass without tail iterations.
+/// VPT (= Values Per Thread) for the FOR / DELTA_FOR loop. With BLOCK_DIM=256 this
+/// covers BP_META_GROUP_SIZE (2048) in one pass without tail iterations.
 constexpr uint32_t VPT = BP_META_GROUP_SIZE / BLOCK_DIM;
 static_assert(BLOCK_DIM * VPT == BP_META_GROUP_SIZE,
               "BLOCK_DIM and VPT must tile the metadata group exactly");
@@ -104,54 +93,64 @@ struct bp_group_desc {
 /// bits 20..69, which crosses two 32-bit boundaries). Callers must ensure
 /// `packed[]` has one guard word past the live data so that third-word read
 /// is in-bounds; the kernel writes the guard word itself.
-///
-/// Pattern #2 (shift-by-bit-width UB) is guarded by both the `bit_off > 0`
-/// check on the third-word read and the `width >= 64` check on the mask.
 template <typename T>
 __device__ __forceinline__ T unpack_value(uint32_t const* packed, uint32_t idx, uint32_t width)
 {
+  auto constexpr WORD_BITS  = ::cuda::std::numeric_limits<uint32_t>::digits;
+  auto constexpr WORD_BYTES = sizeof(uint32_t);
   if (width == 0) return T(0);
 
-  uint64_t bit_pos  = static_cast<uint64_t>(idx) * width;
-  uint32_t word_idx = static_cast<uint32_t>(bit_pos / 32);
-  uint32_t bit_off  = static_cast<uint32_t>(bit_pos & 31);
+  auto const bit_pos  = static_cast<uint64_t>(idx) * width;
+  auto const word_idx = static_cast<uint32_t>(bit_pos / WORD_BITS);
+  auto const bit_off  = static_cast<uint32_t>(bit_pos % WORD_BITS);
 
-  uint64_t combined = static_cast<uint64_t>(packed[word_idx]);
-  if (bit_off + width > 32) { combined |= static_cast<uint64_t>(packed[word_idx + 1]) << 32; }
-  uint64_t result = combined >> bit_off;
+  // We need to upcast in case we need bits from the next word.
+  auto result = static_cast<uint64_t>(packed[word_idx]);
+  if (bit_off + width > WORD_BITS) {
+    result |= static_cast<uint64_t>(packed[word_idx + 1]) << WORD_BITS;
+  }
+  result >>= bit_off;
 
-  if constexpr (sizeof(T) > 4) {
-    if (bit_off > 0 && bit_off + width > 64) {
+  // For 8B types, we may need bits from the second next word.
+  if constexpr (sizeof(T) > WORD_BYTES) {
+    if (bit_off > 0 && bit_off + width > 2 * WORD_BITS) {
       result |= static_cast<uint64_t>(packed[word_idx + 2]) << (64 - bit_off);
     }
   }
 
-  uint64_t mask = (width >= 64) ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
+  auto const mask = (width >= 64) ? ~uint64_t{0} : (uint64_t{1} << width) - 1;
   return static_cast<T>(result & mask);
 }
 
 //===----------------------------------------------------------------------===//
 // Batched decode kernel.
-//
-// CONSTANT / CONSTANT_DELTA modes pack T values into 16-byte `int4` units
-// and issue one streaming store per pack — halving (or quartering) the
-// store-instruction count vs scalar `__stwt`. The 16-byte-aligned writes
-// stay coalesced because each warp's 32 threads cover 32×16 = 512 bytes
-// of contiguous output, mapping to four 128-byte cache-line transactions.
 //===----------------------------------------------------------------------===//
-
-template <typename T>
+template <typename T, int SHMEM_BYTES>
 __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs,
                                          T* __restrict__ d_output,
                                          uint32_t num_groups)
 {
-  uint32_t gid = blockIdx.x;
+  namespace cg              = cooperative_groups;
+  using vec_t               = int4;
+  auto constexpr VEC_BYTES  = sizeof(vec_t);
+  auto constexpr WORD_BYTES = sizeof(uint32_t);
+  auto constexpr WORD_BITS  = ::cuda::std::numeric_limits<uint32_t>::digits;
+
+  static_assert(sizeof(T) <= 8 && sizeof(vec_t) % sizeof(T) == 0,
+                "BITPACKING kernel only instantiates for type sizes in {1,2,4,8}; "
+                "extending the dispatcher to a non-conforming type needs a scalar "
+                "fallback path here");
+
+  auto const gid = blockIdx.x;
   if (gid >= num_groups) return;
 
-  auto const desc          = descs[gid];
-  uint8_t const* seg_base  = desc.d_segment;
-  uint32_t const seg_bytes = desc.segment_bytes;
-  T* out                   = d_output + desc.global_row_offset;
+  auto const desc      = descs[gid];
+  auto const* seg_base = desc.d_segment;
+  auto const seg_bytes = desc.segment_bytes;
+
+  // Note that d_output is 256B aligned (guaranteed by CUDA), and global_row_offset is a multiple of
+  // BP_META_GROUP_SIZE, so `out` is always 16B-aligned, and 16B vectorized stores are defined.
+  auto* out = d_output + desc.global_row_offset;
 
   // Shared metadata — written by thread 0, read by all after the barrier.
   // `sm_aux` is overloaded by mode:
@@ -185,13 +184,13 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
       metadata_end <= seg_bytes;
 
     if (metadata_ok) {
-      uint8_t const* entry_addr = seg_base + metadata_end - (desc.group_idx + 1) * sizeof(uint32_t);
-      uint32_t encoded          = 0;
+      auto const* entry_addr = seg_base + metadata_end - (desc.group_idx + 1) * sizeof(uint32_t);
+      uint32_t encoded       = 0;
       memcpy(&encoded, entry_addr, sizeof(uint32_t));
 
-      uint32_t data_off   = encoded & 0x00FFFFFFu;
-      uint8_t parsed_mode = (encoded >> 24) & 0xFFu;
-      sm_row_count        = desc.group_row_count;
+      auto const data_off    = encoded & 0x00FFFFFFu;
+      auto const parsed_mode = (encoded >> 24) & 0xFFu;
+      sm_row_count           = desc.group_row_count;
 
       // `data_off` is a within-segment offset; the kernel reads v0 and v1
       // unconditionally (2*sizeof(T)) for every mode below, then reads a
@@ -201,7 +200,7 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
       bool data_off_ok = uint64_t{data_off} + 2u * sizeof(T) <= metadata_end;
 
       if (data_off_ok) {
-        uint8_t const* dp = seg_base + data_off;
+        auto const* dp = seg_base + data_off;
         T v0{}, v1{};
         memcpy(&v0, dp, sizeof(T));
         memcpy(&v1, dp + sizeof(T), sizeof(T));
@@ -242,8 +241,7 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
             break;
         }
 
-        // sizeof(T)*8 is the kernel's hard upper bound for unpack_value;
-        // wider widths would read packed words past the segment.
+        // Bitpacking widths larger than the target type width are invalid.
         if (sm_width > sizeof(T) * 8u) {
           sm_mode  = static_cast<uint8_t>(BitpackingMode::INVALID);
           sm_width = 0;
@@ -252,8 +250,8 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
         // Ensure the packed stream stays inside the segment buffer.
         if (sm_mode == static_cast<uint8_t>(BitpackingMode::FOR) ||
             sm_mode == static_cast<uint8_t>(BitpackingMode::DELTA_FOR)) {
-          uint64_t packed_words = (uint64_t{sm_row_count} * sm_width + 31u) / 32u;
-          uint64_t packed_end   = uint64_t{sm_data_offset} + packed_words * sizeof(uint32_t);
+          auto const packed_words = ::cuda::ceil_div(sm_row_count * sm_width, WORD_BITS);
+          auto const packed_end   = uint64_t{sm_data_offset} + packed_words * WORD_BYTES;
           if (packed_end > metadata_end) {
             sm_mode  = static_cast<uint8_t>(BitpackingMode::INVALID);
             sm_width = 0;
@@ -264,28 +262,19 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
   }
   __syncthreads();
 
-  uint32_t const rc = sm_row_count;
-  auto const mode   = static_cast<BitpackingMode>(sm_mode);
+  auto const rc   = sm_row_count;
+  auto const mode = static_cast<BitpackingMode>(sm_mode);
 
   //===--------------------------------------------------------------------===//
   // CONSTANT — broadcast `sm_aux` to every row.
-  //
-  // We don't go through `cudf::type_dispatcher` like the UNCOMPRESSED-CONSTANT
-  // path does, because the constant value is parsed *inside this kernel* from
-  // the segment's metadata; reaching for a separate dispatcher launch would
-  // require staging the parsed value back to a device scalar and re-launching.
   //===--------------------------------------------------------------------===//
   if (mode == BitpackingMode::CONSTANT) {
-    static_assert(sizeof(T) <= 8 && 16u % sizeof(T) == 0u,
-                  "BITPACKING kernel only instantiates for type sizes in {1,2,4,8}; "
-                  "extending the dispatcher to a non-conforming type needs a scalar "
-                  "fallback path here");
-    T const val            = sm_aux;
-    constexpr uint32_t TPV = 16u / sizeof(T);
-    uint32_t vec_count     = rc / TPV;
-    int4* out4             = reinterpret_cast<int4*>(out);
-    int4 packed;
-    T* lanes = reinterpret_cast<T*>(&packed);
+    auto const val         = sm_aux;
+    uint32_t constexpr TPV = sizeof(vec_t) / sizeof(T);
+    auto const vec_count   = rc / TPV;
+    auto* out4             = reinterpret_cast<vec_t*>(out);
+    vec_t packed;
+    auto* lanes = reinterpret_cast<T*>(&packed);
 #pragma unroll
     for (uint32_t i = 0; i < TPV; ++i)
       lanes[i] = val;
@@ -303,24 +292,22 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
   // CONSTANT_DELTA — out[i] = frame + i*delta.
   //===--------------------------------------------------------------------===//
   if (mode == BitpackingMode::CONSTANT_DELTA) {
-    // sizeof(T) constraint enforced by the static_assert in the CONSTANT
-    // branch above — reach here only via the same template instantiations.
-    T const frame          = sm_frame;
-    T const delta          = sm_aux;
-    constexpr uint32_t TPV = 16u / sizeof(T);
-    uint32_t vec_count     = rc / TPV;
-    int4* out4             = reinterpret_cast<int4*>(out);
+    auto const frame       = sm_frame;
+    auto const delta       = sm_aux;
+    uint32_t constexpr TPV = sizeof(vec_t) / sizeof(T);
+    auto const vec_count   = rc / TPV;
+    auto* out4             = reinterpret_cast<vec_t*>(out);
     for (uint32_t v = threadIdx.x; v < vec_count; v += blockDim.x) {
-      int4 packed;
-      T* lanes        = reinterpret_cast<T*>(&packed);
-      uint32_t base_v = v * TPV;
+      vec_t packed;
+      auto* lanes       = reinterpret_cast<T*>(&packed);
+      auto const base_v = v * TPV;
 #pragma unroll
       for (uint32_t i = 0; i < TPV; ++i) {
         lanes[i] = static_cast<T>(frame + static_cast<T>(base_v + i) * delta);
       }
       __stcs(out4 + v, packed);
     }
-    uint32_t tail_start = vec_count * TPV;
+    auto const tail_start = vec_count * TPV;
     for (uint32_t i = tail_start + threadIdx.x; i < rc; i += blockDim.x) {
       __stcs(out + i, static_cast<T>(frame + static_cast<T>(i) * delta));
     }
@@ -332,59 +319,43 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
   //===--------------------------------------------------------------------===//
 
   // Anything other than FOR / DELTA_FOR is INVALID metadata or an unknown
-  // mode. Deterministic zero-fill of the descriptor's row range — leaving
-  // the buffer uninitialised would expose prior device contents (the
-  // information-disclosure concern Copilot flagged). Use desc.group_row_count
-  // (always trusted; comes from the host descriptor) rather than sm_row_count,
-  // which is only set on a successful metadata parse.
+  // mode: zero-fill the descriptor's row range.
   if (mode != BitpackingMode::FOR && mode != BitpackingMode::DELTA_FOR) {
-    uint32_t const fill_rows = desc.group_row_count;
+    auto const fill_rows = desc.group_row_count;
     for (uint32_t i = threadIdx.x; i < fill_rows; i += blockDim.x) {
       __stcs(out + i, T(0));
     }
     return;
   }
 
-  uint32_t const width = sm_width;
-  T const frame        = sm_frame;
+  auto const width = sm_width;
+  auto const frame = sm_frame;
 
-  extern __shared__ uint32_t shmem[];
-  uint8_t const* packed_bytes = seg_base + sm_data_offset;
-  uint32_t packed_words       = (rc * width + 31u) / 32u;
+  auto constexpr TARGET_ALIGNMENT_BYTES = sizeof(vec_t);
+  alignas(TARGET_ALIGNMENT_BYTES) __shared__ uint32_t shmem[SHMEM_BYTES / WORD_BYTES];
+  auto const* packed_bytes  = seg_base + sm_data_offset;
+  auto const n_packed_words = ::cuda::ceil_div(rc * width, WORD_BITS);
+  auto const block          = cg::this_thread_block();
 
-  // Stage the packed-bytes slice into shmem via `cp.async.ca.shared.global`
-  // (sm_80+) instead of scalar memcpy through registers. Try 16-byte loads
-  // when both source and destination are 16-byte aligned and the word count
-  // is a multiple of 4; fall back to 4-byte loads otherwise. The branch is
-  // uniform across the CTA (sm_data_offset is broadcast through shmem) so
-  // there's no warp divergence.
-  uintptr_t const src_addr = reinterpret_cast<uintptr_t>(packed_bytes);
-  bool const can_use_16b   = (src_addr & 15u) == 0 && (packed_words & 3u) == 0;
-  if (can_use_16b) {
-    uint32_t const quad_count = packed_words >> 2;  // packed_words / 4
-    for (uint32_t i = threadIdx.x; i < quad_count; i += blockDim.x) {
-      __pipeline_memcpy_async(&shmem[i * 4], packed_bytes + i * 16u, 16);
-    }
-  } else {
-    for (uint32_t i = threadIdx.x; i < packed_words; i += blockDim.x) {
-      __pipeline_memcpy_async(&shmem[i], packed_bytes + i * sizeof(uint32_t), sizeof(uint32_t));
-    }
-  }
+  // Async copy the packed bytes into shared memory.
+  cg::memcpy_async(
+    block, reinterpret_cast<uint8_t*>(shmem), packed_bytes, n_packed_words * WORD_BYTES);
+
   // Guard word — set after async-copy issue; wait below covers both.
-  if (threadIdx.x == 0) shmem[packed_words] = 0u;
-  __pipeline_commit();
-  __pipeline_wait_prior(0);
-  __syncthreads();
+  if (threadIdx.x == 0) shmem[n_packed_words] = 0;
+  cg::wait(block);
+
+  //===--------------------------------------------------------------------===//
+  // FOR -- frame + value.
+  //===--------------------------------------------------------------------===//
 
   if (mode == BitpackingMode::FOR) {
-    // Striped layout: in iteration v, all blockDim.x threads write
-    // contiguous output positions [v*blockDim.x .. v*blockDim.x+blockDim.x).
-    // One coalesced cache-line transaction per warp per iteration.
+    // Striped fill
 #pragma unroll
     for (uint32_t v = 0; v < VPT; ++v) {
-      uint32_t idx = v * blockDim.x + threadIdx.x;
+      auto const idx = v * blockDim.x + threadIdx.x;
       if (idx >= rc) break;
-      __stcs(out + idx, static_cast<T>(frame + unpack_value<T>(shmem, idx, width)));
+      __stcs(out + idx, frame + unpack_value<T>(shmem, idx, width));
     }
     return;
   }
@@ -392,24 +363,18 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
   //===--------------------------------------------------------------------===//
   // DELTA_FOR — frame + per-row delta, prefix-sum, then add delta_offset.
   //===--------------------------------------------------------------------===//
-  //
-  // Two-stage scan in blocked layout (each thread holds VPT consecutive
-  // values). The block-wide prefix-sum is built from per-warp `cub::WarpScan`
-  // (uses `__shfl` only — no shmem, no barriers) plus a single shmem
-  // exchange of the per-warp totals; one thread serially scans those 8
-  // totals and broadcasts back. Final values are exchanged through shmem
-  // (reusing the packed-data buffer, no longer read after the unpack loop)
+  // Two-stage scan in blocked layout The block-wide prefix-sum is built from per-warp
+  // `cub::WarpScan` plus a single shmem exchange of the per-warp totals; one thread serially scans
+  // those 8 totals and broadcasts back. Final values are exchanged through shmem
   // into striped layout for coalesced global stores.
   //
-  // Why not `cub::BlockScan<T, 256>`? Its TempStorage costs measurable
-  // extra registers and static shmem per CTA on sm_80, dropping CTA-per-SM
-  // occupancy. WarpScan + serial warp-aggregate avoids both. Pattern
-  // mirrors cudf's parquet delta-binary decode (`cpp/src/io/parquet/
-  // delta_binary.cuh`).
+  // Used instead of `cub::BlockScan<T, 256>` to reduce register pressure and SMEM usage for
+  // improved occupancy.
+
   T thread_data[VPT];
 #pragma unroll
   for (uint32_t v = 0; v < VPT; ++v) {
-    uint32_t idx   = threadIdx.x * VPT + v;
+    auto const idx = threadIdx.x * VPT + v;
     thread_data[v] = (idx < rc) ? static_cast<T>(frame + unpack_value<T>(shmem, idx, width)) : T(0);
   }
 #pragma unroll
@@ -417,16 +382,14 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
     thread_data[v] = static_cast<T>(thread_data[v] + thread_data[v - 1]);
   }
 
-  // Stage 1 — per-warp inclusive scan of thread aggregates. Each warp's
-  // 32 threads scan their thread_agg values via `__shfl` (no shmem, no
-  // barriers). Lane 31 of each warp publishes the warp's total to shmem.
-  using WarpScanT              = cub::WarpScan<T>;
-  constexpr uint32_t NUM_WARPS = BLOCK_DIM / 32;
+  // Stage 1 — per-warp inclusive scan of thread aggregates.
+  using WarpScanT          = cub::WarpScan<T>;
+  auto constexpr NUM_WARPS = BLOCK_DIM / 32;
   __shared__ typename WarpScanT::TempStorage warp_scan_temp[NUM_WARPS];
   __shared__ T warp_aggregates[NUM_WARPS];
 
-  uint32_t const warp_id = threadIdx.x / 32;
-  uint32_t const lane_id = threadIdx.x % 32;
+  auto const warp_id = threadIdx.x / 32;
+  auto const lane_id = threadIdx.x % 32;
 
   T thread_agg = thread_data[VPT - 1];
   T warp_inclusive;
@@ -436,11 +399,11 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
   __syncthreads();
 
   // Stage 2 — serial scan of NUM_WARPS=8 warp totals by warp 0 lane 0.
-  // Cheaper than another WarpScan; 8 sequential adds in registers.
   if (warp_id == 0 && lane_id == 0) {
     T running = T(0);
+#pragma unroll
     for (uint32_t w = 0; w < NUM_WARPS; ++w) {
-      T t                = warp_aggregates[w];
+      auto const t       = warp_aggregates[w];
       warp_aggregates[w] = running;
       running            = static_cast<T>(running + t);
     }
@@ -451,25 +414,23 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
   //   warp_aggregates[warp_id] (sum of warps before this one)
   //   + (warp_inclusive - thread_agg) (this thread's exclusive prefix in warp)
   //   + delta_offset
-  T const delta_offset     = sm_aux;
-  T const warp_prefix      = warp_aggregates[warp_id];
-  T const thread_exclusive = static_cast<T>(warp_inclusive - thread_agg);
-  T const prefix           = static_cast<T>(warp_prefix + thread_exclusive + delta_offset);
+  auto const delta_offset     = sm_aux;
+  auto const warp_prefix      = warp_aggregates[warp_id];
+  auto const thread_exclusive = static_cast<T>(warp_inclusive - thread_agg);
+  auto const prefix           = static_cast<T>(warp_prefix + thread_exclusive + delta_offset);
 
   // Blocked->striped exchange via shmem (reusing the packed-words buffer,
-  // no longer read after the unpack loop). Necessary for coalesced global
-  // stores — direct blocked stores would scatter writes 32× across cache
-  // lines per warp.
-  T* shmem_t = reinterpret_cast<T*>(shmem);
+  // no longer read after the unpack loop) for coalesced stores.
+  auto* shmem_t = reinterpret_cast<T*>(shmem);
 #pragma unroll
   for (uint32_t v = 0; v < VPT; ++v) {
-    uint32_t idx = threadIdx.x * VPT + v;
+    auto const idx = threadIdx.x * VPT + v;
     if (idx < rc) shmem_t[idx] = static_cast<T>(thread_data[v] + prefix);
   }
   __syncthreads();
 #pragma unroll
   for (uint32_t v = 0; v < VPT; ++v) {
-    uint32_t idx = v * blockDim.x + threadIdx.x;
+    auto const idx = v * blockDim.x + threadIdx.x;
     if (idx < rc) __stcs(out + idx, shmem_t[idx]);
   }
 }
@@ -484,13 +445,12 @@ std::vector<bp_group_desc> build_group_descs(gpu_codec_run const& run)
 {
   std::vector<bp_group_desc> descs;
   // Each segment contributes ceil(row_count / BP_META_GROUP_SIZE) groups;
-  // the reserve is a tight upper bound when every segment is a full group.
-  descs.reserve(run.segments.size() * 2);
   for (auto const& seg : run.segments) {
     if (seg.row_count == 0) continue;
-    uint32_t num_groups = (seg.row_count + BP_META_GROUP_SIZE - 1) / BP_META_GROUP_SIZE;
+    auto const num_groups = ::cuda::ceil_div(seg.row_count, BP_META_GROUP_SIZE);
     for (uint32_t g = 0; g < num_groups; ++g) {
-      uint32_t group_rows =
+      // If it's the last group, ceiling the number of rows based on the segment row count
+      auto const group_rows =
         (g + 1u < num_groups) ? BP_META_GROUP_SIZE : seg.row_count - g * BP_META_GROUP_SIZE;
       descs.push_back(
         {seg.d_bytes, seg.bytes_size, g, group_rows, seg.row_offset + g * BP_META_GROUP_SIZE});
@@ -506,6 +466,13 @@ void launch_typed(bp_group_desc const* h_descs,
                   rmm::cuda_stream_view stream,
                   rmm::device_async_resource_ref mr)
 {
+  // The +1 guard word satisfies `unpack_value`'s 3-word read contract for
+  // 64-bit types when a value spans words [w, w+1, w+2].
+  auto constexpr MAX_WIDTH        = ::cuda::std::numeric_limits<T>::digits;
+  auto constexpr WORD_BITS        = ::cuda::std::numeric_limits<uint32_t>::digits;
+  auto constexpr MAX_PACKED_WORDS = ::cuda::ceil_div(BP_META_GROUP_SIZE * MAX_WIDTH, WORD_BITS) + 1;
+  auto constexpr SHMEM_BYTES      = static_cast<int>(MAX_PACKED_WORDS * sizeof(uint32_t));
+
   if (num_groups == 0) return;
 
   rmm::device_uvector<bp_group_desc> d_descs(num_groups, stream, mr);
@@ -515,26 +482,8 @@ void launch_typed(bp_group_desc const* h_descs,
                                cudaMemcpyHostToDevice,
                                stream.value()));
 
-  // Live shmem footprint per CTA, in 32-bit words:
-  //   BP_META_GROUP_SIZE values × max_width bits / 32, rounded up.
-  // The +1 guard word satisfies `unpack_value`'s 3-word read contract for
-  // 64-bit types when a value spans words [w, w+1, w+2].
-  constexpr uint32_t max_width        = sizeof(T) * 8u;
-  constexpr uint32_t max_packed_words = (BP_META_GROUP_SIZE * max_width + 31u) / 32u + 1u;
-  constexpr size_t shmem_bytes        = max_packed_words * sizeof(uint32_t);
-
-  // Default per-CTA dynamic shmem cap on Turing/Ampere is 48 KB. For T up
-  // to int64 the live footprint peaks at ~16 KB. The static_assert catches
-  // any future BP_META_GROUP_SIZE / wider-T regression at compile time
-  // rather than as an opaque "previous unspecified launch failure" at the
-  // next stream sync.
-  static_assert(shmem_bytes <= 48u * 1024u,
-                "kernel_decode_bitpacking dynamic shmem exceeds the 48 KB default; "
-                "either reduce BP_META_GROUP_SIZE / max_width, or call "
-                "cudaFuncSetAttribute(MaxDynamicSharedMemorySize) before launch");
-
-  kernel_decode_bitpacking<T>
-    <<<static_cast<uint32_t>(num_groups), BLOCK_DIM, shmem_bytes, stream.value()>>>(
+  kernel_decode_bitpacking<T, SHMEM_BYTES>
+    <<<static_cast<uint32_t>(num_groups), BLOCK_DIM, 0, stream.value()>>>(
       d_descs.data(), d_output, static_cast<uint32_t>(num_groups));
 }
 

@@ -62,6 +62,7 @@ namespace {
 
 auto const I32 = cudf::data_type{cudf::type_id::INT32};
 auto const I64 = cudf::data_type{cudf::type_id::INT64};
+auto const U8  = cudf::data_type{cudf::type_id::UINT8};
 auto const U16 = cudf::data_type{cudf::type_id::UINT16};
 
 // Synthetic-segment builders moved to scan/bitpacking_synth.hpp so the
@@ -113,6 +114,17 @@ TEST_CASE("gpu_decode_table BITPACKING - CONSTANT broadcasts value", "[scan][dec
     REQUIRE(out.size() == 257);
     for (auto x : out)
       REQUIRE(x == v);
+  }
+
+  SECTION("uint8 0x5A, 200 rows (TPV=16 lanes per int4 broadcast)")
+  {
+    // Narrowest type — sizeof(T)=1 → TPV=16, the broadest int4 broadcast layout.
+    // Exercises the static_assert(sizeof(vec_t) % sizeof(T) == 0) at sizeof(T)=1
+    // and the 12 full int4 stores + 8 scalar tail elements.
+    auto bytes = make_constant_block<uint8_t>(0x5A);
+    auto out   = decode_one<uint8_t>(bytes, U8, 200);
+    for (auto v : out)
+      REQUIRE(v == 0x5A);
   }
 }
 
@@ -187,6 +199,65 @@ TEST_CASE("gpu_decode_table BITPACKING - FOR unpacks frame + packed deltas",
     auto out   = decode_one<uint16_t>(bytes, U16, 200);
     for (uint32_t i = 0; i < 200; ++i)
       REQUIRE(out[i] == 500u + (i * 3u) % 1024u);
+  }
+
+  SECTION("int32 width=1 (smallest non-degenerate width)")
+  {
+    // Single-bit packing — 64 alternating 0/1 values into two 32-bit words.
+    // Pins the unpack_value mask compute at the smallest width.
+    std::vector<int32_t> deltas(64);
+    for (int32_t i = 0; i < 64; ++i)
+      deltas[i] = i & 1;
+    auto bytes = make_for_block<int32_t>(50, 1, deltas);
+    auto out   = decode_one<int32_t>(bytes, I32, 64);
+    for (uint32_t i = 0; i < 64; ++i)
+      REQUIRE(out[i] == 50 + (static_cast<int32_t>(i) & 1));
+  }
+
+  SECTION("int32 width=32 (max-width, no inter-word straddle)")
+  {
+    // Each value occupies a full word — bit_off is always 0 — so the straddle
+    // branch in unpack_value never fires. Pins the upper boundary of the width
+    // validator (kernel rejects width > sizeof(T)*8 at the bound, not at it).
+    std::vector<int32_t> deltas(33);
+    for (int32_t i = 0; i < 33; ++i)
+      deltas[i] = 0x10000000 + i;
+    auto bytes = make_for_block<int32_t>(0, 32, deltas);
+    auto out   = decode_one<int32_t>(bytes, I32, 33);
+    for (uint32_t i = 0; i < 33; ++i)
+      REQUIRE(out[i] == 0x10000000 + static_cast<int32_t>(i));
+  }
+
+  SECTION("int64 width=64 (max-width, `width >= 64` mask branch)")
+  {
+    // unpack_value selects `(width >= 64) ? ~uint64_t{0} : make_mask(width)`.
+    // width=64 is the explicit "no mask" path that lets the full 64-bit value
+    // through unchanged.
+    std::vector<int64_t> deltas(40);
+    for (int64_t i = 0; i < 40; ++i)
+      deltas[i] = (1LL << 50) + i;
+    auto bytes = make_for_block<int64_t>(0, 64, deltas);
+    auto out   = decode_one<int64_t>(bytes, I64, 40);
+    for (uint32_t i = 0; i < 40; ++i)
+      REQUIRE(out[i] == (1LL << 50) + static_cast<int64_t>(i));
+  }
+
+  SECTION("int64 width=63 (true 3-word straddle in unpack_value)")
+  {
+    // unpack_value's third-word read fires when bit_off > 0 AND
+    // bit_off + width > 64. The existing "width=33" case can't satisfy this
+    // (max bit_off=31 → 31+33=64, not strictly >64). width=63 gives bit_off
+    // values that climb past 0 → 3-word path is actually exercised.
+    std::vector<int64_t> deltas(100);
+    for (int64_t i = 0; i < 100; ++i)
+      deltas[i] = (i * 0x123456789LL) & (static_cast<int64_t>((1ULL << 63) - 1ULL));
+    auto bytes = make_for_block<int64_t>(0, 63, deltas);
+    auto out   = decode_one<int64_t>(bytes, I64, 100);
+    for (uint32_t i = 0; i < 100; ++i) {
+      int64_t expected =
+        (static_cast<int64_t>(i) * 0x123456789LL) & (static_cast<int64_t>((1ULL << 63) - 1ULL));
+      REQUIRE(out[i] == expected);
+    }
   }
 }
 
@@ -298,6 +369,231 @@ TEST_CASE("gpu_decode_table BITPACKING - multi-group segment", "[scan][decode][b
     REQUIRE(out[i] == 7);
   for (uint32_t i = 0; i < total_rows - group_rows; ++i)
     REQUIRE(out[group_rows + i] == 99);
+}
+
+TEST_CASE("gpu_decode_table BITPACKING - multi-group segment, group 1 is FOR",
+          "[scan][decode][bitpacking]")
+{
+  // Group 0: CONSTANT, fills BP_META_GROUP_SIZE rows. Group 1: FOR, decodes
+  // a packed stream — exercises the multi-group dispatcher routing each
+  // group to its own decode path (prior multi-group test was CONSTANT/CONSTANT,
+  // never lit up the FOR cp.async + unpack path through a non-zero
+  // global_row_offset).
+  using T                       = int32_t;
+  constexpr uint32_t group_rows = BP_META_GROUP_SIZE;
+  constexpr uint32_t g1_rows    = 500;
+  constexpr uint32_t total_rows = group_rows + g1_rows;
+  constexpr T g0_value          = 7;
+  constexpr T g1_frame          = 100;
+  constexpr uint32_t g1_width   = 8;
+
+  std::vector<T> g1_packed(g1_rows);
+  for (uint32_t i = 0; i < g1_rows; ++i)
+    g1_packed[i] = static_cast<T>((i * 3 + 1) & 0xFF);
+
+  auto packed_words           = pack_values<T>(g1_packed, g1_width);
+  size_t const pkd_bytes      = packed_words.size() * sizeof(uint32_t);
+  size_t const g0_data_off    = 8;
+  size_t const g1_data_off    = g0_data_off + sizeof(T);
+  size_t const header_end     = g1_data_off + 2 * sizeof(T) + pkd_bytes;
+  uint64_t const metadata_end = header_end + 2 * sizeof(uint32_t);
+
+  std::vector<uint8_t> bytes(metadata_end, 0);
+  std::memcpy(bytes.data(), &metadata_end, sizeof(uint64_t));
+  std::memcpy(bytes.data() + g0_data_off, &g0_value, sizeof(T));
+  T const width_t = static_cast<T>(g1_width);
+  std::memcpy(bytes.data() + g1_data_off, &g1_frame, sizeof(T));
+  std::memcpy(bytes.data() + g1_data_off + sizeof(T), &width_t, sizeof(T));
+  std::memcpy(bytes.data() + g1_data_off + 2 * sizeof(T), packed_words.data(), pkd_bytes);
+
+  uint32_t const entry0 =
+    (static_cast<uint32_t>(BitpackingMode::CONSTANT) << 24) | static_cast<uint32_t>(g0_data_off);
+  uint32_t const entry1 =
+    (static_cast<uint32_t>(BitpackingMode::FOR) << 24) | static_cast<uint32_t>(g1_data_off);
+  std::memcpy(bytes.data() + metadata_end - 4, &entry0, sizeof(uint32_t));
+  std::memcpy(bytes.data() + metadata_end - 8, &entry1, sizeof(uint32_t));
+
+  auto out = decode_one<int32_t>(bytes, I32, total_rows);
+  for (uint32_t i = 0; i < group_rows; ++i)
+    REQUIRE(out[i] == g0_value);
+  for (uint32_t i = 0; i < g1_rows; ++i)
+    REQUIRE(out[group_rows + i] == g1_frame + g1_packed[i]);
+}
+
+TEST_CASE(
+  "gpu_decode_table BITPACKING - multi-group segment, group 1 is DELTA_FOR with "
+  "non-trivial delta_offset",
+  "[scan][decode][bitpacking]")
+{
+  // Group 0: CONSTANT. Group 1: DELTA_FOR with a non-zero delta_offset that
+  // gets prefix-summed into every output row. Catches both the multi-group
+  // routing AND the WarpScan + delta_offset bias path on a non-zero
+  // global_row_offset.
+  using T                       = int32_t;
+  constexpr uint32_t group_rows = BP_META_GROUP_SIZE;
+  constexpr uint32_t g1_rows    = 500;
+  constexpr uint32_t total_rows = group_rows + g1_rows;
+  constexpr T g0_value          = 0;
+  constexpr T g1_frame          = 2;
+  constexpr T g1_delta_offset   = 1000;
+  constexpr uint32_t g1_width   = 8;
+
+  std::vector<T> g1_packed(g1_rows);
+  for (uint32_t i = 0; i < g1_rows; ++i)
+    g1_packed[i] = static_cast<T>((i * 5 + 7) & 0xFF);
+
+  auto packed_words           = pack_values<T>(g1_packed, g1_width);
+  size_t const pkd_bytes      = packed_words.size() * sizeof(uint32_t);
+  size_t const g0_data_off    = 8;
+  size_t const g1_data_off    = g0_data_off + sizeof(T);
+  size_t const header_end     = g1_data_off + 3 * sizeof(T) + pkd_bytes;
+  uint64_t const metadata_end = header_end + 2 * sizeof(uint32_t);
+
+  std::vector<uint8_t> bytes(metadata_end, 0);
+  std::memcpy(bytes.data(), &metadata_end, sizeof(uint64_t));
+  std::memcpy(bytes.data() + g0_data_off, &g0_value, sizeof(T));
+  T const width_t = static_cast<T>(g1_width);
+  std::memcpy(bytes.data() + g1_data_off, &g1_frame, sizeof(T));
+  std::memcpy(bytes.data() + g1_data_off + sizeof(T), &width_t, sizeof(T));
+  std::memcpy(bytes.data() + g1_data_off + 2 * sizeof(T), &g1_delta_offset, sizeof(T));
+  std::memcpy(bytes.data() + g1_data_off + 3 * sizeof(T), packed_words.data(), pkd_bytes);
+
+  uint32_t const entry0 =
+    (static_cast<uint32_t>(BitpackingMode::CONSTANT) << 24) | static_cast<uint32_t>(g0_data_off);
+  uint32_t const entry1 =
+    (static_cast<uint32_t>(BitpackingMode::DELTA_FOR) << 24) | static_cast<uint32_t>(g1_data_off);
+  std::memcpy(bytes.data() + metadata_end - 4, &entry0, sizeof(uint32_t));
+  std::memcpy(bytes.data() + metadata_end - 8, &entry1, sizeof(uint32_t));
+
+  auto out = decode_one<int32_t>(bytes, I32, total_rows);
+  for (uint32_t i = 0; i < group_rows; ++i)
+    REQUIRE(out[i] == g0_value);
+
+  // Reference DELTA_FOR: raw[i] = frame + packed[i]; out[i] = delta_offset + sum_{k≤i} raw[k].
+  T running = g1_delta_offset;
+  for (uint32_t i = 0; i < g1_rows; ++i) {
+    running = static_cast<T>(running + g1_frame + g1_packed[i]);
+    REQUIRE(out[group_rows + i] == running);
+  }
+}
+
+TEST_CASE("gpu_decode_table BITPACKING - row_count exactly BP_META_GROUP_SIZE (no partial tail)",
+          "[scan][decode][bitpacking]")
+{
+  // Pins the off-by-one in the kernel's `if (idx >= rc) break` — exactly 2048
+  // rows means every iter of the unpack loop is in-bounds, no tail guard fires.
+  // FOR is chosen because it exercises the cp.async + unpack loop, where an
+  // off-by-one in `rc` would silently mismask the last warp's stores.
+  constexpr uint32_t rc = BP_META_GROUP_SIZE;
+  std::vector<int32_t> deltas(rc);
+  for (uint32_t i = 0; i < rc; ++i)
+    deltas[i] = static_cast<int32_t>(i & 0xFF);
+  auto bytes = make_for_block<int32_t>(100, 8, deltas);
+  auto out   = decode_one<int32_t>(bytes, I32, rc);
+  for (uint32_t i = 0; i < rc; ++i)
+    REQUIRE(out[i] == 100 + static_cast<int32_t>(i & 0xFF));
+}
+
+TEST_CASE("gpu_decode_table BITPACKING - 3-group segment with mixed modes",
+          "[scan][decode][bitpacking]")
+{
+  // Three groups, three different modes. Pins:
+  //   (1) per-CTA mode routing across all three FOR-family paths in one launch,
+  //   (2) metadata trailer indexing at K=2 (kernel reads metadata_end - (K+1)*4
+  //       = metadata_end - 12) — existing multi-group test only goes to K=1.
+  // Layout: group 0 CONSTANT, group 1 FOR, group 2 DELTA_FOR (partial tail).
+  using T                       = int32_t;
+  constexpr uint32_t group_rows = BP_META_GROUP_SIZE;
+  constexpr uint32_t g2_rows    = 500;
+  constexpr uint32_t total_rows = 2 * group_rows + g2_rows;
+
+  constexpr T g0_value        = 7;
+  constexpr T g1_frame        = 100;
+  constexpr uint32_t g1_width = 8;
+  constexpr T g2_frame        = 2;
+  constexpr T g2_delta_offset = 1000;
+  constexpr uint32_t g2_width = 8;
+
+  std::vector<T> g1_packed(group_rows);
+  for (uint32_t i = 0; i < group_rows; ++i)
+    g1_packed[i] = static_cast<T>((i * 3 + 1) & 0xFF);
+  std::vector<T> g2_packed(g2_rows);
+  for (uint32_t i = 0; i < g2_rows; ++i)
+    g2_packed[i] = static_cast<T>((i * 5 + 7) & 0xFF);
+
+  auto g1_packed_words      = pack_values<T>(g1_packed, g1_width);
+  auto g2_packed_words      = pack_values<T>(g2_packed, g2_width);
+  size_t const g1_pkd_bytes = g1_packed_words.size() * sizeof(uint32_t);
+  size_t const g2_pkd_bytes = g2_packed_words.size() * sizeof(uint32_t);
+
+  size_t const g0_data_off = 8;                                           // CONSTANT: 1 T
+  size_t const g1_data_off = g0_data_off + sizeof(T);                     // FOR: 2 T + packed
+  size_t const g2_data_off = g1_data_off + 2 * sizeof(T) + g1_pkd_bytes;  // DELTA_FOR: 3 T + packed
+  size_t const header_end  = g2_data_off + 3 * sizeof(T) + g2_pkd_bytes;
+  uint64_t const metadata_end = header_end + 3 * sizeof(uint32_t);
+
+  std::vector<uint8_t> bytes(metadata_end, 0);
+  std::memcpy(bytes.data(), &metadata_end, sizeof(uint64_t));
+  std::memcpy(bytes.data() + g0_data_off, &g0_value, sizeof(T));
+
+  T const g1_width_t = static_cast<T>(g1_width);
+  std::memcpy(bytes.data() + g1_data_off, &g1_frame, sizeof(T));
+  std::memcpy(bytes.data() + g1_data_off + sizeof(T), &g1_width_t, sizeof(T));
+  std::memcpy(bytes.data() + g1_data_off + 2 * sizeof(T), g1_packed_words.data(), g1_pkd_bytes);
+
+  T const g2_width_t = static_cast<T>(g2_width);
+  std::memcpy(bytes.data() + g2_data_off, &g2_frame, sizeof(T));
+  std::memcpy(bytes.data() + g2_data_off + sizeof(T), &g2_width_t, sizeof(T));
+  std::memcpy(bytes.data() + g2_data_off + 2 * sizeof(T), &g2_delta_offset, sizeof(T));
+  std::memcpy(bytes.data() + g2_data_off + 3 * sizeof(T), g2_packed_words.data(), g2_pkd_bytes);
+
+  uint32_t const entry0 =
+    (static_cast<uint32_t>(BitpackingMode::CONSTANT) << 24) | static_cast<uint32_t>(g0_data_off);
+  uint32_t const entry1 =
+    (static_cast<uint32_t>(BitpackingMode::FOR) << 24) | static_cast<uint32_t>(g1_data_off);
+  uint32_t const entry2 =
+    (static_cast<uint32_t>(BitpackingMode::DELTA_FOR) << 24) | static_cast<uint32_t>(g2_data_off);
+  std::memcpy(bytes.data() + metadata_end - 4, &entry0, sizeof(uint32_t));   // K=0
+  std::memcpy(bytes.data() + metadata_end - 8, &entry1, sizeof(uint32_t));   // K=1
+  std::memcpy(bytes.data() + metadata_end - 12, &entry2, sizeof(uint32_t));  // K=2
+
+  auto out = decode_one<int32_t>(bytes, I32, total_rows);
+  for (uint32_t i = 0; i < group_rows; ++i)
+    REQUIRE(out[i] == g0_value);
+  for (uint32_t i = 0; i < group_rows; ++i)
+    REQUIRE(out[group_rows + i] == g1_frame + g1_packed[i]);
+  T running = g2_delta_offset;
+  for (uint32_t i = 0; i < g2_rows; ++i) {
+    running = static_cast<T>(running + g2_frame + g2_packed[i]);
+    REQUIRE(out[2 * group_rows + i] == running);
+  }
+}
+
+TEST_CASE("gpu_decode_table BITPACKING - DELTA_FOR uint16 small-type prefix-sum",
+          "[scan][decode][bitpacking]")
+{
+  // Lock down the prefix-sum path on a narrower type than int32/int64. uint16
+  // wraps at 65536, so values stay below that; mild deltas prove the unpack +
+  // WarpScan + delta_offset bias chain handles 16-bit accumulators without
+  // truncation in the cub::WarpScan<T> instantiation.
+  using T                  = uint16_t;
+  constexpr uint32_t rc    = 1024;
+  constexpr T frame        = 1;
+  constexpr T delta_offset = 100;
+  constexpr uint32_t width = 8;
+
+  std::vector<T> packed_vals(rc);
+  for (uint32_t i = 0; i < rc; ++i)
+    packed_vals[i] = static_cast<T>((i * 7 + 13) & 0x1F);  // 0..31; max sum ≈ 100 + 1024*32 < 65536
+
+  auto bytes = make_delta_for_block<T>(frame, delta_offset, width, packed_vals);
+  auto out   = decode_one<T>(bytes, U16, rc);
+
+  T running = delta_offset;
+  for (uint32_t i = 0; i < rc; ++i) {
+    running = static_cast<T>(running + frame + packed_vals[i]);
+    REQUIRE(out[i] == running);
+  }
 }
 
 //===----------------------------------------------------------------------===//

@@ -43,7 +43,8 @@
 
 #include <cuda/scan/gpu_native_decode.cuh>
 
-#include <cstddef>
+#include <duckdb/common/vector_size.hpp>
+
 #include <cstdint>
 
 namespace sirius::cuda::scan {
@@ -51,11 +52,16 @@ namespace sirius::cuda::scan {
 /// Number of values per metadata group within a bitpacked segment. Fixed by
 /// DuckDB's on-disk format — every metadata-group entry encodes the mode and
 /// data offset for exactly this many rows (the last group of a segment may
-/// be short).
-inline constexpr uint32_t BP_META_GROUP_SIZE = 2048;
+/// be short). See duckdb/src/storage/compression/bitpacking.cpp. We statically
+/// catch redefinitions of STANDARD_VECTOR_SIZE that break this mirror based on
+/// the definition of BITPACKING_METADATA_GROUP_SIZE there.
+static constexpr uint32_t BP_META_GROUP_SIZE = 2048;
+static_assert(STANDARD_VECTOR_SIZE <= 512 || STANDARD_VECTOR_SIZE == 2048);
 
 /// Mirrors `duckdb::BitpackingMode`. Values must match the encoding DuckDB
-/// writes into the high byte of each 32-bit metadata-group entry.
+/// writes into the high byte of each 32-bit metadata-group entry. See
+/// duckdb/src/include/duckdb/storage/compression/bitpacking.hpp.
+/// KEVIN: the DuckDB enum does not explicitly enumerate -- potential for mismatch.
 enum class BitpackingMode : uint8_t {
   INVALID        = 0,
   AUTO           = 1,
@@ -71,10 +77,6 @@ enum class BitpackingMode : uint8_t {
 ///
 /// `d_output` must be sized for the column's full row count; each segment
 /// writes `seg.row_count` rows starting at `seg.row_offset * type_size`.
-///
-/// All work is enqueued on `stream`. Descriptor staging uses `mr` so the
-/// allocation is tracked by the reservation system rather than a bare
-/// cudaMallocAsync.
 void decode_bitpacking_data(gpu_codec_run const& run,
                             uint8_t* d_output,
                             cudf::data_type type,
