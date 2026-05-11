@@ -18,6 +18,7 @@
 
 #include "config.hpp"
 #include "exec/config.hpp"
+#include "io/object_store_config.hpp"
 #include "op/scan/config.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 
@@ -109,6 +110,14 @@ struct sirius_config {
   }
 
   [[nodiscard]] operator_params& get_operator_params() noexcept { return _operator_params; }
+
+  /// Object-store backend credentials + endpoint. Empty fields disable the
+  /// S3 backend; SiriusContext::initialize() reads this to populate
+  /// scan_manager_config::s3_config before constructing the scan_manager.
+  /// Direct member access (no getter/setter) to keep the test fixture and
+  /// future SET-handler wiring simple — both sides write into this struct
+  /// and SiriusContext consumes it at initialize() time.
+  sirius::io::object_store_config object_store_config{};
 
  private:
   cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};

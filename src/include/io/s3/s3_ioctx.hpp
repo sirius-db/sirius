@@ -19,6 +19,7 @@
 #include "io/io_context.hpp"
 #include "io/s3/credential_provider.hpp"
 
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -28,6 +29,10 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+namespace sirius::exec {
+class static_thread_pool;
+}  // namespace sirius::exec
 
 namespace sirius::io::s3 {
 
@@ -46,6 +51,37 @@ struct s3_ioctx_config {
   std::shared_ptr<credential_provider> creds;
   std::size_t max_connections = 16;
   long request_timeout_s      = 60;
+
+  /// Optional caller-owned thread pool for async paths. When non-null,
+  /// @c host_read_async_io / @c host_read_ranges_async_io /
+  /// @c device_read_async_io schedule work onto this pool's threads. When
+  /// nullptr (default), async paths fall back to per-request
+  /// @c std::thread().detach() — kept for standalone-test scenarios where
+  /// no scan_manager / SiriusContext owns a pool. The s3_ioctx never owns
+  /// or shuts down this pool; lifetime is the caller's responsibility.
+  exec::static_thread_pool* async_thread_pool{nullptr};
+
+  /// Maximum total attempts for retriable HTTP / libcurl failures during
+  /// @c range_get and @c head_object_size. Includes the first attempt
+  /// (so @c max_retry_attempts=1 means no retries). Non-retriable errors
+  /// (4xx except 408/429, @c SignatureDoesNotMatch, @c NoSuchKey, etc.)
+  /// surface immediately regardless of this value.
+  std::size_t max_retry_attempts = 3;
+
+  /// Base backoff between attempts; the wait before attempt N (0-indexed)
+  /// is @c base * 2^N + uniform[0, jitter]. @c base=0 disables both the
+  /// computed backoff and the jitter so retries fire as fast as the
+  /// reactor allows.
+  std::chrono::milliseconds retry_backoff_base = std::chrono::milliseconds{100};
+
+  /// Maximum random jitter added on top of the exponential backoff.
+  std::chrono::milliseconds retry_jitter = std::chrono::milliseconds{50};
+
+  /// Honor server-supplied @c Retry-After header (HTTP 429 / 503) when
+  /// present and well-formed; the parsed value overrides the computed
+  /// backoff for that retry, capped at 30 seconds. Disable for
+  /// deterministic tests.
+  bool honor_retry_after = true;
 };
 
 /**

@@ -24,6 +24,7 @@
 #include "op/scan/parquet_schema_mapping.hpp"
 #include "op/scan/scan_utils.hpp"
 #include "scan_manager/parquet_metadata.hpp"
+#include "scan_manager/sirius_scan_manager.hpp"
 
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/parquet.hpp>
@@ -57,6 +58,36 @@ struct rg_accumulator {
 
 }  // namespace
 
+// Legacy public ctor — no scan_manager. Forwards to the private ctor with
+// nullptr; run_batch falls through to cudf::io::datasource::create for each
+// file (mirrors the pre-multi-ioctx single-ioctx-null behavior).
+parquet_split_provider::parquet_split_provider(
+  duckdb::vector<sirius::logical_type> const& returned_types,
+  std::vector<std::string> const& file_paths,
+  duckdb::vector<duckdb::ColumnIndex> const& column_ids,
+  duckdb::vector<duckdb::idx_t> const& projection_ids,
+  duckdb::vector<std::string> const& names,
+  std::size_t scan_output_arity,
+  duckdb::unique_ptr<duckdb::TableFilterSet> table_filter_set,
+  duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
+  std::size_t approximate_batch_size,
+  std::size_t max_file_processed)
+  : parquet_split_provider(returned_types,
+                           file_paths,
+                           column_ids,
+                           projection_ids,
+                           names,
+                           scan_output_arity,
+                           std::move(table_filter_set),
+                           partition_indices,
+                           approximate_batch_size,
+                           max_file_processed,
+                           static_cast<sirius_scan_manager*>(nullptr))
+{
+}
+
+// New public ctor — reference to scan_manager. Forwards to the private ctor
+// with the reference's address.
 parquet_split_provider::parquet_split_provider(
   duckdb::vector<sirius::logical_type> const& returned_types,
   std::vector<std::string> const& file_paths,
@@ -68,12 +99,39 @@ parquet_split_provider::parquet_split_provider(
   duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
   std::size_t approximate_batch_size,
   std::size_t max_file_processed,
-  std::shared_ptr<sirius::io::sirius_ioctx> io_ctx)
+  sirius_scan_manager& scan_manager)
+  : parquet_split_provider(returned_types,
+                           file_paths,
+                           column_ids,
+                           projection_ids,
+                           names,
+                           scan_output_arity,
+                           std::move(table_filter_set),
+                           partition_indices,
+                           approximate_batch_size,
+                           max_file_processed,
+                           &scan_manager)
+{
+}
+
+// Private delegating ctor — actual init body lives here.
+parquet_split_provider::parquet_split_provider(
+  duckdb::vector<sirius::logical_type> const& returned_types,
+  std::vector<std::string> const& file_paths,
+  duckdb::vector<duckdb::ColumnIndex> const& column_ids,
+  duckdb::vector<duckdb::idx_t> const& projection_ids,
+  duckdb::vector<std::string> const& names,
+  std::size_t scan_output_arity,
+  duckdb::unique_ptr<duckdb::TableFilterSet> table_filter_set,
+  duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
+  std::size_t approximate_batch_size,
+  std::size_t max_file_processed,
+  sirius_scan_manager* scan_manager)
   : _file_paths(file_paths),
     _approximate_batch_size(approximate_batch_size),
     _max_file_processed(max_file_processed),
     _total_files(file_paths.size()),
-    _io_ctx(std::move(io_ctx))
+    _scan_manager(scan_manager)
 {
   // Any non-trivial scan shape — reader-side projection, filter pushdown, or hive-partition
   // injection — needs column names for reader set_column_names / AST name resolution /
@@ -214,17 +272,39 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     }
 
     //===----------Read metadata footers----------===//
-    // When the manager exposes a sirius_ioctx, mint an io_object up-front and
-    // route the footer fetch through sirius_datasource so the same io_object
-    // can be threaded onto every emitted row_group_slice.  Falls through to
-    // cudf's path when the manager was configured with use_sirius_datasource=false.
+    // Per-path ioctx dispatch via scan_manager: each file is independently
+    // routed to its supporting backend (local file → uring_ioctx, s3:// → s3_ioctx).
+    // When the scan_manager is null (rare test fixture) or has no backend
+    // claiming this path, fall through to cudf's path; an unsupported path
+    // with a live scan_manager is a hard error (no backend can read it).
+    //
+    // Path normalization: uring_reactor::supports / create_io_object only
+    // accept bare absolute paths (they call is_regular_file on the raw
+    // string). When the planner gives us a "file://" URI, strip the scheme
+    // BEFORE dispatching so both supports() and create_io_object() see the
+    // bare path. S3 paths are passed through unchanged.
+    auto normalize_path = [](std::string const& p) -> std::string {
+      static constexpr std::string_view kFile = "file://";
+      if (p.size() > kFile.size() && std::string_view{p}.substr(0, kFile.size()) == kFile) {
+        return p.substr(kFile.size());
+      }
+      return p;
+    };
+    auto const lookup_path = normalize_path(file_path);
+    std::shared_ptr<sirius::io::sirius_ioctx> file_io_ctx;
+    if (_scan_manager != nullptr) {
+      file_io_ctx = _scan_manager->io_ctx_shared_for(lookup_path);
+      if (!file_io_ctx) {
+        throw std::runtime_error("[parquet_split_provider] no backend supports path: " + file_path);
+      }
+    }
     std::shared_ptr<sirius::io::sirius_io_object> file_io_object;
     std::unique_ptr<cudf::io::datasource> datasource;
-    if (_io_ctx != nullptr) {
-      file_io_object = _io_ctx->create_io_object(file_path);
-      datasource     = _io_ctx->make_datasource(file_io_object);
+    if (file_io_ctx) {
+      file_io_object = file_io_ctx->create_io_object(lookup_path);
+      datasource     = file_io_ctx->make_datasource(file_io_object);
     } else {
-      datasource = cudf::io::datasource::create(file_path);
+      datasource = cudf::io::datasource::create(lookup_path);
     }
 
     //===----------Parse metadata (with prefetch-cache reuse)----------===//
@@ -312,7 +392,7 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     // surviving row group + footer/trailer.  insert() must use the same
     // merged ranges scan_task computes — the cache only serves reads that
     // are fully covered by an inserted range.
-    if (file_io_object && _io_ctx != nullptr && _io_ctx->cache() != nullptr &&
+    if (file_io_object && file_io_ctx && file_io_ctx->cache() != nullptr &&
         !row_group_indices.empty()) {
       using range_t = cudf::io::text::byte_range_info;
 
@@ -367,12 +447,14 @@ void parquet_split_provider::run_batch(file_batch const& batch,
       // and don't need to re-store it; otherwise we just parsed the footer and
       // hand the freshly-built parquet_metadata to the cache so the next scan
       // of this file can skip the footer fetch.
+      // Use per-file `file_io_ctx` (PR4+5 per-path dispatch) so mixed-backend
+      // batches each route metadata to the right backend's cache.
       std::shared_ptr<sirius::io::sirius_io_object_metadata> metadata_to_store =
         cached_parquet_metadata
           ? nullptr
           : std::static_pointer_cast<sirius::io::sirius_io_object_metadata>(
               std::make_shared<parquet_metadata>(file_metadata, footer_byte_len));
-      _io_ctx->cache()->insert(*file_io_object, std::move(metadata_to_store), ranges);
+      file_io_ctx->cache()->insert(*file_io_object, std::move(metadata_to_store), ranges);
     }
 
     std::vector<cudf::size_type> cur_rgs;
@@ -386,7 +468,7 @@ void parquet_split_provider::run_batch(file_batch const& batch,
                                 std::move(cur_rgs),
                                 cur_uncompressed_bytes,
                                 cur_compressed_bytes,
-                                _io_ctx,
+                                file_io_ctx,
                                 file_io_object);
       // Promote the just-sealed slice's uncompressed bytes into the cross-file accumulator.
       accum.total_uncompressed_bytes += cur_uncompressed_bytes;

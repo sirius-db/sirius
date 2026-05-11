@@ -16,6 +16,7 @@
 
 #include "io/s3/s3_ioctx.hpp"
 
+#include "exec/thread_pool.hpp"
 #include "io/s3/credential_provider.hpp"
 #include "io/s3/s3_io_object.hpp"
 #include "io/sirius_datasource.hpp"
@@ -29,11 +30,15 @@
 #include <curl/curl.h>
 
 #include <algorithm>
+#include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <exception>
 #include <future>
+#include <optional>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -73,58 +78,165 @@ std::size_t curl_write_string(void* ptr, std::size_t size, std::size_t nmemb, vo
 }
 
 // libcurl write callback writing into a caller-supplied flat buffer.
+// Always consumes the full incoming chunk so curl can complete the request
+// (otherwise libcurl reports CURLE_WRITE_ERROR and retry classification
+// loses the underlying HTTP status). Overflow detection happens after the
+// fact via @c total_received vs the requested size — the success path
+// (@c range_get) checks @c written == requested-size and @c total_received
+// == @c written; a discrepancy means the server sent more than requested.
+// For error responses (429 with "slow down" body, etc.), we deliberately
+// drop the body bytes that exceed @c capacity rather than failing the
+// transfer — the retry path doesn't need the error body content.
 struct buf_sink {
   std::uint8_t* dst;
   std::size_t capacity;
   std::size_t written;
+  std::size_t total_received;
 };
 std::size_t curl_write_buf(void* ptr, std::size_t size, std::size_t nmemb, void* userdata)
 {
   auto* sink  = static_cast<buf_sink*>(userdata);
   auto nbytes = size * nmemb;
-  if (sink->written + nbytes > sink->capacity) {
-    // Server returned more than requested; signal error via short write.
-    return 0;
+  auto room   = sink->capacity > sink->written ? sink->capacity - sink->written : std::size_t{0};
+  auto copy   = std::min(nbytes, room);
+  if (copy > 0) {
+    std::memcpy(sink->dst + sink->written, ptr, copy);
+    sink->written += copy;
   }
-  std::memcpy(sink->dst + sink->written, ptr, nbytes);
-  sink->written += nbytes;
+  sink->total_received += nbytes;
   return nbytes;
 }
 
-// libcurl header callback that snags the @c Content-Range value (if present).
-// We use it to verify a 206 response actually covers the byte range we asked
-// for, rather than trusting the server to honor Range silently.
+// libcurl header callback that snags the @c Content-Range (for 206 validation)
+// and @c Retry-After (for retry backoff override on 429 / 503) values.
 struct header_capture {
   std::string content_range;
+  std::string retry_after;
 };
+
+// Trim whitespace + trailing CRLF in-place on a string_view.
+std::string_view trim_header_value(std::string_view v)
+{
+  while (!v.empty() && (v.front() == ' ' || v.front() == '\t'))
+    v.remove_prefix(1);
+  while (!v.empty() &&
+         (v.back() == '\r' || v.back() == '\n' || v.back() == ' ' || v.back() == '\t'))
+    v.remove_suffix(1);
+  return v;
+}
+
+// Case-insensitive prefix match of `prefix` on `line`. `prefix` MUST already
+// be lowercase. Returns the trimmed value substring on match, std::nullopt
+// otherwise.
+std::optional<std::string_view> match_header(std::string_view line, std::string_view prefix)
+{
+  if (line.size() < prefix.size()) return std::nullopt;
+  for (std::size_t i = 0; i < prefix.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(line[i])) !=
+        static_cast<unsigned char>(prefix[i])) {
+      return std::nullopt;
+    }
+  }
+  return trim_header_value(line.substr(prefix.size()));
+}
+
 std::size_t curl_header_capture(char* buffer, std::size_t size, std::size_t nmemb, void* userdata)
 {
   auto* hc          = static_cast<header_capture*>(userdata);
   std::size_t total = size * nmemb;
   std::string_view l(buffer, total);
-  // Header lines arrive as "Name: value\r\n". Match Content-Range
-  // case-insensitively (HTTP header names are case-insensitive).
-  static constexpr std::string_view kPrefix = "content-range:";
-  if (l.size() >= kPrefix.size()) {
-    bool match = true;
-    for (std::size_t i = 0; i < kPrefix.size(); ++i) {
-      if (std::tolower(static_cast<unsigned char>(l[i])) !=
-          static_cast<unsigned char>(kPrefix[i])) {
-        match = false;
-        break;
-      }
-    }
-    if (match) {
-      auto v = l.substr(kPrefix.size());
-      while (!v.empty() && (v.front() == ' ' || v.front() == '\t'))
-        v.remove_prefix(1);
-      while (!v.empty() &&
-             (v.back() == '\r' || v.back() == '\n' || v.back() == ' ' || v.back() == '\t'))
-        v.remove_suffix(1);
-      hc->content_range = std::string(v);
-    }
-  }
+  if (auto v = match_header(l, "content-range:")) { hc->content_range = std::string(*v); }
+  if (auto v = match_header(l, "retry-after:")) { hc->retry_after = std::string(*v); }
   return total;
+}
+
+// ---------------------------------------------------------------------------
+// Retry classification + backoff helpers (P2)
+// ---------------------------------------------------------------------------
+
+// HTTP statuses Sirius retries: 408 Request Timeout, 429 Too Many Requests,
+// 5xx server-side. 4xx are deliberately NOT retried (auth / not-found are
+// non-transient; retrying would just delay surfacing the real error).
+bool is_retriable_status(long http_status)
+{
+  if (http_status == 408 || http_status == 429) return true;
+  return http_status >= 500 && http_status < 600;
+}
+
+// libcurl transport-level failures that are usually transient: connection
+// failure, timeout, mid-stream drops. Deliberately narrow — protocol errors
+// (CURLE_RECV_ERROR is borderline but included since MinIO under load can
+// drop reads mid-body) are kept retriable; logic errors like
+// CURLE_URL_MALFORMAT are surfaced immediately.
+bool is_retriable_curl_code(CURLcode code)
+{
+  switch (code) {
+    case CURLE_COULDNT_CONNECT:
+    case CURLE_OPERATION_TIMEDOUT:
+    case CURLE_GOT_NOTHING:
+    case CURLE_RECV_ERROR:
+    case CURLE_SEND_ERROR:
+    case CURLE_PARTIAL_FILE:
+    case CURLE_HTTP2_STREAM: return true;
+    default: return false;
+  }
+}
+
+// Parse the seconds form of "Retry-After: <N>". The HTTP-date form is
+// allowed by RFC but rare in S3-compatible stores; treat malformed / date
+// forms as "absent" so the caller falls back to the computed backoff.
+std::optional<std::chrono::milliseconds> parse_retry_after_seconds(std::string_view v)
+{
+  if (v.empty()) return std::nullopt;
+  // Reject obvious non-numeric (HTTP-date form starts with weekday name).
+  for (char c : v) {
+    if (!std::isdigit(static_cast<unsigned char>(c))) return std::nullopt;
+  }
+  try {
+    auto seconds = std::stoull(std::string{v});
+    return std::chrono::milliseconds{seconds * 1000};
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
+// Backoff for retry index N (0 == first retry, after the initial attempt
+// failed): base * 2^N. Jitter added by caller. When base == 0, returns
+// zero — caller can still add a Retry-After override if present.
+std::chrono::milliseconds compute_backoff_base(std::chrono::milliseconds base,
+                                               std::size_t retry_idx)
+{
+  if (base == std::chrono::milliseconds{0}) return std::chrono::milliseconds{0};
+  // Cap exponent at 16 (2^16 ≈ base * 65536) to avoid overflow on long runs.
+  auto shift = std::min<std::size_t>(retry_idx, 16);
+  return base * (1ULL << shift);
+}
+
+std::chrono::milliseconds compute_jitter(std::chrono::milliseconds jitter)
+{
+  if (jitter <= std::chrono::milliseconds{0}) return std::chrono::milliseconds{0};
+  thread_local std::mt19937_64 rng{std::random_device{}()};
+  std::uniform_int_distribution<long long> dist{0, jitter.count()};
+  return std::chrono::milliseconds{dist(rng)};
+}
+
+// Wait between retry attempts. Caller passes the retry index (0 == first
+// retry). If `retry_after` is present and honored, it replaces the
+// computed backoff (capped at 30 seconds). Otherwise base * 2^retry_idx
+// + uniform[0, jitter]. No-op when total wait is zero.
+void sleep_for_retry(std::size_t retry_idx,
+                     std::chrono::milliseconds base,
+                     std::chrono::milliseconds jitter,
+                     std::optional<std::chrono::milliseconds> retry_after)
+{
+  constexpr std::chrono::milliseconds kRetryAfterCap{30 * 1000};
+  std::chrono::milliseconds wait{0};
+  if (retry_after) {
+    wait = std::min(*retry_after, kRetryAfterCap);
+  } else {
+    wait = compute_backoff_base(base, retry_idx) + compute_jitter(jitter);
+  }
+  if (wait > std::chrono::milliseconds{0}) { std::this_thread::sleep_for(wait); }
 }
 
 // Parse "bytes <start>-<end>/<total>" (or "*"). Returns false if malformed.
@@ -298,33 +410,58 @@ void s3_ioctx::release_handle(handle_slot slot)
 
 std::size_t s3_ioctx::head_object_size(std::string_view bucket, std::string_view key)
 {
-  auto slot = acquire_handle();
-  auto* h   = static_cast<CURL*>(slot.easy);
-
   // Auth lives in the URL's query string (X-Amz-Signature etc.); no
-  // Authorization / x-amz-date headers needed.
-  std::string url = _cfg.creds->get_presigned_url(
-    s3_object_ref{std::string{bucket}, std::string{key}}, presign_method::HEAD);
+  // Authorization / x-amz-date headers needed. The presigned URL is freshly
+  // minted each attempt — if a retry crosses the presigner's TTL window the
+  // next attempt still gets a valid URL.
+  auto const max_attempts = std::max<std::size_t>(_cfg.max_retry_attempts, 1);
+  auto slot               = acquire_handle();
+  auto* h                 = static_cast<CURL*>(slot.easy);
 
-  curl_easy_setopt(h, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(h, CURLOPT_NOBODY, 1L);
-  if (_cfg.request_timeout_s > 0) curl_easy_setopt(h, CURLOPT_TIMEOUT, _cfg.request_timeout_s);
+  std::string last_diag;
+  long last_http_code     = 0;
+  CURLcode last_curl_code = CURLE_OK;
 
-  auto rc = curl_easy_perform(h);
-  if (rc != CURLE_OK) {
-    throw std::runtime_error(std::string("s3_ioctx: HEAD failed: ") + curl_easy_strerror(rc));
+  for (std::size_t attempt = 1; attempt <= max_attempts; ++attempt) {
+    curl_easy_reset(h);
+    std::string url = _cfg.creds->get_presigned_url(
+      s3_object_ref{std::string{bucket}, std::string{key}}, presign_method::HEAD);
+    header_capture hc;
+    curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(h, CURLOPT_NOBODY, 1L);
+    curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, curl_header_capture);
+    curl_easy_setopt(h, CURLOPT_HEADERDATA, &hc);
+    if (_cfg.request_timeout_s > 0) curl_easy_setopt(h, CURLOPT_TIMEOUT, _cfg.request_timeout_s);
+
+    last_curl_code = curl_easy_perform(h);
+    last_http_code = 0;
+    curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &last_http_code);
+
+    if (last_curl_code == CURLE_OK && last_http_code >= 200 && last_http_code < 300) {
+      curl_off_t content_len = -1;
+      curl_easy_getinfo(h, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &content_len);
+      if (content_len < 0)
+        throw std::runtime_error("s3_ioctx: HEAD response missing Content-Length");
+      return static_cast<std::size_t>(content_len);
+    }
+
+    bool retriable = (last_curl_code != CURLE_OK && is_retriable_curl_code(last_curl_code)) ||
+                     (last_curl_code == CURLE_OK && is_retriable_status(last_http_code));
+    last_diag = last_curl_code != CURLE_OK
+                  ? std::string{"libcurl "} + curl_easy_strerror(last_curl_code)
+                  : "HTTP " + std::to_string(last_http_code);
+
+    if (!retriable || attempt >= max_attempts) break;
+
+    std::optional<std::chrono::milliseconds> retry_after;
+    if (_cfg.honor_retry_after) { retry_after = parse_retry_after_seconds(hc.retry_after); }
+    sleep_for_retry(attempt - 1, _cfg.retry_backoff_base, _cfg.retry_jitter, retry_after);
   }
-  long http_code = 0;
-  curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &http_code);
-  if (http_code < 200 || http_code >= 300) {
-    std::ostringstream os;
-    os << "s3_ioctx: HEAD " << bucket << "/" << key << " returned HTTP " << http_code;
-    throw std::runtime_error(os.str());
-  }
-  curl_off_t content_len = -1;
-  curl_easy_getinfo(h, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &content_len);
-  if (content_len < 0) throw std::runtime_error("s3_ioctx: HEAD response missing Content-Length");
-  return static_cast<std::size_t>(content_len);
+
+  std::ostringstream os;
+  os << "s3_ioctx: HEAD " << bucket << "/" << key << " failed after " << max_attempts
+     << " attempt(s); last: " << last_diag;
+  throw std::runtime_error(os.str());
 }
 
 std::size_t s3_ioctx::range_get(std::string_view bucket,
@@ -334,74 +471,105 @@ std::size_t s3_ioctx::range_get(std::string_view bucket,
                                 std::uint8_t* dst)
 {
   if (size == 0) return 0;
-  auto slot = acquire_handle();
-  auto* h   = static_cast<CURL*>(slot.easy);
+  auto const max_attempts = std::max<std::size_t>(_cfg.max_retry_attempts, 1);
+  auto slot               = acquire_handle();
+  auto* h                 = static_cast<CURL*>(slot.easy);
 
-  // Auth lives in the URL's query string; we only attach the Range header,
-  // which the presigned URL deliberately leaves unsigned (SignedHeaders=host
-  // only) so callers may add Range / Accept / etc. without breaking the
-  // signature.
-  std::string url = _cfg.creds->get_presigned_url(
-    s3_object_ref{std::string{bucket}, std::string{key}}, presign_method::GET);
+  std::string last_diag;
+  long last_http_code     = 0;
+  CURLcode last_curl_code = CURLE_OK;
 
-  std::ostringstream range_os;
-  range_os << "Range: bytes=" << offset << "-" << (offset + size - 1);
-  std::string range_header = range_os.str();
-  curl_slist* hdrs         = curl_slist_append(nullptr, range_header.c_str());
+  for (std::size_t attempt = 1; attempt <= max_attempts; ++attempt) {
+    curl_easy_reset(h);
 
-  buf_sink sink{dst, size, 0};
-  header_capture hc;
-  curl_easy_setopt(h, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(h, CURLOPT_HTTPGET, 1L);
-  curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdrs);
-  curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, curl_write_buf);
-  curl_easy_setopt(h, CURLOPT_WRITEDATA, &sink);
-  curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, curl_header_capture);
-  curl_easy_setopt(h, CURLOPT_HEADERDATA, &hc);
-  if (_cfg.request_timeout_s > 0) curl_easy_setopt(h, CURLOPT_TIMEOUT, _cfg.request_timeout_s);
+    // Auth lives in the URL's query string; we only attach the Range header,
+    // which the presigned URL deliberately leaves unsigned (SignedHeaders=host
+    // only) so callers may add Range / Accept / etc. without breaking the
+    // signature.
+    std::string url = _cfg.creds->get_presigned_url(
+      s3_object_ref{std::string{bucket}, std::string{key}}, presign_method::GET);
 
-  auto rc = curl_easy_perform(h);
-  curl_slist_free_all(hdrs);
-  if (rc != CURLE_OK) {
-    throw std::runtime_error(std::string("s3_ioctx: GET failed: ") + curl_easy_strerror(rc));
-  }
-  long http_code = 0;
-  curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &http_code);
+    std::ostringstream range_os;
+    range_os << "Range: bytes=" << offset << "-" << (offset + size - 1);
+    std::string range_header = range_os.str();
+    curl_slist* hdrs         = curl_slist_append(nullptr, range_header.c_str());
 
-  // Validate the response actually covers the byte range we asked for. A
-  // misbehaving / non-Range-aware store could otherwise hand us bytes from
-  // the wrong offset under a 200 response and we'd silently feed corrupt
-  // data into the parquet reader.
-  auto fail = [&](std::string_view why) {
-    std::ostringstream os;
-    os << "s3_ioctx: GET " << bucket << "/" << key << " offset=" << offset << " size=" << size
-       << " returned HTTP " << http_code << "; " << why;
-    if (!hc.content_range.empty()) os << " (Content-Range: " << hc.content_range << ")";
-    throw std::runtime_error(os.str());
-  };
+    buf_sink sink{dst, size, 0, 0};
+    header_capture hc;
+    curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(h, CURLOPT_HTTPGET, 1L);
+    curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdrs);
+    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, curl_write_buf);
+    curl_easy_setopt(h, CURLOPT_WRITEDATA, &sink);
+    curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, curl_header_capture);
+    curl_easy_setopt(h, CURLOPT_HEADERDATA, &hc);
+    if (_cfg.request_timeout_s > 0) curl_easy_setopt(h, CURLOPT_TIMEOUT, _cfg.request_timeout_s);
 
-  if (http_code == 206) {
-    if (sink.written != size)
-      fail("206 body length " + std::to_string(sink.written) + " != requested size");
-    if (!hc.content_range.empty()) {
-      std::size_t got_start = 0;
-      std::size_t got_end   = 0;
-      if (!parse_content_range(hc.content_range, got_start, got_end))
-        fail("malformed Content-Range");
-      if (got_start != offset || got_end - got_start + 1 != size) fail("Content-Range mismatch");
+    last_curl_code = curl_easy_perform(h);
+    curl_slist_free_all(hdrs);
+    last_http_code = 0;
+    curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &last_http_code);
+
+    if (last_curl_code == CURLE_OK) {
+      // Validate the response actually covers the byte range we asked for.
+      // A misbehaving / non-Range-aware store could otherwise hand us bytes
+      // from the wrong offset under a 200 response and we'd silently feed
+      // corrupt data into the parquet reader.
+      auto fail = [&](std::string_view why) {
+        std::ostringstream os;
+        os << "s3_ioctx: GET " << bucket << "/" << key << " offset=" << offset << " size=" << size
+           << " returned HTTP " << last_http_code << "; " << why;
+        if (!hc.content_range.empty()) os << " (Content-Range: " << hc.content_range << ")";
+        throw std::runtime_error(os.str());
+      };
+
+      if (last_http_code == 206) {
+        // sink.written == bytes copied into dst (capped at requested size);
+        // sink.total_received == bytes server actually delivered. Mismatch
+        // between total_received and the requested size flags either short
+        // body (server hung up early) or overflow (server sent more than
+        // asked). Both are anomalies on a 206.
+        if (sink.total_received != size || sink.written != size)
+          fail("206 body length " + std::to_string(sink.total_received) + " != requested size");
+        if (!hc.content_range.empty()) {
+          std::size_t got_start = 0;
+          std::size_t got_end   = 0;
+          if (!parse_content_range(hc.content_range, got_start, got_end))
+            fail("malformed Content-Range");
+          if (got_start != offset || got_end - got_start + 1 != size)
+            fail("Content-Range mismatch");
+        }
+        return sink.written;
+      }
+      if (last_http_code == 200) {
+        // Some stores collapse a small ranged GET to a 200 with the full body.
+        // Only accept that when the request started at offset 0 *and* the body
+        // we got happens to match the requested length — both conditions guard
+        // against silently grabbing the head of an object when we asked for an
+        // interior range. Otherwise treat as a non-retriable response anomaly.
+        if (offset != 0 || sink.total_received != size)
+          fail("server returned 200 (no Range honored)");
+        return sink.written;
+      }
     }
-  } else if (http_code == 200) {
-    // Some stores collapse a small ranged GET to a 200 with the full body.
-    // Only accept that when the request started at offset 0 *and* the body
-    // we got happens to match the requested length — both conditions guard
-    // against silently grabbing the head of an object when we asked for an
-    // interior range.
-    if (offset != 0 || sink.written != size)
-      fail("server returned 200 (no Range honored) for ranged request");
-  } else {
-    fail("unexpected status");
+
+    bool retriable = (last_curl_code != CURLE_OK && is_retriable_curl_code(last_curl_code)) ||
+                     (last_curl_code == CURLE_OK && is_retriable_status(last_http_code));
+    last_diag = last_curl_code != CURLE_OK
+                  ? std::string{"libcurl "} + curl_easy_strerror(last_curl_code)
+                  : "HTTP " + std::to_string(last_http_code);
+
+    if (!retriable || attempt >= max_attempts) break;
+
+    std::optional<std::chrono::milliseconds> retry_after;
+    if (_cfg.honor_retry_after) { retry_after = parse_retry_after_seconds(hc.retry_after); }
+    sleep_for_retry(attempt - 1, _cfg.retry_backoff_base, _cfg.retry_jitter, retry_after);
   }
-  return sink.written;
+
+  std::ostringstream os;
+  os << "s3_ioctx: GET " << bucket << "/" << key << " offset=" << offset << " size=" << size
+     << " failed after " << max_attempts << " attempt(s); last: " << last_diag;
+  throw std::runtime_error(os.str());
 }
 
 // ===========================================================================
@@ -423,19 +591,30 @@ std::size_t s3_ioctx::host_read_io(sirius_io_object& obj,
 
 namespace {
 
-void dispatch_async(io_completion_handler handler, std::function<std::size_t()> op)
+// Dispatch an async I/O completion onto either an injected static_thread_pool
+// (preferred — scan_manager / SiriusContext wires the pool's lifetime to the
+// engine) or a detached worker (fallback for standalone-test scenarios where
+// no scan_manager owns a pool). Either path invokes the handler exactly once
+// with either (bytes_written, nullptr) on success or (0, exception_ptr) on
+// throw. The s3_ioctx never owns the pool — it's caller-controlled and
+// outlives the ioctx.
+void dispatch_async(exec::static_thread_pool* pool,
+                    io_completion_handler handler,
+                    std::function<std::size_t()> op)
 {
-  // Fire-and-forget worker thread. Exceptions from @p op are routed through
-  // the handler as (0, exception_ptr). The base class contract is that the
-  // handler is invoked exactly once on completion.
-  std::thread([handler = std::move(handler), op = std::move(op)]() mutable {
+  auto task = [handler = std::move(handler), op = std::move(op)]() mutable {
     try {
       auto bytes = op();
       handler(bytes, nullptr);
     } catch (...) {
       handler(0, std::current_exception());
     }
-  }).detach();
+  };
+  if (pool != nullptr) {
+    pool->schedule(std::move(task));
+  } else {
+    std::thread(std::move(task)).detach();
+  }
 }
 
 }  // namespace
@@ -452,9 +631,10 @@ void s3_ioctx::host_read_async_io(sirius_io_object& obj,
   // the future resolves would leave us with dangling `this` / `&obj`.
   auto self      = shared_from_this();
   auto obj_owner = obj.shared_from_this();
-  dispatch_async(std::move(handler), [self, obj_owner, offset, size, dst]() {
-    return self->host_read_io(*obj_owner, offset, size, dst);
-  });
+  dispatch_async(
+    _cfg.async_thread_pool, std::move(handler), [self, obj_owner, offset, size, dst]() {
+      return self->host_read_io(*obj_owner, offset, size, dst);
+    });
 }
 
 void s3_ioctx::host_read_ranges_async_io(sirius_io_object& obj,
@@ -472,7 +652,8 @@ void s3_ioctx::host_read_ranges_async_io(sirius_io_object& obj,
   // underlying host_span entries. The byte buffers each host_span points at
   // remain caller-owned until the handler fires (standard async-I/O contract).
   std::vector<cudf::host_span<std::byte>> dst_owned(dst.begin(), dst.end());
-  dispatch_async(std::move(handler),
+  dispatch_async(_cfg.async_thread_pool,
+                 std::move(handler),
                  [self, obj_owner, ranges, dst_owned = std::move(dst_owned)]() mutable {
                    return self->host_read_ranges_impl(*obj_owner, ranges, dst_owned);
                  });
@@ -547,9 +728,10 @@ void s3_ioctx::device_read_async_io(sirius_io_object& obj,
   // detached worker (see host_read_async_io).
   auto self      = shared_from_this();
   auto obj_owner = obj.shared_from_this();
-  dispatch_async(std::move(handler), [self, obj_owner, offset, size, dst, stream]() {
-    return self->device_read_io(*obj_owner, offset, size, dst, stream);
-  });
+  dispatch_async(
+    _cfg.async_thread_pool, std::move(handler), [self, obj_owner, offset, size, dst, stream]() {
+      return self->device_read_io(*obj_owner, offset, size, dst, stream);
+    });
 }
 
 // ===========================================================================

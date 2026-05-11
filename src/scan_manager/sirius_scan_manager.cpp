@@ -18,6 +18,7 @@
 
 #include "exec/thread_pool.hpp"
 #include "io/prefetching_cache.hpp"
+#include "io/s3/s3_ioctx.hpp"
 #include "io/uring/uring_ioctx.hpp"
 #include "log/logging.hpp"
 #include "op/scan/parquet_scan_info.hpp"
@@ -50,48 +51,134 @@ sirius_scan_manager::sirius_scan_manager(
     _dispatcher(
       std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads))
 {
+  std::shared_ptr<sirius::io::sirius_ioctx> uring_ctx;
   if (_config.use_sirius_datasource) {
     if (host_mr == nullptr) {
       throw std::runtime_error(
         "[sirius_scan_manager] use_sirius_datasource is true but no host "
         "fixed_size_host_memory_resource was provided");
     }
-    _io_ctx = std::make_shared<sirius::io::uring_ioctx>(
+    // Combine HEAD's new ctor signature (FSMR-aware, n_reactors first) with
+    // PR4+5's multi-ioctx vector storage. _io_ctxs[0] is the uring backend.
+    uring_ctx = std::make_shared<sirius::io::uring_ioctx>(
       _config.uring_n_reactors, _config.uring_ring_entries, *host_mr);
+    _io_ctxs.push_back(uring_ctx);
     SIRIUS_LOG_DEBUG(
       "[sirius_scan_manager] sirius_datasource enabled (uring_ioctx n_reactors={} ring_entries={})",
       _config.uring_n_reactors,
       _config.uring_ring_entries);
-
-    if (_config.enable_prefetch_cache) {
-      // Slab size = CHUNKS_PER_SLAB blocks at the resource's block size.
-      // Round the byte budget up so the user gets at least what they asked for.
-      auto const slab_bytes = host_mr->get_block_size() *
-                              static_cast<std::size_t>(sirius::io::buffer_pool::CHUNKS_PER_SLAB);
-      auto const max_slabs =
-        static_cast<uint32_t>((_config.prefetch_buffer_pool_bytes + slab_bytes - 1) / slab_bytes);
-      _buffer_pool = std::make_unique<sirius::io::buffer_pool>(*host_mr, max_slabs);
-      _io_ctx->initialize_cache(*_buffer_pool, _config.prefetch_inflight_budget_chunks);
-      SIRIUS_LOG_DEBUG(
-        "[sirius_scan_manager] prefetch cache enabled (slabs={} budget_bytes={} "
-        "inflight_chunks={})",
-        max_slabs,
-        max_slabs * slab_bytes,
-        _config.prefetch_inflight_budget_chunks);
-    }
+    // Cache initialization moved to AFTER s3_ioctx construction (line ~120+)
+    // so all _io_ctxs share the same buffer_pool. Uses host_mr->get_block_size()
+    // for slab sizing per Amin's d95f43a2 dynamic chunk size.
   } else {
     SIRIUS_LOG_DEBUG(
       "[sirius_scan_manager] sirius_datasource disabled — falling back to "
       "cudf::io::datasource::create");
   }
+
+  // Construct the S3 backend on top of the local-file backend. Order matters:
+  // io_ctx_for() walks _io_ctxs and returns the first match, so the local
+  // backend (which supports file:// and bare absolute paths) is tried before
+  // S3 (which only claims s3:// prefixes). Cross-claim is impossible since
+  // their supports() are disjoint, but order keeps lookup deterministic.
+  if (_config.s3_config) {
+    // S3 async paths need a caller-owned thread pool to avoid per-request
+    // detached std::thread fallback. Construct it BEFORE the s3_ioctx and
+    // inject via s3_ioctx_config::async_thread_pool.
+    _s3_thread_pool =
+      std::make_unique<exec::static_thread_pool>(_config.s3_thread_pool.num_threads,
+                                                 _config.s3_thread_pool.thread_name_prefix,
+                                                 _config.s3_thread_pool.cpu_affinity_list);
+    auto s3_cfg              = *_config.s3_config;
+    s3_cfg.async_thread_pool = _s3_thread_pool.get();
+    auto s3_ctx              = std::make_shared<sirius::io::s3::s3_ioctx>(std::move(s3_cfg));
+    _io_ctxs.push_back(s3_ctx);
+    SIRIUS_LOG_DEBUG("[sirius_scan_manager] s3 backend enabled (s3_thread_pool num_threads={})",
+                     _config.s3_thread_pool.num_threads);
+  }
+
+  if (_config.enable_prefetch_cache && !_io_ctxs.empty()) {
+    if (host_mr == nullptr) {
+      throw std::runtime_error(
+        "[sirius_scan_manager] enable_prefetch_cache is true but no host "
+        "fixed_size_host_memory_resource was provided");
+    }
+    auto const slab_bytes =
+      host_mr->get_block_size() * static_cast<std::size_t>(sirius::io::buffer_pool::CHUNKS_PER_SLAB);
+    auto const max_slabs =
+      static_cast<uint32_t>((_config.prefetch_buffer_pool_bytes + slab_bytes - 1) / slab_bytes);
+    _buffer_pool = std::make_unique<sirius::io::buffer_pool>(*host_mr, max_slabs);
+    for (auto& ctx : _io_ctxs) {
+      ctx->initialize_cache(*_buffer_pool, _config.prefetch_inflight_budget_chunks);
+    }
+    SIRIUS_LOG_DEBUG(
+      "[sirius_scan_manager] prefetch cache enabled (slabs={} budget_bytes={} "
+      "inflight_chunks={})",
+      max_slabs,
+      max_slabs * slab_bytes,
+      _config.prefetch_inflight_budget_chunks);
+  }
 }
 
 sirius_scan_manager::~sirius_scan_manager()
 {
-  if (_io_ctx && _io_ctx->cache() != nullptr) {
-    SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _io_ctx->cache()->summary());
+  for (auto const& ctx : _io_ctxs) {
+    if (ctx && ctx->cache() != nullptr) {
+      SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", ctx->cache()->summary());
+    }
   }
   stop();
+}
+
+namespace {
+
+// Walk @c ioctxs and return the first @c ctx whose @c supports(path) is
+// true, or nullptr. Also tries with @c "file://" prefix stripped because
+// @c uring_reactor::supports (from #740) calls @c is_regular_file on the
+// raw input — so it accepts bare absolute paths but not @c file:// URIs.
+// Stripping at the dispatch layer keeps #740's code untouched and works
+// for the both-shape inputs Sirius's parquet plans can produce.
+template <typename Container, typename Out>
+Out lookup_supporting(Container const& ioctxs,
+                      std::string_view path,
+                      Out (*get_value)(typename Container::value_type const&))
+{
+  for (auto const& ctx : ioctxs) {
+    if (ctx && ctx->supports(path)) return get_value(ctx);
+  }
+  constexpr std::string_view kFileScheme = "file://";
+  if (path.size() > kFileScheme.size() && path.substr(0, kFileScheme.size()) == kFileScheme) {
+    auto bare = path.substr(kFileScheme.size());
+    for (auto const& ctx : ioctxs) {
+      if (ctx && ctx->supports(bare)) return get_value(ctx);
+    }
+  }
+  return Out{};
+}
+
+sirius::io::sirius_ioctx* raw_ptr(std::shared_ptr<sirius::io::sirius_ioctx> const& ctx)
+{
+  return ctx.get();
+}
+
+std::shared_ptr<sirius::io::sirius_ioctx> shared_copy(
+  std::shared_ptr<sirius::io::sirius_ioctx> const& ctx)
+{
+  return ctx;
+}
+
+}  // namespace
+
+sirius::io::sirius_ioctx* sirius_scan_manager::io_ctx_for(std::string_view path) const noexcept
+{
+  return lookup_supporting<decltype(_io_ctxs), sirius::io::sirius_ioctx*>(_io_ctxs, path, raw_ptr);
+}
+
+std::shared_ptr<sirius::io::sirius_ioctx> sirius_scan_manager::io_ctx_shared_for(
+  std::string_view path) const noexcept
+{
+  return lookup_supporting<decltype(_io_ctxs), std::shared_ptr<sirius::io::sirius_ioctx>>(
+    _io_ctxs, path, shared_copy);
 }
 
 void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
@@ -99,8 +186,13 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
   reset();
 
   // Advance the cache age so the evictor can score this query's inserts
-  // against entries left over from prior queries.
-  if (_io_ctx && _io_ctx->cache()) { _io_ctx->cache()->refresh_cache(); }
+  // against entries left over from prior queries. The buffer_pool (and the
+  // prefetching_cache on each ioctx that draws from it) is shared across all
+  // registered backends, so refreshing one cache covers all of them — but
+  // calling refresh on each is safe and explicit; pick whichever has one.
+  for (auto const& ctx : _io_ctxs) {
+    if (ctx && ctx->cache()) { ctx->cache()->refresh_cache(); }
+  }
 
   SIRIUS_LOG_DEBUG("[sirius_scan_manager::prepare_for_query] pipelines={}",
                    query.get_pipelines().size());
@@ -274,7 +366,7 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
     info->partition_indices,
     info->approximate_batch_size,
     parquet_split_provider::DEFAULT_MAX_FILE_PROCESSED,
-    _io_ctx);
+    *this);
 }
 
 void sirius_scan_manager::start_metadata_processing()
@@ -315,6 +407,17 @@ void sirius_scan_manager::start() {}
 void sirius_scan_manager::stop()
 {
   reset();
+  // Shut down ioctx FIRST (drains in-flight HTTP / uring submissions) so
+  // their async workers don't try to submit work to a stopped thread pool
+  // after we stop it below. shutdown() is idempotent on s3_ioctx; uring_ioctx
+  // matches that contract per #740's base class.
+  for (auto& ctx : _io_ctxs) {
+    if (ctx) { ctx->shutdown(); }
+  }
+  // Stop the S3 thread pool BEFORE the main thread pool — its workers run
+  // detached completion handlers that may indirectly enqueue work onto
+  // _thread_pool. Stopping S3 first prevents that interleaving.
+  if (_s3_thread_pool) { _s3_thread_pool->stop(); }
   _thread_pool.stop();
 }
 

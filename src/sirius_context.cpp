@@ -22,6 +22,9 @@
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "io/s3/s3_ioctx.hpp"
+#include "io/s3/sirius_sigv4_credential_provider.hpp"
+#include "io/s3/static_credentials.hpp"
 #include "log/logging.hpp"
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
@@ -307,8 +310,30 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   task_creator_->set_task_scheduler(*task_scheduler_);
   task_scheduler_->set_task_creator(*task_creator_);
 
-  scan_manager_ = std::make_unique<sirius::scan_manager::sirius_scan_manager>(
-    config_.get_scan_manager_config(), host_fsmr);
+  // Compose the scan_manager_config: start from the engine's default
+  // (uring + prefetch knobs) and layer the S3 backend on top when the
+  // object_store_config has all the required fields. Empty fields keep
+  // the S3 backend disabled — the default scan_manager_config has
+  // s3_config == std::nullopt and the scan_manager skips s3_ioctx
+  // construction. The FSMR is passed through to uring_ioctx / buffer_pool.
+  auto sm_config = config_.get_scan_manager_config();
+  if (!config_.object_store_config.endpoint.empty() &&
+      !config_.object_store_config.access_key.empty() &&
+      !config_.object_store_config.secret_key.empty()) {
+    sirius::io::s3::static_credentials creds;
+    creds.access_key_id     = config_.object_store_config.access_key;
+    creds.secret_access_key = config_.object_store_config.secret_key;
+    auto provider           = std::make_shared<sirius::io::s3::sirius_sigv4_credential_provider>(
+      std::move(creds),
+      config_.object_store_config.region,
+      config_.object_store_config.endpoint,
+      std::chrono::minutes{5});
+    sirius::io::s3::s3_ioctx_config s3_cfg{};
+    s3_cfg.creds        = std::move(provider);
+    sm_config.s3_config = std::move(s3_cfg);
+  }
+  scan_manager_ = std::make_unique<sirius::scan_manager::sirius_scan_manager>(std::move(sm_config),
+                                                                              host_fsmr);
 
   // Wire the pipeline task queue into downgrade executors now that task_scheduler_
   // has been constructed.

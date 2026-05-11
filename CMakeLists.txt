@@ -400,6 +400,7 @@ set(TEST_SOURCES
     test/cpp/io/test_uri_parser.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
+    test/cpp/integration/test_scan_manager_s3_end_to_end.cpp
     test/cpp/integration/test_transparent_execution.cpp
     test/cpp/memory/test_host_table_utils.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
@@ -440,9 +441,11 @@ set(TEST_SOURCES
     test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_scan_task.cpp
     test/cpp/scan/test_parquet_split_provider.cpp
+    test/cpp/scan/test_parquet_split_provider_s3.cpp
     test/cpp/scan/test_partition_inject.cpp
     test/cpp/scan/test_scan_executor.cpp
     test/cpp/scan/test_split_connector.cpp
+    test/cpp/scan_manager/test_sirius_scan_manager_s3.cpp
     test/cpp/unittest.cpp
     test/cpp/utils/sirius_test_env.cpp
     test/cpp/utils/utils.cpp)

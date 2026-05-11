@@ -15,6 +15,7 @@
  */
 
 #include "catch.hpp"
+#include "exec/thread_pool.hpp"
 #include "io/io_errors.hpp"
 #include "io/s3/credential_provider.hpp"
 #include "io/s3/mock_credential_provider.hpp"
@@ -25,12 +26,23 @@
 #include <cudf/io/text/byte_range_info.hpp>
 #include <cudf/utilities/span.hpp>
 
+#include <rmm/cuda_stream.hpp>
+#include <rmm/cuda_stream_view.hpp>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -40,9 +52,11 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -255,6 +269,195 @@ class blocking_first_get_provider final : public credential_provider {
   std::atomic<bool> _blocked_first_get{false};
 };
 
+std::string current_thread_name()
+{
+  std::array<char, 16> name{};
+  if (pthread_getname_np(pthread_self(), name.data(), name.size()) != 0) { return {}; }
+  return std::string{name.data()};
+}
+
+struct async_observation {
+  std::size_t bytes{0};
+  std::exception_ptr error;
+  std::string thread_name;
+};
+
+template <typename Launch>
+async_observation observe_async_completion(Launch&& launch)
+{
+  auto done = std::make_shared<std::promise<async_observation>>();
+  auto fut  = done->get_future();
+  launch([done](std::size_t bytes, std::exception_ptr ep) {
+    done->set_value(async_observation{bytes, ep, current_thread_name()});
+  });
+  REQUIRE(fut.wait_for(5s) == std::future_status::ready);
+  return fut.get();
+}
+
+struct scripted_http_response {
+  long status{200};
+  std::string reason{"OK"};
+  std::vector<std::string> headers;
+  std::string body;
+  bool close_without_response{false};
+};
+
+std::string serialize(scripted_http_response const& response)
+{
+  std::ostringstream out;
+  out << "HTTP/1.1 " << response.status << " " << response.reason << "\r\n";
+
+  bool has_content_length = false;
+  bool has_connection     = false;
+  for (auto const& header : response.headers) {
+    has_content_length = has_content_length || header.rfind("Content-Length:", 0) == 0;
+    has_connection     = has_connection || header.rfind("Connection:", 0) == 0;
+    out << header << "\r\n";
+  }
+  if (!has_content_length) { out << "Content-Length: " << response.body.size() << "\r\n"; }
+  if (!has_connection) { out << "Connection: close\r\n"; }
+  out << "\r\n" << response.body;
+  return out.str();
+}
+
+void send_all(int fd, std::string const& payload)
+{
+  auto const* data      = payload.data();
+  std::size_t remaining = payload.size();
+  while (remaining > 0) {
+    auto sent = ::send(fd, data, remaining, 0);
+    if (sent <= 0) { return; }
+    data += sent;
+    remaining -= static_cast<std::size_t>(sent);
+  }
+}
+
+class scripted_http_server {
+ public:
+  explicit scripted_http_server(std::vector<scripted_http_response> responses)
+    : _responses(std::move(responses))
+  {
+    _listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(_listen_fd >= 0);
+
+    int opt = 1;
+    REQUIRE(::setsockopt(_listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == 0);
+
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port        = 0;
+
+    REQUIRE(::bind(_listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+    REQUIRE(::listen(_listen_fd, 16) == 0);
+
+    sockaddr_in bound{};
+    socklen_t len = sizeof(bound);
+    REQUIRE(::getsockname(_listen_fd, reinterpret_cast<sockaddr*>(&bound), &len) == 0);
+    _port = ntohs(bound.sin_port);
+
+    _thread = std::thread([this] { serve(); });
+  }
+
+  ~scripted_http_server()
+  {
+    _stop.store(true, std::memory_order_relaxed);
+    if (_listen_fd >= 0) {
+      ::shutdown(_listen_fd, SHUT_RDWR);
+      ::close(_listen_fd);
+      _listen_fd = -1;
+    }
+    if (_thread.joinable()) { _thread.join(); }
+  }
+
+  std::string url(std::string_view path = "/object") const
+  {
+    return "http://127.0.0.1:" + std::to_string(_port) + std::string{path};
+  }
+
+  std::size_t request_count() const noexcept { return _request_count.load(); }
+
+ private:
+  void serve()
+  {
+    while (!_stop.load(std::memory_order_relaxed)) {
+      sockaddr_in client_addr{};
+      socklen_t client_len = sizeof(client_addr);
+      int client = ::accept(_listen_fd, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
+      if (client < 0) { return; }
+
+      ++_request_count;
+      read_request(client);
+
+      auto const index = _next_response.fetch_add(1);
+      scripted_http_response response;
+      if (index < _responses.size()) {
+        response = _responses[index];
+      } else if (!_responses.empty()) {
+        response = _responses.back();
+      }
+
+      if (!response.close_without_response) { send_all(client, serialize(response)); }
+      ::shutdown(client, SHUT_RDWR);
+      ::close(client);
+    }
+  }
+
+  void read_request(int client)
+  {
+    std::string request;
+    std::array<char, 1024> buffer{};
+    while (request.find("\r\n\r\n") == std::string::npos && request.size() < 8192) {
+      auto got = ::recv(client, buffer.data(), buffer.size(), 0);
+      if (got <= 0) { break; }
+      request.append(buffer.data(), static_cast<std::size_t>(got));
+    }
+  }
+
+  std::vector<scripted_http_response> _responses;
+  int _listen_fd{-1};
+  std::uint16_t _port{0};
+  std::atomic<std::size_t> _next_response{0};
+  std::atomic<std::size_t> _request_count{0};
+  std::atomic<bool> _stop{false};
+  std::thread _thread;
+};
+
+scripted_http_response http_error(long status, std::string reason, std::string body = {})
+{
+  return scripted_http_response{status, std::move(reason), {}, std::move(body)};
+}
+
+scripted_http_response range_ok(std::string body, std::size_t object_size)
+{
+  auto const end = body.empty() ? 0 : body.size() - 1;
+  return scripted_http_response{
+    206,
+    "Partial Content",
+    {"Content-Range: bytes 0-" + std::to_string(end) + "/" + std::to_string(object_size)},
+    std::move(body)};
+}
+
+scripted_http_response head_ok(std::size_t object_size)
+{
+  return scripted_http_response{200, "OK", {"Content-Length: " + std::to_string(object_size)}, ""};
+}
+
+std::shared_ptr<s3_ioctx> make_retry_ioctx(std::string url,
+                                           std::size_t attempts,
+                                           std::chrono::milliseconds base   = 0ms,
+                                           std::chrono::milliseconds jitter = 0ms,
+                                           bool honor_retry_after           = false)
+{
+  auto provider = std::make_shared<mock_credential_provider>(std::move(url));
+  s3_ioctx_config cfg{provider, 1, 1};
+  cfg.max_retry_attempts = attempts;
+  cfg.retry_backoff_base = base;
+  cfg.retry_jitter       = jitter;
+  cfg.honor_retry_after  = honor_retry_after;
+  return std::make_shared<s3_ioctx>(std::move(cfg));
+}
+
 }  // namespace
 
 TEST_CASE("s3_io_object preserves S3 identity and cache id", "[s3][ioctx]")
@@ -334,6 +537,17 @@ TEST_CASE("s3_ioctx validates config and clips EOF host reads before presigning"
   CHECK(std::all_of(dst.begin(), dst.end(), [](auto b) { return b == 0xAB; }));
 }
 
+TEST_CASE("s3_ioctx config exposes async pool and retry defaults", "[s3][ioctx]")
+{
+  s3_ioctx_config cfg{};
+
+  CHECK(cfg.async_thread_pool == nullptr);
+  CHECK(cfg.max_retry_attempts == 3);
+  CHECK(cfg.retry_backoff_base == 100ms);
+  CHECK(cfg.retry_jitter == 50ms);
+  CHECK(cfg.honor_retry_after);
+}
+
 TEST_CASE("s3_ioctx asks credential_provider for method-specific presigned URLs", "[s3][ioctx]")
 {
   auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
@@ -390,6 +604,185 @@ TEST_CASE("s3_ioctx async host reads keep context and object alive until complet
   REQUIRE(ep != nullptr);
   CHECK_THROWS_AS(std::rethrow_exception(ep), credential_error);
   CHECK(provider->method() == presign_method::GET);
+}
+
+TEST_CASE("s3_ioctx schedules async read entry points on the injected pool", "[s3][ioctx]")
+{
+  sirius::exec::static_thread_pool pool(2, "s3tp");
+  auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
+  s3_ioctx_config cfg{provider, 1, 1};
+  cfg.async_thread_pool = &pool;
+
+  auto ctx = std::make_shared<s3_ioctx>(std::move(cfg));
+  auto obj = make_s3_object("bucket", "empty", 0);
+
+  std::vector<std::uint8_t> host_dst(1);
+  auto host = observe_async_completion([&](auto handler) {
+    ctx->host_read_async_io(*obj, 0, 0, host_dst.data(), std::move(handler));
+  });
+
+  std::vector<cudf::io::text::byte_range_info> ranges;
+  std::vector<cudf::host_span<std::byte>> spans;
+  auto range = observe_async_completion([&](auto handler) {
+    ctx->host_read_ranges_async_io(
+      *obj, ranges, std::span<cudf::host_span<std::byte>>{spans}, std::move(handler));
+  });
+
+  auto device = observe_async_completion([&](auto handler) {
+    ctx->device_read_async_io(*obj, 0, 0, nullptr, rmm::cuda_stream_default, std::move(handler));
+  });
+
+  for (auto const& obs : {host, range, device}) {
+    CHECK(obs.bytes == 0);
+    CHECK(obs.error == nullptr);
+    CHECK(obs.thread_name.rfind("s3tp_", 0) == 0);
+  }
+}
+
+TEST_CASE("s3_ioctx keeps standalone detached async fallback when no pool is injected",
+          "[s3][ioctx]")
+{
+  auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
+  s3_ioctx_config cfg{provider, 1, 1};
+  cfg.async_thread_pool = nullptr;
+
+  auto ctx = std::make_shared<s3_ioctx>(std::move(cfg));
+  auto obj = make_s3_object("bucket", "empty", 0);
+  std::vector<std::uint8_t> dst(1);
+
+  auto obs = observe_async_completion(
+    [&](auto handler) { ctx->host_read_async_io(*obj, 0, 0, dst.data(), std::move(handler)); });
+
+  CHECK(obs.bytes == 0);
+  CHECK(obs.error == nullptr);
+}
+
+TEST_CASE("s3_ioctx shutdown does not stop the caller-owned async pool", "[s3][ioctx]")
+{
+  sirius::exec::static_thread_pool pool(1, "s3alive");
+  auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
+  s3_ioctx_config cfg{provider, 1, 1};
+  cfg.async_thread_pool = &pool;
+
+  auto ctx = std::make_shared<s3_ioctx>(std::move(cfg));
+  ctx->shutdown();
+
+  std::promise<void> ran;
+  auto fut = ran.get_future();
+  pool.schedule([&ran] { ran.set_value(); });
+  CHECK(fut.wait_for(1s) == std::future_status::ready);
+}
+
+TEST_CASE("s3_ioctx retries HTTP 5xx range GETs", "[s3][ioctx][retry]")
+{
+  scripted_http_server server({http_error(500, "Internal Server Error"),
+                               http_error(500, "Internal Server Error"),
+                               range_ok("hello", 5)});
+  auto ctx = make_retry_ioctx(server.url(), 3);
+  auto obj = make_s3_object("bucket", "key", 5);
+  std::vector<std::uint8_t> dst(5);
+
+  REQUIRE(ctx->host_read(*obj, 0, dst.size(), dst.data()) == dst.size());
+  CHECK(std::string(dst.begin(), dst.end()) == "hello");
+  CHECK(server.request_count() == 3);
+}
+
+TEST_CASE("s3_ioctx honors Retry-After for HTTP 429 range GET retries", "[s3][ioctx][retry]")
+{
+  scripted_http_response throttled{429, "Too Many Requests", {"Retry-After: 1"}, "slow down"};
+  scripted_http_server server({throttled, range_ok("ok", 2)});
+  auto ctx = make_retry_ioctx(server.url(), 2, 0ms, 0ms, true);
+  auto obj = make_s3_object("bucket", "key", 2);
+  std::vector<std::uint8_t> dst(2);
+
+  auto const start = std::chrono::steady_clock::now();
+  REQUIRE(ctx->host_read(*obj, 0, dst.size(), dst.data()) == dst.size());
+  auto const elapsed = std::chrono::steady_clock::now() - start;
+
+  CHECK(std::string(dst.begin(), dst.end()) == "ok");
+  CHECK(server.request_count() == 2);
+  CHECK(elapsed >= 900ms);
+}
+
+TEST_CASE("s3_ioctx retries transient libcurl receive failures", "[s3][ioctx][retry]")
+{
+  scripted_http_response transient{};
+  transient.close_without_response = true;
+  scripted_http_server server({transient, range_ok("abc", 3)});
+  auto ctx = make_retry_ioctx(server.url(), 2);
+  auto obj = make_s3_object("bucket", "key", 3);
+  std::vector<std::uint8_t> dst(3);
+
+  REQUIRE(ctx->host_read(*obj, 0, dst.size(), dst.data()) == dst.size());
+  CHECK(std::string(dst.begin(), dst.end()) == "abc");
+  CHECK(server.request_count() == 2);
+}
+
+TEST_CASE("s3_ioctx does not retry authorization or missing-key HTTP failures",
+          "[s3][ioctx][retry]")
+{
+  scripted_http_server forbidden(
+    {http_error(403, "Forbidden", "<Error><Code>SignatureDoesNotMatch</Code></Error>"),
+     range_ok("bad", 3)});
+  auto forbidden_ctx = make_retry_ioctx(forbidden.url(), 3);
+  auto obj           = make_s3_object("bucket", "key", 3);
+  std::vector<std::uint8_t> dst(3);
+
+  CHECK_THROWS_AS(forbidden_ctx->host_read(*obj, 0, dst.size(), dst.data()), std::runtime_error);
+  CHECK(forbidden.request_count() == 1);
+
+  scripted_http_server missing(
+    {http_error(404, "Not Found", "<Error><Code>NoSuchKey</Code></Error>"), range_ok("bad", 3)});
+  auto missing_ctx = make_retry_ioctx(missing.url(), 3);
+
+  CHECK_THROWS_AS(missing_ctx->host_read(*obj, 0, dst.size(), dst.data()), std::runtime_error);
+  CHECK(missing.request_count() == 1);
+}
+
+TEST_CASE("s3_ioctx retries HEAD object-size requests with the same policy", "[s3][ioctx][retry]")
+{
+  scripted_http_server server({http_error(503, "Service Unavailable"), head_ok(123)});
+  auto ctx = make_retry_ioctx(server.url(), 2);
+
+  CHECK(ctx->head_object_size("bucket", "key") == 123);
+  CHECK(server.request_count() == 2);
+}
+
+TEST_CASE("s3_ioctx reports retry exhaustion with attempt diagnostics", "[s3][ioctx][retry]")
+{
+  scripted_http_server server({http_error(503, "Service Unavailable"),
+                               http_error(503, "Service Unavailable"),
+                               http_error(503, "Service Unavailable")});
+  auto ctx = make_retry_ioctx(server.url(), 3);
+  auto obj = make_s3_object("bucket", "key", 1);
+  std::vector<std::uint8_t> dst(1);
+
+  try {
+    (void)ctx->host_read(*obj, 0, dst.size(), dst.data());
+    FAIL("range GET succeeded after every scripted attempt returned 503");
+  } catch (std::runtime_error const& e) {
+    auto const msg = std::string{e.what()};
+    CHECK(msg.find("503") != std::string::npos);
+    CHECK(msg.find("attempt") != std::string::npos);
+    CHECK(msg.find("3") != std::string::npos);
+  }
+  CHECK(server.request_count() == 3);
+}
+
+TEST_CASE("s3_ioctx retry backoff timing stays within tolerance", "[s3][ioctx][retry]")
+{
+  scripted_http_server server({http_error(500, "Internal Server Error"), range_ok("x", 1)});
+  auto ctx = make_retry_ioctx(server.url(), 2, 100ms, 0ms);
+  auto obj = make_s3_object("bucket", "key", 1);
+  std::vector<std::uint8_t> dst(1);
+
+  auto const start = std::chrono::steady_clock::now();
+  REQUIRE(ctx->host_read(*obj, 0, dst.size(), dst.data()) == dst.size());
+  auto const elapsed = std::chrono::steady_clock::now() - start;
+
+  CHECK(elapsed >= 100ms);
+  CHECK(elapsed < 700ms);
+  CHECK(server.request_count() == 2);
 }
 
 TEST_CASE("s3_ioctx reads single objects from MinIO with presigned range GETs",
