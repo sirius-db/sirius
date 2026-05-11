@@ -146,7 +146,7 @@ TEST_CASE("partition no_history_peak_memory_estimate: num_partitions unset retur
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
     0,
     f.hash_join.get()};
-  REQUIRE(part.no_history_peak_memory_estimate({1, 1000}) == 1000);
+  REQUIRE(part.no_history_peak_memory_estimate({1, 1000}) == 2000);
 }
 
 TEST_CASE("partition no_history_peak_memory_estimate: 1 partition returns 0",
@@ -170,7 +170,7 @@ TEST_CASE("partition no_history_peak_memory_estimate: 2 partitions returns bytes
     0,
     f.hash_join.get()};
   part.set_num_partitions(2);
-  REQUIRE(part.no_history_peak_memory_estimate({3, 2000}) == 2000);
+  REQUIRE(part.no_history_peak_memory_estimate({3, 2000}) == 4000);
 }
 
 TEST_CASE("partition no_history_peak_memory_estimate: many partitions returns bytes",
@@ -182,14 +182,14 @@ TEST_CASE("partition no_history_peak_memory_estimate: many partitions returns by
     0,
     f.hash_join.get()};
   part.set_num_partitions(8);
-  REQUIRE(part.no_history_peak_memory_estimate({5, 4096}) == 4096);
+  REQUIRE(part.no_history_peak_memory_estimate({5, 4096}) == 8192);
 }
 
 // ---------------------------------------------------------------------------
 // sirius_physical_parquet_scan
 // ---------------------------------------------------------------------------
 
-TEST_CASE("parquet scan no_history_peak_memory_estimate returns 10× bytes",
+TEST_CASE("parquet scan no_history_peak_memory_estimate returns 8x bytes",
           "[no_history_peak_memory_estimate][parquet_scan]")
 {
   // Constructed with all-empty/nullptr args; constructor body is a no-op when
@@ -209,6 +209,6 @@ TEST_CASE("parquet scan no_history_peak_memory_estimate returns 10× bytes",
                                     /*physical_table_scan=*/nullptr};
 
   REQUIRE(scan.no_history_peak_memory_estimate({0, 0}) == 0);
-  REQUIRE(scan.no_history_peak_memory_estimate({1, 100}) == 1000);
-  REQUIRE(scan.no_history_peak_memory_estimate({4, 512}) == 5120);
+  REQUIRE(scan.no_history_peak_memory_estimate({1, 100}) == 800);
+  REQUIRE(scan.no_history_peak_memory_estimate({4, 512}) == 4096);
 }

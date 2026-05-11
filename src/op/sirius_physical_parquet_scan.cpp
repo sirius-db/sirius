@@ -126,7 +126,7 @@ sirius_physical_parquet_scan::sirius_physical_parquet_scan(
 std::size_t sirius_physical_parquet_scan::no_history_peak_memory_estimate(
   const op::input_stats& stats) const
 {
-  return stats.bytes * 10;
+  return stats.bytes * 8;
 }
 
 }  // namespace op

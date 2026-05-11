@@ -275,7 +275,7 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
 std::size_t sirius_gpu_parquet_scan_operator::no_history_peak_memory_estimate(
   const op::input_stats& stats) const
 {
-  return stats.bytes * 10;
+  return stats.bytes * 8;
 }
 
 }  // namespace sirius::op::scan
