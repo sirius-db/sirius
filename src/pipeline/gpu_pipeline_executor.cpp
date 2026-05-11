@@ -241,14 +241,6 @@ void gpu_pipeline_executor::manager_loop()
           if (cur_local && cur_local->original_task_id.has_value()) {
             next_retry_count = cur_local->retry_count + 1;
             orig_task_id     = cur_local->original_task_id.value();
-          } else {
-            SIRIUS_LOG_ERROR(
-              "GPU Pipeline Executor: Failed to cast task local state for OOM reschedule");
-            // if (_completion_handler) {
-            //   _completion_handler->report_error(
-            //     "GPU Pipeline Executor: Failed to cast task local state for OOM reschedule");
-            // }
-            // return;
           }
 
           static constexpr uint32_t MAX_OOM_RETRIES = 10;
