@@ -116,6 +116,15 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
+  /**
+   * @brief Estimate peak GPU memory for this operator when no execution history is available.
+   *
+   * @param stats  Batch count and total input bytes for the task about to run.
+   * @return Estimated peak GPU bytes this operator will allocate.
+   */
+  [[nodiscard]] std::size_t no_history_peak_memory_estimate(
+    const op::input_stats& stats) const override;
+
  private:
   /// Read the parquet byte ranges described by @p scan_data and apply the post-read
   /// filter (when not pushed down) and the scan_plan's output assembly. Used by
