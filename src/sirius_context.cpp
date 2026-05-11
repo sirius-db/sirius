@@ -201,6 +201,16 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
     config_.get_memory_space_configs());
 
+  {
+    auto disk_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::DISK);
+    if (disk_spaces.empty()) {
+      SIRIUS_LOG_WARN(
+        "SiriusContext: disk memory space is not configured; spilling GPU or HOST data to disk is "
+        "disabled. If queries run out of GPU/HOST memory, downgrades to disk will not be "
+        "possible.");
+    }
+  }
+
   // Configure cuDF to use our pinned slab allocator for small internal host buffers
   // (e.g. column_device_view metadata arrays in cudf::concatenate).  This eliminates
   // the pageable H2D transfers that cuDF issues by default.

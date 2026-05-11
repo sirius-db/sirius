@@ -80,6 +80,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
 
   // Slice from the reordered table to create separate table partitions.
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
+  output_batches.reserve(num_partitions);
   std::vector<cudf::size_type> slice_indices;
   slice_indices.reserve(num_partitions * 2);
   for (int i = 0; i < num_partitions; ++i) {

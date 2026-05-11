@@ -407,6 +407,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_projection.cpp
     test/cpp/operator/test_physical_result_collector.cpp
     test/cpp/operator/test_physical_table_scan.cpp
+    test/cpp/operator/test_no_history_peak_memory_estimate.cpp
     test/cpp/operator/test_physical_top_n.cpp
     test/cpp/operator/test_physical_ungrouped_aggregate.cpp
     test/cpp/parallel/test_task_executor.cpp

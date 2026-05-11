@@ -237,5 +237,12 @@ void sirius_physical_concat::set_concat_all(bool concat_all)
   _concat_all = concat_all;
 }
 
+std::size_t sirius_physical_concat::no_history_peak_memory_estimate(
+  const op::input_stats& stats) const
+{
+  if (stats.num_batches <= 1) { return 0; }
+  return stats.bytes;
+}
+
 }  // namespace op
 }  // namespace sirius

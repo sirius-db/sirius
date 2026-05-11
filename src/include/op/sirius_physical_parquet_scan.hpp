@@ -115,6 +115,9 @@ class sirius_physical_parquet_scan : public sirius_physical_operator {
 
  public:
   bool is_source() const override { return true; }
+
+  [[nodiscard]] std::size_t no_history_peak_memory_estimate(
+    const op::input_stats& stats) const override;
 };
 
 }  // namespace op
