@@ -19,6 +19,7 @@
 #include "io/s3/credential_provider.hpp"
 #include "io/s3/s3_io_object.hpp"
 #include "io/sirius_datasource.hpp"
+#include "io/uri_parser.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
@@ -192,6 +193,62 @@ std::unique_ptr<cudf::io::datasource> s3_ioctx::make_datasource(
   return std::make_unique<sirius_datasource>(shared_from_this(), std::move(io_object));
 }
 
+std::shared_ptr<sirius_io_object> s3_ioctx::create_io_object(std::string path)
+{
+  // Use PR1's URI parser. It throws std::invalid_argument on:
+  //   - empty URI / empty scheme / relative bare path
+  //   - empty bucket (host) / empty key (e.g. "s3://bucket" or "s3://bucket/")
+  //   - malformed percent-encoding
+  // and normalizes the scheme to lowercase. We let those propagate as-is for
+  // C5 (non-S3 / malformed path) — caller sees std::invalid_argument.
+  auto parsed = sirius::io::parse(path);
+  if (parsed.scheme != "s3") {
+    throw std::invalid_argument("s3_ioctx::create_io_object: unsupported scheme '" + parsed.scheme +
+                                "' (only 's3' is supported)");
+  }
+  // parsed.host == bucket, parsed.path == key (one separator slash consumed
+  // by the parser; any further leading slashes survive into the key per S3
+  // REST semantics).
+  auto size = head_object_size(parsed.host, parsed.path);
+  return std::make_shared<s3_io_object>(
+    std::move(parsed.host), std::move(parsed.path), size, std::move(path));
+}
+
+bool s3_ioctx::supports(std::string_view path) const
+{
+  // Capability check semantics from the base-class doxygen: "can serve reads
+  // for @p path". A prefix-only check is too permissive — it would return
+  // true for "s3://", "s3://bucket", "s3://bucket/" (malformed / no key),
+  // which would lock multi-ioctx dispatch onto this backend only for
+  // create_io_object() to throw later. Tighten by also verifying the URI
+  // shape via sirius::io::parse (non-empty bucket + non-empty key, no
+  // malformed percent-encoding); fall through to other backends on failure.
+  //
+  // Quick scheme prefix gate first to avoid parser cost on obvious non-S3
+  // paths (the common case in mixed-backend dispatch — file:// / bare
+  // absolute paths picked up by uring_ioctx::supports()).
+  constexpr std::string_view kPrefix = "s3://";
+  if (path.size() < kPrefix.size()) return false;
+  for (std::size_t i = 0; i < kPrefix.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(path[i])) !=
+        static_cast<unsigned char>(kPrefix[i])) {
+      return false;
+    }
+  }
+  // supports() must not throw — multi-ioctx dispatch iterates supports()
+  // over a vector via find_if and a throw would prevent fallback to other
+  // backends. Catch parser exceptions and return false. Deliberately no
+  // HEAD here: that would defeat the cheap-capability-probe contract
+  // (supports() is O(parse), not O(network); create_io_object() does the
+  // HEAD).
+  try {
+    auto parsed = sirius::io::parse(path);
+    return parsed.scheme == "s3" && !parsed.host.empty() && !parsed.path.empty();
+  } catch (std::invalid_argument const&) {
+    return false;
+  }
+}
+
 // ===========================================================================
 // handle pool
 // ===========================================================================
@@ -351,10 +408,10 @@ std::size_t s3_ioctx::range_get(std::string_view bucket,
 // host read APIs
 // ===========================================================================
 
-std::size_t s3_ioctx::host_read(sirius_io_object& obj,
-                                std::size_t offset,
-                                std::size_t size,
-                                std::uint8_t* dst)
+std::size_t s3_ioctx::host_read_io(sirius_io_object& obj,
+                                   std::size_t offset,
+                                   std::size_t size,
+                                   std::uint8_t* dst)
 {
   auto& so = dynamic_cast<s3_io_object&>(obj);
   // Clip to object size so reads past EOF return short instead of having S3
@@ -362,18 +419,6 @@ std::size_t s3_ioctx::host_read(sirius_io_object& obj,
   size = std::min(size, so.size() > offset ? so.size() - offset : std::size_t{0});
   if (size == 0) return 0;
   return range_get(so.bucket(), so.key(), offset, size, dst);
-}
-
-std::unique_ptr<cudf::io::datasource::buffer> s3_ioctx::host_read(sirius_io_object& obj,
-                                                                  std::size_t offset,
-                                                                  std::size_t size)
-{
-  auto& so = dynamic_cast<s3_io_object&>(obj);
-  size     = std::min(size, so.size() > offset ? so.size() - offset : 0UL);
-  std::vector<std::uint8_t> owned(size);
-  std::size_t got = host_read(obj, offset, size, owned.data());
-  owned.resize(got);
-  return cudf::io::datasource::buffer::create(std::move(owned));
 }
 
 namespace {
@@ -395,11 +440,11 @@ void dispatch_async(io_completion_handler handler, std::function<std::size_t()> 
 
 }  // namespace
 
-void s3_ioctx::host_read_async(sirius_io_object& obj,
-                               std::size_t offset,
-                               std::size_t size,
-                               std::uint8_t* dst,
-                               io_completion_handler handler)
+void s3_ioctx::host_read_async_io(sirius_io_object& obj,
+                                  std::size_t offset,
+                                  std::size_t size,
+                                  std::uint8_t* dst,
+                                  io_completion_handler handler)
 {
   // Capture shared_ptrs to keep both the ioctx and the io_object alive until
   // the detached worker completes; otherwise a caller dropping the datasource
@@ -408,16 +453,19 @@ void s3_ioctx::host_read_async(sirius_io_object& obj,
   auto self      = shared_from_this();
   auto obj_owner = obj.shared_from_this();
   dispatch_async(std::move(handler), [self, obj_owner, offset, size, dst]() {
-    return self->host_read(*obj_owner, offset, size, dst);
+    return self->host_read_io(*obj_owner, offset, size, dst);
   });
 }
 
-void s3_ioctx::host_read_ranges_async(sirius_io_object& obj,
-                                      std::vector<cudf::io::text::byte_range_info> const& ranges,
-                                      std::span<cudf::host_span<std::byte>> dst,
-                                      io_completion_handler handler)
+void s3_ioctx::host_read_ranges_async_io(sirius_io_object& obj,
+                                         std::vector<cudf::io::text::byte_range_info> const& ranges,
+                                         std::span<cudf::host_span<std::byte>> dst,
+                                         io_completion_handler handler)
 {
-  auto self      = shared_from_this();
+  // Downcast self to s3_ioctx because host_read_ranges_impl is a private
+  // method of this class, not visible through the sirius_ioctx base pointer
+  // returned by shared_from_this().
+  auto self      = std::static_pointer_cast<s3_ioctx>(shared_from_this());
   auto obj_owner = obj.shared_from_this();
   // Materialize the dst descriptor array into owned storage. std::span is a
   // non-owning view: capturing it by value preserves only (ptr, len), not the
@@ -426,13 +474,14 @@ void s3_ioctx::host_read_ranges_async(sirius_io_object& obj,
   std::vector<cudf::host_span<std::byte>> dst_owned(dst.begin(), dst.end());
   dispatch_async(std::move(handler),
                  [self, obj_owner, ranges, dst_owned = std::move(dst_owned)]() mutable {
-                   return self->host_read_ranges(*obj_owner, ranges, dst_owned);
+                   return self->host_read_ranges_impl(*obj_owner, ranges, dst_owned);
                  });
 }
 
-std::size_t s3_ioctx::host_read_ranges(sirius_io_object& obj,
-                                       std::vector<cudf::io::text::byte_range_info> const& ranges,
-                                       std::span<cudf::host_span<std::byte>> dst)
+std::size_t s3_ioctx::host_read_ranges_impl(
+  sirius_io_object& obj,
+  std::vector<cudf::io::text::byte_range_info> const& ranges,
+  std::span<cudf::host_span<std::byte>> dst)
 {
   if (ranges.size() != dst.size())
     throw std::invalid_argument("s3_ioctx::host_read_ranges: ranges/dst size mismatch");
@@ -442,13 +491,13 @@ std::size_t s3_ioctx::host_read_ranges(sirius_io_object& obj,
   for (std::size_t i = 0; i < ranges.size(); ++i) {
     auto offset = static_cast<std::size_t>(ranges[i].offset());
     auto size   = static_cast<std::size_t>(ranges[i].size());
-    // Clip per-range to EOF first (mirrors host_read single-range semantics);
+    // Clip per-range to EOF first (mirrors host_read_io single-range semantics);
     // validate dst against the clipped size so an EOF-crossing range with a
     // dst sized for the actual returned bytes does not spuriously throw.
     auto clipped = std::min(size, obj_sz > offset ? obj_sz - offset : std::size_t{0});
     if (dst[i].size() < clipped)
       throw std::invalid_argument("s3_ioctx::host_read_ranges: dst span too small");
-    total += host_read(obj, offset, clipped, reinterpret_cast<std::uint8_t*>(dst[i].data()));
+    total += host_read_io(obj, offset, clipped, reinterpret_cast<std::uint8_t*>(dst[i].data()));
   }
   return total;
 }
@@ -462,35 +511,6 @@ std::size_t s3_ioctx::host_read_ranges(sirius_io_object& obj,
 // device_read / device_read_async first consults the (optional) prefetching
 // cache; these methods only run on cache miss.
 
-std::unique_ptr<cudf::io::datasource::buffer> s3_ioctx::device_read_io(sirius_io_object& obj,
-                                                                       std::size_t offset,
-                                                                       std::size_t size,
-                                                                       rmm::cuda_stream_view stream)
-{
-  // Round-trip through a host-owned buffer, then copy onto a freshly-allocated
-  // device buffer returned as an owned_buffer wrapping a device_buffer.
-  std::vector<std::uint8_t> host(size);
-  auto got = host_read(obj, offset, size, host.data());
-  host.resize(got);
-
-  // Allocate device memory and issue an async H2D copy; sync before returning
-  // so the buffer is safe to hand to cudf.
-  rmm::device_buffer device_buf(got, stream);
-  if (got > 0) {
-    auto rc =
-      cudaMemcpyAsync(device_buf.data(), host.data(), got, cudaMemcpyHostToDevice, stream.value());
-    if (rc != cudaSuccess) {
-      throw std::runtime_error(std::string("s3_ioctx::device_read_io cudaMemcpyAsync failed: ") +
-                               cudaGetErrorString(rc));
-    }
-    if (auto sync_rc = cudaStreamSynchronize(stream.value()); sync_rc != cudaSuccess) {
-      throw std::runtime_error(std::string("s3_ioctx::device_read_io stream sync failed: ") +
-                               cudaGetErrorString(sync_rc));
-    }
-  }
-  return cudf::io::datasource::buffer::create(std::move(device_buf));
-}
-
 std::size_t s3_ioctx::device_read_io(sirius_io_object& obj,
                                      std::size_t offset,
                                      std::size_t size,
@@ -498,7 +518,7 @@ std::size_t s3_ioctx::device_read_io(sirius_io_object& obj,
                                      rmm::cuda_stream_view stream)
 {
   std::vector<std::uint8_t> host(size);
-  auto got = host_read(obj, offset, size, host.data());
+  auto got = host_read_io(obj, offset, size, host.data());
   if (got > 0) {
     auto rc = cudaMemcpyAsync(dst, host.data(), got, cudaMemcpyHostToDevice, stream.value());
     if (rc != cudaSuccess) {
@@ -513,7 +533,7 @@ std::size_t s3_ioctx::device_read_io(sirius_io_object& obj,
   return got;
 }
 
-void s3_ioctx::device_read_io_async(sirius_io_object& obj,
+void s3_ioctx::device_read_async_io(sirius_io_object& obj,
                                     std::size_t offset,
                                     std::size_t size,
                                     std::uint8_t* dst,
@@ -524,7 +544,7 @@ void s3_ioctx::device_read_io_async(sirius_io_object& obj,
   // stream; the synchronous path above is sufficient because the worker
   // thread blocks on the stream before reporting completion. Captured
   // shared_ptrs extend the ioctx and io_object lifetimes through the
-  // detached worker (see host_read_async).
+  // detached worker (see host_read_async_io).
   auto self      = shared_from_this();
   auto obj_owner = obj.shared_from_this();
   dispatch_async(std::move(handler), [self, obj_owner, offset, size, dst, stream]() {

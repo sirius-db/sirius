@@ -40,6 +40,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -112,6 +113,17 @@ std::vector<std::uint8_t> read_binary_file(fs::path const& path)
   return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
 }
 
+std::string s3_uri(std::string_view bucket, std::string_view key)
+{
+  return "s3://" + std::string{bucket} + "/" + std::string{key};
+}
+
+std::shared_ptr<s3_io_object> make_s3_object(std::string bucket, std::string key, std::size_t size)
+{
+  auto path = s3_uri(bucket, key);
+  return std::make_shared<s3_io_object>(std::move(bucket), std::move(key), size, std::move(path));
+}
+
 std::shared_ptr<s3_ioctx> make_live_ioctx(s3_test_env const& env)
 {
   static_credentials creds;
@@ -143,6 +155,23 @@ void require_bytes_equal(std::vector<std::byte> const& got,
   for (std::size_t i = 0; i < got.size(); ++i) {
     CHECK(static_cast<std::uint8_t>(got[i]) == expected[offset + i]);
   }
+}
+
+using async_read_result = std::pair<std::size_t, std::exception_ptr>;
+
+async_read_result read_ranges_async(s3_ioctx& ctx,
+                                    s3_io_object& obj,
+                                    std::vector<cudf::io::text::byte_range_info> const& ranges,
+                                    std::span<cudf::host_span<std::byte>> dst)
+{
+  std::promise<async_read_result> done;
+  auto fut = done.get_future();
+
+  ctx.host_read_ranges_async_io(
+    obj, ranges, dst, [&done](auto bytes, auto ep) { done.set_value({bytes, ep}); });
+
+  REQUIRE(fut.wait_for(5s) == std::future_status::ready);
+  return fut.get();
 }
 
 class blocking_throwing_provider final : public credential_provider {
@@ -230,12 +259,64 @@ class blocking_first_get_provider final : public credential_provider {
 
 TEST_CASE("s3_io_object preserves S3 identity and cache id", "[s3][ioctx]")
 {
-  s3_io_object obj("bucket", "/path/to/object.parquet", 123);
+  s3_io_object obj("bucket", "/path/to/object.parquet", 123, "s3://bucket//path/to/object.parquet");
 
   CHECK(obj.bucket() == "bucket");
   CHECK(obj.key() == "/path/to/object.parquet");
   CHECK(obj.size() == 123);
   CHECK(obj.raw_file_cache_id() == "s3://bucket//path/to/object.parquet");
+}
+
+TEST_CASE("s3_io_object object_path returns the constructor path", "[s3][io_object]")
+{
+  s3_io_object obj("bucket", "key", 1024, "s3://bucket/key");
+
+  CHECK(obj.object_path() == "s3://bucket/key");
+  CHECK(obj.raw_file_cache_id() == "s3://bucket/key");
+}
+
+TEST_CASE("s3_ioctx supports accepts S3 URIs without presigning", "[s3][ioctx]")
+{
+  auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
+  s3_ioctx ctx{s3_ioctx_config{provider, 1, 1}};
+
+  CHECK(ctx.supports("s3://bucket/key"));
+  CHECK(provider->call_count() == 0);
+}
+
+TEST_CASE("s3_ioctx supports rejects non-S3 paths without throwing", "[s3][ioctx]")
+{
+  auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
+  s3_ioctx ctx{s3_ioctx_config{provider, 1, 1}};
+
+  CHECK_FALSE(ctx.supports("file:///tmp/foo"));
+  CHECK_FALSE(ctx.supports("/abs/path"));
+  CHECK_FALSE(ctx.supports("https://example.com"));
+  CHECK(provider->call_count() == 0);
+}
+
+TEST_CASE("s3_ioctx supports treats the S3 scheme case-insensitively", "[s3][ioctx]")
+{
+  auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
+  s3_ioctx ctx{s3_ioctx_config{provider, 1, 1}};
+
+  CHECK(ctx.supports("S3://bucket/key"));
+  CHECK(ctx.supports("s3://bucket/key"));
+  CHECK(provider->call_count() == 0);
+}
+
+TEST_CASE("s3_ioctx create_io_object rejects non-S3 paths before presigning", "[s3][ioctx]")
+{
+  auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
+  s3_ioctx ctx{s3_ioctx_config{provider, 1, 1}};
+
+  try {
+    (void)ctx.create_io_object("file:///foo");
+    FAIL("create_io_object accepted a non-S3 path");
+  } catch (std::invalid_argument const& e) {
+    CHECK(std::string_view{e.what()}.find("unsupported") != std::string_view::npos);
+  }
+  CHECK(provider->call_count() == 0);
 }
 
 TEST_CASE("s3_ioctx validates config and clips EOF host reads before presigning", "[s3][ioctx]")
@@ -244,7 +325,7 @@ TEST_CASE("s3_ioctx validates config and clips EOF host reads before presigning"
 
   auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
   auto ctx      = std::make_shared<s3_ioctx>(s3_ioctx_config{provider, 1, 1});
-  auto obj      = std::make_shared<s3_io_object>("bucket", "key", 8);
+  auto obj      = make_s3_object("bucket", "key", 8);
   std::vector<std::uint8_t> dst(4, 0xAB);
 
   CHECK(ctx->host_read(*obj, 8, dst.size(), dst.data()) == 0);
@@ -258,7 +339,7 @@ TEST_CASE("s3_ioctx asks credential_provider for method-specific presigned URLs"
   auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
   provider->set_throw("stop before libcurl performs a request");
   auto ctx = std::make_shared<s3_ioctx>(s3_ioctx_config{provider, 1, 1});
-  auto obj = std::make_shared<s3_io_object>("bucket", "key", 8);
+  auto obj = make_s3_object("bucket", "key", 8);
   std::vector<std::uint8_t> dst(4);
 
   CHECK_THROWS_AS(ctx->head_object_size("bucket", "key"), credential_error);
@@ -290,12 +371,12 @@ TEST_CASE("s3_ioctx async host reads keep context and object alive until complet
 {
   auto provider = std::make_shared<blocking_throwing_provider>();
   auto ctx      = std::make_shared<s3_ioctx>(s3_ioctx_config{provider, 1, 1});
-  auto obj      = std::make_shared<s3_io_object>("bucket", "key", 16);
+  auto obj      = make_s3_object("bucket", "key", 16);
   std::vector<std::uint8_t> dst(4);
 
   auto done = std::make_shared<std::promise<std::pair<std::size_t, std::exception_ptr>>>();
   auto fut  = done->get_future();
-  ctx->host_read_async(
+  ctx->host_read_async_io(
     *obj, 0, dst.size(), dst.data(), [done](auto bytes, auto ep) { done->set_value({bytes, ep}); });
 
   REQUIRE(provider->wait_until_entered(5s));
@@ -327,7 +408,7 @@ TEST_CASE("s3_ioctx reads single objects from MinIO with presigned range GETs",
   if (!size) return;
 
   REQUIRE(*size == local.size());
-  auto obj = std::make_shared<s3_io_object>(env->bucket, key, *size);
+  auto obj = make_s3_object(env->bucket, key, *size);
 
   std::vector<std::uint8_t> full(local.size());
   CHECK(ctx->host_read(*obj, 0, full.size(), full.data()) == full.size());
@@ -341,6 +422,45 @@ TEST_CASE("s3_ioctx reads single objects from MinIO with presigned range GETs",
   std::vector<std::uint8_t> eof(8, 0xCC);
   CHECK(ctx->host_read(*obj, local.size(), eof.size(), eof.data()) == 0);
   CHECK(std::all_of(eof.begin(), eof.end(), [](auto b) { return b == 0xCC; }));
+}
+
+TEST_CASE("s3_ioctx create_io_object populates S3 object metadata from MinIO",
+          "[s3][ioctx][integration]")
+{
+  auto env = read_s3_test_env();
+  if (!env) {
+    WARN("Skipping live S3 test because SIRIUS_TEST_S3_* environment is not configured");
+    return;
+  }
+
+  auto key   = env_or("SIRIUS_TEST_S3_KEY", "hello.txt");
+  auto local = read_binary_file(env->local_dir / key);
+  auto ctx   = make_live_ioctx(*env);
+  auto path  = s3_uri(env->bucket, key);
+
+  auto object = ctx->create_io_object(path);
+  REQUIRE(object != nullptr);
+  CHECK(object->size() == local.size());
+  CHECK(object->object_path() == path);
+  CHECK(object->raw_file_cache_id() == path);
+
+  auto s3_object = std::dynamic_pointer_cast<s3_io_object>(object);
+  REQUIRE(s3_object != nullptr);
+  CHECK(s3_object->bucket() == env->bucket);
+  CHECK(s3_object->key() == key);
+}
+
+TEST_CASE("s3_ioctx create_io_object propagates missing S3 key HEAD failures",
+          "[s3][ioctx][integration]")
+{
+  auto env = read_s3_test_env();
+  if (!env) {
+    WARN("Skipping live S3 test because SIRIUS_TEST_S3_* environment is not configured");
+    return;
+  }
+
+  auto ctx = make_live_ioctx(*env);
+  CHECK_THROWS(ctx->create_io_object(s3_uri(env->bucket, "nonexistent-key-xyz")));
 }
 
 TEST_CASE("s3_ioctx reads multiple MinIO byte ranges", "[s3][ioctx][integration]")
@@ -358,7 +478,7 @@ TEST_CASE("s3_ioctx reads multiple MinIO byte ranges", "[s3][ioctx][integration]
   if (!size) return;
   REQUIRE(*size == local.size());
 
-  auto obj = std::make_shared<s3_io_object>(env->bucket, key, *size);
+  auto obj = make_s3_object(env->bucket, key, *size);
   std::vector<cudf::io::text::byte_range_info> ranges{
     {0, 16},
     {17, 31},
@@ -378,8 +498,9 @@ TEST_CASE("s3_ioctx reads multiple MinIO byte ranges", "[s3][ioctx][integration]
     spans.emplace_back(buffer.data(), buffer.size());
   }
 
-  auto const total =
-    ctx->host_read_ranges(*obj, ranges, std::span<cudf::host_span<std::byte>>{spans});
+  auto const [total, ep] =
+    read_ranges_async(*ctx, *obj, ranges, std::span<cudf::host_span<std::byte>>{spans});
+  REQUIRE(ep == nullptr);
   CHECK(total == 16 + 31 + 64 + 33);
   for (std::size_t i = 0; i < ranges.size(); ++i) {
     require_bytes_equal(buffers[i], local, static_cast<std::size_t>(ranges[i].offset()));
@@ -406,7 +527,7 @@ TEST_CASE("s3_ioctx async range reads copy caller span descriptors before dispat
     std::move(creds), env->region, env->endpoint, 30min);
   auto provider = std::make_shared<blocking_first_get_provider>(std::move(delegate));
   auto ctx      = std::make_shared<s3_ioctx>(s3_ioctx_config{provider, 2, 20});
-  auto obj      = std::make_shared<s3_io_object>(env->bucket, key, local.size());
+  auto obj      = make_s3_object(env->bucket, key, local.size());
 
   std::vector<cudf::io::text::byte_range_info> ranges{{0, 8}, {8, 8}};
   std::vector<std::byte> first(8);
@@ -421,10 +542,10 @@ TEST_CASE("s3_ioctx async range reads copy caller span descriptors before dispat
     descriptors.emplace_back(first.data(), first.size());
     descriptors.emplace_back(second.data(), second.size());
 
-    ctx->host_read_ranges_async(*obj,
-                                ranges,
-                                std::span<cudf::host_span<std::byte>>{descriptors},
-                                [done](auto bytes, auto ep) { done->set_value({bytes, ep}); });
+    ctx->host_read_ranges_async_io(*obj,
+                                   ranges,
+                                   std::span<cudf::host_span<std::byte>>{descriptors},
+                                   [done](auto bytes, auto ep) { done->set_value({bytes, ep}); });
 
     auto const entered = provider->wait_until_first_get_entered(5s);
     if (!entered) { provider->release(); }
@@ -457,7 +578,7 @@ TEST_CASE("s3_ioctx host_read_ranges clips EOF-crossing range before dst validat
   auto local            = read_binary_file(env->local_dir / key);
   REQUIRE(local.size() >= 200);
   auto ctx = make_live_ioctx(*env);
-  auto obj = std::make_shared<s3_io_object>(env->bucket, key, local.size());
+  auto obj = make_s3_object(env->bucket, key, local.size());
 
   auto const offset = local.size() - 100;
   std::vector<cudf::io::text::byte_range_info> ranges{
@@ -467,9 +588,10 @@ TEST_CASE("s3_ioctx host_read_ranges clips EOF-crossing range before dst validat
   std::vector<cudf::host_span<std::byte>> spans;
   spans.emplace_back(buffer.data(), buffer.size());
 
-  auto const total =
-    ctx->host_read_ranges(*obj, ranges, std::span<cudf::host_span<std::byte>>{spans});
+  auto const [total, ep] =
+    read_ranges_async(*ctx, *obj, ranges, std::span<cudf::host_span<std::byte>>{spans});
 
+  REQUIRE(ep == nullptr);
   CHECK(total == 100);
   require_bytes_equal(buffer, local, offset);
 }
@@ -486,7 +608,7 @@ TEST_CASE("s3_ioctx host_read_ranges returns zero for ranges starting at EOF",
   std::string const key = "medium.bin";
   auto local            = read_binary_file(env->local_dir / key);
   auto ctx              = make_live_ioctx(*env);
-  auto obj              = std::make_shared<s3_io_object>(env->bucket, key, local.size());
+  auto obj              = make_s3_object(env->bucket, key, local.size());
 
   std::vector<cudf::io::text::byte_range_info> ranges{
     {static_cast<int64_t>(local.size()), 50},
@@ -495,9 +617,10 @@ TEST_CASE("s3_ioctx host_read_ranges returns zero for ranges starting at EOF",
   std::vector<cudf::host_span<std::byte>> spans;
   spans.emplace_back(empty.data(), empty.size());
 
-  auto const total =
-    ctx->host_read_ranges(*obj, ranges, std::span<cudf::host_span<std::byte>>{spans});
+  auto const [total, ep] =
+    read_ranges_async(*ctx, *obj, ranges, std::span<cudf::host_span<std::byte>>{spans});
 
+  REQUIRE(ep == nullptr);
   CHECK(total == 0);
 }
 
@@ -514,7 +637,7 @@ TEST_CASE("s3_ioctx host_read_ranges rejects dst smaller than clipped size",
   auto local            = read_binary_file(env->local_dir / key);
   REQUIRE(local.size() >= 200);
   auto ctx = make_live_ioctx(*env);
-  auto obj = std::make_shared<s3_io_object>(env->bucket, key, local.size());
+  auto obj = make_s3_object(env->bucket, key, local.size());
 
   auto const offset = local.size() - 100;
   std::vector<cudf::io::text::byte_range_info> ranges{
@@ -524,9 +647,12 @@ TEST_CASE("s3_ioctx host_read_ranges rejects dst smaller than clipped size",
   std::vector<cudf::host_span<std::byte>> spans;
   spans.emplace_back(buffer.data(), buffer.size());
 
-  CHECK_THROWS_WITH(
-    ctx->host_read_ranges(*obj, ranges, std::span<cudf::host_span<std::byte>>{spans}),
-    "s3_ioctx::host_read_ranges: dst span too small");
+  auto const [bytes, ep] =
+    read_ranges_async(*ctx, *obj, ranges, std::span<cudf::host_span<std::byte>>{spans});
+
+  CHECK(bytes == 0);
+  REQUIRE(ep != nullptr);
+  CHECK_THROWS_WITH(std::rethrow_exception(ep), "s3_ioctx::host_read_ranges: dst span too small");
 }
 
 TEST_CASE("s3_ioctx host_read_ranges clips EOF-crossing ranges independently",
@@ -542,7 +668,7 @@ TEST_CASE("s3_ioctx host_read_ranges clips EOF-crossing ranges independently",
   auto local            = read_binary_file(env->local_dir / key);
   REQUIRE(local.size() >= 150);
   auto ctx = make_live_ioctx(*env);
-  auto obj = std::make_shared<s3_io_object>(env->bucket, key, local.size());
+  auto obj = make_s3_object(env->bucket, key, local.size());
 
   auto const eof_crossing_offset = local.size() - 50;
   std::vector<cudf::io::text::byte_range_info> ranges{
@@ -555,9 +681,10 @@ TEST_CASE("s3_ioctx host_read_ranges clips EOF-crossing ranges independently",
   spans.emplace_back(head.data(), head.size());
   spans.emplace_back(tail.data(), tail.size());
 
-  auto const total =
-    ctx->host_read_ranges(*obj, ranges, std::span<cudf::host_span<std::byte>>{spans});
+  auto const [total, ep] =
+    read_ranges_async(*ctx, *obj, ranges, std::span<cudf::host_span<std::byte>>{spans});
 
+  REQUIRE(ep == nullptr);
   CHECK(total == 150);
   require_bytes_equal(head, local, 0);
   require_bytes_equal(tail, local, eof_crossing_offset);
