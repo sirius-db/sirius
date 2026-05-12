@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Gauntlet on Rebased Branch)
 status: executing
-stopped_at: Completed 23-03-PLAN.md — cucascade gitlink bumped to 1e889d7; MCP build + 4 gauntlet suites green; Plan 23-04 unblocked for git merge origin/dev
-last_updated: "2026-05-12T18:14:49.558Z"
+stopped_at: Completed 23-04-PLAN.md — merge commit 49b7b86 integrates origin/dev into feature/single-node-multi-gpu2; 6 conflicts resolved; build green; 4 gauntlet suites pass; Plan 23-05 unblocked
+last_updated: "2026-05-12T18:36:06.287Z"
 last_activity: 2026-05-12
 progress:
   total_phases: 11
   completed_phases: 2
   total_plans: 19
-  completed_plans: 17
+  completed_plans: 18
 ---
 
 # Project State
@@ -25,7 +25,7 @@ See: .planning/PROJECT.md (updated 2026-05-04)
 ## Current Position
 
 Phase: 23 (update-cucascade-and-sirius-from-upstream) — EXECUTING
-Plan: 4 of 5
+Plan: 5 of 5
 Status: Ready to execute
 Last activity: 2026-05-12
 
@@ -121,6 +121,7 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 | Phase 23 P01 | 3min | 2 tasks | 0 files |
 | Phase 23 P02 | 12min | 2 tasks | 2 files |
 | Phase 23 P03 | 8min | 2 tasks | 1 files |
+| Phase 23 P04 | 35min | 2 tasks | 7 files |
 
 ## Decisions
 
@@ -290,6 +291,9 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 - [Phase 23]: 42a01c4 disposition: re-format + continue (clang-format applied cleanly to post-rebase tree; patch was non-trivial)
 - [Phase 23]: Gitlink bump committed atomically as 08f36e8 BEFORE any dev-merge work (D-12: bisect isolation between cucascade bump and sirius merge)
 - [Phase 23]: PR #121 is API-compatible with existing Sirius code — no Sirius-side adaptations needed for the new cucascade pin; all 4 invariant test suites pass on first attempt
+- [Phase 23]: 6 merge conflicts resolved — all behavioral-correctness-driven, 0 mechanical ours/theirs picks; pipeline_breakers_ auto-fix (Rule 1) for 972cb32 rename
+- [Phase 23]: duckdb_scan_executor.cpp: integrated reservation_info struct API + NUMA-preference routing — both required simultaneously
+- [Phase 23]: [mgpu] first-run flake (cudaErrorInvalidValue) confirmed pre-existing; 7cc7a79 flake disposition deferred to Plan 23-05
 
 ## Accumulated Context
 
@@ -332,6 +336,6 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 
 ## Session Continuity
 
-Last session: 2026-05-12T18:14:49.552Z
-Stopped at: Completed 23-03-PLAN.md — cucascade gitlink bumped to 1e889d7; MCP build + 4 gauntlet suites green; Plan 23-04 unblocked for git merge origin/dev
+Last session: 2026-05-12T18:36:06.283Z
+Stopped at: Completed 23-04-PLAN.md — merge commit 49b7b86 integrates origin/dev into feature/single-node-multi-gpu2; 6 conflicts resolved; build green; 4 gauntlet suites pass; Plan 23-05 unblocked
 Resume file: None
