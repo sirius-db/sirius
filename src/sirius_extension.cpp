@@ -796,64 +796,57 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   std::size_t const chunk_read_limit =
     sirius_ctx->get_config().get_operator_params().scan_task_batch_size;
 
-  // Read each file via cudf::chunked_parquet_reader so each emitted batch stays within
-  // chunk_read_limit bytes. The optional n_rows budget caps the cumulative row count
-  // across files; once exhausted, stop early.
-  std::vector<std::unique_ptr<cudf::table>> tables;
-  std::vector<std::string> read_column_names;  // captured from parquet metadata
-  int64_t remaining_rows = data.args.n_rows.value_or(-1);
-  for (auto const& path : file_paths) {
-    if (data.args.n_rows.has_value() && remaining_rows <= 0) { break; }
+  // Read all files through a single cudf::chunked_parquet_reader. cudf concatenates the
+  // sources internally and emits batches each within chunk_read_limit bytes; the optional
+  // n_rows budget caps the cumulative row count across files.
+  cudf::io::parquet_reader_options opts =
+    cudf::io::parquet_reader_options::builder(cudf::io::source_info{file_paths}).build();
+  if (!cols.empty()) { opts.set_column_names(cols); }
+  if (data.args.n_rows.has_value()) { opts.set_num_rows(data.args.n_rows.value()); }
 
-    auto opts = cudf::io::parquet_reader_options::builder(
-                  cudf::io::source_info{std::vector<std::string>{path}})
-                  .build();
-    if (!cols.empty()) { opts.set_column_names(cols); }
-    if (data.args.n_rows.has_value()) { opts.set_num_rows(remaining_rows); }
+  std::vector<std::unique_ptr<cudf::table>> tables;                               // tier='gpu'
+  std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;  // tier='host'
+  std::vector<std::string> read_column_names;
 
+  // For tier='host' the full table may not fit in GPU memory, so each batch is downgraded
+  // to a pinned host_data_representation immediately and the GPU buffers are released
+  // before the next read_chunk(). The GPU↔HOST converter uses cudaMemcpyBatchAsync which
+  // requires a real, non-default stream.
+  cucascade::representation_converter_registry* registry_ptr = nullptr;
+  std::optional<rmm::cuda_stream> pin_stream;
+  rmm::cuda_stream_view stream_view{};
+  if (data.args.tier == "host") {
+    registry_ptr = &sirius::converter_registry::get();
+    pin_stream.emplace();
+    stream_view = pin_stream->view();
+  }
+
+  if (!file_paths.empty()) {
     cudf::io::chunked_parquet_reader reader(chunk_read_limit, opts);
-    int64_t file_rows_read = 0;
     while (reader.has_next()) {
-      auto chunk      = reader.read_chunk();
-      auto chunk_rows = static_cast<int64_t>(chunk.tbl->num_rows());
-      if (chunk_rows == 0) { break; }
+      auto chunk = reader.read_chunk();
+      if (chunk.tbl->num_rows() == 0) { break; }
       if (read_column_names.empty()) {
         read_column_names.reserve(chunk.metadata.schema_info.size());
         for (auto const& col_info : chunk.metadata.schema_info) {
           read_column_names.push_back(col_info.name);
         }
       }
-      file_rows_read += chunk_rows;
-      tables.emplace_back(std::move(chunk.tbl));
+      if (data.args.tier == "host") {
+        cucascade::gpu_table_representation gpu_repr(std::move(chunk.tbl), gpu_mem_space);
+        auto host_repr = registry_ptr->convert<cucascade::host_data_representation>(
+          gpu_repr, host_mem_space, stream_view);
+        // Sync before gpu_repr leaves scope so the async D2H copies finish before its
+        // device buffers are freed.
+        stream_view.synchronize();
+        host_chunks.emplace_back(std::move(host_repr));
+      } else {
+        tables.emplace_back(std::move(chunk.tbl));
+      }
     }
-    if (data.args.n_rows.has_value()) { remaining_rows -= file_rows_read; }
   }
 
   if (data.args.tier == "host") {
-    // Downgrade each freshly-read GPU table to a host_data_representation. The GPU
-    // table is wrapped in a transient gpu_table_representation just so the converter
-    // registry can dispatch on its concrete type. After conversion, the GPU side
-    // is released — the pinned bytes live in pinned host memory.
-    auto& registry = sirius::converter_registry::get();
-    // The GPU↔HOST converter uses cudaMemcpyBatchAsync which requires a real,
-    // non-default stream. Use a per-call rmm::cuda_stream so we don't accidentally
-    // serialize against other concurrent work on the default stream.
-    rmm::cuda_stream pin_stream;
-    auto stream_view = pin_stream.view();
-    std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;
-    host_chunks.reserve(tables.size());
-    for (auto& table : tables) {
-      if (!table) { continue; }
-      cucascade::gpu_table_representation gpu_repr(std::move(table), gpu_mem_space);
-      auto host_repr = registry.convert<cucascade::host_data_representation>(
-        gpu_repr, host_mem_space, stream_view);
-      host_chunks.emplace_back(std::move(host_repr));
-    }
-    // Conversion enqueues async D2H copies on the stream; sync before the GPU
-    // representations leave scope so we do not free their device buffers while
-    // copies are still in flight.
-    stream_view.synchronize();
-
     sirius_ctx->get_scan_manager().insert_pinned_entry_host(data.args.name,
                                                             std::move(read_column_names),
                                                             std::move(file_paths),
