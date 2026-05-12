@@ -74,17 +74,6 @@ class sirius_engine {
   std::size_t root_pipeline_idx;
   //! The total amount of pipelines in the query
   std::size_t total_pipelines;
-  //! Insert the repository
-  void insert_repository(std::string_view port_id,
-                         duckdb::shared_ptr<pipeline::sirius_pipeline> input_pipeline,
-                         duckdb::shared_ptr<pipeline::sirius_pipeline> dependent_pipeline,
-                         op::MemoryBarrierType barrier_type = op::MemoryBarrierType::FULL);
-  //! Insert the repository
-  void insert_repository(std::string_view port_id,
-                         op::sirius_physical_operator* cur_op,
-                         duckdb::shared_ptr<pipeline::sirius_pipeline> input_pipeline,
-                         duckdb::shared_ptr<pipeline::sirius_pipeline> dependent_pipeline,
-                         op::MemoryBarrierType barrier_type = op::MemoryBarrierType::FULL);
   //! Whether or not the root of the pipeline is a result collector object
   bool has_result_collector();
   //! Returns the query result - can only be used if `HasResultCollector` returns true
