@@ -149,6 +149,7 @@ set(EXTENSION_SOURCES
     src/downgrade/downgrade_executor.cpp
     src/expression/expression.cpp
     src/expression/join_condition.cpp
+    src/expression/value.cpp
     src/expression_executor/expression_executor_strategy.cpp
     src/expression_executor/gpu_expression_executor.cpp
     src/expression_executor/gpu_expression_translator.cpp
@@ -273,8 +274,9 @@ set(EXTENSION_SOURCES
 
 # Legacy Sirius — all legacy-specific config lives in src/legacy/CMakeLists.txt.
 # Deleting src/legacy/ cleanly removes legacy build support.
-set(CUDA_SOURCES src/op/scan/equality_delete_mask.cu
-                 src/cuda/scan/gpu_native_decode.cu)
+set(CUDA_SOURCES
+    src/op/scan/equality_delete_mask.cu src/cuda/scan/gpu_decode_bitpacking.cu
+    src/cuda/scan/gpu_native_decode.cu)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
   add_subdirectory(src/legacy)
   list(APPEND EXTENSION_SOURCES ${SIRIUS_LEGACY_SOURCES}
@@ -376,6 +378,7 @@ set(TEST_SOURCES
     test/cpp/expression/test_ast_scaffold.cpp
     test/cpp/expression/test_expression.cpp
     test/cpp/expression/test_join_condition.cpp
+    test/cpp/expression/test_value.cpp
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
     test/cpp/helper/test_logical_type.cpp
@@ -412,6 +415,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_projection.cpp
     test/cpp/operator/test_physical_result_collector.cpp
     test/cpp/operator/test_physical_table_scan.cpp
+    test/cpp/operator/test_no_history_peak_memory_estimate.cpp
     test/cpp/operator/test_physical_top_n.cpp
     test/cpp/operator/test_physical_ungrouped_aggregate.cpp
     test/cpp/parallel/test_task_executor.cpp
@@ -426,6 +430,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_task_scheduler.cpp
     test/cpp/scan/bench_decode_codecs.cpp
     test/cpp/scan/test_column_builder.cpp
+    test/cpp/scan/test_gpu_decode_bitpacking.cpp
     test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_scan_task.cpp

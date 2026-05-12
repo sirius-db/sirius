@@ -116,7 +116,7 @@ pipeline_conversion_result sirius_pipeline_converter::convert(sirius_meta_pipeli
                                                               sirius_engine& engine)
 {
   scheduled_.clear();
-  pipeline_breakers_.clear();
+  inserted_operators_.clear();
 
   auto copied_scheduled = schedule_and_copy_pipelines(root_pipeline);
   split_pipelines(copied_scheduled);
@@ -127,7 +127,7 @@ pipeline_conversion_result sirius_pipeline_converter::convert(sirius_meta_pipeli
   configure_partition_min_partitions();
   log_pipeline_debug_info();
 
-  return {std::move(scheduled_), std::move(pipeline_breakers_), meta_pipeline_count_};
+  return {std::move(scheduled_), std::move(inserted_operators_), meta_pipeline_count_};
 }
 
 duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>
@@ -216,7 +216,7 @@ sirius_pipeline_converter::schedule_and_copy_pipelines(sirius_meta_pipeline& roo
 // TODO(v1.4 Phase 20 — SM-03): if writer_event recording happens here, ensure cudaStreamWaitEvent
 // chain remains intact post-Scan-Manager (Phase 13 / Pitfall P2)
 //===----------------------------------------------------------------------===//
-// split_parquet_scan_source()
+// insert_parquet_scan_operator()
 //
 // Rewrites a DuckDB parquet table scan into a Sirius gpu_scan_op as the
 // pipeline source. The companion metadata scan operator is constructed here
@@ -225,7 +225,7 @@ sirius_pipeline_converter::schedule_and_copy_pipelines(sirius_meta_pipeline& roo
 // so the scan_manager can take ownership and drive its execute() on its own
 // thread pool during prepare_for_query.
 //===----------------------------------------------------------------------===//
-void sirius_pipeline_converter::split_parquet_scan_source(
+void sirius_pipeline_converter::insert_parquet_scan_operator(
   duckdb::shared_ptr<sirius_pipeline>& current_pipeline)
 {
   auto& scan_op = current_pipeline->get_source()->Cast<op::sirius_physical_table_scan>();
@@ -234,7 +234,7 @@ void sirius_pipeline_converter::split_parquet_scan_source(
   auto const& bind_data = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
   if (!bind_data.file_list || bind_data.file_list->IsEmpty()) {
     throw std::runtime_error(
-      "[sirius_pipeline_converter::split_parquet_scan_source] No input files to scan");
+      "[sirius_pipeline_converter::insert_parquet_scan_operator] No input files to scan");
   }
   std::vector<std::string> file_paths;
   for (auto const& file : bind_data.file_list->GetAllFiles()) {
@@ -259,7 +259,7 @@ void sirius_pipeline_converter::split_parquet_scan_source(
   // finalize_pipeline_structure() will set current_pipeline->source = &operators[0] = gpu_scan_op.
   current_pipeline->operators.insert(current_pipeline->operators.begin(), *gpu_scan_ptr);
 
-  pipeline_breakers_.push_back(std::move(gpu_scan_op));
+  inserted_operators_.push_back(std::move(gpu_scan_op));
 }
 
 void sirius_pipeline_converter::split_table_scan_source(
@@ -270,7 +270,7 @@ void sirius_pipeline_converter::split_table_scan_source(
   auto& scan_op = current_pipeline->get_source()->Cast<op::sirius_physical_table_scan>();
   // If parquet scan, route to metadata scan + gpu scan operator pipeline
   if (scan_op.function.name == "parquet_scan" || scan_op.function.name == "read_parquet") {
-    split_parquet_scan_source(current_pipeline);
+    insert_parquet_scan_operator(current_pipeline);
     return;
   }
 
@@ -289,7 +289,7 @@ void sirius_pipeline_converter::split_table_scan_source(
     current_pipeline->operators.insert(current_pipeline->operators.begin(), scan_op);
 
     scheduled_.push_back(new_pipeline);
-    pipeline_breakers_.push_back(std::move(new_scan_op));
+    inserted_operators_.push_back(std::move(new_scan_op));
   } else {
     throw std::runtime_error("Unsupported scan function: " + scan_op.function.name);
   }
@@ -336,7 +336,7 @@ void sirius_pipeline_converter::split_cpu_source(
   current_pipeline->operators.insert(current_pipeline->operators.begin(), *source_op);
 
   scheduled_.push_back(new_pipeline);
-  pipeline_breakers_.push_back(std::move(cpu_source_op));
+  inserted_operators_.push_back(std::move(cpu_source_op));
 }
 
 void sirius_pipeline_converter::split_intermediate_joins(
@@ -375,7 +375,7 @@ void sirius_pipeline_converter::split_intermediate_joins(
         concat_op.get(),
         false,
         op_params_.hash_partition_bytes);
-      pipeline_breakers_.push_back(std::move(partition_op));
+      inserted_operators_.push_back(std::move(partition_op));
     } else {
       concat_op = make_uniq<op::sirius_physical_concat>(
         current_pipeline->operators[join_pos - 1].get().types,
@@ -389,11 +389,11 @@ void sirius_pipeline_converter::split_intermediate_joins(
         concat_op.get(),
         false,
         op_params_.hash_partition_bytes);
-      pipeline_breakers_.push_back(std::move(partition_op));
+      inserted_operators_.push_back(std::move(partition_op));
     }
 
     auto* partition_ptr =
-      static_cast<op::sirius_physical_partition*>(pipeline_breakers_.back().get());
+      static_cast<op::sirius_physical_partition*>(inserted_operators_.back().get());
 
     if (join_pos > 0) {
       auto new_pipeline = duckdb::make_shared_ptr<sirius_pipeline>(build_ctx_);
@@ -438,8 +438,8 @@ void sirius_pipeline_converter::split_intermediate_joins(
     concat_pipeline->source = partition_ptr;
     concat_pipeline->sink   = concat_op.get();
 
-    pipeline_breakers_.push_back(std::move(concat_op));
-    auto* concat_ptr = static_cast<op::sirius_physical_concat*>(pipeline_breakers_.back().get());
+    inserted_operators_.push_back(std::move(concat_op));
+    auto* concat_ptr = static_cast<op::sirius_physical_concat*>(inserted_operators_.back().get());
 
     scheduled_.push_back(concat_pipeline);
 
@@ -530,8 +530,8 @@ void sirius_pipeline_converter::split_join_sink(
     scheduled_.push_back(concat_pipeline);
   }
 
-  pipeline_breakers_.push_back(std::move(partition_op));
-  pipeline_breakers_.push_back(std::move(concat_op));
+  inserted_operators_.push_back(std::move(partition_op));
+  inserted_operators_.push_back(std::move(concat_op));
 }
 
 void sirius_pipeline_converter::split_group_aggregate_sink(
@@ -548,10 +548,10 @@ void sirius_pipeline_converter::split_group_aggregate_sink(
                                                current_pipeline->get_sink().get(),
                                                false,
                                                op_params_.hash_partition_bytes);
-    pipeline_breakers_.push_back(std::move(partition_op));
+    inserted_operators_.push_back(std::move(partition_op));
 
     auto* partition_ptr =
-      static_cast<op::sirius_physical_partition*>(pipeline_breakers_.back().get());
+      static_cast<op::sirius_physical_partition*>(inserted_operators_.back().get());
 
     // Keep GROUP_BY as the sink (don't move it to operators)
     scheduled_.push_back(current_pipeline);
@@ -575,7 +575,7 @@ void sirius_pipeline_converter::split_group_aggregate_sink(
       }
     }
     scheduled_.push_back(merge_pipeline);
-    pipeline_breakers_.push_back(std::move(merge_op));
+    inserted_operators_.push_back(std::move(merge_op));
   } else {
     // UNGROUPED_AGGREGATE — no PARTITION needed
     scheduled_.push_back(current_pipeline);
@@ -592,7 +592,7 @@ void sirius_pipeline_converter::split_group_aggregate_sink(
       }
     }
     scheduled_.push_back(new_pipeline);
-    pipeline_breakers_.push_back(std::move(merge_op));
+    inserted_operators_.push_back(std::move(merge_op));
   }
 }
 
@@ -687,9 +687,9 @@ void sirius_pipeline_converter::split_order_by_sink(
   }
 
   // Store ownership
-  pipeline_breakers_.push_back(std::move(sample_op));
-  pipeline_breakers_.push_back(std::move(partition_op));
-  pipeline_breakers_.push_back(std::move(merge_op));
+  inserted_operators_.push_back(std::move(sample_op));
+  inserted_operators_.push_back(std::move(partition_op));
+  inserted_operators_.push_back(std::move(merge_op));
 }
 
 void sirius_pipeline_converter::split_top_n_sink(
@@ -722,7 +722,7 @@ void sirius_pipeline_converter::split_top_n_sink(
   }
 
   // Store ownership
-  pipeline_breakers_.push_back(std::move(merge_op));
+  inserted_operators_.push_back(std::move(merge_op));
 }
 
 void sirius_pipeline_converter::split_delim_join_sink(
@@ -806,8 +806,8 @@ void sirius_pipeline_converter::split_delim_join_sink(
     concat_pipeline->source = partition_join.get();
     concat_pipeline->sink   = concat_op.get();
 
-    pipeline_breakers_.push_back(std::move(partition_join));
-    pipeline_breakers_.push_back(std::move(concat_op));
+    inserted_operators_.push_back(std::move(partition_join));
+    inserted_operators_.push_back(std::move(concat_op));
     scheduled_.push_back(concat_pipeline);
   }
 
@@ -830,8 +830,8 @@ void sirius_pipeline_converter::split_delim_join_sink(
     }
   }
 
-  pipeline_breakers_.push_back(std::move(partition_distinct));
-  pipeline_breakers_.push_back(std::move(merge_distinct_op));
+  inserted_operators_.push_back(std::move(partition_distinct));
+  inserted_operators_.push_back(std::move(merge_distinct_op));
   scheduled_.push_back(merge_pipeline);
 }
 
@@ -1135,7 +1135,7 @@ void sirius_pipeline_converter::configure_partition_min_partitions()
                                                                               small_table_bytes);
     }
   };
-  for (auto& breaker : pipeline_breakers_) {
+  for (auto& breaker : inserted_operators_) {
     apply_to_op(breaker.get());
   }
   for (auto& pipe : scheduled_) {

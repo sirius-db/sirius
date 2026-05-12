@@ -201,6 +201,7 @@ void downgrade_executor::processing_loop()
     size_t host_end_idx = target_spaces.size();
     auto disk_spaces =
       _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::DISK);
+    bool disk_not_configured = disk_spaces.empty();
     for (auto* ds : disk_spaces) {
       target_spaces.push_back(ds);
     }
@@ -334,6 +335,14 @@ void downgrade_executor::processing_loop()
 
     // Wait for all in-flight work to finish (predicate also checked in workers)
     _pool->wait_all();
+
+    if (disk_not_configured && !req->satisfied.load()) {
+      SIRIUS_LOG_WARN(
+        "[downgrade] [{}] downgrade request not satisfied and disk memory space is not configured; "
+        "data cannot be spilled to disk. Consider configuring a disk memory space to enable "
+        "spilling.",
+        _source_label);
+    }
 
     // === Logging ===
     auto total_bytes   = req->bytes_freed.load(std::memory_order_relaxed);

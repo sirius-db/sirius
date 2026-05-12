@@ -311,9 +311,7 @@ void task_creator::manager_loop()
             port_info.next_operator->get_port(port_info.next_operator_port_name)->repo);
         }
 
-        // scheduling scan task
         if (node->type == ::sirius::op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
-          // Check to see if you need to create a new global s for this scan operator
           size_t operator_id          = node->get_operator_id();
           auto scan_task_global_state = _scan_operator_global_state_map.at(operator_id);
 
@@ -321,6 +319,7 @@ void task_creator::manager_loop()
             _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
               ->get_config()
               .get_operator_params();
+
           auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
             *scan_task_global_state,
             *_execution_context,
@@ -330,16 +329,18 @@ void task_creator::manager_loop()
             throw std::runtime_error(
               "No destination data repositories provided for scan task creation.");
           }
-          auto scan_task = std::make_unique<op::scan::duckdb_scan_task>(
-            get_next_task_id(),
-            destination_data_repositories[0],  // WSM amin TODO: is this correct? there probably
-                                               // needs to be multiple possible destination data
-                                               // repositories
-            std::move(scan_task_local_state),
-            scan_task_global_state);
-          pipeline->mark_task_created();  // WSM TODO: this needs to be done atomically
-                                          // with the task creation
+          // Hold the pipeline lock while constructing the task so that
+          // mark_task_created() (called by the constructor) and
+          // update_pipeline_status() are mutually exclusive.
+          auto task_lock = pipeline->get_task_creation_lock();
+          auto scan_task =
+            std::make_unique<op::scan::duckdb_scan_task>(get_next_task_id(),
+                                                         destination_data_repositories[0],
+                                                         std::move(scan_task_local_state),
+                                                         scan_task_global_state);
+          task_lock.unlock();
           _task_scheduler->schedule(std::move(scan_task));
+
         } else if (node->type == ::sirius::op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
           size_t operator_id             = node->get_operator_id();
           auto parquet_task_global_state = _parquet_scan_operator_global_state_map.at(operator_id);
@@ -348,27 +349,22 @@ void task_creator::manager_loop()
           auto* parquet_scan = (node->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN)
                                  ? static_cast<op::sirius_physical_parquet_scan*>(node)
                                  : &node->Cast<op::sirius_physical_parquet_scan>();
+
           while (true) {
-            pipeline->mark_task_created();
+            // Hold the pipeline lock across the partition claim and task construction so
+            // that claim_next_rg_partition() (which advances the pipeline's scan state)
+            // and mark_task_created() (called by the constructor) are atomic with respect
+            // to update_pipeline_status().
+            auto task_lock = pipeline->get_task_creation_lock();
             auto partition = parquet_task_global_state->claim_next_rg_partition();
-            if (!partition.has_value()) {
-              pipeline->mark_task_completed();
-              if (pipeline->is_pipeline_finished()) {
-                auto output_consumers = pipeline->get_output_consumers();
-                for (auto& output_consumer : output_consumers) {
-                  schedule(output_consumer);
-                }
-              }
-              return;
-            }
+            if (!partition.has_value()) { return; }
             if (!parquet_task_global_state->has_more_partitions()) {
-              parquet_scan->has_more_partitions = false;
+              parquet_scan->has_more_partitions.store(false);
             }
 
             auto parquet_task_local_state =
               std::make_unique<op::scan::parquet_scan_task_local_state>(*parquet_task_global_state,
                                                                         *partition);
-
             if (destination_data_repositories.empty()) {
               throw std::runtime_error(
                 "No destination data repositories provided for parquet scan task creation.");
@@ -378,65 +374,50 @@ void task_creator::manager_loop()
                                                             destination_data_repositories[0],
                                                             std::move(parquet_task_local_state),
                                                             parquet_task_global_state);
+            task_lock.unlock();
             _task_scheduler->schedule(std::move(parquet_task));
 
             // If there is only a single scan in the plan, continue creating scan tasks to create
             // I/O parallelism. Otherwise, let the plan drive the creation of more tasks.
             if (_num_scans_in_plan >= 2) { break; }
           }
+
         } else if (node->type == ::sirius::op::SiriusPhysicalOperatorType::CPU_SOURCE) {
           SIRIUS_LOG_DEBUG("Task Creator: creating cpu_source_task for operator {}",
                            node->get_name());
           size_t operator_id     = node->get_operator_id();
           auto cpu_source_global = _cpu_source_operator_global_state_map.at(operator_id);
 
-          pipeline->mark_task_created();
-
           if (destination_data_repositories.empty()) {
             throw std::runtime_error(
               "No destination data repositories provided for cpu source task creation.");
           }
-
           auto local_state = std::make_unique<op::scan::cpu_source_task_local_state>();
+          auto task_lock   = pipeline->get_task_creation_lock();
           auto task        = std::make_unique<op::scan::cpu_source_task>(get_next_task_id(),
                                                                   destination_data_repositories[0],
                                                                   std::move(local_state),
-                                                                  cpu_source_global,
-                                                                  *_client_context);
+                                                                  cpu_source_global);
           SIRIUS_LOG_DEBUG("Task Creator: scheduling cpu_source_task, dest_repos={}",
                            destination_data_repositories.size());
+          task_lock.unlock();
           _task_scheduler->schedule(std::move(task));
-        } else {
-          // need to exhaust input batches until all ports are empty
-          while (!node->all_ports_empty()) {
-            // Mark task created BEFORE popping data from ports to prevent a race
-            // condition where update_pipeline_status() sees empty ports and matching
-            // task counters, prematurely marking the pipeline as finished.
-            pipeline->mark_task_created();
 
+        } else {
+          // Create all possible tasks until all ports are empty
+          while (!node->all_ports_empty()) {
+            auto task_lock  = pipeline->get_task_creation_lock();
             auto input_data = node->get_next_task_input_data();
             auto* pipelineable_input =
               dynamic_cast<op::pipelineable_operator_data*>(input_data.get());
             if (!input_data ||
                 (pipelineable_input && pipelineable_input->get_data_batches().empty())) {
-              // No data was available (e.g., another thread already consumed it).
-              // Balance the counter. mark_task_completed() calls update_pipeline_status()
-              // which is correct: if all ports are truly empty and all real tasks have
-              // completed, the pipeline should finish.
-              pipeline->mark_task_completed();
-              if (pipeline->is_pipeline_finished()) {
-                auto output_consumers = pipeline->get_output_consumers();
-                for (auto& output_consumer : output_consumers) {
-                  this->schedule(output_consumer);
-                }
-              }
+              // do data to create task for
               break;
             }
 
-            // Check to see if you need to create a new global state for this operator
             size_t operator_id                  = node->get_operator_id();
             auto gpu_pipeline_task_global_state = _gpu_operator_global_state_map.at(operator_id);
-
             auto local_state =
               std::make_unique<pipeline::gpu_pipeline_task_local_state>(std::move(input_data));
 
@@ -533,6 +514,7 @@ void task_creator::manager_loop()
                                                             destination_data_repositories,
                                                             std::move(local_state),
                                                             gpu_pipeline_task_global_state);
+            task_lock.unlock();
             _task_scheduler->schedule(std::move(task));
           }
         }

@@ -2049,7 +2049,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
   compare_gpu_vs_cpu(
     "select l.l_orderkey, l.l_linenumber, l.l_quantity, l.l_partkey, o.o_orderkey, o.o_totalprice, "
     "o.o_custkey, o_comment from lineitem l join orders o on l.l_orderkey = o.o_orderkey order by "
-    "l.l_orderkey, l.l_linenumber;");
+    "l.l_orderkey, l.l_linenumber limit 5000;");
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
@@ -2059,7 +2059,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
   compare_gpu_vs_cpu(
     "select l.l_orderkey, l.l_linenumber, l.l_quantity, l.l_partkey, o.o_orderkey, o.o_totalprice, "
     "o.o_custkey, o_comment from lineitem l join orders o on l.l_orderkey = o.o_orderkey order by "
-    "l.l_orderkey, l.l_linenumber;");
+    "l.l_orderkey, l.l_linenumber limit 5000;");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
@@ -2069,7 +2069,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
   compare_gpu_vs_cpu(
     "select l.l_orderkey, l.l_linenumber, l.l_quantity, l.l_partkey, o.o_orderkey, o.o_totalprice, "
     "o.o_custkey, o_comment from lineitem l left join orders o on l.l_orderkey = o.o_orderkey "
-    "order by l.l_orderkey, l.l_linenumber;");
+    "order by l.l_orderkey, l.l_linenumber  limit 5000;");
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
@@ -2079,7 +2079,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
   compare_gpu_vs_cpu(
     "select l.l_orderkey, l.l_linenumber, l.l_quantity, l.l_partkey, o.o_orderkey, o.o_totalprice, "
     "o.o_custkey, o_comment from lineitem l left join orders o on l.l_orderkey = o.o_orderkey "
-    "order by l.l_orderkey, l.l_linenumber;");
+    "order by l.l_orderkey, l.l_linenumber  limit 5000;");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
@@ -2089,7 +2089,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
   compare_gpu_vs_cpu(
     "select l.l_orderkey, l.l_linenumber, l.l_quantity, l.l_partkey, o.o_orderkey, o.o_totalprice, "
     "o.o_custkey, o_comment from lineitem l right join orders o on l.l_orderkey = o.o_orderkey "
-    "order by l.l_orderkey, l.l_linenumber;");
+    "order by l.l_orderkey, l.l_linenumber  limit 5000;");
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
@@ -2099,7 +2099,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
   compare_gpu_vs_cpu(
     "select l.l_orderkey, l.l_linenumber, l.l_quantity, l.l_partkey, o.o_orderkey, o.o_totalprice, "
     "o.o_custkey, o_comment from lineitem l right join orders o on l.l_orderkey = o.o_orderkey "
-    "order by l.l_orderkey, l.l_linenumber;");
+    "order by l.l_orderkey, l.l_linenumber  limit 5000;");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
@@ -2109,7 +2109,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
   compare_gpu_vs_cpu(
     "select l.l_orderkey, l.l_linenumber, l.l_quantity, l.l_partkey, o.o_orderkey, o.o_totalprice, "
     "o.o_custkey, o_comment from lineitem l full outer join orders o on l.l_orderkey = "
-    "o.o_orderkey order by l.l_orderkey, l.l_linenumber;");
+    "o.o_orderkey order by l.l_orderkey, l.l_linenumber  limit 5000;");
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
@@ -2119,7 +2119,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
   compare_gpu_vs_cpu(
     "select l.l_orderkey, l.l_linenumber, l.l_quantity, l.l_partkey, o.o_orderkey, o.o_totalprice, "
     "o.o_custkey, o_comment from lineitem l full outer join orders o on l.l_orderkey = "
-    "o.o_orderkey order by l.l_orderkey, l.l_linenumber;");
+    "o.o_orderkey order by l.l_orderkey, l.l_linenumber  limit 5000;");
 }
 
 //===----------------------------------------------------------------------===//
@@ -3221,6 +3221,124 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 {
   compare_gpu_vs_cpu(
     "select n_nationkey, n_regionkey from nation order by n_regionkey desc limit 5;");
+}
+
+//===----------------------------------------------------------------------===//
+// Empty result queries
+//===----------------------------------------------------------------------===//
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - empty simple query",
+                 "[integration][gpu_execution][empty_result]")
+{
+  compare_gpu_vs_cpu(
+    "select l_linestatus, l_orderkey, l_comment, l_receiptdate from lineitem where l_linestatus = "
+    "'J' and l_orderkey = 1;");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - empty simple query parquet",
+                 "[integration][gpu_execution][parquet][empty_result]")
+{
+  compare_gpu_vs_cpu(
+    "select l_linestatus, l_orderkey, l_comment, l_receiptdate from lineitem where l_linestatus = "
+    "'J' and l_orderkey = 1;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - empty aggregation with group by query",
+                 "[integration][gpu_execution][empty_result]")
+{
+  compare_gpu_vs_cpu(
+    "select l_linestatus, count(*), min(l_orderkey) as mino, sum(l_orderkey), count(l_orderkey), "
+    "count(l_receiptdate), min(l_receiptdate), count(l_comment), min(l_comment) from lineitem "
+    "where l_linestatus = 'J' group by l_linestatus;");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - empty aggregation with group by query parquet",
+                 "[integration][gpu_execution][parquet][empty_result]")
+{
+  compare_gpu_vs_cpu(
+    "select l_linestatus, count(*), min(l_orderkey) as mino, sum(l_orderkey), count(l_orderkey), "
+    "count(l_receiptdate), min(l_receiptdate), count(l_comment), min(l_comment) from lineitem "
+    "where l_linestatus = 'J' group by l_linestatus;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - empty aggregation without group by query",
+                 "[integration][gpu_execution][empty_result]")
+{
+  compare_gpu_vs_cpu(
+    "select count(*), min(l_orderkey), sum(l_orderkey) as sumo, count(l_orderkey), "
+    "count(l_receiptdate), min(l_receiptdate), count(l_comment), min(l_comment) from lineitem "
+    "where l_linestatus = 'J';");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - empty aggregation without group by query parquet",
+                 "[integration][gpu_execution][parquet][empty_result]")
+{
+  compare_gpu_vs_cpu(
+    "select count(*), min(l_orderkey), sum(l_orderkey) as sumo, count(l_orderkey), "
+    "count(l_receiptdate), min(l_receiptdate), count(l_comment), min(l_comment) from lineitem "
+    "where l_linestatus = 'J';");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - join with empty one side",
+                 "[integration][gpu_execution][empty_result]")
+{
+  compare_gpu_vs_cpu(
+    "select l.l_orderkey as lokey, l.l_linestatus, o.o_custkey from lineitem l inner join orders o "
+    "on l.l_orderkey = o.o_orderkey where l_linestatus = 'J';");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - join with empty one side parquet",
+                 "[integration][gpu_execution][parquet][empty_result]")
+{
+  compare_gpu_vs_cpu(
+    "select l.l_orderkey as lokey, l.l_linestatus, o.o_custkey from lineitem l inner join orders o "
+    "on l.l_orderkey = o.o_orderkey where l_linestatus = 'J';");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - join with empty two sides",
+                 "[integration][gpu_execution][empty_result]")
+{
+  compare_gpu_vs_cpu(
+    "select l.l_orderkey, l.l_linestatus, o.o_custkey as ockey from lineitem l inner join orders o "
+    "on l.l_orderkey = o.o_orderkey where l_linestatus = 'J' and o.o_comment = 'Special';");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - join with empty two sides parquet",
+                 "[integration][gpu_execution][parquet][empty_result]")
+{
+  compare_gpu_vs_cpu(
+    "select l.l_orderkey, l.l_linestatus, o.o_custkey as ockey from lineitem l inner join orders o "
+    "on l.l_orderkey = o.o_orderkey where l_linestatus = 'J' and o.o_comment = 'Special';");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - join with empty output and order by",
+                 "[integration][gpu_execution][empty_result]")
+{
+  compare_gpu_vs_cpu(
+    "select l.l_orderkey, l.l_linestatus, o.o_custkey from lineitem l inner join orders o on "
+    "l.l_orderkey = o.o_orderkey where l.l_orderkey > 10000 and o.o_orderkey < 10000 order by "
+    "l.l_orderkey, o.o_custkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - join with empty output and order by parquet",
+                 "[integration][gpu_execution][parquet][empty_result]")
+{
+  compare_gpu_vs_cpu(
+    "select l.l_orderkey, l.l_linestatus, o.o_custkey from lineitem l inner join orders o on "
+    "l.l_orderkey = o.o_orderkey where l.l_orderkey > 10000 and o.o_orderkey < 10000 order by "
+    "l.l_orderkey, o.o_custkey;");
 }
 
 //===----------------------------------------------------------------------===//

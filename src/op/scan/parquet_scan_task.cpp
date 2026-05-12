@@ -1066,14 +1066,19 @@ void parquet_scan_task::publish_output(op::operator_data& output_data,
   }
 }
 
-size_t parquet_scan_task::get_estimated_reservation_size() const
+pipeline::reservation_size_info parquet_scan_task::get_estimated_reservation_size_info() const
 {
-  auto current_estimate =
+  std::size_t input_basis =
     this->_local_state->cast<parquet_scan_task_local_state>().get_task_consumption_basis();
   auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
-  auto refined  = g_state.get_memory_history().estimate_peak_memory(current_estimate);
-  if (refined) { return *refined; }
-  return current_estimate;
+  auto peak_opt = g_state.get_memory_history().estimate_peak_memory(input_basis);
+
+  pipeline::reservation_size_info info;
+  info.input_basis          = input_basis;
+  info.had_history          = peak_opt.has_value();
+  info.peak_memory_estimate = peak_opt.value_or(input_basis);
+  info.reservation_size     = info.peak_memory_estimate;
+  return info;
 }
 
 void parquet_scan_task::read_range_into_allocation(

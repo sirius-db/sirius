@@ -36,8 +36,9 @@ namespace pipeline {
 struct pipeline_conversion_result {
   //! The execution-ready pipelines in dependency order
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> scheduled_pipelines;
-  //! Ownership container for operators created during splitting (PARTITION, CONCAT, MERGE, etc.)
-  duckdb::vector<duckdb::unique_ptr<op::sirius_physical_operator>> pipeline_breakers;
+  //! Ownership container for operators inserted during splitting (PARTITION, CONCAT, MERGE,
+  //! and source-side operators such as DUCKDB_SCAN, GPU_PARQUET_SCAN, CPU_SOURCE).
+  duckdb::vector<duckdb::unique_ptr<op::sirius_physical_operator>> inserted_operators;
   //! Number of meta-pipelines (used for progress tracking)
   std::size_t meta_pipeline_count;
 };
@@ -78,7 +79,7 @@ class sirius_pipeline_converter {
 
   // Phase 2: Split pipelines by operator type
   void split_pipelines(duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled);
-  void split_parquet_scan_source(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
+  void insert_parquet_scan_operator(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
   void split_table_scan_source(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
   void split_cpu_source(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
   void split_intermediate_joins(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
@@ -122,7 +123,7 @@ class sirius_pipeline_converter {
 
   // Internal state built during convert(), moved into result
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> scheduled_;
-  duckdb::vector<duckdb::unique_ptr<op::sirius_physical_operator>> pipeline_breakers_;
+  duckdb::vector<duckdb::unique_ptr<op::sirius_physical_operator>> inserted_operators_;
   std::size_t meta_pipeline_count_ = 0;
 };
 

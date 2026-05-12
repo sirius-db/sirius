@@ -220,6 +220,17 @@ class partitioned_operator_data : public pipelineable_operator_data {
   std::size_t _partition_idx = 0;
 };
 
+/**
+ * @brief Input statistics passed to no_history_peak_memory_estimate().
+ *
+ * Carries the two dimensions that operator overrides typically condition on:
+ * the number of input batches and the total uncompressed byte count.
+ */
+struct input_stats {
+  std::size_t num_batches = 0;
+  std::size_t bytes       = 0;
+};
+
 //! sirius_physical_operator is the base class of the physical operators present in the
 //! execution plan
 class sirius_physical_operator {
@@ -278,6 +289,28 @@ class sirius_physical_operator {
 
  public:
   // Operator interface
+
+  /**
+   * @brief Estimate peak GPU memory for this operator when no execution history is available.
+   *
+   * Called by gpu_pipeline_task::get_estimated_reservation_size_info() on the first task
+   * execution for a pipeline (before any history records exist). The default is 2× the
+   * input bytes, matching the historical fallback. Overrides may return a lower value for
+   * operators that are known to be pass-throughs under certain conditions (e.g. concat with
+   * a single batch, or partition with a single partition), or a higher value for operators
+   * that expand input significantly (e.g. decompressing parquet).
+   *
+   * A return value of 0 means "no additional peak memory expected"; the caller will fall
+   * back to the 2× default when every operator in the pipeline returns 0.
+   *
+   * @param stats  Batch count and total input bytes for the task about to run.
+   * @return Estimated peak GPU bytes this operator will allocate.
+   */
+  [[nodiscard]] virtual std::size_t no_history_peak_memory_estimate(const input_stats& stats) const
+  {
+    return stats.bytes * 2;
+  }
+
   virtual std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                                  rmm::cuda_stream_view stream);
 
@@ -315,8 +348,20 @@ class sirius_physical_operator {
   virtual void build_pipelines(pipeline::sirius_pipeline& current,
                                pipeline::sirius_meta_pipeline& meta_pipeline);
 
-  //! Called when the pipeline this operator belongs to finishes. Override to release resources.
-  virtual void finalize_operator() {}
+  //! Called when the pipeline this operator belongs to finishes. Sets finalized=true, then
+  //! dispatches to on_finalize_operator(). Do not override this; override on_finalize_operator().
+  void finalize_operator()
+  {
+    finalized = true;
+    on_finalize_operator();
+  }
+
+  //! True after finalize_operator() has been called on this operator.
+  bool finalized = false;
+
+ protected:
+  //! Override this instead of finalize_operator() to perform cleanup when a pipeline finishes.
+  virtual void on_finalize_operator() {}
 
  public:
   template <class TARGET>

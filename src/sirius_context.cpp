@@ -45,8 +45,10 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdlib>  // for std::getenv
 #include <filesystem>
+#include <iostream>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -157,6 +159,7 @@ void SiriusContext::QueryEnd()
   try {
     spdlog::info("QueryEnd");
     captured_logical_plan_.reset();
+
     query_.reset();
 
     // Drain all downgrade executors before clearing repositories — ensures no downgrade
@@ -239,6 +242,16 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
     config_.get_memory_space_configs());
+
+  {
+    auto disk_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::DISK);
+    if (disk_spaces.empty()) {
+      SIRIUS_LOG_WARN(
+        "SiriusContext: disk memory space is not configured; spilling GPU or HOST data to disk is "
+        "disabled. If queries run out of GPU/HOST memory, downgrades to disk will not be "
+        "possible.");
+    }
+  }
 
   // ---- MGPU-05: Per-NUMA host memory space assertion ----
   // sirius_config::apply_defaults (src/sirius_config.cpp:216) + YAML-path
@@ -694,8 +707,7 @@ duckdb::shared_ptr<const sirius::planner::query> SiriusContext::get_query() cons
 
 bool SiriusContext::is_query_lifecycle_active() const noexcept
 {
-  std::lock_guard lock(query_lifecycle_mutex_);
-  return active_query_depth_ > 0;
+  return query_lifecycle_held_.load(std::memory_order_acquire);
 }
 
 void SiriusContext::set_captured_logical_plan(unique_ptr<LogicalOperator> plan)
@@ -892,25 +904,14 @@ void SiriusContext::throw_if_not_initialized() const
 
 void SiriusContext::acquire_query_lifecycle_slot()
 {
-  std::unique_lock lock(query_lifecycle_mutex_);
-  auto current_thread = std::this_thread::get_id();
-  query_lifecycle_cv_.wait(
-    lock, [&] { return active_query_depth_ == 0 || active_query_owner_ == current_thread; });
-  active_query_owner_ = current_thread;
-  active_query_depth_++;
+  query_lifecycle_mutex_.lock();
+  query_lifecycle_held_.store(true, std::memory_order_release);
 }
 
 void SiriusContext::release_query_lifecycle_slot()
 {
-  std::unique_lock lock(query_lifecycle_mutex_);
-  D_ASSERT(active_query_depth_ > 0);
-  D_ASSERT(active_query_owner_ == std::this_thread::get_id());
-  active_query_depth_--;
-  if (active_query_depth_ == 0) {
-    active_query_owner_ = {};
-    lock.unlock();
-    query_lifecycle_cv_.notify_one();
-  }
+  query_lifecycle_held_.store(false, std::memory_order_release);
+  query_lifecycle_mutex_.unlock();
 }
 
 // ================= Free Functions ================= //

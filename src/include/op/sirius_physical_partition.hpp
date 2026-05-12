@@ -99,6 +99,9 @@ class sirius_physical_partition : public sirius_physical_operator {
     _small_table_bytes  = small_table_bytes;
   }
 
+  [[nodiscard]] std::size_t no_history_peak_memory_estimate(
+    const op::input_stats& stats) const override;
+
  private:
   void get_partition_keys_and_type(sirius_physical_operator* op, bool is_build = false);
 
