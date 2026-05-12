@@ -105,7 +105,7 @@ class sirius_pipeline_converter {
 
   // Phase 3: Compute plan-time wiring descriptors
   // Runtime materialization is done by `materialize_repository_wiring()` from
-  // `pipeline/repository_wiring_materializer.hpp`.
+  // `pipeline/repository_wiring.hpp`.
   void compute_repository_wiring();
 
   // Phase 4: Set up dependencies

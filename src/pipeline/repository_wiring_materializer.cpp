@@ -14,11 +14,10 @@
  * limitations under the License.
  */
 
-#include "pipeline/repository_wiring_materializer.hpp"
-
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
+#include "pipeline/repository_wiring.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
 #include <cucascade/data/data_repository.hpp>

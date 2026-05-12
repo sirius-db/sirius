@@ -27,7 +27,6 @@
 #include <op/sirius_physical_operator_type.hpp>
 #include <op/sirius_physical_partition.hpp>
 #include <pipeline/repository_wiring.hpp>
-#include <pipeline/repository_wiring_materializer.hpp>
 #include <pipeline/sirius_pipeline.hpp>
 
 #include <stdexcept>
