@@ -121,8 +121,6 @@ pipeline_conversion_result sirius_pipeline_converter::convert(sirius_meta_pipeli
   setup_pipeline_parents();
   finalize_pipeline_structure();
   link_join_partition_siblings();
-  // Note: log_pipeline_debug_info() is now called by the engine after
-  // materialize_repository_wiring(), since it inspects runtime port state.
 
   return {std::move(scheduled_),
           std::move(inserted_operators_),
