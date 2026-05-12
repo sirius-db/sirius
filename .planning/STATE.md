@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Gauntlet on Rebased Branch)
 status: executing
-stopped_at: "Phase 22.3 scaffolded (K.7 CTE planner fix). Phases 22, 22.1, 22.2 SHIPPED today on feature/single-node-multi-gpu2. K.7 isolated: Q11 returns 0 rows at SF10+ regardless of num_gpus due to sirius_plan_cte.cpp:50 declaring _types from consumer subplan but execute() forwarding producer batches. Resume by reading 22.3-CONTEXT.md."
-last_updated: "2026-05-08T17:29:49.033Z"
-last_activity: 2026-05-08
+stopped_at: Completed 23-01-PLAN.md — cucascade rebase mid-flight at 9a23f4f; Plan 23-02 resumes with git rebase --continue
+last_updated: "2026-05-12T17:55:38.157Z"
+last_activity: 2026-05-12
 progress:
-  total_phases: 10
+  total_phases: 11
   completed_phases: 2
-  total_plans: 14
-  completed_plans: 14
+  total_plans: 19
+  completed_plans: 15
 ---
 
 # Project State
@@ -20,14 +20,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-05-04)
 
 **Core value:** Any query can transparently execute across every GPU on the node — tasks are scheduled to the GPU where their input data already resides, memory pressure is absorbed by downgrading to the correct NUMA domain, and parquet I/O is routed through a multi-GPU-safe backend.
-**Current focus:** Phase 22.1 — remove-kvikio
+**Current focus:** Phase 23 — update-cucascade-and-sirius-from-upstream
 
 ## Current Position
 
-Phase: 22.2
-Plan: Not started
+Phase: 23 (update-cucascade-and-sirius-from-upstream) — EXECUTING
+Plan: 2 of 5
 Status: Ready to execute
-Last activity: 2026-05-08
+Last activity: 2026-05-12
 
 ```
 v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans | SHIPPED 2026-05-06
@@ -118,6 +118,7 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 | Phase 22.1 P06 | 6min | 3 tasks | 4 files |
 | Phase 22.1-remove-kvikio P05 | 8min | 4 tasks | 3 files |
 | Phase 22.1 P03 | 16min | 3 tasks | 5 files |
+| Phase 23 P01 | 3min | 2 tasks | 0 files |
 
 ## Decisions
 
@@ -280,6 +281,9 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 - [Phase 22.1-remove-kvikio]: Plan 22.1-05: iceberg sites #3 + #4 routed through GPU 0 sirius_ioctx; closes kvikio half of IO-MGPU-02; multi-GPU iceberg residency deferred as IO-MGPU-04 per D-06
 - [Phase 22.1]: [22.1-03] Setter pattern (D-04) for gpu_ioctxs injection on sirius_gpu_parquet_scan_operator — sirius_scan_manager::create_provider_for calls op->set_gpu_ioctxs(gpu_ioctxs) BEFORE returning any provider. Avoids constructor churn through pipeline_converter; mirrors how parquet_scan_task_global_state already accepts the map.
 - [Phase 22.1]: [22.1-03] Single-ioctx-per-scan_data routing (NOT per-slice). All slices in a scan_data share gpu_memory_space (set by prepare_for_processing once per task), so ioctx selection happens once per call. Cross-GPU fan-out is parquet_split_provider's responsibility — it produces per-GPU scan_data instances.
+- [Phase 23]: Re-scoped cucascade rebase target from bcddb89 to 49134ff (CMake C-language cleanup only — no D-03/D-04 impact)
+- [Phase 23]: D-04 KEEP confirmed: small_pinned_host_memory_resource.cpp not touched by PR #121; D-03 DROP confirmed for all 4 overlap files
+- [Phase 23]: Rebase conflict in D-03 file resolved by --theirs + unstage, achieving same surgical split result as planned
 
 ## Accumulated Context
 
@@ -322,6 +326,6 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 
 ## Session Continuity
 
-Last session: 2026-05-08T17:29:49.029Z
-Stopped at: Phase 22.3 scaffolded (K.7 CTE planner fix). Phases 22, 22.1, 22.2 SHIPPED today on feature/single-node-multi-gpu2. K.7 isolated: Q11 returns 0 rows at SF10+ regardless of num_gpus due to sirius_plan_cte.cpp:50 declaring _types from consumer subplan but execute() forwarding producer batches. Resume by reading 22.3-CONTEXT.md.
-Resume file: .planning/phases/22.3-fix-cte-types/22.3-CONTEXT.md
+Last session: 2026-05-12T17:55:38.154Z
+Stopped at: Completed 23-01-PLAN.md — cucascade rebase mid-flight at 9a23f4f; Plan 23-02 resumes with git rebase --continue
+Resume file: None
