@@ -39,7 +39,7 @@ namespace pipeline {
 //!     port is also added to its `partition_join` sibling so the partitioned join branch
 //!     can read the same repository.
 //!   - When the destination's type is `LEFT_DELIM_JOIN`, this throws — a left delim join
-//!     should never act as a destination/source.
+//!     should never act as a destination of the directed edge/source operator of the destination pipeline.
 //!
 //! Precondition: every `source_pipeline` and `dest_pipeline` referenced in `wirings` must
 //! already have its pipeline id assigned (see `sirius_pipeline::set_pipeline_id`). Port
