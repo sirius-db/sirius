@@ -8,6 +8,8 @@ This document covers the GPU expression execution subsystem used by FILTER and P
 
 `gpu_expression_executor` evaluates DuckDB expressions on the GPU. It provides two execution modes:
 
+> **API boundary:** Operator headers and the executor's public header take expressions as `sirius::expression` / `sirius::join_condition` — opaque PIMPL wrappers around `duckdb::Expression` / `duckdb::JoinCondition` defined in `src/include/expression/`. Plan builders wrap at the DuckDB boundary (`sirius::wrap`); operator `.cpp` files unwrap internally via `expression/expression_internal.hpp` to access the raw DuckDB type. This keeps `duckdb/planner/expression/...` includes out of the operator surface.
+
 | Method | Purpose | Used By |
 |--------|---------|---------|
 | `execute(batch)` | Projects: evaluates expressions and returns result columns with all rows | PROJECTION |
@@ -59,11 +61,15 @@ SET expression_executor_strategy = 'ast_jit';   -- or 'ast_interpret', 'material
 | Constant | `BoundConstantExpression` | `42`, `'hello'` |
 | Comparison | `BoundComparisonExpression` | `a > b`, `x = 10`, `a IS NOT DISTINCT FROM b` |
 | Conjunction | `BoundConjunctionExpression` | `a AND b`, `x OR y` |
-| Arithmetic/logical | `BoundOperatorExpression` | `a + b`, `NOT x` |
+| Arithmetic/logical | `BoundOperatorExpression` | `a + b`, `NOT x`, `COALESCE(a, b, 0)`, `x IN (1, 2, 3)` |
 | Function call | `BoundFunctionExpression` | `UPPER(name)`, `YEAR(date)` |
 | Type cast | `BoundCastExpression` | `CAST(x AS DOUBLE)` |
 | CASE/WHEN | `BoundCaseExpression` | `CASE WHEN x > 0 THEN 'pos' ELSE 'neg' END` |
 | BETWEEN | `BoundBetweenExpression` | `x BETWEEN 10 AND 20` |
+
+`COALESCE` is materialized via `cudf::replace_nulls` iteratively across children: the first child is materialized (scalars are lifted to a column); each subsequent child replaces the residual nulls in the running result. Children are only evaluated when the running result still has nulls. The result is wrapped via `materialize_as_ast_column` so COALESCE composes inside AST-capable parents. `count_ast_ops` returns 0 — COALESCE always takes the materialize-only path.
+
+`COMPARE_IN` covers the full numeric set (INT8–INT64, UINT8–UINT64, BOOL8, FLOAT, DOUBLE, DECIMAL32/64/128, all TIMESTAMP precisions, DATE) plus VARCHAR. BOOL8 dispatches via `uint8_t` because `std::vector<bool>::data()` is deleted.
 
 Per-expression-type dispatch lives in `src/expression_executor/specializations/` (one file per expression class: `gpu_execute_comparison.cpp`, `gpu_execute_case.cpp`, etc.). Each specialization decides how to emit AST nodes, materialize, or fall back based on the effective execution mode.
 

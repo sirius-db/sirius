@@ -99,7 +99,7 @@ Key methods:
 - `mark_task_completed()` — increments `tasks_completed`, calls `update_pipeline_status()`
 - `update_pipeline_status()` — checks source-dependent completion logic:
   - DUCKDB_SCAN: finished when `exhausted` flag is set
-  - PARQUET_SCAN: finished when `has_more_partitions` is false and `tasks_created == tasks_completed`
+  - GPU_PARQUET_SCAN: finished when the bound `split_connector` is closed and drained and `tasks_created == tasks_completed`
   - Others: finished when upstream done, ports empty, and all tasks completed
 - `is_ready()` — marks pipeline ready and reverses operators to execution order
 - `register_new_batch_index()` / `update_batch_index()` — batch ordering for order-preserving execution
@@ -206,14 +206,18 @@ In the diagrams below, `[A, B, C]` denotes a pipeline where A is `operators[0]` 
 
 ### TABLE_SCAN Splitting
 
-TABLE_SCAN is replaced with DUCKDB_SCAN or PARQUET_SCAN. A separate scan pipeline is created, and the original TABLE_SCAN is kept as the first operator of the main pipeline:
+TABLE_SCAN splits along two paths depending on the table function:
+
+**Parquet (`parquet_scan` / `read_parquet`):** TABLE_SCAN is replaced with `GPU_PARQUET_SCAN` at `operators[0]` of the same pipeline — no separate scan pipeline is created. The DuckDB bind data is captured into a `parquet_scan_info` and parked on the operator. During `prepare_for_query`, `sirius_scan_manager` reads the info, builds a `split_provider` (parquet or cached), and binds a `split_connector` to the operator. The operator pulls splits from the connector inside `get_next_task_input_data()` (see [Scan — Scan Manager](scan.md#scan-manager)).
+
+**DuckDB-managed (`seq_scan`, `iceberg_scan`):** A separate scan pipeline is created, and the original TABLE_SCAN is kept as the first operator of the main pipeline:
 
 ```mermaid
 graph LR
     SP["Scan Pipeline<br/>[DUCKDB_SCAN]"] -->|"PIPELINE, 'scan'"| MP["Main Pipeline<br/>[TABLE_SCAN, filter, ..., sink]"]
 ```
 
-The DUCKDB_SCAN (or PARQUET_SCAN) is the sole operator in the scan pipeline. TABLE_SCAN stays at `operators[0]` of the main pipeline (line 391). The repository uses `PIPELINE` barrier on the `"scan"` port.
+DUCKDB_SCAN (or ICEBERG_SCAN) is the sole operator in the scan pipeline. TABLE_SCAN stays at `operators[0]` of the main pipeline. The repository uses `PIPELINE` barrier on the `"scan"` port.
 
 ### HASH_JOIN Probe Side
 

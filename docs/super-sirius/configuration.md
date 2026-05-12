@@ -261,7 +261,7 @@ Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
 |----------|---------|-------------|
 | `print_gpu_table_max_rows` | - | Max rows to print in debug output |
 | `enable_fallback_check` | - | Enable fallback validation |
-| `enable_duckdb_fallback` | false | Fall back to DuckDB CPU on Sirius errors |
+| `enable_duckdb_fallback` | true | Fall back to DuckDB CPU on Sirius errors. Matches the legacy `gpu_processing` path. Set to `false` to surface Sirius errors instead of silently falling back. |
 | `enable_regex_jit_impl` | - | Use JIT regex implementation |
 
 ## Legacy Config Flags
@@ -275,7 +275,7 @@ Static constants from `namespace duckdb::Config` (used by legacy Sirius) and `na
 | `USE_PIN_MEM_FOR_CPU_PROCESSING` | true | `duckdb::Config` |
 | `USE_PIN_MEM_FOR_CACHING` | false | `duckdb::Config` |
 | `USE_CUDF_EXPR` | true | `duckdb::Config` |
-| `ENABLE_DUCKDB_FALLBACK` | false | `duckdb::Config` |
+| `ENABLE_DUCKDB_FALLBACK` | true | `duckdb::Config` |
 | `NUM_GPU_EXECUTOR_THREADS` | 2 | `sirius::Config` |
 | `NUM_PIPELINE_EXECUTOR_THREADS` | 1 | `sirius::Config` |
 | `NUM_GPU` | 1 | `sirius::Config` |
