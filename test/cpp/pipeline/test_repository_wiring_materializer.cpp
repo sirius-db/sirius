@@ -47,7 +47,6 @@ using sirius::pipeline::sirius_pipeline_build_state;
 namespace {
 
 // Test scaffolding: minimal pipeline_build_context, reused across cases.
-// Mirrors the pattern in test_get_next_ports_after_sink.cpp.
 class wiring_test_env {
  public:
   wiring_test_env() = default;
