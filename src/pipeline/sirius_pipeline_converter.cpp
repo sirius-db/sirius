@@ -1014,11 +1014,10 @@ void sirius_pipeline_converter::compute_repository_wiring()
 
 void sirius_pipeline_converter::setup_pipeline_parents()
 {
-  // Drive parents off the wiring descriptors instead of reading materialised ports —
+  // Derive parents off the wiring descriptors instead of reading materialised ports —
   // ports aren't attached until `materialize_repository_wiring()` runs after `convert()`
   // returns. Each descriptor encodes a `source_pipeline -> dest_pipeline` edge that the
-  // old code derived from `add_next_port_after_sink({next_op, port_id})`; emit order is
-  // preserved so the resulting parents list matches the pre-refactor ordering.
+  // old code derived from `add_next_port_after_sink({next_op, port_id})`
   for (const auto& pipeline : scheduled_) {
     pipeline->parents.clear();
     pipeline->dependencies.clear();
