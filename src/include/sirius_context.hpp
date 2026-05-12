@@ -37,12 +37,10 @@
 #include <duckdb/planner/logical_operator.hpp>
 
 #include <atomic>
-#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
-#include <thread>
 #include <vector>
 
 namespace cucascade::memory {
@@ -243,12 +241,11 @@ class SiriusContext : public ClientContextState {
   std::atomic<int> _internal_query_depth{0};
   // The current Super Sirius runtime is shared across connections, so query
   // lifecycle callbacks and engine execution must be serialized to avoid
-  // cross-connection state corruption.
-  mutable std::mutex query_lifecycle_mutex_;
-  std::condition_variable query_lifecycle_cv_;
-  std::thread::id active_query_owner_{};
-  std::size_t active_query_depth_ = 0;
-  bool is_initialized_            = false;
+  // cross-connection state corruption. Held for the duration of
+  // QueryBegin→QueryEnd; InternalQueryGuard paths skip it.
+  std::mutex query_lifecycle_mutex_;
+  std::atomic<bool> query_lifecycle_held_{false};
+  bool is_initialized_ = false;
   sirius::sirius_config config_;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;
   // Destroyed before memory_manager_ (declared after it — reverse destruction order).
