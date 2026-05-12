@@ -103,7 +103,7 @@ class sirius_pipeline_converter {
                              duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
                              size_t pipeline_idx);
 
-  // Phase 3: Compute plan-time wiring descriptors (no engine access).
+  // Phase 3: Compute plan-time wiring descriptors
   // Runtime materialization is done by `materialize_repository_wiring()` from
   // `pipeline/repository_wiring_materializer.hpp`.
   void compute_repository_wiring();
