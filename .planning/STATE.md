@@ -1,16 +1,16 @@
 ---
 gsd_state_version: 1.0
 milestone: v1.3
-milestone_name: Gauntlet on Rebased Branch)
-status: executing
-stopped_at: Completed 23-04-PLAN.md — merge commit 49b7b86 integrates origin/dev into feature/single-node-multi-gpu2; 6 conflicts resolved; build green; 4 gauntlet suites pass; Plan 23-05 unblocked
-last_updated: "2026-05-12T18:36:06.287Z"
+milestone_name: Gauntlet on Rebased Branch
+status: complete
+stopped_at: "Completed 23-05-PLAN.md — Phase 23 gauntlet PARTIAL (REG-05/REG-06 L1 FAIL: convert_gpu_to_gpu regression from Phase 23 Plan 02 rebase commit 8392c3d; all other 15 invariant gates PASS; side-benefit CONFIRMED: 7cc7a79 closed pin_table suite-run flake)"
+last_updated: "2026-05-12T20:00:00.000Z"
 last_activity: 2026-05-12
 progress:
   total_phases: 11
-  completed_phases: 2
+  completed_phases: 3
   total_plans: 19
-  completed_plans: 18
+  completed_plans: 19
 ---
 
 # Project State
@@ -122,6 +122,7 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 | Phase 23 P02 | 12min | 2 tasks | 2 files |
 | Phase 23 P03 | 8min | 2 tasks | 1 files |
 | Phase 23 P04 | 35min | 2 tasks | 7 files |
+| Phase 23 P05 | ~60min | 4 tasks | 5 files |
 
 ## Decisions
 
@@ -294,6 +295,13 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 - [Phase 23]: 6 merge conflicts resolved — all behavioral-correctness-driven, 0 mechanical ours/theirs picks; pipeline_breakers_ auto-fix (Rule 1) for 972cb32 rename
 - [Phase 23]: duckdb_scan_executor.cpp: integrated reservation_info struct API + NUMA-preference routing — both required simultaneously
 - [Phase 23]: [mgpu] first-run flake (cudaErrorInvalidValue) confirmed pre-existing; 7cc7a79 flake disposition deferred to Plan 23-05
+- [Phase 23]: [23-05] Phase 23 gauntlet PARTIAL — 15/17 gates PASS; REG-05 [mgpu_stress] and REG-06 Leg1 [multi_gpu_foundation] FAIL with cudaErrorInvalidValue at representation_converter.cpp:628 (new convert_gpu_to_gpu column-walk path hits alloc_and_peer_copy_async HtoD copy on broken-peer-DMA hardware); Phase 24 fix: add rmm::cuda_set_device_raii{dst_device} before line 628
+- [Phase 23]: [23-05] Side-benefit CONFIRMED: [mgpu-audit] 6/6 PASS in suite mode (was flaky in Phase 22.3 suite runs); 7cc7a79 task-creation race fix incidentally closed the pin_table suite-run flake; carry-forward retired
+- [Phase 23]: [23-05] sanitizer_gate_22.sh cluster_B=1 is a false positive: total_races=0; alloc_and_peer_copy_async frame appears in benign cudaErrorPeerAccessAlreadyEnabled backtraces from probe_peer_dma_works; Cluster B same-stream invariant actually holds; gate script needs update in Phase 24
+- [Phase 23]: [23-05] REG-03 now 49/49 71623 assertions (was 48/48 71607); +1 test +16 assertions from origin/dev upstream additions — improvement, not regression
+- [Phase 23]: [23-05] HYG-02 = 40 (unchanged; all in src/legacy/); cucascade gitlink = 1e889d7 (confirmed matches Plan 23-02 SHA)
+- [Phase 23]: [23-05] All Phase 22.x grep gates preserved post origin/dev merge; CTE producer_types, SF10 Q11 test, downgrade tier gate, drain_after_error, PIN-MGPU-01 chunk_memory_spaces all present
+- [Phase 23]: [23-05] Conflict resolution audit: all 6 Plan 23-04 conflicts resolved correctly; see 23-04-CONFLICT-LOG.md; behavioral-correctness-driven resolutions; 0 mechanical ours/theirs picks
 
 ## Accumulated Context
 

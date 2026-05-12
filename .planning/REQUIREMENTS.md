@@ -155,6 +155,9 @@
 | fu17-cluster-b | 22 | Complete (Cluster B = 0 post-fix; cucascade pin c666b21) |
 | IO-MGPU-03 | 22.1 | Complete (Validated 2026-05-08) — kvikio fully removed from src/; GATE-22.1-A bypass-grep zero; K.1 (Cluster A) closed; v1.4 ship-gate gauntlet PASS without regression |
 | IO-MGPU-02 | 22.1 | Partial (kvikio half closed; per-GPU iceberg residency renamed as IO-MGPU-04 deferred to v1.6+) |
+| MERGE-CC-23 | 23 | Partial — cucascade fork rebased onto bcddb89 (PR #121); 6 commits ahead of upstream; surgical split of 6236494 correct; commit 8392c3d introduces convert_gpu_to_gpu regression on broken-peer-DMA hardware (Phase 24 fix candidate). See 23-VERDICT.md + 23-CUCASCADE-DIFF.md. |
+| MERGE-DEV-23 | 23 | Complete — origin/dev merged into feature/single-node-multi-gpu2 at commit 49b7b86; 6 conflicts resolved (all behavioral-correctness-driven); 12 upstream commits absorbed; build green; all invariant grep gates preserved. |
+| GAUNTLET-23 | 23 | Partial — 15/17 gates PASS; REG-05 [mgpu_stress] and REG-06 Leg1 [multi_gpu_foundation] FAIL (cudaErrorInvalidValue at representation_converter.cpp:628 from new convert_gpu_to_gpu column-walk path via alloc_and_peer_copy_async on broken-peer-DMA hardware). All other gates (REG-01..04, [datasource_factory], [tpch_sf10], [mgpu-audit], GATE-22.1-A/B/C, K.6, K.7, Cluster B, HYG-02) PASS. Side-benefit: 7cc7a79 closed pin_table suite-run flake. See 23-VERDICT.md. |
 
 **Coverage:** 36 / 36 requirements mapped to phases (32 v1.4 + 2 Phase 22 + 2 Phase 22.1). Validated by roadmapper 2026-05-04. Phase assignments confirmed against compile-graph dependency order: 16 → 17 → 18 → 19 → 20 → 21 → 22 → 22.1. Plan-level traceability filled in via per-phase SUMMARYs.
 
