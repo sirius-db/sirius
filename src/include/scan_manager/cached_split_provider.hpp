@@ -21,9 +21,11 @@
 
 #include <cudf/column/column.hpp>
 
+#include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/planner/expression.hpp>
 
+#include <cstddef>
 #include <memory>
 #include <vector>
 
@@ -53,15 +55,33 @@ namespace sirius::scan_manager {
  */
 class cached_split_provider : public split_provider {
  public:
+  /// GPU-tier constructor: the pinned columns are GPU-resident cudf columns. start()
+  /// emits one zero-copy gpu_table_representation per batch.
   cached_split_provider(std::vector<std::vector<std::shared_ptr<cudf::column>>> columns_per_request,
                         cucascade::memory::memory_space& memory_space,
                         std::shared_ptr<duckdb::Expression> filter_expression,
                         std::shared_ptr<op::scan::scan_plan const> plan);
 
+  /// HOST-tier constructor: each chunk in @p host_chunks is a host_data_representation
+  /// holding all pinned columns. @p column_indices selects the columns required by the
+  /// scan in scan_plan D-order. start() slices each chunk by these indices and emits
+  /// one host_data_representation-backed batch per chunk; conversion to GPU happens
+  /// downstream in scan_cached_operator_data::prepare_for_processing.
+  cached_split_provider(
+    std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
+    std::vector<std::size_t> column_indices,
+    cucascade::memory::memory_space& memory_space,
+    std::shared_ptr<duckdb::Expression> filter_expression,
+    std::shared_ptr<op::scan::scan_plan const> plan);
+
   std::future<void> start(exec::thread_pool& pool, split_connector& connector) override;
 
  private:
+  // Populated when constructed via the GPU constructor; empty in HOST mode.
   std::vector<std::vector<std::shared_ptr<cudf::column>>> _columns_per_request;
+  // Populated when constructed via the HOST constructor; empty in GPU mode.
+  std::vector<std::shared_ptr<cucascade::host_data_representation>> _host_chunks;
+  std::vector<std::size_t> _column_indices;
   cucascade::memory::memory_space* _memory_space;
   std::shared_ptr<duckdb::Expression> _filter_expression;
   std::shared_ptr<op::scan::scan_plan const> _plan;

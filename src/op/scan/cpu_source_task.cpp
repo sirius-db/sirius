@@ -102,7 +102,7 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
     return std::make_shared<cucascade::data_batch>(
       get_next_batch_id(),
       std::make_unique<host_data_representation>(
-        std::make_unique<host_table_allocation>(
+        host_table_allocation::create(
           nullptr, std::vector<cucascade::memory::column_metadata>{}, 0),
         &mem_space));
   }
@@ -138,7 +138,7 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
     return std::make_shared<cucascade::data_batch>(
       get_next_batch_id(),
       std::make_unique<host_data_representation>(
-        std::make_unique<host_table_allocation>(
+        host_table_allocation::create(
           nullptr, std::vector<cucascade::memory::column_metadata>{}, 0),
         &mem_space));
   }
@@ -263,7 +263,7 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
   }
 
   auto table_allocation =
-    std::make_unique<host_table_allocation>(std::move(allocation), std::move(columns), offset);
+    host_table_allocation::create(std::move(allocation), std::move(columns), offset);
   auto table = std::make_unique<host_data_representation>(std::move(table_allocation), &mem_space);
   return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(table));
 }
