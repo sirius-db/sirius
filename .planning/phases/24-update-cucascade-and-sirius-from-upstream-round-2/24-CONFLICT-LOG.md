@@ -136,22 +136,98 @@ Extra: (new) fix(test) → 5203de5 [Rule 1 auto-fix for upstream test API mismat
 - duckdb_scan_executor.cpp (reservation_info + NUMA-preference vs 2e197c6 host-tier + ba5ed27 descriptors split)
 - cucascade gitlink (D-05: ours always wins)
 
-### Conflicted files (Plan 24-03 enumerates):
-(placeholder)
+### Conflicted files (9 files from 2e197c6's cucascade API changes vs our ff06fac pre-adaptation)
 
-### Auto-merged but high-risk grep verifications (Plan 24-03 fills in):
-- drain_after_error preserved in task_scheduler.cpp / sirius_engine.cpp
-- _no_pref_rr_counter + SCHED-RR preserved in task_scheduler.cpp
-- PIN-MGPU-01 chunk_memory_spaces grep >= baseline
-- kvikio bypass grep = 0
-- CTE producer_types fix preserved at src/planner/sirius_plan_cte.cpp:52
-- downgrade_executor tier gate preserved at src/downgrade/downgrade_executor.cpp:79,89,182
+| File | Commits involved | D-01 decision |
+|------|-----------------|---------------|
+| `cucascade` (gitlink) | D-05 | OURS-WINS → `5203de5` |
+| `src/include/memory/multiple_blocks_allocation_accessor.hpp` | 2e197c6 vs ff06fac | UPSTREAM (comment before template) |
+| `src/include/op/result/host_table_chunk_reader.hpp` | 2e197c6 vs ff06fac | INTEGRATE: upstream method signatures, our value-type field |
+| `src/op/result/host_table_chunk_reader.cpp` | 2e197c6 vs ff06fac | INTEGRATE: upstream shared_ptr params, our flexible template |
+| `src/include/scan_manager/cached_split_provider.hpp` | 2e197c6 vs ff06fac | INTEGRATE BOTH: keep `_chunk_memory_spaces` + add upstream HOST-tier fields |
+| `src/scan_manager/cached_split_provider.cpp` | 2e197c6 vs ff06fac | INTEGRATE: upstream HOST ctor + our GPU ctor preserved |
+| `src/include/scan_manager/sirius_scan_manager.hpp` | 2e197c6 vs ff06fac | INTEGRATE BOTH: keep `chunk_memory_spaces` + add upstream `host_chunks`/`tier`/`memory_space` |
+| `src/scan_manager/sirius_scan_manager.cpp` | 2e197c6 vs ff06fac | INTEGRATE BOTH: our `chunk_memory_spaces` + upstream `tier=GPU` |
+| `src/pipeline/sirius_pipeline_converter.cpp` | ba5ed27 vs PIN-MGPU-01 | Keep `configure_partition_min_partitions()`, drop `log_pipeline_debug_info()` (ports not attached until after convert returns) |
+| `src/sirius_extension.cpp` | 2e197c6 + PIN-MGPU-01 | Keep our per-file kvikio-bypass loop + add upstream HOST-tier conversion branch inside loop |
+| `test/cpp/memory/test_host_table_utils.cpp` | 2e197c6 vs ff06fac | UPSTREAM formatting (replace_all for identical formatting conflicts) |
+
+### Per-file conflict rationale
+
+**1. `cucascade` gitlink (D-05):**
+- Upstream proposed `96bfea1` (pure upstream). Our fork is at `5203de5` (descendant of `96bfea1`).
+- D-05 ours-wins: git automatically fast-forwarded to `5203de5`.
+
+**2. `multiple_blocks_allocation_accessor.hpp`:**
+- Our adaptation had removed a 3-line comment before `template <typename Ptr>`.
+- Upstream 2e197c6 retained it. D-01: take upstream's comment.
+
+**3. `host_table_chunk_reader.hpp`:**
+- Conflict: our `allocation_ptr` (typedef alias) in method params vs upstream's explicit `std::shared_ptr<multiple_blocks_allocation>`.
+- Private field: our value type (`allocation_ptr _allocation`) vs upstream's const-reference (`shared_ptr<...> const& _allocation`).
+- Resolution: Upstream's explicit shared_ptr for method signatures; our value type for `_allocation` field (avoids dangling-reference risk from const-ref).
+
+**4. `host_table_chunk_reader.cpp`:**
+- 4 conflict blocks, all method signature variants.
+- Resolution: Upstream shared_ptr param style for standard methods; our flexible `template <bool HasNulls, typename OffsetType, typename AllocPtr>` kept for `make_duckdb_strings` (more general).
+
+**5. `cached_split_provider.hpp`:**
+- Conflict: our `_chunk_memory_spaces` (PIN-MGPU-01 per-chunk GPU routing) vs upstream's HOST-tier fields.
+- Resolution: INTEGRATE BOTH — preserved `_chunk_memory_spaces` as D-09 unique behavior, added all upstream HOST fields (`_host_chunks`, `_column_indices`, `_memory_space`).
+
+**6. `cached_split_provider.cpp`:**
+- Upstream added a HOST-tier constructor that our pre-adaptation didn't have.
+- Resolution: Added upstream HOST ctor body as a second constructor; our GPU ctor unchanged.
+
+**7. `sirius_scan_manager.hpp`:**
+- Conflict: our `chunk_memory_spaces` in `pinned_entry` struct vs upstream's `host_chunks`, `tier`, `memory_space` fields.
+- Resolution: INTEGRATE BOTH — all fields coexist, GPU ctor uses `chunk_memory_spaces`, HOST path uses new fields.
+
+**8. `sirius_scan_manager.cpp`:**
+- Conflict in `insert_pinned_entry`: our `chunk_memory_spaces = std::move(...)` vs upstream's `tier = GPU; memory_space = ...`.
+- Resolution: INTEGRATE — kept our `chunk_memory_spaces` move assignment + added upstream's `tier = GPU` assignment.
+- `insert_pinned_entry_host` added as new function from upstream.
+
+**9. `sirius_pipeline_converter.cpp`:**
+- Small conflict: our `configure_partition_min_partitions(); log_pipeline_debug_info();` vs upstream's empty hunk.
+- Resolution: Keep `configure_partition_min_partitions()` (PIN-MGPU-01 SCHED-RR unique behavior). Drop `log_pipeline_debug_info()` — ports not attached until after convert() returns (upstream correctly removed it).
+
+**10. `sirius_extension.cpp`:**
+- Most complex: 4 conflict blocks in `PinTableFunction`.
+- Block 1 (includes): Integrated both our `<rmm/cuda_device.hpp>` AND upstream's `<rmm/cuda_stream.hpp>` + `<cucascade/data/cpu_data_representation.hpp>`.
+- Blocks 2-3 (comment + gpu_spaces setup): Kept our PIN-MGPU-01 comment + added upstream's `gpu_mem_space` + `host_mem_space` for HOST tier.
+- Block 4 (large read loop): KEY DECISION — kept our per-file kvikio-bypass + PIN-MGPU-01 round-robin loop AND added upstream's HOST-tier conversion path (D2H conversion + `host_chunks` accumulation) inside the loop.
+- Post-merge D-04 fix: Missing `stream_view` arg in `gpu_table_representation(tbl, space)` → `(tbl, space, stream_view)` (committed as separate fix-up `90fad83`).
+
+**11. `test_host_table_utils.cpp`:**
+- Two identical formatting conflicts for `host_table_allocation::create()` call.
+- Resolution: `replace_all=true`, upstream formatting (D-01).
+
+### Auto-merged but high-risk grep verifications (all PASS):
+
+| Gate | Pattern | Count | Status |
+|------|---------|-------|--------|
+| drain_after_error | `drain_after_error` in src/ | 6 | PASS — preserved |
+| SCHED-RR | `configure_partition_min_partitions\|SCHED_RR` in src/ | 4 | PASS — preserved |
+| CTE producer_types | `producer_types` in src/ | 2 | PASS — preserved |
+| downgrade tier gate | `downgrade.*tier\|tier.*downgrade` in src/ | 5 | PASS — preserved |
+| HYG-02 cuda_stream_default | `cuda_stream_default` in src/ | 40 | PASS — ≤40 |
+| kvikio-free | `source_info{path\|datasource::create` in src/ | 1 (comment only) | PASS — no actual usage |
+| chunk_memory_spaces | `chunk_memory_spaces` in src/ | 42 | PASS — preserved |
+
+### D-05 gitlink verification:
+```
+LINKPOST=5203de5a028ccb57402a4105e35282c567c3ee5a → PASS
+```
 
 ---
 
-## Summary table (Plans 24-02 + 24-03 fill in)
+## Summary table
 
 | Component | Conflicts | Resolution path | Verification |
 |-----------|-----------|-----------------|--------------|
-| cucascade rebase | 1 predicted (commit 3) | keep our P2P code + take upstream HOST-tier type changes | cucascade ctest + grep gates |
-| sirius merge | <N> | upstream-favored per D-01 | build + invariant greps |
+| cucascade rebase | 1 predicted (commit 3) | keep our P2P code + take upstream HOST-tier type changes | cucascade ctest 1/1 PASS + grep gates |
+| sirius merge | 9 conflict files + D-05 gitlink | upstream-favored per D-01; INTEGRATE BOTH for parallel code paths | MCP build 79/79 PASS + 7 invariant gates + unit tests |
+| [pin_table] | N/A | Preserved throughout merge | `[pin_table]`: 51/51 assertions PASS |
+| [pin_table_host] | N/A | New upstream test from 2e197c6 | `[pin_table_host]`: 51/51 assertions PASS |
+| [mgpu] | N/A | All multi-GPU invariants preserved | `[mgpu]`: 79091/79091 assertions PASS (16 tests) |
