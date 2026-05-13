@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Gauntlet on Rebased Branch)
-status: Phase 23 PASS (17/17 gauntlet gates)
-stopped_at: Completed 23-04-PLAN.md — merge commit 49b7b86 integrates origin/dev into feature/single-node-multi-gpu2; 6 conflicts resolved; build green; 4 gauntlet suites pass; Plan 23-05 unblocked
-last_updated: "2026-05-13T11:09:55.154Z"
+status: executing
+stopped_at: Completed 24-01-PLAN.md — upstream diff triage + conflict-log skeleton + cucascade rebase paused at commit 3 (8392c3d); Plan 24-02 unblocked to resolve representation_converter.cpp conflict
+last_updated: "2026-05-13T15:11:45.142Z"
 last_activity: 2026-05-13
 progress:
-  total_phases: 11
+  total_phases: 12
   completed_phases: 3
-  total_plans: 21
-  completed_plans: 21
+  total_plans: 26
+  completed_plans: 22
 ---
 
 # Project State
@@ -20,13 +20,13 @@ progress:
 See: .planning/PROJECT.md (updated 2026-05-04)
 
 **Core value:** Any query can transparently execute across every GPU on the node — tasks are scheduled to the GPU where their input data already resides, memory pressure is absorbed by downgrading to the correct NUMA domain, and parquet I/O is routed through a multi-GPU-safe backend.
-**Current focus:** Phase 23 — update-cucascade-and-sirius-from-upstream
+**Current focus:** Phase 24 — update-cucascade-and-sirius-from-upstream-round-2
 
 ## Current Position
 
-Phase: 23
-Plan: Not started
-Status: Phase 23 PASS (17/17 gauntlet gates)
+Phase: 24 (update-cucascade-and-sirius-from-upstream-round-2) — EXECUTING
+Plan: 2 of 5
+Status: Ready to execute
 Last activity: 2026-05-13
 
 ```
@@ -125,6 +125,7 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 | Phase 23 P05 | ~60min | 4 tasks | 5 files |
 | Phase 23 P06 | ~20min | 2 tasks | 2 files |
 | Phase 23 P07 | ~90min | 5 tasks | 8 files |
+| Phase 24 P01 | 20min | 2 tasks | 3 files |
 
 ## Decisions
 
@@ -310,6 +311,8 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 - [Phase 23]: [23-07] sanitizer_gate_22.sh updated: flat grep replaced with windowed awk (in_race state machine); P22_SELFTEST=1 mode added; cluster_B=0 on pre-recorded Phase 23-05 log (was false-positive 1)
 - [Phase 23]: [23-07] cudf copy_partitions memcheck violations (94 Invalid __global__ read in libcudf.so) newly visible in Leg 1 memcheck run because new convert_gpu_to_gpu path exercises checksum cudf::pack(); classified as cudf library baseline (not sirius/cucascade regression); test passes 7/7 without sanitizer
 - [Phase 23]: [23-07] Cucascade fork now 8 commits ahead of bcddb89 (was 6 post-Phase-23-02); CC-UPSTREAM-01 carry policy preserved; no upstream PRs opened
+- [Phase 24]: alloc_and_peer_copy_async and reconstruct_column_p2p are 100% fork-only code — not in upstream; 7/8 rebase commits are CLEAN, only 8392c3d is RE-DERIVE on representation_converter.cpp
+- [Phase 24]: Cucascade rebase paused at commit 3 (8392c3d) on representation_converter.cpp conflict — Plan 24-02 resolves by keeping P2P block + taking upstream HOST-tier parameter-type changes
 
 ## Accumulated Context
 
@@ -354,6 +357,6 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 
 ## Session Continuity
 
-Last session: 2026-05-12T18:36:06.283Z
-Stopped at: Completed 23-04-PLAN.md — merge commit 49b7b86 integrates origin/dev into feature/single-node-multi-gpu2; 6 conflicts resolved; build green; 4 gauntlet suites pass; Plan 23-05 unblocked
+Last session: 2026-05-13T15:11:45.138Z
+Stopped at: Completed 24-01-PLAN.md — upstream diff triage + conflict-log skeleton + cucascade rebase paused at commit 3 (8392c3d); Plan 24-02 unblocked to resolve representation_converter.cpp conflict
 Resume file: None
