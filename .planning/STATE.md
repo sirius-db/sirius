@@ -1,16 +1,16 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.5+
-milestone_name: Upstream sync (cucascade + sirius round 2)
-status: complete
-stopped_at: "Completed 24-05-PLAN.md — Phase 24 PASS (18/18 gauntlet gates); cucascade pin 9da4047→5203de5; sirius origin/dev merged; 24-VERDICT.md + 24-CUCASCADE-DIFF.md authored"
-last_updated: "2026-05-13T00:00:00Z"
+milestone: v1.3
+milestone_name: Gauntlet on Rebased Branch)
+status: verifying
+stopped_at: Completed 24-05-PLAN.md — Phase 24 PASS (18/18 gauntlet); verdict + diff authored; planning metadata updated; Phase 24 CLOSED
+last_updated: "2026-05-13T17:15:25.088Z"
 last_activity: 2026-05-13
 progress:
   total_phases: 12
   completed_phases: 4
-  total_plans: 31
-  completed_plans: 31
+  total_plans: 26
+  completed_plans: 26
 ---
 
 # Project State
@@ -24,9 +24,9 @@ See: .planning/PROJECT.md (updated 2026-05-04)
 
 ## Current Position
 
-Phase: 24 (update-cucascade-and-sirius-from-upstream-round-2) — COMPLETE
-Plan: 5 of 5 (all complete)
-Status: Phase 24 PASS (18/18 gauntlet gates); 24-VERDICT.md authored; Phase 24 CLOSED
+Phase: 24
+Plan: Not started
+Status: Phase complete — ready for verification
 Last activity: 2026-05-13
 
 ```
