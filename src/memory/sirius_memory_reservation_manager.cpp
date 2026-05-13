@@ -25,6 +25,8 @@
 
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
+#include <cuda_runtime_api.h>
+
 namespace sirius {
 namespace memory {
 
@@ -50,8 +52,18 @@ sirius_memory_reservation_manager::~sirius_memory_reservation_manager()
   // Restore the previous cuDF device resources saved in the constructor.
   // Calling reset_current_device_resource_ref() would leave cuDF with a null/invalid
   // resource that crashes subsequent allocations in other tests or code paths.
+  //
+  // Before restoring the device resource refs, drain each GPU so any pending
+  // stream-ordered frees (cudaFreeAsync) against the cuda_async_memory_resource
+  // pool we are about to destroy have completed. Without this drain, callers
+  // that leave async deallocations un-synchronized (e.g., a TEST_CASE that lets
+  // its cuda_stream + data_batches fall out of scope without an explicit sync)
+  // can corrupt the driver's per-device pool list, which then crashes the next
+  // sirius_memory_reservation_manager that constructs a fresh pool on the same
+  // device. The cost is a single device sync per managed GPU at teardown.
   for (std::size_t i = 0; i < gpu_spaces.size() && i < prev_device_mrs_.size(); ++i) {
     rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{gpu_spaces[i]->get_device_id()}};
+    cudaDeviceSynchronize();
     cudf::set_current_device_resource_ref(prev_device_mrs_[i]);
   }
 }
