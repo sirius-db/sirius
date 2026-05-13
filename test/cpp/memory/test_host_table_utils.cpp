@@ -472,7 +472,7 @@ TEST_CASE("host_table_utils - pack metadata with gaps across multiple blocks",
   columns.push_back(big_builder.make_column_metadata(num_rows));
 
   auto const sz         = allocation->size_bytes();
-  auto table_allocation = std::make_unique<cucascade::memory::host_table_allocation>(
+  auto table_allocation = cucascade::memory::host_table_allocation::create(
     std::move(allocation), std::move(columns), sz);
   auto host_table =
     std::make_unique<cucascade::host_data_representation>(std::move(table_allocation), host_space);
@@ -602,7 +602,7 @@ TEST_CASE("host_table_utils - underfilled varchar column truncates rows",
   columns.push_back(str_builder.make_column_metadata(rows_fit));
 
   auto const sz         = allocation->size_bytes();
-  auto table_allocation = std::make_unique<cucascade::memory::host_table_allocation>(
+  auto table_allocation = cucascade::memory::host_table_allocation::create(
     std::move(allocation), std::move(columns), sz);
   auto host_table =
     std::make_unique<cucascade::host_data_representation>(std::move(table_allocation), host_space);

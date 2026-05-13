@@ -458,7 +458,7 @@ std::shared_ptr<cucascade::data_batch> duckdb_scan_task_local_state::make_data_b
   // Make the host table allocation
   auto const sz = get_tail_byte_offset();
   auto table_allocation =
-    std::make_unique<host_table_allocation>(std::move(_allocation), std::move(columns), sz);
+    host_table_allocation::create(std::move(_allocation), std::move(columns), sz);
 
   // Make the host table representation
   auto table = std::make_unique<host_data_representation>(std::move(table_allocation), _host_space);

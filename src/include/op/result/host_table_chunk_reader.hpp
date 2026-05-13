@@ -82,8 +82,10 @@ class host_table_chunk_reader {
      * @param[in] col The column metadata describing the column's buffer layout
      * @param[in] allocation The multiple blocks allocation containing the column data
      */
+    using allocation_ptr = cucascade::memory::host_table_allocation::buffers_ptr;
+
     column_reader(cucascade::memory::column_metadata const& col,
-                  std::unique_ptr<multiple_blocks_allocation> const& allocation);
+                  allocation_ptr const& allocation);
 
     /**
      * @brief Copy the null mask to the duckdb validity mask for the given row range
@@ -96,7 +98,7 @@ class host_table_chunk_reader {
     void copy_mask_to_validity(duckdb::ValidityMask& validity,
                                size_t row_offset,
                                size_t count,
-                               std::unique_ptr<multiple_blocks_allocation> const& allocation);
+                               allocation_ptr const& allocation);
 
     /**
      * @brief Copy fixed-width data into the duckdb vector for the given row range
@@ -109,7 +111,7 @@ class host_table_chunk_reader {
     void copy_fixed_width(duckdb::Vector& vector,
                           size_t row_offset,
                           size_t count,
-                          std::unique_ptr<multiple_blocks_allocation> const& allocation);
+                          allocation_ptr const& allocation);
 
     /**
      * @brief Copy string data into the duckdb vector for the given row range
@@ -122,7 +124,7 @@ class host_table_chunk_reader {
     void copy_string(duckdb::Vector& vector,
                      size_t row_offset,
                      size_t count,
-                     std::unique_ptr<multiple_blocks_allocation> const& allocation);
+                     allocation_ptr const& allocation);
   };
 
  public:
@@ -162,9 +164,9 @@ class host_table_chunk_reader {
   }
 
  private:
+  using allocation_ptr = cucascade::memory::host_table_allocation::buffers_ptr;
   duckdb::ClientContext& _client_ctx;  ///< The duckdb client context (for allocation)
-  std::unique_ptr<multiple_blocks_allocation> const&
-    _allocation;  ///< The multiple blocks allocation for the data batch
+  allocation_ptr _allocation;          ///< The multiple blocks allocation for the data batch
   duckdb::vector<duckdb::LogicalType> _types;  ///< The duckdb logical types for each column
   size_t _total_rows{0};                       ///< The total number of rows in the data batch
   size_t _row_offset{0};                       ///< The current row offset for reading chunks

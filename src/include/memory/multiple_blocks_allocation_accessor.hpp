@@ -63,10 +63,11 @@ struct multiple_blocks_allocation_accessor {
    * @brief Initialize the accessor with a byte offset within the allocation.
    *
    * @param[in] byte_offset The byte offset within the allocation at which this accessor starts.
-   * @param[in] allocation The multiple blocks allocation.
+   * @param[in] allocation The multiple blocks allocation (unique_ptr or shared_ptr).
    * @throws std::runtime_error if the block size is not a multiple of the size of T.
    */
-  void initialize(size_t byte_offset, std::unique_ptr<multiple_blocks_allocation> const& allocation)
+  template <typename Ptr>
+  void initialize(size_t byte_offset, Ptr const& allocation)
   {
     assert(allocation != nullptr);
 
@@ -115,7 +116,8 @@ struct multiple_blocks_allocation_accessor {
    * @param[in] value The value to set.
    * @param[in, out] allocation The allocation.
    */
-  void set_current(T value, std::unique_ptr<multiple_blocks_allocation>& allocation)
+  template <typename Ptr>
+  void set_current(T value, Ptr& allocation)
   {
     assert(block_index < num_blocks);
     assert(allocation != nullptr);
@@ -134,9 +136,8 @@ struct multiple_blocks_allocation_accessor {
    * @tparam S The type to which to cast the value.
    * @param[in] allocation The allocation.
    */
-  template <typename S>
-  [[nodiscard]] S get_current_as(
-    std::unique_ptr<multiple_blocks_allocation> const& allocation) const
+  template <typename S, typename Ptr>
+  [[nodiscard]] S get_current_as(Ptr const& allocation) const
   {
     D_ASSERT(block_index < num_blocks);
     D_ASSERT(allocation != nullptr);
@@ -155,7 +156,8 @@ struct multiple_blocks_allocation_accessor {
    *
    * @param[in] allocation The allocation.
    */
-  [[nodiscard]] T get_current(std::unique_ptr<multiple_blocks_allocation> const& allocation) const
+  template <typename Ptr>
+  [[nodiscard]] T get_current(Ptr const& allocation) const
   {
     return get_current_as<underlying_type>(allocation);
   }
@@ -163,8 +165,8 @@ struct multiple_blocks_allocation_accessor {
   /**
    * @brief Get the value at a specific offset position from the initial offset.
    */
-  [[nodiscard]] T get(size_t offset,
-                      const std::unique_ptr<multiple_blocks_allocation>& allocation) const
+  template <typename Ptr>
+  [[nodiscard]] T get(size_t offset, Ptr const& allocation) const
   {
     size_t global_offset        = initial_byte_offset + sizeof(T) * offset;
     size_t temp_block_index     = global_offset / allocation->block_size();
@@ -209,7 +211,8 @@ struct multiple_blocks_allocation_accessor {
    * @param[in] bytes The number of consecutive values to set.
    * @param[in, out] allocation The allocation.
    */
-  void memset(uint8_t val, size_t bytes, std::unique_ptr<multiple_blocks_allocation>& allocation)
+  template <typename Ptr>
+  void memset(uint8_t val, size_t bytes, Ptr& allocation)
   {
     size_t bytes_set = 0;
     while (bytes_set < bytes) {
@@ -235,9 +238,8 @@ struct multiple_blocks_allocation_accessor {
    * @param[in] bytes Number of bytes to copy from the source buffer.
    * @param[in, out] allocation The allocation.
    */
-  void memcpy_from(void const* src,
-                   size_t bytes,
-                   std::unique_ptr<multiple_blocks_allocation>& allocation)
+  template <typename Ptr>
+  void memcpy_from(void const* src, size_t bytes, Ptr& allocation)
   {
     size_t bytes_copied = 0;
     // Loop over blocks into which to copy the src
@@ -266,9 +268,8 @@ struct multiple_blocks_allocation_accessor {
    * @param[in] dest Pointer to the destination buffer.
    * @param[in] bytes Number of bytes to copy to the destination buffer.
    */
-  void memcpy_to(std::unique_ptr<multiple_blocks_allocation> const& allocation,
-                 void* dest,
-                 size_t bytes)
+  template <typename Ptr>
+  void memcpy_to(Ptr const& allocation, void* dest, size_t bytes)
   {
     size_t bytes_copied = 0;
     // Loop over blocks from which to copy the data
