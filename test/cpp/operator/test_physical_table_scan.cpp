@@ -456,7 +456,7 @@ TEST_CASE("parquet_scan with decimal filter sets table_scan passthrough",
   cols.push_back(std::move(col1));
   auto table    = std::make_unique<cudf::table>(std::move(cols));
   auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(std::move(table), *space);
-  auto input_batch = std::make_shared<cucascade::data_batch>(0, std::move(gpu_repr));
+  auto input_batch = cucascade::data_batch::make(0, std::move(gpu_repr));
 
   // Filter: col0 > 3.00 (decimal column-vs-literal comparisons translate to cuDF AST)
   auto table_filters   = duckdb::make_uniq<duckdb::TableFilterSet>();

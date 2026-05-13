@@ -47,18 +47,18 @@ using namespace std::chrono_literals;
 
 namespace {
 
-/// Helper: get the memory tier of a data_batch via to_read_only()
+/// Helper: get the memory tier of a data_batch via get_read_only()
 cucascade::memory::Tier get_batch_tier(cucascade::data_batch& batch)
 {
-  auto ro = batch.to_read_only();
-  return ro.get_memory_space()->get_tier();
+  auto ro = batch.get_read_only();
+  return ro->get_memory_space()->get_tier();
 }
 
-/// Helper: get byte size of a data_batch via to_read_only()
+/// Helper: get byte size of a data_batch via get_read_only()
 size_t get_batch_size(cucascade::data_batch& batch)
 {
-  auto ro = batch.to_read_only();
-  return ro.get_data()->get_size_in_bytes();
+  auto ro = batch.get_read_only();
+  return ro->get_data()->get_size_in_bytes();
 }
 
 const auto GPU_SPACE_ID = cucascade::memory::memory_space_id(cucascade::memory::Tier::GPU, 0);
@@ -324,7 +324,7 @@ TEST_CASE("request_free_memory skips active partitions in first pass", "[downgra
   repo->add_data_batch(batch_p2, 2);
 
   // Lock batch_p1 in read_only state so downgrade executor skips it (state != idle)
-  auto batch_p1_lock = batch_p1->to_read_only();
+  auto batch_p1_lock = batch_p1->get_read_only();
   repo_mgr.add_new_repository(1, "out", std::move(repo));
 
   size_t three_batches = get_batch_size(*batch_p0) * 3;
@@ -370,8 +370,8 @@ TEST_CASE("request_free_memory skips batches already on HOST", "[downgrade_execu
   rmm::cuda_stream conv_stream;
   {
     // Acquire exclusive lock and convert to host representation
-    auto mut = gpu_batch->to_mutable();
-    mut.convert_to<cucascade::host_data_representation>(registry, host_space, conv_stream);
+    auto mut = gpu_batch->get_mutable();
+    mut->convert_to<cucascade::host_data_representation>(registry, host_space, conv_stream);
     // mut goes out of scope → releases exclusive lock, batch returns to idle
   }
   REQUIRE(get_batch_tier(*gpu_batch) == cucascade::memory::Tier::HOST);

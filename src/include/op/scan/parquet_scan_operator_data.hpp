@@ -218,12 +218,12 @@ class scan_cached_operator_data : public op::operator_data {
   {
     if (!batch || !requested_memory_space) { return; }
     {
-      auto ro = batch->to_read_only();
-      if (!ro.get_data() || ro.get_current_tier() == ::cucascade::memory::Tier::GPU) { return; }
+      auto ro = batch->get_read_only();
+      if (!ro->get_data() || ro->get_current_tier() == ::cucascade::memory::Tier::GPU) { return; }
     }
     auto& registry = ::sirius::converter_registry::get();
-    auto mut       = batch->to_mutable();
-    mut.convert_to<cucascade::gpu_table_representation>(registry, requested_memory_space, stream);
+    auto mut       = batch->get_mutable();
+    mut->convert_to<cucascade::gpu_table_representation>(registry, requested_memory_space, stream);
   }
 
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
@@ -232,8 +232,8 @@ class scan_cached_operator_data : public op::operator_data {
     // batches and host_data_representation batches that prepare_for_processing
     // will upgrade to GPU. Sizes are close enough between tiers to size the
     // task's memory reservation.
-    auto ro          = batch->to_read_only();
-    auto const* data = ro.get_data();
+    auto ro    = batch->get_read_only();
+    auto* data = ro->get_data();
     if (!data) { return 0; }
     return data->get_size_in_bytes();
   }

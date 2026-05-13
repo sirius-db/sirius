@@ -797,7 +797,7 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
   auto output_cudf_table = std::make_unique<cudf::table>(std::move(mark_out_cols), stream);
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<::cucascade::data_batch>>{
-      make_data_batch(std::move(output_cudf_table), *left_batch.get_memory_space())});
+      make_data_batch(std::move(output_cudf_table), *left_batch->get_memory_space())});
 }
 
 std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator_data& input_data,
@@ -836,7 +836,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       {
         std::lock_guard<std::mutex> lg(op_state_mutex);
         _built_table_cast_columns = std::move(build_keys_result.owned_cast_columns);
-        _build_table              = build_batch_ro;
+        _build_table.emplace(build_batch_ro.clone_read_only_access());
         if (unique_build_keys &&
             (join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::LEFT)) {
           _distinct_hash_table = std::make_unique<cudf::distinct_hash_join>(
@@ -866,7 +866,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
 
       left_full  = get_cudf_table_view(input_batches[0]);
       right_full = _build_table.value()
-                     .get_data()
+                     ->get_data()
                      ->cast<cucascade::gpu_table_representation>()
                      .get_table_view();
 
@@ -884,7 +884,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                                   lhs_output_columns.col_idxs,
                                                   rhs_output_columns.col_idxs,
                                                   std::move(build_indices),
-                                                  *input_batches[0].get_memory_space(),
+                                                  *input_batches[0]->get_memory_space(),
                                                   stream);
         }
       } else {
@@ -1100,7 +1100,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                                 lhs_output_columns.col_idxs,
                                                 rhs_output_columns.col_idxs,
                                                 std::move(build_indices),
-                                                *input_batches[0].get_memory_space(),
+                                                *input_batches[0]->get_memory_space(),
                                                 stream);
       }
     } else if (join_type == duckdb::JoinType::INNER) {
@@ -1159,7 +1159,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                             rhs_output_columns.col_idxs,
                             std::move(left_indices),
                             std::move(right_indices),
-                            *input_batches[0].get_memory_space(),
+                            *input_batches[0]->get_memory_space(),
                             stream);
 }
 

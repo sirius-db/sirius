@@ -30,6 +30,21 @@
 namespace sirius {
 namespace op {
 
+namespace {
+
+std::vector<::cucascade::read_only_data_batch> clone_read_only_batch_accessors(
+  const std::vector<::cucascade::read_only_data_batch>& batches)
+{
+  std::vector<::cucascade::read_only_data_batch> cloned_batches;
+  cloned_batches.reserve(batches.size());
+  for (const auto& batch : batches) {
+    cloned_batches.push_back(batch.clone_read_only_access());
+  }
+  return cloned_batches;
+}
+
+}  // namespace
+
 //===--------------------------------------------------------------------===//
 // operator_data
 //===--------------------------------------------------------------------===//
@@ -44,8 +59,8 @@ pipelineable_operator_data::get_data_batches() const
     std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
     batches.reserve(_read_only_data_batches->size());
     for (const auto& ro : *_read_only_data_batches) {
-      auto copy = ro;
-      batches.push_back(::cucascade::data_batch::to_idle(std::move(copy)));
+      auto copy = ro.clone_read_only_access();
+      batches.push_back(::cucascade::read_only_data_batch::to_idle(std::move(copy)));
     }
     _data_batches = std::move(batches);
   }
@@ -63,18 +78,19 @@ std::vector<::cucascade::read_only_data_batch> pipelineable_operator_data::get_r
     ro_batches.reserve(_data_batches->size());
     for (const auto& batch : *_data_batches) {
       if (batch) {
-        ro_batches.push_back(batch->to_read_only());
+        ro_batches.push_back(batch->get_read_only());
       } else {
         SIRIUS_LOG_WARN("pipelineable_operator_data: null batch encountered, skipping");
       }
     }
     if (leave_locked) {
       _read_only_data_batches = std::move(ro_batches);
+      return clone_read_only_batch_accessors(*_read_only_data_batches);
     } else {
       return std::move(ro_batches);
     }
   }
-  return *_read_only_data_batches;
+  return clone_read_only_batch_accessors(*_read_only_data_batches);
 }
 
 void pipelineable_operator_data::prepare_for_processing(

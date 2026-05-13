@@ -180,7 +180,7 @@ TEST_CASE("Concatenate multiple data batches", "[operator][merge_concat]")
     num_batches, num_input_rows, column_types, {column_types.size(), std::nullopt}, *mem_space);
   std::vector<read_only_data_batch> ro_batches;
   for (auto& b : input.batches) {
-    ro_batches.push_back(b->to_read_only());
+    ro_batches.push_back(b->get_read_only());
   }
   auto output_batch = gpu_merge_impl::concat(ro_batches, cudf::get_default_stream(), *mem_space);
   ro_batches.clear();
@@ -202,7 +202,7 @@ TEST_CASE("Concatenate multiple data batches with different size", "[operator][m
     num_batches, num_input_rows, column_types, {column_types.size(), std::nullopt}, *mem_space);
   std::vector<read_only_data_batch> ro_batches;
   for (auto& b : input.batches) {
-    ro_batches.push_back(b->to_read_only());
+    ro_batches.push_back(b->get_read_only());
   }
   auto output_batch = gpu_merge_impl::concat(ro_batches, cudf::get_default_stream(), *mem_space);
   ro_batches.clear();
@@ -224,7 +224,7 @@ TEST_CASE("Concatenate with invalid input", "[operator][merge_concat]")
   {
     std::vector<read_only_data_batch> ro;
     for (auto& b : input.batches) {
-      ro.push_back(b->to_read_only());
+      ro.push_back(b->get_read_only());
     }
     REQUIRE_THROWS_AS(gpu_merge_impl::concat(ro, cudf::get_default_stream(), *mem_space),
                       std::runtime_error);
@@ -244,7 +244,7 @@ TEST_CASE("Concatenate multiple data batches but no input rows", "[operator][mer
     num_batches, num_input_rows, column_types, {column_types.size(), std::nullopt}, *mem_space);
   std::vector<read_only_data_batch> ro_batches;
   for (auto& b : input.batches) {
-    ro_batches.push_back(b->to_read_only());
+    ro_batches.push_back(b->get_read_only());
   }
   auto output_batch = gpu_merge_impl::concat(ro_batches, cudf::get_default_stream(), *mem_space);
   ro_batches.clear();
@@ -266,7 +266,7 @@ TEST_CASE("Concatenate mixed empty and non-empty data batches", "[operator][merg
     num_batches, num_input_rows, column_types, {column_types.size(), std::nullopt}, *mem_space);
   std::vector<read_only_data_batch> ro_batches;
   for (auto& b : input.batches) {
-    ro_batches.push_back(b->to_read_only());
+    ro_batches.push_back(b->get_read_only());
   }
   auto output_batch = gpu_merge_impl::concat(ro_batches, cudf::get_default_stream(), *mem_space);
   ro_batches.clear();
@@ -293,7 +293,7 @@ batches_with_handles create_batches_with_local_ungrouped_agg_result(
     aggregate_idx[i] = i;
   }
   for (int i = 0; i < num_batches; ++i) {
-    auto ro_batch = base_input.batches[i]->to_read_only();
+    auto ro_batch = base_input.batches[i]->get_read_only();
     auto batch    = gpu_aggregate_impl::local_ungrouped_aggregate(
       ro_batch, aggregates, aggregate_idx, cudf::get_default_stream(), mem_space);
     result.batches.push_back(std::move(batch));
@@ -430,7 +430,7 @@ TEST_CASE("Ungrouped merge aggregate of min/max/count/sum", "[operator][merge_un
   std::vector<std::optional<cudf::size_type>> merge_nth_index(aggregates.size(), std::nullopt);
   std::vector<read_only_data_batch> ro_batches;
   for (auto& b : input.batches) {
-    ro_batches.push_back(b->to_read_only());
+    ro_batches.push_back(b->get_read_only());
   }
   auto output_batch = gpu_merge_impl::merge_ungrouped_aggregate(
     ro_batches, aggregates, merge_nth_index, cudf::get_default_stream(), *mem_space);
@@ -454,7 +454,7 @@ TEST_CASE("Ungrouped merge aggregate with invalid input", "[operator][merge_ungr
   {
     std::vector<read_only_data_batch> ro;
     for (auto& b : input.batches) {
-      ro.push_back(b->to_read_only());
+      ro.push_back(b->get_read_only());
     }
     REQUIRE_THROWS_AS(gpu_merge_impl::merge_ungrouped_aggregate(
                         ro, aggregates, merge_nth_index, cudf::get_default_stream(), *mem_space),
@@ -471,7 +471,7 @@ TEST_CASE("Ungrouped merge aggregate with invalid input", "[operator][merge_ungr
   {
     std::vector<read_only_data_batch> ro;
     for (auto& b : input2.batches) {
-      ro.push_back(b->to_read_only());
+      ro.push_back(b->get_read_only());
     }
     REQUIRE_THROWS_AS(gpu_merge_impl::merge_ungrouped_aggregate(
                         ro, aggregates, merge_nth_index, cudf::get_default_stream(), *mem_space),
@@ -500,7 +500,7 @@ TEST_CASE("Ungrouped merge aggregate with empty local aggregate results",
   std::vector<std::optional<cudf::size_type>> merge_nth_index(aggregates.size(), std::nullopt);
   std::vector<read_only_data_batch> ro_batches;
   for (auto& b : input.batches) {
-    ro_batches.push_back(b->to_read_only());
+    ro_batches.push_back(b->get_read_only());
   }
   auto output_batch = gpu_merge_impl::merge_ungrouped_aggregate(
     ro_batches, aggregates, merge_nth_index, cudf::get_default_stream(), *mem_space);
@@ -531,7 +531,7 @@ TEST_CASE("Ungrouped merge aggregate with mixed empty and non-empty local aggreg
   std::vector<std::optional<cudf::size_type>> merge_nth_index(aggregates.size(), std::nullopt);
   std::vector<read_only_data_batch> ro_batches;
   for (auto& b : input.batches) {
-    ro_batches.push_back(b->to_read_only());
+    ro_batches.push_back(b->get_read_only());
   }
   auto output_batch = gpu_merge_impl::merge_ungrouped_aggregate(
     ro_batches, aggregates, merge_nth_index, cudf::get_default_stream(), *mem_space);
@@ -561,7 +561,7 @@ batches_with_handles create_batches_with_local_grouped_agg_result(
   // Compute local grouped aggregates
   batches_with_handles result;
   for (int i = 0; i < num_batches; ++i) {
-    auto ro_batch = base_input.batches[i]->to_read_only();
+    auto ro_batch = base_input.batches[i]->get_read_only();
     auto batch    = gpu_aggregate_impl::local_grouped_aggregate(
       ro_batch, group_idx, aggregates, aggregate_idx, {}, cudf::get_default_stream(), mem_space);
     result.batches.push_back(std::move(batch));
@@ -707,7 +707,7 @@ TEST_CASE("Grouped merge aggregate of min/max/count/sum", "[operator][merge_grou
                                                             *mem_space);
   std::vector<read_only_data_batch> ro_batches;
   for (auto& b : input.batches) {
-    ro_batches.push_back(b->to_read_only());
+    ro_batches.push_back(b->get_read_only());
   }
   auto output_batch = gpu_merge_impl::merge_grouped_aggregate(
     ro_batches, group_idx.size(), aggregates, cudf::get_default_stream(), *mem_space);
@@ -738,7 +738,7 @@ TEST_CASE("Grouped merge aggregate with invalid input", "[operator][merge_groupe
   {
     std::vector<read_only_data_batch> ro;
     for (auto& b : input.batches) {
-      ro.push_back(b->to_read_only());
+      ro.push_back(b->get_read_only());
     }
     REQUIRE_THROWS_AS(gpu_merge_impl::merge_grouped_aggregate(
                         ro, group_idx.size(), aggregates, cudf::get_default_stream(), *mem_space),
@@ -754,7 +754,7 @@ TEST_CASE("Grouped merge aggregate with invalid input", "[operator][merge_groupe
   {
     std::vector<read_only_data_batch> ro;
     for (auto& b : input2.batches) {
-      ro.push_back(b->to_read_only());
+      ro.push_back(b->get_read_only());
     }
     REQUIRE_THROWS_AS(gpu_merge_impl::merge_grouped_aggregate(
                         ro, group_idx.size(), aggregates, cudf::get_default_stream(), *mem_space),
@@ -791,7 +791,7 @@ TEST_CASE("Grouped merge aggregate with empty local aggregate results",
                                                             *mem_space);
   std::vector<read_only_data_batch> ro_batches;
   for (auto& b : input.batches) {
-    ro_batches.push_back(b->to_read_only());
+    ro_batches.push_back(b->get_read_only());
   }
   auto output_batch = gpu_merge_impl::merge_grouped_aggregate(
     ro_batches, group_idx.size(), aggregates, cudf::get_default_stream(), *mem_space);
@@ -830,7 +830,7 @@ TEST_CASE("Grouped merge aggregate with mixed empty and non-empty local aggregat
                                                             *mem_space);
   std::vector<read_only_data_batch> ro_batches;
   for (auto& b : input.batches) {
-    ro_batches.push_back(b->to_read_only());
+    ro_batches.push_back(b->get_read_only());
   }
   auto output_batch = gpu_merge_impl::merge_grouped_aggregate(
     ro_batches, group_idx.size(), aggregates, cudf::get_default_stream(), *mem_space);
@@ -864,7 +864,7 @@ batches_with_handles create_batches_with_local_orderby_result(
     projections[i] = i;
   }
   for (int i = 0; i < num_batches; ++i) {
-    auto ro_batch = base_input.batches[i]->to_read_only();
+    auto ro_batch = base_input.batches[i]->get_read_only();
     auto batch    = gpu_order_impl::local_order_by(ro_batch,
                                                 order_key_idx,
                                                 column_order,
@@ -939,7 +939,7 @@ TEST_CASE("Merge order-by basic", "[operator][merge_order_by]")
                                                         *mem_space);
   std::vector<read_only_data_batch> ro_batches;
   for (auto& b : input.batches) {
-    ro_batches.push_back(b->to_read_only());
+    ro_batches.push_back(b->get_read_only());
   }
   auto output_batch = gpu_merge_impl::merge_order_by(ro_batches,
                                                      order_key_idx,
@@ -978,7 +978,7 @@ TEST_CASE("Merge order-by with invalid input", "[operator][merge_order_by]")
   {
     std::vector<read_only_data_batch> ro;
     for (auto& b : input.batches) {
-      ro.push_back(b->to_read_only());
+      ro.push_back(b->get_read_only());
     }
     REQUIRE_THROWS_AS(
       gpu_merge_impl::merge_order_by(
@@ -1000,7 +1000,7 @@ TEST_CASE("Merge order-by with invalid input", "[operator][merge_order_by]")
   {
     std::vector<read_only_data_batch> ro;
     for (auto& b : input2.batches) {
-      ro.push_back(b->to_read_only());
+      ro.push_back(b->get_read_only());
     }
     REQUIRE_THROWS_AS(
       gpu_merge_impl::merge_order_by(
@@ -1034,7 +1034,7 @@ TEST_CASE("Merge order-by with empty local order-by results", "[operator][merge_
                                                         *mem_space);
   std::vector<read_only_data_batch> ro_batches;
   for (auto& b : input.batches) {
-    ro_batches.push_back(b->to_read_only());
+    ro_batches.push_back(b->get_read_only());
   }
   auto output_batch = gpu_merge_impl::merge_order_by(ro_batches,
                                                      order_key_idx,
@@ -1074,7 +1074,7 @@ TEST_CASE("Merge order-by with mixed empty and non-empty local order-by results"
                                                         *mem_space);
   std::vector<read_only_data_batch> ro_batches;
   for (auto& b : input.batches) {
-    ro_batches.push_back(b->to_read_only());
+    ro_batches.push_back(b->get_read_only());
   }
   auto output_batch = gpu_merge_impl::merge_order_by(ro_batches,
                                                      order_key_idx,

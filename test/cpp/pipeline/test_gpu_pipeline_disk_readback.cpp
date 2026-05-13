@@ -127,27 +127,27 @@ TEST_CASE("DISK->GPU round-trip conversion via converter registry", "[gpu_pipeli
   rmm::cuda_stream stream;
 
   auto batch = make_gpu_batch(*gpu_space);
-  REQUIRE(batch->to_read_only().get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+  REQUIRE(batch->get_read_only()->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
 
   // --- GPU -> DISK ---
   {
-    auto mut = batch->to_mutable();
+    auto mut = batch->get_mutable();
     REQUIRE_NOTHROW(
-      mut.convert_to<cucascade::disk_data_representation>(registry, disk_space, stream));
+      mut->convert_to<cucascade::disk_data_representation>(registry, disk_space, stream));
   }
 
-  REQUIRE(batch->to_read_only().get_memory_space()->get_tier() == cucascade::memory::Tier::DISK);
+  REQUIRE(batch->get_read_only()->get_memory_space()->get_tier() == cucascade::memory::Tier::DISK);
 
   // --- DISK -> GPU ---
   // This mirrors exactly what lock_or_prepare_batch Tier::GPU arm does when the batch is
   // disk-resident and the target memory space is GPU.
   {
-    auto mut = batch->to_mutable();
+    auto mut = batch->get_mutable();
     REQUIRE_NOTHROW(
-      mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream));
+      mut->convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream));
   }
 
-  REQUIRE(batch->to_read_only().get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+  REQUIRE(batch->get_read_only()->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
 }
 
 TEST_CASE("DISK->GPU conversion preserves data correctness", "[gpu_pipeline_disk]")
@@ -166,7 +166,7 @@ TEST_CASE("DISK->GPU conversion preserves data correctness", "[gpu_pipeline_disk
 
   const size_t num_rows = 500;
   auto batch            = make_gpu_batch(*gpu_space, num_rows);
-  REQUIRE(batch->to_read_only().get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+  REQUIRE(batch->get_read_only()->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
 
   // Snapshot column values before round-trip
   auto table_before = sirius::get_cudf_table_view(*batch);
@@ -177,26 +177,26 @@ TEST_CASE("DISK->GPU conversion preserves data correctness", "[gpu_pipeline_disk
              cudaMemcpyDeviceToHost);
 
   const size_t size_before = [&batch]() {
-    auto ro = batch->to_read_only();
-    return ro.get_data()->get_size_in_bytes();
+    auto ro = batch->get_read_only();
+    return ro->get_data()->get_size_in_bytes();
   }();
   REQUIRE(size_before > 0);
 
   // GPU -> DISK
   {
-    auto mut = batch->to_mutable();
+    auto mut = batch->get_mutable();
     REQUIRE_NOTHROW(
-      mut.convert_to<cucascade::disk_data_representation>(registry, disk_space, stream));
+      mut->convert_to<cucascade::disk_data_representation>(registry, disk_space, stream));
   }
-  REQUIRE(batch->to_read_only().get_memory_space()->get_tier() == cucascade::memory::Tier::DISK);
+  REQUIRE(batch->get_read_only()->get_memory_space()->get_tier() == cucascade::memory::Tier::DISK);
 
   // DISK -> GPU
   {
-    auto mut = batch->to_mutable();
+    auto mut = batch->get_mutable();
     REQUIRE_NOTHROW(
-      mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream));
+      mut->convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream));
   }
-  REQUIRE(batch->to_read_only().get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+  REQUIRE(batch->get_read_only()->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
 
   // Verify schema and shape
   auto table_after = sirius::get_cudf_table_view(*batch);
@@ -214,8 +214,8 @@ TEST_CASE("DISK->GPU conversion preserves data correctness", "[gpu_pipeline_disk
 
   // Size should be unchanged (same data, same GPU format)
   const size_t size_after = [&batch]() {
-    auto ro = batch->to_read_only();
-    return ro.get_data()->get_size_in_bytes();
+    auto ro = batch->get_read_only();
+    return ro->get_data()->get_size_in_bytes();
   }();
   REQUIRE(size_after == size_before);
 }

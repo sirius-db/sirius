@@ -104,7 +104,7 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single 
 
   auto gpu_repr = std::make_unique<gpu_table_representation>(std::move(table), *space);
   auto input_batch =
-    std::make_shared<data_batch>(::sirius::get_next_batch_id(), std::move(gpu_repr));
+    data_batch::make(::sirius::get_next_batch_id(), std::move(gpu_repr));
 
   // this cardinality is not real, we are setting here this large in order to force more partitions
   // to be made
@@ -233,7 +233,7 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with two par
 
   auto gpu_repr = std::make_unique<gpu_table_representation>(std::move(table), *space);
   auto input_batch =
-    std::make_shared<data_batch>(::sirius::get_next_batch_id(), std::move(gpu_repr));
+    data_batch::make(::sirius::get_next_batch_id(), std::move(gpu_repr));
 
   std::size_t partition_size = 10000000;
   // this cardinality is not real, we are setting here this large in order to force more partitions
@@ -322,7 +322,7 @@ TEST_CASE(
 
   auto gpu_repr = std::make_unique<gpu_table_representation>(std::move(table), *space);
   auto input_batch =
-    std::make_shared<data_batch>(::sirius::get_next_batch_id(), std::move(gpu_repr));
+    data_batch::make(::sirius::get_next_batch_id(), std::move(gpu_repr));
 
   std::size_t estimated_cardinality = num_values;
 

@@ -774,8 +774,8 @@ void parquet_scan_task::execute(rmm::cuda_stream_view stream)
     std::size_t output_bytes       = 0;
     for (const auto& batch : pipelineable_output_data.get_data_batches()) {
       if (batch) {
-        auto ro = batch->to_read_only();
-        if (ro.get_data()) { output_bytes += ro.get_data()->get_size_in_bytes(); }
+        auto ro = batch->get_read_only();
+        if (ro->get_data()) { output_bytes += ro->get_data()->get_size_in_bytes(); }
       }
     }
     auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
@@ -901,19 +901,19 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
     auto host_table = registry.convert<cucascade::host_data_representation>(
       *materialized_table, l_state.get_memory_space(), stream);
     if (_wrap_in_cache) {
-      batch = std::make_shared<cucascade::data_batch>(
+      batch = cucascade::data_batch::make(
         get_next_batch_id(),
         std::make_unique<cached_host_data_representation>(std::move(host_table)));
     } else {
-      batch = std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(host_table));
+      batch = cucascade::data_batch::make(get_next_batch_id(), std::move(host_table));
     }
   } else {
     if (_wrap_in_cache) {
-      batch = std::make_shared<cucascade::data_batch>(
+      batch = cucascade::data_batch::make(
         get_next_batch_id(),
         std::make_unique<cached_host_parquet_representation>(std::move(parquet_representation)));
     } else {
-      batch = std::make_shared<cucascade::data_batch>(get_next_batch_id(),
+      batch = cucascade::data_batch::make(get_next_batch_id(),
                                                       std::move(parquet_representation));
     }
   }

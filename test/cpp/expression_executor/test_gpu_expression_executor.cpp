@@ -167,7 +167,7 @@ std::shared_ptr<data_batch> make_input_batch(
     128, column_types, ranges, cudf::get_default_stream(), mr);
   auto gpu_repr = std::make_unique<gpu_table_representation>(std::move(table), space);
   auto batch_id = ::sirius::get_next_batch_id();
-  return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
+  return data_batch::make(batch_id, std::move(gpu_repr));
 }
 
 std::shared_ptr<data_batch> make_int32_batch_with_nulls(memory_space& space,
@@ -202,7 +202,7 @@ std::shared_ptr<data_batch> make_int32_batch_with_nulls(memory_space& space,
 
   auto gpu_repr = std::make_unique<gpu_table_representation>(std::move(table), space);
   auto batch_id = ::sirius::get_next_batch_id();
-  return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
+  return data_batch::make(batch_id, std::move(gpu_repr));
 }
 
 std::shared_ptr<data_batch> make_two_int32_batch_with_nulls(memory_space& space,
@@ -241,7 +241,7 @@ std::shared_ptr<data_batch> make_two_int32_batch_with_nulls(memory_space& space,
 
   auto gpu_repr = std::make_unique<gpu_table_representation>(std::move(table), space);
   auto batch_id = ::sirius::get_next_batch_id();
-  return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
+  return data_batch::make(batch_id, std::move(gpu_repr));
 }
 
 std::shared_ptr<data_batch> make_decimal64_batch(memory_space& space,
@@ -268,7 +268,7 @@ std::shared_ptr<data_batch> make_decimal64_batch(memory_space& space,
 
   auto gpu_repr = std::make_unique<gpu_table_representation>(std::move(table), space);
   auto batch_id = ::sirius::get_next_batch_id();
-  return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
+  return data_batch::make(batch_id, std::move(gpu_repr));
 }
 
 std::shared_ptr<data_batch> make_decimal64_two_col_batch(memory_space& space,
@@ -300,7 +300,7 @@ std::shared_ptr<data_batch> make_decimal64_two_col_batch(memory_space& space,
 
   auto gpu_repr = std::make_unique<gpu_table_representation>(std::move(table), space);
   auto batch_id = ::sirius::get_next_batch_id();
-  return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
+  return data_batch::make(batch_id, std::move(gpu_repr));
 }
 
 std::shared_ptr<data_batch> make_decimal32_batch(memory_space& space,
@@ -327,7 +327,7 @@ std::shared_ptr<data_batch> make_decimal32_batch(memory_space& space,
 
   auto gpu_repr = std::make_unique<gpu_table_representation>(std::move(table), space);
   auto batch_id = ::sirius::get_next_batch_id();
-  return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
+  return data_batch::make(batch_id, std::move(gpu_repr));
 }
 
 std::shared_ptr<data_batch> make_decimal128_batch(memory_space& space,
@@ -354,7 +354,7 @@ std::shared_ptr<data_batch> make_decimal128_batch(memory_space& space,
 
   auto gpu_repr = std::make_unique<gpu_table_representation>(std::move(table), space);
   auto batch_id = ::sirius::get_next_batch_id();
-  return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
+  return data_batch::make(batch_id, std::move(gpu_repr));
 }
 
 using exp_executor      = ::sirius::gpu_expression_executor;
@@ -388,14 +388,14 @@ exec_result run_execute(memory_space& space,
 {
   auto wrapped = sirius::wrap_many(std::move(exprs));
   exp_executor executor(wrapped, get_resource_ref(space), cudf::get_default_stream(), strategy);
-  auto input_ro     = input_batch->to_read_only();
-  auto& in_repr     = input_ro.get_data()->cast<gpu_table_representation>();
+  auto input_ro     = input_batch->get_read_only();
+  auto& in_repr     = input_ro->get_data()->cast<gpu_table_representation>();
   auto output_table = executor.execute(in_repr.get_table_view());
   REQUIRE(output_table != nullptr);
   auto output_batch =
-    sirius::make_data_batch(std::move(output_table), *input_ro.get_memory_space());
-  auto output_ro = output_batch->to_read_only();
-  auto& out_repr = output_ro.get_data()->cast<gpu_table_representation>();
+    sirius::make_data_batch(std::move(output_table), *input_ro->get_memory_space());
+  auto output_ro = output_batch->get_read_only();
+  auto& out_repr = output_ro->get_data()->cast<gpu_table_representation>();
   return {input_batch, output_batch, in_repr.get_table_view(), out_repr.get_table_view()};
 }
 
@@ -406,14 +406,14 @@ exec_result run_select(memory_space& space,
 {
   auto wrapped = sirius::wrap_many(std::move(exprs));
   exp_executor executor(wrapped, get_resource_ref(space), cudf::get_default_stream(), strategy);
-  auto input_ro     = input_batch->to_read_only();
-  auto& in_repr     = input_ro.get_data()->cast<gpu_table_representation>();
+  auto input_ro     = input_batch->get_read_only();
+  auto& in_repr     = input_ro->get_data()->cast<gpu_table_representation>();
   auto output_table = executor.select(in_repr.get_table_view());
   REQUIRE(output_table != nullptr);
   auto output_batch =
-    sirius::make_data_batch(std::move(output_table), *input_ro.get_memory_space());
-  auto output_ro = output_batch->to_read_only();
-  auto& out_repr = output_ro.get_data()->cast<gpu_table_representation>();
+    sirius::make_data_batch(std::move(output_table), *input_ro->get_memory_space());
+  auto output_ro = output_batch->get_read_only();
+  auto& out_repr = output_ro->get_data()->cast<gpu_table_representation>();
   return {input_batch, output_batch, in_repr.get_table_view(), out_repr.get_table_view()};
 }
 

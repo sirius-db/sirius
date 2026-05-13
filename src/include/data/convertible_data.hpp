@@ -45,7 +45,7 @@ namespace sirius {
  * implementations wrap either a data_batch or a gpu_pipeline_task.
  *
  * Implementations are responsible for:
- * - Acquiring mutable_data_batch via to_mutable() (blocking) or try_to_mutable() (non-blocking)
+ * - Acquiring mutable_data_batch via get_mutable() (blocking) or try_get_mutable() (non-blocking)
  * - Performing the actual data conversion via convert_to on the mutable accessor
  * - RAII automatic state restoration on all exit paths (success, failure, exception)
  */
@@ -64,8 +64,8 @@ class convertible_data {
    * @param target_spaces  Candidate memory spaces to convert into (tried in order).
    * @param stream         CUDA stream for asynchronous memory operations.
    * @param res_mgr        Reservation manager for acquiring memory in the target space.
-   * @param blocking       When true, uses to_mutable() (blocks until exclusive lock acquired).
-   *                       When false, uses try_to_mutable() (returns nullopt immediately if
+   * @param blocking       When true, uses get_mutable() (blocks until exclusive lock acquired).
+   *                       When false, uses try_get_mutable() (returns nullopt immediately if
    *                       the lock is unavailable).
    * @return A vector of bytes converted per target space index on success, or nullopt if
    *         no conversion occurred.

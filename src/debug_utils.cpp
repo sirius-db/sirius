@@ -72,8 +72,8 @@ namespace {
 
 bool is_gpu_tier(cucascade::data_batch& batch, const char* func_name)
 {
-  auto ro    = batch.to_read_only();
-  auto* data = ro.get_data();
+  auto ro    = batch.get_read_only();
+  auto* data = ro->get_data();
   if (data == nullptr) {
     SIRIUS_LOG_WARN("[SIRIUS_DIAG] {}: batch has no data", func_name);
     return false;

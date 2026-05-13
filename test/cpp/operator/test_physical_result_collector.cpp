@@ -195,8 +195,8 @@ void convert_batch_to_host(duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx,
 
   auto& registry = sirius::converter_registry::get();
   {
-    auto mut = batch->to_mutable();
-    mut.convert_to<cucascade::host_data_representation>(registry, host_space, stream);
+    auto mut = batch->get_mutable();
+    mut->convert_to<cucascade::host_data_representation>(registry, host_space, stream);
   }
 }
 

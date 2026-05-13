@@ -81,12 +81,12 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_merge_sort::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_read_only_batches();
+  auto input_batches = input.get_read_only_batches();
 
   // Find memory space
   cucascade::memory::memory_space* space = nullptr;
   for (auto const& batch : input_batches) {
-    if (!space) { space = batch.get_memory_space(); }
+    if (!space) { space = batch->get_memory_space(); }
   }
 
   if (input_batches.empty() || !space) {
@@ -113,7 +113,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
     std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
     if (_final_projections.empty()) {
       auto ro_vec = input.get_read_only_batches();
-      outputs.push_back(cucascade::data_batch::to_idle(std::move(ro_vec[0])));
+      outputs.push_back(cucascade::read_only_data_batch::to_idle(std::move(ro_vec[0])));
     } else {
       outputs.push_back(apply_final_projection(input_batches[0]));
     }
@@ -149,7 +149,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
     if (_final_projections.empty()) {
       outputs.push_back(std::move(merged_batch));
     } else {
-      auto ro = merged_batch->to_read_only();
+      auto ro = merged_batch->get_read_only();
       outputs.push_back(apply_final_projection(ro));
     }
   }

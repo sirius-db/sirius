@@ -110,8 +110,8 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   std::vector<::cucascade::read_only_data_batch> valid_batches;
   cucascade::memory::memory_space* space = nullptr;
   for (auto const& batch : input_batches) {
-    if (!space) { space = batch.get_memory_space(); }
-    valid_batches.push_back(batch);
+    if (!space) { space = batch->get_memory_space(); }
+    valid_batches.push_back(batch.clone_read_only_access());
   }
 
   if (valid_batches.empty() || !space) {
@@ -129,7 +129,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
     for (auto const& batch : valid_batches) {
       auto view = get_cudf_table_view(batch);
       sample_views.push_back(view);
-      total_sample_bytes += batch.get_data()->get_size_in_bytes();
+      total_sample_bytes += batch->get_data()->get_size_in_bytes();
     }
 
     auto concat_table = cudf::concatenate(sample_views, stream, space->get_default_allocator());

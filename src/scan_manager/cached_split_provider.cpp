@@ -79,7 +79,7 @@ std::future<void> cached_split_provider::start(exec::thread_pool& /*pool*/,
       }
       auto sliced = chunk->slice(_column_indices);
       auto batch =
-        std::make_shared<cucascade::data_batch>(::sirius::get_next_batch_id(), std::move(sliced));
+        cucascade::data_batch::make(::sirius::get_next_batch_id(), std::move(sliced));
       connector.push_split(std::make_unique<op::scan::scan_cached_operator_data>(
         std::move(batch), _filter_expression, _plan));
     }
@@ -120,7 +120,7 @@ std::future<void> cached_split_provider::start(exec::thread_pool& /*pool*/,
     auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
       view, std::move(owner), alloc_size, *_memory_space);
     auto batch =
-      std::make_shared<cucascade::data_batch>(::sirius::get_next_batch_id(), std::move(gpu_repr));
+      cucascade::data_batch::make(::sirius::get_next_batch_id(), std::move(gpu_repr));
 
     connector.push_split(std::make_unique<op::scan::scan_cached_operator_data>(
       std::move(batch), _filter_expression, _plan));
