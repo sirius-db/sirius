@@ -3,12 +3,12 @@ phase: 23-update-cucascade-and-sirius-from-upstream
 type: cucascade-fork-divergence
 upstream_base: bcddb89
 upstream_base_subject: "Make host memory portable (PR #121)"
-fork_head: 1e889d7e67070de7dc88860c373622182afe35df
-fork_head_short: 1e889d7
+fork_head: 9da404756a8354d84d1dcd6bf3f3b46c29abfb3e
+fork_head_short: 9da4047
 fork_branch: fix/pinned-portable-flags
-commits_ahead: 6
+commits_ahead: 8
 prior_pin: c666b21
-last_updated: 2026-05-12
+last_updated: 2026-05-13
 status: CC-UPSTREAM-01-carry
 ---
 
@@ -36,6 +36,10 @@ bcddb89  upstream: PR #121 "Make host memory portable"
     +-- 89d6a3f  style: pre-commit cleanup (clang-format + codespell)
     |
     +-- 1e889d7  fix(p22): same-stream invariant in alloc_and_peer_copy_async (Cluster B)
+    |
+    +-- 37df815  fix(p23): cuda_set_device_raii guard for HtoD in alloc_and_peer_copy_async
+    |
+    +-- 9da4047  fix(p23): run_p2p_probe_locked must restore device context on exit
 ```
 
 ---
@@ -184,18 +188,82 @@ Before this fix, the function created an in-function `rmm::cuda_stream src_strea
 
 ---
 
+## Commit 7: 37df815 — dst_guard for HtoD in alloc_and_peer_copy_async (Phase 23 gap-closure)
+
+**Subject:** `fix(p23): cuda_set_device_raii guard for HtoD in alloc_and_peer_copy_async`
+
+**SHA:** `37df8153bf8330203954da99d341a139fcedd18c`
+
+**Files touched:**
+- `src/data/representation_converter.cpp` (+5/-1 in `alloc_and_peer_copy_async`)
+
+**What this commit does:**
+
+Wraps the HtoD `cudaMemcpyAsync` at line 628 (now ~629 after edit) in a new scope:
+```cpp
+{
+  // Phase 23 gap-closure: set dst-device context before HtoD cudaMemcpyAsync
+  rmm::cuda_set_device_raii dst_guard{rmm::cuda_device_id{dst_device}};
+  cudaMemcpyAsync(buf.data(), host_buf, size, cudaMemcpyHostToDevice, target_stream.value());
+}
+```
+
+Without this guard, the destination CUDA context is not active when `cudaMemcpyAsync(HtoD)` is called,
+causing `cudaErrorInvalidValue` on hardware where peer DMA is broken (2 × RTX 6000 Ada). The function
+already has a `rmm::cuda_set_device_raii src_guard{rmm::cuda_device_id{src_device}}` for the DtoH copy;
+the HtoD copy needed a symmetric dst_guard.
+
+**Phase introduced:** Phase 23 Plan 23-06 (gap-closure — fixes REG-05/REG-06 regression from commit 8392c3d)
+
+**Upstream candidate:** Yes — should be submitted upstream alongside commit 6 (1e889d7) as a bundle.
+
+---
+
+## Commit 8: 9da4047 — probe device-restore in run_p2p_probe_locked (Phase 23 gap-closure)
+
+**Subject:** `fix(p23): run_p2p_probe_locked must restore device context on exit`
+
+**SHA:** `9da404756a8354d84d1dcd6bf3f3b46c29abfb3e`
+
+**Files touched:**
+- `src/data/representation_converter.cpp` (+4/-1 in `run_p2p_probe_locked`)
+
+**What this commit does:**
+
+`run_p2p_probe_locked` probes peer DMA between every (src, dst) GPU pair using `cudaMemcpyPeer`.
+Before this fix, the function ended with a hardcoded `cudaSetDevice(0)`, clobbering any caller-held
+RAII device guard. This left the active CUDA device as 0 after probe completion, causing downstream
+`cudaEventRecord` calls for GPU 1's stream to fail with `cudaErrorInvalidResourceHandle` (the event
+was created for GPU 1's context, but the current device was GPU 0).
+
+Fix: save the current device at entry with `cudaGetDevice` and restore it at exit with `cudaSetDevice`.
+
+**Discovery:** Found during Plan 23-07 smoke test: after applying commit 7 (37df815), the
+[multi_gpu_foundation] 7/7 smoke still showed 6/7 FAIL with a different error
+(`cudaErrorInvalidResourceHandle at gpu_data_representation.cpp:106`). The probe device-restore bug
+was an independent second bug exposed by the first fix.
+
+**Phase introduced:** Phase 23 Plan 23-07 (deviation Rule 1 auto-fix — blocking bug in smoke test)
+
+**Upstream candidate:** Yes — straightforward correctness fix; should be submitted upstream together with commits 6+7.
+
+---
+
 ## Upstreaming notes (CC-UPSTREAM-01)
 
 Per CC-UPSTREAM-01 policy (established 2026-05-04):
 
-- All 6 commits are carried in the local fork on `feature/single-node-multi-gpu2`
+- All 8 commits are carried in the local fork on `feature/single-node-multi-gpu2`
 - No upstream PRs have been opened
 - Upstream PR candidates when reviewed:
   - **Commit 2** (io_worker ordering) — most straightforward; clear correctness fix
-  - **Commits 5+6 combined** (formatting + same-stream invariant) — cleanest pair; once Phase 24 dst_device guard is applied, submit commits 6+Phase-24-fix together
+  - **Commits 5+6+7+8 combined** (formatting + same-stream invariant + dst_guard + probe-restore) — the 4 Phase 22/23 `alloc_and_peer_copy_async` fixes form a logical unit for upstream PR submission
   - **Commit 4** (stream-lineage) — requires upstream agreement on `writer_stream` ctor design
   - **Commits 1+3** (memory hygiene + P2P override) — requires hardware-matrix validation; defer until server hardware available upstream
 
-The Phase 24 fix to `alloc_and_peer_copy_async` (add `rmm::cuda_set_device_raii{dst_device}` around the HtoD copy at line 628) should be applied to the local fork before any upstream PR for commits 3+6 is submitted.
+Commits 6, 7, and 8 together make `alloc_and_peer_copy_async` correct for broken-peer-DMA hardware:
+- 6 (1e889d7): same-stream invariant — DtoH + HtoD on same target_stream
+- 7 (37df815): dst_guard — HtoD requires dst-device CUDA context active
+- 8 (9da4047): probe-restore — run_p2p_probe_locked must not clobber caller's device context
 
-This document supersedes `22-CUCASCADE-DIFF.md` for the current fork state. The prior Phase 22 diff documented the 6-commit chain from base `73d00c4`; after the Phase 23 rebase, the new base is `bcddb89` and the 6 commits have new SHAs but equivalent content (with the exception of commit 1 which surgically drops the 4 upstream-superseded files).
+This document supersedes `22-CUCASCADE-DIFF.md` for the current fork state. The prior Phase 22 diff documented the 6-commit chain from base `73d00c4`; after the Phase 23 rebase, the new base is `bcddb89` and the fork carries 8 commits (6 from Phase 23 Plan 02 rebase + 2 gap-closure commits from Plans 23-06/23-07).

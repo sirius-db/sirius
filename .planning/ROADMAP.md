@@ -229,7 +229,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 | 20. Scan Manager + Pin Tables Port | v1.4 | 6/6 | Complete | 2026-05-06 |
 | 21. v1.4 Ship Gate | v1.4 | 1/1 | Complete | 2026-05-06 |
 | 22. Multi-GPU pinning + stream lineage hardening | v1.5+ | 7/7 | Complete    | 2026-05-08 |
-| 23. Update cucascade + sirius from upstream | v1.5+ | 6/7 | In Progress|  |
+| 23. Update cucascade + sirius from upstream | v1.5+ | 7/7 | Complete | 2026-05-13 |
 
 ## Phase context
 
@@ -327,13 +327,13 @@ Plans:
 **Goal:** Re-base our cucascade fork onto `origin/main` (HEAD `bcddb89`, 1 commit ahead of our `c666b21` pin) and merge sirius `origin/dev` (12 commits ahead) into `feature/single-node-multi-gpu2`. Resolve overlap conflicts in favor of upstream where the upstream change supersedes ours; preserve everything else we shipped during Phase 17–22.3. Cucascade upstream PR #121 "Make host memory portable" (`bcddb89`) adds portable pinned memory + CUDA event wrapper and supersedes the portable-pinning hunks of our squashed commit `6236494`. Surgical-split strategy: drop those 4 overlapping files' hunks from `6236494`; keep the 3 ours-only files (ptds tracker, pool peer access, `pipeline_io_backend.cpp` cleanup). Other 5 cucascade commits rebase on top with predicted conflict surface in `995bf4e` + `42a01c4` (both touch `memory/common`). Sirius merge from `origin/dev` is a separate step after the cucascade gitlink bump; highest-risk upstream commits documented (`7eeaab4` value AST Phase 2, `7cc7a79` task-creation race fix, `972cb32` converter symbol rename, `e94ad4a` per-op memory estimate, `5d09a59` bytes-to-materialize fix). All Phase 22.x invariants (REG-01..06, GATE-22.1-A/B/C, K.6/K.7 NO-REPRO, HYG-02, kvikio-free, Cluster A=0 / Cluster B same-stream invariant) must hold post-merge.
 **Requirements**: MERGE-CC-23 (cucascade rebase clean against `origin/main` `bcddb89` with surgical 6236494 split), MERGE-DEV-23 (sirius `origin/dev` merge into `feature/single-node-multi-gpu2`), GAUNTLET-23 (full Phase 22.x invariant gauntlet passes post-merge).
 **Depends on:** Phase 22.3 (must ship before this phase rebases; the new SF10 Q11 test is part of the post-merge gauntlet)
-**Plans:** 6/7 plans executed
+**Plans:** 7/7 plans executed — PASS (gap-closure Plans 23-06/23-07)
 
 Plans:
 - [x] 23-01-PLAN.md — Cucascade rebase prep + surgical split of 6236494 (backup branch + pre-merge tag + start interactive rebase)
 - [x] 23-02-PLAN.md — Cucascade rebase continuation — apply a1778f9/995bf4e/1c1e648/42a01c4/c666b21; integrate PR #121 portable-pinning with our DMA probe + stream-lineage + Cluster B same-stream
 - [x] 23-03-PLAN.md — Bump Sirius cucascade gitlink to post-rebase HEAD; intermediate MCP build + 4 invariant Catch2 suites
 - [x] 23-04-PLAN.md — git merge origin/dev into feature/single-node-multi-gpu2; resolve D-13..D-20 conflicts with per-file triage log; intermediate build + invariant gauntlet
-- [x] 23-05-PLAN.md — Full v1.4 + Phase 22.x gauntlet (REG-01..06, GATE-22.1-A/B/C, K.6/K.7 NO-REPRO, Cluster B same-stream) + sanitizer baseline diff + 23-VERDICT.md + 23-CUCASCADE-DIFF.md (CC-UPSTREAM-01) — PARTIAL: convert_gpu_to_gpu regression (commit 8392c3d) → Phase 24 fix candidate
+- [x] 23-05-PLAN.md — Full v1.4 + Phase 22.x gauntlet (REG-01..06, GATE-22.1-A/B/C, K.6/K.7 NO-REPRO, Cluster B same-stream) + sanitizer baseline diff + 23-VERDICT.md + 23-CUCASCADE-DIFF.md (CC-UPSTREAM-01) — PARTIAL: convert_gpu_to_gpu regression (commit 8392c3d) → gap-closure in Plans 23-06/23-07
 - [x] 23-06-PLAN.md — Gap closure: cucascade alloc_and_peer_copy_async dst_guard fix (HtoD device-context binding) + cucascade ctest validation (no sirius gitlink bump here)
-- [ ] 23-07-PLAN.md — Gap closure: bump sirius cucascade gitlink + rebuild + rerun REG-05/REG-06 Leg1/Leg2 + fix sanitizer_gate_22.sh cluster_B false-positive + flip VERDICT PARTIAL→PASS
+- [x] 23-07-PLAN.md — Gap closure: bump sirius cucascade gitlink (37df815 + probe-restore 9da4047) + rebuild + rerun REG-05/REG-06 Leg1/Leg2 + fix sanitizer_gate_22.sh cluster_B false-positive + flip VERDICT PARTIAL→PASS
