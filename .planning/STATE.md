@@ -1,16 +1,16 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.3
-milestone_name: Gauntlet on Rebased Branch)
-status: executing
-stopped_at: "Completed 24-04-PLAN.md — 18/18 PASS gauntlet approved; ready for Plan 24-05 (24-VERDICT.md)"
+milestone: v1.5+
+milestone_name: Upstream sync (cucascade + sirius round 2)
+status: complete
+stopped_at: "Completed 24-05-PLAN.md — Phase 24 PASS (18/18 gauntlet gates); cucascade pin 9da4047→5203de5; sirius origin/dev merged; 24-VERDICT.md + 24-CUCASCADE-DIFF.md authored"
 last_updated: "2026-05-13T00:00:00Z"
 last_activity: 2026-05-13
 progress:
   total_phases: 12
-  completed_phases: 3
-  total_plans: 26
-  completed_plans: 26
+  completed_phases: 4
+  total_plans: 31
+  completed_plans: 31
 ---
 
 # Project State
@@ -24,9 +24,9 @@ See: .planning/PROJECT.md (updated 2026-05-04)
 
 ## Current Position
 
-Phase: 24 (update-cucascade-and-sirius-from-upstream-round-2) — EXECUTING
-Plan: 5 of 5
-Status: Plan 24-04 complete (GAUNTLET-24 approved); ready for Plan 24-05 (24-VERDICT.md)
+Phase: 24 (update-cucascade-and-sirius-from-upstream-round-2) — COMPLETE
+Plan: 5 of 5 (all complete)
+Status: Phase 24 PASS (18/18 gauntlet gates); 24-VERDICT.md authored; Phase 24 CLOSED
 Last activity: 2026-05-13
 
 ```
@@ -127,8 +127,9 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 | Phase 23 P07 | ~90min | 5 tasks | 8 files |
 | Phase 24 P01 | 20min | 2 tasks | 3 files |
 | Phase 24 P02 | 45min | 2 tasks | 9 files |
-| Phase 24 P03 | 82 | 3 tasks | 13 files |
-| Phase 24 P04 | 35min | 3 tasks | 1 files |
+| Phase 24 P03 | 82min | 3 tasks | 13 files |
+| Phase 24 P04 | 55min | 3 tasks | 1 files |
+| Phase 24 P05 | ~30min | 2 tasks | 6 files |
 
 ## Decisions
 
@@ -323,6 +324,11 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 - [Phase 24-04]: D-04 Commit E Branch A — upstream 2e197c6 added [pin_table_host] Catch2 tag (test/cpp/integration/test_gpu_execution_tpch.cpp:4556); no new test file needed; upstream test is durable bisectable artifact.
 - [Phase 24-04]: chunk_memory_spaces count drop 60→42 accepted as non-regression: integrate-both merge strategy in 24-03 added host-tier path using host_chunks/tier/memory_space fields; GPU round-robin path still uses chunk_memory_spaces; coexistence verified by [pin_mgpu] 2/2 + [mgpu-audit] 6/6 + [pin_table_host] 1/1.
 - [Phase 24-04]: Verdict track PASS — Plan 24-05 authors 24-VERDICT.md as PASS; no gap-closure needed.
+- [Phase 24-01]: Backup branch + read upstream diffs; per-commit classification: 7/8 CLEAN, 1 RE-DERIVE (8392c3d on representation_converter.cpp); alloc_and_peer_copy_async is 100% fork-only code; rebase started and paused at commit 3.
+- [Phase 24-02]: Cucascade rebased onto 9ceebaa; 9/9 fork commits survived (8 Phase 23 + 1 new test-fix 5203de5 for 96bfea1 slice-roundtrip API mismatch); D-04 Commit B (ff06fac) API adapter for private constructor + shared_ptr; D-04 Commit A (d228504) atomic gitlink bump; ctest 1/1 PASS; MCP build PASS.
+- [Phase 24-03]: origin/dev merged (ba5ed27 + 2e197c6); 9 conflict files resolved D-01 upstream-favored (INTEGRATE BOTH for parallel code paths); D-05 gitlink ours-wins at 5203de5; D-04 Commit D (90fad83) post-merge stream_view fix; build PASS; invariant grep gates all PASS.
+- [Phase 24-04]: Gauntlet ran 18 gates (17 Phase 23 baseline + D-07 new pin_table tier='host' smoke); 18/18 PASS; REG-06 Leg 1 memcheck improved 6/7→7/7; D-07 Branch A — upstream [pin_table_host] test exists (1/1 PASS 51 assertions); chunk_memory_spaces count drop 60→42 accepted as non-regression (integrate-both merge); human-verify APPROVED 2026-05-13.
+- [Phase 24-05]: Verdict PASS; 24-VERDICT.md + 24-CUCASCADE-DIFF.md authored; REQUIREMENTS + ROADMAP + STATE + PROJECT updated; CC-UPSTREAM-01 carry now 9 commits ahead of 9ceebaa; Phase 24 CLOSED 2026-05-13.
 
 ## Accumulated Context
 
@@ -363,10 +369,11 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 - Phase 22.2 inserted after Phase 22.1: Fix downgrade_executor cudaSetDevice(-1) (K.6 closure) (URGENT). Reason: Phase 22.1's advisory SF100 Q11 num_gpus=2 check empirically isolated K.6 to HOST-tier downgrade_executor worker-init. Bug location: src/downgrade/downgrade_executor.cpp:67-89 unconditionally calls cudaSetDevice on _memory_space->get_device_id() which returns sentinel -1 for HOST-tier memory spaces. ~15-LOC fix gates both stream pool creation and per_thread_init on _space_id.tier == cucascade::memory::Tier::GPU. Shipped 2026-05-08 (HEAD 7dc47a2) — K.6 closed; SF100 Q11 num_gpus=2 cudaSetDevice errors 1→0.
 - Phase 22.3 inserted after Phase 22.2: Fix CTE operator types declaration (K.7 closure — Q11 SF10+ correctness) (URGENT). Reason: Phase 22.2's K.6 closure cleared the cudaSetDevice noise that was masking K.7. Empirical isolation 2026-05-08: Q11 returns 0 rows at any scale ≥ SF10 regardless of num_gpus (SF10 num_gpus=1 reproduces; not multi-GPU specific, not SF100 specific). Bug location: src/planner/sirius_plan_cte.cpp:50 sets sirius_physical_cte._types = right->types (consumer's output types), but src/op/sirius_physical_cte.cpp:75-81 execute() is a passthrough forwarding the producer's batches unchanged. Likely fix: change to op.children[0]->types (producer side per LogicalMaterializedCTE convention). [TPC-H][parquet] test gate uses SF1 only — SF1 doesn't exercise pipeline_task so the bug never gates. New SF10 Q11 test required.
 - Phase 23 added: Update cucascade + sirius from upstream — first round. Rebase cucascade fork onto origin/main bcddb89 (PR #121 portable host memory supersedes our 6236494 portable-pinning hunks; surgical-split keeps 3 ours-only files). Merge sirius origin/dev (12 commits ahead) into feature/single-node-multi-gpu2 (393 ahead at start). Re-run Phase 22.x invariant gauntlet. Shipped 2026-05-13 (HEAD 3520db7) after gap closure (Plans 23-06/23-07): 17/17 gates PASS; cucascade fork 8 ahead at 9da4047; new gap-closure commits 37df815 (dst_guard in alloc_and_peer_copy_async) + 9da4047 (run_p2p_probe_locked device-context restore); sanitizer_gate_22.sh cluster_B false-positive closed via windowed awk + P22_SELFTEST. Side-benefit: upstream 7cc7a79 task-creation race fix closed Phase 22.3 pin_table suite-run flake.
-- Phase 24 added 2026-05-13: Update cucascade + sirius from upstream (round 2). Reason: 2 more upstream commits each side since Phase 23 shipped. Cucascade origin/main advanced bcddb89 → +9ceebaa (reconstruct_column STRING fix #124) +96bfea1 (slice host table #122). Sirius origin/dev advanced 8524c79 → +ba5ed27 (wire_data_repositories Phase 2 #770) +2e197c6 (pin_table tier='host' #774). Overlap-risk commits: cucascade 9ceebaa touches reconstruct_column path (same area as Phase 23 gap-closure 37df815/9da4047); sirius 2e197c6 adds host-tier pin_table next to Phase 22 PIN-MGPU-01 round-robin distribution; sirius ba5ed27 refactors datasource/IO surface adjacent to Phase 22.1 kvikio-free path. Requirements: MERGE-CC-24, MERGE-DEV-24, GAUNTLET-24. Plans TBD via /gsd:plan-phase 24.
+- Phase 24 added 2026-05-13: Update cucascade + sirius from upstream (round 2). Reason: 2 more upstream commits each side since Phase 23 shipped. Cucascade origin/main advanced bcddb89 → +9ceebaa (reconstruct_column STRING fix #124) +96bfea1 (slice host table #122). Sirius origin/dev advanced 8524c79 → +ba5ed27 (wire_data_repositories Phase 2 #770) +2e197c6 (pin_table tier='host' #774). Overlap-risk commits: cucascade 9ceebaa touches reconstruct_column path (same area as Phase 23 gap-closure 37df815/9da4047); sirius 2e197c6 adds host-tier pin_table next to Phase 22 PIN-MGPU-01 round-robin distribution; sirius ba5ed27 refactors datasource/IO surface adjacent to Phase 22.1 kvikio-free path. Requirements: MERGE-CC-24, MERGE-DEV-24, GAUNTLET-24. 5 plans executed.
+- Phase 24 CLOSED 2026-05-13: PASS — 18/18 gauntlet gates; cucascade pin advanced 9da4047 → 5203de5 (9 commits ahead of 9ceebaa); sirius HEAD now at a1909c8 (post-merge with origin/dev integrated). Zero regressions. Two improvements: REG-06 Leg 1 memcheck 6/7→7/7; D-07 new [pin_table_host] gate 1/1. D-01 upstream-source-of-truth META-RULE: 1 RE-DERIVE conflict in cucascade (representation_converter.cpp) resolved cleanly; 9 sirius conflicts resolved INTEGRATE BOTH for parallel code paths. No gap-closure plans needed. CC-UPSTREAM-01 carry continues (9 commits ahead). See 24-VERDICT.md.
 
 ## Session Continuity
 
-Last session: 2026-05-13T16:49:17.269Z
-Stopped at: CHECKPOINT 24-04 Task 3 — awaiting human-verify of 18/18 PASS gauntlet
+Last session: 2026-05-13T00:00:00Z
+Stopped at: Completed 24-05-PLAN.md — Phase 24 PASS (18/18 gauntlet); verdict + diff authored; planning metadata updated; Phase 24 CLOSED
 Resume file: None

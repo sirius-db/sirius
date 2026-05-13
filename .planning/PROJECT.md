@@ -10,6 +10,17 @@ Any query can transparently execute across every GPU on the node — tasks are s
 
 ## Current State
 
+**Phase 24 shipped 2026-05-13** — Update cucascade + sirius from upstream (round 2).
+- 5 plans / 3 requirements validated (MERGE-CC-24, MERGE-DEV-24, GAUNTLET-24) — all PASS on first attempt; no gap-closure plans needed
+- Cucascade fork rebased onto `origin/main` HEAD `9ceebaa` (PR #124 "Fix for: Invalid Error: reconstruct_column STRING #124" and PR #122 "feat: adding the ability to slice host table" as `96bfea1`); single RE-DERIVE conflict on `representation_converter.cpp` (shared_ptr dereference + our `target_stream` preserved); 1 test-fix commit added for `96bfea1` writer_stream API mismatch. Fork now 9 commits ahead at `5203de5`
+- Sirius `origin/dev` merged into `feature/single-node-multi-gpu2` — `ba5ed27` (wire_data_repositories Phase 2 split) + `2e197c6` (pin_table tier='host'); 9 conflict files resolved INTEGRATE BOTH (PIN-MGPU-01 GPU-tier round-robin path coexists with new host-tier path); D-05 gitlink ours-wins at `5203de5`; D-04 Commit D post-merge fix-up (stream_view arg)
+- 18/18 invariant gates PASS: REG-01..06 (all 17 Phase 23 baseline gates) + D-07 new `[pin_table_host]` gate (1/1, 51 assertions, upstream test from `2e197c6`); HYG-02=40; kvikio-free=0; Cluster A=0; Cluster B=0; sanitizer_gate_22.sh P22_SELFTEST PASS
+- Two improvements over Phase 23 baseline: REG-06 Leg 1 memcheck 6/7 PARTIAL → 7/7 PASS (cudf library violations absent); D-07 new gate (pin_table tier='host' smoke) 1/1 PASS via upstream test — D-04 Commit E not needed (Branch A)
+- D-01 upstream-as-source-of-truth META-RULE application: 1 cucascade RE-DERIVE + INTEGRATE BOTH for sirius merge; biased toward upstream tighter than Phase 23's symmetric triage; fork count held at 9 (no commits dropped, +1 test-fix)
+- CC-UPSTREAM-01 carry pattern continues: 9 commits ahead of `9ceebaa`; no upstream PRs submitted (user handles separately); `24-CUCASCADE-DIFF.md` documents per-commit notes and recommended upstream PR groupings
+- Branch: `feature/single-node-multi-gpu2` (local-only; no `git push`; cucascade fork stays on local branch per CC-UPSTREAM-01 carry pattern)
+- See: [`24-VERDICT.md`](phases/24-update-cucascade-and-sirius-from-upstream-round-2/24-VERDICT.md), [`24-CUCASCADE-DIFF.md`](phases/24-update-cucascade-and-sirius-from-upstream-round-2/24-CUCASCADE-DIFF.md), [`24-CONFLICT-LOG.md`](phases/24-update-cucascade-and-sirius-from-upstream-round-2/24-CONFLICT-LOG.md)
+
 **Phase 23 shipped 2026-05-13** — Update cucascade + sirius from upstream.
 - 7 plans / 3 requirements validated (MERGE-CC-23, MERGE-DEV-23, GAUNTLET-23) — initial 5 plans (rebase + merge + gauntlet) PARTIAL; gap-closure 2 plans (23-06 dst_guard + 23-07 gitlink/script/verdict) PASS
 - Cucascade fork rebased onto `origin/main` HEAD `bcddb89` (PR #121 "Make host memory portable" supersedes our portable-pinning hunks of `6236494`); surgical-split kept 3 ours-only files (ptds tracker, pool peer access, `pipeline_io_backend` hygiene); 5 remaining commits re-applied on top. Fork now 8 commits ahead at `9da4047`
