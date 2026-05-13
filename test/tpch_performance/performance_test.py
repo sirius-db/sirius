@@ -220,29 +220,22 @@ def _resolve_parquet_files(parquet_dir, table):
     return candidates
 
 
-def open_connection(source, gpu_execution=False):
-    """Open a DuckDB connection, load the Sirius extension, register tables.
-
-    `source` may be a .duckdb file path or a parquet directory. When a parquet
-    directory, each TPC-H table is registered as a view over its parquet files.
-    """
-    is_dir = os.path.isdir(source)
-    db_path = ":memory:" if is_dir else source
-    log(f"Opening DuckDB connection (db_path={db_path}, is_dir={is_dir})")
-    con = duckdb.connect(db_path, config={"allow_unsigned_extensions": "true"})
-    if is_dir:
-        for table in TPCH_TABLES:
-            files = _resolve_parquet_files(source, table)
-            if not files:
-                raise FileNotFoundError(
-                    f"No parquet files found for table '{table}' in {source}"
-                )
-            log(f"  Registering view '{table}' over {len(files)} file(s)")
-            file_list = ",".join(f"'{f}'" for f in files)
-            con.execute(
-                f"CREATE OR REPLACE VIEW {table} AS SELECT * FROM read_parquet([{file_list}])"
+def open_connection(parquet_dir, gpu_execution=False):
+    """Open an in-memory DuckDB, register TPC-H parquet views, optionally LOAD Sirius."""
+    log(f"Opening DuckDB connection over parquet dir {parquet_dir}")
+    con = duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
+    for table in TPCH_TABLES:
+        files = _resolve_parquet_files(parquet_dir, table)
+        if not files:
+            raise FileNotFoundError(
+                f"No parquet files found for table '{table}' in {parquet_dir}"
             )
-        log("All TPC-H views registered")
+        log(f"  Registering view '{table}' over {len(files)} file(s)")
+        file_list = ",".join(f"'{f}'" for f in files)
+        con.execute(
+            f"CREATE OR REPLACE VIEW {table} AS SELECT * FROM read_parquet([{file_list}])"
+        )
+    log("All TPC-H views registered")
     if gpu_execution:
         log(f"Loading Sirius extension from {EXTENSION_PATH}")
         con.execute(f"LOAD '{EXTENSION_PATH}'")
@@ -492,18 +485,11 @@ def validate(source, queries):
 
 def parse_args():
     p = argparse.ArgumentParser(description="Run TPC-H performance tests")
-    src = p.add_mutually_exclusive_group()
-    src.add_argument(
-        "--sf",
-        type=int,
-        default=None,
-        help="Scale factor — uses the default performance_test.duckdb file",
-    )
-    src.add_argument(
+    p.add_argument(
         "--input",
         type=str,
-        default=None,
-        help="Path to a .duckdb database file or a parquet directory",
+        required=True,
+        help="Path to a TPC-H parquet directory (one .parquet file or subdir per table)",
     )
     p.add_argument(
         "--mode",
@@ -561,8 +547,7 @@ def parse_args():
         help=(
             "Pin TPC-H tables into the Sirius cache. 'per-query' pins/unpins "
             "around each query in grouped/isolated mode; in sequential mode it "
-            "becomes a single union-pin at session start. Requires --input to "
-            "point at a parquet directory. (default: none)"
+            "becomes a single union-pin at session start. (default: none)"
         ),
     )
     p.add_argument(
@@ -576,21 +561,21 @@ def parse_args():
 
 def main():
     args = parse_args()
-    source = args.input or "performance_test.duckdb"
+    source = args.input
+    if not os.path.isdir(source):
+        raise SystemExit(
+            f"--input must be a parquet directory; got {source!r}. "
+            ".duckdb database files are not supported."
+        )
+    parquet_dir = source
     queries = parse_query_spec(args.queries)
     engine_modes = resolve_engine_modes(args.engine)
     output_root = args.output or DEFAULT_OUTPUT_ROOT
 
-    parquet_dir = source if os.path.isdir(source) else None
-    if args.pinning_mode != "none":
-        if args.engine == "cpu":
-            raise SystemExit(
-                "--pinning-mode is Sirius-only; cannot be combined with --engine cpu"
-            )
-        if parquet_dir is None:
-            raise SystemExit(
-                "--pinning-mode per-query requires --input to point at a parquet directory"
-            )
+    if args.pinning_mode != "none" and args.engine == "cpu":
+        raise SystemExit(
+            "--pinning-mode is Sirius-only; cannot be combined with --engine cpu"
+        )
 
     config_path = (args.config or "").strip()
     if config_path:
@@ -617,8 +602,6 @@ def main():
     os.environ["SIRIUS_LOG_DIR"] = log_dir
 
     log(f"Source:        {source}")
-    if args.sf is not None:
-        log(f"Scale factor:  {args.sf}")
     log(f"Mode:          {args.mode}")
     log(f"Iterations:    {args.iterations}")
     log(f"Engine:        {args.engine}")
