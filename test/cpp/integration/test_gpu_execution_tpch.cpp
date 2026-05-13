@@ -4550,3 +4550,24 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
   REQUIRE(unpin_result);
   REQUIRE_FALSE(unpin_result->HasError());
 }
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - pin_table host tier scan and aggregate",
+                 "[integration][gpu_execution][parquet][pin_table_host]")
+{
+  auto parquet_dir = fs::path(__FILE__).parent_path() / "data/parquet";
+  auto pin_query   = "CALL pin_table('" + parquet_dir.string() +
+                   "/lineitem.parquet', tier='host', name='lineitem');";
+  auto pin_result = con->Query(pin_query);
+  REQUIRE(pin_result);
+  if (pin_result->HasError()) { UNSCOPED_INFO("pin_table error: " << pin_result->GetError()); }
+  REQUIRE_FALSE(pin_result->HasError());
+
+  compare_gpu_vs_cpu(
+    "select l_returnflag, l_linestatus, count(*), sum(l_quantity) "
+    "from lineitem group by l_returnflag, l_linestatus order by l_returnflag, l_linestatus;");
+
+  auto unpin_result = con->Query("CALL unpin_table('lineitem');");
+  REQUIRE(unpin_result);
+  REQUIRE_FALSE(unpin_result->HasError());
+}

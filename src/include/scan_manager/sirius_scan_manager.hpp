@@ -25,6 +25,7 @@
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
 
+#include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <io/types.hpp>
 
@@ -57,6 +58,8 @@ struct pinned_entry {
   /// this list to match an incoming scan operator's parquet_scan_info::file_paths
   /// against this entry, so it can swap in a cached split provider.
   std::vector<std::string> file_paths;
+  /// GPU-tier storage: one chunk vector per pinned column name. Populated by
+  /// @ref sirius_scan_manager::insert_pinned_entry. Empty when @ref tier is HOST.
   std::unordered_map<std::string, std::vector<std::shared_ptr<cudf::column>>>
     data_batches_by_column;
   /// Per-chunk memory space placement. Parallel to the inner vectors of
@@ -65,6 +68,16 @@ struct pinned_entry {
   /// share the same memory_space because they came from the same
   /// chunked_parquet_reader::read_chunk() call (Phase 22 D-03).
   std::vector<cucascade::memory::memory_space*> chunk_memory_spaces;
+  /// HOST-tier storage: one host_data_representation per chunk, each holding all
+  /// pinned columns. The cached_split_provider slices these by column index when
+  /// serving a particular scan. Populated by @ref insert_pinned_entry_host.
+  std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;
+  /// Tier the pinned data resides in. Drives which storage member above is used
+  /// and which cached_split_provider variant @ref create_provider_for builds.
+  cucascade::memory::Tier tier{cucascade::memory::Tier::GPU};
+  /// Memory space the pinned data resides in. Captured at pin time so the
+  /// cached_split_provider can wrap copied tables as data_batch instances.
+  cucascade::memory::memory_space* memory_space{nullptr};
   /// Total number of rows across all pinned chunks. Used by insert_pinned_entry
   /// to decide whether a re-insert merges into the existing entry (same row
   /// count → add unique columns) or replaces it (different row count).
@@ -157,6 +170,28 @@ class sirius_scan_manager {
                            std::vector<std::string> file_paths,
                            std::vector<std::unique_ptr<cudf::table>> data_tables,
                            std::vector<cucascade::memory::memory_space*> chunk_memory_spaces);
+
+  /// \brief Pin the entry for a table on the host tier.
+  ///
+  /// Each entry in @p host_chunks describes one batch's worth of pinned data
+  /// (covering all pinned columns) as a host_data_representation. The
+  /// cached_split_provider built from this entry slices each chunk by column
+  /// index at scan time. Re-insert with a different row count drops the
+  /// existing entry; otherwise the call replaces the entry's chunks.
+  ///
+  /// \param name          Table name key.
+  /// \param column_names  Column names in the order the chunks were captured (i.e.
+  ///                      the i-th column in each host_data_representation
+  ///                      corresponds to @c column_names[i]).
+  /// \param file_paths    Resolved file paths captured at pin time.
+  /// \param host_chunks   One host_data_representation per emitted batch.
+  /// \param memory_space  Host memory space the chunks reside in.
+  void insert_pinned_entry_host(
+    const std::string& name,
+    std::vector<std::string> column_names,
+    std::vector<std::string> file_paths,
+    std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
+    cucascade::memory::memory_space& memory_space);
 
   /// \brief Remove the pinned entry for @p name. No-op if absent.
   void remove_pinned_entry(const std::string& name);

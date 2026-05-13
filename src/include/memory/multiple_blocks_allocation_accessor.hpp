@@ -66,6 +66,10 @@ struct multiple_blocks_allocation_accessor {
    * @param[in] allocation The multiple blocks allocation (unique_ptr or shared_ptr).
    * @throws std::runtime_error if the block size is not a multiple of the size of T.
    */
+  /// Templated on the smart-pointer type so callers can pass either
+  /// std::unique_ptr<...> (the duckdb/parquet scan task path that owns the
+  /// allocation) or std::shared_ptr<...> (the host_table_chunk_reader path,
+  /// where cucascade now hands out shared host_table_allocation buffers).
   template <typename Ptr>
   void initialize(size_t byte_offset, Ptr const& allocation)
   {

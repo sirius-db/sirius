@@ -35,7 +35,7 @@ namespace sirius::op::result {
 
 host_table_chunk_reader::column_reader::column_reader(
   cucascade::memory::column_metadata const& col,
-  allocation_ptr const& allocation)
+  std::shared_ptr<multiple_blocks_allocation> const& allocation)
 {
   if (allocation == nullptr || allocation->block_size() == 0) {
     throw std::runtime_error(
@@ -70,7 +70,7 @@ void host_table_chunk_reader::column_reader::copy_mask_to_validity(
   duckdb::ValidityMask& validity,
   size_t row_offset,
   size_t count,
-  allocation_ptr const& allocation)
+  std::shared_ptr<multiple_blocks_allocation> const& allocation)
 {
   assert(row_offset + count <= static_cast<size_t>(size));
   assert(utils::mod_8(row_offset) == 0);  // Must be byte-aligned start
@@ -87,7 +87,7 @@ void host_table_chunk_reader::column_reader::copy_fixed_width(
   duckdb::Vector& vector,
   size_t row_offset,
   size_t count,
-  allocation_ptr const& allocation)
+  std::shared_ptr<multiple_blocks_allocation> const& allocation)
 {
   assert(vector.GetType().InternalType() != duckdb::PhysicalType::VARCHAR);
   assert(row_offset + count <= static_cast<size_t>(size));
@@ -166,7 +166,7 @@ void host_table_chunk_reader::column_reader::copy_string(
   duckdb::Vector& vector,
   size_t row_offset,
   size_t count,
-  allocation_ptr const& allocation)
+  std::shared_ptr<multiple_blocks_allocation> const& allocation)
 {
   assert(vector.GetType().InternalType() == duckdb::PhysicalType::VARCHAR);
   assert(row_offset + count <= static_cast<size_t>(size));

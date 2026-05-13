@@ -27,8 +27,12 @@
 #include <cudf/io/types.hpp>
 
 #include <rmm/cuda_device.hpp>
+#include <rmm/cuda_stream.hpp>
+
+#include <cucascade/data/cpu_data_representation.hpp>
 
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
@@ -709,8 +713,9 @@ unique_ptr<FunctionData> SiriusExtension::PinTableBind(ClientContext& context,
     throw BinderException("pin_table requires a 'tier' named parameter");
   }
   result->args.tier = tier_it->second.ToString();
-  if (result->args.tier == "host") {
-    throw NotImplementedException("pin_table tier='host' is not yet supported");
+  if (result->args.tier != "gpu" && result->args.tier != "host") {
+    throw NotImplementedException("pin_table tier='" + result->args.tier +
+                                  "' is not supported (only 'gpu' and 'host')");
   }
 
   auto name_it = input.named_parameters.find("name");
@@ -759,10 +764,22 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   // file reads across all GPU memory spaces so multi-file pin_table calls
   // distribute their chunks evenly. Each file's chunks all bind to the same
   // GPU (per-file binding — see comment at chunk_idx increment below).
+  // For tier='host' we additionally convert each table to a host_data_representation
+  // (via the GPU↔HOST converter) so the pinned data lives in pinned host memory.
   auto& memory_manager = sirius_ctx->get_memory_manager();
   auto gpu_spaces      = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   if (gpu_spaces.empty()) {
     throw InvalidInputException("pin_table: no GPU memory space available");
+  }
+  auto& gpu_mem_space = const_cast<cucascade::memory::memory_space&>(*gpu_spaces[0]);
+
+  cucascade::memory::memory_space* host_mem_space = nullptr;
+  if (data.args.tier == "host") {
+    auto host_spaces = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+    if (host_spaces.empty()) {
+      throw InvalidInputException("pin_table: no HOST memory space available");
+    }
+    host_mem_space = const_cast<cucascade::memory::memory_space*>(host_spaces[0]);
   }
 
   // Glob the user-supplied path into concrete files.
@@ -805,12 +822,28 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   // is the memory_space* for the i-th cudf::table in tables. Consumed by
   // insert_pinned_entry's precondition check (size==data_tables.size).
   std::vector<cucascade::memory::memory_space*> chunk_memory_spaces;
+  // HOST-tier storage: one host_data_representation per chunk.
+  std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;
   std::vector<std::string> read_column_names;  // captured from parquet metadata
   int64_t remaining_rows = data.args.n_rows.value_or(-1);
   // Phase 22 D-02: per-call local counter (NOT std::atomic, NOT global).
   // PinTableFunction is single-threaded; new pin_table calls restart at chunk
   // 0 → GPU 0 for reproducibility (D-02 lock).
   std::size_t chunk_idx = 0;
+
+  // For tier='host' the full table may not fit in GPU memory, so each batch is downgraded
+  // to a pinned host_data_representation immediately and the GPU buffers are released
+  // before the next read_chunk(). The GPU↔HOST converter uses cudaMemcpyBatchAsync which
+  // requires a real, non-default stream.
+  cucascade::representation_converter_registry* registry_ptr = nullptr;
+  std::optional<rmm::cuda_stream> pin_stream;
+  rmm::cuda_stream_view stream_view{};
+  if (data.args.tier == "host") {
+    registry_ptr = &sirius::converter_registry::get();
+    pin_stream.emplace();
+    stream_view = pin_stream->view();
+  }
+
   for (auto const& path : file_paths) {
     if (data.args.n_rows.has_value() && remaining_rows <= 0) { break; }
 
@@ -840,13 +873,13 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     auto io_object  = std::make_shared<sirius::io::uring_io_object>(path);
     auto datasource = target_ioctx->make_datasource(io_object);
 
-    auto opts = cudf::io::parquet_reader_options::builder(
-                  cudf::io::source_info{datasource.get()})
-                  .build();
-    if (!cols.empty()) { opts.set_column_names(cols); }
-    if (data.args.n_rows.has_value()) { opts.set_num_rows(remaining_rows); }
+    auto file_opts = cudf::io::parquet_reader_options::builder(
+                       cudf::io::source_info{datasource.get()})
+                       .build();
+    if (!cols.empty()) { file_opts.set_column_names(cols); }
+    if (data.args.n_rows.has_value()) { file_opts.set_num_rows(remaining_rows); }
 
-    cudf::io::chunked_parquet_reader reader(chunk_read_limit, opts);
+    cudf::io::chunked_parquet_reader reader(chunk_read_limit, file_opts);
     int64_t file_rows_read = 0;
     while (reader.has_next()) {
       auto chunk      = reader.read_chunk();
@@ -859,24 +892,40 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
         }
       }
       file_rows_read += chunk_rows;
-      tables.emplace_back(std::move(chunk.tbl));
-      chunk_memory_spaces.push_back(target_space);  // parallel to tables (D-03)
+      if (data.args.tier == "host") {
+        cucascade::gpu_table_representation gpu_repr(std::move(chunk.tbl), gpu_mem_space);
+        auto host_repr = registry_ptr->convert<cucascade::host_data_representation>(
+          gpu_repr, host_mem_space, stream_view);
+        // Sync before gpu_repr leaves scope so the async D2H copies finish before its
+        // device buffers are freed.
+        stream_view.synchronize();
+        host_chunks.emplace_back(std::move(host_repr));
+      } else {
+        tables.emplace_back(std::move(chunk.tbl));
+        chunk_memory_spaces.push_back(target_space);  // parallel to tables (D-03)
+      }
     }
     if (data.args.n_rows.has_value()) { remaining_rows -= file_rows_read; }
     // Phase 22 PIN-MGPU-01 (D-01/D-02): per-call local counter, increments
     // per file. All chunks within a single chunked_parquet_reader stay on
     // the same GPU (per D-03 chunks-at-index-i invariant). Cross-file
-    // alternation produces the round-robin. Multi-chunk single-file
-    // distribution requires multi-file fixtures (see Plan 05 distribution
-    // gate test).
+    // alternation produces the round-robin.
     ++chunk_idx;
   }
 
-  sirius_ctx->get_scan_manager().insert_pinned_entry(data.args.name,
-                                                     std::move(read_column_names),
-                                                     std::move(file_paths),
-                                                     std::move(tables),
-                                                     std::move(chunk_memory_spaces));
+  if (data.args.tier == "host") {
+    sirius_ctx->get_scan_manager().insert_pinned_entry_host(data.args.name,
+                                                            std::move(read_column_names),
+                                                            std::move(file_paths),
+                                                            std::move(host_chunks),
+                                                            *host_mem_space);
+  } else {
+    sirius_ctx->get_scan_manager().insert_pinned_entry(data.args.name,
+                                                       std::move(read_column_names),
+                                                       std::move(file_paths),
+                                                       std::move(tables),
+                                                       std::move(chunk_memory_spaces));
+  }
 
   output.SetCardinality(1);
   output.SetValue(0, 0, Value::BOOLEAN(true));

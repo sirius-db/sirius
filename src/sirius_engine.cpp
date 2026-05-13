@@ -44,6 +44,7 @@
 #include "op/sirius_physical_top_n_merge.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
+#include "pipeline/repository_wiring.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"
 #include "pipeline/sirius_plan_printer.hpp"
 #include "sirius/exception.hpp"
@@ -92,77 +93,6 @@ void sirius_engine::reset()
   sirius_pipelines.clear();
   new_pipeline_breakers.clear();
   new_scheduled.clear();
-}
-
-void sirius_engine::insert_repository(
-  std::string_view port_id,
-  duckdb::shared_ptr<pipeline::sirius_pipeline> input_pipeline,
-  duckdb::shared_ptr<pipeline::sirius_pipeline> dependent_pipeline,
-  op::MemoryBarrierType barrier_type)
-{
-  auto next_op            = dependent_pipeline->get_operators().size() == 0
-                              ? dependent_pipeline->get_sink().get()
-                              : &dependent_pipeline->get_operators()[0].get();
-  size_t op_id            = next_op->operator_id;
-  auto& data_repo_manager = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
-                              ->get_data_repository_manager();
-  data_repo_manager.add_new_repository(
-    op_id, port_id, std::make_unique<::cucascade::shared_data_repository>());
-  next_op->add_port(port_id,
-                    std::make_unique<op::sirius_physical_operator::port>(
-                      barrier_type,
-                      data_repo_manager.get_repository(op_id, port_id).get(),
-                      input_pipeline,
-                      dependent_pipeline));
-  input_pipeline->get_sink()->add_next_port_after_sink({next_op, port_id});
-
-  if (next_op->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
-    auto partition_op = next_op->Cast<op::sirius_physical_right_delim_join>().partition_join;
-    partition_op->add_port(port_id,
-                           std::make_unique<op::sirius_physical_operator::port>(
-                             op::MemoryBarrierType::FULL,
-                             data_repo_manager.get_repository(op_id, port_id).get(),
-                             input_pipeline,
-                             dependent_pipeline));
-  } else if (next_op->type == op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
-    throw std::runtime_error("Left delim join should never be a source");
-  }
-}
-
-void sirius_engine::insert_repository(
-  std::string_view port_id,
-  op::sirius_physical_operator* cur_op,
-  duckdb::shared_ptr<pipeline::sirius_pipeline> input_pipeline,
-  duckdb::shared_ptr<pipeline::sirius_pipeline> dependent_pipeline,
-  op::MemoryBarrierType barrier_type)
-{
-  auto& data_repo_manager = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
-                              ->get_data_repository_manager();
-  auto next_op = dependent_pipeline->get_operators().size() == 0
-                   ? dependent_pipeline->get_sink().get()
-                   : &dependent_pipeline->get_operators()[0].get();
-  size_t op_id = next_op->operator_id;
-  data_repo_manager.add_new_repository(
-    op_id, port_id, std::make_unique<::cucascade::shared_data_repository>());
-  next_op->add_port(port_id,
-                    std::make_unique<op::sirius_physical_operator::port>(
-                      barrier_type,
-                      data_repo_manager.get_repository(op_id, port_id).get(),
-                      input_pipeline,
-                      dependent_pipeline));
-  cur_op->add_next_port_after_sink({next_op, port_id});
-
-  if (next_op->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
-    auto partition_op = next_op->Cast<op::sirius_physical_right_delim_join>().partition_join;
-    partition_op->add_port(port_id,
-                           std::make_unique<op::sirius_physical_operator::port>(
-                             op::MemoryBarrierType::FULL,
-                             data_repo_manager.get_repository(op_id, port_id).get(),
-                             input_pipeline,
-                             dependent_pipeline));
-  } else if (next_op->type == op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
-    throw std::runtime_error("Left delim join should never be a source");
-  }
 }
 
 void sirius_engine::cancel_tasks()
@@ -448,7 +378,11 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 
   // Convert meta-pipelines into execution-ready pipelines
   pipeline::sirius_pipeline_converter converter(build_ctx, op_params, &iceberg_delete_data_cache_);
-  auto result = converter.convert(*root_pipeline, *this);
+  auto result = converter.convert(*root_pipeline);
+
+  // Materialize plan-time wiring descriptors into runtime repositories and ports.
+  pipeline::materialize_repository_wiring(result.repository_wirings,
+                                          sirius_ctx_ptr->get_data_repository_manager());
 
   new_scheduled         = std::move(result.scheduled_pipelines);
   new_pipeline_breakers = std::move(result.inserted_operators);

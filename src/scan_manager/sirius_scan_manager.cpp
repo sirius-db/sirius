@@ -154,6 +154,57 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
         break;
       }
 
+      // Filter expression: BoundReferences are in D-space, via plan.batch_position_by_column_id.
+      // Same recipe parquet_split_provider uses, so the filter evaluates correctly against
+      // the cached batch (which is in D-order by construction above). Built before the
+      // tier-specific assembly so both branches share the same filter.
+      std::shared_ptr<duckdb::Expression> filter_expression;
+      if (info->table_filters && !info->table_filters->filters.empty()) {
+        auto duckdb_expression =
+          op::convert_table_filters_to_expression(*info->table_filters,
+                                                  info->column_ids,
+                                                  info->returned_types,
+                                                  plan.batch_position_by_column_id,
+                                                  plan.partition_primary_indices);
+        if (duckdb_expression) {
+          filter_expression = std::shared_ptr<duckdb::Expression>(std::move(duckdb_expression));
+        }
+      }
+
+      if (entry.tier == cucascade::memory::Tier::HOST) {
+        // Map each D-position to its index inside the captured host chunk. column_names
+        // is in capture order, so we look up the requested data column by name. A missing
+        // column means the user pinned a subset that doesn't cover this scan — fall back
+        // to the parquet path so the query still succeeds.
+        std::vector<std::size_t> column_indices;
+        column_indices.reserve(plan.data_columns.size());
+        for (auto const& dc : plan.data_columns) {
+          auto it = std::find(entry.column_names.begin(), entry.column_names.end(), dc.name);
+          if (it == entry.column_names.end()) {
+            throw std::runtime_error("[sirius_scan_manager::create_provider_for] pinned entry '" +
+                                     pinned_name + "' missing column '" + dc.name +
+                                     "' required by scan op");
+          }
+          column_indices.push_back(
+            static_cast<std::size_t>(std::distance(entry.column_names.begin(), it)));
+        }
+
+        SIRIUS_LOG_DEBUG(
+          "[sirius_scan_manager::create_provider_for] using host cached_split_provider for "
+          "op_id={} (pinned='{}' data_cols={} chunks={} needs_assembly={})",
+          op->get_operator_id(),
+          pinned_name,
+          column_indices.size(),
+          entry.host_chunks.size(),
+          op::scan::needs_output_assembly(plan));
+
+        return std::make_unique<cached_split_provider>(entry.host_chunks,
+                                                       std::move(column_indices),
+                                                       *entry.memory_space,
+                                                       std::move(filter_expression),
+                                                       std::move(plan_shared));
+      }
+
       // Look up the pinned chunks for each D-position by name. data_columns is in
       // D-order, so columns_per_request[d] is the chunk vector for D-position d.
       std::vector<std::vector<std::shared_ptr<cudf::column>>> columns_per_request;
@@ -166,22 +217,6 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
                                    "' required by scan op");
         }
         columns_per_request.push_back(it->second);
-      }
-
-      // Filter expression: BoundReferences are in D-space, via plan.batch_position_by_column_id.
-      // Same recipe parquet_split_provider uses, so the filter evaluates correctly against
-      // the cached batch (which is in D-order by construction above).
-      std::shared_ptr<duckdb::Expression> filter_expression;
-      if (info->table_filters && !info->table_filters->filters.empty()) {
-        auto duckdb_expression =
-          op::convert_table_filters_to_expression(*info->table_filters,
-                                                  info->column_ids,
-                                                  info->returned_types,
-                                                  plan.batch_position_by_column_id,
-                                                  plan.partition_primary_indices);
-        if (duckdb_expression) {
-          filter_expression = std::shared_ptr<duckdb::Expression>(std::move(duckdb_expression));
-        }
       }
 
       SIRIUS_LOG_DEBUG(
@@ -351,10 +386,11 @@ void sirius_scan_manager::insert_pinned_entry(
   }
 
   pinned_entry entry;
-  entry.column_names         = std::move(column_names);
-  entry.file_paths           = std::move(file_paths);
-  entry.chunk_memory_spaces  = std::move(chunk_memory_spaces);
-  entry.num_rows             = new_num_rows;
+  entry.column_names        = std::move(column_names);
+  entry.file_paths          = std::move(file_paths);
+  entry.chunk_memory_spaces = std::move(chunk_memory_spaces);
+  entry.tier                = cucascade::memory::Tier::GPU;
+  entry.num_rows            = new_num_rows;
 
   for (auto& table : data_tables) {
     if (!table) { continue; }
@@ -368,6 +404,36 @@ void sirius_scan_manager::insert_pinned_entry(
       entry.data_batches_by_column[entry.column_names[i]].emplace_back(std::move(cols[i]));
     }
   }
+
+  _pinned_entries[name] = std::move(entry);
+}
+
+void sirius_scan_manager::insert_pinned_entry_host(
+  const std::string& name,
+  std::vector<std::string> column_names,
+  std::vector<std::string> file_paths,
+  std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
+  cucascade::memory::memory_space& memory_space)
+{
+  // The host-tier path captures one chunk per emitted batch; each chunk holds every
+  // pinned column. Re-insert always replaces — there is no per-column merge analog
+  // to the GPU path because the chunk-vs-column dimensions are flipped.
+  std::size_t new_num_rows = 0;
+  for (auto const& chunk : host_chunks) {
+    if (!chunk) { continue; }
+    auto const& host_table = chunk->get_host_table();
+    if (host_table && !host_table->columns.empty()) {
+      new_num_rows += static_cast<std::size_t>(host_table->columns.front().num_rows);
+    }
+  }
+
+  pinned_entry entry;
+  entry.column_names = std::move(column_names);
+  entry.file_paths   = std::move(file_paths);
+  entry.tier         = cucascade::memory::Tier::HOST;
+  entry.memory_space = &memory_space;
+  entry.num_rows     = new_num_rows;
+  entry.host_chunks  = std::move(host_chunks);
 
   _pinned_entries[name] = std::move(entry);
 }

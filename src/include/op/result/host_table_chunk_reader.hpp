@@ -85,7 +85,7 @@ class host_table_chunk_reader {
     using allocation_ptr = cucascade::memory::host_table_allocation::buffers_ptr;
 
     column_reader(cucascade::memory::column_metadata const& col,
-                  allocation_ptr const& allocation);
+                  std::shared_ptr<multiple_blocks_allocation> const& allocation);
 
     /**
      * @brief Copy the null mask to the duckdb validity mask for the given row range
@@ -98,7 +98,7 @@ class host_table_chunk_reader {
     void copy_mask_to_validity(duckdb::ValidityMask& validity,
                                size_t row_offset,
                                size_t count,
-                               allocation_ptr const& allocation);
+                               std::shared_ptr<multiple_blocks_allocation> const& allocation);
 
     /**
      * @brief Copy fixed-width data into the duckdb vector for the given row range
@@ -111,7 +111,7 @@ class host_table_chunk_reader {
     void copy_fixed_width(duckdb::Vector& vector,
                           size_t row_offset,
                           size_t count,
-                          allocation_ptr const& allocation);
+                          std::shared_ptr<multiple_blocks_allocation> const& allocation);
 
     /**
      * @brief Copy string data into the duckdb vector for the given row range
@@ -124,7 +124,7 @@ class host_table_chunk_reader {
     void copy_string(duckdb::Vector& vector,
                      size_t row_offset,
                      size_t count,
-                     allocation_ptr const& allocation);
+                     std::shared_ptr<multiple_blocks_allocation> const& allocation);
   };
 
  public:
