@@ -893,7 +893,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
       }
       file_rows_read += chunk_rows;
       if (data.args.tier == "host") {
-        cucascade::gpu_table_representation gpu_repr(std::move(chunk.tbl), gpu_mem_space);
+        cucascade::gpu_table_representation gpu_repr(std::move(chunk.tbl), gpu_mem_space, stream_view);
         auto host_repr = registry_ptr->convert<cucascade::host_data_representation>(
           gpu_repr, host_mem_space, stream_view);
         // Sync before gpu_repr leaves scope so the async D2H copies finish before its
