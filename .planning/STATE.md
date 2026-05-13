@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Gauntlet on Rebased Branch)
 status: executing
-stopped_at: Completed 24-01-PLAN.md — upstream diff triage + conflict-log skeleton + cucascade rebase paused at commit 3 (8392c3d); Plan 24-02 unblocked to resolve representation_converter.cpp conflict
-last_updated: "2026-05-13T15:11:45.142Z"
+stopped_at: Completed 24-02-PLAN.md
+last_updated: "2026-05-13T15:47:51.849Z"
 last_activity: 2026-05-13
 progress:
   total_phases: 12
   completed_phases: 3
   total_plans: 26
-  completed_plans: 22
+  completed_plans: 23
 ---
 
 # Project State
@@ -25,7 +25,7 @@ See: .planning/PROJECT.md (updated 2026-05-04)
 ## Current Position
 
 Phase: 24 (update-cucascade-and-sirius-from-upstream-round-2) — EXECUTING
-Plan: 2 of 5
+Plan: 3 of 5
 Status: Ready to execute
 Last activity: 2026-05-13
 
@@ -126,6 +126,7 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 | Phase 23 P06 | ~20min | 2 tasks | 2 files |
 | Phase 23 P07 | ~90min | 5 tasks | 8 files |
 | Phase 24 P01 | 20min | 2 tasks | 3 files |
+| Phase 24 P02 | 45min | 2 tasks | 9 files |
 
 ## Decisions
 
@@ -313,6 +314,8 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 - [Phase 23]: [23-07] Cucascade fork now 8 commits ahead of bcddb89 (was 6 post-Phase-23-02); CC-UPSTREAM-01 carry policy preserved; no upstream PRs opened
 - [Phase 24]: alloc_and_peer_copy_async and reconstruct_column_p2p are 100% fork-only code — not in upstream; 7/8 rebase commits are CLEAN, only 8392c3d is RE-DERIVE on representation_converter.cpp
 - [Phase 24]: Cucascade rebase paused at commit 3 (8392c3d) on representation_converter.cpp conflict — Plan 24-02 resolves by keeping P2P block + taking upstream HOST-tier parameter-type changes
+- [Phase 24]: D-02 re-derive commit 3 (8392c3d): take upstream *fast_table->allocation dereference (shared_ptr) AND keep our target_stream (multi-GPU fix)
+- [Phase 24]: D-04 Commit B (ff06fac): sirius API adapter for 96bfea1 private constructor — templatize accessor, use ::create() factory, switch _allocation to shared_ptr
 
 ## Accumulated Context
 
@@ -357,6 +360,6 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 
 ## Session Continuity
 
-Last session: 2026-05-13T15:11:45.138Z
-Stopped at: Completed 24-01-PLAN.md — upstream diff triage + conflict-log skeleton + cucascade rebase paused at commit 3 (8392c3d); Plan 24-02 unblocked to resolve representation_converter.cpp conflict
+Last session: 2026-05-13T15:47:51.845Z
+Stopped at: Completed 24-02-PLAN.md
 Resume file: None
