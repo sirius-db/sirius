@@ -129,11 +129,27 @@ Upstream `96bfea1` added test `host_data_representation::slice round-trip preser
 ## Task 2 Outcome
 
 **NEW_CC_HEAD (full):** `5203de5a028ccb57402a4105e35282c567c3ee5a`
+**NEW_CC_HEAD (short):** `5203de5`
 
-**Sirius gitlink-bump commit:**
-- SHA: (captured post-commit in this section)
+**D-04 Commit B (API adapter):**
+- SHA: `ff06fac`
+- Subject: `fix(p24): adapt sirius to cucascade 96bfea1 host_table_allocation API changes (D-04 Commit B)`
+- Files: 6 (multiple_blocks_allocation_accessor.hpp, host_table_chunk_reader.hpp, host_table_chunk_reader.cpp, cpu_source_task.cpp, duckdb_scan_task.cpp, test_host_table_utils.cpp)
+- Required because 96bfea1 made host_table_allocation constructor private and changed allocation from unique_ptr to shared_ptr. Our sirius source used make_unique<host_table_allocation> and unique_ptr const& references.
+- Fix: templatize accessor methods, use ::create() factory, change _allocation member to shared_ptr
+
+**D-04 Commit A (gitlink-bump):**
+- SHA: `d228504`
 - Subject: `submodule: bump cucascade to 5203de5 (p24 rebase onto 9ceebaa)`
+- Atomic check: PASS — `git show --name-only d228504 | grep -v '^$'` = exactly `cucascade`
+- Submodule status: no leading `+` (clean checkout matching gitlink)
 
-**MCP build pre-commit:** TBD (recorded after Task 2 MCP runs)
+**MCP build pre-commit:** PASS (`[120/120]` all targets, no errors)
 
-**MCP build post-commit:** TBD (recorded after Task 2 MCP runs)
+**MCP build post-commit:** PASS (`[90/90]` all targets linked, no errors, warnings only in Rust component)
+
+**git submodule status cucascade:**
+```
+ 5203de5a028ccb57402a4105e35282c567c3ee5a cucascade (heads/fix/pinned-portable-flags)
+```
+(No leading `+` — clean checkout matching gitlink)
