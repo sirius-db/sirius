@@ -30,6 +30,17 @@
 # Cluster B stack frame; never `grep -v`. Cluster B count must be 0 ->
 # `grep -cE <pattern>` returns 0; NOT `grep -cv <pattern>` returns N.
 #
+# Pitfall 7 (Phase 23 gap-closure): the cluster_B grep must distinguish
+# race-check findings from API-error backtraces. compute-sanitizer surfaces
+# `Host Frame: ... alloc_and_peer_copy_async ...` lines in BOTH contexts:
+#   1) Race findings (headed by `Use-before-alloc on allocation`) — the
+#      ACTUAL gate target; cluster_B must count these.
+#   2) API-error backtraces (headed by `Program hit cuda...`) — emitted
+#      by probe_peer_dma_works during init when cudaMemcpyPeer returns
+#      cudaErrorPeerAccessAlreadyEnabled. NOT a Phase 22 D-07 regression.
+# The cluster_B count uses an awk windowed match (in_race state) instead
+# of a flat grep. See 23-VERDICT.md Section J for the false-positive trail.
+#
 # Exit codes:
 #   0 - PASS: Cluster B = 0 AND Cluster A = 0
 #   1 - FAIL: Cluster B > 0 OR Cluster A > 0
@@ -41,6 +52,7 @@
 #       binary missing/non-executable
 #   3 - sanitizer crashed before producing log output (distinguishes
 #       from "0 races detected")
+#   4 - selftest failed (P22_SELFTEST=1 mode only)
 # 124 - timeout fired (compute-sanitizer hung; per project memory)
 #
 # Environment overrides (all optional):
@@ -70,6 +82,40 @@ if [[ ! -x "${UNIT}" ]]; then
   echo "[p22-sanitizer-gate] HINT: build first (mcp__project-commands__run_command build)"
   echo "[p22-sanitizer-gate] HINT: or set P22_UNITTEST_BIN env override"
   exit 2
+fi
+
+# Phase 23 self-test (P22_SELFTEST=1 only): inject a fake log with one
+# race finding + one API-error backtrace, both mentioning
+# alloc_and_peer_copy_async, and verify cluster_B=1 (race) and not 2.
+if [[ "${P22_SELFTEST:-0}" == "1" ]]; then
+  tmp=$(mktemp)
+  cat >"$tmp" <<'SELFTEST_LOG'
+========= COMPUTE-SANITIZER
+========= Use-before-alloc on allocation 0xdead of size 16
+=========     at 0x100 in kernel
+=========     Host Frame: cucascade::data::alloc_and_peer_copy_async + 0x80
+=========
+========= Program hit cudaErrorPeerAccessAlreadyEnabled (error 704)
+=========     Saved host backtrace
+=========     Host Frame: cucascade::data::alloc_and_peer_copy_async + 0x40
+=========
+SELFTEST_LOG
+  CB_TEST=$(awk '
+    /^=+ Use-before-alloc on allocation/ { in_race=1; in_api=0; next }
+    /^=+ Program hit cuda/               { in_race=0; in_api=1; next }
+    /^=+ ERROR:/                         { in_race=0; in_api=1; next }
+    /^=+ COMPUTE-SANITIZER/              { in_race=0; in_api=0; next }
+    /^$/                                 { in_race=0; in_api=0; next }
+    in_race && /Host Frame:.*alloc_and_peer_copy_async/ { count++ }
+    END { print count + 0 }
+  ' "$tmp")
+  rm -f "$tmp"
+  if [[ "${CB_TEST}" != "1" ]]; then
+    echo "[p22-sanitizer-gate] SELFTEST FAIL: expected cluster_B=1 (race), got cluster_B=${CB_TEST}"
+    exit 4
+  fi
+  echo "[p22-sanitizer-gate] SELFTEST PASS: windowed cluster_B counter is correct"
+  exit 0
 fi
 
 # Skip running the sanitizer entirely if a pre-recorded log was supplied
@@ -120,7 +166,23 @@ fi
 # Pitfall 5 literal filters. Each `grep -cE` is wrapped with `|| true`
 # because grep returns exit 1 on zero matches (which is the desired
 # pass state for Cluster B), and `set -e` would otherwise abort.
-CLUSTER_B=$(grep -cE 'Host Frame:.*alloc_and_peer_copy_async' "${LOG}" || true)
+#
+# Phase 23 gap-closure: cluster_B was a false-positive when total_races=0
+# because alloc_and_peer_copy_async also appears in cudaErrorPeerAccessAlreadyEnabled
+# API-error backtraces emitted by probe_peer_dma_works at init. We now
+# count host-frame mentions ONLY inside race-check sections (headed by
+# 'Use-before-alloc on allocation' — same header TOTAL_RACES uses).
+# An API-error section is headed by 'Program hit cuda' (compute-sanitizer
+# boilerplate for cudaError* surfaced via memcheck).
+CLUSTER_B=$(awk '
+  /^=+ Use-before-alloc on allocation/ { in_race=1; in_api=0; next }
+  /^=+ Program hit cuda/               { in_race=0; in_api=1; next }
+  /^=+ ERROR:/                         { in_race=0; in_api=1; next }
+  /^=+ COMPUTE-SANITIZER/              { in_race=0; in_api=0; next }
+  /^$/                                 { in_race=0; in_api=0; next }
+  in_race && /Host Frame:.*alloc_and_peer_copy_async/ { count++ }
+  END { print count + 0 }
+' "${LOG}" || true)
 CLUSTER_A=$(grep -cE 'Host Frame:.*(read_column_chunks_async|posix_device_io)' "${LOG}" || true)
 TOTAL_RACES=$(grep -cE 'Use-before-alloc on allocation' "${LOG}" || true)
 
