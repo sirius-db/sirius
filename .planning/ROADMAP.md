@@ -230,6 +230,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 | 21. v1.4 Ship Gate | v1.4 | 1/1 | Complete | 2026-05-06 |
 | 22. Multi-GPU pinning + stream lineage hardening | v1.5+ | 7/7 | Complete    | 2026-05-08 |
 | 23. Update cucascade + sirius from upstream | v1.5+ | 7/7 | Complete    | 2026-05-13 |
+| 24. Update cucascade + sirius from upstream (round 2) | v1.5+ | 0/0 | Not planned | — |
 
 ## Phase context
 
@@ -337,3 +338,19 @@ Plans:
 - [x] 23-05-PLAN.md — Full v1.4 + Phase 22.x gauntlet (REG-01..06, GATE-22.1-A/B/C, K.6/K.7 NO-REPRO, Cluster B same-stream) + sanitizer baseline diff + 23-VERDICT.md + 23-CUCASCADE-DIFF.md (CC-UPSTREAM-01) — PARTIAL: convert_gpu_to_gpu regression (commit 8392c3d) → gap-closure in Plans 23-06/23-07
 - [x] 23-06-PLAN.md — Gap closure: cucascade alloc_and_peer_copy_async dst_guard fix (HtoD device-context binding) + cucascade ctest validation (no sirius gitlink bump here)
 - [x] 23-07-PLAN.md — Gap closure: bump sirius cucascade gitlink (37df815 + probe-restore 9da4047) + rebuild + rerun REG-05/REG-06 Leg1/Leg2 + fix sanitizer_gate_22.sh cluster_B false-positive + flip VERDICT PARTIAL→PASS
+
+### Phase 24: Update cucascade + sirius from upstream (round 2)
+
+**Goal:** Pull new upstream commits into our forks for the second time, repeating the Phase 23 pattern. Cucascade `origin/main` has advanced 2 commits beyond Phase 23's base `bcddb89`: `9ceebaa` ("Fix for: Invalid Error: reconstruct_column: STRING column metadata must have at least one child (offsets)" #124) and `96bfea1` ("feat: adding the ability to slice host table" #122). Sirius `origin/dev` has advanced 2 commits beyond Phase 23's merge tip `8524c79`: `ba5ed27` ("refactor: split wire_data_repositories into descriptors + runtime (Phase 2 of #601)" #770) and `2e197c6` ("feat(pin_table): support tier='host' for host-tier caching" #774). Rebase our cucascade fork `fix/pinned-portable-flags` (currently 8 ahead at `9da4047`) onto the new cucascade `origin/main` tip, then merge new sirius `origin/dev` into `feature/single-node-multi-gpu2` (currently 411 ahead from Phases 17-23). Re-run the full Phase 22.x/23 invariant gauntlet (REG-01..06, GATE-22.1-A/B/C, K.6/K.7 NO-REPRO, Cluster B same-stream, HYG-02 = 40, kvikio-free = 0, datasource_factory, tpch_sf10, mgpu-audit, sanitizer_gate_22.sh).
+
+**Overlap risks to triage (DO NOT mechanically pick a side):**
+- Cucascade `9ceebaa` touches the `reconstruct_column` path — same code area as Phase 23 gap-closure commits `37df815` (dst_guard in `alloc_and_peer_copy_async`) and `9da4047` (`run_p2p_probe_locked` device-context restore). Check whether the upstream STRING-column fix supersedes, interacts with, or is independent of our guards. If it touches `reconstruct_column_p2p` directly, the conflict resolution must preserve both behaviors.
+- Sirius `2e197c6` adds host-tier pinning to `pin_table` — adjacent to Phase 22 PIN-MGPU-01 (`PinTableFunction` round-robin distribution across GPU memory spaces). Verify the new `tier='host'` argument coexists with our multi-GPU round-robin path and that `[pin_mgpu]` + `[mgpu-audit]` suites still pass.
+- Sirius `ba5ed27` refactors `wire_data_repositories` (Phase 2 of #601) — likely touches the same datasource/IO surface we already merged from Phase 17/22.1. Watch for conflicts with our `sirius_ioctx::make_datasource(uring_io_object)` kvikio-free path.
+
+**Requirements**: MERGE-CC-24 (cucascade rebase clean against new `origin/main` tip with 9ceebaa + 96bfea1 integrated), MERGE-DEV-24 (sirius `origin/dev` merge with ba5ed27 + 2e197c6), GAUNTLET-24 (full Phase 22.x/23 invariant gauntlet passes post-merge; sanitizer_gate_22.sh windowed awk + P22_SELFTEST still green)
+**Depends on:** Phase 23 (cucascade fork at 9da4047 with dst_guard + probe-device-restore fixes; sirius at feature/single-node-multi-gpu2 HEAD 3520db7; Phase 23 gauntlet PASS baseline)
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (run /gsd:plan-phase 24 to break down)
