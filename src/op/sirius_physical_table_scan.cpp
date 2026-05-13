@@ -134,9 +134,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
       if (batch->get_data()) {
         auto& gpu_rep = batch->get_data()->cast<cucascade::gpu_table_representation>();
         table_views.push_back(gpu_rep.get_table_view());
-        if (!space) {
-          space = batch->get_memory_space();
-        }
+        if (!space) { space = batch->get_memory_space(); }
       }
     }
     if (table_views.size() > 1 && space) {
@@ -166,9 +164,8 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
       local_filter_expr, cudf::get_current_device_resource_ref(), stream);
     auto filtered_table = gpu_expression_executor.select(
       batch_ref->get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
-    auto* output_space =
-      batch_ref->get_memory_space();
-    output_batch = sirius::make_data_batch(std::move(filtered_table), *output_space);
+    auto* output_space = batch_ref->get_memory_space();
+    output_batch       = sirius::make_data_batch(std::move(filtered_table), *output_space);
   } else {
     output_batch = ::cucascade::read_only_data_batch::to_idle(std::move(batch_ref));
   }
@@ -210,12 +207,10 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     cucascade::memory::memory_space* space = nullptr;
     {
       auto output_mut = output_batch->get_mutable();
-      space = output_mut->get_memory_space();
-      auto& gpu_rep =
-        output_mut->get_data()
-          ->cast<cucascade::gpu_table_representation>();
-      auto table = gpu_rep.release_table(stream);
-      columns        = table->release();
+      space           = output_mut->get_memory_space();
+      auto& gpu_rep   = output_mut->get_data()->cast<cucascade::gpu_table_representation>();
+      auto table      = gpu_rep.release_table(stream);
+      columns         = table->release();
     }  // mutable lock released here
 
     // Select output columns using the batch column map.

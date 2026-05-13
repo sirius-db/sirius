@@ -913,8 +913,7 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
         get_next_batch_id(),
         std::make_unique<cached_host_parquet_representation>(std::move(parquet_representation)));
     } else {
-      batch = cucascade::data_batch::make(get_next_batch_id(),
-                                                      std::move(parquet_representation));
+      batch = cucascade::data_batch::make(get_next_batch_id(), std::move(parquet_representation));
     }
   }
   auto result = std::make_unique<op::pipelineable_operator_data>(

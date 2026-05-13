@@ -192,13 +192,12 @@ std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
         auto* idata_rep = ro->get_data();
         if (auto* host_data = dynamic_cast<cached_host_data_representation*>(idata_rep);
             host_data) {
-          cloned_batches.push_back(cucascade::data_batch::make(
-            get_next_batch_id(), host_data->shallow_clone()));
-        } else if (auto* parquet_rep =
-                     dynamic_cast<cached_host_parquet_representation*>(idata_rep);
+          cloned_batches.push_back(
+            cucascade::data_batch::make(get_next_batch_id(), host_data->shallow_clone()));
+        } else if (auto* parquet_rep = dynamic_cast<cached_host_parquet_representation*>(idata_rep);
                    parquet_rep) {
-          cloned_batches.push_back(cucascade::data_batch::make(
-            get_next_batch_id(), parquet_rep->shallow_clone()));
+          cloned_batches.push_back(
+            cucascade::data_batch::make(get_next_batch_id(), parquet_rep->shallow_clone()));
         } else {
           throw std::runtime_error("Invalid data representation type");
         }

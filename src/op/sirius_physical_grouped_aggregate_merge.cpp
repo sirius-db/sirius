@@ -166,7 +166,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_grouped_aggregate_merge::execute"};
-  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  auto& input        = dynamic_cast<const pipelineable_operator_data&>(input_data);
   auto input_batches = input.get_read_only_batches();
   if (input_batches.size() == 0) {
     throw std::runtime_error(
@@ -202,8 +202,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   auto merged_mut    = merged->get_mutable();
   auto* space        = merged_mut->get_memory_space();
   auto mr            = space->get_default_allocator();
-  auto& gpu_rep      = merged_mut->get_data()
-                    ->cast<cucascade::gpu_table_representation>();
+  auto& gpu_rep      = merged_mut->get_data()->cast<cucascade::gpu_table_representation>();
   auto merged_cols   = gpu_rep.release_table(stream)->release();
   int num_group_cols = static_cast<int>(group_idx.size());
 

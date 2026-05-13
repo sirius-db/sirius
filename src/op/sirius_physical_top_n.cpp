@@ -149,7 +149,7 @@ std::unique_ptr<operator_data> sirius_physical_top_n::execute(const operator_dat
                                                               rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_top_n::execute"};
-  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  auto& input        = dynamic_cast<const pipelineable_operator_data&>(input_data);
   auto input_batches = input.get_read_only_batches();
   if (limit == 0) {
     return std::make_unique<pipelineable_operator_data>(
@@ -163,7 +163,7 @@ std::unique_ptr<operator_data> sirius_physical_top_n::execute(const operator_dat
   }
 
   auto const& input_batch = input_batches[0];
-  auto* space = input_batch->get_memory_space();
+  auto* space             = input_batch->get_memory_space();
   if (space == nullptr) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
@@ -214,7 +214,7 @@ std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operat
                                                                     rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_top_n_merge::execute"};
-  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  auto& input        = dynamic_cast<const pipelineable_operator_data&>(input_data);
   auto input_batches = input.get_read_only_batches();
   if (limit == 0) {
     return std::make_unique<pipelineable_operator_data>(

@@ -168,7 +168,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
   }
 
   auto const& input_batch_ro = input_batches[0];
-  auto* space = input_batch_ro->get_memory_space();
+  auto* space                = input_batch_ro->get_memory_space();
 
   if (_num_partitions.value() < 2 || _partition_keys.empty()) {
     return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());

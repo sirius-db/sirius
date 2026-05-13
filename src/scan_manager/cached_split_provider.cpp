@@ -78,8 +78,7 @@ std::future<void> cached_split_provider::start(exec::thread_pool& /*pool*/,
           "[cached_split_provider] null host_data_representation in pinned chunks");
       }
       auto sliced = chunk->slice(_column_indices);
-      auto batch =
-        cucascade::data_batch::make(::sirius::get_next_batch_id(), std::move(sliced));
+      auto batch  = cucascade::data_batch::make(::sirius::get_next_batch_id(), std::move(sliced));
       connector.push_split(std::make_unique<op::scan::scan_cached_operator_data>(
         std::move(batch), _filter_expression, _plan));
     }
@@ -119,8 +118,7 @@ std::future<void> cached_split_provider::start(exec::thread_pool& /*pool*/,
     cudf::table_view view(col_views);
     auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
       view, std::move(owner), alloc_size, *_memory_space);
-    auto batch =
-      cucascade::data_batch::make(::sirius::get_next_batch_id(), std::move(gpu_repr));
+    auto batch = cucascade::data_batch::make(::sirius::get_next_batch_id(), std::move(gpu_repr));
 
     connector.push_split(std::make_unique<op::scan::scan_cached_operator_data>(
       std::move(batch), _filter_expression, _plan));

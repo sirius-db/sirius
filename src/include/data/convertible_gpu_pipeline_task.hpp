@@ -52,7 +52,7 @@ namespace sirius {
  * all code paths.
  *
  * The convert() method uses the RAII mutable lock pattern: for each data_batch in the
-   * task's input data, it acquires a mutable_data_batch via get_mutable() or try_get_mutable(),
+ * task's input data, it acquires a mutable_data_batch via get_mutable() or try_get_mutable(),
  * attempts conversion to a target memory space, and relies on the mutable_data_batch RAII
  * destructor to restore idle state on all exit paths (success, failure, exception).
  */

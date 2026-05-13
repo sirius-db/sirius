@@ -491,8 +491,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
-  auto* space =
-    input_batches[0]->get_memory_space();
+  auto* space = input_batches[0]->get_memory_space();
   if (space == nullptr) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
