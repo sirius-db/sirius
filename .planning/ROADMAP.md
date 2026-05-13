@@ -230,7 +230,7 @@ Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md`
 | 21. v1.4 Ship Gate | v1.4 | 1/1 | Complete | 2026-05-06 |
 | 22. Multi-GPU pinning + stream lineage hardening | v1.5+ | 7/7 | Complete    | 2026-05-08 |
 | 23. Update cucascade + sirius from upstream | v1.5+ | 7/7 | Complete    | 2026-05-13 |
-| 24. Update cucascade + sirius from upstream (round 2) | v1.5+ | 2/5 | In Progress|  |
+| 24. Update cucascade + sirius from upstream (round 2) | v1.5+ | 4/5 | In Progress|  |
 
 ## Phase context
 
@@ -350,11 +350,11 @@ Plans:
 
 **Requirements**: MERGE-CC-24 (cucascade rebase clean against new `origin/main` tip with 9ceebaa + 96bfea1 integrated), MERGE-DEV-24 (sirius `origin/dev` merge with ba5ed27 + 2e197c6), GAUNTLET-24 (full Phase 22.x/23 invariant gauntlet passes post-merge; sanitizer_gate_22.sh windowed awk + P22_SELFTEST still green)
 **Depends on:** Phase 23 (cucascade fork at 9da4047 with dst_guard + probe-device-restore fixes; sirius at feature/single-node-multi-gpu2 HEAD 3520db7; Phase 23 gauntlet PASS baseline)
-**Plans:** 2/5 plans executed
+**Plans:** 4/5 plans executed
 
 Plans:
 - [x] 24-01-PLAN.md — Upstream cucascade diff triage (96bfea1 + 9ceebaa) + 24-CONFLICT-LOG.md skeleton + start cucascade rebase
 - [x] 24-02-PLAN.md — Complete cucascade rebase per D-01/D-02 (re-derive surviving fixes) + cucascade ctest + atomic sirius gitlink bump (D-04 Commit A)
-- [ ] 24-03-PLAN.md — Read sirius upstream diffs + merge origin/dev with D-01 upstream-favored triage + D-05 gitlink ours-wins + intermediate MCP build + invariant grep gates (D-04 Commit C/D)
-- [ ] 24-04-PLAN.md — Run 18-gate gauntlet (Phase 23 17 baseline + D-07 new pin_table tier='host' smoke); compute-sanitizer via Bash + timeout; sanitizer_gate_22.sh re-verify; human-verify checkpoint
+- [x] 24-03-PLAN.md — Read sirius upstream diffs + merge origin/dev with D-01 upstream-favored triage + D-05 gitlink ours-wins + intermediate MCP build + invariant grep gates (D-04 Commit C/D)
+- [x] 24-04-PLAN.md — Run 18-gate gauntlet (Phase 23 17 baseline + D-07 new pin_table tier='host' smoke); compute-sanitizer via Bash + timeout; sanitizer_gate_22.sh re-verify; human-verify checkpoint — 18/18 PASS APPROVED 2026-05-13
 - [ ] 24-05-PLAN.md — Author 24-VERDICT.md + 24-CUCASCADE-DIFF.md + update REQUIREMENTS / ROADMAP / STATE / PROJECT in atomic D-04 Commit F doc commit

@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Gauntlet on Rebased Branch)
 status: executing
-stopped_at: CHECKPOINT 24-04 Task 3 — awaiting human-verify of 18/18 PASS gauntlet
-last_updated: "2026-05-13T16:49:17.272Z"
+stopped_at: "Completed 24-04-PLAN.md — 18/18 PASS gauntlet approved; ready for Plan 24-05 (24-VERDICT.md)"
+last_updated: "2026-05-13T00:00:00Z"
 last_activity: 2026-05-13
 progress:
   total_phases: 12
   completed_phases: 3
   total_plans: 26
-  completed_plans: 25
+  completed_plans: 26
 ---
 
 # Project State
@@ -25,8 +25,8 @@ See: .planning/PROJECT.md (updated 2026-05-04)
 ## Current Position
 
 Phase: 24 (update-cucascade-and-sirius-from-upstream-round-2) — EXECUTING
-Plan: 4 of 5
-Status: Ready to execute
+Plan: 5 of 5
+Status: Plan 24-04 complete (GAUNTLET-24 approved); ready for Plan 24-05 (24-VERDICT.md)
 Last activity: 2026-05-13
 
 ```
@@ -128,7 +128,7 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 | Phase 24 P01 | 20min | 2 tasks | 3 files |
 | Phase 24 P02 | 45min | 2 tasks | 9 files |
 | Phase 24 P03 | 82 | 3 tasks | 13 files |
-| Phase 24 P04 | 35min | 2 tasks | 1 files |
+| Phase 24 P04 | 35min | 3 tasks | 1 files |
 
 ## Decisions
 
@@ -319,6 +319,10 @@ v1.4 Progress: [####################] 6/6 phases | 32/32 requirements | 29 plans
 - [Phase 24]: D-02 re-derive commit 3 (8392c3d): take upstream *fast_table->allocation dereference (shared_ptr) AND keep our target_stream (multi-GPU fix)
 - [Phase 24]: D-04 Commit B (ff06fac): sirius API adapter for 96bfea1 private constructor — templatize accessor, use ::create() factory, switch _allocation to shared_ptr
 - [Phase 24]: D-01 upstream-favored: all 9 conflict files resolved by integrating both code paths (OURS unique behavior + UPSTREAM new features); D-04 Commit D separate from merge commit; D-05 cucascade gitlink ours-wins at 5203de5
+- [Phase 24-04]: GAUNTLET-24 PASS — 18/18 gates PASS; human-verify checkpoint approved 2026-05-13. Two improvements: REG-06 Leg 1 memcheck 6/7 PARTIAL → 7/7 PASS; new [pin_table_host] gate 1/1 PASS.
+- [Phase 24-04]: D-04 Commit E Branch A — upstream 2e197c6 added [pin_table_host] Catch2 tag (test/cpp/integration/test_gpu_execution_tpch.cpp:4556); no new test file needed; upstream test is durable bisectable artifact.
+- [Phase 24-04]: chunk_memory_spaces count drop 60→42 accepted as non-regression: integrate-both merge strategy in 24-03 added host-tier path using host_chunks/tier/memory_space fields; GPU round-robin path still uses chunk_memory_spaces; coexistence verified by [pin_mgpu] 2/2 + [mgpu-audit] 6/6 + [pin_table_host] 1/1.
+- [Phase 24-04]: Verdict track PASS — Plan 24-05 authors 24-VERDICT.md as PASS; no gap-closure needed.
 
 ## Accumulated Context
 

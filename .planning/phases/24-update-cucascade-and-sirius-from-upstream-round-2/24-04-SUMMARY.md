@@ -26,7 +26,8 @@ metrics:
   gates_pass: 18
   gates_fail: 0
   gates_partial: 0
-checkpoint_status: AWAITING_HUMAN_VERIFY
+checkpoint_status: APPROVED
+requirements-completed: [GAUNTLET-24]
 ---
 
 # Phase 24 Plan 04: Gauntlet Run Summary
@@ -39,7 +40,7 @@ checkpoint_status: AWAITING_HUMAN_VERIFY
 |------|-------------|--------|--------|
 | 1 | 14 grep + functional gates (Sections A+B), D-07 pin_table_host branch detection + run | `1189c82` | DONE |
 | 2 | REG-06 Leg 1 functional + memcheck, Leg 2 memcheck, sanitizer_gate_22.sh selftest + full run (Section C) | `1189c82` | DONE |
-| 3 | Human-verify checkpoint — awaiting user approval | (checkpoint) | AWAITING |
+| 3 | Human-verify checkpoint — approved by user (18/18 PASS) | `7a23f63` | DONE |
 
 ## Commits
 
@@ -98,21 +99,24 @@ None - plan executed exactly as written. Branch A was confirmed by source-level 
 
 ## Checkpoint Status
 
-**AWAITING Task 3 human-verify checkpoint.**
+**Task 3 human-verify checkpoint: APPROVED** (2026-05-13)
 
-Plan 24-05 (verdict flip) should proceed with:
+Plan 24-05 (verdict flip) proceeds with:
 - Verdict track: **PASS** — all 18 gates green
-- D-04 Commit E: upstream tag re-used (no new commit)
+- D-04 Commit E: upstream tag re-used (Branch A — no new test file committed)
 - Carry-forwards: none (all Phase 23 carry-forwards satisfied)
-- Notable improvement: REG-06 Leg 1 memcheck 6/7 → 7/7 to document
+- Notable improvement: REG-06 Leg 1 memcheck 6/7 PARTIAL → 7/7 PASS to document in 24-VERDICT.md
 
 ## Self-Check: PASSED
 
 Files exist:
-- `.planning/phases/24-update-cucascade-and-sirius-from-upstream-round-2/24-04-GAUNTLET-RESULTS.md` — FOUND
+- `.planning/phases/24-update-cucascade-and-sirius-from-upstream-round-2/24-04-GAUNTLET-RESULTS.md` — FOUND (with ## Approval section at 7a23f63)
+- `.planning/phases/24-update-cucascade-and-sirius-from-upstream-round-2/24-04-SUMMARY.md` — FOUND (this file; status: complete, tasks: 3/3)
 
 Commits exist:
 - `1189c82` — FOUND (gauntlet results commit)
+- `502acef` — FOUND (checkpoint docs commit)
+- `7a23f63` — FOUND (approval recording commit — atomic, GAUNTLET-RESULTS.md only)
 
 Gate log files exist at `/tmp/claude/p24_04_*.log`:
 - p24_04_grep_gates.txt — FOUND
