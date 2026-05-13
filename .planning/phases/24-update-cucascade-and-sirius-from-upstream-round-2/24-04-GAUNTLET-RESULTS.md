@@ -139,3 +139,40 @@ All 6 errors are `cudaErrorPeerAccessAlreadyEnabled` (error 704) from `duckdb::S
 
 *Results file created by Plan 24-04 Tasks 1+2. All sections complete.*
 *Ready for Task 3 human-verify checkpoint.*
+
+---
+
+## Approval
+
+**Timestamp:** 2026-05-13T00:00:00Z
+**Verdict:** approved
+**Reviewer:** Felipe Aramburu (faramburu@nvidia.com)
+
+All 18 gates PASS. User reviewed Sections A (grep gates), B (functional gates), and C (sanitizer + REG-06) and explicitly approved.
+
+### Gate Summary at Approval
+
+| Section | Gates | Result |
+|---------|-------|--------|
+| A — Grep Gates | 9/9 | ALL PASS (chunk_memory_spaces drift 60→42 accepted as integration-both refactor; functional coexistence verified) |
+| B — Functional Gates | 12/12 | ALL PASS (D-07 pin_table_host 1/1; D-04 Commit E NOT needed — upstream tag used) |
+| C — Sanitizer + REG-06 | 6/6 | ALL PASS |
+| **Total** | **18/18** | **ALL PASS** |
+
+### Improvements Over Phase 23 Baseline
+
+1. **REG-06 Leg 1 memcheck (6/7 PARTIAL → 7/7 PASS):** Phase 23 reported cudf library `Invalid __global__ read` violations in `libcudf.so` (contiguous_split checksum path) causing 1 test to be marked PARTIAL under the sanitizer. Phase 24 run shows those violations absent — all 7 errors are pre-existing `cudaErrorPeerAccessAlreadyEnabled` API-error backtraces from `probe_peer_dma_works` (same baseline as Leg 2). Full PASS.
+
+2. **New `[pin_table_host]` gate (N/A → 1/1 PASS):** Upstream commit `2e197c6` introduced host-tier caching for `pin_table`; the corresponding `[pin_table_host]` Catch2 tag is present in the post-merge sirius_unittest binary and passes (51 assertions). D-04 Commit E NOT needed — Branch A taken (upstream test serves as the durable bisectable artifact).
+
+### D-04 Commit E Disposition
+
+**Branch A — Upstream test exists.** Commit `2e197c6` added `[pin_table_host]` Catch2 tag at `test/cpp/integration/test_gpu_execution_tpch.cpp:4556`. No new test file needed. The upstream test is the durable, bisectable artifact per D-04 intent.
+
+### chunk_memory_spaces Drift Disposition
+
+Count dropped from 60 (Phase 23) to 42 (Phase 24). Accepted as a non-regression: the 24-03 merge integrated upstream `2e197c6`'s host-tier path which uses `host_chunks`/`tier`/`memory_space` fields for the new HOST branch, not `chunk_memory_spaces`. The GPU-tier round-robin path still uses `chunk_memory_spaces`; coexistence verified by `[pin_mgpu]` PASS 2/2, `[mgpu-audit]` PASS 6/6, `[pin_table_host]` PASS 1/1.
+
+### Verdict Track for Plan 24-05
+
+**PASS track.** Plan 24-05 will author `24-VERDICT.md` as PASS and close Phase 24. No gap-closure plans needed.
