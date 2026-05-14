@@ -39,6 +39,7 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Data Management](data-management.md) | Data batches, repositories, ports, barrier semantics |
 | [Configuration](configuration.md) | sirius_config, operator_params, SET variables |
 | [Optimizations](optimizations.md) | Performance optimizations with PRs, code paths, configs |
+| [PR #732 Change Summary](pr-732-changes.md) | Multi-GPU execution + upstream sync — reviewer's guide to the 438-commit PR |
 
 ## Suggested Reading Order
 
