@@ -96,11 +96,11 @@ struct IcebergDeleteData {
  * @param table_path     The Iceberg table path passed to iceberg_scan().
  * @param metadata_ioctx Single-GPU sirius_ioctx for routing parquet reads
  *                       (V2 equality-delete files + footer extraction). Per
- *                       Phase 22.1 D-06, GPU 0 ioctx is sufficient — these
- *                       are planning-time reads, not on the multi-GPU column-
+ *                       A single GPU's ioctx is sufficient — these are
+ *                       planning-time reads, not on the multi-GPU column-
  *                       chunk hot path. Multi-GPU residency for iceberg
- *                       metadata is deferred (IO-MGPU-04). Per D-09, the
- *                       caller MUST provide a non-null ioctx; nullptr throws.
+ *                       metadata is deferred. The caller MUST provide a
+ *                       non-null ioctx; nullptr throws.
  * @param snapshot_id    Optional Iceberg snapshot id (latest if omitted).
  * @return Shared pointer to immutable delete data.
  */

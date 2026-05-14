@@ -35,7 +35,7 @@ namespace sirius {
  *
  * Empty by design — the SQL type of a NULL is recovered from the
  * sibling sirius::logical_type that travels with the value (see
- * sirius::ast::constant::return_type, D-05/D-10).
+ * sirius::ast::constant::return_type).
  */
 struct null_value {};
 
@@ -72,7 +72,7 @@ struct timestamp_ms_value {
  *        (the SQL default TIMESTAMP precision).
  *
  * 64-bit signed microseconds from epoch. Mirrors duckdb::timestamp_tz_t.value
- * (the accessor used by gpu_execute_constant.cpp:140 for microsecond TIMESTAMP).
+ * (the accessor used by gpu_execute_constant.cpp for microsecond TIMESTAMP).
  */
 struct timestamp_us_value {
   int64_t value{};
@@ -91,9 +91,9 @@ struct timestamp_ns_value {
  * @brief Carrier for a fixed-point DECIMAL literal whose unscaled value
  *        fits in int32_t (precision <= 9).
  *
- * Precision lives in the sibling sirius::logical_type (D-06). cuDF expects
- * a *negative* scale (numeric::scale_type{-scale}); the negation happens at
- * the cuDF boundary in Phase 5, NOT in this struct.
+ * Precision lives in the sibling sirius::logical_type. cuDF expects a
+ * *negative* scale (numeric::scale_type{-scale}); the negation happens at
+ * the cuDF boundary, NOT in this struct.
  */
 struct decimal32 {
   int32_t value{};
@@ -121,24 +121,24 @@ struct decimal128 {
 /**
  * @brief Sum type over every supported SQL literal kind.
  *
- * The alternative order is part of the public ABI — std::variant indexes
- * by position and Phase 5's std::visit dispatch will depend on this
- * ordering. NULL is alternative 0 so value{} default-constructs to NULL.
+ * The alternative order is part of the public ABI — std::variant indexes by
+ * position, so std::visit dispatch depends on this ordering. NULL is
+ * alternative 0 so value{} default-constructs to NULL.
  *
- * HUGEINT and UHUGEINT do not have distinct alternatives; they reuse
- * int64_t and uint64_t respectively (D-03 narrowing — matches the
- * executor's current cuDF mapping).
+ * HUGEINT and UHUGEINT do not have distinct alternatives; they reuse int64_t
+ * and uint64_t respectively (narrowing — matches the executor's current cuDF
+ * mapping).
  */
 using value = std::variant<null_value,
                            bool,
                            int8_t,
                            int16_t,
                            int32_t,
-                           int64_t,  // BIGINT and HUGEINT (D-03)
+                           int64_t,  // BIGINT and HUGEINT (narrowed)
                            uint8_t,
                            uint16_t,
                            uint32_t,
-                           uint64_t,  // UBIGINT and UHUGEINT (D-03)
+                           uint64_t,  // UBIGINT and UHUGEINT (narrowed)
                            float,
                            double,
                            date_value,
@@ -154,10 +154,10 @@ using value = std::variant<null_value,
 /**
  * @brief Convert a duckdb::Value to a sirius::value.
  *
- * The supplied logical_type drives DECIMAL precision recovery (D-06)
- * and typed-NULL fidelity (D-05). For HUGEINT / UHUGEINT, the value is
- * narrowed to int64_t / uint64_t (D-03) — same narrowing the executor
- * performs today via duckdb::GetCudfType.
+ * The supplied logical_type drives DECIMAL precision recovery and typed-NULL
+ * fidelity. For HUGEINT / UHUGEINT, the value is narrowed to int64_t /
+ * uint64_t — the same narrowing the executor performs today via
+ * duckdb::GetCudfType.
  *
  * @throws sirius::not_implemented_exception if the type is unsupported.
  */
@@ -168,7 +168,7 @@ value from_duckdb(const duckdb::Value& v, const logical_type& type);
  *
  * The supplied logical_type drives DECIMAL precision width selection
  * (Value::DECIMAL(int16_t,...) vs int32 vs int64 vs hugeint_t) and
- * recovers the SQL type of typed NULLs (D-05).
+ * recovers the SQL type of typed NULLs.
  *
  * @throws sirius::not_implemented_exception if the type is unsupported.
  */

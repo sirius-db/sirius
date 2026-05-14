@@ -206,21 +206,19 @@ struct equality_delete_read_result {
  * Also reads the parquet footer to extract Iceberg field IDs for each key
  * column, enabling schema-evolution-safe matching against data files.
  *
- * Phase 22.1 D-06 / D-09: routes both cudf::io::read_parquet (table) and
- * cudf::io::read_parquet_footers (field-id extraction) through the supplied
- * sirius_ioctx (single-GPU GPU 0 per D-06). The caller MUST provide a
- * non-null ioctx — the kvikio bypass path is forbidden phase-wide.
+ * Routes both cudf::io::read_parquet (table) and cudf::io::read_parquet_footers
+ * (field-id extraction) through the supplied single-GPU sirius_ioctx. The
+ * caller MUST provide a non-null ioctx — the kvikio bypass path is forbidden.
  */
 equality_delete_read_result read_equality_delete_file(std::string const& delete_file_path,
                                                       sirius::io::sirius_ioctx& ioctx)
 {
   auto stream = cudf::get_default_stream();
 
-  // Phase 22.1 D-06: single-GPU sirius_ioctx (the ioctx parameter — caller
-  // passes GPU 0 per D-06). Both the read_parquet (table data) AND the
-  // read_parquet_footers (field-id extraction) share the same uring_io_object
-  // + sirius_datasource — the io_object opens 2 fds (O_RDONLY + O_RDONLY|O_DIRECT)
-  // so reusing avoids reopening for the footer pass.
+  // Both the read_parquet (table data) AND the read_parquet_footers (field-id
+  // extraction) share the same uring_io_object + sirius_datasource — the
+  // io_object opens 2 fds (O_RDONLY + O_RDONLY|O_DIRECT) so reusing avoids
+  // reopening for the footer pass.
   auto io_object  = std::make_shared<sirius::io::uring_io_object>(delete_file_path);
   auto datasource = ioctx.make_datasource(io_object);
 
@@ -362,9 +360,6 @@ EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
 /// Read equality deletes, group by (schema + sequence number), build per-group hash joins.
 /// This matches DuckDB's approach: each group has exactly one sequence number,
 /// so the scan-time check is a simple CPU comparison (no extra GPU work).
-///
-/// Phase 22.1 D-06: ioctx is the single-GPU sirius_ioctx (GPU 0) used to
-/// route every per-file read through the kvikio-free I/O path.
 void materialize_equality_deletes(std::vector<IcebergDeleteFileEntry> const& eq_entries,
                                   sirius::io::sirius_ioctx& ioctx,
                                   IcebergDeleteData& data)
@@ -433,14 +428,10 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
 {
   auto data = std::make_shared<IcebergDeleteData>();
 
-  // Phase 22.1 D-06 / D-09: kvikio path is forbidden phase-wide. The caller
-  // (sirius_engine::initialize_iceberg_delete_data) MUST provide a non-null
-  // sirius_ioctx — there is no fall-through to cudf's bundled file_source
-  // factory.
   if (!metadata_ioctx) {
     throw std::invalid_argument(
-      "[iceberg] read_iceberg_delete_data: metadata_ioctx is null (Phase 22.1 D-06 / D-09 — "
-      "kvikio path is forbidden; caller must provide a sirius_ioctx).");
+      "[iceberg] read_iceberg_delete_data: metadata_ioctx is null (kvikio path is forbidden; "
+      "caller must provide a sirius_ioctx).");
   }
 
   try {

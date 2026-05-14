@@ -253,7 +253,7 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
   uint64_t _task_id;
   std::vector<cucascade::shared_data_repository*> _data_repos;
   cucascade::memory::reservation_aware_resource_adaptor* _allocator = nullptr;
-  /// Input data_batches held for subscribe/unsubscribe lifecycle (LIFE-01/LIFE-02, D-06)
+  /// Input data_batches held for subscribe/unsubscribe lifecycle
   std::vector<std::shared_ptr<cucascade::data_batch>> _input_batches;
 };
 

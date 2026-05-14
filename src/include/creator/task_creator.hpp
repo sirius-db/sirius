@@ -205,13 +205,14 @@ class task_creator {
   /// System topology for NUMA-aware GPU routing (non-owning, may be null)
   const cucascade::memory::system_topology_info* _sys_topology{nullptr};
   /// Maps NUMA node ID -> all GPU device_ids on that NUMA node (for HOST data
-  /// locality). A NUMA node can host multiple GPUs; SCHED-02 round-robins
-  /// across the vector so work spreads instead of pinning to the first GPU.
+  /// locality). A NUMA node can host multiple GPUs; the NUMA-affinity rule
+  /// round-robins across the vector so work spreads instead of pinning to the
+  /// first GPU.
   /// GPUs that report numa_node=-1 (non-NUMA / single-NUMA hosts, per the
   /// Linux /sys/bus/pci/devices/*/numa_node convention) are normalized to
   /// NUMA 0 so they match the host memory space built for the single node.
   std::unordered_map<int, std::vector<int>> _numa_to_gpu;
-  /// Round-robin counter for SCHED-02 when multiple GPUs share a NUMA node.
+  /// Round-robin counter for NUMA-affinity routing when multiple GPUs share a NUMA node.
   std::atomic<uint64_t> _numa_to_gpu_rr{0};
 };
 

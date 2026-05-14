@@ -205,7 +205,7 @@ convert_host_parquet_to_gpu_with_prefetched_data_source(
   // their work in-stream order, but the target stream itself is the writer
   // identity that any cross-device reader (cucascade::convert_gpu_to_gpu) must
   // observe — record the writer event so the subsequent reader's
-  // cudaStreamWaitEvent receives a real ordering primitive (Phase 13-02).
+  // cudaStreamWaitEvent receives a real ordering primitive.
   auto repr = std::make_unique<cucascade::gpu_table_representation>(
     std::move(table),
     *const_cast<cucascade::memory::memory_space*>(target_memory_space),

@@ -100,10 +100,10 @@ std::future<void> cached_split_provider::start(exec::thread_pool& /*pool*/,
     }
   }
 
-  // Phase 22 D-04: per-chunk memory_space vector must align with the chunk
-  // count derived from columns_per_request. Reject any caller that passes a
-  // misaligned vector loudly rather than silently dispatching cached batches
-  // to the wrong GPU.
+  // Per-chunk memory_space vector must align with the chunk count derived
+  // from columns_per_request. Reject any caller that passes a misaligned
+  // vector loudly rather than silently dispatching cached batches to the
+  // wrong GPU.
   if (_chunk_memory_spaces.size() != num_batches) {
     throw std::runtime_error(
       "[cached_split_provider] chunk_memory_spaces.size() (" +
@@ -128,25 +128,13 @@ std::future<void> cached_split_provider::start(exec::thread_pool& /*pool*/,
     }
 
     cudf::table_view view(col_views);
-    // Phase 18 / DB-04: cucascade #117 makes writer_stream REQUIRED on all
-    // gpu_table_representation constructors (Phase 13-04 Path-2 stream-lineage
-    // contract). The cached path wraps already-pinned data: the underlying
-    // GPU memory was written long ago by whichever pipeline originally
-    // populated the pinned cache, on a stream that no longer exists at this
-    // call site. Passing a default-constructed cuda_stream_view records no
-    // writer event — documented as the "legacy, no-stream" pattern in
-    // cucascade/include/cucascade/data/gpu_data_representation.hpp:60-66:
-    // "passing a default-constructed cuda_stream_view records no event
-    // (legacy, only acceptable for paths whose data was never produced on
-    // any stream)". The cached pinned data is exactly such a path — any
-    // downstream cross-device reader that needs ordering must obtain it
-    // via record_writer_event() at the actual writing site. This is NOT
-    // the legacy default-stream wrapper (which would violate HYG-02);
-    // cuda_stream_view{} is a null stream view.
+    // Pass a null cuda_stream_view (NOT the default-stream wrapper) — the
+    // cached path wraps pre-written data, so there's no current writer to
+    // record. Any cross-device reader that needs ordering must obtain it
+    // via record_writer_event() at the actual writing site.
     rmm::cuda_stream_view const no_writer_stream{};
-    // Phase 22 D-04: per-chunk memory_space lookup. Replaces entry-level
-    // _memory_space (now gone post-PIN-MGPU-01); each chunk carries the
-    // memory_space its data lives on so SCHED-01 routing fans tasks correctly.
+    // Per-chunk memory_space lookup — each chunk carries the memory_space
+    // its data lives on so data-locality scheduling fans tasks correctly.
     auto* chunk_space = _chunk_memory_spaces.at(batch_idx);
     if (chunk_space == nullptr) {
       throw std::runtime_error(

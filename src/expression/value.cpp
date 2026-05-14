@@ -35,9 +35,9 @@ namespace sirius {
 
 value from_duckdb(const duckdb::Value& v, const logical_type& type)
 {
-  // D-05: typed NULL fidelity — every IsNull() input becomes null_value,
-  // regardless of the value's logical type. The SQL type of the NULL is
-  // recovered later via the supplied logical_type at the to_duckdb boundary.
+  // Typed NULL fidelity — every IsNull() input becomes null_value, regardless
+  // of the value's logical type. The SQL type of the NULL is recovered later
+  // via the supplied logical_type at the to_duckdb boundary.
   if (v.IsNull()) { return value{null_value{}}; }
 
   switch (type.id()) {
@@ -46,12 +46,12 @@ value from_duckdb(const duckdb::Value& v, const logical_type& type)
     case type_id::SMALLINT: return value{v.GetValue<int16_t>()};
     case type_id::INTEGER: return value{v.GetValue<int32_t>()};
     case type_id::BIGINT: return value{v.GetValue<int64_t>()};
-    case type_id::HUGEINT: return value{v.GetValue<int64_t>()};  // D-03 narrowing
+    case type_id::HUGEINT: return value{v.GetValue<int64_t>()};  // narrowing
     case type_id::UTINYINT: return value{v.GetValue<uint8_t>()};
     case type_id::USMALLINT: return value{v.GetValue<uint16_t>()};
     case type_id::UINTEGER: return value{v.GetValue<uint32_t>()};
     case type_id::UBIGINT: return value{v.GetValue<uint64_t>()};
-    case type_id::UHUGEINT: return value{v.GetValue<uint64_t>()};  // D-03 narrowing
+    case type_id::UHUGEINT: return value{v.GetValue<uint64_t>()};  // narrowing
     case type_id::FLOAT: return value{v.GetValue<float>()};
     case type_id::DOUBLE: return value{v.GetValue<double>()};
     case type_id::DATE: return value{date_value{v.GetValue<duckdb::date_t>().days}};
@@ -60,16 +60,16 @@ value from_duckdb(const duckdb::Value& v, const logical_type& type)
     case type_id::TIMESTAMP_MS:
       return value{timestamp_ms_value{v.GetValue<duckdb::timestamp_ms_t>().value}};
     case type_id::TIMESTAMP:
-      // gpu_execute_constant.cpp:140 uses duckdb::timestamp_tz_t for microsecond
-      // TIMESTAMP — mirror that accessor exactly so Phase 5's executor migration
-      // is a structural rewrite, not a behavior change.
+      // gpu_execute_constant.cpp uses duckdb::timestamp_tz_t for microsecond
+      // TIMESTAMP — mirror that accessor exactly so the executor migration is
+      // a structural rewrite, not a behavior change.
       return value{timestamp_us_value{v.GetValue<duckdb::timestamp_tz_t>().value}};
     case type_id::TIMESTAMP_NS:
       return value{timestamp_ns_value{v.GetValue<duckdb::timestamp_ns_t>().value}};
     case type_id::VARCHAR: return value{v.GetValue<std::string>()};
     case type_id::DECIMAL: {
-      // D-06: precision lives in the supplied logical_type, NOT in the
-      // alternative struct. The alt carries only (rep, scale).
+      // Precision lives in the supplied logical_type, NOT in the alternative
+      // struct. The alt carries only (rep, scale).
       auto const precision = type.decimal_precision();
       auto const scale     = type.decimal_scale();
       // Sirius has only decimal32/64/128, so DuckDB's narrower physical
@@ -98,7 +98,7 @@ value from_duckdb(const duckdb::Value& v, const logical_type& type)
 
 duckdb::Value to_duckdb(const value& v, const logical_type& type)
 {
-  // D-05: typed NULL recovery — null_value plus the supplied type yields a
+  // Typed NULL recovery — null_value plus the supplied type yields a
   // typed-null duckdb::Value via the `Value(LogicalType)` ctor. Reuses the
   // sirius::to_duckdb(logical_type) overload from helper/type_conversions.hpp.
   if (std::holds_alternative<null_value>(v)) { return duckdb::Value(to_duckdb(type)); }
@@ -111,7 +111,7 @@ duckdb::Value to_duckdb(const value& v, const logical_type& type)
     case type_id::BIGINT: return duckdb::Value::BIGINT(std::get<int64_t>(v));
     case type_id::HUGEINT:
       return duckdb::Value::HUGEINT(
-        std::get<int64_t>(v));  // D-03: narrowed alt → widen via factory
+        std::get<int64_t>(v));  // narrowed alt → widen via factory
     case type_id::UTINYINT: return duckdb::Value::UTINYINT(std::get<uint8_t>(v));
     case type_id::USMALLINT: return duckdb::Value::USMALLINT(std::get<uint16_t>(v));
     case type_id::UINTEGER: return duckdb::Value::UINTEGER(std::get<uint32_t>(v));

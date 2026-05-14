@@ -85,11 +85,10 @@ duckdb_scan_executor::duckdb_scan_executor(
   // device_id. Each pool's streams are created under that device's
   // rmm::cuda_set_device_raii so acquired streams are correctly bound to the
   // target GPU when select_target_gpu() picks a non-zero device. Mirrors
-  // gpu_pipeline_executor's per-executor pool shape
-  // (src/pipeline/gpu_pipeline_executor.cpp:45) lifted to the multi-GPU scan
-  // case — duckdb_scan_executor is shared across all GPUs, so it needs a map
-  // rather than a single pool. Closes the root cause of the v1.1 E2E
-  // cudaErrorInvalidValue at cuda_memcpy.cu (see Pattern 1 in 08-RESEARCH.md).
+  // gpu_pipeline_executor's per-executor pool shape lifted to the multi-GPU
+  // scan case — duckdb_scan_executor is shared across all GPUs, so it needs a
+  // map rather than a single pool. Without this binding, a wrong-device stream
+  // surfaces as a cudaErrorInvalidValue inside cuda_memcpy.
   for (auto* space : _gpu_memory_spaces) {
     auto const dev_id = space->get_device_id();
     rmm::cuda_set_device_raii guard{rmm::cuda_device_id{dev_id}};
@@ -154,9 +153,9 @@ void duckdb_scan_executor::set_scan_caching_enabled(cache_level level)
 void duckdb_scan_executor::prepare_cache_for_scan_operators(
   const std::vector<sirius::op::sirius_physical_operator*>& scan_operators)
 {
-  // Phase 9 FIX-B (Pitfall 3): reset affinity map alongside _scan_round_robin
-  // at query start. Without this paired reset, a new query's counter values
-  // would collide with stale entries from a prior query.
+  // Reset affinity map alongside _scan_round_robin at query start. Without
+  // this paired reset, a new query's counter values would collide with stale
+  // entries from a prior query.
   _scan_round_robin.store(0, std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> lock(_batch_affinity_mutex);
@@ -213,9 +212,9 @@ int duckdb_scan_executor::select_target_gpu()
     auto fallback_counter = _scan_round_robin.fetch_add(1);
     auto idx              = fallback_counter % _gpu_memory_spaces.size();
     auto device_id        = _gpu_memory_spaces[idx]->get_device_id();
-    // Phase 9 FIX-B: record affinity in the fallback branch too — a stale
-    // entry from this path would otherwise cause a disjointedness assert to
-    // pass by accident (counter not in map → not counted in intersection).
+    // Record affinity in the fallback branch too — a stale entry from this
+    // path would otherwise cause a disjointedness assert to pass by accident
+    // (counter not in map → not counted in intersection).
     {
       std::lock_guard<std::mutex> lock(_batch_affinity_mutex);
       _batch_gpu_affinity[fallback_counter] = device_id;
@@ -243,19 +242,10 @@ int duckdb_scan_executor::select_target_gpu()
       SIRIUS_LOG_DEBUG("Scan executor: distributing scan batch to GPU {} (available: {} bytes)",
                        space->get_device_id(),
                        space->get_available_memory());
-      // v1.1 e2e verification audit: info-level scan-batch assignment log
-      // so a real SQL query can be grepped for per-GPU batch distribution.
-      // Phase 8 AUDIT-02: appended batch_id= suffix (reusing the already-fetched
-      // _scan_round_robin counter value as the unique per-batch id) so tests can
-      // grep + awk-split + sort -u to count UNIQUE batches per GPU (robust
-      // against log-line duplication from retries). The leading
-      // "[mgpu-audit] scan_batch assigned to GPU N" substring is preserved
-      // verbatim for backward-compat with v1.1 verification greps.
-      // Phase 9 FIX-B (Bug 1 — 08-08-DIAGNOSIS.md hypothesis E): record batch→GPU
-      // affinity atomically with the audit emission. The `counter` value is the
-      // same batch_id=K that appears in the log line below, so a test parsing
-      // the log can cross-reference with this map deterministically. Lock held
-      // for the insertion only — contention negligible vs. I/O cost per batch.
+      // Record batch→GPU affinity and emit the audit log atomically. The
+      // counter doubles as batch_id=K in the log, so tests can cross-reference
+      // the log with this map. Log prefix "[mgpu-audit] scan_batch assigned
+      // to GPU N" is load-bearing — verification greps depend on it.
       {
         std::lock_guard<std::mutex> lock(_batch_affinity_mutex);
         _batch_gpu_affinity[counter] = space->get_device_id();
@@ -289,19 +279,19 @@ std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
     cloned_batches.reserve(batches.size());
     if (is_duckdb_scan) {
       for (auto& batch : batches) {
-        // Phase 18 / DB-02 Recipe R1: clone() moved off data_batch onto the
-        // accessors under cucascade #117. Take a scoped read-only accessor
-        // (concurrent shared locks are permitted) and clone through it.
+        // clone() lives on the accessors (not on data_batch) — take a scoped
+        // read-only accessor (concurrent shared locks are permitted) and
+        // clone through it.
         auto ro = batch->to_read_only();
         cloned_batches.push_back(ro.clone(get_next_batch_id(), stream));
       }
     } else if (is_parquet_scan) {
       for (auto& batch : batches) {
-        // Phase 18 / DB-02 Recipe R1: scoped read-only accessor on the
-        // source batch for the dynamic_cast probe + shallow_clone() call.
-        // The shallow_clone produces a NEW idata_representation owned by a
-        // brand-new data_batch — its lifetime is independent of the source
-        // accessor, so dropping `ro` at end-of-iteration is safe.
+        // Scoped read-only accessor on the source batch for the dynamic_cast
+        // probe + shallow_clone() call. The shallow_clone produces a NEW
+        // idata_representation owned by a brand-new data_batch — its lifetime
+        // is independent of the source accessor, so dropping `ro` at
+        // end-of-iteration is safe.
         auto ro         = batch->to_read_only();
         auto* idata_rep = ro.get_data();
         if (auto* host_data = dynamic_cast<cached_host_data_representation*>(idata_rep);
@@ -382,23 +372,22 @@ void duckdb_scan_executor::manager_loop()
     if (scan_task && scan_task->is<parquet_scan_task>()) {
       auto* parquet_task = dynamic_cast<parquet_scan_task*>(scan_task);
 
-      // Phase 9 FIX-A (Bug 2 — 08-08-DIAGNOSIS.md hypothesis E): plumb target_gpu_id
-      // into the task's LOCAL state so parquet_scan_task::compute_task reads the
-      // real device id rather than the nullopt sentinel that routed _datasource
-      // to backends.begin() (GPU 0's io_backend) regardless of which GPU the
-      // dispatch guard pinned. Local state (per-task) avoids the shared-global
-      // race described in 09-RESEARCH.md Pitfall 1.
+      // Plumb target_gpu_id into the task's LOCAL state so
+      // parquet_scan_task::compute_task reads the real device id rather than
+      // the nullopt sentinel that routed _datasource to backends.begin()
+      // (GPU 0's io_backend) regardless of which GPU the dispatch guard
+      // pinned. Local state (per-task) avoids a shared-global race.
       //
-      // Must happen BEFORE _bounded_pool->dispatch(...) below (Pitfall 5): once
-      // compute_task runs, _datasource is cached on the task and the preferred
-      // lookup is skipped on subsequent calls.
+      // Must happen BEFORE _bounded_pool->dispatch(...) below: once
+      // compute_task runs, _datasource is cached on the task and the
+      // preferred lookup is skipped on subsequent calls.
       if (auto* parquet_local_state =
             dynamic_cast<parquet_scan_task_local_state*>(scan_task->local_state())) {
         parquet_local_state->set_preferred_device_id(target_gpu_id);
       } else {
         SIRIUS_LOG_ERROR(
           "duckdb_scan_executor: parquet_scan_task local_state downcast failed "
-          "(Phase 9 FIX-A plumbing skipped; compute_task will fall back to "
+          "(preferred-device plumbing skipped; compute_task will fall back to "
           "global get_preferred_device_id())");
       }
 
@@ -490,7 +479,7 @@ void duckdb_scan_executor::manager_loop()
     }
     // acquire_stream() may lazily create a new rmm::cuda_stream on GROW
     // policy; wrap the call in a device guard so the new stream binds to
-    // target_gpu_id (see 08-RESEARCH.md Open Questions Q4).
+    // target_gpu_id.
     cucascade::memory::borrowed_stream exc_stream = [&] {
       rmm::cuda_set_device_raii acquire_guard{rmm::cuda_device_id{target_gpu_id}};
       return pool_iter->second->acquire_stream(
@@ -504,10 +493,10 @@ void duckdb_scan_executor::manager_loop()
        t             = std::move(task),
        scan_task     = std::move(scan_task),
        target_gpu_id = target_gpu_id]() mutable {
-        // Pitfall 1 (08-RESEARCH.md): _bounded_pool workers are GPU-agnostic;
-        // cudaSetDevice is thread-local. Pin this worker to target_gpu_id
-        // BEFORE any cudf/RMM call so the (stream, current_device) pair stays
-        // consistent through the entire scan task lifetime.
+        // _bounded_pool workers are GPU-agnostic; cudaSetDevice is
+        // thread-local. Pin this worker to target_gpu_id BEFORE any cudf/RMM
+        // call so the (stream, current_device) pair stays consistent through
+        // the entire scan task lifetime.
         rmm::cuda_set_device_raii dispatch_guard{rmm::cuda_device_id{target_gpu_id}};
         try {
           auto consumers = scan_task->get_output_consumers();

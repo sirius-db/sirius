@@ -150,9 +150,8 @@ void iceberg_scan_task_global_state::build_delete_pipeline(sirius_physical_icebe
     return;
   }
 
-  // Phase 19 IO-15 / Q3 audit: iceberg delete-file helpers DO NOT construct
-  // sirius_datasource (or the retired cucascade adapter) internally —
-  // read_positional_delete_file uses DuckDB read_parquet (CPU), and
+  // Iceberg delete-file helpers DO NOT construct sirius_datasource internally
+  // — read_positional_delete_file uses DuckDB read_parquet (CPU), and
   // read_equality_delete_file uses cudf::io::datasource::create directly. The
   // ioctx map is therefore not needed here; we still require at least one
   // ioctx be configured so the base parquet_scan_task_global_state's

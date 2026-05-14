@@ -33,7 +33,7 @@
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 
-// sirius IO framework (Phase 19 IO-13/IO-15)
+// sirius IO framework
 #include <io/types.hpp>
 
 // Forward-declare uring_io_object to avoid pulling in <liburing.h>
@@ -133,9 +133,8 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    * @param[in] scan_op The physical table scan operator
    * @param[in] approximate_batch_size The target approximate batch size for the scan tasks
    * @param[in] gpu_ioctxs Per-GPU sirius_ioctx instances indexed by device_id.
-   *            Seeded by task_creator from SiriusContext::get_gpu_ioctxs()
-   *            (Approach C, Phase 5 Plan 04 → Phase 19 IO-13). Used for
-   *            planning-time footer pre-reads and hot-path per-task
+   *            Seeded by task_creator from SiriusContext::get_gpu_ioctxs().
+   *            Used for planning-time footer pre-reads and hot-path per-task
    *            sirius_datasource construction.
    */
   parquet_scan_task_global_state(
@@ -266,14 +265,13 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   }
 
   /**
-   * @brief Access the per-GPU sirius_ioctx map (Approach C, Phase 5 Plan 04 → Phase 19 IO-13).
+   * @brief Access the per-GPU sirius_ioctx map.
    *
    * Seeded at construction time by task_creator from
-   * SiriusContext::get_gpu_ioctxs(). Keyed by device_id; value is a
-   * shared_ptr to the per-GPU sirius::io::sirius_ioctx bound to that
-   * GPU's CUDA context. Used by compute_task() (hot path, routed by
-   * preferred_device_id) and by initialize_from_files() (planning-time,
-   * first-available GPU).
+   * SiriusContext::get_gpu_ioctxs(). Keyed by device_id; value is a shared_ptr
+   * to the per-GPU sirius::io::sirius_ioctx bound to that GPU's CUDA context.
+   * Used by compute_task() (hot path, routed by preferred_device_id) and by
+   * initialize_from_files() (planning-time, first-available GPU).
    *
    * @return A const reference to the map.
    */
@@ -284,7 +282,7 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   }
 
   /**
-   * @brief Get the cached uring_io_object for the given file index (Phase 19 Open Q1).
+   * @brief Get the cached uring_io_object for the given file index.
    *
    * Cached at planning time inside initialize_from_files() so the hot path
    * (compute_task) does not re-open file descriptors per task. uring_io_object's
@@ -322,7 +320,7 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    * This is passed to host_parquet_representation so filter scalars survive until
    * materialization. Keyed by device_id so the converter can pick the entry that
    * matches its task's target device — per-device scalar device buffers are required
-   * for multi-GPU correctness (MGPU-07).
+   * for multi-GPU correctness.
    *
    * @return A shared_ptr to the per-device filter map (may be null / empty if no filter). */
   [[nodiscard]] std::shared_ptr<
@@ -545,17 +543,16 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   std::unordered_set<size_t> _hive_partition_index_set;
 
   /// Per-GPU sirius_ioctx instances keyed by device_id. Seeded by task_creator
-  /// from SiriusContext::get_gpu_ioctxs() at global-state construction time
-  /// (Approach C, Phase 5 Plan 04 → Phase 19 IO-13). The adapter layer
-  /// (sirius::io::sirius_datasource) is constructed via
+  /// from SiriusContext::get_gpu_ioctxs() at global-state construction time.
+  /// The adapter layer (sirius::io::sirius_datasource) is constructed via
   /// ioctx->make_datasource(io_object) selected by preferred_device_id (hot
   /// path) or first-available (planning).
   std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> _gpu_ioctxs;
 
-  /// Cached uring_io_objects per file (Phase 19 Open Q1). Constructed once at
-  /// planning time inside initialize_from_files(), reused by every per-task
-  /// datasource construction. Avoids per-task fd reopens (uring_io_object ctor
-  /// opens 2 fds via ::open).
+  /// Cached uring_io_objects per file. Constructed once at planning time
+  /// inside initialize_from_files(), reused by every per-task datasource
+  /// construction. Avoids per-task fd reopens (uring_io_object ctor opens 2
+  /// fds via ::open).
   std::vector<std::shared_ptr<sirius::io::uring_io_object>> _file_io_objects;
 };
 
@@ -656,14 +653,14 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_task_loca
     return _partition.row_group_indices;
   }
 
-  //===----------Preferred device id (Phase 9 Bug 2 fix)----------===//
+  //===----------Preferred device id----------===//
   /**
    * @brief Record which GPU this task was assigned to at dispatch time.
    * Set by duckdb_scan_executor::manager_loop after select_target_gpu().
    * Read by parquet_scan_task::compute_task for per-GPU io_backend routing.
-   * Per-task (local state) by design: Pitfall 1 in 09-RESEARCH.md warns that
-   * using the shared global state creates a data race across concurrent
-   * scan tasks for the same pipeline on different GPUs.
+   * Per-task (local state) by design: using the shared global state would
+   * create a data race across concurrent scan tasks for the same pipeline
+   * on different GPUs.
    */
   void set_preferred_device_id(int device_id) { _preferred_device_id = device_id; }
   [[nodiscard]] std::optional<int> get_preferred_device_id() const { return _preferred_device_id; }
@@ -671,7 +668,7 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_task_loca
  private:
   parquet_scan_task_global_state::row_group_range _partition;  ///< Assigned row-group partition
   std::size_t _metadata_bytes;                                 ///< The number of metadata bytes
-  std::optional<int> _preferred_device_id;  ///< Per-task GPU assignment (Phase 9 Bug 2 fix)
+  std::optional<int> _preferred_device_id;  ///< Per-task GPU assignment
 };
 
 //===----------------------------------------------------------------------===//

@@ -20,8 +20,8 @@
 #include "exec/thread_pool.hpp"
 #include "scan_manager/split_provider.hpp"
 
-// Phase 20.6 IO-MGPU-02: forward-declare sirius_ioctx via <io/types.hpp>
-// for the gpu_ioctxs map type used by prepare_for_query / create_provider_for.
+// Forward-declare sirius_ioctx via <io/types.hpp> for the gpu_ioctxs map type
+// used by prepare_for_query / create_provider_for.
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
 
@@ -66,7 +66,7 @@ struct pinned_entry {
   /// data_batches_by_column: chunk_memory_spaces[i] is the memory_space*
   /// for every column's chunk at index i. All columns at chunk index i
   /// share the same memory_space because they came from the same
-  /// chunked_parquet_reader::read_chunk() call (Phase 22 D-03).
+  /// chunked_parquet_reader::read_chunk() call.
   std::vector<cucascade::memory::memory_space*> chunk_memory_spaces;
   /// HOST-tier storage: one host_data_representation per chunk, each holding all
   /// pinned columns. The cached_split_provider slices these by column index when
@@ -120,12 +120,12 @@ class sirius_scan_manager {
   /// needed.
   ///
   /// @param query        The query whose scan operators must be prepared.
-  /// @param gpu_ioctxs   Per-GPU sirius_ioctx instances (Phase 20.6 IO-MGPU-02).
-  ///                     Forwarded to parquet_split_provider so that footer
-  ///                     metadata reads route through io_uring instead of
-  ///                     cudf's bundled kvikio path. Empty map is permitted
-  ///                     for callers (test harnesses) that pre-populate
-  ///                     scan_info another way; production callers
+  /// @param gpu_ioctxs   Per-GPU sirius_ioctx instances. Forwarded to
+  ///                     parquet_split_provider so that footer metadata
+  ///                     reads route through io_uring instead of cudf's
+  ///                     bundled kvikio path. Empty map is permitted for
+  ///                     callers (test harnesses) that pre-populate scan_info
+  ///                     another way; production callers
   ///                     (SiriusContext::create_query) MUST pass the map
   ///                     from SiriusContext::get_gpu_ioctxs().
   void prepare_for_query(
@@ -154,8 +154,8 @@ class sirius_scan_manager {
   ///   - If an entry exists and its @c num_rows equals the new total row count,
   ///     only columns whose names are not already present are merged in;
   ///     duplicates are dropped. The existing file_paths and chunk_memory_spaces
-  ///     are preserved (Phase 22 Pitfall 3: merge MUST verify chunk_memory_spaces
-  ///     alignment between existing and new entry).
+  ///     are preserved (merge MUST verify chunk_memory_spaces alignment
+  ///     between existing and new entry).
   ///   - If row counts differ, the existing entry is dropped and replaced.
   ///
   /// \param name                  Table name key.
@@ -164,7 +164,7 @@ class sirius_scan_manager {
   /// \param data_tables           Cudf tables produced by chunked parquet reads (may be empty).
   /// \param chunk_memory_spaces   Per-chunk memory space placement (size MUST equal total chunk
   ///                              count across data_tables; value at index i is shared by all
-  ///                              columns at chunk i, per D-03).
+  ///                              columns at chunk i).
   void insert_pinned_entry(const std::string& name,
                            std::vector<std::string> column_names,
                            std::vector<std::string> file_paths,
@@ -196,9 +196,9 @@ class sirius_scan_manager {
   /// \brief Remove the pinned entry for @p name. No-op if absent.
   void remove_pinned_entry(const std::string& name);
 
-  /// \brief Public read-accessor for the pinned-entries map. Used by
-  /// PIN-MGPU-01 unit tests to assert per-chunk memory_space placement
-  /// after CALL pin_table. Const-only — callers cannot mutate the map.
+  /// \brief Public read-accessor for the pinned-entries map. Used by unit
+  /// tests to assert per-chunk memory_space placement after CALL pin_table.
+  /// Const-only — callers cannot mutate the map.
   [[nodiscard]] const std::unordered_map<std::string, pinned_entry>&
   get_pinned_entries() const noexcept { return _pinned_entries; }
 

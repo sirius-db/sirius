@@ -205,15 +205,14 @@ class duckdb_scan_executor : public sirius::parallel::itask_executor {
   std::vector<cucascade::memory::memory_space*> _gpu_memory_spaces;  ///< All GPU memory spaces
   std::atomic<size_t> _scan_round_robin{0};  ///< Round-robin counter for scan distribution
 
-  // Phase 9 FIX-B (Bug 1 — 08-08-DIAGNOSIS.md hypothesis E): sticky batch→GPU
-  // affinity, recorded atomically with the [mgpu-audit] batch_id=K emission
-  // in select_target_gpu(). The key is the `counter` value from
-  // _scan_round_robin that doubles as the audit-log batch_id; the value is
-  // the device_id chosen for that batch. Cleared in prepare_cache_for_scan_operators
-  // alongside _scan_round_robin (Pitfall 3: never let the counter and the map
-  // drift — a stale entry from a prior query would collide with a new counter
-  // value). Guarded by _batch_affinity_mutex; contention is negligible vs.
-  // I/O cost per batch.
+  // Sticky batch→GPU affinity, recorded atomically with the [mgpu-audit]
+  // batch_id=K emission in select_target_gpu(). The key is the `counter`
+  // value from _scan_round_robin that doubles as the audit-log batch_id; the
+  // value is the device_id chosen for that batch. Cleared in
+  // prepare_cache_for_scan_operators alongside _scan_round_robin (never let
+  // the counter and the map drift — a stale entry from a prior query would
+  // collide with a new counter value). Guarded by _batch_affinity_mutex;
+  // contention is negligible vs. I/O cost per batch.
   mutable std::mutex _batch_affinity_mutex;
   std::unordered_map<uint64_t, int> _batch_gpu_affinity;
 

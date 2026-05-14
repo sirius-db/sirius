@@ -121,7 +121,7 @@ class datasource_factory {
   /**
    * @brief Create a @c cudf::io::datasource for @p uri.
    *
-   * Dispatch (post Phase 22.1 — kvikio-free invariant per CONTEXT.md D-09):
+   * Dispatch (kvikio-free invariant):
    *   - Every URI scheme MUST resolve through the registry to a registered
    *     @c sirius_ioctx whose @c make_datasource builds a @c sirius_datasource.
    *     The factory NEVER falls back to cudf's bundled @c file_source factory
@@ -156,7 +156,7 @@ class datasource_factory {
    *        DuckDB's @c MultiFileBindData / @c scan_op.parameters and may be a
    *        bare relative path rather than a normalized URI.
    *
-   * Dispatch (post Phase 22.1):
+   * Dispatch:
    *   - Relative bare path (no leading @c '/' and no @c "://"): normalized to
    *     @c file:///<absolute> via @c std::filesystem::absolute() and dispatched
    *     through @c create. Covers iceberg / hive test fixtures that hand out

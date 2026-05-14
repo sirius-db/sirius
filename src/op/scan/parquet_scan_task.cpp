@@ -27,11 +27,11 @@
 #include <op/scan/parquet_scan_task.hpp>
 #include <op/sirius_physical_parquet_scan.hpp>
 #include <pipeline/sirius_pipeline.hpp>
-// Phase 19 IO-15: include uring_reactor LAST among sirius headers — liburing.h
-// transitively pulled by uring_reactor.hpp defines a BLOCK_SIZE macro that
-// collides with the BLOCK_SIZE static member in <blockingconcurrentqueue.h>
-// (used by spdlog / pipeline). All consumers of blockingconcurrentqueue.h
-// must precede this include.
+// Include uring_reactor LAST among sirius headers — liburing.h transitively
+// pulled by uring_reactor.hpp defines a BLOCK_SIZE macro that collides with
+// the BLOCK_SIZE static member in <blockingconcurrentqueue.h> (used by spdlog
+// / pipeline). All consumers of blockingconcurrentqueue.h must precede this
+// include.
 #include <io/uring/uring_reactor.hpp>
 
 // cucascade
@@ -325,28 +325,25 @@ void parquet_scan_task_global_state::initialize_from_files()
   _footer_offsets.reserve(_file_paths.size());
   _file_io_objects.reserve(_file_paths.size());
 
-  // Phase 19 IO-15: use sirius_datasource (io_uring + per-GPU ioctx) instead
-  // of the retired cucascade-backed adapter. Planning-time reads — pick the
-  // first available GPU ioctx deterministically; the reads are small (footer
-  // only) and don't populate per-GPU row-group allocations, so context
-  // mismatch is correctness-neutral (RESEARCH.md Pitfall 6).
+  // Use sirius_datasource (io_uring + per-GPU ioctx) for planning-time reads.
+  // Pick the first available GPU ioctx deterministically; the reads are small
+  // (footer only) and don't populate per-GPU row-group allocations, so
+  // context mismatch is correctness-neutral.
   auto const planning_ioctx_it = _gpu_ioctxs.begin();
   if (planning_ioctx_it == _gpu_ioctxs.end()) {
     throw std::runtime_error(
       "[parquet_scan_task_global_state] No GPU sirius_ioctxs configured — "
-      "SiriusContext::initialize() must have populated at least one "
-      "(Approach C seeding via task_creator required).");
+      "SiriusContext::initialize() must have populated at least one.");
   }
 
   for (auto const& file_path : _file_paths) {
-    // Cache uring_io_object on global_state per RESEARCH.md Open Q1 — its ctor
-    // opens 2 fds (O_RDONLY + O_RDONLY|O_DIRECT). Reusing across all per-task
-    // datasource constructions avoids per-task fd reopens at SF100+.
+    // Cache uring_io_object on global_state — its ctor opens 2 fds (O_RDONLY +
+    // O_RDONLY|O_DIRECT). Reusing across all per-task datasource constructions
+    // avoids per-task fd reopens at high scale factors.
     auto io_object       = std::make_shared<sirius::io::uring_io_object>(file_path);
     auto const file_size = io_object->size();
-    // Phase 19 RESEARCH.md Pattern 2: ioctx->make_datasource(io_object) returns
-    // a unique_ptr<cudf::io::datasource> wrapping a sirius_datasource that
-    // delegates every read to the owning ioctx.
+    // ioctx->make_datasource(io_object) returns a unique_ptr<cudf::io::datasource>
+    // wrapping a sirius_datasource that delegates every read to the owning ioctx.
     auto datasource = planning_ioctx_it->second->make_datasource(io_object);
     _file_io_objects.push_back(std::move(io_object));
     datasources.push_back(std::move(datasource));
@@ -569,11 +566,11 @@ void parquet_scan_task_global_state::initialize_from_files()
   // column position. This is necessary because after hive partition removal
   // the DuckDB indices no longer coincide with parquet column positions.
   //
-  // HYG-01: explicit stream for the planning-time filter_row_groups_with_stats
-  // call below. A throwaway local stream is sufficient here — this is
-  // scan-plan time, called once per file, and the filter call is
-  // self-contained (no other work queued on this stream). User rule
-  // forbids the default-stream sentinel everywhere in Sirius.
+  // Explicit stream for the planning-time filter_row_groups_with_stats call
+  // below. A throwaway local stream is sufficient here — this is scan-plan
+  // time, called once per file, and the filter call is self-contained (no
+  // other work queued on this stream). The default-stream sentinel is
+  // forbidden everywhere in Sirius.
   rmm::cuda_stream planning_stream;
   // Pick the per-device filter entry that matches the current device for
   // planning-time row-group pruning. Tasks will later pick their own entry at
@@ -837,10 +834,6 @@ void parquet_scan_task::execute(rmm::cuda_stream_view stream)
     auto& pipelineable_output_data = dynamic_cast<op::pipelineable_operator_data&>(*output_data);
     std::size_t output_bytes       = 0;
     for (const auto& batch : pipelineable_output_data.get_data_batches()) {
-      // Phase 18 / DB-02 Recipe R2: scoped read-only accessor per loop
-      // iteration; destroyed at end-of-iteration -> shared lock released.
-      // These output batches were produced by compute_task() and no other
-      // accessor is held on them here (no P1 overlap).
       if (!batch) { continue; }
       auto ro = batch->to_read_only();
       if (ro.get_data()) { output_bytes += ro.get_data()->get_size_in_bytes(); }
@@ -858,21 +851,14 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
   auto& l_state = this->_local_state->cast<parquet_scan_task_local_state>();
   auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
 
-  // [mgpu-probe] entry instrumentation (08-07 gap-closure).
-  // Captures the device/stream context AT THE UPSTREAM H2D frame boundary,
-  // before the read_range_into_allocation -> prefetched_data_source H2D chain
-  // runs. If current_device != preferred_device_id at this point, the
-  // hazard is hypothesis A (upstream is wrong-device) and the subsequent
-  // converter entry will observe the same mismatch. If current_device matches
-  // here but mismatches at the converter entry breadcrumb in
-  // host_parquet_representation_converters.cpp:~89, a frame between
-  // compute_task and lock_or_prepare_batch is switching device context.
+  // [mgpu-probe] breadcrumb at the upstream H2D boundary. Pair with the
+  // host_parquet_representation_converters.cpp breadcrumb to localize
+  // device-context drift between compute_task and lock_or_prepare_batch.
   {
     int current_device = -1;
     (void)cudaGetDevice(&current_device);
-    // Phase 9 FIX-A: two-tier preferred_device_id lookup (local-wins-over-global).
-    // Mirrors gpu_pipeline_task::get_preferred_device_id (gpu_pipeline_task.hpp:188-194).
-    // Probe reports the EFFECTIVE value that _datasource construction below will see.
+    // Two-tier lookup mirrors gpu_pipeline_task::get_preferred_device_id —
+    // reports the effective value _datasource construction below will see.
     auto const local_preferred_probe = l_state.get_preferred_device_id();
     auto const preferred_probe =
       local_preferred_probe.has_value() ? local_preferred_probe : g_state.get_preferred_device_id();
@@ -887,30 +873,18 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
   }
 
   if (!_datasource) {
-    // Phase 19 IO-15 + IO-14: route the per-task datasource construction to
-    // the per-GPU sirius_ioctx selected by preferred_device_id.
-    //
-    // parquet_scan_task is a sirius_pipeline_itask (NOT a gpu_pipeline_task),
-    // so the two-tier local_state/global_state get_preferred_device_id() helper
-    // from gpu_pipeline_task is not directly available. We consult the
-    // global_state's pipeline-level preferred device (set on
-    // sirius_pipeline_task_global_state base) when present. Today, the
-    // pipeline_executor routes non-gpu_pipeline_task instances to the first GPU
-    // executor by default (pipeline_executor.cpp:237-244), so parquet_scan_task
-    // effectively runs on the first GPU when no explicit preference is set —
-    // we mirror that behavior here by falling back to the first configured
-    // ioctx. This keeps the datasource construction aligned with the actual
-    // executor-routing decision and avoids silent context mismatch.
+    // Falling back to ioctxs.begin() when no preference is set mirrors the
+    // pipeline_executor's own default for non-gpu_pipeline_task instances —
+    // keeps datasource construction aligned with executor routing and avoids
+    // silent context mismatch.
     auto const& ioctxs = g_state.get_gpu_ioctxs();
     if (ioctxs.empty()) {
       throw std::runtime_error(
         "[parquet_scan_task::compute_task] no GPU sirius_ioctxs configured — "
-        "SiriusContext::initialize() must have populated at least one "
-        "(Approach C seeding via task_creator required)");
+        "SiriusContext::initialize() must have populated at least one");
     }
-    // Phase 9 FIX-A: two-tier lookup (local-wins-over-global). See also the
-    // same idiom in the [mgpu-probe] entry breadcrumb above — both must
-    // produce the SAME value for the probe log to match the actual routing.
+    // Two-tier lookup: local state wins over global. Must match the probe
+    // log idiom above so log values reflect the actual routing decision.
     auto const local_preferred = l_state.get_preferred_device_id();
     auto const preferred =
       local_preferred.has_value() ? local_preferred : g_state.get_preferred_device_id();
@@ -919,9 +893,8 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
       throw std::out_of_range("[parquet_scan_task::compute_task] no sirius_ioctx for device_id=" +
                               std::to_string(preferred.value_or(-1)));
     }
-    // Reuse the cached uring_io_object (RESEARCH.md Open Q1) — populated at
-    // planning time inside initialize_from_files() so we don't re-open fds
-    // per task.
+    // Reuse the cached uring_io_object — populated at planning time inside
+    // initialize_from_files() so we don't re-open fds per task.
     auto io_object = g_state.get_file_io_object(l_state.get_file_idx());
     // make_datasource returns unique_ptr<cudf::io::datasource>; convert to
     // shared_ptr for the _datasource member which is shared because it may be

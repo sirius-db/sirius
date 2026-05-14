@@ -192,14 +192,13 @@ class task_scheduler {
 
   // for testing/stress only — see Doxygen below.
   /**
-   * @brief Inject an initial value into the SCHED-RR round-robin counter.
+   * @brief Inject an initial value into the round-robin counter.
    *
-   * For testing/stress only. Intended to verify that the SCHED-RR
+   * For testing/stress only. Intended to verify that the round-robin
    * distribution path (and the per-task-device contract documented in
-   * `docs/super-sirius/pipeline-execution.md`) is correct under
-   * arbitrary counter starting offsets — catches hash-bucket-order
-   * dependent bugs and off-by-one drift that a counter starting at 0
-   * each query might mask.
+   * `docs/super-sirius/pipeline-execution.md`) is correct under arbitrary
+   * counter starting offsets — catches hash-bucket-order dependent bugs and
+   * off-by-one drift that a counter starting at 0 each query might mask.
    *
    * Must be called AFTER `prepare_for_query` (which resets the counter
    * to 0) but BEFORE the first task is dispatched into

@@ -63,17 +63,11 @@ void downgrade_executor::start()
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
 
-  // Phase 22.2 (K.6 closure): only GPU-tier executors have a real CUDA device
-  // ordinal. HOST-tier and DISK-tier memory_spaces return device_id == -1
-  // from get_device_id() (sentinel for "no GPU"). Constructing a CUDA stream
-  // pool keyed to rmm::cuda_device_id{-1} or calling cudaSetDevice(-1) in the
-  // per-thread init both fail with cudaErrorInvalidDevice. At SF1 the failure
-  // is silent because non-GPU executors rarely service requests; at SF100
-  // host pressure routes work to the dead worker, the executor errors out,
-  // and the query falls back to an empty result (the original K.6 symptom).
-  // For non-GPU tiers, default the stream pool to GPU 0 (the stream is
-  // ordering metadata; host->disk work is CPU-side) and skip the per-thread
-  // CUDA-binding entirely.
+  // HOST/DISK tier memory_spaces return device_id == -1; passing that to
+  // rmm::cuda_device_id or cudaSetDevice fails with cudaErrorInvalidDevice.
+  // Default the stream pool to GPU 0 for non-GPU tiers and skip per-thread
+  // CUDA binding entirely (the stream is ordering metadata; host/disk work
+  // is CPU-side).
   {
     int device_id = 0;
     if (_space_id.tier == cucascade::memory::Tier::GPU && _memory_space) {
@@ -89,10 +83,8 @@ void downgrade_executor::start()
   if (_memory_space && _space_id.tier == cucascade::memory::Tier::GPU) {
     auto device_id  = _memory_space->get_device_id();
     per_thread_init = [device_id]() noexcept {
-      // MGPU-03: pin each worker thread to the downgrade executor's GPU
-      // context. Silent failure would cause downgrade memcpys to leak
-      // across GPU contexts. Lambda is noexcept so we inline the check
-      // rather than use CUCASCADE_CUDA_TRY (RESEARCH.md Pitfall 3).
+      // Pin each worker to its GPU; silent failure leaks downgrade memcpys
+      // across contexts. Lambda is noexcept, so check inline.
       cudaError_t err = cudaSetDevice(device_id);
       if (err != cudaSuccess) {
         spdlog::error("downgrade_executor per-thread init: cudaSetDevice({}) failed: {}",

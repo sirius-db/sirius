@@ -329,14 +329,14 @@ void sirius_engine::prefetch_iceberg_delete_data(op::sirius_physical_operator& p
 
   duckdb::SiriusContext::InternalQueryGuard guard(*sirius_ctx);
 
-  // Phase 22.1 D-06: iceberg metadata reads use a single GPU 0 sirius_ioctx
-  // (planning-time / pre-execution; not on the multi-GPU column-chunk hot path).
-  // Multi-GPU residency for iceberg metadata is deferred (IO-MGPU-04).
+  // Iceberg metadata reads use a single GPU's sirius_ioctx (planning-time /
+  // pre-execution; not on the multi-GPU column-chunk hot path). Multi-GPU
+  // residency for iceberg metadata is deferred.
   auto const& gpu_ioctxs = sirius_ctx->get_gpu_ioctxs();
   if (gpu_ioctxs.empty()) {
     throw std::runtime_error(
       "[sirius_engine] read_iceberg_delete_data: SiriusContext has no GPU sirius_ioctxs "
-      "(Phase 22.1 D-06; D-09 — kvikio path is forbidden).");
+      "(kvikio path is forbidden).");
   }
   // Pick the lowest-numbered GPU id (deterministic ordering — get_gpu_ioctxs
   // returns an unordered_map, so use std::min_element rather than .begin()).

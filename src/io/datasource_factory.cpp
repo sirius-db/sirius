@@ -91,11 +91,11 @@ void datasource_registry::clear()
 namespace {
 
 // Documentation constant: the canonical "file" scheme name registered by
-// SiriusContext::initialize() (Plan 22.1-01). Post-22.1 the factory looks
-// up schemes via registry.lookup(p.scheme) without branching on this name,
-// so the constant is intentionally unused at runtime — kept as a single
-// source of truth that the registration site (sirius_context.cpp) and any
-// future scheme-specific factory code can refer to.
+// SiriusContext::initialize(). The factory looks up schemes via
+// registry.lookup(p.scheme) without branching on this name, so the constant
+// is intentionally unused at runtime — kept as a single source of truth that
+// the registration site (sirius_context.cpp) and any future scheme-specific
+// factory code can refer to.
 [[maybe_unused]] constexpr std::string_view kFileScheme = "file";
 
 }  // namespace
@@ -109,15 +109,15 @@ std::string datasource_factory::extract_path(std::string_view uri) { return pars
 std::unique_ptr<cudf::io::datasource> datasource_factory::create_for_parquet_scan(
   std::string_view uri, datasource_registry const& registry, sirius_config const& config)
 {
-  // Phase 22.1 D-07: relative bare paths normalize to file:///<absolute>
-  // and dispatch through create(). The pre-22.1 bypass to cudf's default
-  // datasource routed through libkvikio internally; that's the kvikio path
-  // D-09 forbids.
-  // DuckDB's iceberg / hive fixtures still hand out paths like
-  // "test/cpp/integration/data/...parquet"; we resolve those against the process
-  // CWD via std::filesystem::absolute (matches pre-22.1 cudf-default semantics
-  // for relative paths) and prepend "file://" so create()'s parser routes them
-  // through the registered kFileScheme ioctx (Plan 22.1-01).
+  // Relative bare paths normalize to file:///<absolute> and dispatch through
+  // create(). Bypassing to cudf's default datasource would route through
+  // libkvikio internally — the forbidden kvikio path.
+  //
+  // DuckDB's iceberg / hive fixtures hand out paths like
+  // "test/cpp/integration/data/...parquet"; we resolve those against the
+  // process CWD via std::filesystem::absolute (matching cudf-default
+  // semantics for relative paths) and prepend "file://" so create()'s parser
+  // routes them through the registered kFileScheme ioctx.
   if (!uri.empty() && uri.front() != '/' && uri.find("://") == std::string_view::npos) {
     namespace fs = std::filesystem;
     std::error_code ec;
@@ -138,11 +138,11 @@ std::unique_ptr<cudf::io::datasource> datasource_factory::create(
 {
   auto p = parse(uri);
 
-  // Phase 22.1 D-07/D-09/D-10: ALL schemes (including kFileScheme) MUST be
-  // resolved via the registry. The pre-22.1 kFileScheme bypass returned the
-  // cudf default datasource which routed through libkvikio internally
-  // (binds a single CUDA context per FileHandle, breaks multi-GPU residency).
-  // Plan 22.1-01 registers kFileScheme -> sirius_ioctx at SiriusContext::initialize().
+  // ALL schemes (including kFileScheme) MUST be resolved via the registry.
+  // Bypassing kFileScheme to the cudf default datasource would route through
+  // libkvikio internally (binds a single CUDA context per FileHandle, breaks
+  // multi-GPU residency). SiriusContext::initialize() registers kFileScheme
+  // -> sirius_ioctx so this lookup succeeds.
   auto ioctx = registry.lookup(p.scheme);
   if (!ioctx) {
     throw std::runtime_error(
@@ -150,10 +150,9 @@ std::unique_ptr<cudf::io::datasource> datasource_factory::create(
       "' — kvikio path is forbidden (uri=" + std::string{uri} + ")");
   }
 
-  // For all currently-supported schemes (kFileScheme post-Plan 22.1-01),
-  // the io_object is a uring_io_object constructed from the parsed path.
-  // Object-store schemes (s3, gs, azure) will need scheme-specific
-  // io_object construction; that work is out of scope for 22.1.
+  // For all currently-supported schemes (kFileScheme), the io_object is a
+  // uring_io_object constructed from the parsed path. Object-store schemes
+  // (s3, gs, azure) will need scheme-specific io_object construction.
   auto io_object = std::make_shared<sirius::io::uring_io_object>(std::move(p.path));
   return ioctx->make_datasource(std::move(io_object));
 }

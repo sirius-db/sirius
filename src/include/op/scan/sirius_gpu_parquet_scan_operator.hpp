@@ -76,7 +76,7 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
   ///        and held by sirius_scan_manager. Called by create_provider_for(...) before
   ///        the operator is first executed.
   /// @details Used by read_table_from_metadata() to select the per-chunk ioctx via
-  ///          scan_data.gpu_memory_space->get_device_id() — Phase 22.1 D-04.
+  ///          scan_data.gpu_memory_space->get_device_id().
   void set_gpu_ioctxs(
     std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> ioctxs);
 
@@ -161,11 +161,11 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
   std::unique_ptr<scan_manager::split_connector> _split_connector;
   std::unique_ptr<parquet_scan_info> _scan_info;
 
-  // Phase 22.1 D-04: per-GPU ioctx map for ioctx->make_datasource(uring_io_object)
-  // routing in read_table_from_metadata. Populated by set_gpu_ioctxs(); empty until
-  // sirius_scan_manager::create_provider_for() injects it (the operator can be
-  // constructed before SiriusContext is available — set_gpu_ioctxs is mandatory
-  // before the first execute()).
+  // Per-GPU ioctx map for ioctx->make_datasource(uring_io_object) routing in
+  // read_table_from_metadata. Populated by set_gpu_ioctxs(); empty until
+  // sirius_scan_manager::create_provider_for() injects it (the operator can
+  // be constructed before SiriusContext is available — set_gpu_ioctxs is
+  // mandatory before the first execute()).
   std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> _gpu_ioctxs;
 };
 

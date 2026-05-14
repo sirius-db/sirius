@@ -24,13 +24,11 @@
 #include "op/scan/scan_utils.hpp"
 #include "scan_manager/split_connector.hpp"
 
-// Phase 20.6 IO-MGPU-02: sirius IO framework includes. sirius_datasource
-// declares the per-ioctx datasource factory; uring_reactor pulls in the
-// concrete uring_io_object construction. uring_reactor MUST be included
-// last among sirius headers — liburing's BLOCK_SIZE macro collides with
-// blockingconcurrentqueue.h's static const BLOCK_SIZE member when both
-// transitively land in the same TU. Mirrors the working include ordering
-// in src/op/scan/parquet_scan_task.cpp:25-35 + sirius_context.cpp.
+// Sirius IO framework includes. sirius_datasource declares the per-ioctx
+// datasource factory; uring_reactor pulls in the concrete uring_io_object
+// construction. uring_reactor MUST be included last among sirius headers —
+// liburing's BLOCK_SIZE macro collides with blockingconcurrentqueue.h's
+// static const BLOCK_SIZE member when both transitively land in the same TU.
 #include <io/sirius_datasource.hpp>
 // (other sirius headers above already included)
 #include <cudf/io/datasource.hpp>
@@ -230,27 +228,17 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
     }
   }
 
-  // Phase 20.6 IO-MGPU-02 / Phase 22.1 D-08: route footer + column-chunk reads
-  // through sirius_datasource (io_uring + per-GPU CUDA-context binding) instead
-  // of the cudf-bundled file_source factory (which routes through libkvikio and
-  // bypasses the IO framework established in Phase 19). Pick a planning ioctx
-  // deterministically — footer reads are small (<1 MiB) and per-GPU residency
-  // for column data is determined later by the scan operator's task affinity,
-  // not by which ioctx the datasource was originally constructed from.
-  // Mirrors parquet_scan_task_global_state::initialize_from_files() (Phase 19).
-  //
-  // Phase 22.1 D-08 / D-09: gpu_ioctxs MUST be populated. The pre-22.1
-  // unit-test fallback to cudf's default datasource factory routed through
-  // libkvikio internally — that's the kvikio path D-09 forbids. Test
-  // fixtures inject a real ioctx via make_test_gpu_ioctxs() (Phase 19 IO-15
-  // helper, lifted to shared header test/cpp/scan/test_helpers_ioctx.hpp in
-  // Phase 22.1-06).
+  // Route reads through sirius_datasource — cudf's bundled file_source uses
+  // libkvikio which binds a single CUDA context per FileHandle, breaking
+  // multi-GPU residency. Picking the first ioctx for planning is safe: footer
+  // reads are small, and per-GPU placement of column data is decided later
+  // by the scan operator's task affinity.
   if (_gpu_ioctxs.empty()) {
     throw std::runtime_error(
-      "parquet_split_provider: gpu_ioctxs is empty — kvikio path is forbidden "
-      "(Phase 22.1 D-08 / D-09). Production callers receive gpu_ioctxs from "
-      "SiriusContext::get_gpu_ioctxs(); test fixtures must inject via "
-      "make_test_gpu_ioctxs() helper (test/cpp/scan/test_helpers_ioctx.hpp).");
+      "parquet_split_provider: gpu_ioctxs is empty — kvikio path is forbidden. "
+      "Production callers receive gpu_ioctxs from SiriusContext::get_gpu_ioctxs(); "
+      "test fixtures must inject via make_test_gpu_ioctxs() helper "
+      "(test/cpp/scan/test_helpers_ioctx.hpp).");
   }
   auto const planning_ioctx_it = _gpu_ioctxs.begin();
 
@@ -291,11 +279,10 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
     }
 
     //===----------Read metadata footers----------===//
-    // Phase 22.1 D-08 / D-09: gpu_ioctxs is guaranteed non-empty (precondition
-    // checked above). Route through sirius_datasource for per-GPU IO context
-    // binding (multi-GPU IO routing — bypasses cudf's bundled file_source
-    // which would route through libkvikio and skip the io_uring + per-GPU
-    // CUDA-context binding).
+    // gpu_ioctxs is guaranteed non-empty (precondition checked above). Route
+    // through sirius_datasource for per-GPU IO context binding — bypasses
+    // cudf's bundled file_source which would route through libkvikio and
+    // skip the io_uring + per-GPU CUDA-context binding.
     auto io_object  = std::make_shared<sirius::io::uring_io_object>(file_path);
     auto datasource = planning_ioctx_it->second->make_datasource(io_object);
     auto footer_buffer = cudf::io::parquet::fetch_footer_to_host(*datasource);
@@ -414,12 +401,12 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
       cur_rgs.push_back(rg_idx);
     }
     seal_current_file();
-    // Pre-merge invariant restored: emit at least one split per file so source
-    // pipelines (GPU_PARQUET_SCAN -> ...) generate multiple gpu_pipeline_tasks
-    // when scanning multiple files. task_scheduler's SCHED-RR counter then
-    // distributes those tasks across GPUs. Without this flush, small workloads
-    // (test_physical_*_mgpu fixtures) bundle all files under the
-    // _approximate_batch_size threshold into one split → one task → one GPU.
+    // Emit at least one split per file so source pipelines (GPU_PARQUET_SCAN
+    // -> ...) generate multiple gpu_pipeline_tasks when scanning multiple
+    // files. The task_scheduler's round-robin counter then distributes those
+    // tasks across GPUs. Without this flush, small workloads bundle all files
+    // under the _approximate_batch_size threshold into one split → one task →
+    // one GPU.
     flush();
   }
   flush();

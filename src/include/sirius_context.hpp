@@ -172,21 +172,21 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>&
   get_downgrade_executors() const;
 
-  /// @brief Resolve the per-GPU sirius_ioctx for the given device (Phase 19 IO-13).
+  /// @brief Resolve the per-GPU sirius_ioctx for the given device.
   ///
   /// Per-GPU sirius_ioctx instances are constructed once per GPU during
   /// initialize() under rmm::cuda_set_device_raii so the reactor's pinned
   /// bounce slots and admission_control are bound to the matching CUDA
   /// context. Callers supply device_id from
   /// gpu_pipeline_task::get_preferred_device_id() (local_state wins over
-  /// global_state per Phase 4 push-model semantics).
+  /// global_state).
   ///
   /// @param device_id GPU device id (must match a configured GPU memory space).
   /// @return Shared pointer to the sirius_ioctx for that device.
   /// @throws std::out_of_range if no ioctx was registered for device_id.
   [[nodiscard]] std::shared_ptr<sirius::io::sirius_ioctx> get_ioctx_for(int device_id) const;
 
-  /// @brief Read-only view of the full per-GPU sirius_ioctx cache (Phase 19 IO-13).
+  /// @brief Read-only view of the full per-GPU sirius_ioctx cache.
   ///
   /// Used by consumers that need to enumerate all configured GPU ioctxs
   /// (e.g. task_creator seeding parquet_scan_task_global_state with a copy
@@ -201,11 +201,10 @@ class SiriusContext : public ClientContextState {
   }
 
   /// @brief Read-only access to the datasource registry populated at startup.
-  /// @details Phase 22.1 D-10: kFileScheme is registered at the end of
-  ///          initialize() against the lowest-numbered GPU's sirius_ioctx;
-  ///          object-store schemes (s3://, gs://, azure://) are not yet
-  ///          registered. Plan 22.1-02 will flip
-  ///          datasource_factory::create() to throw on unknown scheme — this
+  /// @details kFileScheme is registered at the end of initialize() against
+  ///          the lowest-numbered GPU's sirius_ioctx; object-store schemes
+  ///          (s3://, gs://, azure://) are not yet registered.
+  ///          datasource_factory::create() throws on unknown scheme — this
   ///          accessor is the read-side hook that lets the factory consult
   ///          the registry at every parquet read.
   [[nodiscard]] sirius::io::datasource_registry const& get_datasource_registry() const
@@ -214,7 +213,7 @@ class SiriusContext : public ClientContextState {
   }
 
   /// @brief Check whether cudaDeviceEnablePeerAccess succeeded for the given
-  ///        (src, dst) GPU pair at SiriusContext::initialize() time (MGPU-06).
+  ///        (src, dst) GPU pair at SiriusContext::initialize() time.
   ///
   /// Used by Sirius-side P2P-aware converter override (if registered) and by
   /// integration tests verifying the adaptive-scan + P2P path. Returns false
@@ -311,28 +310,27 @@ class SiriusContext : public ClientContextState {
   bool is_initialized_ = false;
   sirius::sirius_config config_;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;
-  // Phase 19 IO-13: per-GPU sirius_ioctx. One ioctx per GPU memory space,
-  // constructed under rmm::cuda_set_device_raii in initialize() so the
-  // reactor's pinned bounce slots (cudaHostAlloc(cudaHostAllocPortable)) bind
-  // to the matching CUDA context. Each ioctx owns its own admission_control
-  // budget (P5 mitigation — default uring_ioctx ctor allocates one
-  // admission_control instance per ioctx). Cleared in terminate() BEFORE
-  // memory_manager_->shutdown() so ~uring_reactor's worker-thread join +
-  // cudaFreeHost run against a live CUDA context (Pitfall 3).
+  // Per-GPU sirius_ioctx. One ioctx per GPU memory space, constructed under
+  // rmm::cuda_set_device_raii in initialize() so the reactor's pinned bounce
+  // slots (cudaHostAlloc(cudaHostAllocPortable)) bind to the matching CUDA
+  // context. Each ioctx owns its own admission_control budget (the default
+  // uring_ioctx ctor allocates one admission_control instance per ioctx).
+  // Cleared in terminate() BEFORE memory_manager_->shutdown() so
+  // ~uring_reactor's worker-thread join + cudaFreeHost run against a live
+  // CUDA context.
   std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs_;
-  // Phase 22.1 D-10: registry mapping URI scheme -> ioctx, populated by
-  // initialize() with kFileScheme -> gpu_ioctxs_.at(<lowest_gpu_id>).
-  // datasource_factory::create() (Plan 22.1-02) reads this registry to
-  // resolve schemes; throws if no entry exists. Cleared BEFORE
-  // gpu_ioctxs_ in shutdown to avoid dangling shared_ptrs (terminate()
-  // ordering in src/sirius_context.cpp).
+  // Registry mapping URI scheme -> ioctx, populated by initialize() with
+  // kFileScheme -> gpu_ioctxs_.at(<lowest_gpu_id>). datasource_factory::create()
+  // reads this registry to resolve schemes; throws if no entry exists.
+  // Cleared BEFORE gpu_ioctxs_ in shutdown to avoid dangling shared_ptrs
+  // (terminate() ordering in src/sirius_context.cpp).
   sirius::io::datasource_registry datasource_registry_;
-  // MGPU-06 P2P: set of (src, dst) GPU pairs where cudaDeviceEnablePeerAccess
+  // P2P: set of (src, dst) GPU pairs where cudaDeviceEnablePeerAccess
   // succeeded in initialize(). Populated under rmm::cuda_set_device_raii, one
-  // call per pair. Consumed by is_peer_access_enabled() + Plan 07-02's
-  // optional Sirius-side converter override. Holds no CUDA resources — just
-  // a set of int pairs — so destruction order relative to memory_manager_ is
-  // unconstrained; placed adjacent to gpu_ioctxs_ for MGPU-state locality.
+  // call per pair. Consumed by is_peer_access_enabled() and any Sirius-side
+  // converter override. Holds no CUDA resources — just a set of int pairs —
+  // so destruction order relative to memory_manager_ is unconstrained;
+  // placed adjacent to gpu_ioctxs_ for multi-GPU state locality.
   struct peer_pair_hash {
     size_t operator()(std::pair<int, int> const& p) const noexcept
     {

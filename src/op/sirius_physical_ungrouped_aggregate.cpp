@@ -434,7 +434,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
     auto out_table = std::make_unique<cudf::table>(std::move(cols), stream);
     // STREAM-LINEAGE: cudf::table ctor + cudf::make_column_from_scalar wrote
     // on `stream`; the constructor records the writer event for downstream
-    // cross-device readers (Phase 13-02 / 13-04 Path-2).
+    // cross-device readers.
     auto out_repr =
       std::make_unique<cucascade::gpu_table_representation>(std::move(out_table), *space, stream);
     std::unique_ptr<cucascade::idata_representation> output_data = std::move(out_repr);
@@ -538,7 +538,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
     std::move(output_cols), stream, cudf::get_current_device_resource_ref());
   // STREAM-LINEAGE: cudf::table ctor + make_avg_column write on `stream`;
   // the constructor records the writer event for downstream cross-device
-  // readers (Phase 13-02 / 13-04 Path-2).
+  // readers.
   auto out_repr =
     std::make_unique<cucascade::gpu_table_representation>(std::move(out_table), *space, stream);
   std::unique_ptr<cucascade::idata_representation> output_data = std::move(out_repr);

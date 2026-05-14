@@ -47,9 +47,9 @@ namespace sirius::scan_manager {
  *     emitted batches.
  *   - @p chunk_memory_spaces is parallel to the inner vectors of
  *     @p columns_per_request: chunk_memory_spaces[i] is the memory_space*
- *     for chunk i across all D-positions. Per Phase 22 D-04, each emitted
- *     data_batch carries the memory_space its data lives on so SCHED-01
- *     routing fans tasks correctly across GPUs.
+ *     for chunk i across all D-positions. Each emitted data_batch carries
+ *     the memory_space its data lives on so data-locality scheduling fans
+ *     tasks correctly across GPUs.
  *   - @p filter_expression and @p plan are forwarded unchanged on every
  *     emitted batch, mirroring the parquet path's per-split contract. The scan
  *     operator queries @c needs_output_assembly(*plan) to decide whether to
@@ -82,9 +82,8 @@ class cached_split_provider : public split_provider {
  private:
   // Populated when constructed via the GPU constructor; empty in HOST mode.
   std::vector<std::vector<std::shared_ptr<cudf::column>>> _columns_per_request;
-  // Phase 22 D-04: per-chunk memory_space lookup. Replaces entry-level
-  // _memory_space (now gone post-PIN-MGPU-01); each chunk carries the
-  // memory_space its data lives on so SCHED-01 routing fans tasks correctly.
+  // Per-chunk memory_space lookup — each chunk carries the memory_space
+  // its data lives on so data-locality scheduling fans tasks correctly.
   std::vector<cucascade::memory::memory_space*> _chunk_memory_spaces;
   // Populated when constructed via the HOST constructor; empty in GPU mode.
   std::vector<std::shared_ptr<cucascade::host_data_representation>> _host_chunks;

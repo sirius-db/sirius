@@ -153,7 +153,7 @@ void task_scheduler::prepare_for_query(duckdb::shared_ptr<planner::query> query)
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->drain_leftover_tasks();
   }
-  // Reset SCHED-RR counter so the round-robin walk is reproducible across
+  // Reset the round-robin counter so the walk is reproducible across
   // iterations of the same query (cache=table_gpu warm path keys cache
   // entries by device_id; without this reset the second iteration's source
   // tasks would assign to a different GPU and miss the cache entries).
@@ -238,7 +238,7 @@ void task_scheduler::management_eventloop()
       break;
     }
 
-    // Determine target GPU from task's data locality preference (SCHED-01/02/04).
+    // Determine target GPU from task's data locality preference.
     int target_device_id = _gpu_executors.begin()->first;
     uint64_t task_id     = 0;
     bool have_pref       = false;
@@ -250,7 +250,7 @@ void task_scheduler::management_eventloop()
       }
       task_id = gpu_task->get_task_id();
     }
-    // SCHED-RR: distribute preference-less source tasks (metadata scan,
+    // Distribute preference-less source tasks (metadata scan,
     // GPU_PARQUET_SCAN) round-robin so they don't all pile onto begin().
     // Downstream merge operators rely on lock_or_prepare_batch (in
     // batch_lock_utils.hpp) to convert cross-GPU input to the consumer's
@@ -265,24 +265,14 @@ void task_scheduler::management_eventloop()
     }
 
     SIRIUS_LOG_DEBUG("management_eventloop: routing task to GPU {}", target_device_id);
-    // v1.1 e2e verification audit: info-level dispatch log so a real SQL query
-    // can be grepped for per-GPU task distribution without needing debug logs.
-    // Phase 8 AUDIT-01: appended task_id= suffix so tests can grep + awk-split +
-    // sort -u to count UNIQUE tasks per GPU (robust against log-line duplication
-    // from retries). The leading "[mgpu-audit] pipeline_task dispatched to GPU N"
-    // substring is preserved verbatim for backward-compat with v1.1 verification greps.
+    // Log prefix "[mgpu-audit] pipeline_task dispatched to GPU N" is
+    // load-bearing — verification greps depend on it.
     SIRIUS_LOG_INFO(
       "[mgpu-audit] pipeline_task dispatched to GPU {} task_id={}", target_device_id, task_id);
-    // wait_on_preferred_device: when the preferred GPU executor is at capacity,
-    // the task sits in *that* executor's queue rather than falling back to a
-    // different GPU. This is the v1.0 Phase 02-01 user-locked decision recorded
-    // in STATE.md ("At-capacity preferred task waits on that executor rather
-    // than falling back to another GPU") and is the structural invariant gated
-    // by plan 04-02 Task 3b's human-verify checkpoint (W6 sentinel).
-    //
-    // The gpu_pipeline_executor's manager_loop() handles capacity control via
-    // bounded_pool->reserve() and memory reservation via make_reservation();
-    // schedule() here merely enqueues, it does not dispatch.
+    // At-capacity tasks stay in the preferred executor's queue rather than
+    // spilling to another GPU — preserves data locality at the cost of higher
+    // tail latency. Capacity control happens in gpu_pipeline_executor; this is
+    // an enqueue, not a dispatch.
     _gpu_executors.at(target_device_id)->schedule(std::move(task));
   }
 }

@@ -50,18 +50,13 @@ task_creator::task_creator(exec::thread_pool_config config,
                            const cucascade::memory::system_topology_info* sys_topology)
   : _running(false), _config(config), _mem_res_mgr(mem_res_mgr), _sys_topology(sys_topology)
 {
-  // Build NUMA node -> GPU device mapping for HOST data locality routing.
-  // numa_node=-1 is the Linux convention for a non-NUMA / single-NUMA host
-  // (see /sys/bus/pci/devices/*/numa_node). On those hosts the single host
-  // memory space is constructed with numa_id=0, so normalize -1 to 0 here so
-  // host_bytes lookups against this map actually find an entry. Without this
-  // normalization SCHED-02 never fires on single-NUMA multi-GPU boxes and
-  // every host-sourced pipeline task falls through to the default GPU.
+  // Normalize numa_node=-1 (Linux convention for non-NUMA / single-NUMA
+  // hosts) to 0 so it matches the host memory space, which is built with
+  // numa_id=0 on those hosts. Without normalization, host-sourced tasks on
+  // single-NUMA boxes fall through to the default GPU.
   //
-  // Record ALL GPUs on each NUMA (not just the first) — SCHED-02 can then
-  // round-robin across them, which matters when two or more GPUs share one
-  // NUMA node: single-socket boxes, the audit test host, and any GPU whose
-  // topology entry reports -1.
+  // Record every GPU under its NUMA key (not just the first) so the
+  // round-robin walk spreads work across all GPUs sharing a NUMA node.
   if (_sys_topology) {
     for (size_t i = 0; i < _sys_topology->gpus.size(); ++i) {
       auto raw_numa       = _sys_topology->gpus[i].numa_node;
@@ -117,11 +112,8 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
       if (it != _parquet_scan_operator_global_state_map.end()) {
         it->second->rebind(pipeline, &source_operator->Cast<op::sirius_physical_parquet_scan>());
       } else {
-        // Approach C (Phase 5 Plan 04 → Phase 19 IO-13): seed
-        // parquet_scan_task_global_state with the per-GPU sirius_ioctx map
-        // from SiriusContext. The map is captured by copy into the
-        // global_state; scan tasks look up the ioctx for their
-        // preferred_device_id in compute_task().
+        // Scan tasks look up the ioctx for their preferred_device_id in
+        // compute_task() — the map is copied into global_state.
         auto* sirius_ctx =
           _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state").get();
         const auto& op_params = sirius_ctx->get_config().get_operator_params();
@@ -149,15 +141,9 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
       } else {
         SIRIUS_LOG_INFO("[task_creator::prepare_for_query] creating NEW state for id={}",
                         operator_id);
-        // Approach C (Phase 5 Plan 04/05 → Phase 19 IO-13): seed
-        // iceberg_scan_task_global_state with the per-GPU sirius_ioctx map
-        // from SiriusContext. The map is forwarded to the base
-        // parquet_scan_task_global_state so the data-file footer pre-reads
-        // can resolve datasources via get_gpu_ioctxs(). Delete-file reads
-        // (build_delete_pipeline) bypass sirius_datasource — Q3 audit
-        // confirmed they use DuckDB read_parquet / cudf's bundled file_source
-        // factory directly. Tracked under IO-MGPU-02 for v1.5+ multi-GPU
-        // residency on iceberg metadata + delete-file reads.
+        // Iceberg delete-file reads bypass sirius_datasource (they go through
+        // DuckDB read_parquet / cudf's bundled file_source). Multi-GPU
+        // residency for iceberg metadata + delete-file reads is deferred.
         auto* sirius_ctx =
           _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state").get();
         const auto& op_params = sirius_ctx->get_config().get_operator_params();
@@ -421,20 +407,20 @@ void task_creator::manager_loop()
             auto local_state =
               std::make_unique<pipeline::gpu_pipeline_task_local_state>(std::move(input_data));
 
-            // Compute preferred GPU based on data locality (SCHED-01, SCHED-02)
-            // pipelineable_input was cast from input_data before the move into local_state;
-            // the moved-from unique_ptr transfers ownership but leaves the underlying object
-            // at the same address, so the raw pointer remains valid here.
+            // pipelineable_input remains valid here: the cast happened before
+            // the move into local_state, and unique_ptr move transfers
+            // ownership without relocating the object.
             {
               std::optional<int> preferred_device_id;
-              // SCHED-00: if the input is tagged with a partition index, pin the
-              // task to partition_idx % num_gpus. Partition-based operators
-              // (hash_join, grouped_aggregate_merge, …) use cuco hash tables
-              // under the hood, and cuco tables must live on a single device —
-              // a stream bound to GPU A touching a counter built under GPU B
-              // trips cudaErrorInvalidValue at counter_storage.cuh. Routing on
-              // partition_idx keeps every task of a given partition on one GPU
-              // while still spreading partitions across GPUs.
+              // Partition affinity: if the input is tagged with a partition
+              // index, pin the task to partition_idx % num_gpus.
+              // Partition-based operators (hash_join, grouped_aggregate_merge,
+              // …) use cuco hash tables under the hood, and cuco tables must
+              // live on a single device — a stream bound to GPU A touching a
+              // counter built under GPU B trips cudaErrorInvalidValue at
+              // counter_storage.cuh. Routing on partition_idx keeps every
+              // task of a given partition on one GPU while still spreading
+              // partitions across GPUs.
               if (auto* partitioned =
                     dynamic_cast<op::partitioned_operator_data*>(pipelineable_input);
                   partitioned && _sys_topology && !_sys_topology->gpus.empty()) {
@@ -448,11 +434,6 @@ void task_creator::manager_loop()
                 std::unordered_map<int, size_t> host_bytes;
                 for (const auto& batch : pipelineable_input->get_data_batches()) {
                   if (!batch) { continue; }
-                  // Phase 18 / DB-02 Recipe R2: scoped read-only accessor
-                  // per loop iteration for the affinity/sizing probe.
-                  // Destroyed at end-of-iteration -> shared lock released.
-                  // Called pre-task-dispatch from manager_loop, so no other
-                  // accessor is held on these batches (no P1 overlap).
                   auto ro     = batch->to_read_only();
                   auto* space = ro.get_memory_space();
                   if (!space || !ro.get_data()) { continue; }
@@ -461,8 +442,8 @@ void task_creator::manager_loop()
                     gpu_bytes[space->get_device_id()] += size;
                   } else if (space->get_tier() == cucascade::memory::Tier::HOST) {
                     // Normalize numa_id=-1 (non-NUMA / single-NUMA hosts, per
-                    // the Linux /sys/bus/pci/devices/*/numa_node convention) to
-                    // 0 so the SCHED-02 lookup matches the normalized
+                    // the Linux /sys/bus/pci/devices/*/numa_node convention)
+                    // to 0 so the NUMA-affinity lookup matches the normalized
                     // `_numa_to_gpu` map key. Without this, host_bytes[-1]
                     // never hits `_numa_to_gpu[0]`, preferred_device_id stays
                     // nullopt, and every host-sourced pipeline task falls
@@ -473,7 +454,7 @@ void task_creator::manager_loop()
                   }
                 }
                 if (!gpu_bytes.empty()) {
-                  // SCHED-01: Route to GPU with most data by bytes
+                  // Data-locality: route to GPU with most data by bytes
                   preferred_device_id = std::max_element(gpu_bytes.begin(),
                                                          gpu_bytes.end(),
                                                          [](const auto& a, const auto& b) {
@@ -481,10 +462,11 @@ void task_creator::manager_loop()
                                                          })
                                           ->first;
                 } else if (!host_bytes.empty() && !_numa_to_gpu.empty()) {
-                  // SCHED-02: No GPU data, route to a GPU on the same NUMA as
-                  // the host data. When that NUMA hosts multiple GPUs, pick
-                  // round-robin across them — pinning every host-sourced
-                  // pipeline task to a single GPU defeats multi-GPU speedup.
+                  // NUMA-affinity: no GPU data, route to a GPU on the same
+                  // NUMA as the host data. When that NUMA hosts multiple
+                  // GPUs, pick round-robin across them — pinning every
+                  // host-sourced pipeline task to a single GPU defeats
+                  // multi-GPU speedup.
                   auto top_host = std::max_element(host_bytes.begin(),
                                                    host_bytes.end(),
                                                    [](const auto& a, const auto& b) {

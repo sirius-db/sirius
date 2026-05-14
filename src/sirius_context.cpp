@@ -192,8 +192,7 @@ void SiriusContext::QueryEnd()
   // If we leave this state alive past QueryEnd, ~task_creator at SiriusContext
   // teardown ends up releasing those BlockHandles after parts of DuckDB's
   // DatabaseInstance have already been torn down (~DBConfig fires ~SiriusContext
-  // mid-DB destruction), which SIGSEGVs in ~BlockMemory. Phase 11-01 record:
-  // .planning/phases/11-mgpu-audit-attach-sigsegv/11-01-FIX.md.
+  // mid-DB destruction), which SIGSEGVs in ~BlockMemory.
   if (task_creator_) { task_creator_->reset(/*keep_parquet_metadata=*/true); }
   release_query_lifecycle_slot();
 }
@@ -216,21 +215,15 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 
   config_ = config;
 
-  // ---- MGPU-01: Topology fail-hard + startup log ----
-  // Topology is discovered once in sirius_config::sirius_config() via
-  // cucascade::memory::topology_discovery. This block validates the cached
-  // result at initialize() entry — before any memory_manager_ / io_backend /
-  // downgrade_executor construction — so downstream failures don't mask a
-  // stub topology. The accessor at src/include/sirius_context.hpp:117
-  // (get_hw_topology()) is the sole authorised source of GPU/NUMA counts
-  // going forward; Super Sirius files must not call the raw CUDA/NUMA
-  // device-enumeration APIs directly (enforced by the MGPU-01 grep sweep
-  // gate documented in .planning/phases/06-*/06-01-SUMMARY.md).
+  // Validate the cached topology before any downstream construction so a stub
+  // topology fails loudly rather than producing zero-GPU executors silently.
+  // get_hw_topology() is the only authorised source of GPU/NUMA counts —
+  // never call raw CUDA/NUMA device-enumeration APIs directly elsewhere.
   auto const& topo = config_.get_hw_topology();
   if (topo.num_gpus == 0) {
     throw std::runtime_error(
       "SiriusContext::initialize: cucascade::topology_discovery reported 0 GPUs — "
-      "refusing to initialize on stub topology (MGPU-01 fail-hard).");
+      "refusing to initialize on stub topology.");
   }
   spdlog::info("SiriusContext: topology summary — {} GPU(s), {} NUMA node(s), host='{}'",
                topo.num_gpus,
@@ -253,15 +246,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     }
   }
 
-  // ---- MGPU-05: Per-NUMA host memory space assertion ----
-  // sirius_config::apply_defaults (src/sirius_config.cpp:216) + YAML-path
-  // both call .use_host_per_numa() so cucascade builds one
-  // numa_region_pinned_host_memory_resource per NUMA node. This block
-  // verifies the configurator honoured that request post-construction and
-  // logs the host_space count alongside topology.num_numa_nodes for the
-  // Phase-6 validation artifact (/proc/PID/numa_maps evidence goes in
-  // 06-SUMMARY.md). Warn-not-throw: non-NUMA CI hosts legitimately report
-  // num_numa_nodes == 0 (RESEARCH.md Pitfall 4).
+  // Verify cucascade built one host memory space per NUMA node. Warn rather
+  // than throw — non-NUMA CI hosts legitimately report num_numa_nodes == 0.
   {
     auto const mgpu05_host_spaces =
       memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
@@ -272,7 +258,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
         mgpu05_host_spaces.size() != static_cast<size_t>(topo.num_numa_nodes)) {
       spdlog::warn(
         "SiriusContext: host space count ({}) != NUMA node count ({}) — "
-        "MGPU-05 expects one host space per NUMA domain. Check "
+        "expected one host space per NUMA domain. Check "
         "sirius_config apply_defaults (.use_host_per_numa()) or YAML host "
         "configuration.",
         mgpu05_host_spaces.size(),
@@ -280,14 +266,10 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     }
   }
 
-  // === Phase 19 IO-13: per-GPU sirius_ioctx ===
-  // One ioctx per GPU memory space. Each uring_ioctx ctor allocates pinned
-  // bounce slots via cudaHostAlloc with cudaHostAllocPortable bound to the
-  // current CUDA context, so the rmm::cuda_set_device_raii guard is mandatory
-  // (P4). Each ioctx also owns its own admission_control instance — the
-  // default ctor of uring_ioctx → templated_ioctx<uring_reactor> wires this
-  // up per-instance, which satisfies P5 mitigation (per-GPU admission
-  // budget; never shared).
+  // One sirius_ioctx per GPU memory space. The cudaHostAllocPortable bounce
+  // slots inside uring_ioctx bind to the current CUDA context, so each
+  // construction must happen under rmm::cuda_set_device_raii. Each ioctx
+  // gets its own admission_control budget (never shared across GPUs).
   {
     auto gpu_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
     gpu_ioctxs_.reserve(gpu_spaces.size());
@@ -295,27 +277,16 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
       auto const device_id = gpu_space->get_device_id();
       rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{device_id}};
 
-      // Defaults match src/include/io/uring/uring_ioctx.hpp:85-88:
-      //   host_ring_depth=16, ring_entries=64, n_reactors=4,
-      //   bounce_slot_size=sirius::io::CHUNK_SIZE (1 MiB).
-      // Phase 19 RESEARCH.md Pattern 1: uring_ioctx ctor allocates
-      // 32 × 1 MiB pinned bounce slots per reactor via cudaHostAlloc bound
-      // to current context — RAII required.
-      //
-      // RESEARCH.md Open Q2: do NOT call ioctx->initialize_cache() in
-      // Phase 19. sirius_datasource device_read falls through to
-      // device_read_io when _cache==nullptr (sirius_datasource.cpp:122-128).
-      // v1.1 baseline correctness is feasible without the cache; cache
-      // enablement deferred to Phase 20+ per CONTEXT.md.
+      // uring_ioctx ctor allocates pinned bounce slots via cudaHostAlloc
+      // bound to current context — the rmm::cuda_set_device_raii above is
+      // mandatory. Cache is left uninitialized; sirius_datasource falls
+      // through to device_read_io when _cache==nullptr.
       auto ioctx = std::make_shared<sirius::io::uring_ioctx>(
         /*host_ring_depth=*/16u,
         /*ring_entries=*/64u,
         /*n_reactors=*/static_cast<size_t>(4),
         /*bounce_slot_size=*/sirius::io::CHUNK_SIZE);
 
-      // IO-13 audit: log the device_id we targeted and the actual current
-      // device at the moment the ioctx was created. These should match
-      // (mirror of the cucascade-backend audit above).
       int readback = -1;
       cudaGetDevice(&readback);
       spdlog::info("SiriusContext: sirius_ioctx created for GPU {} (cudaGetDevice readback={})",
@@ -326,18 +297,12 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     }
   }
 
-  // === Phase 22.1 D-10: register kFileScheme in datasource_registry_ ===
-  // The factory (Plan 22.1-02) consults this registry on every parquet read;
-  // it will throw if a scheme has no registered ioctx. The registry stores ONE
-  // entry per scheme (not per-GPU); consumers that need per-GPU ioctx
-  // selection use get_ioctx_for(device_id) directly. Picking the
-  // lowest-numbered GPU here is arbitrary — it is correct because
-  // make_datasource on any ioctx returns a sirius_datasource that the
-  // consumer wires up with the right device_id at use site (the registered
-  // ioctx is a fallback for callers that don't know which GPU they want;
-  // Plan 22.1-03/04/05 callers all pass an explicit per-GPU ioctx).
+  // Register kFileScheme as a fallback for callers that don't pick a GPU
+  // explicitly. The registry stores ONE entry per scheme; per-GPU selection
+  // happens via get_ioctx_for(device_id). Lowest-numbered GPU is an arbitrary
+  // but stable choice — production callers all pass an explicit per-GPU ioctx.
   if (!gpu_ioctxs_.empty()) {
-    // Match the spelling of `kFileScheme` from datasource_factory.cpp:90
+    // Match the spelling of `kFileScheme` from datasource_factory.cpp
     // verbatim (anonymous namespace constant).
     static constexpr std::string_view kFileScheme = "file";
     auto lowest_gpu                               = std::min_element(
@@ -351,19 +316,15 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   } else {
     throw std::runtime_error(
       "SiriusContext::initialize: cannot register kFileScheme; no per-GPU sirius_ioctx exists "
-      "(gpu_ioctxs_.empty()). Phase 19 IO-13 must have produced at least one ioctx.");
+      "(gpu_ioctxs_.empty()). Per-GPU ioctx setup must have produced at least one ioctx.");
   }
 
-  // ---- MGPU-06: Enable P2P peer access for every available GPU pair ----
-  // cucascade::convert_gpu_to_gpu at cucascade/src/data/representation_converter.cpp:173
-  // already calls cudaMemcpyPeerAsync on every GPU->GPU conversion. For that
-  // call to bypass host staging and avoid the Phase-4-deferred return-leg bug
-  // at test/cpp/downgrade/test_downgrade_executor.cpp:813 TODO(MGPU-06), peer
-  // access must be enabled ONCE at init for every (src, dst) pair the host
-  // supports. This block is the net-new Sirius code RESEARCH.md Finding 1
-  // identified as the core MGPU-06 closure. Non-fatal failure mode:
-  // spdlog::error and continue -- host-staged fallback in cucascade's
-  // converter is a correct alternate path.
+  // Enable P2P peer access for every available GPU pair.
+  // cucascade::convert_gpu_to_gpu calls cudaMemcpyPeerAsync on every GPU->GPU
+  // conversion. For that call to bypass host staging, peer access must be
+  // enabled ONCE at init for every (src, dst) pair the host supports.
+  // Non-fatal failure mode: spdlog::error and continue — host-staged fallback
+  // in cucascade's converter is a correct alternate path.
   {
     auto const& mgpu06_topo = config_.get_hw_topology();
     if (mgpu06_topo.num_gpus >= 2) {
@@ -377,7 +338,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
           cudaError_t probe_err =
             cudaDeviceCanAccessPeer(&can_access, static_cast<int>(i), static_cast<int>(j));
           if (probe_err != cudaSuccess) {
-            spdlog::error("SiriusContext: cudaDeviceCanAccessPeer({},{}) failed: {} (MGPU-06)",
+            spdlog::error("SiriusContext: cudaDeviceCanAccessPeer({},{}) failed: {}",
                           i,
                           j,
                           cudaGetErrorString(probe_err));
@@ -385,7 +346,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
           }
           if (can_access == 0) {
             spdlog::info(
-              "SiriusContext: no P2P access {} -> {} -- falling back to host staging (MGPU-06)",
+              "SiriusContext: no P2P access {} -> {} -- falling back to host staging",
               i,
               j);
             continue;
@@ -398,10 +359,10 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
           (void)cudaGetLastError();
           if (enable_err == cudaSuccess || enable_err == cudaErrorPeerAccessAlreadyEnabled) {
             peer_access_enabled_pairs_.emplace(static_cast<int>(i), static_cast<int>(j));
-            spdlog::info("SiriusContext: P2P enabled {} -> {} (MGPU-06)", i, j);
+            spdlog::info("SiriusContext: P2P enabled {} -> {}", i, j);
           } else {
             spdlog::error(
-              "SiriusContext: cudaDeviceEnablePeerAccess({}) from ctx {} failed: {} (MGPU-06)",
+              "SiriusContext: cudaDeviceEnablePeerAccess({}) from ctx {} failed: {}",
               j,
               i,
               cudaGetErrorString(enable_err));
@@ -410,7 +371,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
       }
     } else {
       spdlog::info(
-        "SiriusContext: skipping MGPU-06 peer-access enable loop (num_gpus={}); "
+        "SiriusContext: skipping peer-access enable loop (num_gpus={}); "
         "single-GPU host has no pairs to enable",
         mgpu06_topo.num_gpus);
     }
@@ -532,24 +493,15 @@ void SiriusContext::terminate()
   }
   downgrade_executors_.clear();
 
-  // Phase 22.1 D-10: clear the registry BEFORE gpu_ioctxs_ so the registry's
-  // shared_ptr<sirius_ioctx> entries do not outlive their owners. The
-  // registry itself is value-typed (datasource_registry_ is a member of
-  // SiriusContext), but it holds shared_ptrs — calling clear() drops those
-  // refs first so gpu_ioctxs_.clear() below is the sole remaining owner
-  // when ~uring_ioctx runs.
+  // Teardown order is load-bearing: registry holds shared_ptrs to ioctxs, so
+  // it must drop its refs first. Then ~uring_ioctx (inside gpu_ioctxs_.clear)
+  // joins reactor threads and calls cudaFreeHost, which requires a live CUDA
+  // context — must happen before memory_manager_->shutdown().
   datasource_registry_.clear();
-  // Phase 19 IO-13: tear down per-GPU sirius_ioctx instances BEFORE
-  // memory_manager_->shutdown() (Pitfall 3). Each ~uring_ioctx joins its
-  // reactor worker thread and frees pinned bounce slots via cudaFreeHost,
-  // which requires the CUDA context to still be live. The cudaDeviceSynchronize
-  // call further down already drains any pending async copies before pinned
-  // slabs are freed by memory_manager_.
   gpu_ioctxs_.clear();
-  // MGPU-06: clear peer-access cache. No cudaDeviceDisablePeerAccess call --
-  // CUDA cleans up peer-access mappings at process exit, and explicit disable
-  // during shutdown risks tearing down mappings the memory_manager_ teardown
-  // (below) may still traverse for GPU->HOST drains.
+  // No cudaDeviceDisablePeerAccess: CUDA cleans up peer mappings at process
+  // exit, and explicit disable here can tear down mappings that
+  // memory_manager_ teardown below still traverses for GPU->HOST drains.
   peer_access_enabled_pairs_.clear();
 
   // Ensure all CUDA operations (including async copies from downgrade tasks)
@@ -687,9 +639,9 @@ void SiriusContext::create_query(
     duckdb::make_shared_ptr<sirius::planner::query>(std::move(pipelines), context, telemetry_info);
   task_scheduler_->prepare_for_query(query_);
   task_creator_->prepare_for_query(*query_);
-  // Phase 20.6 IO-MGPU-02: pass per-GPU sirius_ioctx map to scan_manager so
-  // parquet_split_provider can construct sirius_datasources via
-  // ioctx->make_datasource(io_object) instead of cudf's bundled file_source factory.
+  // Pass per-GPU sirius_ioctx map to scan_manager so parquet_split_provider
+  // can construct sirius_datasources via ioctx->make_datasource(io_object)
+  // instead of cudf's bundled file_source factory.
   scan_manager_->prepare_for_query(*query_, gpu_ioctxs_);
 }
 

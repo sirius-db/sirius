@@ -91,13 +91,13 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
   auto info = op->take_scan_info();
   if (!info) { return nullptr; }
 
-  // Phase 22.1 D-04: inject the per-GPU sirius_ioctx map into the operator
-  // BEFORE returning any provider (cached or parquet). read_table_from_metadata
-  // requires _gpu_ioctxs to be non-empty before its first invocation. The setter
-  // is idempotent and runs once per query; prepare_for_query (the sole caller of
+  // Inject the per-GPU sirius_ioctx map into the operator BEFORE returning
+  // any provider (cached or parquet). read_table_from_metadata requires
+  // _gpu_ioctxs to be non-empty before its first invocation. The setter is
+  // idempotent and runs once per query; prepare_for_query (the sole caller of
   // create_provider_for) runs before any execute(), so the operator sees the
-  // ioctx map well before the parquet scan path needs it for ioctx selection by
-  // scan_data.gpu_memory_space->get_device_id().
+  // ioctx map well before the parquet scan path needs it for ioctx selection
+  // by scan_data.gpu_memory_space->get_device_id().
   op->set_gpu_ioctxs(gpu_ioctxs);
 
   // If a pinned entry's file paths match this operator's scan_info, build the same
@@ -113,10 +113,10 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
   try {
     for (auto const& [pinned_name, entry] : _pinned_entries) {
       if (!matches_scan_info(entry)) { continue; }
-      // Phase 22 D-04: validate the per-chunk memory_space vector before
-      // building the cached_split_provider. Empty vector means the pinned
-      // entry has no chunks (unusual but legal for empty parquet files);
-      // null entries inside the vector violate D-03 chunks-at-index-i.
+      // Validate the per-chunk memory_space vector before building the
+      // cached_split_provider. Empty vector means the pinned entry has no
+      // chunks (unusual but legal for empty parquet files); null entries
+      // inside the vector violate the chunks-at-index-i invariant.
       if (entry.chunk_memory_spaces.empty()) {
         throw std::runtime_error("[sirius_scan_manager::create_provider_for] pinned entry '" +
                                  pinned_name + "' has no chunk_memory_spaces");
@@ -227,11 +227,8 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
         columns_per_request.size(),
         op::scan::needs_output_assembly(plan));
 
-      // Phase 22 D-04: forward the entry's per-chunk memory_space vector to
-      // cached_split_provider. The provider asserts size == num_batches at
-      // start() time and emits each chunk's data_batch tagged with its actual
-      // memory_space so SCHED-01 routing fans cached-scan tasks correctly
-      // across GPUs.
+      // Each chunk's data_batch is tagged with its actual memory_space so
+      // data-locality scheduling fans cached-scan tasks across GPUs.
       return std::make_unique<cached_split_provider>(std::move(columns_per_request),
                                                      entry.chunk_memory_spaces,
                                                      std::move(filter_expression),
@@ -306,10 +303,11 @@ void sirius_scan_manager::insert_pinned_entry(
   std::vector<std::unique_ptr<cudf::table>> data_tables,
   std::vector<cucascade::memory::memory_space*> chunk_memory_spaces)
 {
-  // Phase 22 (D-03): chunk_memory_spaces is parallel to data_tables — the caller
-  // (PinTableFunction) emits one memory_space* per chunked_parquet_reader::read_chunk()
-  // result, and there is exactly one cudf::table per chunk in data_tables. Reject any
-  // misalignment loudly rather than silently aliasing chunks to the wrong GPU.
+  // chunk_memory_spaces is parallel to data_tables — the caller
+  // (PinTableFunction) emits one memory_space* per
+  // chunked_parquet_reader::read_chunk() result, and there is exactly one
+  // cudf::table per chunk in data_tables. Reject any misalignment loudly
+  // rather than silently aliasing chunks to the wrong GPU.
   if (chunk_memory_spaces.size() != data_tables.size()) {
     throw std::invalid_argument(
       "[sirius_scan_manager::insert_pinned_entry] chunk_memory_spaces.size() (" +
@@ -327,14 +325,14 @@ void sirius_scan_manager::insert_pinned_entry(
   auto existing_it = _pinned_entries.find(name);
   if (existing_it != _pinned_entries.end()) {
     if (existing_it->second.num_rows == new_num_rows) {
-      // Phase 22 Pitfall 3: same-row-count merge MUST preserve per-chunk
-      // memory_space alignment between existing and new entry. Per D-02 the
-      // round-robin counter restarts at chunk 0 → GPU 0 per pin_table call,
-      // and (per D-03) chunks at index i across all columns share a memory_space
-      // because they came from the same chunked_parquet_reader::read_chunk()
-      // call. Two pin_table calls of the same file_paths with the same
-      // chunk_read_limit MUST therefore produce identical chunk_memory_spaces
-      // vectors. Reject any mismatch loudly rather than silently aliasing.
+      // Same-row-count merge MUST preserve per-chunk memory_space alignment
+      // between existing and new entry. The round-robin counter restarts at
+      // chunk 0 → GPU 0 per pin_table call, and chunks at index i across all
+      // columns share a memory_space because they came from the same
+      // chunked_parquet_reader::read_chunk() call. Two pin_table calls of the
+      // same file_paths with the same chunk_read_limit MUST therefore produce
+      // identical chunk_memory_spaces vectors. Reject any mismatch loudly
+      // rather than silently aliasing.
       auto& entry = existing_it->second;
       if (entry.chunk_memory_spaces.size() != chunk_memory_spaces.size()) {
         throw std::runtime_error(

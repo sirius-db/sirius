@@ -568,8 +568,8 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
             input_batch.push_back(
               ports["build"]->repo->get_data_batch_by_id(right_batch_id, partition_idx));
           }
-          // MIXED_JOIN distributes per-partition tasks across GPUs via SCHED-00
-          // (partition_idx % num_gpus). Tag with the partition index so the
+          // MIXED_JOIN distributes per-partition tasks across GPUs by
+          // partition_idx % num_gpus. Tag with the partition index so the
           // scheduler can route by partition.
           return std::make_unique<partitioned_operator_data>(std::move(input_batch),
                                                              partition_idx);
@@ -618,8 +618,8 @@ static join_side_keys_result prepare_join_keys(
   cudf::table_view table = get_cudf_table_view(input_batch);
 
   if (!cast_necessary) {
-    // Phase 12-02: filter key_col_indices to the valid range [0, num_columns())
-    // so a stale index from the SORT-as-HASH_JOIN partitioner doesn't throw
+    // Filter key_col_indices to the valid range [0, num_columns()) so a stale
+    // index from the SORT-as-HASH_JOIN partitioner doesn't throw
     // std::out_of_range from cudf::table_view::select.
     std::vector<cudf::size_type> valid_indices;
     valid_indices.reserve(key_col_indices.size());

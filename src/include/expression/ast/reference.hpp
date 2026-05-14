@@ -25,7 +25,7 @@ namespace sirius::ast {
  * @brief Sirius-native mirror of duckdb::BoundReferenceExpression.
  *
  * Carries an index into the input data batch's column vector. The index is
- * populated by the translator (Phase 4).
+ * populated by the translator.
  */
 struct reference {
   uint32_t column_index{0};

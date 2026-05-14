@@ -55,12 +55,12 @@ absl::AnyInvocable<void() noexcept> gpu_pipeline_executor::get_per_thread_init()
 {
   auto device_id = _memory_space->get_device_id();
   return [device_id]() noexcept {
-    // MGPU-03: per-thread init runs on a worker thread just spawned by the
+    // Per-thread init runs on a worker thread just spawned by the
     // bounded_pool. cudaSetDevice pins this thread to the executor's GPU
-    // context; silent failure would cause every downstream CUDA call on
-    // this thread to land on GPU 0 regardless of device_id. We cannot use
-    // CUCASCADE_CUDA_TRY here because the lambda is noexcept (RESEARCH.md
-    // Pitfall 3) — inline the check instead.
+    // context; silent failure would cause every downstream CUDA call on this
+    // thread to land on GPU 0 regardless of device_id. We cannot use
+    // CUCASCADE_CUDA_TRY here because the lambda is noexcept — inline the
+    // check instead.
     cudaError_t err = cudaSetDevice(device_id);
     if (err != cudaSuccess) {
       spdlog::error("gpu_pipeline_executor per-thread init: cudaSetDevice({}) failed: {}",
@@ -343,14 +343,11 @@ void gpu_pipeline_executor::manager_loop()
         }
 
         if (!query_complete && _task_creator) {
-          // Always schedule consumers explicitly. Pre-merge mgpu task distribution
-          // (test_physical_*_mgpu / mgpu-audit) relies on this to fan tasks out
-          // across GPUs via task_scheduler's SCHED-RR counter — schedule() increments
-          // the counter once per call, and the explicit loop here drives the rotation.
-          // notify_downstream_pipelines() (invoked from mark_task_completed in the
-          // task destructor) also schedules these same consumers, but only when the
-          // pipeline is fully drained; the mgpu test fixtures need rotation to begin
-          // before that point so mid-pipeline task batches reach GPU 1 too.
+          // Schedule consumers explicitly here to drive the scheduler's
+          // round-robin rotation per-batch. notify_downstream_pipelines() in
+          // the task destructor only fires once the pipeline drains —
+          // mid-pipeline batches need to start rotating before that point so
+          // they reach all GPUs.
           for (auto* consumer : consumers) {
             if (consumer) { _task_creator->schedule(consumer); }
           }

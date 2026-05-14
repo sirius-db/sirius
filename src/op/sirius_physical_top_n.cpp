@@ -177,8 +177,8 @@ std::unique_ptr<operator_data> sirius_physical_top_n::execute(const operator_dat
 
   std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
   // STREAM-LINEAGE: compute_top_n_table writes the output table on `stream`;
-  // the constructor records the writer event so cross-device readers honor the
-  // producer-consumer ordering (Phase 13-02 / 13-04 Path-2).
+  // the constructor records the writer event so cross-device readers honor
+  // the producer-consumer ordering.
   auto output_repr =
     std::make_unique<cucascade::gpu_table_representation>(std::move(output_table), *space, stream);
   std::unique_ptr<cucascade::idata_representation> output_data = std::move(output_repr);
@@ -226,11 +226,10 @@ std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operat
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
-  // INVARIANT (SCHED-RR contract): all input batches arrive on target_space
-  // via gpu_pipeline_task::execute_pipeline_task_round ->
+  // INVARIANT: all input batches arrive on target_space via
+  // gpu_pipeline_task::execute_pipeline_task_round ->
   // pipelineable_operator_data::prepare_for_processing -> lock_or_prepare_batch.
   // batches[0]->get_memory_space() == target_space here.
-  // See .planning/phases/15-mgpu-operator-colocation-audit/15-AUDIT-LOG.md.
   cucascade::memory::memory_space* space = nullptr;
   for (auto const& batch : input_batches) {
     space = batch.get_memory_space();
@@ -278,8 +277,7 @@ std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operat
 
   std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
   // STREAM-LINEAGE: compute_top_n_table + slice write on `stream`; the
-  // constructor records the writer event for downstream cross-device readers
-  // (Phase 13-02 / 13-04 Path-2).
+  // constructor records the writer event for downstream cross-device readers.
   auto output_repr =
     std::make_unique<cucascade::gpu_table_representation>(std::move(output_table), *space, stream);
   std::unique_ptr<cucascade::idata_representation> output_data = std::move(output_repr);

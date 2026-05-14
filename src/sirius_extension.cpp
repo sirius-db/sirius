@@ -71,14 +71,14 @@ extern "C" int cudaProfilerStop();
 #include "sirius_interface.hpp"
 #include "util/segfault_backtrace.hpp"
 
-// Phase 22.1 D-05 (Plan 22.1-04): PinTableFunction routes parquet reads
-// through the per-GPU sirius_ioctx instead of cudf's bundled file_source
-// factory (which uses kvikio internally and binds to a single CUDA context).
+// PinTableFunction routes parquet reads through the per-GPU sirius_ioctx
+// instead of cudf's bundled file_source factory (which uses kvikio internally
+// and binds to a single CUDA context).
 //
-// Phase 19 IO-15 ordering rule: include uring_reactor LAST among sirius
-// headers — liburing.h transitively pulled by uring_reactor.hpp defines a
-// BLOCK_SIZE preprocessor macro that collides with the BLOCK_SIZE static
-// member in <blockingconcurrentqueue.h> (used by spdlog / pipeline / duckdb
+// Ordering rule: include uring_reactor LAST among sirius headers — liburing.h
+// transitively pulled by uring_reactor.hpp defines a BLOCK_SIZE preprocessor
+// macro that collides with the BLOCK_SIZE static member in
+// <blockingconcurrentqueue.h> (used by spdlog / pipeline / duckdb
 // connection_manager). All consumers of blockingconcurrentqueue.h must
 // precede this include.
 #include "io/types.hpp"               // sirius::io::sirius_ioctx
@@ -759,13 +759,13 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     throw InvalidInputException("pin_table requires the Sirius context to be initialized");
   }
 
-  // Phase 22 PIN-MGPU-01 (D-01/D-02/D-05): the cudf reader places parquet
-  // chunks on whichever GPU is current at read_chunk() time; round-robin the
-  // file reads across all GPU memory spaces so multi-file pin_table calls
-  // distribute their chunks evenly. Each file's chunks all bind to the same
-  // GPU (per-file binding — see comment at chunk_idx increment below).
-  // For tier='host' we additionally convert each table to a host_data_representation
-  // (via the GPU↔HOST converter) so the pinned data lives in pinned host memory.
+  // The cudf reader places parquet chunks on whichever GPU is current at
+  // read_chunk() time; round-robin the file reads across all GPU memory spaces
+  // so multi-file pin_table calls distribute their chunks evenly. Each file's
+  // chunks all bind to the same GPU (per-file binding — see comment at
+  // chunk_idx increment below). For tier='host' we additionally convert each
+  // table to a host_data_representation (via the GPU↔HOST converter) so the
+  // pinned data lives in pinned host memory.
   auto& memory_manager = sirius_ctx->get_memory_manager();
   auto gpu_spaces      = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   if (gpu_spaces.empty()) {
@@ -818,17 +818,17 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   // chunk_read_limit bytes. The optional n_rows budget caps the cumulative row count
   // across files; once exhausted, stop early.
   std::vector<std::unique_ptr<cudf::table>> tables;
-  // Phase 22 PIN-MGPU-01 (D-03): parallel vector to tables — chunk_memory_spaces[i]
-  // is the memory_space* for the i-th cudf::table in tables. Consumed by
-  // insert_pinned_entry's precondition check (size==data_tables.size).
+  // Parallel vector to tables — chunk_memory_spaces[i] is the memory_space*
+  // for the i-th cudf::table in tables. Consumed by insert_pinned_entry's
+  // precondition check (size==data_tables.size).
   std::vector<cucascade::memory::memory_space*> chunk_memory_spaces;
   // HOST-tier storage: one host_data_representation per chunk.
   std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;
   std::vector<std::string> read_column_names;  // captured from parquet metadata
   int64_t remaining_rows = data.args.n_rows.value_or(-1);
-  // Phase 22 D-02: per-call local counter (NOT std::atomic, NOT global).
-  // PinTableFunction is single-threaded; new pin_table calls restart at chunk
-  // 0 → GPU 0 for reproducibility (D-02 lock).
+  // Per-call local counter (NOT std::atomic, NOT global). PinTableFunction is
+  // single-threaded; new pin_table calls restart at chunk 0 → GPU 0 for
+  // reproducibility.
   std::size_t chunk_idx = 0;
 
   // For tier='host' the full table may not fit in GPU memory, so each batch is downgraded
@@ -847,29 +847,27 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   for (auto const& path : file_paths) {
     if (data.args.n_rows.has_value() && remaining_rows <= 0) { break; }
 
-    // Phase 22 D-05: bind device BEFORE constructing chunked_parquet_reader so
-    // the cudf allocator places footer + decompress + column buffers on the
-    // intended GPU. Pitfall 2 closure.
+    // Bind device BEFORE constructing chunked_parquet_reader so the cudf
+    // allocator places footer + decompress + column buffers on the intended
+    // GPU.
     auto* target_space = const_cast<cucascade::memory::memory_space*>(
       gpu_spaces[chunk_idx % gpu_spaces.size()]);
     int target_gpu_id = target_space->get_device_id();
     rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{target_gpu_id}};
 
-    // Phase 22.1 D-05 (Plan 22.1-04): route the chunked_parquet_reader through
-    // the per-GPU sirius_ioctx instead of cudf's bundled file_source factory
-    // (kvikio). The pre-22.1 string-form source_info routed reads through
-    // libkvikio's FileHandle which binds a single CUDA context per file,
-    // breaking multi-GPU residency (the columns end up on the wrong GPU under
-    // sanitizer races; see 22.1-CONTEXT.md "Why kvikio breaks multi-GPU").
+    // Route the chunked_parquet_reader through the per-GPU sirius_ioctx
+    // instead of cudf's bundled file_source factory (kvikio). The string-form
+    // source_info routes reads through libkvikio's FileHandle which binds a
+    // single CUDA context per file, breaking multi-GPU residency (the columns
+    // end up on the wrong GPU under sanitizer races).
     auto target_ioctx = sirius_ctx->get_ioctx_for(target_gpu_id);
     if (!target_ioctx) {
       throw InvalidInputException(
-        "pin_table: no sirius_ioctx for target GPU " + std::to_string(target_gpu_id) +
-        " (Phase 22.1 D-05).");
+        "pin_table: no sirius_ioctx for target GPU " + std::to_string(target_gpu_id) + ".");
     }
     // Lifetime: io_object MUST outlive datasource MUST outlive reader.
-    // Declared in this order so reverse-destruction order (Pitfall 5)
-    // tears them down safely at end of loop iteration.
+    // Declared in this order so reverse-destruction order tears them down
+    // safely at end of loop iteration.
     auto io_object  = std::make_shared<sirius::io::uring_io_object>(path);
     auto datasource = target_ioctx->make_datasource(io_object);
 
@@ -902,14 +900,13 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
         host_chunks.emplace_back(std::move(host_repr));
       } else {
         tables.emplace_back(std::move(chunk.tbl));
-        chunk_memory_spaces.push_back(target_space);  // parallel to tables (D-03)
+        chunk_memory_spaces.push_back(target_space);  // parallel to tables
       }
     }
     if (data.args.n_rows.has_value()) { remaining_rows -= file_rows_read; }
-    // Phase 22 PIN-MGPU-01 (D-01/D-02): per-call local counter, increments
-    // per file. All chunks within a single chunked_parquet_reader stay on
-    // the same GPU (per D-03 chunks-at-index-i invariant). Cross-file
-    // alternation produces the round-robin.
+    // Per-call local counter, increments per file. All chunks within a single
+    // chunked_parquet_reader stay on the same GPU (chunks-at-index-i
+    // invariant). Cross-file alternation produces the round-robin.
     ++chunk_idx;
   }
 
