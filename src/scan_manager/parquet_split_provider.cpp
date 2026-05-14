@@ -23,6 +23,7 @@
 #include "op/scan/parquet_scan_operator_data.hpp"
 #include "op/scan/parquet_schema_mapping.hpp"
 #include "op/scan/scan_utils.hpp"
+#include "scan_manager/parquet_metadata.hpp"
 
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/parquet.hpp>
@@ -225,14 +226,37 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     } else {
       datasource = cudf::io::datasource::create(file_path);
     }
-    auto footer_buffer = cudf::io::parquet::fetch_footer_to_host(*datasource);
 
-    //===----------Parse metadata----------===//
-    op::scan::hybrid_scan_reader reader(
-      cudf::host_span<uint8_t const>(footer_buffer->data(), footer_buffer->size()),
-      *reader_options);
-    auto file_metadata =
-      std::make_shared<cudf::io::parquet::FileMetaData const>(reader.parquet_metadata());
+    //===----------Parse metadata (with prefetch-cache reuse)----------===//
+    // If the prefetching cache already has a parquet_metadata entry for this
+    // file (from a previous scan of the same path in this session), reuse the
+    // parsed FileMetaData and skip the footer fetch.  Otherwise fetch + parse
+    // and stash the result on the cache below.
+    std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
+    std::shared_ptr<parquet_metadata> cached_parquet_metadata;
+    std::size_t footer_byte_len = 0;
+    std::unique_ptr<op::scan::hybrid_scan_reader> reader_ptr;
+
+    if (file_io_object && _io_ctx != nullptr && _io_ctx->cache() != nullptr) {
+      if (auto cached = _io_ctx->cache()->get_metadata(*file_io_object)) {
+        cached_parquet_metadata = std::dynamic_pointer_cast<parquet_metadata>(std::move(cached));
+      }
+    }
+
+    if (cached_parquet_metadata) {
+      file_metadata   = cached_parquet_metadata->file_metadata();
+      footer_byte_len = cached_parquet_metadata->footer_byte_len();
+      reader_ptr = std::make_unique<op::scan::hybrid_scan_reader>(*file_metadata, *reader_options);
+    } else {
+      auto footer_buffer = cudf::io::parquet::fetch_footer_to_host(*datasource);
+      footer_byte_len    = footer_buffer->size();
+      reader_ptr         = std::make_unique<op::scan::hybrid_scan_reader>(
+        cudf::host_span<uint8_t const>(footer_buffer->data(), footer_buffer->size()),
+        *reader_options);
+      file_metadata =
+        std::make_shared<cudf::io::parquet::FileMetaData const>(reader_ptr->parquet_metadata());
+    }
+    auto& reader         = *reader_ptr;
     auto const& metadata = *file_metadata;
 
     //===----------Resolve selected DuckDB columns to parquet column chunk indices----------===//
@@ -319,13 +343,13 @@ void parquet_split_provider::run_batch(file_batch const& batch,
       }
 
       // footer_offset / footer_size mirror parquet_scan_task's computation:
-      // the trailer is 8 bytes (4 footer_len + 4 magic) and footer_buffer
-      // returns the footer body alone.
+      // the trailer is 8 bytes (4 footer_len + 4 magic) and the footer body
+      // length (excluding the trailer) is recorded on parquet_metadata so we
+      // don't need the original footer buffer to recompute the range.
       constexpr std::size_t FOOTER_TAIL_SIZE = 8;
       auto const file_size                   = file_io_object->size();
-      auto const footer_len                  = footer_buffer->size();
-      auto const footer_off  = static_cast<int64_t>(file_size - FOOTER_TAIL_SIZE - footer_len);
-      auto const footer_size = static_cast<int64_t>(FOOTER_TAIL_SIZE + footer_len);
+      auto const footer_off  = static_cast<int64_t>(file_size - FOOTER_TAIL_SIZE - footer_byte_len);
+      auto const footer_size = static_cast<int64_t>(FOOTER_TAIL_SIZE + footer_byte_len);
 
       std::vector<range_t> ranges;
       ranges.reserve(merged.size() + 2);
@@ -339,7 +363,16 @@ void parquet_split_provider::run_batch(file_batch const& batch,
         return a.offset() < b.offset();
       });
 
-      _io_ctx->cache()->insert(*file_io_object, /*metadata=*/nullptr, ranges);
+      // When the cache already had parquet_metadata for this file we reused it
+      // and don't need to re-store it; otherwise we just parsed the footer and
+      // hand the freshly-built parquet_metadata to the cache so the next scan
+      // of this file can skip the footer fetch.
+      std::shared_ptr<sirius::io::sirius_io_object_metadata> metadata_to_store =
+        cached_parquet_metadata
+          ? nullptr
+          : std::static_pointer_cast<sirius::io::sirius_io_object_metadata>(
+              std::make_shared<parquet_metadata>(file_metadata, footer_byte_len));
+      _io_ctx->cache()->insert(*file_io_object, std::move(metadata_to_store), ranges);
     }
 
     std::vector<cudf::size_type> cur_rgs;

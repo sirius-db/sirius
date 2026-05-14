@@ -403,7 +403,10 @@ void prefetching_cache::insert(sirius_io_object& obj,
 
   file.io_obj    = obj_sp;
   file.file_size = file_size;
-  file.metadata  = std::move(metadata);
+  // A nullptr @p metadata means "no new metadata to store" — preserve whatever
+  // a previous insert() left in place so callers can skip re-supplying it on
+  // every prefetch insert.
+  if (metadata) { file.metadata = std::move(metadata); }
 
   // Every range in the insert becomes a prefetch request, regardless of the
   // entry's current state.  The worker decides at dispatch time whether the
@@ -592,6 +595,20 @@ std::vector<pinned_view> prefetching_cache::read_ranges(
     result.push_back(std::move(view));
   }
   return result;
+}
+
+std::shared_ptr<sirius_io_object_metadata> prefetching_cache::get_metadata(
+  const sirius_io_object& obj) const
+{
+  auto const& key = obj.raw_file_cache_id();
+
+  std::shared_lock map_lk(_map_mtx);
+  auto it = _file_cache.find(key);
+  if (it == _file_cache.end()) { return nullptr; }
+  auto& file = *it->second;
+
+  std::shared_lock file_lk(file.mtx);
+  return file.metadata;
 }
 
 void prefetching_cache::refresh_cache()

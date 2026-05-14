@@ -469,6 +469,11 @@ class prefetching_cache {
   /// @c shared_from_this() so the underlying file handles stay open
   /// until all pending prefetch work for this file has completed.
   /// @p obj must already be owned by a @c std::shared_ptr.
+  ///
+  /// @p metadata is optional: a non-null pointer overwrites any previously
+  /// stored metadata for this file's cache key, while a null pointer leaves
+  /// the existing entry untouched.  This lets repeat callers re-trigger
+  /// prefetch without having to re-supply (or re-parse) the metadata.
   void insert(sirius_io_object& obj,
               std::shared_ptr<sirius_io_object_metadata> metadata,
               const std::vector<cudf::io::text::byte_range_info>& ranges);
@@ -490,6 +495,15 @@ class prefetching_cache {
     const sirius_io_object& obj,
     const std::vector<cudf::io::text::byte_range_info>& ranges,
     cudaStream_t stream);
+
+  /// Look up the metadata that a previous insert() stored for @p obj.
+  /// Returns nullptr if no entry exists for the object's cache key or no
+  /// metadata was supplied on insert.  Callers that want to skip re-parsing
+  /// a parquet footer (or other backend-specific metadata) check this
+  /// before doing the parse and then call insert() with a freshly-built
+  /// metadata object on a miss.
+  [[nodiscard]] std::shared_ptr<sirius_io_object_metadata> get_metadata(
+    const sirius_io_object& obj) const;
 
   /// Increment _cache_age by 1.  The evictor uses
   /// (n_total_read_request - _cache_age) to score entries into buckets.
