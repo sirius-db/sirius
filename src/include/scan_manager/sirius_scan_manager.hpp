@@ -62,7 +62,7 @@ namespace sirius::scan_manager {
  */
 struct scan_manager_config {
   exec::thread_pool_config thread_pool{.num_threads = 8, .thread_name_prefix = "scan_manager"};
-  bool use_sirius_datasource{true};
+  bool use_sirius_datasource{false};
   /// Number of @c uring_reactor instances in the ioctx pool.  Ignored when
   /// @c use_sirius_datasource is false.
   std::size_t uring_n_reactors{4};

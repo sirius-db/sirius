@@ -17,6 +17,7 @@
 #pragma once
 
 #include "io/io_context.hpp"
+#include "io/prefetching_cache.hpp"
 #include "io/sirius_datasource.hpp"
 
 #include <rmm/device_buffer.hpp>
@@ -120,10 +121,20 @@ class templated_ioctx : public sirius_ioctx {
       _reactors.emplace_back(factory());
   }
 
+  ~templated_ioctx() override
+  {
+    // sirius_ioctx owns the cache in the base class, which would normally be
+    // destroyed after this derived class's reactor pool. Stop the cache first
+    // so its worker cannot enqueue into reactors while they are shutting down.
+    _cache.reset();
+    shutdown();
+  }
+
   void shutdown() override
   {
-    for (auto& r : _reactors)
+    for (auto& r : _reactors) {
       r->shutdown();
+    }
   }
 
   std::unique_ptr<cudf::io::datasource> make_datasource(

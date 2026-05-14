@@ -336,10 +336,7 @@ void SiriusContext::terminate()
 
   task_scheduler_->stop();
   task_scheduler_.reset();
-  if (scan_manager_) {
-    scan_manager_->stop();
-    scan_manager_->reset();
-  }
+  if (scan_manager_) { scan_manager_->stop(); }
   task_creator_->stop_thread_pool();
   task_creator_.reset();
   for (auto& executor : downgrade_executors_) {
@@ -353,6 +350,15 @@ void SiriusContext::terminate()
   // sync, the subsequent cudaFreeHost inside the memory manager destructor
   // can deadlock against a new cudaHostAlloc from the next SiriusContext.
   cudaDeviceSynchronize();
+
+  // The scan manager owns the sirius_ioctx, prefetch buffer_pool, pinned-table
+  // entries, and cached parquet columns. All of those are backed by memory
+  // resources owned by memory_manager_, so the manager must be destroyed before
+  // memory_manager_->shutdown()/reset().
+  scan_manager_.reset();
+
+  // Drop any remaining repositories while the memory manager is still alive.
+  data_repository_manager_.reset();
 
   // Restore the previous cuDF pinned memory resource and threshold before destroying the
   // slab allocator — cuDF holds a non-owning reference and would dangle after reset().

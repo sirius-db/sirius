@@ -200,12 +200,48 @@ class entry_state {
     _packed.notify_all();
   }
 
+  /// loading → cached using CAS.  Returns false if shutdown or another
+  /// completion path already moved the entry out of loading.
+  bool try_mark_cached() noexcept
+  {
+    auto expected = pack(loading, 0);
+    bool ok = _packed.compare_exchange_strong(expected, pack(cached, 0), std::memory_order_acq_rel);
+    if (ok) { _packed.notify_all(); }
+    return ok;
+  }
+
   /// loading → empty.  IO failed, chunks already freed by caller.
   /// Wakes any readers parked in @c wait_while_loading().
   void mark_load_failed() noexcept
   {
     _packed.store(pack(empty, 0), std::memory_order_release);
     _packed.notify_all();
+  }
+
+  /// loading → empty using CAS.  Returns false if the entry was already
+  /// resolved or aborted.
+  bool try_mark_load_failed() noexcept
+  {
+    auto expected = pack(loading, 0);
+    bool ok = _packed.compare_exchange_strong(expected, pack(empty, 0), std::memory_order_acq_rel);
+    if (ok) { _packed.notify_all(); }
+    return ok;
+  }
+
+  /// (queued | loading) → empty. Used during cache shutdown to wake readers
+  /// that are parked on a background load that may never complete.
+  bool try_abort_pending() noexcept
+  {
+    uint32_t cur = _packed.load(std::memory_order_acquire);
+    while (true) {
+      auto st = unpack_state(cur);
+      if (st != queued && st != loading) return false;
+      if (_packed.compare_exchange_weak(
+            cur, pack(empty, 0), std::memory_order_acq_rel, std::memory_order_acquire)) {
+        _packed.notify_all();
+        return true;
+      }
+    }
   }
 
   /// Block while state == loading.  Returns when the state transitions
@@ -542,6 +578,7 @@ class prefetching_cache {
   void worker_loop(std::stop_token stop);
   void evictor_loop(std::stop_token stop);
   void enqueue_work(work_item item);
+  void abort_pending_entries() noexcept;
 
   /// Release all chunks held by an entry back to the pool.
   void release_chunks(cache_entry& entry);

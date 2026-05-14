@@ -314,8 +314,22 @@ prefetching_cache::~prefetching_cache()
   _worker_thread.request_stop();
   _evictor_thread.request_stop();
   _work_seq.fetch_add(1, std::memory_order_release);
-  _work_seq.notify_one();
+  _work_seq.notify_all();
   _request_sem.release();
+
+  // Wake readers waiting on entries that were loading when shutdown began.
+  // Outstanding backend requests may still resolve via their request_context
+  // safety net, but waiters should not depend on that happening.
+  abort_pending_entries();
+
+  // Join explicitly so all cache-owned queues and counters outlive the worker
+  // and evictor loops. std::jthread would join during member destruction, but
+  // doing it here lets us abort any entries that raced into loading just before
+  // the worker observed stop.
+  if (_worker_thread.joinable()) { _worker_thread.join(); }
+  if (_evictor_thread.joinable()) { _evictor_thread.join(); }
+
+  abort_pending_entries();
 }
 
 void prefetching_cache::enqueue_work(work_item item)
@@ -330,6 +344,22 @@ void prefetching_cache::release_chunks(cache_entry& entry)
   for (auto* p : entry.chunks)
     _pool.deallocate(p);
   entry.chunks.clear();
+}
+
+void prefetching_cache::abort_pending_entries() noexcept
+{
+  try {
+    std::shared_lock map_lk(_map_mtx);
+    for (auto const& [_, file_ptr] : _file_cache) {
+      if (!file_ptr) { continue; }
+      std::shared_lock file_lk(file_ptr->mtx);
+      for (auto const& entry : file_ptr->entries) {
+        if (entry) { entry->state.try_abort_pending(); }
+      }
+    }
+  } catch (...) {
+    // Destructors must not throw; best effort wake-up only.
+  }
 }
 
 // ===========================================================================
@@ -877,6 +907,15 @@ void prefetching_cache::evictor_loop(std::stop_token stop)
         std::make_exception_ptr(std::runtime_error("eviction aborted — cache shutting down")));
     }
   }
+
+  // A worker may be blocked in fut.get() after enqueueing a request while the
+  // stop token is already set. Drain anything the loop did not pick up and
+  // resolve it with an exception so the worker can exit.
+  eviction_request req;
+  while (_request_queue.try_dequeue(req)) {
+    req.promise.set_exception(
+      std::make_exception_ptr(std::runtime_error("eviction aborted — cache shutting down")));
+  }
 }
 
 // ===========================================================================
@@ -1024,11 +1063,12 @@ void prefetching_cache::worker_loop(std::stop_token stop)
 
     {
       auto& obj_ref = *item.io_obj;
+      auto* pool    = &_pool;
       _io_ctx->host_read_ranges_async_io(
         obj_ref,
         io_ranges,
         io_dsts,
-        [this,
+        [pool,
          batch  = std::move(batch),
          slot   = std::move(slot_holder),
          io_obj = std::move(item.io_obj),
@@ -1040,12 +1080,14 @@ void prefetching_cache::worker_loop(std::stop_token stop)
               spdlog::error("prefetching_cache: IO failed for {}: {}", key, ex.what());
             }
             for (auto const& e : batch) {
-              release_chunks(*e);
-              e->state.mark_load_failed();
+              for (auto* p : e->chunks)
+                pool->deallocate(p);
+              e->chunks.clear();
+              e->state.try_mark_load_failed();
             }
           } else {
             for (auto const& e : batch)
-              e->state.mark_cached();
+              e->state.try_mark_cached();
           }
           // `slot` and `io_obj` destruct here — budget is returned to
           // admission_control, and the file handle is released only
