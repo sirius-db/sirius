@@ -16,6 +16,7 @@
 
 #include "creator/task_creator.hpp"
 
+#include "cucascade/memory/common.hpp"
 #include "log/logging.hpp"
 #include "op/scan/cpu_source_task.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
@@ -33,6 +34,7 @@
 #include <duckdb/execution/execution_context.hpp>
 #include <duckdb/parallel/thread_context.hpp>
 
+#include <limits>
 #include <optional>
 
 namespace sirius::creator {
@@ -344,14 +346,17 @@ void task_creator::manager_loop()
 
         } else {
           // Create all possible tasks until all ports are empty
-          while (!node->all_ports_empty()) {
+          auto is_gpu_parquet_scan = node->type == op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN;
+          std::size_t count = is_gpu_parquet_scan ? 1 : std::numeric_limits<std::size_t>::max();
+          // need to exhaust input batches until all ports are empty
+          while (!node->all_ports_empty() && count-- > 0) {
             auto task_lock  = pipeline->get_task_creation_lock();
             auto input_data = node->get_next_task_input_data();
             auto* pipelineable_input =
               dynamic_cast<op::pipelineable_operator_data*>(input_data.get());
             if (!input_data ||
                 (pipelineable_input && pipelineable_input->get_data_batches().empty())) {
-              // do data to create task for
+              // no data to create task for
               break;
             }
 

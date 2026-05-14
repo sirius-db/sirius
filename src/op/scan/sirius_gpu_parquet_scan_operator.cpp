@@ -92,10 +92,7 @@ std::optional<task_creation_hint> sirius_gpu_parquet_scan_operator::get_next_tas
   return task_creation_hint{TaskCreationHint::READY, this};
 }
 
-bool sirius_gpu_parquet_scan_operator::all_ports_empty()
-{
-  return _split_connector->is_closed() && !_split_connector->has_more_splits();
-}
+bool sirius_gpu_parquet_scan_operator::all_ports_empty() { return _split_connector->is_closed(); }
 
 std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::get_next_task_input_data()
 {
@@ -123,7 +120,14 @@ std::unique_ptr<cudf::table> sirius_gpu_parquet_scan_operator::read_table_from_m
   rg_per_src.reserve(scan_data.rg_slices.size());
 
   for (auto const& slice : scan_data.rg_slices) {
-    sources.push_back(cudf::io::datasource::create(slice.file_path));
+    if (slice.io_ctx && slice.io_object) {
+      // sirius path: reuse the io_object minted by the split provider so the
+      // prefetching cache (if enabled) can serve these reads from pinned memory.
+      sources.push_back(slice.io_ctx->make_datasource(slice.io_object));
+    } else {
+      // Fallback when scan_manager was configured with use_sirius_datasource=false.
+      sources.push_back(cudf::io::datasource::create(slice.file_path));
+    }
     metadatas.push_back(*slice.file_metadata);  // copy unavoidable: cudf takes by value
     rg_per_src.push_back(slice.row_group_indices);
   }

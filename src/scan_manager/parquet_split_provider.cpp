@@ -16,13 +16,13 @@
 
 #include "scan_manager/parquet_split_provider.hpp"
 
-#include "exec/thread_pool.hpp"
 #include "expression_executor/gpu_expression_translator_internal.hpp"
+#include "io/io_context.hpp"
+#include "io/prefetching_cache.hpp"
 #include "log/logging.hpp"
 #include "op/scan/parquet_scan_operator_data.hpp"
 #include "op/scan/parquet_schema_mapping.hpp"
 #include "op/scan/scan_utils.hpp"
-#include "scan_manager/split_connector.hpp"
 
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/parquet.hpp>
@@ -34,13 +34,11 @@
 #include <duckdb/common/hive_partitioning.hpp>
 
 #include <algorithm>
-#include <atomic>
-#include <exception>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace sirius::scan_manager {
 
@@ -68,11 +66,13 @@ parquet_split_provider::parquet_split_provider(
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filter_set,
   duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
   std::size_t approximate_batch_size,
-  std::size_t max_file_processed)
+  std::size_t max_file_processed,
+  std::shared_ptr<sirius::io::sirius_ioctx> io_ctx)
   : _file_paths(file_paths),
     _approximate_batch_size(approximate_batch_size),
     _max_file_processed(max_file_processed),
-    _total_files(file_paths.size())
+    _total_files(file_paths.size()),
+    _io_ctx(std::move(io_ctx))
 {
   // Any non-trivial scan shape — reader-side projection, filter pushdown, or hive-partition
   // injection — needs column names for reader set_column_names / AST name resolution /
@@ -102,87 +102,45 @@ parquet_split_provider::parquet_split_provider(
                                               _plan->partition_primary_indices);
     if (duckdb_expression) { _duckdb_filter_expression = std::move(duckdb_expression); }
   }
+
+  // Pre-decompose the file list into per-task batches once; next_split_provider() iterates this
+  // list one batch at a time and hands each claimed batch to a worker for parallel processing.
+  for (std::size_t start = 0; start < _total_files; start += _max_file_processed) {
+    auto const end = std::min(start + _max_file_processed, _total_files);
+    file_batch batch;
+    batch.file_paths.assign(_file_paths.begin() + static_cast<std::ptrdiff_t>(start),
+                            _file_paths.begin() + static_cast<std::ptrdiff_t>(end));
+    _batches.push_back(std::move(batch));
+  }
 }
 
 parquet_split_provider::~parquet_split_provider() = default;
 
-std::optional<parquet_split_provider::file_batch> parquet_split_provider::next_task_input()
+bool parquet_split_provider::has_more_splits() const
 {
-  if (_next_file_idx >= _total_files) { return std::nullopt; }
-  auto const start = _next_file_idx;
-  auto const end   = std::min(start + _max_file_processed, _total_files);
-  _next_file_idx   = end;
-
-  file_batch batch;
-  batch.file_paths.assign(_file_paths.begin() + static_cast<std::ptrdiff_t>(start),
-                          _file_paths.begin() + static_cast<std::ptrdiff_t>(end));
-  return batch;
+  return _next_batch_idx.load(std::memory_order_relaxed) < _batches.size();
 }
 
-std::future<void> parquet_split_provider::start(exec::thread_pool& pool, split_connector& connector)
+std::function<std::vector<std::unique_ptr<op::operator_data>>()>
+parquet_split_provider::next_split_provider()
 {
-  // Drain all batches up-front so we can size the remaining-task counter
-  // precisely; the connector closes when the last batch lands.
-  std::vector<file_batch> batches;
-  while (auto next = next_task_input()) {
-    batches.push_back(std::move(*next));
-  }
-
-  auto promise = std::make_shared<std::promise<void>>();
-  auto future  = promise->get_future();
-
-  if (batches.empty()) {
-    connector.close();
-    promise->set_value();
-    return future;
-  }
-
-  auto remaining   = std::make_shared<std::atomic<std::size_t>>(batches.size());
-  auto first_error = std::make_shared<std::atomic<bool>>(false);
-  auto error_ptr   = std::make_shared<std::exception_ptr>();
-  auto error_mutex = std::make_shared<std::mutex>();
-
-  for (auto& batch : batches) {
-    pool.schedule([this,
-                   batch = std::move(batch),
-                   &connector,
-                   remaining,
-                   promise,
-                   first_error,
-                   error_ptr,
-                   error_mutex]() {
-      try {
-        run_batch(batch, connector);
-      } catch (const std::exception& e) {
-        SIRIUS_LOG_ERROR("[parquet_split_provider] metadata scan task failed: {}", e.what());
-        bool expected = false;
-        if (first_error->compare_exchange_strong(expected, true)) {
-          std::lock_guard<std::mutex> lock(*error_mutex);
-          *error_ptr = std::current_exception();
-        }
-      } catch (...) {
-        SIRIUS_LOG_ERROR("[parquet_split_provider] metadata scan task failed (unknown)");
-        bool expected = false;
-        if (first_error->compare_exchange_strong(expected, true)) {
-          std::lock_guard<std::mutex> lock(*error_mutex);
-          *error_ptr = std::current_exception();
-        }
-      }
-      if (remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        connector.close();
-        if (first_error->load(std::memory_order_acquire)) {
-          std::lock_guard<std::mutex> lock(*error_mutex);
-          promise->set_exception(*error_ptr);
-        } else {
-          promise->set_value();
-        }
-      }
-    });
-  }
-  return future;
+  // Atomic claim happens here so the (expensive) run_batch work captured
+  // below can run in parallel on a worker pool — distinct callables operate
+  // on distinct batch indices. fetch_add can briefly observe an index past
+  // the end (when more workers run than batches); returning null in that
+  // case signals "no work claimed" without forcing the caller to invoke a
+  // dummy callable.
+  auto const batch_idx = _next_batch_idx.fetch_add(1, std::memory_order_relaxed);
+  if (batch_idx >= _batches.size()) { return nullptr; }
+  return [this, batch_idx]() {
+    std::vector<std::unique_ptr<op::operator_data>> out;
+    run_batch(_batches[batch_idx], out);
+    return out;
+  };
 }
 
-void parquet_split_provider::run_batch(file_batch const& batch, split_connector& connector)
+void parquet_split_provider::run_batch(file_batch const& batch,
+                                       std::vector<std::unique_ptr<op::operator_data>>& out)
 {
   auto stream = cudf::get_default_stream();
 
@@ -220,12 +178,12 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
 
   // Loop over files to read footers, parse metadata, and compute row-group partitions.
   rg_accumulator accum;
-  // flush() pushes the bundled slices but does NOT reset partition_values. The file loop owns
-  // partition_values and re-seeds it on every file iteration; clearing it here would orphan the
-  // post-flush tail of a mid-file overflow.
+  // flush() appends the bundled slices to `out` but does NOT reset partition_values. The file
+  // loop owns partition_values and re-seeds it on every file iteration; clearing it here would
+  // orphan the post-flush tail of a mid-file overflow.
   auto flush = [&]() {
     if (accum.slices.empty()) { return; }
-    connector.push_split(std::make_unique<op::scan::parquet_scan_data>(
+    out.push_back(std::make_unique<op::scan::parquet_scan_data>(
       std::move(accum.slices),
       reader_options,
       _duckdb_filter_expression,
@@ -255,7 +213,18 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
     }
 
     //===----------Read metadata footers----------===//
-    auto datasource    = cudf::io::datasource::create(file_path);
+    // When the manager exposes a sirius_ioctx, mint an io_object up-front and
+    // route the footer fetch through sirius_datasource so the same io_object
+    // can be threaded onto every emitted row_group_slice.  Falls through to
+    // cudf's path when the manager was configured with use_sirius_datasource=false.
+    std::shared_ptr<sirius::io::sirius_io_object> file_io_object;
+    std::unique_ptr<cudf::io::datasource> datasource;
+    if (_io_ctx != nullptr) {
+      file_io_object = _io_ctx->create_io_object(file_path);
+      datasource     = _io_ctx->make_datasource(file_io_object);
+    } else {
+      datasource = cudf::io::datasource::create(file_path);
+    }
     auto footer_buffer = cudf::io::parquet::fetch_footer_to_host(*datasource);
 
     //===----------Parse metadata----------===//
@@ -313,14 +282,79 @@ void parquet_split_provider::run_batch(file_batch const& batch, split_connector&
       // clang-format on
     }
 
+    //===----------Prefetch cache prewarm----------===//
+    // When the ioctx has a cache, hand it the exact byte ranges scan_task
+    // will request: PAR1 header + (merged) column-chunk ranges for every
+    // surviving row group + footer/trailer.  insert() must use the same
+    // merged ranges scan_task computes — the cache only serves reads that
+    // are fully covered by an inserted range.
+    if (file_io_object && _io_ctx != nullptr && _io_ctx->cache() != nullptr &&
+        !row_group_indices.empty()) {
+      using range_t = cudf::io::text::byte_range_info;
+
+      auto chunk_ranges = reader.all_column_chunks_byte_ranges(row_group_indices, *reader_options);
+
+      // Inline merge: parquet_scan_task::detail::merge_byte_ranges is TU-local;
+      // duplicating the ~10-line walk avoids cross-component coupling.
+      std::sort(chunk_ranges.begin(), chunk_ranges.end(), [](auto const& a, auto const& b) {
+        return a.offset() < b.offset();
+      });
+      std::vector<range_t> merged;
+      merged.reserve(chunk_ranges.size());
+      if (!chunk_ranges.empty()) {
+        auto cur_start = chunk_ranges[0].offset();
+        auto cur_end   = cur_start + chunk_ranges[0].size();
+        for (auto const& r : chunk_ranges) {
+          auto const rs = r.offset();
+          auto const re = rs + r.size();
+          if (rs <= cur_end) {
+            cur_end = std::max(cur_end, re);
+          } else {
+            merged.emplace_back(cur_start, cur_end - cur_start);
+            cur_start = rs;
+            cur_end   = re;
+          }
+        }
+        merged.emplace_back(cur_start, cur_end - cur_start);
+      }
+
+      // footer_offset / footer_size mirror parquet_scan_task's computation:
+      // the trailer is 8 bytes (4 footer_len + 4 magic) and footer_buffer
+      // returns the footer body alone.
+      constexpr std::size_t FOOTER_TAIL_SIZE = 8;
+      auto const file_size                   = file_io_object->size();
+      auto const footer_len                  = footer_buffer->size();
+      auto const footer_off  = static_cast<int64_t>(file_size - FOOTER_TAIL_SIZE - footer_len);
+      auto const footer_size = static_cast<int64_t>(FOOTER_TAIL_SIZE + footer_len);
+
+      std::vector<range_t> ranges;
+      ranges.reserve(merged.size() + 2);
+      ranges.emplace_back(0, 4);  // PAR1 header
+      ranges.insert(ranges.end(), merged.begin(), merged.end());
+      ranges.emplace_back(footer_off, footer_size);
+      // Cache requires sorted-by-offset.  Header is at 0, footer is at file end,
+      // and merged column chunks live in between — a defensive sort handles any
+      // pathological layout where a column chunk starts before the header.
+      std::sort(ranges.begin(), ranges.end(), [](auto const& a, auto const& b) {
+        return a.offset() < b.offset();
+      });
+
+      _io_ctx->cache()->insert(*file_io_object, /*metadata=*/nullptr, ranges);
+    }
+
     std::vector<cudf::size_type> cur_rgs;
     std::size_t cur_uncompressed_bytes = 0;
     std::size_t cur_compressed_bytes   = 0;
 
     auto seal_current_file = [&]() {
       if (cur_rgs.empty()) { return; }
-      accum.slices.emplace_back(
-        file_metadata, file_path, std::move(cur_rgs), cur_uncompressed_bytes, cur_compressed_bytes);
+      accum.slices.emplace_back(file_metadata,
+                                file_path,
+                                std::move(cur_rgs),
+                                cur_uncompressed_bytes,
+                                cur_compressed_bytes,
+                                _io_ctx,
+                                file_io_object);
       // Promote the just-sealed slice's uncompressed bytes into the cross-file accumulator.
       accum.total_uncompressed_bytes += cur_uncompressed_bytes;
       cur_rgs.clear();

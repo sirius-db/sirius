@@ -45,33 +45,26 @@ class mock_ioctx : public sirius_ioctx {
  public:
   void shutdown() override {}
 
+  std::shared_ptr<sirius_io_object> create_io_object(std::string) override
+  {
+    throw std::logic_error("unused");
+  }
+
   std::unique_ptr<cudf::io::datasource> make_datasource(std::shared_ptr<sirius_io_object>) override
   {
     ++make_datasource_calls;
     throw std::logic_error("mock_ioctx::make_datasource should not run in PR1");
   }
 
-  size_t host_read(sirius_io_object&, size_t, size_t, uint8_t*) override
+  [[nodiscard]] bool supports(std::string_view) const override { return true; }
+
+  size_t host_read_io(sirius_io_object&, size_t, size_t, uint8_t*) override
   {
     throw std::logic_error("unused");
   }
 
-  std::unique_ptr<cudf::io::datasource::buffer> host_read(sirius_io_object&,
-                                                          size_t,
-                                                          size_t) override
-  {
-    throw std::logic_error("unused");
-  }
-
-  void host_read_async(sirius_io_object&, size_t, size_t, uint8_t*, io_completion_handler) override
-  {
-    throw std::logic_error("unused");
-  }
-
-  std::unique_ptr<cudf::io::datasource::buffer> device_read_io(sirius_io_object&,
-                                                               size_t,
-                                                               size_t,
-                                                               rmm::cuda_stream_view) override
+  void host_read_async_io(
+    sirius_io_object&, size_t, size_t, uint8_t*, io_completion_handler) override
   {
     throw std::logic_error("unused");
   }
@@ -81,7 +74,7 @@ class mock_ioctx : public sirius_ioctx {
     throw std::logic_error("unused");
   }
 
-  void device_read_io_async(sirius_io_object&,
+  void device_read_async_io(sirius_io_object&,
                             size_t,
                             size_t,
                             uint8_t*,
@@ -91,17 +84,10 @@ class mock_ioctx : public sirius_ioctx {
     throw std::logic_error("unused");
   }
 
-  void host_read_ranges_async(sirius_io_object&,
-                              std::vector<cudf::io::text::byte_range_info> const&,
-                              std::span<cudf::host_span<std::byte>>,
-                              io_completion_handler) override
-  {
-    throw std::logic_error("unused");
-  }
-
-  size_t host_read_ranges(sirius_io_object&,
-                          std::vector<cudf::io::text::byte_range_info> const&,
-                          std::span<cudf::host_span<std::byte>>) override
+  void host_read_ranges_async_io(sirius_io_object&,
+                                 std::vector<cudf::io::text::byte_range_info> const&,
+                                 std::span<cudf::host_span<std::byte>>,
+                                 io_completion_handler) override
   {
     throw std::logic_error("unused");
   }

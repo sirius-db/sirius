@@ -24,13 +24,14 @@
 #include <cuda_runtime.h>
 
 #include <concurrentqueue.h>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 #include <array>
 #include <atomic>
 #include <future>
 #include <list>
-#include <map>
 #include <memory>
+#include <mutex>
 #include <semaphore>
 #include <shared_mutex>
 #include <span>
@@ -41,38 +42,38 @@
 
 namespace sirius::io {
 
+class sirius_ioctx;
+
 // ---------------------------------------------------------------------------
-// buffer_pool — growable multi-slab pool of 1MB pinned chunks
+// buffer_pool — growable pool of pinned chunks
 // ---------------------------------------------------------------------------
 //
-// Manages one or more CUDA-pinned slabs.  Each slab is a contiguous
-// allocation of CHUNKS_PER_SLAB * 1MB.  New slabs are allocated lazily when
-// the pool is exhausted, up to max_slabs.
+// Backed by a @c cucascade::memory::fixed_size_host_memory_resource.  Each
+// grow step requests CHUNKS_PER_SLAB blocks from the upstream resource and
+// appends the raw pointers to an internal free list.  Blocks are never
+// returned to the upstream resource until the pool is destroyed; allocate()
+// pops from the free list and deallocate() pushes back.
 //
-// allocate() returns a raw pointer to a 1MB region.
-// deallocate() finds the owning slab via a sorted map of slab base addresses
-// and returns the chunk to that slab's free list.
+// The chunk size is taken from @c mr.get_block_size() — all cache layout
+// arithmetic that needs the chunk size reads it from @c chunk_bytes().
 
 class buffer_pool {
  public:
-  static constexpr size_t CHUNK_BYTES       = 1UL << 20;  // 1MB
-  static constexpr uint32_t CHUNKS_PER_SLAB = 500;        // 500 chunks per slab
-  static constexpr size_t SLAB_BYTES        = static_cast<size_t>(CHUNKS_PER_SLAB) * CHUNK_BYTES;
+  static constexpr uint32_t CHUNKS_PER_SLAB = 500;  // 500 chunks per slab
 
-  explicit buffer_pool(uint32_t max_slabs);
+  buffer_pool(cucascade::memory::fixed_size_host_memory_resource& mr, uint32_t max_slabs);
   ~buffer_pool();
 
   buffer_pool(buffer_pool const&)            = delete;
   buffer_pool& operator=(buffer_pool const&) = delete;
 
-  /// Allocate a single 1MB chunk.  Returns nullptr when all slabs are
-  /// exhausted and no new slab can be allocated.
+  /// Allocate a single chunk.  Returns nullptr when the pool is exhausted
+  /// and the upstream resource cannot supply a fresh slab.
   std::byte* allocate();
 
   /// Bulk-allocate up to @p n chunks, appending pointers to @p out.
-  /// Returns the number actually allocated (may be < n if pool is exhausted
-  /// and cannot grow).  Uses try_dequeue_bulk internally to minimise
-  /// per-chunk overhead.
+  /// Returns the number actually allocated (may be < n if the pool is
+  /// exhausted and cannot grow).
   size_t allocate_bulk(size_t n, std::vector<std::byte*>& out);
 
   void deallocate_bulk(std::vector<std::byte*>& out);
@@ -80,29 +81,40 @@ class buffer_pool {
   /// Return a chunk to the pool.
   void deallocate(std::byte* p);
 
-  size_t capacity() const noexcept
+  [[nodiscard]] size_t chunk_bytes() const noexcept { return _chunk_bytes; }
+  [[nodiscard]] size_t slab_bytes() const noexcept
   {
-    return static_cast<size_t>(_total_chunks.load(std::memory_order_relaxed)) * CHUNK_BYTES;
+    return static_cast<size_t>(CHUNKS_PER_SLAB) * _chunk_bytes;
   }
-  uint32_t free_count() const noexcept { return _total_free.load(std::memory_order_relaxed); }
-  uint32_t total_chunks() const noexcept { return _total_chunks.load(std::memory_order_relaxed); }
+  [[nodiscard]] size_t capacity() const noexcept
+  {
+    return static_cast<size_t>(_total_chunks.load(std::memory_order_relaxed)) * _chunk_bytes;
+  }
+  [[nodiscard]] uint32_t free_count() const noexcept
+  {
+    return _total_free.load(std::memory_order_relaxed);
+  }
+  [[nodiscard]] uint32_t total_chunks() const noexcept
+  {
+    return _total_chunks.load(std::memory_order_relaxed);
+  }
 
  private:
-  struct slab {
-    std::byte* base{nullptr};
-    duckdb_moodycamel::ConcurrentQueue<std::byte*> free_chunks;
-    std::atomic<uint32_t> free_count{0};
-  };
+  /// Pull one slab worth of blocks from the upstream resource and append
+  /// them to @c _free_list.  Caller must hold @c _mtx.
+  bool grow_locked();
 
-  bool grow();
-  slab* find_slab(std::byte* p);
-
+  cucascade::memory::fixed_size_host_memory_resource& _mr;
+  size_t _chunk_bytes;
   uint32_t _max_slabs;
 
-  // Protected by _grow_mtx (exclusive for grow, shared for find_slab).
-  mutable std::shared_mutex _grow_mtx;
-  std::vector<std::unique_ptr<slab>> _slabs;
-  std::map<std::byte*, slab*> _slab_map;
+  // Protects _allocations and _free_list.
+  std::mutex _mtx;
+  // Held to keep upstream blocks alive for the lifetime of the pool —
+  // the multiple_blocks_allocation destructor is what returns blocks to
+  // the resource, so we never drop these until the pool is destroyed.
+  std::vector<cucascade::memory::fixed_multiple_blocks_allocation> _allocations;
+  std::vector<std::byte*> _free_list;
 
   std::atomic<uint32_t> _total_free{0};
   std::atomic<uint32_t> _total_chunks{0};
@@ -280,7 +292,13 @@ struct alignas(64) cache_entry {
   cudf::io::text::byte_range_info logical_range;
   cudf::io::text::byte_range_info physical_range;
 
-  /// Pointers to 1MB chunks from buffer_pool backing this range.
+  /// Size of each chunk in @c chunks (== buffer_pool::chunk_bytes() at the
+  /// time of entry creation).  Stored on the entry so pinned_view doesn't
+  /// need a pool reference to do chunk-index arithmetic.
+  size_t chunk_bytes{0};
+
+  /// Pointers to pinned chunks (each of size @c chunk_bytes) from buffer_pool
+  /// backing this range.
   std::vector<std::byte*> chunks;
 
   /// Packed state + pin_count.  All state transitions go through this.
@@ -306,26 +324,16 @@ struct alignas(64) cache_entry {
   /// consumption_ts < request_ts.
   std::atomic<uint64_t> consumption_ts{0};
 
-  /// Recorded on the last reader's stream when @c pinned_view goes out of
-  /// scope.  The evictor queries this before releasing chunks so a still
-  /// in-flight cudaMemcpyAsync can't read from pinned memory that we've
-  /// just handed back to the pool.
-  cudaEvent_t read_event{nullptr};
-
   /// Set to true while this entry sits in the evictor's LRU list, cleared
   /// when the evictor pops it out (eviction or otherwise).  Only mutated
   /// by the evictor thread, so no synchronisation is required.
   bool in_lru{false};
 
-  cache_entry(cudf::io::text::byte_range_info logical, cudf::io::text::byte_range_info physical)
-    : logical_range(logical), physical_range(physical)
+  cache_entry(cudf::io::text::byte_range_info logical,
+              cudf::io::text::byte_range_info physical,
+              size_t chunk_bytes)
+    : logical_range(logical), physical_range(physical), chunk_bytes(chunk_bytes)
   {
-    cudaEventCreateWithFlags(&read_event, cudaEventDisableTiming);
-  }
-
-  ~cache_entry()
-  {
-    if (read_event) cudaEventDestroy(read_event);
   }
 
   cache_entry(cache_entry const&)            = delete;
@@ -381,10 +389,12 @@ struct eviction_request {
 class pinned_view {
  public:
   pinned_view() = default;
-  /// @p stream is the caller's CUDA stream; on the last release, we record
-  /// an event on it so the evictor can be certain any in-flight
-  /// cudaMemcpyAsync reading from this entry's chunks has completed before
-  /// the chunks are recycled.
+  /// @p stream is the caller's CUDA stream.  When non-null, the read pin
+  /// is released via a host callback enqueued on this stream, so the entry
+  /// stays in_use (and therefore non-evictable) until any cudaMemcpyAsync
+  /// the caller submitted earlier has finished consuming the chunks.  When
+  /// null, the read is released synchronously on destruction (host-only
+  /// reads have no async work to wait on).
   pinned_view(std::shared_ptr<cache_entry> entry,
               duckdb_moodycamel::ConcurrentQueue<eviction_candidate>& candidate_queue,
               cudaStream_t stream);
@@ -466,9 +476,9 @@ class prefetching_cache {
   /// Non-blocking read of a single range.
   /// Returns an empty pinned_view if the range is not cached or the cached
   /// entry does not fully cover [offset, offset+size).  Updates hit / miss
-  /// counters (see summary()).  @p stream is used by the returned
-  /// pinned_view to record an event on release so the evictor can tell
-  /// when any in-flight async memcpys have finished.
+  /// counters (see summary()).  @p stream, when non-null, defers the
+  /// returned pinned_view's read release until the stream reaches the
+  /// release point — see @c pinned_view's ctor for the full contract.
   [[nodiscard]] pinned_view read(const sirius_io_object& obj,
                                  size_t offset,
                                  size_t size,
