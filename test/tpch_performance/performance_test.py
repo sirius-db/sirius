@@ -16,11 +16,13 @@ import argparse
 import csv
 import glob
 import json
+import math
 import os
 import shutil
 import subprocess
 import time
-from datetime import datetime
+from datetime import date, datetime, time as dtime, timedelta
+from decimal import Decimal
 
 import duckdb
 from queries import QUERIES
@@ -43,8 +45,7 @@ def log(msg):
 
 MODES = ("grouped", "sequential", "isolated")
 ENGINE_CHOICES = ("gpu", "cpu", "both")
-PINNING_MODES = ("none", "per-query")
-PIN_TIERS = ("gpu", "host")
+PIN_CHOICES = ("none", "gpu", "host")
 TPCH_TABLES = (
     "customer",
     "lineitem",
@@ -89,8 +90,7 @@ def setup_benchmark_dir(
     engine,
     queries,
     config_path,
-    pinning_mode,
-    pin_tier,
+    pin,
 ):
     """Create the benchmark output directory and return its paths.
 
@@ -126,8 +126,7 @@ def setup_benchmark_dir(
         "iterations": iterations,
         "engine": engine,
         "queries": [f"q{q}" for q in queries],
-        "pinning_mode": pinning_mode,
-        "pin_tier": pin_tier if pinning_mode != "none" else None,
+        "pin": pin,
         "runtime_file": os.path.relpath(runtime_csv, benchmark_dir),
     }
     with open(os.path.join(benchmark_dir, "metadata.json"), "w") as f:
@@ -136,32 +135,43 @@ def setup_benchmark_dir(
     return benchmark_dir, runtime_csv, log_dir
 
 
-def _verify_results(duckdb_rows, sirius_rows, query_name):
-    """Verify that DuckDB and Sirius results match."""
-    try:
-        if len(duckdb_rows) != len(sirius_rows):
-            print(
-                f"❌ {query_name}: Row count mismatch - DuckDB: {len(duckdb_rows)}, Sirius: {len(sirius_rows)}"
-            )
-            return False
+VALIDATION_ABS_TOL = 1e-10
 
-        duckdb_rows_sorted = sorted(duckdb_rows, key=lambda x: str(x))
-        sirius_rows_sorted = sorted(sirius_rows, key=lambda x: str(x))
+_RESULT_EVAL_GLOBALS = {
+    "__builtins__": {},
+    "Decimal": Decimal,
+    "datetime": datetime,
+    "date": date,
+    "time": dtime,
+    "timedelta": timedelta,
+}
 
-        for i, (duck_row, sirius_row) in enumerate(
-            zip(duckdb_rows_sorted, sirius_rows_sorted)
-        ):
-            if duck_row != sirius_row:
-                print(f"❌ {query_name}: Row {i} mismatch")
-                print(f"   DuckDB:  {duck_row}")
-                print(f"   Sirius:  {sirius_row}")
-                return False
 
-        print(f"✓ {query_name}: Results match ({len(duckdb_rows)} rows)")
-        return True
-    except Exception as e:
-        print(f"❌ {query_name}: Error during verification - {e}")
+def _parse_result_row(line):
+    return eval(line.strip(), _RESULT_EVAL_GLOBALS)  # noqa: S307
+
+
+def _load_result_file(path):
+    rows = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(_parse_result_row(line))
+    return rows
+
+
+def _values_match(a, b, abs_tol):
+    if isinstance(a, float) and isinstance(b, float):
+        return math.isclose(a, b, rel_tol=0.0, abs_tol=abs_tol)
+    return a == b
+
+
+def _rows_match(a, b, abs_tol):
+    if len(a) != len(b):
         return False
+    return all(_values_match(av, bv, abs_tol) for av, bv in zip(a, b))
 
 
 def parse_query_spec(spec):
@@ -298,13 +308,13 @@ def run_grouped(
     *,
     benchmark_dir,
     parquet_dir,
-    pinning_mode,
+    pin,
 ):
     """Per-query iterations back-to-back; one connection per engine. Pin per query."""
     log(
         "Mode 'grouped': single connection per engine, iterations back-to-back per query"
     )
-    pin_enabled = pinning_mode == "per-query"
+    pin_enabled = pin != "none"
     for name, use_gpu in engine_modes:
         con = open_connection(source, gpu_execution=use_gpu)
         try:
@@ -334,11 +344,11 @@ def run_sequential(
     *,
     benchmark_dir,
     parquet_dir,
-    pinning_mode,
+    pin,
 ):
     """Round-robin iterations; one connection per engine. Single union-pin at session start."""
     log("Mode 'sequential': single connection per engine, round-robin iterations")
-    pin_enabled = pinning_mode == "per-query"
+    pin_enabled = pin != "none"
     for name, use_gpu in engine_modes:
         con = open_connection(source, gpu_execution=use_gpu)
         try:
@@ -368,11 +378,11 @@ def run_isolated(
     *,
     benchmark_dir,
     parquet_dir,
-    pinning_mode,
+    pin,
 ):
     """Fresh connection + OS cache drop per (query, iteration). Pin per execution."""
     log("Mode 'isolated': renewing connection and dropping OS cache before every run")
-    pin_enabled = pinning_mode == "per-query"
+    pin_enabled = pin != "none"
     for name, use_gpu in engine_modes:
         for qnum in queries:
             for it in range(iterations):
@@ -456,31 +466,72 @@ def split_sirius_log(log_dir, benchmark_dir, queries, iterations, mode):
     log(f"Per-query Sirius logs written under {os.path.join(benchmark_dir, 'sirius')}/")
 
 
-def validate(source, queries):
-    """Compare CPU vs GPU result sets query-by-query."""
-    con = open_connection(source, gpu_execution=True)
-    try:
-        results = {}
-        for qnum in queries:
-            query_name = f"q{qnum}"
-            print(f"Verifying {query_name}...")
-            try:
-                con.execute("SET gpu_execution = false;")
-                cpu_rows = con.execute(QUERIES[query_name]).fetchall()
-                con.execute("SET gpu_execution = true;")
-                gpu_rows = con.execute(QUERIES[query_name]).fetchall()
-                results[qnum] = _verify_results(cpu_rows, gpu_rows, query_name)
-            except Exception as e:
-                print(f"  {query_name}: Exception - {e}")
-                results[qnum] = False
+def validate(benchmark_dir, queries):
+    """Compare saved DuckDB vs Sirius result.txt files.
 
-        passed = sum(1 for v in results.values() if v)
-        print(f"\n{'=' * 60}")
-        print(f"Validation Summary: {passed}/{len(results)} queries passed")
-        print(f"{'=' * 60}")
-        return results
-    finally:
-        con.close()
+    Mirrors compare_results.py: byte-exact match first, then a tolerance-aware
+    fallback (abs_tol=VALIDATION_ABS_TOL on Python float values only; strict
+    equality on Decimal/int/str/date/etc.). No query re-execution, no DuckDB
+    connection — safe to run after the GPU pool from the timed pass is still
+    resident.
+    """
+    log(f"Validating saved results in {benchmark_dir}")
+    results = {}
+    for qnum in queries:
+        qname = f"q{qnum}"
+        duck_path = os.path.join(benchmark_dir, "duckdb", qname, "result.txt")
+        sir_path = os.path.join(benchmark_dir, "sirius", qname, "result.txt")
+        if not os.path.exists(duck_path) or not os.path.exists(sir_path):
+            print(f"❌ {qname}: missing result.txt (duckdb or sirius)")
+            results[qnum] = False
+            continue
+        with open(duck_path, "rb") as fd, open(sir_path, "rb") as fs:
+            if fd.read() == fs.read():
+                print(f"✓ {qname}: byte-exact match")
+                results[qnum] = True
+                continue
+        try:
+            duck_rows = _load_result_file(duck_path)
+            sir_rows = _load_result_file(sir_path)
+        except Exception as e:
+            print(f"❌ {qname}: parse error - {e}")
+            results[qnum] = False
+            continue
+        if len(duck_rows) != len(sir_rows):
+            print(
+                f"❌ {qname}: row count mismatch - "
+                f"duckdb={len(duck_rows)} sirius={len(sir_rows)}"
+            )
+            results[qnum] = False
+            continue
+        duck_sorted = sorted(duck_rows, key=lambda x: str(x))
+        sir_sorted = sorted(sir_rows, key=lambda x: str(x))
+        mismatch = None
+        for i, (d, s) in enumerate(zip(duck_sorted, sir_sorted)):
+            if not _rows_match(d, s, VALIDATION_ABS_TOL):
+                mismatch = (i, d, s)
+                break
+        if mismatch is None:
+            print(
+                f"✓ {qname}: within tolerance "
+                f"(abs_tol={VALIDATION_ABS_TOL}, {len(duck_rows)} rows)"
+            )
+            results[qnum] = True
+        else:
+            i, d, s = mismatch
+            print(f"❌ {qname}: row {i} mismatch")
+            print(f"   duckdb: {d}")
+            print(f"   sirius: {s}")
+            results[qnum] = False
+
+    passed = sum(1 for v in results.values() if v)
+    failed = [f"q{q}" for q, ok in results.items() if not ok]
+    print(f"\n{'=' * 60}")
+    print(f"Validation Summary: {passed}/{len(results)} queries passed")
+    if failed:
+        print(f"Failed: {', '.join(failed)}")
+    print(f"{'=' * 60}")
+    return results
 
 
 def parse_args():
@@ -526,7 +577,12 @@ def parse_args():
     p.add_argument(
         "--validation",
         action="store_true",
-        help="After timing, validate that GPU and CPU produce matching results",
+        help=(
+            "After timing, validate that GPU and CPU produce matching results "
+            "by comparing the saved <engine>/q<N>/result.txt files. Byte-exact "
+            f"match first, then abs_tol={VALIDATION_ABS_TOL} on float columns "
+            "(strict equality elsewhere). Requires --engine both."
+        ),
     )
     p.add_argument(
         "--queries",
@@ -541,20 +597,15 @@ def parse_args():
         help="Path to Sirius config YAML (default: $SIRIUS_CONFIG_FILE)",
     )
     p.add_argument(
-        "--pinning-mode",
-        choices=PINNING_MODES,
+        "--pin",
+        choices=PIN_CHOICES,
         default="none",
         help=(
-            "Pin TPC-H tables into the Sirius cache. 'per-query' pins/unpins "
-            "around each query in grouped/isolated mode; in sequential mode it "
-            "becomes a single union-pin at session start. (default: none)"
+            "Pin TPC-H tables into the Sirius cache (Sirius-only). 'gpu' or "
+            "'host' selects the cache tier; 'none' disables pinning. Pin is "
+            "per-query in grouped/isolated mode and a single union-pin at "
+            "session start in sequential mode. (default: none)"
         ),
-    )
-    p.add_argument(
-        "--pin-tier",
-        choices=PIN_TIERS,
-        default="gpu",
-        help="Sirius cache tier when --pinning-mode is per-query (default: gpu)",
     )
     return p.parse_args()
 
@@ -572,9 +623,12 @@ def main():
     engine_modes = resolve_engine_modes(args.engine)
     output_root = args.output or DEFAULT_OUTPUT_ROOT
 
-    if args.pinning_mode != "none" and args.engine == "cpu":
+    if args.pin != "none" and args.engine == "cpu":
+        raise SystemExit("--pin is Sirius-only; cannot be combined with --engine cpu")
+
+    if args.validation and args.engine != "both":
         raise SystemExit(
-            "--pinning-mode is Sirius-only; cannot be combined with --engine cpu"
+            "--validation requires --engine both (needs both result sets to compare)"
         )
 
     config_path = (args.config or "").strip()
@@ -586,8 +640,8 @@ def main():
             "running with Sirius default configuration."
         )
 
-    if args.pinning_mode != "none":
-        os.environ["SIRIUS_PIN_TIER"] = args.pin_tier
+    if args.pin != "none":
+        os.environ["SIRIUS_PIN_TIER"] = args.pin
 
     benchmark_dir, runtime_csv, log_dir = setup_benchmark_dir(
         output_root,
@@ -596,8 +650,7 @@ def main():
         args.engine,
         queries,
         config_path,
-        args.pinning_mode,
-        args.pin_tier,
+        args.pin,
     )
     os.environ["SIRIUS_LOG_DIR"] = log_dir
 
@@ -607,9 +660,7 @@ def main():
     log(f"Engine:        {args.engine}")
     log(f"Queries:       {queries}")
     log(f"Config:        {config_path or '(default)'}")
-    log(f"Pinning mode:  {args.pinning_mode}")
-    if args.pinning_mode != "none":
-        log(f"Pin tier:      {args.pin_tier}")
+    log(f"Pin:           {args.pin}")
     log(f"Benchmark dir: {benchmark_dir}")
     log(f"Runtime CSV:   {runtime_csv}")
     log(f"Log dir:       {log_dir}")
@@ -626,7 +677,7 @@ def main():
             writer,
             benchmark_dir=benchmark_dir,
             parquet_dir=parquet_dir,
-            pinning_mode=args.pinning_mode,
+            pin=args.pin,
         )
 
     log("Benchmark run complete")
@@ -636,7 +687,7 @@ def main():
 
     if args.validation:
         log("Starting validation")
-        validate(source, queries)
+        validate(benchmark_dir, queries)
         log("Validation complete")
 
 
