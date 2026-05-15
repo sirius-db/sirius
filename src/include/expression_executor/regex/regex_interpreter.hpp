@@ -21,7 +21,7 @@
 #include <unordered_map>
 
 namespace sirius {
-namespace expression {
+namespace regex {
 
 struct RegexUdf {
   std::string function_name;
@@ -48,5 +48,5 @@ private:
   RegexInterpreter interpreter_;
 };
 
-} // namespace expression
+} // namespace regex
 } // namespace sirius

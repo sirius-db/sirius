@@ -30,7 +30,7 @@
 #include <regex>
 
 namespace sirius {
-namespace expression {
+namespace regex {
 namespace {
 
 enum class NodeKind {
@@ -840,5 +840,5 @@ const RegexUdf& RegexUdfCache::GetOrCreate(const std::string& pattern, const std
   return it->second;
 }
 
-} // namespace expression
+} // namespace regex
 } // namespace sirius

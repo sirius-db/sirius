@@ -153,6 +153,7 @@ set(EXTENSION_SOURCES
     src/expression_executor/expression_executor_strategy.cpp
     src/expression_executor/gpu_expression_executor.cpp
     src/expression_executor/gpu_expression_translator.cpp
+    src/expression_executor/regex/regex_interpreter.cpp
     src/expression_executor/regex/regex_playground.cpp
     src/expression_executor/specializations/gpu_execute_between.cpp
     src/expression_executor/specializations/gpu_execute_case.cpp

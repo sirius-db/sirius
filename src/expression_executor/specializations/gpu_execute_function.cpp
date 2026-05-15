@@ -46,6 +46,9 @@
 #include <cudf/transform.hpp>
 #include <cudf/unary.hpp>
 
+// sirius logging
+#include <log/logging.hpp>
+
 // standard library
 #include <optional>
 #include <regex>
@@ -374,7 +377,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
     if (has_backrefs) {
       if (duckdb::Config::ENABLE_REGEX_JIT_IMPL) {
         try {
-          auto& cache = ::sirius::expression::RegexUdfCache::Instance();
+          auto& cache = ::sirius::regex::RegexUdfCache::Instance();
           const auto& udf = cache.GetOrCreate(pattern_str, replace_str);
           return cudf::transform({input.get_column_view()},
                                  udf.source,

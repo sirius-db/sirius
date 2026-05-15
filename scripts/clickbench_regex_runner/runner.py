@@ -10,7 +10,7 @@ import tempfile
 import numpy as np
 
 CLICKBENCH_TABLE_NAME = "hits"
-SIRIUS_FAILURE_MESSAGE = "Error in GPUExecuteQuery"
+SIRIUS_FAILURE_MESSAGE = "Error in gpu_execution"
 RUN_TIME_LINE = "Run Time (s):"
 
 current_path = os.path.abspath(__file__)
@@ -84,12 +84,9 @@ def benchmark_query(args, query_to_run, query_label):
     query_temp_file_path = query_temp_file.name
     with open(query_temp_file_path, 'w+') as writer:
         writer.write(".timer on\n")
-        if (query_label == 'query24'):
-            writer.write(f"call gpu_buffer_init('{q24_caching_region_size}', '{q24_processing_region_size}', pinned_memory_size = '{q24_cpu_processing_region_size}');\n")
-        else:
-            writer.write(f"call gpu_buffer_init('{args.caching_region_size}', '{args.processing_region_size}');\n")
+        escaped_query = query_to_run.replace("'", "''")
         for _ in range(args.num_warm_runs + 1):
-            writer.write(f'call gpu_processing("{query_to_run}");\n')
+            writer.write(f"call gpu_execution('{escaped_query}');\n")
 
     # Redirect the result to a temporary file
     result_temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".result")
