@@ -17,6 +17,7 @@
 #include "catch.hpp"
 #include "exec/thread_pool.hpp"
 #include "helper/logical_type.hpp"
+#include "io/prefetching_cache.hpp"
 #include "io/s3/s3_ioctx.hpp"
 #include "io/s3/sirius_sigv4_credential_provider.hpp"
 #include "op/scan/parquet_scan_operator_data.hpp"
@@ -24,6 +25,8 @@
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "scan_manager/split_connector.hpp"
 
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 #include <duckdb.hpp>
 #include <duckdb/common/column_index.hpp>
 #include <duckdb/common/types.hpp>
@@ -42,6 +45,7 @@
 #include <utility>
 #include <vector>
 
+using sirius::io::buffer_pool;
 using sirius::io::s3::s3_ioctx;
 using sirius::io::s3::s3_ioctx_config;
 using sirius::io::s3::sirius_sigv4_credential_provider;
@@ -100,6 +104,32 @@ std::string s3_uri(std::string_view bucket, std::string_view key)
 {
   return "s3://" + std::string{bucket} + "/" + std::string{key};
 }
+
+std::size_t cache_capacity_bytes(std::size_t block_size, std::uint32_t max_slabs)
+{
+  return block_size * static_cast<std::size_t>(buffer_pool::CHUNKS_PER_SLAB) *
+         static_cast<std::size_t>(max_slabs);
+}
+
+struct host_cache_memory {
+  static constexpr std::uint32_t max_slabs = 3;
+  static constexpr std::size_t block_size  = 4096;
+
+  host_cache_memory()
+    : upstream(0, true),
+      host_mr(0,
+              upstream,
+              cache_capacity_bytes(block_size, max_slabs),
+              cache_capacity_bytes(block_size, max_slabs),
+              block_size,
+              static_cast<std::size_t>(buffer_pool::CHUNKS_PER_SLAB),
+              1)
+  {
+  }
+
+  cucascade::memory::numa_region_pinned_host_memory_resource upstream;
+  cucascade::memory::fixed_size_host_memory_resource host_mr;
+};
 
 std::filesystem::path fresh_tmp_dir(std::string const& tag)
 {
@@ -181,15 +211,17 @@ s3_ioctx_config make_live_s3_config(s3_test_env const& env)
   return cfg;
 }
 
-sirius_scan_manager make_scan_manager(std::optional<s3_test_env> const& env = std::nullopt)
+sirius_scan_manager make_scan_manager(cucascade::memory::fixed_size_host_memory_resource& host_mr,
+                                      std::optional<s3_test_env> const& env = std::nullopt)
 {
   scan_manager_config cfg{};
+  cfg.uring_n_reactors = 1;
   if (env) {
     cfg.s3_config                         = make_live_s3_config(*env);
     cfg.s3_thread_pool.num_threads        = 4;
     cfg.s3_thread_pool.thread_name_prefix = "s3_psp";
   }
-  return sirius_scan_manager(std::move(cfg));
+  return sirius_scan_manager(std::move(cfg), &host_mr);
 }
 
 parquet_split_provider make_provider(std::vector<std::string> paths,
@@ -251,7 +283,8 @@ TEST_CASE("parquet_split_provider routes pure local batches through scan_manager
   auto path     = write_parquet_file(con, dir, "local", 256);
   auto file_uri = "file://" + path.string();
 
-  auto manager  = make_scan_manager();
+  host_cache_memory memory;
+  auto manager  = make_scan_manager(memory.host_mr);
   auto provider = make_provider({file_uri}, local_returned_types(), manager);
   auto splits   = drive_provider(provider);
 
@@ -275,7 +308,8 @@ TEST_CASE("parquet_split_provider routes pure S3 batches through scan_manager S3
     return;
   }
 
-  auto manager  = make_scan_manager(env);
+  host_cache_memory memory;
+  auto manager  = make_scan_manager(memory.host_mr, env);
   auto path     = s3_uri(env->bucket, "parquet/nation.parquet");
   auto provider = make_provider({path}, nation_returned_types(), manager);
   auto splits   = drive_provider(provider);
@@ -305,7 +339,8 @@ TEST_CASE("parquet_split_provider dispatches mixed local and S3 batches per path
   auto local_uri  = "file://" + local_path.string();
   auto s3_path    = s3_uri(env->bucket, "parquet/nation.parquet");
 
-  auto manager  = make_scan_manager(env);
+  host_cache_memory memory;
+  auto manager  = make_scan_manager(memory.host_mr, env);
   auto provider = make_provider({local_uri, s3_path}, nation_returned_types(), manager);
   auto splits   = drive_provider(provider);
 
@@ -323,7 +358,8 @@ TEST_CASE("parquet_split_provider dispatches mixed local and S3 batches per path
 TEST_CASE("parquet_split_provider reports unsupported paths through the connector",
           "[scan_manager][parquet_split_provider][s3]")
 {
-  auto manager = make_scan_manager();
+  host_cache_memory memory;
+  auto manager = make_scan_manager(memory.host_mr);
   auto provider =
     make_provider({"unsupported://bucket/key.parquet"}, local_returned_types(), manager);
 

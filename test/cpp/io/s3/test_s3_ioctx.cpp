@@ -17,6 +17,7 @@
 #include "catch.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/io_errors.hpp"
+#include "io/prefetching_cache.hpp"
 #include "io/s3/credential_provider.hpp"
 #include "io/s3/mock_credential_provider.hpp"
 #include "io/s3/s3_io_object.hpp"
@@ -30,6 +31,8 @@
 #include <rmm/cuda_stream_view.hpp>
 
 #include <arpa/inet.h>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <sys/socket.h>
@@ -60,6 +63,7 @@
 #include <utility>
 #include <vector>
 
+using sirius::io::buffer_pool;
 using sirius::io::credential_error;
 using sirius::io::s3::credential_provider;
 using sirius::io::s3::mock_credential_provider;
@@ -138,13 +142,18 @@ std::shared_ptr<s3_io_object> make_s3_object(std::string bucket, std::string key
   return std::make_shared<s3_io_object>(std::move(bucket), std::move(key), size, std::move(path));
 }
 
-std::shared_ptr<s3_ioctx> make_live_ioctx(s3_test_env const& env)
+std::shared_ptr<credential_provider> make_live_provider(s3_test_env const& env)
 {
   static_credentials creds;
   creds.access_key_id     = env.access_key;
   creds.secret_access_key = env.secret_key;
-  auto provider           = std::make_shared<sirius_sigv4_credential_provider>(
+  return std::make_shared<sirius_sigv4_credential_provider>(
     std::move(creds), env.region, env.endpoint, 30min);
+}
+
+std::shared_ptr<s3_ioctx> make_live_ioctx(s3_test_env const& env)
+{
+  auto provider = make_live_provider(env);
   return std::make_shared<s3_ioctx>(s3_ioctx_config{std::move(provider), 4, 20});
 }
 
@@ -456,6 +465,81 @@ std::shared_ptr<s3_ioctx> make_retry_ioctx(std::string url,
   cfg.retry_jitter       = jitter;
   cfg.honor_retry_after  = honor_retry_after;
   return std::make_shared<s3_ioctx>(std::move(cfg));
+}
+
+class delayed_get_provider final : public credential_provider {
+ public:
+  delayed_get_provider(std::shared_ptr<credential_provider> delegate,
+                       std::chrono::milliseconds delay)
+    : _delegate(std::move(delegate)), _delay(delay)
+  {
+  }
+
+  std::string get_presigned_url(s3_object_ref const& obj, presign_method method) override
+  {
+    if (method == presign_method::GET) {
+      _get_count.fetch_add(1, std::memory_order_relaxed);
+      std::this_thread::sleep_for(_delay);
+    }
+    return _delegate->get_presigned_url(obj, method);
+  }
+
+  [[nodiscard]] int get_count() const noexcept
+  {
+    return _get_count.load(std::memory_order_relaxed);
+  }
+
+ private:
+  std::shared_ptr<credential_provider> _delegate;
+  std::chrono::milliseconds _delay;
+  std::atomic<int> _get_count{0};
+};
+
+std::size_t cache_capacity_bytes(std::size_t block_size, std::uint32_t max_slabs)
+{
+  return block_size * static_cast<std::size_t>(buffer_pool::CHUNKS_PER_SLAB) *
+         static_cast<std::size_t>(max_slabs);
+}
+
+struct cache_test_resources {
+  static constexpr std::uint32_t max_slabs = 1;
+  static constexpr std::size_t block_size  = 4096;
+
+  cache_test_resources()
+    : upstream(0, true),
+      host_mr(0,
+              upstream,
+              cache_capacity_bytes(block_size, max_slabs),
+              cache_capacity_bytes(block_size, max_slabs),
+              block_size,
+              static_cast<std::size_t>(buffer_pool::CHUNKS_PER_SLAB),
+              1),
+      pool(host_mr, max_slabs)
+  {
+  }
+
+  cucascade::memory::numa_region_pinned_host_memory_resource upstream;
+  cucascade::memory::fixed_size_host_memory_resource host_mr;
+  buffer_pool pool;
+};
+
+bool wait_until_cached(s3_ioctx& ctx,
+                       s3_io_object& obj,
+                       cudf::io::text::byte_range_info range,
+                       std::chrono::milliseconds timeout)
+{
+  auto const deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (auto view = ctx.cache()->read(obj,
+                                      static_cast<std::size_t>(range.offset()),
+                                      static_cast<std::size_t>(range.size()),
+                                      nullptr);
+        view) {
+      return true;
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+  return false;
 }
 
 }  // namespace
@@ -1081,4 +1165,94 @@ TEST_CASE("s3_ioctx host_read_ranges clips EOF-crossing ranges independently",
   CHECK(total == 150);
   require_bytes_equal(head, local, 0);
   require_bytes_equal(tail, local, eof_crossing_offset);
+}
+
+TEST_CASE("s3_ioctx host_read_ranges_async_io fans ranges across the injected pool",
+          "[s3][ioctx][parallel][integration]")
+{
+  auto env = read_s3_test_env();
+  if (!env) {
+    WARN("Skipping live S3 test because SIRIUS_TEST_S3_* environment is not configured");
+    return;
+  }
+
+  constexpr std::size_t range_count  = 8;
+  constexpr std::size_t worker_count = 4;
+  constexpr auto per_get_delay       = 100ms;
+  constexpr auto fanout_waves        = (range_count + worker_count - 1) / worker_count;
+  constexpr auto expected_budget     = per_get_delay * 3 * fanout_waves;
+
+  std::string const key = "medium.bin";
+  auto local            = read_binary_file(env->local_dir / key);
+  REQUIRE(local.size() >= range_count * 128);
+
+  auto provider = std::make_shared<delayed_get_provider>(make_live_provider(*env), per_get_delay);
+  sirius::exec::static_thread_pool pool(static_cast<int>(worker_count), "s3_range_fanout_test");
+
+  s3_ioctx_config cfg{};
+  cfg.creds             = provider;
+  cfg.max_connections   = range_count;
+  cfg.request_timeout_s = 20;
+  cfg.async_thread_pool = &pool;
+  auto ctx              = std::make_shared<s3_ioctx>(std::move(cfg));
+  auto obj              = make_s3_object(env->bucket, key, local.size());
+
+  std::vector<cudf::io::text::byte_range_info> ranges;
+  ranges.reserve(range_count);
+  std::vector<std::vector<std::byte>> buffers;
+  buffers.reserve(range_count);
+  for (std::size_t i = 0; i < range_count; ++i) {
+    ranges.push_back({static_cast<int64_t>(i * 128), 64});
+    buffers.emplace_back(64);
+  }
+
+  std::vector<cudf::host_span<std::byte>> spans;
+  spans.reserve(buffers.size());
+  for (auto& buffer : buffers) {
+    spans.emplace_back(buffer.data(), buffer.size());
+  }
+
+  auto const t0 = std::chrono::steady_clock::now();
+  auto const [total, ep] =
+    read_ranges_async(*ctx, *obj, ranges, std::span<cudf::host_span<std::byte>>{spans});
+  auto const elapsed =
+    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0);
+
+  REQUIRE(ep == nullptr);
+  CHECK(total == range_count * 64);
+  CHECK(provider->get_count() == static_cast<int>(range_count));
+  CHECK(elapsed <= expected_budget);
+}
+
+TEST_CASE("s3_ioctx destroys its prefetch cache before shutting down S3 async workers",
+          "[s3][ioctx][teardown][integration]")
+{
+  auto env = read_s3_test_env();
+  if (!env) {
+    WARN("Skipping live S3 test because SIRIUS_TEST_S3_* environment is not configured");
+    return;
+  }
+
+  std::string const key = "medium.bin";
+  auto local            = read_binary_file(env->local_dir / key);
+  REQUIRE(local.size() >= 128);
+
+  cache_test_resources cache_resources;
+  auto ctx = make_live_ioctx(*env);
+  ctx->initialize_cache(cache_resources.pool, 8);
+  REQUIRE(ctx->cache() != nullptr);
+
+  auto obj = make_s3_object(env->bucket, key, local.size());
+  std::vector<cudf::io::text::byte_range_info> ranges{{0, 128}};
+  for (int i = 0; i < 64; ++i) {
+    ctx->cache()->insert(*obj, nullptr, ranges);
+  }
+  REQUIRE(wait_until_cached(*ctx, *obj, ranges.front(), 10s));
+
+  auto const destroy_start = std::chrono::steady_clock::now();
+  ctx.reset();
+  auto const destroy_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - destroy_start);
+
+  CHECK(destroy_elapsed < 2s);
 }

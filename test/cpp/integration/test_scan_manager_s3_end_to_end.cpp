@@ -17,6 +17,7 @@
 #include "catch.hpp"
 #include "exec/thread_pool.hpp"
 #include "helper/logical_type.hpp"
+#include "io/prefetching_cache.hpp"
 #include "io/s3/s3_ioctx.hpp"
 #include "io/s3/sirius_sigv4_credential_provider.hpp"
 #include "op/scan/parquet_scan_operator_data.hpp"
@@ -29,6 +30,8 @@
 #include <cudf/io/parquet.hpp>
 #include <cudf/table/table.hpp>
 
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 #include <duckdb/common/column_index.hpp>
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/vector.hpp>
@@ -44,6 +47,7 @@
 #include <utility>
 #include <vector>
 
+using sirius::io::buffer_pool;
 using sirius::io::s3::s3_ioctx;
 using sirius::io::s3::s3_ioctx_config;
 using sirius::io::s3::sirius_sigv4_credential_provider;
@@ -104,6 +108,32 @@ std::string s3_uri(std::string_view bucket, std::string_view key)
   return "s3://" + std::string{bucket} + "/" + std::string{key};
 }
 
+std::size_t cache_capacity_bytes(std::size_t block_size, std::uint32_t max_slabs)
+{
+  return block_size * static_cast<std::size_t>(buffer_pool::CHUNKS_PER_SLAB) *
+         static_cast<std::size_t>(max_slabs);
+}
+
+struct host_cache_memory {
+  static constexpr std::uint32_t max_slabs = 3;
+  static constexpr std::size_t block_size  = 4096;
+
+  host_cache_memory()
+    : upstream(0, true),
+      host_mr(0,
+              upstream,
+              cache_capacity_bytes(block_size, max_slabs),
+              cache_capacity_bytes(block_size, max_slabs),
+              block_size,
+              static_cast<std::size_t>(buffer_pool::CHUNKS_PER_SLAB),
+              1)
+  {
+  }
+
+  cucascade::memory::numa_region_pinned_host_memory_resource upstream;
+  cucascade::memory::fixed_size_host_memory_resource host_mr;
+};
+
 s3_ioctx_config make_s3_config(s3_test_env const& env, bool bad_credentials = false)
 {
   static_credentials creds;
@@ -123,13 +153,16 @@ s3_ioctx_config make_s3_config(s3_test_env const& env, bool bad_credentials = fa
   return cfg;
 }
 
-sirius_scan_manager make_scan_manager(s3_test_env const& env, bool bad_credentials = false)
+sirius_scan_manager make_scan_manager(s3_test_env const& env,
+                                      cucascade::memory::fixed_size_host_memory_resource& host_mr,
+                                      bool bad_credentials = false)
 {
   scan_manager_config cfg{};
+  cfg.uring_n_reactors                  = 1;
   cfg.s3_config                         = make_s3_config(env, bad_credentials);
   cfg.s3_thread_pool.num_threads        = 4;
   cfg.s3_thread_pool.thread_name_prefix = "s3_e2e";
-  return sirius_scan_manager(std::move(cfg));
+  return sirius_scan_manager(std::move(cfg), &host_mr);
 }
 
 duckdb::vector<duckdb::ColumnIndex> all_column_ids(std::size_t n)
@@ -224,7 +257,8 @@ TEST_CASE("scan_manager S3 end-to-end reads nation parquet through sirius_dataso
     return;
   }
 
-  auto manager = make_scan_manager(*env);
+  host_cache_memory memory;
+  auto manager = make_scan_manager(*env, memory.host_mr);
   auto path    = s3_uri(env->bucket, "parquet/nation.parquet");
 
   auto result = read_parquet_through_scan_manager(manager, path);
@@ -255,7 +289,8 @@ TEST_CASE("scan_manager S3 end-to-end routes parquet_split_provider through S3 i
     return;
   }
 
-  auto manager  = make_scan_manager(*env);
+  host_cache_memory memory;
+  auto manager  = make_scan_manager(*env, memory.host_mr);
   auto path     = s3_uri(env->bucket, "parquet/nation.parquet");
   auto provider = make_provider({path}, manager);
   auto splits   = drive_provider(provider);
@@ -280,7 +315,8 @@ TEST_CASE("scan_manager S3 end-to-end dispatches mixed local and S3 parquet path
     return;
   }
 
-  auto manager    = make_scan_manager(*env);
+  host_cache_memory memory;
+  auto manager    = make_scan_manager(*env, memory.host_mr);
   auto local_path = std::filesystem::absolute("test/cpp/integration/data/parquet/nation.parquet");
   auto local_uri  = "file://" + local_path.string();
   auto s3_path    = s3_uri(env->bucket, "parquet/nation.parquet");
@@ -307,7 +343,8 @@ TEST_CASE("scan_manager S3 end-to-end surfaces missing-key failures after retrie
     return;
   }
 
-  auto manager      = make_scan_manager(*env);
+  host_cache_memory memory;
+  auto manager      = make_scan_manager(*env, memory.host_mr);
   auto missing_path = s3_uri(env->bucket, "definitely-does-not-exist.parquet");
   auto provider     = make_provider({missing_path}, manager);
 
@@ -324,7 +361,8 @@ TEST_CASE("scan_manager S3 end-to-end does not retry bad credentials indefinitel
     return;
   }
 
-  auto manager = make_scan_manager(*env, true);
+  host_cache_memory memory;
+  auto manager = make_scan_manager(*env, memory.host_mr, true);
   auto path    = s3_uri(env->bucket, "parquet/nation.parquet");
   auto* io_ctx = manager.io_ctx_for(path);
   REQUIRE(io_ctx != nullptr);

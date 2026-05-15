@@ -17,6 +17,7 @@
 #include "io/s3/s3_ioctx.hpp"
 
 #include "exec/thread_pool.hpp"
+#include "io/prefetching_cache.hpp"
 #include "io/s3/credential_provider.hpp"
 #include "io/s3/s3_io_object.hpp"
 #include "io/sirius_datasource.hpp"
@@ -282,7 +283,18 @@ s3_ioctx::s3_ioctx(s3_ioctx_config config) : _cfg(std::move(config))
   ensure_curl_inited();
 }
 
-s3_ioctx::~s3_ioctx() { shutdown(); }
+s3_ioctx::~s3_ioctx()
+{
+  // P3.9 teardown ordering: destroy the prefetch cache (and its worker /
+  // evictor jthreads) BEFORE shutting down the curl handle pool. The cache
+  // workers call back into host_read_io / device_read_io on cache miss; if
+  // the curl pool tears down first, an in-flight load would dereference
+  // freed handles. _cache lives on the sirius_ioctx base, so the default
+  // destructor would only reach it AFTER ~s3_ioctx() returns — too late
+  // because shutdown() has already invalidated _free_handles by then.
+  _cache.reset();
+  shutdown();
+}
 
 void s3_ioctx::shutdown()
 {
@@ -539,6 +551,7 @@ std::size_t s3_ioctx::range_get(std::string_view bucket,
           if (got_start != offset || got_end - got_start + 1 != size)
             fail("Content-Range mismatch");
         }
+        _bytes_read_total.fetch_add(sink.written, std::memory_order_relaxed);
         return sink.written;
       }
       if (last_http_code == 200) {
@@ -549,6 +562,7 @@ std::size_t s3_ioctx::range_get(std::string_view bucket,
         // interior range. Otherwise treat as a non-retriable response anomaly.
         if (offset != 0 || sink.total_received != size)
           fail("server returned 200 (no Range honored)");
+        _bytes_read_total.fetch_add(sink.written, std::memory_order_relaxed);
         return sink.written;
       }
     }
@@ -637,29 +651,141 @@ void s3_ioctx::host_read_async_io(sirius_io_object& obj,
     });
 }
 
+namespace {
+
+// Shared completion state for the per-range fan-out path. One ranges_ctx is
+// created per host_read_ranges_async_io call when a thread pool is present;
+// each pool task references it via shared_ptr. The last task to finish
+// (pending decrements to 0) invokes the user handler — either with the
+// summed byte count or with the first-captured exception_ptr.
+struct ranges_ctx {
+  std::shared_ptr<sirius::io::s3::s3_ioctx> self;
+  std::shared_ptr<sirius::io::sirius_io_object> obj_owner;
+  std::atomic<std::size_t> pending;
+  std::atomic<std::size_t> total_bytes{0};
+  std::mutex error_mtx;
+  std::exception_ptr first_error;
+  sirius::io::io_completion_handler handler;
+};
+
+}  // namespace
+
 void s3_ioctx::host_read_ranges_async_io(sirius_io_object& obj,
                                          std::vector<cudf::io::text::byte_range_info> const& ranges,
                                          std::span<cudf::host_span<std::byte>> dst,
                                          io_completion_handler handler)
 {
-  // Downcast self to s3_ioctx because host_read_ranges_impl is a private
-  // method of this class, not visible through the sirius_ioctx base pointer
-  // returned by shared_from_this().
-  auto self      = std::static_pointer_cast<s3_ioctx>(shared_from_this());
-  auto obj_owner = obj.shared_from_this();
-  // Materialize the dst descriptor array into owned storage. std::span is a
-  // non-owning view: capturing it by value preserves only (ptr, len), not the
-  // underlying host_span entries. The byte buffers each host_span points at
-  // remain caller-owned until the handler fires (standard async-I/O contract).
-  std::vector<cudf::host_span<std::byte>> dst_owned(dst.begin(), dst.end());
-  dispatch_async(_cfg.async_thread_pool,
-                 std::move(handler),
-                 [self, obj_owner, ranges, dst_owned = std::move(dst_owned)]() mutable {
-                   return self->host_read_ranges_impl(*obj_owner, ranges, dst_owned);
-                 });
+  // Async-only contract: every exit path delivers exactly one handler
+  // invocation, never throws synchronously. The cache worker
+  // (prefetching_cache::worker_loop) calls this without an outer try/catch
+  // and holds resources (allocated chunks, budget slot) that would leak
+  // if a sync throw escaped the call. Validation errors and lookup throws
+  // (shared_from_this / dynamic_cast / dst-size) are captured in Phase 1
+  // and dispatched as an exception_ptr through the handler in Phase 2.
+  auto* pool = _cfg.async_thread_pool;
+
+  // -- Phase 1: validation + setup. Any throw here is caught and surfaces
+  //    through the handler below; no resource leaks because nothing has
+  //    been scheduled yet.
+  std::shared_ptr<s3_ioctx> self_kept;
+  std::shared_ptr<sirius_io_object> obj_kept;
+  std::vector<std::size_t> clipped_sizes;
+  std::vector<std::size_t> offsets;
+  std::vector<std::uint8_t*> dst_ptrs;
+  std::exception_ptr setup_error;
+
+  try {
+    if (ranges.size() != dst.size())
+      throw std::invalid_argument("s3_ioctx::host_read_ranges: ranges/dst size mismatch");
+    self_kept = std::static_pointer_cast<s3_ioctx>(shared_from_this());
+    obj_kept  = obj.shared_from_this();
+    if (!ranges.empty()) {
+      auto& so                 = dynamic_cast<s3_io_object&>(obj);
+      std::size_t const obj_sz = so.size();
+      clipped_sizes.reserve(ranges.size());
+      offsets.reserve(ranges.size());
+      dst_ptrs.reserve(ranges.size());
+      for (std::size_t i = 0; i < ranges.size(); ++i) {
+        auto offset  = static_cast<std::size_t>(ranges[i].offset());
+        auto size    = static_cast<std::size_t>(ranges[i].size());
+        auto clipped = std::min(size, obj_sz > offset ? obj_sz - offset : std::size_t{0});
+        if (dst[i].size() < clipped)
+          throw std::invalid_argument("s3_ioctx::host_read_ranges: dst span too small");
+        clipped_sizes.push_back(clipped);
+        offsets.push_back(offset);
+        dst_ptrs.push_back(reinterpret_cast<std::uint8_t*>(dst[i].data()));
+      }
+    }
+  } catch (...) {
+    setup_error = std::current_exception();
+  }
+
+  // -- Phase 2a: no-pool fallback. dispatch_async already wraps the inner
+  //    op in try/catch and delivers exceptions through the handler, so a
+  //    setup_error here just flows through the same path.
+  if (pool == nullptr) {
+    if (setup_error) {
+      std::thread([h = std::move(handler), ep = setup_error]() mutable { h(0, ep); }).detach();
+      return;
+    }
+    std::vector<cudf::host_span<std::byte>> dst_owned(dst.begin(), dst.end());
+    dispatch_async(nullptr,
+                   std::move(handler),
+                   [self      = std::move(self_kept),
+                    obj_owner = std::move(obj_kept),
+                    ranges,
+                    dst_owned = std::move(dst_owned)]() mutable {
+                     return self->host_read_ranges_serial_impl(*obj_owner, ranges, dst_owned);
+                   });
+    return;
+  }
+
+  // -- Phase 2b: pool path. Setup errors and the empty-ranges shortcut
+  //    both deliver via a single pool task to preserve the "handler runs
+  //    on a pool thread" contract that the pre-P1.6 dispatch_async path
+  //    established.
+  if (setup_error) {
+    pool->schedule([h = std::move(handler), ep = setup_error]() mutable { h(0, ep); });
+    return;
+  }
+  if (ranges.empty()) {
+    pool->schedule([h = std::move(handler)]() mutable { h(0, nullptr); });
+    return;
+  }
+
+  // -- Phase 2c: pool path fan-out. One task per range, shared ctx tracks
+  //    completion; last task to decrement pending fires the handler.
+  auto ctx = std::make_shared<ranges_ctx>();
+  ctx->self.swap(self_kept);
+  ctx->obj_owner.swap(obj_kept);
+  ctx->pending.store(ranges.size(), std::memory_order_relaxed);
+  ctx->handler = std::move(handler);
+
+  for (std::size_t i = 0; i < ranges.size(); ++i) {
+    auto offset = offsets[i];
+    auto size   = clipped_sizes[i];
+    auto* dst_i = dst_ptrs[i];
+    pool->schedule([ctx, offset, size, dst_i]() {
+      try {
+        std::size_t bytes = 0;
+        if (size > 0) { bytes = ctx->self->host_read_io(*ctx->obj_owner, offset, size, dst_i); }
+        ctx->total_bytes.fetch_add(bytes, std::memory_order_relaxed);
+      } catch (...) {
+        std::scoped_lock lk(ctx->error_mtx);
+        if (!ctx->first_error) ctx->first_error = std::current_exception();
+      }
+      if (ctx->pending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        if (ctx->first_error) {
+          ctx->handler(0, ctx->first_error);
+        } else {
+          ctx->handler(ctx->total_bytes.load(std::memory_order_relaxed), nullptr);
+        }
+      }
+    });
+  }
 }
 
-std::size_t s3_ioctx::host_read_ranges_impl(
+std::size_t s3_ioctx::host_read_ranges_serial_impl(
   sirius_io_object& obj,
   std::vector<cudf::io::text::byte_range_info> const& ranges,
   std::span<cudf::host_span<std::byte>> dst)
@@ -670,11 +796,8 @@ std::size_t s3_ioctx::host_read_ranges_impl(
   std::size_t const obj_sz = so.size();
   std::size_t total        = 0;
   for (std::size_t i = 0; i < ranges.size(); ++i) {
-    auto offset = static_cast<std::size_t>(ranges[i].offset());
-    auto size   = static_cast<std::size_t>(ranges[i].size());
-    // Clip per-range to EOF first (mirrors host_read_io single-range semantics);
-    // validate dst against the clipped size so an EOF-crossing range with a
-    // dst sized for the actual returned bytes does not spuriously throw.
+    auto offset  = static_cast<std::size_t>(ranges[i].offset());
+    auto size    = static_cast<std::size_t>(ranges[i].size());
     auto clipped = std::min(size, obj_sz > offset ? obj_sz - offset : std::size_t{0});
     if (dst[i].size() < clipped)
       throw std::invalid_argument("s3_ioctx::host_read_ranges: dst span too small");

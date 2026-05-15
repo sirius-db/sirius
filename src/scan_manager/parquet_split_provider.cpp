@@ -317,8 +317,8 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     std::size_t footer_byte_len = 0;
     std::unique_ptr<op::scan::hybrid_scan_reader> reader_ptr;
 
-    if (file_io_object && _io_ctx != nullptr && _io_ctx->cache() != nullptr) {
-      if (auto cached = _io_ctx->cache()->get_metadata(*file_io_object)) {
+    if (file_io_object && file_io_ctx && file_io_ctx->cache() != nullptr) {
+      if (auto cached = file_io_ctx->cache()->get_metadata(*file_io_object)) {
         cached_parquet_metadata = std::dynamic_pointer_cast<parquet_metadata>(std::move(cached));
       }
     }

@@ -400,6 +400,14 @@ set(TEST_SOURCES
     test/cpp/io/test_uri_parser.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
+    # P7 perf benchmark is temporarily excluded from the default test build
+    # until the SF10 fixture (~6-7GB lineitem.parquet) is provisioned on the
+    # CI MinIO. The hidden `[!benchmark][s3][perf][bench]` tag, the
+    # `make s3-bench` / `make s3-bench-fixtures` targets, the
+    # `s3_ioctx::bytes_read_total()` accessor, and the
+    # `prefetching_cache::total_size_bytes()` accessor are all retained so the
+    # benchmark can be re-enabled by uncommenting this line.
+    # test/cpp/integration/test_s3_perf_benchmark.cpp
     test/cpp/integration/test_scan_manager_s3_end_to_end.cpp
     test/cpp/integration/test_transparent_execution.cpp
     test/cpp/memory/test_host_table_utils.cpp

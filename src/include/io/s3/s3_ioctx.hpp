@@ -19,6 +19,7 @@
 #include "io/io_context.hpp"
 #include "io/s3/credential_provider.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -137,15 +138,20 @@ struct s3_ioctx_config {
  * workers stay alive on their own through @c shared_from_this() captures
  * and finish whatever request they had in flight before returning.
  *
- * @par Resources NOT yet injected
+ * @par Resource injection
  *
  * - **Thread pool**. Async paths (@c host_read_async_io,
- *   @c host_read_ranges_async_io, @c device_read_async_io) currently spawn
- *   a per-request @c std::thread().detach(); the worker captures
+ *   @c host_read_ranges_async_io, @c device_read_async_io) schedule their
+ *   work on the caller-injected @c s3_ioctx_config::async_thread_pool when
+ *   one is provided (the engine's @c sirius_scan_manager owns an 8-thread
+ *   pool by default and wires it in). When no pool is injected, async
+ *   paths fall back to per-request @c std::thread().detach() for
+ *   standalone-test scenarios. Either way, the worker captures
  *   @c shared_from_this() and @c obj.shared_from_this() so the ioctx +
- *   io_object stay alive through the detached worker. A future enhancement
- *   could inject a shared @c bounded_thread_pool — see the follow-up PR
- *   (thread-pool injection + S3 HTTP retry).
+ *   io_object stay alive through the in-flight request.
+ *   @c host_read_ranges_async_io fans out one task per range when a pool
+ *   is wired, mirroring the worker count and avoiding the serial-latency
+ *   stacking that the single-task path would exhibit.
  * - **CUDA stream**. Caller-supplied per request on the device-read path.
  */
 class s3_ioctx final : public sirius_ioctx {
@@ -205,14 +211,29 @@ class s3_ioctx final : public sirius_ioctx {
   /// must outlive the completion handler — same contract as the
   /// @c uint8_t* @c dst in @c host_read_async_io.
   ///
+  /// When @c s3_ioctx_config::async_thread_pool is set, the implementation
+  /// schedules one task per range onto the pool so the per-cURL latency of
+  /// independent ranges overlaps (P1.6 fan-out). The user handler fires
+  /// exactly once from a pool thread after every range either completes or
+  /// errors — successful byte counts are summed; the first observed
+  /// exception (if any) is delivered through the handler's
+  /// @c exception_ptr. When no pool is wired, the implementation falls
+  /// back to a single-task serial walk on a detached @c std::thread.
+  ///
   /// Each @c ranges[i] is clipped to
   /// @c min(ranges[i].size(), obj.size() - ranges[i].offset()) before
   /// validation; the @c dst[i].size() check is against the clipped size, so
   /// an EOF-crossing range with a dst sized for the actual returned bytes
-  /// does not throw. Ranges starting at or beyond EOF contribute zero bytes.
-  /// Throws @c std::invalid_argument (delivered via the completion handler's
-  /// @c exception_ptr) when @c dst[i].size() is smaller than the clipped
-  /// size for any range. Mirrors single-range @c host_read_io EOF semantics.
+  /// does not error. Ranges starting at or beyond EOF contribute zero bytes.
+  ///
+  /// Validation errors (@c ranges/dst size mismatch, @c dst[i].size() smaller
+  /// than the clipped size) and lookup errors (@c bad_weak_ptr from
+  /// @c shared_from_this on an unowned object, @c bad_cast from a
+  /// non-S3 @c sirius_io_object) are *not* thrown synchronously — they
+  /// are caught and delivered through the completion handler's
+  /// @c exception_ptr from a pool / detached worker, preserving the
+  /// async-only "exactly one handler invocation" contract that the cache
+  /// worker (and other callers without their own try/catch) rely on.
   void host_read_ranges_async_io(sirius_io_object& obj,
                                  std::vector<cudf::io::text::byte_range_info> const& ranges,
                                  std::span<cudf::host_span<std::byte>> dst,
@@ -246,6 +267,21 @@ class s3_ioctx final : public sirius_ioctx {
   cudf::io::text::byte_range_info compute_physical_range(cudf::io::text::byte_range_info logical,
                                                          std::size_t file_size) const override;
 
+  // -- Observability --------------------------------------------------------
+
+  /// Cumulative bytes returned by @c range_get since construction. Each
+  /// successful HTTP body delivered into @c dst is added exactly once
+  /// (retried attempts of the same range are not double-counted because
+  /// the counter is bumped only on the success-return path). Intended for
+  /// perf benchmarks (P7) and observability — every call to
+  /// @c host_read_io / @c host_read_async_io / @c host_read_ranges_async_io /
+  /// @c device_read_io / @c device_read_async_io that misses the cache
+  /// passes through @c range_get and increments this counter.
+  [[nodiscard]] std::uint64_t bytes_read_total() const noexcept
+  {
+    return _bytes_read_total.load(std::memory_order_relaxed);
+  }
+
  private:
   struct handle_slot;
 
@@ -258,15 +294,18 @@ class s3_ioctx final : public sirius_ioctx {
                         std::size_t size,
                         std::uint8_t* dst);
 
-  /// Sync multi-range implementation. Used internally by
-  /// @c host_read_ranges_async_io after its lambda owns the descriptor
-  /// array; not exposed in the public contract because the new
-  /// @c sirius_ioctx base only offers an async multi-range entry point.
-  /// Applies the clip-then-validate semantics documented on
+  /// Serial multi-range implementation. Used by @c host_read_ranges_async_io
+  /// only when @c _cfg.async_thread_pool is null (test/standalone scenarios
+  /// where no caller pool is wired in). When a pool is present, the async
+  /// entry point fans out one task per range instead — see P1.6 in the
+  /// PR4+5 runtime integration plan. Not exposed in the public contract
+  /// because the new @c sirius_ioctx base only offers an async multi-range
+  /// entry point. Applies the clip-then-validate semantics documented on
   /// @c host_read_ranges_async_io.
-  std::size_t host_read_ranges_impl(sirius_io_object& obj,
-                                    std::vector<cudf::io::text::byte_range_info> const& ranges,
-                                    std::span<cudf::host_span<std::byte>> dst);
+  std::size_t host_read_ranges_serial_impl(
+    sirius_io_object& obj,
+    std::vector<cudf::io::text::byte_range_info> const& ranges,
+    std::span<cudf::host_span<std::byte>> dst);
 
   struct handle_slot {
     s3_ioctx* owner{nullptr};
@@ -304,6 +343,10 @@ class s3_ioctx final : public sirius_ioctx {
   std::vector<void*> _free_handles;
   std::size_t _total_handles{0};
   bool _shutdown{false};
+
+  /// See @c bytes_read_total(). Updated only inside @c range_get on the
+  /// success-return path (HTTP 206 / 200 with validated body length).
+  std::atomic<std::uint64_t> _bytes_read_total{0};
 };
 
 }  // namespace sirius::io::s3
