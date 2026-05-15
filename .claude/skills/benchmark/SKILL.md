@@ -117,7 +117,8 @@ pixi run python test/tpch_performance/performance_test.py \
 - `--queries <spec>` — comma list with ranges, e.g. `1,3,6-10` (default: all 22).
 - `--config <yaml>` — overrides `$SIRIUS_CONFIG_FILE` for the run; copied into `<benchmark_dir>/config.yml`.
 - `--output <dir>` — root directory for benchmark output (default: `test/tpch_performance/output/`). A timestamped subdir is always created underneath.
-- `--validation` — after timing, re-run each query on CPU and GPU and assert results match.
+- `--name <NAME>` — override the auto-generated benchmark subdirectory name. When set, output goes to `<output>/<NAME>/` instead of `<output>/tpch_<ts>_<mode>_<engine>_iter<N>/`. Useful for labeling runs (e.g. `--name baseline`, `--name with-fix`). Omit for the default timestamped name.
+- `--validation` — after timing, compare the saved `<engine>/q<N>/result.txt` files for CPU and GPU. Byte-exact match first, then `abs_tol=1e-10` on float columns (strict equality on Decimal/int/string/date). Requires `--engine both`; rejected otherwise. No query re-execution (so no second Sirius extension load and no risk of GPU pool re-init OOM).
 
 **Iteration ordering (`--mode`):**
 - `grouped` (default) — per query: run all N iterations back-to-back; one connection per engine. Best for hot-cache measurement.
@@ -125,9 +126,8 @@ pixi run python test/tpch_performance/performance_test.py \
 - `isolated` — renew the DuckDB connection per (query, iteration) and `drop_os_cache` before every run. True cold-start every execution. Requires the passwordless sudo setup below.
 
 **Pin-table (Sirius cache pre-load):**
-- `--pinning-mode {none, per-query}` — default `none`. In `grouped`/`isolated` modes `per-query` pins/unpins around each query's iteration block; in `sequential` mode it emits a single union-pin (all referenced columns per table) at session start and a union-unpin at the end.
-- `--pin-tier {gpu, host}` — default `gpu`. Selects the Sirius cache tier.
-- `--pinning-mode per-query` is rejected when combined with `--engine cpu` (pin is Sirius-only).
+- `--pin {none, gpu, host}` — default `none`. `gpu` or `host` selects the Sirius cache tier; `none` disables pinning. Pin is per-query in `grouped`/`isolated` mode (pinned/unpinned around each query's iteration block) and a single union-pin (all referenced columns per table) at session start in `sequential` mode.
+- `--pin gpu`/`--pin host` is rejected when combined with `--engine cpu` (pin is Sirius-only).
 - Column lists per query live in `test/tpch_performance/tpch_pin_columns.py` (`QUERY_COLUMNS`). The runner imports `emit_pin` / `emit_unpin` / `emit_pin_all` / `emit_unpin_all` from that module.
 
 **Examples:**
@@ -141,13 +141,13 @@ pixi run python test/tpch_performance/performance_test.py \
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf100 \
     --queries 1,3,6 --iterations 3 --mode grouped --engine gpu \
-    --pinning-mode per-query --pin-tier gpu
+    --pin gpu
 
 # Sequential round-robin with a single host-tier union-pin
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf10 \
     --iterations 2 --mode sequential --engine gpu \
-    --pinning-mode per-query --pin-tier host
+    --pin host
 
 # Cold-start measurement (renew connection + drop OS cache per run)
 pixi run python test/tpch_performance/performance_test.py \
@@ -173,7 +173,7 @@ echo "$(whoami) ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches" | su
 `<output_dir>/tpch_<YYYYMMDD_HHMMSS>_<mode>_<engine>_iter<N>/`
 
 - `config.yml` — copy of the Sirius config used (only when `--config` is provided).
-- `metadata.json` — fields: `commit`, `branch_name`, `date`, `mode`, `iterations`, `engine`, `queries`, `pinning_mode`, `pin_tier`, `runtime_file`.
+- `metadata.json` — fields: `commit`, `branch_name`, `date`, `mode`, `iterations`, `engine`, `queries`, `pin`, `runtime_file`.
 - `csv/runtimes.csv` — long-format header `engine, query, iteration, runtime_s`.
 - `log_dir/sirius_YYYY-MM-DD.log` — combined Sirius spdlog daily-sink output (`SIRIUS_LOG_DIR` target).
 - `<engine>/q<N>/result.txt` — fetched rows for that query, one `repr(row)` per line. Overwritten on each iteration (last iter wins).
@@ -185,5 +185,6 @@ echo "$(whoami) ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches" | su
 
 - **Ask the user** for any paths you don't know. Do NOT assume paths.
 - **Ask about data**: Does the parquet dataset already exist? If yes, ask for the directory path. If no, confirm the user wants to generate it before proceeding — data generation can take significant time and disk space at large scale factors. Do NOT auto-generate without asking.
+- **Optionally ask for `--name`**: offer the user the option to label the output subdirectory (e.g. `baseline`, `with-fix`, `sf1000-host-pin`). If they decline or don't provide one, omit `--name` and let the default `tpch_<ts>_<mode>_<engine>_iter<N>` name be used. Do not invent a name unprompted.
 - Ensure the Sirius extension is built: `pixi run -e clang make release` (the runner loads `build/release/extension/sirius/sirius.duckdb_extension` for any GPU engine).
 - For Super Sirius: ensure `SIRIUS_CONFIG_FILE` is set, or pass `--config <yaml>` to `performance_test.py`.

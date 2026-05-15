@@ -91,6 +91,7 @@ def setup_benchmark_dir(
     queries,
     config_path,
     pin,
+    name=None,
 ):
     """Create the benchmark output directory and return its paths.
 
@@ -103,9 +104,15 @@ def setup_benchmark_dir(
           log_dir/                  (SIRIUS_LOG_DIR target)
           <engine>/q<N>/result.txt  (one repr(row) per line)
           sirius/q<N>/sirius.log    (post-run split of combined log)
+
+    If `name` is provided, the benchmark dir is `<output_root>/<name>` (no
+    timestamp); otherwise the default `tpch_<ts>_<mode>_<engine>_iter<N>` is used.
     """
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    benchmark_name = f"tpch_{ts}_{mode}_{engine}_iter{iterations}"
+    if name:
+        benchmark_name = name
+    else:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        benchmark_name = f"tpch_{ts}_{mode}_{engine}_iter{iterations}"
     benchmark_dir = os.path.join(output_root, benchmark_name)
     csv_dir = os.path.join(benchmark_dir, "csv")
     log_dir = os.path.join(benchmark_dir, "log_dir")
@@ -607,6 +614,16 @@ def parse_args():
             "session start in sequential mode. (default: none)"
         ),
     )
+    p.add_argument(
+        "--name",
+        type=str,
+        default=None,
+        help=(
+            "Name for the benchmark output subdirectory under --output. "
+            "Overrides the default 'tpch_<ts>_<mode>_<engine>_iter<N>'. "
+            "Re-runs with the same name will overwrite per-iteration outputs."
+        ),
+    )
     return p.parse_args()
 
 
@@ -651,6 +668,7 @@ def main():
         queries,
         config_path,
         args.pin,
+        name=args.name,
     )
     os.environ["SIRIUS_LOG_DIR"] = log_dir
 
