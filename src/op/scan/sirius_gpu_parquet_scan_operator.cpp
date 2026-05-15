@@ -275,6 +275,7 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
 std::size_t sirius_gpu_parquet_scan_operator::no_history_peak_memory_estimate(
   const op::input_stats& stats) const
 {
+  if (stats.type == op::operator_data_type::SCAN_CACHED) { return stats.bytes; }
   return stats.bytes * 8;
 }
 

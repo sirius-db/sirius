@@ -127,6 +127,11 @@ class parquet_scan_data : public op::operator_data {
   {
   }
 
+  [[nodiscard]] op::operator_data_type get_type() const override
+  {
+    return op::operator_data_type::PARQUET_SCAN;
+  }
+
   /**
    * @brief Capture the task's reserved memory space so that
    *        sirius_gpu_parquet_scan_operator::execute() can tag its output batches with it.
@@ -203,6 +208,11 @@ class scan_cached_operator_data : public op::operator_data {
       filter_expression(std::move(filter_expression)),
       plan(std::move(plan))
   {
+  }
+
+  [[nodiscard]] op::operator_data_type get_type() const override
+  {
+    return op::operator_data_type::SCAN_CACHED;
   }
 
   /**

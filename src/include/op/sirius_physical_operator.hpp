@@ -56,6 +56,21 @@ struct task_creation_hint {
 };
 
 /**
+ * @brief Tag identifying the concrete operator_data subclass.
+ *
+ * Returned by operator_data::get_type() so callers can branch on the runtime
+ * type without a dynamic_cast. Each subclass overrides get_type() to return
+ * its own value; BASE is the default for the unspecialized base class.
+ */
+enum class operator_data_type : uint8_t {
+  BASE,
+  PIPELINEABLE,
+  PARTITIONED,
+  PARQUET_SCAN,
+  SCAN_CACHED,
+};
+
+/**
  * @brief Generic base class for operator input/output data.
  *
  * This is an intentionally minimal base class with no opinion on what the
@@ -70,6 +85,14 @@ class operator_data {
   operator_data& operator=(const operator_data&) = default;
   operator_data(operator_data&&)                 = default;
   operator_data& operator=(operator_data&&)      = default;
+
+  /**
+   * @brief Identify the concrete subclass at runtime.
+   *
+   * Subclasses override to return their own operator_data_type. The base
+   * implementation returns operator_data_type::BASE.
+   */
+  [[nodiscard]] virtual operator_data_type get_type() const { return operator_data_type::BASE; }
 
   /**
    * @brief Per-task preparation hook invoked before the operator consumes this data.
@@ -146,6 +169,11 @@ class pipelineable_operator_data : public operator_data {
   {
   }
 
+  [[nodiscard]] operator_data_type get_type() const override
+  {
+    return operator_data_type::PIPELINEABLE;
+  }
+
   /**
    * @brief Get idle data batch pointers, lazily populating from read-only batches if needed.
    */
@@ -210,6 +238,11 @@ class partitioned_operator_data : public pipelineable_operator_data {
   {
   }
 
+  [[nodiscard]] operator_data_type get_type() const override
+  {
+    return operator_data_type::PARTITIONED;
+  }
+
   /**
    * @brief Get the partition index.
    * @return Partition index
@@ -223,12 +256,15 @@ class partitioned_operator_data : public pipelineable_operator_data {
 /**
  * @brief Input statistics passed to no_history_peak_memory_estimate().
  *
- * Carries the two dimensions that operator overrides typically condition on:
- * the number of input batches and the total uncompressed byte count.
+ * Carries the dimensions that operator overrides typically condition on: the
+ * number of input batches, the total uncompressed byte count, and the runtime
+ * type of the operator_data feeding the task (so overrides can branch on the
+ * concrete input shape without a dynamic_cast).
  */
 struct input_stats {
   std::size_t num_batches = 0;
   std::size_t bytes       = 0;
+  operator_data_type type = operator_data_type::BASE;
 };
 
 //! sirius_physical_operator is the base class of the physical operators present in the
