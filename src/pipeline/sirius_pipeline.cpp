@@ -25,6 +25,7 @@
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
+#include "op/sirius_physical_iceberg_scan.hpp"
 #include "op/sirius_physical_parquet_scan.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "sirius/exception.hpp"
@@ -339,65 +340,92 @@ void sirius_pipeline::notify_downstream_pipelines()
   }
 }
 
+std::unique_lock<std::mutex> sirius_pipeline::get_task_creation_lock()
+{
+  return std::unique_lock<std::mutex>(_status_mutex);
+}
+
 void sirius_pipeline::update_pipeline_status()
 {
-  auto end_nvtx_range_if_finished = [this]() {
-    if (pipeline_finished.load() && _nvtx_range_started.load()) {
-      nvtxRangeEnd(_nvtx_pipeline_range_id);
-    }
-  };
+  bool should_notify = false;
+  {
+    std::lock_guard<std::mutex> lock(_status_mutex);
 
-  // Skip if already finished — avoids redundant re-evaluation and re-notification.
-  if (pipeline_finished.load()) {
-    notify_downstream_pipelines();
-    return;
-  }
+    auto end_nvtx_range_if_finished = [this]() {
+      if (pipeline_finished.load() && _nvtx_range_started.load()) {
+        nvtxRangeEnd(_nvtx_pipeline_range_id);
+      }
+    };
 
-  if (get_source()->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
-    auto& table_scan = get_source()->Cast<op::sirius_physical_duckdb_scan>();
-    if (table_scan.exhausted) {  // WSM amin TODO: can we use exhausted? how about we use
-                                 // get_next_task_hint() to check if the source is ready?
-      pipeline_finished.store(true);
-      end_nvtx_range_if_finished();
-      notify_downstream_pipelines();
-      return;
-    }
-  } else if (get_source()->type == op::SiriusPhysicalOperatorType::CPU_SOURCE) {
-    auto& cpu_source = get_source()->Cast<op::sirius_physical_cpu_source>();
-    if (cpu_source.exhausted.load()) {
-      if (tasks_created.load() == tasks_completed.load()) {
-        pipeline_finished = true;
-        notify_downstream_pipelines();
-      }
-      end_nvtx_range_if_finished();
-      return;
-    }
-  } else {
-    op::sirius_physical_operator* first_node =
-      operators.size() > 0 ? &operators[0].get() : (sink ? sink.get() : nullptr);
-    if (first_node == nullptr) { throw internal_exception("First node of pipeline is nullptr"); }
-    // Check if any operator has exhausted its limit — this allows the pipeline to finish
-    // early without waiting for the source pipeline to drain all remaining batches.
-    bool limit_exhausted = false;
-    for (auto& op_ref : operators) {
-      if (op_ref.get().is_limit_exhausted()) {
-        limit_exhausted = true;
-        break;
-      }
-    }
-    if (limit_exhausted ||
-        (first_node->is_source_pipeline_finished() && first_node->all_ports_empty())) {
-      if (tasks_created.load() == tasks_completed.load()) {
-        pipeline_finished.store(true);
-        for (auto& op : get_operators()) {
-          op.get().finalize_operator();
+    // Skip if already finished — avoids redundant re-evaluation and re-notification.
+    if (pipeline_finished.load()) {
+      should_notify = true;
+    } else if (get_source()->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
+      auto& table_scan = get_source()->Cast<op::sirius_physical_duckdb_scan>();
+      if (table_scan.exhausted.load()) {
+        if (tasks_created.load() == tasks_completed.load()) {
+          pipeline_finished.store(true);
+          for (auto& op : get_operators()) {
+            op.get().finalize_operator();
+          }
+          should_notify = true;
         }
         end_nvtx_range_if_finished();
-        notify_downstream_pipelines();
       }
+    } else if (get_source()->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
+      auto& parquet_scan = static_cast<op::sirius_physical_parquet_scan&>(*get_source());
+      if (!parquet_scan.has_more_partitions.load()) {
+        if (tasks_created.load() == tasks_completed.load()) {
+          pipeline_finished.store(true);
+          for (auto& op : get_operators()) {
+            op.get().finalize_operator();
+          }
+          should_notify = true;
+        }
+        end_nvtx_range_if_finished();
+      }
+    } else if (get_source()->type == op::SiriusPhysicalOperatorType::CPU_SOURCE) {
+      auto& cpu_source = get_source()->Cast<op::sirius_physical_cpu_source>();
+      if (cpu_source.exhausted.load()) {
+        if (tasks_created.load() == tasks_completed.load()) {
+          pipeline_finished.store(true);
+          for (auto& op : get_operators()) {
+            op.get().finalize_operator();
+          }
+          should_notify = true;
+        }
+        end_nvtx_range_if_finished();
+      }
+    } else {
+      op::sirius_physical_operator* first_node =
+        operators.size() > 0 ? &operators[0].get() : (sink ? sink.get() : nullptr);
+      if (first_node == nullptr) { throw internal_exception("First node of pipeline is nullptr"); }
+      // Check if any operator has exhausted its limit — this allows the pipeline to finish
+      // early without waiting for the source pipeline to drain all remaining batches.
+      bool limit_exhausted = false;
+      for (auto& op_ref : operators) {
+        if (op_ref.get().is_limit_exhausted()) {
+          limit_exhausted = true;
+          break;
+        }
+      }
+      if (limit_exhausted ||
+          (first_node->is_source_pipeline_finished() && first_node->all_ports_empty())) {
+        if (tasks_created.load() == tasks_completed.load()) {
+          pipeline_finished.store(true);
+          for (auto& op : get_operators()) {
+            op.get().finalize_operator();
+          }
+          end_nvtx_range_if_finished();
+          should_notify = true;
+        }
+      }
+      if (!pipeline_finished.load()) { end_nvtx_range_if_finished(); }
     }
-    if (!pipeline_finished.load()) { end_nvtx_range_if_finished(); }
-  }
+  }  // _status_mutex released here — notify_downstream_pipelines must run outside the lock
+     // to avoid holding the child pipeline mutex while acquiring a parent's
+
+  if (should_notify) { notify_downstream_pipelines(); }
 }
 
 void sirius_pipeline::mark_task_created()

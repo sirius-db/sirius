@@ -565,7 +565,7 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_task_loca
 
   [[nodiscard]] std::size_t get_task_consumption_basis() const override
   {
-    return get_reserved_compressed_bytes();
+    return get_reserved_uncompressed_bytes();
   }
 
   /**
@@ -619,6 +619,7 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
       _task_id(task_id),
       _data_repo(data_repo)
   {
+    if (auto pipeline = g_state->get_operator().get_pipeline()) { pipeline->mark_task_created(); }
   }
 
   ~parquet_scan_task() override;
@@ -650,12 +651,15 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
   void publish_output(op::operator_data& output_data, rmm::cuda_stream_view stream) override;
 
   /**
-   * @brief Get the estimated reservation size for this task, which is the number of compressed
-   * bytes reserved by this task's local state.
+   * @brief Compute the full reservation size breakdown for this task.
    *
-   * @return The estimated reservation size in bytes.
+   * Uses pipeline_memory_history to refine the estimate when history is available.
+   * bytes_to_materialize_input is always 0 for scan tasks.
+   *
+   * @return reservation_size_info with all fields populated.
    */
-  [[nodiscard]] std::size_t get_estimated_reservation_size() const override;
+  [[nodiscard]] pipeline::reservation_size_info get_estimated_reservation_size_info()
+    const override;
 
   /**
    * @brief Get the output consumers operators for this task.

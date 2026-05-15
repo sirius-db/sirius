@@ -263,9 +263,10 @@ void duckdb_scan_executor::manager_loop()
         parquet_task->set_materialized_columns(
           wrap_batch_data, cache_decoded_table, _gpu_memory_space);
       }
-      auto bytes_needed = scan_task->get_estimated_reservation_size();
-      auto reservation  = _mem_mgr->request_reservation(
-        cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST}, bytes_needed);
+      auto reservation_info = scan_task->get_estimated_reservation_size_info();
+      auto reservation      = _mem_mgr->request_reservation(
+        cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST},
+        reservation_info.reservation_size);
       if (!reservation) {
         SIRIUS_LOG_ERROR("DuckDB Scan Executor: Failed to acquire host memory reservation");
         _completion_handler->report_error(
@@ -274,11 +275,43 @@ void duckdb_scan_executor::manager_loop()
       }
       if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
             scan_task->local_state())) {
-        local_state->set_reservation(std::move(reservation));
+        local_state->set_reservation(std::move(reservation), reservation_info);
       } else {
         _completion_handler->report_error(
           "DuckDB Scan Executor: Failed to cast local state for task");
         SIRIUS_LOG_ERROR("DuckDB Scan Executor: Failed to cast local state for task");
+        break;
+      }
+    } else if (scan_task && scan_task->is<duckdb_scan_task>()) {
+      auto reservation_info = scan_task->get_estimated_reservation_size_info();
+      if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
+            scan_task->local_state())) {
+        local_state->set_reservation(nullptr, reservation_info);
+      } else {
+        _completion_handler->report_error(
+          "DuckDB Scan Executor: Failed to cast local state for duckdb_scan_task");
+        SIRIUS_LOG_ERROR("DuckDB Scan Executor: Failed to cast local state for duckdb_scan_task");
+        break;
+      }
+    } else if (scan_task && scan_task->is<cpu_source_task>()) {
+      auto reservation_info = scan_task->get_estimated_reservation_size_info();
+      auto reservation      = _mem_mgr->request_reservation(
+        cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST},
+        reservation_info.reservation_size);
+      if (!reservation) {
+        SIRIUS_LOG_ERROR(
+          "DuckDB Scan Executor: Failed to acquire host memory reservation for CPU source");
+        _completion_handler->report_error(
+          "DuckDB Scan Executor: Failed to acquire host memory reservation for CPU source");
+        break;
+      }
+      if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
+            scan_task->local_state())) {
+        local_state->set_reservation(std::move(reservation), reservation_info);
+      } else {
+        _completion_handler->report_error(
+          "DuckDB Scan Executor: Failed to cast local state for cpu_source_task");
+        SIRIUS_LOG_ERROR("DuckDB Scan Executor: Failed to cast local state for cpu_source_task");
         break;
       }
     }

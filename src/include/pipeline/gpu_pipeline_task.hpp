@@ -66,7 +66,6 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
                                          size_t start_operator_index = 0)
     : _input_data(std::move(input_data)), _start_operator_index(start_operator_index)
   {
-    _bytes_to_materialize_input = get_estimated_bytes_to_materialize_input();
   }
 
   std::unique_ptr<op::operator_data> _input_data;  ///< Input data batches for the pipeline
@@ -77,27 +76,12 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
   /// Task ID of the original (non-retried) task; only meaningful when retry_count > 0.
   std::optional<uint64_t> original_task_id = std::nullopt;
 
-  // We want to cache the estimation basis, because its going to be calculated from the inputs, but
-  // if the inputs change due to preparing for processing then we will loose this information and we
-  // can't then provide it to the operator history
-  mutable std::optional<std::size_t> _estimation_basis = std::nullopt;
-
-  // The peak bytes observed to materialize the input data. We need to track this so we can subtract
-  // it from the peak bytes observed to compute the operators' peak bytes.
-  size_t _bytes_to_materialize_input = 0;
-
-  /**
-   * @brief Get a const pointer to the reservation (non-owning).
-   *
-   * @return const cucascade::memory::reservation* Pointer to the reservation, or nullptr
-   */
-  const cucascade::memory::reservation* get_reservation() const { return _reservation.get(); }
-
   [[nodiscard]] std::size_t get_task_consumption_basis() const override
   {
-    if (_estimation_basis) { return *_estimation_basis; }
-    _estimation_basis = _input_data ? _input_data->get_estimated_size_in_bytes() : 0;
-    return *_estimation_basis;
+    if (_reservation_size_info) { return _reservation_size_info->input_basis; }
+    // Fallback for code paths that call this before get_estimated_reservation_size_info()
+    // (e.g. tests that bypass the normal executor flow).
+    return _input_data ? _input_data->get_estimated_size_in_bytes() : 0;
   }
 
   [[nodiscard]] std::size_t get_estimated_bytes_to_materialize_input() const
@@ -190,23 +174,11 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    */
   std::size_t get_input_size() const;
 
-  std::size_t get_estimated_reservation_size() const override;
+  [[nodiscard]] pipeline::reservation_size_info get_estimated_reservation_size_info()
+    const override;
 
   /// @brief Get the output consumer operators for this task.
   std::vector<op::sirius_physical_operator*> get_output_consumers() override;
-
-  /**
-   * @brief Mark this task as rescheduled due to OOM.
-   *
-   * When set, the destructor will NOT call mark_task_completed() on the pipeline,
-   * since the rescheduled replacement task will handle that instead.
-   */
-  void mark_as_rescheduled() noexcept { _oom_rescheduled = true; }
-
-  /**
-   * @brief Check if this task was rescheduled due to OOM.
-   */
-  [[nodiscard]] bool is_rescheduled() const noexcept { return _oom_rescheduled; }
 
   /**
    * @brief Get the data repositories for output publishing.
@@ -245,7 +217,6 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
  private:
   uint64_t _task_id;
   std::vector<cucascade::shared_data_repository*> _data_repos;
-  bool _oom_rescheduled                                             = false;
   cucascade::memory::reservation_aware_resource_adaptor* _allocator = nullptr;
   /// Input data_batches held for subscribe/unsubscribe lifecycle (LIFE-01/LIFE-02, D-06)
   std::vector<std::shared_ptr<cucascade::data_batch>> _input_batches;

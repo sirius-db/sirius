@@ -21,14 +21,12 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <duckdb/common/types.hpp>
-#include <duckdb/main/client_context.hpp>
 #include <op/sirius_physical_cpu_source.hpp>
 #include <parallel/task.hpp>
 #include <pipeline/sirius_pipeline.hpp>
 #include <pipeline/sirius_pipeline_itask.hpp>
 #include <pipeline/sirius_pipeline_task_states.hpp>
 #include <pipeline/task_scheduler.hpp>
-#include <sirius_context.hpp>
 
 namespace sirius::op::scan {
 
@@ -62,14 +60,10 @@ class cpu_source_task_local_state : public pipeline::sirius_pipeline_task_local_
  public:
   cpu_source_task_local_state() = default;
 
-  // Required override of the base class's pure virtual. The consumption
-  // basis feeds pipeline_memory_history (via estimate_peak_memory /
-  // record_on_failure / record) so the estimator can learn a task's memory
-  // footprint over time. cpu_source_task never exercises that code path: it
-  // does not call get_estimated_reservation_size(), does not record memory
-  // history, and is only scheduled through the CPU_SOURCE branch in
-  // task_creator/duckdb_scan_executor (neither reads this value). Return 0
-  // to satisfy the interface; the field is otherwise unused for this task.
+  // The consumption basis feeds pipeline_memory_history, which cpu_source_task
+  // does not use — its reservation size is estimated directly from the
+  // collection row count in get_estimated_reservation_size_info(), not from
+  // historical data. Return 0 to satisfy the interface.
   [[nodiscard]] std::size_t get_task_consumption_basis() const override { return 0; }
 };
 
@@ -85,8 +79,7 @@ class cpu_source_task : public pipeline::sirius_pipeline_itask {
   cpu_source_task(uint64_t task_id,
                   cucascade::shared_data_repository* data_repo,
                   std::unique_ptr<cpu_source_task_local_state> local_state,
-                  std::shared_ptr<cpu_source_task_global_state> global_state,
-                  duckdb::ClientContext& client_ctx);
+                  std::shared_ptr<cpu_source_task_global_state> global_state);
 
   ~cpu_source_task() override;
 
@@ -94,13 +87,13 @@ class cpu_source_task : public pipeline::sirius_pipeline_itask {
 
   void publish_output(op::operator_data& output_data, rmm::cuda_stream_view stream) override;
 
-  [[nodiscard]] std::size_t get_estimated_reservation_size() const override { return 0; }
+  [[nodiscard]] pipeline::reservation_size_info get_estimated_reservation_size_info()
+    const override;
 
   std::vector<op::sirius_physical_operator*> get_output_consumers() override;
 
  private:
   cucascade::shared_data_repository* _data_repo;
-  duckdb::ClientContext& _client_ctx;
 };
 
 }  // namespace sirius::op::scan

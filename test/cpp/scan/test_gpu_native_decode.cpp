@@ -242,10 +242,11 @@ TEST_CASE_METHOD(decode_env, "gpu_decode_table - throws on unsupported codec", "
 {
   std::vector<int32_t> dummy = {0};
   auto d                     = upload(dummy, stream.view());
-  // BITPACKING is a real DuckDB codec the dispatcher doesn't yet implement —
-  // picking it gives us a concrete "unimplemented codec" path without
-  // inventing a fake enum.
-  auto col = one_codec_column(I32, 1, CompressionType::COMPRESSION_BITPACKING, {segment(d, 0, 1)});
+  // DICTIONARY is a real DuckDB codec that this dispatcher doesn't yet
+  // implement — picking it gives us a concrete "unimplemented codec" path
+  // without inventing a fake enum. (RLE and BITPACKING used to fill this
+  // role; both have since been implemented.)
+  auto col = one_codec_column(I32, 1, CompressionType::COMPRESSION_DICTIONARY, {segment(d, 0, 1)});
 
   REQUIRE_THROWS_WITH(decode({col}), Catch::Contains("viability invariant violated"));
 }

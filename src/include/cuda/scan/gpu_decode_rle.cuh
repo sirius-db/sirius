@@ -16,9 +16,6 @@
 
 #pragma once
 
-// RLE decode entry for the GPU-native scan path. Routed from
-// `dispatch_data_run` in gpu_native_decode.cu.
-
 #include <cudf/types.hpp>
 
 #include <rmm/cuda_stream_view.hpp>

@@ -68,6 +68,7 @@ find_package(spdlog REQUIRED CONFIG)
 find_package(yaml-cpp REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
+find_package(OpenSSL REQUIRED)
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
 
@@ -148,6 +149,7 @@ set(EXTENSION_SOURCES
     src/downgrade/downgrade_executor.cpp
     src/expression/expression.cpp
     src/expression/join_condition.cpp
+    src/expression/value.cpp
     src/expression_executor/expression_executor_strategy.cpp
     src/expression_executor/gpu_expression_executor.cpp
     src/expression_executor/gpu_expression_translator.cpp
@@ -164,6 +166,8 @@ set(EXTENSION_SOURCES
     src/io/admission_control.cpp
     src/io/datasource_factory.cpp
     src/io/prefetching_cache.cpp
+    src/io/s3/sigv4.cpp
+    src/io/s3/sirius_sigv4_credential_provider.cpp
     src/io/sirius_datasource.cpp
     src/io/uri_parser.cpp
     src/io/uring/uring_ioctx.cpp
@@ -271,7 +275,7 @@ set(EXTENSION_SOURCES
 # Deleting src/legacy/ cleanly removes legacy build support.
 set(CUDA_SOURCES
     src/op/scan/equality_delete_mask.cu src/cuda/scan/gpu_decode_rle.cu
-    src/cuda/scan/gpu_native_decode.cu)
+    src/cuda/scan/gpu_decode_bitpacking.cu src/cuda/scan/gpu_native_decode.cu)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
   add_subdirectory(src/legacy)
   list(APPEND EXTENSION_SOURCES ${SIRIUS_LEGACY_SOURCES}
@@ -332,9 +336,10 @@ endforeach()
 
 # Additional libraries only needed by the static extension
 target_link_libraries(sirius_extension PkgConfig::NUMA PkgConfig::LIBURING
-                      yaml-cpp::yaml-cpp absl::any_invocable)
+                      OpenSSL::Crypto yaml-cpp::yaml-cpp absl::any_invocable)
 
-target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING)
+target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING
+                      OpenSSL::Crypto)
 
 # Required by DuckDB's export set (duckdb_static -> sirius_extension ->
 # cucascade_static / telemetry_bridge)
@@ -372,9 +377,13 @@ set(TEST_SOURCES
     test/cpp/expression/test_ast_scaffold.cpp
     test/cpp/expression/test_expression.cpp
     test/cpp/expression/test_join_condition.cpp
+    test/cpp/expression/test_value.cpp
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
     test/cpp/helper/test_logical_type.cpp
+    test/cpp/io/s3/test_sigv4.cpp
+    test/cpp/io/s3/test_sirius_sigv4_credential_provider.cpp
+    test/cpp/io/s3/test_static_credentials.cpp
     test/cpp/io/test_datasource_factory.cpp
     test/cpp/io/test_uri_parser.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
@@ -398,6 +407,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_projection.cpp
     test/cpp/operator/test_physical_result_collector.cpp
     test/cpp/operator/test_physical_table_scan.cpp
+    test/cpp/operator/test_no_history_peak_memory_estimate.cpp
     test/cpp/operator/test_physical_top_n.cpp
     test/cpp/operator/test_physical_ungrouped_aggregate.cpp
     test/cpp/parallel/test_task_executor.cpp
@@ -412,6 +422,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_task_scheduler.cpp
     test/cpp/scan/bench_decode_codecs.cpp
     test/cpp/scan/test_column_builder.cpp
+    test/cpp/scan/test_gpu_decode_bitpacking.cpp
     test/cpp/scan/test_gpu_decode_rle.cpp
     test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
