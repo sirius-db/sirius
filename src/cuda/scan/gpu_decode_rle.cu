@@ -166,7 +166,7 @@ __device__ __forceinline__ rle_parsed_metadata parse_rle_metadata(rle_segment_de
  * @brief Compute the prefix sums over the counts in the segment to determine the positions in the
  * output columns into which to fill values.
  *
- * The work paritioning is 1 CTA per segment.
+ * The work partitioning is 1 CTA per segment.
  */
 template <int BLOCK_THREADS, int ITEMS_PER_THREAD, int PREFIX_SUM_BUFFER_ENTRIES_PER_SEGMENT>
 __global__ void kernel_build_rle(rle_segment_desc const* __restrict__ segment_descriptors,
