@@ -16,12 +16,15 @@
 
 #include "io/prefetching_cache.hpp"
 
+#include "io/io_context.hpp"
+
 #include <cuda_runtime.h>
 
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <cassert>
+#include <memory>
 #include <stdexcept>
 
 namespace sirius::io {
@@ -30,148 +33,122 @@ namespace sirius::io {
 // buffer_pool
 // ===========================================================================
 
-buffer_pool::buffer_pool(uint32_t max_slabs) : _max_slabs(max_slabs) {}
-
-buffer_pool::~buffer_pool()
+buffer_pool::buffer_pool(cucascade::memory::fixed_size_host_memory_resource& mr, uint32_t max_slabs)
+  : _mr(mr), _chunk_bytes(mr.get_block_size()), _max_slabs(max_slabs)
 {
-  for (auto& s : _slabs)
-    cudaFreeHost(s->base);
+  std::unique_lock lk(_mtx);
+  for (uint32_t i = 0; i < std::min<uint32_t>(10, _max_slabs); ++i) {
+    if (!grow_locked()) break;
+  }
 }
 
-bool buffer_pool::grow()
-{
-  std::unique_lock lk(_grow_mtx);
-  if (_slabs.size() >= _max_slabs) return false;
+buffer_pool::~buffer_pool() = default;
 
-  void* raw = nullptr;
-  // Portable so multi-GPU ioctx users can H2D-copy from these slabs on any
-  // device's stream.
-  auto err = cudaHostAlloc(&raw, SLAB_BYTES, cudaHostAllocPortable);
-  if (err != cudaSuccess) {
-    spdlog::warn("buffer_pool: cudaHostAlloc({:.0f}MB) failed: {}",
-                 static_cast<double>(SLAB_BYTES) / (1024.0 * 1024.0),
-                 cudaGetErrorString(err));
+bool buffer_pool::grow_locked()
+{
+  if (_allocations.size() >= _max_slabs) return false;
+
+  auto const bytes = slab_bytes();
+  cucascade::memory::fixed_multiple_blocks_allocation alloc;
+  try {
+    alloc = _mr.allocate_multiple_blocks(bytes);
+  } catch (std::exception const& e) {
+    spdlog::warn("buffer_pool: allocate_multiple_blocks({:.0f}MB) failed: {}",
+                 static_cast<double>(bytes) / (1024.0 * 1024.0),
+                 e.what());
     return false;
   }
+  if (!alloc) return false;
 
-  auto s  = std::make_unique<slab>();
-  s->base = static_cast<std::byte*>(raw);
-  s->free_count.store(CHUNKS_PER_SLAB, std::memory_order_relaxed);
-  for (uint32_t i = 0; i < CHUNKS_PER_SLAB; ++i)
-    s->free_chunks.enqueue(s->base + static_cast<size_t>(i) * CHUNK_BYTES);
+  auto blocks = alloc->get_blocks();
+  _free_list.reserve(_free_list.size() + blocks.size());
+  for (auto* p : blocks)
+    _free_list.push_back(p);
+  auto const n = static_cast<uint32_t>(blocks.size());
+  _allocations.push_back(std::move(alloc));
+  _total_chunks.fetch_add(n, std::memory_order_relaxed);
+  _total_free.fetch_add(n, std::memory_order_relaxed);
 
-  _slab_map[s->base] = s.get();
-  _slabs.push_back(std::move(s));
-  _total_chunks.fetch_add(CHUNKS_PER_SLAB, std::memory_order_relaxed);
-  _total_free.fetch_add(CHUNKS_PER_SLAB, std::memory_order_relaxed);
-
-  spdlog::debug("buffer_pool: allocated slab {} ({:.0f}MB)",
-                _slabs.size(),
-                static_cast<double>(SLAB_BYTES) / (1024.0 * 1024.0));
+  spdlog::debug("buffer_pool: allocated slab {} ({} chunks, {:.0f}MB)",
+                _allocations.size(),
+                n,
+                static_cast<double>(bytes) / (1024.0 * 1024.0));
   return true;
-}
-
-buffer_pool::slab* buffer_pool::find_slab(std::byte* p)
-{
-  std::shared_lock lk(_grow_mtx);
-  auto it = _slab_map.upper_bound(p);
-  if (it == _slab_map.begin()) return nullptr;
-  --it;
-  if (p >= it->first && p < it->first + SLAB_BYTES) return it->second;
-  return nullptr;
 }
 
 std::byte* buffer_pool::allocate()
 {
-  // Try existing slabs, most recent first (likely to have free chunks).
-  {
-    std::shared_lock lk(_grow_mtx);
-    for (auto it = _slabs.rbegin(); it != _slabs.rend(); ++it) {
-      std::byte* p;
-      if ((*it)->free_chunks.try_dequeue(p)) {
-        (*it)->free_count.fetch_sub(1, std::memory_order_relaxed);
-        _total_free.fetch_sub(1, std::memory_order_relaxed);
-        return p;
-      }
-    }
-  }
-
-  // All slabs exhausted — try to grow.
-  if (!grow()) return nullptr;
-
-  std::shared_lock lk(_grow_mtx);
-  std::byte* p;
-  if (_slabs.back()->free_chunks.try_dequeue(p)) {
-    _slabs.back()->free_count.fetch_sub(1, std::memory_order_relaxed);
-    _total_free.fetch_sub(1, std::memory_order_relaxed);
-    return p;
-  }
-  return nullptr;
+  std::unique_lock lk(_mtx);
+  if (_free_list.empty() && !grow_locked()) return nullptr;
+  std::byte* p = _free_list.back();
+  _free_list.pop_back();
+  _total_free.fetch_sub(1, std::memory_order_relaxed);
+  return p;
 }
 
 size_t buffer_pool::allocate_bulk(size_t n, std::vector<std::byte*>& out)
 {
   if (n == 0) return 0;
 
-  // Scratch buffer for try_dequeue_bulk (stack-allocated for small n,
-  // heap for large).
-  constexpr size_t STACK_MAX = 64;
-  std::byte* stack_buf[STACK_MAX];
-  std::unique_ptr<std::byte*[]> heap_buf;
-  std::byte** buf = stack_buf;
-  if (n > STACK_MAX) {
-    heap_buf = std::make_unique<std::byte*[]>(n);
-    buf      = heap_buf.get();
-  }
-
-  size_t remaining = n;
-  size_t total_got = 0;
-
-  auto drain_slabs = [&]() {
-    std::shared_lock lk(_grow_mtx);
-    for (auto it = _slabs.rbegin(); it != _slabs.rend() && remaining > 0; ++it) {
-      auto got = (*it)->free_chunks.try_dequeue_bulk(buf + total_got, remaining);
-      if (got > 0) {
-        (*it)->free_count.fetch_sub(static_cast<uint32_t>(got), std::memory_order_relaxed);
-        _total_free.fetch_sub(static_cast<uint32_t>(got), std::memory_order_relaxed);
-        total_got += got;
-        remaining -= got;
-      }
+  std::unique_lock lk(_mtx);
+  size_t got = 0;
+  while (got < n) {
+    auto take = std::min(n - got, _free_list.size());
+    if (take > 0) {
+      out.insert(out.end(), _free_list.end() - static_cast<ptrdiff_t>(take), _free_list.end());
+      _free_list.resize(_free_list.size() - take);
+      got += take;
     }
-  };
-
-  drain_slabs();
-
-  // If we still need more, grow and drain the new slab.
-  while (remaining > 0) {
-    if (!grow()) break;
-    drain_slabs();
+    if (got == n) break;
+    if (!grow_locked()) break;
   }
-
-  out.insert(out.end(), buf, buf + total_got);
-  return total_got;
+  _total_free.fetch_sub(static_cast<uint32_t>(got), std::memory_order_relaxed);
+  return got;
 }
 
 void buffer_pool::deallocate_bulk(std::vector<std::byte*>& out)
 {
-  for (auto* p : out) {
-    deallocate(p);
-  }
+  if (out.empty()) return;
+  std::unique_lock lk(_mtx);
+  _free_list.insert(_free_list.end(), out.begin(), out.end());
+  _total_free.fetch_add(static_cast<uint32_t>(out.size()), std::memory_order_relaxed);
+  lk.unlock();
   out.clear();
 }
 
 void buffer_pool::deallocate(std::byte* p)
 {
-  auto* s = find_slab(p);
-  assert(s && "buffer_pool::deallocate: pointer does not belong to any slab");
-  s->free_chunks.enqueue(p);
-  s->free_count.fetch_add(1, std::memory_order_relaxed);
+  std::unique_lock lk(_mtx);
+  _free_list.push_back(p);
   _total_free.fetch_add(1, std::memory_order_relaxed);
 }
 
 // ===========================================================================
 // pinned_view
 // ===========================================================================
+
+namespace {
+
+// Carries a strong ref to the entry until the host callback fires, so the
+// entry can't be destroyed mid-flight even if the cache map drops it.
+struct release_callback_args {
+  std::shared_ptr<cache_entry> entry;
+};
+
+// cudaStreamAddCallback signature (deprecated but used deliberately).
+// Unlike cudaLaunchHostFunc, this callback fires even when the stream is
+// already in an error state — so a poisoned stream cannot leak the entry's
+// pin and its pool chunks forever.  Status is intentionally ignored: the
+// read pin must be released regardless of whether the H2D copy succeeded.
+void CUDART_CB release_read_host_callback(cudaStream_t /*stream*/,
+                                          cudaError_t /*status*/,
+                                          void* p) noexcept
+{
+  std::unique_ptr<release_callback_args> args(static_cast<release_callback_args*>(p));
+  args->entry->state.release_read();
+}
+
+}  // namespace
 
 pinned_view::pinned_view(std::shared_ptr<cache_entry> entry,
                          duckdb_moodycamel::ConcurrentQueue<eviction_candidate>& candidate_queue,
@@ -206,22 +183,33 @@ pinned_view& pinned_view::operator=(pinned_view&& o) noexcept
 void pinned_view::unpin()
 {
   if (!_entry) return;
-  // release_read returns true only when this was the *last* active reader
-  // (state transitioned in_use → cached).  That's exactly the edge that makes
-  // the entry newly evictable, so post a candidate hint then and only then.
-  if (_entry->state.release_read()) {
-    // Record an event on the reader's stream BEFORE handing the entry to
-    // the evictor.  The evictor checks cudaEventQuery(read_event) before
-    // releasing chunks, so any cudaMemcpyAsync the reader submitted earlier
-    // against this entry's pinned chunks is guaranteed complete before we
-    // recycle those chunks.
-    if (_stream && _entry->read_event) cudaEventRecord(_entry->read_event, _stream);
-    // Silent post: no semaphore release.  The evictor drains candidates on
-    // its next poll tick (EVICTOR_POLL_INTERVAL) or whenever a chunk request
-    // wakes it — whichever comes first.
-    _candidate_queue->enqueue({std::weak_ptr<cache_entry>(_entry)});
+
+  // Always enqueue an eviction candidate — the evictor's state.get_state()
+  // gate skips entries still in_use, so a candidate whose deferred
+  // release_read is still pending on a stream callback simply isn't evicted
+  // until the callback runs.  Silent post: no semaphore release.  The
+  // evictor drains candidates on its next poll tick (EVICTOR_POLL_INTERVAL)
+  // or whenever a chunk request wakes it — whichever comes first.
+  _candidate_queue->enqueue({std::weak_ptr<cache_entry>(_entry)});
+
+  if (_stream == nullptr) {
+    // Synchronous path (host reads): no async ops outstanding, release now.
+    _entry->state.release_read();
+    _entry.reset();
+  } else {
+    // Async path (device reads): defer release_read via a host callback so
+    // it fires only after the caller's stream reaches this point.  Any
+    // cudaMemcpyAsync submitted earlier against this entry's pinned chunks
+    // therefore completes before pin_count drops to zero — at which point
+    // the entry transitions in_use → cached and becomes evictable.
+    auto args   = std::make_unique<release_callback_args>();
+    args->entry = std::move(_entry);
+    // cudaStreamAddCallback (not cudaLaunchHostFunc): fires on error too,
+    // so the release_read() is guaranteed even if the user's stream is
+    // poisoned by an unrelated failure.  Otherwise a single stream error
+    // would permanently leak this entry's pin and its pinned chunks.
+    cudaStreamAddCallback(_stream, &release_read_host_callback, args.release(), 0);
   }
-  _entry.reset();
 }
 
 size_t pinned_view::num_chunks() const noexcept { return _entry ? _entry->chunks.size() : 0; }
@@ -230,8 +218,9 @@ std::span<const std::byte> pinned_view::operator[](size_t i) const noexcept
 {
   if (!_entry || i >= _entry->chunks.size()) return {};
   auto phys_size   = static_cast<size_t>(_entry->physical_range.size());
-  auto chunk_start = i * buffer_pool::CHUNK_BYTES;
-  auto chunk_sz    = std::min(buffer_pool::CHUNK_BYTES, phys_size - chunk_start);
+  auto chunk_bytes = _entry->chunk_bytes;
+  auto chunk_start = i * chunk_bytes;
+  auto chunk_sz    = std::min(chunk_bytes, phys_size - chunk_start);
   return {_entry->chunks[i], chunk_sz};
 }
 
@@ -270,14 +259,15 @@ std::vector<cudf::io::datasource::non_owning_buffer> pinned_view::slice(size_t o
   size_t remaining  = size;
 
   // Walk the chunks that span [phys_start, phys_start + size).
-  size_t chunk_idx    = phys_start / buffer_pool::CHUNK_BYTES;
-  size_t off_in_chunk = phys_start % buffer_pool::CHUNK_BYTES;
+  auto const chunk_bytes = _entry->chunk_bytes;
+  size_t chunk_idx       = phys_start / chunk_bytes;
+  size_t off_in_chunk    = phys_start % chunk_bytes;
 
   while (remaining > 0 && chunk_idx < _entry->chunks.size()) {
-    auto chunk_avail = std::min(buffer_pool::CHUNK_BYTES - off_in_chunk,
-                                phys_size - chunk_idx * buffer_pool::CHUNK_BYTES - off_in_chunk);
-    auto n           = std::min(remaining, chunk_avail);
-    auto* p          = reinterpret_cast<uint8_t const*>(_entry->chunks[chunk_idx]) + off_in_chunk;
+    auto chunk_avail =
+      std::min(chunk_bytes - off_in_chunk, phys_size - chunk_idx * chunk_bytes - off_in_chunk);
+    auto n  = std::min(remaining, chunk_avail);
+    auto* p = reinterpret_cast<uint8_t const*>(_entry->chunks[chunk_idx]) + off_in_chunk;
 
     // Coalesce with the previous slice if this chunk is contiguous with the
     // tail of the previous slice in the pinned host address space.  Adjacent
@@ -324,8 +314,22 @@ prefetching_cache::~prefetching_cache()
   _worker_thread.request_stop();
   _evictor_thread.request_stop();
   _work_seq.fetch_add(1, std::memory_order_release);
-  _work_seq.notify_one();
+  _work_seq.notify_all();
   _request_sem.release();
+
+  // Wake readers waiting on entries that were loading when shutdown began.
+  // Outstanding backend requests may still resolve via their request_context
+  // safety net, but waiters should not depend on that happening.
+  abort_pending_entries();
+
+  // Join explicitly so all cache-owned queues and counters outlive the worker
+  // and evictor loops. std::jthread would join during member destruction, but
+  // doing it here lets us abort any entries that raced into loading just before
+  // the worker observed stop.
+  if (_worker_thread.joinable()) { _worker_thread.join(); }
+  if (_evictor_thread.joinable()) { _evictor_thread.join(); }
+
+  abort_pending_entries();
 }
 
 void prefetching_cache::enqueue_work(work_item item)
@@ -340,6 +344,22 @@ void prefetching_cache::release_chunks(cache_entry& entry)
   for (auto* p : entry.chunks)
     _pool.deallocate(p);
   entry.chunks.clear();
+}
+
+void prefetching_cache::abort_pending_entries() noexcept
+{
+  try {
+    std::shared_lock map_lk(_map_mtx);
+    for (auto const& [_, file_ptr] : _file_cache) {
+      if (!file_ptr) { continue; }
+      std::shared_lock file_lk(file_ptr->mtx);
+      for (auto const& entry : file_ptr->entries) {
+        if (entry) { entry->state.try_abort_pending(); }
+      }
+    }
+  } catch (...) {
+    // Destructors must not throw; best effort wake-up only.
+  }
 }
 
 // ===========================================================================
@@ -413,7 +433,10 @@ void prefetching_cache::insert(sirius_io_object& obj,
 
   file.io_obj    = obj_sp;
   file.file_size = file_size;
-  file.metadata  = std::move(metadata);
+  // A nullptr @p metadata means "no new metadata to store" — preserve whatever
+  // a previous insert() left in place so callers can skip re-supplying it on
+  // every prefetch insert.
+  if (metadata) { file.metadata = std::move(metadata); }
 
   // Every range in the insert becomes a prefetch request, regardless of the
   // entry's current state.  The worker decides at dispatch time whether the
@@ -450,7 +473,7 @@ void prefetching_cache::insert(sirius_io_object& obj,
       ++ex_it;
     } else {
       auto physical = _io_ctx->compute_physical_range(logical, file_size);
-      auto e        = std::make_shared<cache_entry>(logical, physical);
+      auto e        = std::make_shared<cache_entry>(logical, physical, _pool.chunk_bytes());
       e->n_total_request.fetch_add(1, std::memory_order_relaxed);
       e->n_request.store(1, std::memory_order_relaxed);
       e->request_ts.store(tick, std::memory_order_release);
@@ -517,7 +540,14 @@ pinned_view prefetching_cache::read(const sirius_io_object& obj,
     }
     if (st == entry_state::loading) {
       waited_on_loading = true;
+      // Release file_lk across the wait: the entry is pinned by our local
+      // shared_ptr, and file.mtx no longer protects anything we touch while
+      // parked.  Holding it shared would stall every concurrent insert() on
+      // this file (and, under writer-preference shared_mutex, every reader
+      // queued behind that insert).
+      file_lk.unlock();
       entry->state.wait_while_loading();
+      file_lk.lock();
       continue;
     }
     _partial_miss_count.fetch_add(1, std::memory_order_relaxed);
@@ -580,7 +610,12 @@ std::vector<pinned_view> prefetching_cache::read_ranges(
       }
       if (st == entry_state::loading) {
         waited_on_loading = true;
+        // Release file_lk across the wait: see read() for the rationale.
+        // The entry is pinned by our local shared_ptr; the next find_entry()
+        // call (for the next range in the batch) will re-take file_lk.
+        file_lk.unlock();
         entry->state.wait_while_loading();
+        file_lk.lock();
         continue;
       }
       _partial_miss_count.fetch_add(1, std::memory_order_relaxed);
@@ -590,6 +625,20 @@ std::vector<pinned_view> prefetching_cache::read_ranges(
     result.push_back(std::move(view));
   }
   return result;
+}
+
+std::shared_ptr<sirius_io_object_metadata> prefetching_cache::get_metadata(
+  const sirius_io_object& obj) const
+{
+  auto const& key = obj.raw_file_cache_id();
+
+  std::shared_lock map_lk(_map_mtx);
+  auto it = _file_cache.find(key);
+  if (it == _file_cache.end()) { return nullptr; }
+  auto& file = *it->second;
+
+  std::shared_lock file_lk(file.mtx);
+  return file.metadata;
 }
 
 void prefetching_cache::refresh_cache()
@@ -606,8 +655,7 @@ void prefetching_cache::refresh_cache()
     }
   }
 
-  // Log the stats snapshot at each aging event.
-  (void)summary();
+  spdlog::info("cache being refreshed: closing — {}", summary());
 }
 
 std::string prefetching_cache::summary() const
@@ -732,16 +780,16 @@ void prefetching_cache::evictor_loop(std::stop_token stop)
   std::stop_callback stop_cb(stop, [this] { _request_sem.release(); });
 
   // Free one cached entry's chunks back to the pool.  Returns the number
-  // of chunks freed, or 0 if the entry isn't eligible right now (racing
-  // reader, in-flight cudaMemcpyAsync, etc.).  Caller removes the entry
-  // from the LRU on non-zero return.
+  // of chunks freed, or 0 if the entry isn't eligible right now.  Caller
+  // removes the entry from the LRU on non-zero return.
+  //
+  // The state-machine gate (state == cached, pin_count == 0) is the only
+  // in-use check needed: pinned_view::unpin defers release_read via a host
+  // callback on the reader's stream, so an entry stays in_use until any
+  // cudaMemcpyAsync the reader submitted has completed.
   auto try_evict_raw = [this](cache_entry* entry, int64_t age) -> size_t {
     if (entry->state.get_state() != entry_state::cached) return 0;
     if (!entry->is_consumed_or_stale(static_cast<uint64_t>(age))) return 0;
-    if (entry->read_event) {
-      auto q = cudaEventQuery(entry->read_event);
-      if (q != cudaSuccess) return 0;
-    }
     if (!entry->state.try_start_evicting()) return 0;
     size_t n = entry->chunks.size();
     _pool.deallocate_bulk(entry->chunks);
@@ -859,6 +907,15 @@ void prefetching_cache::evictor_loop(std::stop_token stop)
         std::make_exception_ptr(std::runtime_error("eviction aborted — cache shutting down")));
     }
   }
+
+  // A worker may be blocked in fut.get() after enqueueing a request while the
+  // stop token is already set. Drain anything the loop did not pick up and
+  // resolve it with an exception so the worker can exit.
+  eviction_request req;
+  while (_request_queue.try_dequeue(req)) {
+    req.promise.set_exception(
+      std::make_exception_ptr(std::runtime_error("eviction aborted — cache shutting down")));
+  }
 }
 
 // ===========================================================================
@@ -889,13 +946,14 @@ void prefetching_cache::worker_loop(std::stop_token stop)
     // filtered again in Phase 4 by try_start_loading.
     std::vector<size_t> per_entry_chunks(item.entries.size(), 0);
     size_t upper_bound_chunks = 0;
+    auto const chunk_bytes    = _pool.chunk_bytes();
     for (size_t i = 0; i < item.entries.size(); ++i) {
       auto const& e = item.entries[i];
       if (e->n_request.load(std::memory_order_acquire) <= 0) continue;
       auto st = e->state.get_state();
       if (st != entry_state::empty && st != entry_state::queued) continue;
       auto phys_size      = static_cast<size_t>(e->physical_range.size());
-      auto n              = (phys_size + buffer_pool::CHUNK_BYTES - 1) / buffer_pool::CHUNK_BYTES;
+      auto n              = (phys_size + chunk_bytes - 1) / chunk_bytes;
       per_entry_chunks[i] = n;
       upper_bound_chunks += n;
     }
@@ -988,11 +1046,12 @@ void prefetching_cache::worker_loop(std::stop_token stop)
     std::vector<cudf::io::text::byte_range_info> io_ranges;
     std::vector<cudf::host_span<std::byte>> io_dsts;
     for (auto const& e : batch) {
-      auto phys_off  = static_cast<size_t>(e->physical_range.offset());
-      auto phys_size = static_cast<size_t>(e->physical_range.size());
+      auto phys_off          = static_cast<size_t>(e->physical_range.offset());
+      auto phys_size         = static_cast<size_t>(e->physical_range.size());
+      auto const chunk_bytes = e->chunk_bytes;
       for (size_t i = 0; i < e->chunks.size(); ++i) {
-        auto off = phys_off + i * buffer_pool::CHUNK_BYTES;
-        auto sz  = std::min(buffer_pool::CHUNK_BYTES, phys_size - i * buffer_pool::CHUNK_BYTES);
+        auto off = phys_off + i * chunk_bytes;
+        auto sz  = std::min(chunk_bytes, phys_size - i * chunk_bytes);
         io_ranges.emplace_back(static_cast<int64_t>(off), static_cast<int64_t>(sz));
         io_dsts.emplace_back(e->chunks[i], sz);
       }
@@ -1004,28 +1063,31 @@ void prefetching_cache::worker_loop(std::stop_token stop)
 
     {
       auto& obj_ref = *item.io_obj;
-      _io_ctx->host_read_ranges_async(
+      auto* pool    = &_pool;
+      _io_ctx->host_read_ranges_async_io(
         obj_ref,
         io_ranges,
         io_dsts,
-        [this,
+        [pool,
          batch  = std::move(batch),
          slot   = std::move(slot_holder),
          io_obj = std::move(item.io_obj),
          key    = std::move(item.file_key)](size_t /*bytes*/, std::exception_ptr ep) {
           if (ep) {
             try {
-              std::rethrow_exception(ep);
+              std::rethrow_exception(std::move(ep));
             } catch (std::exception const& ex) {
               spdlog::error("prefetching_cache: IO failed for {}: {}", key, ex.what());
             }
             for (auto const& e : batch) {
-              release_chunks(*e);
-              e->state.mark_load_failed();
+              for (auto* p : e->chunks)
+                pool->deallocate(p);
+              e->chunks.clear();
+              e->state.try_mark_load_failed();
             }
           } else {
             for (auto const& e : batch)
-              e->state.mark_cached();
+              e->state.try_mark_cached();
           }
           // `slot` and `io_obj` destruct here — budget is returned to
           // admission_control, and the file handle is released only

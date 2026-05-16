@@ -19,27 +19,18 @@
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/text/byte_range_info.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
-
 #include <cuda_runtime.h>
 
 #include <atomic>
 #include <cstddef>
 #include <exception>
 #include <functional>
-#include <future>
 #include <memory>
-#include <mutex>
-#include <span>
+#include <stdexcept>
 #include <string>
-#include <vector>
+#include <utility>
 
 namespace sirius::io {
-
-// Forward declarations (cache is owned by sirius_ioctx; defined in
-// prefetching_cache.hpp).
-class prefetching_cache;
-class buffer_pool;
 
 // ---------------------------------------------------------------------------
 // Completion handler
@@ -55,7 +46,7 @@ using io_completion_handler = std::function<void(size_t bytes_transferred, std::
 // ---------------------------------------------------------------------------
 
 static constexpr size_t CHUNK_SIZE    = 1UL << 20;  ///< Bounce-buffer chunk size (1 MiB).
-static constexpr size_t NUM_CHUNKS    = 32;         ///< Number of bounce slots per reactor.
+static constexpr size_t NUM_CHUNKS    = 128;        ///< Number of bounce slots per reactor.
 static constexpr size_t IO_BLOCK_SIZE = 4096;       ///< O_DIRECT alignment requirement (bytes).
 
 // ---------------------------------------------------------------------------
@@ -63,9 +54,9 @@ static constexpr size_t IO_BLOCK_SIZE = 4096;       ///< O_DIRECT alignment requ
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Abstract per-file handle that provides file identity to a datasource.
- *
- * Decouples file location / cache-key logic from I/O mechanics.
+ * @brief Abstract per-file handle.  A passive bag of native handles
+ * produced by a backend reactor (e.g. file descriptors, CURL easy
+ * handles, S3 client state).  Performs no I/O of its own.
  *
  * Inherits from @c std::enable_shared_from_this so the prefetching cache can
  * take a reference to an io_object and safely extend its lifetime via
@@ -76,8 +67,17 @@ class sirius_io_object : public std::enable_shared_from_this<sirius_io_object> {
  public:
   virtual ~sirius_io_object() = default;
 
+  /// Stable identifier used as the prefetching-cache key.  Often equal to
+  /// @c object_path() but may differ for backends that need to distinguish
+  /// otherwise-equal paths (versioned S3 keys, normalized URLs, …).
   [[nodiscard]] virtual const std::string& raw_file_cache_id() const noexcept = 0;
-  [[nodiscard]] virtual size_t size() const noexcept                          = 0;
+
+  /// The path / URL / key the caller used to construct this object.
+  [[nodiscard]] virtual const std::string& object_path() const noexcept = 0;
+
+  /// Total size of the underlying object, populated by the reactor at
+  /// construction time and stored on the io_object thereafter.
+  [[nodiscard]] virtual size_t size() const noexcept = 0;
 };
 
 class sirius_io_object_metadata {
@@ -93,35 +93,118 @@ class sirius_io_object_metadata {
  * @brief Shared completion state for one logical read call (host or device).
  *
  * A single read may be split into multiple sub-requests. All sub-requests
- * decrement @c pending; the last one resolves the promise.
+ * decrement @c pending; the last one resolves the handler.
+ *
+ * Construction is gated by @c create() so callers can't forget to set
+ * @c pending or @c handler (a missed setup would silently deadlock the
+ * caller).  The destructor is a safety net: if @c handler hasn't been
+ * fired by the time the last @c shared_ptr drops (e.g., a sub-request
+ * was silently dropped somewhere in the dispatch chain), it fires with
+ * an explicit error so the caller sees a failure instead of hanging.
  */
 struct request_context {
-  io_completion_handler handler;
-  std::atomic<size_t> pending{0};
-  size_t total_bytes{0};
-  std::atomic<bool> failed{false};
-  std::mutex exc_mtx;
-  std::exception_ptr exc;
+ private:
+  // Private tag so only create() can construct.  Public ctor signature so
+  // std::make_shared still works (preserves the single-allocation control
+  // block + object layout).
+  struct create_passkey {};
+
+ public:
+  explicit request_context(create_passkey) noexcept {}
+
+  request_context(request_context const&)            = delete;
+  request_context& operator=(request_context const&) = delete;
+
+  /// Construct a request_context expecting @p n_chunks chunk_done /
+  /// chunk_failed calls.
+  ///
+  /// - If @p n_chunks == 0: invokes @p handler with (0, nullptr) immediately
+  ///   and returns nullptr.  Caller checks `if (!ctx) return;`.
+  /// - If @p handler is null and @p n_chunks > 0: throws
+  ///   @c std::invalid_argument.  A pending count with no handler would
+  ///   silently deadlock the caller.
+  /// - Otherwise: returns a fully-populated shared_ptr.
+  [[nodiscard]] static std::shared_ptr<request_context> create(size_t n_chunks,
+                                                               size_t total_bytes,
+                                                               io_completion_handler handler)
+  {
+    if (n_chunks == 0) {
+      if (handler) {
+        try {
+          handler(0, nullptr);
+        } catch (...) {
+          // Caller's handler threw on the zero-work path; nothing useful
+          // to do here.
+        }
+      }
+      return nullptr;
+    }
+    if (!handler) {
+      throw std::invalid_argument("request_context::create: handler is null but n_chunks > 0");
+    }
+    auto ctx         = std::make_shared<request_context>(create_passkey{});
+    ctx->handler     = std::move(handler);
+    ctx->total_bytes = total_bytes;
+    ctx->pending.store(n_chunks, std::memory_order_relaxed);
+    return ctx;
+  }
+
+  ~request_context() noexcept
+  {
+    // Safety net: if the handler hasn't been fired by the normal path
+    // (e.g., a sub-request was silently dropped between enqueue and
+    // completion), fire it now with an explicit error so the caller
+    // doesn't hang forever waiting on a handler that will never come.
+    bool expected = false;
+    if (handler_fired.compare_exchange_strong(expected, true, std::memory_order_acq_rel) &&
+        handler) {
+      try {
+        handler(0,
+                std::make_exception_ptr(
+                  std::runtime_error("request_context destructed before all chunks completed — "
+                                     "handler resolved by safety net")));
+      } catch (...) {
+        // A throwing handler at destruction time can't propagate anywhere
+        // useful — swallow to keep the destructor noexcept.
+      }
+    }
+  }
 
   void chunk_done()
   {
-    if (pending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-      std::lock_guard lk{exc_mtx};
-      if (failed.load(std::memory_order_relaxed))
-        handler(0, exc);
-      else
-        handler(total_bytes, nullptr);
+    if (pending.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
+
+    // Last chunk — fire the handler exactly once.  The CAS guard makes
+    // this idempotent against the destructor safety net and against any
+    // future imbalance where chunk_done could be called extra times.
+    bool expected = false;
+    if (!handler_fired.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
+
+    if (failed.load(std::memory_order_relaxed)) {
+      handler(0, exc);
+    } else {
+      handler(total_bytes, nullptr);
     }
   }
 
   void chunk_failed(std::exception_ptr e)
   {
-    if (!failed.exchange(true, std::memory_order_relaxed)) {
-      std::lock_guard lk{exc_mtx};
+    bool expected = false;
+    if (failed.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
       exc = std::move(e);
     }
     chunk_done();
   }
+
+  io_completion_handler handler;
+  std::atomic<size_t> pending{0};
+  size_t total_bytes{0};
+  std::atomic<bool> failed{false};
+  std::exception_ptr exc;
+  /// Set (via CAS) by whichever path resolves the handler — normal
+  /// completion in chunk_done() or the destructor safety net.
+  /// Guarantees the handler fires at most once.
+  std::atomic<bool> handler_fired{false};
 };
 
 // ---------------------------------------------------------------------------
@@ -161,117 +244,6 @@ struct host_read_req {
   size_t size{0};
   uint8_t* dst{nullptr};
   std::shared_ptr<request_context> ctx;
-};
-
-// ---------------------------------------------------------------------------
-// sirius_ioctx
-// ---------------------------------------------------------------------------
-
-/**
- * @brief Abstract shared context passed to every datasource.
- *
- * Holds resources that are shared across all datasources (ring pools,
- * reactor threads, ...). Extend this class to provide a concrete I/O backend.
- */
-class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
- public:
-  sirius_ioctx();
-  virtual ~sirius_ioctx();
-
-  virtual void shutdown() = 0;
-
-  virtual std::unique_ptr<cudf::io::datasource> make_datasource(
-    std::shared_ptr<sirius_io_object> io_object) = 0;
-
-  /// Construct the owned prefetching_cache.  Must be called before any
-  /// read that should consult the cache; until then device_read falls
-  /// through directly to device_read_io.
-  void initialize_cache(buffer_pool& pool, size_t inflight_budget_chunks = 2048);
-
-  [[nodiscard]] prefetching_cache* cache() noexcept { return _cache.get(); }
-
-  // -- Read API ---------------------------------------------------------------
-
-  virtual size_t host_read(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst) = 0;
-
-  virtual std::unique_ptr<cudf::io::datasource::buffer> host_read(sirius_io_object& obj,
-                                                                  size_t offset,
-                                                                  size_t size) = 0;
-
-  virtual void host_read_async(sirius_io_object& obj,
-                               size_t offset,
-                               size_t size,
-                               uint8_t* dst,
-                               io_completion_handler handler) = 0;
-
-  // device_read / device_read_async: concrete in the base; consult the
-  // cache first, fall through to device_read_io{,_async} on miss.
-  std::unique_ptr<cudf::io::datasource::buffer> device_read(sirius_io_object& obj,
-                                                            size_t offset,
-                                                            size_t size,
-                                                            rmm::cuda_stream_view stream);
-
-  size_t device_read(
-    sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream);
-
-  void device_read_async(sirius_io_object& obj,
-                         size_t offset,
-                         size_t size,
-                         uint8_t* dst,
-                         rmm::cuda_stream_view stream,
-                         io_completion_handler handler);
-
-  // Backend-specific IO path (no cache lookup).  Implementations read
-  // directly from the underlying device (e.g. O_DIRECT + cuFile).
-  virtual std::unique_ptr<cudf::io::datasource::buffer> device_read_io(
-    sirius_io_object& obj, size_t offset, size_t size, rmm::cuda_stream_view stream) = 0;
-
-  virtual size_t device_read_io(sirius_io_object& obj,
-                                size_t offset,
-                                size_t size,
-                                uint8_t* dst,
-                                rmm::cuda_stream_view stream) = 0;
-
-  virtual void device_read_io_async(sirius_io_object& obj,
-                                    size_t offset,
-                                    size_t size,
-                                    uint8_t* dst,
-                                    rmm::cuda_stream_view stream,
-                                    io_completion_handler handler) = 0;
-
-  virtual void host_read_ranges_async(sirius_io_object& obj,
-                                      std::vector<cudf::io::text::byte_range_info> const& ranges,
-                                      std::span<cudf::host_span<std::byte>> dst,
-                                      io_completion_handler handler) = 0;
-
-  virtual size_t host_read_ranges(sirius_io_object& obj,
-                                  std::vector<cudf::io::text::byte_range_info> const& ranges,
-                                  std::span<cudf::host_span<std::byte>> dst) = 0;
-
-  // -- Physical range alignment ------------------------------------------------
-
-  virtual cudf::io::text::byte_range_info compute_physical_range(
-    cudf::io::text::byte_range_info logical, size_t file_size) const = 0;
-
- protected:
-  std::unique_ptr<prefetching_cache> _cache;
-};
-
-// ---------------------------------------------------------------------------
-// io_datasource
-// ---------------------------------------------------------------------------
-
-/**
- * @brief Extended datasource with batch range-read support.
- */
-class io_datasource : public cudf::io::datasource {
- public:
-  virtual void host_read_ranges_async(std::vector<cudf::io::text::byte_range_info> const& ranges,
-                                      std::span<cudf::host_span<std::byte>> dst,
-                                      io_completion_handler handler) = 0;
-
-  virtual size_t host_read_ranges(std::vector<cudf::io::text::byte_range_info> const& ranges,
-                                  std::span<cudf::host_span<std::byte>> dst) = 0;
 };
 
 }  // namespace sirius::io

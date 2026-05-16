@@ -20,22 +20,25 @@
 
 #include <absl/functional/any_invocable.h>
 
+#include <concepts>
 #include <condition_variable>
+#include <exception>
 #include <latch>
 #include <mutex>
 #include <queue>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace sirius::exec {
 
-class thread_pool {
+class static_thread_pool {
  public:
-  explicit thread_pool(int num_threads,
-                       const std::string& name                             = "thread_pool",
-                       std::vector<int> cpu_ids                            = {},
-                       absl::AnyInvocable<void() noexcept> per_thread_init = nullptr)
+  explicit static_thread_pool(int num_threads,
+                              const std::string& name                             = "thread_pool",
+                              std::vector<int> cpu_ids                            = {},
+                              absl::AnyInvocable<void() noexcept> per_thread_init = nullptr)
   {
     threads_.reserve(num_threads);
 
@@ -69,10 +72,10 @@ class thread_pool {
     if (init_latch) { init_latch->wait(); }
   }
 
-  thread_pool(const thread_pool&)            = delete;
-  thread_pool& operator=(const thread_pool&) = delete;
+  static_thread_pool(const static_thread_pool&)            = delete;
+  static_thread_pool& operator=(const static_thread_pool&) = delete;
 
-  ~thread_pool()
+  ~static_thread_pool()
   {
     stop();
     for (auto& t : threads_) {
@@ -80,23 +83,27 @@ class thread_pool {
     }
   }
 
-  void schedule(absl::AnyInvocable<void()> fn)
+  void schedule(std::invocable auto&& fn)
   {
-    assert(fn != nullptr);
     std::lock_guard l(mu_);
-    queue_.emplace([this, fn = std::move(fn)]() mutable noexcept {
+    queue_.emplace([callable = std::forward<decltype(fn)>(fn)]() mutable noexcept {
       try {
-        fn();
+        callable();
       } catch (const std::exception& e) {
-        SIRIUS_LOG_ERROR("Exception in thread pool task: {}, {}", e.what(), "closing thread pool");
-        stop();
+        SIRIUS_LOG_ERROR("Exception thrown from thread_pool on_error handler {}", e.what());
       } catch (...) {
-        SIRIUS_LOG_ERROR("{}", "Exception in thread pool task, closing thread pool");
-        stop();
+        SIRIUS_LOG_ERROR("Unknown exception thrown from thread_pool");
       }
     });
     cv_.notify_one();
   }
+
+  /// \brief Alias for schedule(). Lets static_thread_pool satisfy the same
+  ///        scheduler shape as scoped_dispatcher (which exposes enqueue()),
+  ///        so generic dispatchers can target either.
+  void enqueue(std::invocable auto&& fn) { schedule(std::forward<decltype(fn)>(fn)); }
+
+  [[nodiscard]] std::size_t num_threads() const noexcept { return threads_.size(); }
 
   void stop() noexcept
   {
