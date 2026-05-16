@@ -347,7 +347,7 @@ bench_record make_record(std::string scenario,
 
 }  // namespace
 
-TEST_CASE("S3 parquet perf benchmark emits portable JSON baseline", "[!benchmark][s3][perf][bench]")
+TEST_CASE("S3 parquet perf benchmark emits portable JSON baseline", "[!benchmark][perf][bench]")
 {
   auto env = read_bench_env();
   if (!env) {

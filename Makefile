@@ -155,8 +155,9 @@ s3-cpp-test:
 	@source $(S3_DIR)/env.sh && export SIRIUS_TEST_S3_STRICT=1 && $(S3_TEST_BIN) "[s3][integration]"
 
 # -----------------------------------------------------------------------------
-# S3 perf benchmark (Catch2 [!benchmark][s3][perf][bench] hidden tag — not in
-# the default CI suite). Generates a JSON record under
+# S3 perf benchmark (Catch2 [!benchmark][perf][bench] hidden tag — not in the
+# default CI suite, and deliberately NOT tagged [s3] so the [s3] integration
+# gate does not pull the benchmark in). Generates a JSON record under
 # build/release/extension/sirius/test/cpp/log/perf_<ts>.json for tracking.
 # Override SIRIUS_BENCH_BACKEND=aws-s3 to portably hit AWS instead of MinIO;
 # see test/cpp/integration/s3/fixtures/README.md for the env-var contract.
@@ -187,4 +188,4 @@ s3-bench:
 	  export SIRIUS_BENCH_S3_BUCKET="$${SIRIUS_BENCH_S3_BUCKET:-$$SIRIUS_TEST_S3_BUCKET}"; \
 	fi; \
 	export SIRIUS_BENCH_GIT_SHA="$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"; \
-	$(S3_TEST_BIN) "[!benchmark][s3][perf][bench]"
+	$(S3_TEST_BIN) "[!benchmark][perf][bench]"

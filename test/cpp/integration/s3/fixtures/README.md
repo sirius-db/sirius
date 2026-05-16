@@ -1,17 +1,17 @@
 # S3 Perf Benchmark Fixture
 
-`generate_perf_dataset.sh` prepares the hidden `[!benchmark][s3][perf][bench]`
+`generate_perf_dataset.sh` prepares the hidden `[!benchmark][perf][bench]`
 Catch2 benchmark fixture:
 
 1. Uses DuckDB's `tpch` extension to generate SF=10 data.
-2. Exports the seven-column `lineitem` subset used by the benchmark to Parquet.
+2. Exports the full `lineitem` table used by the benchmark to Parquet.
 3. Uploads the Parquet file to a MinIO/S3-compatible bucket with `mc`.
 
 The benchmark defaults are:
 
 ```sh
 SIRIUS_BENCH_S3_ENDPOINT=http://127.0.0.1:9000
-SIRIUS_BENCH_S3_BUCKET=sirius-bench
+SIRIUS_BENCH_S3_BUCKET=${SIRIUS_TEST_S3_BUCKET:-sirius-test}
 SIRIUS_BENCH_S3_KEY=tpch/lineitem_sf10.parquet
 ```
 

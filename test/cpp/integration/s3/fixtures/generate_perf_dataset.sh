@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/../../../../../.." && pwd)"
+PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/../../../../.." && pwd)"
 
 MC="${MC:-mc}"
 DUCKDB="${DUCKDB:-duckdb}"
@@ -10,7 +10,7 @@ ALIAS="${SIRIUS_BENCH_MC_ALIAS:-sirius-bench}"
 ENDPOINT="${SIRIUS_BENCH_S3_ENDPOINT:-${SIRIUS_TEST_S3_ENDPOINT:-http://127.0.0.1:9000}}"
 ACCESS_KEY="${SIRIUS_BENCH_S3_ACCESS_KEY:-${SIRIUS_TEST_S3_ACCESS_KEY:-minioadmin}}"
 SECRET_KEY="${SIRIUS_BENCH_S3_SECRET_KEY:-${SIRIUS_TEST_S3_SECRET_KEY:-minioadmin}}"
-BUCKET="${SIRIUS_BENCH_S3_BUCKET:-sirius-bench}"
+BUCKET="${SIRIUS_BENCH_S3_BUCKET:-${SIRIUS_TEST_S3_BUCKET:-sirius-test}}"
 KEY="${SIRIUS_BENCH_S3_KEY:-tpch/lineitem_sf10.parquet}"
 WORK_DIR="${SIRIUS_BENCH_WORK_DIR:-${PROJECT_ROOT}/test/cpp/integration/s3/fixtures/generated}"
 PARQUET="${WORK_DIR}/lineitem_sf10.parquet"
@@ -26,15 +26,7 @@ INSTALL tpch;
 LOAD tpch;
 CALL dbgen(sf=10);
 COPY (
-  SELECT
-    l_orderkey,
-    l_partkey,
-    l_suppkey,
-    l_linenumber,
-    l_quantity,
-    l_extendedprice,
-    l_discount
-  FROM lineitem
+  SELECT * FROM lineitem
 ) TO '${PARQUET}' (FORMAT PARQUET);
 SQL
 
