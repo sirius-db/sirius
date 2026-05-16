@@ -43,7 +43,6 @@
 #include <cstddef>
 #include <cstdlib>  // for std::getenv
 #include <filesystem>
-#include <iostream>
 #include <memory>
 #include <optional>
 #include <string>
@@ -246,14 +245,15 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // Configure cuDF to use our pinned slab allocator for small internal host buffers
   // (e.g. column_device_view metadata arrays in cudf::concatenate).  This eliminates
   // the pageable H2D transfers that cuDF issues by default.
+  cucascade::memory::fixed_size_host_memory_resource* host_fsmr = nullptr;
   {
     auto host_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
     if (!host_spaces.empty()) {
-      auto* fsmr = host_spaces[0]
-                     ->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
-      if (fsmr != nullptr) {
+      host_fsmr = host_spaces[0]
+                    ->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
+      if (host_fsmr != nullptr) {
         small_pinned_allocator_ =
-          std::make_unique<cucascade::memory::small_pinned_host_memory_resource>(*fsmr);
+          std::make_unique<cucascade::memory::small_pinned_host_memory_resource>(*host_fsmr);
         small_pinned_allocator_view_.emplace(
           sirius::memory::make_host_device_resource_view_checked(small_pinned_allocator_.get()));
         prev_pinned_threshold_ = cudf::get_allocate_host_as_pinned_threshold();
@@ -264,6 +264,11 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
         spdlog::info("SiriusContext: cuDF pinned memory resource configured (max slab {} B)",
                      cucascade::memory::small_pinned_host_memory_resource::MAX_SLAB_SIZE);
       }
+    } else {
+      throw std::runtime_error(
+        "SiriusContext: no HOST memory space configured; pinned memory for small cuDF buffers is "
+        "disabled. This may cause performance degradation due to increased pageable H2D transfers. "
+        "To fix this, add a HOST memory space to the Sirius config.");
     }
   }
 
@@ -302,8 +307,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   task_creator_->set_task_scheduler(*task_scheduler_);
   task_scheduler_->set_task_creator(*task_creator_);
 
-  scan_manager_ =
-    std::make_unique<sirius::scan_manager::sirius_scan_manager>(config_.get_scan_manager_config());
+  scan_manager_ = std::make_unique<sirius::scan_manager::sirius_scan_manager>(
+    config_.get_scan_manager_config(), host_fsmr);
 
   // Wire the pipeline task queue into downgrade executors now that task_scheduler_
   // has been constructed.
@@ -331,10 +336,7 @@ void SiriusContext::terminate()
 
   task_scheduler_->stop();
   task_scheduler_.reset();
-  if (scan_manager_) {
-    scan_manager_->stop();
-    scan_manager_->reset();
-  }
+  if (scan_manager_) { scan_manager_->stop(); }
   task_creator_->stop_thread_pool();
   task_creator_.reset();
   for (auto& executor : downgrade_executors_) {
@@ -348,6 +350,15 @@ void SiriusContext::terminate()
   // sync, the subsequent cudaFreeHost inside the memory manager destructor
   // can deadlock against a new cudaHostAlloc from the next SiriusContext.
   cudaDeviceSynchronize();
+
+  // The scan manager owns the sirius_ioctx, prefetch buffer_pool, pinned-table
+  // entries, and cached parquet columns. All of those are backed by memory
+  // resources owned by memory_manager_, so the manager must be destroyed before
+  // memory_manager_->shutdown()/reset().
+  scan_manager_.reset();
+
+  // Drop any remaining repositories while the memory manager is still alive.
+  data_repository_manager_.reset();
 
   // Restore the previous cuDF pinned memory resource and threshold before destroying the
   // slab allocator — cuDF holds a non-owning reference and would dangle after reset().

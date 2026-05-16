@@ -37,6 +37,9 @@ from tpch_pin_columns import (
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
 def log(msg):
     """Timestamped, flushed progress log so hangs are visible in real time."""
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]

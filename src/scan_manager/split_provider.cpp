@@ -1,5 +1,5 @@
 /*
- * Copyright 2026, Sirius Contributors.
+ * Copyright 2025, Sirius Contributors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,18 +14,19 @@
  * limitations under the License.
  */
 
-#include "io/uring/uring_ioctx.hpp"
+#include "scan_manager/split_provider.hpp"
 
-#include <memory>
+#include "op/sirius_physical_operator.hpp"
+#include "scan_manager/split_connector.hpp"
 
-namespace sirius::io {
+#include <utility>
 
-uring_ioctx::uring_ioctx(size_t n_reactors,
-                         unsigned ring_entries,
-                         cucascade::memory::fixed_size_host_memory_resource& mr)
-  : templated_ioctx<uring_reactor>(
-      n_reactors, [&mr, ring_entries] { return std::make_unique<uring_reactor>(mr, ring_entries); })
+namespace sirius::scan_manager {
+
+void split_provider::push_to_connector(split_connector& connector,
+                                       std::unique_ptr<op::operator_data> split)
 {
+  connector.push_split(std::move(split));
 }
 
-}  // namespace sirius::io
+}  // namespace sirius::scan_manager
