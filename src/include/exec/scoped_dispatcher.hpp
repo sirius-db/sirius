@@ -22,6 +22,7 @@
 #include <concepts>
 #include <condition_variable>
 #include <mutex>
+#include <source_location>
 #include <type_traits>
 #include <utility>
 
@@ -102,6 +103,20 @@ class scoped_dispatcher {
  private:
   using task_t = absl::AnyInvocable<void()>;
 
+  static void log_exception_ptr(const std::exception_ptr& eptr,
+                                std::source_location loc = std::source_location::current())
+  {
+    try {
+      if (eptr) std::rethrow_exception(eptr);
+    } catch (const std::exception& e) {
+      SIRIUS_LOG_ERROR(
+        "Exception in scoped_dispatcher task at {}:{}: {}", loc.file_name(), loc.line(), e.what());
+    } catch (...) {
+      SIRIUS_LOG_ERROR(
+        "Unknown exception in scoped_dispatcher task at {}:{}", loc.file_name(), loc.line());
+    }
+  }
+
   template <typename F>
   task_t wrap(F&& f)
   {
@@ -110,6 +125,7 @@ class scoped_dispatcher {
         try {
           invoke_with_optional_stop_token(f, stop_.get_token());
         } catch (...) { /* swallow */
+          log_exception_ptr(std::current_exception());
         }
       }
       on_task_done();

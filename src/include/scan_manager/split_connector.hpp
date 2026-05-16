@@ -16,16 +16,14 @@
 
 #pragma once
 
+#include "op/sirius_physical_operator.hpp"
+
 #include <condition_variable>
 #include <deque>
 #include <exception>
 #include <memory>
 #include <mutex>
 #include <optional>
-
-namespace sirius::op {
-class operator_data;
-}  // namespace sirius::op
 
 namespace sirius::scan_manager {
 
