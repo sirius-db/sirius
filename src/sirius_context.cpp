@@ -332,8 +332,15 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     s3_cfg.creds        = std::move(provider);
     sm_config.s3_config = std::move(s3_cfg);
   }
-  scan_manager_ = std::make_unique<sirius::scan_manager::sirius_scan_manager>(std::move(sm_config),
-                                                                              host_fsmr);
+  // Persist the composed config back onto config_ so a later get_config()
+  // reflects the actual S3 wiring -- get_scan_manager_config() must not report
+  // s3_config == nullopt while the live scan_manager has an S3 backend. The
+  // s3_ioctx_config stored here carries credentials only; async_thread_pool
+  // stays null -- sirius_scan_manager injects its live _s3_thread_pool into its
+  // own working copy.
+  config_.set_scan_manager_config(std::move(sm_config));
+  scan_manager_ = std::make_unique<sirius::scan_manager::sirius_scan_manager>(
+    config_.get_scan_manager_config(), host_fsmr);
 
   // Wire the pipeline task queue into downgrade executors now that task_scheduler_
   // has been constructed.

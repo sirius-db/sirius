@@ -82,6 +82,11 @@ struct sirius_config {
 
   [[nodiscard]] const scan_manager::scan_manager_config& get_scan_manager_config() const noexcept;
 
+  /// Overwrite the stored scan_manager_config. SiriusContext::initialize() uses
+  /// this to persist the S3 backend it materialized from object_store_config,
+  /// so a later get_config() reflects the actual scan_manager wiring.
+  void set_scan_manager_config(scan_manager::scan_manager_config config) noexcept;
+
   [[nodiscard]] const exec::thread_pool_config& get_gpu_pipeline_executor_config() const noexcept;
 
   [[nodiscard]] const exec::downgrade_executor_config& get_downgrade_executor_config()

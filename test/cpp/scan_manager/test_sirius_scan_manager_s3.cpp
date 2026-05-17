@@ -377,6 +377,7 @@ TEST_CASE("SiriusContext initialize keeps empty object_store_config inert",
   duckdb::SiriusContext context;
   context.initialize(cfg);
   CHECK(context.get_scan_manager().io_ctx_for("s3://bucket/key.parquet") == nullptr);
+  CHECK_FALSE(context.get_config().get_scan_manager_config().s3_config.has_value());
   context.terminate();
 }
 
@@ -395,6 +396,10 @@ TEST_CASE("SiriusContext initialize wires populated object_store_config into sca
   auto* s3_ctx = context.get_scan_manager().io_ctx_for("s3://bucket/nation.parquet");
   REQUIRE(s3_ctx != nullptr);
   CHECK(dynamic_cast<s3_ioctx*>(s3_ctx) != nullptr);
+
+  auto const& stored_scan_config = context.get_config().get_scan_manager_config();
+  REQUIRE(stored_scan_config.s3_config.has_value());
+  CHECK(stored_scan_config.s3_config->async_thread_pool == nullptr);
 
   context.terminate();
 }

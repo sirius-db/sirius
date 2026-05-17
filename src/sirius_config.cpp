@@ -425,6 +425,11 @@ const scan_manager::scan_manager_config& sirius_config::get_scan_manager_config(
   return _scan_manager_config;
 }
 
+void sirius_config::set_scan_manager_config(scan_manager::scan_manager_config config) noexcept
+{
+  _scan_manager_config = std::move(config);
+}
+
 const exec::thread_pool_config& sirius_config::get_duckdb_scan_executor_config() const noexcept
 {
   return _scan_executor_config.thread_pool_config;
