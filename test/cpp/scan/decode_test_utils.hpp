@@ -141,4 +141,29 @@ inline void require_constant_broadcast(decode_env& env,
     REQUIRE(x == value);
 }
 
+/// Decode `col` and assert each output row matches `expected_row(i)`.
+/// Use this from any codec's bench-scale verify TEST_CASE — the bench
+/// microbench tests in bench_decode_codecs.cpp discard their output, so
+/// every codec PR should ship a matching verify test using this helper to
+/// catch silent miscompiles at scale.
+///
+/// `expected_row` may be any callable taking `uint32_t row -> T`.
+template <typename T, typename ExpectedRow>
+inline void verify_decoded_column(rmm::cuda_stream_view stream,
+                                  rmm::device_async_resource_ref mr,
+                                  ::sirius::cuda::scan::gpu_column_decode_input const& col,
+                                  ExpectedRow expected_row)
+{
+  auto t = ::sirius::cuda::scan::gpu_decode_table({col}, stream, mr);
+  auto out =
+    download<T>(t->get_column(0).view().template data<T>(), col.total_rows, stream.value());
+  for (uint32_t i = 0; i < col.total_rows; ++i) {
+    T const want = expected_row(i);
+    if (out[i] != want) {
+      FAIL("row=" << i << " expected=" << static_cast<long long>(want)
+                  << " got=" << static_cast<long long>(out[i]));
+    }
+  }
+}
+
 }  // namespace sirius::test::decode

@@ -21,6 +21,7 @@
 
 #include "scan/bitpacking_synth.hpp"
 #include "scan/decode_test_utils.hpp"
+#include "scan/rle_synth.hpp"
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
@@ -228,7 +229,151 @@ TEST_CASE("bench CONSTANT int64 32MiB", "[!benchmark][scan][decode]")
     "[bench] CONSTANT     int64 32MiB:        %.6fs  write=%.1f GiB/s\n", sec, bytes_w / sec / GIB);
 }
 
-//===----------------------------------------------------------------------===//
+namespace {
+
+constexpr uint32_t RLE_BENCH_SEG_ROWS = 122880;  // DuckDB row-group max
+
+}  // namespace
+
+TEST_CASE("bench RLE int64 long_runs (16 entries/seg) 128Mi rows", "[!benchmark][scan][decode]")
+{
+  using ::sirius::test::decode::rle::make_uniform_runs;
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+
+  // 16 runs of 7680 rows each — long-run / value-broadcast pattern.
+  constexpr uint32_t N_RUNS   = 16;
+  constexpr uint16_t RUN_LEN  = static_cast<uint16_t>(RLE_BENCH_SEG_ROWS / N_RUNS);
+  constexpr uint32_t SEG_ROWS = N_RUNS * RUN_LEN;
+  constexpr uint32_t N_SEGS   = (128u << 20) / SEG_ROWS;
+  auto seg_bytes              = make_uniform_runs<int64_t>(N_RUNS, RUN_LEN);
+
+  std::vector<rmm::device_buffer> bufs;
+  std::vector<gpu_segment_desc> segs;
+  bufs.reserve(N_SEGS);
+  segs.reserve(N_SEGS);
+  for (uint32_t i = 0; i < N_SEGS; ++i) {
+    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream.view());
+    segs.push_back(segment(bufs.back(), i * SEG_ROWS, SEG_ROWS));
+  }
+  auto col = one_codec_column(cudf::data_type{cudf::type_id::INT64},
+                              N_SEGS * SEG_ROWS,
+                              CompressionType::COMPRESSION_RLE,
+                              segs);
+
+  double sec     = bench_seconds(stream, {col}, mr);
+  double bytes_w = double(size_t{N_SEGS} * SEG_ROWS * sizeof(int64_t));
+  std::printf("[bench] RLE          int64 long_runs    %u rows: %.6fs  write=%.1f GiB/s\n",
+              N_SEGS * SEG_ROWS,
+              sec,
+              bytes_w / sec / GIB);
+}
+
+TEST_CASE("bench RLE int64 medium_runs (1024 entries/seg) 128Mi rows", "[!benchmark][scan][decode]")
+{
+  using ::sirius::test::decode::rle::make_uniform_runs;
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+
+  // 1024 runs of 120 rows — cumsum (4 KiB) fits in shmem.
+  constexpr uint32_t N_RUNS   = 1024;
+  constexpr uint16_t RUN_LEN  = static_cast<uint16_t>(RLE_BENCH_SEG_ROWS / N_RUNS);
+  constexpr uint32_t SEG_ROWS = N_RUNS * RUN_LEN;
+  constexpr uint32_t N_SEGS   = (128u << 20) / SEG_ROWS;
+  auto seg_bytes              = make_uniform_runs<int64_t>(N_RUNS, RUN_LEN);
+
+  std::vector<rmm::device_buffer> bufs;
+  std::vector<gpu_segment_desc> segs;
+  bufs.reserve(N_SEGS);
+  segs.reserve(N_SEGS);
+  for (uint32_t i = 0; i < N_SEGS; ++i) {
+    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream.view());
+    segs.push_back(segment(bufs.back(), i * SEG_ROWS, SEG_ROWS));
+  }
+  auto col = one_codec_column(cudf::data_type{cudf::type_id::INT64},
+                              N_SEGS * SEG_ROWS,
+                              CompressionType::COMPRESSION_RLE,
+                              segs);
+
+  double sec     = bench_seconds(stream, {col}, mr);
+  double bytes_w = double(size_t{N_SEGS} * SEG_ROWS * sizeof(int64_t));
+  std::printf("[bench] RLE          int64 medium_runs  %u rows: %.6fs  write=%.1f GiB/s\n",
+              N_SEGS * SEG_ROWS,
+              sec,
+              bytes_w / sec / GIB);
+}
+
+TEST_CASE("bench RLE int64 pareto_runs (skewed distribution) 128Mi rows",
+          "[!benchmark][scan][decode]")
+{
+  // Realistic shape: Pareto-distributed run lengths. Many short runs +
+  // a few long ones, like sorted low-cardinality columns in TPC-H.
+  using ::sirius::test::decode::rle::make_pareto_runs;
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+
+  // 122880 rows per segment with Pareto x_min=400 → mean run ~1200, ~100
+  // entries per segment. Comfortably within the build cap and matches the
+  // shape of TPC-H sorted-low-cardinality columns (l_returnflag-class).
+  constexpr uint32_t SEG_ROWS = 122880;
+  constexpr uint32_t N_SEGS   = (128u << 20) / SEG_ROWS;
+
+  std::vector<rmm::device_buffer> bufs;
+  std::vector<gpu_segment_desc> segs;
+  bufs.reserve(N_SEGS);
+  segs.reserve(N_SEGS);
+  for (uint32_t i = 0; i < N_SEGS; ++i) {
+    auto seg_bytes = make_pareto_runs<int64_t>(SEG_ROWS, /*seed=*/i + 1, /*x_min=*/400.0);
+    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream.view());
+    segs.push_back(segment(bufs.back(), i * SEG_ROWS, SEG_ROWS));
+  }
+  auto col = one_codec_column(cudf::data_type{cudf::type_id::INT64},
+                              N_SEGS * SEG_ROWS,
+                              CompressionType::COMPRESSION_RLE,
+                              segs);
+
+  double sec     = bench_seconds(stream, {col}, mr);
+  double bytes_w = double(size_t{N_SEGS} * SEG_ROWS * sizeof(int64_t));
+  std::printf("[bench] RLE          int64 pareto_runs   %u rows: %.6fs  write=%.1f GiB/s\n",
+              N_SEGS * SEG_ROWS,
+              sec,
+              bytes_w / sec / GIB);
+}
+
+TEST_CASE("bench RLE int32 short_runs (4096 entries/seg) 65M rows", "[!benchmark][scan][decode]")
+{
+  using ::sirius::test::decode::rle::make_uniform_runs;
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+
+  // At the build kernel's max-entry cap; each run is 30 rows.
+  constexpr uint32_t N_RUNS   = 4096;
+  constexpr uint16_t RUN_LEN  = 30;  // 4096*30 = 122880
+  constexpr uint32_t SEG_ROWS = N_RUNS * RUN_LEN;
+  constexpr uint32_t N_SEGS   = (64u << 20) / SEG_ROWS;
+  auto seg_bytes              = make_uniform_runs<int32_t>(N_RUNS, RUN_LEN);
+
+  std::vector<rmm::device_buffer> bufs;
+  std::vector<gpu_segment_desc> segs;
+  bufs.reserve(N_SEGS);
+  segs.reserve(N_SEGS);
+  for (uint32_t i = 0; i < N_SEGS; ++i) {
+    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream.view());
+    segs.push_back(segment(bufs.back(), i * SEG_ROWS, SEG_ROWS));
+  }
+  auto col = one_codec_column(cudf::data_type{cudf::type_id::INT32},
+                              N_SEGS * SEG_ROWS,
+                              CompressionType::COMPRESSION_RLE,
+                              segs);
+
+  double sec     = bench_seconds(stream, {col}, mr);
+  double bytes_w = double(size_t{N_SEGS} * SEG_ROWS * sizeof(int32_t));
+  std::printf("[bench] RLE          int32 short_runs   %u rows: %.6fs  write=%.1f GiB/s\n",
+              N_SEGS * SEG_ROWS,
+              sec,
+              bytes_w / sec / GIB);
+}
+
 // BITPACKING benches.
 //
 // Each segment is BP_META_GROUP_SIZE rows so it dispatches as one CTA (the
