@@ -16,7 +16,10 @@
 
 #include "catch.hpp"
 #include "io/object_store_config.hpp"
+#include "sirius_config.hpp"
 
+#include <filesystem>
+#include <fstream>
 #include <string>
 
 using sirius::io::enum_to_string;
@@ -77,4 +80,32 @@ TEST_CASE("object_store_config enum_to_string returns canonical names", "[object
 
   REQUIRE(enum_to_string(object_store_config::transport::RDMA, out));
   CHECK(out == "rdma");
+}
+
+TEST_CASE("sirius_config loads object_store_config from YAML", "[object_store_config][config]")
+{
+  auto const path = std::filesystem::temp_directory_path() / "sirius_object_store_config.yaml";
+  {
+    std::ofstream out(path);
+    out << "sirius:\n"
+           "  object_store_config:\n"
+           "    endpoint: http://127.0.0.1:9000\n"
+           "    region: us-east-1\n"
+           "    access_key: minioadmin\n"
+           "    secret_key: minioadmin-secret\n"
+           "    s3_transport: rdma\n";
+    REQUIRE(out);
+  }
+
+  sirius::sirius_config cfg;
+  cfg.load_from_file(path);
+
+  CHECK(cfg.object_store_config.endpoint == "http://127.0.0.1:9000");
+  CHECK(cfg.object_store_config.region == "us-east-1");
+  CHECK(cfg.object_store_config.access_key == "minioadmin");
+  CHECK(cfg.object_store_config.secret_key == "minioadmin-secret");
+  CHECK(cfg.object_store_config.s3_transport == object_store_config::transport::RDMA);
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
 }

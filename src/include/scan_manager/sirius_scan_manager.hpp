@@ -27,6 +27,8 @@
 
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <duckdb/common/types.hpp>
+#include <duckdb/common/vector.hpp>
 
 namespace cucascade::memory {
 class fixed_size_host_memory_resource;
@@ -131,6 +133,19 @@ struct pinned_entry {
   /// to decide whether a re-insert merges into the existing entry (same row
   /// count → add unique columns) or replaces it (different row count).
   std::size_t num_rows{0};
+};
+
+/**
+ * @brief Bind-time result of @ref sirius_scan_manager::describe_parquet.
+ *
+ * Carries the column types and names a parquet file's footer yields, ready to
+ * be copied into a DuckDB table function's bind out-parameters, plus the total
+ * object size in bytes.
+ */
+struct parquet_bind_result {
+  duckdb::vector<duckdb::LogicalType> return_types;
+  duckdb::vector<std::string> names;
+  std::size_t object_size{0};
 };
 
 /**
@@ -257,6 +272,21 @@ class sirius_scan_manager {
   ///        when no backend supports @p path.
   [[nodiscard]] std::shared_ptr<sirius::io::sirius_ioctx> io_ctx_shared_for(
     std::string_view path) const noexcept;
+
+  /// \brief Probe a parquet file's schema for the SQL bind path.
+  ///
+  /// Resolves @p uri to a backend via @c io_ctx_for, fetches only the parquet
+  /// footer (no full-file download), and infers the column types and names.
+  /// When the resolved backend has a prefetch cache, the parsed footer is
+  /// inserted as metadata-only so a subsequent scan reuses it instead of
+  /// fetching and parsing the footer a second time.
+  ///
+  /// This is the C++ entry point behind the @c sirius_read_parquet table
+  /// function's bind callback.
+  ///
+  /// \throws std::runtime_error when no backend supports @p uri, or when the
+  ///         footer fetch / schema inference fails.
+  [[nodiscard]] parquet_bind_result describe_parquet(std::string const& uri);
 
  private:
   /// \brief Build a split_provider for @p op by reading its parquet scan_info.

@@ -17,6 +17,7 @@
 #include "scan_manager/sirius_scan_manager.hpp"
 
 #include "exec/thread_pool.hpp"
+#include "io/parquet_helpers.hpp"
 #include "io/prefetching_cache.hpp"
 #include "io/s3/s3_ioctx.hpp"
 #include "io/uring/uring_ioctx.hpp"
@@ -29,14 +30,24 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "planner/query.hpp"
 #include "scan_manager/cached_split_provider.hpp"
+#include "scan_manager/parquet_metadata.hpp"
 #include "scan_manager/parquet_split_provider.hpp"
 #include "scan_manager/split_connector.hpp"
 #include "scan_manager/split_provider.hpp"
 
+#include <cudf/io/datasource.hpp>
+#include <cudf/io/experimental/hybrid_scan.hpp>
+#include <cudf/io/parquet.hpp>
+#include <cudf/io/parquet_io_utils.hpp>
+#include <cudf/io/parquet_schema.hpp>
+#include <cudf/utilities/span.hpp>
+
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 #include <algorithm>
+#include <cstdint>
 #include <exception>
+#include <memory>
 #include <stdexcept>
 #include <utility>
 
@@ -180,6 +191,47 @@ std::shared_ptr<sirius::io::sirius_ioctx> sirius_scan_manager::io_ctx_shared_for
 {
   return lookup_supporting<decltype(_io_ctxs), std::shared_ptr<sirius::io::sirius_ioctx>>(
     _io_ctxs, path, shared_copy);
+}
+
+parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri)
+{
+  auto* io_ctx = io_ctx_for(uri);
+  if (io_ctx == nullptr) {
+    throw std::runtime_error("[sirius_scan_manager::describe_parquet] no backend supports URI: " +
+                             uri);
+  }
+
+  // Footer-only fetch + Thrift parse — the same path parquet_split_provider's
+  // run_batch takes on a metadata-cache miss, so bind and scan agree on how
+  // the footer is read.
+  auto io_object  = io_ctx->create_io_object(uri);
+  auto datasource = io_ctx->make_datasource(io_object);
+
+  auto footer_buffer         = cudf::io::parquet::fetch_footer_to_host(*datasource);
+  auto const footer_byte_len = footer_buffer->size();
+  auto reader_options        = cudf::io::parquet_reader_options::builder().build();
+  cudf::io::parquet::experimental::hybrid_scan_reader reader{
+    cudf::host_span<std::uint8_t const>(footer_buffer->data(), footer_buffer->size()),
+    reader_options};
+  auto file_metadata = reader.parquet_metadata();
+
+  auto schema = sirius::io::parquet_helpers::extract_schema(file_metadata);
+
+  // Footer-parse reuse: a metadata-only insert (empty ranges => no chunk
+  // prefetch) lets the subsequent scan's get_metadata hit, so the footer is
+  // Thrift-parsed once instead of twice.
+  if (auto* cache = io_ctx->cache(); cache != nullptr) {
+    auto metadata = std::make_shared<parquet_metadata>(
+      std::make_shared<cudf::io::parquet::FileMetaData const>(std::move(file_metadata)),
+      footer_byte_len);
+    cache->insert(*io_object, std::move(metadata), /*ranges=*/{});
+  }
+
+  parquet_bind_result result;
+  result.return_types = std::move(schema.types);
+  result.names        = std::move(schema.names);
+  result.object_size  = datasource->size();
+  return result;
 }
 
 void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)

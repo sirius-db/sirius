@@ -167,6 +167,7 @@ set(EXTENSION_SOURCES
     src/io/admission_control.cpp
     src/io/datasource_factory.cpp
     src/io/io_context.cpp
+    src/io/parquet_helpers.cpp
     src/io/prefetching_cache.cpp
     src/io/s3/s3_ioctx.cpp
     src/io/s3/sigv4.cpp
@@ -269,6 +270,7 @@ set(EXTENSION_SOURCES
     src/sirius_engine.cpp
     src/sirius_extension.cpp
     src/sirius_interface.cpp
+    src/sirius_sql_rewrite.cpp
     src/telemetry/telemetry_context.cpp
     src/transparent/physical_sirius_execution.cpp
     src/transparent/sirius_optimizer_extension.cpp
@@ -397,9 +399,11 @@ set(TEST_SOURCES
     test/cpp/io/s3/test_sirius_sigv4_credential_provider.cpp
     test/cpp/io/s3/test_static_credentials.cpp
     test/cpp/io/test_datasource_factory.cpp
+    test/cpp/io/test_parquet_helpers.cpp
     test/cpp/io/test_uri_parser.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
+    test/cpp/integration/test_s3_sql_surface.cpp
     test/cpp/integration/test_s3_perf_benchmark.cpp
     test/cpp/integration/test_scan_manager_s3_end_to_end.cpp
     test/cpp/integration/test_transparent_execution.cpp
@@ -428,6 +432,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
+    test/cpp/pipeline/test_sirius_read_parquet_converter.cpp
     test/cpp/pipeline/test_pipeline_memory_history.cpp
     test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
     test/cpp/pipeline/test_gpu_pipeline_disk_readback.cpp
@@ -447,6 +452,8 @@ set(TEST_SOURCES
     test/cpp/scan/test_scan_executor.cpp
     test/cpp/scan/test_split_connector.cpp
     test/cpp/scan_manager/test_sirius_scan_manager_s3.cpp
+    test/cpp/scan_manager/test_describe_parquet_s3.cpp
+    test/cpp/sql/test_sirius_sql_rewrite.cpp
     test/cpp/unittest.cpp
     test/cpp/utils/sirius_test_env.cpp
     test/cpp/utils/utils.cpp)
