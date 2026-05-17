@@ -19,6 +19,7 @@
 // skip it. Numbers paste into test/data/decode_baselines/<arch>.json.
 //===----------------------------------------------------------------------===//
 
+#include "scan/alp_synth.hpp"
 #include "scan/bitpacking_synth.hpp"
 #include "scan/decode_test_utils.hpp"
 #include "scan/rle_synth.hpp"
@@ -35,6 +36,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <variant>
 #include <vector>
 
 using duckdb::CompressionType;
@@ -587,6 +589,179 @@ TEST_CASE("bench BITPACKING int32 DELTA_FOR width=8 128M rows", "[!benchmark][sc
   double sec     = bench_seconds(stream, {col}, mr);
   double bytes_w = double(size_t{N_SEGS} * SEG_ROWS * sizeof(int32_t));
   std::printf("[bench] BITPACKING   int32 DELTA_FOR w=8 128M rows: %.6fs  write=%.1f GiB/s\n",
+              sec,
+              bytes_w / sec / GIB);
+}
+
+//===----------------------------------------------------------------------===//
+// ALP / ALPRD benches. Tagged `[!benchmark]`; numbers paste into
+// test/data/decode_baselines/<arch>.json under the alp / alprd keys.
+//
+// `bw_pinned` cases (most useful for self-relative phase-2 perf comparisons)
+// fix bit_width per case so runs are reproducible across machines.
+//===----------------------------------------------------------------------===//
+
+using sirius::test::decode::alp::synth_alp_segment;
+using sirius::test::decode::alp::synth_alprd_segment;
+
+TEST_CASE("bench ALP double bw=11 32K vectors (32M rows)", "[!benchmark][scan][decode]")
+{
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+  constexpr uint32_t N_VECS = 32u * 1024u;
+  constexpr uint32_t ROWS   = N_VECS * 1024u;
+
+  auto seg_bytes = synth_alp_segment<double>(N_VECS, /*bit_width=*/11);
+  auto d_seg     = sirius::test::decode::upload(seg_bytes, stream.view());
+  auto col =
+    sirius::test::decode::one_codec_column(cudf::data_type{cudf::type_id::FLOAT64},
+                                           ROWS,
+                                           CompressionType::COMPRESSION_ALP,
+                                           {sirius::test::decode::segment(d_seg, 0, ROWS)});
+
+  double sec     = bench_seconds(stream, {col}, mr);
+  double bytes_w = double(size_t{ROWS} * sizeof(double));
+  std::printf("[bench] ALP          f64 bw=11 32M rows:      %.6fs  write=%.1f GiB/s\n",
+              sec,
+              bytes_w / sec / GIB);
+}
+
+TEST_CASE("bench ALP float bw=20 32K vectors (32M rows)", "[!benchmark][scan][decode]")
+{
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+  constexpr uint32_t N_VECS = 32u * 1024u;
+  constexpr uint32_t ROWS   = N_VECS * 1024u;
+
+  auto seg_bytes = synth_alp_segment<float>(N_VECS, /*bit_width=*/20);
+  auto d_seg     = sirius::test::decode::upload(seg_bytes, stream.view());
+  auto col =
+    sirius::test::decode::one_codec_column(cudf::data_type{cudf::type_id::FLOAT32},
+                                           ROWS,
+                                           CompressionType::COMPRESSION_ALP,
+                                           {sirius::test::decode::segment(d_seg, 0, ROWS)});
+
+  double sec     = bench_seconds(stream, {col}, mr);
+  double bytes_w = double(size_t{ROWS} * sizeof(float));
+  std::printf("[bench] ALP          f32 bw=20 32M rows:      %.6fs  write=%.1f GiB/s\n",
+              sec,
+              bytes_w / sec / GIB);
+}
+
+TEST_CASE("bench ALPRD double right_bw=48 left_bw=3 32K vectors (32M rows)",
+          "[!benchmark][scan][decode]")
+{
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+  constexpr uint32_t N_VECS = 32u * 1024u;
+  constexpr uint32_t ROWS   = N_VECS * 1024u;
+
+  std::vector<uint16_t> dict = {0xAAAA, 0x5555, 0x1234, 0xABCD, 0xDEAD, 0xBEEF, 0xCAFE, 0xF00D};
+  auto seg_bytes = synth_alprd_segment<double>(N_VECS, /*right_bw=*/48, /*left_bw=*/3, dict);
+  auto d_seg     = sirius::test::decode::upload(seg_bytes, stream.view());
+  auto col =
+    sirius::test::decode::one_codec_column(cudf::data_type{cudf::type_id::FLOAT64},
+                                           ROWS,
+                                           CompressionType::COMPRESSION_ALPRD,
+                                           {sirius::test::decode::segment(d_seg, 0, ROWS)});
+
+  double sec     = bench_seconds(stream, {col}, mr);
+  double bytes_w = double(size_t{ROWS} * sizeof(double));
+  std::printf("[bench] ALPRD        f64 r48/l3 32M rows:      %.6fs  write=%.1f GiB/s\n",
+              sec,
+              bytes_w / sec / GIB);
+}
+
+// Power-of-2 / byte-aligned widths. ALP-encoded TPC-H integer-derived columns
+// (DECIMAL, dates, narrow ints) cluster on bw=8/16/32; the bw=11/20 cases
+// above exercise the worst-case 64-bit-straddle bit-extract path.
+
+TEST_CASE("bench ALP double bw=8 32K vectors (32M rows)", "[!benchmark][scan][decode]")
+{
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+  constexpr uint32_t N_VECS = 32u * 1024u;
+  constexpr uint32_t ROWS   = N_VECS * 1024u;
+
+  auto seg_bytes = synth_alp_segment<double>(N_VECS, /*bit_width=*/8);
+  auto d_seg     = sirius::test::decode::upload(seg_bytes, stream.view());
+  auto col =
+    sirius::test::decode::one_codec_column(cudf::data_type{cudf::type_id::FLOAT64},
+                                           ROWS,
+                                           CompressionType::COMPRESSION_ALP,
+                                           {sirius::test::decode::segment(d_seg, 0, ROWS)});
+
+  double sec     = bench_seconds(stream, {col}, mr);
+  double bytes_w = double(size_t{ROWS} * sizeof(double));
+  std::printf("[bench] ALP          f64 bw=8  32M rows:      %.6fs  write=%.1f GiB/s\n",
+              sec,
+              bytes_w / sec / GIB);
+}
+
+TEST_CASE("bench ALP double bw=16 32K vectors (32M rows)", "[!benchmark][scan][decode]")
+{
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+  constexpr uint32_t N_VECS = 32u * 1024u;
+  constexpr uint32_t ROWS   = N_VECS * 1024u;
+
+  auto seg_bytes = synth_alp_segment<double>(N_VECS, /*bit_width=*/16);
+  auto d_seg     = sirius::test::decode::upload(seg_bytes, stream.view());
+  auto col =
+    sirius::test::decode::one_codec_column(cudf::data_type{cudf::type_id::FLOAT64},
+                                           ROWS,
+                                           CompressionType::COMPRESSION_ALP,
+                                           {sirius::test::decode::segment(d_seg, 0, ROWS)});
+
+  double sec     = bench_seconds(stream, {col}, mr);
+  double bytes_w = double(size_t{ROWS} * sizeof(double));
+  std::printf("[bench] ALP          f64 bw=16 32M rows:      %.6fs  write=%.1f GiB/s\n",
+              sec,
+              bytes_w / sec / GIB);
+}
+
+TEST_CASE("bench ALP float bw=32 32K vectors (32M rows)", "[!benchmark][scan][decode]")
+{
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+  constexpr uint32_t N_VECS = 32u * 1024u;
+  constexpr uint32_t ROWS   = N_VECS * 1024u;
+
+  auto seg_bytes = synth_alp_segment<float>(N_VECS, /*bit_width=*/32);
+  auto d_seg     = sirius::test::decode::upload(seg_bytes, stream.view());
+  auto col =
+    sirius::test::decode::one_codec_column(cudf::data_type{cudf::type_id::FLOAT32},
+                                           ROWS,
+                                           CompressionType::COMPRESSION_ALP,
+                                           {sirius::test::decode::segment(d_seg, 0, ROWS)});
+
+  double sec     = bench_seconds(stream, {col}, mr);
+  double bytes_w = double(size_t{ROWS} * sizeof(float));
+  std::printf("[bench] ALP          f32 bw=32 32M rows:      %.6fs  write=%.1f GiB/s\n",
+              sec,
+              bytes_w / sec / GIB);
+}
+
+TEST_CASE("bench ALPRD double right_bw=56 left_bw=2 32K vectors (32M rows)",
+          "[!benchmark][scan][decode]")
+{
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+  constexpr uint32_t N_VECS = 32u * 1024u;
+  constexpr uint32_t ROWS   = N_VECS * 1024u;
+
+  std::vector<uint16_t> dict = {0xAAAA, 0x5555, 0x1234, 0xABCD};
+  auto seg_bytes = synth_alprd_segment<double>(N_VECS, /*right_bw=*/56, /*left_bw=*/2, dict);
+  auto d_seg     = sirius::test::decode::upload(seg_bytes, stream.view());
+  auto col =
+    sirius::test::decode::one_codec_column(cudf::data_type{cudf::type_id::FLOAT64},
+                                           ROWS,
+                                           CompressionType::COMPRESSION_ALPRD,
+                                           {sirius::test::decode::segment(d_seg, 0, ROWS)});
+
+  double sec     = bench_seconds(stream, {col}, mr);
+  double bytes_w = double(size_t{ROWS} * sizeof(double));
+  std::printf("[bench] ALPRD        f64 r56/l2 32M rows:      %.6fs  write=%.1f GiB/s\n",
               sec,
               bytes_w / sec / GIB);
 }

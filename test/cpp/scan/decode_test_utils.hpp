@@ -160,8 +160,9 @@ inline void verify_decoded_column(rmm::cuda_stream_view stream,
   for (uint32_t i = 0; i < col.total_rows; ++i) {
     T const want = expected_row(i);
     if (out[i] != want) {
-      FAIL("row=" << i << " expected=" << static_cast<long long>(want)
-                  << " got=" << static_cast<long long>(out[i]));
+      // Stream T directly so floating-point T renders without a lossy
+      // long-long cast (`static_cast<long long>(3.14)` would print 3).
+      FAIL("row=" << i << " expected=" << want << " got=" << out[i]);
     }
   }
 }
