@@ -14,42 +14,47 @@
  * limitations under the License.
  */
 
-// ALP / ALPRD decode kernels. One CTA = one 1024-row vector. On any bounds
-// check failure the kernel zero-fills `desc.vec_row_count` rows using the
-// trusted host descriptor row count, never parsed metadata.
+//===----------------------------------------------------------------------===//
+// clang-format off
+// ALP / ALPRD decode kernels. The work partitioning is 1 CTA per 1024-row vector.
+// On any bounds check failure the kernel zero-fills `desc.vec_row_count` rows.
 //
-// On-disk layouts (verified against
-// duckdb/src/include/duckdb/storage/compression/{alp,alprd}/):
+// On-disk layouts (see: duckdb/src/include/duckdb/storage/compression/{alp,alprd}/):
 //
 //   ALP segment (one segment holds N 1024-row "vectors"):
 //
-//   byte 0   4                                 metadata_end          seg_end
-//   │        │                                 │                     │
-//   ├─uint32─┼─── per-vector data (forward) ───┼── trailer table ────┤
-//   │ end    │                                 │  uint32[N], V at    │
-//   │        │                                 │  metadata_end-(V+1)*4
-//   └─offset of metadata_end
+//   byte 0   4                                                                    metadata_end
+//   │        │                                 │                                  │
+//   ├─uint32─┼─── per-vector data (forward) ───┼── trailer table (backward) ──────┤
+//   │ end    │                                 │  uint32[N], V at                 │
+//   │        │                                 │  metadata_end-(V+1)*4            │
+//     └─offset of metadata_end
 //
 //   ALP per-vector (compressed) — 13-byte header + bitstream + exceptions:
 //
 //   ┌───┬───┬─────┬────────────────┬──┬────────────────┬───────┬─────────┐
 //   │exp│fac│ ec  │ FOR (uint64)   │bw│ packed uint64  │ exc   │ exc pos │
-//   │ u8│ u8│ u16 │                │u8│ mantissas      │ T[ec] │ u16[ec] │
+//   │ u8│ u8│ u16 │                │u8│ codes          │ T[ec] │ u16[ec] │
 //   └───┴───┴─────┴────────────────┴──┴────────────────┴───────┴─────────┘
-//   0   1   2     4               12  13              ↑       ↑
-//                                                     │       │
-//                                bitstream = round_up(rows,32)*bw/8 bytes
+//   0   1   2     4               12  13              [A]     [B]      [C]
 //
-//   exp == 0xFF → uncompressed-sentinel: 1-byte 0xFF then raw T[rows].
-//   bw ≤ sizeof(T)*8. Exception position bound-checked against fill_rows.
+//   [A] = 13 + round_up(rows, 32) * bw / 8   (end of bitstream)
+//   [B] = [A] + ec * sizeof(T)               (end of exception values)
+//   [C] = [B] + ec * sizeof(u16)             (end of vector)
+//
+//   - Decoded value = code * 10^fac * 10^(-exp).
+//   - Exception positions are walked after decoding to install the exception values at the
+//     corresponding vector positions.
+//   - exp == 0xFF → uncompressed-sentinel: 1-byte 0xFF then raw T[rows].
 //
 //   ALPRD segment (small dict header lives between metadata_end and trailer):
 //
-//   byte 0   4   5   6   7                                 metadata_end ↘
-//   │        │   │   │   │                                 │             │
-//   ├─uint32─┼─u8┼─u8┼─u8┼── uint16 dict[dict_size] ───────┼── per-vec ──┤
-//   │ end    │ rb│ lb│ds │ (≤ 8 entries, lb ≤ 3)           │  data       │
-//   └─offset
+//   byte 0   4   5   6   7                                                                       metadata_end
+//   │        │   │   │   │                                 │             │                       │
+//   ├─uint32─┼─u8┼─u8┼─u8┼── uint16 dict[dict_size] ───────┼── per-vec ──┼── trailer (backward) ─┤
+//   │ end    │ rb│ lb│ds │   (≤ 8 entries, lb ≤ 3)         │   data      │  uint32[N], V at      │
+//   │        │   │   │   │                                 │             │  metadata_end-(V+1)*4 │
+//     └─offset of metadata_end
 //
 //   ALPRD per-vector (compressed) — 2-byte header + two bitstreams + exceptions:
 //
@@ -60,9 +65,12 @@
 //   └─────┴───────────────────┴─────────────────────┴───────┴─────────┘
 //   0     2
 //
-//   ec == 0xFFFF → uncompressed-sentinel: 2-byte 0xFFFF then raw EXACT_T[rows].
-//   Reconstructed bits = (uint64_t)dict[left_idx] << rb | right_part, then
-//   bit-cast to T (double / float).
+//   - Decoded value = dict[left_idx] << rb | right_part
+//   - Exception positions are walked after decoding to install the exception values at the
+//     corresponding vector positions.
+//   - ec == 0xFFFF → uncompressed-sentinel: 2-byte 0xFFFF then raw EXACT_T[rows].
+//===----------------------------------------------------------------------===//
+// clang-format on
 
 #include "cuda/scan/gpu_decode_alp.cuh"
 
@@ -70,8 +78,15 @@
 #include <rmm/device_uvector.hpp>
 
 #include <cuda/cmath>
+#include <cuda/std/limits>
+#include <cuda/std/numeric>
+#include <cuda/std/type_traits>
 #include <cuda_runtime.h>
 
+#include <duckdb/storage/compression/alp/alp_constants.hpp>
+#include <duckdb/storage/compression/alprd/alprd_constants.hpp>
+
+#include <climits>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -84,14 +99,12 @@ namespace sirius::cuda::scan {
 namespace {
 
 constexpr uint32_t BLOCK_DIM = 256;
-
-// Max factor index — the encoder couples (factor, exponent), so this bound
-// is shared across f32 and f64. `MAX_EXPONENT` lives on AlpTypedConstants<T>
-// because exponent IS type-specific.
 constexpr uint8_t ALP_MAX_FACTOR =
   static_cast<uint8_t>(std::extent_v<decltype(duckdb::AlpConstants::FACT_ARR)> - 1);
 
-/// One CTA's unit of work for ALP / ALPRD: one vector within one segment.
+/**
+ * @brief Vector-level descriptor for a CTA
+ */
 struct alp_vector_desc {
   uint8_t const* d_segment;    ///< Device pointer to the segment's first byte.
   uint32_t segment_bytes;      ///< Size of the staged segment buffer.
@@ -100,61 +113,115 @@ struct alp_vector_desc {
   uint32_t global_row_offset;  ///< Output offset, in rows, for this vector.
 };
 
-// Mirrors of `AlpConstants::FACT_ARR` and `AlpTypedConstants<T>::FRAC_ARR`.
-__device__ __constant__ int64_t d_alp_fact[19] = {1LL,
-                                                  10LL,
-                                                  100LL,
-                                                  1000LL,
-                                                  10000LL,
-                                                  100000LL,
-                                                  1000000LL,
-                                                  10000000LL,
-                                                  100000000LL,
-                                                  1000000000LL,
-                                                  10000000000LL,
-                                                  100000000000LL,
-                                                  1000000000000LL,
-                                                  10000000000000LL,
-                                                  100000000000000LL,
-                                                  1000000000000000LL,
-                                                  10000000000000000LL,
-                                                  100000000000000000LL,
-                                                  1000000000000000000LL};
+/**
+ * @brief Per-vector parse outcome. Routes the CTA to one of three paths:
+ * zero-fill (invalid), raw bit-cast (uncompressed sentinel), or bitpacked
+ * decode (compressed).
+ */
+enum class alp_parse_status : uint8_t { invalid, uncompressed, compressed };
 
-__device__ __constant__ float d_alp_frac_f32[11] = {1.0F,
-                                                    0.1F,
-                                                    0.01F,
-                                                    0.001F,
-                                                    0.0001F,
-                                                    0.00001F,
-                                                    0.000001F,
-                                                    0.0000001F,
-                                                    0.00000001F,
-                                                    0.000000001F,
-                                                    0.0000000001F};
+/**
+ * @brief Parsed per-vector metadata. Thread 0 populates this from the
+ * segment header + trailer; the rest of the CTA reads it through shmem.
+ */
+struct alp_vector_meta {
+  alp_parse_status status;
+  uint32_t data_off;              ///< Byte offset of this vector's data within the segment.
+  uint8_t exp;                    ///< Decode exponent index.
+  uint8_t fac;                    ///< Decode factor index.
+  uint16_t exc_count;             ///< Number of exception positions.
+  uint64_t for_val;               ///< Frame-of-reference (added to each unpacked code).
+  uint8_t bw;                     ///< Bitpack width.
+  uint8_t const* packed_bytes_p;  ///< Pointer to the byte-stream of packed codes.
+  uint32_t packed_bytes_count;    ///< Size of the bitpacked stream in bytes.
+};
 
-__device__ __constant__ double d_alp_frac_f64[21] = {1.0,
-                                                     0.1,
-                                                     0.01,
-                                                     0.001,
-                                                     0.0001,
-                                                     0.00001,
-                                                     0.000001,
-                                                     0.0000001,
-                                                     0.00000001,
-                                                     0.000000001,
-                                                     0.0000000001,
-                                                     0.00000000001,
-                                                     0.000000000001,
-                                                     0.0000000000001,
-                                                     0.00000000000001,
-                                                     0.000000000000001,
-                                                     0.0000000000000001,
-                                                     0.00000000000000001,
-                                                     0.000000000000000001,
-                                                     0.0000000000000000001,
-                                                     0.00000000000000000001};
+/**
+ * @brief Per-vector ALPRD parse outcome — see `alp_parse_status` for the
+ * three routing paths.
+ */
+enum class alprd_parse_status : uint8_t { invalid, uncompressed, compressed };
 
+/**
+ * @brief Parsed per-vector ALPRD metadata. Thread 0 populates this from the
+ * segment header + trailer; the rest of the CTA reads it through shmem. The
+ * segment dictionary is loaded separately by a cooperative dict-load.
+ */
+struct alprd_vector_meta {
+  alprd_parse_status status;
+  uint32_t data_off;                    ///< Byte offset of this vector's data within the segment.
+  uint16_t exc_count;                   ///< Number of exception positions.
+  uint8_t right_bw;                     ///< Right-bits packed width.
+  uint8_t left_bw;                      ///< Left-bits packed width.
+  uint8_t dict_size;                    ///< Number of entries in the segment dictionary.
+  uint8_t const* left_packed_bytes_p;   ///< Pointer to the byte-stream of left dict-indices.
+  uint32_t left_packed_bytes_count;     ///< Size of the left bitpacked stream in bytes.
+  uint8_t const* right_packed_bytes_p;  ///< Pointer to the byte-stream of right parts.
+  uint32_t right_packed_bytes_count;    ///< Size of the right bitpacked stream in bytes.
+};
+
+/**
+ * @brief Factor and exponent tables for ALP decoding: decoded val = code * fact[fac] * frac[exp].
+ * Placed in constant memory. Mirrors of `AlpConstants::FACT_ARR` and
+ * `AlpTypedConstants<T>::FRAC_ARR`.
+ */
+__device__ __constant__ int64_t d_alp_fact[] = {1LL,
+                                                10LL,
+                                                100LL,
+                                                1000LL,
+                                                10000LL,
+                                                100000LL,
+                                                1000000LL,
+                                                10000000LL,
+                                                100000000LL,
+                                                1000000000LL,
+                                                10000000000LL,
+                                                100000000000LL,
+                                                1000000000000LL,
+                                                10000000000000LL,
+                                                100000000000000LL,
+                                                1000000000000000LL,
+                                                10000000000000000LL,
+                                                100000000000000000LL,
+                                                1000000000000000000LL};
+
+__device__ __constant__ float d_alp_frac_f32[] = {1.0F,
+                                                  0.1F,
+                                                  0.01F,
+                                                  0.001F,
+                                                  0.0001F,
+                                                  0.00001F,
+                                                  0.000001F,
+                                                  0.0000001F,
+                                                  0.00000001F,
+                                                  0.000000001F,
+                                                  0.0000000001F};
+
+__device__ __constant__ double d_alp_frac_f64[] = {1.0,
+                                                   0.1,
+                                                   0.01,
+                                                   0.001,
+                                                   0.0001,
+                                                   0.00001,
+                                                   0.000001,
+                                                   0.0000001,
+                                                   0.00000001,
+                                                   0.000000001,
+                                                   0.0000000001,
+                                                   0.00000000001,
+                                                   0.000000000001,
+                                                   0.0000000000001,
+                                                   0.00000000000001,
+                                                   0.000000000000001,
+                                                   0.0000000000000001,
+                                                   0.00000000000000001,
+                                                   0.000000000000000001,
+                                                   0.0000000000000000001,
+                                                   0.00000000000000000001};
+
+/**
+ * @brief Get the pointer to the fraction array in constant memory for float/double
+ */
 template <typename T>
 __device__ __forceinline__ T const* alp_frac_ptr();
 template <>
@@ -168,107 +235,107 @@ __device__ __forceinline__ double const* alp_frac_ptr<double>()
   return d_alp_frac_f64;
 }
 
-// Per-vector data starts at arbitrary byte offsets — metadata reads cannot
-// assume 2/4/8-byte alignment, so go through `memcpy`.
-__device__ __forceinline__ uint16_t ld16(uint8_t const* p)
+/**
+ * @brief Perform an unaligned load of type @p T from buffer @p p.
+ *
+ * Per-vector data starts at arbitrary byte offsets, so metadata reads cannot make alignment
+ * assumptions.
+ */
+template <typename T>
+__device__ __forceinline__ T ld_unaligned(uint8_t const* p)
 {
-  uint16_t v;
+  T v;
   memcpy(&v, p, sizeof(v));
   return v;
 }
 
-__device__ __forceinline__ uint32_t ld32(uint8_t const* p)
+/**
+ * @brief Calculate the number of bytes for a bitpacked buffer given @p row_count rows and @p width
+ * bits per row.
+ *
+ * Mirror of DuckDB's `BitpackingPrimitives::GetRequiredBytes`.
+ */
+__device__ __host__ __forceinline__ uint32_t bp_required_bytes(uint32_t row_count, uint32_t width)
 {
-  uint32_t v;
-  memcpy(&v, p, sizeof(v));
-  return v;
+  // DuckDB packs values in groups of 32
+  constexpr uint32_t BITPACK_GROUP = 32;
+
+  if (width == 0) return 0;
+  // Round up to the nearest multiple of 32
+  auto const n_rounded = ::cuda::ceil_div(row_count, BITPACK_GROUP) * BITPACK_GROUP;
+  // Count the number of bytes needed (n_rounded is a multiple of 8 by definition)
+  return (n_rounded * width) / 8;
 }
 
-__device__ __forceinline__ uint64_t ld64(uint8_t const* p)
-{
-  uint64_t v;
-  memcpy(&v, p, sizeof(v));
-  return v;
-}
-
-// Mirror of `BitpackingPrimitives::GetRequiredSize`.
-__device__ __host__ __forceinline__ uint32_t bp_required_bytes(uint32_t count, uint32_t width)
-{
-  if (width == 0u) return 0u;
-  uint32_t const rounded = ::cuda::ceil_div(count, 32u) * 32u;
-  return rounded * width / 8u;
-}
-
-// Caller must supply 2 trailing guard words past the live data (the
-// 64-bit straddle case reads up to 3 consecutive 32-bit words).
+/**
+ * @brief Unpack a value of type ResT from @p packed bitstream.
+ * @note The caller must supply 2 trailing guard words past the live data.
+ */
 template <typename ResT>
 __device__ __forceinline__ ResT unpack_from_shmem(uint32_t const* packed,
                                                   uint32_t idx,
                                                   uint32_t width)
 {
-  if (width == 0u) return ResT(0);
+  constexpr uint32_t WORD_BYTES       = sizeof(uint32_t);
+  constexpr uint32_t WORD_BITS        = ::cuda::std::numeric_limits<uint32_t>::digits;
+  constexpr uint32_t DOUBLE_WORD_BITS = ::cuda::std::numeric_limits<uint64_t>::digits;
+  constexpr uint64_t DOUBLE_WORD_MAX  = ::cuda::std::numeric_limits<uint64_t>::max();
 
-  uint64_t bit_pos  = static_cast<uint64_t>(idx) * width;
-  uint32_t word_idx = static_cast<uint32_t>(bit_pos >> 5);
-  uint32_t bit_off  = static_cast<uint32_t>(bit_pos & 31u);
+  if (width == 0) return 0;
 
-  uint64_t combined = static_cast<uint64_t>(packed[word_idx]);
-  if (bit_off + width > 32u) { combined |= static_cast<uint64_t>(packed[word_idx + 1]) << 32; }
-  uint64_t result = combined >> bit_off;
+  auto const bit_pos  = static_cast<uint64_t>(idx) * width;
+  auto const word_idx = static_cast<uint32_t>(bit_pos / WORD_BITS);
+  auto const bit_off  = static_cast<uint32_t>(bit_pos % WORD_BITS);
 
-  if constexpr (sizeof(ResT) > 4) {
-    if (bit_off > 0 && bit_off + width > 64u) {
-      result |= static_cast<uint64_t>(packed[word_idx + 2]) << (64u - bit_off);
+  auto combined = static_cast<uint64_t>(packed[word_idx]);
+  if (bit_off + width > WORD_BITS) {
+    combined |= static_cast<uint64_t>(packed[word_idx + 1]) << WORD_BITS;
+  }
+  auto result = combined >> bit_off;
+
+  if constexpr (sizeof(ResT) > WORD_BYTES) {
+    static_assert(::cuda::std::is_same_v<ResT, uint64_t>);
+    if (bit_off > 0 && bit_off + width > DOUBLE_WORD_BITS) {
+      result |= static_cast<uint64_t>(packed[word_idx + 2]) << (DOUBLE_WORD_BITS - bit_off);
     }
   }
 
-  uint64_t mask = (width >= 64u) ? ~uint64_t{0} : ((uint64_t{1} << width) - 1u);
+  auto const mask = (width >= DOUBLE_WORD_BITS) ? DOUBLE_WORD_MAX : ((uint64_t{1} << width) - 1u);
   return static_cast<ResT>(result & mask);
 }
 
-// `src` is any byte alignment; `byte_count` need not be a multiple of 4.
-// We can't use `cg::memcpy_async` with `cuda::aligned_size_t<N>` here:
-// `src = vp + 13` where `vp = seg_base + data_off` and `data_off` varies
-// per vector at runtime, so neither 4- nor 16-byte alignment is provable.
-// Each thread doing `memcpy(&v, src + off, 4)` lowers to `ld.u32` (with
-// the unaligned-access handler on sm_75) — same primitive cg::memcpy_async
-// would use on an aligned middle, without the prefix/middle/tail split.
+/**
+ * @brief Copy bytes from @p src to @p dst_words in SMEM. memcpy is used because there is no
+ * guarantee on the byte alignment for @p src pointer.
+ */
 __device__ __forceinline__ void stage_bytes_to_shmem(uint32_t* dst_words,
                                                      uint8_t const* src,
                                                      uint32_t byte_count,
                                                      uint32_t pad_words)
 {
-  uint32_t live_words = ::cuda::ceil_div(byte_count, 4u);
+  constexpr uint32_t WORD_BYTES = sizeof(uint32_t);
+
+  auto const live_words = ::cuda::ceil_div(byte_count, WORD_BYTES);
   for (uint32_t w = threadIdx.x; w < live_words; w += blockDim.x) {
-    uint32_t off = w * 4u;
-    uint32_t v   = 0u;
-    if (off + 4u <= byte_count) {
-      memcpy(&v, src + off, 4);
+    auto const byte_offset = w * WORD_BYTES;
+    uint32_t v             = 0;
+    if (byte_offset + WORD_BYTES <= byte_count) {
+      memcpy(&v, src + byte_offset, WORD_BYTES);
     } else {
       // Tail: at most 3 leftover bytes. Zero-pad the high bytes.
-      uint32_t left = byte_count - off;
-      memcpy(&v, src + off, left);
+      auto const left = byte_count - byte_offset;
+      memcpy(&v, src + byte_offset, left);
     }
     dst_words[w] = v;
   }
   for (uint32_t w = live_words + threadIdx.x; w < live_words + pad_words; w += blockDim.x) {
-    dst_words[w] = 0u;
+    dst_words[w] = 0;
   }
 }
 
-// Read a value the kernel previously wrote with `__stwt`. Correct only after
-// a __syncthreads barrier separating the write from this read: `__stwt`
-// invalidates the issuing SM's L1 line, so the post-sync ordinary load
-// refills from L2 with the freshly written value. Any change to the main
-// loop's store hint (e.g., switching to `__stcg` or vectorized stores) must
-// revisit this helper. Used by ALPRD's exception scatter to recover
-// right-bits without a second pre-pass over `out`.
-template <typename T>
-__device__ __forceinline__ T read_back_after_stwt(T const* out, uint32_t pos)
-{
-  return out[pos];
-}
-
+/**
+ * @brief Zero-fill @p out buffer with @p row_count zeros in the case of malfomation.
+ */
 template <typename T>
 __device__ __forceinline__ void zero_fill_vector(T* out, uint32_t row_count)
 {
@@ -277,417 +344,156 @@ __device__ __forceinline__ void zero_fill_vector(T* out, uint32_t row_count)
   }
 }
 
-// Dynamic shmem: uint32 packed_words[] — bitpacked mantissa stream plus
-// 2 guard words for `unpack_from_shmem`.
+//===----------------------------------------------------------------------===//
+// ALP
+//===----------------------------------------------------------------------===//
+/**
+ * @brief Parse the ALP segment trailer + per-vector header.
+ */
 template <typename T>
+__device__ alp_vector_meta parse_alp_metadata(uint8_t const* seg_base,
+                                              uint32_t seg_bytes,
+                                              uint32_t vec_idx,
+                                              uint32_t fill_rows)
+{
+  constexpr uint32_t T_BITS = sizeof(T) * CHAR_BIT;
+
+  alp_vector_meta meta{};
+  meta.status = alp_parse_status::invalid;
+
+  if (seg_bytes < duckdb::AlpConstants::HEADER_SIZE) return meta;
+
+  // Parse the segment trailer
+  auto const metadata_end = ld_unaligned<uint32_t>(seg_base);
+  // We must have: metadata_end - (ved_idx + 1) * METADATA_POINTER_SIZE >= METADATA_POINTER_SIZE, so
+  // that the desired metadata entry fits within the segment.
+  auto const trailer_need = (vec_idx + 2) * duckdb::AlpConstants::METADATA_POINTER_SIZE;
+  if (metadata_end > seg_bytes || metadata_end < trailer_need) return meta;
+  auto const metadata_entry_offset =
+    metadata_end - (vec_idx + 1) * duckdb::AlpConstants::METADATA_POINTER_SIZE;
+  auto const data_off = ld_unaligned<uint32_t>(seg_base + metadata_entry_offset);
+  if (data_off < duckdb::AlpConstants::HEADER_SIZE || data_off >= metadata_end) return meta;
+  meta.data_off = data_off;
+
+  // Parse the per-vector header
+  auto const* vector_p = seg_base + data_off;
+  auto const exp       = vector_p[0];
+  if (exp == ALP_UNCOMPRESSED_SENTINEL) {
+    // 1-B padding before raw values
+    auto const raw_end = data_off + 1 + fill_rows * sizeof(T);
+    if (raw_end > metadata_end) return meta;
+    meta.status = alp_parse_status::uncompressed;
+    return meta;
+  }
+
+  // Ensure header parsing produces valid reads
+  constexpr auto VECTOR_HEADER_SIZE =
+    duckdb::AlpConstants::EXPONENT_SIZE + duckdb::AlpConstants::FACTOR_SIZE +
+    duckdb::AlpConstants::EXCEPTIONS_COUNT_SIZE + duckdb::AlpConstants::FOR_SIZE +
+    duckdb::AlpConstants::BIT_WIDTH_SIZE;
+  if (data_off + VECTOR_HEADER_SIZE > metadata_end) return meta;
+  auto const fac              = vector_p[1];
+  auto const exceptions_count = ld_unaligned<uint16_t>(vector_p + 2);
+  auto const for_value        = ld_unaligned<uint64_t>(vector_p + 4);
+  auto const bw               = vector_p[12];
+  if (bw > T_BITS) return meta;
+  if (exp > duckdb::AlpTypedConstants<T>::MAX_EXPONENT || fac > ALP_MAX_FACTOR) return meta;
+
+  auto const packed_bytes = bp_required_bytes(fill_rows, bw);
+  auto const payload_end  = data_off + VECTOR_HEADER_SIZE + packed_bytes +
+                           exceptions_count * (sizeof(T) + sizeof(uint16_t));
+  if (payload_end > metadata_end) return meta;
+
+  meta.status             = alp_parse_status::compressed;
+  meta.exp                = exp;
+  meta.fac                = fac;
+  meta.exc_count          = exceptions_count;
+  meta.for_val            = for_value;
+  meta.bw                 = bw;
+  meta.packed_bytes_p     = vector_p + VECTOR_HEADER_SIZE;
+  meta.packed_bytes_count = packed_bytes;
+  return meta;
+}
+
+/**
+ * @brief Decoding kernel for ALP encoded values. Work partitioning is 1 CTA per 1024-row vector.
+ */
+template <int SMEM_WORDS, typename T>
 __global__ void kernel_decode_alp(alp_vector_desc const* __restrict__ descs,
                                   T* __restrict__ d_output,
                                   uint32_t num_vecs)
 {
-  static_assert(sizeof(T) == 4 || sizeof(T) == 8,
+  static_assert(::cuda::std::is_same_v<T, float> || ::cuda::std::is_same_v<T, double>,
                 "ALP only supports float / double; the dispatcher rejects other widths");
 
-  uint32_t vid = blockIdx.x;
-  if (vid >= num_vecs) return;
+  __shared__ uint32_t shmem[SMEM_WORDS];
+  __shared__ alp_vector_meta sh_meta;
 
-  auto const desc          = descs[vid];
-  uint8_t const* seg_base  = desc.d_segment;
-  uint32_t const seg_bytes = desc.segment_bytes;
-  uint32_t const fill_rows = desc.vec_row_count;
-  T* out                   = d_output + desc.global_row_offset;
-
-  __shared__ bool sh_invalid;
-  __shared__ bool sh_uncompressed;
-  __shared__ uint32_t sh_data_off;
-  __shared__ uint8_t sh_exp;
-  __shared__ uint8_t sh_fac;
-  __shared__ uint16_t sh_exc_count;
-  __shared__ uint64_t sh_for;
-  __shared__ uint8_t sh_bw;
-  __shared__ uint32_t sh_packed_bytes;
+  auto const vector_id = blockIdx.x;
+  if (vector_id >= num_vecs) return;
+  auto const desc      = descs[vector_id];
+  auto const* seg_base = desc.d_segment;
+  auto const seg_bytes = desc.segment_bytes;
+  auto const fill_rows = desc.vec_row_count;
+  auto* out            = d_output + desc.global_row_offset;
 
   if (threadIdx.x == 0) {
-    sh_invalid      = false;
-    sh_uncompressed = false;
-    sh_data_off     = 0;
-    sh_exp          = 0;
-    sh_fac          = 0;
-    sh_exc_count    = 0;
-    sh_for          = 0;
-    sh_bw           = 0;
-    sh_packed_bytes = 0;
-
-    if (seg_bytes < 4u) {
-      sh_invalid = true;
-    } else {
-      uint32_t metadata_end = ld32(seg_base);
-      uint64_t trailer_need = uint64_t{4u} + (uint64_t{desc.vec_idx} + 1u) * 4u;
-      if (metadata_end > seg_bytes || metadata_end < trailer_need) {
-        sh_invalid = true;
-      } else {
-        // Vector pointer must land in (4, metadata_end).
-        uint32_t entry_off = metadata_end - (desc.vec_idx + 1u) * 4u;
-        uint32_t data_off  = ld32(seg_base + entry_off);
-        if (data_off < 4u || data_off >= metadata_end) {
-          sh_invalid = true;
-        } else {
-          sh_data_off = data_off;
-          uint8_t exp = seg_base[data_off];
-          if (exp == ALP_UNCOMPRESSED_SENTINEL) {
-            uint64_t raw_end = uint64_t{data_off} + 1u + uint64_t{fill_rows} * sizeof(T);
-            if (raw_end > metadata_end) {
-              sh_invalid = true;
-            } else {
-              sh_uncompressed = true;
-            }
-          } else if (uint64_t{data_off} + 13u > metadata_end) {
-            sh_invalid = true;
-          } else {
-            uint8_t const* vp  = seg_base + data_off;
-            uint16_t exc_count = ld16(vp + 2);
-            uint64_t for_value = ld64(vp + 4);
-            uint8_t bw         = vp[12];
-
-            if (bw > sizeof(T) * 8u) {
-              sh_invalid = true;
-            } else {
-              uint32_t packed_bytes = bp_required_bytes(fill_rows, bw);
-              uint64_t payload_end =
-                uint64_t{data_off} + 13u + packed_bytes + uint64_t{exc_count} * (sizeof(T) + 2u);
-              if (payload_end > metadata_end) {
-                sh_invalid = true;
-              } else {
-                // ALP encoder couples (factor, exponent): factor is bounded
-                // by FACT_ARR extent (shared across types), exponent is
-                // bounded by AlpTypedConstants<T>::MAX_EXPONENT (10/f32,
-                // 18/f64). Out-of-range corrupt values would crash the
-                // constant-memory load.
-                uint8_t fac          = vp[1];
-                uint8_t max_exponent = duckdb::AlpTypedConstants<T>::MAX_EXPONENT;
-                if (exp > max_exponent || fac > ALP_MAX_FACTOR) {
-                  sh_invalid = true;
-                } else {
-                  sh_exp          = exp;
-                  sh_fac          = fac;
-                  sh_exc_count    = exc_count;
-                  sh_for          = for_value;
-                  sh_bw           = bw;
-                  sh_packed_bytes = packed_bytes;
-                }
-              }
-            }
-          }
-        }
-      }
-    }
+    sh_meta = parse_alp_metadata<T>(seg_base, seg_bytes, desc.vec_idx, fill_rows);
   }
   __syncthreads();
 
-  if (sh_invalid) {
+  if (sh_meta.status == alp_parse_status::invalid) {
     zero_fill_vector<T>(out, fill_rows);
     return;
   }
 
-  // Uncompressed sentinel — bit-cast via u32/u64 because raw_p is byte-aligned.
-  if (sh_uncompressed) {
-    uint8_t const* raw_p = seg_base + sh_data_off + 1u;
-    if constexpr (sizeof(T) == 4) {
-      for (uint32_t i = threadIdx.x; i < fill_rows; i += blockDim.x) {
-        uint32_t bits = ld32(raw_p + i * 4u);
-        T v;
-        memcpy(&v, &bits, sizeof(T));
-        __stwt(out + i, v);
-      }
-    } else {
-      for (uint32_t i = threadIdx.x; i < fill_rows; i += blockDim.x) {
-        uint64_t bits = ld64(raw_p + i * 8u);
-        T v;
-        memcpy(&v, &bits, sizeof(T));
-        __stwt(out + i, v);
-      }
+  //===----------Uncompressed----------===/
+  if (sh_meta.status == alp_parse_status::uncompressed) {
+    // 1B pad before the array of uncompressed values
+    auto const* raw_p = seg_base + sh_meta.data_off + 1;
+    for (uint32_t i = threadIdx.x; i < fill_rows; i += blockDim.x) {
+      __stwt(out + i, ld_unaligned<T>(raw_p + i * sizeof(T)));
     }
     return;
   }
 
-  // 2 guard words satisfy the 3-word read in unpack_from_shmem for 64-bit
-  // straddles past the last live word.
-  uint8_t const* vp           = seg_base + sh_data_off;
-  uint8_t const* packed_bytes = vp + 13u;
-
-  extern __shared__ uint32_t shmem[];
-  stage_bytes_to_shmem(shmem, packed_bytes, sh_packed_bytes, /*pad_words=*/2u);
+  //===----------Compressed----------===//
+  stage_bytes_to_shmem(shmem, sh_meta.packed_bytes_p, sh_meta.packed_bytes_count, /*pad_words=*/2);
   __syncthreads();
 
-  // FOR add is unsigned-wraparound; cast to int64 before applying FACT/FRAC.
-  T const fact_t       = static_cast<T>(d_alp_fact[sh_fac]);
-  T const frac_t       = alp_frac_ptr<T>()[sh_exp];
-  uint64_t const for_v = sh_for;
-  uint32_t const bw    = sh_bw;
-
+  auto const fact_t = static_cast<T>(d_alp_fact[sh_meta.fac]);
+  auto const frac_t = alp_frac_ptr<T>()[sh_meta.exp];
+  auto const for_v  = sh_meta.for_val;
+  auto const bw     = sh_meta.bw;
   for (uint32_t i = threadIdx.x; i < fill_rows; i += blockDim.x) {
-    uint64_t u  = unpack_from_shmem<uint64_t>(shmem, i, bw);
-    int64_t enc = static_cast<int64_t>(u + for_v);
-    T plain     = static_cast<T>(enc) * fact_t * frac_t;
-    __stwt(out + i, plain);
+    auto const u = unpack_from_shmem<uint64_t>(shmem, i, bw);
+    // FOR add is unsigned-wraparound; cast to int64 before applying FACT/FRAC.
+    auto const enc   = static_cast<int64_t>(u + for_v);
+    auto const decod = static_cast<T>(enc) * fact_t * frac_t;
+    __stwt(out + i, decod);
   }
 
-  // Bound-check `pos` to refuse a corrupt OOB write — positions are
-  // unique by construction at compress time, but the parsed value isn't
-  // trusted.
-  uint16_t const exc_count = sh_exc_count;
-  if (exc_count > 0u) {
-    // Sync only on the exception path: every thread must finish its main-loop
-    // store before any thread overwrites a row with its exception value.
-    // `sh_exc_count` is broadcast-shared, so all threads take the same branch.
+  //===----------Exceptions----------===//
+  auto const exc_count = sh_meta.exc_count;
+  if (exc_count > 0) {
+    // Sync ensures that every thread finishes its main-loop store before any thread overwrites with
+    // an exception value
     __syncthreads();
-    uint8_t const* exc_base   = packed_bytes + sh_packed_bytes;
-    uint8_t const* exc_p_base = exc_base + uint32_t{exc_count} * sizeof(T);
+    auto const* exc_base          = sh_meta.packed_bytes_p + sh_meta.packed_bytes_count;
+    auto const* exc_position_base = exc_base + uint32_t{exc_count} * sizeof(T);
     for (uint32_t e = threadIdx.x; e < exc_count; e += blockDim.x) {
       uint16_t pos;
-      memcpy(&pos, exc_p_base + e * 2u, sizeof(pos));
-      if (pos < fill_rows) {
-        T v;
-        if constexpr (sizeof(T) == 4) {
-          uint32_t bits = ld32(exc_base + e * 4u);
-          memcpy(&v, &bits, sizeof(T));
-        } else {
-          uint64_t bits = ld64(exc_base + e * 8u);
-          memcpy(&v, &bits, sizeof(T));
-        }
-        __stwt(out + pos, v);
-      }
+      memcpy(&pos,
+             exc_position_base + e * duckdb::AlpConstants::EXCEPTION_POSITION_SIZE,
+             sizeof(uint16_t));
+      if (pos < fill_rows) { __stwt(out + pos, ld_unaligned<T>(exc_base + e * sizeof(T))); }
     }
   }
 }
 
-// Dynamic shmem layout (4-byte words): left_packed[] | guards |
-// right_packed[] | guards. Static shmem holds the segment dictionary
-// (≤ 16 bytes) plus per-vector parsed state. EXACT_T is the unsigned
-// bit-mirror of T.
-template <typename T>
-__global__ void kernel_decode_alprd(alp_vector_desc const* __restrict__ descs,
-                                    T* __restrict__ d_output,
-                                    uint32_t num_vecs)
-{
-  static_assert(sizeof(T) == 4 || sizeof(T) == 8,
-                "ALPRD only supports float / double; the dispatcher rejects other widths");
-  using EXACT_T = typename std::conditional<sizeof(T) == 4, uint32_t, uint64_t>::type;
-
-  uint32_t vid = blockIdx.x;
-  if (vid >= num_vecs) return;
-
-  auto const desc          = descs[vid];
-  uint8_t const* seg_base  = desc.d_segment;
-  uint32_t const seg_bytes = desc.segment_bytes;
-  uint32_t const fill_rows = desc.vec_row_count;
-  T* out                   = d_output + desc.global_row_offset;
-
-  __shared__ bool sh_invalid;
-  __shared__ bool sh_uncompressed;
-  __shared__ uint32_t sh_data_off;
-  __shared__ uint16_t sh_exc_count;
-  __shared__ uint8_t sh_right_bw;
-  __shared__ uint8_t sh_left_bw;
-  __shared__ uint8_t sh_dict_size;
-  __shared__ uint16_t sh_dict[ALPRD_MAX_DICT_SIZE];
-  __shared__ uint32_t sh_left_bytes;
-  __shared__ uint32_t sh_right_bytes;
-
-  if (threadIdx.x == 0) {
-    sh_invalid      = false;
-    sh_uncompressed = false;
-    sh_data_off     = 0;
-    sh_exc_count    = 0;
-    sh_right_bw     = 0;
-    sh_left_bw      = 0;
-    sh_dict_size    = 0;
-    sh_left_bytes   = 0;
-    sh_right_bytes  = 0;
-
-    if (seg_bytes < ALPRD_HEADER_SIZE) {
-      sh_invalid = true;
-    } else {
-      uint32_t metadata_end = ld32(seg_base);
-      uint64_t trailer_need = uint64_t{ALPRD_HEADER_SIZE} + (uint64_t{desc.vec_idx} + 1u) * 4u;
-      if (metadata_end > seg_bytes || metadata_end < trailer_need) {
-        sh_invalid = true;
-      } else {
-        uint8_t right_bw  = seg_base[4];
-        uint8_t left_bw   = seg_base[5];
-        uint8_t dict_size = seg_base[6];
-        // right_bw + left_bw fits in storage; left_bw ≤ 3 ⇒ dict_size ≤ 8.
-        if (right_bw > sizeof(T) * 8u || left_bw > 3u || dict_size > ALPRD_MAX_DICT_SIZE) {
-          sh_invalid = true;
-        } else {
-          uint64_t header_end = uint64_t{ALPRD_HEADER_SIZE} + uint64_t{dict_size} * 2u;
-          if (header_end > metadata_end) {
-            sh_invalid = true;
-          } else {
-            sh_right_bw  = right_bw;
-            sh_left_bw   = left_bw;
-            sh_dict_size = dict_size;
-
-            uint32_t entry_off = metadata_end - (desc.vec_idx + 1u) * 4u;
-            uint32_t data_off  = ld32(seg_base + entry_off);
-            if (data_off < header_end || data_off >= metadata_end ||
-                uint64_t{data_off} + 2u > metadata_end) {
-              sh_invalid = true;
-            } else {
-              sh_data_off        = data_off;
-              uint16_t exc_count = ld16(seg_base + data_off);
-              if (exc_count == ALPRD_UNCOMPRESSED_SENTINEL) {
-                uint64_t raw_end = uint64_t{data_off} + 2u + uint64_t{fill_rows} * sizeof(T);
-                if (raw_end > metadata_end) {
-                  sh_invalid = true;
-                } else {
-                  sh_uncompressed = true;
-                }
-              } else {
-                sh_exc_count         = exc_count;
-                uint32_t left_bytes  = bp_required_bytes(fill_rows, left_bw);
-                uint32_t right_bytes = bp_required_bytes(fill_rows, right_bw);
-                // payload = 2 + left_bytes + right_bytes + exc_count*(2+2)
-                uint64_t payload_end =
-                  uint64_t{data_off} + 2u + left_bytes + right_bytes + uint64_t{exc_count} * 4u;
-                if (payload_end > metadata_end) {
-                  sh_invalid = true;
-                } else {
-                  sh_left_bytes  = left_bytes;
-                  sh_right_bytes = right_bytes;
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-
-  // Cooperatively zero-init the full 8-entry dict before reading entries
-  // [0, sh_dict_size). With left_bw ≤ 3 (validated above), left_idx ∈ [0,8),
-  // so the inner-loop `sh_dict[left_idx]` read is unconditionally safe — a
-  // corrupt left_idx ≥ sh_dict_size lands on a zero slot, no bounds check
-  // needed in the hot path. Thread 0's parse runs concurrently.
-  if (threadIdx.x < ALPRD_MAX_DICT_SIZE) { sh_dict[threadIdx.x] = 0; }
-  __syncthreads();
-  if (!sh_invalid && threadIdx.x < uint32_t{sh_dict_size}) {
-    uint16_t dv;
-    memcpy(&dv, seg_base + ALPRD_HEADER_SIZE + threadIdx.x * 2u, sizeof(dv));
-    sh_dict[threadIdx.x] = dv;
-  }
-  __syncthreads();
-
-  if (sh_invalid) {
-    zero_fill_vector<T>(out, fill_rows);
-    return;
-  }
-
-  if (sh_uncompressed) {
-    uint8_t const* raw_p = seg_base + sh_data_off + 2u;
-    if constexpr (sizeof(T) == 4) {
-      for (uint32_t i = threadIdx.x; i < fill_rows; i += blockDim.x) {
-        uint32_t bits = ld32(raw_p + i * 4u);
-        T v;
-        memcpy(&v, &bits, sizeof(T));
-        __stwt(out + i, v);
-      }
-    } else {
-      for (uint32_t i = threadIdx.x; i < fill_rows; i += blockDim.x) {
-        uint64_t bits = ld64(raw_p + i * 8u);
-        T v;
-        memcpy(&v, &bits, sizeof(T));
-        __stwt(out + i, v);
-      }
-    }
-    return;
-  }
-
-  // Stage left and right packed streams into shmem. Each region carries 2
-  // trailing guard words for the 64-bit straddle case.
-  uint8_t const* left_bp  = seg_base + sh_data_off + 2u;
-  uint8_t const* right_bp = left_bp + sh_left_bytes;
-
-  extern __shared__ uint32_t shmem[];
-  uint32_t left_live    = ::cuda::ceil_div(sh_left_bytes, 4u);
-  uint32_t* left_words  = shmem;
-  uint32_t* right_words = shmem + left_live + 2u;
-
-  stage_bytes_to_shmem(left_words, left_bp, sh_left_bytes, /*pad_words=*/2u);
-  stage_bytes_to_shmem(right_words, right_bp, sh_right_bytes, /*pad_words=*/2u);
-  __syncthreads();
-
-  uint8_t const right_bw = sh_right_bw;
-  uint8_t const left_bw  = sh_left_bw;
-  // right_bw == sizeof(T)*8 ⇒ shifting EXACT_T by that width is UB; gate it.
-  bool const full_right = (right_bw >= sizeof(T) * 8u);
-
-  for (uint32_t i = threadIdx.x; i < fill_rows; i += blockDim.x) {
-    EXACT_T right_val = unpack_from_shmem<EXACT_T>(right_words, i, right_bw);
-    EXACT_T bits;
-    if (full_right) {
-      bits = right_val;
-    } else {
-      uint16_t left_idx = unpack_from_shmem<uint16_t>(left_words, i, left_bw);
-      EXACT_T left_val  = static_cast<EXACT_T>(sh_dict[left_idx]);
-      bits              = (left_val << right_bw) | right_val;
-    }
-    T v;
-    memcpy(&v, &bits, sizeof(T));
-    __stwt(out + i, v);
-  }
-
-  // Exception scatter recovers right-bits via `read_back_after_stwt` —
-  // see helper for the L1-invalidate contract.
-  uint16_t const exc_count = sh_exc_count;
-  if (exc_count > 0u) {
-    // Sync only on the exception path: read_back_after_stwt(out, pos) reads
-    // what other threads wrote in the main loop, so the barrier is required
-    // here. `sh_exc_count` is broadcast-shared — uniform branch is safe.
-    __syncthreads();
-    uint8_t const* exc_base   = right_bp + sh_right_bytes;
-    uint8_t const* exc_p_base = exc_base + uint32_t{exc_count} * 2u;
-
-    EXACT_T const r_mask = full_right ? ~EXACT_T{0} : ((EXACT_T{1} << right_bw) - EXACT_T{1});
-
-    for (uint32_t e = threadIdx.x; e < exc_count; e += blockDim.x) {
-      uint16_t pos;
-      memcpy(&pos, exc_p_base + e * 2u, sizeof(pos));
-      if (pos >= fill_rows) continue;
-
-      uint16_t exc_left;
-      memcpy(&exc_left, exc_base + e * 2u, sizeof(exc_left));
-
-      T existing = read_back_after_stwt(out, pos);
-      EXACT_T existing_bits;
-      memcpy(&existing_bits, &existing, sizeof(EXACT_T));
-      EXACT_T right_part = existing_bits & r_mask;
-      EXACT_T bits =
-        full_right ? right_part : ((static_cast<EXACT_T>(exc_left) << right_bw) | right_part);
-      T v;
-      memcpy(&v, &bits, sizeof(T));
-      __stwt(out + pos, v);
-    }
-  }
-}
-
-std::vector<alp_vector_desc> build_vector_descs(gpu_codec_run const& run)
-{
-  std::vector<alp_vector_desc> descs;
-  // Small over-reservation; tight worst case is ceil(row_count / 1024) per segment.
-  descs.reserve(run.segments.size() * 2);
-  for (auto const& seg : run.segments) {
-    if (seg.row_count == 0) continue;
-    uint32_t num_vecs = ::cuda::ceil_div(seg.row_count, ALP_VECTOR_SIZE);
-    for (uint32_t v = 0; v < num_vecs; ++v) {
-      uint32_t vec_rows =
-        (v + 1u < num_vecs) ? ALP_VECTOR_SIZE : seg.row_count - v * ALP_VECTOR_SIZE;
-      descs.push_back(
-        {seg.d_bytes, seg.bytes_size, v, vec_rows, seg.row_offset + v * ALP_VECTOR_SIZE});
-    }
-  }
-  return descs;
-}
-
+/**
+ * @brief HOST-side ALP decoding kernel dispatcher.
+ */
 template <typename T>
 void launch_alp_typed(alp_vector_desc const* h_descs,
                       size_t num_vecs,
@@ -695,6 +501,10 @@ void launch_alp_typed(alp_vector_desc const* h_descs,
                       rmm::cuda_stream_view stream,
                       rmm::device_async_resource_ref mr)
 {
+  constexpr uint32_t MAX_PACKED_BYTES = duckdb::AlpConstants::ALP_VECTOR_SIZE * sizeof(T);
+  // Two guard words past the live data for the 64-bit straddle case.
+  constexpr uint32_t MAX_PACKED_WORDS = ::cuda::ceil_div(MAX_PACKED_BYTES, sizeof(uint32_t)) + 2;
+
   if (num_vecs == 0) return;
 
   rmm::device_uvector<alp_vector_desc> d_descs(num_vecs, stream, mr);
@@ -704,22 +514,225 @@ void launch_alp_typed(alp_vector_desc const* h_descs,
                                cudaMemcpyHostToDevice,
                                stream.value()));
 
-  // Live shmem footprint per CTA: bitpacked stream, max width sizeof(T)*8,
-  // ALP_VECTOR_SIZE values. Two guard words past the live data for the
-  // 64-bit straddle case.
-  constexpr uint32_t max_width        = sizeof(T) * 8u;
-  constexpr uint32_t max_packed_bytes = ::cuda::ceil_div(ALP_VECTOR_SIZE * max_width, 8u);
-  constexpr uint32_t max_packed_words = ::cuda::ceil_div(max_packed_bytes, 4u) + 2u;
-  constexpr size_t shmem_bytes        = max_packed_words * sizeof(uint32_t);
-  static_assert(shmem_bytes <= 48u * 1024u,
-                "kernel_decode_alp dynamic shmem exceeds 48 KiB; either reduce "
-                "ALP_VECTOR_SIZE or call cudaFuncSetAttribute(MaxDynamicSharedMemorySize) "
-                "before launch");
-
-  kernel_decode_alp<T><<<static_cast<uint32_t>(num_vecs), BLOCK_DIM, shmem_bytes, stream.value()>>>(
-    d_descs.data(), d_output, static_cast<uint32_t>(num_vecs));
+  kernel_decode_alp<MAX_PACKED_WORDS, T>
+    <<<static_cast<uint32_t>(num_vecs), BLOCK_DIM, 0, stream.value()>>>(
+      d_descs.data(), d_output, static_cast<uint32_t>(num_vecs));
 }
 
+//===----------------------------------------------------------------------===//
+// ALPRD
+//===----------------------------------------------------------------------===//
+/**
+ * @brief Parse the ALPRD segment header + per-vector header.
+ */
+template <typename T>
+__device__ alprd_vector_meta parse_alprd_metadata(uint8_t const* seg_base,
+                                                  uint32_t seg_bytes,
+                                                  uint32_t vec_idx,
+                                                  uint32_t fill_rows)
+{
+  constexpr uint32_t T_BITS = sizeof(T) * CHAR_BIT;
+
+  alprd_vector_meta meta{};
+  meta.status = alprd_parse_status::invalid;
+
+  if (seg_bytes < duckdb::AlpRDConstants::HEADER_SIZE) return meta;
+
+  // Parse the segment header
+  auto const metadata_end = ld_unaligned<uint32_t>(seg_base);
+  // We must have: metadata_end - (vec_idx + 1) * METADATA_POINTER_SIZE >= HEADER_SIZE, so
+  // that the desired metadata entry fits within the segment.
+  auto const trailer_need = duckdb::AlpRDConstants::HEADER_SIZE +
+                            (vec_idx + 1) * duckdb::AlpRDConstants::METADATA_POINTER_SIZE;
+  if (metadata_end > seg_bytes || metadata_end < trailer_need) return meta;
+
+  // Segment-level widths sit immediately after the metadata_end pointer.
+  auto const right_bw  = seg_base[duckdb::AlpRDConstants::METADATA_POINTER_SIZE];
+  auto const left_bw   = seg_base[duckdb::AlpRDConstants::METADATA_POINTER_SIZE +
+                                duckdb::AlpRDConstants::RIGHT_BIT_WIDTH_SIZE];
+  auto const dict_size = seg_base[duckdb::AlpRDConstants::METADATA_POINTER_SIZE +
+                                  duckdb::AlpRDConstants::RIGHT_BIT_WIDTH_SIZE +
+                                  duckdb::AlpRDConstants::LEFT_BIT_WIDTH_SIZE];
+  if (right_bw > T_BITS || left_bw > duckdb::AlpRDConstants::MAX_DICTIONARY_BIT_WIDTH ||
+      dict_size > duckdb::AlpRDConstants::MAX_DICTIONARY_SIZE) {
+    return meta;
+  }
+
+  auto const dict_end = duckdb::AlpRDConstants::HEADER_SIZE +
+                        dict_size * duckdb::AlpRDConstants::DICTIONARY_ELEMENT_SIZE;
+  if (dict_end > metadata_end) return meta;
+
+  meta.right_bw  = right_bw;
+  meta.left_bw   = left_bw;
+  meta.dict_size = dict_size;
+
+  // Locate this vector's per-vector data via the trailer pointer table.
+  auto const metadata_entry_offset =
+    metadata_end - (vec_idx + 1) * duckdb::AlpRDConstants::METADATA_POINTER_SIZE;
+  auto const data_off = ld_unaligned<uint32_t>(seg_base + metadata_entry_offset);
+  if (data_off < dict_end ||
+      data_off + duckdb::AlpRDConstants::EXCEPTIONS_COUNT_SIZE > metadata_end) {
+    return meta;
+  }
+  meta.data_off = data_off;
+
+  // Per-vector header is the 2-byte exception count.
+  auto const* vector_p        = seg_base + data_off;
+  auto const exceptions_count = ld_unaligned<uint16_t>(vector_p);
+  if (exceptions_count == ALPRD_UNCOMPRESSED_SENTINEL) {
+    // 2-B sentinel before raw values
+    auto const raw_end =
+      data_off + duckdb::AlpRDConstants::EXCEPTIONS_COUNT_SIZE + fill_rows * sizeof(T);
+    if (raw_end > metadata_end) return meta;
+    meta.status = alprd_parse_status::uncompressed;
+    return meta;
+  }
+
+  auto const left_packed_bytes  = bp_required_bytes(fill_rows, left_bw);
+  auto const right_packed_bytes = bp_required_bytes(fill_rows, right_bw);
+  auto const payload_end        = data_off + duckdb::AlpRDConstants::EXCEPTIONS_COUNT_SIZE +
+                           left_packed_bytes + right_packed_bytes +
+                           exceptions_count * (duckdb::AlpRDConstants::EXCEPTION_SIZE +
+                                               duckdb::AlpRDConstants::EXCEPTION_POSITION_SIZE);
+  if (payload_end > metadata_end) return meta;
+
+  meta.status                   = alprd_parse_status::compressed;
+  meta.exc_count                = exceptions_count;
+  meta.left_packed_bytes_p      = vector_p + duckdb::AlpRDConstants::EXCEPTIONS_COUNT_SIZE;
+  meta.left_packed_bytes_count  = left_packed_bytes;
+  meta.right_packed_bytes_p     = meta.left_packed_bytes_p + left_packed_bytes;
+  meta.right_packed_bytes_count = right_packed_bytes;
+  return meta;
+}
+
+/**
+ * @brief Decoding kernel for ALPRD encoded values. Work partitioning is 1 CTA per 1024-row vector.
+ */
+template <int SMEM_WORDS, typename T>
+__global__ void kernel_decode_alprd(alp_vector_desc const* __restrict__ descs,
+                                    T* __restrict__ d_output,
+                                    uint32_t num_vecs)
+{
+  static_assert(::cuda::std::is_same_v<T, float> || ::cuda::std::is_same_v<T, double>,
+                "ALPRD only supports float / double; the dispatcher rejects other widths");
+  using raw_t = ::cuda::std::conditional_t<::cuda::std::is_same_v<T, float>, uint32_t, uint64_t>;
+  constexpr uint32_t T_BITS = sizeof(T) * CHAR_BIT;
+
+  __shared__ uint32_t shmem[SMEM_WORDS];
+  __shared__ alprd_vector_meta sh_meta;
+  __shared__ uint16_t sh_dict[duckdb::AlpRDConstants::MAX_DICTIONARY_SIZE];
+
+  auto const vector_id = blockIdx.x;
+  if (vector_id >= num_vecs) return;
+  auto const desc      = descs[vector_id];
+  auto const* seg_base = desc.d_segment;
+  auto const seg_bytes = desc.segment_bytes;
+  auto const fill_rows = desc.vec_row_count;
+  auto* out            = d_output + desc.global_row_offset;
+
+  if (threadIdx.x == 0) {
+    sh_meta = parse_alprd_metadata<T>(seg_base, seg_bytes, desc.vec_idx, fill_rows);
+  }
+
+  // Cooperatively zero-init the dict so a corrupt left_idx ≥ dict_size lands
+  // on a zero slot — no bounds check needed in the hot path.
+  if (threadIdx.x < duckdb::AlpRDConstants::MAX_DICTIONARY_SIZE) { sh_dict[threadIdx.x] = 0; }
+  __syncthreads();
+  if (sh_meta.status != alprd_parse_status::invalid && threadIdx.x < sh_meta.dict_size) {
+    auto const* dict_p   = seg_base + duckdb::AlpRDConstants::HEADER_SIZE;
+    sh_dict[threadIdx.x] = ld_unaligned<uint16_t>(
+      dict_p + threadIdx.x * duckdb::AlpRDConstants::DICTIONARY_ELEMENT_SIZE);
+  }
+  __syncthreads();
+
+  if (sh_meta.status == alprd_parse_status::invalid) {
+    zero_fill_vector<T>(out, fill_rows);
+    return;
+  }
+
+  //===----------Uncompressed----------===/
+  if (sh_meta.status == alprd_parse_status::uncompressed) {
+    // 2B sentinel before the array of uncompressed values
+    auto const* raw_p = seg_base + sh_meta.data_off + 2;
+    for (uint32_t i = threadIdx.x; i < fill_rows; i += blockDim.x) {
+      __stwt(out + i, ld_unaligned<T>(raw_p + i * sizeof(T)));
+    }
+    return;
+  }
+
+  //===----------Compressed----------===//
+  // Stage left and right packed streams into shmem with 2 guard words after each region.
+  auto const left_live = ::cuda::ceil_div(sh_meta.left_packed_bytes_count, sizeof(uint32_t));
+  auto* left_words     = shmem;
+  auto* right_words    = shmem + left_live + 2;
+  stage_bytes_to_shmem(left_words,
+                       sh_meta.left_packed_bytes_p,
+                       sh_meta.left_packed_bytes_count,
+                       /*pad_words=*/2);
+  stage_bytes_to_shmem(right_words,
+                       sh_meta.right_packed_bytes_p,
+                       sh_meta.right_packed_bytes_count,
+                       /*pad_words=*/2);
+  __syncthreads();
+
+  auto const right_bw = sh_meta.right_bw;
+  auto const left_bw  = sh_meta.left_bw;
+  // right_bw == sizeof(T)*8 ⇒ shifting raw_t by that width is UB; gate it.
+  auto const full_right = right_bw >= T_BITS;
+
+  for (uint32_t i = threadIdx.x; i < fill_rows; i += blockDim.x) {
+    auto const right_val = unpack_from_shmem<raw_t>(right_words, i, right_bw);
+    raw_t bits;
+    if (full_right) {
+      bits = right_val;
+    } else {
+      auto const left_idx = unpack_from_shmem<uint16_t>(left_words, i, left_bw);
+      auto const left_val = static_cast<raw_t>(sh_dict[left_idx]);
+      bits                = (left_val << right_bw) | right_val;
+    }
+    T v;
+    memcpy(&v, &bits, sizeof(T));
+    __stwt(out + i, v);
+  }
+
+  //===----------Exceptions----------===//
+  // Recover each row's `right` bits from `out` rather than re-unpacking the
+  // right bitstream.
+  auto const exc_count = sh_meta.exc_count;
+  if (exc_count > 0) {
+    // Sync to ensure the writes to out have completed
+    __syncthreads();
+    auto const* exc_base = sh_meta.right_packed_bytes_p + sh_meta.right_packed_bytes_count;
+    auto const* exc_position_base =
+      exc_base + uint32_t{exc_count} * duckdb::AlpRDConstants::EXCEPTION_SIZE;
+    auto const r_mask =
+      full_right ? ::cuda::std::numeric_limits<raw_t>::max() : ((raw_t{1} << right_bw) - raw_t{1});
+
+    for (uint32_t e = threadIdx.x; e < exc_count; e += blockDim.x) {
+      uint16_t pos;
+      memcpy(&pos,
+             exc_position_base + e * duckdb::AlpRDConstants::EXCEPTION_POSITION_SIZE,
+             sizeof(uint16_t));
+      if (pos >= fill_rows) continue;
+
+      auto const exc_left =
+        ld_unaligned<uint16_t>(exc_base + e * duckdb::AlpRDConstants::EXCEPTION_SIZE);
+      auto const existing = out[pos];  // Has correct right bits
+      raw_t existing_bits;
+      memcpy(&existing_bits, &existing, sizeof(raw_t));
+      auto const right_part = existing_bits & r_mask;
+      auto const bits =
+        full_right ? right_part : ((static_cast<raw_t>(exc_left) << right_bw) | right_part);
+      T v;
+      memcpy(&v, &bits, sizeof(T));
+      __stwt(out + pos, v);
+    }
+  }
+}
+
+/**
+ * @brief HOST-side ALPRD decoding kernel dispatcher.
+ */
 template <typename T>
 void launch_alprd_typed(alp_vector_desc const* h_descs,
                         size_t num_vecs,
@@ -727,6 +740,16 @@ void launch_alprd_typed(alp_vector_desc const* h_descs,
                         rmm::cuda_stream_view stream,
                         rmm::device_async_resource_ref mr)
 {
+  // Live shmem: left stream (left_bw ≤ MAX_DICTIONARY_BIT_WIDTH) + right
+  // stream (right_bw ≤ sizeof(T)*8). Two guard words past each region for
+  // the 64-bit straddle case.
+  constexpr uint32_t MAX_LEFT_BYTES = ::cuda::ceil_div(
+    duckdb::AlpRDConstants::ALP_VECTOR_SIZE * duckdb::AlpRDConstants::MAX_DICTIONARY_BIT_WIDTH, 8);
+  constexpr uint32_t MAX_RIGHT_BYTES = duckdb::AlpRDConstants::ALP_VECTOR_SIZE * sizeof(T);
+  constexpr uint32_t MAX_LEFT_WORDS  = ::cuda::ceil_div(MAX_LEFT_BYTES, sizeof(uint32_t)) + 2;
+  constexpr uint32_t MAX_RIGHT_WORDS = ::cuda::ceil_div(MAX_RIGHT_BYTES, sizeof(uint32_t)) + 2;
+  constexpr uint32_t SHMEM_WORDS     = MAX_LEFT_WORDS + MAX_RIGHT_WORDS;
+
   if (num_vecs == 0) return;
 
   rmm::device_uvector<alp_vector_desc> d_descs(num_vecs, stream, mr);
@@ -736,30 +759,47 @@ void launch_alprd_typed(alp_vector_desc const* h_descs,
                                cudaMemcpyHostToDevice,
                                stream.value()));
 
-  // Live shmem: left stream (left_bw ≤ 3) + right stream (right_bw ≤
-  // sizeof(T)*8). Guard pair after each region.
-  constexpr uint32_t max_left_bytes  = ::cuda::ceil_div(ALP_VECTOR_SIZE * 3u, 8u);
-  constexpr uint32_t max_right_bytes = ::cuda::ceil_div(ALP_VECTOR_SIZE * sizeof(T) * 8u, 8u);
-  constexpr uint32_t max_left_words  = ::cuda::ceil_div(max_left_bytes, 4u) + 2u;
-  constexpr uint32_t max_right_words = ::cuda::ceil_div(max_right_bytes, 4u) + 2u;
-  constexpr size_t shmem_bytes       = (max_left_words + max_right_words) * sizeof(uint32_t);
-  static_assert(shmem_bytes <= 48u * 1024u, "kernel_decode_alprd dynamic shmem exceeds 48 KiB");
-
-  kernel_decode_alprd<T>
-    <<<static_cast<uint32_t>(num_vecs), BLOCK_DIM, shmem_bytes, stream.value()>>>(
+  kernel_decode_alprd<SHMEM_WORDS, T>
+    <<<static_cast<uint32_t>(num_vecs), BLOCK_DIM, 0, stream.value()>>>(
       d_descs.data(), d_output, static_cast<uint32_t>(num_vecs));
 }
 
-void throw_unsupported_type(uint32_t type_size, char const* codec)
+//===----------------------------------------------------------------------===//
+// CTA-level descriptors
+//===----------------------------------------------------------------------===//
+std::vector<alp_vector_desc> build_vector_descs(gpu_codec_run const& run)
 {
-  throw std::runtime_error(std::string("gpu_decode_table: viability invariant violated — ") +
-                           codec + " type_size " + std::to_string(type_size));
+  std::vector<alp_vector_desc> descs;
+  // Calculate the number of required descriptors
+  size_t total_vecs = 0;
+  for (auto const& seg : run.segments) {
+    total_vecs += ::cuda::ceil_div(seg.row_count, ALP_VECTOR_SIZE);
+  }
+  descs.reserve(total_vecs);
+  for (auto const& seg : run.segments) {
+    if (seg.row_count == 0) continue;
+    auto const num_vecs = ::cuda::ceil_div(seg.row_count, ALP_VECTOR_SIZE);
+    for (uint32_t v = 0; v < num_vecs; ++v) {
+      auto const vec_rows =
+        (v < num_vecs - 1) ? ALP_VECTOR_SIZE : seg.row_count - v * ALP_VECTOR_SIZE;
+      descs.push_back(
+        {seg.d_bytes, seg.bytes_size, v, vec_rows, seg.row_offset + v * ALP_VECTOR_SIZE});
+    }
+  }
+  return descs;
 }
 
 }  // anonymous namespace
 
-// `type` parameter is signature-uniformity for the dispatcher table;
-// `type_size` alone selects the ALP / ALPRD kernel.
+//===----------------------------------------------------------------------===//
+// Public Entry Points for ALP(RD) Decoding
+//===----------------------------------------------------------------------===//
+/**
+ * @brief Decode a set of ALP-encoded segments.
+ *
+ * @param run A set of segments with the ALP codec
+ * @param d_output
+ */
 void decode_alp_data(gpu_codec_run const& run,
                      uint8_t* d_output,
                      cudf::data_type /*type*/,
@@ -779,7 +819,9 @@ void decode_alp_data(gpu_codec_run const& run,
       launch_alp_typed<double>(
         descs.data(), descs.size(), reinterpret_cast<double*>(d_output), stream, mr);
       break;
-    default: throw_unsupported_type(type_size, "ALP");
+    default:
+      throw std::runtime_error("[gpu_decode_alp]: type_size " + std::to_string(type_size) +
+                               " is invalid for ALP decoding.");
   }
 }
 
@@ -790,7 +832,7 @@ void decode_alprd_data(gpu_codec_run const& run,
                        rmm::cuda_stream_view stream,
                        rmm::device_async_resource_ref mr)
 {
-  auto descs = build_vector_descs(run);
+  auto const descs = build_vector_descs(run);
   if (descs.empty()) return;
 
   switch (type_size) {
@@ -802,7 +844,9 @@ void decode_alprd_data(gpu_codec_run const& run,
       launch_alprd_typed<double>(
         descs.data(), descs.size(), reinterpret_cast<double*>(d_output), stream, mr);
       break;
-    default: throw_unsupported_type(type_size, "ALPRD");
+    default:
+      throw std::runtime_error("[gpu_decode_alprd]: type_size " + std::to_string(type_size) +
+                               " is invalid for ALPRD decoding.");
   }
 }
 

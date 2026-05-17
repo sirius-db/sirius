@@ -18,8 +18,7 @@
 
 // ALP / ALPRD decode entries for the GPU-native scan path. On any bounds
 // check failure the kernel zero-fills the trusted host descriptor row
-// range — returning without writing would leak prior device contents.
-// On-disk format reference and per-vector layouts: gpu_decode_alp.cu.
+// range. On-disk format reference and per-vector layouts: gpu_decode_alp.cu.
 
 #include <cudf/types.hpp>
 
