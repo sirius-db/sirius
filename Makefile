@@ -155,23 +155,22 @@ s3-cpp-test:
 	@source $(S3_DIR)/env.sh && export SIRIUS_TEST_S3_STRICT=1 && $(S3_TEST_BIN) "[s3][integration]"
 
 # -----------------------------------------------------------------------------
-# S3 perf benchmark (Catch2 [!benchmark][perf][bench] hidden tag — not in the
+# S3 perf benchmark (Catch2 [!benchmark][perf][bench] hidden tag - not in the
 # default CI suite, and deliberately NOT tagged [s3] so the [s3] integration
-# gate does not pull the benchmark in). Generates a JSON record under
+# gate does not pull the benchmark in). `make s3-bench-fixtures` runs
+# fixtures.sh --perf, which first uploads the standard fixtures and then adds
+# the SF10 lineitem parquet. Generates a JSON record under
 # build/release/extension/sirius/test/cpp/log/perf_<ts>.json for tracking.
 # Override SIRIUS_BENCH_BACKEND=aws-s3 to portably hit AWS instead of MinIO;
 # see test/cpp/integration/s3/fixtures/README.md for the env-var contract.
 
-S3_BENCH_FIXTURES_DIR := test/cpp/integration/s3/fixtures
-S3_BENCH_FIXTURE_SCRIPT := $(S3_BENCH_FIXTURES_DIR)/generate_perf_dataset.sh
-
 s3-bench-fixtures: SHELL := /bin/bash
 s3-bench-fixtures:
-	@if [ ! -x $(S3_BENCH_FIXTURE_SCRIPT) ]; then \
-	  echo "s3-bench-fixtures: $(S3_BENCH_FIXTURE_SCRIPT) not executable" >&2; \
+	@if [ ! -x $(S3_DIR)/fixtures.sh ]; then \
+	  echo "s3-bench-fixtures: $(S3_DIR)/fixtures.sh not executable" >&2; \
 	  exit 1; \
 	fi
-	@$(S3_BENCH_FIXTURE_SCRIPT)
+	@$(S3_DIR)/fixtures.sh --perf
 
 s3-bench: SHELL := /bin/bash
 s3-bench:
