@@ -36,9 +36,11 @@
 #include <duckdb/common/hive_partitioning.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -274,27 +276,52 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     //===----------Read metadata footers----------===//
     // Per-path ioctx dispatch via scan_manager: each file is independently
     // routed to its supporting backend (local file → uring_ioctx, s3:// → s3_ioctx).
-    // When the scan_manager is null (rare test fixture) or has no backend
-    // claiming this path, fall through to cudf's path; an unsupported path
-    // with a live scan_manager is a hard error (no backend can read it).
+    // When the scan_manager is null (rare test fixture), or has no backend
+    // claiming this path, fall through to cudf::io::datasource::create.
+    // Exception: a path carrying a URI scheme (s3://, http://, …) that no
+    // backend claims is a hard error — cudf cannot read a remote scheme, so a
+    // clear Sirius error beats an opaque cudf failure. A bare local path with
+    // no backend (e.g. use_sirius_datasource=false) is fine: cudf reads local
+    // files natively.
     //
     // Path normalization: uring_reactor::supports / create_io_object only
     // accept bare absolute paths (they call is_regular_file on the raw
     // string). When the planner gives us a "file://" URI, strip the scheme
     // BEFORE dispatching so both supports() and create_io_object() see the
-    // bare path. S3 paths are passed through unchanged.
+    // bare path. The "file://" match is case-insensitive (RFC 3986 schemes
+    // are; Sirius's URI parser treats them so) so a "FILE://" URI is still
+    // recognized as local. S3 and other schemes are passed through unchanged.
     auto normalize_path = [](std::string const& p) -> std::string {
       static constexpr std::string_view kFile = "file://";
-      if (p.size() > kFile.size() && std::string_view{p}.substr(0, kFile.size()) == kFile) {
-        return p.substr(kFile.size());
+      if (p.size() > kFile.size()) {
+        bool is_file_uri = true;
+        for (std::size_t i = 0; i < kFile.size(); ++i) {
+          if (std::tolower(static_cast<unsigned char>(p[i])) !=
+              static_cast<unsigned char>(kFile[i])) {
+            is_file_uri = false;
+            break;
+          }
+        }
+        if (is_file_uri) { return p.substr(kFile.size()); }
       }
       return p;
+    };
+    // A path still carrying a "://" after file:// stripping has a URI scheme
+    // that no Sirius backend claimed and that cudf cannot read locally
+    // (s3://, http://, …). Used only to pick the failure mode — throw vs.
+    // cudf fallback — when no backend claims the path. Scheme-name case is
+    // irrelevant: the "://" delimiter is what marks a non-local path.
+    auto has_uri_scheme = [](std::string const& p) -> bool {
+      return p.find("://") != std::string::npos;
     };
     auto const lookup_path = normalize_path(file_path);
     std::shared_ptr<sirius::io::sirius_ioctx> file_io_ctx;
     if (_scan_manager != nullptr) {
       file_io_ctx = _scan_manager->io_ctx_shared_for(lookup_path);
-      if (!file_io_ctx) {
+      // No backend claims this path. Throw for a scheme'd URI — cudf cannot
+      // read it. A bare local path (no scheme) falls through with a null
+      // file_io_ctx to the cudf datasource branch below.
+      if (!file_io_ctx && has_uri_scheme(lookup_path)) {
         throw std::runtime_error("[parquet_split_provider] no backend supports path: " + file_path);
       }
     }

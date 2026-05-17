@@ -215,7 +215,8 @@ sirius_scan_manager make_scan_manager(cucascade::memory::fixed_size_host_memory_
                                       std::optional<s3_test_env> const& env = std::nullopt)
 {
   scan_manager_config cfg{};
-  cfg.uring_n_reactors = 1;
+  cfg.use_sirius_datasource = true;
+  cfg.uring_n_reactors      = 1;
   if (env) {
     cfg.s3_config                         = make_live_s3_config(*env);
     cfg.s3_thread_pool.num_threads        = 4;

@@ -103,9 +103,13 @@ class parquet_split_provider : public split_provider {
   ///                      @c sirius_scan_manager::io_ctx_shared_for(path):
   ///                      each file in @p file_paths is independently routed
   ///                      to its supporting backend at @c run_batch time.
-  ///                      Files whose path is claimed by no backend cause
-  ///                      @c run_batch to throw @c std::runtime_error
-  ///                      ("no backend supports path: ...").
+  ///                      A URI with a non-@c file scheme (e.g. @c s3://)
+  ///                      claimed by no backend causes @c run_batch to
+  ///                      throw @c std::runtime_error ("no backend
+  ///                      supports path: ..."); a local path — bare, or a
+  ///                      @c file:// URI of any case, normalized to a bare
+  ///                      path — with no backend falls back to
+  ///                      @c cudf::io::datasource::create.
   parquet_split_provider(duckdb::vector<sirius::logical_type> const& returned_types,
                          std::vector<std::string> const& file_paths,
                          duckdb::vector<duckdb::ColumnIndex> const& column_ids,

@@ -23,6 +23,7 @@
 #include <helper/logical_type.hpp>
 #include <op/scan/parquet_scan_operator_data.hpp>
 #include <scan_manager/parquet_split_provider.hpp>
+#include <scan_manager/sirius_scan_manager.hpp>
 #include <scan_manager/split_connector.hpp>
 
 // duckdb
@@ -36,6 +37,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -143,6 +145,26 @@ std::size_t total_uncompressed_bytes(parquet_scan_data const& data)
   return total;
 }
 
+std::unordered_set<std::string> files_seen_in(
+  std::vector<std::unique_ptr<parquet_scan_data>> const& splits)
+{
+  std::unordered_set<std::string> seen;
+  for (auto const& split : splits) {
+    for (auto const& slice : split->rg_slices) {
+      seen.insert(slice.file_path);
+    }
+  }
+  return seen;
+}
+
+scan_manager_config cudf_fallback_scan_manager_config()
+{
+  scan_manager_config cfg{};
+  cfg.use_sirius_datasource = false;
+  cfg.uring_n_reactors      = 1;
+  return cfg;
+}
+
 // Helper to build a temp directory keyed by test name; cleared if it already exists.
 std::filesystem::path fresh_tmp_dir(std::string const& tag)
 {
@@ -154,6 +176,133 @@ std::filesystem::path fresh_tmp_dir(std::string const& tag)
 }
 
 }  // namespace
+
+TEST_CASE("parquet_split_provider - scan_manager disabled datasource falls back to cudf",
+          "[scan_manager][parquet_split_provider]")
+{
+  auto const dir       = fresh_tmp_dir("scan_manager_cudf_fallback");
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+
+  constexpr std::size_t k_files         = 2;
+  constexpr std::size_t k_rows_per_file = 1000;
+  constexpr std::size_t k_rg_size       = 500;
+
+  std::vector<std::string> file_paths;
+  file_paths.reserve(k_files);
+  for (std::size_t i = 0; i < k_files; ++i) {
+    auto path = write_parquet_file(con,
+                                   dir,
+                                   "local_" + std::to_string(i),
+                                   k_rows_per_file,
+                                   k_rg_size,
+                                   static_cast<std::int64_t>(i * k_rows_per_file));
+    file_paths.push_back(path.string());
+  }
+
+  sirius_scan_manager manager(cudf_fallback_scan_manager_config());
+  auto const returned_types = default_returned_types();
+  parquet_split_provider provider(
+    returned_types,
+    file_paths,
+    all_column_ids(returned_types.size()),
+    /*projection_ids*/ {},
+    /*names*/ {},
+    /*scan_output_arity*/ returned_types.size(),
+    /*table_filter_set*/ nullptr,
+    /*partition_indices*/ {},
+    /*approximate_batch_size*/ std::size_t{1} << 30,
+    /*max_file_processed*/ parquet_split_provider::DEFAULT_MAX_FILE_PROCESSED,
+    manager);
+
+  std::vector<std::unique_ptr<parquet_scan_data>> splits;
+  REQUIRE_NOTHROW(splits = drive_provider(provider));
+  REQUIRE_FALSE(splits.empty());
+
+  auto const seen = files_seen_in(splits);
+  for (auto const& path : file_paths) {
+    INFO("missing file path " << path);
+    REQUIRE(seen.find(path) != seen.end());
+  }
+
+  for (auto const& split : splits) {
+    for (auto const& slice : split->rg_slices) {
+      CHECK(slice.io_ctx == nullptr);
+      CHECK(slice.io_object == nullptr);
+    }
+  }
+
+  std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("parquet_split_provider - scan_manager keeps throwing for unclaimed s3 paths",
+          "[scan_manager][parquet_split_provider]")
+{
+  auto const returned_types = default_returned_types();
+  for (auto const path :
+       {"s3://bucket/key.parquet", "S3://bucket/key.parquet", "s3://bucket", "s3://bucket/"}) {
+    INFO("path=" << path);
+    sirius_scan_manager manager(cudf_fallback_scan_manager_config());
+    parquet_split_provider provider(returned_types,
+                                    {path},
+                                    all_column_ids(returned_types.size()),
+                                    /*projection_ids*/ {},
+                                    /*names*/ {},
+                                    /*scan_output_arity*/ returned_types.size(),
+                                    /*table_filter_set*/ nullptr,
+                                    /*partition_indices*/ {},
+                                    /*approximate_batch_size*/ std::size_t{1} << 30,
+                                    /*max_file_processed*/ 1,
+                                    manager);
+
+    try {
+      (void)drive_provider(provider);
+      FAIL("expected unsupported s3 path to throw");
+    } catch (std::runtime_error const& e) {
+      CHECK(std::string{e.what()}.find("no backend supports path") != std::string::npos);
+    }
+  }
+}
+
+TEST_CASE("parquet_split_provider - scan_manager disabled datasource falls back for file URI",
+          "[scan_manager][parquet_split_provider]")
+{
+  auto const dir       = fresh_tmp_dir("scan_manager_file_uri_fallback");
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+
+  auto const bare_path      = write_parquet_file(con, dir, "local_file_uri", 1000, 500, 0);
+  auto const returned_types = default_returned_types();
+  for (auto const prefix : {"file://", "FILE://"}) {
+    auto const file_uri = std::string{prefix} + bare_path.string();
+    INFO("file_uri=" << file_uri);
+
+    sirius_scan_manager manager(cudf_fallback_scan_manager_config());
+    parquet_split_provider provider(returned_types,
+                                    {file_uri},
+                                    all_column_ids(returned_types.size()),
+                                    /*projection_ids*/ {},
+                                    /*names*/ {},
+                                    /*scan_output_arity*/ returned_types.size(),
+                                    /*table_filter_set*/ nullptr,
+                                    /*partition_indices*/ {},
+                                    /*approximate_batch_size*/ std::size_t{1} << 30,
+                                    /*max_file_processed*/ 1,
+                                    manager);
+
+    std::vector<std::unique_ptr<parquet_scan_data>> splits;
+    REQUIRE_NOTHROW(splits = drive_provider(provider));
+    REQUIRE_FALSE(splits.empty());
+
+    for (auto const& split : splits) {
+      for (auto const& slice : split->rg_slices) {
+        CHECK(slice.file_path == file_uri);
+        CHECK(slice.io_ctx == nullptr);
+        CHECK(slice.io_object == nullptr);
+      }
+    }
+  }
+
+  std::filesystem::remove_all(dir);
+}
 
 TEST_CASE("parquet_split_provider - max_file_processed bounds files per emitted split",
           "[scan_manager][parquet_split_provider]")

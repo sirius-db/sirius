@@ -251,6 +251,7 @@ TEST_CASE("sirius_scan_manager constructs S3 backend and dispatches by path", "[
   auto const local_uri = make_file_uri("dispatch.dat");
 
   scan_manager_config cfg{};
+  cfg.use_sirius_datasource             = true;
   cfg.uring_n_reactors                  = 1;
   cfg.s3_config                         = make_mock_s3_config();
   cfg.s3_thread_pool.num_threads        = 2;
@@ -275,7 +276,8 @@ TEST_CASE("sirius_scan_manager constructs S3 backend and dispatches by path", "[
 TEST_CASE("sirius_scan_manager leaves S3 disabled when s3_config is empty", "[scan_manager][s3]")
 {
   scan_manager_config cfg{};
-  cfg.uring_n_reactors = 1;
+  cfg.use_sirius_datasource = true;
+  cfg.uring_n_reactors      = 1;
   host_cache_memory memory;
   sirius_scan_manager manager(std::move(cfg), &memory.host_mr);
 
@@ -288,8 +290,9 @@ TEST_CASE("sirius_scan_manager stop is idempotent with both uring and S3 backend
           "[scan_manager][s3]")
 {
   scan_manager_config cfg{};
-  cfg.uring_n_reactors = 1;
-  cfg.s3_config        = make_mock_s3_config();
+  cfg.use_sirius_datasource = true;
+  cfg.uring_n_reactors      = 1;
+  cfg.s3_config             = make_mock_s3_config();
 
   host_cache_memory memory;
   sirius_scan_manager manager(std::move(cfg), &memory.host_mr);

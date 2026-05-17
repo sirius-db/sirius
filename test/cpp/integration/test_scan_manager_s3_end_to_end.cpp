@@ -158,6 +158,7 @@ sirius_scan_manager make_scan_manager(s3_test_env const& env,
                                       bool bad_credentials = false)
 {
   scan_manager_config cfg{};
+  cfg.use_sirius_datasource             = true;
   cfg.uring_n_reactors                  = 1;
   cfg.s3_config                         = make_s3_config(env, bad_credentials);
   cfg.s3_thread_pool.num_threads        = 4;
