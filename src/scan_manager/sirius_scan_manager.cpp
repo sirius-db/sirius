@@ -103,8 +103,8 @@ sirius_scan_manager::sirius_scan_manager(
         "[sirius_scan_manager] enable_prefetch_cache is true but no host "
         "fixed_size_host_memory_resource was provided");
     }
-    auto const slab_bytes =
-      host_mr->get_block_size() * static_cast<std::size_t>(sirius::io::buffer_pool::CHUNKS_PER_SLAB);
+    auto const slab_bytes = host_mr->get_block_size() *
+                            static_cast<std::size_t>(sirius::io::buffer_pool::CHUNKS_PER_SLAB);
     auto const max_slabs =
       static_cast<uint32_t>((_config.prefetch_buffer_pool_bytes + slab_bytes - 1) / slab_bytes);
     _buffer_pool = std::make_unique<sirius::io::buffer_pool>(*host_mr, max_slabs);
