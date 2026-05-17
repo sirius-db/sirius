@@ -263,6 +263,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_recursive_cte.cpp
     src/planner/sirius_plan_top_n.cpp
     src/scan_manager/cached_split_provider.cpp
+    src/scan_manager/duckdb_native_split_provider.cpp
     src/pin_table.cpp
     src/scan_manager/parquet_split_provider.cpp
     src/scan_manager/sirius_scan_manager.cpp
