@@ -795,10 +795,21 @@ std::vector<alp_vector_desc> build_vector_descs(gpu_codec_run const& run)
 // Public Entry Points for ALP(RD) Decoding
 //===----------------------------------------------------------------------===//
 /**
- * @brief Decode a set of ALP-encoded segments.
+ * @brief Decode a set of ALP-encoded segments into a contiguous output buffer.
  *
- * @param run A set of segments with the ALP codec
- * @param d_output
+ * One CTA decodes one 1024-row vector; segments are split across vectors via
+ * `build_vector_descs`. Each segment writes to `d_output` at its own
+ * `row_offset * type_size`. Malformed vectors are zero-filled rather than
+ * faulted.
+ *
+ * @param run        Segments tagged with the ALP codec.
+ * @param d_output   Device-side output buffer, sized for `run.total_rows * type_size` bytes.
+ * @param type       Output element type (unused; `type_size` alone selects the kernel).
+ * @param type_size  Output element width in bytes — must be 4 (float) or 8 (double).
+ * @param stream     CUDA stream for the descriptor upload and kernel launches.
+ * @param mr         Device memory resource for the per-launch descriptor buffer.
+ *
+ * @throws std::runtime_error if `type_size` is not 4 or 8.
  */
 void decode_alp_data(gpu_codec_run const& run,
                      uint8_t* d_output,
@@ -807,7 +818,7 @@ void decode_alp_data(gpu_codec_run const& run,
                      rmm::cuda_stream_view stream,
                      rmm::device_async_resource_ref mr)
 {
-  auto descs = build_vector_descs(run);
+  auto const descs = build_vector_descs(run);
   if (descs.empty()) return;
 
   switch (type_size) {
@@ -825,6 +836,23 @@ void decode_alp_data(gpu_codec_run const& run,
   }
 }
 
+/**
+ * @brief Decode a set of ALPRD-encoded segments into a contiguous output buffer.
+ *
+ * One CTA decodes one 1024-row vector; segments are split across vectors via
+ * `build_vector_descs`. Each segment writes to `d_output` at its own
+ * `row_offset * type_size`. Malformed vectors are zero-filled rather than
+ * faulted.
+ *
+ * @param run        Segments tagged with the ALPRD codec.
+ * @param d_output   Device-side output buffer, sized for `run.total_rows * type_size` bytes.
+ * @param type       Output element type (unused; `type_size` alone selects the kernel).
+ * @param type_size  Output element width in bytes — must be 4 (float) or 8 (double).
+ * @param stream     CUDA stream for the descriptor upload and kernel launches.
+ * @param mr         Device memory resource for the per-launch descriptor buffer.
+ *
+ * @throws std::runtime_error if `type_size` is not 4 or 8.
+ */
 void decode_alprd_data(gpu_codec_run const& run,
                        uint8_t* d_output,
                        cudf::data_type /*type*/,
