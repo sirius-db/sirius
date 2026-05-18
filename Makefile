@@ -22,7 +22,7 @@ MAIN_BUILD_TARGETS ?= duckdb duckdb_local_extension_repo
 	clang-release clang-debug clang-relwithdebinfo \
 	ci-release configure_ci set_duckdb_version \
 	test test_release test_debug test_reldebug test_ci-release clean list-presets \
-	s3-up s3-down s3-test s3-cpp-test s3-bench s3-bench-fixtures
+	s3-up s3-down s3-test s3-cpp-test s3-e2e s3-bench s3-bench-fixtures
 
 PRESETS_LINK := $(DUCKDB_DIR)/CMakePresets.json
 
@@ -129,6 +129,9 @@ list-presets: $(PRESETS_LINK)
 #                     if SQL-level integration returns via a new target later.
 # `make s3-cpp-test`  runs the Catch2 [s3][integration] tag, which also
 #                     selects tests tagged [s3][parquet][integration].
+# `make s3-e2e`       one-shot end-to-end SQL gate: brings MinIO up, runs the
+#                     Catch2 [s3][sql] surface tests, then tears MinIO down
+#                     even on failure. Run it last, after `make release`.
 #
 # See test/cpp/integration/s3/README.md for details.
 
@@ -153,6 +156,22 @@ s3-cpp-test:
 	  exit 1; \
 	fi
 	@source $(S3_DIR)/env.sh && export SIRIUS_TEST_S3_STRICT=1 && $(S3_TEST_BIN) "[s3][integration]"
+
+# One-shot end-to-end SQL gate. Unlike s3-cpp-test (which assumes MinIO is
+# already up), this brings MinIO up itself, runs the [s3][sql] surface tests,
+# and always tears MinIO down via an EXIT trap - even if the tests fail.
+s3-e2e: SHELL := /bin/bash
+s3-e2e:
+	@if [ ! -x $(S3_TEST_BIN) ]; then \
+	  echo "s3-e2e: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
+	  exit 1; \
+	fi
+	@set -e; \
+	trap '$(MAKE) s3-down' EXIT; \
+	$(MAKE) s3-up; \
+	source $(S3_DIR)/env.sh; \
+	export SIRIUS_TEST_S3_STRICT=1; \
+	$(S3_TEST_BIN) "[s3][sql]"
 
 # -----------------------------------------------------------------------------
 # S3 perf benchmark (Catch2 [!benchmark][perf][bench] hidden tag - not in the

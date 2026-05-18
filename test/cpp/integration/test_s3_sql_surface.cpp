@@ -20,6 +20,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -78,7 +79,7 @@ std::string s3_uri(std::string_view bucket, std::string_view key)
   return "s3://" + std::string{bucket} + "/" + std::string{key};
 }
 
-std::string yaml_quote(std::string const& value)
+std::string sql_quote(std::string_view value)
 {
   std::string out{"'"};
   for (char c : value) {
@@ -88,6 +89,8 @@ std::string yaml_quote(std::string const& value)
   out.push_back('\'');
   return out;
 }
+
+std::string yaml_quote(std::string const& value) { return sql_quote(value); }
 
 void load_sirius_extension(duckdb::DuckDB& db)
 {
@@ -212,6 +215,58 @@ std::string gpu_execution_sql(std::string const& inner_sql)
   return "SELECT * FROM gpu_execution('" + escaped + "')";
 }
 
+std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result)
+{
+  std::vector<std::vector<std::string>> rows;
+  for (duckdb::idx_t r = 0; r < result.RowCount(); ++r) {
+    std::vector<std::string> row;
+    row.reserve(result.ColumnCount());
+    for (duckdb::idx_t c = 0; c < result.ColumnCount(); ++c) {
+      row.push_back(result.GetValue(c, r).ToString());
+    }
+    rows.push_back(std::move(row));
+  }
+  return rows;
+}
+
+fs::path local_parquet_path(std::string_view table)
+{
+  return fs::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "integration" / "data" / "parquet" /
+         (std::string{table} + ".parquet");
+}
+
+std::string local_parquet_scan(std::string_view table)
+{
+  return "read_parquet(" + sql_quote(local_parquet_path(table).string()) + ")";
+}
+
+std::string s3_parquet_scan(s3_test_env const& env, std::string_view table)
+{
+  auto const key = "parquet/" + std::string{table} + ".parquet";
+  return "read_parquet(" + sql_quote(s3_uri(env.bucket, key)) + ")";
+}
+
+std::string tpch_q3_shape_query(std::string const& customer_scan,
+                                std::string const& orders_scan,
+                                std::string const& lineitem_scan)
+{
+  return "SELECT l_orderkey, "
+         "sum(l_extendedprice * (1 - l_discount)) AS revenue, "
+         "o_orderdate, "
+         "o_shippriority "
+         "FROM " +
+         customer_scan + " c, " + orders_scan + " o, " + lineitem_scan +
+         " l "
+         "WHERE c_mktsegment = 'BUILDING' "
+         "AND c_custkey = o_custkey "
+         "AND l_orderkey = o_orderkey "
+         "AND o_orderdate < DATE '1995-03-15' "
+         "AND l_shipdate > DATE '1995-03-15' "
+         "GROUP BY l_orderkey, o_orderdate, o_shippriority "
+         "ORDER BY revenue DESC, o_orderdate, l_orderkey "
+         "LIMIT 10";
+}
+
 }  // namespace
 
 TEST_CASE("sirius_read_parquet is registered as a one-argument table function",
@@ -310,4 +365,53 @@ TEST_CASE("gpu_execution S3 SQL surface returns empty result sets cleanly",
   auto result = require_query_ok(fixture.con, sql);
 
   CHECK(result->RowCount() == 0);
+}
+
+TEST_CASE("gpu_execution S3 SQL surface matches local TPC-H Q3 shape",
+          "[s3][sql][gpu_execution][integration]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  auto const s3_query = tpch_q3_shape_query(s3_parquet_scan(*env, "customer"),
+                                            s3_parquet_scan(*env, "orders"),
+                                            s3_parquet_scan(*env, "lineitem"));
+  auto s3_result      = require_query_ok(fixture.con, gpu_execution_sql(s3_query));
+
+  duckdb::DuckDB baseline_db(nullptr);
+  duckdb::Connection baseline_con(baseline_db);
+  auto const local_query = tpch_q3_shape_query(
+    local_parquet_scan("customer"), local_parquet_scan("orders"), local_parquet_scan("lineitem"));
+  auto baseline_result = require_query_ok(baseline_con, local_query);
+
+  CHECK(s3_result->RowCount() <= 10);
+  REQUIRE(s3_result->RowCount() == baseline_result->RowCount());
+  REQUIRE(s3_result->ColumnCount() == baseline_result->ColumnCount());
+  CHECK(collect_rows(*s3_result) == collect_rows(*baseline_result));
+}
+
+TEST_CASE("gpu_execution S3 SQL surface scans all orders row groups",
+          "[s3][sql][gpu_execution][integration]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  auto const aggregate_sql =
+    "SELECT count(*), min(o_orderdate), max(o_orderdate) FROM " + s3_parquet_scan(*env, "orders");
+
+  s3_sql_fixture fixture(*env);
+  auto s3_result = require_query_ok(fixture.con, gpu_execution_sql(aggregate_sql));
+
+  duckdb::DuckDB baseline_db(nullptr);
+  duckdb::Connection baseline_con(baseline_db);
+  auto const local_sql =
+    "SELECT count(*), min(o_orderdate), max(o_orderdate) FROM " + local_parquet_scan("orders");
+  auto baseline_result = require_query_ok(baseline_con, local_sql);
+
+  REQUIRE(s3_result->RowCount() == 1);
+  REQUIRE(s3_result->ColumnCount() == 3);
+  REQUIRE(baseline_result->RowCount() == 1);
+  REQUIRE(baseline_result->ColumnCount() == 3);
+  CHECK(collect_rows(*s3_result) == collect_rows(*baseline_result));
 }
