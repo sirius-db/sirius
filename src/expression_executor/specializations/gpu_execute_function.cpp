@@ -385,8 +385,24 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
       num_rows, std::move(child_cols), 0, rmm::device_buffer{}, _stream, _mr);
   }
 
-  throw not_implemented_exception(
-    "[gpu_expression_executor:function] execute called on unsupported function: {}", func_string);
+  // `error()` is a runtime-error-raising function. We deliberately do not
+  // evaluate it on-device here; the upstream fallback path is expected to
+  // handle it on the CPU. (Phase 6 will revisit this once ERROR_FUNC_STR
+  // migrates)
+  if (resolved_id == function_id::error) {
+    throw not_implemented_exception(
+      "[gpu_expression_executor:function] error() is not dispatched on GPU; "
+      "expected to fall back to CPU execution");
+  }
+
+  // Invariant violation: `func_string` resolved to a valid function_id (so it
+  // passed the unsupported-name guard at the top of execute()), yet no dispatch
+  // arm above claimed it. This means an entry was added to `function_id`
+  // without a corresponding GPU handler here.
+  throw internal_exception(
+    "[gpu_expression_executor:function]: registered function_id has no GPU "
+    "dispatch arm (function name: {})",
+    func_string);
 }
 
 }  // namespace sirius

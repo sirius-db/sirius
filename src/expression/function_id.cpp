@@ -27,17 +27,19 @@ namespace sirius {
 
 namespace {
 
-// D-02: forward table — 28 entries (substring has TWO DuckDB-side aliases).
+// Forward table: DuckDB function name -> Sirius function id.
+// `substring` and `substr` are DuckDB-side aliases for the same function id,
+// so this table has one extra entry beyond the enum cardinality.
 // Linear scan; called once per BoundFunctionExpression at executor entry.
-inline constexpr std::array<std::pair<std::string_view, function_id>, 28> kForwardTable = {{
+constexpr std::array<std::pair<std::string_view, function_id>, 28> kForwardTable = {{
   {"+", function_id::add},
   {"-", function_id::sub},
   {"*", function_id::mul},
   {"/", function_id::div},
   {"//", function_id::int_div},
   {"%", function_id::mod},
-  {"substring", function_id::substring},  // canonical (D-SUB-1)
-  {"substr", function_id::substring},     // alias    (D-SUB-1)
+  {"substring", function_id::substring},  // canonical name
+  {"substr", function_id::substring},     // alias
   {"~~", function_id::like},
   {"!~~", function_id::not_like},
   {"contains", function_id::contains},
@@ -60,8 +62,9 @@ inline constexpr std::array<std::pair<std::string_view, function_id>, 28> kForwa
   {"error", function_id::error},
 }};
 
-// D-02: reverse table — 27 entries, indexed by enum value (NOT searched).
-inline constexpr std::array<std::string_view, 27> kReverseTable = {
+// Reverse table: Sirius function id -> canonical DuckDB function name.
+// Indexed directly by enum value; never searched.
+constexpr std::array<std::string_view, 27> kReverseTable = {
   "+",           "-",           "*",           "/",          "//",
   "%",           "substring",   "~~",          "!~~",        "contains",
   "prefix",      "suffix",      "strlen",      "length",     "regexp_replace",
@@ -76,6 +79,27 @@ static_assert(kReverseTable.size() == 27,
               "kReverseTable must have one slot per function_id value.");
 static_assert(kForwardTable.size() == 28,
               "kForwardTable has one extra entry for the substring/substr alias.");
+
+// Walks both tables to ensure every enum value has exactly one canonical
+// forward entry whose name matches the reverse table at the same index.
+// Catches table drift (missing ids, duplicated canonicals, name mismatches)
+// at compile time.
+consteval bool function_id_tables_are_consistent()
+{
+  std::array<int, kReverseTable.size()> canonical_counts{};
+  for (auto const& [name, id] : kForwardTable) {
+    auto const idx = static_cast<std::size_t>(id);
+    if (idx >= kReverseTable.size()) { return false; }
+    if (name == kReverseTable[idx]) { ++canonical_counts[idx]; }
+  }
+  for (auto const count : canonical_counts) {
+    if (count != 1) { return false; }
+  }
+  return true;
+}
+
+static_assert(function_id_tables_are_consistent(),
+              "function_id forward/reverse tables must agree on one canonical name per id.");
 
 }  // namespace
 
