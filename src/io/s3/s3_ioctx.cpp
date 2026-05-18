@@ -25,9 +25,11 @@
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
+#include <rmm/error.hpp>
 
 #include <cuda_runtime.h>
 
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <curl/curl.h>
 
 #include <algorithm>
@@ -821,20 +823,75 @@ std::size_t s3_ioctx::device_read_io(sirius_io_object& obj,
                                      std::uint8_t* dst,
                                      rmm::cuda_stream_view stream)
 {
-  std::vector<std::uint8_t> host(size);
-  auto got = host_read_io(obj, offset, size, host.data());
-  if (got > 0) {
-    auto rc = cudaMemcpyAsync(dst, host.data(), got, cudaMemcpyHostToDevice, stream.value());
+  if (size == 0) { return 0; }
+
+  // Fallback: no caller-supplied host FSMR (standalone / unit-test
+  // construction). One std::vector staging buffer sized to the whole
+  // request — unbounded, but kept so direct s3_ioctx construction works.
+  if (_cfg.host_memory_resource == nullptr) {
+    std::vector<std::uint8_t> host(size);
+    auto got = host_read_io(obj, offset, size, host.data());
+    if (got > 0) {
+      auto rc = cudaMemcpyAsync(dst, host.data(), got, cudaMemcpyHostToDevice, stream.value());
+      if (rc != cudaSuccess) {
+        throw std::runtime_error(std::string("s3_ioctx::device_read_io cudaMemcpyAsync failed: ") +
+                                 cudaGetErrorString(rc));
+      }
+      if (auto sync_rc = cudaStreamSynchronize(stream.value()); sync_rc != cudaSuccess) {
+        throw std::runtime_error(std::string("s3_ioctx::device_read_io stream sync failed: ") +
+                                 cudaGetErrorString(sync_rc));
+      }
+    }
+    return got;
+  }
+
+  // FSMR path: stage the H2D bounce through a single bounded host block,
+  // reused across chunks, so transient host memory is capped at one block
+  // regardless of the request size.
+  auto* host_mr           = _cfg.host_memory_resource;
+  std::size_t const chunk = host_mr->get_block_size();
+  if (chunk == 0) { throw std::runtime_error("s3_ioctx::device_read_io: FSMR block size is zero"); }
+
+  cucascade::memory::fixed_size_host_memory_resource::fixed_multiple_blocks_allocation staging;
+  try {
+    staging = host_mr->allocate_multiple_blocks(chunk);
+  } catch (rmm::out_of_memory const& e) {
+    // Rethrow as rmm::out_of_memory (not std::runtime_error) so the pipeline's
+    // OOM classification (gpu_pipeline_task) still recognizes this and can run
+    // its reschedule / downgrade path; only enrich the message with S3 context.
+    throw rmm::out_of_memory(
+      std::string("s3_ioctx::device_read_io: out of memory allocating a "
+                  "fixed_size_host_memory_resource staging block (object='") +
+      obj.object_path() + "' offset=" + std::to_string(offset) + " size=" + std::to_string(size) +
+      " chunk=" + std::to_string(chunk) + "): " + e.what());
+  } catch (std::exception const& e) {
+    throw std::runtime_error(
+      std::string("s3_ioctx::device_read_io: failed to allocate a staging block from the "
+                  "fixed_size_host_memory_resource (object='") +
+      obj.object_path() + "' offset=" + std::to_string(offset) + " size=" + std::to_string(size) +
+      " chunk=" + std::to_string(chunk) + "): " + e.what());
+  }
+  auto* host = reinterpret_cast<std::uint8_t*>(staging->at(0).data());
+
+  std::size_t total = 0;
+  while (total < size) {
+    std::size_t const todo = std::min(chunk, size - total);
+    std::size_t const got  = host_read_io(obj, offset + total, todo, host);
+    if (got == 0) { break; }  // EOF
+    auto rc = cudaMemcpyAsync(dst + total, host, got, cudaMemcpyHostToDevice, stream.value());
     if (rc != cudaSuccess) {
       throw std::runtime_error(std::string("s3_ioctx::device_read_io cudaMemcpyAsync failed: ") +
                                cudaGetErrorString(rc));
     }
+    // Sync before the next iteration overwrites the shared staging block.
     if (auto sync_rc = cudaStreamSynchronize(stream.value()); sync_rc != cudaSuccess) {
       throw std::runtime_error(std::string("s3_ioctx::device_read_io stream sync failed: ") +
                                cudaGetErrorString(sync_rc));
     }
+    total += got;
+    if (got < todo) { break; }  // short read = EOF
   }
-  return got;
+  return total;
 }
 
 void s3_ioctx::device_read_async_io(sirius_io_object& obj,

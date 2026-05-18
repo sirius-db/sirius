@@ -30,6 +30,8 @@
 #include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
 
+#include <cuda_runtime_api.h>
+
 #include <arpa/inet.h>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
@@ -157,6 +159,18 @@ std::shared_ptr<s3_ioctx> make_live_ioctx(s3_test_env const& env)
   return std::make_shared<s3_ioctx>(s3_ioctx_config{std::move(provider), 4, 20});
 }
 
+std::shared_ptr<s3_ioctx> make_live_ioctx_with_fsmr(
+  std::shared_ptr<credential_provider> provider,
+  cucascade::memory::fixed_size_host_memory_resource& host_mr)
+{
+  s3_ioctx_config cfg{};
+  cfg.creds                = std::move(provider);
+  cfg.max_connections      = 16;
+  cfg.request_timeout_s    = 20;
+  cfg.host_memory_resource = &host_mr;
+  return std::make_shared<s3_ioctx>(std::move(cfg));
+}
+
 std::optional<std::size_t> try_head_or_skip(s3_ioctx& ctx,
                                             s3_test_env const& env,
                                             std::string_view key)
@@ -179,6 +193,75 @@ void require_bytes_equal(std::vector<std::byte> const& got,
     CHECK(static_cast<std::uint8_t>(got[i]) == expected[offset + i]);
   }
 }
+
+void require_bytes_equal(std::vector<std::uint8_t> const& got,
+                         std::vector<std::uint8_t> const& expected,
+                         std::size_t offset)
+{
+  REQUIRE(offset + got.size() <= expected.size());
+  for (std::size_t i = 0; i < got.size(); ++i) {
+    CHECK(got[i] == expected[offset + i]);
+  }
+}
+
+void require_cuda_success(cudaError_t status)
+{
+  INFO(cudaGetErrorString(status));
+  REQUIRE(status == cudaSuccess);
+}
+
+class device_byte_buffer {
+ public:
+  explicit device_byte_buffer(std::size_t size) : _size(size)
+  {
+    if (_size > 0) {
+      void* p = nullptr;
+      require_cuda_success(cudaMalloc(&p, _size));
+      _data = static_cast<std::uint8_t*>(p);
+    }
+  }
+
+  ~device_byte_buffer()
+  {
+    if (_data != nullptr) { cudaFree(_data); }
+  }
+
+  device_byte_buffer(device_byte_buffer const&)            = delete;
+  device_byte_buffer& operator=(device_byte_buffer const&) = delete;
+
+  [[nodiscard]] std::uint8_t* data() noexcept { return _data; }
+  [[nodiscard]] std::uint8_t const* data() const noexcept { return _data; }
+  [[nodiscard]] std::size_t size() const noexcept { return _size; }
+
+ private:
+  std::uint8_t* _data{nullptr};
+  std::size_t _size{0};
+};
+
+std::vector<std::uint8_t> copy_device_to_host(device_byte_buffer const& device, std::size_t bytes)
+{
+  REQUIRE(bytes <= device.size());
+  std::vector<std::uint8_t> host(bytes);
+  if (bytes > 0) {
+    require_cuda_success(cudaMemcpy(host.data(), device.data(), bytes, cudaMemcpyDeviceToHost));
+  }
+  return host;
+}
+
+struct fsmr_test_resources {
+  fsmr_test_resources(std::size_t block_size,
+                      std::size_t capacity,
+                      std::size_t memory_limit,
+                      std::size_t pool_size     = 1,
+                      std::size_t initial_pools = 0)
+    : upstream(0, true),
+      host_mr(0, upstream, memory_limit, capacity, block_size, pool_size, initial_pools)
+  {
+  }
+
+  cucascade::memory::numa_region_pinned_host_memory_resource upstream;
+  cucascade::memory::fixed_size_host_memory_resource host_mr;
+};
 
 using async_read_result = std::pair<std::size_t, std::exception_ptr>;
 
@@ -1165,6 +1248,187 @@ TEST_CASE("s3_ioctx host_read_ranges clips EOF-crossing ranges independently",
   CHECK(total == 150);
   require_bytes_equal(head, local, 0);
   require_bytes_equal(tail, local, eof_crossing_offset);
+}
+
+TEST_CASE("s3_ioctx device_read uses bounded FSMR staging for multi-chunk S3 objects",
+          "[s3][ioctx][integration]")
+{
+  auto env = read_s3_test_env();
+  if (!env) {
+    WARN("Skipping live S3 test because SIRIUS_TEST_S3_* environment is not configured");
+    return;
+  }
+
+  constexpr std::size_t block_size = 1 << 20;
+  std::string const key            = "medium.bin";
+  auto local                       = read_binary_file(env->local_dir / key);
+  REQUIRE(local.size() > block_size);
+
+  fsmr_test_resources memory(block_size, block_size, block_size);
+  auto before_peak = memory.host_mr.get_peak_total_allocated_bytes();
+
+  auto provider = std::make_shared<delayed_get_provider>(make_live_provider(*env), 0ms);
+  auto ctx      = make_live_ioctx_with_fsmr(provider, memory.host_mr);
+  auto obj      = make_s3_object(env->bucket, key, local.size());
+
+  rmm::cuda_stream stream;
+  device_byte_buffer dst(local.size());
+  auto const got = ctx->device_read(*obj, 0, local.size(), dst.data(), stream.view());
+
+  CHECK(got == local.size());
+  require_bytes_equal(copy_device_to_host(dst, got), local, 0);
+
+  auto const peak_delta = memory.host_mr.get_peak_total_allocated_bytes() - before_peak;
+  CHECK(peak_delta > 0);
+  CHECK(peak_delta <= block_size);
+  CHECK(memory.host_mr.get_free_blocks() == 1);
+  CHECK(provider->get_count() == static_cast<int>((local.size() + block_size - 1) / block_size));
+}
+
+TEST_CASE("s3_ioctx device_read with FSMR staging handles nonzero-offset remainder chunks",
+          "[s3][ioctx][integration]")
+{
+  auto env = read_s3_test_env();
+  if (!env) {
+    WARN("Skipping live S3 test because SIRIUS_TEST_S3_* environment is not configured");
+    return;
+  }
+
+  constexpr std::size_t block_size = 4096;
+  std::string const key            = "medium.bin";
+  auto local                       = read_binary_file(env->local_dir / key);
+  auto const offset                = std::size_t{17};
+  auto const request_size          = block_size + 123;
+  REQUIRE(local.size() >= offset + request_size);
+
+  fsmr_test_resources memory(block_size, block_size, block_size);
+  auto before_peak = memory.host_mr.get_peak_total_allocated_bytes();
+
+  auto provider = std::make_shared<delayed_get_provider>(make_live_provider(*env), 0ms);
+  auto ctx      = make_live_ioctx_with_fsmr(provider, memory.host_mr);
+  auto obj      = make_s3_object(env->bucket, key, local.size());
+
+  rmm::cuda_stream stream;
+  device_byte_buffer dst(request_size);
+  auto const got = ctx->device_read(*obj, offset, request_size, dst.data(), stream.view());
+
+  CHECK(got == request_size);
+  require_bytes_equal(copy_device_to_host(dst, got), local, offset);
+  CHECK(memory.host_mr.get_peak_total_allocated_bytes() - before_peak <= block_size);
+  CHECK(provider->get_count() == 2);
+}
+
+TEST_CASE("s3_ioctx device_read with FSMR staging clips EOF-crossing reads",
+          "[s3][ioctx][integration]")
+{
+  auto env = read_s3_test_env();
+  if (!env) {
+    WARN("Skipping live S3 test because SIRIUS_TEST_S3_* environment is not configured");
+    return;
+  }
+
+  constexpr std::size_t block_size = 4096;
+  std::string const key            = "medium.bin";
+  auto local                       = read_binary_file(env->local_dir / key);
+  REQUIRE(local.size() > 512);
+
+  fsmr_test_resources memory(block_size, block_size, block_size);
+  auto ctx = make_live_ioctx_with_fsmr(make_live_provider(*env), memory.host_mr);
+  auto obj = make_s3_object(env->bucket, key, local.size());
+
+  auto const offset       = local.size() - 123;
+  auto const request_size = block_size + 99;
+
+  rmm::cuda_stream stream;
+  device_byte_buffer dst(request_size);
+  auto const got = ctx->device_read(*obj, offset, request_size, dst.data(), stream.view());
+
+  CHECK(got == 123);
+  require_bytes_equal(copy_device_to_host(dst, got), local, offset);
+}
+
+TEST_CASE("s3_ioctx device_read with FSMR staging returns zero without borrowing a block",
+          "[s3][ioctx][integration]")
+{
+  constexpr std::size_t block_size = 4096;
+  fsmr_test_resources memory(block_size, block_size, block_size);
+  auto before_peak = memory.host_mr.get_peak_total_allocated_bytes();
+
+  auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
+  auto ctx      = make_live_ioctx_with_fsmr(provider, memory.host_mr);
+  auto obj      = make_s3_object("bucket", "key", 128);
+
+  rmm::cuda_stream stream;
+  CHECK(ctx->device_read(*obj, 0, 0, nullptr, stream.view()) == 0);
+  CHECK(memory.host_mr.get_peak_total_allocated_bytes() == before_peak);
+  CHECK(memory.host_mr.get_free_blocks() == 0);
+}
+
+TEST_CASE("s3_ioctx device_read keeps vector fallback when no FSMR is injected",
+          "[s3][ioctx][integration]")
+{
+  auto env = read_s3_test_env();
+  if (!env) {
+    WARN("Skipping live S3 test because SIRIUS_TEST_S3_* environment is not configured");
+    return;
+  }
+
+  std::string const key = "small.bin";
+  auto local            = read_binary_file(env->local_dir / key);
+  auto ctx              = make_live_ioctx(*env);
+  auto obj              = make_s3_object(env->bucket, key, local.size());
+
+  rmm::cuda_stream stream;
+  device_byte_buffer dst(local.size());
+  auto const got = ctx->device_read(*obj, 0, local.size(), dst.data(), stream.view());
+
+  CHECK(got == local.size());
+  require_bytes_equal(copy_device_to_host(dst, got), local, 0);
+}
+
+TEST_CASE("s3_ioctx device_read rejects an injected FSMR with zero block size",
+          "[s3][ioctx][integration]")
+{
+  fsmr_test_resources memory(/*block_size=*/0, /*capacity=*/0, /*memory_limit=*/0);
+  auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
+  auto ctx      = make_live_ioctx_with_fsmr(provider, memory.host_mr);
+  auto obj      = make_s3_object("bucket", "key", 1);
+
+  rmm::cuda_stream stream;
+  device_byte_buffer dst(1);
+
+  try {
+    (void)ctx->device_read(*obj, 0, 1, dst.data(), stream.view());
+    FAIL("expected zero-block-size FSMR to be rejected");
+  } catch (std::exception const& e) {
+    auto const msg = std::string{e.what()};
+    CHECK(msg.find("s3_ioctx::device_read_io") != std::string::npos);
+    CHECK(msg.find("block size is zero") != std::string::npos);
+  }
+}
+
+TEST_CASE("s3_ioctx device_read reports context when FSMR staging allocation is exhausted",
+          "[s3][ioctx][integration]")
+{
+  constexpr std::size_t block_size = 4096;
+  fsmr_test_resources memory(block_size, /*capacity=*/0, /*memory_limit=*/0);
+  auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
+  auto ctx      = make_live_ioctx_with_fsmr(provider, memory.host_mr);
+  auto obj      = make_s3_object("bucket", "key", 1);
+
+  rmm::cuda_stream stream;
+  device_byte_buffer dst(1);
+
+  try {
+    (void)ctx->device_read(*obj, 0, 1, dst.data(), stream.view());
+    FAIL("expected FSMR exhaustion to surface as rmm::out_of_memory");
+  } catch (rmm::out_of_memory const& e) {
+    auto const msg = std::string{e.what()};
+    CHECK(msg.find("s3_ioctx::device_read_io") != std::string::npos);
+    CHECK(msg.find("fixed_size_host_memory_resource") != std::string::npos);
+  } catch (std::exception const& e) {
+    FAIL("expected rmm::out_of_memory, got: " << e.what());
+  }
 }
 
 TEST_CASE("s3_ioctx host_read_ranges_async_io fans ranges across the injected pool",

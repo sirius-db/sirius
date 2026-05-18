@@ -35,6 +35,10 @@ namespace sirius::exec {
 class static_thread_pool;
 }  // namespace sirius::exec
 
+namespace cucascade::memory {
+class fixed_size_host_memory_resource;
+}  // namespace cucascade::memory
+
 namespace sirius::io::s3 {
 
 class s3_io_object;
@@ -83,6 +87,16 @@ struct s3_ioctx_config {
   /// backoff for that retry, capped at 30 seconds. Disable for
   /// deterministic tests.
   bool honor_retry_after = true;
+
+  /// Optional caller-owned host memory resource for device-read staging.
+  /// When non-null, @c device_read_io stages the H2D bounce through one
+  /// bounded FSMR block (reused across chunks) instead of a per-call
+  /// @c std::vector sized to the whole request, so transient host memory is
+  /// capped at one block. When nullptr (default), device reads keep the
+  /// @c std::vector fallback — preserved for standalone / unit-test
+  /// construction. The s3_ioctx never owns this resource; its lifetime is
+  /// the caller's (sirius_scan_manager) responsibility.
+  cucascade::memory::fixed_size_host_memory_resource* host_memory_resource{nullptr};
 };
 
 /**

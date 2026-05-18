@@ -89,9 +89,10 @@ sirius_scan_manager::sirius_scan_manager(
       std::make_unique<exec::static_thread_pool>(_config.s3_thread_pool.num_threads,
                                                  _config.s3_thread_pool.thread_name_prefix,
                                                  _config.s3_thread_pool.cpu_affinity_list);
-    auto s3_cfg              = *_config.s3_config;
-    s3_cfg.async_thread_pool = _s3_thread_pool.get();
-    auto s3_ctx              = std::make_shared<sirius::io::s3::s3_ioctx>(std::move(s3_cfg));
+    auto s3_cfg                 = *_config.s3_config;
+    s3_cfg.async_thread_pool    = _s3_thread_pool.get();
+    s3_cfg.host_memory_resource = host_mr;
+    auto s3_ctx                 = std::make_shared<sirius::io::s3::s3_ioctx>(std::move(s3_cfg));
     _io_ctxs.push_back(s3_ctx);
     SIRIUS_LOG_DEBUG("[sirius_scan_manager] s3 backend enabled (s3_thread_pool num_threads={})",
                      _config.s3_thread_pool.num_threads);
