@@ -210,17 +210,38 @@ If translation fails, filtering falls back to `gpu_expression_executor` on the d
 
 **Config:** `scan_task_batch_size` (default: 512 MB)
 
-### Two-Pipeline Metadata Scan (PR #571)
+### Asynchronous Parquet Metadata via Scan Manager (PRs #571, #620, #731)
 
-**Motivation:** Synchronous metadata parsing in `parquet_scan_task_global_state` constructor blocks all pipeline tasks until all file footers are read.
+**Motivation:** Synchronous metadata parsing on the GPU pipeline thread blocks all pipeline tasks until file footers are read, AST filters are translated, and row-group partitions are computed.
 
-**Mechanism:** Extracts metadata work into a dedicated first pipeline:
-- **Pipeline 1** (`PARQUET_METADATA_SCAN` → `GPU_PARQUET_SCAN`): Parses Parquet footers (up to 8 files per task), translates AST filters, computes row-group partitions
-- **Pipeline 2** (`GPU_PARQUET_SCAN` as source): Serves self-contained `parquet_scan_data` tasks, each calling `cudf::io::read_parquet`
+**Mechanism:** A dedicated `sirius_scan_manager` runs alongside the GPU executors and owns a thread pool that drives one `split_provider` per parquet scan operator. The provider parses footers (up to 8 files per task by default), translates AST filters, prunes row groups, and pushes `parquet_scan_data` splits into a per-operator `split_connector`. The GPU scan operator's `get_next_task_input_data()` blocks on the connector and returns each split as it arrives, so consumer scheduling is decoupled from production order. Providers are started sequentially in plan order so per-query memory pressure stays bounded.
 
 **Code path:**
-- `src/op/scan/sirius_parquet_metadata_scan_operator.cpp` — metadata scan operator
-- `src/op/scan/sirius_gpu_parquet_scan_operator.cpp` — GPU parquet scan operator
+- `src/scan_manager/sirius_scan_manager.cpp` — manager thread pool, provider registry, sequential driver loop
+- `src/scan_manager/parquet_split_provider.cpp` — metadata parsing, AST filter translation, row-group bundling
+- `src/scan_manager/split_connector.cpp` — blocking queue between provider and operator
+
+### Multifile Parquet Splits (PR #738)
+
+**Motivation:** Many small parquet files each yielding a tiny GPU batch causes per-task scheduling and kernel-launch overhead to dominate scan throughput.
+
+**Mechanism:** `parquet_split_provider` coalesces row-group slices from multiple parquet files into a single split when the bundled files share identical hive-partition values (so synthesized partition columns remain scalar). `accum.total_uncompressed_bytes` accumulates across files; a split is emitted once the total exceeds `approximate_batch_size` or partition values change. The downstream `cudf::io::read_parquet` reads from all bundled files in one invocation.
+
+**Code path:** `src/scan_manager/parquet_split_provider.cpp` — `run_batch()` accumulator
+
+**Config:** `scan_task_batch_size` (default: 512 MB) is forwarded as `approximate_batch_size` to the provider.
+
+### Sirius IO + Prefetching Cache (PR #675)
+
+**Motivation:** Repeated parquet reads pay full file-system cost on every query. A pinned-memory cache between the file and cuDF's parquet reader can serve subsequent reads at H2D-copy speed without re-reading from disk.
+
+**Mechanism:** `sirius::io` provides a `cudf::io::datasource` (`sirius_datasource`) backed by io_uring reactors and an optional pinned-memory `prefetching_cache`. The cache hit path issues `cudaMemcpyAsync` from pinned host memory directly to device; the miss path falls through to backend I/O, which uses `O_DIRECT` reads through pinned bounce slots and round-robin dispatch across reactor threads. A packed atomic state machine (4-bit state + 28-bit pin count in one `atomic<uint32_t>`) eliminates TOCTOU between readability checks and pin acquisition. Eviction is driven by a tiered LRU score; admission control caps concurrent in-flight chunks to keep memory bounded.
+
+**Code path:**
+- `src/io/sirius_datasource.cpp` — `cudf::io::datasource` implementation
+- `src/io/prefetching_cache.cpp` — chunk cache, worker, evictor, buffer pool
+- `src/io/uring/uring_reactor.cpp` — io_uring backend reactor
+- `src/io/admission_control.cpp` — RAII budget enforcement
 
 ### Skip File I/O from Cache (PR #455)
 

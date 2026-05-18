@@ -17,6 +17,7 @@
 #pragma once
 
 // sirius
+#include <data/sirius_converter_registry.hpp>
 #include <expression_executor/gpu_expression_translator_internal.hpp>
 #include <op/scan/scan_plan.hpp>
 #include <op/sirius_physical_operator.hpp>
@@ -30,6 +31,7 @@
 // cucascade
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/memory/common.hpp>
 
 // standard library
 #include <cstddef>
@@ -203,10 +205,37 @@ class scan_cached_operator_data : public op::operator_data {
   {
   }
 
+  /**
+   * @brief Move host-tier cached batches onto the requested GPU memory space.
+   *
+   * pin_table tier='host' wraps the cached chunks as host_data_representation; the
+   * scan operator's execute() expects gpu_table_representation, so we convert here
+   * (when the gpu_pipeline_executor has already reserved the target memory space).
+   * GPU-resident batches need no work — execute() consumes them directly.
+   */
+  void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
+                              rmm::cuda_stream_view stream) override
+  {
+    if (!batch || !requested_memory_space) { return; }
+    {
+      auto ro = batch->to_read_only();
+      if (!ro.get_data() || ro.get_current_tier() == ::cucascade::memory::Tier::GPU) { return; }
+    }
+    auto& registry = ::sirius::converter_registry::get();
+    auto mut       = batch->to_mutable();
+    mut.convert_to<cucascade::gpu_table_representation>(registry, requested_memory_space, stream);
+  }
+
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
   {
-    auto ro = batch->to_read_only();
-    return ro.get_data()->cast<cucascade::gpu_table_representation>().get_size_in_bytes();
+    // Use the generic representation accessor so this works for both GPU-resident
+    // batches and host_data_representation batches that prepare_for_processing
+    // will upgrade to GPU. Sizes are close enough between tiers to size the
+    // task's memory reservation.
+    auto ro          = batch->to_read_only();
+    auto const* data = ro.get_data();
+    if (!data) { return 0; }
+    return data->get_size_in_bytes();
   }
 
   /// Cached data batch viewed by the scan. Owning shared_ptr keeps the pinned

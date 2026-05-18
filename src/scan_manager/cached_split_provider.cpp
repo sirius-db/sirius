@@ -25,6 +25,7 @@
 #include <cudf/column/column_view.hpp>
 #include <cudf/table/table_view.hpp>
 
+#include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 
@@ -46,11 +47,47 @@ cached_split_provider::cached_split_provider(
 {
 }
 
+cached_split_provider::cached_split_provider(
+  std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
+  std::vector<std::size_t> column_indices,
+  cucascade::memory::memory_space& memory_space,
+  std::shared_ptr<duckdb::Expression> filter_expression,
+  std::shared_ptr<op::scan::scan_plan const> plan)
+  : _host_chunks(std::move(host_chunks)),
+    _column_indices(std::move(column_indices)),
+    _memory_space(&memory_space),
+    _filter_expression(std::move(filter_expression)),
+    _plan(std::move(plan))
+{
+}
+
 std::future<void> cached_split_provider::start(exec::thread_pool& /*pool*/,
                                                split_connector& connector)
 {
   std::promise<void> promise;
   auto future = promise.get_future();
+
+  if (!_host_chunks.empty()) {
+    // HOST tier: slice each pinned chunk down to the requested columns and emit a
+    // data_batch wrapping the resulting host_data_representation. The batch is
+    // converted to GPU later by scan_cached_operator_data::prepare_for_processing,
+    // so downstream execute() still sees a gpu_table_representation.
+    for (auto const& chunk : _host_chunks) {
+      if (!chunk) {
+        throw std::runtime_error(
+          "[cached_split_provider] null host_data_representation in pinned chunks");
+      }
+      auto sliced = chunk->slice(_column_indices);
+      auto batch =
+        std::make_shared<cucascade::data_batch>(::sirius::get_next_batch_id(), std::move(sliced));
+      connector.push_split(std::make_unique<op::scan::scan_cached_operator_data>(
+        std::move(batch), _filter_expression, _plan));
+    }
+
+    connector.close();
+    promise.set_value();
+    return future;
+  }
 
   std::size_t const num_batches =
     _columns_per_request.empty() ? 0 : _columns_per_request.front().size();

@@ -63,6 +63,9 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
   //! before the join so the hash join sees a single build batch.
   void set_concat_all(bool concat_all);
 
+  [[nodiscard]] std::size_t no_history_peak_memory_estimate(
+    const op::input_stats& stats) const override;
+
  private:
   sirius_physical_operator* _parent_op;
   bool _is_build;
