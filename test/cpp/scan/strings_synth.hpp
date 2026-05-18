@@ -342,6 +342,49 @@ inline std::vector<uint8_t> make_fsst_segment(std::vector<std::string> const& st
   return bytes;
 }
 
+/// Split `strings` into multiple FSST segments, each fitting within
+/// `block_size_bytes` (mirrors DuckDB FSSTCompressionState::HasEnoughSpace,
+/// which flushes a segment the moment `required_size > info.GetBlockSize()`).
+/// Produces a `(segment_bytes, row_count)` pair per segment. Starts from a
+/// row-count target derived from input byte budget; if the produced segment
+/// overflows the cap, halves the target and retries — so one pathological
+/// batch can't cause runaway segment count.
+inline std::vector<std::pair<std::vector<uint8_t>, uint32_t>> make_fsst_segments_chunked(
+  std::vector<std::string> const& strings, uint32_t block_size_bytes = 262136u)
+{
+  std::vector<std::pair<std::vector<uint8_t>, uint32_t>> out;
+  uint32_t const total_rows = static_cast<uint32_t>(strings.size());
+  if (total_rows == 0) return out;
+
+  // Target an input byte budget that empirically fits within block_size_bytes
+  // for TPC-H-like data: FSST ~50% compression + ~8 KiB symbol table + ~1 B
+  // bitpacked length per row + 16 B header. Use ~2x block size as input
+  // budget for the initial guess; let the retry loop shrink if needed.
+  uint32_t i = 0;
+  while (i < total_rows) {
+    // Initial row count from average length.
+    size_t avg_byte = 0;
+    for (uint32_t k = i; k < std::min(i + 64u, total_rows); ++k)
+      avg_byte += strings[k].size();
+    avg_byte = std::max<size_t>(1u, avg_byte / std::min(64u, total_rows - i));
+    uint32_t batch_rows =
+      std::max(32u, static_cast<uint32_t>((size_t{block_size_bytes} * 2u) / (avg_byte + 4u)));
+    batch_rows = std::min(batch_rows, total_rows - i);
+
+    while (true) {
+      std::vector<std::string> slice(strings.begin() + i, strings.begin() + i + batch_rows);
+      auto seg_bytes = make_fsst_segment(slice);
+      if (seg_bytes.size() <= block_size_bytes || batch_rows == 1) {
+        out.emplace_back(std::move(seg_bytes), batch_rows);
+        i += batch_rows;
+        break;
+      }
+      batch_rows = std::max(1u, batch_rows / 2u);
+    }
+  }
+  return out;
+}
+
 /// `mode`: 0=DICTIONARY, 1=DICT_FSST, 2=FSST_ONLY (row i -> dict idx i+1).
 /// `unique_strings[0]` reserved for NULL; `selections` ignored for mode 2.
 /// Layout matches dict_fsst/compression.cpp.

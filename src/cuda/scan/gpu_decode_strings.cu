@@ -85,6 +85,7 @@ enum : uint8_t {
 };
 
 /// 255 codes (0..254); byte 255 is the escape sentinel.
+constexpr uint32_t FSST_SIZE        = 256;
 constexpr uint32_t FSST_NUM_SYMBOLS = 255;
 constexpr uint8_t FSST_ESC          = 255;
 static_assert(FSST_ESC == FSST_NUM_SYMBOLS);
@@ -149,11 +150,13 @@ struct alignas(8) dict_fsst_desc {
   uint8_t _pad[6];
 };
 
-constexpr uint32_t BLOCK_DIM              = 256;  // see FSST_WARPS_PER_CTA static_assert
-constexpr uint32_t MIN_CHUNK_ROW          = 64;
-constexpr uint32_t WARP_SIZE              = 32;
+constexpr uint32_t BLOCK_DIM = 256;  // see FSST_WARPS_PER_CTA static_assert
+constexpr uint32_t MIN_ROWS_PER_CHUNK =
+  64;  ///< The minimum number of rows for a segment chunk;
+       ///< BLOCK_DIM=256 threads -> 8 warps per chunk -> 8 rows per warp.
+constexpr uint32_t WARP_THREADS           = 32;
 constexpr uint32_t FULL_MASK              = 0xFFFFFFFFu;
-constexpr uint32_t WARP_BULK_STRIDE_BYTES = WARP_SIZE * 4u;
+constexpr uint32_t WARP_BULK_STRIDE_BYTES = WARP_THREADS * 4u;
 /// Above this, take the exact-total sync rather than trust the host upper
 /// bound — a pathological max_string_length could otherwise force a GB-class
 /// over-allocation.
@@ -163,6 +166,7 @@ constexpr size_t HOST_UPPER_BOUND_LIMIT = size_t{512} * 1024u * 1024u;
 /// (launch-bound at short rows) to warp-cooperative (bandwidth-bound at long
 /// rows). Mirrors cuDF's strings-gather split (32B) with headroom.
 constexpr uint32_t DICT_WARP_COOP_MIN_LEN = 64u;
+constexpr uint32_t MAX_BITPACKING_WIDTH   = 32;
 
 /// DuckDB's AlignValue<idx_t>.
 constexpr uint32_t align_up8(uint32_t n) { return (n + 7u) & ~7u; }
@@ -175,19 +179,109 @@ __device__ __forceinline__ bool parse_dict_header(uint8_t const* base,
   if (limit < sizeof(dict_header_t)) return false;
   memcpy(hdr, base, sizeof(*hdr));
   return hdr->index_buffer_offset + hdr->index_buffer_count * sizeof(uint32_t) <= limit &&
-         hdr->dict_end <= limit && hdr->bitpacking_width <= 32u;
+         hdr->dict_end <= limit && hdr->bitpacking_width <= MAX_BITPACKING_WIDTH;
 }
 
+/// Device port of duckdb_fsst_import (libfsst.cpp:429). Same opaque blob
+/// layout (8B version | 1B zeroTerminated | 8B lenHisto | packed symbols by
+/// length group 1..8,1). CUDA targets are always little-endian so the
+/// host-side swap64_if_be is a no-op here. Used by kernel_build_fsst_decoders
+/// to populate per-segment decoders without round-tripping through host.
+constexpr uint32_t FSST_VERSION_LO        = 20190218u;
+constexpr unsigned long long FSST_CORRUPT = 32774747032022883ull;  // "corrupt" in LE
+
+__device__ __forceinline__ bool device_fsst_import(uint8_t const* buf, fsst_decoder_compact* out)
+{
+  // Zero first so a bad header / corrupted symtab leaves a deterministic
+  // (all-zero-length) decoder.
+  for (uint32_t i = 0; i < FSST_NUM_SYMBOLS; ++i) {
+    out->len[i]    = 0;
+    out->symbol[i] = 0;
+  }
+
+  uint64_t version;
+  memcpy(&version, buf, 8);
+  if ((version >> 32) != FSST_VERSION_LO) return false;
+
+  uint32_t pos     = 17;
+  uint8_t zeroTerm = buf[8] & 1u;
+  uint8_t lenHisto[8];
+  for (uint32_t i = 0; i < 8u; ++i)
+    lenHisto[i] = buf[9 + i];
+
+  out->len[0]    = 1;
+  out->symbol[0] = 0;
+  uint32_t code  = zeroTerm;
+  if (zeroTerm) lenHisto[0]--;
+
+  for (uint32_t l = 1; l <= 8u; ++l) {
+    uint32_t hist_idx = l & 7u;         // 1,2,3,4,5,6,7,0
+    uint32_t sym_len  = (l & 7u) + 1u;  // 2,3,4,5,6,7,8,1
+    for (uint32_t i = 0; i < lenHisto[hist_idx]; ++i, ++code) {
+      out->len[code] = static_cast<uint8_t>(sym_len);
+      uint64_t sym   = 0;
+      for (uint32_t j = 0; j < sym_len; ++j)
+        sym |= uint64_t(buf[pos + j]) << (8u * j);
+      out->symbol[code] = sym;
+      pos += sym_len;
+    }
+  }
+  while (code < 255u) {
+    out->symbol[code] = FSST_CORRUPT;
+    out->len[code++]  = 8u;
+  }
+  return true;
+}
+
+// Forward decl — definition lives further down with the other FSST kernels.
 __device__ __forceinline__ bool parse_fsst_header(uint8_t const* base,
                                                   uint32_t limit,
-                                                  fsst_header_t* hdr)
+                                                  fsst_header_t* hdr);
+
+/// One CTA per segment: coalesced LDG of the symtab into shmem first, then
+/// thread 0 parses from shmem into the decoder slot. A naive one-thread-per-
+/// segment grid suffers ~3-5× from scattered LDG across distinct segment
+/// addresses (each thread reads ~300 B of symtab from a different region of
+/// device memory). Coalesced load amortizes that cost across 256 lanes; the
+/// parse itself is inherently serial (each symbol's start depends on the
+/// previous symbol's length) so we leave that to thread 0.
+__global__ __launch_bounds__(BLOCK_DIM, 4) void kernel_build_fsst_decoders(
+  string_chunk_desc const* __restrict__ descs,
+  uint32_t num_segments,
+  fsst_decoder_compact* __restrict__ d_decoders)
 {
-  if (limit < sizeof(fsst_header_t)) return false;
-  memcpy(hdr, base, sizeof(*hdr));
-  return hdr->dict_end <= limit && hdr->fsst_symbol_table_offset < hdr->dict_end &&
-         hdr->bitpacking_width <= 32u;
+  auto const seg_idx = blockIdx.x;
+  auto const desc    = descs[seg_idx];
+
+  __shared__ uint8_t sm_ok;
+  __shared__ fsst_header_t sm_hdr;
+  __shared__ uint8_t sm_symtab[FSST_SYMTAB_MAX_BYTES];
+
+  if (threadIdx.x == 0) {
+    sm_ok = parse_fsst_header(desc.d_bytes, desc.bytes_size, &sm_hdr) ? 1u : 0u;
+  }
+  __syncthreads();
+
+  if (!sm_ok) {
+    for (uint32_t i = threadIdx.x; i < FSST_NUM_SYMBOLS; i += blockDim.x) {
+      d_decoders[seg_idx].len[i]    = 0;
+      d_decoders[seg_idx].symbol[i] = 0;
+    }
+    return;
+  }
+
+  uint32_t const symtab_off = sm_hdr.fsst_symbol_table_offset;
+  uint32_t symtab_size      = desc.bytes_size - symtab_off;
+  if (symtab_size > FSST_SYMTAB_MAX_BYTES) symtab_size = FSST_SYMTAB_MAX_BYTES;
+  uint8_t const* sym_src = desc.d_bytes + symtab_off;
+  for (uint32_t i = threadIdx.x; i < symtab_size; i += blockDim.x)
+    sm_symtab[i] = sym_src[i];
+  __syncthreads();
+
+  if (threadIdx.x == 0) device_fsst_import(sm_symtab, &d_decoders[seg_idx]);
 }
 
+/// TODO: refactor as utility function
 template <typename T>
 __device__ __forceinline__ T unpack_value(uint32_t const* packed, uint32_t idx, uint32_t width)
 {
@@ -270,10 +364,10 @@ std::vector<Desc> expand_chunks(std::vector<Desc> const& descs, uint32_t target_
   if (descs.size() >= target_ctas || total_rows == 0) return descs;
 
   uint32_t chunk_size = total_rows / target_ctas;
-  chunk_size          = std::max(chunk_size, MIN_CHUNK_ROW);
+  chunk_size          = std::max(chunk_size, MIN_ROWS_PER_CHUNK);
   // Round down to warp size for store coalescing within a chunk.
-  chunk_size = (chunk_size / WARP_SIZE) * WARP_SIZE;
-  if (chunk_size == 0) chunk_size = WARP_SIZE;
+  chunk_size = (chunk_size / WARP_THREADS) * WARP_THREADS;
+  if (chunk_size == 0) chunk_size = WARP_THREADS;
 
   std::vector<Desc> out;
   out.reserve(target_ctas + descs.size());
@@ -400,9 +494,9 @@ __global__ void kernel_gather_dict_warp(string_chunk_desc const* __restrict__ de
   uint32_t const* d_idx   = reinterpret_cast<uint32_t const*>(base + sm_hdr.index_buffer_offset);
   uint8_t const* dict_end = base + sm_hdr.dict_end;
 
-  uint32_t const lane          = threadIdx.x & (WARP_SIZE - 1u);
-  uint32_t const warp_id       = threadIdx.x / WARP_SIZE;
-  uint32_t const warps_per_cta = blockDim.x / WARP_SIZE;
+  uint32_t const lane          = threadIdx.x & (WARP_THREADS - 1u);
+  uint32_t const warp_id       = threadIdx.x / WARP_THREADS;
+  uint32_t const warps_per_cta = blockDim.x / WARP_THREADS;
 
   for (uint32_t i = warp_id; i < desc.row_count; i += warps_per_cta) {
     uint32_t seg_i = desc.seg_row_start + i;
@@ -421,7 +515,7 @@ __global__ void kernel_gather_dict_warp(string_chunk_desc const* __restrict__ de
       memcpy(d_chars + op + k, &v, 4);
       k += WARP_BULK_STRIDE_BYTES;
     }
-    for (uint32_t t = n4 + lane; t < str_len; t += WARP_SIZE) {
+    for (uint32_t t = n4 + lane; t < str_len; t += WARP_THREADS) {
       d_chars[op + t] = src[t];
     }
   }
@@ -444,133 +538,340 @@ __global__ void kernel_gather_dict_warp(string_chunk_desc const* __restrict__ de
 //   A — unpack compressed_lengths into d_comp_offsets[fsst_base..]
 //   B — in-CTA InclusiveSum producing per-row cumulative compressed bytes
 //   C — for each row, walk its compressed bytes summing decoded lengths
-// A+B owns per-segment prefix-sum state (one CTA per segment); C is the
-// expensive serial byte-scan and chunks across CTAs. The same compressed-
-// offset array is reused by the gather pass.
+// A+B owns per-segment prefix-sum state (one CTA per segment); C partitions
+// a segment across CTAs into 'chunks' and performs a serial byte scan.
+//
+// Pass 2 gather walks the compressed bytes to emit the decoded strings,
+// using 1 warp per row and the same chunking as phase C to partition work
+// across segments.
 //===----------------------------------------------------------------------===//
 
-__global__ void kernel_compute_lengths_fsst(string_chunk_desc const* __restrict__ descs,
-                                            uint32_t* __restrict__ d_comp_offsets,
-                                            uint32_t const* __restrict__ d_fsst_row_starts,
-                                            uint32_t num_segments)
-{
-  uint32_t seg_idx = blockIdx.x;
-  if (seg_idx >= num_segments) return;
-  auto const desc     = descs[seg_idx];
-  uint8_t const* base = desc.d_bytes;
+//===----------HOST logic----------===//
+struct prepared_fsst {
+  std::vector<string_chunk_desc> length_descs;  ///< pass-1 A+B (per segment)
+  std::vector<fsst_chunk_desc> gather_chunks;   ///< pass-1 phase-C + pass-2 (per chunk)
+  std::vector<fsst_decoder_compact> decoders;   ///< symbol tables (per segment)
+  std::vector<uint32_t> row_starts;             ///< prefix sum of FSST row counts
+  uint32_t total_fsst_row_count;
+};
 
-  __shared__ uint8_t sm_ok;
+prepared_fsst prepare_fsst(gpu_string_codec_run const& run)
+{
+  prepared_fsst out;
+  out.total_fsst_row_count = 0;
+  out.length_descs.reserve(run.segments.size());
+  out.row_starts.reserve(run.segments.size());
+
+  // Segment descriptors for pass-1 A+B
+  for (auto const& seg : run.segments) {
+    if (seg.row_count == 0) continue;
+    out.row_starts.push_back(out.total_fsst_row_count);
+    out.total_fsst_row_count += seg.row_count;
+    out.length_descs.push_back(
+      {seg.d_bytes, seg.bytes_size, seg.row_count, seg.row_offset, seg.seg_row_start});
+  }
+  auto const segment_count = out.length_descs.size();
+  out.decoders.resize(segment_count);
+
+  // Chunked descriptors for phase-C + gather. Split per-segment only when
+  // total segments < target_ctas (else one-chunk-per-segment fills SMs already).
+  auto const target_ctas         = get_target_ctas();
+  uint32_t target_rows_per_chunk = 0;
+  if (segment_count < target_ctas && out.total_fsst_row_count > 0) {
+    target_rows_per_chunk = std::max(out.total_fsst_row_count / target_ctas, MIN_ROWS_PER_CHUNK);
+    target_rows_per_chunk = (target_rows_per_chunk / 32) * 32;  // Ensure multiple of 32
+    if (target_rows_per_chunk == 0) target_rows_per_chunk = 32;
+  }
+  for (uint32_t segment_idx = 0; segment_idx < segment_count; ++segment_idx) {
+    auto const& seg          = out.length_descs[segment_idx];
+    auto const fsst_base_row = out.row_starts[segment_idx];
+    if (target_rows_per_chunk == 0) {
+      // No chunking: one CTA per segment
+      out.gather_chunks.push_back({seg.d_bytes,
+                                   seg.bytes_size,
+                                   seg.row_count,
+                                   seg.global_row_start,
+                                   fsst_base_row,
+                                   segment_idx,
+                                   1,
+                                   {0, 0, 0}});
+    } else {
+      // Chunking: one CTA per chunk (slice of a segment)
+      auto remaining                    = seg.row_count;
+      uint32_t offset                   = 0;
+      uint8_t is_first_chunk_in_segment = 1;
+      while (remaining > 0) {
+        auto const chunk_row_count = std::min(remaining, target_rows_per_chunk);
+        out.gather_chunks.push_back({seg.d_bytes,
+                                     seg.bytes_size,
+                                     chunk_row_count,
+                                     seg.global_row_start + offset,
+                                     fsst_base_row + offset,
+                                     segment_idx,
+                                     is_first_chunk_in_segment,
+                                     {0, 0, 0}});
+        offset += chunk_row_count;
+        remaining -= chunk_row_count;
+        is_first_chunk_in_segment = 0;
+      }
+    }
+  }
+  return out;
+}
+
+//===----------DEVICE logic----------===//
+/**
+ * @brief Copy FSST header @p hdr into @p base, bounded by the buffer size @p limit.
+ * @return true if the header was successfully copied (i.e. the header fits within the buffer), and
+ * if the header metadata is valid; false otherwise.
+ */
+__device__ __forceinline__ bool parse_fsst_header(uint8_t const* base,
+                                                  uint32_t limit,
+                                                  fsst_header_t* hdr)
+{
+  if (limit < sizeof(fsst_header_t)) return false;
+  memcpy(hdr, base, sizeof(fsst_header_t));
+  return hdr->dict_end <= limit && hdr->fsst_symbol_table_offset < hdr->dict_end &&
+         hdr->bitpacking_width <= MAX_BITPACKING_WIDTH;
+}
+
+/**
+ * @brief Compute the per-row offsets into the FSST compressed byte stream for an FSST segment.
+ */
+__global__ void kernel_compute_compressed_offsets_fsst(
+  uint32_t* __restrict__ d_comp_offsets,
+  string_chunk_desc const* __restrict__ descs,
+  uint32_t const* __restrict__ d_fsst_row_starts,
+  uint32_t num_segments)
+{
+  using BlockScanT = cub::BlockScan<uint32_t, BLOCK_DIM>;
+
+  __shared__ typename BlockScanT::TempStorage scan_temp;
+  __shared__ bool sm_ok;
   __shared__ fsst_header_t sm_hdr;
-  if (threadIdx.x == 0) sm_ok = parse_fsst_header(base, desc.bytes_size, &sm_hdr) ? 1 : 0;
+
+  // CTA <-> segment mapping
+  auto const seg_idx = blockIdx.x;
+  if (seg_idx >= num_segments) return;
+  auto const desc  = descs[seg_idx];
+  auto const* base = desc.d_bytes;
+
+  if (threadIdx.x == 0) { sm_ok = parse_fsst_header(base, desc.bytes_size, &sm_hdr); }
   __syncthreads();
 
-  uint32_t fsst_base = d_fsst_row_starts[seg_idx];
-  uint32_t row_count = desc.row_count;
-  uint32_t* my_comp  = d_comp_offsets + fsst_base;
+  auto const segment_base      = d_fsst_row_starts[seg_idx];
+  auto const segment_row_count = desc.row_count;
+  auto* segment_comp_offsets   = d_comp_offsets + segment_base;
 
   if (!sm_ok) {
-    // Zero the slice so phase-C emits empty strings — chars buffer stays valid.
-    for (uint32_t i = threadIdx.x; i < row_count; i += blockDim.x)
-      my_comp[i] = 0u;
+    // Zero the offsets for the segment so phase-C emits empty strings
+    for (uint32_t i = threadIdx.x; i < segment_row_count; i += blockDim.x)
+      segment_comp_offsets[i] = 0;
     return;
   }
 
-  // Phase A: unpack compressed lengths.
-  uint32_t const* packed = reinterpret_cast<uint32_t const*>(base + sizeof(fsst_header_t));
-  for (uint32_t i = threadIdx.x; i < row_count; i += blockDim.x) {
-    my_comp[i] = unpack_value<uint32_t>(packed, i, sm_hdr.bitpacking_width);
+  // Phase A: unpack compressed lengths from the bitpacked length stream after the header.
+  auto const* packed = reinterpret_cast<uint32_t const*>(base + sizeof(fsst_header_t));
+  for (uint32_t i = threadIdx.x; i < segment_row_count; i += blockDim.x) {
+    segment_comp_offsets[i] = unpack_value<uint32_t>(packed, i, sm_hdr.bitpacking_width);
   }
   __syncthreads();
 
   // Phase B: per-thread sequential scan + BlockScan over per-thread totals.
-  using BlockScanT = cub::BlockScan<uint32_t, BLOCK_DIM>;
-  __shared__ typename BlockScanT::TempStorage scan_temp;
-  uint32_t chunk_size = (row_count + blockDim.x - 1u) / blockDim.x;
-  uint32_t start      = threadIdx.x * chunk_size;
-  uint32_t end        = min(start + chunk_size, row_count);
-  uint32_t local_sum  = 0;
-  for (uint32_t i = start; i < end; ++i) {
-    local_sum += my_comp[i];
-    my_comp[i] = local_sum;
+  auto const max_rows_per_thread = ::cuda::ceil_div(segment_row_count, blockDim.x);
+  auto const start               = threadIdx.x * max_rows_per_thread;
+  auto const end                 = ::cuda::std::min(start + max_rows_per_thread, segment_row_count);
+  uint32_t thread_sum            = 0;
+  for (int i = start; i < end; ++i) {
+    /// WARNING: uncoalesced GMEM access pattern
+    thread_sum += segment_comp_offsets[i];
+    segment_comp_offsets[i] = thread_sum;
   }
-  uint32_t scanned;
-  BlockScanT(scan_temp).ExclusiveSum(local_sum, scanned);
-  if (scanned > 0) {
-    for (uint32_t i = start; i < end; ++i)
-      my_comp[i] += scanned;
+  uint32_t exclusive_sum = 0;
+  BlockScanT(scan_temp).ExclusiveSum(thread_sum, exclusive_sum);
+  if (exclusive_sum > 0) {
+    for (int i = start; i < end; ++i) {
+      /// WARNING: uncoalesced GMEM access pattern
+      segment_comp_offsets[i] += exclusive_sum;
+    }
   }
 }
 
-__global__ void kernel_compute_lengths_fsst_phase_c(
+/**
+ * @brief Compute the compressed length of a row in the FSST compressed stream, where @p comp_ptr
+ * points to the start of the compressed bytes for that row, and @p sm_len is the symbol length
+ * table from the FSST header.
+ */
+__device__ __forceinline__ uint32_t warp_compute_decomp_len(uint8_t const* __restrict__ comp_ptr,
+                                                            uint32_t comp_len,
+                                                            uint8_t const* __restrict__ sm_len,
+                                                            uint32_t lane)
+{
+  uint32_t total             = 0;
+  int prev_chunk_last_is_esc = 0;
+  for (uint32_t off = 0; off < comp_len; off += WARP_THREADS) {
+    auto const bytes_in_chunk = ::cuda::std::min(comp_len - off, uint32_t{WARP_THREADS});
+    auto const is_active      = lane < bytes_in_chunk;
+    uint8_t const my_byte     = is_active ? comp_ptr[off + lane] : 0;
+    int const is_esc          = is_active && my_byte == FSST_ESC ? 1 : 0;
+
+    auto const neighbor_is_esc = __shfl_up_sync(FULL_MASK, is_esc, 1);
+    auto const prev_is_esc     = (lane == 0) ? prev_chunk_last_is_esc : neighbor_is_esc;
+
+    // Per-lane contribution: 0 for inactive / escape-sentinel;
+    //                        1 for the literal byte that follows an escape;
+    //                        sm_len[code] otherwise.
+    uint32_t my_len = 0;
+    if (is_active) {
+      if (prev_is_esc) {
+        my_len = 1;
+      } else if (!is_esc) {
+        my_len = sm_len[my_byte];
+      }
+    }
+
+    // Scan the lengths
+#pragma unroll
+    for (uint32_t s = WARP_THREADS / 2; s > 0; s /= 2) {
+      my_len += __shfl_xor_sync(FULL_MASK, my_len, s);
+    }
+    total += my_len;
+
+    // Broadcast whether the last byte in this 32B stripe was an escape for the next stripe.
+    auto const last_active_lane = bytes_in_chunk - 1;
+    prev_chunk_last_is_esc      = __shfl_sync(FULL_MASK, is_esc, last_active_lane);
+  }
+  return total;
+}
+
+/**
+ * @brief Compute the decompressed lengths for each row in the FSST compressed stream.
+ */
+__global__ __launch_bounds__(BLOCK_DIM, 8) void kernel_compute_decompressed_lengths_fsst(
   fsst_chunk_desc const* __restrict__ descs,
   uint32_t* __restrict__ d_lengths,
   uint32_t const* __restrict__ d_comp_offsets,
   fsst_decoder_compact const* __restrict__ d_decoders,
   uint32_t num_chunks)
 {
-  uint32_t cid = blockIdx.x;
-  if (cid >= num_chunks) return;
-  auto const desc     = descs[cid];
-  uint8_t const* base = desc.d_bytes;
+  auto const chunk_id = blockIdx.x;
+  if (chunk_id >= num_chunks) return;
+  auto const desc  = descs[chunk_id];
+  auto const* base = desc.d_bytes;
 
-  __shared__ uint8_t sm_ok;
+  __shared__ bool sm_ok;
   __shared__ fsst_header_t sm_hdr;
   __shared__ uint8_t sm_len[FSST_NUM_SYMBOLS];
-  if (threadIdx.x == 0) sm_ok = parse_fsst_header(base, desc.bytes_size, &sm_hdr) ? 1 : 0;
+  if (threadIdx.x == 0) { sm_ok = parse_fsst_header(base, desc.bytes_size, &sm_hdr); }
   __syncthreads();
 
+  // Zero-fill lengths for the chunk if the metadata is malformed
   if (!sm_ok) {
     for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
-      d_lengths[desc.global_row_start + i] = 0u;
+      d_lengths[desc.global_row_start + i] = 0;
     }
     return;
   }
 
   fsst_decoder_compact const& dec = d_decoders[desc.seg_decoder_idx];
-  for (uint32_t i = threadIdx.x; i < FSST_NUM_SYMBOLS; i += blockDim.x)
+  for (uint32_t i = threadIdx.x; i < FSST_NUM_SYMBOLS; i += blockDim.x) {
     sm_len[i] = dec.len[i];
+  }
   __syncthreads();
 
-  uint8_t const* dict_end_ptr = base + sm_hdr.dict_end;
-  uint32_t const* my_comp     = d_comp_offsets + desc.fsst_row_start;
+  auto const* dict_end_ptr          = base + sm_hdr.dict_end;
+  auto const* compressed_cumsum_ptr = d_comp_offsets + desc.fsst_row_start;
 
-  for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
-    uint32_t cum      = my_comp[i];
-    uint32_t prev     = (i > 0) ? my_comp[i - 1] : (desc.is_first_chunk ? 0u : *(my_comp - 1));
-    uint32_t comp_len = cum - prev;
-    if (comp_len == 0) {
-      d_lengths[desc.global_row_start + i] = 0u;
-      continue;
-    }
-    uint8_t const* comp_ptr = dict_end_ptr - cum;
-    uint32_t decomp_len     = 0;
-    uint32_t pos            = 0;
-    while (pos < comp_len) {
-      uint8_t code = comp_ptr[pos++];
-      if (code < FSST_ESC) {
-        decomp_len += sm_len[code];
-      } else {
-        ++pos;
-        ++decomp_len;
+  // Dispatch on the chunk's average compressed-byte/row: thread-per-row for short rows,
+  // warp-per-row for longer rows, split on whether the average length spans 2 rows in the
+  // warp-per-row path.
+  auto const start           = desc.is_first_chunk ? 0 : *(compressed_cumsum_ptr - 1);
+  auto const end             = compressed_cumsum_ptr[desc.row_count - 1];
+  auto const avg_comp_length = (end - start) / desc.row_count;
+
+  if (avg_comp_length >= 2 * WARP_THREADS) {
+    // Warp-per-row
+    auto const lane          = threadIdx.x % WARP_THREADS;
+    auto const warp_id       = threadIdx.x / WARP_THREADS;
+    auto const warps_per_cta = blockDim.x / WARP_THREADS;
+    for (uint32_t i = warp_id; i < desc.row_count; i += warps_per_cta) {
+      auto const cumsum      = compressed_cumsum_ptr[i];
+      auto const prev_cumsum = (i > 0) ? compressed_cumsum_ptr[i - 1] : start;
+      auto const comp_len    = cumsum - prev_cumsum;
+      if (comp_len == 0) {
+        if (lane == 0) { d_lengths[desc.global_row_start + i] = 0; }
+        continue;
       }
+      auto const* comp_length_ptr = dict_end_ptr - cumsum;
+      uint32_t decomp_len = warp_compute_decomp_len(comp_length_ptr, comp_len, sm_len, lane);
+      if (lane == 0) { d_lengths[desc.global_row_start + i] = decomp_len; }
     }
-    d_lengths[desc.global_row_start + i] = decomp_len;
+  } else {
+    // Thread-per-row
+    for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
+      auto const cumsum      = compressed_cumsum_ptr[i];
+      auto const prev_cumsum = (i > 0) ? compressed_cumsum_ptr[i - 1] : start;
+      auto const comp_len    = cumsum - prev_cumsum;
+      if (comp_len == 0) {
+        d_lengths[desc.global_row_start + i] = 0u;
+        continue;
+      }
+      auto const* comp_ptr = dict_end_ptr - cumsum;
+      int decomp_len       = 0;
+      int pos              = 0;
+      while (pos < comp_len) {
+        auto const code = comp_ptr[pos++];
+        if (code < FSST_ESC) {
+          decomp_len += sm_len[code];
+        } else {
+          ++pos;
+          ++decomp_len;
+        }
+      }
+      d_lengths[desc.global_row_start + i] = decomp_len;
+    }
   }
 }
 
-/// 32 input bytes × max 8B symbol = 256B; 64 u32 keeps ld.shared.u32 aligned.
-constexpr uint32_t FSST_SCRATCH_U32_PER_WARP = 64u;
-constexpr uint32_t FSST_WARPS_PER_CTA        = 8u;
-static_assert(FSST_WARPS_PER_CTA == BLOCK_DIM / WARP_SIZE);
+constexpr uint32_t FSST_SCRATCH_U32_PER_WARP   = 256;
+constexpr uint32_t FSST_SCRATCH_BYTES_PER_WARP = FSST_SCRATCH_U32_PER_WARP * sizeof(uint32_t);
+constexpr uint32_t FSST_MAX_CHUNK_EMIT =
+  WARP_THREADS * 8;  ///< max 8B symbol table entry per warp thread
+constexpr uint32_t FSST_WARPS_PER_CTA = BLOCK_DIM / WARP_THREADS;
 
-/// One warp decodes `comp_len` compressed bytes in 32-byte input chunks:
-/// warp-scan for per-lane output offsets → scatter decoded bytes into a
-/// per-warp shmem slab → coalesced stride-4 drain to `dst`. Per-chunk flush
-/// caps shmem use at 256B/warp.
-///
-/// `sm_sym` is split lo/hi so the common short-symbol load is one 4B read on
-/// bank `c & 31` instead of straddling two banks; `sm_sym_hi` is only read
-/// when len[code] > 4.
+/**
+ * @brief Drain the per-warp scratch buffer to global memory, with warp lanes cooperating in
+ * stride-4 chunks plus a per-byte cleanup for the last <4 bytes. Used in both the lazy-flush path
+ * when scratch is full and the final drain at the end of a chunk.
+ */
+__device__ __forceinline__ void warp_drain_scratch(uint8_t* __restrict__ dst,
+                                                   uint32_t const* __restrict__ scratch_u32,
+                                                   uint8_t const* __restrict__ scratch_u8,
+                                                   uint32_t n,
+                                                   uint32_t lane)
+{
+  constexpr uint32_t WORD_BYTES = 4;
+  auto const n_full_words       = n / WORD_BYTES;
+  auto word_id                  = lane;
+  while (word_id < n_full_words) {
+    auto const v = scratch_u32[word_id];
+    memcpy(dst + word_id * WORD_BYTES, &v, WORD_BYTES);
+    word_id += WARP_THREADS;
+  }
+  for (uint32_t t = n_full_words * WORD_BYTES + lane; t < n; t += WARP_THREADS) {
+    dst[t] = scratch_u8[t];
+  }
+}
+
+/**
+ * @brief Decode a chunk of compressed bytes using the FSST algorithm.
+ *
+ * One warp decodes `comp_len` compressed bytes in 32-byte input chunks. Decoded symbols accumulate
+ * in a per-warp scratch slab; we flush to `dst` only when the next chunk's worst-case emit (256 B)
+ * would overflow scratch, or once at the end of the row.
+ * `sm_sym` is split lo/hi so the common short-symbol load is one 4 B bank read.
+ * `sm_sym_hi` is only read when len[code] > 4.
+ */
 __device__ __forceinline__ void warp_decode_fsst(uint8_t const* __restrict__ comp_ptr,
                                                  uint32_t comp_len,
                                                  uint8_t* __restrict__ dst,
@@ -580,141 +881,154 @@ __device__ __forceinline__ void warp_decode_fsst(uint8_t const* __restrict__ com
                                                  uint32_t* __restrict__ warp_scratch_u32,
                                                  uint32_t lane)
 {
-  uint8_t* warp_scratch_u8        = reinterpret_cast<uint8_t*>(warp_scratch_u32);
-  uint32_t cumulative_out_off     = 0;
+  auto* warp_scratch_u8           = reinterpret_cast<uint8_t*>(warp_scratch_u32);
+  uint32_t cumulative_out_offset  = 0;  ///< bytes already flushed to dst
+  uint32_t scratch_used           = 0;  ///< bytes pending in scratch
   uint32_t prev_chunk_last_is_esc = 0;
 
-  for (uint32_t off = 0; off < comp_len; off += WARP_SIZE) {
-    uint32_t bytes_in_chunk = comp_len - off;
-    if (bytes_in_chunk > WARP_SIZE) bytes_in_chunk = WARP_SIZE;
+  for (uint32_t off = 0; off < comp_len; off += WARP_THREADS) {
+    auto const bytes_in_chunk = ::cuda::std::min(comp_len - off, WARP_THREADS);
+    auto const active         = lane < bytes_in_chunk;
+    uint8_t const my_byte     = active ? comp_ptr[off + lane] : 0;
+    int const is_esc          = (active && my_byte == FSST_ESC) ? 1 : 0;
+    auto const neighbor_esc   = __shfl_up_sync(FULL_MASK, is_esc, 1);
+    auto const prev_was_esc   = (lane == 0) ? prev_chunk_last_is_esc : neighbor_esc;
 
-    uint8_t my_byte = (lane < bytes_in_chunk) ? comp_ptr[off + lane] : 0u;
-    uint32_t active = (lane < bytes_in_chunk) ? 1u : 0u;
-    uint32_t is_esc = (active && my_byte == FSST_ESC) ? 1u : 0u;
-
-    uint32_t neighbor_esc = __shfl_up_sync(FULL_MASK, is_esc, 1);
-    uint32_t prev_was_esc = (lane == 0) ? prev_chunk_last_is_esc : neighbor_esc;
-
-    uint32_t my_len       = 0u;
-    uint32_t my_sym_lo    = 0u;
-    uint32_t my_sym_hi    = 0u;
-    uint32_t my_emit_kind = 0u;
+    // Decode the symbol for this lane, if active and not an escape byte.
+    // my_len == 0 → no write (inactive or unresolved escape sentinel).
+    // my_sym_lo holds `my_byte` directly for escape-literal lanes.
+    uint32_t my_len    = 0;
+    uint32_t my_sym_lo = 0;
+    uint32_t my_sym_hi = 0;
     if (active) {
       if (prev_was_esc) {
-        my_len       = 1u;
-        my_sym_lo    = my_byte;
-        my_emit_kind = 2u;
+        my_len    = 1;
+        my_sym_lo = my_byte;
       } else if (!is_esc) {
-        uint8_t code = my_byte;
-        my_len       = sm_len[code];
-        my_sym_lo    = sm_sym_lo[code];
-        if (my_len > 4u) my_sym_hi = sm_sym_hi[code];
-        my_emit_kind = 1u;
+        auto const code = my_byte;
+        my_len          = sm_len[code];
+        my_sym_lo       = sm_sym_lo[code];
+        if (my_len > 4) { my_sym_hi = sm_sym_hi[code]; }
       }
     }
 
-    uint32_t scan = my_len;
+    // Determine the write offsets into the scratch pad for this lane's decoded symbol via an
+    // inclusive scan of the decoded lengths.
+    auto scan = my_len;
 #pragma unroll
-    for (uint32_t step = 1u; step < WARP_SIZE; step <<= 1) {
-      uint32_t add = __shfl_up_sync(FULL_MASK, scan, step);
-      if (lane >= step) scan += add;
+    for (uint32_t step = 1; step < WARP_THREADS; step /= 2) {
+      auto const add = __shfl_up_sync(FULL_MASK, scan, step);
+      if (lane >= step) { scan += add; }
     }
-    uint32_t exclusive = scan - my_len;
+    auto const exclusive   = scan - my_len;
+    auto const base        = scratch_used + exclusive;
+    auto const chunk_total = __shfl_sync(FULL_MASK, scan, WARP_THREADS - 1);
 
-    if (my_emit_kind == 1u) {
+    // Copy the decoded symbol into the scratch pad at the offset computed from the scan.
+    if (my_len > 0) {
       switch (my_len) {
-        case 1: warp_scratch_u8[exclusive] = static_cast<uint8_t>(my_sym_lo); break;
-        case 2: memcpy(warp_scratch_u8 + exclusive, &my_sym_lo, 2); break;
-        case 3: memcpy(warp_scratch_u8 + exclusive, &my_sym_lo, 3); break;
-        case 4: memcpy(warp_scratch_u8 + exclusive, &my_sym_lo, 4); break;
+        case 1: warp_scratch_u8[base] = static_cast<uint8_t>(my_sym_lo); break;
+        case 2: memcpy(warp_scratch_u8 + base, &my_sym_lo, 2); break;
+        case 3: memcpy(warp_scratch_u8 + base, &my_sym_lo, 3); break;
+        case 4: memcpy(warp_scratch_u8 + base, &my_sym_lo, 4); break;
         default: {
-          memcpy(warp_scratch_u8 + exclusive, &my_sym_lo, 4);
-          uint32_t const tail = my_len - 4u;
-          memcpy(warp_scratch_u8 + exclusive + 4u, &my_sym_hi, tail);
+          memcpy(warp_scratch_u8 + base, &my_sym_lo, 4);
+          auto const tail_bytes = my_len - 4;
+          memcpy(warp_scratch_u8 + base + 4, &my_sym_hi, tail_bytes);
           break;
         }
       }
-    } else if (my_emit_kind == 2u) {
-      warp_scratch_u8[exclusive] = static_cast<uint8_t>(my_sym_lo);
     }
 
-    uint32_t chunk_total = __shfl_sync(FULL_MASK, scan, WARP_SIZE - 1u);
+    scratch_used += chunk_total;
+    auto const last_active_lane = bytes_in_chunk - 1;
+    prev_chunk_last_is_esc      = __shfl_sync(FULL_MASK, is_esc, last_active_lane);
 
+    // Lazy flush: only when the next chunk might overflow scratch.
+    auto const more_chunks = (off + WARP_THREADS) < comp_len;
+    if (more_chunks && scratch_used + FSST_MAX_CHUNK_EMIT > FSST_SCRATCH_BYTES_PER_WARP) {
+      __syncwarp();
+      warp_drain_scratch(
+        dst + cumulative_out_offset, warp_scratch_u32, warp_scratch_u8, scratch_used, lane);
+      __syncwarp();
+      cumulative_out_offset += scratch_used;
+      scratch_used = 0;
+    }
+  }
+
+  // Final flush at end of row — always required, scratch holds the tail.
+  if (scratch_used > 0) {
     __syncwarp();
-
-    uint32_t const n  = chunk_total;
-    uint32_t const n4 = n & ~3u;
-    uint32_t k        = lane * 4u;
-    while (k < n4) {
-      uint32_t v = warp_scratch_u32[k >> 2];
-      memcpy(dst + cumulative_out_off + k, &v, 4);
-      k += WARP_BULK_STRIDE_BYTES;
-    }
-    for (uint32_t t = n4 + lane; t < n; t += WARP_SIZE) {
-      dst[cumulative_out_off + t] = warp_scratch_u8[t];
-    }
-
+    warp_drain_scratch(
+      dst + cumulative_out_offset, warp_scratch_u32, warp_scratch_u8, scratch_used, lane);
     __syncwarp();
-    cumulative_out_off += chunk_total;
-
-    uint32_t last_active_lane = bytes_in_chunk - 1u;
-    prev_chunk_last_is_esc    = __shfl_sync(FULL_MASK, is_esc, last_active_lane);
   }
 }
 
-__global__ void kernel_gather_fsst_chunked(fsst_chunk_desc const* __restrict__ descs,
-                                           int32_t const* __restrict__ d_offsets,
-                                           uint8_t* __restrict__ d_chars,
-                                           uint32_t const* __restrict__ d_comp_offsets,
-                                           fsst_decoder_compact const* __restrict__ d_decoders,
-                                           uint32_t num_chunks)
+/**
+ * @brief Gather kernel for FSST-compressed segments, with the same chunking as phase-C. Each warp
+ * walks the compressed byte stream for its row, decodes on the fly into a per-warp scratch buffer,
+ * and flushes to global when the next chunk's worst-case emit would overflow scratch.
+ */
+__global__ __launch_bounds__(BLOCK_DIM, 8) void kernel_gather_fsst_chunked(
+  fsst_chunk_desc const* __restrict__ descs,
+  int32_t const* __restrict__ d_offsets,
+  uint8_t* __restrict__ d_chars,
+  uint32_t const* __restrict__ d_comp_offsets,
+  fsst_decoder_compact const* __restrict__ d_decoders,
+  uint32_t num_chunks)
 {
-  uint32_t cid = blockIdx.x;
-  if (cid >= num_chunks) return;
-  auto const desc     = descs[cid];
-  uint8_t const* base = desc.d_bytes;
-
-  __shared__ uint8_t sm_ok;
+  __shared__ bool sm_ok;
   __shared__ fsst_header_t sm_hdr;
-  __shared__ uint8_t sm_len[256];
-  __shared__ uint32_t sm_sym_lo[256];
-  __shared__ uint32_t sm_sym_hi[256];
-  __shared__ uint32_t sm_scratch_u32[FSST_WARPS_PER_CTA][FSST_SCRATCH_U32_PER_WARP];
+  __shared__ uint8_t sm_len[FSST_SIZE];
+  __shared__ uint32_t sm_sym_lo[FSST_SIZE];  ///< The lower 4B of the symbol
+  __shared__ uint32_t sm_sym_hi[FSST_SIZE];  ///< The upper 4B of the symbol (only used if len > 4)
+  __shared__ uint32_t
+    sm_scratch_u32[FSST_WARPS_PER_CTA]
+                  [FSST_SCRATCH_U32_PER_WARP];  ///< Per-warp scratch for decoding symbols before
+                                                ///< flushing to global
 
-  if (threadIdx.x == 0) sm_ok = parse_fsst_header(base, desc.bytes_size, &sm_hdr) ? 1 : 0;
+  auto const chunk_id = blockIdx.x;
+  if (chunk_id >= num_chunks) return;
+  auto const desc          = descs[chunk_id];
+  auto const* segment_base = desc.d_bytes;
+
+  // Parse the segment header
+  if (threadIdx.x == 0) { sm_ok = parse_fsst_header(segment_base, desc.bytes_size, &sm_hdr); }
   __syncthreads();
   if (!sm_ok) return;  // pass-1 emitted zero lengths → nothing to gather
 
+  // Load the symbol table into SMEM
   fsst_decoder_compact const& dec = d_decoders[desc.seg_decoder_idx];
-  for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) {
-    sm_len[i]    = (i < FSST_NUM_SYMBOLS) ? dec.len[i] : uint8_t{0};
-    uint64_t sym = (i < FSST_NUM_SYMBOLS) ? dec.symbol[i] : 0ull;
-    sm_sym_lo[i] = static_cast<uint32_t>(sym);
-    sm_sym_hi[i] = static_cast<uint32_t>(sym >> 32);
+  for (uint32_t i = threadIdx.x; i < FSST_SIZE; i += blockDim.x) {
+    sm_len[i]          = (i < FSST_NUM_SYMBOLS) ? dec.len[i] : 0;
+    uint64_t const sym = (i < FSST_NUM_SYMBOLS) ? dec.symbol[i] : 0;
+    sm_sym_lo[i]       = static_cast<uint32_t>(sym);
+    sm_sym_hi[i]       = static_cast<uint32_t>(sym >> 32);
   }
   __syncthreads();
 
-  uint8_t const* dict_end_ptr = base + sm_hdr.dict_end;
-  uint32_t const* my_comp     = d_comp_offsets + desc.fsst_row_start;
-
-  // 1 warp per row. `*(my_comp - 1)` is safe within a segment for non-first
-  // chunks: chunking happens within a segment, so my_comp[-1] reads the
-  // prior in-segment row's cumulative compressed bytes.
-  uint32_t const lane          = threadIdx.x & (WARP_SIZE - 1u);
-  uint32_t const warp_id       = threadIdx.x / WARP_SIZE;
-  uint32_t const warps_per_cta = blockDim.x / WARP_SIZE;
+  // Warp-per-row gather + decode.
+  // Each warp walks the compressed byte stream for its row, decodes on the fly into the per-warp
+  // scratch, and flushes to global when the next chunk's worst-case emit would overflow scratch.
+  auto const* dict_end_ptr  = segment_base + sm_hdr.dict_end;
+  auto const* my_cumsum_ptr = d_comp_offsets + desc.fsst_row_start;
+  auto const lane           = threadIdx.x % WARP_THREADS;
+  auto const warp_id        = threadIdx.x / WARP_THREADS;
+  auto const warps_per_cta  = blockDim.x / WARP_THREADS;
 
   for (uint32_t i = warp_id; i < desc.row_count; i += warps_per_cta) {
-    uint32_t cum      = my_comp[i];
-    uint32_t prev     = (i > 0) ? my_comp[i - 1] : (desc.is_first_chunk ? 0u : *(my_comp - 1));
-    uint32_t comp_len = cum - prev;
+    auto const my_cumsum = my_cumsum_ptr[i];
+    auto const prev_cumsum =
+      (i > 0) ? my_cumsum_ptr[i - 1] : (desc.is_first_chunk ? 0 : *(my_cumsum_ptr - 1));
+    auto const comp_len = my_cumsum - prev_cumsum;
     if (comp_len == 0) continue;
 
-    uint8_t const* comp_ptr = dict_end_ptr - cum;
-    uint32_t out_base       = static_cast<uint32_t>(d_offsets[desc.global_row_start + i]);
+    auto const* comp_ptr       = dict_end_ptr - my_cumsum;
+    auto const out_base_offset = static_cast<uint32_t>(d_offsets[desc.global_row_start + i]);
     warp_decode_fsst(comp_ptr,
                      comp_len,
-                     d_chars + out_base,
+                     d_chars + out_base_offset,
                      sm_len,
                      sm_sym_lo,
                      sm_sym_hi,
@@ -870,9 +1184,9 @@ __global__ void kernel_gather_dict_fsst(dict_fsst_desc const* __restrict__ descs
   uint8_t const* memcpy_src =
     mode_dict_fsst ? (predecode_buf + desc.predecode_seg_offset) : (base + desc.dict_data_offset);
 
-  uint32_t const lane          = threadIdx.x & (WARP_SIZE - 1u);
-  uint32_t const warp_id       = threadIdx.x / WARP_SIZE;
-  uint32_t const warps_per_cta = blockDim.x / WARP_SIZE;
+  uint32_t const lane          = threadIdx.x & (WARP_THREADS - 1u);
+  uint32_t const warp_id       = threadIdx.x / WARP_THREADS;
+  uint32_t const warps_per_cta = blockDim.x / WARP_THREADS;
 
   for (uint32_t i = warp_id; i < desc.row_count; i += warps_per_cta) {
     uint32_t seg_i = desc.seg_row_start + i;
@@ -894,7 +1208,7 @@ __global__ void kernel_gather_dict_fsst(dict_fsst_desc const* __restrict__ descs
         memcpy(d_chars + op + k, &v, 4);
         k += WARP_BULK_STRIDE_BYTES;
       }
-      for (uint32_t t = n4 + lane; t < entry_len; t += WARP_SIZE) {
+      for (uint32_t t = n4 + lane; t < entry_len; t += WARP_THREADS) {
         d_chars[op + t] = src[t];
       }
       continue;
@@ -971,14 +1285,6 @@ struct prepared_dict {
   std::vector<string_chunk_desc> descs_long;   ///< max_string_length >= DICT_WARP_COOP_MIN_LEN
 };
 
-struct prepared_fsst {
-  std::vector<string_chunk_desc> length_descs;  ///< pass-1 A+B (per segment)
-  std::vector<fsst_chunk_desc> gather_chunks;   ///< pass-1 phase-C + pass-2 chunks
-  std::vector<fsst_decoder_compact> decoders;
-  std::vector<uint32_t> row_starts;  ///< prefix sum of FSST row counts
-  uint32_t total_fsst_rows;
-};
-
 struct prepared_dict_fsst {
   std::vector<dict_fsst_desc> descs;
   std::vector<fsst_decoder_compact> decoders;
@@ -998,93 +1304,6 @@ prepared_dict prepare_dict(gpu_string_codec_run const& run)
     auto& bucket =
       (seg.max_string_length < DICT_WARP_COOP_MIN_LEN) ? out.descs_short : out.descs_long;
     bucket.push_back(d);
-  }
-  return out;
-}
-
-prepared_fsst prepare_fsst(gpu_string_codec_run const& run)
-{
-  prepared_fsst out;
-  out.total_fsst_rows = 0;
-  out.length_descs.reserve(run.segments.size());
-  out.decoders.reserve(run.segments.size());
-  out.row_starts.reserve(run.segments.size());
-
-  for (size_t si = 0; si < run.segments.size(); ++si) {
-    auto const& seg = run.segments[si];
-    if (seg.row_count == 0) continue;
-    out.row_starts.push_back(out.total_fsst_rows);
-    out.total_fsst_rows += seg.row_count;
-    out.length_descs.push_back(
-      {seg.d_bytes, seg.bytes_size, seg.row_count, seg.row_offset, seg.seg_row_start});
-
-    // Per-segment D2H of header + symbol table — opaque format needs host import.
-    fsst_header_t hdr{};
-    if (seg.bytes_size < sizeof(hdr)) {
-      out.decoders.emplace_back();
-      continue;
-    }
-    RMM_CUDA_TRY(cudaMemcpy(&hdr, seg.d_bytes, sizeof(hdr), cudaMemcpyDeviceToHost));
-    if (hdr.fsst_symbol_table_offset >= seg.bytes_size ||
-        hdr.fsst_symbol_table_offset >= hdr.dict_end || hdr.dict_end > seg.bytes_size) {
-      out.decoders.emplace_back();
-      continue;
-    }
-    size_t symtab_max =
-      std::min<size_t>(seg.bytes_size - hdr.fsst_symbol_table_offset, FSST_SYMTAB_MAX_BYTES);
-    std::vector<uint8_t> symtab(symtab_max);
-    RMM_CUDA_TRY(cudaMemcpy(symtab.data(),
-                            seg.d_bytes + hdr.fsst_symbol_table_offset,
-                            symtab_max,
-                            cudaMemcpyDeviceToHost));
-    fsst_decoder_full full{};
-    duckdb_fsst_import(&full, symtab.data());
-    fsst_decoder_compact compact;
-    std::memcpy(compact.len, full.len, sizeof(compact.len));
-    std::memcpy(compact.symbol, full.symbol, sizeof(compact.symbol));
-    out.decoders.push_back(compact);
-  }
-
-  // Chunked descriptors for phase-C + gather. Split per-segment only when
-  // total segments < target_ctas (else one-chunk-per-segment fills SMs already).
-  uint32_t target_ctas     = get_target_ctas();
-  uint32_t chunk_size_fsst = 0;
-  if (out.length_descs.size() < target_ctas && out.total_fsst_rows > 0) {
-    chunk_size_fsst = std::max(out.total_fsst_rows / target_ctas, MIN_CHUNK_ROW);
-    chunk_size_fsst = (chunk_size_fsst / 32u) * 32u;
-    if (chunk_size_fsst == 0) chunk_size_fsst = 32u;
-  }
-  for (size_t si = 0; si < out.length_descs.size(); ++si) {
-    auto const& seg        = out.length_descs[si];
-    uint32_t fsst_base_row = out.row_starts[si];
-    if (chunk_size_fsst == 0) {
-      out.gather_chunks.push_back({seg.d_bytes,
-                                   seg.bytes_size,
-                                   seg.row_count,
-                                   seg.global_row_start,
-                                   fsst_base_row,
-                                   static_cast<uint32_t>(si),
-                                   uint8_t{1},
-                                   {0, 0, 0}});
-    } else {
-      uint32_t remaining = seg.row_count;
-      uint32_t off       = 0;
-      bool first         = true;
-      while (remaining > 0) {
-        uint32_t n = std::min(remaining, chunk_size_fsst);
-        out.gather_chunks.push_back({seg.d_bytes,
-                                     seg.bytes_size,
-                                     n,
-                                     seg.global_row_start + off,
-                                     fsst_base_row + off,
-                                     static_cast<uint32_t>(si),
-                                     uint8_t(first ? 1 : 0),
-                                     {0, 0, 0}});
-        off += n;
-        remaining -= n;
-        first = false;
-      }
-    }
   }
   return out;
 }
@@ -1225,7 +1444,7 @@ prepared_dict_fsst prepare_dict_fsst(gpu_string_codec_run const& run)
   return out;
 }
 
-}  // anonymous namespace
+}  // namespace
 
 std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode_input const& col,
                                                         rmm::cuda_stream_view stream,
@@ -1258,13 +1477,14 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
       case duckdb::CompressionType::COMPRESSION_FSST: {
         auto p = prepare_fsst(run);
         // Rebase row_starts + decoder indices into the merged FSST set.
-        uint32_t row_base     = prep_fsst.total_fsst_rows;
-        uint32_t decoder_base = static_cast<uint32_t>(prep_fsst.decoders.size());
-        for (auto& s : p.row_starts)
-          s += row_base;
+        auto const row_count_base     = prep_fsst.total_fsst_row_count;
+        auto const decoder_count_base = static_cast<uint32_t>(prep_fsst.decoders.size());
+        for (auto& s : p.row_starts) {
+          s += row_count_base;
+        }
         for (auto& c : p.gather_chunks) {
-          c.fsst_row_start += row_base;
-          c.seg_decoder_idx += decoder_base;
+          c.fsst_row_start += row_count_base;
+          c.seg_decoder_idx += decoder_count_base;
         }
         prep_fsst.length_descs.insert(
           prep_fsst.length_descs.end(), p.length_descs.begin(), p.length_descs.end());
@@ -1273,7 +1493,7 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
         prep_fsst.decoders.insert(prep_fsst.decoders.end(), p.decoders.begin(), p.decoders.end());
         prep_fsst.gather_chunks.insert(
           prep_fsst.gather_chunks.end(), p.gather_chunks.begin(), p.gather_chunks.end());
-        prep_fsst.total_fsst_rows += p.total_fsst_rows;
+        prep_fsst.total_fsst_row_count += p.total_fsst_row_count;
         break;
       }
       case duckdb::CompressionType::COMPRESSION_DICT_FSST: {
@@ -1321,16 +1541,19 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
     }
   }
 
-  // N+1-sized with the tail zero so CUB writes offsets[total_rows] = total
-  // chars naturally; zero-init also covers NULL rows skipped by codec kernels.
-  rmm::device_uvector<uint32_t> d_lengths(size_t{total_rows} + 1u, stream, mr);
-  rmm::device_uvector<int32_t> d_offsets(size_t{total_rows} + 1u, stream, mr);
-  RMM_CUDA_TRY(cudaMemsetAsync(
-    d_lengths.data(), 0, (size_t{total_rows} + 1u) * sizeof(uint32_t), stream.value()));
+  // Allocate output and intermediate buffers.
+  rmm::device_uvector<uint32_t> d_lengths(size_t{total_rows} + 1, stream, mr);
+  rmm::device_uvector<int32_t> d_offsets(size_t{total_rows} + 1, stream, mr);
+  // RMM_CUDA_TRY(cudaMemsetAsync(
+  //   d_lengths.data(), 0, (size_t{total_rows} + 1) * sizeof(uint32_t), stream.value()));
+  rmm::device_buffer d_comp_offsets(prep_fsst.total_fsst_row_count * sizeof(uint32_t), stream, mr);
 
-  rmm::device_buffer comp_offsets_buf(
-    prep_fsst.total_fsst_rows > 0 ? prep_fsst.total_fsst_rows * sizeof(uint32_t) : 0, stream, mr);
-  uint32_t* d_comp_offsets = static_cast<uint32_t*>(comp_offsets_buf.data());
+  // Per-row kernels take chunked descriptors; predecode + mark_nulls stay
+  // per-segment via prep_dict_fsst.descs.
+  auto const target_ctas       = get_target_ctas();
+  auto const dict_chunks_short = expand_chunks(prep_dict.descs_short, target_ctas);
+  auto const dict_chunks_long  = expand_chunks(prep_dict.descs_long, target_ctas);
+  auto const dict_fsst_chunks  = expand_chunks(prep_dict_fsst.descs, target_ctas);
 
   auto upload = [&](void const* src, size_t bytes) {
     rmm::device_buffer buf(bytes, stream, mr);
@@ -1339,14 +1562,6 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
     }
     return buf;
   };
-
-  // Per-row kernels take chunked descriptors; predecode + mark_nulls stay
-  // per-segment via prep_dict_fsst.descs.
-  uint32_t target_ctas   = get_target_ctas();
-  auto dict_chunks_short = expand_chunks(prep_dict.descs_short, target_ctas);
-  auto dict_chunks_long  = expand_chunks(prep_dict.descs_long, target_ctas);
-  auto dict_fsst_chunks  = expand_chunks(prep_dict_fsst.descs, target_ctas);
-
   rmm::device_buffer d_dict_short_buf =
     upload(dict_chunks_short.data(), dict_chunks_short.size() * sizeof(string_chunk_desc));
   rmm::device_buffer d_dict_long_buf =
@@ -1374,6 +1589,7 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
   // Pageable host sources — sync before kernels consume to avoid free-mid-copy.
   RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));
 
+  auto* d_comp_offsets_p     = static_cast<uint32_t*>(d_comp_offsets.data());
   auto* d_dict_short_p       = static_cast<string_chunk_desc*>(d_dict_short_buf.data());
   auto* d_dict_long_p        = static_cast<string_chunk_desc*>(d_dict_long_buf.data());
   auto* d_fsst_lengths_p     = static_cast<string_chunk_desc*>(d_fsst_lengths_buf.data());
@@ -1402,22 +1618,30 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
       d_dict_long_p, d_lengths.data(), static_cast<uint32_t>(dict_chunks_long.size()));
   }
   if (!prep_fsst.length_descs.empty()) {
+    // On-device symbol-table parse: one CTA per segment, coalesced symtab
+    // load into shmem then serial host-style parse. Replaces the per-segment
+    // sync D2H + duckdb_fsst_import that used to happen in prepare_fsst.
+    auto const n_decoders = static_cast<uint32_t>(prep_fsst.length_descs.size());
+    kernel_build_fsst_decoders<<<n_decoders, BLOCK_DIM, 0, stream.value()>>>(
+      d_fsst_lengths_p, n_decoders, d_fsst_decs_p);
+
     // A+B per-segment (prefix-sum state lives in one CTA); C per-chunk.
-    kernel_compute_lengths_fsst<<<static_cast<uint32_t>(prep_fsst.length_descs.size()),
-                                  BLOCK_DIM,
-                                  0,
-                                  stream.value()>>>(
+    kernel_compute_compressed_offsets_fsst<<<static_cast<uint32_t>(prep_fsst.length_descs.size()),
+                                             BLOCK_DIM,
+                                             0,
+                                             stream.value()>>>(
+      d_comp_offsets_p,
       d_fsst_lengths_p,
-      d_comp_offsets,
       d_fsst_starts_p,
       static_cast<uint32_t>(prep_fsst.length_descs.size()));
-    kernel_compute_lengths_fsst_phase_c<<<static_cast<uint32_t>(prep_fsst.gather_chunks.size()),
-                                          BLOCK_DIM,
-                                          0,
-                                          stream.value()>>>(
+    kernel_compute_decompressed_lengths_fsst<<<static_cast<uint32_t>(
+                                                 prep_fsst.gather_chunks.size()),
+                                               BLOCK_DIM,
+                                               0,
+                                               stream.value()>>>(
       d_fsst_chunks_p,
       d_lengths.data(),
-      d_comp_offsets,
+      d_comp_offsets_p,
       d_fsst_decs_p,
       static_cast<uint32_t>(prep_fsst.gather_chunks.size()));
   }
@@ -1515,7 +1739,7 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
       d_fsst_chunks_p,
       d_offsets.data(),
       d_chars_p,
-      d_comp_offsets,
+      d_comp_offsets_p,
       d_fsst_decs_p,
       static_cast<uint32_t>(prep_fsst.gather_chunks.size()));
   }
