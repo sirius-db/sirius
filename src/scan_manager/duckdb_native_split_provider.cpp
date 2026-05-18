@@ -18,6 +18,8 @@
 
 #include "log/logging.hpp"
 
+#include <algorithm>
+#include <cstdint>
 #include <stdexcept>
 #include <utility>
 
@@ -25,26 +27,87 @@ namespace sirius::scan_manager {
 
 namespace {
 
+// cudf strings columns use int32 offsets, so the per-column decoded byte budget
+// for a single scan output must stay under INT32_MAX. 64 MB headroom covers
+// max_string_length being an upper bound + offsets/validity allocations.
+constexpr std::size_t VARCHAR_BYTE_CAP =
+  (static_cast<std::size_t>(1) << 31) - (static_cast<std::size_t>(64) << 20);
+
+std::size_t rg_varchar_bytes_for_col(const op::scan::duckdb_row_group_metadata& rg,
+                                     std::size_t col_idx)
+{
+  std::size_t total = 0;
+  for (const auto& seg : rg.columns[col_idx].data_segments) {
+    std::uint32_t per_row = seg.max_string_length == 0
+                              ? op::scan::VARCHAR_UNKNOWN_LENGTH_FALLBACK_BYTES
+                              : seg.max_string_length;
+    total += static_cast<std::size_t>(seg.segment_count) * static_cast<std::size_t>(per_row);
+  }
+  return total;
+}
+
 std::vector<duckdb_native_split_provider::row_group_batch> partition_row_groups_into_batches(
   const std::vector<op::scan::duckdb_row_group_metadata>& row_groups,
-  std::size_t approximate_batch_size)
+  std::size_t approximate_batch_size,
+  const std::vector<sirius::logical_type>& projected_types)
 {
   std::vector<duckdb_native_split_provider::row_group_batch> batches;
   if (row_groups.empty()) return batches;
 
-  if (approximate_batch_size == 0) {
+  const std::size_t num_cols = projected_types.size();
+  std::vector<bool> is_varchar(num_cols, false);
+  for (std::size_t c = 0; c < num_cols; ++c) {
+    is_varchar[c] = projected_types[c].is_varchar();
+  }
+  const bool any_varchar = std::any_of(is_varchar.begin(), is_varchar.end(), [](bool b) { return b; });
+
+  // Fast path: no batch-bytes cap AND no varchar columns → single batch.
+  if (approximate_batch_size == 0 && !any_varchar) {
     batches.push_back({0, row_groups.size()});
     return batches;
   }
 
   std::size_t batch_first = 0;
   std::size_t batch_bytes = 0;
+  std::vector<std::size_t> col_bytes(num_cols, 0);
+
   for (std::size_t i = 0; i < row_groups.size(); ++i) {
-    batch_bytes += row_groups[i].decoded_bytes_budget;
-    if (batch_bytes >= approximate_batch_size) {
-      batches.push_back({batch_first, i + 1 - batch_first});
-      batch_first = i + 1;
-      batch_bytes = 0;
+    const std::size_t this_rg_bytes = row_groups[i].decoded_bytes_budget;
+    std::vector<std::size_t> this_rg_col_bytes(num_cols, 0);
+    if (any_varchar) {
+      for (std::size_t c = 0; c < num_cols; ++c) {
+        if (is_varchar[c]) this_rg_col_bytes[c] = rg_varchar_bytes_for_col(row_groups[i], c);
+      }
+    }
+
+    // Decide whether to close the in-progress batch before adding this RG.
+    // Cap (c): only fire when the batch is non-empty, so a single oversized RG
+    // still makes forward progress as its own singleton batch.
+    if (i > batch_first) {
+      const bool would_exceed_total =
+        (approximate_batch_size > 0) && (batch_bytes + this_rg_bytes > approximate_batch_size);
+
+      bool would_exceed_varchar = false;
+      if (any_varchar) {
+        for (std::size_t c = 0; c < num_cols; ++c) {
+          if (is_varchar[c] && col_bytes[c] + this_rg_col_bytes[c] > VARCHAR_BYTE_CAP) {
+            would_exceed_varchar = true;
+            break;
+          }
+        }
+      }
+
+      if (would_exceed_total || would_exceed_varchar) {
+        batches.push_back({batch_first, i - batch_first});
+        batch_first = i;
+        batch_bytes = 0;
+        std::fill(col_bytes.begin(), col_bytes.end(), 0);
+      }
+    }
+
+    batch_bytes += this_rg_bytes;
+    if (any_varchar) {
+      for (std::size_t c = 0; c < num_cols; ++c) col_bytes[c] += this_rg_col_bytes[c];
     }
   }
   if (batch_first < row_groups.size()) {
@@ -82,8 +145,8 @@ duckdb_native_split_provider::duckdb_native_split_provider(op::scan::duckdb_nati
     return;
   }
 
-  _batches =
-    partition_row_groups_into_batches(_metadata.row_groups, _scan_info->approximate_batch_size);
+  _batches = partition_row_groups_into_batches(
+    _metadata.row_groups, _scan_info->approximate_batch_size, _scan_info->projected_types);
 }
 
 duckdb_native_split_provider::~duckdb_native_split_provider() = default;
