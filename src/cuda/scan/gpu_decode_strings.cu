@@ -410,30 +410,32 @@ __global__ void kernel_compute_lengths_dict(string_chunk_desc const* __restrict_
                                             uint32_t* __restrict__ d_lengths,
                                             uint32_t num_chunks)
 {
-  uint32_t cid = blockIdx.x;
-  if (cid >= num_chunks) return;
-  auto const desc     = descs[cid];
-  uint8_t const* base = desc.d_bytes;
+  auto const chunk_id = blockIdx.x;
+  if (chunk_id >= num_chunks) return;
+  auto const desc          = descs[chunk_id];
+  auto const* segment_base = desc.d_bytes;
 
-  __shared__ uint8_t sm_ok;
+  __shared__ bool sm_ok;
   __shared__ dict_header_t sm_hdr;
-  if (threadIdx.x == 0) sm_ok = parse_dict_header(base, desc.bytes_size, &sm_hdr) ? 1 : 0;
+  if (threadIdx.x == 0) { sm_ok = parse_dict_header(segment_base, desc.bytes_size, &sm_hdr); }
   __syncthreads();
 
   // Malformed metadata → zero-fill using the trusted descriptor row count.
   if (!sm_ok) {
     for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
-      d_lengths[desc.global_row_start + i] = 0u;
+      d_lengths[desc.global_row_start + i] = 0;
     }
     return;
   }
 
-  uint32_t const* d_sel = reinterpret_cast<uint32_t const*>(base + sizeof(dict_header_t));
-  uint32_t const* d_idx = reinterpret_cast<uint32_t const*>(base + sm_hdr.index_buffer_offset);
+  // Calculate lengths by unpacking the selection buffer to get dict indices, then looking up
+  // lengths from the index buffer.
+  auto const* d_sel = reinterpret_cast<uint32_t const*>(segment_base + sizeof(dict_header_t));
+  auto const* d_idx = reinterpret_cast<uint32_t const*>(segment_base + sm_hdr.index_buffer_offset);
   for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
-    uint32_t seg_i = desc.seg_row_start + i;
-    uint32_t sel   = unpack_value<uint32_t>(d_sel, seg_i, sm_hdr.bitpacking_width);
-    uint32_t len   = (sel == 0) ? 0u : (d_idx[sel] - d_idx[sel - 1]);
+    auto const segment_idx = desc.seg_row_start + i;
+    auto const sel         = unpack_value<uint32_t>(d_sel, segment_idx, sm_hdr.bitpacking_width);
+    auto const len         = (sel == 0) ? 0 : (d_idx[sel] - d_idx[sel - 1]);
     d_lengths[desc.global_row_start + i] = len;
   }
 }
@@ -443,10 +445,10 @@ __global__ void kernel_gather_dict(string_chunk_desc const* __restrict__ descs,
                                    uint8_t* __restrict__ d_chars,
                                    uint32_t num_chunks)
 {
-  uint32_t cid = blockIdx.x;
-  if (cid >= num_chunks) return;
-  auto const desc     = descs[cid];
-  uint8_t const* base = desc.d_bytes;
+  auto const chunk_id = blockIdx.x;
+  if (chunk_id >= num_chunks) return;
+  auto const desc  = descs[chunk_id];
+  auto const* base = desc.d_bytes;
 
   __shared__ uint8_t sm_ok;
   __shared__ dict_header_t sm_hdr;
@@ -887,7 +889,7 @@ __device__ __forceinline__ void warp_decode_fsst(uint8_t const* __restrict__ com
   uint32_t prev_chunk_last_is_esc = 0;
 
   for (uint32_t off = 0; off < comp_len; off += WARP_THREADS) {
-    auto const bytes_in_chunk = ::cuda::std::min(comp_len - off, WARP_THREADS);
+    auto const bytes_in_chunk = ::cuda::std::min(comp_len - off, uint32_t{WARP_THREADS});
     auto const active         = lane < bytes_in_chunk;
     uint8_t const my_byte     = active ? comp_ptr[off + lane] : 0;
     int const is_esc          = (active && my_byte == FSST_ESC) ? 1 : 0;
@@ -913,10 +915,10 @@ __device__ __forceinline__ void warp_decode_fsst(uint8_t const* __restrict__ com
     }
 
     // Determine the write offsets into the scratch pad for this lane's decoded symbol via an
-    // inclusive scan of the decoded lengths.
+    // inclusive Hillis-Steele scan of the decoded lengths.
     auto scan = my_len;
 #pragma unroll
-    for (uint32_t step = 1; step < WARP_THREADS; step /= 2) {
+    for (uint32_t step = 1; step < WARP_THREADS; step <<= 1) {
       auto const add = __shfl_up_sync(FULL_MASK, scan, step);
       if (lane >= step) { scan += add; }
     }
