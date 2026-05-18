@@ -14,18 +14,6 @@
  * limitations under the License.
  */
 
-// String-codec decode kernels and orchestrator. See gpu_decode_strings.cuh.
-//
-// File layout (top to bottom):
-//   1. Shared core      — on-disk headers, decoder types, descriptor structs,
-//                         tuning constants, helpers used across codecs, and
-//                         the `prepared_*` types each codec produces.
-//   2. DICTIONARY codec — kernels + prepare_dict().
-//   3. FSST codec       — kernels + prepare_fsst(). The warp-decode helper
-//                         `warp_decode_fsst` is reused by DICT_FSST mode 2.
-//   4. DICT_FSST codec  — kernels + prepare_dict_fsst().
-//   5. Orchestrator     — `gpu_decode_strings_column` + validity overlay.
-
 #include "cuda/scan/gpu_decode_strings.cuh"
 
 #include <cudf/column/column.hpp>
@@ -63,8 +51,7 @@ namespace {
 //                                                     (DICT_FSST)
 //===----------------------------------------------------------------------===//
 
-//----- On-disk headers ------------------------------------------------------
-
+//----- On-disk headers ------------------------------------------------------//
 struct dict_header_t {
   uint32_t dict_size;
   uint32_t dict_end;
@@ -96,15 +83,13 @@ enum : uint8_t {
   DICT_FSST_MODE_FSST_ONLY  = 2,
 };
 
-//----- FSST decoder types (shared: FSST + DICT_FSST modes 1+2) --------------
+//----- FSST decoder types (shared: FSST + DICT_FSST modes 1+2) --------------//
 
 /// 255 codes (0..254); byte 255 is the escape sentinel.
-constexpr uint32_t FSST_SIZE        = 256;
-constexpr uint32_t FSST_NUM_SYMBOLS = 255;
-constexpr uint8_t FSST_ESC          = 255;
-static_assert(FSST_ESC == FSST_NUM_SYMBOLS);
-
-constexpr size_t FSST_SYMTAB_MAX_BYTES = 8192u;  // opaque serialized blob
+constexpr uint32_t FSST_SIZE           = 256;
+constexpr uint32_t FSST_NUM_SYMBOLS    = 255;
+constexpr uint8_t FSST_ESC             = 255;
+constexpr size_t FSST_SYMTAB_MAX_BYTES = 8192;  // opaque serialized blob
 
 /// Trimmed `duckdb_fsst_decoder_t`: drops `version` + `zeroTerminated`.
 /// `len` + `symbol` arrays are ABI-compatible with `_full` for the import memcpy.
@@ -166,7 +151,7 @@ struct alignas(8) dict_fsst_desc {
   uint8_t _pad[6];
 };
 
-//----- Tuning constants -----------------------------------------------------
+//----- Tuning constants -----------------------------------------------------//
 
 constexpr uint32_t BLOCK_DIM = 256;  // see FSST_WARPS_PER_CTA static_assert
 constexpr uint32_t MIN_ROWS_PER_CHUNK =
@@ -187,7 +172,7 @@ constexpr size_t HOST_UPPER_BOUND_LIMIT = size_t{512} * 1024u * 1024u;
 /// rows). Mirrors cuDF's strings-gather split (32B) with headroom.
 constexpr uint32_t DICT_WARP_COOP_MIN_LEN = 64u;
 
-//----- Helpers --------------------------------------------------------------
+//----- Helpers --------------------------------------------------------------//
 
 /// DuckDB's AlignValue<idx_t>.
 constexpr uint32_t align_up8(uint32_t n) { return (n + 7u) & ~7u; }
@@ -294,7 +279,11 @@ __device__ __forceinline__ bool parse_dict_header(uint8_t const* base,
          hdr->dict_end <= limit && hdr->bitpacking_width <= MAX_BITPACKING_WIDTH;
 }
 
-/// false on malformed metadata; callers zero-fill.
+/**
+ * @brief Copy FSST header @p hdr into @p base, bounded by the buffer size @p limit.
+ * @return true if the header was successfully copied (i.e. the header fits within the buffer), and
+ * if the header metadata is valid; false otherwise.
+ */
 __device__ __forceinline__ bool parse_fsst_header(uint8_t const* base,
                                                   uint32_t limit,
                                                   fsst_header_t* hdr)
@@ -305,7 +294,7 @@ __device__ __forceinline__ bool parse_fsst_header(uint8_t const* base,
          hdr->bitpacking_width <= MAX_BITPACKING_WIDTH;
 }
 
-//----- Per-codec prepared-data struct types ---------------------------------
+//----- Per-codec prepared-data struct types ---------------------------------//
 // Each codec's prepare_* returns one of these; gpu_decode_strings_column
 // aggregates them across runs before launching kernels.
 
@@ -343,12 +332,18 @@ struct prepared_dict_fsst {
 //   0        20                 ^                                        ^
 //                               hdr.index_buffer_offset                  hdr.dict_end
 //
-// Index 0 is reserved for NULL (decoded length 0). Length(i) =
-// idx_buf[i] - idx_buf[i-1]; bytes for entry i live in
-// `[dict_end - idx_buf[i], dict_end - idx_buf[i-1])`.
+// Index 0 is reserved for NULL (decoded length 0).
+// Length(i) = idx_buf[i] - idx_buf[i-1].
+// Bytes for entry i live in `[dict_end - idx_buf[i], dict_end - idx_buf[i-1])`.
 // One CTA per chunk, grid-stride within the chunk.
 //===----------------------------------------------------------------------===//
 
+/**
+ * @brief Compute decoded string lengths for a DICTIONARY segment.
+ *
+ * Walks the selection buffer to get dictionary indices, looks up lengths from the index buffer, and
+ * writes per-row lengths to d_lengths.
+ */
 __global__ void kernel_compute_lengths_dict(string_chunk_desc const* __restrict__ descs,
                                             uint32_t* __restrict__ d_lengths,
                                             uint32_t num_chunks)
@@ -383,6 +378,13 @@ __global__ void kernel_compute_lengths_dict(string_chunk_desc const* __restrict_
   }
 }
 
+/**
+ * @brief Gather DICTIONARY segment strings to the output chars buffer.
+ *
+ * Walk the selection buffer to get dict indices, look up offsets from the index buffer, then copy
+ * from the dict bytes to the output chars buffer at positions from d_offsets.
+ * Work granularity is one thread per row.
+ */
 __global__ void kernel_gather_dict(string_chunk_desc const* __restrict__ descs,
                                    int32_t const* __restrict__ d_offsets,
                                    uint8_t* __restrict__ d_chars,
@@ -397,8 +399,6 @@ __global__ void kernel_gather_dict(string_chunk_desc const* __restrict__ descs,
   __shared__ dict_header_t sm_hdr;
   if (threadIdx.x == 0) { sm_ok = parse_dict_header(segment_base, desc.bytes_size, &sm_hdr); }
   __syncthreads();
-  // Pass 1 already zero-filled lengths on malformed metadata — d_offsets[i+1]
-  // == d_offsets[i] for those rows, so nothing to write here.
   if (!sm_ok) return;
 
   auto const* d_sel = reinterpret_cast<uint32_t const*>(segment_base + sizeof(dict_header_t));
@@ -406,64 +406,68 @@ __global__ void kernel_gather_dict(string_chunk_desc const* __restrict__ descs,
   auto const* dict_end = segment_base + sm_hdr.dict_end;
 
   for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
-    uint32_t seg_i = desc.seg_row_start + i;
-    uint32_t sel   = unpack_value<uint32_t>(d_sel, seg_i, sm_hdr.bitpacking_width);
+    auto const segment_idx = desc.seg_row_start + i;
+    auto const sel         = unpack_value<uint32_t>(d_sel, segment_idx, sm_hdr.bitpacking_width);
     if (sel == 0) continue;
-    uint32_t end_off   = d_idx[sel];
-    uint32_t str_len   = end_off - d_idx[sel - 1];
-    int32_t out_pos    = d_offsets[desc.global_row_start + i];
-    uint8_t const* src = dict_end - end_off;
+    auto const end_off = d_idx[sel];
+    auto const str_len = end_off - d_idx[sel - 1];
+    auto const out_pos = d_offsets[desc.global_row_start + i];
+    auto const* src    = dict_end - end_off;
     memcpy(d_chars + out_pos, src, str_len);
   }
 }
 
-/// Warp-cooperative DICTIONARY gather: 1 warp per row, stride-4 byte copy.
-/// See DICT_WARP_COOP_MIN_LEN for when this kernel is selected.
+/**
+ * @brief Gather DICTIONARY segment strings to the output chars buffer.
+ *
+ * Similar to kernel_gather_dict but with warp-cooperative copying for long strings.
+ */
 __global__ void kernel_gather_dict_warp(string_chunk_desc const* __restrict__ descs,
                                         int32_t const* __restrict__ d_offsets,
                                         uint8_t* __restrict__ d_chars,
                                         uint32_t num_chunks)
 {
-  uint32_t cid = blockIdx.x;
-  if (cid >= num_chunks) return;
-  auto const desc             = descs[cid];
+  auto const chunk_id = blockIdx.x;
+  if (chunk_id >= num_chunks) return;
+  auto const desc             = descs[chunk_id];
   uint8_t const* segment_base = desc.d_bytes;
 
-  __shared__ uint8_t sm_ok;
+  __shared__ bool sm_ok;
   __shared__ dict_header_t sm_hdr;
-  if (threadIdx.x == 0)
-    sm_ok = parse_dict_header(segment_base, desc.bytes_size, &sm_hdr) ? 1 : 0;
+  if (threadIdx.x == 0) { sm_ok = parse_dict_header(segment_base, desc.bytes_size, &sm_hdr); }
   __syncthreads();
   if (!sm_ok) return;
 
-  uint32_t const* d_sel = reinterpret_cast<uint32_t const*>(segment_base + sizeof(dict_header_t));
-  uint32_t const* d_idx =
-    reinterpret_cast<uint32_t const*>(segment_base + sm_hdr.index_buffer_offset);
-  uint8_t const* dict_end = segment_base + sm_hdr.dict_end;
+  auto const* d_sel = reinterpret_cast<uint32_t const*>(segment_base + sizeof(dict_header_t));
+  auto const* d_idx = reinterpret_cast<uint32_t const*>(segment_base + sm_hdr.index_buffer_offset);
+  auto const* dict_end = segment_base + sm_hdr.dict_end;
 
-  uint32_t const lane          = threadIdx.x & (WARP_THREADS - 1u);
+  uint32_t const lane          = threadIdx.x % WARP_THREADS;
   uint32_t const warp_id       = threadIdx.x / WARP_THREADS;
   uint32_t const warps_per_cta = blockDim.x / WARP_THREADS;
 
   for (uint32_t i = warp_id; i < desc.row_count; i += warps_per_cta) {
-    uint32_t seg_i = desc.seg_row_start + i;
-    uint32_t sel   = unpack_value<uint32_t>(d_sel, seg_i, sm_hdr.bitpacking_width);
+    auto const segment_idx = desc.seg_row_start + i;
+    auto const sel         = unpack_value<uint32_t>(d_sel, segment_idx, sm_hdr.bitpacking_width);
     if (sel == 0) continue;
-    uint32_t end_off   = d_idx[sel];
-    uint32_t str_len   = end_off - d_idx[sel - 1];
-    uint32_t op        = static_cast<uint32_t>(d_offsets[desc.global_row_start + i]);
-    uint8_t const* src = dict_end - end_off;
+    auto const end_off    = d_idx[sel];
+    auto const str_len    = end_off - d_idx[sel - 1];
+    auto const offset_ptr = static_cast<uint32_t>(d_offsets[desc.global_row_start + i]);
+    auto const* src       = dict_end - end_off;
 
-    uint32_t n4 = str_len & ~3u;
-    uint32_t k  = lane * 4u;
-    while (k < n4) {
+    // Try to concentrate stores in 4B/word.
+    constexpr uint32_t WORD_BYTES = 4;
+    auto const n_full_words       = str_len / WORD_BYTES;
+    auto word_id                  = lane;  // word index, stride = WARP_THREADS
+    while (word_id < n_full_words) {
       uint32_t v;
-      memcpy(&v, src + k, 4);
-      memcpy(d_chars + op + k, &v, 4);
-      k += WARP_BULK_STRIDE_BYTES;
+      memcpy(&v, src + word_id * WORD_BYTES, WORD_BYTES);
+      memcpy(d_chars + offset_ptr + word_id * WORD_BYTES, &v, WORD_BYTES);
+      word_id += WARP_THREADS;
     }
-    for (uint32_t t = n4 + lane; t < str_len; t += WARP_THREADS) {
-      d_chars[op + t] = src[t];
+    // Trailing bytes
+    for (uint32_t t = n_full_words * WORD_BYTES + lane; t < str_len; t += WARP_THREADS) {
+      d_chars[offset_ptr + t] = src[t];
     }
   }
 }
@@ -610,9 +614,12 @@ __global__ __launch_bounds__(BLOCK_DIM, 4) void kernel_build_fsst_decoders(
 
 //----- Pass 1 (A+B): per-row compressed-byte offsets ------------------------
 
-/// Compute the per-row offsets into the FSST compressed byte stream for an
-/// FSST segment. One CTA per segment; in-CTA cub::BlockScan over per-thread
-/// chunk sums produces the inclusive prefix sum the gather kernel reads.
+/**
+ * @brief Compute the per-row offsets into the FSST compressed byte stream for an FSST segment.
+ *
+ * One CTA per segment; in-CTA cub::BlockScan over per-thread chunk sums produces the inclusive
+ * prefix sum the gather kernel reads.
+ */
 __global__ void kernel_compute_compressed_offsets_fsst(
   uint32_t* __restrict__ d_comp_offsets,
   string_chunk_desc const* __restrict__ descs,
@@ -673,10 +680,11 @@ __global__ void kernel_compute_compressed_offsets_fsst(
 
 //----- Pass 1 (C): per-row decompressed lengths -----------------------------
 
-/// One warp cooperatively walks `comp_len` bytes of one row's compressed
-/// stream, returning the row's total decoded-byte count. Per-lane
-/// contribution is the symbol length looked up from `sm_len`, with the
-/// escape-sentinel/literal pair handled via a shfl_up of `is_esc`.
+/**
+ * @brief Compute the compressed length of a row in the FSST compressed stream, where @p comp_ptr
+ * points to the start of the compressed bytes for that row, and @p sm_len is the symbol length
+ * table from the FSST header.
+ */
 __device__ __forceinline__ uint32_t warp_compute_decomp_len(uint8_t const* __restrict__ comp_ptr,
                                                             uint32_t comp_len,
                                                             uint8_t const* __restrict__ sm_len,
@@ -719,10 +727,13 @@ __device__ __forceinline__ uint32_t warp_compute_decomp_len(uint8_t const* __res
   return total;
 }
 
-/// Compute the decompressed length per row. Adaptive per CTA: thread-per-row
-/// for short rows (lower warp-coord tax dominates), warp-per-row for longer
-/// rows (coalesced LDG dominates). 2 × WARP_THREADS = 64 B / row crossover
-/// matches the empirical sweet spot.
+/**
+ * @brief Compute the decompressed lengths for each row in the FSST compressed stream.
+ *
+ * Adaptive per CTA: thread-per-row for short rows (lower warp-coord tax dominates), warp-per-row
+ * for longer rows (coalesced LDG dominates). 2 × WARP_THREADS = 64 B / row crossover matches the
+ * empirical sweet spot.
+ */
 __global__ __launch_bounds__(BLOCK_DIM, 8) void kernel_compute_decompressed_lengths_fsst(
   fsst_chunk_desc const* __restrict__ descs,
   uint32_t* __restrict__ d_lengths,
@@ -816,9 +827,11 @@ constexpr uint32_t FSST_MAX_CHUNK_EMIT =
   WARP_THREADS * 8;  ///< worst-case bytes emitted per 32B input chunk (8B max symbol)
 constexpr uint32_t FSST_WARPS_PER_CTA = BLOCK_DIM / WARP_THREADS;
 
-/// Drain the per-warp scratch buffer to global memory, with warp lanes
-/// cooperating in stride-4 chunks plus a per-byte cleanup for the trailing
-/// 0–3 bytes. Used by both the lazy-flush path and the end-of-row drain.
+/**
+ * @brief Drain the per-warp scratch buffer to global memory, with warp lanes cooperating in
+ * stride-4 chunks plus a per-byte cleanup for the last <4 bytes. Used in both the lazy-flush path
+ * when scratch is full and the final drain at the end of a chunk.
+ */
 __device__ __forceinline__ void warp_drain_scratch(uint8_t* __restrict__ dst,
                                                    uint32_t const* __restrict__ scratch_u32,
                                                    uint8_t const* __restrict__ scratch_u8,
@@ -838,17 +851,19 @@ __device__ __forceinline__ void warp_drain_scratch(uint8_t* __restrict__ dst,
   }
 }
 
-/// One warp decodes `comp_len` compressed bytes in 32-byte input chunks.
-/// Decoded symbols accumulate in a per-warp scratch slab; we flush to `dst`
-/// only when the next chunk's worst-case emit (256 B) would overflow scratch,
-/// or once at the end of the row. Multiple chunks share one __syncwarp() pair
-/// vs the old per-chunk drain. Direct lane-to-global stores were measured
-/// 30-68 % slower than the shmem-staged drain (small byte stores generated
-/// many partial L2 sectors).
-///
-/// `sm_sym` is split lo/hi so the common short-symbol load is one 4 B read on
-/// bank `c & 31` instead of straddling two banks; `sm_sym_hi` is only read
-/// when len[code] > 4. Reused by DICT_FSST mode-2 inline decompress.
+/**
+ * @brief Decode a chunk of compressed bytes using the FSST algorithm.
+ *
+ * One warp decodes `comp_len` compressed bytes in 32-byte input chunks. Decoded symbols accumulate
+ * in a per-warp scratch slab; we flush to `dst` only when the next chunk's worst-case emit (256 B)
+ * would overflow scratch, or once at the end of the row.
+ * `sm_sym` is split lo/hi so the common short-symbol load is one 4 B bank read.
+ * `sm_sym_hi` is only read when len[code] > 4.
+ *
+ * @note Reused by DICT_FSST mode-2 inline decompress.
+ * @note Direct lane-to-global stores were measured 30-68 % slower than the shmem-staged drain
+ * (small byte stores generated many partial L2 sectors).
+ */
 __device__ __forceinline__ void warp_decode_fsst(uint8_t const* __restrict__ comp_ptr,
                                                  uint32_t comp_len,
                                                  uint8_t* __restrict__ dst,
@@ -942,10 +957,11 @@ __device__ __forceinline__ void warp_decode_fsst(uint8_t const* __restrict__ com
   }
 }
 
-/// Gather kernel for FSST-compressed segments, with the same chunking as
-/// phase-C. Each warp walks the compressed byte stream for its row, decodes
-/// on the fly into a per-warp scratch buffer, and flushes to global when the
-/// next chunk's worst-case emit would overflow scratch.
+/**
+ * @brief Gather kernel for FSST-compressed segments, with the same chunking as phase-C. Each warp
+ * walks the compressed byte stream for its row, decodes on the fly into a per-warp scratch buffer,
+ * and flushes to global when the next chunk's worst-case emit would overflow scratch.
+ */
 __global__ __launch_bounds__(BLOCK_DIM, 8) void kernel_gather_fsst_chunked(
   fsst_chunk_desc const* __restrict__ descs,
   int32_t const* __restrict__ d_offsets,
