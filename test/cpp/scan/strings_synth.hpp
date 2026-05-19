@@ -126,6 +126,41 @@ inline std::vector<uint8_t> make_dict_segment(std::vector<std::string> const& di
   return bytes;
 }
 
+/// UNCOMPRESSED varchar segment. Layout:
+///   [dict_size:4] [dict_end:4] [offsets:4*N] [chars]
+/// offsets[i] is positive cumulative byte length through row i, and the chars
+/// region grows backward from dict_end so row i starts at `dict_end - offsets[i]`.
+inline std::vector<uint8_t> make_uncompressed_segment(std::vector<std::string> const& strings)
+{
+  uint32_t const row_count = static_cast<uint32_t>(strings.size());
+
+  std::vector<int32_t> offsets(row_count);
+  uint32_t cum = 0;
+  for (uint32_t i = 0; i < row_count; ++i) {
+    cum += static_cast<uint32_t>(strings[i].size());
+    offsets[i] = static_cast<int32_t>(cum);
+  }
+  uint32_t const total_chars  = cum;
+  uint32_t const header_size  = 8;
+  uint32_t const offsets_size = row_count * 4;
+  uint32_t const total        = header_size + offsets_size + total_chars;
+  uint32_t const dict_end     = total;
+  uint32_t const dict_size    = 0;  // unused by the UNCOMPRESSED varchar decoder
+
+  std::vector<uint8_t> bytes(total, 0);
+  std::memcpy(bytes.data(), &dict_size, 4);
+  std::memcpy(bytes.data() + 4, &dict_end, 4);
+  if (offsets_size > 0) { std::memcpy(bytes.data() + 8, offsets.data(), offsets_size); }
+  for (uint32_t i = 0; i < row_count; ++i) {
+    uint32_t length = static_cast<uint32_t>(strings[i].size());
+    if (length > 0) {
+      std::memcpy(
+        bytes.data() + dict_end - static_cast<uint32_t>(offsets[i]), strings[i].data(), length);
+    }
+  }
+  return bytes;
+}
+
 // dbgen-style grammar — produces TPC-H-shaped comments (5-150B, high common-
 // word repetition) so FSST microbenches see realistic symbol-table coverage.
 

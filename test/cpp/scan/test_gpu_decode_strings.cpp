@@ -50,6 +50,7 @@ using sirius::test::decode::download;
 using sirius::test::decode::strings::make_dict_fsst_segment;
 using sirius::test::decode::strings::make_dict_segment;
 using sirius::test::decode::strings::make_fsst_segment;
+using sirius::test::decode::strings::make_uncompressed_segment;
 
 namespace {
 
@@ -131,9 +132,9 @@ std::vector<std::string> decode_one_segment(std::vector<uint8_t> const& bytes,
   return out;
 }
 
-/// Pre-fill the chars buffer with a 0xCC canary, run a malformed segment
-/// through the orchestrator, return decoded chars. Caller asserts every
-/// canary byte was overwritten to 0 (or the row was emitted as empty).
+/// Run a malformed segment through the orchestrator and return the decoded
+/// strings. Caller asserts every row is empty — the malformed-header path
+/// zero-fills lengths so no chars are emitted.
 std::vector<std::string> decode_invalid_with_canary(std::vector<uint8_t> const& bytes,
                                                     duckdb::CompressionType codec,
                                                     uint32_t row_count)
@@ -172,6 +173,77 @@ std::vector<std::string> decode_invalid_with_canary(std::vector<uint8_t> const& 
 }
 
 }  // namespace
+
+// --- UNCOMPRESSED happy path ---
+
+TEST_CASE("gpu_decode_strings UNCOMPRESSED - all empty strings",
+          "[scan][decode][strings][uncompressed]")
+{
+  std::vector<std::string> rows(8, "");
+  auto bytes = make_uncompressed_segment(rows);
+  auto out   = decode_one_segment(bytes,
+                                CompressionType::COMPRESSION_UNCOMPRESSED,
+                                static_cast<uint32_t>(rows.size()),
+                                /*max_len=*/4u);
+  REQUIRE(out.size() == rows.size());
+  for (auto const& s : out)
+    REQUIRE(s.empty());
+}
+
+TEST_CASE("gpu_decode_strings UNCOMPRESSED - varied lengths including empty",
+          "[scan][decode][strings][uncompressed]")
+{
+  std::vector<std::string> rows = {"", "x", "", "abcd", "longer-string-here", "", "z"};
+  auto bytes                    = make_uncompressed_segment(rows);
+  auto out                      = decode_one_segment(bytes,
+                                CompressionType::COMPRESSION_UNCOMPRESSED,
+                                static_cast<uint32_t>(rows.size()),
+                                /*max_len=*/32u);
+  REQUIRE(out.size() == rows.size());
+  for (size_t i = 0; i < rows.size(); ++i) {
+    REQUIRE(out[i] == rows[i]);
+  }
+}
+
+TEST_CASE("gpu_decode_strings UNCOMPRESSED - many rows across multiple CTAs",
+          "[scan][decode][strings][uncompressed]")
+{
+  // 4096 rows exercises multi-CTA dispatch + cumulative offset growth.
+  std::vector<std::string> rows;
+  rows.reserve(4096);
+  for (uint32_t i = 0; i < 4096; ++i) {
+    rows.push_back("row_" + std::to_string(i));
+  }
+  auto bytes = make_uncompressed_segment(rows);
+  auto out   = decode_one_segment(bytes,
+                                CompressionType::COMPRESSION_UNCOMPRESSED,
+                                static_cast<uint32_t>(rows.size()),
+                                /*max_len=*/16u);
+  REQUIRE(out.size() == rows.size());
+  for (size_t i = 0; i < rows.size(); ++i) {
+    REQUIRE(out[i] == rows[i]);
+  }
+}
+
+// --- UNCOMPRESSED defensive path ---
+
+TEST_CASE("gpu_decode_strings UNCOMPRESSED - segment_size below header zero-fills",
+          "[scan][decode][strings][uncompressed][defensive]")
+{
+  // Build a valid segment then truncate below the [dict_size:4][dict_end:4] + offsets
+  // region. The kernel's bounds check (`limit >= 8u + end_row * 4u`) should
+  // detect this and zero-fill all lengths.
+  std::vector<std::string> rows = {"abc", "defg", "hi"};
+  auto bytes                    = make_uncompressed_segment(rows);
+  bytes.resize(8);  // header only; offsets array missing
+  auto out = decode_one_segment(bytes,
+                                CompressionType::COMPRESSION_UNCOMPRESSED,
+                                static_cast<uint32_t>(rows.size()),
+                                /*max_len=*/8u);
+  REQUIRE(out.size() == rows.size());
+  for (auto const& s : out)
+    REQUIRE(s.empty());
+}
 
 // --- DICTIONARY happy path ---
 

@@ -15,6 +15,7 @@
  */
 
 #include "cuda/scan/gpu_decode_strings.cuh"
+#include "cuda/scan/unpack_value.cuh"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -237,46 +238,6 @@ std::vector<Desc> expand_chunks(std::vector<Desc> const& descs, uint32_t target_
   return out;
 }
 
-/// Bit-packed value reader. DuckDB's BitpackingPrimitives uses 32-element
-/// bit-dense groups on 32-bit boundaries; an 8-byte straddling load is still
-/// safe for widths ≤ 32. For T larger than 4 bytes we may need a third word.
-/// TODO: Refactor into common decoder utilities (see issue #781)
-template <typename T>
-__device__ __forceinline__ T unpack_value(uint32_t const* packed, uint32_t idx, uint32_t width)
-{
-  if (width == 0) return T(0);
-  uint64_t bit_pos  = static_cast<uint64_t>(idx) * width;
-  uint32_t word_idx = static_cast<uint32_t>(bit_pos / 32);
-  uint32_t bit_off  = static_cast<uint32_t>(bit_pos & 31);
-  uint64_t combined = static_cast<uint64_t>(packed[word_idx]);
-  if (bit_off + width > 32) { combined |= static_cast<uint64_t>(packed[word_idx + 1]) << 32; }
-  uint64_t result = combined >> bit_off;
-  if constexpr (sizeof(T) > 4) {
-    if (bit_off > 0 && bit_off + width > 64) {
-      result |= static_cast<uint64_t>(packed[word_idx + 2]) << (64 - bit_off);
-    }
-  }
-  uint64_t mask = (width >= 64) ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
-  return static_cast<T>(result & mask);
-}
-
-/**
- * @brief Extracts @p width bit value at logical index @p idx from a byte-aligned bitpacked stream
- * @p packed.
- */
-template <typename T>
-T host_unpack_bitpacked(uint8_t const* packed, uint32_t idx, uint32_t width)
-{
-  if (width == 0) return T(0);
-  auto const bit_pos  = static_cast<uint64_t>(idx) * width;
-  auto const byte_off = static_cast<uint32_t>(bit_pos / CHAR_BIT);
-  auto const bit_off  = static_cast<uint32_t>(bit_pos % CHAR_BIT);
-  uint64_t combined;
-  std::memcpy(&combined, packed + byte_off, sizeof(uint64_t));
-  uint64_t mask = (width >= 64) ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
-  return static_cast<T>((combined >> bit_off) & mask);
-}
-
 /**
  * @brief Parse DICTIONARY header @p hdr from @p base, bounded by the buffer size @p limit.
  * @return true if the header was successfully parsed (i.e. the header fits within the buffer), and
@@ -311,6 +272,10 @@ __device__ __forceinline__ bool parse_fsst_header(uint8_t const* base,
 // Each codec's prepare_* returns one of these; gpu_decode_strings_column
 // aggregates them across runs before launching kernels.
 
+struct prepared_uncomp {
+  std::vector<string_chunk_desc> descs;
+};
+
 struct prepared_dict {
   std::vector<string_chunk_desc> descs_short;  ///< max_string_length < DICT_WARP_COOP_MIN_LEN
   std::vector<string_chunk_desc> descs_long;   ///< max_string_length >= DICT_WARP_COOP_MIN_LEN
@@ -334,7 +299,123 @@ struct prepared_dict_fsst {
 };
 
 //===----------------------------------------------------------------------===//
-// 2. DICTIONARY codec
+// 2. UNCOMPRESSED codec
+//
+//   offset 0                                                       seg_end
+//   +-----------+----------+----------------------+---------------------+
+//   | dict_size | dict_end |       offsets        |        chars        |
+//   |    4B     |    4B    |  int32 × end_row     |  grows BACKWARD     |
+//   |  (unused) |          |  backward-cumul      |  from dict_end      |
+//   +-----------+----------+----------------------+---------------------+
+//   0           4          8                      ^                     ^
+//                                                  8 + 4*end_row        dict_end
+//
+// offsets[i] is signed int32; sign bit is DuckDB's inline-vs-pointer flag
+// for in-memory string_t slots and is irrelevant on disk — take abs() for
+// length math. Row i lives in `[dict_end - |offsets[i]|, dict_end - |offsets[i-1]|)`.
+// One CTA per chunk, grid-stride within the chunk.
+//===----------------------------------------------------------------------===//
+
+/**
+ * @brief Compute decoded string lengths for an UNCOMPRESSED varchar segment.
+ *
+ * Lengths come from successive differences of the backward-cumulative offsets
+ * array. If the segment is too short to contain the offsets region the kernel
+ * zero-fills.
+ */
+__global__ void kernel_compute_lengths_uncomp(string_chunk_desc const* __restrict__ descs,
+                                              uint32_t* __restrict__ d_lengths,
+                                              uint32_t num_chunks)
+{
+  auto const chunk_id = blockIdx.x;
+  if (chunk_id >= num_chunks) return;
+  auto const desc      = descs[chunk_id];
+  auto const* base     = desc.d_bytes;
+  auto const limit     = desc.bytes_size;
+  auto const end_row   = desc.seg_row_start + desc.row_count;
+
+  __shared__ bool sm_ok;
+  if (threadIdx.x == 0) { sm_ok = (limit >= 8u + size_t{end_row} * 4u); }
+  __syncthreads();
+  if (!sm_ok) {
+    for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
+      d_lengths[desc.global_row_start + i] = 0u;
+    }
+    return;
+  }
+
+  auto const* duck_offsets = reinterpret_cast<int32_t const*>(base + 8);
+  for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
+    auto const seg_i = desc.seg_row_start + i;
+    auto const cur   = duck_offsets[seg_i];
+    auto const prev  = (seg_i > 0) ? duck_offsets[seg_i - 1] : 0;
+    auto const abs_cur  = static_cast<uint32_t>(cur >= 0 ? cur : -cur);
+    auto const abs_prev = static_cast<uint32_t>(prev >= 0 ? prev : -prev);
+    d_lengths[desc.global_row_start + i] = abs_cur - abs_prev;
+  }
+}
+
+/**
+ * @brief Gather UNCOMPRESSED segment strings to the output chars buffer.
+ *
+ * Chars region grows backward from `dict_end`, so row i starts at
+ * `dict_end - |offsets[i]|`. Work granularity is one thread per row.
+ */
+__global__ void kernel_gather_uncomp(string_chunk_desc const* __restrict__ descs,
+                                     int32_t const* __restrict__ d_offsets,
+                                     uint8_t* __restrict__ d_chars,
+                                     uint32_t num_chunks)
+{
+  auto const chunk_id = blockIdx.x;
+  if (chunk_id >= num_chunks) return;
+  auto const desc    = descs[chunk_id];
+  auto const* base   = desc.d_bytes;
+  auto const limit   = desc.bytes_size;
+  auto const end_row = desc.seg_row_start + desc.row_count;
+
+  __shared__ bool sm_ok;
+  __shared__ uint32_t sm_dict_end;
+  if (threadIdx.x == 0) {
+    sm_ok = (limit >= 8u + size_t{end_row} * 4u);
+    if (sm_ok) { memcpy(&sm_dict_end, base + 4, sizeof(sm_dict_end)); }
+  }
+  __syncthreads();
+  if (!sm_ok) return;
+
+  auto const* duck_offsets = reinterpret_cast<int32_t const*>(base + 8);
+  auto const* dict_end     = base + sm_dict_end;
+
+  for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
+    auto const seg_i    = desc.seg_row_start + i;
+    auto const cur      = duck_offsets[seg_i];
+    auto const prev     = (seg_i > 0) ? duck_offsets[seg_i - 1] : 0;
+    auto const abs_cur  = static_cast<uint32_t>(cur >= 0 ? cur : -cur);
+    auto const abs_prev = static_cast<uint32_t>(prev >= 0 ? prev : -prev);
+    auto const str_len  = abs_cur - abs_prev;
+
+    auto const out_pos = d_offsets[desc.global_row_start + i];
+    auto const* src    = dict_end - abs_cur;
+    memcpy(d_chars + out_pos, src, str_len);
+  }
+}
+
+/**
+ * @brief Build per-segment descriptors for an UNCOMPRESSED varchar codec run.
+ */
+prepared_uncomp prepare_uncomp(gpu_string_codec_run const& run)
+{
+  prepared_uncomp out;
+  out.descs.reserve(run.segments.size());
+  for (auto const& seg : run.segments) {
+    if (seg.row_count == 0) continue;
+    out.descs.push_back(
+      {seg.d_bytes, seg.bytes_size, seg.row_count, seg.row_offset, seg.seg_row_start});
+  }
+  return out;
+}
+
+//===----------------------------------------------------------------------===//
+// 3. DICTIONARY codec
 //
 //   offset 0                                                      seg_end
 //   +--------+------------------+------------------+---------------------+
@@ -386,7 +467,8 @@ __global__ void kernel_compute_lengths_dict(string_chunk_desc const* __restrict_
   for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
     auto const segment_idx = desc.seg_row_start + i;
     auto const sel         = unpack_value<uint32_t>(d_sel, segment_idx, sm_hdr.bitpacking_width);
-    auto const len         = (sel == 0) ? 0 : (d_idx[sel] - d_idx[sel - 1]);
+    uint32_t len           = 0u;
+    if (sel != 0u && sel < sm_hdr.index_buffer_count) { len = d_idx[sel] - d_idx[sel - 1]; }
     d_lengths[desc.global_row_start + i] = len;
   }
 }
@@ -504,7 +586,7 @@ prepared_dict prepare_dict(gpu_string_codec_run const& run)
 }
 
 //===----------------------------------------------------------------------===//
-// 3. FSST codec
+// 4. FSST codec
 //
 //   offset 0                                                       seg_end
 //   +--------+--------------------+---------------+------------------------+
@@ -798,7 +880,11 @@ __global__ __launch_bounds__(BLOCK_DIM, 8) void kernel_compute_decompressed_leng
     for (uint32_t i = warp_id; i < desc.row_count; i += warps_per_cta) {
       auto const cumsum      = compressed_cumsum_ptr[i];
       auto const prev_cumsum = (i > 0) ? compressed_cumsum_ptr[i - 1] : start;
-      auto const comp_len    = cumsum - prev_cumsum;
+      if (cumsum > sm_hdr.dict_end || prev_cumsum > cumsum) {
+        if (lane == 0) { d_lengths[desc.global_row_start + i] = 0u; }
+        continue;
+      }
+      auto const comp_len = cumsum - prev_cumsum;
       if (comp_len == 0) {
         if (lane == 0) { d_lengths[desc.global_row_start + i] = 0; }
         continue;
@@ -812,7 +898,11 @@ __global__ __launch_bounds__(BLOCK_DIM, 8) void kernel_compute_decompressed_leng
     for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
       auto const cumsum      = compressed_cumsum_ptr[i];
       auto const prev_cumsum = (i > 0) ? compressed_cumsum_ptr[i - 1] : start;
-      auto const comp_len    = cumsum - prev_cumsum;
+      if (cumsum > sm_hdr.dict_end || prev_cumsum > cumsum) {
+        d_lengths[desc.global_row_start + i] = 0u;
+        continue;
+      }
+      auto const comp_len = cumsum - prev_cumsum;
       if (comp_len == 0) {
         d_lengths[desc.global_row_start + i] = 0u;
         continue;
@@ -824,7 +914,8 @@ __global__ __launch_bounds__(BLOCK_DIM, 8) void kernel_compute_decompressed_leng
         auto const code = comp_ptr[pos++];
         if (code < FSST_ESC) {
           decomp_len += sm_len[code];
-        } else {
+        } else if (pos < comp_len) {
+          // Trailing escape (corrupt input) is dropped — stay in sync with gather.
           ++pos;
           ++decomp_len;
         }
@@ -1110,7 +1201,7 @@ prepared_fsst prepare_fsst(gpu_string_codec_run const& run)
 }
 
 //===----------------------------------------------------------------------===//
-// 4. DICT_FSST codec
+// 5. DICT_FSST codec
 //
 //   +-----+------------+--------+----------------+--------------------+
 //   | hdr | dict bytes | symtab | string_lengths |    dict_indices    |
@@ -1343,7 +1434,8 @@ __global__ void kernel_compute_lengths_dict_fsst(dict_fsst_desc const* __restric
     uint32_t seg_i = desc.seg_row_start + i;
     uint32_t idx =
       fsst_only ? (seg_i + 1u) : unpack_value<uint32_t>(d_idx, seg_i, desc.dict_indices_width);
-    uint32_t len                         = (idx == 0u) ? 0u : (dec_off[idx + 1] - dec_off[idx]);
+    uint32_t len = 0u;
+    if (idx != 0u && idx < desc.dict_count) { len = dec_off[idx + 1] - dec_off[idx]; }
     d_lengths[desc.global_row_start + i] = len;
   }
 }
@@ -1402,7 +1494,7 @@ __global__ void kernel_predecode_dict_fsst(dict_fsst_desc const* __restrict__ de
           default: memcpy(out_ptr + op, &sym, sym_len); break;
         }
         op += sym_len;
-      } else {
+      } else if (pos < comp_len) {
         out_ptr[op++] = comp_ptr[pos++];
       }
     }
@@ -1780,7 +1872,7 @@ prepared_dict_fsst prepare_dict_fsst(gpu_string_codec_run const& run,
 }
 
 //===----------------------------------------------------------------------===//
-// 5. Orchestrator
+// 6. Orchestrator
 //
 // `gpu_decode_strings_column` aggregates per-codec `prepared_*` state across
 // all runs in a column, uploads descriptors, dispatches the codec kernels in
@@ -1828,6 +1920,7 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
                              std::to_string(total_rows) + ") > cudf::size_type max");
   }
 
+  prepared_uncomp prep_uncomp;
   prepared_dict prep_dict;
   prepared_fsst prep_fsst;
   prepared_dict_fsst prep_dict_fsst;
@@ -1889,12 +1982,9 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
         break;
       }
       case duckdb::CompressionType::COMPRESSION_UNCOMPRESSED: {
-        // Legacy `decode_string_column_batched` handles this codec — reaching
-        // here means upstream viability check let one through.
-        throw std::runtime_error(
-          "gpu_decode_strings_column: UNCOMPRESSED varchar codec "
-          "should route to the legacy varchar path; "
-          "upstream viability check missed it");
+        auto p = prepare_uncomp(run);
+        prep_uncomp.descs.insert(prep_uncomp.descs.end(), p.descs.begin(), p.descs.end());
+        break;
       }
       default:
         throw std::runtime_error(
@@ -1920,6 +2010,7 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
   // Per-row kernels take chunked descriptors; predecode + mark_nulls stay
   // per-segment via prep_dict_fsst.descs.
   auto const target_ctas       = get_target_ctas();
+  auto const uncomp_chunks     = expand_chunks(prep_uncomp.descs, target_ctas);
   auto const dict_chunks_short = expand_chunks(prep_dict.descs_short, target_ctas);
   auto const dict_chunks_long  = expand_chunks(prep_dict.descs_long, target_ctas);
   auto const dict_fsst_chunks  = expand_chunks(prep_dict_fsst.descs, target_ctas);
@@ -1931,6 +2022,8 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
     }
     return buf;
   };
+  rmm::device_buffer d_uncomp_chunks_buf =
+    upload(uncomp_chunks.data(), uncomp_chunks.size() * sizeof(string_chunk_desc));
   rmm::device_buffer d_dict_short_buf =
     upload(dict_chunks_short.data(), dict_chunks_short.size() * sizeof(string_chunk_desc));
   rmm::device_buffer d_dict_long_buf =
@@ -1959,6 +2052,7 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
   RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));
 
   auto* d_comp_offsets_p     = static_cast<uint32_t*>(d_comp_offsets.data());
+  auto* d_uncomp_chunks_p    = static_cast<string_chunk_desc*>(d_uncomp_chunks_buf.data());
   auto* d_dict_short_p       = static_cast<string_chunk_desc*>(d_dict_short_buf.data());
   auto* d_dict_long_p        = static_cast<string_chunk_desc*>(d_dict_long_buf.data());
   auto* d_fsst_lengths_p     = static_cast<string_chunk_desc*>(d_fsst_lengths_buf.data());
@@ -1972,6 +2066,13 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
   auto* d_decoded_off_p      = static_cast<uint32_t*>(d_decoded_offsets_buf.data());
 
   // Pass 1: lengths. Same kernel for short/long DICTIONARY — only gather forks.
+  if (!uncomp_chunks.empty()) {
+    kernel_compute_lengths_uncomp<<<static_cast<uint32_t>(uncomp_chunks.size()),
+                                    BLOCK_DIM,
+                                    0,
+                                    stream.value()>>>(
+      d_uncomp_chunks_p, d_lengths.data(), static_cast<uint32_t>(uncomp_chunks.size()));
+  }
   if (!dict_chunks_short.empty()) {
     kernel_compute_lengths_dict<<<static_cast<uint32_t>(dict_chunks_short.size()),
                                   BLOCK_DIM,
@@ -2087,6 +2188,15 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
   auto* d_chars_p = static_cast<uint8_t*>(d_chars.data());
 
   // Pass 2: gather. See DICT_WARP_COOP_MIN_LEN for the partition rationale.
+  if (!uncomp_chunks.empty()) {
+    kernel_gather_uncomp<<<static_cast<uint32_t>(uncomp_chunks.size()),
+                           BLOCK_DIM,
+                           0,
+                           stream.value()>>>(d_uncomp_chunks_p,
+                                             d_offsets.data(),
+                                             d_chars_p,
+                                             static_cast<uint32_t>(uncomp_chunks.size()));
+  }
   if (!dict_chunks_short.empty()) {
     kernel_gather_dict<<<static_cast<uint32_t>(dict_chunks_short.size()),
                          BLOCK_DIM,

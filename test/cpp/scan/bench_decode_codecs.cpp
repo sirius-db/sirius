@@ -501,7 +501,7 @@ std::vector<uint8_t> load_fixture_bytes(char const* var_name)
   if (sz <= 0) return {};
   f.seekg(0);
   std::vector<uint8_t> bytes(static_cast<size_t>(sz));
-  f.read(reinterpret_cast<char*>(bytes.data()), sz);
+  f.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(sz));
   return bytes;
 }
 
