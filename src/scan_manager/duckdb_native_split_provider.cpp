@@ -59,7 +59,8 @@ std::vector<duckdb_native_split_provider::row_group_batch> partition_row_groups_
   for (std::size_t c = 0; c < num_cols; ++c) {
     is_varchar[c] = projected_types[c].is_varchar();
   }
-  const bool any_varchar = std::any_of(is_varchar.begin(), is_varchar.end(), [](bool b) { return b; });
+  const bool any_varchar =
+    std::any_of(is_varchar.begin(), is_varchar.end(), [](bool b) { return b; });
 
   // Fast path: no batch-bytes cap AND no varchar columns → single batch.
   if (approximate_batch_size == 0 && !any_varchar) {
@@ -107,7 +108,8 @@ std::vector<duckdb_native_split_provider::row_group_batch> partition_row_groups_
 
     batch_bytes += this_rg_bytes;
     if (any_varchar) {
-      for (std::size_t c = 0; c < num_cols; ++c) col_bytes[c] += this_rg_col_bytes[c];
+      for (std::size_t c = 0; c < num_cols; ++c)
+        col_bytes[c] += this_rg_col_bytes[c];
     }
   }
   if (batch_first < row_groups.size()) {
@@ -118,16 +120,16 @@ std::vector<duckdb_native_split_provider::row_group_batch> partition_row_groups_
 
 }  // namespace
 
-duckdb_native_split_provider::duckdb_native_split_provider(op::scan::duckdb_native_scan_info info)
-  : _scan_info(std::make_shared<op::scan::duckdb_native_scan_info const>(std::move(info)))
+duckdb_native_split_provider::duckdb_native_split_provider(
+  op::scan::duckdb_native_scan_info info, std::shared_ptr<sirius::io::sirius_ioctx> io_ctx)
+  : _scan_info(std::make_shared<op::scan::duckdb_native_scan_info const>(std::move(info))),
+    _io_ctx(std::move(io_ctx))
 {
   if (_scan_info->storage == nullptr) {
-    throw std::invalid_argument(
-      "duckdb_native_split_provider: scan_info.storage must be non-null");
+    throw std::invalid_argument("duckdb_native_split_provider: scan_info.storage must be non-null");
   }
   if (_scan_info->context == nullptr) {
-    throw std::invalid_argument(
-      "duckdb_native_split_provider: scan_info.context must be non-null");
+    throw std::invalid_argument("duckdb_native_split_provider: scan_info.context must be non-null");
   }
   if (_scan_info->projected_cols.size() != _scan_info->projected_types.size()) {
     throw std::invalid_argument(

@@ -28,6 +28,10 @@
 #include <string>
 #include <vector>
 
+namespace sirius::io {
+class sirius_ioctx;
+}  // namespace sirius::io
+
 namespace sirius::scan_manager {
 
 class duckdb_native_split_provider : public split_provider {
@@ -37,7 +41,8 @@ class duckdb_native_split_provider : public split_provider {
     std::shared_ptr<op::scan::duckdb_native_scan_info const> scan_info;
   };
 
-  explicit duckdb_native_split_provider(op::scan::duckdb_native_scan_info info);
+  duckdb_native_split_provider(op::scan::duckdb_native_scan_info info,
+                               std::shared_ptr<sirius::io::sirius_ioctx> io_ctx = nullptr);
 
   ~duckdb_native_split_provider() override;
 
@@ -60,6 +65,11 @@ class duckdb_native_split_provider : public split_provider {
   op::scan::duckdb_native_metadata _metadata;
   std::vector<row_group_batch> _batches;
   std::atomic<std::size_t> _next_batch_idx{0};
+  /// sirius_io substrate handle parked at construction. The provider itself
+  /// does not read from it; the scan task that consumes the split payloads
+  /// uses it to route .db block reads through sirius_ioctx::host_read.
+  /// May be null when the scan_manager runs without sirius_datasource.
+  std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
 };
 
 }  // namespace sirius::scan_manager
