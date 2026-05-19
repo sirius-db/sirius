@@ -113,6 +113,19 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
   try {
     for (auto const& [pinned_name, entry] : _pinned_entries) {
       if (!matches_scan_info(entry)) { continue; }
+      // A partial pin (created with pin_table(..., n_rows=N) where N capped
+      // the captured rows below the full file content) MUST NOT serve cached
+      // reads. The incoming scan_info doesn't carry an n_rows budget — serving
+      // the partial entry would silently return only the pinned prefix and
+      // mask the missing rows. Fall through to the parquet path.
+      if (entry.is_partial) {
+        SIRIUS_LOG_DEBUG(
+          "[sirius_scan_manager::create_provider_for] pinned entry '{}' matches op_id={} but is "
+          "partial (row-count budget at pin time); falling through to parquet_split_provider",
+          pinned_name,
+          op->get_operator_id());
+        break;
+      }
       // Validate the per-chunk memory_space vector before building the
       // cached_split_provider. Empty vector means the pinned entry has no
       // chunks (unusual but legal for empty parquet files); null entries
@@ -301,7 +314,8 @@ void sirius_scan_manager::insert_pinned_entry(
   std::vector<std::string> column_names,
   std::vector<std::string> file_paths,
   std::vector<std::unique_ptr<cudf::table>> data_tables,
-  std::vector<cucascade::memory::memory_space*> chunk_memory_spaces)
+  std::vector<cucascade::memory::memory_space*> chunk_memory_spaces,
+  bool is_partial)
 {
   // chunk_memory_spaces is parallel to data_tables — the caller
   // (PinTableFunction) emits one memory_space* per
@@ -324,7 +338,11 @@ void sirius_scan_manager::insert_pinned_entry(
 
   auto existing_it = _pinned_entries.find(name);
   if (existing_it != _pinned_entries.end()) {
-    if (existing_it->second.num_rows == new_num_rows) {
+    // Same-row-count merge only applies when the completeness contracts match.
+    // Mixing a full pin with a partial pin produces an entry whose columns came
+    // from different row coverage — drop and rebuild instead.
+    if (existing_it->second.num_rows == new_num_rows &&
+        existing_it->second.is_partial == is_partial) {
       // Same-row-count merge MUST preserve per-chunk memory_space alignment
       // between existing and new entry. The round-robin counter restarts at
       // chunk 0 → GPU 0 per pin_table call, and chunks at index i across all
@@ -351,6 +369,15 @@ void sirius_scan_manager::insert_pinned_entry(
         }
       }
       // Same row count → merge unique columns into the existing entry.
+      // Decide which column INDICES are new BEFORE iterating chunks. Doing
+      // the contains() check per-chunk would let chunk 0 install a new
+      // column and then chunks 1..N-1 see contains()==true and skip — leaving
+      // the new column with only chunk 0 and tripping cached_split_provider's
+      // "mismatched chunk count across requested columns" invariant.
+      std::vector<bool> is_new_col(column_names.size(), false);
+      for (std::size_t i = 0; i < column_names.size(); ++i) {
+        is_new_col[i] = !entry.data_batches_by_column.contains(column_names[i]);
+      }
       for (auto& table : data_tables) {
         if (!table) { continue; }
         auto cols = table->release();
@@ -361,12 +388,12 @@ void sirius_scan_manager::insert_pinned_entry(
             std::to_string(column_names.size()));
         }
         for (std::size_t i = 0; i < cols.size(); ++i) {
-          auto const& col_name = column_names[i];
-          if (entry.data_batches_by_column.contains(col_name)) {
-            // Already cached — drop the duplicate column.
+          if (!is_new_col[i]) {
+            // Column was already cached before this merge call — drop the
+            // duplicate chunk.
             continue;
           }
-          entry.data_batches_by_column[col_name].emplace_back(std::move(cols[i]));
+          entry.data_batches_by_column[column_names[i]].emplace_back(std::move(cols[i]));
         }
       }
       // Append any new column names to the entry's column_names list so its
@@ -379,7 +406,7 @@ void sirius_scan_manager::insert_pinned_entry(
       }
       return;
     }
-    // Row count differs → drop the stale entry and rebuild below.
+    // Row count or completeness contract differs → drop the stale entry and rebuild below.
     _pinned_entries.erase(existing_it);
   }
 
@@ -389,6 +416,7 @@ void sirius_scan_manager::insert_pinned_entry(
   entry.chunk_memory_spaces = std::move(chunk_memory_spaces);
   entry.tier                = cucascade::memory::Tier::GPU;
   entry.num_rows            = new_num_rows;
+  entry.is_partial          = is_partial;
 
   for (auto& table : data_tables) {
     if (!table) { continue; }
@@ -411,7 +439,8 @@ void sirius_scan_manager::insert_pinned_entry_host(
   std::vector<std::string> column_names,
   std::vector<std::string> file_paths,
   std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
-  cucascade::memory::memory_space& memory_space)
+  cucascade::memory::memory_space& memory_space,
+  bool is_partial)
 {
   // The host-tier path captures one chunk per emitted batch; each chunk holds every
   // pinned column. Re-insert always replaces — there is no per-column merge analog
@@ -432,6 +461,7 @@ void sirius_scan_manager::insert_pinned_entry_host(
   entry.memory_space = &memory_space;
   entry.num_rows     = new_num_rows;
   entry.host_chunks  = std::move(host_chunks);
+  entry.is_partial   = is_partial;
 
   _pinned_entries[name] = std::move(entry);
 }

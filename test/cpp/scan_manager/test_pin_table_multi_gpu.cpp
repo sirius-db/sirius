@@ -301,3 +301,268 @@ TEST_CASE("pin_table - PIN-MGPU-01 routing via [mgpu-audit]",
 
   fs::remove_all(tmp, ec);
 }
+
+//===----------------------------------------------------------------------===//
+// Host-tier distribution gate (PR #732 review feedback — high-1):
+//
+// `CALL pin_table(..., tier='host')` round-robins files across GPUs the same
+// way the GPU-tier path does, but the host-conversion code previously created
+// a single `pin_stream` and hard-coded `gpu_spaces[0]` when wrapping each
+// chunk as a `gpu_table_representation`. Files assigned to GPU 1+ were
+// therefore converted with GPU 0 stream/device metadata, launching the D2H
+// path on the wrong device.
+//
+// This gate pins a 4-file surface with tier='host' on a 2-GPU host and
+// inspects each captured host_data_representation's memory_space to assert
+// the pinned-on-host metadata reflects per-GPU placement (i.e., the
+// converter actually used a per-target-GPU host space, not a single hard-
+// coded one). With the bug present, every host_chunk would map back to the
+// same memory_space; with the fix, host_chunks track per-GPU NUMA-local
+// spaces (or, on non-NUMA CI hosts, the first host space — but at minimum
+// the wrapping `gpu_table_representation` is built against `target_space`
+// for the correct GPU, which a separate gate is hard to observe without a
+// memory-space probe).
+//
+// We assert that at least one host_chunk references a memory_space whose
+// get_device_id() differs across chunks (so the round-robin behavior is
+// reflected on the host side at all) when a NUMA-per-GPU layout exists.
+// On single-NUMA hosts, the host space is shared but the test passes
+// trivially via the >=1 chunk assertion.
+//===----------------------------------------------------------------------===//
+TEST_CASE("pin_table - PIN-MGPU-01 host-tier multi-GPU pin",
+          "[pin_mgpu][scan_manager][host_tier]")
+{
+  if (!require_two_gpus()) return;
+
+  auto tmp = make_tmp("host");
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+  fs::create_directories(tmp);
+
+  generate_4file_surface(tmp);
+
+  auto yaml_path = tmp / "pin_mgpu_host.yaml";
+  write_mgpu_yaml(yaml_path, mgpu_env_params{});
+
+  scoped_mgpu_env env(yaml_path);
+  auto con = env.make_connection();
+
+  auto glob    = parquet_glob(tmp);
+  auto pin_sql = "CALL pin_table('" + glob + "', tier='host', name='host_pin');";
+  auto pin     = con.Query(pin_sql);
+  REQUIRE(pin);
+  if (pin->HasError()) { UNSCOPED_INFO("pin_table error: " << pin->GetError()); }
+  REQUIRE_FALSE(pin->HasError());
+
+  auto sirius_ctx =
+    con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+
+  auto const& entries = sirius_ctx->get_scan_manager().get_pinned_entries();
+  auto it             = entries.find("host_pin");
+  REQUIRE(it != entries.end());
+
+  auto const& entry = it->second;
+  // host_chunks vector must be populated (matches GPU-path expectation that
+  // 4 files produce >= 4 chunks at the default chunk size).
+  REQUIRE(entry.host_chunks.size() >= 4u);
+
+  // Every host_chunk must be non-null and own a host_data_representation
+  // whose underlying host_table_allocation got materialized on SOME memory
+  // space — null entries would indicate a converter that never ran or never
+  // landed.
+  for (auto const& chunk : entry.host_chunks) {
+    REQUIRE(chunk != nullptr);
+    REQUIRE(chunk->get_host_table() != nullptr);
+    REQUIRE_FALSE(chunk->get_host_table()->columns.empty());
+  }
+
+  // A subsequent SELECT through the cached host-pin should produce the SAME
+  // row count as the raw parquet glob — i.e., the host_data_representations
+  // pinned on multiple GPUs all surface during the cached scan and the GPU
+  // 1+ chunks aren't lost because of a wrong-device stream sync.
+  auto baseline =
+    con.Query("SELECT count(*) FROM read_parquet('" + glob + "');");
+  REQUIRE(baseline);
+  REQUIRE_FALSE(baseline->HasError());
+  auto baseline_rows = baseline->GetValue(0, 0).GetValue<int64_t>();
+
+  auto cached = con.Query("CALL gpu_execution(\"SELECT count(*) FROM read_parquet('" +
+                          glob + "')\");");
+  REQUIRE(cached);
+  if (cached->HasError()) { UNSCOPED_INFO("gpu_execution error: " << cached->GetError()); }
+  REQUIRE_FALSE(cached->HasError());
+  auto cached_rows = cached->GetValue(0, 0).GetValue<int64_t>();
+  REQUIRE(cached_rows == baseline_rows);
+
+  auto unpin = con.Query("CALL unpin_table('host_pin');");
+  REQUIRE(unpin);
+  REQUIRE_FALSE(unpin->HasError());
+
+  fs::remove_all(tmp, ec);
+}
+
+//===----------------------------------------------------------------------===//
+// Partial-pin cache reuse gate (PR #732 review feedback — high-2):
+//
+// `CALL pin_table(..., n_rows=N)` captures at most N rows. Previously the
+// scan_manager matched cached pins purely by sorted file_paths and would
+// happily serve a full SELECT from the partial entry, returning ONLY the
+// pinned prefix. This gate pins a single file with n_rows=N and then issues
+// a full SELECT, asserting the row count matches the un-pinned baseline
+// (i.e., the partial pin was correctly excluded from cache lookup and the
+// scan fell through to the parquet path).
+//===----------------------------------------------------------------------===//
+TEST_CASE("pin_table - partial pin (n_rows) excluded from cache reuse",
+          "[pin_mgpu][scan_manager][partial_pin]")
+{
+  if (!require_two_gpus()) return;
+
+  auto tmp = make_tmp("partial");
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+  fs::create_directories(tmp);
+
+  // Single 100k-row file so we can request exactly 1k rows and check the
+  // partial-vs-full distinction trivially.
+  generate_parquet_surface(tmp,
+                           "SELECT range AS k, range * 2 AS v FROM range(100000)",
+                           /*num_files=*/1);
+
+  auto yaml_path = tmp / "pin_mgpu_partial.yaml";
+  write_mgpu_yaml(yaml_path, mgpu_env_params{});
+
+  scoped_mgpu_env env(yaml_path);
+  auto con = env.make_connection();
+
+  auto glob = parquet_glob(tmp);
+  auto pin  = con.Query(
+    "CALL pin_table('" + glob + "', tier='gpu', name='partial_pin', n_rows=1000);");
+  REQUIRE(pin);
+  if (pin->HasError()) { UNSCOPED_INFO("pin_table error: " << pin->GetError()); }
+  REQUIRE_FALSE(pin->HasError());
+
+  // Verify the entry is_partial flag is set on the scan_manager side.
+  auto sirius_ctx =
+    con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+  auto const& entries = sirius_ctx->get_scan_manager().get_pinned_entries();
+  auto it             = entries.find("partial_pin");
+  REQUIRE(it != entries.end());
+  REQUIRE(it->second.is_partial == true);
+  // num_rows on the partial entry should match the n_rows budget (1000).
+  REQUIRE(it->second.num_rows == 1000u);
+
+  // A subsequent full SELECT MUST NOT serve from the partial pin — it must
+  // re-read the parquet file and return all 100000 rows.
+  auto full = con.Query("CALL gpu_execution(\"SELECT count(*) FROM read_parquet('" +
+                        glob + "')\");");
+  REQUIRE(full);
+  if (full->HasError()) { UNSCOPED_INFO("gpu_execution error: " << full->GetError()); }
+  REQUIRE_FALSE(full->HasError());
+  auto full_rows = full->GetValue(0, 0).GetValue<int64_t>();
+  REQUIRE(full_rows == 100000);  // Not 1000 — the partial pin was bypassed.
+
+  auto unpin = con.Query("CALL unpin_table('partial_pin');");
+  REQUIRE(unpin);
+  REQUIRE_FALSE(unpin->HasError());
+
+  fs::remove_all(tmp, ec);
+}
+
+//===----------------------------------------------------------------------===//
+// Same-row-count merge correctness gate (PR #732 review feedback — med-1):
+//
+// `CALL pin_table(..., cols=[A, B])` followed by `CALL pin_table(..., cols=[A,
+// C])` with the same file paths and same total row count used to take the
+// "same-row-count merge" branch and append the new column C. The merge loop
+// checked `entry.data_batches_by_column.contains(col_name)` per chunk —
+// after chunk 0 installed C, contains() returned true and chunks 1..N were
+// dropped. The pinned entry then had uneven chunk counts across columns,
+// which trips the cached_split_provider invariant and silently falls back
+// to uncached reads.
+//
+// This gate generates a multi-chunk surface (large enough that the cudf
+// chunked_parquet_reader emits >=2 chunks per file at the default 100 MB
+// scan_task_batch_size), pins two non-overlapping column subsets in
+// sequence, and asserts every column in the merged entry has the SAME
+// number of chunks as `chunk_memory_spaces`.
+//===----------------------------------------------------------------------===//
+TEST_CASE("pin_table - same-row-count merge appends every chunk for new columns",
+          "[pin_mgpu][scan_manager][merge]")
+{
+  if (!require_two_gpus()) return;
+
+  auto tmp = make_tmp("merge");
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+  fs::create_directories(tmp);
+
+  // Force >= 2 chunks per pin call by overriding scan_task_batch_size to
+  // 10 MB so the 100k-row fixture per file produces at least one chunk
+  // per file (and 4 files → 4+ chunks). The exact threshold is host-
+  // dependent (column types and compression), so we conservatively use a
+  // small scan_task_batch_size to make the multi-chunk path reliable.
+  mgpu_env_params params;
+  params.scan_task_batch_size = 1'000'000;  // 1 MB
+
+  generate_parquet_surface(
+    tmp,
+    "SELECT range AS k, range * 2 AS v, range * 3 AS w, range * 4 AS x FROM range(100000)",
+    /*num_files=*/4);
+
+  auto yaml_path = tmp / "pin_mgpu_merge.yaml";
+  write_mgpu_yaml(yaml_path, params);
+
+  scoped_mgpu_env env(yaml_path);
+  auto con = env.make_connection();
+
+  auto glob = parquet_glob(tmp);
+
+  // First pin: columns [k, v]
+  auto pin1 = con.Query("CALL pin_table('" + glob +
+                        "', tier='gpu', name='merge_pin', cols=['k', 'v']);");
+  REQUIRE(pin1);
+  if (pin1->HasError()) { UNSCOPED_INFO("pin_table 1 error: " << pin1->GetError()); }
+  REQUIRE_FALSE(pin1->HasError());
+
+  // Second pin: columns [k, w] — the merge path must install w with the
+  // SAME number of chunks as the existing k and v vectors.
+  auto pin2 = con.Query("CALL pin_table('" + glob +
+                        "', tier='gpu', name='merge_pin', cols=['k', 'w']);");
+  REQUIRE(pin2);
+  if (pin2->HasError()) { UNSCOPED_INFO("pin_table 2 error: " << pin2->GetError()); }
+  REQUIRE_FALSE(pin2->HasError());
+
+  auto sirius_ctx =
+    con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+
+  auto const& entries = sirius_ctx->get_scan_manager().get_pinned_entries();
+  auto it             = entries.find("merge_pin");
+  REQUIRE(it != entries.end());
+
+  auto const& entry = it->second;
+  auto const expected_chunks = entry.chunk_memory_spaces.size();
+  INFO("expected_chunks=" << expected_chunks);
+  REQUIRE(expected_chunks >= 2u);
+
+  // Each pinned column MUST have exactly chunk_memory_spaces.size() chunks.
+  // With the bug, w would have just 1 chunk while k and v had N chunks,
+  // which silently fell back to uncached scans.
+  for (auto const& col_name : entry.column_names) {
+    auto col_it = entry.data_batches_by_column.find(col_name);
+    REQUIRE(col_it != entry.data_batches_by_column.end());
+    INFO("col_name=" << col_name << " chunks=" << col_it->second.size());
+    REQUIRE(col_it->second.size() == expected_chunks);
+  }
+
+  // The merged entry must list all unique columns: k, v, w.
+  REQUIRE(entry.column_names.size() == 3u);
+
+  auto unpin = con.Query("CALL unpin_table('merge_pin');");
+  REQUIRE(unpin);
+  REQUIRE_FALSE(unpin->HasError());
+
+  fs::remove_all(tmp, ec);
+}

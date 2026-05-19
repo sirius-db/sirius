@@ -21,6 +21,7 @@
 #include "op/scan/duckdb_scan_executor.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
 #include "op/scan/iceberg_scan_task.hpp"
+#include "op/scan/parquet_scan_operator_data.hpp"
 #include "op/scan/parquet_scan_task.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
@@ -484,6 +485,50 @@ void task_creator::manager_loop()
                   gpu_bytes.size(),
                   host_bytes.size(),
                   preferred_device_id.value_or(-1));
+              }
+              // Cached-scan locality: scan_cached_operator_data is NOT a
+              // pipelineable_operator_data (see parquet_scan_operator_data.hpp),
+              // so the data-locality block above skipped it wholesale. Without
+              // this branch, every pinned-table scan task gets dispatched
+              // round-robin by the scheduler and triggers a peer DMA or host
+              // staging when the consumer GPU differs from the chunk's home
+              // GPU. The pinned chunk's GPU residency is preserved on the
+              // batch (cached_split_provider pins each chunk_memory_space into
+              // the gpu_table_representation), so we just read it here.
+              if (!preferred_device_id.has_value()) {
+                if (auto* cached =
+                      dynamic_cast<op::scan::scan_cached_operator_data*>(
+                        local_state->_input_data.get())) {
+                  if (cached->batch) {
+                    auto ro     = cached->batch->to_read_only();
+                    auto* space = ro.get_memory_space();
+                    if (space) {
+                      if (space->get_tier() == cucascade::memory::Tier::GPU) {
+                        preferred_device_id = space->get_device_id();
+                      } else if (space->get_tier() == cucascade::memory::Tier::HOST &&
+                                 !_numa_to_gpu.empty()) {
+                        // tier='host' pinned chunks carry a NUMA-local host
+                        // memory_space; map back through _numa_to_gpu to pick
+                        // a GPU on the same NUMA. Normalize numa_id=-1 to 0
+                        // to match the convention used by the pipelineable
+                        // locality block above.
+                        int host_key = space->get_device_id();
+                        if (host_key < 0) host_key = 0;
+                        auto it = _numa_to_gpu.find(host_key);
+                        if (it != _numa_to_gpu.end() && !it->second.empty()) {
+                          auto idx = _numa_to_gpu_rr.fetch_add(1) % it->second.size();
+                          preferred_device_id = it->second[idx];
+                        }
+                      }
+                      SIRIUS_LOG_DEBUG(
+                        "Task Creator: cached-scan locality tier={} device_id={} "
+                        "preferred_device={}",
+                        static_cast<int>(space->get_tier()),
+                        space->get_device_id(),
+                        preferred_device_id.value_or(-1));
+                    }
+                  }
+                }
               }
               if (preferred_device_id.has_value()) {
                 local_state->set_preferred_device_id(preferred_device_id.value());

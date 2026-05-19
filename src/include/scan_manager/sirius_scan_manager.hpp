@@ -82,6 +82,12 @@ struct pinned_entry {
   /// to decide whether a re-insert merges into the existing entry (same row
   /// count → add unique columns) or replaces it (different row count).
   std::size_t num_rows{0};
+  /// True when the pin was created with a row-count budget (e.g.
+  /// `CALL pin_table(..., n_rows=N)`) that capped the captured rows below
+  /// the full file content. Partial entries MUST NOT serve cached reads
+  /// because a subsequent full scan of the same file paths would silently
+  /// return only the pinned prefix.
+  bool is_partial{false};
 };
 
 /**
@@ -165,11 +171,15 @@ class sirius_scan_manager {
   /// \param chunk_memory_spaces   Per-chunk memory space placement (size MUST equal total chunk
   ///                              count across data_tables; value at index i is shared by all
   ///                              columns at chunk i).
+  /// \param is_partial            True when the caller capped row capture below the full file
+  ///                              content (e.g. pin_table n_rows budget). Partial entries
+  ///                              must NOT serve cached reads — see pinned_entry::is_partial.
   void insert_pinned_entry(const std::string& name,
                            std::vector<std::string> column_names,
                            std::vector<std::string> file_paths,
                            std::vector<std::unique_ptr<cudf::table>> data_tables,
-                           std::vector<cucascade::memory::memory_space*> chunk_memory_spaces);
+                           std::vector<cucascade::memory::memory_space*> chunk_memory_spaces,
+                           bool is_partial = false);
 
   /// \brief Pin the entry for a table on the host tier.
   ///
@@ -186,12 +196,16 @@ class sirius_scan_manager {
   /// \param file_paths    Resolved file paths captured at pin time.
   /// \param host_chunks   One host_data_representation per emitted batch.
   /// \param memory_space  Host memory space the chunks reside in.
+  /// \param is_partial    True when the caller capped row capture below the full file
+  ///                      content (e.g. pin_table n_rows budget). Partial entries
+  ///                      must NOT serve cached reads — see pinned_entry::is_partial.
   void insert_pinned_entry_host(
     const std::string& name,
     std::vector<std::string> column_names,
     std::vector<std::string> file_paths,
     std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
-    cucascade::memory::memory_space& memory_space);
+    cucascade::memory::memory_space& memory_space,
+    bool is_partial = false);
 
   /// \brief Remove the pinned entry for @p name. No-op if absent.
   void remove_pinned_entry(const std::string& name);

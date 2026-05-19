@@ -26,8 +26,8 @@ Every byte of data lives in exactly one **memory tier** at any moment. Tiers, fa
 
 | Tier | Backed by | Capacity per host | Typical purpose |
 |------|-----------|-------------------|-----------------|
-| `GPU` | `cuda_async_memory_resource` (one pool per device) | Bounded by GPU device memory × `reservation_fraction_per_gpu` (default 0.75) | Active query data |
-| `HOST` | NUMA-local pinned host memory | Sized via `set_per_host_capacity()` × `reservation_fraction_per_host` | Downgrade target when GPU is full |
+| `GPU` | `cuda_async_memory_resource` (one pool per device) | Bounded by GPU device memory × `usage_limit_fraction` | Active query data |
+| `HOST` | NUMA-local pinned host memory | Set by config: `memory.host.capacity_bytes` (per NUMA host memory resource) | Downgrade target when GPU is full |
 | `DISK` | On-disk file pool via cucascade's `idisk_io_backend` | Configured via `set_disk_mounting_point(gpu_id, capacity, path)` | Last-resort downgrade target |
 
 `HOST` is partitioned by NUMA node — each GPU has a paired host region on its NUMA-local memory controller for fast downgrade. This is configured via `cucascade::memory::reservation_manager_configurator::use_host_per_gpu()` at startup.
@@ -35,18 +35,19 @@ Every byte of data lives in exactly one **memory tier** at any moment. Tiers, fa
 Conceptually:
 
 ```
-        ┌─────────┐  ┌─────────┐
-        │  GPU 0  │  │  GPU 1  │      ← Tier::GPU
-        └────┬────┘  └────┬────┘
-             │            │
-        ┌────┴────┐  ┌────┴────┐
-        │ Host    │  │ Host    │
-        │ (NUMA0) │  │ (NUMA1) │      ← Tier::HOST (per-GPU NUMA-local)
-        └────┬────┘  └────┬────┘
-             └─────┬──────┘
-              ┌────┴────┐
-              │  Disk   │              ← Tier::DISK (shared pool)
-              └─────────┘
+┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐
+│  GPU 0  │  │  GPU 1  │  │  GPU 2  │  │  GPU 3  │  ← Tier::GPU
+└────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘
+     └─────┬──────┘            └─────┬──────┘
+           │                         │
+      ┌────┴────┐               ┌────┴────┐
+      │ Host    │               │ Host    │
+      │ (NUMA0) │               │ (NUMA1) │      ← Tier::HOST (per-NUMA, shared by sibling GPUs)
+      └────┬────┘               └────┬────┘
+           └─────────────┬───────────┘
+                    ┌────┴────┐
+                    │  Disk   │                  ← Tier::DISK (shared pool)
+                    └─────────┘
 ```
 
 A `cucascade::memory::memory_space` is the in-memory representation of one (tier, gpu_id) pair. The engine queries spaces via `manager.get_memory_space(Tier, gpu_id)` and routes allocations through that space's `device_async_resource_ref`. Each space owns its allocator and a `reservation_aware_resource_adaptor` that tracks per-thread byte budgets so OOM is detectable before the driver fails.
@@ -115,7 +116,7 @@ The pin pipeline (`src/scan_manager/`):
 
 1. **Open the parquet files.** `PinTableFunction` resolves the file scheme through `datasource_registry_`, gets per-GPU `sirius_datasource` instances backed by `uring_ioctx`.
 2. **Enumerate chunks.** Reads parquet metadata to discover row-group chunks.
-3. **Distribute round-robin.** `chunk_memory_spaces[i] = gpu_spaces[i % gpu_spaces.size()]` — chunk `i` is assigned to the `i`-th GPU's memory_space. This is the **PIN-MGPU-01 invariant**.
+3. **Distribute round-robin per FILE (not per chunk).** Each parquet file is bound to one GPU via `gpu_spaces[file_idx % gpu_spaces.size()]`; every chunk emitted by that file's `chunked_parquet_reader` inherits the same memory_space. This is the **PIN-MGPU-01 invariant**. (Cross-chunk-within-file distribution is intentionally NOT done: keeping a file pinned to one GPU avoids cross-device buffer migration mid-file.)
 4. **Read each chunk into its target space.** Each chunk's read goes through the `uring_ioctx` whose GPU owns the target memory_space — so the I/O lands directly in the right GPU's pinned memory region with no cross-GPU copies.
 5. **Record the pinned entry.** `pinned_entry { data_batches_by_column, chunk_memory_spaces }` is stored on the `sirius_scan_manager`. The `chunk_memory_spaces` vector is parallel to `data_batches_by_column[col_idx]` — `chunk_memory_spaces[i]` is the owning space for chunk `i` regardless of which column you're looking at.
 

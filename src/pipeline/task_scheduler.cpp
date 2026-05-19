@@ -250,12 +250,18 @@ void task_scheduler::management_eventloop()
       }
       task_id = gpu_task->get_task_id();
     }
-    // Distribute preference-less source tasks (metadata scan,
-    // GPU_PARQUET_SCAN) round-robin so they don't all pile onto begin().
-    // Downstream merge operators rely on lock_or_prepare_batch (in
-    // batch_lock_utils.hpp) to convert cross-GPU input to the consumer's
-    // target memory space via cucascade::convert_gpu_to_gpu (which uses
-    // peer-DMA where supported and host-staging on consumer hardware).
+    // Distribute preference-less source tasks (metadata-only parquet
+    // scans whose input batch has no GPU-resident memory_space) round-robin
+    // so they don't all pile onto begin(). NOTE: cached-pin scan tasks
+    // ARE preference-aware now — task_creator reads each
+    // scan_cached_operator_data's batch memory_space and sets
+    // preferred_device_id accordingly, so they take the have_pref branch
+    // above and stay on their chunk's home GPU. Downstream merge operators
+    // rely on lock_or_prepare_batch (batch_lock_utils.hpp) to convert
+    // cross-GPU input to the consumer's target memory space via
+    // cucascade::convert_gpu_to_gpu (peer-DMA where supported,
+    // host-staging on consumer hardware) — that fallback still applies
+    // for the residual preference-less cases.
     if (!have_pref && _gpu_executors.size() > 1) {
       auto idx =
         _no_pref_rr_counter.fetch_add(1, std::memory_order_relaxed) % _gpu_executors.size();

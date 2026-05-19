@@ -367,15 +367,21 @@ void sirius_physical_hash_join::build_pipelines(pipeline::sirius_pipeline& curre
   sirius_physical_hash_join::build_join_pipelines(current, meta_pipeline, *this);
 }
 
-void sirius_physical_hash_join::update_join_exec_mode(int num_partitions, uint64_t build_side_bytes)
+void sirius_physical_hash_join::update_join_exec_mode(int num_partitions,
+                                                       uint64_t build_side_bytes,
+                                                       bool build_foldable_to_single_batch)
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
   if (num_partitions == 1 && build_side_bytes < _max_build_hash_table_bytes &&
-      join_type != duckdb::JoinType::SEMI && join_type != duckdb::JoinType::RIGHT_SEMI &&
-      join_type != duckdb::JoinType::ANTI && join_type != duckdb::JoinType::RIGHT_ANTI &&
-      join_type != duckdb::JoinType::RIGHT && join_type != duckdb::JoinType::MARK &&
-      _join_mode != HASH_JOIN_MODE::MIXED_JOIN) {
-    // Switch to a more efficient join strategy for small datasets
+      build_foldable_to_single_batch && join_type != duckdb::JoinType::SEMI &&
+      join_type != duckdb::JoinType::RIGHT_SEMI && join_type != duckdb::JoinType::ANTI &&
+      join_type != duckdb::JoinType::RIGHT_ANTI && join_type != duckdb::JoinType::RIGHT &&
+      join_type != duckdb::JoinType::MARK && _join_mode != HASH_JOIN_MODE::MIXED_JOIN) {
+    // Switch to a more efficient join strategy for small datasets. The
+    // build_foldable_to_single_batch gate matches the runtime invariant in
+    // get_next_task_input_data_for_build_probe — BUILD_PROBE requires the
+    // build port to deliver exactly one batch, so we refuse to enter the
+    // mode when the upstream pipeline cannot guarantee that.
     _join_mode = HASH_JOIN_MODE::BUILD_PROBE;
     SIRIUS_LOG_DEBUG(
       "sirius_physical_hash_join id {} switching to BUILD_PROBE mode with {} partitions and build "
@@ -618,15 +624,29 @@ static join_side_keys_result prepare_join_keys(
   cudf::table_view table = get_cudf_table_view(input_batch);
 
   if (!cast_necessary) {
-    // Filter key_col_indices to the valid range [0, num_columns()) so a stale
-    // index from the SORT-as-HASH_JOIN partitioner doesn't throw
-    // std::out_of_range from cudf::table_view::select.
-    std::vector<cudf::size_type> valid_indices;
-    valid_indices.reserve(key_col_indices.size());
+    // INVARIANT: every entry in key_col_indices must address a column in
+    // `table`. PR #732 closed the only known violator — DuckDB's
+    // LATE_MATERIALIZATION optimizer was rewriting `ORDER BY ... LIMIT N`
+    // into a self-RIGHT_SEMI_JOIN keyed on parquet virtual columns
+    // (file_index / file_row_number) that Sirius's scan path silently
+    // drops, leaving the join with key_col_indices entries pointing past
+    // the physical batch. Disabling that pass in
+    // src/transparent/sirius_optimizer_extension.cpp removed the bad
+    // emitter. If you hit this throw, a new emitter has been introduced —
+    // fix it at the source rather than reintroducing the historical
+    // silent filter (see PR #732 comment 3242605041 for the prior shape).
+    auto const num_cols = table.num_columns();
     for (auto idx : key_col_indices) {
-      if (idx < table.num_columns()) { valid_indices.push_back(idx); }
+      if (idx >= num_cols) {
+        throw std::out_of_range(
+          "prepare_join_keys: key_col_indices entry " + std::to_string(idx) +
+          " is >= input table column count " + std::to_string(num_cols) +
+          " (is_left_side=" + (is_left_side ? "true" : "false") +
+          "). The upstream emitter wired a join key that does not exist in "
+          "the physical batch — fix the emitter, do not paper over it here.");
+      }
     }
-    result.keys = table.select(valid_indices);
+    result.keys = table.select(key_col_indices);
     return result;
   }
 
