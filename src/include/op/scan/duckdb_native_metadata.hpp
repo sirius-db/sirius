@@ -26,6 +26,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -49,10 +50,14 @@ struct duckdb_segment_descriptor {
   duckdb::idx_t segment_start;
   duckdb::idx_t segment_count;
   duckdb::CompressionType compression;
-  /// 0 means the stat was not advertised. Dictionary-family VARCHAR codecs
-  /// require it; Uncompressed VARCHAR tolerates 0 by flipping the row
-  /// group's `decoded_bytes_budget_is_lower_bound`.
-  std::uint32_t max_string_length = 0;
+  /// Per-segment max-string-length parsed from DuckDB's
+  /// `ColumnSegmentInfo::segment_stats` text blob. nullopt for validity
+  /// segments and non-VARCHAR data segments. After a viable walk, every
+  /// VARCHAR data segment is guaranteed Some(...); Some(0) is legal data
+  /// (every value in this segment is ""). Drives the GPU kernel's
+  /// chars-region sizing and short/long-string routing, and the
+  /// partitioner's per-column varchar-byte cap.
+  std::optional<std::uint32_t> max_string_length;
 };
 
 struct duckdb_column_metadata {
@@ -73,16 +78,7 @@ struct duckdb_row_group_metadata {
   /// Parallel to the walker's `projected_cols` argument.
   std::vector<duckdb_column_metadata> columns;
   std::size_t decoded_bytes_budget = 0;
-  /// True when at least one column fell back to
-  /// `VARCHAR_UNKNOWN_LENGTH_FALLBACK_BYTES`. Treat the budget as a soft
-  /// lower bound in that case.
-  bool decoded_bytes_budget_is_lower_bound = false;
 };
-
-/// Per-row byte budget used for VARCHAR columns whose row group did not
-/// advertise a max-string-length stat (Uncompressed only — dictionary
-/// codecs refuse in that case).
-inline constexpr std::uint32_t VARCHAR_UNKNOWN_LENGTH_FALLBACK_BYTES = 256;
 
 /// When `viable` is false the walker bailed at the first unsupported
 /// segment or type; `row_groups` is partial and must not be consumed.

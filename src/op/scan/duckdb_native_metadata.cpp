@@ -24,9 +24,14 @@
 #include <duckdb/storage/table_storage_info.hpp>
 
 #include <algorithm>
+#include <cassert>
+#include <charconv>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -124,56 +129,30 @@ bool is_supported_logical_type(const sirius::logical_type& type, std::string& re
   return false;
 }
 
-std::uint32_t lookup_max_string_length(duckdb::PartitionRowGroup& prg,
-                                       const duckdb::StorageIndex& storage_idx)
+// Parse the per-segment Max String Length out of DuckDB's stats blob
+// (`ColumnSegmentInfo::segment_stats`). Format:
+//   "[Min: ..., Max: ..., Has Unicode: ..., Max String Length: N][Has Null: ...]"
+// The "Max String Length: " token only appears in StringStats, so a forward
+// strstr is safe (no risk of matching a `Max:` value containing the word).
+//
+// Returns nullopt iff the field is absent from the blob — meaning the segment
+// was written without string stats (pathological on modern DuckDB; every
+// VARCHAR storage path in duckdb/src/storage/compression/*.cpp updates these
+// stats unconditionally).
+std::optional<std::uint32_t> parse_segment_max_string_length(std::string_view blob)
 {
-  auto stats = prg.GetColumnStatistics(storage_idx);
-  if (!stats) { return 0; }
-  if (!duckdb::StringStats::HasMaxStringLength(*stats)) { return 0; }
-  return duckdb::StringStats::MaxStringLength(*stats);
+  constexpr std::string_view kNeedle = "Max String Length: ";
+  auto pos                           = blob.find(kNeedle);
+  if (pos == std::string_view::npos) { return std::nullopt; }
+  pos += kNeedle.size();
+  std::uint32_t value = 0;
+  auto [ptr, ec]      = std::from_chars(blob.data() + pos, blob.data() + blob.size(), value);
+  if (ec != std::errc{}) { return std::nullopt; }
+  return value;
 }
 
-using row_group_handles =
-  std::vector<std::pair<duckdb::idx_t, duckdb::shared_ptr<duckdb::PartitionRowGroup>>>;
-
-class varchar_max_length_resolver {
- public:
-  varchar_max_length_resolver(const row_group_handles& handles,
-                              const std::vector<projected_column>& projected_cols)
-    : _handles(handles), _projected_cols(projected_cols)
-  {
-  }
-
-  /// Returns 0 when the row group did not advertise the stat.
-  std::uint32_t get(duckdb::idx_t rg_idx, duckdb::idx_t col_id, std::size_t projected_ci)
-  {
-    const auto k = key(rg_idx, col_id);
-    auto it      = _cache.find(k);
-    if (it != _cache.end()) { return it->second; }
-    std::uint32_t max_len = 0;
-    if (rg_idx < _handles.size() && _handles[rg_idx].second) {
-      max_len = lookup_max_string_length(*_handles[rg_idx].second,
-                                         _projected_cols[projected_ci].storage_idx);
-    }
-    _cache.emplace(k, max_len);
-    return max_len;
-  }
-
- private:
-  // col_id is narrowed to uint32; >2^32 columns would alias.
-  static std::uint64_t key(duckdb::idx_t rg, duckdb::idx_t col)
-  {
-    return (static_cast<std::uint64_t>(rg) << 32) | static_cast<std::uint32_t>(col);
-  }
-
-  const row_group_handles& _handles;
-  const std::vector<projected_column>& _projected_cols;
-  std::unordered_map<std::uint64_t, std::uint32_t> _cache;
-};
-
 duckdb_segment_descriptor build_segment_descriptor(const duckdb::ColumnSegmentInfo& seg,
-                                                   duckdb::CompressionType compression,
-                                                   std::uint32_t max_string_length)
+                                                   duckdb::CompressionType compression)
 {
   duckdb_segment_descriptor desc{};
   desc.block_id          = seg.block_id;
@@ -182,9 +161,11 @@ duckdb_segment_descriptor build_segment_descriptor(const duckdb::ColumnSegmentIn
   desc.segment_start     = seg.segment_start;
   desc.segment_count     = seg.segment_count;
   desc.compression       = compression;
-  desc.max_string_length = max_string_length;
   return desc;
 }
+
+using row_group_handles =
+  std::vector<std::pair<duckdb::idx_t, duckdb::shared_ptr<duckdb::PartitionRowGroup>>>;
 
 // Use PartitionStatistics::count as the source of truth so rowid-only
 // projections (no data segments to sum) still get a real row_count.
@@ -212,15 +193,14 @@ void compute_row_counts(duckdb_native_metadata& md,
   }
 }
 
-// VARCHAR columns whose row group did not advertise a max-string-length
-// stat fall back to VARCHAR_UNKNOWN_LENGTH_FALLBACK_BYTES per row and the
-// row group's `decoded_bytes_budget_is_lower_bound` is set.
+// Per-segment chars exact: budget = Σ(seg.count × *seg.max_string_length) + offsets.
+// The walker refuses on absent stat, so every VARCHAR data segment is guaranteed
+// Some(...) when this runs.
 void compute_decoded_byte_budgets(duckdb_native_metadata& md,
                                   const std::vector<sirius::logical_type>& projected_types)
 {
   for (auto& rg_md : md.row_groups) {
     std::size_t budget = 0;
-    bool any_unknown   = false;
     for (std::size_t ci = 0; ci < rg_md.columns.size(); ++ci) {
       const auto& col_md = rg_md.columns[ci];
       if (col_md.is_rowid) {
@@ -228,22 +208,18 @@ void compute_decoded_byte_budgets(duckdb_native_metadata& md,
         continue;
       }
       if (projected_types[ci].is_varchar()) {
-        std::uint32_t max_len = 0;
-        for (const auto& d : col_md.data_segments) {
-          max_len = std::max(max_len, d.max_string_length);
+        std::size_t chars_total = 0;
+        for (const auto& seg : col_md.data_segments) {
+          chars_total +=
+            static_cast<std::size_t>(seg.segment_count) * static_cast<std::size_t>(*seg.max_string_length);
         }
-        if (max_len == 0) {
-          max_len     = VARCHAR_UNKNOWN_LENGTH_FALLBACK_BYTES;
-          any_unknown = true;
-        }
-        budget += static_cast<std::size_t>(rg_md.row_count) * (sizeof(std::uint32_t) + max_len);
+        budget += chars_total + static_cast<std::size_t>(rg_md.row_count) * sizeof(std::uint32_t);
       } else {
         budget +=
           static_cast<std::size_t>(rg_md.row_count) * projected_types[ci].fixed_width_byte_size();
       }
     }
-    rg_md.decoded_bytes_budget                = budget;
-    rg_md.decoded_bytes_budget_is_lower_bound = any_unknown;
+    rg_md.decoded_bytes_budget = budget;
   }
 }
 
@@ -381,8 +357,6 @@ duckdb_native_metadata walk_duckdb_native_metadata(
     if (rg < handles.size()) { md.row_groups[rg].row_group_start = handles[rg].first; }
   }
 
-  varchar_max_length_resolver max_len_resolver(handles, projected_cols);
-
   for (const auto& seg : column_segments) {
     auto pl = projected_lookup.find(seg.column_id);
     if (pl == projected_lookup.end()) { continue; }  // not projected
@@ -400,25 +374,24 @@ duckdb_native_metadata walk_duckdb_native_metadata(
       return md;
     }
 
-    std::uint32_t max_string_length = 0;
+    auto desc = build_segment_descriptor(seg, compression);
+
     if (!validity_seg && projected_types[ci].is_varchar()) {
-      // Dictionary-family codecs need the stat to size the host-side
-      // pre-decode buffer.
-      const bool needs_max_len = compression == duckdb::CompressionType::COMPRESSION_DICTIONARY ||
-                                 compression == duckdb::CompressionType::COMPRESSION_FSST ||
-                                 compression == duckdb::CompressionType::COMPRESSION_DICT_FSST;
-      if (needs_max_len) {
-        max_string_length = max_len_resolver.get(rg_idx, seg.column_id, ci);
-        if (max_string_length == 0) {
-          refuse("varchar segment on column " + std::to_string(seg.column_id) + " row group " +
-                 std::to_string(rg_idx) + ": codec \"" + seg.compression_type +
-                 "\" needs max_string_length stat but row group did not advertise one");
-          return md;
-        }
+      // Per-segment Max String Length from the stats blob. Every VARCHAR
+      // storage path in DuckDB writes this (UpdateStringStats in
+      // duckdb/src/storage/compression/*.cpp and string_uncompressed.hpp), so
+      // a missing field is pathological — refuse the row group rather than
+      // silently fall back to a guessed bound. Some(0) is legal data (every
+      // value in this segment is "") — accept; the kernel/partitioner size
+      // a zero-byte chars region for it.
+      desc.max_string_length = parse_segment_max_string_length(seg.segment_stats);
+      if (!desc.max_string_length.has_value()) {
+        refuse("varchar segment on column " + std::to_string(seg.column_id) + " row group " +
+               std::to_string(rg_idx) + ": Max String Length stat absent from segment_stats");
+        return md;
       }
     }
 
-    auto desc    = build_segment_descriptor(seg, compression, max_string_length);
     auto& col_md = md.row_groups[rg_idx].columns[ci];
     if (validity_seg) {
       col_md.validity_segments.push_back(std::move(desc));
@@ -426,6 +399,34 @@ duckdb_native_metadata walk_duckdb_native_metadata(
       col_md.data_segments.push_back(std::move(desc));
     }
   }
+
+#ifndef NDEBUG
+  // Invariant check: DuckDB's typed `PartitionRowGroup::GetColumnStatistics`
+  // returns max(per-segment max) via StringStats::Merge (see
+  // duckdb/src/storage/statistics/string_stats.cpp:181). If the assert ever
+  // fires, DuckDB has changed its merge semantics or we've parsed the blob
+  // wrong — either way the per-segment data we ship to the kernel is
+  // suspect.
+  for (std::size_t rg_idx = 0; rg_idx < handles.size(); ++rg_idx) {
+    auto& prg = handles[rg_idx].second;
+    if (!prg) { continue; }
+    for (std::size_t ci = 0; ci < projected_cols.size(); ++ci) {
+      if (projected_cols[ci].is_rowid || !projected_types[ci].is_varchar()) { continue; }
+      auto stats = prg->GetColumnStatistics(projected_cols[ci].storage_idx);
+      if (!stats || !duckdb::StringStats::HasMaxStringLength(*stats)) { continue; }
+      const auto rg_typed_max  = duckdb::StringStats::MaxStringLength(*stats);
+      const auto& data_segs    = md.row_groups[rg_idx].columns[ci].data_segments;
+      std::uint32_t per_seg_max = 0;
+      for (const auto& seg : data_segs) {
+        if (seg.max_string_length.has_value()) {
+          per_seg_max = std::max(per_seg_max, *seg.max_string_length);
+        }
+      }
+      assert(rg_typed_max == per_seg_max &&
+             "DuckDB rg-level MaxStringLength != max(per-segment) — Merge semantics drifted?");
+    }
+  }
+#endif
 
   // GetColumnSegmentInfo at v1.5.2 already yields segments in segment_start
   // order per (column, row group); this sort is a guard against future
