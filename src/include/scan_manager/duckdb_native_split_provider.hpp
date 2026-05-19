@@ -58,6 +58,8 @@ class duckdb_native_split_provider : public split_provider {
 
   [[nodiscard]] bool has_more_splits() const override;
 
+  /// Returns an empty std::function once all batches have been claimed;
+  /// callers should check `has_more_splits()` first.
   std::function<std::vector<std::unique_ptr<op::operator_data>>()> next_split_provider() override;
 
  private:

@@ -28,9 +28,9 @@ namespace sirius::scan_manager {
 
 namespace {
 
-// cudf strings columns use int32 offsets, so the per-column decoded byte budget
-// for a single scan output must stay under INT32_MAX. 64 MB headroom covers
-// max_string_length being an upper bound + offsets/validity allocations.
+// cudf strings columns use int32 offsets, so a column's decoded bytes must
+// stay under INT32_MAX. 64 MB headroom covers max_string_length being an
+// upper bound + the per-column offsets / validity buffers.
 constexpr std::size_t VARCHAR_BYTE_CAP =
   static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()) -
   (static_cast<std::size_t>(64) * 1024 * 1024);
@@ -75,11 +75,12 @@ std::vector<duckdb_native_split_provider::row_group_batch> partition_row_groups_
   std::vector<std::size_t> col_bytes(num_cols, 0);
 
   for (std::size_t i = 0; i < row_groups.size(); ++i) {
-    const std::size_t this_rg_bytes = row_groups[i].decoded_bytes_budget;
+    const auto& rg                  = row_groups[i];
+    const std::size_t this_rg_bytes = rg.decoded_bytes_budget;
     std::vector<std::size_t> this_rg_col_bytes(num_cols, 0);
     if (any_varchar) {
       for (std::size_t c = 0; c < num_cols; ++c) {
-        if (is_varchar[c]) this_rg_col_bytes[c] = rg_varchar_bytes_for_col(row_groups[i], c);
+        if (is_varchar[c]) this_rg_col_bytes[c] = rg_varchar_bytes_for_col(rg, c);
       }
     }
 
