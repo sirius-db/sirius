@@ -143,12 +143,12 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
   // projection_ids, partition_indices, table_filters) — format-agnostic. If
   // it misses, dispatch through scan_info::make_provider() to the format's
   // own split_provider construction.
-  if (auto cached = try_cached_for(*info, op->get_operator_id())) { return cached; }
-  return info->make_provider(*this);
+  if (auto cached = try_make_cached_provider(*info, op->get_operator_id())) { return cached; }
+  return info->make_provider(_io_ctx);
 }
 
-std::unique_ptr<split_provider> sirius_scan_manager::try_cached_for(op::scan::scan_info const& info,
-                                                                    std::size_t op_id)
+std::unique_ptr<split_provider> sirius_scan_manager::try_make_cached_provider(
+  op::scan::scan_info const& info, std::size_t op_id)
 {
   // If a pinned entry's file paths match this scan_info, build the same
   // scan_plan the parquet path would build and serve the scan from cache.
@@ -164,7 +164,7 @@ std::unique_ptr<split_provider> sirius_scan_manager::try_cached_for(op::scan::sc
     for (auto const& [pinned_name, entry] : _pinned_entries) {
       if (!matches_scan_info(entry)) { continue; }
       if (entry.memory_space == nullptr) {
-        throw std::runtime_error("[sirius_scan_manager::try_cached_for] pinned entry '" +
+        throw std::runtime_error("[sirius_scan_manager::try_make_cached_provider] pinned entry '" +
                                  pinned_name + "' has no memory_space");
       }
 
@@ -186,7 +186,7 @@ std::unique_ptr<split_provider> sirius_scan_manager::try_cached_for(op::scan::sc
       // which extracts partition values per file at read time.
       if (plan.has_partitions()) {
         SIRIUS_LOG_DEBUG(
-          "[sirius_scan_manager::try_cached_for] pinned entry '{}' matches op_id={} but "
+          "[sirius_scan_manager::try_make_cached_provider] pinned entry '{}' matches op_id={} but "
           "scan has hive partitions; falling through to per-format split_provider",
           pinned_name,
           op_id);
@@ -229,7 +229,7 @@ std::unique_ptr<split_provider> sirius_scan_manager::try_cached_for(op::scan::sc
         }
 
         SIRIUS_LOG_DEBUG(
-          "[sirius_scan_manager::try_cached_for] using host cached_split_provider for "
+          "[sirius_scan_manager::try_make_cached_provider] using host cached_split_provider for "
           "op_id={} (pinned='{}' data_cols={} chunks={} needs_assembly={})",
           op_id,
           pinned_name,
@@ -251,15 +251,15 @@ std::unique_ptr<split_provider> sirius_scan_manager::try_cached_for(op::scan::sc
       for (auto const& dc : plan.data_columns) {
         auto it = entry.data_batches_by_column.find(dc.name);
         if (it == entry.data_batches_by_column.end()) {
-          throw std::runtime_error("[sirius_scan_manager::try_cached_for] pinned entry '" +
-                                   pinned_name + "' missing column '" + dc.name +
-                                   "' required by scan op");
+          throw std::runtime_error(
+            "[sirius_scan_manager::try_make_cached_provider] pinned entry '" + pinned_name +
+            "' missing column '" + dc.name + "' required by scan op");
         }
         columns_per_request.push_back(it->second);
       }
 
       SIRIUS_LOG_DEBUG(
-        "[sirius_scan_manager::try_cached_for] using cached_split_provider for op_id={} "
+        "[sirius_scan_manager::try_make_cached_provider] using cached_split_provider for op_id={} "
         "(pinned='{}' data_cols={} needs_assembly={})",
         op_id,
         pinned_name,

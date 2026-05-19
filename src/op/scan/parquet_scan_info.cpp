@@ -17,7 +17,6 @@
 #include "op/scan/parquet_scan_info.hpp"
 
 #include "scan_manager/parquet_split_provider.hpp"
-#include "scan_manager/sirius_scan_manager.hpp"
 
 #include <memory>
 #include <utility>
@@ -25,7 +24,7 @@
 namespace sirius::op::scan {
 
 std::unique_ptr<scan_manager::split_provider> parquet_scan_info::make_provider(
-  scan_manager::sirius_scan_manager& manager)
+  std::shared_ptr<sirius::io::sirius_ioctx> io_ctx)
 {
   return std::make_unique<scan_manager::parquet_split_provider>(
     returned_types,
@@ -38,7 +37,7 @@ std::unique_ptr<scan_manager::split_provider> parquet_scan_info::make_provider(
     partition_indices,
     approximate_batch_size,
     scan_manager::parquet_split_provider::DEFAULT_MAX_FILE_PROCESSED,
-    manager.shared_io_ctx());
+    std::move(io_ctx));
 }
 
 }  // namespace sirius::op::scan

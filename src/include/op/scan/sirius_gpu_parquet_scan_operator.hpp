@@ -69,15 +69,6 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
                                    duckdb::idx_t estimated_cardinality,
                                    std::unique_ptr<scan_info> scan_info);
 
-  /// Test-only delegating constructor. The pipeline converter always builds the
-  /// 3-arg form; unit tests that don't exercise the scan_manager path use this
-  /// to keep their old @c (types, estimated_cardinality) call sites unchanged.
-  sirius_gpu_parquet_scan_operator(duckdb::vector<sirius::logical_type> types,
-                                   duckdb::idx_t estimated_cardinality)
-    : sirius_gpu_parquet_scan_operator(std::move(types), estimated_cardinality, nullptr)
-  {
-  }
-
   ~sirius_gpu_parquet_scan_operator() override;
 
   //===----------Source interface----------===//
