@@ -282,7 +282,7 @@ set(EXTENSION_SOURCES
 set(CUDA_SOURCES
     src/op/scan/equality_delete_mask.cu src/cuda/scan/gpu_decode_alp.cu
     src/cuda/scan/gpu_decode_bitpacking.cu src/cuda/scan/gpu_decode_rle.cu
-    src/cuda/scan/gpu_native_decode.cu)
+    src/cuda/scan/gpu_decode_strings.cu src/cuda/scan/gpu_native_decode.cu)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
   add_subdirectory(src/legacy)
   list(APPEND EXTENSION_SOURCES ${SIRIUS_LEGACY_SOURCES}
@@ -436,6 +436,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_gpu_decode_alp.cpp
     test/cpp/scan/test_gpu_decode_bitpacking.cpp
     test/cpp/scan/test_gpu_decode_rle.cpp
+    test/cpp/scan/test_gpu_decode_strings.cpp
     test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_scan_task.cpp
