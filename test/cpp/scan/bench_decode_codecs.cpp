@@ -961,3 +961,97 @@ TEST_CASE("bench DICT_FSST mode 1 1M rows / TPC-H-like dict", "[!benchmark][scan
     double(rows) / sec / 1e6,
     double(rows) * avg_dict_len / sec / GIB);
 }
+
+TEST_CASE("bench DICT_FSST realistic multi-segment mode 1",
+          "[!benchmark][scan][decode][strings]")
+{
+  // Realistic DuckDB layout: DICT_FSST segments cap at Storage::DEFAULT_BLOCK_SIZE
+  // (~256 KiB). For TPC-H-like comments and mode-1 dicts this gives roughly
+  // 1-4 K rows per segment depending on dict reuse; 1 M rows therefore split
+  // into many segments and exercise the per-segment host work in
+  // prepare_dict_fsst (2 sync D2H per segment) as well as kernel scaling.
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+
+  double peak_d2d_gbs = measure_peak_d2d_gbs(stream, mr);
+  std::printf("[bench] peak D2D bandwidth (measured): %.1f GB/s\n", peak_d2d_gbs);
+
+  uint32_t const rows = 1u << 20;
+  std::vector<std::string> synth(rows);
+  size_t total_input_bytes = 0;
+  for (uint32_t i = 0; i < rows; ++i) {
+    synth[i] = sirius::test::decode::strings::make_tpch_like_comment(
+      static_cast<uint64_t>(i) * 0x9E3779B97F4A7C15ull, 5u, 150u);
+    total_input_bytes += synth[i].size();
+  }
+  auto seg_blobs =
+    sirius::test::decode::strings::make_dict_fsst_segments_chunked(synth, /*mode=*/1);
+
+  size_t total_seg_bytes = 0;
+  uint32_t max_seg_rows  = 0;
+  uint32_t max_seg_bytes = 0;
+  for (auto const& [b, rc] : seg_blobs) {
+    total_seg_bytes += b.size();
+    max_seg_rows  = std::max(max_seg_rows, rc);
+    max_seg_bytes = std::max(max_seg_bytes, static_cast<uint32_t>(b.size()));
+  }
+  double avg_seg_rows  = double(rows) / seg_blobs.size();
+  double avg_seg_bytes = double(total_seg_bytes) / seg_blobs.size();
+
+  // Pad each segment up to 8 B so its on-device base stays 8-aligned (header
+  // read at d_bytes[0..16) crosses no alignment boundary).
+  constexpr size_t SEG_ALIGN = 8;
+  std::vector<size_t> seg_offsets(seg_blobs.size());
+  size_t alloc_bytes = 0;
+  for (size_t k = 0; k < seg_blobs.size(); ++k) {
+    seg_offsets[k] = alloc_bytes;
+    alloc_bytes += (seg_blobs[k].first.size() + SEG_ALIGN - 1) & ~(SEG_ALIGN - 1);
+  }
+  rmm::device_buffer d_all(alloc_bytes, stream.view());
+  std::vector<sirius::cuda::scan::gpu_string_segment_desc> segs;
+  segs.reserve(seg_blobs.size());
+  uint32_t row_cursor = 0;
+  auto const* d_base  = static_cast<uint8_t const*>(d_all.data());
+  for (size_t k = 0; k < seg_blobs.size(); ++k) {
+    auto const& [b, rc] = seg_blobs[k];
+    cudaMemcpyAsync(const_cast<uint8_t*>(d_base) + seg_offsets[k],
+                    b.data(),
+                    b.size(),
+                    cudaMemcpyHostToDevice,
+                    stream.value());
+    segs.push_back({d_base + seg_offsets[k],
+                    static_cast<uint32_t>(b.size()),
+                    row_cursor,
+                    rc,
+                    /*seg_row_start=*/0,
+                    /*max_string_length=*/160u});
+    row_cursor += rc;
+  }
+  cudaStreamSynchronize(stream.value());
+
+  sirius::cuda::scan::gpu_string_column_decode_input col;
+  col.total_rows = rows;
+  col.has_nulls  = false;
+  col.data.push_back({CompressionType::COMPRESSION_DICT_FSST, std::move(segs)});
+
+  double sec      = bench_strings_seconds(stream, col, mr);
+  double avg_len  = double(total_input_bytes) / rows;
+  double out_gbs  = double(rows) * avg_len / sec / 1e9;
+  double pct_peak = 100.0 * out_gbs / peak_d2d_gbs;
+
+  std::printf(
+    "[bench] DICT_FSST realistic mode-1 %.0fB avg, %zu segs (avg %.0f rows / %.0f B), "
+    "max %u rows / %u B:\n",
+    avg_len,
+    seg_blobs.size(),
+    avg_seg_rows,
+    avg_seg_bytes,
+    max_seg_rows,
+    max_seg_bytes);
+  std::printf(
+    "[bench]   %.6fs  decode=%.1f Mr/s  output write=%.1f GB/s  (%.1f%% of measured peak D2D)\n",
+    sec,
+    double(rows) / sec / 1e6,
+    out_gbs,
+    pct_peak);
+}

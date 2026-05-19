@@ -25,6 +25,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // libduckdb FSST encoder API (signatures at duckdb/third_party/fsst/fsst.h).
@@ -385,6 +386,16 @@ inline std::vector<std::pair<std::vector<uint8_t>, uint32_t>> make_fsst_segments
   return out;
 }
 
+/// Split a row-vector into multiple DICT_FSST segments, each fitting within
+/// DuckDB's `Storage::DEFAULT_BLOCK_SIZE` (~256 KiB). Per segment we build a
+/// local dictionary from unique strings, generate selections, and call
+/// `make_dict_fsst_segment`. If the resulting segment overflows the cap, we
+/// halve the row budget and retry — bounding pathological cases.
+///
+/// Mirrors `make_fsst_segments_chunked` for the FSST codec.
+inline std::vector<std::pair<std::vector<uint8_t>, uint32_t>> make_dict_fsst_segments_chunked(
+  std::vector<std::string> const& strings, uint8_t mode, uint32_t block_size_bytes = 262136u);
+
 /// `mode`: 0=DICTIONARY, 1=DICT_FSST, 2=FSST_ONLY (row i -> dict idx i+1).
 /// `unique_strings[0]` reserved for NULL; `selections` ignored for mode 2.
 /// Layout matches dict_fsst/compression.cpp.
@@ -502,6 +513,51 @@ inline std::vector<uint8_t> make_dict_fsst_segment(std::vector<std::string> cons
     std::memcpy(bytes.data() + off_didx, packed_didx.data(), didx_bytes_to_copy);
   }
   return bytes;
+}
+
+inline std::vector<std::pair<std::vector<uint8_t>, uint32_t>> make_dict_fsst_segments_chunked(
+  std::vector<std::string> const& strings, uint8_t mode, uint32_t block_size_bytes)
+{
+  std::vector<std::pair<std::vector<uint8_t>, uint32_t>> out;
+  uint32_t const total_rows = static_cast<uint32_t>(strings.size());
+  if (total_rows == 0) return out;
+
+  // Initial row budget: a real DICT_FSST segment fits ~5K rows of TPC-H-like
+  // comments inside the 256 KiB block once the dict is FSST-compressed. Use
+  // 4096 as a safe starting target; the retry loop halves on overflow.
+  uint32_t i = 0;
+  while (i < total_rows) {
+    uint32_t batch_rows = std::min(4096u, total_rows - i);
+    while (true) {
+      // Build a local dictionary (entry 0 reserved for NULL).
+      std::unordered_map<std::string, uint32_t> dict_map;
+      std::vector<std::string> dict;
+      dict.reserve(batch_rows + 1);
+      dict.emplace_back();  // NULL slot
+      std::vector<uint32_t> selections;
+      selections.reserve(batch_rows);
+      for (uint32_t r = i; r < i + batch_rows; ++r) {
+        auto it = dict_map.find(strings[r]);
+        uint32_t idx;
+        if (it == dict_map.end()) {
+          idx                  = static_cast<uint32_t>(dict.size());
+          dict_map[strings[r]] = idx;
+          dict.push_back(strings[r]);
+        } else {
+          idx = it->second;
+        }
+        selections.push_back(idx);
+      }
+      auto seg_bytes = make_dict_fsst_segment(dict, selections, mode);
+      if (seg_bytes.size() <= block_size_bytes || batch_rows == 1) {
+        out.emplace_back(std::move(seg_bytes), batch_rows);
+        i += batch_rows;
+        break;
+      }
+      batch_rows = std::max(1u, batch_rows / 2u);
+    }
+  }
+  return out;
 }
 
 }  // namespace sirius::test::decode::strings

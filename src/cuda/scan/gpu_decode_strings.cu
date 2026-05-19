@@ -84,12 +84,11 @@ enum : uint8_t {
 };
 
 //----- FSST decoder types (shared: FSST + DICT_FSST modes 1+2) --------------//
-
 /// 255 codes (0..254); byte 255 is the escape sentinel.
-constexpr uint32_t FSST_SIZE           = 256;
-constexpr uint32_t FSST_NUM_SYMBOLS    = 255;
-constexpr uint8_t FSST_ESC             = 255;
-constexpr size_t FSST_SYMTAB_MAX_BYTES = 8192;  // opaque serialized blob
+constexpr uint32_t FSST_SIZE             = 256;
+constexpr uint32_t FSST_NUM_SYMBOLS      = 255;
+constexpr uint8_t FSST_ESC               = 255;
+constexpr uint32_t FSST_SYMTAB_MAX_BYTES = 8192;  // opaque serialized blob
 
 /// Trimmed `duckdb_fsst_decoder_t`: drops `version` + `zeroTerminated`.
 /// `len` + `symbol` arrays are ABI-compatible with `_full` for the import memcpy.
@@ -111,8 +110,7 @@ static_assert(sizeof(fsst_decoder_compact::symbol) == sizeof(fsst_decoder_full::
 // Declared locally to avoid pulling the libduckdb FSST header into the CUDA TU.
 extern "C" unsigned int duckdb_fsst_import(void* decoder, unsigned char* buf);
 
-//----- Per-kernel descriptors -----------------------------------------------
-
+//----- Per-kernel descriptors -----------------------------------------------//
 /// Descriptor for DICTIONARY chunks and FSST length-pass segments.
 /// FSST length pass can't chunk: the in-CTA prefix sum is per-segment.
 struct alignas(8) string_chunk_desc {
@@ -152,7 +150,6 @@ struct alignas(8) dict_fsst_desc {
 };
 
 //----- Tuning constants -----------------------------------------------------//
-
 constexpr uint32_t BLOCK_DIM = 256;  // see FSST_WARPS_PER_CTA static_assert
 constexpr uint32_t MIN_ROWS_PER_CHUNK =
   64;  ///< Minimum rows per segment chunk; BLOCK_DIM=256 threads -> 8 warps
@@ -173,11 +170,19 @@ constexpr size_t HOST_UPPER_BOUND_LIMIT = size_t{512} * 1024u * 1024u;
 constexpr uint32_t DICT_WARP_COOP_MIN_LEN = 64u;
 
 //----- Helpers --------------------------------------------------------------//
-
-/// DuckDB's AlignValue<idx_t>.
+/**
+ * @brief Align a value to the next 8-byte boundary.
+ *
+ * Mirror of DuckDB's AlignValue<idx_t> for 64-bit idx_t.
+ */
 constexpr uint32_t align_up8(uint32_t n) { return (n + 7u) & ~7u; }
 
-/// Two waves of full occupancy at BLOCK_DIM threads, per current device.
+/**
+ * @brief Get a target number of CTAs for chunking segments, based on the current device's
+ * occupancy.
+ *
+ * Two waves of full occupancy at BLOCK_DIM threads, per current device.
+ */
 uint32_t get_target_ctas()
 {
   int device = 0;
@@ -193,11 +198,12 @@ uint32_t get_target_ctas()
   return cached;
 }
 
-/// Split per-segment descriptors into smaller row sub-ranges so the kernel
-/// grid fills available SMs. Below MIN_ROWS_PER_CHUNK the per-CTA overhead
-/// dominates and we keep the original shape. Used for per-row work
-/// (compute_lengths, gather); per-dict work (predecode, mark_nulls) keeps
-/// one-CTA-per-segment so dictionaries are not decoded per chunk.
+/**
+ * @brief Expand segment descriptors into smaller chunks.
+ *
+ * Used for per-row work (compute_lengths, gather); per-dict work (predecode, mark_nulls) keeps
+ * one-CTA-per-segment so dictionaries are not decoded per chunk.
+ */
 template <typename Desc>
 std::vector<Desc> expand_chunks(std::vector<Desc> const& descs, uint32_t target_ctas)
 {
@@ -234,6 +240,7 @@ std::vector<Desc> expand_chunks(std::vector<Desc> const& descs, uint32_t target_
 /// Bit-packed value reader. DuckDB's BitpackingPrimitives uses 32-element
 /// bit-dense groups on 32-bit boundaries; an 8-byte straddling load is still
 /// safe for widths ≤ 32. For T larger than 4 bytes we may need a third word.
+/// TODO: Refactor into common decoder utilities (see issue #781)
 template <typename T>
 __device__ __forceinline__ T unpack_value(uint32_t const* packed, uint32_t idx, uint32_t width)
 {
@@ -253,22 +260,28 @@ __device__ __forceinline__ T unpack_value(uint32_t const* packed, uint32_t idx, 
   return static_cast<T>(result & mask);
 }
 
-/// Host-side counterpart to `unpack_value` — byte-addressed, used during
-/// `prepare_dict_fsst` to walk header regions copied to host.
+/**
+ * @brief Extracts @p width bit value at logical index @p idx from a byte-aligned bitpacked stream
+ * @p packed.
+ */
 template <typename T>
-inline T host_unpack_bitpacked(uint8_t const* packed, uint32_t idx, uint32_t width)
+T host_unpack_bitpacked(uint8_t const* packed, uint32_t idx, uint32_t width)
 {
   if (width == 0) return T(0);
-  uint64_t bit_pos  = static_cast<uint64_t>(idx) * width;
-  uint32_t byte_off = static_cast<uint32_t>(bit_pos >> 3);
-  uint32_t bit_off  = static_cast<uint32_t>(bit_pos & 7u);
+  auto const bit_pos  = static_cast<uint64_t>(idx) * width;
+  auto const byte_off = static_cast<uint32_t>(bit_pos / CHAR_BIT);
+  auto const bit_off  = static_cast<uint32_t>(bit_pos % CHAR_BIT);
   uint64_t combined;
   std::memcpy(&combined, packed + byte_off, sizeof(uint64_t));
   uint64_t mask = (width >= 64) ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
   return static_cast<T>((combined >> bit_off) & mask);
 }
 
-/// false on malformed metadata; callers zero-fill.
+/**
+ * @brief Parse DICTIONARY header @p hdr from @p base, bounded by the buffer size @p limit.
+ * @return true if the header was successfully parsed (i.e. the header fits within the buffer), and
+ * if the header metadata is valid; false otherwise.
+ */
 __device__ __forceinline__ bool parse_dict_header(uint8_t const* base,
                                                   uint32_t limit,
                                                   dict_header_t* hdr)
@@ -472,6 +485,10 @@ __global__ void kernel_gather_dict_warp(string_chunk_desc const* __restrict__ de
   }
 }
 
+/**
+ * @brief Build per-segment descriptors for a DICTIONARY codec run, bucketing
+ * each segment into the short- or long-string gather path by `max_string_length`.
+ */
 prepared_dict prepare_dict(gpu_string_codec_run const& run)
 {
   prepared_dict out;
@@ -516,66 +533,67 @@ prepared_dict prepare_dict(gpu_string_codec_run const& run)
 // mode 2 (inline-decompress per row).
 //===----------------------------------------------------------------------===//
 
-//----- On-device FSST symbol-table import -----------------------------------
-
-/// Device port of duckdb_fsst_import (libfsst.cpp:429). Same opaque blob
-/// layout (8B version | 1B zeroTerminated | 8B lenHisto | packed symbols by
-/// length group 1..8,1). CUDA targets are always little-endian so the
-/// host-side swap64_if_be is a no-op here. Used by kernel_build_fsst_decoders
-/// to populate per-segment decoders without round-tripping through host.
-constexpr uint32_t FSST_VERSION_LO        = 20190218u;
-constexpr unsigned long long FSST_CORRUPT = 32774747032022883ull;  // "corrupt" in LE
-
+//----- On-device FSST symbol-table import -----------------------------------//
+/**
+ * @brief Import FSST symbol table on device from the opaque on-disk blob format.
+ *
+ * Device port of duckdb_fsst_import (libfsst.cpp:429). Same opaque blob layout (8B version | 1B
+ * zeroTerminated | 8B lenHisto | packed symbols by length group 1..8,1). Used by
+ * kernel_build_fsst_decoders to populate per-segment decoders without round-tripping through host.
+ */
 __device__ __forceinline__ bool device_fsst_import(uint8_t const* buf, fsst_decoder_compact* out)
 {
-  // Zero first so a bad header / corrupted symtab leaves a deterministic
-  // (all-zero-length) decoder.
+  constexpr uint32_t FSST_VERSION_LO = 20190218;
+  constexpr uint64_t FSST_CORRUPT    = 32774747032022883;  // "corrupt" in LE
+
+  // Zero-fill so a bad header / corrupted symtab leaves a deterministic (all-zero-length) decoder.
   for (uint32_t i = 0; i < FSST_NUM_SYMBOLS; ++i) {
     out->len[i]    = 0;
     out->symbol[i] = 0;
   }
 
   uint64_t version;
-  memcpy(&version, buf, 8);
-  if ((version >> 32) != FSST_VERSION_LO) return false;
+  memcpy(&version, buf, sizeof(uint64_t));
+  if ((version >> 32) != FSST_VERSION_LO) { return false; }
 
-  uint32_t pos     = 17;
-  uint8_t zeroTerm = buf[8] & 1u;
-  uint8_t lenHisto[8];
-  for (uint32_t i = 0; i < 8u; ++i)
-    lenHisto[i] = buf[9 + i];
+  uint32_t pos      = 17;
+  uint8_t zero_term = buf[8] & 1u;
+  uint8_t length_histo[8];
+  for (uint32_t i = 0; i < 8u; ++i) {
+    length_histo[i] = buf[9 + i];
+  }
 
   out->len[0]    = 1;
   out->symbol[0] = 0;
-  uint32_t code  = zeroTerm;
-  if (zeroTerm) lenHisto[0]--;
+  uint32_t code  = zero_term;
+  if (zero_term) length_histo[0]--;
 
   for (uint32_t l = 1; l <= 8u; ++l) {
     uint32_t hist_idx = l & 7u;         // 1,2,3,4,5,6,7,0
     uint32_t sym_len  = (l & 7u) + 1u;  // 2,3,4,5,6,7,8,1
-    for (uint32_t i = 0; i < lenHisto[hist_idx]; ++i, ++code) {
+    for (uint32_t i = 0; i < length_histo[hist_idx]; ++i, ++code) {
       out->len[code] = static_cast<uint8_t>(sym_len);
       uint64_t sym   = 0;
-      for (uint32_t j = 0; j < sym_len; ++j)
+      for (uint32_t j = 0; j < sym_len; ++j) {
         sym |= uint64_t(buf[pos + j]) << (8u * j);
+      }
       out->symbol[code] = sym;
       pos += sym_len;
     }
   }
-  while (code < 255u) {
+  while (code < FSST_NUM_SYMBOLS) {
     out->symbol[code] = FSST_CORRUPT;
     out->len[code++]  = 8u;
   }
   return true;
 }
 
-/// One CTA per segment: coalesced LDG of the symtab into shmem first, then
-/// thread 0 parses from shmem into the decoder slot. A naive one-thread-per-
-/// segment grid suffers ~3-5× from scattered LDG across distinct segment
-/// addresses (each thread reads ~300 B of symtab from a different region of
-/// device memory). Coalesced load amortizes that cost across 256 lanes; the
-/// parse itself is inherently serial (each symbol's start depends on the
-/// previous symbol's length) so we leave that to thread 0.
+/**
+ * @brief Build per-segment FSST decoders from the on-disk symbol table blob.
+ *
+ * Coalesced load of the symbol table blob for the segment into shared memory, then single-threaded
+ * parse into the fsst_decoder_compact format in global memory. One CTA per segment.
+ */
 __global__ __launch_bounds__(BLOCK_DIM, 4) void kernel_build_fsst_decoders(
   string_chunk_desc const* __restrict__ descs,
   uint32_t num_segments,
@@ -584,13 +602,11 @@ __global__ __launch_bounds__(BLOCK_DIM, 4) void kernel_build_fsst_decoders(
   auto const seg_idx = blockIdx.x;
   auto const desc    = descs[seg_idx];
 
-  __shared__ uint8_t sm_ok;
+  __shared__ bool sm_ok;
   __shared__ fsst_header_t sm_hdr;
   __shared__ uint8_t sm_symtab[FSST_SYMTAB_MAX_BYTES];
 
-  if (threadIdx.x == 0) {
-    sm_ok = parse_fsst_header(desc.d_bytes, desc.bytes_size, &sm_hdr) ? 1u : 0u;
-  }
+  if (threadIdx.x == 0) { sm_ok = parse_fsst_header(desc.d_bytes, desc.bytes_size, &sm_hdr); }
   __syncthreads();
 
   if (!sm_ok) {
@@ -601,19 +617,19 @@ __global__ __launch_bounds__(BLOCK_DIM, 4) void kernel_build_fsst_decoders(
     return;
   }
 
-  uint32_t const symtab_off = sm_hdr.fsst_symbol_table_offset;
-  uint32_t symtab_size      = desc.bytes_size - symtab_off;
-  if (symtab_size > FSST_SYMTAB_MAX_BYTES) symtab_size = FSST_SYMTAB_MAX_BYTES;
-  uint8_t const* sym_src = desc.d_bytes + symtab_off;
-  for (uint32_t i = threadIdx.x; i < symtab_size; i += blockDim.x)
+  auto const symtab_off = sm_hdr.fsst_symbol_table_offset;
+  auto const symtab_size =
+    ::cuda::std::min(desc.bytes_size - symtab_off, uint32_t{FSST_SYMTAB_MAX_BYTES});
+  auto const* sym_src = desc.d_bytes + symtab_off;
+  for (uint32_t i = threadIdx.x; i < symtab_size; i += blockDim.x) {
     sm_symtab[i] = sym_src[i];
+  }
   __syncthreads();
 
-  if (threadIdx.x == 0) device_fsst_import(sm_symtab, &d_decoders[seg_idx]);
+  if (threadIdx.x == 0) { device_fsst_import(sm_symtab, &d_decoders[seg_idx]); }
 }
 
-//----- Pass 1 (A+B): per-row compressed-byte offsets ------------------------
-
+//----- Pass 1 (A+B): per-row compressed-byte offsets ------------------------//
 /**
  * @brief Compute the per-row offsets into the FSST compressed byte stream for an FSST segment.
  *
@@ -678,8 +694,7 @@ __global__ void kernel_compute_compressed_offsets_fsst(
   }
 }
 
-//----- Pass 1 (C): per-row decompressed lengths -----------------------------
-
+//----- Pass 1 (C): per-row decompressed lengths -----------------------------//
 /**
  * @brief Compute the compressed length of a row in the FSST compressed stream, where @p comp_ptr
  * points to the start of the compressed bytes for that row, and @p sm_len is the symbol length
@@ -819,8 +834,7 @@ __global__ __launch_bounds__(BLOCK_DIM, 8) void kernel_compute_decompressed_leng
   }
 }
 
-//----- Pass 2: gather (decode + emit) ---------------------------------------
-
+//----- Pass 2: gather (decode + emit) ---------------------------------------//
 constexpr uint32_t FSST_SCRATCH_U32_PER_WARP   = 256;
 constexpr uint32_t FSST_SCRATCH_BYTES_PER_WARP = FSST_SCRATCH_U32_PER_WARP * sizeof(uint32_t);
 constexpr uint32_t FSST_MAX_CHUNK_EMIT =
@@ -905,7 +919,7 @@ __device__ __forceinline__ void warp_decode_fsst(uint8_t const* __restrict__ com
     }
 
     // Determine the write offsets into the scratch pad for this lane's decoded symbol via an
-    // inclusive Hillis-Steele scan of the decoded lengths.
+    // inclusive scan of the decoded lengths.
     auto scan = my_len;
 #pragma unroll
     for (uint32_t step = 1; step < WARP_THREADS; step <<= 1) {
@@ -1027,27 +1041,7 @@ __global__ __launch_bounds__(BLOCK_DIM, 8) void kernel_gather_fsst_chunked(
   }
 }
 
-//----- Host helpers + prepare_fsst ------------------------------------------
-
-/// Count FSST-decoded length without emitting output. Used by
-/// `prepare_dict_fsst` to size per-segment decoded-offset arrays for
-/// mode-1 DICT_FSST segments.
-inline size_t fsst_decompressed_length_host(fsst_decoder_compact const& dec,
-                                            uint8_t const* src,
-                                            size_t src_len)
-{
-  size_t pos = 0, dec_len = 0;
-  while (pos < src_len) {
-    uint8_t code = src[pos++];
-    if (code < FSST_ESC) {
-      dec_len += dec.len[code];
-    } else {
-      ++pos;
-      ++dec_len;
-    }
-  }
-  return dec_len;
-}
+//----- Host helpers + prepare_fsst ------------------------------------------//
 
 prepared_fsst prepare_fsst(gpu_string_codec_run const& run)
 {
@@ -1137,6 +1131,200 @@ prepared_fsst prepare_fsst(gpu_string_codec_run const& run)
 // dict_idx == 0 = NULL. DuckDB ships COMPRESSION_EMPTY validity for these,
 // which the overlay path skips — mark_nulls folds them in.
 //===----------------------------------------------------------------------===//
+
+/**
+ * @brief Parse DICT_FSST header @p hdr from @p base, bounded by the buffer size @p limit.
+ * @return true if the header fits within the buffer and metadata is valid; false otherwise.
+ */
+__device__ __forceinline__ bool parse_dict_fsst_header(uint8_t const* base,
+                                                       uint32_t limit,
+                                                       dict_fsst_header_t* hdr)
+{
+  if (limit < sizeof(dict_fsst_header_t)) return false;
+  memcpy(hdr, base, sizeof(dict_fsst_header_t));
+  return hdr->mode <= DICT_FSST_MODE_FSST_ONLY;
+}
+
+/**
+ * @brief Per-segment scratch input for `kernel_build_dict_fsst_data`. Filled
+ * host-side after a single batched header D2H so the kernel has all metadata
+ * it needs without re-reading the header on device. `base_off` is the
+ * cumulative `(dict_count + 1)` over prior valid segments — it indexes into
+ * the global d_byte_offsets / d_decoded_offsets arrays.
+ */
+struct dict_fsst_pre_desc {
+  uint8_t const* d_bytes;
+  uint32_t bytes_size;
+  uint32_t off_dict;
+  uint32_t off_symtab;
+  uint32_t off_slens;
+  uint32_t base_off;
+  uint32_t dict_count;
+  uint8_t mode;
+  uint8_t string_lengths_width;
+  uint8_t valid;  ///< 0 = host-validated as a stub (kernel writes zeros and returns)
+  uint8_t _pad;
+};
+static_assert(sizeof(dict_fsst_pre_desc) % 4 == 0);
+
+/**
+ * @brief One CTA per segment: parse the symbol table on device, unpack
+ * string_lengths into byte_offsets and inclusive-scan it, then for FSST modes
+ * walk each dict entry to fill decoded_offsets. Writes per-segment outputs
+ * (total decoded bytes + inline-null flag) for the host to aggregate.
+ * Same pattern as `kernel_build_fsst_decoders`.
+ */
+__global__ __launch_bounds__(BLOCK_DIM, 4) void kernel_build_dict_fsst_data(
+  dict_fsst_pre_desc const* __restrict__ pre,
+  uint32_t num_segments,
+  fsst_decoder_compact* __restrict__ d_decoders,
+  uint32_t* __restrict__ d_byte_offsets,
+  uint32_t* __restrict__ d_decoded_offsets,
+  uint32_t* __restrict__ d_per_seg_decoded_total,
+  uint8_t* __restrict__ d_per_seg_inline_null)
+{
+  using BlockScanT = cub::BlockScan<uint32_t, BLOCK_DIM>;
+
+  __shared__ typename BlockScanT::TempStorage scan_temp;
+  __shared__ uint8_t sm_symtab[FSST_SYMTAB_MAX_BYTES];
+  __shared__ uint8_t sm_len[FSST_NUM_SYMBOLS];
+
+  auto const seg_idx = blockIdx.x;
+  if (seg_idx >= num_segments) return;
+  auto const d = pre[seg_idx];
+
+  if (!d.valid) {
+    if (threadIdx.x == 0) {
+      d_per_seg_decoded_total[seg_idx] = 0;
+      d_per_seg_inline_null[seg_idx]   = 0;
+      for (uint32_t i = 0; i < FSST_NUM_SYMBOLS; ++i) {
+        d_decoders[seg_idx].len[i]    = 0;
+        d_decoders[seg_idx].symbol[i] = 0;
+      }
+    }
+    return;
+  }
+
+  auto* my_byte_off   = d_byte_offsets + d.base_off;
+  auto* my_dec_off    = d_decoded_offsets + d.base_off;
+  bool const has_fsst = (d.mode != DICT_FSST_MODE_DICTIONARY) && (d.dict_count > 1);
+
+  // Phase 1: symbol-table import on device (FSST modes only).
+  if (has_fsst) {
+    auto const symtab_size =
+      ::cuda::std::min(d.bytes_size - d.off_symtab, uint32_t{FSST_SYMTAB_MAX_BYTES});
+    for (uint32_t i = threadIdx.x; i < symtab_size; i += blockDim.x) {
+      sm_symtab[i] = d.d_bytes[d.off_symtab + i];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) { device_fsst_import(sm_symtab, &d_decoders[seg_idx]); }
+    __syncthreads();
+    // Cache sm_len[] for the per-entry walks below.
+    for (uint32_t i = threadIdx.x; i < FSST_NUM_SYMBOLS; i += blockDim.x) {
+      sm_len[i] = d_decoders[seg_idx].len[i];
+    }
+  } else {
+    for (uint32_t i = threadIdx.x; i < FSST_NUM_SYMBOLS; i += blockDim.x) {
+      d_decoders[seg_idx].len[i]    = 0;
+      d_decoders[seg_idx].symbol[i] = 0;
+    }
+  }
+  __syncthreads();
+
+  // Phase 2: unpack string_lengths into byte_offsets[1..dict_count+1).
+  // byte_offsets[0] = 0; the inclusive scan below yields the exclusive prefix
+  // sum (decoded_offsets[k] = sum of entry_lens[0..k-1]).
+  if (threadIdx.x == 0) my_byte_off[0] = 0;
+  auto const* slens_packed = reinterpret_cast<uint32_t const*>(d.d_bytes + d.off_slens);
+  for (uint32_t k = threadIdx.x; k < d.dict_count; k += blockDim.x) {
+    my_byte_off[k + 1] = unpack_value<uint32_t>(slens_packed, k, d.string_lengths_width);
+  }
+  __syncthreads();
+
+  // In-place inclusive scan over byte_offsets[0..dict_count].
+  {
+    auto const N              = d.dict_count + 1;
+    auto const max_per_thread = ::cuda::ceil_div(N, blockDim.x);
+    auto const start          = threadIdx.x * max_per_thread;
+    auto const end            = ::cuda::std::min(start + max_per_thread, N);
+    uint32_t thread_sum       = 0;
+    for (int i = start; i < end; ++i) {
+      thread_sum += my_byte_off[i];
+      my_byte_off[i] = thread_sum;
+    }
+    uint32_t exclusive_sum = 0;
+    BlockScanT(scan_temp).ExclusiveSum(thread_sum, exclusive_sum);
+    if (exclusive_sum > 0) {
+      for (int i = start; i < end; ++i) {
+        my_byte_off[i] += exclusive_sum;
+      }
+    }
+  }
+  __syncthreads();
+
+  // Phase 3: decoded_offsets.
+  if (!has_fsst) {
+    // Mode 0 (raw DICTIONARY): decoded_offsets = byte_offsets.
+    for (uint32_t k = threadIdx.x; k <= d.dict_count; k += blockDim.x) {
+      my_dec_off[k] = my_byte_off[k];
+    }
+    __syncthreads();
+  } else {
+    // FSST modes: walk each dict entry's compressed bytes, sum decoded lengths.
+    // Entry k = 0 is the reserved NULL slot (decoded length = 0); per host
+    // contract decoded_offsets[base+1] = decoded_offsets[base] regardless of
+    // entry_lens[0].
+    if (threadIdx.x == 0) my_dec_off[0] = 0;
+    if (threadIdx.x == 0 && d.dict_count >= 1) my_dec_off[1] = 0;  // entry 0 is NULL
+    auto const* dict_bytes_base = d.d_bytes + d.off_dict;
+    for (uint32_t k = threadIdx.x + 1; k < d.dict_count; k += blockDim.x) {
+      auto const comp_start = my_byte_off[k];
+      auto const comp_len   = my_byte_off[k + 1] - comp_start;
+      auto const* cp        = dict_bytes_base + comp_start;
+      uint32_t decomp_len   = 0;
+      uint32_t pos          = 0;
+      while (pos < comp_len) {
+        uint8_t code = cp[pos++];
+        if (code < FSST_ESC) {
+          decomp_len += sm_len[code];
+        } else {
+          ++pos;
+          ++decomp_len;
+        }
+      }
+      my_dec_off[k + 1] = decomp_len;
+    }
+    __syncthreads();
+
+    // In-place inclusive scan over decoded_offsets[0..dict_count].
+    auto const N              = d.dict_count + 1u;
+    auto const max_per_thread = ::cuda::ceil_div(N, blockDim.x);
+    auto const start          = threadIdx.x * max_per_thread;
+    auto const end            = ::cuda::std::min(start + max_per_thread, N);
+    uint32_t thread_sum       = 0;
+    for (uint32_t i = start; i < end; ++i) {
+      thread_sum += my_dec_off[i];
+      my_dec_off[i] = thread_sum;
+    }
+    uint32_t exclusive_sum = 0;
+    BlockScanT(scan_temp).ExclusiveSum(thread_sum, exclusive_sum);
+    if (exclusive_sum > 0) {
+      for (uint32_t i = start; i < end; ++i) {
+        my_dec_off[i] += exclusive_sum;
+      }
+    }
+    __syncthreads();
+  }
+
+  // Phase 4: per-segment scalars.
+  if (threadIdx.x == 0) {
+    d_per_seg_decoded_total[seg_idx] = my_dec_off[d.dict_count];
+    // entry_lens[0] = byte_offsets[1] - byte_offsets[0] = byte_offsets[1].
+    bool const any_null =
+      (d.mode != DICT_FSST_MODE_FSST_ONLY) && (d.dict_count > 1) && (my_byte_off[1] == 0);
+    d_per_seg_inline_null[seg_idx] = any_null ? 1 : 0;
+  }
+}
 
 __global__ void kernel_compute_lengths_dict_fsst(dict_fsst_desc const* __restrict__ descs,
                                                  uint32_t* __restrict__ d_lengths,
@@ -1333,7 +1521,7 @@ __global__ void kernel_dict_fsst_mark_nulls(dict_fsst_desc const* __restrict__ d
 }
 
 /// Stub descriptor for malformed segments — kernel zero-fills these rows.
-inline dict_fsst_desc make_stub_dict_fsst_desc(gpu_string_segment_desc const& seg)
+dict_fsst_desc make_stub_dict_fsst_desc(gpu_string_segment_desc const& seg)
 {
   return {seg.d_bytes,
           seg.bytes_size,
@@ -1351,7 +1539,53 @@ inline dict_fsst_desc make_stub_dict_fsst_desc(gpu_string_segment_desc const& se
           {0, 0, 0, 0, 0, 0}};
 }
 
-prepared_dict_fsst prepare_dict_fsst(gpu_string_codec_run const& run)
+/**
+ * @brief Resizable pinned-host scratch pool. cudaMallocHost is expensive
+ * (~ms per call for MB-class allocations) so we keep a single buffer per
+ * usage site and grow it on demand — once warm, subsequent calls pay zero
+ * allocation cost.
+ */
+class pinned_host_pool {
+  void* ptr_  = nullptr;
+  size_t cap_ = 0;
+
+ public:
+  void* get(size_t bytes)
+  {
+    if (bytes > cap_) {
+      if (ptr_) cudaFreeHost(ptr_);
+      ptr_ = nullptr;
+      cap_ = 0;
+      if (bytes > 0) {
+        RMM_CUDA_TRY(cudaMallocHost(&ptr_, bytes));
+        cap_ = bytes;
+      }
+    }
+    return ptr_;
+  }
+  ~pinned_host_pool()
+  {
+    if (ptr_) cudaFreeHost(ptr_);
+  }
+};
+
+/**
+ * @brief Build per-segment DICT_FSST predecode state on device.
+ *
+ * Pipeline:
+ *   1. Batched async D2H of all headers (one stream-sync, pinned host pool).
+ *   2. Validate headers + compute per-segment region offsets and a cumulative
+ *      `base_off` into the flat byte_offsets / decoded_offsets arrays.
+ *   3. Launch `kernel_build_dict_fsst_data` — one CTA per segment does symbol
+ *      table import, string_lengths unpack + scan, FSST per-entry decoded
+ *      length walks, and per-segment scalar outputs.
+ *   4. Batched async D2H of the small result buffers (one stream-sync).
+ *   5. Host-side build of `dict_fsst_desc[]` with the cross-segment
+ *      `predecode_seg_offset` prefix sum.
+ */
+prepared_dict_fsst prepare_dict_fsst(gpu_string_codec_run const& run,
+                                     rmm::cuda_stream_view stream,
+                                     rmm::device_async_resource_ref mr)
 {
   prepared_dict_fsst out;
   out.any_inline_nulls      = false;
@@ -1359,23 +1593,44 @@ prepared_dict_fsst prepare_dict_fsst(gpu_string_codec_run const& run)
   out.descs.reserve(run.segments.size());
   out.decoders.reserve(run.segments.size());
 
-  for (auto const& seg : run.segments) {
-    if (seg.row_count == 0) continue;
-    if (seg.bytes_size < sizeof(dict_fsst_header_t)) {
-      out.descs.push_back(make_stub_dict_fsst_desc(seg));
+  uint32_t const num_segs = static_cast<uint32_t>(run.segments.size());
+  if (num_segs == 0) return out;
+
+  // Phase 1: batched async D2H of all headers into pinned host memory.
+  // Replaces N synchronous cudaMemcpy(header) calls with a single sync. The
+  // pinned pool amortizes cudaMallocHost across calls — first call pays, the
+  // rest are zero-cost.
+  static thread_local pinned_host_pool headers_pool;
+  auto* headers =
+    static_cast<dict_fsst_header_t*>(headers_pool.get(sizeof(dict_fsst_header_t) * num_segs));
+  for (uint32_t i = 0; i < num_segs; ++i) {
+    auto const& seg = run.segments[i];
+    if (seg.row_count == 0 || seg.bytes_size < sizeof(dict_fsst_header_t)) {
+      headers[i].mode = 0xFFu;  // out-of-range marker, host-validated below
       continue;
     }
+    RMM_CUDA_TRY(cudaMemcpyAsync(&headers[i],
+                                 seg.d_bytes,
+                                 sizeof(dict_fsst_header_t),
+                                 cudaMemcpyDeviceToHost,
+                                 stream.value()));
+  }
+  RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));
 
-    // Two targeted D2H reads — dict_indices stays on device.
-    dict_fsst_header_t hdr;
-    RMM_CUDA_TRY(cudaMemcpy(&hdr, seg.d_bytes, sizeof(hdr), cudaMemcpyDeviceToHost));
+  // Phase 2: validate, compute per-segment region offsets + cumulative
+  // base_off into the global byte/decoded_offsets arrays.
+  std::vector<dict_fsst_pre_desc> pre(num_segs);
+  uint32_t total_dict_entries = 0;  // sum of (dict_count + 1) for valid segs
+  for (uint32_t i = 0; i < num_segs; ++i) {
+    auto const& seg = run.segments[i];
+    auto& p         = pre[i];
+    p.valid         = 0;
+    p.d_bytes       = seg.d_bytes;
+    p.bytes_size    = seg.bytes_size;
+    if (seg.row_count == 0 || seg.bytes_size < sizeof(dict_fsst_header_t)) continue;
+    auto const& hdr = headers[i];
+    if (hdr.mode > DICT_FSST_MODE_FSST_ONLY) continue;
 
-    if (hdr.mode > DICT_FSST_MODE_FSST_ONLY) {
-      out.descs.push_back(make_stub_dict_fsst_desc(seg));
-      continue;
-    }
-
-    // Region offsets; each region 8-byte aligned (DuckDB AlignValue).
     uint32_t off_dict   = align_up8(static_cast<uint32_t>(sizeof(hdr)));
     uint32_t off_symtab = align_up8(off_dict + hdr.dict_size);
     uint32_t off_slens  = (hdr.mode == DICT_FSST_MODE_DICTIONARY)
@@ -1383,88 +1638,144 @@ prepared_dict_fsst prepare_dict_fsst(gpu_string_codec_run const& run)
                             : align_up8(off_symtab + hdr.symbol_table_size);
     uint32_t slens_bits = hdr.dict_count * hdr.string_lengths_width;
     uint32_t off_didx   = align_up8(off_slens + (slens_bits + 7u) / 8u);
+    if (off_didx > seg.bytes_size && hdr.mode != DICT_FSST_MODE_FSST_ONLY) continue;
 
-    if (off_didx > seg.bytes_size && hdr.mode != DICT_FSST_MODE_FSST_ONLY) {
+    p.off_dict             = off_dict;
+    p.off_symtab           = off_symtab;
+    p.off_slens            = off_slens;
+    p.dict_count           = hdr.dict_count;
+    p.mode                 = hdr.mode;
+    p.string_lengths_width = hdr.string_lengths_width;
+    p.base_off             = total_dict_entries;
+    p.valid                = 1;
+    total_dict_entries += hdr.dict_count + 1u;
+  }
+
+  if (total_dict_entries == 0) {
+    for (auto const& seg : run.segments) {
+      if (seg.row_count > 0) out.descs.push_back(make_stub_dict_fsst_desc(seg));
+    }
+    return out;
+  }
+
+  // Phase 3: launch the on-device prep kernel. Replaces the per-segment host
+  // pipeline (D2H prefix + duckdb_fsst_import + host walks).
+  rmm::device_buffer d_pre_buf(pre.size() * sizeof(dict_fsst_pre_desc), stream, mr);
+  RMM_CUDA_TRY(cudaMemcpyAsync(d_pre_buf.data(),
+                               pre.data(),
+                               pre.size() * sizeof(dict_fsst_pre_desc),
+                               cudaMemcpyHostToDevice,
+                               stream.value()));
+  rmm::device_buffer d_decoders_buf(num_segs * sizeof(fsst_decoder_compact), stream, mr);
+  rmm::device_buffer d_byte_off_buf(total_dict_entries * sizeof(uint32_t), stream, mr);
+  rmm::device_buffer d_dec_off_buf(total_dict_entries * sizeof(uint32_t), stream, mr);
+  rmm::device_buffer d_per_seg_total_buf(num_segs * sizeof(uint32_t), stream, mr);
+  rmm::device_buffer d_per_seg_inline_null_buf(num_segs * sizeof(uint8_t), stream, mr);
+
+  kernel_build_dict_fsst_data<<<num_segs, BLOCK_DIM, 0, stream.value()>>>(
+    static_cast<dict_fsst_pre_desc const*>(d_pre_buf.data()),
+    num_segs,
+    static_cast<fsst_decoder_compact*>(d_decoders_buf.data()),
+    static_cast<uint32_t*>(d_byte_off_buf.data()),
+    static_cast<uint32_t*>(d_dec_off_buf.data()),
+    static_cast<uint32_t*>(d_per_seg_total_buf.data()),
+    static_cast<uint8_t*>(d_per_seg_inline_null_buf.data()));
+
+  // Phase 4: pull results back into host vectors (small — single ~5 MB D2H
+  // for typical TPC-H multi-segment workloads).
+  out.decoders.resize(num_segs);
+  out.byte_offsets.resize(total_dict_entries);
+  out.decoded_offsets.resize(total_dict_entries);
+  std::vector<uint32_t> per_seg_total(num_segs);
+  std::vector<uint8_t> per_seg_inline_null(num_segs);
+
+  static thread_local pinned_host_pool d2h_pool;
+  size_t const d2h_bytes = num_segs * sizeof(fsst_decoder_compact) +
+                           2 * total_dict_entries * sizeof(uint32_t) + num_segs * sizeof(uint32_t) +
+                           num_segs * sizeof(uint8_t);
+  auto* staging      = static_cast<uint8_t*>(d2h_pool.get(d2h_bytes));
+  size_t off         = 0;
+  auto* pin_decoders = reinterpret_cast<fsst_decoder_compact*>(staging + off);
+  off += num_segs * sizeof(fsst_decoder_compact);
+  auto* pin_byte_off = reinterpret_cast<uint32_t*>(staging + off);
+  off += total_dict_entries * sizeof(uint32_t);
+  auto* pin_dec_off = reinterpret_cast<uint32_t*>(staging + off);
+  off += total_dict_entries * sizeof(uint32_t);
+  auto* pin_per_seg_total = reinterpret_cast<uint32_t*>(staging + off);
+  off += num_segs * sizeof(uint32_t);
+  auto* pin_per_seg_inline_null = reinterpret_cast<uint8_t*>(staging + off);
+
+  RMM_CUDA_TRY(cudaMemcpyAsync(pin_decoders,
+                               d_decoders_buf.data(),
+                               num_segs * sizeof(fsst_decoder_compact),
+                               cudaMemcpyDeviceToHost,
+                               stream.value()));
+  RMM_CUDA_TRY(cudaMemcpyAsync(pin_byte_off,
+                               d_byte_off_buf.data(),
+                               total_dict_entries * sizeof(uint32_t),
+                               cudaMemcpyDeviceToHost,
+                               stream.value()));
+  RMM_CUDA_TRY(cudaMemcpyAsync(pin_dec_off,
+                               d_dec_off_buf.data(),
+                               total_dict_entries * sizeof(uint32_t),
+                               cudaMemcpyDeviceToHost,
+                               stream.value()));
+  RMM_CUDA_TRY(cudaMemcpyAsync(pin_per_seg_total,
+                               d_per_seg_total_buf.data(),
+                               num_segs * sizeof(uint32_t),
+                               cudaMemcpyDeviceToHost,
+                               stream.value()));
+  RMM_CUDA_TRY(cudaMemcpyAsync(pin_per_seg_inline_null,
+                               d_per_seg_inline_null_buf.data(),
+                               num_segs * sizeof(uint8_t),
+                               cudaMemcpyDeviceToHost,
+                               stream.value()));
+  RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+
+  std::memcpy(out.decoders.data(), pin_decoders, num_segs * sizeof(fsst_decoder_compact));
+  std::memcpy(out.byte_offsets.data(), pin_byte_off, total_dict_entries * sizeof(uint32_t));
+  std::memcpy(out.decoded_offsets.data(), pin_dec_off, total_dict_entries * sizeof(uint32_t));
+  std::memcpy(per_seg_total.data(), pin_per_seg_total, num_segs * sizeof(uint32_t));
+  std::memcpy(per_seg_inline_null.data(), pin_per_seg_inline_null, num_segs * sizeof(uint8_t));
+
+  // Phase 5: build dict_fsst_desc[] on host. predecode_seg_offset is a
+  // cross-segment cumulative scan over per_seg_total (mode-1 segs only).
+  uint32_t predecode_cursor = 0;
+  for (uint32_t i = 0; i < num_segs; ++i) {
+    auto const& seg = run.segments[i];
+    if (seg.row_count == 0) continue;
+    auto const& p = pre[i];
+    if (!p.valid) {
       out.descs.push_back(make_stub_dict_fsst_desc(seg));
       continue;
     }
-
-    // +7B pad: host_unpack_bitpacked reads 8B at a time at the tail.
-    uint32_t prefix_bytes = std::min(off_didx, seg.bytes_size);
-    std::vector<uint8_t> host_bytes_vec(size_t{prefix_bytes} + 7u, 0u);
-    uint8_t* host_bytes = host_bytes_vec.data();
-    RMM_CUDA_TRY(cudaMemcpy(host_bytes, seg.d_bytes, prefix_bytes, cudaMemcpyDeviceToHost));
-
-    // entry_lens[k] = bitpacked length of dict entry k (compressed in FSST modes).
-    std::vector<uint32_t> entry_lens(hdr.dict_count, 0);
-    uint8_t const* slens_ptr = host_bytes + off_slens;
-    for (uint32_t k = 0; k < hdr.dict_count; ++k) {
-      entry_lens[k] = host_unpack_bitpacked<uint32_t>(slens_ptr, k, hdr.string_lengths_width);
+    auto const& hdr        = headers[i];
+    uint32_t predecode_off = 0;
+    if (p.mode == DICT_FSST_MODE_DICT_FSST) {
+      predecode_off = predecode_cursor;
+      predecode_cursor += per_seg_total[i];
     }
-
-    // byte_offsets[k] = cumulative compressed-byte position of entry k.
-    uint32_t base_off = static_cast<uint32_t>(out.byte_offsets.size());
-    out.byte_offsets.resize(base_off + hdr.dict_count + 1u);
-    out.byte_offsets[base_off] = 0u;
-    for (uint32_t k = 0; k < hdr.dict_count; ++k) {
-      out.byte_offsets[base_off + k + 1] = out.byte_offsets[base_off + k] + entry_lens[k];
-    }
-
-    // decoded_offsets[k]: same as byte_offsets in mode 0, FSST-walked otherwise.
-    fsst_decoder_compact compact{};
-    if (hdr.mode != DICT_FSST_MODE_DICTIONARY) {
-      fsst_decoder_full full{};
-      duckdb_fsst_import(&full, host_bytes + off_symtab);
-      std::memcpy(compact.len, full.len, sizeof(compact.len));
-      std::memcpy(compact.symbol, full.symbol, sizeof(compact.symbol));
-    }
-    out.decoders.push_back(compact);
-
-    out.decoded_offsets.resize(base_off + hdr.dict_count + 1u);
-    out.decoded_offsets[base_off] = 0u;
-    if (hdr.mode == DICT_FSST_MODE_DICTIONARY) {
-      // Raw dict — decoded == compressed.
-      for (uint32_t k = 0; k <= hdr.dict_count; ++k) {
-        out.decoded_offsets[base_off + k] = out.byte_offsets[base_off + k];
-      }
-    } else {
-      uint8_t const* dict_bytes = host_bytes + off_dict;
-      for (uint32_t k = 0; k < hdr.dict_count; ++k) {
-        size_t comp_start = out.byte_offsets[base_off + k];
-        size_t comp_len   = entry_lens[k];
-        size_t dec_len =
-          (k == 0) ? 0 : fsst_decompressed_length_host(compact, dict_bytes + comp_start, comp_len);
-        out.decoded_offsets[base_off + k + 1] =
-          out.decoded_offsets[base_off + k] + static_cast<uint32_t>(dec_len);
-      }
-    }
-
-    // dict_count>1 + entry_lens[0]==0 => inline-NULL encoding used.
-    out.any_inline_nulls = out.any_inline_nulls || (hdr.mode != DICT_FSST_MODE_FSST_ONLY &&
-                                                    hdr.dict_count > 1 && entry_lens[0] == 0u);
-
-    // Mode-1 only reserves predecode-buffer space.
-    uint32_t predecode_off = 0u;
-    if (hdr.mode == DICT_FSST_MODE_DICT_FSST) {
-      predecode_off = out.total_predecode_bytes;
-      out.total_predecode_bytes += out.decoded_offsets[base_off + hdr.dict_count];
-    }
-
-    out.descs.push_back({seg.d_bytes,
-                         seg.bytes_size,
-                         seg.row_count,
-                         seg.row_offset,
-                         seg.seg_row_start,
-                         off_dict,
-                         (hdr.mode == DICT_FSST_MODE_FSST_ONLY) ? 0u : off_didx,
-                         base_off,
-                         static_cast<uint32_t>(out.decoders.size() - 1u),
-                         hdr.dict_count,
-                         predecode_off,
-                         hdr.dictionary_indices_width,
-                         hdr.mode,
-                         {0, 0, 0, 0, 0, 0}});
+    out.descs.push_back(
+      {seg.d_bytes,
+       seg.bytes_size,
+       seg.row_count,
+       seg.row_offset,
+       seg.seg_row_start,
+       p.off_dict,
+       (p.mode == DICT_FSST_MODE_FSST_ONLY)
+         ? 0u
+         : align_up8(p.off_slens + (p.dict_count * p.string_lengths_width + 7u) / 8u),
+       p.base_off,
+       i,  // seg_decoder_idx — 1:1 with seg_idx in the new layout
+       p.dict_count,
+       predecode_off,
+       hdr.dictionary_indices_width,
+       p.mode,
+       {0, 0, 0, 0, 0, 0}});
+    if (per_seg_inline_null[i]) out.any_inline_nulls = true;
   }
+  out.total_predecode_bytes = predecode_cursor;
+
   return out;
 }
 
@@ -1492,14 +1803,15 @@ void overlay_validity_run(gpu_codec_run const& run, uint8_t* d_mask, rmm::cuda_s
       throw std::runtime_error("gpu_decode_strings_column: validity row_offset (" +
                                std::to_string(seg.row_offset) + ") not byte-aligned");
     }
-    size_t bytes = (size_t{seg.row_count} + 7) / 8;
-    if (size_t{seg.bytes_size} < bytes) {
+    auto const bytes  = ::cuda::ceil_div(seg.row_count, 8);
+    auto const offset = seg.row_offset / 8;
+    if (seg.bytes_size < bytes) {
       throw std::runtime_error("gpu_decode_strings_column: validity segment bytes_size (" +
                                std::to_string(seg.bytes_size) + ") < required " +
                                std::to_string(bytes));
     }
     RMM_CUDA_TRY(cudaMemcpyAsync(
-      d_mask + seg.row_offset / 8, seg.d_bytes, bytes, cudaMemcpyDeviceToDevice, stream.value()));
+      d_mask + offset, seg.d_bytes, bytes, cudaMemcpyDeviceToDevice, stream.value()));
   }
 }
 
@@ -1556,10 +1868,10 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
         break;
       }
       case duckdb::CompressionType::COMPRESSION_DICT_FSST: {
-        auto p                  = prepare_dict_fsst(run);
-        uint32_t bo_base        = static_cast<uint32_t>(prep_dict_fsst.byte_offsets.size());
-        uint32_t dec_base       = static_cast<uint32_t>(prep_dict_fsst.decoders.size());
-        uint32_t predecode_base = prep_dict_fsst.total_predecode_bytes;
+        auto p                    = prepare_dict_fsst(run, stream, mr);
+        auto const bo_base        = static_cast<uint32_t>(prep_dict_fsst.byte_offsets.size());
+        auto const dec_base       = static_cast<uint32_t>(prep_dict_fsst.decoders.size());
+        auto const predecode_base = prep_dict_fsst.total_predecode_bytes;
         for (auto& d : p.descs) {
           d.seg_dict_offset_base += bo_base;
           d.seg_decoder_idx += dec_base;
@@ -1734,8 +2046,8 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
   }
 
   // Prefix-sum lengths → byte offsets per row.
-  size_t cub_bytes = 0;
-  int const scan_n = static_cast<int>(total_rows) + 1;
+  size_t cub_bytes  = 0;
+  auto const scan_n = static_cast<int>(total_rows) + 1;
   cub::DeviceScan::ExclusiveSum(nullptr,
                                 cub_bytes,
                                 d_lengths.data(),
@@ -1751,7 +2063,7 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
                                 stream.value());
 
   // cudf strings offsets are int32; reject up front if the upper bound exceeds it.
-  constexpr size_t INT32_MAX_SIZE = static_cast<size_t>(std::numeric_limits<int32_t>::max());
+  constexpr auto INT32_MAX_SIZE = static_cast<size_t>(std::numeric_limits<int32_t>::max());
   if (!needs_exact_total && cum_chars_upper > INT32_MAX_SIZE) {
     throw std::runtime_error("gpu_decode_strings_column: estimated total_chars (" +
                              std::to_string(cum_chars_upper) + ") exceeds int32 max");
