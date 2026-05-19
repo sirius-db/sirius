@@ -20,6 +20,7 @@
 // sirius
 #include <op/sirius_physical_operator.hpp>
 #include <scan_manager/split_connector.hpp>
+#include <scan_manager/split_provider.hpp>
 
 // standard library
 #include <future>
@@ -42,15 +43,27 @@ struct tagged_split : public op::operator_data {
   int tag;
 };
 
+// Test-only provider that re-exposes the protected push_to_connector helper.
+// split_connector::push_split is private and reachable only via this gate, so
+// tests that exercise the connector queue directly go through the provider.
+struct test_pusher : public split_provider {
+  using split_provider::push_to_connector;
+  [[nodiscard]] bool has_more_splits() const override { return false; }
+  std::function<std::vector<std::unique_ptr<op::operator_data>>()> next_split_provider() override
+  {
+    return nullptr;
+  }
+};
+
 }  // namespace
 
 TEST_CASE("split_connector - push then get returns FIFO", "[scan_manager][split_connector]")
 {
   split_connector connector;
 
-  connector.push_split(std::make_unique<tagged_split>(1));
-  connector.push_split(std::make_unique<tagged_split>(2));
-  connector.push_split(std::make_unique<tagged_split>(3));
+  test_pusher::push_to_connector(connector, std::make_unique<tagged_split>(1));
+  test_pusher::push_to_connector(connector, std::make_unique<tagged_split>(2));
+  test_pusher::push_to_connector(connector, std::make_unique<tagged_split>(3));
 
   REQUIRE(connector.has_more_splits());
   REQUIRE_FALSE(connector.is_closed());
@@ -86,8 +99,8 @@ TEST_CASE("split_connector - close after pushes drains then returns nullopt",
           "[scan_manager][split_connector]")
 {
   split_connector connector;
-  connector.push_split(std::make_unique<tagged_split>(7));
-  connector.push_split(std::make_unique<tagged_split>(8));
+  test_pusher::push_to_connector(connector, std::make_unique<tagged_split>(7));
+  test_pusher::push_to_connector(connector, std::make_unique<tagged_split>(8));
   connector.close();
 
   // Closed but not drained — is_closed() should report false until items are pulled.
@@ -138,7 +151,8 @@ TEST_CASE("split_connector - multi-producer / multi-consumer preserves all items
   for (int p = 0; p < k_producers; ++p) {
     producers.emplace_back([&, p] {
       for (int i = 0; i < k_pushes_per_producer; ++i) {
-        connector.push_split(std::make_unique<tagged_split>(p * k_pushes_per_producer + i));
+        test_pusher::push_to_connector(
+          connector, std::make_unique<tagged_split>(p * k_pushes_per_producer + i));
       }
     });
   }

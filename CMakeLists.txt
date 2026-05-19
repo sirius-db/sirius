@@ -148,6 +148,7 @@ set(EXTENSION_SOURCES
     src/data/host_parquet_representation_converters.cpp
     src/downgrade/downgrade_executor.cpp
     src/expression/expression.cpp
+    src/expression/function_id.cpp
     src/expression/join_condition.cpp
     src/expression/value.cpp
     src/expression_executor/expression_executor_strategy.cpp
@@ -165,6 +166,7 @@ set(EXTENSION_SOURCES
     src/expression_executor/specializations/gpu_execute_reference.cpp
     src/io/admission_control.cpp
     src/io/datasource_factory.cpp
+    src/io/io_context.cpp
     src/io/prefetching_cache.cpp
     src/io/s3/sigv4.cpp
     src/io/s3/sirius_sigv4_credential_provider.cpp
@@ -183,6 +185,7 @@ set(EXTENSION_SOURCES
     src/op/scan/cached_ranges.cpp
     src/op/scan/duckdb_scan_executor.cpp
     src/op/scan/cpu_source_task.cpp
+    src/op/scan/duckdb_native_metadata.cpp
     src/op/scan/duckdb_scan_task.cpp
     src/op/scan/equality_delete_filter.cpp
     src/op/scan/hive_partition.cpp
@@ -198,6 +201,7 @@ set(EXTENSION_SOURCES
     src/op/scan/scan_plan.cpp
     src/op/scan/scan_utils.cpp
     src/op/scan/sirius_gpu_parquet_scan_operator.cpp
+    src/op/sirius_dynamic_filter.cpp
     src/op/sirius_physical_column_data_scan.cpp
     src/op/sirius_physical_cpu_source.cpp
     src/op/sirius_physical_concat.cpp
@@ -234,6 +238,7 @@ set(EXTENSION_SOURCES
     src/pipeline/sirius_meta_pipeline.cpp
     src/pipeline/sirius_pipeline.cpp
     src/pipeline/sirius_pipeline_converter.cpp
+    src/pipeline/repository_wiring_materializer.cpp
     src/pipeline/sirius_plan_printer.cpp
     src/pipeline/task_request.cpp
     src/planner/query.cpp
@@ -259,6 +264,7 @@ set(EXTENSION_SOURCES
     src/scan_manager/parquet_split_provider.cpp
     src/scan_manager/sirius_scan_manager.cpp
     src/scan_manager/split_connector.cpp
+    src/scan_manager/split_provider.cpp
     src/sirius_config.cpp
     src/sirius_context.cpp
     src/sirius_engine.cpp
@@ -274,7 +280,8 @@ set(EXTENSION_SOURCES
 # Legacy Sirius — all legacy-specific config lives in src/legacy/CMakeLists.txt.
 # Deleting src/legacy/ cleanly removes legacy build support.
 set(CUDA_SOURCES
-    src/op/scan/equality_delete_mask.cu src/cuda/scan/gpu_decode_bitpacking.cu
+    src/op/scan/equality_delete_mask.cu src/cuda/scan/gpu_decode_alp.cu
+    src/cuda/scan/gpu_decode_bitpacking.cu src/cuda/scan/gpu_decode_rle.cu
     src/cuda/scan/gpu_decode_strings.cu src/cuda/scan/gpu_native_decode.cu)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
   add_subdirectory(src/legacy)
@@ -376,6 +383,7 @@ set(TEST_SOURCES
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/expression/test_ast_scaffold.cpp
     test/cpp/expression/test_expression.cpp
+    test/cpp/expression/test_function_id.cpp
     test/cpp/expression/test_join_condition.cpp
     test/cpp/expression/test_value.cpp
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
@@ -410,6 +418,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_no_history_peak_memory_estimate.cpp
     test/cpp/operator/test_physical_top_n.cpp
     test/cpp/operator/test_physical_ungrouped_aggregate.cpp
+    test/cpp/operator/test_sirius_dynamic_filter.cpp
     test/cpp/parallel/test_task_executor.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
@@ -419,10 +428,14 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_gpu_pipeline_disk_readback.cpp
     test/cpp/pipeline/test_get_next_ports_after_sink.cpp
     test/cpp/pipeline/test_plan_printer.cpp
+    test/cpp/pipeline/test_repository_wiring_materializer.cpp
     test/cpp/pipeline/test_task_scheduler.cpp
     test/cpp/scan/bench_decode_codecs.cpp
     test/cpp/scan/test_column_builder.cpp
+    test/cpp/scan/test_duckdb_native_walker.cpp
+    test/cpp/scan/test_gpu_decode_alp.cpp
     test/cpp/scan/test_gpu_decode_bitpacking.cpp
+    test/cpp/scan/test_gpu_decode_rle.cpp
     test/cpp/scan/test_gpu_decode_strings.cpp
     test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
@@ -480,3 +493,38 @@ if(SIRIUS_LEGACY_COMPILE_DEFINITIONS)
   target_compile_definitions(sirius_unittest
                              PRIVATE ${SIRIUS_LEGACY_COMPILE_DEFINITIONS})
 endif()
+
+# -----------------------------------------------------------------------------
+# test/io/parquet_benchmark — standalone benchmark binary for sirius_datasource
+# -----------------------------------------------------------------------------
+add_executable(parquet_benchmark test/io/parquet_benchmark.cpp)
+
+if(VCPKG_BUILD)
+  set_target_properties(parquet_benchmark PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+  target_include_directories(parquet_benchmark BEFORE PRIVATE ${_VCPKG_INC})
+endif()
+
+target_include_directories(
+  parquet_benchmark
+  PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
+
+target_link_libraries(
+  parquet_benchmark
+  sirius_extension
+  duckdb_static
+  cudf::cudf
+  rmm::rmm
+  spdlog::spdlog
+  cuCascade::cucascade
+  PkgConfig::LIBURING
+  PkgConfig::NUMA)
+link_extension_libraries(parquet_benchmark "")
+
+target_link_options(parquet_benchmark PRIVATE
+                    "LINKER:--allow-multiple-definition")
+
+set_target_properties(
+  parquet_benchmark
+  PROPERTIES CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
