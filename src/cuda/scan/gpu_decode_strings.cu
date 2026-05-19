@@ -329,10 +329,10 @@ __global__ void kernel_compute_lengths_uncomp(string_chunk_desc const* __restric
 {
   auto const chunk_id = blockIdx.x;
   if (chunk_id >= num_chunks) return;
-  auto const desc      = descs[chunk_id];
-  auto const* base     = desc.d_bytes;
-  auto const limit     = desc.bytes_size;
-  auto const end_row   = desc.seg_row_start + desc.row_count;
+  auto const desc    = descs[chunk_id];
+  auto const* base   = desc.d_bytes;
+  auto const limit   = desc.bytes_size;
+  auto const end_row = desc.seg_row_start + desc.row_count;
 
   __shared__ bool sm_ok;
   if (threadIdx.x == 0) { sm_ok = (limit >= 8u + size_t{end_row} * 4u); }
@@ -346,11 +346,11 @@ __global__ void kernel_compute_lengths_uncomp(string_chunk_desc const* __restric
 
   auto const* duck_offsets = reinterpret_cast<int32_t const*>(base + 8);
   for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
-    auto const seg_i = desc.seg_row_start + i;
-    auto const cur   = duck_offsets[seg_i];
-    auto const prev  = (seg_i > 0) ? duck_offsets[seg_i - 1] : 0;
-    auto const abs_cur  = static_cast<uint32_t>(cur >= 0 ? cur : -cur);
-    auto const abs_prev = static_cast<uint32_t>(prev >= 0 ? prev : -prev);
+    auto const seg_i                     = desc.seg_row_start + i;
+    auto const cur                       = duck_offsets[seg_i];
+    auto const prev                      = (seg_i > 0) ? duck_offsets[seg_i - 1] : 0;
+    auto const abs_cur                   = static_cast<uint32_t>(cur >= 0 ? cur : -cur);
+    auto const abs_prev                  = static_cast<uint32_t>(prev >= 0 ? prev : -prev);
     d_lengths[desc.global_row_start + i] = abs_cur - abs_prev;
   }
 }
@@ -2192,10 +2192,8 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
     kernel_gather_uncomp<<<static_cast<uint32_t>(uncomp_chunks.size()),
                            BLOCK_DIM,
                            0,
-                           stream.value()>>>(d_uncomp_chunks_p,
-                                             d_offsets.data(),
-                                             d_chars_p,
-                                             static_cast<uint32_t>(uncomp_chunks.size()));
+                           stream.value()>>>(
+      d_uncomp_chunks_p, d_offsets.data(), d_chars_p, static_cast<uint32_t>(uncomp_chunks.size()));
   }
   if (!dict_chunks_short.empty()) {
     kernel_gather_dict<<<static_cast<uint32_t>(dict_chunks_short.size()),

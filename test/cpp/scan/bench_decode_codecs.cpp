@@ -1071,9 +1071,9 @@ TEST_CASE("bench FSST realistic multi-segment / TPC-H-like comments",
   }
   auto seg_blobs = sirius::test::decode::strings::make_fsst_segments_chunked(synth);
 
-  size_t total_seg_bytes  = 0;
-  uint32_t max_seg_rows   = 0;
-  uint32_t max_seg_bytes  = 0;
+  size_t total_seg_bytes = 0;
+  uint32_t max_seg_rows  = 0;
+  uint32_t max_seg_bytes = 0;
   for (auto const& [b, rc] : seg_blobs) {
     total_seg_bytes += b.size();
     max_seg_rows  = std::max(max_seg_rows, rc);
@@ -1095,8 +1095,8 @@ TEST_CASE("bench FSST realistic multi-segment / TPC-H-like comments",
   rmm::device_buffer d_all(alloc_bytes, stream.view());
   std::vector<sirius::cuda::scan::gpu_string_segment_desc> segs;
   segs.reserve(seg_blobs.size());
-  uint32_t row_cursor     = 0;
-  auto const* d_base      = static_cast<uint8_t const*>(d_all.data());
+  uint32_t row_cursor = 0;
+  auto const* d_base  = static_cast<uint8_t const*>(d_all.data());
   for (size_t k = 0; k < seg_blobs.size(); ++k) {
     auto const& [b, rc] = seg_blobs[k];
     cudaMemcpyAsync(const_cast<uint8_t*>(d_base) + seg_offsets[k],
@@ -1159,9 +1159,9 @@ TEST_CASE("bench FSST realistic multi-segment / long comments",
   }
   auto seg_blobs = sirius::test::decode::strings::make_fsst_segments_chunked(synth);
 
-  size_t total_seg_bytes  = 0;
-  uint32_t max_seg_rows   = 0;
-  uint32_t max_seg_bytes  = 0;
+  size_t total_seg_bytes = 0;
+  uint32_t max_seg_rows  = 0;
+  uint32_t max_seg_bytes = 0;
   for (auto const& [b, rc] : seg_blobs) {
     total_seg_bytes += b.size();
     max_seg_rows  = std::max(max_seg_rows, rc);
@@ -1180,8 +1180,8 @@ TEST_CASE("bench FSST realistic multi-segment / long comments",
   rmm::device_buffer d_all(alloc_bytes, stream.view());
   std::vector<sirius::cuda::scan::gpu_string_segment_desc> segs;
   segs.reserve(seg_blobs.size());
-  uint32_t row_cursor     = 0;
-  auto const* d_base      = static_cast<uint8_t const*>(d_all.data());
+  uint32_t row_cursor = 0;
+  auto const* d_base  = static_cast<uint8_t const*>(d_all.data());
   for (size_t k = 0; k < seg_blobs.size(); ++k) {
     auto const& [b, rc] = seg_blobs[k];
     cudaMemcpyAsync(const_cast<uint8_t*>(d_base) + seg_offsets[k],
@@ -1210,7 +1210,8 @@ TEST_CASE("bench FSST realistic multi-segment / long comments",
   double pct_peak = 100.0 * out_gbs / peak_d2d_gbs;
 
   std::printf(
-    "[bench] FSST realistic-long %.0fB avg, %zu segs (avg %.0f rows / %.0f B), max %u rows / %u B:\n",
+    "[bench] FSST realistic-long %.0fB avg, %zu segs (avg %.0f rows / %.0f B), max %u rows / %u "
+    "B:\n",
     avg_len,
     seg_blobs.size(),
     avg_seg_rows,
@@ -1282,8 +1283,7 @@ TEST_CASE("bench DICT_FSST mode 1 1M rows / TPC-H-like dict", "[!benchmark][scan
     double(rows) * avg_dict_len / sec / GIB);
 }
 
-TEST_CASE("bench DICT_FSST realistic multi-segment mode 1",
-          "[!benchmark][scan][decode][strings]")
+TEST_CASE("bench DICT_FSST realistic multi-segment mode 1", "[!benchmark][scan][decode][strings]")
 {
   // Realistic DuckDB layout: DICT_FSST segments cap at Storage::DEFAULT_BLOCK_SIZE
   // (~256 KiB). For TPC-H-like comments and mode-1 dicts this gives roughly
