@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -31,7 +32,8 @@ namespace {
 // for a single scan output must stay under INT32_MAX. 64 MB headroom covers
 // max_string_length being an upper bound + offsets/validity allocations.
 constexpr std::size_t VARCHAR_BYTE_CAP =
-  (static_cast<std::size_t>(1) << 31) - (static_cast<std::size_t>(64) << 20);
+  static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()) -
+  (static_cast<std::size_t>(64) * 1024 * 1024);
 
 std::size_t rg_varchar_bytes_for_col(const op::scan::duckdb_row_group_metadata& rg,
                                      std::size_t col_idx)
@@ -81,9 +83,8 @@ std::vector<duckdb_native_split_provider::row_group_batch> partition_row_groups_
       }
     }
 
-    // Decide whether to close the in-progress batch before adding this RG.
-    // Cap (c): only fire when the batch is non-empty, so a single oversized RG
-    // still makes forward progress as its own singleton batch.
+    // Close the in-progress batch only when non-empty, so a single oversized
+    // row group still progresses as its own singleton batch.
     if (i > batch_first) {
       const bool would_exceed_total =
         (approximate_batch_size > 0) && (batch_bytes + this_rg_bytes > approximate_batch_size);
@@ -141,12 +142,9 @@ duckdb_native_split_provider::duckdb_native_split_provider(
                                                     _scan_info->projected_cols,
                                                     _scan_info->projected_types);
   if (!_metadata.viable) {
-    // Throw rather than registering with zero batches: empty-splits leaves the
-    // downstream pipeline waiting forever on the FULL barrier. The throw
-    // surfaces as a query error and sirius_extension's transparent fallback
-    // (sirius_extension.cpp:520) routes to DuckDB CPU, the right home for
-    // queries our native scan can't handle. The legacy DUCKDB_SCAN GPU path
-    // is being sunsetted, so we don't try to re-route there.
+    // Empty-splits would deadlock the downstream pipeline on the FULL barrier.
+    // Throwing surfaces as a query error, which the extension's transparent
+    // fallback routes to DuckDB CPU.
     SPDLOG_DEBUG("[duckdb_native_split_provider] non-viable: {}",
                  _metadata.viability_failure_reason);
     throw std::runtime_error("duckdb-native scan rejected query: " +
