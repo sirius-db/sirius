@@ -139,10 +139,16 @@ duckdb_native_split_provider::duckdb_native_split_provider(op::scan::duckdb_nati
                                                     _scan_info->projected_cols,
                                                     _scan_info->projected_types);
   if (!_metadata.viable) {
+    // Throw rather than registering with zero batches: empty-splits leaves the
+    // downstream pipeline waiting forever on the FULL barrier. The throw
+    // surfaces as a query error and sirius_extension's transparent fallback
+    // (sirius_extension.cpp:520) routes to DuckDB CPU, the right home for
+    // queries our native scan can't handle. The legacy DUCKDB_SCAN GPU path
+    // is being sunsetted, so we don't try to re-route there.
     SPDLOG_DEBUG("[duckdb_native_split_provider] non-viable: {}",
                  _metadata.viability_failure_reason);
-    _batches.clear();
-    return;
+    throw std::runtime_error("duckdb-native scan rejected query: " +
+                             _metadata.viability_failure_reason);
   }
 
   _batches = partition_row_groups_into_batches(
