@@ -18,6 +18,7 @@
 #include <cudf/cudf_utils.hpp>
 
 #include <expression/expression_internal.hpp>
+#include <expression/function_id.hpp>
 #include <expression_executor/ast_supported_types.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 
@@ -414,9 +415,11 @@ std::size_t gpu_expression_executor::count_ast_ops(duckdb::Expression const& exp
 
       // Check the set of supported AST functions. If the function is supported, count 1 for the
       // function itself plus the ops in the children.
-      if (std::find(supported_ast_functions.begin(),
+      auto const resolved_id_opt = sirius::from_duckdb_function_name(func_expr.function.name);
+      if (resolved_id_opt.has_value() &&
+          std::find(supported_ast_functions.begin(),
                     supported_ast_functions.end(),
-                    func_expr.function.name) != supported_ast_functions.end()) {
+                    *resolved_id_opt) != supported_ast_functions.end()) {
         std::size_t count = 1;
         for (const auto& child : func_expr.children) {
           count += count_ast_ops(*child);

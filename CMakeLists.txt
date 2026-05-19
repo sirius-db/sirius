@@ -148,6 +148,7 @@ set(EXTENSION_SOURCES
     src/data/host_parquet_representation_converters.cpp
     src/downgrade/downgrade_executor.cpp
     src/expression/expression.cpp
+    src/expression/function_id.cpp
     src/expression/join_condition.cpp
     src/expression/value.cpp
     src/expression_executor/expression_executor_strategy.cpp
@@ -382,6 +383,7 @@ set(TEST_SOURCES
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/expression/test_ast_scaffold.cpp
     test/cpp/expression/test_expression.cpp
+    test/cpp/expression/test_function_id.cpp
     test/cpp/expression/test_join_condition.cpp
     test/cpp/expression/test_value.cpp
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
