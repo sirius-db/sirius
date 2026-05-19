@@ -56,9 +56,6 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
 
   void sink(const operator_data& output_data, rmm::cuda_stream_view stream) override;
 
-  //! Get the parent operator (e.g., HASH_JOIN for build concat)
-  sirius_physical_operator* get_parent_op() const { return _parent_op; }
-
   //! Used when PARTITION + `update_join_exec_mode` selects BUILD_PROBE: merge all build batches
   //! before the join so the hash join sees a single build batch.
   void set_concat_all(bool concat_all);
@@ -67,7 +64,6 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
     const op::input_stats& stats) const override;
 
  private:
-  sirius_physical_operator* _parent_op;
   bool _is_build;
   bool _concat_all;
   uint64_t _concat_batch_bytes;

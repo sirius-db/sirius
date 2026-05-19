@@ -64,6 +64,15 @@ sirius_physical_plan_generator::get_or_create_dynamic_filter_channel(
   return it->second;
 }
 
+void sirius_physical_plan_generator::set_parent_ops(sirius::op::sirius_physical_operator& op,
+                                                    sirius::op::sirius_physical_operator* parent)
+{
+  op.set_parent_op(parent);
+  for (auto& child : op.children) {
+    if (child) { set_parent_ops(*child, &op); }
+  }
+}
+
 sirius::OrderPreservationType sirius_physical_plan_generator::order_preservation_recursive(
   sirius::op::sirius_physical_operator& op)
 {

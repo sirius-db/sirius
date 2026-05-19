@@ -110,7 +110,6 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// Looks at the amount of data waiting on the input port and determines the number of partitions
   /// to create. Returns a pair of (num_partitions, total_bytes).
   std::pair<int, uint64_t> determine_num_partitions();
-  sirius_physical_operator* _parent_op            = nullptr;
   sirius_physical_operator* _sibling_partition_op = nullptr;
   sirius_physical_operator* _hash_join_op =
     nullptr;  // hash join operator that this partition operator feeds into (optional: for

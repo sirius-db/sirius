@@ -60,6 +60,14 @@ struct Config {
   // Whether to use modified pipeline for the new execution model
   static bool MODIFIED_PIPELINE;
 
+  // Phase 3 (#601) gate: switch the pipeline build path from the legacy
+  // sirius_pipeline_converter (which constructs ~12 operator types at runtime) to the
+  // tree-based path where sirius_physical_plan_generator inserts all operators into the plan
+  // tree and the converter becomes a pure topology pass driven by per-operator build_pipelines
+  // overrides. Default false until both paths produce byte-identical pipeline state on every
+  // TPC-H plan (verified via the Sub-phase D differential dump test).
+  static bool USE_TREE_BASED_PIPELINE_BUILD;
+
   // Whether to fall back to duckdb execution after an error is detected
   static bool ENABLE_DUCKDB_FALLBACK;
 

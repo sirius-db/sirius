@@ -48,6 +48,9 @@ class sirius_pipeline;
 class sirius_pipeline_build_state;
 class sirius_meta_pipeline;
 }  // namespace pipeline
+namespace planner {
+class sirius_physical_plan_generator;
+}  // namespace planner
 namespace op {
 
 enum class TaskCreationHint { WAITING_FOR_INPUT_DATA, READY };
@@ -377,6 +380,11 @@ class sirius_physical_operator {
   //! operator has no pipeline set.
   [[nodiscard]] telemetry::batch_telemetry_info batch_telemetry() const;
 
+  //! Pointer to this operator's parent in the physical plan tree, or nullptr at the root.
+  //! Populated by `sirius_physical_plan_generator`'s post-pass walk over `children[]` after
+  //! plan generation completes; used by the pipeline converter and tree-based wiring lookup.
+  [[nodiscard]] sirius_physical_operator* get_parent_op() const noexcept { return _parent_op; }
+
   virtual bool equals(const sirius_physical_operator& other) const { return false; }
 
   virtual void verify();
@@ -569,6 +577,20 @@ class sirius_physical_operator {
   std::list<std::unique_ptr<port>> _ports_list;
   //! The next operators to be executed after this operator when it is used as a sink
   std::vector<sirius_physical_operator::next_port_info> next_port_after_sink;
+  //! The parent of this operator in the plan tree. Set by `sirius_physical_plan_generator`
+  //! via the private `set_parent_op()` setter (friend access) after the tree is final, or by
+  //! derived constructors during the legacy converter-driven construction path. nullptr at the
+  //! root and on operators that have not yet been linked into a tree.
+  sirius_physical_operator* _parent_op = nullptr;
+
+ private:
+  //! Mutate the parent pointer. Restricted to `sirius_physical_plan_generator` so parent
+  //! pointers stay immutable once plan generation finishes. Derived constructors can still
+  //! initialize `_parent_op` directly via the protected field (legacy path, removed in
+  //! Phase 3.1).
+  void set_parent_op(sirius_physical_operator* parent_op) noexcept { _parent_op = parent_op; }
+
+  friend class ::sirius::planner::sirius_physical_plan_generator;
 };
 
 }  // namespace op

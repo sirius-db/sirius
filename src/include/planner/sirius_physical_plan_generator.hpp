@@ -194,5 +194,16 @@ class sirius_physical_plan_generator {
  public:
   duckdb::ClientContext& context;
   // duckdb::GPUContext& gpu_context;
+
+ private:
+  //! Recursive post-pass walk that sets each operator's `_parent_op` from the final tree
+  //! structure. Called once at the end of plan generation, after all tree rewrites have
+  //! settled, so the parent pointer is derived from `children[]` and cannot drift. Access
+  //! to `sirius_physical_operator::set_parent_op` is granted via friendship.
+  //!
+  //! Dormant in Sub-phase A: declared and defined but not yet invoked. The call site is
+  //! added in Sub-phase B at the end of `Plan(unique_ptr<LogicalOperator>)`.
+  static void set_parent_ops(sirius::op::sirius_physical_operator& op,
+                             sirius::op::sirius_physical_operator* parent);
 };
 }  // namespace sirius::planner

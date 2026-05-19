@@ -1483,6 +1483,32 @@ static void SetModifiedPipeline(ClientContext& context, SetScope scope, Value& p
   SIRIUS_LOG_DEBUG("Updated config MODIFIED_PIPELINE to {}", Config::MODIFIED_PIPELINE);
 }
 
+static void SetUseTreeBasedPipelineBuild(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::USE_TREE_BASED_PIPELINE_BUILD = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config USE_TREE_BASED_PIPELINE_BUILD to {}",
+                   Config::USE_TREE_BASED_PIPELINE_BUILD);
+}
+
+static void SetCacheScanLevel(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (sirius_ctx == nullptr) {
+    SIRIUS_LOG_DEBUG("SiriusContext not available; cache_scan_level SET ignored");
+    return;
+  }
+  auto level_str = StringValue::Get(parameter);
+  sirius::op::scan::cache_level level;
+  if (!sirius::op::scan::string_to_enum(level_str, level)) {
+    throw InvalidInputException(
+      "Invalid cache_scan_level '{}'. Valid values: none, table_gpu, table_host, parquet",
+      level_str);
+  }
+  auto& cfg = sirius_ctx->get_config();
+  cfg.set_cache_level(level);
+  SIRIUS_LOG_DEBUG("Updated config cache_scan_level to {}", level_str);
+}
+
 static sirius::operator_params* get_operator_params(ClientContext& context)
 {
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -1756,6 +1782,17 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(Config::MODIFIED_PIPELINE),
                             SetModifiedPipeline);
+
+  // Phase 3 (#601) gate for tree-based pipeline build. See Config::USE_TREE_BASED_PIPELINE_BUILD
+  // in config.hpp for the design rationale. Default false until the differential dump test
+  // confirms byte-identical pipeline state vs the legacy converter path on every TPC-H plan.
+  config.AddExtensionOption(
+    "use_tree_based_pipeline_build",
+    "Phase 3 (#601) gate: build pipelines from the operator tree (build_pipelines virtuals) "
+    "instead of constructing operators in sirius_pipeline_converter at runtime",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(Config::USE_TREE_BASED_PIPELINE_BUILD),
+    SetUseTreeBasedPipelineBuild);
 
   // Add in config options for duckdb scan task
   // Default batch size
