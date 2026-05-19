@@ -89,6 +89,10 @@ struct rle_segment_desc {
   uint8_t const* d_bytes;
   uint32_t bytes_size;
   uint32_t segment_row_count;
+  /// Per-value byte width. DuckDB's `bytes_size` includes zero-padded slack
+  /// when the segment is the last in its block; `parse_rle_metadata` uses
+  /// `type_size` to bound iteration at the real-count boundary instead.
+  uint32_t type_size;
 };
 
 /**
@@ -132,7 +136,10 @@ struct BlockPrefixCallbackOp {
  */
 struct rle_parsed_metadata {
   rle_count_t const* counts_ptr;
-  uint32_t n_counts_max;
+  /// Real entry count of the counts[] region, computed from the values
+  /// region length (RLE has a 1:1 invariant between values and counts).
+  /// Stops iteration short of any zero-padded slack at the block tail.
+  uint32_t n_counts_real;
   bool is_malformed;
 };
 
@@ -156,9 +163,20 @@ __device__ __forceinline__ rle_parsed_metadata parse_rle_metadata(rle_segment_de
     md.is_malformed = true;
     return md;
   }
+  // Real entry count = values_region_bytes / type_size (1:1 invariant). If
+  // type_size is unset or doesn't divide cleanly, fall back to the bytes-
+  // derived bound and rely on the malformed-vs-match swap below to recover.
+  const uint64_t values_region_bytes = counts_offset - RLE_HEADER_SIZE;
+  const uint64_t counts_region_bytes = desc.bytes_size - counts_offset;
+  uint64_t n_real = 0;
+  if (desc.type_size > 0 && (values_region_bytes % desc.type_size) == 0) {
+    n_real = values_region_bytes / desc.type_size;
+  } else {
+    n_real = counts_region_bytes / sizeof(rle_count_t);
+  }
 
-  md.counts_ptr   = reinterpret_cast<rle_count_t const*>(desc.d_bytes + counts_offset);
-  md.n_counts_max = static_cast<uint32_t>((desc.bytes_size - counts_offset) / sizeof(rle_count_t));
+  md.counts_ptr    = reinterpret_cast<rle_count_t const*>(desc.d_bytes + counts_offset);
+  md.n_counts_real = static_cast<uint32_t>(n_real);
   return md;
 }
 
@@ -220,10 +238,10 @@ __global__ void kernel_build_rle(rle_segment_desc const* __restrict__ segment_de
 
   auto const n_segment_rows = segment_descriptor.segment_row_count;
   auto const* counts_ptr    = s_md.counts_ptr;
-  // (Defensively) cap iteration at the per-segment prefix-sum slot so BlockStore can't write past
-  // the slot.
+  // Bound by `n_counts_real` (skips block-tail zero slack) and clamp to the
+  // prefix-sum slot so BlockStore can't write past it.
   auto const n_counts_max = ::cuda::std::min(
-    s_md.n_counts_max, static_cast<uint32_t>(PREFIX_SUM_BUFFER_ENTRIES_PER_SEGMENT));
+    s_md.n_counts_real, static_cast<uint32_t>(PREFIX_SUM_BUFFER_ENTRIES_PER_SEGMENT));
   auto* prefix_sum_ptr =
     d_prefix_sums + static_cast<size_t>(segment_id) * PREFIX_SUM_BUFFER_ENTRIES_PER_SEGMENT;
 
@@ -292,12 +310,16 @@ __global__ void kernel_build_rle(rle_segment_desc const* __restrict__ segment_de
     if (threadIdx.x == 0) { s_first_match = tile_first_match; }
     __syncthreads();
 
-    if (s_is_malformed) {
-      if (threadIdx.x == 0) { d_counts[segment_id] = MALFORMED_FLAG; }
-      return;
-    }
+    // Match wins over malformed: once a tile entry's prefix sum hits
+    // n_segment_rows, the segment is well-formed up to that point. A zero
+    // count past that match comes from block-tail slack (encoder never
+    // emits count == 0 in real data), not corruption.
     if (s_first_match != NO_MATCH) {
       if (threadIdx.x == 0) { d_counts[segment_id] = s_first_match; }
+      return;
+    }
+    if (s_is_malformed) {
+      if (threadIdx.x == 0) { d_counts[segment_id] = MALFORMED_FLAG; }
       return;
     }
   }
@@ -501,8 +523,10 @@ void decode_rle_data(gpu_codec_run const& run,
   // Build per-segment build descriptors.
   std::vector<rle_segment_desc> h_build_descs(num_live_segments);
   for (size_t i = 0; i < num_live_segments; ++i) {
-    h_build_descs[i] = {
-      live_segments[i]->d_bytes, live_segments[i]->bytes_size, live_segments[i]->row_count};
+    h_build_descs[i] = {live_segments[i]->d_bytes,
+                        live_segments[i]->bytes_size,
+                        live_segments[i]->row_count,
+                        type_size};
   }
 
   // Worst-case allocation: 352 KiB/segment.
