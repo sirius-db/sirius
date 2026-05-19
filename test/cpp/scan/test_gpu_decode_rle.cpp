@@ -250,6 +250,23 @@ TEST_CASE("gpu_decode_table RLE - segment with on-disk padding", "[scan][decode]
     REQUIRE(out[10 + i] == 88);
 }
 
+TEST_CASE("gpu_decode_table RLE - trailing slack past counts decodes correctly",
+          "[scan][decode][rle]")
+{
+  // DuckDB's block allocator gives the last segment in a 256 KB block all
+  // remaining unused space — bytes past the real RLE data are zero-fill slack.
+  // The kernel must bound iteration on the values-region size; otherwise it
+  // walks the slack, hits a zero count, and zero-fills the column output.
+  std::vector<int32_t> values{1, 2, 3};
+  std::vector<uint16_t> counts{10, 20, 30};
+  auto bytes = sirius::test::decode::rle::make_rle_block<int32_t>(values, counts);
+  bytes.resize(bytes.size() + 4096, 0);
+
+  auto out      = decode_one<int32_t>(bytes, I32, 60);
+  auto expected = expand_runs<int32_t>(values, counts);
+  REQUIRE(out == expected);
+}
+
 // Defensive guards: pre-fill output with a 0xCC canary, call decode_rle_data
 // directly (skipping the dispatcher's allocate-fresh path), then assert
 // every byte is zero.
@@ -393,11 +410,13 @@ TEST_CASE("gpu_decode_table RLE - count walk overflows row_count zero-fills",
     REQUIRE(out[i] == 0);
 }
 
-TEST_CASE("gpu_decode_table RLE - zero count inside walk zero-fills",
+TEST_CASE("gpu_decode_table RLE - zero count with sum underflow zero-fills",
           "[scan][decode][rle][defensive]")
 {
-  // DuckDB never emits zero counts; treat them as malformed.
-  auto bytes = make_rle_block<int32_t>({1, 99, 2}, {10, 0, 10});
+  // An interior zero count is malformed only when the running sum never
+  // reaches n_segment_rows by the end of real counts — a present-and-zero
+  // count followed by a sum-match is legitimate (slack).
+  auto bytes = make_rle_block<int32_t>({1, 99, 2}, {10, 0, 5});  // sum = 15
 
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
