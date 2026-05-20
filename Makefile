@@ -22,7 +22,7 @@ MAIN_BUILD_TARGETS ?= duckdb duckdb_local_extension_repo
 	clang-release clang-debug clang-relwithdebinfo \
 	ci-release configure_ci set_duckdb_version \
 	test test_release test_debug test_reldebug test_ci-release clean list-presets \
-	s3-up s3-down s3-test s3-sql-test s3-bench s3-bench-fixtures
+	s3-up s3-up-large s3-down s3-test s3-sql-test s3-test-large s3-bench s3-bench-fixtures
 
 PRESETS_LINK := $(DUCKDB_DIR)/CMakePresets.json
 
@@ -122,11 +122,17 @@ list-presets: $(PRESETS_LINK)
 #                     fixtures under test/cpp/integration/data/parquet).
 # `make s3-down`      tears it down (including the data volume).
 # `make test`         runs the default Catch2 suite without starting MinIO.
-# `make s3-test`      one-shot full S3 correctness gate: starts MinIO, sources
-#                     env.sh, runs every Catch2 test tagged [s3] in strict
-#                     mode, then tears MinIO down even on failure.
+# `make s3-test`      one-shot standard S3 correctness gate: starts MinIO,
+#                     sources env.sh, runs every Catch2 test tagged [s3]
+#                     except [large] in strict mode, then tears MinIO down
+#                     even on failure.
 # `make s3-sql-test`  one-shot SQL-over-S3 end-to-end subset: same fixture
-#                     lifecycle as s3-test, but runs only [s3][sql].
+#                     lifecycle as s3-test, but runs only [s3][sql] except
+#                     [large].
+# `make s3-test-large`
+#                     one-shot large-SF10 SQL-over-S3 gate: starts MinIO,
+#                     uploads standard fixtures plus lineitem_sf10.parquet via
+#                     fixtures.sh --perf, then runs [s3][sql][large].
 #
 # See test/cpp/integration/s3/README.md for details.
 
@@ -137,6 +143,10 @@ S3_TEST_BIN ?= build/release/extension/sirius/test/cpp/sirius_unittest
 s3-up:
 	docker compose -f $(S3_COMPOSE) up -d
 	$(S3_DIR)/fixtures.sh
+
+s3-up-large:
+	docker compose -f $(S3_COMPOSE) up -d
+	$(S3_DIR)/fixtures.sh --perf
 
 s3-down:
 	docker compose -f $(S3_COMPOSE) down -v
@@ -152,7 +162,7 @@ s3-test:
 	$(MAKE) s3-up; \
 	source $(S3_DIR)/env.sh; \
 	export SIRIUS_TEST_S3_STRICT=1; \
-	$(S3_TEST_BIN) "[s3]"
+	$(S3_TEST_BIN) "[s3]~[large]"
 
 s3-sql-test: SHELL := /bin/bash
 s3-sql-test:
@@ -165,7 +175,22 @@ s3-sql-test:
 	$(MAKE) s3-up; \
 	source $(S3_DIR)/env.sh; \
 	export SIRIUS_TEST_S3_STRICT=1; \
-	$(S3_TEST_BIN) "[s3][sql]"
+	$(S3_TEST_BIN) "[s3][sql]~[large]"
+
+s3-test-large: SHELL := /bin/bash
+s3-test-large:
+	@if [ ! -x $(S3_TEST_BIN) ]; then \
+	  echo "s3-test-large: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
+	  exit 1; \
+	fi
+	@set -e; \
+	trap '$(MAKE) s3-down' EXIT; \
+	$(MAKE) s3-up-large; \
+	source $(S3_DIR)/env.sh; \
+	export SIRIUS_TEST_S3_STRICT=1; \
+	$(S3_TEST_BIN) "[s3][sql][large][large-count]"; \
+	$(S3_TEST_BIN) "[s3][sql][large][large-q1]"; \
+	$(S3_TEST_BIN) "[s3][sql][large][large-join]"
 
 # -----------------------------------------------------------------------------
 # S3 perf benchmark (Catch2 [!benchmark][perf][bench] hidden tag - not in the

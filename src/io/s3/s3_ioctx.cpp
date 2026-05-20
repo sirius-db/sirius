@@ -871,6 +871,7 @@ std::size_t s3_ioctx::device_read_io(sirius_io_object& obj,
       obj.object_path() + "' offset=" + std::to_string(offset) + " size=" + std::to_string(size) +
       " chunk=" + std::to_string(chunk) + "): " + e.what());
   }
+  _fsmr_borrows_total.fetch_add(1, std::memory_order_relaxed);
   auto* host = reinterpret_cast<std::uint8_t*>(staging->at(0).data());
 
   std::size_t total = 0;

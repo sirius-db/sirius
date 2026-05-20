@@ -6,6 +6,7 @@
  */
 
 #include "catch.hpp"
+#include "io/s3/s3_ioctx.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 
@@ -18,6 +19,7 @@
 #include <duckdb/parser/tableref/table_function_ref.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -86,6 +88,12 @@ std::string s3_uri(std::string_view bucket, std::string_view key)
   return "s3://" + std::string{bucket} + "/" + std::string{key};
 }
 
+std::string sf10_lineitem_key()
+{
+  return env_or("SIRIUS_PR6_LARGE_S3_KEY",
+                env_or("SIRIUS_BENCH_S3_KEY", "tpch/lineitem_sf10.parquet"));
+}
+
 std::string sql_quote(std::string_view value)
 {
   std::string out{"'"};
@@ -112,9 +120,29 @@ void load_sirius_extension(duckdb::DuckDB& db)
   }
 }
 
+struct sirius_memory_limits {
+  std::string gpu_usage{"256 MiB"};
+  std::string gpu_reservation{"128 MiB"};
+  std::string host_capacity{"512 MiB"};
+  std::string disk_capacity;
+};
+
+sirius_memory_limits large_sirius_memory_limits()
+{
+  sirius_memory_limits limits;
+  limits.gpu_usage       = "5 GiB";
+  limits.gpu_reservation = "2 GiB";
+  limits.host_capacity   = "8 GiB";
+  // SF10 scans can trigger downgrade pressure on the CI RTX 3060; provide a
+  // disk tier so the large correctness tests exercise Sirius tiering instead
+  // of failing at the no-disk spill boundary.
+  limits.disk_capacity = "32 GiB";
+  return limits;
+}
+
 class sirius_config_env_guard {
  public:
-  explicit sirius_config_env_guard(s3_test_env const& env)
+  explicit sirius_config_env_guard(s3_test_env const& env, sirius_memory_limits limits = {})
   {
     if (auto* current = std::getenv("SIRIUS_CONFIG_FILE"); current != nullptr) {
       had_original_config_env_ = true;
@@ -131,14 +159,47 @@ class sirius_config_env_guard {
     fs::create_directories(dir_);
 
     std::ofstream out(config_path_);
-    out << "sirius:\n"
-           "  memory:\n"
-           "    gpu:\n"
-           "      usage_limit_bytes: 256 MiB\n"
-           "      reservation_limit_bytes: 128 MiB\n"
-           "    host:\n"
-           "      capacity_bytes: 512 MiB\n"
-           "  object_store_config:\n"
+    out << "sirius:\n";
+    if (limits.disk_capacity.empty()) {
+      out << "  memory:\n"
+             "    gpu:\n"
+             "      usage_limit_bytes: "
+          << limits.gpu_usage
+          << "\n"
+             "      reservation_limit_bytes: "
+          << limits.gpu_reservation
+          << "\n"
+             "    host:\n"
+             "      capacity_bytes: "
+          << limits.host_capacity << "\n";
+    } else {
+      out << "  space:\n"
+             "    gpu:\n"
+             "      - device_id: 0\n"
+             "        per_stream_reservation: false\n"
+             "        reservation_limit_fraction: 0.4\n"
+             "        downgrade_trigger_fraction: 0.8\n"
+             "        downgrade_stop_fraction: 0.6\n"
+             "        memory_capacity: "
+          << limits.gpu_usage
+          << "\n"
+             "    host:\n"
+             "      - numa_id: -1\n"
+             "        reservation_limit_fraction: 0.9\n"
+             "        downgrade_trigger_fraction: 0.8\n"
+             "        downgrade_stop_fraction: 0.6\n"
+             "        memory_capacity: "
+          << limits.host_capacity
+          << "\n"
+             "    disk:\n"
+             "      - disk_id: 0\n"
+             "        mount_path: "
+          << yaml_quote((dir_ / "disk_memory").string())
+          << "\n"
+             "        memory_capacity: "
+          << limits.disk_capacity << "\n";
+    }
+    out << "  object_store_config:\n"
            "    endpoint: "
         << yaml_quote(env.endpoint)
         << "\n"
@@ -184,7 +245,8 @@ class sirius_config_env_guard {
 
 class s3_sql_fixture {
  public:
-  explicit s3_sql_fixture(s3_test_env const& env) : config_env(env), db(nullptr), con(db)
+  explicit s3_sql_fixture(s3_test_env const& env, sirius_memory_limits limits = {})
+    : config_env(env, std::move(limits)), db(nullptr), con(db)
   {
     load_sirius_extension(db);
     REQUIRE(con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state"));
@@ -236,15 +298,70 @@ std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResu
   return rows;
 }
 
+void check_rows_equal_with_tolerant_columns(duckdb::MaterializedQueryResult& actual,
+                                            duckdb::MaterializedQueryResult& expected,
+                                            std::vector<duckdb::idx_t> const& tolerant_columns)
+{
+  REQUIRE(actual.RowCount() == expected.RowCount());
+  REQUIRE(actual.ColumnCount() == expected.ColumnCount());
+  for (duckdb::idx_t r = 0; r < actual.RowCount(); ++r) {
+    for (duckdb::idx_t c = 0; c < actual.ColumnCount(); ++c) {
+      auto const actual_value   = actual.GetValue(c, r).ToString();
+      auto const expected_value = expected.GetValue(c, r).ToString();
+      INFO("row=" << r << " column=" << c);
+      if (std::find(tolerant_columns.begin(), tolerant_columns.end(), c) !=
+          tolerant_columns.end()) {
+        CHECK(std::stod(actual_value) ==
+              Approx(std::stod(expected_value)).epsilon(1e-10).margin(1e-9));
+      } else {
+        CHECK(actual_value == expected_value);
+      }
+    }
+  }
+}
+
+bool within_large_s3_byte_budget(std::uint64_t byte_delta, std::size_t object_size)
+{
+  // Today the SF10 SQL path can fetch parquet byte ranges twice over the network:
+  // once via parquet_split_provider's prefetching_cache prewarm
+  // (prefetching_cache.cpp worker -> host_read_ranges_async_io -> range_get),
+  // and again when cudf::io::read_parquet reads through sirius_datasource
+  // (sirius_gpu_parquet_scan_operator -> io_ctx->make_datasource ->
+  // host_read_async -> range_get on cache miss). The scan path attempts
+  // cache->read(), but the current prewarm/read pattern is not a reliable
+  // hit path at SF10 scale.
+  //
+  // Keep this as a regression-only guard until the scan path is made to
+  // consume prefetched ranges reliably (tracked in newplan.md §26).
+  return byte_delta <= 3ULL * static_cast<std::uint64_t>(object_size);
+}
+
 fs::path local_parquet_path(std::string_view table)
 {
   return fs::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "integration" / "data" / "parquet" /
          (std::string{table} + ".parquet");
 }
 
+fs::path local_sf10_lineitem_path()
+{
+  auto override_path = env_or("SIRIUS_PR6_LARGE_LOCAL_PARQUET");
+  if (!override_path.empty()) { return fs::path{override_path}; }
+
+  auto work_dir = env_or("SIRIUS_BENCH_WORK_DIR");
+  if (!work_dir.empty()) { return fs::path{work_dir} / "lineitem_sf10.parquet"; }
+
+  return fs::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "integration" / "s3" / "fixtures" /
+         "generated" / "lineitem_sf10.parquet";
+}
+
 std::string local_parquet_scan(std::string_view table)
 {
   return "read_parquet(" + sql_quote(local_parquet_path(table).string()) + ")";
+}
+
+std::string local_parquet_file_scan(fs::path const& path)
+{
+  return "read_parquet(" + sql_quote(path.string()) + ")";
 }
 
 std::string s3_parquet_scan(s3_test_env const& env, std::string_view table)
@@ -257,6 +374,77 @@ std::string s3_sirius_parquet_scan(s3_test_env const& env, std::string_view tabl
 {
   auto const key = "parquet/" + std::string{table} + ".parquet";
   return "sirius_read_parquet(" + sql_quote(s3_uri(env.bucket, key)) + ")";
+}
+
+std::string s3_large_lineitem_uri(s3_test_env const& env)
+{
+  return s3_uri(env.bucket, sf10_lineitem_key());
+}
+
+std::string s3_large_lineitem_scan(s3_test_env const& env)
+{
+  return "read_parquet(" + sql_quote(s3_large_lineitem_uri(env)) + ")";
+}
+
+std::string s3_sirius_large_lineitem_scan(s3_test_env const& env)
+{
+  return "sirius_read_parquet(" + sql_quote(s3_large_lineitem_uri(env)) + ")";
+}
+
+duckdb::SiriusContext& require_sirius_context(s3_sql_fixture& fixture)
+{
+  auto sirius_ctx =
+    fixture.con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx);
+  return *sirius_ctx;
+}
+
+sirius::io::s3::s3_ioctx& require_s3_ioctx(s3_sql_fixture& fixture, std::string const& uri)
+{
+  auto& sirius_ctx = require_sirius_context(fixture);
+  auto* base_ctx   = sirius_ctx.get_scan_manager().io_ctx_for(uri);
+  REQUIRE(base_ctx != nullptr);
+  auto* s3_ctx = dynamic_cast<sirius::io::s3::s3_ioctx*>(base_ctx);
+  REQUIRE(s3_ctx != nullptr);
+  return *s3_ctx;
+}
+
+struct large_lineitem_fixture {
+  std::string uri;
+  fs::path local_path;
+  std::size_t object_size{0};
+  duckdb::idx_t total_num_rows{0};
+};
+
+std::optional<large_lineitem_fixture> read_large_lineitem_fixture(s3_sql_fixture& fixture,
+                                                                  s3_test_env const& env)
+{
+  large_lineitem_fixture out;
+  out.uri        = s3_large_lineitem_uri(env);
+  out.local_path = local_sf10_lineitem_path();
+
+  if (!fs::exists(out.local_path)) {
+    if (truthy_env("SIRIUS_TEST_S3_STRICT")) {
+      FAIL("SF10 local parquet fixture is required in strict mode: " + out.local_path.string());
+    }
+    SUCCEED("SF10 local parquet fixture is absent; skipping large S3 SQL test");
+    return std::nullopt;
+  }
+
+  try {
+    auto& sirius_ctx   = require_sirius_context(fixture);
+    auto bind_info     = sirius_ctx.get_scan_manager().describe_parquet(out.uri);
+    out.object_size    = bind_info.object_size;
+    out.total_num_rows = static_cast<duckdb::idx_t>(bind_info.total_num_rows);
+  } catch (std::exception const& e) {
+    if (truthy_env("SIRIUS_TEST_S3_STRICT")) {
+      FAIL("SF10 S3 parquet fixture is required in strict mode at " + out.uri + ": " + e.what());
+    }
+    SUCCEED("SF10 S3 parquet fixture is absent; skipping large S3 SQL test");
+    return std::nullopt;
+  }
+
+  return out;
 }
 
 std::string explain_text(duckdb::Connection& con, std::string const& sql)
@@ -277,6 +465,18 @@ duckdb::idx_t local_parquet_row_count(std::string_view table)
   duckdb::DuckDB db(nullptr);
   duckdb::Connection con(db);
   auto result = require_query_ok(con, "SELECT count(*) FROM " + local_parquet_scan(table));
+  REQUIRE(result->RowCount() == 1);
+  auto const rows = result->GetValue(0, 0).GetValue<int64_t>();
+  REQUIRE(rows >= 0);
+  return static_cast<duckdb::idx_t>(rows);
+}
+
+duckdb::idx_t local_parquet_file_row_count(fs::path const& path)
+{
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto result =
+    require_query_ok(con, "SELECT count(l_orderkey) FROM " + local_parquet_file_scan(path));
   REQUIRE(result->RowCount() == 1);
   auto const rows = result->GetValue(0, 0).GetValue<int64_t>();
   REQUIRE(rows >= 0);
@@ -353,6 +553,37 @@ std::string tpch_q3_shape_query(std::string const& customer_scan,
          "GROUP BY l_orderkey, o_orderdate, o_shippriority "
          "ORDER BY revenue DESC, o_orderdate, l_orderkey "
          "LIMIT 10";
+}
+
+std::string tpch_q1_shape_query(std::string const& lineitem_scan)
+{
+  // Keep the TPC-H Q1 operator shape, but use a bounded date window so SF10
+  // row-group pruning keeps the CI GPU under its 5 GiB Sirius memory cap.
+  // The full-date Q1 shape currently needs more GPU intermediates than this
+  // host can reserve; large-scale tier engagement is tracked separately.
+  return "SELECT l_returnflag, "
+         "l_linestatus, "
+         "sum(l_quantity) AS sum_qty, "
+         "sum(l_extendedprice) AS sum_base_price, "
+         "sum(l_extendedprice * (1 - l_discount)) AS sum_disc_price, "
+         "sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge, "
+         "avg(l_quantity) AS avg_qty, "
+         "avg(l_extendedprice) AS avg_price, "
+         "avg(l_discount) AS avg_disc, "
+         "count(*) AS count_order "
+         "FROM " +
+         lineitem_scan +
+         " WHERE l_shipdate BETWEEN DATE '1996-01-01' AND DATE '1996-06-30' "
+         "GROUP BY l_returnflag, l_linestatus "
+         "ORDER BY l_returnflag, l_linestatus";
+}
+
+std::string large_lineitem_orders_join_query(std::string const& lineitem_scan,
+                                             std::string const& orders_scan)
+{
+  return "SELECT count(*) FROM " + lineitem_scan + " l JOIN " + orders_scan +
+         " o ON l.l_orderkey = o.o_orderkey "
+         "WHERE o.o_orderdate < DATE '1995-03-15'";
 }
 
 }  // namespace
@@ -569,4 +800,97 @@ TEST_CASE("gpu_execution S3 SQL surface scans all orders row groups",
   REQUIRE(baseline_result->RowCount() == 1);
   REQUIRE(baseline_result->ColumnCount() == 3);
   CHECK(collect_rows(*s3_result) == collect_rows(*baseline_result));
+}
+
+TEST_CASE("gpu_execution large S3 lineitem count matches the local parquet oracle",
+          "[.][s3][sql][large][large-count][gpu_execution][integration]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env, large_sirius_memory_limits());
+  auto large = read_large_lineitem_fixture(fixture, *env);
+  if (!large) { return; }
+
+  auto& s3_ctx              = require_s3_ioctx(fixture, large->uri);
+  auto const expected_rows  = local_parquet_file_row_count(large->local_path);
+  auto const before_bytes   = s3_ctx.bytes_read_total();
+  auto const s3_count_query = "SELECT count(l_orderkey) FROM " + s3_large_lineitem_scan(*env);
+  auto s3_result            = require_query_ok(fixture.con, gpu_execution_sql(s3_count_query));
+  auto const byte_delta     = s3_ctx.bytes_read_total() - before_bytes;
+
+  REQUIRE(s3_result->RowCount() == 1);
+  REQUIRE(s3_result->ColumnCount() == 1);
+  CHECK(s3_result->GetValue(0, 0).GetValue<int64_t>() == static_cast<int64_t>(expected_rows));
+  CHECK(large->total_num_rows == expected_rows);
+  CHECK(expected_rows > 50'000'000);
+  CHECK(large->object_size == fs::file_size(large->local_path));
+  INFO("byte_delta=" << byte_delta << " object_size=" << large->object_size);
+  CHECK(within_large_s3_byte_budget(byte_delta, large->object_size));
+}
+
+TEST_CASE("gpu_execution large S3 lineitem TPC-H Q1 shape matches local CPU",
+          "[.][s3][sql][large][large-q1][gpu_execution][integration]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env, large_sirius_memory_limits());
+  auto large = read_large_lineitem_fixture(fixture, *env);
+  if (!large) { return; }
+
+  auto& s3_ctx              = require_s3_ioctx(fixture, large->uri);
+  auto const before_bytes   = s3_ctx.bytes_read_total();
+  auto const before_borrows = s3_ctx.fsmr_borrows_total();
+  auto const s3_query       = tpch_q1_shape_query(s3_large_lineitem_scan(*env));
+  auto s3_result            = require_query_ok(fixture.con, gpu_execution_sql(s3_query));
+  auto const byte_delta     = s3_ctx.bytes_read_total() - before_bytes;
+  auto const borrow_delta   = s3_ctx.fsmr_borrows_total() - before_borrows;
+
+  duckdb::DuckDB baseline_db(nullptr);
+  duckdb::Connection baseline_con(baseline_db);
+  auto const local_query = tpch_q1_shape_query(local_parquet_file_scan(large->local_path));
+  auto baseline_result   = require_query_ok(baseline_con, local_query);
+
+  REQUIRE(s3_result->RowCount() == baseline_result->RowCount());
+  REQUIRE(s3_result->ColumnCount() == baseline_result->ColumnCount());
+  check_rows_equal_with_tolerant_columns(*s3_result, *baseline_result, {6, 7, 8});
+  CHECK(byte_delta > 0);
+  INFO("byte_delta=" << byte_delta << " object_size=" << large->object_size);
+  CHECK(within_large_s3_byte_budget(byte_delta, large->object_size));
+  CHECK(borrow_delta > 0);
+}
+
+TEST_CASE("gpu_execution large S3 lineitem join uses planner cardinality and matches local CPU",
+          "[.][s3][sql][large][large-join][gpu_execution][integration]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env, large_sirius_memory_limits());
+  auto large = read_large_lineitem_fixture(fixture, *env);
+  if (!large) { return; }
+
+  auto const expected_lineitem_rows = local_parquet_file_row_count(large->local_path);
+  auto const expected_orders_rows   = local_parquet_row_count("orders");
+  auto const s3_query =
+    large_lineitem_orders_join_query(s3_large_lineitem_scan(*env), s3_parquet_scan(*env, "orders"));
+  auto s3_result = require_query_ok(fixture.con, gpu_execution_sql(s3_query));
+
+  duckdb::DuckDB baseline_db(nullptr);
+  duckdb::Connection baseline_con(baseline_db);
+  auto const local_query = large_lineitem_orders_join_query(
+    local_parquet_file_scan(large->local_path), local_parquet_scan("orders"));
+  auto baseline_result = require_query_ok(baseline_con, local_query);
+
+  REQUIRE(s3_result->RowCount() == baseline_result->RowCount());
+  REQUIRE(s3_result->ColumnCount() == baseline_result->ColumnCount());
+  CHECK(collect_rows(*s3_result) == collect_rows(*baseline_result));
+
+  auto const explain_sql = large_lineitem_orders_join_query(s3_sirius_large_lineitem_scan(*env),
+                                                            s3_sirius_parquet_scan(*env, "orders"));
+  auto const plan        = explain_text(fixture.con, explain_sql);
+  INFO(plan);
+  CHECK(plan_mentions_cardinality(plan, expected_lineitem_rows));
+  CHECK(plan_mentions_cardinality(plan, expected_orders_rows));
 }

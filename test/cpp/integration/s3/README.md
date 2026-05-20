@@ -16,6 +16,9 @@ SQL-over-S3 surface.
 - A `fixtures.sh` script that uploads everything to MinIO via the `mc`
   container image so tests can bit-compare (and parse) S3 reads against the
   local copy.
+- An opt-in `fixtures.sh --perf` / `make s3-test-large` path that also
+  generates and uploads the SF10 `tpch/lineitem_sf10.parquet` fixture for
+  large SQL correctness coverage.
 - `env.sh` that exports the `SIRIUS_TEST_S3_*` variables consumed by
   the S3 Catch2 tests.
 - A strict-mode toggle (`SIRIUS_TEST_S3_STRICT`) that keeps ad-hoc local runs
@@ -35,21 +38,30 @@ SQL-over-S3 surface.
 make test
 
 # Run the full S3 correctness gate. This starts MinIO, populates fixtures,
-# sources env.sh, enables strict mode, runs every [s3] Catch2 test, and tears
-# MinIO down even if the tests fail.
+# sources env.sh, enables strict mode, runs every non-large [s3] Catch2 test,
+# and tears MinIO down even if the tests fail.
 make s3-test
 
 # Run only the SQL-over-S3 end-to-end subset.
 make s3-sql-test
 
+# Run the opt-in large-SF10 SQL-over-S3 correctness suite. This generates
+# test/cpp/integration/s3/fixtures/generated/lineitem_sf10.parquet with the
+# in-tree build/release/duckdb, uploads it to s3://sirius-test/tpch/, and runs
+# the [s3][sql][large] tests. Expect this to take much longer than s3-test.
+make s3-test-large
+
 # Or run manually:
 make s3-up
 source test/cpp/integration/s3/env.sh
 export SIRIUS_TEST_S3_STRICT=1
-build/release/extension/sirius/test/cpp/sirius_unittest "[s3]"
+build/release/extension/sirius/test/cpp/sirius_unittest "[s3]~[large]"
 
 # SQL-over-S3 subset only:
-build/release/extension/sirius/test/cpp/sirius_unittest "[s3][sql]"
+build/release/extension/sirius/test/cpp/sirius_unittest "[s3][sql]~[large]"
+
+# Large SQL-over-S3 subset only, after `make s3-up-large`:
+build/release/extension/sirius/test/cpp/sirius_unittest "[s3][sql][large]"
 
 # Tear down (the `-v` in `down -v` also removes the named volume).
 make s3-down
@@ -83,6 +95,7 @@ sha256 manifest stays stable:
 | `small.bin` | 20 KiB | bit-equal full-object read via `datasource_factory` |
 | `medium.bin` | 8 MiB | multi-range reads at odd offsets |
 | `parquet/*.parquet` | varies | standard TPCH Parquet fixtures reused by S3 datasource, scan-manager, split-provider, and SQL-over-S3 tests. |
+| `tpch/lineitem_sf10.parquet` | ~1.5 GiB | opt-in large SQL correctness fixture generated only by `fixtures.sh --perf` / `make s3-test-large`. |
 
 `small.bin` / `medium.bin` are opaque deterministic byte blobs, not real
 parquet - the byte-equality tests in `test_s3_integration.cpp` do not invoke
@@ -113,6 +126,9 @@ A sha256 manifest is written to `fixtures/local/MANIFEST.sha256`.
   means `make s3-up` did not populate fixtures successfully.
 - SQL-over-S3 tests cover `sirius_read_parquet('s3://...')` directly and the
   `gpu_execution('... read_parquet("s3://...") ...')` rewrite path.
+- Large SQL-over-S3 tests are tagged `[s3][sql][large]` and hidden from the
+  default Catch2 run. `make s3-test` and `make s3-sql-test` explicitly exclude
+  `[large]`; use `make s3-test-large` when you want the SF10 coverage.
 - `env.sh` also exports `SIRIUS_CONFIG_FILE` pointing at `sirius.yaml` in this
   directory. It caps Super Sirius's startup GPU/host reservation at 256/128
   MiB so `require sirius` in SQL tests in this area won't OOM on GPUs that
