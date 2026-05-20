@@ -18,6 +18,7 @@
 
 #include "duckdb/common/type_visitor.hpp"
 #include "config.hpp"
+#include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -31,6 +32,8 @@
 #include "op/sirius_dynamic_filter.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_context.hpp"
+#include "op/scan/parquet_scan_info.hpp"
+#include "op/scan/sirius_gpu_parquet_scan_operator.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_cpu_source.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
@@ -79,17 +82,47 @@ void wrap_above(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
   slot          = std::forward<WrapperFactory>(factory)(std::move(original));
 }
 
+//! Build a `parquet_scan_info` describing a parquet read by lifting fields out of a
+//! `sirius_physical_table_scan`. **Destructive**: `scan_op.table_filters` is moved into the
+//! info and `scan_op.table_filters` is left null. Mirrors the field plumbing in today's
+//! `sirius_pipeline_converter::insert_parquet_scan_operator` byte-for-byte.
+std::unique_ptr<sirius::op::scan::parquet_scan_info> build_parquet_scan_info(
+  sirius::op::sirius_physical_table_scan& scan_op)
+{
+  auto const& bind_data = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
+  if (!bind_data.file_list || bind_data.file_list->IsEmpty()) {
+    throw std::runtime_error(
+      "[sirius_physical_plan_generator::build_parquet_scan_info] No input files to scan");
+  }
+  std::vector<std::string> file_paths;
+  for (auto const& file : bind_data.file_list->GetAllFiles()) {
+    file_paths.push_back(file.path);
+  }
+  auto const& partition_indices = bind_data.reader_bind.hive_partitioning_indexes;
+
+  auto info               = std::make_unique<sirius::op::scan::parquet_scan_info>();
+  info->returned_types    = scan_op.returned_types;
+  info->file_paths        = std::move(file_paths);
+  info->column_ids        = scan_op.column_ids;
+  info->projection_ids    = scan_op.projection_ids;
+  info->names             = scan_op.names;
+  info->table_filters     = std::move(scan_op.table_filters);
+  info->partition_indices = partition_indices;
+  return info;
+}
+
 //! Attach a leaf GPU scan operator as the only child of a TABLE_SCAN, mirroring today's
 //! `sirius_pipeline_converter::split_table_scan_source` (which constructs the same operator
 //! as a separate pipeline at runtime instead of nesting it in the tree). In the tree-based
 //! path the leaf lives in the plan tree from plan time so `build_pipelines` can derive the
 //! scan pipeline structurally rather than via runtime mutation.
 //!
-//! Sub-phase B.2a handles `seq_scan` → DUCKDB_SCAN. Parquet (`parquet_scan` / `read_parquet`)
-//! and Iceberg (`iceberg_scan`) are dispatched here in B.2b / B.2c respectively. While those
-//! cases remain unhandled, this function quietly skips them: the legacy converter (still
-//! authoritative when the flag is off) handles them at runtime. Once B.2c lands, this
-//! function throws on truly unsupported scan functions to match the converter's behavior.
+//! Sub-phase B.2a handles `seq_scan` → DUCKDB_SCAN; B.2b adds `parquet_scan` /
+//! `read_parquet` → `sirius_gpu_parquet_scan_operator`. Iceberg (`iceberg_scan`) is
+//! dispatched here in B.2c. While `iceberg_scan` remains unhandled, this function quietly
+//! returns and the legacy converter (still authoritative when the flag is off) keeps
+//! handling it at runtime. B.2c will tighten this to throw on truly unsupported scan
+//! functions to match converter behavior.
 void wrap_table_scan_source(sirius::op::sirius_physical_operator& table_scan_op)
 {
   // Table-in-out functions wear a TABLE_SCAN with children — skip per the master plan's
@@ -103,8 +136,12 @@ void wrap_table_scan_source(sirius::op::sirius_physical_operator& table_scan_op)
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> leaf;
   if (fn == "seq_scan") {
     leaf = duckdb::make_uniq<sirius::op::sirius_physical_duckdb_scan>(&scan);
+  } else if (fn == "parquet_scan" || fn == "read_parquet") {
+    auto info = build_parquet_scan_info(scan);
+    leaf      = duckdb::make_uniq<sirius::op::scan::sirius_gpu_parquet_scan_operator>(
+      scan.types, scan.estimated_cardinality, std::move(info));
   } else {
-    // parquet_scan / read_parquet handled in B.2b; iceberg_scan in B.2c.
+    // iceberg_scan handled in B.2c.
     return;
   }
   table_scan_op.children.push_back(std::move(leaf));
