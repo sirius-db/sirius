@@ -36,6 +36,7 @@
 #include "op/scan/parquet_scan_info.hpp"
 #include "op/scan/sirius_gpu_parquet_scan_operator.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
+#include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cpu_source.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
@@ -326,6 +327,56 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
   });
 }
 
+//! Wrap a single child of a HASH_JOIN or NESTED_LOOP_JOIN at `parent.children[child_idx]`
+//! with `CONCAT → PARTITION → original_child`. `is_build` flips the build/probe semantics
+//! threaded through both wrappers (and into PARTITION's hash key derivation via the
+//! parent_op cascade). Mirrors the per-side construction in `split_intermediate_joins`
+//! (probe) and `split_join_sink` (build) at converter:361-371 and 463-491.
+void wrap_join_child(sirius::op::sirius_physical_operator& parent,
+                     std::size_t child_idx,
+                     bool is_build,
+                     const sirius::operator_params& op_params)
+{
+  auto* parent_ptr = &parent;
+  wrap_child(
+    parent, child_idx, [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> child_orig) {
+      // Capture types and cardinality from the original child BEFORE moving it: PARTITION
+      // and CONCAT need them to construct, and after the move into PARTITION the original's
+      // members are no longer addressable.
+      auto child_types = child_orig->types;
+      auto est_card    = child_orig->estimated_cardinality;
+
+      auto concat = duckdb::make_uniq<sirius::op::sirius_physical_concat>(
+        child_types, est_card, parent_ptr, is_build, op_params.concat_batch_bytes);
+      auto partition =
+        duckdb::make_uniq<sirius::op::sirius_physical_partition>(std::move(child_types),
+                                                                 est_card,
+                                                                 /*parent_op=*/concat.get(),
+                                                                 is_build,
+                                                                 op_params.hash_partition_bytes);
+      partition->children.push_back(std::move(child_orig));
+      concat->children.push_back(std::move(partition));
+      return concat;
+    });
+}
+
+//! Wrap both children of a HASH_JOIN or NESTED_LOOP_JOIN with the CONCAT/PARTITION feeder
+//! chain. Probe side (`children[0]`, `is_build=false`) mirrors
+//! `split_intermediate_joins`; build side (`children[1]`, `is_build=true`) mirrors
+//! `split_join_sink`. If a side is unexpectedly missing (`children.size() < 2`), it is
+//! simply skipped — the join wouldn't be well-formed otherwise and the downstream
+//! operators would have already failed.
+void wrap_join(sirius::op::sirius_physical_operator& join_op,
+               const sirius::operator_params& op_params)
+{
+  if (join_op.children.size() >= 1) {
+    wrap_join_child(join_op, /*child_idx=*/0, /*is_build=*/false, op_params);
+  }
+  if (join_op.children.size() >= 2) {
+    wrap_join_child(join_op, /*child_idx=*/1, /*is_build=*/true, op_params);
+  }
+}
+
 //! Post-order recursive walk over the physical plan tree. Children are visited (and rewritten)
 //! before the dispatch on `slot->type`, so a later `wrap_above` cannot re-enter the freshly-
 //! inserted wrapper subtree and double-wrap the original node. Source-side wraps append a leaf
@@ -333,7 +384,9 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
 //! leaf into an intermediate; the new leaf has no children of its own, so post-order is
 //! equivalent to pre-order in those cases. Sink-side wraps replace the slot with a wrapper
 //! subtree whose root sits above the original sink; the new wrapper nodes are not visited
-//! because the walk has already moved past the slot.
+//! because the walk has already moved past the slot. Join-side wraps replace each child of a
+//! HJ/NLJ with a CONCAT/PARTITION chain; the chain's original child (the already-walked
+//! probe/build subtree) is moved into PARTITION's child slot.
 void insert_gpu_pipeline_operators_recursive(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
   const std::unordered_map<std::string, std::shared_ptr<const sirius::op::scan::IcebergDeleteData>>&
@@ -361,8 +414,13 @@ void insert_gpu_pipeline_operators_recursive(
       break;
     case sirius::op::SiriusPhysicalOperatorType::ORDER_BY: wrap_order_by(slot, op_params); break;
     case sirius::op::SiriusPhysicalOperatorType::TOP_N: wrap_top_n(slot); break;
+    case sirius::op::SiriusPhysicalOperatorType::HASH_JOIN:
+    case sirius::op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN:
+      wrap_join(*slot, op_params);
+      break;
     default:
-      // Joins (HASH_JOIN, NESTED_LOOP_JOIN) and DELIM JOIN internals land in B.4 and B.5.
+      // DELIM JOIN internals (LEFT_DELIM_JOIN, RIGHT_DELIM_JOIN with their internal join_op +
+      // distinct_op + column_data_scan sibling references) land in Sub-phase B.5.
       break;
   }
 }
