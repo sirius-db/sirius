@@ -293,16 +293,16 @@ TEST_CASE("datasource_factory object-store schemes require registered backend",
                   std::runtime_error);
 }
 
-// Phase 22.1 routes every registered scheme through io_object construction. The factory
-// currently builds a uring_io_object regardless of scheme (datasource_factory.cpp:157);
-// for object-store URIs that calls ::open(path) which fails before the ioctx is reached.
-// The contract these tests guard is twofold:
+// The factory dispatches every registered scheme through ioctx->open_datasource(path),
+// which in turn calls create_io_object (mock throws std::logic_error("unused")). The
+// contract these tests guard is twofold:
 //   (1) registry lookup IS case-insensitive (S3 resolves to the s3 ioctx — without that
 //       the throw message would be "no ioctx registered for scheme 'S3'");
-//   (2) the object-store ioctx is NOT called yet — make_datasource_calls stays 0 — so a
-//       real s3 ioctx isn't accidentally dispatched against a uring_io_object that has
-//       already failed to open. Lifting (2) requires scheme-specific io_object
-//       construction (out of scope for 22.x).
+//   (2) make_datasource is NOT reached — create_io_object throws first, so an unfinished
+//       object-store backend can't accidentally feed a half-constructed io_object into
+//       make_datasource.
+// Catch as std::exception because the failure path can be any exception subtype depending
+// on which step (create_io_object vs ::open) throws first.
 TEST_CASE("datasource_factory dispatches mixed-case scheme through registry",
           "[datasource_factory]")
 {
@@ -313,8 +313,8 @@ TEST_CASE("datasource_factory dispatches mixed-case scheme through registry",
 
   try {
     (void)datasource_factory::create("S3://bucket/key.parquet", reg, cfg);
-    FAIL("expected uring_io_object construction to fail before ioctx dispatch");
-  } catch (std::runtime_error const& e) {
+    FAIL("expected ioctx dispatch to throw before make_datasource is called");
+  } catch (std::exception const& e) {
     std::string msg = e.what();
     CHECK(msg.find("no ioctx registered") == std::string::npos);
   }
@@ -330,7 +330,10 @@ TEST_CASE("datasource_factory does not dispatch object-store schemes to register
   auto ctx = std::make_shared<mock_ioctx>();
   reg.register_ioctx("s3", ctx);
 
+  // Factory now dispatches via ioctx->open_datasource, which calls create_io_object
+  // (mock throws std::logic_error). The invariant we care about is that make_datasource
+  // is never reached for an unfinished object-store backend.
   CHECK_THROWS_AS(datasource_factory::create("s3://bucket/key.parquet", reg, cfg),
-                  std::runtime_error);
+                  std::exception);
   CHECK(ctx->make_datasource_calls == 0);
 }
