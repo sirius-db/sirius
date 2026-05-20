@@ -128,8 +128,8 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
 void task_creator::drain_pending_tasks()
 {
   // Drain any queued task creation requests that haven't been picked up yet
-  _task_creation_queue.drain();
   _task_creation_queue.interrupt();
+  _task_creation_queue.drain();
   // Wait for any in-flight task creation lambdas to finish
   _bounded_pool->wait_all();
   _task_creation_queue.reactivate();
