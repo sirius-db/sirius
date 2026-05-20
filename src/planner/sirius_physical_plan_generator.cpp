@@ -16,11 +16,8 @@
 
 #include "planner/sirius_physical_plan_generator.hpp"
 
-<<<<<<< HEAD
 #include "duckdb/common/type_visitor.hpp"
-=======
 #include "config.hpp"
->>>>>>> 0c6e7760b (refactor: tree-rewrite skeleton + flag-gated call site (Sub-phase B.1 of #604))
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -34,6 +31,10 @@
 #include "op/sirius_dynamic_filter.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_context.hpp"
+#include "op/sirius_physical_column_data_scan.hpp"
+#include "op/sirius_physical_cpu_source.hpp"
+#include "op/sirius_physical_duckdb_scan.hpp"
+#include "op/sirius_physical_table_scan.hpp"
 
 #include <utility>
 
@@ -78,24 +79,93 @@ void wrap_above(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
   slot          = std::forward<WrapperFactory>(factory)(std::move(original));
 }
 
-//! Recursive top-down walk over the physical plan tree. Dispatches on `slot->type` to apply
-//! per-operator-type wraps via `wrap_child` / `wrap_above`, then recurses into children
-//! (which may include freshly-inserted wrappers). The dispatch is left empty in Sub-phase B.1;
-//! per-operator-type factories arrive in B.2 (sources), B.3 (sinks), B.4 (joins), B.5
-//! (delim joins).
+//! Attach a leaf GPU scan operator as the only child of a TABLE_SCAN, mirroring today's
+//! `sirius_pipeline_converter::split_table_scan_source` (which constructs the same operator
+//! as a separate pipeline at runtime instead of nesting it in the tree). In the tree-based
+//! path the leaf lives in the plan tree from plan time so `build_pipelines` can derive the
+//! scan pipeline structurally rather than via runtime mutation.
+//!
+//! Sub-phase B.2a handles `seq_scan` → DUCKDB_SCAN. Parquet (`parquet_scan` / `read_parquet`)
+//! and Iceberg (`iceberg_scan`) are dispatched here in B.2b / B.2c respectively. While those
+//! cases remain unhandled, this function quietly skips them: the legacy converter (still
+//! authoritative when the flag is off) handles them at runtime. Once B.2c lands, this
+//! function throws on truly unsupported scan functions to match the converter's behavior.
+void wrap_table_scan_source(sirius::op::sirius_physical_operator& table_scan_op)
+{
+  // Table-in-out functions wear a TABLE_SCAN with children — skip per the master plan's
+  // exclusion rule. Wrapping them would change their child layout in a way the converter
+  // and downstream operators don't expect.
+  if (!table_scan_op.children.empty()) { return; }
+
+  auto& scan     = table_scan_op.Cast<sirius::op::sirius_physical_table_scan>();
+  const auto& fn = scan.function.name;
+
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> leaf;
+  if (fn == "seq_scan") {
+    leaf = duckdb::make_uniq<sirius::op::sirius_physical_duckdb_scan>(&scan);
+  } else {
+    // parquet_scan / read_parquet handled in B.2b; iceberg_scan in B.2c.
+    return;
+  }
+  table_scan_op.children.push_back(std::move(leaf));
+}
+
+//! Attach a leaf CPU_SOURCE operator as the only child of a COLUMN_DATA_SCAN (with non-null
+//! collection), EMPTY_RESULT, or DUMMY_SCAN node. Mirrors the legacy converter's
+//! `split_cpu_source`. COLUMN_DATA_SCAN with a null collection is the LEFT_DELIM_JOIN cached
+//! chunk scan — populated at runtime by the delim-join sink, not by `cpu_source_task` — so
+//! we deliberately leave it as-is.
+void wrap_cpu_source(sirius::op::sirius_physical_operator& source_op)
+{
+  if (!source_op.children.empty()) { return; }
+
+  duckdb::unique_ptr<sirius::op::sirius_physical_cpu_source> leaf;
+  switch (source_op.type) {
+    case sirius::op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN: {
+      auto& col_scan = source_op.Cast<sirius::op::sirius_physical_column_data_scan>();
+      if (!col_scan.collection) { return; }  // LEFT_DELIM_JOIN cached chunk scan — skip
+      leaf = duckdb::make_uniq<sirius::op::sirius_physical_cpu_source>(
+        source_op.types, source_op.estimated_cardinality, std::move(col_scan.collection));
+      break;
+    }
+    case sirius::op::SiriusPhysicalOperatorType::DUMMY_SCAN:
+      leaf = duckdb::make_uniq<sirius::op::sirius_physical_cpu_source>(
+        source_op.types, source_op.estimated_cardinality, /*produce_single_row=*/true);
+      break;
+    case sirius::op::SiriusPhysicalOperatorType::EMPTY_RESULT:
+      leaf = duckdb::make_uniq<sirius::op::sirius_physical_cpu_source>(
+        source_op.types, source_op.estimated_cardinality, /*produce_single_row=*/false);
+      break;
+    default: return;
+  }
+  source_op.children.push_back(std::move(leaf));
+}
+
+//! Post-order recursive walk over the physical plan tree. Children are visited (and rewritten)
+//! before the dispatch on `slot->type`, so a later `wrap_above` cannot re-enter the freshly-
+//! inserted wrapper subtree and double-wrap the original node. Source-side wraps (this sub-
+//! phase) append a leaf to an existing TABLE_SCAN/COLUMN_DATA_SCAN/EMPTY_RESULT/DUMMY_SCAN
+//! node, growing it from a leaf into an intermediate; the new leaf has no children of its own,
+//! so post-order is equivalent to pre-order in those cases.
 void insert_gpu_pipeline_operators_recursive(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
 {
   if (!slot) { return; }
 
-  // TODO(Sub-phase B.2+): dispatch on slot->type and apply wraps for source-side leaf
-  // operators (TABLE_SCAN, CPU_SOURCE family), sink wraps (HASH_GROUP_BY, ORDER_BY, TOP_N,
-  // UNGROUPED_AGGREGATE), joins (HASH_JOIN, NESTED_LOOP_JOIN), and DELIM JOIN internals.
-  // For now this is a no-op skeleton so the walk infrastructure is in place and the
-  // gated call site below is exercised when the flag is on.
-
   for (auto& child_slot : slot->children) {
     insert_gpu_pipeline_operators_recursive(child_slot);
+  }
+
+  switch (slot->type) {
+    case sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN: wrap_table_scan_source(*slot); break;
+    case sirius::op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN:
+    case sirius::op::SiriusPhysicalOperatorType::EMPTY_RESULT:
+    case sirius::op::SiriusPhysicalOperatorType::DUMMY_SCAN: wrap_cpu_source(*slot); break;
+    default:
+      // Sink wraps (HASH_GROUP_BY, ORDER_BY, TOP_N, UNGROUPED_AGGREGATE), joins
+      // (HASH_JOIN, NESTED_LOOP_JOIN), and DELIM JOIN internals land in subsequent
+      // commits within Sub-phase B.
+      break;
   }
 }
 
