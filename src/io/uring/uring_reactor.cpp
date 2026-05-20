@@ -19,6 +19,7 @@
 #include <rmm/cuda_device.hpp>
 
 #include <fcntl.h>
+#include <numa.h>
 #include <spdlog/spdlog.h>
 #include <sys/stat.h>
 
@@ -55,22 +56,69 @@ uring_io_object::uring_io_object(std::string path) : _path(std::move(path))
 // uring_reactor
 // ---------------------------------------------------------------------------
 
-uring_reactor::uring_reactor(unsigned ring_entries, size_t bounce_slot_size)
-  : _ring_entries(ring_entries)
+uring_reactor::uring_reactor(unsigned ring_entries, size_t bounce_slot_size, int numa_node)
+  : _ring_entries(ring_entries), _bounce_slot_size(bounce_slot_size), _numa_node(numa_node)
 {
+  // Allocate pinned bounce buffers. Each slot is reachable from any GPU
+  // context (Portable flag). When _numa_node >= 0 we explicitly back the
+  // pages with the requested NUMA domain via numa_alloc_onnode +
+  // cudaHostRegister(Portable|Mapped) so the io_uring reactor's H2D copies
+  // don't cross NUMA on a multi-socket host. Mirrors cucascade's
+  // numa_region_pinned_host_memory_resource pattern, replicated inline to
+  // avoid coupling to its RMM-style stream_ref/alignment-tracking surface.
   for (int i = 0; i < static_cast<int>(NUM_CHUNKS); ++i) {
     void* raw = nullptr;
-    // Portable flag so these buffers are reachable from CUDA contexts
-    // other than the one current at ioctx construction (multi-GPU usage).
-    CUDA_CHECK(cudaHostAlloc(&raw, bounce_slot_size, cudaHostAllocPortable));
-    _bounce[i].buf.reset(raw);
-    _cb_args[i] = {this, i};
+    if (_numa_node >= 0) {
+      raw = numa_alloc_onnode(bounce_slot_size, _numa_node);
+      if (raw == nullptr) {
+        throw std::runtime_error(
+          "uring_reactor: numa_alloc_onnode failed for node=" + std::to_string(_numa_node));
+      }
+      cudaError_t reg_err =
+        cudaHostRegister(raw,
+                         bounce_slot_size,
+                         static_cast<unsigned>(cudaHostRegisterPortable | cudaHostRegisterMapped));
+      if (reg_err != cudaSuccess) {
+        numa_free(raw, bounce_slot_size);
+        throw std::runtime_error(std::string("uring_reactor: cudaHostRegister failed: ") +
+                                 cudaGetErrorString(reg_err));
+      }
+    } else {
+      // Portable flag so these buffers are reachable from CUDA contexts
+      // other than the one current at ioctx construction (multi-GPU usage).
+      CUDA_CHECK(cudaHostAlloc(&raw, bounce_slot_size, cudaHostAllocPortable));
+    }
+    _bounce[i].buf = raw;
+    _cb_args[i]    = {this, i};
   }
 
   _worker = std::thread([this] { worker_loop(); });
 }
 
-uring_reactor::~uring_reactor() { shutdown(); }
+uring_reactor::~uring_reactor()
+{
+  shutdown();
+  // Free bounce slots in the inverse of the allocation policy chosen by
+  // the ctor. shutdown() above joins the worker thread, so no callback
+  // can race the unregister/free.
+  for (auto& slot : _bounce) {
+    if (slot.buf == nullptr) continue;
+    if (_numa_node >= 0) {
+      // Errors here are unrecoverable in a noexcept dtor — log and continue.
+      cudaError_t unreg = cudaHostUnregister(slot.buf);
+      if (unreg != cudaSuccess) {
+        spdlog::warn("uring_reactor: cudaHostUnregister failed: {}", cudaGetErrorString(unreg));
+      }
+      numa_free(slot.buf, _bounce_slot_size);
+    } else {
+      cudaError_t fr = cudaFreeHost(slot.buf);
+      if (fr != cudaSuccess) {
+        spdlog::warn("uring_reactor: cudaFreeHost failed: {}", cudaGetErrorString(fr));
+      }
+    }
+    slot.buf = nullptr;
+  }
+}
 
 void uring_reactor::interrupt()
 {
@@ -214,7 +262,7 @@ void uring_reactor::worker_loop()
                     req.file_off,
                     to_mb(req.io_size));
       io_uring_prep_read(
-        sqe, req.handle, _bounce[si].buf.get(), (unsigned)req.io_size, (__u64)req.file_off);
+        sqe, req.handle, _bounce[si].buf, (unsigned)req.io_size, (__u64)req.file_off);
       io_uring_sqe_set_data64(sqe, (uint64_t)si);
       slots[si].state = slot_state::READING;
       slots[si].req   = std::move(req);
@@ -282,7 +330,7 @@ void uring_reactor::worker_loop()
             std::optional<rmm::cuda_set_device_raii> dev_guard;
             if (req.device_id >= 0) { dev_guard.emplace(rmm::cuda_device_id{req.device_id}); }
             cudaMemcpyAsync(req.dst,
-                            (uint8_t*)_bounce[si].buf.get() + req.data_off,
+                            (uint8_t*)_bounce[si].buf + req.data_off,
                             actual,
                             cudaMemcpyHostToDevice,
                             req.stream);

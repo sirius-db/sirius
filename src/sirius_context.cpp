@@ -35,6 +35,8 @@
 
 #include <cuda_runtime_api.h>
 
+#include "memory/numa_small_pinned_mr.hpp"
+
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 #include <duckdb/common/allocator.hpp>
@@ -266,34 +268,75 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     }
   }
 
-  // One sirius_ioctx per GPU memory space. The cudaHostAllocPortable bounce
-  // slots inside uring_ioctx bind to the current CUDA context, so each
-  // construction must happen under rmm::cuda_set_device_raii. Each ioctx
-  // gets its own admission_control budget (never shared across GPUs).
+  // One sirius_ioctx per NUMA node hosting managed GPUs. A single ioctx
+  // already serves multiple GPUs correctly (device_read_req carries device_id +
+  // stream; reactor switches device before cudaMemcpyAsync) — going per-GPU
+  // multiplied reactor worker threads and oversubscribed the NVMe driver.
+  // Build steps per node:
+  //   1. choose an anchor device (lowest-numbered GPU on the node) to set
+  //      current CUDA device for ioctx ctor + cudaHostRegister
+  //   2. construct uring_ioctx with numa_node passed in so bounce slots
+  //      land on the right NUMA domain
+  //   3. fan numa_ioctxs_[node] out into gpu_ioctxs_[dev] for every GPU on
+  //      that node, aliasing the shared_ptr
   {
     auto gpu_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
-    gpu_ioctxs_.reserve(gpu_spaces.size());
+
+    // Group GPUs by normalized NUMA node id (-1 -> 0 to match task_creator
+    // and host_space construction conventions).
+    std::unordered_map<int, std::vector<int>> node_to_devices;
     for (auto* gpu_space : gpu_spaces) {
       auto const device_id = gpu_space->get_device_id();
-      rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{device_id}};
+      int raw_numa         = -1;
+      if (device_id >= 0 && static_cast<unsigned>(device_id) < topo.gpus.size()) {
+        raw_numa = topo.gpus[device_id].numa_node;
+      }
+      int const node = (raw_numa < 0) ? 0 : raw_numa;
+      device_to_numa_[device_id] = node;
+      node_to_devices[node].push_back(device_id);
+    }
 
-      // uring_ioctx ctor allocates pinned bounce slots via cudaHostAlloc
-      // bound to current context — the rmm::cuda_set_device_raii above is
-      // mandatory. Cache is left uninitialized; sirius_datasource falls
-      // through to device_read_io when _cache==nullptr.
+    numa_ioctxs_.reserve(node_to_devices.size());
+    gpu_ioctxs_.reserve(gpu_spaces.size());
+    for (auto& [node, devices] : node_to_devices) {
+      std::sort(devices.begin(), devices.end());
+      int const anchor_device = devices.front();
+      rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{anchor_device}};
+
+      // Scale reactor pool with the number of GPUs the node serves so we
+      // keep parallelism without exploding worker-thread count on hosts
+      // with many GPUs per node. Clamped at [4, 16] — matches the historic
+      // per-GPU default of 4 reactors as a floor.
+      size_t const n_reactors =
+        std::clamp<size_t>(4 * devices.size(), 4, 16);
+
       auto ioctx = std::make_shared<sirius::io::uring_ioctx>(
         /*host_ring_depth=*/16u,
         /*ring_entries=*/64u,
-        /*n_reactors=*/static_cast<size_t>(4),
-        /*bounce_slot_size=*/sirius::io::CHUNK_SIZE);
+        /*n_reactors=*/n_reactors,
+        /*bounce_slot_size=*/sirius::io::CHUNK_SIZE,
+        /*numa_node=*/node);
 
       int readback = -1;
       cudaGetDevice(&readback);
-      SIRIUS_LOG_INFO("SiriusContext: sirius_ioctx created for GPU {} (cudaGetDevice readback={})",
-                   device_id,
-                   readback);
+      std::string devices_str;
+      for (size_t i = 0; i < devices.size(); ++i) {
+        if (i > 0) devices_str.push_back(',');
+        devices_str += std::to_string(devices[i]);
+      }
+      SIRIUS_LOG_INFO(
+        "SiriusContext: sirius_ioctx created for NUMA node {} (anchor GPU {}, devices=[{}], "
+        "n_reactors={}, cudaGetDevice readback={})",
+        node,
+        anchor_device,
+        devices_str,
+        n_reactors,
+        readback);
 
-      gpu_ioctxs_[device_id] = std::move(ioctx);
+      numa_ioctxs_.emplace(node, ioctx);
+      for (int dev : devices) {
+        gpu_ioctxs_.emplace(dev, ioctx);  // alias the per-node shared_ptr
+      }
     }
   }
 
@@ -380,14 +423,42 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // Configure cuDF to use our pinned slab allocator for small internal host buffers
   // (e.g. column_device_view metadata arrays in cudf::concatenate).  This eliminates
   // the pageable H2D transfers that cuDF issues by default.
+  //
+  // cuDF's set_pinned_memory_resource is process-global with no per-device
+  // hook (see <cudf/utilities/pinned_memory.hpp> — it stores a single
+  // host_device_async_resource_ref). Wrap one small_pinned_host_memory_resource
+  // per host space (cucascade builds one per NUMA node when
+  // use_host_per_numa() is set in sirius_config) behind a thin dispatcher
+  // that reads cudaGetDevice() at every alloc/dealloc and routes to the
+  // matching node's pool. Previously this block hardcoded host_spaces[0],
+  // funneling every cuDF metadata allocation through one NUMA domain on
+  // multi-NUMA hosts.
   {
     auto host_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
     if (!host_spaces.empty()) {
-      auto* fsmr = host_spaces[0]
-                     ->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
-      if (fsmr != nullptr) {
-        small_pinned_allocator_ =
-          std::make_unique<cucascade::memory::small_pinned_host_memory_resource>(*fsmr);
+      std::unordered_map<int,
+                         std::unique_ptr<cucascade::memory::small_pinned_host_memory_resource>>
+        per_node_pools;
+      int fallback_node = -1;
+      for (auto* host_space : host_spaces) {
+        auto* fsmr =
+          host_space
+            ->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
+        if (fsmr == nullptr) { continue; }
+        int raw_numa = host_space->get_device_id();  // numa_id for HOST tier
+        int node     = (raw_numa < 0) ? 0 : raw_numa;
+        if (fallback_node < 0) { fallback_node = node; }
+        per_node_pools.emplace(
+          node, std::make_unique<cucascade::memory::small_pinned_host_memory_resource>(*fsmr));
+      }
+      if (!per_node_pools.empty()) {
+        // Use the lowest-numbered NUMA node as fallback so threads that
+        // happen to alloc before binding to a device still hit a valid
+        // pool deterministically.
+        if (fallback_node < 0) { fallback_node = per_node_pools.begin()->first; }
+        std::unordered_map<int, int> device_to_numa_copy = device_to_numa_;
+        small_pinned_allocator_ = std::make_unique<sirius::memory::numa_small_pinned_mr>(
+          std::move(per_node_pools), std::move(device_to_numa_copy), fallback_node);
         small_pinned_allocator_view_.emplace(
           sirius::memory::make_host_device_resource_view_checked(small_pinned_allocator_.get()));
         prev_pinned_threshold_ = cudf::get_allocate_host_as_pinned_threshold();
@@ -395,8 +466,11 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
           rmm::host_device_async_resource_ref{*small_pinned_allocator_view_});
         cudf::set_allocate_host_as_pinned_threshold(
           cucascade::memory::small_pinned_host_memory_resource::MAX_SLAB_SIZE);
-        SIRIUS_LOG_INFO("SiriusContext: cuDF pinned memory resource configured (max slab {} B)",
-                     cucascade::memory::small_pinned_host_memory_resource::MAX_SLAB_SIZE);
+        SIRIUS_LOG_INFO(
+          "SiriusContext: cuDF pinned memory resource configured (NUMA-aware, max slab {} B, "
+          "fallback node={})",
+          cucascade::memory::small_pinned_host_memory_resource::MAX_SLAB_SIZE,
+          fallback_node);
       }
     }
   }
@@ -494,11 +568,16 @@ void SiriusContext::terminate()
   downgrade_executors_.clear();
 
   // Teardown order is load-bearing: registry holds shared_ptrs to ioctxs, so
-  // it must drop its refs first. Then ~uring_ioctx (inside gpu_ioctxs_.clear)
-  // joins reactor threads and calls cudaFreeHost, which requires a live CUDA
-  // context — must happen before memory_manager_->shutdown().
+  // it must drop its refs first. Then gpu_ioctxs_ (the device-keyed view) is
+  // cleared to drop the aliasing shared_ptrs. Only when that's done do we
+  // clear numa_ioctxs_, which actually destroys each uring_ioctx — joining
+  // reactor threads and freeing the NUMA-bound pinned bounce buffers
+  // (cudaHostUnregister + numa_free, or cudaFreeHost) — which requires a
+  // live CUDA context, so it must run BEFORE memory_manager_->shutdown().
   datasource_registry_.clear();
   gpu_ioctxs_.clear();
+  numa_ioctxs_.clear();
+  device_to_numa_.clear();
   // No cudaDeviceDisablePeerAccess: CUDA cleans up peer mappings at process
   // exit, and explicit disable here can tear down mappings that
   // memory_manager_ teardown below still traverses for GPU->HOST drains.

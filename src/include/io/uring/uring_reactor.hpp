@@ -87,15 +87,6 @@ struct ring_deleter {
 using unique_ring = std::unique_ptr<io_uring, ring_deleter>;
 
 /**
- * @brief Custom deleter for CUDA pinned (host) memory allocated with
- *        @c cudaHostAlloc.
- */
-struct pinned_deleter {
-  void operator()(void* p) const noexcept { cudaFreeHost(p); }
-};
-using unique_pinned_buf = std::unique_ptr<void, pinned_deleter>;
-
-/**
  * @brief Converts a byte count to mebibytes.
  */
 inline double to_mb(size_t bytes) noexcept
@@ -107,9 +98,16 @@ inline double to_mb(size_t bytes) noexcept
 
 /**
  * @brief One pinned-memory staging buffer with a completion flag.
+ *
+ * The backing buffer is allocated by uring_reactor's ctor and freed in its
+ * dtor. Two allocation modes are supported:
+ *   - numa_node < 0 : cudaHostAlloc(cudaHostAllocPortable)
+ *   - numa_node >= 0: numa_alloc_onnode + cudaHostRegister(Portable|Mapped)
+ * The matching free path is selected from `_numa_node`/`_size` recorded on
+ * the reactor — bounce_slot itself stays POD.
  */
 struct bounce_slot {
-  unique_pinned_buf buf;
+  void* buf{nullptr};
   std::atomic<bool> cuda_done{false};
 };
 
@@ -163,7 +161,14 @@ class uring_reactor {
   using device_read_req_type = device_read_req<native_handle_type>;
   using host_read_req_type   = host_read_req<native_handle_type>;
 
-  explicit uring_reactor(unsigned ring_entries = 64, size_t bounce_slot_size = CHUNK_SIZE);
+  /// @param ring_entries       SQE depth for the per-reactor io_uring.
+  /// @param bounce_slot_size   Size of each pinned bounce buffer slot.
+  /// @param numa_node          Target NUMA node for pinned bounce-buffer
+  ///                           allocation. Use -1 to skip NUMA binding
+  ///                           (single-node hosts / fallback path).
+  explicit uring_reactor(unsigned ring_entries  = 64,
+                         size_t bounce_slot_size = CHUNK_SIZE,
+                         int numa_node           = -1);
 
   ~uring_reactor();
 
@@ -208,6 +213,8 @@ class uring_reactor {
   std::array<bounce_slot, NUM_CHUNKS> _bounce;
   std::array<cb_arg, NUM_CHUNKS> _cb_args;
   unsigned _ring_entries;
+  size_t _bounce_slot_size{0};
+  int _numa_node{-1};
   std::atomic<uint64_t> _wake_seq{0};
   std::atomic<bool> _stop{false};
   std::thread _worker;

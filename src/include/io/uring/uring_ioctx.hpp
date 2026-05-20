@@ -82,10 +82,18 @@ class ring_pool {
  */
 class uring_ioctx : public templated_ioctx<uring_reactor> {
  public:
+  /// @param host_ring_depth   Side-channel host ring pool depth.
+  /// @param ring_entries      SQE depth per reactor io_uring.
+  /// @param n_reactors        Number of reactor workers (each owns its own ring).
+  /// @param bounce_slot_size  Size of each pinned bounce slot.
+  /// @param numa_node         Target NUMA node for pinned bounce buffers
+  ///                          shared across all reactors. -1 disables NUMA
+  ///                          binding (legacy single-node behaviour).
   explicit uring_ioctx(unsigned host_ring_depth = 16,
                        unsigned ring_entries    = 64,
                        size_t n_reactors        = 4,
-                       size_t bounce_slot_size  = 1UL * 1024 * 1024);
+                       size_t bounce_slot_size  = 1UL * 1024 * 1024,
+                       int numa_node            = -1);
 };
 
 }  // namespace sirius::io
