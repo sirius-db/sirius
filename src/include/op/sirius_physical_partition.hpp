@@ -60,6 +60,9 @@ class sirius_physical_partition : public sirius_physical_operator {
 
   bool is_sink() const override;
 
+  void build_pipelines(pipeline::sirius_pipeline& current,
+                       pipeline::sirius_meta_pipeline& meta_pipeline) override;
+
   bool is_build_partition();
 
   void set_drives_partition_count(bool drives) { _drives_partition_count = drives; }

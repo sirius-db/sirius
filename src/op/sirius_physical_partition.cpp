@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_partition.hpp"
 
+#include "config.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -25,6 +26,7 @@
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "op/sirius_physical_hash_join.hpp"
+#include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
 #include <nvtx3/nvtx3.hpp>
@@ -72,6 +74,41 @@ std::string sirius_physical_partition::get_name() const { return "PARTITION"; }
 bool sirius_physical_partition::is_source() const { return true; }
 
 bool sirius_physical_partition::is_sink() const { return true; }
+
+void sirius_physical_partition::build_pipelines(pipeline::sirius_pipeline& current,
+                                                pipeline::sirius_meta_pipeline& meta_pipeline)
+{
+  if (!duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
+    sirius_physical_operator::build_pipelines(current, meta_pipeline);
+    return;
+  }
+  // Phase 3.2 (#604) Path 3b: PARTITION is a sink, and its tree child is
+  // promoted to be the sink of a deeper child_meta — reproducing today's
+  // position-dependent sink promotion in split_join_sink,
+  // split_delim_join_sink, and split_intermediate_joins (when operators.size()
+  // > 0). The result is two pipelines: partition_meta = [*this] and deeper_meta
+  // = [...intermediates..., child_op] where child_op was the original tree
+  // child.
+  D_ASSERT(children.size() == 1);
+  auto& child_op       = *children[0];
+  auto& partition_meta = meta_pipeline.create_child_meta_pipeline(current, *this);
+
+  if (child_op.children.empty()) {
+    // No upstream chain to promote — child_op handles itself.  Sink-leaf
+    // children (DUCKDB_SCAN, ICEBERG_SCAN, GPU_PARQUET_SCAN, CPU_SOURCE) take
+    // their C.3 override path and create their own scan_meta under
+    // partition_meta. Regular source-leaves fall through the base source-leaf
+    // branch and get appended to partition_meta.base.
+    partition_meta.build(child_op);
+    return;
+  }
+  // child_op has its own children — promote it to the sink slot of a deeper
+  // child meta under partition_meta. deeper_meta.base.operators is pre-
+  // populated with [child_op] by create_pipeline (C.1).
+  auto& deeper_meta =
+    partition_meta.create_child_meta_pipeline(*partition_meta.get_base_pipeline(), child_op);
+  deeper_meta.build(*child_op.children[0]);
+}
 
 void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_operator* op,
                                                             bool is_build)
