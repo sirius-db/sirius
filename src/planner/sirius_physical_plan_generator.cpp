@@ -38,9 +38,21 @@
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_cpu_source.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
+#include "op/sirius_physical_grouped_aggregate.hpp"
+#include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "op/sirius_physical_iceberg_scan.hpp"
+#include "op/sirius_physical_merge_sort.hpp"
+#include "op/sirius_physical_order.hpp"
+#include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_result_collector.hpp"
+#include "op/sirius_physical_sort_partition.hpp"
+#include "op/sirius_physical_sort_sample.hpp"
 #include "op/sirius_physical_table_scan.hpp"
+#include "op/sirius_physical_top_n.hpp"
+#include "op/sirius_physical_top_n_merge.hpp"
+#include "op/sirius_physical_ungrouped_aggregate.hpp"
+#include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
+#include "sirius_config.hpp"
 #include "sirius_context.hpp"
 
 #include <optional>
@@ -197,21 +209,141 @@ void wrap_cpu_source(sirius::op::sirius_physical_operator& source_op)
   source_op.children.push_back(std::move(leaf));
 }
 
+//! Replace a HASH_GROUP_BY slot with `GROUPED_AGGREGATE_MERGE → PARTITION → HASH_GROUP_BY →
+//! original_input`. Mirrors the converter's `split_group_aggregate_sink` HASH_GROUP_BY branch.
+//! The original HGB is kept as the per-thread state sink; PARTITION buckets its output for
+//! the cross-thread merge.
+void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
+                        const sirius::operator_params& op_params)
+{
+  wrap_above(slot, [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> hgb_op) {
+    auto* hgb_ptr = hgb_op.get();
+
+    auto partition =
+      duckdb::make_uniq<sirius::op::sirius_physical_partition>(hgb_ptr->types,
+                                                               hgb_ptr->estimated_cardinality,
+                                                               /*parent_op=*/hgb_ptr,
+                                                               /*is_build=*/false,
+                                                               op_params.hash_partition_bytes);
+    partition->children.push_back(std::move(hgb_op));
+
+    auto merge = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate_merge>(
+      &hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>());
+    merge->children.push_back(std::move(partition));
+    return merge;
+  });
+}
+
+//! Replace an UNGROUPED_AGGREGATE slot with `UNGROUPED_AGGREGATE_MERGE → UNGROUPED_AGGREGATE →
+//! original_input`. Mirrors the UNGROUPED branch of `split_group_aggregate_sink`. No PARTITION
+//! step is needed: the merge consumes the single per-thread accumulator directly.
+void wrap_ungrouped_aggregate(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
+{
+  wrap_above(slot, [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> ungrouped_op) {
+    auto* ungrouped_ptr = ungrouped_op.get();
+    auto merge          = duckdb::make_uniq<sirius::op::sirius_physical_ungrouped_aggregate_merge>(
+      &ungrouped_ptr->Cast<sirius::op::sirius_physical_ungrouped_aggregate>());
+    merge->children.push_back(std::move(ungrouped_op));
+    return merge;
+  });
+}
+
+//! Replace a TOP_N slot with `TOP_N_MERGE → TOP_N → original_input`. Mirrors `split_top_n_sink`.
+void wrap_top_n(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
+{
+  wrap_above(slot, [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> topn_op) {
+    auto* topn_ptr = &topn_op->Cast<sirius::op::sirius_physical_top_n>();
+    auto merge     = duckdb::make_uniq<sirius::op::sirius_physical_top_n_merge>(topn_ptr);
+    merge->children.push_back(std::move(topn_op));
+    return merge;
+  });
+}
+
+//! Replace an ORDER_BY slot with the sort chain
+//! `MERGE_SORT → SORT_PARTITION → SORT_SAMPLE → ORDER_BY → original_input`. Mirrors
+//! `split_order_by_sink` field-for-field including the destructive side-effects:
+//!   - ORDER_BY's `projections` is overwritten with the identity projection over the input's
+//!     types, and its `types` is replaced with the input's types — so the per-batch sort
+//!     keeps every column visible to SORT_SAMPLE / SORT_PARTITION.
+//!   - SORT_SAMPLE optionally receives `max_partition_bytes` from `op_params`.
+//!   - SORT_PARTITION's `set_sample_op` is wired to the SORT_SAMPLE just inserted.
+//!   - MERGE_SORT receives the original projection back via `set_final_projections` when the
+//!     original was non-identity (otherwise the chain already projects all columns).
+void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
+                   const sirius::operator_params& op_params)
+{
+  wrap_above(slot, [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> order_op) {
+    auto* order_ptr = &order_op->Cast<sirius::op::sirius_physical_order>();
+    if (order_ptr->children.empty()) {
+      throw std::runtime_error(
+        "[sirius_physical_plan_generator::wrap_order_by] ORDER_BY has no child input");
+    }
+
+    auto original_projections = order_ptr->projections;
+    auto const& child_types   = order_ptr->children[0]->types;
+
+    duckdb::vector<std::size_t> identity_proj;
+    identity_proj.reserve(child_types.size());
+    for (std::size_t col_idx = 0; col_idx < child_types.size(); col_idx++) {
+      identity_proj.push_back(col_idx);
+    }
+    order_ptr->projections = std::move(identity_proj);
+    order_ptr->types       = child_types;
+
+    auto sample      = duckdb::make_uniq<sirius::op::sirius_physical_sort_sample>(order_ptr);
+    auto* sample_ptr = sample.get();
+    if (op_params.max_sort_partition_bytes > 0) {
+      sample_ptr->set_max_partition_bytes(op_params.max_sort_partition_bytes);
+    }
+    sample->children.push_back(std::move(order_op));
+
+    auto partition = duckdb::make_uniq<sirius::op::sirius_physical_sort_partition>(order_ptr);
+    partition->set_sample_op(sample_ptr);
+    partition->children.push_back(std::move(sample));
+
+    auto merge = duckdb::make_uniq<sirius::op::sirius_physical_merge_sort>(order_ptr);
+
+    bool is_identity = (original_projections.size() == order_ptr->types.size());
+    if (is_identity) {
+      for (std::size_t i = 0; i < original_projections.size(); i++) {
+        if (original_projections[i] != i) {
+          is_identity = false;
+          break;
+        }
+      }
+    }
+    if (!is_identity) {
+      duckdb::vector<sirius::logical_type> output_types;
+      output_types.reserve(original_projections.size());
+      for (auto idx : original_projections) {
+        output_types.push_back(order_ptr->types[idx]);
+      }
+      merge->set_final_projections(std::move(original_projections), std::move(output_types));
+    }
+
+    merge->children.push_back(std::move(partition));
+    return merge;
+  });
+}
+
 //! Post-order recursive walk over the physical plan tree. Children are visited (and rewritten)
 //! before the dispatch on `slot->type`, so a later `wrap_above` cannot re-enter the freshly-
-//! inserted wrapper subtree and double-wrap the original node. Source-side wraps (this sub-
-//! phase) append a leaf to an existing TABLE_SCAN/COLUMN_DATA_SCAN/EMPTY_RESULT/DUMMY_SCAN
-//! node, growing it from a leaf into an intermediate; the new leaf has no children of its own,
-//! so post-order is equivalent to pre-order in those cases.
+//! inserted wrapper subtree and double-wrap the original node. Source-side wraps append a leaf
+//! to an existing TABLE_SCAN/COLUMN_DATA_SCAN/EMPTY_RESULT/DUMMY_SCAN node, growing it from a
+//! leaf into an intermediate; the new leaf has no children of its own, so post-order is
+//! equivalent to pre-order in those cases. Sink-side wraps replace the slot with a wrapper
+//! subtree whose root sits above the original sink; the new wrapper nodes are not visited
+//! because the walk has already moved past the slot.
 void insert_gpu_pipeline_operators_recursive(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
   const std::unordered_map<std::string, std::shared_ptr<const sirius::op::scan::IcebergDeleteData>>&
-    iceberg_cache)
+    iceberg_cache,
+  const sirius::operator_params& op_params)
 {
   if (!slot) { return; }
 
   for (auto& child_slot : slot->children) {
-    insert_gpu_pipeline_operators_recursive(child_slot, iceberg_cache);
+    insert_gpu_pipeline_operators_recursive(child_slot, iceberg_cache, op_params);
   }
 
   switch (slot->type) {
@@ -221,10 +353,16 @@ void insert_gpu_pipeline_operators_recursive(
     case sirius::op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN:
     case sirius::op::SiriusPhysicalOperatorType::EMPTY_RESULT:
     case sirius::op::SiriusPhysicalOperatorType::DUMMY_SCAN: wrap_cpu_source(*slot); break;
+    case sirius::op::SiriusPhysicalOperatorType::HASH_GROUP_BY:
+      wrap_hash_group_by(slot, op_params);
+      break;
+    case sirius::op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE:
+      wrap_ungrouped_aggregate(slot);
+      break;
+    case sirius::op::SiriusPhysicalOperatorType::ORDER_BY: wrap_order_by(slot, op_params); break;
+    case sirius::op::SiriusPhysicalOperatorType::TOP_N: wrap_top_n(slot); break;
     default:
-      // Sink wraps (HASH_GROUP_BY, ORDER_BY, TOP_N, UNGROUPED_AGGREGATE), joins
-      // (HASH_JOIN, NESTED_LOOP_JOIN), and DELIM JOIN internals land in subsequent
-      // commits within Sub-phase B.
+      // Joins (HASH_JOIN, NESTED_LOOP_JOIN) and DELIM JOIN internals land in B.4 and B.5.
       break;
   }
 }
@@ -263,7 +401,16 @@ void sirius_physical_plan_generator::set_parent_ops(sirius::op::sirius_physical_
 void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& plan)
 {
-  insert_gpu_pipeline_operators_recursive(plan, iceberg_delete_data_cache_);
+  // op_params live on SiriusContext alongside the cache_level / quent config. Sink wraps
+  // (HASH_GROUP_BY, ORDER_BY) need `hash_partition_bytes` and `max_sort_partition_bytes` to
+  // match the legacy converter's `op_params_` reads at line 544 and line 624. Use empty
+  // defaults if SiriusContext is missing — the resulting wraps fall back to the operators'
+  // own constructor defaults, which match converter behavior when the context is absent.
+  sirius::operator_params op_params;
+  if (auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
+    op_params = sirius_ctx->get_config().get_operator_params();
+  }
+  insert_gpu_pipeline_operators_recursive(plan, iceberg_delete_data_cache_, op_params);
 }
 
 std::string sirius_physical_plan_generator::resolve_iceberg_table_path(
