@@ -16,7 +16,11 @@
 
 #include "planner/sirius_physical_plan_generator.hpp"
 
+<<<<<<< HEAD
 #include "duckdb/common/type_visitor.hpp"
+=======
+#include "config.hpp"
+>>>>>>> 0c6e7760b (refactor: tree-rewrite skeleton + flag-gated call site (Sub-phase B.1 of #604))
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -31,6 +35,8 @@
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_context.hpp"
 
+#include <utility>
+
 namespace sirius::planner {
 
 namespace {
@@ -42,6 +48,57 @@ bool dynamic_filter_pushdown_enabled(duckdb::ClientContext& context)
   if (!state) { return false; }
   return state->get_config().get_operator_params().enable_dynamic_filter_pushdown;
 }
+
+//! Insert `factory(std::move(parent.children[i]))` between `parent` and its i-th child. The
+//! factory takes ownership of the original child and returns the wrapper subtree (which
+//! must already hold the original as one of its own descendants).
+//!
+//! Move-semantics on `parent.children[i]` guarantees no raw pointer is held across the
+//! mutation: the slot is null between the `std::move` and the assignment, so the compiler
+//! enforces tree integrity. See the master plan (`Tree-mutation pattern`) for the rationale.
+template <typename WrapperFactory>
+void wrap_child(sirius::op::sirius_physical_operator& parent,
+                std::size_t i,
+                WrapperFactory&& factory)
+{
+  auto original      = std::move(parent.children[i]);
+  auto wrapper       = std::forward<WrapperFactory>(factory)(std::move(original));
+  parent.children[i] = std::move(wrapper);
+}
+
+//! Replace the operator at `slot` with `factory(std::move(slot))`. Used for sink-wrap rewrites
+//! (HASH_GROUP_BY, ORDER_BY, TOP_N, etc.) where the original operator becomes a child of a
+//! newly-inserted wrapper that sits in the slot it used to occupy. The factory receives
+//! ownership of the original and must return a wrapper subtree containing the original.
+template <typename WrapperFactory>
+void wrap_above(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
+                WrapperFactory&& factory)
+{
+  auto original = std::move(slot);
+  slot          = std::forward<WrapperFactory>(factory)(std::move(original));
+}
+
+//! Recursive top-down walk over the physical plan tree. Dispatches on `slot->type` to apply
+//! per-operator-type wraps via `wrap_child` / `wrap_above`, then recurses into children
+//! (which may include freshly-inserted wrappers). The dispatch is left empty in Sub-phase B.1;
+//! per-operator-type factories arrive in B.2 (sources), B.3 (sinks), B.4 (joins), B.5
+//! (delim joins).
+void insert_gpu_pipeline_operators_recursive(
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
+{
+  if (!slot) { return; }
+
+  // TODO(Sub-phase B.2+): dispatch on slot->type and apply wraps for source-side leaf
+  // operators (TABLE_SCAN, CPU_SOURCE family), sink wraps (HASH_GROUP_BY, ORDER_BY, TOP_N,
+  // UNGROUPED_AGGREGATE), joins (HASH_JOIN, NESTED_LOOP_JOIN), and DELIM JOIN internals.
+  // For now this is a no-op skeleton so the walk infrastructure is in place and the
+  // gated call site below is exercised when the flag is on.
+
+  for (auto& child_slot : slot->children) {
+    insert_gpu_pipeline_operators_recursive(child_slot);
+  }
+}
+
 }  // namespace
 
 sirius_physical_plan_generator::sirius_physical_plan_generator(duckdb::ClientContext& context)
@@ -71,6 +128,12 @@ void sirius_physical_plan_generator::set_parent_ops(sirius::op::sirius_physical_
   for (auto& child : op.children) {
     if (child) { set_parent_ops(*child, &op); }
   }
+}
+
+void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator>& plan)
+{
+  insert_gpu_pipeline_operators_recursive(plan);
 }
 
 sirius::OrderPreservationType sirius_physical_plan_generator::order_preservation_recursive(
@@ -143,6 +206,18 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
 
   plan = fold_adjacent_projections(std::move(plan));
   plan->verify();
+
+  // Phase 3 (#601) tree-based pipeline build. When the flag is on, rewrite the plan tree to
+  // contain GPU pipeline operators (PARTITION/CONCAT/MERGE_*/SORT_*/scan companions/etc.)
+  // so the converter becomes a pure topology pass driven by `build_pipelines` virtuals.
+  // Default off; the legacy `sirius_pipeline_converter` is authoritative when the flag is
+  // off. `set_parent_ops` then derives every operator's `_parent_op` from the final tree,
+  // enabling Sub-phase C/D's tree-parent-lookup wiring.
+  if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
+    insert_gpu_pipeline_operators(plan);
+    set_parent_ops(*plan, /*parent=*/nullptr);
+  }
+
   return plan;
 }
 

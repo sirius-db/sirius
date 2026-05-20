@@ -196,13 +196,21 @@ class sirius_physical_plan_generator {
   // duckdb::GPUContext& gpu_context;
 
  private:
+  //! Walk the freshly-generated physical plan tree top-down and insert GPU pipeline operators
+  //! (PARTITION, CONCAT, SORT_SAMPLE / SORT_PARTITION / MERGE_SORT, GROUPED_AGGREGATE_MERGE,
+  //! UNGROUPED_AGGREGATE_MERGE, TOP_N_MERGE, DUCKDB/ICEBERG/PARQUET scan companions,
+  //! CPU_SOURCE, etc.) so the tree contains the full execution structure before the pipeline
+  //! converter runs. Gated by `duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD` at the call site;
+  //! Sub-phase B.1 lands the skeleton (recursive walk + `wrap_child` helper) with empty
+  //! per-operator-type dispatch. Operator-specific factories land in subsequent commits.
+  void insert_gpu_pipeline_operators(
+    duckdb::unique_ptr<sirius::op::sirius_physical_operator>& plan);
+
   //! Recursive post-pass walk that sets each operator's `_parent_op` from the final tree
   //! structure. Called once at the end of plan generation, after all tree rewrites have
   //! settled, so the parent pointer is derived from `children[]` and cannot drift. Access
-  //! to `sirius_physical_operator::set_parent_op` is granted via friendship.
-  //!
-  //! Dormant in Sub-phase A: declared and defined but not yet invoked. The call site is
-  //! added in Sub-phase B at the end of `Plan(unique_ptr<LogicalOperator>)`.
+  //! to `sirius_physical_operator::set_parent_op` is granted via friendship. Sub-phase B
+  //! wires the call site, gated by the same flag as `insert_gpu_pipeline_operators`.
   static void set_parent_ops(sirius::op::sirius_physical_operator& op,
                              sirius::op::sirius_physical_operator* parent);
 };
