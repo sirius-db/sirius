@@ -17,6 +17,7 @@
 #include "op/sirius_physical_hash_join.hpp"
 
 #include "cudf/aggregation.hpp"
+#include "config.hpp"
 #include "cudf/copying.hpp"
 #include "cudf/join/distinct_hash_join.hpp"
 #include "cudf/join/filtered_join.hpp"
@@ -389,17 +390,32 @@ void sirius_physical_hash_join::build_join_pipelines(pipeline::sirius_pipeline& 
   duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> dependencies;
   duckdb::optional_ptr<pipeline::sirius_meta_pipeline> last_child_ptr;
   if (build_rhs) {
-    // on the RHS (build side), we construct a child MetaPipeline with this operator as its sink
-    auto& child_meta_pipeline = meta_pipeline.create_child_meta_pipeline(current, op);
-    child_meta_pipeline.build(*op.children[1]);
-    // if (op.children[1].get().CanSaturateThreads(current.GetClientContext())) {
-    // 	// if the build side can saturate all available threads,
-    // 	// we don't just make the LHS pipeline depend on the RHS, but recursively all LHS children
-    // too.
-    // 	// this prevents breadth-first plan evaluation
-    // 	child_meta_pipeline.GetPipelines(dependencies, false);
-    // 	last_child_ptr = meta_pipeline.GetLastChild();
-    // }
+    if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
+      // Phase 3.2 (#604) Path 3b: Phase 3.1's wrap_join inserted
+      // CONCAT_build → PARTITION_build → original_build as op.children[1].
+      // Use CONCAT_build itself as the sink of build_meta — NOT op — to avoid
+      // producing a redundant single-operator [op] build pipeline that today's
+      // converter eliminates via sink promotion in split_join_sink. Recurse
+      // past CONCAT_build into its child so CONCAT_build.build_pipelines
+      // doesn't create a duplicate sink=CONCAT_build meta.
+      auto& build_child = *op.children[1];
+      D_ASSERT(build_child.is_sink());
+      D_ASSERT(!build_child.children.empty());
+      auto& build_meta = meta_pipeline.create_child_meta_pipeline(current, build_child);
+      build_meta.build(*build_child.children[0]);
+    } else {
+      // on the RHS (build side), we construct a child MetaPipeline with this operator as its sink
+      auto& child_meta_pipeline = meta_pipeline.create_child_meta_pipeline(current, op);
+      child_meta_pipeline.build(*op.children[1]);
+      // if (op.children[1].get().CanSaturateThreads(current.GetClientContext())) {
+      // 	// if the build side can saturate all available threads,
+      // 	// we don't just make the LHS pipeline depend on the RHS, but recursively all LHS children
+      // too.
+      // 	// this prevents breadth-first plan evaluation
+      // 	child_meta_pipeline.GetPipelines(dependencies, false);
+      // 	last_child_ptr = meta_pipeline.GetLastChild();
+      // }
+    }
   }
 
   op.children[0]->build_pipelines(current, meta_pipeline);

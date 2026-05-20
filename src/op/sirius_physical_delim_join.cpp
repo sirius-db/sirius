@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_delim_join.hpp"
 
+#include "config.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_dummy_scan.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
@@ -142,7 +143,17 @@ void sirius_physical_right_delim_join::build_pipelines(
       duckdb::reference<pipeline::sirius_pipeline>(*child_meta_pipeline.get_base_pipeline())));
   }
 
-  sirius_physical_hash_join::build_join_pipelines(current, meta_pipeline, *join, false);
+  // Phase 3.2 (#604) Path 3b: under USE_TREE_BASED_PIPELINE_BUILD, Sub-phase
+  // B.5's wrap_delim_join recursed into delim->join and Sub-phase B.4's
+  // wrap_join inserted CONCAT_build → PARTITION_build → original_build as
+  // internal_join.children[1]. The modified build_join_pipelines (build_rhs=
+  // true) consumes that chain into build_meta + partition_meta + deeper_meta
+  // — handling the internal join's build side via the plan tree rather than
+  // via the legacy converter's runtime partition_join construction. Under
+  // flag OFF, build_rhs=false preserves today's behavior (legacy converter
+  // builds partition_join at runtime).
+  sirius_physical_hash_join::build_join_pipelines(
+    current, meta_pipeline, *join, duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD);
 }
 
 std::unique_ptr<operator_data> sirius_physical_right_delim_join::execute(
