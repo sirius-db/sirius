@@ -33,15 +33,22 @@ namespace {
 constexpr std::size_t VARCHAR_BYTE_CAP =
   static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max());
 
-// Per-segment exact: bound = Σ(seg.segment_count × *seg.max_string_length).
-// Walker refuses on absent stat so every segment is Some(...) here.
+// Per-segment exact: Σ(seg_count × *msl). Throws on a single-rg overshoot
+// of the cudf int32 chars cap so the transparent fallback routes to CPU
+// instead of failing later in the kernel.
 std::size_t rg_varchar_bytes_for_col(const op::scan::duckdb_row_group_metadata& rg,
                                      std::size_t col_idx)
 {
   std::size_t total = 0;
   for (const auto& seg : rg.columns[col_idx].data_segments) {
-    total +=
-      static_cast<std::size_t>(seg.segment_count) * static_cast<std::size_t>(*seg.max_string_length);
+    total += static_cast<std::size_t>(seg.segment_count) *
+             static_cast<std::size_t>(*seg.max_string_length);
+  }
+  if (total > VARCHAR_BYTE_CAP) {
+    throw std::runtime_error(
+      "duckdb-native scan rejected query: row group " + std::to_string(rg.row_group_index) +
+      " column " + std::to_string(rg.columns[col_idx].column_id) + " varchar chars upper bound (" +
+      std::to_string(total) + ") exceeds cudf int32 chars cap");
   }
   return total;
 }
@@ -71,12 +78,15 @@ std::vector<duckdb_native_split_provider::row_group_batch> partition_row_groups_
   std::size_t batch_first = 0;
   std::size_t batch_bytes = 0;
   std::vector<std::size_t> col_bytes(num_cols, 0);
+  // Hoisted scratch — reset per iteration to skip the allocator on tables
+  // with millions of row groups.
+  std::vector<std::size_t> this_rg_col_bytes(num_cols, 0);
 
   for (std::size_t i = 0; i < row_groups.size(); ++i) {
     const auto& rg                  = row_groups[i];
     const std::size_t this_rg_bytes = rg.decoded_bytes_budget;
-    std::vector<std::size_t> this_rg_col_bytes(num_cols, 0);
     if (any_varchar) {
+      std::fill(this_rg_col_bytes.begin(), this_rg_col_bytes.end(), 0);
       for (std::size_t c = 0; c < num_cols; ++c) {
         if (is_varchar[c]) this_rg_col_bytes[c] = rg_varchar_bytes_for_col(rg, c);
       }

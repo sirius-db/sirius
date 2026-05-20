@@ -50,13 +50,9 @@ struct duckdb_segment_descriptor {
   duckdb::idx_t segment_start;
   duckdb::idx_t segment_count;
   duckdb::CompressionType compression;
-  /// Per-segment max-string-length parsed from DuckDB's
-  /// `ColumnSegmentInfo::segment_stats` text blob. nullopt for validity
-  /// segments and non-VARCHAR data segments. After a viable walk, every
-  /// VARCHAR data segment is guaranteed Some(...); Some(0) is legal data
-  /// (every value in this segment is ""). Drives the GPU kernel's
-  /// chars-region sizing and short/long-string routing, and the
-  /// partitioner's per-column varchar-byte cap.
+  /// Parsed from `ColumnSegmentInfo::segment_stats`. nullopt on validity
+  /// and non-VARCHAR segments. Every VARCHAR segment in a viable walk
+  /// carries Some; Some(0) is the legal all-empty-row-group case.
   std::optional<std::uint32_t> max_string_length;
 };
 

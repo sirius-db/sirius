@@ -25,7 +25,6 @@
 #include <op/scan/duckdb_native_metadata.hpp>
 #include <utils/utils.hpp>
 
-#include <set>
 #include <string>
 
 using namespace sirius;
@@ -254,8 +253,7 @@ TEST_CASE("walker populates per-segment max_string_length for VARCHAR",
   }
 }
 
-TEST_CASE("walker accepts all-empty varchar row group (Some(0))",
-          "[scan][duckdb_native_walker]")
+TEST_CASE("walker accepts all-empty varchar row group (Some(0))", "[scan][duckdb_native_walker]")
 {
   // An all-empty-string row group is legal data — DuckDB stores
   // MaxStringLength: 0 in the segment_stats blob, and the walker accepts.
