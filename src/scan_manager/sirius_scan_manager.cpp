@@ -213,7 +213,8 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
   cudf::io::parquet::experimental::hybrid_scan_reader reader{
     cudf::host_span<std::uint8_t const>(footer_buffer->data(), footer_buffer->size()),
     reader_options};
-  auto file_metadata = reader.parquet_metadata();
+  auto file_metadata         = reader.parquet_metadata();
+  auto const footer_num_rows = file_metadata.num_rows;
 
   auto schema = sirius::io::parquet_helpers::extract_schema(file_metadata);
 
@@ -228,9 +229,10 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
   }
 
   parquet_bind_result result;
-  result.return_types = std::move(schema.types);
-  result.names        = std::move(schema.names);
-  result.object_size  = datasource->size();
+  result.return_types   = std::move(schema.types);
+  result.names          = std::move(schema.names);
+  result.object_size    = datasource->size();
+  result.total_num_rows = static_cast<std::size_t>(footer_num_rows);
   return result;
 }
 

@@ -453,6 +453,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_split_connector.cpp
     test/cpp/scan_manager/test_sirius_scan_manager_s3.cpp
     test/cpp/scan_manager/test_describe_parquet_s3.cpp
+    test/cpp/sirius_extension/test_sirius_read_parquet_cardinality.cpp
     test/cpp/sql/test_sirius_sql_rewrite.cpp
     test/cpp/unittest.cpp
     test/cpp/utils/sirius_test_env.cpp

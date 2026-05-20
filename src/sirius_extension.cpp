@@ -96,8 +96,9 @@ unique_ptr<QueryResult> run_internal_cpu_fallback_query(ClientContext& context,
 // Bind callback for the sirius_read_parquet table function — a thin forwarder.
 // It resolves the URI to the connection's scan_manager and probes the parquet
 // footer through describe_parquet (footer-only, no full-file download), then
-// hands the inferred schema back to DuckDB. The pipeline converter reads the
-// URI straight from the scan op's parameters, so no bind data is produced.
+// hands the inferred schema back to DuckDB. Bind data carries the URI and
+// footer row count so the cardinality callback can expose a real estimate to
+// the optimizer; the pipeline converter still reads the URI from parameters[0].
 unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
                                                TableFunctionBindInput& input,
                                                vector<LogicalType>& return_types,
@@ -116,7 +117,7 @@ unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
   auto bind_result = sirius_ctx->get_scan_manager().describe_parquet(uri);
   return_types     = std::move(bind_result.return_types);
   names            = std::move(bind_result.names);
-  return nullptr;
+  return make_uniq<SiriusReadParquetBindData>(uri, bind_result.total_num_rows);
 }
 
 // Execute callback for sirius_read_parquet. The real scan runs through the
@@ -128,6 +129,15 @@ void SiriusReadParquetFunction(ClientContext&, TableFunctionInput&, DataChunk&)
 }
 
 }  // namespace
+
+unique_ptr<NodeStatistics> SiriusReadParquetCardinality(ClientContext&,
+                                                        FunctionData const* bind_data_p)
+{
+  if (bind_data_p == nullptr) { return nullptr; }
+  auto const* typed = dynamic_cast<SiriusReadParquetBindData const*>(bind_data_p);
+  if (typed == nullptr) { return nullptr; }
+  return make_uniq<NodeStatistics>(typed->total_num_rows, typed->total_num_rows);
+}
 
 struct SiriusTableFunctionData : public TableFunctionData {
   SiriusTableFunctionData() = default;
@@ -1050,6 +1060,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
                                     {LogicalType::VARCHAR},
                                     SiriusReadParquetFunction,
                                     SiriusReadParquetBind);
+  sirius_read_parquet.cardinality = SiriusReadParquetCardinality;
   CreateTableFunctionInfo sirius_read_parquet_info(sirius_read_parquet);
   catalog.CreateTableFunction(transaction, sirius_read_parquet_info);
 

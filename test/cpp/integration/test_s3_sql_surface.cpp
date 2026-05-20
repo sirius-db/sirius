@@ -10,7 +10,14 @@
 #include "sirius_extension.hpp"
 
 #include <duckdb.hpp>
+#include <duckdb/catalog/catalog.hpp>
+#include <duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp>
+#include <duckdb/function/table_function.hpp>
+#include <duckdb/parser/expression/constant_expression.hpp>
+#include <duckdb/parser/expression/function_expression.hpp>
+#include <duckdb/parser/tableref/table_function_ref.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -246,6 +253,87 @@ std::string s3_parquet_scan(s3_test_env const& env, std::string_view table)
   return "read_parquet(" + sql_quote(s3_uri(env.bucket, key)) + ")";
 }
 
+std::string s3_sirius_parquet_scan(s3_test_env const& env, std::string_view table)
+{
+  auto const key = "parquet/" + std::string{table} + ".parquet";
+  return "sirius_read_parquet(" + sql_quote(s3_uri(env.bucket, key)) + ")";
+}
+
+std::string explain_text(duckdb::Connection& con, std::string const& sql)
+{
+  auto result = require_query_ok(con, "EXPLAIN " + sql);
+  std::string out;
+  for (duckdb::idx_t r = 0; r < result->RowCount(); ++r) {
+    for (duckdb::idx_t c = 0; c < result->ColumnCount(); ++c) {
+      out += result->GetValue(c, r).ToString();
+      out.push_back('\n');
+    }
+  }
+  return out;
+}
+
+duckdb::idx_t local_parquet_row_count(std::string_view table)
+{
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto result = require_query_ok(con, "SELECT count(*) FROM " + local_parquet_scan(table));
+  REQUIRE(result->RowCount() == 1);
+  auto const rows = result->GetValue(0, 0).GetValue<int64_t>();
+  REQUIRE(rows >= 0);
+  return static_cast<duckdb::idx_t>(rows);
+}
+
+bool plan_mentions_cardinality(std::string plan_text, duckdb::idx_t row_count)
+{
+  plan_text.erase(std::remove(plan_text.begin(), plan_text.end(), ','), plan_text.end());
+  auto const rows = std::to_string(row_count);
+  return plan_text.find("~" + rows + " rows") != std::string::npos ||
+         plan_text.find("EC: " + rows) != std::string::npos ||
+         plan_text.find("Estimated Cardinality: " + rows) != std::string::npos;
+}
+
+duckdb::unique_ptr<duckdb::FunctionData> bind_sirius_read_parquet(
+  duckdb::ClientContext& ctx,
+  std::string const& uri,
+  duckdb::TableFunction& table_function,
+  duckdb::vector<duckdb::LogicalType>& types,
+  duckdb::vector<std::string>& names)
+{
+  duckdb::unique_ptr<duckdb::FunctionData> bind_data;
+  ctx.RunFunctionInTransaction([&] {
+    auto& entry = duckdb::Catalog::GetEntry<duckdb::TableFunctionCatalogEntry>(
+      ctx, INVALID_CATALOG, DEFAULT_SCHEMA, "sirius_read_parquet");
+
+    duckdb::vector<duckdb::LogicalType> arg_types;
+    arg_types.emplace_back(duckdb::LogicalType::VARCHAR);
+    table_function = entry.functions.GetFunctionByArguments(ctx, arg_types);
+
+    duckdb::vector<duckdb::Value> inputs;
+    inputs.emplace_back(uri);
+
+    duckdb::named_parameter_map_t named_parameters;
+    duckdb::vector<duckdb::LogicalType> input_table_types;
+    duckdb::vector<std::string> input_table_names;
+
+    duckdb::TableFunctionRef ref;
+    duckdb::vector<duckdb::unique_ptr<duckdb::ParsedExpression>> children;
+    children.push_back(duckdb::make_uniq<duckdb::ConstantExpression>(duckdb::Value(uri)));
+    ref.function = duckdb::make_uniq<duckdb::FunctionExpression>(
+      "sirius_read_parquet", std::move(children), nullptr, nullptr, false, false, false);
+
+    duckdb::TableFunctionBindInput bind_input(inputs,
+                                              named_parameters,
+                                              input_table_types,
+                                              input_table_names,
+                                              nullptr,
+                                              nullptr,
+                                              table_function,
+                                              ref);
+    bind_data = table_function.bind(ctx, bind_input, types, names);
+  });
+  return bind_data;
+}
+
 std::string tpch_q3_shape_query(std::string const& customer_scan,
                                 std::string const& orders_scan,
                                 std::string const& lineitem_scan)
@@ -389,6 +477,73 @@ TEST_CASE("gpu_execution S3 SQL surface matches local TPC-H Q3 shape",
   REQUIRE(s3_result->RowCount() == baseline_result->RowCount());
   REQUIRE(s3_result->ColumnCount() == baseline_result->ColumnCount());
   CHECK(collect_rows(*s3_result) == collect_rows(*baseline_result));
+}
+
+TEST_CASE("sirius_read_parquet bind returns row-count metadata for cardinality",
+          "[s3][sql][planner-metadata][integration]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  auto const uri                  = s3_uri(env->bucket, "parquet/orders.parquet");
+  auto const expected_orders_rows = local_parquet_row_count("orders");
+  duckdb::TableFunction table_function;
+  duckdb::vector<duckdb::LogicalType> return_types;
+  duckdb::vector<std::string> names;
+
+  auto bind_data =
+    bind_sirius_read_parquet(*fixture.con.context, uri, table_function, return_types, names);
+
+  REQUIRE(bind_data != nullptr);
+  auto const* typed = dynamic_cast<duckdb::SiriusReadParquetBindData const*>(bind_data.get());
+  REQUIRE(typed != nullptr);
+  CHECK(typed->uri == uri);
+  CHECK(typed->total_num_rows == expected_orders_rows);
+  CHECK_FALSE(return_types.empty());
+  CHECK_FALSE(names.empty());
+  REQUIRE(table_function.cardinality != nullptr);
+
+  auto stats = table_function.cardinality(*fixture.con.context, bind_data.get());
+  REQUIRE(stats != nullptr);
+  CHECK(stats->has_estimated_cardinality);
+  CHECK(stats->estimated_cardinality == expected_orders_rows);
+  CHECK(stats->has_max_cardinality);
+  CHECK(stats->max_cardinality == expected_orders_rows);
+}
+
+TEST_CASE("sirius_read_parquet exposes S3 row count to DuckDB EXPLAIN",
+          "[s3][sql][planner-metadata][integration]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  auto const expected_orders_rows = local_parquet_row_count("orders");
+  auto const plan =
+    explain_text(fixture.con, "SELECT * FROM " + s3_sirius_parquet_scan(*env, "orders"));
+
+  INFO(plan);
+  CHECK(plan_mentions_cardinality(plan, expected_orders_rows));
+}
+
+TEST_CASE("sirius_read_parquet exposes distinct S3 table cardinalities in joins",
+          "[s3][sql][planner-metadata][integration]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  auto const expected_orders_rows = local_parquet_row_count("orders");
+  auto const expected_nation_rows = local_parquet_row_count("nation");
+  auto const sql = "SELECT count(*) FROM " + s3_sirius_parquet_scan(*env, "orders") + " o JOIN " +
+                   s3_sirius_parquet_scan(*env, "nation") +
+                   " n ON (o.o_custkey % 25) = n.n_nationkey";
+  auto const plan = explain_text(fixture.con, sql);
+
+  INFO(plan);
+  CHECK(plan_mentions_cardinality(plan, expected_orders_rows));
+  CHECK(plan_mentions_cardinality(plan, expected_nation_rows));
 }
 
 TEST_CASE("gpu_execution S3 SQL surface scans all orders row groups",

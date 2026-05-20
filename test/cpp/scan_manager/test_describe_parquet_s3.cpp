@@ -235,3 +235,30 @@ TEST_CASE("describe_parquet inserts parsed parquet metadata into the prefetch ca
   CHECK_FALSE(bind_info.names.empty());
   CHECK(parquet->file_metadata()->schema.size() >= bind_info.names.size() + 1);
 }
+
+TEST_CASE("describe_parquet exposes the parquet footer row count for planner metadata",
+          "[s3][describe_parquet][planner-metadata]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  host_cache_memory memory;
+  auto manager   = make_s3_manager(*env, &memory.host_mr, true);
+  auto const uri = s3_uri(env->bucket, "parquet/orders.parquet");
+
+  auto bind_info = manager.describe_parquet(uri);
+
+  auto* base_ctx = manager.io_ctx_for(uri);
+  auto* s3_ctx   = dynamic_cast<s3_ioctx*>(base_ctx);
+  REQUIRE(s3_ctx != nullptr);
+  REQUIRE(s3_ctx->cache() != nullptr);
+
+  auto io_object = s3_ctx->create_io_object(uri);
+  auto metadata  = s3_ctx->cache()->get_metadata(*io_object);
+  auto parquet   = std::dynamic_pointer_cast<parquet_metadata>(metadata);
+  REQUIRE(parquet != nullptr);
+  REQUIRE(parquet->file_metadata() != nullptr);
+
+  CHECK(bind_info.total_num_rows > 0);
+  CHECK(bind_info.total_num_rows == static_cast<std::size_t>(parquet->file_metadata()->num_rows));
+}

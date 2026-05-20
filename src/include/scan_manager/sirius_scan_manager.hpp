@@ -146,6 +146,7 @@ struct parquet_bind_result {
   duckdb::vector<duckdb::LogicalType> return_types;
   duckdb::vector<std::string> names;
   std::size_t object_size{0};
+  std::size_t total_num_rows{0};
 };
 
 /**
