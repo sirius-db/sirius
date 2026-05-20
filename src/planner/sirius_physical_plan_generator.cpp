@@ -38,6 +38,7 @@
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cpu_source.hpp"
+#include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
@@ -377,6 +378,94 @@ void wrap_join(sirius::op::sirius_physical_operator& join_op,
   }
 }
 
+// Forward declaration so `wrap_delim_join` can recurse into the internal `join`/`distinct`
+// subtrees of a DELIM JOIN; those operators are stored as `unique_ptr` fields on the
+// delim-join class, not in `children[]`, so the standard tree walk would otherwise skip them.
+void insert_gpu_pipeline_operators_recursive(
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
+  const std::unordered_map<std::string, std::shared_ptr<const sirius::op::scan::IcebergDeleteData>>&
+    iceberg_cache,
+  const sirius::operator_params& op_params);
+
+//! Rewrite the internal subtrees of a DELIM JOIN (LEFT or RIGHT) and wire the sibling
+//! pointers that the operator needs at runtime. Mirrors `split_delim_join_sink`'s
+//! sibling-pointer assignments (converter:750-755) without recreating the
+//! DISTINCT_MERGE/PARTITION_DISTINCT chain — that lives in Sub-phase C's `build_pipelines`
+//! redesign of DELIM JOIN, since today's converter creates those operators outside the tree
+//! and there is no field on `sirius_physical_delim_join` to host the chain yet.
+//!
+//! What this does in B.5:
+//!   - Recursively walks `delim->join` so source-side wraps (TABLE_SCAN/CPU_SOURCE family)
+//!     and sink-side wraps (HASH_GROUP_BY/ORDER_BY/TOP_N/UNGROUPED) inside the internal
+//!     join's subtree fire, and so the internal join (if HJ/NLJ) gets the same
+//!     CONCAT/PARTITION wraps on its probe + build that Sub-phase B.4 applies to top-level
+//!     joins. This is what plants the `partition_join` candidate node.
+//!   - Recursively walks `delim->distinct` so source-side wraps below DISTINCT fire.
+//!     `wrap_hash_group_by` will NOT fire on DISTINCT itself — DISTINCT is reached via the
+//!     `distinct` field, not via the dispatcher's `children[]` traversal. Wrapping DISTINCT
+//!     with MERGE_AGG/PARTITION the way HASH_GROUP_BY is wrapped would change the type of
+//!     `delim_join->distinct` from `unique_ptr<sirius_physical_grouped_aggregate>` to
+//!     `unique_ptr<sirius_physical_operator>`, a deferred design decision documented above.
+//!   - For RIGHT_DELIM_JOIN: after the internal-join recursion has wrapped the build side
+//!     with `CONCAT_build → PARTITION_build → original_build`, captures the new
+//!     PARTITION_build via `internal_join->children[1]->children[0]` and assigns it to
+//!     `right_delim_join.partition_join`. Matches converter:750-751.
+//!   - For LEFT_DELIM_JOIN: assigns `left_delim_join.column_data_scan` to the COLUMN_DATA_SCAN
+//!     at `internal_join->children[0]`. Matches converter:753-754.
+void wrap_delim_join(
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
+  const std::unordered_map<std::string, std::shared_ptr<const sirius::op::scan::IcebergDeleteData>>&
+    iceberg_cache,
+  const sirius::operator_params& op_params)
+{
+  auto& delim_base = slot->Cast<sirius::op::sirius_physical_delim_join>();
+
+  // Recurse into the internal join + distinct subtrees so their source/sink/join wraps fire.
+  // This is what produces the CONCAT_build/PARTITION_build chain on the internal join's
+  // build side (when the internal join is HJ/NLJ) that the RIGHT_DELIM sibling pointer
+  // references.
+  if (delim_base.join) {
+    insert_gpu_pipeline_operators_recursive(delim_base.join, iceberg_cache, op_params);
+  }
+  if (delim_base.distinct) {
+    // distinct is a unique_ptr<sirius_physical_grouped_aggregate>; the recursive walker
+    // takes unique_ptr<sirius_physical_operator>&. Recurse via children[] instead so we
+    // only walk the source-side subtrees below DISTINCT, leaving DISTINCT itself
+    // unwrapped (see function-level comment).
+    for (auto& child_slot : delim_base.distinct->children) {
+      insert_gpu_pipeline_operators_recursive(child_slot, iceberg_cache, op_params);
+    }
+  }
+
+  if (slot->type == sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
+    auto& right_delim   = slot->Cast<sirius::op::sirius_physical_right_delim_join>();
+    auto* internal_join = delim_base.join.get();
+    if (internal_join && internal_join->children.size() >= 2) {
+      auto* build_child = internal_join->children[1].get();
+      if (build_child && build_child->type == sirius::op::SiriusPhysicalOperatorType::CONCAT &&
+          !build_child->children.empty()) {
+        auto* partition_build = build_child->children[0].get();
+        if (partition_build &&
+            partition_build->type == sirius::op::SiriusPhysicalOperatorType::PARTITION) {
+          right_delim.partition_join =
+            &partition_build->Cast<sirius::op::sirius_physical_partition>();
+        }
+      }
+    }
+  } else if (slot->type == sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
+    auto& left_delim    = slot->Cast<sirius::op::sirius_physical_left_delim_join>();
+    auto* internal_join = delim_base.join.get();
+    if (internal_join && !internal_join->children.empty()) {
+      auto* probe_child = internal_join->children[0].get();
+      if (probe_child &&
+          probe_child->type == sirius::op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN) {
+        left_delim.column_data_scan =
+          &probe_child->Cast<sirius::op::sirius_physical_column_data_scan>();
+      }
+    }
+  }
+}
+
 //! Post-order recursive walk over the physical plan tree. Children are visited (and rewritten)
 //! before the dispatch on `slot->type`, so a later `wrap_above` cannot re-enter the freshly-
 //! inserted wrapper subtree and double-wrap the original node. Source-side wraps append a leaf
@@ -386,7 +475,8 @@ void wrap_join(sirius::op::sirius_physical_operator& join_op,
 //! subtree whose root sits above the original sink; the new wrapper nodes are not visited
 //! because the walk has already moved past the slot. Join-side wraps replace each child of a
 //! HJ/NLJ with a CONCAT/PARTITION chain; the chain's original child (the already-walked
-//! probe/build subtree) is moved into PARTITION's child slot.
+//! probe/build subtree) is moved into PARTITION's child slot. DELIM JOIN handling recurses
+//! into the internal `join`/`distinct` fields (which live outside `children[]`).
 void insert_gpu_pipeline_operators_recursive(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
   const std::unordered_map<std::string, std::shared_ptr<const sirius::op::scan::IcebergDeleteData>>&
@@ -418,10 +508,11 @@ void insert_gpu_pipeline_operators_recursive(
     case sirius::op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN:
       wrap_join(*slot, op_params);
       break;
-    default:
-      // DELIM JOIN internals (LEFT_DELIM_JOIN, RIGHT_DELIM_JOIN with their internal join_op +
-      // distinct_op + column_data_scan sibling references) land in Sub-phase B.5.
+    case sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN:
+    case sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN:
+      wrap_delim_join(slot, iceberg_cache, op_params);
       break;
+    default: break;
   }
 }
 
