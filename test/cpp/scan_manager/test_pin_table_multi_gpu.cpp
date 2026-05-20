@@ -403,6 +403,184 @@ TEST_CASE("pin_table - PIN-MGPU-01 host-tier multi-GPU pin",
 }
 
 //===----------------------------------------------------------------------===//
+// Host-tier cache-path-actually-used gate (KNOWN ISSUE — hidden by default
+// via Catch2 [.] tag; pending follow-up fix).
+//
+// Bobbi flagged that for `pin_table(tier='host')`, `chunk_memory_spaces` is
+// always empty. The user-visible symptom (uncovered during this investigation):
+//
+//   1. `pin_table(tier='host')` stores the entry with `host_chunks` populated
+//      and `chunk_memory_spaces` intentionally empty (per design — host-tier
+//      entries carry their memory_space inside each host_data_representation).
+//   2. At scan time, sirius_scan_manager::create_provider_for() validates
+//      chunk_memory_spaces unconditionally and throws on empty for host
+//      entries (incorrect). The broad `catch(...)` swallows it and falls
+//      through to the parquet path.
+//   3. Lifting the validation throw exposes a deeper bug:
+//      sirius_gpu_parquet_scan_operator::execute() hard-casts cached batches
+//      to `gpu_table_representation` (sirius_gpu_parquet_scan_operator.cpp:265),
+//      so host_data_representation chunks can't be served. The proper fix
+//      requires either (a) eager HOST→GPU conversion in cached_split_provider's
+//      produce_split(), or (b) detect HOST and convert in the scan operator
+//      using `converter_registry.convert<gpu_table_representation>(...)`.
+//
+// These tests verify the desired end-state behavior: cached host data serves
+// queries even when the underlying parquet files are mutated. The tests are
+// tagged [.] (hidden by default) and will start passing once the deeper fix
+// lands. Run via `--invisibles` or by filter `[host_tier_pending]`.
+//
+// The row-count discriminator is precise: the cached path retains the
+// original 400000 rows even after the on-disk files are overwritten with a
+// 200000-row surface. The current silent-fall-through-to-parquet behavior
+// would report 200000.
+//===----------------------------------------------------------------------===//
+TEST_CASE("pin_table - host-tier cached path serves SELECT after parquet files overwritten",
+          "[.][pin_mgpu][scan_manager][host_tier][host_tier_pending]")
+{
+  if (!require_two_gpus()) return;
+
+  auto tmp = make_tmp("host-cached");
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+  fs::create_directories(tmp);
+
+  // Original surface: 4 files × 100k rows = 400000 rows total.
+  generate_4file_surface(tmp);
+
+  auto yaml_path = tmp / "pin_mgpu_host_cached.yaml";
+  write_mgpu_yaml(yaml_path, mgpu_env_params{});
+
+  scoped_mgpu_env env(yaml_path);
+  auto con = env.make_connection();
+
+  auto glob = parquet_glob(tmp);
+
+  // Baseline row count via PURE DuckDB (transparent sirius interception
+  // OFF). This must capture the real on-disk row count so we have a stable
+  // expected value the cached path must reproduce after files are
+  // overwritten.
+  REQUIRE_FALSE(con.Query("SET gpu_execution = false;")->HasError());
+  auto baseline = con.Query("SELECT count(*) FROM read_parquet('" + glob + "');");
+  REQUIRE(baseline);
+  REQUIRE_FALSE(baseline->HasError());
+  auto baseline_rows = baseline->GetValue(0, 0).GetValue<int64_t>();
+  REQUIRE(baseline_rows == 400000);  // 4 files × 100k rows
+  REQUIRE_FALSE(con.Query("SET gpu_execution = true;")->HasError());
+
+  // Pin to host. After this point, the pinned host_data_representations are
+  // the source of truth for queries matching this file glob.
+  auto pin_sql = "CALL pin_table('" + glob + "', tier='host', name='host_cache_test');";
+  auto pin     = con.Query(pin_sql);
+  REQUIRE(pin);
+  if (pin->HasError()) { UNSCOPED_INFO("pin_table error: " << pin->GetError()); }
+  REQUIRE_FALSE(pin->HasError());
+
+  // Sanity check: query BEFORE overwriting to confirm pin → cached SELECT works
+  // in this scenario. Both paths return the same answer here, so this only
+  // proves the plumbing is wired, not that cache is exercised.
+  auto pre_overwrite =
+    con.Query("CALL gpu_execution(\"SELECT count(*) FROM read_parquet('" + glob + "')\");");
+  REQUIRE(pre_overwrite);
+  REQUIRE_FALSE(pre_overwrite->HasError());
+  REQUIRE(pre_overwrite->GetValue(0, 0).GetValue<int64_t>() == baseline_rows);
+
+  // Overwrite the parquet files with HALF as many rows (50k per file).
+  // The glob still resolves (so DuckDB's read_parquet bind succeeds), but
+  // the underlying data is now different. Cached path → 400000;
+  // fall-through to parquet → 200000.
+  generate_parquet_surface(tmp,
+                           "SELECT range AS k, range * 2 AS v FROM range(50000)",
+                           /*num_files=*/4);
+
+  auto cached = con.Query("CALL gpu_execution(\"SELECT count(*) FROM read_parquet('" +
+                          glob + "')\");");
+  REQUIRE(cached);
+  if (cached->HasError()) { UNSCOPED_INFO("gpu_execution error: " << cached->GetError()); }
+  REQUIRE_FALSE(cached->HasError());
+  auto cached_rows = cached->GetValue(0, 0).GetValue<int64_t>();
+  INFO("expected cached_rows=" << baseline_rows
+                               << " (silent fall-through would return 200000)");
+  REQUIRE(cached_rows == baseline_rows);
+
+  auto unpin = con.Query("CALL unpin_table('host_cache_test');");
+  REQUIRE(unpin);
+  REQUIRE_FALSE(unpin->HasError());
+
+  fs::remove_all(tmp, ec);
+}
+
+//===----------------------------------------------------------------------===//
+// Host-tier cached path serves non-trivial aggregate (KNOWN ISSUE — hidden
+// via Catch2 [.]).
+//
+// Companion to the row-count test above. count(*) can sometimes be served
+// from row-count metadata alone. This test runs a SUM that requires reading
+// every pinned value to prove the cached host_data_representations actually
+// feed the GPU expression executor end-to-end. Overwrite the on-disk parquet
+// with a DIFFERENT multiplier so the SUM from the new files differs from the
+// pinned SUM; only the cached path can return the original SUM.
+//
+// Hidden by [.] tag until the host_chunks scan-operator path is wired up.
+//===----------------------------------------------------------------------===//
+TEST_CASE("pin_table - host-tier cached path serves aggregate after parquet files overwritten",
+          "[.][pin_mgpu][scan_manager][host_tier][host_tier_pending]")
+{
+  if (!require_two_gpus()) return;
+
+  auto tmp = make_tmp("host-cached-agg");
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+  fs::create_directories(tmp);
+
+  // Original: 4 files of `SELECT range AS k, range * 2 AS v FROM range(100000)`.
+  // Per file SUM(v) = 2 * (0 + 1 + ... + 99999) = 2 * 99999*100000/2 = 9999900000.
+  // 4 files: 4 * 9999900000 = 39999600000.
+  generate_4file_surface(tmp);
+
+  auto yaml_path = tmp / "pin_mgpu_host_cached_agg.yaml";
+  write_mgpu_yaml(yaml_path, mgpu_env_params{});
+
+  scoped_mgpu_env env(yaml_path);
+  auto con = env.make_connection();
+
+  auto glob = parquet_glob(tmp);
+
+  auto baseline = con.Query("SELECT SUM(v) FROM read_parquet('" + glob + "');");
+  REQUIRE(baseline);
+  REQUIRE_FALSE(baseline->HasError());
+  auto baseline_sum = baseline->GetValue(0, 0).GetValue<int64_t>();
+  REQUIRE(baseline_sum == 39999600000LL);
+
+  auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='host_agg_test');");
+  REQUIRE(pin);
+  if (pin->HasError()) { UNSCOPED_INFO("pin_table error: " << pin->GetError()); }
+  REQUIRE_FALSE(pin->HasError());
+
+  // Overwrite with `range * 5` (same row count, different values) so
+  // fall-through SUM would be 4 * 5 * 99999 * 100000 / 2 = 99999000000,
+  // distinguishable from the pinned SUM (39999600000).
+  generate_parquet_surface(tmp,
+                           "SELECT range AS k, range * 5 AS v FROM range(100000)",
+                           /*num_files=*/4);
+
+  auto cached = con.Query("CALL gpu_execution(\"SELECT SUM(v) FROM read_parquet('" +
+                          glob + "')\");");
+  REQUIRE(cached);
+  if (cached->HasError()) { UNSCOPED_INFO("gpu_execution error: " << cached->GetError()); }
+  REQUIRE_FALSE(cached->HasError());
+  auto cached_sum = cached->GetValue(0, 0).GetValue<int64_t>();
+  INFO("expected cached_sum=" << baseline_sum
+                              << " (silent fall-through would return 99999000000)");
+  REQUIRE(cached_sum == baseline_sum);
+
+  auto unpin = con.Query("CALL unpin_table('host_agg_test');");
+  REQUIRE(unpin);
+  REQUIRE_FALSE(unpin->HasError());
+
+  fs::remove_all(tmp, ec);
+}
+
+//===----------------------------------------------------------------------===//
 // Partial-pin cache reuse gate (PR #732 review feedback — high-2):
 //
 // `CALL pin_table(..., n_rows=N)` captures at most N rows. Previously the
