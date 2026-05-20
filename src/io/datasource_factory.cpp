@@ -17,7 +17,6 @@
 #include "io/datasource_factory.hpp"
 
 #include "io/uri_parser.hpp"
-#include "io/uring/uring_reactor.hpp"
 #include "sirius_config.hpp"
 
 #include <cudf/io/datasource.hpp>
@@ -150,11 +149,7 @@ std::unique_ptr<cudf::io::datasource> datasource_factory::create(
       "' — kvikio path is forbidden (uri=" + std::string{uri} + ")");
   }
 
-  // For all currently-supported schemes (kFileScheme), the io_object is a
-  // uring_io_object constructed from the parsed path. Object-store schemes
-  // (s3, gs, azure) will need scheme-specific io_object construction.
-  auto io_object = std::make_shared<sirius::io::uring_io_object>(std::move(p.path));
-  return ioctx->make_datasource(std::move(io_object));
+  return ioctx->open_datasource(std::move(p.path));
 }
 
 }  // namespace sirius::io

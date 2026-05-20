@@ -340,7 +340,7 @@ void parquet_scan_task_global_state::initialize_from_files()
     // Cache uring_io_object on global_state — its ctor opens 2 fds (O_RDONLY +
     // O_RDONLY|O_DIRECT). Reusing across all per-task datasource constructions
     // avoids per-task fd reopens at high scale factors.
-    auto io_object       = std::make_shared<sirius::io::uring_io_object>(file_path);
+    auto io_object       = planning_ioctx_it->second->create_io_object(file_path);
     auto const file_size = io_object->size();
     // ioctx->make_datasource(io_object) returns a unique_ptr<cudf::io::datasource>
     // wrapping a sirius_datasource that delegates every read to the owning ioctx.

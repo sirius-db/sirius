@@ -23,8 +23,8 @@
 #include <cudf/utilities/default_stream.hpp>
 
 #include <duckdb/main/connection.hpp>
+#include "io/io_context.hpp"
 #include "io/types.hpp"
-#include "io/uring/uring_reactor.hpp"
 #include <log/logging.hpp>
 #include <op/scan/iceberg_avro_reader.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
@@ -219,7 +219,7 @@ equality_delete_read_result read_equality_delete_file(std::string const& delete_
   // extraction) share the same uring_io_object + sirius_datasource — the
   // io_object opens 2 fds (O_RDONLY + O_RDONLY|O_DIRECT) so reusing avoids
   // reopening for the footer pass.
-  auto io_object  = std::make_shared<sirius::io::uring_io_object>(delete_file_path);
+  auto io_object  = ioctx.create_io_object(delete_file_path);
   auto datasource = ioctx.make_datasource(io_object);
 
   auto opts =

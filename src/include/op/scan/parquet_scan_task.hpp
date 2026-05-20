@@ -291,7 +291,7 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    *
    * @return Shared pointer to the cached io_object for @p file_idx.
    */
-  [[nodiscard]] std::shared_ptr<sirius::io::uring_io_object> get_file_io_object(
+  [[nodiscard]] std::shared_ptr<sirius::io::sirius_io_object> get_file_io_object(
     std::size_t file_idx) const
   {
     return _file_io_objects[file_idx];
@@ -553,7 +553,7 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   /// inside initialize_from_files(), reused by every per-task datasource
   /// construction. Avoids per-task fd reopens (uring_io_object ctor opens 2
   /// fds via ::open).
-  std::vector<std::shared_ptr<sirius::io::uring_io_object>> _file_io_objects;
+  std::vector<std::shared_ptr<sirius::io::sirius_io_object>> _file_io_objects;
 };
 
 //===----------------------------------------------------------------------===//

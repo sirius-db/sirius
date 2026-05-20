@@ -30,6 +30,10 @@
 #include <unordered_map>
 #include <vector>
 
+namespace sirius::io {
+class sirius_ioctx;
+}  // namespace sirius::io
+
 namespace sirius::op::scan {
 
 /**
