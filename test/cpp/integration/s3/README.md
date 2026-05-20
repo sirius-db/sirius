@@ -1,11 +1,9 @@
 # S3 integration test scaffolding
 
-Local MinIO + fixture tooling for the Catch2 `[s3][integration]` tests,
-including both:
-- lower-level datasource/parquet semantic tests that read bytes through
-  Sirius's S3 datasource and validate them out-of-band, and
-- a small `gpu_execution` guard that documents the current DuckDB `httpfs`
-  bind-time limitation for direct `read_parquet('s3://...')`.
+Local MinIO + fixture tooling for the Catch2 `[s3]` tests. The suite covers
+the S3 backend from the lower-level `s3_ioctx` and retry/cache paths through
+`scan_manager`, parquet split-provider routing, `describe_parquet`, and the
+SQL-over-S3 surface.
 
 ## What this gives you
 
@@ -19,9 +17,7 @@ including both:
   container image so tests can bit-compare (and parse) S3 reads against the
   local copy.
 - `env.sh` that exports the `SIRIUS_TEST_S3_*` variables consumed by
-  `test/cpp/io/s3/test_s3_ioctx.cpp`, `test_s3_integration.cpp`,
-  `test_s3_parquet_integration.cpp`, and the S3 `gpu_execution` guard test
-  under `test/cpp/integration/`.
+  the S3 Catch2 tests.
 - A strict-mode toggle (`SIRIUS_TEST_S3_STRICT`) that keeps ad-hoc local runs
   best-effort while making `make s3-test` fail hard if live S3 access breaks
   after the environment is present.
@@ -35,21 +31,25 @@ including both:
 ## Typical flow
 
 ```bash
-# Bring MinIO up and populate fixtures.
-make s3-up
+# Build and run the default Catch2 suite. This does not start MinIO.
+make test
 
-# Run the Catch2 S3 integration tests against MinIO. This tag filter also
-# selects [s3][parquet][integration] since Catch2 tags AND together. env.sh
-# is sourced for you by the recipe and points tests at the local MinIO.
-make s3-test            # alias for s3-cpp-test
-make s3-cpp-test        # equivalent
+# Run the full S3 correctness gate. This starts MinIO, populates fixtures,
+# sources env.sh, enables strict mode, runs every [s3] Catch2 test, and tears
+# MinIO down even if the tests fail.
+make s3-test
+
+# Run only the SQL-over-S3 end-to-end subset.
+make s3-sql-test
 
 # Or run manually:
+make s3-up
 source test/cpp/integration/s3/env.sh
-build/release/extension/sirius/test/cpp/sirius_unittest "[s3][integration]"
+export SIRIUS_TEST_S3_STRICT=1
+build/release/extension/sirius/test/cpp/sirius_unittest "[s3]"
 
-# Force runtime S3 failures to fail instead of skipping:
-SIRIUS_TEST_S3_STRICT=1 build/release/extension/sirius/test/cpp/sirius_unittest "[s3][integration]"
+# SQL-over-S3 subset only:
+build/release/extension/sirius/test/cpp/sirius_unittest "[s3][sql]"
 
 # Tear down (the `-v` in `down -v` also removes the named volume).
 make s3-down
@@ -82,7 +82,7 @@ sha256 manifest stays stable:
 | `hello.txt` | 16 B | HEAD + tiny-range read |
 | `small.bin` | 20 KiB | bit-equal full-object read via `datasource_factory` |
 | `medium.bin` | 8 MiB | multi-range reads at odd offsets |
-| `parquet/*.parquet` | varies | standard TPCH Parquet fixtures reused by datasource-level semantic tests and by the `gpu_execution` S3 bind-time guard. |
+| `parquet/*.parquet` | varies | standard TPCH Parquet fixtures reused by S3 datasource, scan-manager, split-provider, and SQL-over-S3 tests. |
 
 `small.bin` / `medium.bin` are opaque deterministic byte blobs, not real
 parquet - the byte-equality tests in `test_s3_integration.cpp` do not invoke
@@ -108,14 +108,11 @@ A sha256 manifest is written to `fixtures/local/MANIFEST.sha256`.
 - When `SIRIUS_TEST_S3_STRICT=1`, once the env/fixture preconditions are met,
   live failures such as `HEAD` or `datasource_factory::create` errors fail the
   test instead of downgrading to a skip. `make s3-test` enables this mode.
-- The `[s3][parquet][integration]` test additionally skips when
+- Some parquet-backed S3 tests additionally skip when
   `parquet/nation.parquet` is missing locally. In normal repo checkouts this
   means `make s3-up` did not populate fixtures successfully.
-- Direct `gpu_execution("... read_parquet('s3://...') ...")` is currently
-  blocked at DuckDB bind time: DuckDB's `read_parquet` insists on `httpfs`
-  before Sirius can take over the scan. The S3 suite keeps a guard test that
-  asserts this limitation explicitly so it does not regress silently. Real S3
-  coverage today lives in the datasource-level semantic tests.
+- SQL-over-S3 tests cover `sirius_read_parquet('s3://...')` directly and the
+  `gpu_execution('... read_parquet("s3://...") ...')` rewrite path.
 - `env.sh` also exports `SIRIUS_CONFIG_FILE` pointing at `sirius.yaml` in this
   directory. It caps Super Sirius's startup GPU/host reservation at 256/128
   MiB so `require sirius` in SQL tests in this area won't OOM on GPUs that

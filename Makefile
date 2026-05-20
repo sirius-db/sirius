@@ -22,7 +22,7 @@ MAIN_BUILD_TARGETS ?= duckdb duckdb_local_extension_repo
 	clang-release clang-debug clang-relwithdebinfo \
 	ci-release configure_ci set_duckdb_version \
 	test test_release test_debug test_reldebug test_ci-release clean list-presets \
-	s3-up s3-down s3-test s3-cpp-test s3-e2e s3-bench s3-bench-fixtures
+	s3-up s3-down s3-test s3-sql-test s3-bench s3-bench-fixtures
 
 PRESETS_LINK := $(DUCKDB_DIR)/CMakePresets.json
 
@@ -97,20 +97,16 @@ set_duckdb_version:
 test: test_release
 
 test_release: release
-	@echo "SQL logic tests use the legacy gpu_processing path and are skipped by default."
-	@echo "Run C++ unit tests with: ./build/release/extension/sirius/test/cpp/sirius_unittest"
+	./build/release/extension/sirius/test/cpp/sirius_unittest
 
 test_debug: debug
-	@echo "SQL logic tests use the legacy gpu_processing path and are skipped by default."
-	@echo "Run C++ unit tests with: ./build/debug/extension/sirius/test/cpp/sirius_unittest"
+	./build/debug/extension/sirius/test/cpp/sirius_unittest
 
 test_reldebug: relwithdebinfo
-	@echo "SQL logic tests use the legacy gpu_processing path and are skipped by default."
-	@echo "Run C++ unit tests with: ./build/relwithdebinfo/extension/sirius/test/cpp/sirius_unittest"
+	./build/relwithdebinfo/extension/sirius/test/cpp/sirius_unittest
 
 test_ci-release: ci-release
-	@echo "SQL logic tests use the legacy gpu_processing path and are skipped by default."
-	@echo "Run C++ unit tests with: ./build/ci-release/extension/sirius/test/cpp/sirius_unittest"
+	./build/ci-release/extension/sirius/test/cpp/sirius_unittest
 
 clean:
 	rm -rf build
@@ -125,13 +121,12 @@ list-presets: $(PRESETS_LINK)
 #                     (binary blobs plus the standard integration parquet
 #                     fixtures under test/cpp/integration/data/parquet).
 # `make s3-down`      tears it down (including the data volume).
-# `make s3-test`      alias for `s3-cpp-test`; kept for forward compatibility
-#                     if SQL-level integration returns via a new target later.
-# `make s3-cpp-test`  runs the Catch2 [s3][integration] tag, which also
-#                     selects tests tagged [s3][parquet][integration].
-# `make s3-e2e`       one-shot end-to-end SQL gate: brings MinIO up, runs the
-#                     Catch2 [s3][sql] surface tests, then tears MinIO down
-#                     even on failure. Run it last, after `make release`.
+# `make test`         runs the default Catch2 suite without starting MinIO.
+# `make s3-test`      one-shot full S3 correctness gate: starts MinIO, sources
+#                     env.sh, runs every Catch2 test tagged [s3] in strict
+#                     mode, then tears MinIO down even on failure.
+# `make s3-sql-test`  one-shot SQL-over-S3 end-to-end subset: same fixture
+#                     lifecycle as s3-test, but runs only [s3][sql].
 #
 # See test/cpp/integration/s3/README.md for details.
 
@@ -147,23 +142,22 @@ s3-down:
 	docker compose -f $(S3_COMPOSE) down -v
 
 s3-test: SHELL := /bin/bash
-s3-test: s3-cpp-test
-
-s3-cpp-test: SHELL := /bin/bash
-s3-cpp-test:
+s3-test:
 	@if [ ! -x $(S3_TEST_BIN) ]; then \
-	  echo "s3-cpp-test: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
+	  echo "s3-test: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
 	  exit 1; \
 	fi
-	@source $(S3_DIR)/env.sh && export SIRIUS_TEST_S3_STRICT=1 && $(S3_TEST_BIN) "[s3][integration]"
+	@set -e; \
+	trap '$(MAKE) s3-down' EXIT; \
+	$(MAKE) s3-up; \
+	source $(S3_DIR)/env.sh; \
+	export SIRIUS_TEST_S3_STRICT=1; \
+	$(S3_TEST_BIN) "[s3]"
 
-# One-shot end-to-end SQL gate. Unlike s3-cpp-test (which assumes MinIO is
-# already up), this brings MinIO up itself, runs the [s3][sql] surface tests,
-# and always tears MinIO down via an EXIT trap - even if the tests fail.
-s3-e2e: SHELL := /bin/bash
-s3-e2e:
+s3-sql-test: SHELL := /bin/bash
+s3-sql-test:
 	@if [ ! -x $(S3_TEST_BIN) ]; then \
-	  echo "s3-e2e: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
+	  echo "s3-sql-test: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
 	  exit 1; \
 	fi
 	@set -e; \
