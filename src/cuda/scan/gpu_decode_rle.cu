@@ -168,7 +168,7 @@ __device__ __forceinline__ rle_parsed_metadata parse_rle_metadata(rle_segment_de
   // derived bound and rely on the malformed-vs-match swap below to recover.
   const uint64_t values_region_bytes = counts_offset - RLE_HEADER_SIZE;
   const uint64_t counts_region_bytes = desc.bytes_size - counts_offset;
-  uint64_t n_real = 0;
+  uint64_t n_real                    = 0;
   if (desc.type_size > 0 && (values_region_bytes % desc.type_size) == 0) {
     n_real = values_region_bytes / desc.type_size;
   } else {

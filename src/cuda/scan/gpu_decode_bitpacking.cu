@@ -114,9 +114,8 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
   // prior-segment row count was a multiple of `sizeof(vec_t) / sizeof(T)` —
   // not in general. CONSTANT and CONSTANT_DELTA branch on this and use
   // scalar stores when unaligned (FOR / DELTA_FOR already store scalar).
-  auto* out = d_output + desc.global_row_offset;
-  bool const out_vec_aligned =
-    (reinterpret_cast<::cuda::std::uintptr_t>(out) % sizeof(vec_t)) == 0;
+  auto* out                  = d_output + desc.global_row_offset;
+  bool const out_vec_aligned = (reinterpret_cast<::cuda::std::uintptr_t>(out) % sizeof(vec_t)) == 0;
 
   // Shared metadata — written by thread 0, read by all after the barrier.
   // `sm_aux` is overloaded by mode:
