@@ -24,6 +24,7 @@
 #include "pipeline/sirius_pipeline.hpp"
 
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -67,6 +68,14 @@ duckdb::unique_ptr<op::sirius_physical_operator> construct_sirius_specific_opera
   op::sirius_physical_operator& physical_op,
   const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>*
     iceberg_cache);
+
+//! Returns a deterministic, comparable serialization of a pipeline_conversion_result.
+//! Used for differential testing between flag-OFF (legacy) and flag-ON (tree-based)
+//! pipeline-conversion paths during Phase 3 (#604). Output is line-oriented and includes
+//! pipeline indices, source/sink/operators types, and repository wiring descriptors
+//! keyed by pipeline index (so byte-comparable across paths that produce equivalent
+//! shapes on the same plan tree).
+std::string dump_pipeline_conversion_result(const pipeline_conversion_result& result);
 
 class sirius_pipeline_converter {
  public:

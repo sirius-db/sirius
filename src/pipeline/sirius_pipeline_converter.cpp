@@ -59,7 +59,9 @@
 #include <algorithm>
 #include <chrono>
 #include <numeric>
+#include <sstream>
 #include <stdexcept>
+#include <string>
 
 namespace sirius::pipeline {
 
@@ -1377,6 +1379,58 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
     SIRIUS_LOG_INFO("");  // Blank line between pipelines
   }
   SIRIUS_LOG_INFO("=== END DETAILED PIPELINE DEBUG INFO ===\n");
+}
+
+std::string dump_pipeline_conversion_result(const pipeline_conversion_result& result)
+{
+  std::unordered_map<const sirius_pipeline*, std::size_t> pipeline_to_index;
+  for (std::size_t i = 0; i < result.scheduled_pipelines.size(); ++i) {
+    pipeline_to_index[result.scheduled_pipelines[i].get()] = i;
+  }
+
+  auto pipeline_index = [&](const duckdb::shared_ptr<sirius_pipeline>& p) -> std::string {
+    auto it = pipeline_to_index.find(p.get());
+    return it == pipeline_to_index.end() ? std::string{"?"} : std::to_string(it->second);
+  };
+
+  auto op_name = [](const op::sirius_physical_operator* op) -> std::string {
+    return op == nullptr ? std::string{"(null)"} : op::SiriusPhysicalOperatorToString(op->type);
+  };
+
+  auto barrier_name = [](op::MemoryBarrierType b) -> std::string {
+    switch (b) {
+      case op::MemoryBarrierType::PIPELINE: return "PIPELINE";
+      case op::MemoryBarrierType::PARTIAL: return "PARTIAL";
+      case op::MemoryBarrierType::FULL: return "FULL";
+    }
+    return "?";
+  };
+
+  std::ostringstream out;
+  out << "=== pipelines (" << result.scheduled_pipelines.size() << ") ===\n";
+  for (std::size_t i = 0; i < result.scheduled_pipelines.size(); ++i) {
+    auto& p = *result.scheduled_pipelines[i];
+    out << "[pipeline " << i << "]\n";
+    out << "  source: " << op_name(p.get_source().get()) << "\n";
+    out << "  sink: " << op_name(p.get_sink().get()) << "\n";
+    const auto ops = p.get_operators();
+    out << "  operators (" << ops.size() << "):\n";
+    std::size_t op_idx = 0;
+    for (const auto& op_ref : ops) {
+      out << "    [" << op_idx++ << "] " << op_name(&op_ref.get()) << "\n";
+    }
+  }
+  out << "\n=== repository_wirings (" << result.repository_wirings.size() << ") ===\n";
+  for (std::size_t i = 0; i < result.repository_wirings.size(); ++i) {
+    const auto& w = result.repository_wirings[i];
+    out << "[wiring " << i << "]\n";
+    out << "  port_id: " << w.port_id << "\n";
+    out << "  barrier: " << barrier_name(w.barrier_type) << "\n";
+    out << "  source_op: " << op_name(w.source_op) << "\n";
+    out << "  src_pipeline: " << pipeline_index(w.source_pipeline) << "\n";
+    out << "  dest_pipeline: " << pipeline_index(w.dest_pipeline) << "\n";
+  }
+  return out.str();
 }
 
 }  // namespace sirius::pipeline
