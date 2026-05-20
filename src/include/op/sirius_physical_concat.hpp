@@ -45,7 +45,7 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
 
   bool is_sink() const override;
 
-  bool is_build_concat();
+  bool is_build_concat() const;
 
   std::optional<task_creation_hint> get_next_task_hint() override;
 

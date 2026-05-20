@@ -227,7 +227,7 @@ bool sirius_physical_concat::is_source() const { return true; }
 
 bool sirius_physical_concat::is_sink() const { return true; }
 
-bool sirius_physical_concat::is_build_concat() { return _is_build; }
+bool sirius_physical_concat::is_build_concat() const { return _is_build; }
 
 void sirius_physical_concat::set_concat_all(bool concat_all)
 {

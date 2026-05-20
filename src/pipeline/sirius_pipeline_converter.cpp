@@ -991,6 +991,10 @@ void sirius_pipeline_converter::split_pipelines(
 
 void sirius_pipeline_converter::compute_repository_wiring()
 {
+  if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
+    compute_repository_wiring_tree_based();
+    return;
+  }
   // build source to pipelines map
   std::unordered_map<const op::sirius_physical_operator*,
                      duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>>
@@ -1129,6 +1133,146 @@ void sirius_pipeline_converter::compute_repository_wiring()
         emit("default", op::MemoryBarrierType::FULL, sink_op, pipeline, dependent_pipeline);
       }
     }
+  }
+}
+
+std::string_view sirius_pipeline_converter::resolve_port_id(
+  const op::sirius_physical_operator& sink, const op::sirius_physical_operator& /*parent*/)
+{
+  using T = op::SiriusPhysicalOperatorType;
+  // Build-side CONCATs feed the join's "build" port; everything else feeds "default".
+  if (sink.type == T::CONCAT) {
+    return sink.Cast<op::sirius_physical_concat>().is_build_concat() ? "build" : "default";
+  }
+  // Leaf scans push splits onto the "scan" port of the next operator.
+  if (sink.type == T::DUCKDB_SCAN || sink.type == T::ICEBERG_SCAN ||
+      sink.type == T::GPU_PARQUET_SCAN || sink.type == T::CPU_SOURCE) {
+    return "scan";
+  }
+  return "default";
+}
+
+op::MemoryBarrierType sirius_pipeline_converter::resolve_barrier(
+  const op::sirius_physical_operator& sink, const sirius_pipeline& dest)
+{
+  using T = op::SiriusPhysicalOperatorType;
+  // Sort/scan/sample sinks process batches as they arrive — no barrier required.
+  if (sink.type == T::ORDER_BY || sink.type == T::SORT_SAMPLE || sink.type == T::DUCKDB_SCAN ||
+      sink.type == T::ICEBERG_SCAN || sink.type == T::GPU_PARQUET_SCAN ||
+      sink.type == T::CPU_SOURCE) {
+    return op::MemoryBarrierType::PIPELINE;
+  }
+  // Producers that feed CONCAT can drain incrementally (PARTIAL); otherwise wait
+  // for the upstream pipeline to finish (FULL).
+  if (sink.type == T::PARTITION || sink.type == T::UNGROUPED_AGGREGATE || sink.type == T::TOP_N ||
+      sink.type == T::SORT_PARTITION) {
+    const auto ops                  = dest.get_operators();
+    const bool downstream_is_concat = (!ops.empty() && ops[0].get().type == T::CONCAT) ||
+                                      (dest.get_sink() && dest.get_sink()->type == T::CONCAT);
+    return downstream_is_concat ? op::MemoryBarrierType::PARTIAL : op::MemoryBarrierType::FULL;
+  }
+  return op::MemoryBarrierType::FULL;
+}
+
+void sirius_pipeline_converter::compute_repository_wiring_tree_based()
+{
+  // Build a fast lookup: operator pointer -> the pipeline that "starts at" it.
+  // A pipeline P starts at op X iff X is operators[0] (entry-point post-reverse)
+  // OR P.sink == X (sink-only pipelines where source == sink).
+  std::unordered_map<const op::sirius_physical_operator*, duckdb::shared_ptr<sirius_pipeline>>
+    dest_for_op;
+  for (const auto& pipeline : scheduled_) {
+    const auto ops = pipeline->get_operators();
+    if (!ops.empty()) { dest_for_op[&ops[0].get()] = pipeline; }
+    if (pipeline->get_sink()) { dest_for_op[pipeline->get_sink().get()] = pipeline; }
+  }
+
+  // Assign pipeline IDs before emitting wiring descriptors. Runtime materialization
+  // uses these to sort `_ports_list` deterministically.
+  for (size_t i = 0; i < scheduled_.size(); i++) {
+    scheduled_[i]->set_pipeline_id(i);
+  }
+
+  auto emit = [&](std::string_view port_id,
+                  op::MemoryBarrierType barrier,
+                  op::sirius_physical_operator* source_op,
+                  const duckdb::shared_ptr<sirius_pipeline>& src,
+                  const duckdb::shared_ptr<sirius_pipeline>& dst) {
+    repository_wirings_.push_back({port_id, barrier, source_op, src, dst});
+  };
+
+  for (auto& pipeline : scheduled_) {
+    auto* sink_op = pipeline->get_sink().get();
+    if (!sink_op) { continue; }
+
+    using T = op::SiriusPhysicalOperatorType;
+
+    // RESULT_COLLECTOR is a terminal sink — nothing to emit.
+    if (sink_op->type == T::RESULT_COLLECTOR) { continue; }
+
+    // CTE iterates its sibling `cte_scans` (parent_op alone doesn't encode them).
+    if (sink_op->type == T::CTE) {
+      auto& cte_op = sink_op->Cast<op::sirius_physical_cte>();
+      for (auto cte_scan : cte_op.cte_scans) {
+        auto it = dest_for_op.find(&cte_scan.get());
+        if (it == dest_for_op.end()) { continue; }
+        emit("default", op::MemoryBarrierType::FULL, sink_op, pipeline, it->second);
+      }
+      continue;
+    }
+
+    // RIGHT_DELIM_JOIN: emit partition_join + distinct sibling references.
+    if (sink_op->type == T::RIGHT_DELIM_JOIN) {
+      auto& right_delim    = sink_op->Cast<op::sirius_physical_right_delim_join>();
+      auto* partition_join = right_delim.partition_join;
+      auto* distinct_op    = right_delim.distinct.get();
+      if (partition_join) {
+        auto it = dest_for_op.find(partition_join);
+        if (it != dest_for_op.end()) {
+          emit("default", op::MemoryBarrierType::FULL, partition_join, pipeline, it->second);
+        }
+      }
+      if (distinct_op) {
+        auto it = dest_for_op.find(distinct_op);
+        if (it != dest_for_op.end()) {
+          emit("default", op::MemoryBarrierType::FULL, distinct_op, pipeline, it->second);
+        }
+      }
+      continue;
+    }
+
+    // LEFT_DELIM_JOIN: emit column_data_scan + distinct sibling references.
+    if (sink_op->type == T::LEFT_DELIM_JOIN) {
+      auto& left_delim       = sink_op->Cast<op::sirius_physical_left_delim_join>();
+      auto* distinct_op      = left_delim.distinct.get();
+      auto* column_data_scan = left_delim.column_data_scan;
+      if (column_data_scan) {
+        auto it = dest_for_op.find(column_data_scan);
+        if (it != dest_for_op.end()) {
+          emit("default", op::MemoryBarrierType::FULL, column_data_scan, pipeline, it->second);
+        }
+      }
+      if (distinct_op) {
+        auto it = dest_for_op.find(distinct_op);
+        if (it != dest_for_op.end()) {
+          emit("default", op::MemoryBarrierType::FULL, distinct_op, pipeline, it->second);
+        }
+      }
+      continue;
+    }
+
+    // Uniform tree-parent lookup for everything else.
+    auto* parent_op = sink_op->get_parent_op();
+    if (!parent_op) { continue; }
+    auto it = dest_for_op.find(parent_op);
+    if (it == dest_for_op.end()) { continue; }
+
+    const auto& dest = it->second;
+    emit(resolve_port_id(*sink_op, *parent_op),
+         resolve_barrier(*sink_op, *dest),
+         sink_op,
+         pipeline,
+         dest);
   }
 }
 
