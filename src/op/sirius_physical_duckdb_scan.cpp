@@ -16,7 +16,9 @@
 
 #include "op/sirius_physical_duckdb_scan.hpp"
 
+#include "config.hpp"
 #include "log/logging.hpp"
+#include "pipeline/sirius_meta_pipeline.hpp"
 
 #include <algorithm>
 
@@ -123,6 +125,21 @@ sirius_physical_duckdb_scan::sirius_physical_duckdb_scan(
 
   fake_table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
   SIRIUS_LOG_DEBUG("Table scan column ids: {}", column_ids.size());
+}
+
+void sirius_physical_duckdb_scan::build_pipelines(pipeline::sirius_pipeline& current,
+                                                  pipeline::sirius_meta_pipeline& meta_pipeline)
+{
+  if (!duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
+    sirius_physical_operator::build_pipelines(current, meta_pipeline);
+    return;
+  }
+  // Phase 3.2 (#604): scan-leaves are the sink of their own child_meta. Under
+  // the new protocol, create_child_meta_pipeline pre-populates [*this] in the
+  // new child_meta's operators[] (via C.1), so post-reverse operators=[*this]
+  // with source=sink=*this. Scan-leaves have no children, so no recursion.
+  D_ASSERT(children.empty());
+  meta_pipeline.create_child_meta_pipeline(current, *this);
 }
 
 }  // namespace op

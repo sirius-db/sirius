@@ -103,6 +103,9 @@ class sirius_physical_duckdb_scan : public sirius_physical_operator {
 
  public:
   bool is_source() const override { return true; }
+
+  void build_pipelines(pipeline::sirius_pipeline& current,
+                       pipeline::sirius_meta_pipeline& meta_pipeline) override;
 };
 
 }  // namespace op

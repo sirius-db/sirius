@@ -54,6 +54,9 @@ class sirius_physical_cpu_source : public sirius_physical_operator {
 
   bool is_source() const override { return true; }
 
+  void build_pipelines(pipeline::sirius_pipeline& current,
+                       pipeline::sirius_meta_pipeline& meta_pipeline) override;
+
   //! The ColumnDataCollection to scan (may be nullptr for EMPTY_RESULT)
   duckdb::optionally_owned_ptr<duckdb::ColumnDataCollection> collection;
   //! Whether to produce a single empty row (DUMMY_SCAN behavior)

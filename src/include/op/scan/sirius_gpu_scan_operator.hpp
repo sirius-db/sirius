@@ -84,6 +84,10 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   // -----------------------------
   bool is_source() const override { return true; }
 
+  //===----------Pipeline construction----------===//
+  void build_pipelines(pipeline::sirius_pipeline& current,
+                       pipeline::sirius_meta_pipeline& meta_pipeline) override;
+
   std::optional<task_creation_hint> get_next_task_hint() override;
   [[nodiscard]] bool all_ports_empty() override;
   std::unique_ptr<op::operator_data> get_next_task_input_data() override;

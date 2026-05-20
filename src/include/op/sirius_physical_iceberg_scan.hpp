@@ -64,6 +64,9 @@ class sirius_physical_iceberg_scan : public sirius_physical_parquet_scan {
                                duckdb::vector<duckdb::Value> parameters,
                                duckdb::virtual_column_map_t virtual_columns);
 
+  void build_pipelines(pipeline::sirius_pipeline& current,
+                       pipeline::sirius_meta_pipeline& meta_pipeline) override;
+
   // -------------------------------------------------------------------------
   // Fully materialized delete data (populated by sirius_engine.cpp).
   // nullptr or empty() for V1 tables.
