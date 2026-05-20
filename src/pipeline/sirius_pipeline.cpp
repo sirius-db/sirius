@@ -16,6 +16,7 @@
 
 #include "pipeline/sirius_pipeline.hpp"
 
+#include "config.hpp"
 #include "creator/task_creator.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
@@ -131,6 +132,13 @@ void sirius_pipeline::is_ready()
   if (ready) { return; }
   ready = true;
   std::reverse(operators.begin(), operators.end());
+  if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD && !operators.empty()) {
+    // Phase 3.2 (#604): absorb what finalize_pipeline_structure does today —
+    // derive source/sink from operators[] so the post-finalize state is produced
+    // during build, not by a separate converter pass.
+    source = &operators.front().get();
+    sink   = &operators.back().get();
+  }
 }
 
 void sirius_pipeline::add_dependency(duckdb::shared_ptr<sirius_pipeline>& pipeline)
