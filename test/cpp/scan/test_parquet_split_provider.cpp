@@ -44,7 +44,6 @@
 #include <algorithm>
 #include <cstddef>
 #include <filesystem>
-#include <future>
 #include <memory>
 #include <string>
 #include <unordered_set>
@@ -116,9 +115,11 @@ duckdb::vector<sirius::logical_type> default_returned_types()
 std::vector<std::unique_ptr<parquet_scan_data>> drive_provider(parquet_split_provider& provider,
                                                                int n_threads = 2)
 {
-  exec::thread_pool pool(n_threads, "psp_test_pool");
+  exec::static_thread_pool pool(n_threads, "psp_test_pool");
   split_connector connector;
-  auto fut = provider.start(pool, connector);
+  // run() is fire-and-forget; metadata-scan errors flow through connector.close()
+  // and surface here when get_next_split() rethrows.
+  provider.run(pool, connector);
 
   std::vector<std::unique_ptr<parquet_scan_data>> drained;
   while (true) {
@@ -130,7 +131,6 @@ std::vector<std::unique_ptr<parquet_scan_data>> drive_provider(parquet_split_pro
     REQUIRE(parquet != nullptr);
     drained.emplace_back(std::unique_ptr<parquet_scan_data>(parquet));
   }
-  fut.get();  // surface any error from a metadata-scan task
   return drained;
 }
 

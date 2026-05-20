@@ -19,6 +19,7 @@
 #include "config.hpp"
 #include "exec/config.hpp"
 #include "op/scan/config.hpp"
+#include "scan_manager/sirius_scan_manager.hpp"
 
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
@@ -78,7 +79,7 @@ struct sirius_config {
 
   [[nodiscard]] const exec::thread_pool_config& get_task_creator_config() const noexcept;
 
-  [[nodiscard]] const exec::thread_pool_config& get_scan_manager_config() const noexcept;
+  [[nodiscard]] const scan_manager::scan_manager_config& get_scan_manager_config() const noexcept;
 
   [[nodiscard]] const exec::thread_pool_config& get_gpu_pipeline_executor_config() const noexcept;
 
@@ -114,8 +115,7 @@ struct sirius_config {
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   exec::thread_pool_config _task_creator_config{.num_threads        = 2,
                                                 .thread_name_prefix = "task_creator"};
-  exec::thread_pool_config _scan_manager_config{.num_threads        = 2,
-                                                .thread_name_prefix = "scan_manager"};
+  scan_manager::scan_manager_config _scan_manager_config{};
   exec::thread_pool_config _gpu_pipeline_executor_config{.num_threads        = 4,
                                                          .thread_name_prefix = "gpu_pipeline"};
   exec::downgrade_executor_config _downgrade_executor_config;

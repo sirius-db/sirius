@@ -253,6 +253,41 @@ def emit_unpin(query_num: int) -> str:
     return "\n".join(f"CALL unpin_table('{table}');" for table in cols_by_table) + "\n"
 
 
+def _union_columns_by_table() -> dict[str, list[str]]:
+    """Union of columns each table is referenced with across all queries."""
+    by_table: dict[str, set[str]] = {}
+    for cols_by_table in QUERY_COLUMNS.values():
+        for table, cols in cols_by_table.items():
+            by_table.setdefault(table, set()).update(cols)
+    return {table: sorted(cols) for table, cols in by_table.items()}
+
+
+def emit_pin_all(parquet_dir: str) -> str:
+    """Emit one CALL pin_table per table with the union of columns across all queries.
+
+    Used by sequential-mode benchmarks where re-pinning between queries would
+    erase the cache; pin everything once up front instead.
+    """
+    tier = os.environ.get("SIRIUS_PIN_TIER", "gpu")
+    lines = []
+    for table, cols in _union_columns_by_table().items():
+        path = detect_pin_glob(parquet_dir, table)
+        col_literals = ",".join(f"'{c}'" for c in cols)
+        lines.append(
+            f"CALL pin_table('{path}', tier='{tier}', name='{table}', cols=[{col_literals}]);"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def emit_unpin_all() -> str:
+    return (
+        "\n".join(
+            f"CALL unpin_table('{table}');" for table in _union_columns_by_table()
+        )
+        + "\n"
+    )
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 3:
         print(

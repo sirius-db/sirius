@@ -21,6 +21,7 @@
 #include <cuda_runtime.h>
 
 #include <concurrentqueue.h>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <liburing.h>
 
 #include <array>
@@ -28,6 +29,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <thread>
 
 namespace {
@@ -109,6 +111,12 @@ inline double to_mb(size_t bytes) noexcept
 struct bounce_slot {
   void* buf{nullptr};
   std::atomic<bool> cuda_done{false};
+  // Status captured by cuda_copy_cb at callback time.  Written before the
+  // release-store on cuda_done, read after the acquire-load — so the
+  // happens-before chain piggybacks on cuda_done.  Lets poll_cuda use the
+  // stream's state when our copy finished, ignoring later unrelated work
+  // the consumer may have queued onto the same stream.
+  cudaError_t cuda_status{cudaSuccess};
 };
 
 // ---------------------------------------------------------------------------
@@ -118,15 +126,23 @@ struct bounce_slot {
 /**
  * @brief Concrete @c sirius_io_object backed by a filesystem path.
  *
- * Opens a buffered @c O_RDONLY fd (for @c pread / host_read) and an
- * @c O_DIRECT fd (for reactor-driven device reads).  The two file
- * descriptors are the native handles consumed by @c uring_reactor.
+ * Passive bag of native handles.  The buffered @c O_RDONLY fd
+ * (for @c pread / host_read) and the @c O_DIRECT fd (for reactor-driven
+ * device reads) are produced by @c uring_reactor::create_io_object — this
+ * class does no I/O of its own.
  */
 class uring_io_object : public sirius_io_object {
  public:
-  explicit uring_io_object(std::string path);
+  uring_io_object(std::string path, file_descriptor fd, file_descriptor fd_direct, size_t file_size)
+    : _path(std::move(path)),
+      _fd(std::move(fd)),
+      _fd_direct(std::move(fd_direct)),
+      _file_size(file_size)
+  {
+  }
 
   [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _path; }
+  [[nodiscard]] const std::string& object_path() const noexcept override { return _path; }
   [[nodiscard]] size_t size() const noexcept override { return _file_size; }
 
   [[nodiscard]] int fd() const noexcept { return _fd.get(); }
@@ -201,6 +217,18 @@ class uring_reactor {
   static cudf::io::text::byte_range_info align_to_physical(cudf::io::text::byte_range_info logical,
                                                            size_t file_size);
 
+  /// Whether @p path can be served by this reactor.  Local-disk only:
+  /// returns true iff the path refers to an existing, accessible file.
+  [[nodiscard]] static bool supports(std::string_view path);
+
+  /// Open the buffered + O_DIRECT fds for @p path and return them
+  /// packaged in a @c uring_io_object.  Throws on unsupported paths or
+  /// open() failure.
+  static std::unique_ptr<uring_io_object> create_io_object(std::string path);
+
+  /// fstat the open fd to get the file's current size.
+  static size_t size(int fd);
+
  private:
   void worker_loop();
 
@@ -208,7 +236,11 @@ class uring_reactor {
     uring_reactor* self;
     int slot;
   };
-  static void cuda_copy_cb(void* p) noexcept;
+  // cudaStreamAddCallback signature (deprecated but used deliberately).
+  // Unlike cudaLaunchHostFunc, the callback fires even when the stream is
+  // already in an error state — so we never strand a slot in COPYING
+  // waiting for a callback that wouldn't otherwise come.
+  static void cuda_copy_cb(cudaStream_t stream, cudaError_t status, void* p) noexcept;
 
   std::array<bounce_slot, NUM_CHUNKS> _bounce;
   std::array<cb_arg, NUM_CHUNKS> _cb_args;
@@ -220,7 +252,6 @@ class uring_reactor {
   std::thread _worker;
   duckdb_moodycamel::ConcurrentQueue<device_read_req_type> _queue;
   duckdb_moodycamel::ConcurrentQueue<host_read_req_type> _host_queue;
-  std::atomic<uint64_t> _cuda_seq{0};
 };
 
 }  // namespace sirius::io

@@ -114,10 +114,7 @@ std::optional<task_creation_hint> sirius_gpu_parquet_scan_operator::get_next_tas
   return task_creation_hint{TaskCreationHint::READY, this};
 }
 
-bool sirius_gpu_parquet_scan_operator::all_ports_empty()
-{
-  return _split_connector->is_closed() && !_split_connector->has_more_splits();
-}
+bool sirius_gpu_parquet_scan_operator::all_ports_empty() { return _split_connector->is_closed(); }
 
 std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::get_next_task_input_data()
 {
@@ -171,13 +168,16 @@ std::unique_ptr<cudf::table> sirius_gpu_parquet_scan_operator::read_table_from_m
   // Hold uring_io_object shared_ptrs for the duration of the read so the
   // sirius_datasources keep a valid handle (sirius_datasource holds a raw
   // observer of the io_object).
-  std::vector<std::shared_ptr<sirius::io::uring_io_object>> io_objects;
+  std::vector<std::shared_ptr<sirius::io::sirius_io_object>> io_objects;
   io_objects.reserve(scan_data.rg_slices.size());
   for (auto const& slice : scan_data.rg_slices) {
-    auto io_object  = std::make_shared<sirius::io::uring_io_object>(slice.file_path);
-    auto datasource = ioctx_it->second->make_datasource(io_object);
-    io_objects.push_back(std::move(io_object));
-    sources.push_back(std::move(datasource));
+    if (slice.io_object) {
+      sources.push_back(ioctx_it->second->make_datasource(slice.io_object));
+    } else {
+      auto io_object = ioctx_it->second->create_io_object(slice.file_path);
+      sources.push_back(ioctx_it->second->make_datasource(io_object));
+      io_objects.push_back(std::move(io_object));
+    }
     metadatas.push_back(*slice.file_metadata);  // copy unavoidable: cudf takes by value
     rg_per_src.push_back(slice.row_group_indices);
   }
@@ -329,6 +329,7 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
 std::size_t sirius_gpu_parquet_scan_operator::no_history_peak_memory_estimate(
   const op::input_stats& stats) const
 {
+  if (stats.type == op::operator_data_type::SCAN_CACHED) { return stats.bytes; }
   return stats.bytes * 8;
 }
 

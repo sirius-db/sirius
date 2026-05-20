@@ -16,63 +16,9 @@
 
 #include "io/uring/uring_ioctx.hpp"
 
-#include <algorithm>
-#include <cstring>
-#include <ranges>
-#include <stdexcept>
+#include <memory>
 
 namespace sirius::io {
-
-// ---------------------------------------------------------------------------
-// ring_pool
-// ---------------------------------------------------------------------------
-
-void ring_pool::init(size_t n_rings, unsigned ring_entries)
-{
-  _rings  = std::make_unique<io_uring[]>(n_rings);
-  _in_use = std::make_unique<bool[]>(n_rings);
-  _n      = n_rings;
-
-  for (auto i : std::views::iota(size_t{0}, _n)) {
-    int ret = io_uring_queue_init(ring_entries, &_rings[i], 0);
-    if (ret < 0)
-      throw std::runtime_error("ring_pool: io_uring_queue_init failed: " +
-                               std::string(strerror(-ret)));
-  }
-}
-
-ring_pool::~ring_pool()
-{
-  std::for_each_n(_rings.get(), _n, [](io_uring& r) { io_uring_queue_exit(&r); });
-}
-
-ring_pool::guard ring_pool::acquire()
-{
-  std::unique_lock lk{_mtx};
-  size_t found = _n;
-  _cv.wait(lk, [&] {
-    auto* first = _in_use.get();
-    auto* it    = std::find(first, first + _n, false);
-    if (it == first + _n) return false;
-    *it   = true;
-    found = static_cast<size_t>(it - first);
-    return true;
-  });
-  return guard{this, found};
-}
-
-void ring_pool::release(size_t idx)
-{
-  {
-    std::lock_guard lk{_mtx};
-    _in_use[idx] = false;
-  }
-  _cv.notify_one();
-}
-
-// ---------------------------------------------------------------------------
-// uring_ioctx
-// ---------------------------------------------------------------------------
 
 uring_ioctx::uring_ioctx(unsigned host_ring_depth,
                          unsigned ring_entries,

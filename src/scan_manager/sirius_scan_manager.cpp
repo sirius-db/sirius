@@ -16,6 +16,9 @@
 
 #include "scan_manager/sirius_scan_manager.hpp"
 
+#include "exec/thread_pool.hpp"
+#include "io/prefetching_cache.hpp"
+#include "io/uring/uring_ioctx.hpp"
 #include "log/logging.hpp"
 #include "op/scan/parquet_scan_info.hpp"
 #include "op/scan/scan_plan.hpp"
@@ -29,24 +32,75 @@
 #include "scan_manager/split_connector.hpp"
 #include "scan_manager/split_provider.hpp"
 
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+
 #include <algorithm>
 #include <exception>
+#include <stdexcept>
 #include <utility>
 
 namespace sirius::scan_manager {
 
-sirius_scan_manager::sirius_scan_manager(exec::thread_pool_config config)
-  : _config(std::move(config))
+sirius_scan_manager::sirius_scan_manager(
+  scan_manager_config config, cucascade::memory::fixed_size_host_memory_resource* host_mr)
+  : _config(std::move(config)),
+    _thread_pool(_config.thread_pool.num_threads,
+                 _config.thread_pool.thread_name_prefix,
+                 _config.thread_pool.cpu_affinity_list),
+    _dispatcher(
+      std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads))
 {
+  if (_config.use_sirius_datasource) {
+    if (host_mr == nullptr) {
+      throw std::runtime_error(
+        "[sirius_scan_manager] use_sirius_datasource is true but no host "
+        "fixed_size_host_memory_resource was provided");
+    }
+    _io_ctx = std::make_shared<sirius::io::uring_ioctx>(
+      _config.uring_n_reactors, _config.uring_ring_entries, *host_mr);
+    SIRIUS_LOG_DEBUG(
+      "[sirius_scan_manager] sirius_datasource enabled (uring_ioctx n_reactors={} ring_entries={})",
+      _config.uring_n_reactors,
+      _config.uring_ring_entries);
+
+    if (_config.enable_prefetch_cache) {
+      // Slab size = CHUNKS_PER_SLAB blocks at the resource's block size.
+      // Round the byte budget up so the user gets at least what they asked for.
+      auto const slab_bytes = host_mr->get_block_size() *
+                              static_cast<std::size_t>(sirius::io::buffer_pool::CHUNKS_PER_SLAB);
+      auto const max_slabs =
+        static_cast<uint32_t>((_config.prefetch_buffer_pool_bytes + slab_bytes - 1) / slab_bytes);
+      _buffer_pool = std::make_unique<sirius::io::buffer_pool>(*host_mr, max_slabs);
+      _io_ctx->initialize_cache(*_buffer_pool, _config.prefetch_inflight_budget_chunks);
+      SIRIUS_LOG_DEBUG(
+        "[sirius_scan_manager] prefetch cache enabled (slabs={} budget_bytes={} "
+        "inflight_chunks={})",
+        max_slabs,
+        max_slabs * slab_bytes,
+        _config.prefetch_inflight_budget_chunks);
+    }
+  } else {
+    SIRIUS_LOG_DEBUG(
+      "[sirius_scan_manager] sirius_datasource disabled — falling back to "
+      "cudf::io::datasource::create");
+  }
 }
 
-sirius_scan_manager::~sirius_scan_manager() { stop(); }
+sirius_scan_manager::~sirius_scan_manager()
+{
+  if (_io_ctx && _io_ctx->cache() != nullptr) {
+    SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _io_ctx->cache()->summary());
+  }
+  stop();
+}
 
 void sirius_scan_manager::prepare_for_query(
   const sirius::planner::query& query,
   std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs)
 {
   reset();
+
+  if (_io_ctx && _io_ctx->cache()) { _io_ctx->cache()->refresh_cache(); }
 
   SIRIUS_LOG_DEBUG("[sirius_scan_manager::prepare_for_query] pipelines={} gpu_ioctxs={}",
                    query.get_pipelines().size(),
@@ -77,11 +131,7 @@ void sirius_scan_manager::prepare_for_query(
 
   if (_scan_op_order.empty()) { return; }
 
-  if (!_thread_pool) {
-    throw std::runtime_error("[sirius_scan_manager::prepare_for_query] thread pool not started");
-  }
-
-  _driver_thread = std::thread(&sirius_scan_manager::run_driver_loop, this);
+  start_metadata_processing();
 }
 
 std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
@@ -250,10 +300,6 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
   } catch (...) {
     SIRIUS_LOG_TRACE("not all the columns are pinned for this query");
   }
-  // Forward gpu_ioctxs to parquet_split_provider so run_batch() can construct
-  // sirius_datasources via ioctx->make_datasource(io_object) instead of cudf's
-  // bundled file_source factory (the latter routes through kvikio and bypasses
-  // io_uring + per-GPU CUDA-context binding established for multi-GPU IO).
   return std::make_unique<parquet_split_provider>(
     info->returned_types,
     info->file_paths,
@@ -268,7 +314,7 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
     gpu_ioctxs);
 }
 
-void sirius_scan_manager::run_driver_loop()
+void sirius_scan_manager::start_metadata_processing()
 {
   for (auto* op : _scan_op_order) {
     auto it = _providers_by_op.find(op);
@@ -277,36 +323,36 @@ void sirius_scan_manager::run_driver_loop()
     if (connector == nullptr) { continue; }
 
     try {
-      auto future = it->second->start(*_thread_pool, *connector);
-      future.get();
+      // run() is fire-and-forget: it enqueues workers and returns immediately.
+      // Worker exceptions ride on connector.close(exception_ptr) and surface
+      // when the consumer drains via get_next_split().
+      it->second->run(*_dispatcher, *connector);
     } catch (const std::exception& e) {
-      SIRIUS_LOG_ERROR("[sirius_scan_manager] driver: provider failed: {}", e.what());
-      // Make sure the consumer is unblocked even on failure.
-      connector->close();
+      SIRIUS_LOG_ERROR("[sirius_scan_manager] driver: provider failed to start: {}", e.what());
+      // Synchronous failure inside run() (e.g. scheduler.enqueue throwing)
+      // bypasses the worker error path, so forward it through the connector
+      // here. close() is idempotent and keeps the first stored exception.
+      connector->close(std::current_exception());
     }
   }
 }
 
 void sirius_scan_manager::reset()
 {
-  if (_driver_thread.joinable()) { _driver_thread.join(); }
+  _dispatcher->request_stop();
+  _dispatcher->wait_for_all();
   _scan_op_order.clear();
   _providers_by_op.clear();
+  _dispatcher =
+    std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads);
 }
 
-void sirius_scan_manager::start()
-{
-  if (_thread_pool) { return; }
-  _thread_pool = std::make_unique<exec::thread_pool>(
-    _config.num_threads, _config.thread_name_prefix, _config.cpu_affinity_list);
-}
+void sirius_scan_manager::start() {}
 
 void sirius_scan_manager::stop()
 {
-  if (_driver_thread.joinable()) { _driver_thread.join(); }
-  if (!_thread_pool) { return; }
-  _thread_pool->stop();
-  _thread_pool.reset();
+  reset();
+  _thread_pool.stop();
 }
 
 void sirius_scan_manager::insert_pinned_entry(

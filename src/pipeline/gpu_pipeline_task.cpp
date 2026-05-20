@@ -473,7 +473,9 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
     if (auto* pd = dynamic_cast<const op::pipelineable_operator_data*>(ls._input_data.get())) {
       num_batches = pd->get_data_batches().size();
     }
-    const op::input_stats stats{num_batches, input_basis};
+    const auto input_type =
+      ls._input_data ? ls._input_data->get_type() : op::operator_data_type::BASE;
+    const op::input_stats stats{num_batches, input_basis, input_type};
 
     std::size_t max_estimate = 0;
     if (auto* pipeline = gs.get_pipeline()) {
