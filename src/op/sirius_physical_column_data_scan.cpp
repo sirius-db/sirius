@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_column_data_scan.hpp"
 
+#include "config.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
@@ -70,7 +71,16 @@ void sirius_physical_column_data_scan::build_pipelines(
                delim_sink->type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
       auto& delim_join = delim_sink->Cast<sirius_physical_delim_join>();
       current.add_dependency(delim_dependency);
-      state.set_pipeline_source(current, delim_join.distinct->Cast<sirius_physical_operator>());
+      if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
+        // Phase 3.2 (#604): source is derived from operators[0] post-reverse,
+        // so append delim_join.distinct to operators[] rather than only
+        // setting the source field. compute_repository_wiring (Sub-phase D)
+        // resolves the data feeder via the tree-parent / delim_join_dependencies
+        // map instead of the source pointer.
+        state.add_pipeline_operator(current, delim_join.distinct->Cast<sirius_physical_operator>());
+      } else {
+        state.set_pipeline_source(current, delim_join.distinct->Cast<sirius_physical_operator>());
+      }
       return;
     }
     case SiriusPhysicalOperatorType::CTE_SCAN: {
@@ -85,7 +95,11 @@ void sirius_physical_column_data_scan::build_pipelines(
       D_ASSERT(cte_sink);
       D_ASSERT(cte_sink->type == SiriusPhysicalOperatorType::CTE);
       current.add_dependency(cte_dependency);
-      state.set_pipeline_source(current, *this);
+      if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
+        state.add_pipeline_operator(current, *this);
+      } else {
+        state.set_pipeline_source(current, *this);
+      }
       return;
     }
     case SiriusPhysicalOperatorType::RECURSIVE_RECURRING_CTE_SCAN:
@@ -98,7 +112,11 @@ void sirius_physical_column_data_scan::build_pipelines(
     default: break;
   }
   D_ASSERT(children.empty());
-  state.set_pipeline_source(current, *this);
+  if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
+    state.add_pipeline_operator(current, *this);
+  } else {
+    state.set_pipeline_source(current, *this);
+  }
 }
 
 std::unique_ptr<operator_data> sirius_physical_column_data_scan::execute(
