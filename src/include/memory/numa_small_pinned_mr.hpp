@@ -26,7 +26,6 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
-#include <vector>
 
 namespace sirius::memory {
 
