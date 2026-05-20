@@ -32,13 +32,18 @@
 #include "op/sirius_dynamic_filter.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_context.hpp"
+#include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/scan/parquet_scan_info.hpp"
 #include "op/scan/sirius_gpu_parquet_scan_operator.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_cpu_source.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
+#include "op/sirius_physical_iceberg_scan.hpp"
+#include "op/sirius_physical_result_collector.hpp"
 #include "op/sirius_physical_table_scan.hpp"
+#include "sirius_context.hpp"
 
+#include <optional>
 #include <utility>
 
 namespace sirius::planner {
@@ -112,18 +117,24 @@ std::unique_ptr<sirius::op::scan::parquet_scan_info> build_parquet_scan_info(
 }
 
 //! Attach a leaf GPU scan operator as the only child of a TABLE_SCAN, mirroring today's
-//! `sirius_pipeline_converter::split_table_scan_source` (which constructs the same operator
-//! as a separate pipeline at runtime instead of nesting it in the tree). In the tree-based
-//! path the leaf lives in the plan tree from plan time so `build_pipelines` can derive the
-//! scan pipeline structurally rather than via runtime mutation.
+//! `sirius_pipeline_converter::split_table_scan_source` and `insert_parquet_scan_operator`
+//! (which construct the same operators as separate pipelines at runtime instead of nesting
+//! them in the tree). In the tree-based path the leaf lives in the plan tree from plan time
+//! so `build_pipelines` can derive the scan pipeline structurally rather than via runtime
+//! mutation.
 //!
-//! Sub-phase B.2a handles `seq_scan` → DUCKDB_SCAN; B.2b adds `parquet_scan` /
-//! `read_parquet` → `sirius_gpu_parquet_scan_operator`. Iceberg (`iceberg_scan`) is
-//! dispatched here in B.2c. While `iceberg_scan` remains unhandled, this function quietly
-//! returns and the legacy converter (still authoritative when the flag is off) keeps
-//! handling it at runtime. B.2c will tighten this to throw on truly unsupported scan
-//! functions to match converter behavior.
-void wrap_table_scan_source(sirius::op::sirius_physical_operator& table_scan_op)
+//! For `iceberg_scan`, attaches the pre-fetched `IcebergDeleteData` from
+//! `iceberg_delete_data_cache_` so the GPU operator sees the delete-merge set on every read.
+//! Path resolution mirrors `resolve_iceberg_table_path` exactly; cache misses leave
+//! `delete_data` null, which matches today's converter behavior at
+//! `construct_sirius_specific_operator:65-76`.
+//!
+//! Throws on truly unsupported scan functions to match `construct_sirius_specific_operator`'s
+//! behavior at converter line 80.
+void wrap_table_scan_source(
+  sirius::op::sirius_physical_operator& table_scan_op,
+  const std::unordered_map<std::string, std::shared_ptr<const sirius::op::scan::IcebergDeleteData>>&
+    iceberg_cache)
 {
   // Table-in-out functions wear a TABLE_SCAN with children — skip per the master plan's
   // exclusion rule. Wrapping them would change their child layout in a way the converter
@@ -140,9 +151,17 @@ void wrap_table_scan_source(sirius::op::sirius_physical_operator& table_scan_op)
     auto info = build_parquet_scan_info(scan);
     leaf      = duckdb::make_uniq<sirius::op::scan::sirius_gpu_parquet_scan_operator>(
       scan.types, scan.estimated_cardinality, std::move(info));
+  } else if (fn == "iceberg_scan") {
+    auto iceberg_scan = duckdb::make_uniq<sirius::op::sirius_physical_iceberg_scan>(&scan);
+    if (!scan.parameters.empty()) {
+      auto const table_path = scan.parameters[0].ToString();
+      auto it               = iceberg_cache.find(table_path);
+      if (it != iceberg_cache.end()) { iceberg_scan->delete_data = it->second; }
+    }
+    leaf = std::move(iceberg_scan);
   } else {
-    // iceberg_scan handled in B.2c.
-    return;
+    throw std::runtime_error(
+      "[sirius_physical_plan_generator::wrap_table_scan_source] Unsupported scan function: " + fn);
   }
   table_scan_op.children.push_back(std::move(leaf));
 }
@@ -185,16 +204,20 @@ void wrap_cpu_source(sirius::op::sirius_physical_operator& source_op)
 //! node, growing it from a leaf into an intermediate; the new leaf has no children of its own,
 //! so post-order is equivalent to pre-order in those cases.
 void insert_gpu_pipeline_operators_recursive(
-  duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
+  const std::unordered_map<std::string, std::shared_ptr<const sirius::op::scan::IcebergDeleteData>>&
+    iceberg_cache)
 {
   if (!slot) { return; }
 
   for (auto& child_slot : slot->children) {
-    insert_gpu_pipeline_operators_recursive(child_slot);
+    insert_gpu_pipeline_operators_recursive(child_slot, iceberg_cache);
   }
 
   switch (slot->type) {
-    case sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN: wrap_table_scan_source(*slot); break;
+    case sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN:
+      wrap_table_scan_source(*slot, iceberg_cache);
+      break;
     case sirius::op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN:
     case sirius::op::SiriusPhysicalOperatorType::EMPTY_RESULT:
     case sirius::op::SiriusPhysicalOperatorType::DUMMY_SCAN: wrap_cpu_source(*slot); break;
@@ -240,7 +263,78 @@ void sirius_physical_plan_generator::set_parent_ops(sirius::op::sirius_physical_
 void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& plan)
 {
-  insert_gpu_pipeline_operators_recursive(plan);
+  insert_gpu_pipeline_operators_recursive(plan, iceberg_delete_data_cache_);
+}
+
+std::string sirius_physical_plan_generator::resolve_iceberg_table_path(
+  sirius::op::sirius_physical_table_scan& scan_op)
+{
+  if (!scan_op.parameters.empty()) { return scan_op.parameters[0].ToString(); }
+
+  // REST catalog: derive from bind_data file list.
+  if (scan_op.bind_data) {
+    auto& bind_data = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
+    if (bind_data.file_list && !bind_data.file_list->IsEmpty()) {
+      auto files = bind_data.file_list->GetAllFiles();
+      if (!files.empty()) {
+        auto const& first_path = files[0].path;
+        // Strip "/data/<filename>" to get table root.
+        auto data_pos = first_path.rfind("/data/");
+        if (data_pos != std::string::npos) { return first_path.substr(0, data_pos); }
+      }
+    }
+  }
+  return {};
+}
+
+void sirius_physical_plan_generator::prefetch_iceberg_delete_data(
+  sirius::op::sirius_physical_operator& plan)
+{
+  // Walk the plan tree and fully materialize delete data for every iceberg scan, mirroring
+  // `sirius_engine::prefetch_iceberg_delete_data`. The engine's variant still runs for the
+  // flag-off (legacy converter) path until Sub-phase E removes it; this variant feeds the
+  // tree-based wrap performed by `wrap_table_scan_source` later in `create_plan`.
+  if (plan.type != sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN) {
+    if (plan.type == sirius::op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
+      auto& collector = plan.Cast<sirius::op::sirius_physical_result_collector>();
+      prefetch_iceberg_delete_data(collector.plan);
+    } else {
+      for (auto& child : plan.children) {
+        prefetch_iceberg_delete_data(*child);
+      }
+    }
+    return;
+  }
+
+  auto& scan_op = plan.Cast<sirius::op::sirius_physical_table_scan>();
+  if (scan_op.function.name != "iceberg_scan") { return; }
+
+  std::string const table_path = resolve_iceberg_table_path(scan_op);
+  if (table_path.empty()) { return; }
+  if (iceberg_delete_data_cache_.count(table_path)) { return; }  // already fetched
+
+  // Extract snapshot parameters if present (for snapshot-aware delete discovery).
+  std::optional<uint64_t> snapshot_id;
+  auto sid_it = scan_op.named_parameters.find("snapshot_from_id");
+  if (sid_it != scan_op.named_parameters.end() && !sid_it->second.IsNull()) {
+    snapshot_id = sid_it->second.GetValue<uint64_t>();
+  }
+
+  // Opening secondary connections triggers QueryBegin/QueryEnd on the shared SiriusContext;
+  // InternalQueryGuard suppresses those side-effects.
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    SIRIUS_LOG_WARN(
+      "[sirius_physical_plan_generator] SiriusContext not available; treating iceberg '{}' as V1.",
+      table_path);
+    iceberg_delete_data_cache_.emplace(table_path,
+                                       std::make_shared<sirius::op::scan::IcebergDeleteData>());
+    return;
+  }
+
+  duckdb::SiriusContext::InternalQueryGuard guard(*sirius_ctx);
+  auto data = sirius::op::scan::read_iceberg_delete_data(context, table_path, snapshot_id);
+  iceberg_delete_data_cache_.emplace(table_path, std::move(data));
 }
 
 sirius::OrderPreservationType sirius_physical_plan_generator::order_preservation_recursive(
@@ -318,9 +412,12 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   // contain GPU pipeline operators (PARTITION/CONCAT/MERGE_*/SORT_*/scan companions/etc.)
   // so the converter becomes a pure topology pass driven by `build_pipelines` virtuals.
   // Default off; the legacy `sirius_pipeline_converter` is authoritative when the flag is
-  // off. `set_parent_ops` then derives every operator's `_parent_op` from the final tree,
-  // enabling Sub-phase C/D's tree-parent-lookup wiring.
+  // off. Iceberg delete data is pre-fetched before the tree rewrite so
+  // `wrap_table_scan_source` can attach `delete_data` to each `sirius_physical_iceberg_scan`
+  // it constructs. `set_parent_ops` then derives every operator's `_parent_op` from the
+  // final tree, enabling Sub-phase C/D's tree-parent-lookup wiring.
   if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
+    prefetch_iceberg_delete_data(*plan);
     insert_gpu_pipeline_operators(plan);
     set_parent_ops(*plan, /*parent=*/nullptr);
   }
