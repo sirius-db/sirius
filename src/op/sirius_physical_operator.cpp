@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_operator.hpp"
 
+#include "config.hpp"
 #include "log/logging.hpp"
 #include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
@@ -158,8 +159,14 @@ void sirius_physical_operator::build_pipelines(pipeline::sirius_pipeline& curren
     // operator is a sink, build a pipeline
     D_ASSERT(children.size() == 1);
 
-    // single operator: the operator becomes the data source of the current pipeline
-    state.set_pipeline_source(current, *this);
+    if (!duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
+      // Legacy protocol: source field tracks pre-finalize source.
+      state.set_pipeline_source(current, *this);
+    }
+    // Phase 3.2 (#604): under the new protocol, create_child_meta_pipeline
+    // pre-populates the new child_meta's operators[] with [*this], so *this
+    // lands at operators.back() post-reverse — source/sink derive from
+    // operators[] in is_ready, so no separate set_pipeline_source is needed.
 
     // we create a new pipeline starting from the child
     auto& child_meta_pipeline = meta_pipeline.create_child_meta_pipeline(current, *this);
@@ -167,8 +174,14 @@ void sirius_physical_operator::build_pipelines(pipeline::sirius_pipeline& curren
   } else {
     // operator is not a sink! recurse in children
     if (children.empty()) {
-      // source
-      state.set_pipeline_source(current, *this);
+      // source-leaf
+      if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
+        // Phase 3.2 (#604): source-leaves land at operators[0] post-reverse, so
+        // append to operators[] rather than only setting the source field.
+        state.add_pipeline_operator(current, *this);
+      } else {
+        state.set_pipeline_source(current, *this);
+      }
     } else {
       if (children.size() != 1) {
         throw internal_exception("Operator not supported in build_pipelines");
