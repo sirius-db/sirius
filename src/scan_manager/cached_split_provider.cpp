@@ -123,7 +123,7 @@ std::vector<std::unique_ptr<op::operator_data>> cached_split_provider::produce_s
         auto* chunk_space = !_chunk_memory_spaces.empty() ? _chunk_memory_spaces.at(batch_idx)
                                                           : _memory_space;
         auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
-          view, std::move(chunk), alloc_size, *chunk_space);
+          view, std::move(chunk), alloc_size, *chunk_space, rmm::cuda_stream_view{});
         return std::make_shared<cucascade::data_batch>(::sirius::get_next_batch_id(),
                                                        std::move(gpu_repr));
       } else if constexpr (std::is_same_v<T, host_chunk>) {

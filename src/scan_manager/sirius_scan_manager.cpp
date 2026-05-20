@@ -57,7 +57,7 @@ sirius_scan_manager::sirius_scan_manager(
         "fixed_size_host_memory_resource was provided");
     }
     _io_ctx = std::make_shared<sirius::io::uring_ioctx>(
-      _config.uring_n_reactors, _config.uring_ring_entries, *host_mr);
+      /*host_ring_depth=*/16u, _config.uring_ring_entries, _config.uring_n_reactors);
     SIRIUS_LOG_DEBUG(
       "[sirius_scan_manager] sirius_datasource enabled (uring_ioctx n_reactors={} ring_entries={})",
       _config.uring_n_reactors,

@@ -885,10 +885,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
       throw InvalidInputException(
         "pin_table: no sirius_ioctx for target GPU " + std::to_string(target_gpu_id) + ".");
     }
-    // Lifetime: io_object MUST outlive datasource MUST outlive reader.
-    // Declared in this order so reverse-destruction order tears them down
-    // safely at end of loop iteration.
-    auto io_object  = std::make_shared<sirius::io::uring_io_object>(path);
+    auto io_object  = target_ioctx->create_io_object(path);
     auto datasource = target_ioctx->make_datasource(io_object);
 
     auto file_opts = cudf::io::parquet_reader_options::builder(
