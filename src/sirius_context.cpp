@@ -771,8 +771,16 @@ void SiriusContext::create_query(
   task_creator_->prepare_for_query(*query_);
   // Pass per-GPU sirius_ioctx map to scan_manager so parquet_split_provider
   // can construct sirius_datasources via ioctx->make_datasource(io_object)
-  // instead of cudf's bundled file_source factory.
-  scan_manager_->prepare_for_query(*query_, gpu_ioctxs_);
+  // instead of cudf's bundled file_source factory. Also build a device_id ->
+  // GPU memory_space map for the HOST-tier cached_split_provider's
+  // host->gpu materialization at produce_split time (pin_table tier='host').
+  std::unordered_map<int, cucascade::memory::memory_space*> gpu_memory_spaces;
+  for (auto const* gpu_space :
+       memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+    gpu_memory_spaces[gpu_space->get_device_id()] =
+      const_cast<cucascade::memory::memory_space*>(gpu_space);
+  }
+  scan_manager_->prepare_for_query(*query_, gpu_ioctxs_, gpu_memory_spaces);
 }
 
 duckdb::shared_ptr<sirius::planner::query> SiriusContext::get_query()

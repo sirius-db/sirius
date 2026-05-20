@@ -435,7 +435,7 @@ TEST_CASE("pin_table - PIN-MGPU-01 host-tier multi-GPU pin",
 // would report 200000.
 //===----------------------------------------------------------------------===//
 TEST_CASE("pin_table - host-tier cached path serves SELECT after parquet files overwritten",
-          "[.][pin_mgpu][scan_manager][host_tier][host_tier_pending]")
+          "[pin_mgpu][scan_manager][host_tier][regression]")
 {
   if (!require_two_gpus()) return;
 
@@ -476,31 +476,35 @@ TEST_CASE("pin_table - host-tier cached path serves SELECT after parquet files o
   REQUIRE_FALSE(pin->HasError());
 
   // Sanity check: query BEFORE overwriting to confirm pin → cached SELECT works
-  // in this scenario. Both paths return the same answer here, so this only
-  // proves the plumbing is wired, not that cache is exercised.
+  // in this scenario. Use MAX(k) instead of count(*) — count(*) has a separate
+  // metadata-only optimization that bypasses the cached_split_provider's
+  // column-selection path; MAX(k) requires the cached chunks to actually
+  // surface the k column's values, which is exactly what host-tier caching
+  // must serve.
   auto pre_overwrite =
-    con.Query("CALL gpu_execution(\"SELECT count(*) FROM read_parquet('" + glob + "')\");");
+    con.Query("CALL gpu_execution(\"SELECT MAX(k) FROM read_parquet('" + glob + "')\");");
   REQUIRE(pre_overwrite);
   REQUIRE_FALSE(pre_overwrite->HasError());
-  REQUIRE(pre_overwrite->GetValue(0, 0).GetValue<int64_t>() == baseline_rows);
+  // range(100000) -> k goes 0..99999; MAX(k) across 4 identical files is 99999.
+  REQUIRE(pre_overwrite->GetValue(0, 0).GetValue<int64_t>() == 99999);
 
-  // Overwrite the parquet files with HALF as many rows (50k per file).
-  // The glob still resolves (so DuckDB's read_parquet bind succeeds), but
-  // the underlying data is now different. Cached path → 400000;
-  // fall-through to parquet → 200000.
+  // Overwrite the parquet files with a HIGHER `k` ceiling (200k per file
+  // instead of 100k). The glob still resolves so DuckDB's read_parquet bind
+  // succeeds, but the underlying data is now different.
+  //   - Cached path returns the ORIGINAL MAX(k) = 99999.
+  //   - Fall-through to parquet returns the NEW MAX(k) = 199999.
   generate_parquet_surface(tmp,
-                           "SELECT range AS k, range * 2 AS v FROM range(50000)",
+                           "SELECT range AS k, range * 2 AS v FROM range(200000)",
                            /*num_files=*/4);
 
-  auto cached = con.Query("CALL gpu_execution(\"SELECT count(*) FROM read_parquet('" +
+  auto cached = con.Query("CALL gpu_execution(\"SELECT MAX(k) FROM read_parquet('" +
                           glob + "')\");");
   REQUIRE(cached);
   if (cached->HasError()) { UNSCOPED_INFO("gpu_execution error: " << cached->GetError()); }
   REQUIRE_FALSE(cached->HasError());
-  auto cached_rows = cached->GetValue(0, 0).GetValue<int64_t>();
-  INFO("expected cached_rows=" << baseline_rows
-                               << " (silent fall-through would return 200000)");
-  REQUIRE(cached_rows == baseline_rows);
+  auto cached_max = cached->GetValue(0, 0).GetValue<int64_t>();
+  INFO("expected cached_max=99999 (silent fall-through would return 199999)");
+  REQUIRE(cached_max == 99999);
 
   auto unpin = con.Query("CALL unpin_table('host_cache_test');");
   REQUIRE(unpin);
@@ -523,7 +527,7 @@ TEST_CASE("pin_table - host-tier cached path serves SELECT after parquet files o
 // Hidden by [.] tag until the host_chunks scan-operator path is wired up.
 //===----------------------------------------------------------------------===//
 TEST_CASE("pin_table - host-tier cached path serves aggregate after parquet files overwritten",
-          "[.][pin_mgpu][scan_manager][host_tier][host_tier_pending]")
+          "[pin_mgpu][scan_manager][host_tier][regression]")
 {
   if (!require_two_gpus()) return;
 
@@ -545,11 +549,15 @@ TEST_CASE("pin_table - host-tier cached path serves aggregate after parquet file
 
   auto glob = parquet_glob(tmp);
 
+  // Baseline via pure DuckDB so transparent sirius interception doesn't go
+  // through the same cached path we're trying to verify.
+  REQUIRE_FALSE(con.Query("SET gpu_execution = false;")->HasError());
   auto baseline = con.Query("SELECT SUM(v) FROM read_parquet('" + glob + "');");
   REQUIRE(baseline);
   REQUIRE_FALSE(baseline->HasError());
   auto baseline_sum = baseline->GetValue(0, 0).GetValue<int64_t>();
   REQUIRE(baseline_sum == 39999600000LL);
+  REQUIRE_FALSE(con.Query("SET gpu_execution = true;")->HasError());
 
   auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='host_agg_test');");
   REQUIRE(pin);

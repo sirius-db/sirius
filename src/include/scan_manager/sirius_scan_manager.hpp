@@ -178,9 +178,15 @@ class sirius_scan_manager {
   ///                     another way; production callers
   ///                     (SiriusContext::create_query) MUST pass the map
   ///                     from SiriusContext::get_gpu_ioctxs().
+  /// @param gpu_memory_spaces device_id -> GPU memory_space lookup used by the
+  ///                     HOST-tier cached_split_provider to materialize host
+  ///                     chunks onto the executing GPU. Empty map disables the
+  ///                     HOST-tier cache path (queries against a host pin fall
+  ///                     through to parquet).
   void prepare_for_query(
     const sirius::planner::query& query,
-    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs = {});
+    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs = {},
+    std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces = {});
 
   /// \brief Clear the providers map and join the driver thread if it is
   ///        still running.
@@ -276,9 +282,13 @@ class sirius_scan_manager {
   /// @param op           The parquet scan operator.
   /// @param gpu_ioctxs   Per-GPU sirius_ioctx map forwarded to
   ///                     parquet_split_provider for multi-GPU IO routing.
+  /// @param gpu_memory_spaces device_id -> GPU memory_space lookup forwarded to
+  ///                     HOST-tier cached_split_provider for HOST->GPU
+  ///                     materialization at produce_split time.
   std::unique_ptr<split_provider> create_provider_for(
     op::scan::sirius_gpu_parquet_scan_operator* op,
-    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs);
+    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs,
+    std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces);
 
   /// \brief Run providers sequentially: start each, wait on its future, advance.
   void start_metadata_processing();

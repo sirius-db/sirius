@@ -96,15 +96,18 @@ sirius_scan_manager::~sirius_scan_manager()
 
 void sirius_scan_manager::prepare_for_query(
   const sirius::planner::query& query,
-  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs)
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs,
+  std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces)
 {
   reset();
 
   if (_io_ctx && _io_ctx->cache()) { _io_ctx->cache()->refresh_cache(); }
 
-  SIRIUS_LOG_DEBUG("[sirius_scan_manager::prepare_for_query] pipelines={} gpu_ioctxs={}",
-                   query.get_pipelines().size(),
-                   gpu_ioctxs.size());
+  SIRIUS_LOG_DEBUG(
+    "[sirius_scan_manager::prepare_for_query] pipelines={} gpu_ioctxs={} gpu_memory_spaces={}",
+    query.get_pipelines().size(),
+    gpu_ioctxs.size(),
+    gpu_memory_spaces.size());
 
   for (auto const& pipeline : query.get_pipelines()) {
     if (!pipeline) { continue; }
@@ -115,7 +118,7 @@ void sirius_scan_manager::prepare_for_query(
     auto* op = &source->Cast<op::scan::sirius_gpu_parquet_scan_operator>();
     if (_providers_by_op.find(op) != _providers_by_op.end()) { continue; }
 
-    auto provider = create_provider_for(op, gpu_ioctxs);
+    auto provider = create_provider_for(op, gpu_ioctxs, gpu_memory_spaces);
     if (!provider) {
       // No scan_info parked on the operator (e.g. tests construct the operator
       // directly). Skip — caller is responsible for the connector.
@@ -136,7 +139,8 @@ void sirius_scan_manager::prepare_for_query(
 
 std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
   op::scan::sirius_gpu_parquet_scan_operator* op,
-  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs)
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs,
+  std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces)
 {
   auto info = op->take_scan_info();
   if (!info) { return nullptr; }
@@ -176,22 +180,6 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
           op->get_operator_id());
         break;
       }
-      // Validate the per-chunk memory_space vector before building the
-      // cached_split_provider. Empty vector means the pinned entry has no
-      // chunks (unusual but legal for empty parquet files); null entries
-      // inside the vector violate the chunks-at-index-i invariant.
-      if (entry.chunk_memory_spaces.empty()) {
-        throw std::runtime_error("[sirius_scan_manager::create_provider_for] pinned entry '" +
-                                 pinned_name + "' has no chunk_memory_spaces");
-      }
-      for (std::size_t i = 0; i < entry.chunk_memory_spaces.size(); ++i) {
-        if (entry.chunk_memory_spaces[i] == nullptr) {
-          throw std::runtime_error(
-            "[sirius_scan_manager::create_provider_for] pinned entry '" + pinned_name +
-            "' chunk_memory_spaces[" + std::to_string(i) + "] is null");
-        }
-      }
-
       // Build the canonical scan_plan once. Everything downstream — cached column
       // layout, filter pushdown indices, post-read assembly — reads from this.
       // Held by shared_ptr<const> so each emitted scan_cached_operator_data can
@@ -235,6 +223,34 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
       }
 
       if (entry.tier == cucascade::memory::Tier::HOST) {
+        // HOST-tier entries store one host_data_representation per chunk in
+        // entry.host_chunks; chunk_memory_spaces is intentionally empty (see
+        // pinned_entry doc comment + insert_pinned_entry_host). Validate the
+        // host_chunks vector instead.
+        if (entry.host_chunks.empty()) {
+          throw std::runtime_error("[sirius_scan_manager::create_provider_for] pinned host entry '" +
+                                   pinned_name + "' has no host_chunks");
+        }
+        for (std::size_t i = 0; i < entry.host_chunks.size(); ++i) {
+          if (!entry.host_chunks[i]) {
+            throw std::runtime_error(
+              "[sirius_scan_manager::create_provider_for] pinned host entry '" + pinned_name +
+              "' host_chunks[" + std::to_string(i) + "] is null");
+          }
+        }
+        // The HOST cached path materializes host chunks onto the executing
+        // GPU via converter_registry.convert<gpu_table_representation>(...).
+        // Without a GPU memory_space map there is no destination — fall
+        // through to the parquet path so the query still succeeds.
+        if (gpu_memory_spaces.empty()) {
+          SIRIUS_LOG_DEBUG(
+            "[sirius_scan_manager::create_provider_for] pinned host entry '{}' matches op_id={} "
+            "but no gpu_memory_spaces map was provided; falling through to parquet_split_provider",
+            pinned_name,
+            op->get_operator_id());
+          break;
+        }
+
         // Map each D-position to its index inside the captured host chunk. column_names
         // is in capture order, so we look up the requested data column by name. A missing
         // column means the user pinned a subset that doesn't cover this scan — fall back
@@ -264,8 +280,25 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
         return std::make_unique<cached_split_provider>(entry.host_chunks,
                                                        std::move(column_indices),
                                                        *entry.memory_space,
+                                                       gpu_memory_spaces,
                                                        std::move(filter_expression),
                                                        std::move(plan_shared));
+      }
+
+      // GPU-tier validation: every cached chunk has an owning memory_space.
+      // chunk_memory_spaces is parallel to the inner vectors of
+      // data_batches_by_column; empty vector means no chunks; null entries
+      // violate the chunks-at-index-i invariant.
+      if (entry.chunk_memory_spaces.empty()) {
+        throw std::runtime_error("[sirius_scan_manager::create_provider_for] pinned entry '" +
+                                 pinned_name + "' has no chunk_memory_spaces");
+      }
+      for (std::size_t i = 0; i < entry.chunk_memory_spaces.size(); ++i) {
+        if (entry.chunk_memory_spaces[i] == nullptr) {
+          throw std::runtime_error(
+            "[sirius_scan_manager::create_provider_for] pinned entry '" + pinned_name +
+            "' chunk_memory_spaces[" + std::to_string(i) + "] is null");
+        }
       }
 
       // Look up the pinned chunks for each D-position by name. data_columns is in
