@@ -270,15 +270,10 @@ TEST_CASE("gpu_decode_table RLE - trailing slack past counts decodes correctly",
 TEST_CASE("gpu_decode_table RLE - narrow-type alignment padding decodes correctly",
           "[scan][decode][rle]")
 {
-  // The last segment per column can have entry_count not a multiple of 8,
-  // so for sizeof(T) < 8 DuckDB inserts 0..7 bytes of zero-fill alignment
-  // padding between values and counts. Worst case: T = uint8 with 3
-  // entries → minimal=11, aligned=16, padding=5. The kernel walks counts
-  // using the values-region bound (so it stops exactly at the real-count
-  // boundary) and the match-vs-malformed reordering absorbs any trailing
-  // bytes that get loaded into the same tile. Pin the contract by placing
-  // non-zero poison bytes immediately after the segment and asserting the
-  // decoded output is still correct.
+  // Narrow types (sizeof(T)<8) get 0..7 bytes of alignment padding between
+  // values and counts; worst case uint8 with 3 entries → 5 bytes. 0xFF
+  // poison after the segment proves the values-region bound + match-vs-
+  // malformed reordering absorb any over-read into the tile.
   std::vector<uint8_t> values{11, 22, 33};
   std::vector<uint16_t> counts{5, 10, 15};  // sum = 30
   auto seg                 = sirius::test::decode::rle::make_rle_block<uint8_t>(values, counts);
