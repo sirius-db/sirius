@@ -18,40 +18,18 @@
 
 #include "log/logging.hpp"
 
-#include <algorithm>
-#include <cstdint>
-#include <limits>
 #include <stdexcept>
 #include <utility>
+
+// Work placement note: diverges from `parquet_split_provider`. For parquet a
+// scan-manager worker thread parses metadata and emits splits, because each
+// parquet file means real IO. For duckdb-native the metadata is already in
+// memory, so the walker + batch partitioning runs here in the ctor on the
+// query-executor thread; worker threads only claim pre-built batches.
 
 namespace sirius::scan_manager {
 
 namespace {
-
-// cudf strings columns use int32 chars-offsets; one column's bytes per
-// scan output must stay <= INT32_MAX.
-constexpr std::size_t VARCHAR_BYTE_CAP =
-  static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max());
-
-// Per-segment exact: Σ(seg_count × *msl). Throws on a single-rg overshoot
-// of the cudf int32 chars cap so the transparent fallback routes to CPU
-// instead of failing later in the kernel.
-std::size_t rg_varchar_bytes_for_col(const op::scan::duckdb_row_group_metadata& rg,
-                                     std::size_t col_idx)
-{
-  std::size_t total = 0;
-  for (const auto& seg : rg.columns[col_idx].data_segments) {
-    total += static_cast<std::size_t>(seg.segment_count) *
-             static_cast<std::size_t>(*seg.max_string_length);
-  }
-  if (total > VARCHAR_BYTE_CAP) {
-    throw std::runtime_error(
-      "duckdb-native scan rejected query: row group " + std::to_string(rg.row_group_index) +
-      " column " + std::to_string(rg.columns[col_idx].column_id) + " varchar chars upper bound (" +
-      std::to_string(total) + ") exceeds cudf int32 chars cap");
-  }
-  return total;
-}
 
 std::vector<duckdb_native_split_provider::row_group_batch> partition_row_groups_into_batches(
   const std::vector<op::scan::duckdb_row_group_metadata>& row_groups,
@@ -63,11 +41,11 @@ std::vector<duckdb_native_split_provider::row_group_batch> partition_row_groups_
 
   const std::size_t num_cols = projected_types.size();
   std::vector<bool> is_varchar(num_cols, false);
+  bool any_varchar = false;
   for (std::size_t c = 0; c < num_cols; ++c) {
     is_varchar[c] = projected_types[c].is_varchar();
+    any_varchar   = any_varchar || is_varchar[c];
   }
-  const bool any_varchar =
-    std::any_of(is_varchar.begin(), is_varchar.end(), [](bool b) { return b; });
 
   // No caps in play → single batch.
   if (approximate_batch_size == 0 && !any_varchar) {
@@ -78,19 +56,10 @@ std::vector<duckdb_native_split_provider::row_group_batch> partition_row_groups_
   std::size_t batch_first = 0;
   std::size_t batch_bytes = 0;
   std::vector<std::size_t> col_bytes(num_cols, 0);
-  // Hoisted scratch — reset per iteration to skip the allocator on tables
-  // with millions of row groups.
-  std::vector<std::size_t> this_rg_col_bytes(num_cols, 0);
 
   for (std::size_t i = 0; i < row_groups.size(); ++i) {
     const auto& rg                  = row_groups[i];
     const std::size_t this_rg_bytes = rg.decoded_bytes_budget;
-    if (any_varchar) {
-      std::fill(this_rg_col_bytes.begin(), this_rg_col_bytes.end(), 0);
-      for (std::size_t c = 0; c < num_cols; ++c) {
-        if (is_varchar[c]) this_rg_col_bytes[c] = rg_varchar_bytes_for_col(rg, c);
-      }
-    }
 
     // Only close a non-empty batch; an over-cap row group always lands in
     // the current batch as its first member (singleton if it's alone).
@@ -101,7 +70,8 @@ std::vector<duckdb_native_split_provider::row_group_batch> partition_row_groups_
       bool would_exceed_varchar = false;
       if (any_varchar) {
         for (std::size_t c = 0; c < num_cols; ++c) {
-          if (is_varchar[c] && col_bytes[c] + this_rg_col_bytes[c] > VARCHAR_BYTE_CAP) {
+          if (is_varchar[c] &&
+              col_bytes[c] + rg.varchar_bytes_per_col[c] >= op::scan::kCudfInt32StringsThreshold) {
             would_exceed_varchar = true;
             break;
           }
@@ -118,8 +88,9 @@ std::vector<duckdb_native_split_provider::row_group_batch> partition_row_groups_
 
     batch_bytes += this_rg_bytes;
     if (any_varchar) {
-      for (std::size_t c = 0; c < num_cols; ++c)
-        col_bytes[c] += this_rg_col_bytes[c];
+      for (std::size_t c = 0; c < num_cols; ++c) {
+        col_bytes[c] += rg.varchar_bytes_per_col[c];
+      }
     }
   }
   if (batch_first < row_groups.size()) {
@@ -178,12 +149,14 @@ duckdb_native_split_provider::next_split_provider()
   if (idx >= _batches.size()) { return {}; }
 
   row_group_batch batch = _batches[idx];
+  // `_metadata.row_groups[i]` is moved out — batches are disjoint and each
+  // batch is claimed exactly once, so the source entry is never read again.
   return [this, batch]() -> std::vector<std::unique_ptr<op::operator_data>> {
     auto payload       = std::make_unique<split_payload>();
     payload->scan_info = _scan_info;
     payload->row_groups.reserve(batch.count);
     for (std::size_t i = batch.first_idx; i < batch.first_idx + batch.count; ++i) {
-      payload->row_groups.push_back(_metadata.row_groups[i]);
+      payload->row_groups.push_back(std::move(_metadata.row_groups[i]));
     }
     std::vector<std::unique_ptr<op::operator_data>> out;
     out.push_back(std::move(payload));

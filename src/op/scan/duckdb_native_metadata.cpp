@@ -303,17 +303,14 @@ duckdb_native_metadata walk_duckdb_native_metadata(
   row_group_handles handles;
   handles.reserve(partition_stats.size());
   for (std::size_t i = 0; i < partition_stats.size(); ++i) {
-    auto& ps                = partition_stats[i];
-    duckdb::idx_t row_start = 0;
-    if (ps.row_start.IsValid()) {
-      row_start = ps.row_start.GetIndex();
-    } else {
-      // Not expected on a materialized row group at v1.5.2; rowid synthesis
-      // for this group would emit incorrect ids.
-      SIRIUS_LOG_WARN(
-        "[duckdb_native_metadata] partition_stats[{}].row_start is not valid; defaulting to 0", i);
+    auto& ps = partition_stats[i];
+    if (!ps.row_start.IsValid()) {
+      // Defaulting to 0 would emit wrong rowids; route to CPU instead.
+      refuse("partition_stats[" + std::to_string(i) +
+             "].row_start is not valid; cannot synthesize rowids");
+      return md;
     }
-    handles.emplace_back(row_start, ps.partition_row_group);
+    handles.emplace_back(ps.row_start.GetIndex(), ps.partition_row_group);
   }
 
   // O(1) skip for non-projected columns in the GetColumnSegmentInfo loop.
@@ -427,6 +424,36 @@ duckdb_native_metadata walk_duckdb_native_metadata(
   compute_row_counts(md, partition_stats);
   compute_decoded_byte_budgets(md, projected_types);
   drop_empty_trailing_row_groups(md);
+
+  // Per-column varchar upper bound, cached on each row group so the
+  // partitioner is a pure read. Walker refuses any row group whose
+  // per-column upper bound hits the cudf int32 chars threshold (cudf
+  // throws there in default-mode make_offsets_child_column).
+  for (auto& rg : md.row_groups) {
+    rg.varchar_bytes_per_col.assign(projected_cols.size(), 0);
+    for (std::size_t ci = 0; ci < projected_cols.size(); ++ci) {
+      if (projected_cols[ci].is_rowid || !projected_types[ci].is_varchar()) { continue; }
+      std::size_t total = 0;
+      for (const auto& seg : rg.columns[ci].data_segments) {
+        total += static_cast<std::size_t>(seg.segment_count) *
+                 static_cast<std::size_t>(*seg.max_string_length);
+      }
+      if (total >= kCudfInt32StringsThreshold) {
+        refuse("row group " + std::to_string(rg.row_group_index) + " column " +
+               std::to_string(rg.columns[ci].column_id) + " varchar chars upper bound (" +
+               std::to_string(total) + ") >= cudf int32 chars threshold");
+        return md;
+      }
+      rg.varchar_bytes_per_col[ci] = total;
+    }
+  }
+
+  if (md.row_groups.empty()) {
+    // Zero splits would hang the pipeline on the FULL barrier; refuse so
+    // the transparent fallback routes to DuckDB CPU.
+    refuse("no row groups in table (empty or fully pruned)");
+    return md;
+  }
 
   md.viable = true;
   SIRIUS_LOG_DEBUG(

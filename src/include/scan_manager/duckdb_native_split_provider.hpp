@@ -25,7 +25,6 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
-#include <string>
 #include <vector>
 
 namespace sirius::io {

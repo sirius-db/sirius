@@ -18,6 +18,8 @@
 
 #include "helper/logical_type.hpp"
 
+#include <cudf/types.hpp>
+
 #include <duckdb/common/enums/compression_type.hpp>
 #include <duckdb/common/types.hpp>
 #include <duckdb/main/client_context.hpp>
@@ -26,6 +28,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -74,7 +77,23 @@ struct duckdb_row_group_metadata {
   /// Parallel to the walker's `projected_cols` argument.
   std::vector<duckdb_column_metadata> columns;
   std::size_t decoded_bytes_budget = 0;
+  /// Parallel to `columns`. For varchar columns: Σ(seg.segment_count ×
+  /// *seg.max_string_length) — the upper bound used against the cudf int32
+  /// chars threshold. 0 for non-varchar columns. Populated by the walker so
+  /// downstream partitioning never re-walks segments.
+  std::vector<std::size_t> varchar_bytes_per_col;
 };
+
+/// Default-mode cudf strings columns use int32 offsets;
+/// `make_offsets_child_column` throws `std::overflow_error` ("Size of output
+/// exceeds the column size limit") when total chars per strings column
+/// `>= std::numeric_limits<cudf::size_type>::max()` unless
+/// `LIBCUDF_LARGE_STRINGS_ENABLED` is set. Sirius does not opt in and its
+/// strings-decode kernels (`gpu_decode_strings.cu`) are hard-coded to
+/// int32 offsets, so the walker refuses any row group whose per-column
+/// varchar upper bound hits this threshold.
+constexpr std::size_t kCudfInt32StringsThreshold =
+  static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
 
 /// When `viable` is false the walker bailed at the first unsupported
 /// segment or type; `row_groups` is partial and must not be consumed.

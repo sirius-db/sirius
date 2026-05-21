@@ -39,6 +39,10 @@ class split_provider;
 
 namespace sirius::op::scan {
 
+/// DuckDB-native bind-data. Single-use: `make_provider()` moves the whole
+/// object into the split_provider's owned scan_info, leaving `storage` /
+/// `context` null on the source. A second call would trip the non-null
+/// preconditions in `duckdb_native_split_provider`'s ctor.
 struct duckdb_native_scan_info : public scan_info {
   duckdb::DataTable* storage     = nullptr;
   duckdb::ClientContext* context = nullptr;
@@ -48,6 +52,7 @@ struct duckdb_native_scan_info : public scan_info {
 
   std::string db_path;
 
+  /// Single call only — moves *this into the returned split_provider.
   std::unique_ptr<scan_manager::split_provider> make_provider(
     std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs) override;
 };
