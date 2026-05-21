@@ -446,11 +446,9 @@ TEST_CASE("gpu_decode_table RLE - count walk overflows row_count zero-fills",
 TEST_CASE("gpu_decode_table RLE - zero count with sum underflow zero-fills",
           "[scan][decode][rle][defensive]")
 {
-  // An interior zero count is malformed only when the running sum never
-  // reaches n_segment_rows by the end of the real-counts walk. Trailing
-  // zeros that appear AFTER the prefix-sum has already matched are slack
-  // and are absorbed by the match-vs-malformed reordering, not by the
-  // zero-count check.
+  // Interior zero count + sum never reaches n_segment_rows → malformed.
+  // (Zeros after the sum-match are slack — handled by match-over-malformed,
+  // not this check.)
   auto bytes = make_rle_block<int32_t>({1, 99, 2}, {10, 0, 5});  // sum = 15
 
   rmm::cuda_stream stream;
