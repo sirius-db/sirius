@@ -15,7 +15,7 @@
  */
 
 #include <catch.hpp>
-#include <io/duckdb_db_io_object.hpp>
+#include <io/duckdb_io_object.hpp>
 #include <unistd.h>
 
 #include <cstdio>
@@ -35,7 +35,7 @@ class scoped_tempfile {
   {
     // mkstemp mutates the template; std::string::data() is writable since C++17.
     std::string tmpl =
-      (std::filesystem::temp_directory_path() / "sirius_db_io_object_XXXXXX").string();
+      (std::filesystem::temp_directory_path() / "sirius_io_object_XXXXXX").string();
     int fd = ::mkstemp(tmpl.data());
     REQUIRE(fd >= 0);
     ::close(fd);
@@ -61,43 +61,42 @@ class scoped_tempfile {
 
 }  // namespace
 
-TEST_CASE("duckdb_db_io_object reports stat-derived size", "[io][duckdb_db_io_object]")
+TEST_CASE("duckdb_io_object reports stat-derived size", "[io][duckdb_io_object]")
 {
   scoped_tempfile tf{"0123456789"};
-  duckdb_db_io_object obj{tf.path()};
+  duckdb_io_object obj{tf.path()};
   // Cache id is the canonical form of the input path (resolves any symlinks
   // in the prefix, e.g. /tmp -> /private/tmp on some platforms).
   REQUIRE(obj.raw_file_cache_id() == std::filesystem::canonical(tf.path()).string());
   REQUIRE(obj.size() == 10);
 }
 
-TEST_CASE("duckdb_db_io_object canonicalizes equivalent path spellings to the same cache id",
-          "[io][duckdb_db_io_object]")
+TEST_CASE("duckdb_io_object canonicalizes equivalent path spellings to the same cache id",
+          "[io][duckdb_io_object]")
 {
   scoped_tempfile tf{"abcdef"};
   // Construct one from the path mkstemp returned and one with a redundant
   // /./ in the middle; canonical() must collapse both to the same string.
   std::string with_dot = std::filesystem::path(tf.path()).parent_path().string() + "/./" +
                          std::filesystem::path(tf.path()).filename().string();
-  duckdb_db_io_object a{tf.path()};
-  duckdb_db_io_object b{with_dot};
+  duckdb_io_object a{tf.path()};
+  duckdb_io_object b{with_dot};
   REQUIRE(a.raw_file_cache_id() == b.raw_file_cache_id());
 }
 
-TEST_CASE("duckdb_db_io_object handles empty file", "[io][duckdb_db_io_object]")
+TEST_CASE("duckdb_io_object handles empty file", "[io][duckdb_io_object]")
 {
   scoped_tempfile tf{""};
-  duckdb_db_io_object obj{tf.path()};
+  duckdb_io_object obj{tf.path()};
   REQUIRE(obj.size() == 0);
 }
 
-TEST_CASE("duckdb_db_io_object rejects empty path", "[io][duckdb_db_io_object]")
+TEST_CASE("duckdb_io_object rejects empty path", "[io][duckdb_io_object]")
 {
-  REQUIRE_THROWS_AS(duckdb_db_io_object{std::string{}}, std::invalid_argument);
+  REQUIRE_THROWS_AS(duckdb_io_object{std::string{}}, std::invalid_argument);
 }
 
-TEST_CASE("duckdb_db_io_object throws when file is missing", "[io][duckdb_db_io_object]")
+TEST_CASE("duckdb_io_object throws when file is missing", "[io][duckdb_io_object]")
 {
-  REQUIRE_THROWS_AS(duckdb_db_io_object{"/this/path/does/not/exist/sirius_test"},
-                    std::runtime_error);
+  REQUIRE_THROWS_AS(duckdb_io_object{"/this/path/does/not/exist/sirius_test"}, std::runtime_error);
 }

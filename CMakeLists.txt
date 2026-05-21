@@ -166,7 +166,7 @@ set(EXTENSION_SOURCES
     src/expression_executor/specializations/gpu_execute_reference.cpp
     src/io/admission_control.cpp
     src/io/datasource_factory.cpp
-    src/io/duckdb_db_io_object.cpp
+    src/io/duckdb_io_object.cpp
     src/io/io_context.cpp
     src/io/prefetching_cache.cpp
     src/io/s3/sigv4.cpp
@@ -394,7 +394,7 @@ set(TEST_SOURCES
     test/cpp/io/s3/test_sirius_sigv4_credential_provider.cpp
     test/cpp/io/s3/test_static_credentials.cpp
     test/cpp/io/test_datasource_factory.cpp
-    test/cpp/io/test_duckdb_db_io_object.cpp
+    test/cpp/io/test_duckdb_io_object.cpp
     test/cpp/io/test_uri_parser.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp

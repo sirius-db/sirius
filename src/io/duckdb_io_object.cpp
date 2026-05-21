@@ -14,20 +14,18 @@
  * limitations under the License.
  */
 
-#include "io/duckdb_db_io_object.hpp"
+#include "io/duckdb_io_object.hpp"
 
 #include <filesystem>
 #include <stdexcept>
-#include <utility>
 
 namespace sirius::io {
 
-duckdb_db_io_object::duckdb_db_io_object(std::string path) : _absolute_path(), _size_bytes(0)
+duckdb_io_object::duckdb_io_object(std::string const& path) : _absolute_path(), _size_bytes(0)
 {
-  if (path.empty()) { throw std::invalid_argument("duckdb_db_io_object: path must be non-empty"); }
-  // canonical() throws filesystem_error if the file doesn't exist or any
-  // intermediate symlink is broken; that's the right behavior for a cache
-  // key (won't dedupe a path we can't read).
+  if (path.empty()) { throw std::invalid_argument("duckdb_io_object: path must be non-empty"); }
+  // canonical() throws filesystem_error on missing / broken paths — correct
+  // for a cache key (don't dedupe what we can't read).
   auto const canonical = std::filesystem::canonical(path);
   _absolute_path       = canonical.string();
   _size_bytes          = std::filesystem::file_size(canonical);
