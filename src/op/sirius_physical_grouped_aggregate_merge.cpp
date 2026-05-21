@@ -145,7 +145,8 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next
   std::lock_guard<std::mutex> lg(lock);
   if (current_partition_index < ports.begin()->second->repo->num_partitions()) {
     std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
-    bool found_batch = true;
+    bool found_batch       = true;
+    auto this_partition_id = current_partition_index;
     while (found_batch) {
       auto batch = ports.begin()->second->repo->pop_next_data_batch(current_partition_index);
       if (batch) {
@@ -156,7 +157,11 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next
     }
     current_partition_index++;
     if (input_batch.empty()) { return nullptr; }
-    return std::make_unique<pipelineable_operator_data>(input_batch);
+    // Tag with the source partition index so the scheduler pins this task to
+    // partition_idx % num_gpus. merge_group_by materializes a cuco hash table
+    // to combine its input batches, so — like hash_join — every task of a
+    // given partition must stay on a single GPU.
+    return std::make_unique<partitioned_operator_data>(std::move(input_batch), this_partition_id);
   } else {
     return nullptr;
   }
@@ -259,7 +264,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   }
 
   auto output_table = std::make_unique<cudf::table>(std::move(output_cols), stream, mr);
-  auto result       = sirius::make_data_batch(std::move(output_table), *space);
+  auto result       = sirius::make_data_batch(std::move(output_table), *space, stream);
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<::cucascade::data_batch>>{result});
 }

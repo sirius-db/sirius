@@ -360,12 +360,12 @@ TEST_CASE("GPU pipeline executor reschedules tasks on OOM", "[gpu_pipeline_execu
 
   f.executor->start();
 
-  // Thread that responds to task requests from the executor's manager_loop.
+  // Post-v1.0 push-model (commit 90dc104): gpu_pipeline_executor no longer publishes
+  // task_requests. Schedule tasks directly onto the executor instead of waiting on
+  // f.request_channel.get(). The request_channel is kept wired to preserve the
+  // fixture API but is not used at runtime.
   std::thread request_handler([&]() {
     while (dispatched.load(std::memory_order_relaxed) < num_tasks) {
-      auto request = f.request_channel.get();
-      if (!request) { break; }
-
       auto local_state = std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(
         std::make_unique<sirius::op::pipelineable_operator_data>(
           std::vector<std::shared_ptr<cucascade::data_batch>>{}));
@@ -375,14 +375,6 @@ TEST_CASE("GPU pipeline executor reschedules tasks on OOM", "[gpu_pipeline_execu
         global_state);
       f.executor->schedule(std::move(task));
       dispatched.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    // Keep consuming task requests for rescheduled tasks until completion.
-    // Rescheduled tasks are already in the executor's queue — we just drain
-    // the request channel to prevent the manager_loop from blocking.
-    while (global_state->completed_count.load(std::memory_order_relaxed) < num_tasks) {
-      auto request = f.request_channel.get();
-      if (!request) { break; }
     }
   });
 
@@ -459,15 +451,11 @@ TEST_CASE("GPU pipeline executor fails after max OOM retries",
 
   f.executor->start();
 
-  // Request handler thread: creates and schedules tasks as the manager_loop
-  // requests them. First num_small requests become small_tasks, the rest xl_tasks.
-  // After all initial tasks are dispatched, keep draining the request channel
-  // so the manager_loop doesn't block when rescheduled XL tasks re-enter the queue.
+  // Post-v1.0 push-model (commit 90dc104): schedule tasks directly instead of
+  // waiting on request_channel.get(). First num_small tasks become small_tasks,
+  // the rest xl_tasks.
   std::thread request_handler([&]() {
     while (dispatched.load(std::memory_order_relaxed) < num_tasks) {
-      auto request = f.request_channel.get();
-      if (!request) { break; }
-
       auto id          = static_cast<uint64_t>(dispatched.load(std::memory_order_relaxed));
       auto local_state = std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(
         std::make_unique<sirius::op::pipelineable_operator_data>(
@@ -481,13 +469,6 @@ TEST_CASE("GPU pipeline executor fails after max OOM retries",
       }
       f.executor->schedule(std::move(task));
       dispatched.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    // Keep draining task requests so rescheduled XL tasks can proceed through
-    // the manager_loop until the completion handler signals an error.
-    while (!f.completion.has_error()) {
-      auto request = f.request_channel.try_get();
-      if (!request) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
     }
   });
 

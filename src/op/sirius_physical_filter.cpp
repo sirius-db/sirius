@@ -56,7 +56,7 @@ std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_da
     auto filtered_table = gpu_expression_executor.select(
       batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
     output_batches.push_back(
-      sirius::make_data_batch(std::move(filtered_table), *batch.get_memory_space()));
+      sirius::make_data_batch(std::move(filtered_table), *batch.get_memory_space(), stream));
   }
   return std::make_unique<pipelineable_operator_data>(output_batches);
 }

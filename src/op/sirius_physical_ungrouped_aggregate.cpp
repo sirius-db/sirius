@@ -432,9 +432,13 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
     }
 
     auto out_table = std::make_unique<cudf::table>(std::move(cols), stream);
-    std::unique_ptr<cucascade::idata_representation> output_data =
-      std::make_unique<cucascade::gpu_table_representation>(std::move(out_table), *space);
-    auto const batch_id = ::sirius::get_next_batch_id();
+    // STREAM-LINEAGE: cudf::table ctor + cudf::make_column_from_scalar wrote
+    // on `stream`; the constructor records the writer event for downstream
+    // cross-device readers.
+    auto out_repr =
+      std::make_unique<cucascade::gpu_table_representation>(std::move(out_table), *space, stream);
+    std::unique_ptr<cucascade::idata_representation> output_data = std::move(out_repr);
+    auto const batch_id                                          = ::sirius::get_next_batch_id();
     outputs.push_back(std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data)));
   }
 
@@ -532,10 +536,14 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
 
   auto out_table = std::make_unique<cudf::table>(
     std::move(output_cols), stream, cudf::get_current_device_resource_ref());
-  std::unique_ptr<cucascade::idata_representation> output_data =
-    std::make_unique<cucascade::gpu_table_representation>(std::move(out_table), *space);
-  auto const batch_id = ::sirius::get_next_batch_id();
-  auto output_batch   = std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data));
+  // STREAM-LINEAGE: cudf::table ctor + make_avg_column write on `stream`;
+  // the constructor records the writer event for downstream cross-device
+  // readers.
+  auto out_repr =
+    std::make_unique<cucascade::gpu_table_representation>(std::move(out_table), *space, stream);
+  std::unique_ptr<cucascade::idata_representation> output_data = std::move(out_repr);
+  auto const batch_id                                          = ::sirius::get_next_batch_id();
+  auto output_batch = std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data));
 
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(output_batch)});

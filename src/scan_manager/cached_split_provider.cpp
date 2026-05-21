@@ -17,15 +17,19 @@
 #include "scan_manager/cached_split_provider.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "data/sirius_converter_registry.hpp"
 #include "op/scan/parquet_scan_operator_data.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/table/table_view.hpp>
 
+#include <cuda_runtime.h>
+
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/data/representation_converter.hpp>
 
 #include <span>
 #include <stdexcept>
@@ -37,10 +41,10 @@ namespace sirius::scan_manager {
 
 cached_split_provider::cached_split_provider(
   std::vector<std::vector<std::shared_ptr<cudf::column>>> columns_per_request,
-  cucascade::memory::memory_space& memory_space,
+  std::vector<cucascade::memory::memory_space*> chunk_memory_spaces,
   std::shared_ptr<duckdb::Expression> filter_expression,
   std::shared_ptr<op::scan::scan_plan const> plan)
-  : _memory_space(&memory_space),
+  : _chunk_memory_spaces(std::move(chunk_memory_spaces)),
     _filter_expression(std::move(filter_expression)),
     _plan(std::move(plan))
 {
@@ -72,13 +76,20 @@ cached_split_provider::cached_split_provider(
   std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
   std::vector<std::size_t> column_indices,
   cucascade::memory::memory_space& memory_space,
+  std::unordered_map<int, cucascade::memory::memory_space*> gpu_memory_spaces,
   std::shared_ptr<duckdb::Expression> filter_expression,
   std::shared_ptr<op::scan::scan_plan const> plan)
   : _column_indices(std::move(column_indices)),
     _memory_space(&memory_space),
+    _gpu_memory_spaces(std::move(gpu_memory_spaces)),
     _filter_expression(std::move(filter_expression)),
     _plan(std::move(plan))
 {
+  if (_gpu_memory_spaces.empty()) {
+    throw std::runtime_error(
+      "[cached_split_provider] HOST-tier constructor requires non-empty gpu_memory_spaces "
+      "so produce_split can convert host chunks to the executing GPU's space");
+  }
   _batches.reserve(host_chunks.size());
   for (auto& chunk : host_chunks) {
     if (!chunk) {
@@ -109,7 +120,7 @@ std::vector<std::unique_ptr<op::operator_data>> cached_split_provider::produce_s
   std::size_t batch_idx)
 {
   auto batch = std::visit(
-    [this](auto& chunk) -> std::shared_ptr<cucascade::data_batch> {
+    [this, batch_idx](auto& chunk) -> std::shared_ptr<cucascade::data_batch> {
       using T = std::decay_t<decltype(chunk)>;
       if constexpr (std::is_same_v<T, gpu_chunk>) {
         std::vector<cudf::column_view> col_views;
@@ -119,23 +130,48 @@ std::vector<std::unique_ptr<op::operator_data>> cached_split_provider::produce_s
           col_views.emplace_back(col_ptr->view());
           alloc_size += col_ptr->alloc_size();
         }
-        // The shared_ptr<column> entries in `chunk` keep the underlying
-        // device buffers alive; we move them into the gpu_table_representation
-        // as its owner so the table_view's pointers stay valid for the
-        // lifetime of the emitted data_batch. Each chunk index is claimed
-        // exactly once, so moving from the variant alternative is safe.
         cudf::table_view view(col_views);
+        auto* chunk_space =
+          !_chunk_memory_spaces.empty() ? _chunk_memory_spaces.at(batch_idx) : _memory_space;
         auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
-          view, std::move(chunk), alloc_size, *_memory_space);
+          view, std::move(chunk), alloc_size, *chunk_space, rmm::cuda_stream_view{});
         return std::make_shared<cucascade::data_batch>(::sirius::get_next_batch_id(),
                                                        std::move(gpu_repr));
       } else if constexpr (std::is_same_v<T, host_chunk>) {
-        // HOST tier: each chunk holds the full pinned table; slice down to the
-        // columns the scan actually wants. Conversion back to GPU happens later
-        // in scan_cached_operator_data::prepare_for_processing.
+        // Slice the host_data_representation down to only the columns the scan
+        // requests, then materialize on the executing GPU. The conversion is
+        // eager (vs returning a HOST batch and letting the scan operator
+        // convert) so downstream consumers — sirius_gpu_parquet_scan_operator,
+        // assemble_scan_output, expression executor — only ever see GPU
+        // batches and can stay tier-agnostic.
         auto sliced = chunk->slice(std::span<const std::size_t>(_column_indices));
+
+        int current_device = -1;
+        auto cuda_err      = cudaGetDevice(&current_device);
+        if (cuda_err != cudaSuccess) {
+          throw std::runtime_error(
+            std::string("[cached_split_provider] cudaGetDevice failed during host->gpu "
+                        "conversion: ") +
+            cudaGetErrorString(cuda_err));
+        }
+        auto gpu_it = _gpu_memory_spaces.find(current_device);
+        if (gpu_it == _gpu_memory_spaces.end() || gpu_it->second == nullptr) {
+          throw std::runtime_error(
+            "[cached_split_provider] no GPU memory_space registered for device " +
+            std::to_string(current_device) +
+            " — pin_table(tier='host') cached scan cannot materialize chunk on this GPU");
+        }
+        auto* target_gpu_space = gpu_it->second;
+        auto stream            = target_gpu_space->acquire_stream();
+        auto& registry         = ::sirius::converter_registry::get();
+        auto gpu_repr =
+          registry.convert<cucascade::gpu_table_representation>(*sliced, target_gpu_space, stream);
+        // Sync before sliced/source goes out of scope so the H->D copies
+        // captured on the converter's stream complete before any host pages
+        // (still referenced by sliced) potentially move.
+        stream.synchronize();
         return std::make_shared<cucascade::data_batch>(::sirius::get_next_batch_id(),
-                                                       std::move(sliced));
+                                                       std::move(gpu_repr));
       }
     },
     _batches[batch_idx]);

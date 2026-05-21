@@ -56,6 +56,7 @@
 
 #include <cucascade/data/data_repository_manager.hpp>
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace sirius {
@@ -164,6 +165,22 @@ void sirius_engine::execute()
     sirius_ctx->get_task_scheduler().drain_after_error();
     throw;
   }
+  // Success path: drain task_creator + executors before returning.
+  // mark_completed() signals the future as soon as the result_collector
+  // pipeline finishes, but other pipelines may still be notifying downstream
+  // consumers (which push task_creation_requests referencing operator
+  // pointers in this engine). Once execute() returns, the engine is
+  // destroyed via sirius_active_query.reset() in cleanup_internal; any
+  // request popped after that point hits a use-after-free in
+  // task_creator::get_operator_for_next_task. Reproduces under multi-thread
+  // sort with many partitions (test "gpu_execution - order by multipartition")
+  // and across consecutive integration tests that share a SiriusContext.
+  // drain_after_error() interrupts + restarts task_creator and every executor,
+  // so leftover dispatch state from this query cannot bleed into the next.
+  // The pairing of stop_thread_pool() + start_thread_pool() now re-arms
+  // _task_creation_queue (see start_thread_pool: reactivate()), so the next
+  // query can enqueue requests cleanly.
+  sirius_ctx->get_task_scheduler().drain_after_error();
 
   // All tasks completed — operators and pipelines are still alive here.
   // Warn about any intermediate operators that were never finalized.
@@ -186,7 +203,22 @@ duckdb::unique_ptr<op::sirius_physical_operator> sirius_engine::construct_sirius
 {
   if (op->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
     auto& scan_physical_op = op->Cast<op::sirius_physical_table_scan>();
-    if (scan_physical_op.function.name == "iceberg_scan") {
+    if (scan_physical_op.function.name == "parquet_scan" ||
+        scan_physical_op.function.name == "read_parquet") {
+      // Gather the configured GPU device ids so the parquet-scan op can build
+      // one translated filter tree per GPU (scalars end up on the right device
+      // for each task's dispatch target). Falls back to the current device if
+      // SiriusContext is not yet registered.
+      std::vector<int> gpu_device_ids;
+      auto ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+      if (ctx != nullptr) {
+        for (auto const& kv : ctx->get_gpu_ioctxs()) {
+          gpu_device_ids.push_back(kv.first);
+        }
+      }
+      return duckdb::make_uniq<op::sirius_physical_parquet_scan>(&scan_physical_op,
+                                                                 std::move(gpu_device_ids));
+    } else if (scan_physical_op.function.name == "iceberg_scan") {
       return construct_iceberg_scan_operator(scan_physical_op);
     } else if (scan_physical_op.function.name == "seq_scan") {
       return duckdb::make_uniq<op::sirius_physical_duckdb_scan>(&scan_physical_op);
@@ -296,7 +328,22 @@ void sirius_engine::prefetch_iceberg_delete_data(op::sirius_physical_operator& p
   }
 
   duckdb::SiriusContext::InternalQueryGuard guard(*sirius_ctx);
-  auto data = op::scan::read_iceberg_delete_data(context, table_path, snapshot_id);
+
+  // Iceberg metadata reads use a single GPU's sirius_ioctx (planning-time /
+  // pre-execution; not on the multi-GPU column-chunk hot path). Multi-GPU
+  // residency for iceberg metadata is deferred.
+  auto const& gpu_ioctxs = sirius_ctx->get_gpu_ioctxs();
+  if (gpu_ioctxs.empty()) {
+    throw std::runtime_error(
+      "[sirius_engine] read_iceberg_delete_data: SiriusContext has no GPU sirius_ioctxs "
+      "(kvikio path is forbidden).");
+  }
+  // Pick the lowest-numbered GPU id (deterministic ordering — get_gpu_ioctxs
+  // returns an unordered_map, so use std::min_element rather than .begin()).
+  auto lowest = std::min_element(gpu_ioctxs.begin(),
+                                 gpu_ioctxs.end(),
+                                 [](auto const& a, auto const& b) { return a.first < b.first; });
+  auto data = op::scan::read_iceberg_delete_data(context, table_path, lowest->second, snapshot_id);
   iceberg_delete_data_cache_.emplace(table_path, std::move(data));
 }
 
@@ -316,6 +363,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   pipeline::pipeline_build_context build_ctx;
   build_ctx.preserve_insertion_order =
     duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context);
+  build_ctx.num_gpus = static_cast<int>(sirius_ctx_ptr->get_config().get_hw_topology().gpus.size());
 
   // Build meta-pipeline tree from operator plan
   pipeline::sirius_pipeline_build_state state;

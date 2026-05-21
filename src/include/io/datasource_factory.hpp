@@ -122,19 +122,19 @@ class datasource_factory {
   /**
    * @brief Create a @c cudf::io::datasource for @p uri.
    *
-   * Dispatch:
+   * Dispatch (kvikio-free invariant):
+   *   - Every URI scheme MUST resolve through the registry to a registered
+   *     @c sirius_ioctx whose @c make_datasource builds a @c sirius_datasource.
+   *     The factory NEVER falls back to cudf's bundled @c file_source factory
+   *     (kvikio-backed) — that path is forbidden because kvikio's per-FileHandle
+   *     CUDA-context binding breaks multi-GPU residency.
    *   - Local file paths (@c "/data/foo.parquet", @c "file:///data/foo.parquet")
-   *     return cudf's default datasource (@c cudf::io::datasource::create) —
-   *     pre-PR3 baseline. The registry is not consulted for file scheme.
-   *   - Object-store schemes (@c s3://, etc.) first go through the registry
-   *     lookup. In PR1, a registered object-store scheme still throws
-   *     "object construction is not yet implemented"; the backend PR that owns
-   *     the concrete @c sirius_io_object wires the final construction step.
-   *
-   * The wider return type is deliberate: it lets the file branch keep using
-   * cudf's proven default reader without forcing a sirius-specific adapter,
-   * which sidesteps regression risk on the local-parquet hot path until a
-   * GDS-aware backend (PR6) makes the switch worthwhile.
+   *     route through @c kFileScheme, which is registered in
+   *     @c SiriusContext::initialize() with a uring-backed @c sirius_ioctx.
+   *   - Object-store schemes (@c s3://, etc.) require their backend to register
+   *     a @c sirius_ioctx for that scheme at startup. If no ioctx is registered,
+   *     the factory throws "kvikio path is forbidden" rather than silently
+   *     falling back.
    *
    * @param uri      The resource URI (e.g. @c "/data/file.parquet",
    *                 @c "file:///data/file.parquet", @c "s3://bucket/key").
@@ -158,14 +158,13 @@ class datasource_factory {
    *        bare relative path rather than a normalized URI.
    *
    * Dispatch:
-   *   - Relative bare path (no leading @c '/' and no @c "://"): bypass the
-   *     factory and return cudf's default datasource directly. This matches
-   *     the pre-PR3 baseline; it covers iceberg / hive test fixtures that
-   *     hand out paths like @c "test/cpp/integration/data/...parquet".
-   *   - Anything else (absolute path, @c file:///..., @c s3://..., future
-   *     object-store schemes): delegate to the strict @c create above. The
-   *     parser accepts these and routes file scheme to cudf default, object
-   *     stores to the registered @c sirius_ioctx.
+   *   - Relative bare path (no leading @c '/' and no @c "://"): normalized to
+   *     @c file:///<absolute> via @c std::filesystem::absolute() and dispatched
+   *     through @c create. Covers iceberg / hive test fixtures that hand out
+   *     paths like @c "test/cpp/integration/data/...parquet".
+   *   - Anything else (absolute path, @c file:///..., @c s3://..., object-store
+   *     schemes): delegate to the strict @c create above. Every path resolves
+   *     through the registry to a @c sirius_ioctx — no kvikio fallback.
    *
    * The strict @c create keeps its parser-strict contract — prefer it for
    * callers that should reject unscheme'd input as a real bug.

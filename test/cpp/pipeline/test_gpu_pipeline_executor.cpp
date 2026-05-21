@@ -139,7 +139,12 @@ class sirius_pipeline_task : public sirius::pipeline::gpu_pipeline_task {
 
 }  // namespace
 
-TEST_CASE("GPU pipeline executor uses task requests to schedule GPU tasks",
+// Post-v1.0 push-model: tasks are pushed directly to the executor (see commit 90dc104 —
+// management_eventloop now pops tasks from _task_queue and routes by preferred_device_id;
+// gpu_pipeline_executor no longer publishes task_requests on a pull channel). The test
+// keeps the request_channel wiring to validate executor construction, but schedules
+// tasks directly instead of waiting on `request_channel.get()`.
+TEST_CASE("GPU pipeline executor schedules GPU tasks directly (push-model)",
           "[gpu_pipeline_executor]")
 {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
@@ -182,10 +187,9 @@ TEST_CASE("GPU pipeline executor uses task requests to schedule GPU tasks",
   executor.start();
 
   std::thread request_handler([&]() {
+    // Push-model: schedule tasks directly onto the executor. The executor's
+    // manager_loop handles capacity/reservation internally (bounded_pool->reserve()).
     while (dispatched.load(std::memory_order_relaxed) < num_tasks) {
-      auto request = request_channel.get();
-      if (!request) { break; }
-
       auto local_state = std::make_unique<test_gpu_pipeline_task_local_state>(
         std::make_unique<sirius::op::pipelineable_operator_data>(
           std::vector<std::shared_ptr<cucascade::data_batch>>{}));

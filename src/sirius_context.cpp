@@ -23,6 +23,7 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "log/logging.hpp"
+#include "memory/numa_small_pinned_mr.hpp"
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
@@ -31,22 +32,29 @@
 
 #include <cudf/utilities/pinned_memory.hpp>
 
+#include <rmm/cuda_device.hpp>
+
 #include <cuda_runtime_api.h>
 
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 #include <duckdb/common/allocator.hpp>
 #include <duckdb/execution/physical_plan_generator.hpp>
+#include <io/types.hpp>
+#include <io/uring/uring_ioctx.hpp>
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdlib>  // for std::getenv
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace duckdb {
 
@@ -148,7 +156,7 @@ void SiriusContext::QueryBegin(ClientContext& context)
     sirius::op::sirius_physical_operator::next_operator_id.store(0);
 
     auto query = context.GetCurrentQuery();
-    spdlog::info("QueryBegin: {}", query.substr(0, std::min(query.size(), size_t(120))));
+    SIRIUS_LOG_INFO("QueryBegin: {}", query.substr(0, std::min(query.size(), size_t(120))));
     bool query_cache_hit = false;
     if (config_.is_scan_caching_enabled()) {
       query_cache_hit = task_scheduler_->get_scan_executor().cache_scan_results_for_query(query);
@@ -169,7 +177,7 @@ void SiriusContext::QueryEnd()
   if (is_internal_query_active()) { return; }
 
   try {
-    spdlog::info("QueryEnd");
+    SIRIUS_LOG_INFO("QueryEnd");
     captured_logical_plan_.reset();
 
     query_.reset();
@@ -185,7 +193,7 @@ void SiriusContext::QueryEnd()
     if (data_repository_manager_) {
       auto leaked = data_repository_manager_->clear_all_repositories();
       for (auto const& info : leaked) {
-        spdlog::warn(
+        SIRIUS_LOG_WARN(
           "SiriusContext::QueryEnd: operator {} port '{}' still had {} un-consumed "
           "data batch(es) (memory leak).",
           info.operator_id,
@@ -208,6 +216,14 @@ void SiriusContext::QueryEnd()
     throw;
   }
 
+  // Drop per-query global states held by task_creator. These include
+  // duckdb_scan_task_global_state, which transitively owns a
+  // duckdb::DuckTableScanState referencing BufferManager-owned BlockHandles.
+  // If we leave this state alive past QueryEnd, ~task_creator at SiriusContext
+  // teardown ends up releasing those BlockHandles after parts of DuckDB's
+  // DatabaseInstance have already been torn down (~DBConfig fires ~SiriusContext
+  // mid-DB destruction), which SIGSEGVs in ~BlockMemory.
+  if (task_creator_) { task_creator_->reset(/*keep_parquet_metadata=*/true); }
   release_query_lifecycle_slot();
 }
 
@@ -229,6 +245,25 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 
   config_ = config;
 
+  // Validate the cached topology before any downstream construction so a stub
+  // topology fails loudly rather than producing zero-GPU executors silently.
+  // get_hw_topology() is the only authorised source of GPU/NUMA counts —
+  // never call raw CUDA/NUMA device-enumeration APIs directly elsewhere.
+  auto const& topo = config_.get_hw_topology();
+  if (topo.num_gpus == 0) {
+    throw std::runtime_error(
+      "SiriusContext::initialize: cucascade::topology_discovery reported 0 GPUs — "
+      "refusing to initialize on stub topology.");
+  }
+  SIRIUS_LOG_INFO("SiriusContext: topology summary — {} GPU(s), {} NUMA node(s), host='{}'",
+                  topo.num_gpus,
+                  topo.num_numa_nodes,
+                  topo.hostname);
+  for (auto const& gpu : topo.gpus) {
+    SIRIUS_LOG_INFO(
+      "  GPU {}: {} (numa={}, pci={})", gpu.id, gpu.name, gpu.numa_node, gpu.pci_bus_id);
+  }
+
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
     config_.get_memory_space_configs());
 
@@ -242,6 +277,174 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     }
   }
 
+  // Verify cucascade built one host memory space per NUMA node. Warn rather
+  // than throw — non-NUMA CI hosts legitimately report num_numa_nodes == 0.
+  {
+    auto const mgpu05_host_spaces =
+      memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+    SIRIUS_LOG_INFO("SiriusContext: {} host memory space(s) created for {} NUMA node(s)",
+                    mgpu05_host_spaces.size(),
+                    topo.num_numa_nodes);
+    if (topo.num_numa_nodes > 0 &&
+        mgpu05_host_spaces.size() != static_cast<size_t>(topo.num_numa_nodes)) {
+      SIRIUS_LOG_WARN(
+        "SiriusContext: host space count ({}) != NUMA node count ({}) — "
+        "expected one host space per NUMA domain. Check "
+        "sirius_config apply_defaults (.use_host_per_numa()) or YAML host "
+        "configuration.",
+        mgpu05_host_spaces.size(),
+        topo.num_numa_nodes);
+    }
+  }
+
+  // One sirius_ioctx per NUMA node hosting managed GPUs. A single ioctx
+  // already serves multiple GPUs correctly (device_read_req carries device_id +
+  // stream; reactor switches device before cudaMemcpyAsync) — going per-GPU
+  // multiplied reactor worker threads and oversubscribed the NVMe driver.
+  // Build steps per node:
+  //   1. choose an anchor device (lowest-numbered GPU on the node) to set
+  //      current CUDA device for ioctx ctor + cudaHostRegister
+  //   2. construct uring_ioctx with numa_node passed in so bounce slots
+  //      land on the right NUMA domain
+  //   3. fan numa_ioctxs_[node] out into gpu_ioctxs_[dev] for every GPU on
+  //      that node, aliasing the shared_ptr
+  {
+    auto gpu_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+
+    // Group GPUs by normalized NUMA node id (-1 -> 0 to match task_creator
+    // and host_space construction conventions).
+    std::unordered_map<int, std::vector<int>> node_to_devices;
+    for (auto* gpu_space : gpu_spaces) {
+      auto const device_id = gpu_space->get_device_id();
+      int raw_numa         = -1;
+      if (device_id >= 0 && static_cast<unsigned>(device_id) < topo.gpus.size()) {
+        raw_numa = topo.gpus[device_id].numa_node;
+      }
+      int const node             = (raw_numa < 0) ? 0 : raw_numa;
+      device_to_numa_[device_id] = node;
+      node_to_devices[node].push_back(device_id);
+    }
+
+    numa_ioctxs_.reserve(node_to_devices.size());
+    gpu_ioctxs_.reserve(gpu_spaces.size());
+    for (auto& [node, devices] : node_to_devices) {
+      std::sort(devices.begin(), devices.end());
+      int const anchor_device = devices.front();
+      rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{anchor_device}};
+
+      // Scale reactor pool with the number of GPUs the node serves so we
+      // keep parallelism without exploding worker-thread count on hosts
+      // with many GPUs per node. Clamped at [4, 16] — matches the historic
+      // per-GPU default of 4 reactors as a floor.
+      size_t const n_reactors = std::clamp<size_t>(4 * devices.size(), 4, 16);
+
+      auto ioctx = std::make_shared<sirius::io::uring_ioctx>(
+        /*host_ring_depth=*/16u,
+        /*ring_entries=*/64u,
+        /*n_reactors=*/n_reactors,
+        /*bounce_slot_size=*/sirius::io::CHUNK_SIZE,
+        /*numa_node=*/node);
+
+      int readback = -1;
+      cudaGetDevice(&readback);
+      std::string devices_str;
+      for (size_t i = 0; i < devices.size(); ++i) {
+        if (i > 0) devices_str.push_back(',');
+        devices_str += std::to_string(devices[i]);
+      }
+      SIRIUS_LOG_INFO(
+        "SiriusContext: sirius_ioctx created for NUMA node {} (anchor GPU {}, devices=[{}], "
+        "n_reactors={}, cudaGetDevice readback={})",
+        node,
+        anchor_device,
+        devices_str,
+        n_reactors,
+        readback);
+
+      numa_ioctxs_.emplace(node, ioctx);
+      for (int dev : devices) {
+        gpu_ioctxs_.emplace(dev, ioctx);  // alias the per-node shared_ptr
+      }
+    }
+  }
+
+  // Register kFileScheme as a fallback for callers that don't pick a GPU
+  // explicitly. The registry stores ONE entry per scheme; per-GPU selection
+  // happens via get_ioctx_for(device_id). Lowest-numbered GPU is an arbitrary
+  // but stable choice — production callers all pass an explicit per-GPU ioctx.
+  if (!gpu_ioctxs_.empty()) {
+    // Match the spelling of `kFileScheme` from datasource_factory.cpp
+    // verbatim (anonymous namespace constant).
+    static constexpr std::string_view kFileScheme = "file";
+    auto lowest_gpu =
+      std::min_element(gpu_ioctxs_.begin(), gpu_ioctxs_.end(), [](auto const& a, auto const& b) {
+        return a.first < b.first;
+      });
+    datasource_registry_.register_ioctx(std::string{kFileScheme}, lowest_gpu->second);
+    SIRIUS_LOG_INFO(
+      "SiriusContext: registered kFileScheme -> sirius_ioctx for GPU {} (datasource_registry_)",
+      lowest_gpu->first);
+  } else {
+    throw std::runtime_error(
+      "SiriusContext::initialize: cannot register kFileScheme; no per-GPU sirius_ioctx exists "
+      "(gpu_ioctxs_.empty()). Per-GPU ioctx setup must have produced at least one ioctx.");
+  }
+
+  // Enable P2P peer access for every available GPU pair.
+  // cucascade::convert_gpu_to_gpu calls cudaMemcpyPeerAsync on every GPU->GPU
+  // conversion. For that call to bypass host staging, peer access must be
+  // enabled ONCE at init for every (src, dst) pair the host supports.
+  // Non-fatal failure mode: SIRIUS_LOG_ERROR and continue — host-staged fallback
+  // in cucascade's converter is a correct alternate path.
+  {
+    auto const& mgpu06_topo = config_.get_hw_topology();
+    if (mgpu06_topo.num_gpus >= 2) {
+      peer_access_enabled_pairs_.reserve(static_cast<size_t>(mgpu06_topo.num_gpus) *
+                                         (mgpu06_topo.num_gpus - 1));
+      for (unsigned i = 0; i < mgpu06_topo.num_gpus; ++i) {
+        rmm::cuda_set_device_raii guard_i{rmm::cuda_device_id{static_cast<int>(i)}};
+        for (unsigned j = 0; j < mgpu06_topo.num_gpus; ++j) {
+          if (i == j) continue;
+          int can_access = 0;
+          cudaError_t probe_err =
+            cudaDeviceCanAccessPeer(&can_access, static_cast<int>(i), static_cast<int>(j));
+          if (probe_err != cudaSuccess) {
+            SIRIUS_LOG_ERROR("SiriusContext: cudaDeviceCanAccessPeer({},{}) failed: {}",
+                             i,
+                             j,
+                             cudaGetErrorString(probe_err));
+            continue;
+          }
+          if (can_access == 0) {
+            SIRIUS_LOG_INFO(
+              "SiriusContext: no P2P access {} -> {} -- falling back to host staging", i, j);
+            continue;
+          }
+          cudaError_t enable_err = cudaDeviceEnablePeerAccess(static_cast<int>(j), 0);
+          // Always consume sticky error state — cudaErrorPeerAccessAlreadyEnabled
+          // (and any other non-fatal condition) persists in the runtime until
+          // cudaGetLastError() is called, which would make the NEXT CUDA API
+          // call fail spuriously in unrelated code (e.g., thrust::exclusive_scan).
+          (void)cudaGetLastError();
+          if (enable_err == cudaSuccess || enable_err == cudaErrorPeerAccessAlreadyEnabled) {
+            peer_access_enabled_pairs_.emplace(static_cast<int>(i), static_cast<int>(j));
+            SIRIUS_LOG_INFO("SiriusContext: P2P enabled {} -> {}", i, j);
+          } else {
+            SIRIUS_LOG_ERROR("SiriusContext: cudaDeviceEnablePeerAccess({}) from ctx {} failed: {}",
+                             j,
+                             i,
+                             cudaGetErrorString(enable_err));
+          }
+        }
+      }
+    } else {
+      SIRIUS_LOG_INFO(
+        "SiriusContext: skipping peer-access enable loop (num_gpus={}); "
+        "single-GPU host has no pairs to enable",
+        mgpu06_topo.num_gpus);
+    }
+  }
+
   // Configure cuDF to use our pinned slab allocator for small internal host buffers
   // (e.g. column_device_view metadata arrays in cudf::concatenate).  This eliminates
   // the pageable H2D transfers that cuDF issues by default.
@@ -251,9 +454,24 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     if (!host_spaces.empty()) {
       host_fsmr = host_spaces[0]
                     ->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
-      if (host_fsmr != nullptr) {
-        small_pinned_allocator_ =
-          std::make_unique<cucascade::memory::small_pinned_host_memory_resource>(*host_fsmr);
+      std::unordered_map<int, std::unique_ptr<cucascade::memory::small_pinned_host_memory_resource>>
+        per_node_pools;
+      int fallback_node = -1;
+      for (auto* host_space : host_spaces) {
+        auto* fsmr =
+          host_space->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
+        if (fsmr == nullptr) { continue; }
+        int raw_numa = host_space->get_device_id();
+        int node     = (raw_numa < 0) ? 0 : raw_numa;
+        if (fallback_node < 0) { fallback_node = node; }
+        per_node_pools.emplace(
+          node, std::make_unique<cucascade::memory::small_pinned_host_memory_resource>(*fsmr));
+      }
+      if (!per_node_pools.empty()) {
+        if (fallback_node < 0) { fallback_node = per_node_pools.begin()->first; }
+        std::unordered_map<int, int> device_to_numa_copy = device_to_numa_;
+        small_pinned_allocator_ = std::make_unique<sirius::memory::numa_small_pinned_mr>(
+          std::move(per_node_pools), std::move(device_to_numa_copy), fallback_node);
         small_pinned_allocator_view_.emplace(
           sirius::memory::make_host_device_resource_view_checked(small_pinned_allocator_.get()));
         prev_pinned_threshold_ = cudf::get_allocate_host_as_pinned_threshold();
@@ -261,8 +479,11 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
           rmm::host_device_async_resource_ref{*small_pinned_allocator_view_});
         cudf::set_allocate_host_as_pinned_threshold(
           cucascade::memory::small_pinned_host_memory_resource::MAX_SLAB_SIZE);
-        spdlog::info("SiriusContext: cuDF pinned memory resource configured (max slab {} B)",
-                     cucascade::memory::small_pinned_host_memory_resource::MAX_SLAB_SIZE);
+        SIRIUS_LOG_INFO(
+          "SiriusContext: cuDF pinned memory resource configured (NUMA-aware, max slab {} B, "
+          "fallback node={})",
+          cucascade::memory::small_pinned_host_memory_resource::MAX_SLAB_SIZE,
+          fallback_node);
       }
     } else {
       throw std::runtime_error(
@@ -277,10 +498,27 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // Create one downgrade executor per GPU memory space BEFORE task_scheduler,
   // so pointers are available for injection into gpu_pipeline_executors.
   // HOST->DISK downgrade is not yet implemented, so we skip HOST tier for now.
+  //
+  // Per-GPU NUMA-aware downgrade (re-authored from v1.0 dd86dd0 onto dev PR #579 shape):
+  // each GPU's downgrade_executor gets its own copy of downgrade_executor_config with
+  // preferred_numa_node populated from hw_topology().gpus[device_id].numa_node. The config
+  // copy flows into downgrade_task via processing_loop so GPU->HOST dispatch prefers the
+  // NUMA-local host memory_space via cucascade's
+  // any_memory_space_in_tier_with_preference strategy.
   auto create_executors_for_tier = [&](cucascade::memory::Tier tier) {
-    auto spaces        = memory_manager_->get_memory_spaces_for_tier(tier);
-    auto const& dg_cfg = config_.get_downgrade_executor_config();
+    auto spaces          = memory_manager_->get_memory_spaces_for_tier(tier);
+    auto const& base_cfg = config_.get_downgrade_executor_config();
+    auto const& topo     = config_.get_hw_topology();
     for (auto* space : spaces) {
+      // Copy the base downgrade_executor_config so we can attach a per-GPU NUMA preference
+      // without mutating the shared config owned by sirius_config.
+      sirius::exec::downgrade_executor_config dg_cfg = base_cfg;
+      if (tier == cucascade::memory::Tier::GPU) {
+        auto dev_id = space->get_device_id();
+        if (dev_id >= 0 && static_cast<unsigned>(dev_id) < topo.gpus.size()) {
+          dg_cfg.preferred_numa_node = topo.gpus[dev_id].numa_node;
+        }
+      }
       auto executor = std::make_unique<sirius::parallel::downgrade_executor>(
         dg_cfg,
         *data_repository_manager_,
@@ -302,8 +540,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
                                                        &config_.get_hw_topology(),
                                                        &downgrade_executors_);
 
-  task_creator_ = std::make_unique<sirius::creator::task_creator>(config_.get_task_creator_config(),
-                                                                  *memory_manager_);
+  task_creator_ = std::make_unique<sirius::creator::task_creator>(
+    config_.get_task_creator_config(), *memory_manager_, &config_.get_hw_topology());
   task_creator_->set_task_scheduler(*task_scheduler_);
   task_scheduler_->set_task_creator(*task_creator_);
 
@@ -344,11 +582,48 @@ void SiriusContext::terminate()
   }
   downgrade_executors_.clear();
 
+  // Teardown order is load-bearing: registry holds shared_ptrs to ioctxs, so
+  // it must drop its refs first. Then gpu_ioctxs_ (the device-keyed view) is
+  // cleared to drop the aliasing shared_ptrs. Only when that's done do we
+  // clear numa_ioctxs_, which actually destroys each uring_ioctx — joining
+  // reactor threads and freeing the NUMA-bound pinned bounce buffers
+  // (cudaHostUnregister + numa_free, or cudaFreeHost) — which requires a
+  // live CUDA context, so it must run BEFORE memory_manager_->shutdown().
+  datasource_registry_.clear();
+  gpu_ioctxs_.clear();
+  numa_ioctxs_.clear();
+  device_to_numa_.clear();
+  // No cudaDeviceDisablePeerAccess: CUDA cleans up peer mappings at process
+  // exit, and explicit disable here can tear down mappings that
+  // memory_manager_ teardown below still traverses for GPU->HOST drains.
+  peer_access_enabled_pairs_.clear();
+
   // Ensure all CUDA operations (including async copies from downgrade tasks)
   // are complete before destroying pinned memory pools.  cudaStreamDestroy
   // returns immediately even when copies are still in-flight; without this
   // sync, the subsequent cudaFreeHost inside the memory manager destructor
   // can deadlock against a new cudaHostAlloc from the next SiriusContext.
+  //
+  // Multi-GPU: a single cudaDeviceSynchronize() drains only the device that
+  // is current right now, but the shared pinned allocator we tear down below
+  // is targeted by D2H copies from EVERY managed GPU. Iterate over every
+  // configured GPU memory_space so no in-flight peer copy is still scheduled
+  // against the pinned slab when it is destroyed. The sync inside
+  // ~sirius_memory_reservation_manager runs AFTER this block and therefore
+  // does not protect the shared allocator. cuda_set_device_raii restores the
+  // previously-current device on scope exit. memory_manager_ is still alive
+  // here (its shutdown runs further below); gpu_ioctxs_ was cleared above so
+  // it is not a usable source for this enumeration.
+  if (memory_manager_) {
+    auto gpu_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+    for (auto const* space : gpu_spaces) {
+      rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{space->get_device_id()}};
+      cudaDeviceSynchronize();
+    }
+  }
+  // Defensive final sync on whatever device is current. Preserves the
+  // historical single-sync behavior in the unlikely path where memory_manager_
+  // has no GPU spaces.
   cudaDeviceSynchronize();
 
   // The scan manager owns the sirius_ioctx, prefetch buffer_pool, pinned-table
@@ -389,6 +664,18 @@ const sirius::memory::sirius_memory_reservation_manager& SiriusContext::get_memo
 {
   throw_if_not_initialized();
   return *memory_manager_;
+}
+
+std::shared_ptr<sirius::io::sirius_ioctx> SiriusContext::get_ioctx_for(int device_id) const
+{
+  throw_if_not_initialized();
+  auto it = gpu_ioctxs_.find(device_id);
+  if (it == gpu_ioctxs_.end()) {
+    throw std::out_of_range(
+      "SiriusContext::get_ioctx_for: no sirius_ioctx registered for device_id=" +
+      std::to_string(device_id));
+  }
+  return it->second;
 }
 
 cucascade::shared_data_repository_manager& SiriusContext::get_data_repository_manager()
@@ -476,7 +763,18 @@ void SiriusContext::create_query(
     duckdb::make_shared_ptr<sirius::planner::query>(std::move(pipelines), context, telemetry_info);
   task_scheduler_->prepare_for_query(query_);
   task_creator_->prepare_for_query(*query_);
-  scan_manager_->prepare_for_query(*query_);
+  // Pass per-GPU sirius_ioctx map to scan_manager so parquet_split_provider
+  // can construct sirius_datasources via ioctx->make_datasource(io_object)
+  // instead of cudf's bundled file_source factory. Also build a device_id ->
+  // GPU memory_space map for the HOST-tier cached_split_provider's
+  // host->gpu materialization at produce_split time (pin_table tier='host').
+  std::unordered_map<int, cucascade::memory::memory_space*> gpu_memory_spaces;
+  for (auto const* gpu_space :
+       memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+    gpu_memory_spaces[gpu_space->get_device_id()] =
+      const_cast<cucascade::memory::memory_space*>(gpu_space);
+  }
+  scan_manager_->prepare_for_query(*query_, gpu_ioctxs_, gpu_memory_spaces);
 }
 
 duckdb::shared_ptr<sirius::planner::query> SiriusContext::get_query()
@@ -622,11 +920,11 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       logical_plan = optimizer.Optimize(std::move(planner.plan));
     } catch (NotImplementedException& e) {
       record_transparent_fallback();
-      spdlog::info("Transparent execution fallback (replan unsupported): {}", e.what());
+      SIRIUS_LOG_INFO("Transparent execution fallback (replan unsupported): {}", e.what());
       return RebindQueryInfo::DO_NOT_REBIND;
     } catch (std::exception& e) {
       record_transparent_fallback();
-      spdlog::info("Transparent execution fallback (replan failed): {}", e.what());
+      SIRIUS_LOG_INFO("Transparent execution fallback (replan failed): {}", e.what());
       return RebindQueryInfo::DO_NOT_REBIND;
     }
     if (!logical_plan) { return RebindQueryInfo::DO_NOT_REBIND; }
@@ -659,7 +957,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       logical_plan.reset();  // signal PhysicalSiriusExecution to use the SQL replan path
     }
 
-    spdlog::info("Transparent execution: Sirius physical plan generated successfully");
+    SIRIUS_LOG_INFO("Transparent execution: Sirius physical plan generated successfully");
 
     // Create a new DuckDB PhysicalPlan containing our custom operator.
     auto new_physical_plan = make_uniq<PhysicalPlan>(Allocator::Get(context));
@@ -671,13 +969,13 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     prepared.physical_plan = std::move(new_physical_plan);
     record_transparent_rebind_success();
 
-    spdlog::info("Transparent execution: physical plan replaced with GPU operator");
+    SIRIUS_LOG_INFO("Transparent execution: physical plan replaced with GPU operator");
   } catch (NotImplementedException& e) {
     record_transparent_fallback();
-    spdlog::info("Transparent execution fallback (unsupported): {}", e.what());
+    SIRIUS_LOG_INFO("Transparent execution fallback (unsupported): {}", e.what());
   } catch (std::exception& e) {
     record_transparent_fallback();
-    spdlog::info("Transparent execution fallback: {}", e.what());
+    SIRIUS_LOG_INFO("Transparent execution fallback: {}", e.what());
   }
 
   return RebindQueryInfo::DO_NOT_REBIND;
@@ -712,64 +1010,64 @@ SiriusContextExtensionCallback::SiriusContextExtensionCallback()
 
 void SiriusContextExtensionCallback::OnConnectionOpened(ClientContext& context)
 {
-  spdlog::info("Connection opened.");
+  SIRIUS_LOG_INFO("Connection opened.");
   if (context_) { context.registered_state->Insert("sirius_state", context_); }
 }
 
 void SiriusContextExtensionCallback::OnConnectionClosed(ClientContext& context)
 {
-  spdlog::info("Connection closed.");
+  SIRIUS_LOG_INFO("Connection closed.");
   // remove the context from the registered state
   context.registered_state->Remove("sirius_state");
 }
 
 void SiriusContextExtensionCallback::OnExtensionLoaded(DatabaseInstance& db, const string& name)
 {
-  spdlog::info("Extension loaded: {}", name);
+  SIRIUS_LOG_INFO("Extension loaded: {}", name);
 }
 
 void SiriusContextExtensionCallback::OnBeginExtensionLoad(DatabaseInstance& db, const string& name)
 {
-  spdlog::info("Beginning to load extension: {}", name);
+  SIRIUS_LOG_INFO("Beginning to load extension: {}", name);
 }
 
 void SiriusContextExtensionCallback::OnExtensionLoadFail(DatabaseInstance& db,
                                                          const string& name,
                                                          const ErrorData& error)
 {
-  spdlog::error("Failed to load extension: {}. Error: {}", name, error.RawMessage());
+  SIRIUS_LOG_ERROR("Failed to load extension: {}. Error: {}", name, error.RawMessage());
 }
 
 void SiriusContextExtensionCallback::read_config_file_if_exists()
 {
   // Check for explicit disable (used by benchmarks/tests that need pure CPU execution)
   if (auto* val = std::getenv("SIRIUS_DISABLE"); val != nullptr && std::string(val) != "0") {
-    spdlog::info("Sirius disabled via SIRIUS_DISABLE environment variable.");
+    SIRIUS_LOG_INFO("Sirius disabled via SIRIUS_DISABLE environment variable.");
     return;
   }
 
   auto config_path = get_config_file_path();
   if (config_path && std::filesystem::exists(*config_path)) {
     config_.load_from_file(*config_path);
-    spdlog::info("Loaded Sirius configuration from file: {}", *config_path);
+    SIRIUS_LOG_INFO("Loaded Sirius configuration from file: {}", *config_path);
   } else if (config_path) {
     // SIRIUS_CONFIG_FILE was explicitly set but points to a non-existent file — error
     auto msg = "SIRIUS_CONFIG_FILE points to non-existent file: " + *config_path;
-    spdlog::error("{}", msg);
+    SIRIUS_LOG_ERROR("{}", msg);
     throw std::runtime_error(msg);
   } else {
     // Check if the user has a legacy .cfg file they may need to migrate
     if (auto legacy_path = find_legacy_config_file()) {
-      spdlog::warn(
+      SIRIUS_LOG_WARN(
         "Found legacy config file '{}'. Sirius now uses YAML configuration "
         "(sirius.yaml). Please migrate your settings to the new format. "
         "See docs/super-sirius/configuration.md for details.",
         *legacy_path);
     }
-    spdlog::info(
+    SIRIUS_LOG_INFO(
       "No sirius.yaml found (checked $SIRIUS_CONFIG_FILE, ./sirius.yaml, "
       "~/.sirius/sirius.yaml). Using defaults.");
-    spdlog::warn(
+    SIRIUS_LOG_WARN(
       "Super Sirius will allocate most GPU and pinned host memory on startup. "
       "If you are using the legacy code path (gpu_buffer_init / gpu_processing), "
       "set SIRIUS_DISABLE=1 to prevent this.");

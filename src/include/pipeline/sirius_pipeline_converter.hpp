@@ -116,6 +116,13 @@ class sirius_pipeline_converter {
   // Phase 5: Debug logging
   void log_pipeline_debug_info() const;
 
+  // Configure every sirius_physical_partition operator with the multi-GPU
+  // partition floor so partition-consumer tasks (hash_join, merge_group_by)
+  // have at least num_gpus partitions to spread across devices for big
+  // inputs. Small tables stay at their natural partition count. Reads
+  // num_gpus from build_ctx_; no-op when num_gpus <= 1.
+  void configure_partition_min_partitions();
+
   const pipeline_build_context build_ctx_;
   const sirius::operator_params& op_params_;
   const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>*
