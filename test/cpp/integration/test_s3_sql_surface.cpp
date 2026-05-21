@@ -655,9 +655,10 @@ struct b1_metrics {
 
 struct b1_run_record {
   std::string query;
-  bool prewarm{true};
+  std::string config;
   int iteration{0};
   b1_metrics metrics;
+  bool has_cache_metrics{false};
 };
 
 struct b1_summary {
@@ -679,16 +680,36 @@ double median_sorted(std::vector<double> values)
 
 b1_summary summarize_metric(std::vector<b1_run_record> const& records,
                             std::string_view query,
-                            bool prewarm,
+                            std::string_view config,
                             b1_metric_getter getter)
 {
   std::vector<double> values;
   for (auto const& record : records) {
-    if (std::string_view{record.query} == query && record.prewarm == prewarm) {
+    if (std::string_view{record.query} == query && std::string_view{record.config} == config) {
       values.push_back(getter(record.metrics));
     }
   }
   REQUIRE_FALSE(values.empty());
+  return b1_summary{median_sorted(values),
+                    *std::min_element(values.begin(), values.end()),
+                    *std::max_element(values.begin(), values.end())};
+}
+
+std::optional<b1_summary> summarize_metric_if_available(std::vector<b1_run_record> const& records,
+                                                        std::string_view query,
+                                                        std::string_view config,
+                                                        b1_metric_getter getter,
+                                                        bool requires_cache)
+{
+  std::vector<double> values;
+  for (auto const& record : records) {
+    if (std::string_view{record.query} != query || std::string_view{record.config} != config) {
+      continue;
+    }
+    if (requires_cache && !record.has_cache_metrics) { continue; }
+    values.push_back(getter(record.metrics));
+  }
+  if (values.empty()) { return std::nullopt; }
   return b1_summary{median_sorted(values),
                     *std::min_element(values.begin(), values.end()),
                     *std::max_element(values.begin(), values.end())};
@@ -712,10 +733,23 @@ std::string format_summary(b1_summary const& summary, bool integral = false)
          format_double(summary.max) + "]";
 }
 
+std::string format_optional_summary(std::optional<b1_summary> summary, bool integral = false)
+{
+  if (!summary) { return "n/a"; }
+  return format_summary(*summary, integral);
+}
+
 std::string format_ratio(double numerator, double denominator)
 {
   if (denominator == 0.0) { return "n/a"; }
   return format_double(numerator / denominator, 3);
+}
+
+std::string format_optional_ratio(std::optional<b1_summary> numerator,
+                                  std::optional<b1_summary> denominator)
+{
+  if (!numerator || !denominator) { return "n/a"; }
+  return format_ratio(numerator->median, denominator->median);
 }
 
 double metric_wall_ms(b1_metrics const& metrics) { return metrics.wall_clock_ms; }
@@ -753,27 +787,61 @@ struct b1_metric_row {
   b1_metric_getter getter;
   bool integral{true};
   bool scale_by_object_size{false};
+  bool requires_cache{false};
 };
 
 constexpr std::array<b1_metric_row, 9> b1_metric_rows{{
-  {"wall_clock_ms", metric_wall_ms, false, false},
-  {"bytes_read_total", metric_bytes_read, true, false},
-  {"bytes_read / object_size", metric_bytes_read, false, true},
-  {"fsmr_borrows_total", metric_fsmr_borrows, true, false},
-  {"hit_count_total", metric_hit_count, true, false},
-  {"hit_after_wait_total", metric_hit_after_wait, true, false},
-  {"partial_miss_count_total", metric_partial_miss, true, false},
-  {"full_miss_count_total", metric_full_miss, true, false},
-  {"range_miss_count_total", metric_range_miss, true, false},
+  {"wall_clock_ms", metric_wall_ms, false, false, false},
+  {"bytes_read_total", metric_bytes_read, true, false, false},
+  {"bytes_read / object_size", metric_bytes_read, false, true, false},
+  {"fsmr_borrows_total", metric_fsmr_borrows, true, false, false},
+  {"hit_count_total", metric_hit_count, true, false, true},
+  {"hit_after_wait_total", metric_hit_after_wait, true, false, true},
+  {"partial_miss_count_total", metric_partial_miss, true, false, true},
+  {"full_miss_count_total", metric_full_miss, true, false, true},
+  {"range_miss_count_total", metric_range_miss, true, false, true},
 }};
+
+constexpr std::string_view kB1CacheOffConfig      = "cache_off";
+constexpr std::string_view kB1CacheOnPrewarmOn    = "cache_on_prewarm_on";
+constexpr std::string_view kB1CacheOnPrewarmOff   = "cache_on_prewarm_off";
+constexpr std::string_view kB1CountStarQuery      = "count_star";
+constexpr std::string_view kB1CountProjectedQuery = "count_l_orderkey";
+constexpr std::string_view kB1Q1Query             = "q1";
+constexpr std::string_view kB1JoinQuery           = "join";
+
+constexpr std::array<std::string_view, 3> b1_config_names{
+  kB1CacheOffConfig, kB1CacheOnPrewarmOn, kB1CacheOnPrewarmOff};
+constexpr std::array<std::string_view, 4> b1_query_names{
+  kB1CountStarQuery, kB1CountProjectedQuery, kB1Q1Query, kB1JoinQuery};
+
+std::string b1_config_label(std::string_view config)
+{
+  if (config == kB1CacheOffConfig) { return "cache OFF (production default)"; }
+  if (config == kB1CacheOnPrewarmOn) { return "cache ON + prewarm ON"; }
+  if (config == kB1CacheOnPrewarmOff) { return "cache ON + prewarm OFF"; }
+  return std::string{config};
+}
+
+std::string b1_query_label(std::string_view query)
+{
+  if (query == kB1CountStarQuery) { return "count(*)"; }
+  if (query == kB1CountProjectedQuery) { return "count(l_orderkey)"; }
+  if (query == kB1Q1Query) { return "q1 — TPC-H Q1 shape (narrowed-date filter)"; }
+  if (query == kB1JoinQuery) { return "join — lineitem×orders"; }
+  return std::string{query};
+}
 
 b1_cache_counters sum_cache_counters(std::vector<b1_run_record> const& records,
                                      std::string_view query,
-                                     bool prewarm)
+                                     std::string_view config)
 {
   b1_cache_counters out;
   for (auto const& record : records) {
-    if (std::string_view{record.query} != query || record.prewarm != prewarm) { continue; }
+    if (std::string_view{record.query} != query || std::string_view{record.config} != config ||
+        !record.has_cache_metrics) {
+      continue;
+    }
     out.hit_count += record.metrics.cache.hit_count;
     out.hit_after_wait += record.metrics.cache.hit_after_wait;
     out.partial_miss += record.metrics.cache.partial_miss;
@@ -802,11 +870,13 @@ std::string dominant_miss_counter(b1_cache_counters const& counters)
 
 bool fsmr_nonzero_for_all_records(std::vector<b1_run_record> const& records,
                                   std::string_view query,
-                                  bool prewarm)
+                                  std::string_view config)
 {
   bool saw_record = false;
   for (auto const& record : records) {
-    if (std::string_view{record.query} != query || record.prewarm != prewarm) { continue; }
+    if (std::string_view{record.query} != query || std::string_view{record.config} != config) {
+      continue;
+    }
     saw_record = true;
     if (record.metrics.fsmr_borrows == 0) { return false; }
   }
@@ -833,7 +903,7 @@ void write_b1_bench_markdown(fs::path const& path,
   auto const host   = env_or("SIRIUS_BENCH_HOST", "unknown");
   auto const date   = env_or("SIRIUS_BENCH_DATE", "unknown");
 
-  out << "# B1 Phase 2 — bench results\n\n"
+  out << "# B1 Phase 3a — bench results\n\n"
       << "**Branch / SHA:** " << branch << " @ " << sha << "\n"
       << "**CI host:** " << host << "\n"
       << "**Date:** " << date << "\n"
@@ -841,60 +911,119 @@ void write_b1_bench_markdown(fs::path const& path,
       << format_double(static_cast<double>(object_size) / (1024.0 * 1024.0 * 1024.0), 2)
       << " GiB)\n\n"
       << "## Raw iteration data\n\n"
-      << "| query | prewarm | iteration | wall_clock_ms | bytes_read_total | "
+      << "| query | config | iteration | wall_clock_ms | bytes_read_total | "
          "fsmr_borrows_total | hit_count_total | hit_after_wait_total | "
          "partial_miss_count_total | full_miss_count_total | range_miss_count_total |\n"
-      << "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n";
+      << "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n";
 
   for (auto const& record : records) {
-    out << "|" << record.query << "|" << (record.prewarm ? "ON" : "OFF") << "|" << record.iteration
-        << "|" << format_double(record.metrics.wall_clock_ms) << "|" << record.metrics.bytes_read
-        << "|" << record.metrics.fsmr_borrows << "|" << record.metrics.cache.hit_count << "|"
-        << record.metrics.cache.hit_after_wait << "|" << record.metrics.cache.partial_miss << "|"
-        << record.metrics.cache.full_miss << "|" << record.metrics.cache.range_miss << "|\n";
+    auto const cache_hit = record.has_cache_metrics ? std::to_string(record.metrics.cache.hit_count)
+                                                    : std::string{"n/a"};
+    auto const cache_wait   = record.has_cache_metrics
+                                ? std::to_string(record.metrics.cache.hit_after_wait)
+                                : std::string{"n/a"};
+    auto const partial_miss = record.has_cache_metrics
+                                ? std::to_string(record.metrics.cache.partial_miss)
+                                : std::string{"n/a"};
+    auto const full_miss = record.has_cache_metrics ? std::to_string(record.metrics.cache.full_miss)
+                                                    : std::string{"n/a"};
+    auto const range_miss = record.has_cache_metrics
+                              ? std::to_string(record.metrics.cache.range_miss)
+                              : std::string{"n/a"};
+    out << "|" << record.query << "|" << record.config << "|" << record.iteration << "|"
+        << format_double(record.metrics.wall_clock_ms) << "|" << record.metrics.bytes_read << "|"
+        << record.metrics.fsmr_borrows << "|" << cache_hit << "|" << cache_wait << "|"
+        << partial_miss << "|" << full_miss << "|" << range_miss << "|\n";
+  }
+
+  out << "\n## Cache OFF (production default)\n\n"
+      << "| query | wall_clock_ms median [min, max] | bytes_read / object_size | "
+         "fsmr_borrows_total median [min, max] |\n"
+      << "|---|---:|---:|---:|\n";
+  for (auto const query : b1_query_names) {
+    auto wall    = summarize_metric(records, query, kB1CacheOffConfig, metric_wall_ms);
+    auto bytes   = summarize_metric(records, query, kB1CacheOffConfig, metric_bytes_read);
+    auto borrows = summarize_metric(records, query, kB1CacheOffConfig, metric_fsmr_borrows);
+    bytes        = b1_summary{bytes.median / static_cast<double>(object_size),
+                       bytes.min / static_cast<double>(object_size),
+                       bytes.max / static_cast<double>(object_size)};
+    out << "|" << b1_query_label(query) << "|" << format_summary(wall) << "|"
+        << format_summary(bytes) << "|" << format_summary(borrows, true) << "|\n";
   }
 
   out << "\n## Per-query results\n\n";
-  constexpr std::array<std::string_view, 3> queries{"count", "q1", "join"};
-  for (auto const query : queries) {
-    out << "### " << query;
-    if (query == std::string_view{"q1"}) {
-      out << " — TPC-H Q1 shape (narrowed-date filter)";
-    } else if (query == std::string_view{"join"}) {
-      out << " — lineitem×orders";
-    } else {
-      out << "(*)";
-    }
+  for (auto const query : b1_query_names) {
+    out << "### " << b1_query_label(query);
     out << "\n\n"
-        << "| metric | prewarm ON median [min, max] | prewarm OFF median [min, max] | "
-           "OFF / ON ratio |\n"
-        << "|---|---:|---:|---:|\n";
+        << "| metric | cache OFF median [min, max] | cache ON + prewarm ON median [min, max] | "
+           "cache ON + prewarm OFF median [min, max] | cache ON prewarm OFF/ON ratio |\n"
+        << "|---|---:|---:|---:|---:|\n";
 
     for (auto const& row : b1_metric_rows) {
-      auto on  = summarize_metric(records, query, true, row.getter);
-      auto off = summarize_metric(records, query, false, row.getter);
+      auto cache_off = summarize_metric_if_available(
+        records, query, kB1CacheOffConfig, row.getter, row.requires_cache);
+      auto prewarm_on = summarize_metric_if_available(
+        records, query, kB1CacheOnPrewarmOn, row.getter, row.requires_cache);
+      auto prewarm_off = summarize_metric_if_available(
+        records, query, kB1CacheOnPrewarmOff, row.getter, row.requires_cache);
       if (row.scale_by_object_size) {
         auto const scale = static_cast<double>(object_size);
-        on               = b1_summary{on.median / scale, on.min / scale, on.max / scale};
-        off              = b1_summary{off.median / scale, off.min / scale, off.max / scale};
+        if (cache_off) {
+          cache_off =
+            b1_summary{cache_off->median / scale, cache_off->min / scale, cache_off->max / scale};
+        }
+        if (prewarm_on) {
+          prewarm_on = b1_summary{
+            prewarm_on->median / scale, prewarm_on->min / scale, prewarm_on->max / scale};
+        }
+        if (prewarm_off) {
+          prewarm_off = b1_summary{
+            prewarm_off->median / scale, prewarm_off->min / scale, prewarm_off->max / scale};
+        }
       }
-      out << "|" << row.name << "|" << format_summary(on, row.integral && !row.scale_by_object_size)
-          << "|" << format_summary(off, row.integral && !row.scale_by_object_size) << "|"
-          << format_ratio(off.median, on.median) << "|\n";
+      out << "|" << row.name << "|"
+          << format_optional_summary(cache_off, row.integral && !row.scale_by_object_size) << "|"
+          << format_optional_summary(prewarm_on, row.integral && !row.scale_by_object_size) << "|"
+          << format_optional_summary(prewarm_off, row.integral && !row.scale_by_object_size) << "|"
+          << format_optional_ratio(prewarm_off, prewarm_on) << "|\n";
     }
     out << "\n";
   }
 
+  out << "## count(*) vs count(l_orderkey)\n\n"
+      << "| config | count(*) bytes/object | count(l_orderkey) bytes/object | "
+         "count(*) / count(l_orderkey) bytes | count(*) wall ms | "
+         "count(l_orderkey) wall ms | count(*) / count(l_orderkey) wall |\n"
+      << "|---|---:|---:|---:|---:|---:|---:|\n";
+  for (auto const config : b1_config_names) {
+    auto count_star_bytes = summarize_metric(records, kB1CountStarQuery, config, metric_bytes_read);
+    auto count_key_bytes =
+      summarize_metric(records, kB1CountProjectedQuery, config, metric_bytes_read);
+    auto count_star_wall = summarize_metric(records, kB1CountStarQuery, config, metric_wall_ms);
+    auto count_key_wall = summarize_metric(records, kB1CountProjectedQuery, config, metric_wall_ms);
+    out << "|" << b1_config_label(config) << "|"
+        << format_double(count_star_bytes.median / static_cast<double>(object_size)) << "|"
+        << format_double(count_key_bytes.median / static_cast<double>(object_size)) << "|"
+        << format_ratio(count_star_bytes.median, count_key_bytes.median) << "|"
+        << format_double(count_star_wall.median) << "|" << format_double(count_key_wall.median)
+        << "|" << format_ratio(count_star_wall.median, count_key_wall.median) << "|\n";
+  }
+  out << "\n";
+
   out << "## Observations\n\n";
   bool direction_a_trigger = false;
   bool direction_c_trigger = true;
-  for (auto const query : queries) {
-    auto const on_wall   = summarize_metric(records, query, true, metric_wall_ms);
-    auto const off_wall  = summarize_metric(records, query, false, metric_wall_ms);
-    auto const on_bytes  = summarize_metric(records, query, true, metric_bytes_read);
-    auto const off_bytes = summarize_metric(records, query, false, metric_bytes_read);
-    auto const on_cache  = sum_cache_counters(records, query, true);
-    auto const off_cache = sum_cache_counters(records, query, false);
+  for (auto const query : b1_query_names) {
+    auto const cache_off_wall = summarize_metric(records, query, kB1CacheOffConfig, metric_wall_ms);
+    auto const on_wall  = summarize_metric(records, query, kB1CacheOnPrewarmOn, metric_wall_ms);
+    auto const off_wall = summarize_metric(records, query, kB1CacheOnPrewarmOff, metric_wall_ms);
+    auto const cache_off_bytes =
+      summarize_metric(records, query, kB1CacheOffConfig, metric_bytes_read);
+    auto const on_bytes = summarize_metric(records, query, kB1CacheOnPrewarmOn, metric_bytes_read);
+    auto const off_bytes =
+      summarize_metric(records, query, kB1CacheOnPrewarmOff, metric_bytes_read);
+    auto const on_cache  = sum_cache_counters(records, query, kB1CacheOnPrewarmOn);
+    auto const off_cache = sum_cache_counters(records, query, kB1CacheOnPrewarmOff);
     auto const total_on_cache =
       on_cache.hit_count + on_cache.partial_miss + on_cache.full_miss + on_cache.range_miss;
     auto const hit_rate = total_on_cache == 0 ? 0.0
@@ -905,26 +1034,54 @@ void write_b1_bench_markdown(fs::path const& path,
     if (prewarm_saves_wall >= 0.10 && hit_rate > 0.50) { direction_a_trigger = true; }
     if (!(prewarm_saves_wall < 0.10 || hit_rate < 0.05)) { direction_c_trigger = false; }
 
-    out << "- " << query
-        << ": bytes_read_total OFF/ON=" << format_ratio(off_bytes.median, on_bytes.median)
-        << ", wall_clock_ms OFF/ON=" << format_ratio(off_wall.median, on_wall.median)
+    out << "- " << b1_query_label(query) << ": cache-OFF bytes/object="
+        << format_double(cache_off_bytes.median / static_cast<double>(object_size))
+        << ", cache-OFF wall/cache-ON+prewarm-ON wall="
+        << format_ratio(cache_off_wall.median, on_wall.median)
+        << ", cache-ON prewarm OFF/ON bytes=" << format_ratio(off_bytes.median, on_bytes.median)
+        << ", cache-ON prewarm OFF/ON wall=" << format_ratio(off_wall.median, on_wall.median)
         << ", prewarm-ON cache hit rate=" << cache_hit_rate(on_cache)
         << "%, dominant miss ON=" << dominant_miss_counter(on_cache)
         << ", dominant miss OFF=" << dominant_miss_counter(off_cache)
-        << ", FSMR borrow count nonzero on both branches="
-        << (fsmr_nonzero_for_all_records(records, query, true) &&
-                fsmr_nonzero_for_all_records(records, query, false)
+        << ", FSMR borrow count nonzero on cache-OFF and cache-ON+prewarm-OFF="
+        << (fsmr_nonzero_for_all_records(records, query, kB1CacheOffConfig) &&
+                fsmr_nonzero_for_all_records(records, query, kB1CacheOnPrewarmOff)
               ? "yes"
               : "no")
+        << ", FSMR borrow count zero on cache-ON+prewarm-ON="
+        << (fsmr_nonzero_for_all_records(records, query, kB1CacheOnPrewarmOn) ? "no" : "yes")
         << ".\n";
   }
 
+  auto const cache_off_count_star_bytes =
+    summarize_metric(records, kB1CountStarQuery, kB1CacheOffConfig, metric_bytes_read);
+  auto const cache_off_count_key_bytes =
+    summarize_metric(records, kB1CountProjectedQuery, kB1CacheOffConfig, metric_bytes_read);
+  auto const cache_off_count_star_ratio =
+    cache_off_count_star_bytes.median / static_cast<double>(object_size);
+  auto const cache_off_count_key_ratio =
+    cache_off_count_key_bytes.median / static_cast<double>(object_size);
+
   out << "\n## Phase 3 decision trigger\n\n"
-      << "- If prewarm ON saves >= 10% wall-clock on at least one query AND hit rate > 50%: "
-         "Phase 3 = direction A (fix cache hit alignment).\n"
-      << "- If prewarm ON saves < 10% OR hit rate ~= 0%: Phase 3 = direction C "
-         "(flip default to OFF, tighten byte-budget guard).\n"
+      << "- If cache-OFF count(*) bytes/object > 1.5 while count(l_orderkey) stays <= 1.2: "
+         "file cache-OFF empty-projection redundancy as a separate backlog item.\n"
+      << "- If cache-OFF count(*) bytes/object is already ~= 1.0: treat §26's earlier 1.87x "
+         "as stale or non-reproduced on current code.\n"
+      << "- If cache-ON prewarm ON saves >= 10% wall-clock and hit rate > 50%: Phase 3 can "
+         "consider cache hit alignment; otherwise prefer the measured default/cache policy "
+         "follow-up.\n"
       << "- Trigger evaluation from this run: ";
+  if (cache_off_count_star_ratio > 1.5 && cache_off_count_key_ratio <= 1.2) {
+    out << "cache-OFF count(*) redundancy reproduced; keep it separate from the cache-ON "
+           "prewarm result.\n";
+  } else if (cache_off_count_star_ratio <= 1.2) {
+    out << "cache-OFF count(*) redundancy did not reproduce on current code; §26's 1.87x "
+           "measurement looks stale or configuration-specific.\n";
+  } else {
+    out << "cache-OFF count(*) is elevated but not enough to classify cleanly; review the raw "
+           "bytes before tightening guards.\n";
+  }
+  out << "- Cache-ON prewarm trigger evaluation: ";
   if (direction_a_trigger) {
     out << "direction A condition met.\n";
   } else if (direction_c_trigger) {
@@ -1323,69 +1480,93 @@ TEST_CASE("gpu_execution large S3 lineitem join matches local CPU without chunk 
   CHECK(collect_rows(*s3_result) == collect_rows(*baseline_result));
 }
 
-TEST_CASE("B1 Phase 2 prewarm bench records SF10 S3 SQL telemetry",
+TEST_CASE("B1 Phase 3a cache-mode bench records SF10 S3 SQL telemetry",
           "[!benchmark][b1_bench][s3][sql][large]")
 {
   auto env = read_s3_test_env();
   if (skip_if_no_s3_env(env)) { return; }
 
-  constexpr int kIterations = 5;
+  constexpr int kIterations = 3;
+  struct bench_config {
+    std::string_view name;
+    sirius_memory_limits limits;
+    bool expects_cache{false};
+    bool expects_fsmr_borrows{true};
+  };
   struct bench_query {
     std::string_view name;
     std::string sql;
   };
 
+  std::array<bench_config, 3> const configs{{
+    {kB1CacheOffConfig, large_sirius_memory_limits(), false, true},
+    {kB1CacheOnPrewarmOn, large_sirius_memory_limits_with_chunk_prewarm(true), true, false},
+    {kB1CacheOnPrewarmOff, large_sirius_memory_limits_with_chunk_prewarm(false), true, true},
+  }};
+
   std::vector<b1_run_record> records;
   std::optional<std::size_t> object_size;
 
-  for (auto const prewarm : {true, false}) {
-    for (int query_index = 0; query_index < 3; ++query_index) {
+  for (auto const& config : configs) {
+    for (int query_index = 0; query_index < static_cast<int>(b1_query_names.size());
+         ++query_index) {
       for (int iteration = 1; iteration <= kIterations; ++iteration) {
-        s3_sql_fixture fixture(*env, large_sirius_memory_limits_with_chunk_prewarm(prewarm));
+        s3_sql_fixture fixture(*env, config.limits);
         auto large = read_large_lineitem_fixture(fixture, *env);
         if (!large) { return; }
         if (!object_size) { object_size = large->object_size; }
 
-        std::array<bench_query, 3> const queries{{
-          {"count", "SELECT count(l_orderkey) FROM " + s3_large_lineitem_scan(*env)},
-          {"q1", tpch_q1_shape_query(s3_large_lineitem_scan(*env))},
-          {"join",
+        std::array<bench_query, 4> const queries{{
+          {kB1CountStarQuery, "SELECT count(*) FROM " + s3_large_lineitem_scan(*env)},
+          {kB1CountProjectedQuery, "SELECT count(l_orderkey) FROM " + s3_large_lineitem_scan(*env)},
+          {kB1Q1Query, tpch_q1_shape_query(s3_large_lineitem_scan(*env))},
+          {kB1JoinQuery,
            large_lineitem_orders_join_query(s3_large_lineitem_scan(*env),
                                             s3_parquet_scan(*env, "orders"))},
         }};
 
         auto& s3_ctx = require_s3_ioctx(fixture, large->uri);
-        REQUIRE(s3_ctx.cache() != nullptr);
+        auto* cache  = s3_ctx.cache();
+        if (config.expects_cache) {
+          REQUIRE(cache != nullptr);
+        } else {
+          REQUIRE(cache == nullptr);
+        }
         auto const& query         = queries[static_cast<std::size_t>(query_index)];
         auto const before_bytes   = s3_ctx.bytes_read_total();
         auto const before_borrows = s3_ctx.fsmr_borrows_total();
-        auto const before_cache   = snapshot_cache(*s3_ctx.cache());
+        auto const before_cache   = cache ? std::optional{snapshot_cache(*cache)} : std::nullopt;
 
         auto const start = std::chrono::steady_clock::now();
         auto result      = require_query_ok(fixture.con, gpu_execution_sql(query.sql));
         auto const stop  = std::chrono::steady_clock::now();
 
-        auto const after_cache  = snapshot_cache(*s3_ctx.cache());
+        auto const after_cache  = cache ? std::optional{snapshot_cache(*cache)} : std::nullopt;
         auto const wall_ms      = std::chrono::duration<double, std::milli>(stop - start).count();
         auto const borrow_delta = s3_ctx.fsmr_borrows_total() - before_borrows;
+        auto cache_delta        = b1_cache_counters{};
+        if (before_cache && after_cache) { cache_delta = *after_cache - *before_cache; }
 
         REQUIRE(result->RowCount() > 0);
+        if (config.expects_fsmr_borrows) {
+          CHECK(borrow_delta > 0);
+        } else {
+          CHECK(borrow_delta == 0);
+        }
 
         records.push_back(b1_run_record{
           std::string{query.name},
-          prewarm,
+          std::string{config.name},
           iteration,
-          b1_metrics{wall_ms,
-                     s3_ctx.bytes_read_total() - before_bytes,
-                     borrow_delta,
-                     after_cache - before_cache},
+          b1_metrics{wall_ms, s3_ctx.bytes_read_total() - before_bytes, borrow_delta, cache_delta},
+          cache != nullptr,
         });
       }
     }
   }
 
   REQUIRE(object_size.has_value());
-  REQUIRE(records.size() == 30);
+  REQUIRE(records.size() == configs.size() * b1_query_names.size() * kIterations);
   auto const output_path = b1_bench_output_path();
   write_b1_bench_markdown(output_path, records, *object_size);
   CHECK(fs::exists(output_path));
