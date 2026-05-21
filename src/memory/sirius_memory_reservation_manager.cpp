@@ -23,9 +23,9 @@
 
 #include <rmm/cuda_device.hpp>
 
-#include <cucascade/memory/memory_reservation_manager.hpp>
-
 #include <cuda_runtime_api.h>
+
+#include <cucascade/memory/memory_reservation_manager.hpp>
 
 namespace sirius {
 namespace memory {

@@ -77,8 +77,7 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
   ///        the operator is first executed.
   /// @details Used by read_table_from_metadata() to select the per-chunk ioctx via
   ///          scan_data.gpu_memory_space->get_device_id().
-  void set_gpu_ioctxs(
-    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> ioctxs);
+  void set_gpu_ioctxs(std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> ioctxs);
 
   //===----------Source interface----------===//
   bool is_source() const override { return true; }

@@ -340,12 +340,10 @@ void sirius_engine::prefetch_iceberg_delete_data(op::sirius_physical_operator& p
   }
   // Pick the lowest-numbered GPU id (deterministic ordering — get_gpu_ioctxs
   // returns an unordered_map, so use std::min_element rather than .begin()).
-  auto lowest = std::min_element(
-    gpu_ioctxs.begin(), gpu_ioctxs.end(), [](auto const& a, auto const& b) {
-      return a.first < b.first;
-    });
-  auto data = op::scan::read_iceberg_delete_data(
-    context, table_path, lowest->second, snapshot_id);
+  auto lowest = std::min_element(gpu_ioctxs.begin(),
+                                 gpu_ioctxs.end(),
+                                 [](auto const& a, auto const& b) { return a.first < b.first; });
+  auto data = op::scan::read_iceberg_delete_data(context, table_path, lowest->second, snapshot_id);
   iceberg_delete_data_cache_.emplace(table_path, std::move(data));
 }
 

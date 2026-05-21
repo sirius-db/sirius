@@ -503,9 +503,8 @@ void task_creator::manager_loop()
               // batch (cached_split_provider pins each chunk_memory_space into
               // the gpu_table_representation), so we just read it here.
               if (!preferred_device_id.has_value()) {
-                if (auto* cached =
-                      dynamic_cast<op::scan::scan_cached_operator_data*>(
-                        local_state->_input_data.get())) {
+                if (auto* cached = dynamic_cast<op::scan::scan_cached_operator_data*>(
+                      local_state->_input_data.get())) {
                   if (cached->batch) {
                     auto ro     = cached->batch->to_read_only();
                     auto* space = ro.get_memory_space();
@@ -523,7 +522,7 @@ void task_creator::manager_loop()
                         if (host_key < 0) host_key = 0;
                         auto it = _numa_to_gpu.find(host_key);
                         if (it != _numa_to_gpu.end() && !it->second.empty()) {
-                          auto idx = _numa_to_gpu_rr.fetch_add(1) % it->second.size();
+                          auto idx            = _numa_to_gpu_rr.fetch_add(1) % it->second.size();
                           preferred_device_id = it->second[idx];
                         }
                       }

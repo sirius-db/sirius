@@ -368,8 +368,8 @@ void sirius_physical_hash_join::build_pipelines(pipeline::sirius_pipeline& curre
 }
 
 void sirius_physical_hash_join::update_join_exec_mode(int num_partitions,
-                                                       uint64_t build_side_bytes,
-                                                       bool build_foldable_to_single_batch)
+                                                      uint64_t build_side_bytes,
+                                                      bool build_foldable_to_single_batch)
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
   if (num_partitions == 1 && build_side_bytes < _max_build_hash_table_bytes &&
@@ -577,8 +577,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
           // MIXED_JOIN distributes per-partition tasks across GPUs by
           // partition_idx % num_gpus. Tag with the partition index so the
           // scheduler can route by partition.
-          return std::make_unique<partitioned_operator_data>(std::move(input_batch),
-                                                             partition_idx);
+          return std::make_unique<partitioned_operator_data>(std::move(input_batch), partition_idx);
         }
         right_counter++;
         counter++;
@@ -638,12 +637,11 @@ static join_side_keys_result prepare_join_keys(
     auto const num_cols = table.num_columns();
     for (auto idx : key_col_indices) {
       if (idx >= num_cols) {
-        throw std::out_of_range(
-          "prepare_join_keys: key_col_indices entry " + std::to_string(idx) +
-          " is >= input table column count " + std::to_string(num_cols) +
-          " (is_left_side=" + (is_left_side ? "true" : "false") +
-          "). The upstream emitter wired a join key that does not exist in "
-          "the physical batch — fix the emitter, do not paper over it here.");
+        throw std::out_of_range("prepare_join_keys: key_col_indices entry " + std::to_string(idx) +
+                                " is >= input table column count " + std::to_string(num_cols) +
+                                " (is_left_side=" + (is_left_side ? "true" : "false") +
+                                "). The upstream emitter wired a join key that does not exist in "
+                                "the physical batch — fix the emitter, do not paper over it here.");
       }
     }
     result.keys = table.select(key_col_indices);

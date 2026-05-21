@@ -110,8 +110,7 @@ duckdb::Value to_duckdb(const value& v, const logical_type& type)
     case type_id::INTEGER: return duckdb::Value::INTEGER(std::get<int32_t>(v));
     case type_id::BIGINT: return duckdb::Value::BIGINT(std::get<int64_t>(v));
     case type_id::HUGEINT:
-      return duckdb::Value::HUGEINT(
-        std::get<int64_t>(v));  // narrowed alt → widen via factory
+      return duckdb::Value::HUGEINT(std::get<int64_t>(v));  // narrowed alt → widen via factory
     case type_id::UTINYINT: return duckdb::Value::UTINYINT(std::get<uint8_t>(v));
     case type_id::USMALLINT: return duckdb::Value::USMALLINT(std::get<uint16_t>(v));
     case type_id::UINTEGER: return duckdb::Value::UINTEGER(std::get<uint32_t>(v));
