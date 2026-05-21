@@ -57,6 +57,16 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   // expressions using partition statistics, producing EXPRESSION_GET + DUMMY_SCAN.
   // Transparent execution still falls back on those COLUMN_DATA_SCAN sources.
   disabled.insert(duckdb::OptimizerType::STATISTICS_PROPAGATION);
+  // LATE_MATERIALIZATION rewrites `ORDER BY ... LIMIT N` over a scan into a
+  // self-RIGHT_SEMI_JOIN keyed on the parquet virtual columns `file_index` /
+  // `file_row_number` (TOP_N picks the N rows, the semi-join re-fetches them
+  // by row id). Sirius's parquet scan path drops virtual columns silently
+  // (src/op/scan/scan_plan.cpp:194), so the join's key_col_indices reference
+  // columns that don't exist at runtime. Until the scan path threads virtual
+  // columns through (or sirius_plan_get falls back on them), disable this
+  // pass so the small-sort / ORDER-BY-LIMIT plans stay on the standard
+  // sort path. See PR #732 comment 3242605041.
+  disabled.insert(duckdb::OptimizerType::LATE_MATERIALIZATION);
 
   duckdb::DBConfig::GetConfig(context).options.disabled_optimizers = std::move(disabled);
 }

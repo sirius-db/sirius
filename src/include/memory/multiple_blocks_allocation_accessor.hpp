@@ -63,7 +63,7 @@ struct multiple_blocks_allocation_accessor {
    * @brief Initialize the accessor with a byte offset within the allocation.
    *
    * @param[in] byte_offset The byte offset within the allocation at which this accessor starts.
-   * @param[in] allocation The multiple blocks allocation.
+   * @param[in] allocation The multiple blocks allocation (unique_ptr or shared_ptr).
    * @throws std::runtime_error if the block size is not a multiple of the size of T.
    */
   /// Templated on the smart-pointer type so callers can pass either

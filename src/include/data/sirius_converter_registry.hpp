@@ -16,8 +16,11 @@
 
 #pragma once
 
+#include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <data/host_parquet_representation_converters.hpp>
+#include <spdlog/spdlog.h>
 
 #include <memory>
 #include <mutex>

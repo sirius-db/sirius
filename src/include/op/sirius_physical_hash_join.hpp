@@ -129,7 +129,16 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// for small datasets).
   /// @param num_partitions
   /// @param build_side_bytes
-  void update_join_exec_mode(int num_partitions, uint64_t build_side_bytes);
+  /// @param build_foldable_to_single_batch True when the upstream pipeline can guarantee the
+  ///        build side will arrive as exactly one batch (typically because a downstream
+  ///        build-side CONCAT was configured with concat_all). BUILD_PROBE mode requires
+  ///        the build side to fold into a single batch — when this guarantee is absent the
+  ///        runtime-side build-batch invariant in get_next_task_input_data_for_build_probe
+  ///        would throw on otherwise-valid small-build joins that are still split into
+  ///        multiple batches, so BUILD_PROBE is not entered.
+  void update_join_exec_mode(int num_partitions,
+                             uint64_t build_side_bytes,
+                             bool build_foldable_to_single_batch);
 
   /// @brief True when this join runs in build-then-probe mode (see `update_join_exec_mode`).
   [[nodiscard]] bool is_build_probe_mode();

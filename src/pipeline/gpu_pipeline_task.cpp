@@ -170,7 +170,7 @@ gpu_pipeline_task::gpu_pipeline_task(
     _task_id(task_id),
     _data_repos(std::move(data_repos))
 {
-  // Subscribe to all input data_batches (LIFE-01, D-06)
+  // Subscribe to all input data_batches
   auto& ls = _local_state->cast<gpu_pipeline_task_local_state>();
   if (ls._input_data) {
     auto* pipelineable_input =
@@ -191,7 +191,7 @@ gpu_pipeline_task::gpu_pipeline_task(
 
 gpu_pipeline_task::~gpu_pipeline_task()
 {
-  // Unsubscribe from all input data_batches (LIFE-02, D-06)
+  // Unsubscribe from all input data_batches
   for (const auto& batch : _input_batches) {
     if (batch) {
       try {

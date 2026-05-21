@@ -32,9 +32,10 @@
 
 #include <cucascade/memory/topology_discovery.hpp>
 
+#include <atomic>
 #include <future>
+#include <map>
 #include <queue>
-#include <unordered_map>
 
 namespace sirius::op::scan {
 class duckdb_scan_executor;
@@ -189,6 +190,25 @@ class task_scheduler {
    */
   void drain_after_error();
 
+  // for testing/stress only — see Doxygen below.
+  /**
+   * @brief Inject an initial value into the round-robin counter.
+   *
+   * For testing/stress only. Intended to verify that the round-robin
+   * distribution path (and the per-task-device contract documented in
+   * `docs/super-sirius/pipeline-execution.md`) is correct under arbitrary
+   * counter starting offsets — catches hash-bucket-order dependent bugs and
+   * off-by-one drift that a counter starting at 0 each query might mask.
+   *
+   * Must be called AFTER `prepare_for_query` (which resets the counter
+   * to 0) but BEFORE the first task is dispatched into
+   * `management_eventloop`. Concurrent calls are safe (atomic store).
+   */
+  void set_no_pref_rr_counter_for_testing(size_t value) noexcept
+  {
+    _no_pref_rr_counter.store(value, std::memory_order_relaxed);
+  }
+
  private:
   void management_eventloop();
 
@@ -200,8 +220,11 @@ class task_scheduler {
   std::thread _management_thread;
   std::atomic<bool> _running{false};
 
-  std::unordered_map<int, std::unique_ptr<gpu_pipeline_executor>>
-    _gpu_executors;  ///< Map of device_id to GPU executor
+  /// device_id -> GPU executor. std::map (not unordered_map) so iteration
+  /// order is deterministic (ascending by device_id) — keeps preference-less
+  /// task dispatch reproducible across runs.
+  std::map<int, std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;
+  std::atomic<size_t> _no_pref_rr_counter{0};
 
   sirius::creator::task_creator* _task_creator{nullptr};
   std::unique_ptr<sirius::op::scan::duckdb_scan_executor> _scan_executor;

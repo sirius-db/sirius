@@ -17,10 +17,26 @@
 #include "catch.hpp"
 #include "sirius_context.hpp"
 
+#include <cudf/contiguous_split.hpp>
+#include <cudf/utilities/default_stream.hpp>
+
+#include <rmm/cuda_stream.hpp>
+
+#include <cuda_runtime_api.h>
+
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
+#include <cucascade/memory/reservation_manager_configurator.hpp>
+#include <cucascade/memory/topology_discovery.hpp>
+#include <data/data_batch_utils.hpp>
+#include <data/sirius_converter_registry.hpp>
 #include <duckdb.hpp>
 #include <duckdb/execution/execution_context.hpp>
+#include <memory/sirius_memory_reservation_manager.hpp>
+#include <utils/utils.hpp>
 
+#include <cstdint>
 #include <cstdlib>  // for setenv/putenv
 #include <filesystem>
 #include <fstream>
@@ -28,6 +44,71 @@
 #include <set>
 #include <source_location>
 #include <string>
+#include <vector>
+
+namespace {
+// MGPU-06 test helper: enable CUDA driver-level peer access for every GPU
+// pair, idempotently, with sticky-error consumption (matches Plan 07-01's
+// enable-loop pattern at sirius_context.cpp). Test-scope because this
+// TEST_CASE builds a bare memory manager rather than going through
+// SiriusContext::initialize() — without this the peer-async convert path
+// hits cudaErrorIllegalAddress on the return leg. Returns true if at
+// least one pair is bidirectionally P2P-capable.
+bool enable_p2p_for_test(int num_gpus)
+{
+  bool any_enabled = false;
+  for (int i = 0; i < num_gpus; ++i) {
+    for (int j = 0; j < num_gpus; ++j) {
+      if (i == j) { continue; }
+      int can_access = 0;
+      if (cudaDeviceCanAccessPeer(&can_access, i, j) != cudaSuccess || !can_access) {
+        (void)cudaGetLastError();
+        continue;
+      }
+      cudaError_t prev_dev_err = cudaSetDevice(i);
+      (void)prev_dev_err;
+      cudaError_t enable_err = cudaDeviceEnablePeerAccess(j, 0);
+      (void)cudaGetLastError();  // consume sticky state (see 07-01 SUMMARY)
+      if (enable_err == cudaSuccess || enable_err == cudaErrorPeerAccessAlreadyEnabled) {
+        any_enabled = true;
+      }
+    }
+  }
+  cudaSetDevice(0);
+  (void)cudaGetLastError();
+  return any_enabled;
+}
+
+// MGPU-06 data integrity guard (Phase 7 / RESEARCH.md Pitfall 2). FNV-1a
+// checksum over a packed batch payload. Duplicated here because the
+// equivalent helper in test/cpp/downgrade/test_downgrade_executor.cpp lives
+// in an anonymous namespace and is not reachable from this TU.
+// Phase 18 / DB-03: const dropped from data_batch& parameter (mirrors
+// debug_utils.hpp pattern from plan 18-04). cucascade #117's to_read_only is
+// non-const because it acquires the shared lock.
+uint64_t compute_batch_checksum_fnv1a64(cucascade::data_batch& batch, rmm::cuda_stream_view stream)
+{
+  // Phase 18 / DB-03 Recipe R1: scoped read-only accessor for the lifetime
+  // of gpu_rep, packed, and host_buf — released at function exit.
+  auto ro             = batch.to_read_only();
+  auto const& gpu_rep = ro.get_data()->cast<cucascade::gpu_table_representation>();
+  auto packed         = cudf::pack(gpu_rep.get_table_view(), stream);
+  stream.synchronize();
+
+  auto const bytes = packed.gpu_data->size();
+  std::vector<uint8_t> host_buf(bytes);
+  cudaMemcpyAsync(
+    host_buf.data(), packed.gpu_data->data(), bytes, cudaMemcpyDeviceToHost, stream.value());
+  stream.synchronize();
+
+  uint64_t h = 0xcbf29ce484222325ULL;
+  for (auto b : host_buf) {
+    h ^= static_cast<uint64_t>(b);
+    h *= 0x100000001b3ULL;
+  }
+  return h;
+}
+}  // namespace
 
 namespace fs = std::filesystem;
 
@@ -98,6 +179,342 @@ TEST_CASE("Sirius configuration loading from file with spaces",
   REQUIRE(manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).size() == 1);
   REQUIRE(manager.get_memory_spaces_for_tier(cucascade::memory::Tier::DISK).size() == 2);
   REQUIRE(manager.get_all_memory_spaces().size() == 4);
+}
+
+// ============================================================================
+// Multi-GPU Foundation Validation Tests
+// ============================================================================
+//
+// Device Guard Audit — GPU thread entry points and their cudaSetDevice usage:
+//
+// 1. gpu_pipeline_executor::get_per_thread_init()
+//    File: src/pipeline/gpu_pipeline_executor.cpp
+//    Guard: cudaSetDevice(device_id) — called per worker thread before any GPU work.
+//    Also: manager_loop() uses rmm::cuda_set_device_raii for the manager thread.
+//    Status: VERIFIED — device_id obtained from memory_space->get_device_id().
+//
+// 2. downgrade_executor::get_per_thread_init()
+//    File: src/downgrade/downgrade_executor.cpp
+//    Guard: cudaSetDevice(device_id) — called per worker thread.
+//    Note: Returns nullptr if _memory_space is null (host-only downgrade).
+//    Status: VERIFIED — device_id obtained from memory_space->get_device_id().
+//
+// 3. sirius_memory_reservation_manager constructor
+//    File: src/memory/sirius_memory_reservation_manager.cpp (via parent class)
+//    Guard: rmm::cuda_set_device_raii — used during GPU memory resource creation
+//           inside cucascade::memory::memory_reservation_manager constructor.
+//    Status: VERIFIED — each GPU space is created with the correct device context.
+//
+// 4. duckdb_scan_executor
+//    File: src/op/scan/duckdb_scan_executor.cpp
+//    Role: Host-side DuckDB scanning. GPU upload goes through converters which
+//          are dispatched in the pipeline executor's GPU context.
+//    Status: N/A — no direct GPU operations; data upload handled by converters.
+//
+// 5. Legacy CUDA wrappers (src/cuda/cudf/*.cu)
+//    Role: Only called from gpu_processing (legacy) path, never from gpu_execution.
+//    Status: N/A for Super Sirius (new path).
+//
+// Summary: All GPU thread entry points in the Super Sirius (gpu_execution) path
+// correctly set the CUDA device before performing GPU operations. The device_id
+// is derived from the memory_space associated with each executor, ensuring
+// multi-GPU correctness when multiple executors target different devices.
+// ============================================================================
+
+TEST_CASE("topology_discovery populates GPU info", "[multi_gpu_foundation]")
+{
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  REQUIRE(device_count >= 1);
+
+  cucascade::memory::topology_discovery discovery;
+  REQUIRE(discovery.discover());
+
+  auto const& topology = discovery.get_topology();
+  REQUIRE(topology.num_gpus >= 1);
+  REQUIRE(topology.gpus.size() == topology.num_gpus);
+
+  for (unsigned int i = 0; i < topology.num_gpus; ++i) {
+    auto const& gpu = topology.gpus[i];
+    REQUIRE(gpu.id == i);
+    REQUIRE(gpu.numa_node >= -1);
+    REQUIRE_FALSE(gpu.name.empty());
+  }
+}
+
+TEST_CASE("reservation_manager_configurator builds N GPU spaces", "[multi_gpu_foundation]")
+{
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  REQUIRE(device_count >= 1);
+
+  cucascade::memory::topology_discovery discovery;
+  REQUIRE(discovery.discover());
+  auto const& topology = discovery.get_topology();
+
+  cucascade::memory::reservation_manager_configurator builder;
+  builder.set_number_of_gpus(topology.num_gpus).use_host_per_numa();
+  auto configs = builder.build(topology);
+
+  // Count GPU and HOST tier configs (memory_space_config is a variant post-bump f47de0b)
+  size_t gpu_count  = 0;
+  size_t host_count = 0;
+  for (auto const& cfg : configs) {
+    if (std::holds_alternative<cucascade::memory::gpu_memory_space_config>(cfg)) { ++gpu_count; }
+    if (std::holds_alternative<cucascade::memory::host_memory_space_config>(cfg)) { ++host_count; }
+  }
+
+  REQUIRE(gpu_count == topology.num_gpus);
+  REQUIRE(host_count >= 1);
+}
+
+TEST_CASE("memory_manager creates independent spaces per GPU", "[multi_gpu_foundation]")
+{
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  REQUIRE(device_count >= 1);
+
+  sirius::converter_registry::reset_for_testing();
+
+  cucascade::memory::reservation_manager_configurator builder;
+  const size_t gpu_capacity  = 512ull << 20;  // 512 MB for test
+  const double limit_ratio   = 0.75;
+  const size_t host_capacity = 1ull << 30;  // 1 GB
+
+  builder.set_number_of_gpus(static_cast<size_t>(device_count))
+    .set_gpu_usage_limit(gpu_capacity)
+    .set_reservation_fraction_per_gpu(limit_ratio)
+    .set_per_host_capacity(host_capacity)
+    .use_host_per_gpu()
+    .set_reservation_fraction_per_host(limit_ratio);
+
+  auto space_configs = builder.build();
+  auto manager =
+    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(std::move(space_configs));
+
+  sirius::converter_registry::initialize();
+
+  auto gpu_spaces = manager->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  REQUIRE(gpu_spaces.size() == static_cast<size_t>(device_count));
+
+  // Verify each GPU space has a unique device_id
+  std::set<int> device_ids;
+  for (auto const* space : gpu_spaces) {
+    REQUIRE(space != nullptr);
+    device_ids.insert(space->get_device_id());
+  }
+  REQUIRE(device_ids.size() == static_cast<size_t>(device_count));
+
+  auto host_spaces = manager->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  REQUIRE(host_spaces.size() >= 1);
+
+  manager->shutdown();
+  sirius::converter_registry::shutdown();
+}
+
+TEST_CASE("converter_registry has gpu_to_gpu converter (MEM-03)", "[multi_gpu_foundation]")
+{
+  sirius::converter_registry::reset_for_testing();
+  sirius::converter_registry::initialize();
+
+  auto& registry = sirius::converter_registry::get();
+
+  // Validate that GPU-to-GPU converter is registered (prerequisite for MEM-03 cross-GPU transfer)
+  bool has_gpu_to_gpu =
+    registry
+      .has_converter<cucascade::gpu_table_representation, cucascade::gpu_table_representation>();
+  REQUIRE(has_gpu_to_gpu);
+
+  sirius::converter_registry::shutdown();
+}
+
+// MGPU-04 registration gate: cucascade::register_builtin_converters (called
+// by sirius::converter_registry::initialize()) registers a GPU->GPU
+// peer-async converter at cucascade/src/data/representation_converter.cpp:1464.
+// This test is the grep-verifiable gate that proves the registration
+// survives SiriusContext init. See 06-RESEARCH.md Finding 2 for why we do
+// not register a second converter here.
+TEST_CASE("converter_registry exposes gpu_to_gpu converter after initialize() (MGPU-04)",
+          "[multi_gpu_foundation][mgpu_04_registration]")
+{
+  sirius::converter_registry::reset_for_testing();
+  sirius::converter_registry::initialize();
+
+  auto& registry = sirius::converter_registry::get();
+
+  bool has_gpu_to_gpu =
+    registry
+      .has_converter<cucascade::gpu_table_representation, cucascade::gpu_table_representation>();
+  REQUIRE(has_gpu_to_gpu);
+
+  sirius::converter_registry::shutdown();
+}
+
+TEST_CASE("multi_gpu_config_two_gpus", "[.][multi_gpu_foundation]")
+{
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  if (device_count < 2) {
+    WARN("skipping: requires >=2 GPUs");
+    return;
+  }
+
+  sirius::converter_registry::reset_for_testing();
+
+  cucascade::memory::reservation_manager_configurator builder;
+  const size_t gpu_capacity  = 512ull << 20;
+  const double limit_ratio   = 0.75;
+  const size_t host_capacity = 1ull << 30;
+
+  builder.set_number_of_gpus(2)
+    .set_gpu_usage_limit(gpu_capacity)
+    .set_reservation_fraction_per_gpu(limit_ratio)
+    .set_per_host_capacity(host_capacity)
+    .use_host_per_gpu()
+    .set_reservation_fraction_per_host(limit_ratio);
+
+  auto space_configs = builder.build();
+  auto manager =
+    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(std::move(space_configs));
+
+  sirius::converter_registry::initialize();
+
+  auto gpu_spaces = manager->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  REQUIRE(gpu_spaces.size() == 2);
+
+  REQUIRE(gpu_spaces[0]->get_device_id() == 0);
+  REQUIRE(gpu_spaces[1]->get_device_id() == 1);
+  REQUIRE(gpu_spaces[0]->get_device_id() != gpu_spaces[1]->get_device_id());
+
+  manager->shutdown();
+  sirius::converter_registry::shutdown();
+}
+
+// MGPU-04 + MGPU-06 full round-trip: GPU0 -> GPU1 -> GPU0 data conversion
+// using the built-in cucascade peer-async converter. Phase 7 Plan 07-01's
+// peer-access enable loop at SiriusContext::initialize() closes the
+// Phase-4-deferred GPU1 -> GPU0 return-leg bug, so this test now exercises
+// both legs and gates correctness with an FNV-1a checksum over the batch
+// payload (silent-corruption guard per Pitfall 2 in
+// .planning/phases/07-*/07-RESEARCH.md — Ada Lovelace + Sapphire Rapids).
+// WARN+return on single-GPU hosts (Catch2 v2 skip idiom).
+TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-06)",
+          "[multi_gpu_foundation][mgpu_04_round_trip]")
+{
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  if (device_count < 2) {
+    WARN("skipping: requires >=2 GPUs for MGPU-04 round-trip");
+    return;
+  }
+
+  sirius::converter_registry::reset_for_testing();
+
+  cucascade::memory::reservation_manager_configurator builder;
+  const size_t gpu_capacity  = 256ull << 20;
+  const double limit_ratio   = 0.75;
+  const size_t host_capacity = 1ull << 30;
+
+  builder.set_number_of_gpus(2)
+    .set_gpu_usage_limit(gpu_capacity)
+    .set_reservation_fraction_per_gpu(limit_ratio)
+    .set_per_host_capacity(host_capacity)
+    .use_host_per_numa()
+    .set_reservation_fraction_per_host(limit_ratio);
+
+  auto space_configs = builder.build();
+  auto manager =
+    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(std::move(space_configs));
+
+  sirius::converter_registry::initialize();
+  auto& registry = sirius::converter_registry::get();
+
+  auto gpu_spaces = manager->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  REQUIRE(gpu_spaces.size() == 2);
+  auto* gpu0 = const_cast<cucascade::memory::memory_space*>(gpu_spaces[0]);
+  auto* gpu1 = const_cast<cucascade::memory::memory_space*>(gpu_spaces[1]);
+  REQUIRE(gpu0->get_device_id() == 0);
+  REQUIRE(gpu1->get_device_id() == 1);
+
+  // Enable CUDA driver-level peer access for every GPU pair — Plan 07-01's
+  // enable loop normally runs inside SiriusContext::initialize(), but this
+  // TEST_CASE builds a bare memory manager and bypasses that seam. Without
+  // the enable call cucascade's peer-async convert_gpu_to_gpu triggers
+  // cudaErrorIllegalAddress on the GPU1 -> GPU0 return leg (MGPU-06 bug).
+  enable_p2p_for_test(2);
+
+  // Build a minimal GPU-resident batch on gpu0. The make_gpu_batch helper in
+  // test_downgrade_executor.cpp lives in an anonymous namespace and is not
+  // reachable from this TU; replicate its body inline using the
+  // sirius::create_cudf_table_with_random_data + sirius::make_data_batch
+  // primitives (same helpers the downgrade test uses).
+  auto build_stream                                      = cudf::get_default_stream();
+  auto mr                                                = gpu0->get_default_allocator();
+  std::vector<cudf::data_type> col_types                 = {cudf::data_type{cudf::type_id::INT32}};
+  std::vector<std::optional<std::pair<int, int>>> ranges = {std::make_pair(0, 100000)};
+  auto table = sirius::create_cudf_table_with_random_data(
+    /*num_rows=*/1024, col_types, ranges, build_stream, mr);
+  auto batch = sirius::make_data_batch(std::move(table), *gpu0, build_stream);
+  REQUIRE(batch != nullptr);
+  size_t original_bytes = 0;
+  {
+    auto __ro_1    = batch->to_read_only();
+    original_bytes = __ro_1.get_data()->get_size_in_bytes();
+  }
+  REQUIRE(original_bytes > 0);
+  {
+    auto __ro_2 = batch->to_read_only();
+    REQUIRE(__ro_2.get_memory_space()->get_device_id() == 0);
+  }
+
+  rmm::cuda_stream stream;
+
+  // MGPU-06 Pitfall 2 data integrity guard — Ada Lovelace + Sapphire Rapids
+  // silent PCIe P2P write-ordering corruption. Capture the FNV-1a checksum
+  // over the batch payload BEFORE any cross-GPU transfer.
+  auto checksum_pre = compute_batch_checksum_fnv1a64(*batch, stream.view());
+
+  // GPU0 -> GPU1 forward leg.
+  // Phase 18 / DB-03 Recipe R8 + R3: scoped mutable accessor.
+  {
+    auto mut = batch->to_mutable();
+    mut.convert_to<cucascade::gpu_table_representation>(registry, gpu1, stream.view());
+  }
+
+  {
+    auto __ro_3 = batch->to_read_only();
+    REQUIRE(__ro_3.get_memory_space()->get_device_id() == 1);
+    REQUIRE(__ro_3.get_data()->get_size_in_bytes() == original_bytes);
+  }
+
+  // MGPU-06 return leg: Phase 7 Plan 07-01's peer-access enable loop at
+  // SiriusContext::initialize() closes the Phase-4-deferred GPU1 -> GPU0
+  // bug. Checksum integrity guard per RESEARCH.md Pitfall 2 (silent data
+  // corruption on Ada Lovelace + Sapphire Rapids).
+  // Phase 18 / DB-03 Recipe R8 + R3: scoped mutable accessor.
+  {
+    auto mut = batch->to_mutable();
+    mut.convert_to<cucascade::gpu_table_representation>(registry, gpu0, stream.view());
+  }
+
+  {
+    auto __ro_4 = batch->to_read_only();
+    REQUIRE(__ro_4.get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+    REQUIRE(__ro_4.get_memory_space()->get_device_id() == gpu0->get_device_id());
+    REQUIRE(__ro_4.get_data()->get_size_in_bytes() == original_bytes);
+  }
+
+  // Final data-integrity gate: post-round-trip checksum must equal
+  // pre-round-trip checksum. Failure here on an Ada Lovelace + Intel Xeon
+  // Sapphire Rapids (or later) host = silent data corruption; see Pitfall 2
+  // in .planning/phases/07-*/07-RESEARCH.md for the NVIDIA-documented
+  // mitigation (disable P2P on affected platforms, or use Hopper/Blackwell).
+  auto checksum_post = compute_batch_checksum_fnv1a64(*batch, stream.view());
+  INFO("MGPU-04 + MGPU-06 round-trip checksum: pre=" << checksum_pre << " post=" << checksum_post);
+  REQUIRE(checksum_post == checksum_pre);
+
+  manager->shutdown();
+  sirius::converter_registry::shutdown();
 }
 
 TEST_CASE("Internal query guard preserves transparent execution state",

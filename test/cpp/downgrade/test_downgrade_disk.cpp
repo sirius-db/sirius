@@ -74,7 +74,7 @@ std::shared_ptr<cucascade::data_batch> make_gpu_batch(cucascade::memory::memory_
 
   auto table = sirius::create_cudf_table_with_random_data(num_rows, col_types, ranges, stream, mr);
 
-  return sirius::make_data_batch(std::move(table), gpu_space);
+  return sirius::make_data_batch(std::move(table), gpu_space, stream);
 }
 
 // Pre-exhaust all HOST capacity so that subsequent make_reservation_or_null calls

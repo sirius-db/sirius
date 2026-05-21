@@ -14,12 +14,28 @@
  * limitations under the License.
  */
 
+#include <cudf/concatenate.hpp>
+#include <cudf/io/parquet.hpp>
+#include <cudf/join/distinct_hash_join.hpp>
+#include <cudf/stream_compaction.hpp>
+#include <cudf/strings/strings_column_view.hpp>
+#include <cudf/table/table.hpp>
+#include <cudf/types.hpp>
+
+#include <rmm/detail/error.hpp>
+
+#include <cuda_runtime_api.h>
+
 #include <duckdb/common/multi_file/multi_file_states.hpp>
+#include <io/sirius_datasource.hpp>
+#include <io/types.hpp>
 #include <log/logging.hpp>
 #include <op/scan/iceberg_delete_filter.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
 #include <op/scan/iceberg_scan_task.hpp>
 
+#include <algorithm>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -93,9 +109,10 @@ iceberg_scan_task_global_state::init_data iceberg_scan_task_global_state::prepar
 iceberg_scan_task_global_state::iceberg_scan_task_global_state(
   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
   sirius_physical_iceberg_scan* scan_op,
-  size_t approximate_batch_size)
+  size_t approximate_batch_size,
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs)
   : iceberg_scan_task_global_state(
-      std::move(pipeline), scan_op, prepare(scan_op), approximate_batch_size)
+      std::move(pipeline), scan_op, prepare(scan_op), approximate_batch_size, std::move(gpu_ioctxs))
 {
   // Propagate hive partition info to the base class so it can build
   // the partition injection function (same as the public constructor does).
@@ -108,12 +125,14 @@ iceberg_scan_task_global_state::iceberg_scan_task_global_state(
   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
   sirius_physical_iceberg_scan* scan_op,
   init_data init,
-  size_t approximate_batch_size)
+  size_t approximate_batch_size,
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs)
   : parquet_scan_task_global_state(std::move(pipeline),
                                    static_cast<sirius_physical_parquet_scan*>(scan_op),
                                    std::move(init.file_paths),
                                    std::move(init.selected_column_indices),
-                                   approximate_batch_size)
+                                   approximate_batch_size,
+                                   std::move(gpu_ioctxs))
 {
   build_delete_pipeline(scan_op, init.extra_eq_delete_columns);
 }
@@ -129,6 +148,19 @@ void iceberg_scan_task_global_state::build_delete_pipeline(sirius_physical_icebe
   if (!dd || dd->empty()) {
     SIRIUS_LOG_DEBUG("[iceberg] No delete data; running as plain parquet scan.");
     return;
+  }
+
+  // Iceberg delete-file helpers DO NOT construct sirius_datasource internally
+  // — read_positional_delete_file uses DuckDB read_parquet (CPU), and
+  // read_equality_delete_file uses cudf::io::datasource::create directly. The
+  // ioctx map is therefore not needed here; we still require at least one
+  // ioctx be configured so the base parquet_scan_task_global_state's
+  // planning-time footer reads can resolve a datasource.
+  auto const& gpu_ioctxs = this->get_gpu_ioctxs();
+  if (gpu_ioctxs.empty()) {
+    throw std::runtime_error(
+      "[iceberg] No GPU sirius_ioctxs available — "
+      "SiriusContext must have registered at least one ioctx.");
   }
 
   // -----------------------------------------------------------------------

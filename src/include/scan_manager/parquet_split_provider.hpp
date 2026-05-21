@@ -21,16 +21,24 @@
 #include "scan_manager/split_provider.hpp"
 #include "sirius_config.hpp"
 
+// Per-GPU sirius_ioctx for routing parquet reads through io_uring
+// (sirius_datasource) instead of cudf's bundled kvikio-backed file_source.
+// <io/types.hpp> declares sirius_ioctx; the uring_io_object concrete type is
+// referenced only in the .cpp via <io/uring/uring_reactor.hpp> (LAST among
+// sirius headers — liburing's BLOCK_SIZE macro collides with
+// blockingconcurrentqueue).
 #include <duckdb/common/column_index.hpp>
 #include <duckdb/common/multi_file/multi_file_data.hpp>
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/vector.hpp>
+#include <io/types.hpp>
 
 #include <atomic>
 #include <cstddef>
 #include <functional>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace duckdb {
@@ -79,6 +87,16 @@ class parquet_split_provider : public split_provider {
    *                                partition.
    * @param max_file_processed      Maximum number of files handled by one
    *                                metadata task.
+   * @param gpu_ioctxs              Per-GPU sirius_ioctx instances indexed by
+   *                                device_id. Seeded by sirius_scan_manager
+   *                                from SiriusContext::get_gpu_ioctxs().
+   *                                Used in run_batch to construct
+   *                                sirius_datasources via
+   *                                ioctx->make_datasource(io_object) instead
+   *                                of cudf's bundled file_source factory —
+   *                                the latter routes through kvikio and
+   *                                bypasses the io_uring + per-GPU
+   *                                CUDA-context binding.
    */
   parquet_split_provider(
     duckdb::vector<sirius::logical_type> const& returned_types,
@@ -91,11 +109,7 @@ class parquet_split_provider : public split_provider {
     duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices = {},
     std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE,
     std::size_t max_file_processed     = DEFAULT_MAX_FILE_PROCESSED,
-    /// Optional sirius IO context.  When non-null, footer fetches go through
-    /// @c sirius_datasource, and both the io_object and the ioctx itself are
-    /// attached to each emitted @c row_group_slice so the scan operator can
-    /// reuse the same path for data reads.
-    std::shared_ptr<sirius::io::sirius_ioctx> io_ctx = nullptr);
+    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs = {});
 
   ~parquet_split_provider() override;
 
@@ -132,17 +146,9 @@ class parquet_split_provider : public split_provider {
   std::size_t _approximate_batch_size;
   std::size_t _max_file_processed;
   std::size_t _total_files;
-  /// Optional ioctx for routing reads through @c sirius_datasource.
-  /// Held as a shared_ptr so it stays alive as long as any emitted slice
-  /// references it.
-  std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> _gpu_ioctxs;
 
-  /// Pre-decomposed file batches built once in the constructor; immutable
-  /// thereafter. Each callable returned by next_split_provider() processes
-  /// one entry.
   std::vector<file_batch> _batches;
-  /// Atomically incremented to claim the next batch index. Lets multiple
-  /// workers process distinct batches in parallel with no mutex.
   std::atomic<std::size_t> _next_batch_idx{0};
 };
 

@@ -29,8 +29,7 @@ namespace sirius::ast {
 struct node;
 
 namespace detail {
-/// Placeholder function identifier.
-/// Phase 3 replaces this with sirius::function_id.
+/// Placeholder function identifier (to be replaced with sirius::function_id).
 enum class function_placeholder : uint16_t {
   unknown = 0,
 };

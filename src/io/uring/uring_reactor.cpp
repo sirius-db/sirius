@@ -19,7 +19,10 @@
 #include "driver_types.h"
 #include "io/types.hpp"
 
+#include <rmm/cuda_device.hpp>
+
 #include <fcntl.h>
+#include <numa.h>
 #include <spdlog/spdlog.h>
 #include <sys/stat.h>
 
@@ -27,6 +30,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <optional>
 #include <ranges>
 #include <stdexcept>
 
@@ -64,26 +68,60 @@ size_t uring_reactor::size(int fd)
   return static_cast<size_t>(st.st_size);
 }
 
-uring_reactor::uring_reactor(cucascade::memory::fixed_size_host_memory_resource& mr,
-                             unsigned ring_entries)
-  : _bounce_slot_size(mr.get_block_size()), _ring_entries(ring_entries)
+uring_reactor::uring_reactor(unsigned ring_entries, size_t bounce_slot_size, int numa_node)
+  : _ring_entries(ring_entries), _bounce_slot_size(bounce_slot_size), _numa_node(numa_node)
 {
-  _bounce_storage = mr.allocate_multiple_blocks(NUM_CHUNKS * _bounce_slot_size);
-  auto blocks     = _bounce_storage->get_blocks();
-  if (blocks.size() < NUM_CHUNKS) {
-    throw std::runtime_error(
-      "uring_reactor: fixed_size_host_memory_resource returned fewer blocks (" +
-      std::to_string(blocks.size()) + ") than required (" + std::to_string(NUM_CHUNKS) + ")");
-  }
   for (int i = 0; i < static_cast<int>(NUM_CHUNKS); ++i) {
-    _bounce[i].buf = blocks[i];
+    void* raw = nullptr;
+    if (_numa_node >= 0) {
+      raw = numa_alloc_onnode(bounce_slot_size, _numa_node);
+      if (raw == nullptr) {
+        throw std::runtime_error("uring_reactor: numa_alloc_onnode failed for node=" +
+                                 std::to_string(_numa_node));
+      }
+      cudaError_t reg_err =
+        cudaHostRegister(raw,
+                         bounce_slot_size,
+                         static_cast<unsigned>(cudaHostRegisterPortable | cudaHostRegisterMapped));
+      if (reg_err != cudaSuccess) {
+        numa_free(raw, bounce_slot_size);
+        throw std::runtime_error(std::string("uring_reactor: cudaHostRegister failed: ") +
+                                 cudaGetErrorString(reg_err));
+      }
+    } else {
+      CUDA_CHECK(cudaHostAlloc(&raw, bounce_slot_size, cudaHostAllocPortable));
+    }
+    _bounce[i].buf = raw;
     _cb_args[i]    = {this, i};
   }
 
   _worker = std::thread([this] { worker_loop(); });
 }
 
-uring_reactor::~uring_reactor() { shutdown(); }
+uring_reactor::~uring_reactor()
+{
+  shutdown();
+  // Free bounce slots in the inverse of the allocation policy chosen by
+  // the ctor. shutdown() above joins the worker thread, so no callback
+  // can race the unregister/free.
+  for (auto& slot : _bounce) {
+    if (slot.buf == nullptr) continue;
+    if (_numa_node >= 0) {
+      // Errors here are unrecoverable in a noexcept dtor — log and continue.
+      cudaError_t unreg = cudaHostUnregister(slot.buf);
+      if (unreg != cudaSuccess) {
+        spdlog::warn("uring_reactor: cudaHostUnregister failed: {}", cudaGetErrorString(unreg));
+      }
+      numa_free(slot.buf, _bounce_slot_size);
+    } else {
+      cudaError_t fr = cudaFreeHost(slot.buf);
+      if (fr != cudaSuccess) {
+        spdlog::warn("uring_reactor: cudaFreeHost failed: {}", cudaGetErrorString(fr));
+      }
+    }
+    slot.buf = nullptr;
+  }
+}
 
 void uring_reactor::interrupt()
 {
@@ -320,9 +358,6 @@ void uring_reactor::worker_loop()
       io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
       if (!sqe) break;
       auto& req = pending.front();
-      // Bounce slots are pre-registered via io_uring_register_buffers, so
-      // submit through the fixed-buffer fast path — skips per-IO buffer
-      // pin/unmap overhead in the kernel.
       io_uring_prep_read_fixed(sqe,
                                req.handle,
                                _bounce[si].buf,
@@ -422,10 +457,6 @@ void uring_reactor::worker_loop()
         bool const fully_read = sinfo.bytes_read >= req.io_size;
         bool const eof        = (rd == 0);
         if (!fully_read && !eof) {
-          // Short read mid-file: queue a follow-up SQE for the unread tail
-          // into the same bounce slot at the next-byte offset. The slot
-          // stays in READING; once we get the full io_size (or EOF), we
-          // proceed to the H2D path below using sinfo.bytes_read.
           io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
           if (sqe) {
             io_uring_prep_read_fixed(sqe,

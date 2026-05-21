@@ -110,8 +110,8 @@ std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(
     auto sliced_table = std::make_unique<cudf::table>(
       slices.front(), stream, batch.get_memory_space()->get_default_allocator());
     std::unique_ptr<cucascade::idata_representation> output_data =
-      std::make_unique<cucascade::gpu_table_representation>(std::move(sliced_table),
-                                                            *batch.get_memory_space());
+      std::make_unique<cucascade::gpu_table_representation>(
+        std::move(sliced_table), *batch.get_memory_space(), stream);
 
     auto const batch_id = ::sirius::get_next_batch_id();
     auto output_batch   = std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data));

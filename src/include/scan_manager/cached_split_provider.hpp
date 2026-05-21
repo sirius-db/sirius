@@ -29,6 +29,7 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -54,8 +55,11 @@ namespace sirius::scan_manager {
  *   - HOST constructor: @p host_chunks holds one host_data_representation per
  *     emitted batch (each covering all pinned columns), and @p column_indices
  *     selects the columns required by the scan in scan_plan D-order.
- *   - @p memory_space is captured into each emitted data_batch so memory
- *     accounting matches where the cached columns reside.
+ *   - @p chunk_memory_spaces is parallel to the inner vectors of
+ *     @p columns_per_request: chunk_memory_spaces[i] is the memory_space*
+ *     for chunk i across all D-positions. Each emitted data_batch carries
+ *     the memory_space its data lives on so data-locality scheduling fans
+ *     tasks correctly across GPUs.
  *   - @p filter_expression and @p plan are forwarded unchanged on every
  *     emitted batch, mirroring the parquet path's per-split contract. The scan
  *     operator queries @c needs_output_assembly(*plan) to decide whether to
@@ -80,20 +84,29 @@ class cached_split_provider : public split_provider {
   /// Each callable returned by @ref next_split_provider() emits one zero-copy
   /// gpu_table_representation per batch.
   cached_split_provider(std::vector<std::vector<std::shared_ptr<cudf::column>>> columns_per_request,
-                        cucascade::memory::memory_space& memory_space,
+                        std::vector<cucascade::memory::memory_space*> chunk_memory_spaces,
                         std::shared_ptr<duckdb::Expression> filter_expression,
                         std::shared_ptr<op::scan::scan_plan const> plan);
 
   /// HOST-tier constructor: each chunk in @p host_chunks is a host_data_representation
   /// holding all pinned columns. @p column_indices selects the columns required by the
   /// scan in scan_plan D-order. Each callable returned by @ref next_split_provider()
-  /// slices the claimed chunk by these indices and emits one host_data_representation-
-  /// backed batch; conversion to GPU happens downstream in
-  /// scan_cached_operator_data::prepare_for_processing.
+  /// slices the claimed chunk by these indices, converts the slice to a
+  /// gpu_table_representation on the current device's GPU memory_space (looked
+  /// up via @p gpu_memory_spaces keyed by device_id), and emits a GPU-resident
+  /// data_batch. The conversion happens at produce_split time so downstream
+  /// consumers (sirius_gpu_parquet_scan_operator::execute) see GPU batches and
+  /// do not need a separate host-aware code path.
+  ///
+  /// @param gpu_memory_spaces device_id -> memory_space lookup; cached_split_provider
+  ///                          calls cudaGetDevice() to identify the executing GPU
+  ///                          and converts host chunks onto the matching space.
+  ///                          Empty map throws at conversion time.
   cached_split_provider(
     std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
     std::vector<std::size_t> column_indices,
     cucascade::memory::memory_space& memory_space,
+    std::unordered_map<int, cucascade::memory::memory_space*> gpu_memory_spaces,
     std::shared_ptr<duckdb::Expression> filter_expression,
     std::shared_ptr<op::scan::scan_plan const> plan);
 
@@ -105,19 +118,18 @@ class cached_split_provider : public split_provider {
   std::function<std::vector<std::unique_ptr<op::operator_data>>()> next_split_provider() override;
 
  private:
-  /// \brief Produce the split for an already-claimed chunk index. Called by
-  ///        the callable returned from @ref next_split_provider(); dispatches
-  ///        on @ref chunk_variant to build either a GPU- or host-resident
-  ///        data_batch.
   std::vector<std::unique_ptr<op::operator_data>> produce_split(std::size_t batch_idx);
 
-  /// One entry per emitted batch; tier is fixed at construction and consistent
-  /// across the vector (every entry holds the same variant alternative).
   std::vector<chunk_variant> _batches;
-  /// Only meaningful for HOST mode: which columns of each host_data_representation
-  /// to slice out before emitting. Empty in GPU mode.
+  // Per-chunk memory_space lookup — each chunk carries the memory_space
+  // its data lives on so data-locality scheduling fans tasks correctly.
+  // Populated in GPU mode (per-chunk); empty in HOST mode (uses _memory_space).
+  std::vector<cucascade::memory::memory_space*> _chunk_memory_spaces;
   std::vector<std::size_t> _column_indices;
   cucascade::memory::memory_space* _memory_space;
+  // HOST-mode only: device_id -> GPU memory_space lookup used at produce_split
+  // time to materialize host chunks onto the executing GPU.
+  std::unordered_map<int, cucascade::memory::memory_space*> _gpu_memory_spaces;
   std::shared_ptr<duckdb::Expression> _filter_expression;
   std::shared_ptr<op::scan::scan_plan const> _plan;
   std::atomic<std::size_t> _next_batch_idx{0};

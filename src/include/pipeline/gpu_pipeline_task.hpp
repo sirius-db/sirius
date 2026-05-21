@@ -71,6 +71,20 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
   std::unique_ptr<op::operator_data> _input_data;  ///< Input data batches for the pipeline
   size_t _start_operator_index = 0;  ///< Operator index to resume from (0 = start of pipeline)
 
+  /**
+   * @brief Set the preferred GPU device ID for this task based on data locality.
+   *
+   * @param device_id The GPU device ID where the majority of input data resides
+   */
+  void set_preferred_device_id(int device_id) { _preferred_device_id = device_id; }
+
+  /**
+   * @brief Get the preferred GPU device ID for this task.
+   *
+   * @return The preferred device ID, or std::nullopt if not set
+   */
+  [[nodiscard]] std::optional<int> get_preferred_device_id() const { return _preferred_device_id; }
+
   /// Number of times this task has been retried due to OOM (0 = first attempt).
   uint32_t retry_count = 0;
   /// Task ID of the original (non-retried) task; only meaningful when retry_count > 0.
@@ -98,6 +112,9 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
     }
     return input_size;
   }
+
+ private:
+  std::optional<int> _preferred_device_id;  ///< Preferred GPU device based on data locality
 };
 
 /**
@@ -133,6 +150,24 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    * @param stream CUDA stream used for device memory operations and kernel launches
    */
   void execute(rmm::cuda_stream_view stream) override;
+
+  /**
+   * @brief Get the preferred GPU device ID for this task.
+   *
+   * Checks local_state first (per-task override), then global_state (pipeline default).
+   *
+   * @return The preferred device ID, or std::nullopt if not set at either level
+   */
+  [[nodiscard]] std::optional<int> get_preferred_device_id() const
+  {
+    if (auto* ls = dynamic_cast<const gpu_pipeline_task_local_state*>(_local_state.get())) {
+      if (ls->get_preferred_device_id().has_value()) { return ls->get_preferred_device_id(); }
+    }
+    if (auto gs = std::dynamic_pointer_cast<const gpu_pipeline_task_global_state>(_global_state)) {
+      return gs->get_preferred_device_id();
+    }
+    return std::nullopt;
+  }
 
   /**
    * @brief Get the unique identifier for this task
@@ -218,7 +253,7 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
   uint64_t _task_id;
   std::vector<cucascade::shared_data_repository*> _data_repos;
   cucascade::memory::reservation_aware_resource_adaptor* _allocator = nullptr;
-  /// Input data_batches held for subscribe/unsubscribe lifecycle (LIFE-01/LIFE-02, D-06)
+  /// Input data_batches held for subscribe/unsubscribe lifecycle
   std::vector<std::shared_ptr<cucascade::data_batch>> _input_batches;
 };
 

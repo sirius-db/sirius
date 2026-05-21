@@ -29,8 +29,12 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <vector>
 
 namespace sirius::op {
 class sirius_physical_operator;
@@ -160,6 +164,16 @@ class duckdb_scan_executor : public sirius::parallel::itask_executor {
    */
   void submit_scan_request();
 
+  /**
+   * @brief Select the target GPU for the next scan batch.
+   *
+   * Distributes scan batches across GPUs proportional to available GPU memory.
+   * Falls back to round-robin when all GPUs are at capacity.
+   *
+   * @return The device_id of the GPU to target for the next scan batch.
+   */
+  int select_target_gpu();
+
   std::unique_ptr<op::operator_data> get_scan_output(pipeline::sirius_pipeline_itask* task,
                                                      rmm::cuda_stream_view stream);
 
@@ -174,10 +188,34 @@ class duckdb_scan_executor : public sirius::parallel::itask_executor {
   cache_level _cache_level{cache_level::NONE};
   bool _preload_mode{false};
 
-  std::unique_ptr<cucascade::memory::exclusive_stream_pool> _stream_pool;
+  // Per-GPU stream pools keyed by device_id. Each pool's streams are constructed
+  // under the corresponding device's context (rmm::cuda_set_device_raii), so
+  // acquired streams are target-bound and safe for cudf/RMM allocation + H2D
+  // copies on that device. Replaces the former single `_stream_pool` that was
+  // always bound to GPU 0 regardless of select_target_gpu()'s choice — the root
+  // cause of the v1.1 post-ship `cudaErrorInvalidValue` at cuda_memcpy.cu
+  // (FIX-01, v1.2). Mirrors gpu_pipeline_executor's per-executor pool shape
+  // (src/pipeline/gpu_pipeline_executor.cpp:45) lifted to the multi-GPU case.
+  std::unordered_map<int, std::unique_ptr<cucascade::memory::exclusive_stream_pool>>
+    _gpu_stream_pools;
   exec::publisher<std::unique_ptr<sirius::pipeline::task_request>> _task_request_publisher;
   cucascade::memory::memory_reservation_manager* _mem_mgr{nullptr};
-  cucascade::memory::memory_space* _gpu_memory_space{nullptr};
+  cucascade::memory::memory_space* _gpu_memory_space{
+    nullptr};  ///< First GPU space (backward compat)
+  std::vector<cucascade::memory::memory_space*> _gpu_memory_spaces;  ///< All GPU memory spaces
+  std::atomic<size_t> _scan_round_robin{0};  ///< Round-robin counter for scan distribution
+
+  // Sticky batch→GPU affinity, recorded atomically with the [mgpu-audit]
+  // batch_id=K emission in select_target_gpu(). The key is the `counter`
+  // value from _scan_round_robin that doubles as the audit-log batch_id; the
+  // value is the device_id chosen for that batch. Cleared in
+  // prepare_cache_for_scan_operators alongside _scan_round_robin (never let
+  // the counter and the map drift — a stale entry from a prior query would
+  // collide with a new counter value). Guarded by _batch_affinity_mutex;
+  // contention is negligible vs. I/O cost per batch.
+  mutable std::mutex _batch_affinity_mutex;
+  std::unordered_map<uint64_t, int> _batch_gpu_affinity;
+
   sirius::creator::task_creator* _task_creator{nullptr};
   sirius::pipeline::completion_handler* _completion_handler{nullptr};
 };

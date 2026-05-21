@@ -396,7 +396,7 @@ TEST_CASE("parquet_scan with translatable filter sets table_scan passthrough",
 
   // INT64 > 3 should translate successfully
   REQUIRE(table_scan.passthrough == true);
-  REQUIRE(parquet_scan.translated_filter.has_value());
+  REQUIRE(!parquet_scan.translated_filter_by_device.empty());
   REQUIRE(!table_scan.filter_expr.is_null());
 
   // In passthrough mode, execute() returns input data unchanged
@@ -455,7 +455,8 @@ TEST_CASE("parquet_scan with decimal filter sets table_scan passthrough",
   cols.push_back(std::move(col0));
   cols.push_back(std::move(col1));
   auto table    = std::make_unique<cudf::table>(std::move(cols));
-  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(std::move(table), *space);
+  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
+    std::move(table), *space, cudf::get_default_stream());
   auto input_batch = std::make_shared<cucascade::data_batch>(0, std::move(gpu_repr));
 
   // Filter: col0 > 3.00 (decimal column-vs-literal comparisons translate to cuDF AST)
@@ -499,7 +500,7 @@ TEST_CASE("parquet_scan with decimal filter sets table_scan passthrough",
 
   // DECIMAL64 > 3.00 should translate successfully
   REQUIRE(table_scan.passthrough == true);
-  REQUIRE(parquet_scan.translated_filter.has_value());
+  REQUIRE(!parquet_scan.translated_filter_by_device.empty());
   REQUIRE(!table_scan.filter_expr.is_null());
 
   // In passthrough mode, execute() returns input data unchanged

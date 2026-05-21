@@ -84,7 +84,7 @@ TEST_CASE("sirius_physical_grouped_aggregate_merge grouped aggregates single dat
   // For merge test, the input is already aggregated data (the expected table)
   // The merge operator should return it unchanged for a single batch
   auto input_table = std::make_unique<cudf::table>(expected_table->view());
-  auto input_batch = sirius::make_data_batch(std::move(input_table), *space);
+  auto input_batch = sirius::make_data_batch(std::move(input_table), *space, stream);
 
   auto outputs = grouped_aggregate_merger.execute(
     pipelineable_operator_data({std::move(input_batch)}), default_stream());
@@ -170,7 +170,7 @@ TEMPLATE_TEST_CASE(
 
   for (auto& input_table : input_tables) {
     std::shared_ptr<data_batch> input_batch =
-      sirius::make_data_batch(std::move(input_table), *space);
+      sirius::make_data_batch(std::move(input_table), *space, stream);
 
     auto outputs =
       grouped_aggregator.execute(pipelineable_operator_data({input_batch}), default_stream());
@@ -268,7 +268,7 @@ TEMPLATE_TEST_CASE("sirius_physical_grouped_aggregate_merge end-to-end with AVG"
   // Run local aggregation on each split
   std::vector<std::shared_ptr<data_batch>> agg_outputs;
   for (auto& split_table : input_tables) {
-    auto input_batch = sirius::make_data_batch(std::move(split_table), *space);
+    auto input_batch = sirius::make_data_batch(std::move(split_table), *space, stream);
     auto outputs =
       grouped_aggregator.execute(pipelineable_operator_data({input_batch}), default_stream());
     REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() ==

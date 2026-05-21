@@ -22,10 +22,17 @@
 #include <data/sirius_converter_registry.hpp>
 #include <expression_executor/gpu_expression_translator_internal.hpp>
 #include <helper/type_conversions.hpp>
+#include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
 #include <op/scan/parquet_scan_task.hpp>
 #include <op/sirius_physical_parquet_scan.hpp>
 #include <pipeline/sirius_pipeline.hpp>
+// Include uring_reactor LAST among sirius headers — liburing.h transitively
+// pulled by uring_reactor.hpp defines a BLOCK_SIZE macro that collides with
+// the BLOCK_SIZE static member in <blockingconcurrentqueue.h> (used by spdlog
+// / pipeline). All consumers of blockingconcurrentqueue.h must precede this
+// include.
+#include <io/uring/uring_reactor.hpp>
 
 // cucascade
 #include <cucascade/data/cpu_data_representation.hpp>
@@ -52,11 +59,16 @@
 #include <cudf/io/parquet_io_utils.hpp>
 #endif
 
+// rmm
+#include <rmm/cuda_stream.hpp>
+
 // standard library
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstring>
+#include <filesystem>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -207,10 +219,12 @@ std::vector<byte_range_info> merge_byte_ranges(std::vector<byte_range_info> cons
 parquet_scan_task_global_state::parquet_scan_task_global_state(
   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
   sirius_physical_parquet_scan* scan_op,
-  std::size_t approximate_batch_size)
+  std::size_t approximate_batch_size,
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs)
   : pipeline::sirius_pipeline_task_global_state(pipeline),
     _approximate_batch_size(approximate_batch_size),
-    _scan_op(scan_op)
+    _scan_op(scan_op),
+    _gpu_ioctxs(std::move(gpu_ioctxs))
 {
   if (scan_op->function.in_out_function) {
     throw std::runtime_error(
@@ -267,12 +281,14 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
   sirius_physical_parquet_scan* scan_op,
   std::vector<std::string> file_paths,
   std::vector<size_t> selected_column_indices,
-  std::size_t approximate_batch_size)
+  std::size_t approximate_batch_size,
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs)
   : pipeline::sirius_pipeline_task_global_state(pipeline),
     _approximate_batch_size(approximate_batch_size),
     _scan_op(scan_op),
     _selected_column_indices(std::move(selected_column_indices)),
-    _file_paths(std::move(file_paths))
+    _file_paths(std::move(file_paths)),
+    _gpu_ioctxs(std::move(gpu_ioctxs))
 {
   if (_file_paths.empty()) {
     throw std::runtime_error("[parquet_scan_task_global_state] No input files to scan");
@@ -307,10 +323,29 @@ void parquet_scan_task_global_state::initialize_from_files()
   _file_sizes.reserve(_file_paths.size());
   _metadata_byte_sizes.reserve(_file_paths.size());
   _footer_offsets.reserve(_file_paths.size());
+  _file_io_objects.reserve(_file_paths.size());
+
+  // Use sirius_datasource (io_uring + per-GPU ioctx) for planning-time reads.
+  // Pick the first available GPU ioctx deterministically; the reads are small
+  // (footer only) and don't populate per-GPU row-group allocations, so
+  // context mismatch is correctness-neutral.
+  auto const planning_ioctx_it = _gpu_ioctxs.begin();
+  if (planning_ioctx_it == _gpu_ioctxs.end()) {
+    throw std::runtime_error(
+      "[parquet_scan_task_global_state] No GPU sirius_ioctxs configured — "
+      "SiriusContext::initialize() must have populated at least one.");
+  }
 
   for (auto const& file_path : _file_paths) {
-    auto datasource      = cudf::io::datasource::create(file_path);
-    auto const file_size = datasource->size();
+    // Cache uring_io_object on global_state — its ctor opens 2 fds (O_RDONLY +
+    // O_RDONLY|O_DIRECT). Reusing across all per-task datasource constructions
+    // avoids per-task fd reopens at high scale factors.
+    auto io_object       = planning_ioctx_it->second->create_io_object(file_path);
+    auto const file_size = io_object->size();
+    // ioctx->make_datasource(io_object) returns a unique_ptr<cudf::io::datasource>
+    // wrapping a sirius_datasource that delegates every read to the owning ioctx.
+    auto datasource = planning_ioctx_it->second->make_datasource(io_object);
+    _file_io_objects.push_back(std::move(io_object));
     datasources.push_back(std::move(datasource));
 
 #if CUDF_VERSION_NUM >= 2604
@@ -333,7 +368,7 @@ void parquet_scan_task_global_state::initialize_from_files()
   _reader_options = cudf::io::parquet_reader_options::builder().build();
 
   // If filtering or projecting, we need column names
-  bool const do_filter    = _scan_op->translated_filter.has_value();
+  bool const do_filter    = !_scan_op->translated_filter_by_device.empty();
   bool const is_projected = !_scan_op->projection_ids.empty();
   if (do_filter || is_projected) {
     if (_scan_op->names.empty()) {
@@ -494,12 +529,17 @@ void parquet_scan_task_global_state::initialize_from_files()
 
   //===----------Filters----------===//
   if (do_filter) {
-    // The filter was attempted in the physical operator constructor.
-    // If translation failed, the table scan operator will execute the filter, otherwise the table
-    // scan operator will be a no-op passthrough.
-    _translated_filter = std::make_shared<gpu_expression_translator::translated_expression>(
-      std::move(*_scan_op->translated_filter));
-    _reader_options.set_filter(_translated_filter->back());
+    // Per-GPU filter expressions were built by the physical operator constructor
+    // (one per configured GPU). We move the whole map into shared ownership so
+    // host_parquet_representation can keep it alive across all tasks. The filter is
+    // NOT set on _reader_options here because a single _reader_options instance is
+    // shared by all tasks regardless of target GPU; set_filter with a device-
+    // specific tree here would bind everyone to one device. Instead, each converter
+    // call selects the right per-device tree and calls set_filter on its own opts
+    // copy under target_device_raii.
+    _translated_filter_by_device =
+      std::make_shared<std::unordered_map<int, gpu_expression_translator::translated_expression>>(
+        std::move(_scan_op->translated_filter_by_device));
   }
 
   // Verify projected columns are flat (we don't support nested projections yet).
@@ -525,9 +565,30 @@ void parquet_scan_task_global_state::initialize_from_files()
   // _selected_column_indices entry (DuckDB primary index) to the parquet
   // column position. This is necessary because after hive partition removal
   // the DuckDB indices no longer coincide with parquet column positions.
+  //
+  // Explicit stream for the planning-time filter_row_groups_with_stats call
+  // below. A throwaway local stream is sufficient here — this is scan-plan
+  // time, called once per file, and the filter call is self-contained (no
+  // other work queued on this stream). The default-stream sentinel is
+  // forbidden everywhere in Sirius.
+  rmm::cuda_stream planning_stream;
+  // Pick the per-device filter entry that matches the current device for
+  // planning-time row-group pruning. Tasks will later pick their own entry at
+  // converter time; this planning-time set_filter is just for the metadata
+  // stats evaluation on this thread.
+  cudf::io::parquet_reader_options planning_options = _reader_options;
+  if (_translated_filter_by_device && !_translated_filter_by_device->empty()) {
+    int planning_device = 0;
+    (void)::cudaGetDevice(&planning_device);
+    auto it = _translated_filter_by_device->find(planning_device);
+    if (it == _translated_filter_by_device->end()) {
+      it = _translated_filter_by_device->begin();  // fallback to any device
+    }
+    planning_options.set_filter(it->second.back());
+  }
   for (std::size_t file_idx = 0; file_idx < _file_paths.size(); ++file_idx) {
-    auto row_group_indices = readers[file_idx]->all_row_groups(_reader_options);
-    if (_translated_filter) {
+    auto row_group_indices = readers[file_idx]->all_row_groups(planning_options);
+    if (_translated_filter_by_device && !_translated_filter_by_device->empty()) {
       auto const row_groups_before_pruning = row_group_indices.size();
       // clang-format off
       SIRIUS_LOG_INFO("[parquet_scan_task_global_state] Row group pruning: file: {}\n" \
@@ -537,7 +598,7 @@ void parquet_scan_task_global_state::initialize_from_files()
       // clang-format on
       // Prune row groups with filter pushdown using metadata statistics.
       row_group_indices = readers[file_idx]->filter_row_groups_with_stats(
-        row_group_indices, _reader_options, rmm::cuda_stream_default);
+        row_group_indices, planning_options, planning_stream.view());
       auto const row_groups_after_pruning = row_group_indices.size();
       auto const pruned_row_groups        = row_groups_before_pruning - row_groups_after_pruning;
       // clang-format off
@@ -696,7 +757,7 @@ void parquet_scan_task_global_state::build_schema_reconciliation(
                           output_cols   = std::move(output_cols)](
                            std::unique_ptr<cudf::table> tbl,
                            std::string const& file_path,
-                           std::vector<std::string> const& /*partition_values*/,
+                           [[maybe_unused]] std::vector<std::string> const& partition_values,
                            rmm::cuda_stream_view stream) -> std::unique_ptr<cudf::table> {
     if (!tbl || tbl->num_rows() == 0) return tbl;
 
@@ -773,10 +834,9 @@ void parquet_scan_task::execute(rmm::cuda_stream_view stream)
     auto& pipelineable_output_data = dynamic_cast<op::pipelineable_operator_data&>(*output_data);
     std::size_t output_bytes       = 0;
     for (const auto& batch : pipelineable_output_data.get_data_batches()) {
-      if (batch) {
-        auto ro = batch->to_read_only();
-        if (ro.get_data()) { output_bytes += ro.get_data()->get_size_in_bytes(); }
-      }
+      if (!batch) { continue; }
+      auto ro = batch->to_read_only();
+      if (ro.get_data()) { output_bytes += ro.get_data()->get_size_in_bytes(); }
     }
     auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
     g_state.get_memory_history().record({estimated_bytes, output_bytes, output_bytes});
@@ -791,8 +851,56 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
   auto& l_state = this->_local_state->cast<parquet_scan_task_local_state>();
   auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
 
+  // [mgpu-probe] breadcrumb at the upstream H2D boundary. Pair with the
+  // host_parquet_representation_converters.cpp breadcrumb to localize
+  // device-context drift between compute_task and lock_or_prepare_batch.
+  {
+    int current_device = -1;
+    (void)cudaGetDevice(&current_device);
+    // Two-tier lookup mirrors gpu_pipeline_task::get_preferred_device_id —
+    // reports the effective value _datasource construction below will see.
+    auto const local_preferred_probe = l_state.get_preferred_device_id();
+    auto const preferred_probe =
+      local_preferred_probe.has_value() ? local_preferred_probe : g_state.get_preferred_device_id();
+    auto* memspace_probe = l_state.get_memory_space();
+    SIRIUS_LOG_INFO(
+      "[mgpu-probe] parquet_scan_task::compute_task entry current_device={} stream={} "
+      "preferred_device_id={} memspace_device_id={}",
+      current_device,
+      static_cast<void*>(stream.value()),
+      preferred_probe.value_or(-1),
+      memspace_probe != nullptr ? memspace_probe->get_device_id() : -1);
+  }
+
   if (!_datasource) {
-    _datasource = cudf::io::datasource::create(g_state.get_file_path(l_state.get_file_idx()));
+    // Falling back to ioctxs.begin() when no preference is set mirrors the
+    // pipeline_executor's own default for non-gpu_pipeline_task instances —
+    // keeps datasource construction aligned with executor routing and avoids
+    // silent context mismatch.
+    auto const& ioctxs = g_state.get_gpu_ioctxs();
+    if (ioctxs.empty()) {
+      throw std::runtime_error(
+        "[parquet_scan_task::compute_task] no GPU sirius_ioctxs configured — "
+        "SiriusContext::initialize() must have populated at least one");
+    }
+    // Two-tier lookup: local state wins over global. Must match the probe
+    // log idiom above so log values reflect the actual routing decision.
+    auto const local_preferred = l_state.get_preferred_device_id();
+    auto const preferred =
+      local_preferred.has_value() ? local_preferred : g_state.get_preferred_device_id();
+    auto ioctx_it = preferred.has_value() ? ioctxs.find(*preferred) : ioctxs.begin();
+    if (ioctx_it == ioctxs.end()) {
+      throw std::out_of_range("[parquet_scan_task::compute_task] no sirius_ioctx for device_id=" +
+                              std::to_string(preferred.value_or(-1)));
+    }
+    // Reuse the cached uring_io_object — populated at planning time inside
+    // initialize_from_files() so we don't re-open fds per task.
+    auto io_object = g_state.get_file_io_object(l_state.get_file_idx());
+    // make_datasource returns unique_ptr<cudf::io::datasource>; convert to
+    // shared_ptr for the _datasource member which is shared because it may be
+    // observed from multiple downstream representation converters.
+    _datasource = std::shared_ptr<cudf::io::datasource>(
+      ioctx_it->second->make_datasource(std::move(io_object)));
   }
 
   auto reader = g_state.make_reader(l_state.get_file_idx());
@@ -863,7 +971,7 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
                                                   l_state.get_reserved_uncompressed_bytes(),
                                                   file_size,
                                                   _datasource,
-                                                  g_state.get_filter_expression(),
+                                                  g_state.get_filter_expression_by_device(),
                                                   g_state.get_post_filter_projection_ids());
 
   // Propagate hooks and data-file path to the converter.
@@ -872,20 +980,6 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
   }
   if (g_state.has_partition_inject_fn()) {
     parquet_representation->set_partition_inject_fn(g_state.get_partition_inject_fn());
-    // Compute partition values once per task from the file path. The inject closure indexes
-    // them in hive_partition_columns order rather than re-parsing the path at each call.
-    auto const& file_path         = g_state.get_file_path(l_state.get_file_idx());
-    auto const& partition_columns = g_state.get_hive_partition_columns();
-    std::vector<std::string> partition_values;
-    partition_values.reserve(partition_columns.size());
-    if (!partition_columns.empty()) {
-      auto parsed = duckdb::HivePartitioning::Parse(file_path);
-      for (auto const& pc : partition_columns) {
-        auto it = parsed.find(pc.column_name);
-        partition_values.push_back(it != parsed.end() ? it->second : std::string{});
-      }
-    }
-    parquet_representation->set_partition_values(std::move(partition_values));
   }
   if (g_state.has_post_convert_fn() || g_state.has_partition_inject_fn()) {
     parquet_representation->set_data_file_path(g_state.get_file_path(l_state.get_file_idx()));
@@ -932,6 +1026,7 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
     result->get_data_batches().size(),
     num_rgs,
     task_duration.count() / 1000.0);
+
   return result;
 }
 
@@ -939,7 +1034,7 @@ void parquet_scan_task::publish_output(op::operator_data& output_data,
                                        rmm::cuda_stream_view /* stream */)
 {
   auto& pipelineable_output = dynamic_cast<op::pipelineable_operator_data&>(output_data);
-  for (auto& batch : pipelineable_output.get_data_batches()) {
+  for (auto const& batch : pipelineable_output.get_data_batches()) {
     _data_repo->add_data_batch(batch);
   }
 }

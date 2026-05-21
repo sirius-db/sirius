@@ -61,7 +61,7 @@ std::shared_ptr<cucascade::data_batch> gpu_order_impl::local_order_by(
                                    memory_space.get_default_allocator());
 
   // Create the output data batch
-  return make_data_batch(std::move(output_table), memory_space);
+  return make_data_batch(std::move(output_table), memory_space, stream);
 }
 
 }  // namespace op

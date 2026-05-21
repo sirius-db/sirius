@@ -98,4 +98,22 @@ class shared_test_env {
 extern shared_test_env* g_shared_env;
 extern shared_test_env* g_integration_env;
 
+// 2-GPU integration env (TEST-01/02 v1.2). Mirrors g_integration_env but
+// backed by integration-2gpu.yaml. TEST_CASE bodies can select which env
+// to use via acquire_integration_env_for(num_gpus) or directly via
+// g_integration_env_2gpu->is_active().
+extern shared_test_env* g_integration_env_2gpu;
+
+/**
+ * @brief Returns the shared env corresponding to num_gpus, for binding by the caller.
+ *
+ * Caller is responsible for resume()/pause() lifecycle if not using the Catch2
+ * listener's tag-based mechanism. On single-GPU hosts when num_gpus == 2, returns
+ * nullptr (caller should WARN+return per Catch2 v2 convention).
+ *
+ * @param num_gpus 1 returns g_integration_env; 2 returns g_integration_env_2gpu
+ *                 (or nullptr on single-GPU host); other values return nullptr.
+ */
+shared_test_env* acquire_integration_env_for(int num_gpus);
+
 }  // namespace sirius::test

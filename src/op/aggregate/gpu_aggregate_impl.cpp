@@ -107,7 +107,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_ungrouped_aggre
   auto output_table = std::make_unique<cudf::table>(
     std::move(output_cols), stream, memory_space.get_default_allocator());
 
-  return make_data_batch(std::move(output_table), memory_space);
+  return make_data_batch(std::move(output_table), memory_space, stream);
 }
 
 std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggregate(
@@ -313,7 +313,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   // Create the output data batch
   auto output_table = std::make_unique<cudf::table>(
     std::move(output_cols), stream, memory_space.get_default_allocator());
-  return make_data_batch(std::move(output_table), memory_space);
+  return make_data_batch(std::move(output_table), memory_space, stream);
 }
 
 }  // namespace op

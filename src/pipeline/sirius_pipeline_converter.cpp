@@ -121,6 +121,7 @@ pipeline_conversion_result sirius_pipeline_converter::convert(sirius_meta_pipeli
   setup_pipeline_parents();
   finalize_pipeline_structure();
   link_join_partition_siblings();
+  configure_partition_min_partitions();
 
   return {std::move(scheduled_),
           std::move(inserted_operators_),
@@ -209,6 +210,9 @@ sirius_pipeline_converter::schedule_and_copy_pipelines(sirius_meta_pipeline& roo
   return copied_scheduled;
 }
 
+// TODO: batch_lock_utils RAII migration may affect this converter — review.
+// TODO: if writer_event recording happens here, ensure the
+// cudaStreamWaitEvent chain remains intact post-Scan-Manager.
 //===----------------------------------------------------------------------===//
 // insert_parquet_scan_operator()
 //
@@ -1082,6 +1086,37 @@ void sirius_pipeline_converter::link_join_partition_siblings()
         probe_partition_op.set_sibling_partition_op(&build_partition_op);
       }
     }
+  }
+}
+
+void sirius_pipeline_converter::configure_partition_min_partitions()
+{
+  // Pull num_gpus from the build context (populated from sirius_engine's
+  // hardware topology at convert time). Single-GPU runs keep the default
+  // min of 1 (no-op). For multi-GPU we force a floor equal to num_gpus on
+  // big-enough inputs; small_table_bytes keeps tiny aggregations on a
+  // single GPU to avoid cross-device overhead.
+  const int num_gpus = build_ctx_.num_gpus;
+  if (num_gpus <= 1) return;
+  // Heuristic threshold: below ~16 MiB per GPU the partition overhead
+  // dominates. Configurable later if we find a workload where this matters.
+  const uint64_t small_table_bytes = static_cast<uint64_t>(num_gpus) * uint64_t{16} * 1024 * 1024;
+
+  auto apply_to_op = [&](op::sirius_physical_operator* op) {
+    if (op && op->type == op::SiriusPhysicalOperatorType::PARTITION) {
+      static_cast<op::sirius_physical_partition*>(op)->set_min_num_partitions(num_gpus,
+                                                                              small_table_bytes);
+    }
+  };
+  for (auto& breaker : inserted_operators_) {
+    apply_to_op(breaker.get());
+  }
+  for (auto& pipe : scheduled_) {
+    if (!pipe) continue;
+    auto sink   = pipe->get_sink();
+    auto source = pipe->get_source();
+    if (sink) apply_to_op(sink.get());
+    if (source) apply_to_op(source.get());
   }
 }
 
