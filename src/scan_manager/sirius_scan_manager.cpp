@@ -43,94 +43,29 @@
 namespace sirius::scan_manager {
 
 sirius_scan_manager::sirius_scan_manager(
-  scan_manager_config config, cucascade::memory::fixed_size_host_memory_resource* host_mr)
+  scan_manager_config config, std::vector<std::shared_ptr<sirius::io::sirius_ioctx>> io_ctxs)
   : _config(std::move(config)),
     _thread_pool(_config.thread_pool.num_threads,
                  _config.thread_pool.thread_name_prefix,
                  _config.thread_pool.cpu_affinity_list),
     _dispatcher(
-      std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads))
+      std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads)),
+    _io_ctxs(std::move(io_ctxs))
 {
-  std::shared_ptr<sirius::io::sirius_ioctx> uring_ctx;
-  if (_config.use_sirius_datasource) {
-    if (host_mr == nullptr) {
-      throw std::runtime_error(
-        "[sirius_scan_manager] use_sirius_datasource is true but no host "
-        "fixed_size_host_memory_resource was provided");
-    }
-    // uring_ioctx uses dev #732's numa-based bounce-buffer ctor (host_ring_depth,
-    // ring_entries, n_reactors — bounce_slot_size + numa_node default). PR4+5's
-    // multi-ioctx vector storage keeps it as _io_ctxs[0] (the local-file backend).
-    // host_mr is no longer passed to uring (dev manages pinned bounce per
-    // numa_node); it still backs the s3 ioctx + prefetch buffer_pool below.
-    uring_ctx = std::make_shared<sirius::io::uring_ioctx>(
-      /*host_ring_depth=*/16u, _config.uring_ring_entries, _config.uring_n_reactors);
-    _io_ctxs.push_back(uring_ctx);
-    SIRIUS_LOG_DEBUG(
-      "[sirius_scan_manager] sirius_datasource enabled (uring_ioctx n_reactors={} ring_entries={})",
-      _config.uring_n_reactors,
-      _config.uring_ring_entries);
-    // Cache initialization moved to AFTER s3_ioctx construction (line ~120+)
-    // so all _io_ctxs share the same buffer_pool. Uses host_mr->get_block_size()
-    // for slab sizing per Amin's d95f43a2 dynamic chunk size.
-  } else {
-    SIRIUS_LOG_DEBUG(
-      "[sirius_scan_manager] sirius_datasource disabled — falling back to "
-      "cudf::io::datasource::create");
-  }
-
-  // Construct the S3 backend on top of the local-file backend. Order matters:
-  // io_ctx_for() walks _io_ctxs and returns the first match, so the local
-  // backend (which supports file:// and bare absolute paths) is tried before
-  // S3 (which only claims s3:// prefixes). Cross-claim is impossible since
-  // their supports() are disjoint, but order keeps lookup deterministic.
-  if (_config.s3_config) {
-    // S3 async paths need a caller-owned thread pool to avoid per-request
-    // detached std::thread fallback. Construct it BEFORE the s3_ioctx and
-    // inject via s3_ioctx_config::async_thread_pool.
-    _s3_thread_pool =
-      std::make_unique<exec::static_thread_pool>(_config.s3_thread_pool.num_threads,
-                                                 _config.s3_thread_pool.thread_name_prefix,
-                                                 _config.s3_thread_pool.cpu_affinity_list);
-    auto s3_cfg                 = *_config.s3_config;
-    s3_cfg.async_thread_pool    = _s3_thread_pool.get();
-    s3_cfg.host_memory_resource = host_mr;
-    auto s3_ctx                 = std::make_shared<sirius::io::s3::s3_ioctx>(std::move(s3_cfg));
-    _io_ctxs.push_back(s3_ctx);
-    SIRIUS_LOG_DEBUG("[sirius_scan_manager] s3 backend enabled (s3_thread_pool num_threads={})",
-                     _config.s3_thread_pool.num_threads);
-  }
-
-  if (_config.enable_prefetch_cache && !_io_ctxs.empty()) {
-    if (host_mr == nullptr) {
-      throw std::runtime_error(
-        "[sirius_scan_manager] enable_prefetch_cache is true but no host "
-        "fixed_size_host_memory_resource was provided");
-    }
-    auto const slab_bytes = host_mr->get_block_size() *
-                            static_cast<std::size_t>(sirius::io::buffer_pool::CHUNKS_PER_SLAB);
-    auto const max_slabs =
-      static_cast<uint32_t>((_config.prefetch_buffer_pool_bytes + slab_bytes - 1) / slab_bytes);
-    _buffer_pool = std::make_unique<sirius::io::buffer_pool>(*host_mr, max_slabs);
-    for (auto& ctx : _io_ctxs) {
-      ctx->initialize_cache(*_buffer_pool, _config.prefetch_inflight_budget_chunks);
-    }
-    SIRIUS_LOG_DEBUG(
-      "[sirius_scan_manager] prefetch cache enabled (slabs={} budget_bytes={} "
-      "inflight_chunks={})",
-      max_slabs,
-      max_slabs * slab_bytes,
-      _config.prefetch_inflight_budget_chunks);
-  }
+  // S6 (NUMA) increment 1: the scan_manager no longer constructs IO backends.
+  // SiriusContext owns the uring(s) + s3_ioctx + S3 async thread pool + prefetch
+  // buffer_pool/cache and passes the routing backends in as borrowed
+  // shared_ptrs. io_ctx_for / io_ctx_shared_for dispatch over this borrowed
+  // list; stop() and the destructor must NOT shut down or destroy them.
+  SIRIUS_LOG_DEBUG("[sirius_scan_manager] constructed with {} borrowed IO backend(s)",
+                   _io_ctxs.size());
 }
 
 sirius_scan_manager::~sirius_scan_manager()
 {
-  for (auto const& ctx : _io_ctxs) {
-    if (ctx && ctx->cache() != nullptr) {
-      SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", ctx->cache()->summary());
-    }
-  }
+  // S6: backends + their caches are owned by SiriusContext (which logs cache
+  // summaries on its own teardown). Only stop our scan-orchestration pool here;
+  // do not touch the borrowed backends.
   stop();
 }
 
@@ -485,17 +420,10 @@ void sirius_scan_manager::start() {}
 void sirius_scan_manager::stop()
 {
   reset();
-  // Shut down ioctx FIRST (drains in-flight HTTP / uring submissions) so
-  // their async workers don't try to submit work to a stopped thread pool
-  // after we stop it below. shutdown() is idempotent on s3_ioctx; uring_ioctx
-  // matches that contract per #740's base class.
-  for (auto& ctx : _io_ctxs) {
-    if (ctx) { ctx->shutdown(); }
-  }
-  // Stop the S3 thread pool BEFORE the main thread pool — its workers run
-  // detached completion handlers that may indirectly enqueue work onto
-  // _thread_pool. Stopping S3 first prevents that interleaving.
-  if (_s3_thread_pool) { _s3_thread_pool->stop(); }
+  // S6: the IO backends + the S3 async pool are owned by SiriusContext, which
+  // drains (shutdown) the s3_ioctx and stops the S3 pool during its own
+  // teardown. The scan_manager only stops its scan-orchestration pool here and
+  // must NOT shut down the borrowed backends.
   _thread_pool.stop();
 }
 

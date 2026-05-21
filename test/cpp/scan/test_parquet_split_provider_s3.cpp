@@ -25,6 +25,12 @@
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "scan_manager/split_connector.hpp"
 
+// Include this last among sirius/test headers: it transitively pulls
+// liburing.h, whose BLOCK_SIZE macro collides with blockingconcurrentqueue.h.
+// clang-format off
+#include <scan/test_helpers_ioctx.hpp>
+// clang-format on
+
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 #include <duckdb.hpp>
@@ -46,6 +52,7 @@
 #include <vector>
 
 using sirius::io::buffer_pool;
+using sirius::io::sirius_ioctx;
 using sirius::io::s3::s3_ioctx;
 using sirius::io::s3::s3_ioctx_config;
 using sirius::io::s3::sirius_sigv4_credential_provider;
@@ -217,12 +224,21 @@ sirius_scan_manager make_scan_manager(cucascade::memory::fixed_size_host_memory_
   scan_manager_config cfg{};
   cfg.use_sirius_datasource = true;
   cfg.uring_n_reactors      = 1;
+
+  std::vector<std::shared_ptr<sirius_ioctx>> borrowed_ioctxs;
+  auto gpu_ioctxs = sirius::scan_test_utils::make_test_gpu_ioctxs(1);
+  REQUIRE_FALSE(gpu_ioctxs.empty());
+  borrowed_ioctxs.push_back(gpu_ioctxs.begin()->second);
+
   if (env) {
-    cfg.s3_config                         = make_live_s3_config(*env);
+    auto s3_cfg                           = make_live_s3_config(*env);
+    s3_cfg.host_memory_resource           = &host_mr;
+    cfg.s3_config                         = s3_cfg;
     cfg.s3_thread_pool.num_threads        = 4;
     cfg.s3_thread_pool.thread_name_prefix = "s3_psp";
+    borrowed_ioctxs.push_back(std::make_shared<s3_ioctx>(std::move(s3_cfg)));
   }
-  return sirius_scan_manager(std::move(cfg), &host_mr);
+  return sirius_scan_manager(std::move(cfg), std::move(borrowed_ioctxs));
 }
 
 parquet_split_provider make_provider(std::vector<std::string> paths,
