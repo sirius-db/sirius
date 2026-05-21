@@ -20,13 +20,18 @@
 #include <duckdb/parser/tableref/table_function_ref.hpp>
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <memory>
+#include <numeric>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -146,6 +151,13 @@ sirius_memory_limits large_sirius_memory_limits_without_chunk_prewarm()
 {
   auto limits                 = large_sirius_memory_limits();
   limits.enable_chunk_prewarm = false;
+  return limits;
+}
+
+sirius_memory_limits large_sirius_memory_limits_with_chunk_prewarm(bool enabled)
+{
+  auto limits                 = large_sirius_memory_limits();
+  limits.enable_chunk_prewarm = enabled;
   return limits;
 }
 
@@ -608,6 +620,321 @@ std::string large_lineitem_orders_join_query(std::string const& lineitem_scan,
          "WHERE o.o_orderdate < DATE '1995-03-15'";
 }
 
+struct b1_cache_counters {
+  std::uint64_t hit_count{0};
+  std::uint64_t hit_after_wait{0};
+  std::uint64_t partial_miss{0};
+  std::uint64_t full_miss{0};
+  std::uint64_t range_miss{0};
+};
+
+b1_cache_counters snapshot_cache(sirius::io::prefetching_cache const& cache)
+{
+  return b1_cache_counters{cache.hit_count_total(),
+                           cache.hit_after_wait_total(),
+                           cache.partial_miss_count_total(),
+                           cache.full_miss_count_total(),
+                           cache.range_miss_count_total()};
+}
+
+b1_cache_counters operator-(b1_cache_counters const& after, b1_cache_counters const& before)
+{
+  return b1_cache_counters{after.hit_count - before.hit_count,
+                           after.hit_after_wait - before.hit_after_wait,
+                           after.partial_miss - before.partial_miss,
+                           after.full_miss - before.full_miss,
+                           after.range_miss - before.range_miss};
+}
+
+struct b1_metrics {
+  double wall_clock_ms{0};
+  std::uint64_t bytes_read{0};
+  std::uint64_t fsmr_borrows{0};
+  b1_cache_counters cache;
+};
+
+struct b1_run_record {
+  std::string query;
+  bool prewarm{true};
+  int iteration{0};
+  b1_metrics metrics;
+};
+
+struct b1_summary {
+  double median{0};
+  double min{0};
+  double max{0};
+};
+
+using b1_metric_getter = double (*)(b1_metrics const&);
+
+double median_sorted(std::vector<double> values)
+{
+  REQUIRE_FALSE(values.empty());
+  std::sort(values.begin(), values.end());
+  auto const mid = values.size() / 2;
+  if (values.size() % 2 == 1) { return values[mid]; }
+  return (values[mid - 1] + values[mid]) / 2.0;
+}
+
+b1_summary summarize_metric(std::vector<b1_run_record> const& records,
+                            std::string_view query,
+                            bool prewarm,
+                            b1_metric_getter getter)
+{
+  std::vector<double> values;
+  for (auto const& record : records) {
+    if (std::string_view{record.query} == query && record.prewarm == prewarm) {
+      values.push_back(getter(record.metrics));
+    }
+  }
+  REQUIRE_FALSE(values.empty());
+  return b1_summary{median_sorted(values),
+                    *std::min_element(values.begin(), values.end()),
+                    *std::max_element(values.begin(), values.end())};
+}
+
+std::string format_double(double value, int precision = 2)
+{
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(precision) << value;
+  return out.str();
+}
+
+std::string format_summary(b1_summary const& summary, bool integral = false)
+{
+  if (integral) {
+    return std::to_string(static_cast<std::uint64_t>(std::llround(summary.median))) + " [" +
+           std::to_string(static_cast<std::uint64_t>(std::llround(summary.min))) + ", " +
+           std::to_string(static_cast<std::uint64_t>(std::llround(summary.max))) + "]";
+  }
+  return format_double(summary.median) + " [" + format_double(summary.min) + ", " +
+         format_double(summary.max) + "]";
+}
+
+std::string format_ratio(double numerator, double denominator)
+{
+  if (denominator == 0.0) { return "n/a"; }
+  return format_double(numerator / denominator, 3);
+}
+
+double metric_wall_ms(b1_metrics const& metrics) { return metrics.wall_clock_ms; }
+double metric_bytes_read(b1_metrics const& metrics)
+{
+  return static_cast<double>(metrics.bytes_read);
+}
+double metric_fsmr_borrows(b1_metrics const& metrics)
+{
+  return static_cast<double>(metrics.fsmr_borrows);
+}
+double metric_hit_count(b1_metrics const& metrics)
+{
+  return static_cast<double>(metrics.cache.hit_count);
+}
+double metric_hit_after_wait(b1_metrics const& metrics)
+{
+  return static_cast<double>(metrics.cache.hit_after_wait);
+}
+double metric_partial_miss(b1_metrics const& metrics)
+{
+  return static_cast<double>(metrics.cache.partial_miss);
+}
+double metric_full_miss(b1_metrics const& metrics)
+{
+  return static_cast<double>(metrics.cache.full_miss);
+}
+double metric_range_miss(b1_metrics const& metrics)
+{
+  return static_cast<double>(metrics.cache.range_miss);
+}
+
+struct b1_metric_row {
+  std::string_view name;
+  b1_metric_getter getter;
+  bool integral{true};
+  bool scale_by_object_size{false};
+};
+
+constexpr std::array<b1_metric_row, 9> b1_metric_rows{{
+  {"wall_clock_ms", metric_wall_ms, false, false},
+  {"bytes_read_total", metric_bytes_read, true, false},
+  {"bytes_read / object_size", metric_bytes_read, false, true},
+  {"fsmr_borrows_total", metric_fsmr_borrows, true, false},
+  {"hit_count_total", metric_hit_count, true, false},
+  {"hit_after_wait_total", metric_hit_after_wait, true, false},
+  {"partial_miss_count_total", metric_partial_miss, true, false},
+  {"full_miss_count_total", metric_full_miss, true, false},
+  {"range_miss_count_total", metric_range_miss, true, false},
+}};
+
+b1_cache_counters sum_cache_counters(std::vector<b1_run_record> const& records,
+                                     std::string_view query,
+                                     bool prewarm)
+{
+  b1_cache_counters out;
+  for (auto const& record : records) {
+    if (std::string_view{record.query} != query || record.prewarm != prewarm) { continue; }
+    out.hit_count += record.metrics.cache.hit_count;
+    out.hit_after_wait += record.metrics.cache.hit_after_wait;
+    out.partial_miss += record.metrics.cache.partial_miss;
+    out.full_miss += record.metrics.cache.full_miss;
+    out.range_miss += record.metrics.cache.range_miss;
+  }
+  return out;
+}
+
+std::string cache_hit_rate(b1_cache_counters const& counters)
+{
+  auto const misses = counters.partial_miss + counters.full_miss + counters.range_miss;
+  auto const total  = counters.hit_count + misses;
+  if (total == 0) { return "n/a"; }
+  return format_double(100.0 * static_cast<double>(counters.hit_count) /
+                       static_cast<double>(total));
+}
+
+std::string dominant_miss_counter(b1_cache_counters const& counters)
+{
+  auto dominant = std::pair<std::string_view, std::uint64_t>{"partial_miss", counters.partial_miss};
+  if (counters.full_miss > dominant.second) { dominant = {"full_miss", counters.full_miss}; }
+  if (counters.range_miss > dominant.second) { dominant = {"range_miss", counters.range_miss}; }
+  return std::string{dominant.first} + "=" + std::to_string(dominant.second);
+}
+
+bool fsmr_nonzero_for_all_records(std::vector<b1_run_record> const& records,
+                                  std::string_view query,
+                                  bool prewarm)
+{
+  bool saw_record = false;
+  for (auto const& record : records) {
+    if (std::string_view{record.query} != query || record.prewarm != prewarm) { continue; }
+    saw_record = true;
+    if (record.metrics.fsmr_borrows == 0) { return false; }
+  }
+  return saw_record;
+}
+
+fs::path b1_bench_output_path()
+{
+  auto path = env_or("SIRIUS_BENCH_OUTPUT_PATH");
+  if (!path.empty()) { return fs::path{path}; }
+  return fs::path{SIRIUS_PROJECT_ROOT} / "pr6-b1-bench-results.md";
+}
+
+void write_b1_bench_markdown(fs::path const& path,
+                             std::vector<b1_run_record> const& records,
+                             std::size_t object_size)
+{
+  if (!path.parent_path().empty()) { fs::create_directories(path.parent_path()); }
+  std::ofstream out(path);
+  REQUIRE(out);
+
+  auto const branch = env_or("SIRIUS_BENCH_BRANCH", "unknown");
+  auto const sha    = env_or("SIRIUS_BENCH_SHA", "unknown");
+  auto const host   = env_or("SIRIUS_BENCH_HOST", "unknown");
+  auto const date   = env_or("SIRIUS_BENCH_DATE", "unknown");
+
+  out << "# B1 Phase 2 — bench results\n\n"
+      << "**Branch / SHA:** " << branch << " @ " << sha << "\n"
+      << "**CI host:** " << host << "\n"
+      << "**Date:** " << date << "\n"
+      << "**SF10 lineitem object size:** " << object_size << " bytes (~"
+      << format_double(static_cast<double>(object_size) / (1024.0 * 1024.0 * 1024.0), 2)
+      << " GiB)\n\n"
+      << "## Raw iteration data\n\n"
+      << "| query | prewarm | iteration | wall_clock_ms | bytes_read_total | "
+         "fsmr_borrows_total | hit_count_total | hit_after_wait_total | "
+         "partial_miss_count_total | full_miss_count_total | range_miss_count_total |\n"
+      << "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n";
+
+  for (auto const& record : records) {
+    out << "|" << record.query << "|" << (record.prewarm ? "ON" : "OFF") << "|" << record.iteration
+        << "|" << format_double(record.metrics.wall_clock_ms) << "|" << record.metrics.bytes_read
+        << "|" << record.metrics.fsmr_borrows << "|" << record.metrics.cache.hit_count << "|"
+        << record.metrics.cache.hit_after_wait << "|" << record.metrics.cache.partial_miss << "|"
+        << record.metrics.cache.full_miss << "|" << record.metrics.cache.range_miss << "|\n";
+  }
+
+  out << "\n## Per-query results\n\n";
+  constexpr std::array<std::string_view, 3> queries{"count", "q1", "join"};
+  for (auto const query : queries) {
+    out << "### " << query;
+    if (query == std::string_view{"q1"}) {
+      out << " — TPC-H Q1 shape (narrowed-date filter)";
+    } else if (query == std::string_view{"join"}) {
+      out << " — lineitem×orders";
+    } else {
+      out << "(*)";
+    }
+    out << "\n\n"
+        << "| metric | prewarm ON median [min, max] | prewarm OFF median [min, max] | "
+           "OFF / ON ratio |\n"
+        << "|---|---:|---:|---:|\n";
+
+    for (auto const& row : b1_metric_rows) {
+      auto on  = summarize_metric(records, query, true, row.getter);
+      auto off = summarize_metric(records, query, false, row.getter);
+      if (row.scale_by_object_size) {
+        auto const scale = static_cast<double>(object_size);
+        on               = b1_summary{on.median / scale, on.min / scale, on.max / scale};
+        off              = b1_summary{off.median / scale, off.min / scale, off.max / scale};
+      }
+      out << "|" << row.name << "|" << format_summary(on, row.integral && !row.scale_by_object_size)
+          << "|" << format_summary(off, row.integral && !row.scale_by_object_size) << "|"
+          << format_ratio(off.median, on.median) << "|\n";
+    }
+    out << "\n";
+  }
+
+  out << "## Observations\n\n";
+  bool direction_a_trigger = false;
+  bool direction_c_trigger = true;
+  for (auto const query : queries) {
+    auto const on_wall   = summarize_metric(records, query, true, metric_wall_ms);
+    auto const off_wall  = summarize_metric(records, query, false, metric_wall_ms);
+    auto const on_bytes  = summarize_metric(records, query, true, metric_bytes_read);
+    auto const off_bytes = summarize_metric(records, query, false, metric_bytes_read);
+    auto const on_cache  = sum_cache_counters(records, query, true);
+    auto const off_cache = sum_cache_counters(records, query, false);
+    auto const total_on_cache =
+      on_cache.hit_count + on_cache.partial_miss + on_cache.full_miss + on_cache.range_miss;
+    auto const hit_rate = total_on_cache == 0 ? 0.0
+                                              : static_cast<double>(on_cache.hit_count) /
+                                                  static_cast<double>(total_on_cache);
+    auto const prewarm_saves_wall =
+      off_wall.median > 0.0 ? (off_wall.median - on_wall.median) / off_wall.median : 0.0;
+    if (prewarm_saves_wall >= 0.10 && hit_rate > 0.50) { direction_a_trigger = true; }
+    if (!(prewarm_saves_wall < 0.10 || hit_rate < 0.05)) { direction_c_trigger = false; }
+
+    out << "- " << query
+        << ": bytes_read_total OFF/ON=" << format_ratio(off_bytes.median, on_bytes.median)
+        << ", wall_clock_ms OFF/ON=" << format_ratio(off_wall.median, on_wall.median)
+        << ", prewarm-ON cache hit rate=" << cache_hit_rate(on_cache)
+        << "%, dominant miss ON=" << dominant_miss_counter(on_cache)
+        << ", dominant miss OFF=" << dominant_miss_counter(off_cache)
+        << ", FSMR borrow count nonzero on both branches="
+        << (fsmr_nonzero_for_all_records(records, query, true) &&
+                fsmr_nonzero_for_all_records(records, query, false)
+              ? "yes"
+              : "no")
+        << ".\n";
+  }
+
+  out << "\n## Phase 3 decision trigger\n\n"
+      << "- If prewarm ON saves >= 10% wall-clock on at least one query AND hit rate > 50%: "
+         "Phase 3 = direction A (fix cache hit alignment).\n"
+      << "- If prewarm ON saves < 10% OR hit rate ~= 0%: Phase 3 = direction C "
+         "(flip default to OFF, tighten byte-budget guard).\n"
+      << "- Trigger evaluation from this run: ";
+  if (direction_a_trigger) {
+    out << "direction A condition met.\n";
+  } else if (direction_c_trigger) {
+    out << "direction C condition met.\n";
+  } else {
+    out << "mixed signal: prewarm ON saves wall-clock, but cache hit rate stays below 50%; "
+           "Phase 3 should review before choosing A vs C.\n";
+  }
+}
+
 }  // namespace
 
 TEST_CASE("sirius_read_parquet is registered as a one-argument table function",
@@ -994,4 +1321,72 @@ TEST_CASE("gpu_execution large S3 lineitem join matches local CPU without chunk 
   REQUIRE(s3_result->RowCount() == baseline_result->RowCount());
   REQUIRE(s3_result->ColumnCount() == baseline_result->ColumnCount());
   CHECK(collect_rows(*s3_result) == collect_rows(*baseline_result));
+}
+
+TEST_CASE("B1 Phase 2 prewarm bench records SF10 S3 SQL telemetry",
+          "[!benchmark][b1_bench][s3][sql][large]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  constexpr int kIterations = 5;
+  struct bench_query {
+    std::string_view name;
+    std::string sql;
+  };
+
+  std::vector<b1_run_record> records;
+  std::optional<std::size_t> object_size;
+
+  for (auto const prewarm : {true, false}) {
+    for (int query_index = 0; query_index < 3; ++query_index) {
+      for (int iteration = 1; iteration <= kIterations; ++iteration) {
+        s3_sql_fixture fixture(*env, large_sirius_memory_limits_with_chunk_prewarm(prewarm));
+        auto large = read_large_lineitem_fixture(fixture, *env);
+        if (!large) { return; }
+        if (!object_size) { object_size = large->object_size; }
+
+        std::array<bench_query, 3> const queries{{
+          {"count", "SELECT count(l_orderkey) FROM " + s3_large_lineitem_scan(*env)},
+          {"q1", tpch_q1_shape_query(s3_large_lineitem_scan(*env))},
+          {"join",
+           large_lineitem_orders_join_query(s3_large_lineitem_scan(*env),
+                                            s3_parquet_scan(*env, "orders"))},
+        }};
+
+        auto& s3_ctx = require_s3_ioctx(fixture, large->uri);
+        REQUIRE(s3_ctx.cache() != nullptr);
+        auto const& query         = queries[static_cast<std::size_t>(query_index)];
+        auto const before_bytes   = s3_ctx.bytes_read_total();
+        auto const before_borrows = s3_ctx.fsmr_borrows_total();
+        auto const before_cache   = snapshot_cache(*s3_ctx.cache());
+
+        auto const start = std::chrono::steady_clock::now();
+        auto result      = require_query_ok(fixture.con, gpu_execution_sql(query.sql));
+        auto const stop  = std::chrono::steady_clock::now();
+
+        auto const after_cache  = snapshot_cache(*s3_ctx.cache());
+        auto const wall_ms      = std::chrono::duration<double, std::milli>(stop - start).count();
+        auto const borrow_delta = s3_ctx.fsmr_borrows_total() - before_borrows;
+
+        REQUIRE(result->RowCount() > 0);
+
+        records.push_back(b1_run_record{
+          std::string{query.name},
+          prewarm,
+          iteration,
+          b1_metrics{wall_ms,
+                     s3_ctx.bytes_read_total() - before_bytes,
+                     borrow_delta,
+                     after_cache - before_cache},
+        });
+      }
+    }
+  }
+
+  REQUIRE(object_size.has_value());
+  REQUIRE(records.size() == 30);
+  auto const output_path = b1_bench_output_path();
+  write_b1_bench_markdown(output_path, records, *object_size);
+  CHECK(fs::exists(output_path));
 }
