@@ -167,6 +167,7 @@ set(EXTENSION_SOURCES
     # I/O adapters (Phase 19 — io_uring + sirius_datasource)
     src/io/admission_control.cpp
     src/io/datasource_factory.cpp
+    src/io/duckdb_io_object.cpp
     src/io/io_context.cpp
     src/io/prefetching_cache.cpp
     src/io/s3/sigv4.cpp
@@ -439,6 +440,7 @@ set(TEST_SOURCES
     test/cpp/io/s3/test_sirius_sigv4_credential_provider.cpp
     test/cpp/io/s3/test_static_credentials.cpp
     test/cpp/io/test_datasource_factory.cpp
+    test/cpp/io/test_duckdb_io_object.cpp
     test/cpp/io/test_uri_parser.cpp
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
     test/cpp/operator/test_physical_hash_join_mgpu.cpp
