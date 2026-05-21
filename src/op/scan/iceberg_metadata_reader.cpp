@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 
+#include "io/io_context.hpp"
+#include "io/types.hpp"
+
 #include <cudf/concatenate.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/parquet.hpp>
@@ -23,8 +26,6 @@
 #include <cudf/utilities/default_stream.hpp>
 
 #include <duckdb/main/connection.hpp>
-#include "io/io_context.hpp"
-#include "io/types.hpp"
 #include <log/logging.hpp>
 #include <op/scan/iceberg_avro_reader.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>

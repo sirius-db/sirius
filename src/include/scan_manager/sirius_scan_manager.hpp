@@ -186,7 +186,7 @@ class sirius_scan_manager {
   void prepare_for_query(
     const sirius::planner::query& query,
     std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs = {},
-    std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces = {});
+    std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces   = {});
 
   /// \brief Clear the providers map and join the driver thread if it is
   ///        still running.
@@ -216,7 +216,8 @@ class sirius_scan_manager {
   ///
   /// \param name                  Table name key.
   /// \param column_names          Column names in the order returned by the parquet read.
-  /// \param file_paths            Resolved file paths captured at pin time (used to match scan ops).
+  /// \param file_paths            Resolved file paths captured at pin time (used to match scan
+  /// ops).
   /// \param data_tables           Cudf tables produced by chunked parquet reads (may be empty).
   /// \param chunk_memory_spaces   Per-chunk memory space placement (size MUST equal total chunk
   ///                              count across data_tables; value at index i is shared by all
@@ -263,8 +264,11 @@ class sirius_scan_manager {
   /// \brief Public read-accessor for the pinned-entries map. Used by unit
   /// tests to assert per-chunk memory_space placement after CALL pin_table.
   /// Const-only — callers cannot mutate the map.
-  [[nodiscard]] const std::unordered_map<std::string, pinned_entry>&
-  get_pinned_entries() const noexcept { return _pinned_entries; }
+  [[nodiscard]] const std::unordered_map<std::string, pinned_entry>& get_pinned_entries()
+    const noexcept
+  {
+    return _pinned_entries;
+  }
 
   /// \brief Process-wide ioctx used to mint @c sirius_datasource instances.
   ///        Returns nullptr when the manager was configured with

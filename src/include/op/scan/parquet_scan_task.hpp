@@ -668,7 +668,7 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_task_loca
  private:
   parquet_scan_task_global_state::row_group_range _partition;  ///< Assigned row-group partition
   std::size_t _metadata_bytes;                                 ///< The number of metadata bytes
-  std::optional<int> _preferred_device_id;  ///< Per-task GPU assignment
+  std::optional<int> _preferred_device_id;                     ///< Per-task GPU assignment
 };
 
 //===----------------------------------------------------------------------===//

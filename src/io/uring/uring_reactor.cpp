@@ -76,8 +76,8 @@ uring_reactor::uring_reactor(unsigned ring_entries, size_t bounce_slot_size, int
     if (_numa_node >= 0) {
       raw = numa_alloc_onnode(bounce_slot_size, _numa_node);
       if (raw == nullptr) {
-        throw std::runtime_error(
-          "uring_reactor: numa_alloc_onnode failed for node=" + std::to_string(_numa_node));
+        throw std::runtime_error("uring_reactor: numa_alloc_onnode failed for node=" +
+                                 std::to_string(_numa_node));
       }
       cudaError_t reg_err =
         cudaHostRegister(raw,

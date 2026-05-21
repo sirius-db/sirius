@@ -182,7 +182,7 @@ class uring_reactor {
   /// @param numa_node          Target NUMA node for pinned bounce-buffer
   ///                           allocation. Use -1 to skip NUMA binding
   ///                           (single-node hosts / fallback path).
-  explicit uring_reactor(unsigned ring_entries  = 64,
+  explicit uring_reactor(unsigned ring_entries   = 64,
                          size_t bounce_slot_size = CHUNK_SIZE,
                          int numa_node           = -1);
 

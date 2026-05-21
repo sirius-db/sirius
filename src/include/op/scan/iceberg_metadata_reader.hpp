@@ -16,12 +16,13 @@
 
 #pragma once
 
+#include "io/types.hpp"
+
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/join/distinct_hash_join.hpp>
 #include <cudf/table/table.hpp>
 
 #include <duckdb/main/client_context.hpp>
-#include "io/types.hpp"
 #include <op/scan/iceberg_avro_reader.hpp>
 
 #include <memory>

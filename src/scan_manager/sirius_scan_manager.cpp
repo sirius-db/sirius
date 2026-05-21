@@ -228,8 +228,9 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
         // pinned_entry doc comment + insert_pinned_entry_host). Validate the
         // host_chunks vector instead.
         if (entry.host_chunks.empty()) {
-          throw std::runtime_error("[sirius_scan_manager::create_provider_for] pinned host entry '" +
-                                   pinned_name + "' has no host_chunks");
+          throw std::runtime_error(
+            "[sirius_scan_manager::create_provider_for] pinned host entry '" + pinned_name +
+            "' has no host_chunks");
         }
         for (std::size_t i = 0; i < entry.host_chunks.size(); ++i) {
           if (!entry.host_chunks[i]) {
@@ -295,9 +296,9 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
       }
       for (std::size_t i = 0; i < entry.chunk_memory_spaces.size(); ++i) {
         if (entry.chunk_memory_spaces[i] == nullptr) {
-          throw std::runtime_error(
-            "[sirius_scan_manager::create_provider_for] pinned entry '" + pinned_name +
-            "' chunk_memory_spaces[" + std::to_string(i) + "] is null");
+          throw std::runtime_error("[sirius_scan_manager::create_provider_for] pinned entry '" +
+                                   pinned_name + "' chunk_memory_spaces[" + std::to_string(i) +
+                                   "] is null");
         }
       }
 
@@ -436,8 +437,8 @@ void sirius_scan_manager::insert_pinned_entry(
           "[sirius_scan_manager::insert_pinned_entry] merge mismatch — "
           "existing.chunk_memory_spaces.size() (" +
           std::to_string(entry.chunk_memory_spaces.size()) +
-          ") != new chunk_memory_spaces.size() (" +
-          std::to_string(chunk_memory_spaces.size()) + ")");
+          ") != new chunk_memory_spaces.size() (" + std::to_string(chunk_memory_spaces.size()) +
+          ")");
       }
       for (std::size_t i = 0; i < chunk_memory_spaces.size(); ++i) {
         if (entry.chunk_memory_spaces[i] != chunk_memory_spaces[i]) {

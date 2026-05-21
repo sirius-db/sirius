@@ -30,7 +30,6 @@
 #include <rmm/cuda_stream.hpp>
 
 #include <cucascade/data/cpu_data_representation.hpp>
-
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
@@ -81,8 +80,8 @@ extern "C" int cudaProfilerStop();
 // <blockingconcurrentqueue.h> (used by spdlog / pipeline / duckdb
 // connection_manager). All consumers of blockingconcurrentqueue.h must
 // precede this include.
-#include "io/types.hpp"               // sirius::io::sirius_ioctx
-#include "io/uring/uring_reactor.hpp" // sirius::io::uring_io_object
+#include "io/types.hpp"                // sirius::io::sirius_ioctx
+#include "io/uring/uring_reactor.hpp"  // sirius::io::uring_io_object
 
 #include <cstdlib>
 #include <unordered_map>
@@ -870,8 +869,8 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     // Bind device BEFORE constructing chunked_parquet_reader so the cudf
     // allocator places footer + decompress + column buffers on the intended
     // GPU.
-    auto* target_space = const_cast<cucascade::memory::memory_space*>(
-      gpu_spaces[chunk_idx % gpu_spaces.size()]);
+    auto* target_space =
+      const_cast<cucascade::memory::memory_space*>(gpu_spaces[chunk_idx % gpu_spaces.size()]);
     int target_gpu_id = target_space->get_device_id();
     rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{target_gpu_id}};
 
@@ -882,15 +881,14 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     // end up on the wrong GPU under sanitizer races).
     auto target_ioctx = sirius_ctx->get_ioctx_for(target_gpu_id);
     if (!target_ioctx) {
-      throw InvalidInputException(
-        "pin_table: no sirius_ioctx for target GPU " + std::to_string(target_gpu_id) + ".");
+      throw InvalidInputException("pin_table: no sirius_ioctx for target GPU " +
+                                  std::to_string(target_gpu_id) + ".");
     }
     auto io_object  = target_ioctx->create_io_object(path);
     auto datasource = target_ioctx->make_datasource(io_object);
 
-    auto file_opts = cudf::io::parquet_reader_options::builder(
-                       cudf::io::source_info{datasource.get()})
-                       .build();
+    auto file_opts =
+      cudf::io::parquet_reader_options::builder(cudf::io::source_info{datasource.get()}).build();
     if (!cols.empty()) { file_opts.set_column_names(cols); }
     if (data.args.n_rows.has_value()) { file_opts.set_num_rows(remaining_rows); }
 

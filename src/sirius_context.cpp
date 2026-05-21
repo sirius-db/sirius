@@ -23,6 +23,7 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "log/logging.hpp"
+#include "memory/numa_small_pinned_mr.hpp"
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
@@ -34,8 +35,6 @@
 #include <rmm/cuda_device.hpp>
 
 #include <cuda_runtime_api.h>
-
-#include "memory/numa_small_pinned_mr.hpp"
 
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
@@ -257,11 +256,12 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
       "refusing to initialize on stub topology.");
   }
   SIRIUS_LOG_INFO("SiriusContext: topology summary — {} GPU(s), {} NUMA node(s), host='{}'",
-               topo.num_gpus,
-               topo.num_numa_nodes,
-               topo.hostname);
+                  topo.num_gpus,
+                  topo.num_numa_nodes,
+                  topo.hostname);
   for (auto const& gpu : topo.gpus) {
-    SIRIUS_LOG_INFO("  GPU {}: {} (numa={}, pci={})", gpu.id, gpu.name, gpu.numa_node, gpu.pci_bus_id);
+    SIRIUS_LOG_INFO(
+      "  GPU {}: {} (numa={}, pci={})", gpu.id, gpu.name, gpu.numa_node, gpu.pci_bus_id);
   }
 
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
@@ -283,8 +283,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     auto const mgpu05_host_spaces =
       memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
     SIRIUS_LOG_INFO("SiriusContext: {} host memory space(s) created for {} NUMA node(s)",
-                 mgpu05_host_spaces.size(),
-                 topo.num_numa_nodes);
+                    mgpu05_host_spaces.size(),
+                    topo.num_numa_nodes);
     if (topo.num_numa_nodes > 0 &&
         mgpu05_host_spaces.size() != static_cast<size_t>(topo.num_numa_nodes)) {
       SIRIUS_LOG_WARN(
@@ -320,7 +320,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
       if (device_id >= 0 && static_cast<unsigned>(device_id) < topo.gpus.size()) {
         raw_numa = topo.gpus[device_id].numa_node;
       }
-      int const node = (raw_numa < 0) ? 0 : raw_numa;
+      int const node             = (raw_numa < 0) ? 0 : raw_numa;
       device_to_numa_[device_id] = node;
       node_to_devices[node].push_back(device_id);
     }
@@ -336,8 +336,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
       // keep parallelism without exploding worker-thread count on hosts
       // with many GPUs per node. Clamped at [4, 16] — matches the historic
       // per-GPU default of 4 reactors as a floor.
-      size_t const n_reactors =
-        std::clamp<size_t>(4 * devices.size(), 4, 16);
+      size_t const n_reactors = std::clamp<size_t>(4 * devices.size(), 4, 16);
 
       auto ioctx = std::make_shared<sirius::io::uring_ioctx>(
         /*host_ring_depth=*/16u,
@@ -377,8 +376,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     // Match the spelling of `kFileScheme` from datasource_factory.cpp
     // verbatim (anonymous namespace constant).
     static constexpr std::string_view kFileScheme = "file";
-    auto lowest_gpu                               = std::min_element(
-      gpu_ioctxs_.begin(), gpu_ioctxs_.end(), [](auto const& a, auto const& b) {
+    auto lowest_gpu =
+      std::min_element(gpu_ioctxs_.begin(), gpu_ioctxs_.end(), [](auto const& a, auto const& b) {
         return a.first < b.first;
       });
     datasource_registry_.register_ioctx(std::string{kFileScheme}, lowest_gpu->second);
@@ -411,16 +410,14 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
             cudaDeviceCanAccessPeer(&can_access, static_cast<int>(i), static_cast<int>(j));
           if (probe_err != cudaSuccess) {
             SIRIUS_LOG_ERROR("SiriusContext: cudaDeviceCanAccessPeer({},{}) failed: {}",
-                          i,
-                          j,
-                          cudaGetErrorString(probe_err));
+                             i,
+                             j,
+                             cudaGetErrorString(probe_err));
             continue;
           }
           if (can_access == 0) {
             SIRIUS_LOG_INFO(
-              "SiriusContext: no P2P access {} -> {} -- falling back to host staging",
-              i,
-              j);
+              "SiriusContext: no P2P access {} -> {} -- falling back to host staging", i, j);
             continue;
           }
           cudaError_t enable_err = cudaDeviceEnablePeerAccess(static_cast<int>(j), 0);
@@ -433,11 +430,10 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
             peer_access_enabled_pairs_.emplace(static_cast<int>(i), static_cast<int>(j));
             SIRIUS_LOG_INFO("SiriusContext: P2P enabled {} -> {}", i, j);
           } else {
-            SIRIUS_LOG_ERROR(
-              "SiriusContext: cudaDeviceEnablePeerAccess({}) from ctx {} failed: {}",
-              j,
-              i,
-              cudaGetErrorString(enable_err));
+            SIRIUS_LOG_ERROR("SiriusContext: cudaDeviceEnablePeerAccess({}) from ctx {} failed: {}",
+                             j,
+                             i,
+                             cudaGetErrorString(enable_err));
           }
         }
       }
@@ -458,14 +454,12 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     if (!host_spaces.empty()) {
       host_fsmr = host_spaces[0]
                     ->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
-      std::unordered_map<int,
-                         std::unique_ptr<cucascade::memory::small_pinned_host_memory_resource>>
+      std::unordered_map<int, std::unique_ptr<cucascade::memory::small_pinned_host_memory_resource>>
         per_node_pools;
       int fallback_node = -1;
       for (auto* host_space : host_spaces) {
         auto* fsmr =
-          host_space
-            ->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
+          host_space->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
         if (fsmr == nullptr) { continue; }
         int raw_numa = host_space->get_device_id();
         int node     = (raw_numa < 0) ? 0 : raw_numa;

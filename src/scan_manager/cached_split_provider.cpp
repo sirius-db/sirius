@@ -24,12 +24,12 @@
 #include <cudf/column/column_view.hpp>
 #include <cudf/table/table_view.hpp>
 
+#include <cuda_runtime.h>
+
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
-
-#include <cuda_runtime.h>
 
 #include <span>
 #include <stdexcept>
@@ -131,8 +131,8 @@ std::vector<std::unique_ptr<op::operator_data>> cached_split_provider::produce_s
           alloc_size += col_ptr->alloc_size();
         }
         cudf::table_view view(col_views);
-        auto* chunk_space = !_chunk_memory_spaces.empty() ? _chunk_memory_spaces.at(batch_idx)
-                                                          : _memory_space;
+        auto* chunk_space =
+          !_chunk_memory_spaces.empty() ? _chunk_memory_spaces.at(batch_idx) : _memory_space;
         auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
           view, std::move(chunk), alloc_size, *chunk_space, rmm::cuda_stream_view{});
         return std::make_shared<cucascade::data_batch>(::sirius::get_next_batch_id(),
@@ -164,8 +164,8 @@ std::vector<std::unique_ptr<op::operator_data>> cached_split_provider::produce_s
         auto* target_gpu_space = gpu_it->second;
         auto stream            = target_gpu_space->acquire_stream();
         auto& registry         = ::sirius::converter_registry::get();
-        auto gpu_repr          = registry.convert<cucascade::gpu_table_representation>(
-          *sliced, target_gpu_space, stream);
+        auto gpu_repr =
+          registry.convert<cucascade::gpu_table_representation>(*sliced, target_gpu_space, stream);
         // Sync before sliced/source goes out of scope so the H->D copies
         // captured on the converter's stream complete before any host pages
         // (still referenced by sliced) potentially move.

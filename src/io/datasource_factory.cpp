@@ -144,9 +144,8 @@ std::unique_ptr<cudf::io::datasource> datasource_factory::create(
   // -> sirius_ioctx so this lookup succeeds.
   auto ioctx = registry.lookup(p.scheme);
   if (!ioctx) {
-    throw std::runtime_error(
-      "datasource_factory: no ioctx registered for scheme '" + p.scheme +
-      "' — kvikio path is forbidden (uri=" + std::string{uri} + ")");
+    throw std::runtime_error("datasource_factory: no ioctx registered for scheme '" + p.scheme +
+                             "' — kvikio path is forbidden (uri=" + std::string{uri} + ")");
   }
 
   return ioctx->open_datasource(std::move(p.path));

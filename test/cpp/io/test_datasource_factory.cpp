@@ -333,7 +333,6 @@ TEST_CASE("datasource_factory does not dispatch object-store schemes to register
   // Factory now dispatches via ioctx->open_datasource, which calls create_io_object
   // (mock throws std::logic_error). The invariant we care about is that make_datasource
   // is never reached for an unfinished object-store backend.
-  CHECK_THROWS_AS(datasource_factory::create("s3://bucket/key.parquet", reg, cfg),
-                  std::exception);
+  CHECK_THROWS_AS(datasource_factory::create("s3://bucket/key.parquet", reg, cfg), std::exception);
   CHECK(ctx->make_datasource_calls == 0);
 }

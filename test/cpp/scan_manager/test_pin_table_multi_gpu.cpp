@@ -39,10 +39,10 @@
 #include "operator/mgpu_test_utils.hpp"
 #include "sirius_context.hpp"
 
-#include <cucascade/memory/memory_space.hpp>
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
+#include <cucascade/memory/memory_space.hpp>
 #include <duckdb.hpp>
 #include <spdlog/spdlog.h>
 #include <unistd.h>
@@ -72,8 +72,7 @@ using sirius::test::mgpu::write_mgpu_yaml;
  */
 fs::path make_tmp(std::string const& tag)
 {
-  return fs::temp_directory_path() /
-         ("sirius-pin-mgpu-" + tag + "-" + std::to_string(::getpid()));
+  return fs::temp_directory_path() / ("sirius-pin-mgpu-" + tag + "-" + std::to_string(::getpid()));
 }
 
 /**
@@ -94,7 +93,8 @@ void generate_4file_surface(fs::path const& dir)
 {
   // Inline call (same line) so the plan-level grep gate
   // `generate_parquet_surface.*4` matches against this fixture builder.
-  generate_parquet_surface(dir, "SELECT range AS k, range * 2 AS v FROM range(100000)", /*num_files=*/4);
+  generate_parquet_surface(
+    dir, "SELECT range AS k, range * 2 AS v FROM range(100000)", /*num_files=*/4);
 }
 
 }  // namespace
@@ -103,8 +103,7 @@ void generate_4file_surface(fs::path const& dir)
 // Distribution gate: assert pinned_entry.chunk_memory_spaces lands chunks
 // on at least 2 distinct GPU device_ids.
 //===----------------------------------------------------------------------===//
-TEST_CASE("pin_table - PIN-MGPU-01 multi-GPU chunk distribution",
-          "[pin_mgpu][scan_manager]")
+TEST_CASE("pin_table - PIN-MGPU-01 multi-GPU chunk distribution", "[pin_mgpu][scan_manager]")
 {
   if (!require_two_gpus()) return;
 
@@ -121,10 +120,9 @@ TEST_CASE("pin_table - PIN-MGPU-01 multi-GPU chunk distribution",
   scoped_mgpu_env env(yaml_path);
   auto con = env.make_connection();
 
-  auto glob = parquet_glob(tmp);
-  auto pin_sql =
-    "CALL pin_table('" + glob + "', tier='gpu', name='multi_chunk');";
-  auto pin = con.Query(pin_sql);
+  auto glob    = parquet_glob(tmp);
+  auto pin_sql = "CALL pin_table('" + glob + "', tier='gpu', name='multi_chunk');";
+  auto pin     = con.Query(pin_sql);
   REQUIRE(pin);
   if (pin->HasError()) { UNSCOPED_INFO("pin_table error: " << pin->GetError()); }
   REQUIRE_FALSE(pin->HasError());
@@ -134,8 +132,7 @@ TEST_CASE("pin_table - PIN-MGPU-01 multi-GPU chunk distribution",
   // mgpu_test_utils.hpp:199). The connection's ClientContext owns the
   // registered_state map; "sirius_state" is the key the extension callback
   // inserts under (src/sirius_context.cpp:893).
-  auto sirius_ctx =
-    con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
   REQUIRE(sirius_ctx != nullptr);
 
   auto const& entries = sirius_ctx->get_scan_manager().get_pinned_entries();
@@ -154,8 +151,7 @@ TEST_CASE("pin_table - PIN-MGPU-01 multi-GPU chunk distribution",
   }
 
   INFO("chunk_memory_spaces.size=" << entry.chunk_memory_spaces.size()
-                                   << " distinct_device_ids="
-                                   << distinct_device_ids.size());
+                                   << " distinct_device_ids=" << distinct_device_ids.size());
   REQUIRE(distinct_device_ids.size() >= 2u);
 
   auto unpin = con.Query("CALL unpin_table('multi_chunk');");
@@ -206,9 +202,8 @@ TEST_CASE("pin_table - PIN-MGPU-01 routing via [mgpu-audit]",
     REQUIRE(fb);
     REQUIRE_FALSE(fb->HasError());
 
-    auto pin_sql =
-      "CALL pin_table('" + glob + "', tier='gpu', name='multi_chunk');";
-    auto pin = con.Query(pin_sql);
+    auto pin_sql = "CALL pin_table('" + glob + "', tier='gpu', name='multi_chunk');";
+    auto pin     = con.Query(pin_sql);
     REQUIRE(pin);
     if (pin->HasError()) { UNSCOPED_INFO("pin_table error: " << pin->GetError()); }
     REQUIRE_FALSE(pin->HasError());
@@ -216,18 +211,16 @@ TEST_CASE("pin_table - PIN-MGPU-01 routing via [mgpu-audit]",
     // Run a SELECT through the cached split provider. The scan_manager
     // matches incoming parquet_scan_info::file_paths against the pinned
     // entry's file_paths (sirius_scan_manager.cpp matches_scan_info
-    // lambda), so we re-use the same glob in read_parquet. Sirius's
+    // lambda), so we reuse the same glob in read_parquet. Sirius's
     // task_creator + cached_split_provider then emit one
     // scan_cached_operator_data per chunk tagged with that chunk's
     // memory_space, which the [mgpu-audit] hook in pipeline_executor.cpp
     // and duckdb_scan_executor.cpp records.
-    auto select_sql = "CALL gpu_execution(\"SELECT k, count(*) FROM read_parquet('" +
-                      glob + "') WHERE k % 2 = 0 GROUP BY k LIMIT 10\");";
+    auto select_sql = "CALL gpu_execution(\"SELECT k, count(*) FROM read_parquet('" + glob +
+                      "') WHERE k % 2 = 0 GROUP BY k LIMIT 10\");";
     auto select = con.Query(select_sql);
     REQUIRE(select);
-    if (select->HasError()) {
-      UNSCOPED_INFO("gpu_execution error: " << select->GetError());
-    }
+    if (select->HasError()) { UNSCOPED_INFO("gpu_execution error: " << select->GetError()); }
     REQUIRE_FALSE(select->HasError());
 
     auto unpin = con.Query("CALL unpin_table('multi_chunk');");
@@ -329,8 +322,7 @@ TEST_CASE("pin_table - PIN-MGPU-01 routing via [mgpu-audit]",
 // On single-NUMA hosts, the host space is shared but the test passes
 // trivially via the >=1 chunk assertion.
 //===----------------------------------------------------------------------===//
-TEST_CASE("pin_table - PIN-MGPU-01 host-tier multi-GPU pin",
-          "[pin_mgpu][scan_manager][host_tier]")
+TEST_CASE("pin_table - PIN-MGPU-01 host-tier multi-GPU pin", "[pin_mgpu][scan_manager][host_tier]")
 {
   if (!require_two_gpus()) return;
 
@@ -354,8 +346,7 @@ TEST_CASE("pin_table - PIN-MGPU-01 host-tier multi-GPU pin",
   if (pin->HasError()) { UNSCOPED_INFO("pin_table error: " << pin->GetError()); }
   REQUIRE_FALSE(pin->HasError());
 
-  auto sirius_ctx =
-    con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
   REQUIRE(sirius_ctx != nullptr);
 
   auto const& entries = sirius_ctx->get_scan_manager().get_pinned_entries();
@@ -381,14 +372,13 @@ TEST_CASE("pin_table - PIN-MGPU-01 host-tier multi-GPU pin",
   // row count as the raw parquet glob — i.e., the host_data_representations
   // pinned on multiple GPUs all surface during the cached scan and the GPU
   // 1+ chunks aren't lost because of a wrong-device stream sync.
-  auto baseline =
-    con.Query("SELECT count(*) FROM read_parquet('" + glob + "');");
+  auto baseline = con.Query("SELECT count(*) FROM read_parquet('" + glob + "');");
   REQUIRE(baseline);
   REQUIRE_FALSE(baseline->HasError());
   auto baseline_rows = baseline->GetValue(0, 0).GetValue<int64_t>();
 
-  auto cached = con.Query("CALL gpu_execution(\"SELECT count(*) FROM read_parquet('" +
-                          glob + "')\");");
+  auto cached =
+    con.Query("CALL gpu_execution(\"SELECT count(*) FROM read_parquet('" + glob + "')\");");
   REQUIRE(cached);
   if (cached->HasError()) { UNSCOPED_INFO("gpu_execution error: " << cached->GetError()); }
   REQUIRE_FALSE(cached->HasError());
@@ -497,8 +487,8 @@ TEST_CASE("pin_table - host-tier cached path serves SELECT after parquet files o
                            "SELECT range AS k, range * 2 AS v FROM range(200000)",
                            /*num_files=*/4);
 
-  auto cached = con.Query("CALL gpu_execution(\"SELECT MAX(k) FROM read_parquet('" +
-                          glob + "')\");");
+  auto cached =
+    con.Query("CALL gpu_execution(\"SELECT MAX(k) FROM read_parquet('" + glob + "')\");");
   REQUIRE(cached);
   if (cached->HasError()) { UNSCOPED_INFO("gpu_execution error: " << cached->GetError()); }
   REQUIRE_FALSE(cached->HasError());
@@ -571,14 +561,13 @@ TEST_CASE("pin_table - host-tier cached path serves aggregate after parquet file
                            "SELECT range AS k, range * 5 AS v FROM range(100000)",
                            /*num_files=*/4);
 
-  auto cached = con.Query("CALL gpu_execution(\"SELECT SUM(v) FROM read_parquet('" +
-                          glob + "')\");");
+  auto cached =
+    con.Query("CALL gpu_execution(\"SELECT SUM(v) FROM read_parquet('" + glob + "')\");");
   REQUIRE(cached);
   if (cached->HasError()) { UNSCOPED_INFO("gpu_execution error: " << cached->GetError()); }
   REQUIRE_FALSE(cached->HasError());
   auto cached_sum = cached->GetValue(0, 0).GetValue<int64_t>();
-  INFO("expected cached_sum=" << baseline_sum
-                              << " (silent fall-through would return 99999000000)");
+  INFO("expected cached_sum=" << baseline_sum << " (silent fall-through would return 99999000000)");
   REQUIRE(cached_sum == baseline_sum);
 
   auto unpin = con.Query("CALL unpin_table('host_agg_test');");
@@ -622,15 +611,14 @@ TEST_CASE("pin_table - partial pin (n_rows) excluded from cache reuse",
   auto con = env.make_connection();
 
   auto glob = parquet_glob(tmp);
-  auto pin  = con.Query(
-    "CALL pin_table('" + glob + "', tier='gpu', name='partial_pin', n_rows=1000);");
+  auto pin =
+    con.Query("CALL pin_table('" + glob + "', tier='gpu', name='partial_pin', n_rows=1000);");
   REQUIRE(pin);
   if (pin->HasError()) { UNSCOPED_INFO("pin_table error: " << pin->GetError()); }
   REQUIRE_FALSE(pin->HasError());
 
   // Verify the entry is_partial flag is set on the scan_manager side.
-  auto sirius_ctx =
-    con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
   REQUIRE(sirius_ctx != nullptr);
   auto const& entries = sirius_ctx->get_scan_manager().get_pinned_entries();
   auto it             = entries.find("partial_pin");
@@ -641,8 +629,8 @@ TEST_CASE("pin_table - partial pin (n_rows) excluded from cache reuse",
 
   // A subsequent full SELECT MUST NOT serve from the partial pin — it must
   // re-read the parquet file and return all 100000 rows.
-  auto full = con.Query("CALL gpu_execution(\"SELECT count(*) FROM read_parquet('" +
-                        glob + "')\");");
+  auto full =
+    con.Query("CALL gpu_execution(\"SELECT count(*) FROM read_parquet('" + glob + "')\");");
   REQUIRE(full);
   if (full->HasError()) { UNSCOPED_INFO("gpu_execution error: " << full->GetError()); }
   REQUIRE_FALSE(full->HasError());
@@ -706,29 +694,28 @@ TEST_CASE("pin_table - same-row-count merge appends every chunk for new columns"
   auto glob = parquet_glob(tmp);
 
   // First pin: columns [k, v]
-  auto pin1 = con.Query("CALL pin_table('" + glob +
-                        "', tier='gpu', name='merge_pin', cols=['k', 'v']);");
+  auto pin1 =
+    con.Query("CALL pin_table('" + glob + "', tier='gpu', name='merge_pin', cols=['k', 'v']);");
   REQUIRE(pin1);
   if (pin1->HasError()) { UNSCOPED_INFO("pin_table 1 error: " << pin1->GetError()); }
   REQUIRE_FALSE(pin1->HasError());
 
   // Second pin: columns [k, w] — the merge path must install w with the
   // SAME number of chunks as the existing k and v vectors.
-  auto pin2 = con.Query("CALL pin_table('" + glob +
-                        "', tier='gpu', name='merge_pin', cols=['k', 'w']);");
+  auto pin2 =
+    con.Query("CALL pin_table('" + glob + "', tier='gpu', name='merge_pin', cols=['k', 'w']);");
   REQUIRE(pin2);
   if (pin2->HasError()) { UNSCOPED_INFO("pin_table 2 error: " << pin2->GetError()); }
   REQUIRE_FALSE(pin2->HasError());
 
-  auto sirius_ctx =
-    con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
   REQUIRE(sirius_ctx != nullptr);
 
   auto const& entries = sirius_ctx->get_scan_manager().get_pinned_entries();
   auto it             = entries.find("merge_pin");
   REQUIRE(it != entries.end());
 
-  auto const& entry = it->second;
+  auto const& entry          = it->second;
   auto const expected_chunks = entry.chunk_memory_spaces.size();
   INFO("expected_chunks=" << expected_chunks);
   REQUIRE(expected_chunks >= 2u);
