@@ -187,7 +187,7 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
   }
 }
 
-bool sirius_physical_partition::is_build_partition() { return _is_build; }
+bool sirius_physical_partition::is_build_partition() const { return _is_build; }
 
 std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator_data& input_data,
                                                                   rmm::cuda_stream_view stream)

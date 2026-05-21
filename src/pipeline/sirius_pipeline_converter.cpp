@@ -1176,6 +1176,30 @@ op::MemoryBarrierType sirius_pipeline_converter::resolve_barrier(
                                       (dest.get_sink() && dest.get_sink()->type == T::CONCAT);
     return downstream_is_concat ? op::MemoryBarrierType::PARTIAL : op::MemoryBarrierType::FULL;
   }
+  // Intermediate sink feeding a probe-side PARTITION: the probe pipeline can
+  // stream batches, so the upstream→PARTITION_probe edge uses PARTIAL. Build-
+  // side PARTITION stays FULL — build must accumulate all partitions before
+  // the probe can join them. Exception (#1088): a RIGHT-family join must size
+  // from the complete probe input because CONCAT retains the whole probe
+  // partition, so its probe PARTITION also keeps FULL. RIGHT_DELIM_JOIN's
+  // internal join is exempt from that exception — it bootstraps its probe
+  // subtree from build-side distinct data. Under the legacy path this same
+  // distinction is enforced as a post-hoc mutation in
+  // link_join_partition_siblings; consolidating it here keeps all barrier
+  // decisions in resolve_barrier.
+  if (dest.get_sink() && dest.get_sink()->type == T::PARTITION) {
+    auto& partition = dest.get_sink()->Cast<op::sirius_physical_partition>();
+    // Tree-parent walk: PARTITION -> CONCAT -> owning join (stamped at plan-gen).
+    auto* concat = partition.get_parent_op();
+    auto* join   = concat ? concat->get_parent_op() : nullptr;
+    const bool right_family_full =
+      join && join->type == T::HASH_JOIN &&
+      join->Cast<op::sirius_physical_hash_join>().is_right_family() &&
+      !(join->get_parent_op() && join->get_parent_op()->type == T::RIGHT_DELIM_JOIN);
+    if (!partition.is_build_partition() && !right_family_full) {
+      return op::MemoryBarrierType::PARTIAL;
+    }
+  }
   return op::MemoryBarrierType::FULL;
 }
 
@@ -1337,13 +1361,23 @@ void sirius_pipeline_converter::link_join_partition_siblings()
 
       // Probe partitions normally stream through a partial barrier. A RIGHT-family join must
       // size from the complete probe input because CONCAT retains the whole probe partition.
-      auto wiring_it = std::find_if(
-        repository_wirings_.begin(), repository_wirings_.end(), [&](const repository_wiring& w) {
-          return w.dest_pipeline == probe_partition_pipeline && w.port_id == "default";
-        });
-      D_ASSERT(wiring_it != repository_wirings_.end());
-      wiring_it->barrier_type =
-        probe_drives_partition_count ? op::MemoryBarrierType::FULL : op::MemoryBarrierType::PARTIAL;
+      // The corresponding port doesn't exist yet (materialisation happens after `convert()`
+      // returns); mutate the descriptor so the materialiser creates the port with the correct
+      // barrier type.
+      //
+      // Under USE_TREE_BASED_PIPELINE_BUILD, resolve_barrier already emits the
+      // upstream→PARTITION_probe edge with the right FULL/PARTIAL barrier directly. Skip
+      // the mutation under flag ON to keep barrier decisions consolidated in one
+      // place; the sibling-pointer setup below still runs in both flag states.
+      if (!duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
+        auto wiring_it = std::find_if(
+          repository_wirings_.begin(), repository_wirings_.end(), [&](const repository_wiring& w) {
+            return w.dest_pipeline == probe_partition_pipeline && w.port_id == "default";
+          });
+        D_ASSERT(wiring_it != repository_wirings_.end());
+        wiring_it->barrier_type = probe_drives_partition_count ? op::MemoryBarrierType::FULL
+                                                               : op::MemoryBarrierType::PARTIAL;
+      }
       if (is_right_delim) {
         // partition pipeline only has one operator
         auto& right_delim_join_op =
