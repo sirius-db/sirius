@@ -35,7 +35,7 @@ namespace sirius::pipeline {
 
 namespace {
 
-/// Maximum recursion depth for tree building to prevent stack overflow from cycles (T-01-01).
+/// Maximum recursion depth for tree building to prevent stack overflow from cycles.
 constexpr size_t MAX_TREE_DEPTH = 100;
 
 /// A node in the 2D render grid representing a pipeline.
@@ -374,7 +374,7 @@ std::string sirius_plan_printer::render_pipelines() const
     if (!pipeline) { continue; }
     ss << "Pipeline #" << pipeline->get_pipeline_id() << ": ";
 
-    // Build arrow-separated operator chain with IDs (D-04, D-05)
+    // Build arrow-separated operator chain with IDs
     auto source = pipeline->get_source();
     auto sink   = pipeline->get_sink();
     if (source) { ss << format_operator_with_id(*source); }

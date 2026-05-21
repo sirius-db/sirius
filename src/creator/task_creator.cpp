@@ -22,6 +22,7 @@
 #include "op/scan/duckdb_scan_executor.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
 #include "op/scan/iceberg_scan_task.hpp"
+#include "op/scan/parquet_scan_operator_data.hpp"
 #include "op/scan/parquet_scan_task.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
@@ -31,11 +32,15 @@
 #include "planner/query.hpp"
 #include "sirius_context.hpp"
 
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/memory_space.hpp>
 #include <duckdb/execution/execution_context.hpp>
 #include <duckdb/parallel/thread_context.hpp>
 
+#include <algorithm>
 #include <limits>
 #include <optional>
+#include <unordered_map>
 
 namespace sirius::creator {
 
@@ -44,9 +49,24 @@ namespace sirius::creator {
 //------------------------------------------------------------------------------
 
 task_creator::task_creator(exec::thread_pool_config config,
-                           sirius::memory::sirius_memory_reservation_manager& mem_res_mgr)
-  : _running(false), _config(config), _mem_res_mgr(mem_res_mgr)
+                           sirius::memory::sirius_memory_reservation_manager& mem_res_mgr,
+                           const cucascade::memory::system_topology_info* sys_topology)
+  : _running(false), _config(config), _mem_res_mgr(mem_res_mgr), _sys_topology(sys_topology)
 {
+  // Normalize numa_node=-1 (Linux convention for non-NUMA / single-NUMA
+  // hosts) to 0 so it matches the host memory space, which is built with
+  // numa_id=0 on those hosts. Without normalization, host-sourced tasks on
+  // single-NUMA boxes fall through to the default GPU.
+  //
+  // Record every GPU under its NUMA key (not just the first) so the
+  // round-robin walk spreads work across all GPUs sharing a NUMA node.
+  if (_sys_topology) {
+    for (size_t i = 0; i < _sys_topology->gpus.size(); ++i) {
+      auto raw_numa       = _sys_topology->gpus[i].numa_node;
+      int normalized_numa = (raw_numa < 0) ? 0 : raw_numa;
+      _numa_to_gpu[normalized_numa].push_back(static_cast<int>(_sys_topology->gpus[i].id));
+    }
+  }
 }
 
 task_creator::~task_creator() { stop(); }
@@ -90,6 +110,25 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
           *_task_scheduler,
           *_client_context,
           &source_operator->Cast<op::sirius_physical_duckdb_scan>()));
+    } else if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
+      auto it = _parquet_scan_operator_global_state_map.find(operator_id);
+      if (it != _parquet_scan_operator_global_state_map.end()) {
+        it->second->rebind(pipeline, &source_operator->Cast<op::sirius_physical_parquet_scan>());
+      } else {
+        // Scan tasks look up the ioctx for their preferred_device_id in
+        // compute_task() — the map is copied into global_state.
+        auto* sirius_ctx =
+          _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state").get();
+        const auto& op_params = sirius_ctx->get_config().get_operator_params();
+        auto gpu_ioctxs       = sirius_ctx->get_gpu_ioctxs();
+        _parquet_scan_operator_global_state_map.emplace(
+          operator_id,
+          std::make_shared<op::scan::parquet_scan_task_global_state>(
+            pipeline,
+            &source_operator->Cast<op::sirius_physical_parquet_scan>(),
+            op_params.scan_task_batch_size,
+            std::move(gpu_ioctxs)));
+      }
     } else if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::CPU_SOURCE) {
       _cpu_source_operator_global_state_map.emplace(
         operator_id,
@@ -105,16 +144,20 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
       } else {
         SIRIUS_LOG_INFO("[task_creator::prepare_for_query] creating NEW state for id={}",
                         operator_id);
-        const auto& op_params =
-          _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
-            ->get_config()
-            .get_operator_params();
+        // Iceberg delete-file reads bypass sirius_datasource (they go through
+        // DuckDB read_parquet / cudf's bundled file_source). Multi-GPU
+        // residency for iceberg metadata + delete-file reads is deferred.
+        auto* sirius_ctx =
+          _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state").get();
+        const auto& op_params = sirius_ctx->get_config().get_operator_params();
+        auto gpu_ioctxs       = sirius_ctx->get_gpu_ioctxs();
         _parquet_scan_operator_global_state_map.emplace(
           operator_id,
           std::make_shared<op::scan::iceberg_scan_task_global_state>(
             pipeline,
             &source_operator->Cast<op::sirius_physical_iceberg_scan>(),
-            op_params.scan_task_batch_size));
+            op_params.scan_task_batch_size,
+            std::move(gpu_ioctxs)));
       }
     } else {
       auto gs = std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline);
@@ -194,6 +237,11 @@ void task_creator::start_thread_pool()
 {
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
+  // Re-arm the request queue. stop_thread_pool() calls
+  // _task_creation_queue.interrupt() so the manager's pop() unblocks; without
+  // a paired reactivate() here, subsequent schedule() pushes silently no-op
+  // and the next query's manager_loop sees an empty/inactive queue forever.
+  _task_creation_queue.reactivate();
   _bounded_pool = std::make_unique<exec::bounded_thread_pool>(
     _config.num_threads, _config.thread_name_prefix, _config.cpu_affinity_list);
   _manager_thread = std::thread(&task_creator::manager_loop, this);
@@ -366,8 +414,136 @@ void task_creator::manager_loop()
             auto gpu_pipeline_task_global_state = _gpu_operator_global_state_map.at(operator_id);
             auto local_state =
               std::make_unique<pipeline::gpu_pipeline_task_local_state>(std::move(input_data));
+
+            // pipelineable_input remains valid here: the cast happened before
+            // the move into local_state, and unique_ptr move transfers
+            // ownership without relocating the object.
+            {
+              std::optional<int> preferred_device_id;
+              // Partition affinity: if the input is tagged with a partition
+              // index, pin the task to partition_idx % num_gpus.
+              // Partition-based operators (hash_join, grouped_aggregate_merge,
+              // …) use cuco hash tables under the hood, and cuco tables must
+              // live on a single device — a stream bound to GPU A touching a
+              // counter built under GPU B trips cudaErrorInvalidValue at
+              // counter_storage.cuh. Routing on partition_idx keeps every
+              // task of a given partition on one GPU while still spreading
+              // partitions across GPUs.
+              if (auto* partitioned =
+                    dynamic_cast<op::partitioned_operator_data*>(pipelineable_input);
+                  partitioned && _sys_topology && !_sys_topology->gpus.empty()) {
+                auto n_gpus         = _sys_topology->gpus.size();
+                auto idx            = partitioned->get_partition_idx() % n_gpus;
+                preferred_device_id = static_cast<int>(_sys_topology->gpus[idx].id);
+              }
+              if (!preferred_device_id.has_value() && pipelineable_input &&
+                  !pipelineable_input->get_data_batches().empty()) {
+                std::unordered_map<int, size_t> gpu_bytes;
+                std::unordered_map<int, size_t> host_bytes;
+                for (const auto& batch : pipelineable_input->get_data_batches()) {
+                  if (!batch) { continue; }
+                  auto ro     = batch->to_read_only();
+                  auto* space = ro.get_memory_space();
+                  if (!space || !ro.get_data()) { continue; }
+                  auto size = ro.get_data()->get_size_in_bytes();
+                  if (space->get_tier() == cucascade::memory::Tier::GPU) {
+                    gpu_bytes[space->get_device_id()] += size;
+                  } else if (space->get_tier() == cucascade::memory::Tier::HOST) {
+                    // Normalize numa_id=-1 (non-NUMA / single-NUMA hosts, per
+                    // the Linux /sys/bus/pci/devices/*/numa_node convention)
+                    // to 0 so the NUMA-affinity lookup matches the normalized
+                    // `_numa_to_gpu` map key. Without this, host_bytes[-1]
+                    // never hits `_numa_to_gpu[0]`, preferred_device_id stays
+                    // nullopt, and every host-sourced pipeline task falls
+                    // back to `_gpu_executors.begin()->first`.
+                    int host_key = space->get_device_id();
+                    if (host_key < 0) host_key = 0;
+                    host_bytes[host_key] += size;
+                  }
+                }
+                if (!gpu_bytes.empty()) {
+                  // Data-locality: route to GPU with most data by bytes
+                  preferred_device_id = std::max_element(gpu_bytes.begin(),
+                                                         gpu_bytes.end(),
+                                                         [](const auto& a, const auto& b) {
+                                                           return a.second < b.second;
+                                                         })
+                                          ->first;
+                } else if (!host_bytes.empty() && !_numa_to_gpu.empty()) {
+                  // NUMA-affinity: no GPU data, route to a GPU on the same
+                  // NUMA as the host data. When that NUMA hosts multiple
+                  // GPUs, pick round-robin across them — pinning every
+                  // host-sourced pipeline task to a single GPU defeats
+                  // multi-GPU speedup.
+                  auto top_host = std::max_element(host_bytes.begin(),
+                                                   host_bytes.end(),
+                                                   [](const auto& a, const auto& b) {
+                                                     return a.second < b.second;
+                                                   })
+                                    ->first;
+                  auto it = _numa_to_gpu.find(top_host);
+                  if (it != _numa_to_gpu.end() && !it->second.empty()) {
+                    auto idx            = _numa_to_gpu_rr.fetch_add(1) % it->second.size();
+                    preferred_device_id = it->second[idx];
+                  }
+                }
+                SIRIUS_LOG_DEBUG(
+                  "Task Creator: locality score gpu_sources={} host_sources={} preferred_device={}",
+                  gpu_bytes.size(),
+                  host_bytes.size(),
+                  preferred_device_id.value_or(-1));
+              }
+              // Cached-scan locality: scan_cached_operator_data is NOT a
+              // pipelineable_operator_data (see parquet_scan_operator_data.hpp),
+              // so the data-locality block above skipped it wholesale. Without
+              // this branch, every pinned-table scan task gets dispatched
+              // round-robin by the scheduler and triggers a peer DMA or host
+              // staging when the consumer GPU differs from the chunk's home
+              // GPU. The pinned chunk's GPU residency is preserved on the
+              // batch (cached_split_provider pins each chunk_memory_space into
+              // the gpu_table_representation), so we just read it here.
+              if (!preferred_device_id.has_value()) {
+                if (auto* cached = dynamic_cast<op::scan::scan_cached_operator_data*>(
+                      local_state->_input_data.get())) {
+                  if (cached->batch) {
+                    auto ro     = cached->batch->to_read_only();
+                    auto* space = ro.get_memory_space();
+                    if (space) {
+                      if (space->get_tier() == cucascade::memory::Tier::GPU) {
+                        preferred_device_id = space->get_device_id();
+                      } else if (space->get_tier() == cucascade::memory::Tier::HOST &&
+                                 !_numa_to_gpu.empty()) {
+                        // tier='host' pinned chunks carry a NUMA-local host
+                        // memory_space; map back through _numa_to_gpu to pick
+                        // a GPU on the same NUMA. Normalize numa_id=-1 to 0
+                        // to match the convention used by the pipelineable
+                        // locality block above.
+                        int host_key = space->get_device_id();
+                        if (host_key < 0) host_key = 0;
+                        auto it = _numa_to_gpu.find(host_key);
+                        if (it != _numa_to_gpu.end() && !it->second.empty()) {
+                          auto idx            = _numa_to_gpu_rr.fetch_add(1) % it->second.size();
+                          preferred_device_id = it->second[idx];
+                        }
+                      }
+                      SIRIUS_LOG_DEBUG(
+                        "Task Creator: cached-scan locality tier={} device_id={} "
+                        "preferred_device={}",
+                        static_cast<int>(space->get_tier()),
+                        space->get_device_id(),
+                        preferred_device_id.value_or(-1));
+                    }
+                  }
+                }
+              }
+              if (preferred_device_id.has_value()) {
+                local_state->set_preferred_device_id(preferred_device_id.value());
+              }
+            }
+
+            auto task_id = get_next_task_id();
             auto task =
-              std::make_unique<pipeline::gpu_pipeline_task>(get_next_task_id(),
+              std::make_unique<pipeline::gpu_pipeline_task>(task_id,
                                                             destination_data_repositories,
                                                             std::move(local_state),
                                                             gpu_pipeline_task_global_state);

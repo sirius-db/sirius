@@ -25,10 +25,9 @@ namespace sirius::ast {
 /**
  * @brief Sirius-native mirror of duckdb::BoundConstantExpression.
  *
- * Carries a typed literal. `payload` is the typed sum-type holding the
- * SQL value; `return_type` carries DECIMAL precision (D-06) and the SQL
- * type of typed NULLs (D-05). Mirrors the shape of cast::target_type
- * and function_call::return_type.
+ * Carries a typed literal. `payload` is the typed sum-type holding the SQL
+ * value; `return_type` carries DECIMAL precision and the SQL type of typed
+ * NULLs. Mirrors the shape of cast::target_type and function_call::return_type.
  */
 struct constant {
   sirius::value payload;

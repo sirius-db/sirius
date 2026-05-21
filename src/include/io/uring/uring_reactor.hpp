@@ -88,14 +88,25 @@ struct ring_deleter {
 };
 using unique_ring = std::unique_ptr<io_uring, ring_deleter>;
 
+/**
+ * @brief Converts a byte count to mebibytes.
+ */
+inline double to_mb(size_t bytes) noexcept
+{
+  return static_cast<double>(bytes) / (1024.0 * 1024.0);
+}
+
 // ---- bounce_slot -----------------------------------------------------------
 
 /**
  * @brief One pinned-memory staging buffer with a completion flag.
  *
- * The buffer is a non-owning pointer into a block owned by the reactor's
- * @c fixed_size_host_memory_resource allocation — the resource frees the
- * memory when the reactor is destroyed.
+ * The backing buffer is allocated by uring_reactor's ctor and freed in its
+ * dtor. Two allocation modes are supported:
+ *   - numa_node < 0 : cudaHostAlloc(cudaHostAllocPortable)
+ *   - numa_node >= 0: numa_alloc_onnode + cudaHostRegister(Portable|Mapped)
+ * The matching free path is selected from `_numa_node`/`_size` recorded on
+ * the reactor — bounce_slot itself stays POD.
  */
 struct bounce_slot {
   void* buf{nullptr};
@@ -166,11 +177,14 @@ class uring_reactor {
   using device_read_req_type = device_read_req<native_handle_type>;
   using host_read_req_type   = host_read_req<native_handle_type>;
 
-  /// Bounce slots are allocated from @p mr; their size is taken from
-  /// @c mr.get_block_size().  The reactor keeps the @c multiple_blocks_allocation
-  /// alive for its lifetime — blocks return to the resource on destruction.
-  explicit uring_reactor(cucascade::memory::fixed_size_host_memory_resource& mr,
-                         unsigned ring_entries = 64);
+  /// @param ring_entries       SQE depth for the per-reactor io_uring.
+  /// @param bounce_slot_size   Size of each pinned bounce buffer slot.
+  /// @param numa_node          Target NUMA node for pinned bounce-buffer
+  ///                           allocation. Use -1 to skip NUMA binding
+  ///                           (single-node hosts / fallback path).
+  explicit uring_reactor(unsigned ring_entries   = 64,
+                         size_t bounce_slot_size = CHUNK_SIZE,
+                         int numa_node           = -1);
 
   ~uring_reactor();
 
@@ -228,14 +242,11 @@ class uring_reactor {
   // waiting for a callback that wouldn't otherwise come.
   static void cuda_copy_cb(cudaStream_t stream, cudaError_t status, void* p) noexcept;
 
-  // Keeps the bounce-slot blocks alive for the reactor's lifetime.  The
-  // multiple_blocks_allocation destructor returns the blocks to the upstream
-  // resource when the reactor is destroyed.
-  cucascade::memory::fixed_multiple_blocks_allocation _bounce_storage;
-  std::size_t _bounce_slot_size;
   std::array<bounce_slot, NUM_CHUNKS> _bounce;
   std::array<cb_arg, NUM_CHUNKS> _cb_args;
   unsigned _ring_entries;
+  size_t _bounce_slot_size{0};
+  int _numa_node{-1};
   std::atomic<uint64_t> _wake_seq{0};
   std::atomic<bool> _stop{false};
   std::thread _worker;

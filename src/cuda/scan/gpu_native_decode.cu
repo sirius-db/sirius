@@ -31,7 +31,9 @@
 // every synchronous CUDA API call is individually wrapped in `RMM_CUDA_TRY`.
 //===----------------------------------------------------------------------===//
 
+#include "cuda/scan/gpu_decode_alp.cuh"
 #include "cuda/scan/gpu_decode_bitpacking.cuh"
+#include "cuda/scan/gpu_decode_rle.cuh"
 #include "cuda/scan/gpu_native_decode.cuh"
 
 #include <cudf/column/column.hpp>
@@ -434,8 +436,17 @@ void dispatch_data_run(gpu_codec_run const& run,
     case duckdb::CompressionType::COMPRESSION_CONSTANT:
       decode_constant_data(run, d_output, type, type_size, stream);
       return;
+    case duckdb::CompressionType::COMPRESSION_RLE:
+      decode_rle_data(run, d_output, type, type_size, stream, mr);
+      return;
     case duckdb::CompressionType::COMPRESSION_BITPACKING:
       decode_bitpacking_data(run, d_output, type, type_size, stream, mr);
+      return;
+    case duckdb::CompressionType::COMPRESSION_ALP:
+      decode_alp_data(run, d_output, type, type_size, stream, mr);
+      return;
+    case duckdb::CompressionType::COMPRESSION_ALPRD:
+      decode_alprd_data(run, d_output, type, type_size, stream, mr);
       return;
     default:
       throw std::runtime_error("gpu_decode_table: viability invariant violated — data codec " +

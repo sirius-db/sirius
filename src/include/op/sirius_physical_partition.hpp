@@ -88,6 +88,17 @@ class sirius_physical_partition : public sirius_physical_operator {
 
   void set_num_partitions(int num_partitions);
 
+  /// Set a floor for num_partitions. The partition-consumer downstream (hash
+  /// join, merge_group_by) pins each partition to partition_idx % num_gpus,
+  /// so we need at least num_gpus partitions for all GPUs to see work on big
+  /// inputs. Small inputs fall below `small_table_bytes` and stay at one
+  /// partition (runs on a single GPU).
+  void set_min_num_partitions(int min_num_partitions, uint64_t small_table_bytes)
+  {
+    _min_num_partitions = min_num_partitions;
+    _small_table_bytes  = small_table_bytes;
+  }
+
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const op::input_stats& stats) const override;
 
@@ -112,6 +123,8 @@ class sirius_physical_partition : public sirius_physical_operator {
   bool _has_sibling_partition_op;
   PartitionType _partition_type;
   uint64_t s_partition_size;
+  int _min_num_partitions{1};
+  uint64_t _small_table_bytes{0};
 };
 
 }  // namespace op

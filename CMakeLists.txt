@@ -149,6 +149,7 @@ set(EXTENSION_SOURCES
     src/data/host_parquet_representation_converters.cpp
     src/downgrade/downgrade_executor.cpp
     src/expression/expression.cpp
+    src/expression/function_id.cpp
     src/expression/join_condition.cpp
     src/expression/value.cpp
     src/expression_executor/expression_executor_strategy.cpp
@@ -164,6 +165,7 @@ set(EXTENSION_SOURCES
     src/expression_executor/specializations/gpu_execute_function.cpp
     src/expression_executor/specializations/gpu_execute_operator.cpp
     src/expression_executor/specializations/gpu_execute_reference.cpp
+    # I/O adapters (Phase 19 — io_uring + sirius_datasource)
     src/io/admission_control.cpp
     src/io/datasource_factory.cpp
     src/io/io_context.cpp
@@ -186,6 +188,7 @@ set(EXTENSION_SOURCES
     src/op/scan/cached_ranges.cpp
     src/op/scan/duckdb_scan_executor.cpp
     src/op/scan/cpu_source_task.cpp
+    src/op/scan/duckdb_native_metadata.cpp
     src/op/scan/duckdb_scan_task.cpp
     src/op/scan/equality_delete_filter.cpp
     src/op/scan/hive_partition.cpp
@@ -201,6 +204,7 @@ set(EXTENSION_SOURCES
     src/op/scan/scan_plan.cpp
     src/op/scan/scan_utils.cpp
     src/op/scan/sirius_gpu_parquet_scan_operator.cpp
+    src/op/sirius_dynamic_filter.cpp
     src/op/sirius_physical_column_data_scan.cpp
     src/op/sirius_physical_cpu_source.cpp
     src/op/sirius_physical_concat.cpp
@@ -279,8 +283,9 @@ set(EXTENSION_SOURCES
 # Legacy Sirius — all legacy-specific config lives in src/legacy/CMakeLists.txt.
 # Deleting src/legacy/ cleanly removes legacy build support.
 set(CUDA_SOURCES
-    src/op/scan/equality_delete_mask.cu src/cuda/scan/gpu_decode_bitpacking.cu
-    src/cuda/scan/gpu_native_decode.cu)
+    src/op/scan/equality_delete_mask.cu src/cuda/scan/gpu_decode_alp.cu
+    src/cuda/scan/gpu_decode_bitpacking.cu src/cuda/scan/gpu_decode_rle.cu
+    src/cuda/scan/gpu_decode_strings.cu src/cuda/scan/gpu_native_decode.cu)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
   add_subdirectory(src/legacy)
   list(APPEND EXTENSION_SOURCES ${SIRIUS_LEGACY_SOURCES}
@@ -352,10 +357,48 @@ target_link_libraries(
 target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING
                       PkgConfig::CURL OpenSSL::Crypto)
 
+# cucascade upstream PRs #126/#128/#130 moved cucascade to static-CUDA linkage
+# and pulled the NVML *static stub* (libnvidia-ml.a) into libcucascade.a via the
+# `CUDA::nvml_static` imported target. Upstream's
+# `LINKER:--exclude-libs,libnvidia-ml` workaround (PR #130) keeps cucascade's
+# own tests happy by hiding the bundled stub symbols from the dynamic export
+# table (NVIDIA bug 6174166: libnvidia-ml.so dlsyms into the host process and
+# recurses into the stub). For sirius's larger transitive graph, hiding the
+# symbols segfaults at runtime — DuckDB/RMM call nvml directly before nvmlInit's
+# jump-table patch fires — while leaving them visible deadlocks in stubSpinLock
+# when the real driver loads.
+#
+# The robust fix for sirius: override CUDA::nvml_static's IMPORTED location to
+# point at the *shared* stub (libnvidia-ml.so) in the same pixi env. The shared
+# stub uses normal dynamic linking via ld.so, which resolves to the real
+# libnvidia-ml.so.1 at runtime, matching the working Phase-24 configuration.
+# This bypasses both failure modes (no stub symbols bundled, no dynamic-export
+# conflict).
+if(TARGET CUDA::nvml_static)
+  get_target_property(_nvml_static_loc CUDA::nvml_static IMPORTED_LOCATION)
+  if(_nvml_static_loc AND _nvml_static_loc MATCHES "libnvidia-ml\\.a$")
+    string(REGEX REPLACE "libnvidia-ml\\.a$" "libnvidia-ml.so" _nvml_shared_loc
+                         "${_nvml_static_loc}")
+    if(EXISTS "${_nvml_shared_loc}")
+      set_target_properties(
+        CUDA::nvml_static
+        PROPERTIES IMPORTED_LOCATION "${_nvml_shared_loc}"
+                   IMPORTED_LOCATION_RELEASE "${_nvml_shared_loc}")
+      message(
+        STATUS
+          "Sirius: redirected CUDA::nvml_static from ${_nvml_static_loc} to ${_nvml_shared_loc}"
+      )
+    endif()
+  endif()
+endif()
+
 # Required by DuckDB's export set (duckdb_static -> sirius_extension ->
-# cucascade_static / telemetry_bridge)
+# cucascade_static / telemetry_bridge). cucascade upstream PR #126 split
+# topology_discovery into its own static target — list it here so the export set
+# covers the dependency chain.
 install(
-  TARGETS sirius_extension cucascade_static telemetry_bridge
+  TARGETS sirius_extension cucascade_static cucascade_topology_discovery_static
+          telemetry_bridge
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
@@ -387,22 +430,30 @@ set(TEST_SOURCES
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/expression/test_ast_scaffold.cpp
     test/cpp/expression/test_expression.cpp
+    test/cpp/expression/test_function_id.cpp
     test/cpp/expression/test_join_condition.cpp
     test/cpp/expression/test_value.cpp
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
     test/cpp/helper/test_logical_type.cpp
+    test/cpp/integration/test_gpu_execution_locality.cpp
+    test/cpp/integration/test_gpu_execution_multi_format.cpp
+    test/cpp/integration/test_gpu_execution_tpch.cpp
+    test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
+    test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
+    test/cpp/integration/test_transparent_execution.cpp
     test/cpp/io/s3/test_sigv4.cpp
     test/cpp/io/s3/test_s3_ioctx.cpp
     test/cpp/io/s3/test_sirius_sigv4_credential_provider.cpp
     test/cpp/io/s3/test_static_credentials.cpp
     test/cpp/io/test_datasource_factory.cpp
     test/cpp/io/test_uri_parser.cpp
-    test/cpp/integration/test_gpu_execution_multi_format.cpp
-    test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/integration/test_s3_perf_benchmark.cpp
     test/cpp/integration/test_scan_manager_s3_end_to_end.cpp
-    test/cpp/integration/test_transparent_execution.cpp
+    test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
+    test/cpp/operator/test_physical_hash_join_mgpu.cpp
+    test/cpp/operator/test_physical_order_mgpu.cpp
+    test/cpp/operator/test_mgpu_stress.cpp
     test/cpp/memory/test_host_table_utils.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
@@ -424,6 +475,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_no_history_peak_memory_estimate.cpp
     test/cpp/operator/test_physical_top_n.cpp
     test/cpp/operator/test_physical_ungrouped_aggregate.cpp
+    test/cpp/operator/test_sirius_dynamic_filter.cpp
     test/cpp/parallel/test_task_executor.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
@@ -437,7 +489,11 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_task_scheduler.cpp
     test/cpp/scan/bench_decode_codecs.cpp
     test/cpp/scan/test_column_builder.cpp
+    test/cpp/scan/test_duckdb_native_walker.cpp
+    test/cpp/scan/test_gpu_decode_alp.cpp
     test/cpp/scan/test_gpu_decode_bitpacking.cpp
+    test/cpp/scan/test_gpu_decode_rle.cpp
+    test/cpp/scan/test_gpu_decode_strings.cpp
     test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_scan_task.cpp
@@ -447,6 +503,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_scan_executor.cpp
     test/cpp/scan/test_split_connector.cpp
     test/cpp/scan_manager/test_sirius_scan_manager_s3.cpp
+    test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
     test/cpp/unittest.cpp
     test/cpp/utils/sirius_test_env.cpp
     test/cpp/utils/utils.cpp)

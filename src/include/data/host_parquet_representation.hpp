@@ -110,8 +110,9 @@ class host_parquet_representation : public cucascade::idata_representation {
                               std::size_t uncompressed_size_in_bytes,
                               std::size_t file_size,
                               std::shared_ptr<cudf::io::datasource> fallback_datasource,
-                              std::shared_ptr<translated_expression> filter_expression = nullptr,
-                              std::vector<std::size_t> post_filter_projection_ids      = {})
+                              std::shared_ptr<std::unordered_map<int, translated_expression>>
+                                filter_expression_by_device                       = nullptr,
+                              std::vector<std::size_t> post_filter_projection_ids = {})
     : idata_representation(*memory_space),
       _column_chunks(std::move(column_chunks)),
       _parquet_reader(std::move(parquet_reader)),
@@ -122,7 +123,7 @@ class host_parquet_representation : public cucascade::idata_representation {
       _uncompressed_size_in_bytes(uncompressed_size_in_bytes),
       _file_size(file_size),
       _fallback_datasource(fallback_datasource),
-      _filter_expression(filter_expression),
+      _filter_expression_by_device(std::move(filter_expression_by_device)),
       _post_filter_projection_ids(std::move(post_filter_projection_ids))
   {
   }
@@ -277,13 +278,18 @@ class host_parquet_representation : public cucascade::idata_representation {
   }
 
   /**
-   * @brief Gets the optional filter expression for filter pushdown.
+   * @brief Gets the per-GPU map of translated filter expressions for filter pushdown.
    *
-   * @return A shared_ptr to the translated filter expression, or nullptr if not set.
+   * The converter uses this to pick the entry matching its task's target device so the
+   * cudf::scalar device buffers evaluated by cudf::io::read_parquet live on the current
+   * GPU.
+   *
+   * @return A shared_ptr to the per-device filter map (may be null or empty).
    */
-  [[nodiscard]] std::shared_ptr<translated_expression> const& get_filter_expression() const
+  [[nodiscard]] std::shared_ptr<std::unordered_map<int, translated_expression>> const&
+  get_filter_expression_by_device() const
   {
-    return _filter_expression;
+    return _filter_expression_by_device;
   }
 
   /**
@@ -389,17 +395,18 @@ class host_parquet_representation : public cucascade::idata_representation {
   }
 
  private:
-  host_parquet_representation(cucascade::memory::memory_space* memory_space,
-                              std::shared_ptr<hybrid_scan_reader> parquet_reader,
-                              cudf::io::parquet_reader_options reader_options,
-                              std::vector<cudf::size_type> row_group_indices,
-                              std::vector<cudf::io::text::byte_range_info> column_chunk_byte_ranges,
-                              std::size_t size_in_bytes,
-                              std::size_t uncompressed_size_in_bytes,
-                              std::size_t file_size,
-                              std::shared_ptr<cudf::io::datasource> fallback_datasource,
-                              std::shared_ptr<translated_expression> filter_expression,
-                              std::vector<std::size_t> post_filter_projection_ids)
+  host_parquet_representation(
+    cucascade::memory::memory_space* memory_space,
+    std::shared_ptr<hybrid_scan_reader> parquet_reader,
+    cudf::io::parquet_reader_options reader_options,
+    std::vector<cudf::size_type> row_group_indices,
+    std::vector<cudf::io::text::byte_range_info> column_chunk_byte_ranges,
+    std::size_t size_in_bytes,
+    std::size_t uncompressed_size_in_bytes,
+    std::size_t file_size,
+    std::shared_ptr<cudf::io::datasource> fallback_datasource,
+    std::shared_ptr<std::unordered_map<int, translated_expression>> filter_expression_by_device,
+    std::vector<std::size_t> post_filter_projection_ids)
     : idata_representation(*memory_space),
       _parquet_reader(std::move(parquet_reader)),
       _reader_options(std::move(reader_options)),
@@ -409,7 +416,7 @@ class host_parquet_representation : public cucascade::idata_representation {
       _uncompressed_size_in_bytes(uncompressed_size_in_bytes),
       _file_size(file_size),
       _fallback_datasource(fallback_datasource),
-      _filter_expression(filter_expression),
+      _filter_expression_by_device(std::move(filter_expression_by_device)),
       _post_filter_projection_ids(std::move(post_filter_projection_ids))
   {
   }
@@ -424,7 +431,7 @@ class host_parquet_representation : public cucascade::idata_representation {
   std::size_t _uncompressed_size_in_bytes;
   std::size_t _file_size{0};
   std::shared_ptr<cudf::io::datasource> _fallback_datasource;
-  std::shared_ptr<translated_expression> _filter_expression;
+  std::shared_ptr<std::unordered_map<int, translated_expression>> _filter_expression_by_device;
   std::vector<std::size_t> _post_filter_projection_ids;
   /// Optional post-convert hook (null for plain parquet, set for iceberg V2 deletes).
   post_convert_fn_t _post_convert_fn;
