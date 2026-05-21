@@ -439,9 +439,9 @@ TEST_CASE("ast_from_duckdb - BOUND_FUNCTION '+' resolves to function_id::add",
   REQUIRE(out);
   REQUIRE(out->holds<function_call>());
   auto const& fc = out->get<function_call>();
-  REQUIRE(fc.function == sirius::function_id::add);
-  REQUIRE(fc.arguments.size() == 2);
-  REQUIRE(fc.return_type.id() == sirius::type_id::INTEGER);
+  REQUIRE(fc.function() == sirius::function_id::add);
+  REQUIRE(fc.arguments().size() == 2);
+  REQUIRE(fc.return_type().id() == sirius::type_id::INTEGER);
 }
 
 TEST_CASE("ast_from_duckdb - BOUND_FUNCTION 'substring' resolves to function_id::substring",
@@ -463,7 +463,7 @@ TEST_CASE("ast_from_duckdb - BOUND_FUNCTION 'substring' resolves to function_id:
   auto out = sirius::ast::from_duckdb(*fn_expr);
   REQUIRE(out);
   REQUIRE(out->holds<function_call>());
-  REQUIRE(out->get<function_call>().function == sirius::function_id::substring);
+  REQUIRE(out->get<function_call>().function() == sirius::function_id::substring);
 }
 
 TEST_CASE("ast_from_duckdb - BOUND_FUNCTION 'substr' alias resolves to function_id::substring",
@@ -485,7 +485,7 @@ TEST_CASE("ast_from_duckdb - BOUND_FUNCTION 'substr' alias resolves to function_
   auto out = sirius::ast::from_duckdb(*fn_expr);
   REQUIRE(out);
   REQUIRE(out->holds<function_call>());
-  REQUIRE(out->get<function_call>().function == sirius::function_id::substring);
+  REQUIRE(out->get<function_call>().function() == sirius::function_id::substring);
 }
 
 TEST_CASE("ast_from_duckdb - BOUND_FUNCTION unknown name returns nullptr",
