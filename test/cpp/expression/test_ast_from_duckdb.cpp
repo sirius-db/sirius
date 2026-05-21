@@ -716,17 +716,17 @@ TEST_CASE("ast_from_duckdb - real Binder output translates to non-null trees",
   // four landmark kinds we expect from the four SQL fragments in the query,
   // rather than asserting an exact tree shape (the Binder may wrap children
   // in implicit casts or rearrange unrelated structure).
-  bool saw_between           = false;
-  bool saw_add               = false;
-  bool saw_like              = false;
-  bool saw_is_not_null       = false;
+  bool saw_between     = false;
+  bool saw_add         = false;
+  bool saw_like        = false;
+  bool saw_is_not_null = false;
   // The query's expected node set is {between, function_call, unary_op,
   // reference, constant}. Only the three non-leaf kinds need a descent arm;
   // any other kind appearing here would indicate an unexpected binder
   // rewrite and is surfaced by the landmark assertions failing below.
   std::function<void(node const&)> visit_node = [&](node const& n) {
     if (n.holds<between>()) {
-      saw_between = true;
+      saw_between    = true;
       auto const& bw = n.get<between>();
       if (bw.input) visit_node(*bw.input);
       if (bw.lower) visit_node(*bw.lower);
