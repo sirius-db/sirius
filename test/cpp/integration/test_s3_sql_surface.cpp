@@ -350,24 +350,20 @@ void check_rows_equal_with_tolerant_columns(duckdb::MaterializedQueryResult& act
 
 bool within_large_s3_byte_budget(std::uint64_t byte_delta, std::size_t object_size)
 {
-  // Today the SF10 SQL path can fetch parquet byte ranges twice over the network:
-  // once via parquet_split_provider's prefetching_cache prewarm
-  // (prefetching_cache.cpp worker -> host_read_ranges_async_io -> range_get),
-  // and again when cudf::io::read_parquet reads through sirius_datasource
-  // (sirius_gpu_parquet_scan_operator -> io_ctx->make_datasource ->
-  // host_read_async -> range_get on cache miss). The scan path attempts
-  // cache->read(), but the current prewarm/read pattern is not a reliable
-  // hit path at SF10 scale.
-  //
-  // Keep this as a regression-only guard until the scan path is made to
-  // consume prefetched ranges reliably (tracked in newplan.md §26).
-  return byte_delta <= 3ULL * static_cast<std::uint64_t>(object_size);
+  // B1 Phase 3a (newplan §26.6) measured every config (cache-off /
+  // cache-on+prewarm-on / cache-on+prewarm-off) at 1.00x object_size on SF10;
+  // §26's earlier 1.87x double-fetch did not reproduce on current code.
+  // 1.1x is a tight regression guard; measured worst case is the join at
+  // ~1.003x (lineitem + orders both read against the lineitem object_size).
+  return byte_delta <=
+         static_cast<std::uint64_t>(object_size) + static_cast<std::uint64_t>(object_size / 10);
 }
 
 bool within_no_prewarm_s3_byte_budget(std::uint64_t byte_delta, std::size_t object_size)
 {
+  // Same 1.1x ceiling; cache-on + prewarm-off also measured 1.00x (§26.6).
   return byte_delta <=
-         static_cast<std::uint64_t>(object_size) + static_cast<std::uint64_t>(object_size / 5);
+         static_cast<std::uint64_t>(object_size) + static_cast<std::uint64_t>(object_size / 10);
 }
 
 fs::path local_parquet_path(std::string_view table)
