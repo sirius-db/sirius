@@ -46,6 +46,8 @@
 #include <duckdb/common/exception.hpp>
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/function/scalar_function.hpp>
+#include <duckdb/main/client_config.hpp>
+#include <duckdb/main/client_context.hpp>
 #include <duckdb/main/connection.hpp>
 #include <duckdb/main/database.hpp>
 #include <duckdb/planner/expression/bound_between_expression.hpp>
@@ -406,8 +408,7 @@ TEST_CASE("ast_from_duckdb - BOUND_CAST honors try_cast = true",
           "[ast_from_duckdb]")
 {
   auto child = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
-  // Direct ctor with try_cast=true: BoundCastExpression(child, target, try_cast)
-  auto cast_expr = duckdb::make_uniq<BoundCastExpression>(
+  auto cast_expr = BoundCastExpression::AddDefaultCastToType(
     std::move(child), LogicalType{LogicalTypeId::BIGINT}, /*try_cast=*/true);
   auto out = sirius::ast::from_duckdb(*cast_expr);
   REQUIRE(out);
@@ -621,15 +622,16 @@ TEST_CASE("ast_from_duckdb - BOUND_OPERATOR COMPARE_NOT_IN translates to in_list
 TEST_CASE("ast_from_duckdb - BOUND_OPERATOR unsupported ExpressionType returns nullptr",
           "[ast_from_duckdb]")
 {
-  // OPERATOR_GLOB is well-formed for BoundOperatorExpression but not in the
-  // demultiplex table; signal fallback via nullptr.
-  auto glob_expr = duckdb::make_uniq<BoundOperatorExpression>(
-    ExpressionType::OPERATOR_GLOB, LogicalType{LogicalTypeId::BOOLEAN});
-  glob_expr->children.push_back(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::VARCHAR}, 0));
-  glob_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value("x%")));
+  // OPERATOR_NULLIF is a well-formed BoundOperatorExpression kind that is not in
+  // the demultiplex table; signal fallback via nullptr.
+  auto nullif_expr = duckdb::make_uniq<BoundOperatorExpression>(
+    ExpressionType::OPERATOR_NULLIF, LogicalType{LogicalTypeId::INTEGER});
+  nullif_expr->children.push_back(
+    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
+  nullif_expr->children.push_back(
+    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(0)));
 
-  REQUIRE(sirius::ast::from_duckdb(*glob_expr) == nullptr);
+  REQUIRE(sirius::ast::from_duckdb(*nullif_expr) == nullptr);
 }
 
 // ============================================================================
@@ -658,6 +660,12 @@ TEST_CASE("ast_from_duckdb - real Binder output translates to non-null trees",
   duckdb::DuckDB db(nullptr, &config);
   duckdb::Connection conn(db);
   conn.Query("CREATE TABLE t(a INTEGER, b VARCHAR, c BIGINT);");
+
+  // The optimizer would constant-fold a query against an empty table down to
+  // EMPTY_RESULT, stripping out every BoundExpression. Run the planner without
+  // the optimizer so the test actually exercises from_duckdb on real Binder
+  // output.
+  duckdb::ClientConfig::GetConfig(*conn.context).enable_optimizer = false;
 
   auto plan = conn.ExtractPlan(
     "SELECT a + 3, b LIKE 'x%', c IS NOT NULL FROM t WHERE a BETWEEN 1 AND 10");
