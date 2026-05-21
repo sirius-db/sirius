@@ -17,23 +17,16 @@
 #pragma once
 
 // sirius
-#include "helper/logical_type.hpp"  // sirius::logical_type
+#include "expression/function_id.hpp"  // sirius::function_id
+#include "helper/logical_type.hpp"     // sirius::logical_type
 
 // standard library
-#include <cstdint>
 #include <memory>
 #include <vector>
 
 namespace sirius::ast {
 
 struct node;
-
-namespace detail {
-/// Placeholder function identifier (to be replaced with sirius::function_id).
-enum class function_placeholder : uint16_t {
-  unknown = 0,
-};
-}  // namespace detail
 
 /**
  * @brief Sirius-native mirror of duckdb::BoundFunctionExpression.
@@ -42,7 +35,7 @@ enum class function_placeholder : uint16_t {
  * construction time so the executor does not need to re-derive it.
  */
 struct function_call {
-  detail::function_placeholder function{detail::function_placeholder::unknown};
+  sirius::function_id function{sirius::function_id::add};
   std::vector<std::unique_ptr<node>> arguments;
   sirius::logical_type return_type;
 };
