@@ -134,7 +134,12 @@ pipeline_conversion_result sirius_pipeline_converter::convert(sirius_meta_pipeli
   repository_wirings_.clear();
 
   auto copied_scheduled = schedule_and_copy_pipelines(root_pipeline);
-  split_pipelines(copied_scheduled);
+  if (!duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
+    // Phase 3.3 (#604): under the tree-based path, the plan generator + build_pipelines
+    // virtuals already place every operator. There is nothing to split or insert at
+    // convert time.
+    split_pipelines(copied_scheduled);
+  }
   compute_repository_wiring();
   setup_pipeline_parents();
   finalize_pipeline_structure();
@@ -1298,8 +1303,15 @@ void sirius_pipeline_converter::finalize_pipeline_structure()
   // AFTER THIS POINT: operators[] contains ALL operators (source through sink).
   // source = &operators[0], sink = operators.back().
   for (const auto& pipeline : scheduled_) {
-    pipeline->operators.push_back(*pipeline->sink);
-    pipeline->source = &pipeline->operators[0].get();
+    if (!duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
+      // Phase 3.2 (#604): under USE_TREE_BASED_PIPELINE_BUILD, is_ready (C.1)
+      // already pushed sink into operators[] and set source = &operators[0].
+      // Skip the redoing here; the parent->dependency reverse map still needs
+      // to be populated (next loop), so the function as a whole is still
+      // called under both flag states until Sub-phase E deletes it.
+      pipeline->operators.push_back(*pipeline->sink);
+      pipeline->source = &pipeline->operators[0].get();
+    }
     // for each parent pipeline, add the current pipeline to the dependencies
     for (auto& parent : pipeline->parents) {
       if (auto locked_parent = parent.lock()) { locked_parent->dependencies.push_back(pipeline); }
