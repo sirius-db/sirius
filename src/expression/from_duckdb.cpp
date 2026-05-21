@@ -32,7 +32,7 @@
 #include "expression/function_id.hpp"
 #include "expression/join_condition.hpp"  // sirius::comparison_type, sirius::from_duckdb(ExpressionType)
 #include "expression/value.hpp"           // sirius::from_duckdb(Value const&, logical_type const&)
-#include "helper/type_conversions.hpp"    // sirius::from_duckdb(LogicalType const&)
+#include "helper/type_conversions.hpp"  // sirius::from_duckdb(LogicalType const&)
 
 // duckdb
 #include <duckdb/common/assert.hpp>

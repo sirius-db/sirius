@@ -46,9 +46,7 @@ class function_call {
   function_call(sirius::function_id id,
                 std::vector<std::unique_ptr<node>> arguments,
                 sirius::logical_type return_type)
-      : function_(id),
-        arguments_(std::move(arguments)),
-        return_type_(std::move(return_type))
+    : function_(id), arguments_(std::move(arguments)), return_type_(std::move(return_type))
   {
   }
 
