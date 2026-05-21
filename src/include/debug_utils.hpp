@@ -97,7 +97,7 @@ enum class DebugFormat { ALIGNED, CSV };
  * @param col_names      Optional column names (falls back to col[N])
  * @param max_string_len Maximum display length for STRING values. Longer
  *                       strings truncated with '...' suffix. Pass 0 for no
- *                       truncation (per D-02).
+ *                       truncation.
  */
 void debug_head(cucascade::data_batch& batch,
                 cudf::size_type n,

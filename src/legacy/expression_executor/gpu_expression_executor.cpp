@@ -286,12 +286,15 @@ std::shared_ptr<cucascade::data_batch> GpuExpressionExecutor::execute(
     output_columns[i] = std::move(result);
   }
 
-  // Create the data representation
+  // Create the data representation. cucascade::gpu_table_representation now
+  // requires a stream argument (writer_stream for STREAM-LINEAGE event
+  // recording); reuse execution_stream since that's the stream the output
+  // columns were materialized on.
   std::unique_ptr<cucascade::idata_representation> output_data_rep =
     std::make_unique<cucascade::gpu_table_representation>(
-      std::move(
-        std::make_unique<cudf::table>(std::move(output_columns), execution_stream, resource_ref)),
-      *input_ro.get_memory_space());
+      std::make_unique<cudf::table>(std::move(output_columns), execution_stream, resource_ref),
+      *input_ro.get_memory_space(),
+      execution_stream);
 
   // Create the data batch and return
   auto const batch_id = ::sirius::get_next_batch_id();
@@ -357,8 +360,8 @@ std::shared_ptr<cucascade::data_batch> GpuExpressionExecutor::select(
   auto output_table =
     cudf::apply_boolean_mask(input_table, bitmap->view(), execution_stream, resource_ref);
   std::unique_ptr<cucascade::idata_representation> output_data_rep =
-    std::make_unique<cucascade::gpu_table_representation>(std::move(output_table),
-                                                          *input_ro.get_memory_space());
+    std::make_unique<cucascade::gpu_table_representation>(
+      std::move(output_table), *input_ro.get_memory_space(), execution_stream);
 
   // Create the data batch and return
   auto const batch_id = ::sirius::get_next_batch_id();

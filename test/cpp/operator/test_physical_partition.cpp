@@ -102,7 +102,8 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single 
   columns.push_back(std::move(col1));
   auto table = std::make_unique<cudf::table>(std::move(columns));
 
-  auto gpu_repr = std::make_unique<gpu_table_representation>(std::move(table), *space);
+  auto gpu_repr = std::make_unique<gpu_table_representation>(
+    std::move(table), *space, cudf::get_default_stream());
   auto input_batch =
     std::make_shared<data_batch>(::sirius::get_next_batch_id(), std::move(gpu_repr));
 
@@ -231,7 +232,8 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with two par
   columns.push_back(std::move(col2));
   auto table = std::make_unique<cudf::table>(std::move(columns));
 
-  auto gpu_repr = std::make_unique<gpu_table_representation>(std::move(table), *space);
+  auto gpu_repr = std::make_unique<gpu_table_representation>(
+    std::move(table), *space, cudf::get_default_stream());
   auto input_batch =
     std::make_shared<data_batch>(::sirius::get_next_batch_id(), std::move(gpu_repr));
 
@@ -320,7 +322,8 @@ TEST_CASE(
   columns.push_back(std::move(col1));
   auto table = std::make_unique<cudf::table>(std::move(columns));
 
-  auto gpu_repr = std::make_unique<gpu_table_representation>(std::move(table), *space);
+  auto gpu_repr = std::make_unique<gpu_table_representation>(
+    std::move(table), *space, cudf::get_default_stream());
   auto input_batch =
     std::make_shared<data_batch>(::sirius::get_next_batch_id(), std::move(gpu_repr));
 

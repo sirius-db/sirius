@@ -25,6 +25,13 @@
 #include "op/scan/scan_utils.hpp"
 #include "scan_manager/parquet_metadata.hpp"
 
+// Sirius IO framework includes. sirius_datasource declares the per-ioctx
+// datasource factory; uring_reactor pulls in the concrete uring_io_object
+// construction. uring_reactor MUST be included last among sirius headers —
+// liburing's BLOCK_SIZE macro collides with blockingconcurrentqueue.h's
+// static const BLOCK_SIZE member when both transitively land in the same TU.
+#include <io/sirius_datasource.hpp>
+// (other sirius headers above already included)
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
@@ -33,6 +40,7 @@
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <duckdb/common/hive_partitioning.hpp>
+#include <io/uring/uring_reactor.hpp>
 
 #include <algorithm>
 #include <memory>
@@ -68,12 +76,12 @@ parquet_split_provider::parquet_split_provider(
   duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
   std::size_t approximate_batch_size,
   std::size_t max_file_processed,
-  std::shared_ptr<sirius::io::sirius_ioctx> io_ctx)
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs)
   : _file_paths(file_paths),
     _approximate_batch_size(approximate_batch_size),
     _max_file_processed(max_file_processed),
     _total_files(file_paths.size()),
-    _io_ctx(std::move(io_ctx))
+    _gpu_ioctxs(std::move(gpu_ioctxs))
 {
   // Any non-trivial scan shape — reader-side projection, filter pushdown, or hive-partition
   // injection — needs column names for reader set_column_names / AST name resolution /
@@ -177,6 +185,20 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     }
   }
 
+  // Route reads through sirius_datasource — cudf's bundled file_source uses
+  // libkvikio which binds a single CUDA context per FileHandle, breaking
+  // multi-GPU residency. Picking the first ioctx for planning is safe: footer
+  // reads are small, and per-GPU placement of column data is decided later
+  // by the scan operator's task affinity.
+  if (_gpu_ioctxs.empty()) {
+    throw std::runtime_error(
+      "parquet_split_provider: gpu_ioctxs is empty — kvikio path is forbidden. "
+      "Production callers receive gpu_ioctxs from SiriusContext::get_gpu_ioctxs(); "
+      "test fixtures must inject via make_test_gpu_ioctxs() helper "
+      "(test/cpp/scan/test_helpers_ioctx.hpp).");
+  }
+  auto const planning_ioctx_it = _gpu_ioctxs.begin();
+
   // Loop over files to read footers, parse metadata, and compute row-group partitions.
   rg_accumulator accum;
   // flush() appends the bundled slices to `out` but does NOT reset partition_values. The file
@@ -214,18 +236,8 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     }
 
     //===----------Read metadata footers----------===//
-    // When the manager exposes a sirius_ioctx, mint an io_object up-front and
-    // route the footer fetch through sirius_datasource so the same io_object
-    // can be threaded onto every emitted row_group_slice.  Falls through to
-    // cudf's path when the manager was configured with use_sirius_datasource=false.
-    std::shared_ptr<sirius::io::sirius_io_object> file_io_object;
-    std::unique_ptr<cudf::io::datasource> datasource;
-    if (_io_ctx != nullptr) {
-      file_io_object = _io_ctx->create_io_object(file_path);
-      datasource     = _io_ctx->make_datasource(file_io_object);
-    } else {
-      datasource = cudf::io::datasource::create(file_path);
-    }
+    auto file_io_object = planning_ioctx_it->second->create_io_object(file_path);
+    auto datasource     = planning_ioctx_it->second->make_datasource(file_io_object);
 
     //===----------Parse metadata (with prefetch-cache reuse)----------===//
     // If the prefetching cache already has a parquet_metadata entry for this
@@ -237,8 +249,8 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     std::size_t footer_byte_len = 0;
     std::unique_ptr<op::scan::hybrid_scan_reader> reader_ptr;
 
-    if (file_io_object && _io_ctx != nullptr && _io_ctx->cache() != nullptr) {
-      if (auto cached = _io_ctx->cache()->get_metadata(*file_io_object)) {
+    if (file_io_object && planning_ioctx_it->second->cache() != nullptr) {
+      if (auto cached = planning_ioctx_it->second->cache()->get_metadata(*file_io_object)) {
         cached_parquet_metadata = std::dynamic_pointer_cast<parquet_metadata>(std::move(cached));
       }
     }
@@ -312,7 +324,7 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     // surviving row group + footer/trailer.  insert() must use the same
     // merged ranges scan_task computes — the cache only serves reads that
     // are fully covered by an inserted range.
-    if (file_io_object && _io_ctx != nullptr && _io_ctx->cache() != nullptr &&
+    if (file_io_object && planning_ioctx_it->second->cache() != nullptr &&
         !row_group_indices.empty()) {
       using range_t = cudf::io::text::byte_range_info;
 
@@ -372,7 +384,8 @@ void parquet_split_provider::run_batch(file_batch const& batch,
           ? nullptr
           : std::static_pointer_cast<sirius::io::sirius_io_object_metadata>(
               std::make_shared<parquet_metadata>(file_metadata, footer_byte_len));
-      _io_ctx->cache()->insert(*file_io_object, std::move(metadata_to_store), ranges);
+      planning_ioctx_it->second->cache()->insert(
+        *file_io_object, std::move(metadata_to_store), ranges);
     }
 
     std::vector<cudf::size_type> cur_rgs;
@@ -386,7 +399,7 @@ void parquet_split_provider::run_batch(file_batch const& batch,
                                 std::move(cur_rgs),
                                 cur_uncompressed_bytes,
                                 cur_compressed_bytes,
-                                _io_ctx,
+                                planning_ioctx_it->second,
                                 file_io_object);
       // Promote the just-sealed slice's uncompressed bytes into the cross-file accumulator.
       accum.total_uncompressed_bytes += cur_uncompressed_bytes;
@@ -439,6 +452,13 @@ void parquet_split_provider::run_batch(file_batch const& batch,
       cur_rgs.push_back(rg_idx);
     }
     seal_current_file();
+    // Emit at least one split per file so source pipelines (GPU_PARQUET_SCAN
+    // -> ...) generate multiple gpu_pipeline_tasks when scanning multiple
+    // files. The task_scheduler's round-robin counter then distributes those
+    // tasks across GPUs. Without this flush, small workloads bundle all files
+    // under the _approximate_batch_size threshold into one split → one task →
+    // one GPU.
+    flush();
   }
   flush();
 }

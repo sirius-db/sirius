@@ -55,7 +55,18 @@ absl::AnyInvocable<void() noexcept> gpu_pipeline_executor::get_per_thread_init()
 {
   auto device_id = _memory_space->get_device_id();
   return [device_id]() noexcept {
-    cudaSetDevice(device_id);
+    // Per-thread init runs on a worker thread just spawned by the
+    // bounded_pool. cudaSetDevice pins this thread to the executor's GPU
+    // context; silent failure would cause every downstream CUDA call on this
+    // thread to land on GPU 0 regardless of device_id. We cannot use
+    // CUCASCADE_CUDA_TRY here because the lambda is noexcept — inline the
+    // check instead.
+    cudaError_t err = cudaSetDevice(device_id);
+    if (err != cudaSuccess) {
+      spdlog::error("gpu_pipeline_executor per-thread init: cudaSetDevice({}) failed: {}",
+                    device_id,
+                    cudaGetErrorString(err));
+    }
     sirius::util::enable_log_on_default_stream();
   };
 }
@@ -70,11 +81,8 @@ void gpu_pipeline_executor::manager_loop()
       SIRIUS_LOG_INFO("GPU Pipeline Executor: pool interrupted, stopping manager loop");
       break;
     }
-    if (!_task_request_publisher.send(
-          std::make_unique<pipeline::task_request>(_memory_space->get_device_id(), false))) {
-      SIRIUS_LOG_INFO("GPU Pipeline Executor: Failed to send task request, channel is closed");
-      break;
-    }
+    // Task request sending removed: management_eventloop now pushes tasks directly
+    // to this executor based on data locality preference (push model).
     auto pipeline_task = _task_queue.pop();  // block till a task is available
     if (!pipeline_task) {
       SIRIUS_LOG_INFO("GPU Pipeline Executor: task queue interrupted, stopping manager loop");
@@ -243,7 +251,16 @@ void gpu_pipeline_executor::manager_loop()
             orig_task_id     = cur_local->original_task_id.value();
           }
 
-          static constexpr uint32_t MAX_OOM_RETRIES = 10;
+          // Bumped from 10 to 100 as part of follow-up #17. SF100 Q11 with
+          // cache=table_gpu + num_gpus=2 exhausted the old 10-retry budget
+          // against cross-GPU BUILD_PROBE batch-lock contention: the batch
+          // was held in `processing` on one GPU while the probe task on the
+          // other GPU needed it. Each convert-release cycle is O(100ms) at
+          // SF100 scale, so 10 retries × 5ms backoff (50 ms total) was far
+          // too short. With 100 retries × 50 ms backoff (~5 s) the probe
+          // tasks get enough patience to clear the contention window while
+          // still bailing out on truly wedged queries.
+          static constexpr uint32_t MAX_OOM_RETRIES = 100;
           if (next_retry_count > MAX_OOM_RETRIES) {
             SIRIUS_LOG_ERROR(
               "GPU Pipeline Executor: task {} (original task {}) exceeded {} OOM retries at "
@@ -289,10 +306,12 @@ void gpu_pipeline_executor::manager_loop()
           auto new_task =
             gpu_task->create_rescheduled_task(new_task_id, std::move(new_local_state));
 
-          // Brief backoff before rescheduling to allow other tasks to complete
-          // and free memory. Without this, a rescheduled task can spin in a tight
-          // OOM → reschedule → OOM loop consuming CPU without making progress.
-          std::this_thread::sleep_for(std::chrono::milliseconds(5));
+          // Backoff before rescheduling to allow other tasks to complete and
+          // free memory (true OOM case) or release a contended batch
+          // (cross-GPU processing contention, follow-up #17). 50 ms gives
+          // typical SF100 probe tasks time to finish their current work
+          // without putting the rescheduled task into a tight busy-spin.
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
           // Schedule the rescheduled task. It goes back through manager_loop()
           // to acquire a fresh reservation before execution.
@@ -324,19 +343,20 @@ void gpu_pipeline_executor::manager_loop()
         }
 
         if (!query_complete && _task_creator) {
-          // If the pipeline just finished, notify_downstream_pipelines() (called from
-          // mark_task_completed() above) already scheduled the consumers. Skip the
-          // explicit schedule to avoid a duplicate request that races with operator
-          // teardown after mark_completed().
-          bool pipeline_done = pipeline && pipeline->is_pipeline_finished();
-          if (!pipeline_done) {
-            for (auto* consumer : consumers) {
-              if (consumer) { _task_creator->schedule(consumer); }
-            }
+          // Schedule consumers explicitly here to drive the scheduler's
+          // round-robin rotation per-batch. notify_downstream_pipelines() in
+          // the task destructor only fires once the pipeline drains —
+          // mid-pipeline batches need to start rotating before that point so
+          // they reach all GPUs.
+          for (auto* consumer : consumers) {
+            if (consumer) { _task_creator->schedule(consumer); }
           }
         }
 
-        if (query_complete && _completion_handler) { _completion_handler->mark_completed(); }
+        if (query_complete && _completion_handler) {
+          _task_creator->drain_pending_tasks();
+          _completion_handler->mark_completed();
+        }
       });
   }
 }

@@ -28,6 +28,7 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace sirius::io {
@@ -88,12 +89,14 @@ struct scan_info {
    * checked and missed. May consume mutable fields on @c *this (e.g. moving
    * @ref table_filters into the constructed provider).
    *
-   * @param io_ctx  Process-wide ioctx the provider attaches to its emitted
-   *                slices. May be null when the scan_manager is configured
-   *                with @c use_sirius_datasource=false.
+   * @param gpu_ioctxs  Per-GPU sirius_ioctx map forwarded to the underlying
+   *                    split_provider for multi-GPU IO routing. Empty map is
+   *                    permitted when the scan_manager is configured with
+   *                    @c use_sirius_datasource=false (the provider then
+   *                    falls back to cudf's bundled datasource factory).
    */
   virtual std::unique_ptr<scan_manager::split_provider> make_provider(
-    std::shared_ptr<sirius::io::sirius_ioctx> io_ctx) = 0;
+    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs) = 0;
 };
 
 }  // namespace sirius::op::scan

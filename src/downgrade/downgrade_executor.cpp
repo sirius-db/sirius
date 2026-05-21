@@ -21,8 +21,10 @@
 #include "data/convertible_gpu_pipeline_task.hpp"
 #include "log/logging.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <thread>
+#include <vector>
 
 namespace sirius {
 namespace parallel {
@@ -61,18 +63,35 @@ void downgrade_executor::start()
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
 
+  // HOST/DISK tier memory_spaces return device_id == -1; passing that to
+  // rmm::cuda_device_id or cudaSetDevice fails with cudaErrorInvalidDevice.
+  // Default the stream pool to GPU 0 for non-GPU tiers and skip per-thread
+  // CUDA binding entirely (the stream is ordering metadata; host/disk work
+  // is CPU-side).
   {
-    auto device_id = _memory_space ? _memory_space->get_device_id() : 0;
-    _stream_pool   = std::make_unique<cucascade::memory::exclusive_stream_pool>(
+    int device_id = 0;
+    if (_space_id.tier == cucascade::memory::Tier::GPU && _memory_space) {
+      device_id = _memory_space->get_device_id();
+    }
+    _stream_pool = std::make_unique<cucascade::memory::exclusive_stream_pool>(
       rmm::cuda_device_id{device_id}, _config.thread_pool.num_threads);
   }
 
   _request_queue.reactivate();
 
   absl::AnyInvocable<void() noexcept> per_thread_init = nullptr;
-  if (_memory_space) {
+  if (_memory_space && _space_id.tier == cucascade::memory::Tier::GPU) {
     auto device_id  = _memory_space->get_device_id();
-    per_thread_init = [device_id]() noexcept { cudaSetDevice(device_id); };
+    per_thread_init = [device_id]() noexcept {
+      // Pin each worker to its GPU; silent failure leaks downgrade memcpys
+      // across contexts. Lambda is noexcept, so check inline.
+      cudaError_t err = cudaSetDevice(device_id);
+      if (err != cudaSuccess) {
+        spdlog::error("downgrade_executor per-thread init: cudaSetDevice({}) failed: {}",
+                      device_id,
+                      cudaGetErrorString(err));
+      }
+    };
   }
 
   _pool = std::make_unique<exec::bounded_thread_pool>(_config.thread_pool.num_threads,
@@ -147,11 +166,26 @@ void downgrade_executor::processing_loop()
     // Resolve the source memory space for filtering candidates
     auto* source_space = _reservation_manager.get_memory_space(_space_id.tier, _space_id.device_id);
 
-    // Build target spaces list: for GPU->HOST downgrade, target is HOST tier followed by DISK tier
+    // Build target spaces list: for GPU->HOST downgrade, target is HOST tier followed by DISK tier.
+    // NUMA preference (from downgrade_executor_config, v1.0 dd86dd0 intent re-authored on the
+    // post-#637 architecture): if preferred_numa_node is set, stable_partition the matching HOST
+    // space(s) to the front of target_spaces so cand->convert() tries the NUMA-local space first.
     std::vector<const cucascade::memory::memory_space*> target_spaces;
     if (_space_id.tier == cucascade::memory::Tier::GPU) {
-      auto host_spaces =
+      auto host_span =
         _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+      // Copy span -> vector before reordering: the span is a view into the manager's
+      // internal storage, and stable_partition would otherwise mutate it in place.
+      std::vector<const cucascade::memory::memory_space*> host_spaces(host_span.begin(),
+                                                                      host_span.end());
+      if (auto pref = _config.preferred_numa_node; pref.has_value()) {
+        std::stable_partition(host_spaces.begin(),
+                              host_spaces.end(),
+                              [pref_numa = *pref](const cucascade::memory::memory_space* s) {
+                                return s != nullptr &&
+                                       static_cast<int>(s->get_device_id()) == pref_numa;
+                              });
+      }
       for (auto* hs : host_spaces) {
         target_spaces.push_back(hs);
       }

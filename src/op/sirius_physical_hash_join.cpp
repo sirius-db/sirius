@@ -367,15 +367,21 @@ void sirius_physical_hash_join::build_pipelines(pipeline::sirius_pipeline& curre
   sirius_physical_hash_join::build_join_pipelines(current, meta_pipeline, *this);
 }
 
-void sirius_physical_hash_join::update_join_exec_mode(int num_partitions, uint64_t build_side_bytes)
+void sirius_physical_hash_join::update_join_exec_mode(int num_partitions,
+                                                      uint64_t build_side_bytes,
+                                                      bool build_foldable_to_single_batch)
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
   if (num_partitions == 1 && build_side_bytes < _max_build_hash_table_bytes &&
-      join_type != duckdb::JoinType::SEMI && join_type != duckdb::JoinType::RIGHT_SEMI &&
-      join_type != duckdb::JoinType::ANTI && join_type != duckdb::JoinType::RIGHT_ANTI &&
-      join_type != duckdb::JoinType::RIGHT && join_type != duckdb::JoinType::MARK &&
-      _join_mode != HASH_JOIN_MODE::MIXED_JOIN) {
-    // Switch to a more efficient join strategy for small datasets
+      build_foldable_to_single_batch && join_type != duckdb::JoinType::SEMI &&
+      join_type != duckdb::JoinType::RIGHT_SEMI && join_type != duckdb::JoinType::ANTI &&
+      join_type != duckdb::JoinType::RIGHT_ANTI && join_type != duckdb::JoinType::RIGHT &&
+      join_type != duckdb::JoinType::MARK && _join_mode != HASH_JOIN_MODE::MIXED_JOIN) {
+    // Switch to a more efficient join strategy for small datasets. The
+    // build_foldable_to_single_batch gate matches the runtime invariant in
+    // get_next_task_input_data_for_build_probe — BUILD_PROBE requires the
+    // build port to deliver exactly one batch, so we refuse to enter the
+    // mode when the upstream pipeline cannot guarantee that.
     _join_mode = HASH_JOIN_MODE::BUILD_PROBE;
     SIRIUS_LOG_DEBUG(
       "sirius_physical_hash_join id {} switching to BUILD_PROBE mode with {} partitions and build "
@@ -470,7 +476,12 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     input_batch.push_back(std::move(probe_batch));
     input_batch.push_back(std::move(build_batch));
     _hash_table_build_state = BUILD_HASH_TABLE_STATE::SCHEDULED;
-    return std::make_unique<pipelineable_operator_data>(input_batch);
+    // BUILD_PROBE mode uses a single cuco hash table shared across every probe
+    // task for this join. All such tasks must land on the same GPU, so we tag
+    // them with operator_id as the partition index (hash joins get spread
+    // across GPUs at the query level, but each individual join stays pinned).
+    return std::make_unique<partitioned_operator_data>(std::move(input_batch),
+                                                       this->get_operator_id());
 
   } else if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::BUILT) {
     if (probe_port->repo->num_partitions() != 1) {
@@ -491,7 +502,10 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
         "batch from the default port but got none in operator " +
         std::to_string(this->get_operator_id()));
     }
-    return std::make_unique<pipelineable_operator_data>(input_batch);
+    // Subsequent probe-only tasks share the hash table built under the initial
+    // SCHEDULING task. They MUST run on the same GPU — tag with operator_id.
+    return std::make_unique<partitioned_operator_data>(std::move(input_batch),
+                                                       this->get_operator_id());
   } else {
     SIRIUS_LOG_WARN(fmt::format(
       "In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: invalid hash table "
@@ -560,7 +574,10 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
             input_batch.push_back(
               ports["build"]->repo->get_data_batch_by_id(right_batch_id, partition_idx));
           }
-          return std::make_unique<pipelineable_operator_data>(input_batch);
+          // MIXED_JOIN distributes per-partition tasks across GPUs by
+          // partition_idx % num_gpus. Tag with the partition index so the
+          // scheduler can route by partition.
+          return std::make_unique<partitioned_operator_data>(std::move(input_batch), partition_idx);
         }
         right_counter++;
         counter++;
@@ -606,6 +623,27 @@ static join_side_keys_result prepare_join_keys(
   cudf::table_view table = get_cudf_table_view(input_batch);
 
   if (!cast_necessary) {
+    // INVARIANT: every entry in key_col_indices must address a column in
+    // `table`. PR #732 closed the only known violator — DuckDB's
+    // LATE_MATERIALIZATION optimizer was rewriting `ORDER BY ... LIMIT N`
+    // into a self-RIGHT_SEMI_JOIN keyed on parquet virtual columns
+    // (file_index / file_row_number) that Sirius's scan path silently
+    // drops, leaving the join with key_col_indices entries pointing past
+    // the physical batch. Disabling that pass in
+    // src/transparent/sirius_optimizer_extension.cpp removed the bad
+    // emitter. If you hit this throw, a new emitter has been introduced —
+    // fix it at the source rather than reintroducing the historical
+    // silent filter (see PR #732 comment 3242605041 for the prior shape).
+    auto const num_cols = table.num_columns();
+    for (auto idx : key_col_indices) {
+      if (idx >= num_cols) {
+        throw std::out_of_range("prepare_join_keys: key_col_indices entry " + std::to_string(idx) +
+                                " is >= input table column count " + std::to_string(num_cols) +
+                                " (is_left_side=" + (is_left_side ? "true" : "false") +
+                                "). The upstream emitter wired a join key that does not exist in "
+                                "the physical batch — fix the emitter, do not paper over it here.");
+      }
+    }
     result.keys = table.select(key_col_indices);
     return result;
   }
@@ -695,7 +733,7 @@ static std::unique_ptr<operator_data> gather_join_output(
   auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols), stream);
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<::cucascade::data_batch>>{
-      make_data_batch(std::move(output_cudf_table), memory_space)});
+      make_data_batch(std::move(output_cudf_table), memory_space, stream)});
 }
 
 /// Assemble output for a distinct_hash_join left_join.
@@ -736,7 +774,7 @@ static std::unique_ptr<operator_data> gather_distinct_left_join_output(
   auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols), stream);
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<::cucascade::data_batch>>{
-      make_data_batch(std::move(output_cudf_table), memory_space)});
+      make_data_batch(std::move(output_cudf_table), memory_space, stream)});
 }
 
 /// @brief the MARK join output from the semi_join matching row indices.
@@ -797,7 +835,7 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
   auto output_cudf_table = std::make_unique<cudf::table>(std::move(mark_out_cols), stream);
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<::cucascade::data_batch>>{
-      make_data_batch(std::move(output_cudf_table), *left_batch.get_memory_space())});
+      make_data_batch(std::move(output_cudf_table), *left_batch.get_memory_space(), stream)});
 }
 
 std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator_data& input_data,

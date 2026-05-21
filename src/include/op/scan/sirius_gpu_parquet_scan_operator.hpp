@@ -17,6 +17,7 @@
 #pragma once
 
 // sirius
+#include <io/types.hpp>
 #include <op/scan/hive_partition.hpp>
 #include <op/scan/parquet_scan_operator_data.hpp>
 #include <op/sirius_physical_operator.hpp>
@@ -28,6 +29,7 @@
 // standard library
 #include <memory>
 #include <optional>
+#include <unordered_map>
 
 namespace sirius::scan_manager {
 class split_connector;
@@ -70,6 +72,13 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
                                    std::unique_ptr<scan_info> scan_info);
 
   ~sirius_gpu_parquet_scan_operator() override;
+
+  /// @brief Inject the per-GPU sirius_ioctx map produced by SiriusContext::initialize()
+  ///        and held by sirius_scan_manager. Called by create_provider_for(...) before
+  ///        the operator is first executed.
+  /// @details Used by read_table_from_metadata() to select the per-chunk ioctx via
+  ///          scan_data.gpu_memory_space->get_device_id().
+  void set_gpu_ioctxs(std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> ioctxs);
 
   //===----------Source interface----------===//
   bool is_source() const override { return true; }
@@ -151,6 +160,13 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
   //===----------Fields----------===//
   std::unique_ptr<scan_manager::split_connector> _split_connector;
   std::unique_ptr<scan_info> _scan_info;
+
+  // Per-GPU ioctx map for ioctx->make_datasource(uring_io_object) routing in
+  // read_table_from_metadata. Populated by set_gpu_ioctxs(); empty until
+  // sirius_scan_manager::create_provider_for() injects it (the operator can
+  // be constructed before SiriusContext is available — set_gpu_ioctxs is
+  // mandatory before the first execute()).
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> _gpu_ioctxs;
 };
 
 }  // namespace sirius::op::scan

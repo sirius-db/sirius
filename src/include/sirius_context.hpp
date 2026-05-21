@@ -35,6 +35,8 @@
 #include <duckdb/main/prepared_statement_data.hpp>
 #include <duckdb/planner/extension_callback.hpp>
 #include <duckdb/planner/logical_operator.hpp>
+#include <io/datasource_factory.hpp>
+#include <io/types.hpp>
 
 #include <atomic>
 #include <memory>
@@ -42,11 +44,18 @@
 #include <optional>
 #include <set>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace cucascade::memory {
 class small_pinned_host_memory_resource;
 }  // namespace cucascade::memory
+
+namespace sirius::memory {
+class numa_small_pinned_mr;
+}  // namespace sirius::memory
 
 namespace sirius {
 class sirius_engine;
@@ -172,6 +181,66 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>&
   get_downgrade_executors() const;
 
+  /// @brief Resolve the sirius_ioctx serving the given device.
+  ///
+  /// Since per-NUMA construction (Phase: numa-ioctx), sirius_ioctx instances
+  /// are owned per NUMA node rather than per GPU — every GPU on the same
+  /// node shares the same shared_ptr. This accessor resolves
+  /// device_id -> NUMA node -> ioctx so callers that previously held device
+  /// keys continue to work transparently. The reactor's pinned bounce slots
+  /// are NUMA-bound at ctor time (numa_alloc_onnode + cudaHostRegister) so
+  /// device_read_req's cudaMemcpyAsync still lands on the right NUMA domain.
+  ///
+  /// @param device_id GPU device id (must match a configured GPU memory space).
+  /// @return Shared pointer to the sirius_ioctx whose reactor pool serves
+  ///         this device (NUMA-anchored).
+  /// @throws std::out_of_range if no ioctx was registered for device_id.
+  [[nodiscard]] std::shared_ptr<sirius::io::sirius_ioctx> get_ioctx_for(int device_id) const;
+
+  /// @brief Read-only device_id-keyed view of the sirius_ioctx cache.
+  ///
+  /// Callers (task_creator seeding parquet_scan_task_global_state,
+  /// planning-time first-available picks, etc.) still consume a
+  /// device_id->ioctx map. Multiple entries on the same NUMA node alias a
+  /// shared_ptr so destruction order matches numa_ioctxs_; the map itself
+  /// is rebuilt from numa_ioctxs_ at initialize() time. Returns by
+  /// const-reference — lifetime is tied to SiriusContext; callers must not
+  /// hold the reference past terminate().
+  [[nodiscard]] std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const&
+  get_gpu_ioctxs() const
+  {
+    return gpu_ioctxs_;
+  }
+
+  /// @brief Read-only access to the datasource registry populated at startup.
+  /// @details kFileScheme is registered at the end of initialize() against
+  ///          the lowest-numbered GPU's sirius_ioctx; object-store schemes
+  ///          (s3://, gs://, azure://) are not yet registered.
+  ///          datasource_factory::create() throws on unknown scheme — this
+  ///          accessor is the read-side hook that lets the factory consult
+  ///          the registry at every parquet read.
+  [[nodiscard]] sirius::io::datasource_registry const& get_datasource_registry() const
+  {
+    return datasource_registry_;
+  }
+
+  /// @brief Check whether cudaDeviceEnablePeerAccess succeeded for the given
+  ///        (src, dst) GPU pair at SiriusContext::initialize() time.
+  ///
+  /// Used by Sirius-side P2P-aware converter override (if registered) and by
+  /// integration tests verifying the adaptive-scan + P2P path. Returns false
+  /// if either device index is out of range, if cudaDeviceCanAccessPeer
+  /// reported no access, or if cudaDeviceEnablePeerAccess returned an error
+  /// other than cudaErrorPeerAccessAlreadyEnabled.
+  ///
+  /// @param src Source GPU device id
+  /// @param dst Destination GPU device id
+  /// @return true iff peer access was successfully enabled at init time.
+  [[nodiscard]] bool is_peer_access_enabled(int src, int dst) const noexcept
+  {
+    return peer_access_enabled_pairs_.count({src, dst}) > 0;
+  }
+
   [[nodiscard]] sirius::creator::task_creator& get_task_creator();
   [[nodiscard]] const sirius::creator::task_creator& get_task_creator() const;
 
@@ -253,10 +322,62 @@ class SiriusContext : public ClientContextState {
   bool is_initialized_ = false;
   sirius::sirius_config config_;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;
-  // Destroyed before memory_manager_ (declared after it — reverse destruction order).
-  std::unique_ptr<cucascade::memory::small_pinned_host_memory_resource> small_pinned_allocator_;
-  std::optional<
-    sirius::memory::host_device_resource_view<cucascade::memory::small_pinned_host_memory_resource>>
+  // Per-NUMA sirius_ioctx. We build one ioctx per distinct NUMA node hosting
+  // a managed GPU instead of one per GPU — a single ioctx already supports
+  // multi-GPU correctly (each device_read_req carries its own device_id and
+  // stream; the reactor switches device before cudaMemcpyAsync). Going
+  // per-NUMA cuts the reactor worker-thread count on multi-GPU hosts and
+  // matches cucascade's NUMA-pinned host space layout.
+  //
+  // Construction: in initialize(), under rmm::cuda_set_device_raii of the
+  // lowest-numbered GPU on the node, with the reactor told to bind its
+  // pinned bounce slots (numa_alloc_onnode + cudaHostRegister Portable|Mapped)
+  // to the same node.
+  //
+  // Teardown order in terminate(): datasource_registry_ -> gpu_ioctxs_ (the
+  // view, drops references) -> numa_ioctxs_ (actual destruction of reactor
+  // pools + bounce buffers under a live CUDA context, BEFORE memory_manager_
+  // shutdown).
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> numa_ioctxs_;
+  // device_id -> normalized NUMA node id ((-1) -> 0). Computed once at
+  // initialize() from get_hw_topology().gpus[].numa_node. get_ioctx_for()
+  // and the per-NUMA cuDF pinned MR dispatcher both consult this map.
+  std::unordered_map<int, int> device_to_numa_;
+  // Device-id-keyed view of numa_ioctxs_. Every entry holds a shared_ptr
+  // aliasing the per-NUMA ioctx that serves its device; multiple GPUs on
+  // the same NUMA node alias the same target. Existing callers continue to
+  // treat it as a per-GPU map.
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs_;
+  // Registry mapping URI scheme -> ioctx, populated by initialize() with
+  // kFileScheme -> gpu_ioctxs_.at(<lowest_gpu_id>). datasource_factory::create()
+  // reads this registry to resolve schemes; throws if no entry exists.
+  // Cleared BEFORE gpu_ioctxs_ in shutdown to avoid dangling shared_ptrs
+  // (terminate() ordering in src/sirius_context.cpp).
+  sirius::io::datasource_registry datasource_registry_;
+  // P2P: set of (src, dst) GPU pairs where cudaDeviceEnablePeerAccess
+  // succeeded in initialize(). Populated under rmm::cuda_set_device_raii, one
+  // call per pair. Consumed by is_peer_access_enabled() and any Sirius-side
+  // converter override. Holds no CUDA resources — just a set of int pairs —
+  // so destruction order relative to memory_manager_ is unconstrained;
+  // placed adjacent to gpu_ioctxs_ for multi-GPU state locality.
+  struct peer_pair_hash {
+    size_t operator()(std::pair<int, int> const& p) const noexcept
+    {
+      return (static_cast<size_t>(p.first) << 32) ^ static_cast<size_t>(p.second);
+    }
+  };
+  std::unordered_set<std::pair<int, int>, peer_pair_hash> peer_access_enabled_pairs_;
+  // NUMA-aware cuDF small-pinned MR. Owns one
+  // small_pinned_host_memory_resource per host space (one per NUMA node)
+  // and dispatches each cuDF allocate/deallocate to the slab pool whose
+  // NUMA node matches the current CUDA device. Replaces the previous
+  // single-pool path that hardcoded host_spaces[0] and funneled every
+  // GPU's cuDF metadata allocation through one NUMA domain.
+  // Destroyed before memory_manager_ (declared after it — reverse
+  // destruction order). prev_pinned_mr_ is restored in terminate() before
+  // these are torn down to prevent cuDF from holding a dangling ref.
+  std::unique_ptr<sirius::memory::numa_small_pinned_mr> small_pinned_allocator_;
+  std::optional<sirius::memory::host_device_resource_view<sirius::memory::numa_small_pinned_mr>>
     small_pinned_allocator_view_{};
   // Previous cuDF pinned resource and threshold — restored in terminate() before the view and
   // allocator are destroyed to prevent dangling references.

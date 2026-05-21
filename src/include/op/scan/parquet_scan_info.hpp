@@ -33,7 +33,7 @@ namespace sirius::op::scan {
  */
 struct parquet_scan_info : scan_info {
   std::unique_ptr<scan_manager::split_provider> make_provider(
-    std::shared_ptr<sirius::io::sirius_ioctx> io_ctx) override;
+    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs) override;
 };
 
 }  // namespace sirius::op::scan

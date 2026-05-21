@@ -22,6 +22,8 @@
 #include <cudf/io/datasource.hpp>
 
 #include <cctype>
+#include <filesystem>
+#include <memory>
 #include <stdexcept>
 #include <utility>
 
@@ -87,7 +89,13 @@ void datasource_registry::clear()
 
 namespace {
 
-constexpr std::string_view kFileScheme = "file";
+// Documentation constant: the canonical "file" scheme name registered by
+// SiriusContext::initialize(). The factory looks up schemes via
+// registry.lookup(p.scheme) without branching on this name, so the constant
+// is intentionally unused at runtime — kept as a single source of truth that
+// the registration site (sirius_context.cpp) and any future scheme-specific
+// factory code can refer to.
+[[maybe_unused]] constexpr std::string_view kFileScheme = "file";
 
 }  // namespace
 
@@ -100,14 +108,26 @@ std::string datasource_factory::extract_path(std::string_view uri) { return pars
 std::unique_ptr<cudf::io::datasource> datasource_factory::create_for_parquet_scan(
   std::string_view uri, datasource_registry const& registry, sirius_config const& config)
 {
-  // Relative bare paths (no leading '/' and no scheme://) — DuckDB's iceberg /
-  // hive fixtures still hand these out, and the strict parser deliberately
-  // rejects them. Bypass to cudf default; semantically identical to the pre-PR3
-  // baseline. Anything else (absolute path, file:///..., s3://...) goes through
-  // the strict create() so its parser routes file→cudf and object-store→ioctx
-  // uniformly.
+  // Relative bare paths normalize to file:///<absolute> and dispatch through
+  // create(). Bypassing to cudf's default datasource would route through
+  // libkvikio internally — the forbidden kvikio path.
+  //
+  // DuckDB's iceberg / hive fixtures hand out paths like
+  // "test/cpp/integration/data/...parquet"; we resolve those against the
+  // process CWD via std::filesystem::absolute (matching cudf-default
+  // semantics for relative paths) and prepend "file://" so create()'s parser
+  // routes them through the registered kFileScheme ioctx.
   if (!uri.empty() && uri.front() != '/' && uri.find("://") == std::string_view::npos) {
-    return cudf::io::datasource::create(std::string{uri});
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    auto abs = fs::absolute(fs::path{std::string{uri}}, ec);
+    if (ec) {
+      throw std::runtime_error(
+        "datasource_factory::create_for_parquet_scan: failed to resolve relative path '" +
+        std::string{uri} + "' to absolute: " + ec.message());
+    }
+    std::string normalized = "file://" + abs.string();
+    return create(normalized, registry, config);
   }
   return create(uri, registry, config);
 }
@@ -117,26 +137,18 @@ std::unique_ptr<cudf::io::datasource> datasource_factory::create(
 {
   auto p = parse(uri);
 
-  // Local file paths stay on cudf's default pread-based datasource. This
-  // matches the pre-PR3 baseline and sidesteps the new IO framework for the
-  // hot path that 99% of queries hit. A future PR (e.g. gds_ioctx) can opt
-  // local NVMe paths into a sirius-managed backend via a SET knob without
-  // touching the call sites.
-  if (p.scheme == kFileScheme) { return cudf::io::datasource::create(std::move(p.path)); }
-
-  // Object-store schemes go through the registry → ioctx → sirius_datasource.
+  // ALL schemes (including kFileScheme) MUST be resolved via the registry.
+  // Bypassing kFileScheme to the cudf default datasource would route through
+  // libkvikio internally (binds a single CUDA context per FileHandle, breaks
+  // multi-GPU residency). SiriusContext::initialize() registers kFileScheme
+  // -> sirius_ioctx so this lookup succeeds.
   auto ioctx = registry.lookup(p.scheme);
   if (!ioctx) {
-    throw std::runtime_error("datasource_factory: no backend registered for scheme '" + p.scheme +
-                             "' (uri=" + std::string{uri} + ")");
+    throw std::runtime_error("datasource_factory: no ioctx registered for scheme '" + p.scheme +
+                             "' — kvikio path is forbidden (uri=" + std::string{uri} + ")");
   }
 
-  // Object-store io_object construction is backend-specific and lives in each
-  // backend's PR (s3 lands in PR3). PR1 ships only the dispatch skeleton — no
-  // scheme-aware branches in the factory.
-  (void)ioctx;
-  throw std::runtime_error("datasource_factory: scheme '" + p.scheme +
-                           "' is registered but object construction is not yet implemented");
+  return ioctx->open_datasource(std::move(p.path));
 }
 
 }  // namespace sirius::io
