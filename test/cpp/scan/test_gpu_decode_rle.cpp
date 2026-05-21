@@ -267,6 +267,44 @@ TEST_CASE("gpu_decode_table RLE - trailing slack past counts decodes correctly",
   REQUIRE(out == expected);
 }
 
+TEST_CASE("gpu_decode_table RLE - narrow-type alignment padding decodes correctly",
+          "[scan][decode][rle]")
+{
+  // The last segment per column can have entry_count not a multiple of 8,
+  // so for sizeof(T) < 8 DuckDB inserts 0..7 bytes of zero-fill alignment
+  // padding between values and counts. Worst case: T = uint8 with 3
+  // entries → minimal=11, aligned=16, padding=5. The kernel walks counts
+  // using the values-region bound (so it stops exactly at the real-count
+  // boundary) and the match-vs-malformed reordering absorbs any trailing
+  // bytes that get loaded into the same tile. Pin the contract by placing
+  // non-zero poison bytes immediately after the segment and asserting the
+  // decoded output is still correct.
+  std::vector<uint8_t> values{11, 22, 33};
+  std::vector<uint16_t> counts{5, 10, 15};  // sum = 30
+  auto seg                 = sirius::test::decode::rle::make_rle_block<uint8_t>(values, counts);
+  uint32_t const seg_bytes = static_cast<uint32_t>(seg.size());
+  std::vector<uint8_t> bytes(seg_bytes + 64, 0xFF);
+  std::memcpy(bytes.data(), seg.data(), seg_bytes);
+
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+
+  uint32_t const total_rows = 30;
+  gpu_column_decode_input col;
+  col.out_type   = U8;
+  col.total_rows = total_rows;
+  col.has_nulls  = false;
+  col.data.push_back({CompressionType::COMPRESSION_RLE,
+                      {gpu_segment_desc{
+                        static_cast<uint8_t const*>(d_seg.data()), seg_bytes, 0, total_rows}}});
+
+  auto t   = gpu_decode_table({col}, stream.view(), mr);
+  auto out = download<uint8_t>(t->get_column(0).view().data<uint8_t>(), total_rows, stream.value());
+  auto expected = expand_runs<uint8_t>(values, counts);
+  REQUIRE(out == expected);
+}
+
 // Defensive guards: pre-fill output with a 0xCC canary, call decode_rle_data
 // directly (skipping the dispatcher's allocate-fresh path), then assert
 // every byte is zero.
@@ -414,8 +452,10 @@ TEST_CASE("gpu_decode_table RLE - zero count with sum underflow zero-fills",
           "[scan][decode][rle][defensive]")
 {
   // An interior zero count is malformed only when the running sum never
-  // reaches n_segment_rows by the end of real counts — a present-and-zero
-  // count followed by a sum-match is legitimate (slack).
+  // reaches n_segment_rows by the end of the real-counts walk. Trailing
+  // zeros that appear AFTER the prefix-sum has already matched are slack
+  // and are absorbed by the match-vs-malformed reordering, not by the
+  // zero-count check.
   auto bytes = make_rle_block<int32_t>({1, 99, 2}, {10, 0, 5});  // sum = 15
 
   rmm::cuda_stream stream;
