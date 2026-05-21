@@ -712,10 +712,44 @@ TEST_CASE("ast_from_duckdb - real Binder output translates to non-null trees",
     conn.ExtractPlan("SELECT a + 3, b LIKE 'x%', c IS NOT NULL FROM t WHERE a BETWEEN 1 AND 10");
   REQUIRE(plan);
 
+  // Recursive descent over the Sirius AST. We collect the presence of the
+  // four landmark kinds we expect from the four SQL fragments in the query,
+  // rather than asserting an exact tree shape (the Binder may wrap children
+  // in implicit casts or rearrange unrelated structure).
+  bool saw_between           = false;
+  bool saw_add               = false;
+  bool saw_like              = false;
+  bool saw_is_not_null       = false;
+  // The query's expected node set is {between, function_call, unary_op,
+  // reference, constant}. Only the three non-leaf kinds need a descent arm;
+  // any other kind appearing here would indicate an unexpected binder
+  // rewrite and is surfaced by the landmark assertions failing below.
+  std::function<void(node const&)> visit_node = [&](node const& n) {
+    if (n.holds<between>()) {
+      saw_between = true;
+      auto const& bw = n.get<between>();
+      if (bw.input) visit_node(*bw.input);
+      if (bw.lower) visit_node(*bw.lower);
+      if (bw.upper) visit_node(*bw.upper);
+    } else if (n.holds<function_call>()) {
+      auto const& fc = n.get<function_call>();
+      if (fc.function() == sirius::function_id::add) saw_add = true;
+      if (fc.function() == sirius::function_id::like) saw_like = true;
+      for (auto const& a : fc.arguments()) {
+        if (a) visit_node(*a);
+      }
+    } else if (n.holds<unary_op>()) {
+      auto const& uo = n.get<unary_op>();
+      if (uo.op == unary_op::kind::op_is_not_null) saw_is_not_null = true;
+      if (uo.child) visit_node(*uo.child);
+    }
+    // reference and constant are leaves; nothing to descend into.
+  };
+
   // DFS walk the LogicalOperator tree, collecting every Expression on every
   // operator. The structural assertion is: every Expression translates to a
-  // non-null Sirius AST tree. We do NOT assert the exact tree shape because
-  // the Binder may insert implicit casts or simplifications.
+  // non-null Sirius AST tree, AND the union of all produced trees covers the
+  // four landmark kinds named above.
   std::size_t expression_count = 0;
   std::function<void(duckdb::LogicalOperator const&)> walk =
     [&](duckdb::LogicalOperator const& op) {
@@ -723,6 +757,7 @@ TEST_CASE("ast_from_duckdb - real Binder output translates to non-null trees",
         REQUIRE(e);
         auto out = sirius::ast::from_duckdb(*e);
         REQUIRE(out);
+        visit_node(*out);
         ++expression_count;
       }
       for (auto const& child : op.children) {
@@ -731,7 +766,12 @@ TEST_CASE("ast_from_duckdb - real Binder output translates to non-null trees",
     };
   walk(*plan);
 
-  // The query carries multiple projection + filter expressions; ensure the
-  // traversal actually visited something.
-  REQUIRE(expression_count >= 1);
+  // 3 projection expressions (a+3, b LIKE 'x%', c IS NOT NULL) + 1 filter
+  // expression (a BETWEEN 1 AND 10). The optimizer is disabled, so the binder
+  // output should not collapse any of these.
+  REQUIRE(expression_count >= 4);
+  REQUIRE(saw_between);
+  REQUIRE(saw_add);
+  REQUIRE(saw_like);
+  REQUIRE(saw_is_not_null);
 }
