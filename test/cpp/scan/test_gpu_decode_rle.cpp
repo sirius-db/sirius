@@ -295,9 +295,9 @@ TEST_CASE("gpu_decode_table RLE - narrow-type alignment padding decodes correctl
   col.out_type   = U8;
   col.total_rows = total_rows;
   col.has_nulls  = false;
-  col.data.push_back({CompressionType::COMPRESSION_RLE,
-                      {gpu_segment_desc{
-                        static_cast<uint8_t const*>(d_seg.data()), seg_bytes, 0, total_rows}}});
+  col.data.push_back(
+    {CompressionType::COMPRESSION_RLE,
+     {gpu_segment_desc{static_cast<uint8_t const*>(d_seg.data()), seg_bytes, 0, total_rows}}});
 
   auto t   = gpu_decode_table({col}, stream.view(), mr);
   auto out = download<uint8_t>(t->get_column(0).view().data<uint8_t>(), total_rows, stream.value());
