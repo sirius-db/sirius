@@ -38,9 +38,11 @@ namespace sirius::ast {
  *
  * @throws duckdb::InternalException on an ExpressionClass that the Sirius
  *         translator has never seen.
- * @throws sirius::not_implemented_exception if a BoundConstantExpression
- *         carries a duckdb::Value whose logical_type is unsupported by
- *         sirius::from_duckdb(duckdb::Value const&, sirius::logical_type const&).
+ * @throws sirius::not_implemented_exception if any embedded duckdb::Value or
+ *         duckdb::LogicalType carries a type unsupported by the upstream
+ *         sirius::from_duckdb(...) helpers. This can fire from
+ *         BoundConstantExpression (Value translation), BoundCastExpression
+ *         (target type), or BoundFunctionExpression (return type).
  */
 std::unique_ptr<node> from_duckdb(duckdb::Expression const& expr);
 

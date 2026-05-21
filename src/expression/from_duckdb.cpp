@@ -35,6 +35,7 @@
 #include "helper/type_conversions.hpp"    // sirius::from_duckdb(LogicalType const&)
 
 // duckdb
+#include <duckdb/common/assert.hpp>
 #include <duckdb/common/enums/expression_type.hpp>
 #include <duckdb/common/exception.hpp>
 #include <duckdb/planner/expression.hpp>
@@ -185,6 +186,7 @@ std::unique_ptr<node> translate_operator(duckdb::BoundOperatorExpression const& 
     default: break;
   }
   if (unary_kind != unary_op::kind::invalid) {
+    D_ASSERT(!expr.children.empty());
     auto child = from_duckdb(*expr.children[0]);
     if (!child) { return nullptr; }
     return std::make_unique<node>(unary_op{unary_kind, std::move(child)});
@@ -203,6 +205,7 @@ std::unique_ptr<node> translate_operator(duckdb::BoundOperatorExpression const& 
 
   if (op_type == duckdb::ExpressionType::COMPARE_IN ||
       op_type == duckdb::ExpressionType::COMPARE_NOT_IN) {
+    D_ASSERT(!expr.children.empty());
     auto probe = from_duckdb(*expr.children[0]);
     if (!probe) { return nullptr; }
     std::vector<std::unique_ptr<node>> values;
