@@ -321,6 +321,66 @@ TEST_CASE("gpu_decode_table BITPACKING - multi-segment column", "[scan][decode][
     REQUIRE(out[50 + i] == 103);
 }
 
+TEST_CASE("gpu_decode_table BITPACKING - CONSTANT/CONSTANT_DELTA at unaligned dst row offset",
+          "[scan][decode][bitpacking]")
+{
+  // CONSTANT and CONSTANT_DELTA paths do 16B vector stores to
+  // out = d_output + global_row_offset. Alignment holds within a single
+  // segment (group offsets are multiples of BP_META_GROUP_SIZE = 2048) but
+  // breaks across stacked segments whose cumulative row count is not a
+  // multiple of sizeof(vec_t)/sizeof(T). The kernel must detect this and
+  // fall back to scalar stores; otherwise the vector store faults with
+  // cudaErrorMisalignedAddress.
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+  // Segment A: 50 int32 rows = 200 bytes, not a multiple of 16. Segment B's
+  // destination then starts at byte offset 200 — unaligned for vec_t stores.
+  auto bytes_a = make_for_block<int32_t>(/*frame=*/0, /*width=*/4, std::vector<int32_t>(50, 1));
+  rmm::device_buffer d_a(bytes_a.data(), bytes_a.size(), stream.view());
+
+  SECTION("CONSTANT at unaligned row offset")
+  {
+    auto bytes_b = make_constant_block<int32_t>(77);
+    rmm::device_buffer d_b(bytes_b.data(), bytes_b.size(), stream.view());
+    gpu_column_decode_input col;
+    col.out_type   = I32;
+    col.total_rows = 100;
+    col.data.push_back(
+      {CompressionType::COMPRESSION_BITPACKING,
+       {gpu_segment_desc{
+          static_cast<uint8_t const*>(d_a.data()), static_cast<uint32_t>(d_a.size()), 0, 50},
+        gpu_segment_desc{
+          static_cast<uint8_t const*>(d_b.data()), static_cast<uint32_t>(d_b.size()), 50, 50}}});
+    auto t   = gpu_decode_table({col}, stream.view(), mr);
+    auto out = download<int32_t>(t->get_column(0).view().data<int32_t>(), 100, stream.value());
+    for (uint32_t i = 0; i < 50; ++i)
+      REQUIRE(out[i] == 1);
+    for (uint32_t i = 0; i < 50; ++i)
+      REQUIRE(out[50 + i] == 77);
+  }
+
+  SECTION("CONSTANT_DELTA at unaligned row offset")
+  {
+    auto bytes_b = make_constant_delta_block<int32_t>(/*frame=*/1000, /*delta=*/3);
+    rmm::device_buffer d_b(bytes_b.data(), bytes_b.size(), stream.view());
+    gpu_column_decode_input col;
+    col.out_type   = I32;
+    col.total_rows = 100;
+    col.data.push_back(
+      {CompressionType::COMPRESSION_BITPACKING,
+       {gpu_segment_desc{
+          static_cast<uint8_t const*>(d_a.data()), static_cast<uint32_t>(d_a.size()), 0, 50},
+        gpu_segment_desc{
+          static_cast<uint8_t const*>(d_b.data()), static_cast<uint32_t>(d_b.size()), 50, 50}}});
+    auto t   = gpu_decode_table({col}, stream.view(), mr);
+    auto out = download<int32_t>(t->get_column(0).view().data<int32_t>(), 100, stream.value());
+    for (uint32_t i = 0; i < 50; ++i)
+      REQUIRE(out[i] == 1);
+    for (uint32_t i = 0; i < 50; ++i)
+      REQUIRE(out[50 + i] == 1000 + static_cast<int32_t>(i) * 3);
+  }
+}
+
 TEST_CASE("gpu_decode_table BITPACKING - multi-group segment", "[scan][decode][bitpacking]")
 {
   // One segment that spans more than BP_META_GROUP_SIZE rows. The kernel

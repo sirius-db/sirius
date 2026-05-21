@@ -250,6 +250,56 @@ TEST_CASE("gpu_decode_table RLE - segment with on-disk padding", "[scan][decode]
     REQUIRE(out[10 + i] == 88);
 }
 
+TEST_CASE("gpu_decode_table RLE - trailing slack past counts decodes correctly",
+          "[scan][decode][rle]")
+{
+  // DuckDB's block allocator gives the last segment in a 256 KB block all
+  // remaining unused space — bytes past the real RLE data are zero-fill slack.
+  // The kernel must bound iteration on the values-region size; otherwise it
+  // walks the slack, hits a zero count, and zero-fills the column output.
+  std::vector<int32_t> values{1, 2, 3};
+  std::vector<uint16_t> counts{10, 20, 30};
+  auto bytes = sirius::test::decode::rle::make_rle_block<int32_t>(values, counts);
+  bytes.resize(bytes.size() + 4096, 0);
+
+  auto out      = decode_one<int32_t>(bytes, I32, 60);
+  auto expected = expand_runs<int32_t>(values, counts);
+  REQUIRE(out == expected);
+}
+
+TEST_CASE("gpu_decode_table RLE - narrow-type alignment padding decodes correctly",
+          "[scan][decode][rle]")
+{
+  // Narrow types (sizeof(T)<8) get 0..7 bytes of alignment padding between
+  // values and counts; worst case uint8 with 3 entries → 5 bytes. 0xFF
+  // poison after the segment proves the values-region bound + match-vs-
+  // malformed reordering absorb any over-read into the tile.
+  std::vector<uint8_t> values{11, 22, 33};
+  std::vector<uint16_t> counts{5, 10, 15};  // sum = 30
+  auto seg                 = sirius::test::decode::rle::make_rle_block<uint8_t>(values, counts);
+  uint32_t const seg_bytes = static_cast<uint32_t>(seg.size());
+  std::vector<uint8_t> bytes(seg_bytes + 64, 0xFF);
+  std::memcpy(bytes.data(), seg.data(), seg_bytes);
+
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+
+  uint32_t const total_rows = 30;
+  gpu_column_decode_input col;
+  col.out_type   = U8;
+  col.total_rows = total_rows;
+  col.has_nulls  = false;
+  col.data.push_back(
+    {CompressionType::COMPRESSION_RLE,
+     {gpu_segment_desc{static_cast<uint8_t const*>(d_seg.data()), seg_bytes, 0, total_rows}}});
+
+  auto t   = gpu_decode_table({col}, stream.view(), mr);
+  auto out = download<uint8_t>(t->get_column(0).view().data<uint8_t>(), total_rows, stream.value());
+  auto expected = expand_runs<uint8_t>(values, counts);
+  REQUIRE(out == expected);
+}
+
 // Defensive guards: pre-fill output with a 0xCC canary, call decode_rle_data
 // directly (skipping the dispatcher's allocate-fresh path), then assert
 // every byte is zero.
@@ -393,11 +443,13 @@ TEST_CASE("gpu_decode_table RLE - count walk overflows row_count zero-fills",
     REQUIRE(out[i] == 0);
 }
 
-TEST_CASE("gpu_decode_table RLE - zero count inside walk zero-fills",
+TEST_CASE("gpu_decode_table RLE - zero count with sum underflow zero-fills",
           "[scan][decode][rle][defensive]")
 {
-  // DuckDB never emits zero counts; treat them as malformed.
-  auto bytes = make_rle_block<int32_t>({1, 99, 2}, {10, 0, 10});
+  // Interior zero count + sum never reaches n_segment_rows → malformed.
+  // (Zeros after the sum-match are slack — handled by match-over-malformed,
+  // not this check.)
+  auto bytes = make_rle_block<int32_t>({1, 99, 2}, {10, 0, 5});  // sum = 15
 
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
