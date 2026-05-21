@@ -6,6 +6,7 @@
  */
 
 #include "catch.hpp"
+#include "io/prefetching_cache.hpp"
 #include "io/s3/s3_ioctx.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
@@ -125,6 +126,7 @@ struct sirius_memory_limits {
   std::string gpu_reservation{"128 MiB"};
   std::string host_capacity{"512 MiB"};
   std::string disk_capacity;
+  std::optional<bool> enable_chunk_prewarm;
 };
 
 sirius_memory_limits large_sirius_memory_limits()
@@ -137,6 +139,13 @@ sirius_memory_limits large_sirius_memory_limits()
   // disk tier so the large correctness tests exercise Sirius tiering instead
   // of failing at the no-disk spill boundary.
   limits.disk_capacity = "32 GiB";
+  return limits;
+}
+
+sirius_memory_limits large_sirius_memory_limits_without_chunk_prewarm()
+{
+  auto limits                 = large_sirius_memory_limits();
+  limits.enable_chunk_prewarm = false;
   return limits;
 }
 
@@ -211,6 +220,13 @@ class sirius_config_env_guard {
         << "\n"
            "    secret_key: "
         << yaml_quote(env.secret_key) << "\n";
+    if (limits.enable_chunk_prewarm.has_value()) {
+      out << "  executor:\n"
+             "    scan_manager:\n"
+             "      enable_prefetch_cache: true\n"
+             "      enable_chunk_prewarm: "
+          << (*limits.enable_chunk_prewarm ? "true" : "false") << "\n";
+    }
     out.close();
     REQUIRE(out);
 
@@ -334,6 +350,12 @@ bool within_large_s3_byte_budget(std::uint64_t byte_delta, std::size_t object_si
   // Keep this as a regression-only guard until the scan path is made to
   // consume prefetched ranges reliably (tracked in newplan.md §26).
   return byte_delta <= 3ULL * static_cast<std::uint64_t>(object_size);
+}
+
+bool within_no_prewarm_s3_byte_budget(std::uint64_t byte_delta, std::size_t object_size)
+{
+  return byte_delta <=
+         static_cast<std::uint64_t>(object_size) + static_cast<std::uint64_t>(object_size / 5);
 }
 
 fs::path local_parquet_path(std::string_view table)
@@ -893,4 +915,83 @@ TEST_CASE("gpu_execution large S3 lineitem join uses planner cardinality and mat
   INFO(plan);
   CHECK(plan_mentions_cardinality(plan, expected_lineitem_rows));
   CHECK(plan_mentions_cardinality(plan, expected_orders_rows));
+}
+
+TEST_CASE("gpu_execution large S3 lineitem count stays within byte budget without chunk prewarm",
+          "[.][s3][sql][large][large-count-no-prewarm][gpu_execution][integration]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env, large_sirius_memory_limits_without_chunk_prewarm());
+  auto large = read_large_lineitem_fixture(fixture, *env);
+  if (!large) { return; }
+
+  auto& s3_ctx = require_s3_ioctx(fixture, large->uri);
+  REQUIRE(s3_ctx.cache() != nullptr);
+  auto const expected_rows       = local_parquet_file_row_count(large->local_path);
+  auto const before_bytes        = s3_ctx.bytes_read_total();
+  auto const before_hits         = s3_ctx.cache()->hit_count_total();
+  auto const before_range_misses = s3_ctx.cache()->range_miss_count_total();
+  auto const s3_count_query      = "SELECT count(l_orderkey) FROM " + s3_large_lineitem_scan(*env);
+  auto s3_result                 = require_query_ok(fixture.con, gpu_execution_sql(s3_count_query));
+  auto const byte_delta          = s3_ctx.bytes_read_total() - before_bytes;
+  auto const hit_delta           = s3_ctx.cache()->hit_count_total() - before_hits;
+  auto const range_miss_delta    = s3_ctx.cache()->range_miss_count_total() - before_range_misses;
+
+  REQUIRE(s3_result->RowCount() == 1);
+  REQUIRE(s3_result->ColumnCount() == 1);
+  CHECK(s3_result->GetValue(0, 0).GetValue<int64_t>() == static_cast<int64_t>(expected_rows));
+  INFO("byte_delta=" << byte_delta << " object_size=" << large->object_size);
+  CHECK(within_no_prewarm_s3_byte_budget(byte_delta, large->object_size));
+  CHECK(hit_delta == 0);
+  CHECK(range_miss_delta > 0);
+}
+
+TEST_CASE("gpu_execution large S3 lineitem Q1 shape matches local CPU without chunk prewarm",
+          "[.][s3][sql][large][large-q1-no-prewarm][gpu_execution][integration]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env, large_sirius_memory_limits_without_chunk_prewarm());
+  auto large = read_large_lineitem_fixture(fixture, *env);
+  if (!large) { return; }
+
+  auto const s3_query = tpch_q1_shape_query(s3_large_lineitem_scan(*env));
+  auto s3_result      = require_query_ok(fixture.con, gpu_execution_sql(s3_query));
+
+  duckdb::DuckDB baseline_db(nullptr);
+  duckdb::Connection baseline_con(baseline_db);
+  auto const local_query = tpch_q1_shape_query(local_parquet_file_scan(large->local_path));
+  auto baseline_result   = require_query_ok(baseline_con, local_query);
+
+  REQUIRE(s3_result->RowCount() == baseline_result->RowCount());
+  REQUIRE(s3_result->ColumnCount() == baseline_result->ColumnCount());
+  check_rows_equal_with_tolerant_columns(*s3_result, *baseline_result, {6, 7, 8});
+}
+
+TEST_CASE("gpu_execution large S3 lineitem join matches local CPU without chunk prewarm",
+          "[.][s3][sql][large][large-join-no-prewarm][gpu_execution][integration]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env, large_sirius_memory_limits_without_chunk_prewarm());
+  auto large = read_large_lineitem_fixture(fixture, *env);
+  if (!large) { return; }
+
+  auto const s3_query =
+    large_lineitem_orders_join_query(s3_large_lineitem_scan(*env), s3_parquet_scan(*env, "orders"));
+  auto s3_result = require_query_ok(fixture.con, gpu_execution_sql(s3_query));
+
+  duckdb::DuckDB baseline_db(nullptr);
+  duckdb::Connection baseline_con(baseline_db);
+  auto const local_query = large_lineitem_orders_join_query(
+    local_parquet_file_scan(large->local_path), local_parquet_scan("orders"));
+  auto baseline_result = require_query_ok(baseline_con, local_query);
+
+  REQUIRE(s3_result->RowCount() == baseline_result->RowCount());
+  REQUIRE(s3_result->ColumnCount() == baseline_result->ColumnCount());
+  CHECK(collect_rows(*s3_result) == collect_rows(*baseline_result));
 }

@@ -94,6 +94,7 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("prefetch_inflight_budget_chunks",
              opt.prefetch_inflight_budget_chunks,
              yaml::greater_than<std::size_t>{0});
+  r.optional("enable_chunk_prewarm", opt.enable_chunk_prewarm);
   r.reject_unknown();
 }
 

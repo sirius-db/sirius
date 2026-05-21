@@ -109,3 +109,25 @@ TEST_CASE("sirius_config loads object_store_config from YAML", "[object_store_co
   std::error_code ec;
   std::filesystem::remove(path, ec);
 }
+
+TEST_CASE("sirius_config defaults chunk prewarm to enabled when YAML omits the key",
+          "[scan_manager][config][prefetching_cache]")
+{
+  auto const path = std::filesystem::temp_directory_path() / "sirius_chunk_prewarm_default.yaml";
+  {
+    std::ofstream out(path);
+    out << "sirius:\n"
+           "  executor:\n"
+           "    scan_manager:\n"
+           "      use_sirius_datasource: true\n";
+    REQUIRE(out);
+  }
+
+  sirius::sirius_config cfg;
+  cfg.load_from_file(path);
+
+  CHECK(cfg.get_scan_manager_config().enable_chunk_prewarm);
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}

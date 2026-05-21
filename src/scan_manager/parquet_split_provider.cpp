@@ -481,7 +481,17 @@ void parquet_split_provider::run_batch(file_batch const& batch,
           ? nullptr
           : std::static_pointer_cast<sirius::io::sirius_io_object_metadata>(
               std::make_shared<parquet_metadata>(file_metadata, footer_byte_len));
-      file_io_ctx->cache()->insert(*file_io_object, std::move(metadata_to_store), ranges);
+      // B1 Phase 1: prewarm of column-chunk byte ranges is gated by
+      // scan_manager_config::enable_chunk_prewarm. When false, we still
+      // insert metadata (so §24 describe_parquet's footer reuse keeps
+      // working) but skip the per-chunk prefetch — letting the bench
+      // compare prefetch overlap vs cost.
+      bool const prewarm = (_scan_manager != nullptr) && _scan_manager->chunk_prewarm_enabled();
+      if (prewarm) {
+        file_io_ctx->cache()->insert(*file_io_object, std::move(metadata_to_store), ranges);
+      } else {
+        file_io_ctx->cache()->insert(*file_io_object, std::move(metadata_to_store), {});
+      }
     }
 
     std::vector<cudf::size_type> cur_rgs;

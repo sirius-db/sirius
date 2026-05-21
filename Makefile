@@ -190,7 +190,10 @@ s3-test-large:
 	export SIRIUS_TEST_S3_STRICT=1; \
 	$(S3_TEST_BIN) "[s3][sql][large][large-count]"; \
 	$(S3_TEST_BIN) "[s3][sql][large][large-q1]"; \
-	$(S3_TEST_BIN) "[s3][sql][large][large-join]"
+	$(S3_TEST_BIN) "[s3][sql][large][large-join]"; \
+	$(S3_TEST_BIN) "[s3][sql][large][large-count-no-prewarm]"; \
+	$(S3_TEST_BIN) "[s3][sql][large][large-q1-no-prewarm]"; \
+	$(S3_TEST_BIN) "[s3][sql][large][large-join-no-prewarm]"
 
 # -----------------------------------------------------------------------------
 # S3 perf benchmark (Catch2 [!benchmark][perf][bench] hidden tag - not in the

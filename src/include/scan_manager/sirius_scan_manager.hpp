@@ -86,6 +86,14 @@ struct scan_manager_config {
   /// control).  Ignored when @c enable_prefetch_cache is false.
   std::size_t prefetch_inflight_budget_chunks{2048};
 
+  /// When true (default — current behavior), parquet_split_provider prewarms
+  /// per-row-group column-chunk byte ranges via @c cache->insert(obj,
+  /// metadata, ranges).  When false, prewarm is skipped: insert is called
+  /// with empty ranges (metadata-only, as in §24 describe_parquet).  Lets
+  /// the B1 micro-bench A/B compare prefetch overlap on SF10.  Ignored when
+  /// @c enable_prefetch_cache is false (no cache → no prewarm regardless).
+  bool enable_chunk_prewarm{true};
+
   /// S3 backend opt-in. When set, scan_manager constructs an @c s3_ioctx
   /// alongside the uring_ioctx using these credentials/knobs. Default
   /// construction (empty optional) leaves the S3 backend disabled.
@@ -273,6 +281,13 @@ class sirius_scan_manager {
   ///        when no backend supports @p path.
   [[nodiscard]] std::shared_ptr<sirius::io::sirius_ioctx> io_ctx_shared_for(
     std::string_view path) const noexcept;
+
+  /// \brief Whether parquet_split_provider should prewarm column-chunk byte
+  /// ranges via @c cache->insert(obj, metadata, ranges). Mirrors
+  /// @c scan_manager_config::enable_chunk_prewarm. False disables the
+  /// prewarm (insert is called with empty ranges — metadata-only, §24
+  /// describe_parquet shape), letting B1 micro-bench A/B prefetch overlap.
+  [[nodiscard]] bool chunk_prewarm_enabled() const noexcept { return _config.enable_chunk_prewarm; }
 
   /// \brief Probe a parquet file's schema for the SQL bind path.
   ///
