@@ -49,7 +49,14 @@ sirius_scan_manager::sirius_scan_manager(
                  _config.thread_pool.cpu_affinity_list),
     _dispatcher(
       std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads)),
-    _io_ctxs(std::move(io_ctxs))
+    _io_ctxs(std::move(io_ctxs)),
+    // One dedicated stream per scan-manager worker for metadata-side CUDA work
+    // (AST literal construction + parquet row-group stats pruning). Sizing
+    // matches the worker count so acquire_metadata_stream() with the default
+    // BLOCK policy never has to grow the pool. Streams are created on the
+    // device active at construction time (typically GPU 0); metadata-side work
+    // is small and GPU-agnostic, so this is fine for multi-GPU configs.
+    _metadata_stream_pool(rmm::cuda_device_id{}, _config.thread_pool.num_threads)
 {
   // S6 (NUMA) increment 1: the scan_manager no longer constructs IO backends.
   // SiriusContext owns the uring(s) + s3_ioctx + S3 async thread pool + prefetch
@@ -117,6 +124,12 @@ std::shared_ptr<sirius::io::sirius_ioctx> sirius_scan_manager::io_ctx_shared_for
 {
   return lookup_supporting<decltype(_io_ctxs), std::shared_ptr<sirius::io::sirius_ioctx>>(
     _io_ctxs, path, shared_copy);
+}
+
+cucascade::memory::borrowed_stream sirius_scan_manager::acquire_metadata_stream() noexcept
+{
+  return _metadata_stream_pool.acquire_stream(
+    cucascade::memory::exclusive_stream_pool::stream_acquire_policy::BLOCK);
 }
 
 void sirius_scan_manager::prepare_for_query(

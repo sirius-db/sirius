@@ -23,7 +23,8 @@
 #include <cudf/io/parquet_metadata.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/types.hpp>
-#include <cudf/utilities/default_stream.hpp>
+
+#include <rmm/cuda_stream.hpp>
 
 #include <duckdb/main/connection.hpp>
 #include <log/logging.hpp>
@@ -214,7 +215,13 @@ struct equality_delete_read_result {
 equality_delete_read_result read_equality_delete_file(std::string const& delete_file_path,
                                                       sirius::io::sirius_ioctx& ioctx)
 {
-  auto stream = cudf::get_default_stream();
+  // Use a dedicated stream rather than cudf::get_default_stream(). When
+  // multiple iceberg deletes are materialized concurrently they would share
+  // the default stream and serialize behind each other; an owned stream per
+  // call is both more isolated and avoids the cross-worker AST-vs-pruning
+  // race that parquet_split_provider hit.
+  rmm::cuda_stream owned_stream;
+  auto stream = owned_stream.view();
 
   // Both the read_parquet (table data) AND the read_parquet_footers (field-id
   // extraction) share the same uring_io_object + sirius_datasource — the
@@ -321,7 +328,9 @@ EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
                                          std::vector<std::optional<int32_t>> key_field_ids,
                                          std::vector<cudf::table_view> const& views)
 {
-  auto stream = cudf::get_default_stream();
+  // Dedicated stream per call — see note in read_equality_delete_file above.
+  rmm::cuda_stream owned_stream;
+  auto stream = owned_stream.view();
 
   auto all_rows = (views.size() == 1) ? std::make_unique<cudf::table>(views[0], stream)
                                       : cudf::concatenate(views, stream);

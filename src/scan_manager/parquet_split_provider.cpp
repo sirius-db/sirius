@@ -37,8 +37,9 @@
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
 #include <cudf/io/parquet_schema.hpp>
-#include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
+
+#include <rmm/cuda_stream.hpp>
 
 #include <duckdb/common/hive_partitioning.hpp>
 #include <io/uring/uring_reactor.hpp>
@@ -217,7 +218,24 @@ parquet_split_provider::next_split_provider()
 void parquet_split_provider::run_batch(file_batch const& batch,
                                        std::vector<std::unique_ptr<op::operator_data>>& out)
 {
-  auto stream = cudf::get_default_stream();
+  // Acquire a dedicated CUDA stream for this batch's metadata-side work
+  // (AST literal construction + filter_row_groups_with_stats). Sharing
+  // cudf::get_default_stream() across concurrent run_batch invocations on
+  // the scan_manager thread pool races the stats-pruning step against the
+  // producing worker's literals and occasionally drops a row group from
+  // the scan. The production path (provider built via sirius_scan_manager)
+  // borrows from the manager's per-worker pool; the legacy no-scan_manager
+  // path used by test fixtures constructs a fresh owning stream per call.
+  std::optional<cucascade::memory::borrowed_stream> borrowed_stream_opt;
+  std::optional<rmm::cuda_stream> owned_stream_opt;
+  rmm::cuda_stream_view stream = [&]() -> rmm::cuda_stream_view {
+    if (_scan_manager != nullptr) {
+      borrowed_stream_opt = _scan_manager->acquire_metadata_stream();
+      return borrowed_stream_opt->get();
+    }
+    owned_stream_opt.emplace();
+    return owned_stream_opt->view();
+  }();
 
   //===----------Build reader options----------===//
   auto const data_column_names = _plan->data_column_names();
@@ -231,6 +249,14 @@ void parquet_split_provider::run_batch(file_batch const& batch,
   // Translate the filter to a cudf AST for reader-side pushdown, falling back to a post-read
   // DuckDB-expression evaluation when translation isn't possible. Partition-column filters
   // have already been dropped at construction; anything remaining references data columns.
+  //
+  // The translated expression is NOT attached to the shared `reader_options` — set_filter
+  // stores a non-owning reference_wrapper and `ast_expression` is a function-local whose
+  // literals (and the AST nodes that point at them) die when this function returns. The
+  // shared `reader_options` is captured into every emitted parquet_scan_data; downstream
+  // read_table_from_metadata re-translates the filter on its own task stream. The local
+  // copy used for stats pruning below holds the reference only for the duration of the
+  // pruning call.
   std::optional<gpu_expression_translator::translated_expression> ast_expression = std::nullopt;
   if (_duckdb_filter_expression) {
     // Resolver maps the BoundReferenceExpression's batch position (D) to the corresponding
@@ -243,7 +269,6 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     ast_expression =
       translator.translate_expression_with_names(*_duckdb_filter_expression, name_resolver);
     if (ast_expression) {
-      reader_options->set_filter(ast_expression->back());
       SIRIUS_LOG_DEBUG(
         "[parquet_split_provider] Translated filter expression for row group pruning.");
     } else {
@@ -440,9 +465,15 @@ void parquet_split_provider::run_batch(file_batch const& batch,
                        file_path,
                        row_groups_before_pruning);
       // clang-format on
-      // Prune row groups with filter pushdown using metadata statistics.
+      // Prune row groups with filter pushdown using metadata statistics. The
+      // filter reference is set on a LOCAL copy of reader_options so the AST
+      // lifetime (this function) doesn't outlive the shared reader_options
+      // captured into parquet_scan_data — set_filter stores a non-owning
+      // reference_wrapper and dangling refs in the shared options would be UB.
+      auto pruning_opts = *reader_options;
+      pruning_opts.set_filter(ast_expression->back());
       row_group_indices =
-        reader.filter_row_groups_with_stats(row_group_indices, *reader_options, stream);
+        reader.filter_row_groups_with_stats(row_group_indices, pruning_opts, stream);
       auto const row_groups_after_pruning = row_group_indices.size();
       auto const pruned_row_groups        = row_groups_before_pruning - row_groups_after_pruning;
       // clang-format off
@@ -596,6 +627,15 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     flush();
   }
   flush();
+
+  // Drain any pending GPU work on this batch's stream before releasing it
+  // back to the pool (or letting the owned fallback stream go out of scope).
+  // filter_row_groups_with_stats and the translator's literal-scalar
+  // construction queue work on `stream`; finishing it here guarantees that
+  // ast_expression's owned_literals (about to be destroyed) have completed
+  // any stream-ordered deallocations on a stream another worker will reuse
+  // next.
+  stream.synchronize();
 }
 
 }  // namespace sirius::scan_manager

@@ -29,6 +29,7 @@
 
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/stream_pool.hpp>
 #include <io/types.hpp>
 
 namespace cucascade::memory {
@@ -324,6 +325,22 @@ class sirius_scan_manager {
   [[nodiscard]] std::shared_ptr<sirius::io::sirius_ioctx> io_ctx_shared_for(
     std::string_view path) const noexcept;
 
+  /// \brief Borrow a dedicated CUDA stream for scan-side metadata work
+  ///        (AST literal materialization + parquet row-group stats pruning).
+  ///
+  /// Producers running on the scan_manager thread pool must NOT submit work
+  /// on @c cudf::get_default_stream(): concurrent provider workers would
+  /// share that one stream and the AST-literal/stats-pruning sequence on
+  /// each worker would interleave with the others' work, occasionally
+  /// producing a wrong pruning decision and silently dropping a row group.
+  /// Borrowing a stream from this pool guarantees per-worker isolation.
+  ///
+  /// The pool is sized to @c _config.thread_pool.num_threads with a
+  /// @c BLOCK acquire policy, so each scan-manager worker is guaranteed
+  /// a stream without growing the pool. The returned @c borrowed_stream
+  /// returns its underlying @c rmm::cuda_stream to the pool when destroyed.
+  [[nodiscard]] cucascade::memory::borrowed_stream acquire_metadata_stream() noexcept;
+
  private:
   /// \brief Build a split_provider for @p op by reading its scan_info.
   ///        Tries the pinned-cache short-circuit (format-agnostic; uses only
@@ -358,6 +375,14 @@ class sirius_scan_manager {
   scan_manager_config _config;
   exec::static_thread_pool _thread_pool;
   std::unique_ptr<exec::scoped_dispatcher> _dispatcher;
+  /// Per-worker CUDA streams for scan-side metadata work. Sized to
+  /// @c _config.thread_pool.num_threads so every concurrent
+  /// @c parquet_split_provider::run_batch invocation gets its own stream
+  /// for AST literal construction and @c filter_row_groups_with_stats.
+  /// Without this, all workers share @c cudf::get_default_stream() and
+  /// the stats-pruning step races with the producing worker's literals,
+  /// occasionally dropping a row group from the scan.
+  cucascade::memory::exclusive_stream_pool _metadata_stream_pool;
   /// BORROWED ioctx backends, in priority order (S6) — owned by SiriusContext,
   /// passed in at construction. The first entry is the default local-file
   /// backend (@c uring_ioctx); subsequent entries are object-store backends
