@@ -114,7 +114,7 @@ jobs:
           retention-days: 1
 
   test-cuda-13:
-    runs-on: [self-hosted, ubuntu-24.04, cuda-13, gpu-4xt4]
+    runs-on: [self-hosted, ubuntu-24.04, cuda-13, gpu-2xt4]
     needs: build-cuda-13
     if: needs.build-cuda-13.result == 'success'
     timeout-minutes: 60
@@ -188,7 +188,7 @@ jobs:
           retention-days: 14
 
   test-cuda-12:
-    runs-on: [self-hosted, ubuntu-22.04, cuda-12, gpu-4xt4]
+    runs-on: [self-hosted, ubuntu-22.04, cuda-12, gpu-2xt4]
     needs: build-cuda-12
     if: needs.build-cuda-12.result == 'success'
     timeout-minutes: 60
