@@ -530,6 +530,16 @@ scripted_http_response range_ok(std::string body, std::size_t object_size)
     std::move(body)};
 }
 
+scripted_http_response range_ok_at(std::string body, std::size_t offset, std::size_t object_size)
+{
+  auto const end = offset + (body.empty() ? 0 : body.size() - 1);
+  return scripted_http_response{206,
+                                "Partial Content",
+                                {"Content-Range: bytes " + std::to_string(offset) + "-" +
+                                 std::to_string(end) + "/" + std::to_string(object_size)},
+                                std::move(body)};
+}
+
 scripted_http_response head_ok(std::size_t object_size)
 {
   return scripted_http_response{200, "OK", {"Content-Length: " + std::to_string(object_size)}, ""};
@@ -950,6 +960,66 @@ TEST_CASE("s3_ioctx retry backoff timing stays within tolerance", "[s3][ioctx][r
   CHECK(elapsed >= 100ms);
   CHECK(elapsed < 700ms);
   CHECK(server.request_count() == 2);
+}
+
+TEST_CASE("s3_ioctx host_read_ranges short-circuits EOF-only ranges before presigning",
+          "[s3][ioctx]")
+{
+  auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
+  auto ctx      = std::make_shared<s3_ioctx>(s3_ioctx_config{provider, 1, 1});
+  auto obj      = make_s3_object("bucket", "object.bin", 100);
+
+  std::vector<std::byte> a(1);
+  std::vector<std::byte> b(1);
+  std::vector<cudf::io::text::byte_range_info> ranges{{100, 16}, {128, 32}};
+  std::vector<cudf::host_span<std::byte>> dst{{a.data(), a.size()}, {b.data(), b.size()}};
+
+  auto [bytes, ep] = read_ranges_async(*ctx, *obj, ranges, std::span{dst});
+
+  CHECK(bytes == 0);
+  CHECK(ep == nullptr);
+  CHECK(provider->call_count() == 0);
+  CHECK(provider->get_count() == 0);
+}
+
+TEST_CASE("s3_ioctx host_read_ranges validates dst against EOF-clipped sizes before presigning",
+          "[s3][ioctx]")
+{
+  auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
+  auto ctx      = std::make_shared<s3_ioctx>(s3_ioctx_config{provider, 1, 1});
+  auto obj      = make_s3_object("bucket", "object.bin", 100);
+
+  std::vector<std::byte> dst_bytes(3);
+  std::vector<cudf::io::text::byte_range_info> ranges{{96, 16}};
+  std::vector<cudf::host_span<std::byte>> dst{{dst_bytes.data(), dst_bytes.size()}};
+
+  auto [bytes, ep] = read_ranges_async(*ctx, *obj, ranges, std::span{dst});
+
+  CHECK(bytes == 0);
+  REQUIRE(ep != nullptr);
+  CHECK_THROWS_WITH(std::rethrow_exception(ep), "s3_ioctx::host_read_ranges: dst span too small");
+  CHECK(provider->call_count() == 0);
+  CHECK(provider->get_count() == 0);
+}
+
+TEST_CASE("s3_ioctx host_read_ranges reads the clipped EOF-crossing byte count", "[s3][ioctx]")
+{
+  scripted_http_server server({range_ok_at("tail", 96, 100)});
+  auto provider = std::make_shared<mock_credential_provider>(server.url());
+  auto ctx      = std::make_shared<s3_ioctx>(s3_ioctx_config{provider, 1, 1});
+  auto obj      = make_s3_object("bucket", "object.bin", 100);
+
+  std::vector<std::byte> dst_bytes(4);
+  std::vector<cudf::io::text::byte_range_info> ranges{{96, 16}};
+  std::vector<cudf::host_span<std::byte>> dst{{dst_bytes.data(), dst_bytes.size()}};
+
+  auto [bytes, ep] = read_ranges_async(*ctx, *obj, ranges, std::span{dst});
+
+  CHECK(ep == nullptr);
+  CHECK(bytes == 4);
+  CHECK(provider->get_count() == 1);
+  CHECK(server.request_count() == 1);
+  CHECK(std::string(reinterpret_cast<char const*>(dst_bytes.data()), dst_bytes.size()) == "tail");
 }
 
 TEST_CASE("s3_ioctx reads single objects from MinIO with presigned range GETs",
