@@ -1150,6 +1150,32 @@ TEST_CASE("gpu_execution rewrites S3 read_parquet and scans through Sirius",
   CHECK(result->GetValue(2, 0).GetValue<int32_t>() == 0);
 }
 
+TEST_CASE("gpu_execution S3 window query falls back to DuckDB CPU",
+          "[.][s3][integration][sql][gpu_execution][fallback]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  auto const s3_query =
+    "SELECT n_nationkey, ROW_NUMBER() OVER (ORDER BY n_nationkey) AS rn "
+    "FROM " +
+    s3_parquet_scan(*env, "nation") + " ORDER BY n_nationkey";
+  auto s3_result = require_query_ok(fixture.con, gpu_execution_sql(s3_query));
+
+  duckdb::DuckDB baseline_db(nullptr);
+  duckdb::Connection baseline_con(baseline_db);
+  auto const local_query =
+    "SELECT n_nationkey, ROW_NUMBER() OVER (ORDER BY n_nationkey) AS rn "
+    "FROM " +
+    local_parquet_scan("nation") + " ORDER BY n_nationkey";
+  auto baseline_result = require_query_ok(baseline_con, local_query);
+
+  REQUIRE(s3_result->RowCount() == 25);
+  REQUIRE(s3_result->ColumnCount() == 2);
+  check_rows_equal_with_tolerant_columns(*s3_result, *baseline_result, {});
+}
+
 TEST_CASE("gpu_execution can call sirius_read_parquet directly",
           "[.][s3][integration][sql][gpu_execution]")
 {

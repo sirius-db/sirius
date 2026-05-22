@@ -162,6 +162,13 @@ struct SiriusTableFunctionData : public TableFunctionData {
   unique_ptr<Connection> conn;
   unique_ptr<::sirius::sirius_interface> sirius_iface;
   string query;
+  // Pre-rewrite query used for the CPU fallback. The GPU path runs the rewritten
+  // `query` (read_parquet('s3://…') -> sirius_read_parquet('s3://…')), which
+  // throws if executed on the CPU. A fallback must instead replay the original
+  // read_parquet('s3://…'), which DuckDB's CPU reader serves through the
+  // registered sirius_s3_filesystem (newplan §29). For local / non-s3 queries
+  // the rewrite is a no-op, so this equals `query`.
+  string cpu_fallback_query;
   bool enable_optimizer;
   bool finished   = false;
   bool plan_error = false;
@@ -509,7 +516,12 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   // read_parquet('s3://…') -> sirius_read_parquet('s3://…'). DuckDB core has no
   // S3 filesystem, so without this rewrite the s3:// bind fails before Sirius
   // ever runs. Local paths and non-s3 calls are left untouched.
-  result->query = sirius::rewrite_sirius_owned_remote_parquet_calls(result->query);
+  //
+  // Capture the pre-rewrite query first: a CPU fallback must replay the original
+  // read_parquet('s3://…') (served by sirius_s3_filesystem on the CPU path), not
+  // the rewritten sirius_read_parquet, which throws off the GPU.
+  result->cpu_fallback_query = result->query;
+  result->query              = sirius::rewrite_sirius_owned_remote_parquet_calls(result->query);
 
   // Parse the query just to get the result type information and to create PreparedStatementData
   Parser parser(context.GetParserOptions());
@@ -567,7 +579,7 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
       printf(
         "=============================================\nError in SiriusExecuteQuery, fallback to "
         "DuckDB\n=============================================\n");
-      data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
+      data.res = run_internal_cpu_fallback_query(context, *data.conn, data.cpu_fallback_query);
     } else {
       data.res =
         data.sirius_iface->sirius_execute_query(context, data.query, data.gpu_prepared, {});
@@ -577,7 +589,7 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
           printf(
             "=============================================\nError in SiriusExecuteQuery, fallback "
             "to DuckDB\n=============================================\n");
-          data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
+          data.res = run_internal_cpu_fallback_query(context, *data.conn, data.cpu_fallback_query);
         } else {
           throw std::runtime_error("SiriusExecuteQuery error: " + data.res->GetError());
           return;
