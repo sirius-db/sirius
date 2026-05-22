@@ -15,7 +15,7 @@ from typing import List, Optional
 from . import patterns
 
 
-SQL_KEEP_PREFIXES = ("select ", "with ")
+SQL_KEEP_KEYWORDS = {"select", "with"}
 
 
 @dataclass
@@ -36,7 +36,10 @@ def _extract_ts(line: str) -> Optional[str]:
 
 def _is_analytical(sql: str) -> bool:
     stripped = sql.lstrip().lower()
-    return stripped.startswith(SQL_KEEP_PREFIXES)
+    if not stripped:
+        return False
+    first_word = stripped.split(maxsplit=1)[0]
+    return first_word in SQL_KEEP_KEYWORDS
 
 
 def segment(lines: List[str]) -> List[QuerySegment]:

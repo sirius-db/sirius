@@ -28,10 +28,13 @@ DEBUG_TAG = "[debug]"
 QUERY_BEGIN_ANCHOR = "[info] [:] [query_pool] QueryBegin allocated="
 QUERY_END_ANCHOR = "[info] [:] [query_pool] QueryEnd allocated="
 
-# Example: "[2026-05-20 14:25:02.368] [info] [:] QueryBegin: with revenue_view as ..."
-QUERY_SQL_ANCHOR = "[info] [:] QueryBegin: "
+# Example (old): "[2026-05-20 14:25:02.368] [info] [:] QueryBegin: with revenue_view as ..."
+# Example (new): "[2026-05-22 17:33:13.408] [info] [sirius_context.cpp:205] QueryBegin: select ..."
+# Both forms appear in the wild; the second element changed from [:] to a
+# file:line tag in newer Sirius builds.
+QUERY_SQL_ANCHOR = "QueryBegin: "  # distinguished from "QueryBegin allocated=" by ": "
 QUERY_SQL_RE = re.compile(
-    r"\[(?P<ts>[\d\-: .]+)\] \[info\] \[:\] QueryBegin: (?P<sql>.*)$"
+    r"\[(?P<ts>[\d\-: .]+)\] \[info\] \[[^\]]+\] QueryBegin: (?P<sql>.*)$"
 )
 
 # --- Pipeline Overview block -------------------------------------------------
