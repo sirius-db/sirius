@@ -112,17 +112,14 @@ void host_table_chunk_reader::column_reader::copy_fixed_width(
 
 namespace detail {
 // Helper template function for constructing duckdb strings from offsets
-template <bool HasNulls, typename OffsetType>
-void make_duckdb_strings(
-  memory::multiple_blocks_allocation_accessor<OffsetType>& offset_accessor,
-  std::shared_ptr<
-    cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation> const&
-    allocation,
-  duckdb::Vector& vector,
-  size_t count,
-  size_t start_offset,
-  size_t end_offset,
-  duckdb::data_ptr_t str_buffer_ptr)
+template <bool HasNulls, typename OffsetType, typename AllocPtr>
+void make_duckdb_strings(memory::multiple_blocks_allocation_accessor<OffsetType>& offset_accessor,
+                         AllocPtr const& allocation,
+                         duckdb::Vector& vector,
+                         size_t count,
+                         size_t start_offset,
+                         size_t end_offset,
+                         duckdb::data_ptr_t str_buffer_ptr)
 {
   auto* strings = duckdb::FlatVector::GetData<duckdb::string_t>(vector);
   size_t start  = start_offset;

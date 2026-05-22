@@ -22,7 +22,7 @@
 #include "io/s3/s3_ioctx.hpp"
 #include "io/uring/uring_ioctx.hpp"
 #include "log/logging.hpp"
-#include "op/scan/parquet_scan_info.hpp"
+#include "op/scan/scan_info.hpp"
 #include "op/scan/scan_plan.hpp"
 #include "op/scan/scan_utils.hpp"
 #include "op/scan/sirius_gpu_parquet_scan_operator.hpp"
@@ -54,91 +54,29 @@
 namespace sirius::scan_manager {
 
 sirius_scan_manager::sirius_scan_manager(
-  scan_manager_config config, cucascade::memory::fixed_size_host_memory_resource* host_mr)
+  scan_manager_config config, std::vector<std::shared_ptr<sirius::io::sirius_ioctx>> io_ctxs)
   : _config(std::move(config)),
     _thread_pool(_config.thread_pool.num_threads,
                  _config.thread_pool.thread_name_prefix,
                  _config.thread_pool.cpu_affinity_list),
     _dispatcher(
-      std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads))
+      std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads)),
+    _io_ctxs(std::move(io_ctxs))
 {
-  std::shared_ptr<sirius::io::sirius_ioctx> uring_ctx;
-  if (_config.use_sirius_datasource) {
-    if (host_mr == nullptr) {
-      throw std::runtime_error(
-        "[sirius_scan_manager] use_sirius_datasource is true but no host "
-        "fixed_size_host_memory_resource was provided");
-    }
-    // Combine HEAD's new ctor signature (FSMR-aware, n_reactors first) with
-    // PR4+5's multi-ioctx vector storage. _io_ctxs[0] is the uring backend.
-    uring_ctx = std::make_shared<sirius::io::uring_ioctx>(
-      _config.uring_n_reactors, _config.uring_ring_entries, *host_mr);
-    _io_ctxs.push_back(uring_ctx);
-    SIRIUS_LOG_DEBUG(
-      "[sirius_scan_manager] sirius_datasource enabled (uring_ioctx n_reactors={} ring_entries={})",
-      _config.uring_n_reactors,
-      _config.uring_ring_entries);
-    // Cache initialization moved to AFTER s3_ioctx construction (line ~120+)
-    // so all _io_ctxs share the same buffer_pool. Uses host_mr->get_block_size()
-    // for slab sizing per Amin's d95f43a2 dynamic chunk size.
-  } else {
-    SIRIUS_LOG_DEBUG(
-      "[sirius_scan_manager] sirius_datasource disabled — falling back to "
-      "cudf::io::datasource::create");
-  }
-
-  // Construct the S3 backend on top of the local-file backend. Order matters:
-  // io_ctx_for() walks _io_ctxs and returns the first match, so the local
-  // backend (which supports file:// and bare absolute paths) is tried before
-  // S3 (which only claims s3:// prefixes). Cross-claim is impossible since
-  // their supports() are disjoint, but order keeps lookup deterministic.
-  if (_config.s3_config) {
-    // S3 async paths need a caller-owned thread pool to avoid per-request
-    // detached std::thread fallback. Construct it BEFORE the s3_ioctx and
-    // inject via s3_ioctx_config::async_thread_pool.
-    _s3_thread_pool =
-      std::make_unique<exec::static_thread_pool>(_config.s3_thread_pool.num_threads,
-                                                 _config.s3_thread_pool.thread_name_prefix,
-                                                 _config.s3_thread_pool.cpu_affinity_list);
-    auto s3_cfg                 = *_config.s3_config;
-    s3_cfg.async_thread_pool    = _s3_thread_pool.get();
-    s3_cfg.host_memory_resource = host_mr;
-    auto s3_ctx                 = std::make_shared<sirius::io::s3::s3_ioctx>(std::move(s3_cfg));
-    _io_ctxs.push_back(s3_ctx);
-    SIRIUS_LOG_DEBUG("[sirius_scan_manager] s3 backend enabled (s3_thread_pool num_threads={})",
-                     _config.s3_thread_pool.num_threads);
-  }
-
-  if (_config.enable_prefetch_cache && !_io_ctxs.empty()) {
-    if (host_mr == nullptr) {
-      throw std::runtime_error(
-        "[sirius_scan_manager] enable_prefetch_cache is true but no host "
-        "fixed_size_host_memory_resource was provided");
-    }
-    auto const slab_bytes = host_mr->get_block_size() *
-                            static_cast<std::size_t>(sirius::io::buffer_pool::CHUNKS_PER_SLAB);
-    auto const max_slabs =
-      static_cast<uint32_t>((_config.prefetch_buffer_pool_bytes + slab_bytes - 1) / slab_bytes);
-    _buffer_pool = std::make_unique<sirius::io::buffer_pool>(*host_mr, max_slabs);
-    for (auto& ctx : _io_ctxs) {
-      ctx->initialize_cache(*_buffer_pool, _config.prefetch_inflight_budget_chunks);
-    }
-    SIRIUS_LOG_DEBUG(
-      "[sirius_scan_manager] prefetch cache enabled (slabs={} budget_bytes={} "
-      "inflight_chunks={})",
-      max_slabs,
-      max_slabs * slab_bytes,
-      _config.prefetch_inflight_budget_chunks);
-  }
+  // S6 (NUMA) increment 1: the scan_manager no longer constructs IO backends.
+  // SiriusContext owns the uring(s) + s3_ioctx + S3 async thread pool + prefetch
+  // buffer_pool/cache and passes the routing backends in as borrowed
+  // shared_ptrs. io_ctx_for / io_ctx_shared_for dispatch over this borrowed
+  // list; stop() and the destructor must NOT shut down or destroy them.
+  SIRIUS_LOG_DEBUG("[sirius_scan_manager] constructed with {} borrowed IO backend(s)",
+                   _io_ctxs.size());
 }
 
 sirius_scan_manager::~sirius_scan_manager()
 {
-  for (auto const& ctx : _io_ctxs) {
-    if (ctx && ctx->cache() != nullptr) {
-      SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", ctx->cache()->summary());
-    }
-  }
+  // S6: backends + their caches are owned by SiriusContext (which logs cache
+  // summaries on its own teardown). Only stop our scan-orchestration pool here;
+  // do not touch the borrowed backends.
   stop();
 }
 
@@ -236,7 +174,10 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
   return result;
 }
 
-void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
+void sirius_scan_manager::prepare_for_query(
+  const sirius::planner::query& query,
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs,
+  std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces)
 {
   reset();
 
@@ -249,8 +190,11 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
     if (ctx && ctx->cache()) { ctx->cache()->refresh_cache(); }
   }
 
-  SIRIUS_LOG_DEBUG("[sirius_scan_manager::prepare_for_query] pipelines={}",
-                   query.get_pipelines().size());
+  SIRIUS_LOG_DEBUG(
+    "[sirius_scan_manager::prepare_for_query] pipelines={} gpu_ioctxs={} gpu_memory_spaces={}",
+    query.get_pipelines().size(),
+    gpu_ioctxs.size(),
+    gpu_memory_spaces.size());
 
   for (auto const& pipeline : query.get_pipelines()) {
     if (!pipeline) { continue; }
@@ -261,7 +205,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
     auto* op = &source->Cast<op::scan::sirius_gpu_parquet_scan_operator>();
     if (_providers_by_op.find(op) != _providers_by_op.end()) { continue; }
 
-    auto provider = create_provider_for(op);
+    auto provider = create_provider_for(op, gpu_ioctxs, gpu_memory_spaces);
     if (!provider) {
       // No scan_info parked on the operator (e.g. tests construct the operator
       // directly). Skip — caller is responsible for the connector.
@@ -281,17 +225,47 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
 }
 
 std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
-  op::scan::sirius_gpu_parquet_scan_operator* op)
+  op::scan::sirius_gpu_parquet_scan_operator* op,
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs,
+  std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces)
 {
   auto info = op->take_scan_info();
   if (!info) { return nullptr; }
 
-  // If a pinned entry's file paths match this operator's scan_info, build the same
+  // Inject the per-GPU sirius_ioctx map into the operator BEFORE returning
+  // any provider (cached or per-format). read_table_from_metadata requires
+  // _gpu_ioctxs to be non-empty before its first invocation. The setter is
+  // idempotent and runs once per query; prepare_for_query (the sole caller of
+  // create_provider_for) runs before any execute(), so the operator sees the
+  // ioctx map well before the parquet scan path needs it for ioctx selection
+  // by scan_data.gpu_memory_space->get_device_id().
+  op->set_gpu_ioctxs(gpu_ioctxs);
+
+  // Pinned-cache short-circuit lives on the manager because it uses only the
+  // common scan_info fields (file_paths, column_ids, names, returned_types,
+  // projection_ids, partition_indices, table_filters) — format-agnostic. If
+  // it misses, dispatch through scan_info::make_provider() to the format's
+  // own split_provider construction.
+  if (auto cached = try_make_cached_provider(*info, op->get_operator_id(), gpu_memory_spaces)) {
+    return cached;
+  }
+  // Combined-runtime: pass *this so the format provider can route per-path
+  // (s3:// -> s3_ioctx via io_ctx_shared_for, local -> per-GPU uring). Upstream
+  // #749's make_provider(gpu_ioctxs) only wired local; S3 needs the scan_manager.
+  return info->make_provider(*this, gpu_ioctxs);
+}
+
+std::unique_ptr<split_provider> sirius_scan_manager::try_make_cached_provider(
+  op::scan::scan_info const& info,
+  std::size_t op_id,
+  std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces)
+{
+  // If a pinned entry's file paths match this scan_info, build the same
   // scan_plan the parquet path would build and serve the scan from cache.
   auto matches_scan_info = [&info](const pinned_entry& entry) {
-    if (entry.file_paths.size() != info->file_paths.size()) { return false; }
+    if (entry.file_paths.size() != info.file_paths.size()) { return false; }
     auto sorted_a = entry.file_paths;
-    auto sorted_b = info->file_paths;
+    auto sorted_b = info.file_paths;
     std::sort(sorted_a.begin(), sorted_a.end());
     std::sort(sorted_b.begin(), sorted_b.end());
     return sorted_a == sorted_b;
@@ -299,33 +273,41 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
   try {
     for (auto const& [pinned_name, entry] : _pinned_entries) {
       if (!matches_scan_info(entry)) { continue; }
-      if (entry.memory_space == nullptr) {
-        throw std::runtime_error("[sirius_scan_manager::create_provider_for] pinned entry '" +
-                                 pinned_name + "' has no memory_space");
+      // A partial pin (created with pin_table(..., n_rows=N) where N capped
+      // the captured rows below the full file content) MUST NOT serve cached
+      // reads. The incoming scan_info doesn't carry an n_rows budget — serving
+      // the partial entry would silently return only the pinned prefix and
+      // mask the missing rows. Fall through to the per-format path.
+      if (entry.is_partial) {
+        SIRIUS_LOG_DEBUG(
+          "[sirius_scan_manager::try_make_cached_provider] pinned entry '{}' matches op_id={} but "
+          "is partial (row-count budget at pin time); falling through to per-format split_provider",
+          pinned_name,
+          op_id);
+        break;
       }
-
       // Build the canonical scan_plan once. Everything downstream — cached column
       // layout, filter pushdown indices, post-read assembly — reads from this.
       // Held by shared_ptr<const> so each emitted scan_cached_operator_data can
       // carry it to the GPU scan operator's per-task assembly check without copying.
       auto plan_shared = std::make_shared<op::scan::scan_plan const>(
-        op::scan::build_scan_plan(info->column_ids,
-                                  info->projection_ids,
-                                  info->names,
-                                  info->returned_types,
-                                  op->get_types().size(),
-                                  info->partition_indices));
+        op::scan::build_scan_plan(info.column_ids,
+                                  info.projection_ids,
+                                  info.names,
+                                  info.returned_types,
+                                  info.scan_output_arity,
+                                  info.partition_indices));
       auto const& plan = *plan_shared;
 
       // Hive partitions on a cached scan would require per-chunk file_path metadata
-      // that pinned entries don't carry today. Fall through to the parquet path,
+      // that pinned entries don't carry today. Fall through to the per-format path,
       // which extracts partition values per file at read time.
       if (plan.has_partitions()) {
         SIRIUS_LOG_DEBUG(
-          "[sirius_scan_manager::create_provider_for] pinned entry '{}' matches op_id={} but "
-          "scan has hive partitions; falling through to parquet_split_provider",
+          "[sirius_scan_manager::try_make_cached_provider] pinned entry '{}' matches op_id={} but "
+          "scan has hive partitions; falling through to per-format split_provider",
           pinned_name,
-          op->get_operator_id());
+          op_id);
         break;
       }
 
@@ -334,11 +316,11 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
       // the cached batch (which is in D-order by construction above). Built before the
       // tier-specific assembly so both branches share the same filter.
       std::shared_ptr<duckdb::Expression> filter_expression;
-      if (info->table_filters && !info->table_filters->filters.empty()) {
+      if (info.table_filters && !info.table_filters->filters.empty()) {
         auto duckdb_expression =
-          op::convert_table_filters_to_expression(*info->table_filters,
-                                                  info->column_ids,
-                                                  info->returned_types,
+          op::convert_table_filters_to_expression(*info.table_filters,
+                                                  info.column_ids,
+                                                  info.returned_types,
                                                   plan.batch_position_by_column_id,
                                                   plan.partition_primary_indices);
         if (duckdb_expression) {
@@ -347,27 +329,57 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
       }
 
       if (entry.tier == cucascade::memory::Tier::HOST) {
+        // HOST-tier entries store one host_data_representation per chunk in
+        // entry.host_chunks; chunk_memory_spaces is intentionally empty (see
+        // pinned_entry doc comment + insert_pinned_entry_host). Validate the
+        // host_chunks vector instead.
+        if (entry.host_chunks.empty()) {
+          throw std::runtime_error(
+            "[sirius_scan_manager::try_make_cached_provider] pinned host entry '" + pinned_name +
+            "' has no host_chunks");
+        }
+        for (std::size_t i = 0; i < entry.host_chunks.size(); ++i) {
+          if (!entry.host_chunks[i]) {
+            throw std::runtime_error(
+              "[sirius_scan_manager::try_make_cached_provider] pinned host entry '" + pinned_name +
+              "' host_chunks[" + std::to_string(i) + "] is null");
+          }
+        }
+        // The HOST cached path materializes host chunks onto the executing
+        // GPU via converter_registry.convert<gpu_table_representation>(...).
+        // Without a GPU memory_space map there is no destination — fall
+        // through to the per-format path so the query still succeeds.
+        if (gpu_memory_spaces.empty()) {
+          SIRIUS_LOG_DEBUG(
+            "[sirius_scan_manager::try_make_cached_provider] pinned host entry '{}' matches "
+            "op_id={} but no gpu_memory_spaces map was provided; falling through to per-format "
+            "split_provider",
+            pinned_name,
+            op_id);
+          break;
+        }
+
         // Map each D-position to its index inside the captured host chunk. column_names
         // is in capture order, so we look up the requested data column by name. A missing
         // column means the user pinned a subset that doesn't cover this scan — fall back
-        // to the parquet path so the query still succeeds.
+        // to the per-format path so the query still succeeds.
         std::vector<std::size_t> column_indices;
         column_indices.reserve(plan.data_columns.size());
         for (auto const& dc : plan.data_columns) {
           auto it = std::find(entry.column_names.begin(), entry.column_names.end(), dc.name);
           if (it == entry.column_names.end()) {
-            throw std::runtime_error("[sirius_scan_manager::create_provider_for] pinned entry '" +
-                                     pinned_name + "' missing column '" + dc.name +
-                                     "' required by scan op");
+            throw std::runtime_error(
+              "[sirius_scan_manager::try_make_cached_provider] pinned entry '" + pinned_name +
+              "' missing column '" + dc.name + "' required by scan op");
           }
           column_indices.push_back(
             static_cast<std::size_t>(std::distance(entry.column_names.begin(), it)));
         }
 
         SIRIUS_LOG_DEBUG(
-          "[sirius_scan_manager::create_provider_for] using host cached_split_provider for "
+          "[sirius_scan_manager::try_make_cached_provider] using host cached_split_provider for "
           "op_id={} (pinned='{}' data_cols={} chunks={} needs_assembly={})",
-          op->get_operator_id(),
+          op_id,
           pinned_name,
           column_indices.size(),
           entry.host_chunks.size(),
@@ -376,8 +388,25 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
         return std::make_unique<cached_split_provider>(entry.host_chunks,
                                                        std::move(column_indices),
                                                        *entry.memory_space,
+                                                       gpu_memory_spaces,
                                                        std::move(filter_expression),
                                                        std::move(plan_shared));
+      }
+
+      // GPU-tier validation: every cached chunk has an owning memory_space.
+      // chunk_memory_spaces is parallel to the inner vectors of
+      // data_batches_by_column; empty vector means no chunks; null entries
+      // violate the chunks-at-index-i invariant.
+      if (entry.chunk_memory_spaces.empty()) {
+        throw std::runtime_error("[sirius_scan_manager::try_make_cached_provider] pinned entry '" +
+                                 pinned_name + "' has no chunk_memory_spaces");
+      }
+      for (std::size_t i = 0; i < entry.chunk_memory_spaces.size(); ++i) {
+        if (entry.chunk_memory_spaces[i] == nullptr) {
+          throw std::runtime_error(
+            "[sirius_scan_manager::try_make_cached_provider] pinned entry '" + pinned_name +
+            "' chunk_memory_spaces[" + std::to_string(i) + "] is null");
+        }
       }
 
       // Look up the pinned chunks for each D-position by name. data_columns is in
@@ -387,41 +416,32 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
       for (auto const& dc : plan.data_columns) {
         auto it = entry.data_batches_by_column.find(dc.name);
         if (it == entry.data_batches_by_column.end()) {
-          throw std::runtime_error("[sirius_scan_manager::create_provider_for] pinned entry '" +
-                                   pinned_name + "' missing column '" + dc.name +
-                                   "' required by scan op");
+          throw std::runtime_error(
+            "[sirius_scan_manager::try_make_cached_provider] pinned entry '" + pinned_name +
+            "' missing column '" + dc.name + "' required by scan op");
         }
         columns_per_request.push_back(it->second);
       }
 
       SIRIUS_LOG_DEBUG(
-        "[sirius_scan_manager::create_provider_for] using cached_split_provider for op_id={} "
+        "[sirius_scan_manager::try_make_cached_provider] using cached_split_provider for op_id={} "
         "(pinned='{}' data_cols={} needs_assembly={})",
-        op->get_operator_id(),
+        op_id,
         pinned_name,
         columns_per_request.size(),
         op::scan::needs_output_assembly(plan));
 
+      // Each chunk's data_batch is tagged with its actual memory_space so
+      // data-locality scheduling fans cached-scan tasks across GPUs.
       return std::make_unique<cached_split_provider>(std::move(columns_per_request),
-                                                     *entry.memory_space,
+                                                     entry.chunk_memory_spaces,
                                                      std::move(filter_expression),
                                                      std::move(plan_shared));
     }
   } catch (...) {
     SIRIUS_LOG_TRACE("not all the columns are pinned for this query");
   }
-  return std::make_unique<parquet_split_provider>(
-    info->returned_types,
-    info->file_paths,
-    info->column_ids,
-    info->projection_ids,
-    info->names,
-    op->get_types().size(),
-    std::move(info->table_filters),
-    info->partition_indices,
-    info->approximate_batch_size,
-    parquet_split_provider::DEFAULT_MAX_FILE_PROCESSED,
-    *this);
+  return nullptr;
 }
 
 void sirius_scan_manager::start_metadata_processing()
@@ -462,26 +482,33 @@ void sirius_scan_manager::start() {}
 void sirius_scan_manager::stop()
 {
   reset();
-  // Shut down ioctx FIRST (drains in-flight HTTP / uring submissions) so
-  // their async workers don't try to submit work to a stopped thread pool
-  // after we stop it below. shutdown() is idempotent on s3_ioctx; uring_ioctx
-  // matches that contract per #740's base class.
-  for (auto& ctx : _io_ctxs) {
-    if (ctx) { ctx->shutdown(); }
-  }
-  // Stop the S3 thread pool BEFORE the main thread pool — its workers run
-  // detached completion handlers that may indirectly enqueue work onto
-  // _thread_pool. Stopping S3 first prevents that interleaving.
-  if (_s3_thread_pool) { _s3_thread_pool->stop(); }
+  // S6: the IO backends + the S3 async pool are owned by SiriusContext, which
+  // drains (shutdown) the s3_ioctx and stops the S3 pool during its own
+  // teardown. The scan_manager only stops its scan-orchestration pool here and
+  // must NOT shut down the borrowed backends.
   _thread_pool.stop();
 }
 
-void sirius_scan_manager::insert_pinned_entry(const std::string& name,
-                                              std::vector<std::string> column_names,
-                                              std::vector<std::string> file_paths,
-                                              std::vector<std::unique_ptr<cudf::table>> data_tables,
-                                              cucascade::memory::memory_space& memory_space)
+void sirius_scan_manager::insert_pinned_entry(
+  const std::string& name,
+  std::vector<std::string> column_names,
+  std::vector<std::string> file_paths,
+  std::vector<std::unique_ptr<cudf::table>> data_tables,
+  std::vector<cucascade::memory::memory_space*> chunk_memory_spaces,
+  bool is_partial)
 {
+  // chunk_memory_spaces is parallel to data_tables — the caller
+  // (PinTableFunction) emits one memory_space* per
+  // chunked_parquet_reader::read_chunk() result, and there is exactly one
+  // cudf::table per chunk in data_tables. Reject any misalignment loudly
+  // rather than silently aliasing chunks to the wrong GPU.
+  if (chunk_memory_spaces.size() != data_tables.size()) {
+    throw std::invalid_argument(
+      "[sirius_scan_manager::insert_pinned_entry] chunk_memory_spaces.size() (" +
+      std::to_string(chunk_memory_spaces.size()) + ") must equal data_tables.size() (" +
+      std::to_string(data_tables.size()) + ")");
+  }
+
   // Compute the total row count of the incoming tables before releasing them
   // (release() empties the table; num_rows() would then return 0).
   std::size_t new_num_rows = 0;
@@ -491,9 +518,46 @@ void sirius_scan_manager::insert_pinned_entry(const std::string& name,
 
   auto existing_it = _pinned_entries.find(name);
   if (existing_it != _pinned_entries.end()) {
-    if (existing_it->second.num_rows == new_num_rows) {
-      // Same row count → merge unique columns into the existing entry.
+    // Same-row-count merge only applies when the completeness contracts match.
+    // Mixing a full pin with a partial pin produces an entry whose columns came
+    // from different row coverage — drop and rebuild instead.
+    if (existing_it->second.num_rows == new_num_rows &&
+        existing_it->second.is_partial == is_partial) {
+      // Same-row-count merge MUST preserve per-chunk memory_space alignment
+      // between existing and new entry. The round-robin counter restarts at
+      // chunk 0 → GPU 0 per pin_table call, and chunks at index i across all
+      // columns share a memory_space because they came from the same
+      // chunked_parquet_reader::read_chunk() call. Two pin_table calls of the
+      // same file_paths with the same chunk_read_limit MUST therefore produce
+      // identical chunk_memory_spaces vectors. Reject any mismatch loudly
+      // rather than silently aliasing.
       auto& entry = existing_it->second;
+      if (entry.chunk_memory_spaces.size() != chunk_memory_spaces.size()) {
+        throw std::runtime_error(
+          "[sirius_scan_manager::insert_pinned_entry] merge mismatch — "
+          "existing.chunk_memory_spaces.size() (" +
+          std::to_string(entry.chunk_memory_spaces.size()) +
+          ") != new chunk_memory_spaces.size() (" + std::to_string(chunk_memory_spaces.size()) +
+          ")");
+      }
+      for (std::size_t i = 0; i < chunk_memory_spaces.size(); ++i) {
+        if (entry.chunk_memory_spaces[i] != chunk_memory_spaces[i]) {
+          throw std::runtime_error(
+            "[sirius_scan_manager::insert_pinned_entry] merge mismatch — "
+            "chunk_memory_spaces[" +
+            std::to_string(i) + "] differs between existing and new entry");
+        }
+      }
+      // Same row count → merge unique columns into the existing entry.
+      // Decide which column INDICES are new BEFORE iterating chunks. Doing
+      // the contains() check per-chunk would let chunk 0 install a new
+      // column and then chunks 1..N-1 see contains()==true and skip — leaving
+      // the new column with only chunk 0 and tripping cached_split_provider's
+      // "mismatched chunk count across requested columns" invariant.
+      std::vector<bool> is_new_col(column_names.size(), false);
+      for (std::size_t i = 0; i < column_names.size(); ++i) {
+        is_new_col[i] = !entry.data_batches_by_column.contains(column_names[i]);
+      }
       for (auto& table : data_tables) {
         if (!table) { continue; }
         auto cols = table->release();
@@ -504,12 +568,12 @@ void sirius_scan_manager::insert_pinned_entry(const std::string& name,
             std::to_string(column_names.size()));
         }
         for (std::size_t i = 0; i < cols.size(); ++i) {
-          auto const& col_name = column_names[i];
-          if (entry.data_batches_by_column.contains(col_name)) {
-            // Already cached — drop the duplicate column.
+          if (!is_new_col[i]) {
+            // Column was already cached before this merge call — drop the
+            // duplicate chunk.
             continue;
           }
-          entry.data_batches_by_column[col_name].emplace_back(std::move(cols[i]));
+          entry.data_batches_by_column[column_names[i]].emplace_back(std::move(cols[i]));
         }
       }
       // Append any new column names to the entry's column_names list so its
@@ -522,16 +586,17 @@ void sirius_scan_manager::insert_pinned_entry(const std::string& name,
       }
       return;
     }
-    // Row count differs → drop the stale entry and rebuild below.
+    // Row count or completeness contract differs → drop the stale entry and rebuild below.
     _pinned_entries.erase(existing_it);
   }
 
   pinned_entry entry;
-  entry.column_names = std::move(column_names);
-  entry.file_paths   = std::move(file_paths);
-  entry.tier         = cucascade::memory::Tier::GPU;
-  entry.memory_space = &memory_space;
-  entry.num_rows     = new_num_rows;
+  entry.column_names        = std::move(column_names);
+  entry.file_paths          = std::move(file_paths);
+  entry.chunk_memory_spaces = std::move(chunk_memory_spaces);
+  entry.tier                = cucascade::memory::Tier::GPU;
+  entry.num_rows            = new_num_rows;
+  entry.is_partial          = is_partial;
 
   for (auto& table : data_tables) {
     if (!table) { continue; }
@@ -554,7 +619,8 @@ void sirius_scan_manager::insert_pinned_entry_host(
   std::vector<std::string> column_names,
   std::vector<std::string> file_paths,
   std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
-  cucascade::memory::memory_space& memory_space)
+  cucascade::memory::memory_space& memory_space,
+  bool is_partial)
 {
   // The host-tier path captures one chunk per emitted batch; each chunk holds every
   // pinned column. Re-insert always replaces — there is no per-column merge analog
@@ -575,6 +641,7 @@ void sirius_scan_manager::insert_pinned_entry_host(
   entry.memory_space = &memory_space;
   entry.num_rows     = new_num_rows;
   entry.host_chunks  = std::move(host_chunks);
+  entry.is_partial   = is_partial;
 
   _pinned_entries[name] = std::move(entry);
 }

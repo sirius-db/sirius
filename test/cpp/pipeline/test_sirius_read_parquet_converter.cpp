@@ -7,7 +7,7 @@
 
 #include "catch.hpp"
 #include "helper/logical_type.hpp"
-#include "op/scan/parquet_scan_info.hpp"
+#include "op/scan/scan_info.hpp"
 #include "op/scan/sirius_gpu_parquet_scan_operator.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -61,7 +61,7 @@ template struct private_member_access<
   &sirius::pipeline::sirius_pipeline_converter::inserted_operators_>;
 
 struct scan_info_access {
-  using type = std::unique_ptr<sirius::op::scan::parquet_scan_info>
+  using type = std::unique_ptr<sirius::op::scan::scan_info>
     sirius::op::scan::sirius_gpu_parquet_scan_operator::*;
   friend type get(scan_info_access);
 };

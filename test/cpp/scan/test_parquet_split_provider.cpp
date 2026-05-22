@@ -26,6 +26,15 @@
 #include <scan_manager/sirius_scan_manager.hpp>
 #include <scan_manager/split_connector.hpp>
 
+// Phase 19 IO-15: include test_helpers_ioctx.hpp LAST among sirius/test
+// headers — it transitively pulls liburing.h via uring_ioctx.hpp ->
+// uring_reactor.hpp, and liburing.h defines a BLOCK_SIZE macro that collides
+// with the BLOCK_SIZE static member in <blockingconcurrentqueue.h> (transitively
+// pulled via utils/utils.hpp -> sirius_context.hpp -> task_creator.hpp ->
+// bounded_thread_pool.hpp). All consumers of blockingconcurrentqueue.h must
+// precede this include. Mirrors src/op/scan/parquet_scan_task.cpp:30-35.
+#include <scan/test_helpers_ioctx.hpp>
+
 // duckdb
 #include <duckdb.hpp>
 #include <duckdb/common/column_index.hpp>
@@ -342,7 +351,8 @@ TEST_CASE("parquet_split_provider - max_file_processed bounds files per emitted 
                                   /*table_filter_set*/ nullptr,
                                   /*partition_indices*/ {},
                                   k_huge_batch_bytes,
-                                  k_max_files_per_task);
+                                  k_max_files_per_task,
+                                  sirius::scan_test_utils::make_test_gpu_ioctxs());
 
   auto splits = drive_provider(provider);
   REQUIRE_FALSE(splits.empty());
@@ -395,7 +405,8 @@ TEST_CASE("parquet_split_provider - max_file_processed=1 emits one file per spli
                                   /*table_filter_set*/ nullptr,
                                   /*partition_indices*/ {},
                                   /*approximate_batch_size*/ std::size_t{1} << 30,
-                                  /*max_file_processed*/ 1);
+                                  /*max_file_processed*/ 1,
+                                  sirius::scan_test_utils::make_test_gpu_ioctxs());
 
   auto splits = drive_provider(provider);
   REQUIRE(splits.size() == k_files);
@@ -448,7 +459,8 @@ TEST_CASE(
                                  /*table_filter_set*/ nullptr,
                                  /*partition_indices*/ {},
                                  /*approximate_batch_size*/ std::size_t{1} << 30,
-                                 /*max_file_processed*/ 1);
+                                 /*max_file_processed*/ 1,
+                                 sirius::scan_test_utils::make_test_gpu_ioctxs());
     auto probe_splits = drive_provider(probe);
     REQUIRE(probe_splits.size() == k_files);
     for (auto const& split : probe_splits) {
@@ -471,7 +483,8 @@ TEST_CASE(
                                   /*table_filter_set*/ nullptr,
                                   /*partition_indices*/ {},
                                   budget_bytes,
-                                  /*max_file_processed*/ k_files);  // one task covers all files
+                                  /*max_file_processed*/ k_files,  // one task covers all files
+                                  sirius::scan_test_utils::make_test_gpu_ioctxs());
 
   auto splits = drive_provider(provider);
   REQUIRE_FALSE(splits.empty());
@@ -531,7 +544,8 @@ TEST_CASE(
                                  /*table_filter_set*/ nullptr,
                                  /*partition_indices*/ {},
                                  /*approximate_batch_size*/ std::size_t{1} << 30,
-                                 /*max_file_processed*/ 1);
+                                 /*max_file_processed*/ 1,
+                                 sirius::scan_test_utils::make_test_gpu_ioctxs());
     auto probe_splits = drive_provider(probe);
     REQUIRE(probe_splits.size() == 1);
     whole_file_bytes = total_uncompressed_bytes(*probe_splits.front());
@@ -551,7 +565,8 @@ TEST_CASE(
                                   /*table_filter_set*/ nullptr,
                                   /*partition_indices*/ {},
                                   budget_bytes,
-                                  /*max_file_processed*/ 1);
+                                  /*max_file_processed*/ 1,
+                                  sirius::scan_test_utils::make_test_gpu_ioctxs());
 
   auto splits = drive_provider(provider);
   REQUIRE(splits.size() >= 2);  // must have flushed mid-file at least once

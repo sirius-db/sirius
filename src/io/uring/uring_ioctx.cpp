@@ -20,11 +20,14 @@
 
 namespace sirius::io {
 
-uring_ioctx::uring_ioctx(size_t n_reactors,
+uring_ioctx::uring_ioctx(unsigned host_ring_depth,
                          unsigned ring_entries,
-                         cucascade::memory::fixed_size_host_memory_resource& mr)
-  : templated_ioctx<uring_reactor>(
-      n_reactors, [&mr, ring_entries] { return std::make_unique<uring_reactor>(mr, ring_entries); })
+                         size_t n_reactors,
+                         size_t bounce_slot_size,
+                         int numa_node)
+  : templated_ioctx<uring_reactor>(n_reactors, [ring_entries, bounce_slot_size, numa_node] {
+      return std::make_unique<uring_reactor>(ring_entries, bounce_slot_size, numa_node);
+    })
 {
 }
 

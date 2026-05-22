@@ -21,16 +21,24 @@
 #include "scan_manager/split_provider.hpp"
 #include "sirius_config.hpp"
 
+// Per-GPU sirius_ioctx for routing parquet reads through io_uring
+// (sirius_datasource) instead of cudf's bundled kvikio-backed file_source.
+// <io/types.hpp> declares sirius_ioctx; the uring_io_object concrete type is
+// referenced only in the .cpp via <io/uring/uring_reactor.hpp> (LAST among
+// sirius headers — liburing's BLOCK_SIZE macro collides with
+// blockingconcurrentqueue).
 #include <duckdb/common/column_index.hpp>
 #include <duckdb/common/multi_file/multi_file_data.hpp>
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/vector.hpp>
+#include <io/types.hpp>
 
 #include <atomic>
 #include <cstddef>
 #include <functional>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace duckdb {
@@ -81,11 +89,25 @@ class parquet_split_provider : public split_provider {
    *                                partition.
    * @param max_file_processed      Maximum number of files handled by one
    *                                metadata task.
+   * @param gpu_ioctxs              Per-GPU sirius_ioctx instances indexed by
+   *                                device_id. Seeded by sirius_scan_manager
+   *                                from SiriusContext::get_gpu_ioctxs().
+   *                                Used in run_batch to construct
+   *                                sirius_datasources via
+   *                                ioctx->make_datasource(io_object) instead
+   *                                of cudf's bundled file_source factory —
+   *                                the latter routes through kvikio and
+   *                                bypasses the io_uring + per-GPU
+   *                                CUDA-context binding.
    */
-  /// Legacy overload: no @c scan_manager. Used by pre-existing #740-era
-  /// tests that construct the provider with no ioctx and expect the
-  /// @c cudf::io::datasource::create fallback for every file. @c _scan_manager
-  /// stays nullptr; @c run_batch falls through to cudf's own datasource.
+  /// No-scan_manager overload (dev #732 + tests). @c _scan_manager stays
+  /// nullptr; local reads route through @p gpu_ioctxs (per-GPU local backends,
+  /// injected by tests via @c make_test_gpu_ioctxs). When both @p gpu_ioctxs is
+  /// empty AND there is no scan_manager, @c run_batch throws (the cudf/kvikio
+  /// local file_source is forbidden under the multi-GPU model) — so this
+  /// overload requires a non-empty @p gpu_ioctxs. The @c cudf::io::datasource
+  /// fallback now only triggers when a scan_manager is wired but reports no
+  /// backend for a local path (e.g. @c use_sirius_datasource=false).
   parquet_split_provider(
     duckdb::vector<sirius::logical_type> const& returned_types,
     std::vector<std::string> const& file_paths,
@@ -96,7 +118,8 @@ class parquet_split_provider : public split_provider {
     duckdb::unique_ptr<duckdb::TableFilterSet> table_filter_set            = nullptr,
     duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices = {},
     std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE,
-    std::size_t max_file_processed     = DEFAULT_MAX_FILE_PROCESSED);
+    std::size_t max_file_processed     = DEFAULT_MAX_FILE_PROCESSED,
+    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs = {});
 
   /// @param scan_manager  Reference to the engine's @c sirius_scan_manager.
   ///                      Used for per-path ioctx dispatch via
@@ -110,17 +133,22 @@ class parquet_split_provider : public split_provider {
   ///                      @c file:// URI of any case, normalized to a bare
   ///                      path — with no backend falls back to
   ///                      @c cudf::io::datasource::create.
-  parquet_split_provider(duckdb::vector<sirius::logical_type> const& returned_types,
-                         std::vector<std::string> const& file_paths,
-                         duckdb::vector<duckdb::ColumnIndex> const& column_ids,
-                         duckdb::vector<duckdb::idx_t> const& projection_ids,
-                         duckdb::vector<std::string> const& names,
-                         std::size_t scan_output_arity,
-                         duckdb::unique_ptr<duckdb::TableFilterSet> table_filter_set,
-                         duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
-                         std::size_t approximate_batch_size,
-                         std::size_t max_file_processed,
-                         sirius_scan_manager& scan_manager);
+  /// @param gpu_ioctxs    Per-GPU sirius_ioctx map (dev #732). Forwarded for
+  ///                      the local-file footer/metadata planning read; the
+  ///                      S3 branch routes through @p scan_manager instead.
+  parquet_split_provider(
+    duckdb::vector<sirius::logical_type> const& returned_types,
+    std::vector<std::string> const& file_paths,
+    duckdb::vector<duckdb::ColumnIndex> const& column_ids,
+    duckdb::vector<duckdb::idx_t> const& projection_ids,
+    duckdb::vector<std::string> const& names,
+    std::size_t scan_output_arity,
+    duckdb::unique_ptr<duckdb::TableFilterSet> table_filter_set,
+    duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
+    std::size_t approximate_batch_size,
+    std::size_t max_file_processed,
+    sirius_scan_manager& scan_manager,
+    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs = {});
 
   ~parquet_split_provider() override;
 
@@ -142,17 +170,19 @@ class parquet_split_provider : public split_provider {
   /// scan_manager as a pointer lets the legacy (no-scan_manager) public
   /// ctor delegate with nullptr, falling through to
   /// @c cudf::io::datasource::create in @c run_batch.
-  parquet_split_provider(duckdb::vector<sirius::logical_type> const& returned_types,
-                         std::vector<std::string> const& file_paths,
-                         duckdb::vector<duckdb::ColumnIndex> const& column_ids,
-                         duckdb::vector<duckdb::idx_t> const& projection_ids,
-                         duckdb::vector<std::string> const& names,
-                         std::size_t scan_output_arity,
-                         duckdb::unique_ptr<duckdb::TableFilterSet> table_filter_set,
-                         duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
-                         std::size_t approximate_batch_size,
-                         std::size_t max_file_processed,
-                         sirius_scan_manager* scan_manager);
+  parquet_split_provider(
+    duckdb::vector<sirius::logical_type> const& returned_types,
+    std::vector<std::string> const& file_paths,
+    duckdb::vector<duckdb::ColumnIndex> const& column_ids,
+    duckdb::vector<duckdb::idx_t> const& projection_ids,
+    duckdb::vector<std::string> const& names,
+    std::size_t scan_output_arity,
+    duckdb::unique_ptr<duckdb::TableFilterSet> table_filter_set,
+    duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
+    std::size_t approximate_batch_size,
+    std::size_t max_file_processed,
+    sirius_scan_manager* scan_manager,
+    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs = {});
 
  private:
   struct file_batch {
@@ -182,13 +212,13 @@ class parquet_split_provider : public split_provider {
   /// build the provider without any scan_manager — production paths
   /// (@c create_provider_for) always set this to a live manager.
   sirius_scan_manager* _scan_manager{nullptr};
+  /// Per-GPU sirius_ioctx map (dev #732). Used for the local-file footer/
+  /// metadata planning read (any GPU's ioctx — footer reads are GPU-agnostic;
+  /// per-GPU column placement is decided downstream by task affinity). The S3
+  /// branch routes through @c _scan_manager instead.
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> _gpu_ioctxs;
 
-  /// Pre-decomposed file batches built once in the constructor; immutable
-  /// thereafter. Each callable returned by next_split_provider() processes
-  /// one entry.
   std::vector<file_batch> _batches;
-  /// Atomically incremented to claim the next batch index. Lets multiple
-  /// workers process distinct batches in parallel with no mutex.
   std::atomic<std::size_t> _next_batch_idx{0};
 };
 

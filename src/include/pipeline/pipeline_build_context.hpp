@@ -25,6 +25,13 @@ struct pipeline_build_context {
   //! Whether query results must preserve insertion order
   //! (from DuckDB's PreserveInsertionOrderSetting)
   bool preserve_insertion_order = true;
+
+  //! Number of GPUs available for partition-floor heuristics. Defaults to 1
+  //! (single-GPU). Set from sirius_engine's hardware topology at convert time;
+  //! enables sirius_pipeline_converter::configure_partition_min_partitions to
+  //! ensure big partition-consuming operators (hash_join, merge_group_by) get
+  //! at least num_gpus partitions to spread work across devices.
+  int num_gpus = 1;
 };
 
 }  // namespace sirius::pipeline

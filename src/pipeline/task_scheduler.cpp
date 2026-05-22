@@ -153,6 +153,11 @@ void task_scheduler::prepare_for_query(duckdb::shared_ptr<planner::query> query)
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->drain_leftover_tasks();
   }
+  // Reset the round-robin counter so the walk is reproducible across
+  // iterations of the same query (cache=table_gpu warm path keys cache
+  // entries by device_id; without this reset the second iteration's source
+  // tasks would assign to a different GPU and miss the cache entries).
+  _no_pref_rr_counter.store(0, std::memory_order_relaxed);
 
   auto scans = query->get_scan_operators();
   _scan_executor->prepare_cache_for_scan_operators(scans);
@@ -224,19 +229,57 @@ void task_scheduler::drain_after_error()
 void task_scheduler::management_eventloop()
 {
   while (_running.load()) {
-    auto request = _task_request_channel.get();
-    if (request == nullptr) {
-      SIRIUS_LOG_INFO("Task request channel closed, exiting management event loop.");
+    // Task-first: pop the next GPU pipeline task to dispatch.
+    // Scan tasks are routed directly to _scan_executor in schedule(), so
+    // all tasks in _task_queue are GPU pipeline tasks.
+    auto task = _task_queue.pop();
+    if (task == nullptr) {
+      SIRIUS_LOG_INFO("Task queue closed, exiting management event loop.");
       break;
     }
-    if (!request->is_scan) {
-      auto task = _task_queue.pop();
-      if (task == nullptr) {
-        SIRIUS_LOG_INFO("Task queue closed, exiting management event loop.");
-        break;
+
+    // Determine target GPU from task's data locality preference.
+    int target_device_id = _gpu_executors.begin()->first;
+    uint64_t task_id     = 0;
+    bool have_pref       = false;
+    if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
+      auto pref = gpu_task->get_preferred_device_id();
+      if (pref.has_value() && _gpu_executors.count(pref.value())) {
+        target_device_id = pref.value();
+        have_pref        = true;
       }
-      _gpu_executors.at(request->device_id)->schedule(std::move(task));
+      task_id = gpu_task->get_task_id();
     }
+    // Distribute preference-less source tasks (metadata-only parquet
+    // scans whose input batch has no GPU-resident memory_space) round-robin
+    // so they don't all pile onto begin(). NOTE: cached-pin scan tasks
+    // ARE preference-aware now — task_creator reads each
+    // scan_cached_operator_data's batch memory_space and sets
+    // preferred_device_id accordingly, so they take the have_pref branch
+    // above and stay on their chunk's home GPU. Downstream merge operators
+    // rely on lock_or_prepare_batch (batch_lock_utils.hpp) to convert
+    // cross-GPU input to the consumer's target memory space via
+    // cucascade::convert_gpu_to_gpu (peer-DMA where supported,
+    // host-staging on consumer hardware) — that fallback still applies
+    // for the residual preference-less cases.
+    if (!have_pref && _gpu_executors.size() > 1) {
+      auto idx =
+        _no_pref_rr_counter.fetch_add(1, std::memory_order_relaxed) % _gpu_executors.size();
+      auto it = _gpu_executors.begin();
+      std::advance(it, idx);
+      target_device_id = it->first;
+    }
+
+    SIRIUS_LOG_DEBUG("management_eventloop: routing task to GPU {}", target_device_id);
+    // Log prefix "[mgpu-audit] pipeline_task dispatched to GPU N" is
+    // load-bearing — verification greps depend on it.
+    SIRIUS_LOG_INFO(
+      "[mgpu-audit] pipeline_task dispatched to GPU {} task_id={}", target_device_id, task_id);
+    // At-capacity tasks stay in the preferred executor's queue rather than
+    // spilling to another GPU — preserves data locality at the cost of higher
+    // tail latency. Capacity control happens in gpu_pipeline_executor; this is
+    // an enqueue, not a dispatch.
+    _gpu_executors.at(target_device_id)->schedule(std::move(task));
   }
 }
 

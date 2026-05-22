@@ -87,7 +87,7 @@ bool is_gpu_tier(cucascade::data_batch& batch, const char* func_name)
   return true;
 }
 
-// STATS-02: Classify types eligible for statistics computation.
+// Classify types eligible for statistics computation.
 // BOOL8 is explicitly excluded even though cudf::is_numeric(BOOL8) returns true.
 bool is_stats_numeric(cudf::type_id id)
 {
@@ -106,7 +106,7 @@ bool is_stats_numeric(cudf::type_id id)
   }
 }
 
-// Determine widened output type for SUM to prevent overflow (Pitfall 3, Pitfall 6).
+// Determine widened output type for SUM to prevent overflow.
 cudf::data_type sum_output_type(cudf::type_id id)
 {
   switch (id) {
@@ -163,32 +163,32 @@ std::string scalar_to_string(cudf::scalar const& s,
     }
     case cudf::type_id::FLOAT32: {
       auto val = static_cast<cudf::numeric_scalar<float> const&>(s).value(stream);
-      return fmt::format("{:g}", val);  // D-04
+      return fmt::format("{:g}", val);
     }
     case cudf::type_id::FLOAT64: {
       auto val = static_cast<cudf::numeric_scalar<double> const&>(s).value(stream);
-      return fmt::format("{:g}", val);  // D-04
+      return fmt::format("{:g}", val);
     }
     default: return "?";
   }
 }
 
 // ---------------------------------------------------------------------------
-// Decimal formatting helpers (D-04, D-05)
+// Decimal formatting helpers
 // ---------------------------------------------------------------------------
 
 // Format DECIMAL32/DECIMAL64 raw integer with fixed-point decimal placement.
-// Uses unsigned magnitude to handle INT_MIN / INT64_MIN correctly (T-03-03).
+// Uses unsigned magnitude to handle INT_MIN / INT64_MIN correctly.
 template <typename T>
 std::string format_decimal_value(T raw, int abs_scale)
 {
   if (abs_scale == 0) { return fmt::format("{}", raw); }
   bool negative = raw < 0;
-  // Cast to unsigned BEFORE negation to avoid UB on MIN values (T-03-03)
+  // Cast to unsigned BEFORE negation to avoid UB on MIN values
   using U            = std::make_unsigned_t<T>;
   U magnitude        = negative ? static_cast<U>(0) - static_cast<U>(raw) : static_cast<U>(raw);
   std::string digits = fmt::format("{}", magnitude);
-  // Pad with leading zeros if digit count <= abs_scale (Pitfall 4: 5 with scale=2 -> "0.05")
+  // Pad with leading zeros if digit count <= abs_scale (e.g. 5 with scale=2 -> "0.05")
   while (digits.size() <= static_cast<std::size_t>(abs_scale)) {
     digits.insert(digits.begin(), '0');
   }
@@ -198,7 +198,7 @@ std::string format_decimal_value(T raw, int abs_scale)
 }
 
 // Format DECIMAL128 (__int128_t) raw integer with fixed-point decimal placement.
-// Manual int128-to-string because fmt has no __int128_t formatter (Pitfall 2).
+// Manual int128-to-string because fmt has no __int128_t formatter.
 std::string format_decimal128_value(__int128_t raw, int abs_scale)
 {
   bool negative = raw < 0;
@@ -236,7 +236,7 @@ std::string format_decimal128_value(__int128_t raw, int abs_scale)
 
 // Howard Hinnant's civil_from_days algorithm (public domain).
 // Converts days since Unix epoch (1970-01-01) to calendar date.
-// Handles negative days (pre-1970) correctly via floor division (Pitfall 5).
+// Handles negative days (pre-1970) correctly via floor division.
 struct civil_date {
   int year;
   unsigned month;
@@ -262,7 +262,7 @@ civil_date civil_from_days(int32_t days_since_epoch)
 // Format TIMESTAMP_SECONDS (int64_t seconds since epoch)
 std::string format_timestamp_s(int64_t raw_s)
 {
-  // Floor division for days (Pitfall 5: negative timestamps)
+  // Floor division for days to handle negative timestamps correctly
   int32_t days       = static_cast<int32_t>((raw_s >= 0) ? raw_s / 86400 : (raw_s - 86399) / 86400);
   int seconds_in_day = static_cast<int>(raw_s - static_cast<int64_t>(days) * 86400);
   auto [y, m, d]     = civil_from_days(days);
@@ -354,7 +354,7 @@ std::string format_timestamp_ns(int64_t raw_ns)
   return result;
 }
 
-// Format TIMESTAMP_DAYS (int32_t days since epoch) as YYYY-MM-DD only (D-07)
+// Format TIMESTAMP_DAYS (int32_t days since epoch) as YYYY-MM-DD only
 std::string format_date_days(int32_t raw_days)
 {
   auto [y, m, d] = civil_from_days(raw_days);
@@ -803,7 +803,7 @@ void debug_head(cucascade::data_batch& batch,
 
     auto num_cols = tv.num_columns();
 
-    // D-13: Empty batch handling
+    // Empty batch handling
     if (tv.num_rows() == 0) {
       std::string output;
       output += fmt::format(
@@ -813,10 +813,10 @@ void debug_head(cucascade::data_batch& batch,
       return;
     }
 
-    // D-12: Clamp N to actual row count
+    // Clamp N to actual row count
     auto keep = std::min(n, tv.num_rows());
 
-    // HEAD-03: cudf::slice for zero-copy row selection
+    // cudf::slice for zero-copy row selection
     cudf::table_view sliced_tv = tv;
     if (keep < tv.num_rows()) {
       auto slices = cudf::slice(tv, {0, keep}, stream);
@@ -870,14 +870,14 @@ void debug_stats(cucascade::data_batch& batch,
                           tv.num_rows(),
                           num_cols);
 
-    // D-13: Empty batch
+    // Empty batch
     if (tv.num_rows() == 0) {
       output += "[SIRIUS_DIAG]   (empty batch)\n";
       SIRIUS_LOG_DEBUG("{}", output);
       return;
     }
 
-    // D-07: Summary table format consistent with debug_schema
+    // Summary table format consistent with debug_schema
     output += fmt::format("[SIRIUS_DIAG]   {:<6s} {:<20s} {:<15s} {:>15s} {:>15s} {:>15s}\n",
                           "idx",
                           "name",
@@ -912,15 +912,15 @@ void debug_stats(cucascade::data_batch& batch,
         continue;
       }
 
-      // STATS-03: Use cudf::minmax for combined min+max (1 kernel launch)
+      // Use cudf::minmax for combined min+max (1 kernel launch)
       auto [min_scalar, max_scalar] = cudf::minmax(col, stream);
 
-      // Use cudf::reduce for SUM with widened output type (Pitfall 3)
+      // Use cudf::reduce for SUM with widened output type
       auto sum_agg    = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
       auto sum_type   = sum_output_type(col.type().id());
       auto sum_scalar = cudf::reduce(col, *sum_agg, sum_type, stream);
 
-      // D-10: All-NULL columns show NULL
+      // All-NULL columns show NULL
       std::string min_str = scalar_to_string(*min_scalar, col.type(), stream);
       std::string max_str = scalar_to_string(*max_scalar, col.type(), stream);
       std::string sum_str = scalar_to_string(*sum_scalar, sum_type, stream);
@@ -981,7 +981,7 @@ void debug_checksum(cucascade::data_batch& batch,
       auto nc = col.null_count();
       if (nc < 0) { nc = 0; }
 
-      // Pitfall 6 / T-03-05: Empty or all-NULL column
+      // Empty or all-NULL column
       if (col.size() == 0 || nc == col.size()) {
         output += fmt::format("[SIRIUS_DIAG]   {} checksum: 0x{:016X} nulls={}\n",
                               name,
@@ -1046,7 +1046,7 @@ void debug_diff(cucascade::data_batch& batch_a,
       tv_a.num_rows(),
       tv_b.num_rows());
 
-    // D-06 / DIFF-02: Schema mismatch check — column count
+    // Schema mismatch check — column count
     if (tv_a.num_columns() != tv_b.num_columns()) {
       output +=
         fmt::format("[SIRIUS_DIAG]   schema mismatch: batch_a has {} cols, batch_b has {} cols\n",
@@ -1058,7 +1058,7 @@ void debug_diff(cucascade::data_batch& batch_a,
 
     auto num_cols = tv_a.num_columns();
 
-    // D-06 / DIFF-02: Schema mismatch check — column types
+    // Schema mismatch check — column types
     bool type_mismatch = false;
     for (cudf::size_type c = 0; c < num_cols; ++c) {
       if (tv_a.column(c).type() != tv_b.column(c).type()) {
@@ -1077,7 +1077,7 @@ void debug_diff(cucascade::data_batch& batch_a,
       return;
     }
 
-    // D-06 / DIFF-03: Row count mismatch
+    // Row count mismatch
     if (tv_a.num_rows() != tv_b.num_rows()) {
       output += fmt::format(
         "[SIRIUS_DIAG]   row count mismatch: batch_a has {} rows, batch_b has {} rows\n",
@@ -1089,7 +1089,7 @@ void debug_diff(cucascade::data_batch& batch_a,
 
     auto num_rows = tv_a.num_rows();
 
-    // D-03 / DIFF-05 / T-04-01: Row limit guard to prevent OOM
+    // Row limit guard to prevent OOM
     if (num_rows > max_rows) {
       output +=
         fmt::format("[SIRIUS_DIAG]   row count {} exceeds limit {}, skipping value comparison\n",
@@ -1099,7 +1099,7 @@ void debug_diff(cucascade::data_batch& batch_a,
       return;
     }
 
-    // D-04 / DIFF-01 / DIFF-04: Per-column host-side value comparison
+    // Per-column host-side value comparison
     bool all_identical = true;
     for (cudf::size_type c = 0; c < num_cols; ++c) {
       auto const& col_a = tv_a.column(c);
@@ -1300,7 +1300,7 @@ void debug_sample(cucascade::data_batch& batch,
       return;
     }
 
-    // T-04-02: Clamp N to batch size
+    // Clamp N to batch size
     auto keep = std::min(n, tv.num_rows());
     if (keep <= 0) { return; }
 

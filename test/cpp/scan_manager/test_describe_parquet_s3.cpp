@@ -11,13 +11,14 @@
 #include "io/s3/sirius_sigv4_credential_provider.hpp"
 #include "scan_manager/parquet_metadata.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
-
-#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
-#include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
+#include "sirius_config.hpp"
+#include "sirius_context.hpp"
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
@@ -37,8 +38,10 @@ namespace {
 
 using namespace std::chrono_literals;
 
-constexpr std::size_t one_mib         = 1ULL << 20;
-constexpr std::size_t one_hundred_mib = 100ULL << 20;
+constexpr std::size_t one_mib           = 1ULL << 20;
+constexpr std::size_t one_hundred_mib   = 100ULL << 20;
+constexpr std::uint32_t cache_max_slabs = 3;
+constexpr std::size_t cache_block_size  = 4096;
 
 std::string env_or(std::string_view name, std::string fallback = {})
 {
@@ -101,26 +104,6 @@ std::size_t cache_capacity_bytes(std::size_t block_size, std::uint32_t max_slabs
          static_cast<std::size_t>(max_slabs);
 }
 
-struct host_cache_memory {
-  static constexpr std::uint32_t max_slabs = 3;
-  static constexpr std::size_t block_size  = 4096;
-
-  host_cache_memory()
-    : upstream(0, true),
-      host_mr(0,
-              upstream,
-              cache_capacity_bytes(block_size, max_slabs),
-              cache_capacity_bytes(block_size, max_slabs),
-              block_size,
-              static_cast<std::size_t>(buffer_pool::CHUNKS_PER_SLAB),
-              1)
-  {
-  }
-
-  cucascade::memory::numa_region_pinned_host_memory_resource upstream;
-  cucascade::memory::fixed_size_host_memory_resource host_mr;
-};
-
 s3_ioctx_config make_s3_config(s3_test_env const& env)
 {
   static_credentials creds;
@@ -139,9 +122,7 @@ s3_ioctx_config make_s3_config(s3_test_env const& env)
   return cfg;
 }
 
-sirius_scan_manager make_s3_manager(s3_test_env const& env,
-                                    cucascade::memory::fixed_size_host_memory_resource* host_mr,
-                                    bool enable_cache)
+scan_manager_config make_s3_scan_manager_config(s3_test_env const& env, bool enable_cache)
 {
   scan_manager_config cfg{};
   cfg.use_sirius_datasource             = true;
@@ -150,11 +131,48 @@ sirius_scan_manager make_s3_manager(s3_test_env const& env,
   cfg.s3_thread_pool.num_threads        = 4;
   cfg.s3_thread_pool.thread_name_prefix = "pr6_s3";
   cfg.enable_prefetch_cache             = enable_cache;
-  cfg.prefetch_buffer_pool_bytes =
-    cache_capacity_bytes(host_cache_memory::block_size, host_cache_memory::max_slabs);
-  cfg.prefetch_inflight_budget_chunks = 8;
-  return sirius_scan_manager(std::move(cfg), host_mr);
+  cfg.prefetch_buffer_pool_bytes        = cache_capacity_bytes(cache_block_size, cache_max_slabs);
+  cfg.prefetch_inflight_budget_chunks   = 8;
+  return cfg;
 }
+
+sirius::sirius_config make_context_config(std::string_view filename = "integration_s3cache.yaml")
+{
+  auto const config_path =
+    std::filesystem::path(__FILE__).parent_path().parent_path() / "integration" / filename;
+  sirius::sirius_config cfg{};
+  cfg.load_from_file(config_path);
+  REQUIRE_FALSE(cfg.get_memory_space_configs().empty());
+  return cfg;
+}
+
+class describe_parquet_context {
+ public:
+  describe_parquet_context(s3_test_env const& env, bool enable_cache)
+  {
+    auto cfg = make_context_config();
+    cfg.set_scan_manager_config(make_s3_scan_manager_config(env, enable_cache));
+    context.initialize(cfg);
+    initialized_ = true;
+  }
+
+  ~describe_parquet_context()
+  {
+    if (!initialized_) { return; }
+    try {
+      context.terminate();
+    } catch (...) {
+    }
+  }
+
+  describe_parquet_context(describe_parquet_context const&)            = delete;
+  describe_parquet_context& operator=(describe_parquet_context const&) = delete;
+
+  duckdb::SiriusContext context;
+
+ private:
+  bool initialized_{false};
+};
 
 }  // namespace
 
@@ -174,8 +192,8 @@ TEST_CASE("describe_parquet surfaces S3 missing-object errors cleanly", "[s3][de
   auto env = read_s3_test_env();
   if (skip_if_no_s3_env(env)) { return; }
 
-  host_cache_memory memory;
-  auto manager   = make_s3_manager(*env, &memory.host_mr, false);
+  describe_parquet_context fixture(*env, false);
+  auto& manager  = fixture.context.get_scan_manager();
   auto const uri = s3_uri(env->bucket, "parquet/definitely-missing-pr6-object.parquet");
 
   REQUIRE_THROWS_WITH(manager.describe_parquet(uri), Catch::Contains("404"));
@@ -186,8 +204,8 @@ TEST_CASE("describe_parquet fetches only the footer over S3", "[s3][describe_par
   auto env = read_s3_test_env();
   if (skip_if_no_s3_env(env)) { return; }
 
-  host_cache_memory memory;
-  auto manager   = make_s3_manager(*env, &memory.host_mr, false);
+  describe_parquet_context fixture(*env, false);
+  auto& manager  = fixture.context.get_scan_manager();
   auto const key = env_or("SIRIUS_PR6_LARGE_S3_KEY", "parquet/lineitem.parquet");
   auto const uri = s3_uri(env->bucket, key);
 
@@ -215,8 +233,8 @@ TEST_CASE("describe_parquet inserts parsed parquet metadata into the prefetch ca
   auto env = read_s3_test_env();
   if (skip_if_no_s3_env(env)) { return; }
 
-  host_cache_memory memory;
-  auto manager   = make_s3_manager(*env, &memory.host_mr, true);
+  describe_parquet_context fixture(*env, true);
+  auto& manager  = fixture.context.get_scan_manager();
   auto const uri = s3_uri(env->bucket, "parquet/nation.parquet");
   auto bind_info = manager.describe_parquet(uri);
   auto* base_ctx = manager.io_ctx_for(uri);
@@ -242,8 +260,8 @@ TEST_CASE("describe_parquet exposes the parquet footer row count for planner met
   auto env = read_s3_test_env();
   if (skip_if_no_s3_env(env)) { return; }
 
-  host_cache_memory memory;
-  auto manager   = make_s3_manager(*env, &memory.host_mr, true);
+  describe_parquet_context fixture(*env, true);
+  auto& manager  = fixture.context.get_scan_manager();
   auto const uri = s3_uri(env->bucket, "parquet/orders.parquet");
 
   auto bind_info = manager.describe_parquet(uri);

@@ -245,6 +245,14 @@ std::pair<int, uint64_t> sirius_physical_partition::determine_num_partitions()
     }
   }
   int num_partitions = static_cast<int>(std::max(uint64_t{1}, total_bytes / s_partition_size));
+  // Multi-GPU floor: if the input is big enough to justify using the second
+  // GPU, force at least num_gpus partitions so partition-based operators
+  // (hash_join, merge_group_by) get work on every GPU. Below the small-table
+  // threshold we keep num_partitions at its natural value — tiny tables run
+  // on a single GPU to avoid cross-device overhead.
+  if (_min_num_partitions > 1 && total_bytes >= _small_table_bytes) {
+    num_partitions = std::max(num_partitions, _min_num_partitions);
+  }
   return std::make_pair(num_partitions, total_bytes);
 }
 
@@ -295,7 +303,24 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
     if (!_num_partitions.has_value()) {
       auto [num_parts, total_bytes] = determine_num_partitions();
       auto& hash_join               = _hash_join_op->Cast<sirius_physical_hash_join>();
-      hash_join.update_join_exec_mode(num_parts, total_bytes);
+      // BUILD_PROBE mode requires the build side to deliver exactly one
+      // batch at runtime. The only mechanism that guarantees that is the
+      // build-side CONCAT with concat_all enabled. Detect whether either
+      // partition has a build-side CONCAT downstream BEFORE asking the
+      // join to consider BUILD_PROBE — without this gate, a small build
+      // side with no downstream CONCAT would enter BUILD_PROBE and then
+      // throw at runtime in get_next_task_input_data_for_build_probe when
+      // size(0) != 1.
+      auto has_build_concat = [](sirius_physical_operator& part_op) {
+        for (auto& next_port : part_op.get_next_ports_after_sink()) {
+          if (next_port.next_operator->type != SiriusPhysicalOperatorType::CONCAT) { continue; }
+          auto& concat = next_port.next_operator->Cast<sirius_physical_concat>();
+          if (concat.is_build_concat()) { return true; }
+        }
+        return false;
+      };
+      bool const build_foldable = has_build_concat(*this) || has_build_concat(sibling);
+      hash_join.update_join_exec_mode(num_parts, total_bytes, build_foldable);
       if (_hash_join_op->type == SiriusPhysicalOperatorType::HASH_JOIN &&
           hash_join.is_build_probe_mode()) {
         // Either sibling may run this block first; configure the build-side CONCAT only.

@@ -17,6 +17,7 @@
 #pragma once
 
 // sirius
+#include <io/types.hpp>
 #include <op/scan/hive_partition.hpp>
 #include <op/scan/parquet_scan_operator_data.hpp>
 #include <op/sirius_physical_operator.hpp>
@@ -28,6 +29,7 @@
 // standard library
 #include <memory>
 #include <optional>
+#include <unordered_map>
 
 namespace sirius::scan_manager {
 class split_connector;
@@ -36,7 +38,7 @@ class sirius_scan_manager;
 
 namespace sirius::op::scan {
 
-struct parquet_scan_info;
+struct scan_info;
 
 //===----------------------------------------------------------------------===//
 // Parquet scan operator
@@ -45,13 +47,14 @@ struct parquet_scan_info;
  * @brief Operator that reads parquet byte ranges for a batch of row groups and produces
  *        gpu_table_representation data batches for downstream GPU operators.
  *
- * The operator carries a parquet_scan_info populated by the pipeline converter; the
- * scan_manager reads it during prepare_for_query to construct a parquet_split_provider
- * for this operator. Splits — one parquet_scan_data per row-group partition — are
- * pushed into the operator's bound split_connector by the provider on the scan_manager
- * thread pool. The operator pulls splits via get_next_task_input_data(), which blocks
- * inside split_connector::get_next_split until a split arrives or the connector is
- * closed.
+ * The operator carries a scan_info (populated by the pipeline converter as a concrete
+ * subclass — parquet_scan_info today). The scan_manager reads it during prepare_for_query,
+ * checks for a pinned-cache match against the scan_info's common fields, and otherwise
+ * dispatches through scan_info::make_provider() to build the format's split_provider.
+ * Splits — one parquet_scan_data per row-group partition — are pushed into the operator's
+ * bound split_connector by the provider on the scan_manager thread pool. The operator
+ * pulls splits via get_next_task_input_data(), which blocks inside
+ * split_connector::get_next_split until a split arrives or the connector is closed.
  */
 class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
  public:
@@ -66,9 +69,16 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
    */
   sirius_gpu_parquet_scan_operator(duckdb::vector<sirius::logical_type> types,
                                    duckdb::idx_t estimated_cardinality,
-                                   std::unique_ptr<parquet_scan_info> scan_info);
+                                   std::unique_ptr<scan_info> scan_info);
 
   ~sirius_gpu_parquet_scan_operator() override;
+
+  /// @brief Inject the per-GPU sirius_ioctx map produced by SiriusContext::initialize()
+  ///        and held by sirius_scan_manager. Called by create_provider_for(...) before
+  ///        the operator is first executed.
+  /// @details Used by read_table_from_metadata() to select the per-chunk ioctx via
+  ///          scan_data.gpu_memory_space->get_device_id().
+  void set_gpu_ioctxs(std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> ioctxs);
 
   //===----------Source interface----------===//
   bool is_source() const override { return true; }
@@ -139,7 +149,7 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
 
   /// \brief Take ownership of the bind-data so the scan_manager's factory can build a
   ///        split provider. Called once per query; subsequent calls return nullptr.
-  std::unique_ptr<parquet_scan_info> take_scan_info();
+  std::unique_ptr<scan_info> take_scan_info();
 
   /// \brief Install the split connector that the scan_manager will feed.
   void set_split_connector(std::unique_ptr<scan_manager::split_connector> connector);
@@ -149,7 +159,14 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
 
   //===----------Fields----------===//
   std::unique_ptr<scan_manager::split_connector> _split_connector;
-  std::unique_ptr<parquet_scan_info> _scan_info;
+  std::unique_ptr<scan_info> _scan_info;
+
+  // Per-GPU ioctx map for ioctx->make_datasource(uring_io_object) routing in
+  // read_table_from_metadata. Populated by set_gpu_ioctxs(); empty until
+  // sirius_scan_manager::create_provider_for() injects it (the operator can
+  // be constructed before SiriusContext is available — set_gpu_ioctxs is
+  // mandatory before the first execute()).
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> _gpu_ioctxs;
 };
 
 }  // namespace sirius::op::scan

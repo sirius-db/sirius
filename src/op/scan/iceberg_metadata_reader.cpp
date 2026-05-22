@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 
+#include "io/io_context.hpp"
+#include "io/types.hpp"
+
 #include <cudf/concatenate.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/parquet.hpp>
@@ -203,12 +206,25 @@ struct equality_delete_read_result {
  *
  * Also reads the parquet footer to extract Iceberg field IDs for each key
  * column, enabling schema-evolution-safe matching against data files.
+ *
+ * Routes both cudf::io::read_parquet (table) and cudf::io::read_parquet_footers
+ * (field-id extraction) through the supplied single-GPU sirius_ioctx. The
+ * caller MUST provide a non-null ioctx — the kvikio bypass path is forbidden.
  */
-equality_delete_read_result read_equality_delete_file(std::string const& delete_file_path)
+equality_delete_read_result read_equality_delete_file(std::string const& delete_file_path,
+                                                      sirius::io::sirius_ioctx& ioctx)
 {
   auto stream = cudf::get_default_stream();
+
+  // Both the read_parquet (table data) AND the read_parquet_footers (field-id
+  // extraction) share the same uring_io_object + sirius_datasource — the
+  // io_object opens 2 fds (O_RDONLY + O_RDONLY|O_DIRECT) so reusing avoids
+  // reopening for the footer pass.
+  auto io_object  = ioctx.create_io_object(delete_file_path);
+  auto datasource = ioctx.make_datasource(io_object);
+
   auto opts =
-    cudf::io::parquet_reader_options::builder(cudf::io::source_info{delete_file_path}).build();
+    cudf::io::parquet_reader_options::builder(cudf::io::source_info{datasource.get()}).build();
   auto result = cudf::io::read_parquet(opts, stream);
 
   if (!result.tbl) {
@@ -224,9 +240,13 @@ equality_delete_read_result read_equality_delete_file(std::string const& delete_
   // Extract Iceberg field IDs from the parquet footer schema.
   std::vector<std::optional<int32_t>> field_ids;
   try {
-    auto ds = cudf::io::datasource::create(delete_file_path);
+    // Reuse the same datasource pointer for the footer pass — datasource and
+    // io_object MUST outlive both reads. Both calls are synchronous so by
+    // function exit both io_object and datasource are dropped together; the
+    // function returns by-value (result.tbl, col_names, field_ids) and
+    // doesn't retain any handle.
     std::vector<std::unique_ptr<cudf::io::datasource>> sources;
-    sources.push_back(std::move(ds));
+    sources.push_back(std::move(datasource));
     auto footers = cudf::io::read_parquet_footers(sources);
 
     if (!footers.empty()) {
@@ -342,6 +362,7 @@ EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
 /// This matches DuckDB's approach: each group has exactly one sequence number,
 /// so the scan-time check is a simple CPU comparison (no extra GPU work).
 void materialize_equality_deletes(std::vector<IcebergDeleteFileEntry> const& eq_entries,
+                                  sirius::io::sirius_ioctx& ioctx,
                                   IcebergDeleteData& data)
 {
   if (eq_entries.empty()) return;
@@ -362,7 +383,7 @@ void materialize_equality_deletes(std::vector<IcebergDeleteFileEntry> const& eq_
     SIRIUS_LOG_DEBUG("[iceberg] Reading equality-delete file: {} (seq={})",
                      eq_entry.file_path,
                      eq_entry.sequence_number);
-    auto read_result = read_equality_delete_file(eq_entry.file_path);
+    auto read_result = read_equality_delete_file(eq_entry.file_path, ioctx);
 
     // Find existing group with same column names AND same sequence number.
     FileGroup* target = nullptr;
@@ -403,9 +424,16 @@ void materialize_equality_deletes(std::vector<IcebergDeleteFileEntry> const& eq_
 std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
   duckdb::ClientContext& context,
   std::string const& table_path,
+  std::shared_ptr<sirius::io::sirius_ioctx> metadata_ioctx,
   std::optional<uint64_t> snapshot_id)
 {
   auto data = std::make_shared<IcebergDeleteData>();
+
+  if (!metadata_ioctx) {
+    throw std::invalid_argument(
+      "[iceberg] read_iceberg_delete_data: metadata_ioctx is null (kvikio path is forbidden; "
+      "caller must provide a sirius_ioctx).");
+  }
 
   try {
     // Single-pass discovery: reads manifest list once, each manifest once.
@@ -425,7 +453,7 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
     }
     if (has_eq_deletes) {
       data->data_file_sequence_numbers = std::move(discovery.data_file_sequence_numbers);
-      materialize_equality_deletes(discovery.equality_delete_entries, *data);
+      materialize_equality_deletes(discovery.equality_delete_entries, *metadata_ioctx, *data);
     }
 
   } catch (std::exception const& e) {

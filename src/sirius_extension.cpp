@@ -26,6 +26,7 @@
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/types.hpp>
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 
 #include <cucascade/data/cpu_data_representation.hpp>
@@ -70,7 +71,21 @@ extern "C" int cudaProfilerStop();
 #include "sirius_sql_rewrite.hpp"
 #include "util/segfault_backtrace.hpp"
 
+// PinTableFunction routes parquet reads through the per-GPU sirius_ioctx
+// instead of cudf's bundled file_source factory (which uses kvikio internally
+// and binds to a single CUDA context).
+//
+// Ordering rule: include uring_reactor LAST among sirius headers — liburing.h
+// transitively pulled by uring_reactor.hpp defines a BLOCK_SIZE preprocessor
+// macro that collides with the BLOCK_SIZE static member in
+// <blockingconcurrentqueue.h> (used by spdlog / pipeline / duckdb
+// connection_manager). All consumers of blockingconcurrentqueue.h must
+// precede this include.
+#include "io/types.hpp"                // sirius::io::sirius_ioctx
+#include "io/uring/uring_reactor.hpp"  // sirius::io::uring_io_object
+
 #include <cstdlib>
+#include <unordered_map>
 
 namespace duckdb {
 
@@ -791,28 +806,51 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
 
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) {
-    std::cerr << "what the fuck is going on" << std::endl;
     throw InvalidInputException("pin_table requires the Sirius context to be initialized");
   }
 
-  // The cudf reader always places tables on GPU. For tier='gpu' we hand the GPU columns
-  // straight to the scan_manager. For tier='host' we additionally convert each table to
-  // a host_data_representation (via the GPU↔HOST converter) so the pinned data lives in
-  // pinned host memory instead of GPU memory.
+  // The cudf reader places parquet chunks on whichever GPU is current at
+  // read_chunk() time; round-robin the file reads across all GPU memory spaces
+  // so multi-file pin_table calls distribute their chunks evenly. Each file's
+  // chunks all bind to the same GPU (per-file binding — see comment at
+  // chunk_idx increment below). For tier='host' we additionally convert each
+  // table to a host_data_representation (via the GPU↔HOST converter) so the
+  // pinned data lives in pinned host memory.
   auto& memory_manager = sirius_ctx->get_memory_manager();
   auto gpu_spaces      = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   if (gpu_spaces.empty()) {
     throw InvalidInputException("pin_table: no GPU memory space available");
   }
-  auto& gpu_mem_space = const_cast<cucascade::memory::memory_space&>(*gpu_spaces[0]);
 
-  cucascade::memory::memory_space* host_mem_space = nullptr;
+  // For host tier, build a target_gpu_id -> NUMA-local host memory_space map.
+  // Each round-robin GPU's host conversion should pin its data on the host
+  // memory_space whose NUMA node matches the GPU. Fall back to host_spaces[0]
+  // when the GPU's NUMA node is unknown or no matching host space exists.
+  std::unordered_map<int, cucascade::memory::memory_space*> host_space_by_gpu;
   if (data.args.tier == "host") {
     auto host_spaces = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
     if (host_spaces.empty()) {
       throw InvalidInputException("pin_table: no HOST memory space available");
     }
-    host_mem_space = const_cast<cucascade::memory::memory_space*>(host_spaces[0]);
+    auto* fallback_host = const_cast<cucascade::memory::memory_space*>(host_spaces[0]);
+    auto const& topo    = sirius_ctx->get_config().get_hw_topology();
+    for (auto const* gpu_space : gpu_spaces) {
+      int const gpu_id = gpu_space->get_device_id();
+      int numa_node    = -1;
+      if (static_cast<size_t>(gpu_id) < topo.gpus.size()) {
+        numa_node = topo.gpus[gpu_id].numa_node;
+      }
+      cucascade::memory::memory_space* picked = fallback_host;
+      if (numa_node >= 0) {
+        for (auto* hs : host_spaces) {
+          if (hs->get_device_id() == numa_node) {
+            picked = const_cast<cucascade::memory::memory_space*>(hs);
+            break;
+          }
+        }
+      }
+      host_space_by_gpu[gpu_id] = picked;
+    }
   }
 
   // Glob the user-supplied path into concrete files.
@@ -847,68 +885,134 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   std::size_t const chunk_read_limit =
     sirius_ctx->get_config().get_operator_params().scan_task_batch_size;
 
-  // Read all files through a single cudf::chunked_parquet_reader. cudf concatenates the
-  // sources internally and emits batches each within chunk_read_limit bytes; the optional
-  // n_rows budget caps the cumulative row count across files.
-  cudf::io::parquet_reader_options opts =
-    cudf::io::parquet_reader_options::builder(cudf::io::source_info{file_paths}).build();
-  if (!cols.empty()) { opts.set_column_names(cols); }
-  if (data.args.n_rows.has_value()) { opts.set_num_rows(data.args.n_rows.value()); }
-
-  std::vector<std::unique_ptr<cudf::table>> tables;                               // tier='gpu'
-  std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;  // tier='host'
-  std::vector<std::string> read_column_names;
+  // Read each file via cudf::chunked_parquet_reader so each emitted batch stays within
+  // chunk_read_limit bytes. The optional n_rows budget caps the cumulative row count
+  // across files; once exhausted, stop early.
+  std::vector<std::unique_ptr<cudf::table>> tables;
+  // Parallel vector to tables — chunk_memory_spaces[i] is the memory_space*
+  // for the i-th cudf::table in tables. Consumed by insert_pinned_entry's
+  // precondition check (size==data_tables.size).
+  std::vector<cucascade::memory::memory_space*> chunk_memory_spaces;
+  // HOST-tier storage: one host_data_representation per chunk.
+  std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;
+  std::vector<std::string> read_column_names;  // captured from parquet metadata
+  int64_t remaining_rows = data.args.n_rows.value_or(-1);
+  // Per-call local counter (NOT std::atomic, NOT global). PinTableFunction is
+  // single-threaded; new pin_table calls restart at chunk 0 → GPU 0 for
+  // reproducibility.
+  std::size_t chunk_idx = 0;
 
   // For tier='host' the full table may not fit in GPU memory, so each batch is downgraded
   // to a pinned host_data_representation immediately and the GPU buffers are released
   // before the next read_chunk(). The GPU↔HOST converter uses cudaMemcpyBatchAsync which
-  // requires a real, non-default stream.
+  // requires a real, non-default stream. Streams are constructed lazily inside the
+  // per-file loop under the device guard so each cuda_stream binds to its target GPU's
+  // context — a single pre-created stream binds to whichever device was current when
+  // emplaced and would route D2H copies through the wrong device for round-robin files
+  // that land on GPU 1+.
   cucascade::representation_converter_registry* registry_ptr = nullptr;
-  std::optional<rmm::cuda_stream> pin_stream;
-  rmm::cuda_stream_view stream_view{};
-  if (data.args.tier == "host") {
-    registry_ptr = &sirius::converter_registry::get();
-    pin_stream.emplace();
-    stream_view = pin_stream->view();
-  }
+  std::unordered_map<int, rmm::cuda_stream> pin_streams_by_gpu;
+  if (data.args.tier == "host") { registry_ptr = &sirius::converter_registry::get(); }
 
-  if (!file_paths.empty()) {
-    cudf::io::chunked_parquet_reader reader(chunk_read_limit, opts);
+  for (auto const& path : file_paths) {
+    if (data.args.n_rows.has_value() && remaining_rows <= 0) { break; }
+
+    // Bind device BEFORE constructing chunked_parquet_reader so the cudf
+    // allocator places footer + decompress + column buffers on the intended
+    // GPU.
+    auto* target_space =
+      const_cast<cucascade::memory::memory_space*>(gpu_spaces[chunk_idx % gpu_spaces.size()]);
+    int target_gpu_id = target_space->get_device_id();
+    rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{target_gpu_id}};
+
+    // Route the chunked_parquet_reader through the per-GPU sirius_ioctx
+    // instead of cudf's bundled file_source factory (kvikio). The string-form
+    // source_info routes reads through libkvikio's FileHandle which binds a
+    // single CUDA context per file, breaking multi-GPU residency (the columns
+    // end up on the wrong GPU under sanitizer races).
+    auto target_ioctx = sirius_ctx->get_ioctx_for(target_gpu_id);
+    if (!target_ioctx) {
+      throw InvalidInputException("pin_table: no sirius_ioctx for target GPU " +
+                                  std::to_string(target_gpu_id) + ".");
+    }
+    auto io_object  = target_ioctx->create_io_object(path);
+    auto datasource = target_ioctx->make_datasource(io_object);
+
+    auto file_opts =
+      cudf::io::parquet_reader_options::builder(cudf::io::source_info{datasource.get()}).build();
+    if (!cols.empty()) { file_opts.set_column_names(cols); }
+    if (data.args.n_rows.has_value()) { file_opts.set_num_rows(remaining_rows); }
+
+    cudf::io::chunked_parquet_reader reader(chunk_read_limit, file_opts);
+    int64_t file_rows_read = 0;
     while (reader.has_next()) {
-      auto chunk = reader.read_chunk();
-      if (chunk.tbl->num_rows() == 0) { break; }
+      auto chunk      = reader.read_chunk();
+      auto chunk_rows = static_cast<int64_t>(chunk.tbl->num_rows());
+      if (chunk_rows == 0) { break; }
       if (read_column_names.empty()) {
         read_column_names.reserve(chunk.metadata.schema_info.size());
         for (auto const& col_info : chunk.metadata.schema_info) {
           read_column_names.push_back(col_info.name);
         }
       }
+      file_rows_read += chunk_rows;
       if (data.args.tier == "host") {
-        cucascade::gpu_table_representation gpu_repr(std::move(chunk.tbl), gpu_mem_space);
+        // Per-target-GPU stream + per-target-GPU host space: each round-robin
+        // file's chunks must record their D2H copies on a stream bound to the
+        // target GPU's context, and the destination host pinning should land
+        // on the NUMA-local host memory_space for that GPU.
+        // try_emplace default-constructs the rmm::cuda_stream when the key is
+        // missing. The default ctor calls cudaStreamCreate under whatever
+        // device is current — which is target_gpu_id by virtue of the
+        // surrounding device_guard.
+        auto [stream_it, inserted] = pin_streams_by_gpu.try_emplace(target_gpu_id);
+        (void)inserted;
+        rmm::cuda_stream_view target_stream = stream_it->second.view();
+        auto* target_host_space             = host_space_by_gpu.at(target_gpu_id);
+        cucascade::gpu_table_representation gpu_repr(
+          std::move(chunk.tbl), *target_space, target_stream);
         auto host_repr = registry_ptr->convert<cucascade::host_data_representation>(
-          gpu_repr, host_mem_space, stream_view);
+          gpu_repr, target_host_space, target_stream);
         // Sync before gpu_repr leaves scope so the async D2H copies finish before its
         // device buffers are freed.
-        stream_view.synchronize();
+        target_stream.synchronize();
         host_chunks.emplace_back(std::move(host_repr));
       } else {
         tables.emplace_back(std::move(chunk.tbl));
+        chunk_memory_spaces.push_back(target_space);  // parallel to tables
       }
     }
+    if (data.args.n_rows.has_value()) { remaining_rows -= file_rows_read; }
+    // Per-call local counter, increments per file. All chunks within a single
+    // chunked_parquet_reader stay on the same GPU (chunks-at-index-i
+    // invariant). Cross-file alternation produces the round-robin.
+    ++chunk_idx;
   }
 
+  // A user-supplied n_rows budget caps row capture below the full file content.
+  // The scan_manager must refuse cached reuse of such partial entries — see
+  // pinned_entry::is_partial.
+  bool const is_partial_pin = data.args.n_rows.has_value();
   if (data.args.tier == "host") {
+    // entry.memory_space is metadata only; each host_chunk carries its own
+    // per-GPU NUMA-local memory_space inside its host_data_representation.
+    // Pass a representative (the first round-robin GPU's host space) so the
+    // entry still has a non-null memory_space for diagnostics.
+    int const first_gpu_id          = gpu_spaces[0]->get_device_id();
+    auto* representative_host_space = host_space_by_gpu.at(first_gpu_id);
     sirius_ctx->get_scan_manager().insert_pinned_entry_host(data.args.name,
                                                             std::move(read_column_names),
                                                             std::move(file_paths),
                                                             std::move(host_chunks),
-                                                            *host_mem_space);
+                                                            *representative_host_space,
+                                                            is_partial_pin);
   } else {
     sirius_ctx->get_scan_manager().insert_pinned_entry(data.args.name,
                                                        std::move(read_column_names),
                                                        std::move(file_paths),
                                                        std::move(tables),
-                                                       gpu_mem_space);
+                                                       std::move(chunk_memory_spaces),
+                                                       is_partial_pin);
   }
 
   output.SetCardinality(1);

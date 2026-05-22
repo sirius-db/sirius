@@ -26,6 +26,13 @@
 #include "scan_manager/parquet_metadata.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 
+// Sirius IO framework includes. sirius_datasource declares the per-ioctx
+// datasource factory; uring_reactor pulls in the concrete uring_io_object
+// construction. uring_reactor MUST be included last among sirius headers —
+// liburing's BLOCK_SIZE macro collides with blockingconcurrentqueue.h's
+// static const BLOCK_SIZE member when both transitively land in the same TU.
+#include <io/sirius_datasource.hpp>
+// (other sirius headers above already included)
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
@@ -34,6 +41,7 @@
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <duckdb/common/hive_partitioning.hpp>
+#include <io/uring/uring_reactor.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -73,7 +81,8 @@ parquet_split_provider::parquet_split_provider(
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filter_set,
   duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
   std::size_t approximate_batch_size,
-  std::size_t max_file_processed)
+  std::size_t max_file_processed,
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs)
   : parquet_split_provider(returned_types,
                            file_paths,
                            column_ids,
@@ -84,7 +93,8 @@ parquet_split_provider::parquet_split_provider(
                            partition_indices,
                            approximate_batch_size,
                            max_file_processed,
-                           static_cast<sirius_scan_manager*>(nullptr))
+                           static_cast<sirius_scan_manager*>(nullptr),
+                           std::move(gpu_ioctxs))
 {
 }
 
@@ -101,7 +111,8 @@ parquet_split_provider::parquet_split_provider(
   duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
   std::size_t approximate_batch_size,
   std::size_t max_file_processed,
-  sirius_scan_manager& scan_manager)
+  sirius_scan_manager& scan_manager,
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs)
   : parquet_split_provider(returned_types,
                            file_paths,
                            column_ids,
@@ -112,7 +123,8 @@ parquet_split_provider::parquet_split_provider(
                            partition_indices,
                            approximate_batch_size,
                            max_file_processed,
-                           &scan_manager)
+                           &scan_manager,
+                           std::move(gpu_ioctxs))
 {
 }
 
@@ -128,12 +140,14 @@ parquet_split_provider::parquet_split_provider(
   duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
   std::size_t approximate_batch_size,
   std::size_t max_file_processed,
-  sirius_scan_manager* scan_manager)
+  sirius_scan_manager* scan_manager,
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs)
   : _file_paths(file_paths),
     _approximate_batch_size(approximate_batch_size),
     _max_file_processed(max_file_processed),
     _total_files(file_paths.size()),
-    _scan_manager(scan_manager)
+    _scan_manager(scan_manager),
+    _gpu_ioctxs(std::move(gpu_ioctxs))
 {
   // Any non-trivial scan shape — reader-side projection, filter pushdown, or hive-partition
   // injection — needs column names for reader set_column_names / AST name resolution /
@@ -237,6 +251,28 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     }
   }
 
+  // Route reads through sirius_datasource — cudf's bundled file_source uses
+  // libkvikio which binds a single CUDA context per FileHandle, breaking
+  // multi-GPU residency. Picking the first ioctx for planning is safe: footer
+  // reads are small, and per-GPU placement of column data is decided later
+  // by the scan operator's task affinity.
+  // dev #732 forbids an empty gpu_ioctxs to keep local reads off cudf's kvikio
+  // file_source (which binds one CUDA context per handle, breaking multi-GPU
+  // residency). PR4+5 relaxes this: when a scan_manager is wired in, s3:// paths
+  // route through its s3_ioctx and local paths through its borrowed uring backend,
+  // so an empty gpu_ioctxs is only fatal when there is ALSO no scan_manager —
+  // that case throws below. (The cudf::io::datasource::create fallback is a
+  // separate path in run_batch, taken only when a scan_manager IS present but
+  // reports no backend for a local path, e.g. use_sirius_datasource=false.)
+  if (_gpu_ioctxs.empty() && _scan_manager == nullptr) {
+    throw std::runtime_error(
+      "parquet_split_provider: gpu_ioctxs is empty and no scan_manager is wired — "
+      "kvikio path is forbidden. Production callers receive gpu_ioctxs from "
+      "SiriusContext::get_gpu_ioctxs(); test fixtures must inject via "
+      "make_test_gpu_ioctxs() helper (test/cpp/scan/test_helpers_ioctx.hpp).");
+  }
+  auto const planning_ioctx_it = _gpu_ioctxs.begin();
+
   // Loop over files to read footers, parse metadata, and compute row-group partitions.
   rg_accumulator accum;
   // flush() appends the bundled slices to `out` but does NOT reset partition_values. The file
@@ -274,23 +310,23 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     }
 
     //===----------Read metadata footers----------===//
-    // Per-path ioctx dispatch via scan_manager: each file is independently
-    // routed to its supporting backend (local file → uring_ioctx, s3:// → s3_ioctx).
-    // When the scan_manager is null (rare test fixture), or has no backend
-    // claiming this path, fall through to cudf::io::datasource::create.
-    // Exception: a path carrying a URI scheme (s3://, http://, …) that no
-    // backend claims is a hard error — cudf cannot read a remote scheme, so a
-    // clear Sirius error beats an opaque cudf failure. A bare local path with
-    // no backend (e.g. use_sirius_datasource=false) is fine: cudf reads local
-    // files natively.
+    // Merged dispatch (multi-GPU #732 × multi-backend-S3 PR4+5):
+    //   * s3:// (any non-local scheme) → scan_manager's per-path dispatch. The
+    //     s3_ioctx is a single shared network backend (not per-GPU) and carries
+    //     the S3 prefetch cache.
+    //   * local file → dev #732's per-GPU planning ioctx (gpu_ioctxs.begin()).
+    //     Footer reads are GPU-agnostic; per-GPU column placement is decided
+    //     downstream by the scan operator's task affinity, so any GPU's ioctx
+    //     is safe for planning, and routing through io_uring (not cudf's kvikio
+    //     file_source) preserves per-GPU CUDA-context binding.
+    //   * neither (legacy test fixture with no scan_manager and empty
+    //     gpu_ioctxs) → cudf::io::datasource::create.
     //
     // Path normalization: uring_reactor::supports / create_io_object only
     // accept bare absolute paths (they call is_regular_file on the raw
     // string). When the planner gives us a "file://" URI, strip the scheme
-    // BEFORE dispatching so both supports() and create_io_object() see the
-    // bare path. The "file://" match is case-insensitive (RFC 3986 schemes
-    // are; Sirius's URI parser treats them so) so a "FILE://" URI is still
-    // recognized as local. S3 and other schemes are passed through unchanged.
+    // BEFORE dispatching. The "file://" match is case-insensitive so a
+    // "FILE://" URI is still local. S3 and other schemes pass through unchanged.
     auto normalize_path = [](std::string const& p) -> std::string {
       static constexpr std::string_view kFile = "file://";
       if (p.size() > kFile.size()) {
@@ -307,23 +343,26 @@ void parquet_split_provider::run_batch(file_batch const& batch,
       return p;
     };
     // A path still carrying a "://" after file:// stripping has a URI scheme
-    // that no Sirius backend claimed and that cudf cannot read locally
-    // (s3://, http://, …). Used only to pick the failure mode — throw vs.
-    // cudf fallback — when no backend claims the path. Scheme-name case is
-    // irrelevant: the "://" delimiter is what marks a non-local path.
+    // (s3://, http://, …) that cudf cannot read locally — used to pick the
+    // failure mode and to decide s3 vs local routing.
     auto has_uri_scheme = [](std::string const& p) -> bool {
       return p.find("://") != std::string::npos;
     };
     auto const lookup_path = normalize_path(file_path);
     std::shared_ptr<sirius::io::sirius_ioctx> file_io_ctx;
-    if (_scan_manager != nullptr) {
-      file_io_ctx = _scan_manager->io_ctx_shared_for(lookup_path);
-      // No backend claims this path. Throw for a scheme'd URI — cudf cannot
-      // read it. A bare local path (no scheme) falls through with a null
-      // file_io_ctx to the cudf datasource branch below.
-      if (!file_io_ctx && has_uri_scheme(lookup_path)) {
+    if (has_uri_scheme(lookup_path)) {
+      // Non-local scheme → route through scan_manager (s3_ioctx etc.).
+      if (_scan_manager != nullptr) { file_io_ctx = _scan_manager->io_ctx_shared_for(lookup_path); }
+      if (!file_io_ctx) {
         throw std::runtime_error("[parquet_split_provider] no backend supports path: " + file_path);
       }
+    } else if (planning_ioctx_it != _gpu_ioctxs.end()) {
+      // Local file → dev #732's per-GPU planning ioctx.
+      file_io_ctx = planning_ioctx_it->second;
+    } else if (_scan_manager != nullptr) {
+      // Local file, no gpu_ioctxs injected → scan_manager's uring backend
+      // (still keeps the read off cudf's kvikio file_source).
+      file_io_ctx = _scan_manager->io_ctx_shared_for(lookup_path);
     }
     std::shared_ptr<sirius::io::sirius_io_object> file_io_object;
     std::unique_ptr<cudf::io::datasource> datasource;
@@ -558,6 +597,13 @@ void parquet_split_provider::run_batch(file_batch const& batch,
       cur_rgs.push_back(rg_idx);
     }
     seal_current_file();
+    // Emit at least one split per file so source pipelines (GPU_PARQUET_SCAN
+    // -> ...) generate multiple gpu_pipeline_tasks when scanning multiple
+    // files. The task_scheduler's round-robin counter then distributes those
+    // tasks across GPUs. Without this flush, small workloads bundle all files
+    // under the _approximate_batch_size threshold into one split → one task →
+    // one GPU.
+    flush();
   }
   flush();
 }

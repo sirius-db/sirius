@@ -32,13 +32,14 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Physical Plan Generation](physical-plan-generation.md) | Logical-to-physical mapping, pipeline construction, splitting rules |
 | [Operators](operators.md) | All physical operators: interface, GPU implementation, cuDF APIs |
 | [Expression Executor](expression-executor.md) | gpu_expression_executor, GPU expression translator, cuDF AST |
-| [Pipeline Execution](pipeline-execution.md) | GPU executor, task scheduling, completion, OOM handling |
+| [Pipeline Execution](pipeline-execution.md) | GPU executor, task scheduling, completion, OOM handling, per-task-device contract under SCHED-RR |
 | [Task Creator](task-creator.md) | Task creation: hint chain, per-operator scheduling behavior |
 | [Scan](scan.md) | Scan subsystem: parquet scan, DuckDB scan, caching, prefetched data source |
 | [Memory Management](memory-management.md) | cuCascade tiers, reservations, downgrade executor |
 | [Data Management](data-management.md) | Data batches, repositories, ports, barrier semantics |
 | [Configuration](configuration.md) | sirius_config, operator_params, SET variables |
 | [Optimizations](optimizations.md) | Performance optimizations with PRs, code paths, configs |
+| [Multi-GPU Architecture](multi-gpu-architecture.md) | How Sirius executes SQL across every GPU on a node — tiers, pin tables, SCHED-RR, cross-GPU transfers, downgrade, concurrency invariants |
 
 ## Suggested Reading Order
 

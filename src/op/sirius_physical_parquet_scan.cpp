@@ -21,6 +21,10 @@
 #include "op/scan/scan_utils.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 
+#include <rmm/cuda_device.hpp>
+#include <rmm/cuda_stream.hpp>
+#include <rmm/mr/per_device_resource.hpp>
+
 #include <duckdb/common/multi_file/multi_file_states.hpp>
 
 #include <unordered_set>
@@ -39,7 +43,8 @@ duckdb::ExtraOperatorInfo copy_extra_info_parquet_scan(const duckdb::ExtraOperat
   return copy;
 }
 
-sirius_physical_parquet_scan::sirius_physical_parquet_scan(sirius_physical_table_scan* table_scan)
+sirius_physical_parquet_scan::sirius_physical_parquet_scan(sirius_physical_table_scan* table_scan,
+                                                           std::vector<int> gpu_device_ids)
   : sirius_physical_parquet_scan(
       table_scan->types,
       table_scan->function,
@@ -53,7 +58,8 @@ sirius_physical_parquet_scan::sirius_physical_parquet_scan(sirius_physical_table
       copy_extra_info_parquet_scan(table_scan->extra_info),
       table_scan->parameters,
       table_scan->virtual_columns,
-      table_scan)  // Pass pointer to the table scan for filter pushdown
+      table_scan,  // Pass pointer to the table scan for filter pushdown
+      std::move(gpu_device_ids))
 {
 }
 
@@ -70,7 +76,8 @@ sirius_physical_parquet_scan::sirius_physical_parquet_scan(
   duckdb::ExtraOperatorInfo extra_info,
   duckdb::vector<duckdb::Value> parameters_p,
   duckdb::virtual_column_map_t virtual_columns_p,
-  sirius_physical_table_scan* table_scan)
+  sirius_physical_table_scan* table_scan,
+  std::vector<int> gpu_device_ids)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::PARQUET_SCAN, std::move(types), estimated_cardinality),
     function(std::move(function_p)),
@@ -106,11 +113,62 @@ sirius_physical_parquet_scan::sirius_physical_parquet_scan(
     auto duckdb_expression = convert_table_filters_to_expression(
       *table_filters, column_ids, returned_types, batch_column_map, hive_partition_primary_indices);
     if (duckdb_expression) {
-      gpu_expression_translator translator(rmm::cuda_stream_default,
-                                           cudf::get_current_device_resource_ref());
-      translated_filter =
-        translator.translate_expression_with_names(*duckdb_expression, name_resolver);
-      if (!translated_filter) {
+      // Build one translated filter tree PER GPU. Each tree's cudf::scalar
+      // device buffers live on the tree's own device, so a task dispatched to
+      // device N evaluates the filter's AST entirely against device-N memory.
+      // Without this, a single translation at planner-time would bind scalars
+      // to the planner's current device (typically GPU 0), and tasks on other
+      // GPUs would hit cudaErrorInvalidValue / cudaErrorIllegalAddress when
+      // cudf::io::read_parquet evaluates the AST against per-rowgroup stats.
+      std::vector<int> device_ids_for_translation = gpu_device_ids;
+      if (device_ids_for_translation.empty()) {
+        // Fallback: translate for the current device only when no explicit
+        // device list is provided (e.g. operator constructed outside the
+        // multi-GPU engine path). Preserves single-GPU semantics.
+        int current_device = 0;
+        (void)::cudaGetDevice(&current_device);
+        device_ids_for_translation.push_back(current_device);
+      }
+
+      bool all_translations_ok = true;
+      for (int device_id : device_ids_for_translation) {
+        rmm::cuda_set_device_raii device_raii{rmm::cuda_device_id{device_id}};
+        // Translate on an explicit per-device stream, then synchronize it
+        // before handing the translated AST off. The translator materializes
+        // cudf::string_scalar / numeric_scalar device buffers via
+        // cudaMallocAsync on whatever stream it's given; if it uses the
+        // default stream, later kernels running on *other* streams (e.g.
+        // filter_row_groups_with_stats using a throwaway `planning_stream` in
+        // parquet_scan_task.cpp) can launch before the alloc event has fired,
+        // yielding a use-before-alloc stream-ordered race (surfaces as
+        // cudaErrorIllegalAddress inside cudf::detail::compute_column_kernel).
+        // Confirmed by compute-sanitizer --track-stream-ordered-races=all.
+        rmm::cuda_stream translation_stream;
+        gpu_expression_translator translator(
+          translation_stream.view(),
+          rmm::mr::get_per_device_resource_ref(rmm::cuda_device_id{device_id}));
+        auto translated =
+          translator.translate_expression_with_names(*duckdb_expression, name_resolver);
+        // Synchronize BEFORE storing into translated_filter_by_device so any
+        // future reader — on any stream, on any device after peer-access — is
+        // guaranteed to observe the scalar allocations as already completed.
+        translation_stream.synchronize();
+        if (!translated) {
+          all_translations_ok = false;
+          break;
+        }
+        // Transfer ownership of the stream into the translated_expression so
+        // it lives exactly as long as the cudf::scalar device buffers that
+        // were allocated on it.  Without this, the stream is destroyed here
+        // (end of for-loop body) while the scalars still reference its handle
+        // for future cudaFreeAsync deallocation — causing a use-after-destroy
+        // SIGSEGV when the translated_expression is eventually torn down.
+        translated->owned_stream = std::move(translation_stream);
+        translated_filter_by_device.emplace(device_id, std::move(*translated));
+      }
+
+      if (!all_translations_ok) {
+        translated_filter_by_device.clear();
         SIRIUS_LOG_INFO(
           "[sirius_physical_parquet_scan] Failed to translate filter expression for pushdown. "
           "Filter will be applied in the table scan operator.");
@@ -121,8 +179,6 @@ sirius_physical_parquet_scan::sirius_physical_parquet_scan(
       // Move the duckdb_expression into the table scan
       if (table_scan) { table_scan->filter_expr = sirius::wrap(std::move(duckdb_expression)); }
     }
-  } else {
-    translated_filter = std::nullopt;
   }
 }
 

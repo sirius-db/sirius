@@ -42,6 +42,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "cuda/scan/gpu_decode_bitpacking.cuh"
+#include "cuda/scan/unpack_value.cuh"
 
 #include <rmm/detail/error.hpp>
 #include <rmm/device_uvector.hpp>
@@ -82,47 +83,6 @@ struct bp_group_desc {
 };
 
 //===----------------------------------------------------------------------===//
-// Bit-level value extraction.
-//===----------------------------------------------------------------------===//
-
-/// Read one width-bit value from `packed[]` at logical index `idx`. Values
-/// are stored LSB-first within 32-bit words.
-///
-/// For T wider than 32 bits a value can span three 32-bit words when both
-/// `bit_off > 0` and `bit_off + width > 64` (e.g. width=50, bit_off=20 reads
-/// bits 20..69, which crosses two 32-bit boundaries). Callers must ensure
-/// `packed[]` has one guard word past the live data so that third-word read
-/// is in-bounds; the kernel writes the guard word itself.
-template <typename T>
-__device__ __forceinline__ T unpack_value(uint32_t const* packed, uint32_t idx, uint32_t width)
-{
-  auto constexpr WORD_BITS  = ::cuda::std::numeric_limits<uint32_t>::digits;
-  auto constexpr WORD_BYTES = sizeof(uint32_t);
-  if (width == 0) return T(0);
-
-  auto const bit_pos  = static_cast<uint64_t>(idx) * width;
-  auto const word_idx = static_cast<uint32_t>(bit_pos / WORD_BITS);
-  auto const bit_off  = static_cast<uint32_t>(bit_pos % WORD_BITS);
-
-  // We need to upcast in case we need bits from the next word.
-  auto result = static_cast<uint64_t>(packed[word_idx]);
-  if (bit_off + width > WORD_BITS) {
-    result |= static_cast<uint64_t>(packed[word_idx + 1]) << WORD_BITS;
-  }
-  result >>= bit_off;
-
-  // For 8B types, we may need bits from the second next word.
-  if constexpr (sizeof(T) > WORD_BYTES) {
-    if (bit_off > 0 && bit_off + width > 2 * WORD_BITS) {
-      result |= static_cast<uint64_t>(packed[word_idx + 2]) << (64 - bit_off);
-    }
-  }
-
-  auto const mask = (width >= 64) ? ~uint64_t{0} : (uint64_t{1} << width) - 1;
-  return static_cast<T>(result & mask);
-}
-
-//===----------------------------------------------------------------------===//
 // Batched decode kernel.
 //===----------------------------------------------------------------------===//
 template <typename T, int SHMEM_BYTES>
@@ -148,9 +108,14 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
   auto const* seg_base = desc.d_segment;
   auto const seg_bytes = desc.segment_bytes;
 
-  // Note that d_output is 256B aligned (guaranteed by CUDA), and global_row_offset is a multiple of
-  // BP_META_GROUP_SIZE, so `out` is always 16B-aligned, and 16B vectorized stores are defined.
-  auto* out = d_output + desc.global_row_offset;
+  // `d_output` is 256B-aligned by CUDA, but `out` is only 16B-aligned when
+  // `global_row_offset * sizeof(T)` is a multiple of `sizeof(vec_t)`. That
+  // holds for the first segment in a column and any stacked segment whose
+  // prior-segment row count was a multiple of `sizeof(vec_t) / sizeof(T)` —
+  // not in general. CONSTANT and CONSTANT_DELTA branch on this and use
+  // scalar stores when unaligned (FOR / DELTA_FOR already store scalar).
+  auto* out                  = d_output + desc.global_row_offset;
+  bool const out_vec_aligned = (reinterpret_cast<::cuda::std::uintptr_t>(out) % sizeof(vec_t)) == 0;
 
   // Shared metadata — written by thread 0, read by all after the barrier.
   // `sm_aux` is overloaded by mode:
@@ -271,19 +236,25 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
   if (mode == BitpackingMode::CONSTANT) {
     auto const val         = sm_aux;
     uint32_t constexpr TPV = sizeof(vec_t) / sizeof(T);
-    auto const vec_count   = rc / TPV;
-    auto* out4             = reinterpret_cast<vec_t*>(out);
-    vec_t packed;
-    auto* lanes = reinterpret_cast<T*>(&packed);
+    if (out_vec_aligned) {
+      auto const vec_count = rc / TPV;
+      auto* out4           = reinterpret_cast<vec_t*>(out);
+      vec_t packed;
+      auto* lanes = reinterpret_cast<T*>(&packed);
 #pragma unroll
-    for (uint32_t i = 0; i < TPV; ++i)
-      lanes[i] = val;
-    for (uint32_t v = threadIdx.x; v < vec_count; v += blockDim.x) {
-      __stcs(out4 + v, packed);
-    }
-    uint32_t tail_start = vec_count * TPV;
-    for (uint32_t i = tail_start + threadIdx.x; i < rc; i += blockDim.x) {
-      __stcs(out + i, val);
+      for (uint32_t i = 0; i < TPV; ++i)
+        lanes[i] = val;
+      for (uint32_t v = threadIdx.x; v < vec_count; v += blockDim.x) {
+        __stcs(out4 + v, packed);
+      }
+      uint32_t tail_start = vec_count * TPV;
+      for (uint32_t i = tail_start + threadIdx.x; i < rc; i += blockDim.x) {
+        __stcs(out + i, val);
+      }
+    } else {
+      for (uint32_t i = threadIdx.x; i < rc; i += blockDim.x) {
+        __stcs(out + i, val);
+      }
     }
     return;
   }
@@ -295,21 +266,27 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
     auto const frame       = sm_frame;
     auto const delta       = sm_aux;
     uint32_t constexpr TPV = sizeof(vec_t) / sizeof(T);
-    auto const vec_count   = rc / TPV;
-    auto* out4             = reinterpret_cast<vec_t*>(out);
-    for (uint32_t v = threadIdx.x; v < vec_count; v += blockDim.x) {
-      vec_t packed;
-      auto* lanes       = reinterpret_cast<T*>(&packed);
-      auto const base_v = v * TPV;
+    if (out_vec_aligned) {
+      auto const vec_count = rc / TPV;
+      auto* out4           = reinterpret_cast<vec_t*>(out);
+      for (uint32_t v = threadIdx.x; v < vec_count; v += blockDim.x) {
+        vec_t packed;
+        auto* lanes       = reinterpret_cast<T*>(&packed);
+        auto const base_v = v * TPV;
 #pragma unroll
-      for (uint32_t i = 0; i < TPV; ++i) {
-        lanes[i] = static_cast<T>(frame + static_cast<T>(base_v + i) * delta);
+        for (uint32_t i = 0; i < TPV; ++i) {
+          lanes[i] = static_cast<T>(frame + static_cast<T>(base_v + i) * delta);
+        }
+        __stcs(out4 + v, packed);
       }
-      __stcs(out4 + v, packed);
-    }
-    auto const tail_start = vec_count * TPV;
-    for (uint32_t i = tail_start + threadIdx.x; i < rc; i += blockDim.x) {
-      __stcs(out + i, static_cast<T>(frame + static_cast<T>(i) * delta));
+      auto const tail_start = vec_count * TPV;
+      for (uint32_t i = tail_start + threadIdx.x; i < rc; i += blockDim.x) {
+        __stcs(out + i, static_cast<T>(frame + static_cast<T>(i) * delta));
+      }
+    } else {
+      for (uint32_t i = threadIdx.x; i < rc; i += blockDim.x) {
+        __stcs(out + i, static_cast<T>(frame + static_cast<T>(i) * delta));
+      }
     }
     return;
   }
