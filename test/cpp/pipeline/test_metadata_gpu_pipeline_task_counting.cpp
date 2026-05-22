@@ -260,8 +260,8 @@ TEST_CASE("pipeline task counting - single file, default max_file_processed (one
   std::vector<std::string> files = {path.string()};
   duckdb::vector<duckdb::idx_t> no_projection;
 
-  sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(sirius::from_duckdb_vec(schema.types),
-                                                            0);
+  sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(
+    sirius::from_duckdb_vec(schema.types), 0, nullptr);
   sirius::op::scan::sirius_parquet_metadata_scan_operator metadata_op(
     &gpu_op,
     sirius::from_duckdb_vec(schema.types),
@@ -328,8 +328,8 @@ TEST_CASE("pipeline task counting - multi-file metadata scan with max_file_proce
   auto schema = synthetic_schema();
   duckdb::vector<duckdb::idx_t> no_projection;
 
-  sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(sirius::from_duckdb_vec(schema.types),
-                                                            0);
+  sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(
+    sirius::from_duckdb_vec(schema.types), 0, nullptr);
   sirius::op::scan::sirius_parquet_metadata_scan_operator metadata_op(
     &gpu_op,
     sirius::from_duckdb_vec(schema.types),
