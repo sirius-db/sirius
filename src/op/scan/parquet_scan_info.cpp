@@ -14,26 +14,30 @@
  * limitations under the License.
  */
 
-#pragma once
+#include "op/scan/parquet_scan_info.hpp"
 
-#include "op/scan/scan_info.hpp"
+#include "scan_manager/parquet_split_provider.hpp"
 
 #include <memory>
+#include <utility>
 
 namespace sirius::op::scan {
 
-/**
- * @brief Bind-data for a parquet scan.
- *
- * All scan fields are inherited from @ref scan_info; this subclass exists so
- * @ref make_provider dispatches to @ref scan_manager::parquet_split_provider.
- *
- * Populated once during plan generation and parked on the gpu parquet scan
- * operator. The scan_manager reads it during prepare_for_query.
- */
-struct parquet_scan_info : scan_info {
-  std::unique_ptr<scan_manager::split_provider> make_provider(
-    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs) override;
-};
+std::unique_ptr<scan_manager::split_provider> parquet_scan_info::make_provider(
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs)
+{
+  return std::make_unique<scan_manager::parquet_split_provider>(
+    returned_types,
+    file_paths,
+    column_ids,
+    projection_ids,
+    names,
+    scan_output_arity,
+    std::move(table_filters),
+    partition_indices,
+    approximate_batch_size,
+    scan_manager::parquet_split_provider::DEFAULT_MAX_FILE_PROCESSED,
+    gpu_ioctxs);
+}
 
 }  // namespace sirius::op::scan

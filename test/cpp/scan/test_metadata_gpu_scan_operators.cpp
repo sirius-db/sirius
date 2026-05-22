@@ -181,8 +181,8 @@ std::vector<std::shared_ptr<cucascade::data_batch>> run_two_pipeline_scan(
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters = nullptr,
   rmm::cuda_stream_view stream                             = cudf::get_default_stream())
 {
-  sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(sirius::from_duckdb_vec(output_types),
-                                                            0);
+  sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(
+    sirius::from_duckdb_vec(output_types), 0, nullptr);
 
   // --- Pipeline 1: metadata scan ---
   sirius::op::scan::sirius_parquet_metadata_scan_operator metadata_op(
@@ -286,8 +286,8 @@ TEST_CASE("metadata_scan_operator - source interface dispatches all files",
   std::vector<std::string> files = {path.string()};
   duckdb::vector<duckdb::idx_t> no_projection;
 
-  sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(sirius::from_duckdb_vec(schema.types),
-                                                            0);
+  sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(
+    sirius::from_duckdb_vec(schema.types), 0, nullptr);
   sirius::op::scan::sirius_parquet_metadata_scan_operator op(&gpu_op,
                                                              sirius::from_duckdb_vec(schema.types),
                                                              sirius::from_duckdb_vec(schema.types),
@@ -326,8 +326,8 @@ TEST_CASE("metadata_scan_operator - execute produces partitioned metadata",
   std::vector<std::string> files = {path.string()};
   duckdb::vector<duckdb::idx_t> no_projection;
 
-  sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(sirius::from_duckdb_vec(schema.types),
-                                                            0);
+  sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(
+    sirius::from_duckdb_vec(schema.types), 0, nullptr);
   sirius::op::scan::sirius_parquet_metadata_scan_operator op(&gpu_op,
                                                              sirius::from_duckdb_vec(schema.types),
                                                              sirius::from_duckdb_vec(schema.types),
@@ -397,8 +397,8 @@ TEST_CASE("metadata_scan_operator - projection restricts byte accounting to sele
   // --- Full scan (no projection): all chunks contribute. ---
   std::size_t full_uncompressed_bytes = 0;
   {
-    sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(sirius::from_duckdb_vec(full_types),
-                                                              0);
+    sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(
+      sirius::from_duckdb_vec(full_types), 0, nullptr);
     sirius::op::scan::sirius_parquet_metadata_scan_operator op(
       &gpu_op,
       sirius::from_duckdb_vec(full_types),
@@ -427,7 +427,7 @@ TEST_CASE("metadata_scan_operator - projection restricts byte accounting to sele
                                                         duckdb::LogicalType::INTEGER};
     duckdb::vector<duckdb::idx_t> projection_ids{1, 2};
     sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(
-      sirius::from_duckdb_vec(projected_types), 0);
+      sirius::from_duckdb_vec(projected_types), 0, nullptr);
     sirius::op::scan::sirius_parquet_metadata_scan_operator op(
       &gpu_op,
       sirius::from_duckdb_vec(projected_types),
@@ -812,7 +812,7 @@ TEST_CASE("gpu_scan_operator - idle without handoff port", "[gpu_scan_operator][
 
   duckdb::vector<duckdb::LogicalType> types;
   types.push_back(duckdb::LogicalType::INTEGER);
-  sirius::op::scan::sirius_gpu_parquet_scan_operator op(sirius::from_duckdb_vec(types), 0);
+  sirius::op::scan::sirius_gpu_parquet_scan_operator op(sirius::from_duckdb_vec(types), 0, nullptr);
 
   REQUIRE(op.is_source());
 

@@ -47,6 +47,7 @@ class buffer_pool;
 
 namespace sirius::op::scan {
 class sirius_gpu_parquet_scan_operator;
+struct scan_info;
 }  // namespace sirius::op::scan
 
 namespace sirius::planner {
@@ -95,7 +96,7 @@ struct scan_manager_config {
 struct pinned_entry {
   std::vector<std::string> column_names;
   /// Resolved (globbed) file paths captured at pin time. The scan_manager uses
-  /// this list to match an incoming scan operator's parquet_scan_info::file_paths
+  /// this list to match an incoming scan operator's scan_info::file_paths
   /// against this entry, so it can swap in a cached split provider.
   std::vector<std::string> file_paths;
   /// GPU-tier storage: one chunk vector per pinned column name. Populated by
@@ -276,22 +277,41 @@ class sirius_scan_manager {
   [[nodiscard]] sirius::io::sirius_ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
 
  private:
-  /// \brief Build a split_provider for @p op by reading its parquet scan_info
-  ///        and installing the resulting hive-partition inject_fn (if any) on
-  ///        the operator. Returns a cached_split_provider when a pinned entry
-  ///        matches, otherwise a parquet_split_provider; in both cases the
-  ///        provider carries the scan_plan that the operator's execute()
-  ///        consults for output assembly.
+  /// \brief Build a split_provider for @p op by reading its scan_info.
+  ///        Tries the pinned-cache short-circuit (format-agnostic; uses only
+  ///        the common scan_info fields) and otherwise dispatches through
+  ///        scan_info::make_provider() to the format-specific provider.
   ///
-  /// @param op           The parquet scan operator.
-  /// @param gpu_ioctxs   Per-GPU sirius_ioctx map forwarded to
-  ///                     parquet_split_provider for multi-GPU IO routing.
+  /// @param op           The scan operator.
+  /// @param gpu_ioctxs   Per-GPU sirius_ioctx map forwarded to the
+  ///                     format-specific provider (via scan_info::make_provider)
+  ///                     for multi-GPU IO routing.
   /// @param gpu_memory_spaces device_id -> GPU memory_space lookup forwarded to
   ///                     HOST-tier cached_split_provider for HOST->GPU
   ///                     materialization at produce_split time.
   std::unique_ptr<split_provider> create_provider_for(
     op::scan::sirius_gpu_parquet_scan_operator* op,
     std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs,
+    std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces);
+
+  /// \brief Build a cached_split_provider when a pinned entry matches the
+  ///        scan's file paths. Returns nullptr on miss so the caller can
+  ///        fall through to per-format dispatch. Format-agnostic: uses only
+  ///        fields on the scan_info base.
+  ///
+  /// @param info               Scan bind-data — file_paths, column_ids, names, types,
+  ///                           projection_ids, partition_indices, table_filters,
+  ///                           scan_output_arity. Read-only; not consumed.
+  /// @param op_id              Operator id for diagnostic logging.
+  /// @param gpu_memory_spaces  device_id -> GPU memory_space lookup forwarded to the
+  ///                           HOST-tier cached_split_provider for HOST->GPU
+  ///                           materialization at produce_split time. An empty
+  ///                           map disables the HOST-tier cache path (queries
+  ///                           against a host pin fall through to the per-format
+  ///                           provider).
+  std::unique_ptr<split_provider> try_make_cached_provider(
+    op::scan::scan_info const& info,
+    std::size_t op_id,
     std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces);
 
   /// \brief Run providers sequentially: start each, wait on its future, advance.
