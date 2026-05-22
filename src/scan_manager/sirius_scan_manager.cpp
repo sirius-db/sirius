@@ -172,14 +172,6 @@ std::unique_ptr<split_provider> sirius_scan_manager::try_make_cached_provider(
     std::sort(sorted_b.begin(), sorted_b.end());
     return sorted_a == sorted_b;
   };
-  // Hard invariant — surface scan_manager corruption rather than let the
-  // catch-all below swallow it as a silent cache miss.
-  for (auto const& [pinned_name, entry] : _pinned_entries) {
-    if (matches_scan_info(entry) && entry.memory_space == nullptr) {
-      throw std::runtime_error("[sirius_scan_manager::try_make_cached_provider] pinned entry '" +
-                               pinned_name + "' has no memory_space");
-    }
-  }
   try {
     for (auto const& [pinned_name, entry] : _pinned_entries) {
       if (!matches_scan_info(entry)) { continue; }
