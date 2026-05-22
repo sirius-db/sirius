@@ -1022,6 +1022,43 @@ TEST_CASE("s3_ioctx host_read_ranges reads the clipped EOF-crossing byte count",
   CHECK(std::string(reinterpret_cast<char const*>(dst_bytes.data()), dst_bytes.size()) == "tail");
 }
 
+TEST_CASE("s3_ioctx host_read_ranges_async_io reports validation errors asynchronously",
+          "[s3][ioctx]")
+{
+  auto exercise = [](sirius::exec::static_thread_pool* pool) {
+    auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
+    s3_ioctx_config cfg{provider, 1, 1};
+    cfg.async_thread_pool = pool;
+    auto ctx              = std::make_shared<s3_ioctx>(std::move(cfg));
+    auto obj              = make_s3_object("bucket", "object.bin", 100);
+
+    std::vector<std::byte> dst_bytes(3);
+    std::vector<cudf::io::text::byte_range_info> ranges{{96, 16}};
+    std::vector<cudf::host_span<std::byte>> dst{{dst_bytes.data(), dst_bytes.size()}};
+    std::promise<async_read_result> done;
+    auto fut = done.get_future();
+
+    REQUIRE_NOTHROW(ctx->host_read_ranges_async_io(
+      *obj, ranges, std::span{dst}, [&done](auto bytes, auto ep) { done.set_value({bytes, ep}); }));
+    REQUIRE(fut.wait_for(5s) == std::future_status::ready);
+
+    auto [bytes, ep] = fut.get();
+    CHECK(bytes == 0);
+    REQUIRE(ep != nullptr);
+    CHECK_THROWS_WITH(std::rethrow_exception(ep), "s3_ioctx::host_read_ranges: dst span too small");
+    CHECK(provider->call_count() == 0);
+    CHECK(provider->get_count() == 0);
+  };
+
+  SECTION("no injected pool") { exercise(nullptr); }
+
+  SECTION("injected pool")
+  {
+    sirius::exec::static_thread_pool pool(1, "s3err");
+    exercise(&pool);
+  }
+}
+
 TEST_CASE("s3_ioctx reads single objects from MinIO with presigned range GETs",
           "[.][s3][integration][ioctx]")
 {
