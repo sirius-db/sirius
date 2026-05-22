@@ -22,6 +22,11 @@
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "exec/thread_pool.hpp"
+#include "io/prefetching_cache.hpp"
+#include "io/s3/s3_ioctx.hpp"
+#include "io/s3/sirius_sigv4_credential_provider.hpp"
+#include "io/s3/static_credentials.hpp"
 #include "log/logging.hpp"
 #include "memory/numa_small_pinned_mr.hpp"
 #include "memory/resource_ref_utils.hpp"
@@ -545,8 +550,88 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   task_creator_->set_task_scheduler(*task_scheduler_);
   task_scheduler_->set_task_creator(*task_creator_);
 
+  // Compose the scan_manager_config: start from the engine's default
+  // (uring + prefetch knobs) and layer the S3 backend on top when the
+  // object_store_config has all the required fields. Empty fields keep
+  // the S3 backend disabled — the default scan_manager_config has
+  // s3_config == std::nullopt and the scan_manager skips s3_ioctx
+  // construction. The FSMR is passed through to uring_ioctx / buffer_pool.
+  auto sm_config = config_.get_scan_manager_config();
+  if (!config_.object_store_config.endpoint.empty() &&
+      !config_.object_store_config.access_key.empty() &&
+      !config_.object_store_config.secret_key.empty()) {
+    sirius::io::s3::static_credentials creds;
+    creds.access_key_id     = config_.object_store_config.access_key;
+    creds.secret_access_key = config_.object_store_config.secret_key;
+    auto provider           = std::make_shared<sirius::io::s3::sirius_sigv4_credential_provider>(
+      std::move(creds),
+      config_.object_store_config.region,
+      config_.object_store_config.endpoint,
+      std::chrono::minutes{5});
+    sirius::io::s3::s3_ioctx_config s3_cfg{};
+    s3_cfg.creds        = std::move(provider);
+    sm_config.s3_config = std::move(s3_cfg);
+  }
+  // Persist the composed config back onto config_ so a later get_config()
+  // reflects the actual S3 wiring -- get_scan_manager_config() must not report
+  // s3_config == nullopt while a live S3 backend exists. The s3_ioctx_config
+  // stored here carries credentials only; async_thread_pool stays null --
+  // SiriusContext (S6) injects its live s3_thread_pool_ into the s3_ioctx's own
+  // config copy when it builds the backend below.
+  config_.set_scan_manager_config(std::move(sm_config));
+  // S6 (NUMA) increment 1: SiriusContext owns the scan-side IO backends. Build
+  // the S3 backend (+ its async pool) and the prefetch buffer_pool here, then
+  // hand the scan_manager a BORROWED routing list. The prefetch cache is
+  // initialized on the real read-path backends — the per-NUMA urings (which
+  // gpu_ioctxs_ alias) and the s3_ioctx — so a repeated local read actually
+  // hits the cache (it previously hung off a scan-manager-only uring). The
+  // stored s3_config keeps async_thread_pool == nullptr; we inject our live
+  // s3_thread_pool_ into the s3_ioctx's own config copy here.
+  auto const& scan_cfg = config_.get_scan_manager_config();
+  if (scan_cfg.s3_config) {
+    s3_thread_pool_ =
+      std::make_unique<sirius::exec::static_thread_pool>(scan_cfg.s3_thread_pool.num_threads,
+                                                         scan_cfg.s3_thread_pool.thread_name_prefix,
+                                                         scan_cfg.s3_thread_pool.cpu_affinity_list);
+    auto s3_cfg                 = *scan_cfg.s3_config;
+    s3_cfg.async_thread_pool    = s3_thread_pool_.get();
+    s3_cfg.host_memory_resource = host_fsmr;
+    s3_ioctx_                   = std::make_shared<sirius::io::s3::s3_ioctx>(std::move(s3_cfg));
+  }
+  if (scan_cfg.enable_prefetch_cache && host_fsmr != nullptr) {
+    auto const slab_bytes = host_fsmr->get_block_size() *
+                            static_cast<std::size_t>(sirius::io::buffer_pool::CHUNKS_PER_SLAB);
+    auto const max_slabs =
+      static_cast<uint32_t>((scan_cfg.prefetch_buffer_pool_bytes + slab_bytes - 1) / slab_bytes);
+    prefetch_buffer_pool_ = std::make_unique<sirius::io::buffer_pool>(*host_fsmr, max_slabs);
+    // Initialize the cache on the REAL read-path backends: the per-NUMA urings
+    // (gpu_ioctxs_ alias these, so covering numa_ioctxs_ covers every per-GPU
+    // local read path) and the s3_ioctx.
+    for (auto& kv : numa_ioctxs_) {
+      if (kv.second) {
+        kv.second->initialize_cache(*prefetch_buffer_pool_,
+                                    scan_cfg.prefetch_inflight_budget_chunks);
+      }
+    }
+    if (s3_ioctx_) {
+      s3_ioctx_->initialize_cache(*prefetch_buffer_pool_, scan_cfg.prefetch_inflight_budget_chunks);
+    }
+  }
+  // Borrowed routing list for the scan_manager: the default local backend
+  // (lowest-GPU uring, matching datasource_registry's kFileScheme target) plus
+  // the s3_ioctx when configured. The scan_manager dispatches over these but
+  // does not own them — SiriusContext releases them in terminate().
+  std::vector<std::shared_ptr<sirius::io::sirius_ioctx>> borrowed_io_ctxs;
+  if (!gpu_ioctxs_.empty()) {
+    auto const lowest =
+      std::min_element(gpu_ioctxs_.begin(), gpu_ioctxs_.end(), [](auto const& a, auto const& b) {
+        return a.first < b.first;
+      });
+    borrowed_io_ctxs.push_back(lowest->second);
+  }
+  if (s3_ioctx_) { borrowed_io_ctxs.push_back(s3_ioctx_); }
   scan_manager_ = std::make_unique<sirius::scan_manager::sirius_scan_manager>(
-    config_.get_scan_manager_config(), host_fsmr);
+    config_.get_scan_manager_config(), std::move(borrowed_io_ctxs));
 
   // Wire the pipeline task queue into downgrade executors now that task_scheduler_
   // has been constructed.
@@ -589,6 +674,11 @@ void SiriusContext::terminate()
   // reactor threads and freeing the NUMA-bound pinned bounce buffers
   // (cudaHostUnregister + numa_free, or cudaFreeHost) — which requires a
   // live CUDA context, so it must run BEFORE memory_manager_->shutdown().
+  //
+  // S6: the scan_manager borrows the lowest-GPU uring for routing, so that one
+  // uring's final ref is held by scan_manager_ and dropped at
+  // scan_manager_.reset() below (still BEFORE memory_manager_ shutdown); the
+  // other urings are destroyed here at numa_ioctxs_.clear().
   datasource_registry_.clear();
   gpu_ioctxs_.clear();
   numa_ioctxs_.clear();
@@ -626,11 +716,29 @@ void SiriusContext::terminate()
   // has no GPU spaces.
   cudaDeviceSynchronize();
 
-  // The scan manager owns the sirius_ioctx, prefetch buffer_pool, pinned-table
-  // entries, and cached parquet columns. All of those are backed by memory
-  // resources owned by memory_manager_, so the manager must be destroyed before
-  // memory_manager_->shutdown()/reset().
+  // The scan manager owns its pinned-table entries and cached parquet columns
+  // (backed by memory_manager_), so it must be destroyed before
+  // memory_manager_->shutdown()/reset(). Its reset() also drops the BORROWED
+  // IO-backend aliases (S6) — releasing the lowest-GPU uring whose alias it held
+  // (its cache is torn down here; prefetch_buffer_pool_, reset below, is still
+  // alive).
   scan_manager_.reset();
+
+  // S6 (NUMA): SiriusContext owns the S3 backend, its async pool, and the
+  // prefetch buffer_pool (scan_manager only borrowed them and dropped its
+  // aliases in reset() above). Reset s3_ioctx_ FIRST, while s3_thread_pool_ and
+  // prefetch_buffer_pool_ are STILL ALIVE: ~s3_ioctx() runs _cache.reset() —
+  // stopping the cache worker/evictor threads, which on a miss call back into
+  // host_read_io/device_read_io (touching the async pool + curl handles) — and
+  // only THEN shutdown() (tearing down the curl handle pool). That is the P3.9
+  // ordering. Do NOT call shutdown() explicitly here: doing it before the cache
+  // workers stop reintroduces the worker -> freed-curl-handle UAF. After the
+  // s3_ioctx is gone, stop/reset the pool, then release the buffer_pool LAST
+  // (both the s3 cache and the per-NUMA uring caches reference it).
+  s3_ioctx_.reset();
+  if (s3_thread_pool_) { s3_thread_pool_->stop(); }
+  s3_thread_pool_.reset();
+  prefetch_buffer_pool_.reset();
 
   // Drop any remaining repositories while the memory manager is still alive.
   data_repository_manager_.reset();

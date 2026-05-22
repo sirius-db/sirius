@@ -37,6 +37,7 @@ class sirius_ioctx;
 
 namespace sirius::scan_manager {
 class split_provider;
+class sirius_scan_manager;
 }  // namespace sirius::scan_manager
 
 namespace sirius::op::scan {
@@ -81,10 +82,20 @@ struct scan_info {
    * Called once by the scan_manager after the cache short-circuit misses.
    * May move fields off @c *this into the provider.
    *
-   * @param gpu_ioctxs  Per-GPU ioctx map. Empty when
-   *                    @c use_sirius_datasource=false.
+   * @param manager     Owning scan_manager, forwarded so the format provider can
+   *                    route each path to its backend (s3:// -> s3_ioctx via
+   *                    @c io_ctx_shared_for, local -> per-GPU uring). Combined-
+   *                    runtime S3 integration layered on upstream #749.
+   * @param gpu_ioctxs  Per-GPU sirius_ioctx map forwarded to the underlying
+   *                    split_provider for multi-GPU IO routing. An empty map is
+   *                    accepted only at the provider / test-fallback layer (the
+   *                    provider then routes local paths through cudf's bundled
+   *                    datasource factory); the live GPU scan path requires a
+   *                    non-empty map and throws otherwise
+   *                    (sirius_gpu_parquet_scan_operator).
    */
   virtual std::unique_ptr<scan_manager::split_provider> make_provider(
+    scan_manager::sirius_scan_manager& manager,
     std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs) = 0;
 };
 

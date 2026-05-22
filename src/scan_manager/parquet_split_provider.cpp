@@ -24,6 +24,7 @@
 #include "op/scan/parquet_schema_mapping.hpp"
 #include "op/scan/scan_utils.hpp"
 #include "scan_manager/parquet_metadata.hpp"
+#include "scan_manager/sirius_scan_manager.hpp"
 
 // Sirius IO framework includes. sirius_datasource declares the per-ioctx
 // datasource factory; uring_reactor pulls in the concrete uring_io_object
@@ -43,9 +44,11 @@
 #include <io/uring/uring_reactor.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -65,6 +68,9 @@ struct rg_accumulator {
 
 }  // namespace
 
+// Legacy public ctor — no scan_manager. Forwards to the private ctor with
+// nullptr; run_batch falls through to cudf::io::datasource::create for each
+// file (mirrors the pre-multi-ioctx single-ioctx-null behavior).
 parquet_split_provider::parquet_split_provider(
   duckdb::vector<sirius::logical_type> const& returned_types,
   std::vector<std::string> const& file_paths,
@@ -77,10 +83,70 @@ parquet_split_provider::parquet_split_provider(
   std::size_t approximate_batch_size,
   std::size_t max_file_processed,
   std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs)
+  : parquet_split_provider(returned_types,
+                           file_paths,
+                           column_ids,
+                           projection_ids,
+                           names,
+                           scan_output_arity,
+                           std::move(table_filter_set),
+                           partition_indices,
+                           approximate_batch_size,
+                           max_file_processed,
+                           static_cast<sirius_scan_manager*>(nullptr),
+                           std::move(gpu_ioctxs))
+{
+}
+
+// New public ctor — reference to scan_manager. Forwards to the private ctor
+// with the reference's address.
+parquet_split_provider::parquet_split_provider(
+  duckdb::vector<sirius::logical_type> const& returned_types,
+  std::vector<std::string> const& file_paths,
+  duckdb::vector<duckdb::ColumnIndex> const& column_ids,
+  duckdb::vector<duckdb::idx_t> const& projection_ids,
+  duckdb::vector<std::string> const& names,
+  std::size_t scan_output_arity,
+  duckdb::unique_ptr<duckdb::TableFilterSet> table_filter_set,
+  duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
+  std::size_t approximate_batch_size,
+  std::size_t max_file_processed,
+  sirius_scan_manager& scan_manager,
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs)
+  : parquet_split_provider(returned_types,
+                           file_paths,
+                           column_ids,
+                           projection_ids,
+                           names,
+                           scan_output_arity,
+                           std::move(table_filter_set),
+                           partition_indices,
+                           approximate_batch_size,
+                           max_file_processed,
+                           &scan_manager,
+                           std::move(gpu_ioctxs))
+{
+}
+
+// Private delegating ctor — actual init body lives here.
+parquet_split_provider::parquet_split_provider(
+  duckdb::vector<sirius::logical_type> const& returned_types,
+  std::vector<std::string> const& file_paths,
+  duckdb::vector<duckdb::ColumnIndex> const& column_ids,
+  duckdb::vector<duckdb::idx_t> const& projection_ids,
+  duckdb::vector<std::string> const& names,
+  std::size_t scan_output_arity,
+  duckdb::unique_ptr<duckdb::TableFilterSet> table_filter_set,
+  duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
+  std::size_t approximate_batch_size,
+  std::size_t max_file_processed,
+  sirius_scan_manager* scan_manager,
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs)
   : _file_paths(file_paths),
     _approximate_batch_size(approximate_batch_size),
     _max_file_processed(max_file_processed),
     _total_files(file_paths.size()),
+    _scan_manager(scan_manager),
     _gpu_ioctxs(std::move(gpu_ioctxs))
 {
   // Any non-trivial scan shape — reader-side projection, filter pushdown, or hive-partition
@@ -190,12 +256,20 @@ void parquet_split_provider::run_batch(file_batch const& batch,
   // multi-GPU residency. Picking the first ioctx for planning is safe: footer
   // reads are small, and per-GPU placement of column data is decided later
   // by the scan operator's task affinity.
-  if (_gpu_ioctxs.empty()) {
+  // dev #732 forbids an empty gpu_ioctxs to keep local reads off cudf's kvikio
+  // file_source (which binds one CUDA context per handle, breaking multi-GPU
+  // residency). PR4+5 relaxes this: when a scan_manager is wired in, s3:// paths
+  // route through its s3_ioctx and local paths through its borrowed uring backend,
+  // so an empty gpu_ioctxs is only fatal when there is ALSO no scan_manager —
+  // that case throws below. (The cudf::io::datasource::create fallback is a
+  // separate path in run_batch, taken only when a scan_manager IS present but
+  // reports no backend for a local path, e.g. use_sirius_datasource=false.)
+  if (_gpu_ioctxs.empty() && _scan_manager == nullptr) {
     throw std::runtime_error(
-      "parquet_split_provider: gpu_ioctxs is empty — kvikio path is forbidden. "
-      "Production callers receive gpu_ioctxs from SiriusContext::get_gpu_ioctxs(); "
-      "test fixtures must inject via make_test_gpu_ioctxs() helper "
-      "(test/cpp/scan/test_helpers_ioctx.hpp).");
+      "parquet_split_provider: gpu_ioctxs is empty and no scan_manager is wired — "
+      "kvikio path is forbidden. Production callers receive gpu_ioctxs from "
+      "SiriusContext::get_gpu_ioctxs(); test fixtures must inject via "
+      "make_test_gpu_ioctxs() helper (test/cpp/scan/test_helpers_ioctx.hpp).");
   }
   auto const planning_ioctx_it = _gpu_ioctxs.begin();
 
@@ -236,8 +310,68 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     }
 
     //===----------Read metadata footers----------===//
-    auto file_io_object = planning_ioctx_it->second->create_io_object(file_path);
-    auto datasource     = planning_ioctx_it->second->make_datasource(file_io_object);
+    // Merged dispatch (multi-GPU #732 × multi-backend-S3 PR4+5):
+    //   * s3:// (any non-local scheme) → scan_manager's per-path dispatch. The
+    //     s3_ioctx is a single shared network backend (not per-GPU) and carries
+    //     the S3 prefetch cache.
+    //   * local file → dev #732's per-GPU planning ioctx (gpu_ioctxs.begin()).
+    //     Footer reads are GPU-agnostic; per-GPU column placement is decided
+    //     downstream by the scan operator's task affinity, so any GPU's ioctx
+    //     is safe for planning, and routing through io_uring (not cudf's kvikio
+    //     file_source) preserves per-GPU CUDA-context binding.
+    //   * neither (legacy test fixture with no scan_manager and empty
+    //     gpu_ioctxs) → cudf::io::datasource::create.
+    //
+    // Path normalization: uring_reactor::supports / create_io_object only
+    // accept bare absolute paths (they call is_regular_file on the raw
+    // string). When the planner gives us a "file://" URI, strip the scheme
+    // BEFORE dispatching. The "file://" match is case-insensitive so a
+    // "FILE://" URI is still local. S3 and other schemes pass through unchanged.
+    auto normalize_path = [](std::string const& p) -> std::string {
+      static constexpr std::string_view kFile = "file://";
+      if (p.size() > kFile.size()) {
+        bool is_file_uri = true;
+        for (std::size_t i = 0; i < kFile.size(); ++i) {
+          if (std::tolower(static_cast<unsigned char>(p[i])) !=
+              static_cast<unsigned char>(kFile[i])) {
+            is_file_uri = false;
+            break;
+          }
+        }
+        if (is_file_uri) { return p.substr(kFile.size()); }
+      }
+      return p;
+    };
+    // A path still carrying a "://" after file:// stripping has a URI scheme
+    // (s3://, http://, …) that cudf cannot read locally — used to pick the
+    // failure mode and to decide s3 vs local routing.
+    auto has_uri_scheme = [](std::string const& p) -> bool {
+      return p.find("://") != std::string::npos;
+    };
+    auto const lookup_path = normalize_path(file_path);
+    std::shared_ptr<sirius::io::sirius_ioctx> file_io_ctx;
+    if (has_uri_scheme(lookup_path)) {
+      // Non-local scheme → route through scan_manager (s3_ioctx etc.).
+      if (_scan_manager != nullptr) { file_io_ctx = _scan_manager->io_ctx_shared_for(lookup_path); }
+      if (!file_io_ctx) {
+        throw std::runtime_error("[parquet_split_provider] no backend supports path: " + file_path);
+      }
+    } else if (planning_ioctx_it != _gpu_ioctxs.end()) {
+      // Local file → dev #732's per-GPU planning ioctx.
+      file_io_ctx = planning_ioctx_it->second;
+    } else if (_scan_manager != nullptr) {
+      // Local file, no gpu_ioctxs injected → scan_manager's uring backend
+      // (still keeps the read off cudf's kvikio file_source).
+      file_io_ctx = _scan_manager->io_ctx_shared_for(lookup_path);
+    }
+    std::shared_ptr<sirius::io::sirius_io_object> file_io_object;
+    std::unique_ptr<cudf::io::datasource> datasource;
+    if (file_io_ctx) {
+      file_io_object = file_io_ctx->create_io_object(lookup_path);
+      datasource     = file_io_ctx->make_datasource(file_io_object);
+    } else {
+      datasource = cudf::io::datasource::create(lookup_path);
+    }
 
     //===----------Parse metadata (with prefetch-cache reuse)----------===//
     // If the prefetching cache already has a parquet_metadata entry for this
@@ -249,8 +383,8 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     std::size_t footer_byte_len = 0;
     std::unique_ptr<op::scan::hybrid_scan_reader> reader_ptr;
 
-    if (file_io_object && planning_ioctx_it->second->cache() != nullptr) {
-      if (auto cached = planning_ioctx_it->second->cache()->get_metadata(*file_io_object)) {
+    if (file_io_object && file_io_ctx && file_io_ctx->cache() != nullptr) {
+      if (auto cached = file_io_ctx->cache()->get_metadata(*file_io_object)) {
         cached_parquet_metadata = std::dynamic_pointer_cast<parquet_metadata>(std::move(cached));
       }
     }
@@ -324,7 +458,7 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     // surviving row group + footer/trailer.  insert() must use the same
     // merged ranges scan_task computes — the cache only serves reads that
     // are fully covered by an inserted range.
-    if (file_io_object && planning_ioctx_it->second->cache() != nullptr &&
+    if (file_io_object && file_io_ctx && file_io_ctx->cache() != nullptr &&
         !row_group_indices.empty()) {
       using range_t = cudf::io::text::byte_range_info;
 
@@ -379,13 +513,14 @@ void parquet_split_provider::run_batch(file_batch const& batch,
       // and don't need to re-store it; otherwise we just parsed the footer and
       // hand the freshly-built parquet_metadata to the cache so the next scan
       // of this file can skip the footer fetch.
+      // Use per-file `file_io_ctx` (PR4+5 per-path dispatch) so mixed-backend
+      // batches each route metadata to the right backend's cache.
       std::shared_ptr<sirius::io::sirius_io_object_metadata> metadata_to_store =
         cached_parquet_metadata
           ? nullptr
           : std::static_pointer_cast<sirius::io::sirius_io_object_metadata>(
               std::make_shared<parquet_metadata>(file_metadata, footer_byte_len));
-      planning_ioctx_it->second->cache()->insert(
-        *file_io_object, std::move(metadata_to_store), ranges);
+      file_io_ctx->cache()->insert(*file_io_object, std::move(metadata_to_store), ranges);
     }
 
     std::vector<cudf::size_type> cur_rgs;
@@ -399,7 +534,7 @@ void parquet_split_provider::run_batch(file_batch const& batch,
                                 std::move(cur_rgs),
                                 cur_uncompressed_bytes,
                                 cur_compressed_bytes,
-                                planning_ioctx_it->second,
+                                file_io_ctx,
                                 file_io_object);
       // Promote the just-sealed slice's uncompressed bytes into the cross-file accumulator.
       accum.total_uncompressed_bytes += cur_uncompressed_bytes;

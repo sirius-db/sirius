@@ -549,6 +549,12 @@ class prefetching_cache {
   /// pool utilisation, and pending chunks.
   [[nodiscard]] std::string summary() const;
 
+  /// Effective cache capacity in bytes, i.e. the @c buffer_pool's current
+  /// capacity (slabs grown × chunk size). Perf benchmarks compare this
+  /// against the wire-bytes-read of a cold scan to detect "cache too small
+  /// to absorb the full object" warm-vs-cold ratios.
+  [[nodiscard]] std::size_t total_size_bytes() const noexcept { return _pool.capacity(); }
+
  private:
   // ---- work items dispatched through the queue ------------------------------
 

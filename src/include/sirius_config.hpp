@@ -18,6 +18,7 @@
 
 #include "config.hpp"
 #include "exec/config.hpp"
+#include "io/object_store_config.hpp"
 #include "op/scan/config.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 
@@ -81,6 +82,11 @@ struct sirius_config {
 
   [[nodiscard]] const scan_manager::scan_manager_config& get_scan_manager_config() const noexcept;
 
+  /// Overwrite the stored scan_manager_config. SiriusContext::initialize() uses
+  /// this to persist the S3 backend it materialized from object_store_config,
+  /// so a later get_config() reflects the actual scan_manager wiring.
+  void set_scan_manager_config(scan_manager::scan_manager_config config) noexcept;
+
   [[nodiscard]] const exec::thread_pool_config& get_gpu_pipeline_executor_config() const noexcept;
 
   [[nodiscard]] const exec::downgrade_executor_config& get_downgrade_executor_config()
@@ -109,6 +115,14 @@ struct sirius_config {
   }
 
   [[nodiscard]] operator_params& get_operator_params() noexcept { return _operator_params; }
+
+  /// Object-store backend credentials + endpoint. Empty fields disable the
+  /// S3 backend; SiriusContext::initialize() reads this to populate
+  /// scan_manager_config::s3_config before constructing the scan_manager.
+  /// Direct member access (no getter/setter) to keep the test fixture and
+  /// future SET-handler wiring simple — both sides write into this struct
+  /// and SiriusContext consumes it at initialize() time.
+  sirius::io::object_store_config object_store_config{};
 
  private:
   cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};

@@ -40,6 +40,8 @@ spdlog = "1.8.*"
 sqlite = "3.*"
 rust-src = "*"
 liburing = "*"
+openssl = "*"
+libcurl = "*"
 
 [tasks]
 
