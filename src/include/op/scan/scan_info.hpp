@@ -43,19 +43,12 @@ class sirius_scan_manager;
 namespace sirius::op::scan {
 
 /**
- * @brief Polymorphic base for per-format bind-data parked on a gpu scan operator.
+ * @brief Polymorphic base for per-format scan bind-data.
  *
- * Carries the scan fields common to every file-format scan (file paths,
- * projection, filters, partitions, output arity). Subclasses add format-specific
- * fields (e.g. iceberg snapshot id, manifest paths) and implement @ref make_provider
- * to construct the format's split_provider.
- *
- * The scan_manager reads scan_info during prepare_for_query to either short-circuit
- * to a cached_split_provider (using only base fields, so format-agnostic) or
- * dispatch through @ref make_provider to the format-specific provider.
- *
- * Populated once by the pipeline converter, then moved into the operator. Consumed
- * once by the scan_manager via the operator's take_scan_info().
+ * Carries the fields common to every file-format scan. Subclasses add
+ * format-specific fields and implement @ref make_provider. Populated by
+ * the pipeline converter; consumed once via the operator's
+ * take_scan_info().
  */
 struct scan_info {
   /// Logical types of the scan source's columns, in source schema order.
@@ -86,9 +79,8 @@ struct scan_info {
   /**
    * @brief Build the format-specific split_provider this scan_info dispatches to.
    *
-   * Called once by the scan_manager after the cache short-circuit has been
-   * checked and missed. May consume mutable fields on @c *this (e.g. moving
-   * @ref table_filters into the constructed provider).
+   * Called once by the scan_manager after the cache short-circuit misses.
+   * May move fields off @c *this into the provider.
    *
    * @param manager     Owning scan_manager, forwarded so the format provider can
    *                    route each path to its backend (s3:// -> s3_ioctx via

@@ -389,20 +389,10 @@ class sirius_scan_manager {
     std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces);
 
   /// \brief Build a cached_split_provider when a pinned entry matches the
-  ///        scan's file paths. Returns nullptr on miss so the caller can
-  ///        fall through to per-format dispatch. Format-agnostic: uses only
-  ///        fields on the scan_info base.
-  ///
-  /// @param info               Scan bind-data — file_paths, column_ids, names, types,
-  ///                           projection_ids, partition_indices, table_filters,
-  ///                           scan_output_arity. Read-only; not consumed.
-  /// @param op_id              Operator id for diagnostic logging.
-  /// @param gpu_memory_spaces  device_id -> GPU memory_space lookup forwarded to the
-  ///                           HOST-tier cached_split_provider for HOST->GPU
-  ///                           materialization at produce_split time. An empty
-  ///                           map disables the HOST-tier cache path (queries
-  ///                           against a host pin fall through to the per-format
-  ///                           provider).
+  ///        scan's file paths. Returns nullptr on miss. Reads only the
+  ///        format-agnostic base fields on @p info; not consumed.
+  ///        @p gpu_memory_spaces is forwarded to the HOST-tier
+  ///        cached_split_provider; an empty map disables the HOST-tier path.
   std::unique_ptr<split_provider> try_make_cached_provider(
     op::scan::scan_info const& info,
     std::size_t op_id,

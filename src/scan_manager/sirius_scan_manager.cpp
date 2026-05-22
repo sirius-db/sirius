@@ -232,20 +232,13 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
   auto info = op->take_scan_info();
   if (!info) { return nullptr; }
 
-  // Inject the per-GPU sirius_ioctx map into the operator BEFORE returning
-  // any provider (cached or per-format). read_table_from_metadata requires
-  // _gpu_ioctxs to be non-empty before its first invocation. The setter is
-  // idempotent and runs once per query; prepare_for_query (the sole caller of
-  // create_provider_for) runs before any execute(), so the operator sees the
-  // ioctx map well before the parquet scan path needs it for ioctx selection
-  // by scan_data.gpu_memory_space->get_device_id().
+  // Inject the per-GPU ioctx map into the operator before any provider returns —
+  // read_table_from_metadata needs it before its first invocation, and
+  // prepare_for_query runs before any execute().
   op->set_gpu_ioctxs(gpu_ioctxs);
 
-  // Pinned-cache short-circuit lives on the manager because it uses only the
-  // common scan_info fields (file_paths, column_ids, names, returned_types,
-  // projection_ids, partition_indices, table_filters) — format-agnostic. If
-  // it misses, dispatch through scan_info::make_provider() to the format's
-  // own split_provider construction.
+  // Cache short-circuit lives on the manager (format-agnostic); on miss,
+  // dispatch through the polymorphic make_provider.
   if (auto cached = try_make_cached_provider(*info, op->get_operator_id(), gpu_memory_spaces)) {
     return cached;
   }
@@ -273,11 +266,10 @@ std::unique_ptr<split_provider> sirius_scan_manager::try_make_cached_provider(
   try {
     for (auto const& [pinned_name, entry] : _pinned_entries) {
       if (!matches_scan_info(entry)) { continue; }
-      // A partial pin (created with pin_table(..., n_rows=N) where N capped
-      // the captured rows below the full file content) MUST NOT serve cached
-      // reads. The incoming scan_info doesn't carry an n_rows budget — serving
-      // the partial entry would silently return only the pinned prefix and
-      // mask the missing rows. Fall through to the per-format path.
+      // A partial pin (pin_table(..., n_rows=N) capped below the full file
+      // content) MUST NOT serve cached reads — the incoming scan_info carries
+      // no n_rows budget, so a partial-entry hit would silently mask missing
+      // rows. Fall through to the per-format path.
       if (entry.is_partial) {
         SIRIUS_LOG_DEBUG(
           "[sirius_scan_manager::try_make_cached_provider] pinned entry '{}' matches op_id={} but "
@@ -286,6 +278,7 @@ std::unique_ptr<split_provider> sirius_scan_manager::try_make_cached_provider(
           op_id);
         break;
       }
+
       // Build the canonical scan_plan once. Everything downstream — cached column
       // layout, filter pushdown indices, post-read assembly — reads from this.
       // Held by shared_ptr<const> so each emitted scan_cached_operator_data can
