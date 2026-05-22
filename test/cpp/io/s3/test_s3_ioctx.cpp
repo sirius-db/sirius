@@ -953,7 +953,7 @@ TEST_CASE("s3_ioctx retry backoff timing stays within tolerance", "[s3][ioctx][r
 }
 
 TEST_CASE("s3_ioctx reads single objects from MinIO with presigned range GETs",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -985,7 +985,7 @@ TEST_CASE("s3_ioctx reads single objects from MinIO with presigned range GETs",
 }
 
 TEST_CASE("s3_ioctx create_io_object populates S3 object metadata from MinIO",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1011,7 +1011,7 @@ TEST_CASE("s3_ioctx create_io_object populates S3 object metadata from MinIO",
 }
 
 TEST_CASE("s3_ioctx create_io_object propagates missing S3 key HEAD failures",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1023,7 +1023,7 @@ TEST_CASE("s3_ioctx create_io_object propagates missing S3 key HEAD failures",
   CHECK_THROWS(ctx->create_io_object(s3_uri(env->bucket, "nonexistent-key-xyz")));
 }
 
-TEST_CASE("s3_ioctx reads multiple MinIO byte ranges", "[s3][ioctx][integration]")
+TEST_CASE("s3_ioctx reads multiple MinIO byte ranges", "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1068,7 +1068,7 @@ TEST_CASE("s3_ioctx reads multiple MinIO byte ranges", "[s3][ioctx][integration]
 }
 
 TEST_CASE("s3_ioctx async range reads copy caller span descriptors before dispatch",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1126,7 +1126,7 @@ TEST_CASE("s3_ioctx async range reads copy caller span descriptors before dispat
 }
 
 TEST_CASE("s3_ioctx host_read_ranges clips EOF-crossing range before dst validation",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1157,7 +1157,7 @@ TEST_CASE("s3_ioctx host_read_ranges clips EOF-crossing range before dst validat
 }
 
 TEST_CASE("s3_ioctx host_read_ranges returns zero for ranges starting at EOF",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1185,7 +1185,7 @@ TEST_CASE("s3_ioctx host_read_ranges returns zero for ranges starting at EOF",
 }
 
 TEST_CASE("s3_ioctx host_read_ranges rejects dst smaller than clipped size",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1216,7 +1216,7 @@ TEST_CASE("s3_ioctx host_read_ranges rejects dst smaller than clipped size",
 }
 
 TEST_CASE("s3_ioctx host_read_ranges clips EOF-crossing ranges independently",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1251,7 +1251,7 @@ TEST_CASE("s3_ioctx host_read_ranges clips EOF-crossing ranges independently",
 }
 
 TEST_CASE("s3_ioctx device_read uses bounded FSMR staging for multi-chunk S3 objects",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1286,7 +1286,7 @@ TEST_CASE("s3_ioctx device_read uses bounded FSMR staging for multi-chunk S3 obj
 }
 
 TEST_CASE("s3_ioctx device_read with FSMR staging handles nonzero-offset remainder chunks",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1319,7 +1319,7 @@ TEST_CASE("s3_ioctx device_read with FSMR staging handles nonzero-offset remaind
 }
 
 TEST_CASE("s3_ioctx device_read with FSMR staging clips EOF-crossing reads",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1348,7 +1348,7 @@ TEST_CASE("s3_ioctx device_read with FSMR staging clips EOF-crossing reads",
 }
 
 TEST_CASE("s3_ioctx device_read with FSMR staging returns zero without borrowing a block",
-          "[s3][ioctx][integration]")
+          "[s3][ioctx]")
 {
   constexpr std::size_t block_size = 4096;
   fsmr_test_resources memory(block_size, block_size, block_size);
@@ -1365,7 +1365,7 @@ TEST_CASE("s3_ioctx device_read with FSMR staging returns zero without borrowing
 }
 
 TEST_CASE("s3_ioctx device_read keeps vector fallback when no FSMR is injected",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1386,8 +1386,7 @@ TEST_CASE("s3_ioctx device_read keeps vector fallback when no FSMR is injected",
   require_bytes_equal(copy_device_to_host(dst, got), local, 0);
 }
 
-TEST_CASE("s3_ioctx device_read rejects an injected FSMR with zero block size",
-          "[s3][ioctx][integration]")
+TEST_CASE("s3_ioctx device_read rejects an injected FSMR with zero block size", "[s3][ioctx]")
 {
   fsmr_test_resources memory(/*block_size=*/0, /*capacity=*/0, /*memory_limit=*/0);
   auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
@@ -1408,7 +1407,7 @@ TEST_CASE("s3_ioctx device_read rejects an injected FSMR with zero block size",
 }
 
 TEST_CASE("s3_ioctx device_read reports context when FSMR staging allocation is exhausted",
-          "[s3][ioctx][integration]")
+          "[s3][ioctx]")
 {
   constexpr std::size_t block_size = 4096;
   fsmr_test_resources memory(block_size, /*capacity=*/0, /*memory_limit=*/0);
@@ -1432,7 +1431,7 @@ TEST_CASE("s3_ioctx device_read reports context when FSMR staging allocation is 
 }
 
 TEST_CASE("s3_ioctx host_read_ranges_async_io fans ranges across the injected pool",
-          "[s3][ioctx][parallel][integration]")
+          "[.][s3][integration][ioctx][parallel]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1489,7 +1488,7 @@ TEST_CASE("s3_ioctx host_read_ranges_async_io fans ranges across the injected po
 }
 
 TEST_CASE("s3_ioctx destroys its prefetch cache before shutting down S3 async workers",
-          "[s3][ioctx][teardown][integration]")
+          "[.][s3][integration][ioctx][teardown]")
 {
   auto env = read_s3_test_env();
   if (!env) {

@@ -267,7 +267,7 @@ bool saw_scheme(std::vector<std::unique_ptr<parquet_scan_data>> const& splits,
 }  // namespace
 
 TEST_CASE("scan_manager S3 end-to-end reads nation parquet through sirius_datasource",
-          "[scan_manager][s3][integration]")
+          "[.][s3][integration][scan_manager]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -299,7 +299,7 @@ TEST_CASE("scan_manager S3 end-to-end reads nation parquet through sirius_dataso
 }
 
 TEST_CASE("scan_manager S3 end-to-end routes parquet_split_provider through S3 ioctx",
-          "[scan_manager][s3][integration]")
+          "[.][s3][integration][scan_manager]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -325,7 +325,7 @@ TEST_CASE("scan_manager S3 end-to-end routes parquet_split_provider through S3 i
 }
 
 TEST_CASE("scan_manager S3 end-to-end dispatches mixed local and S3 parquet paths",
-          "[scan_manager][s3][integration]")
+          "[.][s3][integration][scan_manager]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -353,7 +353,7 @@ TEST_CASE("scan_manager S3 end-to-end dispatches mixed local and S3 parquet path
 }
 
 TEST_CASE("scan_manager S3 end-to-end surfaces missing-key failures after retries",
-          "[scan_manager][s3][integration]")
+          "[.][s3][integration][scan_manager]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -370,7 +370,7 @@ TEST_CASE("scan_manager S3 end-to-end surfaces missing-key failures after retrie
 }
 
 TEST_CASE("scan_manager S3 end-to-end does not retry bad credentials indefinitely",
-          "[scan_manager][s3][integration]")
+          "[.][s3][integration][scan_manager]")
 {
   auto env = read_s3_test_env();
   if (!env) {

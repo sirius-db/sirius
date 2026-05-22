@@ -187,7 +187,8 @@ TEST_CASE("describe_parquet reports no matching backend with the URI in the erro
                       Catch::Contains("s3://missing-backend/object.parquet"));
 }
 
-TEST_CASE("describe_parquet surfaces S3 missing-object errors cleanly", "[s3][describe_parquet]")
+TEST_CASE("describe_parquet surfaces S3 missing-object errors cleanly",
+          "[.][s3][integration][describe_parquet]")
 {
   auto env = read_s3_test_env();
   if (skip_if_no_s3_env(env)) { return; }
@@ -199,7 +200,8 @@ TEST_CASE("describe_parquet surfaces S3 missing-object errors cleanly", "[s3][de
   REQUIRE_THROWS_WITH(manager.describe_parquet(uri), Catch::Contains("404"));
 }
 
-TEST_CASE("describe_parquet fetches only the footer over S3", "[s3][describe_parquet]")
+TEST_CASE("describe_parquet fetches only the footer over S3",
+          "[.][s3][integration][describe_parquet]")
 {
   auto env = read_s3_test_env();
   if (skip_if_no_s3_env(env)) { return; }
@@ -228,7 +230,7 @@ TEST_CASE("describe_parquet fetches only the footer over S3", "[s3][describe_par
 }
 
 TEST_CASE("describe_parquet inserts parsed parquet metadata into the prefetch cache",
-          "[s3][describe_parquet][cache]")
+          "[.][s3][integration][describe_parquet][cache]")
 {
   auto env = read_s3_test_env();
   if (skip_if_no_s3_env(env)) { return; }
@@ -255,7 +257,7 @@ TEST_CASE("describe_parquet inserts parsed parquet metadata into the prefetch ca
 }
 
 TEST_CASE("describe_parquet exposes the parquet footer row count for planner metadata",
-          "[s3][describe_parquet][planner-metadata]")
+          "[.][s3][integration][describe_parquet][planner-metadata]")
 {
   auto env = read_s3_test_env();
   if (skip_if_no_s3_env(env)) { return; }

@@ -1108,7 +1108,7 @@ TEST_CASE("sirius_read_parquet is registered as a one-argument table function",
 }
 
 TEST_CASE("sirius_read_parquet executes directly via transparent execution",
-          "[s3][sql][integration]")
+          "[.][s3][integration][sql]")
 {
   auto env = read_s3_test_env();
   if (skip_if_no_s3_env(env)) { return; }
@@ -1130,7 +1130,7 @@ TEST_CASE("sirius_read_parquet executes directly via transparent execution",
 }
 
 TEST_CASE("gpu_execution rewrites S3 read_parquet and scans through Sirius",
-          "[s3][sql][gpu_execution][integration]")
+          "[.][s3][integration][sql][gpu_execution]")
 {
   auto env = read_s3_test_env();
   if (skip_if_no_s3_env(env)) { return; }
@@ -1151,7 +1151,7 @@ TEST_CASE("gpu_execution rewrites S3 read_parquet and scans through Sirius",
 }
 
 TEST_CASE("gpu_execution can call sirius_read_parquet directly",
-          "[s3][sql][gpu_execution][integration]")
+          "[.][s3][integration][sql][gpu_execution]")
 {
   auto env = read_s3_test_env();
   if (skip_if_no_s3_env(env)) { return; }
@@ -1172,7 +1172,7 @@ TEST_CASE("gpu_execution can call sirius_read_parquet directly",
 }
 
 TEST_CASE("gpu_execution S3 SQL surface returns empty result sets cleanly",
-          "[s3][sql][gpu_execution][integration]")
+          "[.][s3][integration][sql][gpu_execution]")
 {
   auto env = read_s3_test_env();
   if (skip_if_no_s3_env(env)) { return; }
@@ -1189,7 +1189,7 @@ TEST_CASE("gpu_execution S3 SQL surface returns empty result sets cleanly",
 }
 
 TEST_CASE("gpu_execution S3 SQL surface matches local TPC-H Q3 shape",
-          "[s3][sql][gpu_execution][integration]")
+          "[.][s3][integration][sql][gpu_execution]")
 {
   auto env = read_s3_test_env();
   if (skip_if_no_s3_env(env)) { return; }
@@ -1213,7 +1213,7 @@ TEST_CASE("gpu_execution S3 SQL surface matches local TPC-H Q3 shape",
 }
 
 TEST_CASE("sirius_read_parquet bind returns row-count metadata for cardinality",
-          "[s3][sql][planner-metadata][integration]")
+          "[.][s3][integration][sql][planner-metadata]")
 {
   auto env = read_s3_test_env();
   if (skip_if_no_s3_env(env)) { return; }
@@ -1246,7 +1246,7 @@ TEST_CASE("sirius_read_parquet bind returns row-count metadata for cardinality",
 }
 
 TEST_CASE("sirius_read_parquet exposes S3 row count to DuckDB EXPLAIN",
-          "[s3][sql][planner-metadata][integration]")
+          "[.][s3][integration][sql][planner-metadata]")
 {
   auto env = read_s3_test_env();
   if (skip_if_no_s3_env(env)) { return; }
@@ -1261,7 +1261,7 @@ TEST_CASE("sirius_read_parquet exposes S3 row count to DuckDB EXPLAIN",
 }
 
 TEST_CASE("sirius_read_parquet exposes distinct S3 table cardinalities in joins",
-          "[s3][sql][planner-metadata][integration]")
+          "[.][s3][integration][sql][planner-metadata]")
 {
   auto env = read_s3_test_env();
   if (skip_if_no_s3_env(env)) { return; }
@@ -1280,7 +1280,7 @@ TEST_CASE("sirius_read_parquet exposes distinct S3 table cardinalities in joins"
 }
 
 TEST_CASE("gpu_execution S3 SQL surface scans all orders row groups",
-          "[s3][sql][gpu_execution][integration]")
+          "[.][s3][integration][sql][gpu_execution]")
 {
   auto env = read_s3_test_env();
   if (skip_if_no_s3_env(env)) { return; }

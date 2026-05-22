@@ -162,7 +162,7 @@ s3-test:
 	$(MAKE) s3-up; \
 	source $(S3_DIR)/env.sh; \
 	export SIRIUS_TEST_S3_STRICT=1; \
-	$(S3_TEST_BIN) "[s3]~[large]"
+	$(S3_TEST_BIN) "[s3][integration]~[large]"
 
 s3-sql-test: SHELL := /bin/bash
 s3-sql-test:
@@ -175,7 +175,7 @@ s3-sql-test:
 	$(MAKE) s3-up; \
 	source $(S3_DIR)/env.sh; \
 	export SIRIUS_TEST_S3_STRICT=1; \
-	$(S3_TEST_BIN) "[s3][sql]~[large]"
+	$(S3_TEST_BIN) "[s3][integration][sql]~[large]"
 
 s3-test-large: SHELL := /bin/bash
 s3-test-large:
