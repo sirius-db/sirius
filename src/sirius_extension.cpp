@@ -81,8 +81,9 @@ extern "C" int cudaProfilerStop();
 // <blockingconcurrentqueue.h> (used by spdlog / pipeline / duckdb
 // connection_manager). All consumers of blockingconcurrentqueue.h must
 // precede this include.
-#include "io/types.hpp"                // sirius::io::sirius_ioctx
-#include "io/uring/uring_reactor.hpp"  // sirius::io::uring_io_object
+#include "io/s3/sirius_s3_filesystem.hpp"  // sirius::io::s3::sirius_s3_filesystem
+#include "io/types.hpp"                    // sirius::io::sirius_ioctx
+#include "io/uring/uring_reactor.hpp"      // sirius::io::uring_io_object
 
 #include <cstdlib>
 #include <unordered_map>
@@ -1608,6 +1609,12 @@ static void LoadInternal(ExtensionLoader& loader)
   sirius::converter_registry::initialize();
   SiriusExtension::InitialGPUConfigs(config);
   SiriusExtension::RegisterGPUFunctions(db);
+
+  // Register the s3:// FileSystem subsystem so DuckDB's CPU read_parquet can
+  // read S3 parquet through Sirius's s3_ioctx (the S3 execution CPU fallback;
+  // newplan §29). Stateless: it resolves the per-connection s3_ioctx via the
+  // FileOpener -> ClientContext -> SiriusContext at OpenFile time.
+  db.GetFileSystem().RegisterSubSystem(make_uniq<sirius::io::s3::sirius_s3_filesystem>());
 
   // Register optimizer extension for transparent GPU execution.
   // Pre-hook disables incompatible optimizers; post-hook captures the plan.
