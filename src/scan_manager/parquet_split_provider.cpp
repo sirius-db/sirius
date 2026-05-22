@@ -259,9 +259,11 @@ void parquet_split_provider::run_batch(file_batch const& batch,
   // dev #732 forbids an empty gpu_ioctxs to keep local reads off cudf's kvikio
   // file_source (which binds one CUDA context per handle, breaking multi-GPU
   // residency). PR4+5 relaxes this: when a scan_manager is wired in, s3:// paths
-  // route through its s3_ioctx and local paths fall back to its uring backend,
-  // so an empty gpu_ioctxs is only fatal when there is also no scan_manager
-  // (legacy fixtures then fall through to cudf::io::datasource::create).
+  // route through its s3_ioctx and local paths through its borrowed uring backend,
+  // so an empty gpu_ioctxs is only fatal when there is ALSO no scan_manager —
+  // that case throws below. (The cudf::io::datasource::create fallback is a
+  // separate path in run_batch, taken only when a scan_manager IS present but
+  // reports no backend for a local path, e.g. use_sirius_datasource=false.)
   if (_gpu_ioctxs.empty() && _scan_manager == nullptr) {
     throw std::runtime_error(
       "parquet_split_provider: gpu_ioctxs is empty and no scan_manager is wired — "

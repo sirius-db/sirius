@@ -171,9 +171,11 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
 void task_creator::drain_pending_tasks()
 {
   // Drain any queued task creation requests that haven't been picked up yet
+  _task_creation_queue.interrupt();
   _task_creation_queue.drain();
   // Wait for any in-flight task creation lambdas to finish
   _bounded_pool->wait_all();
+  _task_creation_queue.reactivate();
 }
 
 void task_creator::reset(bool keep_parquet_metadata)
@@ -274,11 +276,10 @@ void task_creator::manager_loop()
       SIRIUS_LOG_INFO("Task Creator: pool interrupted, stopping manager loop");
       break;
     }
-
     auto request = _task_creation_queue.pop();
     if (!request) {
-      SIRIUS_LOG_INFO("Task Creator: task queue interrupted, stopping manager loop");
-      break;
+      // This is likely because the task creator was interrupted and the queue was drained
+      continue;
     }
 
     auto node = request->node;

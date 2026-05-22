@@ -168,6 +168,7 @@ set(EXTENSION_SOURCES
     # I/O adapters (Phase 19 — io_uring + sirius_datasource)
     src/io/admission_control.cpp
     src/io/datasource_factory.cpp
+    src/io/duckdb_io_object.cpp
     src/io/io_context.cpp
     src/io/prefetching_cache.cpp
     src/io/s3/s3_ioctx.cpp
@@ -198,6 +199,7 @@ set(EXTENSION_SOURCES
     src/op/scan/iceberg_scan_task.cpp
     src/op/scan/positional_delete_filter.cpp
     src/op/scan/puffin_reader.cpp
+    src/op/scan/parquet_scan_info.cpp
     src/op/scan/parquet_scan_task.cpp
     src/op/scan/parquet_schema_mapping.cpp
     src/op/scan/prefetched_data_source.cpp
@@ -447,6 +449,7 @@ set(TEST_SOURCES
     test/cpp/io/s3/test_sirius_sigv4_credential_provider.cpp
     test/cpp/io/s3/test_static_credentials.cpp
     test/cpp/io/test_datasource_factory.cpp
+    test/cpp/io/test_duckdb_io_object.cpp
     test/cpp/io/test_uri_parser.cpp
     test/cpp/integration/test_s3_perf_benchmark.cpp
     test/cpp/integration/test_scan_manager_s3_end_to_end.cpp

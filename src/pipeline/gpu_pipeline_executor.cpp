@@ -353,7 +353,10 @@ void gpu_pipeline_executor::manager_loop()
           }
         }
 
-        if (query_complete && _completion_handler) { _completion_handler->mark_completed(); }
+        if (query_complete && _completion_handler) {
+          _task_creator->drain_pending_tasks();
+          _completion_handler->mark_completed();
+        }
       });
   }
 }
