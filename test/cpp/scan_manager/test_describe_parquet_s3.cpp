@@ -14,6 +14,15 @@
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 
+// Include this last among sirius/test headers: it transitively pulls
+// liburing.h, whose BLOCK_SIZE macro collides with blockingconcurrentqueue.h.
+// clang-format off
+#include <scan/test_helpers_ioctx.hpp>
+// clang-format on
+
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
+
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -26,6 +35,9 @@
 #include <utility>
 
 using sirius::io::buffer_pool;
+using sirius::io::sirius_io_object;
+using sirius::io::sirius_ioctx;
+using sirius::io::uring_ioctx;
 using sirius::io::s3::s3_ioctx;
 using sirius::io::s3::s3_ioctx_config;
 using sirius::io::s3::sirius_sigv4_credential_provider;
@@ -102,6 +114,61 @@ std::size_t cache_capacity_bytes(std::size_t block_size, std::uint32_t max_slabs
 {
   return block_size * static_cast<std::size_t>(buffer_pool::CHUNKS_PER_SLAB) *
          static_cast<std::size_t>(max_slabs);
+}
+
+std::string strip_file_scheme(std::string_view path)
+{
+  static constexpr std::string_view file_scheme = "file://";
+  if (path.size() > file_scheme.size() && path.substr(0, file_scheme.size()) == file_scheme) {
+    return std::string{path.substr(file_scheme.size())};
+  }
+  return std::string{path};
+}
+
+class file_uri_uring_ioctx final : public uring_ioctx {
+ public:
+  file_uri_uring_ioctx()
+    : uring_ioctx(/*host_ring_depth=*/16,
+                  /*ring_entries=*/64,
+                  /*n_reactors=*/1,
+                  /*bounce_slot_size=*/1UL * 1024 * 1024)
+  {
+  }
+
+  std::shared_ptr<sirius_io_object> create_io_object(std::string path) override
+  {
+    return uring_ioctx::create_io_object(strip_file_scheme(path));
+  }
+
+  [[nodiscard]] bool supports(std::string_view path) const override
+  {
+    return uring_ioctx::supports(strip_file_scheme(path));
+  }
+};
+
+struct host_cache_memory {
+  host_cache_memory()
+    : upstream(0, true),
+      host_mr(0,
+              upstream,
+              cache_capacity_bytes(cache_block_size, cache_max_slabs),
+              cache_capacity_bytes(cache_block_size, cache_max_slabs),
+              cache_block_size,
+              static_cast<std::size_t>(buffer_pool::CHUNKS_PER_SLAB),
+              1),
+      pool(host_mr, cache_max_slabs)
+  {
+  }
+
+  cucascade::memory::numa_region_pinned_host_memory_resource upstream;
+  cucascade::memory::fixed_size_host_memory_resource host_mr;
+  buffer_pool pool;
+};
+
+std::filesystem::path parquet_fixture(std::string_view file_name)
+{
+  return std::filesystem::path{SIRIUS_PROJECT_ROOT} / "test" / "cpp" / "integration" / "data" /
+         "parquet" / file_name;
 }
 
 s3_ioctx_config make_s3_config(s3_test_env const& env)
@@ -185,6 +252,52 @@ TEST_CASE("describe_parquet reports no matching backend with the URI in the erro
 
   REQUIRE_THROWS_WITH(manager.describe_parquet("s3://missing-backend/object.parquet"),
                       Catch::Contains("s3://missing-backend/object.parquet"));
+}
+
+TEST_CASE("describe_parquet parses local parquet footer metadata through the ioctx path",
+          "[scan_manager][describe_parquet][s3]")
+{
+  auto local_ctx = std::make_shared<file_uri_uring_ioctx>();
+
+  scan_manager_config cfg{};
+  cfg.use_sirius_datasource = true;
+  sirius_scan_manager manager(std::move(cfg), {std::static_pointer_cast<sirius_ioctx>(local_ctx)});
+
+  for (auto const fixture_name : {"nation.parquet", "orders.parquet"}) {
+    auto const uri = "file://" + parquet_fixture(fixture_name).string();
+    auto bind_info = manager.describe_parquet(uri);
+
+    CHECK_FALSE(bind_info.names.empty());
+    CHECK(bind_info.return_types.size() == bind_info.names.size());
+    CHECK(bind_info.total_num_rows > 0);
+    CHECK(bind_info.object_size > 0);
+  }
+}
+
+TEST_CASE("describe_parquet metadata-only insert round-trips local parquet footer through cache",
+          "[scan_manager][describe_parquet][s3][cache]")
+{
+  host_cache_memory cache_memory;
+  auto local_ctx = std::make_shared<file_uri_uring_ioctx>();
+  local_ctx->initialize_cache(cache_memory.pool, 8);
+
+  scan_manager_config cfg{};
+  cfg.use_sirius_datasource = true;
+  sirius_scan_manager manager(std::move(cfg), {std::static_pointer_cast<sirius_ioctx>(local_ctx)});
+
+  auto const uri = "file://" + parquet_fixture("orders.parquet").string();
+  auto bind_info = manager.describe_parquet(uri);
+  auto io_object = local_ctx->create_io_object(uri);
+  auto metadata  = local_ctx->cache()->get_metadata(*io_object);
+
+  REQUIRE(metadata != nullptr);
+  auto parquet = std::dynamic_pointer_cast<parquet_metadata>(metadata);
+  REQUIRE(parquet != nullptr);
+  REQUIRE(parquet->file_metadata() != nullptr);
+
+  CHECK(bind_info.total_num_rows == static_cast<std::size_t>(parquet->file_metadata()->num_rows));
+  CHECK(parquet->footer_byte_len() > 0);
+  CHECK(parquet->file_metadata()->schema.size() >= bind_info.names.size() + 1);
 }
 
 TEST_CASE("describe_parquet surfaces S3 missing-object errors cleanly",
