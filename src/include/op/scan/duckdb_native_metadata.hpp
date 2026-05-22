@@ -18,6 +18,8 @@
 
 #include "helper/logical_type.hpp"
 
+#include <cudf/types.hpp>
+
 #include <duckdb/common/enums/compression_type.hpp>
 #include <duckdb/common/types.hpp>
 #include <duckdb/main/client_context.hpp>
@@ -26,6 +28,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -49,10 +53,10 @@ struct duckdb_segment_descriptor {
   duckdb::idx_t segment_start;
   duckdb::idx_t segment_count;
   duckdb::CompressionType compression;
-  /// 0 means the stat was not advertised. Dictionary-family VARCHAR codecs
-  /// require it; Uncompressed VARCHAR tolerates 0 by flipping the row
-  /// group's `decoded_bytes_budget_is_lower_bound`.
-  std::uint32_t max_string_length = 0;
+  /// Parsed from `ColumnSegmentInfo::segment_stats`. nullopt on validity
+  /// and non-VARCHAR segments. Every VARCHAR segment in a viable walk
+  /// carries Some; Some(0) is the legal all-empty-row-group case.
+  std::optional<std::uint32_t> max_string_length;
 };
 
 struct duckdb_column_metadata {
@@ -73,16 +77,23 @@ struct duckdb_row_group_metadata {
   /// Parallel to the walker's `projected_cols` argument.
   std::vector<duckdb_column_metadata> columns;
   std::size_t decoded_bytes_budget = 0;
-  /// True when at least one column fell back to
-  /// `VARCHAR_UNKNOWN_LENGTH_FALLBACK_BYTES`. Treat the budget as a soft
-  /// lower bound in that case.
-  bool decoded_bytes_budget_is_lower_bound = false;
+  /// Parallel to `columns`. For varchar columns: Σ(seg.segment_count ×
+  /// *seg.max_string_length) — the upper bound used against the cudf int32
+  /// chars threshold. 0 for non-varchar columns. Populated by the walker so
+  /// downstream partitioning never re-walks segments.
+  std::vector<std::size_t> varchar_bytes_per_col;
 };
 
-/// Per-row byte budget used for VARCHAR columns whose row group did not
-/// advertise a max-string-length stat (Uncompressed only — dictionary
-/// codecs refuse in that case).
-inline constexpr std::uint32_t VARCHAR_UNKNOWN_LENGTH_FALLBACK_BYTES = 256;
+/// Default-mode cudf strings columns use int32 offsets;
+/// `make_offsets_child_column` throws `std::overflow_error` ("Size of output
+/// exceeds the column size limit") when total chars per strings column
+/// `>= std::numeric_limits<cudf::size_type>::max()` unless
+/// `LIBCUDF_LARGE_STRINGS_ENABLED` is set. Sirius does not opt in and its
+/// strings-decode kernels (`gpu_decode_strings.cu`) are hard-coded to
+/// int32 offsets, so the walker refuses any row group whose per-column
+/// varchar upper bound hits this threshold.
+constexpr std::size_t kCudfInt32StringsThreshold =
+  static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
 
 /// When `viable` is false the walker bailed at the first unsupported
 /// segment or type; `row_groups` is partial and must not be consumed.
