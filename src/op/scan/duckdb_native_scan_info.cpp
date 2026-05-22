@@ -24,8 +24,14 @@
 namespace sirius::op::scan {
 
 std::unique_ptr<scan_manager::split_provider> duckdb_native_scan_info::make_provider(
+  scan_manager::sirius_scan_manager& manager,
   std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs)
 {
+  // The .duckdb-native path routes through a single local ioctx, not S3 path
+  // routing, so the scan_manager is unused here — unlike parquet/S3, which use
+  // it via io_ctx_shared_for(path). It stays in the signature only to satisfy
+  // the combined-runtime scan_info::make_provider(manager, gpu_ioctxs) contract.
+  (void)manager;
   // duckdb_native_scan_task currently uses a single ioctx (Phase B lift is per
   // single-GPU). Pick the first ioctx in the map; pass nullptr when empty so
   // the split_provider falls through to BufferManager::Pin.

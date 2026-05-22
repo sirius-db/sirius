@@ -71,6 +71,7 @@ find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
+pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
 
 # cuCascade - GPU Memory Reservation Library (submodule) cucascade links `numa`
 # as a bare library name (-lnuma). In the vcpkg build the static libnuma.a lives
@@ -170,6 +171,7 @@ set(EXTENSION_SOURCES
     src/io/duckdb_io_object.cpp
     src/io/io_context.cpp
     src/io/prefetching_cache.cpp
+    src/io/s3/s3_ioctx.cpp
     src/io/s3/sigv4.cpp
     src/io/s3/sirius_sigv4_credential_provider.cpp
     src/io/sirius_datasource.cpp
@@ -347,11 +349,17 @@ foreach(_target sirius_extension sirius_loadable_extension)
 endforeach()
 
 # Additional libraries only needed by the static extension
-target_link_libraries(sirius_extension PkgConfig::NUMA PkgConfig::LIBURING
-                      OpenSSL::Crypto yaml-cpp::yaml-cpp absl::any_invocable)
+target_link_libraries(
+  sirius_extension
+  PkgConfig::NUMA
+  PkgConfig::LIBURING
+  PkgConfig::CURL
+  OpenSSL::Crypto
+  yaml-cpp::yaml-cpp
+  absl::any_invocable)
 
 target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING
-                      OpenSSL::Crypto)
+                      PkgConfig::CURL OpenSSL::Crypto)
 
 # cucascade upstream PRs #126/#128/#130 moved cucascade to static-CUDA linkage
 # and pulled the NVML *static stub* (libnvidia-ml.a) into libcucascade.a via the
@@ -439,11 +447,14 @@ set(TEST_SOURCES
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/integration/test_transparent_execution.cpp
     test/cpp/io/s3/test_sigv4.cpp
+    test/cpp/io/s3/test_s3_ioctx.cpp
     test/cpp/io/s3/test_sirius_sigv4_credential_provider.cpp
     test/cpp/io/s3/test_static_credentials.cpp
     test/cpp/io/test_datasource_factory.cpp
     test/cpp/io/test_duckdb_io_object.cpp
     test/cpp/io/test_uri_parser.cpp
+    test/cpp/integration/test_s3_perf_benchmark.cpp
+    test/cpp/integration/test_scan_manager_s3_end_to_end.cpp
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
     test/cpp/operator/test_physical_hash_join_mgpu.cpp
     test/cpp/operator/test_physical_order_mgpu.cpp
@@ -493,9 +504,11 @@ set(TEST_SOURCES
     test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_scan_task.cpp
     test/cpp/scan/test_parquet_split_provider.cpp
+    test/cpp/scan/test_parquet_split_provider_s3.cpp
     test/cpp/scan/test_partition_inject.cpp
     test/cpp/scan/test_scan_executor.cpp
     test/cpp/scan/test_split_connector.cpp
+    test/cpp/scan_manager/test_sirius_scan_manager_s3.cpp
     test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
     test/cpp/unittest.cpp
     test/cpp/utils/sirius_test_env.cpp

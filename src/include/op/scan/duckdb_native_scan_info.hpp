@@ -53,7 +53,11 @@ struct duckdb_native_scan_info : public scan_info {
   std::string db_path;
 
   /// Single call only — moves *this into the returned split_provider.
+  /// @p manager is part of the polymorphic scan_info::make_provider contract
+  /// (parquet/S3 use it for io_ctx_shared_for path routing) but is unused here:
+  /// the .duckdb-native path runs on a single local ioctx taken from @p gpu_ioctxs.
   std::unique_ptr<scan_manager::split_provider> make_provider(
+    scan_manager::sirius_scan_manager& manager,
     std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs) override;
 };
 

@@ -57,6 +57,14 @@ namespace sirius::memory {
 class numa_small_pinned_mr;
 }  // namespace sirius::memory
 
+namespace sirius::io {
+class buffer_pool;
+}  // namespace sirius::io
+
+namespace sirius::exec {
+class static_thread_pool;
+}  // namespace sirius::exec
+
 namespace sirius {
 class sirius_engine;
 }  // namespace sirius
@@ -212,6 +220,14 @@ class SiriusContext : public ClientContextState {
     return gpu_ioctxs_;
   }
 
+  /// @brief The SiriusContext-owned S3 backend, or nullptr when no
+  ///        object_store_config is wired (S6 increment 1: a single shared
+  ///        instance; increment 2 shards it per NUMA node). The scan_manager
+  ///        borrows this for s3:// routing; SiriusContext is the owner and
+  ///        releases it in terminate(). Returns a shared_ptr copy — callers
+  ///        must not extend its lifetime past terminate().
+  [[nodiscard]] std::shared_ptr<sirius::io::sirius_ioctx> get_s3_ioctx() const { return s3_ioctx_; }
+
   /// @brief Read-only access to the datasource registry populated at startup.
   /// @details kFileScheme is registered at the end of initialize() against
   ///          the lowest-numbered GPU's sirius_ioctx; object-store schemes
@@ -334,10 +350,29 @@ class SiriusContext : public ClientContextState {
   // pinned bounce slots (numa_alloc_onnode + cudaHostRegister Portable|Mapped)
   // to the same node.
   //
-  // Teardown order in terminate(): datasource_registry_ -> gpu_ioctxs_ (the
-  // view, drops references) -> numa_ioctxs_ (actual destruction of reactor
-  // pools + bounce buffers under a live CUDA context, BEFORE memory_manager_
-  // shutdown).
+  // S6 (NUMA): SiriusContext owns the scan-side IO backends; the scan_manager
+  // only borrows them for routing. These three are declared BEFORE numa_ioctxs_
+  // / s3_ioctx_ so the implicit-destructor backstop frees the prefetch
+  // buffer_pool LAST, after every cache that references it (the per-NUMA uring
+  // caches and the s3 cache). The authoritative path is the explicit ordering
+  // in terminate().
+  //
+  // Pinned-host pool backing every backend's prefetching cache. Built only when
+  // enable_prefetch_cache is set. prefetching_cache holds it as a buffer_pool&,
+  // so it must outlive all caches — declared first, destroyed last.
+  std::unique_ptr<sirius::io::buffer_pool> prefetch_buffer_pool_;
+  // Dedicated S3 async worker pool, injected into the s3_ioctx. Built only when
+  // an S3 backend is configured. Must outlive s3_ioctx_ (declared before it).
+  std::unique_ptr<sirius::exec::static_thread_pool> s3_thread_pool_;
+  // The S3 backend (S6 increment 1: single shared instance), owned here and
+  // borrowed by the scan_manager. nullptr when no object_store_config is wired.
+  std::shared_ptr<sirius::io::sirius_ioctx> s3_ioctx_;
+  // Teardown order in terminate(): scan_manager_ (drops borrowed aliases) ->
+  // datasource_registry_ -> gpu_ioctxs_ (view, drops references) -> numa_ioctxs_
+  // (destroys reactor pools + uring caches under a live CUDA context) ->
+  // s3_ioctx_ (destroys s3 cache) -> s3_thread_pool_ -> prefetch_buffer_pool_
+  // (last, after every cache that references it), all BEFORE memory_manager_
+  // shutdown.
   std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> numa_ioctxs_;
   // device_id -> normalized NUMA node id ((-1) -> 0). Computed once at
   // initialize() from get_hw_topology().gpus[].numa_node. get_ioctx_for()

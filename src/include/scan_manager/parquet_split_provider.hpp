@@ -52,6 +52,8 @@ class sirius_ioctx;
 
 namespace sirius::scan_manager {
 
+class sirius_scan_manager;
+
 /**
  * @brief Split provider that parses parquet metadata and emits one
  *        @c parquet_scan_data per row-group partition.
@@ -98,6 +100,14 @@ class parquet_split_provider : public split_provider {
    *                                bypasses the io_uring + per-GPU
    *                                CUDA-context binding.
    */
+  /// No-scan_manager overload (dev #732 + tests). @c _scan_manager stays
+  /// nullptr; local reads route through @p gpu_ioctxs (per-GPU local backends,
+  /// injected by tests via @c make_test_gpu_ioctxs). When both @p gpu_ioctxs is
+  /// empty AND there is no scan_manager, @c run_batch throws (the cudf/kvikio
+  /// local file_source is forbidden under the multi-GPU model) — so this
+  /// overload requires a non-empty @p gpu_ioctxs. The @c cudf::io::datasource
+  /// fallback now only triggers when a scan_manager is wired but reports no
+  /// backend for a local path (e.g. @c use_sirius_datasource=false).
   parquet_split_provider(
     duckdb::vector<sirius::logical_type> const& returned_types,
     std::vector<std::string> const& file_paths,
@@ -111,6 +121,35 @@ class parquet_split_provider : public split_provider {
     std::size_t max_file_processed     = DEFAULT_MAX_FILE_PROCESSED,
     std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs = {});
 
+  /// @param scan_manager  Reference to the engine's @c sirius_scan_manager.
+  ///                      Used for per-path ioctx dispatch via
+  ///                      @c sirius_scan_manager::io_ctx_shared_for(path):
+  ///                      each file in @p file_paths is independently routed
+  ///                      to its supporting backend at @c run_batch time.
+  ///                      A URI with a non-@c file scheme (e.g. @c s3://)
+  ///                      claimed by no backend causes @c run_batch to
+  ///                      throw @c std::runtime_error ("no backend
+  ///                      supports path: ..."); a local path — bare, or a
+  ///                      @c file:// URI of any case, normalized to a bare
+  ///                      path — with no backend falls back to
+  ///                      @c cudf::io::datasource::create.
+  /// @param gpu_ioctxs    Per-GPU sirius_ioctx map (dev #732). Forwarded for
+  ///                      the local-file footer/metadata planning read; the
+  ///                      S3 branch routes through @p scan_manager instead.
+  parquet_split_provider(
+    duckdb::vector<sirius::logical_type> const& returned_types,
+    std::vector<std::string> const& file_paths,
+    duckdb::vector<duckdb::ColumnIndex> const& column_ids,
+    duckdb::vector<duckdb::idx_t> const& projection_ids,
+    duckdb::vector<std::string> const& names,
+    std::size_t scan_output_arity,
+    duckdb::unique_ptr<duckdb::TableFilterSet> table_filter_set,
+    duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
+    std::size_t approximate_batch_size,
+    std::size_t max_file_processed,
+    sirius_scan_manager& scan_manager,
+    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs = {});
+
   ~parquet_split_provider() override;
 
   parquet_split_provider(const parquet_split_provider&)            = delete;
@@ -122,8 +161,28 @@ class parquet_split_provider : public split_provider {
 
   /// \brief Atomically claim the next batch index and return a callable that
   ///        runs the metadata scan for it. Once every batch has been claimed,
-  ///        the returned callable yields an empty vector.
+  ///        @c next_split_provider returns @c nullptr — base @c run() skips
+  ///        the empty slot rather than enqueueing a no-op task.
   std::function<std::vector<std::unique_ptr<op::operator_data>>()> next_split_provider() override;
+
+ private:
+  /// Internal delegating ctor that both public ctors forward to. Carrying
+  /// scan_manager as a pointer lets the legacy (no-scan_manager) public
+  /// ctor delegate with nullptr, falling through to
+  /// @c cudf::io::datasource::create in @c run_batch.
+  parquet_split_provider(
+    duckdb::vector<sirius::logical_type> const& returned_types,
+    std::vector<std::string> const& file_paths,
+    duckdb::vector<duckdb::ColumnIndex> const& column_ids,
+    duckdb::vector<duckdb::idx_t> const& projection_ids,
+    duckdb::vector<std::string> const& names,
+    std::size_t scan_output_arity,
+    duckdb::unique_ptr<duckdb::TableFilterSet> table_filter_set,
+    duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
+    std::size_t approximate_batch_size,
+    std::size_t max_file_processed,
+    sirius_scan_manager* scan_manager,
+    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs = {});
 
  private:
   struct file_batch {
@@ -146,6 +205,17 @@ class parquet_split_provider : public split_provider {
   std::size_t _approximate_batch_size;
   std::size_t _max_file_processed;
   std::size_t _total_files;
+  /// Scan manager reference for per-path ioctx dispatch. Resolved per-file
+  /// in @c run_batch via @c _scan_manager->io_ctx_shared_for(file_path) so
+  /// mixed-backend batches (e.g. local file:// + s3://) each read through
+  /// their supporting backend. May be nullptr only for test fixtures that
+  /// build the provider without any scan_manager — production paths
+  /// (@c create_provider_for) always set this to a live manager.
+  sirius_scan_manager* _scan_manager{nullptr};
+  /// Per-GPU sirius_ioctx map (dev #732). Used for the local-file footer/
+  /// metadata planning read (any GPU's ioctx — footer reads are GPU-agnostic;
+  /// per-GPU column placement is decided downstream by task affinity). The S3
+  /// branch routes through @c _scan_manager instead.
   std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> _gpu_ioctxs;
 
   std::vector<file_batch> _batches;

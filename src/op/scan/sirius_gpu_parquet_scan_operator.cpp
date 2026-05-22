@@ -171,11 +171,25 @@ std::unique_ptr<cudf::table> sirius_gpu_parquet_scan_operator::read_table_from_m
   std::vector<std::shared_ptr<sirius::io::sirius_io_object>> io_objects;
   io_objects.reserve(scan_data.rg_slices.size());
   for (auto const& slice : scan_data.rg_slices) {
+    // Two-dimensional ioctx selection (multi-GPU #732 × multi-backend-S3).
+    // slice.io_ctx is the backend that minted slice.io_object:
+    //   * per-GPU LOCAL backend (one of _gpu_ioctxs) → rebind the read to the
+    //     *target* GPU's local ioctx so it binds to the executing GPU's CUDA
+    //     context (dev #732 residency); the planning-time GPU may differ.
+    //   * shared REMOTE backend (e.g. the single s3_ioctx) → read through
+    //     slice.io_ctx directly; S3 is network→host and not per-GPU.
+    auto const is_per_gpu_local = [&] {
+      for (auto const& [dev, ctx] : _gpu_ioctxs) {
+        if (ctx == slice.io_ctx) { return true; }
+      }
+      return false;
+    }();
+    auto const ds_ioctx = (slice.io_ctx && !is_per_gpu_local) ? slice.io_ctx : ioctx_it->second;
     if (slice.io_object) {
-      sources.push_back(ioctx_it->second->make_datasource(slice.io_object));
+      sources.push_back(ds_ioctx->make_datasource(slice.io_object));
     } else {
-      auto io_object = ioctx_it->second->create_io_object(slice.file_path);
-      sources.push_back(ioctx_it->second->make_datasource(io_object));
+      auto io_object = ds_ioctx->create_io_object(slice.file_path);
+      sources.push_back(ds_ioctx->make_datasource(io_object));
       io_objects.push_back(std::move(io_object));
     }
     metadatas.push_back(*slice.file_metadata);  // copy unavoidable: cudf takes by value
