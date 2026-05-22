@@ -36,14 +36,12 @@ struct duckdb_native_scan_info;
 cucascade::memory::memory_space* pick_gpu_memory_space_for_duckdb_native_scan(
   duckdb_native_scan_info const& scan_info);
 
-/// Decode a single split (a contiguous run of row-group metadata produced by
-/// the walker) into a cudf::table.
-///
-/// V1 spike scope: fixed-width data codecs UNCOMPRESSED / RLE / BITPACKING,
-/// rowid synthesis, UNCOMPRESSED / EMPTY / CONSTANT validity. Throws
-/// std::runtime_error on VARCHAR columns, CONSTANT data segments, ROARING
-/// validity, or any other codec the walker accepted but the spike does not
-/// yet handle. Those are deliberate V2 follow-ups.
+/// Decode a single split (contiguous run of row-group metadata from the
+/// walker) into a cudf::table. Supported: fixed-width data (UNCOMPRESSED /
+/// RLE / BITPACKING / CONSTANT), varchar data (UNCOMPRESSED / DICTIONARY /
+/// FSST / DICT_FSST), validity (UNCOMPRESSED / EMPTY / CONSTANT / ROARING),
+/// rowid synthesis. Throws std::runtime_error on any codec the walker
+/// accepted but this decoder does not implement.
 std::unique_ptr<cudf::table> decode_duckdb_native_split(
   scan_manager::duckdb_native_split_provider::split_payload const& split,
   cucascade::memory::memory_space& mem_space,

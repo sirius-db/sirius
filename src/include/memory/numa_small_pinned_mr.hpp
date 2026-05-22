@@ -77,7 +77,7 @@ class numa_small_pinned_mr {
 
   ~numa_small_pinned_mr() = default;
 
-  void* allocate(cuda::stream_ref stream,
+  void* allocate(::cuda::stream_ref stream,
                  std::size_t bytes,
                  std::size_t alignment = alignof(std::max_align_t))
   {
@@ -90,7 +90,7 @@ class numa_small_pinned_mr {
     return ptr;
   }
 
-  void deallocate(cuda::stream_ref stream,
+  void deallocate(::cuda::stream_ref stream,
                   void* ptr,
                   std::size_t bytes,
                   std::size_t alignment = alignof(std::max_align_t)) noexcept
@@ -111,20 +111,20 @@ class numa_small_pinned_mr {
 
   void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
   {
-    return allocate(cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
+    return allocate(::cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
   }
 
   void deallocate_sync(void* ptr,
                        std::size_t bytes,
                        std::size_t alignment = alignof(std::max_align_t)) noexcept
   {
-    deallocate(cuda::stream_ref{cudaStream_t{nullptr}}, ptr, bytes, alignment);
+    deallocate(::cuda::stream_ref{cudaStream_t{nullptr}}, ptr, bytes, alignment);
   }
 
   bool operator==(numa_small_pinned_mr const& other) const noexcept { return this == &other; }
 
-  friend void get_property(numa_small_pinned_mr const&, cuda::mr::device_accessible) noexcept {}
-  friend void get_property(numa_small_pinned_mr const&, cuda::mr::host_accessible) noexcept {}
+  friend void get_property(numa_small_pinned_mr const&, ::cuda::mr::device_accessible) noexcept {}
+  friend void get_property(numa_small_pinned_mr const&, ::cuda::mr::host_accessible) noexcept {}
 
  private:
   int node_for_current_device() const noexcept
@@ -156,8 +156,8 @@ class numa_small_pinned_mr {
   std::unordered_map<void*, int> ptr_to_node_;
 };
 
-static_assert(cuda::mr::resource_with<numa_small_pinned_mr,
-                                      cuda::mr::device_accessible,
-                                      cuda::mr::host_accessible>);
+static_assert(::cuda::mr::resource_with<numa_small_pinned_mr,
+                                        ::cuda::mr::device_accessible,
+                                        ::cuda::mr::host_accessible>);
 
 }  // namespace sirius::memory

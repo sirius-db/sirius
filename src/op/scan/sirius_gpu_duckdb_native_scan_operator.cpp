@@ -113,14 +113,14 @@ std::unique_ptr<operator_data> sirius_gpu_duckdb_native_scan_operator::execute(
   auto const& info = *split->scan_info;
   auto mr_ref      = mem_space->get_default_allocator();
 
-  auto const& source_ids = !info.projection_ids.empty() ? info.projection_ids : [&] {
-    duckdb::vector<duckdb::idx_t> all;
-    all.reserve(info.column_ids.size());
+  duckdb::vector<duckdb::idx_t> source_ids_fallback;
+  if (info.projection_ids.empty()) {
+    source_ids_fallback.reserve(info.column_ids.size());
     for (duckdb::idx_t i = 0; i < info.column_ids.size(); ++i) {
-      all.push_back(i);
+      source_ids_fallback.push_back(i);
     }
-    return all;
-  }();
+  }
+  auto const& source_ids = info.projection_ids.empty() ? source_ids_fallback : info.projection_ids;
 
   std::vector<std::optional<std::size_t>> emission_order_map(info.column_ids.size());
   for (std::size_t k = 0; k < source_ids.size(); ++k) {

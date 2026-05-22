@@ -218,10 +218,11 @@ void compute_decoded_byte_budgets(duckdb_native_metadata& md,
   }
 }
 
-// ColumnSegmentInfo exposes block_id + block_offset but not segment_size.
-// Derive it by sorting all segments by (block_id, block_offset) and taking
-// the offset delta with the next segment in the same block. Last-in-block
-// falls back to `block_size - block_offset`.
+// ColumnSegmentInfo lacks segment_size. Derive via sorted-by-(block_id,
+// block_offset) delta to the next walked segment; last-in-block falls back
+// to `block_size - block_offset`. Upper bound only: trailing free space and
+// cross-table partial-block neighbors inflate it. Codec headers self-bound
+// reads, so correctness-safe; only H2D and staging bytes pay the overshoot.
 void compute_segment_bytes_size(duckdb_native_metadata& md, std::size_t block_size)
 {
   std::vector<duckdb_segment_descriptor*> refs;

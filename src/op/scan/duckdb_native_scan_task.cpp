@@ -14,13 +14,6 @@
  * limitations under the License.
  */
 
-// clang-format off
-// sirius_context.hpp must precede cuda/scan/*: resource_ref_utils.hpp
-// references ::cuda::stream_ref unqualified, and an earlier sirius::cuda
-// open would shadow it.
-#include "sirius_context.hpp"
-// clang-format on
-
 #include "op/scan/duckdb_native_scan_task.hpp"
 
 #include "cuda/scan/gpu_decode_strings.cuh"
@@ -32,6 +25,7 @@
 #include "log/logging.hpp"
 #include "op/scan/duckdb_block_layout.hpp"
 #include "op/scan/duckdb_native_scan_info.hpp"
+#include "sirius_context.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -230,17 +224,20 @@ pinned_segment_bytes read_block_via_io(::sirius::io::sirius_ioctx& ctx,
                                        duckdb::SingleFileBlockManager const& bm,
                                        duckdb_segment_descriptor const& seg)
 {
-  const std::size_t block_size = bm.GetBlockSize();
   pinned_segment_bytes out;
-  out.owned_bytes.resize(block_size);
+  if (seg.bytes_size == 0) { return out; }
+  out.owned_bytes.resize(seg.bytes_size);
   const std::size_t got = ctx.host_read(
-    obj, duckdb_block_payload_offset(bm, seg.block_id), block_size, out.owned_bytes.data());
-  if (got != block_size) {
+    obj,
+    duckdb_block_payload_offset(bm, seg.block_id) + static_cast<std::size_t>(seg.block_offset),
+    seg.bytes_size,
+    out.owned_bytes.data());
+  if (got != seg.bytes_size) {
     throw std::runtime_error(std::string(kTag) + " short host_read for block_id " +
                              std::to_string(seg.block_id) + ": got " + std::to_string(got) +
-                             " expected " + std::to_string(block_size));
+                             " expected " + std::to_string(seg.bytes_size));
   }
-  out.host_ptr = out.owned_bytes.data() + seg.block_offset;
+  out.host_ptr = out.owned_bytes.data();
   out.bytes    = seg.bytes_size;
   return out;
 }
@@ -256,17 +253,17 @@ pinned_segment_bytes read_blocks_with_additional_via_io(::sirius::io::sirius_ioc
   std::vector<uint8_t> concat;
   concat.resize(main_payload_size + seg.additional_blocks.size() * block_size);
 
-  // Main block: read full payload then memcpy starting at block_offset.
-  {
-    std::vector<uint8_t> main_buf(block_size);
+  // Main block: read just bytes_size from (payload + block_offset). No temp + memcpy.
+  if (main_payload_size > 0) {
     const std::size_t got = ctx.host_read(
-      obj, duckdb_block_payload_offset(bm, seg.block_id), block_size, main_buf.data());
-    if (got != block_size) {
+      obj,
+      duckdb_block_payload_offset(bm, seg.block_id) + static_cast<std::size_t>(seg.block_offset),
+      main_payload_size,
+      concat.data());
+    if (got != main_payload_size) {
       throw std::runtime_error(std::string(kTag) + " short host_read for main block_id " +
-                               std::to_string(seg.block_id));
-    }
-    if (main_payload_size > 0) {
-      std::memcpy(concat.data(), main_buf.data() + seg.block_offset, main_payload_size);
+                               std::to_string(seg.block_id) + ": got " + std::to_string(got) +
+                               " expected " + std::to_string(main_payload_size));
     }
   }
 
@@ -623,10 +620,10 @@ void copy_staged_to_device(rmm::device_buffer& device_buf,
                                  cudaMemcpyHostToDevice,
                                  stream.value()));
   }
-  // Async H2D from pageable host into an RMM pool buffer leaves the destination
-  // unpopulated when the FSST symbol-table parse reads it via synchronous
-  // cudaMemcpy on the NULL / per-thread default stream (no ordering with our
-  // scan stream). Sync once here so all downstream readers see populated bytes.
+  // Pageable→cuda_async_memory_resource H2D has an empirical stream-ordering
+  // hazard: same-stream kernels can read pool residue at the destination.
+  // Sync once per upload batch. To drop: pinned source AND lifetime that
+  // outlives the kernel (event-tagged pool return or operator-owned staging).
   RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));
 }
 
