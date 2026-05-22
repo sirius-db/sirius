@@ -190,6 +190,7 @@ set(EXTENSION_SOURCES
     src/op/scan/duckdb_scan_executor.cpp
     src/op/scan/cpu_source_task.cpp
     src/op/scan/duckdb_native_metadata.cpp
+    src/op/scan/duckdb_native_scan_task.cpp
     src/op/scan/duckdb_scan_task.cpp
     src/op/scan/equality_delete_filter.cpp
     src/op/scan/hive_partition.cpp
@@ -206,6 +207,7 @@ set(EXTENSION_SOURCES
     src/op/scan/prefetched_data_source.cpp
     src/op/scan/scan_plan.cpp
     src/op/scan/scan_utils.cpp
+    src/op/scan/sirius_gpu_duckdb_native_scan_operator.cpp
     src/op/scan/sirius_gpu_parquet_scan_operator.cpp
     src/op/sirius_dynamic_filter.cpp
     src/op/sirius_physical_column_data_scan.cpp
@@ -494,6 +496,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_task_scheduler.cpp
     test/cpp/scan/bench_decode_codecs.cpp
     test/cpp/scan/test_column_builder.cpp
+    test/cpp/scan/test_duckdb_block_layout.cpp
     test/cpp/scan/test_duckdb_native_split_provider.cpp
     test/cpp/scan/test_duckdb_native_walker.cpp
     test/cpp/scan/test_gpu_decode_alp.cpp

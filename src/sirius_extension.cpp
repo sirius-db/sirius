@@ -1353,6 +1353,15 @@ static void SetEnableGpuExecution(ClientContext& context, SetScope scope, Value&
   SIRIUS_LOG_DEBUG("Updated gpu_execution to {}", BooleanValue::Get(parameter));
 }
 
+static void SetEnableGpuDuckdbNativeScan(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->enable_gpu_duckdb_native_scan = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_GPU_DUCKDB_NATIVE_SCAN to {}",
+                   params->enable_gpu_duckdb_native_scan);
+}
+
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 {
   // Add in config option for gpu buffer manager
@@ -1532,6 +1541,14 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::BOOLEAN,
     Value::BOOLEAN(true),
     SetEnableGpuExecution);
+
+  config.AddExtensionOption(
+    "enable_gpu_duckdb_native_scan",
+    "Route DuckDB seq_scan to the GPU-native scan operator instead of the CPU fallback "
+    "(experimental; off by default)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(sirius::operator_params{}.enable_gpu_duckdb_native_scan),
+    SetEnableGpuDuckdbNativeScan);
 }
 
 static void LoadInternal(ExtensionLoader& loader)

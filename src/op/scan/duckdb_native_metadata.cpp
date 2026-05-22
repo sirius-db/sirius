@@ -19,8 +19,11 @@
 #include "log/logging.hpp"
 
 #include <duckdb/function/partition_stats.hpp>
+#include <duckdb/main/attached_database.hpp>
+#include <duckdb/storage/block_manager.hpp>
 #include <duckdb/storage/statistics/base_statistics.hpp>
 #include <duckdb/storage/statistics/string_stats.hpp>
+#include <duckdb/storage/storage_manager.hpp>
 #include <duckdb/storage/table_storage_info.hpp>
 
 #include <algorithm>
@@ -212,6 +215,34 @@ void compute_decoded_byte_budgets(duckdb_native_metadata& md,
       }
     }
     rg_md.decoded_bytes_budget = budget;
+  }
+}
+
+// ColumnSegmentInfo exposes block_id + block_offset but not segment_size.
+// Derive it by sorting all segments by (block_id, block_offset) and taking
+// the offset delta with the next segment in the same block. Last-in-block
+// falls back to `block_size - block_offset`.
+void compute_segment_bytes_size(duckdb_native_metadata& md, std::size_t block_size)
+{
+  std::vector<duckdb_segment_descriptor*> refs;
+  for (auto& rg : md.row_groups) {
+    for (auto& col : rg.columns) {
+      for (auto& s : col.data_segments)
+        if (s.block_id >= 0) refs.push_back(&s);
+      for (auto& s : col.validity_segments)
+        if (s.block_id >= 0) refs.push_back(&s);
+    }
+  }
+  std::sort(refs.begin(), refs.end(), [](const auto* a, const auto* b) {
+    if (a->block_id != b->block_id) return a->block_id < b->block_id;
+    return a->block_offset < b->block_offset;
+  });
+  for (std::size_t i = 0; i < refs.size(); ++i) {
+    auto& seg                = *refs[i];
+    const bool last_in_block = i + 1 == refs.size() || refs[i + 1]->block_id != seg.block_id;
+    const std::size_t end =
+      last_in_block ? block_size : static_cast<std::size_t>(refs[i + 1]->block_offset);
+    seg.bytes_size = end - static_cast<std::size_t>(seg.block_offset);
   }
 }
 
@@ -420,6 +451,9 @@ duckdb_native_metadata walk_duckdb_native_metadata(
       std::sort(col_md.validity_segments.begin(), col_md.validity_segments.end(), seg_less);
     }
   }
+
+  compute_segment_bytes_size(
+    md, storage.GetAttached().GetStorageManager().GetBlockManager().GetBlockSize());
 
   compute_row_counts(md, partition_stats);
   compute_decoded_byte_budgets(md, projected_types);

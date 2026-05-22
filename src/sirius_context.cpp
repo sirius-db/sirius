@@ -557,6 +557,10 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // s3_config == std::nullopt and the scan_manager skips s3_ioctx
   // construction. The FSMR is passed through to uring_ioctx / buffer_pool.
   auto sm_config = config_.get_scan_manager_config();
+  // The duckdb-native scan routes block reads via sirius_ioctx::host_read; the
+  // ioctx requires the substrate built, so force it on when a host_fsmr is
+  // available.
+  if (host_fsmr != nullptr) { sm_config.use_sirius_datasource = true; }
   if (!config_.object_store_config.endpoint.empty() &&
       !config_.object_store_config.access_key.empty() &&
       !config_.object_store_config.secret_key.empty()) {
