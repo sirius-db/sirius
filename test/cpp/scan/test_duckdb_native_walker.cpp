@@ -230,35 +230,84 @@ TEST_CASE("walker separates data and validity segments by column_path",
   REQUIRE(saw_validity);
 }
 
-TEST_CASE("walker walks VARCHAR (Uncompressed) table without max-length stat needed",
+TEST_CASE("walker populates per-segment max_string_length for VARCHAR",
           "[scan][duckdb_native_walker]")
 {
+  // After the walk succeeds, every VARCHAR data segment must carry Some(...).
   auto [db_owner, con] = sirius::make_test_db_and_connection();
   exec_ok(con, "CREATE TABLE t(s VARCHAR)");
-  exec_ok(con, "INSERT INTO t SELECT 'hello' FROM range(0, 200)");
+  exec_ok(con, "INSERT INTO t SELECT 'hello' FROM range(0, 2500)");
   exec_ok(con, "CHECKPOINT");
   auto& storage = get_storage(con, "t");
 
   std::vector<projected_column> cols   = {real_col(0)};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::VARCHAR)};
   auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
-  // Both outcomes are valid: viable=true (Uncompressed/RLE varchar) or
-  // viable=false with a max_string_length reason (Dictionary/FSST without
-  // the stat). Confirm the walk didn't crash and the budget flag is honest.
-  if (md.viable) {
-    REQUIRE_FALSE(md.row_groups.empty());
-    for (const auto& rg : md.row_groups) {
-      bool any_varchar_unknown = false;
-      for (const auto& d : rg.columns[0].data_segments) {
-        if (d.max_string_length == 0) {
-          any_varchar_unknown = true;
-          break;
-        }
-      }
-      if (any_varchar_unknown) { REQUIRE(rg.decoded_bytes_budget_is_lower_bound); }
+  REQUIRE(md.viable);
+  REQUIRE_FALSE(md.row_groups.empty());
+  for (const auto& rg : md.row_groups) {
+    for (const auto& d : rg.columns[0].data_segments) {
+      REQUIRE(d.max_string_length.has_value());
+      REQUIRE(*d.max_string_length == 5);  // "hello" → length 5
     }
-  } else {
-    REQUIRE_FALSE(md.viability_failure_reason.empty());
+  }
+}
+
+TEST_CASE("walker accepts all-empty varchar row group (Some(0))", "[scan][duckdb_native_walker]")
+{
+  // An all-empty-string row group is legal data — DuckDB stores
+  // MaxStringLength: 0 in the segment_stats blob, and the walker accepts.
+  // Real-world example: clickbench SocialAction, ParamOrderID, Title row
+  // groups (Dict-encoded, msl=0).
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  exec_ok(con, "CREATE TABLE t(s VARCHAR)");
+  exec_ok(con, "INSERT INTO t SELECT '' FROM range(0, 100000)");
+  exec_ok(con, "CHECKPOINT");
+  auto& storage = get_storage(con, "t");
+
+  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::VARCHAR)};
+  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+
+  REQUIRE(md.viable);
+  REQUIRE_FALSE(md.row_groups.empty());
+  bool saw_zero = false;
+  for (const auto& rg : md.row_groups) {
+    for (const auto& d : rg.columns[0].data_segments) {
+      REQUIRE(d.max_string_length.has_value());
+      if (*d.max_string_length == 0) { saw_zero = true; }
+    }
+  }
+  REQUIRE(saw_zero);
+}
+
+TEST_CASE("walker per-segment max_string_length reflects long strings",
+          "[scan][duckdb_native_walker]")
+{
+  // The stat is per-storage-segment, not per-row-group. The hard guarantee
+  // we can lock in here is that long strings make it into the value (it's
+  // not collapsed to 0 or a vector-level number). A fixture that forces
+  // multiple distinct per-segment values is fragile — DuckDB's compressor
+  // may pack three short-string classes into one segment. The empirical
+  // "values genuinely vary within an rg" case is verified against
+  // ClickBench data (rg 0 Title has 28 segments with msl 520..1026).
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  exec_ok(con, "CREATE TABLE t(s VARCHAR)");
+  exec_ok(con, "INSERT INTO t SELECT repeat('x', 500) FROM range(0, 5000)");
+  exec_ok(con, "CHECKPOINT");
+  auto& storage = get_storage(con, "t");
+
+  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::VARCHAR)};
+  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  REQUIRE(md.viable);
+  REQUIRE_FALSE(md.row_groups.empty());
+
+  for (const auto& rg : md.row_groups) {
+    for (const auto& d : rg.columns[0].data_segments) {
+      REQUIRE(d.max_string_length.has_value());
+      REQUIRE(*d.max_string_length == 500);
+    }
   }
 }
 
