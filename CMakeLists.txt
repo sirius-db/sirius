@@ -199,6 +199,7 @@ set(EXTENSION_SOURCES
     src/op/scan/iceberg_scan_task.cpp
     src/op/scan/positional_delete_filter.cpp
     src/op/scan/puffin_reader.cpp
+    src/op/scan/duckdb_native_scan_info.cpp
     src/op/scan/parquet_scan_info.cpp
     src/op/scan/parquet_scan_task.cpp
     src/op/scan/parquet_schema_mapping.cpp
@@ -265,6 +266,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_recursive_cte.cpp
     src/planner/sirius_plan_top_n.cpp
     src/scan_manager/cached_split_provider.cpp
+    src/scan_manager/duckdb_native_split_provider.cpp
     src/pin_table.cpp
     src/scan_manager/parquet_split_provider.cpp
     src/scan_manager/sirius_scan_manager.cpp
@@ -492,6 +494,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_task_scheduler.cpp
     test/cpp/scan/bench_decode_codecs.cpp
     test/cpp/scan/test_column_builder.cpp
+    test/cpp/scan/test_duckdb_native_split_provider.cpp
     test/cpp/scan/test_duckdb_native_walker.cpp
     test/cpp/scan/test_gpu_decode_alp.cpp
     test/cpp/scan/test_gpu_decode_bitpacking.cpp

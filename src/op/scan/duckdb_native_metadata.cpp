@@ -24,9 +24,14 @@
 #include <duckdb/storage/table_storage_info.hpp>
 
 #include <algorithm>
+#include <cassert>
+#include <charconv>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -124,56 +129,23 @@ bool is_supported_logical_type(const sirius::logical_type& type, std::string& re
   return false;
 }
 
-std::uint32_t lookup_max_string_length(duckdb::PartitionRowGroup& prg,
-                                       const duckdb::StorageIndex& storage_idx)
+// Extract "Max String Length: N" from a StringStats text blob. The token
+// only appears in StringStats, so a forward find is safe. nullopt = field
+// absent from the blob (segment was written without the stat).
+std::optional<std::uint32_t> parse_segment_max_string_length(std::string_view blob)
 {
-  auto stats = prg.GetColumnStatistics(storage_idx);
-  if (!stats) { return 0; }
-  if (!duckdb::StringStats::HasMaxStringLength(*stats)) { return 0; }
-  return duckdb::StringStats::MaxStringLength(*stats);
+  constexpr std::string_view kNeedle = "Max String Length: ";
+  auto pos                           = blob.find(kNeedle);
+  if (pos == std::string_view::npos) { return std::nullopt; }
+  pos += kNeedle.size();
+  std::uint32_t value = 0;
+  auto [ptr, ec]      = std::from_chars(blob.data() + pos, blob.data() + blob.size(), value);
+  if (ec != std::errc{}) { return std::nullopt; }
+  return value;
 }
 
-using row_group_handles =
-  std::vector<std::pair<duckdb::idx_t, duckdb::shared_ptr<duckdb::PartitionRowGroup>>>;
-
-class varchar_max_length_resolver {
- public:
-  varchar_max_length_resolver(const row_group_handles& handles,
-                              const std::vector<projected_column>& projected_cols)
-    : _handles(handles), _projected_cols(projected_cols)
-  {
-  }
-
-  /// Returns 0 when the row group did not advertise the stat.
-  std::uint32_t get(duckdb::idx_t rg_idx, duckdb::idx_t col_id, std::size_t projected_ci)
-  {
-    const auto k = key(rg_idx, col_id);
-    auto it      = _cache.find(k);
-    if (it != _cache.end()) { return it->second; }
-    std::uint32_t max_len = 0;
-    if (rg_idx < _handles.size() && _handles[rg_idx].second) {
-      max_len = lookup_max_string_length(*_handles[rg_idx].second,
-                                         _projected_cols[projected_ci].storage_idx);
-    }
-    _cache.emplace(k, max_len);
-    return max_len;
-  }
-
- private:
-  // col_id is narrowed to uint32; >2^32 columns would alias.
-  static std::uint64_t key(duckdb::idx_t rg, duckdb::idx_t col)
-  {
-    return (static_cast<std::uint64_t>(rg) << 32) | static_cast<std::uint32_t>(col);
-  }
-
-  const row_group_handles& _handles;
-  const std::vector<projected_column>& _projected_cols;
-  std::unordered_map<std::uint64_t, std::uint32_t> _cache;
-};
-
 duckdb_segment_descriptor build_segment_descriptor(const duckdb::ColumnSegmentInfo& seg,
-                                                   duckdb::CompressionType compression,
-                                                   std::uint32_t max_string_length)
+                                                   duckdb::CompressionType compression)
 {
   duckdb_segment_descriptor desc{};
   desc.block_id          = seg.block_id;
@@ -182,9 +154,11 @@ duckdb_segment_descriptor build_segment_descriptor(const duckdb::ColumnSegmentIn
   desc.segment_start     = seg.segment_start;
   desc.segment_count     = seg.segment_count;
   desc.compression       = compression;
-  desc.max_string_length = max_string_length;
   return desc;
 }
+
+using row_group_handles =
+  std::vector<std::pair<duckdb::idx_t, duckdb::shared_ptr<duckdb::PartitionRowGroup>>>;
 
 // Use PartitionStatistics::count as the source of truth so rowid-only
 // projections (no data segments to sum) still get a real row_count.
@@ -212,15 +186,13 @@ void compute_row_counts(duckdb_native_metadata& md,
   }
 }
 
-// VARCHAR columns whose row group did not advertise a max-string-length
-// stat fall back to VARCHAR_UNKNOWN_LENGTH_FALLBACK_BYTES per row and the
-// row group's `decoded_bytes_budget_is_lower_bound` is set.
+// Per-segment exact: chars + offsets. Walker refuse-on-absent guarantees
+// every VARCHAR data segment carries Some here.
 void compute_decoded_byte_budgets(duckdb_native_metadata& md,
                                   const std::vector<sirius::logical_type>& projected_types)
 {
   for (auto& rg_md : md.row_groups) {
     std::size_t budget = 0;
-    bool any_unknown   = false;
     for (std::size_t ci = 0; ci < rg_md.columns.size(); ++ci) {
       const auto& col_md = rg_md.columns[ci];
       if (col_md.is_rowid) {
@@ -228,22 +200,18 @@ void compute_decoded_byte_budgets(duckdb_native_metadata& md,
         continue;
       }
       if (projected_types[ci].is_varchar()) {
-        std::uint32_t max_len = 0;
-        for (const auto& d : col_md.data_segments) {
-          max_len = std::max(max_len, d.max_string_length);
+        std::size_t chars_total = 0;
+        for (const auto& seg : col_md.data_segments) {
+          chars_total += static_cast<std::size_t>(seg.segment_count) *
+                         static_cast<std::size_t>(*seg.max_string_length);
         }
-        if (max_len == 0) {
-          max_len     = VARCHAR_UNKNOWN_LENGTH_FALLBACK_BYTES;
-          any_unknown = true;
-        }
-        budget += static_cast<std::size_t>(rg_md.row_count) * (sizeof(std::uint32_t) + max_len);
+        budget += chars_total + static_cast<std::size_t>(rg_md.row_count) * sizeof(std::uint32_t);
       } else {
         budget +=
           static_cast<std::size_t>(rg_md.row_count) * projected_types[ci].fixed_width_byte_size();
       }
     }
-    rg_md.decoded_bytes_budget                = budget;
-    rg_md.decoded_bytes_budget_is_lower_bound = any_unknown;
+    rg_md.decoded_bytes_budget = budget;
   }
 }
 
@@ -335,17 +303,14 @@ duckdb_native_metadata walk_duckdb_native_metadata(
   row_group_handles handles;
   handles.reserve(partition_stats.size());
   for (std::size_t i = 0; i < partition_stats.size(); ++i) {
-    auto& ps                = partition_stats[i];
-    duckdb::idx_t row_start = 0;
-    if (ps.row_start.IsValid()) {
-      row_start = ps.row_start.GetIndex();
-    } else {
-      // Not expected on a materialized row group at v1.5.2; rowid synthesis
-      // for this group would emit incorrect ids.
-      SIRIUS_LOG_WARN(
-        "[duckdb_native_metadata] partition_stats[{}].row_start is not valid; defaulting to 0", i);
+    auto& ps = partition_stats[i];
+    if (!ps.row_start.IsValid()) {
+      // Defaulting to 0 would emit wrong rowids; route to CPU instead.
+      refuse("partition_stats[" + std::to_string(i) +
+             "].row_start is not valid; cannot synthesize rowids");
+      return md;
     }
-    handles.emplace_back(row_start, ps.partition_row_group);
+    handles.emplace_back(ps.row_start.GetIndex(), ps.partition_row_group);
   }
 
   // O(1) skip for non-projected columns in the GetColumnSegmentInfo loop.
@@ -381,8 +346,6 @@ duckdb_native_metadata walk_duckdb_native_metadata(
     if (rg < handles.size()) { md.row_groups[rg].row_group_start = handles[rg].first; }
   }
 
-  varchar_max_length_resolver max_len_resolver(handles, projected_cols);
-
   for (const auto& seg : column_segments) {
     auto pl = projected_lookup.find(seg.column_id);
     if (pl == projected_lookup.end()) { continue; }  // not projected
@@ -400,25 +363,19 @@ duckdb_native_metadata walk_duckdb_native_metadata(
       return md;
     }
 
-    std::uint32_t max_string_length = 0;
+    auto desc = build_segment_descriptor(seg, compression);
+
     if (!validity_seg && projected_types[ci].is_varchar()) {
-      // Dictionary-family codecs need the stat to size the host-side
-      // pre-decode buffer.
-      const bool needs_max_len = compression == duckdb::CompressionType::COMPRESSION_DICTIONARY ||
-                                 compression == duckdb::CompressionType::COMPRESSION_FSST ||
-                                 compression == duckdb::CompressionType::COMPRESSION_DICT_FSST;
-      if (needs_max_len) {
-        max_string_length = max_len_resolver.get(rg_idx, seg.column_id, ci);
-        if (max_string_length == 0) {
-          refuse("varchar segment on column " + std::to_string(seg.column_id) + " row group " +
-                 std::to_string(rg_idx) + ": codec \"" + seg.compression_type +
-                 "\" needs max_string_length stat but row group did not advertise one");
-          return md;
-        }
+      // Refuse on absent stat so downstream consumers can deref unchecked.
+      // Some(0) is legal data (all-empty row group); decode produces 0 chars.
+      desc.max_string_length = parse_segment_max_string_length(seg.segment_stats);
+      if (!desc.max_string_length.has_value()) {
+        refuse("varchar segment on column " + std::to_string(seg.column_id) + " row group " +
+               std::to_string(rg_idx) + ": Max String Length stat absent from segment_stats");
+        return md;
       }
     }
 
-    auto desc    = build_segment_descriptor(seg, compression, max_string_length);
     auto& col_md = md.row_groups[rg_idx].columns[ci];
     if (validity_seg) {
       col_md.validity_segments.push_back(std::move(desc));
@@ -426,6 +383,30 @@ duckdb_native_metadata walk_duckdb_native_metadata(
       col_md.data_segments.push_back(std::move(desc));
     }
   }
+
+#ifndef NDEBUG
+  // Invariant: DuckDB's typed PartitionRowGroup::GetColumnStatistics returns
+  // max(per-segment) via StringStats::Merge. Catches API drift.
+  for (std::size_t rg_idx = 0; rg_idx < handles.size(); ++rg_idx) {
+    auto& prg = handles[rg_idx].second;
+    if (!prg) { continue; }
+    for (std::size_t ci = 0; ci < projected_cols.size(); ++ci) {
+      if (projected_cols[ci].is_rowid || !projected_types[ci].is_varchar()) { continue; }
+      auto stats = prg->GetColumnStatistics(projected_cols[ci].storage_idx);
+      if (!stats || !duckdb::StringStats::HasMaxStringLength(*stats)) { continue; }
+      const auto rg_typed_max   = duckdb::StringStats::MaxStringLength(*stats);
+      const auto& data_segs     = md.row_groups[rg_idx].columns[ci].data_segments;
+      std::uint32_t per_seg_max = 0;
+      for (const auto& seg : data_segs) {
+        if (seg.max_string_length.has_value()) {
+          per_seg_max = std::max(per_seg_max, *seg.max_string_length);
+        }
+      }
+      assert(rg_typed_max == per_seg_max &&
+             "DuckDB rg-level MaxStringLength != max(per-segment) — Merge semantics drifted?");
+    }
+  }
+#endif
 
   // GetColumnSegmentInfo at v1.5.2 already yields segments in segment_start
   // order per (column, row group); this sort is a guard against future
@@ -443,6 +424,36 @@ duckdb_native_metadata walk_duckdb_native_metadata(
   compute_row_counts(md, partition_stats);
   compute_decoded_byte_budgets(md, projected_types);
   drop_empty_trailing_row_groups(md);
+
+  // Per-column varchar upper bound, cached on each row group so the
+  // partitioner is a pure read. Walker refuses any row group whose
+  // per-column upper bound hits the cudf int32 chars threshold (cudf
+  // throws there in default-mode make_offsets_child_column).
+  for (auto& rg : md.row_groups) {
+    rg.varchar_bytes_per_col.assign(projected_cols.size(), 0);
+    for (std::size_t ci = 0; ci < projected_cols.size(); ++ci) {
+      if (projected_cols[ci].is_rowid || !projected_types[ci].is_varchar()) { continue; }
+      std::size_t total = 0;
+      for (const auto& seg : rg.columns[ci].data_segments) {
+        total += static_cast<std::size_t>(seg.segment_count) *
+                 static_cast<std::size_t>(*seg.max_string_length);
+      }
+      if (total >= kCudfInt32StringsThreshold) {
+        refuse("row group " + std::to_string(rg.row_group_index) + " column " +
+               std::to_string(rg.columns[ci].column_id) + " varchar chars upper bound (" +
+               std::to_string(total) + ") >= cudf int32 chars threshold");
+        return md;
+      }
+      rg.varchar_bytes_per_col[ci] = total;
+    }
+  }
+
+  if (md.row_groups.empty()) {
+    // Zero splits would hang the pipeline on the FULL barrier; refuse so
+    // the transparent fallback routes to DuckDB CPU.
+    refuse("no row groups in table (empty or fully pruned)");
+    return md;
+  }
 
   md.viable = true;
   SIRIUS_LOG_DEBUG(
