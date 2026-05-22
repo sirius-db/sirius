@@ -694,6 +694,19 @@ TEST_CASE("ast_from_duckdb - BOUND_PARAMETER returns nullptr", "[ast_from_duckdb
 // trigger a multi-second SiriusContext setup it does not need.
 // ============================================================================
 
+// Why optimizer-off rather than populate-the-table-and-leave-optimizer-on:
+// populating `t` with rows would let the optimizer run, which would fold the
+// binder's BETWEEN-as-AND rewrite back into a single BoundBetween — but it
+// would also pull in two unrelated rewrites that obscure what we're testing.
+// FilterPushdown can move `a BETWEEN 1 AND 10` into LogicalGet::table_filters
+// (a TableFilter tree, not BoundExpressions) and elide the LogicalFilter
+// entirely, so the BETWEEN disappears from op.expressions. LikeOptimizationRule
+// rewrites `b LIKE 'x%'` into a `prefix(b, 'x')` function call, so the LIKE
+// landmark disappears too. Both rewrites are optimizer-version sensitive and
+// would couple this test to optimizer pass behavior. We keep the optimizer
+// off and assert against the binder's actual output — the rewrites the binder
+// itself performs (documented below) are stable and part of the binder's
+// public contract.
 TEST_CASE("ast_from_duckdb - real Binder output translates to non-null trees",
           "[ast_from_duckdb][ast_from_duckdb_binder]")
 {
@@ -713,24 +726,67 @@ TEST_CASE("ast_from_duckdb - real Binder output translates to non-null trees",
   REQUIRE(plan);
 
   // Recursive descent over the Sirius AST. We collect the presence of the
-  // four landmark kinds we expect from the four SQL fragments in the query,
+  // landmark kinds we expect from the four SQL fragments in the query,
   // rather than asserting an exact tree shape (the Binder may wrap children
   // in implicit casts or rearrange unrelated structure).
-  bool saw_between     = false;
+  //
+  // BETWEEN landmark note: two binder/planner rewrites combine to strip
+  // away both `between` and `conjunction` nodes for this query:
+  //   1. The binder rewrites a BETWEEN whose input is non-volatile /
+  //      non-parameter / non-subquery into a copy-input AND of two
+  //      comparisons — see
+  //      duckdb/src/planner/binder/expression/bind_between_expression.cpp
+  //      lines 54-63. The optimizer would normally fold that pair back into
+  //      a single BoundBetweenExpression, but this test disables the
+  //      optimizer.
+  //   2. LogicalFilter::SplitPredicates (filter construction, not the
+  //      optimizer — see duckdb/src/planner/operator/logical_filter.cpp
+  //      line 25) then flattens the top-level AND into two separate filter
+  //      expressions on the LogicalFilter, so no BoundConjunction survives
+  //      in the planned tree either.
+  // Net effect: the filter for `a BETWEEN 1 AND 10` arrives here as two
+  // sibling BoundComparisonExpressions (`a >= 1` and `a <= 10`). Coverage
+  // for the actual translate_between arm lives in the direct-construction
+  // case "BOUND_BETWEEN translates to between node with inclusive bounds"
+  // earlier in this file; here we assert the rewritten form instead.
+  bool saw_compare_ge  = false;
+  bool saw_compare_le  = false;
   bool saw_add         = false;
   bool saw_like        = false;
   bool saw_is_not_null = false;
-  // The query's expected node set is {between, function_call, unary_op,
-  // reference, constant}. Only the three non-leaf kinds need a descent arm;
-  // any other kind appearing here would indicate an unexpected binder
-  // rewrite and is surfaced by the landmark assertions failing below.
+  // The query's expected node set after the binder + filter rewrites is
+  // {comparison, function_call, unary_op, reference, constant}. The
+  // between/conjunction arms are retained defensively so a future query
+  // tweak that legitimately produces either kind (e.g. volatile BETWEEN
+  // input, or an AND that survives because it's nested inside a
+  // projection rather than a filter) still descends through them.
   std::function<void(node const&)> visit_node = [&](node const& n) {
     if (n.holds<between>()) {
-      saw_between    = true;
       auto const& bw = n.get<between>();
       if (bw.input) visit_node(*bw.input);
       if (bw.lower) visit_node(*bw.lower);
       if (bw.upper) visit_node(*bw.upper);
+    } else if (n.holds<conjunction>()) {
+      // Defensive descent. See the BETWEEN landmark note above for why no
+      // conjunction node is expected for this specific query — but if a
+      // future tweak places an AND somewhere LogicalFilter::SplitPredicates
+      // can't flatten (e.g. inside a projection), we still want to recurse
+      // through it so leaf landmarks remain reachable.
+      auto const& cj = n.get<conjunction>();
+      for (auto const& c : cj.children) {
+        if (c) visit_node(*c);
+      }
+    } else if (n.holds<comparison>()) {
+      // The two comparisons produced by the BETWEEN rewrite land here as
+      // sibling expressions on the LogicalFilter: `a >= 1` (ge) and
+      // `a <= 10` (le). Asserting both ops appear is what pins down that
+      // the rewritten form really came from the original BETWEEN rather
+      // than from some other binder path.
+      auto const& cmp = n.get<comparison>();
+      if (cmp.op == sirius::comparison_type::ge) saw_compare_ge = true;
+      if (cmp.op == sirius::comparison_type::le) saw_compare_le = true;
+      if (cmp.left) visit_node(*cmp.left);
+      if (cmp.right) visit_node(*cmp.right);
     } else if (n.holds<function_call>()) {
       auto const& fc = n.get<function_call>();
       if (fc.function() == sirius::function_id::add) saw_add = true;
@@ -749,7 +805,7 @@ TEST_CASE("ast_from_duckdb - real Binder output translates to non-null trees",
   // DFS walk the LogicalOperator tree, collecting every Expression on every
   // operator. The structural assertion is: every Expression translates to a
   // non-null Sirius AST tree, AND the union of all produced trees covers the
-  // four landmark kinds named above.
+  // landmark kinds named above.
   std::size_t expression_count = 0;
   std::function<void(duckdb::LogicalOperator const&)> walk =
     [&](duckdb::LogicalOperator const& op) {
@@ -766,11 +822,14 @@ TEST_CASE("ast_from_duckdb - real Binder output translates to non-null trees",
     };
   walk(*plan);
 
-  // 3 projection expressions (a+3, b LIKE 'x%', c IS NOT NULL) + 1 filter
-  // expression (a BETWEEN 1 AND 10). The optimizer is disabled, so the binder
-  // output should not collapse any of these.
-  REQUIRE(expression_count >= 4);
-  REQUIRE(saw_between);
+  // 3 projection expressions (a+3, b LIKE 'x%', c IS NOT NULL) + 2 filter
+  // expressions (the BETWEEN rewrite produces `a >= 1` and `a <= 10`, and
+  // LogicalFilter::SplitPredicates flattens them into separate sibling
+  // expressions — see the BETWEEN landmark note above). The optimizer is
+  // disabled, so the binder output should not collapse any of these.
+  REQUIRE(expression_count >= 5);
+  REQUIRE(saw_compare_ge);
+  REQUIRE(saw_compare_le);
   REQUIRE(saw_add);
   REQUIRE(saw_like);
   REQUIRE(saw_is_not_null);
