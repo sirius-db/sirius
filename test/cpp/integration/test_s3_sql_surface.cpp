@@ -1090,7 +1090,7 @@ void write_b1_bench_markdown(fs::path const& path,
 
 }  // namespace
 
-TEST_CASE("sirius_read_parquet is registered as a one-argument table function",
+TEST_CASE("internal sirius_read_parquet is registered as a one-argument table function",
           "[sql][s3][registration]")
 {
   duckdb::DuckDB db(nullptr);
@@ -1105,28 +1105,6 @@ TEST_CASE("sirius_read_parquet is registered as a one-argument table function",
   REQUIRE(result->RowCount() == 1);
   CHECK(result->GetValue(0, 0).ToString() == "sirius_read_parquet");
   CHECK(result->GetValue(1, 0).ToString().find("VARCHAR") != std::string::npos);
-}
-
-TEST_CASE("sirius_read_parquet executes directly via transparent execution",
-          "[.][s3][integration][sql]")
-{
-  auto env = read_s3_test_env();
-  if (skip_if_no_s3_env(env)) { return; }
-
-  s3_sql_fixture fixture(*env);
-  auto const uri = s3_uri(env->bucket, "parquet/nation.parquet");
-
-  auto const sql =
-    "SELECT n_nationkey, n_name, n_regionkey "
-    "FROM sirius_read_parquet('" +
-    uri + "') ORDER BY n_nationkey";
-  auto result = require_query_ok(fixture.con, sql);
-
-  REQUIRE(result->RowCount() == 25);
-  REQUIRE(result->ColumnCount() == 3);
-  CHECK(result->GetValue(0, 0).GetValue<int32_t>() == 0);
-  CHECK(result->GetValue(1, 0).ToString() == "ALGERIA");
-  CHECK(result->GetValue(2, 0).GetValue<int32_t>() == 0);
 }
 
 TEST_CASE("gpu_execution rewrites S3 read_parquet and scans through Sirius",
@@ -1176,27 +1154,6 @@ TEST_CASE("gpu_execution S3 window query falls back to DuckDB CPU",
   check_rows_equal_with_tolerant_columns(*s3_result, *baseline_result, {});
 }
 
-TEST_CASE("gpu_execution can call sirius_read_parquet directly",
-          "[.][s3][integration][sql][gpu_execution]")
-{
-  auto env = read_s3_test_env();
-  if (skip_if_no_s3_env(env)) { return; }
-
-  s3_sql_fixture fixture(*env);
-  auto const uri = s3_uri(env->bucket, "parquet/nation.parquet");
-  auto const sql = gpu_execution_sql(
-    "SELECT n_nationkey, n_name, n_regionkey "
-    "FROM sirius_read_parquet('" +
-    uri + "') ORDER BY n_nationkey");
-  auto result = require_query_ok(fixture.con, sql);
-
-  REQUIRE(result->RowCount() == 25);
-  REQUIRE(result->ColumnCount() == 3);
-  CHECK(result->GetValue(0, 0).GetValue<int32_t>() == 0);
-  CHECK(result->GetValue(1, 0).ToString() == "ALGERIA");
-  CHECK(result->GetValue(2, 0).GetValue<int32_t>() == 0);
-}
-
 TEST_CASE("gpu_execution S3 SQL surface returns empty result sets cleanly",
           "[.][s3][integration][sql][gpu_execution]")
 {
@@ -1238,7 +1195,7 @@ TEST_CASE("gpu_execution S3 SQL surface matches local TPC-H Q3 shape",
   CHECK(collect_rows(*s3_result) == collect_rows(*baseline_result));
 }
 
-TEST_CASE("sirius_read_parquet bind returns row-count metadata for cardinality",
+TEST_CASE("internal sirius_read_parquet bind returns row-count metadata for cardinality",
           "[.][s3][integration][sql][planner-metadata]")
 {
   auto env = read_s3_test_env();
@@ -1271,7 +1228,7 @@ TEST_CASE("sirius_read_parquet bind returns row-count metadata for cardinality",
   CHECK(stats->max_cardinality == expected_orders_rows);
 }
 
-TEST_CASE("sirius_read_parquet exposes S3 row count to DuckDB EXPLAIN",
+TEST_CASE("internal sirius_read_parquet exposes S3 row count to DuckDB EXPLAIN",
           "[.][s3][integration][sql][planner-metadata]")
 {
   auto env = read_s3_test_env();
@@ -1286,7 +1243,7 @@ TEST_CASE("sirius_read_parquet exposes S3 row count to DuckDB EXPLAIN",
   CHECK(plan_mentions_cardinality(plan, expected_orders_rows));
 }
 
-TEST_CASE("sirius_read_parquet exposes distinct S3 table cardinalities in joins",
+TEST_CASE("internal sirius_read_parquet exposes distinct S3 table cardinalities in joins",
           "[.][s3][integration][sql][planner-metadata]")
 {
   auto env = read_s3_test_env();

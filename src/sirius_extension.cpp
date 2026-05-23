@@ -137,11 +137,16 @@ unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
 }
 
 // Execute callback for sirius_read_parquet. The real scan runs through the
-// Sirius GPU pipeline; this table function is only an internal bind surface
-// for gpu_execution, so a direct DuckDB execution is rejected cleanly.
+// Sirius GPU pipeline; this table function is an internal rewrite target for
+// read_parquet('s3://...') inside gpu_execution, NOT a user-facing function.
+// A direct DuckDB (CPU) execution is rejected cleanly — query S3 Parquet via
+// read_parquet('s3://...'), which the bind-time rewrite routes here for the GPU
+// path and which the CPU fallback replays through sirius_s3_filesystem.
 void SiriusReadParquetFunction(ClientContext&, TableFunctionInput&, DataChunk&)
 {
-  throw std::runtime_error("sirius_read_parquet must be executed through gpu_execution()");
+  throw std::runtime_error(
+    "sirius_read_parquet is an internal rewrite target; query S3 Parquet with "
+    "read_parquet('s3://...') inside gpu_execution()");
 }
 
 }  // namespace
@@ -1173,6 +1178,8 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   // Sirius-owned S3 parquet entry point. gpu_execution rewrites
   // read_parquet('s3://...') to this table function so the bind runs through
   // Sirius's footer-only S3 path instead of DuckDB's native read_parquet.
+  // Registered so the rewrite's output binds, but INTERNAL — not a public
+  // surface: users query S3 Parquet with read_parquet('s3://...'), not this.
   TableFunction sirius_read_parquet("sirius_read_parquet",
                                     {LogicalType::VARCHAR},
                                     SiriusReadParquetFunction,
