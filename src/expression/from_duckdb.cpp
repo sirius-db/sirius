@@ -1,0 +1,258 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "expression/ast/from_duckdb.hpp"
+
+// sirius
+#include "expression/ast/between.hpp"
+#include "expression/ast/case_expr.hpp"
+#include "expression/ast/cast.hpp"
+#include "expression/ast/coalesce.hpp"
+#include "expression/ast/comparison.hpp"
+#include "expression/ast/conjunction.hpp"
+#include "expression/ast/constant.hpp"
+#include "expression/ast/function_call.hpp"
+#include "expression/ast/in_list.hpp"
+#include "expression/ast/node.hpp"
+#include "expression/ast/reference.hpp"
+#include "expression/ast/unary_op.hpp"
+#include "expression/function_id.hpp"
+#include "expression/join_condition.hpp"  // sirius::comparison_type, sirius::from_duckdb(ExpressionType)
+#include "expression/value.hpp"           // sirius::from_duckdb(Value const&, logical_type const&)
+#include "helper/type_conversions.hpp"  // sirius::from_duckdb(LogicalType const&)
+
+// duckdb
+#include <duckdb/common/assert.hpp>
+#include <duckdb/common/enums/expression_type.hpp>
+#include <duckdb/common/exception.hpp>
+#include <duckdb/planner/expression.hpp>
+#include <duckdb/planner/expression/bound_between_expression.hpp>
+#include <duckdb/planner/expression/bound_case_expression.hpp>
+#include <duckdb/planner/expression/bound_cast_expression.hpp>
+#include <duckdb/planner/expression/bound_comparison_expression.hpp>
+#include <duckdb/planner/expression/bound_conjunction_expression.hpp>
+#include <duckdb/planner/expression/bound_constant_expression.hpp>
+#include <duckdb/planner/expression/bound_function_expression.hpp>
+#include <duckdb/planner/expression/bound_operator_expression.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
+
+// standard library
+#include <memory>
+#include <utility>
+#include <vector>
+
+namespace sirius::ast {
+
+namespace {
+
+std::unique_ptr<node> translate_reference(duckdb::BoundReferenceExpression const& expr)
+{
+  return std::make_unique<node>(reference{static_cast<uint32_t>(expr.index)});
+}
+
+std::unique_ptr<node> translate_constant(duckdb::BoundConstantExpression const& expr)
+{
+  auto return_type = sirius::from_duckdb(expr.return_type);
+  auto payload     = sirius::from_duckdb(expr.value, return_type);
+  return std::make_unique<node>(constant{std::move(payload), std::move(return_type)});
+}
+
+std::unique_ptr<node> translate_comparison(duckdb::BoundComparisonExpression const& expr)
+{
+  // Distinct-from / not-distinct-from are well-formed but not carried by the
+  // Sirius comparison node; signal fallback via nullptr before consulting the
+  // shared ExpressionType mapper.
+  switch (expr.GetExpressionType()) {
+    case duckdb::ExpressionType::COMPARE_EQUAL:
+    case duckdb::ExpressionType::COMPARE_NOTEQUAL:
+    case duckdb::ExpressionType::COMPARE_LESSTHAN:
+    case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO:
+    case duckdb::ExpressionType::COMPARE_GREATERTHAN:
+    case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO: break;
+    default: return nullptr;
+  }
+  auto left  = from_duckdb(*expr.left);
+  auto right = from_duckdb(*expr.right);
+  if (!left || !right) { return nullptr; }
+  return std::make_unique<node>(comparison{
+    /*op=*/sirius::from_duckdb(expr.GetExpressionType()),
+    /*left=*/std::move(left),
+    /*right=*/std::move(right),
+  });
+}
+
+std::unique_ptr<node> translate_conjunction(duckdb::BoundConjunctionExpression const& expr)
+{
+  conjunction::kind op{conjunction::kind::invalid};
+  switch (expr.GetExpressionType()) {
+    case duckdb::ExpressionType::CONJUNCTION_AND: op = conjunction::kind::op_and; break;
+    case duckdb::ExpressionType::CONJUNCTION_OR: op = conjunction::kind::op_or; break;
+    default: return nullptr;
+  }
+  std::vector<std::unique_ptr<node>> children;
+  children.reserve(expr.children.size());
+  for (auto const& child : expr.children) {
+    auto translated = from_duckdb(*child);
+    if (!translated) { return nullptr; }
+    children.push_back(std::move(translated));
+  }
+  return std::make_unique<node>(conjunction{op, std::move(children)});
+}
+
+std::unique_ptr<node> translate_between(duckdb::BoundBetweenExpression const& expr)
+{
+  auto input = from_duckdb(*expr.input);
+  auto lower = from_duckdb(*expr.lower);
+  auto upper = from_duckdb(*expr.upper);
+  if (!input || !lower || !upper) { return nullptr; }
+  return std::make_unique<node>(between{
+    /*input=*/std::move(input),
+    /*lower=*/std::move(lower),
+    /*upper=*/std::move(upper),
+    /*lower_inclusive=*/expr.lower_inclusive,
+    /*upper_inclusive=*/expr.upper_inclusive,
+  });
+}
+
+std::unique_ptr<node> translate_case(duckdb::BoundCaseExpression const& expr)
+{
+  std::vector<case_expr::when_then> cases;
+  cases.reserve(expr.case_checks.size());
+  for (auto const& check : expr.case_checks) {
+    auto when_node = from_duckdb(*check.when_expr);
+    auto then_node = from_duckdb(*check.then_expr);
+    if (!when_node || !then_node) { return nullptr; }
+    cases.push_back(case_expr::when_then{std::move(when_node), std::move(then_node)});
+  }
+  auto else_node = from_duckdb(*expr.else_expr);
+  if (!else_node) { return nullptr; }
+  return std::make_unique<node>(case_expr{std::move(cases), std::move(else_node)});
+}
+
+std::unique_ptr<node> translate_cast(duckdb::BoundCastExpression const& expr)
+{
+  auto child = from_duckdb(*expr.child);
+  if (!child) { return nullptr; }
+  auto target_type = sirius::from_duckdb(expr.return_type);
+  return std::make_unique<node>(cast{
+    /*child=*/std::move(child),
+    /*target_type=*/std::move(target_type),
+    /*try_cast=*/expr.try_cast,
+  });
+}
+
+std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& expr)
+{
+  auto func_id_opt = sirius::from_duckdb_function_name(expr.function.name);
+  if (!func_id_opt.has_value()) { return nullptr; }
+  std::vector<std::unique_ptr<node>> arguments;
+  arguments.reserve(expr.children.size());
+  for (auto const& child : expr.children) {
+    auto translated = from_duckdb(*child);
+    if (!translated) { return nullptr; }
+    arguments.push_back(std::move(translated));
+  }
+  auto return_type = sirius::from_duckdb(expr.return_type);
+  return std::make_unique<node>(
+    function_call{*func_id_opt, std::move(arguments), std::move(return_type)});
+}
+
+std::unique_ptr<node> translate_operator(duckdb::BoundOperatorExpression const& expr)
+{
+  auto const op_type = expr.GetExpressionType();
+
+  // Unary operators share a single AST node; only the kind tag differs.
+  unary_op::kind unary_kind{unary_op::kind::invalid};
+  switch (op_type) {
+    case duckdb::ExpressionType::OPERATOR_NOT: unary_kind = unary_op::kind::op_not; break;
+    case duckdb::ExpressionType::OPERATOR_IS_NULL: unary_kind = unary_op::kind::op_is_null; break;
+    case duckdb::ExpressionType::OPERATOR_IS_NOT_NULL:
+      unary_kind = unary_op::kind::op_is_not_null;
+      break;
+    case duckdb::ExpressionType::OPERATOR_TRY: unary_kind = unary_op::kind::op_try; break;
+    default: break;
+  }
+  if (unary_kind != unary_op::kind::invalid) {
+    D_ASSERT(!expr.children.empty());
+    auto child = from_duckdb(*expr.children[0]);
+    if (!child) { return nullptr; }
+    return std::make_unique<node>(unary_op{unary_kind, std::move(child)});
+  }
+
+  if (op_type == duckdb::ExpressionType::OPERATOR_COALESCE) {
+    std::vector<std::unique_ptr<node>> children;
+    children.reserve(expr.children.size());
+    for (auto const& child : expr.children) {
+      auto translated = from_duckdb(*child);
+      if (!translated) { return nullptr; }
+      children.push_back(std::move(translated));
+    }
+    return std::make_unique<node>(coalesce{std::move(children)});
+  }
+
+  if (op_type == duckdb::ExpressionType::COMPARE_IN ||
+      op_type == duckdb::ExpressionType::COMPARE_NOT_IN) {
+    D_ASSERT(!expr.children.empty());
+    auto probe = from_duckdb(*expr.children[0]);
+    if (!probe) { return nullptr; }
+    std::vector<std::unique_ptr<node>> values;
+    values.reserve(expr.children.size() > 0 ? expr.children.size() - 1 : 0);
+    for (size_t i = 1; i < expr.children.size(); ++i) {
+      auto translated = from_duckdb(*expr.children[i]);
+      if (!translated) { return nullptr; }
+      values.push_back(std::move(translated));
+    }
+    return std::make_unique<node>(in_list{
+      /*probe=*/std::move(probe),
+      /*values=*/std::move(values),
+      /*negated=*/op_type == duckdb::ExpressionType::COMPARE_NOT_IN,
+    });
+  }
+
+  return nullptr;
+}
+
+}  // namespace
+
+std::unique_ptr<node> from_duckdb(duckdb::Expression const& expr)
+{
+  switch (expr.GetExpressionClass()) {
+    case duckdb::ExpressionClass::BOUND_BETWEEN:
+      return translate_between(expr.Cast<duckdb::BoundBetweenExpression>());
+    case duckdb::ExpressionClass::BOUND_CASE:
+      return translate_case(expr.Cast<duckdb::BoundCaseExpression>());
+    case duckdb::ExpressionClass::BOUND_CAST:
+      return translate_cast(expr.Cast<duckdb::BoundCastExpression>());
+    case duckdb::ExpressionClass::BOUND_COMPARISON:
+      return translate_comparison(expr.Cast<duckdb::BoundComparisonExpression>());
+    case duckdb::ExpressionClass::BOUND_CONJUNCTION:
+      return translate_conjunction(expr.Cast<duckdb::BoundConjunctionExpression>());
+    case duckdb::ExpressionClass::BOUND_CONSTANT:
+      return translate_constant(expr.Cast<duckdb::BoundConstantExpression>());
+    case duckdb::ExpressionClass::BOUND_FUNCTION:
+      return translate_function(expr.Cast<duckdb::BoundFunctionExpression>());
+    case duckdb::ExpressionClass::BOUND_OPERATOR:
+      return translate_operator(expr.Cast<duckdb::BoundOperatorExpression>());
+    case duckdb::ExpressionClass::BOUND_PARAMETER: return nullptr;
+    case duckdb::ExpressionClass::BOUND_REF:
+      return translate_reference(expr.Cast<duckdb::BoundReferenceExpression>());
+    default:
+      throw duckdb::InternalException("[sirius::ast::from_duckdb] Unknown ExpressionClass: {}",
+                                      expr.GetExpressionClass());
+  }
+}
+
+}  // namespace sirius::ast
