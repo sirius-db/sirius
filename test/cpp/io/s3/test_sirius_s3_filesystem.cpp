@@ -96,6 +96,19 @@ std::string sql_quote(std::string_view value)
 
 std::string yaml_quote(std::string const& value) { return sql_quote(value); }
 
+template <typename Fn>
+std::string thrown_message(Fn&& fn)
+{
+  try {
+    fn();
+  } catch (std::exception const& e) {
+    return e.what();
+  } catch (...) {
+    return "<non-std exception>";
+  }
+  return {};
+}
+
 fs::path local_parquet_path(std::string_view table)
 {
   return fs::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "integration" / "data" / "parquet" /
@@ -250,6 +263,43 @@ TEST_CASE("sirius_s3_filesystem claims only S3 paths", "[s3][filesystem]")
   CHECK(fs.CanSeek());
 }
 
+TEST_CASE("sirius_s3_filesystem rejects S3 glob patterns", "[s3][filesystem]")
+{
+  sirius::io::s3::sirius_s3_filesystem fs;
+
+  CHECK_THROWS(fs.Glob("s3://bucket/prefix/*.parquet"));
+  CHECK_THROWS(fs.Glob("s3://bucket/a?.parquet"));
+  CHECK_THROWS(fs.Glob("s3://bucket/[ab].parquet"));
+
+  auto exact = fs.Glob("s3://bucket/key.parquet");
+  REQUIRE(exact.size() == 1);
+  CHECK(exact[0].path == "s3://bucket/key.parquet");
+
+  CHECK(fs.Glob("s3://bucket").empty());
+}
+
+TEST_CASE("sirius_s3_filesystem rejects write opens before opener resolution", "[s3][filesystem]")
+{
+  sirius::io::s3::sirius_s3_filesystem fs;
+
+  auto const write_message = thrown_message([&] {
+    auto handle =
+      fs.OpenFile("s3://bucket/key.parquet", duckdb::FileFlags::FILE_FLAGS_WRITE, nullptr);
+    (void)handle;
+  });
+  REQUIRE_FALSE(write_message.empty());
+  CHECK(write_message.find("read-only") != std::string::npos);
+  CHECK(write_message.find("no ClientContext") == std::string::npos);
+
+  auto const read_message = thrown_message([&] {
+    auto handle =
+      fs.OpenFile("s3://bucket/key.parquet", duckdb::FileFlags::FILE_FLAGS_READ, nullptr);
+    (void)handle;
+  });
+  REQUIRE_FALSE(read_message.empty());
+  CHECK(read_message.find("no ClientContext") != std::string::npos);
+}
+
 TEST_CASE("sirius_s3_filesystem opens through FileOpener and reads positional ranges",
           "[.][s3][integration][filesystem]")
 {
@@ -279,6 +329,35 @@ TEST_CASE("sirius_s3_filesystem opens through FileOpener and reads positional ra
 
   CHECK(direct_count == direct_bytes.size());
   CHECK(fs_bytes == direct_bytes);
+}
+
+TEST_CASE("sirius_s3_filesystem positional reads fail on short reads and negative sizes",
+          "[.][s3][integration][filesystem]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  s3_filesystem_fixture fixture(*env);
+  auto const uri = s3_uri(env->bucket, "parquet/nation.parquet");
+  auto& fs       = duckdb::FileSystem::GetFileSystem(*fixture.con.context);
+  auto handle    = fs.OpenFile(uri, duckdb::FileFlags::FILE_FLAGS_READ);
+  REQUIRE(handle != nullptr);
+
+  auto const size = handle->GetFileSize();
+  REQUIRE(size > 100);
+
+  std::vector<std::uint8_t> in_range(16);
+  REQUIRE_NOTHROW(fs.Read(*handle, in_range.data(), static_cast<int64_t>(in_range.size()), 0));
+
+  std::vector<std::uint8_t> eof_crossing(100);
+  CHECK_THROWS_AS(fs.Read(*handle,
+                          eof_crossing.data(),
+                          static_cast<int64_t>(eof_crossing.size()),
+                          static_cast<duckdb::idx_t>(size - 10)),
+                  duckdb::IOException);
+
+  std::vector<std::uint8_t> whole_object(size);
+  CHECK_THROWS_AS(fs.Read(*handle, whole_object.data(), -1, 0), duckdb::IOException);
 }
 
 TEST_CASE("DuckDB CPU read_parquet reads S3 through the registered Sirius filesystem",

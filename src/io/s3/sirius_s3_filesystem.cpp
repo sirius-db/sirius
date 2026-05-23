@@ -20,6 +20,7 @@
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
 
+#include <duckdb/common/exception.hpp>
 #include <duckdb/common/file_opener.hpp>
 #include <duckdb/main/client_context.hpp>
 
@@ -87,6 +88,13 @@ duckdb::unique_ptr<duckdb::FileHandle> sirius_s3_filesystem::OpenFile(
   duckdb::FileOpenFlags flags,
   duckdb::optional_ptr<duckdb::FileOpener> opener)
 {
+  // Read-only filesystem: reject write opens (e.g. COPY ... TO 's3://…') before
+  // resolving the connection, so callers get a clear error instead of failing
+  // later on a HEAD of a not-yet-existing object.
+  if (flags.OpenForWriting()) {
+    throw duckdb::IOException("[sirius_s3_filesystem] '" + path +
+                              "' is read-only; S3 writes (COPY TO) are not supported");
+  }
   // The ClientFileSystem (OpenerFileSystem) layer injects the connection's
   // FileOpener even though the parquet reader passes none (newplan §29.9).
   auto client = duckdb::FileOpener::TryGetClientContext(opener);
@@ -115,11 +123,24 @@ void sirius_s3_filesystem::Read(duckdb::FileHandle& handle,
                                 int64_t nr_bytes,
                                 duckdb::idx_t location)
 {
-  auto& h = as_s3_handle(handle);
-  h.ioctx_->host_read_io(*h.object_,
-                         static_cast<std::size_t>(location),
-                         static_cast<std::size_t>(nr_bytes),
-                         static_cast<std::uint8_t*>(buffer));
+  if (nr_bytes < 0) {
+    throw duckdb::IOException("[sirius_s3_filesystem] negative read size on '" + handle.GetPath() +
+                              "'");
+  }
+  auto& h        = as_s3_handle(handle);
+  auto const got = h.ioctx_->host_read_io(*h.object_,
+                                          static_cast<std::size_t>(location),
+                                          static_cast<std::size_t>(nr_bytes),
+                                          static_cast<std::uint8_t*>(buffer));
+  // DuckDB's positional Read contract is read-exactly-or-throw; host_read_io
+  // clips an EOF-crossing range to a short read, which would otherwise leave the
+  // tail of `buffer` stale.
+  if (got != static_cast<std::size_t>(nr_bytes)) {
+    throw duckdb::IOException("[sirius_s3_filesystem] short read on '" + handle.GetPath() +
+                              "': requested " + std::to_string(nr_bytes) + " at " +
+                              std::to_string(static_cast<std::uint64_t>(location)) + ", got " +
+                              std::to_string(got));
+  }
 }
 
 int64_t sirius_s3_filesystem::Read(duckdb::FileHandle& handle, void* buffer, int64_t nr_bytes)
@@ -146,6 +167,14 @@ duckdb::timestamp_t sirius_s3_filesystem::GetLastModifiedTime(duckdb::FileHandle
 duckdb::vector<duckdb::OpenFileInfo> sirius_s3_filesystem::Glob(const std::string& path,
                                                                 duckdb::FileOpener* /*opener*/)
 {
+  // No S3 LIST: reject glob/wildcard patterns with a clear error instead of
+  // treating '*' as a literal key and failing later on object open (§29.5).
+  if (duckdb::FileSystem::HasGlob(path)) {
+    throw duckdb::IOException(
+      "[sirius_s3_filesystem] glob/wildcard patterns are not supported for s3:// "
+      "(no S3 LIST); specify an exact object key: '" +
+      path + "'");
+  }
   duckdb::vector<duckdb::OpenFileInfo> result;
   if (CanHandleFile(path)) { result.emplace_back(path); }
   return result;
