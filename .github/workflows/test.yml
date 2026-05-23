@@ -138,7 +138,9 @@ jobs:
         run: tar -xf build.tar
 
       - name: Run C++ unit tests
-        run: timeout 45m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort
+        run: |
+            nvidia-smi
+            timeout 45m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort
 
       - name: Upload unit test logs
         if: always()
@@ -212,7 +214,9 @@ jobs:
         run: tar -xf build.tar
 
       - name: Run C++ unit tests
-        run: timeout 45m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort
+        run: |
+            nvidia-smi
+            timeout 45m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort
 
       - name: Upload unit test logs
         if: always()
