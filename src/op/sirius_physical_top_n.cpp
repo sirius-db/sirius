@@ -19,6 +19,7 @@
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/filter/dynamic_filter.hpp"
+#include "op/cudf_sort_order.hpp"
 #include "op/sirius_physical_order.hpp"
 #include "op/sirius_physical_top_n_merge.hpp"
 
@@ -70,21 +71,33 @@ std::unique_ptr<cudf::table> compute_top_n_table(
       throw duckdb::InternalException("TopN order index out of range");
     }
 
-    auto order =
-      ord.type == duckdb::OrderType::ASCENDING ? cudf::order::ASCENDING : cudf::order::DESCENDING;
-    auto null_ord = ord.null_order == duckdb::OrderByNullType::NULLS_FIRST
-                      ? cudf::null_order::BEFORE
-                      : cudf::null_order::AFTER;
-    auto indices  = cudf::top_k_order(input.column(idx), keep_rows, order, stream, memory_resource);
-    auto gathered = cudf::gather(
-      input, indices->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, memory_resource);
-    // top_k_order does not guarantee sorted output — sort the gathered rows
-    kept = cudf::sort_by_key(gathered->view(),
-                             cudf::table_view({gathered->view().column(idx)}),
-                             {order},
-                             {null_ord},
-                             stream,
-                             memory_resource);
+    auto order    = to_cudf_order(ord.type);
+    auto null_ord = to_cudf_null_order(ord.type, ord.null_order);
+    if (input.column(idx).has_nulls()) {
+      // cudf::top_k_order takes no null_order, so it cannot honor SQL NULLS FIRST/LAST when
+      // selecting which rows are in the top k (it treats NULLs as the largest value). For a
+      // nullable key, fall back to a full sort that honors null placement, then slice the top k.
+      auto sorted = cudf::sort_by_key(
+        input, cudf::table_view({input.column(idx)}), {order}, {null_ord}, stream, memory_resource);
+      if (keep_rows == sorted->num_rows()) {
+        kept = std::move(sorted);
+      } else {
+        auto slices = cudf::slice(sorted->view(), {0, keep_rows}, stream);
+        kept        = std::make_unique<cudf::table>(slices.front(), stream, memory_resource);
+      }
+    } else {
+      auto indices =
+        cudf::top_k_order(input.column(idx), keep_rows, order, stream, memory_resource);
+      auto gathered = cudf::gather(
+        input, indices->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, memory_resource);
+      // top_k_order does not guarantee sorted output — sort the gathered rows
+      kept = cudf::sort_by_key(gathered->view(),
+                               cudf::table_view({gathered->view().column(idx)}),
+                               {order},
+                               {null_ord},
+                               stream,
+                               memory_resource);
+    }
   } else {
     // Multi-key: fall back to full sort_by_key
     std::vector<cudf::column_view> key_views;
@@ -104,11 +117,8 @@ std::unique_ptr<cudf::table> compute_top_n_table(
         throw duckdb::InternalException("TopN order index out of range");
       }
       key_views.push_back(input.column(idx));
-      key_orders.push_back(ord.type == duckdb::OrderType::ASCENDING ? cudf::order::ASCENDING
-                                                                    : cudf::order::DESCENDING);
-      null_orders.push_back(ord.null_order == duckdb::OrderByNullType::NULLS_FIRST
-                              ? cudf::null_order::BEFORE
-                              : cudf::null_order::AFTER);
+      key_orders.push_back(to_cudf_order(ord.type));
+      null_orders.push_back(to_cudf_null_order(ord.type, ord.null_order));
     }
 
     auto keys_table = cudf::table_view(key_views);

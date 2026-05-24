@@ -20,6 +20,7 @@
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
+#include "op/cudf_sort_order.hpp"
 #include "op/sirius_physical_sort_sample.hpp"
 
 #include <cudf/search.hpp>
@@ -84,11 +85,8 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
     }
     auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().index);
     order_key_idx.push_back(idx);
-    column_order.push_back(ord.type == duckdb::OrderType::ASCENDING ? cudf::order::ASCENDING
-                                                                    : cudf::order::DESCENDING);
-    null_precedence.push_back(ord.null_order == duckdb::OrderByNullType::NULLS_FIRST
-                                ? cudf::null_order::BEFORE
-                                : cudf::null_order::AFTER);
+    column_order.push_back(to_cudf_order(ord.type));
+    null_precedence.push_back(to_cudf_null_order(ord.type, ord.null_order));
   }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;

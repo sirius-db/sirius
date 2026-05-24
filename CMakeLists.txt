@@ -354,6 +354,7 @@ set(TEST_SOURCES
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
+    test/cpp/integration/test_gpu_execution_order_nulls.cpp
     test/cpp/integration/test_gpu_execution_tpcds.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/integration/test_gpu_execution_window.cpp

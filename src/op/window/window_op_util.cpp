@@ -18,6 +18,7 @@
 
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
+#include "op/cudf_sort_order.hpp"
 
 #include <limits>
 #include <stdexcept>
@@ -74,20 +75,11 @@ window_definitions convert_duckdb_window_to_cudf(
       }
       for (const auto& order : window.orders) {
         defs.order_idx.push_back(bound_ref_index(*order.expression));
-        const bool descending = (order.type == duckdb::OrderType::DESCENDING);
-        defs.order_dirs.push_back(descending ? cudf::order::DESCENDING : cudf::order::ASCENDING);
-
-        // SQL NULLS FIRST/LAST is an absolute position in the result. cuDF, however, applies
-        // null_order in the ascending frame and then reverses it for a DESCENDING column, so for a
-        // descending key we must flip BEFORE<->AFTER to keep NULLS FIRST/LAST honored as written.
-        const bool nulls_first = (order.null_order == duckdb::OrderByNullType::NULLS_FIRST);
-        cudf::null_order cudf_null =
-          nulls_first ? cudf::null_order::BEFORE : cudf::null_order::AFTER;
-        if (descending) {
-          cudf_null = (cudf_null == cudf::null_order::BEFORE) ? cudf::null_order::AFTER
-                                                              : cudf::null_order::BEFORE;
-        }
-        defs.order_null.push_back(cudf_null);
+        // to_cudf_null_order centralizes the cuDF DESC-null contract (it flips BEFORE<->AFTER for a
+        // descending key so SQL NULLS FIRST/LAST stays an absolute position); see
+        // op/cudf_sort_order.hpp.
+        defs.order_dirs.push_back(to_cudf_order(order.type));
+        defs.order_null.push_back(to_cudf_null_order(order.type, order.null_order));
       }
       keys_recorded = true;
     }
