@@ -22,6 +22,7 @@
 #include "log/logging.hpp"
 
 #include <cudf/binaryop.hpp>
+#include <cudf/replace.hpp>
 #include <cudf/search.hpp>
 #include <cudf/unary.hpp>
 
@@ -206,7 +207,17 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundOperator
       return std::move(intermediate_result);
     }
   } else if (expression_type == ExpressionType::OPERATOR_COALESCE) {
-    throw NotImplementedException("Execute[OPERATOR_COALESCE]: Not yet implemented!");
+    // COALESCE(a, b, ...) returns the first non-NULL value per row. cuDF has no n-ary coalesce, so
+    // chain replace_nulls: start from the first child, then fill remaining NULLs from each next
+    // child. The binder casts all arguments to a common type, so the children share a type (as
+    // replace_nulls requires); the result keeps NULLs only where every argument was NULL.
+    auto result = Execute(*expr.children[0], state->child_states[0].get());
+    for (idx_t child = 1; child < expr.children.size(); ++child) {
+      auto replacement = Execute(*expr.children[child], state->child_states[child].get());
+      result =
+        cudf::replace_nulls(result->view(), replacement->view(), execution_stream, resource_ref);
+    }
+    return std::move(result);
   } else if (expr.children.size() == 1) {
     // Resolve child
     auto child = Execute(*expr.children[0], state->child_states[0].get());
