@@ -48,6 +48,7 @@
 #include <iostream>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -460,6 +461,29 @@ class TpcDsPlanTranslationFixture {
     std::cout << "========================================" << std::endl;
   }
 
+  std::pair<bool, std::string> check_query(const std::string& check_function_name,
+                                           std::string query)
+  {
+    size_t pos = 0;
+    while ((pos = query.find('\'', pos)) != std::string::npos) {
+      query.insert(pos, "'");
+      pos += 2;
+    }
+
+    auto result =
+      con->Query("SELECT success, error_message FROM " + check_function_name + "('" + query + "')");
+    REQUIRE(result);
+    if (result->HasError()) { return {false, result->GetError()}; }
+
+    auto chunk = result->Fetch();
+    REQUIRE(chunk);
+    REQUIRE(chunk->size() == 1);
+
+    auto success    = chunk->GetValue(0, 0).GetValue<bool>();
+    auto error_text = chunk->GetValue(1, 0).ToString();
+    return {success, error_text};
+  }
+
   std::unique_ptr<DuckDB> db;
   std::unique_ptr<Connection> con;
 };
@@ -496,4 +520,43 @@ TEST_CASE_METHOD(TpcDsPlanTranslationFixture,
   }
 
   run_plan_translation_test("gpu_plan_check", "TPC-DS Plan Translation Summary (Legacy GPU)");
+}
+
+TEST_CASE_METHOD(TpcDsPlanTranslationFixture,
+                 "TPC-DS Phase 1 ranking query translates in Sirius planner",
+                 "[tpcds][plan][coverage][window]")
+{
+  if (!load_tpcds()) {
+    WARN("TPC-DS extension not available — skipping ranking translation test");
+    return;
+  }
+
+  const std::string query = R"SQL(
+SELECT ss_store_sk, ss_item_sk, ss_ticket_number, sales_rank
+FROM (
+  SELECT
+    ss_store_sk,
+    ss_item_sk,
+    ss_ticket_number,
+    rank() OVER (
+      PARTITION BY ss_store_sk
+      ORDER BY ss_sold_date_sk ASC NULLS LAST,
+               ss_ticket_number ASC NULLS LAST,
+               ss_item_sk ASC NULLS LAST,
+               ss_customer_sk ASC NULLS LAST
+    ) AS sales_rank
+  FROM store_sales
+  WHERE ss_store_sk IS NOT NULL
+    AND ss_sold_date_sk IS NOT NULL
+    AND ss_ticket_number IS NOT NULL
+    AND ss_item_sk IS NOT NULL
+    AND ss_customer_sk IS NOT NULL
+) ranked
+ORDER BY ss_store_sk, sales_rank, ss_item_sk, ss_ticket_number
+LIMIT 100
+)SQL";
+
+  auto [success, error] = check_query("sirius_plan_check", query);
+  if (!success) { UNSCOPED_INFO("Sirius ranking translation error: " << error); }
+  REQUIRE(success);
 }
