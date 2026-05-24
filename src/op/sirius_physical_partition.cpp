@@ -22,6 +22,7 @@
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "op/sirius_physical_hash_join.hpp"
+#include "op/sirius_physical_window.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
 #include <nvtx3/nvtx3.hpp>
@@ -131,6 +132,18 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     auto& grouped_aggregate_merge_op = op->Cast<sirius_physical_grouped_aggregate_merge>();
     _partition_keys                  = grouped_aggregate_merge_op.get_output_grouping_indices();
 
+  } else if (op->type == SiriusPhysicalOperatorType::WINDOW) {
+    // Hash-partition by the window's PARTITION BY columns so every row of a partition lands in one
+    // GPU partition (ranking needs the whole partition together). No PARTITION BY -> one global
+    // partition holding all rows (mirrors NESTED_LOOP_JOIN's single-partition shape).
+    auto& window_op = op->Cast<sirius_physical_window>();
+    _partition_keys = window_op.get_partition_key_indices();
+    if (_partition_keys.empty()) {
+      _partition_type = PartitionType::NONE;
+      _num_partitions = 1;
+    } else {
+      _partition_type = PartitionType::HASH;
+    }
   } else if (op->type == SiriusPhysicalOperatorType::CONCAT) {
     auto& parent_concat_op = op->Cast<sirius_physical_concat>();
     bool is_build          = parent_concat_op.is_build_concat();

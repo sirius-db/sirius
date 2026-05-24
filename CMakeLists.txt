@@ -138,6 +138,7 @@ set(EXTENSION_SOURCES
     src/op/scan/scan_utils.cpp
     src/op/scan/sirius_parquet_metadata_scan_operator.cpp
     src/op/scan/sirius_gpu_parquet_scan_operator.cpp
+    src/op/window/window_op_util.cpp
     src/op/sirius_physical_column_data_scan.cpp
     src/op/sirius_physical_concat.cpp
     src/op/sirius_physical_cte.cpp
@@ -166,6 +167,7 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_table_scan.cpp
     src/op/sirius_physical_top_n.cpp
     src/op/sirius_physical_ungrouped_aggregate.cpp
+    src/op/sirius_physical_window.cpp
     src/parallel/task_executor.cpp
     src/pipeline/gpu_pipeline_executor.cpp
     src/pipeline/gpu_pipeline_queue.cpp
@@ -194,6 +196,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_projection.cpp
     src/planner/sirius_plan_recursive_cte.cpp
     src/planner/sirius_plan_top_n.cpp
+    src/planner/sirius_plan_window.cpp
     src/sirius_config.cpp
     src/sirius_context.cpp
     src/sirius_engine.cpp
@@ -353,7 +356,9 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_tpcds.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
+    test/cpp/integration/test_gpu_execution_window.cpp
     test/cpp/integration/test_tpcds_plan_translation.cpp
+    test/cpp/integration/test_window_benchmark.cpp
     test/cpp/memory/test_host_table_utils.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
     test/cpp/memory_management/test_cpu_cache.cpp

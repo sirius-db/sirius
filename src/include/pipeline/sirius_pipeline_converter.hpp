@@ -64,6 +64,7 @@ class sirius_pipeline_converter {
   void split_table_scan_source(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
   void split_intermediate_joins(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
   void split_join_sink(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
+  void split_window_sink(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
   void split_group_aggregate_sink(
     duckdb::shared_ptr<sirius_pipeline>& current_pipeline,
     duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,

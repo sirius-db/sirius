@@ -86,34 +86,24 @@ class TpcDsGPUExecutionFixture {
   {
     con->Query("SET enable_duckdb_fallback = false;");
 
-    auto gpu_sql    = "CALL gpu_execution(\"" + query + "\")";
-    auto gpu_result = con->Query(gpu_sql);
-    REQUIRE(gpu_result);
-    if (gpu_result->HasError()) {
-      UNSCOPED_INFO("gpu_execution error: " << gpu_result->GetError());
-    }
-    REQUIRE_FALSE(gpu_result->HasError());
-
-    auto cpu_result = con->Query(query);
-    REQUIRE(cpu_result);
-    if (cpu_result->HasError()) { UNSCOPED_INFO("cpu error: " << cpu_result->GetError()); }
-    REQUIRE_FALSE(cpu_result->HasError());
-
-    REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
-    REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
-
-    auto ncols               = gpu_result->ColumnCount();
-    std::string order_clause = " ORDER BY ";
-    for (duckdb::idx_t c = 0; c < ncols; c++) {
-      if (c > 0) { order_clause += ", "; }
-      order_clause += std::to_string(c + 1);
-    }
-
     auto clean_query = query;
     while (!clean_query.empty() && (clean_query.back() == ';' || clean_query.back() == ' ')) {
       clean_query.pop_back();
     }
 
+    // CPU reference; also yields the column count used to build the deterministic ORDER BY.
+    auto cpu_result = con->Query("SELECT * FROM (" + clean_query + ") t");
+    REQUIRE(cpu_result);
+    if (cpu_result->HasError()) { UNSCOPED_INFO("cpu error: " << cpu_result->GetError()); }
+    REQUIRE_FALSE(cpu_result->HasError());
+
+    std::string order_clause = " ORDER BY ";
+    for (duckdb::idx_t c = 0; c < cpu_result->ColumnCount(); c++) {
+      if (c > 0) { order_clause += ", "; }
+      order_clause += std::to_string(c + 1);
+    }
+
+    // Compare GPU vs CPU under a deterministic ordering; gpu_execution runs only once.
     auto gpu_sorted =
       con->Query("SELECT * FROM gpu_execution(\"" + clean_query + "\")" + order_clause);
     auto cpu_sorted = con->Query("SELECT * FROM (" + clean_query + ") t" + order_clause);
@@ -123,6 +113,9 @@ class TpcDsGPUExecutionFixture {
     REQUIRE(cpu_sorted);
     if (cpu_sorted->HasError()) { UNSCOPED_INFO("cpu sorted error: " << cpu_sorted->GetError()); }
     REQUIRE_FALSE(cpu_sorted->HasError());
+
+    REQUIRE(gpu_sorted->ColumnCount() == cpu_sorted->ColumnCount());
+    REQUIRE(gpu_sorted->RowCount() == cpu_sorted->RowCount());
 
     for (duckdb::idx_t r = 0; r < gpu_sorted->RowCount(); r++) {
       for (duckdb::idx_t c = 0; c < gpu_sorted->ColumnCount(); c++) {
@@ -159,56 +152,53 @@ class TpcDsGPUExecutionFixture {
 }  // namespace
 
 TEST_CASE_METHOD(TpcDsGPUExecutionFixture,
-                 "gpu_execution TPC-DS row_number over store_sales",
-                 "[tpcds][gpu][window]")
+                 "gpu_execution TPC-DS Q44 ranking query",
+                 "[.][integration][tpcds][gpu][window]")
 {
   compare_gpu_vs_cpu(
-    "SELECT ss_store_sk, ss_item_sk, ss_ticket_number, rn "
-    "FROM ("
-    "  SELECT "
-    "    ss_store_sk,"
-    "    ss_item_sk,"
-    "    ss_ticket_number,"
-    "    row_number() OVER ("
-    "      PARTITION BY ss_store_sk "
-    "      ORDER BY ss_sold_date_sk ASC NULLS LAST,"
-    "               ss_ticket_number ASC NULLS LAST,"
-    "               ss_item_sk ASC NULLS LAST,"
-    "               ss_customer_sk ASC NULLS LAST"
-    "    ) AS rn "
-    "  FROM store_sales "
-    "  WHERE ss_store_sk IS NOT NULL "
-    "    AND ss_sold_date_sk IS NOT NULL "
-    "    AND ss_ticket_number IS NOT NULL "
-    "    AND ss_item_sk IS NOT NULL "
-    "    AND ss_customer_sk IS NOT NULL"
-    ") ranked "
-    "ORDER BY ss_store_sk, rn, ss_item_sk, ss_ticket_number "
-    "LIMIT 200");
-}
-
-TEST_CASE_METHOD(TpcDsGPUExecutionFixture,
-                 "gpu_execution TPC-DS rank and dense_rank over customer",
-                 "[tpcds][gpu][window]")
-{
-  compare_gpu_vs_cpu(
-    "SELECT c_birth_country, c_customer_sk, c_birth_year, rnk, dr "
-    "FROM ("
-    "  SELECT "
-    "    c_birth_country,"
-    "    c_customer_sk,"
-    "    c_birth_year,"
-    "    rank() OVER ("
-    "      PARTITION BY c_birth_country "
-    "      ORDER BY c_birth_year ASC NULLS LAST"
-    "    ) AS rnk,"
-    "    dense_rank() OVER ("
-    "      PARTITION BY c_birth_country "
-    "      ORDER BY c_birth_year ASC NULLS LAST"
-    "    ) AS dr "
-    "  FROM customer "
-    "  WHERE c_birth_country IS NOT NULL"
-    ") ranked "
-    "ORDER BY c_birth_country, rnk, c_customer_sk "
-    "LIMIT 200");
+    "SELECT low_side.rnk,"
+    "       i1.i_product_name best_performing,"
+    "       i2.i_product_name worst_performing "
+    "FROM "
+    "  (SELECT * "
+    "   FROM "
+    "     (SELECT item_sk,"
+    "             rank() OVER (ORDER BY rank_col ASC) rnk "
+    "      FROM "
+    "        (SELECT ss_item_sk item_sk,"
+    "                avg(ss_net_profit) rank_col "
+    "         FROM store_sales ss1 "
+    "         WHERE ss_store_sk = 1 "
+    "         GROUP BY ss_item_sk "
+    "         HAVING avg(ss_net_profit) > 0.9 * "
+    "           (SELECT avg(ss_net_profit) rank_col "
+    "            FROM store_sales "
+    "            WHERE ss_store_sk = 1 "
+    "              AND ss_addr_sk IS NULL "
+    "            GROUP BY ss_store_sk)) v1) v11 "
+    "   WHERE rnk < 11) low_side,"
+    "  (SELECT * "
+    "   FROM "
+    "     (SELECT item_sk,"
+    "             rank() OVER (ORDER BY rank_col DESC) rnk "
+    "      FROM "
+    "        (SELECT ss_item_sk item_sk,"
+    "                avg(ss_net_profit) rank_col "
+    "         FROM store_sales ss1 "
+    "         WHERE ss_store_sk = 1 "
+    "         GROUP BY ss_item_sk "
+    "         HAVING avg(ss_net_profit) > 0.9 * "
+    "           (SELECT avg(ss_net_profit) rank_col "
+    "            FROM store_sales "
+    "            WHERE ss_store_sk = 1 "
+    "              AND ss_addr_sk IS NULL "
+    "            GROUP BY ss_store_sk)) v2) v21 "
+    "   WHERE rnk < 11) high_side,"
+    "  item i1,"
+    "  item i2 "
+    "WHERE low_side.rnk = high_side.rnk "
+    "  AND i1.i_item_sk = low_side.item_sk "
+    "  AND i2.i_item_sk = high_side.item_sk "
+    "ORDER BY low_side.rnk "
+    "LIMIT 100");
 }

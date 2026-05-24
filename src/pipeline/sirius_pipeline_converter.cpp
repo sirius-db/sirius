@@ -38,6 +38,7 @@
 #include "op/sirius_physical_top_n_merge.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
+#include "op/sirius_physical_window.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 #include "sirius_engine.hpp"
@@ -381,6 +382,59 @@ void sirius_pipeline_converter::split_join_sink(
   pipeline_breakers_.push_back(std::move(concat_op));
 }
 
+void sirius_pipeline_converter::split_window_sink(
+  duckdb::shared_ptr<sirius_pipeline>& current_pipeline)
+{
+  // current_pipeline currently ends at WINDOW. Reshape it into:
+  //   <child subtree ... pipeline breaker> -> PARTITION -> WINDOW
+  // This is HASH_GROUP_BY's PARTITION -> MERGE_GROUP_BY shape minus the local partial stage and
+  // minus CONCAT (CONCAT is join-only). WINDOW is itself the partition-consumer, and it stays the
+  // source of any downstream pipelines, so unlike join/group-by no downstream rewiring is needed.
+  auto window_op = current_pipeline->get_sink();
+
+  // PARTITION reads from whatever produces WINDOW's input: the last intermediate operator if there
+  // is one, otherwise the pipeline source. That producer becomes a pipeline breaker so PARTITION's
+  // determine_num_partitions() sees the full input size (same rule as join build).
+  op::sirius_physical_operator* producer = current_pipeline->operators.size() > 0
+                                             ? &current_pipeline->operators.back().get()
+                                             : current_pipeline->get_source().get();
+
+  auto partition_op = make_uniq<op::sirius_physical_partition>(producer->types,
+                                                               producer->estimated_cardinality,
+                                                               window_op.get(),
+                                                               false,
+                                                               op_params_.hash_partition_bytes);
+  op::sirius_physical_partition* partition_ptr =
+    static_cast<op::sirius_physical_partition*>(partition_op.get());
+
+  if (current_pipeline->operators.size() > 0) {
+    // Last op before WINDOW becomes this pipeline's sink (pipeline breaker).
+    current_pipeline->sink = producer;
+    current_pipeline->operators.erase(current_pipeline->operators.end() - 1);
+    scheduled_.push_back(current_pipeline);
+
+    // PARTITION pipeline: producer (source) -> PARTITION (sink)
+    auto partition_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(engine_);
+    partition_pipeline->source = producer;
+    partition_pipeline->sink   = partition_ptr;
+    scheduled_.push_back(partition_pipeline);
+  } else {
+    // No intermediate ops before WINDOW: PARTITION becomes this pipeline's sink.
+    current_pipeline->sink = partition_ptr;
+    scheduled_.push_back(current_pipeline);
+  }
+
+  // WINDOW pipeline: PARTITION (source) -> WINDOW (sink). PARTITION -> WINDOW is a FULL barrier
+  // (wired generically by the PARTITION branch in wire_data_repositories, since WINDOW is not a
+  // CONCAT). Do not push PARTITION into this pipeline's operators (mirrors the merge pipeline).
+  auto window_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(engine_);
+  window_pipeline->source = partition_ptr;
+  window_pipeline->sink   = window_op.get();
+  scheduled_.push_back(window_pipeline);
+
+  pipeline_breakers_.push_back(std::move(partition_op));
+}
+
 void sirius_pipeline_converter::split_group_aggregate_sink(
   duckdb::shared_ptr<sirius_pipeline>& current_pipeline,
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
@@ -706,6 +760,8 @@ void sirius_pipeline_converter::split_pipelines(
       split_order_by_sink(current_pipeline, copied_scheduled, i);
     } else if (sink_type == op::SiriusPhysicalOperatorType::TOP_N) {
       split_top_n_sink(current_pipeline, copied_scheduled, i);
+    } else if (sink_type == op::SiriusPhysicalOperatorType::WINDOW) {
+      split_window_sink(current_pipeline);
     } else if (sink_type == op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
                sink_type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
       split_delim_join_sink(current_pipeline, copied_scheduled, i);
@@ -742,7 +798,8 @@ void sirius_pipeline_converter::wire_data_repositories()
     if (scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::MERGE_GROUP_BY ||
         scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::MERGE_SORT ||
         scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::MERGE_TOP_N ||
-        scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::MERGE_AGGREGATE) {
+        scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::MERGE_AGGREGATE ||
+        scheduled_[i]->sink->type == op::SiriusPhysicalOperatorType::WINDOW) {
       auto sink_op             = scheduled_[i]->get_sink().get();
       std::string_view port_id = "default";
       for (auto dependent_pipeline : source_to_pipelines[sink_op]) {
