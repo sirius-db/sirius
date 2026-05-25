@@ -344,6 +344,73 @@ TEST_CASE_METHOD(WindowGPUExecutionFixture,
 }
 
 TEST_CASE_METHOD(WindowGPUExecutionFixture,
+                 "gpu_execution window ranking supports non-integer keys",
+                 "[integration][window][gpu]")
+{
+  require_ok(*con,
+             "CREATE TEMP TABLE window_typed_input ("
+             "  gs VARCHAR,"
+             "  gi INTEGER,"
+             "  md DOUBLE,"
+             "  od DATE,"
+             "  ts TIMESTAMP,"
+             "  id INTEGER"
+             ")");
+  require_ok(*con,
+             "INSERT INTO window_typed_input VALUES "
+             "('a', 1, 1.5, DATE '2021-01-01', TIMESTAMP '2021-01-01 10:00', 1),"
+             "('a', 1, 1.5, DATE '2021-01-02', TIMESTAMP '2021-01-01 09:00', 2),"
+             "('a', 1, NULL, NULL, NULL, 3),"
+             "('b', 2, 2.5, DATE '2020-06-01', TIMESTAMP '2020-06-01 00:00', 4),"
+             "('b', 2, 2.5, DATE '2020-06-01', TIMESTAMP '2020-06-02 00:00', 5),"
+             "('b', 2, NULL, DATE '2020-05-01', NULL, 6),"
+             "('c', 3, 9.9, DATE '2019-12-31', TIMESTAMP '2019-12-31 23:59', 7),"
+             "(NULL, 3, 9.9, DATE '2019-12-31', TIMESTAMP '2019-12-31 22:00', 8),"
+             "(NULL, 3, NULL, NULL, NULL, 9)");
+
+  {
+    INFO("string partition keys and double DESC NULLS LAST order keys");
+    compare_gpu_vs_cpu(
+      "SELECT gs, md, id, "
+      "       row_number() OVER ("
+      "         PARTITION BY gs "
+      "         ORDER BY md DESC NULLS LAST, id ASC"
+      "       ) AS rn "
+      "FROM window_typed_input");
+  }
+
+  {
+    INFO("date DESC NULLS LAST order keys drive rank and dense_rank peer groups");
+    compare_gpu_vs_cpu(
+      "SELECT gi, od, id, "
+      "       rank() OVER (PARTITION BY gi ORDER BY od DESC NULLS LAST) AS rnk, "
+      "       dense_rank() OVER (PARTITION BY gi ORDER BY od DESC NULLS LAST) AS dr "
+      "FROM window_typed_input");
+  }
+
+  {
+    INFO("global string DESC NULLS LAST and timestamp ASC NULLS FIRST order keys");
+    compare_gpu_vs_cpu(
+      "SELECT gs, ts, id, "
+      "       rank() OVER ("
+      "         ORDER BY gs DESC NULLS LAST, ts ASC NULLS FIRST"
+      "       ) AS rnk "
+      "FROM window_typed_input");
+  }
+
+  {
+    INFO("timestamp ASC NULLS FIRST order keys under string partitions");
+    compare_gpu_vs_cpu(
+      "SELECT gs, ts, id, "
+      "       row_number() OVER ("
+      "         PARTITION BY gs "
+      "         ORDER BY ts ASC NULLS FIRST, id ASC"
+      "       ) AS rn "
+      "FROM window_typed_input");
+  }
+}
+
+TEST_CASE_METHOD(WindowGPUExecutionFixture,
                  "gpu_execution window multi-batch and multi-partition ranking",
                  "[integration][window][gpu]")
 {
