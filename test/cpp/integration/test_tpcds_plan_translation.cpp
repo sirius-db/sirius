@@ -626,11 +626,12 @@ TEST_CASE_METHOD(TpcDsPlanTranslationFixture,
     DYNAMIC_SECTION("Q" << query_nr)
     {
       if (query_nr == 67) {
-        // Q67 GPU execution is deferred until COALESCE is supported by the GPU expression
-        // executor; this test only asserts Sirius plan translation.
+        // Q67 remains translation-only here: COALESCE now runs on GPU, but end-to-end Q67 GPU
+        // execution is still deferred until the remaining non-window TPC-DS gaps (e.g. the ROLLUP
+        // projection path) are covered. This test only asserts Sirius plan translation.
         INFO(
-          "Q67 GPU execution is deferred until COALESCE is supported by the GPU expression "
-          "executor");
+          "Q67 remains translation-only; end-to-end GPU execution is deferred until the remaining "
+          "non-window TPC-DS gaps are covered");
       }
       auto [success, error] = check_query("sirius_plan_check", get_tpcds_query(query_nr));
       if (!success) {
