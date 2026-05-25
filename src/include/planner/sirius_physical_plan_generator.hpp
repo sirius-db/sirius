@@ -42,6 +42,7 @@ class LogicalTopN;
 class LogicalProjection;
 class LogicalMaterializedCTE;
 class LogicalCTERef;
+class LogicalWindow;
 }  // namespace duckdb
 
 namespace sirius::planner {

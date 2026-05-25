@@ -33,7 +33,7 @@ namespace sirius {
 namespace op {
 
 sirius_physical_window::sirius_physical_window(
-  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<sirius::logical_type> types,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> window_exprs,
   std::size_t estimated_cardinality)
   : sirius_physical_partition_consumer_operator(
@@ -53,15 +53,10 @@ std::unique_ptr<operator_data> sirius_physical_window::get_next_task_input_data(
   std::lock_guard<std::mutex> lg(lock);
   if (current_partition_index < ports.begin()->second->repo->num_partitions()) {
     std::vector<std::shared_ptr<::cucascade::data_batch>> input_batch;
-    bool found_batch = true;
-    while (found_batch) {
-      auto batch = ports.begin()->second->repo->pop_data_batch(
-        ::cucascade::batch_state::task_created, current_partition_index);
-      if (batch) {
-        input_batch.push_back(std::move(batch));
-      } else {
-        found_batch = false;
-      }
+    while (true) {
+      auto batch = ports.begin()->second->repo->pop_next_data_batch(current_partition_index);
+      if (!batch) { break; }
+      input_batch.push_back(std::move(batch));
     }
     current_partition_index++;
     if (input_batch.empty()) { return nullptr; }
@@ -74,18 +69,18 @@ std::unique_ptr<operator_data> sirius_physical_window::execute(const operator_da
                                                                rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_window::execute"};
-  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_data_batches();
+  auto& input        = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  auto input_batches = input.get_read_only_batches();
 
-  // Collect the partition's non-empty batches and their (shared) memory space.
+  // Collect the partition's batches and their (shared) memory space. Read-only batch handles keep
+  // the underlying GPU data alive for the views below.
   cucascade::memory::memory_space* space = nullptr;
   std::vector<cudf::table_view> views;
   for (const auto& batch : input_batches) {
-    if (!batch) { continue; }
-    auto* batch_space = batch->get_memory_space();
+    auto* batch_space = batch.get_memory_space();
     if (!batch_space) { continue; }
     if (!space) { space = batch_space; }
-    views.push_back(get_cudf_table_view(*batch));
+    views.push_back(get_cudf_table_view(batch));
   }
   if (space == nullptr || views.empty()) {
     return std::make_unique<pipelineable_operator_data>(
@@ -224,7 +219,7 @@ std::unique_ptr<operator_data> sirius_physical_window::execute(const operator_da
 
   auto output_table = std::make_unique<cudf::table>(std::move(output_cols), stream, mr);
   std::vector<std::shared_ptr<::cucascade::data_batch>> out_batches{
-    make_data_batch(std::move(output_table), *space)};
+    make_data_batch(std::move(output_table), *space, stream)};
   return std::make_unique<pipelineable_operator_data>(out_batches);
 }
 

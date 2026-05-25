@@ -183,7 +183,7 @@ TEST_CASE_METHOD(WindowPlanFixture,
   CHECK(window->type == sirius::op::SiriusPhysicalOperatorType::WINDOW);
   CHECK(window->is_sink());
   CHECK(window->is_source());
-  CHECK(window->source_order() == duckdb::OrderPreservationType::NO_ORDER);
+  CHECK(window->source_order() == sirius::OrderPreservationType::NO_ORDER);
 
   std::vector<int> expected_partition_keys{0};
   CHECK(window->get_partition_key_indices() == expected_partition_keys);
@@ -202,7 +202,7 @@ TEST_CASE_METHOD(WindowPlanFixture,
   CHECK(window->get_partition_key_indices().empty());
   CHECK(window->is_sink());
   CHECK(window->is_source());
-  CHECK(window->source_order() == duckdb::OrderPreservationType::NO_ORDER);
+  CHECK(window->source_order() == sirius::OrderPreservationType::NO_ORDER);
 }
 
 TEST_CASE_METHOD(WindowPlanFixture,

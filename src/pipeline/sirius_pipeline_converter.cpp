@@ -566,7 +566,7 @@ void sirius_pipeline_converter::split_window_sink(
     scheduled_.push_back(current_pipeline);
 
     // PARTITION pipeline: producer (source) -> PARTITION (sink)
-    auto partition_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(engine_);
+    auto partition_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(build_ctx_);
     partition_pipeline->source = producer;
     partition_pipeline->sink   = partition_ptr;
     scheduled_.push_back(partition_pipeline);
@@ -579,12 +579,12 @@ void sirius_pipeline_converter::split_window_sink(
   // WINDOW pipeline: PARTITION (source) -> WINDOW (sink). PARTITION -> WINDOW is a FULL barrier
   // (wired generically by the PARTITION branch in wire_data_repositories, since WINDOW is not a
   // CONCAT). Do not push PARTITION into this pipeline's operators (mirrors the merge pipeline).
-  auto window_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(engine_);
+  auto window_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(build_ctx_);
   window_pipeline->source = partition_ptr;
   window_pipeline->sink   = window_op.get();
   scheduled_.push_back(window_pipeline);
 
-  pipeline_breakers_.push_back(std::move(partition_op));
+  inserted_operators_.push_back(std::move(partition_op));
 }
 
 void sirius_pipeline_converter::split_group_aggregate_sink(

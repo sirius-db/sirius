@@ -18,6 +18,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/operator/logical_window.hpp"
+#include "helper/type_conversions.hpp"
 #include "op/sirius_physical_window.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
@@ -106,7 +107,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalWindow& op)
   auto plan   = create_plan(*op.children[0]);
   auto window = duckdb::make_uniq_base<sirius::op::sirius_physical_operator,
                                        sirius::op::sirius_physical_window>(
-    op.types, std::move(op.expressions), op.estimated_cardinality);
+    sirius::from_duckdb_vec(op.types), std::move(op.expressions), op.estimated_cardinality);
   window->children.push_back(std::move(plan));
   return window;
 }

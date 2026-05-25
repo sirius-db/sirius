@@ -44,7 +44,7 @@ class sirius_physical_window : public sirius_physical_partition_consumer_operato
   /// @param types        output schema = child output columns ++ one BIGINT per window expression
   /// @param window_exprs the LogicalWindow's BoundWindowExpression list (Phase 1 ranking only,
   ///                     sharing one PARTITION BY / ORDER BY; validated by create_plan)
-  sirius_physical_window(duckdb::vector<duckdb::LogicalType> types,
+  sirius_physical_window(duckdb::vector<sirius::logical_type> types,
                          duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> window_exprs,
                          std::size_t estimated_cardinality);
 
@@ -65,9 +65,9 @@ class sirius_physical_window : public sirius_physical_partition_consumer_operato
   bool is_source() const override { return true; }
 
   // Window sorts internally and emits in that order; outer ORDER BY (if any) re-orders downstream.
-  duckdb::OrderPreservationType source_order() const override
+  sirius::OrderPreservationType source_order() const override
   {
-    return duckdb::OrderPreservationType::NO_ORDER;
+    return sirius::OrderPreservationType::NO_ORDER;
   }
 
   // Sink interface
