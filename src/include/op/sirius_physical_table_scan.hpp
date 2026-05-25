@@ -21,6 +21,7 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "expression/expression.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 namespace sirius {
@@ -58,10 +59,10 @@ class sirius_physical_table_scan : public sirius_physical_operator {
  public:
   //! Table scan that immediately projects out filter columns that are unused in the remainder of
   //! the query plan
-  sirius_physical_table_scan(duckdb::vector<duckdb::LogicalType> types,
+  sirius_physical_table_scan(duckdb::vector<sirius::logical_type> types,
                              duckdb::TableFunction function,
                              duckdb::unique_ptr<duckdb::FunctionData> bind_data,
-                             duckdb::vector<duckdb::LogicalType> returned_types,
+                             duckdb::vector<sirius::logical_type> returned_types,
                              duckdb::vector<duckdb::ColumnIndex> column_ids,
                              duckdb::vector<std::size_t> projection_ids,
                              duckdb::vector<std::string> names,
@@ -76,7 +77,7 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   //! Bind data of the function
   duckdb::unique_ptr<duckdb::FunctionData> bind_data;
   //! The types of ALL columns that can be returned by the table function
-  duckdb::vector<duckdb::LogicalType> returned_types;
+  duckdb::vector<sirius::logical_type> returned_types;
   //! The column ids used within the table function
   duckdb::vector<duckdb::ColumnIndex> column_ids;
   //! The projected-out column ids
@@ -90,6 +91,8 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   duckdb::ExtraOperatorInfo extra_info;
   //! Parameters
   duckdb::vector<duckdb::Value> parameters;
+  //! Named parameters (e.g., snapshot_from_id for iceberg_scan)
+  duckdb::named_parameter_map_t named_parameters;
   //! Contains a reference to dynamically generated table filters (through e.g. a join up in the
   //! tree)
   duckdb::shared_ptr<duckdb::DynamicTableFilterSet> dynamic_filters;
@@ -106,7 +109,7 @@ class sirius_physical_table_scan : public sirius_physical_operator {
 
   bool* already_cached;
 
-  duckdb::vector<duckdb::LogicalType> scanned_types;
+  duckdb::vector<sirius::logical_type> scanned_types;
 
   duckdb::vector<std::size_t> scanned_ids;
 
@@ -123,7 +126,7 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   bool passthrough = false;
 
   //! The composite filter expression from the table filter set, if any
-  duckdb::unique_ptr<duckdb::Expression> filter_expr = nullptr;
+  sirius::expression filter_expr;
 
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 

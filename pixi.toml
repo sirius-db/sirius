@@ -7,31 +7,41 @@ requires-pixi = ">=0.59"
 [activation]
 scripts = ["scripts/pixi_activate.sh"]
 
+[activation.env]
+SCCACHE_BASEDIRS = "$PIXI_PROJECT_ROOT:$CONDA_PREFIX"
+
 [dependencies]
 bc = "*"
-cmake = "4.1.*"
+cmake = "4.*"
 cuda-nvcc = "*"
 cuda-nvml-dev = "*"
 cxx-compiler = "*"
 make = "*"
 ninja = "*"
-sccache = "*"
+sccache = "=0.15.0" # Version must match sccache version installed by mozilla-actions/sccache-action in GH workflows
 unzip = "*"
-clang = ">=21,<22"
+clang = "21.*"
 wget = "*"
 pre-commit = "*"
-clang-tools = ">=21.1.8,<22"
+identify = ">=2.6"
+clang-tools = "21.*"
 pkg-config = "*"
 mold = "*"
+libprotobuf = "*"
+rust = "*"
 
 [feature.dev-libs.dependencies]
 librmm = "*"
 libcurand-dev = "*"
 yaml-cpp = "*"
-libabseil = ">=20260107.0"
-duckdb = "=1.4.4"
+libabseil = "*"
+duckdb = "=1.5.2"
 spdlog = "1.8.*"
-sqlite = ">=3.52.0,<4"
+sqlite = "3.*"
+rust-src = "*"
+liburing = "*"
+openssl = "*"
+libcurl = "*"
 
 [tasks]
 
@@ -61,6 +71,8 @@ CUDAARCHS = "75-real;80-real;86-real;90a-real"
 VCPKG_CUDA_VERSION = "12"
 
 [feature.vcpkg.dependencies]
+# Enable S3 use for vcpkg cache
+awscli = "*"
 bison = "*"
 libnvjitlink-dev = "*"
 cuda-nvrtc-dev = "*"
@@ -74,10 +86,10 @@ scripts = ["scripts/vcpkg.sh"]
 
 [feature.duckdb-python.dependencies]
 pip = "*"
-python = ">=3.12"
-pybind11 = ">=2.6.0"
-scikit-build-core = ">=0.11.4"
-setuptools-scm = ">=8.0"
+python = "3.*"
+pybind11 = "*"
+scikit-build-core = "*"
+setuptools-scm = "*"
 
 [feature.duckdb-python.tasks]
 build-duckdb-python = "CMAKE_ARGS=\"-DDUCKDB_SOURCE_PATH=$PIXI_PROJECT_ROOT/duckdb\" pip install --no-build-isolation ./duckdb-python"

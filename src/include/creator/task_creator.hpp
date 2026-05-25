@@ -20,31 +20,29 @@
 #include "exec/bounded_thread_pool.hpp"
 #include "exec/config.hpp"
 #include "exec/interruptible_mpmc.hpp"
-#include "helper/helper.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/sirius_physical_operator.hpp"
-#include "parallel/task_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
 #include <blockingconcurrentqueue.h>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
+#include <cucascade/memory/topology_discovery.hpp>
 
 #include <atomic>
-#include <condition_variable>
-#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
-#include <variant>
+#include <unordered_map>
 
 namespace sirius::pipeline {
-class pipeline_executor;
+class task_scheduler;
 class sirius_pipeline_task_global_state;
 }  // namespace sirius::pipeline
 
 namespace sirius::op::scan {
+class cpu_source_task_global_state;
 class duckdb_scan_task_global_state;
 class parquet_scan_task_global_state;
 class iceberg_scan_task_global_state;
@@ -82,9 +80,11 @@ class task_creator {
    *
    * @param config Configuration for the thread pool (thread count, name prefix, CPU affinity).
    * @param mem_res_mgr Reference to the memory reservation manager.
+   * @param sys_topology Optional system topology info for NUMA-aware GPU routing.
    */
   task_creator(exec::thread_pool_config config,
-               sirius::memory::sirius_memory_reservation_manager& mem_res_mgr);
+               sirius::memory::sirius_memory_reservation_manager& mem_res_mgr,
+               const cucascade::memory::system_topology_info* sys_topology = nullptr);
 
   /**
    * @brief Destructor that ensures the thread pool is stopped.
@@ -101,7 +101,7 @@ class task_creator {
   void set_client_context(::duckdb::ClientContext& client_context);
 
   /// \brief sets pipeline executor reference
-  void set_pipeline_executor(sirius::pipeline::pipeline_executor& pipeline_executor);
+  void set_task_scheduler(sirius::pipeline::task_scheduler& task_scheduler);
 
   /// \brief prepare global states for all pipelines in the query
   void prepare_for_query(const sirius::planner::query& query);
@@ -179,7 +179,7 @@ class task_creator {
   std::unique_ptr<exec::bounded_thread_pool> _bounded_pool;
   std::thread _manager_thread;
   ::duckdb::ClientContext* _client_context;
-  sirius::pipeline::pipeline_executor* _pipeline_executor{nullptr};
+  sirius::pipeline::task_scheduler* _task_scheduler{nullptr};
   sirius::memory::sirius_memory_reservation_manager& _mem_res_mgr;
   std::atomic<uint64_t> _task_id{0};
   size_t _num_scans_in_plan{0};
@@ -194,11 +194,26 @@ class task_creator {
     _scan_operator_global_state_map;
   std::map<size_t, std::shared_ptr<op::scan::parquet_scan_task_global_state>>
     _parquet_scan_operator_global_state_map;
+  std::map<size_t, std::shared_ptr<op::scan::cpu_source_task_global_state>>
+    _cpu_source_operator_global_state_map;
   std::map<size_t, std::shared_ptr<pipeline::sirius_pipeline_task_global_state>>
     _gpu_operator_global_state_map;
   std::unique_ptr<duckdb::ThreadContext> _thread_context;
   std::unique_ptr<duckdb::ExecutionContext> _execution_context;
   std::mutex _global_state_mutex;  // Protect concurrent access to the map
+
+  /// System topology for NUMA-aware GPU routing (non-owning, may be null)
+  const cucascade::memory::system_topology_info* _sys_topology{nullptr};
+  /// Maps NUMA node ID -> all GPU device_ids on that NUMA node (for HOST data
+  /// locality). A NUMA node can host multiple GPUs; the NUMA-affinity rule
+  /// round-robins across the vector so work spreads instead of pinning to the
+  /// first GPU.
+  /// GPUs that report numa_node=-1 (non-NUMA / single-NUMA hosts, per the
+  /// Linux /sys/bus/pci/devices/*/numa_node convention) are normalized to
+  /// NUMA 0 so they match the host memory space built for the single node.
+  std::unordered_map<int, std::vector<int>> _numa_to_gpu;
+  /// Round-robin counter for NUMA-affinity routing when multiple GPUs share a NUMA node.
+  std::atomic<uint64_t> _numa_to_gpu_rr{0};
 };
 
 }  // namespace sirius::creator

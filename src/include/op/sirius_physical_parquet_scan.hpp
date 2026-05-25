@@ -21,7 +21,7 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/data_table.hpp"
-#include "expression_executor/gpu_expression_translator.hpp"
+#include "expression_executor/gpu_expression_translator_internal.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 
@@ -36,14 +36,15 @@ class sirius_physical_parquet_scan : public sirius_physical_operator {
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::PARQUET_SCAN;
 
  public:
-  sirius_physical_parquet_scan(sirius_physical_table_scan* table_scan);
+  sirius_physical_parquet_scan(sirius_physical_table_scan* table_scan,
+                               std::vector<int> gpu_device_ids = {});
 
   //! Table scan that immediately projects out filter columns that are unused in the remainder of
   //! the query plan
-  sirius_physical_parquet_scan(duckdb::vector<duckdb::LogicalType> types,
+  sirius_physical_parquet_scan(duckdb::vector<sirius::logical_type> types,
                                duckdb::TableFunction function,
                                duckdb::unique_ptr<duckdb::FunctionData> bind_data,
-                               duckdb::vector<duckdb::LogicalType> returned_types,
+                               duckdb::vector<sirius::logical_type> returned_types,
                                duckdb::vector<duckdb::ColumnIndex> column_ids,
                                duckdb::vector<std::size_t> projection_ids,
                                duckdb::vector<std::string> names,
@@ -52,7 +53,8 @@ class sirius_physical_parquet_scan : public sirius_physical_operator {
                                duckdb::ExtraOperatorInfo extra_info,
                                duckdb::vector<duckdb::Value> parameters,
                                duckdb::virtual_column_map_t virtual_columns,
-                               sirius_physical_table_scan* physical_table_scan);
+                               sirius_physical_table_scan* physical_table_scan,
+                               std::vector<int> gpu_device_ids = {});
 
   std::optional<task_creation_hint> get_next_task_hint() override
   {
@@ -65,7 +67,7 @@ class sirius_physical_parquet_scan : public sirius_physical_operator {
   //! Bind data of the function
   duckdb::unique_ptr<duckdb::FunctionData> bind_data;
   //! The types of ALL columns that can be returned by the table function
-  duckdb::vector<duckdb::LogicalType> returned_types;
+  duckdb::vector<sirius::logical_type> returned_types;
   //! The column ids used within the table function
   duckdb::vector<duckdb::ColumnIndex> column_ids;
   //! The projected-out column ids
@@ -95,7 +97,7 @@ class sirius_physical_parquet_scan : public sirius_physical_operator {
 
   bool* already_cached;
 
-  duckdb::vector<duckdb::LogicalType> scanned_types;
+  duckdb::vector<sirius::logical_type> scanned_types;
 
   duckdb::vector<std::size_t> scanned_ids;
 
@@ -108,13 +110,18 @@ class sirius_physical_parquet_scan : public sirius_physical_operator {
 
   std::atomic<bool> has_more_partitions{true};
 
-  //! The translated filter expression, if translation from duckdb expression to cuDF AST was
-  //! successful. We need to maintain this here so that translation failures can be detected during
-  //! the execution of the table scan operator, in which case the filter can be applied there.
-  std::optional<gpu_expression_translator::translated_expression> translated_filter;
+  //! Per-GPU translated filter expressions. Each entry binds the filter's cudf::scalar
+  //! device buffers to a specific device so tasks dispatched to that device can
+  //! evaluate the AST without hitting cudaErrorInvalidValue / cudaErrorIllegalAddress
+  //! under num_gpus>1. Empty = no filter / translation failed.
+  std::unordered_map<int, gpu_expression_translator::translated_expression>
+    translated_filter_by_device;
 
  public:
   bool is_source() const override { return true; }
+
+  [[nodiscard]] std::size_t no_history_peak_memory_estimate(
+    const op::input_stats& stats) const override;
 };
 
 }  // namespace op

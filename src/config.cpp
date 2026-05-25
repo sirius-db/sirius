@@ -22,6 +22,8 @@ bool Config::USE_PIN_MEM_FOR_CPU_PROCESSING = true;
 bool Config::USE_PIN_MEM_FOR_CACHING        = false;
 
 bool Config::USE_CUDF_EXPR = true;
+sirius::expression_executor_strategy Config::EXPRESSION_EXECUTOR_STRATEGY =
+  sirius::expression_executor_strategy::AST_INTERPRET;
 
 bool Config::USE_CUSTOM_TOP_N = true;
 
@@ -33,7 +35,7 @@ uint64_t Config::PRINT_GPU_TABLE_MAX_ROWS = 1000;
 
 bool Config::ENABLE_FALLBACK_CHECK = false;
 
-bool Config::ENABLE_DUCKDB_FALLBACK = false;
+bool Config::ENABLE_DUCKDB_FALLBACK = true;
 
 bool Config::ENABLE_REGEX_JIT_IMPL = true;
 
@@ -47,5 +49,9 @@ uint64_t Config::MAX_SORT_PARTITION_BYTES = 0;  ///< 0 = auto (33% of available 
 std::string Config::LOG_LEVEL = "info";
 std::string Config::LOG_DIR   = "log";
 int Config::LOG_FLUSH_SECONDS = 3;
+
+bool Config::ENABLE_QUENT                  = false;
+std::string Config::QUENT_OUTPUT_DIRECTORY = "telemetry_data";
+std::string Config::QUENT_ENGINE_NAME      = "siriusDB";
 
 }  // namespace duckdb

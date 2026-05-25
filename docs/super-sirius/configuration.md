@@ -78,10 +78,14 @@ sirius:
       downgrade_trigger_fraction: 0.8
       downgrade_stop_fraction: 0.6
     host:
-      capacity_bytes: 471200000000
+      capacity_bytes: 439Gi
       initial_number_pools: 785
       pool_size: 512
-      block_size: 1048576
+      block_size: 1Mi
+    disk:
+      disk_id: 0
+      capacity_bytes: 1Ti
+      downgrade_root_dirs: "/mnt/nvme/sirius_spill"
   executor:
     pipeline:
       num_threads: 4
@@ -89,6 +93,7 @@ sirius:
     downgrade:
       num_threads: 1
       thread_name_prefix: "sirius_downgrade_executor"
+      monitor_period_ms: 10
     duckdb_scan:
       num_threads: 4
       thread_name_prefix: "sirius_scan_executor"
@@ -96,12 +101,80 @@ sirius:
     task_creator:
       num_threads: 2
   operator_params:
-    scan_task_batch_size: 5368709120     # 5 GB
+    scan_task_batch_size: 5Gi
     default_scan_task_varchar_size: 256
     max_sort_partition_bytes: 0          # 0 = auto (33% GPU memory)
-    hash_partition_bytes: 5368709120     # 5 GB
-    concat_batch_bytes: 5368709120       # 5 GB
+    hash_partition_bytes: 5Gi
+    concat_batch_bytes: 5Gi
+    max_build_hash_table_bytes: 500Mi
 ```
+
+## Memory Configuration
+
+Sirius uses cuCascade for tiered memory management across GPU, Host (pinned), and Disk tiers. The `memory` section provides a high-level interface that maps to cuCascade's underlying memory space configs.
+
+### Topology
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `num_gpus` | int | 1 | Number of GPUs to use. Mutually exclusive with `gpu_ids`. |
+| `gpu_ids` | list of int | — | Explicit GPU device IDs. Mutually exclusive with `num_gpus`. |
+
+### GPU Memory (`sirius.memory.gpu`)
+
+Controls how much GPU VRAM Sirius claims and when it starts evicting data to host memory.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `usage_limit_fraction` | double | 0.95 | Fraction of total VRAM to use as Sirius's GPU memory capacity. The remaining 5% is left for the CUDA runtime, cuDF temporaries, and other GPU consumers. |
+| `usage_limit_bytes` | bytes | — | Absolute VRAM limit. Mutually exclusive with `usage_limit_fraction`. |
+| `reservation_limit_fraction` | double | 0.9 | Fraction of the GPU capacity (set by `usage_limit_*`) that can be reserved by pipeline tasks. Reservations are acquired before task execution and prevent overcommit. |
+| `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`. |
+| `downgrade_trigger_fraction` | double | 1.0 | Start evicting GPU-resident data to host when reserved memory exceeds this fraction of capacity. At the default of 1.0, downgrading only triggers when the GPU is fully reserved. |
+| `downgrade_stop_fraction` | double | 0.7 | Stop evicting when reserved memory drops to this fraction of capacity. The gap between trigger and stop prevents oscillation. |
+| `track_per_stream_reservation` | bool | false | Track memory reservations per CUDA stream instead of globally. Useful for debugging per-task memory usage. |
+
+### Host Memory (`sirius.memory.host`)
+
+Controls pinned host memory pools. One pool group is created per NUMA node (auto-detected from hardware topology).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `capacity_bytes` | bytes | 8Gi | Pinned host memory capacity **per NUMA node**. This memory is allocated at startup using `cudaMallocHost`. |
+| `reservation_limit_fraction` | double | 0.9 | Fraction of host capacity that can be reserved. |
+| `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`. |
+| `downgrade_trigger_fraction` | double | 0.8 | Start evicting host-resident data to disk when reserved memory exceeds this fraction. |
+| `downgrade_stop_fraction` | double | 0.7 | Stop evicting when reserved memory drops to this fraction. |
+| `block_size` | bytes | 1Mi | Size of each allocation block in the pool. Larger blocks reduce allocation overhead but waste memory on small allocations. |
+| `pool_size` | int | 128 | Number of blocks per pool. Total pool capacity = `block_size × pool_size`. |
+| `initial_number_pools` | int | 4 | Number of pools pre-allocated at startup. Additional pools are created on demand. Initial host footprint = `block_size × pool_size × initial_number_pools`. |
+
+### Disk Memory (`sirius.memory.disk`)
+
+Controls the disk spill tier. Data evicted from host memory is written here. Disk spilling is **disabled by default** (empty `downgrade_root_dirs`).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `disk_id` | int | 0 | Identifier for the disk space. |
+| `capacity_bytes` | bytes | 1Ti | Maximum disk space for spill files. |
+| `downgrade_root_dirs` | string | "" | Directory path for spill files. **Must be set** to enable disk spilling. Use a fast local mount (NVMe preferred). |
+
+### How Downgrade Thresholds Work
+
+Each memory tier uses a trigger/stop threshold pair to control data eviction:
+
+```
+  0%             downgrade_stop    downgrade_trigger     reservation_limit
+  |─────────────────|─────────────────|────────────────────|───── capacity
+       normal           hysteresis         evicting           denied
+```
+
+- Below `downgrade_stop`: normal operation, no eviction
+- Between `stop` and `trigger`: no new evictions start, but in-flight evictions finish
+- Above `downgrade_trigger`: actively evict data to the next lower tier
+- Above `reservation_limit`: new reservations are denied (triggers OOM retry)
+
+The gap between `trigger` and `stop` prevents oscillation — without it, evicting one batch could drop below trigger, then the next allocation re-triggers eviction.
 
 ## Operator Parameters
 
@@ -116,7 +189,7 @@ sirius:
 | `concat_batch_bytes` | 512 MB | Target output batch size for CONCAT operator |
 | `max_build_hash_table_bytes` | 500 MB | Max build-side size for BUILD_PROBE join mode |
 
-**Validation:** `validate_and_fix()` ensures `max_build_hash_table_bytes < concat_batch_bytes`.
+**Note:** `max_build_hash_table_bytes` can be larger than `concat_batch_bytes`. When it is, the partition operator configures CONCAT to concatenate all batches, enabling the more efficient BUILD_PROBE join mode for larger build sides. Other joins (STANDARD, MIXED) still use `concat_batch_bytes` as the batch size threshold.
 
 ## Thread Pool Configuration
 
@@ -176,13 +249,19 @@ Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
 | `concat_batch_bytes` | 512 MB | CONCAT output batch size |
 | `max_build_hash_table_bytes` | 500 MB | Max build-side hash table bytes |
 
+### Transparent Execution
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `gpu_execution` | true | Enable transparent GPU execution for plain SQL queries. When enabled, supported queries are automatically intercepted and executed on the GPU. When disabled, only explicit `CALL gpu_execution('...')` uses the GPU. |
+
 ### Debug
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `print_gpu_table_max_rows` | - | Max rows to print in debug output |
 | `enable_fallback_check` | - | Enable fallback validation |
-| `enable_duckdb_fallback` | false | Fall back to DuckDB CPU on Sirius errors |
+| `enable_duckdb_fallback` | true | Fall back to DuckDB CPU on Sirius errors. Matches the legacy `gpu_processing` path. Set to `false` to surface Sirius errors instead of silently falling back. |
 | `enable_regex_jit_impl` | - | Use JIT regex implementation |
 
 ## Legacy Config Flags
@@ -196,7 +275,7 @@ Static constants from `namespace duckdb::Config` (used by legacy Sirius) and `na
 | `USE_PIN_MEM_FOR_CPU_PROCESSING` | true | `duckdb::Config` |
 | `USE_PIN_MEM_FOR_CACHING` | false | `duckdb::Config` |
 | `USE_CUDF_EXPR` | true | `duckdb::Config` |
-| `ENABLE_DUCKDB_FALLBACK` | false | `duckdb::Config` |
+| `ENABLE_DUCKDB_FALLBACK` | true | `duckdb::Config` |
 | `NUM_GPU_EXECUTOR_THREADS` | 2 | `sirius::Config` |
 | `NUM_PIPELINE_EXECUTOR_THREADS` | 1 | `sirius::Config` |
 | `NUM_GPU` | 1 | `sirius::Config` |

@@ -32,6 +32,7 @@
 #include "../operator_type_traits.hpp"
 #include "aggregate_test_utils.hpp"
 #include "data/data_batch_utils.hpp"
+#include "helper/type_conversions.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "utils/data_utils.hpp"
@@ -128,8 +129,8 @@ TEST_CASE("count distinct: single batch, basic correctness",
   std::vector<int32_t> keys   = {0, 0, 0, 0, 0, 1, 1, 1, 2, 2, 2};
   std::vector<int32_t> values = {10, 20, 10, 30, 20, 40, 50, 40, 60, 60, 60};
 
-  auto input_batch =
-    sirius::make_data_batch(make_count_distinct_input<ValTraits>(keys, values, stream, mr), *space);
+  auto input_batch = sirius::make_data_batch(
+    make_count_distinct_input<ValTraits>(keys, values, stream, mr), *space, stream);
 
   auto expected_table = make_count_distinct_expected({0, 1, 2}, {3, 2, 1}, stream, mr);
 
@@ -234,7 +235,7 @@ TEMPLATE_TEST_CASE("count distinct: multiple batches, randomly striped",
   // Run local aggregate on each split
   std::vector<std::shared_ptr<data_batch>> local_results;
   for (auto& split : splits) {
-    auto input_batch = sirius::make_data_batch(std::move(split), *space);
+    auto input_batch = sirius::make_data_batch(std::move(split), *space, stream);
     local_results.push_back(run_local(local_op, input_batch));
   }
 
@@ -286,15 +287,19 @@ TEST_CASE("count distinct: cross-batch duplicate deduplication within a partitio
 
   // Batch 1
   auto batch1 = sirius::make_data_batch(
-    make_count_distinct_input<ValTraits>({0, 0, 1, 2}, {10, 20, 40, 60}, stream, mr), *space);
+    make_count_distinct_input<ValTraits>({0, 0, 1, 2}, {10, 20, 40, 60}, stream, mr),
+    *space,
+    stream);
 
   // Batch 2 — intentional cross-batch dups: (0,10), (1,40), (2,60)
   auto batch2 = sirius::make_data_batch(
-    make_count_distinct_input<ValTraits>({0, 1, 1, 2}, {10, 50, 40, 60}, stream, mr), *space);
+    make_count_distinct_input<ValTraits>({0, 1, 1, 2}, {10, 50, 40, 60}, stream, mr),
+    *space,
+    stream);
 
   // Batch 3 — further cross-batch dups: (1,40), (2,60)
   auto batch3 = sirius::make_data_batch(
-    make_count_distinct_input<ValTraits>({0, 1, 2}, {30, 40, 60}, stream, mr), *space);
+    make_count_distinct_input<ValTraits>({0, 1, 2}, {30, 40, 60}, stream, mr), *space, stream);
 
   auto expected_table = make_count_distinct_expected({0, 1, 2}, {3, 2, 1}, stream, mr);
 
@@ -358,10 +363,11 @@ TEST_CASE("count distinct: mixed with regular aggregations, multiple batches",
   // key=1: [40,40]    ++ [50]     → {40,50}    → count_distinct=2, min=40, count=3
   auto batch1 = sirius::make_data_batch(
     make_count_distinct_input<ValTraits>({0, 0, 0, 1, 1}, {10, 10, 20, 40, 40}, stream, mr),
-    *space);
+    *space,
+    stream);
 
   auto batch2 = sirius::make_data_batch(
-    make_count_distinct_input<ValTraits>({0, 0, 1}, {20, 30, 50}, stream, mr), *space);
+    make_count_distinct_input<ValTraits>({0, 0, 1}, {20, 30, 50}, stream, mr), *space, stream);
 
   // Build expected: [key(int32) | count_distinct(int64) | min(int32) | count(int64)]
   std::vector<std::unique_ptr<cudf::column>> exp_cols;
@@ -373,11 +379,11 @@ TEST_CASE("count distinct: mixed with regular aggregations, multiple batches",
   auto expected_table = std::make_unique<cudf::table>(std::move(exp_cols));
 
   // Build expressions: [count(distinct col1), min(col1), count(col1)]
-  duckdb::vector<duckdb::LogicalType> output_types;
-  output_types.push_back(KeyTraits::logical_type());    // group key
-  output_types.push_back(duckdb::LogicalType::BIGINT);  // count distinct
-  output_types.push_back(ValTraits::logical_type());    // min
-  output_types.push_back(duckdb::LogicalType::BIGINT);  // count
+  duckdb::vector<sirius::logical_type> output_types;
+  output_types.push_back(sirius::from_duckdb(KeyTraits::logical_type()));    // group key
+  output_types.push_back(sirius::from_duckdb(duckdb::LogicalType::BIGINT));  // count distinct
+  output_types.push_back(sirius::from_duckdb(ValTraits::logical_type()));    // min
+  output_types.push_back(sirius::from_duckdb(duckdb::LogicalType::BIGINT));  // count
 
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups;
   groups.push_back(
@@ -414,7 +420,7 @@ TEST_CASE("count distinct: mixed with regular aggregations, multiple batches",
   }
 
   // Clone expressions for merge operator (it takes the same spec)
-  duckdb::vector<duckdb::LogicalType> output_types2 = output_types;
+  duckdb::vector<sirius::logical_type> output_types2 = output_types;
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups2;
   groups2.push_back(
     duckdb::make_uniq<duckdb::BoundReferenceExpression>(KeyTraits::logical_type(), 0));
@@ -425,14 +431,14 @@ TEST_CASE("count distinct: mixed with regular aggregations, multiple batches",
 
   sirius_physical_grouped_aggregate local_op(context,
                                              std::move(output_types),
-                                             std::move(aggregates),
-                                             std::move(groups),
+                                             sirius::wrap_many(std::move(aggregates)),
+                                             sirius::wrap_many(std::move(groups)),
                                              2 /*estimated_cardinality*/);
 
   sirius_physical_grouped_aggregate_merge merge_op(context,
                                                    std::move(output_types2),
-                                                   std::move(aggregates2),
-                                                   std::move(groups2),
+                                                   sirius::wrap_many(std::move(aggregates2)),
+                                                   sirius::wrap_many(std::move(groups2)),
                                                    2 /*estimated_cardinality*/);
 
   auto local1 = run_local(local_op, batch1);
@@ -521,7 +527,8 @@ TEST_CASE("count distinct: multiple partitions with multiple batches per partiti
   // --- Process partition 0 (separate execute() call, as the real pipeline does) ---
   std::vector<std::shared_ptr<data_batch>> local_p0;
   for (auto& split : splits0) {
-    local_p0.push_back(run_local(local_op, sirius::make_data_batch(std::move(split), *space)));
+    local_p0.push_back(
+      run_local(local_op, sirius::make_data_batch(std::move(split), *space, stream)));
   }
   auto result_p0 = merge_op.execute(pipelineable_operator_data(local_p0), default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*result_p0).get_data_batches().size() ==
@@ -536,7 +543,8 @@ TEST_CASE("count distinct: multiple partitions with multiple batches per partiti
   // --- Process partition 1 (separate execute() call) ---
   std::vector<std::shared_ptr<data_batch>> local_p1;
   for (auto& split : splits1) {
-    local_p1.push_back(run_local(local_op, sirius::make_data_batch(std::move(split), *space)));
+    local_p1.push_back(
+      run_local(local_op, sirius::make_data_batch(std::move(split), *space, stream)));
   }
   auto result_p1 = merge_op.execute(pipelineable_operator_data(local_p1), default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*result_p1).get_data_batches().size() ==
@@ -591,12 +599,12 @@ TEST_CASE("count distinct: multi-column struct expression",
   };
 
   // Batch 1
-  auto batch1 =
-    sirius::make_data_batch(make_3col_input({0, 0, 1, 1}, {10, 10, 30, 30}, {1, 1, 3, 3}), *space);
+  auto batch1 = sirius::make_data_batch(
+    make_3col_input({0, 0, 1, 1}, {10, 10, 30, 30}, {1, 1, 3, 3}), *space, stream);
 
   // Batch 2 — introduces new combos and cross-batch dups
-  auto batch2 =
-    sirius::make_data_batch(make_3col_input({0, 0, 0, 1}, {10, 10, 20, 40}, {2, 1, 1, 3}), *space);
+  auto batch2 = sirius::make_data_batch(
+    make_3col_input({0, 0, 0, 1}, {10, 10, 20, 40}, {2, 1, 1, 3}), *space, stream);
 
   // Expected: key=0 → 3 (combos: (10,1),(10,2),(20,1)), key=1 → 2 (combos: (30,3),(40,3))
   auto expected_table = make_count_distinct_expected({0, 1}, {3, 2}, stream, mr);

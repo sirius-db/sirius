@@ -15,7 +15,6 @@
  */
 
 #include "duckdb/planner/operator/logical_column_data_get.hpp"
-#include "op/sirius_physical_column_data_scan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
 namespace sirius::planner {
@@ -23,14 +22,14 @@ namespace sirius::planner {
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalColumnDataGet& op)
 {
-  D_ASSERT(op.children.size() == 0);
-  D_ASSERT(op.collection);
-
-  return duckdb::make_uniq<sirius::op::sirius_physical_column_data_scan>(
-    op.types,
-    sirius::op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN,
-    op.estimated_cardinality,
-    std::move(op.collection));
+  // LogicalColumnDataGet (LOGICAL_CHUNK_GET) appears at the scan leaf of
+  // DESCRIBE TABLE / SHOW queries. The IN_CLAUSE optimizer (which also
+  // produces these nodes) is disabled for transparent execution, so this
+  // path is only reached for catalog metadata queries. Those contain nullable
+  // VARCHAR columns whose GPU memory transfer fails with cudaErrorInvalidValue.
+  // Fall back to CPU for all standalone catalog scans.
+  throw duckdb::NotImplementedException(
+    "Catalog metadata scan (LOGICAL_CHUNK_GET) is not supported in Sirius GPU execution");
 }
 
 }  // namespace sirius::planner

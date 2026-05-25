@@ -16,10 +16,13 @@
 
 #include "sirius_test_env.hpp"
 
+#include <cuda_runtime.h>
+
 namespace sirius::test {
 
-shared_test_env* g_shared_env      = nullptr;
-shared_test_env* g_integration_env = nullptr;
+shared_test_env* g_shared_env           = nullptr;
+shared_test_env* g_integration_env      = nullptr;
+shared_test_env* g_integration_env_2gpu = nullptr;
 
 shared_test_env::shared_test_env(const std::filesystem::path& config_path)
   : config_path_(config_path)
@@ -77,6 +80,18 @@ void shared_test_env::resume()
 {
   // Recreate DuckDB with the shared config — reinitializes SiriusContext.
   create_db();
+}
+
+shared_test_env* acquire_integration_env_for(int num_gpus)
+{
+  if (num_gpus == 1) { return g_integration_env; }
+  if (num_gpus == 2) {
+    int count = 0;
+    cudaGetDeviceCount(&count);
+    if (count < 2) { return nullptr; }
+    return g_integration_env_2gpu;
+  }
+  return nullptr;
 }
 
 }  // namespace sirius::test

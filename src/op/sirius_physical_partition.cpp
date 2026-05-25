@@ -16,8 +16,11 @@
 
 #include "op/sirius_physical_partition.hpp"
 
+#include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "expression/expression_internal.hpp"
+#include "log/logging.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
@@ -50,7 +53,7 @@ std::optional<std::size_t> extract_bound_ref_index(const duckdb::Expression& exp
 
 }  // namespace
 
-sirius_physical_partition::sirius_physical_partition(duckdb::vector<duckdb::LogicalType> types,
+sirius_physical_partition::sirius_physical_partition(duckdb::vector<sirius::logical_type> types,
                                                      std::size_t estimated_cardinality,
                                                      sirius_physical_operator* parent_op,
                                                      bool is_build,
@@ -79,14 +82,14 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     auto& hash_join_op = op->Cast<sirius_physical_hash_join>();
     for (std::size_t cond_idx = 0; cond_idx < hash_join_op.conditions.size(); cond_idx++) {
       auto& condition = hash_join_op.conditions[cond_idx];
-      if (condition.comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
-          condition.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+      if (condition.comparison != sirius::comparison_type::equal &&
+          condition.comparison != sirius::comparison_type::not_distinct_from) {
         continue;
       }
       std::optional<std::size_t> left_index =
-        extract_bound_ref_index(*hash_join_op.conditions[cond_idx].left);
+        extract_bound_ref_index(*sirius::unwrap(hash_join_op.conditions[cond_idx].left));
       std::optional<std::size_t> right_index =
-        extract_bound_ref_index(*hash_join_op.conditions[cond_idx].right);
+        extract_bound_ref_index(*sirius::unwrap(hash_join_op.conditions[cond_idx].right));
       if (left_index.has_value() && right_index.has_value()) {
         // Determine if a type cast is needed for hash alignment.
         // When the join condition has a BOUND_CAST on one side, the two sides have different
@@ -94,8 +97,8 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
         // values for the same integer in different representations, so without a cast, matching
         // keys would land in different partitions. We apply the same cast used by the join
         // condition so both sides hash identically.
-        const auto& key_expr = is_build ? *hash_join_op.conditions[cond_idx].right
-                                        : *hash_join_op.conditions[cond_idx].left;
+        const auto& key_expr = is_build ? *sirius::unwrap(hash_join_op.conditions[cond_idx].right)
+                                        : *sirius::unwrap(hash_join_op.conditions[cond_idx].left);
         if (is_build) {
           _partition_keys.push_back(right_index.value());
         } else {
@@ -167,7 +170,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_partition::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_data_batches();
+  const auto& input_batches = input.get_read_only_batches();
   if (input_batches.size() != 1) {
     throw std::runtime_error("We expect only one input batch for partition operator " +
                              std::to_string(this->get_operator_id()));
@@ -176,28 +179,34 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
     throw std::runtime_error("Num partitions was not set in sirius_physical_partition operator " +
                              std::to_string(this->get_operator_id()));
   }
+
+  auto const& input_batch_ro = input_batches[0];
+  auto* space                = input_batch_ro.get_memory_space();
+
   if (_num_partitions.value() < 2 || _partition_keys.empty()) {
-    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
+    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
   }
 
-  auto input_batch = input_batches[0];
   std::vector<std::shared_ptr<cucascade::data_batch>> partitioned_results;
   switch (_partition_type) {
     case PartitionType::HASH:
-      partitioned_results = gpu_partition_impl::hash_partition(input_batch,
+      partitioned_results = gpu_partition_impl::hash_partition(input_batch_ro,
                                                                _partition_keys,
                                                                _partition_key_cast_types,
                                                                _num_partitions.value(),
                                                                stream,
-                                                               *input_batch->get_memory_space());
+                                                               *space);
       break;
     case PartitionType::RANGE:
       throw std::runtime_error("Range partitioning is not implemented yet");
     case PartitionType::EVENLY:
       partitioned_results = gpu_partition_impl::evenly_partition(
-        input_batch, _num_partitions.value(), stream, *input_batch->get_memory_space());
+        input_batch_ro, _num_partitions.value(), stream, *space);
       break;
-    case PartitionType::NONE: partitioned_results = {input_batch}; break;
+    case PartitionType::NONE: {
+      partitioned_results = {input_batch_ro.clone(sirius::get_next_batch_id(), stream)};
+      break;
+    }
     case PartitionType::CUSTOM:
       throw std::runtime_error("Custom partitioning is not implemented yet");
     default:
@@ -242,10 +251,21 @@ std::pair<int, uint64_t> sirius_physical_partition::determine_num_partitions()
   auto batch_ids       = repo->get_batch_ids(0);
   uint64_t total_bytes = 0;
   for (auto batch_id : batch_ids) {
-    auto batch = repo->get_data_batch_by_id(batch_id, std::nullopt, 0);
-    if (batch && batch->get_data()) { total_bytes += batch->get_data()->get_size_in_bytes(); }
+    auto batch = repo->get_data_batch_by_id(batch_id, 0);
+    if (batch) {
+      auto ro = batch->to_read_only();
+      if (ro.get_data()) { total_bytes += ro.get_data()->get_size_in_bytes(); }
+    }
   }
   int num_partitions = static_cast<int>(std::max(uint64_t{1}, total_bytes / s_partition_size));
+  // Multi-GPU floor: if the input is big enough to justify using the second
+  // GPU, force at least num_gpus partitions so partition-based operators
+  // (hash_join, merge_group_by) get work on every GPU. Below the small-table
+  // threshold we keep num_partitions at its natural value — tiny tables run
+  // on a single GPU to avoid cross-device overhead.
+  if (_min_num_partitions > 1 && total_bytes >= _small_table_bytes) {
+    num_partitions = std::max(num_partitions, _min_num_partitions);
+  }
   return std::make_pair(num_partitions, total_bytes);
 }
 
@@ -296,12 +316,29 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
     if (!_num_partitions.has_value()) {
       auto [num_parts, total_bytes] = determine_num_partitions();
       auto& hash_join               = _hash_join_op->Cast<sirius_physical_hash_join>();
-      hash_join.update_join_exec_mode(num_parts, total_bytes);
+      // BUILD_PROBE mode requires the build side to deliver exactly one
+      // batch at runtime. The only mechanism that guarantees that is the
+      // build-side CONCAT with concat_all enabled. Detect whether either
+      // partition has a build-side CONCAT downstream BEFORE asking the
+      // join to consider BUILD_PROBE — without this gate, a small build
+      // side with no downstream CONCAT would enter BUILD_PROBE and then
+      // throw at runtime in get_next_task_input_data_for_build_probe when
+      // size(0) != 1.
+      auto has_build_concat = [](sirius_physical_operator& part_op) {
+        for (auto& next_port : part_op.get_next_ports_after_sink()) {
+          if (next_port.next_operator->type != SiriusPhysicalOperatorType::CONCAT) { continue; }
+          auto& concat = next_port.next_operator->Cast<sirius_physical_concat>();
+          if (concat.is_build_concat()) { return true; }
+        }
+        return false;
+      };
+      bool const build_foldable = has_build_concat(*this) || has_build_concat(sibling);
+      hash_join.update_join_exec_mode(num_parts, total_bytes, build_foldable);
       if (_hash_join_op->type == SiriusPhysicalOperatorType::HASH_JOIN &&
           hash_join.is_build_probe_mode()) {
         // Either sibling may run this block first; configure the build-side CONCAT only.
         auto enable_build_concat_all = [](sirius_physical_operator& part_op) {
-          for (auto& next_port : part_op.get_next_port_after_sink()) {
+          for (auto& next_port : part_op.get_next_ports_after_sink()) {
             if (next_port.next_operator->type != SiriusPhysicalOperatorType::CONCAT) { continue; }
             auto& concat = next_port.next_operator->Cast<sirius_physical_concat>();
             if (concat.is_build_concat()) { concat.set_concat_all(true); }
@@ -334,6 +371,13 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
     }
   }
   return sirius_physical_operator::get_next_task_input_data();
+}
+
+std::size_t sirius_physical_partition::no_history_peak_memory_estimate(
+  const op::input_stats& stats) const
+{
+  if (_num_partitions.has_value() && *_num_partitions == 1) { return 0; }
+  return stats.bytes * 2;
 }
 
 }  // namespace op

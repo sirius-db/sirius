@@ -70,6 +70,31 @@ In BUILD_PROBE mode, the first task builds a `cudf::hash_join` hash table and ca
 - `src/op/aggregate/gpu_aggregate_impl.cpp` — `cudf::approx_distinct_count` usage
 - `src/op/aggregate/aggregate_op_util.cpp` — `has_count_distinct` flag
 
+### Distinct Hash Join (PR #558)
+
+**Motivation:** `cudf::hash_join` does not exploit build-side uniqueness, performing unnecessary work for 1:1 joins.
+
+**Mechanism:** When build-side keys are proven unique via logical plan analysis, Sirius uses `cudf::distinct_hash_join` instead of `cudf::hash_join` in BUILD_PROBE mode. `prove_unique_columns()` walks the DuckDB logical plan subtree and detects uniqueness from:
+- PRIMARY KEY constraints on `LogicalGet`
+- GROUP BY columns on `LogicalAggregate`
+- Propagation through `LogicalFilter`, `LogicalOrder`, `LogicalLimit`, `LogicalTopN`, `LogicalProjection`, `LogicalComparisonJoin`
+
+Only applies to INNER and LEFT joins with pure equality conditions (excludes IS NOT DISTINCT FROM due to `null_equality::UNEQUAL` semantics).
+
+**Code path:** `src/planner/sirius_plan_comparison_join.cpp` — `prove_unique_columns()`, `src/op/sirius_physical_hash_join.cpp` — distinct hash table construction
+
+### Scan Scheduling Tuning (PR #507)
+
+**Motivation:** Eagerly depleting all scan sources at query startup wastes GPU memory on multi-scan plans (e.g., joins with two scanned tables).
+
+**Mechanism:** Two changes:
+1. At query startup, at most 2 scans are scheduled initially
+2. In `task_creator::manager_loop`, scan exhaustion (continuous creation) only runs when `_num_scans_in_plan == 1`. For 2+ scans, the `get_next_task_hint()` topology-driven mechanism controls task creation instead.
+
+**Code path:** `src/creator/task_creator.cpp` — `manager_loop()`, `src/pipeline/task_scheduler.cpp` — `schedule_next_scan_tasks()`
+
+**Config:** `max_build_hash_table_bytes` (default: 500 MB) — now independent from `concat_batch_bytes`, enabling larger build sides in BUILD_PROBE mode without affecting other joins.
+
 ## Memory Optimizations
 
 ### Memory-Pressure-Driven Downgrade (PR #368)
@@ -112,6 +137,24 @@ Data is moved from GPU to HOST tier via converter registry.
 
 **Code path:** `src/memory/defragmenter_oom_policy.cpp`
 
+### Adaptive Memory Reservation Estimation (PR #473)
+
+**Motivation:** Fixed-multiplier memory reservation estimates cause either over-reservation (wasting GPU memory) or under-reservation (triggering OOM retries).
+
+**Mechanism:** Each GPU pipeline maintains a `pipeline_memory_history` — a thread-safe ring buffer of up to 64 `task_memory_record` entries recording `estimated_bytes`, `peak_memory_bytes`, and `output_bytes`. `estimate_peak_memory()` computes a weighted average of historical `peak/estimated` ratios, where records with similar estimation bases are weighted higher using a log-ratio distance function. Failed tasks (OOM) ratchet up the estimate by keeping the maximum observed peak for a given input size.
+
+**Code path:**
+- `src/include/pipeline/pipeline_memory_history.hpp` — history ring buffer and estimation
+- `src/pipeline/gpu_pipeline_task.cpp` — `get_estimated_reservation_size()`
+
+### Downgrade Request Pattern (PR #579)
+
+**Motivation:** The previous downgrade retry loop over-freed memory and caused contention between concurrent downgrade requests competing for the same batches.
+
+**Mechanism:** `request_downgrade(predicate)` enqueues a `downgrade_request` struct onto an MPMC queue. A single processing thread handles requests sequentially, lazily fetching candidates from data repositories, then task queues, dispatching them to a thread pool one-by-one via `convertible_data::convert()`, and evaluating the caller-supplied `predicate` after each completion. The predicate defines "done" (e.g., "memory reservation succeeded") -- no retry loop, no over-freeing.
+
+**Code path:** `src/downgrade/downgrade_executor.cpp` -- `request_downgrade()`, `processing_loop()`
+
 ### Pinned Host Memory Caching (PR #437)
 
 **Motivation:** Standard host memory requires page-locking for GPU transfers, which is expensive.
@@ -120,7 +163,7 @@ Data is moved from GPU to HOST tier via converter registry.
 
 **Code path:** cuCascade `cucascade/src/memory/small_pinned_host_memory_resource.cpp`, integrated in `src/include/sirius_context.hpp`
 
-**Config:** Memory manager settings in `sirius.cfg` (cuCascade)
+**Config:** Memory manager settings in `sirius.yaml` (see [Configuration](configuration.md))
 
 ## Scan Optimizations
 
@@ -141,6 +184,64 @@ Query hash matching detects cache hits. On cache hit (PRELOAD mode), data is loa
 - `src/op/scan/duckdb_scan_executor.cpp` — cache/preload logic
 
 **Config:** `scan_cache_level` SET variable
+
+### Row Group Pruning with Filter Pushdown (PR #363)
+
+**Motivation:** Scanning all row groups wastes I/O bandwidth when filter predicates can eliminate entire groups.
+
+**Mechanism:** When `gpu_expression_translator` successfully converts DuckDB `TableFilterSet` filters into a cuDF AST:
+1. `filter_row_groups_with_stats()` uses Parquet column min/max statistics to discard row groups that cannot match the filter — before I/O
+2. The AST is set on `parquet_reader_options` via `set_filter()`, pushing filtering into the cuDF reader
+3. `TABLE_SCAN` is set to passthrough (no GPU expression evaluation needed)
+
+If translation fails, filtering falls back to `gpu_expression_executor` on the decoded batch.
+
+**Code path:**
+- `src/op/scan/scan_utils.cpp` — `convert_table_filters_to_expression()`, `filter_row_groups_with_stats()`
+- `src/op/scan/parquet_scan_task.cpp` — filter integration in global state initialization
+
+### Batch Coalescing for Small Files (PR #503)
+
+**Motivation:** Many small Parquet files each produce a tiny GPU batch, causing high per-task scheduling and kernel launch overhead.
+
+**Mechanism:** `sirius_physical_table_scan::get_next_task_input_data()` accumulates batches until `accumulated_bytes >= scan_task_batch_size` OR `batch_count >= 32`. When multiple batches are present, `execute()` calls `cudf::concatenate()` to produce a single fused table before filtering/projecting.
+
+**Code path:** `src/op/sirius_physical_table_scan.cpp` — `get_next_task_input_data()`, `execute()`
+
+**Config:** `scan_task_batch_size` (default: 512 MB)
+
+### Asynchronous Parquet Metadata via Scan Manager (PRs #571, #620, #731)
+
+**Motivation:** Synchronous metadata parsing on the GPU pipeline thread blocks all pipeline tasks until file footers are read, AST filters are translated, and row-group partitions are computed.
+
+**Mechanism:** A dedicated `sirius_scan_manager` runs alongside the GPU executors and owns a thread pool that drives one `split_provider` per parquet scan operator. The provider parses footers (up to 8 files per task by default), translates AST filters, prunes row groups, and pushes `parquet_scan_data` splits into a per-operator `split_connector`. The GPU scan operator's `get_next_task_input_data()` blocks on the connector and returns each split as it arrives, so consumer scheduling is decoupled from production order. Providers are started sequentially in plan order so per-query memory pressure stays bounded.
+
+**Code path:**
+- `src/scan_manager/sirius_scan_manager.cpp` — manager thread pool, provider registry, sequential driver loop
+- `src/scan_manager/parquet_split_provider.cpp` — metadata parsing, AST filter translation, row-group bundling
+- `src/scan_manager/split_connector.cpp` — blocking queue between provider and operator
+
+### Multifile Parquet Splits (PR #738)
+
+**Motivation:** Many small parquet files each yielding a tiny GPU batch causes per-task scheduling and kernel-launch overhead to dominate scan throughput.
+
+**Mechanism:** `parquet_split_provider` coalesces row-group slices from multiple parquet files into a single split when the bundled files share identical hive-partition values (so synthesized partition columns remain scalar). `accum.total_uncompressed_bytes` accumulates across files; a split is emitted once the total exceeds `approximate_batch_size` or partition values change. The downstream `cudf::io::read_parquet` reads from all bundled files in one invocation.
+
+**Code path:** `src/scan_manager/parquet_split_provider.cpp` — `run_batch()` accumulator
+
+**Config:** `scan_task_batch_size` (default: 512 MB) is forwarded as `approximate_batch_size` to the provider.
+
+### Sirius IO + Prefetching Cache (PR #675)
+
+**Motivation:** Repeated parquet reads pay full file-system cost on every query. A pinned-memory cache between the file and cuDF's parquet reader can serve subsequent reads at H2D-copy speed without re-reading from disk.
+
+**Mechanism:** `sirius::io` provides a `cudf::io::datasource` (`sirius_datasource`) backed by io_uring reactors and an optional pinned-memory `prefetching_cache`. The cache hit path issues `cudaMemcpyAsync` from pinned host memory directly to device; the miss path falls through to backend I/O, which uses `O_DIRECT` reads through pinned bounce slots and round-robin dispatch across reactor threads. A packed atomic state machine (4-bit state + 28-bit pin count in one `atomic<uint32_t>`) eliminates TOCTOU between readability checks and pin acquisition. Eviction is driven by a tiered LRU score; admission control caps concurrent in-flight chunks to keep memory bounded.
+
+**Code path:**
+- `src/io/sirius_datasource.cpp` — `cudf::io::datasource` implementation
+- `src/io/prefetching_cache.cpp` — chunk cache, worker, evictor, buffer pool
+- `src/io/uring/uring_reactor.cpp` — io_uring backend reactor
+- `src/io/admission_control.cpp` — RAII budget enforcement
 
 ### Skip File I/O from Cache (PR #455)
 

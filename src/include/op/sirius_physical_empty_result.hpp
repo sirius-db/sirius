@@ -27,7 +27,7 @@ class sirius_physical_empty_result : public sirius_physical_operator {
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::EMPTY_RESULT;
 
  public:
-  explicit sirius_physical_empty_result(duckdb::vector<duckdb::LogicalType> types,
+  explicit sirius_physical_empty_result(duckdb::vector<sirius::logical_type> types,
                                         std::size_t estimated_cardinality)
     : sirius_physical_operator(
         SiriusPhysicalOperatorType::EMPTY_RESULT, std::move(types), estimated_cardinality)

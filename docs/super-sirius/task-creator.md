@@ -23,7 +23,7 @@ operator->get_next_task_hint() → READY or WAITING_FOR_INPUT_DATA
     ↓
 Create task (duckdb_scan_task, parquet_scan_task, or gpu_pipeline_task)
     ↓
-Dispatch to executor (scan_executor or pipeline_executor)
+Dispatch to executor (scan_executor or task_scheduler)
 ```
 
 ## Global State Maps
@@ -196,6 +196,7 @@ Same pattern as MERGE_SORT: drains all batches from one partition per call.
 |----------|------------------------|------------------------------|------------|
 | DUCKDB_SCAN | READY if not exhausted | N/A (task creator handles) | Source, no ports |
 | PARQUET_SCAN | READY if partitions remain | N/A (task creator handles) | Source, no ports |
+| ICEBERG_SCAN | Inherits from PARQUET_SCAN | N/A (task creator handles) | Source, no ports |
 | HASH_JOIN (BUILD_PROBE) | Build state machine | Build+probe or probe only | Build/probe asymmetry |
 | HASH_JOIN (STANDARD) | Base class | Cartesian product walk | Multi-partition iteration |
 | PARTITION | Delegates to build sibling | Mutex-locked count determination | Sibling coordination |
@@ -210,9 +211,13 @@ Same pattern as MERGE_SORT: drains all batches from one partition per call.
 
 **File:** `src/creator/task_creator.cpp`
 
+### Scan Scheduling Strategy
+
+At query startup, at most 2 scans are scheduled initially. In the manager loop, scan exhaustion (continuous creation to deplete the source) only runs when `_num_scans_in_plan == 1` — to maximize I/O parallelism for single-table scans. For plans with 2+ scans, the `get_next_task_hint()` topology-driven mechanism controls task creation, avoiding excessive memory consumption from eagerly scanning all tables.
+
 ```
 while running:
-    1. kiosk.acquire()                    -- wait for thread availability
+    1. thread_pool.reserve()              -- wait for thread availability (bounded_thread_pool slot)
     2. _task_creation_queue.pop()         -- get next scheduling request
     3. node = get_operator_for_next_task(request.node)  -- follow hint chain
     4. if node is nullptr: continue
@@ -233,7 +238,7 @@ while running:
            - Loop while (!node.all_ports_empty()):
              - pipeline.mark_task_created()  // BEFORE popping data
              - data = node.get_next_task_input_data()
-             - If data: create gpu_pipeline_task, dispatch to pipeline_executor
+             - If data: create gpu_pipeline_task, dispatch to task_scheduler
              - If no data: pipeline.mark_task_completed()
 ```
 

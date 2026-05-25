@@ -21,15 +21,29 @@
 
 // sirius
 #include <exec/config.hpp>
-#include <op/scan/duckdb_scan_task_queue.hpp>
+#include <helper/type_conversions.hpp>
 #include <op/scan/parquet_scan_task.hpp>
 #include <op/sirius_physical_parquet_scan.hpp>
 #include <parallel/task_executor.hpp>
 
+// Phase 19 IO-15: include test_helpers_ioctx.hpp LAST among sirius/test
+// headers — it transitively pulls liburing.h via uring_ioctx.hpp ->
+// uring_reactor.hpp, and liburing.h defines a BLOCK_SIZE macro that collides
+// with the BLOCK_SIZE static member in <blockingconcurrentqueue.h> (transitively
+// pulled via utils/utils.hpp -> sirius_context.hpp -> task_creator.hpp ->
+// bounded_thread_pool.hpp). All consumers of blockingconcurrentqueue.h must
+// precede this include. Mirrors src/op/scan/parquet_scan_task.cpp:30-35.
+#include <scan/test_helpers_ioctx.hpp>
+
 // cucascade
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
+// sirius IO framework (Phase 19 IO-15 helper preparation)
+#include <io/types.hpp>
+#include <io/uring/uring_ioctx.hpp>
+
 // rmm
+#include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 
 // cudf
@@ -51,8 +65,11 @@
 #include <algorithm>
 #include <cstddef>
 #include <filesystem>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 
 using namespace sirius;
 using namespace sirius::scan_test_utils;
@@ -91,6 +108,11 @@ class scan_test_executor : public sirius::parallel::itask_executor {
     }
   }
 };
+
+// Phase 22.1 D-08: make_test_gpu_ioctxs() lifted into shared header
+// scan/test_helpers_ioctx.hpp so that test_parquet_split_provider.cpp can
+// reuse the same helper. Uses sirius::scan_test_utils::make_test_gpu_ioctxs.
+using sirius::scan_test_utils::make_test_gpu_ioctxs;
 
 static std::unique_ptr<sirius::op::sirius_physical_parquet_scan> make_parquet_scan(
   duckdb::ClientContext& ctx,
@@ -200,19 +222,20 @@ static std::unique_ptr<sirius::op::sirius_physical_parquet_scan> make_parquet_sc
     }
   }
 
-  return std::make_unique<sirius::op::sirius_physical_parquet_scan>(output_types,
-                                                                    table_function,
-                                                                    std::move(bind_data),
-                                                                    return_types,
-                                                                    std::move(column_ids),
-                                                                    std::move(projection_ids),
-                                                                    std::move(names),
-                                                                    std::move(table_filters),
-                                                                    0,
-                                                                    std::move(extra_info),
-                                                                    duckdb::vector<duckdb::Value>(),
-                                                                    std::move(virtual_columns),
-                                                                    nullptr);
+  return std::make_unique<sirius::op::sirius_physical_parquet_scan>(
+    sirius::from_duckdb_vec(output_types),
+    table_function,
+    std::move(bind_data),
+    sirius::from_duckdb_vec(return_types),
+    std::move(column_ids),
+    std::move(projection_ids),
+    std::move(names),
+    std::move(table_filters),
+    0,
+    std::move(extra_info),
+    duckdb::vector<duckdb::Value>(),
+    std::move(virtual_columns),
+    nullptr);
 }
 
 static duckdb::unique_ptr<duckdb::TableFilterSet> make_id_constant_filter(
@@ -371,7 +394,7 @@ static void run_parquet_scan_test(std::string const& table_name,
   REQUIRE(physical_scan);
 
   auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr, physical_scan.get(), batch_size);
+    nullptr, physical_scan.get(), batch_size, make_test_gpu_ioctxs());
 
   cucascade::shared_data_repository data_repo;
 
@@ -469,7 +492,7 @@ static void run_multi_file_parquet_scan_test(
   REQUIRE(physical_scan);
 
   auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr, physical_scan.get(), batch_size);
+    nullptr, physical_scan.get(), batch_size, make_test_gpu_ioctxs());
 
   cucascade::shared_data_repository data_repo;
 
@@ -553,7 +576,7 @@ static void run_parquet_scan_test_with_filter(
   REQUIRE(physical_scan);
 
   auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr, physical_scan.get(), batch_size);
+    nullptr, physical_scan.get(), batch_size, make_test_gpu_ioctxs());
 
   cucascade::shared_data_repository data_repo;
 
@@ -588,8 +611,10 @@ static void run_parquet_scan_test_with_filter(
     return batches;
   };
 
+  // HYG-02: use an explicit local stream instead of the default-stream sentinel.
+  rmm::cuda_stream validator_stream;
   auto batches = run_scan();
-  validator(batches, expected_rows, mem_mgr, rmm::cuda_stream_default);
+  validator(batches, expected_rows, mem_mgr, validator_stream.view());
 
   auto commit_result = con.Query("COMMIT");
   REQUIRE(commit_result);
@@ -613,7 +638,7 @@ static size_t count_row_group_partitions(
   REQUIRE(physical_scan);
 
   auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr, physical_scan.get(), batch_size);
+    nullptr, physical_scan.get(), batch_size, make_test_gpu_ioctxs());
   return global_state->get_num_row_group_partitions();
 }
 

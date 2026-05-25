@@ -15,6 +15,8 @@
  */
 
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "expression/expression.hpp"
+#include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_delim_join.hpp"
@@ -76,14 +78,14 @@ sirius_physical_plan_generator::plan_delim_join(duckdb::LogicalComparisonJoin& o
   duckdb::unique_ptr<sirius::op::sirius_physical_delim_join> delim_join;
   if (op.delim_flipped) {
     delim_join = duckdb::make_uniq<sirius::op::sirius_physical_right_delim_join>(
-      op.types,
+      sirius::from_duckdb_vec(op.types),
       std::move(plan),
       delim_scans,
       op.estimated_cardinality,
       duckdb::optional_idx(this->delim_index));
   } else {
     delim_join = duckdb::make_uniq<sirius::op::sirius_physical_left_delim_join>(
-      op.types,
+      sirius::from_duckdb_vec(op.types),
       std::move(plan),
       delim_scans,
       op.estimated_cardinality,
@@ -93,9 +95,9 @@ sirius_physical_plan_generator::plan_delim_join(duckdb::LogicalComparisonJoin& o
   // chunk
   delim_join->distinct = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate>(
     context,
-    delim_types,
-    std::move(distinct_expressions),
-    std::move(distinct_groups),
+    sirius::from_duckdb_vec(delim_types),
+    sirius::wrap_many(std::move(distinct_expressions)),
+    sirius::wrap_many(std::move(distinct_groups)),
     op.estimated_cardinality);
 
   return std::move(delim_join);

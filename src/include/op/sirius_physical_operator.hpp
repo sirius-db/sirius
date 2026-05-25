@@ -16,19 +16,12 @@
 
 #pragma once
 
-#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/common.hpp"
-#include "duckdb/common/enums/operator_result_type.hpp"
-#include "duckdb/common/enums/order_preservation_type.hpp"
-#include "duckdb/common/exception.hpp"
-#include "duckdb/common/optional_idx.hpp"
-#include "duckdb/common/types/data_chunk.hpp"
-#include "duckdb/execution/execution_context.hpp"
-#include "duckdb/execution/physical_operator.hpp"
-#include "duckdb/execution/physical_operator_states.hpp"
-#include "duckdb/optimizer/join_order/join_node.hpp"
+#include "helper/logical_type.hpp"
 #include "helper/types.hpp"
 #include "op/sirius_physical_operator_type.hpp"
+#include "sirius/exception.hpp"
+#include "telemetry-bridge/gen/uuid.rs.h"
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
@@ -63,6 +56,21 @@ struct task_creation_hint {
 };
 
 /**
+ * @brief Tag identifying the concrete operator_data subclass.
+ *
+ * Returned by operator_data::get_type() so callers can branch on the runtime
+ * type without a dynamic_cast. Each subclass overrides get_type() to return
+ * its own value; BASE is the default for the unspecialized base class.
+ */
+enum class operator_data_type : uint8_t {
+  BASE,
+  PIPELINEABLE,
+  PARTITIONED,
+  PARQUET_SCAN,
+  SCAN_CACHED,
+};
+
+/**
  * @brief Generic base class for operator input/output data.
  *
  * This is an intentionally minimal base class with no opinion on what the
@@ -77,63 +85,142 @@ class operator_data {
   operator_data& operator=(const operator_data&) = default;
   operator_data(operator_data&&)                 = default;
   operator_data& operator=(operator_data&&)      = default;
+
+  /**
+   * @brief Identify the concrete subclass at runtime.
+   *
+   * Subclasses override to return their own operator_data_type. The base
+   * implementation returns operator_data_type::BASE.
+   */
+  [[nodiscard]] virtual operator_data_type get_type() const { return operator_data_type::BASE; }
+
+  /**
+   * @brief Per-task preparation hook invoked before the operator consumes this data.
+   *
+   * Called by the pipeline task machinery after the GPU pipeline executor has acquired
+   * a memory reservation for the task, and before the operator's execute() runs. This
+   * gives the data object a chance to perform any per-task setup that needs to happen
+   * in the context of the task's reserved memory space, including:
+   *   - Locking (or converting-then-locking) owned data batches into the requested
+   *     memory space — see pipelineable_operator_data::prepare_for_processing.
+   *   - Capturing the memory space for later use by execute() in operators that
+   *     produce output but own no input batches — e.g. source operators such as
+   *     parquet_scan_data, which need a target memory space for their output tables
+   *     but have no upstream batch to inherit one from.
+   *
+   * @param requested_memory_space  The memory space associated with the task's
+   *                                reservation. Any locking, conversion, or
+   *                                allocation performed during preparation should
+   *                                target this space. May be nullptr when the
+   *                                caller has no target preference, in which case
+   *                                implementations should fall back to each batch's
+   *                                current space (see pipelineable_operator_data).
+   * @param stream                  CUDA stream available for any data-movement
+   *                                kernels triggered by preparation.
+   * Throws on failure.
+   * pipelineable_operator_data rethrows rmm::out_of_memory after logging,
+   * and throws sirius::internal_exception for unrecoverable preparation errors.
+   *
+   * The default implementation is a no-op appropriate for operator_data subclasses
+   * that own no data requiring locking and need no per-task setup.
+   * Override when either condition changes.
+   */
+  virtual void prepare_for_processing(
+    const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream) {
+  };
+
+  /**
+   * @brief Estimate the uncompressed GPU memory footprint of this data.
+   *
+   * Used by the reservation system to size memory reservations before a task
+   * executes. The default returns 0, which is appropriate for metadata-only
+   * subclasses (e.g. parquet_metadata_input). Subclasses that carry or
+   * represent GPU-resident data should override to return a meaningful estimate.
+   */
+  [[nodiscard]] virtual std::size_t get_estimated_size_in_bytes() const { return 0; }
 };
 
 /**
- * @brief Operator data carrying a collection of data batches for pipeline execution.
+ * @brief Operator data carrying data batches for pipeline execution.
  *
- * This is the standard data container used by pipeline operators. It wraps a
- * vector of data batches that flow between operators in a pipeline.
+ * Unifies idle and read-only-locked batch access in a single container. Holds an
+ * optional vector of idle data_batch shared_ptrs and/or an optional vector of
+ * read_only_data_batch RAII accessors. Lazy conversion is performed on demand:
+ *   - get_data_batches() populates _data_batches from _read_only_data_batches if needed
+ *   - get_read_only_batches() populates _read_only_data_batches from _data_batches if needed
+ *
+ * prepare_for_processing() locks idle batches and stores the result in
+ * _read_only_data_batches. remove_read_only_lock() releases all shared locks.
  */
 class pipelineable_operator_data : public operator_data {
  public:
-  pipelineable_operator_data() = default;
+  pipelineable_operator_data()
+  {
+    _data_batches = std::vector<std::shared_ptr<::cucascade::data_batch>>();
+  }
   explicit pipelineable_operator_data(
     std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
     : _data_batches(std::move(data_batches))
   {
   }
-
-  /**
-   * @brief Get the data batches.
-   * @return Const reference to vector of data batch pointers
-   */
-  [[nodiscard]] const std::vector<std::shared_ptr<::cucascade::data_batch>>& get_data_batches()
-    const
+  explicit pipelineable_operator_data(
+    std::vector<::cucascade::read_only_data_batch> read_only_data_batches)
+    : _read_only_data_batches(std::move(read_only_data_batches))
   {
-    return _data_batches;
+  }
+
+  [[nodiscard]] operator_data_type get_type() const override
+  {
+    return operator_data_type::PIPELINEABLE;
   }
 
   /**
-   * @brief Move the data batches out of this container, leaving it empty.
-   * @return Vector of data batch pointers (moved out).
+   * @brief Get idle data batch pointers, lazily populating from read-only batches if needed.
    */
-  std::vector<std::shared_ptr<::cucascade::data_batch>> release_data_batches()
+  [[nodiscard]] const std::vector<std::shared_ptr<::cucascade::data_batch>>& get_data_batches()
+    const;
+
+  /**
+   * @brief Get read-only locked batches, lazily populating from idle batches if needed.
+   */
+  [[nodiscard]] std::vector<::cucascade::read_only_data_batch> get_read_only_batches(
+    bool leave_locked = false) const;
+
+  /**
+   * @brief Release all read-only locks by resetting _read_only_data_batches.
+   */
+  void remove_read_only_lock()
   {
-    return std::move(_data_batches);
+    // Releasing the lock means getting rid of any _read_only_data_batches that we may have cached.
+    // But we want to make sure we do keep the data alive. So we ensure that the data_batches are
+    // populated.
+    if (!_data_batches) { auto _ = get_data_batches(); }
+    _read_only_data_batches = std::nullopt;
   }
 
   /**
    * @brief Lock all data batches for processing in the requested memory space.
    *
-   * Iterates over all batches and locks (or converts then locks) each one into the
-   * requested memory space. Returns the processing handles that keep the batches locked
-   * until they go out of scope.
-   *
-   * Returns std::nullopt if any batch fails to lock (triggers a retry/reschedule).
-   * Propagates rmm::out_of_memory so the caller can record metrics and reschedule.
-   *
-   * @param requested_memory_space  Target memory space; may be nullptr to use each batch's
-   *                                current space.
-   * @param stream                  CUDA stream used for any data-movement kernels.
-   * @return Processing handles for all batches, or std::nullopt on lock failure.
+   * Iterates over all idle batches and locks (or converts then locks) each one,
+   * storing the results in _read_only_data_batches. Throws sirius::internal_exception
+   * if any batch pointer is null or any batch fails to lock. Propagates rmm::out_of_memory.
    */
-  virtual std::optional<std::vector<::cucascade::data_batch_processing_handle>>
-  prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
-                         rmm::cuda_stream_view stream);
+  void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
+                              rmm::cuda_stream_view stream) override;
+
+  [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
+  {
+    std::size_t total = 0;
+    auto ro_batches   = get_read_only_batches(false);
+    for (auto const& ro : ro_batches) {
+      if (ro.get_data()) { total += ro.get_data()->get_uncompressed_data_size_in_bytes(); }
+    }
+    return total;
+  }
 
  private:
-  std::vector<std::shared_ptr<::cucascade::data_batch>> _data_batches;
+  mutable std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> _data_batches;
+  mutable std::optional<std::vector<::cucascade::read_only_data_batch>> _read_only_data_batches;
 };
 
 /**
@@ -151,6 +238,11 @@ class partitioned_operator_data : public pipelineable_operator_data {
   {
   }
 
+  [[nodiscard]] operator_data_type get_type() const override
+  {
+    return operator_data_type::PARTITIONED;
+  }
+
   /**
    * @brief Get the partition index.
    * @return Partition index
@@ -159,6 +251,20 @@ class partitioned_operator_data : public pipelineable_operator_data {
 
  private:
   std::size_t _partition_idx = 0;
+};
+
+/**
+ * @brief Input statistics passed to no_history_peak_memory_estimate().
+ *
+ * Carries the dimensions that operator overrides typically condition on: the
+ * number of input batches, the total uncompressed byte count, and the runtime
+ * type of the operator_data feeding the task (so overrides can branch on the
+ * concrete input shape without a dynamic_cast).
+ */
+struct input_stats {
+  std::size_t num_batches = 0;
+  std::size_t bytes       = 0;
+  operator_data_type type = operator_data_type::BASE;
 };
 
 //! sirius_physical_operator is the base class of the physical operators present in the
@@ -171,7 +277,7 @@ class sirius_physical_operator {
 
  public:
   sirius_physical_operator(SiriusPhysicalOperatorType type,
-                           duckdb::vector<duckdb::LogicalType> types,
+                           duckdb::vector<sirius::logical_type> types,
                            std::size_t estimated_cardinality)
     : type(type),
       types(std::move(types)),
@@ -184,20 +290,16 @@ class sirius_physical_operator {
 
   //! The physical operator type
   SiriusPhysicalOperatorType type;
-  //! The set of children of the operator
+  //! The set of children of the operator (operators that feed data _into_ the current operator)
   duckdb::vector<duckdb::unique_ptr<sirius_physical_operator>> children;
   //! The types returned by this physical operator
-  duckdb::vector<duckdb::LogicalType> types;
+  duckdb::vector<sirius::logical_type> types;
   //! The estimated cardinality of this physical operator
   std::size_t estimated_cardinality;
   //! The unique ID of this operator (auto-incremented at creation)
   size_t operator_id;
 
-  //! The global sink state of this operator
-  duckdb::unique_ptr<duckdb::GlobalSinkState> sink_state;
-  //! The global state of this operator
-  duckdb::unique_ptr<duckdb::GlobalOperatorState> op_state;
-  //! Lock for (re)setting any of the operator states
+  //! Lock for concurrent access to operator state
   std::mutex lock;
 
  public:
@@ -212,7 +314,7 @@ class sirius_physical_operator {
   virtual duckdb::vector<duckdb::const_reference<sirius_physical_operator>> get_children() const;
 
   //! Return a vector of the types that will be returned by this operator
-  const duckdb::vector<duckdb::LogicalType>& get_types() const { return types; }
+  const duckdb::vector<sirius::logical_type>& get_types() const { return types; }
 
   //! Get the unique operator ID
   size_t get_operator_id() const { return operator_id; }
@@ -223,45 +325,49 @@ class sirius_physical_operator {
 
  public:
   // Operator interface
-  virtual duckdb::unique_ptr<duckdb::OperatorState> get_operator_state(
-    duckdb::ExecutionContext& context) const;
 
-  virtual duckdb::unique_ptr<duckdb::GlobalOperatorState> get_global_operator_state(
-    duckdb::ClientContext& context) const;
+  /**
+   * @brief Estimate peak GPU memory for this operator when no execution history is available.
+   *
+   * Called by gpu_pipeline_task::get_estimated_reservation_size_info() on the first task
+   * execution for a pipeline (before any history records exist). The default is 2× the
+   * input bytes, matching the historical fallback. Overrides may return a lower value for
+   * operators that are known to be pass-throughs under certain conditions (e.g. concat with
+   * a single batch, or partition with a single partition), or a higher value for operators
+   * that expand input significantly (e.g. decompressing parquet).
+   *
+   * A return value of 0 means "no additional peak memory expected"; the caller will fall
+   * back to the 2× default when every operator in the pipeline returns 0.
+   *
+   * @param stats  Batch count and total input bytes for the task about to run.
+   * @return Estimated peak GPU bytes this operator will allocate.
+   */
+  [[nodiscard]] virtual std::size_t no_history_peak_memory_estimate(const input_stats& stats) const
+  {
+    return stats.bytes * 2;
+  }
 
   virtual std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                                  rmm::cuda_stream_view stream);
 
   //! The influence the operator has on order (insertion order means no influence)
-  virtual duckdb::OrderPreservationType operator_order() const
+  virtual sirius::OrderPreservationType operator_order() const
   {
-    return duckdb::OrderPreservationType::INSERTION_ORDER;
+    return sirius::OrderPreservationType::INSERTION_ORDER;
   }
 
  public:
   // Source interface
-  virtual duckdb::unique_ptr<duckdb::LocalSourceState> get_local_source_state(
-    duckdb::ExecutionContext& context, duckdb::GlobalSourceState& gstate) const;
-
-  virtual duckdb::unique_ptr<duckdb::GlobalSourceState> get_global_source_state(
-    duckdb::ClientContext& context) const;
-
   virtual bool is_source() const { return false; }
 
   //! The type of order emitted by the operator (as a source)
-  virtual duckdb::OrderPreservationType source_order() const
+  virtual sirius::OrderPreservationType source_order() const
   {
-    return duckdb::OrderPreservationType::INSERTION_ORDER;
+    return sirius::OrderPreservationType::INSERTION_ORDER;
   }
 
  public:
   // Sink interface
-  virtual duckdb::unique_ptr<duckdb::LocalSinkState> get_local_sink_state(
-    duckdb::ExecutionContext& context) const;
-
-  virtual duckdb::unique_ptr<duckdb::GlobalSinkState> get_global_sink_state(
-    duckdb::ClientContext& context) const;
-
   virtual void sink(const operator_data& input_data, rmm::cuda_stream_view stream);
 
   virtual bool is_sink() const { return false; }
@@ -278,8 +384,20 @@ class sirius_physical_operator {
   virtual void build_pipelines(pipeline::sirius_pipeline& current,
                                pipeline::sirius_meta_pipeline& meta_pipeline);
 
-  //! Called when the pipeline this operator belongs to finishes. Override to release resources.
-  virtual void finalize_operator() {}
+  //! Called when the pipeline this operator belongs to finishes. Sets finalized=true, then
+  //! dispatches to on_finalize_operator(). Do not override this; override on_finalize_operator().
+  void finalize_operator()
+  {
+    finalized = true;
+    on_finalize_operator();
+  }
+
+  //! True after finalize_operator() has been called on this operator.
+  bool finalized = false;
+
+ protected:
+  //! Override this instead of finalize_operator() to perform cleanup when a pipeline finishes.
+  virtual void on_finalize_operator() {}
 
  public:
   template <class TARGET>
@@ -287,7 +405,7 @@ class sirius_physical_operator {
   {
     // TODO(amin) this is buggy code
     if (TARGET::TYPE != SiriusPhysicalOperatorType::INVALID && type != TARGET::TYPE) {
-      throw duckdb::InternalException(
+      throw internal_exception(
         "Failed to cast physical operator to type - physical operator type mismatch");
     }
     return reinterpret_cast<TARGET&>(*this);
@@ -297,7 +415,7 @@ class sirius_physical_operator {
   const TARGET& Cast() const
   {
     if (TARGET::TYPE != SiriusPhysicalOperatorType::INVALID && type != TARGET::TYPE) {
-      throw duckdb::InternalException(
+      throw internal_exception(
         "Failed to cast physical operator to type - physical operator type mismatch");
     }
     return reinterpret_cast<const TARGET&>(*this);
@@ -305,9 +423,16 @@ class sirius_physical_operator {
 
   struct port {
     MemoryBarrierType type;
+    /// May be NULL for dependency-only ports that carry no data flow (e.g., "dependency").
+    /// Null repos are treated as "empty, not data-gating" by the base-class port handling methods
+    /// (get_next_task_hint, get_next_task_input_data, all_ports_empty, push_data_batch).
     ::cucascade::shared_data_repository* repo;
     duckdb::shared_ptr<pipeline::sirius_pipeline> src_pipeline;
     duckdb::shared_ptr<pipeline::sirius_pipeline> dest_pipeline;
+    //! A UUID for a port on an operator at the beginning of a
+    // pipeline. This port receives data from a prior pipeline,
+    // forming an incoming edge from that pipeline.
+    uuid::UUID source_port_uuid{uuid::now_v7()};
   };
 
   /// Describes a downstream operator's port to which data is pushed
@@ -316,6 +441,18 @@ class sirius_physical_operator {
     sirius_physical_operator* next_operator;
     //! The port name on the downstream operator to push data into
     std::string_view next_operator_port_name;
+    //! A UUID to encode the concept of a pseudo port, to conform to the model of quent,
+    // that sits on an operator, at the end of a pipeline, sending data to a downstream
+    // pipeline's first operator's receiving port, forming a directed edge from the current
+    // operator's pipeline to the next_operator's pipeline:
+    // ┌─ pipeline A ──────────────────┐  ┌─ pipeline B ──────────────────┐
+    // │          ┌─ last op ───────┐  │  │  ┌─ first op ──────┐          │
+    // │ ┌────┐   │ ┌─ pseudo ┐     │  │  │  │     ┌─ port ─┐  │   ┌────┐ │
+    // │ │ op │...│ │        *───────────────────────▶      │  │...│ op │ │
+    // │ └────┘   │ └─ port ──┘     │  │  │  │     └────────┘  │   └────┘ │
+    // │          └─────────────────┘  │  │  └─────────────────┘          │
+    // └───────────────────────────────┘  └───────────────────────────────┘
+    uuid::UUID pseudo_sink_port_uuid;
   };
 
   // source pipeline pushed to repo of the ports
@@ -333,7 +470,7 @@ class sirius_physical_operator {
   //! Add a next port after sink
   void add_next_port_after_sink(next_port_info port_info);
   //! Get the next ports after sink
-  std::vector<sirius_physical_operator::next_port_info>& get_next_port_after_sink();
+  const std::vector<sirius_physical_operator::next_port_info>& get_next_ports_after_sink() const;
 
   //! Get the next task hint
   virtual std::optional<task_creation_hint> get_next_task_hint();
@@ -345,14 +482,6 @@ class sirius_physical_operator {
   {
     // WSM TODO implement this
     throw std::runtime_error("can_create_more_tasks not implemented for operator " + get_name());
-    return true;
-  }
-
-  /// \brief check if all tasks have been processed
-  virtual bool has_processed_all_tasks() const
-  {
-    // WSM TODO implement this
-    throw std::runtime_error("has_processed_all_tasks not implemented for operator " + get_name());
     return true;
   }
 

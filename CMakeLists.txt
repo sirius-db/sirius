@@ -40,6 +40,11 @@ if(VCPKG_BUILD)
   string(REGEX REPLACE "-I[^ ]*/include/cccl" "" CMAKE_CUDA_FLAGS
                        "${CMAKE_CUDA_FLAGS}")
 
+  # The loadable extension must not depend on libcudart.so in the vcpkg build.
+  # Set the CUDA language default to the static runtime before any CUDA targets
+  # are created.
+  set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
+
   # Strip conda-injected -Wl,-rpath flags from linker flags and disable CMake's
   # RPATH mechanism so binaries don't carry a hardcoded path to the pixi/conda
   # env. All deps are statically linked, so no RPATH is needed. FORCE is
@@ -63,7 +68,10 @@ find_package(spdlog REQUIRED CONFIG)
 find_package(yaml-cpp REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
+find_package(OpenSSL REQUIRED)
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
+pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
+pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
 
 # cuCascade - GPU Memory Reservation Library (submodule) cucascade links `numa`
 # as a bare library name (-lnuma). In the vcpkg build the static libnuma.a lives
@@ -80,29 +88,73 @@ endif()
 set(BUILD_TESTS
     OFF
     CACHE BOOL "" FORCE)
+set(CUCASCADE_BUILD_TESTS
+    OFF
+    CACHE BOOL "" FORCE)
+set(CUCASCADE_BUILD_BENCHMARKS
+    OFF
+    CACHE BOOL "" FORCE)
 set(CUCASCADE_BUILD_SHARED_LIBS
     OFF
     CACHE BOOL "" FORCE)
 set(CUCASCADE_BUILD_STATIC_LIBS
     ON
     CACHE BOOL "" FORCE)
-set(WARNINGS_AS_ERRORS
+set(CUCASCADE_WARNINGS_AS_ERRORS
     OFF
     CACHE BOOL "" FORCE)
 add_subdirectory(cucascade "${CMAKE_BINARY_DIR}/cucascade" EXCLUDE_FROM_ALL)
 
+if(VCPKG_BUILD AND TARGET CUDA::cudart_static)
+  function(sirius_prefer_static_cudart target_name)
+    foreach(_prop LINK_LIBRARIES INTERFACE_LINK_LIBRARIES)
+      get_target_property(_libs "${target_name}" "${_prop}")
+      if(NOT _libs OR _libs STREQUAL "_libs-NOTFOUND")
+        continue()
+      endif()
+
+      set(_patched_libs "${_libs}")
+      list(TRANSFORM _patched_libs REPLACE "^CUDA::cudart$"
+                                           "CUDA::cudart_static")
+      list(TRANSFORM _patched_libs REPLACE "^\\$<LINK_ONLY:CUDA::cudart>$"
+                                           "$<LINK_ONLY:CUDA::cudart_static>")
+
+      if(NOT _patched_libs STREQUAL _libs)
+        set_target_properties("${target_name}" PROPERTIES "${_prop}"
+                                                          "${_patched_libs}")
+      endif()
+    endforeach()
+
+    set_target_properties("${target_name}" PROPERTIES CUDA_RUNTIME_LIBRARY
+                                                      Static)
+  endfunction()
+
+  foreach(_target cucascade_objects cucascade_static cucascade_shared)
+    if(TARGET "${_target}")
+      sirius_prefer_static_cudart("${_target}")
+    endif()
+  endforeach()
+endif()
+
+# Rust telemetry instrumentation (C++ FFI via Corrosion)
+add_subdirectory(rust/crates/telemetry/bridge)
+
 # cmake-format: off
 set(EXTENSION_SOURCES
     src/config.cpp
-    src/cpu_cache.cpp
+    src/helper/type_conversions.cpp
     src/debug_utils.cpp
     src/creator/task_creator.cpp
     src/data/host_parquet_representation.cpp
     src/data/host_parquet_representation_converters.cpp
     src/downgrade/downgrade_executor.cpp
-    src/downgrade/downgrade_task.cpp
+    src/expression/expression.cpp
+    src/expression/from_duckdb.cpp
+    src/expression/function_id.cpp
+    src/expression/join_condition.cpp
+    src/expression/value.cpp
+    src/expression_executor/expression_executor_strategy.cpp
     src/expression_executor/gpu_expression_executor.cpp
-    src/expression_executor/gpu_expression_executor_state.cpp
     src/expression_executor/gpu_expression_translator.cpp
     src/expression_executor/regex/regex_playground.cpp
     src/expression_executor/specializations/gpu_execute_between.cpp
@@ -114,8 +166,19 @@ set(EXTENSION_SOURCES
     src/expression_executor/specializations/gpu_execute_function.cpp
     src/expression_executor/specializations/gpu_execute_operator.cpp
     src/expression_executor/specializations/gpu_execute_reference.cpp
-    src/fallback.cpp
-    src/gpu_buffer_manager.cpp
+    # I/O adapters (Phase 19 — io_uring + sirius_datasource)
+    src/io/admission_control.cpp
+    src/io/datasource_factory.cpp
+    src/io/duckdb_io_object.cpp
+    src/io/io_context.cpp
+    src/io/prefetching_cache.cpp
+    src/io/s3/s3_ioctx.cpp
+    src/io/s3/sigv4.cpp
+    src/io/s3/sirius_sigv4_credential_provider.cpp
+    src/io/sirius_datasource.cpp
+    src/io/uri_parser.cpp
+    src/io/uring/uring_ioctx.cpp
+    src/io/uring/uring_reactor.cpp
     src/memory/defragmenter_oom_policy.cpp
     src/memory/sirius_memory_reservation_manager.cpp
     src/op/aggregate/aggregate_op_util.cpp
@@ -126,20 +189,29 @@ set(EXTENSION_SOURCES
     src/op/result/host_table_chunk_reader.cpp
     src/op/scan/cached_ranges.cpp
     src/op/scan/duckdb_scan_executor.cpp
+    src/op/scan/cpu_source_task.cpp
+    src/op/scan/duckdb_native_metadata.cpp
     src/op/scan/duckdb_scan_task.cpp
     src/op/scan/equality_delete_filter.cpp
+    src/op/scan/hive_partition.cpp
     src/op/scan/iceberg_avro_reader.cpp
     src/op/scan/iceberg_delete_pipeline.cpp
     src/op/scan/iceberg_metadata_reader.cpp
     src/op/scan/iceberg_scan_task.cpp
     src/op/scan/positional_delete_filter.cpp
+    src/op/scan/puffin_reader.cpp
+    src/op/scan/duckdb_native_scan_info.cpp
+    src/op/scan/parquet_scan_info.cpp
     src/op/scan/parquet_scan_task.cpp
+    src/op/scan/parquet_schema_mapping.cpp
     src/op/scan/prefetched_data_source.cpp
+    src/op/scan/scan_plan.cpp
     src/op/scan/scan_utils.cpp
-    src/op/scan/sirius_parquet_metadata_scan_operator.cpp
     src/op/scan/sirius_gpu_parquet_scan_operator.cpp
+    src/op/sirius_dynamic_filter.cpp
     src/op/window/window_op_util.cpp
     src/op/sirius_physical_column_data_scan.cpp
+    src/op/sirius_physical_cpu_source.cpp
     src/op/sirius_physical_concat.cpp
     src/op/sirius_physical_cte.cpp
     src/op/sirius_physical_delim_join.cpp
@@ -170,13 +242,13 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_window.cpp
     src/parallel/task_executor.cpp
     src/pipeline/gpu_pipeline_executor.cpp
-    src/pipeline/gpu_pipeline_queue.cpp
     src/pipeline/gpu_pipeline_task.cpp
-    src/pipeline/pipeline_executor.cpp
-    src/pipeline/pipeline_queue.cpp
+    src/pipeline/task_scheduler.cpp
     src/pipeline/sirius_meta_pipeline.cpp
     src/pipeline/sirius_pipeline.cpp
     src/pipeline/sirius_pipeline_converter.cpp
+    src/pipeline/repository_wiring_materializer.cpp
+    src/pipeline/sirius_plan_printer.cpp
     src/pipeline/task_request.cpp
     src/planner/query.cpp
     src/planner/sirius_physical_plan_generator.cpp
@@ -197,49 +269,37 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_recursive_cte.cpp
     src/planner/sirius_plan_top_n.cpp
     src/planner/sirius_plan_window.cpp
+    src/scan_manager/cached_split_provider.cpp
+    src/scan_manager/duckdb_native_split_provider.cpp
+    src/pin_table.cpp
+    src/scan_manager/parquet_split_provider.cpp
+    src/scan_manager/sirius_scan_manager.cpp
+    src/scan_manager/split_connector.cpp
+    src/scan_manager/split_provider.cpp
     src/sirius_config.cpp
     src/sirius_context.cpp
     src/sirius_engine.cpp
     src/sirius_extension.cpp
     src/sirius_interface.cpp
+    src/telemetry/telemetry_context.cpp
+    src/transparent/physical_sirius_execution.cpp
+    src/transparent/sirius_optimizer_extension.cpp
     src/util/stream_check_wrapper.cpp
     src/util/segfault_backtrace_handler.cpp)
+# cmake-format: on
 
-# Legacy Sirius — all config lives in src/legacy/CMakeLists.txt.
+# Legacy Sirius — all legacy-specific config lives in src/legacy/CMakeLists.txt.
 # Deleting src/legacy/ cleanly removes legacy build support.
+set(CUDA_SOURCES
+    src/op/scan/equality_delete_mask.cu src/cuda/scan/gpu_decode_alp.cu
+    src/cuda/scan/gpu_decode_bitpacking.cu src/cuda/scan/gpu_decode_rle.cu
+    src/cuda/scan/gpu_decode_strings.cu src/cuda/scan/gpu_native_decode.cu)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
   add_subdirectory(src/legacy)
   list(APPEND EXTENSION_SOURCES ${SIRIUS_LEGACY_SOURCES}
        ${SIRIUS_LEGACY_CONDITIONAL_SOURCES})
+  list(APPEND CUDA_SOURCES ${SIRIUS_LEGACY_CUDA_SOURCES})
 endif()
-
-set(CUDA_SOURCES
-    src/cuda/allocator.cu
-    src/cuda/communication.cu
-    src/cuda/iceberg/equality_delete_mask.cu
-    src/cuda/cudf/cudf_aggregate.cu
-    src/cuda/cudf/cudf_duplicate_elimination.cu
-    src/cuda/cudf/cudf_groupby.cu
-    src/cuda/cudf/cudf_join.cu
-    src/cuda/cudf/cudf_orderby.cu
-    src/cuda/cudf/cudf_utils.cu
-    src/cuda/expression_executor/gpu_dispatch_materialize.cu
-    src/cuda/expression_executor/gpu_dispatch_select.cu
-    src/cuda/expression_executor/gpu_dispatch_string.cu
-    src/cuda/operator/arbitrary_expression.cu
-    src/cuda/operator/comparison_expression.cu
-    src/cuda/operator/hash_join_inner.cu
-    src/cuda/operator/hash_join_right.cu
-    src/cuda/operator/hash_join_single.cu
-    src/cuda/operator/materialize.cu
-    src/cuda/operator/nested_loop_join.cu
-    src/cuda/operator/strings_matching.cu
-    src/cuda/operator/substring.cu
-    src/cuda/operator/strlen_from_offsets.cu
-    src/cuda/operator/empty_str_check.cu
-    src/cuda/print.cu
-    src/cuda/utils.cu)
-# cmake-format: on
 
 build_static_extension(sirius ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 build_loadable_extension(sirius CPP ${EXTENSION_SOURCES} ${CUDA_SOURCES})
@@ -254,6 +314,10 @@ foreach(_target sirius_extension sirius_loadable_extension)
                CUDA_STANDARD_REQUIRED ON
                CUDA_SEPARABLE_COMPILATION ON
                CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+  if(VCPKG_BUILD)
+    set_target_properties(${_target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+  endif()
 
   # In the vcpkg build, vcpkg include dir must be searched before DuckDB's
   # bundled fmt (which uses duckdb_fmt namespace, incompatible with spdlog).
@@ -276,56 +340,73 @@ foreach(_target sirius_extension sirius_loadable_extension)
                                PRIVATE ${SIRIUS_LEGACY_COMPILE_DEFINITIONS})
   endif()
 
-  target_link_libraries(${_target} cudf::cudf rmm::rmm spdlog::spdlog
-                        cuCascade::cucascade)
+  target_link_libraries(
+    ${_target}
+    cudf::cudf
+    rmm::rmm
+    spdlog::spdlog
+    cuCascade::cucascade
+    yaml-cpp::yaml-cpp
+    telemetry_bridge)
 
   add_dependencies(${_target} duckdb_static)
 endforeach()
 
-# Precompiled headers for extension targets
-target_precompile_headers(
+# Additional libraries only needed by the static extension
+target_link_libraries(
   sirius_extension
-  PRIVATE
-  # STL headers (60+ combined inclusions)
-  <algorithm>
-  <memory>
-  <optional>
-  <string>
-  <string_view>
-  <vector>
-  # Logging (44/139 source files)
-  "src/include/log/logging.hpp"
-  # DuckDB planner (30+ files)
-  <duckdb/planner/expression/bound_reference_expression.hpp>)
-target_precompile_headers(sirius_loadable_extension REUSE_FROM sirius_extension)
+  PkgConfig::NUMA
+  PkgConfig::LIBURING
+  PkgConfig::CURL
+  OpenSSL::Crypto
+  yaml-cpp::yaml-cpp
+  absl::any_invocable)
 
-# CMake PCH doesn't apply to nvcc — skip PCH for CUDA sources
-set_source_files_properties(${CUDA_SOURCES} PROPERTIES SKIP_PRECOMPILE_HEADERS
-                                                       ON)
+target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING
+                      PkgConfig::CURL OpenSSL::Crypto)
 
-# The conda-forge GCC wrapper hard-codes -rpath <conda_prefix>/lib into every
-# link invocation. Strip it from the loadable extension so the binary only
-# depends on system libraries at runtime.
-if(VCPKG_BUILD)
-  find_program(_PATCHELF patchelf)
-  if(_PATCHELF)
-    add_custom_command(
-      TARGET sirius_loadable_extension
-      POST_BUILD
-      COMMAND ${_PATCHELF} --remove-rpath
-              $<TARGET_FILE:sirius_loadable_extension>
-      COMMENT "Stripping RPATH from sirius loadable extension")
+# cucascade upstream PRs #126/#128/#130 moved cucascade to static-CUDA linkage
+# and pulled the NVML *static stub* (libnvidia-ml.a) into libcucascade.a via the
+# `CUDA::nvml_static` imported target. Upstream's
+# `LINKER:--exclude-libs,libnvidia-ml` workaround (PR #130) keeps cucascade's
+# own tests happy by hiding the bundled stub symbols from the dynamic export
+# table (NVIDIA bug 6174166: libnvidia-ml.so dlsyms into the host process and
+# recurses into the stub). For sirius's larger transitive graph, hiding the
+# symbols segfaults at runtime — DuckDB/RMM call nvml directly before nvmlInit's
+# jump-table patch fires — while leaving them visible deadlocks in stubSpinLock
+# when the real driver loads.
+#
+# The robust fix for sirius: override CUDA::nvml_static's IMPORTED location to
+# point at the *shared* stub (libnvidia-ml.so) in the same pixi env. The shared
+# stub uses normal dynamic linking via ld.so, which resolves to the real
+# libnvidia-ml.so.1 at runtime, matching the working Phase-24 configuration.
+# This bypasses both failure modes (no stub symbols bundled, no dynamic-export
+# conflict).
+if(TARGET CUDA::nvml_static)
+  get_target_property(_nvml_static_loc CUDA::nvml_static IMPORTED_LOCATION)
+  if(_nvml_static_loc AND _nvml_static_loc MATCHES "libnvidia-ml\\.a$")
+    string(REGEX REPLACE "libnvidia-ml\\.a$" "libnvidia-ml.so" _nvml_shared_loc
+                         "${_nvml_static_loc}")
+    if(EXISTS "${_nvml_shared_loc}")
+      set_target_properties(
+        CUDA::nvml_static
+        PROPERTIES IMPORTED_LOCATION "${_nvml_shared_loc}"
+                   IMPORTED_LOCATION_RELEASE "${_nvml_shared_loc}")
+      message(
+        STATUS
+          "Sirius: redirected CUDA::nvml_static from ${_nvml_static_loc} to ${_nvml_shared_loc}"
+      )
+    endif()
   endif()
 endif()
 
-# Additional libraries only needed by the static extension
-target_link_libraries(sirius_extension PkgConfig::NUMA yaml-cpp::yaml-cpp
-                      absl::any_invocable)
-
 # Required by DuckDB's export set (duckdb_static -> sirius_extension ->
-# cucascade_static)
+# cucascade_static / telemetry_bridge). cucascade upstream PR #126 split
+# topology_discovery into its own static target — list it here so the export set
+# covers the dependency chain.
 install(
-  TARGETS sirius_extension cucascade_static
+  TARGETS sirius_extension cucascade_static cucascade_topology_discovery_static
+          telemetry_bridge
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
@@ -345,14 +426,26 @@ endif()
 set(TEST_SOURCES
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
+    test/cpp/config/test_object_store_config.cpp
+    test/cpp/data/test_convertible_data_batch.cpp
+    test/cpp/data/test_convertible_gpu_pipeline_task.cpp
     test/cpp/data/test_host_parquet_representation.cpp
-    test/cpp/debug/test_debug_utils.cpp
+    test/cpp/downgrade/test_downgrade_disk.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
+    test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
+    test/cpp/expression/test_ast_from_duckdb.cpp
+    test/cpp/expression/test_ast_scaffold.cpp
+    test/cpp/expression/test_expression.cpp
+    test/cpp/expression/test_function_id.cpp
+    test/cpp/expression/test_join_condition.cpp
+    test/cpp/expression/test_value.cpp
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
+    test/cpp/helper/test_logical_type.cpp
+    test/cpp/integration/test_gpu_execution_locality.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_order_nulls.cpp
     test/cpp/integration/test_gpu_execution_tpcds.cpp
@@ -360,9 +453,24 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_window.cpp
     test/cpp/integration/test_tpcds_plan_translation.cpp
     test/cpp/integration/test_window_benchmark.cpp
+    test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
+    test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
+    test/cpp/integration/test_transparent_execution.cpp
+    test/cpp/io/s3/test_sigv4.cpp
+    test/cpp/io/s3/test_s3_ioctx.cpp
+    test/cpp/io/s3/test_sirius_sigv4_credential_provider.cpp
+    test/cpp/io/s3/test_static_credentials.cpp
+    test/cpp/io/test_datasource_factory.cpp
+    test/cpp/io/test_duckdb_io_object.cpp
+    test/cpp/io/test_uri_parser.cpp
+    test/cpp/integration/test_s3_perf_benchmark.cpp
+    test/cpp/integration/test_scan_manager_s3_end_to_end.cpp
+    test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
+    test/cpp/operator/test_physical_hash_join_mgpu.cpp
+    test/cpp/operator/test_physical_order_mgpu.cpp
+    test/cpp/operator/test_mgpu_stress.cpp
     test/cpp/memory/test_host_table_utils.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
-    test/cpp/memory_management/test_cpu_cache.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_count_distinct.cpp
@@ -379,24 +487,48 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_projection.cpp
     test/cpp/operator/test_physical_result_collector.cpp
     test/cpp/operator/test_physical_table_scan.cpp
+    test/cpp/operator/test_no_history_peak_memory_estimate.cpp
     test/cpp/operator/test_physical_top_n.cpp
     test/cpp/operator/test_physical_ungrouped_aggregate.cpp
     test/cpp/operator/test_physical_window.cpp
+    test/cpp/operator/test_sirius_dynamic_filter.cpp
     test/cpp/parallel/test_task_executor.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
     test/cpp/pipeline/test_pipeline_memory_history.cpp
     test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
-    test/cpp/pipeline/test_pipeline_executor.cpp
+    test/cpp/pipeline/test_gpu_pipeline_disk_readback.cpp
+    test/cpp/pipeline/test_get_next_ports_after_sink.cpp
+    test/cpp/pipeline/test_plan_printer.cpp
+    test/cpp/pipeline/test_repository_wiring_materializer.cpp
+    test/cpp/pipeline/test_task_scheduler.cpp
+    test/cpp/scan/bench_decode_codecs.cpp
     test/cpp/scan/test_column_builder.cpp
-    test/cpp/scan/test_metadata_gpu_scan_operators.cpp
+    test/cpp/scan/test_duckdb_native_split_provider.cpp
+    test/cpp/scan/test_duckdb_native_walker.cpp
+    test/cpp/scan/test_gpu_decode_alp.cpp
+    test/cpp/scan/test_gpu_decode_bitpacking.cpp
+    test/cpp/scan/test_gpu_decode_rle.cpp
+    test/cpp/scan/test_gpu_decode_strings.cpp
+    test/cpp/scan/test_gpu_native_decode.cpp
+    test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_scan_task.cpp
+    test/cpp/scan/test_parquet_split_provider.cpp
+    test/cpp/scan/test_parquet_split_provider_s3.cpp
+    test/cpp/scan/test_partition_inject.cpp
     test/cpp/scan/test_scan_executor.cpp
+    test/cpp/scan/test_split_connector.cpp
+    test/cpp/scan_manager/test_sirius_scan_manager_s3.cpp
+    test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
     test/cpp/unittest.cpp
     test/cpp/utils/sirius_test_env.cpp
     test/cpp/utils/utils.cpp)
 # cmake-format: on
+
+if(SIRIUS_LEGACY_TEST_SOURCES)
+  list(APPEND TEST_SOURCES ${SIRIUS_LEGACY_TEST_SOURCES})
+endif()
 
 add_executable(sirius_unittest ${TEST_SOURCES})
 
@@ -421,13 +553,6 @@ link_extension_libraries(sirius_unittest "")
 target_link_options(sirius_unittest PRIVATE
                     "LINKER:--allow-multiple-definition")
 
-# Precompile Catch2 header (18K lines) once instead of in every test file
-target_precompile_headers(sirius_unittest PRIVATE <catch.hpp>)
-# unittest.cpp defines CATCH_CONFIG_RUNNER before including catch.hpp, which is
-# incompatible with the PCH (compiled without that define). Exclude it.
-set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/unittest.cpp"
-                            PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
-
 set_target_properties(
   sirius_unittest
   PROPERTIES CXX_STANDARD 20
@@ -440,3 +565,43 @@ target_compile_definitions(
     $<BUILD_INTERFACE:SIRIUS_DEFAULT_LOG_DIR="${CMAKE_BINARY_DIR}/log">
     $<BUILD_INTERFACE:SIRIUS_UNITTEST_LOG_DIR="${CMAKE_CURRENT_BINARY_DIR}/test/cpp/log">
     $<BUILD_INTERFACE:SIRIUS_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}">)
+
+if(SIRIUS_LEGACY_COMPILE_DEFINITIONS)
+  target_compile_definitions(sirius_unittest
+                             PRIVATE ${SIRIUS_LEGACY_COMPILE_DEFINITIONS})
+endif()
+
+# -----------------------------------------------------------------------------
+# test/io/parquet_benchmark — standalone benchmark binary for sirius_datasource
+# -----------------------------------------------------------------------------
+add_executable(parquet_benchmark test/io/parquet_benchmark.cpp)
+
+if(VCPKG_BUILD)
+  set_target_properties(parquet_benchmark PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+  target_include_directories(parquet_benchmark BEFORE PRIVATE ${_VCPKG_INC})
+endif()
+
+target_include_directories(
+  parquet_benchmark
+  PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
+
+target_link_libraries(
+  parquet_benchmark
+  sirius_extension
+  duckdb_static
+  cudf::cudf
+  rmm::rmm
+  spdlog::spdlog
+  cuCascade::cucascade
+  PkgConfig::LIBURING
+  PkgConfig::NUMA)
+link_extension_libraries(parquet_benchmark "")
+
+target_link_options(parquet_benchmark PRIVATE
+                    "LINKER:--allow-multiple-definition")
+
+set_target_properties(
+  parquet_benchmark
+  PROPERTIES CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")

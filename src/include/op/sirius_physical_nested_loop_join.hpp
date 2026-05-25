@@ -17,13 +17,13 @@
 #pragma once
 
 #include "duckdb/common/value_operations/value_operations.hpp"
-#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/join_hashtable.hpp"
 #include "duckdb/execution/operator/join/perfect_hash_join_executor.hpp"
 #include "duckdb/execution/operator/join/physical_comparison_join.hpp"
 #include "duckdb/execution/operator/join/physical_join.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
+#include "expression/join_condition.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 
 namespace sirius {
@@ -46,7 +46,7 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
     duckdb::LogicalOperator& op,
     duckdb::unique_ptr<sirius_physical_operator> left,
     duckdb::unique_ptr<sirius_physical_operator> right,
-    duckdb::vector<duckdb::JoinCondition> cond,
+    duckdb::vector<sirius::join_condition> cond,
     duckdb::JoinType join_type,
     std::size_t estimated_cardinality,
     duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info_p);
@@ -54,34 +54,34 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
   sirius_physical_nested_loop_join(duckdb::LogicalOperator& op,
                                    duckdb::unique_ptr<sirius_physical_operator> left,
                                    duckdb::unique_ptr<sirius_physical_operator> right,
-                                   duckdb::vector<duckdb::JoinCondition> cond,
+                                   duckdb::vector<sirius::join_condition> cond,
                                    duckdb::JoinType join_type,
                                    std::size_t estimated_cardinality);
 
   sirius_physical_nested_loop_join(duckdb::LogicalOperator& op,
                                    duckdb::unique_ptr<sirius_physical_operator> left,
                                    duckdb::unique_ptr<sirius_physical_operator> right,
-                                   duckdb::vector<duckdb::JoinCondition> cond,
+                                   duckdb::vector<sirius::join_condition> cond,
                                    duckdb::JoinType join_type,
                                    std::size_t estimated_cardinality,
                                    duckdb::vector<std::size_t> left_projection_map,
                                    duckdb::vector<std::size_t> right_projection_map);
 
-  duckdb::vector<duckdb::JoinCondition> conditions;
+  duckdb::vector<sirius::join_condition> conditions;
   //! The types of the join keys
-  duckdb::vector<duckdb::LogicalType> condition_types;
+  duckdb::vector<sirius::logical_type> condition_types;
   //! The type of the join
   duckdb::JoinType join_type;
 
   //! The indices for getting the payload columns
   duckdb::vector<std::size_t> payload_column_idxs;
   //! The types of the payload columns
-  duckdb::vector<duckdb::LogicalType> payload_types;
+  duckdb::vector<sirius::logical_type> payload_types;
 
   //! Positions of the RHS columns that need to output
   duckdb::vector<std::size_t> rhs_output_columns;
   //! The types of the output
-  duckdb::vector<duckdb::LogicalType> rhs_output_types;
+  duckdb::vector<sirius::logical_type> rhs_output_types;
 
   //! Output column order: indices into left table columns (empty = identity 0,1,...,left_cols-1)
   duckdb::vector<std::size_t> left_output_col_idxs;
@@ -89,7 +89,7 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
   duckdb::vector<std::size_t> right_output_col_idxs;
 
   //! Duplicate eliminated types; only used for delim_joins (i.e. correlated subqueries)
-  duckdb::vector<duckdb::LogicalType> delim_types;
+  duckdb::vector<sirius::logical_type> delim_types;
 
   duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> filter_pushdown;
 
@@ -111,12 +111,12 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
   // Sink Interface
   bool is_sink() const override { return true; }
 
-  static bool is_supported(const duckdb::vector<duckdb::JoinCondition>& conditions,
+  static bool is_supported(const duckdb::vector<sirius::join_condition>& conditions,
                            duckdb::JoinType join_type);
 
  public:
   //! Returns a list of the types of the join conditions
-  duckdb::vector<duckdb::LogicalType> get_join_types() const;
+  duckdb::vector<sirius::logical_type> get_join_types() const;
 
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 

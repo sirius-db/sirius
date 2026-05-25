@@ -91,39 +91,53 @@ One `downgrade_executor` per memory space monitors pressure and moves data to lo
 
 ### Thread Model
 
-- **Monitor thread** (`monitor_loop()`): polls memory space every ~10ms for `should_downgrade_memory()` signal
-- **Manager thread** (`manager_loop()`): dispatches downgrade tasks from queue to thread pool via kiosk
-- **Worker thread pool** (default: 4 threads): executes actual data movement
+- **Processing thread**: dequeues `downgrade_request` objects sequentially from an `interruptible_mpmc` queue
+- **Monitor thread** (if `monitor_period_ms > 0`): polls memory space for pressure and fires monitor requests via fire-and-forget into the same queue
+- **Worker thread pool** (`exec::bounded_thread_pool`): executes actual data movement concurrently
 
-### Downgrade Pass
+### Downgrade Request Pattern
 
-`run_downgrade_pass()` selects data batches for downgrade:
+The downgrade executor uses a request-based model with tiered candidate fetching:
 
-**Selection strategy:**
-1. Partitioned repositories first, then by descending data size
-2. Two-pass within each repository:
-   - **Pass 1**: Non-active partitions (less likely to be needed soon)
-   - **Pass 2**: Active partitions (if pressure persists)
-3. Within a repository: iterate partitions last-to-first (newer data first)
+1. Caller invokes `request_downgrade(predicate)` which constructs a `downgrade_request` and pushes it onto the MPMC queue. Returns `std::future<size_t>`.
+2. The processing thread dequeues requests **sequentially** (to avoid contention between concurrent requests competing for the same batches).
+3. For each request, the processing loop fetches candidates lazily in tiered order:
+   - **Tier 1 (data repositories):** Creates a `convertible_data_batch_provider` per repository and fetches idle GPU-resident batches one at a time
+   - **Tier 2 (task_scheduler queue):** Creates a `convertible_gpu_pipeline_task_provider` to extract tasks with convertible data batches from the pipeline-level task queue
+4. Each candidate is dispatched to the `bounded_thread_pool` and converted via `convertible_data::convert()`. After each conversion, the `predicate` is evaluated. If it returns `true`, no new candidates are dispatched (in-flight conversions finish naturally). The promise resolves with total bytes freed.
 
-**Execution per batch:**
-1. Check if batch is already on HOST tier (skip if so)
-2. `try_to_lock_for_in_transit()` — prevents concurrent pipeline access
-3. Acquire HOST memory reservation
-4. Convert GPU representation → HOST representation via `converter_registry`
-5. Release in-transit lock, restore previous batch state
-6. Send completion message to `task_creator` for downstream scheduling
+**Pipeline integration:** When `gpu_pipeline_executor` gets a partial memory reservation (shortfall), it issues a single `request_downgrade(predicate)` where the predicate attempts `make_reservation_or_null(bytes_needed)`. The downgrade stops as soon as the reservation succeeds -- single request, no over-freeing.
 
-The downgrade executor runs **concurrently** with pipeline execution, monitoring memory pressure asynchronously.
+### Candidate Selection Strategy
 
-### `downgrade_task`
+Candidates are fetched lazily via `convertible_data_provider` implementations:
 
-**File:** `src/include/downgrade/downgrade_task.hpp`
+1. **Data repositories** are iterated in repository manager order. Within each repository, `convertible_data_batch_provider` iterates partitions back-to-front, then batches back-to-front, filtering for idle batches in the source memory space.
+2. **Pipeline task queue** is inspected via `convertible_gpu_pipeline_task_provider`, which uses `mutable_pop_if` to temporarily extract tasks with matching data batches. Tasks are returned to the queue via RAII on all code paths.
 
-Global state shared across all downgrade tasks:
-- Reference to `sirius_memory_reservation_manager`
-- Reference to `data_repository_manager`
-- Reference to task completion message queue
+Candidates are converted individually via `convertible_data::convert()`, which handles state locking, memory reservation, tier conversion, and failure rollback atomically.
+
+## Memory Consumption History
+
+**File:** `src/include/pipeline/pipeline_memory_history.hpp`
+
+Each GPU pipeline maintains a `pipeline_memory_history` — a thread-safe ring buffer of up to 64 `task_memory_record` entries, each recording:
+- `estimated_bytes` — pre-execution estimation basis (input data size)
+- `peak_memory_bytes` — actual peak allocation observed during execution
+- `output_bytes` — output size, or `nullopt` if the task OOM'd
+
+### Recording
+
+- `record(rec)` — on successful task completion
+- `record_on_failure(estimated_bytes, peak)` — on OOM; keeps the **higher** peak for repeated failures with the same input size, so each retry reserves more
+
+### Estimation
+
+`estimate_peak_memory(estimated_bytes)` computes a weighted average of historical `peak/estimated` ratios. Records with similar estimation bases are weighted higher using a log-ratio distance function: `weight = 1 / (1 + |log(rec_est / new_est)|)`.
+
+### Integration
+
+`gpu_pipeline_task::get_estimated_reservation_size()` uses `estimate_peak_memory()` for the reservation, adding `_bytes_to_materialize_input` (bytes to pull from HOST/disk to GPU) and subtracting it from recorded peak to keep operator history clean of I/O materialization overhead.
 
 ## Memory Pool Defragmentation
 
@@ -147,7 +161,7 @@ On allocation failure:
 - Fixed-size block pools: 64MB blocks, 1024 blocks per pool
 - Automatic NUMA node affinity
 - Used for GPU↔CPU transfers and scan caching
-- Configured via `sirius.cfg` (memory manager settings in cuCascade)
+- Configured via `sirius.yaml` (see [Configuration](configuration.md))
 
 ## Key Files
 
@@ -155,7 +169,7 @@ On allocation failure:
 |------|---------|
 | `src/include/memory/sirius_memory_reservation_manager.hpp` | Memory manager, tier configuration |
 | `src/include/downgrade/downgrade_executor.hpp` | Downgrade executor interface |
-| `src/downgrade/downgrade_executor.cpp` | Monitor loop, candidate selection |
-| `src/include/downgrade/downgrade_task.hpp` | Downgrade task definition |
+| `src/downgrade/downgrade_executor.cpp` | Processing loop, tiered candidate fetching |
 | `src/include/memory/defragmenter_oom_policy.hpp` | Pool defragmentation policy |
 | `src/memory/defragmenter_oom_policy.cpp` | Fragmentation detection and trimming |
+| `src/include/pipeline/pipeline_memory_history.hpp` | Per-pipeline memory consumption history |

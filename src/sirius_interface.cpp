@@ -24,7 +24,11 @@
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
+#include "telemetry/telemetry_context.hpp"
+
+#include <optional>
 
 namespace sirius {
 
@@ -35,8 +39,9 @@ void bind_prepared_statement_parameters(duckdb::PreparedStatementData& statement
   statement.Bind(std::move(owned_values));
 }
 
-sirius_interface::sirius_interface(duckdb::ClientContext& client_context)
-  : client_context(client_context) {};
+sirius_interface::sirius_interface(duckdb::ClientContext& client_context,
+                                   std::optional<std::string> query_label)
+  : client_context(client_context), telemetry(std::move(query_label)) {};
 
 void sirius_interface::sirius_process_error(duckdb::ErrorData& error,
                                             const duckdb::string& query) const
@@ -167,7 +172,7 @@ duckdb::unique_ptr<duckdb::PendingQueryResult> sirius_interface::sirius_pending_
       duckdb::ErrorData("Error in sirius_pending_statement_internal"));
   }
   D_ASSERT(sirius_collector->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR);
-  auto types = sirius_collector->get_types();
+  auto types = sirius::to_duckdb_vec(sirius_collector->get_types());
   D_ASSERT(types == statement.types);
   engine.initialize(std::move(sirius_collector));
 

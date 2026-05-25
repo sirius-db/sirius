@@ -1,0 +1,235 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include "config.hpp"
+#include "exec/channel.hpp"
+#include "exec/config.hpp"
+#include "exec/inspectable_mpsc.hpp"
+#include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/scan/config.hpp"
+#include "op/sirius_physical_duckdb_scan.hpp"
+#include "op/sirius_physical_operator.hpp"
+#include "parallel/task.hpp"
+#include "pipeline/completion_handler.hpp"
+#include "pipeline/gpu_pipeline_task.hpp"
+#include "pipeline/task_request.hpp"
+#include "planner/query.hpp"
+
+#include <cucascade/memory/topology_discovery.hpp>
+
+#include <atomic>
+#include <future>
+#include <map>
+#include <queue>
+
+namespace sirius::op::scan {
+class duckdb_scan_executor;
+}  // namespace sirius::op::scan
+
+namespace sirius::parallel {
+class downgrade_executor;
+}  // namespace sirius::parallel
+
+namespace sirius {
+
+namespace creator {
+class task_creator;
+}
+
+namespace pipeline {
+
+class gpu_pipeline_executor;
+
+/**
+ * @brief Executor specialized for executing GPU pipeline operations.
+ *
+ * This executor inherits from itask_executor and uses a gpu_pipeline_task_queue for
+ * task scheduling. It manages a pool of threads dedicated to executing GPU pipeline
+ * tasks with specialized GPU resource management.
+ */
+class task_scheduler {
+ public:
+  /**
+   * @brief Constructs a new task_scheduler with task execution configuration
+   *
+   * @param gpu_executor_config Configuration for the GPU pipeline executor thread pool
+   * @param scan_executor_config Configuration for the scan executor thread pool
+   * @param mem_mgr Reference to the memory reservation manager
+   * @param sys_topology Optional system topology info for CPU affinity
+   * @param downgrade_executors Optional vector of downgrade executors
+   */
+  explicit task_scheduler(const exec::thread_pool_config& gpu_executor_config,
+                          const exec::thread_pool_config& scan_executor_config,
+                          sirius::memory::sirius_memory_reservation_manager& mem_mgr,
+                          const cucascade::memory::system_topology_info* sys_topology = nullptr,
+                          const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>*
+                            downgrade_executors = nullptr);
+
+  /**
+   * @brief Destructor for the task_scheduler.
+   */
+  ~task_scheduler();
+
+  // Non-copyable but movable
+  task_scheduler(const task_scheduler&)            = delete;
+  task_scheduler& operator=(const task_scheduler&) = delete;
+  task_scheduler(task_scheduler&&)                 = delete;
+  task_scheduler& operator=(task_scheduler&&)      = delete;
+
+  /**
+   * @brief Schedules a task for execution with GPU-specific logic
+   *
+   * Overrides the base class schedule method to provide specialized scheduling
+   * behavior for GPU pipeline operations, including resource allocation and
+   * GPU context management.
+   *
+   * @param task The task to schedule (must be a gpu_pipeline_task)
+   */
+  void schedule(std::unique_ptr<sirius::parallel::itask> task);
+
+  /**
+   * @brief Starts the executor and initializes worker threads
+   *
+   * Initializes the thread pool and begins accepting tasks for execution.
+   */
+  void start();
+
+  /**
+   * @brief Stops the executor and cleanly shuts down worker threads
+   *
+   * Stops accepting new tasks and waits for all worker threads to complete
+   * their current tasks before shutting down.
+   */
+  void stop();
+
+  /**
+   * @brief Set the task creator reference
+   *
+   * Sets the task creator for this executor and propagates it to all GPU executors.
+   *
+   * @param task_creator Reference to the task creator
+   */
+  void set_task_creator(sirius::creator::task_creator& task_creator);
+
+  /**
+   * @brief Get the scan executor reference
+   *
+   * @return Reference to the duckdb scan executor
+   */
+  [[nodiscard]] sirius::op::scan::duckdb_scan_executor& get_scan_executor() noexcept;
+
+  [[nodiscard]] const sirius::op::scan::duckdb_scan_executor& get_scan_executor() const noexcept;
+
+  /**
+   * @brief Configure scan result caching level
+   *
+   * @param level The cache level to use
+   */
+  void set_scan_caching_config(sirius::op::scan::cache_level level);
+
+  /**
+   * @brief Get a pointer to the pipeline-level task queue.
+   */
+  [[nodiscard]] exec::inspectable_mpsc<sirius::parallel::itask>* get_pipeline_task_queue() noexcept
+  {
+    return &_task_queue;
+  }
+
+  /**
+   * @brief Set the priority scan operators
+   *
+   * Sets the scan operators that should be executed with priority.
+   * First element in vector will be first out of the queue.
+   * Also prepares the scan executor cache for these operators.
+   *
+   * @param scans Vector of scan operators (first in vector = first out of queue)
+   */
+  void prepare_for_query(duckdb::shared_ptr<planner::query> query);
+
+  /**
+   * @brief Start query execution and return a future for completion.
+   *
+   * Sets up the completion handler and returns a future that will be satisfied
+   * when the query completes or errors. Note: prepare_for_query must be called
+   * before this method.
+   *
+   * @return A future that will be satisfied when the query completes.
+   */
+  std::future<void> start_query();
+
+  /**
+   * @brief Terminate the query execution and report the error to duckdb.
+   *
+   * @param error The error to report.
+   */
+  void terminate_query(std::exception_ptr error);
+
+  /**
+   * @brief Drain all in-flight tasks after a query error.
+   *
+   * Drains the top-level task queue and waits for each GPU executor to finish
+   * all in-flight thread-pool tasks.  After this call it is safe for QueryEnd
+   * to destroy data repositories without causing a use-after-free in executing
+   * tasks.  Each GPU executor's manager thread is restarted so the executor is
+   * ready for the next query.
+   */
+  void drain_after_error();
+
+  // for testing/stress only — see Doxygen below.
+  /**
+   * @brief Inject an initial value into the round-robin counter.
+   *
+   * For testing/stress only. Intended to verify that the round-robin
+   * distribution path (and the per-task-device contract documented in
+   * `docs/super-sirius/pipeline-execution.md`) is correct under arbitrary
+   * counter starting offsets — catches hash-bucket-order dependent bugs and
+   * off-by-one drift that a counter starting at 0 each query might mask.
+   *
+   * Must be called AFTER `prepare_for_query` (which resets the counter
+   * to 0) but BEFORE the first task is dispatched into
+   * `management_eventloop`. Concurrent calls are safe (atomic store).
+   */
+  void set_no_pref_rr_counter_for_testing(size_t value) noexcept
+  {
+    _no_pref_rr_counter.store(value, std::memory_order_relaxed);
+  }
+
+ private:
+  void management_eventloop();
+
+  std::mutex _priority_scans_mutex;
+  std::queue<op::sirius_physical_operator*> _priority_scans;
+
+  exec::inspectable_mpsc<sirius::parallel::itask> _task_queue;  ///< Queue for GPU pipeline tasks
+  exec::channel<std::unique_ptr<task_request>> _task_request_channel;
+  std::thread _management_thread;
+  std::atomic<bool> _running{false};
+
+  /// device_id -> GPU executor. std::map (not unordered_map) so iteration
+  /// order is deterministic (ascending by device_id) — keeps preference-less
+  /// task dispatch reproducible across runs.
+  std::map<int, std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;
+  std::atomic<size_t> _no_pref_rr_counter{0};
+
+  sirius::creator::task_creator* _task_creator{nullptr};
+  std::unique_ptr<sirius::op::scan::duckdb_scan_executor> _scan_executor;
+  std::unique_ptr<completion_handler> _completion_handler;
+};
+
+}  // namespace pipeline
+}  // namespace sirius

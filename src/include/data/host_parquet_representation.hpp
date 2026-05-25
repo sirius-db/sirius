@@ -17,7 +17,8 @@
 #pragma once
 
 // sirius
-#include <expression_executor/gpu_expression_translator.hpp>
+#include <expression_executor/gpu_expression_translator_internal.hpp>
+#include <op/scan/hive_partition.hpp>  // For partition_inject_fn_t
 
 // cucascade
 #include <cucascade/data/common.hpp>
@@ -60,6 +61,10 @@ using post_convert_fn_t =
                                              std::string const& data_file_path,
                                              int64_t first_row_offset,
                                              rmm::cuda_stream_view)>;
+
+// partition_inject_fn_t is the legacy typedef declared in <op/scan/hive_partition.hpp>
+// (sirius:: namespace). It carries file_path so the schema-reconciliation closure built by
+// parquet_scan_task_global_state::build_schema_reconciliation can do per-file column-set lookups.
 
 /**
  * @brief A host representation of Parquet data for use in a hybrid scan.
@@ -105,8 +110,9 @@ class host_parquet_representation : public cucascade::idata_representation {
                               std::size_t uncompressed_size_in_bytes,
                               std::size_t file_size,
                               std::shared_ptr<cudf::io::datasource> fallback_datasource,
-                              std::shared_ptr<translated_expression> filter_expression = nullptr,
-                              std::vector<std::size_t> post_filter_projection_ids      = {})
+                              std::shared_ptr<std::unordered_map<int, translated_expression>>
+                                filter_expression_by_device                       = nullptr,
+                              std::vector<std::size_t> post_filter_projection_ids = {})
     : idata_representation(*memory_space),
       _column_chunks(std::move(column_chunks)),
       _parquet_reader(std::move(parquet_reader)),
@@ -117,7 +123,7 @@ class host_parquet_representation : public cucascade::idata_representation {
       _uncompressed_size_in_bytes(uncompressed_size_in_bytes),
       _file_size(file_size),
       _fallback_datasource(fallback_datasource),
-      _filter_expression(filter_expression),
+      _filter_expression_by_device(std::move(filter_expression_by_device)),
       _post_filter_projection_ids(std::move(post_filter_projection_ids))
   {
   }
@@ -272,13 +278,18 @@ class host_parquet_representation : public cucascade::idata_representation {
   }
 
   /**
-   * @brief Gets the optional filter expression for filter pushdown.
+   * @brief Gets the per-GPU map of translated filter expressions for filter pushdown.
    *
-   * @return A shared_ptr to the translated filter expression, or nullptr if not set.
+   * The converter uses this to pick the entry matching its task's target device so the
+   * cudf::scalar device buffers evaluated by cudf::io::read_parquet live on the current
+   * GPU.
+   *
+   * @return A shared_ptr to the per-device filter map (may be null or empty).
    */
-  [[nodiscard]] std::shared_ptr<translated_expression> const& get_filter_expression() const
+  [[nodiscard]] std::shared_ptr<std::unordered_map<int, translated_expression>> const&
+  get_filter_expression_by_device() const
   {
-    return _filter_expression;
+    return _filter_expression_by_device;
   }
 
   /**
@@ -331,6 +342,39 @@ class host_parquet_representation : public cucascade::idata_representation {
 
   [[nodiscard]] std::string const& get_data_file_path() const { return _data_file_path; }
 
+  // -------------------------------------------------------------------------
+  // Hive partition column injection
+  // -------------------------------------------------------------------------
+
+  void set_partition_inject_fn(partition_inject_fn_t fn) { _partition_inject_fn = std::move(fn); }
+
+  [[nodiscard]] bool has_partition_inject_fn() const { return _partition_inject_fn != nullptr; }
+
+  /// Hive partition values for this representation's file, in hive_partition_columns order.
+  /// Set once per task by the caller that installs the inject fn.
+  void set_partition_values(std::vector<std::string> values)
+  {
+    _partition_values = std::move(values);
+  }
+
+  [[nodiscard]] std::vector<std::string> const& get_partition_values() const
+  {
+    return _partition_values;
+  }
+
+  /// Only call after checking has_partition_inject_fn().
+  [[nodiscard]] std::unique_ptr<cudf::table> apply_partition_inject(
+    std::unique_ptr<cudf::table> tbl, rmm::cuda_stream_view stream)
+  {
+    D_ASSERT(_partition_inject_fn);
+    return _partition_inject_fn(std::move(tbl), _data_file_path, _partition_values, stream);
+  }
+
+  [[nodiscard]] partition_inject_fn_t const& get_partition_inject_fn() const
+  {
+    return _partition_inject_fn;
+  }
+
   /**
    * @brief Compute the 0-based absolute row offset of the first row in this batch.
    *
@@ -351,17 +395,18 @@ class host_parquet_representation : public cucascade::idata_representation {
   }
 
  private:
-  host_parquet_representation(cucascade::memory::memory_space* memory_space,
-                              std::shared_ptr<hybrid_scan_reader> parquet_reader,
-                              cudf::io::parquet_reader_options reader_options,
-                              std::vector<cudf::size_type> row_group_indices,
-                              std::vector<cudf::io::text::byte_range_info> column_chunk_byte_ranges,
-                              std::size_t size_in_bytes,
-                              std::size_t uncompressed_size_in_bytes,
-                              std::size_t file_size,
-                              std::shared_ptr<cudf::io::datasource> fallback_datasource,
-                              std::shared_ptr<translated_expression> filter_expression,
-                              std::vector<std::size_t> post_filter_projection_ids)
+  host_parquet_representation(
+    cucascade::memory::memory_space* memory_space,
+    std::shared_ptr<hybrid_scan_reader> parquet_reader,
+    cudf::io::parquet_reader_options reader_options,
+    std::vector<cudf::size_type> row_group_indices,
+    std::vector<cudf::io::text::byte_range_info> column_chunk_byte_ranges,
+    std::size_t size_in_bytes,
+    std::size_t uncompressed_size_in_bytes,
+    std::size_t file_size,
+    std::shared_ptr<cudf::io::datasource> fallback_datasource,
+    std::shared_ptr<std::unordered_map<int, translated_expression>> filter_expression_by_device,
+    std::vector<std::size_t> post_filter_projection_ids)
     : idata_representation(*memory_space),
       _parquet_reader(std::move(parquet_reader)),
       _reader_options(std::move(reader_options)),
@@ -371,7 +416,7 @@ class host_parquet_representation : public cucascade::idata_representation {
       _uncompressed_size_in_bytes(uncompressed_size_in_bytes),
       _file_size(file_size),
       _fallback_datasource(fallback_datasource),
-      _filter_expression(filter_expression),
+      _filter_expression_by_device(std::move(filter_expression_by_device)),
       _post_filter_projection_ids(std::move(post_filter_projection_ids))
   {
   }
@@ -386,11 +431,16 @@ class host_parquet_representation : public cucascade::idata_representation {
   std::size_t _uncompressed_size_in_bytes;
   std::size_t _file_size{0};
   std::shared_ptr<cudf::io::datasource> _fallback_datasource;
-  std::shared_ptr<translated_expression> _filter_expression;
+  std::shared_ptr<std::unordered_map<int, translated_expression>> _filter_expression_by_device;
   std::vector<std::size_t> _post_filter_projection_ids;
   /// Optional post-convert hook (null for plain parquet, set for iceberg V2 deletes).
   post_convert_fn_t _post_convert_fn;
-  /// Path of the Iceberg data file this batch was read from (empty for plain parquet).
+  /// Optional partition column injection hook (null unless hive-partitioned).
+  partition_inject_fn_t _partition_inject_fn;
+  /// Path of the data file this batch was read from.
   std::string _data_file_path;
+  /// Hive partition values for @ref _data_file_path, in hive_partition_columns order.
+  /// Empty unless the table has hive partitions; consumed by apply_partition_inject().
+  std::vector<std::string> _partition_values;
 };
 }  // namespace sirius

@@ -25,6 +25,7 @@
 #include "duckdb/execution/radix_partitioned_hashtable.hpp"
 #include "duckdb/parser/group_by_node.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "expression/expression.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_operator.hpp"
@@ -44,7 +45,7 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   sirius_physical_grouped_aggregate_merge(sirius_physical_grouped_aggregate* grouped_aggregate);
 
   sirius_physical_grouped_aggregate_merge(
-    duckdb::vector<duckdb::LogicalType> types,
+    duckdb::vector<sirius::logical_type> types,
     std::vector<int> group_idx,
     std::vector<cudf::aggregation::Kind> cudf_aggregates,
     std::vector<int> cudf_aggregate_idx,
@@ -54,18 +55,17 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
     bool has_count_distinct,
     std::size_t estimated_cardinality);
 
-  sirius_physical_grouped_aggregate_merge(
-    duckdb::ClientContext& context,
-    duckdb::vector<duckdb::LogicalType> types,
-    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
-    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups,
-    std::size_t estimated_cardinality);
+  sirius_physical_grouped_aggregate_merge(duckdb::ClientContext& context,
+                                          duckdb::vector<sirius::logical_type> types,
+                                          duckdb::vector<sirius::expression> expressions,
+                                          duckdb::vector<sirius::expression> groups,
+                                          std::size_t estimated_cardinality);
 
   sirius_physical_grouped_aggregate_merge(
     duckdb::ClientContext& context,
-    duckdb::vector<duckdb::LogicalType> types,
-    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
-    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups,
+    duckdb::vector<sirius::logical_type> types,
+    duckdb::vector<sirius::expression> expressions,
+    duckdb::vector<sirius::expression> groups,
     duckdb::vector<duckdb::GroupingSet> grouping_sets,
     duckdb::vector<duckdb::unsafe_vector<std::size_t>> grouping_functions,
     std::size_t estimated_cardinality,
@@ -80,13 +80,11 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   duckdb::vector<duckdb::HashAggregateGroupingData> groupings;
   duckdb::unique_ptr<duckdb::DistinctAggregateCollectionInfo> distinct_collection_info;
   //! A recreation of the input chunk, with nulls for everything that isn't a group
-  duckdb::vector<duckdb::LogicalType> input_group_types;
+  duckdb::vector<sirius::logical_type> input_group_types;
 
   // Filters given to sink and friends
   duckdb::unsafe_vector<std::size_t> non_distinct_filter;
   duckdb::unsafe_vector<std::size_t> distinct_filter;
-
-  duckdb::unordered_map<duckdb::Expression*, size_t> filter_indexes;
 
   sirius_physical_operator* child_op;
   sirius_physical_operator* get_child_op() const { return child_op; }
@@ -115,9 +113,9 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   // Source interface
   bool is_source() const override { return true; }
 
-  duckdb::OrderPreservationType source_order() const override
+  sirius::OrderPreservationType source_order() const override
   {
-    return duckdb::OrderPreservationType::NO_ORDER;
+    return sirius::OrderPreservationType::NO_ORDER;
   }
 
   // Sink interface

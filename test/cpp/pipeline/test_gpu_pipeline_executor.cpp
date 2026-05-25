@@ -23,12 +23,11 @@
 #include "pipeline/task_request.hpp"
 #include "scan/test_utils.hpp"
 
-#include <rmm/mr/device_memory_resource.hpp>
-
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -108,7 +107,7 @@ class sirius_pipeline_task : public sirius::pipeline::gpu_pipeline_task {
 
     void* allocation = nullptr;
     try {
-      allocation = allocator->allocate(stream, kAllocationBytes);
+      allocation = allocator->allocate(stream, kAllocationBytes, alignof(std::max_align_t));
     } catch (const std::exception& e) {
       global.add_error(std::string("GPU allocation failed: ") + e.what());
       allocator->reset_stream_reservation(stream);
@@ -116,7 +115,7 @@ class sirius_pipeline_task : public sirius::pipeline::gpu_pipeline_task {
       return;
     }
 
-    allocator->deallocate(stream, allocation, kAllocationBytes);
+    allocator->deallocate(stream, allocation, kAllocationBytes, alignof(std::max_align_t));
 
     auto consumed_bytes = mem_space.get_total_reserved_memory();
     {
@@ -128,14 +127,24 @@ class sirius_pipeline_task : public sirius::pipeline::gpu_pipeline_task {
     global.executed_count.fetch_add(1, std::memory_order_relaxed);
   }
 
-  std::size_t get_estimated_reservation_size() const override { return kReservationBytes; }
+  sirius::pipeline::reservation_size_info get_estimated_reservation_size_info() const override
+  {
+    sirius::pipeline::reservation_size_info info;
+    info.reservation_size = kReservationBytes;
+    return info;
+  }
 
   std::vector<sirius::op::sirius_physical_operator*> get_output_consumers() override { return {}; }
 };
 
 }  // namespace
 
-TEST_CASE("GPU pipeline executor uses task requests to schedule GPU tasks",
+// Post-v1.0 push-model: tasks are pushed directly to the executor (see commit 90dc104 —
+// management_eventloop now pops tasks from _task_queue and routes by preferred_device_id;
+// gpu_pipeline_executor no longer publishes task_requests on a pull channel). The test
+// keeps the request_channel wiring to validate executor construction, but schedules
+// tasks directly instead of waiting on `request_channel.get()`.
+TEST_CASE("GPU pipeline executor schedules GPU tasks directly (push-model)",
           "[gpu_pipeline_executor]")
 {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
@@ -178,10 +187,9 @@ TEST_CASE("GPU pipeline executor uses task requests to schedule GPU tasks",
   executor.start();
 
   std::thread request_handler([&]() {
+    // Push-model: schedule tasks directly onto the executor. The executor's
+    // manager_loop handles capacity/reservation internally (bounded_pool->reserve()).
     while (dispatched.load(std::memory_order_relaxed) < num_tasks) {
-      auto request = request_channel.get();
-      if (!request) { break; }
-
       auto local_state = std::make_unique<test_gpu_pipeline_task_local_state>(
         std::make_unique<sirius::op::pipelineable_operator_data>(
           std::vector<std::shared_ptr<cucascade::data_batch>>{}));

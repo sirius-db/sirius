@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "helper/type_conversions.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "operator_test_utils.hpp"
 #include "operator_type_traits.hpp"
@@ -78,8 +79,7 @@ TEMPLATE_TEST_CASE("sirius_physical_filter executes on data_batch for multiple n
       *space, filter_vals, data_vals, Traits::cudf_type, std::nullopt);
   }
 
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs;
-  exprs.push_back(duckdb::make_uniq<BoundComparisonExpression>(
+  auto filter_expr = sirius::wrap(duckdb::make_uniq<BoundComparisonExpression>(
     ExpressionType::COMPARE_GREATERTHAN,
     duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT),
                                                 0),
@@ -89,17 +89,14 @@ TEMPLATE_TEST_CASE("sirius_physical_filter executes on data_batch for multiple n
   types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));  // filter column
   types.push_back(Traits::logical_type());
 
-  sirius_physical_filter filter(std::move(types), std::move(exprs), filter_vals.size());
+  sirius_physical_filter filter(
+    sirius::from_duckdb_vec(types), std::move(filter_expr), filter_vals.size());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = filter.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
-  auto output_table = dynamic_cast<const pipelineable_operator_data&>(*outputs)
-                        .get_data_batches()[0]
-                        ->get_data()
-                        ->cast<gpu_table_representation>()
-                        .get_table();
-  auto out_view    = output_table.view();
+  auto out_view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
   auto host_vals   = copy_column_to_host<typename Traits::type>(out_view.column(1));
   auto host_filter = copy_column_to_host<int64_t>(out_view.column(0));
 

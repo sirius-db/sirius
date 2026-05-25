@@ -16,12 +16,19 @@
 
 #include "planner/query.hpp"
 
+#include "sirius_engine.hpp"
+#include "sirius_interface.hpp"
+#include "telemetry/telemetry_context.hpp"
+
 namespace sirius::planner {
 
-query::query(duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> pipelines)
-  : _pipelines(std::move(pipelines))
+query::query(duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> pipelines,
+             const quent::Context& context,
+             telemetry::query_telemetry_info telemetry_info)
+  : _plan_id(uuid::now_v7()), _pipelines(std::move(pipelines))
 {
   build_indices();
+  telemetry::emit_plan_telemetry(context, _pipelines, _plan_id, telemetry_info);
 }
 
 void query::build_indices()
@@ -36,10 +43,11 @@ void query::build_indices()
       // Add to operator-to-pipeline map
       _operator_to_pipeline[source.get()] = pipeline;
 
-      // If it's a table scan, add to scan operators vector
+      // If it's a scan-like source, add to scan operators vector
       if (source->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
-          source->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN ||
-          source->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
+          source->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN ||
+          source->type == op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN ||
+          source->type == op::SiriusPhysicalOperatorType::CPU_SOURCE) {
         _scan_operators.push_back(source.get());
       }
     }

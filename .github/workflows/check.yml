@@ -54,6 +54,7 @@ jobs:
         environment: [default]
         cudf-channel:
           - stable
+        variant: [super]
         exclude:
           - compiler: gcc
             build-type: debug
@@ -65,15 +66,23 @@ jobs:
             build-type: release
             environment: vcpkg
             cudf-channel: stable
+            variant: super
           - arch: arm64
             compiler: gcc
             build-type: release
             environment: default
             cudf-channel: nightly
+            variant: super
+          - arch: x64
+            compiler: gcc
+            build-type: release
+            environment: default
+            cudf-channel: stable
+            variant: legacy
       fail-fast: false
     runs-on: >-
       ${{ matrix.environment == 'vcpkg'
-        && fromJSON('["self-hosted", "ubuntu-22.04", "cuda-13", "cpu-xl"]')
+        && fromJSON('["self-hosted", "ubuntu-24.04", "cuda-13", "cpu-xl"]')
         || format('ubuntu-24.04{0}', case(matrix.arch == 'arm64', '-arm', '')) }}
     timeout-minutes: ${{ case(matrix.environment == 'vcpkg', 240, 60) }}
     continue-on-error: ${{ matrix.cudf-channel == 'nightly' }}
@@ -95,16 +104,22 @@ jobs:
             ${{ matrix.cudf-channel == 'nightly' && 'nightly-runner'
               || matrix.environment }}
 
-      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      - name: Configure cache backends
+        run: |
+          if [[ -n "${SCCACHE_BUCKET}" ]]; then
+            echo "SCCACHE_BUCKET DEFINED -> Self Hosted Runner, Disable GHA sccache, use S3 vcpkg cache"
+            echo "SCCACHE_GHA_ENABLED=false" >> $GITHUB_ENV
+          else
+            echo "SCCACHE_BUCKET UNDEFINED -> GitHub Runner, Enable GHA sccache"
+            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+          fi
+          if [[ -n "${VCPKG_BUCKET}" ]]; then
+            echo "VCPKG_BINARY_SOURCES=clear;x-aws,s3://${VCPKG_BUCKET}/,readwrite" >> $GITHUB_ENV
+          fi
 
-      - uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
-        if: matrix.environment == 'vcpkg'
-        with:
-          path: ~/.cache/vcpkg/archives
-          key: vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vcpkg.json', 'vcpkg/versions/baseline.json', 'vcpkg_ports/**') }}
-          restore-keys: vcpkg-${{ runner.os }}-${{ runner.arch }}-
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
 
-      - run: ${{ case(matrix.cudf-channel == 'nightly', 'pixi run -e nightly-runner nightly-run', '') }} make ${{ case(matrix.compiler == 'gcc', matrix.build-type, format('clang-{0}', matrix.build-type)) }} -j$(nproc)
+      - run: ${{ case(matrix.cudf-channel == 'nightly', 'pixi run -e nightly-runner nightly-run', '') }} make ${{ matrix.variant == 'legacy' && format('legacy-{0}', matrix.build-type) || case(matrix.compiler == 'gcc', matrix.build-type, format('clang-{0}', matrix.build-type)) }} -j$(nproc)
         if: matrix.environment != 'vcpkg'
         env:
           CUDAARCHS: "100"
@@ -112,5 +127,41 @@ jobs:
       - name: Build (vcpkg)
         if: matrix.environment == 'vcpkg'
         run: |
-          pixi run -e vcpkg cmake -S duckdb --preset vcpkg-release
-          pixi run -e vcpkg cmake --build build/vcpkg-release
+          set -o pipefail
+          pixi run -e vcpkg cmake -S duckdb --preset vcpkg-release 2>&1 | tee /tmp/vcpkg.log
+          pixi run -e vcpkg cmake --build build/vcpkg-release --target duckdb duckdb_local_extension_repo sirius_unittest 2>&1 | tee -a /tmp/vcpkg.log
+
+      - name: vcpkg cache summary
+        if: matrix.environment == 'vcpkg' && always()
+        run: |
+          [ -f /tmp/vcpkg.log ] || exit 0
+          RESTORED=$(grep -oP 'Restored \K\d+(?= package)' /tmp/vcpkg.log | head -1)
+          RESTORED=${RESTORED:-0}
+          RESTORE_TIME=$(grep -oP 'from AWS in \K[\d.]+(?= min)' /tmp/vcpkg.log | head -1)
+          TOTAL=$(grep -oP 'Installing \d+/\K\d+' /tmp/vcpkg.log | tail -1)
+          BUILT=$((${TOTAL:-0} - ${RESTORED:-0}))
+          UPLOADED=$(grep -c 'Starting submission' /tmp/vcpkg.log || true)
+          BUILD_MS=$(grep -oP 'Elapsed time to handle [^:]+: \K[\d.]+(?= ms)' /tmp/vcpkg.log | awk '{s+=$1} END {printf "%.1f", s/1000}')
+          HIT_RATE=$(( TOTAL > 0 ? RESTORED * 100 / TOTAL : 0 ))
+          {
+            echo "## vcpkg cache stats"
+            echo "| Metric | Value |"
+            echo "|---|---|"
+            echo "| Cache hit % | **${HIT_RATE}%** |"
+            echo "| Restored from S3 | **${RESTORED}** packages${RESTORE_TIME:+ in ${RESTORE_TIME} min} |"
+            echo "| Built from source | **${BUILT}** packages |"
+            echo "| Uploaded to S3 | **${UPLOADED}** packages |"
+            [ "${BUILT}" -gt 0 ] && echo "| Build time | **${BUILD_MS}** s |" || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  check:
+    runs-on: ubuntu-slim
+    needs: [lint, build]
+    if: always()
+    steps:
+      - name: All checks ok
+        if: ${{ !(contains(needs.*.result, 'failure')) }}
+        run: exit 0
+      - name: Some checks failed
+        if: ${{ contains(needs.*.result, 'failure') }}
+        run: exit 1

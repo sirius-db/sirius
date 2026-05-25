@@ -17,7 +17,7 @@
 #include "operator/gpu_physical_filter.hpp"
 
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
-#include "expression_executor/gpu_expression_executor.hpp"
+#include "legacy/expression_executor/gpu_expression_executor.hpp"
 #include "log/logging.hpp"
 
 namespace duckdb {

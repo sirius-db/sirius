@@ -17,7 +17,6 @@
 #pragma once
 
 // sirius
-#include <gpu_query_result.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <sirius_context.hpp>
 
@@ -53,8 +52,8 @@ class sirius_physical_result_collector : public sirius_physical_operator {
   duckdb::vector<std::string> names;
 
  public:
-  // //! The final method used to fetch the query result from this operator
-  virtual duckdb::unique_ptr<duckdb::QueryResult> get_result(duckdb::GlobalSinkState& state) = 0;
+  //! The final method used to fetch the query result from this operator
+  virtual duckdb::unique_ptr<duckdb::QueryResult> get_result() = 0;
 
   bool is_sink() const override { return true; }
 
@@ -76,10 +75,9 @@ class sirius_physical_materialized_collector : public sirius_physical_result_col
   /**
    * @brief Fetch the final query result from the result collection
    *
-   * @param[in] state The global sink state (currently unused)
    * @return The query result
    */
-  duckdb::unique_ptr<duckdb::QueryResult> get_result(duckdb::GlobalSinkState& state) override;
+  duckdb::unique_ptr<duckdb::QueryResult> get_result() override;
 
   /**
    * @brief Sink a data batch into the result collection

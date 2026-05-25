@@ -33,7 +33,7 @@ class sirius_physical_sort_partition : public sirius_physical_operator {
  public:
   sirius_physical_sort_partition(sirius_physical_order* order_by);
 
-  sirius_physical_sort_partition(duckdb::vector<duckdb::LogicalType> types,
+  sirius_physical_sort_partition(duckdb::vector<sirius::logical_type> types,
                                  duckdb::vector<duckdb::BoundOrderByNode> orders,
                                  duckdb::vector<std::size_t> projections_p,
                                  std::size_t estimated_cardinality);
@@ -46,9 +46,9 @@ class sirius_physical_sort_partition : public sirius_physical_operator {
   // Source interface
   bool is_source() const override { return true; }
 
-  duckdb::OrderPreservationType source_order() const override
+  sirius::OrderPreservationType source_order() const override
   {
-    return duckdb::OrderPreservationType::FIXED_ORDER;
+    return sirius::OrderPreservationType::FIXED_ORDER;
   }
 
  public:
@@ -66,7 +66,7 @@ class sirius_physical_sort_partition : public sirius_physical_operator {
   //! Get the sample operator
   sirius_physical_sort_sample* get_sample_op() const { return _sample_op; }
 
-  void finalize_operator() override;
+  void on_finalize_operator() override;
 
  private:
   sirius_physical_sort_sample* _sample_op = nullptr;

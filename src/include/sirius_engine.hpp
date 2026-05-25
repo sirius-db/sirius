@@ -24,8 +24,12 @@
 #include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_result_collector.hpp"
+#include "pipeline/pipeline_build_context.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "telemetry-bridge/gen/query.rs.h"
+#include "telemetry-bridge/gen/query_group.rs.h"
+#include "telemetry-bridge/gen/uuid.rs.h"
 
 #include <cucascade/data/data_repository_manager.hpp>
 
@@ -52,9 +56,8 @@ class sirius_engine {
   friend class pipeline::sirius_meta_pipeline;
 
  public:
-  explicit sirius_engine(duckdb::ClientContext& context, sirius_interface& sirius_iface)
-    : context(context), sirius_iface(sirius_iface) {};
-  ~sirius_engine() {}
+  explicit sirius_engine(duckdb::ClientContext& context, sirius_interface& sirius_iface);
+  ~sirius_engine();
 
   duckdb::ClientContext& context;
   sirius_interface& sirius_iface;
@@ -71,17 +74,6 @@ class sirius_engine {
   std::size_t root_pipeline_idx;
   //! The total amount of pipelines in the query
   std::size_t total_pipelines;
-  //! Insert the repository
-  void insert_repository(std::string_view port_id,
-                         duckdb::shared_ptr<pipeline::sirius_pipeline> input_pipeline,
-                         duckdb::shared_ptr<pipeline::sirius_pipeline> dependent_pipeline,
-                         op::MemoryBarrierType barrier_type = op::MemoryBarrierType::FULL);
-  //! Insert the repository
-  void insert_repository(std::string_view port_id,
-                         op::sirius_physical_operator* cur_op,
-                         duckdb::shared_ptr<pipeline::sirius_pipeline> input_pipeline,
-                         duckdb::shared_ptr<pipeline::sirius_pipeline> dependent_pipeline,
-                         op::MemoryBarrierType barrier_type = op::MemoryBarrierType::FULL);
   //! Whether or not the root of the pipeline is a result collector object
   bool has_result_collector();
   //! Returns the query result - can only be used if `HasResultCollector` returns true
@@ -105,7 +97,7 @@ class sirius_engine {
   //! Pre-fetch iceberg table metadata (delete files) for all iceberg scans in the plan.
   //! Must be called from initialize() BEFORE initialize_internal() assigns operator IDs
   //! to pipeline-breaker operators (PARTITION, CONCAT, etc.).
-  void prefetch_iceberg_metadata(op::sirius_physical_operator& plan);
+  void prefetch_iceberg_delete_data(op::sirius_physical_operator& plan);
   //! Create a child pipeline
   duckdb::shared_ptr<pipeline::sirius_pipeline> create_child_pipeline(
     pipeline::sirius_pipeline& current, op::sirius_physical_operator& op);
@@ -122,10 +114,16 @@ class sirius_engine {
   // ---------------------------------------------------------------------------
   // Iceberg metadata cache
   //
-  // Populated by prefetch_iceberg_metadata() in initialize(), BEFORE
+  // Populated by prefetch_iceberg_delete_data() in initialize(), BEFORE
   // initialize_internal() runs.  Keyed by iceberg table path string.
   // ---------------------------------------------------------------------------
-  std::unordered_map<std::string, op::scan::IcebergDeleteFiles> iceberg_metadata_cache_;
+  std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>
+    iceberg_delete_data_cache_;
+
+ private:
+  uuid::UUID query_group_uuid_;
+  rust::Box<quent::query_group::QueryGroupObserver> query_group_observer_;
+  rust::Box<quent::query::QueryHandle> query_handle_;
 };
 
 }  // namespace sirius

@@ -111,11 +111,197 @@ The **destructor** calls `pipeline->mark_task_completed()` to update pipeline co
 
 **`get_output_consumers()`** returns the first operator of each parent pipeline — these downstream operators are scheduled next by the GPU executor.
 
+## Per-task-device contract under SCHED-RR
+
+This section is the authoritative per-task-device contract every operator MUST honor when reading a memory space from one of its input batches under multi-GPU execution.
+
+### Why this contract exists
+
+**Pre-Phase-14 history.** Before Phase 14 (`feat/sched-rr-distribution`) landed, the task scheduler stored its per-GPU executors in a `std::unordered_map<int, std::unique_ptr<gpu_pipeline_executor>>`. The code path in `task_scheduler::management_eventloop` that picked a default GPU for a preference-less task did so via:
+
+```cpp
+int target_device_id = _gpu_executors.begin()->first;
+```
+
+That `begin()` is hash-bucket-ordered — but for any single process it returns the *same* GPU on every call. Every preference-less source-pipeline task (metadata scan, parquet scan with no locality hint) piled onto whichever GPU happened to live in the first hash bucket. The implicit-and-undocumented contract was: "default GPU is `_gpu_executors.begin()->first`."
+
+**Phase 14 SCHED-RR change.** Phase 14 replaced the `unordered_map` with a `std::map<int, std::unique_ptr<gpu_pipeline_executor>>` (deterministic ascending-by-`device_id` iteration), added `std::atomic<size_t> _no_pref_rr_counter{0}`, and inserted a round-robin walk in `management_eventloop` that distributes preference-less tasks across all configured GPUs. Source-pipeline tasks now genuinely land on multiple GPUs within a single query — exactly what an N-GPU configuration is supposed to deliver.
+
+**The hazard this exposes.** Several operators read `valid_batches[0]->get_memory_space()` (or an equivalent expression on a single input batch) as the authoritative target memory space, then perform their concat/merge/sort directly on that space. Pre-Phase-14, this was *accidentally* safe — every batch in the input vector was already on the implicit "default GPU" because every upstream task was dispatched to that same default. Under SCHED-RR, that accident is gone. If an operator reads `batches[0]->get_memory_space()` without a guarantee that *all* batches in the input vector are colocated on that space, it can silently produce wrong results, mis-allocate, or skip data on the other GPU.
+
+The fix is not to patch every read site to detect cross-GPU input. The fix is the upstream contract below: every operator's input batches are colocated by the task scheduler **before** the operator's `execute()` runs, so reading `batches[0]->get_memory_space()` is a SAFE alias for the task's reservation device.
+
+### The contract
+
+> **Every operator's input batches MUST arrive on the task's reservation device.** Operators MUST NOT use `batches[0]->get_memory_space()` as the authoritative target memory space; that read is acceptable only as an alias for `target_space` *after* `prepare_for_processing` has run upstream. New operators that read `get_memory_space()` from a batch they did not themselves construct MUST add an `INVARIANT (SCHED-RR contract)` comment naming the upstream enforcement path (see "For new operator authors" below).
+
+This is a four-layer contract: the scheduler picks `target_space`, the task layer enforces it, the per-batch lock protocol implements it, and the operator layer relies on the postcondition. Each layer is shown below with the source line where it lives.
+
+### How the contract is enforced
+
+**Layer 1 — `gpu_pipeline_task::execute` captures `target_space` from the task's reservation.**
+
+`src/pipeline/gpu_pipeline_task.cpp:310-315`:
+
+```cpp
+auto reservation         = local_state.release_reservation();
+if (!reservation) { throw std::runtime_error("GPU pipeline task requires a memory reservation"); }
+auto reservation_bytes = reservation->size();
+const auto* requested_memory_space =
+  reservation != nullptr ? &reservation->get_memory_space() : nullptr;
+```
+
+The reservation was attached by the GPU executor's manager loop (see [GPU Pipeline Executor](#gpu-pipeline-executor) above) on the SCHED-RR-chosen device. `requested_memory_space` is the authoritative target for every input batch this task will touch.
+
+**Layer 2 — `gpu_pipeline_task::execute` calls `prepare_for_processing` on the operator-data input.**
+
+`src/pipeline/gpu_pipeline_task.cpp:329-332`:
+
+```cpp
+std::optional<std::vector<cucascade::data_batch_processing_handle>> handles_opt;
+try {
+  handles_opt =
+    local_state._input_data.get()->prepare_for_processing(requested_memory_space, stream);
+```
+
+This is the gate. `compute_task(stream)` (line 373) — which iterates the pipeline's operators and calls each one's `execute()` — does not run until `prepare_for_processing` has returned a non-empty `handles_opt`. Every batch in the input vector is colocated on `requested_memory_space` by the time any operator sees it.
+
+**Layer 3 — `pipelineable_operator_data::prepare_for_processing` walks each batch and locks-or-converts it.**
+
+`src/op/sirius_physical_operator.cpp:37-84`:
+
+```cpp
+std::optional<std::vector<::cucascade::data_batch_processing_handle>>
+pipelineable_operator_data::prepare_for_processing(
+  const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
+{
+  std::vector<::cucascade::data_batch_processing_handle> handles;
+  handles.reserve(_data_batches.size());
+
+  for (const auto& batch : _data_batches) {
+    ...
+    handle = pipeline::lock_or_prepare_batch(batch, requested_memory_space, stream);
+    ...
+    handles.emplace_back(std::move(*handle));
+  }
+
+  return handles;
+}
+```
+
+Every batch in `_data_batches` is fed through `lock_or_prepare_batch`. There is no early-exit short-circuit — partial colocation is not possible. Either every batch ends up on `requested_memory_space` or the function returns `std::nullopt` and the task is rescheduled (line 351-353 of `gpu_pipeline_task.cpp`).
+
+**Layer 4 — `lock_or_prepare_batch` does the actual conversion.**
+
+`src/include/pipeline/batch_lock_utils.hpp:48-126`:
+
+```cpp
+inline std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_batch(
+  const std::shared_ptr<cucascade::data_batch>& batch,
+  const cucascade::memory::memory_space* requested_memory_space,
+  rmm::cuda_stream_view stream)
+{
+  ...
+  while (!lock_result.success && lock_result.status == status::memory_space_mismatch) {
+    ...
+    case cucascade::memory::Tier::GPU: {
+      ...
+      batch->convert_to<cucascade::gpu_table_representation>(registry, target_space, stream);
+      ...
+    }
+    ...
+  }
+  ...
+  return std::move(lock_result.handle);
+}
+```
+
+If the batch is already on `target_space`, it is locked in place. If it is on a different GPU, `batch->convert_to<gpu_table_representation>(...)` invokes the cucascade converter registry, which routes the GPU↔GPU path through `cucascade::convert_gpu_to_gpu` (peer-DMA on server hardware, automatic host-staging on consumer hardware whose chipset misreports peer-access support).
+
+**Postcondition.** When `prepare_for_processing` returns successfully, every batch in `_input_data->_data_batches` lives on `requested_memory_space`. Therefore the per-operator expression `batches[0]->get_memory_space() == target_space` holds at every audited read site. Operators that walk every batch and adopt the first non-null batch's space (e.g. `sirius_physical_sort_sample.cpp:112`, `sirius_physical_merge_sort.cpp:92`, `sirius_physical_table_scan.cpp:129`) are safe by the same postcondition.
+
+### The SCHED-RR distribution policy
+
+The contract above is necessary because the scheduler distributes preference-less tasks across multiple GPUs. The distribution policy itself lives in three places.
+
+**Storage: deterministic ordering.** `src/include/pipeline/task_scheduler.hpp:224-228`:
+
+```cpp
+/// device_id -> GPU executor. std::map (not unordered_map) so iteration
+/// order is deterministic (ascending by device_id) — keeps preference-less
+/// task dispatch reproducible across runs.
+std::map<int, std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;
+std::atomic<size_t> _no_pref_rr_counter{0};
+```
+
+`std::map` gives an ascending-by-`device_id` iteration order, which makes `_gpu_executors.begin()` deterministic instead of hash-bucket-dependent and makes `std::advance(it, idx)` walk a fixed sequence.
+
+**Per-query reset.** `src/pipeline/task_scheduler.cpp:156-160`, inside `task_scheduler::prepare_for_query`:
+
+```cpp
+// Reset SCHED-RR counter so the round-robin walk is reproducible across
+// iterations of the same query (cache=table_gpu warm path keys cache
+// entries by device_id; without this reset the second iteration's source
+// tasks would assign to a different GPU and miss the cache entries).
+_no_pref_rr_counter.store(0, std::memory_order_relaxed);
+```
+
+The reset is mandatory for `cache=table_gpu` warm-path correctness. Without it, iteration `N+1` of the same query would dispatch preference-less source tasks to a different starting GPU than iteration `N`, missing the per-device cache populated on iteration `N`. Phase 13 follow-up #17 scale-up test is the regression gate that locks this behavior in.
+
+**Per-task round-robin walk.** `src/pipeline/task_scheduler.cpp:259-265`, inside `management_eventloop`:
+
+```cpp
+if (!have_pref && _gpu_executors.size() > 1) {
+  auto idx = _no_pref_rr_counter.fetch_add(1, std::memory_order_relaxed) %
+             _gpu_executors.size();
+  auto it = _gpu_executors.begin();
+  std::advance(it, idx);
+  target_device_id = it->first;
+}
+```
+
+The walk is gated on `!have_pref && _gpu_executors.size() > 1` so two configurations stay untouched:
+
+- **1-GPU configurations.** The single executor is always picked by the line just above this block (`int target_device_id = _gpu_executors.begin()->first;`).
+- **Preference-bearing tasks.** `SCHED-01/02/04` tasks (data-locality-bearing, e.g. downstream pipeline tasks consuming a specific repository) keep their `preferred_device_id` and skip the round-robin walk entirely. Locality is preserved.
+
+Only *preference-less* source-pipeline tasks (metadata scans, parquet scans with no upstream locality) round-robin across GPUs.
+
+### Migration note (Phase 14)
+
+> **The pre-Phase-14 "default GPU is `_gpu_executors.begin()->first`" behavior is gone.** Any operator that hardcodes single-GPU assumptions, defaults to GPU 0, or uses `batches[0]->get_memory_space()` without going through the lock protocol upstream is now WRONG under SCHED-RR distribution. Phase 15 (cross-GPU operator-colocation audit) verified all 11 known sites; new operators MUST follow the same pattern.
+
+If you are reading older operator code that says "all batches are expected to share the same space in practice" or similar unverified-assumption phrasing, that comment predates the contract and should be replaced with the verified `INVARIANT (SCHED-RR contract)` comment shown below — the original phrasing is exactly the wording the Phase 15 audit removed from `top_n.cpp` (see [empirical evidence](#empirical-evidence) below).
+
+### Empirical evidence
+
+Three pieces of evidence corroborate that the contract holds for every currently-shipping operator:
+
+- **Phase 14 ship-validation** — `[mgpu]` 12/13 PASS, `[TPC-H][parquet]` 22/22 PASS, `[integration][TPC-H]` 48/48 PASS (71608 assertions). The single `[mgpu]` fail is the Phase-12-territory `physical_order - small sort stays single-GPU` `vector::_M_range_check`, fixed on `fix/order-small-sort-rangecheck` and unrelated to operator colocation.
+- **Phase 15 Wave 1 audit** — All 11 operator sites that read `valid_batches[0]->get_memory_space()` (or equivalent) are classified `SAFE` based on upstream-trace through `gpu_pipeline_task::execute -> pipelineable_operator_data::prepare_for_processing -> lock_or_prepare_batch`. See [`.planning/phases/15-mgpu-operator-colocation-audit/15-AUDIT-LOG.md`](../../.planning/phases/15-mgpu-operator-colocation-audit/15-AUDIT-LOG.md) for the per-site classification table and justification.
+- **Phase 15 Wave 2 stress test** — `test/cpp/operator/test_mgpu_stress.cpp` exercises five representative `[mgpu]` queries under 100 distinct `_no_pref_rr_counter` starting offsets (500 inner runs, 77053 assertions), each asserting CPU baseline match via `require_gpu_matches_cpu`. PASS in 86.6s on `2 × RTX 6000 Ada`. Catches hash-bucket-order-dependent bugs and any latent off-by-one that a counter-always-starts-at-0 test would mask.
+
+### For new operator authors
+
+When you write a new `sirius_physical_operator` subclass that calls `get_memory_space()` on any input batch your operator did not itself construct, add an `INVARIANT (SCHED-RR contract)` comment immediately above the call. The audited form (see `src/op/sirius_physical_concat.cpp:193`) is:
+
+```cpp
+// INVARIANT (SCHED-RR contract): all input batches arrive on target_space
+// via gpu_pipeline_task::execute_pipeline_task_round ->
+// pipelineable_operator_data::prepare_for_processing -> lock_or_prepare_batch.
+// See docs/super-sirius/pipeline-execution.md "Per-task-device contract under SCHED-RR".
+cucascade::memory::memory_space* space = valid_batches[0]->get_memory_space();
+```
+
+This makes the upstream-protection assumption explicit and reviewable. The comment is mandatory for any code touching `get_memory_space()` on a batch the operator did not itself construct. If your operator constructs an output batch (e.g. by calling `make_data_batch(table, mem_space, writer_stream)`), reads on *that* output are out of scope — the operator chose its own `mem_space` and is the authority for it.
+
+If you cannot satisfy the contract — for example, your operator legitimately needs to consume input batches from multiple GPUs without going through `pipelineable_operator_data` — then you must explicitly call `lock_or_prepare_batch` per batch yourself, or use `cucascade::convert_gpu_to_gpu` to colocate before reading. Do not assume `batches[0]`'s space is authoritative.
+
 ## Pipeline Executor
 
-**File:** `src/include/pipeline/pipeline_executor.hpp`, `src/pipeline/pipeline_executor.cpp`
+**File:** `src/include/pipeline/task_scheduler.hpp`, `src/pipeline/task_scheduler.cpp`
 
-The `pipeline_executor` is the top-level orchestrator that owns GPU and scan sub-executors.
+The `task_scheduler` is the top-level orchestrator that owns GPU and scan sub-executors.
 
 ### Key Methods
 
@@ -151,14 +337,19 @@ The event loop bridges task creation (which pushes to `_task_queue`) with GPU ex
 
 One `gpu_pipeline_executor` exists per GPU device. It manages a thread pool for executing GPU pipeline tasks.
 
+### Executor Class Hierarchy
+
+All executors (`gpu_pipeline_executor`, `downgrade_executor`, `duckdb_scan_executor`) inherit from `itask_executor`, which provides shared infrastructure: thread pool, task queue, `_running` flag, and `start/stop/schedule/drain_and_wait` lifecycle methods. Subclasses implement `manager_loop()` (required) and optional hooks `get_per_thread_init`, `on_start`, `on_stop`.
+
+Concurrency is managed via `exec::bounded_thread_pool`, which uses a two-phase `reserve() -> pool.dispatch(slot, fn)` model with RAII slot release.
+
 ### Components
 
 | Component | Type | Purpose |
 |-----------|------|---------|
-| `_thread_pool` | `exec::thread_pool` | Worker threads (default: 4), each pinned to GPU device |
+| `_thread_pool` | `exec::bounded_thread_pool` | Worker threads (default: 4), each pinned to GPU device, with slot-based concurrency control |
 | `_task_queue` | `interruptible_mpmc<itask>` | Thread-safe queue for incoming tasks |
 | `_manager_thread` | `std::thread` | Runs `manager_loop()` |
-| `_kiosk` | `exec::kiosk` | Ticket-based semaphore limiting concurrency |
 | `_stream_pool` | `exclusive_stream_pool` | Pool of CUDA streams, one per worker |
 | `_memory_space` | `memory_space*` | GPU memory for making reservations |
 | `_task_request_publisher` | `publisher<task_request>` | Channel to signal pipeline executor |
@@ -169,13 +360,13 @@ One `gpu_pipeline_executor` exists per GPU device. It manages a thread pool for 
 
 ```
 while running:
-    1. kiosk.acquire()                    -- block until a worker is free
+    1. thread_pool.reserve()              -- block until a worker slot is available (RAII)
     2. task_request_publisher.send()      -- tell pipeline executor we can accept work
     3. task_queue.pop()                   -- block until a task is available
     4. memory_space.make_reservation()    -- reserve GPU memory for the task
     5. task.set_reservation(reservation)  -- attach reservation to task
     6. stream_pool.acquire_stream()       -- get a CUDA stream
-    7. thread_pool.schedule(lambda):      -- dispatch to worker
+    7. thread_pool.dispatch(slot, lambda): -- dispatch to worker (slot released on completion)
          a. task.execute(stream)
          b. On OOM: retry (see below)
          c. On success: check query completion
@@ -198,7 +389,7 @@ The completion check happens **before** scheduling downstream tasks to prevent s
 GPU executors communicate with the pipeline executor via `exec::channel<task_request>`:
 
 ```
-gpu_executor → task_request_publisher.send() → pipeline_executor.management_eventloop()
+gpu_executor → task_request_publisher.send() → task_scheduler.management_eventloop()
              ← task_queue.push()              ← task_creator.schedule()
 ```
 
@@ -241,7 +432,7 @@ If max retries are exceeded, the error propagates and terminates the query.
 
 ## Error Handling and Draining
 
-**File:** `src/pipeline/pipeline_executor.cpp`
+**File:** `src/pipeline/task_scheduler.cpp`
 
 `drain_after_error()` performs a multi-stage clean shutdown:
 
@@ -257,8 +448,8 @@ This ensures that when `drain_after_error()` returns, no tasks are referencing o
 
 | File | Purpose |
 |------|---------|
-| `src/include/pipeline/pipeline_executor.hpp` | Top-level executor |
-| `src/pipeline/pipeline_executor.cpp` | Event loop, query lifecycle |
+| `src/include/pipeline/task_scheduler.hpp` | Top-level executor |
+| `src/pipeline/task_scheduler.cpp` | Event loop, query lifecycle |
 | `src/include/pipeline/gpu_pipeline_executor.hpp` | Per-GPU executor |
 | `src/pipeline/gpu_pipeline_executor.cpp` | Manager loop, OOM handling |
 | `src/include/pipeline/gpu_pipeline_task.hpp` | GPU task class |
@@ -268,3 +459,5 @@ This ensures that when `drain_after_error()` returns, no tasks are referencing o
 | `src/include/pipeline/sirius_pipeline.hpp` | Pipeline structure |
 | `src/include/pipeline/sirius_pipeline_itask.hpp` | Task interface |
 | `src/include/pipeline/task_request.hpp` | Executor↔pipeline request |
+| `src/include/exec/bounded_thread_pool.hpp` | Slot-based thread pool with RAII concurrency control |
+| `src/include/parallel/task_executor.hpp` | `itask_executor` base class for all executors |

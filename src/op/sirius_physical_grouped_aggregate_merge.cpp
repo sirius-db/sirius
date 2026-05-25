@@ -15,6 +15,7 @@
  */
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 
+#include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
@@ -29,38 +30,10 @@
 namespace sirius {
 namespace op {
 
-static duckdb::vector<duckdb::LogicalType> create_group_chunk_types(
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& groups)
-{
-  duckdb::set<std::size_t> group_indices;
-
-  if (groups.empty()) { return {}; }
-
-  for (auto& group : groups) {
-    D_ASSERT(group->type == duckdb::ExpressionType::BOUND_REF);
-    auto& bound_ref = group->Cast<duckdb::BoundReferenceExpression>();
-    group_indices.insert(bound_ref.index);
-  }
-  std::size_t highest_index = *group_indices.rbegin();
-  duckdb::vector<duckdb::LogicalType> types(highest_index + 1, duckdb::LogicalType::SQLNULL);
-  for (auto& group : groups) {
-    auto& bound_ref        = group->Cast<duckdb::BoundReferenceExpression>();
-    types[bound_ref.index] = bound_ref.return_type;
-  }
-  return types;
-}
-
-// Helper to deep copy a vector of Expression unique_ptrs
-static duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> copy_expressions(
-  const duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& src)
-{
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> result;
-  result.reserve(src.size());
-  for (const auto& expr : src) {
-    result.push_back(expr->Copy());
-  }
-  return result;
-}
+// Helpers create_group_chunk_types / copy_expressions were used by the original grouping-sets
+// initialization path (now dead) and by the merge clone-from-parent ctor (which now takes pre-
+// converted cuDF definitions instead of DuckDB expressions). Both helpers have no remaining
+// callers in Super Sirius and have been removed.
 
 // Helper to convert vector<vector<idx_t>> to vector<unsafe_vector<idx_t>>
 static duckdb::vector<duckdb::unsafe_vector<std::size_t>> convert_grouping_functions(
@@ -94,7 +67,7 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
 }
 
 sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
-  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<sirius::logical_type> types,
   std::vector<int> group_idx,
   std::vector<cudf::aggregation::Kind> cudf_aggregates,
   std::vector<int> cudf_aggregate_idx,
@@ -117,9 +90,9 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
 
 sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
   duckdb::ClientContext& context,
-  duckdb::vector<duckdb::LogicalType> types,
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups_p,
+  duckdb::vector<sirius::logical_type> types,
+  duckdb::vector<sirius::expression> expressions,
+  duckdb::vector<sirius::expression> groups_p,
   std::size_t estimated_cardinality)
   : sirius_physical_grouped_aggregate_merge(context,
                                             std::move(types),
@@ -141,15 +114,15 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
 // the groupby expressions (groups_p) for each grouping_sets. The first level of the vector is the
 // grouping set and the second level is the indexes to the groupby expression for that set.
 sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
-  duckdb::ClientContext& context,
-  duckdb::vector<duckdb::LogicalType> types,
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups_p,
+  duckdb::ClientContext& /*context*/,
+  duckdb::vector<sirius::logical_type> types,
+  duckdb::vector<sirius::expression> expressions,
+  duckdb::vector<sirius::expression> groups_p,
   duckdb::vector<duckdb::GroupingSet> grouping_sets_p,
-  duckdb::vector<duckdb::unsafe_vector<std::size_t>> grouping_functions_p,
+  duckdb::vector<duckdb::unsafe_vector<std::size_t>> /*grouping_functions_p*/,
   std::size_t estimated_cardinality,
-  duckdb::TupleDataValidityType group_validity,
-  duckdb::TupleDataValidityType distinct_validity)
+  duckdb::TupleDataValidityType /*group_validity*/,
+  duckdb::TupleDataValidityType /*distinct_validity*/)
   : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::MERGE_GROUP_BY, std::move(types), estimated_cardinality),
     grouping_sets(std::move(grouping_sets_p))
@@ -172,10 +145,10 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next
   std::lock_guard<std::mutex> lg(lock);
   if (current_partition_index < ports.begin()->second->repo->num_partitions()) {
     std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
-    bool found_batch = true;
+    bool found_batch       = true;
+    auto this_partition_id = current_partition_index;
     while (found_batch) {
-      auto batch = ports.begin()->second->repo->pop_data_batch(
-        ::cucascade::batch_state::task_created, current_partition_index);
+      auto batch = ports.begin()->second->repo->pop_next_data_batch(current_partition_index);
       if (batch) {
         input_batch.push_back(std::move(batch));
       } else {
@@ -184,7 +157,11 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next
     }
     current_partition_index++;
     if (input_batch.empty()) { return nullptr; }
-    return std::make_unique<pipelineable_operator_data>(input_batch);
+    // Tag with the source partition index so the scheduler pins this task to
+    // partition_idx % num_gpus. merge_group_by materializes a cuco hash table
+    // to combine its input batches, so — like hash_join — every task of a
+    // given partition must stay on a single GPU.
+    return std::make_unique<partitioned_operator_data>(std::move(input_batch), this_partition_id);
   } else {
     return nullptr;
   }
@@ -195,7 +172,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_grouped_aggregate_merge::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_data_batches();
+  const auto& input_batches = input.get_read_only_batches();
   if (input_batches.size() == 0) {
     throw std::runtime_error(
       "We expect at least one input batch for grouped aggregate merge operator");
@@ -203,19 +180,19 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
 
   // Fast path: single batch with no post-processing needed
   if (input_batches.size() == 1 && !has_avg && !has_count_distinct) {
-    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
+    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
   }
 
   // Merge multiple batches, or use single batch directly if only one
   std::shared_ptr<::cucascade::data_batch> merged;
   if (input_batches.size() == 1) {
-    merged = input_batches[0];
+    merged = input_batches[0].clone(sirius::get_next_batch_id(), stream);
   } else {
     merged = gpu_merge_impl::merge_grouped_aggregate(input_batches,
                                                      group_idx.size(),
                                                      cudf_aggregates,
                                                      stream,
-                                                     *input_batches[0]->get_memory_space());
+                                                     *input_batches[0].get_memory_space());
   }
 
   // If no post-processing needed, return merged result directly
@@ -226,10 +203,12 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
 
   // Post-merge projection: handle AVG (SUM/COUNT) and COUNT DISTINCT (list element count).
   // Release ownership of the merged table's columns so we can move (not copy) them.
-  auto* space        = merged->get_memory_space();
+  // Acquire EXCLUSIVE lock since release_table() is a mutating operation
+  auto merged_mut    = merged->to_mutable();
+  auto* space        = merged_mut.get_memory_space();
   auto mr            = space->get_default_allocator();
-  auto& gpu_rep      = merged->get_data()->cast<cucascade::gpu_table_representation>();
-  auto merged_cols   = gpu_rep.release_table()->release();
+  auto& gpu_rep      = merged_mut.get_data()->cast<cucascade::gpu_table_representation>();
+  auto merged_cols   = gpu_rep.release_table(stream)->release();
   int num_group_cols = static_cast<int>(group_idx.size());
 
   std::vector<std::unique_ptr<cudf::column>> output_cols;
@@ -249,9 +228,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
       auto count_view = merged_cols[count_col_idx]->view();
 
       std::unique_ptr<cudf::column> avg_col;
-      bool is_decimal = (slot.output_type.id() == cudf::type_id::DECIMAL32 ||
-                         slot.output_type.id() == cudf::type_id::DECIMAL64 ||
-                         slot.output_type.id() == cudf::type_id::DECIMAL128);
+      bool is_decimal = sirius::IsCudfTypeDecimal(slot.output_type);
       if (is_decimal) {
         // DECIMAL: divide directly in fixed-point to preserve precision
         avg_col = cudf::binary_operation(
@@ -287,7 +264,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   }
 
   auto output_table = std::make_unique<cudf::table>(std::move(output_cols), stream, mr);
-  auto result       = sirius::make_data_batch(std::move(output_table), *space);
+  auto result       = sirius::make_data_batch(std::move(output_table), *space, stream);
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<::cucascade::data_batch>>{result});
 }

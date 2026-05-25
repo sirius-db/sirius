@@ -16,9 +16,16 @@
 
 #pragma once
 
+// sirius
+#include <helper/logical_type.hpp>
+
 // duckdb
 #include <duckdb/common/types.hpp>
 #include <duckdb/planner/table_filter.hpp>
+
+// standard library
+#include <optional>
+#include <unordered_set>
 
 namespace sirius::op {
 
@@ -34,21 +41,31 @@ namespace sirius::op {
  * When projection_ids is empty, every column_ids entry maps to its own index.
  *
  * Returns a vector of size column_ids_count where:
- *   result[i] = batch position of column_ids[i], or idx_t(-1) if not projected.
+ *   result[i] = batch position of column_ids[i], or nullopt if the column is not in the batch.
  */
-std::vector<duckdb::idx_t> build_batch_column_map(
-  const duckdb::vector<duckdb::idx_t>& projection_ids, duckdb::idx_t column_ids_count);
+std::vector<std::optional<std::size_t>> build_batch_column_map(
+  const duckdb::vector<duckdb::idx_t>& projection_ids, std::size_t column_ids_count);
 
 /**
  * @brief Convert a DuckDB TableFilterSet into a single bound DuckDB expression (conjunction of
  * all filters), suitable for passing to gpu_expression_translator::translate_expression().
  *
- * Returns nullptr if the filter set is empty or contains only unsupported filter types.
+ * @p batch_position_by_column_id is the canonical column_ids → batch-position map, with @c nullopt
+ * for columns that are not present in the batch (e.g. unprojected columns or hive partitions).
+ *
+ * Filters whose column's primary index is in @p skip_primary_indices are omitted. Parquet scans
+ * pass the hive-partition primary-index set here: partition columns don't exist in the parquet
+ * file, so pushing a filter that references one crashes libcudf's reader. DuckDB already applies
+ * partition filters at the file-list level when hive_partitioning is enabled, so dropping them
+ * here is safe.
+ *
+ * Returns nullptr if the filter set is empty or contains only unsupported/skipped filter types.
  */
 duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
   const duckdb::TableFilterSet& filters,
   const duckdb::vector<duckdb::ColumnIndex>& column_ids,
-  const duckdb::vector<duckdb::LogicalType>& returned_types,
-  const std::vector<duckdb::idx_t>& batch_column_map);
+  const duckdb::vector<sirius::logical_type>& returned_types,
+  const std::vector<std::optional<std::size_t>>& batch_position_by_column_id,
+  const std::unordered_set<std::size_t>& skip_primary_indices = {});
 
 }  // namespace sirius::op

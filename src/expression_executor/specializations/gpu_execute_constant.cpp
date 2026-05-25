@@ -14,91 +14,183 @@
  * limitations under the License.
  */
 
-#include "duckdb/common/exception.hpp"
-#include "duckdb/planner/expression/bound_constant_expression.hpp"
-#include "expression_executor/gpu_expression_executor.hpp"
-#include "expression_executor/gpu_expression_executor_state.hpp"
+// sirius
+#include <expression_executor/gpu_expression_executor.hpp>
+#include <sirius/exception.hpp>
 
+// duckdb
+#include <duckdb/common/exception.hpp>
+#include <duckdb/planner/expression/bound_constant_expression.hpp>
+
+// cudf
+#include <cudf/ast/expressions.hpp>
+#include <cudf/cudf_utils.hpp>
+#include <cudf/fixed_point/fixed_point.hpp>
+#include <cudf/types.hpp>
+#include <cudf/wrappers/timestamps.hpp>
+
+// rmm
 #include <rmm/cuda_stream_view.hpp>
 
-#include <type_traits>
+namespace {
+using execute_result = ::sirius::gpu_expression_executor::execute_result;
+using ast_node       = ::sirius::gpu_expression_executor::ast_result;
+using execution_mode = ::sirius::gpu_expression_executor::execution_mode;
 
-namespace duckdb {
-namespace sirius {
-
-std::unique_ptr<GpuExpressionState> GpuExpressionExecutor::InitializeState(
-  const BoundConstantExpression& expr, GpuExpressionExecutorState& root)
+template <typename T>
+execute_result make_execute_result_from_scalar(
+  cudf::ast::tree& ast_tree,
+  std::vector<std::unique_ptr<cudf::scalar>>& temp_scalars,
+  T device_scalar,
+  execution_mode mode)
 {
-  return std::make_unique<GpuExpressionState>(expr, root);
+  if (mode == execution_mode::AST) {
+    auto const& expr_ref       = ast_tree.emplace<cudf::ast::literal>(*device_scalar);
+    auto const temp_scalar_idx = temp_scalars.size();
+    temp_scalars.push_back(std::move(device_scalar));
+    return execute_result(ast_node(expr_ref, {temp_scalar_idx}, std::vector<std::size_t>{}));
+  }
+  return execute_result(std::move(device_scalar));
 }
 
-// Helper template functor to reduce bloat
-template <typename T>
-struct MakeColumnFromConstant {
-  static std::unique_ptr<cudf::column> Do(const BoundConstantExpression& expr,
-                                          cudf::size_type count,
-                                          rmm::device_async_resource_ref mr,
-                                          rmm::cuda_stream_view stream)
-  {
-    if constexpr (std::is_same<T, std::string>()) {
-      cudf::string_scalar scalar(expr.value.GetValue<std::string>(), true, stream, mr);
-      return cudf::make_column_from_scalar(scalar, count, stream, mr);
-    } else if constexpr (std::is_same_v<T, numeric::decimal32> ||
-                         std::is_same_v<T, numeric::decimal64>) {
-      auto type = expr.value.type();
-      if (type.id() != LogicalTypeId::DECIMAL) {
-        throw InternalException("Invalid duckdb type for decimal constant: %d",
-                                static_cast<int>(type.id()));
-      }
-      // cudf decimal type uses negative scale
-      auto scalar = cudf::fixed_point_scalar<T>(expr.value.GetValueUnsafe<typename T::rep>(),
-                                                numeric::scale_type{-DecimalType::GetScale(type)},
-                                                true,
-                                                stream,
-                                                mr);
-      return cudf::make_column_from_scalar(scalar, count, stream, mr);
-    } else {
-      auto scalar = cudf::numeric_scalar<T>(expr.value.GetValue<T>(), true, stream, mr);
-      return cudf::make_column_from_scalar(scalar, count, stream, mr);
-    }
-  }
-};
+}  // namespace
 
-std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundConstantExpression& expr,
-                                                             GpuExpressionState* state)
+namespace sirius {
+using execute_result = gpu_expression_executor::execute_result;
+
+execute_result gpu_expression_executor::execute(duckdb::BoundConstantExpression const& expr,
+                                                execution_mode mode)
 {
-  D_ASSERT(expr.value.type() == expr.return_type);
+  assert(expr.value.type() == expr.return_type);
 
-  // In many cases, this column materialization is pruned away
-  auto cudf_type = GetCudfType(expr.return_type);
+  auto const cudf_type = duckdb::GetCudfType(expr.value.type());
+  bool const is_valid  = !expr.value.IsNull();
+
   switch (cudf_type.id()) {
-    case cudf::type_id::INT16:
-      return MakeColumnFromConstant<int16_t>::Do(expr, input_count, resource_ref, execution_stream);
-    case cudf::type_id::INT32:
-      return MakeColumnFromConstant<int32_t>::Do(expr, input_count, resource_ref, execution_stream);
-    case cudf::type_id::INT64:
-      return MakeColumnFromConstant<int64_t>::Do(expr, input_count, resource_ref, execution_stream);
-    case cudf::type_id::FLOAT32:
-      return MakeColumnFromConstant<float_t>::Do(expr, input_count, resource_ref, execution_stream);
-    case cudf::type_id::FLOAT64:
-      return MakeColumnFromConstant<double_t>::Do(
-        expr, input_count, resource_ref, execution_stream);
-    case cudf::type_id::BOOL8:
-      return MakeColumnFromConstant<bool>::Do(expr, input_count, resource_ref, execution_stream);
-    case cudf::type_id::STRING:
-      return MakeColumnFromConstant<std::string>::Do(
-        expr, input_count, resource_ref, execution_stream);
-    case cudf::type_id::DECIMAL32:
-      return MakeColumnFromConstant<numeric::decimal32>::Do(
-        expr, input_count, resource_ref, execution_stream);
-    case cudf::type_id::DECIMAL64:
-      return MakeColumnFromConstant<numeric::decimal64>::Do(
-        expr, input_count, resource_ref, execution_stream);
+    case cudf::type_id::INT8: {
+      auto scalar = std::make_unique<cudf::numeric_scalar<int8_t>>(
+        is_valid ? expr.value.GetValue<int8_t>() : int8_t{}, is_valid, _stream, _mr);
+      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+    }
+    case cudf::type_id::INT16: {
+      auto scalar = std::make_unique<cudf::numeric_scalar<int16_t>>(
+        is_valid ? expr.value.GetValue<int16_t>() : int16_t{}, is_valid, _stream, _mr);
+      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+    }
+    case cudf::type_id::INT32: {
+      auto scalar = std::make_unique<cudf::numeric_scalar<int32_t>>(
+        is_valid ? expr.value.GetValue<int32_t>() : int32_t{}, is_valid, _stream, _mr);
+      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+    }
+    case cudf::type_id::INT64: {
+      auto scalar = std::make_unique<cudf::numeric_scalar<int64_t>>(
+        is_valid ? expr.value.GetValue<int64_t>() : int64_t{}, is_valid, _stream, _mr);
+      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+    }
+    case cudf::type_id::UINT8: {
+      auto scalar = std::make_unique<cudf::numeric_scalar<uint8_t>>(
+        is_valid ? expr.value.GetValue<uint8_t>() : uint8_t{}, is_valid, _stream, _mr);
+      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+    }
+    case cudf::type_id::UINT16: {
+      auto scalar = std::make_unique<cudf::numeric_scalar<uint16_t>>(
+        is_valid ? expr.value.GetValue<uint16_t>() : uint16_t{}, is_valid, _stream, _mr);
+      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+    }
+    case cudf::type_id::UINT32: {
+      auto scalar = std::make_unique<cudf::numeric_scalar<uint32_t>>(
+        is_valid ? expr.value.GetValue<uint32_t>() : uint32_t{}, is_valid, _stream, _mr);
+      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+    }
+    case cudf::type_id::UINT64: {
+      auto scalar = std::make_unique<cudf::numeric_scalar<uint64_t>>(
+        is_valid ? expr.value.GetValue<uint64_t>() : uint64_t{}, is_valid, _stream, _mr);
+      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+    }
+    case cudf::type_id::FLOAT32: {
+      auto scalar = std::make_unique<cudf::numeric_scalar<float_t>>(
+        is_valid ? expr.value.GetValue<float_t>() : float_t{}, is_valid, _stream, _mr);
+      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+    }
+    case cudf::type_id::FLOAT64: {
+      auto scalar = std::make_unique<cudf::numeric_scalar<double_t>>(
+        is_valid ? expr.value.GetValue<double_t>() : double_t{}, is_valid, _stream, _mr);
+      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+    }
+    case cudf::type_id::BOOL8: {
+      auto scalar = std::make_unique<cudf::numeric_scalar<bool>>(
+        is_valid ? expr.value.GetValue<bool>() : false, is_valid, _stream, _mr);
+      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+    }
+    case cudf::type_id::TIMESTAMP_DAYS: {
+      auto scalar = std::make_unique<cudf::timestamp_scalar<cudf::timestamp_D>>(
+        cudf::duration_D{is_valid ? expr.value.GetValue<duckdb::date_t>().days : 0},
+        is_valid,
+        _stream,
+        _mr);
+      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+    }
+    case cudf::type_id::TIMESTAMP_SECONDS: {
+      auto scalar = std::make_unique<cudf::timestamp_scalar<cudf::timestamp_s>>(
+        cudf::duration_s{is_valid ? expr.value.GetValue<duckdb::timestamp_sec_t>().value : 0},
+        is_valid,
+        _stream,
+        _mr);
+      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+    }
+    case cudf::type_id::TIMESTAMP_MILLISECONDS: {
+      auto scalar = std::make_unique<cudf::timestamp_scalar<cudf::timestamp_ms>>(
+        cudf::duration_ms{is_valid ? expr.value.GetValue<duckdb::timestamp_ms_t>().value : 0},
+        is_valid,
+        _stream,
+        _mr);
+      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+    }
+    case cudf::type_id::TIMESTAMP_MICROSECONDS: {
+      auto scalar = std::make_unique<cudf::timestamp_scalar<cudf::timestamp_us>>(
+        cudf::duration_us{is_valid ? expr.value.GetValue<duckdb::timestamp_tz_t>().value : 0},
+        is_valid,
+        _stream,
+        _mr);
+      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+    }
+    case cudf::type_id::TIMESTAMP_NANOSECONDS: {
+      auto scalar = std::make_unique<cudf::timestamp_scalar<cudf::timestamp_ns>>(
+        cudf::duration_ns{is_valid ? expr.value.GetValue<duckdb::timestamp_ns_t>().value : 0},
+        is_valid,
+        _stream,
+        _mr);
+      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+    }
+    case cudf::type_id::DECIMAL32: {
+      auto const scale = numeric::scale_type{-duckdb::DecimalType::GetScale(expr.return_type)};
+      auto scalar      = std::make_unique<cudf::fixed_point_scalar<numeric::decimal32>>(
+        expr.value.GetValueUnsafe<numeric::decimal32::rep>(), scale, is_valid, _stream, _mr);
+      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+    }
+    case cudf::type_id::DECIMAL64: {
+      auto const scale = numeric::scale_type{-duckdb::DecimalType::GetScale(expr.return_type)};
+      auto scalar      = std::make_unique<cudf::fixed_point_scalar<numeric::decimal64>>(
+        expr.value.GetValueUnsafe<numeric::decimal64::rep>(), scale, is_valid, _stream, _mr);
+      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+    }
+    case cudf::type_id::DECIMAL128: {
+      auto const scale = numeric::scale_type{-duckdb::DecimalType::GetScale(expr.return_type)};
+      duckdb::hugeint_t hugeint_value = expr.value.GetValueUnsafe<duckdb::hugeint_t>();
+      __int128_t int128_value = (__int128_t(hugeint_value.upper) << 64) | hugeint_value.lower;
+      auto scalar             = std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(
+        int128_value, scale, is_valid, _stream, _mr);
+      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+    }
+    case cudf::type_id::STRING: {
+      auto scalar = std::make_unique<cudf::string_scalar>(
+        is_valid ? expr.value.GetValue<std::string>() : std::string{}, is_valid, _stream, _mr);
+      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+    }
     default:
-      throw InternalException("Execute[Constant]: Unknown cudf type: %d",
-                              static_cast<int>(cudf_type.id()));
+      throw not_implemented_exception("[gpu_expression_executor] Unsupported scalar type: %s",
+                                      expr.return_type.ToString());
   }
 }
 
 }  // namespace sirius
-}  // namespace duckdb

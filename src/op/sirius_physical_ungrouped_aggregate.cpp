@@ -21,8 +21,10 @@
 #include "duckdb/common/types/decimal.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "expression/expression_internal.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
+#include "sirius/exception.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
@@ -48,19 +50,17 @@ namespace sirius {
 namespace op {
 
 sirius_physical_ungrouped_aggregate::sirius_physical_ungrouped_aggregate(
-  duckdb::vector<duckdb::LogicalType> types,
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
+  duckdb::vector<sirius::logical_type> types,
+  duckdb::vector<sirius::expression> expressions,
   std::size_t estimated_cardinality,
-  duckdb::TupleDataValidityType distinct_validity)
+  duckdb::TupleDataValidityType /*distinct_validity*/)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE, std::move(types), estimated_cardinality),
     aggregates(std::move(expressions))
 {
-  distinct_collection_info = duckdb::DistinctAggregateCollectionInfo::Create(aggregates);
-  // aggregation_result       = duckdb::make_shared_ptr<GPUIntermediateRelation>(aggregates.size());
-  if (!distinct_collection_info) { return; }
-  distinct_data =
-    duckdb::make_uniq<duckdb::DistinctAggregateData>(*distinct_collection_info, distinct_validity);
+  // Sirius's GPU aggregate path does not support DISTINCT aggregates — see the throw in
+  // build_aggregate_layout. DistinctAggregateCollectionInfo / DistinctAggregateData are not
+  // wired into any subsequent code path here, so we skip populating them.
 }
 
 namespace {
@@ -109,20 +109,19 @@ struct aggregate_layout {
   bool has_avg = false;
 };
 
-aggregate_layout build_aggregate_layout(
-  const duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& aggregates)
+aggregate_layout build_aggregate_layout(const duckdb::vector<sirius::expression>& aggregates)
 {
   aggregate_layout layout;
   size_t local_idx = 0;
   layout.aggregates.reserve(aggregates.size());
 
   for (size_t i = 0; i < aggregates.size(); ++i) {
-    auto& agg = aggregates[i]->Cast<duckdb::BoundAggregateExpression>();
+    auto& agg = sirius::unwrap(aggregates[i])->Cast<duckdb::BoundAggregateExpression>();
     if (agg.IsDistinct()) {
-      throw duckdb::NotImplementedException("Distinct aggregates not supported in GPU path yet");
+      throw not_implemented_exception("Distinct aggregates not supported in GPU path yet");
     }
     if (agg.children.size() > 1) {
-      throw duckdb::NotImplementedException("Aggregates with multiple children not supported yet");
+      throw not_implemented_exception("Aggregates with multiple children not supported yet");
     }
 
     aggregate_spec spec;
@@ -141,7 +140,7 @@ aggregate_layout build_aggregate_layout(
       layout.merge_nth_index.push_back(std::nullopt);
     } else if (fname == "count") {
       if (agg.children.empty()) {
-        throw duckdb::NotImplementedException("count() without arguments not supported");
+        throw not_implemented_exception("count() without arguments not supported");
       }
       spec.kind          = aggregate_kind::COUNT;
       spec.return_type   = duckdb::LogicalType::BIGINT;
@@ -152,7 +151,7 @@ aggregate_layout build_aggregate_layout(
       layout.merge_nth_index.push_back(std::nullopt);
     } else if (fname == "sum" || fname == "sum_no_overflow") {
       if (agg.children.empty()) {
-        throw duckdb::NotImplementedException("sum() without arguments not supported");
+        throw not_implemented_exception("sum() without arguments not supported");
       }
       spec.kind          = aggregate_kind::SUM;
       spec.input_idx     = agg.children[0]->Cast<duckdb::BoundReferenceExpression>().index;
@@ -162,7 +161,7 @@ aggregate_layout build_aggregate_layout(
       layout.merge_nth_index.push_back(std::nullopt);
     } else if (fname == "min") {
       if (agg.children.empty()) {
-        throw duckdb::NotImplementedException("min() without arguments not supported");
+        throw not_implemented_exception("min() without arguments not supported");
       }
       spec.kind          = aggregate_kind::MIN;
       spec.input_idx     = agg.children[0]->Cast<duckdb::BoundReferenceExpression>().index;
@@ -172,7 +171,7 @@ aggregate_layout build_aggregate_layout(
       layout.merge_nth_index.push_back(std::nullopt);
     } else if (fname == "max") {
       if (agg.children.empty()) {
-        throw duckdb::NotImplementedException("max() without arguments not supported");
+        throw not_implemented_exception("max() without arguments not supported");
       }
       spec.kind          = aggregate_kind::MAX;
       spec.input_idx     = agg.children[0]->Cast<duckdb::BoundReferenceExpression>().index;
@@ -182,7 +181,7 @@ aggregate_layout build_aggregate_layout(
       layout.merge_nth_index.push_back(std::nullopt);
     } else if (fname == "avg") {
       if (agg.children.empty()) {
-        throw duckdb::NotImplementedException("avg() without arguments not supported");
+        throw not_implemented_exception("avg() without arguments not supported");
       }
       spec.kind          = aggregate_kind::AVG;
       spec.input_idx     = agg.children[0]->Cast<duckdb::BoundReferenceExpression>().index;
@@ -203,7 +202,7 @@ aggregate_layout build_aggregate_layout(
       layout.merge_kinds.push_back(cudf::aggregation::Kind::NTH_ELEMENT);
       layout.merge_nth_index.push_back(0);  // first element
     } else {
-      throw duckdb::NotImplementedException("Aggregate not supported: " + fname);
+      throw not_implemented_exception("Aggregate not supported: " + fname);
     }
 
     layout.aggregates.push_back(std::move(spec));
@@ -232,9 +231,7 @@ std::unique_ptr<cudf::column> make_avg_column(const cudf::column_view& sum_view,
   // The sum column type may differ from the return type (e.g., sum is DECIMAL64 but
   // DuckDB's avg return type is DOUBLE).
   long double sum_host = 0.0L;
-  bool sum_is_decimal =
-    (sum_type.id() == cudf::type_id::DECIMAL32 || sum_type.id() == cudf::type_id::DECIMAL64 ||
-     sum_type.id() == cudf::type_id::DECIMAL128);
+  bool sum_is_decimal  = sirius::IsCudfTypeDecimal(sum_type);
   if (sum_is_decimal) {
     auto denom = std::pow(10.0L, static_cast<long double>(-sum_type.scale()));
     switch (sum_type.id()) {
@@ -269,7 +266,7 @@ std::unique_ptr<cudf::column> make_avg_column(const cudf::column_view& sum_view,
       case cudf::type_id::INT64:
         sum_host = scalar_cast<cudf::numeric_scalar<int64_t>>(*sum_value).value();
         break;
-      default: throw duckdb::NotImplementedException("AVG: unsupported sum column type");
+      default: throw not_implemented_exception("AVG: unsupported sum column type");
     }
   }
 
@@ -313,7 +310,7 @@ std::unique_ptr<cudf::column> make_avg_column(const cudf::column_view& sum_view,
         out_scalar = make_numeric_scalar_with_value<int32_t>(
           out_cudf_type, static_cast<int32_t>(avg_host), stream);
         break;
-      default: throw duckdb::NotImplementedException("AVG: unsupported return type");
+      default: throw not_implemented_exception("AVG: unsupported return type");
     }
   }
 
@@ -327,7 +324,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_data_batches();
+  const auto& input_batches = input.get_read_only_batches();
   if (aggregates.empty()) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
@@ -338,12 +335,10 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
   outputs.reserve(input_batches.size());
 
   for (auto const& batch : input_batches) {
-    if (!batch) { continue; }
-    auto* space = batch->get_memory_space();
+    auto* space = batch.get_memory_space();
     if (!space) { continue; }
 
-    auto& table = batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
-    auto view   = table.view();
+    auto view = batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
 
     std::vector<std::unique_ptr<cudf::column>> cols;
     cols.reserve(layout.local_types.size());
@@ -395,9 +390,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
           // cuDF requires output type == input type for fixed-point (decimal) reductions.
           // For AVG we use input type and apply return type in the merge step (SUM/COUNT).
           // For SUM we widen (expected by duckdb) before the aggregation to avoid overflow.
-          bool is_decimal = (col.type().id() == cudf::type_id::DECIMAL32 ||
-                             col.type().id() == cudf::type_id::DECIMAL64 ||
-                             col.type().id() == cudf::type_id::DECIMAL128);
+          bool is_decimal = sirius::IsCudfTypeDecimal(col.type());
 
           std::unique_ptr<cudf::column> casted_col;
           if (spec.kind == aggregate_kind::SUM) {
@@ -439,23 +432,27 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
     }
 
     auto out_table = std::make_unique<cudf::table>(std::move(cols), stream);
-    std::unique_ptr<cucascade::idata_representation> output_data =
-      std::make_unique<cucascade::gpu_table_representation>(std::move(out_table), *space);
-    auto const batch_id = ::sirius::get_next_batch_id();
+    // STREAM-LINEAGE: cudf::table ctor + cudf::make_column_from_scalar wrote
+    // on `stream`; the constructor records the writer event for downstream
+    // cross-device readers.
+    auto out_repr =
+      std::make_unique<cucascade::gpu_table_representation>(std::move(out_table), *space, stream);
+    std::unique_ptr<cucascade::idata_representation> output_data = std::move(out_repr);
+    auto const batch_id                                          = ::sirius::get_next_batch_id();
     outputs.push_back(std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data)));
   }
 
   return std::make_unique<pipelineable_operator_data>(outputs);
 }
 
-// Helper to deep copy Expression vector (same as in grouped_aggregate)
-static duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> copy_expressions(
-  const duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& src)
+// Helper to deep copy the wrapped aggregate expressions (used by the merge overload below).
+static duckdb::vector<sirius::expression> copy_expressions(
+  const duckdb::vector<sirius::expression>& src)
 {
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> result;
+  duckdb::vector<sirius::expression> result;
   result.reserve(src.size());
   for (const auto& expr : src) {
-    result.push_back(expr->Copy());
+    result.push_back(sirius::wrap(sirius::unwrap(expr)->Copy()));
   }
   return result;
 }
@@ -472,43 +469,33 @@ sirius_physical_ungrouped_aggregate_merge::sirius_physical_ungrouped_aggregate_m
 }
 
 sirius_physical_ungrouped_aggregate_merge::sirius_physical_ungrouped_aggregate_merge(
-  duckdb::vector<duckdb::LogicalType> types,
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
+  duckdb::vector<sirius::logical_type> types,
+  duckdb::vector<sirius::expression> expressions,
   std::size_t estimated_cardinality,
-  duckdb::TupleDataValidityType distinct_validity)
+  duckdb::TupleDataValidityType /*distinct_validity*/)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::MERGE_AGGREGATE, std::move(types), estimated_cardinality),
     aggregates(std::move(expressions))
 {
-  distinct_collection_info = duckdb::DistinctAggregateCollectionInfo::Create(aggregates);
-  // aggregation_result       = duckdb::make_shared_ptr<GPUIntermediateRelation>(aggregates.size());
-  if (!distinct_collection_info) { return; }
-  distinct_data =
-    duckdb::make_uniq<duckdb::DistinctAggregateData>(*distinct_collection_info, distinct_validity);
 }
 
 std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate_merge::execute"};
-  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_data_batches();
+  auto& input        = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  auto input_batches = input.get_read_only_batches();
   if (aggregates.empty()) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
-  std::vector<std::shared_ptr<cucascade::data_batch>> valid_batches;
-  valid_batches.reserve(input_batches.size());
-  for (auto const& batch : input_batches) {
-    if (batch) { valid_batches.push_back(batch); }
-  }
-  if (valid_batches.empty()) {
+  if (input_batches.empty()) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
-  cucascade::memory::memory_space* space = valid_batches[0]->get_memory_space();
+  cucascade::memory::memory_space* space = input_batches[0].get_memory_space();
   if (space == nullptr) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
@@ -516,11 +503,11 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
 
   auto layout = build_aggregate_layout(aggregates);
   std::shared_ptr<cucascade::data_batch> merged_batch;
-  if (valid_batches.size() == 1) {
-    merged_batch = valid_batches[0];
+  if (input_batches.size() == 1) {
+    merged_batch = cucascade::data_batch::to_idle(std::move(input_batches[0]));
   } else {
     merged_batch = gpu_merge_impl::merge_ungrouped_aggregate(
-      valid_batches, layout.merge_kinds, layout.merge_nth_index, stream, *space);
+      input_batches, layout.merge_kinds, layout.merge_nth_index, stream, *space);
   }
 
   if (!layout.has_avg) {
@@ -528,9 +515,10 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
       std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(merged_batch)});
   }
 
-  auto& merged_table =
-    merged_batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
-  auto merged_view = merged_table.view();
+  // Acquire read access to merged batch to extract table
+  auto merged_ro = merged_batch->to_read_only();
+  auto merged_view =
+    merged_ro.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
 
   std::vector<std::unique_ptr<cudf::column>> output_cols;
   output_cols.reserve(layout.aggregates.size());
@@ -548,10 +536,14 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
 
   auto out_table = std::make_unique<cudf::table>(
     std::move(output_cols), stream, cudf::get_current_device_resource_ref());
-  std::unique_ptr<cucascade::idata_representation> output_data =
-    std::make_unique<cucascade::gpu_table_representation>(std::move(out_table), *space);
-  auto const batch_id = ::sirius::get_next_batch_id();
-  auto output_batch   = std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data));
+  // STREAM-LINEAGE: cudf::table ctor + make_avg_column write on `stream`;
+  // the constructor records the writer event for downstream cross-device
+  // readers.
+  auto out_repr =
+    std::make_unique<cucascade::gpu_table_representation>(std::move(out_table), *space, stream);
+  std::unique_ptr<cucascade::idata_representation> output_data = std::move(out_repr);
+  auto const batch_id                                          = ::sirius::get_next_batch_id();
+  auto output_batch = std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data));
 
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(output_batch)});
@@ -565,8 +557,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::get_ne
   std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
   bool found_batch = true;
   while (found_batch) {
-    auto batch =
-      ports.begin()->second->repo->pop_data_batch(::cucascade::batch_state::task_created);
+    auto batch = ports.begin()->second->repo->pop_next_data_batch();
     if (batch) {
       input_batch.push_back(std::move(batch));
     } else {

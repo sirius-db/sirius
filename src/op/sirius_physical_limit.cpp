@@ -17,6 +17,7 @@
 #include "op/sirius_physical_limit.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "sirius/exception.hpp"
 
 #include <cudf/copying.hpp>
 
@@ -28,7 +29,7 @@ namespace sirius {
 namespace op {
 
 sirius_physical_streaming_limit::sirius_physical_streaming_limit(
-  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<sirius::logical_type> types,
   duckdb::BoundLimitNode limit_val_p,
   duckdb::BoundLimitNode offset_val_p,
   std::size_t estimated_cardinality,
@@ -69,28 +70,25 @@ std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_streaming_limit::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_data_batches();
+  const auto& input_batches = input.get_read_only_batches();
 
   if (limit_val.Type() != duckdb::LimitNodeType::CONSTANT_VALUE) {
-    throw duckdb::NotImplementedException("Streaming limit with non-constant limit value");
+    throw not_implemented_exception("Streaming limit with non-constant limit value");
   }
   if (offset_val.Type() != duckdb::LimitNodeType::CONSTANT_VALUE &&
       offset_val.Type() != duckdb::LimitNodeType::UNSET) {
-    throw duckdb::NotImplementedException("Streaming limit with non-constant offset value");
+    throw not_implemented_exception("Streaming limit with non-constant offset value");
   }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.reserve(input_batches.size());
 
   for (auto const& batch : input_batches) {
-    if (!batch) { continue; }
-
     // Check if limit is already exhausted
     if (_remaining_limit.load(std::memory_order_acquire) <= 0) { break; }
 
-    auto& input_table = batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
-    auto view         = input_table.view();
-    auto num_rows     = static_cast<int64_t>(view.num_rows());
+    auto view     = batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+    auto num_rows = static_cast<int64_t>(view.num_rows());
 
     if (num_rows == 0) { continue; }
 
@@ -110,10 +108,10 @@ std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(
 
     // cudf::slice returns a vector of table_views; materialize into a table
     auto sliced_table = std::make_unique<cudf::table>(
-      slices.front(), stream, batch->get_memory_space()->get_default_allocator());
+      slices.front(), stream, batch.get_memory_space()->get_default_allocator());
     std::unique_ptr<cucascade::idata_representation> output_data =
-      std::make_unique<cucascade::gpu_table_representation>(std::move(sliced_table),
-                                                            *batch->get_memory_space());
+      std::make_unique<cucascade::gpu_table_representation>(
+        std::move(sliced_table), *batch.get_memory_space(), stream);
 
     auto const batch_id = ::sirius::get_next_batch_id();
     auto output_batch   = std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data));

@@ -102,7 +102,8 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single 
   columns.push_back(std::move(col1));
   auto table = std::make_unique<cudf::table>(std::move(columns));
 
-  auto gpu_repr = std::make_unique<gpu_table_representation>(std::move(table), *space);
+  auto gpu_repr = std::make_unique<gpu_table_representation>(
+    std::move(table), *space, cudf::get_default_stream());
   auto input_batch =
     std::make_shared<data_batch>(::sirius::get_next_batch_id(), std::move(gpu_repr));
 
@@ -123,7 +124,7 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single 
   );
 
   // Create partitioner types (copy of agg_output_types before moving)
-  duckdb::vector<duckdb::LogicalType> partitioner_types = agg_result.output_types;
+  duckdb::vector<sirius::logical_type> partitioner_types = agg_result.output_types;
 
   // Create the grouped aggregate merge operator
   sirius_physical_grouped_aggregate_merge grouped_aggregator(context,
@@ -132,11 +133,8 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single 
                                                              std::move(agg_result.groups),
                                                              estimated_cardinality);
 
-  sirius_physical_partition partitioner(std::move(partitioner_types),
-                                        estimated_cardinality,
-                                        &grouped_aggregator,
-                                        false,
-                                        partition_size);
+  sirius_physical_partition partitioner(
+    partitioner_types, estimated_cardinality, &grouped_aggregator, false, partition_size);
 
   // Compute num_partitions from estimated bytes: cardinality * bytes_per_row / partition_size
   // col0 is Traits::type, col1 is int32_t
@@ -157,7 +155,7 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single 
   std::size_t total_num_rows = 0;
   for (auto& output :
        dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()) {
-    total_num_rows += output->get_data()->cast<gpu_table_representation>().get_table().num_rows();
+    total_num_rows += sirius::get_cudf_table_view(*output).num_rows();
   }
   REQUIRE(total_num_rows == num_values);
 }
@@ -234,7 +232,8 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with two par
   columns.push_back(std::move(col2));
   auto table = std::make_unique<cudf::table>(std::move(columns));
 
-  auto gpu_repr = std::make_unique<gpu_table_representation>(std::move(table), *space);
+  auto gpu_repr = std::make_unique<gpu_table_representation>(
+    std::move(table), *space, cudf::get_default_stream());
   auto input_batch =
     std::make_shared<data_batch>(::sirius::get_next_batch_id(), std::move(gpu_repr));
 
@@ -256,7 +255,7 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with two par
   );
 
   // Create partitioner types (copy of agg_output_types before moving)
-  duckdb::vector<duckdb::LogicalType> partitioner_types = agg_result.output_types;
+  duckdb::vector<sirius::logical_type> partitioner_types = agg_result.output_types;
 
   // Create the grouped aggregate merge operator
   sirius_physical_grouped_aggregate_merge grouped_aggregator(context,
@@ -265,11 +264,8 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with two par
                                                              std::move(agg_result.groups),
                                                              estimated_cardinality);
 
-  sirius_physical_partition partitioner(std::move(partitioner_types),
-                                        estimated_cardinality,
-                                        &grouped_aggregator,
-                                        false,
-                                        partition_size);
+  sirius_physical_partition partitioner(
+    partitioner_types, estimated_cardinality, &grouped_aggregator, false, partition_size);
 
   // Compute num_partitions from estimated bytes: cardinality * bytes_per_row / partition_size
   // col0 is Traits::type, col1 and col2 are int32_t
@@ -290,8 +286,7 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with two par
   std::size_t total_num_rows = 0;
   for (auto& output :
        dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()) {
-    std::size_t num_rows_out =
-      output->get_data()->cast<gpu_table_representation>().get_table().num_rows();
+    std::size_t num_rows_out = sirius::get_cudf_table_view(*output).num_rows();
     REQUIRE(num_rows_out % prime_repeater ==
             0);  // each group was created to have prime_repeater rows, so each partition should
                  // have a multiple of that
@@ -327,7 +322,8 @@ TEST_CASE(
   columns.push_back(std::move(col1));
   auto table = std::make_unique<cudf::table>(std::move(columns));
 
-  auto gpu_repr = std::make_unique<gpu_table_representation>(std::move(table), *space);
+  auto gpu_repr = std::make_unique<gpu_table_representation>(
+    std::move(table), *space, cudf::get_default_stream());
   auto input_batch =
     std::make_shared<data_batch>(::sirius::get_next_batch_id(), std::move(gpu_repr));
 
@@ -346,7 +342,7 @@ TEST_CASE(
   );
 
   // Create partitioner types (copy of agg_output_types before moving)
-  duckdb::vector<duckdb::LogicalType> partitioner_types = agg_result.output_types;
+  duckdb::vector<sirius::logical_type> partitioner_types = agg_result.output_types;
 
   // Create the grouped aggregate merge operator
   sirius_physical_grouped_aggregate_merge grouped_aggregator(context,
@@ -356,7 +352,7 @@ TEST_CASE(
                                                              estimated_cardinality);
 
   sirius_physical_partition partitioner(
-    std::move(partitioner_types), estimated_cardinality, &grouped_aggregator, false);
+    partitioner_types, estimated_cardinality, &grouped_aggregator, false);
 
   // Compute num_partitions from estimated bytes: cardinality * bytes_per_row / partition_size
   // col0 and col1 are both int32_t; uses default partition size (512 MB)
@@ -368,10 +364,7 @@ TEST_CASE(
 
   auto outputs = partitioner.execute(pipelineable_operator_data({input_batch}), default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
-  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs)
-            .get_data_batches()[0]
-            ->get_data()
-            ->cast<gpu_table_representation>()
-            .get_table()
+  REQUIRE(sirius::get_cudf_table_view(
+            *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0])
             .num_rows() == num_values);
 }

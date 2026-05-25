@@ -99,7 +99,7 @@ Key methods:
 - `mark_task_completed()` — increments `tasks_completed`, calls `update_pipeline_status()`
 - `update_pipeline_status()` — checks source-dependent completion logic:
   - DUCKDB_SCAN: finished when `exhausted` flag is set
-  - PARQUET_SCAN: finished when `has_more_partitions` is false and `tasks_created == tasks_completed`
+  - GPU_PARQUET_SCAN: finished when the bound `split_connector` is closed and drained and `tasks_created == tasks_completed`
   - Others: finished when upstream done, ports empty, and all tasks completed
 - `is_ready()` — marks pipeline ready and reverses operators to execution order
 - `register_new_batch_index()` / `update_batch_index()` — batch ordering for order-preserving execution
@@ -170,7 +170,7 @@ children[1]->build_pipelines(current, meta_pipeline);  // Reference side
 
 ### Pipeline Finalization
 
-At the end of `initialize_internal()` (`src/sirius_engine.cpp`, line ~1133), after all pipeline splitting is done, each pipeline is finalized:
+During `finalize_pipeline_structure()` in `sirius_pipeline_converter` (`src/pipeline/sirius_pipeline_converter.cpp`), after all pipeline splitting is done, each pipeline is finalized:
 
 ```cpp
 // Finalize pipeline structure: push sink into operators, set source
@@ -188,20 +188,36 @@ After this step:
 
 ## Part 3: Pipeline Splitting Rules
 
-After meta-pipeline construction, `sirius_engine::initialize_internal()` applies Sirius-specific pipeline splitting. Each split introduces new operators and **data repositories between pipelines**. Repositories are never placed in the middle of a pipeline — they always connect the sink of one pipeline to the source of the next.
+After meta-pipeline construction, `sirius_pipeline_converter::convert()` applies Sirius-specific pipeline splitting. This class organizes the work into focused phases:
+
+1. `schedule_and_copy_pipelines()` — walk meta-pipeline tree, schedule and copy
+2. `split_pipelines()` — dispatches to per-operator splitting helpers (`split_table_scan_source`, `split_intermediate_joins`, `split_join_sink`, `split_group_aggregate_sink`, `split_order_by_sink`, `split_top_n_sink`, `split_delim_join_sink`)
+3. `wire_data_repositories()` — connect operator ports to data repositories
+4. `setup_pipeline_parents()` — assign parent/child pipeline relationships
+5. `finalize_pipeline_structure()` — source/sink semantic shift (see [Pipeline Finalization](#pipeline-finalization))
+6. `link_join_partition_siblings()` — link PARTITION/JOIN/CONCAT sibling chains
+7. `log_pipeline_debug_info()` — structured debug logging
+
+`sirius_engine::initialize_internal()` is now a ~35-line orchestrator calling `sirius_pipeline_converter(*this, op_params).convert(*root_pipeline)`.
+
+Each split introduces new operators and **data repositories between pipelines**. Repositories are never placed in the middle of a pipeline — they always connect the sink of one pipeline to the source of the next.
 
 In the diagrams below, `[A, B, C]` denotes a pipeline where A is `operators[0]` (source), C is `operators.back()` (sink), and B is intermediate. After finalization, each operator appears **exactly once** in its pipeline's `operators` list. Solid edges denote data repositories connecting pipelines, labeled with the barrier type (e.g., `FULL`, `PARTIAL`, `PIPELINE`). Dashed edges indicate internal pushes within an operator's `sink()` method.
 
 ### TABLE_SCAN Splitting
 
-TABLE_SCAN is replaced with DUCKDB_SCAN or PARQUET_SCAN. A separate scan pipeline is created, and the original TABLE_SCAN is kept as the first operator of the main pipeline:
+TABLE_SCAN splits along two paths depending on the table function:
+
+**Parquet (`parquet_scan` / `read_parquet`):** TABLE_SCAN is replaced with `GPU_PARQUET_SCAN` at `operators[0]` of the same pipeline — no separate scan pipeline is created. The DuckDB bind data is captured into a `parquet_scan_info` and parked on the operator. During `prepare_for_query`, `sirius_scan_manager` reads the info, builds a `split_provider` (parquet or cached), and binds a `split_connector` to the operator. The operator pulls splits from the connector inside `get_next_task_input_data()` (see [Scan — Scan Manager](scan.md#scan-manager)).
+
+**DuckDB-managed (`seq_scan`, `iceberg_scan`):** A separate scan pipeline is created, and the original TABLE_SCAN is kept as the first operator of the main pipeline:
 
 ```mermaid
 graph LR
     SP["Scan Pipeline<br/>[DUCKDB_SCAN]"] -->|"PIPELINE, 'scan'"| MP["Main Pipeline<br/>[TABLE_SCAN, filter, ..., sink]"]
 ```
 
-The DUCKDB_SCAN (or PARQUET_SCAN) is the sole operator in the scan pipeline. TABLE_SCAN stays at `operators[0]` of the main pipeline (line 391). The repository uses `PIPELINE` barrier on the `"scan"` port.
+DUCKDB_SCAN (or ICEBERG_SCAN) is the sole operator in the scan pipeline. TABLE_SCAN stays at `operators[0]` of the main pipeline. The repository uses `PIPELINE` barrier on the `"scan"` port.
 
 ### HASH_JOIN Probe Side
 

@@ -20,6 +20,7 @@
 #include <config.hpp>
 #include <data/host_parquet_representation.hpp>
 #include <memory/multiple_blocks_allocation_accessor.hpp>
+#include <op/scan/hive_partition.hpp>
 #include <op/sirius_physical_parquet_scan.hpp>
 #include <op/sirius_physical_table_scan.hpp>
 #include <pipeline/sirius_pipeline_itask.hpp>
@@ -32,7 +33,21 @@
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 
+// sirius IO framework
+#include <io/types.hpp>
+
+// Forward-declare uring_io_object to avoid pulling in <liburing.h>
+// transitively here. liburing's <io_uring.h> defines a BLOCK_SIZE macro that
+// collides with the BLOCK_SIZE static member in <blockingconcurrentqueue.h>
+// (which is pulled in elsewhere in this translation unit). The full
+// definition lives at src/include/io/uring/uring_reactor.hpp; the .cpp
+// includes that header directly.
+namespace sirius::io {
+class uring_io_object;
+}
+
 // duckdb
+#include <duckdb/common/multi_file/multi_file_states.hpp>
 #include <duckdb/main/client_context.hpp>
 
 // cudf
@@ -51,6 +66,8 @@
 #include <atomic>
 #include <memory>
 #include <optional>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace sirius::op::scan {
@@ -63,8 +80,13 @@ namespace detail {
  * @brief Compute the parquet column indices to read given column and projection id vectors.
  *
  * Applies projection_ids / column_ids to select only the needed columns.
- * Virtual columns and duplicates are excluded/deduplicated.
+ * Virtual columns, duplicates, and hive partition columns are excluded.
  * Defined in parquet_scan_task.cpp.
+ *
+ * Note: the returned indices are DuckDB primary indices. Hive partition columns
+ * (present in the DuckDB schema but not in the parquet files) are NOT removed
+ * here — callers must filter them post-hoc using the bind data's
+ * `hive_partitioning_indexes`.
  *
  * @param column_ids     All column ids exposed by the table function.
  * @param projection_ids Subset of column_ids positions selected by the planner (empty = no
@@ -75,12 +97,14 @@ std::vector<size_t> make_selected_column_indices(
   duckdb::vector<duckdb::idx_t> const& projection_ids);
 
 /**
- * @brief Return true if all selected projected columns have a flat (depth-1) schema.
+ * @brief Return true if all projected leaf columns have a flat (depth-1) schema.
  *
+ * Looks up each projected column by name in the parquet file's schema and
+ * checks that its `path_in_schema` has length 1 (i.e., not nested).
  * Defined in parquet_scan_task.cpp.
  */
 bool projected_columns_are_flat(cudf::io::parquet::FileMetaData const& meta,
-                                std::vector<size_t> const& selected_column_indices);
+                                std::vector<std::string> const& projected_column_names);
 }  // namespace detail
 
 //===----------------------------------------------------------------------===//
@@ -108,11 +132,16 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    * @param[in] pipeline The pipeline associated with this task
    * @param[in] scan_op The physical table scan operator
    * @param[in] approximate_batch_size The target approximate batch size for the scan tasks
+   * @param[in] gpu_ioctxs Per-GPU sirius_ioctx instances indexed by device_id.
+   *            Seeded by task_creator from SiriusContext::get_gpu_ioctxs().
+   *            Used for planning-time footer pre-reads and hot-path per-task
+   *            sirius_datasource construction.
    */
   parquet_scan_task_global_state(
     duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
     sirius_physical_parquet_scan* scan_op,
-    std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE);
+    std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE,
+    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs = {});
 
   //===----------Methods----------===//
   /**
@@ -197,7 +226,17 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    */
   [[nodiscard]] std::unique_ptr<hybrid_scan_reader> make_reader(std::size_t file_idx) const
   {
-    return std::make_unique<hybrid_scan_reader>(_file_metadatas[file_idx], _reader_options);
+    auto opts = _reader_options;
+    // Per-file column projection for schema evolution: each file may have
+    // a different subset of the requested columns.
+    if (!_per_file_column_names.empty() && file_idx < _per_file_column_names.size()) {
+#if CUDF_VERSION_NUM >= 2604
+      opts.set_column_names(_per_file_column_names[file_idx]);
+#else
+      opts.set_columns(_per_file_column_names[file_idx]);
+#endif
+    }
+    return std::make_unique<hybrid_scan_reader>(_file_metadatas[file_idx], opts);
   }
 
   /**
@@ -226,6 +265,39 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   }
 
   /**
+   * @brief Access the per-GPU sirius_ioctx map.
+   *
+   * Seeded at construction time by task_creator from
+   * SiriusContext::get_gpu_ioctxs(). Keyed by device_id; value is a shared_ptr
+   * to the per-GPU sirius::io::sirius_ioctx bound to that GPU's CUDA context.
+   * Used by compute_task() (hot path, routed by preferred_device_id) and by
+   * initialize_from_files() (planning-time, first-available GPU).
+   *
+   * @return A const reference to the map.
+   */
+  [[nodiscard]] std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const&
+  get_gpu_ioctxs() const
+  {
+    return _gpu_ioctxs;
+  }
+
+  /**
+   * @brief Get the cached uring_io_object for the given file index.
+   *
+   * Cached at planning time inside initialize_from_files() so the hot path
+   * (compute_task) does not re-open file descriptors per task. uring_io_object's
+   * ctor opens TWO fds (buffered O_RDONLY + O_RDONLY|O_DIRECT); avoiding per-task
+   * reopens prevents fd-exhaustion at SF100+.
+   *
+   * @return Shared pointer to the cached io_object for @p file_idx.
+   */
+  [[nodiscard]] std::shared_ptr<sirius::io::sirius_io_object> get_file_io_object(
+    std::size_t file_idx) const
+  {
+    return _file_io_objects[file_idx];
+  }
+
+  /**
    * @brief Get the total number of parquet metadata bytes (header + footer + trailer)
    * that must be cached alongside the column-chunk data for file @p file_idx.
    */
@@ -243,16 +315,19 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
     return _footer_offsets[file_idx];
   }
 
-  /** @brief Get a shared_ptr that pins the translated AST filter expression alive.
+  /** @brief Get a shared_ptr holding the per-GPU translated AST filter expressions alive.
    *
-   * This is passed to host_parquet_representation so the filter expression (which
-   * parquet_reader_options stores as a reference) survives until materialization.
+   * This is passed to host_parquet_representation so filter scalars survive until
+   * materialization. Keyed by device_id so the converter can pick the entry that
+   * matches its task's target device — per-device scalar device buffers are required
+   * for multi-GPU correctness.
    *
-   * @return A shared_ptr to the translated filter expression (may be null if no filter). */
-  [[nodiscard]] std::shared_ptr<gpu_expression_translator::translated_expression>
-  get_filter_expression() const
+   * @return A shared_ptr to the per-device filter map (may be null / empty if no filter). */
+  [[nodiscard]] std::shared_ptr<
+    std::unordered_map<int, gpu_expression_translator::translated_expression>>
+  get_filter_expression_by_device() const
   {
-    return _translated_filter;
+    return _translated_filter_by_device;
   }
 
   /**
@@ -289,6 +364,99 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    */
   [[nodiscard]] post_convert_fn_t get_post_convert_fn() const { return _post_convert_fn; }
 
+  /**
+   * @brief Return the selected column indices (DuckDB primary indices of data-only
+   * columns, in cudf table order — hive partition columns excluded).
+   *
+   * Used by iceberg_scan_task_global_state to compute data_key_indices that correctly map
+   * equality-delete key names to cudf table column positions.
+   */
+  [[nodiscard]] std::vector<size_t> const& get_selected_column_indices() const
+  {
+    return _selected_column_indices;
+  }
+
+  /**
+   * @brief Return the parquet FileMetaData for the given data file index.
+   *
+   * Used by iceberg_scan_task_global_state to extract Iceberg field IDs
+   * from data file schemas for schema-evolution-safe column matching.
+   */
+  [[nodiscard]] cudf::io::parquet::FileMetaData const& get_file_metadata(size_t file_idx) const
+  {
+    return _file_metadatas[file_idx];
+  }
+
+  /// Return the number of data files.
+  [[nodiscard]] size_t num_files() const { return _file_paths.size(); }
+
+  // -------------------------------------------------------------------------
+  // Hive partition column support
+  // -------------------------------------------------------------------------
+
+  /// True if this scan involves hive-partitioned files.
+  [[nodiscard]] bool has_hive_partitions() const { return !_hive_partition_columns.empty(); }
+
+  /// True if a partition_inject_fn was installed (hive partitioning OR schema
+  /// reconciliation). Schema evolution can install one even when there are no
+  /// hive partition columns, so callers that propagate the fn down to
+  /// host_parquet_representation should gate on this rather than
+  /// has_hive_partitions().
+  [[nodiscard]] bool has_partition_inject_fn() const
+  {
+    return static_cast<bool>(_partition_inject_fn);
+  }
+
+  /// Return the partition injection function (may be null). Legacy typedef — carries file_path
+  /// so the schema-reconciliation closure can do per-file column-set lookups.
+  [[nodiscard]] sirius::partition_inject_fn_t const& get_partition_inject_fn() const
+  {
+    return _partition_inject_fn;
+  }
+
+  /// Return the hive partition column metadata.
+  [[nodiscard]] std::vector<hive_partition_column> const& get_hive_partition_columns() const
+  {
+    return _hive_partition_columns;
+  }
+
+  /// Return the set of DuckDB column indices that are hive partitions.
+  [[nodiscard]] std::unordered_set<size_t> const& get_hive_partition_index_set() const
+  {
+    return _hive_partition_index_set;
+  }
+
+  /**
+   * @brief Initialize hive partition metadata and build the injection function.
+   *
+   * Called from both the public constructor (plain parquet) and the iceberg
+   * subclass constructor. Safe to call after base construction.
+   */
+  void init_hive_partitions(duckdb::MultiFileBindData const& bind_data,
+                            sirius_physical_parquet_scan* scan_op);
+
+  /**
+   * @brief Detect missing/schema-evolution columns and set up per-file projection.
+   *
+   * Scans all file metadatas to find columns missing from ALL files (→ partition
+   * columns) vs missing from SOME files (→ schema evolution, per-file projection).
+   * Also applies column-name projection to reader options.
+   *
+   * Called from both constructors after file metadata is available.
+   */
+  void detect_columns_and_apply_projection(sirius_physical_parquet_scan* scan_op);
+
+  /**
+   * @brief Build a schema reconciliation function for schema evolution.
+   *
+   * When files have different column sets (e.g., column added in later snapshot),
+   * this builds a partition_inject_fn that injects typed NULL columns for columns
+   * missing from specific files, producing a consistent output schema.
+   *
+   * Must be called AFTER init_hive_partitions (chains with any existing inject fn).
+   */
+  void build_schema_reconciliation(sirius_physical_parquet_scan* scan_op);
+
  protected:
   /**
    * @brief Protected constructor for subclasses that pre-process the file list.
@@ -308,24 +476,33 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    * @param selected_column_indices Column indices to read (may be widened for
    *                                equality-delete key columns).
    * @param approximate_batch_size  Target uncompressed batch size for partitioning.
+   * @param gpu_ioctxs              Per-GPU sirius_ioctx instances indexed by
+   *                                device_id (Approach C; see public ctor).
    */
-  parquet_scan_task_global_state(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
-                                 sirius_physical_parquet_scan* scan_op,
-                                 std::vector<std::string> file_paths,
-                                 std::vector<size_t> const& selected_column_indices,
-                                 size_t approximate_batch_size);
+  parquet_scan_task_global_state(
+    duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
+    sirius_physical_parquet_scan* scan_op,
+    std::vector<std::string> file_paths,
+    std::vector<size_t> selected_column_indices,
+    std::size_t approximate_batch_size,
+    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs = {});
 
  private:
   /**
    * @brief Shared initialization: read footers, apply projections/filters, parse
-   * metadata, and partition row groups. Called by both constructors after
-   * _file_paths has been populated.
+   * metadata, detect hive partitions from the parquet schema, and partition row
+   * groups. Called by both constructors after _file_paths and
+   * _selected_column_indices have been populated.
    */
   void initialize_from_files();
 
   //===----------Fields----------===//
   std::size_t _approximate_batch_size;     ///< Target approximate batch size for scan tasks
   sirius_physical_parquet_scan* _scan_op;  ///< The physical parquet scan operator being executed
+
+  /// DuckDB primary indices of data-only columns to read, in cudf table order.
+  /// Hive partition columns are excluded.
+  std::vector<size_t> _selected_column_indices;
 
   std::vector<std::string> _file_paths;                          ///< The parquet file paths
   std::vector<cudf::io::parquet::FileMetaData> _file_metadatas;  ///< The parquet file metadata
@@ -335,9 +512,12 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   std::vector<std::size_t> _metadata_byte_sizes;  ///< Per-file header+footer+trailer bytes
   std::vector<std::size_t> _footer_offsets;       ///< Per-file offset where footer begins
 
-  std::shared_ptr<gpu_expression_translator::translated_expression>
-    _translated_filter;  ///< The translated filter expression, if any, to keep alive for
-                         ///< materialization
+  std::shared_ptr<std::unordered_map<int, gpu_expression_translator::translated_expression>>
+    _translated_filter_by_device;  ///< Per-GPU translated filter expressions, keyed by
+                                   ///< device_id. Each entry's cudf::scalar device buffers
+                                   ///< live on that specific device so tasks dispatched
+                                   ///< across GPUs can evaluate the AST against memory
+                                   ///< accessible from the task's current device.
   std::vector<std::size_t>
     _post_filter_projection_ids;  ///< The indices of projected columns in the reader output
 
@@ -348,6 +528,32 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   /// Optional hook called after each batch is decompressed to a GPU table.
   /// Null for plain parquet scans; set by iceberg_scan_task_global_state.
   post_convert_fn_t _post_convert_fn;
+
+  /// Optional partition column injection (null unless hive-partitioned). Legacy typedef so the
+  /// schema-reconciliation closure (which needs file_path for per-file column-set lookups) can
+  /// share this storage with the simple hive-injection closure.
+  sirius::partition_inject_fn_t _partition_inject_fn;
+
+  /// Per-file column names for cuDF projection (schema evolution support).
+  /// Empty if all files share the same schema; otherwise one entry per file.
+  std::vector<std::vector<std::string>> _per_file_column_names;
+
+  /// Hive partition columns (not present in parquet files).
+  std::vector<hive_partition_column> _hive_partition_columns;
+  std::unordered_set<size_t> _hive_partition_index_set;
+
+  /// Per-GPU sirius_ioctx instances keyed by device_id. Seeded by task_creator
+  /// from SiriusContext::get_gpu_ioctxs() at global-state construction time.
+  /// The adapter layer (sirius::io::sirius_datasource) is constructed via
+  /// ioctx->make_datasource(io_object) selected by preferred_device_id (hot
+  /// path) or first-available (planning).
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> _gpu_ioctxs;
+
+  /// Cached uring_io_objects per file. Constructed once at planning time
+  /// inside initialize_from_files(), reused by every per-task datasource
+  /// construction. Avoids per-task fd reopens (uring_io_object ctor opens 2
+  /// fds via ::open).
+  std::vector<std::shared_ptr<sirius::io::sirius_io_object>> _file_io_objects;
 };
 
 //===----------------------------------------------------------------------===//
@@ -434,7 +640,7 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_task_loca
 
   [[nodiscard]] std::size_t get_task_consumption_basis() const override
   {
-    return get_reserved_compressed_bytes();
+    return get_reserved_uncompressed_bytes();
   }
 
   /**
@@ -447,9 +653,22 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_task_loca
     return _partition.row_group_indices;
   }
 
+  //===----------Preferred device id----------===//
+  /**
+   * @brief Record which GPU this task was assigned to at dispatch time.
+   * Set by duckdb_scan_executor::manager_loop after select_target_gpu().
+   * Read by parquet_scan_task::compute_task for per-GPU io_backend routing.
+   * Per-task (local state) by design: using the shared global state would
+   * create a data race across concurrent scan tasks for the same pipeline
+   * on different GPUs.
+   */
+  void set_preferred_device_id(int device_id) { _preferred_device_id = device_id; }
+  [[nodiscard]] std::optional<int> get_preferred_device_id() const { return _preferred_device_id; }
+
  private:
   parquet_scan_task_global_state::row_group_range _partition;  ///< Assigned row-group partition
   std::size_t _metadata_bytes;                                 ///< The number of metadata bytes
+  std::optional<int> _preferred_device_id;                     ///< Per-task GPU assignment
 };
 
 //===----------------------------------------------------------------------===//
@@ -488,6 +707,7 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
       _task_id(task_id),
       _data_repo(data_repo)
   {
+    if (auto pipeline = g_state->get_operator().get_pipeline()) { pipeline->mark_task_created(); }
   }
 
   ~parquet_scan_task() override;
@@ -519,12 +739,15 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
   void publish_output(op::operator_data& output_data, rmm::cuda_stream_view stream) override;
 
   /**
-   * @brief Get the estimated reservation size for this task, which is the number of compressed
-   * bytes reserved by this task's local state.
+   * @brief Compute the full reservation size breakdown for this task.
    *
-   * @return The estimated reservation size in bytes.
+   * Uses pipeline_memory_history to refine the estimate when history is available.
+   * bytes_to_materialize_input is always 0 for scan tasks.
+   *
+   * @return reservation_size_info with all fields populated.
    */
-  [[nodiscard]] std::size_t get_estimated_reservation_size() const override;
+  [[nodiscard]] pipeline::reservation_size_info get_estimated_reservation_size_info()
+    const override;
 
   /**
    * @brief Get the output consumers operators for this task.
@@ -535,8 +758,7 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
   {
     auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
     std::vector<sirius_physical_operator*> output_consumers;
-    auto ports = g_state.get_operator().get_next_port_after_sink();
-    for (auto& next_port : ports) {
+    for (const auto& next_port : g_state.get_operator().get_next_ports_after_sink()) {
       output_consumers.push_back(next_port.next_operator);
     }
     return output_consumers;

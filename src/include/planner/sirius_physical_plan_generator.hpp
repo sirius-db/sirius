@@ -20,16 +20,28 @@
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
-#include "duckdb/parser/group_by_node.hpp"
-#include "duckdb/planner/joinside.hpp"
-#include "duckdb/planner/logical_operator.hpp"
-#include "duckdb/planner/logical_tokens.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 namespace duckdb {
 class ClientContext;
 class GPUContext;
 class ColumnDataCollection;
+class LogicalOperator;
+class LogicalAggregate;
+class LogicalColumnDataGet;
+class LogicalComparisonJoin;
+class LogicalDelimGet;
+class LogicalDummyScan;
+class LogicalEmptyResult;
+class LogicalExpressionGet;
+class LogicalFilter;
+class LogicalGet;
+class LogicalLimit;
+class LogicalOrder;
+class LogicalTopN;
+class LogicalProjection;
+class LogicalMaterializedCTE;
+class LogicalCTERef;
 }  // namespace duckdb
 
 namespace sirius::planner {
@@ -72,10 +84,8 @@ class sirius_physical_plan_generator {
                                        sirius::op::sirius_physical_operator& plan);
   //! The order preservation type of the given operator decided by recursively looking at its
   //! children
-  static duckdb::OrderPreservationType order_preservation_recursive(
+  static sirius::OrderPreservationType order_preservation_recursive(
     sirius::op::sirius_physical_operator& op);
-
-  static bool has_equality(duckdb::vector<duckdb::JoinCondition>& conds, std::size_t& range_count);
 
  protected:
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalOperator& op);
@@ -155,11 +165,6 @@ class sirius_physical_plan_generator {
     duckdb::LogicalComparisonJoin& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_delim_join(
     duckdb::LogicalComparisonJoin& op);
-  duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expressions(
-    duckdb::unique_ptr<sirius::op::sirius_physical_operator> child,
-    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& expressions,
-    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& groups,
-    duckdb::optional_ptr<duckdb::vector<duckdb::GroupingSet>> grouping_sets);
 
   // private:
   bool preserve_insertion_order(sirius::op::sirius_physical_operator& plan);

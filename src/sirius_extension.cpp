@@ -18,6 +18,22 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "config.hpp"
+#include "data/data_batch_utils.hpp"
+#include "duckdb/common/file_system.hpp"
+#include "duckdb/common/open_file_info.hpp"
+#include "expression_executor/expression_executor_strategy.hpp"
+
+#include <cudf/io/parquet.hpp>
+#include <cudf/io/types.hpp>
+
+#include <rmm/cuda_device.hpp>
+#include <rmm/cuda_stream.hpp>
+
+#include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 // Forward-declare CUDA profiler API functions (linked via libcudart).
 extern "C" int cudaProfilerStart();
@@ -39,25 +55,59 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "transparent/sirius_optimizer_extension.hpp"
 // #include "from_substrait.hpp"
-#include "gpu_buffer_manager.hpp"
 #ifdef SIRIUS_ENABLE_LEGACY
+#include "gpu_buffer_manager.hpp"
 #include "gpu_context.hpp"
 #include "gpu_physical_plan_generator.hpp"
 #endif
 #include "duckdb/main/connection_manager.hpp"
 #include "log/logging.hpp"
+#include "pin_table.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "sirius_interface.hpp"
 #include "util/segfault_backtrace.hpp"
 
+// PinTableFunction routes parquet reads through the per-GPU sirius_ioctx
+// instead of cudf's bundled file_source factory (which uses kvikio internally
+// and binds to a single CUDA context).
+//
+// Ordering rule: include uring_reactor LAST among sirius headers — liburing.h
+// transitively pulled by uring_reactor.hpp defines a BLOCK_SIZE preprocessor
+// macro that collides with the BLOCK_SIZE static member in
+// <blockingconcurrentqueue.h> (used by spdlog / pipeline / duckdb
+// connection_manager). All consumers of blockingconcurrentqueue.h must
+// precede this include.
+#include "io/types.hpp"                // sirius::io::sirius_ioctx
+#include "io/uring/uring_reactor.hpp"  // sirius::io::uring_io_object
+
 #include <cstdlib>
+#include <unordered_map>
 
 namespace duckdb {
 
-const std::string PINNED_MEMORY_PARAM_KEY   = "pinned_memory_size";
+const std::string PINNED_MEMORY_PARAM_KEY = "pinned_memory_size";
+#ifdef SIRIUS_ENABLE_LEGACY
 bool SiriusExtension::buffer_is_initialized = false;
+#endif
+
+constexpr std::string QUERY_LABEL_PARAM_KEY = "query_label";
+
+namespace {
+unique_ptr<QueryResult> run_internal_cpu_fallback_query(ClientContext& context,
+                                                        Connection& connection,
+                                                        const string& query)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return connection.Query(query); }
+
+  duckdb::SiriusContext::InternalQueryGuard guard(*sirius_ctx);
+  return connection.Query(query);
+}
+
+}  // namespace
 
 struct SiriusTableFunctionData : public TableFunctionData {
   SiriusTableFunctionData() = default;
@@ -92,11 +142,9 @@ struct SiriusTableFunctionData : public TableFunctionData {
       DBConfig::GetConfig(context).options.disabled_optimizers;
     disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
     disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
-    // STATISTICS_PROPAGATION folds ungrouped MIN/MAX aggregates into constant
-    // expressions using partition statistics, producing EXPRESSION_GET + DUMMY_SCAN.
-    // The GPU pipeline cannot schedule COLUMN_DATA_SCAN sources, so disable this
-    // to keep the query on the scan -> aggregate path where the GPU can execute it.
-    disabled_optimizers.insert(OptimizerType::STATISTICS_PROPAGATION);
+    // STATISTICS_PROPAGATION is now enabled: cpu_source_task handles the
+    // COLUMN_DATA_SCAN / EXPRESSION_GET / DUMMY_SCAN sources that this
+    // optimizer produces (e.g. folding count(*), MIN, MAX to constants).
 #ifdef DEBUG
     disabled_optimizers.insert(OptimizerType::COLUMN_LIFETIME);
 #endif
@@ -328,19 +376,19 @@ void SiriusExtension::GPUProcessingFunction(ClientContext& context,
       printf(
         "=============================================\nError in GPUExecuteQuery, fallback to "
         "DuckDB\n=============================================\n");
-      data.res = data.conn->Query(data.query);
+      data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
     } else if (data.plan_error) {
       printf(
         "=============================================\nError in GPUExecuteQuery, fallback to "
         "DuckDB\n=============================================\n");
-      data.res = data.conn->Query(data.query);
+      data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
     } else {
       data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
       if (data.res->HasError()) {
         printf(
           "=============================================\nError in GPUExecuteQuery, fallback to "
           "DuckDB\n=============================================\n");
-        data.res = data.conn->Query(data.query);
+        data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
       }
     }
     auto end      = std::chrono::high_resolution_clock::now();
@@ -391,12 +439,27 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   result->conn             = make_uniq<Connection>(*context.db);
   result->query            = input.inputs[0].ToString();
   result->enable_optimizer = true;
-  result->sirius_iface     = make_uniq<::sirius::sirius_interface>(context);
+
+  std::optional<std::string> query_label = std::nullopt;
+  // take any query_label that was set using sirius_set_query_label SQL call.
+  if (auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+      sirius_ctx) {
+    query_label = sirius_ctx->take_pending_query_label();
+  }
+  // however, give precedence to a query_label that was set inline in with
+  // gpu_execution SQL call.
+  if (auto it = input.named_parameters.find(QUERY_LABEL_PARAM_KEY);
+      it != input.named_parameters.end() && not it->second.IsNull()) {
+    query_label = it->second.ToString();
+  }
+
+  result->sirius_iface = make_uniq<::sirius::sirius_interface>(context, std::move(query_label));
+
   if (input.inputs[0].IsNull()) {
     throw BinderException("gpu_execution cannot be called with a NULL parameter");
   }
 
-  // Parse the query just to get the result type information and to create preparedstatmement data
+  // Parse the query just to get the result type information and to create PreparedStatementData
   Parser parser(context.GetParserOptions());
   parser.ParseQuery(result->query);
   Planner planner(context);
@@ -452,7 +515,7 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
       printf(
         "=============================================\nError in SiriusExecuteQuery, fallback to "
         "DuckDB\n=============================================\n");
-      data.res = data.conn->Query(data.query);
+      data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
     } else {
       data.res =
         data.sirius_iface->sirius_execute_query(context, data.query, data.gpu_prepared, {});
@@ -462,7 +525,7 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
           printf(
             "=============================================\nError in SiriusExecuteQuery, fallback "
             "to DuckDB\n=============================================\n");
-          data.res = data.conn->Query(data.query);
+          data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
         } else {
           throw std::runtime_error("SiriusExecuteQuery error: " + data.res->GetError());
           return;
@@ -504,6 +567,7 @@ static unique_ptr<LogicalOperator> OptimizePlan(ClientContext& context,
   return plan;
 }
 
+#ifdef SIRIUS_ENABLE_LEGACY
 struct GPUBufferInitFunctionData : public TableFunctionData {
   GPUBufferInitFunctionData() {}
   bool finished = false;
@@ -615,6 +679,7 @@ void SiriusExtension::GPUBufferInitFunction(ClientContext& context,
   }
   data.finished = true;
 }
+#endif  // SIRIUS_ENABLE_LEGACY
 
 static unique_ptr<FunctionData> ProfilerBind(ClientContext& context,
                                              TableFunctionBindInput& input,
@@ -624,6 +689,324 @@ static unique_ptr<FunctionData> ProfilerBind(ClientContext& context,
   return_types.push_back(LogicalType::BOOLEAN);
   names.push_back("ok");
   return nullptr;
+}
+
+struct PinTableFunctionData : public TableFunctionData {
+  PinTableArgs args;
+  bool finished = false;
+};
+
+unique_ptr<FunctionData> SiriusExtension::PinTableBind(ClientContext& context,
+                                                       TableFunctionBindInput& input,
+                                                       vector<LogicalType>& return_types,
+                                                       vector<string>& names)
+{
+  auto result = make_uniq<PinTableFunctionData>();
+
+  if (input.inputs.empty() || input.inputs[0].IsNull()) {
+    throw BinderException("pin_table requires a non-null path argument");
+  }
+  result->args.path = input.inputs[0].ToString();
+
+  auto tier_it = input.named_parameters.find("tier");
+  if (tier_it == input.named_parameters.end() || tier_it->second.IsNull()) {
+    throw BinderException("pin_table requires a 'tier' named parameter");
+  }
+  result->args.tier = tier_it->second.ToString();
+  if (result->args.tier != "gpu" && result->args.tier != "host") {
+    throw NotImplementedException("pin_table tier='" + result->args.tier +
+                                  "' is not supported (only 'gpu' and 'host')");
+  }
+
+  auto name_it = input.named_parameters.find("name");
+  if (name_it == input.named_parameters.end() || name_it->second.IsNull()) {
+    throw BinderException("pin_table requires a 'name' named parameter");
+  }
+  result->args.name = name_it->second.ToString();
+
+  auto cols_it = input.named_parameters.find("cols");
+  if (cols_it != input.named_parameters.end() && !cols_it->second.IsNull()) {
+    vector<string> cols;
+    for (auto& val : ListValue::GetChildren(cols_it->second)) {
+      if (val.IsNull()) {
+        throw BinderException("pin_table 'cols' list cannot contain NULL entries");
+      }
+      cols.push_back(val.ToString());
+    }
+    result->args.cols = std::move(cols);
+  }
+
+  auto n_rows_it = input.named_parameters.find("n_rows");
+  if (n_rows_it != input.named_parameters.end() && !n_rows_it->second.IsNull()) {
+    result->args.n_rows = n_rows_it->second.GetValue<int64_t>();
+  }
+
+  return_types.emplace_back(LogicalType::BOOLEAN);
+  names.emplace_back("Success");
+  return std::move(result);
+}
+
+void SiriusExtension::PinTableFunction(ClientContext& context,
+                                       TableFunctionInput& data_p,
+                                       DataChunk& output)
+{
+  auto& data = data_p.bind_data->CastNoConst<PinTableFunctionData>();
+  if (data.finished) { return; }
+
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    throw InvalidInputException("pin_table requires the Sirius context to be initialized");
+  }
+
+  // The cudf reader places parquet chunks on whichever GPU is current at
+  // read_chunk() time; round-robin the file reads across all GPU memory spaces
+  // so multi-file pin_table calls distribute their chunks evenly. Each file's
+  // chunks all bind to the same GPU (per-file binding — see comment at
+  // chunk_idx increment below). For tier='host' we additionally convert each
+  // table to a host_data_representation (via the GPU↔HOST converter) so the
+  // pinned data lives in pinned host memory.
+  auto& memory_manager = sirius_ctx->get_memory_manager();
+  auto gpu_spaces      = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  if (gpu_spaces.empty()) {
+    throw InvalidInputException("pin_table: no GPU memory space available");
+  }
+
+  // For host tier, build a target_gpu_id -> NUMA-local host memory_space map.
+  // Each round-robin GPU's host conversion should pin its data on the host
+  // memory_space whose NUMA node matches the GPU. Fall back to host_spaces[0]
+  // when the GPU's NUMA node is unknown or no matching host space exists.
+  std::unordered_map<int, cucascade::memory::memory_space*> host_space_by_gpu;
+  if (data.args.tier == "host") {
+    auto host_spaces = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+    if (host_spaces.empty()) {
+      throw InvalidInputException("pin_table: no HOST memory space available");
+    }
+    auto* fallback_host = const_cast<cucascade::memory::memory_space*>(host_spaces[0]);
+    auto const& topo    = sirius_ctx->get_config().get_hw_topology();
+    for (auto const* gpu_space : gpu_spaces) {
+      int const gpu_id = gpu_space->get_device_id();
+      int numa_node    = -1;
+      if (static_cast<size_t>(gpu_id) < topo.gpus.size()) {
+        numa_node = topo.gpus[gpu_id].numa_node;
+      }
+      cucascade::memory::memory_space* picked = fallback_host;
+      if (numa_node >= 0) {
+        for (auto* hs : host_spaces) {
+          if (hs->get_device_id() == numa_node) {
+            picked = const_cast<cucascade::memory::memory_space*>(hs);
+            break;
+          }
+        }
+      }
+      host_space_by_gpu[gpu_id] = picked;
+    }
+  }
+
+  // Glob the user-supplied path into concrete files.
+  auto& fs   = FileSystem::GetFileSystem(context);
+  auto files = fs.GlobFiles(data.args.path);
+  std::vector<std::string> file_paths;
+  file_paths.reserve(files.size());
+  for (auto& f : files) {
+    file_paths.push_back(f.path);
+  }
+
+  // Only parquet files are supported. Validate by extension before reading.
+  auto has_parquet_ext = [](std::string const& p) {
+    constexpr std::string_view kExt = ".parquet";
+    if (p.size() < kExt.size()) { return false; }
+    auto tail = p.substr(p.size() - kExt.size());
+    std::transform(
+      tail.begin(), tail.end(), tail.begin(), [](unsigned char c) { return std::tolower(c); });
+    return tail == kExt;
+  };
+  for (auto const& path : file_paths) {
+    if (!has_parquet_ext(path)) {
+      throw InvalidInputException("pin_table only supports parquet files, got non-parquet path: " +
+                                  path);
+    }
+  }
+
+  std::vector<std::string> cols =
+    data.args.cols.has_value() ? *data.args.cols : std::vector<std::string>{};
+
+  // Chunk read limit (target bytes per emitted batch) comes from operator_params.
+  std::size_t const chunk_read_limit =
+    sirius_ctx->get_config().get_operator_params().scan_task_batch_size;
+
+  // Read each file via cudf::chunked_parquet_reader so each emitted batch stays within
+  // chunk_read_limit bytes. The optional n_rows budget caps the cumulative row count
+  // across files; once exhausted, stop early.
+  std::vector<std::unique_ptr<cudf::table>> tables;
+  // Parallel vector to tables — chunk_memory_spaces[i] is the memory_space*
+  // for the i-th cudf::table in tables. Consumed by insert_pinned_entry's
+  // precondition check (size==data_tables.size).
+  std::vector<cucascade::memory::memory_space*> chunk_memory_spaces;
+  // HOST-tier storage: one host_data_representation per chunk.
+  std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;
+  std::vector<std::string> read_column_names;  // captured from parquet metadata
+  int64_t remaining_rows = data.args.n_rows.value_or(-1);
+  // Per-call local counter (NOT std::atomic, NOT global). PinTableFunction is
+  // single-threaded; new pin_table calls restart at chunk 0 → GPU 0 for
+  // reproducibility.
+  std::size_t chunk_idx = 0;
+
+  // For tier='host' the full table may not fit in GPU memory, so each batch is downgraded
+  // to a pinned host_data_representation immediately and the GPU buffers are released
+  // before the next read_chunk(). The GPU↔HOST converter uses cudaMemcpyBatchAsync which
+  // requires a real, non-default stream. Streams are constructed lazily inside the
+  // per-file loop under the device guard so each cuda_stream binds to its target GPU's
+  // context — a single pre-created stream binds to whichever device was current when
+  // emplaced and would route D2H copies through the wrong device for round-robin files
+  // that land on GPU 1+.
+  cucascade::representation_converter_registry* registry_ptr = nullptr;
+  std::unordered_map<int, rmm::cuda_stream> pin_streams_by_gpu;
+  if (data.args.tier == "host") { registry_ptr = &sirius::converter_registry::get(); }
+
+  for (auto const& path : file_paths) {
+    if (data.args.n_rows.has_value() && remaining_rows <= 0) { break; }
+
+    // Bind device BEFORE constructing chunked_parquet_reader so the cudf
+    // allocator places footer + decompress + column buffers on the intended
+    // GPU.
+    auto* target_space =
+      const_cast<cucascade::memory::memory_space*>(gpu_spaces[chunk_idx % gpu_spaces.size()]);
+    int target_gpu_id = target_space->get_device_id();
+    rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{target_gpu_id}};
+
+    // Route the chunked_parquet_reader through the per-GPU sirius_ioctx
+    // instead of cudf's bundled file_source factory (kvikio). The string-form
+    // source_info routes reads through libkvikio's FileHandle which binds a
+    // single CUDA context per file, breaking multi-GPU residency (the columns
+    // end up on the wrong GPU under sanitizer races).
+    auto target_ioctx = sirius_ctx->get_ioctx_for(target_gpu_id);
+    if (!target_ioctx) {
+      throw InvalidInputException("pin_table: no sirius_ioctx for target GPU " +
+                                  std::to_string(target_gpu_id) + ".");
+    }
+    auto io_object  = target_ioctx->create_io_object(path);
+    auto datasource = target_ioctx->make_datasource(io_object);
+
+    auto file_opts =
+      cudf::io::parquet_reader_options::builder(cudf::io::source_info{datasource.get()}).build();
+    if (!cols.empty()) { file_opts.set_column_names(cols); }
+    if (data.args.n_rows.has_value()) { file_opts.set_num_rows(remaining_rows); }
+
+    cudf::io::chunked_parquet_reader reader(chunk_read_limit, file_opts);
+    int64_t file_rows_read = 0;
+    while (reader.has_next()) {
+      auto chunk      = reader.read_chunk();
+      auto chunk_rows = static_cast<int64_t>(chunk.tbl->num_rows());
+      if (chunk_rows == 0) { break; }
+      if (read_column_names.empty()) {
+        read_column_names.reserve(chunk.metadata.schema_info.size());
+        for (auto const& col_info : chunk.metadata.schema_info) {
+          read_column_names.push_back(col_info.name);
+        }
+      }
+      file_rows_read += chunk_rows;
+      if (data.args.tier == "host") {
+        // Per-target-GPU stream + per-target-GPU host space: each round-robin
+        // file's chunks must record their D2H copies on a stream bound to the
+        // target GPU's context, and the destination host pinning should land
+        // on the NUMA-local host memory_space for that GPU.
+        // try_emplace default-constructs the rmm::cuda_stream when the key is
+        // missing. The default ctor calls cudaStreamCreate under whatever
+        // device is current — which is target_gpu_id by virtue of the
+        // surrounding device_guard.
+        auto [stream_it, inserted] = pin_streams_by_gpu.try_emplace(target_gpu_id);
+        (void)inserted;
+        rmm::cuda_stream_view target_stream = stream_it->second.view();
+        auto* target_host_space             = host_space_by_gpu.at(target_gpu_id);
+        cucascade::gpu_table_representation gpu_repr(
+          std::move(chunk.tbl), *target_space, target_stream);
+        auto host_repr = registry_ptr->convert<cucascade::host_data_representation>(
+          gpu_repr, target_host_space, target_stream);
+        // Sync before gpu_repr leaves scope so the async D2H copies finish before its
+        // device buffers are freed.
+        target_stream.synchronize();
+        host_chunks.emplace_back(std::move(host_repr));
+      } else {
+        tables.emplace_back(std::move(chunk.tbl));
+        chunk_memory_spaces.push_back(target_space);  // parallel to tables
+      }
+    }
+    if (data.args.n_rows.has_value()) { remaining_rows -= file_rows_read; }
+    // Per-call local counter, increments per file. All chunks within a single
+    // chunked_parquet_reader stay on the same GPU (chunks-at-index-i
+    // invariant). Cross-file alternation produces the round-robin.
+    ++chunk_idx;
+  }
+
+  // A user-supplied n_rows budget caps row capture below the full file content.
+  // The scan_manager must refuse cached reuse of such partial entries — see
+  // pinned_entry::is_partial.
+  bool const is_partial_pin = data.args.n_rows.has_value();
+  if (data.args.tier == "host") {
+    // entry.memory_space is metadata only; each host_chunk carries its own
+    // per-GPU NUMA-local memory_space inside its host_data_representation.
+    // Pass a representative (the first round-robin GPU's host space) so the
+    // entry still has a non-null memory_space for diagnostics.
+    int const first_gpu_id          = gpu_spaces[0]->get_device_id();
+    auto* representative_host_space = host_space_by_gpu.at(first_gpu_id);
+    sirius_ctx->get_scan_manager().insert_pinned_entry_host(data.args.name,
+                                                            std::move(read_column_names),
+                                                            std::move(file_paths),
+                                                            std::move(host_chunks),
+                                                            *representative_host_space,
+                                                            is_partial_pin);
+  } else {
+    sirius_ctx->get_scan_manager().insert_pinned_entry(data.args.name,
+                                                       std::move(read_column_names),
+                                                       std::move(file_paths),
+                                                       std::move(tables),
+                                                       std::move(chunk_memory_spaces),
+                                                       is_partial_pin);
+  }
+
+  output.SetCardinality(1);
+  output.SetValue(0, 0, Value::BOOLEAN(true));
+  data.finished = true;
+}
+
+struct UnpinTableFunctionData : public TableFunctionData {
+  std::string name;
+  bool finished = false;
+};
+
+unique_ptr<FunctionData> SiriusExtension::UnpinTableBind(ClientContext& context,
+                                                         TableFunctionBindInput& input,
+                                                         vector<LogicalType>& return_types,
+                                                         vector<string>& names)
+{
+  auto result = make_uniq<UnpinTableFunctionData>();
+
+  if (input.inputs.empty() || input.inputs[0].IsNull()) {
+    throw BinderException("unpin_table requires a non-null name argument");
+  }
+  result->name = input.inputs[0].ToString();
+
+  return_types.emplace_back(LogicalType::BOOLEAN);
+  names.emplace_back("Success");
+  return std::move(result);
+}
+
+void SiriusExtension::UnpinTableFunction(ClientContext& context,
+                                         TableFunctionInput& data_p,
+                                         DataChunk& output)
+{
+  auto& data = data_p.bind_data->CastNoConst<UnpinTableFunctionData>();
+  if (data.finished) { return; }
+
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    throw InvalidInputException("unpin_table requires the Sirius context to be initialized");
+  }
+  sirius_ctx->get_scan_manager().remove_pinned_entry(data.name);
+
+  output.SetCardinality(1);
+  output.SetValue(0, 0, Value::BOOLEAN(true));
+  data.finished = true;
 }
 
 struct ProfilerFunctionData : public GlobalTableFunctionState {
@@ -660,10 +1043,49 @@ static void ProfilerStopFunction(ClientContext& context,
   data.finished = true;
 }
 
+struct SiriusSetQueryLabelData : public TableFunctionData {
+  std::string label;
+  bool finished = false;
+};
+
+static unique_ptr<FunctionData> SiriusSetQueryLabelBind(ClientContext& context,
+                                                        TableFunctionBindInput& input,
+                                                        vector<LogicalType>& return_types,
+                                                        vector<string>& names)
+{
+  if (input.inputs.empty() || input.inputs[0].IsNull()) {
+    throw BinderException("sirius_set_query_label requires a non-NULL VARCHAR argument");
+  }
+  auto result   = make_uniq<SiriusSetQueryLabelData>();
+  result->label = input.inputs[0].ToString();
+  return_types.push_back(LogicalType::BOOLEAN);
+  names.push_back("ok");
+  return std::move(result);
+}
+
+static void SiriusSetQueryLabelFunction(ClientContext& context,
+                                        TableFunctionInput& data_p,
+                                        DataChunk& output)
+{
+  auto& data = data_p.bind_data->CastNoConst<SiriusSetQueryLabelData>();
+  if (data.finished) { return; }
+
+  if (auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+      sirius_ctx) {
+    sirius_ctx->set_pending_query_label(data.label);
+  }
+
+  output.SetCardinality(1);
+  output.SetValue(0, 0, Value::BOOLEAN(true));
+  data.finished = true;
+}
+
 void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
 {
   auto transaction = CatalogTransaction::GetSystemTransaction(instance);
   auto& catalog    = Catalog::GetSystemCatalog(instance);
+
+#ifdef SIRIUS_ENABLE_LEGACY
   TableFunction gpu_buffer_init("gpu_buffer_init",
                                 {LogicalType::VARCHAR, LogicalType::VARCHAR},
                                 GPUBufferInitFunction,
@@ -672,7 +1094,6 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   CreateTableFunctionInfo gpu_buffer_init_info(gpu_buffer_init);
   catalog.CreateTableFunction(transaction, gpu_buffer_init_info);
 
-#ifdef SIRIUS_ENABLE_LEGACY
   RegisterLegacyGPUFunctions(transaction, catalog);
 #endif
 
@@ -680,9 +1101,17 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
                               {LogicalType::VARCHAR},
                               GPUExecutionFunction,
                               SiriusExtension::GPUExecutionBind);
-  gpu_execution.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
+  gpu_execution.named_parameters["enable_optimizer"]    = LogicalType::BOOLEAN;
+  gpu_execution.named_parameters[QUERY_LABEL_PARAM_KEY] = LogicalType::VARCHAR;
   CreateTableFunctionInfo gpu_execution_info(gpu_execution);
   catalog.CreateTableFunction(transaction, gpu_execution_info);
+
+  TableFunction set_query_label("sirius_set_query_label",
+                                {LogicalType::VARCHAR},
+                                SiriusSetQueryLabelFunction,
+                                SiriusSetQueryLabelBind);
+  CreateTableFunctionInfo set_query_label_info(set_query_label);
+  catalog.CreateTableFunction(transaction, set_query_label_info);
 
   // Profiler control functions for nsys --capture-range=cudaProfilerApi
   TableFunction profiler_start(
@@ -694,6 +1123,19 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     "profiler_stop", {}, ProfilerStopFunction, ProfilerBind, ProfilerInit);
   CreateTableFunctionInfo profiler_stop_info(profiler_stop);
   catalog.CreateTableFunction(transaction, profiler_stop_info);
+
+  TableFunction pin_table("pin_table", {LogicalType::VARCHAR}, PinTableFunction, PinTableBind);
+  pin_table.named_parameters["tier"]   = LogicalType::VARCHAR;
+  pin_table.named_parameters["name"]   = LogicalType::VARCHAR;
+  pin_table.named_parameters["cols"]   = LogicalType::LIST(LogicalType::VARCHAR);
+  pin_table.named_parameters["n_rows"] = LogicalType::BIGINT;
+  CreateTableFunctionInfo pin_table_info(pin_table);
+  catalog.CreateTableFunction(transaction, pin_table_info);
+
+  TableFunction unpin_table(
+    "unpin_table", {LogicalType::VARCHAR}, UnpinTableFunction, UnpinTableBind);
+  CreateTableFunctionInfo unpin_table_info(unpin_table);
+  catalog.CreateTableFunction(transaction, unpin_table_info);
 }
 
 static void SetUsePinMemory(ClientContext& context, SetScope scope, Value& parameter)
@@ -713,6 +1155,21 @@ static void SetUseCudfExpr(ClientContext& context, SetScope scope, Value& parame
 {
   Config::USE_CUDF_EXPR = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config USE_CUDF_EXPR to {}", Config::USE_CUDF_EXPR);
+}
+
+static void SetExpressionExecutorStrategy(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto value = StringValue::Get(parameter);
+  sirius::expression_executor_strategy parsed;
+  if (!sirius::string_to_strategy(value, parsed)) {
+    throw InvalidInputException(
+      "Invalid expression_executor_strategy '{}'. Valid values: materialize, ast_interpret, "
+      "ast_jit",
+      value);
+  }
+  Config::EXPRESSION_EXECUTOR_STRATEGY = parsed;
+  SIRIUS_LOG_DEBUG("Updated config EXPRESSION_EXECUTOR_STRATEGY to {}",
+                   sirius::strategy_to_string(Config::EXPRESSION_EXECUTOR_STRATEGY));
 }
 
 static void SetUseCustomTopN(ClientContext& context, SetScope scope, Value& parameter)
@@ -864,6 +1321,24 @@ static void SetLogFlushSeconds(ClientContext& context, SetScope scope, Value& pa
   SIRIUS_LOG_DEBUG("Updated config LOG_FLUSH_SECONDS to {}", Config::LOG_FLUSH_SECONDS);
 }
 
+static void SetEnableQuent(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::ENABLE_QUENT = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_QUENT to {}", Config::ENABLE_QUENT);
+}
+
+static void SetQuentOutputDirectory(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::QUENT_OUTPUT_DIRECTORY = StringValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config QUENT_OUTPUT_DIRECTORY to {}", Config::QUENT_OUTPUT_DIRECTORY);
+}
+
+static void SetQuentEngineName(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::QUENT_ENGINE_NAME = StringValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config QUENT_ENGINE_NAME to {}", Config::QUENT_ENGINE_NAME);
+}
+
 static void SetMaxBuildHashTableBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -871,6 +1346,11 @@ static void SetMaxBuildHashTableBytes(ClientContext& context, SetScope scope, Va
   params->max_build_hash_table_bytes = UBigIntValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config MAX_BUILD_HASH_TABLE_BYTES to {}",
                    params->max_build_hash_table_bytes);
+}
+
+static void SetEnableGpuExecution(ClientContext& context, SetScope scope, Value& parameter)
+{
+  SIRIUS_LOG_DEBUG("Updated gpu_execution to {}", BooleanValue::Get(parameter));
 }
 
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
@@ -895,6 +1375,14 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(Config::USE_CUDF_EXPR),
                             SetUseCudfExpr);
+
+  config.AddExtensionOption(
+    "expression_executor_strategy",
+    "Strategy for the gpu_expression_executor: 'materialize', 'ast_interpret', or "
+    "'ast_jit'",
+    LogicalType::VARCHAR,
+    Value(std::string(sirius::strategy_to_string(Config::EXPRESSION_EXECUTOR_STRATEGY))),
+    SetExpressionExecutorStrategy);
 
   // Add in config option for top-N
   config.AddExtensionOption("use_custom_top_n",
@@ -995,6 +1483,24 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             Value::INTEGER(Config::LOG_FLUSH_SECONDS),
                             SetLogFlushSeconds);
 
+  // Quent telemetry configuration
+  config.AddExtensionOption(
+    "enable_quent",
+    "Whether to emit quent telemetry (false uses the noop exporter; true uses ndjson)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(Config::ENABLE_QUENT),
+    SetEnableQuent);
+  config.AddExtensionOption("quent_output_directory",
+                            "Output directory for quent telemetry exports",
+                            LogicalType::VARCHAR,
+                            Value(Config::QUENT_OUTPUT_DIRECTORY),
+                            SetQuentOutputDirectory);
+  config.AddExtensionOption("quent_engine_name",
+                            "Engine name reported via quent telemetry",
+                            LogicalType::VARCHAR,
+                            Value(Config::QUENT_ENGINE_NAME),
+                            SetQuentEngineName);
+
   config.AddExtensionOption("hash_partition_bytes",
                             "Target size in bytes per hash partition",
                             LogicalType::UBIGINT,
@@ -1019,6 +1525,13 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::UBIGINT,
                             Value::UBIGINT(sirius::operator_params{}.max_build_hash_table_bytes),
                             SetMaxBuildHashTableBytes);
+
+  config.AddExtensionOption(
+    "gpu_execution",
+    "Whether to transparently intercept SQL queries and execute them on GPU",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(true),
+    SetEnableGpuExecution);
 }
 
 static void LoadInternal(ExtensionLoader& loader)
@@ -1033,6 +1546,13 @@ static void LoadInternal(ExtensionLoader& loader)
   sirius::converter_registry::initialize();
   SiriusExtension::InitialGPUConfigs(config);
   SiriusExtension::RegisterGPUFunctions(db);
+
+  // Register optimizer extension for transparent GPU execution.
+  // Pre-hook disables incompatible optimizers; post-hook captures the plan.
+  OptimizerExtension opt_ext;
+  opt_ext.pre_optimize_function = sirius::transparent::sirius_pre_optimizer_hook;
+  opt_ext.optimize_function     = sirius::transparent::sirius_optimizer_hook;
+  OptimizerExtension::Register(config, std::move(opt_ext));
 
   // Register SiriusContext on connections that were opened before the extension
   // was loaded (e.g. when loaded via LOAD in Python or the CLI).

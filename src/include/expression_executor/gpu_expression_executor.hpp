@@ -18,26 +18,16 @@
 
 // sirius
 #include <config.hpp>
-#include <expression_executor/gpu_expression_executor_state.hpp>
-#include <gpu_buffer_manager.hpp>
-#include <gpu_columns.hpp>
-
-// duckdb
-#include <duckdb/planner/expression/bound_between_expression.hpp>
-#include <duckdb/planner/expression/bound_case_expression.hpp>
-#include <duckdb/planner/expression/bound_cast_expression.hpp>
-#include <duckdb/planner/expression/bound_comparison_expression.hpp>
-#include <duckdb/planner/expression/bound_conjunction_expression.hpp>
-#include <duckdb/planner/expression/bound_constant_expression.hpp>
-#include <duckdb/planner/expression/bound_function_expression.hpp>
-#include <duckdb/planner/expression/bound_operator_expression.hpp>
-#include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <expression/expression.hpp>
+#include <expression_executor/expression_executor_strategy.hpp>
 
 // cucascades
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository_manager.hpp>
 
 // cudf
+#include <cudf/ast/expressions.hpp>
+#include <cudf/column/column_view.hpp>
 #include <cudf/types.hpp>
 
 // rmm
@@ -46,160 +36,367 @@
 
 // standard library
 #include <memory>
+#include <variant>
 #include <vector>
 
 namespace duckdb {
+class Expression;
+class BoundBetweenExpression;
+class BoundCaseExpression;
+class BoundCastExpression;
+class BoundComparisonExpression;
+class BoundConjunctionExpression;
+class BoundConstantExpression;
+class BoundFunctionExpression;
+class BoundOperatorExpression;
+class BoundReferenceExpression;
+}  // namespace duckdb
+
 namespace sirius {
 
-//===----------------------------------------------------------------------===//
-// GpuExpressionExecutor
-//===----------------------------------------------------------------------===//
+/**
+ * @brief Returns the current default expression_executor_strategy configured via
+ * `duckdb::Config::EXPRESSION_EXECUTOR_STRATEGY`.
+ */
+inline expression_executor_strategy strategy_from_config()
+{
+  return duckdb::Config::EXPRESSION_EXECUTOR_STRATEGY;
+}
 
 /**
- * @brief The GpuExpressionExecutor is responsible for evaluating expressions on the GPU.
+ * @brief The gpu_expression_executor is responsible for evaluating DuckDB expressions on the GPU
+ * using cuDF.
+ *
+ * It builds a tree of AST trees whose edges are 'AST breakers', i.e., expression
+ * operations that don't have cuDF AST equivalents (e.g., LIKE, SUBSTRING, CASE, etc.). Each AST
+ * tree is then interpreted or JIT-compiled with cuDF to produce the final result. If the
+ * expression_executor_strategy is MATERIALIZE, the AST trees are single operators and revert to
+ * direct unary/binary operators. To control how many nodes should be in an AST tree before we
+ * execute in AST mode (rather than MATERIALIZE mode), toggle the `min_ast_size` parameter in the
+ * constructor.
  */
-struct GpuExpressionExecutor {
+class gpu_expression_executor {
+  using expr_ref = std::reference_wrapper<cudf::ast::expression const>;
+
+ public:
   using data_batch              = cucascade::data_batch;
   using data_repository_manager = cucascade::data_repository_manager<std::shared_ptr<data_batch>>;
 
-  //===----------Constructor/Destructor(s)----------===//
   /**
-   * @brief Constructs an expression executor with a single expression
+   * @brief The result of adding an expression to the executor's AST tree.
    *
-   * @param expr The expression to evaluate
-   * @param resource_ref The rmm::device_async_resource_ref to pass to cudf APIs for allocations
+   * It stores the reference to the AST node corresponding to the expression, as well as the indices
+   * of any temporary scalars or columns that need to be kept alive for the AST node to be valid.
+   * When the tree to which this AST node belongs is evaluated, these scalars and columns are
+   * released.
    */
-  GpuExpressionExecutor(
-    const Expression& expr,
-    rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref());
+  struct ast_result {
+    expr_ref expr;  ///< The reference to the AST node corresponding to the expression.
+    std::vector<std::size_t> temp_scalar_indices;  ///< The indices of the temp scalars that need to
+                                                   ///< be kept alive for this AST expression.
+    std::vector<std::size_t> temp_column_indices;  ///< The indices of the temp columns that need to
+                                                   ///< be kept alive for this AST expression.
+
+    /**
+     * @brief Construct an ast_result with the given AST node reference and no temporary scalars or
+     * columns
+     *
+     * @param e The reference to the AST node corresponding to the expression
+     */
+    ast_result(expr_ref e) : expr(e) {}
+
+    /**
+     * @brief Construct an ast_result with the given AST node reference and scalar and column
+     * indices.
+     *
+     * @param e The reference to the AST node corresponding to the expression
+     * @param scalar_indices The indices of the temp scalars that need to be kept alive for this AST
+     * expression.
+     * @param column_indices The indices of the temp columns that need to be kept alive for this AST
+     * expression.
+     */
+    ast_result(expr_ref e,
+               std::vector<std::size_t> scalar_indices,
+               std::vector<std::size_t> column_indices)
+      : expr(e),
+        temp_scalar_indices(std::move(scalar_indices)),
+        temp_column_indices(std::move(column_indices))
+    {
+    }
+
+    /**
+     * @brief Construct an ast_result with the given AST node reference and sets of scalar and
+     * column indices.
+     *
+     * @param e The reference to the AST node corresponding to the expression
+     * @param scalar_indices The set of indices of the temp scalars that need to be kept alive for
+     * this AST expression.
+     * @param column_indices The set of indices of the temp columns that need to be kept alive for
+     * this AST expression.
+     */
+    ast_result(expr_ref e,
+               std::vector<std::vector<std::size_t>> scalar_indices,
+               std::vector<std::vector<std::size_t>> column_indices);
+  };
 
   /**
-   * @brief Constructs an expression executor with a set of expressions
+   * @brief The result placeholder for executing an expression.
    *
-   * @param expressions The expressions to evaluate
-   * @param resource_ref The rmm::device_async_resource_ref to pass to cudf APIs for allocations
+   * It holds either 1) an ast_result if the expression was added to the AST tree,
+   *                 2) a cudf::column_view if the expression is a BOUND_REFERENCE evaluated in
+   *                    MATERIALIZE mode,
+   *                 3) a std::unique_ptr<cudf::scalar> if the expression is a BOUND_CONSTANT
+   *                    evaluated in MATERIALIZE mode.
+   *                 4) a std::unique_ptr<cudf::column> if the expression is an interior
+   *                    node evaluated in MATERIALIZE mode.
    */
-  GpuExpressionExecutor(
-    const vector<unique_ptr<Expression>>& expressions,
-    rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref());
+  struct execute_result {
+    std::variant<ast_result,
+                 cudf::column_view,
+                 std::unique_ptr<cudf::scalar>,
+                 std::unique_ptr<cudf::column>>
+      payload;
 
-  //===----------Fields----------===//
-  std::vector<const Expression*> expressions;  ///< The expressions to execute
-  std::vector<std::unique_ptr<GpuExpressionExecutorState>>
-    states;  ///< The execution states associated with each expression to execute
-  std::vector<shared_ptr<GPUColumn>>
-    input_columns;                              ///< The input columns for expression evaluation
-  rmm::device_async_resource_ref resource_ref;  ///< The allocator to pass to cudf APIs
-  cudf::size_type input_count;                  ///< The row count of the input table
-  bool has_null_input_column;                   ///< Whether some input column is null
-  rmm::cuda_stream_view execution_stream;       ///< THe stream in which to execute operations
+    execute_result() = delete;
 
-  //===----------Fields for New Execution Model----------===//
-  bool use_data_batch_apis =
-    false;  ///< Whether to use the data_batch APIs in executing bound references
-  std::vector<std::unique_ptr<cudf::column>>
-    output_columns;              ///< The columns generated by the executed expressions
-  cudf::table_view input_table;  ///< The input table
+    /// @brief Constructs an execute_result holding an AST expression reference.
+    execute_result(ast_result ast_payload) : payload(std::move(ast_payload)) {}
 
-  //===----------Methods----------===//
-  void AddExpression(const Expression& expr);
-  void ClearExpressions();
+    /// @brief Constructs an execute_result holding a non-owning column view (e.g. a bound
+    /// reference in MATERIALIZE mode).
+    execute_result(cudf::column_view column_view_payload) : payload(column_view_payload) {}
 
-  // Set the root state of the executor to the given expression
-  void Initialize(const Expression& expr, GpuExpressionExecutorState& state);
+    /// @brief Constructs an execute_result holding an owning scalar (e.g. a bound constant in
+    /// MATERIALIZE mode).
+    execute_result(std::unique_ptr<cudf::scalar> scalar_payload)
+      : payload(std::move(scalar_payload))
+    {
+    }
 
-  // Set the input count and columns for the expression executor
-  void SetInputColumns(const GPUIntermediateRelation& input_relation);
+    /// @brief Constructs an execute_result holding an owning column (e.g. an interior expression
+    /// node evaluated in MATERIALIZE mode).
+    execute_result(std::unique_ptr<cudf::column> column_payload)
+      : payload(std::move(column_payload))
+    {
+    }
 
-  // Before evaluating an expression, check the leaves for nullptrs
-  // (Assumes the input columns have already been set)
-  [[nodiscard]] bool HasNullLeaf(const Expression& expr) const;
-  template <typename ExpressionT>
-  bool HasNullLeafLoop(const ExpressionT& expr) const;
+    /// @brief Returns true if the payload holds an ast_result.
+    [[nodiscard]] bool is_ast() const { return std::holds_alternative<ast_result>(payload); }
 
-  // Execute the set of expressions with the given input relation and store the result in the output
-  // relation (Provides the main interface with client code for Projections).
-  void Execute(const GPUIntermediateRelation& input_relation,
-               GPUIntermediateRelation& output_relation,
-               rmm::cuda_stream_view stream = rmm::cuda_stream_default);
+    /// @brief Returns true if the payload holds a cudf::scalar.
+    [[nodiscard]] bool is_scalar() const
+    {
+      return std::holds_alternative<std::unique_ptr<cudf::scalar>>(payload);
+    }
 
-  // Execute the set of expressions with the given input relation and compact into the output
-  // relation based on the resulting selection vector (Provides the main interface with client code
-  // for Filters).
-  void Select(GPUIntermediateRelation& input_relation,
-              GPUIntermediateRelation& output_relation,
-              rmm::cuda_stream_view stream = rmm::cuda_stream_default);
+    /// @brief Returns true if the payload holds a cudf::column_view.
+    [[nodiscard]] bool is_column_view() const
+    {
+      return std::holds_alternative<cudf::column_view>(payload);
+    }
+
+    /// @brief Returns true if the payload holds an owned cudf::column.
+    [[nodiscard]] bool is_owned_column() const
+    {
+      return std::holds_alternative<std::unique_ptr<cudf::column>>(payload);
+    }
+
+    /**
+     * @brief Returns the AST expression reference from the payload.
+     * @throws std::runtime_error if the payload does not hold an ast_result.
+     */
+    [[nodiscard]] expr_ref get_expr() const;
+
+    /**
+     * @brief Returns the indices of temporary scalars that must be kept alive for the AST
+     * expression.
+     * @return The temporary scalar indices if the payload holds an ast_result, otherwise an empty
+     * vector.
+     */
+    [[nodiscard]] std::vector<std::size_t> get_temp_scalar_indices() const;
+
+    /**
+     * @brief Returns the indices of temporary columns that must be kept alive for the AST
+     * expression.
+     * @return The temporary column indices if the payload holds an ast_result, otherwise an empty
+     * vector.
+     */
+    [[nodiscard]] std::vector<std::size_t> get_temp_column_indices() const;
+
+    /**
+     * @brief Returns a const reference to the cudf::scalar held by the payload.
+     * @throws std::runtime_error if the payload does not hold a cudf::scalar.
+     */
+    [[nodiscard]] cudf::scalar const& get_scalar() const;
+
+    /**
+     * @brief Returns a column_view of the result.
+     *
+     * If the payload holds a cudf::column_view, it is returned directly. If it holds a
+     * std::unique_ptr<cudf::column>, a view of the owned column is returned.
+     *
+     * @throws std::runtime_error if the payload holds an ast_result or a cudf::scalar.
+     */
+    [[nodiscard]] cudf::column_view get_column_view() const;
+
+    /**
+     * @brief Moves the owned cudf::column out of the payload.
+     * @throws std::runtime_error if the payload does not hold a std::unique_ptr<cudf::column>.
+     */
+    [[nodiscard]] std::unique_ptr<cudf::column> release_column();
+  };
+
+  /**
+   * @brief The mode in which to execute an expression.
+   *
+   * This is used internally by the expression executor to switch between trying to add expression
+   * nodes to the AST tree or materializing them as cudf::columns during execution. The mode is
+   * determined by the expression_executor_strategy and the min_ast_size parameters of the
+   * constructor, but can also be overridden for individual expressions by passing the desired mode
+   * to the execute method. Note that if an expression is executed in AST mode, it is added to the
+   * AST tree and the result is an ast_result; if it is executed in MATERIALIZE mode, it is executed
+   * directly and the result is a column or scalar. The execution_mode parameter of the execute
+   * method is just a hint and is not strictly enforced, e.g., if you pass execution_mode::AST but
+   * the expression node is an AST breaker, it will be executed in MATERIALIZE mode instead.
+   */
+  enum class execution_mode {
+    AST,
+    MATERIALIZE,
+  };
+
+  /**
+   * @brief Construct a gpu_expression_executor with the given set of expressions (for PROJECTION
+   * operators).
+   *
+   * @param expressions The expressions to execute.
+   * @param resource_ref The rmm::device_async_resource_ref to pass to cuDF APIs for allocations.
+   * @param stream The rmm::cuda_stream_view in which to execute any cuDF operations.
+   * @param strategy The strategy to use for expression execution (AST_INTERPRET, AST_JIT, or
+   * MATERIALIZE). Defaults to the value of `duckdb::Config::EXPRESSION_EXECUTOR_STRATEGY`.
+   * @param min_ast_size The minimum number of nodes in an AST tree before we switch from
+   * MATERIALIZE mode to AST mode. If an expression subtree rooted at a given node produces an AST
+   * with N operators and N < min_ast_size, the expression will be evaluated operator-by-operator
+   * (in MATERIALIZE mode). Otherwise, the executor will try to evaluate the expression subtree by
+   * adding nodes to the AST tree.
+   */
+  gpu_expression_executor(
+    duckdb::vector<sirius::expression> const& expressions,
+    rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
+    rmm::cuda_stream_view stream                = cudf::get_default_stream(),
+    expression_executor_strategy strategy       = strategy_from_config(),
+    std::size_t min_ast_size                    = 2);
+
+  /**
+   * @brief Construct a gpu_expression_executor with the given expression (for FILTER operators).
+   *
+   * @param expression The expressions to execute.
+   * @param resource_ref The rmm::device_async_resource_ref to pass to cuDF APIs for allocations.
+   * @param stream The rmm::cuda_stream_view in which to execute any cuDF operations.
+   * @param strategy The strategy to use for expression execution (AST_INTERPRET, AST_JIT, or
+   * MATERIALIZE). Defaults to the value of `duckdb::Config::EXPRESSION_EXECUTOR_STRATEGY`.
+   * @param min_ast_size The minimum number of nodes in an AST tree before we switch from
+   * MATERIALIZE mode to AST mode. If an expression subtree rooted at a given node produces an AST
+   * with N operators and N < min_ast_size, the expression will be evaluated operator-by-operator
+   * (in MATERIALIZE mode). Otherwise, the executor will try to evaluate the expression subtree by
+   * adding nodes to the AST tree.
+   */
+  gpu_expression_executor(
+    sirius::expression const& expression,
+    rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
+    rmm::cuda_stream_view stream                = cudf::get_default_stream(),
+    expression_executor_strategy strategy       = strategy_from_config(),
+    std::size_t min_ast_size                    = 2);
+
+  /**
+   * @brief Non-owning ctor for internal call sites that already hold a raw duckdb::Expression
+   * pointer (e.g., NLJ lambda over cuDF expressions, parquet scan filter pushdown). The caller
+   * retains ownership; the executor only reads from the expression.
+   */
+  gpu_expression_executor(
+    duckdb::Expression const* expression,
+    rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
+    rmm::cuda_stream_view stream                = cudf::get_default_stream(),
+    expression_executor_strategy strategy       = strategy_from_config(),
+    std::size_t min_ast_size                    = 2);
 
   /**
    * @brief Executes the current set of expressions against the given input batch and emits a new
-   * output batch holding the results.
+   * output batch with the results.
    *
-   * @param input_batch The input batch against which to evaluate expressions
-   * @param stream The stream in which to execute the operations in the expression tree
-   *
-   * @return std::shared_ptr<cucascade::data_batch> The result of the evaluated expressions
-   *
-   * @note It is required that there is only one boolean expression in the current expression set.
+   * @param input_batch The read-only locked input batch against which to evaluate expressions.
+   * @return A new idle batch containing the results of expression evaluation.
    */
-  std::shared_ptr<data_batch> execute(std::shared_ptr<data_batch> input_batch,
-                                      rmm::cuda_stream_view stream);
+  std::unique_ptr<cudf::table> execute(cudf::table_view input);
 
   /**
-   * @brief Evaluates a boolean expression and filters the input batch according to the result.
+   * @brief Selects rows from the input batch based on the executor's (singular) expression.
    *
-   * @param input_batch The input batch against which to evaluate the expression
-   * @param stream The stream in which to execute the operations in the expression tree
-   *
-   * @return std::shared_ptr<cucascade::data_batch> The input batch filtered by the boolean
-   * expression
+   * @param input_batch The read-only locked input batch from which to select rows.
+   * @return A new idle batch containing the selected rows.
    */
-  std::shared_ptr<cucascade::data_batch> select(std::shared_ptr<data_batch> input_batch,
-                                                rmm::cuda_stream_view stream);
+  std::unique_ptr<cudf::table> select(cudf::table_view input);
 
-  // Execute the expression at the given index and return the result
-  std::unique_ptr<cudf::column> ExecuteExpression(idx_t expression_idx);
+ private:
+  std::vector<duckdb::Expression const*> _expressions;  ///< The expressions to execute
+  expression_executor_strategy _strategy;  ///< The strategy to use for expression evaluation
+  rmm::device_async_resource_ref _mr;  ///< The allocator to pass to cudf APIs for any allocations
+  rmm::cuda_stream_view _stream;       ///< The stream in which to execute any cuDF operations
+  std::size_t _min_ast_size;  ///< The minimum number of nodes in an AST tree before we switch from
+                              ///< MATERIALIZE mode to AST mode
+  cudf::table_view _input_table;  ///< The input table for expression evaluation
+  std::vector<std::unique_ptr<cudf::column>>
+    _output_columns;  ///< The output columns generated by expression evaluation (one per
+                      ///< expression)
 
-  //----------Execute + Specializations----------//
-  std::unique_ptr<cudf::column> Execute(const Expression& expr, GpuExpressionState* state);
-  std::unique_ptr<cudf::column> Execute(const BoundBetweenExpression& expr,
-                                        GpuExpressionState* state);
-  std::unique_ptr<cudf::column> Execute(const BoundCaseExpression& expr, GpuExpressionState* state);
-  std::unique_ptr<cudf::column> Execute(const BoundCastExpression& expr, GpuExpressionState* state);
-  std::unique_ptr<cudf::column> Execute(const BoundComparisonExpression& expr,
-                                        GpuExpressionState* state);
-  std::unique_ptr<cudf::column> Execute(const BoundConjunctionExpression& expr,
-                                        GpuExpressionState* state);
-  std::unique_ptr<cudf::column> Execute(const BoundConstantExpression& expr,
-                                        GpuExpressionState* state);
-  std::unique_ptr<cudf::column> Execute(const BoundFunctionExpression& expr,
-                                        GpuExpressionState* state);
-  std::unique_ptr<cudf::column> Execute(const BoundOperatorExpression& expr,
-                                        GpuExpressionState* state);
-  std::unique_ptr<cudf::column> Execute(const BoundReferenceExpression& expr,
-                                        GpuExpressionState* state);
+  cudf::ast::tree
+    _ast_tree;  ///< The AST tree maintaining the set of AST nodes during expression evaluation.
+  std::vector<std::unique_ptr<cudf::scalar>>
+    _temp_scalars;  ///< The temporary scalars that need to be kept alive for the AST nodes in
+                    ///< _ast_tree.
+  std::vector<std::unique_ptr<cudf::column>>
+    _temp_columns;  ///< The temporary columns that need to be kept alive for the AST nodes in
+                    ///< _ast_tree.
 
-  //===----------Initialize State + Specializations----------===//
-  static std::unique_ptr<GpuExpressionState> InitializeState(const Expression& expr,
-                                                             GpuExpressionExecutorState& state);
-  static std::unique_ptr<GpuExpressionState> InitializeState(const BoundBetweenExpression& expr,
-                                                             GpuExpressionExecutorState& state);
-  static std::unique_ptr<GpuExpressionState> InitializeState(const BoundCaseExpression& expr,
-                                                             GpuExpressionExecutorState& state);
-  static std::unique_ptr<GpuExpressionState> InitializeState(const BoundCastExpression& expr,
-                                                             GpuExpressionExecutorState& state);
-  static std::unique_ptr<GpuExpressionState> InitializeState(const BoundComparisonExpression& expr,
-                                                             GpuExpressionExecutorState& state);
-  static std::unique_ptr<GpuExpressionState> InitializeState(const BoundConjunctionExpression& expr,
-                                                             GpuExpressionExecutorState& state);
-  static std::unique_ptr<GpuExpressionState> InitializeState(const BoundConstantExpression& expr,
-                                                             GpuExpressionExecutorState& state);
-  static std::unique_ptr<GpuExpressionState> InitializeState(const BoundFunctionExpression& expr,
-                                                             GpuExpressionExecutorState& state);
-  static std::unique_ptr<GpuExpressionState> InitializeState(const BoundOperatorExpression& expr,
-                                                             GpuExpressionExecutorState& state);
-  static std::unique_ptr<GpuExpressionState> InitializeState(const BoundReferenceExpression& expr,
-                                                             GpuExpressionExecutorState& state);
+  // Execute the AST tree rooted at the given expression reference and return the result as a
+  // column.
+  std::unique_ptr<cudf::column> execute_ast(expr_ref root_expr);
+
+  /**
+   * @brief Stores a materialized column as a temporary and returns an ast_result referencing it.
+   *
+   * This is used by AST breakers (e.g. CASE, unsupported CAST) that cannot represent their logic
+   * as cudf AST nodes. When called with execution_mode::AST from a parent expression, they
+   * materialize their result, stash it in _temp_columns, and return an ast_result with a
+   * column_reference pointing to the temp column's index in the combined table.
+   */
+  execute_result materialize_as_ast_column(std::unique_ptr<cudf::column> column);
+
+  // Release memory for the temporary scalars and columns with the given indices.
+  void release_temporaries(std::vector<std::size_t> const& scalar_indices,
+                           std::vector<std::size_t> const& column_indices);
+  void release_temporaries(std::vector<std::vector<std::size_t>> const& scalar_indices,
+                           std::vector<std::vector<std::size_t>> const& column_indices);
+
+  // Generic execute method
+  execute_result execute(duckdb::Expression const& expr, execution_mode mode = execution_mode::AST);
+
+  // Leaf expression nodes
+  execute_result execute(duckdb::BoundReferenceExpression const& expr, execution_mode mode);
+  execute_result execute(duckdb::BoundConstantExpression const& expr, execution_mode mode);
+
+  // Interior expression nodes
+  execute_result execute(duckdb::BoundBetweenExpression const& expr, execution_mode mode);
+  execute_result execute(duckdb::BoundCaseExpression const& expr, execution_mode mode);
+  execute_result execute(duckdb::BoundCastExpression const& expr, execution_mode mode);
+  execute_result execute(duckdb::BoundComparisonExpression const& expr, execution_mode mode);
+  execute_result execute(duckdb::BoundConjunctionExpression const& expr, execution_mode mode);
+  execute_result execute(duckdb::BoundFunctionExpression const& expr, execution_mode mode);
+  execute_result execute(duckdb::BoundOperatorExpression const& expr, execution_mode mode);
+
+  // Counts the number of AST nodes that would be generated for the given expression if we
+  // added it to the AST tree. This is used to determine whether we should execute in AST mode or
+  // MATERIALIZE mode for the expression (by comparing the count to `min_ast_size`).
+  [[nodiscard]] std::size_t count_ast_ops(duckdb::Expression const& expr) const;
 };
 
 }  // namespace sirius
-}  // namespace duckdb

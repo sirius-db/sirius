@@ -29,7 +29,7 @@ namespace op {
 
 sirius_physical_cte::sirius_physical_cte(std::string ctename,
                                          std::size_t table_index,
-                                         duckdb::vector<duckdb::LogicalType> types,
+                                         duckdb::vector<sirius::logical_type> types,
                                          duckdb::unique_ptr<sirius_physical_operator> top,
                                          duckdb::unique_ptr<sirius_physical_operator> bottom,
                                          std::size_t estimated_cardinality)
@@ -51,8 +51,6 @@ void sirius_physical_cte::build_pipelines(pipeline::sirius_pipeline& current,
                                           pipeline::sirius_meta_pipeline& meta_pipeline)
 {
   D_ASSERT(children.size() == 2);
-  op_state.reset();
-  sink_state.reset();
 
   auto& state = meta_pipeline.get_state();
 
@@ -79,7 +77,7 @@ std::unique_ptr<operator_data> sirius_physical_cte::execute(const operator_data&
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_cte::execute"};
   return std::make_unique<pipelineable_operator_data>(
-    dynamic_cast<const pipelineable_operator_data&>(input_data).get_data_batches());
+    dynamic_cast<const pipelineable_operator_data&>(input_data).get_read_only_batches(false));
 }
 
 }  // namespace op

@@ -15,6 +15,7 @@
  */
 
 // sirius
+#include <helper/type_conversions.hpp>
 #include <helper/utils.hpp>
 #include <op/result/host_table_chunk_reader.hpp>
 
@@ -34,7 +35,7 @@ namespace sirius::op::result {
 
 host_table_chunk_reader::column_reader::column_reader(
   cucascade::memory::column_metadata const& col,
-  std::unique_ptr<multiple_blocks_allocation> const& allocation)
+  std::shared_ptr<multiple_blocks_allocation> const& allocation)
 {
   if (allocation == nullptr || allocation->block_size() == 0) {
     throw std::runtime_error(
@@ -69,7 +70,7 @@ void host_table_chunk_reader::column_reader::copy_mask_to_validity(
   duckdb::ValidityMask& validity,
   size_t row_offset,
   size_t count,
-  std::unique_ptr<multiple_blocks_allocation> const& allocation)
+  std::shared_ptr<multiple_blocks_allocation> const& allocation)
 {
   assert(row_offset + count <= static_cast<size_t>(size));
   assert(utils::mod_8(row_offset) == 0);  // Must be byte-aligned start
@@ -86,7 +87,7 @@ void host_table_chunk_reader::column_reader::copy_fixed_width(
   duckdb::Vector& vector,
   size_t row_offset,
   size_t count,
-  std::unique_ptr<multiple_blocks_allocation> const& allocation)
+  std::shared_ptr<multiple_blocks_allocation> const& allocation)
 {
   assert(vector.GetType().InternalType() != duckdb::PhysicalType::VARCHAR);
   assert(row_offset + count <= static_cast<size_t>(size));
@@ -111,17 +112,14 @@ void host_table_chunk_reader::column_reader::copy_fixed_width(
 
 namespace detail {
 // Helper template function for constructing duckdb strings from offsets
-template <bool HasNulls, typename OffsetType>
-void make_duckdb_strings(
-  memory::multiple_blocks_allocation_accessor<OffsetType>& offset_accessor,
-  std::unique_ptr<
-    cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation> const&
-    allocation,
-  duckdb::Vector& vector,
-  size_t count,
-  size_t start_offset,
-  size_t end_offset,
-  duckdb::data_ptr_t str_buffer_ptr)
+template <bool HasNulls, typename OffsetType, typename AllocPtr>
+void make_duckdb_strings(memory::multiple_blocks_allocation_accessor<OffsetType>& offset_accessor,
+                         AllocPtr const& allocation,
+                         duckdb::Vector& vector,
+                         size_t count,
+                         size_t start_offset,
+                         size_t end_offset,
+                         duckdb::data_ptr_t str_buffer_ptr)
 {
   auto* strings = duckdb::FlatVector::GetData<duckdb::string_t>(vector);
   size_t start  = start_offset;
@@ -167,7 +165,7 @@ void host_table_chunk_reader::column_reader::copy_string(
   duckdb::Vector& vector,
   size_t row_offset,
   size_t count,
-  std::unique_ptr<multiple_blocks_allocation> const& allocation)
+  std::shared_ptr<multiple_blocks_allocation> const& allocation)
 {
   assert(vector.GetType().InternalType() == duckdb::PhysicalType::VARCHAR);
   assert(row_offset + count <= static_cast<size_t>(size));
@@ -221,8 +219,10 @@ void host_table_chunk_reader::column_reader::copy_string(
 host_table_chunk_reader::host_table_chunk_reader(
   duckdb::ClientContext& client_ctx,
   cucascade::host_data_representation const& host_table,
-  duckdb::vector<duckdb::LogicalType> const& types_p)
-  : _client_ctx(client_ctx), _allocation(host_table.get_host_table()->allocation), _types(types_p)
+  duckdb::vector<sirius::logical_type> const& types_p)
+  : _client_ctx(client_ctx),
+    _allocation(host_table.get_host_table()->allocation),
+    _types(sirius::to_duckdb_vec(types_p))
 {
   if (!host_table.get_host_table().get()) {
     throw std::runtime_error(

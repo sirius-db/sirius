@@ -20,24 +20,24 @@ namespace sirius {
 namespace pipeline {
 
 sirius_meta_pipeline::sirius_meta_pipeline(
-  sirius_engine& engine,
+  const pipeline_build_context& ctx,
   sirius_pipeline_build_state& state_p,
-  duckdb::optional_ptr<op::sirius_physical_operator> sink_p)
-  : engine(engine), state(state_p), sink(sink_p), recursive_cte(false), next_batch_index(0)
+  sirius::optional_ptr<op::sirius_physical_operator> sink_p)
+  : build_ctx(ctx), state(state_p), sink(sink_p), recursive_cte(false), next_batch_index(0)
 {
   create_pipeline();
 }
 
-sirius_engine& sirius_meta_pipeline::get_engine() const { return engine; }
+const pipeline_build_context& sirius_meta_pipeline::get_build_context() const { return build_ctx; }
 
 sirius_pipeline_build_state& sirius_meta_pipeline::get_state() const { return state; }
 
-duckdb::optional_ptr<op::sirius_physical_operator> sirius_meta_pipeline::get_sink() const
+sirius::optional_ptr<op::sirius_physical_operator> sirius_meta_pipeline::get_sink() const
 {
   return sink;
 }
 
-duckdb::optional_ptr<sirius_pipeline> sirius_meta_pipeline::get_parent() const { return parent; }
+sirius::optional_ptr<sirius_pipeline> sirius_meta_pipeline::get_parent() const { return parent; }
 
 duckdb::shared_ptr<sirius_pipeline>& sirius_meta_pipeline::get_base_pipeline()
 {
@@ -71,7 +71,7 @@ void sirius_meta_pipeline::get_meta_pipelines(
 sirius_meta_pipeline& sirius_meta_pipeline::get_last_child()
 {
   if (children.empty()) { return *this; }
-  duckdb::reference<const duckdb::vector<duckdb::shared_ptr<sirius_meta_pipeline>>>
+  std::reference_wrapper<const duckdb::vector<duckdb::shared_ptr<sirius_meta_pipeline>>>
     current_children = children;
   while (!current_children.get().back()->children.empty()) {
     current_children = current_children.get().back()->children;
@@ -79,7 +79,7 @@ sirius_meta_pipeline& sirius_meta_pipeline::get_last_child()
   return *current_children.get().back();
 }
 
-duckdb::optional_ptr<const duckdb::vector<duckdb::reference<sirius_pipeline>>>
+const duckdb::vector<std::reference_wrapper<sirius_pipeline>>*
 sirius_meta_pipeline::get_dependencies(sirius_pipeline& dependent) const
 {
   auto it = dependencies.find(dependent);
@@ -120,7 +120,7 @@ void sirius_meta_pipeline::ready()
 sirius_meta_pipeline& sirius_meta_pipeline::create_child_meta_pipeline(
   sirius_pipeline& current, op::sirius_physical_operator& op)
 {
-  children.push_back(duckdb::make_shared_ptr<sirius_meta_pipeline>(engine, state, &op));
+  children.push_back(duckdb::make_shared_ptr<sirius_meta_pipeline>(build_ctx, state, &op));
   auto child_meta_pipeline = children.back().get();
   // store the parent
   child_meta_pipeline->parent = &current;
@@ -133,7 +133,7 @@ sirius_meta_pipeline& sirius_meta_pipeline::create_child_meta_pipeline(
 
 sirius_pipeline& sirius_meta_pipeline::create_pipeline()
 {
-  pipelines.emplace_back(duckdb::make_shared_ptr<sirius_pipeline>(engine));
+  pipelines.emplace_back(duckdb::make_shared_ptr<sirius_pipeline>(build_ctx));
   state.set_pipeline_sink(*pipelines.back(), sink, next_batch_index++);
   return *pipelines.back();
 }
@@ -149,7 +149,7 @@ void sirius_meta_pipeline::add_dependencies_from(sirius_pipeline& dependent,
   if (!including) { it++; }
 
   // collect pipelines that were created from then
-  duckdb::vector<duckdb::reference<pipeline::sirius_pipeline>> created_pipelines;
+  duckdb::vector<std::reference_wrapper<pipeline::sirius_pipeline>> created_pipelines;
   for (; it != pipelines.end(); it++) {
     if (duckdb::RefersToSameObject(**it, dependent)) {
       // cannot depend on itself
@@ -222,7 +222,7 @@ bool sirius_meta_pipeline::has_finish_event(sirius_pipeline& pipeline) const
   return finish_pipelines.find(pipeline) != finish_pipelines.end();
 }
 
-duckdb::optional_ptr<sirius_pipeline> sirius_meta_pipeline::get_finish_group(
+sirius::optional_ptr<sirius_pipeline> sirius_meta_pipeline::get_finish_group(
   sirius_pipeline& pipeline) const
 {
   auto it = finish_map.find(pipeline);
@@ -259,7 +259,7 @@ void sirius_meta_pipeline::create_child_pipeline(sirius_pipeline& current,
   D_ASSERT(current.source);
 
   // create the child pipeline (same batch index)
-  pipelines.emplace_back(state.create_child_pipeline(engine, current, op));
+  pipelines.emplace_back(state.create_child_pipeline(build_ctx, current, op));
   auto& child_pipeline            = *pipelines.back();
   child_pipeline.base_batch_index = current.base_batch_index;
 

@@ -17,6 +17,8 @@
 #pragma once
 
 // sirius
+#include <io/types.hpp>
+#include <op/scan/hive_partition.hpp>
 #include <op/scan/parquet_scan_operator_data.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <op/sirius_physical_operator_type.hpp>
@@ -25,41 +27,34 @@
 #include <cucascade/memory/memory_space.hpp>
 
 // standard library
-#include <atomic>
 #include <memory>
-#include <mutex>
 #include <optional>
-#include <vector>
+#include <unordered_map>
+
+namespace sirius::scan_manager {
+class split_connector;
+class sirius_scan_manager;
+}  // namespace sirius::scan_manager
 
 namespace sirius::op::scan {
 
+struct scan_info;
+
+//===----------------------------------------------------------------------===//
+// Parquet scan operator
+//===----------------------------------------------------------------------===//
 /**
  * @brief Operator that reads parquet byte ranges for a batch of row groups and produces
- *        host_parquet_representation data batches for downstream GPU operators.
+ *        gpu_table_representation data batches for downstream GPU operators.
  *
- * This operator plays two roles in the two-pipeline parquet execution model:
- *
- *  Pipeline 1 (metadata scan):
- *    - Acts as the sink.  sirius_parquet_metadata_scan_operator::execute() produces
- *      partitioned_parquet_metadata objects that are delivered here via sink().
- *    - The operator accumulates the partitioned_parquet_metadata objects.
- *
- *  Pipeline 2 (GPU parquet scan):
- *    - Acts as the source.
- *    - Once finalize_metadata() has been called (after all sink() calls complete),
- *      a flat partition index is built and get_next_task_input_data() can atomically
- *      claim partitions.  Each partition maps 1:1 to a row_group_range — the metadata
- *      scan operator is responsible for sizing partitions to the target batch size.
- *    - execute(parquet_scan_data) reads the actual byte ranges from disk.
- *
- * Thread-safety:
- *   - sink() is called from pipeline 1 worker threads and protects _accumulated_metadata
- *     with _metadata_mutex.
- *   - finalize_metadata() must be called exactly once, after ALL sink() calls have
- *     completed (i.e., after pipeline 1 has fully finished).  It builds the partition
- *     index and sets _finalized, after which all source-side methods become usable.
- *   - get_next_task_input_data() / get_next_task_hint() / all_ports_empty() are called
- *     from pipeline 2 worker threads and only proceed after _finalized is set.
+ * The operator carries a scan_info (populated by the pipeline converter as a concrete
+ * subclass — parquet_scan_info today). The scan_manager reads it during prepare_for_query,
+ * checks for a pinned-cache match against the scan_info's common fields, and otherwise
+ * dispatches through scan_info::make_provider() to build the format's split_provider.
+ * Splits — one parquet_scan_data per row-group partition — are pushed into the operator's
+ * bound split_connector by the provider on the scan_manager thread pool. The operator
+ * pulls splits via get_next_task_input_data(), which blocks inside
+ * split_connector::get_next_split until a split arrives or the connector is closed.
  */
 class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
  public:
@@ -69,104 +64,109 @@ class sirius_gpu_parquet_scan_operator : public sirius_physical_operator {
   /**
    * @param types                  Output column types (forwarded from the parquet scan operator).
    * @param estimated_cardinality  Estimated row count.
-   * @param gpu_memory_space       GPU memory space for allocating output tables.
+   * @param scan_info              Bind-data extracted by the pipeline converter, consumed
+   *                               by the scan_manager during prepare_for_query.
    */
-  sirius_gpu_parquet_scan_operator(duckdb::vector<duckdb::LogicalType> types,
+  sirius_gpu_parquet_scan_operator(duckdb::vector<sirius::logical_type> types,
                                    duckdb::idx_t estimated_cardinality,
-                                   cucascade::memory::memory_space& gpu_memory_space);
+                                   std::unique_ptr<scan_info> scan_info);
 
-  //===----------Sink interface (pipeline 1)----------===//
-  bool is_sink() const override { return true; }
+  ~sirius_gpu_parquet_scan_operator() override;
 
-  /**
-   * @brief Receive partitioned_parquet_metadata produced by pipeline 1 and accumulate it.
-   *
-   * @param input_data  Should be a partitioned_parquet_metadata instance.
-   * @param stream      Unused; metadata handling is CPU-only.
-   */
-  void sink(const operator_data& input_data, rmm::cuda_stream_view stream) override;
+  /// @brief Inject the per-GPU sirius_ioctx map produced by SiriusContext::initialize()
+  ///        and held by sirius_scan_manager. Called by create_provider_for(...) before
+  ///        the operator is first executed.
+  /// @details Used by read_table_from_metadata() to select the per-chunk ioctx via
+  ///          scan_data.gpu_memory_space->get_device_id().
+  void set_gpu_ioctxs(std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> ioctxs);
 
-  //===----------Pipeline 1 → Pipeline 2 transition----------===//
-  /**
-   * @brief Signal that pipeline 1 has fully finished, freeze metadata, and build partition index.
-   *
-   * Must be called exactly once after ALL sink() calls have completed.  After this call,
-   * the source-side methods (get_next_task_hint, all_ports_empty, get_next_task_input_data)
-   * become usable.
-   */
-  void finalize_metadata();
-
-  //===----------Source interface (pipeline 2)----------===//
+  //===----------Source interface----------===//
   bool is_source() const override { return true; }
 
+  //===----------Scheduling interface----------===//
   /**
-   * @brief Returns READY while there are unconsumed partitions, or nullopt when all
-   *        partitions have been dispatched or metadata has not yet been finalized.
+   * @return nullopt once the bound split_connector is closed and drained;
+   *         READY pointing at this operator otherwise.
    */
   std::optional<task_creation_hint> get_next_task_hint() override;
 
   /**
-   * @brief Returns true once all partitions have been dispatched.
-   *
-   * Returns false if metadata has not yet been finalized.
+   * @return true once the bound split_connector is closed and drained.
    */
   [[nodiscard]] bool all_ports_empty() override;
 
   /**
-   * @brief Claims and returns the next parquet_scan_data for a single row_group_range.
+   * @brief Pull the next parquet_scan_data from the bound split_connector.
    *
-   * Returns nullptr when all partitions have been consumed or metadata is not yet finalized.
+   * Blocks inside split_connector::get_next_split until a split is available or
+   * the connector is closed.
+   *
+   * @return the next split, or nullptr when the connector is closed and drained.
    */
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
-  //===----------Execution (pipeline 2)----------===//
+  //===----------Execution----------===//
   /**
-   * @brief Read the byte ranges described by @p input_data from disk and produce a
-   *        host_parquet_representation data batch.
+   * @brief Produce a gpu_table_representation data batch from @p input_data.
    *
-   * @param input_data  Must be a parquet_scan_data instance.
-   * @param stream      CUDA stream (passed through for consistency; I/O is CPU-side).
+   * Two input shapes are supported:
+   *   - parquet_scan_data: the byte ranges described by the split are read from disk via
+   *     read_table_from_metadata(), with optional filter pushdown / post-read filtering
+   *     and (when scan_plan needs assembly) a final reshape to the plan's output layout.
+   *   - scan_cached_operator_data: the table is already pinned in GPU memory; the filter
+   *     expression on the split is applied, then the plan's output assembly is applied
+   *     when needed. When neither is needed the cached batch is forwarded unchanged.
+   *
+   * @param input_data  Must be either parquet_scan_data or scan_cached_operator_data.
+   * @param stream      CUDA stream.
+   * @return gpu_table_representation data batch wrapped as pipelineable_operator_data.
+   * @throws std::runtime_error if @p input_data is of an unsupported type, or if a
+   *         parquet_scan_data does not have an associated gpu memory space.
    */
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
-  //===----------Accessors----------===//
   /**
-   * @brief Return the total number of partitions (tasks) that will be created.
+   * @brief Estimate peak GPU memory for this operator when no execution history is available.
    *
-   * Returns an estimate from accumulated partition counts before finalization,
-   * and the exact count after finalize_metadata().
+   * @param stats  Batch count and total input bytes for the task about to run.
+   * @return Estimated peak GPU bytes this operator will allocate.
    */
-  [[nodiscard]] std::size_t get_total_partitions() const;
+  [[nodiscard]] std::size_t no_history_peak_memory_estimate(
+    const op::input_stats& stats) const override;
 
  private:
-  // ===----------------------------------------------------------------------===//
-  // Accumulation phase (pipeline 1).
-  //   _metadata_mutex protects _accumulated_metadata during concurrent sink() calls.
-  // ===----------------------------------------------------------------------===//
-  mutable std::mutex _metadata_mutex;
-  std::vector<partitioned_parquet_metadata> _accumulated_metadata;
+  /// Read the parquet byte ranges described by @p scan_data and apply the post-read
+  /// filter (when not pushed down) and the scan_plan's output assembly. Used by
+  /// execute() when the input split is a parquet_scan_data.
+  std::unique_ptr<cudf::table> read_table_from_metadata(const parquet_scan_data& scan_data,
+                                                        rmm::cuda_stream_view stream);
 
-  // ===----------------------------------------------------------------------===//
-  // Partition index — built once by finalize_metadata(), then read-only.
-  //
-  //   _finalized          — set by finalize_metadata() with release semantics after
-  //                          the partition index is fully written.  Source-side methods
-  //                          check this with acquire semantics before accessing the index.
-  //   _partition_index    — flat list pairing each partition with its parent metadata.
-  //   _next_partition_idx — atomic counter; each fetch_add(1) claims one partition.
-  // ===----------------------------------------------------------------------===//
-  std::atomic<bool> _finalized{false};
+  // The scan_manager owns the wiring between this operator and its split_provider.
+  // No other code should reach into scan_info / connector, so those entry points
+  // are private and exposed only through this friend.
+  friend class scan_manager::sirius_scan_manager;
 
-  struct partition_entry {
-    partitioned_parquet_metadata const* metadata;
-    std::size_t partition_idx;
-  };
-  std::vector<partition_entry> _partition_index;
-  std::atomic<std::size_t> _next_partition_idx{0};
+  /// \brief Take ownership of the bind-data so the scan_manager's factory can build a
+  ///        split provider. Called once per query; subsequent calls return nullptr.
+  std::unique_ptr<scan_info> take_scan_info();
 
-  // GPU memory space for allocating output tables produced by execute().
-  cucascade::memory::memory_space& _gpu_memory_space;
+  /// \brief Install the split connector that the scan_manager will feed.
+  void set_split_connector(std::unique_ptr<scan_manager::split_connector> connector);
+
+  /// \brief Connector accessor for the scan_manager driver.
+  scan_manager::split_connector* get_split_connector() noexcept { return _split_connector.get(); }
+
+  //===----------Fields----------===//
+  std::unique_ptr<scan_manager::split_connector> _split_connector;
+  std::unique_ptr<scan_info> _scan_info;
+
+  // Per-GPU ioctx map for ioctx->make_datasource(uring_io_object) routing in
+  // read_table_from_metadata. Populated by set_gpu_ioctxs(); empty until
+  // sirius_scan_manager::create_provider_for() injects it (the operator can
+  // be constructed before SiriusContext is available — set_gpu_ioctxs is
+  // mandatory before the first execute()).
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> _gpu_ioctxs;
 };
 
 }  // namespace sirius::op::scan

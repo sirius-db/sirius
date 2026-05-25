@@ -17,7 +17,6 @@
 #pragma once
 
 #include "duckdb/execution/physical_operator.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_operator.hpp"
@@ -34,7 +33,7 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::CONCAT;
 
   explicit sirius_physical_concat(
-    duckdb::vector<duckdb::LogicalType> types,
+    duckdb::vector<sirius::logical_type> types,
     std::size_t estimated_cardinality,
     sirius_physical_operator* parent_op,
     bool is_build,
@@ -63,6 +62,9 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
   //! Used when PARTITION + `update_join_exec_mode` selects BUILD_PROBE: merge all build batches
   //! before the join so the hash join sees a single build batch.
   void set_concat_all(bool concat_all);
+
+  [[nodiscard]] std::size_t no_history_peak_memory_estimate(
+    const op::input_stats& stats) const override;
 
  private:
   sirius_physical_operator* _parent_op;

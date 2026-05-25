@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "helper/type_conversions.hpp"
 #include "operator_test_utils.hpp"
 
 #include <catch.hpp>
@@ -78,7 +79,8 @@ std::shared_ptr<data_batch> make_3col_batch(memory_space& space,
   cols.push_back(make_col(col2));
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
-  auto gpu_repr = std::make_unique<gpu_table_representation>(std::move(table), space);
+  auto gpu_repr =
+    std::make_unique<gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
   auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
 }
@@ -89,10 +91,11 @@ std::shared_ptr<data_batch> sort_batch(const std::shared_ptr<data_batch>& batch,
                                        const duckdb::vector<duckdb::idx_t>& projections,
                                        const duckdb::vector<duckdb::LogicalType>& types)
 {
-  sirius_physical_order order_op(duckdb::vector<duckdb::LogicalType>(types),
-                                 copy_orders(orders),
-                                 duckdb::vector<duckdb::idx_t>(projections),
-                                 0);
+  sirius_physical_order order_op(
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>(types)),
+    copy_orders(orders),
+    duckdb::vector<duckdb::idx_t>(projections),
+    0);
   auto result = order_op.execute(pipelineable_operator_data({batch}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*result).get_data_batches().size() == 1);
   return dynamic_cast<const pipelineable_operator_data&>(*result).get_data_batches()[0];
@@ -123,17 +126,15 @@ TEST_CASE("sirius_physical_merge_sort merges 2 sorted 1-column batches ascending
 
   duckdb::vector<duckdb::idx_t> projections{0};
 
-  sirius_physical_merge_sort op(std::move(types), std::move(orders), std::move(projections), 0);
+  sirius_physical_merge_sort op(
+    sirius::from_duckdb_vec(std::move(types)), std::move(orders), std::move(projections), 0);
 
   auto out = op.execute(pipelineable_operator_data({batch1, batch2}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
-                 .get_data_batches()[0]
-                 ->get_data()
-                 ->cast<gpu_table_representation>()
-                 .get_table();
-  auto col0 = copy_column_to_host<int64_t>(table.view().column(0));
+  auto table = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
+  auto col0 = copy_column_to_host<int64_t>(table.column(0));
 
   std::vector<int64_t> expected{1, 2, 3, 4, 5, 6, 7, 8};
   REQUIRE(col0 == expected);
@@ -158,18 +159,16 @@ TEST_CASE("sirius_physical_merge_sort merges 3 sorted 1-column batches descendin
 
   duckdb::vector<duckdb::idx_t> projections{0};
 
-  sirius_physical_merge_sort op(std::move(types), std::move(orders), std::move(projections), 0);
+  sirius_physical_merge_sort op(
+    sirius::from_duckdb_vec(std::move(types)), std::move(orders), std::move(projections), 0);
 
   auto out =
     op.execute(pipelineable_operator_data({batch1, batch2, batch3}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
-                 .get_data_batches()[0]
-                 ->get_data()
-                 ->cast<gpu_table_representation>()
-                 .get_table();
-  auto col0 = copy_column_to_host<int64_t>(table.view().column(0));
+  auto table = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
+  auto col0 = copy_column_to_host<int64_t>(table.column(0));
 
   std::vector<int64_t> expected{9, 8, 7, 6, 5, 4, 3, 2, 1};
   REQUIRE(col0 == expected);
@@ -199,17 +198,14 @@ TEST_CASE("sirius_physical_merge_sort merges 2 sorted 2-column batches by col0 a
 
   duckdb::vector<duckdb::idx_t> projections{0, 1};
 
-  sirius_physical_merge_sort op(std::move(types), std::move(orders), std::move(projections), 0);
+  sirius_physical_merge_sort op(
+    sirius::from_duckdb_vec(std::move(types)), std::move(orders), std::move(projections), 0);
 
   auto out = op.execute(pipelineable_operator_data({batch1, batch2}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
-                 .get_data_batches()[0]
-                 ->get_data()
-                 ->cast<gpu_table_representation>()
-                 .get_table();
-  auto view   = table.view();
+  auto view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
   auto out_c0 = copy_column_to_host<int64_t>(view.column(0));
   auto out_c1 = copy_column_to_host<int64_t>(view.column(1));
 
@@ -244,7 +240,7 @@ TEST_CASE("sirius_physical_merge_sort merges 2-column batches sorted by 2 keys",
   auto sorted2 = sort_batch(raw2, orders, projections, types);
   // sorted2: (1,15), (2,1), (2,25), (3,35)
 
-  sirius_physical_merge_sort op(duckdb::vector<duckdb::LogicalType>(types),
+  sirius_physical_merge_sort op(sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>(types)),
                                 copy_orders(orders),
                                 duckdb::vector<duckdb::idx_t>(projections),
                                 0);
@@ -252,12 +248,8 @@ TEST_CASE("sirius_physical_merge_sort merges 2-column batches sorted by 2 keys",
   auto out = op.execute(pipelineable_operator_data({sorted1, sorted2}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
-                 .get_data_batches()[0]
-                 ->get_data()
-                 ->cast<gpu_table_representation>()
-                 .get_table();
-  auto view   = table.view();
+  auto view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
   auto out_c0 = copy_column_to_host<int64_t>(view.column(0));
   auto out_c1 = copy_column_to_host<int64_t>(view.column(1));
 
@@ -291,17 +283,14 @@ TEST_CASE("sirius_physical_merge_sort merges 3-column batches sorted by col0, re
 
   duckdb::vector<duckdb::idx_t> projections{0, 1, 2};
 
-  sirius_physical_merge_sort op(std::move(types), std::move(orders), std::move(projections), 0);
+  sirius_physical_merge_sort op(
+    sirius::from_duckdb_vec(std::move(types)), std::move(orders), std::move(projections), 0);
 
   auto out = op.execute(pipelineable_operator_data({batch1, batch2}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
-                 .get_data_batches()[0]
-                 ->get_data()
-                 ->cast<gpu_table_representation>()
-                 .get_table();
-  auto view   = table.view();
+  auto view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
   auto out_c0 = copy_column_to_host<int64_t>(view.column(0));
   auto out_c1 = copy_column_to_host<int64_t>(view.column(1));
   auto out_c2 = copy_column_to_host<int64_t>(view.column(2));
@@ -339,7 +328,7 @@ TEST_CASE("sirius_physical_merge_sort 3 columns sorted by col0 asc + col1 desc",
   auto sorted2 = sort_batch(raw2, orders, projections, types);
   // sorted2: (1,25,500), (2,40,400), (2,5,600)
 
-  sirius_physical_merge_sort op(duckdb::vector<duckdb::LogicalType>(types),
+  sirius_physical_merge_sort op(sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>(types)),
                                 copy_orders(orders),
                                 duckdb::vector<duckdb::idx_t>(projections),
                                 0);
@@ -347,12 +336,8 @@ TEST_CASE("sirius_physical_merge_sort 3 columns sorted by col0 asc + col1 desc",
   auto out = op.execute(pipelineable_operator_data({sorted1, sorted2}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
-                 .get_data_batches()[0]
-                 ->get_data()
-                 ->cast<gpu_table_representation>()
-                 .get_table();
-  auto view   = table.view();
+  auto view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
   auto out_c0 = copy_column_to_host<int64_t>(view.column(0));
   auto out_c1 = copy_column_to_host<int64_t>(view.column(1));
   auto out_c2 = copy_column_to_host<int64_t>(view.column(2));
@@ -384,17 +369,15 @@ TEST_CASE("sirius_physical_merge_sort single batch passthrough", "[physical_merg
 
   duckdb::vector<duckdb::idx_t> projections{0};
 
-  sirius_physical_merge_sort op(std::move(types), std::move(orders), std::move(projections), 0);
+  sirius_physical_merge_sort op(
+    sirius::from_duckdb_vec(std::move(types)), std::move(orders), std::move(projections), 0);
 
   auto out = op.execute(pipelineable_operator_data({batch}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
-                 .get_data_batches()[0]
-                 ->get_data()
-                 ->cast<gpu_table_representation>()
-                 .get_table();
-  auto col0 = copy_column_to_host<int64_t>(table.view().column(0));
+  auto table = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
+  auto col0 = copy_column_to_host<int64_t>(table.column(0));
   REQUIRE(col0 == std::vector<int64_t>{1, 2, 3});
 }
 
@@ -415,18 +398,16 @@ TEST_CASE("sirius_physical_merge_sort skips null batches", "[physical_merge_sort
 
   duckdb::vector<duckdb::idx_t> projections{0};
 
-  sirius_physical_merge_sort op(std::move(types), std::move(orders), std::move(projections), 0);
+  sirius_physical_merge_sort op(
+    sirius::from_duckdb_vec(std::move(types)), std::move(orders), std::move(projections), 0);
 
   std::vector<std::shared_ptr<data_batch>> inputs{nullptr, batch1, nullptr, batch2, nullptr};
   auto out = op.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
-                 .get_data_batches()[0]
-                 ->get_data()
-                 ->cast<gpu_table_representation>()
-                 .get_table();
-  auto col0 = copy_column_to_host<int64_t>(table.view().column(0));
+  auto table = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
+  auto col0 = copy_column_to_host<int64_t>(table.column(0));
   REQUIRE(col0 == std::vector<int64_t>{1, 2, 3, 4, 5, 6});
 }
 
@@ -441,7 +422,8 @@ TEST_CASE("sirius_physical_merge_sort returns empty for all-null inputs", "[phys
 
   duckdb::vector<duckdb::idx_t> projections{0};
 
-  sirius_physical_merge_sort op(std::move(types), std::move(orders), std::move(projections), 0);
+  sirius_physical_merge_sort op(
+    sirius::from_duckdb_vec(std::move(types)), std::move(orders), std::move(projections), 0);
 
   std::vector<std::shared_ptr<data_batch>> inputs{nullptr, nullptr};
   auto out = op.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
@@ -466,21 +448,19 @@ TEST_CASE("sirius_physical_merge_sort constructed from sirius_physical_order",
 
   duckdb::vector<duckdb::idx_t> projections{0};
 
-  sirius_physical_order order_op(duckdb::vector<duckdb::LogicalType>(types),
-                                 copy_orders(orders),
-                                 duckdb::vector<duckdb::idx_t>(projections),
-                                 0);
+  sirius_physical_order order_op(
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>(types)),
+    copy_orders(orders),
+    duckdb::vector<duckdb::idx_t>(projections),
+    0);
 
   sirius_physical_merge_sort op(&order_op);
 
   auto out = op.execute(pipelineable_operator_data({batch1, batch2}), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
-                 .get_data_batches()[0]
-                 ->get_data()
-                 ->cast<gpu_table_representation>()
-                 .get_table();
-  auto col0 = copy_column_to_host<int64_t>(table.view().column(0));
+  auto table = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
+  auto col0 = copy_column_to_host<int64_t>(table.column(0));
   REQUIRE(col0 == std::vector<int64_t>{1, 2, 3, 4, 5, 6});
 }

@@ -18,8 +18,13 @@
 
 #include "op/sirius_physical_parquet_scan.hpp"
 
+#include <memory>
 #include <string>
 #include <vector>
+
+namespace sirius::op::scan {
+struct IcebergDeleteData;
+}
 
 namespace sirius {
 namespace op {
@@ -46,10 +51,10 @@ class sirius_physical_iceberg_scan : public sirius_physical_parquet_scan {
   explicit sirius_physical_iceberg_scan(sirius_physical_table_scan* table_scan);
 
   /// Full-parameter constructor (mirrors sirius_physical_parquet_scan).
-  sirius_physical_iceberg_scan(duckdb::vector<duckdb::LogicalType> types,
+  sirius_physical_iceberg_scan(duckdb::vector<sirius::logical_type> types,
                                duckdb::TableFunction function,
                                duckdb::unique_ptr<duckdb::FunctionData> bind_data,
-                               duckdb::vector<duckdb::LogicalType> returned_types,
+                               duckdb::vector<sirius::logical_type> returned_types,
                                duckdb::vector<duckdb::ColumnIndex> column_ids,
                                duckdb::vector<std::size_t> projection_ids,
                                duckdb::vector<std::string> names,
@@ -60,16 +65,12 @@ class sirius_physical_iceberg_scan : public sirius_physical_parquet_scan {
                                duckdb::virtual_column_map_t virtual_columns);
 
   // -------------------------------------------------------------------------
-  // V2 delete file metadata (populated by sirius_engine.cpp after routing).
-  // Both vectors are empty for V1 tables.
+  // Fully materialized delete data (populated by sirius_engine.cpp).
+  // nullptr or empty() for V1 tables.
   // -------------------------------------------------------------------------
 
-  /// Paths of V2 positional-delete Parquet files.
-  /// Each file has schema: { file_path VARCHAR, pos BIGINT }.
-  std::vector<std::string> positional_delete_files;
-
-  /// Paths of V2 equality-delete Parquet files.
-  std::vector<std::string> equality_delete_files;
+  /// Pre-read, immutable delete data shared across task instances.
+  std::shared_ptr<const scan::IcebergDeleteData> delete_data;
 };
 
 }  // namespace op

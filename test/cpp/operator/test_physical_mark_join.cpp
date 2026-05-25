@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "helper/type_conversions.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "operator_test_utils.hpp"
 
@@ -60,11 +61,12 @@ mark_join_fixture create_mark_join()
 
   auto left_child = duckdb::make_uniq<sirius_physical_operator>(
     SiriusPhysicalOperatorType::PROJECTION,
-    duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER},
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER,
+                                                                duckdb::LogicalType::INTEGER}),
     0);
   auto right_child = duckdb::make_uniq<sirius_physical_operator>(
     SiriusPhysicalOperatorType::PROJECTION,
-    duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER},
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
     0);
 
   duckdb::vector<duckdb::JoinCondition> conditions;
@@ -78,11 +80,11 @@ mark_join_fixture create_mark_join()
     *f.logical_join,
     std::move(left_child),
     std::move(right_child),
-    std::move(conditions),
+    sirius::wrap_join_conditions(std::move(conditions)),
     duckdb::JoinType::MARK,
-    duckdb::vector<duckdb::idx_t>{},        // left_projection_map (empty = all)
-    duckdb::vector<duckdb::idx_t>{},        // right_projection_map (not used by MARK)
-    duckdb::vector<duckdb::LogicalType>{},  // delim_types
+    duckdb::vector<duckdb::idx_t>{},  // left_projection_map (empty = all)
+    duckdb::vector<duckdb::idx_t>{},  // right_projection_map (not used by MARK)
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),  // delim_types
     1000,
     nullptr);
 
@@ -121,12 +123,8 @@ TEST_CASE("sirius_physical_hash_join mark join - partial match", "[physical_mark
     f.hash_join->execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
 
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
-  auto out_view = dynamic_cast<const pipelineable_operator_data&>(*outputs)
-                    .get_data_batches()[0]
-                    ->get_data()
-                    ->cast<gpu_table_representation>()
-                    .get_table()
-                    .view();
+  auto out_view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
   REQUIRE(out_view.num_columns() == 3);
   REQUIRE(out_view.num_rows() == static_cast<cudf::size_type>(left_ids.size()));
 
@@ -156,12 +154,8 @@ TEST_CASE("sirius_physical_hash_join mark join - all rows match", "[physical_mar
     f.hash_join->execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
 
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
-  auto out_view = dynamic_cast<const pipelineable_operator_data&>(*outputs)
-                    .get_data_batches()[0]
-                    ->get_data()
-                    ->cast<gpu_table_representation>()
-                    .get_table()
-                    .view();
+  auto out_view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
   REQUIRE(out_view.num_rows() == static_cast<cudf::size_type>(left_ids.size()));
 
   REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == left_ids);
@@ -189,12 +183,8 @@ TEST_CASE("sirius_physical_hash_join mark join - no rows match", "[physical_mark
     f.hash_join->execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
 
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
-  auto out_view = dynamic_cast<const pipelineable_operator_data&>(*outputs)
-                    .get_data_batches()[0]
-                    ->get_data()
-                    ->cast<gpu_table_representation>()
-                    .get_table()
-                    .view();
+  auto out_view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
   REQUIRE(out_view.num_rows() == static_cast<cudf::size_type>(left_ids.size()));
 
   REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == left_ids);
@@ -222,12 +212,8 @@ TEST_CASE("sirius_physical_hash_join mark join - empty right side", "[physical_m
     f.hash_join->execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
 
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
-  auto out_view = dynamic_cast<const pipelineable_operator_data&>(*outputs)
-                    .get_data_batches()[0]
-                    ->get_data()
-                    ->cast<gpu_table_representation>()
-                    .get_table()
-                    .view();
+  auto out_view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
   REQUIRE(out_view.num_rows() == static_cast<cudf::size_type>(left_ids.size()));
 
   REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == left_ids);
@@ -256,12 +242,8 @@ TEST_CASE("sirius_physical_hash_join mark join - duplicate keys on right side",
     f.hash_join->execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
 
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
-  auto out_view = dynamic_cast<const pipelineable_operator_data&>(*outputs)
-                    .get_data_batches()[0]
-                    ->get_data()
-                    ->cast<gpu_table_representation>()
-                    .get_table()
-                    .view();
+  auto out_view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
   REQUIRE(out_view.num_rows() == static_cast<cudf::size_type>(left_ids.size()));
 
   REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == left_ids);

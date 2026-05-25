@@ -21,6 +21,7 @@
 #include <cudf/cudf_utils.hpp>
 
 #include <data/data_batch_utils.hpp>
+#include <helper/type_conversions.hpp>
 #include <helper/utils.hpp>
 #include <log/logging.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
@@ -42,13 +43,13 @@ namespace sirius::op::scan {
 //===----------------------------------------------------------------------===//
 duckdb_scan_task_global_state::duckdb_scan_task_global_state(
   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
-  pipeline::pipeline_executor& pipeline_exec,
+  pipeline::task_scheduler& pipeline_exec,
   duckdb::ClientContext& client_ctx,
   sirius_physical_duckdb_scan* scan_op)
   : sirius_pipeline_task_global_state(pipeline),
     _sirius_ctx(client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state").get()),
     _max_threads(pipeline_exec.get_scan_executor().get_num_threads()),
-    _pipeline_executor(pipeline_exec),
+    _task_scheduler(pipeline_exec),
     _op(*scan_op)
 {
   // Initialize global table function state
@@ -81,13 +82,11 @@ duckdb_scan_task_global_state::duckdb_scan_task_global_state(
 //===----------------------------------------------------------------------===//
 // duckdb_scan_task_local_state::column_builder
 //===----------------------------------------------------------------------===//
-duckdb_scan_task_local_state::column_builder::column_builder(duckdb::LogicalType t,
+duckdb_scan_task_local_state::column_builder::column_builder(sirius::logical_type t,
                                                              size_t default_varchar_size)
   : type(t)
 {
-  type_size = t.InternalType() == duckdb::PhysicalType::VARCHAR
-                ? default_varchar_size
-                : duckdb::GetTypeIdSize(t.InternalType());
+  type_size = t.is_varchar() ? default_varchar_size : t.fixed_width_byte_size();
 }
 
 void duckdb_scan_task_local_state::column_builder::initialize_accessors(
@@ -98,7 +97,7 @@ void duckdb_scan_task_local_state::column_builder::initialize_accessors(
   assert(allocation != nullptr);
   assert(!allocation->get_blocks().empty());
 
-  if (type.InternalType() == duckdb::PhysicalType::VARCHAR) {
+  if (type.is_varchar()) {
     // Initialize offset accessor
     offset_blocks_accessor.initialize(byte_offset, allocation);
     // Write the initial offset value of 0
@@ -123,7 +122,7 @@ bool duckdb_scan_task_local_state::column_builder::sufficient_space_for_column(
   duckdb::Vector& vec, duckdb::ValidityMask const& validity, size_t num_rows)
 {
   size_t data_bytes = 0;
-  if (type.InternalType() == duckdb::PhysicalType::VARCHAR) {
+  if (type.is_varchar()) {
     auto const* str_data = reinterpret_cast<duckdb::string_t const*>(vec.GetData());
     for (size_t row = 0; row < num_rows; ++row) {
       if (validity.RowIsValid(row)) { data_bytes += str_data[row].GetSize(); }
@@ -227,7 +226,7 @@ void duckdb_scan_task_local_state::column_builder::process_column(
   std::unique_ptr<multiple_blocks_allocation>& allocation)
 {
   // PRECONDITION: Vector must be flattened
-  if (type.InternalType() == duckdb::PhysicalType::VARCHAR) {
+  if (type.is_varchar()) {
     size_t data_bytes    = 0;
     auto const* str_data = reinterpret_cast<duckdb::string_t const*>(vec.GetData());
     for (size_t row = 0; row < num_rows; ++row) {
@@ -263,7 +262,7 @@ duckdb_scan_task_local_state::column_builder::make_column_metadata(size_t num_ro
 {
   using cucascade::memory::column_metadata;
 
-  if (type.InternalType() == duckdb::PhysicalType::VARCHAR) {
+  if (type.is_varchar()) {
     // VARCHAR column: data buffer + offsets child
     column_metadata offsets_child{};
     offsets_child.type_id          = cudf::type_id::INT32;
@@ -292,7 +291,7 @@ duckdb_scan_task_local_state::column_builder::make_column_metadata(size_t num_ro
     return col;
   } else {
     // Fixed-width column
-    auto cudf_type = duckdb::GetCudfType(type);
+    auto cudf_type = sirius::get_cudf_type(type);
 
     column_metadata col{};
     col.type_id          = cudf_type.id();
@@ -378,11 +377,11 @@ void duckdb_scan_task_local_state::estimate_rows_per_batch(sirius_physical_duckd
   for (size_t i = 0; i < _num_columns; ++i) {
     auto const col_type = op.scanned_types[i];
     _column_builders.emplace_back(col_type, _default_varchar_size);
-    if (col_type.InternalType() == duckdb::PhysicalType::VARCHAR) {
+    if (col_type.is_varchar()) {
       _varchar_indices.push_back(i);
       estimated_row_bytes += (sizeof(int32_t) + _default_varchar_size);  // offset + data + mask
     } else {
-      estimated_row_bytes += duckdb::GetTypeIdSize(col_type.InternalType());  // data + mask
+      estimated_row_bytes += col_type.fixed_width_byte_size();  // data + mask
     }
   }
 
@@ -411,7 +410,7 @@ void duckdb_scan_task_local_state::initialize_builders()
     byte_offset = (byte_offset + 7) & ~size_t{7};
     _column_builders[i].initialize_accessors(_estimated_rows_per_batch, byte_offset, _allocation);
     // Update byte_offset for next column
-    if (_column_builders[i].type.InternalType() == duckdb::PhysicalType::VARCHAR) {
+    if (_column_builders[i].type.is_varchar()) {
       // VARCHAR column (offsets + data + mask)
       byte_offset += (_estimated_rows_per_batch + 1) * sizeof(int32_t) +
                      _estimated_rows_per_batch * _default_varchar_size +
@@ -459,7 +458,7 @@ std::shared_ptr<cucascade::data_batch> duckdb_scan_task_local_state::make_data_b
   // Make the host table allocation
   auto const sz = get_tail_byte_offset();
   auto table_allocation =
-    std::make_unique<host_table_allocation>(std::move(_allocation), std::move(columns), sz);
+    host_table_allocation::create(std::move(_allocation), std::move(columns), sz);
 
   // Make the host table representation
   auto table = std::make_unique<host_data_representation>(std::move(table_allocation), _host_space);
@@ -531,7 +530,8 @@ void duckdb_scan_task::process_chunk(duckdb_scan_task_local_state& l_state)
 
 void duckdb_scan_task::execute(rmm::cuda_stream_view stream)
 {
-  auto estimated_bytes = get_estimated_reservation_size();
+  // _reservation_size_info is set by duckdb_scan_executor::manager_loop before dispatch.
+  auto& ls = this->_local_state->cast<duckdb_scan_task_local_state>();
 
   // Record memory metrics for future reservation estimates.
   // Scan tasks don't have peak memory tracking, so use output size as proxy.
@@ -539,13 +539,14 @@ void duckdb_scan_task::execute(rmm::cuda_stream_view stream)
     auto& pipelineable_output_data = dynamic_cast<op::pipelineable_operator_data&>(*output_data);
     std::size_t output_bytes       = 0;
     for (const auto& batch : pipelineable_output_data.get_data_batches()) {
-      if (batch && batch->get_data()) { output_bytes += batch->get_data()->get_size_in_bytes(); }
+      if (batch) {
+        auto ro = batch->to_read_only();
+        if (ro.get_data()) { output_bytes += ro.get_data()->get_size_in_bytes(); }
+      }
     }
     auto& g_state = _global_state->cast<duckdb_scan_task_global_state>();
-    // Use the raw task consumption basis from local state when recording history
-    auto consumption_basis =
-      this->_local_state->cast<duckdb_scan_task_local_state>().get_task_consumption_basis();
-    g_state.get_memory_history().record({consumption_basis, output_bytes, output_bytes});
+    g_state.get_memory_history().record(
+      {ls.get_reservation_size_info()->input_basis, output_bytes, output_bytes});
 
     publish_output(*output_data, stream);
   }
@@ -560,7 +561,7 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
   // Initialize the data chunk with scanned_types (all projected columns, including ROW_ID).
   // This matches the column_ids and projection_ids passed to DuckDB's init functions.
   l_state._chunk.Initialize(duckdb::Allocator::Get(l_state._exec_ctx.client),
-                            g_state._op.scanned_types);
+                            sirius::to_duckdb_vec(g_state._op.scanned_types));
 
   // Enter the scan loop to accumulate a data batch
   while (get_next_chunk(l_state, g_state)) {
@@ -598,7 +599,7 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
       std::static_pointer_cast<duckdb_scan_task_global_state>(this->_global_state);
     auto next_task = std::make_unique<duckdb_scan_task>(
       new_task_id, _data_repo, std::move(new_local_state), shared_global_state);
-    g_state._pipeline_executor.schedule(std::move(next_task));
+    g_state._task_scheduler.schedule(std::move(next_task));
   }
 
   // Make data batch and push to repository
@@ -614,19 +615,24 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
 void duckdb_scan_task::publish_output(op::operator_data& output_data, rmm::cuda_stream_view stream)
 {
   auto& pipelineable_output = dynamic_cast<op::pipelineable_operator_data&>(output_data);
-  for (auto& batch : pipelineable_output.release_data_batches()) {
-    _data_repo->add_data_batch(std::move(batch));
+  for (auto& batch : pipelineable_output.get_data_batches()) {
+    _data_repo->add_data_batch(batch);
   }
 }
 
-std::size_t duckdb_scan_task::get_estimated_reservation_size() const
+pipeline::reservation_size_info duckdb_scan_task::get_estimated_reservation_size_info() const
 {
-  auto current_estimate =
+  std::size_t input_basis =
     this->_local_state->cast<duckdb_scan_task_local_state>().get_task_consumption_basis();
   auto& g_state = this->_global_state->cast<duckdb_scan_task_global_state>();
-  auto refined  = g_state.get_memory_history().estimate_peak_memory(current_estimate);
-  if (refined) { return *refined; }
-  return current_estimate;
+  auto peak_opt = g_state.get_memory_history().estimate_peak_memory(input_basis);
+
+  pipeline::reservation_size_info info;
+  info.input_basis          = input_basis;
+  info.had_history          = peak_opt.has_value();
+  info.peak_memory_estimate = peak_opt.value_or(input_basis);
+  info.reservation_size     = info.peak_memory_estimate;
+  return info;
 }
 
 }  // namespace sirius::op::scan

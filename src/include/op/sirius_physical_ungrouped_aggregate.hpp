@@ -21,6 +21,7 @@
 #include "duckdb/execution/operator/aggregate/distinct_aggregate_data.hpp"
 #include "duckdb/execution/operator/aggregate/grouped_aggregate_data.hpp"
 #include "duckdb/parser/group_by_node.hpp"
+#include "expression/expression.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 namespace sirius {
@@ -32,16 +33,13 @@ class sirius_physical_ungrouped_aggregate : public sirius_physical_operator {
     SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE;
 
  public:
-  sirius_physical_ungrouped_aggregate(
-    duckdb::vector<duckdb::LogicalType> types,
-    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
-    std::size_t estimated_cardinality,
-    duckdb::TupleDataValidityType distinct_validity);
+  sirius_physical_ungrouped_aggregate(duckdb::vector<sirius::logical_type> types,
+                                      duckdb::vector<sirius::expression> select_list,
+                                      std::size_t estimated_cardinality,
+                                      duckdb::TupleDataValidityType distinct_validity);
 
   //! The aggregates that have to be computed
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> aggregates;
-  duckdb::unique_ptr<duckdb::DistinctAggregateData> distinct_data;
-  duckdb::unique_ptr<duckdb::DistinctAggregateCollectionInfo> distinct_collection_info;
+  duckdb::vector<sirius::expression> aggregates;
 
   bool is_source() const override { return true; }
 

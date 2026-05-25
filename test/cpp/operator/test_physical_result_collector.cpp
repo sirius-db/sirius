@@ -16,6 +16,7 @@
 
 // test
 #include <catch.hpp>
+#include <helper/type_conversions.hpp>
 #include <utils/utils.hpp>
 
 // sirius
@@ -180,9 +181,7 @@ void convert_batch_to_host(duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx,
                            std::shared_ptr<data_batch> const& batch,
                            rmm::cuda_stream_view stream)
 {
-  auto* data = batch->get_data();
-  if (!data) { throw std::runtime_error("data_batch has no data representation"); }
-
+  // Use get_cudf_table_view which internally acquires a read-only lock.
   auto const view       = sirius::get_cudf_table_view(*batch);
   auto const data_bytes = estimate_packed_data_bytes(view);
 
@@ -195,7 +194,10 @@ void convert_batch_to_host(duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx,
   if (!host_space) { throw std::runtime_error("Invalid host memory space for test"); }
 
   auto& registry = sirius::converter_registry::get();
-  batch->convert_to<cucascade::host_data_representation>(registry, host_space, stream);
+  {
+    auto mut = batch->to_mutable();
+    mut.convert_to<cucascade::host_data_representation>(registry, host_space, stream);
+  }
 }
 
 }  // namespace
@@ -218,16 +220,11 @@ TEST_CASE("sirius_physical_materialized_collector sink with host input",
 
   auto table = sirius::create_cudf_table_with_random_data(
     num_rows, column_types, ranges, stream, gpu_space->get_default_allocator(), true);
-  auto batch = sirius::make_data_batch(std::move(table), *gpu_space);
+  auto batch = sirius::make_data_batch(std::move(table), *gpu_space, stream);
 
   expected_table_data expected;
   std::vector<std::string> expected_strings;
   {
-    REQUIRE(batch->try_to_create_task());
-    auto lock_result = batch->try_to_lock_for_processing(gpu_space->get_id());
-    REQUIRE(lock_result.success);
-    auto handle = std::move(lock_result.handle);
-
     auto const gpu_view = sirius::get_cudf_table_view(*batch);
     expected            = extract_expected_data(gpu_view);
     expected_strings    = build_expected_strings(expected);
@@ -242,14 +239,14 @@ TEST_CASE("sirius_physical_materialized_collector sink with host input",
     duckdb::make_shared_ptr<duckdb::PreparedStatementData>(duckdb::StatementType::SELECT_STATEMENT);
   prepared->types = types;
   prepared->names = {"c0", "c1", "c2"};
-  auto plan       = duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(types, 0);
+  auto plan =
+    duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(sirius::from_duckdb_vec(types), 0);
   auto sirius_prepared =
     duckdb::make_shared_ptr<sirius_prepared_statement_data>(prepared, std::move(plan));
   sirius::op::sirius_physical_materialized_collector collector(*sirius_prepared, *con.context);
 
   collector.sink(pipelineable_operator_data({batch}), cudf::get_default_stream());
-  duckdb::GlobalSinkState sink_state;
-  auto result = collector.get_result(sink_state);
+  auto result = collector.get_result();
   REQUIRE(result != nullptr);
 
   size_t row_base = 0;
@@ -289,15 +286,10 @@ TEST_CASE("sirius_physical_materialized_collector sink converts GPU input",
 
   auto table = sirius::create_cudf_table_with_random_data(
     num_rows, column_types, ranges, stream, gpu_space->get_default_allocator(), false);
-  auto batch = sirius::make_data_batch(std::move(table), *gpu_space);
+  auto batch = sirius::make_data_batch(std::move(table), *gpu_space, stream);
 
   expected_table_data expected;
   {
-    REQUIRE(batch->try_to_create_task());
-    auto lock_result = batch->try_to_lock_for_processing(gpu_space->get_id());
-    REQUIRE(lock_result.success);
-    auto handle = std::move(lock_result.handle);
-
     auto const gpu_view = sirius::get_cudf_table_view(*batch);
     expected            = extract_expected_data(gpu_view);
   }
@@ -308,14 +300,14 @@ TEST_CASE("sirius_physical_materialized_collector sink converts GPU input",
     duckdb::make_shared_ptr<duckdb::PreparedStatementData>(duckdb::StatementType::SELECT_STATEMENT);
   prepared->types = types;
   prepared->names = {"c0", "c1"};
-  auto plan       = duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(types, 0);
+  auto plan =
+    duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(sirius::from_duckdb_vec(types), 0);
   auto sirius_prepared =
     duckdb::make_shared_ptr<sirius_prepared_statement_data>(prepared, std::move(plan));
   sirius::op::sirius_physical_materialized_collector collector(*sirius_prepared, *con.context);
 
   collector.sink(pipelineable_operator_data({batch}), stream);
-  duckdb::GlobalSinkState sink_state;
-  auto result = collector.get_result(sink_state);
+  auto result = collector.get_result();
   REQUIRE(result != nullptr);
 
   size_t row_base = 0;
@@ -390,7 +382,7 @@ TEST_CASE("sirius_physical_materialized_collector sink supports concurrent appen
     cols.push_back(std::move(col1));
 
     auto table = std::make_unique<cudf::table>(std::move(cols));
-    auto batch = sirius::make_data_batch(std::move(table), *gpu_space);
+    auto batch = sirius::make_data_batch(std::move(table), *gpu_space, stream);
     convert_batch_to_host(sirius_ctx, batch, stream);
     batches.emplace_back(std::move(batch));
   }
@@ -401,7 +393,8 @@ TEST_CASE("sirius_physical_materialized_collector sink supports concurrent appen
     duckdb::make_shared_ptr<duckdb::PreparedStatementData>(duckdb::StatementType::SELECT_STATEMENT);
   prepared->types = types;
   prepared->names = {"c0", "c1"};
-  auto plan       = duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(types, 0);
+  auto plan =
+    duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(sirius::from_duckdb_vec(types), 0);
   auto sirius_prepared =
     duckdb::make_shared_ptr<sirius_prepared_statement_data>(prepared, std::move(plan));
   sirius::op::sirius_physical_materialized_collector collector(*sirius_prepared, *con.context);
@@ -450,8 +443,7 @@ TEST_CASE("sirius_physical_materialized_collector sink supports concurrent appen
     }
   }
 
-  duckdb::GlobalSinkState sink_state;
-  auto result = collector.get_result(sink_state);
+  auto result = collector.get_result();
   REQUIRE(result != nullptr);
 
   std::vector<row_t> actual_rows;

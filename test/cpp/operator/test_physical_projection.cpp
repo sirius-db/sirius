@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "helper/type_conversions.hpp"
 #include "operator_test_utils.hpp"
 #include "operator_type_traits.hpp"
 
@@ -82,17 +83,14 @@ TEMPLATE_TEST_CASE("sirius_physical_projection executes on data_batch for multip
   types.push_back(Traits::logical_type());
   types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
 
-  sirius_physical_projection projection(std::move(types), std::move(exprs), key_vals.size());
+  sirius_physical_projection projection(
+    sirius::from_duckdb_vec(types), sirius::wrap_many(std::move(exprs)), key_vals.size());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = projection.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
-  auto output_table = dynamic_cast<const pipelineable_operator_data&>(*outputs)
-                        .get_data_batches()[0]
-                        ->get_data()
-                        ->cast<gpu_table_representation>()
-                        .get_table();
-  auto out_view = output_table.view();
+  auto out_view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
 
   auto host_data = copy_column_to_host<typename Traits::type>(out_view.column(0));
   auto host_keys = copy_column_to_host<int64_t>(out_view.column(1));
@@ -130,17 +128,14 @@ TEMPLATE_TEST_CASE("sirius_physical_projection can drop columns",
   duckdb::vector<duckdb::LogicalType> types;
   types.push_back(Traits::logical_type());
 
-  sirius_physical_projection projection(std::move(types), std::move(exprs), key_vals.size());
+  sirius_physical_projection projection(
+    sirius::from_duckdb_vec(types), sirius::wrap_many(std::move(exprs)), key_vals.size());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = projection.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
-  auto output_table = dynamic_cast<const pipelineable_operator_data&>(*outputs)
-                        .get_data_batches()[0]
-                        ->get_data()
-                        ->template cast<gpu_table_representation>()
-                        .get_table();
-  auto out_view = output_table.view();
+  auto out_view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
 
   auto host_data = copy_column_to_host<typename Traits::type>(out_view.column(0));
   REQUIRE(host_data == data_vals);
@@ -179,17 +174,14 @@ TEMPLATE_TEST_CASE("sirius_physical_projection can duplicate/reorder columns",
   types.push_back(Traits::logical_type());
   types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
 
-  sirius_physical_projection projection(std::move(types), std::move(exprs), key_vals.size());
+  sirius_physical_projection projection(
+    sirius::from_duckdb_vec(types), sirius::wrap_many(std::move(exprs)), key_vals.size());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = projection.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
-  auto output_table = dynamic_cast<const pipelineable_operator_data&>(*outputs)
-                        .get_data_batches()[0]
-                        ->get_data()
-                        ->template cast<gpu_table_representation>()
-                        .get_table();
-  auto out_view = output_table.view();
+  auto out_view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
 
   auto host_key0 = copy_column_to_host<int64_t>(out_view.column(0));
   auto host_data = copy_column_to_host<typename Traits::type>(out_view.column(1));

@@ -16,17 +16,20 @@
 
 #pragma once
 
-#include "duckdb/common/atomic.hpp"
-#include "duckdb/common/reference_map.hpp"
-#include "duckdb/common/set.hpp"
-#include "duckdb/common/unordered_set.hpp"
-#include "duckdb/function/table_function.hpp"
+#include "common/optional_ptr.hpp"
+#include "common/reference_map.hpp"
+#include "duckdb/parallel/pipeline.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "op/sirius_physical_operator.hpp"
-// #include "duckdb/parallel/executor_task.hpp"
-#include "duckdb/parallel/pipeline.hpp"
+#include "op/sirius_physical_operator_type.hpp"
+#include "pipeline/pipeline_build_context.hpp"
+#include "telemetry-bridge/gen/uuid.rs.h"
 
 #include <nvtx3/nvtx3.hpp>
+
+#include <mutex>
+#include <vector>
+
 namespace sirius {
 
 class sirius_engine;
@@ -34,10 +37,6 @@ class sirius_engine;
 namespace creator {
 class task_creator;
 }  // namespace creator
-
-namespace op {
-class sirius_physical_operator;
-}  // namespace op
 
 namespace pipeline {
 
@@ -51,28 +50,30 @@ class sirius_pipeline_build_state {
 
  public:
   //! Duplicate eliminated join scan dependencies
-  duckdb::reference_map_t<const op::sirius_physical_operator, duckdb::reference<sirius_pipeline>>
+  sirius::reference_map_t<const op::sirius_physical_operator,
+                          std::reference_wrapper<sirius_pipeline>>
     delim_join_dependencies;
   //! Materialized CTE scan dependencies
-  duckdb::reference_map_t<const op::sirius_physical_operator, duckdb::reference<sirius_pipeline>>
+  sirius::reference_map_t<const op::sirius_physical_operator,
+                          std::reference_wrapper<sirius_pipeline>>
     cte_dependencies;
 
  public:
   void set_pipeline_source(sirius_pipeline& pipeline, op::sirius_physical_operator& op);
   void set_pipeline_sink(sirius_pipeline& pipeline,
-                         duckdb::optional_ptr<op::sirius_physical_operator> op,
+                         sirius::optional_ptr<op::sirius_physical_operator> op,
                          std::size_t sink_pipeline_count);
   void set_pipeline_operators(
     sirius_pipeline& pipeline,
-    duckdb::vector<duckdb::reference<op::sirius_physical_operator>> operators);
+    duckdb::vector<std::reference_wrapper<op::sirius_physical_operator>> operators);
   void add_pipeline_operator(sirius_pipeline& pipeline, op::sirius_physical_operator& op);
-  duckdb::shared_ptr<sirius_pipeline> create_child_pipeline(sirius_engine& engine,
+  duckdb::shared_ptr<sirius_pipeline> create_child_pipeline(const pipeline_build_context& ctx,
                                                             sirius_pipeline& pipeline,
                                                             op::sirius_physical_operator& op);
 
-  duckdb::optional_ptr<op::sirius_physical_operator> get_pipeline_source(sirius_pipeline& pipeline);
-  duckdb::optional_ptr<op::sirius_physical_operator> get_pipeline_sink(sirius_pipeline& pipeline);
-  duckdb::vector<duckdb::reference<op::sirius_physical_operator>> get_pipeline_operators(
+  sirius::optional_ptr<op::sirius_physical_operator> get_pipeline_source(sirius_pipeline& pipeline);
+  sirius::optional_ptr<op::sirius_physical_operator> get_pipeline_sink(sirius_pipeline& pipeline);
+  duckdb::vector<std::reference_wrapper<op::sirius_physical_operator>> get_pipeline_operators(
     sirius_pipeline& pipeline);
 };
 
@@ -84,12 +85,10 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   friend class sirius_pipeline_converter;
 
  public:
-  explicit sirius_pipeline(sirius_engine& engine);
+  explicit sirius_pipeline(const pipeline_build_context& ctx);
   virtual ~sirius_pipeline() = default;
 
  public:
-  duckdb::ClientContext& get_client_context();
-
   void add_dependency(duckdb::shared_ptr<sirius_pipeline>& pipeline);
 
   void is_ready();
@@ -113,16 +112,21 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   // const;
 
   //! Returns a list of all operators (including source and sink) involved in this pipeline
-  duckdb::vector<duckdb::reference<op::sirius_physical_operator>> get_operators();
-  duckdb::vector<duckdb::const_reference<op::sirius_physical_operator>> get_operators() const;
+  duckdb::vector<std::reference_wrapper<op::sirius_physical_operator>> get_operators();
+  duckdb::vector<std::reference_wrapper<const op::sirius_physical_operator>> get_operators() const;
 
-  duckdb::optional_ptr<op::sirius_physical_operator> get_sink() { return sink; }
+  sirius::optional_ptr<op::sirius_physical_operator> get_sink() { return sink; }
 
-  duckdb::optional_ptr<op::sirius_physical_operator> get_sink() const noexcept { return sink; }
+  sirius::optional_ptr<op::sirius_physical_operator> get_sink() const noexcept { return sink; }
 
-  duckdb::optional_ptr<op::sirius_physical_operator> get_source() { return source; }
+  sirius::optional_ptr<op::sirius_physical_operator> get_source() { return source; }
 
-  duckdb::optional_ptr<op::sirius_physical_operator> get_source() const noexcept { return source; }
+  sirius::optional_ptr<op::sirius_physical_operator> get_source() const noexcept { return source; }
+
+  // Returns the next ports of the pipeline's sink operator, handling special-cased composite
+  // operators like left and right delim joins. Returns an empty vector if the sink is not set.
+  [[nodiscard]] std::vector<op::sirius_physical_operator::next_port_info>
+  get_next_ports_after_sink() const;
 
   //! Set the pipeline ID
   void set_pipeline_id(size_t id) { pipeline_id = id; }
@@ -157,8 +161,21 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   void mark_task_created();
   void mark_task_completed();
 
+  //! Observers for the per-pipeline task counters (testing / diagnostics).
+  [[nodiscard]] std::size_t get_tasks_created() const { return tasks_created.load(); }
+  [[nodiscard]] std::size_t get_tasks_completed() const { return tasks_completed.load(); }
+
   //! Set the task_creator pointer so this pipeline can schedule downstream consumers on finish.
   void set_task_creator(sirius::creator::task_creator* tc);
+
+  //! Returns a scoped lock on the pipeline status mutex.
+  //! Callers must hold this lock across the operation that consumes pipeline state
+  //! (port data pop, partition claim, etc.) and the task constructor that calls
+  //! mark_task_created(), so that update_pipeline_status() cannot observe an
+  //! empty-port / balanced-counter state while a task is mid-creation.
+  [[nodiscard]] std::unique_lock<std::mutex> get_task_creation_lock();
+
+  [[nodiscard]] uuid::UUID pipeline_uuid() const { return _pipeline_uuid; }
 
  private:
   //! Whether or not the pipeline has been readied
@@ -166,11 +183,11 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   //! Whether or not the pipeline has been initialized
   std::atomic<bool> initialized;
   //! The source of this pipeline
-  duckdb::optional_ptr<op::sirius_physical_operator> source;
+  sirius::optional_ptr<op::sirius_physical_operator> source;
   //! The chain of intermediate operators
-  duckdb::vector<duckdb::reference<op::sirius_physical_operator>> operators;
+  duckdb::vector<std::reference_wrapper<op::sirius_physical_operator>> operators;
   //! The sink (i.e. destination) for data; this is e.g. a hash table to-be-built
-  duckdb::optional_ptr<op::sirius_physical_operator> sink;
+  sirius::optional_ptr<op::sirius_physical_operator> sink;
 
   //! The global source state
   duckdb::unique_ptr<duckdb::GlobalSourceState> source_state;
@@ -197,7 +214,13 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
 
   //! The unique ID of this pipeline (assigned based on new_scheduled order)
   size_t pipeline_id = 0;
-  sirius_engine& engine;
+  //! Plan-time context (replaces sirius_engine& for plan-time needs)
+  pipeline_build_context build_ctx_;
+
+  //! Serialises update_pipeline_status() checks against task_creator's port-pop +
+  //! mark_task_created() sequences so neither can observe a transiently-balanced
+  //! counter while the other is mid-operation.
+  mutable std::mutex _status_mutex;
 
   //! Whether the pipeline has been finished
   std::atomic<bool> pipeline_finished = false;
@@ -208,6 +231,8 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   //! NVTX process-wide range tracking the pipeline's active lifetime
   std::atomic<bool> _nvtx_range_started{false};
   nvtxRangeId_t _nvtx_pipeline_range_id{0};
+
+  uuid::UUID _pipeline_uuid{uuid::now_v7()};
 };
 
 }  // namespace pipeline

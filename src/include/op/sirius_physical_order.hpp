@@ -38,7 +38,7 @@ class sirius_physical_order : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::ORDER_BY;
 
-  sirius_physical_order(duckdb::vector<duckdb::LogicalType> types,
+  sirius_physical_order(duckdb::vector<sirius::logical_type> types,
                         duckdb::vector<duckdb::BoundOrderByNode> orders,
                         duckdb::vector<std::size_t> projections_p,
                         std::size_t estimated_cardinality,
@@ -53,9 +53,9 @@ class sirius_physical_order : public sirius_physical_operator {
   bool is_sink() const override { return true; }
   bool sink_order_dependent() const override { return false; }
 
-  duckdb::OrderPreservationType source_order() const override
+  sirius::OrderPreservationType source_order() const override
   {
-    return duckdb::OrderPreservationType::FIXED_ORDER;
+    return sirius::OrderPreservationType::FIXED_ORDER;
   }
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
