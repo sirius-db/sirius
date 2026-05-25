@@ -204,11 +204,12 @@ TEST_CASE_METHOD(TransparentExecutionFixture,
                  "transparent execution: fallback for unsupported (window)",
                  "[transparent][integration]")
 {
-  // Window functions are not supported by Sirius — should fall back to CPU silently.
+  // Aggregate-over-window is not supported by Sirius (only ranking ROW_NUMBER/RANK/DENSE_RANK is)
+  // — should fall back to CPU silently.
   con->Query("CREATE TABLE test_win AS SELECT i AS id, i % 5 AS grp FROM range(100) t(i);");
   auto before_stats = sirius::test::get_transparent_execution_stats(*con);
   auto result       = con->Query(
-    "SELECT id, grp, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY id) AS rn "
+    "SELECT id, grp, SUM(id) OVER (PARTITION BY grp ORDER BY id) AS s "
           "FROM test_win ORDER BY id;");
   REQUIRE(result);
   REQUIRE_FALSE(result->HasError());
