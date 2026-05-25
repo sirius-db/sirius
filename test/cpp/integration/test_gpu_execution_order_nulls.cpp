@@ -68,7 +68,8 @@ class runtime_setting_guard {
   runtime_setting_guard(duckdb::Connection& con, std::string setting, uint64_t value)
     : con(con),
       setting(std::move(setting)),
-      old_value(query_single_value(con, "SELECT current_setting('" + this->setting + "')"))
+      old_value(query_single_value(
+        con, "SELECT value FROM duckdb_settings() WHERE name = '" + this->setting + "'"))
   {
     require_ok(con, "SET " + this->setting + " = " + std::to_string(value));
   }

@@ -258,9 +258,12 @@ class WindowBenchmarkFixture {
   void print_config_note()
   {
     std::cout << "config | scan_task_batch_size="
-              << query_single_value(*con, "SELECT current_setting('scan_task_batch_size')")
+              << query_single_value(
+                   *con, "SELECT value FROM duckdb_settings() WHERE name = 'scan_task_batch_size'")
               << " | hash_partition_bytes="
-              << query_single_value(*con, "SELECT current_setting('hash_partition_bytes')") << '\n';
+              << query_single_value(
+                   *con, "SELECT value FROM duckdb_settings() WHERE name = 'hash_partition_bytes'")
+              << '\n';
   }
 
   void create_synthetic_table(int64_t rows)
