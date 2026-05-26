@@ -519,81 +519,80 @@ execute_result gpu_expression_executor::execute(sirius::ast::node const& expr, e
     [this, mode](auto const& alt) -> execute_result { return this->execute(alt, mode); }, expr.v);
 }
 
-execute_result gpu_expression_executor::execute(sirius::ast::reference const& /*alt*/,
-                                                execution_mode /*mode*/)
+execute_result gpu_expression_executor::execute(sirius::ast::reference const& alt,
+                                                execution_mode mode)
 {
-  throw duckdb::NotImplementedException(
-    "[gpu_expression_executor] sirius::ast::reference shim not yet implemented");
+  auto duck_expr = sirius::ast::to_duckdb(alt);
+  return execute(*duck_expr, mode);
 }
 
-execute_result gpu_expression_executor::execute(sirius::ast::constant const& /*alt*/,
-                                                execution_mode /*mode*/)
+execute_result gpu_expression_executor::execute(sirius::ast::constant const& alt,
+                                                execution_mode mode)
 {
-  throw duckdb::NotImplementedException(
-    "[gpu_expression_executor] sirius::ast::constant shim not yet implemented");
+  auto duck_expr = sirius::ast::to_duckdb(alt);
+  return execute(*duck_expr, mode);
 }
 
-execute_result gpu_expression_executor::execute(sirius::ast::comparison const& /*alt*/,
-                                                execution_mode /*mode*/)
+execute_result gpu_expression_executor::execute(sirius::ast::comparison const& alt,
+                                                execution_mode mode)
 {
-  throw duckdb::NotImplementedException(
-    "[gpu_expression_executor] sirius::ast::comparison shim not yet implemented");
+  auto duck_expr = sirius::ast::to_duckdb(alt);
+  return execute(*duck_expr, mode);
 }
 
-execute_result gpu_expression_executor::execute(sirius::ast::conjunction const& /*alt*/,
-                                                execution_mode /*mode*/)
+execute_result gpu_expression_executor::execute(sirius::ast::conjunction const& alt,
+                                                execution_mode mode)
 {
-  throw duckdb::NotImplementedException(
-    "[gpu_expression_executor] sirius::ast::conjunction shim not yet implemented");
+  auto duck_expr = sirius::ast::to_duckdb(alt);
+  return execute(*duck_expr, mode);
 }
 
-execute_result gpu_expression_executor::execute(sirius::ast::between const& /*alt*/,
-                                                execution_mode /*mode*/)
+execute_result gpu_expression_executor::execute(sirius::ast::between const& alt,
+                                                execution_mode mode)
 {
-  throw duckdb::NotImplementedException(
-    "[gpu_expression_executor] sirius::ast::between shim not yet implemented");
+  auto duck_expr = sirius::ast::to_duckdb(alt);
+  return execute(*duck_expr, mode);
 }
 
-execute_result gpu_expression_executor::execute(sirius::ast::case_expr const& /*alt*/,
-                                                execution_mode /*mode*/)
+execute_result gpu_expression_executor::execute(sirius::ast::case_expr const& alt,
+                                                execution_mode mode)
 {
-  throw duckdb::NotImplementedException(
-    "[gpu_expression_executor] sirius::ast::case_expr shim not yet implemented");
+  auto duck_expr = sirius::ast::to_duckdb(alt);
+  return execute(*duck_expr, mode);
 }
 
-execute_result gpu_expression_executor::execute(sirius::ast::cast const& /*alt*/,
-                                                execution_mode /*mode*/)
+execute_result gpu_expression_executor::execute(sirius::ast::cast const& alt, execution_mode mode)
 {
-  throw duckdb::NotImplementedException(
-    "[gpu_expression_executor] sirius::ast::cast shim not yet implemented");
+  auto duck_expr = sirius::ast::to_duckdb(alt);
+  return execute(*duck_expr, mode);
 }
 
-execute_result gpu_expression_executor::execute(sirius::ast::unary_op const& /*alt*/,
-                                                execution_mode /*mode*/)
+execute_result gpu_expression_executor::execute(sirius::ast::unary_op const& alt,
+                                                execution_mode mode)
 {
-  throw duckdb::NotImplementedException(
-    "[gpu_expression_executor] sirius::ast::unary_op shim not yet implemented");
+  auto duck_expr = sirius::ast::to_duckdb(alt);
+  return execute(*duck_expr, mode);
 }
 
-execute_result gpu_expression_executor::execute(sirius::ast::coalesce const& /*alt*/,
-                                                execution_mode /*mode*/)
+execute_result gpu_expression_executor::execute(sirius::ast::coalesce const& alt,
+                                                execution_mode mode)
 {
-  throw duckdb::NotImplementedException(
-    "[gpu_expression_executor] sirius::ast::coalesce shim not yet implemented");
+  auto duck_expr = sirius::ast::to_duckdb(alt);
+  return execute(*duck_expr, mode);
 }
 
-execute_result gpu_expression_executor::execute(sirius::ast::in_list const& /*alt*/,
-                                                execution_mode /*mode*/)
+execute_result gpu_expression_executor::execute(sirius::ast::in_list const& alt,
+                                                execution_mode mode)
 {
-  throw duckdb::NotImplementedException(
-    "[gpu_expression_executor] sirius::ast::in_list shim not yet implemented");
+  auto duck_expr = sirius::ast::to_duckdb(alt);
+  return execute(*duck_expr, mode);
 }
 
-execute_result gpu_expression_executor::execute(sirius::ast::function_call const& /*alt*/,
-                                                execution_mode /*mode*/)
+execute_result gpu_expression_executor::execute(sirius::ast::function_call const& alt,
+                                                execution_mode mode)
 {
-  throw duckdb::NotImplementedException(
-    "[gpu_expression_executor] sirius::ast::function_call shim not yet implemented");
+  auto duck_expr = sirius::ast::to_duckdb(alt);
+  return execute(*duck_expr, mode);
 }
 
 std::size_t gpu_expression_executor::count_ast_ops(sirius::ast::node const& expr) const
