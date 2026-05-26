@@ -681,8 +681,9 @@ TEST_CASE("ast_to_duckdb - function_call add translates to BoundFunctionExpressi
   std::vector<std::unique_ptr<node>> args;
   args.push_back(make_ref(0));
   args.push_back(make_int_const(3));
-  node orig{function_call{
-    sirius::function_id::add, std::move(args), sirius::logical_type::make(sirius::type_id::INTEGER)}};
+  node orig{function_call{sirius::function_id::add,
+                          std::move(args),
+                          sirius::logical_type::make(sirius::type_id::INTEGER)}};
   auto out = sirius::ast::to_duckdb(orig);
   REQUIRE(out);
   REQUIRE(out->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION);
@@ -699,8 +700,9 @@ TEST_CASE("ast_to_duckdb - function_call substring translates to BoundFunctionEx
   args.push_back(make_ref(0));
   args.push_back(make_int_const(1));
   args.push_back(make_int_const(3));
-  node orig{function_call{
-    sirius::function_id::substring, std::move(args), sirius::logical_type::make(sirius::type_id::VARCHAR)}};
+  node orig{function_call{sirius::function_id::substring,
+                          std::move(args),
+                          sirius::logical_type::make(sirius::type_id::VARCHAR)}};
   auto out = sirius::ast::to_duckdb(orig);
   REQUIRE(out);
   REQUIRE(out->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION);
@@ -715,8 +717,9 @@ TEST_CASE("ast_to_duckdb - function_call like translates to BoundFunctionExpress
   std::vector<std::unique_ptr<node>> args;
   args.push_back(make_ref(0));
   args.push_back(make_str_const("x%"));
-  node orig{function_call{
-    sirius::function_id::like, std::move(args), sirius::logical_type::make(sirius::type_id::BOOLEAN)}};
+  node orig{function_call{sirius::function_id::like,
+                          std::move(args),
+                          sirius::logical_type::make(sirius::type_id::BOOLEAN)}};
   auto out = sirius::ast::to_duckdb(orig);
   REQUIRE(out);
   REQUIRE(out->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION);
@@ -748,8 +751,9 @@ TEST_CASE("ast_to_duckdb - function_call year translates to BoundFunctionExpress
 {
   std::vector<std::unique_ptr<node>> args;
   args.push_back(make_ref(0));
-  node orig{function_call{
-    sirius::function_id::year, std::move(args), sirius::logical_type::make(sirius::type_id::BIGINT)}};
+  node orig{function_call{sirius::function_id::year,
+                          std::move(args),
+                          sirius::logical_type::make(sirius::type_id::BIGINT)}};
   auto out = sirius::ast::to_duckdb(orig);
   REQUIRE(out);
   REQUIRE(out->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION);
@@ -815,7 +819,9 @@ TEST_CASE("ast_to_duckdb - conjunction self-equivalence via from_duckdb", "[ast_
 TEST_CASE("ast_to_duckdb - between self-equivalence via from_duckdb", "[ast_to_duckdb]")
 {
   node orig{between{
-    make_ref(0), make_int_const(1), make_int_const(10),
+    make_ref(0),
+    make_int_const(1),
+    make_int_const(10),
     /*lower_inclusive=*/true,
     /*upper_inclusive=*/true,
   }};
@@ -898,8 +904,9 @@ TEST_CASE("ast_to_duckdb - function_call self-equivalence via from_duckdb", "[as
   std::vector<std::unique_ptr<node>> args;
   args.push_back(make_ref(0));
   args.push_back(make_int_const(3));
-  node orig{function_call{
-    sirius::function_id::add, std::move(args), sirius::logical_type::make(sirius::type_id::INTEGER)}};
+  node orig{function_call{sirius::function_id::add,
+                          std::move(args),
+                          sirius::logical_type::make(sirius::type_id::INTEGER)}};
   auto duck_expr = sirius::ast::to_duckdb(orig);
   REQUIRE(duck_expr);
   auto round = sirius::ast::from_duckdb(*duck_expr);

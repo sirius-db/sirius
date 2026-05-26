@@ -368,8 +368,7 @@ class gpu_expression_executor {
    *             supports AST mode. AST breakers (case_expr, coalesce, op_try,
    *             etc.) always materialize regardless of the hint.
    */
-  execute_result execute(sirius::ast::node const& expr,
-                         execution_mode mode = execution_mode::AST);
+  execute_result execute(sirius::ast::node const& expr, execution_mode mode = execution_mode::AST);
 
  private:
   std::vector<duckdb::Expression const*> _expressions;  ///< The expressions to execute

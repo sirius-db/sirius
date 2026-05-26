@@ -169,8 +169,8 @@ std::unique_ptr<duckdb::Expression> to_duckdb(cast const& alt)
                                                      duckdb::BoundCastInfo{nullptr},
                                                      /*is_try_cast=*/true));
   }
-  return from_duck_ptr(duckdb::BoundCastExpression::AddDefaultCastToType(std::move(child),
-                                                                         std::move(target_type)));
+  return from_duck_ptr(
+    duckdb::BoundCastExpression::AddDefaultCastToType(std::move(child), std::move(target_type)));
 }
 
 std::unique_ptr<duckdb::Expression> to_duckdb(unary_op const& alt)
@@ -201,8 +201,7 @@ std::unique_ptr<duckdb::Expression> to_duckdb(coalesce const& alt)
   // executor specialization re-derives this from the children at evaluation
   // time; INTEGER is a safe placeholder for this stub.
   auto out = duckdb::make_uniq<duckdb::BoundOperatorExpression>(
-    duckdb::ExpressionType::OPERATOR_COALESCE,
-    duckdb::LogicalType{duckdb::LogicalTypeId::INTEGER});
+    duckdb::ExpressionType::OPERATOR_COALESCE, duckdb::LogicalType{duckdb::LogicalTypeId::INTEGER});
   for (auto const& child : alt.children) {
     out->children.push_back(to_duck_ptr(to_duckdb(*child)));
   }

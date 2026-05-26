@@ -17,7 +17,7 @@
 // sirius
 #include <cudf/cudf_utils.hpp>
 
-#include <expression/ast/node.hpp>       // sirius::ast::node + 11 alternatives
+#include <expression/ast/node.hpp>  // sirius::ast::node + 11 alternatives
 #include <expression/ast/to_duckdb.hpp>  // sirius::ast::to_duckdb (per-alternative overloads + node dispatcher)
 #include <expression/expression_internal.hpp>
 #include <expression/function_id.hpp>

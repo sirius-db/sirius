@@ -223,8 +223,10 @@ cudf::table_view get_table_view(std::shared_ptr<data_batch> const& batch)
 // Run a non-owning executor over the given expression pointer and return the
 // resulting output table.
 template <class ExprPtr>
-std::unique_ptr<cudf::table> run_one(
-  memory_space& space, ExprPtr expr_ptr, cudf::table_view tv, exp_strategy_enum strategy)
+std::unique_ptr<cudf::table> run_one(memory_space& space,
+                                     ExprPtr expr_ptr,
+                                     cudf::table_view tv,
+                                     exp_strategy_enum strategy)
 {
   exp_executor executor(expr_ptr, get_resource_ref(space), cudf::get_default_stream(), strategy);
   return executor.execute(tv);
@@ -247,9 +249,9 @@ std::unique_ptr<sirius::ast::node> int_const_node(int32_t v)
 // DuckDB-side BoundReferenceExpression with INTEGER placeholder.
 duckdb::unique_ptr<Expression> duck_int_ref(uint32_t idx)
 {
-  return duckdb::unique_ptr<Expression>(duckdb::make_uniq<BoundReferenceExpression>(
-                                          LogicalType{LogicalTypeId::INTEGER}, idx)
-                                          .release());
+  return duckdb::unique_ptr<Expression>(
+    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, idx)
+      .release());
 }
 
 duckdb::unique_ptr<Expression> duck_int_const(int32_t v)
@@ -274,7 +276,7 @@ TEST_CASE("ast_equivalence - reference identity round-trip", "[gpu_expression_ex
 
   auto duck_expr =
     duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
-  auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::reference{0});
+  auto hand_ast       = std::make_unique<sirius::ast::node>(sirius::ast::reference{0});
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
 
@@ -304,8 +306,8 @@ TEST_CASE("ast_equivalence - constant INTEGER", "[gpu_expression_executor_ast]")
     *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 100}});
   auto tv = get_table_view(input);
 
-  auto duck_expr = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(42));
-  auto hand_ast  = std::make_unique<sirius::ast::node>(sirius::ast::constant{
+  auto duck_expr      = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(42));
+  auto hand_ast       = std::make_unique<sirius::ast::node>(sirius::ast::constant{
     sirius::value{int32_t{42}}, sirius::logical_type::make(sirius::type_id::INTEGER)});
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
@@ -329,8 +331,8 @@ TEST_CASE("ast_equivalence - constant VARCHAR", "[gpu_expression_executor_ast]")
     *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 100}});
   auto tv = get_table_view(input);
 
-  auto duck_expr = duckdb::make_uniq<BoundConstantExpression>(Value("hello"));
-  auto hand_ast  = std::make_unique<sirius::ast::node>(sirius::ast::constant{
+  auto duck_expr      = duckdb::make_uniq<BoundConstantExpression>(Value("hello"));
+  auto hand_ast       = std::make_unique<sirius::ast::node>(sirius::ast::constant{
     sirius::value{std::string{"hello"}}, sirius::logical_type::make(sirius::type_id::VARCHAR)});
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
@@ -355,8 +357,8 @@ TEST_CASE("ast_equivalence - comparison EQUAL (MATERIALIZE)", "[gpu_expression_e
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
-  auto input = make_input_batch(
-    *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 10}});
+  auto input =
+    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 10}});
   auto tv = get_table_view(input);
 
   auto duck_expr = duckdb::make_uniq<BoundComparisonExpression>(
@@ -381,8 +383,8 @@ TEST_CASE("ast_equivalence - comparison EQUAL (AST_INTERPRET)", "[gpu_expression
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
-  auto input = make_input_batch(
-    *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 10}});
+  auto input =
+    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 10}});
   auto tv = get_table_view(input);
 
   auto duck_expr = duckdb::make_uniq<BoundComparisonExpression>(
@@ -407,8 +409,8 @@ TEST_CASE("ast_equivalence - comparison LESSTHAN (MATERIALIZE)", "[gpu_expressio
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
-  auto input = make_input_batch(
-    *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 10}});
+  auto input =
+    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 10}});
   auto tv = get_table_view(input);
 
   auto duck_expr = duckdb::make_uniq<BoundComparisonExpression>(
@@ -437,16 +439,15 @@ TEST_CASE("ast_equivalence - conjunction AND (MATERIALIZE)", "[gpu_expression_ex
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
-  auto input = make_input_batch(
-    *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 10}});
+  auto input =
+    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 10}});
   auto tv = get_table_view(input);
 
   auto duck_lhs = duckdb::make_uniq<BoundComparisonExpression>(
     ExpressionType::COMPARE_GREATERTHAN, duck_int_ref(0), duck_int_const(1));
   auto duck_rhs = duckdb::make_uniq<BoundComparisonExpression>(
     ExpressionType::COMPARE_LESSTHAN, duck_int_ref(0), duck_int_const(9));
-  auto duck_expr =
-    duckdb::make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
+  auto duck_expr = duckdb::make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
   duck_expr->children.push_back(std::move(duck_lhs));
   duck_expr->children.push_back(std::move(duck_rhs));
 
@@ -476,16 +477,15 @@ TEST_CASE("ast_equivalence - conjunction AND (AST_INTERPRET)", "[gpu_expression_
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
-  auto input = make_input_batch(
-    *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 10}});
+  auto input =
+    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 10}});
   auto tv = get_table_view(input);
 
   auto duck_lhs = duckdb::make_uniq<BoundComparisonExpression>(
     ExpressionType::COMPARE_GREATERTHAN, duck_int_ref(0), duck_int_const(1));
   auto duck_rhs = duckdb::make_uniq<BoundComparisonExpression>(
     ExpressionType::COMPARE_LESSTHAN, duck_int_ref(0), duck_int_const(9));
-  auto duck_expr =
-    duckdb::make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
+  auto duck_expr = duckdb::make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
   duck_expr->children.push_back(std::move(duck_lhs));
   duck_expr->children.push_back(std::move(duck_rhs));
 
@@ -519,14 +519,14 @@ TEST_CASE("ast_equivalence - between (MATERIALIZE)", "[gpu_expression_executor_a
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
-  auto input = make_input_batch(
-    *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 20}});
+  auto input =
+    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 20}});
   auto tv = get_table_view(input);
 
   auto duck_expr = duckdb::make_uniq<BoundBetweenExpression>(
     duck_int_ref(0), duck_int_const(5), duck_int_const(15), /*lo=*/true, /*hi=*/true);
-  auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::between{
-    ref_node(0), int_const_node(5), int_const_node(15), true, true});
+  auto hand_ast = std::make_unique<sirius::ast::node>(
+    sirius::ast::between{ref_node(0), int_const_node(5), int_const_node(15), true, true});
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
 
@@ -550,8 +550,8 @@ TEST_CASE("ast_equivalence - case_expr WHEN/THEN/ELSE (MATERIALIZE)",
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
-  auto input = make_input_batch(
-    *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 10}});
+  auto input =
+    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 10}});
   auto tv = get_table_view(input);
 
   auto duck_when = duckdb::make_uniq<BoundComparisonExpression>(
@@ -596,13 +596,13 @@ TEST_CASE("ast_equivalence - cast INTEGER->BIGINT (MATERIALIZE)", "[gpu_expressi
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
-  auto input = make_input_batch(
-    *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 50}});
+  auto input =
+    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 50}});
   auto tv = get_table_view(input);
 
   auto duck_expr =
     BoundCastExpression::AddDefaultCastToType(duck_int_ref(0), LogicalType{LogicalTypeId::BIGINT});
-  auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::cast{
+  auto hand_ast       = std::make_unique<sirius::ast::node>(sirius::ast::cast{
     ref_node(0), sirius::logical_type::make(sirius::type_id::BIGINT), /*try_cast=*/false});
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
@@ -627,8 +627,8 @@ TEST_CASE("ast_equivalence - unary_op NOT (MATERIALIZE)", "[gpu_expression_execu
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
   // Need a BOOLEAN-producing child; use a comparison.
-  auto input = make_input_batch(
-    *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 10}});
+  auto input =
+    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 10}});
   auto tv = get_table_view(input);
 
   auto duck_inner = duckdb::make_uniq<BoundComparisonExpression>(
@@ -661,8 +661,8 @@ TEST_CASE("ast_equivalence - unary_op IS_NULL (MATERIALIZE)", "[gpu_expression_e
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
-  auto input = make_input_batch(
-    *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 50}});
+  auto input =
+    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 50}});
   auto tv = get_table_view(input);
 
   auto duck_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NULL,
@@ -690,12 +690,12 @@ TEST_CASE("ast_equivalence - unary_op IS_NOT_NULL (MATERIALIZE)", "[gpu_expressi
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
-  auto input = make_input_batch(
-    *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 50}});
+  auto input =
+    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 50}});
   auto tv = get_table_view(input);
 
-  auto duck_expr = duckdb::make_uniq<BoundOperatorExpression>(
-    ExpressionType::OPERATOR_IS_NOT_NULL, LogicalType{LogicalTypeId::BOOLEAN});
+  auto duck_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NOT_NULL,
+                                                              LogicalType{LogicalTypeId::BOOLEAN});
   duck_expr->children.push_back(duck_int_ref(0));
 
   auto hand_ast = std::make_unique<sirius::ast::node>(
@@ -715,8 +715,7 @@ TEST_CASE("ast_equivalence - unary_op IS_NOT_NULL (MATERIALIZE)", "[gpu_expressi
   REQUIRE(hand_host == translated_host);
 }
 
-TEST_CASE("ast_equivalence - unary_op TRY translation (no exec)",
-          "[gpu_expression_executor_ast]")
+TEST_CASE("ast_equivalence - unary_op TRY translation (no exec)", "[gpu_expression_executor_ast]")
 {
   // OPERATOR_TRY is recognized by the AST surface but not executable by the
   // current gpu_expression_executor (it throws on dispatch through
@@ -731,8 +730,7 @@ TEST_CASE("ast_equivalence - unary_op TRY translation (no exec)",
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
   REQUIRE(translated_ast->holds<sirius::ast::unary_op>());
-  REQUIRE(translated_ast->get<sirius::ast::unary_op>().op ==
-          sirius::ast::unary_op::kind::op_try);
+  REQUIRE(translated_ast->get<sirius::ast::unary_op>().op == sirius::ast::unary_op::kind::op_try);
 
   auto round_trip = sirius::ast::to_duckdb(*translated_ast);
   REQUIRE(round_trip);
@@ -747,20 +745,19 @@ TEST_CASE("ast_equivalence - coalesce (MATERIALIZE)", "[gpu_expression_executor_
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
-  auto input = make_input_batch(
-    *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 50}});
+  auto input =
+    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 50}});
   auto tv = get_table_view(input);
 
-  auto duck_expr = duckdb::make_uniq<BoundOperatorExpression>(
-    ExpressionType::OPERATOR_COALESCE, LogicalType{LogicalTypeId::INTEGER});
+  auto duck_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE,
+                                                              LogicalType{LogicalTypeId::INTEGER});
   duck_expr->children.push_back(duck_int_ref(0));
   duck_expr->children.push_back(duck_int_const(0));
 
   std::vector<std::unique_ptr<sirius::ast::node>> children;
   children.push_back(ref_node(0));
   children.push_back(int_const_node(0));
-  auto hand_ast =
-    std::make_unique<sirius::ast::node>(sirius::ast::coalesce{std::move(children)});
+  auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::coalesce{std::move(children)});
 
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
@@ -784,8 +781,8 @@ TEST_CASE("ast_equivalence - in_list IN (MATERIALIZE)", "[gpu_expression_executo
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
-  auto input = make_input_batch(
-    *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 10}});
+  auto input =
+    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 10}});
   auto tv = get_table_view(input);
 
   auto duck_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::COMPARE_IN,
@@ -820,8 +817,8 @@ TEST_CASE("ast_equivalence - in_list IN (AST_INTERPRET)", "[gpu_expression_execu
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
-  auto input = make_input_batch(
-    *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 10}});
+  auto input =
+    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 10}});
   auto tv = get_table_view(input);
 
   auto duck_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::COMPARE_IN,
@@ -860,16 +857,14 @@ TEST_CASE("ast_equivalence - function_call add (MATERIALIZE)", "[gpu_expression_
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
-  auto input = make_input_batch(
-    *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 50}});
+  auto input =
+    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 50}});
   auto tv = get_table_view(input);
 
   auto duck_expr = duckdb::make_uniq<BoundFunctionExpression>(
     LogicalType{LogicalTypeId::INTEGER},
-    ScalarFunction("+",
-                   {LogicalType::INTEGER, LogicalType::INTEGER},
-                   LogicalType::INTEGER,
-                   nullptr),
+    ScalarFunction(
+      "+", {LogicalType::INTEGER, LogicalType::INTEGER}, LogicalType::INTEGER, nullptr),
     duckdb::vector<duckdb::unique_ptr<Expression>>{},
     nullptr);
   duck_expr->children.push_back(duck_int_ref(0));
@@ -878,8 +873,10 @@ TEST_CASE("ast_equivalence - function_call add (MATERIALIZE)", "[gpu_expression_
   std::vector<std::unique_ptr<sirius::ast::node>> args;
   args.push_back(ref_node(0));
   args.push_back(int_const_node(3));
-  auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::function_call{
-    sirius::function_id::add, std::move(args), sirius::logical_type::make(sirius::type_id::INTEGER)});
+  auto hand_ast = std::make_unique<sirius::ast::node>(
+    sirius::ast::function_call{sirius::function_id::add,
+                               std::move(args),
+                               sirius::logical_type::make(sirius::type_id::INTEGER)});
 
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
@@ -899,16 +896,14 @@ TEST_CASE("ast_equivalence - function_call add (AST_INTERPRET)", "[gpu_expressio
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
-  auto input = make_input_batch(
-    *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 50}});
+  auto input =
+    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 50}});
   auto tv = get_table_view(input);
 
   auto duck_expr = duckdb::make_uniq<BoundFunctionExpression>(
     LogicalType{LogicalTypeId::INTEGER},
-    ScalarFunction("+",
-                   {LogicalType::INTEGER, LogicalType::INTEGER},
-                   LogicalType::INTEGER,
-                   nullptr),
+    ScalarFunction(
+      "+", {LogicalType::INTEGER, LogicalType::INTEGER}, LogicalType::INTEGER, nullptr),
     duckdb::vector<duckdb::unique_ptr<Expression>>{},
     nullptr);
   duck_expr->children.push_back(duck_int_ref(0));
@@ -917,8 +912,10 @@ TEST_CASE("ast_equivalence - function_call add (AST_INTERPRET)", "[gpu_expressio
   std::vector<std::unique_ptr<sirius::ast::node>> args;
   args.push_back(ref_node(0));
   args.push_back(int_const_node(3));
-  auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::function_call{
-    sirius::function_id::add, std::move(args), sirius::logical_type::make(sirius::type_id::INTEGER)});
+  auto hand_ast = std::make_unique<sirius::ast::node>(
+    sirius::ast::function_call{sirius::function_id::add,
+                               std::move(args),
+                               sirius::logical_type::make(sirius::type_id::INTEGER)});
 
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
