@@ -152,6 +152,7 @@ set(EXTENSION_SOURCES
     src/expression/from_duckdb.cpp
     src/expression/function_id.cpp
     src/expression/join_condition.cpp
+    src/expression/to_duckdb.cpp
     src/expression/value.cpp
     src/expression_executor/expression_executor_strategy.cpp
     src/expression_executor/gpu_expression_executor.cpp
@@ -435,6 +436,7 @@ set(TEST_SOURCES
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/expression/test_ast_from_duckdb.cpp
     test/cpp/expression/test_ast_scaffold.cpp
+    test/cpp/expression/test_ast_to_duckdb.cpp
     test/cpp/expression/test_expression.cpp
     test/cpp/expression/test_function_id.cpp
     test/cpp/expression/test_join_condition.cpp
