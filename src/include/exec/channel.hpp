@@ -112,6 +112,11 @@ class channel {
   void close() { _queue->interrupt(); }
 
   /**
+   * @brief Reopen the channel after a close, restoring normal send/get behavior.
+   */
+  void reopen() { _queue->reactivate(); }
+
+  /**
    * @brief Check if the channel is still open.
    *
    * @return true if the channel is open, false otherwise

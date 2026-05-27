@@ -62,6 +62,18 @@ void itask_executor::drain_leftover_tasks() { _task_queue.drain(); }
 
 void itask_executor::drain_and_wait()
 {
+  // Guard: if the executor has never been started (or has been stopped),
+  // _bounded_pool is nullptr. drain_after_error may legitimately be called
+  // before any work has been dispatched, in which case there is nothing to
+  // drain. Without this guard the next line dereferences nullptr and crashes
+  // inside pthread_mutex_lock on the (offset-zero) std::mutex member —
+  // observed during task_scheduler::drain_after_error after an early
+  // sirius_engine::execute failure.
+  if (!_bounded_pool) {
+    SIRIUS_LOG_INFO("itask_executor::drain_and_wait: skipped — pool not initialized");
+    return;
+  }
+
   // Interrupt the pool so the manager's reserve() unblocks with an invalid slot.
   _bounded_pool->interrupt();
 
