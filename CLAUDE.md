@@ -206,10 +206,10 @@ The fallback mechanism is implemented in `src/fallback.cpp` and integrates with 
 
 ## Extension Development
 
-This is a DuckDB extension project using the extension template. The build system integrates with DuckDB's extension infrastructure via `extension-ci-tools`.
+This is a DuckDB extension project using DuckDB's CMake extension infrastructure. Local builds are driven through the root `Makefile`, which configures the `duckdb/` submodule with the presets in `cmake/CMakePresets.json`.
 
 **Key files for extension integration:**
-- `Makefile`: Thin wrapper including `extension-ci-tools/makefiles/duckdb_extension.Makefile`
+- `Makefile`: Root build entry point for CMake preset builds
 - `extension_config.cmake`: Specifies which extensions to load (sirius, json, tpcds, tpch, parquet, icu)
 - `src/sirius_extension.cpp`: Extension registration (LoadInternal function)
 

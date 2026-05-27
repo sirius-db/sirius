@@ -26,7 +26,7 @@ Analyze build errors, suggest fixes, rebuild, and iterate until the build succee
    ```bash
    git submodule status
    ```
-   Check that all submodules (`duckdb`, `cucascade`, `extension-ci-tools`, `substrait`, `duckdb-python`) are at expected commits. If any show a `+` prefix (out of sync), warn the user and offer:
+   Check that all submodules (`duckdb`, `cucascade`, `substrait`, `duckdb-python`, `vcpkg`) are at expected commits. If any show a `+` prefix (out of sync), warn the user and offer:
    ```bash
    git submodule update --init --recursive
    ```
