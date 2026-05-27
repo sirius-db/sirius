@@ -39,12 +39,13 @@ task_scheduler::task_scheduler(
   const exec::thread_pool_config& scan_executor_config,
   sirius::memory::sirius_memory_reservation_manager& mem_mgr,
   const cucascade::memory::system_topology_info* sys_topology,
-  const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors)
+  const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors,
+  sirius::telemetry::telemetry_context* telemetry_context)
 {
   // Create the scan executor with memory manager for host allocations
   // Pass a publisher so it can submit task requests without depending on task_scheduler
   _scan_executor = std::make_unique<sirius::op::scan::duckdb_scan_executor>(
-    scan_executor_config, &mem_mgr, _task_request_channel.make_publisher());
+    scan_executor_config, &mem_mgr, _task_request_channel.make_publisher(), telemetry_context);
 
   auto gpu_spaces = mem_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   // Initialize GPU pipeline executors for each available GPU
@@ -77,7 +78,8 @@ task_scheduler::task_scheduler(
       std::make_unique<gpu_pipeline_executor>(config,
                                               const_cast<cucascade::memory::memory_space*>(space),
                                               _task_request_channel.make_publisher(),
-                                              dg_exec));
+                                              dg_exec,
+                                              telemetry_context));
   }
 }
 

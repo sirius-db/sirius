@@ -98,6 +98,11 @@ The Sirius config file (e.g. `~/.sirius/sirius.yaml`) controls:
 - **Thread pools**: `pipeline`, `duckdb_scan`, `task_creator`, `downgrade` thread counts
 - **Scan cache**: `duckdb_scan.cache` (values: `"none"`, `"parquet"`, `"table_gpu"`, `"table_host"`)
 - **Operator params**: `scan_task_batch_size`, `hash_partition_bytes`, `concat_batch_bytes`
+- **Telemetry**: `telemetry.enable_quent`, `telemetry.output_directory`, `telemetry.engine_name`
+
+`run_tpch_parquet_and_generate_telemetry.sh` uses
+`test/tpch_performance/tpch_telemetry_sirius.yaml`, which contains only the
+`telemetry` section. Omitted Sirius sections use the built-in defaults.
 
 ### Example config (GB300, SF1000)
 
@@ -132,4 +137,8 @@ sirius:
     max_sort_partition_bytes: 0            # 0 = auto (33% GPU memory)
     hash_partition_bytes: 5368709120       # 5 GB
     concat_batch_bytes: 5368709120         # 5 GB
+  telemetry:
+    enable_quent: true
+    output_directory: telemetry_data
+    engine_name: siriusDB
 ```

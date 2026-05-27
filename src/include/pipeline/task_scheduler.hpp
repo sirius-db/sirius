@@ -45,6 +45,10 @@ namespace sirius::parallel {
 class downgrade_executor;
 }  // namespace sirius::parallel
 
+namespace sirius::telemetry {
+class telemetry_context;
+}  // namespace sirius::telemetry
+
 namespace sirius {
 
 namespace creator {
@@ -78,7 +82,8 @@ class task_scheduler {
                           sirius::memory::sirius_memory_reservation_manager& mem_mgr,
                           const cucascade::memory::system_topology_info* sys_topology = nullptr,
                           const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>*
-                            downgrade_executors = nullptr);
+                            downgrade_executors = nullptr,
+                          sirius::telemetry::telemetry_context* telemetry_context = nullptr);
 
   /**
    * @brief Destructor for the task_scheduler.

@@ -26,13 +26,20 @@
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 #include "pipeline/task_request.hpp"
+#include "telemetry/telemetry_context.hpp"
 
 #include <rmm/cuda_device.hpp>
 
 #include <util/stream_check_wrapper.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <exception>
+#include <memory>
 #include <mutex>
+#include <string>
+#include <utility>
 namespace sirius {
 namespace pipeline {
 
@@ -40,12 +47,14 @@ gpu_pipeline_executor::gpu_pipeline_executor(
   exec::thread_pool_config config,
   cucascade::memory::memory_space* mem_space,
   exec::publisher<std::unique_ptr<task_request>> task_request_publisher,
-  sirius::parallel::downgrade_executor* downgrade_executor)
+  sirius::parallel::downgrade_executor* downgrade_executor,
+  sirius::telemetry::telemetry_context* telemetry_context)
   : sirius::parallel::itask_executor(config),
     _stream_pool(rmm::cuda_device_id{mem_space->get_device_id()}, config.num_threads),
     _task_request_publisher(std::move(task_request_publisher)),
     _memory_space(mem_space),
-    _downgrade_executor(downgrade_executor)
+    _downgrade_executor(downgrade_executor),
+    _telemetry_context(telemetry_context)
 {
 }
 
@@ -53,8 +62,28 @@ gpu_pipeline_executor::~gpu_pipeline_executor() { stop(); }
 
 absl::AnyInvocable<void() noexcept> gpu_pipeline_executor::get_per_thread_init()
 {
-  auto device_id = _memory_space->get_device_id();
-  return [device_id]() noexcept {
+  auto device_id          = _memory_space->get_device_id();
+  auto* telemetry_context = _telemetry_context;
+  auto thread_name_prefix = _config.thread_name_prefix;
+  auto thread_id_counter  = std::make_shared<std::atomic<uint32_t>>(0);
+
+  return [device_id,
+          telemetry_context,
+          thread_name_prefix = std::move(thread_name_prefix),
+          thread_id_counter]() mutable noexcept {
+    if (telemetry_context) {
+      try {
+        const auto thread_id = thread_id_counter->fetch_add(1, std::memory_order_relaxed);
+        sirius::telemetry::init_executor_thread_for_current_thread(
+          *telemetry_context, thread_name_prefix + "_" + std::to_string(thread_id));
+      } catch (const std::exception& e) {
+        SIRIUS_LOG_ERROR("GPU pipeline executor thread telemetry init failed: {}", e.what());
+      } catch (...) {
+        SIRIUS_LOG_ERROR(
+          "GPU pipeline executor thread telemetry init failed with an unknown exception");
+      }
+    }
+
     // Per-thread init runs on a worker thread just spawned by the
     // bounded_pool. cudaSetDevice pins this thread to the executor's GPU
     // context; silent failure would cause every downstream CUDA call on this

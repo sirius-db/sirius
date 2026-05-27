@@ -26,6 +26,7 @@
 #include <cucascade/memory/topology_discovery.hpp>
 
 #include <filesystem>
+#include <string>
 
 namespace sirius {
 
@@ -61,6 +62,12 @@ struct operator_params {
   /// Maximum build-side bytes for switching to BUILD_PROBE join mode.
   /// May be larger than concat_batch_bytes; build-side batches will be concatenated if needed.
   uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
+};
+
+struct telemetry_config {
+  bool enable_quent{false};
+  std::string output_directory{"telemetry_data"};
+  std::string engine_name{"siriusDB"};
 };
 
 struct sirius_config {
@@ -116,6 +123,11 @@ struct sirius_config {
 
   [[nodiscard]] operator_params& get_operator_params() noexcept { return _operator_params; }
 
+  [[nodiscard]] const telemetry_config& get_telemetry_config() const noexcept
+  {
+    return _telemetry_config;
+  }
+
   /// Object-store backend credentials + endpoint. Empty fields disable the
   /// S3 backend; SiriusContext::initialize() reads this to populate
   /// scan_manager_config::s3_config before constructing the scan_manager.
@@ -135,6 +147,7 @@ struct sirius_config {
   exec::downgrade_executor_config _downgrade_executor_config;
   op::scan::scan_executor_config _scan_executor_config;
   operator_params _operator_params;
+  telemetry_config _telemetry_config;
 };
 
 }  // namespace sirius

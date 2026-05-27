@@ -26,11 +26,29 @@
 #include "duckdb/planner/planner.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
+#include "sirius_context.hpp"
 #include "telemetry/telemetry_context.hpp"
 
 #include <optional>
 
 namespace sirius {
+
+namespace {
+
+const telemetry::telemetry_context& get_telemetry_context(duckdb::ClientContext& client_context)
+{
+  if (not client_context.registered_state) {
+    throw duckdb::InvalidInputException("Sirius context is not registered.");
+  }
+
+  auto sirius_ctx = client_context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (not sirius_ctx || not sirius_ctx->is_initialized()) {
+    throw duckdb::InvalidInputException("Sirius context is not initialized.");
+  }
+  return sirius_ctx->get_telemetry_context();
+}
+
+}  // namespace
 
 void bind_prepared_statement_parameters(duckdb::PreparedStatementData& statement,
                                         const duckdb::PendingQueryParameters& parameters)
@@ -41,7 +59,9 @@ void bind_prepared_statement_parameters(duckdb::PreparedStatementData& statement
 
 sirius_interface::sirius_interface(duckdb::ClientContext& client_context,
                                    std::optional<std::string> query_label)
-  : client_context(client_context), telemetry(std::move(query_label)) {};
+  : client_context(client_context),
+    telemetry(get_telemetry_context(this->client_context)),
+    query_label(std::move(query_label)) {};
 
 void sirius_interface::sirius_process_error(duckdb::ErrorData& error,
                                             const duckdb::string& query) const

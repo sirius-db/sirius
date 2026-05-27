@@ -4,7 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-quent-attributes = { git = "https://github.com/rapidsai/quent.git", rev = "871f8f45fd35288945a13636df8cadf50f7dbcc2" }
-quent-model = { git = "https://github.com/rapidsai/quent.git", rev = "871f8f45fd35288945a13636df8cadf50f7dbcc2" }
-quent-query-engine-model = { git = "https://github.com/rapidsai/quent.git", rev = "871f8f45fd35288945a13636df8cadf50f7dbcc2" }
-quent-stdlib = { git = "https://github.com/rapidsai/quent.git", rev = "871f8f45fd35288945a13636df8cadf50f7dbcc2" }
+quent-attributes = { git = "https://github.com/rapidsai/quent.git", rev = "ba843288dce6bea60a9cb3ed14111cc9c8828ef9" }
+quent-model = { git = "https://github.com/rapidsai/quent.git", rev = "ba843288dce6bea60a9cb3ed14111cc9c8828ef9" }
+quent-query-engine-model = { git = "https://github.com/rapidsai/quent.git", rev = "ba843288dce6bea60a9cb3ed14111cc9c8828ef9" }
+quent-stdlib = { git = "https://github.com/rapidsai/quent.git", rev = "ba843288dce6bea60a9cb3ed14111cc9c8828ef9" }
+uuid = "1"

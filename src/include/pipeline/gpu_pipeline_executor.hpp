@@ -36,6 +36,10 @@ namespace sirius::parallel {
 class downgrade_executor;
 }  // namespace sirius::parallel
 
+namespace sirius::telemetry {
+class telemetry_context;
+}  // namespace sirius::telemetry
+
 namespace sirius {
 
 namespace creator {
@@ -67,7 +71,8 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
     exec::thread_pool_config config,
     cucascade::memory::memory_space* mem_space,
     exec::publisher<std::unique_ptr<task_request>> task_request_publisher,
-    sirius::parallel::downgrade_executor* downgrade_executor = nullptr);
+    sirius::parallel::downgrade_executor* downgrade_executor = nullptr,
+    sirius::telemetry::telemetry_context* telemetry_context  = nullptr);
 
   /**
    * @brief Destructor for the gpu_pipeline_executor.
@@ -125,6 +130,7 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   sirius::parallel::downgrade_executor* _downgrade_executor{nullptr};
   sirius::creator::task_creator* _task_creator{nullptr};
   completion_handler* _completion_handler{nullptr};
+  sirius::telemetry::telemetry_context* _telemetry_context{nullptr};
 };
 
 }  // namespace pipeline

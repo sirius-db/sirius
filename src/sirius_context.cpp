@@ -290,6 +290,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   if (is_initialized_) { throw std::runtime_error("Sirius context is already initialized."); }
 
   config_ = config;
+  telemetry_context_ =
+    std::make_unique<sirius::telemetry::telemetry_context>(config_.get_telemetry_config());
 
   // Validate the cached topology before any downstream construction so a stub
   // topology fails loudly rather than producing zero-GPU executors silently.
@@ -593,7 +595,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
                                                        config_.get_duckdb_scan_executor_config(),
                                                        *memory_manager_,
                                                        &config_.get_hw_topology(),
-                                                       &downgrade_executors_);
+                                                       &downgrade_executors_,
+                                                       telemetry_context_.get());
 
   task_creator_ = std::make_unique<sirius::creator::task_creator>(
     config_.get_task_creator_config(), *memory_manager_, &config_.get_hw_topology());
@@ -716,6 +719,7 @@ void SiriusContext::terminate()
     executor->stop();
   }
   downgrade_executors_.clear();
+  telemetry_context_.reset();
 
   // Teardown order is load-bearing: registry holds shared_ptrs to ioctxs, so
   // it must drop its refs first. Then gpu_ioctxs_ (the device-keyed view) is
@@ -911,14 +915,19 @@ const sirius::scan_manager::sirius_scan_manager& SiriusContext::get_scan_manager
   return *scan_manager_;
 }
 
+const sirius::telemetry::telemetry_context& SiriusContext::get_telemetry_context() const
+{
+  throw_if_not_initialized();
+  return *telemetry_context_;
+}
+
 void SiriusContext::create_query(
   duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
-  const quent::Context& context,
   sirius::telemetry::query_telemetry_info telemetry_info)
 {
   throw_if_not_initialized();
-  query_ =
-    duckdb::make_shared_ptr<sirius::planner::query>(std::move(pipelines), context, telemetry_info);
+  query_ = duckdb::make_shared_ptr<sirius::planner::query>(
+    std::move(pipelines), telemetry_context_->context(), telemetry_info);
   task_scheduler_->prepare_for_query(query_);
   task_creator_->prepare_for_query(*query_);
   // Pass per-GPU sirius_ioctx map to scan_manager so parquet_split_provider

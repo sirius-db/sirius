@@ -19,22 +19,29 @@
 #include "duckdb/common/common.hpp"
 #include "telemetry-bridge/gen/context.rs.h"
 #include "telemetry-bridge/gen/engine.rs.h"
+#include "telemetry-bridge/gen/executor_thread.rs.h"
 #include "telemetry-bridge/gen/uuid.rs.h"
 #include "telemetry-bridge/gen/worker.rs.h"
 
+#include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace sirius::pipeline {
 class sirius_pipeline;
 }  // namespace sirius::pipeline
 
+namespace sirius {
+struct telemetry_config;
+}  // namespace sirius
+
 namespace sirius::telemetry {
 
-/// Owns the top-level telemetry states for a single Sirius session (sirius_interface level).
+/// Owns the top-level telemetry states for a single SiriusContext.
 class telemetry_context {
  public:
-  telemetry_context(std::optional<std::string> query_label);
+  explicit telemetry_context(const sirius::telemetry_config& config);
   ~telemetry_context();
 
   // Non-copyable, non-movable (owns opaque Rust boxes)
@@ -46,7 +53,6 @@ class telemetry_context {
   [[nodiscard]] const uuid::UUID& engine_id() const { return engine_uuid_; }
   [[nodiscard]] const uuid::UUID& worker_id() const { return worker_uuid_; }
   [[nodiscard]] const quent::Context& context() const { return *context_; }
-  [[nodiscard]] const std::optional<std::string>& query_label() const { return query_label_; }
 
  private:
   uuid::UUID engine_uuid_;
@@ -54,7 +60,6 @@ class telemetry_context {
   rust::Box<quent::Context> context_;
   rust::Box<quent::engine::EngineObserver> engine_observer_;
   rust::Box<quent::worker::WorkerObserver> worker_observer_;
-  std::optional<std::string> query_label_;
 };
 
 // A POD to hold common identifiers for useful telemetry.
@@ -70,5 +75,30 @@ void emit_plan_telemetry(
   const duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& pipelines,
   uuid::UUID plan_id,
   query_telemetry_info telemetry_info);
+
+// header-only shared thread-local storage handle: one per thread, shared across translation units
+inline thread_local std::optional<rust::Box<quent::executor_thread::ExecutorThreadHandle>>
+  telemetry_thread_handle{std::nullopt};
+
+inline void init_executor_thread_for_current_thread(const telemetry_context& context,
+                                                    std::string_view instance_name)
+{
+  telemetry_thread_handle =
+    quent::executor_thread::create(context.context(),
+                                   {
+                                     .instance_name   = std::string(instance_name),
+                                     .parent_group_id = context.engine_id(),
+                                   });
+  (*telemetry_thread_handle)->operating();
+}
+
+using executor_thread_handle_ref =
+  std::reference_wrapper<quent::executor_thread::ExecutorThreadHandle>;
+
+inline std::optional<executor_thread_handle_ref> current_executor_thread_handle() noexcept
+{
+  if (not telemetry_thread_handle.has_value()) { return std::nullopt; }
+  return std::ref(**telemetry_thread_handle);
+}
 
 }  // namespace sirius::telemetry

@@ -29,6 +29,7 @@
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
+#include "telemetry/telemetry_context.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
 
@@ -37,9 +38,15 @@
 #include <cucascade/memory/common.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <cstdint>
+#include <exception>
 #include <limits>
+#include <memory>
 #include <mutex>
+#include <string>
+#include <utility>
 
 namespace sirius::op::scan {
 
@@ -69,10 +76,12 @@ bool is_cacheable_query_text(const std::string& query)
 duckdb_scan_executor::duckdb_scan_executor(
   exec::thread_pool_config config,
   cucascade::memory::memory_reservation_manager* mem_mgr,
-  exec::publisher<std::unique_ptr<sirius::pipeline::task_request>> task_request_publisher)
+  exec::publisher<std::unique_ptr<sirius::pipeline::task_request>> task_request_publisher,
+  sirius::telemetry::telemetry_context* telemetry_context)
   : sirius::parallel::itask_executor(config),
     _task_request_publisher(std::move(task_request_publisher)),
-    _mem_mgr(mem_mgr)
+    _mem_mgr(mem_mgr),
+    _telemetry_context(telemetry_context)
 {
   auto gpu_spaces = mem_mgr->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   for (auto* space : gpu_spaces) {
@@ -105,6 +114,30 @@ duckdb_scan_executor::~duckdb_scan_executor()
     _cache.clear();
   }
   stop();
+}
+
+absl::AnyInvocable<void() noexcept> duckdb_scan_executor::get_per_thread_init()
+{
+  if (!_telemetry_context) { return nullptr; }
+
+  auto* telemetry_context = _telemetry_context;
+  auto thread_name_prefix = _config.thread_name_prefix;
+  auto thread_id_counter  = std::make_shared<std::atomic<uint32_t>>(0);
+
+  return [telemetry_context,
+          thread_name_prefix = std::move(thread_name_prefix),
+          thread_id_counter]() mutable noexcept {
+    try {
+      const auto thread_id = thread_id_counter->fetch_add(1, std::memory_order_relaxed);
+      sirius::telemetry::init_executor_thread_for_current_thread(
+        *telemetry_context, thread_name_prefix + "_" + std::to_string(thread_id));
+    } catch (const std::exception& e) {
+      SIRIUS_LOG_ERROR("DuckDB scan executor thread telemetry init failed: {}", e.what());
+    } catch (...) {
+      SIRIUS_LOG_ERROR(
+        "DuckDB scan executor thread telemetry init failed with an unknown exception");
+    }
+  };
 }
 
 void duckdb_scan_executor::set_task_creator(sirius::creator::task_creator* task_creator)
