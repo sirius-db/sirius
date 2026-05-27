@@ -668,13 +668,13 @@ void parquet_split_provider::run_batch(file_batch const& batch,
       cur_rgs.push_back(rg_idx);
     }
     seal_current_file();
-    // Emit at least one split per file so source pipelines (GPU_PARQUET_SCAN
-    // -> ...) generate multiple gpu_pipeline_tasks when scanning multiple
-    // files. The task_scheduler's round-robin counter then distributes those
-    // tasks across GPUs. Without this flush, small workloads bundle all files
-    // under the _approximate_batch_size threshold into one split → one task →
-    // one GPU.
-    flush();
+    // Multi-GPU only: emit at least one split per file so source pipelines
+    // (GPU_PARQUET_SCAN -> ...) generate multiple gpu_pipeline_tasks when
+    // scanning multiple files. The task_scheduler's round-robin counter then
+    // distributes those tasks across GPUs. On a single-GPU system there is no
+    // GPU to balance across, so we keep the BASE byte-budget bundling (more
+    // tasks just add pipeline-start overhead without parallelism benefit).
+    if (_gpu_ioctxs.size() > 1) { flush(); }
   }
   flush();
 }

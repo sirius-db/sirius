@@ -671,11 +671,15 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     prefetch_buffer_pool_ = std::make_unique<sirius::io::buffer_pool>(*host_fsmr, max_slabs);
     // Initialize the cache on the REAL read-path backends: the per-NUMA urings
     // (gpu_ioctxs_ alias these, so covering numa_ioctxs_ covers every per-GPU
-    // local read path) and the s3_ioctx.
-    for (auto& kv : numa_ioctxs_) {
-      if (kv.second) {
-        kv.second->initialize_cache(*prefetch_buffer_pool_,
-                                    scan_cfg.prefetch_inflight_budget_chunks);
+    // local read path) and the s3_ioctx. Skip the per-NUMA urings when the
+    // sirius local read path is disabled — local reads will go through
+    // cudf::io::datasource::create and never touch this cache.
+    if (scan_cfg.use_sirius_datasource) {
+      for (auto& kv : numa_ioctxs_) {
+        if (kv.second) {
+          kv.second->initialize_cache(*prefetch_buffer_pool_,
+                                      scan_cfg.prefetch_inflight_budget_chunks);
+        }
       }
     }
     if (s3_ioctx_) {
@@ -686,8 +690,11 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // (lowest-GPU uring, matching datasource_registry's kFileScheme target) plus
   // the s3_ioctx when configured. The scan_manager dispatches over these but
   // does not own them — SiriusContext releases them in terminate().
+  // When use_sirius_datasource=false, omit the local uring so the scan_manager
+  // reports no backend for local paths and parquet_split_provider falls through
+  // to cudf::io::datasource::create. S3 still routes through its own backend.
   std::vector<std::shared_ptr<sirius::io::sirius_ioctx>> borrowed_io_ctxs;
-  if (!gpu_ioctxs_.empty()) {
+  if (scan_cfg.use_sirius_datasource && !gpu_ioctxs_.empty()) {
     auto const lowest =
       std::min_element(gpu_ioctxs_.begin(), gpu_ioctxs_.end(), [](auto const& a, auto const& b) {
         return a.first < b.first;
