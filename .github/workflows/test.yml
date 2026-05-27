@@ -55,7 +55,7 @@ jobs:
 
       - name: Build
         env:
-          CUDAARCHS: "75" # For Turing, T4 capability
+          CUDAARCHS: "89" # 75 for T4 capability; 89 for L4 capability
         run: make -j$(nproc)
 
       - name: Package build artifacts
@@ -99,7 +99,7 @@ jobs:
 
       - name: Build
         env:
-          CUDAARCHS: "75" # For Turing, T4 capability
+          CUDAARCHS: "89" # 75 for T4 capability; 89 for L4 capability
         run: make -j$(nproc)
 
       - name: Package build artifacts
@@ -114,7 +114,7 @@ jobs:
           retention-days: 1
 
   test-cuda-13:
-    runs-on: [self-hosted, ubuntu-24.04, cuda-13, gpu-2xt4]
+    runs-on: [self-hosted, ubuntu-24.04, cuda-13, gpu-2xl4]
     needs: build-cuda-13
     if: needs.build-cuda-13.result == 'success'
     timeout-minutes: 60
@@ -190,7 +190,7 @@ jobs:
           retention-days: 14
 
   test-cuda-12:
-    runs-on: [self-hosted, ubuntu-22.04, cuda-12, gpu-2xt4]
+    runs-on: [self-hosted, ubuntu-22.04, cuda-12, gpu-2xl4]
     needs: build-cuda-12
     if: needs.build-cuda-12.result == 'success'
     timeout-minutes: 60
