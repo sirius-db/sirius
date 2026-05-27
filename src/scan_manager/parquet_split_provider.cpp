@@ -290,8 +290,7 @@ void parquet_split_provider::run_batch(file_batch const& batch,
           auto probe_ds        = planning_ioctx_it->second->make_datasource(probe_io_object);
           std::shared_ptr<cudf::io::parquet::FileMetaData const> probe_meta;
           if (planning_ioctx_it->second->cache() != nullptr) {
-            if (auto cached =
-                  planning_ioctx_it->second->cache()->get_metadata(*probe_io_object)) {
+            if (auto cached = planning_ioctx_it->second->cache()->get_metadata(*probe_io_object)) {
               if (auto pm = std::dynamic_pointer_cast<parquet_metadata>(cached)) {
                 probe_meta = pm->file_metadata();
               }

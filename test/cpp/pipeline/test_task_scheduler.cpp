@@ -171,7 +171,7 @@ TEST_CASE("Task scheduler survives stop/start cycle", "[task_scheduler]")
   // Second cycle: the channel and task queue must be reopened.
   sched.start();
 
-  auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
+  auto global_state   = std::make_shared<mock_gpu_pipeline_task_global_state>();
   const int num_tasks = 5;
   for (int i = 0; i < num_tasks; ++i) {
     auto local_state = std::make_unique<mock_gpu_pipeline_task_local_state>(i, 0);

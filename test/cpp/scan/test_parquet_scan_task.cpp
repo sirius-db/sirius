@@ -986,7 +986,7 @@ TEST_CASE("parquet_split_provider - FLBA decimal skips filter pushdown",
   // fixed_point_scalar against FLBA stats. The split provider must detect
   // this via the schema probe and set disable_filter_pushdown on every
   // emitted parquet_scan_data. The filter still applies post-decode.
-  auto const dir       = std::filesystem::temp_directory_path() / "psp_flba_test";
+  auto const dir = std::filesystem::temp_directory_path() / "psp_flba_test";
   std::error_code ec;
   std::filesystem::remove_all(dir, ec);
   std::filesystem::create_directories(dir);
@@ -997,30 +997,28 @@ TEST_CASE("parquet_split_provider - FLBA decimal skips filter pushdown",
   constexpr size_t k_rows    = 10000;
   constexpr size_t k_rg_size = 5000;
   std::string const table    = "psp_flba_tmp";
-  auto result                = con.Query(
-    "CREATE TABLE " + table +
-    " AS SELECT (range)::INTEGER AS id, "
-    "CAST(range * 1.25 AS DECIMAL(25,2)) AS amount "
-    "FROM range(0, " +
-    std::to_string(k_rows) + ")");
+  auto result                = con.Query("CREATE TABLE " + table +
+                          " AS SELECT (range)::INTEGER AS id, "
+                                         "CAST(range * 1.25 AS DECIMAL(25,2)) AS amount "
+                                         "FROM range(0, " +
+                          std::to_string(k_rows) + ")");
   REQUIRE(result);
   REQUIRE(!result->HasError());
 
   auto const path = dir / "flba.parquet";
   result          = con.Query("COPY " + table + " TO '" + path.string() +
-                              "' (FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE " +
-                              std::to_string(k_rg_size) + ")");
+                     "' (FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE " +
+                     std::to_string(k_rg_size) + ")");
   REQUIRE(result);
   REQUIRE(!result->HasError());
   con.Query("DROP TABLE " + table);
 
   // Build a filter on the decimal column: amount < 6250.00
   auto table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
-  table_filters->PushFilter(
-    duckdb::ColumnIndex(1),
-    duckdb::make_uniq<duckdb::ConstantFilter>(
-      duckdb::ExpressionType::COMPARE_LESSTHAN,
-      duckdb::Value::DECIMAL(static_cast<int64_t>(625000), 25, 2)));
+  table_filters->PushFilter(duckdb::ColumnIndex(1),
+                            duckdb::make_uniq<duckdb::ConstantFilter>(
+                              duckdb::ExpressionType::COMPARE_LESSTHAN,
+                              duckdb::Value::DECIMAL(static_cast<int64_t>(625000), 25, 2)));
 
   duckdb::vector<sirius::logical_type> types = {
     sirius::logical_type::make(sirius::type_id::INTEGER),
@@ -1080,29 +1078,27 @@ TEST_CASE("parquet_split_provider - INT64 decimal allows filter pushdown",
   constexpr size_t k_rows    = 10000;
   constexpr size_t k_rg_size = 5000;
   std::string const table    = "psp_int64dec_tmp";
-  auto result                = con.Query(
-    "CREATE TABLE " + table +
-    " AS SELECT (range)::INTEGER AS id, "
-    "CAST(range * 1.25 AS DECIMAL(10,2)) AS amount "
-    "FROM range(0, " +
-    std::to_string(k_rows) + ")");
+  auto result                = con.Query("CREATE TABLE " + table +
+                          " AS SELECT (range)::INTEGER AS id, "
+                                         "CAST(range * 1.25 AS DECIMAL(10,2)) AS amount "
+                                         "FROM range(0, " +
+                          std::to_string(k_rows) + ")");
   REQUIRE(result);
   REQUIRE(!result->HasError());
 
   auto const path = dir / "int64dec.parquet";
   result          = con.Query("COPY " + table + " TO '" + path.string() +
-                              "' (FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE " +
-                              std::to_string(k_rg_size) + ")");
+                     "' (FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE " +
+                     std::to_string(k_rg_size) + ")");
   REQUIRE(result);
   REQUIRE(!result->HasError());
   con.Query("DROP TABLE " + table);
 
   auto table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
-  table_filters->PushFilter(
-    duckdb::ColumnIndex(1),
-    duckdb::make_uniq<duckdb::ConstantFilter>(
-      duckdb::ExpressionType::COMPARE_LESSTHAN,
-      duckdb::Value::DECIMAL(static_cast<int64_t>(625000), 10, 2)));
+  table_filters->PushFilter(duckdb::ColumnIndex(1),
+                            duckdb::make_uniq<duckdb::ConstantFilter>(
+                              duckdb::ExpressionType::COMPARE_LESSTHAN,
+                              duckdb::Value::DECIMAL(static_cast<int64_t>(625000), 10, 2)));
 
   duckdb::vector<sirius::logical_type> types = {
     sirius::logical_type::make(sirius::type_id::INTEGER),

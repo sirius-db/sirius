@@ -99,8 +99,8 @@ void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> task)
   } else {
     [[maybe_unused]] auto _ = _task_queue.push(std::move(task));
     if (_self_publisher) {
-      auto wake  = std::make_unique<task_request>();
-      wake->kind = task_request_kind::task_available;
+      auto wake                 = std::make_unique<task_request>();
+      wake->kind                = task_request_kind::task_available;
       [[maybe_unused]] auto _ok = _self_publisher->send(std::move(wake));
     }
   }
