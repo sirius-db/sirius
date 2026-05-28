@@ -5,7 +5,7 @@ as follows:
 
 - Bump submodules
   - `./duckdb` should be set to latest tagged release
-  - `./extension-ci-tools` should be set to updated branch corresponding to latest DuckDB release
-- Bump versions in `./github/workflows`
-  - `duckdb_version` input in `MainDistributionPipeline.yml` should be set to latest tagged release
-  - reusable workflow `_extension_distribution.yml` should be set to updated branch corresponding to latest DuckDB release
+  - Keep related submodules such as `./duckdb-python`, `./substrait`, and `./vcpkg` aligned when the release requires it
+- Bump versions in `.github/workflows`
+  - `duckdb_version` input in `distribution.yml` should be set to latest tagged release
+  - The reusable `sirius-db/extension-ci-tools` workflow ref and `ci_tools_version` input should be updated only when the remote CI tooling branch changes

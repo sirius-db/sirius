@@ -28,10 +28,10 @@ jobs:
         with:
           submodules: recursive
 
-      - uses: prefix-dev/setup-pixi@1b2de7f3351f171c8b4dfeb558c639cb58ed4ec0 # v0.9.5
+      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
         with:
           cache: false
-          pixi-version: v0.65.0
+          pixi-version: v0.69.0
           global-environments: |
             pre-commit
 
@@ -95,10 +95,10 @@ jobs:
         if: matrix.environment == 'vcpkg'
         run: git -C vcpkg rev-parse --is-shallow-repository | grep -q true && git -C vcpkg fetch --unshallow || true
 
-      - uses: prefix-dev/setup-pixi@1b2de7f3351f171c8b4dfeb558c639cb58ed4ec0 # v0.9.5
+      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
         with:
           cache: false
-          pixi-version: v0.65.0
+          pixi-version: v0.69.0
           activate-environment: ${{ matrix.environment != 'vcpkg' && matrix.cudf-channel != 'nightly' }}
           environments: >-
             ${{ matrix.cudf-channel == 'nightly' && 'nightly-runner'

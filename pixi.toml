@@ -2,7 +2,7 @@
 channels = ["rapidsai", "conda-forge" ]
 name = "sirius"
 platforms = ["linux-64", "linux-aarch64"]
-requires-pixi = ">=0.59"
+requires-pixi = ">=0.68"
 
 [activation]
 scripts = ["scripts/pixi_activate.sh"]
@@ -35,7 +35,7 @@ librmm = "*"
 libcurand-dev = "*"
 yaml-cpp = "*"
 libabseil = "*"
-duckdb = "=1.5.2"
+duckdb = "=1.5.3"
 spdlog = "1.8.*"
 sqlite = "3.*"
 rust-src = "*"
@@ -96,7 +96,7 @@ build-duckdb-python = "CMAKE_ARGS=\"-DDUCKDB_SOURCE_PATH=$PIXI_PROJECT_ROOT/duck
 
 # Lightweight env for running nightly cudf builds (no build deps needed)
 [feature.nightly-runner.dependencies]
-pixi = "*"
+pixi = "0.69.*"
 
 [feature.nightly-runner.tasks]
 nightly-shell = "scripts/generate_nightly_env.sh && env -u PIXI_ENVIRONMENT_NAME pixi shell --manifest-path envs/nightly/pixi.toml"

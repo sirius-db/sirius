@@ -410,8 +410,7 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
                    shared_data_repository* data_repo,
                    std::unique_ptr<duckdb_scan_task_local_state> l_state,
                    std::shared_ptr<duckdb_scan_task_global_state> g_state)
-    : sirius::pipeline::sirius_pipeline_itask(std::move(l_state), g_state),
-      _task_id(task_id),
+    : sirius::pipeline::sirius_pipeline_itask(task_id, std::move(l_state), g_state),
       _data_repo(data_repo)
   {
     g_state->_total_task_count.fetch_add(1);
@@ -509,7 +508,6 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
  private:
   //===----------Fields----------===//
   shared_data_repository* _data_repo;  ///< Data repository to which to push batches
-  uint64_t _task_id;                   ///< The unique id of this scan task
 };
 
 }  // namespace sirius::op::scan
