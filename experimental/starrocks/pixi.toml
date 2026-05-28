@@ -4,7 +4,41 @@ name = "sirius-starrocks"
 platforms = ["linux-64","linux-aarch64"]
 
 [environments]
+default = ["fe","be"]
+be = ["be"]
 fe = ["fe"]
+
+[tasks]
+cluster = {cmd = """
+bash -lc 'set -euo pipefail
+
+cleanup() {
+    status=$?
+    trap - EXIT INT TERM
+    kill "${fe_pid:-}" "${be_pid:-}" 2>/dev/null || true
+    wait "${fe_pid:-}" "${be_pid:-}" 2>/dev/null || true
+    exit "${status}"
+}
+trap cleanup EXIT INT TERM
+
+starrocks/output/fe/bin/start_fe.sh --logconsole &
+fe_pid="$!"
+
+target/release/sirius-starrocks-be &
+be_pid="$!"
+
+wait -n "${fe_pid}" "${be_pid}"
+'
+""",cwd = ".",depends-on = ["fe-build","be-build"],description = "Run the local StarRocks FE and Rust BE in the foreground with logs"}
+
+[feature.be.dependencies]
+rust = "*"
+thrift-compiler = "*"
+
+[feature.be.tasks]
+be-build = {cmd = "cargo build --release -p sirius-starrocks-be",description = "Build the Rust StarRocks BE release binary"}
+be-test = {cmd = "cargo test -p sirius-starrocks-be",description = "Run Rust StarRocks BE tests"}
+be-run = {cmd = "cargo run -p sirius-starrocks-be --",description = "Run the Rust StarRocks BE with local FE defaults"}
 
 [feature.fe.dependencies]
 bash = "*"
@@ -20,7 +54,7 @@ maven = ">=3.9"
 openjdk = "17.*"
 python = "3.11.*"
 sed = "*"
-thrift-compiler = "*"
+thrift-compiler = "0.20.*"
 util-linux = "*"
 which = "*"
 
@@ -51,9 +85,11 @@ sed -i "1s|^.*$|#!/usr/bin/env python3|" "$notice_script"
 thirdparty="${PIXI_PROJECT_ROOT}/.pixi/starrocks-fe-thirdparty"
 mkdir -p "${thirdparty}/installed/llvm/lib"
 touch "${thirdparty}/installed/llvm/lib/libLLVMInstCombine.a"
-STARROCKS_THIRDPARTY="${thirdparty}" ./build.sh --fe --with-maven-batch-mode ON'
+STARROCKS_THIRDPARTY="${thirdparty}" ./build.sh --fe --with-maven-batch-mode ON
+cp ../conf/fe.conf output/fe/conf/fe.conf'
 """,
 cwd = "starrocks",inputs = [
+    "conf/fe.conf",
     "starrocks/build.sh",
     "starrocks/env.sh",
     "starrocks/build-support/build_helpers.sh",
