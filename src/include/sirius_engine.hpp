@@ -121,6 +121,7 @@ class sirius_engine {
     iceberg_delete_data_cache_;
 
  private:
+  const telemetry::telemetry_context& telemetry_context_;
   uuid::UUID query_group_uuid_;
   rust::Box<quent::query_group::QueryGroupObserver> query_group_observer_;
   rust::Box<quent::query::QueryHandle> query_handle_;
