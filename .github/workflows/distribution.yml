@@ -11,6 +11,7 @@
 #   1. Pin it to a full-length commit SHA (e.g. uses: owner/repo@<40-char-sha> # vX.Y.Z)
 #   2. If it is not from sirius-db, GitHub, or the explicitly allowed third-party actions above, add it to the
 #      project-level allowlist above before merging
+
 name: Distribution
 
 on:
