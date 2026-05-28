@@ -74,6 +74,12 @@ sirius_gpu_parquet_scan_operator::~sirius_gpu_parquet_scan_operator() = default;
 // route each parquet open through ioctx->make_datasource(uring_io_object), which
 // avoids the cudf-bundled file_source factory that bypasses the ioctx framework
 // and routes through libkvikio (a source of cross-GPU context binding races).
+//
+// _gpu_ioctxs is empty in single-GPU mode with use_sirius_datasource=false; in
+// that case read_table_from_metadata falls back to cudf::io::datasource::create
+// (kvikio) since with only one GPU the per-FileHandle context binding is
+// harmless. Multi-GPU mode always populates this map — enforced by
+// sirius_config::enforce_sirius_datasource_for_multi_gpu().
 void sirius_gpu_parquet_scan_operator::set_gpu_ioctxs(
   std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> ioctxs)
 {
@@ -145,13 +151,16 @@ std::unique_ptr<cudf::table> sirius_gpu_parquet_scan_operator::read_table_from_m
   // by the chunk's memory_space->get_device_id(). The cudf-bundled
   // file_source factory bypasses the ioctx framework and routes through
   // libkvikio's per-FileHandle CUDA-context binding, breaking multi-GPU
-  // residency.
+  // residency. Multi-GPU configurations therefore always supply a populated
+  // _gpu_ioctxs map (enforced by
+  // sirius_config::enforce_sirius_datasource_for_multi_gpu(), which forces
+  // use_sirius_datasource=true whenever >1 GPU is configured).
   //
-  // When use_sirius_datasource=false, the scan_manager hands the operator an
-  // empty _gpu_ioctxs map and the provider emits slices with null io_ctx /
-  // io_object. In that case we deliberately use cudf::io::datasource::create
-  // for every slice (single-GPU mode by definition — kvikio binds one CUDA
-  // context per FileHandle).
+  // When use_sirius_datasource=false (single-GPU only), the scan_manager
+  // hands the operator an empty _gpu_ioctxs map and the provider emits
+  // slices with null io_ctx / io_object. In that case we use
+  // cudf::io::datasource::create for every slice — kvikio's per-FileHandle
+  // CUDA-context binding is harmless with only one GPU in play.
   bool const kvikio_fallback_mode = _gpu_ioctxs.empty();
   std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>>::const_iterator ioctx_it =
     _gpu_ioctxs.end();

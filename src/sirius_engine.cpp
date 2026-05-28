@@ -354,7 +354,8 @@ void sirius_engine::prefetch_iceberg_delete_data(op::sirius_physical_operator& p
   if (gpu_ioctxs.empty()) {
     throw std::runtime_error(
       "[sirius_engine] read_iceberg_delete_data: SiriusContext has no GPU sirius_ioctxs "
-      "(kvikio path is forbidden).");
+      "(read_iceberg_delete_data routes through sirius_datasource and does not implement "
+      "a kvikio fallback).");
   }
   // Pick the lowest-numbered GPU id (deterministic ordering — get_gpu_ioctxs
   // returns an unordered_map, so use std::min_element rather than .begin()).
