@@ -18,7 +18,6 @@
 
 #include "duckdb/main/client_context.hpp"
 #include "sirius_engine.hpp"
-#include "telemetry/telemetry_context.hpp"
 
 #include <optional>
 
@@ -68,8 +67,6 @@ class sirius_interface {
                    std::optional<std::string> query_label = std::nullopt);
   //! The client context
   duckdb::ClientContext& client_context;
-  //! The telemetry context
-  const telemetry::telemetry_context& telemetry;
   //! Optional label for this query's telemetry instance name
   std::optional<std::string> query_label;
   //! The currently active query context

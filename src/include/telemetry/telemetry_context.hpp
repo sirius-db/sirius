@@ -24,7 +24,6 @@
 #include "telemetry-bridge/gen/uuid.rs.h"
 #include "telemetry-bridge/gen/worker.rs.h"
 
-#include <optional>
 #include <string>
 
 namespace sirius::pipeline {

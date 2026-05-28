@@ -27,7 +27,6 @@
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "sirius_context.hpp"
-#include "telemetry/telemetry_context.hpp"
 
 #include <optional>
 
@@ -59,9 +58,7 @@ void bind_prepared_statement_parameters(duckdb::PreparedStatementData& statement
 
 sirius_interface::sirius_interface(duckdb::ClientContext& client_context,
                                    std::optional<std::string> query_label)
-  : client_context(client_context),
-    telemetry(get_telemetry_context(this->client_context)),
-    query_label(std::move(query_label)) {};
+  : client_context(client_context), query_label(std::move(query_label)) {};
 
 void sirius_interface::sirius_process_error(duckdb::ErrorData& error,
                                             const duckdb::string& query) const
@@ -237,18 +234,27 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::sirius_execute_query(
   duckdb::shared_ptr<sirius_prepared_statement_data>& statement_p,
   const duckdb::PendingQueryParameters& parameters)
 {
-  auto pending_query =
-    sirius_pending_statement_or_prepared_statement(context, query, statement_p, parameters);
-  D_ASSERT(sirius_active_query->is_open_result(*pending_query));
-  duckdb::unique_ptr<duckdb::QueryResult> current_result;
-  if (pending_query->HasError()) {
-    current_result =
-      sirius_error_result<duckdb::MaterializedQueryResult>(pending_query->GetErrorObject());
-  } else {
-    current_result = sirius_execute_pending_query_result(*pending_query);
+  try {
+    auto pending_query =
+      sirius_pending_statement_or_prepared_statement(context, query, statement_p, parameters);
+
+    if (pending_query->HasError()) {
+      if (sirius_active_query) { cleanup_internal(nullptr, false); }
+      return sirius_error_result<duckdb::MaterializedQueryResult>(pending_query->GetErrorObject());
+    }
+
+    D_ASSERT(sirius_active_query);
+    D_ASSERT(sirius_active_query->is_open_result(*pending_query));
+    duckdb::unique_ptr<duckdb::QueryResult> current_result;
+
+    auto result = sirius_execute_pending_query_result(*pending_query);
+    SIRIUS_LOG_DEBUG("Done sirius_execute_query");
+
+    return result;
+  } catch (std::exception& e) {
+    if (sirius_active_query) { cleanup_internal(nullptr, false); }
+    return sirius_error_result<duckdb::MaterializedQueryResult>(duckdb::ErrorData(e));
   }
-  SIRIUS_LOG_DEBUG("Done sirius_execute_query");
-  return current_result;
 };
 
 sirius::sirius_engine& sirius_interface::get_sirius_engine()

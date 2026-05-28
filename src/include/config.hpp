@@ -78,7 +78,6 @@ struct Config {
   static std::string LOG_LEVEL;
   static std::string LOG_DIR;
   static int LOG_FLUSH_SECONDS;
-
 };
 
 }  // namespace duckdb

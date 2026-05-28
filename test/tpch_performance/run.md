@@ -101,8 +101,17 @@ The Sirius config file (e.g. `~/.sirius/sirius.yaml`) controls:
 - **Telemetry**: `telemetry.enable_quent`, `telemetry.output_directory`, `telemetry.engine_name`
 
 `run_tpch_parquet_and_generate_telemetry.sh` uses
-`test/tpch_performance/tpch_telemetry_sirius.yaml`, which contains only the
-`telemetry` section. Omitted Sirius sections use the built-in defaults.
+`test/tpch_performance/tpch_telemetry_sirius.yaml` by default. Pass
+`--config <path>` to use a full custom Sirius config for telemetry runs:
+
+```bash
+./test/tpch_performance/run_tpch_parquet_and_generate_telemetry.sh \
+  --config ~/.sirius/sirius.yaml \
+  100 1 6 9
+```
+
+Custom configs are used as-is and must enable telemetry, for example
+`sirius.telemetry.enable_quent: true`.
 
 ### Example config (GB300, SF1000)
 
