@@ -50,7 +50,7 @@ libcurl = "*"
 cuda = "13"
 
 [feature.cuda13.dependencies]
-cuda-version = "13.*"
+cuda-version = "13.2.*"
 libcudf = "26.04.*"
 
 [feature.cuda13.activation.env]
