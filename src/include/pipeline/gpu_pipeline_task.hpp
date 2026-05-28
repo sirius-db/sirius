@@ -170,13 +170,6 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
   }
 
   /**
-   * @brief Get the unique identifier for this task
-   *
-   * @return uint64_t The task ID
-   */
-  uint64_t get_task_id() const;
-
-  /**
    * @brief Get the GPU pipeline associated with this task
    *
    * @return const duckdb::sirius_pipeline* Pointer to the GPU pipeline
@@ -250,7 +243,6 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
     uint64_t task_id, std::unique_ptr<sirius_pipeline_task_local_state> local_state);
 
  private:
-  uint64_t _task_id;
   std::vector<cucascade::shared_data_repository*> _data_repos;
   cucascade::memory::reservation_aware_resource_adaptor* _allocator = nullptr;
   /// Input data_batches held for subscribe/unsubscribe lifecycle

@@ -40,9 +40,10 @@ struct dummy_task_local_state : public itask_local_state {
 
 class dummy_task : public itask {
  public:
-  dummy_task(std::unique_ptr<dummy_task_local_state> local_state,
+  dummy_task(uint64_t task_id,
+             std::unique_ptr<dummy_task_local_state> local_state,
              std::shared_ptr<dummy_task_global_state> global_state)
-    : itask(std::move(local_state), std::move(global_state))
+    : itask(task_id, std::move(local_state), std::move(global_state))
   {
   }
 
@@ -103,7 +104,8 @@ TEST_CASE("Executor executes scheduled tasks", "[task_executor]")
   // Schedule some tasks
   int num_tasks = 20;
   for (int i = 0; i < num_tasks; ++i) {
-    executor.schedule(std::make_unique<dummy_task>(std::make_unique<dummy_task_local_state>(i), g));
+    executor.schedule(
+      std::make_unique<dummy_task>(i, std::make_unique<dummy_task_local_state>(i), g));
   }
 
   // Wait for tasks to complete by polling the counter

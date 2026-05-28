@@ -26,6 +26,7 @@
 
 #include <cucascade/data/data_batch.hpp>
 
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -105,12 +106,14 @@ class sirius_pipeline_itask : public parallel::itask {
   /**
    * @brief Protected constructor for derived classes.
    *
+   * @param task_id The unique identifier for this task
    * @param local_state The local state specific to this task
    * @param global_state The global state shared across multiple tasks
    */
-  sirius_pipeline_itask(std::unique_ptr<sirius_pipeline_task_local_state> local_state,
+  sirius_pipeline_itask(uint64_t task_id,
+                        std::unique_ptr<sirius_pipeline_task_local_state> local_state,
                         std::shared_ptr<sirius_pipeline_task_global_state> global_state)
-    : itask(std::move(local_state), std::move(global_state))
+    : itask(task_id, std::move(local_state), std::move(global_state))
   {
   }
 };

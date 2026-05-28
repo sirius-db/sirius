@@ -66,7 +66,7 @@ test_env& env()
 class dummy_task_local_state : public sirius::parallel::itask_local_state {};
 class dummy_task : public sirius::parallel::itask {
  public:
-  dummy_task() : itask(std::make_unique<dummy_task_local_state>(), nullptr) {}
+  dummy_task() : itask(0, std::make_unique<dummy_task_local_state>(), nullptr) {}
   void execute(rmm::cuda_stream_view /*stream*/) override {}
 };
 

@@ -65,9 +65,10 @@ class mock_gpu_pipeline_task_local_state : public gpu_pipeline_task_local_state 
 
 class mock_gpu_pipeline_task : public gpu_pipeline_task {
  public:
-  mock_gpu_pipeline_task(std::unique_ptr<mock_gpu_pipeline_task_local_state> local_state,
+  mock_gpu_pipeline_task(uint64_t task_id,
+                         std::unique_ptr<mock_gpu_pipeline_task_local_state> local_state,
                          std::shared_ptr<mock_gpu_pipeline_task_global_state> global_state)
-    : gpu_pipeline_task(0,
+    : gpu_pipeline_task(task_id,
                         std::vector<cucascade::shared_data_repository*>{},
                         std::move(local_state),
                         std::move(global_state))
@@ -119,7 +120,7 @@ TEST_CASE("Task scheduler executes tasks through pipeline_queue", "[task_schedul
   const int num_tasks = 10;
   for (int i = 0; i < num_tasks; ++i) {
     auto local_state = std::make_unique<mock_gpu_pipeline_task_local_state>(i, 0);
-    auto task = std::make_unique<mock_gpu_pipeline_task>(std::move(local_state), global_state);
+    auto task = std::make_unique<mock_gpu_pipeline_task>(i, std::move(local_state), global_state);
     executor.schedule(std::move(task));
   }
 
