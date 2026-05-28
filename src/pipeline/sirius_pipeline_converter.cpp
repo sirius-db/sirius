@@ -139,6 +139,12 @@ pipeline_conversion_result sirius_pipeline_converter::convert(sirius_meta_pipeli
     // virtuals already place every operator. There is nothing to split or insert at
     // convert time.
     split_pipelines(copied_scheduled);
+  } else {
+    // Under flag ON, split_pipelines never runs to populate scheduled_, so the post-build
+    // pipelines need to be transferred directly. compute_repository_wiring_tree_based and
+    // the dump helper both read scheduled_ — without this transfer the conversion result
+    // is empty even though build_pipelines produced a full pipeline tree.
+    scheduled_ = std::move(copied_scheduled);
   }
   compute_repository_wiring();
   setup_pipeline_parents();
@@ -1179,24 +1185,31 @@ op::MemoryBarrierType sirius_pipeline_converter::resolve_barrier(
   // Intermediate sink feeding a probe-side PARTITION: the probe pipeline can
   // stream batches, so the upstream→PARTITION_probe edge uses PARTIAL. Build-
   // side PARTITION stays FULL — build must accumulate all partitions before
-  // the probe can join them. Exception (#1088): a RIGHT-family join must size
-  // from the complete probe input because CONCAT retains the whole probe
-  // partition, so its probe PARTITION also keeps FULL. RIGHT_DELIM_JOIN's
-  // internal join is exempt from that exception — it bootstraps its probe
-  // subtree from build-side distinct data. Under the legacy path this same
-  // distinction is enforced as a post-hoc mutation in
-  // link_join_partition_siblings; consolidating it here keeps all barrier
-  // decisions in resolve_barrier.
+  // the probe can join them. Aggregate-fanout PARTITIONs (between an HGB and
+  // its MERGE_GROUP_BY, or between a DISTINCT and its MERGE_DISTINCT) also
+  // stay FULL: the merge operator needs every per-thread bucket before it can
+  // emit output. We distinguish join-feeders from aggregate-fanouts by tree-
+  // parent type — join-feeder PARTITIONs always sit under a CONCAT (the
+  // CONCAT/PARTITION wrap chain emitted by wrap_join_child); aggregate-fanout
+  // PARTITIONs sit under MERGE_GROUP_BY / GROUPED_AGGREGATE_MERGE. Exception
+  // (#1088): a RIGHT-family join must size from the complete probe input
+  // because CONCAT retains the whole probe partition, so its probe PARTITION
+  // also keeps FULL; RIGHT_DELIM_JOIN's internal join is exempt — it
+  // bootstraps its probe subtree from build-side distinct data. Under the
+  // legacy path these same distinctions are enforced via
+  // `link_join_partition_siblings`, which only patches barriers on joins'
+  // probe partitions.
   if (dest.get_sink() && dest.get_sink()->type == T::PARTITION) {
-    auto& partition = dest.get_sink()->Cast<op::sirius_physical_partition>();
+    auto& partition        = dest.get_sink()->Cast<op::sirius_physical_partition>();
+    auto* partition_parent = partition.get_parent_op();
+    const bool join_feeder = partition_parent != nullptr && partition_parent->type == T::CONCAT;
     // Tree-parent walk: PARTITION -> CONCAT -> owning join (stamped at plan-gen).
-    auto* concat = partition.get_parent_op();
-    auto* join   = concat ? concat->get_parent_op() : nullptr;
+    auto* join = join_feeder ? partition_parent->get_parent_op() : nullptr;
     const bool right_family_full =
       join && join->type == T::HASH_JOIN &&
       join->Cast<op::sirius_physical_hash_join>().is_right_family() &&
       !(join->get_parent_op() && join->get_parent_op()->type == T::RIGHT_DELIM_JOIN);
-    if (!partition.is_build_partition() && !right_family_full) {
+    if (!partition.is_build_partition() && join_feeder && !right_family_full) {
       return op::MemoryBarrierType::PARTIAL;
     }
   }
