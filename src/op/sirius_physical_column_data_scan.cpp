@@ -72,13 +72,18 @@ void sirius_physical_column_data_scan::build_pipelines(
       auto& delim_join = delim_sink->Cast<sirius_physical_delim_join>();
       current.add_dependency(delim_dependency);
       if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
-        // Phase 3.2 (#604): source is derived from operators[0] post-reverse,
-        // so append delim_join.distinct to operators[] rather than only
-        // setting the source field. compute_repository_wiring (Sub-phase D)
-        // resolves the data feeder via the tree-parent / delim_join_dependencies
-        // map instead of the source pointer.
-        state.add_pipeline_operator(current, delim_join.distinct->Cast<sirius_physical_operator>());
+        // Phase 3.2 (#604): source is derived from operators[0] post-reverse, so
+        // append the chain top to operators[] rather than only setting source.
+        // distinct_root holds MERGE_DISTINCT after wrap_delim_distinct under flag ON
+        // — feeding the delim_scan from the merged output, not the per-thread
+        // DISTINCT collections. compute_repository_wiring_tree_based resolves the
+        // upstream wiring via the tree-parent walk through the chain.
+        D_ASSERT(delim_join.distinct_root);
+        state.add_pipeline_operator(current, *delim_join.distinct_root);
       } else {
+        // Flag OFF: legacy converter externalizes the chain and retargets downstream
+        // sources from the bare DISTINCT to merge_distinct. Set the source to the
+        // bare DISTINCT here and let the converter retarget it.
         state.set_pipeline_source(current, delim_join.distinct->Cast<sirius_physical_operator>());
       }
       return;

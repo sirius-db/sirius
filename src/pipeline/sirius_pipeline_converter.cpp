@@ -496,7 +496,7 @@ void sirius_pipeline_converter::split_intermediate_joins(
       auto partition_op = make_uniq<op::sirius_physical_partition>(
         current_pipeline->get_source()->types,
         current_pipeline->get_source()->estimated_cardinality,
-        concat_op.get(),
+        &current_pipeline->operators[join_pos].get(),
         false,
         op_params_.hash_partition_bytes);
       inserted_operators_.push_back(std::move(partition_op));
@@ -510,7 +510,7 @@ void sirius_pipeline_converter::split_intermediate_joins(
       auto partition_op = make_uniq<op::sirius_physical_partition>(
         current_pipeline->operators[join_pos - 1].get().types,
         current_pipeline->operators[join_pos - 1].get().estimated_cardinality,
-        concat_op.get(),
+        &current_pipeline->operators[join_pos].get(),
         false,
         op_params_.hash_partition_bytes);
       inserted_operators_.push_back(std::move(partition_op));
@@ -599,7 +599,7 @@ void sirius_pipeline_converter::split_join_sink(
     partition_op = make_uniq<op::sirius_physical_partition>(
       current_pipeline->get_source()->types,
       current_pipeline->get_source()->estimated_cardinality,
-      concat_op.get(),
+      hash_join_op.get(),
       true,
       op_params_.hash_partition_bytes);
   } else {
@@ -616,7 +616,7 @@ void sirius_pipeline_converter::split_join_sink(
       current_pipeline->operators[current_pipeline->operators.size() - 1]
         .get()
         .estimated_cardinality,
-      concat_op.get(),
+      hash_join_op.get(),
       true,
       op_params_.hash_partition_bytes);
   }
@@ -854,7 +854,7 @@ void sirius_pipeline_converter::split_delim_join_sink(
 {
   auto delim_join   = current_pipeline->get_sink();
   auto& join_op     = delim_join->Cast<op::sirius_physical_delim_join>().join;
-  auto& distinct_op = delim_join->Cast<op::sirius_physical_delim_join>().distinct;
+  auto* distinct_op = delim_join->Cast<op::sirius_physical_delim_join>().distinct;
 
   duckdb::unique_ptr<op::sirius_physical_partition> partition_join;
   if (delim_join->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
@@ -886,7 +886,7 @@ void sirius_pipeline_converter::split_delim_join_sink(
   auto partition_distinct =
     make_uniq<op::sirius_physical_partition>(distinct_op->types,
                                              distinct_op->estimated_cardinality,
-                                             distinct_op.get(),
+                                             distinct_op,
                                              false,
                                              op_params_.hash_partition_bytes);
   auto* partition_distinct_ptr =
@@ -935,7 +935,7 @@ void sirius_pipeline_converter::split_delim_join_sink(
 
   // PARTITION_DISTINCT pipeline (single-op): reads distinct output, partitions it
   auto partition_distinct_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(build_ctx_);
-  partition_distinct_pipeline->source = distinct_op.get();
+  partition_distinct_pipeline->source = distinct_op;
   partition_distinct_pipeline->sink   = partition_distinct_ptr;
   scheduled_.push_back(partition_distinct_pipeline);
 
@@ -947,7 +947,7 @@ void sirius_pipeline_converter::split_delim_join_sink(
 
   // Update downstream pipelines to use MERGE_DISTINCT as source
   for (size_t j = pipeline_idx + 1; j < copied_scheduled.size(); j++) {
-    if (copied_scheduled[j]->source.get() == distinct_op.get()) {
+    if (copied_scheduled[j]->source.get() == distinct_op) {
       copied_scheduled[j]->source = merge_distinct_op.get();
     }
   }
@@ -1042,7 +1042,7 @@ void sirius_pipeline_converter::compute_repository_wiring()
     } else if (pipeline->sink->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
       auto& right_delim    = pipeline->get_sink()->Cast<op::sirius_physical_right_delim_join>();
       auto* partition_join = right_delim.partition_join;
-      auto* distinct_op    = right_delim.distinct.get();
+      auto* distinct_op    = right_delim.distinct;
 
       // Wire partition_join -> CONCAT (partition_join pushes via its own
       // sink/next_port_after_sink)
@@ -1057,7 +1057,7 @@ void sirius_pipeline_converter::compute_repository_wiring()
       }
     } else if (pipeline->sink->type == op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
       auto& left_delim      = pipeline->get_sink()->Cast<op::sirius_physical_left_delim_join>();
-      auto* distinct_op     = left_delim.distinct.get();
+      auto* distinct_op     = left_delim.distinct;
       auto column_data_scan = left_delim.column_data_scan;
 
       // Wire column_data_scan -> downstream (column_data_scan pushes via its own sink)
@@ -1077,8 +1077,8 @@ void sirius_pipeline_converter::compute_repository_wiring()
       if (concat.is_build_concat()) {
         // For build concats, no pipeline uses the concat as source. Resolve the
         // destination pipeline by finding the one whose first operator (or sink) is the
-        // HASH_JOIN stored in parent_op.
-        op::sirius_physical_operator* hash_join_op = concat.get_parent_op();
+        // HASH_JOIN that this CONCAT feeds into.
+        op::sirius_physical_operator* hash_join_op = concat.get_downstream_join();
         duckdb::shared_ptr<sirius_pipeline> dest_pipeline;
         for (const auto& candidate : scheduled_) {
           if ((candidate->operators.size() > 0 && &candidate->operators[0].get() == hash_join_op) ||
@@ -1254,7 +1254,7 @@ void sirius_pipeline_converter::compute_repository_wiring_tree_based()
     if (sink_op->type == T::RIGHT_DELIM_JOIN) {
       auto& right_delim    = sink_op->Cast<op::sirius_physical_right_delim_join>();
       auto* partition_join = right_delim.partition_join;
-      auto* distinct_op    = right_delim.distinct.get();
+      auto* distinct_op    = right_delim.distinct;
       if (partition_join) {
         auto it = dest_for_op.find(partition_join);
         if (it != dest_for_op.end()) {
@@ -1273,7 +1273,7 @@ void sirius_pipeline_converter::compute_repository_wiring_tree_based()
     // LEFT_DELIM_JOIN: emit column_data_scan + distinct sibling references.
     if (sink_op->type == T::LEFT_DELIM_JOIN) {
       auto& left_delim       = sink_op->Cast<op::sirius_physical_left_delim_join>();
-      auto* distinct_op      = left_delim.distinct.get();
+      auto* distinct_op      = left_delim.distinct;
       auto* column_data_scan = left_delim.column_data_scan;
       if (column_data_scan) {
         auto it = dest_for_op.find(column_data_scan);

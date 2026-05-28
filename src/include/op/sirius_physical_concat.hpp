@@ -32,10 +32,16 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::CONCAT;
 
+  //! `downstream_join` names the HASH_JOIN or NESTED_LOOP_JOIN this CONCAT feeds into. Its
+  //! join type determines `_concat_all` at construction. The pointer is also retained in
+  //! `_downstream_join` so the legacy converter's `compute_repository_wiring` can locate the
+  //! destination pipeline post-construction. It is *not* the tree parent of this operator —
+  //! the inherited `_parent_op` field is stamped by
+  //! `sirius_physical_plan_generator::set_parent_ops` under flag ON.
   explicit sirius_physical_concat(
     duckdb::vector<sirius::logical_type> types,
     std::size_t estimated_cardinality,
-    sirius_physical_operator* parent_op,
+    sirius_physical_operator* downstream_join,
     bool is_build,
     uint64_t concat_batch_bytes = sirius::config::DEFAULT_CONCAT_BATCH_BYTES);
 
@@ -46,6 +52,14 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
   bool is_sink() const override;
 
   bool is_build_concat() const;
+
+  //! The downstream HJ/NLJ this CONCAT feeds. Used by the legacy converter's
+  //! compute_repository_wiring to find the destination pipeline for a build CONCAT.
+  //! Distinct from `get_parent_op()` (the tree-parent role).
+  [[nodiscard]] sirius_physical_operator* get_downstream_join() const noexcept
+  {
+    return _downstream_join;
+  }
 
   std::optional<task_creation_hint> get_next_task_hint() override;
 
@@ -67,6 +81,8 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
   bool _is_build;
   bool _concat_all;
   uint64_t _concat_batch_bytes;
+  //! Non-owning. Captured at construction from the `downstream_join` ctor argument.
+  sirius_physical_operator* _downstream_join = nullptr;
 };
 
 }  // namespace op

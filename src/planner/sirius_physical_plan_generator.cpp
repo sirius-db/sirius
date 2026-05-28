@@ -16,9 +16,9 @@
 
 #include "planner/sirius_physical_plan_generator.hpp"
 
-#include "duckdb/common/type_visitor.hpp"
 #include "config.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -29,12 +29,10 @@
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "log/logging.hpp"
-#include "op/sirius_dynamic_filter.hpp"
-#include "planner/sirius_plan_projection_utils.hpp"
-#include "sirius_context.hpp"
 #include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/scan/parquet_scan_info.hpp"
 #include "op/scan/sirius_gpu_parquet_scan_operator.hpp"
+#include "op/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cpu_source.hpp"
@@ -54,6 +52,7 @@
 #include "op/sirius_physical_top_n_merge.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
+#include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 
@@ -224,7 +223,7 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
     auto partition =
       duckdb::make_uniq<sirius::op::sirius_physical_partition>(hgb_ptr->types,
                                                                hgb_ptr->estimated_cardinality,
-                                                               /*parent_op=*/hgb_ptr,
+                                                               /*key_source=*/hgb_ptr,
                                                                /*is_build=*/false,
                                                                op_params.hash_partition_bytes);
     partition->children.push_back(std::move(hgb_op));
@@ -328,31 +327,39 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
   });
 }
 
-//! Wrap a single child of a HASH_JOIN or NESTED_LOOP_JOIN at `parent.children[child_idx]`
+//! Wrap a single child of a HASH_JOIN or NESTED_LOOP_JOIN at `join_op.children[child_idx]`
 //! with `CONCAT → PARTITION → original_child`. `is_build` flips the build/probe semantics
-//! threaded through both wrappers (and into PARTITION's hash key derivation via the
-//! parent_op cascade). Mirrors the per-side construction in `split_intermediate_joins`
-//! (probe) and `split_join_sink` (build) at converter:361-371 and 463-491.
-void wrap_join_child(sirius::op::sirius_physical_operator& parent,
+//! threaded through both wrappers. `join_op` is passed verbatim as PARTITION's `key_source`
+//! (HJ conditions or NLJ shape determine partition keys) and as CONCAT's `downstream_join`
+//! (the HJ/NLJ's join type determines CONCAT's batch-coalescing mode). Mirrors the per-side
+//! construction in `split_intermediate_joins` (probe) and `split_join_sink` (build) at
+//! converter:361-371 and 463-491.
+void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
                      std::size_t child_idx,
                      bool is_build,
                      const sirius::operator_params& op_params)
 {
-  auto* parent_ptr = &parent;
+  D_ASSERT(join_op.type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN ||
+           join_op.type == sirius::op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN);
+  auto* join_op_ptr = &join_op;
   wrap_child(
-    parent, child_idx, [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> child_orig) {
+    join_op, child_idx, [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> child_orig) {
       // Capture types and cardinality from the original child BEFORE moving it: PARTITION
       // and CONCAT need them to construct, and after the move into PARTITION the original's
       // members are no longer addressable.
       auto child_types = child_orig->types;
       auto est_card    = child_orig->estimated_cardinality;
 
-      auto concat = duckdb::make_uniq<sirius::op::sirius_physical_concat>(
-        child_types, est_card, parent_ptr, is_build, op_params.concat_batch_bytes);
+      auto concat =
+        duckdb::make_uniq<sirius::op::sirius_physical_concat>(child_types,
+                                                              est_card,
+                                                              /*downstream_join=*/join_op_ptr,
+                                                              is_build,
+                                                              op_params.concat_batch_bytes);
       auto partition =
         duckdb::make_uniq<sirius::op::sirius_physical_partition>(std::move(child_types),
                                                                  est_card,
-                                                                 /*parent_op=*/concat.get(),
+                                                                 /*key_source=*/join_op_ptr,
                                                                  is_build,
                                                                  op_params.hash_partition_bytes);
       partition->children.push_back(std::move(child_orig));
@@ -387,27 +394,57 @@ void insert_gpu_pipeline_operators_recursive(
     iceberg_cache,
   const sirius::operator_params& op_params);
 
+//! Replace a DELIM JOIN's `distinct_root` (initially the bare DISTINCT) with the chain
+//! `DISTINCT_MERGE -> PARTITION_DISTINCT -> original DISTINCT`. Mirrors `wrap_hash_group_by`
+//! structurally, applied to the `distinct_root` slot rather than a `children[]` entry. The
+//! original DISTINCT aggregate stays reachable via the non-owning `delim_base.distinct`
+//! borrow — the inline per-batch sink path on left/right_delim_join uses that borrow, and
+//! the underlying object never relocates (move-of-unique_ptr only transfers ownership).
+void wrap_delim_distinct(sirius::op::sirius_physical_delim_join& delim_base,
+                         const sirius::operator_params& op_params)
+{
+  if (!delim_base.distinct_root) { return; }
+
+  // distinct_root currently holds the bare original DISTINCT aggregate.
+  auto original          = std::move(delim_base.distinct_root);
+  auto* original_agg_ptr = &original->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+
+  auto partition =
+    duckdb::make_uniq<sirius::op::sirius_physical_partition>(original->types,
+                                                             original->estimated_cardinality,
+                                                             /*key_source=*/original.get(),
+                                                             /*is_build=*/false,
+                                                             op_params.hash_partition_bytes);
+  partition->children.push_back(std::move(original));
+
+  auto merge =
+    duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate_merge>(original_agg_ptr);
+  merge->children.push_back(std::move(partition));
+
+  delim_base.distinct_root = std::move(merge);
+  // delim_base.distinct stays valid: the original DISTINCT object never relocates, only its
+  // owning slot moves from delim_base.distinct_root down through the chain.
+}
+
 //! Rewrite the internal subtrees of a DELIM JOIN (LEFT or RIGHT) and wire the sibling
 //! pointers that the operator needs at runtime. Mirrors `split_delim_join_sink`'s
-//! sibling-pointer assignments (converter:750-755) without recreating the
-//! DISTINCT_MERGE/PARTITION_DISTINCT chain — that lives in Sub-phase C's `build_pipelines`
-//! redesign of DELIM JOIN, since today's converter creates those operators outside the tree
-//! and there is no field on `sirius_physical_delim_join` to host the chain yet.
+//! sibling-pointer assignments (converter:750-755) AND the DISTINCT_MERGE/PARTITION_DISTINCT
+//! chain that the legacy converter creates outside the tree (converter:769-841). Both halves
+//! live in the tree under USE_TREE_BASED_PIPELINE_BUILD.
 //!
-//! What this does in B.5:
+//! What this does:
 //!   - Recursively walks `delim->join` so source-side wraps (TABLE_SCAN/CPU_SOURCE family)
 //!     and sink-side wraps (HASH_GROUP_BY/ORDER_BY/TOP_N/UNGROUPED) inside the internal
 //!     join's subtree fire, and so the internal join (if HJ/NLJ) gets the same
 //!     CONCAT/PARTITION wraps on its probe + build that Sub-phase B.4 applies to top-level
 //!     joins. This is what plants the `partition_join` candidate node.
-//!   - Recursively walks `delim->distinct` so source-side wraps below DISTINCT fire.
-//!     `wrap_hash_group_by` will NOT fire on DISTINCT itself — DISTINCT is reached via the
-//!     `distinct` field, not via the dispatcher's `children[]` traversal. Wrapping DISTINCT
-//!     with MERGE_AGG/PARTITION the way HASH_GROUP_BY is wrapped would change the type of
-//!     `delim_join->distinct` from `unique_ptr<sirius_physical_grouped_aggregate>` to
-//!     `unique_ptr<sirius_physical_operator>`, a deferred design decision documented above.
+//!   - Recursively walks the children of the original DISTINCT (via `distinct_root->children`,
+//!     because at this point `distinct_root` still holds the bare DISTINCT) so source-side
+//!     wraps below it fire. Then calls `wrap_delim_distinct` to wrap DISTINCT_MERGE +
+//!     PARTITION_DISTINCT above it. Post-order: source-side wraps first, then the chain
+//!     wrap, so the chain wrap doesn't re-visit the freshly-inserted wrappers.
 //!   - For RIGHT_DELIM_JOIN: after the internal-join recursion has wrapped the build side
-//!     with `CONCAT_build → PARTITION_build → original_build`, captures the new
+//!     with `CONCAT_build -> PARTITION_build -> original_build`, captures the new
 //!     PARTITION_build via `internal_join->children[1]->children[0]` and assigns it to
 //!     `right_delim_join.partition_join`. Matches converter:750-751.
 //!   - For LEFT_DELIM_JOIN: assigns `left_delim_join.column_data_scan` to the COLUMN_DATA_SCAN
@@ -427,14 +464,14 @@ void wrap_delim_join(
   if (delim_base.join) {
     insert_gpu_pipeline_operators_recursive(delim_base.join, iceberg_cache, op_params);
   }
-  if (delim_base.distinct) {
-    // distinct is a unique_ptr<sirius_physical_grouped_aggregate>; the recursive walker
-    // takes unique_ptr<sirius_physical_operator>&. Recurse via children[] instead so we
-    // only walk the source-side subtrees below DISTINCT, leaving DISTINCT itself
-    // unwrapped (see function-level comment).
-    for (auto& child_slot : delim_base.distinct->children) {
+  if (delim_base.distinct_root) {
+    // At this point `distinct_root` still holds the bare original DISTINCT (wrap_delim_distinct
+    // hasn't run yet). Recurse into its children for source-side wraps below DISTINCT, then
+    // wrap MERGE/PARTITION above.
+    for (auto& child_slot : delim_base.distinct_root->children) {
       insert_gpu_pipeline_operators_recursive(child_slot, iceberg_cache, op_params);
     }
+    wrap_delim_distinct(delim_base, op_params);
   }
 
   if (slot->type == sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
@@ -544,6 +581,19 @@ void sirius_physical_plan_generator::set_parent_ops(sirius::op::sirius_physical_
   op.set_parent_op(parent);
   for (auto& child : op.children) {
     if (child) { set_parent_ops(*child, &op); }
+  }
+  // DELIM JOIN stores its internal `join` and `distinct_root` subtrees as unique_ptr fields
+  // outside `children[]`. Descend into them so the wrapped operators inside (B.4's
+  // CONCAT/PARTITION on the join side, wrap_delim_distinct's MERGE/PARTITION on the distinct
+  // side) get their `_parent_op` set to their tree parent. PARTITION's ctor takes a
+  // `key_source` argument that is captured for key/type derivation only and never stored
+  // (separated from the tree-parent role here), so without this descent PARTITION._parent_op
+  // stays nullptr and compute_repository_wiring_tree_based can't resolve its destination.
+  if (op.type == sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
+      op.type == sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
+    auto& delim = op.Cast<sirius::op::sirius_physical_delim_join>();
+    if (delim.join) { set_parent_ops(*delim.join, &op); }
+    if (delim.distinct_root) { set_parent_ops(*delim.distinct_root, &op); }
   }
 }
 

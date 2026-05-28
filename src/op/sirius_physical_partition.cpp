@@ -56,16 +56,19 @@ std::optional<std::size_t> extract_bound_ref_index(const duckdb::Expression& exp
 
 sirius_physical_partition::sirius_physical_partition(duckdb::vector<sirius::logical_type> types,
                                                      std::size_t estimated_cardinality,
-                                                     sirius_physical_operator* parent_op,
+                                                     sirius_physical_operator* key_source,
                                                      bool is_build,
                                                      uint64_t hash_partition_bytes)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::PARTITION, std::move(types), estimated_cardinality)
 {
   s_partition_size = hash_partition_bytes;
-  _parent_op       = parent_op;
   _is_build        = is_build;
-  get_partition_keys_and_type(parent_op, is_build);
+  // `key_source` is the downstream consumer that determines partition keys (HJ/NLJ
+  // conditions, HGB/MERGE_GROUP_BY grouping columns, or a CONCAT that chains to one).
+  // We capture its key/type info now and discard the pointer — the inherited
+  // `_parent_op` field is the *tree parent*, stamped later by `set_parent_ops`.
+  get_partition_keys_and_type(key_source, is_build);
   _drives_partition_count = _is_build;
 }
 
@@ -171,19 +174,12 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     auto& grouped_aggregate_merge_op = op->Cast<sirius_physical_grouped_aggregate_merge>();
     _partition_keys                  = grouped_aggregate_merge_op.get_output_grouping_indices();
 
-  } else if (op->type == SiriusPhysicalOperatorType::CONCAT) {
-    auto& parent_concat_op = op->Cast<sirius_physical_concat>();
-    bool is_build          = parent_concat_op.is_build_concat();
-    _is_build              = is_build;
-    if (parent_concat_op.get_parent_op()->type == SiriusPhysicalOperatorType::HASH_JOIN ||
-        parent_concat_op.get_parent_op()->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
-      get_partition_keys_and_type(parent_concat_op.get_parent_op(), is_build);
-    } else {
-      throw std::runtime_error("Unsupported operator following partition->concat: " +
-                               parent_concat_op.get_parent_op()->get_name());
-    }
   } else {
-    throw std::runtime_error("Unsupported operator type for partition: " + op->get_name());
+    // PARTITION's `key_source` must be a key-bearing consumer (HJ/NLJ for join feeders,
+    // HGB/MERGE_GROUP_BY for aggregate feeders). Callers used to pass a CONCAT here, with
+    // PARTITION recursively unwrapping to find the underlying HJ — that legacy path is gone
+    // now that callers pass the join/group-by directly.
+    throw std::runtime_error("Unsupported key_source for partition: " + op->get_name());
   }
 }
 

@@ -114,12 +114,17 @@ sirius_physical_plan_generator::plan_delim_join(duckdb::LogicalComparisonJoin& o
       duckdb::optional_idx(this->delim_index));
   }
   // we still have to create the DISTINCT clause that is used to generate the duplicate eliminated
-  // chunk
-  delim_join->distinct = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate>(
+  // chunk. Initially `distinct_root` owns the bare original DISTINCT and `distinct` raw-points
+  // at it. Under USE_TREE_BASED_PIPELINE_BUILD, wrap_delim_distinct later replaces
+  // `distinct_root` with the MERGE/PARTITION/DISTINCT chain — `distinct` remains valid because
+  // the underlying object never relocates, only its owning slot deepens.
+  auto distinct_uptr = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate>(
     sirius::from_duckdb_vec(delim_types),
     translate_expressions(std::move(distinct_expressions)),
     translate_expressions(std::move(distinct_groups)),
     op.estimated_cardinality);
+  delim_join->distinct      = distinct_uptr.get();
+  delim_join->distinct_root = std::move(distinct_uptr);
 
   return std::move(delim_join);
 }

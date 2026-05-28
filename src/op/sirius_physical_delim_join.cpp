@@ -123,6 +123,21 @@ void sirius_physical_left_delim_join::build_pipelines(pipeline::sirius_pipeline&
       duckdb::reference<pipeline::sirius_pipeline>(*child_meta_pipeline.get_base_pipeline())));
   }
   join->build_pipelines(current, meta_pipeline);
+
+  if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD && distinct_root) {
+    // Phase 3.2 (#604): spawn a child meta_pipeline rooted at the distinct chain.
+    // After wrap_delim_distinct, distinct_root holds
+    // `DISTINCT_MERGE -> PARTITION_DISTINCT -> original DISTINCT`; building from it
+    // produces the chain's three pipelines via the standard recursive walk. Mirrors
+    // split_delim_join_sink's external chain construction (converter:820-841) but
+    // reachable via the plan tree. Sibling of child_meta_pipeline under meta_pipeline;
+    // data dependency on the original DISTINCT's per-thread output (populated by
+    // child_meta_pipeline's LHS) sequences this meta after child_meta_pipeline.
+    // Under flag OFF, distinct_root holds the bare DISTINCT and the legacy converter
+    // still owns chain construction — skip the spawn there.
+    auto& distinct_meta = meta_pipeline.create_child_meta_pipeline(current, *distinct_root);
+    distinct_meta.build(*distinct_root);
+  }
 }
 
 void sirius_physical_right_delim_join::build_pipelines(
@@ -154,6 +169,13 @@ void sirius_physical_right_delim_join::build_pipelines(
   // builds partition_join at runtime).
   sirius_physical_hash_join::build_join_pipelines(
     current, meta_pipeline, *join, duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD);
+
+  if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD && distinct_root) {
+    // Phase 3.2 (#604): spawn a child meta_pipeline rooted at the distinct chain.
+    // See LEFT_DELIM_JOIN's identical comment block above for the full reasoning.
+    auto& distinct_meta = meta_pipeline.create_child_meta_pipeline(current, *distinct_root);
+    distinct_meta.build(*distinct_root);
+  }
 }
 
 std::unique_ptr<operator_data> sirius_physical_right_delim_join::execute(
