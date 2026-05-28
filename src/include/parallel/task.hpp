@@ -24,6 +24,7 @@
 
 #include <cucascade/memory/memory_reservation.hpp>
 
+#include <cstdint>
 #include <memory>
 
 namespace sirius {
@@ -78,9 +79,12 @@ class itask_global_state {
  */
 class itask {
  public:
-  itask(std::unique_ptr<itask_local_state> local_state,
+  itask(uint64_t task_id,
+        std::unique_ptr<itask_local_state> local_state,
         std::shared_ptr<itask_global_state> global_state)
-    : _local_state(std::move(local_state)), _global_state(std::move(global_state))
+    : _task_id(task_id),
+      _local_state(std::move(local_state)),
+      _global_state(std::move(global_state))
   {
   }
 
@@ -115,8 +119,10 @@ class itask {
 
   itask_local_state* local_state() noexcept { return _local_state.get(); }
   [[nodiscard]] itask_global_state* global_state() noexcept { return _global_state.get(); }
+  [[nodiscard]] uint64_t get_task_id() const noexcept { return _task_id; }
 
  protected:
+  uint64_t _task_id;
   std::unique_ptr<itask_local_state> _local_state;
   std::shared_ptr<itask_global_state> _global_state;
 };
