@@ -71,6 +71,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     std::size_t estimated_cardinality,
     duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info,
     uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES);
+
   sirius_physical_hash_join(
     duckdb::LogicalOperator& op,
     duckdb::unique_ptr<sirius_physical_operator> left,
@@ -83,9 +84,6 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   duckdb::vector<sirius::join_condition> conditions;
   //! Scans where we should push generated filters into (if any)
   duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> filter_pushdown;
-
-  //! Initialize HT for this operator
-  void initialize_hash_table(duckdb::ClientContext& context) const;
 
   //! The types of the join keys
   duckdb::vector<sirius::logical_type> condition_types;

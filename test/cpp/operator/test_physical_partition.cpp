@@ -111,11 +111,6 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single 
   // to be made
   std::size_t estimated_cardinality = 100000000;  // 100 million rows = PARTITION_SIZE x 10
 
-  // Create DuckDB context for aggregate function binding
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto& context = *con.context;
-
   // Create aggregate expressions: GROUP BY column 0, SUM(column 1)
   auto agg_result = sirius::test::create_aggregate_expressions<gpu_type_traits<int32_t>>(
     {0},      // group_indexes: GROUP BY column 0
@@ -127,8 +122,7 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single 
   duckdb::vector<sirius::logical_type> partitioner_types = agg_result.output_types;
 
   // Create the grouped aggregate merge operator
-  sirius_physical_grouped_aggregate_merge grouped_aggregator(context,
-                                                             std::move(agg_result.output_types),
+  sirius_physical_grouped_aggregate_merge grouped_aggregator(std::move(agg_result.output_types),
                                                              std::move(agg_result.aggregates),
                                                              std::move(agg_result.groups),
                                                              estimated_cardinality);
@@ -242,11 +236,6 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with two par
   // to be made
   std::size_t estimated_cardinality = 100000000;  // 100 million rows = PARTITION_SIZE x 10
 
-  // Create DuckDB context for aggregate function binding
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto& context = *con.context;
-
   // Create aggregate expressions: GROUP BY column 0, SUM(column 1)
   auto agg_result = sirius::test::create_aggregate_expressions<gpu_type_traits<int32_t>>(
     {0, 1},   // group_indexes: GROUP BY column 0 and 1
@@ -258,8 +247,7 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with two par
   duckdb::vector<sirius::logical_type> partitioner_types = agg_result.output_types;
 
   // Create the grouped aggregate merge operator
-  sirius_physical_grouped_aggregate_merge grouped_aggregator(context,
-                                                             std::move(agg_result.output_types),
+  sirius_physical_grouped_aggregate_merge grouped_aggregator(std::move(agg_result.output_types),
                                                              std::move(agg_result.aggregates),
                                                              std::move(agg_result.groups),
                                                              estimated_cardinality);
@@ -329,11 +317,6 @@ TEST_CASE(
 
   std::size_t estimated_cardinality = num_values;
 
-  // Create DuckDB context for aggregate function binding
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto& context = *con.context;
-
   // Create aggregate expressions: GROUP BY column 0, SUM(column 1)
   auto agg_result = sirius::test::create_aggregate_expressions<gpu_type_traits<int32_t>>(
     {0},      // group_indexes: GROUP BY column 0
@@ -345,8 +328,7 @@ TEST_CASE(
   duckdb::vector<sirius::logical_type> partitioner_types = agg_result.output_types;
 
   // Create the grouped aggregate merge operator
-  sirius_physical_grouped_aggregate_merge grouped_aggregator(context,
-                                                             std::move(agg_result.output_types),
+  sirius_physical_grouped_aggregate_merge grouped_aggregator(std::move(agg_result.output_types),
                                                              std::move(agg_result.aggregates),
                                                              std::move(agg_result.groups),
                                                              estimated_cardinality);

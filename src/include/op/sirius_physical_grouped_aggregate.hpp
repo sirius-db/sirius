@@ -40,14 +40,12 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
     SiriusPhysicalOperatorType::HASH_GROUP_BY;
 
  public:
-  sirius_physical_grouped_aggregate(duckdb::ClientContext& context,
-                                    duckdb::vector<sirius::logical_type> types,
+  sirius_physical_grouped_aggregate(duckdb::vector<sirius::logical_type> types,
                                     duckdb::vector<sirius::expression> expressions,
                                     duckdb::vector<sirius::expression> groups,
                                     std::size_t estimated_cardinality);
 
   sirius_physical_grouped_aggregate(
-    duckdb::ClientContext& context,
     duckdb::vector<sirius::logical_type> types,
     duckdb::vector<sirius::expression> expressions,
     duckdb::vector<sirius::expression> groups,

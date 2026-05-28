@@ -61,11 +61,6 @@ TEST_CASE("sirius_physical_grouped_aggregate_merge grouped aggregates single dat
   auto [raw_input_table, expected_table] =
     sirius::test::make_test_data_for_grouped_aggregate<Traits>(num_groups, 1, stream, mr);
 
-  // Create DuckDB context for aggregate function binding
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto& context = *con.context;
-
   // Create aggregate expressions: GROUP BY column 0, SUM(column 1)
   auto agg_result = sirius::test::create_aggregate_expressions<Traits>(
     {0},                      // group_indexes: GROUP BY column 0
@@ -75,7 +70,6 @@ TEST_CASE("sirius_physical_grouped_aggregate_merge grouped aggregates single dat
 
   // Create the grouped aggregate merge operator
   sirius_physical_grouped_aggregate_merge grouped_aggregate_merger(
-    context,
     std::move(agg_result.output_types),
     std::move(agg_result.aggregates),
     std::move(agg_result.groups),
@@ -132,11 +126,6 @@ TEMPLATE_TEST_CASE(
   auto input_tables =
     sirius::test::make_random_striped_split(std::move(input_table), 5, stream, mr);
 
-  // Create DuckDB context for aggregate function binding
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto& context = *con.context;
-
   // Create aggregate expressions for grouped_aggregator
   auto agg_result1 = sirius::test::create_aggregate_expressions<Traits>(
     {0, 1},                   // group_indexes: GROUP BY column 0 and 1
@@ -152,15 +141,13 @@ TEMPLATE_TEST_CASE(
   );
 
   // Create the grouped aggregate operator
-  sirius_physical_grouped_aggregate grouped_aggregator(context,
-                                                       std::move(agg_result1.output_types),
+  sirius_physical_grouped_aggregate grouped_aggregator(std::move(agg_result1.output_types),
                                                        std::move(agg_result1.aggregates),
                                                        std::move(agg_result1.groups),
                                                        num_groups);
 
   // Create the grouped aggregate merge operator
   sirius_physical_grouped_aggregate_merge grouped_aggregate_merger(
-    context,
     std::move(agg_result2.output_types),
     std::move(agg_result2.aggregates),
     std::move(agg_result2.groups),
@@ -241,10 +228,6 @@ TEMPLATE_TEST_CASE("sirius_physical_grouped_aggregate_merge end-to-end with AVG"
   auto input_tables =
     sirius::test::make_random_striped_split(std::move(input_table), 5, stream, mr);
 
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto& context = *con.context;
-
   // Create aggregate expressions for local operator
   auto agg_result1 = sirius::test::create_aggregate_expressions<Traits>(
     {0},                             // GROUP BY column 0
@@ -257,8 +240,7 @@ TEMPLATE_TEST_CASE("sirius_physical_grouped_aggregate_merge end-to-end with AVG"
     {0}, {"min", "max", "count", "avg"}, {1, 1, 1, 1});
 
   // Create local and merge operators
-  sirius_physical_grouped_aggregate grouped_aggregator(context,
-                                                       std::move(agg_result1.output_types),
+  sirius_physical_grouped_aggregate grouped_aggregator(std::move(agg_result1.output_types),
                                                        std::move(agg_result1.aggregates),
                                                        std::move(agg_result1.groups),
                                                        num_groups);

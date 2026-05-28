@@ -26,13 +26,11 @@ namespace sirius {
 namespace op {
 
 sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
-  duckdb::ClientContext& context,
   duckdb::vector<sirius::logical_type> types,
   duckdb::vector<sirius::expression> expressions,
   duckdb::vector<sirius::expression> groups_p,
   std::size_t estimated_cardinality)
-  : sirius_physical_grouped_aggregate(context,
-                                      std::move(types),
+  : sirius_physical_grouped_aggregate(std::move(types),
                                       std::move(expressions),
                                       std::move(groups_p),
                                       {},
@@ -51,7 +49,6 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
 // the groupby expressions (groups_p) for each grouping_sets. The first level of the vector is the
 // grouping set and the second level is the indexes to the groupby expression for that set.
 sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
-  duckdb::ClientContext& context,
   duckdb::vector<sirius::logical_type> types,
   duckdb::vector<sirius::expression> expressions,
   duckdb::vector<sirius::expression> groups_p,

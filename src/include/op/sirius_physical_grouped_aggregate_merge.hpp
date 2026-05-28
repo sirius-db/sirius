@@ -55,14 +55,12 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
     bool has_count_distinct,
     std::size_t estimated_cardinality);
 
-  sirius_physical_grouped_aggregate_merge(duckdb::ClientContext& context,
-                                          duckdb::vector<sirius::logical_type> types,
+  sirius_physical_grouped_aggregate_merge(duckdb::vector<sirius::logical_type> types,
                                           duckdb::vector<sirius::expression> expressions,
                                           duckdb::vector<sirius::expression> groups,
                                           std::size_t estimated_cardinality);
 
   sirius_physical_grouped_aggregate_merge(
-    duckdb::ClientContext& context,
     duckdb::vector<sirius::logical_type> types,
     duckdb::vector<sirius::expression> expressions,
     duckdb::vector<sirius::expression> groups,

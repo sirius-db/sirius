@@ -122,10 +122,6 @@ TEST_CASE("count distinct: single batch, basic correctness",
   auto mr     = get_resource_ref(*space);
   auto stream = default_stream();
 
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto& context = *con.context;
-
   std::vector<int32_t> keys   = {0, 0, 0, 0, 0, 1, 1, 1, 2, 2, 2};
   std::vector<int32_t> values = {10, 20, 10, 30, 20, 40, 50, 40, 60, 60, 60};
 
@@ -136,8 +132,7 @@ TEST_CASE("count distinct: single batch, basic correctness",
 
   // Local operator
   auto agg1 = sirius::test::create_count_distinct_expressions<KeyTraits, ValTraits>({0}, 1);
-  sirius_physical_grouped_aggregate local_op(context,
-                                             std::move(agg1.output_types),
+  sirius_physical_grouped_aggregate local_op(std::move(agg1.output_types),
                                              std::move(agg1.aggregates),
                                              std::move(agg1.groups),
                                              3 /*estimated_cardinality*/);
@@ -186,10 +181,6 @@ TEMPLATE_TEST_CASE("count distinct: multiple batches, randomly striped",
   auto mr     = get_resource_ref(*space);
   auto stream = default_stream();
 
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto& context = *con.context;
-
   constexpr int num_groups = 30;
 
   // Build input: each group has 6 rows, 3 distinct values (each repeated twice)
@@ -223,11 +214,8 @@ TEMPLATE_TEST_CASE("count distinct: multiple batches, randomly striped",
 
   // Local operator
   auto agg1 = sirius::test::create_count_distinct_expressions<KeyTraits, ValTraits>({0}, 1);
-  sirius_physical_grouped_aggregate local_op(context,
-                                             std::move(agg1.output_types),
-                                             std::move(agg1.aggregates),
-                                             std::move(agg1.groups),
-                                             num_groups);
+  sirius_physical_grouped_aggregate local_op(
+    std::move(agg1.output_types), std::move(agg1.aggregates), std::move(agg1.groups), num_groups);
 
   // Merge operator
   sirius_physical_grouped_aggregate_merge merge_op(&local_op);
@@ -281,10 +269,6 @@ TEST_CASE("count distinct: cross-batch duplicate deduplication within a partitio
   auto mr     = get_resource_ref(*space);
   auto stream = default_stream();
 
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto& context = *con.context;
-
   // Batch 1
   auto batch1 = sirius::make_data_batch(
     make_count_distinct_input<ValTraits>({0, 0, 1, 2}, {10, 20, 40, 60}, stream, mr),
@@ -305,8 +289,7 @@ TEST_CASE("count distinct: cross-batch duplicate deduplication within a partitio
 
   // Local operator (shared across all batches)
   auto agg1 = sirius::test::create_count_distinct_expressions<KeyTraits, ValTraits>({0}, 1);
-  sirius_physical_grouped_aggregate local_op(context,
-                                             std::move(agg1.output_types),
+  sirius_physical_grouped_aggregate local_op(std::move(agg1.output_types),
                                              std::move(agg1.aggregates),
                                              std::move(agg1.groups),
                                              3 /*estimated_cardinality*/);
@@ -353,10 +336,6 @@ TEST_CASE("count distinct: mixed with regular aggregations, multiple batches",
   REQUIRE(space != nullptr);
   auto mr     = get_resource_ref(*space);
   auto stream = default_stream();
-
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto& context = *con.context;
 
   // Batch 1 and Batch 2 together form the full dataset:
   // key=0: [10,10,20] ++ [20,30]  → {10,20,30} → count_distinct=3, min=10, count=5
@@ -429,14 +408,12 @@ TEST_CASE("count distinct: mixed with regular aggregations, multiple batches",
     aggregates2.push_back(agg->Copy());
   }
 
-  sirius_physical_grouped_aggregate local_op(context,
-                                             std::move(output_types),
+  sirius_physical_grouped_aggregate local_op(std::move(output_types),
                                              sirius::wrap_many(std::move(aggregates)),
                                              sirius::wrap_many(std::move(groups)),
                                              2 /*estimated_cardinality*/);
 
-  sirius_physical_grouped_aggregate_merge merge_op(context,
-                                                   std::move(output_types2),
+  sirius_physical_grouped_aggregate_merge merge_op(std::move(output_types2),
                                                    sirius::wrap_many(std::move(aggregates2)),
                                                    sirius::wrap_many(std::move(groups2)),
                                                    2 /*estimated_cardinality*/);
@@ -487,10 +464,6 @@ TEST_CASE("count distinct: multiple partitions with multiple batches per partiti
   auto mr     = get_resource_ref(*space);
   auto stream = default_stream();
 
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto& context = *con.context;
-
   // Helper: build [key_col, val_col] where each group g gets values
   //   {g*10+0, g*10+1, g*10+2, g*10+3} each repeated twice (8 rows per group)
   auto make_partition_table = [&](const std::vector<int32_t>& group_keys) {
@@ -517,8 +490,7 @@ TEST_CASE("count distinct: multiple partitions with multiple batches per partiti
 
   // Shared local + merge operators
   auto agg_spec = sirius::test::create_count_distinct_expressions<KeyTraits, ValTraits>({0}, 1);
-  sirius_physical_grouped_aggregate local_op(context,
-                                             std::move(agg_spec.output_types),
+  sirius_physical_grouped_aggregate local_op(std::move(agg_spec.output_types),
                                              std::move(agg_spec.aggregates),
                                              std::move(agg_spec.groups),
                                              5 /*estimated_cardinality*/);
@@ -583,10 +555,6 @@ TEST_CASE("count distinct: multi-column struct expression",
   auto mr     = get_resource_ref(*space);
   auto stream = default_stream();
 
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto& context = *con.context;
-
   // Input table: 3 columns — key (col0), val_a (col1), val_b (col2)
   auto make_3col_input = [&](const std::vector<int32_t>& keys,
                              const std::vector<int32_t>& val_a,
@@ -615,8 +583,7 @@ TEST_CASE("count distinct: multi-column struct expression",
     {{duckdb::LogicalType::INTEGER, 1},   // struct_pack(col1, col2)
      {duckdb::LogicalType::INTEGER, 2}});
 
-  sirius_physical_grouped_aggregate local_op(context,
-                                             std::move(agg_spec.output_types),
+  sirius_physical_grouped_aggregate local_op(std::move(agg_spec.output_types),
                                              std::move(agg_spec.aggregates),
                                              std::move(agg_spec.groups),
                                              2 /*estimated_cardinality*/);
