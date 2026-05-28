@@ -17,6 +17,7 @@ on:
   push:
     branches:
       - dev
+  merge_group:
   pull_request:
     paths:
       - .github/workflows/distribution.yml
