@@ -17,7 +17,7 @@ Two queries are comparable only if **both** of the following are true. If either
 
 ### Rule 1: Full SQL string matches
 
-The `sql_preview` in `_index.csv` is truncated at ~120 characters. Don't trust it as proof of equivalence.
+The `sql_preview` in `_index.csv` is a 120-char convenience field the parser derives for display. The Sirius log itself captures the full SQL on `QueryBegin`, so the authoritative text lives at `<folder>/query.sql` — don't rely on the preview as proof of equivalence.
 
 To verify the full SQL matches:
 ```bash
@@ -55,9 +55,9 @@ The common case where this works: a project usually has many log files (one per 
 
 ## Step 2: Watch for two common false-match traps
 
-### Trap A: Truncated-SQL collision
+### Trap A: `sql_preview` collision
 
-The log line `[info] [:] QueryBegin: <sql>` truncates the SQL. Two queries with the same first ~120 chars can be wildly different downstream. The operator-list check (Rule 2) catches this — surface the difference to the user and stop.
+The Sirius log captures the full SQL on `QueryBegin`, but the parser derives a 120-char `sql_preview` field for display in `_index.csv` (and in some report tables). Two different queries that share the same first ~120 characters will look identical in the preview even though their full SQL differs. Always diff `<folder>/query.sql` (the authoritative full text) before declaring two runs equivalent — and run the operator-list check (Rule 2) regardless, since identical SQL can still yield different plans.
 
 ### Trap B: Different scan source
 

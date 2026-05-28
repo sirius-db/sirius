@@ -44,7 +44,7 @@ python3 tools/log_analyzer/parse_logs.py <log_file> [--out <dir>]
 ├── _summary.json               # counts + complete_queries / incomplete_queries lists + format warnings
 ├── _pipeline_aggregates.csv    # one row per (query, pipeline_id) — the workhorse table
 └── <ts>/                       # one folder per query, e.g. 2026-05-20_14-41-37.879
-    ├── query.sql               # SQL text from the log (may be truncated — see pitfalls below)
+    ├── query.sql               # Full SQL text from the log
     ├── query_meta.json         # begin/end ts, duration, status (complete | incomplete)
     ├── pipeline_plan.json      # the structured DAG (pipelines, operators, dependencies, leaves, root)
     ├── pipeline_plan.txt       # raw "=== Pipeline Overview ===" block
@@ -76,7 +76,7 @@ On older logs (pre multi-GPU split) `task_id` is `None` in the input/output/hist
 
 ### Picking a query to analyze
 
-Read `_index.csv` (or `_summary.json -> queries.complete_queries / incomplete_queries`). Each row has `query_begin_ts`, `folder`, `status`, `duration_ms`, and `sql_preview`. The folder name embeds the timestamp, e.g. `2026-05-20_14-41-37.879`.
+Read `_index.csv` (or `_summary.json -> queries.complete_queries / incomplete_queries`). Each row has `query_begin_ts`, `folder`, `status`, `duration_ms`, and `sql_preview` (a 120-char convenience truncation the *parser* applies for display — the full SQL lives at `<folder>/query.sql`). The folder name embeds the timestamp, e.g. `2026-05-20_14-41-37.879`.
 
 Ask the user which query if it's not obvious, or surface the slowest / failed candidates from `_index.csv`.
 
@@ -100,14 +100,14 @@ See `references/comparison.md` for the full playbook, but the matching rule is s
 
 Two queries are comparable only if **BOTH** of these match:
 
-1. **The full SQL string** — *not* just the truncated `sql_preview`.
+1. **The full SQL string** — diff `<folder>/query.sql` between the two runs, *not* the parser's 120-char `sql_preview`.
 2. **The list of operators** — same operator types and counts. Compare `pipeline_plan.json -> counts.operator_types` between the two queries.
 
 If either differs, you are not looking at the same query, and any perf or correctness diff you draw is meaningless. Tell the user that the runs don't match and stop.
 
 ### Two common false-match traps
 
-- **Truncated SQL collision.** The log truncates SQL after ~120 chars in the `QueryBegin:` line. Two queries with the same first 120 characters can differ in their `WHERE` clauses, ordering, or projections. Always verify by also comparing operator lists — they reflect the *actual* plan.
+- **`sql_preview` collision.** The Sirius log captures the full SQL on `QueryBegin`, but the parser still derives a 120-char `sql_preview` field for display in `_index.csv`. Two different queries that share the same first 120 characters will have the same `sql_preview` even though their full SQL differs. Always diff `<folder>/query.sql` (the full text) and cross-check the operator list — they reflect the *actual* plan.
 - **Different scan source.** `GPU_PARQUET_SCAN` vs `DUCKDB_SCAN` (or vs `TABLE_SCAN` on top of a Parquet read) is the same logical query but a different execution path. The two are not directly comparable — perf and memory characteristics differ for legitimate reasons. Call this out to the user as a finding, not a fault.
 
 ### When no comparable run exists in the current log
@@ -179,7 +179,7 @@ After you've localized the issue, recommend the right next step:
 
 ## Common pitfalls (re-emphasized)
 
-- **Don't compare runs without checking operators match.** SQL-string-only matching is unreliable due to truncation and scan-source variation.
+- **Don't compare runs without checking operators match.** Matching on the parser-derived `sql_preview` is unreliable (it's a 120-char convenience field); matching on full SQL via `query.sql` still doesn't catch scan-source variation. Always also compare operator inventories.
 - **`operator_types` in `_pipeline_aggregates.csv` is sourced from `task_outputs`, not `task_inputs`.** Scan pipelines emit no task_inputs but they do emit task_outputs — so the field is populated correctly for them.
 - **When pairing pipelines across two runs, require BOTH `pipeline_num` AND the operator-chain string to match.** For two runs of the same SQL on the same plan, pipeline numbers are stable across runs — but chain strings repeat (multiple PARTITIONs, multiple CONCATs), so matching on chain alone silently mis-pairs. Requiring both protects against the case where a run actually had a different plan slip through.
 - **When the validation walk finds no divergence, report exactly that.** Don't speculate that the bug "must be" in operator content / values. The likeliest explanation is that you didn't compare the right pair — ask the user whether other good runs are worth trying.
