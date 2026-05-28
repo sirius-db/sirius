@@ -337,7 +337,7 @@ SinkResultType GPUPhysicalMaterializedCollector::ConvertGPUTableToCPUCollection(
             auto to_cudf_column        = cudf::cast(from_cudf_column_view,
                                              to_cudf_type,
                                              rmm::cuda_stream_default,
-                                             GPUBufferManager::GetInstance().mr);
+                                             GPUBufferManager::GetInstance().get_mr_ref());
             size_bytes     = materialized_relation.columns[col]->column_length * sizeof(__int128_t);
             host_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(size_bytes);
             uint8_t* to_cudf_data = const_cast<uint8_t*>(to_cudf_column->view().data<uint8_t>());

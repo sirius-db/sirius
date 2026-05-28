@@ -331,9 +331,6 @@ cucascade::host_data_representation const& convert_to_host_table(
   std::shared_ptr<cucascade::data_batch> const& batch,
   rmm::cuda_stream_view stream)
 {
-  auto* data = batch->get_data();
-  if (!data) { throw std::runtime_error("data_batch has no data representation"); }
-
   auto& manager = sirius_ctx->get_memory_manager();
 
   auto reservation =
@@ -347,9 +344,13 @@ cucascade::host_data_representation const& convert_to_host_table(
   if (!host_space) { throw std::runtime_error("Invalid host memory space in test"); }
 
   auto& registry = sirius::converter_registry::get();
-  batch->convert_to<cucascade::host_data_representation>(registry, host_space, stream);
+  {
+    auto mut = batch->to_mutable();
+    mut.convert_to<cucascade::host_data_representation>(registry, host_space, stream);
+  }
 
-  data = batch->get_data();
+  auto ro    = batch->to_read_only();
+  auto* data = ro.get_data();
   if (!data) { throw std::runtime_error("data_batch has no data after conversion"); }
   return data->cast<cucascade::host_data_representation>();
 }
@@ -470,16 +471,19 @@ TEST_CASE("host_table_utils - pack metadata with gaps across multiple blocks",
   columns.push_back(str_builder.make_column_metadata(num_rows));
   columns.push_back(big_builder.make_column_metadata(num_rows));
 
-  auto const sz         = allocation->size_bytes();
-  auto table_allocation = std::make_unique<cucascade::memory::host_table_allocation>(
-    std::move(allocation), std::move(columns), sz);
+  auto const sz = allocation->size_bytes();
+  auto table_allocation =
+    cucascade::memory::host_table_allocation::create(std::move(allocation), std::move(columns), sz);
   auto host_table =
     std::make_unique<cucascade::host_data_representation>(std::move(table_allocation), host_space);
   auto batch =
     std::make_shared<cucascade::data_batch>(sirius::get_next_batch_id(), std::move(host_table));
 
   auto& registry = sirius::converter_registry::get();
-  batch->convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
+  {
+    auto mut = batch->to_mutable();
+    mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
+  }
 
   cudf::table_view table_view = sirius::get_cudf_table_view(*batch);
   REQUIRE(table_view.num_rows() == static_cast<cudf::size_type>(num_rows));
@@ -597,16 +601,19 @@ TEST_CASE("host_table_utils - underfilled varchar column truncates rows",
   columns.push_back(int_builder.make_column_metadata(rows_fit));
   columns.push_back(str_builder.make_column_metadata(rows_fit));
 
-  auto const sz         = allocation->size_bytes();
-  auto table_allocation = std::make_unique<cucascade::memory::host_table_allocation>(
-    std::move(allocation), std::move(columns), sz);
+  auto const sz = allocation->size_bytes();
+  auto table_allocation =
+    cucascade::memory::host_table_allocation::create(std::move(allocation), std::move(columns), sz);
   auto host_table =
     std::make_unique<cucascade::host_data_representation>(std::move(table_allocation), host_space);
   auto batch =
     std::make_shared<cucascade::data_batch>(sirius::get_next_batch_id(), std::move(host_table));
 
   auto& registry = sirius::converter_registry::get();
-  batch->convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
+  {
+    auto mut = batch->to_mutable();
+    mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
+  }
 
   cudf::table_view table_view = sirius::get_cudf_table_view(*batch);
   REQUIRE(table_view.num_rows() == static_cast<cudf::size_type>(rows_fit));
@@ -642,17 +649,12 @@ TEST_CASE("host_table_utils - metadata offsets match packed data",
   auto string_nulls = build_null_indices(num_rows, {1, 9, 64, 128, 256});
   apply_null_mask(table->get_column(1), int64_nulls, stream, mr);
   apply_null_mask(table->get_column(2), string_nulls, stream, mr);
-  auto batch = sirius::make_data_batch(std::move(table), *gpu_space);
+  auto batch = sirius::make_data_batch(std::move(table), *gpu_space, stream);
 
   expected_table_data expected;
   std::vector<uint8_t> expected_int64_mask;
   std::vector<uint8_t> expected_string_mask;
   {
-    REQUIRE(batch->try_to_create_task());
-    auto lock_result = batch->try_to_lock_for_processing(gpu_space->get_id());
-    REQUIRE(lock_result.success);
-    auto handle = std::move(lock_result.handle);
-
     auto const gpu_view  = sirius::get_cudf_table_view(*batch);
     expected             = extract_expected_data(gpu_view);
     expected_int64_mask  = extract_mask_bytes(gpu_view.column(1));

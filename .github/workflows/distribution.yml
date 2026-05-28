@@ -17,6 +17,9 @@ on:
   push:
     branches:
       - dev
+  pull_request:
+    paths:
+      - .github/workflows/distribution.yml
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -29,7 +32,7 @@ jobs:
       duckdb_version: v1.5.1
       ci_tools_version: sirius
       exclude_archs: 'linux_amd64_musl;linux_arm64_musl;osx_amd64;osx_arm64;windows_amd64;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
-      extra_toolchains: 'cuda'
+      extra_toolchains: 'cuda;rust;protobuf'
       vcpkg_url: 'https://github.com/microsoft/vcpkg.git'
       vcpkg_commit: 'ffc071e0c08432c60c9b64f00334c0227667931b'
       skip_tests: true
@@ -42,7 +45,7 @@ jobs:
       cuda_archs: '75-real;80-real;86-real;90a-real;100f-real;120a-real;120'
       cuda_version: '13'
       artifact_postfix: '-cuda13'
-      runners: '{"linux_x64": ["self-hosted", "ubuntu-22.04", "cuda-13", "cpu-xl"], "linux_arm64": ["self-hosted", "ubuntu-22.04", "cuda-13", "arm-xl"]}'
+      runners: '{"linux_x64": ["self-hosted", "ubuntu-24.04", "cuda-13", "cpu-xl"], "linux_arm64": ["self-hosted", "ubuntu-24.04", "cuda-13", "arm-xl"]}'
 
   cuda-12:
     uses: sirius-db/extension-ci-tools/.github/workflows/_extension_distribution.yml@sirius
@@ -51,7 +54,7 @@ jobs:
       duckdb_version: v1.5.1
       ci_tools_version: sirius
       exclude_archs: 'linux_amd64_musl;linux_arm64_musl;osx_amd64;osx_arm64;windows_amd64;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
-      extra_toolchains: 'cuda'
+      extra_toolchains: 'cuda;rust;protobuf'
       vcpkg_url: 'https://github.com/microsoft/vcpkg.git'
       vcpkg_commit: 'ffc071e0c08432c60c9b64f00334c0227667931b'
       skip_tests: true
@@ -64,4 +67,4 @@ jobs:
       cuda_archs: '75-real;80-real;86-real;90a-real'
       cuda_version: '12'
       artifact_postfix: '-cuda12'
-      runners: '{"linux_x64": ["self-hosted", "ubuntu-22.04", "cuda-13", "cpu-xl"], "linux_arm64": ["self-hosted", "ubuntu-22.04", "cuda-13", "arm-xl"]}'
+      runners: '{"linux_x64": ["self-hosted", "ubuntu-22.04", "cuda-12", "cpu-xl"], "linux_arm64": ["self-hosted", "ubuntu-22.04", "cuda-12", "arm-xl"]}'

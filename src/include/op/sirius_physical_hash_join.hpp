@@ -19,13 +19,13 @@
 #include "cudf/cudf_utils.hpp"
 #include "cudf/join/distinct_hash_join.hpp"
 #include "duckdb/common/value_operations/value_operations.hpp"
-#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/join_hashtable.hpp"
 #include "duckdb/execution/operator/join/perfect_hash_join_executor.hpp"
 #include "duckdb/execution/operator/join/physical_comparison_join.hpp"
 #include "duckdb/execution/operator/join/physical_join.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
+#include "expression/join_condition.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "sirius_config.hpp"
 #include "utils.hpp"
@@ -63,7 +63,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     duckdb::LogicalOperator& op,
     duckdb::unique_ptr<sirius_physical_operator> left,
     duckdb::unique_ptr<sirius_physical_operator> right,
-    duckdb::vector<duckdb::JoinCondition> cond,
+    duckdb::vector<sirius::join_condition> cond,
     duckdb::JoinType join_type,
     const duckdb::vector<std::size_t>& left_projection_map,
     const duckdb::vector<std::size_t>& right_projection_map,
@@ -75,12 +75,12 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     duckdb::LogicalOperator& op,
     duckdb::unique_ptr<sirius_physical_operator> left,
     duckdb::unique_ptr<sirius_physical_operator> right,
-    duckdb::vector<duckdb::JoinCondition> cond,
+    duckdb::vector<sirius::join_condition> cond,
     duckdb::JoinType join_type,
     std::size_t estimated_cardinality,
     uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES);
 
-  duckdb::vector<duckdb::JoinCondition> conditions;
+  duckdb::vector<sirius::join_condition> conditions;
   //! Scans where we should push generated filters into (if any)
   duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> filter_pushdown;
 
@@ -119,7 +119,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
    * condition on the same side — cuDF's mixed_join API requires disjoint equality and
    * conditional table columns.
    */
-  static bool are_conditions_supported(duckdb::vector<duckdb::JoinCondition>& conditions);
+  static bool are_conditions_supported(duckdb::vector<sirius::join_condition>& conditions);
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
@@ -129,7 +129,16 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// for small datasets).
   /// @param num_partitions
   /// @param build_side_bytes
-  void update_join_exec_mode(int num_partitions, uint64_t build_side_bytes);
+  /// @param build_foldable_to_single_batch True when the upstream pipeline can guarantee the
+  ///        build side will arrive as exactly one batch (typically because a downstream
+  ///        build-side CONCAT was configured with concat_all). BUILD_PROBE mode requires
+  ///        the build side to fold into a single batch — when this guarantee is absent the
+  ///        runtime-side build-batch invariant in get_next_task_input_data_for_build_probe
+  ///        would throw on otherwise-valid small-build joins that are still split into
+  ///        multiple batches, so BUILD_PROBE is not entered.
+  void update_join_exec_mode(int num_partitions,
+                             uint64_t build_side_bytes,
+                             bool build_foldable_to_single_batch);
 
   /// @brief True when this join runs in build-then-probe mode (see `update_join_exec_mode`).
   [[nodiscard]] bool is_build_probe_mode();
@@ -166,7 +175,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   std::unique_ptr<cudf::hash_join> _hash_table;  // hash object to be used in BUILD_PROBE mode
   std::unique_ptr<cudf::distinct_hash_join>
     _distinct_hash_table;  // used instead of _hash_table when build keys are proven unique
-  std::shared_ptr<::cucascade::data_batch>
+  std::optional<::cucascade::read_only_data_batch>
     _build_table;  // owned build table for BUILD_PROBE mode, to materialize build side results
   std::vector<std::unique_ptr<cudf::column>>
     _built_table_cast_columns;  // scope holder for any columns that may have had to be cast for the
@@ -194,7 +203,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   // Sink Interface
   bool is_sink() const override { return true; }
 
-  void finalize_operator() override;
+  void on_finalize_operator() override;
 };
 
 }  // namespace op

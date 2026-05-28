@@ -38,6 +38,7 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
 
   PhysicalSiriusExecution(duckdb::PhysicalPlan& physical_plan,
                           duckdb::unique_ptr<duckdb::LogicalOperator> logical_plan,
+                          std::string query_sql,
                           duckdb::vector<duckdb::LogicalType> types,
                           duckdb::vector<std::string> names,
                           duckdb::idx_t estimated_cardinality);
@@ -58,7 +59,20 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
   /// A reusable copy of the optimized logical plan.
   /// DuckDB can execute the same prepared physical operator multiple times, so
   /// we rebuild a fresh Sirius physical plan from this template for each run.
-  duckdb::unique_ptr<duckdb::LogicalOperator> logical_plan_;
+  /// May be null when the plan contains a non-Copy()-able LogicalGet (e.g.
+  /// iceberg_scan) — in that case we fall back to re-planning from
+  /// `unbound_statement_`.
+  /// Mutable: GetDataInternal is `const` per the DuckDB interface, but on the
+  /// first execute we may discover Copy() throws and need to clear this so
+  /// future executes skip straight to the replan path.
+  mutable duckdb::unique_ptr<duckdb::LogicalOperator> logical_plan_;
+
+  /// Original SQL string used to re-plan when `logical_plan_` cannot be
+  /// copied (e.g. queries against table functions whose bind_data does not
+  /// implement serialization). Captured up-front because
+  /// PreparedStatementData::unbound_statement is not yet populated when
+  /// OnFinalizePrepare runs.
+  std::string query_sql_;
 
   /// Output column names (needed for result construction).
   duckdb::vector<std::string> result_names_;

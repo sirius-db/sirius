@@ -17,10 +17,15 @@
 #pragma once
 
 #include "catch.hpp"
+
+#ifdef SIRIUS_ENABLE_LEGACY
 #include "gpu_buffer_manager.hpp"
 #include "gpu_columns.hpp"
+#endif
 #include "sirius_context.hpp"
 #include "sirius_test_env.hpp"
+
+#include <cudf/table/table.hpp>
 
 #include <data/sirius_converter_registry.hpp>
 #include <duckdb.hpp>
@@ -34,6 +39,7 @@
 
 namespace duckdb {
 
+#ifdef SIRIUS_ENABLE_LEGACY
 // The buffer manager is shared across all threads so we need to allocate the memory needed by all
 // tests upfront when initializing the buffer manager
 constexpr size_t TEST_BUFFER_MANAGER_MEMORY_BYTES = 2L * 1024L * 1024L * 1024L;  // 2 GB for testing
@@ -73,6 +79,7 @@ shared_ptr<GPUColumn> create_column_with_random_data(GPUColumnTypeId col_type,
                                                      size_t chars_per_record        = 1,
                                                      size_t num_materialize_row_ids = 0,
                                                      bool has_null_mask             = false);
+#endif
 
 }  // namespace duckdb
 

@@ -26,10 +26,10 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
-#include "expression_executor/gpu_dispatcher.hpp"
-#include "expression_executor/gpu_expression_executor.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "gpu_columns.hpp"
+#include "legacy/expression_executor/gpu_dispatcher.hpp"
+#include "legacy/expression_executor/gpu_expression_executor.hpp"
 #include "log/logging.hpp"
 #include "operator/gpu_materialize.hpp"
 #include "utils.hpp"
@@ -1898,7 +1898,7 @@ SourceResultType GPUPhysicalTableScan::GetData(GPUIntermediateRelation& output_r
         }
 
         // Create and execute the expression
-        sirius::GpuExpressionExecutor executor(*filter_expr, gpuBufferManager->mr);
+        sirius::GpuExpressionExecutor executor(*filter_expr, gpuBufferManager->get_mr_ref());
         executor.SetInputColumns(filter_input_relation);
 
         // Execute the boolean filter expression
@@ -1912,7 +1912,7 @@ SourceResultType GPUPhysicalTableScan::GetData(GPUIntermediateRelation& output_r
 
         // Convert boolean bitmap to row_ids using DispatchSelect
         auto [selected_row_ids, selected_count] =
-          sirius::GpuDispatcher::DispatchSelect(bitmap->view(), gpuBufferManager->mr);
+          sirius::GpuDispatcher::DispatchSelect(bitmap->view(), gpuBufferManager->get_mr_ref());
         row_ids  = selected_row_ids;
         count    = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         count[0] = selected_count;

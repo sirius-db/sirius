@@ -85,7 +85,7 @@ inline cucascade::memory::memory_space* get_default_gpu_space()
 }
 inline rmm::device_async_resource_ref get_resource_ref(cucascade::memory::memory_space& space)
 {
-  return rmm::to_device_async_resource_ref_checked(space.get_default_allocator());
+  return space.get_default_allocator();
 }
 
 inline rmm::cuda_stream_view default_stream() { return cudf::get_default_stream(); }
@@ -113,8 +113,7 @@ inline std::shared_ptr<cucascade::data_batch> concatenate_batches_horizontal(
   std::vector<std::unique_ptr<cudf::column>> all_columns;
 
   for (const auto& batch : batches) {
-    auto& table     = batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
-    auto table_view = table.view();
+    auto table_view = sirius::get_cudf_table_view(*batch);
 
     // Release and collect each column from this table
     for (cudf::size_type i = 0; i < table_view.num_columns(); ++i) {
@@ -127,8 +126,8 @@ inline std::shared_ptr<cucascade::data_batch> concatenate_batches_horizontal(
   auto concatenated_table = std::make_unique<cudf::table>(std::move(all_columns));
 
   // Create and return new data_batch
-  auto gpu_repr =
-    std::make_unique<cucascade::gpu_table_representation>(std::move(concatenated_table), space);
+  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
+    std::move(concatenated_table), space, stream);
   auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<cucascade::data_batch>(batch_id, std::move(gpu_repr));
 }
@@ -207,7 +206,8 @@ inline std::shared_ptr<cucascade::data_batch> make_numeric_batch(
   cols.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
-  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(std::move(table), space);
+  auto gpu_repr =
+    std::make_unique<cucascade::gpu_table_representation>(std::move(table), space, stream);
   auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<cucascade::data_batch>(batch_id, std::move(gpu_repr));
 }
@@ -272,7 +272,8 @@ inline std::shared_ptr<cucascade::data_batch> make_string_batch(
   cols.push_back(make_string_column(values, stream, mr));
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
-  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(std::move(table), space);
+  auto gpu_repr =
+    std::make_unique<cucascade::gpu_table_representation>(std::move(table), space, stream);
   auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<cucascade::data_batch>(batch_id, std::move(gpu_repr));
 }
@@ -298,7 +299,8 @@ inline std::shared_ptr<cucascade::data_batch> make_decimal64_batch(
   cols.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
-  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(std::move(table), space);
+  auto gpu_repr =
+    std::make_unique<cucascade::gpu_table_representation>(std::move(table), space, stream);
   auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<cucascade::data_batch>(batch_id, std::move(gpu_repr));
 }
@@ -331,7 +333,8 @@ inline std::shared_ptr<cucascade::data_batch> make_timestamp_batch(
   cols.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
-  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(std::move(table), space);
+  auto gpu_repr =
+    std::make_unique<cucascade::gpu_table_representation>(std::move(table), space, stream);
   auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<cucascade::data_batch>(batch_id, std::move(gpu_repr));
 }
@@ -427,7 +430,8 @@ inline std::shared_ptr<cucascade::data_batch> make_two_column_batch(
   cols.push_back(std::move(col1));
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
-  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(std::move(table), space);
+  auto gpu_repr =
+    std::make_unique<cucascade::gpu_table_representation>(std::move(table), space, stream);
   auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<cucascade::data_batch>(batch_id, std::move(gpu_repr));
 }

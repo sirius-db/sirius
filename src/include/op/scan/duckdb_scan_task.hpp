@@ -24,10 +24,10 @@
 #include <op/sirius_physical_duckdb_scan.hpp>
 #include <op/sirius_physical_table_scan.hpp>
 #include <parallel/task.hpp>
-#include <pipeline/pipeline_executor.hpp>
 #include <pipeline/sirius_pipeline.hpp>
 #include <pipeline/sirius_pipeline_itask.hpp>
 #include <pipeline/sirius_pipeline_task_states.hpp>
+#include <pipeline/task_scheduler.hpp>
 #include <sirius_config.hpp>
 #include <sirius_context.hpp>
 
@@ -75,7 +75,7 @@ class duckdb_scan_task_global_state : public pipeline::sirius_pipeline_task_glob
    * @param[in] gpu_pts The GPU physical table scan being executed
    */
   duckdb_scan_task_global_state(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
-                                pipeline::pipeline_executor& pipeline_exec,
+                                pipeline::task_scheduler& pipeline_exec,
                                 duckdb::ClientContext& client_ctx,
                                 sirius_physical_duckdb_scan* scan_op);
 
@@ -135,8 +135,7 @@ class duckdb_scan_task_global_state : public pipeline::sirius_pipeline_task_glob
   std::vector<sirius_physical_operator*> get_output_consumers() const noexcept
   {
     std::vector<sirius_physical_operator*> output_consumers;
-    auto ports = _op.get_next_port_after_sink();
-    for (auto& next_port : ports) {
+    for (const auto& next_port : _op.get_next_ports_after_sink()) {
       output_consumers.push_back(next_port.next_operator);
     }
     return output_consumers;
@@ -172,11 +171,10 @@ class duckdb_scan_task_global_state : public pipeline::sirius_pipeline_task_glob
   //===----------Fields----------===//
   duckdb::SiriusContext* _sirius_ctx;  ///< The Sirius context
   std::unique_ptr<duckdb::GlobalTableFunctionState>
-    _global_tf_state;  ///< Global state for the table function
-  pipeline::pipeline_executor&
-    _pipeline_executor;                      ///< The pipeline executor for scheduling scan tasks
-  sirius_physical_duckdb_scan& _op;          ///< The physical table scan being executed
-  std::atomic<bool> _source_drained{false};  ///< Whether the table scan source is fully drained
+    _global_tf_state;                            ///< Global state for the table function
+  pipeline::task_scheduler& _task_scheduler;     ///< The task scheduler for scheduling scan tasks
+  sirius_physical_duckdb_scan& _op;              ///< The physical table scan being executed
+  std::atomic<bool> _source_drained{false};      ///< Whether the table scan source is fully drained
   std::atomic<int64_t> _active_local_states{0};  ///< Number of active local table function states
   uint64_t _max_threads;                         ///< Maximum number of threads for this scan task
 };
@@ -441,6 +439,7 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
       _data_repo(data_repo)
   {
     g_state->_total_task_count.fetch_add(1);
+    if (g_state->get_pipeline()) { g_state->get_pipeline()->mark_task_created(); }
   };
 
   //===----------Destructor----------===//
@@ -517,7 +516,8 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
    */
   void publish_output(op::operator_data& output_data, rmm::cuda_stream_view stream) override;
 
-  [[nodiscard]] std::size_t get_estimated_reservation_size() const override;
+  [[nodiscard]] pipeline::reservation_size_info get_estimated_reservation_size_info()
+    const override;
 
   /// @brief Get the output consumer operators for this task.
   std::vector<op::sirius_physical_operator*> get_output_consumers() override

@@ -21,7 +21,8 @@ MAIN_BUILD_TARGETS ?= duckdb duckdb_local_extension_repo
 	legacy-release \
 	clang-release clang-debug clang-relwithdebinfo \
 	ci-release configure_ci set_duckdb_version \
-	test test_release test_debug test_reldebug clean list-presets
+	test test_release test_debug test_reldebug test_ci-release clean list-presets \
+	s3-up s3-down s3-test s3-cpp-test s3-bench s3-bench-fixtures
 
 PRESETS_LINK := $(DUCKDB_DIR)/CMakePresets.json
 
@@ -65,15 +66,27 @@ legacy-release: build/legacy-release/build.ninja
 
 clang-release: build/clang-release/build.ninja
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-release --target $(MAIN_BUILD_TARGETS)
+ifneq ($(TEST_BUILD_TARGET),)
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-release --target $(TEST_BUILD_TARGET)
+endif
 
 clang-debug: build/clang-debug/build.ninja
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-debug --target $(MAIN_BUILD_TARGETS)
+ifneq ($(TEST_BUILD_TARGET),)
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-debug --target $(TEST_BUILD_TARGET)
+endif
 
 clang-relwithdebinfo: build/clang-relwithdebinfo/build.ninja
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-relwithdebinfo --target $(MAIN_BUILD_TARGETS)
+ifneq ($(TEST_BUILD_TARGET),)
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-relwithdebinfo --target $(TEST_BUILD_TARGET)
+endif
 
 ci-release: build/ci-release/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset ci-release
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset ci-release --target $(MAIN_BUILD_TARGETS)
+ifneq ($(TEST_BUILD_TARGET),)
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset ci-release --target $(TEST_BUILD_TARGET)
+endif
 
 configure_ci:
 	@echo "configure_ci step is skipped for this extension build..."
@@ -95,8 +108,83 @@ test_reldebug: relwithdebinfo
 	@echo "SQL logic tests use the legacy gpu_processing path and are skipped by default."
 	@echo "Run C++ unit tests with: ./build/relwithdebinfo/extension/sirius/test/cpp/sirius_unittest"
 
+test_ci-release: ci-release
+	@echo "SQL logic tests use the legacy gpu_processing path and are skipped by default."
+	@echo "Run C++ unit tests with: ./build/ci-release/extension/sirius/test/cpp/sirius_unittest"
+
 clean:
 	rm -rf build
 
 list-presets: $(PRESETS_LINK)
 	cd $(DUCKDB_DIR) && $(CMAKE) --list-presets
+
+# -----------------------------------------------------------------------------
+# S3 integration test scaffolding
+# -----------------------------------------------------------------------------
+# `make s3-up`        starts the pinned MinIO container and populates fixtures
+#                     (binary blobs plus the standard integration parquet
+#                     fixtures under test/cpp/integration/data/parquet).
+# `make s3-down`      tears it down (including the data volume).
+# `make s3-test`      alias for `s3-cpp-test`; kept for forward compatibility
+#                     if SQL-level integration returns via a new target later.
+# `make s3-cpp-test`  runs the Catch2 [s3][integration] tag, which also
+#                     selects tests tagged [s3][parquet][integration].
+#
+# See test/cpp/integration/s3/README.md for details.
+
+S3_DIR := test/cpp/integration/s3
+S3_COMPOSE := $(S3_DIR)/docker-compose.yml
+S3_TEST_BIN ?= build/release/extension/sirius/test/cpp/sirius_unittest
+
+s3-up:
+	docker compose -f $(S3_COMPOSE) up -d
+	$(S3_DIR)/fixtures.sh
+
+s3-down:
+	docker compose -f $(S3_COMPOSE) down -v
+
+s3-test: SHELL := /bin/bash
+s3-test: s3-cpp-test
+
+s3-cpp-test: SHELL := /bin/bash
+s3-cpp-test:
+	@if [ ! -x $(S3_TEST_BIN) ]; then \
+	  echo "s3-cpp-test: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
+	  exit 1; \
+	fi
+	@source $(S3_DIR)/env.sh && export SIRIUS_TEST_S3_STRICT=1 && $(S3_TEST_BIN) "[s3][integration]"
+
+# -----------------------------------------------------------------------------
+# S3 perf benchmark (Catch2 [!benchmark][perf][bench] hidden tag - not in the
+# default CI suite, and deliberately NOT tagged [s3] so the [s3] integration
+# gate does not pull the benchmark in). `make s3-bench-fixtures` runs
+# fixtures.sh --perf, which first uploads the standard fixtures and then adds
+# the SF10 lineitem parquet. Generates a JSON record under
+# build/release/extension/sirius/test/cpp/log/perf_<ts>.json for tracking.
+# Override SIRIUS_BENCH_BACKEND=aws-s3 to portably hit AWS instead of MinIO;
+# see test/cpp/integration/s3/fixtures/README.md for the env-var contract.
+
+s3-bench-fixtures: SHELL := /bin/bash
+s3-bench-fixtures:
+	@if [ ! -x $(S3_DIR)/fixtures.sh ]; then \
+	  echo "s3-bench-fixtures: $(S3_DIR)/fixtures.sh not executable" >&2; \
+	  exit 1; \
+	fi
+	@$(S3_DIR)/fixtures.sh --perf
+
+s3-bench: SHELL := /bin/bash
+s3-bench:
+	@if [ ! -x $(S3_TEST_BIN) ]; then \
+	  echo "s3-bench: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
+	  exit 1; \
+	fi
+	@if [ "$${SIRIUS_BENCH_BACKEND:-minio}" = "minio" ]; then \
+	  source $(S3_DIR)/env.sh; \
+	  export SIRIUS_BENCH_S3_ENDPOINT="$${SIRIUS_BENCH_S3_ENDPOINT:-$$SIRIUS_TEST_S3_ENDPOINT}"; \
+	  export SIRIUS_BENCH_S3_REGION="$${SIRIUS_BENCH_S3_REGION:-$$SIRIUS_TEST_S3_REGION}"; \
+	  export SIRIUS_BENCH_S3_ACCESS_KEY="$${SIRIUS_BENCH_S3_ACCESS_KEY:-$$SIRIUS_TEST_S3_ACCESS_KEY}"; \
+	  export SIRIUS_BENCH_S3_SECRET_KEY="$${SIRIUS_BENCH_S3_SECRET_KEY:-$$SIRIUS_TEST_S3_SECRET_KEY}"; \
+	  export SIRIUS_BENCH_S3_BUCKET="$${SIRIUS_BENCH_S3_BUCKET:-$$SIRIUS_TEST_S3_BUCKET}"; \
+	fi; \
+	export SIRIUS_BENCH_GIT_SHA="$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"; \
+	$(S3_TEST_BIN) "[!benchmark][perf][bench]"

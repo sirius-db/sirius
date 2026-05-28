@@ -18,9 +18,8 @@
 #include "creator/task_creator.hpp"
 #include "exec/config.hpp"
 #include "op/sirius_physical_operator.hpp"
-#include "pipeline/pipeline_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
-#include "sirius_interface.hpp"
+#include "pipeline/task_scheduler.hpp"
 
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
@@ -99,7 +98,10 @@ class mock_sirius_physical_operator : public sirius_physical_operator {
  */
 class mock_gpu_pipeline : public sirius_pipeline {
  public:
-  explicit mock_gpu_pipeline(sirius_engine& engine) : sirius_pipeline(engine), _finished(false) {}
+  explicit mock_gpu_pipeline(const pipeline::pipeline_build_context& ctx)
+    : sirius_pipeline(ctx), _finished(false)
+  {
+  }
 
   void set_finished(bool finished) { _finished = finished; }
 
@@ -112,16 +114,15 @@ class mock_gpu_pipeline : public sirius_pipeline {
 /**
  * @brief A mock GPU pipeline for testing.
  *
- * This requires a sirius_engine reference, so we use a factory pattern
- * to create test pipelines when we have the necessary context.
+ * This sets up ports directly on operators to control get_next_task_hint()
+ * behavior.
  */
 class mock_pipeline_builder {
  public:
   /**
    * @brief Create a mock pipeline with specified source and operators.
    *
-   * Since sirius_pipeline requires sirius_engine, we set up ports directly
-   * on operators to control get_next_task_hint() behavior.
+   * The tests only need operator ports, not fully converted pipelines.
    */
   static void setup_operator_with_pipeline_port(mock_sirius_physical_operator& op,
                                                 const std::string& port_id,
@@ -153,14 +154,14 @@ class testable_task_creator : public task_creator {
  public:
   testable_task_creator(int num_threads,
                         duckdb::ClientContext& client_context,
-                        pipeline_executor& pipeline_executor,
+                        task_scheduler& task_sched,
                         sirius::memory::sirius_memory_reservation_manager& mem_res_mgr)
     : task_creator(
         exec::thread_pool_config{.num_threads = num_threads, .thread_name_prefix = "task_creator"},
         mem_res_mgr)
   {
     this->set_client_context(client_context);
-    this->set_pipeline_executor(pipeline_executor);
+    this->set_task_scheduler(task_sched);
   }
 
   void schedule(op::sirius_physical_operator* request) override
@@ -219,8 +220,6 @@ class test_fixture {
   test_fixture()
     : db(nullptr),
       con(db),
-      sirius_iface(*con.context),
-      engine(*con.context, sirius_iface),
       memory_manager([] {
         cucascade::memory::reservation_manager_configurator builder;
         const size_t gpu_capacity  = 2ull << 27;
@@ -251,15 +250,14 @@ class test_fixture {
    */
   duckdb::shared_ptr<mock_gpu_pipeline> create_mock_pipeline()
   {
-    return duckdb::make_shared_ptr<mock_gpu_pipeline>(engine);
+    return duckdb::make_shared_ptr<mock_gpu_pipeline>(build_ctx);
   }
 
   duckdb::DuckDB db;
   duckdb::Connection con;
-  sirius_interface sirius_iface;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager;
-  sirius_engine engine;
-  pipeline_executor pipeline_exec;
+  pipeline::pipeline_build_context build_ctx{true};
+  task_scheduler pipeline_exec;
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> empty_pipelines;
 };
 
@@ -435,7 +433,7 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
 //   // When hint is a pipeline, process_next_task should call itself with
 //   // pipeline->GetInnerOperators()[0]
 //   //
-//   // Since sirius_pipeline requires sirius_engine and complex setup, we test this
+//   // Since sirius_pipeline requires non-trivial setup, we test this
 //   // behavior indirectly by verifying that the source operator's
 //   // get_next_task_hint() is called and the scheduling logic follows through.
 

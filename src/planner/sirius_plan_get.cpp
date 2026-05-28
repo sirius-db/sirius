@@ -14,15 +14,18 @@
  * limitations under the License.
  */
 
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "expression/expression.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_projection.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
-// #include "duckdb/common/types.hpp"
+
+#include <unordered_set>
 
 namespace sirius::planner {
 
@@ -54,6 +57,15 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   SIRIUS_LOG_INFO("[sirius_plan_get] create_plan for LogicalGet: function={}, bind_data={}, column_ids={}",
                   op.function.name, (op.bind_data ? "present" : "NULL"), op.GetColumnIds().size());
   auto column_ids = op.GetColumnIds();
+
+  // Only GPU-route known table scan functions; all others (pragma, system catalog
+  // functions, etc.) must fall back to CPU.
+  static const std::unordered_set<std::string> kSupportedScanFunctions = {
+    "seq_scan", "parquet_scan", "read_parquet", "iceberg_scan"};
+  if (kSupportedScanFunctions.find(op.function.name) == kSupportedScanFunctions.end()) {
+    throw duckdb::NotImplementedException("Table function '{}' is not supported in Sirius",
+                                          op.function.name);
+  }
 
   if (!op.children.empty()) {
     throw duckdb::NotImplementedException("Table Input Output functions are not supported yet");
@@ -138,8 +150,22 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         auto column_id = column_ids[c].GetPrimaryIndex();
         filter_types.push_back(op.returned_types[column_id]);
       }
-      filter = duckdb::make_uniq<sirius::op::sirius_physical_filter>(
-        sirius::from_duckdb_vec(filter_types), std::move(select_list), op.estimated_cardinality);
+      // sirius_physical_filter owns a single expression; AND-merge predicates when there are many.
+      duckdb::unique_ptr<duckdb::Expression> combined;
+      if (select_list.size() > 1) {
+        auto conjunction = duckdb::make_uniq<duckdb::BoundConjunctionExpression>(
+          duckdb::ExpressionType::CONJUNCTION_AND);
+        for (auto& expr : select_list) {
+          conjunction->children.push_back(std::move(expr));
+        }
+        combined = std::move(conjunction);
+      } else {
+        combined = std::move(select_list[0]);
+      }
+      filter =
+        duckdb::make_uniq<sirius::op::sirius_physical_filter>(sirius::from_duckdb_vec(filter_types),
+                                                              sirius::wrap(std::move(combined)),
+                                                              op.estimated_cardinality);
     }
   }
   op.ResolveOperatorTypes();
@@ -159,6 +185,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       std::move(op.extra_info),
       std::move(op.parameters),
       std::move(op.virtual_columns));
+    node->named_parameters = std::move(op.named_parameters);
     // first check if an additional projection is necessary
     if (column_ids.size() == op.returned_types.size()) {
       bool projection_necessary = false;
@@ -193,7 +220,9 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     }
     duckdb::unique_ptr<sirius::op::sirius_physical_projection> projection =
       duckdb::make_uniq<sirius::op::sirius_physical_projection>(
-        sirius::from_duckdb_vec(types), std::move(expressions), op.estimated_cardinality);
+        sirius::from_duckdb_vec(types),
+        sirius::wrap_many(std::move(expressions)),
+        op.estimated_cardinality);
     if (filter) {
       filter->children.push_back(std::move(node));
       projection->children.push_back(std::move(filter));
@@ -216,7 +245,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     std::move(op.extra_info),
     std::move(op.parameters),
     std::move(op.virtual_columns));
-  node->dynamic_filters = op.dynamic_filters;
+  node->named_parameters = std::move(op.named_parameters);
+  node->dynamic_filters  = op.dynamic_filters;
   if (filter) {
     filter->children.push_back(std::move(node));
     return std::move(filter);

@@ -18,7 +18,6 @@
 
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/planner/bound_result_modifier.hpp"
-#include "duckdb/planner/expression.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 #include <atomic>

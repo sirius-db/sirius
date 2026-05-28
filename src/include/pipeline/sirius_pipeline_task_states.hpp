@@ -23,9 +23,24 @@
 #include <cucascade/memory/memory_reservation.hpp>
 
 #include <memory>
+#include <optional>
 
 namespace sirius {
 namespace pipeline {
+
+/**
+ * @brief Breakdown of a task's pre-execution memory reservation estimate.
+ *
+ * Computed by get_estimated_reservation_size_info() and cached on the local state via
+ * set_reservation() so that execute() can access all components without re-computing.
+ */
+struct reservation_size_info {
+  std::size_t input_basis                = 0;  ///< Estimation basis (e.g. input data size)
+  std::size_t bytes_to_materialize_input = 0;  ///< Cost to bring non-GPU input to GPU; 0 for scans
+  std::size_t peak_memory_estimate = 0;  ///< Predicted operator peak; 2*input_basis if no history
+  std::size_t reservation_size     = 0;  ///< peak_memory_estimate + bytes_to_materialize_input
+  bool had_history                 = false;  ///< True if estimate came from pipeline_memory_history
+};
 
 /**
  * @brief Global state shared across all GPU pipeline tasks in an execution context.
@@ -70,9 +85,27 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
   pipeline_memory_history& get_memory_history() { return _memory_history; }
   const pipeline_memory_history& get_memory_history() const { return _memory_history; }
 
+  /**
+   * @brief Set the preferred GPU device ID for this pipeline's tasks.
+   *
+   * This is a pipeline-level default that can be overridden per-task
+   * via gpu_pipeline_task_local_state::set_preferred_device_id().
+   *
+   * @param device_id The GPU device ID where data locality is highest
+   */
+  void set_preferred_device_id(int device_id) { _preferred_device_id = device_id; }
+
+  /**
+   * @brief Get the preferred GPU device ID for this pipeline's tasks.
+   *
+   * @return The preferred device ID, or std::nullopt if not set
+   */
+  [[nodiscard]] std::optional<int> get_preferred_device_id() const { return _preferred_device_id; }
+
  private:
   duckdb::shared_ptr<sirius_pipeline> _pipeline;  ///< Shared pointer to the GPU pipeline to execute
   pipeline_memory_history _memory_history;        ///< Historical memory metrics for estimation
+  std::optional<int> _preferred_device_id;        ///< Pipeline-level preferred GPU device
 };
 
 /**
@@ -122,7 +155,30 @@ class sirius_pipeline_task_local_state : public parallel::itask_local_state {
     }
   }
 
+  /**
+   * @brief Set a memory reservation and cache the pre-computed size breakdown.
+   *
+   * Combines set_reservation() with storing the reservation_size_info produced by
+   * get_estimated_reservation_size_info(), so execute() can read all estimation
+   * components from _reservation_size_info without re-computing them.
+   *
+   * @param res  The memory reservation to set (ownership transferred to the task)
+   * @param info The pre-computed reservation size breakdown
+   */
+  void set_reservation(std::unique_ptr<cucascade::memory::reservation> res,
+                       reservation_size_info info)
+  {
+    set_reservation(std::move(res));
+    _reservation_size_info = info;
+  }
+
   [[nodiscard]] std::size_t get_reservation_bytes() const { return _reservation_bytes; }
+
+  [[nodiscard]] const std::optional<reservation_size_info>& get_reservation_size_info()
+    const noexcept
+  {
+    return _reservation_size_info;
+  }
 
   /**
    * @brief Non-owning accessor for the held reservation.
@@ -153,7 +209,8 @@ class sirius_pipeline_task_local_state : public parallel::itask_local_state {
 
   std::unique_ptr<cucascade::memory::reservation>
     _reservation;  ///< Memory reservation for GPU resources
-  std::size_t _reservation_bytes;
+  std::size_t _reservation_bytes = 0;
+  std::optional<reservation_size_info> _reservation_size_info;  ///< Cached estimation breakdown
 };
 
 }  // namespace pipeline

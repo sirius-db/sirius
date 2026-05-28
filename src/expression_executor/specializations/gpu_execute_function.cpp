@@ -15,18 +15,16 @@
  */
 
 // sirius
-#include "duckdb/common/types.hpp"
-
-#include <expression_executor/gpu_dispatcher.hpp>
+#include <expression/function_id.hpp>
+#include <expression_executor/ast_supported_types.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
-#include <expression_executor/gpu_expression_executor_state.hpp>
 #include <expression_executor/regex/regex_playground.hpp>
-#include <operator/gpu_physical_strings_matching.hpp>
-#include <operator/strlen_from_offsets.cuh>
+#include <sirius/exception.hpp>
 
 // duckdb
 #include <duckdb/common/assert.hpp>
 #include <duckdb/common/exception.hpp>
+#include <duckdb/common/types.hpp>
 #include <duckdb/planner/expression/bound_constant_expression.hpp>
 #include <duckdb/planner/expression/bound_function_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
@@ -50,83 +48,27 @@
 #include <regex>
 #include <string>
 
-// There has to be a better way to extract the function semantics than string comparison!
-//----------Function Strings----------//
-#define ADD_FUNC_STR            "+"
-#define SUB_FUNC_STR            "-"
-#define MUL_FUNC_STR            "*"
-#define DIV_FUNC_STR            "/"
-#define INT_DIV_FUNC_STR        "//"
-#define MOD_FUNC_STR            "%"
-#define SUBSTRING_FUNC_STR_1    "substring"
-#define SUBSTRING_FUNC_STR_2    "substr"
-#define LIKE_FUNC_STR           "~~"
-#define NOT_LIKE_FUNC_STR       "!~~"
-#define CONTAINS_FUNC_STR       "contains"
-#define PREFIX_FUNC_STR         "prefix"
-#define SUFFIX_FUNC_STR         "suffix"
-#define YEAR_FUNC_STR           "year"
-#define MONTH_FUNC_STR          "month"
-#define DAY_FUNC_STR            "day"
-#define HOUR_FUNC_STR           "hour"
-#define MINUTE_FUNC_STR         "minute"
-#define SECOND_FUNC_STR         "second"
-#define MILLISECOND_FUNC_STR    "millisecond"
-#define MICROSECOND_FUNC_STR    "microsecond"
-#define DATE_TRUNC_FUNC_STR     "date_trunc"
-#define STRLEN_FUNC_STR         "strlen"
-#define LENGTH_FUNC_STR         "length"
-#define REGEXP_REPLACE_FUNC_STR "regexp_replace"
-#define ERROR_FUNC_STR          "error"
-#define ROW_FUNC_STR            "row"
-#define STRUCT_PACK_FUNC_STR    "struct_pack"
-
-#define SPLIT_DELIMITER "%"  // These are not used in new expression executor
-#define WARP_SIZE       32
-
-namespace sirius::experimental {
+namespace sirius {
 using execute_result = gpu_expression_executor::execute_result;
-
-namespace {
-[[nodiscard]] bool is_add_function(std::string_view function_name)
-{
-  return function_name == ADD_FUNC_STR || function_name == "add";
-}
-
-[[nodiscard]] bool is_subtract_function(std::string_view function_name)
-{
-  return function_name == SUB_FUNC_STR || function_name == "subtract";
-}
-
-[[nodiscard]] bool is_multiply_function(std::string_view function_name)
-{
-  return function_name == MUL_FUNC_STR || function_name == "multiply";
-}
-
-[[nodiscard]] bool is_divide_function(std::string_view function_name)
-{
-  return function_name == DIV_FUNC_STR || function_name == INT_DIV_FUNC_STR ||
-         function_name == "divide";
-}
-
-[[nodiscard]] bool is_modulo_function(std::string_view function_name)
-{
-  return function_name == MOD_FUNC_STR || function_name == "mod" ||
-         function_name == "modulus";
-}
-}  // namespace
 
 execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression const& expr,
                                                 execution_mode mode)
 {
-  auto const& func_string = expr.function.name;
+  auto const& func_string    = expr.function.name;
+  auto const resolved_id_opt = sirius::from_duckdb_function_name(func_string);
+  if (!resolved_id_opt.has_value()) {
+    throw not_implemented_exception(
+      "[gpu_expression_executor:function] execute called on unsupported function: {}", func_string);
+  }
+  auto const resolved_id = *resolved_id_opt;
+
   /// We disable AST if the output type is decimal, since cuDF ASTs choke on intermediate decimal
   /// results currently.
   /// TODO: Fix when the following bug fix is in:
   /// https://github.com/rapidsai/cudf/pull/21996
   auto const ast_supported =
     (expr.return_type.id() != duckdb::LogicalTypeId::DECIMAL) &&
-    (std::find(supported_ast_functions.begin(), supported_ast_functions.end(), func_string) !=
+    (std::find(supported_ast_functions.begin(), supported_ast_functions.end(), resolved_id) !=
      supported_ast_functions.end());
 
   if (ast_supported && _strategy != expression_executor_strategy::MATERIALIZE &&
@@ -134,28 +76,25 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
     // Only numeric binary functions are supported in AST currently
     D_ASSERT(expr.children.size() == 2);
 
-    auto function_type_switch_ast =
-      [](std::string const& function_name) -> cudf::ast::ast_operator {
-      if (is_add_function(function_name)) {
-        return cudf::ast::ast_operator::ADD;
-      } else if (is_subtract_function(function_name)) {
-        return cudf::ast::ast_operator::SUB;
-      } else if (is_multiply_function(function_name)) {
-        return cudf::ast::ast_operator::MUL;
-      } else if (is_divide_function(function_name)) {
-        return cudf::ast::ast_operator::DIV;
-      } else if (is_modulo_function(function_name)) {
-        return cudf::ast::ast_operator::MOD;
-      } else {
-        throw duckdb::InternalException(
-          "[gpu_expression_executor:function] unsupported AST function type {}", function_name);
+    auto function_type_switch_ast = [](function_id id) -> cudf::ast::ast_operator {
+      switch (id) {
+        case function_id::add: return cudf::ast::ast_operator::ADD;
+        case function_id::sub: return cudf::ast::ast_operator::SUB;
+        case function_id::mul: return cudf::ast::ast_operator::MUL;
+        case function_id::div:
+        case function_id::int_div: return cudf::ast::ast_operator::DIV;
+        case function_id::mod: return cudf::ast::ast_operator::MOD;
+        default:
+          throw invalid_input_exception(
+            "[gpu_expression_executor:function] unsupported AST function type {}",
+            to_duckdb_function_name(id));
       }
     };
 
     auto left             = execute(*expr.children[0], execution_mode::AST);
     auto right            = execute(*expr.children[1], execution_mode::AST);
     auto const& func_expr = _ast_tree.emplace<cudf::ast::operation>(
-      function_type_switch_ast(func_string), left.get_expr(), right.get_expr());
+      function_type_switch_ast(resolved_id), left.get_expr(), right.get_expr());
 
     if (mode == execution_mode::AST) {
       //===----------1: AST Mode----------===//
@@ -179,13 +118,17 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
   // If the caller requested AST mode but we fell through (unsupported function for AST),
   // materialize the result and wrap it as a temp column for the parent's AST tree.
   if (mode == execution_mode::AST) {
+    // Re-enter execute with MATERIALIZE mode to get the result as a column, then add to the AST
+    // tree.
     auto result = execute(expr, execution_mode::MATERIALIZE);
-    if (result.is_scalar()) {
-      return materialize_as_ast_column(
-        cudf::make_column_from_scalar(result.get_scalar(), _input_table.num_rows(), _stream, _mr));
+    if (!result.is_owned_column()) {
+      // Any function execution in MATERIALIZE mode should produce an owned column. Otherwise,
+      // something went wrong.
+      throw internal_exception(
+        "[gpu_expression_executor:function]: Expected an owned column after executing function "
+        "expression.");
     }
-    return materialize_as_ast_column(
-      std::make_unique<cudf::column>(result.get_column_view(), _stream, _mr));
+    return materialize_as_ast_column(std::move(result.release_column()));
   }
   auto const output_type = GetCudfType(expr.return_type);
 
@@ -205,24 +148,24 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
     return execute_result(cudf::binary_operation(
       left.get_column_view(), right.get_column_view(), op, output_type, _stream, _mr));
   };
-  if (is_add_function(func_string)) {
+  if (resolved_id == function_id::add) {
     return execute_numeric_binary_func(cudf::binary_operator::ADD);
   }
-  if (is_subtract_function(func_string)) {
+  if (resolved_id == function_id::sub) {
     return execute_numeric_binary_func(cudf::binary_operator::SUB);
   }
-  if (is_multiply_function(func_string)) {
+  if (resolved_id == function_id::mul) {
     return execute_numeric_binary_func(cudf::binary_operator::MUL);
   }
-  if (is_divide_function(func_string)) {
+  if (resolved_id == function_id::div || resolved_id == function_id::int_div) {
     return execute_numeric_binary_func(cudf::binary_operator::DIV);
   }
-  if (is_modulo_function(func_string)) {
+  if (resolved_id == function_id::mod) {
     return execute_numeric_binary_func(cudf::binary_operator::MOD);
   }
 
   //----------Substring Function----------//
-  if (func_string == SUBSTRING_FUNC_STR_1 || func_string == SUBSTRING_FUNC_STR_2) {
+  if (resolved_id == function_id::substring) {
     auto input = execute(*expr.children[0], execution_mode::MATERIALIZE);
 
     // The start and len arguments of SUBSTRING are assumed to be constants
@@ -240,7 +183,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
       cudf::strings::slice_strings(cudf::strings_column_view(input.get_column_view()),
                                    cudf::numeric_scalar(start_val, true, _stream, _mr),
                                    cudf::numeric_scalar(stop_val, true, _stream, _mr),
-                                   1,
+                                   cudf::numeric_scalar<cudf::size_type>(1, true, _stream, _mr),
                                    _stream,
                                    _mr);
     return execute_result(std::move(result_column));
@@ -257,20 +200,20 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
     auto match_str             = match_str_expr.value.GetValue<std::string>();
     return {execute_result(std::move(input)), std::move(match_str)};
   };
-  if (func_string == LIKE_FUNC_STR || func_string == NOT_LIKE_FUNC_STR) {
+  if (resolved_id == function_id::like || resolved_id == function_id::not_like) {
     auto [input, match_str] = setup_string_matching();
     auto result_column = cudf::strings::like(cudf::strings_column_view(input.get_column_view()),
                                              std::string_view(match_str),
                                              std::string_view(),
                                              _stream,
                                              _mr);
-    if (func_string == NOT_LIKE_FUNC_STR) {
+    if (resolved_id == function_id::not_like) {
       result_column =
         cudf::unary_operation(result_column->view(), cudf::unary_operator::NOT, _stream, _mr);
     }
     return execute_result(std::move(result_column));
   }
-  if (func_string == CONTAINS_FUNC_STR) {
+  if (resolved_id == function_id::contains) {
     auto [input, match_str] = setup_string_matching();
     auto result_column = cudf::strings::contains(cudf::strings_column_view(input.get_column_view()),
                                                  cudf::string_scalar(match_str, true, _stream, _mr),
@@ -278,7 +221,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
                                                  _mr);
     return execute_result(std::move(result_column));
   }
-  if (func_string == PREFIX_FUNC_STR) {
+  if (resolved_id == function_id::prefix) {
     auto [input, match_str] = setup_string_matching();
     auto result_column =
       cudf::strings::starts_with(cudf::strings_column_view(input.get_column_view()),
@@ -287,7 +230,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
                                  _mr);
     return execute_result(std::move(result_column));
   }
-  if (func_string == SUFFIX_FUNC_STR) {
+  if (resolved_id == function_id::suffix) {
     auto [input, match_str] = setup_string_matching();
     auto result_column =
       cudf::strings::ends_with(cudf::strings_column_view(input.get_column_view()),
@@ -306,33 +249,33 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
       cudf::datetime::extract_datetime_component(input.get_column_view(), component, _stream, _mr);
     return execute_result(std::move(result_column));
   };
-  if (func_string == YEAR_FUNC_STR) {
+  if (resolved_id == function_id::year) {
     return execute_datetime_extract_func(cudf::datetime::datetime_component::YEAR);
   }
-  if (func_string == MONTH_FUNC_STR) {
+  if (resolved_id == function_id::month) {
     return execute_datetime_extract_func(cudf::datetime::datetime_component::MONTH);
   }
-  if (func_string == DAY_FUNC_STR) {
+  if (resolved_id == function_id::day) {
     return execute_datetime_extract_func(cudf::datetime::datetime_component::DAY);
   }
-  if (func_string == HOUR_FUNC_STR) {
+  if (resolved_id == function_id::hour) {
     return execute_datetime_extract_func(cudf::datetime::datetime_component::HOUR);
   }
-  if (func_string == MINUTE_FUNC_STR) {
+  if (resolved_id == function_id::minute) {
     return execute_datetime_extract_func(cudf::datetime::datetime_component::MINUTE);
   }
-  if (func_string == SECOND_FUNC_STR) {
+  if (resolved_id == function_id::second) {
     return execute_datetime_extract_func(cudf::datetime::datetime_component::SECOND);
   }
-  if (func_string == MILLISECOND_FUNC_STR) {
+  if (resolved_id == function_id::millisecond) {
     return execute_datetime_extract_func(cudf::datetime::datetime_component::MILLISECOND);
   }
-  if (func_string == MICROSECOND_FUNC_STR) {
+  if (resolved_id == function_id::microsecond) {
     return execute_datetime_extract_func(cudf::datetime::datetime_component::MICROSECOND);
   }
 
   //----------Date Truncation Function----------//
-  if (func_string == DATE_TRUNC_FUNC_STR) {
+  if (resolved_id == function_id::date_trunc) {
     D_ASSERT(expr.children.size() == 2);
     // The first child is the frequency, which should be a constant string
     D_ASSERT(expr.children[0]->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT);
@@ -356,7 +299,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
       } else if (freq_str == "microsecond") {
         return cudf::datetime::rounding_frequency::MICROSECOND;
       } else {
-        throw duckdb::InternalException(
+        throw invalid_input_exception(
           "[gpu_expression_executor:function] unrecognized/unsupported date_trunc frequency: {}",
           freq_str);
       }
@@ -368,21 +311,21 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
   }
 
   //----------Unary Functions----------//
-  if (func_string == STRLEN_FUNC_STR) {
+  if (resolved_id == function_id::strlen) {
     D_ASSERT(expr.children.size() == 1);
     auto input = execute(*expr.children[0], execution_mode::MATERIALIZE);
     auto result_column =
       cudf::strings::count_bytes(cudf::strings_column_view(input.get_column_view()), _stream, _mr);
     return execute_result(std::move(result_column));
   }
-  if (func_string == LENGTH_FUNC_STR) {
+  if (resolved_id == function_id::length) {
     D_ASSERT(expr.children.size() == 1);
     auto input         = execute(*expr.children[0], execution_mode::MATERIALIZE);
     auto result_column = cudf::strings::count_characters(
       cudf::strings_column_view(input.get_column_view()), _stream, _mr);
     return execute_result(std::move(result_column));
   }
-  if (func_string == REGEXP_REPLACE_FUNC_STR) {
+  if (resolved_id == function_id::regexp_replace) {
     // The input should be <input column, pattern string scalar, replace string scalar>
     D_ASSERT(expr.children.size() == 3);
     D_ASSERT(expr.children[1]->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT);
@@ -401,7 +344,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
     if (has_backrefs) {
       if (duckdb::Config::ENABLE_REGEX_JIT_IMPL) {
         if (pattern_str == R"(^https?://(?:www\.)?([^/]+)/.*$)" && replace_str == R"(\1)") {
-          return ::sirius::expression::regex_playground::jit_transform_clickbench_q28_regex(
+          return ::sirius::regex::regex_playground::jit_transform_clickbench_q28_regex(
             input.get_column_view());
         }
       }
@@ -424,7 +367,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
   //----------Struct Functions----------//
   // row() and struct_pack() both construct a struct column from their child expressions.
   // row() is used by DuckDB for tuple constructors like (col1, col2).
-  if (func_string == ROW_FUNC_STR || func_string == STRUCT_PACK_FUNC_STR) {
+  if (resolved_id == function_id::row || resolved_id == function_id::struct_pack) {
     D_ASSERT(!expr.children.empty());
     std::vector<std::unique_ptr<cudf::column>> child_cols;
     for (const auto& expr : expr.children) {
@@ -442,728 +385,24 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
       num_rows, std::move(child_cols), 0, rmm::device_buffer{}, _stream, _mr);
   }
 
-  // If we reach here, it means the function is not supported in the expression executor
-  throw duckdb::NotImplementedException(
-    "[gpu_expression_executor:function] execute called on unsupported function: %s", func_string);
-}
-
-}  // namespace sirius::experimental
-
-namespace duckdb {
-namespace sirius {
-
-//----------InitializeState----------//
-std::unique_ptr<GpuExpressionState> GpuExpressionExecutor::InitializeState(
-  const BoundFunctionExpression& expr, GpuExpressionExecutorState& root)
-{
-  auto result = std::make_unique<GpuExpressionState>(expr, root);
-  for (auto& child : expr.children) {
-    result->AddChild(*child);
-  }
-  return std::move(result);
-}
-
-//----------StringMatchingDispatcher----------//
-// Helper template functor for string matching operations to reduce bloat in Execute()
-template <StringMatchingType MatchType>
-struct StringMatchingDispatcher {
-  // The executor
-  GpuExpressionExecutor& executor;
-  const bool UseCudf;
-
-  // Constructor
-  explicit StringMatchingDispatcher(GpuExpressionExecutor& exec, bool use_cudf)
-    : executor(exec), UseCudf(use_cudf)
-  {
+  // `error()` is a runtime-error-raising function. We deliberately do not
+  // evaluate it on-device here; the upstream fallback path is expected to
+  // handle it on the CPU. (Phase 6 will revisit this once ERROR_FUNC_STR
+  // migrates)
+  if (resolved_id == function_id::error) {
+    throw not_implemented_exception(
+      "[gpu_expression_executor:function] error() is not dispatched on GPU; "
+      "expected to fall back to CPU execution");
   }
 
-  // Dispatch operator
-  std::unique_ptr<cudf::column> operator()(const BoundFunctionExpression& expr,
-                                           GpuExpressionState* state)
-  {
-    D_ASSERT(expr.children.size() == 2);
-    D_ASSERT(expr.children[1]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT);
-
-    auto input                 = executor.Execute(*expr.children[0], state->child_states[0].get());
-    const auto& match_str_expr = expr.children[1]->Cast<BoundConstantExpression>();
-    const auto& match_str      = match_str_expr.value.GetValue<std::string>();
-
-    // For the following `MatchType`, we only support using cudf
-    if constexpr (MatchType == StringMatchingType::SUFFIX) {
-      const auto match_str_scalar =
-        cudf::string_scalar(match_str, true, executor.execution_stream, executor.resource_ref);
-      return cudf::strings::ends_with(
-        input->view(), match_str_scalar, executor.execution_stream, executor.resource_ref);
-    }
-
-    // For the following `MatchType`, we support using both cudf or the one implemented by Sirius
-    if (UseCudf) {
-      //----------Using CuDF----------//
-      cudf::strings_column_view input_view(input->view());
-      if constexpr (MatchType == StringMatchingType::LIKE ||
-                    MatchType == StringMatchingType::NOT_LIKE) {
-        std::vector<std::string> match_terms = string_split(match_str, SPLIT_DELIMITER);
-
-        auto like = cudf::strings::like(cudf::strings_column_view(input_view),
-                                        std::string_view(match_str),
-                                        std::string_view(),
-                                        executor.execution_stream,
-                                        executor.resource_ref);
-
-        // LIKE or NOT LIKE?
-        if constexpr (MatchType == StringMatchingType::LIKE) {
-          return std::move(like);
-        } else {
-          // Negate the match result
-          return cudf::unary_operation(like->view(),
-                                       cudf::unary_operator::NOT,
-                                       executor.execution_stream,
-                                       executor.resource_ref);
-        }
-      } else if constexpr (MatchType == StringMatchingType::CONTAINS) {
-        // There is an int32 overflow bug in `contains()` before cudf-25.10, where we have to use
-        // `like()` if the input is too large
-#if CUDF_VERSION_NUM < 2510
-        bool can_use_contains = input->size() <= INT32_MAX / WARP_SIZE;
-        if (can_use_contains) {
-          return cudf::strings::contains(
-            input->view(),
-            cudf::string_scalar(match_str, true, executor.execution_stream, executor.resource_ref),
-            executor.execution_stream,
-            executor.resource_ref);
-        }
-        return cudf::strings::like(cudf::strings_column_view(input_view),
-                                   std::string_view("%" + match_str + "%"),
-                                   std::string_view(),
-                                   executor.execution_stream,
-                                   executor.resource_ref);
-#else
-        return cudf::strings::contains(
-          input->view(),
-          cudf::string_scalar(match_str, true, executor.execution_stream, executor.resource_ref),
-          executor.execution_stream,
-          executor.resource_ref);
-#endif
-      } else if constexpr (MatchType == StringMatchingType::PREFIX) {
-        const auto match_str_scalar =
-          cudf::string_scalar(match_str, true, executor.execution_stream, executor.resource_ref);
-        return cudf::strings::starts_with(
-          input_view, match_str_scalar, executor.execution_stream, executor.resource_ref);
-      } else {
-        throw NotImplementedException("Unsupported StringMatchingType when using cudf: %d",
-                                      static_cast<int>(MatchType));
-      }
-    } else {
-      //----------Using Sirius----------//
-      return GpuDispatcher::DispatchStringMatching<MatchType>(
-        input->view(), match_str, executor.resource_ref);
-    }
-  }
-};
-
-//----------NumericBinaryFunctionDispatcher----------//
-template <cudf::binary_operator BinOp>
-struct NumericBinaryFunctionDispatcher {
-  // The executor
-  GpuExpressionExecutor& executor;
-
-  // Constructor
-  explicit NumericBinaryFunctionDispatcher(GpuExpressionExecutor& exec) : executor(exec) {}
-
-  // Left scalar binary operator for numeric types
-  template <typename T>
-  std::unique_ptr<cudf::column> DoLeftScalarBinaryOp(const T& left_value,
-                                                     const cudf::column_view& right,
-                                                     const cudf::data_type& return_type)
-  {
-    auto left_numeric_scalar =
-      cudf::numeric_scalar(left_value, true, executor.execution_stream, executor.resource_ref);
-    return cudf::binary_operation(left_numeric_scalar,
-                                  right,
-                                  BinOp,
-                                  return_type,
-                                  executor.execution_stream,
-                                  executor.resource_ref);
-  }
-
-  // Left scalar binary operator for decimal types
-  template <typename T>
-  std::unique_ptr<cudf::column> DoLeftScalarBinaryOp(typename T::rep left_value,
-                                                     numeric::scale_type scale,
-                                                     const cudf::column_view& right,
-                                                     const cudf::data_type& return_type)
-  {
-    std::unique_ptr<cudf::scalar> left_decimal_scalar;
-    if (right.type().id() == cudf::type_to_id<T>()) {
-      left_decimal_scalar = std::make_unique<cudf::fixed_point_scalar<T>>(
-        left_value, scale, true, executor.execution_stream, executor.resource_ref);
-    } else {
-      // If types are different, need to construct `left_decimal_scalar` using `right.type()`
-      switch (right.type().id()) {
-        case cudf::type_id::DECIMAL32: {
-          if (left_value > std::numeric_limits<int32_t>::max()) {
-            throw InternalException(
-              "Cannot cast left decimal scalar to decimal32, value greater than INT32_MAX");
-          }
-          left_decimal_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal32>>(
-            static_cast<int32_t>(left_value),
-            scale,
-            true,
-            executor.execution_stream,
-            executor.resource_ref);
-          break;
-        }
-        case cudf::type_id::DECIMAL64: {
-          if (left_value > std::numeric_limits<int64_t>::max()) {
-            throw InternalException(
-              "Cannot cast left decimal scalar to decimal64, value greater than INT64_MAX");
-          }
-          left_decimal_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal64>>(
-            static_cast<int64_t>(left_value),
-            scale,
-            true,
-            executor.execution_stream,
-            executor.resource_ref);
-          break;
-        }
-        case cudf::type_id::DECIMAL128: {
-          left_decimal_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(
-            static_cast<__int128_t>(left_value),
-            scale,
-            true,
-            executor.execution_stream,
-            executor.resource_ref);
-          break;
-        }
-        default:
-          throw InternalException(
-            "Right column is not decimal with left decimal constant in `DoLeftScalarBinaryOp`: %d",
-            static_cast<int>(right.type().id()));
-      }
-    }
-    return cudf::binary_operation(*left_decimal_scalar,
-                                  right,
-                                  BinOp,
-                                  return_type,
-                                  executor.execution_stream,
-                                  executor.resource_ref);
-  }
-
-  // Right scalar binary operator for numeric types
-  template <typename T>
-  std::unique_ptr<cudf::column> DoRightScalarBinaryOp(const cudf::column_view& left,
-                                                      const T& right_value,
-                                                      const cudf::data_type& return_type)
-  {
-    auto right_numeric_scalar =
-      cudf::numeric_scalar(right_value, true, executor.execution_stream, executor.resource_ref);
-    return cudf::binary_operation(left,
-                                  right_numeric_scalar,
-                                  BinOp,
-                                  return_type,
-                                  executor.execution_stream,
-                                  executor.resource_ref);
-  }
-
-  // Right scalar binary operator for decimal types
-  template <typename T>
-  std::unique_ptr<cudf::column> DoRightScalarBinaryOp(const cudf::column_view& left,
-                                                      typename T::rep right_value,
-                                                      numeric::scale_type scale,
-                                                      const cudf::data_type& return_type)
-  {
-    std::unique_ptr<cudf::scalar> right_decimal_scalar;
-    if (left.type().id() == cudf::type_to_id<T>()) {
-      right_decimal_scalar = std::make_unique<cudf::fixed_point_scalar<T>>(
-        right_value, scale, true, executor.execution_stream, executor.resource_ref);
-    } else {
-      // If types are different, need to construct `right_decimal_scalar` using `left.type()`
-      switch (left.type().id()) {
-        case cudf::type_id::DECIMAL32: {
-          if (right_value > std::numeric_limits<int32_t>::max()) {
-            throw InternalException(
-              "Cannot cast right decimal scalar to decimal32, value greater than INT32_MAX");
-          }
-          right_decimal_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal32>>(
-            static_cast<int32_t>(right_value),
-            scale,
-            true,
-            executor.execution_stream,
-            executor.resource_ref);
-          break;
-        }
-        case cudf::type_id::DECIMAL64: {
-          if (right_value > std::numeric_limits<int64_t>::max()) {
-            throw InternalException(
-              "Cannot cast right decimal scalar to decimal64, value greater than INT64_MAX");
-          }
-          right_decimal_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal64>>(
-            static_cast<int64_t>(right_value),
-            scale,
-            true,
-            executor.execution_stream,
-            executor.resource_ref);
-          break;
-        }
-        case cudf::type_id::DECIMAL128: {
-          right_decimal_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(
-            static_cast<__int128_t>(right_value),
-            scale,
-            true,
-            executor.execution_stream,
-            executor.resource_ref);
-          break;
-        }
-        default:
-          throw InternalException(
-            "Left column is not decimal with right decimal constant in `DoRightScalarBinaryOp`: %d",
-            static_cast<int>(left.type().id()));
-      }
-    }
-    return cudf::binary_operation(left,
-                                  *right_decimal_scalar,
-                                  BinOp,
-                                  return_type,
-                                  executor.execution_stream,
-                                  executor.resource_ref);
-  }
-
-  // Dispatch operator
-  std::unique_ptr<cudf::column> operator()(const BoundFunctionExpression& expr,
-                                           GpuExpressionState* state)
-  {
-    D_ASSERT(expr.children.size() == 2);
-    const auto& return_type = GetCudfType(expr.return_type);
-
-    // Resolve children
-    if (expr.children[0]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
-      // LHS is a constant, so skip its column materialization
-      const auto& left_value = expr.children[0]->Cast<BoundConstantExpression>().value;
-      const auto& right      = executor.Execute(*expr.children[1], state->child_states[1].get());
-
-      auto cudf_type = GetCudfType(expr.children[0]->return_type);
-      switch (cudf_type.id()) {
-        case cudf::type_id::INT16:
-          return DoLeftScalarBinaryOp(left_value.GetValue<int16_t>(), right->view(), return_type);
-        case cudf::type_id::INT32:
-          return DoLeftScalarBinaryOp(left_value.GetValue<int32_t>(), right->view(), return_type);
-        case cudf::type_id::INT64:
-          return DoLeftScalarBinaryOp(left_value.GetValue<int64_t>(), right->view(), return_type);
-        case cudf::type_id::FLOAT32:
-          return DoLeftScalarBinaryOp(left_value.GetValue<float_t>(), right->view(), return_type);
-        case cudf::type_id::FLOAT64:
-          return DoLeftScalarBinaryOp(left_value.GetValue<double_t>(), right->view(), return_type);
-        case cudf::type_id::DECIMAL32:
-          // cudf decimal type uses negative scale, same for below
-          return DoLeftScalarBinaryOp<numeric::decimal32>(
-            left_value.GetValueUnsafe<int32_t>(),
-            numeric::scale_type{-duckdb::DecimalType::GetScale(left_value.type())},
-            right->view(),
-            return_type);
-        case cudf::type_id::DECIMAL64:
-          return DoLeftScalarBinaryOp<numeric::decimal64>(
-            left_value.GetValueUnsafe<int64_t>(),
-            numeric::scale_type{-duckdb::DecimalType::GetScale(left_value.type())},
-            right->view(),
-            return_type);
-        case cudf::type_id::DECIMAL128: {
-          duckdb::hugeint_t hugeint_value = left_value.GetValueUnsafe<duckdb::hugeint_t>();
-          return DoLeftScalarBinaryOp<numeric::decimal128>(
-            (__int128_t(hugeint_value.upper) << 64) | hugeint_value.lower,
-            numeric::scale_type{-duckdb::DecimalType::GetScale(left_value.type())},
-            right->view(),
-            return_type);
-        }
-        case cudf::type_id::BOOL8:
-          throw NotImplementedException(
-            "Execute[Function]: Boolean types not supported for "
-            "numeric binary operations!");
-        default:
-          throw InternalException(
-            "Execute[Function]: Unknown cudf type of left constant for binary operation: %d",
-            static_cast<int>(cudf_type.id()));
-      }
-    } else if (expr.children[1]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
-      // RHS is a constant, so skip its column materialization
-      const auto& right_value = expr.children[1]->Cast<BoundConstantExpression>().value;
-      const auto& left        = executor.Execute(*expr.children[0], state->child_states[0].get());
-
-      auto cudf_type = GetCudfType(expr.children[1]->return_type);
-      switch (cudf_type.id()) {
-        case cudf::type_id::INT16:
-          return DoRightScalarBinaryOp(left->view(), right_value.GetValue<int16_t>(), return_type);
-        case cudf::type_id::INT32:
-          return DoRightScalarBinaryOp(left->view(), right_value.GetValue<int32_t>(), return_type);
-        case cudf::type_id::INT64:
-          return DoRightScalarBinaryOp(left->view(), right_value.GetValue<int64_t>(), return_type);
-        case cudf::type_id::FLOAT32:
-          return DoRightScalarBinaryOp(left->view(), right_value.GetValue<float_t>(), return_type);
-        case cudf::type_id::FLOAT64:
-          return DoRightScalarBinaryOp(left->view(), right_value.GetValue<double_t>(), return_type);
-        case cudf::type_id::DECIMAL32:
-          // cudf decimal type uses negative scale, same for below
-          return DoRightScalarBinaryOp<numeric::decimal32>(
-            left->view(),
-            right_value.GetValueUnsafe<int32_t>(),
-            numeric::scale_type{-duckdb::DecimalType::GetScale(right_value.type())},
-            return_type);
-        case cudf::type_id::DECIMAL64:
-          return DoRightScalarBinaryOp<numeric::decimal64>(
-            left->view(),
-            right_value.GetValueUnsafe<int64_t>(),
-            numeric::scale_type{-duckdb::DecimalType::GetScale(right_value.type())},
-            return_type);
-        case cudf::type_id::DECIMAL128: {
-          duckdb::hugeint_t hugeint_value = right_value.GetValueUnsafe<duckdb::hugeint_t>();
-          return DoRightScalarBinaryOp<numeric::decimal128>(
-            left->view(),
-            (__int128_t(hugeint_value.upper) << 64) | hugeint_value.lower,
-            numeric::scale_type{-duckdb::DecimalType::GetScale(right_value.type())},
-            return_type);
-        }
-        case cudf::type_id::BOOL8:
-          throw NotImplementedException(
-            "Execute[Function]: Boolean types not supported for "
-            "numeric binary operations!");
-        default:
-          throw InternalException(
-            "Execute[Function]: Unknown cudf type of right constant for binary operation: %d",
-            static_cast<int>(cudf_type.id()));
-      }
-    }
-
-    // NEITHER side is a constant, so we need to execute both children
-    auto left  = executor.Execute(*expr.children[0], state->child_states[0].get());
-    auto right = executor.Execute(*expr.children[1], state->child_states[1].get());
-
-    // Check for BIGINT arithmetic overflow potential (ADD, SUB, MUL)
-    if constexpr (BinOp == cudf::binary_operator::ADD || BinOp == cudf::binary_operator::SUB ||
-                  BinOp == cudf::binary_operator::MUL) {
-      if (left->view().type().id() == cudf::type_id::INT64 &&
-          right->view().type().id() == cudf::type_id::INT64) {
-        // BIGINT arithmetic can overflow - GPU doesn't check for overflow
-        throw NotImplementedException("GPU BIGINT arithmetic may overflow - falling back to CPU");
-      }
-    }
-
-    // Execute the binary operation
-    return cudf::binary_operation(left->view(),
-                                  right->view(),
-                                  BinOp,
-                                  GetCudfType(expr.return_type),
-                                  executor.execution_stream,
-                                  executor.resource_ref);
-  }
-};
-
-//----------DatetimeExtractFunctionDispatcher----------//
-template <cudf::datetime::datetime_component COMP>
-struct DatetimeExtractFunctionDispatcher {
-  // The executor
-  GpuExpressionExecutor& executor;
-
-  // Constructor
-  explicit DatetimeExtractFunctionDispatcher(GpuExpressionExecutor& exec) : executor(exec) {}
-
-  // Dispatch operator
-  std::unique_ptr<cudf::column> operator()(const BoundFunctionExpression& expr,
-                                           GpuExpressionState* state)
-  {
-    D_ASSERT(expr.children.size() == 1);
-    auto input = executor.Execute(*expr.children[0], state->child_states[0].get());
-    return cudf::datetime::extract_datetime_component(
-      input->view(), COMP, executor.execution_stream, executor.resource_ref);
-  }
-};
-
-//----------DatetimeTruncateFunctionDispatcher----------//
-struct DatetimeTruncateFunctionDispatcher {
-  // The executor
-  GpuExpressionExecutor& executor;
-
-  // Constructor
-  explicit DatetimeTruncateFunctionDispatcher(GpuExpressionExecutor& exec) : executor(exec) {}
-
-  // Dispatch operator
-  std::unique_ptr<cudf::column> operator()(const BoundFunctionExpression& expr,
-                                           GpuExpressionState* state)
-  {
-    D_ASSERT(expr.children.size() == 2);
-    std::string freq_str =
-      expr.children[0]->Cast<BoundConstantExpression>().value.GetValue<std::string>();
-    auto input = executor.Execute(*expr.children[1], state->child_states[1].get());
-    if (freq_str == "day") {
-      return cudf::datetime::floor_datetimes(input->view(),
-                                             cudf::datetime::rounding_frequency::DAY,
-                                             executor.execution_stream,
-                                             executor.resource_ref);
-    } else if (freq_str == "hour") {
-      return cudf::datetime::floor_datetimes(input->view(),
-                                             cudf::datetime::rounding_frequency::HOUR,
-                                             executor.execution_stream,
-                                             executor.resource_ref);
-    } else if (freq_str == "minute") {
-      return cudf::datetime::floor_datetimes(input->view(),
-                                             cudf::datetime::rounding_frequency::MINUTE,
-                                             executor.execution_stream,
-                                             executor.resource_ref);
-    } else if (freq_str == "second") {
-      return cudf::datetime::floor_datetimes(input->view(),
-                                             cudf::datetime::rounding_frequency::SECOND,
-                                             executor.execution_stream,
-                                             executor.resource_ref);
-    } else if (freq_str == "millisecond") {
-      return cudf::datetime::floor_datetimes(input->view(),
-                                             cudf::datetime::rounding_frequency::MILLISECOND,
-                                             executor.execution_stream,
-                                             executor.resource_ref);
-    } else if (freq_str == "microsecond") {
-      return cudf::datetime::floor_datetimes(input->view(),
-                                             cudf::datetime::rounding_frequency::MICROSECOND,
-                                             executor.execution_stream,
-                                             executor.resource_ref);
-    } else {
-      throw InvalidInputException("Execute[Function]: Unknown extract type for date_trunc(): %s",
-                                  freq_str);
-    }
-  }
-};
-
-//----------UnaryFunctionDispatcher----------//
-template <UnaryFunctionType FuncType>
-struct UnaryFunctionDispatcher {
-  // The executor
-  GpuExpressionExecutor& executor;
-
-  // Constructor
-  explicit UnaryFunctionDispatcher(GpuExpressionExecutor& exec) : executor(exec) {}
-
-  // Dispatch operator
-  std::unique_ptr<cudf::column> operator()(const BoundFunctionExpression& expr,
-                                           GpuExpressionState* state)
-  {
-    D_ASSERT(expr.children.size() == 1);
-    auto input = executor.Execute(*expr.children[0], state->child_states[0].get());
-
-    switch (FuncType) {
-      case UnaryFunctionType::STRLEN:
-        return cudf::strings::count_bytes(
-          input->view(), executor.execution_stream, executor.resource_ref);
-      case UnaryFunctionType::LENGTH:
-        return cudf::strings::count_characters(
-          input->view(), executor.execution_stream, executor.resource_ref);
-      default:
-        throw NotImplementedException("Unsupported UnaryFunctionType: %d",
-                                      static_cast<int>(FuncType));
-    }
-  }
-};
-
-//----------RegexFunctionDispatcher----------//
-struct RegexFunctionDispatcher {
-  // The executor
-  GpuExpressionExecutor& executor;
-
-  // Constructor
-  explicit RegexFunctionDispatcher(GpuExpressionExecutor& exec) : executor(exec) {}
-
-  // Dispatch operator
-  std::unique_ptr<cudf::column> operator()(const BoundFunctionExpression& expr,
-                                           GpuExpressionState* state)
-  {
-    auto input_cudf_column = executor.Execute(*expr.children[0], state->child_states[0].get());
-    std::string pattern_str =
-      expr.children[1]->Cast<BoundConstantExpression>().value.GetValue<std::string>();
-    std::string replace_str =
-      expr.children[2]->Cast<BoundConstantExpression>().value.GetValue<std::string>();
-    bool has_backrefs = std::regex_search(replace_str, std::regex(R"(\\[0-9])"));
-    if (has_backrefs) {
-      if (Config::ENABLE_REGEX_JIT_IMPL) {
-        if (pattern_str == R"(^https?://(?:www\.)?([^/]+)/.*$)" && replace_str == R"(\1)") {
-          return ::sirius::expression::regex_playground::jit_transform_clickbench_q28_regex(
-            input_cudf_column->view());
-        }
-      }
-      auto regex_prog = cudf::strings::regex_program::create(std::string_view(pattern_str));
-      return cudf::strings::replace_with_backrefs(
-        cudf::strings_column_view(input_cudf_column->view()),
-        *regex_prog,
-        std::string_view(replace_str),
-        executor.execution_stream,
-        executor.resource_ref);
-    } else {
-      auto replace_cudf_column = cudf::make_column_from_scalar(
-        cudf::string_scalar(replace_str, true, executor.execution_stream, executor.resource_ref),
-        1,
-        executor.execution_stream,
-        executor.resource_ref);
-      return cudf::strings::replace_re(cudf::strings_column_view(input_cudf_column->view()),
-                                       {pattern_str},
-                                       cudf::strings_column_view(replace_cudf_column->view()),
-                                       cudf::strings::regex_flags::DEFAULT,
-                                       executor.execution_stream,
-                                       executor.resource_ref);
-    }
-  }
-};
-
-//----------Execute----------//
-std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundFunctionExpression& expr,
-                                                             GpuExpressionState* state)
-{
-  const auto& function_expression_state = state->Cast<GpuExpressionState>();
-  const auto& func_str                  = expr.function.name;
-
-  //----------Numeric Binary Functions----------//
-  // Match both DuckDB operator names (+, -, *, /) and Substrait function names
-  // (add, subtract, multiply, divide) — the latter appear when Substrait plans
-  // are converted back to DuckDB logical plans via from_substrait.
-  if (func_str == ADD_FUNC_STR || func_str == "add") {
-    NumericBinaryFunctionDispatcher<cudf::binary_operator::ADD> binary_function(*this);
-    return binary_function(expr, state);
-  } else if (func_str == SUB_FUNC_STR || func_str == "subtract") {
-    NumericBinaryFunctionDispatcher<cudf::binary_operator::SUB> binary_function(*this);
-    return binary_function(expr, state);
-  } else if (func_str == MUL_FUNC_STR || func_str == "multiply") {
-    NumericBinaryFunctionDispatcher<cudf::binary_operator::MUL> binary_function(*this);
-    return binary_function(expr, state);
-  } else if (func_str == DIV_FUNC_STR || func_str == INT_DIV_FUNC_STR || func_str == "divide") {
-    // For non-integer division on integer types, DuckDB inserts a CAST
-    NumericBinaryFunctionDispatcher<cudf::binary_operator::DIV> binary_function(*this);
-    return binary_function(expr, state);
-  } else if (func_str == MOD_FUNC_STR || func_str == "modulus") {
-    NumericBinaryFunctionDispatcher<cudf::binary_operator::MOD> binary_function(*this);
-    return binary_function(expr, state);
-  } else if (func_str == ERROR_FUNC_STR) {
-    throw InternalException("Execute[Function]: error() should be handled by Execute[Case]!");
-  }
-
-  //----------String Functions----------//
-  if (func_str == SUBSTRING_FUNC_STR_1 || func_str == SUBSTRING_FUNC_STR_2) {
-    // We assume the start and len arguments are constants (seems to be the case in DuckDB)
-    D_ASSERT(expr.children.size() == 3);
-    D_ASSERT(expr.children[1]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT);
-    D_ASSERT(expr.children[2]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT);
-
-    const auto& start_expr = expr.children[1]->Cast<BoundConstantExpression>();
-    const auto& len_expr   = expr.children[2]->Cast<BoundConstantExpression>();
-
-    auto input = Execute(*expr.children[0], state->child_states[0].get());
-
-    if (Config::USE_CUDF_EXPR) {
-      cudf::strings_column_view input_view(input->view());
-      const auto cudf_start = start_expr.value.GetValue<cudf::size_type>() - 1;
-      const auto cudf_end   = len_expr.value.GetValue<cudf::size_type>() + cudf_start;
-
-      return cudf::strings::slice_strings(input_view,
-                                          cudf_start,
-                                          cudf_end,
-                                          1,  // Step
-                                          execution_stream,
-                                          resource_ref);
-    } else {
-      const auto sirius_start = start_expr.value.GetValue<uint64_t>() - 1;
-      const auto sirius_len   = len_expr.value.GetValue<uint64_t>();
-
-      return GpuDispatcher::DispatchSubstring(
-        input->view(), sirius_start, sirius_len, resource_ref, execution_stream);
-    }
-  } else if (func_str == LIKE_FUNC_STR) {
-    StringMatchingDispatcher<StringMatchingType::LIKE> dispatcher(*this, Config::USE_CUDF_EXPR);
-    return dispatcher(expr, state);
-  } else if (func_str == NOT_LIKE_FUNC_STR) {
-    StringMatchingDispatcher<StringMatchingType::NOT_LIKE> dispatcher(*this, Config::USE_CUDF_EXPR);
-    return dispatcher(expr, state);
-  } else if (func_str == CONTAINS_FUNC_STR) {
-    StringMatchingDispatcher<StringMatchingType::CONTAINS> dispatcher(*this, Config::USE_CUDF_EXPR);
-    return dispatcher(expr, state);
-  } else if (func_str == PREFIX_FUNC_STR) {
-    StringMatchingDispatcher<StringMatchingType::PREFIX> dispatcher(*this, Config::USE_CUDF_EXPR);
-    return dispatcher(expr, state);
-  } else if (func_str == SUFFIX_FUNC_STR) {
-    StringMatchingDispatcher<StringMatchingType::SUFFIX> dispatcher(*this, Config::USE_CUDF_EXPR);
-    return dispatcher(expr, state);
-  }
-
-  //----------Datetime Extract Functions----------//
-  else if (func_str == YEAR_FUNC_STR) {
-    DatetimeExtractFunctionDispatcher<cudf::datetime::datetime_component::YEAR> dispatcher(*this);
-    return dispatcher(expr, state);
-  } else if (func_str == MONTH_FUNC_STR) {
-    DatetimeExtractFunctionDispatcher<cudf::datetime::datetime_component::MONTH> dispatcher(*this);
-    return dispatcher(expr, state);
-  } else if (func_str == DAY_FUNC_STR) {
-    DatetimeExtractFunctionDispatcher<cudf::datetime::datetime_component::DAY> dispatcher(*this);
-    return dispatcher(expr, state);
-  } else if (func_str == HOUR_FUNC_STR) {
-    DatetimeExtractFunctionDispatcher<cudf::datetime::datetime_component::HOUR> dispatcher(*this);
-    return dispatcher(expr, state);
-  } else if (func_str == MINUTE_FUNC_STR) {
-    DatetimeExtractFunctionDispatcher<cudf::datetime::datetime_component::MINUTE> dispatcher(*this);
-    return dispatcher(expr, state);
-  } else if (func_str == SECOND_FUNC_STR) {
-    DatetimeExtractFunctionDispatcher<cudf::datetime::datetime_component::SECOND> dispatcher(*this);
-    return dispatcher(expr, state);
-  } else if (func_str == MILLISECOND_FUNC_STR) {
-    DatetimeExtractFunctionDispatcher<cudf::datetime::datetime_component::MILLISECOND> dispatcher(
-      *this);
-    return dispatcher(expr, state);
-  } else if (func_str == MICROSECOND_FUNC_STR) {
-    DatetimeExtractFunctionDispatcher<cudf::datetime::datetime_component::MICROSECOND> dispatcher(
-      *this);
-    return dispatcher(expr, state);
-  }
-
-  //----------DateTime Truncate Functions----------//
-  else if (func_str == DATE_TRUNC_FUNC_STR) {
-    DatetimeTruncateFunctionDispatcher dispatcher(*this);
-    return dispatcher(expr, state);
-  }
-
-  //----------Unary Functions----------//
-  else if (func_str == STRLEN_FUNC_STR) {
-    // P3: compute STRLEN directly from offsets when on the old gpu_processing path.
-    // Avoids materializing the string chars buffer entirely.
-    if (!use_data_batch_apis && expr.children[0]->type == ExpressionType::BOUND_REF) {
-      auto& ref = expr.children[0]->Cast<BoundReferenceExpression>();
-      auto& col = input_columns[ref.index];
-      if (col->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR &&
-          col->data_wrapper.offset != nullptr) {
-        size_t num_rows = col->row_ids != nullptr ? col->row_id_count : col->column_length;
-        return sirius::StrlenFromOffsets(
-          col->data_wrapper.offset, col->row_ids, num_rows, execution_stream, resource_ref);
-      }
-    }
-    UnaryFunctionDispatcher<UnaryFunctionType::STRLEN> dispatcher(*this);
-    return dispatcher(expr, state);
-  } else if (func_str == LENGTH_FUNC_STR) {
-    UnaryFunctionDispatcher<UnaryFunctionType::LENGTH> dispatcher(*this);
-    return dispatcher(expr, state);
-  }
-
-  //----------Regex Functions----------//
-  else if (func_str == REGEXP_REPLACE_FUNC_STR) {
-    RegexFunctionDispatcher dispatcher(*this);
-    return dispatcher(expr, state);
-  }
-
-  //----------Struct Functions----------//
-  // row() and struct_pack() both construct a struct column from their child expressions.
-  // row() is used by DuckDB for tuple constructors like (col1, col2).
-  if (func_str == "row" || func_str == "struct_pack") {
-    D_ASSERT(!expr.children.empty());
-    std::vector<std::unique_ptr<cudf::column>> child_cols;
-    for (size_t i = 0; i < expr.children.size(); ++i) {
-      child_cols.push_back(Execute(*expr.children[i], state->child_states[i].get()));
-    }
-    cudf::size_type num_rows = child_cols[0]->size();
-    return cudf::make_structs_column(
-      num_rows, std::move(child_cols), 0, rmm::device_buffer{}, execution_stream, resource_ref);
-  }
-
-  // If we've gotten this far, we've encountered a unimplemented function type
-  throw InternalException("Execute[Function]: Unknown function type: %s", func_str);
+  // Invariant violation: `func_string` resolved to a valid function_id (so it
+  // passed the unsupported-name guard at the top of execute()), yet no dispatch
+  // arm above claimed it. This means an entry was added to `function_id`
+  // without a corresponding GPU handler here.
+  throw internal_exception(
+    "[gpu_expression_executor:function]: registered function_id has no GPU "
+    "dispatch arm (function name: {})",
+    func_string);
 }
 
 }  // namespace sirius
-}  // namespace duckdb

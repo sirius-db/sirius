@@ -20,15 +20,15 @@ namespace sirius {
 namespace pipeline {
 
 sirius_meta_pipeline::sirius_meta_pipeline(
-  sirius_engine& engine,
+  const pipeline_build_context& ctx,
   sirius_pipeline_build_state& state_p,
   sirius::optional_ptr<op::sirius_physical_operator> sink_p)
-  : engine(engine), state(state_p), sink(sink_p), recursive_cte(false), next_batch_index(0)
+  : build_ctx(ctx), state(state_p), sink(sink_p), recursive_cte(false), next_batch_index(0)
 {
   create_pipeline();
 }
 
-sirius_engine& sirius_meta_pipeline::get_engine() const { return engine; }
+const pipeline_build_context& sirius_meta_pipeline::get_build_context() const { return build_ctx; }
 
 sirius_pipeline_build_state& sirius_meta_pipeline::get_state() const { return state; }
 
@@ -120,7 +120,7 @@ void sirius_meta_pipeline::ready()
 sirius_meta_pipeline& sirius_meta_pipeline::create_child_meta_pipeline(
   sirius_pipeline& current, op::sirius_physical_operator& op)
 {
-  children.push_back(duckdb::make_shared_ptr<sirius_meta_pipeline>(engine, state, &op));
+  children.push_back(duckdb::make_shared_ptr<sirius_meta_pipeline>(build_ctx, state, &op));
   auto child_meta_pipeline = children.back().get();
   // store the parent
   child_meta_pipeline->parent = &current;
@@ -133,7 +133,7 @@ sirius_meta_pipeline& sirius_meta_pipeline::create_child_meta_pipeline(
 
 sirius_pipeline& sirius_meta_pipeline::create_pipeline()
 {
-  pipelines.emplace_back(duckdb::make_shared_ptr<sirius_pipeline>(engine));
+  pipelines.emplace_back(duckdb::make_shared_ptr<sirius_pipeline>(build_ctx));
   state.set_pipeline_sink(*pipelines.back(), sink, next_batch_index++);
   return *pipelines.back();
 }
@@ -259,7 +259,7 @@ void sirius_meta_pipeline::create_child_pipeline(sirius_pipeline& current,
   D_ASSERT(current.source);
 
   // create the child pipeline (same batch index)
-  pipelines.emplace_back(state.create_child_pipeline(engine, current, op));
+  pipelines.emplace_back(state.create_child_pipeline(build_ctx, current, op));
   auto& child_pipeline            = *pipelines.back();
   child_pipeline.base_batch_index = current.base_batch_index;
 

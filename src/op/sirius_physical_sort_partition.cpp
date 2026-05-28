@@ -55,14 +55,14 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_sort_partition::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_data_batches();
+  const auto& input_batches = input.get_read_only_batches();
 
   // If no sample operator or only 1 partition, pass through
   if (!_sample_op || !_sample_op->boundaries_computed() || _sample_op->get_num_partitions() <= 1) {
     SIRIUS_LOG_DEBUG("Sort partition: passthrough ({} batches, {} partitions)",
                      input_batches.size(),
                      _sample_op ? _sample_op->get_num_partitions() : 1);
-    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
+    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
   }
 
   auto start           = std::chrono::high_resolution_clock::now();
@@ -94,10 +94,9 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
 
   for (auto const& batch : input_batches) {
-    if (!batch) { continue; }
-    auto* space = batch->get_memory_space();
+    auto* space = batch.get_memory_space();
     if (!space) { continue; }
-    auto input_table = get_cudf_table_view(*batch);
+    auto input_table = get_cudf_table_view(batch);
     auto num_rows    = input_table.num_rows();
 
     if (num_rows == 0) { continue; }
@@ -149,7 +148,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
       if (partition_views[i].num_rows() == 0) { continue; }
       auto partition_table =
         std::make_unique<cudf::table>(partition_views[i], stream, space->get_default_allocator());
-      output_batches.push_back(make_data_batch(std::move(partition_table), *space));
+      output_batches.push_back(make_data_batch(std::move(partition_table), *space, stream));
     }
   }
 
@@ -165,7 +164,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
   return std::make_unique<pipelineable_operator_data>(output_batches);
 }
 
-void sirius_physical_sort_partition::finalize_operator()
+void sirius_physical_sort_partition::on_finalize_operator()
 {
   if (_sample_op) { _sample_op->clear_partition_boundaries(); }
 }

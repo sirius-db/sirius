@@ -21,6 +21,7 @@
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "expression/expression_internal.hpp"
 
 #include <stdexcept>
 #include <string>
@@ -29,21 +30,22 @@ namespace sirius {
 namespace op {
 
 CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
-  const duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& groups_p,
-  const duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& expressions)
+  const duckdb::vector<sirius::expression>& groups_p,
+  const duckdb::vector<sirius::expression>& expressions)
 {
   CudfAggregateDefinitions result;
 
   // 1. Extract group_idx from groups_p
   for (const auto& group : groups_p) {
-    D_ASSERT(group->type == duckdb::ExpressionType::BOUND_REF);
-    auto& bound_ref = group->Cast<duckdb::BoundReferenceExpression>();
+    auto const* group_expr = sirius::unwrap(group);
+    D_ASSERT(group_expr->type == duckdb::ExpressionType::BOUND_REF);
+    auto& bound_ref = group_expr->Cast<duckdb::BoundReferenceExpression>();
     result.group_idx.push_back(static_cast<int>(bound_ref.index));
   }
 
   // 2. Extract aggregates (cudf::aggregation::Kind) from expressions
   for (const auto& aggregate : expressions) {
-    auto& aggr = aggregate->Cast<duckdb::BoundAggregateExpression>();
+    auto& aggr = sirius::unwrap(aggregate)->Cast<duckdb::BoundAggregateExpression>();
 
     // Handle AVG specially: it expands into SUM + COUNT_VALID
     if (aggr.function.name == "avg") {

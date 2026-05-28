@@ -35,7 +35,7 @@ namespace sirius::pipeline {
 
 namespace {
 
-/// Maximum recursion depth for tree building to prevent stack overflow from cycles (T-01-01).
+/// Maximum recursion depth for tree building to prevent stack overflow from cycles.
 constexpr size_t MAX_TREE_DEPTH = 100;
 
 /// A node in the 2D render grid representing a pipeline.
@@ -103,20 +103,23 @@ void place_node(render_tree& tree,
   render_node node;
   node.pipeline_id = pipeline.get_pipeline_id();
 
-  // Determine connection label: scan parent's sink next_port_after_sink to find
-  // the port connecting to this child pipeline
+  // Determine connection label: scan THIS pipeline's sink next_port_after_sink
+  // to find the port that delivers data to the parent (consumer) pipeline.
+  // The parent's input operator is operators[0] if any, otherwise its sink.
   if (parent) {
-    auto parent_sink = parent->get_sink();
-    if (parent_sink) {
-      for (auto& np : parent_sink->get_next_port_after_sink()) {
-        if (!np.next_operator) { continue; }
+    auto child_sink       = pipeline.get_sink();
+    auto parent_ops       = parent->get_operators();
+    auto* parent_input_op = !parent_ops.empty()
+                              ? &parent_ops[0].get()
+                              : (parent->get_sink() ? parent->get_sink().get() : nullptr);
+    if (child_sink && parent_input_op) {
+      for (auto& np : child_sink->get_next_ports_after_sink()) {
+        if (np.next_operator != parent_input_op) { continue; }
         auto* port = np.next_operator->get_port(np.next_operator_port_name);
-        if (port && port->src_pipeline &&
-            port->src_pipeline->get_pipeline_id() == pipeline.get_pipeline_id()) {
-          node.connection_label = std::string(np.next_operator_port_name) + " [" +
-                                  sirius_plan_printer::barrier_type_to_string(port->type) + "]";
-          break;
-        }
+        if (!port) { continue; }
+        node.connection_label = std::string(np.next_operator_port_name) + " [" +
+                                sirius_plan_printer::barrier_type_to_string(port->type) + "]";
+        break;
       }
     }
   }
@@ -154,6 +157,27 @@ void place_node(render_tree& tree,
     node.content_lines.push_back(sirius_plan_printer::format_operator_with_id(*source));
     for (auto& detail : sirius_plan_printer::get_operator_detail_lines(*source)) {
       node.content_lines.push_back(detail);
+    }
+  }
+
+  // Append input-port memory-barrier annotations at the bottom of the box
+  // (data flows in from the source side). For pipelines whose dependent
+  // entry point is the sink (no operators[]), ports live on sink instead.
+  // const_cast: get_port_ids/get_port are not marked const, but the read is
+  // logically const (just inspecting registered ports).
+  auto ops_for_input = pipeline.get_operators();
+  auto* input_op_const =
+    !ops_for_input.empty() ? &ops_for_input[0].get() : (sink ? sink.get() : nullptr);
+  auto* input_op = const_cast<op::sirius_physical_operator*>(input_op_const);
+  if (input_op) {
+    for (auto port_id : input_op->get_port_ids()) {
+      auto* port = input_op->get_port(port_id);
+      if (!port) { continue; }
+      std::string src_label = port->src_pipeline
+                                ? "(#" + std::to_string(port->src_pipeline->get_pipeline_id()) + ")"
+                                : "";
+      node.content_lines.push_back("Input" + src_label + ": " +
+                                   sirius_plan_printer::barrier_type_to_string(port->type));
     }
   }
 
@@ -279,7 +303,7 @@ std::vector<std::string> sirius_plan_printer::get_operator_detail_lines(
 {
   std::vector<std::string> lines;
 
-  // Join type annotation (D-02: "  type: INNER")
+  // Join type annotation ("  type: INNER")
   if (op.type == op::SiriusPhysicalOperatorType::HASH_JOIN) {
     lines.push_back("  type: " +
                     duckdb::JoinTypeToString(op.Cast<op::sirius_physical_hash_join>().join_type));
@@ -288,7 +312,7 @@ std::vector<std::string> sirius_plan_printer::get_operator_detail_lines(
                                    op.Cast<op::sirius_physical_nested_loop_join>().join_type));
   }
 
-  // Scan function name annotation (D-02: "  scan: seq_scan")
+  // Scan function name annotation ("  scan: seq_scan")
   std::string scan_name;
   switch (op.type) {
     case op::SiriusPhysicalOperatorType::TABLE_SCAN:
@@ -350,7 +374,7 @@ std::string sirius_plan_printer::render_pipelines() const
     if (!pipeline) { continue; }
     ss << "Pipeline #" << pipeline->get_pipeline_id() << ": ";
 
-    // Build arrow-separated operator chain with IDs (D-04, D-05)
+    // Build arrow-separated operator chain with IDs
     auto source = pipeline->get_source();
     auto sink   = pipeline->get_sink();
     if (source) { ss << format_operator_with_id(*source); }
@@ -362,6 +386,24 @@ std::string sirius_plan_printer::render_pipelines() const
     }
     if (sink && sink != source) { ss << " -> " << format_operator_with_id(*sink); }
     ss << "\n";
+
+    // Show input ports on this pipeline's first executable operator (mirrors Output section).
+    // For pipelines whose dependent end is the sink (no explicit operators), ports live on sink.
+    auto* input_op = !ops.empty() ? &ops[0].get() : (sink ? sink.get() : nullptr);
+    if (input_op) {
+      for (auto port_id : input_op->get_port_ids()) {
+        auto* port = input_op->get_port(port_id);
+        if (!port) { continue; }
+        ss << "  Input: ";
+        if (port->src_pipeline) {
+          ss << "<- Pipeline #" << port->src_pipeline->get_pipeline_id();
+        } else {
+          ss << "<- (no source pipeline)";
+        }
+        ss << " [on: " << input_op->get_name() << " (id=" << input_op->get_operator_id() << ")"
+           << ", port: " << port_id << ", barrier: " << barrier_type_to_string(port->type) << "]\n";
+      }
+    }
 
     // Show dependencies
     if (!pipeline->dependencies.empty()) {
@@ -375,7 +417,7 @@ std::string sirius_plan_printer::render_pipelines() const
 
     // Show output connections from sink
     if (sink) {
-      auto& next_ports = sink->get_next_port_after_sink();
+      auto& next_ports = sink->get_next_ports_after_sink();
       for (auto& np : next_ports) {
         if (!np.next_operator) { continue; }
         ss << "  Output: -> " << np.next_operator->get_name();

@@ -173,12 +173,12 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
 
   sirius_physical_ungrouped_aggregate local_op(
     sirius::from_duckdb_vec(local_types),
-    std::move(local_aggregates),
+    sirius::wrap_many(std::move(local_aggregates)),
     0,
     duckdb::TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
   sirius_physical_ungrouped_aggregate_merge merge_op(
     sirius::from_duckdb_vec(merge_types),
-    std::move(merge_aggregates),
+    sirius::wrap_many(std::move(merge_aggregates)),
     0,
     duckdb::TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 
@@ -198,12 +198,8 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
   auto out = merge_op.execute(pipelineable_operator_data(merge_inputs), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
-                 .get_data_batches()[0]
-                 ->get_data()
-                 ->template cast<gpu_table_representation>()
-                 .get_table();
-  auto view = table.view();
+  auto view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
 
   REQUIRE(view.num_columns() == 5);
   REQUIRE(view.num_rows() == 1);
@@ -303,12 +299,12 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate resolves AVG in merge",
 
   sirius_physical_ungrouped_aggregate local_op(
     sirius::from_duckdb_vec(local_types),
-    std::move(local_aggregates),
+    sirius::wrap_many(std::move(local_aggregates)),
     0,
     duckdb::TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
   sirius_physical_ungrouped_aggregate_merge merge_op(
     sirius::from_duckdb_vec(merge_types),
-    std::move(merge_aggregates),
+    sirius::wrap_many(std::move(merge_aggregates)),
     0,
     duckdb::TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 
@@ -329,12 +325,8 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate resolves AVG in merge",
   auto out = merge_op.execute(pipelineable_operator_data(merge_inputs), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
-  auto table = dynamic_cast<const pipelineable_operator_data&>(*out)
-                 .get_data_batches()[0]
-                 ->get_data()
-                 ->template cast<gpu_table_representation>()
-                 .get_table();
-  auto view = table.view();
+  auto view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
   REQUIRE(view.num_columns() == 1);
   REQUIRE(view.num_rows() == 1);
 

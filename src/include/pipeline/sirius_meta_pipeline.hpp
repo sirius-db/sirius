@@ -19,11 +19,10 @@
 #include "common/optional_ptr.hpp"
 #include "common/reference_map.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "pipeline/pipeline_build_context.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
 namespace sirius {
-
-class sirius_engine;
 
 namespace op {
 class sirius_physical_operator;
@@ -54,13 +53,13 @@ class sirius_meta_pipeline : public duckdb::enable_shared_from_this<sirius_meta_
   //!         * And all pipelines that were added to the sirius_meta_pipeline after 'current'
  public:
   //! Create a sirius_meta_pipeline with the given sink
-  sirius_meta_pipeline(sirius_engine& engine,
+  sirius_meta_pipeline(const pipeline_build_context& ctx,
                        sirius_pipeline_build_state& state,
                        sirius::optional_ptr<op::sirius_physical_operator> sink);
 
  public:
-  //! Get the gpu_executor for this sirius_meta_pipeline
-  sirius_engine& get_engine() const;
+  //! Get the pipeline build context for this sirius_meta_pipeline
+  const pipeline_build_context& get_build_context() const;
   //! Get the pipeline_build_state for this sirius_meta_pipeline
   sirius_pipeline_build_state& get_state() const;
   //! Get the sink operator for this sirius_meta_pipeline
@@ -126,8 +125,8 @@ class sirius_meta_pipeline : public duckdb::enable_shared_from_this<sirius_meta_
                                                    op::sirius_physical_operator& op);
 
  private:
-  //! The executor for all MetaPipelines in the query plan
-  sirius_engine& engine;
+  //! Plan-time build context for all MetaPipelines in the query plan
+  const pipeline_build_context build_ctx;
   //! The pipeline_build_state for all MetaPipelines in the query plan
   sirius_pipeline_build_state& state;
   //! Parent pipeline (optional)

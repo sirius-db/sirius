@@ -47,6 +47,7 @@ class SiriusExtension : public Extension {
   static void GPUExecutionFunction(ClientContext& context,
                                    TableFunctionInput& data_p,
                                    DataChunk& output);
+#ifdef SIRIUS_ENABLE_LEGACY
   static void GPUBufferInitFunction(ClientContext& context,
                                     TableFunctionInput& data_p,
                                     DataChunk& output);
@@ -54,6 +55,7 @@ class SiriusExtension : public Extension {
                                                     TableFunctionBindInput& input,
                                                     vector<LogicalType>& return_types,
                                                     vector<string>& names);
+#endif
   static unique_ptr<FunctionData> GPUExecutionBind(ClientContext& context,
                                                    TableFunctionBindInput& input,
                                                    vector<LogicalType>& return_types,
@@ -71,7 +73,25 @@ class SiriusExtension : public Extension {
                                                           vector<string>& names);
   static void EnsureExchangeBufferManager();
 
+  static void PinTableFunction(ClientContext& context,
+                               TableFunctionInput& data_p,
+                               DataChunk& output);
+  static unique_ptr<FunctionData> PinTableBind(ClientContext& context,
+                                               TableFunctionBindInput& input,
+                                               vector<LogicalType>& return_types,
+                                               vector<string>& names);
+
+  static void UnpinTableFunction(ClientContext& context,
+                                 TableFunctionInput& data_p,
+                                 DataChunk& output);
+  static unique_ptr<FunctionData> UnpinTableBind(ClientContext& context,
+                                                 TableFunctionBindInput& input,
+                                                 vector<LogicalType>& return_types,
+                                                 vector<string>& names);
+
+#ifdef SIRIUS_ENABLE_LEGACY
   static bool buffer_is_initialized;
+#endif
 };
 
 }  // namespace duckdb

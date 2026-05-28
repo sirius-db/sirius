@@ -24,14 +24,15 @@
 
 #include <log/logging.hpp>
 #include <op/scan/iceberg_delete_filter.hpp>
+#include <op/scan/iceberg_metadata_reader.hpp>
 
 #include <algorithm>
 
 namespace sirius::op::scan {
 
 positional_delete_filter::positional_delete_filter(
-  std::unordered_map<std::string, std::vector<int64_t>> deletes)
-  : _positional_deletes(std::move(deletes))
+  std::shared_ptr<const IcebergDeleteData> delete_data)
+  : _delete_data(std::move(delete_data))
 {
 }
 
@@ -40,8 +41,8 @@ std::unique_ptr<cudf::table> positional_delete_filter::apply(std::unique_ptr<cud
                                                              int64_t first_row,
                                                              rmm::cuda_stream_view stream)
 {
-  auto it = _positional_deletes.find(data_file_path);
-  if (it == _positional_deletes.end() || it->second.empty()) {
+  auto it = _delete_data->positional_deletes.find(data_file_path);
+  if (it == _delete_data->positional_deletes.end() || it->second.empty()) {
     return tbl;  // No deletes for this file
   }
 

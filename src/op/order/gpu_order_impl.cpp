@@ -22,7 +22,7 @@ namespace sirius {
 namespace op {
 
 std::shared_ptr<cucascade::data_batch> gpu_order_impl::local_order_by(
-  std::shared_ptr<cucascade::data_batch> input,
+  const cucascade::read_only_data_batch& input,
   const std::vector<int>& order_key_idx,
   std::vector<cudf::order> const& column_order,
   std::vector<cudf::null_order> const& null_precedence,
@@ -38,7 +38,7 @@ std::shared_ptr<cucascade::data_batch> gpu_order_impl::local_order_by(
   }
 
   // Get sorted order
-  auto input_table = get_cudf_table_view(*input);
+  auto input_table = get_cudf_table_view(input);
   std::vector<cudf::column_view> sort_cols;
   for (int idx : order_key_idx) {
     sort_cols.push_back(input_table.column(idx));
@@ -61,7 +61,7 @@ std::shared_ptr<cucascade::data_batch> gpu_order_impl::local_order_by(
                                    memory_space.get_default_allocator());
 
   // Create the output data batch
-  return make_data_batch(std::move(output_table), memory_space);
+  return make_data_batch(std::move(output_table), memory_space, stream);
 }
 
 }  // namespace op

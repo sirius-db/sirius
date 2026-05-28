@@ -23,6 +23,7 @@
 #include <data/host_parquet_representation.hpp>
 #include <data/host_parquet_representation_converters.hpp>
 #include <data/sirius_converter_registry.hpp>
+#include <memory/resource_ref_utils.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 
 // cucascade
@@ -74,8 +75,9 @@ static std::vector<memory_space_config> create_test_configs()
   reservation_manager_configurator builder;
   builder.set_number_of_gpus(1)
     .set_gpu_usage_limit(2048ull * 1024 * 1024)
-    .set_gpu_memory_resource_factory(
-      [](int, size_t) { return std::make_unique<rmm::mr::cuda_memory_resource>(); })
+    .set_gpu_memory_resource_factory([](int device_id, size_t capacity) {
+      return cucascade::memory::make_default_gpu_memory_resource(device_id, capacity);
+    })
     .use_host_per_gpu()
     .set_per_host_capacity(4096ull * 1024 * 1024);
   return builder.build();
@@ -487,8 +489,9 @@ TEST_CASE("host_parquet_representation converts to gpu_table_representation",
     host_space->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
   REQUIRE(fsmr != nullptr);
   cucascade::memory::small_pinned_host_memory_resource slab_mr(*fsmr);
+  auto slab_mr_view = sirius::memory::make_host_device_resource_view_checked(&slab_mr);
   // RAII guard: restores previous cuDF state before slab_mr is destroyed.
-  // Declared AFTER slab_mr so it is destroyed FIRST (reverse construction order).
+  // Declared AFTER slab_mr/slab_mr_view so it is destroyed FIRST (reverse construction order).
   struct cudf_pinned_guard {
     rmm::host_device_async_resource_ref prev_mr;
     std::size_t prev_threshold;
@@ -497,8 +500,9 @@ TEST_CASE("host_parquet_representation converts to gpu_table_representation",
       cudf::set_pinned_memory_resource(prev_mr);
       cudf::set_allocate_host_as_pinned_threshold(prev_threshold);
     }
-  } pinned_guard{cudf::set_pinned_memory_resource(slab_mr),
-                 cudf::get_allocate_host_as_pinned_threshold()};
+  } pinned_guard{
+    cudf::set_pinned_memory_resource(rmm::host_device_async_resource_ref{slab_mr_view}),
+    cudf::get_allocate_host_as_pinned_threshold()};
   cudf::set_allocate_host_as_pinned_threshold(
     cucascade::memory::small_pinned_host_memory_resource::MAX_SLAB_SIZE);
 
@@ -516,9 +520,9 @@ TEST_CASE("host_parquet_representation converts to gpu_table_representation",
 
   REQUIRE(gpu_result != nullptr);
   REQUIRE(gpu_result->get_current_tier() == Tier::GPU);
-  REQUIRE(gpu_result->get_table().num_rows() == 500);
+  REQUIRE(gpu_result->get_table_view().num_rows() == 500);
   // 3 columns: id (INT32), value (BIGINT), price (DOUBLE)
-  REQUIRE(gpu_result->get_table().num_columns() == 3);
+  REQUIRE(gpu_result->get_table_view().num_columns() == 3);
   REQUIRE(gpu_result->get_size_in_bytes() > 0);
 
   // Explicitly destroy GPU result and representation before the memory manager
@@ -620,8 +624,8 @@ TEST_CASE("host_parquet_representation converts to GPU with projected columns",
   stream.synchronize();
 
   REQUIRE(gpu_result != nullptr);
-  REQUIRE(gpu_result->get_table().num_rows() == 200);
-  REQUIRE(gpu_result->get_table().num_columns() == 2);  // only "id" and "price"
+  REQUIRE(gpu_result->get_table_view().num_rows() == 200);
+  REQUIRE(gpu_result->get_table_view().num_columns() == 2);  // only "id" and "price"
 
   // Explicitly destroy GPU result and representation before the memory manager
   gpu_result.reset();
@@ -651,6 +655,7 @@ TEST_CASE("host_parquet_representation converts to GPU with post-filter projecte
     host_space->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
   REQUIRE(fsmr != nullptr);
   cucascade::memory::small_pinned_host_memory_resource slab_mr(*fsmr);
+  auto slab_mr_view = sirius::memory::make_host_device_resource_view_checked(&slab_mr);
   struct cudf_pinned_guard {
     rmm::host_device_async_resource_ref prev_mr;
     std::size_t prev_threshold;
@@ -659,8 +664,9 @@ TEST_CASE("host_parquet_representation converts to GPU with post-filter projecte
       cudf::set_pinned_memory_resource(prev_mr);
       cudf::set_allocate_host_as_pinned_threshold(prev_threshold);
     }
-  } pinned_guard{cudf::set_pinned_memory_resource(slab_mr),
-                 cudf::get_allocate_host_as_pinned_threshold()};
+  } pinned_guard{
+    cudf::set_pinned_memory_resource(rmm::host_device_async_resource_ref{slab_mr_view}),
+    cudf::get_allocate_host_as_pinned_threshold()};
   cudf::set_allocate_host_as_pinned_threshold(
     cucascade::memory::small_pinned_host_memory_resource::MAX_SLAB_SIZE);
 
@@ -680,7 +686,7 @@ TEST_CASE("host_parquet_representation converts to GPU with post-filter projecte
   stream.synchronize();
 
   REQUIRE(gpu_result != nullptr);
-  auto table_view = gpu_result->get_table().view();
+  auto table_view = gpu_result->get_table_view();
   REQUIRE(table_view.num_rows() == 200);
   REQUIRE(table_view.num_columns() == 2);
   REQUIRE(table_view.column(0).type().id() == cudf::type_id::INT32);
@@ -743,9 +749,9 @@ TEST_CASE("host_parquet_representation clone then convert to GPU",
   REQUIRE(gpu_cloned != nullptr);
 
   // Both GPU representations should have the same shape and data
-  REQUIRE(gpu_orig->get_table().num_rows() == gpu_cloned->get_table().num_rows());
-  REQUIRE(gpu_orig->get_table().num_columns() == gpu_cloned->get_table().num_columns());
-  REQUIRE(gpu_orig->get_table().num_rows() == 300);
+  REQUIRE(gpu_orig->get_table_view().num_rows() == gpu_cloned->get_table_view().num_rows());
+  REQUIRE(gpu_orig->get_table_view().num_columns() == gpu_cloned->get_table_view().num_columns());
+  REQUIRE(gpu_orig->get_table_view().num_rows() == 300);
 
   // Explicitly destroy GPU results and representations before the memory manager
   gpu_orig.reset();
@@ -765,8 +771,9 @@ TEST_CASE("host_parquet_representation cross-host copy converter",
   reservation_manager_configurator builder;
   builder.set_number_of_gpus(2)
     .set_gpu_usage_limit(2048ull * 1024 * 1024)
-    .set_gpu_memory_resource_factory(
-      [](int, size_t) { return std::make_unique<rmm::mr::cuda_memory_resource>(); })
+    .set_gpu_memory_resource_factory([](int device_id, size_t capacity) {
+      return cucascade::memory::make_default_gpu_memory_resource(device_id, capacity);
+    })
     .use_host_per_gpu()
     .set_per_host_capacity(4096ull * 1024 * 1024);
 

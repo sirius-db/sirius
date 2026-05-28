@@ -18,14 +18,17 @@ cuda-nvml-dev = "*"
 cxx-compiler = "*"
 make = "*"
 ninja = "*"
-sccache = "*"
+sccache = "=0.15.0" # Version must match sccache version installed by mozilla-actions/sccache-action in GH workflows
 unzip = "*"
 clang = "21.*"
 wget = "*"
 pre-commit = "*"
+identify = ">=2.6"
 clang-tools = "21.*"
 pkg-config = "*"
 mold = "*"
+libprotobuf = "*"
+rust = "*"
 
 [feature.dev-libs.dependencies]
 librmm = "*"
@@ -35,6 +38,10 @@ libabseil = "*"
 duckdb = "=1.5.2"
 spdlog = "1.8.*"
 sqlite = "3.*"
+rust-src = "*"
+liburing = "*"
+openssl = "*"
+libcurl = "*"
 
 [tasks]
 
@@ -64,6 +71,8 @@ CUDAARCHS = "75-real;80-real;86-real;90a-real"
 VCPKG_CUDA_VERSION = "12"
 
 [feature.vcpkg.dependencies]
+# Enable S3 use for vcpkg cache
+awscli = "*"
 bison = "*"
 libnvjitlink-dev = "*"
 cuda-nvrtc-dev = "*"

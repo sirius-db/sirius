@@ -72,6 +72,9 @@ class iceberg_delete_filter {
                                              rmm::cuda_stream_view stream) = 0;
 };
 
+// Forward declaration — full definition in iceberg_metadata_reader.hpp.
+struct IcebergDeleteData;
+
 //===----------------------------------------------------------------------===//
 // Positional delete filter
 //===----------------------------------------------------------------------===//
@@ -86,10 +89,10 @@ class iceberg_delete_filter {
 class positional_delete_filter : public iceberg_delete_filter {
  public:
   /**
-   * @param deletes Map of data_file_path -> sorted positions to delete.
-   *                Ownership is moved in.
+   * @param delete_data  Shared ownership of the materialized delete data
+   *                     (keeps positional delete map alive for query lifetime).
    */
-  explicit positional_delete_filter(std::unordered_map<std::string, std::vector<int64_t>> deletes);
+  explicit positional_delete_filter(std::shared_ptr<const IcebergDeleteData> delete_data);
 
   std::unique_ptr<cudf::table> apply(std::unique_ptr<cudf::table> tbl,
                                      std::string const& data_file_path,
@@ -97,7 +100,7 @@ class positional_delete_filter : public iceberg_delete_filter {
                                      rmm::cuda_stream_view stream) override;
 
  private:
-  std::unordered_map<std::string, std::vector<int64_t>> _positional_deletes;
+  std::shared_ptr<const IcebergDeleteData> _delete_data;
 };
 
 //===----------------------------------------------------------------------===//
@@ -107,23 +110,24 @@ class positional_delete_filter : public iceberg_delete_filter {
 /**
  * @brief Applies Iceberg V2 equality deletes to each data batch.
  *
- * Holds a pre-built cudf::distinct_hash_join (build side = deduplicated
- * delete key rows).  For each batch, probes the hash join with the data
- * chunk's key columns, builds a boolean anti-join mask entirely on GPU
- * via thrust::transform, and applies cudf::apply_boolean_mask.
+ * Holds a shared reference to the pre-materialized IcebergDeleteData
+ * (which owns the GPU hash join and delete key table).  For each batch,
+ * probes the hash join with the data chunk's key columns, builds a
+ * boolean anti-join mask entirely on GPU via thrust::transform, and
+ * applies cudf::apply_boolean_mask.
  *
  * No GPU-to-host data transfer is required.
  */
 class equality_delete_filter : public iceberg_delete_filter {
  public:
   /**
-   * @param delete_key_table  Deduplicated equality-delete key rows on GPU.
-   * @param hash_join         Pre-built distinct hash join (build side = delete_key_table).
-   * @param data_key_indices  Indices into the data-chunk columns that correspond
-   *                          to the equality key columns (parallel to delete_key_table columns).
+   * @param delete_data      Shared ownership of the materialized delete data
+   *                         (keeps GPU table + hash join alive for query lifetime).
+   * @param data_key_indices Indices into the data-chunk columns that correspond
+   *                         to the equality key columns.
    */
-  equality_delete_filter(std::unique_ptr<cudf::table> delete_key_table,
-                         std::unique_ptr<cudf::distinct_hash_join> hash_join,
+  equality_delete_filter(std::shared_ptr<const IcebergDeleteData> delete_data,
+                         size_t group_index,
                          std::vector<cudf::size_type> data_key_indices);
 
   std::unique_ptr<cudf::table> apply(std::unique_ptr<cudf::table> tbl,
@@ -132,8 +136,8 @@ class equality_delete_filter : public iceberg_delete_filter {
                                      rmm::cuda_stream_view stream) override;
 
  private:
-  std::unique_ptr<cudf::table> _delete_key_table;
-  std::unique_ptr<cudf::distinct_hash_join> _hash_join;
+  std::shared_ptr<const IcebergDeleteData> _delete_data;
+  size_t _group_index;
   std::vector<cudf::size_type> _data_key_indices;
 };
 

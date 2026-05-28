@@ -46,9 +46,10 @@ SIRIUS_DUCKDB="$PROJECT_DIR/build/release/duckdb"
 PARQUET_DIR=""
 NUM_ITERATIONS=2
 SESSION_TIMEOUT=1200
-SCAN_CACHE_LEVEL=""
+DROP_OS_CACHE=false
 MULTI_SESSION=false
-while [ "${1:-}" = "--parquet-dir" ] || [ "${1:-}" = "--iterations" ] || [ "${1:-}" = "--timeout" ] || [ "${1:-}" = "--cache-level" ] || [ "${1:-}" = "--multi-session" ]; do
+PINNING_MODE="none"
+while [ "${1:-}" = "--parquet-dir" ] || [ "${1:-}" = "--iterations" ] || [ "${1:-}" = "--timeout" ] || [ "${1:-}" = "--drop-os-cache" ] || [ "${1:-}" = "--multi-session" ] || [ "${1:-}" = "--pinning-mode" ]; do
     if [ "$1" = "--parquet-dir" ]; then
         PARQUET_DIR="$2"
         shift 2
@@ -58,22 +59,50 @@ while [ "${1:-}" = "--parquet-dir" ] || [ "${1:-}" = "--iterations" ] || [ "${1:
     elif [ "$1" = "--timeout" ]; then
         SESSION_TIMEOUT="$2"
         shift 2
-    elif [ "$1" = "--cache-level" ]; then
-        SCAN_CACHE_LEVEL="$2"
-        shift 2
+    elif [ "$1" = "--drop-os-cache" ]; then
+        DROP_OS_CACHE=true
+        shift
     elif [ "$1" = "--multi-session" ]; then
         MULTI_SESSION=true
         shift
+    elif [ "$1" = "--pinning-mode" ]; then
+        PINNING_MODE="$2"
+        shift 2
     fi
 done
 
+case "$PINNING_MODE" in
+    none|per-query) ;;
+    *)
+        echo "ERROR: --pinning-mode must be 'none' or 'per-query' (got: $PINNING_MODE)"
+        exit 1
+        ;;
+esac
+
 if [ $# -lt 3 ]; then
-    echo "Usage: $0 [--parquet-dir <path>] [--iterations <N>] [--timeout <seconds>] [--multi-session] <engine> <scale_factor> <query_numbers...>"
+    echo "Usage: $0 [--parquet-dir <path>] [--iterations <N>] [--timeout <seconds>] [--multi-session] [--drop-os-cache] [--pinning-mode none|per-query] <engine> <scale_factor> <query_numbers...>"
     echo "Example: $0 sirius 100 \`seq 1 22\`"
-    echo "  --iterations N    Number of iterations per query (default: 2, 1 cold + N-1 warm)"
-    echo "  --timeout N       Kill the DuckDB session after N seconds (default: 1200, 0 = no timeout)"
-    echo "  --multi-session   Run each query in its own DuckDB process (fresh state per query)"
+    echo "  --iterations N      Number of iterations per query (default: 2, 1 cold + N-1 warm)"
+    echo "  --timeout N         Kill the DuckDB session after N seconds (default: 1200, 0 = no timeout)"
+    echo "  --multi-session     Run each query in its own DuckDB process (fresh state per query)"
+    echo "  --drop-os-cache     Drop OS filesystem cache before each query (requires --multi-session and sudo)"
+    echo "  --pinning-mode MODE 'per-query' calls pin_table for each query's columns before its iterations,"
+    echo "                      then unpin_table afterward. Sirius engine only. Default: 'none'."
     exit 1
+fi
+
+if [ "$DROP_OS_CACHE" = true ] && [ "$MULTI_SESSION" = false ]; then
+    echo "ERROR: --drop-os-cache requires --multi-session (each query must run in its own process)"
+    exit 1
+fi
+
+if [ "$DROP_OS_CACHE" = true ]; then
+    if ! sudo -n -l /usr/bin/tee /proc/sys/vm/drop_caches > /dev/null 2>&1; then
+        echo "ERROR: --drop-os-cache requires passwordless sudo for /usr/bin/tee."
+        echo "Configure it with:"
+        echo "  echo '\$(whoami) ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches' | sudo tee /etc/sudoers.d/drop_caches"
+        exit 1
+    fi
 fi
 
 ENGINE="$1"
@@ -99,10 +128,44 @@ if [ "$ENGINE" != "sirius" ]; then
     export SIRIUS_DISABLE=1
 fi
 
-if [ ! -d "$PARQUET_DIR" ]; then
+has_parquet_data() {
+    local parquet_dir="$1"
+    local parquet_file
+    for parquet_file in "$parquet_dir"/*.parquet "$parquet_dir"/*/*.parquet; do
+        [ -f "$parquet_file" ] && return 0
+    done
+    return 1
+}
+
+ensure_parquet_data() {
+    if [ -d "$PARQUET_DIR" ] && has_parquet_data "$PARQUET_DIR"; then
+        return 0
+    fi
+
     echo "Parquet directory not found: $PARQUET_DIR"
-    echo "Generating TPC-H SF${SF} dataset using tpchgen-rs..."
-    (cd "$SCRIPT_DIR" && pixi run bash generate_tpch_data.sh "$SF" "$PARQUET_DIR")
+    echo "Generating TPC-H SF${SF} dataset..."
+    (
+        cd "$SCRIPT_DIR" &&
+            env -u PIXI_PROJECT_MANIFEST -u PIXI_ENVIRONMENT_NAME \
+                pixi run --manifest-path "$SCRIPT_DIR/pixi.toml" \
+                bash generate_tpch_data.sh "$SF" "$PARQUET_DIR"
+    )
+    local status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "ERROR: failed to generate parquet data for SF${SF} (exit code ${status})."
+        return "$status"
+    fi
+
+    if ! [ -d "$PARQUET_DIR" ] || ! has_parquet_data "$PARQUET_DIR"; then
+        echo "ERROR: parquet data is still unavailable after generation: $PARQUET_DIR"
+        return 1
+    fi
+}
+
+ensure_parquet_data
+status=$?
+if [ "$status" -ne 0 ]; then
+    exit "$status"
 fi
 
 # Build CREATE VIEW statements.
@@ -125,15 +188,17 @@ if [ -n "${TIMING_CSV:-}" ]; then
     echo "query,seconds" > "$TIMING_CSV"
 fi
 
-# Load per-query scan cache level overrides from config file.
-# Format: <query_number> <cache_level> (one per line, # comments ignored).
-# Queries not listed use the default (table_gpu).
-CACHE_CONFIG="$SCRIPT_DIR/scan_cache_levels.conf"
+# Load per-query scan cache level overrides from YAML config.
+# Used in multi-session mode only — in single-session, the Sirius config YAML controls cache level.
+# Format: <query_number>: <cache_level> (one per line, # comments ignored).
+CACHE_CONFIG="$SCRIPT_DIR/scan_cache_levels.yaml"
 declare -A QUERY_CACHE_LEVEL
-if [ "$SF" -ge 1000 ] 2>/dev/null && [ -f "$CACHE_CONFIG" ]; then
-    while IFS=' ' read -r qnum level; do
-        [[ -z "$qnum" || "$qnum" == \#* ]] && continue
-        QUERY_CACHE_LEVEL[$qnum]="$level"
+if [ -f "$CACHE_CONFIG" ]; then
+    while IFS=': ' read -r key value; do
+        [[ -z "$key" || "$key" == \#* ]] && continue
+        value="${value## }"
+        [[ -z "$value" ]] && continue
+        QUERY_CACHE_LEVEL[$key]="$value"
     done < "$CACHE_CONFIG"
 fi
 
@@ -157,7 +222,17 @@ echo "Running TPC-H queries against SF${SF} parquet data"
 echo "Engine: $ENGINE"
 echo "Parquet dir: $PARQUET_DIR"
 echo "Session: $SESSION_MODE"
+if [ "$DROP_OS_CACHE" = true ]; then
+    echo "Drop OS cache: enabled"
+fi
 echo "Iterations: $NUM_ITERATIONS (1 cold + $((NUM_ITERATIONS - 1)) warm)"
+if [ "$PINNING_MODE" != "none" ]; then
+    if [ "$ENGINE" = "sirius" ]; then
+        echo "Pinning mode: $PINNING_MODE (pin_table per query, tier=${SIRIUS_PIN_TIER:-gpu})"
+    else
+        echo "Pinning mode: $PINNING_MODE (ignored — Sirius-only feature)"
+    fi
+fi
 echo "Queries: ${QUERIES[*]}"
 if [ "$SESSION_TIMEOUT" -gt 0 ] 2>/dev/null; then
     echo "Session timeout: ${SESSION_TIMEOUT}s"
@@ -176,6 +251,11 @@ run_single_session() {
     local MARKER_PREFIX="__TPCH_MARKER__"
     local END_MARKER="__TPCH_END__"
 
+    local PIN_ENABLED=false
+    if [ "$PINNING_MODE" = "per-query" ] && [ "$ENGINE" = "sirius" ]; then
+        PIN_ENABLED=true
+    fi
+
     local TEMP_SQL
     TEMP_SQL=$(mktemp /tmp/tpch_all_XXXXXX.sql)
     printf '%s\n' "$VIEW_SQL" > "$TEMP_SQL"
@@ -183,11 +263,12 @@ run_single_session() {
 
     for q in "${VALID_QUERIES[@]}"; do
         local QUERY_FILE="$QUERY_DIR/q${q}.sql"
-        # Set per-query scan cache level.  Bracket the SET with .timer off/on
-        # so it doesn't produce a spurious "Run Time" line in the output.
-        if [ "$ENGINE" = "sirius" ]; then
-            local qlevel="${SCAN_CACHE_LEVEL:-${QUERY_CACHE_LEVEL[$q]:-table_gpu}}"
-            printf ".timer off\nSET scan_cache_level = '%s';\n.timer on\n" "$qlevel" >> "$TEMP_SQL"
+        # Pin/unpin live OUTSIDE the __TPCH_MARKER__ section so pin/unpin
+        # Run Time lines never get counted as query iterations.
+        if [ "$PIN_ENABLED" = true ]; then
+            echo ".print __TPCH_PIN_BEGIN__ ${q}" >> "$TEMP_SQL"
+            python3 "$SCRIPT_DIR/tpch_pin_columns.py" pin "$q" "$PARQUET_DIR" >> "$TEMP_SQL"
+            echo ".print __TPCH_PIN_END__ ${q}" >> "$TEMP_SQL"
         fi
         echo ".print ${MARKER_PREFIX} ${q}" >> "$TEMP_SQL"
         # N iterations back-to-back — nothing between them.
@@ -195,6 +276,11 @@ run_single_session() {
             cat "$QUERY_FILE" >> "$TEMP_SQL"
             printf '\n' >> "$TEMP_SQL"
         done
+        if [ "$PIN_ENABLED" = true ]; then
+            echo ".print __TPCH_UNPIN_BEGIN__ ${q}" >> "$TEMP_SQL"
+            python3 "$SCRIPT_DIR/tpch_pin_columns.py" unpin "$q" >> "$TEMP_SQL"
+            echo ".print __TPCH_UNPIN_END__ ${q}" >> "$TEMP_SQL"
+        fi
     done
     echo ".print ${END_MARKER}" >> "$TEMP_SQL"
 
@@ -227,10 +313,13 @@ run_single_session() {
     TOTAL_ELAPSED=$(echo "$END_TIME - $START_TIME" | bc)
     echo "Total wall-clock time: ${TOTAL_ELAPSED}s"
 
+    local RUN_STATUS=0
     if [ "$SESSION_EXIT" -eq 124 ]; then
         echo "SESSION TIMEOUT: DuckDB was killed after ${SESSION_TIMEOUT}s"
+        RUN_STATUS=124
     elif [ "$SESSION_EXIT" -ne 0 ]; then
         echo "SESSION FAILED: DuckDB exited with code $SESSION_EXIT"
+        RUN_STATUS=$SESSION_EXIT
     fi
 
     rm -f "$TEMP_SQL"
@@ -256,25 +345,27 @@ run_single_session() {
         echo ""
         echo "========== Q${q} =========="
 
-        # Extract the section between this query's marker and the next marker.
+        # Extract the section between this query's marker and the next __TPCH_* marker.
+        # Stopping at any __TPCH_ prefix keeps pin/unpin Run Time lines (which sit in
+        # __TPCH_PIN_*/__TPCH_UNPIN_* sections when --pinning-mode per-query is on)
+        # out of the query iteration window.
         local SECTION
-        SECTION=$(awk -v start="${MARKER_PREFIX} ${q}" \
-                      -v prefix="${MARKER_PREFIX}" \
-                      -v end="${END_MARKER}" '
-            $0 == start                                   { cap = 1; next }
-            cap && ($0 == end || index($0, prefix) == 1)  { exit }
-            cap                                           { print }
+        SECTION=$(awk -v start="${MARKER_PREFIX} ${q}" '
+            $0 == start                            { cap = 1; next }
+            cap && index($0, "__TPCH_") == 1       { exit }
+            cap                                    { print }
         ' "$TEMP_OUTPUT")
 
         if [ -z "$SECTION" ]; then
             echo "  NO OUTPUT (session may have timed out or crashed before this query)"
-            echo "no output" > "$RESULT_FILE"
+            echo "error: no output (session may have timed out or crashed before this query)" > "$RESULT_FILE"
             {
                 echo "step,runtime_s"
                 for ((i = 0; i < NUM_ITERATIONS; i++)); do
                     echo "iter_$((i + 1)),N/A"
                 done
             } > "$TIMING_FILE"
+            [ "$RUN_STATUS" -eq 0 ] && RUN_STATUS=1
             echo "  Timings written to $TIMING_FILE"
             continue
         fi
@@ -313,12 +404,14 @@ run_single_session() {
     done
 
     rm -f "$TEMP_OUTPUT"
+    return "$RUN_STATUS"
 }
 
 # =============================================================================
 # Multi-session mode: each query in its own fresh DuckDB process (duckdb only)
 # =============================================================================
 run_multi_session() {
+    local RUN_STATUS=0
     for q in "${VALID_QUERIES[@]}"; do
         local QUERY_FILE="$QUERY_DIR/q${q}.sql"
 
@@ -337,20 +430,49 @@ run_multi_session() {
         echo ""
         echo "========== Q${q} =========="
 
+        # Drop OS filesystem cache for true cold-run benchmarking.
+        if [ "$DROP_OS_CACHE" = true ]; then
+            echo "  Dropping OS filesystem cache..."
+            sync
+            if echo 3 | sudo -n /usr/bin/tee /proc/sys/vm/drop_caches > /dev/null 2>&1; then
+                echo "  OS cache dropped."
+            else
+                echo "  ERROR: Failed to drop OS cache. Configure passwordless sudo:"
+                echo "    echo '\$(whoami) ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches' | sudo tee /etc/sudoers.d/drop_caches"
+                exit 1
+            fi
+        fi
+
         # Build per-query SQL: views + scan cache level (sirius) + timer + N iterations.
+        # In --pinning-mode per-query, pin before iterations and unpin after — the unpin
+        # is mandatory even though the process is about to exit, to release host-pinned
+        # memory cleanly back to the allocator before the next process starts.
+        local PIN_ENABLED=false
+        if [ "$PINNING_MODE" = "per-query" ] && [ "$ENGINE" = "sirius" ]; then
+            PIN_ENABLED=true
+        fi
         local TEMP_SQL
         TEMP_SQL=$(mktemp /tmp/tpch_q${q}_XXXXXX.sql)
         {
             printf '%s\n' "$VIEW_SQL"
-            if [ "$ENGINE" = "sirius" ]; then
-                local qlevel="${SCAN_CACHE_LEVEL:-${QUERY_CACHE_LEVEL[$q]:-table_gpu}}"
-                printf "SET scan_cache_level = '%s';\n" "$qlevel"
+            if [ "$ENGINE" = "sirius" ] && [ -n "${QUERY_CACHE_LEVEL[$q]:-}" ]; then
+                printf "SET scan_cache_level = '%s';\n" "${QUERY_CACHE_LEVEL[$q]}"
             fi
             printf ".timer on\n"
+            if [ "$PIN_ENABLED" = true ]; then
+                printf ".print __TPCH_PIN_BEGIN__ %s\n" "$q"
+                python3 "$SCRIPT_DIR/tpch_pin_columns.py" pin "$q" "$PARQUET_DIR"
+                printf ".print __TPCH_PIN_END__ %s\n" "$q"
+            fi
             for ((iter = 0; iter < NUM_ITERATIONS; iter++)); do
                 cat "$QUERY_FILE"
                 printf '\n'
             done
+            if [ "$PIN_ENABLED" = true ]; then
+                printf ".print __TPCH_UNPIN_BEGIN__ %s\n" "$q"
+                python3 "$SCRIPT_DIR/tpch_pin_columns.py" unpin "$q"
+                printf ".print __TPCH_UNPIN_END__ %s\n" "$q"
+            fi
         } > "$TEMP_SQL"
 
         # Run in a fresh DuckDB process.
@@ -371,8 +493,10 @@ run_multi_session() {
 
         if [ "$Q_EXIT" -eq 124 ]; then
             echo "  TIMEOUT: killed after ${SESSION_TIMEOUT}s"
+            RUN_STATUS=124
         elif [ "$Q_EXIT" -ne 0 ]; then
             echo "  FAILED: DuckDB exited with code $Q_EXIT"
+            [ "$RUN_STATUS" -eq 0 ] && RUN_STATUS=$Q_EXIT
         fi
 
         # Check for errors in output.
@@ -394,15 +518,29 @@ run_multi_session() {
             continue
         fi
 
+        # When pinning is on, the session output contains pin/unpin Run Time lines
+        # bracketing the iterations. Extract just the iteration window so the
+        # downstream awk and grep see only query iterations.
+        local PARSE_INPUT
+        if [ "$PIN_ENABLED" = true ]; then
+            PARSE_INPUT=$(awk '
+                index($0, "__TPCH_PIN_END__")    == 1 { cap = 1; next }
+                index($0, "__TPCH_UNPIN_BEGIN__") == 1 { exit }
+                cap { print }
+            ' <<< "$OUTPUT")
+        else
+            PARSE_INPUT="$OUTPUT"
+        fi
+
         # Save last-iteration result (lines between the 2nd-to-last and last "Run Time" lines).
         awk -v n="$NUM_ITERATIONS" '
             /Run Time \(s\):/ { tc++; next }
             tc == (n - 1)     { print }
-        ' <<< "$OUTPUT" > "$RESULT_FILE"
+        ' <<< "$PARSE_INPUT" > "$RESULT_FILE"
 
         # Extract per-iteration timings.
         local TIMES
-        readarray -t TIMES < <(grep -oP 'Run Time \(s\): real \K[0-9]+\.[0-9]+' <<< "$OUTPUT")
+        readarray -t TIMES < <(grep -oP 'Run Time \(s\): real \K[0-9]+\.[0-9]+' <<< "$PARSE_INPUT")
 
         {
             echo "step,runtime_s"
@@ -426,24 +564,29 @@ run_multi_session() {
 
         echo "  Timings written to $TIMING_FILE"
     done
+    return "$RUN_STATUS"
 }
 
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
+RUN_STATUS=0
 if [ "$MULTI_SESSION" = true ]; then
-    run_multi_session
+    run_multi_session || RUN_STATUS=$?
 else
-    run_single_session
+    run_single_session || RUN_STATUS=$?
 fi
 
 # ---------------------------------------------------------------------------
 # Split the Sirius log into per-query segments.
 #
-# The log contains "QueryBegin: call gpu_execution(...)" lines for each
-# iteration.  We group every NUM_ITERATIONS consecutive QueryBegin entries
-# (one per iteration) into one query segment and copy it to Q_DIR/sirius.log.
-# The combined log is kept in OUTPUT_DIR.
+# Under Super Sirius transparent execution, each query iteration is logged as
+# "QueryBegin: <raw SQL>" — there is no `call gpu_execution(...)` wrapper.
+# Skip the session prologue (CREATE VIEW for view setup) and any pinning-mode
+# CALLs (pin_table / unpin_table) so the remaining QueryBegin lines correspond
+# 1:1 to user query iterations. We group every NUM_ITERATIONS consecutive
+# entries into one query segment and copy it to Q_DIR/sirius.log. The combined
+# log is kept in OUTPUT_DIR.
 # ---------------------------------------------------------------------------
 if [ "$ENGINE" = "sirius" ] && [ "$MULTI_SESSION" = false ] && [ -n "${OUTPUT_DIR:-}" ] && [ ${#VALID_QUERIES[@]} -gt 0 ]; then
     # spdlog daily sink names files sirius_YYYY-MM-DD.log; find the most recent one.
@@ -454,8 +597,16 @@ if [ "$ENGINE" = "sirius" ] && [ "$MULTI_SESSION" = false ] && [ -n "${OUTPUT_DI
     if [ -n "$LOG_FILE" ]; then
         echo ""
         echo "Splitting Sirius log per query (${NUM_ITERATIONS} iterations per query)..."
-        readarray -t QB_LINES < <(grep -n 'QueryBegin: call' "$LOG_FILE" | cut -d: -f1)
+        readarray -t QB_LINES < <(
+            grep -nE 'QueryBegin:' "$LOG_FILE" \
+                | grep -ivE 'QueryBegin: (CREATE VIEW|CALL (pin_table|unpin_table))' \
+                | cut -d: -f1
+        )
         TOTAL_LOG_LINES=$(wc -l < "$LOG_FILE")
+
+        if [ "${#QB_LINES[@]}" -ne $((${#VALID_QUERIES[@]} * NUM_ITERATIONS)) ]; then
+            echo "  WARNING: expected $((${#VALID_QUERIES[@]} * NUM_ITERATIONS)) QueryBegin lines (queries × iterations) but found ${#QB_LINES[@]} — split may be misaligned."
+        fi
 
         for ((i = 0; i < ${#VALID_QUERIES[@]}; i++)); do
             q="${VALID_QUERIES[$i]}"
@@ -486,3 +637,4 @@ else
     echo "Results saved as result_${ENGINE}_sf${SF}_q*.txt"
     echo "Timings saved as timings_${ENGINE}_sf${SF}_q*.csv"
 fi
+exit "$RUN_STATUS"

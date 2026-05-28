@@ -15,12 +15,12 @@
  */
 
 // sirius
-#include <expression_executor/gpu_dispatcher.hpp>
+#include <cudf/cudf_utils.hpp>
+
+#include <expression/expression_internal.hpp>
+#include <expression/function_id.hpp>
+#include <expression_executor/ast_supported_types.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
-#include <expression_executor/gpu_expression_executor_state.hpp>
-#include <gpu_buffer_manager.hpp>
-#include <gpu_columns.hpp>
-#include <operator/gpu_materialize.hpp>
 
 // cucascade
 #include <cucascade/data/gpu_data_representation.hpp>
@@ -29,6 +29,16 @@
 // duckdb
 #include <duckdb/common/exception.hpp>
 #include <duckdb/common/types.hpp>
+#include <duckdb/planner/expression.hpp>
+#include <duckdb/planner/expression/bound_between_expression.hpp>
+#include <duckdb/planner/expression/bound_case_expression.hpp>
+#include <duckdb/planner/expression/bound_cast_expression.hpp>
+#include <duckdb/planner/expression/bound_comparison_expression.hpp>
+#include <duckdb/planner/expression/bound_conjunction_expression.hpp>
+#include <duckdb/planner/expression/bound_constant_expression.hpp>
+#include <duckdb/planner/expression/bound_function_expression.hpp>
+#include <duckdb/planner/expression/bound_operator_expression.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
 
 // cudf
 #include <cudf/column/column_factories.hpp>
@@ -54,7 +64,7 @@ bool IsFixedWidth(cudf::data_type const& type)
 }
 }  // namespace
 
-namespace sirius::experimental {
+namespace sirius {
 using data_batch     = cucascade::data_batch;
 using execute_result = gpu_expression_executor::execute_result;
 using ast_result     = gpu_expression_executor::ast_result;
@@ -156,22 +166,33 @@ std::unique_ptr<cudf::column> gpu_expression_executor::execute_result::release_c
 //===----------------------------------------------------------------------===//
 
 gpu_expression_executor::gpu_expression_executor(
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> const& expressions,
-  expression_executor_strategy strategy,
+  duckdb::vector<sirius::expression> const& expressions,
   rmm::device_async_resource_ref resource_ref,
   rmm::cuda_stream_view stream,
+  expression_executor_strategy strategy,
   std::size_t min_ast_size)
   : _strategy(strategy), _mr(resource_ref), _stream(stream), _min_ast_size(min_ast_size)
 {
+  _expressions.reserve(expressions.size());
   for (auto const& expr : expressions) {
-    _expressions.push_back(expr.get());
+    _expressions.push_back(sirius::unwrap(expr));
   }
 }
 
-gpu_expression_executor::gpu_expression_executor(duckdb::Expression const* expression,
-                                                 expression_executor_strategy strategy,
+gpu_expression_executor::gpu_expression_executor(sirius::expression const& expression,
                                                  rmm::device_async_resource_ref resource_ref,
                                                  rmm::cuda_stream_view stream,
+                                                 expression_executor_strategy strategy,
+                                                 std::size_t min_ast_size)
+  : _strategy(strategy), _mr(resource_ref), _stream(stream), _min_ast_size(min_ast_size)
+{
+  _expressions.push_back(sirius::unwrap(expression));
+}
+
+gpu_expression_executor::gpu_expression_executor(duckdb::Expression const* expression,
+                                                 rmm::device_async_resource_ref resource_ref,
+                                                 rmm::cuda_stream_view stream,
+                                                 expression_executor_strategy strategy,
                                                  std::size_t min_ast_size)
   : _strategy(strategy), _mr(resource_ref), _stream(stream), _min_ast_size(min_ast_size)
 {
@@ -243,10 +264,8 @@ void gpu_expression_executor::release_temporaries(
   }
 }
 
-std::shared_ptr<data_batch> gpu_expression_executor::execute(
-  std::shared_ptr<data_batch> input_batch)
+std::unique_ptr<cudf::table> gpu_expression_executor::execute(cudf::table_view input)
 {
-  if (!input_batch) { return input_batch; }
   D_ASSERT(!_expressions.empty());
   _output_columns.clear();
   _output_columns.reserve(_expressions.size());
@@ -258,8 +277,7 @@ std::shared_ptr<data_batch> gpu_expression_executor::execute(
   _temp_columns.clear();
 
   // Get the table_view from the input_batch
-  auto const& input_rep = input_batch->get_data()->cast<cucascade::gpu_table_representation>();
-  _input_table          = input_rep.get_table().view();
+  _input_table = std::move(input);
 
   // Execute the expressions and emit results into _output_columns
   for (auto& _expression : _expressions) {
@@ -300,37 +318,21 @@ std::shared_ptr<data_batch> gpu_expression_executor::execute(
     }
   }
 
-  // Create the data representation
-  std::unique_ptr<cucascade::idata_representation> output_data_rep =
-    std::make_unique<cucascade::gpu_table_representation>(
-      std::make_unique<cudf::table>(std::move(_output_columns), _stream, _mr),
-      *input_batch->get_memory_space());
-
-  // Create the data batch and return
-  auto const batch_id = ::sirius::get_next_batch_id();
-  return std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data_rep));
+  return std::make_unique<cudf::table>(std::move(_output_columns), _stream, _mr);
 }
 
-std::shared_ptr<data_batch> gpu_expression_executor::select(std::shared_ptr<data_batch> input_batch)
+std::unique_ptr<cudf::table> gpu_expression_executor::select(cudf::table_view input)
 {
   D_ASSERT(_expressions.size() == 1);
   auto const& expr = *_expressions[0];
   D_ASSERT(expr.return_type == duckdb::LogicalType::BOOLEAN);
 
   // Call execute(input_batch) to set _input_table and produce the boolean mask as a single column
-  auto mask_batch = execute(input_batch);
-  auto& mask_repr = mask_batch->get_data()->cast<cucascade::gpu_table_representation>();
-  auto mask_view  = mask_repr.get_table().view().column(0);
+  auto mask_batch = execute(input);
+  auto mask_view  = mask_batch->view().column(0);
 
   // Apply the boolean mask to filter the input batch
-  auto output_table = cudf::apply_boolean_mask(_input_table, mask_view, _stream, _mr);
-  std::unique_ptr<cucascade::idata_representation> output_data_rep =
-    std::make_unique<cucascade::gpu_table_representation>(std::move(output_table),
-                                                          *input_batch->get_memory_space());
-
-  // Create the data batch and return
-  auto const batch_id = ::sirius::get_next_batch_id();
-  return std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data_rep));
+  return cudf::apply_boolean_mask(input, mask_view, _stream, _mr);
 }
 
 execute_result gpu_expression_executor::execute(duckdb::Expression const& expr, execution_mode mode)
@@ -413,9 +415,11 @@ std::size_t gpu_expression_executor::count_ast_ops(duckdb::Expression const& exp
 
       // Check the set of supported AST functions. If the function is supported, count 1 for the
       // function itself plus the ops in the children.
-      if (std::find(supported_ast_functions.begin(),
+      auto const resolved_id_opt = sirius::from_duckdb_function_name(func_expr.function.name);
+      if (resolved_id_opt.has_value() &&
+          std::find(supported_ast_functions.begin(),
                     supported_ast_functions.end(),
-                    func_expr.function.name) != supported_ast_functions.end()) {
+                    *resolved_id_opt) != supported_ast_functions.end()) {
         std::size_t count = 1;
         for (const auto& child : func_expr.children) {
           count += count_ast_ops(*child);
@@ -438,12 +442,7 @@ std::size_t gpu_expression_executor::count_ast_ops(duckdb::Expression const& exp
           }
           return count;
         }
-        case duckdb::ExpressionType::OPERATOR_COALESCE:
-          /// TODO: Implement COALESCE operator
-          /// GitHub issue ticket: https://github.com/sirius-db/sirius/issues/635
-          throw duckdb::NotImplementedException(
-            "[gpu_expression_executor] count_ast_ops called on an unsupported COALESCE operator "
-            "expression.");
+        case duckdb::ExpressionType::OPERATOR_COALESCE: return 0;
         case duckdb::ExpressionType::OPERATOR_TRY:
           throw duckdb::NotImplementedException(
             "[gpu_expression_executor] count_ast_ops called on an unsupported TRY operator "
@@ -473,376 +472,4 @@ std::size_t gpu_expression_executor::count_ast_ops(duckdb::Expression const& exp
         static_cast<int>(expr.GetExpressionClass()));
   }
 }
-}  // namespace sirius::experimental
-
-namespace duckdb {
-namespace sirius {
-
-GpuExpressionExecutor::GpuExpressionExecutor(const Expression& expr,
-                                             rmm::device_async_resource_ref resource_ref)
-  : resource_ref(resource_ref)
-{
-  AddExpression(expr);
-}
-
-GpuExpressionExecutor::GpuExpressionExecutor(const vector<unique_ptr<Expression>>& expressions,
-                                             rmm::device_async_resource_ref resource_ref)
-  : resource_ref(resource_ref)
-{
-  D_ASSERT(expressions.size() > 0);
-
-  for (const auto& expr : expressions) {
-    AddExpression(*expr);
-  }
-}
-
-void GpuExpressionExecutor::AddExpression(const Expression& expr)
-{
-  // Add the given expression to the list of expressions this executor is responsible for
-  expressions.push_back(&expr);
-
-  // Initialize the executor state of the expression and add to the list of executor states
-  auto state = std::make_unique<GpuExpressionExecutorState>();
-  Initialize(expr, *state);
-  states.push_back(std::move(state));
-}
-
-void GpuExpressionExecutor::ClearExpressions()
-{
-  states.clear();
-  expressions.clear();
-}
-
-void GpuExpressionExecutor::Initialize(const Expression& expr, GpuExpressionExecutorState& state)
-{
-  // Set the executor of the executor state to this GpuExpressionExecutor
-  state.executor = this;
-
-  // Initialize the state of the expression
-  state.root_state = InitializeState(expr, state);
-}
-
-void GpuExpressionExecutor::SetInputColumns(const GPUIntermediateRelation& input_relation)
-{
-  input_count           = 0;
-  has_null_input_column = false;
-
-  // Shallow copy the columns
-  input_columns = input_relation.columns;
-
-  // Set the input count
-  if (input_columns.empty()) {
-    input_count = 1;
-  } else {
-    // All columns that are not null should have the same count
-    for (const auto& col : input_columns) {
-      const auto temp_count = col == nullptr ? 0
-                              : col->row_ids == nullptr
-                                ? static_cast<cudf::size_type>(col->column_length)
-                                : static_cast<cudf::size_type>(col->row_id_count);
-      if (temp_count > 0) {
-        input_count = temp_count;
-      } else {
-        has_null_input_column = true;
-      }
-    }
-  }
-}
-
-// Helper template function for HasNullLeaf()
-template <typename ExpressionT>
-bool GpuExpressionExecutor::HasNullLeafLoop(const ExpressionT& expr) const
-{
-  for (const auto& child : expr.children) {
-    if (HasNullLeaf(*child)) { return true; }
-  }
-  return false;
-}
-
-bool GpuExpressionExecutor::HasNullLeaf(const Expression& expr) const
-{
-  // Check if the expression is a null reference
-  switch (expr.GetExpressionClass()) {
-    case ExpressionClass::BOUND_BETWEEN: {
-      const auto& between_expr = expr.Cast<BoundBetweenExpression>();
-      return HasNullLeaf(*between_expr.input) || HasNullLeaf(*between_expr.lower) ||
-             HasNullLeaf(*between_expr.upper);
-    }
-    case ExpressionClass::BOUND_CASE: {
-      const auto& case_expr = expr.Cast<BoundCaseExpression>();
-      for (const auto& case_check : case_expr.case_checks) {
-        if (HasNullLeaf(*case_check.when_expr) || HasNullLeaf(*case_check.then_expr)) {
-          return true;
-        }
-      }
-      return HasNullLeaf(*case_expr.else_expr);
-    }
-    case ExpressionClass::BOUND_CAST: {
-      const auto& cast_expr = expr.Cast<BoundCastExpression>();
-      return HasNullLeaf(*cast_expr.child);
-    }
-    case ExpressionClass::BOUND_COMPARISON: {
-      const auto& comp_expr = expr.Cast<BoundComparisonExpression>();
-      return HasNullLeaf(*comp_expr.left) || HasNullLeaf(*comp_expr.right);
-    }
-    case ExpressionClass::BOUND_CONJUNCTION: {
-      return HasNullLeafLoop(expr.Cast<BoundConjunctionExpression>());
-    }
-    case ExpressionClass::BOUND_CONSTANT: {
-      // Base case
-      return false;
-    }
-    case ExpressionClass::BOUND_FUNCTION: {
-      return HasNullLeafLoop(expr.Cast<BoundFunctionExpression>());
-    }
-    case ExpressionClass::BOUND_OPERATOR: {
-      return HasNullLeafLoop(expr.Cast<BoundOperatorExpression>());
-    }
-    case ExpressionClass::BOUND_REF: {
-      // Base case
-      const auto& ref_expr = expr.Cast<BoundReferenceExpression>();
-      const auto& col      = input_columns[ref_expr.index];
-      return col == nullptr || col->data_wrapper.data == nullptr;
-    }
-    default:
-      throw InternalException("HasNullLeaf called on an expression [" + expr.ToString() +
-                              "] with unsupported expression class!");
-  }
-  return false;
-}
-
-void GpuExpressionExecutor::Execute(const GPUIntermediateRelation& input_relation,
-                                    GPUIntermediateRelation& output_relation,
-                                    rmm::cuda_stream_view stream)
-{
-  D_ASSERT(expressions.size() == output_relation.columns.size());
-  D_ASSERT(!expressions.empty());
-
-  execution_stream = stream;
-  SetInputColumns(input_relation);
-
-  // Loop over expressions to execute
-  for (idx_t i = 0; i < expressions.size(); ++i) {
-    const auto& expr = *expressions[i];
-
-    // If the expression is a reference, just pass it through
-    if (expr.expression_class == ExpressionClass::BOUND_REF) {
-      auto input_idx             = expr.Cast<BoundReferenceExpression>().index;
-      output_relation.columns[i] = input_relation.columns[input_idx];
-      continue;
-    }
-
-    // Make placeholder output column
-    output_relation.columns[i] = make_shared_ptr<GPUColumn>(
-      0, convertLogicalTypeToColumnType(expr.return_type), nullptr, nullptr);
-
-    // Skip execution if the input count is zero or if there is a null leaf
-    if (input_count == 0 || (has_null_input_column && HasNullLeaf(expr))) { continue; }
-
-    // Otherwise, execute the expression
-    auto result = ExecuteExpression(i);
-
-    // Cast the `result` from libcudf to `return_type` if `result` has different types.
-    // E.g., `extract(year from col)` from libcudf returns int16_t but duckdb requires int64_t
-    // Only use cudf::cast when both types are fixed-width (cast does not support
-    // STRING/LIST/STRUCT).
-    auto cudf_return_type = GetCudfType(expressions[i]->return_type);
-    if (result->type().id() != cudf_return_type.id()) {
-      if (IsFixedWidth(result->type()) && IsFixedWidth(cudf_return_type)) {
-        result = cudf::cast(result->view(), cudf_return_type, execution_stream, resource_ref);
-      } else {
-        throw InternalException("GpuExpressionExecutor: Unsupported type conversion: " +
-                                cudf::type_to_name(result->type()) + " to " +
-                                cudf::type_to_name(cudf_return_type));
-      }
-    }
-
-    // Transfer to output relation (zero copy)
-    output_relation.columns[i]->setFromCudfColumn(*result,
-                                                  false,  // How to know?
-                                                  nullptr,
-                                                  0,
-                                                  &GPUBufferManager::GetInstance());
-  }
-}
-
-std::shared_ptr<cucascade::data_batch> GpuExpressionExecutor::execute(
-  std::shared_ptr<cucascade::data_batch> input_batch, rmm::cuda_stream_view stream)
-{
-  assert(!expressions.empty());
-
-  use_data_batch_apis = true;
-  execution_stream    = stream;
-  output_columns.clear();
-  output_columns.resize(expressions.size());
-
-  // Retrieve the table_view from the data_batch
-  auto& input_data_rep = input_batch->get_data()->cast<cucascade::gpu_table_representation>();
-  input_table          = input_data_rep.get_table().view();
-  input_count          = static_cast<cudf::size_type>(input_table.num_rows());
-
-  for (size_t i = 0; i < expressions.size(); ++i) {
-    auto const& expr = *expressions[i];
-    auto result      = ExecuteExpression(i);
-    // BOUND_REF: pass column through without type check (same as Execute(GPUIntermediateRelation)).
-    // The column is the actual input column; no cast is valid for string/non-fixed-width.
-    if (expr.expression_class != ExpressionClass::BOUND_REF) {
-      auto cudf_return_type = GetCudfType(expressions[i]->return_type);
-      // Cast the `result` from libcudf to `return_type` if `result` has a different type.
-      // E.g., `extract(year from col)` from libcudf returns int16_t but duckdb requires int64_t
-      // Only use cudf::cast when both types are fixed-width (cast does not support
-      // STRING/LIST/STRUCT).
-      if (result->type().id() != cudf_return_type.id()) {
-        if (IsFixedWidth(result->type()) && IsFixedWidth(cudf_return_type)) {
-          result = cudf::cast(result->view(), cudf_return_type, execution_stream, resource_ref);
-        } else {
-          throw InternalException("GpuExpressionExecutor: Unsupported type conversion: " +
-                                  cudf::type_to_name(result->type()) + " to " +
-                                  cudf::type_to_name(cudf_return_type));
-        }
-      }
-    }
-    output_columns[i] = std::move(result);
-  }
-
-  // Create the data representation
-  std::unique_ptr<cucascade::idata_representation> output_data_rep =
-    std::make_unique<cucascade::gpu_table_representation>(
-      std::move(
-        std::make_unique<cudf::table>(std::move(output_columns), execution_stream, resource_ref)),
-      *input_batch->get_memory_space());
-
-  // Create the data batch and return
-  auto const batch_id = ::sirius::get_next_batch_id();
-  return std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data_rep));
-}
-
-void GpuExpressionExecutor::Select(GPUIntermediateRelation& input_relation,
-                                   GPUIntermediateRelation& output_relation,
-                                   rmm::cuda_stream_view stream)
-{
-  D_ASSERT(expressions.size() == 1);
-  D_ASSERT(expressions[0]->return_type == LogicalType::BOOLEAN);
-
-  execution_stream = stream;
-  SetInputColumns(input_relation);
-
-  // If the input count is zero or if there is a null leaf, just materialize
-  if (input_count == 0 || (has_null_input_column && HasNullLeaf(*expressions[0]))) {
-    HandleMaterializeRowIDs(
-      input_relation, output_relation, 0, nullptr, &GPUBufferManager::GetInstance(), true);
-    return;
-  }
-
-  // Execute the boolean expression
-  auto bitmap = ExecuteExpression(0);
-
-  // Need to convert `null` values in bitmap to `false`, to be consistent with SQL `where` clause
-  if (bitmap->null_count() > 0) {
-    cudf::numeric_scalar<bool> false_scalar(false, execution_stream, resource_ref);
-    bitmap = cudf::replace_nulls(bitmap->view(), false_scalar, execution_stream, resource_ref);
-  }
-
-  // Generate the selection vector
-  auto [row_ids, count] = GpuDispatcher::DispatchSelect(bitmap->view(), resource_ref);
-
-  // Compact
-  HandleMaterializeRowIDs(
-    input_relation, output_relation, count, row_ids, &GPUBufferManager::GetInstance(), true);
-}
-
-std::shared_ptr<cucascade::data_batch> GpuExpressionExecutor::select(
-  std::shared_ptr<cucascade::data_batch> input_batch, rmm::cuda_stream_view stream)
-{
-  assert(expressions.size() == 1);
-  assert(expressions[0]->return_type == LogicalType::BOOLEAN);
-
-  use_data_batch_apis = true;
-  execution_stream    = stream;
-  output_columns.clear();
-
-  // Retrieve the table_view from the data_batch
-  auto& input_data_rep = input_batch->get_data()->cast<cucascade::gpu_table_representation>();
-  input_table          = input_data_rep.get_table().view();
-  input_count          = static_cast<cudf::size_type>(input_table.num_rows());
-
-  // Get the bitmap
-  auto bitmap = ExecuteExpression(0);
-
-  // (debug traces removed)
-
-  // Apply the bitmap
-  auto output_table =
-    cudf::apply_boolean_mask(input_table, bitmap->view(), execution_stream, resource_ref);
-  std::unique_ptr<cucascade::idata_representation> output_data_rep =
-    std::make_unique<cucascade::gpu_table_representation>(std::move(output_table),
-                                                          *input_batch->get_memory_space());
-
-  // Create the data batch and return
-  auto const batch_id = ::sirius::get_next_batch_id();
-  return std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data_rep));
-}
-
-std::unique_ptr<cudf::column> GpuExpressionExecutor::ExecuteExpression(idx_t expr_idx)
-{
-  D_ASSERT(expr_idx < expressions.size());
-
-  return Execute(*expressions[expr_idx], states[expr_idx]->root_state.get());
-}
-
-std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const Expression& expr,
-                                                             GpuExpressionState* state)
-{
-  switch (expr.GetExpressionClass()) {
-    case ExpressionClass::BOUND_BETWEEN: return Execute(expr.Cast<BoundBetweenExpression>(), state);
-    case ExpressionClass::BOUND_CASE: return Execute(expr.Cast<BoundCaseExpression>(), state);
-    case ExpressionClass::BOUND_CAST: return Execute(expr.Cast<BoundCastExpression>(), state);
-    case ExpressionClass::BOUND_COMPARISON:
-      return Execute(expr.Cast<BoundComparisonExpression>(), state);
-    case ExpressionClass::BOUND_CONJUNCTION:
-      return Execute(expr.Cast<BoundConjunctionExpression>(), state);
-    case ExpressionClass::BOUND_CONSTANT:
-      return Execute(expr.Cast<BoundConstantExpression>(), state);
-    case ExpressionClass::BOUND_FUNCTION:
-      return Execute(expr.Cast<BoundFunctionExpression>(), state);
-    case ExpressionClass::BOUND_OPERATOR:
-      return Execute(expr.Cast<BoundOperatorExpression>(), state);
-    case ExpressionClass::BOUND_PARAMETER:
-      throw NotImplementedException("Execute[BOUND_PARAMETER]: Not yet implemented!");
-    case ExpressionClass::BOUND_REF: return Execute(expr.Cast<BoundReferenceExpression>(), state);
-    default:
-      throw InternalException("Execute called on an expression [" + expr.ToString() +
-                              "] with unsupported expression class!");
-  }
-}
-
-std::unique_ptr<GpuExpressionState> GpuExpressionExecutor::InitializeState(
-  const Expression& expr, GpuExpressionExecutorState& state)
-{
-  switch (expr.GetExpressionClass()) {
-    case ExpressionClass::BOUND_BETWEEN:
-      return InitializeState(expr.Cast<BoundBetweenExpression>(), state);
-    case ExpressionClass::BOUND_CASE:
-      return InitializeState(expr.Cast<BoundCaseExpression>(), state);
-    case ExpressionClass::BOUND_CAST:
-      return InitializeState(expr.Cast<BoundCastExpression>(), state);
-    case ExpressionClass::BOUND_COMPARISON:
-      return InitializeState(expr.Cast<BoundComparisonExpression>(), state);
-    case ExpressionClass::BOUND_CONJUNCTION:
-      return InitializeState(expr.Cast<BoundConjunctionExpression>(), state);
-    case ExpressionClass::BOUND_CONSTANT:
-      return InitializeState(expr.Cast<BoundConstantExpression>(), state);
-    case ExpressionClass::BOUND_FUNCTION:
-      return InitializeState(expr.Cast<BoundFunctionExpression>(), state);
-    case ExpressionClass::BOUND_OPERATOR:
-      return InitializeState(expr.Cast<BoundOperatorExpression>(), state);
-    case ExpressionClass::BOUND_PARAMETER:
-      throw NotImplementedException("InitializeState[BOUND_PARAMETER]: Not yet implemented!");
-    case ExpressionClass::BOUND_REF:
-      return InitializeState(expr.Cast<BoundReferenceExpression>(), state);
-    default: throw InternalException("InitializeState: Unknown ExpressionClass!");
-  }
-}
-
 }  // namespace sirius
-}  // namespace duckdb

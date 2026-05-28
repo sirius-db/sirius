@@ -155,13 +155,13 @@ std::unique_ptr<cudf::table> project_cached_table_for_scan(
 //===----------------------------------------------------------------------===//
 duckdb_scan_task_global_state::duckdb_scan_task_global_state(
   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
-  pipeline::pipeline_executor& pipeline_exec,
+  pipeline::task_scheduler& pipeline_exec,
   duckdb::ClientContext& client_ctx,
   sirius_physical_duckdb_scan* scan_op)
   : sirius_pipeline_task_global_state(pipeline),
     _sirius_ctx(client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state").get()),
     _max_threads(pipeline_exec.get_scan_executor().get_num_threads()),
-    _pipeline_executor(pipeline_exec),
+    _task_scheduler(pipeline_exec),
     _op(*scan_op)
 {
   // Initialize global table function state
@@ -570,7 +570,7 @@ std::shared_ptr<cucascade::data_batch> duckdb_scan_task_local_state::make_data_b
   // Make the host table allocation
   auto const sz = get_tail_byte_offset();
   auto table_allocation =
-    std::make_unique<host_table_allocation>(std::move(_allocation), std::move(columns), sz);
+    host_table_allocation::create(std::move(_allocation), std::move(columns), sz);
 
   // Make the host table representation
   auto table = std::make_unique<host_data_representation>(std::move(table_allocation), _host_space);
@@ -642,7 +642,7 @@ void duckdb_scan_task::process_chunk(duckdb_scan_task_local_state& l_state)
 
 void duckdb_scan_task::execute(rmm::cuda_stream_view stream)
 {
-  auto estimated_bytes = get_estimated_reservation_size();
+  // _reservation_size_info is set by duckdb_scan_executor::manager_loop before dispatch.
   auto& l_state = this->_local_state->cast<duckdb_scan_task_local_state>();
 
   // Record memory metrics for future reservation estimates.
@@ -651,13 +651,14 @@ void duckdb_scan_task::execute(rmm::cuda_stream_view stream)
     auto& pipelineable_output_data = dynamic_cast<op::pipelineable_operator_data&>(*output_data);
     std::size_t output_bytes       = 0;
     for (const auto& batch : pipelineable_output_data.get_data_batches()) {
-      if (batch && batch->get_data()) { output_bytes += batch->get_data()->get_size_in_bytes(); }
+      if (batch) {
+        auto ro = batch->to_read_only();
+        if (ro.get_data()) { output_bytes += ro.get_data()->get_size_in_bytes(); }
+      }
     }
     auto& g_state = _global_state->cast<duckdb_scan_task_global_state>();
-    // Use the raw task consumption basis from local state when recording history
-    auto consumption_basis =
-      this->_local_state->cast<duckdb_scan_task_local_state>().get_task_consumption_basis();
-    g_state.get_memory_history().record({consumption_basis, output_bytes, output_bytes});
+    g_state.get_memory_history().record(
+      {l_state.get_reservation_size_info()->input_basis, output_bytes, output_bytes});
 
     publish_output(*output_data, stream);
     if (l_state._defer_drain_until_publish) {
@@ -842,7 +843,7 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
       std::static_pointer_cast<duckdb_scan_task_global_state>(this->_global_state);
     auto next_task = std::make_unique<duckdb_scan_task>(
       new_task_id, _data_repo, std::move(new_local_state), shared_global_state);
-    g_state._pipeline_executor.schedule(std::move(next_task));
+    g_state._task_scheduler.schedule(std::move(next_task));
   }
 
   // Make data batch and push to repository
@@ -858,19 +859,24 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
 void duckdb_scan_task::publish_output(op::operator_data& output_data, rmm::cuda_stream_view stream)
 {
   auto& pipelineable_output = dynamic_cast<op::pipelineable_operator_data&>(output_data);
-  for (auto& batch : pipelineable_output.release_data_batches()) {
-    _data_repo->add_data_batch(std::move(batch));
+  for (auto& batch : pipelineable_output.get_data_batches()) {
+    _data_repo->add_data_batch(batch);
   }
 }
 
-std::size_t duckdb_scan_task::get_estimated_reservation_size() const
+pipeline::reservation_size_info duckdb_scan_task::get_estimated_reservation_size_info() const
 {
-  auto current_estimate =
+  std::size_t input_basis =
     this->_local_state->cast<duckdb_scan_task_local_state>().get_task_consumption_basis();
   auto& g_state = this->_global_state->cast<duckdb_scan_task_global_state>();
-  auto refined  = g_state.get_memory_history().estimate_peak_memory(current_estimate);
-  if (refined) { return *refined; }
-  return current_estimate;
+  auto peak_opt = g_state.get_memory_history().estimate_peak_memory(input_basis);
+
+  pipeline::reservation_size_info info;
+  info.input_basis          = input_basis;
+  info.had_history          = peak_opt.has_value();
+  info.peak_memory_estimate = peak_opt.value_or(input_basis);
+  info.reservation_size     = info.peak_memory_estimate;
+  return info;
 }
 
 }  // namespace sirius::op::scan

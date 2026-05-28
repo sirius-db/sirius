@@ -70,13 +70,29 @@ export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
 ```
 
 Each run creates a directory under `runs/<timestamp>_sf<SF>_2iter/` containing:
-- `run_info.txt` — git branch/revision, tree clean/dirty, build freshness, hostname, memory, CPUs, GPUs, filesystem read benchmark
+- `run_info.txt` — git branch/revision, tree clean/dirty, build freshness, hostname, memory, CPUs, GPUs, filesystem read benchmark, pinning_mode setting
 - `run_info.patch` — full git diff when tree is dirty
 - `sirius_config.yaml` — copy of the Sirius config used
 - `sirius/` and `duckdb/` — per-engine logs, per-query results and timings
 - `validation.csv` — per-query match/error status
 - `comparison.txt` — cold/warm timing table with speedup ratios
 - `timings.csv` — long-format iteration runtimes (engine,query,iteration,runtime_s)
+
+#### `--pinning-mode per-query` (PR #721 pin_table)
+
+When passed `--pinning-mode per-query`, the Sirius engine wraps each query block with `CALL pin_table(<glob>, tier='gpu', name=<table>, cols=[...])` for every table the query reads, runs the query for `--iterations` runs back-to-back, then `CALL unpin_table(<table>)` for each pinned table. This isolates per-query pinning cost from query execution: the query-iteration timings written to `timings.csv` reflect query-only time on the pinned-cache scan path.
+
+The per-query column-set is sourced from `tpch_pin_columns.py` (must be a superset of every column the query references, otherwise the scan falls through to disk). The pin path is a glob whose `FileSystem::GlobFiles` expansion must equal the file list of the corresponding `CREATE VIEW … read_parquet([…])` — otherwise `sirius_scan_manager::create_provider_for` will not match and the cache is silently bypassed.
+
+```bash
+./test/tpch_performance/benchmark_and_validate.sh --pinning-mode per-query 100
+```
+
+The DuckDB engine ignores the flag (pinning is Sirius-only) and runs as the unchanged baseline. Pinning time is **not** measured — markers (`__TPCH_PIN_BEGIN__`, `__TPCH_UNPIN_BEGIN__`, …) keep pin/unpin `Run Time` lines outside the iteration-time parser window. In single-session mode, every pinned table is unpinned at the end of its query block before the next query's pin calls run — no carry-over even when consecutive queries reference the same table. In multi-session mode the unpin still runs before each per-query process exits, defensively releasing GPU memory back to the allocator.
+
+To verify a query actually hit the cache, grep `runs/.../sirius/q<N>/sirius.log` for `using cached_split_provider`; the matching-fallback log line is `not all the columns are pinned for this query`.
+
+Tier override: the helper defaults to `tier='gpu'` — the only tier currently implemented in `src/sirius_extension.cpp`. **`tier='host'` is not supported right now and will be added later**: setting `SIRIUS_PIN_TIER=host` today makes the emitted `CALL pin_table` throw `NotImplementedException` at bind time (`src/sirius_extension.cpp:681-683`), and queries fall through to disk reads. Once host-tier support lands, flip via `SIRIUS_PIN_TIER=host`.
 
 ### Unified query runner
 
@@ -198,8 +214,7 @@ Output: `reports/<label>_<YYYYMMDD_HHMMSS>/` containing `report.md`, `summary.js
 
 ## Query Files
 
-- `tpch_queries/orig/q*.sql` — Plain SQL queries
-- `tpch_queries/gpu/q*.sql` — Queries wrapped in `call gpu_execution('...');` for Sirius
+- `tpch_queries/orig/q*.sql` — Plain SQL queries used by both Sirius and DuckDB runners
 
 ## Key Files
 
@@ -218,6 +233,7 @@ Output: `reports/<label>_<YYYYMMDD_HHMMSS>/` containing `report.md`, `summary.js
 | `rewrite_parquet.py` | Rewrite parquet with GPU-optimized row groups (cudf or pyarrow fallback) |
 | `performance_test.py` | Python-based benchmark with result verification |
 | `queries.py` | TPC-H query definitions (base SQL) |
+| `tpch_pin_columns.py` | Per-query column → table mapping for `--pinning-mode per-query`; emits `CALL pin_table(...)` / `CALL unpin_table(...)` SQL |
 | `generate_test_data.py` | Generate test data via dbgen |
 | `generate_test_data_tpchgen-rs.py` | Generate test data via tpchgen-rs Python wrapper + query files |
 | `pixi.toml` | Python environment with cudf, pyarrow, rust for tooling |
@@ -229,7 +245,13 @@ The Sirius config file (`test/cpp/integration/integration.yaml`) controls:
 - **Host memory**: `capacity_bytes`, `initial_number_pools`, `pool_size`, `block_size`
   - Initial allocation = `initial_number_pools * pool_size * block_size`
 - **Thread pools**: `pipeline`, `duckdb_scan`, `task_creator`, `downgrade` thread counts
-- **Scan cache**: `duckdb_scan.cache = true` enables caching
+- **Scan cache**: `duckdb_scan.cache` controls cache level (default: `none`, valid: `none`, `parquet`, `table_host`, `table_gpu`)
+  - In single-session benchmarks, the config YAML controls the cache level directly
+  - In multi-session benchmarks, per-query overrides can be set in `scan_cache_levels.yaml`
+- **Cold-run benchmarking**: Use `--multi-session --drop-os-cache` to drop OS filesystem cache between queries. Requires one-time passwordless sudo setup:
+  ```bash
+  echo "$(whoami) ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches" | sudo tee /etc/sudoers.d/drop_caches
+  ```
 
 ## Parquet Format Notes
 

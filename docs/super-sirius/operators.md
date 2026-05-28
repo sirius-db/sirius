@@ -56,23 +56,17 @@ Direct Parquet file scan. Reads column-chunk byte ranges and optionally material
 ### `sirius_physical_iceberg_scan` — `ICEBERG_SCAN`
 **File:** `src/include/op/sirius_physical_iceberg_scan.hpp`
 
-Apache Iceberg table scan with GPU-accelerated delete filters. Inherits from `sirius_physical_parquet_scan` since Iceberg uses Parquet as the data layer. Supports Iceberg V1 (append-only) and V2 (positional and equality deletes).
+Apache Iceberg table scan with GPU-accelerated delete filters. Inherits from `sirius_physical_parquet_scan` since Iceberg uses Parquet as the data layer. Supports Iceberg V1 (append-only), V2 (positional and equality deletes, including heterogeneous equality-delete schemas), and V3 (deletion vectors via PUFFIN files). Handles schema evolution, snapshot time-travel, and partition evolution.
 
-- **Delete filter pipeline:** Composes `positional_delete_filter` (sorted row position binary search) and `equality_delete_filter` (GPU `cudf::distinct_hash_join` anti-join mask) to apply deletes entirely on GPU with no D2H copies
-- **Metadata:** Custom `iceberg_metadata_reader` with lightweight Avro parser for manifest-list and manifest files
-- **Key members:** `positional_delete_files`, `equality_delete_files`
+- **Delete filter pipeline:** Composes `positional_delete_filter`, `equality_delete_filter` (per-key-schema groups, sequence-scoped), and a deletion-vector filter for V3 to apply deletes entirely on GPU with no D2H copies
+- **Metadata:** Manifest discovery delegates to DuckDB's `iceberg_metadata()`; the custom `iceberg_avro_reader` is the fallback for V3 deletion-vector PUFFIN files
 
 See [Scan — Iceberg Scan](scan.md#iceberg-scan) for details.
-
-### `sirius_parquet_metadata_scan_operator` — `PARQUET_METADATA_SCAN`
-**File:** `src/include/op/scan/sirius_parquet_metadata_scan_operator.hpp`
-
-First pipeline operator in the two-pipeline Parquet scan architecture. Parses Parquet footers for up to 8 files per task, attempts cuDF AST filter translation, and emits `partitioned_parquet_metadata` containing reader options, file metadata, and row-group partitions. See [Scan — Two-Pipeline Metadata Scan](scan.md#two-pipeline-metadata-scan).
 
 ### `sirius_gpu_parquet_scan_operator` — `GPU_PARQUET_SCAN`
 **File:** `src/include/op/scan/sirius_gpu_parquet_scan_operator.hpp`
 
-Second pipeline operator in the two-pipeline Parquet scan architecture. Acts as sink of Pipeline 1 (accumulating metadata from `PARQUET_METADATA_SCAN`) and source of Pipeline 2 (serving `parquet_scan_data` tasks that call `cudf::io::read_parquet`). See [Scan — Two-Pipeline Metadata Scan](scan.md#two-pipeline-metadata-scan).
+Source operator for parquet scans. Carries a `parquet_scan_info` populated by the pipeline converter and pulls splits from a `split_connector` populated by `sirius_scan_manager` on its own thread pool. Each `parquet_scan_data` split drives a `cudf::io::read_parquet` call followed by `scan_plan`-driven output assembly (data columns, hive-partition synthesis, output ordering). See [Scan — Scan Manager](scan.md#scan-manager).
 
 ### `sirius_physical_dummy_scan` — `DUMMY_SCAN`
 **File:** `src/include/op/sirius_physical_dummy_scan.hpp`
@@ -93,7 +87,7 @@ These operators process data in a single pass without buffering.
 
 Applies a predicate expression to filter rows.
 
-- **GPU execution:** `GpuExpressionExecutor::select(batch, stream)` — evaluates the boolean expression and compacts rows using cuDF filtering
+- **GPU execution:** `gpu_expression_executor::select(batch)` — evaluates the boolean expression and compacts rows using cuDF filtering
 - **Key members:** `expression` (filter predicate)
 
 ### `sirius_physical_projection` — `PROJECTION`
@@ -101,7 +95,7 @@ Applies a predicate expression to filter rows.
 
 Evaluates a list of expressions to produce output columns.
 
-- **GPU execution:** `GpuExpressionExecutor::execute(batch, stream)` — evaluates each expression, producing a new table with projected columns
+- **GPU execution:** `gpu_expression_executor::execute(batch, stream)` — evaluates each expression, producing a new table with projected columns
 - **Key members:** `select_list` (output expressions)
 
 ### `sirius_physical_streaming_limit` — `STREAMING_LIMIT`
@@ -305,12 +299,11 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | DUCKDB_SCAN | Scan | DuckDB table function |
 | PARQUET_SCAN | Scan | Direct Parquet reading |
 | ICEBERG_SCAN | Scan | Parquet reading with Iceberg delete filters |
-| PARQUET_METADATA_SCAN | Scan | Parquet footer parsing + row group partitioning |
-| GPU_PARQUET_SCAN | Scan | Parquet byte reading from metadata |
+| GPU_PARQUET_SCAN | Scan | Source operator served by `sirius_scan_manager` |
 | DUMMY_SCAN | Scan | Generates 1 row |
 | COLUMN_DATA_SCAN | Scan | Reads ColumnDataCollection |
-| FILTER | Relational | `GpuExpressionExecutor::select()` |
-| PROJECTION | Relational | `GpuExpressionExecutor::execute()` |
+| FILTER | Relational | `gpu_expression_executor::select()` |
+| PROJECTION | Relational | `gpu_expression_executor::execute()` |
 | STREAMING_LIMIT | Relational | Atomic claim-based |
 | ORDER_BY | Sort | `gpu_order_impl::local_order_by()` |
 | TOP_N | Sort | Order + limit |
