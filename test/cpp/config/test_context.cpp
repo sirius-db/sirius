@@ -149,6 +149,11 @@ TEST_CASE("Sirius configuration loading from file with configurator",
   REQUIRE(manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU).size() == 1);
   REQUIRE(manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).size() == 1);
   REQUIRE(manager.get_memory_spaces_for_tier(cucascade::memory::Tier::DISK).size() == 1);
+
+  auto const& telemetry = sirius_ctx->get_config().get_telemetry_config();
+  REQUIRE_FALSE(telemetry.enable_quent);
+  REQUIRE(telemetry.output_directory == "/tmp/sirius_telemetry_config_test");
+  REQUIRE(telemetry.engine_name == "sirius_config_test");
 }
 
 TEST_CASE("Sirius configuration loading from file with spaces",

@@ -66,12 +66,12 @@ sirius_engine::sirius_engine(duckdb::ClientContext& context, sirius_interface& s
     sirius_iface(sirius_iface),
     query_group_uuid_(uuid::now_v7()),
     query_group_observer_(quent::query_group::create_observer(sirius_iface.telemetry.context())),
-    query_handle_(quent::query::create(
-      sirius_iface.telemetry.context(),
-      quent::query::Init{
-        .instance_name  = sirius_iface.telemetry.query_label().value_or("unnamed_query"),
-        .query_group_id = query_group_uuid_,
-      }))
+    query_handle_(
+      quent::query::create(sirius_iface.telemetry.context(),
+                           quent::query::Init{
+                             .instance_name  = sirius_iface.query_label.value_or("unnamed_query"),
+                             .query_group_id = query_group_uuid_,
+                           }))
 {
   // Declare the query group under this engine
   query_group_observer_->declaration(query_group_uuid_,
@@ -144,7 +144,6 @@ void sirius_engine::execute()
 
   // Create the query with the pipelines
   sirius_ctx->create_query(std::move(new_scheduled),
-                           sirius_iface.telemetry.context(),
                            telemetry::query_telemetry_info{
                              .query_id  = query_handle_->uuid(),
                              .worker_id = sirius_iface.telemetry.worker_id(),

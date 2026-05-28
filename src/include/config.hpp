@@ -78,11 +78,6 @@ struct Config {
   static std::string LOG_LEVEL;
   static std::string LOG_DIR;
   static int LOG_FLUSH_SECONDS;
-
-  // Quent telemetry configuration
-  static bool ENABLE_QUENT;                   // enable_quent
-  static std::string QUENT_OUTPUT_DIRECTORY;  // quent_output_directory
-  static std::string QUENT_ENGINE_NAME;       // quent_engine_name
 };
 
 }  // namespace duckdb
