@@ -48,7 +48,7 @@ gpu_pipeline_executor::gpu_pipeline_executor(
   cucascade::memory::memory_space* mem_space,
   exec::publisher<std::unique_ptr<task_request>> task_request_publisher,
   sirius::parallel::downgrade_executor* downgrade_executor,
-  sirius::telemetry::telemetry_context* telemetry_context)
+  telemetry::telemetry_context* telemetry_context)
   : sirius::parallel::itask_executor(config),
     _stream_pool(rmm::cuda_device_id{mem_space->get_device_id()}, config.num_threads),
     _task_request_publisher(std::move(task_request_publisher)),
@@ -62,27 +62,16 @@ gpu_pipeline_executor::~gpu_pipeline_executor() { stop(); }
 
 absl::AnyInvocable<void() noexcept> gpu_pipeline_executor::get_per_thread_init()
 {
-  auto device_id          = _memory_space->get_device_id();
-  auto* telemetry_context = _telemetry_context;
-  auto thread_name_prefix = _config.thread_name_prefix;
-  auto thread_id_counter  = std::make_shared<std::atomic<uint32_t>>(0);
+  int device_id          = _memory_space->get_device_id();
+  auto thread_id_counter = std::make_shared<std::atomic<uint32_t>>(0);
 
   return [device_id,
-          telemetry_context,
-          thread_name_prefix = std::move(thread_name_prefix),
+          telemetry_context = _telemetry_context,
+          thread_prefix     = _config.thread_name_prefix,
           thread_id_counter]() mutable noexcept {
-    if (telemetry_context) {
-      try {
-        const auto thread_id = thread_id_counter->fetch_add(1, std::memory_order_relaxed);
-        sirius::telemetry::init_executor_thread_for_current_thread(
-          *telemetry_context, thread_name_prefix + "_" + std::to_string(thread_id));
-      } catch (const std::exception& e) {
-        SIRIUS_LOG_ERROR("GPU pipeline executor thread telemetry init failed: {}", e.what());
-      } catch (...) {
-        SIRIUS_LOG_ERROR(
-          "GPU pipeline executor thread telemetry init failed with an unknown exception");
-      }
-    }
+    const int32_t thread_id = thread_id_counter->fetch_add(1, std::memory_order_relaxed);
+    telemetry::executor_thread_telemtry_init(
+      telemetry_context, fmt::format("{}-gpu_exec-{}", thread_prefix, thread_id));
 
     // Per-thread init runs on a worker thread just spawned by the
     // bounded_pool. cudaSetDevice pins this thread to the executor's GPU

@@ -12,6 +12,7 @@ model! {
         quent_query_engine_model::operator::Operator,
         quent_query_engine_model::port::Port,
         task::Task,
+        task::TaskQueue,
         task::TaskManagerLoopThread,
         task::ExecutorThread,
     }

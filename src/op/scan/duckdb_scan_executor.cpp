@@ -118,25 +118,14 @@ duckdb_scan_executor::~duckdb_scan_executor()
 
 absl::AnyInvocable<void() noexcept> duckdb_scan_executor::get_per_thread_init()
 {
-  if (!_telemetry_context) { return nullptr; }
+  auto thread_id_counter = std::make_shared<std::atomic<uint32_t>>(0);
 
-  auto* telemetry_context = _telemetry_context;
-  auto thread_name_prefix = _config.thread_name_prefix;
-  auto thread_id_counter  = std::make_shared<std::atomic<uint32_t>>(0);
-
-  return [telemetry_context,
-          thread_name_prefix = std::move(thread_name_prefix),
-          thread_id_counter]() mutable noexcept {
-    try {
-      const auto thread_id = thread_id_counter->fetch_add(1, std::memory_order_relaxed);
-      sirius::telemetry::init_executor_thread_for_current_thread(
-        *telemetry_context, thread_name_prefix + "_" + std::to_string(thread_id));
-    } catch (const std::exception& e) {
-      SIRIUS_LOG_ERROR("DuckDB scan executor thread telemetry init failed: {}", e.what());
-    } catch (...) {
-      SIRIUS_LOG_ERROR(
-        "DuckDB scan executor thread telemetry init failed with an unknown exception");
-    }
+  return [telemetry_context = _telemetry_context,
+          thread_prefix     = _config.thread_name_prefix,
+          thread_id_counter]() noexcept {
+    const int32_t thread_id = thread_id_counter->fetch_add(1, std::memory_order_relaxed);
+    executor_thread_telemtry_init(telemetry_context,
+                                  fmt::format("{}-duckdb_scan_exec-{}", thread_prefix, thread_id));
   };
 }
 

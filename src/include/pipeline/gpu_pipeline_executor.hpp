@@ -72,7 +72,7 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
     cucascade::memory::memory_space* mem_space,
     exec::publisher<std::unique_ptr<task_request>> task_request_publisher,
     sirius::parallel::downgrade_executor* downgrade_executor = nullptr,
-    sirius::telemetry::telemetry_context* telemetry_context  = nullptr);
+    telemetry::telemetry_context* telemetry_context          = nullptr);
 
   /**
    * @brief Destructor for the gpu_pipeline_executor.
@@ -90,7 +90,7 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
    *
    * @param task_creator Pointer to the task creator
    */
-  void set_task_creator(sirius::creator::task_creator* task_creator);
+  void set_task_creator(creator::task_creator* task_creator);
 
   /**
    * @brief Check if the internal task queue is empty.
@@ -130,7 +130,7 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   sirius::parallel::downgrade_executor* _downgrade_executor{nullptr};
   sirius::creator::task_creator* _task_creator{nullptr};
   completion_handler* _completion_handler{nullptr};
-  sirius::telemetry::telemetry_context* _telemetry_context{nullptr};
+  telemetry::telemetry_context* _telemetry_context{nullptr};
 };
 
 }  // namespace pipeline

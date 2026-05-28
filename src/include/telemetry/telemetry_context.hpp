@@ -17,16 +17,15 @@
 #pragma once
 
 #include "duckdb/common/common.hpp"
+#include "log/logging.hpp"
 #include "telemetry-bridge/gen/context.rs.h"
 #include "telemetry-bridge/gen/engine.rs.h"
 #include "telemetry-bridge/gen/executor_thread.rs.h"
 #include "telemetry-bridge/gen/uuid.rs.h"
 #include "telemetry-bridge/gen/worker.rs.h"
 
-#include <functional>
 #include <optional>
 #include <string>
-#include <string_view>
 
 namespace sirius::pipeline {
 class sirius_pipeline;
@@ -76,29 +75,49 @@ void emit_plan_telemetry(
   uuid::UUID plan_id,
   query_telemetry_info telemetry_info);
 
+struct ExecutorThreadHandleWrapper {
+  ExecutorThreadHandleWrapper(const telemetry_context* context, const std::string& thread_name)
+    : handle(quent::executor_thread::create(context->context(),
+                                            {
+                                              .instance_name   = thread_name,
+                                              .parent_group_id = context->engine_id(),
+                                            }))
+  {
+    handle->operating();
+  }
+
+  ExecutorThreadHandleWrapper(const ExecutorThreadHandleWrapper&)            = delete;
+  ExecutorThreadHandleWrapper& operator=(const ExecutorThreadHandleWrapper&) = delete;
+  ExecutorThreadHandleWrapper(ExecutorThreadHandleWrapper&&)                 = delete;
+  ExecutorThreadHandleWrapper& operator=(ExecutorThreadHandleWrapper&&)      = delete;
+
+  ~ExecutorThreadHandleWrapper()
+  {
+    handle->finalizing();
+    handle->exit();
+  }
+
+  rust::Box<quent::executor_thread::ExecutorThreadHandle> handle;
+};
+
 // header-only shared thread-local storage handle: one per thread, shared across translation units
-inline thread_local std::optional<rust::Box<quent::executor_thread::ExecutorThreadHandle>>
-  telemetry_thread_handle{std::nullopt};
+inline thread_local std::optional<ExecutorThreadHandleWrapper> telemetry_thread_handle{
+  std::nullopt};
 
-inline void init_executor_thread_for_current_thread(const telemetry_context& context,
-                                                    std::string_view instance_name)
+inline void executor_thread_telemtry_init(const telemetry_context* context,
+                                          const std::string& thread_name)
 {
-  telemetry_thread_handle =
-    quent::executor_thread::create(context.context(),
-                                   {
-                                     .instance_name   = std::string(instance_name),
-                                     .parent_group_id = context.engine_id(),
-                                   });
-  (*telemetry_thread_handle)->operating();
-}
+  if (not context) { return; }
 
-using executor_thread_handle_ref =
-  std::reference_wrapper<quent::executor_thread::ExecutorThreadHandle>;
-
-inline std::optional<executor_thread_handle_ref> current_executor_thread_handle() noexcept
-{
-  if (not telemetry_thread_handle.has_value()) { return std::nullopt; }
-  return std::ref(**telemetry_thread_handle);
+  try {
+    telemetry_thread_handle.emplace(context, thread_name);
+  } catch (const std::exception& e) {
+    // Don't throw on telemetry handle creation failure.
+    SIRIUS_LOG_ERROR("{} executor thread telemetry init failed: {}", thread_name, e.what());
+  } catch (...) {
+    SIRIUS_LOG_ERROR("{} executor thread telemetry init failed with an unknown exception",
+                     thread_name);
+  }
 }
 
 }  // namespace sirius::telemetry

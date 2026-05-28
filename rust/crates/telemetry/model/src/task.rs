@@ -120,6 +120,9 @@ fsm! {
             created => queued,
             queued => routing,
             routing => reserving,
+            routing => queued,      // GPU task routed into selected executor queue
+            queued => reserving,    // executor manager pops and starts reservation
+            routing => reserving,   // scan/source route and reserve in same manager loop
             reserving => downgrading,
             downgrading => reserving,
             reserving => finalizing,
