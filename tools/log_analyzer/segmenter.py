@@ -24,7 +24,7 @@ class QuerySegment:
     end_line_idx: Optional[int]  # 0-based index of QueryEnd line (None if incomplete)
     begin_ts: str  # raw timestamp string from QueryBegin
     end_ts: Optional[str]
-    sql: str  # SQL text as it appears in the log (often truncated)
+    sql: str  # SQL text as it appears in the log (full query, whitespace collapsed to single spaces by the emitter)
     status: str  # "complete" | "incomplete"
     lines: List[str] = field(default_factory=list)  # raw lines covering this segment
 

@@ -85,8 +85,10 @@ For each paired pipeline, compute the deltas on these columns:
 | `sum_output_size_bytes` | Same as above but catches changes in column widths / encoding. |
 | `sum_execution_time_ms` | Perf diff. |
 | `max_execution_time_ms` | Catches new straggler-task behavior. |
-| `sum_history_peak_bytes_to_materialize_input` | New downgrade behavior — see single_query.md #4. |
+| `sum_history_peak_bytes_to_materialize_input` | Consumer-side downgrade behavior (tasks re-reading evicted inputs) — see single_query.md #4. |
 | `min_memory_available` | New memory pressure. |
+
+Also compare the per-query downgrades directly: total bytes evicted, source tier breakdown, and host-vs-disk destination. These come from `<folder>/downgrades.csv` in each run (sum `total_bytes` grouped by `source_tier`; sum `to_host_bytes` / `to_disk_bytes`). A run that's slower because it now spills to disk where the other run didn't is a common pattern and shows up here, not in the per-pipeline aggregate.
 
 ## Step 4: The validation-error walk
 

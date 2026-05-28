@@ -51,10 +51,28 @@ python3 tools/log_analyzer/parse_logs.py <log_file> [--out <dir>]
     ├── memory_reservations.csv
     ├── task_inputs.csv
     ├── task_outputs.csv
-    └── memory_history.csv
+    ├── memory_history.csv
+    └── downgrades.csv         # one row per downgrade request (data evicted from a tier)
 ```
 
 The full schema is in `tools/log_analyzer/README.md`. Skim it before doing anything non-obvious.
+
+### Joining across the per-query CSVs
+
+`task_inputs.csv`, `task_outputs.csv`, `memory_history.csv`, and `memory_reservations.csv` can be joined to one another inside a single query folder. Useful keys:
+
+- `pipeline_id` — present on every row. Coarsest join; gives you "all reservation/input/output/history rows that belong to pipeline N".
+- `task_id` — present on every row (in logs emitted after the multi-GPU executor split). One task produces exactly one `memory_reservation`, one `task_input`, one `task_output`, and one `memory_history` row, so `(pipeline_id, task_id)` is effectively a primary key across the four tables.
+
+Typical joins:
+
+- *"Which operator's task consumed the most memory?"* — join `memory_reservations` ↔ `task_outputs` on `(pipeline_id, task_id)`, then sort by `reserved_bytes` or by `peak_allocated_bytes`. You now have both the operator and the reservation that fed it.
+- *"Did the task that downgraded its input also run slowly?"* — join `memory_history` (filter `peak_bytes_to_materialize_input > 0` on a non-scan pipeline) ↔ `task_outputs` on `(pipeline_id, task_id)` to get the offending task's `execution_time_ms`.
+- *"How much did this task's actual output undershoot its reservation?"* — join `memory_reservations` ↔ `task_outputs` on `(pipeline_id, task_id)`; compare `reserved_bytes` to `peak_allocated_bytes`. Systematic over-reservation is a planner-estimate bug.
+
+On older logs (pre multi-GPU split) `task_id` is `None` in the input/output/history CSVs and only the `pipeline_id` join is available. The parser still loads those logs; just lose the per-task granularity.
+
+`downgrades.csv` does **not** participate in this join. Each downgrade is a process-wide eviction request emitted by `downgrade_executor`, not tied to a specific pipeline or task — it carries its own `(timestamp, source_tier, source_device_id)` identity instead. To correlate downgrades with what was running at the time, match `downgrades.timestamp` against the active pipelines window in `_pipeline_aggregates.csv` (`pipeline_begin` ≤ `downgrades.timestamp` ≤ `pipeline_end`).
 
 ### Picking a query to analyze
 
@@ -64,12 +82,13 @@ Ask the user which query if it's not obvious, or surface the slowest / failed ca
 
 ## Mode A: Single-query analysis
 
-See `references/single_query.md` for the full playbook. Quick summary of the four analyses worth running on every query:
+See `references/single_query.md` for the full playbook. Quick summary of the analyses worth running on every query:
 
 1. **Operator time attribution** — which operators dominate? Use `_pipeline_aggregates.csv` (`sum_execution_time_ms`, `max_execution_time_ms`) joined to the pipeline plan to attribute time per operator type.
 2. **Pipeline gap analysis** — for each pipeline, the gap from the previous pipeline's `pipeline_end` to this one's `pipeline_begin`. Large gaps point at pipeline breakers (`barrier: FULL` in the plan) or scheduler stalls.
 3. **Memory pressure** — read `memory_reservations.csv` over time; `memory_available` dropping toward zero (and `total_reserved` approaching `max_pool`) means we got close to OOM and are likely thrashing.
-4. **Downgrade detection** — in `memory_history.csv`, any row with `peak_bytes_to_materialize_input > 0` on a **non-scan** pipeline means the input had to be downgraded (re-materialized from host/disk). A handful is normal; a lot is a red flag — downgrade is expensive.
+4. **Downgrade detection** — read `downgrades.csv` directly. Each row is one satisfied downgrade request and carries the source tier (`GPU:N`, `HOST:-1`, etc.), `total_bytes`, `duration_ms`, throughput, and the `to_host` / `to_disk` split. Sum `total_bytes` by `source_tier` to answer "how much was evicted from GPUs vs from host." A handful is normal under pressure; a lot — especially `HOST→DISK` rows — is a red flag, downgrade is expensive.
+5. **GPU balance** (multi-GPU runs only) — group `task_outputs.csv` by `gpu_id` to see whether operators distributed work evenly across GPUs, or whether one GPU did most of the work for a given pipeline / operator type. Severe imbalance points at scheduling or locality issues.
 
 Cross-reference the pipeline_id in any of these CSVs against `pipeline_plan.json -> operator_index` to name the operator. Don't memorize pipeline numbers — they're query-local.
 
@@ -175,6 +194,8 @@ After you've localized the issue, recommend the right next step:
 | Which pipeline does operator id=N live in? | `<folder>/pipeline_plan.json -> operator_index` |
 | Per-operator execution time | `<folder>/task_outputs.csv` (per-task) or `_pipeline_aggregates.csv` (per-pipeline) |
 | Memory low-water mark | `<folder>/memory_reservations.csv -> memory_available` |
-| Downgrade events | `<folder>/memory_history.csv -> peak_bytes_to_materialize_input > 0` |
+| Downgrade events (bytes evicted, source tier, where it went) | `<folder>/downgrades.csv` |
+| Re-materialized inputs after a downgrade (per-task view) | `<folder>/memory_history.csv -> peak_bytes_to_materialize_input > 0` |
 | Per-pipeline summary across one query | filter `_pipeline_aggregates.csv` by `query_begin_ts` |
+| How well work was balanced across GPUs (multi-GPU runs) | group `task_outputs.csv` by `gpu_id` (per pipeline or per operator type); see `references/single_query.md` § "GPU balance" |
 | Why my parser run looks weird | `_summary.json -> format_warnings`, then `tools/log_analyzer/README.md` |

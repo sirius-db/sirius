@@ -20,6 +20,7 @@ Outputs to <out>/ (default ./log_analysis/<log_basename>/):
         task_inputs.csv
         task_outputs.csv
         memory_history.csv
+        downgrades.csv
 """
 
 import argparse
@@ -33,6 +34,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
     from tools.log_analyzer import aggregator, patterns, plan_parser, segmenter
     from tools.log_analyzer.metrics import (
+        downgrade,
         memory_history,
         memory_reservation,
         task_input,
@@ -41,7 +43,13 @@ if __package__ in (None, ""):
     from tools.log_analyzer.validators import FormatWarnings
 else:
     from . import aggregator, patterns, plan_parser, segmenter
-    from .metrics import memory_history, memory_reservation, task_input, task_output
+    from .metrics import (
+        downgrade,
+        memory_history,
+        memory_reservation,
+        task_input,
+        task_output,
+    )
     from .validators import FormatWarnings
 
 
@@ -103,11 +111,13 @@ def process_query(seg, out_dir: Path, warnings: FormatWarnings) -> dict:
     ti_rows = task_input.parse(seg.lines, warnings)
     to_rows = task_output.parse(seg.lines, warnings)
     mh_rows = memory_history.parse(seg.lines, warnings)
+    dg_rows = downgrade.parse(seg.lines, warnings)
 
     _write_csv(qdir / "memory_reservations.csv", memory_reservation.COLUMNS, mr_rows)
     _write_csv(qdir / "task_inputs.csv", task_input.COLUMNS, ti_rows)
     _write_csv(qdir / "task_outputs.csv", task_output.COLUMNS, to_rows)
     _write_csv(qdir / "memory_history.csv", memory_history.COLUMNS, mh_rows)
+    _write_csv(qdir / "downgrades.csv", downgrade.COLUMNS, dg_rows)
 
     # plan
     plan = plan_parser.parse_plan(seg.lines, warnings)
@@ -143,6 +153,7 @@ def process_query(seg, out_dir: Path, warnings: FormatWarnings) -> dict:
             "task_inputs": len(ti_rows),
             "task_outputs": len(to_rows),
             "memory_history": len(mh_rows),
+            "downgrades": len(dg_rows),
             "pipelines_in_plan": plan["counts"]["pipelines"] if plan else 0,
         },
     }
