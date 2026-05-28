@@ -1,0 +1,131 @@
+[workspace]
+channels = ["rapidsai","conda-forge"]
+name = "sirius-starrocks"
+platforms = ["linux-64","linux-aarch64"]
+
+[environments]
+default = ["fe","be"]
+be = ["be"]
+fe = ["fe"]
+
+[tasks]
+cluster = {cmd = """
+bash -lc 'set -euo pipefail
+
+cleanup() {
+    status=$?
+    trap - EXIT INT TERM
+    kill "${fe_pid:-}" "${be_pid:-}" 2>/dev/null || true
+    wait "${fe_pid:-}" "${be_pid:-}" 2>/dev/null || true
+    exit "${status}"
+}
+trap cleanup EXIT INT TERM
+
+starrocks/output/fe/bin/start_fe.sh --logconsole &
+fe_pid="$!"
+
+target/release/sirius-starrocks-be &
+be_pid="$!"
+
+wait -n "${fe_pid}" "${be_pid}"
+'
+""",cwd = ".",depends-on = ["fe-build","be-build"],description = "Run the local StarRocks FE and Rust BE in the foreground with logs"}
+
+[feature.be.dependencies]
+rust = "*"
+thrift-compiler = "*"
+
+[feature.be.tasks]
+be-build = {cmd = "cargo build --release -p sirius-starrocks-be",description = "Build the Rust StarRocks BE release binary"}
+be-test = {cmd = "cargo test -p sirius-starrocks-be",description = "Run Rust StarRocks BE tests"}
+be-run = {cmd = "cargo run -p sirius-starrocks-be --",description = "Run the Rust StarRocks BE with local FE defaults"}
+
+[feature.fe.dependencies]
+bash = "*"
+coreutils = "*"
+findutils = "*"
+gawk = "*"
+gcc = ">=12.1"
+git = "*"
+grep = "*"
+libprotobuf = "*"
+make = "*"
+maven = ">=3.9"
+openjdk = "17.*"
+python = "3.11.*"
+sed = "*"
+thrift-compiler = "0.20.*"
+util-linux = "*"
+which = "*"
+
+[feature.fe.tasks]
+fe-clean = {cmd = """
+bash -lc 'set -e
+rm -rf output/fe output/LICENSE.txt output/NOTICE.txt fe/*/target fe/plugin/*/target java-extensions/target java-extensions/hadoop-ext/target
+rm -f fe/plugin/hive-udf/dependency-reduced-pom.xml fe/plugin/spark-dpp/dependency-reduced-pom.xml'
+""",cwd = "starrocks",description = "Remove generated StarRocks FE build artifacts"}
+
+fe-run = {cmd = "output/fe/bin/start_fe.sh --logconsole",cwd = "starrocks",depends-on = ["fe-build"],description = "Run the packaged StarRocks FE in the foreground"}
+
+fe-build = {cmd = """
+bash -lc 'set -e
+notice_script="build-support/gen_notice.py"
+notice_backup="$(mktemp)"
+cp "$notice_script" "$notice_backup"
+restore_notice() {
+    status=$?
+    trap - EXIT
+    cp "$notice_backup" "$notice_script"
+    rm -f "$notice_backup"
+    exit "$status"
+}
+trap restore_notice EXIT
+sed -i "1s|^.*$|#!/usr/bin/env python3|" "$notice_script"
+
+thirdparty="${PIXI_PROJECT_ROOT}/.pixi/starrocks-fe-thirdparty"
+mkdir -p "${thirdparty}/installed/llvm/lib"
+touch "${thirdparty}/installed/llvm/lib/libLLVMInstCombine.a"
+STARROCKS_THIRDPARTY="${thirdparty}" ./build.sh --fe --with-maven-batch-mode ON
+cp ../conf/fe.conf output/fe/conf/fe.conf'
+""",
+cwd = "starrocks",inputs = [
+    "conf/fe.conf",
+    "starrocks/build.sh",
+    "starrocks/env.sh",
+    "starrocks/build-support/build_helpers.sh",
+    "starrocks/build-support/gen_notice.py",
+    "starrocks/bin/*_fe.sh",
+    "starrocks/bin/show_fe_version.sh",
+    "starrocks/bin/common.sh",
+    "starrocks/conf/cluster_snapshot.yaml",
+    "starrocks/conf/core-site.xml",
+    "starrocks/conf/fe.conf",
+    "starrocks/conf/hadoop_env.sh",
+    "starrocks/conf/udf_security.policy",
+    "starrocks/fe/checkstyle.xml",
+    "starrocks/fe/pom.xml",
+    "starrocks/fe/*/pom.xml",
+    "starrocks/fe/*/src/**/*",
+    "starrocks/fe/plugin/*/pom.xml",
+    "starrocks/fe/plugin/*/src/**/*",
+    "starrocks/gensrc/Makefile",
+    "starrocks/gensrc/proto/**/*",
+    "starrocks/gensrc/script/**/*",
+    "starrocks/gensrc/thrift/**/*",
+    "starrocks/java-extensions/pom.xml",
+    "starrocks/java-extensions/hadoop-ext/pom.xml",
+    "starrocks/java-extensions/hadoop-ext/src/**/*",
+    "starrocks/webroot/**/*",
+    "starrocks/LICENSE.txt",
+    "starrocks/licenses/**/*",
+    "starrocks/licenses-binary/**/*",
+],outputs = [
+    "starrocks/output/LICENSE.txt",
+    "starrocks/output/NOTICE.txt",
+    "starrocks/output/fe/bin/*.sh",
+    "starrocks/output/fe/conf/*",
+    "starrocks/output/fe/hive-udf/*.jar",
+    "starrocks/output/fe/lib/*.jar",
+    "starrocks/output/fe/spark-dpp/*.jar",
+    "starrocks/output/fe/webroot/**/*",
+],description = "Build and package the StarRocks FE into starrocks/output/fe"}
