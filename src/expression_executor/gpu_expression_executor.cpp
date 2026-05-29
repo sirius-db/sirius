@@ -526,13 +526,6 @@ execute_result gpu_expression_executor::execute(sirius::ast::case_expr const& al
   return execute(*duck_expr, mode);
 }
 
-execute_result gpu_expression_executor::execute(sirius::ast::function_call const& alt,
-                                                execution_mode mode)
-{
-  auto duck_expr = sirius::ast::to_duckdb(alt);
-  return execute(*duck_expr, mode);
-}
-
 std::size_t gpu_expression_executor::count_ast_ops(sirius::ast::node const& expr) const
 {
   // Round-trip shim — the per-specialization migration phase

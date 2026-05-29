@@ -15,19 +15,19 @@
  */
 
 // sirius
+#include <expression/ast/from_duckdb.hpp>
+#include <expression/ast/node.hpp>
 #include <expression/function_id.hpp>
+#include <expression/value.hpp>
 #include <expression_executor/ast_supported_types.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <expression_executor/regex/regex_playground.hpp>
+#include <helper/logical_type.hpp>
 #include <sirius/exception.hpp>
 
 // duckdb
 #include <duckdb/common/assert.hpp>
-#include <duckdb/common/exception.hpp>
-#include <duckdb/common/types.hpp>
-#include <duckdb/planner/expression/bound_constant_expression.hpp>
 #include <duckdb/planner/expression/bound_function_expression.hpp>
-#include <duckdb/planner/expression/bound_reference_expression.hpp>
 
 // cudf
 #include <cudf/binaryop.hpp>
@@ -45,36 +45,42 @@
 #include <cudf/unary.hpp>
 
 // standard library
+#include <algorithm>
 #include <regex>
 #include <string>
+#include <variant>
 
 namespace sirius {
 using execute_result = gpu_expression_executor::execute_result;
 
-execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression const& expr,
+execute_result gpu_expression_executor::execute(sirius::ast::function_call const& alt,
                                                 execution_mode mode)
 {
-  auto const& func_string    = expr.function.name;
-  auto const resolved_id_opt = sirius::from_duckdb_function_name(func_string);
-  if (!resolved_id_opt.has_value()) {
-    throw not_implemented_exception(
-      "[gpu_expression_executor:function] execute called on unsupported function: {}", func_string);
-  }
-  auto const resolved_id = *resolved_id_opt;
+  auto const resolved_id = alt.function();
+  auto const& args       = alt.arguments();
 
-  /// We disable AST if the output type is decimal, since cuDF ASTs choke on intermediate decimal
-  /// results currently.
-  /// TODO: Fix when the following bug fix is in:
-  /// https://github.com/rapidsai/cudf/pull/21996
-  auto const ast_supported =
-    (expr.return_type.id() != duckdb::LogicalTypeId::DECIMAL) &&
-    (std::find(supported_ast_functions.begin(), supported_ast_functions.end(), resolved_id) !=
-     supported_ast_functions.end());
+  // Disable AST mode when the output type is decimal — cuDF ASTs choke on
+  // intermediate decimal results currently.
+  // TODO: Fix when https://github.com/rapidsai/cudf/pull/21996 lands.
+  auto const skip_ast      = alt.return_type().id() == sirius::type_id::DECIMAL;
+  auto const ast_supported = !skip_ast && std::find(supported_ast_functions.begin(),
+                                                    supported_ast_functions.end(),
+                                                    resolved_id) != supported_ast_functions.end();
+
+  // Match DuckDB-typed count_ast_ops for function:
+  //   skip_ast OR unsupported -> 0 ; supported -> 1 + sum of arg counts.
+  std::size_t ast_op_count = 0;
+  if (ast_supported) {
+    ast_op_count = 1;
+    for (auto const& a : args) {
+      ast_op_count += count_ast_ops(*a);
+    }
+  }
 
   if (ast_supported && _strategy != expression_executor_strategy::MATERIALIZE &&
-      (mode == execution_mode::AST || count_ast_ops(expr) >= _min_ast_size)) {
-    // Only numeric binary functions are supported in AST currently
-    D_ASSERT(expr.children.size() == 2);
+      (mode == execution_mode::AST || ast_op_count >= _min_ast_size)) {
+    // Only numeric binary functions are supported in AST currently.
+    D_ASSERT(args.size() == 2);
 
     auto function_type_switch_ast = [](function_id id) -> cudf::ast::ast_operator {
       switch (id) {
@@ -86,13 +92,13 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
         case function_id::mod: return cudf::ast::ast_operator::MOD;
         default:
           throw invalid_input_exception(
-            "[gpu_expression_executor:function] unsupported AST function type {}",
-            to_duckdb_function_name(id));
+            "[gpu_expression_executor:function] unsupported AST function id {}",
+            static_cast<int>(id));
       }
     };
 
-    auto left             = execute(*expr.children[0], execution_mode::AST);
-    auto right            = execute(*expr.children[1], execution_mode::AST);
+    auto left             = execute(*args[0], execution_mode::AST);
+    auto right            = execute(*args[1], execution_mode::AST);
     auto const& func_expr = _ast_tree.emplace<cudf::ast::operation>(
       function_type_switch_ast(resolved_id), left.get_expr(), right.get_expr());
 
@@ -105,37 +111,28 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
     }
 
     //===----------2: MATERIALIZE Mode, evaluate node with AST----------===//
-    // Evaluate the AST subtree
     auto result_column = execute_ast(func_expr);
-
-    // Release consumed temporaries
     release_temporaries({left.get_temp_scalar_indices(), right.get_temp_scalar_indices()},
                         {left.get_temp_column_indices(), right.get_temp_column_indices()});
     return execute_result(std::move(result_column));
   }
 
   //===----------3: MATERIALIZE Mode, evaluate node with solo operation----------===//
-  // If the caller requested AST mode but we fell through (unsupported function for AST),
-  // materialize the result and wrap it as a temp column for the parent's AST tree.
   if (mode == execution_mode::AST) {
-    // Re-enter execute with MATERIALIZE mode to get the result as a column, then add to the AST
-    // tree.
-    auto result = execute(expr, execution_mode::MATERIALIZE);
+    auto result = execute(alt, execution_mode::MATERIALIZE);
     if (!result.is_owned_column()) {
-      // Any function execution in MATERIALIZE mode should produce an owned column. Otherwise,
-      // something went wrong.
       throw internal_exception(
         "[gpu_expression_executor:function]: Expected an owned column after executing function "
         "expression.");
     }
     return materialize_as_ast_column(std::move(result.release_column()));
   }
-  auto const output_type = GetCudfType(expr.return_type);
+  auto const output_type = sirius::get_cudf_type(alt.return_type());
 
   //----------Numeric Binary Functions----------//
   auto execute_numeric_binary_func = [&](cudf::binary_operator op) -> execute_result {
-    auto left  = execute(*expr.children[0], execution_mode::MATERIALIZE);
-    auto right = execute(*expr.children[1], execution_mode::MATERIALIZE);
+    auto left  = execute(*args[0], execution_mode::MATERIALIZE);
+    auto right = execute(*args[1], execution_mode::MATERIALIZE);
     D_ASSERT(!left.is_scalar() || !right.is_scalar());  // Both sides cannot be scalars
     if (left.is_scalar()) {
       return execute_result(cudf::binary_operation(
@@ -166,18 +163,18 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
 
   //----------Substring Function----------//
   if (resolved_id == function_id::substring) {
-    auto input = execute(*expr.children[0], execution_mode::MATERIALIZE);
+    auto input = execute(*args[0], execution_mode::MATERIALIZE);
 
-    // The start and len arguments of SUBSTRING are assumed to be constants
-    D_ASSERT(expr.children[1]->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT);
-    D_ASSERT(expr.children[2]->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT);
-    auto const& start_expr = expr.children[1]->Cast<duckdb::BoundConstantExpression>();
-    auto const& len_expr   = expr.children[2]->Cast<duckdb::BoundConstantExpression>();
+    // The start and len arguments of SUBSTRING are assumed to be INTEGER constants.
+    D_ASSERT(args[1]->holds<sirius::ast::constant>());
+    D_ASSERT(args[2]->holds<sirius::ast::constant>());
+    auto const start_raw = std::get<int32_t>(args[1]->get<sirius::ast::constant>().payload);
+    auto const len_raw   = std::get<int32_t>(args[2]->get<sirius::ast::constant>().payload);
 
     // The values provided by DuckDB must be modified to be 0-indexed and <start, stop> instead of
     // <start, len>
-    auto const start_val = start_expr.value.GetValue<cudf::size_type>() - 1;
-    auto const stop_val  = len_expr.value.GetValue<cudf::size_type>() + start_val;
+    auto const start_val = static_cast<cudf::size_type>(start_raw) - 1;
+    auto const stop_val  = static_cast<cudf::size_type>(len_raw) + start_val;
 
     auto result_column =
       cudf::strings::slice_strings(cudf::strings_column_view(input.get_column_view()),
@@ -191,13 +188,11 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
 
   //----------String Matching Functions----------//
   auto setup_string_matching = [&]() -> std::pair<execute_result, std::string> {
-    // Children should be <input column, comparator scalar>
-    D_ASSERT(expr.children.size() == 2);
-    D_ASSERT(expr.children[1]->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT);
+    D_ASSERT(args.size() == 2);
+    D_ASSERT(args[1]->holds<sirius::ast::constant>());
 
-    auto input                 = execute(*expr.children[0], execution_mode::MATERIALIZE);
-    auto const& match_str_expr = expr.children[1]->Cast<duckdb::BoundConstantExpression>();
-    auto match_str             = match_str_expr.value.GetValue<std::string>();
+    auto input     = execute(*args[0], execution_mode::MATERIALIZE);
+    auto match_str = std::get<std::string>(args[1]->get<sirius::ast::constant>().payload);
     return {execute_result(std::move(input)), std::move(match_str)};
   };
   if (resolved_id == function_id::like || resolved_id == function_id::not_like) {
@@ -243,8 +238,8 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
   //----------DateTime Extraction Functions----------//
   auto execute_datetime_extract_func =
     [&](cudf::datetime::datetime_component component) -> execute_result {
-    D_ASSERT(expr.children.size() == 1);
-    auto input = execute(*expr.children[0], execution_mode::MATERIALIZE);
+    D_ASSERT(args.size() == 1);
+    auto input = execute(*args[0], execution_mode::MATERIALIZE);
     auto result_column =
       cudf::datetime::extract_datetime_component(input.get_column_view(), component, _stream, _mr);
     return execute_result(std::move(result_column));
@@ -276,12 +271,11 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
 
   //----------Date Truncation Function----------//
   if (resolved_id == function_id::date_trunc) {
-    D_ASSERT(expr.children.size() == 2);
+    D_ASSERT(args.size() == 2);
     // The first child is the frequency, which should be a constant string
-    D_ASSERT(expr.children[0]->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT);
-    auto const& freq_expr = expr.children[0]->Cast<duckdb::BoundConstantExpression>();
-    auto const& freq_str  = freq_expr.value.GetValue<std::string>();
-    auto input            = execute(*expr.children[1], execution_mode::MATERIALIZE);
+    D_ASSERT(args[0]->holds<sirius::ast::constant>());
+    auto const& freq_str = std::get<std::string>(args[0]->get<sirius::ast::constant>().payload);
+    auto input           = execute(*args[1], execution_mode::MATERIALIZE);
     D_ASSERT(!input.is_scalar());
 
     auto freq_string_switch =
@@ -312,33 +306,31 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
 
   //----------Unary Functions----------//
   if (resolved_id == function_id::strlen) {
-    D_ASSERT(expr.children.size() == 1);
-    auto input = execute(*expr.children[0], execution_mode::MATERIALIZE);
+    D_ASSERT(args.size() == 1);
+    auto input = execute(*args[0], execution_mode::MATERIALIZE);
     auto result_column =
       cudf::strings::count_bytes(cudf::strings_column_view(input.get_column_view()), _stream, _mr);
     return execute_result(std::move(result_column));
   }
   if (resolved_id == function_id::length) {
-    D_ASSERT(expr.children.size() == 1);
-    auto input         = execute(*expr.children[0], execution_mode::MATERIALIZE);
+    D_ASSERT(args.size() == 1);
+    auto input         = execute(*args[0], execution_mode::MATERIALIZE);
     auto result_column = cudf::strings::count_characters(
       cudf::strings_column_view(input.get_column_view()), _stream, _mr);
     return execute_result(std::move(result_column));
   }
   if (resolved_id == function_id::regexp_replace) {
     // The input should be <input column, pattern string scalar, replace string scalar>
-    D_ASSERT(expr.children.size() == 3);
-    D_ASSERT(expr.children[1]->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT);
-    D_ASSERT(expr.children[2]->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT);
+    D_ASSERT(args.size() == 3);
+    D_ASSERT(args[1]->holds<sirius::ast::constant>());
+    D_ASSERT(args[2]->holds<sirius::ast::constant>());
 
-    auto input = execute(*expr.children[0], execution_mode::MATERIALIZE);
+    auto input = execute(*args[0], execution_mode::MATERIALIZE);
     D_ASSERT(!input.is_scalar());
 
-    auto const& pattern_str =
-      expr.children[1]->Cast<duckdb::BoundConstantExpression>().value.GetValue<std::string>();
-    auto const& replace_str =
-      expr.children[2]->Cast<duckdb::BoundConstantExpression>().value.GetValue<std::string>();
-    auto regex_prog = cudf::strings::regex_program::create(std::string_view(pattern_str));
+    auto const& pattern_str = std::get<std::string>(args[1]->get<sirius::ast::constant>().payload);
+    auto const& replace_str = std::get<std::string>(args[2]->get<sirius::ast::constant>().payload);
+    auto regex_prog         = cudf::strings::regex_program::create(std::string_view(pattern_str));
 
     auto const has_backrefs = std::regex_search(replace_str, std::regex(R"(\\[0-9])"));
     if (has_backrefs) {
@@ -368,10 +360,10 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
   // row() and struct_pack() both construct a struct column from their child expressions.
   // row() is used by DuckDB for tuple constructors like (col1, col2).
   if (resolved_id == function_id::row || resolved_id == function_id::struct_pack) {
-    D_ASSERT(!expr.children.empty());
+    D_ASSERT(!args.empty());
     std::vector<std::unique_ptr<cudf::column>> child_cols;
-    for (const auto& expr : expr.children) {
-      auto result = execute(*expr, execution_mode::MATERIALIZE);
+    for (const auto& a : args) {
+      auto result = execute(*a, execution_mode::MATERIALIZE);
       if (result.is_scalar()) {
         child_cols.push_back(cudf::make_column_from_scalar(
           result.get_scalar(), _input_table.num_rows(), _stream, _mr));
@@ -387,22 +379,26 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
 
   // `error()` is a runtime-error-raising function. We deliberately do not
   // evaluate it on-device here; the upstream fallback path is expected to
-  // handle it on the CPU. (Phase 6 will revisit this once ERROR_FUNC_STR
-  // migrates)
+  // handle it on the CPU.
   if (resolved_id == function_id::error) {
     throw not_implemented_exception(
       "[gpu_expression_executor:function] error() is not dispatched on GPU; "
       "expected to fall back to CPU execution");
   }
 
-  // Invariant violation: `func_string` resolved to a valid function_id (so it
-  // passed the unsupported-name guard at the top of execute()), yet no dispatch
-  // arm above claimed it. This means an entry was added to `function_id`
-  // without a corresponding GPU handler here.
+  // Invariant violation: alt.function() returned a valid function_id but no
+  // dispatch arm above claimed it. This means an entry was added to
+  // function_id without a corresponding GPU handler here.
   throw internal_exception(
-    "[gpu_expression_executor:function]: registered function_id has no GPU "
-    "dispatch arm (function name: {})",
-    func_string);
+    "[gpu_expression_executor:function]: registered function_id has no GPU dispatch arm: id={}",
+    static_cast<int>(resolved_id));
+}
+
+execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression const& expr,
+                                                execution_mode mode)
+{
+  auto node = sirius::ast::from_duckdb(expr);
+  return execute(*node, mode);
 }
 
 }  // namespace sirius

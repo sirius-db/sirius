@@ -2379,3 +2379,68 @@ TEST_CASE("native_ast - cast INTEGER->BIGINT (MATERIALIZE)",
     REQUIRE(out_host[i] == static_cast<int64_t>(in_host[i]));
   }
 }
+
+TEST_CASE("native_ast - function_call add (MATERIALIZE)",
+          "[expression_executor_ast_native][function_call]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  // 2-column INT32 batch.
+  auto input =
+    make_input_batch(*space,
+                     {cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT32}},
+                     {std::pair<int, int>{0, 50}, std::pair<int, int>{0, 50}});
+  auto ro       = input->to_read_only();
+  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  auto tv       = in_repr.get_table_view();
+
+  std::vector<std::unique_ptr<sirius::ast::node>> args;
+  args.push_back(ref_node_native(0));
+  args.push_back(ref_node_native(1));
+  auto hand_ast = std::make_unique<sirius::ast::node>(
+    sirius::ast::function_call{sirius::function_id::add,
+                               std::move(args),
+                               sirius::logical_type::make(sirius::type_id::INTEGER)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), tv, MAT);
+  REQUIRE(out);
+  auto c0       = copy_column_to_host<int32_t>(tv.column(0));
+  auto c1       = copy_column_to_host<int32_t>(tv.column(1));
+  auto out_host = copy_column_to_host<int32_t>(out->view().column(0));
+  REQUIRE(out_host.size() == c0.size());
+  for (size_t i = 0; i < c0.size(); ++i) {
+    REQUIRE(out_host[i] == c0[i] + c1[i]);
+  }
+}
+
+TEST_CASE("native_ast - function_call add (AST_INTERPRET)",
+          "[expression_executor_ast_native][function_call]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto input =
+    make_input_batch(*space,
+                     {cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT32}},
+                     {std::pair<int, int>{0, 50}, std::pair<int, int>{0, 50}});
+  auto ro       = input->to_read_only();
+  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  auto tv       = in_repr.get_table_view();
+
+  std::vector<std::unique_ptr<sirius::ast::node>> args;
+  args.push_back(ref_node_native(0));
+  args.push_back(ref_node_native(1));
+  auto hand_ast = std::make_unique<sirius::ast::node>(
+    sirius::ast::function_call{sirius::function_id::add,
+                               std::move(args),
+                               sirius::logical_type::make(sirius::type_id::INTEGER)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), tv, exp_strategy_enum::AST_INTERPRET);
+  REQUIRE(out);
+  auto c0       = copy_column_to_host<int32_t>(tv.column(0));
+  auto c1       = copy_column_to_host<int32_t>(tv.column(1));
+  auto out_host = copy_column_to_host<int32_t>(out->view().column(0));
+  REQUIRE(out_host.size() == c0.size());
+  for (size_t i = 0; i < c0.size(); ++i) {
+    REQUIRE(out_host[i] == c0[i] + c1[i]);
+  }
+}
