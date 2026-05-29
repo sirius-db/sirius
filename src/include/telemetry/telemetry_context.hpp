@@ -22,19 +22,20 @@
 #include "telemetry-bridge/gen/uuid.rs.h"
 #include "telemetry-bridge/gen/worker.rs.h"
 
-#include <optional>
-#include <string>
-
 namespace sirius::pipeline {
 class sirius_pipeline;
 }  // namespace sirius::pipeline
 
+namespace sirius {
+struct telemetry_config;
+}  // namespace sirius
+
 namespace sirius::telemetry {
 
-/// Owns the top-level telemetry states for a single Sirius session (sirius_interface level).
+/// Owns the top-level telemetry states for a single SiriusContext.
 class telemetry_context {
  public:
-  telemetry_context(std::optional<std::string> query_label);
+  explicit telemetry_context(const sirius::telemetry_config& config);
   ~telemetry_context();
 
   // Non-copyable, non-movable (owns opaque Rust boxes)
@@ -46,7 +47,6 @@ class telemetry_context {
   [[nodiscard]] const uuid::UUID& engine_id() const { return engine_uuid_; }
   [[nodiscard]] const uuid::UUID& worker_id() const { return worker_uuid_; }
   [[nodiscard]] const quent::Context& context() const { return *context_; }
-  [[nodiscard]] const std::optional<std::string>& query_label() const { return query_label_; }
 
  private:
   uuid::UUID engine_uuid_;
@@ -54,7 +54,6 @@ class telemetry_context {
   rust::Box<quent::Context> context_;
   rust::Box<quent::engine::EngineObserver> engine_observer_;
   rust::Box<quent::worker::WorkerObserver> worker_observer_;
-  std::optional<std::string> query_label_;
 };
 
 // A POD to hold common identifiers for useful telemetry.

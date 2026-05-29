@@ -30,6 +30,7 @@
 #include "telemetry-bridge/gen/query.rs.h"
 #include "telemetry-bridge/gen/query_group.rs.h"
 #include "telemetry-bridge/gen/uuid.rs.h"
+#include "telemetry/telemetry_context.hpp"
 
 #include <cucascade/data/data_repository_manager.hpp>
 
@@ -121,6 +122,7 @@ class sirius_engine {
     iceberg_delete_data_cache_;
 
  private:
+  const telemetry::telemetry_context& telemetry_context_;
   uuid::UUID query_group_uuid_;
   rust::Box<quent::query_group::QueryGroupObserver> query_group_observer_;
   rust::Box<quent::query::QueryHandle> query_handle_;

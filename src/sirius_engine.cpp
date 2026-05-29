@@ -61,23 +61,43 @@
 
 namespace sirius {
 
+namespace {
+
+const telemetry::telemetry_context& get_telemetry_context_from_client_context(
+  duckdb::ClientContext& context)
+{
+  if (not context.registered_state) {
+    throw invalid_input_exception("Sirius context is not registered.");
+  }
+
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (not sirius_ctx or not sirius_ctx->is_initialized()) {
+    throw invalid_input_exception("Sirius context is not initialized.");
+  }
+
+  return sirius_ctx->get_telemetry_context();
+}
+
+}  // namespace
+
 sirius_engine::sirius_engine(duckdb::ClientContext& context, sirius_interface& sirius_iface)
   : context(context),
     sirius_iface(sirius_iface),
+    telemetry_context_(get_telemetry_context_from_client_context(this->context)),
     query_group_uuid_(uuid::now_v7()),
-    query_group_observer_(quent::query_group::create_observer(sirius_iface.telemetry.context())),
-    query_handle_(quent::query::create(
-      sirius_iface.telemetry.context(),
-      quent::query::Init{
-        .instance_name  = sirius_iface.telemetry.query_label().value_or("unnamed_query"),
-        .query_group_id = query_group_uuid_,
-      }))
+    query_group_observer_(quent::query_group::create_observer(telemetry_context_.context())),
+    query_handle_(
+      quent::query::create(telemetry_context_.context(),
+                           quent::query::Init{
+                             .instance_name  = sirius_iface.query_label.value_or("unnamed_query"),
+                             .query_group_id = query_group_uuid_,
+                           }))
 {
   // Declare the query group under this engine
   query_group_observer_->declaration(query_group_uuid_,
                                      quent::query_group::Declaration{
                                        .instance_name = "default_group",
-                                       .engine_id     = sirius_iface.telemetry.engine_id(),
+                                       .engine_id     = telemetry_context_.engine_id(),
                                      });
 }
 
@@ -109,9 +129,8 @@ bool sirius_engine::has_result_collector()
 duckdb::unique_ptr<duckdb::QueryResult> sirius_engine::get_result()
 {
   D_ASSERT(has_result_collector());
-  if (!sirius_physical_plan) throw invalid_input_exception("sirius_physical_plan is NULL");
-  if (sirius_physical_plan.get() == NULL)
-    throw invalid_input_exception("sirius_physical_plan is NULL");
+  if (!sirius_physical_plan) { throw invalid_input_exception("sirius_physical_plan is NULL"); }
+
   auto& result_collector =
     sirius_physical_plan.get()->Cast<op::sirius_physical_materialized_collector>();
   duckdb::unique_ptr<duckdb::QueryResult> res = result_collector.get_result();
@@ -144,10 +163,9 @@ void sirius_engine::execute()
 
   // Create the query with the pipelines
   sirius_ctx->create_query(std::move(new_scheduled),
-                           sirius_iface.telemetry.context(),
                            telemetry::query_telemetry_info{
                              .query_id  = query_handle_->uuid(),
-                             .worker_id = sirius_iface.telemetry.worker_id(),
+                             .worker_id = telemetry_context_.worker_id(),
                            });
   auto future = sirius_ctx->get_task_scheduler().start_query();
   try {

@@ -16,12 +16,11 @@
 
 #include "telemetry/telemetry_context.hpp"
 
-#include "config.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/sirius_pipeline.hpp"
-#include "telemetry-bridge/gen/custom_attributes.rs.h"
+#include "sirius_config.hpp"
 #include "telemetry-bridge/gen/operator.rs.h"
 #include "telemetry-bridge/gen/plan.rs.h"
 #include "telemetry-bridge/gen/port.rs.h"
@@ -33,27 +32,23 @@
 
 namespace sirius::telemetry {
 
-telemetry_context::telemetry_context(std::optional<std::string> query_label)
+telemetry_context::telemetry_context(const sirius::telemetry_config& config)
   : engine_uuid_(uuid::now_v7()),
     worker_uuid_(uuid::now_v7()),
-    context_(quent::create_context(uuid::now_v7(),
-                                   duckdb::Config::ENABLE_QUENT ? "ndjson" : "noop",
-                                   duckdb::Config::QUENT_OUTPUT_DIRECTORY)),
+    context_(quent::create_context(
+      uuid::now_v7(), config.enable_quent ? "ndjson" : "noop", config.output_directory)),
     engine_observer_(quent::engine::create_observer(*context_)),
-    worker_observer_(quent::worker::create_observer(*context_)),
-    query_label_(std::move(query_label))
+    worker_observer_(quent::worker::create_observer(*context_))
 {
-  const std::string& engine_name = duckdb::Config::QUENT_ENGINE_NAME;
-
   engine_observer_->init(engine_uuid_,
                          quent::engine::Init{
                            .implementation =
                              quent::engine::Implementation{
-                               .name              = engine_name,
+                               .name              = config.engine_name,
                                .version           = "",
                                .custom_attributes = {},
                              },
-                           .instance_name = engine_name,
+                           .instance_name = config.engine_name,
                          });
 
   worker_observer_->init(worker_uuid_,
@@ -62,7 +57,7 @@ telemetry_context::telemetry_context(std::optional<std::string> query_label)
                            .instance_name    = fmt::format("worker-{}", getpid()),
                          });
 
-  SIRIUS_LOG_INFO("Telemetry context initialized (engine={})", engine_name);
+  SIRIUS_LOG_INFO("Telemetry context initialized (engine={})", config.engine_name);
 }
 
 telemetry_context::~telemetry_context()

@@ -7,16 +7,16 @@
 # attributed back to a specific (query, iteration) pair.
 #
 # Usage:
-#   export SIRIUS_CONFIG_FILE=...
 #   ./run_tpch_parquet_and_generate_telemetry.sh [options] <scale_factor> [query_numbers...]
 #
 # If no query numbers are given, all 22 TPC-H queries are run.
 #
 # Options:
+#   --config <path>        Full Sirius YAML config to use
+#                          (default: bundled telemetry-only config)
 #   --parquet-dir <path>   Directory containing TPC-H parquet files
 #                          (default: $PROJECT_DIR/test_datasets/tpch_parquet_sf<SF>)
 #   --iterations <N>       Iterations per query (default: 2)
-#   --output-dir <path>    Where to write Quent ndjson (default: telemetry_data/)
 #   --note <text>          Free-form annotation prefixed onto each query label
 #
 # Example:
@@ -29,23 +29,25 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DUCKDB="$PROJECT_DIR/build/release/duckdb"
 QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/orig"
+DEFAULT_SIRIUS_TELEMETRY_CONFIG="$SCRIPT_DIR/tpch_telemetry_sirius.yaml"
+SIRIUS_CONFIG="$DEFAULT_SIRIUS_TELEMETRY_CONFIG"
 
 PARQUET_DIR=""
 NUM_ITERATIONS=2
-OUTPUT_DIR="telemetry_data"
 RUN_NOTE=""
+CUSTOM_CONFIG=0
 while [ $# -gt 0 ]; do
     case "${1:-}" in
+        --config)       SIRIUS_CONFIG="$2"; CUSTOM_CONFIG=1; shift 2 ;;
         --parquet-dir)  PARQUET_DIR="$2";    shift 2 ;;
         --iterations)   NUM_ITERATIONS="$2"; shift 2 ;;
-        --output-dir)   OUTPUT_DIR="$2";     shift 2 ;;
         --note)         RUN_NOTE="$2";       shift 2 ;;
         *) break ;;
     esac
 done
 
 if [ $# -lt 1 ]; then
-    echo "Usage: $0 [--parquet-dir <path>] [--iterations <N>] [--output-dir <path>] [--note <text>] <scale_factor> [query_numbers...]"
+    echo "Usage: $0 [--config <path>] [--parquet-dir <path>] [--iterations <N>] [--note <text>] <scale_factor> [query_numbers...]"
     exit 1
 fi
 
@@ -61,6 +63,10 @@ fi
 
 if [ ! -x "$DUCKDB" ]; then
     echo "ERROR: DuckDB binary not found at $DUCKDB"
+    exit 1
+fi
+if [ ! -f "$SIRIUS_CONFIG" ]; then
+    echo "ERROR: Sirius config not found: $SIRIUS_CONFIG"
     exit 1
 fi
 if [ ! -d "$PARQUET_DIR" ]; then
@@ -87,15 +93,11 @@ RUN_NOTE_ESCAPED="${RUN_NOTE//\'/\'\'}"
 LABEL_PREFIX="tpch_"
 [ -n "$RUN_NOTE_ESCAPED" ] && LABEL_PREFIX="${RUN_NOTE_ESCAPED}_${LABEL_PREFIX}"
 
-mkdir -p "$OUTPUT_DIR"
-
-# Build a single SQL file: views, telemetry config, then per-iteration label
-# CALLs followed by the query.
+# Build a single SQL file: views, then per-iteration label CALLs followed by
+# the query.
 TEMP_SQL=$(mktemp /tmp/tpch_telemetry_XXXXXX.sql)
 {
     printf '%s\n' "$VIEW_SQL"
-    printf "SET enable_quent = true;\n"
-    printf "SET quent_output_directory = '%s';\n" "$OUTPUT_DIR"
     # `.timer on` prints a `Run Time` line after every statement, including the
     # label CALLs interleaved with each query.
     printf ".timer on\n"
@@ -119,14 +121,19 @@ echo "Running TPC-H SF${SF} queries with telemetry export"
 echo "  Parquet dir:  $PARQUET_DIR"
 echo "  Queries:      ${QUERIES[*]}"
 echo "  Iterations:   $NUM_ITERATIONS"
-echo "  Output dir:   $OUTPUT_DIR"
+echo "  Config:       $SIRIUS_CONFIG"
+if [ "$CUSTOM_CONFIG" -eq 1 ]; then
+    echo "  Telemetry:    using custom config; ensure sirius.telemetry.enable_quent=true"
+else
+    echo "  Telemetry:    enabled by bundled telemetry config"
+fi
 [ -n "$RUN_NOTE" ] && echo "  Note:         $RUN_NOTE"
 echo "=========================================="
 
-"$DUCKDB" -f "$TEMP_SQL"
+SIRIUS_DISABLE=0 SIRIUS_CONFIG_FILE="$SIRIUS_CONFIG" "$DUCKDB" -f "$TEMP_SQL"
 EXIT=$?
 rm -f "$TEMP_SQL"
 
 echo ""
-echo "Telemetry data written under $OUTPUT_DIR"
+echo "Telemetry output directory is controlled by sirius.telemetry.output_directory in the selected config"
 exit "$EXIT"

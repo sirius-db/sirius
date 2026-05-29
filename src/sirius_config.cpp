@@ -109,6 +109,15 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.reject_unknown();
 }
 
+static void from_yaml(const YAML::Node& node, telemetry_config& opt)
+{
+  yaml::reader r(node, "telemetry");
+  r.optional("enable_quent", opt.enable_quent);
+  r.optional("output_directory", opt.output_directory);
+  r.optional("engine_name", opt.engine_name);
+  r.reject_unknown();
+}
+
 static void from_yaml(const YAML::Node& node, op::scan::scan_executor_config& opt)
 {
   yaml::reader r(node, "duckdb_scan");
@@ -354,6 +363,9 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
 
     // Operator params
     if (auto n = r.optional_node("operator_params")) { sirius::from_yaml(*n, _operator_params); }
+
+    // Telemetry
+    if (auto n = r.optional_node("telemetry")) { sirius::from_yaml(*n, _telemetry_config); }
 
     // Explicit space configs (low-level API)
     std::vector<cucascade::memory::gpu_memory_space_config> gpu_space_configs;
