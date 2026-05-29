@@ -2239,3 +2239,121 @@ TEST_CASE("native_ast - between (MATERIALIZE)", "[expression_executor_ast_native
     REQUIRE(out_host[i] == ((in_host[i] >= 5 && in_host[i] <= 15) ? 1U : 0U));
   }
 }
+
+TEST_CASE("native_ast - unary_op NOT (MATERIALIZE)", "[expression_executor_ast_native][unary_op]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto in = make_int32_input(*space);
+
+  auto cmp      = std::make_unique<sirius::ast::node>(sirius::ast::comparison{
+    sirius::comparison_type::equal, ref_node_native(0), int_const_node_native(5)});
+  auto hand_ast = std::make_unique<sirius::ast::node>(
+    sirius::ast::unary_op{sirius::ast::unary_op::kind::op_not, std::move(cmp)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), in.view, MAT);
+  REQUIRE(out);
+  auto in_host  = copy_column_to_host<int32_t>(in.view.column(0));
+  auto out_host = copy_bool_column_to_host(out->view().column(0));
+  REQUIRE(out_host.size() == in_host.size());
+  for (size_t i = 0; i < in_host.size(); ++i) {
+    REQUIRE(out_host[i] == (in_host[i] != 5 ? 1U : 0U));
+  }
+}
+
+TEST_CASE("native_ast - unary_op IS_NULL (MATERIALIZE)",
+          "[expression_executor_ast_native][unary_op]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  std::vector<int32_t> values{1, 2, 3, 4, 5};
+  std::vector<bool> valids{true, false, true, false, true};
+  auto batch    = make_int32_batch_with_nulls(*space, values, valids);
+  auto ro       = batch->to_read_only();
+  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  auto tv       = in_repr.get_table_view();
+
+  auto hand_ast = std::make_unique<sirius::ast::node>(
+    sirius::ast::unary_op{sirius::ast::unary_op::kind::op_is_null, ref_node_native(0)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), tv, MAT);
+  REQUIRE(out);
+  auto out_host = copy_bool_column_to_host(out->view().column(0));
+  REQUIRE(out_host.size() == valids.size());
+  for (size_t i = 0; i < valids.size(); ++i) {
+    REQUIRE(out_host[i] == (valids[i] ? 0U : 1U));
+  }
+}
+
+TEST_CASE("native_ast - unary_op IS_NOT_NULL (MATERIALIZE)",
+          "[expression_executor_ast_native][unary_op]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  std::vector<int32_t> values{10, 20, 30, 40};
+  std::vector<bool> valids{true, false, true, true};
+  auto batch    = make_int32_batch_with_nulls(*space, values, valids);
+  auto ro       = batch->to_read_only();
+  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  auto tv       = in_repr.get_table_view();
+
+  auto hand_ast = std::make_unique<sirius::ast::node>(
+    sirius::ast::unary_op{sirius::ast::unary_op::kind::op_is_not_null, ref_node_native(0)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), tv, MAT);
+  REQUIRE(out);
+  auto out_host = copy_bool_column_to_host(out->view().column(0));
+  REQUIRE(out_host.size() == valids.size());
+  for (size_t i = 0; i < valids.size(); ++i) {
+    REQUIRE(out_host[i] == (valids[i] ? 1U : 0U));
+  }
+}
+
+TEST_CASE("native_ast - in_list IN (MATERIALIZE)", "[expression_executor_ast_native][in_list]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto in = make_int32_input(*space);
+
+  std::vector<std::unique_ptr<sirius::ast::node>> values;
+  values.push_back(int_const_node_native(1));
+  values.push_back(int_const_node_native(3));
+  values.push_back(int_const_node_native(5));
+  auto hand_ast = std::make_unique<sirius::ast::node>(
+    sirius::ast::in_list{ref_node_native(0), std::move(values), /*negated=*/false});
+
+  auto out = run_native_ast(*space, hand_ast.get(), in.view, MAT);
+  REQUIRE(out);
+  auto in_host  = copy_column_to_host<int32_t>(in.view.column(0));
+  auto out_host = copy_bool_column_to_host(out->view().column(0));
+  REQUIRE(out_host.size() == in_host.size());
+  for (size_t i = 0; i < in_host.size(); ++i) {
+    bool const expected = (in_host[i] == 1 || in_host[i] == 3 || in_host[i] == 5);
+    REQUIRE(out_host[i] == (expected ? 1U : 0U));
+  }
+}
+
+TEST_CASE("native_ast - coalesce (MATERIALIZE)", "[expression_executor_ast_native][coalesce]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  std::vector<int32_t> values{7, 8, 9, 10, 11};
+  std::vector<bool> valids{true, false, true, false, true};
+  auto batch    = make_int32_batch_with_nulls(*space, values, valids);
+  auto ro       = batch->to_read_only();
+  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  auto tv       = in_repr.get_table_view();
+
+  std::vector<std::unique_ptr<sirius::ast::node>> children;
+  children.push_back(ref_node_native(0));
+  children.push_back(int_const_node_native(99));
+  auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::coalesce{std::move(children)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), tv, MAT);
+  REQUIRE(out);
+  auto out_host = copy_column_to_host<int32_t>(out->view().column(0));
+  REQUIRE(out_host.size() == values.size());
+  for (size_t i = 0; i < values.size(); ++i) {
+    REQUIRE(out_host[i] == (valids[i] ? values[i] : 99));
+  }
+}
