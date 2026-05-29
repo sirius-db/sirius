@@ -354,7 +354,13 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   //      land on the right NUMA domain
   //   3. fan numa_ioctxs_[node] out into gpu_ioctxs_[dev] for every GPU on
   //      that node, aliasing the shared_ptr
-  {
+  //
+  // S6: only build the io_uring reactor fleet when the sirius_datasource scan
+  // path is enabled. When disabled (the default), local scans use the cudf
+  // parquet reader directly, so the fleet would be unused — and building it
+  // imposes a large RLIMIT_MEMLOCK requirement (registered io_uring bounce
+  // buffers) that fails preflight on hosts with a low memlock limit.
+  if (config_.get_scan_manager_config().use_sirius_datasource) {
     auto gpu_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
 
     // Group GPUs by normalized NUMA node id (-1 -> 0 to match task_creator
@@ -439,7 +445,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     SIRIUS_LOG_INFO(
       "SiriusContext: registered kFileScheme -> sirius_ioctx for GPU {} (datasource_registry_)",
       lowest_gpu->first);
-  } else {
+  } else if (config_.get_scan_manager_config().use_sirius_datasource) {
     throw std::runtime_error(
       "SiriusContext::initialize: cannot register kFileScheme; no per-GPU sirius_ioctx exists "
       "(gpu_ioctxs_.empty()). Per-GPU ioctx setup must have produced at least one ioctx.");
