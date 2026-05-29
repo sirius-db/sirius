@@ -15,6 +15,8 @@
  */
 
 // sirius
+#include <expression/ast/from_duckdb.hpp>
+#include <expression/ast/node.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 
 // duckdb
@@ -24,13 +26,20 @@ namespace sirius {
 using ast_result     = gpu_expression_executor::ast_result;
 using execute_result = gpu_expression_executor::execute_result;
 
-execute_result gpu_expression_executor::execute(duckdb::BoundReferenceExpression const& expr,
+execute_result gpu_expression_executor::execute(sirius::ast::reference const& alt,
                                                 execution_mode mode)
 {
   if (mode == execution_mode::AST) {
-    auto const& col_expr = _ast_tree.emplace<cudf::ast::column_reference>(expr.index);
+    auto const& col_expr = _ast_tree.emplace<cudf::ast::column_reference>(alt.column_index);
     return execute_result(ast_result(col_expr));
   }
-  return execute_result(_input_table.column(expr.index));
+  return execute_result(_input_table.column(alt.column_index));
+}
+
+execute_result gpu_expression_executor::execute(duckdb::BoundReferenceExpression const& expr,
+                                                execution_mode mode)
+{
+  auto node = sirius::ast::from_duckdb(expr);
+  return execute(*node, mode);
 }
 }  // namespace sirius

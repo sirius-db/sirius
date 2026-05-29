@@ -23,7 +23,23 @@
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
+#include <expression/ast/between.hpp>
+#include <expression/ast/case_expr.hpp>
+#include <expression/ast/cast.hpp>
+#include <expression/ast/coalesce.hpp>
+#include <expression/ast/comparison.hpp>
+#include <expression/ast/conjunction.hpp>
+#include <expression/ast/constant.hpp>
+#include <expression/ast/function_call.hpp>
+#include <expression/ast/in_list.hpp>
+#include <expression/ast/node.hpp>
+#include <expression/ast/reference.hpp>
+#include <expression/ast/unary_op.hpp>
+#include <expression/function_id.hpp>
+#include <expression/join_condition.hpp>
+#include <expression/value.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
+#include <helper/logical_type.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 
 // duckdb
@@ -2034,4 +2050,62 @@ TEMPLATE_TEST_CASE("execute mixed arithmetic and CASE projection",
     REQUIRE(out0[i] == in0[i] + in1[i]);
     REQUIRE(out1[i] == (in0[i] > 25 ? in1[i] * 2 : in1[i]));
   }
+}
+
+// ---------------------------------------------------------------------------
+// native_ast — exercise each migrated AST alternative through the non-owning
+// AST executor ctor, building the AST by hand (no DuckDB allocation involved).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Build a single-column INT32 input batch [0..127] and return its table view.
+struct int32_batch {
+  std::shared_ptr<data_batch> batch;
+  cudf::table_view view;
+};
+
+int32_batch make_int32_input(memory_space& space)
+{
+  auto batch =
+    make_input_batch(space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 100}});
+  auto ro       = batch->to_read_only();
+  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  return {batch, in_repr.get_table_view()};
+}
+
+std::unique_ptr<sirius::ast::node> ref_node_native(uint32_t idx)
+{
+  return std::make_unique<sirius::ast::node>(sirius::ast::reference{idx});
+}
+
+std::unique_ptr<sirius::ast::node> int_const_node_native(int32_t v)
+{
+  return std::make_unique<sirius::ast::node>(
+    sirius::ast::constant{sirius::value{v}, sirius::logical_type::make(sirius::type_id::INTEGER)});
+}
+
+std::unique_ptr<cudf::table> run_native_ast(memory_space& space,
+                                            sirius::ast::node const* expr_ptr,
+                                            cudf::table_view tv,
+                                            exp_strategy_enum strategy = MAT)
+{
+  exp_executor executor(expr_ptr, get_resource_ref(space), cudf::get_default_stream(), strategy);
+  return executor.execute(tv);
+}
+
+}  // namespace
+
+TEST_CASE("native_ast - reference identity", "[expression_executor_ast_native][reference]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto in = make_int32_input(*space);
+
+  auto hand_ast = ref_node_native(0);
+  auto out      = run_native_ast(*space, hand_ast.get(), in.view, MAT);
+  REQUIRE(out);
+  auto in_host  = copy_column_to_host<int32_t>(in.view.column(0));
+  auto out_host = copy_column_to_host<int32_t>(out->view().column(0));
+  REQUIRE(out_host == in_host);
 }
