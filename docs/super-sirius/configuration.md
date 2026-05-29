@@ -12,6 +12,7 @@ The `sirius_config` class loads configuration from a YAML file or uses built-in 
 - Memory space configurations (GPU, Host, Disk)
 - Thread pool configs for all executor types
 - Operator parameters (batch sizes, limits)
+- Telemetry options
 
 ### Config File Resolution
 
@@ -107,6 +108,10 @@ sirius:
     hash_partition_bytes: 5Gi
     concat_batch_bytes: 5Gi
     max_build_hash_table_bytes: 500Mi
+  telemetry:
+    enable_quent: false
+    output_directory: telemetry_data
+    engine_name: siriusDB
 ```
 
 ## Memory Configuration
@@ -190,6 +195,24 @@ The gap between `trigger` and `stop` prevents oscillation — without it, evicti
 | `max_build_hash_table_bytes` | 500 MB | Max build-side size for BUILD_PROBE join mode |
 
 **Note:** `max_build_hash_table_bytes` can be larger than `concat_batch_bytes`. When it is, the partition operator configures CONCAT to concatenate all batches, enabling the more efficient BUILD_PROBE join mode for larger build sides. Other joins (STANDARD, MIXED) still use `concat_batch_bytes` as the batch size threshold.
+
+## Telemetry
+
+```yaml
+sirius:
+  telemetry:
+    enable_quent: true
+    output_directory: telemetry_data
+    engine_name: siriusDB
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enable_quent` | bool | false | Emit Quent telemetry using the ndjson exporter. When false, telemetry uses the noop exporter. |
+| `output_directory` | string | `telemetry_data` | Directory for Quent ndjson files. |
+| `engine_name` | string | `siriusDB` | Engine name reported in engine-level telemetry. |
+
+Per-query labels are configured separately with `CALL sirius_set_query_label(...)` SQL function or the `query_label` named parameter on `gpu_execution(...)`.
 
 ## Thread Pool Configuration
 
