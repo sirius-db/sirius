@@ -521,10 +521,84 @@ execute_result gpu_expression_executor::execute(sirius::ast::node const& expr, e
 
 std::size_t gpu_expression_executor::count_ast_ops(sirius::ast::node const& expr) const
 {
-  // Round-trip shim — the per-specialization migration phase
-  // (https://github.com/sirius-db/sirius/issues/699) replaces this with native
-  // AST traversal one specialization at a time.
-  return count_ast_ops(*sirius::ast::to_duckdb(expr));
+  return std::visit(
+    [this](auto const& alt) -> std::size_t {
+      using T = std::decay_t<decltype(alt)>;
+      if constexpr (std::is_same_v<T, sirius::ast::reference> ||
+                    std::is_same_v<T, sirius::ast::constant>) {
+        // Leaves — match BOUND_REF / BOUND_CONSTANT cases in the DuckDB-typed
+        // count_ast_ops, both of which return 0.
+        return 0;
+      } else if constexpr (std::is_same_v<T, sirius::ast::comparison>) {
+        return 1 + count_ast_ops(*alt.left) + count_ast_ops(*alt.right);
+      } else if constexpr (std::is_same_v<T, sirius::ast::conjunction>) {
+        // Number of AND/OR ops is one less than number of children.
+        std::size_t count = alt.children.size() - 1;
+        for (auto const& c : alt.children) {
+          count += count_ast_ops(*c);
+        }
+        return count;
+      } else if constexpr (std::is_same_v<T, sirius::ast::between>) {
+        // 2 comparison ops + 1 AND op + ops in the children.
+        return 3 + count_ast_ops(*alt.input) + count_ast_ops(*alt.lower) +
+               count_ast_ops(*alt.upper);
+      } else if constexpr (std::is_same_v<T, sirius::ast::case_expr>) {
+        // CASE has no AST support; matches the BOUND_CASE arm.
+        return 0;
+      } else if constexpr (std::is_same_v<T, sirius::ast::cast>) {
+        // CAST contributes 1 + child ops only if the target type is in the
+        // AST allowlist (UBIGINT / BIGINT / DOUBLE); otherwise 0.
+        bool const supported = alt.target_type.id() == sirius::type_id::UBIGINT ||
+                               alt.target_type.id() == sirius::type_id::BIGINT ||
+                               alt.target_type.id() == sirius::type_id::DOUBLE;
+        return supported ? 1 + count_ast_ops(*alt.child) : 0;
+      } else if constexpr (std::is_same_v<T, sirius::ast::unary_op>) {
+        switch (alt.op) {
+          case sirius::ast::unary_op::kind::op_not: return 1 + count_ast_ops(*alt.child);
+          case sirius::ast::unary_op::kind::op_is_null: return 1 + count_ast_ops(*alt.child);
+          case sirius::ast::unary_op::kind::op_is_not_null: return 2 + count_ast_ops(*alt.child);
+          case sirius::ast::unary_op::kind::op_try:
+            throw duckdb::NotImplementedException(
+              "[gpu_expression_executor] count_ast_ops called on an unsupported TRY operator "
+              "expression.");
+          default:
+            throw internal_exception(
+              "[gpu_expression_executor] count_ast_ops called on an operator expression with "
+              "unknown/unsupported unary_op kind: {}",
+              static_cast<int>(alt.op));
+        }
+      } else if constexpr (std::is_same_v<T, sirius::ast::coalesce>) {
+        // COALESCE has no AST support.
+        return 0;
+      } else if constexpr (std::is_same_v<T, sirius::ast::in_list>) {
+        // children = [probe] + values; with N = values.size():
+        //   num_or = N - 1 ; num_eq = N ; +1 if negated.
+        auto const num_or = alt.values.size() - 1;
+        auto const num_eq = alt.values.size();
+        std::size_t count = num_or + num_eq + (alt.negated ? 1U : 0U);
+        count += count_ast_ops(*alt.probe);
+        for (auto const& v : alt.values) {
+          count += count_ast_ops(*v);
+        }
+        return count;
+      } else if constexpr (std::is_same_v<T, sirius::ast::function_call>) {
+        // DECIMAL output -> 0 (cuDF AST chokes on intermediate decimal results).
+        if (alt.return_type().id() == sirius::type_id::DECIMAL) { return 0; }
+        // Supported AST function -> 1 + sum of arg counts; otherwise 0.
+        bool const supported = std::find(supported_ast_functions.begin(),
+                                         supported_ast_functions.end(),
+                                         alt.function()) != supported_ast_functions.end();
+        if (!supported) { return 0; }
+        std::size_t count = 1;
+        for (auto const& a : alt.arguments()) {
+          count += count_ast_ops(*a);
+        }
+        return count;
+      } else {
+        static_assert(sizeof(T) == 0, "Unhandled sirius::ast alternative in count_ast_ops");
+      }
+    },
+    expr.v);
 }
 
 }  // namespace sirius
