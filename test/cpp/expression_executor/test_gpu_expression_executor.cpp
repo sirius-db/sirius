@@ -2444,3 +2444,28 @@ TEST_CASE("native_ast - function_call add (AST_INTERPRET)",
     REQUIRE(out_host[i] == c0[i] + c1[i]);
   }
 }
+
+TEST_CASE("native_ast - case_expr WHEN/THEN/ELSE (MATERIALIZE)",
+          "[expression_executor_ast_native][case_expr]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto in = make_int32_input(*space);
+
+  std::vector<sirius::ast::case_expr::when_then> cases;
+  cases.emplace_back();
+  cases.back().when_ = std::make_unique<sirius::ast::node>(sirius::ast::comparison{
+    sirius::comparison_type::equal, ref_node_native(0), int_const_node_native(5)});
+  cases.back().then_ = int_const_node_native(100);
+  auto hand_ast      = std::make_unique<sirius::ast::node>(
+    sirius::ast::case_expr{std::move(cases), int_const_node_native(0)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), in.view, MAT);
+  REQUIRE(out);
+  auto in_host  = copy_column_to_host<int32_t>(in.view.column(0));
+  auto out_host = copy_column_to_host<int32_t>(out->view().column(0));
+  REQUIRE(out_host.size() == in_host.size());
+  for (size_t i = 0; i < in_host.size(); ++i) {
+    REQUIRE(out_host[i] == (in_host[i] == 5 ? 100 : 0));
+  }
+}
