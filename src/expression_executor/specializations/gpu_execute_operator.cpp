@@ -344,6 +344,10 @@ execute_result gpu_expression_executor::execute(sirius::ast::unary_op const& alt
 execute_result gpu_expression_executor::execute(sirius::ast::in_list const& alt,
                                                 execution_mode mode)
 {
+  if (alt.values.empty()) {
+    throw invalid_input_exception(
+      "[gpu_expression_executor:in_list] in_list has no values — malformed AST.");
+  }
   // Match DuckDB-typed count_ast_ops for COMPARE_IN/NOT_IN:
   //   children = [probe] + values; num_or = N-2, num_eq = N-1, +1 if NOT_IN
   auto const total_children = 1U + alt.values.size();

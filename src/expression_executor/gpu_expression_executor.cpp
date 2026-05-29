@@ -555,6 +555,10 @@ std::size_t gpu_expression_executor::count_ast_ops(sirius::ast::node const& expr
           (alt.op == sirius::comparison_type::distinct_from) ? 2U : 1U;
         return self + count_ast_ops(*alt.left) + count_ast_ops(*alt.right);
       } else if constexpr (std::is_same_v<T, sirius::ast::conjunction>) {
+        if (alt.children.empty()) {
+          throw invalid_input_exception(
+            "[gpu_expression_executor:count_ast_ops] conjunction has no children — malformed AST.");
+        }
         // Number of AND/OR ops is one less than number of children.
         std::size_t count = alt.children.size() - 1;
         for (auto const& c : alt.children) {
@@ -594,6 +598,10 @@ std::size_t gpu_expression_executor::count_ast_ops(sirius::ast::node const& expr
         // COALESCE has no AST support.
         return 0;
       } else if constexpr (std::is_same_v<T, sirius::ast::in_list>) {
+        if (alt.values.empty()) {
+          throw invalid_input_exception(
+            "[gpu_expression_executor:count_ast_ops] in_list has no values — malformed AST.");
+        }
         // children = [probe] + values; with N = values.size():
         //   num_or = N - 1 ; num_eq = N ; +1 if negated.
         auto const num_or = alt.values.size() - 1;

@@ -62,6 +62,10 @@ cudf::binary_operator conjunction_op_to_binary(sirius::ast::conjunction::kind op
 execute_result gpu_expression_executor::execute(sirius::ast::conjunction const& alt,
                                                 execution_mode mode)
 {
+  if (alt.children.empty()) {
+    throw invalid_input_exception(
+      "[gpu_expression_executor:conjunction] conjunction has no children — malformed AST.");
+  }
   // Match the DuckDB-typed count_ast_ops contract for conjunction:
   // (num_children - 1) AND/OR ops + ops in every child.
   std::size_t ast_op_count = alt.children.size() - 1;
