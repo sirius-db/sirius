@@ -2216,3 +2216,26 @@ TEST_CASE("native_ast - conjunction AND (MATERIALIZE)",
     REQUIRE(out_host[i] == ((c0[i] > 10 && c1[i] < 90) ? 1U : 0U));
   }
 }
+
+TEST_CASE("native_ast - between (MATERIALIZE)", "[expression_executor_ast_native][between]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto in = make_int32_input(*space);
+
+  auto hand_ast =
+    std::make_unique<sirius::ast::node>(sirius::ast::between{ref_node_native(0),
+                                                             int_const_node_native(5),
+                                                             int_const_node_native(15),
+                                                             /*lower_inclusive=*/true,
+                                                             /*upper_inclusive=*/true});
+
+  auto out = run_native_ast(*space, hand_ast.get(), in.view, MAT);
+  REQUIRE(out);
+  auto in_host  = copy_column_to_host<int32_t>(in.view.column(0));
+  auto out_host = copy_bool_column_to_host(out->view().column(0));
+  REQUIRE(out_host.size() == in_host.size());
+  for (size_t i = 0; i < in_host.size(); ++i) {
+    REQUIRE(out_host[i] == ((in_host[i] >= 5 && in_host[i] <= 15) ? 1U : 0U));
+  }
+}
