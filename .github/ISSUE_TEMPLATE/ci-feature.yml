@@ -1,6 +1,7 @@
 name: CI Feature / Runner Request
 description: Request a new runner type, size, capability, or CI workflow improvement
 labels: ["ci", "enhancement"]
+title: "[CI-ENH] "
 body:
   - type: markdown
     attributes:
