@@ -153,9 +153,10 @@ class duckdb_scan_task_global_state : public pipeline::sirius_pipeline_task_glob
   std::vector<consumer_with_pipeline> get_output_consumers_with_pipelines() const noexcept
   {
     std::vector<consumer_with_pipeline> result;
-    auto ports = _op.get_next_port_after_sink();
-    for (auto& [child, port_id] : ports) {
-      auto* p = child->get_port(port_id);
+    auto const& ports = _op.get_next_ports_after_sink();
+    for (auto const& info : ports) {
+      auto* child = info.next_operator;
+      auto* p     = child->get_port(info.next_operator_port_name);
       result.push_back({child, p ? p->dest_pipeline : nullptr});
     }
     return result;

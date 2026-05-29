@@ -66,8 +66,10 @@ extern "C" int cudaProfilerStop();
 // Doris addition: SubstraitToDuckDB for from_substrait_local + gpu_execution_substrait.
 #include "from_substrait.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
+// Doris addition: GPUBufferManager / buffer_is_initialized are used by the exchange
+// table functions below, independent of the legacy gpu_processing path.
+#include "legacy/gpu_buffer_manager.hpp"
 #ifdef SIRIUS_ENABLE_LEGACY
-#include "gpu_buffer_manager.hpp"
 #include "gpu_context.hpp"
 #include "gpu_physical_plan_generator.hpp"
 #endif
@@ -98,9 +100,7 @@ extern "C" int cudaProfilerStop();
 namespace duckdb {
 
 const std::string PINNED_MEMORY_PARAM_KEY = "pinned_memory_size";
-#ifdef SIRIUS_ENABLE_LEGACY
 bool SiriusExtension::buffer_is_initialized = false;
-#endif
 
 constexpr std::string QUERY_LABEL_PARAM_KEY = "query_label";
 

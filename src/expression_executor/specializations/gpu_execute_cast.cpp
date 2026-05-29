@@ -86,38 +86,3 @@ execute_result gpu_expression_executor::execute(duckdb::BoundCastExpression cons
 
 }  // namespace sirius
 
-namespace duckdb {
-namespace sirius {
-
-std::unique_ptr<GpuExpressionState> GpuExpressionExecutor::InitializeState(
-  const BoundCastExpression& expr, GpuExpressionExecutorState& root)
-{
-  auto result = make_uniq<GpuExpressionState>(expr, root);
-  result->AddChild(*expr.child);
-  return std::move(result);
-}
-
-// Note that constants are CASTed before they reach the execution engine
-std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundCastExpression& expr,
-                                                             GpuExpressionState* state)
-{
-  auto return_type = GetCudfType(expr.return_type);
-
-  // Resolve the child
-  auto* child_state = state->child_states[0].get();
-  auto child        = Execute(*expr.child, child_state);
-
-  // cuDF's parquet reader may read DECIMAL columns as STRING when the parquet
-  // encoding isn't natively supported. Handle STRING→DECIMAL conversion using
-  // cudf::strings::to_fixed_point instead of cudf::cast (which doesn't support it).
-  if (child->view().type().id() == cudf::type_id::STRING &&
-      cudf::is_fixed_point(return_type)) {
-    return cudf::strings::to_fixed_point(
-      cudf::strings_column_view(child->view()), return_type, execution_stream, resource_ref);
-  }
-
-  return cudf::cast(child->view(), return_type, execution_stream, resource_ref);
-}
-
-}  // namespace sirius
-}  // namespace duckdb

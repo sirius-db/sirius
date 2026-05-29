@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#include <gpu_buffer_manager.hpp>
 #include <last_gpu_buffers.hpp>
+#include <legacy/gpu_buffer_manager.hpp>
 #include <sirius_exchange_c_api.hpp>
 #include <sirius_extension.hpp>
 

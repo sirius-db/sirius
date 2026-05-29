@@ -773,9 +773,10 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
   {
     auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
     std::vector<consumer_with_pipeline> result;
-    auto ports = g_state.get_operator().get_next_port_after_sink();
-    for (auto& [child, port_id] : ports) {
-      auto* p = child->get_port(port_id);
+    auto const& ports = g_state.get_operator().get_next_ports_after_sink();
+    for (auto const& info : ports) {
+      auto* child = info.next_operator;
+      auto* p     = child->get_port(info.next_operator_port_name);
       result.push_back({child, p ? p->dest_pipeline : nullptr});
     }
     return result;

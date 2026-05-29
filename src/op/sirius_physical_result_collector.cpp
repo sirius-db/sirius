@@ -264,8 +264,12 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
   SIRIUS_LOG_INFO("[result_collector] sink called: {} batches, should_retain={}", input_batches.size(), should_retain);
 
   for (auto const& input_batch : input_batches) {
-    auto* data = input_batch->get_data();
-    std::shared_ptr<cucascade::data_batch> clone_batch;
+    // Acquire read-only access to inspect the batch (new cucascade locking model).
+    auto ro    = input_batch->to_read_only();
+    auto* data = ro.get_data();
+    // Holds the cloned host batch's read lock when we convert GPU -> HOST below; declared
+    // here so `data` (which points into it) does not dangle before the chunk reader runs.
+    std::optional<cucascade::read_only_data_batch> result_ro_opt;
     if (!data) {
       throw invalid_input_exception(
         "[GPUPhysicalMaterializedCollector] data_batch has no data representation");
@@ -278,7 +282,7 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
     // If data is in GPU tier, convert to HOST tier first
     if (data->get_current_tier() == cucascade::memory::Tier::GPU) {
       auto& gpu_rep = data->cast<cucascade::gpu_table_representation>();
-      cudf::table_view view = gpu_rep.get_table().view();
+      cudf::table_view view = gpu_rep.get_table_view();
       auto& lgb = duckdb::LastGPUBuffers::GetInstance();
       auto projection_indices = lgb.GetProjectionIndices();
       std::optional<prepared_exchange_view> exchange_view_storage;
@@ -554,10 +558,11 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       auto& mem_space     = reservation->get_memory_space();
       auto& data_repo_mgr = sirius_ctx->get_data_repository_manager();
       auto next_batch_id  = data_repo_mgr.get_next_data_batch_id();
-      clone_batch         = input_batch->clone(next_batch_id, stream);
-      // todo (bobbi) pass stream to sink
-      clone_batch->convert_to<cucascade::host_data_representation>(registry, &mem_space, stream);
-      data = clone_batch->get_data();
+      // clone_to: deep-copy + convert into a new host_data_representation batch.
+      auto result_batch =
+        ro.clone_to<cucascade::host_data_representation>(registry, next_batch_id, &mem_space, stream);
+      result_ro_opt = result_batch->to_read_only();
+      data          = result_ro_opt->get_data();
     } else if (data->get_current_tier() != cucascade::memory::Tier::HOST) {
       // Data must be in HOST tier (i.e., cannot currently reside in DISK tier)
       throw invalid_input_exception(

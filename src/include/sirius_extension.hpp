@@ -89,9 +89,9 @@ class SiriusExtension : public Extension {
                                                  vector<LogicalType>& return_types,
                                                  vector<string>& names);
 
-#ifdef SIRIUS_ENABLE_LEGACY
+  // Used by the Doris exchange path (EnsureExchangeBufferManager / GPUAllocateBuffers),
+  // independent of the legacy gpu_processing path — keep unconditional.
   static bool buffer_is_initialized;
-#endif
 };
 
 }  // namespace duckdb

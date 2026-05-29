@@ -38,7 +38,7 @@
 #include <cudf/utilities/bit.hpp>
 
 // sirius GPU cache
-#include <gpu_buffer_manager.hpp>
+#include <legacy/gpu_buffer_manager.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 
 
@@ -777,14 +777,15 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
           cudaSetDevice(0);
 
           // Create GPU data_batch and publish to the pipeline.
-          std::unique_ptr<cucascade::gpu_table_representation> gpu_rep;
-          if (owned_table) {
-            gpu_rep = std::make_unique<cucascade::gpu_table_representation>(
-              std::move(owned_table), *gpu_space);
-          } else {
-            gpu_rep = std::make_unique<cucascade::gpu_table_representation>(
-              std::move(cached_table), *gpu_space);
+          // The gpu_table_representation ctor takes ownership via unique_ptr. When no
+          // projection produced an owning table, deep-copy the shared cached table's
+          // view into an owning table (the cache retains its own shared_ptr copy).
+          if (!owned_table) {
+            owned_table = std::make_unique<cudf::table>(
+              cached_table->view(), stream, gpu_space->get_default_allocator());
           }
+          auto gpu_rep = std::make_unique<cucascade::gpu_table_representation>(
+            std::move(owned_table), *gpu_space, stream);
           static std::atomic<int64_t> cached_batch_id{1000000};
           auto batch = std::make_shared<cucascade::data_batch>(
               cached_batch_id.fetch_add(1), std::move(gpu_rep));
