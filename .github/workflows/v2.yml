@@ -1,6 +1,6 @@
 name: V2 Cache Benchmark
 on:
-  workflow_dispatch:
+  pull_request:
 
 jobs:
   cache-warm:
