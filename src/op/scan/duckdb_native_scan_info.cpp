@@ -32,7 +32,7 @@ std::unique_ptr<scan_manager::split_provider> duckdb_native_scan_info::make_prov
   // it via io_ctx_shared_for(path). It stays in the signature only to satisfy
   // the combined-runtime scan_info::make_provider(manager, gpu_ioctxs) contract.
   (void)manager;
-  // duckdb_native_scan_task currently uses a single ioctx (Phase B lift is per
+  // the duckdb-native decoder currently uses a single ioctx (Phase B lift is per
   // single-GPU). Pick the first ioctx in the map; pass nullptr when empty so
   // the split_provider falls through to BufferManager::Pin.
   auto io_ctx = gpu_ioctxs.empty() ? nullptr : gpu_ioctxs.begin()->second;

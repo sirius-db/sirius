@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "op/scan/duckdb_native_scan_task.hpp"
+#include "op/scan/duckdb_native_decoder.hpp"
 
 #include "cuda/scan/gpu_decode_strings.cuh"
 #include "cuda/scan/gpu_native_decode.cuh"

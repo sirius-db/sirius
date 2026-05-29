@@ -23,7 +23,7 @@
 #include <expression/expression.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <log/logging.hpp>
-#include <op/scan/duckdb_native_scan_task.hpp>
+#include <op/scan/duckdb_native_decoder.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_duckdb_native_scan_operator.hpp>
 #include <scan_manager/duckdb_native_split_provider.hpp>
