@@ -17,6 +17,7 @@ on:
   push:
     branches:
       - dev
+  merge_group:
   pull_request:
     paths:
       - .github/workflows/distribution.yml
@@ -35,6 +36,7 @@ jobs:
       extra_toolchains: 'cuda;rust;protobuf'
       vcpkg_url: 'https://github.com/microsoft/vcpkg.git'
       vcpkg_commit: 'ffc071e0c08432c60c9b64f00334c0227667931b'
+      vcpkg_binary_cache_enabled: true
       skip_tests: true
       reduced_ci_mode: 'disabled'
       override_ci_tools_repository: 'sirius-db/extension-ci-tools'
@@ -57,6 +59,7 @@ jobs:
       extra_toolchains: 'cuda;rust;protobuf'
       vcpkg_url: 'https://github.com/microsoft/vcpkg.git'
       vcpkg_commit: 'ffc071e0c08432c60c9b64f00334c0227667931b'
+      vcpkg_binary_cache_enabled: true
       skip_tests: true
       reduced_ci_mode: 'disabled'
       override_ci_tools_repository: 'sirius-db/extension-ci-tools'

@@ -1,0 +1,15 @@
+[package]
+name = "sirius-starrocks-be"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+mysql_async.workspace = true
+thiserror.workspace = true
+thrift.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

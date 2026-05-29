@@ -21,3 +21,6 @@
 [submodule "vcpkg"]
 	path = vcpkg
 	url = https://github.com/Microsoft/vcpkg.git
+[submodule "starrocks/starrocks"]
+	path = experimental/starrocks/starrocks
+	url = https://github.com/starrocks/starrocks

@@ -129,9 +129,8 @@ bool sirius_engine::has_result_collector()
 duckdb::unique_ptr<duckdb::QueryResult> sirius_engine::get_result()
 {
   D_ASSERT(has_result_collector());
-  if (!sirius_physical_plan) throw invalid_input_exception("sirius_physical_plan is NULL");
-  if (sirius_physical_plan.get() == nullptr)
-    throw invalid_input_exception("sirius_physical_plan is NULL");
+  if (!sirius_physical_plan) { throw invalid_input_exception("sirius_physical_plan is NULL"); }
+
   auto& result_collector =
     sirius_physical_plan.get()->Cast<op::sirius_physical_materialized_collector>();
   duckdb::unique_ptr<duckdb::QueryResult> res = result_collector.get_result();
