@@ -16,6 +16,8 @@
 
 #include "scan_manager/duckdb_native_split_provider.hpp"
 
+#include "io/io_context.hpp"
+#include "io/types.hpp"
 #include "log/logging.hpp"
 
 #include <stdexcept>
@@ -131,6 +133,13 @@ duckdb_native_split_provider::duckdb_native_split_provider(
                              _metadata.viability_failure_reason);
   }
 
+  // Mint the .db io_object once per query when the manager exposes sirius_ioctx.
+  // The scan task threads this onto every split so reads of .db blocks go through
+  // sirius_ioctx::host_read instead of DuckDB's BufferManager.
+  if (_io_ctx && !_scan_info->db_path.empty()) {
+    _db_io_object = _io_ctx->create_io_object(_scan_info->db_path);
+  }
+
   _batches = partition_row_groups_into_batches(
     _metadata.row_groups, _scan_info->approximate_batch_size, _scan_info->projected_types);
 }
@@ -152,8 +161,10 @@ duckdb_native_split_provider::next_split_provider()
   // `_metadata.row_groups[i]` is moved out — batches are disjoint and each
   // batch is claimed exactly once, so the source entry is never read again.
   return [this, batch]() -> std::vector<std::unique_ptr<op::operator_data>> {
-    auto payload       = std::make_unique<split_payload>();
-    payload->scan_info = _scan_info;
+    auto payload          = std::make_unique<split_payload>();
+    payload->scan_info    = _scan_info;
+    payload->io_ctx       = _io_ctx;
+    payload->db_io_object = _db_io_object;
     payload->row_groups.reserve(batch.count);
     for (std::size_t i = batch.first_idx; i < batch.first_idx + batch.count; ++i) {
       payload->row_groups.push_back(std::move(_metadata.row_groups[i]));

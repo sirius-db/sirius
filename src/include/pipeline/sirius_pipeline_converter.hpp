@@ -27,6 +27,10 @@
 #include <unordered_map>
 #include <vector>
 
+namespace duckdb {
+class ClientContext;
+}  // namespace duckdb
+
 namespace sirius {
 
 struct operator_params;
@@ -70,7 +74,8 @@ class sirius_pipeline_converter {
     const pipeline_build_context& ctx,
     const sirius::operator_params& op_params,
     const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>*
-      iceberg_cache = nullptr);
+      iceberg_cache                       = nullptr,
+    duckdb::ClientContext* client_context = nullptr);
 
   //! Convert meta-pipelines into execution-ready pipelines.
   //! No runtime state required: wiring is emitted as descriptors in the result;
@@ -85,6 +90,7 @@ class sirius_pipeline_converter {
   // Phase 2: Split pipelines by operator type
   void split_pipelines(duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled);
   void insert_parquet_scan_operator(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
+  void insert_duckdb_native_scan_operator(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
   void split_table_scan_source(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
   void split_cpu_source(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
   void split_intermediate_joins(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
@@ -127,6 +133,7 @@ class sirius_pipeline_converter {
   const sirius::operator_params& op_params_;
   const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>*
     iceberg_cache_;
+  duckdb::ClientContext* client_context_ = nullptr;
 
   // Internal state built during convert(), moved into result
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> scheduled_;

@@ -393,7 +393,8 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   root_pipeline_idx = 0;
 
   // Convert meta-pipelines into execution-ready pipelines
-  pipeline::sirius_pipeline_converter converter(build_ctx, op_params, &iceberg_delete_data_cache_);
+  pipeline::sirius_pipeline_converter converter(
+    build_ctx, op_params, &iceberg_delete_data_cache_, &context);
   auto result = converter.convert(*root_pipeline);
 
   // Materialize plan-time wiring descriptors into runtime repositories and ports.

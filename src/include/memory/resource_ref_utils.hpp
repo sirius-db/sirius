@@ -36,14 +36,14 @@ class host_device_resource_view {
 
   [[nodiscard]] Resource* get() const noexcept { return resource_; }
 
-  void* allocate(cuda::stream_ref stream,
+  void* allocate(::cuda::stream_ref stream,
                  std::size_t bytes,
                  std::size_t alignment = alignof(std::max_align_t))
   {
     return resource_->allocate(stream, bytes, alignment);
   }
 
-  void deallocate(cuda::stream_ref stream,
+  void deallocate(::cuda::stream_ref stream,
                   void* ptr,
                   std::size_t bytes,
                   std::size_t alignment = alignof(std::max_align_t)) noexcept
@@ -69,11 +69,13 @@ class host_device_resource_view {
     return lhs.resource_ == rhs.resource_;
   }
 
-  friend void get_property(host_device_resource_view const&, cuda::mr::device_accessible) noexcept
+  friend void get_property(host_device_resource_view const&, ::cuda::mr::device_accessible) noexcept
   {
   }
 
-  friend void get_property(host_device_resource_view const&, cuda::mr::host_accessible) noexcept {}
+  friend void get_property(host_device_resource_view const&, ::cuda::mr::host_accessible) noexcept
+  {
+  }
 
  private:
   Resource* resource_;
@@ -81,7 +83,7 @@ class host_device_resource_view {
 
 template <typename Resource>
   requires(
-    cuda::mr::resource_with<Resource, cuda::mr::host_accessible, cuda::mr::device_accessible>)
+    ::cuda::mr::resource_with<Resource, ::cuda::mr::host_accessible, ::cuda::mr::device_accessible>)
 host_device_resource_view<Resource> make_host_device_resource_view_checked(Resource* resource)
 {
   if (resource == nullptr) { throw std::logic_error("Unexpected null resource pointer."); }
