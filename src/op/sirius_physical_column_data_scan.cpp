@@ -100,10 +100,23 @@ void sirius_physical_column_data_scan::build_pipelines(
       D_ASSERT(cte_sink);
       D_ASSERT(cte_sink->type == SiriusPhysicalOperatorType::CTE);
       current.add_dependency(cte_dependency);
+      // CTE_SCAN is a routing-only marker — never materialize into operators[].
+      // Legacy's `finalize_pipeline_structure` drops the source and starts
+      // operators[] at the next real operator (e.g. PROJECTION). The runtime
+      // executor relies on this contract (`update_pipeline_status` and
+      // PARTITION's sibling sequencing both assume `pipeline->source` is a
+      // real producer like DUCKDB_SCAN, never CTE_SCAN). Tree must match.
+      //
+      // `set_pipeline_source` is still called so `compute_repository_wiring`
+      // (legacy path) can use `source_to_pipelines` to find the consumer.
+      // Under flag ON, `dest_for_op` won't contain CTE_SCAN (it's never in
+      // any operators[0]), so the tree-based wiring uses
+      // `state.cte_scan_consumers` instead — populated here.
+      state.set_pipeline_source(current, *this);
       if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
-        state.add_pipeline_operator(current, *this);
-      } else {
-        state.set_pipeline_source(current, *this);
+        state.cte_scan_consumers.insert(
+          duckdb::make_pair(duckdb::reference<const sirius_physical_operator>(*this),
+                            duckdb::reference<pipeline::sirius_pipeline>(current)));
       }
       return;
     }
