@@ -279,7 +279,18 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
  public:
   // Sink Interface
-  bool is_sink() const override { return true; }
+  //! Under flag OFF: HJ is unconditionally a sink (legacy converter expectation — the
+  //! legacy split_join_sink rewrites the HJ chain into source-partition-concat-sink shape).
+  //! Under flag ON: HJ is a sink only when its tree parent is a PARTITION — i.e. this is
+  //! an inner HJ feeding into a wrap chain on its consumer side. Otherwise HJ is a pure
+  //! source feeding into downstream chain operators (e.g. HJ_top → PROJ → HGB).
+  bool is_sink() const override
+  {
+    if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
+      return _parent_op != nullptr && _parent_op->type == SiriusPhysicalOperatorType::PARTITION;
+    }
+    return true;
+  }
 
   void on_finalize_operator() override;
 };

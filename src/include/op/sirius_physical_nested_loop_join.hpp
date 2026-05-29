@@ -26,6 +26,7 @@
 #include "expression/ast/node.hpp"  // complete sirius::ast::node for join_condition's destructor
 #include "expression/join_condition.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
+#include "sirius_config.hpp"
 
 #include <cstdint>
 
@@ -112,11 +113,27 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
 
  public:
   // Source interface
-  bool is_source() const override { return duckdb::PropagatesBuildSide(join_type); }
+  //! Under flag OFF: NLJ is a source only for join types that propagate the build side
+  //! (LEFT/RIGHT/OUTER/SEMI). Inner NLJ historically doesn't claim source status under the
+  //! legacy converter. Under flag ON: NLJ is always a source — every join emits output.
+  bool is_source() const override
+  {
+    if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) { return true; }
+    return duckdb::PropagatesBuildSide(join_type);
+  }
 
  public:
   // Sink Interface
-  bool is_sink() const override { return true; }
+  //! Under flag OFF: unconditional sink (legacy converter rewrites the chain). Under flag
+  //! ON: sink only when this NLJ's tree parent is a PARTITION (the nested-join case).
+  //! Mirrors HJ's behavior.
+  bool is_sink() const override
+  {
+    if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
+      return _parent_op != nullptr && _parent_op->type == SiriusPhysicalOperatorType::PARTITION;
+    }
+    return true;
+  }
 
   static bool is_supported(const duckdb::vector<sirius::join_condition>& conditions,
                            duckdb::JoinType join_type);

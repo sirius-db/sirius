@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "config.hpp"
 #include "duckdb/common/common.hpp"
 #include "helper/logical_type.hpp"
 #include "helper/types.hpp"
@@ -436,7 +437,21 @@ class sirius_physical_operator {
   // Sink interface
   virtual void sink(const operator_data& input_data, rmm::cuda_stream_view stream);
 
-  virtual bool is_sink() const { return false; }
+  //! Under flag ON: an operator is a pipeline sink iff its tree parent is a PARTITION
+  //! (the operator that produces data flowing into PARTITION terminates the upstream
+  //! pipeline at itself). Computed dynamically from `_parent_op` so it always reflects
+  //! the final tree shape — no state to maintain. Derived classes that are
+  //! unconditionally sinks (HGB, ORDER_BY, all MERGE operators, DUCKDB_SCAN, etc.)
+  //! override this to return `true` regardless of parent.
+  //! Under flag OFF: returns false; the legacy converter owns sink semantics via its
+  //! own derived-class overrides.
+  virtual bool is_sink() const
+  {
+    if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
+      return _parent_op != nullptr && _parent_op->type == SiriusPhysicalOperatorType::PARTITION;
+    }
+    return false;
+  }
 
   //! Whether or not the sink operator depends on the order of the input chunks
   //! If this is set to true, we cannot do things like caching intermediate vectors

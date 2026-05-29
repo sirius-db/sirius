@@ -156,8 +156,11 @@ void sirius_physical_operator::build_pipelines(pipeline::sirius_pipeline& curren
 {
   auto& state = meta_pipeline.get_state();
   if (is_sink()) {
-    // operator is a sink, build a pipeline
-    D_ASSERT(children.size() == 1);
+    // Operator is a sink, build a pipeline. Under flag ON we allow leaf-sinks
+    // (DUCKDB_SCAN / ICEBERG_SCAN / CPU_SOURCE) which terminate their own one-operator
+    // pipeline with no upstream recursion. Under flag OFF scans return is_sink=false so
+    // this branch only sees the legacy "sink with 1 child" shape.
+    D_ASSERT(children.size() <= 1);
 
     if (!duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
       // Legacy protocol: source field tracks pre-finalize source.
@@ -168,9 +171,9 @@ void sirius_physical_operator::build_pipelines(pipeline::sirius_pipeline& curren
     // lands at operators.back() post-reverse — source/sink derive from
     // operators[] in is_ready, so no separate set_pipeline_source is needed.
 
-    // we create a new pipeline starting from the child
+    // we create a new pipeline starting from the child (or just [*this] for leaf-sinks)
     auto& child_meta_pipeline = meta_pipeline.create_child_meta_pipeline(current, *this);
-    child_meta_pipeline.build(*children[0]);
+    if (!children.empty()) { child_meta_pipeline.build(*children[0]); }
   } else {
     // operator is not a sink! recurse in children
     if (children.empty()) {

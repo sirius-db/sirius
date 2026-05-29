@@ -245,26 +245,17 @@ void sirius_physical_nested_loop_join::build_join_pipelines(
   duckdb::optional_ptr<pipeline::sirius_meta_pipeline> last_child_ptr;
   if (build_rhs) {
     if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
-      // Phase 3.2 (#604) Path 3b: same modification as the HJ helper. Phase 3.1
-      // inserted CONCAT_build as op.children[1]; use it as the build_meta sink
-      // and recurse past it into PARTITION_build.
+      // Phase 3 (#604): see sirius_physical_hash_join::build_join_pipelines for the
+      // rationale — plan-time wrap_join inserted CONCAT_build as op.children[1]; use it
+      // as the build_meta sink and recurse past it into its PARTITION child.
       auto& build_child = *op.children[1];
       D_ASSERT(build_child.is_sink());
       D_ASSERT(!build_child.children.empty());
       auto& build_meta = meta_pipeline.create_child_meta_pipeline(current, build_child);
       build_meta.build(*build_child.children[0]);
     } else {
-      // on the RHS (build side), we construct a child MetaPipeline with this operator as its sink
       auto& child_meta_pipeline = meta_pipeline.create_child_meta_pipeline(current, op);
       child_meta_pipeline.build(*op.children[1]);
-      // if (op.children[1].get().CanSaturateThreads(current.GetClientContext())) {
-      // 	// if the build side can saturate all available threads,
-      // 	// we don't just make the LHS pipeline depend on the RHS, but recursively all LHS children
-      // too.
-      // 	// this prevents breadth-first plan evaluation
-      // 	child_meta_pipeline.GetPipelines(dependencies, false);
-      // 	last_child_ptr = meta_pipeline.GetLastChild();
-      // }
     }
   }
 
@@ -290,13 +281,48 @@ void sirius_physical_nested_loop_join::build_join_pipelines(
   auto& join_op           = op.Cast<sirius_physical_nested_loop_join>();
   if (join_op.is_source()) { add_child_pipeline = true; }
 
-  if (add_child_pipeline) { meta_pipeline.create_child_pipeline(current, op, last_pipeline); }
+  // Phase 3 (#604): mirror the gate in sirius_physical_hash_join::build_join_pipelines —
+  // create_child_pipeline emits a phantom HJ/NLJ-source pipeline that legacy drops via
+  // schedule_and_copy_pipelines' filter, but under flag ON is_ready resets `source` to
+  // operators.front() so the filter no longer catches it. Skip the call under flag ON.
+  if (add_child_pipeline && !duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
+    meta_pipeline.create_child_pipeline(current, op, last_pipeline);
+  }
 }
 
 void sirius_physical_nested_loop_join::build_pipelines(
   pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
 {
-  sirius_physical_nested_loop_join::build_join_pipelines(current, meta_pipeline, *this);
+  if (!duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
+    sirius_physical_nested_loop_join::build_join_pipelines(current, meta_pipeline, *this);
+    return;
+  }
+
+  // Phase 3 (#604) flag-ON protocol — mirrors sirius_physical_hash_join::build_pipelines.
+  pipeline::sirius_meta_pipeline* host_meta;
+  pipeline::sirius_pipeline* host_current;
+  if (is_sink()) {
+    auto& sink_meta = meta_pipeline.create_child_meta_pipeline(current, *this);
+    host_meta       = &sink_meta;
+    host_current    = sink_meta.get_base_pipeline().get();
+  } else {
+    meta_pipeline.get_state().add_pipeline_operator(current, *this);
+    host_meta    = &meta_pipeline;
+    host_current = &current;
+  }
+
+  D_ASSERT(children.size() == 2);
+  auto& build_child = *children[1];
+  D_ASSERT(build_child.is_sink());
+  D_ASSERT(!build_child.children.empty());
+  auto& build_meta = host_meta->create_child_meta_pipeline(*host_current, build_child);
+  build_meta.build(*build_child.children[0]);
+
+  auto& probe_child = *children[0];
+  D_ASSERT(probe_child.is_sink());
+  D_ASSERT(!probe_child.children.empty());
+  auto& probe_meta = host_meta->create_child_meta_pipeline(*host_current, probe_child);
+  probe_meta.build(*probe_child.children[0]);
 }
 
 std::unique_ptr<operator_data> sirius_physical_nested_loop_join::get_next_task_input_data()

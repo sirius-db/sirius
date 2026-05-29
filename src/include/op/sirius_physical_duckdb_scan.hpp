@@ -23,6 +23,7 @@
 #include "duckdb/storage/data_table.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_table_scan.hpp"
+#include "sirius_config.hpp"
 
 namespace sirius {
 namespace op {
@@ -103,6 +104,10 @@ class sirius_physical_duckdb_scan : public sirius_physical_operator {
 
  public:
   bool is_source() const override { return true; }
+  //! Under flag ON DUCKDB_SCAN is always a sink (every DuckDB-side scan terminates its
+  //! own one-operator GPU pipeline). Under flag OFF the legacy converter's split passes
+  //! own the source/sink boundaries so we leave `is_sink` at the base default (false).
+  bool is_sink() const override { return duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD; }
 
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
