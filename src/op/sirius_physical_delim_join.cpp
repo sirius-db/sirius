@@ -135,8 +135,13 @@ void sirius_physical_left_delim_join::build_pipelines(pipeline::sirius_pipeline&
     // child_meta_pipeline's LHS) sequences this meta after child_meta_pipeline.
     // Under flag OFF, distinct_root holds the bare DISTINCT and the legacy converter
     // still owns chain construction — skip the spawn there.
+    //
+    // distinct_meta is created with distinct_root pre-populated as its sink, so walk
+    // into distinct_root's child rather than re-building distinct_root itself — calling
+    // build_pipelines on distinct_root would re-trigger its sink protocol and produce a
+    // duplicate child meta with the same sink, doubling the MERGE_GROUP_BY pipeline.
     auto& distinct_meta = meta_pipeline.create_child_meta_pipeline(current, *distinct_root);
-    distinct_meta.build(*distinct_root);
+    if (!distinct_root->children.empty()) { distinct_meta.build(*distinct_root->children[0]); }
   }
 }
 
@@ -172,9 +177,11 @@ void sirius_physical_right_delim_join::build_pipelines(
 
   if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD && distinct_root) {
     // Phase 3.2 (#604): spawn a child meta_pipeline rooted at the distinct chain.
-    // See LEFT_DELIM_JOIN's identical comment block above for the full reasoning.
+    // See LEFT_DELIM_JOIN's identical comment block above for the full reasoning,
+    // including the rationale for walking distinct_root's child rather than
+    // distinct_root itself (avoids duplicate-sink meta under the new is_sink protocol).
     auto& distinct_meta = meta_pipeline.create_child_meta_pipeline(current, *distinct_root);
-    distinct_meta.build(*distinct_root);
+    if (!distinct_root->children.empty()) { distinct_meta.build(*distinct_root->children[0]); }
   }
 }
 
