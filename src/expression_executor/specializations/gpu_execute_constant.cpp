@@ -210,6 +210,11 @@ execute_result gpu_expression_executor::execute(duckdb::BoundConstantExpression 
                                                 execution_mode mode)
 {
   auto node = sirius::ast::from_duckdb(expr);
+  if (!node) {
+    throw not_implemented_exception(
+      "[gpu_expression_executor:constant] BoundConstantExpression could not be lowered to a "
+      "Sirius AST node (sirius::ast::from_duckdb returned nullptr).");
+  }
   return execute(*node, mode);
 }
 

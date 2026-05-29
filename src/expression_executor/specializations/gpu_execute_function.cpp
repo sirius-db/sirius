@@ -398,6 +398,13 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
                                                 execution_mode mode)
 {
   auto node = sirius::ast::from_duckdb(expr);
+  if (!node) {
+    throw not_implemented_exception(
+      "[gpu_expression_executor:function] BoundFunctionExpression could not be lowered to a "
+      "Sirius AST node (function '{}' has no Sirius function_id mapping, or an argument is "
+      "unsupported).",
+      expr.function.name);
+  }
   return execute(*node, mode);
 }
 

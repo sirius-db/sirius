@@ -18,6 +18,7 @@
 #include <expression/ast/from_duckdb.hpp>
 #include <expression/ast/node.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
+#include <sirius/exception.hpp>
 
 // duckdb
 #include <duckdb/planner/expression/bound_between_expression.hpp>
@@ -120,6 +121,11 @@ execute_result gpu_expression_executor::execute(duckdb::BoundBetweenExpression c
                                                 execution_mode mode)
 {
   auto node = sirius::ast::from_duckdb(expr);
+  if (!node) {
+    throw not_implemented_exception(
+      "[gpu_expression_executor:between] BoundBetweenExpression could not be lowered to a "
+      "Sirius AST node (an embedded subexpression is unsupported).");
+  }
   return execute(*node, mode);
 }
 

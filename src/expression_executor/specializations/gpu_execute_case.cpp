@@ -130,6 +130,11 @@ execute_result gpu_expression_executor::execute(duckdb::BoundCaseExpression cons
                                                 execution_mode mode)
 {
   auto node = sirius::ast::from_duckdb(expr);
+  if (!node) {
+    throw not_implemented_exception(
+      "[gpu_expression_executor:case] BoundCaseExpression could not be lowered to a Sirius AST "
+      "node (a WHEN, THEN, or ELSE subexpression is unsupported).");
+  }
   return execute(*node, mode);
 }
 

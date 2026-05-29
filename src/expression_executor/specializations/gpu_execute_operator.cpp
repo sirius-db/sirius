@@ -596,6 +596,12 @@ execute_result gpu_expression_executor::execute(duckdb::BoundOperatorExpression 
                                                 execution_mode mode)
 {
   auto node = sirius::ast::from_duckdb(expr);
+  if (!node) {
+    throw not_implemented_exception(
+      "[gpu_expression_executor:operator] BoundOperatorExpression with operator type {} could "
+      "not be lowered to a Sirius AST node.",
+      static_cast<int>(expr.GetExpressionType()));
+  }
   return execute(*node, mode);
 }
 

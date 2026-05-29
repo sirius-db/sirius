@@ -104,6 +104,11 @@ execute_result gpu_expression_executor::execute(duckdb::BoundCastExpression cons
                                                 execution_mode mode)
 {
   auto node = sirius::ast::from_duckdb(expr);
+  if (!node) {
+    throw not_implemented_exception(
+      "[gpu_expression_executor:cast] BoundCastExpression could not be lowered to a Sirius AST "
+      "node (the cast child is unsupported).");
+  }
   return execute(*node, mode);
 }
 

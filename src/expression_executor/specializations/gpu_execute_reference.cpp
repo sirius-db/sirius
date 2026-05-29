@@ -18,6 +18,7 @@
 #include <expression/ast/from_duckdb.hpp>
 #include <expression/ast/node.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
+#include <sirius/exception.hpp>
 
 // duckdb
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
@@ -40,6 +41,11 @@ execute_result gpu_expression_executor::execute(duckdb::BoundReferenceExpression
                                                 execution_mode mode)
 {
   auto node = sirius::ast::from_duckdb(expr);
+  if (!node) {
+    throw not_implemented_exception(
+      "[gpu_expression_executor:reference] BoundReferenceExpression could not be lowered to a "
+      "Sirius AST node (sirius::ast::from_duckdb returned nullptr).");
+  }
   return execute(*node, mode);
 }
 }  // namespace sirius
