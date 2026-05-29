@@ -2183,3 +2183,36 @@ TEST_CASE("native_ast - comparison LESS_THAN (AST_INTERPRET)",
     REQUIRE(out_host[i] == (in_host[i] < 50 ? 1U : 0U));
   }
 }
+
+TEST_CASE("native_ast - conjunction AND (MATERIALIZE)",
+          "[expression_executor_ast_native][conjunction]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  // Build a 2-column INT32 batch with col0 in [0, 100) and col1 in [0, 100).
+  auto input =
+    make_input_batch(*space,
+                     {cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT32}},
+                     {std::pair<int, int>{0, 100}, std::pair<int, int>{0, 100}});
+  auto ro       = input->to_read_only();
+  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  auto tv       = in_repr.get_table_view();
+
+  std::vector<std::unique_ptr<sirius::ast::node>> children;
+  children.push_back(std::make_unique<sirius::ast::node>(sirius::ast::comparison{
+    sirius::comparison_type::gt, ref_node_native(0), int_const_node_native(10)}));
+  children.push_back(std::make_unique<sirius::ast::node>(sirius::ast::comparison{
+    sirius::comparison_type::lt, ref_node_native(1), int_const_node_native(90)}));
+  auto hand_ast = std::make_unique<sirius::ast::node>(
+    sirius::ast::conjunction{sirius::ast::conjunction::kind::op_and, std::move(children)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), tv, MAT);
+  REQUIRE(out);
+  auto c0       = copy_column_to_host<int32_t>(tv.column(0));
+  auto c1       = copy_column_to_host<int32_t>(tv.column(1));
+  auto out_host = copy_bool_column_to_host(out->view().column(0));
+  REQUIRE(out_host.size() == c0.size());
+  for (size_t i = 0; i < c0.size(); ++i) {
+    REQUIRE(out_host[i] == ((c0[i] > 10 && c1[i] < 90) ? 1U : 0U));
+  }
+}
