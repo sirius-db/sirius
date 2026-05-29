@@ -58,10 +58,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <functional>
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace sirius::pipeline {
 
@@ -161,7 +164,6 @@ pipeline_conversion_result sirius_pipeline_converter::convert(sirius_meta_pipeli
 duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>
 sirius_pipeline_converter::schedule_and_copy_pipelines(sirius_meta_pipeline& root_pipeline)
 {
-  // collect all meta-pipelines from the root pipeline
   duckdb::vector<duckdb::shared_ptr<sirius_meta_pipeline>> to_schedule;
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> sirius_scheduled;
   scheduled_.clear();
@@ -204,11 +206,18 @@ sirius_pipeline_converter::schedule_and_copy_pipelines(sirius_meta_pipeline& roo
       duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> pipeline_inside;
       to_schedule[to_schedule.size() - 1 - meta]->get_pipelines(pipeline_inside, false);
       for (auto& pipeline : pipeline_inside) {
-        if (pipeline->source->type == op::SiriusPhysicalOperatorType::HASH_JOIN ||
-            pipeline->source->type == op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
-          // DuckDB adds a build-side scan pipeline (join as source) for
-          // right/outer joins; sirius joins emit unmatched build rows inline,
-          // so keeping it would wire the join's downstream ports twice.
+        // Legacy-only filter: under flag OFF, `set_pipeline_source` is overwritten as
+        // the recursion descends, so any HJ/NLJ-source pipeline at this point is a stale
+        // build-meta whose true source is its sink. The post-split `[HJ, ..., sink]`
+        // shape only emerges later in `split_pipelines`. DuckDB adds a build-side scan
+        // pipeline (join as source) for right/outer joins; sirius joins emit unmatched
+        // build rows inline, so keeping it would wire the join's downstream ports twice.
+        // Under flag ON, join-source pipelines that reach this point are legitimate
+        // (inner-join outputs feeding PARTITION); dropping them would corrupt the
+        // schedule.
+        if (!duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD &&
+            (pipeline->source->type == op::SiriusPhysicalOperatorType::HASH_JOIN ||
+             pipeline->source->type == op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN)) {
           continue;
         }
         sirius_scheduled.push_back(pipeline);
@@ -1586,16 +1595,6 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
 
 std::string dump_pipeline_conversion_result(const pipeline_conversion_result& result)
 {
-  std::unordered_map<const sirius_pipeline*, std::size_t> pipeline_to_index;
-  for (std::size_t i = 0; i < result.scheduled_pipelines.size(); ++i) {
-    pipeline_to_index[result.scheduled_pipelines[i].get()] = i;
-  }
-
-  auto pipeline_index = [&](const duckdb::shared_ptr<sirius_pipeline>& p) -> std::string {
-    auto it = pipeline_to_index.find(p.get());
-    return it == pipeline_to_index.end() ? std::string{"?"} : std::to_string(it->second);
-  };
-
   auto op_name = [](const op::sirius_physical_operator* op) -> std::string {
     return op == nullptr ? std::string{"(null)"} : op::SiriusPhysicalOperatorToString(op->type);
   };
@@ -1609,10 +1608,67 @@ std::string dump_pipeline_conversion_result(const pipeline_conversion_result& re
     return "?";
   };
 
+  // Per-pipeline local signature: sink|source|operators... Used as the base layer of the
+  // recursive signature below.
+  auto local_sig = [&](const sirius_pipeline* p) -> std::string {
+    std::string s = op_name(p->get_sink().get());
+    s += "|" + op_name(p->get_source().get());
+    for (const auto& op_ref : p->get_operators()) {
+      s += "|" + op_name(&op_ref.get());
+    }
+    return s;
+  };
+
+  // Downstream-aware signature: a pipeline's signature includes its sorted list of
+  // (port_id, downstream_signature). Two pipelines with the same local shape AND the
+  // same set of consumers reach the same signature. Memoized; assumes acyclic graph
+  // (TPC-H plans are DAGs).
+  std::unordered_map<const sirius_pipeline*, std::string> sig_cache;
+  std::function<std::string(const sirius_pipeline*)> compute_sig =
+    [&](const sirius_pipeline* p) -> std::string {
+    auto it = sig_cache.find(p);
+    if (it != sig_cache.end()) { return it->second; }
+    std::vector<std::string> down;
+    for (const auto& w : result.repository_wirings) {
+      if (w.source_pipeline.get() == p) {
+        down.push_back(std::string{w.port_id} + ":" + compute_sig(w.dest_pipeline.get()));
+      }
+    }
+    std::sort(down.begin(), down.end());
+    std::string s = local_sig(p);
+    for (const auto& d : down) {
+      s += "|>" + d;
+    }
+    sig_cache[p] = s;
+    return s;
+  };
+
+  // Canonical pipeline order: sort by signature. Order in `scheduled_pipelines` reflects
+  // the scheduling pass that produced it (legacy iterative split vs tree-based DFS);
+  // sorting here makes the dump comparison independent of that order so both flag states
+  // produce byte-identical output when the resulting graph is the same.
+  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> ordered = result.scheduled_pipelines;
+  std::sort(ordered.begin(), ordered.end(), [&](const auto& a, const auto& b) -> bool {
+    return compute_sig(a.get()) < compute_sig(b.get());
+  });
+
+  std::unordered_map<const sirius_pipeline*, std::size_t> pipeline_to_index;
+  for (std::size_t i = 0; i < ordered.size(); ++i) {
+    pipeline_to_index[ordered[i].get()] = i;
+  }
+  auto idx_of = [&](const duckdb::shared_ptr<sirius_pipeline>& p) -> std::size_t {
+    auto it = pipeline_to_index.find(p.get());
+    return it == pipeline_to_index.end() ? std::numeric_limits<std::size_t>::max() : it->second;
+  };
+  auto pipeline_index = [&](const duckdb::shared_ptr<sirius_pipeline>& p) -> std::string {
+    auto it = pipeline_to_index.find(p.get());
+    return it == pipeline_to_index.end() ? std::string{"?"} : std::to_string(it->second);
+  };
+
   std::ostringstream out;
-  out << "=== pipelines (" << result.scheduled_pipelines.size() << ") ===\n";
-  for (std::size_t i = 0; i < result.scheduled_pipelines.size(); ++i) {
-    auto& p = *result.scheduled_pipelines[i];
+  out << "=== pipelines (" << ordered.size() << ") ===\n";
+  for (std::size_t i = 0; i < ordered.size(); ++i) {
+    auto& p = *ordered[i];
     out << "[pipeline " << i << "]\n";
     out << "  source: " << op_name(p.get_source().get()) << "\n";
     out << "  sink: " << op_name(p.get_sink().get()) << "\n";
@@ -1623,9 +1679,26 @@ std::string dump_pipeline_conversion_result(const pipeline_conversion_result& re
       out << "    [" << op_idx++ << "] " << op_name(&op_ref.get()) << "\n";
     }
   }
-  out << "\n=== repository_wirings (" << result.repository_wirings.size() << ") ===\n";
-  for (std::size_t i = 0; i < result.repository_wirings.size(); ++i) {
-    const auto& w = result.repository_wirings[i];
+
+  // Sort wirings by the canonical pipeline indices so wiring order is also
+  // path-independent.
+  std::vector<repository_wiring> sorted_wirings(result.repository_wirings.begin(),
+                                                result.repository_wirings.end());
+  std::sort(sorted_wirings.begin(),
+            sorted_wirings.end(),
+            [&](const repository_wiring& a, const repository_wiring& b) -> bool {
+              auto a_src = idx_of(a.source_pipeline);
+              auto b_src = idx_of(b.source_pipeline);
+              if (a_src != b_src) { return a_src < b_src; }
+              auto a_dst = idx_of(a.dest_pipeline);
+              auto b_dst = idx_of(b.dest_pipeline);
+              if (a_dst != b_dst) { return a_dst < b_dst; }
+              return a.port_id < b.port_id;
+            });
+
+  out << "\n=== repository_wirings (" << sorted_wirings.size() << ") ===\n";
+  for (std::size_t i = 0; i < sorted_wirings.size(); ++i) {
+    const auto& w = sorted_wirings[i];
     out << "[wiring " << i << "]\n";
     out << "  port_id: " << w.port_id << "\n";
     out << "  barrier: " << barrier_name(w.barrier_type) << "\n";
