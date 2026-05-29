@@ -2357,3 +2357,25 @@ TEST_CASE("native_ast - coalesce (MATERIALIZE)", "[expression_executor_ast_nativ
     REQUIRE(out_host[i] == (valids[i] ? values[i] : 99));
   }
 }
+
+TEST_CASE("native_ast - cast INTEGER->BIGINT (MATERIALIZE)",
+          "[expression_executor_ast_native][cast]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto in = make_int32_input(*space);
+
+  auto hand_ast = std::make_unique<sirius::ast::node>(
+    sirius::ast::cast{ref_node_native(0),
+                      sirius::logical_type::make(sirius::type_id::BIGINT),
+                      /*try_cast=*/false});
+
+  auto out = run_native_ast(*space, hand_ast.get(), in.view, MAT);
+  REQUIRE(out);
+  auto in_host  = copy_column_to_host<int32_t>(in.view.column(0));
+  auto out_host = copy_column_to_host<int64_t>(out->view().column(0));
+  REQUIRE(out_host.size() == in_host.size());
+  for (size_t i = 0; i < in_host.size(); ++i) {
+    REQUIRE(out_host[i] == static_cast<int64_t>(in_host[i]));
+  }
+}

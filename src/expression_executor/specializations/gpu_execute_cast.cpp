@@ -15,8 +15,10 @@
  */
 
 // sirius
-#include <expression_executor/ast_supported_types.hpp>
+#include <expression/ast/from_duckdb.hpp>
+#include <expression/ast/node.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
+#include <helper/logical_type.hpp>
 #include <sirius/exception.hpp>
 
 // duckdb
@@ -26,35 +28,53 @@
 #include <cudf/cudf_utils.hpp>
 #include <cudf/unary.hpp>
 
+// standard library
+#include <algorithm>
+#include <array>
+
 namespace sirius {
 using execute_result = gpu_expression_executor::execute_result;
 
-execute_result gpu_expression_executor::execute(duckdb::BoundCastExpression const& expr,
-                                                execution_mode mode)
+namespace {
+
+// Sirius-typed allowlist mirroring supported_ast_cast_types in
+// expression_executor/ast_supported_types.hpp. CAST target types currently
+// safe to lower into a cuDF AST.
+constexpr std::array<sirius::type_id, 3> supported_ast_cast_types_native{
+  sirius::type_id::UBIGINT, sirius::type_id::BIGINT, sirius::type_id::DOUBLE};
+
+cudf::ast::ast_operator cast_op_to_ast(sirius::type_id id)
 {
-  auto const ast_supported = std::find(supported_ast_cast_types.begin(),
-                                       supported_ast_cast_types.end(),
-                                       expr.return_type.id()) != supported_ast_cast_types.end();
+  switch (id) {
+    case sirius::type_id::UBIGINT: return cudf::ast::ast_operator::CAST_TO_UINT64;
+    case sirius::type_id::BIGINT: return cudf::ast::ast_operator::CAST_TO_INT64;
+    case sirius::type_id::DOUBLE: return cudf::ast::ast_operator::CAST_TO_FLOAT64;
+    default:
+      throw invalid_input_exception(
+        "[gpu_expression_executor] execute called on a CAST expression with unsupported return "
+        "type for AST execution: id={}",
+        static_cast<int>(id));
+  }
+}
+
+}  // namespace
+
+execute_result gpu_expression_executor::execute(sirius::ast::cast const& alt, execution_mode mode)
+{
+  auto const ast_supported =
+    std::find(supported_ast_cast_types_native.begin(),
+              supported_ast_cast_types_native.end(),
+              alt.target_type.id()) != supported_ast_cast_types_native.end();
+
+  // Match DuckDB-typed count_ast_ops contract for cast:
+  //   supported allowlist -> 1 + child ; unsupported -> 0.
+  auto const ast_op_count = ast_supported ? 1 + count_ast_ops(*alt.child) : 0;
 
   if (ast_supported && _strategy != expression_executor_strategy::MATERIALIZE &&
-      (mode == execution_mode::AST || count_ast_ops(expr) >= _min_ast_size)) {
-    auto cast_type_switch = [](duckdb::LogicalTypeId type_id) -> cudf::ast::ast_operator {
-      using enum duckdb::LogicalTypeId;
-      switch (type_id) {
-        case UBIGINT: return cudf::ast::ast_operator::CAST_TO_UINT64;
-        case BIGINT: return cudf::ast::ast_operator::CAST_TO_INT64;
-        case DOUBLE: return cudf::ast::ast_operator::CAST_TO_FLOAT64;
-        default:
-          throw invalid_input_exception(
-            "[gpu_expression_executor] execute called on a CAST expression with unsupported return "
-            "type for AST execution: {}",
-            duckdb::LogicalTypeIdToString(type_id));
-      }
-    };
-
-    auto child            = execute(*expr.child, execution_mode::AST);
+      (mode == execution_mode::AST || ast_op_count >= _min_ast_size)) {
+    auto child            = execute(*alt.child, execution_mode::AST);
     auto const& cast_expr = _ast_tree.emplace<cudf::ast::operation>(
-      cast_type_switch(expr.return_type.id()), child.get_expr());
+      cast_op_to_ast(alt.target_type.id()), child.get_expr());
 
     if (mode == execution_mode::AST) {
       //===----------1: AST Mode----------===//
@@ -62,17 +82,15 @@ execute_result gpu_expression_executor::execute(duckdb::BoundCastExpression cons
         ast_result(cast_expr, child.get_temp_scalar_indices(), child.get_temp_column_indices()));
     }
     //===----------2: MATERIALIZE Mode, evaluate node with AST----------===//
-    // Evaluate the AST subtree
     auto result_column = execute_ast(cast_expr);
 
-    // Release consumed temporaries
     release_temporaries(child.get_temp_scalar_indices(), child.get_temp_column_indices());
     return execute_result(std::move(result_column));
   }
 
   //===----------3: MATERIALIZE Mode, evaluate node with unary/binary ops----------===//
-  auto const return_type = GetCudfType(expr.return_type);
-  auto child             = execute(*expr.child, execution_mode::MATERIALIZE);
+  auto const return_type = sirius::get_cudf_type(alt.target_type);
+  auto child             = execute(*alt.child, execution_mode::MATERIALIZE);
   D_ASSERT(!child.is_scalar());  // CAST should never be called on a scalar
   auto result_column = cudf::cast(child.get_column_view(), return_type, _stream, _mr);
   if (mode == execution_mode::AST) {
@@ -80,6 +98,13 @@ execute_result gpu_expression_executor::execute(duckdb::BoundCastExpression cons
     return materialize_as_ast_column(std::move(result_column));
   }
   return execute_result(std::move(result_column));
+}
+
+execute_result gpu_expression_executor::execute(duckdb::BoundCastExpression const& expr,
+                                                execution_mode mode)
+{
+  auto node = sirius::ast::from_duckdb(expr);
+  return execute(*node, mode);
 }
 
 }  // namespace sirius
