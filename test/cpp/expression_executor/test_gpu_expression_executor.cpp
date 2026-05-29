@@ -30,6 +30,7 @@
 #include <expression/ast/comparison.hpp>
 #include <expression/ast/conjunction.hpp>
 #include <expression/ast/constant.hpp>
+#include <expression/ast/from_duckdb.hpp>
 #include <expression/ast/function_call.hpp>
 #include <expression/ast/in_list.hpp>
 #include <expression/ast/node.hpp>
@@ -2468,4 +2469,35 @@ TEST_CASE("native_ast - case_expr WHEN/THEN/ELSE (MATERIALIZE)",
   for (size_t i = 0; i < in_host.size(); ++i) {
     REQUIRE(out_host[i] == (in_host[i] == 5 ? 100 : 0));
   }
+}
+
+// Translator-only TEST_CASE: verifies that the BoundComparisonExpression shim
+// path now produces a non-null sirius::ast::node for COMPARE_DISTINCT_FROM and
+// COMPARE_NOT_DISTINCT_FROM. The executor's downstream behaviour on these
+// comparison kinds is GPU-bound and asserted by the existing
+// [expression_executor_ast_native][comparison] cases — this case only proves
+// that the lowering pipeline no longer drops these comparison kinds at the
+// from_duckdb step (sirius-db/sirius#699).
+TEST_CASE("native_ast - BoundComparisonExpression DISTINCT_FROM translates without nullptr",
+          "[expression_executor_ast_native_translate][comparison]")
+{
+  auto left  = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
+  auto right = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(7));
+  auto expr  = duckdb::make_uniq<BoundComparisonExpression>(
+    ExpressionType::COMPARE_DISTINCT_FROM, std::move(left), std::move(right));
+
+  auto node = sirius::ast::from_duckdb(*expr);
+  REQUIRE(node);
+  REQUIRE(node->holds<sirius::ast::comparison>());
+  REQUIRE(node->get<sirius::ast::comparison>().op == sirius::comparison_type::distinct_from);
+
+  auto left2  = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
+  auto right2 = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(7));
+  auto expr2  = duckdb::make_uniq<BoundComparisonExpression>(
+    ExpressionType::COMPARE_NOT_DISTINCT_FROM, std::move(left2), std::move(right2));
+
+  auto node2 = sirius::ast::from_duckdb(*expr2);
+  REQUIRE(node2);
+  REQUIRE(node2->holds<sirius::ast::comparison>());
+  REQUIRE(node2->get<sirius::ast::comparison>().op == sirius::comparison_type::not_distinct_from);
 }
