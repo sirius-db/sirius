@@ -2143,3 +2143,43 @@ TEST_CASE("native_ast - constant VARCHAR", "[expression_executor_ast_native][con
   std::vector<std::string> expected(tv.num_rows(), "hello");
   REQUIRE(copy_string_column_to_host(out->view().column(0)) == expected);
 }
+
+TEST_CASE("native_ast - comparison EQUAL (MATERIALIZE)",
+          "[expression_executor_ast_native][comparison]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto in = make_int32_input(*space);
+
+  auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::comparison{
+    sirius::comparison_type::equal, ref_node_native(0), int_const_node_native(42)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), in.view, MAT);
+  REQUIRE(out);
+  auto in_host  = copy_column_to_host<int32_t>(in.view.column(0));
+  auto out_host = copy_bool_column_to_host(out->view().column(0));
+  REQUIRE(out_host.size() == in_host.size());
+  for (size_t i = 0; i < in_host.size(); ++i) {
+    REQUIRE(out_host[i] == (in_host[i] == 42 ? 1U : 0U));
+  }
+}
+
+TEST_CASE("native_ast - comparison LESS_THAN (AST_INTERPRET)",
+          "[expression_executor_ast_native][comparison]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto in = make_int32_input(*space);
+
+  auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::comparison{
+    sirius::comparison_type::lt, ref_node_native(0), int_const_node_native(50)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), in.view, exp_strategy_enum::AST_INTERPRET);
+  REQUIRE(out);
+  auto in_host  = copy_column_to_host<int32_t>(in.view.column(0));
+  auto out_host = copy_bool_column_to_host(out->view().column(0));
+  REQUIRE(out_host.size() == in_host.size());
+  for (size_t i = 0; i < in_host.size(); ++i) {
+    REQUIRE(out_host[i] == (in_host[i] < 50 ? 1U : 0U));
+  }
+}
