@@ -20,6 +20,7 @@ test_datasets/tpch-dbgen/
 test_datasets/tpch-mod-dbgen/
 test_datasets/hits_0.parquet
 .claude/*
+.codex/
 runs/
 .venv
 cufile.log
