@@ -50,6 +50,7 @@ class buffer_pool;
 
 namespace sirius::op::scan {
 class sirius_gpu_parquet_scan_operator;
+class sirius_gpu_duckdb_native_scan_operator;
 struct scan_info;
 }  // namespace sirius::op::scan
 
@@ -352,6 +353,14 @@ class sirius_scan_manager {
     std::size_t op_id,
     std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces);
 
+  /// \brief Factory for the duckdb-native scan path. Cache-probes via
+  ///        try_make_cached_provider, otherwise dispatches through
+  ///        scan_info::make_provider() — mirrors the parquet overload.
+  std::unique_ptr<split_provider> create_provider_for(
+    op::scan::sirius_gpu_duckdb_native_scan_operator* op,
+    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs,
+    std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces);
+
   /// \brief Run providers sequentially: start each, wait on its future, advance.
   void start_metadata_processing();
 
@@ -369,6 +378,10 @@ class sirius_scan_manager {
   std::unordered_map<op::scan::sirius_gpu_parquet_scan_operator*, std::unique_ptr<split_provider>>
     _providers_by_op;
   std::vector<op::scan::sirius_gpu_parquet_scan_operator*> _scan_op_order;
+  std::unordered_map<op::scan::sirius_gpu_duckdb_native_scan_operator*,
+                     std::unique_ptr<split_provider>>
+    _duckdb_native_providers_by_op;
+  std::vector<op::scan::sirius_gpu_duckdb_native_scan_operator*> _duckdb_native_scan_op_order;
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
 };
 

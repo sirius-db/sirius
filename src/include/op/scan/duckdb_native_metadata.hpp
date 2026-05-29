@@ -57,6 +57,9 @@ struct duckdb_segment_descriptor {
   /// and non-VARCHAR segments. Every VARCHAR segment in a viable walk
   /// carries Some; Some(0) is the legal all-empty-row-group case.
   std::optional<std::uint32_t> max_string_length;
+  /// Byte size of this segment's main-block payload. Excludes
+  /// `additional_blocks`; 0 when `block_id < 0`.
+  std::size_t bytes_size = 0;
 };
 
 struct duckdb_column_metadata {
