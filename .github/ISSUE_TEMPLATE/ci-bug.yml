@@ -1,0 +1,80 @@
+name: CI Bug Report
+description: Report a problem with CI runners, builds, caching, or GPU behavior
+labels: ["ci", "bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template for failures with existing CI behavior — runner crashes, OOM,
+        wrong GPU count, timeout, sccache errors, build failures on self-hosted runners.
+
+  - type: input
+    id: job-url
+    attributes:
+      label: Failing job URL
+      description: Link to the GitHub Actions job or run
+      placeholder: "https://github.com/sirius-db/sirius/actions/runs/..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: "Job should complete successfully / sccache should hit S3 / 2 GPUs should be visible"
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      placeholder: "OOM at test 388 / sccache AuthorizationHeaderMalformed / 4 GPUs visible instead of 2"
+    validations:
+      required: true
+
+  - type: textarea
+    id: error-output
+    attributes:
+      label: Error output
+      description: Paste the relevant error lines from the job log
+      render: shell
+    validations:
+      required: false
+
+  - type: dropdown
+    id: frequency
+    attributes:
+      label: Bug frequency
+      options:
+        - Always (every run)
+        - Intermittent (some runs pass)
+        - First occurrence
+    validations:
+      required: true
+
+  - type: dropdown
+    id: affects
+    attributes:
+      label: Bug affects
+      multiple: true
+      options:
+        - GPU runners
+        - CPU runners
+        - ARM runners
+        - sccache / build cache
+        - vcpkg cache
+        - Runner startup / scaling
+        - CI pipeline (check.yml)
+        - CI pipeline (distribution.yml)
+        - CI pipeline (test.yml)
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional details
+      description: PR number, recent changes, workaround attempted, etc.
+    validations:
+      required: false
