@@ -12,7 +12,7 @@ resource! {
 }
 
 resource! {
-    /// A queue to enqueue stuff.
+    /// A queue that manages tasks.
     TaskQueue {
         capacity: { entries: Option<u64> },
     }
@@ -117,20 +117,52 @@ fsm! {
         entry: created,
         exit_from: { finalizing },
         transitions: {
+            // Task object exists and has entered its first scheduling queue.
             created => queued,
+
+            // A manager thread popped a queued task and is choosing where it should run.
             queued => routing,
+
+            // GPU pipeline tasks are routed from the scheduler queue into a selected
+            // per-GPU executor queue.
+            routing => queued,
+
+            // Scan/source tasks are routed and then reserve memory in the same scan
+            // manager loop
             routing => reserving,
-            routing => queued,      // GPU task routed into selected executor queue
-            queued => reserving,    // executor manager pops and starts reservation
-            routing => reserving,   // scan/source route and reserve in same manager loop
+            // GPU tasks reserve after being popped from an executor queue.
+            queued => reserving,
+
+            // The reservation request could not be fully satisfied, so the task asks the
+            // downgrade path to reduce required work/input.
             reserving => downgrading,
+            // A task retries reservation after a downgrade request was completed
             downgrading => reserving,
-            reserving => finalizing,
+
+            // Reservation succeeded and the task is ready to be prepared on a worker.
             reserving => preparing,
+
+            // Worker preparation completed and operator execution has started.
             preparing => computing,
-            preparing => finalizing,
+
+            // GPU pipeline tasks emit one compute event per operator;
+            // scan/source tasks usually emit one compute event for the source operator.
             computing => computing,
+
+            // Normal completion or execution failure after compute.
             computing => finalizing,
+
+            // Reservation o preparationg failure or cancellation.
+            queued => finalizing,
+            // after routing, enqueue to executor can fail/drop if the
+            // executor queue is interrupted.
+            routing => finalizing,
+            // reservation could fail
+            reserving => finalizing,
+            // downgrade request can be cancelled/fail before returning
+            downgrading => finalizing,
+            // upgrading data to required tier might fail.
+            preparing => finalizing,
         },
     }
 }

@@ -124,8 +124,8 @@ absl::AnyInvocable<void() noexcept> duckdb_scan_executor::get_per_thread_init()
           thread_prefix     = _config.thread_name_prefix,
           thread_id_counter]() noexcept {
     const int32_t thread_id = thread_id_counter->fetch_add(1, std::memory_order_relaxed);
-    executor_thread_telemtry_init(telemetry_context,
-                                  fmt::format("{}-duckdb_scan_exec-{}", thread_prefix, thread_id));
+    thread_local_executor_thread_telemtry_init(
+      telemetry_context, fmt::format("{}-duckdb_scan_exec-{}", thread_prefix, thread_id));
   };
 }
 

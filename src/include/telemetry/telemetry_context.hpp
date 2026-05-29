@@ -24,8 +24,6 @@
 #include "telemetry-bridge/gen/uuid.rs.h"
 #include "telemetry-bridge/gen/worker.rs.h"
 
-#include <string>
-
 namespace sirius::pipeline {
 class sirius_pipeline;
 }  // namespace sirius::pipeline
@@ -75,11 +73,11 @@ void emit_plan_telemetry(
   query_telemetry_info telemetry_info);
 
 struct ExecutorThreadHandleWrapper {
-  ExecutorThreadHandleWrapper(const telemetry_context* context, const std::string& thread_name)
-    : handle(quent::executor_thread::create(context->context(),
+  ExecutorThreadHandleWrapper(const telemetry_context& context, const std::string& thread_name)
+    : handle(quent::executor_thread::create(context.context(),
                                             {
                                               .instance_name   = thread_name,
-                                              .parent_group_id = context->engine_id(),
+                                              .parent_group_id = context.engine_id(),
                                             }))
   {
     handle->operating();
@@ -103,13 +101,15 @@ struct ExecutorThreadHandleWrapper {
 inline thread_local std::optional<ExecutorThreadHandleWrapper> telemetry_thread_handle{
   std::nullopt};
 
-inline void executor_thread_telemtry_init(const telemetry_context* context,
-                                          const std::string& thread_name)
+// Initialize the thread local ExecutorThreadHandleWrapper. The supplied telemetry_context
+// may be null, in which case this will be a no-op.
+inline void thread_local_executor_thread_telemtry_init(const telemetry_context* context,
+                                                       const std::string& thread_name)
 {
   if (not context) { return; }
 
   try {
-    telemetry_thread_handle.emplace(context, thread_name);
+    telemetry_thread_handle.emplace(*context, thread_name);
   } catch (const std::exception& e) {
     // Don't throw on telemetry handle creation failure.
     SIRIUS_LOG_ERROR("{} executor thread telemetry init failed: {}", thread_name, e.what());

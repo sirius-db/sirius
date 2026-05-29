@@ -30,6 +30,7 @@
 #include "telemetry-bridge/gen/query.rs.h"
 #include "telemetry-bridge/gen/query_group.rs.h"
 #include "telemetry-bridge/gen/uuid.rs.h"
+#include "telemetry/telemetry_context.hpp"
 
 #include <cucascade/data/data_repository_manager.hpp>
 

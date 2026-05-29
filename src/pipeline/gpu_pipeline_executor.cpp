@@ -70,7 +70,7 @@ absl::AnyInvocable<void() noexcept> gpu_pipeline_executor::get_per_thread_init()
           thread_prefix     = _config.thread_name_prefix,
           thread_id_counter]() mutable noexcept {
     const int32_t thread_id = thread_id_counter->fetch_add(1, std::memory_order_relaxed);
-    telemetry::executor_thread_telemtry_init(
+    telemetry::thread_local_executor_thread_telemtry_init(
       telemetry_context, fmt::format("{}-gpu_exec-{}", thread_prefix, thread_id));
 
     // Per-thread init runs on a worker thread just spawned by the
