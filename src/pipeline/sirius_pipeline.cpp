@@ -325,7 +325,7 @@ bool sirius_pipeline::is_pipeline_finished() const
 
 void sirius_pipeline::set_task_creator(sirius::creator::task_creator* tc) { _task_creator = tc; }
 
-void sirius_pipeline::notify_downstream_pipelines()
+void sirius_pipeline::notify_downstream_pipelines(bool original_pipeline)
 {
   // If this pipeline's sink is the RESULT_COLLECTOR, it is the terminal
   // pipeline of the query — there is no downstream consumer to schedule and
@@ -337,14 +337,16 @@ void sirius_pipeline::notify_downstream_pipelines()
 
   // Schedule output consumers via the task_creator so downstream pipelines
   // whose FULL-barrier ports are now unblocked will get tasks created.
-  if (_task_creator) {
+  // If this is the original pipeline, we dont want to schedule tasks for its consumers, that will
+  // be done later.
+  if (_task_creator && !original_pipeline) {
     for (auto* consumer : get_output_consumers()) {
       if (!consumer->finalized) { _task_creator->schedule(consumer); }
     }
   }
 
   for (auto* parent : get_parents()) {
-    parent->update_pipeline_status();
+    parent->update_pipeline_status(false);
   }
 }
 
@@ -353,7 +355,7 @@ std::unique_lock<std::mutex> sirius_pipeline::get_task_creation_lock()
   return std::unique_lock<std::mutex>(_status_mutex);
 }
 
-void sirius_pipeline::update_pipeline_status()
+void sirius_pipeline::update_pipeline_status(bool original_pipeline)
 {
   bool should_notify = false;
   {
@@ -433,7 +435,7 @@ void sirius_pipeline::update_pipeline_status()
   }  // _status_mutex released here — notify_downstream_pipelines must run outside the lock
      // to avoid holding the child pipeline mutex while acquiring a parent's
 
-  if (should_notify) { notify_downstream_pipelines(); }
+  if (should_notify) { notify_downstream_pipelines(original_pipeline); }
 }
 
 void sirius_pipeline::mark_task_created()

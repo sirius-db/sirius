@@ -352,6 +352,17 @@ void gpu_pipeline_executor::manager_loop()
           }
         }
 
+        if (!query_complete && _task_creator) {
+          // Schedule consumers explicitly here to drive the scheduler's
+          // round-robin rotation per-batch. notify_downstream_pipelines() in
+          // the task destructor only fires once the pipeline drains —
+          // mid-pipeline batches need to start rotating before that point so
+          // they reach all GPUs.
+          for (auto* consumer : consumers) {
+            if (consumer) { _task_creator->schedule(consumer); }
+          }
+        }
+
         if (query_complete && _completion_handler) {
           _task_creator->drain_pending_tasks();
           _completion_handler->mark_completed();
