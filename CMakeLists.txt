@@ -210,6 +210,7 @@ set(EXTENSION_SOURCES
     src/op/scan/scan_utils.cpp
     src/op/scan/sirius_gpu_parquet_scan_operator.cpp
     src/op/sirius_dynamic_filter.cpp
+    src/op/window/window_op_util.cpp
     src/op/sirius_physical_column_data_scan.cpp
     src/op/sirius_physical_cpu_source.cpp
     src/op/sirius_physical_concat.cpp
@@ -239,6 +240,7 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_table_scan.cpp
     src/op/sirius_physical_top_n.cpp
     src/op/sirius_physical_ungrouped_aggregate.cpp
+    src/op/sirius_physical_window.cpp
     src/parallel/task_executor.cpp
     src/pipeline/gpu_pipeline_executor.cpp
     src/pipeline/gpu_pipeline_task.cpp
@@ -267,6 +269,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_projection.cpp
     src/planner/sirius_plan_recursive_cte.cpp
     src/planner/sirius_plan_top_n.cpp
+    src/planner/sirius_plan_window.cpp
     src/scan_manager/cached_split_provider.cpp
     src/scan_manager/duckdb_native_split_provider.cpp
     src/pin_table.cpp
@@ -447,7 +450,12 @@ set(TEST_SOURCES
     test/cpp/helper/test_logical_type.cpp
     test/cpp/integration/test_gpu_execution_locality.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
+    test/cpp/integration/test_gpu_execution_order_nulls.cpp
+    test/cpp/integration/test_gpu_execution_tpcds.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
+    test/cpp/integration/test_gpu_execution_window.cpp
+    test/cpp/integration/test_tpcds_plan_translation.cpp
+    test/cpp/integration/test_window_benchmark.cpp
     test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/integration/test_transparent_execution.cpp
@@ -485,6 +493,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_no_history_peak_memory_estimate.cpp
     test/cpp/operator/test_physical_top_n.cpp
     test/cpp/operator/test_physical_ungrouped_aggregate.cpp
+    test/cpp/operator/test_physical_window.cpp
     test/cpp/operator/test_sirius_dynamic_filter.cpp
     test/cpp/parallel/test_task_executor.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp

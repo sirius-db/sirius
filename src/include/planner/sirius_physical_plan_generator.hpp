@@ -42,6 +42,7 @@ class LogicalTopN;
 class LogicalProjection;
 class LogicalMaterializedCTE;
 class LogicalCTERef;
+class LogicalWindow;
 }  // namespace duckdb
 
 namespace sirius::planner {
@@ -126,6 +127,7 @@ class sirius_physical_plan_generator {
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalLimit& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalOrder& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalTopN& op);
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalWindow& op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator>
   // create_plan(duckdb::LogicalPositionalJoin &op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(

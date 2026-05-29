@@ -34,6 +34,7 @@
 #include <cudf/column/column.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>
+#include <cudf/replace.hpp>
 #include <cudf/search.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/wrappers/timestamps.hpp>

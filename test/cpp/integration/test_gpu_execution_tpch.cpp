@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
@@ -369,6 +370,87 @@ class GPUExecutionParquetFixture : public GPUExecutionFixtureBase {
   }
 };
 
+static std::string strip_trailing_sql(const std::string& sql)
+{
+  auto clean_sql = sql;
+  while (!clean_sql.empty() && (clean_sql.back() == ';' || clean_sql.back() == ' ' ||
+                                clean_sql.back() == '\n' || clean_sql.back() == '\t')) {
+    clean_sql.pop_back();
+  }
+  return clean_sql;
+}
+
+static std::string sql_string_literal(const std::string& value)
+{
+  std::string quoted = "'";
+  for (const auto c : value) {
+    if (c == '\'') quoted += '\'';
+    quoted += c;
+  }
+  quoted += "'";
+  return quoted;
+}
+
+class GPUExecutionCoalesceFixture : public GPUExecutionFixtureBase {
+ public:
+  GPUExecutionCoalesceFixture()
+  {
+    require_ok(
+      "CREATE TEMP TABLE coalesce_input AS "
+      "SELECT "
+      "  CAST(i AS INTEGER) AS id, "
+      "  CAST(CASE WHEN i % 3 = 0 THEN NULL ELSE i END AS INTEGER) AS a, "
+      "  CAST(CASE WHEN i % 4 = 0 THEN NULL ELSE i * 10 END AS INTEGER) AS b, "
+      "  CAST(CASE WHEN i % 5 = 0 THEN NULL ELSE i * 10000000000 END AS BIGINT) "
+      "    AS c_big, "
+      "  CAST(CASE WHEN i % 6 = 0 THEN NULL ELSE i + 0.5 END AS DOUBLE) AS d "
+      "FROM range(0, 24) AS t(i)");
+  }
+
+  void materialize_gpu_and_cpu(const std::string& query)
+  {
+    require_ok("SET enable_duckdb_fallback = false");
+    const auto clean_query = strip_trailing_sql(query);
+    require_ok("DROP TABLE IF EXISTS coalesce_gpu_result");
+    require_ok("DROP TABLE IF EXISTS coalesce_cpu_result");
+    require_ok("CREATE TEMP TABLE coalesce_gpu_result AS SELECT * FROM gpu_execution(" +
+               sql_string_literal(clean_query) + ")");
+    require_ok("CREATE TEMP TABLE coalesce_cpu_result AS " + clean_query);
+  }
+
+  void compare_materialized_results()
+  {
+    require_empty(
+      "SELECT * FROM coalesce_gpu_result "
+      "EXCEPT ALL "
+      "SELECT * FROM coalesce_cpu_result",
+      "GPU minus CPU");
+    require_empty(
+      "SELECT * FROM coalesce_cpu_result "
+      "EXCEPT ALL "
+      "SELECT * FROM coalesce_gpu_result",
+      "CPU minus GPU");
+  }
+
+ private:
+  void require_ok(const std::string& sql)
+  {
+    auto result = con->Query(sql);
+    REQUIRE(result);
+    if (result->HasError()) { UNSCOPED_INFO(result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+  }
+
+  void require_empty(const std::string& sql, const std::string& direction)
+  {
+    auto result = con->Query("SELECT count(*) FROM (" + sql + ") diff");
+    REQUIRE(result);
+    if (result->HasError()) { UNSCOPED_INFO(direction << ": " << result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->GetValue(0, 0).GetValue<int64_t>() == 0);
+  }
+};
+
 //===----------------------------------------------------------------------===//
 // Scan tests
 //===----------------------------------------------------------------------===//
@@ -445,6 +527,20 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "[integration][gpu_execution][parquet][projection]")
 {
   compare_gpu_vs_cpu("select n_nationkey * 2 as doubled, n_regionkey from nation;");
+}
+
+TEST_CASE_METHOD(GPUExecutionCoalesceFixture,
+                 "gpu_execution - coalesce expression",
+                 "[integration][gpu_execution][expression][coalesce]")
+{
+  materialize_gpu_and_cpu(
+    "SELECT id, "
+    "       coalesce(a, b, -1) AS same_type_with_default, "
+    "       coalesce(a, b) AS same_type_nullable, "
+    "       coalesce(a, c_big, 9999999999::BIGINT) AS mixed_integer_width, "
+    "       coalesce(a, d, -1.5) AS mixed_integer_double "
+    "FROM coalesce_input");
+  compare_materialized_results();
 }
 
 //===----------------------------------------------------------------------===//

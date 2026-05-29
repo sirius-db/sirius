@@ -312,10 +312,15 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   bool is_supported_by_hash_join =
     sirius::op::sirius_physical_hash_join::are_conditions_supported(conditions);
   if (is_supported_by_hash_join && !prefer_range_joins) {
-    const auto& op_params = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
-                              ->get_config()
-                              .get_operator_params();
-    auto join = duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(
+    // Equality join with small number of keys : possible perfect join optimization
+    auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    if (!sirius_ctx) {
+      throw duckdb::InvalidInputException(
+        "Sirius context is not initialized. Check that SIRIUS_DISABLE is not set "
+        "and review extension loading logs for errors.");
+    }
+    const auto& op_params = sirius_ctx->get_config().get_operator_params();
+    auto join             = duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(
       op,
       std::move(left),
       std::move(right),

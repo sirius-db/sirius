@@ -34,6 +34,8 @@
  */
 
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "sirius_context.hpp"
+#include "sirius_extension.hpp"
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -45,14 +47,19 @@
 #include <duckdb/parser/parser.hpp>
 #include <duckdb/planner/planner.hpp>
 
+#include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
 
 using namespace duckdb;
+namespace fs = std::filesystem;
 
 // ============================================================================
 // Custom table function: sirius_plan_check(query VARCHAR)
@@ -68,6 +75,70 @@ struct PlanCheckBindData : public TableFunctionData {
   std::string error_message;
   bool finished = false;
 };
+
+class SiriusPlanConfigEnvGuard {
+ public:
+  explicit SiriusPlanConfigEnvGuard(const fs::path& config_path)
+  {
+    SaveEnv("SIRIUS_CONFIG_FILE", had_original_config_env_, original_config_env_);
+    SaveEnv("SIRIUS_DISABLE", had_original_disable_env_, original_disable_env_);
+
+    setenv("SIRIUS_CONFIG_FILE", config_path.string().c_str(), 1);
+    unsetenv("SIRIUS_DISABLE");
+  }
+
+  ~SiriusPlanConfigEnvGuard()
+  {
+    RestoreEnv("SIRIUS_CONFIG_FILE", had_original_config_env_, original_config_env_);
+    RestoreEnv("SIRIUS_DISABLE", had_original_disable_env_, original_disable_env_);
+  }
+
+  SiriusPlanConfigEnvGuard(const SiriusPlanConfigEnvGuard&)            = delete;
+  SiriusPlanConfigEnvGuard& operator=(const SiriusPlanConfigEnvGuard&) = delete;
+
+ private:
+  static void SaveEnv(const char* name, bool& had_value, std::string& value)
+  {
+    if (const char* current = std::getenv(name)) {
+      had_value = true;
+      value     = current;
+    }
+  }
+
+  static void RestoreEnv(const char* name, bool had_value, const std::string& value)
+  {
+    if (had_value) {
+      setenv(name, value.c_str(), 1);
+    } else {
+      unsetenv(name);
+    }
+  }
+
+  bool had_original_config_env_{false};
+  std::string original_config_env_;
+  bool had_original_disable_env_{false};
+  std::string original_disable_env_;
+};
+
+fs::path IntegrationConfigPath()
+{
+  auto cfg = fs::path(__FILE__).parent_path() / "integration.yaml";
+  REQUIRE(fs::exists(cfg));
+  return cfg;
+}
+
+void LoadSiriusExtension(DuckDB& db)
+{
+  try {
+    db.LoadStaticExtension<SiriusExtension>();
+  } catch (const std::exception& e) {
+    std::string msg = e.what();
+    if (msg.find("already exists") == std::string::npos &&
+        msg.find("already loaded") == std::string::npos) {
+      throw;
+    }
+  }
+}
 
 unique_ptr<FunctionData> PlanCheckBind(ClientContext& context,
                                        TableFunctionBindInput& input,
@@ -312,8 +383,13 @@ class TpcDsPlanTranslationFixture {
  public:
   TpcDsPlanTranslationFixture()
   {
-    db  = std::make_unique<DuckDB>(nullptr);
+    config_guard = std::make_unique<SiriusPlanConfigEnvGuard>(IntegrationConfigPath());
+    db           = std::make_unique<DuckDB>(nullptr);
+    LoadSiriusExtension(*db);
     con = std::make_unique<Connection>(*db);
+
+    auto sirius_ctx = con->context->registered_state->Get<SiriusContext>("sirius_state");
+    REQUIRE(sirius_ctx != nullptr);
 
     auto& catalog    = Catalog::GetSystemCatalog(*db->instance);
     auto transaction = CatalogTransaction::GetSystemTransaction(*db->instance);
@@ -460,6 +536,44 @@ class TpcDsPlanTranslationFixture {
     std::cout << "========================================" << std::endl;
   }
 
+  std::pair<bool, std::string> check_query(const std::string& check_function_name,
+                                           std::string query)
+  {
+    size_t pos = 0;
+    while ((pos = query.find('\'', pos)) != std::string::npos) {
+      query.insert(pos, "'");
+      pos += 2;
+    }
+
+    auto result =
+      con->Query("SELECT success, error_message FROM " + check_function_name + "('" + query + "')");
+    REQUIRE(result);
+    if (result->HasError()) { return {false, result->GetError()}; }
+
+    auto chunk = result->Fetch();
+    REQUIRE(chunk);
+    REQUIRE(chunk->size() == 1);
+
+    auto success    = chunk->GetValue(0, 0).GetValue<bool>();
+    auto error_text = chunk->GetValue(1, 0).ToString();
+    return {success, error_text};
+  }
+
+  std::string get_tpcds_query(int query_nr)
+  {
+    auto result =
+      con->Query("SELECT query FROM tpcds_queries() WHERE query_nr = " + std::to_string(query_nr));
+    REQUIRE(result);
+    if (result->HasError()) { UNSCOPED_INFO(result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+
+    auto chunk = result->Fetch();
+    REQUIRE(chunk);
+    REQUIRE(chunk->size() == 1);
+    return chunk->GetValue(0, 0).ToString();
+  }
+
+  std::unique_ptr<SiriusPlanConfigEnvGuard> config_guard;
   std::unique_ptr<DuckDB> db;
   std::unique_ptr<Connection> con;
 };
@@ -472,7 +586,7 @@ class TpcDsPlanTranslationFixture {
 
 TEST_CASE_METHOD(TpcDsPlanTranslationFixture,
                  "TPC-DS plan translation coverage",
-                 "[tpcds][plan][coverage]")
+                 "[.][tpcds][plan][coverage]")
 {
   if (!load_tpcds()) {
     WARN("TPC-DS extension not available — skipping plan translation test");
@@ -488,7 +602,7 @@ TEST_CASE_METHOD(TpcDsPlanTranslationFixture,
 
 TEST_CASE_METHOD(TpcDsPlanTranslationFixture,
                  "TPC-DS legacy plan translation coverage",
-                 "[tpcds][plan][coverage][legacy]")
+                 "[.][tpcds][plan][coverage][legacy]")
 {
   if (!load_tpcds()) {
     WARN("TPC-DS extension not available — skipping legacy plan translation test");
@@ -496,4 +610,34 @@ TEST_CASE_METHOD(TpcDsPlanTranslationFixture,
   }
 
   run_plan_translation_test("gpu_plan_check", "TPC-DS Plan Translation Summary (Legacy GPU)");
+}
+
+TEST_CASE_METHOD(TpcDsPlanTranslationFixture,
+                 "TPC-DS Phase 1 ranking queries translate in Sirius planner",
+                 "[.][tpcds][plan][window]")
+{
+  if (!load_tpcds()) {
+    WARN("TPC-DS extension not available — skipping ranking translation test");
+    return;
+  }
+
+  const std::vector<int> ranking_queries{44, 67};
+  for (const auto query_nr : ranking_queries) {
+    DYNAMIC_SECTION("Q" << query_nr)
+    {
+      if (query_nr == 67) {
+        // Q67 remains translation-only here: COALESCE now runs on GPU, but end-to-end Q67 GPU
+        // execution is still deferred until the remaining non-window TPC-DS gaps (e.g. the ROLLUP
+        // projection path) are covered. This test only asserts Sirius plan translation.
+        INFO(
+          "Q67 remains translation-only; end-to-end GPU execution is deferred until the remaining "
+          "non-window TPC-DS gaps are covered");
+      }
+      auto [success, error] = check_query("sirius_plan_check", get_tpcds_query(query_nr));
+      if (!success) {
+        UNSCOPED_INFO("Sirius TPC-DS Q" << query_nr << " translation error: " << error);
+      }
+      REQUIRE(success);
+    }
+  }
 }

@@ -132,8 +132,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
       plan = create_plan(op.Cast<duckdb::LogicalAggregate>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_WINDOW:
-      throw duckdb::NotImplementedException("Window not supported");
-      // plan = create_plan(op.Cast<duckdb::LogicalWindow>());
+      plan = create_plan(op.Cast<duckdb::LogicalWindow>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_UNNEST:
       throw duckdb::NotImplementedException("Unnest not supported");
