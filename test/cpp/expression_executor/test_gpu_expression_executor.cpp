@@ -2109,3 +2109,37 @@ TEST_CASE("native_ast - reference identity", "[expression_executor_ast_native][r
   auto out_host = copy_column_to_host<int32_t>(out->view().column(0));
   REQUIRE(out_host == in_host);
 }
+
+TEST_CASE("native_ast - constant INTEGER", "[expression_executor_ast_native][constant]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto in = make_int32_input(*space);
+
+  auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::constant{
+    sirius::value{int32_t{42}}, sirius::logical_type::make(sirius::type_id::INTEGER)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), in.view, MAT);
+  REQUIRE(out);
+  std::vector<int32_t> expected(in.view.num_rows(), 42);
+  REQUIRE(copy_column_to_host<int32_t>(out->view().column(0)) == expected);
+}
+
+TEST_CASE("native_ast - constant VARCHAR", "[expression_executor_ast_native][constant]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto input =
+    make_input_batch(*space, {cudf::data_type{cudf::type_id::STRING}}, {std::pair<int, int>{1, 5}});
+  auto ro       = input->to_read_only();
+  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  auto tv       = in_repr.get_table_view();
+
+  auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::constant{
+    sirius::value{std::string{"hello"}}, sirius::logical_type::make(sirius::type_id::VARCHAR)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), tv, MAT);
+  REQUIRE(out);
+  std::vector<std::string> expected(tv.num_rows(), "hello");
+  REQUIRE(copy_string_column_to_host(out->view().column(0)) == expected);
+}
