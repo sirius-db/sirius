@@ -110,10 +110,6 @@ void task_scheduler::start()
 {
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
-  // Reopen the channel and task queue in case a previous stop() closed them.
-  _task_request_channel.reopen();
-  _task_queue.reactivate();
-  _ready_devices.clear();
   _scan_executor->start();
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->start();
