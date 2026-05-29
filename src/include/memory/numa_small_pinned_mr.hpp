@@ -109,16 +109,18 @@ class numa_small_pinned_mr {
     if (it != pools_.end()) { it->second->deallocate(stream, ptr, bytes, alignment); }
   }
 
+  // PTDS, not the legacy default stream: the pool ignores the stream arg
+  // (free-list pop, no device work), so no synchronize is needed.
   void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
   {
-    return allocate(::cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
+    return allocate(::cuda::stream_ref{cudaStreamPerThread}, bytes, alignment);
   }
 
   void deallocate_sync(void* ptr,
                        std::size_t bytes,
                        std::size_t alignment = alignof(std::max_align_t)) noexcept
   {
-    deallocate(::cuda::stream_ref{cudaStream_t{nullptr}}, ptr, bytes, alignment);
+    deallocate(::cuda::stream_ref{cudaStreamPerThread}, ptr, bytes, alignment);
   }
 
   bool operator==(numa_small_pinned_mr const& other) const noexcept { return this == &other; }

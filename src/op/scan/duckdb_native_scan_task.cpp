@@ -127,16 +127,7 @@ bool column_has_real_nulls(duckdb_column_metadata const& col)
 
 cudf::data_type sirius_to_cudf_type(sirius::logical_type const& t)
 {
-  duckdb::vector<sirius::logical_type> wrap{t};
-  auto duckdb_vec = sirius::to_duckdb_vec(wrap);
-  return duckdb::GetCudfType(duckdb_vec[0]);
-}
-
-duckdb::LogicalType sirius_to_duckdb_type(sirius::logical_type const& t)
-{
-  duckdb::vector<sirius::logical_type> wrap{t};
-  auto duckdb_vec = sirius::to_duckdb_vec(wrap);
-  return duckdb_vec[0];
+  return duckdb::GetCudfType(sirius::to_duckdb(t));
 }
 
 //===----------------------------------------------------------------------===//
@@ -192,16 +183,18 @@ pinned_segment_bytes pin_block_with_additional(duckdb::BlockManager& block_manag
 
   std::vector<duckdb::BufferHandle> handles;
   handles.push_back(std::move(main_handle));
+
+  // Single up-front resize: main payload + one full block per additional block.
   std::vector<uint8_t> concat;
-  concat.resize(seg.bytes_size);
+  concat.resize(seg.bytes_size + seg.additional_blocks.size() * block_size);
   std::memcpy(concat.data(), handles.front().Ptr() + seg.block_offset, seg.bytes_size);
 
+  std::size_t offset = seg.bytes_size;
   for (auto add_id : seg.additional_blocks) {
     auto add_handle = block_manager.RegisterBlock(add_id);
     auto h          = buffer_manager.Pin(add_handle);
-    auto offset     = concat.size();
-    concat.resize(offset + block_size);
     std::memcpy(concat.data() + offset, h.Ptr(), block_size);
+    offset += block_size;
     handles.push_back(std::move(h));
   }
 
@@ -326,7 +319,7 @@ void store_typed_min(duckdb::BaseStatistics const& stats, std::vector<uint8_t>& 
 pinned_segment_bytes extract_constant_bytes(duckdb::BaseStatistics const& stats,
                                             sirius::logical_type const& sirius_type)
 {
-  auto duckdb_type = sirius_to_duckdb_type(sirius_type);
+  auto duckdb_type = sirius::to_duckdb(sirius_type);
   pinned_segment_bytes out;
   switch (duckdb_type.InternalType()) {
     case duckdb::PhysicalType::BOOL:
