@@ -207,10 +207,13 @@ TEST_CASE("ast_scaffold - in_list holds a probe, values, and a negation flag", "
 
 TEST_CASE("ast_scaffold - function_call holds arguments and a return type", "[ast_scaffold]")
 {
-  function_call fc;
-  fc.arguments.push_back(std::make_unique<node>(reference{0}));
-  fc.arguments.push_back(std::make_unique<node>(reference{1}));
-  REQUIRE(fc.arguments.size() == 2);
+  std::vector<std::unique_ptr<node>> args;
+  args.push_back(std::make_unique<node>(reference{0}));
+  args.push_back(std::make_unique<node>(reference{1}));
+  function_call fc{sirius::function_id::add,
+                   std::move(args),
+                   sirius::logical_type::make(sirius::type_id::INTEGER)};
+  REQUIRE(fc.arguments().size() == 2);
   node n{std::move(fc)};
   REQUIRE(n.holds<function_call>());
 }

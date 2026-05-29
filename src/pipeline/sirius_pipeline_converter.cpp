@@ -16,10 +16,16 @@
 
 #include "pipeline/sirius_pipeline_converter.hpp"
 
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/common/shared_ptr_ipp.hpp"
+#include "duckdb/function/table/table_scan.hpp"
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/storage/storage_manager.hpp"
 #include "log/logging.hpp"
+#include "op/scan/duckdb_native_scan_info.hpp"
 #include "op/scan/parquet_scan_info.hpp"
+#include "op/scan/sirius_gpu_duckdb_native_scan_operator.hpp"
 #include "op/scan/sirius_gpu_parquet_scan_operator.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
@@ -48,6 +54,7 @@
 #include "sirius_config.hpp"
 
 #include <algorithm>
+#include <numeric>
 #include <stdexcept>
 
 namespace sirius::pipeline {
@@ -105,8 +112,12 @@ sirius_pipeline_converter::sirius_pipeline_converter(
   const pipeline_build_context& ctx,
   const sirius::operator_params& op_params,
   const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>*
-    iceberg_cache)
-  : build_ctx_(ctx), op_params_(op_params), iceberg_cache_(iceberg_cache)
+    iceberg_cache,
+  duckdb::ClientContext* client_context)
+  : build_ctx_(ctx),
+    op_params_(op_params),
+    iceberg_cache_(iceberg_cache),
+    client_context_(client_context)
 {
 }
 
@@ -263,6 +274,8 @@ void sirius_pipeline_converter::insert_parquet_scan_operator(
   // upstream #749's polymorphic scan_info requires scan_output_arity (consumed by
   // scan_info::make_provider). sql-surface's branch above didn't set it.
   scan_info->scan_output_arity = scan_op.types.size();
+  // upstream #792 added approximate_batch_size, driven by operator_params.
+  scan_info->approximate_batch_size = op_params_.scan_task_batch_size;
 
   auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_parquet_scan_operator>(
     scan_op.types, scan_op.estimated_cardinality, std::move(scan_info));
@@ -272,6 +285,86 @@ void sirius_pipeline_converter::insert_parquet_scan_operator(
   // finalize_pipeline_structure() will set current_pipeline->source = &operators[0] = gpu_scan_op.
   current_pipeline->operators.insert(current_pipeline->operators.begin(), *gpu_scan_ptr);
 
+  inserted_operators_.push_back(std::move(gpu_scan_op));
+}
+
+void sirius_pipeline_converter::insert_duckdb_native_scan_operator(
+  duckdb::shared_ptr<sirius_pipeline>& current_pipeline)
+{
+  auto& scan_op = current_pipeline->get_source()->Cast<op::sirius_physical_table_scan>();
+  if (!scan_op.bind_data) {
+    throw std::runtime_error(
+      "[sirius_pipeline_converter::insert_duckdb_native_scan_operator] seq_scan has no bind_data");
+  }
+  auto* table_scan_bind = dynamic_cast<duckdb::TableScanBindData*>(scan_op.bind_data.get());
+  if (table_scan_bind == nullptr) {
+    throw std::runtime_error(
+      "[sirius_pipeline_converter::insert_duckdb_native_scan_operator] seq_scan bind_data is not "
+      "TableScanBindData; the GPU-native duckdb scan path supports only seq_scan over base "
+      "tables. Disable enable_gpu_duckdb_native_scan for this query.");
+  }
+  auto& bind_data = *table_scan_bind;
+  auto& table     = bind_data.table.Cast<duckdb::DuckTableEntry>();
+
+  if (client_context_ == nullptr) {
+    throw std::runtime_error(
+      "[sirius_pipeline_converter::insert_duckdb_native_scan_operator] no client_context passed "
+      "to converter; seq_scan GPU-native path requires it");
+  }
+
+  auto scan_info     = std::make_unique<op::scan::duckdb_native_scan_info>();
+  scan_info->storage = &table.GetStorage();
+  scan_info->context = client_context_;
+  scan_info->db_path = table.GetStorage().GetAttached().GetStorageManager().GetDBPath();
+  scan_info->approximate_batch_size = op_params_.scan_task_batch_size;
+
+  std::vector<std::size_t> source_ids_fallback;
+  if (scan_op.projection_ids.empty()) {
+    source_ids_fallback.resize(scan_op.column_ids.size());
+    std::iota(source_ids_fallback.begin(), source_ids_fallback.end(), 0);
+  }
+  auto const& source_ids =
+    scan_op.projection_ids.empty() ? source_ids_fallback : scan_op.projection_ids;
+
+  // source_ids may exceed scan_op.types when sirius_plan_get.cpp appends filter-only columns
+  // (merge_pushdown_filters). decode_duckdb_native_split applies table_filters and projects
+  // down to output_types — same pattern as sirius_physical_table_scan::execute.
+  scan_info->projected_cols.reserve(source_ids.size());
+  scan_info->projected_types.reserve(source_ids.size());
+  for (std::size_t k = 0; k < source_ids.size(); ++k) {
+    auto pid            = source_ids[k];
+    auto const& col_idx = scan_op.column_ids[pid];
+    op::scan::projected_column pc;
+    pc.is_rowid = col_idx.IsRowIdColumn();
+    if (!pc.is_rowid) { pc.storage_idx = duckdb::StorageIndex(col_idx.GetPrimaryIndex()); }
+    scan_info->projected_cols.push_back(pc);
+
+    sirius::logical_type t;
+    if (k < scan_op.types.size()) {
+      t = scan_op.types[k];
+    } else {
+      t = scan_op.returned_types.at(col_idx.GetPrimaryIndex());
+    }
+    scan_info->projected_types.push_back(t);
+  }
+
+  // Pass filter context to decode_duckdb_native_split (table_filters apply post-decode).
+  if (scan_op.table_filters) {
+    scan_info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+    for (auto& [col_idx, filt] : scan_op.table_filters->filters) {
+      scan_info->table_filters->filters[col_idx] = filt->Copy();
+    }
+  }
+  scan_info->column_ids     = scan_op.column_ids;
+  scan_info->projection_ids = scan_op.projection_ids;
+  scan_info->returned_types = scan_op.returned_types;
+  scan_info->output_types   = scan_op.types;
+
+  auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_duckdb_native_scan_operator>(
+    scan_op.types, scan_op.estimated_cardinality, std::move(scan_info));
+
+  auto* gpu_scan_ptr = gpu_scan_op.get();
+  current_pipeline->operators.insert(current_pipeline->operators.begin(), *gpu_scan_ptr);
   inserted_operators_.push_back(std::move(gpu_scan_op));
 }
 
@@ -285,6 +378,11 @@ void sirius_pipeline_converter::split_table_scan_source(
   if (scan_op.function.name == "parquet_scan" || scan_op.function.name == "read_parquet" ||
       scan_op.function.name == "sirius_read_parquet") {
     insert_parquet_scan_operator(current_pipeline);
+    return;
+  }
+
+  if (scan_op.function.name == "seq_scan" && op_params_.enable_gpu_duckdb_native_scan) {
+    insert_duckdb_native_scan_operator(current_pipeline);
     return;
   }
 
@@ -1191,6 +1289,7 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
                           static_cast<void*>(scan_port->repo));
         }
       } else if (first_op.type == op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN ||
+                 first_op.type == op::SiriusPhysicalOperatorType::GPU_DUCKDB_NATIVE_SCAN ||
                  first_op.type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
                  first_op.type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN ||
                  first_op.type == op::SiriusPhysicalOperatorType::CPU_SOURCE ||
@@ -1235,6 +1334,7 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
                           static_cast<void*>(scan_port->repo));
         }
       } else if (sink->type == op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN ||
+                 sink->type == op::SiriusPhysicalOperatorType::GPU_DUCKDB_NATIVE_SCAN ||
                  sink->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
                  sink->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN ||
                  sink->type == op::SiriusPhysicalOperatorType::CPU_SOURCE ||

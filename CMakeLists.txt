@@ -149,8 +149,10 @@ set(EXTENSION_SOURCES
     src/data/host_parquet_representation_converters.cpp
     src/downgrade/downgrade_executor.cpp
     src/expression/expression.cpp
+    src/expression/from_duckdb.cpp
     src/expression/function_id.cpp
     src/expression/join_condition.cpp
+    src/expression/to_duckdb.cpp
     src/expression/value.cpp
     src/expression_executor/expression_executor_strategy.cpp
     src/expression_executor/gpu_expression_executor.cpp
@@ -192,6 +194,7 @@ set(EXTENSION_SOURCES
     src/op/scan/duckdb_scan_executor.cpp
     src/op/scan/cpu_source_task.cpp
     src/op/scan/duckdb_native_metadata.cpp
+    src/op/scan/duckdb_native_decoder.cpp
     src/op/scan/duckdb_scan_task.cpp
     src/op/scan/equality_delete_filter.cpp
     src/op/scan/hive_partition.cpp
@@ -208,6 +211,7 @@ set(EXTENSION_SOURCES
     src/op/scan/prefetched_data_source.cpp
     src/op/scan/scan_plan.cpp
     src/op/scan/scan_utils.cpp
+    src/op/scan/sirius_gpu_duckdb_native_scan_operator.cpp
     src/op/scan/sirius_gpu_parquet_scan_operator.cpp
     src/op/sirius_dynamic_filter.cpp
     src/op/sirius_physical_column_data_scan.cpp
@@ -435,12 +439,15 @@ set(TEST_SOURCES
     test/cpp/exec/test_bounded_thread_pool.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
+    test/cpp/expression/test_ast_from_duckdb.cpp
     test/cpp/expression/test_ast_scaffold.cpp
+    test/cpp/expression/test_ast_to_duckdb.cpp
     test/cpp/expression/test_expression.cpp
     test/cpp/expression/test_function_id.cpp
     test/cpp/expression/test_join_condition.cpp
     test/cpp/expression/test_value.cpp
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
+    test/cpp/expression_executor/test_gpu_expression_executor_ast_equivalence.cpp
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
     test/cpp/helper/test_logical_type.cpp
     test/cpp/integration/test_gpu_execution_locality.cpp
@@ -503,6 +510,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_task_scheduler.cpp
     test/cpp/scan/bench_decode_codecs.cpp
     test/cpp/scan/test_column_builder.cpp
+    test/cpp/scan/test_duckdb_block_layout.cpp
     test/cpp/scan/test_duckdb_native_split_provider.cpp
     test/cpp/scan/test_duckdb_native_walker.cpp
     test/cpp/scan/test_gpu_decode_alp.cpp
