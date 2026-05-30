@@ -87,8 +87,15 @@ sirius_physical_right_delim_join::sirius_physical_right_delim_join(
 
   children.push_back(std::move(join->children[1]));
 
-  join->children[1] =
+  // B.3+B.4+B.6 (#604): mark the synthetic DUMMY_SCAN so plan-gen's wrap_cpu_source
+  // skips attaching a CPU_SOURCE leaf below it. The placeholder carries no runtime
+  // data flow (RIGHT_DELIM_JOIN::sink invokes partition_join inline), so the
+  // CPU_SOURCE wrap would be plan-time scaffolding that materializes a phantom
+  // [CPU_SOURCE] pipeline with no legacy counterpart.
+  auto dummy_placeholder =
     duckdb::make_uniq<sirius_physical_dummy_scan>(children[0]->get_types(), estimated_cardinality);
+  dummy_placeholder->set_delim_join_placeholder(true);
+  join->children[1] = std::move(dummy_placeholder);
 }
 
 sirius_physical_left_delim_join::sirius_physical_left_delim_join(

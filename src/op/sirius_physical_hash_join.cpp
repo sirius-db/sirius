@@ -16,8 +16,8 @@
 
 #include "op/sirius_physical_hash_join.hpp"
 
-#include "cudf/aggregation.hpp"
 #include "config.hpp"
+#include "cudf/aggregation.hpp"
 #include "cudf/copying.hpp"
 #include "cudf/join/distinct_hash_join.hpp"
 #include "cudf/join/filtered_join.hpp"
@@ -43,6 +43,7 @@
 #include "log/logging.hpp"
 #include "op/dynamic_filter_publisher.hpp"
 #include "op/sirius_dynamic_filter.hpp"
+#include "op/sirius_physical_nested_loop_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
@@ -401,7 +402,22 @@ void sirius_physical_hash_join::build_join_pipelines(pipeline::sirius_pipeline& 
       D_ASSERT(build_child.is_sink());
       D_ASSERT(!build_child.children.empty());
       auto& build_meta = meta_pipeline.create_child_meta_pipeline(current, build_child);
-      build_meta.build(*build_child.children[0]);
+
+      // B.3+B.4+B.6 (#604): when `op` is the inner join of a RIGHT_DELIM_JOIN, the
+      // build subtree below CONCAT_build is synthetic scaffolding —
+      // PARTITION_build/partition_join + DUMMY_SCAN placeholder. partition_join is
+      // owned by the DELIM_JOIN and executed inline (RIGHT_DELIM_JOIN::sink), and
+      // DUMMY_SCAN never produces runtime data. Skip the recursion so PARTITION_build,
+      // DUMMY_SCAN, and (the now-absent) CPU_SOURCE don't materialize their own
+      // pipelines. build_meta still finalizes to a [CONCAT_build] single-op pipeline
+      // via is_ready, matching legacy split_delim_join_sink's [CONCAT] pipeline.
+      bool is_delim_inner = false;
+      if (auto* hj = dynamic_cast<sirius_physical_hash_join*>(&op)) {
+        is_delim_inner = hj->is_delim_join_inner();
+      } else if (auto* nlj = dynamic_cast<sirius_physical_nested_loop_join*>(&op)) {
+        is_delim_inner = nlj->is_delim_join_inner();
+      }
+      if (!is_delim_inner) { build_meta.build(*build_child.children[0]); }
     } else {
       // on the RHS (build side), we construct a child MetaPipeline with this operator as
       // its sink

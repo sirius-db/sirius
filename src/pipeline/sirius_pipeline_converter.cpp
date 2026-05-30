@@ -1297,6 +1297,15 @@ void sirius_pipeline_converter::compute_repository_wiring_tree_based(
       auto* distinct_op    = right_delim.distinct;
       if (partition_join) {
         auto it = dest_for_op.find(partition_join);
+        // B.3+B.4+B.6 (#604): partition_join is owned by the DELIM_JOIN and executed
+        // inline (RIGHT_DELIM_JOIN::sink). Under flag ON it has no pipeline of its own —
+        // build_join_pipelines skips the recursion that would have created one — so the
+        // direct lookup misses. Fall back to its tree parent (CONCAT_build), which is
+        // the build_meta sink and resolves to the externalized [CONCAT_build] single-op
+        // pipeline. Matches legacy `PARTITION → CONCAT` build wiring.
+        if (it == dest_for_op.end()) {
+          if (auto* parent = partition_join->get_parent_op()) { it = dest_for_op.find(parent); }
+        }
         if (it != dest_for_op.end()) {
           emit("default", op::MemoryBarrierType::FULL, partition_join, pipeline, it->second);
         }

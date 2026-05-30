@@ -36,6 +36,22 @@ class sirius_physical_dummy_scan : public sirius_physical_operator {
 
  public:
   bool is_source() const override { return true; }
+
+  //! True when this DUMMY_SCAN was inserted as the synthetic build placeholder under a
+  //! RIGHT_DELIM_JOIN's internal join (children[1]) rather than as a real source. Set in
+  //! `sirius_physical_right_delim_join`'s constructor. Consumed by plan-gen's
+  //! `insert_gpu_pipeline_operators_recursive` to skip `wrap_cpu_source` — the placeholder
+  //! carries no runtime data flow (RIGHT_DELIM_JOIN::sink runs partition_join inline) so a
+  //! CPU_SOURCE leaf below it would be plan-time dead weight that confuses pipeline dumps.
+  //! Real DUMMY_SCAN usages (constant-row subqueries) keep the wrap.
+  [[nodiscard]] bool is_delim_join_placeholder() const noexcept
+  {
+    return _is_delim_join_placeholder;
+  }
+  void set_delim_join_placeholder(bool value) noexcept { _is_delim_join_placeholder = value; }
+
+ protected:
+  bool _is_delim_join_placeholder = false;
 };
 
 }  // namespace op

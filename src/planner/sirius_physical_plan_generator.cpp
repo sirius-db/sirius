@@ -38,6 +38,7 @@
 #include "op/sirius_physical_cpu_source.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
+#include "op/sirius_physical_dummy_scan.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "op/sirius_physical_iceberg_scan.hpp"
@@ -538,8 +539,17 @@ void insert_gpu_pipeline_operators_recursive(
       wrap_table_scan_source(*slot, iceberg_cache);
       break;
     case sirius::op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN:
-    case sirius::op::SiriusPhysicalOperatorType::EMPTY_RESULT:
-    case sirius::op::SiriusPhysicalOperatorType::DUMMY_SCAN: wrap_cpu_source(*slot); break;
+    case sirius::op::SiriusPhysicalOperatorType::EMPTY_RESULT: wrap_cpu_source(*slot); break;
+    case sirius::op::SiriusPhysicalOperatorType::DUMMY_SCAN: {
+      // B.3+B.4+B.6 (#604): skip the CPU_SOURCE wrap for the synthetic DUMMY_SCAN
+      // inserted as a RIGHT_DELIM_JOIN's build placeholder — it carries no runtime
+      // data flow (partition_join executes inline via DELIM_JOIN's sink) so the
+      // CPU_SOURCE leaf would only materialize a phantom pipeline. Real DUMMY_SCAN
+      // usages (constant-row subqueries) keep the wrap.
+      auto& dummy = slot->Cast<sirius::op::sirius_physical_dummy_scan>();
+      if (!dummy.is_delim_join_placeholder()) { wrap_cpu_source(*slot); }
+      break;
+    }
     case sirius::op::SiriusPhysicalOperatorType::HASH_GROUP_BY:
       wrap_hash_group_by(slot, op_params);
       break;
