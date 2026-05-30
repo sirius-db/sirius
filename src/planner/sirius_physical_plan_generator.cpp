@@ -483,7 +483,16 @@ void wrap_delim_join(
   }
 
   if (slot->type == sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
-    auto& right_delim   = slot->Cast<sirius::op::sirius_physical_right_delim_join>();
+    auto& right_delim = slot->Cast<sirius::op::sirius_physical_right_delim_join>();
+
+    // B.5 (#604): tag the bare DISTINCT so its `build_pipelines` becomes a no-op.
+    // RIGHT_DELIM_JOIN::sink runs `distinct->execute` and `distinct->sink` inline,
+    // so the bare DISTINCT contributes nothing to any pipeline (matches legacy's
+    // partition_distinct pipeline which has operators=[PARTITION] only). Scoped
+    // to RIGHT only — LEFT_DELIM_JOIN's distinct keeps standard sink behavior
+    // pending separate analysis for q2/q15/q17/q20.
+    if (right_delim.distinct) { right_delim.distinct->set_owned_by_delim_join(true); }
+
     auto* internal_join = delim_base.join.get();
     if (internal_join && internal_join->children.size() >= 2) {
       auto* build_child = internal_join->children[1].get();

@@ -1312,6 +1312,16 @@ void sirius_pipeline_converter::compute_repository_wiring_tree_based(
       }
       if (distinct_op) {
         auto it = dest_for_op.find(distinct_op);
+        // B.5 (#604): the bare DISTINCT is owned by DELIM_JOIN and executed inline
+        // (RIGHT_DELIM_JOIN::sink). Under flag ON it has no pipeline of its own —
+        // its build_pipelines override short-circuits when `_owned_by_delim_join`
+        // is set — so the direct lookup misses. Fall back to its tree parent
+        // (PARTITION_distinct), which is the partition pipeline that consumes the
+        // bare DISTINCT's per-thread output. Matches legacy
+        // `HASH_GROUP_BY (src=DELIM_JOIN) → PARTITION (dst=PARTITION_distinct)`.
+        if (it == dest_for_op.end()) {
+          if (auto* parent = distinct_op->get_parent_op()) { it = dest_for_op.find(parent); }
+        }
         if (it != dest_for_op.end()) {
           emit("default", op::MemoryBarrierType::FULL, distinct_op, pipeline, it->second);
         }

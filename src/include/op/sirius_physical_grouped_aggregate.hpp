@@ -107,8 +107,26 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
 
   bool sink_order_dependent() const override { return false; }
 
+  //! True when this HASH_GROUP_BY is the bare DISTINCT (`delim_join.distinct`) of a
+  //! RIGHT_DELIM_JOIN. Set in `wrap_delim_join`'s RIGHT branch at plan-gen time. The
+  //! bare DISTINCT's execution is owned by the enclosing delim join — its `execute`
+  //! and `sink` are invoked inline from `sirius_physical_right_delim_join::sink`,
+  //! never via its own pipeline. Consumed by `build_pipelines` to suppress pipeline
+  //! materialization for this operator under USE_TREE_BASED_PIPELINE_BUILD; mirrors
+  //! the absence of any standalone DISTINCT pipeline in legacy's q4 dump (legacy
+  //! split_delim_join_sink creates the partition_distinct pipeline without the
+  //! bare DISTINCT in operators[]).
+  [[nodiscard]] bool is_owned_by_delim_join() const noexcept { return _owned_by_delim_join; }
+  void set_owned_by_delim_join(bool value) noexcept { _owned_by_delim_join = value; }
+
+  void build_pipelines(pipeline::sirius_pipeline& current,
+                       pipeline::sirius_meta_pipeline& meta_pipeline) override;
+
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
+
+ protected:
+  bool _owned_by_delim_join = false;
 };
 
 }  // namespace op
