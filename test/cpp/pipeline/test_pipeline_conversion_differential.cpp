@@ -147,7 +147,7 @@ TEST_CASE("TPC-H SF1: legacy and tree-based converters produce identical pipelin
   //
   // Removing a query from this set as fixes land tightens the gate incrementally; E.4
   // (flag-default flip) cannot ship until the list is empty.
-  static const std::set<int> kKnownFailing = {2, 15, 17, 20, 21, 22};
+  static const std::set<int> kKnownFailing = {15, 21, 22};
 
   for (int q = 1; q <= 22; ++q) {
     if (kKnownFailing.count(q) != 0) { continue; }

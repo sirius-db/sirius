@@ -507,16 +507,18 @@ void wrap_delim_join(
       }
     }
   } else if (slot->type == sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
-    auto& left_delim    = slot->Cast<sirius::op::sirius_physical_left_delim_join>();
-    auto* internal_join = delim_base.join.get();
-    if (internal_join && !internal_join->children.empty()) {
-      auto* probe_child = internal_join->children[0].get();
-      if (probe_child &&
-          probe_child->type == sirius::op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN) {
-        left_delim.column_data_scan =
-          &probe_child->Cast<sirius::op::sirius_physical_column_data_scan>();
-      }
-    }
+    auto& left_delim = slot->Cast<sirius::op::sirius_physical_left_delim_join>();
+
+    // LEFT_DELIM_JOIN ownership (#604, mirror of B.5 for RIGHT): tag the bare
+    // DISTINCT so its build_pipelines becomes a no-op. LEFT_DELIM_JOIN::sink
+    // runs `distinct->execute` and `distinct->sink` inline; the bare DISTINCT
+    // contributes nothing to any pipeline.
+    //
+    // The cached chunk scan (`left_delim.column_data_scan`) is already recorded
+    // and flagged in LEFT_DELIM_JOIN's constructor — we can't recover the same
+    // pointer here because wrap_join (which already ran above) replaced
+    // internal_join->children[0] with a CONCAT/PARTITION wrap chain.
+    if (left_delim.distinct) { left_delim.distinct->set_owned_by_delim_join(true); }
   }
 }
 

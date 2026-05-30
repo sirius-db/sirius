@@ -60,8 +60,22 @@ class sirius_physical_column_data_scan : public sirius_physical_operator {
  public:
   bool is_source() const override { return true; }
 
+  //! True when this COLUMN_DATA_SCAN is the cached chunk scan (`column_data_scan`
+  //! field) of a LEFT_DELIM_JOIN. Set in `wrap_delim_join`'s LEFT branch at
+  //! plan-gen time. LEFT_DELIM_JOIN::sink invokes `column_data_scan->execute` and
+  //! `column_data_scan->sink` inline (analogous to RIGHT_DELIM_JOIN's
+  //! partition_join), so this scan never carries pipeline data of its own.
+  //! `build_pipelines` short-circuits when the flag is set, suppressing pipeline
+  //! materialization — mirrors legacy split_delim_join_sink (no standalone
+  //! pipeline for the cached chunk scan).
+  [[nodiscard]] bool is_owned_by_delim_join() const noexcept { return _owned_by_delim_join; }
+  void set_owned_by_delim_join(bool value) noexcept { _owned_by_delim_join = value; }
+
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
+
+ protected:
+  bool _owned_by_delim_join = false;
 };
 
 }  // namespace op

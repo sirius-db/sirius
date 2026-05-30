@@ -1336,12 +1336,33 @@ void sirius_pipeline_converter::compute_repository_wiring_tree_based(
       auto* column_data_scan = left_delim.column_data_scan;
       if (column_data_scan) {
         auto it = dest_for_op.find(column_data_scan);
+        // LEFT_DELIM_JOIN ownership (#604): column_data_scan is owned by the
+        // delim join and executed inline (LEFT_DELIM_JOIN::sink). Under flag ON
+        // its build_pipelines is a no-op, so the direct lookup misses. Fall
+        // back to its tree parent (PARTITION_probe), which carries the
+        // externalized [PARTITION] pipeline that consumes the cached chunk
+        // scan's output. Matches legacy's
+        // `COLUMN_DATA_SCAN (src=DELIM_JOIN) → PARTITION (dst=PARTITION_probe)`.
+        // Use resolve_barrier so the dest type (PARTITION_probe) dictates the
+        // barrier (PARTIAL for probe-side partition, per join-feeder rule).
+        if (it == dest_for_op.end()) {
+          if (auto* parent = column_data_scan->get_parent_op()) { it = dest_for_op.find(parent); }
+        }
         if (it != dest_for_op.end()) {
-          emit("default", op::MemoryBarrierType::FULL, column_data_scan, pipeline, it->second);
+          emit("default",
+               resolve_barrier(*column_data_scan, *it->second),
+               column_data_scan,
+               pipeline,
+               it->second);
         }
       }
       if (distinct_op) {
         auto it = dest_for_op.find(distinct_op);
+        // Same fallback as B.5 for RIGHT: bare DISTINCT has no pipeline of its
+        // own under flag ON, so resolve to its tree parent (PARTITION_distinct).
+        if (it == dest_for_op.end()) {
+          if (auto* parent = distinct_op->get_parent_op()) { it = dest_for_op.find(parent); }
+        }
         if (it != dest_for_op.end()) {
           emit("default", op::MemoryBarrierType::FULL, distinct_op, pipeline, it->second);
         }

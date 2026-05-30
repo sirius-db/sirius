@@ -120,6 +120,17 @@ sirius_physical_left_delim_join::sirius_physical_left_delim_join(
     estimated_cardinality,
     nullptr);
   if (delim_idx.IsValid()) { cached_chunk_scan->cte_index = delim_idx.GetIndex(); }
+
+  // LEFT_DELIM_JOIN ownership wiring (#604): record the cached chunk scan as a
+  // borrow ptr now — wrap_delim_join's LEFT branch can't recover this reference
+  // post-wrap_join because internal_join->children[0] becomes a CONCAT wrapper.
+  // Also tag the scan so its build_pipelines is a no-op: LEFT_DELIM_JOIN::sink
+  // invokes column_data_scan->execute and column_data_scan->sink inline
+  // (analogous to RIGHT_DELIM_JOIN's partition_join), so it never carries
+  // standalone pipeline data.
+  column_data_scan = cached_chunk_scan.get();
+  cached_chunk_scan->set_owned_by_delim_join(true);
+
   join->children[0] = std::move(cached_chunk_scan);
 }
 

@@ -56,6 +56,14 @@ sirius_physical_column_data_scan::sirius_physical_column_data_scan(
 void sirius_physical_column_data_scan::build_pipelines(
   pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
 {
+  // LEFT_DELIM_JOIN ownership short-circuit (#604): when this scan is the cached
+  // chunk scan (`column_data_scan` field) of a LEFT_DELIM_JOIN, the enclosing
+  // delim join executes it inline via its `sink` method. The scan contributes no
+  // pipeline of its own; wiring to its inner-join probe destination is emitted
+  // from the LEFT_DELIM_JOIN sink case in compute_repository_wiring_tree_based
+  // (with a parent_op fallback that lands on PARTITION_probe's pipeline).
+  if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD && _owned_by_delim_join) { return; }
+
   // check if there is any additional action we need to do depending on the type
   auto& state = meta_pipeline.get_state();
   switch (type) {
