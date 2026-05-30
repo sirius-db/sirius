@@ -18,6 +18,7 @@
 
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "op/cudf_sort_order.hpp"
 #include "op/order/gpu_order_impl.hpp"
 #include "sirius/exception.hpp"
 
@@ -60,11 +61,8 @@ std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_dat
     }
     auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().index);
     order_key_idx.push_back(idx);
-    column_order.push_back(ord.type == duckdb::OrderType::ASCENDING ? cudf::order::ASCENDING
-                                                                    : cudf::order::DESCENDING);
-    null_precedence.push_back(ord.null_order == duckdb::OrderByNullType::NULLS_FIRST
-                                ? cudf::null_order::BEFORE
-                                : cudf::null_order::AFTER);
+    column_order.push_back(to_cudf_order(ord.type));
+    null_precedence.push_back(to_cudf_null_order(ord.type, ord.null_order));
   }
 
   std::vector<int> proj_idx(projections.begin(), projections.end());
