@@ -1330,6 +1330,29 @@ void sirius_pipeline_converter::compute_repository_wiring_tree_based(
       continue;
     }
 
+    // B.1' (#604): the distinct chain top of a DELIM_JOIN (MERGE_GROUP_BY) sits
+    // under DELIM_JOIN in the tree, so the uniform tree-parent walk below would
+    // emit `merge_top -> DELIM_JOIN`. Legacy split_delim_join_sink instead
+    // retargets the merged output to each delim_scan's downstream consumer
+    // (the inner-HJ probe partition). Mirror that here. Detection uses the
+    // explicit `_owning_delim_join` back-pointer set in wrap_delim_distinct —
+    // only the distinct_root carries it.
+    if (auto* owning_delim = sink_op->owning_delim_join()) {
+      for (auto& delim_scan_ref : owning_delim->delim_scans) {
+        auto& delim_scan  = delim_scan_ref.get();
+        auto* scan_parent = delim_scan.get_parent_op();
+        if (!scan_parent) { continue; }
+        auto cit = dest_for_op.find(scan_parent);
+        if (cit == dest_for_op.end()) { continue; }
+        emit(resolve_port_id(*sink_op, *scan_parent),
+             resolve_barrier(*sink_op, *cit->second),
+             sink_op,
+             pipeline,
+             cit->second);
+      }
+      continue;
+    }
+
     // Uniform tree-parent lookup for everything else.
     auto* parent_op = sink_op->get_parent_op();
     if (!parent_op) { continue; }

@@ -421,6 +421,13 @@ void wrap_delim_distinct(sirius::op::sirius_physical_delim_join& delim_base,
     duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate_merge>(original_agg_ptr);
   merge->children.push_back(std::move(partition));
 
+  // B.1' (#604): tag the chain top with the owning DELIM_JOIN so
+  // compute_repository_wiring_tree_based can redirect its tree-parent wiring
+  // (which would otherwise emit merge_top -> DELIM_JOIN) to each delim_scan's
+  // consumer pipeline. Mirrors legacy split_delim_join_sink's retarget at
+  // sirius_pipeline_converter.cpp:849-852.
+  merge->set_owning_delim_join(&delim_base);
+
   delim_base.distinct_root = std::move(merge);
   // delim_base.distinct stays valid: the original DISTINCT object never relocates, only its
   // owning slot moves from delim_base.distinct_root down through the chain.

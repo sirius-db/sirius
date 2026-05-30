@@ -42,6 +42,7 @@ struct batch_telemetry_info;
 
 namespace op {
 class sirius_physical_operator;
+class sirius_physical_delim_join;
 }  // namespace op
 
 namespace pipeline {
@@ -386,6 +387,22 @@ class sirius_physical_operator {
   //! plan generation completes; used by the pipeline converter and tree-based wiring lookup.
   [[nodiscard]] sirius_physical_operator* get_parent_op() const noexcept { return _parent_op; }
 
+  //! Non-owning pointer to the DELIM_JOIN that owns this operator's execution, or nullptr if
+  //! the operator is not part of a DELIM_JOIN subtree. Set on the distinct chain top
+  //! (MERGE_GROUP_BY) by `wrap_delim_distinct` under USE_TREE_BASED_PIPELINE_BUILD. Used by
+  //! `compute_repository_wiring_tree_based` to redirect the merge-top -> DELIM_JOIN edge that
+  //! the uniform tree-parent walk would otherwise emit, routing instead to each
+  //! `delim_scan`'s consumer pipeline. Mirrors legacy `split_delim_join_sink`'s retarget loop.
+  [[nodiscard]] sirius_physical_delim_join* owning_delim_join() const noexcept
+  {
+    return _owning_delim_join;
+  }
+  //! Set by `wrap_delim_distinct` at plan-gen time; not intended to be mutated post-plan-gen.
+  void set_owning_delim_join(sirius_physical_delim_join* delim) noexcept
+  {
+    _owning_delim_join = delim;
+  }
+
   virtual bool equals(const sirius_physical_operator& other) const { return false; }
 
   virtual void verify();
@@ -597,6 +614,10 @@ class sirius_physical_operator {
   //! derived constructors during the legacy converter-driven construction path. nullptr at the
   //! root and on operators that have not yet been linked into a tree.
   sirius_physical_operator* _parent_op = nullptr;
+  //! The DELIM_JOIN that this operator is logically owned by, or nullptr if none. Currently
+  //! set only on the distinct chain top (MERGE_GROUP_BY) of a DELIM_JOIN by
+  //! `wrap_delim_distinct` under USE_TREE_BASED_PIPELINE_BUILD. See `owning_delim_join()`.
+  sirius_physical_delim_join* _owning_delim_join = nullptr;
 
  private:
   //! Mutate the parent pointer. Restricted to `sirius_physical_plan_generator` so parent

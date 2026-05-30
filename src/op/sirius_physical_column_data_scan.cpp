@@ -72,14 +72,17 @@ void sirius_physical_column_data_scan::build_pipelines(
       auto& delim_join = delim_sink->Cast<sirius_physical_delim_join>();
       current.add_dependency(delim_dependency);
       if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
-        // Phase 3.2 (#604): source is derived from operators[0] post-reverse, so
-        // append the chain top to operators[] rather than only setting source.
-        // distinct_root holds MERGE_DISTINCT after wrap_delim_distinct under flag ON
-        // — feeding the delim_scan from the merged output, not the per-thread
-        // DISTINCT collections. compute_repository_wiring_tree_based resolves the
-        // upstream wiring via the tree-parent walk through the chain.
+        // B.1' (#604): DELIM_SCAN is routing-only under flag ON (mirrors CTE_SCAN
+        // post-Phase A). The distinct chain top carries `_owning_delim_join`,
+        // which redirects the uniform tree-parent walk in
+        // compute_repository_wiring_tree_based to wire the merge-top into each
+        // delim_scan's consumer pipeline (inner-HJ probe partition) instead of
+        // the DELIM_JOIN itself — mirrors legacy split_delim_join_sink's
+        // retarget loop. `is_ready` overwrites this pipeline's source to
+        // operators[0] = PARTITION (the inner-HJ probe partition that `current`
+        // was created with), so we don't append anything to operators[] here.
         D_ASSERT(delim_join.distinct_root);
-        state.add_pipeline_operator(current, *delim_join.distinct_root);
+        (void)delim_join;
       } else {
         // Flag OFF: legacy converter externalizes the chain and retargets downstream
         // sources from the bare DISTINCT to merge_distinct. Set the source to the
