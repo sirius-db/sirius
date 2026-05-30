@@ -376,7 +376,7 @@ TEST_CASE("sirius_config carries object_store_config and defaults keep S3 disabl
 }
 
 TEST_CASE("sirius_scan_manager wires S3 ioctx cache and serves repeated host reads from it",
-          "[s3][scan_manager][cache][integration]")
+          "[.][s3][integration][scan_manager][cache]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -419,7 +419,7 @@ TEST_CASE("sirius_scan_manager wires S3 ioctx cache and serves repeated host rea
 }
 
 TEST_CASE("sirius_scan_manager leaves S3 ioctx cache disabled when prefetch cache is off",
-          "[s3][scan_manager][cache]")
+          "[.][s3][integration][scan_manager][cache]")
 {
   auto env = read_s3_test_env();
   if (!env) {

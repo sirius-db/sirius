@@ -67,7 +67,8 @@ duckdb::unique_ptr<op::sirius_physical_operator> construct_sirius_specific_opera
   if (physical_op.type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
     auto& scan_physical_op = physical_op.Cast<op::sirius_physical_table_scan>();
     if (scan_physical_op.function.name == "parquet_scan" ||
-        scan_physical_op.function.name == "read_parquet") {
+        scan_physical_op.function.name == "read_parquet" ||
+        scan_physical_op.function.name == "sirius_read_parquet") {
       return duckdb::make_uniq<op::sirius_physical_parquet_scan>(&scan_physical_op);
     } else if (scan_physical_op.function.name == "iceberg_scan") {
       if (!iceberg_cache) {
@@ -239,28 +240,42 @@ void sirius_pipeline_converter::insert_parquet_scan_operator(
 {
   auto& scan_op = current_pipeline->get_source()->Cast<op::sirius_physical_table_scan>();
 
-  // Extract file paths from the DuckDB scan's bind data.
-  auto const& bind_data = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
-  if (!bind_data.file_list || bind_data.file_list->IsEmpty()) {
-    throw std::runtime_error(
-      "[sirius_pipeline_converter::insert_parquet_scan_operator] No input files to scan");
-  }
-  std::vector<std::string> file_paths;
-  for (auto const& file : bind_data.file_list->GetAllFiles()) {
-    file_paths.push_back(file.path);
-  }
-  auto const& partition_indices = bind_data.reader_bind.hive_partitioning_indexes;
+  auto scan_info            = std::make_unique<op::scan::parquet_scan_info>();
+  scan_info->returned_types = scan_op.returned_types;
+  scan_info->column_ids     = scan_op.column_ids;
+  scan_info->projection_ids = scan_op.projection_ids;
+  scan_info->names          = scan_op.names;
+  scan_info->table_filters  = std::move(scan_op.table_filters);
 
-  auto scan_info                    = std::make_unique<op::scan::parquet_scan_info>();
-  scan_info->returned_types         = scan_op.returned_types;
-  scan_info->file_paths             = std::move(file_paths);
-  scan_info->column_ids             = scan_op.column_ids;
-  scan_info->projection_ids         = scan_op.projection_ids;
-  scan_info->names                  = scan_op.names;
-  scan_info->table_filters          = std::move(scan_op.table_filters);
-  scan_info->partition_indices      = partition_indices;
+  if (scan_op.function.name == "sirius_read_parquet") {
+    // Sirius-owned S3 table function: the single URI lives in parameters[0]
+    // (its bind returns no MultiFileBindData). No hive partitioning on the S3
+    // single-file path, so partition_indices is left empty.
+    if (scan_op.parameters.empty() || scan_op.parameters.front().IsNull()) {
+      throw std::runtime_error(
+        "[sirius_pipeline_converter::insert_parquet_scan_operator] sirius_read_parquet scan "
+        "has no URI parameter");
+    }
+    scan_info->file_paths = {scan_op.parameters.front().GetValue<std::string>()};
+  } else {
+    // Native read_parquet / parquet_scan: file paths come from MultiFileBindData.
+    auto const& bind_data = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
+    if (!bind_data.file_list || bind_data.file_list->IsEmpty()) {
+      throw std::runtime_error(
+        "[sirius_pipeline_converter::insert_parquet_scan_operator] No input files to scan");
+    }
+    std::vector<std::string> file_paths;
+    for (auto const& file : bind_data.file_list->GetAllFiles()) {
+      file_paths.push_back(file.path);
+    }
+    scan_info->file_paths        = std::move(file_paths);
+    scan_info->partition_indices = bind_data.reader_bind.hive_partitioning_indexes;
+  }
+  // upstream #749's polymorphic scan_info requires scan_output_arity (consumed by
+  // scan_info::make_provider). sql-surface's branch above didn't set it.
+  scan_info->scan_output_arity = scan_op.types.size();
+  // upstream #792 added approximate_batch_size, driven by operator_params.
   scan_info->approximate_batch_size = op_params_.scan_task_batch_size;
-  scan_info->scan_output_arity      = scan_op.types.size();
 
   auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_parquet_scan_operator>(
     scan_op.types, scan_op.estimated_cardinality, std::move(scan_info));
@@ -360,7 +375,8 @@ void sirius_pipeline_converter::split_table_scan_source(
 
   auto& scan_op = current_pipeline->get_source()->Cast<op::sirius_physical_table_scan>();
   // If parquet scan, route to metadata scan + gpu scan operator pipeline
-  if (scan_op.function.name == "parquet_scan" || scan_op.function.name == "read_parquet") {
+  if (scan_op.function.name == "parquet_scan" || scan_op.function.name == "read_parquet" ||
+      scan_op.function.name == "sirius_read_parquet") {
     insert_parquet_scan_operator(current_pipeline);
     return;
   }
@@ -1262,7 +1278,7 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
       } else if (first_op.type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
         const auto& scan_name = first_op.Cast<op::sirius_physical_table_scan>().function.name;
         if (scan_name != "seq_scan" && scan_name != "parquet_scan" && scan_name != "read_parquet" &&
-            scan_name != "iceberg_scan") {
+            scan_name != "sirius_read_parquet" && scan_name != "iceberg_scan") {
           throw std::runtime_error("Unsupported scan function: " + scan_name);
         }
         // Scans have "scan" port

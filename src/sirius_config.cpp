@@ -94,6 +94,18 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("prefetch_inflight_budget_chunks",
              opt.prefetch_inflight_budget_chunks,
              yaml::greater_than<std::size_t>{0});
+  r.optional("enable_chunk_prewarm", opt.enable_chunk_prewarm);
+  r.reject_unknown();
+}
+
+static void from_yaml(const YAML::Node& node, sirius::io::object_store_config& opt)
+{
+  yaml::reader r(node, "object_store_config");
+  r.optional("endpoint", opt.endpoint);
+  r.optional("region", opt.region);
+  r.optional("access_key", opt.access_key);
+  r.optional("secret_key", opt.secret_key);
+  r.optional("s3_transport", opt.s3_transport);
   r.reject_unknown();
 }
 
@@ -364,6 +376,11 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
 
     // Operator params
     if (auto n = r.optional_node("operator_params")) { sirius::from_yaml(*n, _operator_params); }
+
+    // Object store (S3) config — endpoint / credentials for the s3:// datasource.
+    if (auto n = r.optional_node("object_store_config")) {
+      sirius::from_yaml(*n, object_store_config);
+    }
 
     // Telemetry
     if (auto n = r.optional_node("telemetry")) { sirius::from_yaml(*n, _telemetry_config); }

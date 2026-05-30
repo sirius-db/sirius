@@ -296,6 +296,18 @@ class s3_ioctx final : public sirius_ioctx {
     return _bytes_read_total.load(std::memory_order_relaxed);
   }
 
+  /// Cumulative count of successful FSMR block borrows performed by
+  /// @c device_read_io since construction. Each successful
+  /// @c allocate_multiple_blocks on the FSMR-staged path increments by one;
+  /// the vector-fallback path (no caller-supplied FSMR) does not contribute.
+  /// Failed allocations (out-of-memory etc.) are not counted. Intended for
+  /// tests asserting that F1's chunked-staging path is exercised at SQL
+  /// scale.
+  [[nodiscard]] std::uint64_t fsmr_borrows_total() const noexcept
+  {
+    return _fsmr_borrows_total.load(std::memory_order_relaxed);
+  }
+
  private:
   struct handle_slot;
 
@@ -361,6 +373,10 @@ class s3_ioctx final : public sirius_ioctx {
   /// See @c bytes_read_total(). Updated only inside @c range_get on the
   /// success-return path (HTTP 206 / 200 with validated body length).
   std::atomic<std::uint64_t> _bytes_read_total{0};
+
+  /// See @c fsmr_borrows_total(). Updated only on the FSMR-staged branch of
+  /// @c device_read_io, after @c allocate_multiple_blocks succeeds.
+  std::atomic<std::uint64_t> _fsmr_borrows_total{0};
 };
 
 }  // namespace sirius::io::s3
