@@ -123,18 +123,30 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
   }
 
  public:
+  //! True when this NLJ is the internal `delim.join` of a RIGHT_DELIM_JOIN. See the
+  //! identical field on `sirius_physical_hash_join` for the full rationale; set in
+  //! `sirius_physical_right_delim_join`'s constructor.
+  [[nodiscard]] bool is_delim_join_inner() const noexcept { return _is_delim_join_inner; }
+  void set_delim_join_inner(bool value) noexcept { _is_delim_join_inner = value; }
+
   // Sink Interface
   //! Under flag OFF: unconditional sink (legacy converter rewrites the chain). Under flag
-  //! ON: sink only when this NLJ's tree parent is a PARTITION (the nested-join case).
-  //! Mirrors HJ's behavior.
+  //! ON: never a sink when this NLJ is the inner join of a RIGHT_DELIM_JOIN
+  //! (`_is_delim_join_inner` short-circuits to `false`); otherwise delegates to the base
+  //! rule (sink iff parent is PARTITION or RIGHT_DELIM_JOIN). Mirrors HJ's behavior.
   bool is_sink() const override
   {
     if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
-      return _parent_op != nullptr && _parent_op->type == SiriusPhysicalOperatorType::PARTITION;
+      if (_is_delim_join_inner) { return false; }
+      return sirius_physical_operator::is_sink();
     }
     return true;
   }
 
+ protected:
+  bool _is_delim_join_inner = false;
+
+ public:
   static bool is_supported(const duckdb::vector<sirius::join_condition>& conditions,
                            duckdb::JoinType join_type);
 

@@ -21,6 +21,7 @@
 #include "op/sirius_physical_dummy_scan.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
+#include "op/sirius_physical_nested_loop_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
@@ -71,6 +72,19 @@ sirius_physical_right_delim_join::sirius_physical_right_delim_join(
                                delim_idx)
 {
   D_ASSERT(join->children.size() == 2);
+
+  // B.2 (#604): the inner join becomes the `delim.join` of this RIGHT_DELIM_JOIN —
+  // owned by us, executed inline by our `sink()`, and never a standalone pipeline
+  // sink. Tag it explicitly so the join's `is_sink()` and (future) build-side
+  // externalization gate skip the rule that would otherwise treat it as one.
+  // Scoped to RIGHT_DELIM_JOIN only; LEFT_DELIM_JOIN's inner join feeds a real
+  // build subtree and must keep standard externalization.
+  if (auto* hj = dynamic_cast<sirius_physical_hash_join*>(join.get())) {
+    hj->set_delim_join_inner(true);
+  } else if (auto* nlj = dynamic_cast<sirius_physical_nested_loop_join*>(join.get())) {
+    nlj->set_delim_join_inner(true);
+  }
+
   children.push_back(std::move(join->children[1]));
 
   join->children[1] =

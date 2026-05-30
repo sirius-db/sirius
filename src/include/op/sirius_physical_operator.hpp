@@ -454,18 +454,23 @@ class sirius_physical_operator {
   // Sink interface
   virtual void sink(const operator_data& input_data, rmm::cuda_stream_view stream);
 
-  //! Under flag ON: an operator is a pipeline sink iff its tree parent is a PARTITION
-  //! (the operator that produces data flowing into PARTITION terminates the upstream
-  //! pipeline at itself). Computed dynamically from `_parent_op` so it always reflects
-  //! the final tree shape — no state to maintain. Derived classes that are
-  //! unconditionally sinks (HGB, ORDER_BY, all MERGE operators, DUCKDB_SCAN, etc.)
-  //! override this to return `true` regardless of parent.
+  //! Under flag ON: an operator is a pipeline sink iff its tree parent is a PARTITION or
+  //! a RIGHT_DELIM_JOIN (the operator that produces data flowing into either terminates
+  //! the upstream pipeline at itself; for RIGHT_DELIM_JOIN, the LHS source is its single
+  //! standalone-pipeline producer, matching legacy split_delim_join_sink). Computed
+  //! dynamically from `_parent_op` so it always reflects the final tree shape — no state
+  //! to maintain. Derived classes that are unconditionally sinks (HGB, ORDER_BY, all MERGE
+  //! operators, DUCKDB_SCAN, etc.) override this to return `true` regardless of parent.
+  //! HJ/NLJ that are the `delim.join` of a DELIM_JOIN override this to return `false`
+  //! (they're never standalone sinks) — see `_is_delim_join_inner`.
   //! Under flag OFF: returns false; the legacy converter owns sink semantics via its
   //! own derived-class overrides.
   virtual bool is_sink() const
   {
     if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
-      return _parent_op != nullptr && _parent_op->type == SiriusPhysicalOperatorType::PARTITION;
+      return _parent_op != nullptr &&
+             (_parent_op->type == SiriusPhysicalOperatorType::PARTITION ||
+              _parent_op->type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
     }
     return false;
   }

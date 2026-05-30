@@ -278,21 +278,39 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
                                    std::size_t partition_idx) override;
 
  public:
+  //! True when this HJ is the internal `delim.join` of a RIGHT_DELIM_JOIN — i.e. its
+  //! execution is owned by the enclosing delim join and it shares a pipeline with its
+  //! lexical sibling sink (PROJECTION) rather than being a standalone pipeline boundary.
+  //! Set in `sirius_physical_right_delim_join`'s constructor; never mutated afterward.
+  //! Consumed by `is_sink()` (to suppress the standalone-sink behavior the base rule
+  //! would otherwise give for a join with `parent_op->type == RIGHT_DELIM_JOIN`) and by
+  //! `build_join_pipelines` (to gate build-side externalization for the synthetic
+  //! DUMMY_SCAN under the inner HJ's build subtree — see B.3+B.4+B.6).
+  [[nodiscard]] bool is_delim_join_inner() const noexcept { return _is_delim_join_inner; }
+  void set_delim_join_inner(bool value) noexcept { _is_delim_join_inner = value; }
+
   // Sink Interface
   //! Under flag OFF: HJ is unconditionally a sink (legacy converter expectation — the
   //! legacy split_join_sink rewrites the HJ chain into source-partition-concat-sink shape).
-  //! Under flag ON: HJ is a sink only when its tree parent is a PARTITION — i.e. this is
-  //! an inner HJ feeding into a wrap chain on its consumer side. Otherwise HJ is a pure
-  //! source feeding into downstream chain operators (e.g. HJ_top → PROJ → HGB).
+  //! Under flag ON: HJ is never a sink when it's the inner join of a RIGHT_DELIM_JOIN
+  //! (`_is_delim_join_inner` short-circuits to `false` — its sibling PROJECTION carries
+  //! the pipeline). Otherwise it delegates to the base rule, which makes HJ a sink iff
+  //! `parent_op->type` is PARTITION or RIGHT_DELIM_JOIN. For non-delim HJs the latter
+  //! case is unreachable (HJ is never positioned directly under RIGHT_DELIM_JOIN except
+  //! as `delim.join`, which is short-circuited above).
   bool is_sink() const override
   {
     if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
-      return _parent_op != nullptr && _parent_op->type == SiriusPhysicalOperatorType::PARTITION;
+      if (_is_delim_join_inner) { return false; }
+      return sirius_physical_operator::is_sink();
     }
     return true;
   }
 
   void on_finalize_operator() override;
+
+ protected:
+  bool _is_delim_join_inner = false;
 };
 
 }  // namespace op

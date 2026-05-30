@@ -134,7 +134,17 @@ void sirius_physical_column_data_scan::build_pipelines(
   }
   D_ASSERT(children.empty());
   if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
-    state.add_pipeline_operator(current, *this);
+    // B.2 (#604): a leaf scan whose tree parent is RIGHT_DELIM_JOIN (or PARTITION) is
+    // a pipeline sink — give it its own single-op pipeline rather than absorbing it
+    // into `current`'s operators[]. Mirrors the leaf-sink branch in
+    // sirius_physical_operator::build_pipelines; we need to replicate the check here
+    // because this override exists to handle the DELIM_SCAN/CTE_SCAN special cases
+    // above and would otherwise unconditionally add to the current pipeline.
+    if (is_sink()) {
+      meta_pipeline.create_child_meta_pipeline(current, *this);
+    } else {
+      state.add_pipeline_operator(current, *this);
+    }
   } else {
     state.set_pipeline_source(current, *this);
   }
