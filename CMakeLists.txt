@@ -524,6 +524,24 @@ endif()
 
 add_executable(sirius_unittest ${TEST_SOURCES})
 
+# TPC-DS integration test fixture, generated at build time (opt-in target). The
+# database is not committed; run `cmake --build . --target tpcds-fixture` once
+# before the TPC-DS integration tests. Requires the duckdb CLI (or python3 with
+# the duckdb module) on PATH; both are provided by the pixi environment.
+set(TPCDS_FIXTURE_DIR ${CMAKE_BINARY_DIR}/test-fixtures)
+set(TPCDS_FIXTURE ${TPCDS_FIXTURE_DIR}/tpcds.duckdb)
+set(TPCDS_FIXTURE_SCRIPT
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/integration/data/duckdb/generate_tpcds_duckdb.sh
+)
+add_custom_command(
+  OUTPUT ${TPCDS_FIXTURE}
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${TPCDS_FIXTURE_DIR}
+  COMMAND bash ${TPCDS_FIXTURE_SCRIPT} ${TPCDS_FIXTURE}
+  DEPENDS ${TPCDS_FIXTURE_SCRIPT}
+  COMMENT "Generating TPC-DS test fixture (SF 0.01) at ${TPCDS_FIXTURE}"
+  VERBATIM)
+add_custom_target(tpcds-fixture DEPENDS ${TPCDS_FIXTURE})
+
 if(VCPKG_BUILD)
   set_target_properties(sirius_unittest PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
   target_include_directories(sirius_unittest BEFORE PRIVATE ${_VCPKG_INC})
