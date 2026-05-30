@@ -317,7 +317,7 @@ TEST_CASE("parquet_split_provider routes pure local batches through scan_manager
 }
 
 TEST_CASE("parquet_split_provider routes pure S3 batches through scan_manager S3 backend",
-          "[scan_manager][parquet_split_provider][s3][integration]")
+          "[.][s3][integration][scan_manager][parquet_split_provider]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -343,7 +343,7 @@ TEST_CASE("parquet_split_provider routes pure S3 batches through scan_manager S3
 }
 
 TEST_CASE("parquet_split_provider dispatches mixed local and S3 batches per path",
-          "[scan_manager][parquet_split_provider][s3][integration]")
+          "[.][s3][integration][scan_manager][parquet_split_provider]")
 {
   auto env = read_s3_test_env();
   if (!env) {

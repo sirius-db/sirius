@@ -369,6 +369,12 @@ void prefetching_cache::abort_pending_entries() noexcept
 std::shared_ptr<cache_entry> prefetching_cache::find_entry(
   const std::vector<std::shared_ptr<cache_entry>>& entries, size_t offset, size_t size)
 {
+  // Pure classification: returns the entry that fully covers
+  // [offset, offset+size) or nullptr otherwise. Counter classification is
+  // the caller's job (read / read_ranges bump _range_miss_count on null
+  // returns) so the three flavors of "no-covering-entry" — no entry below
+  // offset, candidate ends before offset, candidate overlaps but doesn't
+  // fully contain — all share the _range_miss_count bucket from the caller.
   // upper_bound: first entry whose offset > requested offset.  The candidate
   // is pos-1 (the last entry whose offset <= requested offset).
   auto pos =
@@ -377,24 +383,15 @@ std::shared_ptr<cache_entry> prefetching_cache::find_entry(
     });
 
   // No entry starts at or before our offset — nothing covers us.
-  if (pos == entries.begin()) {
-    _full_miss_count.fetch_add(1, std::memory_order_relaxed);
-    return nullptr;
-  }
+  if (pos == entries.begin()) { return nullptr; }
   --pos;
   auto entry_end = static_cast<size_t>((*pos)->logical_range.offset()) +
                    static_cast<size_t>((*pos)->logical_range.size());
 
   // Candidate ends before our offset — no overlap at all.
-  if (entry_end <= offset) {
-    _full_miss_count.fetch_add(1, std::memory_order_relaxed);
-    return nullptr;
-  }
+  if (entry_end <= offset) { return nullptr; }
   // Candidate overlaps but doesn't fully contain the requested tail.
-  if (offset + size > entry_end) {
-    _partial_miss_count.fetch_add(1, std::memory_order_relaxed);
-    return nullptr;
-  }
+  if (offset + size > entry_end) { return nullptr; }
   return *pos;
 }
 
@@ -516,7 +513,10 @@ pinned_view prefetching_cache::read(const sirius_io_object& obj,
   map_lk.unlock();
 
   auto entry = find_entry(file.entries, offset, size);
-  if (!entry) return {};
+  if (!entry) {
+    _range_miss_count.fetch_add(1, std::memory_order_relaxed);
+    return {};
+  }
 
   // Dispatch on state:
   //   cached / in_use  → pin immediately (stamps consumption_ts).
@@ -585,6 +585,7 @@ std::vector<pinned_view> prefetching_cache::read_ranges(
     auto entry =
       find_entry(file.entries, static_cast<size_t>(r.offset()), static_cast<size_t>(r.size()));
     if (!entry) {
+      _range_miss_count.fetch_add(1, std::memory_order_relaxed);
       result.emplace_back();
       continue;
     }

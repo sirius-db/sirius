@@ -29,6 +29,8 @@
 
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <duckdb/common/types.hpp>
+#include <duckdb/common/vector.hpp>
 #include <io/types.hpp>
 
 namespace cucascade::memory {
@@ -90,6 +92,14 @@ struct scan_manager_config {
   /// control).  Ignored when @c enable_prefetch_cache is false.
   std::size_t prefetch_inflight_budget_chunks{2048};
 
+  /// When true (default — current behavior), parquet_split_provider prewarms
+  /// per-row-group column-chunk byte ranges via @c cache->insert(obj,
+  /// metadata, ranges).  When false, prewarm is skipped: insert is called
+  /// with empty ranges (metadata-only, as in §24 describe_parquet).  Lets
+  /// the B1 micro-bench A/B compare prefetch overlap on SF10.  Ignored when
+  /// @c enable_prefetch_cache is false (no cache → no prewarm regardless).
+  bool enable_chunk_prewarm{true};
+
   /// S3 backend opt-in. When set, SiriusContext (S6) constructs an @c s3_ioctx
   /// from these credentials/knobs and hands it to the scan_manager as a borrowed
   /// backend (the scan_manager itself constructs nothing). Default construction
@@ -150,6 +160,20 @@ struct pinned_entry {
   /// because a subsequent full scan of the same file paths would silently
   /// return only the pinned prefix.
   bool is_partial{false};
+};
+
+/**
+ * @brief Bind-time result of @ref sirius_scan_manager::describe_parquet.
+ *
+ * Carries the column types and names a parquet file's footer yields, ready to
+ * be copied into a DuckDB table function's bind out-parameters, plus the total
+ * object size in bytes.
+ */
+struct parquet_bind_result {
+  duckdb::vector<duckdb::LogicalType> return_types;
+  duckdb::vector<std::string> names;
+  std::size_t object_size{0};
+  std::size_t total_num_rows{0};
 };
 
 /**
@@ -324,6 +348,28 @@ class sirius_scan_manager {
   ///        when no backend supports @p path.
   [[nodiscard]] std::shared_ptr<sirius::io::sirius_ioctx> io_ctx_shared_for(
     std::string_view path) const noexcept;
+
+  /// \brief Whether parquet_split_provider should prewarm column-chunk byte
+  /// ranges via @c cache->insert(obj, metadata, ranges). Mirrors
+  /// @c scan_manager_config::enable_chunk_prewarm. False disables the
+  /// prewarm (insert is called with empty ranges — metadata-only, §24
+  /// describe_parquet shape), letting B1 micro-bench A/B prefetch overlap.
+  [[nodiscard]] bool chunk_prewarm_enabled() const noexcept { return _config.enable_chunk_prewarm; }
+
+  /// \brief Probe a parquet file's schema for the SQL bind path.
+  ///
+  /// Resolves @p uri to a backend via @c io_ctx_for, fetches only the parquet
+  /// footer (no full-file download), and infers the column types and names.
+  /// When the resolved backend has a prefetch cache, the parsed footer is
+  /// inserted as metadata-only so a subsequent scan reuses it instead of
+  /// fetching and parsing the footer a second time.
+  ///
+  /// This is the C++ entry point behind the @c sirius_read_parquet table
+  /// function's bind callback.
+  ///
+  /// \throws std::runtime_error when no backend supports @p uri, or when the
+  ///         footer fetch / schema inference fails.
+  [[nodiscard]] parquet_bind_result describe_parquet(std::string const& uri);
 
  private:
   /// \brief Build a split_provider for @p op by reading its scan_info.

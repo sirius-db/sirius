@@ -530,6 +530,16 @@ scripted_http_response range_ok(std::string body, std::size_t object_size)
     std::move(body)};
 }
 
+scripted_http_response range_ok_at(std::string body, std::size_t offset, std::size_t object_size)
+{
+  auto const end = offset + (body.empty() ? 0 : body.size() - 1);
+  return scripted_http_response{206,
+                                "Partial Content",
+                                {"Content-Range: bytes " + std::to_string(offset) + "-" +
+                                 std::to_string(end) + "/" + std::to_string(object_size)},
+                                std::move(body)};
+}
+
 scripted_http_response head_ok(std::size_t object_size)
 {
   return scripted_http_response{200, "OK", {"Content-Length: " + std::to_string(object_size)}, ""};
@@ -952,8 +962,105 @@ TEST_CASE("s3_ioctx retry backoff timing stays within tolerance", "[s3][ioctx][r
   CHECK(server.request_count() == 2);
 }
 
+TEST_CASE("s3_ioctx host_read_ranges short-circuits EOF-only ranges before presigning",
+          "[s3][ioctx]")
+{
+  auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
+  auto ctx      = std::make_shared<s3_ioctx>(s3_ioctx_config{provider, 1, 1});
+  auto obj      = make_s3_object("bucket", "object.bin", 100);
+
+  std::vector<std::byte> a(1);
+  std::vector<std::byte> b(1);
+  std::vector<cudf::io::text::byte_range_info> ranges{{100, 16}, {128, 32}};
+  std::vector<cudf::host_span<std::byte>> dst{{a.data(), a.size()}, {b.data(), b.size()}};
+
+  auto [bytes, ep] = read_ranges_async(*ctx, *obj, ranges, std::span{dst});
+
+  CHECK(bytes == 0);
+  CHECK(ep == nullptr);
+  CHECK(provider->call_count() == 0);
+  CHECK(provider->get_count() == 0);
+}
+
+TEST_CASE("s3_ioctx host_read_ranges validates dst against EOF-clipped sizes before presigning",
+          "[s3][ioctx]")
+{
+  auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
+  auto ctx      = std::make_shared<s3_ioctx>(s3_ioctx_config{provider, 1, 1});
+  auto obj      = make_s3_object("bucket", "object.bin", 100);
+
+  std::vector<std::byte> dst_bytes(3);
+  std::vector<cudf::io::text::byte_range_info> ranges{{96, 16}};
+  std::vector<cudf::host_span<std::byte>> dst{{dst_bytes.data(), dst_bytes.size()}};
+
+  auto [bytes, ep] = read_ranges_async(*ctx, *obj, ranges, std::span{dst});
+
+  CHECK(bytes == 0);
+  REQUIRE(ep != nullptr);
+  CHECK_THROWS_WITH(std::rethrow_exception(ep), "s3_ioctx::host_read_ranges: dst span too small");
+  CHECK(provider->call_count() == 0);
+  CHECK(provider->get_count() == 0);
+}
+
+TEST_CASE("s3_ioctx host_read_ranges reads the clipped EOF-crossing byte count", "[s3][ioctx]")
+{
+  scripted_http_server server({range_ok_at("tail", 96, 100)});
+  auto provider = std::make_shared<mock_credential_provider>(server.url());
+  auto ctx      = std::make_shared<s3_ioctx>(s3_ioctx_config{provider, 1, 1});
+  auto obj      = make_s3_object("bucket", "object.bin", 100);
+
+  std::vector<std::byte> dst_bytes(4);
+  std::vector<cudf::io::text::byte_range_info> ranges{{96, 16}};
+  std::vector<cudf::host_span<std::byte>> dst{{dst_bytes.data(), dst_bytes.size()}};
+
+  auto [bytes, ep] = read_ranges_async(*ctx, *obj, ranges, std::span{dst});
+
+  CHECK(ep == nullptr);
+  CHECK(bytes == 4);
+  CHECK(provider->get_count() == 1);
+  CHECK(server.request_count() == 1);
+  CHECK(std::string(reinterpret_cast<char const*>(dst_bytes.data()), dst_bytes.size()) == "tail");
+}
+
+TEST_CASE("s3_ioctx host_read_ranges_async_io reports validation errors asynchronously",
+          "[s3][ioctx]")
+{
+  auto exercise = [](sirius::exec::static_thread_pool* pool) {
+    auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
+    s3_ioctx_config cfg{provider, 1, 1};
+    cfg.async_thread_pool = pool;
+    auto ctx              = std::make_shared<s3_ioctx>(std::move(cfg));
+    auto obj              = make_s3_object("bucket", "object.bin", 100);
+
+    std::vector<std::byte> dst_bytes(3);
+    std::vector<cudf::io::text::byte_range_info> ranges{{96, 16}};
+    std::vector<cudf::host_span<std::byte>> dst{{dst_bytes.data(), dst_bytes.size()}};
+    std::promise<async_read_result> done;
+    auto fut = done.get_future();
+
+    REQUIRE_NOTHROW(ctx->host_read_ranges_async_io(
+      *obj, ranges, std::span{dst}, [&done](auto bytes, auto ep) { done.set_value({bytes, ep}); }));
+    REQUIRE(fut.wait_for(5s) == std::future_status::ready);
+
+    auto [bytes, ep] = fut.get();
+    CHECK(bytes == 0);
+    REQUIRE(ep != nullptr);
+    CHECK_THROWS_WITH(std::rethrow_exception(ep), "s3_ioctx::host_read_ranges: dst span too small");
+    CHECK(provider->call_count() == 0);
+    CHECK(provider->get_count() == 0);
+  };
+
+  SECTION("no injected pool") { exercise(nullptr); }
+
+  SECTION("injected pool")
+  {
+    sirius::exec::static_thread_pool pool(1, "s3err");
+    exercise(&pool);
+  }
+}
+
 TEST_CASE("s3_ioctx reads single objects from MinIO with presigned range GETs",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -985,7 +1092,7 @@ TEST_CASE("s3_ioctx reads single objects from MinIO with presigned range GETs",
 }
 
 TEST_CASE("s3_ioctx create_io_object populates S3 object metadata from MinIO",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1011,7 +1118,7 @@ TEST_CASE("s3_ioctx create_io_object populates S3 object metadata from MinIO",
 }
 
 TEST_CASE("s3_ioctx create_io_object propagates missing S3 key HEAD failures",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1023,7 +1130,7 @@ TEST_CASE("s3_ioctx create_io_object propagates missing S3 key HEAD failures",
   CHECK_THROWS(ctx->create_io_object(s3_uri(env->bucket, "nonexistent-key-xyz")));
 }
 
-TEST_CASE("s3_ioctx reads multiple MinIO byte ranges", "[s3][ioctx][integration]")
+TEST_CASE("s3_ioctx reads multiple MinIO byte ranges", "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1068,7 +1175,7 @@ TEST_CASE("s3_ioctx reads multiple MinIO byte ranges", "[s3][ioctx][integration]
 }
 
 TEST_CASE("s3_ioctx async range reads copy caller span descriptors before dispatch",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1126,7 +1233,7 @@ TEST_CASE("s3_ioctx async range reads copy caller span descriptors before dispat
 }
 
 TEST_CASE("s3_ioctx host_read_ranges clips EOF-crossing range before dst validation",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1157,7 +1264,7 @@ TEST_CASE("s3_ioctx host_read_ranges clips EOF-crossing range before dst validat
 }
 
 TEST_CASE("s3_ioctx host_read_ranges returns zero for ranges starting at EOF",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1185,7 +1292,7 @@ TEST_CASE("s3_ioctx host_read_ranges returns zero for ranges starting at EOF",
 }
 
 TEST_CASE("s3_ioctx host_read_ranges rejects dst smaller than clipped size",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1216,7 +1323,7 @@ TEST_CASE("s3_ioctx host_read_ranges rejects dst smaller than clipped size",
 }
 
 TEST_CASE("s3_ioctx host_read_ranges clips EOF-crossing ranges independently",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1251,7 +1358,7 @@ TEST_CASE("s3_ioctx host_read_ranges clips EOF-crossing ranges independently",
 }
 
 TEST_CASE("s3_ioctx device_read uses bounded FSMR staging for multi-chunk S3 objects",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1286,7 +1393,7 @@ TEST_CASE("s3_ioctx device_read uses bounded FSMR staging for multi-chunk S3 obj
 }
 
 TEST_CASE("s3_ioctx device_read with FSMR staging handles nonzero-offset remainder chunks",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1319,7 +1426,7 @@ TEST_CASE("s3_ioctx device_read with FSMR staging handles nonzero-offset remaind
 }
 
 TEST_CASE("s3_ioctx device_read with FSMR staging clips EOF-crossing reads",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1348,7 +1455,7 @@ TEST_CASE("s3_ioctx device_read with FSMR staging clips EOF-crossing reads",
 }
 
 TEST_CASE("s3_ioctx device_read with FSMR staging returns zero without borrowing a block",
-          "[s3][ioctx][integration]")
+          "[s3][ioctx]")
 {
   constexpr std::size_t block_size = 4096;
   fsmr_test_resources memory(block_size, block_size, block_size);
@@ -1365,7 +1472,7 @@ TEST_CASE("s3_ioctx device_read with FSMR staging returns zero without borrowing
 }
 
 TEST_CASE("s3_ioctx device_read keeps vector fallback when no FSMR is injected",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1386,8 +1493,7 @@ TEST_CASE("s3_ioctx device_read keeps vector fallback when no FSMR is injected",
   require_bytes_equal(copy_device_to_host(dst, got), local, 0);
 }
 
-TEST_CASE("s3_ioctx device_read rejects an injected FSMR with zero block size",
-          "[s3][ioctx][integration]")
+TEST_CASE("s3_ioctx device_read rejects an injected FSMR with zero block size", "[s3][ioctx]")
 {
   fsmr_test_resources memory(/*block_size=*/0, /*capacity=*/0, /*memory_limit=*/0);
   auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
@@ -1408,7 +1514,7 @@ TEST_CASE("s3_ioctx device_read rejects an injected FSMR with zero block size",
 }
 
 TEST_CASE("s3_ioctx device_read reports context when FSMR staging allocation is exhausted",
-          "[s3][ioctx][integration]")
+          "[s3][ioctx]")
 {
   constexpr std::size_t block_size = 4096;
   fsmr_test_resources memory(block_size, /*capacity=*/0, /*memory_limit=*/0);
@@ -1432,7 +1538,7 @@ TEST_CASE("s3_ioctx device_read reports context when FSMR staging allocation is 
 }
 
 TEST_CASE("s3_ioctx host_read_ranges_async_io fans ranges across the injected pool",
-          "[s3][ioctx][parallel][integration]")
+          "[.][s3][integration][ioctx][parallel]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1489,7 +1595,7 @@ TEST_CASE("s3_ioctx host_read_ranges_async_io fans ranges across the injected po
 }
 
 TEST_CASE("s3_ioctx destroys its prefetch cache before shutting down S3 async workers",
-          "[s3][ioctx][teardown][integration]")
+          "[.][s3][integration][ioctx][teardown]")
 {
   auto env = read_s3_test_env();
   if (!env) {
