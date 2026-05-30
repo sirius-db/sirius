@@ -81,9 +81,8 @@ extern "C" int cudaProfilerStop();
 // <blockingconcurrentqueue.h> (used by spdlog / pipeline / duckdb
 // connection_manager). All consumers of blockingconcurrentqueue.h must
 // precede this include.
-#include "io/s3/sirius_s3_filesystem.hpp"  // sirius::io::s3::sirius_s3_filesystem
-#include "io/types.hpp"                    // sirius::io::sirius_ioctx
-#include "io/uring/uring_reactor.hpp"      // sirius::io::uring_io_object
+#include "io/types.hpp"                // sirius::io::sirius_ioctx
+#include "io/uring/uring_reactor.hpp"  // sirius::io::uring_io_object
 
 #include <cstdlib>
 #include <unordered_map>
@@ -100,8 +99,22 @@ constexpr std::string QUERY_LABEL_PARAM_KEY = "query_label";
 namespace {
 unique_ptr<QueryResult> run_internal_cpu_fallback_query(ClientContext& context,
                                                         Connection& connection,
-                                                        const string& query)
+                                                        const string& query,
+                                                        const string& gpu_error = "")
 {
+  // S3 CPU fallback is not supported. Sirius reads s3:// only on the GPU path
+  // (sirius_read_parquet -> describe_parquet -> cuDF via s3_ioctx); DuckDB's CPU
+  // read_parquet has no S3 filesystem, so a query that reads s3:// cannot fall
+  // back to CPU. Surface a clear error (with the underlying GPU cause) instead
+  // of replaying a query that would fail anyway. Local / non-s3 queries are
+  // unaffected and fall through to the normal DuckDB CPU replay below.
+  if (sirius::references_sirius_owned_s3_parquet(query)) {
+    throw std::runtime_error(
+      "S3 CPU fallback is not supported: this query reads s3:// data, GPU execution failed, and "
+      "Sirius has no CPU fallback for S3 data sources. Underlying GPU error: " +
+      gpu_error);
+  }
+
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) { return connection.Query(query); }
 
@@ -141,7 +154,8 @@ unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
 // read_parquet('s3://...') inside gpu_execution, NOT a user-facing function.
 // A direct DuckDB (CPU) execution is rejected cleanly — query S3 Parquet via
 // read_parquet('s3://...'), which the bind-time rewrite routes here for the GPU
-// path and which the CPU fallback replays through sirius_s3_filesystem.
+// path. S3 has no CPU fallback: if GPU execution fails, an s3:// query errors
+// (S3 CPU fallback is not supported) rather than replaying on the CPU.
 void SiriusReadParquetFunction(ClientContext&, TableFunctionInput&, DataChunk&)
 {
   throw std::runtime_error(
@@ -167,16 +181,21 @@ struct SiriusTableFunctionData : public TableFunctionData {
   unique_ptr<Connection> conn;
   unique_ptr<::sirius::sirius_interface> sirius_iface;
   string query;
-  // Pre-rewrite query used for the CPU fallback. The GPU path runs the rewritten
-  // `query` (read_parquet('s3://…') -> sirius_read_parquet('s3://…')), which
-  // throws if executed on the CPU. A fallback must instead replay the original
-  // read_parquet('s3://…'), which DuckDB's CPU reader serves through the
-  // registered sirius_s3_filesystem (newplan §29). For local / non-s3 queries
-  // the rewrite is a no-op, so this equals `query`.
+  // Pre-rewrite query used for the CPU fallback of LOCAL (non-s3) reads. The GPU
+  // path runs the rewritten `query` (read_parquet('s3://…') ->
+  // sirius_read_parquet('s3://…')), which throws if executed on the CPU, so a
+  // fallback replays this original instead. For local / non-s3 queries the
+  // rewrite is a no-op, so this equals `query` and replays normally. For s3://
+  // queries there is no CPU fallback: run_internal_cpu_fallback_query detects the
+  // s3:// read and raises a clear "S3 CPU fallback is not supported" error.
   string cpu_fallback_query;
   bool enable_optimizer;
   bool finished   = false;
   bool plan_error = false;
+  // Real error message from a failed GPU plan generation. The CPU fallback path
+  // surfaces it so the true cause (e.g. the unsupported operator) is preserved
+  // instead of a generic placeholder.
+  string plan_error_message;
   //! Original options from the connection
   ClientConfig original_config;
   set<OptimizerType> original_disabled_optimizers;
@@ -522,9 +541,10 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   // S3 filesystem, so without this rewrite the s3:// bind fails before Sirius
   // ever runs. Local paths and non-s3 calls are left untouched.
   //
-  // Capture the pre-rewrite query first: a CPU fallback must replay the original
-  // read_parquet('s3://…') (served by sirius_s3_filesystem on the CPU path), not
-  // the rewritten sirius_read_parquet, which throws off the GPU.
+  // Capture the pre-rewrite query first: a CPU fallback of a LOCAL read must
+  // replay the original read_parquet (not the rewritten sirius_read_parquet,
+  // which throws off the GPU). An s3:// query has no CPU fallback — the fallback
+  // path detects it and raises a clear error instead of replaying.
   result->cpu_fallback_query = result->query;
   result->query              = sirius::rewrite_sirius_owned_remote_parquet_calls(result->query);
 
@@ -554,7 +574,8 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
     ErrorData error(e);
     SIRIUS_LOG_ERROR("Error in SiriusGeneratePhysicalPlan: {}", error.RawMessage());
     if (Config::ENABLE_DUCKDB_FALLBACK) {
-      result->plan_error = true;
+      result->plan_error         = true;
+      result->plan_error_message = error.RawMessage();
     } else {
       throw std::runtime_error("Error in SiriusGeneratePhysicalPlan: " + error.RawMessage());
       return nullptr;
@@ -584,7 +605,8 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
       printf(
         "=============================================\nError in SiriusExecuteQuery, fallback to "
         "DuckDB\n=============================================\n");
-      data.res = run_internal_cpu_fallback_query(context, *data.conn, data.cpu_fallback_query);
+      data.res = run_internal_cpu_fallback_query(
+        context, *data.conn, data.cpu_fallback_query, data.plan_error_message);
     } else {
       data.res =
         data.sirius_iface->sirius_execute_query(context, data.query, data.gpu_prepared, {});
@@ -594,7 +616,8 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
           printf(
             "=============================================\nError in SiriusExecuteQuery, fallback "
             "to DuckDB\n=============================================\n");
-          data.res = run_internal_cpu_fallback_query(context, *data.conn, data.cpu_fallback_query);
+          data.res = run_internal_cpu_fallback_query(
+            context, *data.conn, data.cpu_fallback_query, data.res->GetError());
         } else {
           throw std::runtime_error("SiriusExecuteQuery error: " + data.res->GetError());
           return;
@@ -1610,11 +1633,12 @@ static void LoadInternal(ExtensionLoader& loader)
   SiriusExtension::InitialGPUConfigs(config);
   SiriusExtension::RegisterGPUFunctions(db);
 
-  // Register the s3:// FileSystem subsystem so DuckDB's CPU read_parquet can
-  // read S3 parquet through Sirius's s3_ioctx (the S3 execution CPU fallback;
-  // newplan §29). Stateless: it resolves the per-connection s3_ioctx via the
-  // FileOpener -> ClientContext -> SiriusContext at OpenFile time.
-  db.GetFileSystem().RegisterSubSystem(make_uniq<sirius::io::s3::sirius_s3_filesystem>());
+  // S3 CPU fallback is not supported: there is no DuckDB CPU FileSystem for
+  // s3://. S3 parquet is read only on the GPU path (read_parquet('s3://…') is
+  // rewritten to sirius_read_parquet -> describe_parquet -> cuDF via s3_ioctx).
+  // A query that reads s3:// and fails on GPU surfaces a clear "S3 CPU fallback
+  // is not supported" error (see run_internal_cpu_fallback_query); local reads
+  // still fall back to DuckDB's CPU execution.
 
   // Register optimizer extension for transparent GPU execution.
   // Pre-hook disables incompatible optimizers; post-hook captures the plan.

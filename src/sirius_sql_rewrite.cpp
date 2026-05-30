@@ -195,4 +195,13 @@ std::string rewrite_sirius_owned_remote_parquet_calls(std::string const& query)
   return rewritten;
 }
 
+bool references_sirius_owned_s3_parquet(std::string const& query)
+{
+  // The rewrite converts exactly the Sirius-owned read_parquet('s3://…') calls
+  // and leaves everything else byte-for-byte, so the query references such a
+  // call iff the rewrite changes it. Defining the predicate in terms of the
+  // rewrite keeps the two in lockstep — one source of truth, no drift.
+  return rewrite_sirius_owned_remote_parquet_calls(query) != query;
+}
+
 }  // namespace sirius

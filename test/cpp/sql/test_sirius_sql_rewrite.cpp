@@ -78,3 +78,48 @@ TEST_CASE("S3 SQL rewrite targets only Sirius-owned remote parquet calls", "[sql
           "SELECT * FROM read_parquet('file:///tmp/a.parquet')");
   }
 }
+
+TEST_CASE("S3 SQL rewrite predicate detects Sirius-owned remote parquet calls",
+          "[s3][sql][rewrite]")
+{
+  SECTION("detects real s3 read_parquet calls")
+  {
+    CHECK(
+      sirius::references_sirius_owned_s3_parquet("SELECT * FROM read_parquet('s3://b/k.parquet')"));
+    CHECK(sirius::references_sirius_owned_s3_parquet("SELECT * FROM READ_PARQUET('S3://B/K')"));
+    CHECK(sirius::references_sirius_owned_s3_parquet(
+      "SELECT count(*) FROM read_parquet('s3://b/k.parquet', union_by_name=true)"));
+    CHECK(sirius::references_sirius_owned_s3_parquet(
+      "SELECT * FROM read_parquet('/tmp/a.parquet') UNION ALL "
+      "SELECT * FROM read_parquet('s3://b/k.parquet')"));
+  }
+
+  SECTION("ignores local paths and unrelated queries")
+  {
+    CHECK_FALSE(
+      sirius::references_sirius_owned_s3_parquet("SELECT * FROM read_parquet('/local/x.parquet')"));
+    CHECK_FALSE(sirius::references_sirius_owned_s3_parquet(
+      "SELECT * FROM read_parquet('file:///local/x.parquet')"));
+    CHECK_FALSE(sirius::references_sirius_owned_s3_parquet("SELECT 42"));
+  }
+
+  SECTION("ignores comments and quoted strings")
+  {
+    CHECK_FALSE(sirius::references_sirius_owned_s3_parquet(
+      "-- read_parquet('s3://comment/file.parquet')\nSELECT 1"));
+    CHECK_FALSE(sirius::references_sirius_owned_s3_parquet(
+      "/* read_parquet('s3://comment/file.parquet') */ SELECT 1"));
+    CHECK_FALSE(sirius::references_sirius_owned_s3_parquet(
+      "SELECT 'read_parquet(''s3://literal/file.parquet'')'"));
+    CHECK_FALSE(sirius::references_sirius_owned_s3_parquet(
+      "SELECT \"read_parquet('s3://identifier/file.parquet')\""));
+  }
+
+  SECTION("requires the bare read_parquet function name")
+  {
+    CHECK_FALSE(sirius::references_sirius_owned_s3_parquet(
+      "SELECT * FROM my_read_parquet('s3://b/k.parquet')"));
+    CHECK_FALSE(sirius::references_sirius_owned_s3_parquet(
+      "SELECT * FROM read_parquet_mr('s3://b/k.parquet')"));
+  }
+}

@@ -37,4 +37,12 @@ namespace sirius {
 /// native `read_parquet`, which has no S3 filesystem.
 std::string rewrite_sirius_owned_remote_parquet_calls(std::string const& query);
 
+/// True iff @p query contains at least one Sirius-owned remote parquet call —
+/// `read_parquet('s3://…')` as a real, rewritable call (comment / quote /
+/// word-boundary aware, case-insensitive). Equivalent to "the rewrite would
+/// change this query". Used to decide that a failed GPU query has no CPU
+/// fallback: S3 parquet is read only on the GPU path, and DuckDB's CPU reader
+/// has no S3 filesystem, so an s3:// query cannot fall back to CPU.
+bool references_sirius_owned_s3_parquet(std::string const& query);
+
 }  // namespace sirius

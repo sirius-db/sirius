@@ -1123,12 +1123,22 @@ TEST_CASE("gpu_execution rewrites S3 read_parquet and scans through Sirius",
 
   REQUIRE(result->RowCount() == 25);
   REQUIRE(result->ColumnCount() == 3);
-  CHECK(result->GetValue(0, 0).GetValue<int32_t>() == 0);
+  std::array<int, 5> region_counts{};
+  for (duckdb::idx_t row = 0; row < result->RowCount(); ++row) {
+    auto const nation_key = result->GetValue(0, row).GetValue<int32_t>();
+    auto const region_key = result->GetValue(2, row).GetValue<int32_t>();
+    CHECK(nation_key == static_cast<int32_t>(row));
+    REQUIRE(region_key >= 0);
+    REQUIRE(region_key < static_cast<int32_t>(region_counts.size()));
+    ++region_counts[static_cast<std::size_t>(region_key)];
+  }
   CHECK(result->GetValue(1, 0).ToString() == "ALGERIA");
-  CHECK(result->GetValue(2, 0).GetValue<int32_t>() == 0);
+  for (auto const count : region_counts) {
+    CHECK(count == 5);
+  }
 }
 
-TEST_CASE("gpu_execution S3 window query falls back to DuckDB CPU",
+TEST_CASE("gpu_execution S3 window query reports unsupported S3 CPU fallback",
           "[.][s3][integration][sql][gpu_execution][fallback]")
 {
   auto env = read_s3_test_env();
@@ -1139,19 +1149,32 @@ TEST_CASE("gpu_execution S3 window query falls back to DuckDB CPU",
     "SELECT n_nationkey, ROW_NUMBER() OVER (ORDER BY n_nationkey) AS rn "
     "FROM " +
     s3_parquet_scan(*env, "nation") + " ORDER BY n_nationkey";
-  auto s3_result = require_query_ok(fixture.con, gpu_execution_sql(s3_query));
+  auto result = fixture.con.Query(gpu_execution_sql(s3_query));
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+  auto const error = result->GetError();
+  INFO(error);
+  CHECK(error.find("S3 CPU fallback is not supported") != std::string::npos);
+  CHECK((error.find("window") != std::string::npos || error.find("Window") != std::string::npos ||
+         error.find("WINDOW") != std::string::npos));
+  CHECK(error.find("No filesystem") == std::string::npos);
+  CHECK(error.find("no filesystem") == std::string::npos);
+}
 
-  duckdb::DuckDB baseline_db(nullptr);
-  duckdb::Connection baseline_con(baseline_db);
-  auto const local_query =
-    "SELECT n_nationkey, ROW_NUMBER() OVER (ORDER BY n_nationkey) AS rn "
-    "FROM " +
-    local_parquet_scan("nation") + " ORDER BY n_nationkey";
-  auto baseline_result = require_query_ok(baseline_con, local_query);
+TEST_CASE("DuckDB CPU read_parquet does not register a Sirius S3 filesystem",
+          "[.][s3][integration][sql][filesystem]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
 
-  REQUIRE(s3_result->RowCount() == 25);
-  REQUIRE(s3_result->ColumnCount() == 2);
-  check_rows_equal_with_tolerant_columns(*s3_result, *baseline_result, {});
+  s3_sql_fixture fixture(*env);
+  auto const uri = s3_uri(env->bucket, "parquet/nation.parquet");
+  auto result    = fixture.con.Query("SELECT count(*) FROM read_parquet('" + uri + "')");
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+  auto const error = result->GetError();
+  INFO(error);
+  CHECK((error.find("s3") != std::string::npos || error.find("S3") != std::string::npos));
 }
 
 TEST_CASE("gpu_execution S3 SQL surface returns empty result sets cleanly",
