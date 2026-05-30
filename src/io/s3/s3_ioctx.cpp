@@ -478,6 +478,14 @@ std::size_t s3_ioctx::head_object_size(std::string_view bucket, std::string_view
     curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, curl_header_capture);
     curl_easy_setopt(h, CURLOPT_HEADERDATA, &hc);
     if (_cfg.request_timeout_s > 0) curl_easy_setopt(h, CURLOPT_TIMEOUT, _cfg.request_timeout_s);
+    // TLS: verify against a custom CA bundle when configured (on-prem / self-signed /
+    // local-HTTPS); empty -> libcurl's system CA bundle (AWS). tls_verify=false disables checks.
+    if (!_cfg.ca_bundle_path.empty())
+      curl_easy_setopt(h, CURLOPT_CAINFO, _cfg.ca_bundle_path.c_str());
+    if (!_cfg.tls_verify) {
+      curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 0L);
+      curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, 0L);
+    }
 
     last_curl_code = curl_easy_perform(h);
     curl_slist_free_all(hdrs);
@@ -556,6 +564,14 @@ std::size_t s3_ioctx::range_get(std::string_view bucket,
     curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, curl_header_capture);
     curl_easy_setopt(h, CURLOPT_HEADERDATA, &hc);
     if (_cfg.request_timeout_s > 0) curl_easy_setopt(h, CURLOPT_TIMEOUT, _cfg.request_timeout_s);
+    // TLS: verify against a custom CA bundle when configured (on-prem / self-signed /
+    // local-HTTPS); empty -> libcurl's system CA bundle (AWS). tls_verify=false disables checks.
+    if (!_cfg.ca_bundle_path.empty())
+      curl_easy_setopt(h, CURLOPT_CAINFO, _cfg.ca_bundle_path.c_str());
+    if (!_cfg.tls_verify) {
+      curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 0L);
+      curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, 0L);
+    }
 
     last_curl_code = curl_easy_perform(h);
     curl_slist_free_all(hdrs);

@@ -152,10 +152,12 @@ S3_COMPOSE := $(S3_DIR)/docker-compose.yml
 S3_TEST_BIN ?= build/release/extension/sirius/test/cpp/sirius_unittest
 
 s3-up:
+	$(S3_DIR)/ensure_tls_certs.sh
 	docker compose -f $(S3_COMPOSE) up -d
 	$(S3_DIR)/fixtures.sh
 
 s3-up-large:
+	$(S3_DIR)/ensure_tls_certs.sh
 	docker compose -f $(S3_COMPOSE) up -d
 	$(S3_DIR)/fixtures.sh --perf
 

@@ -632,8 +632,10 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
         std::chrono::minutes{5});
     }
     sirius::io::s3::s3_ioctx_config s3_cfg{};
-    s3_cfg.creds        = std::move(provider);
-    sm_config.s3_config = std::move(s3_cfg);
+    s3_cfg.creds          = std::move(provider);
+    s3_cfg.ca_bundle_path = config_.object_store_config.ca_bundle_path;
+    s3_cfg.tls_verify     = config_.object_store_config.tls_verify;
+    sm_config.s3_config   = std::move(s3_cfg);
   }
   // Persist the composed config back onto config_ so a later get_config()
   // reflects the actual S3 wiring -- get_scan_manager_config() must not report

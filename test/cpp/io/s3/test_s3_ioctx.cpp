@@ -98,21 +98,25 @@ bool truthy_env(std::string_view name)
 
 struct s3_test_env {
   std::string endpoint;
+  std::string https_endpoint;
   std::string region;
   std::string access_key;
   std::string secret_key;
   std::string bucket;
   fs::path local_dir;
+  fs::path ca_bundle;
   bool strict{false};
 };
 
 std::optional<s3_test_env> read_s3_test_env()
 {
-  auto endpoint   = env_or("SIRIUS_TEST_S3_ENDPOINT");
-  auto access_key = env_or("SIRIUS_TEST_S3_ACCESS_KEY");
-  auto secret_key = env_or("SIRIUS_TEST_S3_SECRET_KEY");
-  auto bucket     = env_or("SIRIUS_TEST_S3_BUCKET");
-  auto local_dir  = env_or("SIRIUS_TEST_S3_LOCAL_DIR");
+  auto endpoint       = env_or("SIRIUS_TEST_S3_ENDPOINT");
+  auto https_endpoint = env_or("SIRIUS_TEST_S3_HTTPS_ENDPOINT");
+  auto access_key     = env_or("SIRIUS_TEST_S3_ACCESS_KEY");
+  auto secret_key     = env_or("SIRIUS_TEST_S3_SECRET_KEY");
+  auto bucket         = env_or("SIRIUS_TEST_S3_BUCKET");
+  auto local_dir      = env_or("SIRIUS_TEST_S3_LOCAL_DIR");
+  auto ca_bundle      = env_or("SIRIUS_TEST_S3_CA_BUNDLE");
 
   if (endpoint.empty() || access_key.empty() || secret_key.empty() || bucket.empty() ||
       local_dir.empty()) {
@@ -120,12 +124,30 @@ std::optional<s3_test_env> read_s3_test_env()
   }
 
   return s3_test_env{std::move(endpoint),
+                     std::move(https_endpoint),
                      env_or("SIRIUS_TEST_S3_REGION", "us-east-1"),
                      std::move(access_key),
                      std::move(secret_key),
                      std::move(bucket),
                      fs::path{local_dir},
+                     fs::path{ca_bundle},
                      truthy_env("SIRIUS_TEST_S3_STRICT")};
+}
+
+bool skip_if_no_s3_tls_env(std::optional<s3_test_env> const& env)
+{
+  if (!env) {
+    WARN("Skipping live S3 TLS test because SIRIUS_TEST_S3_* environment is not configured");
+    return true;
+  }
+  if (!env->https_endpoint.empty() && !env->ca_bundle.empty() && fs::exists(env->ca_bundle)) {
+    return false;
+  }
+  if (env->strict) {
+    FAIL("SIRIUS_TEST_S3_HTTPS_ENDPOINT and SIRIUS_TEST_S3_CA_BUNDLE are required for TLS tests");
+  }
+  WARN("Skipping live S3 TLS test because the HTTPS endpoint or CA bundle is not configured");
+  return true;
 }
 
 std::vector<std::uint8_t> read_binary_file(fs::path const& path)
@@ -159,6 +181,23 @@ std::shared_ptr<s3_ioctx> make_live_ioctx(s3_test_env const& env)
 {
   auto provider = make_live_provider(env);
   return std::make_shared<s3_ioctx>(s3_ioctx_config{std::move(provider), 4, 20});
+}
+
+std::shared_ptr<s3_ioctx> make_live_tls_ioctx(s3_test_env const& env,
+                                              bool trust_generated_ca,
+                                              bool tls_verify)
+{
+  auto tls_env     = env;
+  tls_env.endpoint = env.https_endpoint;
+  auto provider    = make_live_provider(tls_env);
+
+  s3_ioctx_config cfg{};
+  cfg.creds             = std::move(provider);
+  cfg.max_connections   = 4;
+  cfg.request_timeout_s = 20;
+  cfg.tls_verify        = tls_verify;
+  if (trust_generated_ca) { cfg.ca_bundle_path = env.ca_bundle.string(); }
+  return std::make_shared<s3_ioctx>(std::move(cfg));
 }
 
 std::shared_ptr<s3_ioctx> make_live_ioctx_with_fsmr(
@@ -1255,6 +1294,71 @@ TEST_CASE("s3_ioctx reads single objects from MinIO with presigned range GETs",
   std::vector<std::uint8_t> eof(8, 0xCC);
   CHECK(ctx->host_read(*obj, local.size(), eof.size(), eof.data()) == 0);
   CHECK(std::all_of(eof.begin(), eof.end(), [](auto b) { return b == 0xCC; }));
+}
+
+TEST_CASE("s3_ioctx reads MinIO over HTTPS when configured with the generated CA bundle",
+          "[.][s3][integration][tls][ioctx]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_tls_env(env)) { return; }
+
+  std::string const key = "parquet/nation.parquet";
+  auto local            = read_binary_file(env->local_dir / key);
+  auto ctx  = make_live_tls_ioctx(*env, /*trust_generated_ca=*/true, /*tls_verify=*/true);
+  auto size = try_head_or_skip(*ctx, *env, key);
+  if (!size) return;
+
+  REQUIRE(*size == local.size());
+  auto obj = make_s3_object(env->bucket, key, *size);
+
+  std::vector<std::uint8_t> head(64);
+  REQUIRE(ctx->host_read(*obj, 0, head.size(), head.data()) == head.size());
+  require_bytes_equal(head, local, 0);
+
+  std::vector<std::uint8_t> middle(128);
+  auto const offset = local.size() / 2;
+  REQUIRE(ctx->host_read(*obj, offset, middle.size(), middle.data()) == middle.size());
+  require_bytes_equal(middle, local, offset);
+}
+
+TEST_CASE("s3_ioctx rejects self-signed MinIO HTTPS when no CA bundle is configured",
+          "[.][s3][integration][tls][ioctx]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_tls_env(env)) { return; }
+
+  auto ctx = make_live_tls_ioctx(*env, /*trust_generated_ca=*/false, /*tls_verify=*/true);
+  try {
+    (void)ctx->head_object_size(env->bucket, "parquet/nation.parquet");
+    FAIL("Expected self-signed HTTPS MinIO to fail without the generated CA bundle");
+  } catch (std::exception const& e) {
+    std::string const msg = e.what();
+    INFO(msg);
+    CHECK((msg.find("SSL") != std::string::npos || msg.find("certificate") != std::string::npos ||
+           msg.find("peer") != std::string::npos || msg.find("curl 60") != std::string::npos));
+  }
+}
+
+TEST_CASE("s3_ioctx TLS scaffold leaves the existing HTTP MinIO path unchanged",
+          "[.][s3][integration][tls][ioctx]")
+{
+  auto env = read_s3_test_env();
+  if (!env) {
+    WARN("Skipping live S3 TLS regression because SIRIUS_TEST_S3_* environment is not configured");
+    return;
+  }
+
+  std::string const key = "hello.txt";
+  auto local            = read_binary_file(env->local_dir / key);
+  auto ctx              = make_live_ioctx(*env);
+  auto size             = try_head_or_skip(*ctx, *env, key);
+  if (!size) return;
+
+  REQUIRE(*size == local.size());
+  auto obj = make_s3_object(env->bucket, key, *size);
+  std::vector<std::uint8_t> got(local.size());
+  REQUIRE(ctx->host_read(*obj, 0, got.size(), got.data()) == got.size());
+  CHECK(got == local);
 }
 
 TEST_CASE("s3_ioctx create_io_object populates S3 object metadata from MinIO",

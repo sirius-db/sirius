@@ -97,6 +97,13 @@ struct s3_ioctx_config {
   /// construction. The s3_ioctx never owns this resource; its lifetime is
   /// the caller's (sirius_scan_manager) responsibility.
   cucascade::memory::fixed_size_host_memory_resource* host_memory_resource{nullptr};
+
+  /// TLS for https endpoints. @c ca_bundle_path (non-empty) -> CURLOPT_CAINFO
+  /// so a custom / self-signed CA verifies; empty uses the system CA bundle
+  /// (AWS). @c tls_verify=false disables peer+host verification
+  /// (CURLOPT_SSL_VERIFYPEER / CURLOPT_SSL_VERIFYHOST = 0) — INSECURE, dev/test.
+  std::string ca_bundle_path;
+  bool tls_verify = true;
 };
 
 /**
