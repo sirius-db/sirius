@@ -38,12 +38,10 @@ SQL-over-S3 surface.
 make test
 
 # Run the full S3 correctness gate. This starts MinIO, populates fixtures,
-# sources env.sh, enables strict mode, runs every non-large [s3] Catch2 test,
-# and tears MinIO down even if the tests fail.
+# sources env.sh, enables strict mode, runs every non-large, non-aws
+# [s3][integration] Catch2 test (including the SQL-over-S3 subset), and tears
+# MinIO down even if the tests fail.
 make s3-test
-
-# Run only the SQL-over-S3 end-to-end subset.
-make s3-sql-test
 
 # Run the opt-in large-SF10 SQL-over-S3 correctness suite. This generates
 # test/cpp/integration/s3/fixtures/generated/lineitem_sf10.parquet with the
@@ -127,8 +125,8 @@ A sha256 manifest is written to `fixtures/local/MANIFEST.sha256`.
 - SQL-over-S3 tests cover `sirius_read_parquet('s3://...')` directly and the
   `gpu_execution('... read_parquet("s3://...") ...')` rewrite path.
 - Large SQL-over-S3 tests are tagged `[s3][sql][large]` and hidden from the
-  default Catch2 run. `make s3-test` and `make s3-sql-test` explicitly exclude
-  `[large]`; use `make s3-test-large` when you want the SF10 coverage.
+  default Catch2 run. `make s3-test` explicitly excludes `[large]`; use
+  `make s3-test-large` when you want the SF10 coverage.
 - `env.sh` also exports `SIRIUS_CONFIG_FILE` pointing at `sirius.yaml` in this
   directory. It caps Super Sirius's startup GPU/host reservation at 256/128
   MiB so `require sirius` in SQL tests in this area won't OOM on GPUs that

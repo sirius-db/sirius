@@ -22,7 +22,8 @@ MAIN_BUILD_TARGETS ?= duckdb duckdb_local_extension_repo
 	clang-release clang-debug clang-relwithdebinfo \
 	ci-release configure_ci set_duckdb_version \
 	test test_release test_debug test_reldebug test_ci-release clean list-presets \
-	s3-up s3-up-large s3-down s3-test s3-sql-test s3-test-large s3-bench s3-bench-fixtures
+	s3-up s3-up-large s3-down s3-test s3-test-large \
+	s3-test-aws s3-test-aws-sigv4 s3-test-aws-broker s3-bench s3-bench-fixtures
 
 PRESETS_LINK := $(DUCKDB_DIR)/CMakePresets.json
 
@@ -123,16 +124,26 @@ list-presets: $(PRESETS_LINK)
 # `make s3-down`      tears it down (including the data volume).
 # `make test`         runs the default Catch2 suite without starting MinIO.
 # `make s3-test`      one-shot standard S3 correctness gate: starts MinIO,
-#                     sources env.sh, runs every Catch2 test tagged [s3]
-#                     except [large] in strict mode, then tears MinIO down
-#                     even on failure.
-# `make s3-sql-test`  one-shot SQL-over-S3 end-to-end subset: same fixture
-#                     lifecycle as s3-test, but runs only [s3][sql] except
-#                     [large].
+#                     sources env.sh, runs every Catch2 test tagged
+#                     [s3][integration] except [large] and [aws] in strict
+#                     mode (this includes the SQL-over-S3 subset), then tears
+#                     MinIO down even on failure.
 # `make s3-test-large`
 #                     one-shot large-SF10 SQL-over-S3 gate: starts MinIO,
 #                     uploads standard fixtures plus lineitem_sf10.parquet via
 #                     fixtures.sh --perf, then runs [s3][sql][large].
+#
+# The s3-test-aws* targets are MANUAL real-AWS gates: they never start MinIO or
+# Docker and are deliberately excluded from CI. Export the AWS environment
+# yourself first (regional S3 endpoint, real bucket, and assume-role TEMPORARY
+# credentials including the session token); keep usage bounded.
+# `make s3-test-aws`  runs the live [s3][aws] tests against a real S3 endpoint.
+# `make s3-test-aws-sigv4`
+#                     subset using Sirius's built-in SigV4 presigner only
+#                     ([s3][aws] minus [broker]).
+# `make s3-test-aws-broker`
+#                     subset driven by an external presign broker
+#                     ([s3][aws][broker]).
 #
 # See test/cpp/integration/s3/README.md for details.
 
@@ -162,20 +173,7 @@ s3-test:
 	$(MAKE) s3-up; \
 	source $(S3_DIR)/env.sh; \
 	export SIRIUS_TEST_S3_STRICT=1; \
-	$(S3_TEST_BIN) "[s3][integration]~[large]"
-
-s3-sql-test: SHELL := /bin/bash
-s3-sql-test:
-	@if [ ! -x $(S3_TEST_BIN) ]; then \
-	  echo "s3-sql-test: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
-	  exit 1; \
-	fi
-	@set -e; \
-	trap '$(MAKE) s3-down' EXIT; \
-	$(MAKE) s3-up; \
-	source $(S3_DIR)/env.sh; \
-	export SIRIUS_TEST_S3_STRICT=1; \
-	$(S3_TEST_BIN) "[s3][integration][sql]~[large]"
+	$(S3_TEST_BIN) "[s3][integration]~[large]~[aws]"
 
 s3-test-large: SHELL := /bin/bash
 s3-test-large:
@@ -194,6 +192,41 @@ s3-test-large:
 	$(S3_TEST_BIN) "[s3][sql][large][large-count-no-prewarm]"; \
 	$(S3_TEST_BIN) "[s3][sql][large][large-q1-no-prewarm]"; \
 	$(S3_TEST_BIN) "[s3][sql][large][large-join-no-prewarm]"
+
+# Manual real-AWS gates. These never start MinIO/Docker and are excluded from
+# CI. Export the AWS environment yourself before invoking (regional S3 endpoint,
+# real bucket, and assume-role TEMPORARY credentials including the session
+# token); keep usage bounded. SIRIUS_TEST_S3_STRICT=1 turns a missing-env skip
+# into a hard failure so a misconfigured run is loud rather than silently green.
+s3-test-aws: SHELL := /bin/bash
+s3-test-aws:
+	@if [ ! -x $(S3_TEST_BIN) ]; then \
+	  echo "s3-test-aws: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
+	  exit 1; \
+	fi
+	@set -e; \
+	export SIRIUS_TEST_S3_STRICT=1; \
+	$(S3_TEST_BIN) "[s3][aws]"
+
+s3-test-aws-sigv4: SHELL := /bin/bash
+s3-test-aws-sigv4:
+	@if [ ! -x $(S3_TEST_BIN) ]; then \
+	  echo "s3-test-aws-sigv4: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
+	  exit 1; \
+	fi
+	@set -e; \
+	export SIRIUS_TEST_S3_STRICT=1; \
+	$(S3_TEST_BIN) "[s3][aws]~[broker]"
+
+s3-test-aws-broker: SHELL := /bin/bash
+s3-test-aws-broker:
+	@if [ ! -x $(S3_TEST_BIN) ]; then \
+	  echo "s3-test-aws-broker: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
+	  exit 1; \
+	fi
+	@set -e; \
+	export SIRIUS_TEST_S3_STRICT=1; \
+	$(S3_TEST_BIN) "[s3][aws][broker]"
 
 # -----------------------------------------------------------------------------
 # S3 perf benchmark (Catch2 [!benchmark][perf][bench] hidden tag - not in the
