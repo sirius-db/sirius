@@ -116,16 +116,11 @@ TEST_CASE("TPC-H SF1: legacy and tree-based converters produce identical pipelin
 
   tree_pipeline_flag_guard flag_guard;
 
-  // TPC-H queries where the tree-based path currently diverges from legacy. After
-  // Phase 3's DELIM_JOIN ownership fixes (#604), the only remaining failure is:
-  //
-  //   * q15 — SIGSEGV during conversion under flag ON. Scalar subquery
-  //     (`MAX(total_revenue) FROM revenue_view`) over a materialized CTE referenced
-  //     twice; suspected CTE_SCAN + DELIM_JOIN interaction or `set_parent_ops` gap
-  //     for CTE body. Investigation plan in `~/.claude/plans/imperative-snuggling-tome.md`.
-  //
-  // E.4 (flag-default flip) cannot ship until this set is empty.
-  static const std::set<int> kKnownFailing = {15};
+  // Differential gate for the tree-based pipeline build (#604, sub-phase E.1).
+  // Empty set means all 22 TPC-H queries produce byte-identical dumps under both
+  // flag states; E.4 (flag-default flip) is unblocked. Re-populate with the query
+  // numbers that diverge if a regression lands, then file a follow-up to clear it.
+  static const std::set<int> kKnownFailing = {};
 
   for (int q = 1; q <= 22; ++q) {
     if (kKnownFailing.count(q) != 0) { continue; }

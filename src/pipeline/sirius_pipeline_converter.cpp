@@ -1281,11 +1281,14 @@ void sirius_pipeline_converter::compute_repository_wiring_tree_based(
       for (auto cte_scan : cte_op.cte_scans) {
         auto it = state.cte_scan_consumers.find(cte_scan);
         if (it == state.cte_scan_consumers.end()) { continue; }
-        emit("default",
-             op::MemoryBarrierType::FULL,
-             sink_op,
-             pipeline,
-             it->second.get().shared_from_this());
+        auto dest_pipeline = it->second.get().shared_from_this();
+        // Per-consumer barrier: probe-side CTE_SCAN consumers (e.g. q15's first
+        // CTE_SCAN feeding the main HJ's probe PARTITION) resolve to PARTIAL via
+        // the join-feeder rule; build-side consumers (e.g. q15's second CTE_SCAN
+        // feeding the scalar-subquery aggregate chain) resolve to FULL. Hardcoding
+        // FULL matches legacy on the build side but disagrees on the probe side.
+        emit(
+          "default", resolve_barrier(*sink_op, *dest_pipeline), sink_op, pipeline, dest_pipeline);
       }
       continue;
     }

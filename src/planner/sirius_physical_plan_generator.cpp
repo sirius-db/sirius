@@ -607,6 +607,27 @@ void sirius_physical_plan_generator::set_parent_ops(sirius::op::sirius_physical_
                                                     sirius::op::sirius_physical_operator* parent)
 {
   op.set_parent_op(parent);
+
+  // CTE is transparent for data flow on its consumer side (children[1]): the
+  // CTE body (children[0]) materializes INTO CTE, while children[1] is the
+  // outer query that reads from the CTE via CTE_SCAN and whose result IS
+  // CTE's output (`sirius_physical_cte::execute` just forwards children[1]'s
+  // batches). Set children[1]'s parent_op to CTE's own parent so the
+  // tree-parent walk in `compute_repository_wiring_tree_based` doesn't emit
+  // `consumer_sink -> CTE_pipeline` edges. Such an edge, combined with the
+  // CTE sink's `CTE_pipeline -> CTE_SCAN_consumer` emissions
+  // (`sirius_pipeline_converter.cpp:1146-1158`), would close a cycle that
+  // `dump_pipeline_conversion_result::compute_sig` infinite-loops on (q15
+  // SIGSEGV — only TPC-H query that exercises CTE_SCAN). Mirrors legacy's
+  // wiring graph where the CTE consumer side never wires back to the CTE
+  // sink.
+  if (op.type == sirius::op::SiriusPhysicalOperatorType::CTE) {
+    D_ASSERT(op.children.size() == 2);
+    set_parent_ops(*op.children[0], &op);
+    set_parent_ops(*op.children[1], parent);
+    return;
+  }
+
   for (auto& child : op.children) {
     if (child) { set_parent_ops(*child, &op); }
   }
