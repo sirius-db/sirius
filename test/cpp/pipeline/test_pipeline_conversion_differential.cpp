@@ -116,38 +116,16 @@ TEST_CASE("TPC-H SF1: legacy and tree-based converters produce identical pipelin
 
   tree_pipeline_flag_guard flag_guard;
 
-  // TPC-H queries where the tree-based path currently diverges from legacy. Each entry
-  // is a distinct tree-path bug surfaced by this gate and needs targeted investigation
-  // before flag-default flip (E.4). Split into two failure modes:
-  //   * Exception under flag ON: q2, q4, q17, q20, q21, q22 — tree `build_pipelines`
-  //     throws on subquery / DELIM_JOIN / nested-aggregate patterns.
-  //   * Pipeline-shape diff: q3, q5, q7-q16, q18, q19 — multi-join queries where the
-  //     tree path's pipeline count / barrier ordering doesn't match legacy
-  //     post-finalize state.
-  // Track follow-ups in sirius-db/sirius#604. Removing a query from this set as fixes
-  // land tightens the gate incrementally.
-  // TPC-H queries where the tree-based path currently diverges from legacy. Two distinct
-  // failure modes remain after Phase 3's converter-engagement fixes (#604):
+  // TPC-H queries where the tree-based path currently diverges from legacy. After
+  // Phase 3's DELIM_JOIN ownership fixes (#604), the only remaining failure is:
   //
-  //   * Exception under flag ON (q2, q4, q17, q20, q21, q22) — DELIM_JOIN / subquery
-  //     patterns. These throw `Attempted to access index 0 within vector of size 0` somewhere
-  //     in the converter under flag ON. Likely a shared root cause across the six; needs a
-  //     focused investigation of LEFT_DELIM / RIGHT_DELIM handling under the tree-based
-  //     wraps + emission_order tracking.
+  //   * q15 — SIGSEGV during conversion under flag ON. Scalar subquery
+  //     (`MAX(total_revenue) FROM revenue_view`) over a materialized CTE referenced
+  //     twice; suspected CTE_SCAN + DELIM_JOIN interaction or `set_parent_ops` gap
+  //     for CTE body. Investigation plan in `~/.claude/plans/imperative-snuggling-tome.md`.
   //
-  //   * Pipeline-shape diff (q5, q7-q11, q15, q16, q18) — same pipeline count and operator
-  //     shapes as legacy, but one leaf chain lands at a different position in
-  //     scheduled_pipelines for queries with 4+ joins. Legacy's split_pipelines emits
-  //     build_meta_top's leaf chain at iteration i=4 (between the inner HJs' wraps and
-  //     hgb.base's split), while the tree-based emission_order pushes it either at the
-  //     start (build-first) or end (probe-first) of HJ_top.build_join_pipelines — never in
-  //     the middle. Resolving this requires either flattening the tree-path meta hierarchy
-  //     to match legacy's `build_meta_*` siblings-under-hgb shape, or a custom emission
-  //     deferral. Tracked as a follow-up in #604.
-  //
-  // Removing a query from this set as fixes land tightens the gate incrementally; E.4
-  // (flag-default flip) cannot ship until the list is empty.
-  static const std::set<int> kKnownFailing = {15, 21, 22};
+  // E.4 (flag-default flip) cannot ship until this set is empty.
+  static const std::set<int> kKnownFailing = {15};
 
   for (int q = 1; q <= 22; ++q) {
     if (kKnownFailing.count(q) != 0) { continue; }
