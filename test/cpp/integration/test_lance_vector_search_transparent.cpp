@@ -207,3 +207,39 @@ TEST_CASE_METHOD(LanceVectorSearchTransparentFixture,
 
   require_clean_fallback_and_cpu_parity(query);
 }
+
+TEST_CASE_METHOD(LanceVectorSearchTransparentFixture,
+                 "lance_vector_search self-contained e2e",
+                 "[.lance_e2e_selfcontained][integration]")
+{
+  if (!load_lance_extension()) { return; }
+
+  auto dir = fs::temp_directory_path() / "sirius_lance_e2e";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  const auto ds = (dir / "ds.lance").string();
+
+  auto copy_result = con->Query(
+    "COPY (SELECT i::BIGINT AS id, (i % 3)::INTEGER AS cat, "
+    "[random(), random(), random(), random()]::FLOAT[4] AS vec "
+    "FROM range(200) t(i)) "
+    "TO '" +
+    ds + "' (FORMAT lance, mode 'overwrite');");
+  REQUIRE(copy_result);
+  if (copy_result->HasError()) { UNSCOPED_INFO("COPY lance error: " << copy_result->GetError()); }
+  REQUIRE_FALSE(copy_result->HasError());
+
+  compare_gpu_vs_cpu(
+    "SELECT cat, count(*) AS n, avg(_distance) AS ad "
+    "FROM lance_vector_search('" +
+    ds +
+    "', 'vec', [0.1,0.2,0.3,0.4]::FLOAT[4], k=50) "
+    "GROUP BY cat ORDER BY cat");
+
+  require_clean_fallback_and_cpu_parity(
+    "SELECT id, vec "
+    "FROM lance_vector_search('" +
+    ds + "', 'vec', [0.1,0.2,0.3,0.4]::FLOAT[4], k=5)");
+
+  fs::remove_all(dir);
+}
