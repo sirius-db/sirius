@@ -34,6 +34,7 @@
 
 // duckdb
 #include <duckdb/common/types.hpp>
+#include <duckdb/common/types/vector.hpp>
 #include <duckdb/function/table_function.hpp>
 
 namespace sirius::op::scan {
@@ -86,7 +87,13 @@ duckdb_scan_task_local_state::column_builder::column_builder(sirius::logical_typ
                                                              size_t default_varchar_size)
   : type(t)
 {
-  type_size = t.is_varchar() ? default_varchar_size : t.fixed_width_byte_size();
+  if (t.is_varchar()) {
+    type_size = default_varchar_size;
+  } else if (t.is_array()) {
+    type_size = static_cast<size_t>(t.array_size()) * t.array_child().fixed_width_byte_size();
+  } else {
+    type_size = t.fixed_width_byte_size();
+  }
 }
 
 void duckdb_scan_task_local_state::column_builder::initialize_accessors(
@@ -97,7 +104,8 @@ void duckdb_scan_task_local_state::column_builder::initialize_accessors(
   assert(allocation != nullptr);
   assert(!allocation->get_blocks().empty());
 
-  if (type.is_varchar()) {
+  // ARRAY and VARCHAR have the same layout (offsets + data + mask)
+  if (type.is_varchar() || type.is_array()) {
     // Initialize offset accessor
     offset_blocks_accessor.initialize(byte_offset, allocation);
     // Write the initial offset value of 0
@@ -247,6 +255,25 @@ void duckdb_scan_task_local_state::column_builder::process_column(
       }
     }
     total_data_bytes += data_bytes;
+  } else if (type.is_array()) {
+    // Note: child-element nulls are not tracked yet
+    auto const array_size  = static_cast<size_t>(type.array_size());
+    auto const child_width = type.array_child().fixed_width_byte_size();
+
+    auto& child_vec = duckdb::ArrayVector::GetEntry(vec);
+    child_vec.Flatten(num_rows * array_size);
+
+    auto const data_bytes = num_rows * array_size * child_width;
+    data_blocks_accessor.memcpy_from(child_vec.GetData(), data_bytes, allocation);
+    total_data_bytes += data_bytes;
+
+    // Cumulative offsets: pos 0 already initialized to 0
+    for (size_t row = 0; row < num_rows; ++row) {
+      auto const prev_offset = offset_blocks_accessor.get_current(allocation);
+      offset_blocks_accessor.advance();
+      offset_blocks_accessor.set_current(prev_offset + static_cast<int32_t>(array_size),
+                                         allocation);
+    }
   } else {
     // Fixed-width column
     auto const data_bytes = type_size * num_rows;
@@ -288,6 +315,46 @@ duckdb_scan_task_local_state::column_builder::make_column_metadata(size_t num_ro
     col.data_offset      = data_blocks_accessor.initial_byte_offset;
     col.data_size        = total_data_bytes;
     col.children.push_back(std::move(offsets_child));
+    return col;
+  } else if (type.is_array()) {
+    // cudf LIST requires offsets and values as separate child columns
+    // ARRAY column: parent metadata + offsets child + data child
+    auto const array_size = static_cast<size_t>(type.array_size());
+    auto const child_cudf = sirius::get_cudf_type(type.array_child());
+
+    column_metadata offsets_child{};
+    offsets_child.type_id       = cudf::type_id::INT32;
+    offsets_child.num_rows      = static_cast<cudf::size_type>(num_rows + 1);
+    offsets_child.null_count    = 0;
+    offsets_child.scale         = 0;
+    offsets_child.has_null_mask = false;
+    offsets_child.has_data      = true;
+    offsets_child.data_offset   = offset_blocks_accessor.initial_byte_offset;
+    offsets_child.data_size     = (num_rows + 1) * sizeof(int32_t);
+
+    column_metadata values_child{};
+    values_child.type_id       = child_cudf.id();
+    values_child.num_rows      = static_cast<cudf::size_type>(num_rows * array_size);
+    values_child.null_count    = 0;
+    values_child.scale         = child_cudf.scale();
+    values_child.has_null_mask = false;
+    values_child.has_data      = true;
+    values_child.data_offset   = data_blocks_accessor.initial_byte_offset;
+    values_child.data_size     = total_data_bytes;
+
+    column_metadata col{};
+    col.type_id          = cudf::type_id::LIST;
+    col.num_rows         = static_cast<cudf::size_type>(num_rows);
+    col.null_count       = static_cast<cudf::size_type>(null_count);
+    col.scale            = 0;
+    col.has_null_mask    = (null_count > 0);
+    col.null_mask_offset = mask_blocks_accessor.initial_byte_offset;
+    col.null_mask_size   = (null_count > 0) ? cudf::bitmask_allocation_size_bytes(num_rows) : 0;
+    col.has_data         = false;
+    col.data_offset      = 0;
+    col.data_size        = 0;
+    col.children.push_back(std::move(offsets_child));  // child[0] = offsets
+    col.children.push_back(std::move(values_child));   // child[1] = values
     return col;
   } else {
     // Fixed-width column
@@ -373,13 +440,18 @@ void duckdb_scan_task_local_state::estimate_rows_per_batch(sirius_physical_duckd
   assert(_num_columns <= op.scanned_types.size());
 
   size_t estimated_row_bytes = 0;
+  size_t num_offset_columns  = 0;  ///< Columns with an offsets buffer (VARCHAR + ARRAY)
   _column_builders.reserve(_num_columns);
   for (size_t i = 0; i < _num_columns; ++i) {
     auto const col_type = op.scanned_types[i];
     _column_builders.emplace_back(col_type, _default_varchar_size);
     if (col_type.is_varchar()) {
       _varchar_indices.push_back(i);
+      ++num_offset_columns;
       estimated_row_bytes += (sizeof(int32_t) + _default_varchar_size);  // offset + data + mask
+    } else if (col_type.is_array()) {
+      ++num_offset_columns;
+      estimated_row_bytes += (sizeof(int32_t) + _column_builders[i].type_size);
     } else {
       estimated_row_bytes += col_type.fixed_width_byte_size();  // data + mask
     }
@@ -390,12 +462,12 @@ void duckdb_scan_task_local_state::estimate_rows_per_batch(sirius_physical_duckd
   size_t mask_bytes_per_row = utils::ceil_div_8(_num_columns);
   estimated_row_bytes += mask_bytes_per_row;
 
-  // For VARCHAR columns, add space for the extra offset at the end
-  size_t extra_varchar_offset_bytes = _varchar_indices.size() * sizeof(int32_t);
+  // For VARCHAR and ARRAY columns, add space for the extra offset at the end
+  size_t extra_offset_bytes = num_offset_columns * sizeof(int32_t);
 
   // Calculate rows that fit in the batch
   _estimated_rows_per_batch =
-    (_approximate_batch_size - extra_varchar_offset_bytes) / estimated_row_bytes;
+    (_approximate_batch_size - extra_offset_bytes) / estimated_row_bytes;
 
   // Ensure at least 1 vector can fit, otherwise the task will be a no-op
   _estimated_rows_per_batch = std::max<size_t>(_estimated_rows_per_batch, STANDARD_VECTOR_SIZE);
@@ -410,10 +482,10 @@ void duckdb_scan_task_local_state::initialize_builders()
     byte_offset = (byte_offset + 7) & ~size_t{7};
     _column_builders[i].initialize_accessors(_estimated_rows_per_batch, byte_offset, _allocation);
     // Update byte_offset for next column
-    if (_column_builders[i].type.is_varchar()) {
-      // VARCHAR column (offsets + data + mask)
+    if (_column_builders[i].type.is_varchar() || _column_builders[i].type.is_array()) {
+      // VARCHAR and ARRAY column (offsets + data + mask)
       byte_offset += (_estimated_rows_per_batch + 1) * sizeof(int32_t) +
-                     _estimated_rows_per_batch * _default_varchar_size +
+                     _estimated_rows_per_batch * _column_builders[i].type_size +
                      utils::ceil_div_8(_estimated_rows_per_batch);
     } else {
       // Fixed-width column (data + mask)

@@ -125,6 +125,24 @@ class host_table_chunk_reader {
                      size_t row_offset,
                      size_t count,
                      std::shared_ptr<multiple_blocks_allocation> const& allocation);
+
+    /**
+     * @brief Copy a fixed-size ARRAY (cudf LIST) column into the duckdb ARRAY vector.
+     *
+     * The stored values child (children[1]) is laid out row-major (K elements per row),
+     * matching DuckDB's fixed-size array child layout, so the values are copied contiguously
+     * into the array's child vector. The list-level null mask becomes the array vector's
+     * validity. Child-element nulls are not handled.
+     *
+     * @param[in,out] vector The duckdb ARRAY vector to copy into
+     * @param[in] row_offset The starting row offset to copy from
+     * @param[in] count The number of rows (arrays) to copy
+     * @param[in] allocation The multiple blocks allocation containing the column data
+     */
+    void copy_array(duckdb::Vector& vector,
+                    size_t row_offset,
+                    size_t count,
+                    std::shared_ptr<multiple_blocks_allocation> const& allocation);
   };
 
  public:
