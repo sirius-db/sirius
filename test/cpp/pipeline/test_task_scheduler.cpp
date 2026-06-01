@@ -157,3 +157,33 @@ TEST_CASE("Task queue handles empty queue gracefully", "[pipeline_queue]")
 
   REQUIRE_NOTHROW(executor.stop());
 }
+
+TEST_CASE("Task scheduler dispatches tasks with device preference", "[task_scheduler]")
+{
+  auto manager = initialize_memory_manager(2);
+  sirius::exec::thread_pool_config gpu_config{2};
+  sirius::exec::thread_pool_config scan_config{2};
+  task_scheduler sched(gpu_config, scan_config, *manager);
+
+  auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
+  sched.start();
+
+  // Schedule tasks — pull-signal model ensures tasks stay in the scheduler's
+  // queue (downgrade-visible) until a GPU executor is ready.
+  const int num_tasks = 10;
+  for (int i = 0; i < num_tasks; ++i) {
+    auto local_state = std::make_unique<mock_gpu_pipeline_task_local_state>(i, 0);
+    auto task = std::make_unique<mock_gpu_pipeline_task>(i, std::move(local_state), global_state);
+    sched.schedule(std::move(task));
+  }
+
+  auto start_time = std::chrono::steady_clock::now();
+  while (global_state->executed_count.load(std::memory_order_relaxed) < num_tasks) {
+    std::this_thread::sleep_for(10ms);
+    if (std::chrono::steady_clock::now() - start_time > 10s) {
+      FAIL("Tasks not completed with 2-GPU scheduler");
+    }
+  }
+  REQUIRE(global_state->executed_count.load() == num_tasks);
+  sched.stop();
+}

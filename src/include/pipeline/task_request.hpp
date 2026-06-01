@@ -26,9 +26,20 @@
 namespace sirius {
 namespace pipeline {
 
+enum class task_request_kind {
+  // A GPU pipeline executor has reserved a worker thread and is ready to accept a task.
+  // device_id is the device that is ready.
+  device_ready,
+  // A new task was pushed into task_scheduler::_task_queue. Wakes the management
+  // event loop so it re-runs the matcher against currently-ready devices.
+  // device_id is unused.
+  task_available,
+};
+
 struct task_request {
   int device_id;
   bool is_scan{false};
+  task_request_kind kind{task_request_kind::device_ready};
 };
 
 class task_request_queue {

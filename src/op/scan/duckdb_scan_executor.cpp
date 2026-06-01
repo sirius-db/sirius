@@ -512,7 +512,12 @@ void duckdb_scan_executor::manager_loop()
               _task_creator->schedule(consumer);
             }
           }
+        } catch (std::exception const& e) {
+          SIRIUS_LOG_ERROR("DuckDB Scan Executor: Exception during scan task execution: {}",
+                           e.what());
+          if (_completion_handler) { _completion_handler->report_error(std::current_exception()); }
         } catch (...) {
+          SIRIUS_LOG_ERROR("DuckDB Scan Executor: Unknown exception during scan task execution");
           if (_completion_handler) { _completion_handler->report_error(std::current_exception()); }
         }
       });

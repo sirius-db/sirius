@@ -200,8 +200,13 @@ std::unique_ptr<cudf::table> sirius_gpu_parquet_scan_operator::read_table_from_m
 
   // Try to translate the filter to a *stream-local* cudf AST for filter pushdown. If not
   // successful, fall back to post-read DuckDB-expression evaluation.
+  //
+  // Honor scan_data.disable_filter_pushdown: when set by parquet_split_provider (because
+  // the parquet file has FIXED_LEN_BYTE_ARRAY decimal columns that cudf's stats filter
+  // can't handle), skip the AST set_filter here too. The filter still applies post-decode
+  // via gpu_expression_executor::select below.
   std::optional<gpu_expression_translator::translated_expression> ast_expression = std::nullopt;
-  if (filter_expression) {
+  if (filter_expression && !scan_data.disable_filter_pushdown) {
     auto name_resolver = [plan = scan_data.plan](duckdb::idx_t ref_index) -> std::string {
       return plan->batch_column_name(ref_index);
     };
@@ -217,6 +222,10 @@ std::unique_ptr<cudf::table> sirius_gpu_parquet_scan_operator::read_table_from_m
         "[sirius_gpu_parquet_scan_operator] AST translation failed for parquet reader filter "
         "pushdown.");
     }
+  } else if (filter_expression && scan_data.disable_filter_pushdown) {
+    SIRIUS_LOG_DEBUG(
+      "[sirius_gpu_parquet_scan_operator] Filter pushdown disabled (FLBA-decimal file); "
+      "filter will be evaluated post-decode.");
   }
 
   rmm::device_async_resource_ref mr_ref(scan_data.gpu_memory_space->get_default_allocator());
