@@ -204,6 +204,20 @@ class sirius_physical_plan_generator {
   duckdb::ClientContext& context;
   // duckdb::GPUContext& gpu_context;
 
+ public:
+  //! Recursive post-pass walk that sets each operator's `_parent_op` from the final tree
+  //! structure. Called once at the end of plan generation, after all tree rewrites have
+  //! settled, so the parent pointer is derived from `children[]` and cannot drift. Access
+  //! to `sirius_physical_operator::set_parent_op` is granted via friendship.
+  //!
+  //! Public so that the engine can re-run the walk after the RESULT_COLLECTOR wrap is added
+  //! around the plan (see `sirius_pending_statement_internal` at `src/sirius_interface.cpp:166`)
+  //! — that wrap happens after plan generation finishes, so the wrapped child's `_parent_op`
+  //! would otherwise stay null and break tree-parent-driven wiring under
+  //! `USE_TREE_BASED_PIPELINE_BUILD`.
+  static void set_parent_ops(sirius::op::sirius_physical_operator& op,
+                             sirius::op::sirius_physical_operator* parent);
+
  private:
   //! Walk the freshly-generated physical plan tree top-down and insert GPU pipeline operators
   //! (PARTITION, CONCAT, SORT_SAMPLE / SORT_PARTITION / MERGE_SORT, GROUPED_AGGREGATE_MERGE,
@@ -214,14 +228,6 @@ class sirius_physical_plan_generator {
   //! per-operator-type dispatch. Operator-specific factories land in subsequent commits.
   void insert_gpu_pipeline_operators(
     duckdb::unique_ptr<sirius::op::sirius_physical_operator>& plan);
-
-  //! Recursive post-pass walk that sets each operator's `_parent_op` from the final tree
-  //! structure. Called once at the end of plan generation, after all tree rewrites have
-  //! settled, so the parent pointer is derived from `children[]` and cannot drift. Access
-  //! to `sirius_physical_operator::set_parent_op` is granted via friendship. Sub-phase B
-  //! wires the call site, gated by the same flag as `insert_gpu_pipeline_operators`.
-  static void set_parent_ops(sirius::op::sirius_physical_operator& op,
-                             sirius::op::sirius_physical_operator* parent);
 
   //! Walk the plan tree and fully materialize Iceberg delete data for every TABLE_SCAN whose
   //! `function.name == "iceberg_scan"`, populating `iceberg_delete_data_cache_`. Mirrors the

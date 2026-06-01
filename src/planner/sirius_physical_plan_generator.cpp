@@ -644,6 +644,19 @@ void sirius_physical_plan_generator::set_parent_ops(sirius::op::sirius_physical_
     if (delim.join) { set_parent_ops(*delim.join, &op); }
     if (delim.distinct_root) { set_parent_ops(*delim.distinct_root, &op); }
   }
+  // RESULT_COLLECTOR stores its tree child in `plan` (a reference, outside `children[]`) —
+  // it's the engine-injected root wrapper added by `sirius_pending_statement_internal`
+  // (`src/sirius_interface.cpp:166`), used by BOTH `CALL gpu_execution()` and transparent
+  // execution. Without descending here the wrapped sink (e.g. MERGE_TOP_N) gets
+  // `_parent_op = nullptr` and `compute_repository_wiring_tree_based` silently skips its emit
+  // at the uniform tree-parent lookup (`sirius_pipeline_converter.cpp:1380`), leaving the
+  // RESULT_COLLECTOR pipeline with no input source — runtime hang. Not caught by the E.1
+  // differential gate because `convert_query_to_dump` builds plans by calling
+  // `physical_planner.create_plan()` directly, bypassing the wrapping path.
+  if (op.type == sirius::op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
+    auto& rc = op.Cast<sirius::op::sirius_physical_result_collector>();
+    set_parent_ops(rc.plan, &op);
+  }
 }
 
 void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
