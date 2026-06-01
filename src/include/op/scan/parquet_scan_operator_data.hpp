@@ -131,12 +131,14 @@ class parquet_scan_data : public op::operator_data {
                     std::shared_ptr<cudf::io::parquet_reader_options> reader_options,
                     std::shared_ptr<duckdb::Expression> filter_expression,
                     std::shared_ptr<scan_plan const> plan,
-                    std::vector<std::string> partition_values)
+                    std::vector<std::string> partition_values,
+                    bool disable_filter_pushdown = false)
     : rg_slices(std::move(rg_slices)),
       reader_options(std::move(reader_options)),
       filter_expression(std::move(filter_expression)),
       plan(std::move(plan)),
-      partition_values(std::move(partition_values))
+      partition_values(std::move(partition_values)),
+      disable_filter_pushdown(disable_filter_pushdown)
   {
   }
 
@@ -191,6 +193,13 @@ class parquet_scan_data : public op::operator_data {
   /// order. Empty when the table has no hive partitions. assemble_scan_output consumes this
   /// directly instead of re-parsing a file path at execute time.
   std::vector<std::string> partition_values;
+  /// When true, the scan operator MUST NOT call set_filter on its reader options.
+  /// Set by parquet_split_provider when any decimal column is stored as
+  /// FIXED_LEN_BYTE_ARRAY / BYTE_ARRAY — cudf's row-group stats filter cannot
+  /// compare a fixed_point_scalar AST literal against those physical types and
+  /// throws "Invalid type and stats combination" (stats_filter_helpers.hpp:132).
+  /// The filter still applies post-decode via gpu_expression_executor::select.
+  bool disable_filter_pushdown = false;
   /// GPU memory space for allocating output tables produced by execute().
   cucascade::memory::memory_space* gpu_memory_space = nullptr;
 };

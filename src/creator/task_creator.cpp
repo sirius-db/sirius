@@ -173,8 +173,15 @@ void task_creator::drain_pending_tasks()
   // Drain any queued task creation requests that haven't been picked up yet
   _task_creation_queue.interrupt();
   _task_creation_queue.drain();
-  // Wait for any in-flight task creation lambdas to finish
-  _bounded_pool->wait_all();
+  // Wait for any in-flight task creation lambdas to finish. When called from
+  // task_scheduler::drain_after_error(), stop_thread_pool() has already joined
+  // the worker pool and reset _bounded_pool to null — in that case the pool's
+  // own destructor already drained in-flight work, so this wait_all is
+  // redundant. Dereferencing the null pointer here throws std::system_error
+  // (EPERM) from the pthread_mutex call on garbage memory, surfacing to the
+  // caller as "Operation not permitted" and breaking otherwise-successful
+  // multi-file SF1000 scans.
+  if (_bounded_pool) { _bounded_pool->wait_all(); }
   _task_creation_queue.reactivate();
 }
 
