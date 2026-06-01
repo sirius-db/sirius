@@ -82,7 +82,8 @@ duckdb::unique_ptr<op::sirius_physical_operator> construct_sirius_specific_opera
         if (it != iceberg_cache->end()) { iceberg_scan->delete_data = it->second; }
       }
       return iceberg_scan;
-    } else if (scan_physical_op.function.name == "seq_scan") {
+    } else if (scan_physical_op.function.name == "seq_scan" ||
+               scan_physical_op.function.name == "lance_vector_search") {
       return duckdb::make_uniq<op::sirius_physical_duckdb_scan>(&scan_physical_op);
     } else {
       throw duckdb::NotImplementedException("Unsupported scan function: " +
@@ -386,7 +387,8 @@ void sirius_pipeline_converter::split_table_scan_source(
     return;
   }
 
-  if (scan_op.function.name == "seq_scan" || scan_op.function.name == "iceberg_scan") {
+  if (scan_op.function.name == "seq_scan" || scan_op.function.name == "iceberg_scan" ||
+      scan_op.function.name == "lance_vector_search") {
     auto new_pipeline = duckdb::make_shared_ptr<sirius_pipeline>(build_ctx_);
 
     auto new_scan_op = construct_sirius_specific_operator(scan_op, iceberg_cache_);
@@ -1278,7 +1280,8 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
       } else if (first_op.type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
         const auto& scan_name = first_op.Cast<op::sirius_physical_table_scan>().function.name;
         if (scan_name != "seq_scan" && scan_name != "parquet_scan" && scan_name != "read_parquet" &&
-            scan_name != "sirius_read_parquet" && scan_name != "iceberg_scan") {
+            scan_name != "sirius_read_parquet" && scan_name != "iceberg_scan" &&
+            scan_name != "lance_vector_search") {
           throw std::runtime_error("Unsupported scan function: " + scan_name);
         }
         // Scans have "scan" port

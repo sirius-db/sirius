@@ -19,6 +19,7 @@
 #include "log/logging.hpp"
 
 #include <algorithm>
+#include <utility>
 
 namespace sirius {
 namespace op {
@@ -38,7 +39,13 @@ sirius_physical_duckdb_scan::sirius_physical_duckdb_scan(sirius_physical_table_s
   : sirius_physical_duckdb_scan(
       table_scan->types,
       table_scan->function,
-      table_scan->bind_data ? table_scan->bind_data->Copy() : nullptr,
+      // Move (not Copy) the bind data: the table_scan node is converted to a duckdb_scan exactly
+      // once and never reads bind_data afterwards, so transferring ownership is behavior-preserving
+      // and additionally supports table functions whose bind data is movable but not copyable (the
+      // DuckDB lance extension's lance_vector_search bind data does not implement Copy). The
+      // null-guard keeps a hypothetical double-conversion defined (nullptr) rather than UB. The
+      // parquet/iceberg scan ctors intentionally keep Copy().
+      table_scan->bind_data ? std::move(table_scan->bind_data) : nullptr,
       table_scan->returned_types,
       table_scan->column_ids,
       table_scan->projection_ids,

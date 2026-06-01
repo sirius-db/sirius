@@ -24,9 +24,100 @@
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
+#include <duckdb/common/types/decimal.hpp>
+
 #include <unordered_set>
 
 namespace sirius::planner {
+
+namespace {
+
+bool is_lance_vector_search(const std::string& function_name)
+{
+  return function_name == "lance_vector_search";
+}
+
+void guard_lance_vector_search_projected_type(const duckdb::LogicalType& type,
+                                              const std::string& column_name)
+{
+  using duckdb::LogicalTypeId;
+
+  switch (type.id()) {
+    case LogicalTypeId::LIST:
+    case LogicalTypeId::ARRAY:
+    case LogicalTypeId::STRUCT:
+    case LogicalTypeId::HUGEINT:
+    case LogicalTypeId::UHUGEINT:
+      throw duckdb::NotImplementedException(
+        "lance_vector_search projected column '%s' has unsupported type %s for Sirius GPU "
+        "routing",
+        column_name,
+        type.ToString());
+    case LogicalTypeId::DECIMAL:
+      if (duckdb::DecimalType::GetWidth(type) > 18) {
+        throw duckdb::NotImplementedException(
+          "lance_vector_search projected column '%s' has unsupported type %s for Sirius GPU "
+          "routing",
+          column_name,
+          type.ToString());
+      }
+      break;
+    default: break;
+  }
+}
+
+void guard_lance_vector_search_projected_types(
+  const duckdb::LogicalGet& op, const duckdb::vector<duckdb::ColumnIndex>& column_ids)
+{
+  if (!is_lance_vector_search(op.function.name)) { return; }
+
+  auto check_projected_column = [&](std::size_t projection_id) {
+    const auto& column_id = column_ids[projection_id];
+    if (column_id.IsRowIdColumn()) { return; }
+
+    const auto returned_type_idx = column_id.GetPrimaryIndex();
+    guard_lance_vector_search_projected_type(op.returned_types[returned_type_idx],
+                                             op.names[returned_type_idx]);
+  };
+
+  if (!op.projection_ids.empty()) {
+    for (const auto projection_id : op.projection_ids) {
+      check_projected_column(projection_id);
+    }
+    return;
+  }
+
+  for (std::size_t i = 0; i < column_ids.size(); i++) {
+    check_projected_column(i);
+  }
+}
+
+// Convert a table function's full returned-type list to Sirius types, substituting a benign
+// placeholder for any column type Sirius cannot represent (e.g. ARRAY/FLOAT[N]).
+//
+// Used only for the lance_vector_search scan node. lance reports a full schema that always
+// includes its vector column (FLOAT[N] = ARRAY), but that column is never referenced by the
+// query (projection pushdown prunes column_ids to the selected scalar columns) and is therefore
+// never materialized. The projected-column guard above has already rejected any *projected*
+// unsupported type, so only un-referenced columns can be unconvertible here. The placeholder is
+// never read; positional indexing is preserved (column_ids index into this vector).
+duckdb::vector<sirius::logical_type> from_duckdb_vec_unprojected_tolerant(
+  const duckdb::vector<duckdb::LogicalType>& types)
+{
+  duckdb::vector<sirius::logical_type> result;
+  result.reserve(types.size());
+  for (const auto& type : types) {
+    try {
+      result.push_back(sirius::from_duckdb(type));
+    } catch (const std::exception&) {
+      // Unrepresentable un-referenced column (e.g. the lance vector column): placeholder only.
+      result.push_back(sirius::logical_type::make(sirius::type_id::LIST));
+    }
+  }
+  return result;
+}
+
+}  // namespace
 
 duckdb::unique_ptr<duckdb::TableFilterSet> create_table_filter_set(
   duckdb::TableFilterSet& table_filters, const duckdb::vector<duckdb::ColumnIndex>& column_ids)
@@ -57,10 +148,14 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
 
   // Only GPU-route known table scan functions; all others (pragma, system catalog
   // functions, etc.) must fall back to CPU.
-  static const std::unordered_set<std::string> kSupportedScanFunctions = {
-    "seq_scan", "parquet_scan", "read_parquet", "sirius_read_parquet", "iceberg_scan"};
+  static const std::unordered_set<std::string> kSupportedScanFunctions = {"seq_scan",
+                                                                          "parquet_scan",
+                                                                          "read_parquet",
+                                                                          "sirius_read_parquet",
+                                                                          "iceberg_scan",
+                                                                          "lance_vector_search"};
   if (kSupportedScanFunctions.find(op.function.name) == kSupportedScanFunctions.end()) {
-    throw duckdb::NotImplementedException("Table function '{}' is not supported in Sirius",
+    throw duckdb::NotImplementedException("Table function '%s' is not supported in Sirius",
                                           op.function.name);
   }
 
@@ -157,6 +252,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     }
   }
   op.ResolveOperatorTypes();
+  guard_lance_vector_search_projected_types(op, column_ids);
   // create the table scan node
   if (!op.function.projection_pushdown) {
     // function does not support projection pushdown
@@ -220,11 +316,18 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     return std::move(projection);
   }
 
-  auto node = duckdb::make_uniq<sirius::op::sirius_physical_table_scan>(
+  // lance_vector_search reports a full schema that includes an un-referenced ARRAY vector column
+  // Sirius cannot represent; tolerate it (placeholder) so plan generation does not abort. The
+  // column is pruned from column_ids by projection pushdown and is never materialized. Other
+  // functions keep the strict conversion.
+  auto scan_returned_types = is_lance_vector_search(op.function.name)
+                               ? from_duckdb_vec_unprojected_tolerant(op.returned_types)
+                               : sirius::from_duckdb_vec(op.returned_types);
+  auto node                = duckdb::make_uniq<sirius::op::sirius_physical_table_scan>(
     sirius::from_duckdb_vec(original_types),  // Use original types, not modified
     op.function,
     std::move(op.bind_data),
-    sirius::from_duckdb_vec(op.returned_types),
+    std::move(scan_returned_types),
     column_ids,
     op.projection_ids,
     op.names,
