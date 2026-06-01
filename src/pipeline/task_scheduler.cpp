@@ -219,16 +219,24 @@ void task_scheduler::terminate_query(std::exception_ptr error)
 void task_scheduler::drain_after_error()
 {
   SIRIUS_LOG_INFO("task_scheduler: draining after error");
-  // Drain the task creator first so no thread is inside get_next_task_input_data()/
-  // pop_data_batch() when QueryEnd() clears repositories (avoids use-after-free).
-  if (_task_creator) {
-    _task_creator->stop_thread_pool();
-    // Also drain the pending task_creation_request queue. stop_thread_pool only
-    // interrupts and joins workers; queued requests still hold shared_ptr<data_batch>
-    // references that would survive clear_all_repositories at QueryEnd, contributing
-    // to inter-iteration "memory leak" warnings and residual GPU memory pressure.
-    _task_creator->drain_pending_tasks();
-  }
+  // Teardown ordering is load-bearing. The scan/gpu executor drains below run
+  // in-flight tasks to completion, and a completing task schedules its
+  // downstream consumers via task_creator::schedule() (gpu_pipeline_executor and
+  // duckdb_scan_executor both do this). Each such request holds a raw
+  // sirius_physical_operator* owned by the engine, which is destroyed the moment
+  // execute() returns. If the task_creator is live (or restarted) while those
+  // requests are still in flight, its manager_loop dereferences a freed operator
+  // in get_operator_for_next_task() — a use-after-free that crashes intermittently
+  // under multi-partition sort with many in-flight pipeline tasks.
+  //
+  // So: stop the task_creator FIRST and keep its queue interrupted across the
+  // executor drains. With the queue interrupted, schedule() pushes from
+  // completion callbacks return false and the requests (and their dangling
+  // operator pointers) are dropped instead of processed. Only AFTER every
+  // executor has quiesced do we drain the creation queue and restart the
+  // creator for the next query.
+  if (_task_creator) { _task_creator->stop_thread_pool(); }
+
   // Drain the top-level task queue so management_eventloop doesn't dispatch
   // stale tasks from the failed query.
   _task_queue.drain();
@@ -245,6 +253,20 @@ void task_scheduler::drain_after_error()
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->drain_and_wait();
   }
+
+  // Now that no executor can generate further task_creation_requests, discard
+  // any that accumulated (and release the shared_ptr<data_batch> references they
+  // hold, which would otherwise survive clear_all_repositories at QueryEnd and
+  // show up as inter-iteration "memory leak" warnings). drain_pending_tasks()
+  // reactivates the queue when done.
+  if (_task_creator) { _task_creator->drain_pending_tasks(); }
+
+  // Belt-and-suspenders: the executor restarts above emit device_ready signals,
+  // and the management loop may have dispatched a leftover task into an executor
+  // queue between the two drains. Clear the top-level queue once more so the
+  // next query starts from empty.
+  _task_queue.drain();
+
   if (_task_creator) { _task_creator->start_thread_pool(); }
   SIRIUS_LOG_INFO("task_scheduler: DONE draining after error");
 }
