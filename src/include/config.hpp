@@ -64,8 +64,9 @@ struct Config {
   // sirius_pipeline_converter (which constructs ~12 operator types at runtime) to the
   // tree-based path where sirius_physical_plan_generator inserts all operators into the plan
   // tree and the converter becomes a pure topology pass driven by per-operator build_pipelines
-  // overrides. Default false until both paths produce byte-identical pipeline state on every
-  // TPC-H plan (verified via the Sub-phase D differential dump test).
+  // overrides. Default true: the Sub-phase E.1 differential dump test confirms byte-identical
+  // pipeline state vs the legacy converter on every TPC-H SF1 plan. Set false to fall back to
+  // the legacy converter path (kept for rollback; planned for deletion in a follow-up).
   static bool USE_TREE_BASED_PIPELINE_BUILD;
 
   // Whether to fall back to duckdb execution after an error is detected

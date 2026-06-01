@@ -1784,8 +1784,8 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             SetModifiedPipeline);
 
   // Phase 3 (#601) gate for tree-based pipeline build. See Config::USE_TREE_BASED_PIPELINE_BUILD
-  // in config.hpp for the design rationale. Default false until the differential dump test
-  // confirms byte-identical pipeline state vs the legacy converter path on every TPC-H plan.
+  // in config.hpp for the design rationale. Default true: Sub-phase E.1 differential dump test
+  // confirms byte-identical pipeline state vs the legacy converter on every TPC-H SF1 plan.
   config.AddExtensionOption(
     "use_tree_based_pipeline_build",
     "Phase 3 (#601) gate: build pipelines from the operator tree (build_pipelines virtuals) "
