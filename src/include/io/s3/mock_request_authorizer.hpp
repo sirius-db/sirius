@@ -17,9 +17,10 @@
 #pragma once
 
 #include "io/io_errors.hpp"
-#include "io/s3/credential_provider.hpp"
+#include "io/s3/s3_request_authorizer.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -27,55 +28,60 @@
 namespace sirius::io::s3 {
 
 /**
- * @brief Test-only @c credential_provider that returns a canned URL or throws.
+ * @brief Test-only @c s3_request_authorizer that returns a canned
+ *        @c s3_authorized_request or throws.
  *
  * Header-only so the S3 reactor PR (PR3) and downstream test suites can
  * include it without a separate library target. Produces deterministic
- * output for unit tests of code that consumes @c credential_provider through
+ * output for unit tests of code that consumes @c s3_request_authorizer through
  * the abstract base class — typical pattern is:
  *
  * @code
- *   auto provider = std::make_shared<mock_credential_provider>("https://canned/url");
+ *   auto provider = std::make_shared<mock_request_authorizer>(
+ *     s3_authorized_request{"https://canned/url", {}});
  *   reactor->set_credentials(provider);
  *   reactor->read(obj);
  *   CHECK(provider->call_count() == 1);
  *   CHECK(provider->last_bucket() == "mybucket");
  * @endcode
  *
- * Default behavior: every call to @c get_presigned_url returns the URL
- * passed to the constructor verbatim (independent of @p obj / @p method) so
- * tests can verify "the reactor passed our URL to libcurl unchanged". To
- * exercise error paths, call @c set_throw to make subsequent calls throw
- * @c sirius::io::credential_error.
+ * Default behavior: every call to @c authorize returns the
+ * @c s3_authorized_request passed to the constructor verbatim (independent of
+ * @p obj / @p method) so tests can verify "the reactor passed our URL +
+ * headers to libcurl unchanged". To exercise error paths, call @c set_throw to
+ * make subsequent calls throw @c sirius::io::credential_error.
  *
  * Thread safety: counters are atomic; @c last_bucket / @c last_key are
  * guarded by an internal mutex. Safe to share across threads when tests
  * exercise concurrent reactor paths.
  */
-class mock_credential_provider final : public credential_provider {
+class mock_request_authorizer final : public s3_request_authorizer {
  public:
-  explicit mock_credential_provider(std::string url) : _url(std::move(url)) {}
+  explicit mock_request_authorizer(s3_authorized_request canned) : _canned(std::move(canned)) {}
 
-  std::string get_presigned_url(s3_object_ref const& obj, presign_method method) override
+  s3_authorized_request authorize(s3_object_ref const& obj,
+                                  s3_request_method method,
+                                  std::chrono::seconds timeout) override
   {
     ++_call_count;
-    if (method == presign_method::GET) ++_get_count;
-    if (method == presign_method::HEAD) ++_head_count;
+    if (method == s3_request_method::GET) ++_get_count;
+    if (method == s3_request_method::HEAD) ++_head_count;
     {
       std::scoped_lock lk{_last_mtx};
-      _last_bucket = obj.bucket;
-      _last_key    = obj.key;
+      _last_bucket  = obj.bucket;
+      _last_key     = obj.key;
+      _last_timeout = timeout;
     }
     if (_should_throw.load()) {
       std::string msg;
       {
         std::scoped_lock lk{_last_mtx};
         msg =
-          _throw_msg.empty() ? std::string{"mock_credential_provider: forced failure"} : _throw_msg;
+          _throw_msg.empty() ? std::string{"mock_request_authorizer: forced failure"} : _throw_msg;
       }
       throw credential_error(msg);
     }
-    return _url;
+    return _canned;
   }
 
   /// Subsequent calls throw @c credential_error with @p msg (or default).
@@ -112,9 +118,14 @@ class mock_credential_provider final : public credential_provider {
     std::scoped_lock lk{_last_mtx};
     return _last_key;
   }
+  [[nodiscard]] std::chrono::seconds last_timeout() const
+  {
+    std::scoped_lock lk{_last_mtx};
+    return _last_timeout;
+  }
 
  private:
-  std::string _url;
+  s3_authorized_request _canned;
   std::atomic<int> _call_count{0};
   std::atomic<int> _get_count{0};
   std::atomic<int> _head_count{0};
@@ -122,6 +133,7 @@ class mock_credential_provider final : public credential_provider {
   mutable std::mutex _last_mtx;
   std::string _last_bucket;
   std::string _last_key;
+  std::chrono::seconds _last_timeout{0};
   std::string _throw_msg;
 };
 

@@ -16,9 +16,9 @@
 
 #include "catch.hpp"
 #include "io/prefetching_cache.hpp"
-#include "io/s3/credential_provider.hpp"
 #include "io/s3/s3_ioctx.hpp"
-#include "io/s3/sirius_sigv4_credential_provider.hpp"
+#include "io/s3/s3_request_authorizer.hpp"
+#include "io/s3/sirius_sigv4_authorizer.hpp"
 
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
@@ -46,12 +46,13 @@
 #include <vector>
 
 using sirius::io::buffer_pool;
-using sirius::io::s3::credential_provider;
-using sirius::io::s3::presign_method;
+using sirius::io::s3::s3_authorized_request;
 using sirius::io::s3::s3_ioctx;
 using sirius::io::s3::s3_ioctx_config;
 using sirius::io::s3::s3_object_ref;
-using sirius::io::s3::sirius_sigv4_credential_provider;
+using sirius::io::s3::s3_request_authorizer;
+using sirius::io::s3::s3_request_method;
+using sirius::io::s3::sirius_sigv4_presigned_authorizer;
 using sirius::io::s3::static_credentials;
 
 namespace {
@@ -114,21 +115,23 @@ std::optional<bench_env> read_bench_env()
 
 std::string s3_uri(bench_env const& env) { return "s3://" + env.bucket + "/" + env.key; }
 
-class recording_credential_provider final : public credential_provider {
+class recording_request_authorizer final : public s3_request_authorizer {
  public:
-  explicit recording_credential_provider(bench_env const& env) : _endpoint(env.endpoint)
+  explicit recording_request_authorizer(bench_env const& env) : _endpoint(env.endpoint)
   {
     static_credentials creds;
     creds.access_key_id     = env.access_key;
     creds.secret_access_key = env.secret_key;
-    _delegate               = std::make_shared<sirius_sigv4_credential_provider>(
+    _delegate               = std::make_shared<sirius_sigv4_presigned_authorizer>(
       std::move(creds), env.region, env.endpoint, std::chrono::minutes{30});
   }
 
-  std::string get_presigned_url(s3_object_ref const& obj, presign_method method) override
+  s3_authorized_request authorize(s3_object_ref const& obj,
+                                  s3_request_method method,
+                                  std::chrono::seconds timeout) override
   {
-    if (method == presign_method::GET) { _get_count.fetch_add(1, std::memory_order_relaxed); }
-    return _delegate->get_presigned_url(obj, method);
+    if (method == s3_request_method::GET) { _get_count.fetch_add(1, std::memory_order_relaxed); }
+    return _delegate->authorize(obj, method, timeout);
   }
 
   [[nodiscard]] std::string const& endpoint() const noexcept { return _endpoint; }
@@ -138,12 +141,12 @@ class recording_credential_provider final : public credential_provider {
   }
 
  private:
-  std::shared_ptr<credential_provider> _delegate;
+  std::shared_ptr<s3_request_authorizer> _delegate;
   std::string _endpoint;
   std::atomic<std::uint64_t> _get_count{0};
 };
 
-std::shared_ptr<s3_ioctx> make_bench_ioctx(std::shared_ptr<recording_credential_provider> provider)
+std::shared_ptr<s3_ioctx> make_bench_ioctx(std::shared_ptr<recording_request_authorizer> provider)
 {
   s3_ioctx_config cfg{};
   cfg.creds             = std::move(provider);
@@ -355,7 +358,7 @@ TEST_CASE("S3 parquet perf benchmark emits portable JSON baseline", "[!benchmark
     return;
   }
 
-  auto provider = std::make_shared<recording_credential_provider>(*env);
+  auto provider = std::make_shared<recording_request_authorizer>(*env);
   auto ctx      = make_bench_ioctx(provider);
   auto path     = s3_uri(*env);
 

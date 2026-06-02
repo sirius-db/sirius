@@ -28,5 +28,26 @@ services:
     volumes:
       - minio-data:/data
 
+  minio-tls:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z-cpuv1
+    container_name: sirius-test-minio-tls
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_REGION: us-east-1
+    ports:
+      - "127.0.0.1:9443:9000"   # HTTPS S3 API
+      - "127.0.0.1:9444:9001"   # HTTPS Web console
+    healthcheck:
+      test: ["CMD", "curl", "-k", "-f", "https://127.0.0.1:9000/minio/health/ready"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    volumes:
+      - minio-tls-data:/data
+      - ./certs:/root/.minio/certs:ro
+
 volumes:
   minio-data:
+  minio-tls-data:

@@ -18,8 +18,8 @@
 
 #include "exec/thread_pool.hpp"
 #include "io/prefetching_cache.hpp"
-#include "io/s3/credential_provider.hpp"
 #include "io/s3/s3_io_object.hpp"
+#include "io/s3/s3_request_authorizer.hpp"
 #include "io/sirius_datasource.hpp"
 #include "io/uri_parser.hpp"
 
@@ -260,6 +260,21 @@ bool parse_content_range(std::string_view v, std::size_t& start, std::size_t& en
   return start <= end;
 }
 
+// Build a libcurl header list ("Name: value") from the authorizer-supplied
+// headers. Returns nullptr for an empty header set (the presigned-authorizer
+// case), so callers can pass the result straight to CURLOPT_HTTPHEADER or
+// append additional headers (e.g. Range) onto it. curl_slist_free_all is a
+// no-op on nullptr, so callers always free unconditionally.
+curl_slist* build_header_slist(std::vector<std::pair<std::string, std::string>> const& headers)
+{
+  curl_slist* list = nullptr;
+  for (auto const& [name, value] : headers) {
+    std::string line = name + ": " + value;
+    list             = curl_slist_append(list, line.c_str());
+  }
+  return list;
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -279,7 +294,7 @@ void s3_ioctx::handle_slot::reset()
 
 s3_ioctx::s3_ioctx(s3_ioctx_config config) : _cfg(std::move(config))
 {
-  if (!_cfg.creds) throw std::invalid_argument("s3_ioctx: credential_provider is required");
+  if (!_cfg.creds) throw std::invalid_argument("s3_ioctx: s3_request_authorizer is required");
   if (_cfg.max_connections == 0) _cfg.max_connections = 1;
 
   ensure_curl_inited();
@@ -422,12 +437,25 @@ void s3_ioctx::release_handle(handle_slot slot)
 // HEAD / range GET
 // ===========================================================================
 
+// Per-attempt presigned-URL TTL: cover one libcurl request + clock skew, NOT the
+// whole scan/task lifetime (newplan §30.1 / Codex F4). The URL is freshly minted
+// each attempt, so a short TTL limits leaked-URL blast radius. Falls back to
+// 5 min when no per-request curl timeout is configured.
+static std::chrono::seconds presign_ttl_for_attempt(long request_timeout_s)
+{
+  constexpr long kSkewSeconds = 60;
+  long const base             = request_timeout_s > 0 ? request_timeout_s : 300;
+  return std::chrono::seconds{base + kSkewSeconds};
+}
+
 std::size_t s3_ioctx::head_object_size(std::string_view bucket, std::string_view key)
 {
-  // Auth lives in the URL's query string (X-Amz-Signature etc.); no
-  // Authorization / x-amz-date headers needed. The presigned URL is freshly
-  // minted each attempt — if a retry crosses the presigner's TTL window the
-  // next attempt still gets a valid URL.
+  // Auth is delegated to the request authorizer. In presigned mode it lives in
+  // the URL's query string (X-Amz-Signature etc.) and the returned header set
+  // is empty; in header-signing mode the authorizer also returns Authorization
+  // / x-amz-* headers that we attach verbatim. Either way the request is
+  // re-authorized each attempt — if a retry crosses the authorizer's TTL
+  // window the next attempt still gets a valid URL / signature.
   auto const max_attempts = std::max<std::size_t>(_cfg.max_retry_attempts, 1);
   auto slot               = acquire_handle();
   auto* h                 = static_cast<CURL*>(slot.easy);
@@ -438,16 +466,29 @@ std::size_t s3_ioctx::head_object_size(std::string_view bucket, std::string_view
 
   for (std::size_t attempt = 1; attempt <= max_attempts; ++attempt) {
     curl_easy_reset(h);
-    std::string url = _cfg.creds->get_presigned_url(
-      s3_object_ref{std::string{bucket}, std::string{key}}, presign_method::HEAD);
+    s3_authorized_request req =
+      _cfg.creds->authorize(s3_object_ref{std::string{bucket}, std::string{key}},
+                            s3_request_method::HEAD,
+                            presign_ttl_for_attempt(_cfg.request_timeout_s));
+    curl_slist* hdrs = build_header_slist(req.headers);
     header_capture hc;
-    curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(h, CURLOPT_URL, req.url.c_str());
     curl_easy_setopt(h, CURLOPT_NOBODY, 1L);
+    if (hdrs) curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdrs);
     curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, curl_header_capture);
     curl_easy_setopt(h, CURLOPT_HEADERDATA, &hc);
     if (_cfg.request_timeout_s > 0) curl_easy_setopt(h, CURLOPT_TIMEOUT, _cfg.request_timeout_s);
+    // TLS: verify against a custom CA bundle when configured (on-prem / self-signed /
+    // local-HTTPS); empty -> libcurl's system CA bundle (AWS). tls_verify=false disables checks.
+    if (!_cfg.ca_bundle_path.empty())
+      curl_easy_setopt(h, CURLOPT_CAINFO, _cfg.ca_bundle_path.c_str());
+    if (!_cfg.tls_verify) {
+      curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 0L);
+      curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, 0L);
+    }
 
     last_curl_code = curl_easy_perform(h);
+    curl_slist_free_all(hdrs);
     last_http_code = 0;
     curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &last_http_code);
 
@@ -496,21 +537,26 @@ std::size_t s3_ioctx::range_get(std::string_view bucket,
   for (std::size_t attempt = 1; attempt <= max_attempts; ++attempt) {
     curl_easy_reset(h);
 
-    // Auth lives in the URL's query string; we only attach the Range header,
-    // which the presigned URL deliberately leaves unsigned (SignedHeaders=host
-    // only) so callers may add Range / Accept / etc. without breaking the
-    // signature.
-    std::string url = _cfg.creds->get_presigned_url(
-      s3_object_ref{std::string{bucket}, std::string{key}}, presign_method::GET);
+    // Auth is delegated to the request authorizer. In header-signing mode it
+    // returns Authorization / x-amz-* headers (attached first); in presigned
+    // mode the header set is empty and auth lives in the URL query, which
+    // deliberately leaves the Range header unsigned (SignedHeaders=host only)
+    // so callers may add Range / Accept / etc. without breaking the signature.
+    // The Range header is appended last in both modes.
+    s3_authorized_request req =
+      _cfg.creds->authorize(s3_object_ref{std::string{bucket}, std::string{key}},
+                            s3_request_method::GET,
+                            presign_ttl_for_attempt(_cfg.request_timeout_s));
 
     std::ostringstream range_os;
     range_os << "Range: bytes=" << offset << "-" << (offset + size - 1);
     std::string range_header = range_os.str();
-    curl_slist* hdrs         = curl_slist_append(nullptr, range_header.c_str());
+    curl_slist* hdrs         = build_header_slist(req.headers);
+    hdrs                     = curl_slist_append(hdrs, range_header.c_str());
 
     buf_sink sink{dst, size, 0, 0};
     header_capture hc;
-    curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(h, CURLOPT_URL, req.url.c_str());
     curl_easy_setopt(h, CURLOPT_HTTPGET, 1L);
     curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdrs);
     curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, curl_write_buf);
@@ -518,6 +564,14 @@ std::size_t s3_ioctx::range_get(std::string_view bucket,
     curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, curl_header_capture);
     curl_easy_setopt(h, CURLOPT_HEADERDATA, &hc);
     if (_cfg.request_timeout_s > 0) curl_easy_setopt(h, CURLOPT_TIMEOUT, _cfg.request_timeout_s);
+    // TLS: verify against a custom CA bundle when configured (on-prem / self-signed /
+    // local-HTTPS); empty -> libcurl's system CA bundle (AWS). tls_verify=false disables checks.
+    if (!_cfg.ca_bundle_path.empty())
+      curl_easy_setopt(h, CURLOPT_CAINFO, _cfg.ca_bundle_path.c_str());
+    if (!_cfg.tls_verify) {
+      curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 0L);
+      curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, 0L);
+    }
 
     last_curl_code = curl_easy_perform(h);
     curl_slist_free_all(hdrs);

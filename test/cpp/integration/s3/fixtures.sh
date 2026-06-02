@@ -55,6 +55,7 @@ else
   SECRET_KEY="${SIRIUS_TEST_S3_SECRET_KEY:-minioadmin}"
   BUCKET="${SIRIUS_TEST_S3_BUCKET:-sirius-test}"
 fi
+TLS_ENDPOINT="${SIRIUS_TEST_S3_HTTPS_ENDPOINT:-https://127.0.0.1:9443}"
 
 KEY="${SIRIUS_BENCH_S3_KEY:-tpch/lineitem_sf10.parquet}"
 WORK_DIR="${SIRIUS_BENCH_WORK_DIR:-${SCRIPT_DIR}/fixtures/generated}"
@@ -88,46 +89,84 @@ if [[ "${PERF_MODE}" -eq 1 ]]; then
   mkdir -p "${WORK_DIR}"
 fi
 
-echo "[fixtures] waiting for MinIO at ${ENDPOINT}"
-for _ in $(seq 1 30); do
-  if curl -sf "${ENDPOINT}/minio/health/ready" >/dev/null; then
-    break
+wait_for_minio() {
+  local endpoint="$1"
+  local curl_tls_flag="$2"
+  local -a curl_args=(-sf)
+  if [[ -n "${curl_tls_flag}" ]]; then
+    curl_args+=("${curl_tls_flag}")
   fi
-  sleep 1
-done
-if ! curl -sf "${ENDPOINT}/minio/health/ready" >/dev/null; then
-  echo "[fixtures] MinIO did not become ready at ${ENDPOINT}; is it up?" >&2
-  exit 1
-fi
+  echo "[fixtures] waiting for MinIO at ${endpoint}"
+  for _ in $(seq 1 30); do
+    if curl "${curl_args[@]}" "${endpoint}/minio/health/ready" >/dev/null; then
+      return
+    fi
+    sleep 1
+  done
+  if ! curl "${curl_args[@]}" "${endpoint}/minio/health/ready" >/dev/null; then
+    echo "[fixtures] MinIO did not become ready at ${endpoint}; is it up?" >&2
+    exit 1
+  fi
+}
+
+docker_reachable_endpoint() {
+  local endpoint="$1"
+  if [[ "$(uname -s)" == "Linux" ]]; then
+    printf '%s' "${endpoint}"
+  else
+    printf '%s' "${endpoint/127.0.0.1/host.docker.internal}"
+  fi
+}
+
+wait_for_minio "${ENDPOINT}" ""
+wait_for_minio "${TLS_ENDPOINT}" "-k"
 
 # mc talks to the host-network MinIO. host.docker.internal works on macOS;
 # on Linux we use --network=host + the loopback endpoint.
 if [[ "$(uname -s)" == "Linux" ]]; then
   MC_NET=(--network=host)
-  MC_ENDPOINT="${ENDPOINT}"
 else
   MC_NET=()
-  MC_ENDPOINT="${ENDPOINT/127.0.0.1/host.docker.internal}"
 fi
+MC_ENDPOINT="$(docker_reachable_endpoint "${ENDPOINT}")"
+MC_TLS_ENDPOINT="$(docker_reachable_endpoint "${TLS_ENDPOINT}")"
 
 mc_run() {
+  local alias_name="$1"
+  local endpoint="$2"
+  local insecure="$3"
+  shift 3
+
   local -a mounts=(-v "${FIXTURE_DIR}:/fixtures:ro")
   if [[ "${PERF_MODE}" -eq 1 ]]; then
     mounts+=(-v "${WORK_DIR}:/work:ro")
+  fi
+  local -a mc_tls_flag=()
+  if [[ "${insecure}" == "1" ]]; then
+    mc_tls_flag=(--insecure)
   fi
 
   docker run --rm "${MC_NET[@]}" \
     "${mounts[@]}" \
     --entrypoint /bin/sh \
     "${MC_IMAGE}" \
-    -c "mc alias set local ${MC_ENDPOINT} ${ACCESS_KEY} ${SECRET_KEY} >/dev/null && $*"
+    -c "mc ${mc_tls_flag[*]} alias set ${alias_name} ${endpoint} ${ACCESS_KEY} ${SECRET_KEY} >/dev/null && mc ${mc_tls_flag[*]} $*"
 }
 
-echo "[fixtures] ensuring bucket ${BUCKET} exists"
-mc_run "mc mb --ignore-existing local/${BUCKET}"
+upload_standard_fixtures() {
+  local alias_name="$1"
+  local endpoint="$2"
+  local insecure="$3"
 
-echo "[fixtures] uploading fixtures to s3://${BUCKET}/"
-mc_run "mc cp --recursive /fixtures/ local/${BUCKET}/"
+  echo "[fixtures] ensuring bucket ${BUCKET} exists at ${endpoint}"
+  mc_run "${alias_name}" "${endpoint}" "${insecure}" "mb --ignore-existing ${alias_name}/${BUCKET}"
+
+  echo "[fixtures] uploading fixtures to ${endpoint}/${BUCKET}/"
+  mc_run "${alias_name}" "${endpoint}" "${insecure}" "cp --recursive /fixtures/ ${alias_name}/${BUCKET}/"
+}
+
+upload_standard_fixtures "local" "${MC_ENDPOINT}" "0"
+upload_standard_fixtures "localtls" "${MC_TLS_ENDPOINT}" "1"
 
 if [[ "${PERF_MODE}" -eq 1 ]]; then
   resolve_duckdb
@@ -145,7 +184,7 @@ SQL
   rm -f "${PERF_DB}"
 
   echo "[fixtures] uploading perf fixture to s3://${BUCKET}/${KEY}"
-  mc_run "mc cp /work/$(basename "${PERF_PARQUET}") local/${BUCKET}/${KEY}"
+  mc_run "local" "${MC_ENDPOINT}" "0" "cp /work/$(basename "${PERF_PARQUET}") local/${BUCKET}/${KEY}"
 
   bytes="$(wc -c < "${PERF_PARQUET}" | tr -d ' ')"
   cat <<EOF
@@ -159,6 +198,8 @@ EOF
 fi
 
 echo "[fixtures] listing s3://${BUCKET}/"
-mc_run "mc ls --recursive local/${BUCKET}"
+mc_run "local" "${MC_ENDPOINT}" "0" "ls --recursive local/${BUCKET}"
+echo "[fixtures] listing tls s3://${BUCKET}/"
+mc_run "localtls" "${MC_TLS_ENDPOINT}" "1" "ls --recursive localtls/${BUCKET}"
 
 echo "[fixtures] done"
