@@ -60,7 +60,8 @@ namespace {
 
 std::unique_ptr<node> translate_reference(duckdb::BoundReferenceExpression const& expr)
 {
-  return std::make_unique<node>(reference{static_cast<uint32_t>(expr.index)});
+  return std::make_unique<node>(
+    reference{static_cast<uint32_t>(expr.index), sirius::from_duckdb(expr.return_type)});
 }
 
 std::unique_ptr<node> translate_constant(duckdb::BoundConstantExpression const& expr)
