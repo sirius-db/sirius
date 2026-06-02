@@ -83,8 +83,15 @@ void s3_async_experimental_ioctx::host_read_ranges_async_io(
     return;
   }
 
-  auto& tobj           = static_cast<s3_async_io_object&>(obj);
-  auto const file_size = tobj.size();
+  auto* tobj = dynamic_cast<s3_async_io_object*>(&obj);
+  if (tobj == nullptr) {
+    handler(0,
+            std::make_exception_ptr(std::invalid_argument(
+              "s3_async_experimental_ioctx::host_read_ranges: io_object is not an "
+              "s3_async_io_object")));
+    return;
+  }
+  auto const file_size = tobj->size();
 
   std::vector<s3_reactor::host_read_req_type> reqs;
   reqs.reserve(ranges.size());
@@ -101,7 +108,7 @@ void s3_async_experimental_ioctx::host_read_ranges_async_io(
     }
     if (sz == 0) continue;
     s3_reactor::host_read_req_type req;
-    req.handle = tobj.host_handle();
+    req.handle = tobj->host_handle();
     req.offset = off;
     req.size   = sz;
     req.dst    = reinterpret_cast<std::uint8_t*>(dst[i].data());

@@ -229,6 +229,16 @@ bool parse_range(std::string const& request, std::size_t& begin, std::size_t& en
   return true;
 }
 
+std::string exception_message(std::exception_ptr ep)
+{
+  if (!ep) { return {}; }
+  try {
+    std::rethrow_exception(ep);
+  } catch (std::exception const& e) {
+    return e.what();
+  }
+}
+
 void send_all(int fd, std::string const& body)
 {
   auto const* data      = body.data();
@@ -241,11 +251,28 @@ void send_all(int fd, std::string const& body)
   }
 }
 
+enum class scripted_response_mode {
+  normal,
+  interior_range_200_full_body,
+  wrong_content_range_start,
+  body_longer_than_requested
+};
+
+struct range_fault_policy {
+  std::size_t fail_first_gets{0};
+  long fail_status{503};
+  std::string fail_reason{"Service Unavailable"};
+  std::optional<int> retry_after_seconds;
+  bool always_fail{false};
+  scripted_response_mode response_mode{scripted_response_mode::normal};
+};
+
 class range_http_server {
  public:
   explicit range_http_server(std::vector<std::uint8_t> object,
-                             std::chrono::milliseconds delay = 0ms)
-    : _object(std::move(object)), _delay(delay)
+                             std::chrono::milliseconds delay = 0ms,
+                             range_fault_policy fault        = {})
+    : _object(std::move(object)), _delay(delay), _fault(std::move(fault))
   {
     _listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
     REQUIRE(_listen_fd >= 0);
@@ -290,6 +317,11 @@ class range_http_server {
   std::size_t peak_active_gets() const noexcept { return _peak_active_gets.load(); }
   std::size_t get_count() const noexcept { return _get_count.load(); }
   std::size_t accept_count() const noexcept { return _accept_count.load(); }
+  std::vector<std::chrono::steady_clock::time_point> get_times() const
+  {
+    std::lock_guard<std::mutex> lk(_get_times_mtx);
+    return _get_times;
+  }
 
  private:
   void serve()
@@ -318,11 +350,29 @@ class range_http_server {
       }
 
       if (request.rfind("GET ", 0) == 0) {
-        _get_count.fetch_add(1, std::memory_order_relaxed);
+        auto const get_index = _get_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        {
+          std::lock_guard<std::mutex> lk(_get_times_mtx);
+          _get_times.push_back(std::chrono::steady_clock::now());
+        }
         auto active = _active_gets.fetch_add(1, std::memory_order_acq_rel) + 1;
         auto peak   = _peak_active_gets.load(std::memory_order_relaxed);
         while (active > peak &&
                !_peak_active_gets.compare_exchange_weak(peak, active, std::memory_order_relaxed)) {}
+
+        if (_fault.always_fail || get_index <= _fault.fail_first_gets) {
+          if (_delay > 0ms) { std::this_thread::sleep_for(_delay); }
+          std::ostringstream out;
+          out << "HTTP/1.1 " << _fault.fail_status << " " << _fault.fail_reason << "\r\n"
+              << "Content-Length: 0\r\n";
+          if (_fault.retry_after_seconds.has_value()) {
+            out << "Retry-After: " << *_fault.retry_after_seconds << "\r\n";
+          }
+          out << "Connection: keep-alive\r\n\r\n";
+          send_all(client, out.str());
+          _active_gets.fetch_sub(1, std::memory_order_acq_rel);
+          continue;
+        }
 
         std::size_t begin = 0;
         std::size_t end   = _object.empty() ? 0 : _object.size() - 1;
@@ -337,11 +387,35 @@ class range_http_server {
 
         end = std::min(end, _object.size() - 1);
         if (_delay > 0ms) { std::this_thread::sleep_for(_delay); }
+        if (_fault.response_mode == scripted_response_mode::interior_range_200_full_body &&
+            begin > 0) {
+          std::string body(reinterpret_cast<char const*>(_object.data()), _object.size());
+          std::ostringstream out;
+          out << "HTTP/1.1 200 OK\r\n"
+              << "Content-Length: " << body.size() << "\r\n"
+              << "Connection: keep-alive\r\n\r\n"
+              << body;
+          send_all(client, out.str());
+          _active_gets.fetch_sub(1, std::memory_order_acq_rel);
+          continue;
+        }
+
         std::string body(reinterpret_cast<char const*>(_object.data() + begin), end - begin + 1);
+        auto content_range_begin = begin;
+        auto content_range_end   = end;
+        if (_fault.response_mode == scripted_response_mode::wrong_content_range_start) {
+          content_range_begin = std::min(begin + 1, _object.size() - 1);
+          content_range_end   = std::min(content_range_begin + body.size() - 1, _object.size() - 1);
+        } else if (_fault.response_mode == scripted_response_mode::body_longer_than_requested &&
+                   end + 1 < _object.size()) {
+          body.push_back(static_cast<char>(_object[end + 1]));
+          content_range_end = end + 1;
+        }
         std::ostringstream out;
         out << "HTTP/1.1 206 Partial Content\r\n"
             << "Content-Length: " << body.size() << "\r\n"
-            << "Content-Range: bytes " << begin << "-" << end << "/" << _object.size() << "\r\n"
+            << "Content-Range: bytes " << content_range_begin << "-" << content_range_end << "/"
+            << _object.size() << "\r\n"
             << "Connection: keep-alive\r\n\r\n"
             << body;
         send_all(client, out.str());
@@ -371,6 +445,7 @@ class range_http_server {
 
   std::vector<std::uint8_t> _object;
   std::chrono::milliseconds _delay;
+  range_fault_policy _fault;
   int _listen_fd{-1};
   std::uint16_t _port{0};
   std::atomic<bool> _stop{false};
@@ -380,6 +455,8 @@ class range_http_server {
   std::atomic<std::size_t> _peak_active_gets{0};
   std::atomic<std::size_t> _get_count{0};
   std::atomic<std::size_t> _accept_count{0};
+  mutable std::mutex _get_times_mtx;
+  std::vector<std::chrono::steady_clock::time_point> _get_times;
 };
 
 class fixed_url_authorizer final : public s3_request_authorizer {
@@ -395,6 +472,28 @@ class fixed_url_authorizer final : public s3_request_authorizer {
 
  private:
   std::string _url;
+};
+
+class get_throwing_then_fixed_authorizer final : public s3_request_authorizer {
+ public:
+  get_throwing_then_fixed_authorizer(std::string url, int throws_remaining)
+    : _url(std::move(url)), _throws_remaining(throws_remaining)
+  {
+  }
+
+  s3_authorized_request authorize(s3_object_ref const&,
+                                  s3_request_method method,
+                                  std::chrono::seconds) override
+  {
+    if (method == s3_request_method::GET && _throws_remaining.fetch_sub(1) > 0) {
+      throw std::runtime_error("scripted authorizer failure");
+    }
+    return s3_authorized_request{_url, {}};
+  }
+
+ private:
+  std::string _url;
+  std::atomic<int> _throws_remaining;
 };
 
 std::shared_ptr<s3_async_experimental_ioctx> make_scripted_async_ioctx(
@@ -533,6 +632,260 @@ TEST_CASE("async-curl S3 host_read_ranges_async reports validation errors throug
   }
 }
 
+TEST_CASE("async-curl S3 retries transient async reads", "[.][s3][integration][asynccurl]")
+{
+  auto payload = test_payload(1024);
+
+  SECTION("ranges async retries two 503s and succeeds")
+  {
+    range_fault_policy fault;
+    fault.fail_first_gets = 2;
+    fault.fail_status     = 503;
+    fault.fail_reason     = "Service Unavailable";
+    range_http_server server(payload, 0ms, std::move(fault));
+    auto ctx = make_scripted_async_ioctx(server, 4);
+    auto obj = ctx->create_io_object("s3://bucket/object.bin");
+
+    std::vector<cudf::io::text::byte_range_info> ranges{{16, 32}, {128, 48}, {400, 64}};
+    std::vector<std::vector<std::byte>> buffers;
+    std::vector<cudf::host_span<std::byte>> spans;
+    for (auto const& range : ranges) {
+      buffers.emplace_back(static_cast<std::size_t>(range.size()));
+      spans.emplace_back(buffers.back().data(), buffers.back().size());
+    }
+
+    std::atomic<int> calls{0};
+    std::promise<async_read_result> done;
+    auto fut = done.get_future();
+    ctx->host_read_ranges_async_io(*obj, ranges, std::span{spans}, [&](auto bytes, auto ep) {
+      calls.fetch_add(1, std::memory_order_relaxed);
+      done.set_value({bytes, ep});
+    });
+
+    REQUIRE(fut.wait_for(5s) == std::future_status::ready);
+    auto result = fut.get();
+    CHECK(calls.load(std::memory_order_relaxed) == 1);
+    REQUIRE(result.ep == nullptr);
+    CHECK(result.bytes == 32 + 48 + 64);
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+      require_bytes_equal(buffers[i], payload, static_cast<std::size_t>(ranges[i].offset()));
+    }
+    CHECK(server.get_count() >= ranges.size() + 2);
+  }
+
+  SECTION("host_read_async retries two 503s and succeeds")
+  {
+    range_fault_policy fault;
+    fault.fail_first_gets = 2;
+    fault.fail_status     = 503;
+    fault.fail_reason     = "Service Unavailable";
+    range_http_server server(payload, 0ms, std::move(fault));
+    auto ctx = make_scripted_async_ioctx(server, 4);
+    auto obj = ctx->create_io_object("s3://bucket/object.bin");
+
+    std::vector<std::uint8_t> out(40);
+    auto fut = ctx->host_read_async(*obj, 200, out.size(), out.data());
+    REQUIRE(fut.wait_for(5s) == std::future_status::ready);
+    std::size_t bytes = 0;
+    REQUIRE_NOTHROW(bytes = fut.get());
+    CHECK(bytes == out.size());
+    CHECK(std::equal(out.begin(), out.end(), payload.begin() + 200));
+    CHECK(server.get_count() >= 3);
+  }
+}
+
+TEST_CASE("async-curl S3 retry exhaustion reports the final transient failure",
+          "[.][s3][integration][asynccurl]")
+{
+  range_fault_policy fault;
+  fault.always_fail = true;
+  fault.fail_status = 503;
+  fault.fail_reason = "Service Unavailable";
+  range_http_server server(test_payload(512), 0ms, std::move(fault));
+  auto ctx = make_scripted_async_ioctx(server, 1);
+  auto obj = ctx->create_io_object("s3://bucket/object.bin");
+
+  std::vector<cudf::io::text::byte_range_info> ranges{{32, 32}};
+  std::vector<std::byte> out(32);
+  std::vector<cudf::host_span<std::byte>> spans{{out.data(), out.size()}};
+
+  auto before = std::chrono::steady_clock::now();
+  auto fut    = read_ranges_async_future(*ctx, *obj, ranges, std::span{spans});
+  REQUIRE(fut.wait_for(5s) == std::future_status::ready);
+  auto elapsed = std::chrono::steady_clock::now() - before;
+  auto result  = fut.get();
+
+  REQUIRE(result.ep != nullptr);
+  CHECK(exception_message(result.ep).find("503") != std::string::npos);
+  CHECK(server.get_count() > ranges.size());
+  CHECK(elapsed < 5s);
+}
+
+TEST_CASE("async-curl S3 honors Retry-After before retrying", "[.][s3][integration][asynccurl]")
+{
+  range_fault_policy fault;
+  fault.fail_first_gets     = 1;
+  fault.fail_status         = 503;
+  fault.fail_reason         = "Service Unavailable";
+  fault.retry_after_seconds = 1;
+  range_http_server server(test_payload(512), 0ms, std::move(fault));
+  auto ctx = make_scripted_async_ioctx(server, 1);
+  auto obj = ctx->create_io_object("s3://bucket/object.bin");
+
+  std::vector<cudf::io::text::byte_range_info> ranges{{64, 32}};
+  std::vector<std::byte> out(32);
+  std::vector<cudf::host_span<std::byte>> spans{{out.data(), out.size()}};
+
+  auto before = std::chrono::steady_clock::now();
+  auto fut    = read_ranges_async_future(*ctx, *obj, ranges, std::span{spans});
+  REQUIRE(fut.wait_for(5s) == std::future_status::ready);
+  auto elapsed = std::chrono::steady_clock::now() - before;
+  auto result  = fut.get();
+
+  REQUIRE(result.ep == nullptr);
+  CHECK(result.bytes == 32);
+  CHECK(elapsed >= 900ms);
+  CHECK(server.get_count() >= 2);
+}
+
+TEST_CASE("async-curl S3 does not retry non-retriable HTTP failures",
+          "[.][s3][integration][asynccurl]")
+{
+  range_fault_policy fault;
+  fault.always_fail = true;
+  fault.fail_status = 404;
+  fault.fail_reason = "Not Found";
+  range_http_server server(test_payload(1024), 0ms, std::move(fault));
+  auto ctx = make_scripted_async_ioctx(server, 4);
+  auto obj = ctx->create_io_object("s3://bucket/object.bin");
+
+  std::vector<cudf::io::text::byte_range_info> ranges{{0, 16}, {32, 16}, {64, 16}};
+  std::vector<std::vector<std::byte>> buffers;
+  std::vector<cudf::host_span<std::byte>> spans;
+  for (auto const& range : ranges) {
+    buffers.emplace_back(static_cast<std::size_t>(range.size()));
+    spans.emplace_back(buffers.back().data(), buffers.back().size());
+  }
+
+  auto fut = read_ranges_async_future(*ctx, *obj, ranges, std::span{spans});
+  REQUIRE(fut.wait_for(5s) == std::future_status::ready);
+  auto result = fut.get();
+  REQUIRE(result.ep != nullptr);
+  CHECK(exception_message(result.ep).find("404") != std::string::npos);
+  CHECK(server.get_count() == ranges.size());
+}
+
+TEST_CASE("async-curl S3 sync host_read retries transient failures",
+          "[.][s3][integration][asynccurl]")
+{
+  auto payload = test_payload(1024);
+  range_fault_policy fault;
+  fault.fail_first_gets = 2;
+  fault.fail_status     = 503;
+  fault.fail_reason     = "Service Unavailable";
+  range_http_server server(payload, 0ms, std::move(fault));
+  auto ctx = make_scripted_async_ioctx(server, 4);
+  auto obj = ctx->create_io_object("s3://bucket/object.bin");
+
+  std::vector<std::uint8_t> got(48);
+  std::size_t bytes = 0;
+  REQUIRE_NOTHROW(bytes = ctx->host_read(*obj, 144, got.size(), got.data()));
+  CHECK(bytes == got.size());
+  CHECK(std::equal(got.begin(), got.end(), payload.begin() + 144));
+  CHECK(server.get_count() >= 3);
+}
+
+TEST_CASE("async-curl S3 retry backoff spacing is observable", "[.][s3][integration][asynccurl]")
+{
+  range_fault_policy fault;
+  fault.fail_first_gets = 2;
+  fault.fail_status     = 503;
+  fault.fail_reason     = "Service Unavailable";
+  range_http_server server(test_payload(512), 0ms, std::move(fault));
+  auto ctx = make_scripted_async_ioctx(server, 1);
+  auto obj = ctx->create_io_object("s3://bucket/object.bin");
+
+  std::vector<std::uint8_t> out(16);
+  auto fut = ctx->host_read_async(*obj, 80, out.size(), out.data());
+  REQUIRE(fut.wait_for(5s) == std::future_status::ready);
+  std::size_t bytes = 0;
+  REQUIRE_NOTHROW(bytes = fut.get());
+  CHECK(bytes == out.size());
+
+  auto times = server.get_times();
+  INFO("async-curl retry GET count=" << times.size());
+  if (times.size() >= 3) {
+    auto const first_gap =
+      std::chrono::duration_cast<std::chrono::milliseconds>(times[1] - times[0]).count();
+    auto const second_gap =
+      std::chrono::duration_cast<std::chrono::milliseconds>(times[2] - times[1]).count();
+    INFO("async-curl retry gaps ms: first=" << first_gap << " second=" << second_gap);
+  }
+}
+
+TEST_CASE("async-curl S3 rejects malformed range responses", "[.][s3][integration][asynccurl]")
+{
+  auto payload = test_payload(512);
+
+  SECTION("sync read rejects 200 full body for an interior range")
+  {
+    range_fault_policy fault;
+    fault.response_mode = scripted_response_mode::interior_range_200_full_body;
+    range_http_server server(payload, 0ms, std::move(fault));
+    auto ctx = make_scripted_async_ioctx(server);
+    auto obj = ctx->create_io_object("s3://bucket/object.bin");
+
+    std::vector<std::uint8_t> got(16);
+    CHECK_THROWS(ctx->host_read(*obj, 40, got.size(), got.data()));
+  }
+
+  SECTION("async read rejects 200 full body for an interior range")
+  {
+    range_fault_policy fault;
+    fault.response_mode = scripted_response_mode::interior_range_200_full_body;
+    range_http_server server(payload, 0ms, std::move(fault));
+    auto ctx = make_scripted_async_ioctx(server);
+    auto obj = ctx->create_io_object("s3://bucket/object.bin");
+
+    std::vector<cudf::io::text::byte_range_info> ranges{{40, 16}};
+    std::vector<std::byte> got(16);
+    std::vector<cudf::host_span<std::byte>> spans{{got.data(), got.size()}};
+    auto fut = read_ranges_async_future(*ctx, *obj, ranges, std::span{spans});
+    REQUIRE(fut.wait_for(5s) == std::future_status::ready);
+    auto result = fut.get();
+    CHECK(result.ep != nullptr);
+  }
+
+  SECTION("sync read rejects a mismatched Content-Range start")
+  {
+    range_fault_policy fault;
+    fault.response_mode = scripted_response_mode::wrong_content_range_start;
+    range_http_server server(payload, 0ms, std::move(fault));
+    auto ctx = make_scripted_async_ioctx(server);
+    auto obj = ctx->create_io_object("s3://bucket/object.bin");
+
+    std::vector<std::uint8_t> got(16);
+    CHECK_THROWS(ctx->host_read(*obj, 40, got.size(), got.data()));
+  }
+
+  SECTION("async read rejects a mismatched Content-Range start")
+  {
+    range_fault_policy fault;
+    fault.response_mode = scripted_response_mode::wrong_content_range_start;
+    range_http_server server(payload, 0ms, std::move(fault));
+    auto ctx = make_scripted_async_ioctx(server);
+    auto obj = ctx->create_io_object("s3://bucket/object.bin");
+
+    std::vector<cudf::io::text::byte_range_info> ranges{{40, 16}};
+    std::vector<std::byte> got(16);
+    std::vector<cudf::host_span<std::byte>> spans{{got.data(), got.size()}};
+    auto fut = read_ranges_async_future(*ctx, *obj, ranges, std::span{spans});
+    REQUIRE(fut.wait_for(5s) == std::future_status::ready);
+    auto result = fut.get();
+    CHECK(result.ep != nullptr);
+  }
+}
+
 TEST_CASE("async-curl S3 bounded submit respects max_connections",
           "[.][s3][integration][asynccurl]")
 {
@@ -642,6 +995,32 @@ TEST_CASE("async-curl S3 keep-alive is observable but report-only",
 
   INFO("async-curl accept_count=" << server.accept_count());
   CHECK(server.get_count() == 4);
+}
+
+TEST_CASE("async-curl S3 authorizer failures are reported without killing the reactor",
+          "[.][s3][integration][asynccurl]")
+{
+  range_http_server server(test_payload(512));
+  auto provider = std::make_shared<get_throwing_then_fixed_authorizer>(server.url(), 1);
+  auto ctx      = make_async_ioctx(std::move(provider), 4);
+  auto obj      = ctx->create_io_object("s3://bucket/object.bin");
+
+  std::vector<cudf::io::text::byte_range_info> ranges{{32, 16}};
+  std::vector<std::byte> failed(16);
+  std::vector<cudf::host_span<std::byte>> failed_spans{{failed.data(), failed.size()}};
+  auto failed_fut = read_ranges_async_future(*ctx, *obj, ranges, std::span{failed_spans});
+  REQUIRE(failed_fut.wait_for(5s) == std::future_status::ready);
+  auto failed_result = failed_fut.get();
+  REQUIRE(failed_result.ep != nullptr);
+  CHECK(exception_message(failed_result.ep).find("scripted authorizer failure") !=
+        std::string::npos);
+
+  std::vector<std::uint8_t> got(16);
+  auto ok_fut = ctx->host_read_async(*obj, 64, got.size(), got.data());
+  REQUIRE(ok_fut.wait_for(5s) == std::future_status::ready);
+  std::size_t bytes = 0;
+  REQUIRE_NOTHROW(bytes = ok_fut.get());
+  CHECK(bytes == got.size());
 }
 
 TEST_CASE("async-curl S3 device reads are guarded until Phase 2", "[.][s3][integration][asynccurl]")

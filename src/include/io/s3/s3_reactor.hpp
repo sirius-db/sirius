@@ -23,9 +23,10 @@
 #include <cudf/io/text/byte_range_info.hpp>
 
 #include <atomic>
-#include <condition_variable>
+#include <chrono>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -86,11 +87,14 @@ class s3_async_io_object : public sirius_io_object {
 // ---------------------------------------------------------------------------
 
 /// Single-threaded async-S3 reactor over libcurl's multi interface. Models the
-/// reactor concept consumed by @c templated_ioctx. Phase 0: host reads only —
-/// the synchronous @c host_read / @c head_object_size are blocking GET/HEAD on
-/// a separate easy path (lifted from the production s3_ioctx); the async path
-/// (@c host_read_async / @c host_enqueue_bulk) runs over one @c CURLM* worker
-/// loop with bounded submit. Device reads land in Phase 2.
+/// reactor concept consumed by @c templated_ioctx.
+///
+/// Phase 0: host reads over a curl_multi worker loop with bounded submit; sync
+/// host_read/HEAD on a separate blocking easy path. Phase 1 adds: an async
+/// retry state machine (transient curl / 408 / 429 / 5xx, honoring Retry-After),
+/// a sync retry loop, range-response validation (Content-Range / overflow),
+/// exception-safe transfer setup, and connection-cache limits. Device reads land
+/// in Phase 2.
 class s3_reactor {
  public:
   struct config {
@@ -100,6 +104,12 @@ class s3_reactor {
     bool tls_verify{true};
     std::size_t max_connections{4};
     cucascade::memory::fixed_size_host_memory_resource* host_memory_resource{nullptr};
+
+    // Retry knobs (Phase 1). Defaults keep tests fast.
+    std::size_t max_retry_attempts{4};                 // total attempts incl. the first
+    std::chrono::milliseconds retry_backoff_base{50};  // exponential base
+    std::chrono::milliseconds retry_jitter{20};        // +/- bound
+    bool honor_retry_after{true};
   };
 
   using native_handle_type   = s3_native_handle;
@@ -115,8 +125,6 @@ class s3_reactor {
 
   // -- io_reactor_c surface --------------------------------------------------
 
-  /// Synchronous blocking GET (lifted from production range_get; keeps the sync
-  /// retry loop). Used by the rare synchronous datasource reads.
   std::size_t host_read(native_handle_type handle,
                         std::size_t offset,
                         std::size_t size,
@@ -149,8 +157,6 @@ class s3_reactor {
 
   // -- instance helpers used by the ioctx ------------------------------------
 
-  /// Blocking HEAD (lifted from production head_object_size). Returns the
-  /// object's byte length.
   std::size_t head_object_size(std::string_view bucket, std::string_view key);
 
   [[nodiscard]] std::uint64_t bytes_read_total() const noexcept
@@ -166,12 +172,19 @@ class s3_reactor {
   struct transfer;  // per-async-request state (defined in the .cpp)
 
   void worker_loop();
-  void submit_pending();                            // bounded by max_connections
+  void drain_incoming();
+  void promote_due_retries();
+  void submit_pending();  // bounded by max_connections
+  void build_and_add(transfer* t);
+  void schedule_retry(transfer* t, std::chrono::steady_clock::duration delay);
   void finish(transfer* t, std::exception_ptr ep);  // chunk_done/chunk_failed + cleanup
+  void cancel_all_on_shutdown();
 
-  /// Blocking GET/HEAD shared by host_read + head_object_size. Returns the
-  /// HTTP-validated body byte count written into @p dst (dst may be null for a
-  /// HEAD, in which case only the size is resolved via @p out_object_size).
+  std::chrono::steady_clock::duration backoff_delay(
+    std::size_t attempt, std::optional<std::chrono::milliseconds> retry_after) const;
+
+  /// Blocking GET/HEAD shared by host_read + head_object_size, with the sync
+  /// retry loop. dst may be null for a HEAD (size resolved via out_object_size).
   std::size_t blocking_request(std::string_view bucket,
                                std::string_view key,
                                s3_request_method method,
@@ -187,8 +200,9 @@ class s3_reactor {
   std::atomic<bool> _stop{false};
 
   std::mutex _mtx;
-  std::deque<host_read_req_type> _incoming;        // newly enqueued, not yet on the multi
-  std::deque<host_read_req_type> _pending;         // drained, awaiting bounded submit
+  std::deque<host_read_req_type> _incoming;  // newly enqueued reqs (API side)
+  std::deque<transfer*> _pending;            // wrapped, awaiting bounded submit
+  std::multimap<std::chrono::steady_clock::time_point, transfer*> _retry_queue;
   std::unordered_map<void*, transfer*> _inflight;  // easy handle -> transfer
 
   std::atomic<std::uint64_t> _bytes_read_total{0};
