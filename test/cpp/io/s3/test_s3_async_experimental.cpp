@@ -96,6 +96,7 @@ struct s3_test_env {
   std::string access_key;
   std::string secret_key;
   std::string bucket;
+  std::string session_token;
   fs::path local_dir;
   bool strict{false};
 };
@@ -118,6 +119,7 @@ std::optional<s3_test_env> read_s3_test_env()
                      std::move(access_key),
                      std::move(secret_key),
                      std::move(bucket),
+                     env_or("SIRIUS_TEST_S3_SESSION_TOKEN"),
                      fs::path{local_dir},
                      truthy_env("SIRIUS_TEST_S3_STRICT")};
 }
@@ -127,6 +129,32 @@ bool skip_if_no_s3_env(std::optional<s3_test_env> const& env)
   if (env) { return false; }
   WARN("Skipping async-curl S3 test because SIRIUS_TEST_S3_* is not configured");
   return true;
+}
+
+std::optional<s3_test_env> read_aws_live_env()
+{
+  auto endpoint   = env_or("SIRIUS_TEST_S3_ENDPOINT");
+  auto access_key = env_or("SIRIUS_TEST_S3_ACCESS_KEY");
+  auto secret_key = env_or("SIRIUS_TEST_S3_SECRET_KEY");
+  auto bucket     = env_or("SIRIUS_TEST_S3_BUCKET");
+  auto token      = env_or("SIRIUS_TEST_S3_SESSION_TOKEN");
+
+  if (endpoint.empty() || access_key.empty() || secret_key.empty() || bucket.empty()) {
+    SUCCEED("SIRIUS_TEST_S3_* not set; skipping live AWS async-curl benchmark");
+    return std::nullopt;
+  }
+  if (token.empty()) {
+    FAIL("SIRIUS_TEST_S3_SESSION_TOKEN is required for live AWS async-curl benchmark");
+  }
+
+  return s3_test_env{std::move(endpoint),
+                     env_or("SIRIUS_TEST_S3_REGION", "us-east-1"),
+                     std::move(access_key),
+                     std::move(secret_key),
+                     std::move(bucket),
+                     std::move(token),
+                     fs::path{},
+                     false};
 }
 
 std::string s3_uri(std::string_view bucket, std::string_view key)
@@ -146,6 +174,7 @@ std::shared_ptr<s3_request_authorizer> make_live_provider(s3_test_env const& env
   static_credentials creds;
   creds.access_key_id     = env.access_key;
   creds.secret_access_key = env.secret_key;
+  creds.session_token     = env.session_token;
   return std::make_shared<sirius_sigv4_presigned_authorizer>(
     std::move(creds), env.region, env.endpoint, 30min);
 }
@@ -215,6 +244,25 @@ void require_bytes_equal(std::vector<std::uint8_t> const& got,
     CHECK(got[i] == expected[offset + i]);
   }
 }
+
+std::uint64_t millis(std::chrono::steady_clock::duration d)
+{
+  return static_cast<std::uint64_t>(
+    std::chrono::duration_cast<std::chrono::milliseconds>(d).count());
+}
+
+std::chrono::steady_clock::duration median(std::vector<std::chrono::steady_clock::duration> values)
+{
+  REQUIRE_FALSE(values.empty());
+  std::sort(values.begin(), values.end());
+  return values[values.size() / 2];
+}
+
+struct device_read_bench_result {
+  std::chrono::steady_clock::duration median_time{};
+  std::uint64_t device_stream_sync_total{0};
+  std::uint64_t device_peak_inflight{0};
+};
 
 void fill_device_buffer(rmm::device_buffer& device, int value, rmm::cuda_stream_view stream)
 {
@@ -573,6 +621,20 @@ std::shared_ptr<s3_async_experimental_ioctx> make_scripted_async_ioctx(
     std::make_shared<fixed_url_authorizer>(server.url()), max_connections, request_timeout_s);
 }
 
+std::shared_ptr<s3_ioctx> make_device_blocking_ioctx(
+  std::shared_ptr<s3_request_authorizer> provider,
+  fsmr_test_resources& memory,
+  std::size_t max_connections = 16,
+  long request_timeout_s      = 20)
+{
+  s3_ioctx_config cfg{};
+  cfg.creds                = std::move(provider);
+  cfg.max_connections      = max_connections;
+  cfg.request_timeout_s    = request_timeout_s;
+  cfg.host_memory_resource = &memory.host_mr;
+  return std::make_shared<s3_ioctx>(std::move(cfg));
+}
+
 std::vector<std::uint8_t> test_payload(std::size_t size = 4096)
 {
   std::vector<std::uint8_t> out(size);
@@ -580,6 +642,82 @@ std::vector<std::uint8_t> test_payload(std::size_t size = 4096)
     out[i] = static_cast<std::uint8_t>((i * 17 + 3) % 251);
   }
   return out;
+}
+
+template <typename Ioctx>
+std::chrono::steady_clock::duration time_device_read_once(Ioctx& ctx,
+                                                          sirius::io::sirius_io_object& obj,
+                                                          std::vector<std::uint8_t> const& payload,
+                                                          std::size_t bytes)
+{
+  REQUIRE(bytes <= payload.size());
+  auto stream = rmm::cuda_stream_default;
+  rmm::device_buffer dst(bytes, stream);
+
+  auto const start = std::chrono::steady_clock::now();
+  auto const got   = ctx.device_read(obj, 0, bytes, static_cast<std::uint8_t*>(dst.data()), stream);
+  auto const stop  = std::chrono::steady_clock::now();
+
+  REQUIRE(got == bytes);
+  auto const host = copy_device_to_host(dst, got);
+  CHECK(std::equal(host.begin(), host.end(), payload.begin()));
+  return stop - start;
+}
+
+template <typename Ioctx>
+std::pair<std::chrono::steady_clock::duration, std::vector<std::uint8_t>> time_device_read_to_host(
+  Ioctx& ctx, sirius::io::sirius_io_object& obj, std::size_t bytes)
+{
+  auto stream = rmm::cuda_stream_default;
+  rmm::device_buffer dst(bytes, stream);
+
+  auto const start = std::chrono::steady_clock::now();
+  auto const got   = ctx.device_read(obj, 0, bytes, static_cast<std::uint8_t*>(dst.data()), stream);
+  auto const stop  = std::chrono::steady_clock::now();
+
+  CHECK(got == bytes);
+  return {stop - start, copy_device_to_host(dst, got)};
+}
+
+device_read_bench_result run_async_device_benchmark(range_http_server& server,
+                                                    std::vector<std::uint8_t> const& payload,
+                                                    fsmr_test_resources& memory,
+                                                    std::size_t max_connections,
+                                                    std::size_t iterations = 3)
+{
+  auto ctx = make_device_async_ioctx(
+    std::make_shared<fixed_url_authorizer>(server.url()), memory.host_mr, max_connections);
+  auto obj = ctx->create_io_object("s3://bucket/object.bin");
+
+  (void)time_device_read_once(*ctx, *obj, payload, payload.size());  // warmup
+  std::vector<std::chrono::steady_clock::duration> samples;
+  samples.reserve(iterations);
+  for (std::size_t i = 0; i < iterations; ++i) {
+    samples.push_back(time_device_read_once(*ctx, *obj, payload, payload.size()));
+  }
+
+  return device_read_bench_result{
+    median(samples), ctx->device_stream_sync_total(), ctx->device_peak_inflight()};
+}
+
+std::chrono::steady_clock::duration run_blocking_device_benchmark(
+  range_http_server& server,
+  std::vector<std::uint8_t> const& payload,
+  fsmr_test_resources& memory,
+  std::size_t iterations = 3)
+{
+  auto ctx = make_device_blocking_ioctx(std::make_shared<fixed_url_authorizer>(server.url()),
+                                        memory,
+                                        /*max_connections=*/16);
+  auto obj = ctx->create_io_object("s3://bucket/object.bin");
+
+  (void)time_device_read_once(*ctx, *obj, payload, payload.size());  // warmup
+  std::vector<std::chrono::steady_clock::duration> samples;
+  samples.reserve(iterations);
+  for (std::size_t i = 0; i < iterations; ++i) {
+    samples.push_back(time_device_read_once(*ctx, *obj, payload, payload.size()));
+  }
+  return median(samples);
 }
 
 }  // namespace
@@ -1283,6 +1421,80 @@ TEST_CASE("async-curl S3 device staging peak stays within the active window",
   CHECK(ctx->device_peak_inflight() >= 1);
   CHECK(ctx->device_peak_inflight() <= 2);
   CHECK(ctx->device_stream_sync_total() == 0);
+}
+
+TEST_CASE("async-curl S3 benchmark hides injected range latency versus blocking S3",
+          "[.][s3][benchmark]")
+{
+  constexpr std::size_t payload_size = 16 * sirius::io::CHUNK_SIZE;
+  auto payload                       = test_payload(payload_size);
+  range_http_server server(payload, 20ms);
+  fsmr_test_resources memory(/*block_size=*/sirius::io::CHUNK_SIZE,
+                             /*capacity=*/16 * sirius::io::CHUNK_SIZE,
+                             /*memory_limit=*/16 * sirius::io::CHUNK_SIZE,
+                             /*pool_size=*/16,
+                             /*initial_pools=*/1);
+
+  auto const blocking = run_blocking_device_benchmark(server, payload, memory);
+  INFO("blocking median ms=" << millis(blocking));
+
+  std::vector<std::pair<std::size_t, device_read_bench_result>> async_results;
+  for (auto const max_connections :
+       {std::size_t{1}, std::size_t{2}, std::size_t{4}, std::size_t{8}}) {
+    auto result = run_async_device_benchmark(server, payload, memory, max_connections);
+    INFO("async mc=" << max_connections << " median ms=" << millis(result.median_time)
+                     << " peak_inflight=" << result.device_peak_inflight
+                     << " stream_syncs=" << result.device_stream_sync_total);
+    CHECK(result.device_stream_sync_total == 0);
+    CHECK(result.device_peak_inflight >= 1);
+    CHECK(result.device_peak_inflight <= max_connections);
+    CHECK(result.median_time * 10 <= blocking * 11);
+    async_results.emplace_back(max_connections, result);
+  }
+
+  auto const& async_mc1 = async_results.front().second;
+  auto const& async_mc8 = async_results.back().second;
+  CHECK(async_mc1.median_time * 2 < blocking * 3);
+  CHECK(async_mc8.median_time < blocking / 2);
+}
+
+TEST_CASE("async-curl S3 benchmark reports real AWS S3 headline numbers",
+          "[.][s3][aws][live][benchmark]")
+{
+  auto env = read_aws_live_env();
+  if (!env) { return; }
+  auto key = env_or("SIRIUS_ASYNCCURL_BENCH_S3_KEY");
+  if (key.empty()) {
+    SUCCEED("SIRIUS_ASYNCCURL_BENCH_S3_KEY not set; skipping live AWS async-curl benchmark");
+    return;
+  }
+
+  fsmr_test_resources memory(/*block_size=*/sirius::io::CHUNK_SIZE,
+                             /*capacity=*/16 * sirius::io::CHUNK_SIZE,
+                             /*memory_limit=*/16 * sirius::io::CHUNK_SIZE,
+                             /*pool_size=*/16,
+                             /*initial_pools=*/1);
+  auto blocking = make_device_blocking_ioctx(make_live_provider(*env), memory);
+  auto async =
+    make_device_async_ioctx(make_live_provider(*env), memory.host_mr, /*max_connections=*/8);
+
+  auto blocking_obj = blocking->create_io_object(s3_uri(env->bucket, key));
+  auto async_obj    = async->create_io_object(s3_uri(env->bucket, key));
+  auto const bytes  = std::min<std::size_t>(blocking_obj->size(), 16 * sirius::io::CHUNK_SIZE);
+  REQUIRE(bytes > 0);
+  if (bytes < 2 * sirius::io::CHUNK_SIZE) {
+    WARN("live AWS async-curl benchmark object is smaller than 2 chunks; key=" << key << " bytes="
+                                                                               << bytes);
+  }
+
+  auto [blocking_time, blocking_bytes] = time_device_read_to_host(*blocking, *blocking_obj, bytes);
+  auto [async_time, async_bytes]       = time_device_read_to_host(*async, *async_obj, bytes);
+
+  CHECK(async_bytes == blocking_bytes);
+  CHECK(async->device_stream_sync_total() == 0);
+  INFO("aws key=" << key << " bytes=" << bytes << " blocking_ms=" << millis(blocking_time)
+                  << " async_mc8_ms=" << millis(async_time)
+                  << " async_peak_inflight=" << async->device_peak_inflight());
 }
 
 TEST_CASE("async-curl S3 device reads fail cleanly before copy on non-retriable GET errors",

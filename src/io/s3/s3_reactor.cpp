@@ -892,6 +892,12 @@ void s3_reactor::worker_loop()
 
     submit_pending();
     poll_device_copies();
+    // A completed copy frees a staging block; arm the next pending transfer now,
+    // before polling, so its GET is in flight when we sleep. Otherwise — at low
+    // concurrency, where the freed slot is the only work — we would poll with
+    // nothing in flight and wait the full timeout before submitting the next
+    // GET, serializing each chunk behind a ~100ms dead wait.
+    submit_pending();
 
     // Sleep until socket activity, a wakeup, or the next due retry (cap 100ms).
     // The stream callback wakes us via curl_multi_wakeup, but cap the wait while
