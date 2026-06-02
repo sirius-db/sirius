@@ -274,13 +274,13 @@ impl ComputeNodeHeartbeatHandler {
             .lock()
             .map_err(|_| HeartbeatError::StatePoisoned)?;
 
-        if let Some(epoch) = state.epoch {
-            if master_info.epoch < epoch {
-                return Err(HeartbeatError::StaleEpoch {
-                    received: master_info.epoch,
-                    current: epoch,
-                });
-            }
+        if let Some(epoch) = state.epoch
+            && master_info.epoch < epoch
+        {
+            return Err(HeartbeatError::StaleEpoch {
+                received: master_info.epoch,
+                current: epoch,
+            });
         }
 
         if let Some(cluster_id) = master_info.cluster_id {
@@ -459,10 +459,10 @@ impl HeartbeatServerShutdown {
     }
 
     fn close_active_connection(&self) {
-        if let Ok(active_connection) = self.0.active_connection.lock() {
-            if let Some(connection) = active_connection.as_ref() {
-                let _ = connection.shutdown(Shutdown::Both);
-            }
+        if let Ok(active_connection) = self.0.active_connection.lock()
+            && let Some(connection) = active_connection.as_ref()
+        {
+            let _ = connection.shutdown(Shutdown::Both);
         }
     }
 }

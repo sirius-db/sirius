@@ -258,13 +258,12 @@ impl DescriptorTable {
         let mut offset = 0;
         for &tuple_id in row_tuples {
             let materialized = self.materialized_slot_ids(tuple_id)?;
-            if tuple_id == slot.parent_tuple_id {
-                if let Some(index) = materialized
+            if tuple_id == slot.parent_tuple_id
+                && let Some(index) = materialized
                     .iter()
                     .position(|candidate| *candidate == slot_id)
-                {
-                    return Ok(offset + index);
-                }
+            {
+                return Ok(offset + index);
             }
             offset += materialized.len();
         }

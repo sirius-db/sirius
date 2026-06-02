@@ -99,6 +99,11 @@ fn rewrite_inner_attributes(gen_dir: &Path) -> io::Result<()> {
         let source = fs::read_to_string(&path)?;
         let source = source
             .replace("#![allow(", "#[allow(")
+            .replace(
+                "#![cfg_attr(rustfmt, rustfmt_skip)]",
+                "#[allow(clippy::deprecated_cfg_attr, clippy::empty_line_after_outer_attr)]\n\
+                 #[cfg_attr(rustfmt, rustfmt_skip)]",
+            )
             .replace("#![cfg_attr(", "#[cfg_attr(");
         fs::write(path, source)?;
     }
