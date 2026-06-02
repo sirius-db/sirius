@@ -380,7 +380,6 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
       if (table_scan.exhausted.load()) {
         if (tasks_created.load() == tasks_completed.load()) {
           pipeline_finished.store(true);
-          SIRIUS_LOG_WARN("pipeline_finished set to true for pipeline id={}", pipeline_id);
           for (auto& op : get_operators()) {
             op.get().finalize_operator();
           }
@@ -393,7 +392,6 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
       if (!parquet_scan.has_more_partitions.load()) {
         if (tasks_created.load() == tasks_completed.load()) {
           pipeline_finished.store(true);
-          SIRIUS_LOG_WARN("pipeline_finished set to true for pipeline id={}", pipeline_id);
           for (auto& op : get_operators()) {
             op.get().finalize_operator();
           }
@@ -406,7 +404,6 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
       if (cpu_source.exhausted.load()) {
         if (tasks_created.load() == tasks_completed.load()) {
           pipeline_finished.store(true);
-          SIRIUS_LOG_WARN("pipeline_finished set to true for pipeline id={}", pipeline_id);
           for (auto& op : get_operators()) {
             op.get().finalize_operator();
           }
@@ -431,7 +428,6 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
           (first_node->is_source_pipeline_finished() && first_node->all_ports_empty())) {
         if (tasks_created.load() == tasks_completed.load()) {
           pipeline_finished.store(true);
-          SIRIUS_LOG_WARN("pipeline_finished set to true for pipeline id={}", pipeline_id);
           for (auto& op : get_operators()) {
             op.get().finalize_operator();
           }

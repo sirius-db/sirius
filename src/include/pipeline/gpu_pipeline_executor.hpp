@@ -26,7 +26,6 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/stream_pool.hpp>
 
-#include <atomic>
 #include <thread>
 
 namespace sirius::op {

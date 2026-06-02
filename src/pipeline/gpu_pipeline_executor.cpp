@@ -338,7 +338,6 @@ void gpu_pipeline_executor::manager_loop()
           if (_completion_handler) { _completion_handler->report_error(std::current_exception()); }
           return;
         }
-        auto* gpu_task = cast_to_gpu_pipeline_task(task.get());
         task.reset();
 
         // Check if query is complete BEFORE scheduling downstream tasks.
