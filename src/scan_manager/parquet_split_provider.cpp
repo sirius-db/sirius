@@ -272,8 +272,8 @@ void parquet_split_provider::run_batch(file_batch const& batch,
       return _plan->batch_column_name(ref_index);
     };
     gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
-    ast_expression =
-      translator.translate_expression_with_names(*_duckdb_filter_expression, name_resolver);
+    ast_expression = sirius::op::translate_duckdb_expression_with_names(
+      translator, *_duckdb_filter_expression, name_resolver);
     if (ast_expression) {
       // Probe the first file's schema before committing to filter pushdown. The probe
       // result is reused below by the main file loop via the prefetch cache.
