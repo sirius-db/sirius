@@ -1,5 +1,3 @@
-include!(concat!(env!("OUT_DIR"), "/generated.rs"));
-
 use std::{
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
@@ -13,13 +11,16 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use heartbeat_service::{
-    HeartbeatServiceSyncHandler, HeartbeatServiceSyncProcessor, TBackendInfo, THeartbeatResult,
-    TMasterInfo,
-};
 use mysql_async::{OptsBuilder, Pool, Row, prelude::Queryable};
-use status::TStatus;
-use status_code::TStatusCode;
+use starrocks_thrift::{
+    heartbeat_service::{
+        HeartbeatServiceSyncHandler, HeartbeatServiceSyncProcessor, TBackendInfo, THeartbeatResult,
+        TMasterInfo,
+    },
+    status::TStatus,
+    status_code::TStatusCode,
+    types,
+};
 use thrift::{
     TransportErrorKind,
     protocol::{

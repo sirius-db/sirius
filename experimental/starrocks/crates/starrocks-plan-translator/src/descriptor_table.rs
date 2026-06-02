@@ -1,0 +1,294 @@
+use std::collections::HashMap;
+
+use starrocks_thrift::descriptors::TDescriptorTable;
+use substrait::proto::r#type;
+use substrait::proto::{NamedStruct, Type};
+
+use crate::error::{Result, TranslateError};
+use crate::type_mapper;
+
+/// Normalized StarRocks slot metadata used while translating row references.
+#[derive(Clone, Debug)]
+pub struct SlotInfo {
+    /// StarRocks slot identifier from `TSlotDescriptor.id`.
+    pub slot_id: i32,
+    /// Tuple that owns this slot.
+    pub parent_tuple_id: i32,
+    /// Descriptor-table column position, used to preserve StarRocks output order.
+    pub column_pos: i32,
+    /// Stable output name for the slot, falling back to `col_<slot_id>`.
+    pub col_name: String,
+    /// Substrait type mapped from the StarRocks slot type and nullability.
+    ///
+    /// This is only populated for materialized slots, because unused
+    /// descriptor slots should not make otherwise supported fragments fail.
+    pub substrait_type: Option<Type>,
+    /// Whether StarRocks marks the slot as materialized for this fragment.
+    pub is_materialized: bool,
+}
+
+impl SlotInfo {
+    /// Returns the slot's stable output name.
+    pub fn output_name(&self) -> String {
+        if self.col_name.is_empty() {
+            format!("col_{}", self.slot_id)
+        } else {
+            self.col_name.clone()
+        }
+    }
+}
+
+/// Normalized StarRocks tuple metadata and its ordered materialized slots.
+#[derive(Clone, Debug)]
+pub struct TupleInfo {
+    /// Optional table id referenced by this tuple.
+    pub table_id: Option<i64>,
+    /// Slot ids sorted in descriptor/output order.
+    pub slot_ids: Vec<i32>,
+}
+
+/// Minimal table metadata needed to build Substrait named-table reads.
+#[derive(Clone, Debug)]
+struct TableInfo {
+    /// StarRocks database name, empty for unqualified tuple fallbacks.
+    db_name: String,
+    /// StarRocks table name.
+    table_name: String,
+}
+
+/// Lookup structure for StarRocks descriptor-table ids.
+#[derive(Clone, Debug)]
+pub struct DescriptorTable {
+    /// Slots keyed by StarRocks slot id.
+    slots: HashMap<i32, SlotInfo>,
+    /// Tuples keyed by StarRocks tuple id.
+    tuples: HashMap<i32, TupleInfo>,
+    /// Tables keyed by StarRocks table id.
+    tables: HashMap<i64, TableInfo>,
+}
+
+impl TryFrom<&TDescriptorTable> for DescriptorTable {
+    type Error = TranslateError;
+
+    /// Builds descriptor lookups from the StarRocks Thrift descriptor table.
+    fn try_from(desc_tbl: &TDescriptorTable) -> Result<Self> {
+        let tables = desc_tbl
+            .table_descriptors
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|table| {
+                (
+                    table.id,
+                    TableInfo {
+                        db_name: table.db_name.clone(),
+                        table_name: table.table_name.clone(),
+                    },
+                )
+            })
+            .collect();
+
+        let mut tuples = desc_tbl
+            .tuple_descriptors
+            .iter()
+            .map(|tuple| {
+                let tuple_id = tuple.id.ok_or(TranslateError::MissingField {
+                    context: "TTupleDescriptor",
+                    field: "id",
+                })?;
+                Ok((
+                    tuple_id,
+                    TupleInfo {
+                        table_id: tuple.table_id,
+                        slot_ids: Vec::new(),
+                    },
+                ))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+
+        let slot_descriptors = desc_tbl.slot_descriptors.as_deref().unwrap_or_default();
+        let mut slots = HashMap::with_capacity(slot_descriptors.len());
+
+        for slot in slot_descriptors {
+            let slot_id = slot.id.ok_or(TranslateError::MissingField {
+                context: "TSlotDescriptor",
+                field: "id",
+            })?;
+            let parent_tuple_id = slot.parent.ok_or(TranslateError::MissingField {
+                context: "TSlotDescriptor",
+                field: "parent",
+            })?;
+            let is_materialized = slot.is_materialized.unwrap_or(true);
+            let substrait_type = if is_materialized {
+                let slot_type = slot
+                    .slot_type
+                    .as_ref()
+                    .ok_or(TranslateError::MissingField {
+                        context: "TSlotDescriptor",
+                        field: "slotType",
+                    })?;
+                Some(type_mapper::map_type_desc(
+                    slot_type,
+                    slot.is_nullable.unwrap_or(true),
+                )?)
+            } else {
+                None
+            };
+
+            slots.insert(
+                slot_id,
+                SlotInfo {
+                    slot_id,
+                    parent_tuple_id,
+                    column_pos: slot.column_pos.unwrap_or(slot_id),
+                    col_name: slot
+                        .col_name
+                        .clone()
+                        .unwrap_or_else(|| format!("col_{slot_id}")),
+                    substrait_type,
+                    is_materialized,
+                },
+            );
+
+            tuples
+                .get_mut(&parent_tuple_id)
+                .ok_or_else(|| {
+                    TranslateError::descriptor(format!(
+                        "slot {slot_id} references missing tuple {parent_tuple_id}"
+                    ))
+                })?
+                .slot_ids
+                .push(slot_id);
+        }
+
+        for tuple in tuples.values_mut() {
+            tuple.slot_ids.sort_by_key(|slot_id| {
+                let slot = slots.get(slot_id).expect("slot id stored in tuple exists");
+                (slot.column_pos < 0, slot.column_pos, slot.slot_id)
+            });
+        }
+
+        Ok(Self {
+            slots,
+            tuples,
+            tables,
+        })
+    }
+}
+
+impl DescriptorTable {
+    /// Looks up a StarRocks slot by id.
+    pub fn slot(&self, slot_id: i32) -> Result<&SlotInfo> {
+        self.slots
+            .get(&slot_id)
+            .ok_or_else(|| TranslateError::descriptor(format!("slot {slot_id} not found")))
+    }
+
+    /// Looks up a StarRocks tuple by id.
+    pub fn tuple(&self, tuple_id: i32) -> Result<&TupleInfo> {
+        self.tuples
+            .get(&tuple_id)
+            .ok_or_else(|| TranslateError::descriptor(format!("tuple {tuple_id} not found")))
+    }
+
+    /// Returns materialized slot ids for a tuple in StarRocks descriptor order.
+    pub fn materialized_slot_ids(&self, tuple_id: i32) -> Result<Vec<i32>> {
+        let tuple = self.tuple(tuple_id)?;
+        Ok(tuple
+            .slot_ids
+            .iter()
+            .copied()
+            .filter(|slot_id| {
+                self.slots
+                    .get(slot_id)
+                    .map(|slot| slot.is_materialized)
+                    .unwrap_or(false)
+            })
+            .collect())
+    }
+
+    /// Builds output names for a row layout described by tuple ids.
+    pub fn output_names_for_tuples(&self, row_tuples: &[i32]) -> Result<Vec<String>> {
+        row_tuples
+            .iter()
+            .copied()
+            .map(|tuple_id| {
+                self.materialized_slot_ids(tuple_id)?
+                    .into_iter()
+                    .map(|slot_id| self.slot(slot_id).map(SlotInfo::output_name))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(|names_by_tuple| names_by_tuple.into_iter().flatten().collect())
+    }
+
+    /// Builds the Substrait schema for a StarRocks tuple.
+    pub fn named_struct(&self, tuple_id: i32) -> Result<NamedStruct> {
+        let (names, types): (Vec<_>, Vec<_>) = self
+            .materialized_slot_ids(tuple_id)?
+            .into_iter()
+            .map(|slot_id| {
+                let slot = self.slot(slot_id)?;
+                let substrait_type =
+                    slot.substrait_type
+                        .clone()
+                        .ok_or(TranslateError::MissingField {
+                            context: "materialized TSlotDescriptor",
+                            field: "slotType",
+                        })?;
+                Ok((slot.output_name(), substrait_type))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .unzip();
+
+        Ok(NamedStruct {
+            names,
+            r#struct: Some(r#type::Struct {
+                types,
+                type_variation_reference: 0,
+                nullability: r#type::Nullability::Required as i32,
+            }),
+        })
+    }
+
+    /// Resolves a StarRocks slot id to its zero-based field index in `row_tuples`.
+    pub fn slot_global_index(&self, slot_id: i32, row_tuples: &[i32]) -> Result<usize> {
+        let slot = self.slot(slot_id)?;
+        let mut offset = 0;
+        for &tuple_id in row_tuples {
+            let materialized = self.materialized_slot_ids(tuple_id)?;
+            if tuple_id == slot.parent_tuple_id {
+                if let Some(index) = materialized
+                    .iter()
+                    .position(|candidate| *candidate == slot_id)
+                {
+                    return Ok(offset + index);
+                }
+            }
+            offset += materialized.len();
+        }
+
+        Err(TranslateError::descriptor(format!(
+            "slot {slot_id} is not part of row_tuples {row_tuples:?}"
+        )))
+    }
+
+    /// Returns the Substrait named-table path for a tuple's backing table.
+    pub fn table_names_for_tuple(&self, tuple_id: i32) -> Result<Vec<String>> {
+        let tuple = self.tuple(tuple_id)?;
+        let Some(table_id) = tuple.table_id else {
+            return Ok(vec![format!("tuple_{tuple_id}")]);
+        };
+        let table = self.tables.get(&table_id).ok_or_else(|| {
+            TranslateError::descriptor(format!(
+                "tuple {tuple_id} references missing table {table_id}"
+            ))
+        })?;
+        if table.db_name.is_empty() {
+            Ok(vec![table.table_name.clone()])
+        } else {
+            Ok(vec![table.db_name.clone(), table.table_name.clone()])
+        }
+    }
+}
