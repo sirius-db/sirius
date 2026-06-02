@@ -34,10 +34,7 @@ using execute_result = gpu_expression_executor::execute_result;
 execute_result gpu_expression_executor::execute(sirius::ast::between const& alt,
                                                 execution_mode mode)
 {
-  // Match the DuckDB-typed count_ast_ops contract for between:
-  // 2 comparison ops + 1 AND op + ops in input/lower/upper.
-  auto const ast_op_count =
-    3 + count_ast_ops(*alt.input) + count_ast_ops(*alt.lower) + count_ast_ops(*alt.upper);
+  auto const ast_op_count = alt.cudf_ast_op_count();
 
   if (_strategy != expression_executor_strategy::MATERIALIZE &&
       (mode == execution_mode::AST || ast_op_count >= _min_ast_size)) {
@@ -117,6 +114,11 @@ execute_result gpu_expression_executor::execute(sirius::ast::between const& alt,
   return execute_result(std::move(result_column));
 }
 
+// DuckDB-typed entrypoint. Bridges callers that still pass duckdb::Expression
+// directly into the executor; the eventual home for this from_duckdb step is
+// the planning stage so the executor sees only native sirius::ast types, but
+// until upstream call sites are migrated this overload (and the duckdb
+// includes it requires) must stay.
 execute_result gpu_expression_executor::execute(duckdb::BoundBetweenExpression const& expr,
                                                 execution_mode mode)
 {

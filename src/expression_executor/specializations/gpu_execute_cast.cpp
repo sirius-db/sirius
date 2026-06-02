@@ -17,6 +17,7 @@
 // sirius
 #include <expression/ast/from_duckdb.hpp>
 #include <expression/ast/node.hpp>
+#include <expression_executor/ast_supported_types.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <helper/logical_type.hpp>
 #include <sirius/exception.hpp>
@@ -30,18 +31,11 @@
 
 // standard library
 #include <algorithm>
-#include <array>
 
 namespace sirius {
 using execute_result = gpu_expression_executor::execute_result;
 
 namespace {
-
-// Sirius-typed allowlist mirroring supported_ast_cast_types in
-// expression_executor/ast_supported_types.hpp. CAST target types currently
-// safe to lower into a cuDF AST.
-constexpr std::array<sirius::type_id, 3> supported_ast_cast_types_native{
-  sirius::type_id::UBIGINT, sirius::type_id::BIGINT, sirius::type_id::DOUBLE};
 
 cudf::ast::ast_operator cast_op_to_ast(sirius::type_id id)
 {
@@ -51,8 +45,8 @@ cudf::ast::ast_operator cast_op_to_ast(sirius::type_id id)
     case sirius::type_id::DOUBLE: return cudf::ast::ast_operator::CAST_TO_FLOAT64;
     default:
       throw invalid_input_exception(
-        "[gpu_expression_executor] execute called on a CAST expression with unsupported return "
-        "type for AST execution: id={}",
+        "[cast_op_to_ast] unsupported CAST target type id={}; cuDF AST supports "
+        "UBIGINT, BIGINT, DOUBLE.",
         static_cast<int>(id));
   }
 }
@@ -66,9 +60,7 @@ execute_result gpu_expression_executor::execute(sirius::ast::cast const& alt, ex
               supported_ast_cast_types_native.end(),
               alt.target_type.id()) != supported_ast_cast_types_native.end();
 
-  // Match DuckDB-typed count_ast_ops contract for cast:
-  //   supported allowlist -> 1 + child ; unsupported -> 0.
-  auto const ast_op_count = ast_supported ? 1 + count_ast_ops(*alt.child) : 0;
+  auto const ast_op_count = alt.cudf_ast_op_count();
 
   if (ast_supported && _strategy != expression_executor_strategy::MATERIALIZE &&
       (mode == execution_mode::AST || ast_op_count >= _min_ast_size)) {
@@ -100,6 +92,11 @@ execute_result gpu_expression_executor::execute(sirius::ast::cast const& alt, ex
   return execute_result(std::move(result_column));
 }
 
+// DuckDB-typed entrypoint. Bridges callers that still pass duckdb::Expression
+// directly into the executor; the eventual home for this from_duckdb step is
+// the planning stage so the executor sees only native sirius::ast types, but
+// until upstream call sites are migrated this overload (and the duckdb
+// includes it requires) must stay.
 execute_result gpu_expression_executor::execute(duckdb::BoundCastExpression const& expr,
                                                 execution_mode mode)
 {

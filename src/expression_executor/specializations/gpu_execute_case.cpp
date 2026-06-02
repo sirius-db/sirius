@@ -30,6 +30,9 @@
 #include <cudf/cudf_utils.hpp>
 #include <cudf/reduction.hpp>
 
+// standard library
+#include <ranges>
+
 namespace sirius {
 using execute_result = gpu_expression_executor::execute_result;
 
@@ -45,13 +48,12 @@ execute_result gpu_expression_executor::execute(sirius::ast::case_expr const& al
   // First, execute the ELSE
   auto current_result = execute(*alt.else_, execution_mode::MATERIALIZE);
 
-  // Loop backwards, so that the THEN of the first true WHEN is copied to the output column
-  auto const num_checks = static_cast<int32_t>(alt.cases.size());
-  D_ASSERT(num_checks > 0);
+  // Iterate in reverse so the THEN of the first true WHEN is copied to the
+  // output column last (overwrites any later match). SQL CASE semantics:
+  // first matching WHEN wins.
+  D_ASSERT(!alt.cases.empty());
 
-  for (int32_t i = num_checks - 1; i >= 0; --i) {
-    auto const& case_check = alt.cases[i];
-
+  for (auto const& case_check : std::views::reverse(alt.cases)) {
     // Execute the WHEN expression to get a boolean array intermediate.
     auto current_mask = execute(*case_check.when_, execution_mode::MATERIALIZE);
 
@@ -126,6 +128,11 @@ execute_result gpu_expression_executor::execute(sirius::ast::case_expr const& al
   return current_result;
 }
 
+// DuckDB-typed entrypoint. Bridges callers that still pass duckdb::Expression
+// directly into the executor; the eventual home for this from_duckdb step is
+// the planning stage so the executor sees only native sirius::ast types, but
+// until upstream call sites are migrated this overload (and the duckdb
+// includes it requires) must stay.
 execute_result gpu_expression_executor::execute(duckdb::BoundCaseExpression const& expr,
                                                 execution_mode mode)
 {

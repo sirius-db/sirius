@@ -37,6 +37,11 @@ execute_result gpu_expression_executor::execute(sirius::ast::reference const& al
   return execute_result(_input_table.column(alt.column_index));
 }
 
+// DuckDB-typed entrypoint. Bridges callers that still pass duckdb::Expression
+// directly into the executor; the eventual home for this from_duckdb step is
+// the planning stage so the executor sees only native sirius::ast types, but
+// until upstream call sites are migrated this overload (and the duckdb
+// includes it requires) must stay.
 execute_result gpu_expression_executor::execute(duckdb::BoundReferenceExpression const& expr,
                                                 execution_mode mode)
 {

@@ -61,21 +61,15 @@ execute_result gpu_expression_executor::execute(sirius::ast::function_call const
 
   // Disable AST mode when the output type is decimal — cuDF ASTs choke on
   // intermediate decimal results currently.
-  // TODO: Fix when https://github.com/rapidsai/cudf/pull/21996 lands.
+  // TODO: Remove this special-case once Sirius pins cuDF >= 26.10 (cuDF PR
+  // https://github.com/rapidsai/cudf/pull/21996 merged after the 26.08 cut,
+  // so the fix will ship in 26.10).
   auto const skip_ast      = alt.return_type().id() == sirius::type_id::DECIMAL;
   auto const ast_supported = !skip_ast && std::find(supported_ast_functions.begin(),
                                                     supported_ast_functions.end(),
                                                     resolved_id) != supported_ast_functions.end();
 
-  // Match DuckDB-typed count_ast_ops for function:
-  //   skip_ast OR unsupported -> 0 ; supported -> 1 + sum of arg counts.
-  std::size_t ast_op_count = 0;
-  if (ast_supported) {
-    ast_op_count = 1;
-    for (auto const& a : args) {
-      ast_op_count += count_ast_ops(*a);
-    }
-  }
+  auto const ast_op_count = alt.cudf_ast_op_count();
 
   if (ast_supported && _strategy != expression_executor_strategy::MATERIALIZE &&
       (mode == execution_mode::AST || ast_op_count >= _min_ast_size)) {
@@ -397,6 +391,11 @@ execute_result gpu_expression_executor::execute(sirius::ast::function_call const
     static_cast<int>(resolved_id));
 }
 
+// DuckDB-typed entrypoint. Bridges callers that still pass duckdb::Expression
+// directly into the executor; the eventual home for this from_duckdb step is
+// the planning stage so the executor sees only native sirius::ast types, but
+// until upstream call sites are migrated this overload (and the duckdb
+// includes it requires) must stay.
 execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression const& expr,
                                                 execution_mode mode)
 {

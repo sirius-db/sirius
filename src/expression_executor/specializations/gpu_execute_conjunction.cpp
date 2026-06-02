@@ -66,12 +66,7 @@ execute_result gpu_expression_executor::execute(sirius::ast::conjunction const& 
     throw invalid_input_exception(
       "[gpu_expression_executor:conjunction] conjunction has no children — malformed AST.");
   }
-  // Match the DuckDB-typed count_ast_ops contract for conjunction:
-  // (num_children - 1) AND/OR ops + ops in every child.
-  std::size_t ast_op_count = alt.children.size() - 1;
-  for (auto const& child : alt.children) {
-    ast_op_count += count_ast_ops(*child);
-  }
+  auto const ast_op_count = alt.cudf_ast_op_count();
 
   if (_strategy != expression_executor_strategy::MATERIALIZE &&
       (mode == execution_mode::AST || ast_op_count >= _min_ast_size)) {
@@ -119,6 +114,11 @@ execute_result gpu_expression_executor::execute(sirius::ast::conjunction const& 
   return output;
 }
 
+// DuckDB-typed entrypoint. Bridges callers that still pass duckdb::Expression
+// directly into the executor; the eventual home for this from_duckdb step is
+// the planning stage so the executor sees only native sirius::ast types, but
+// until upstream call sites are migrated this overload (and the duckdb
+// includes it requires) must stay.
 execute_result gpu_expression_executor::execute(duckdb::BoundConjunctionExpression const& expr,
                                                 execution_mode mode)
 {

@@ -254,12 +254,7 @@ execute_result gpu_expression_executor::execute(sirius::ast::unary_op const& alt
       "[gpu_expression_executor] execute called on an unsupported TRY operator expression.");
   }
 
-  // Match DuckDB-typed count_ast_ops:
-  //   OPERATOR_NOT      -> 1 + child
-  //   OPERATOR_IS_NULL  -> 1 + child
-  //   OPERATOR_IS_NOT_NULL -> 2 + child (NOT wrapping IS_NULL)
-  std::size_t const self_count = (alt.op == sirius::ast::unary_op::kind::op_is_not_null) ? 2 : 1;
-  auto const ast_op_count      = self_count + count_ast_ops(*alt.child);
+  auto const ast_op_count = alt.cudf_ast_op_count();
 
   if (_strategy != expression_executor_strategy::MATERIALIZE &&
       (mode == execution_mode::AST || ast_op_count >= _min_ast_size)) {
@@ -348,17 +343,7 @@ execute_result gpu_expression_executor::execute(sirius::ast::in_list const& alt,
     throw invalid_input_exception(
       "[gpu_expression_executor:in_list] in_list has no values — malformed AST.");
   }
-  // Match DuckDB-typed count_ast_ops for COMPARE_IN/NOT_IN:
-  //   children = [probe] + values; num_or = N-2, num_eq = N-1, +1 if NOT_IN
-  auto const total_children = 1U + alt.values.size();
-  D_ASSERT(total_children > 1U);
-  std::size_t const num_or = total_children - 2U;
-  std::size_t const num_eq = total_children - 1U;
-  std::size_t ast_op_count = num_or + num_eq + (alt.negated ? 1U : 0U);
-  ast_op_count += count_ast_ops(*alt.probe);
-  for (auto const& v : alt.values) {
-    ast_op_count += count_ast_ops(*v);
-  }
+  auto const ast_op_count = alt.cudf_ast_op_count();
 
   if (_strategy != expression_executor_strategy::MATERIALIZE &&
       (mode == execution_mode::AST || ast_op_count >= _min_ast_size)) {
@@ -596,6 +581,11 @@ execute_result gpu_expression_executor::execute(sirius::ast::coalesce const& alt
 // public node dispatcher's std::visit over from_duckdb(expr).
 //===----------------------------------------------------------------------===//
 
+// DuckDB-typed entrypoint. Bridges callers that still pass duckdb::Expression
+// directly into the executor; the eventual home for this from_duckdb step is
+// the planning stage so the executor sees only native sirius::ast types, but
+// until upstream call sites are migrated this overload (and the duckdb
+// includes it requires) must stay.
 execute_result gpu_expression_executor::execute(duckdb::BoundOperatorExpression const& expr,
                                                 execution_mode mode)
 {

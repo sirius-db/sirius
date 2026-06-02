@@ -79,7 +79,7 @@ cudf::binary_operator comparison_op_to_binary(sirius::comparison_type op)
 execute_result gpu_expression_executor::execute(sirius::ast::comparison const& alt,
                                                 execution_mode mode)
 {
-  auto const ast_op_count = 1 + count_ast_ops(*alt.left) + count_ast_ops(*alt.right);
+  auto const ast_op_count = alt.cudf_ast_op_count();
   if (_strategy != expression_executor_strategy::MATERIALIZE &&
       (mode == execution_mode::AST || ast_op_count >= _min_ast_size)) {
     auto left             = execute(*alt.left, execution_mode::AST);
@@ -134,6 +134,11 @@ execute_result gpu_expression_executor::execute(sirius::ast::comparison const& a
   return execute_result(std::move(result_column));
 }
 
+// DuckDB-typed entrypoint. Bridges callers that still pass duckdb::Expression
+// directly into the executor; the eventual home for this from_duckdb step is
+// the planning stage so the executor sees only native sirius::ast types, but
+// until upstream call sites are migrated this overload (and the duckdb
+// includes it requires) must stay.
 execute_result gpu_expression_executor::execute(duckdb::BoundComparisonExpression const& expr,
                                                 execution_mode mode)
 {
