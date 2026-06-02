@@ -325,18 +325,31 @@ bool sirius_pipeline::is_pipeline_finished() const
 
 void sirius_pipeline::set_task_creator(sirius::creator::task_creator* tc) { _task_creator = tc; }
 
-void sirius_pipeline::notify_downstream_pipelines()
+void sirius_pipeline::notify_downstream_pipelines(bool original_pipeline)
 {
+  // If this pipeline's sink is the RESULT_COLLECTOR, it is the terminal
+  // pipeline of the query — there is no downstream consumer to schedule and
+  // no parent pipeline whose status needs updating. Returning early avoids
+  // racing with engine teardown after mark_completed() signals the future.
+  if (auto s = get_sink(); s && s->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
+    return;
+  }
+
   // Schedule output consumers via the task_creator so downstream pipelines
   // whose FULL-barrier ports are now unblocked will get tasks created.
-  if (_task_creator) {
+  // If this is the original pipeline, we dont want to schedule tasks for its consumers, that will
+  // be done later.
+  if (_task_creator && !original_pipeline) {
     for (auto* consumer : get_output_consumers()) {
-      _task_creator->schedule(consumer);
+      // If is possible to have a race condition here where one task finished and here it does to
+      // schedule a task right when the last task finished and marks the operator as finalized. That
+      // is ok. This check here is to minimize unnecessary scheduling of task creation.
+      if (!consumer->finalized.load()) { _task_creator->schedule(consumer); }
     }
   }
 
   for (auto* parent : get_parents()) {
-    parent->update_pipeline_status();
+    parent->update_pipeline_status(false);
   }
 }
 
@@ -345,7 +358,7 @@ std::unique_lock<std::mutex> sirius_pipeline::get_task_creation_lock()
   return std::unique_lock<std::mutex>(_status_mutex);
 }
 
-void sirius_pipeline::update_pipeline_status()
+void sirius_pipeline::update_pipeline_status(bool original_pipeline)
 {
   bool should_notify = false;
   {
@@ -425,7 +438,7 @@ void sirius_pipeline::update_pipeline_status()
   }  // _status_mutex released here — notify_downstream_pipelines must run outside the lock
      // to avoid holding the child pipeline mutex while acquiring a parent's
 
-  if (should_notify) { notify_downstream_pipelines(); }
+  if (should_notify) { notify_downstream_pipelines(original_pipeline); }
 }
 
 void sirius_pipeline::mark_task_created()
@@ -449,6 +462,37 @@ void sirius_pipeline::mark_task_created()
 
 void sirius_pipeline::mark_task_completed()
 {
+  // Sanity check: a task is completing here, which means this pipeline was still
+  // running work. If the pipeline was already marked finished, or any of its
+  // operators were already finalized, then we declared the pipeline done too
+  // early — i.e. a task was still in flight when we considered the pipeline
+  // complete. That mismatch can make the whole query look done while work is
+  // still running, so surface it loudly.
+  const bool pipeline_was_finished = pipeline_finished.load();
+  std::string finalized_ops;
+  auto check_op = [&finalized_ops](op::sirius_physical_operator* op) {
+    if (op != nullptr && op->finalized.load()) {
+      if (!finalized_ops.empty()) { finalized_ops += ", "; }
+      finalized_ops += std::format("{} (id={})", op->get_name(), op->get_operator_id());
+    }
+  };
+  check_op(source.get());
+  for (auto& op_ref : operators) {
+    check_op(&op_ref.get());
+  }
+  check_op(sink.get());
+
+  if (pipeline_was_finished || !finalized_ops.empty()) {
+    SIRIUS_LOG_WARN(
+      "Pipeline {}: task completed after the pipeline was already considered done "
+      "(pipeline_finished={}, already-finalized operators=[{}]). This indicates the "
+      "pipeline was marked finished while a task was still running, which can cause the "
+      "query to be reported complete prematurely.",
+      pipeline_id,
+      pipeline_was_finished,
+      finalized_ops);
+  }
+
   tasks_completed++;
   update_pipeline_status();
 }

@@ -15,10 +15,11 @@
  */
 
 #define CATCH_CONFIG_RUNNER
-
+#define CATCH_CONFIG_NO_POSIX_SIGNALS
 #include "catch.hpp"
 #include "config.hpp"
 #include "log/logging.hpp"
+#include "util/segfault_backtrace.hpp"
 #include "utils/sirius_test_env.hpp"
 
 #include <cuda_runtime.h>
@@ -95,6 +96,10 @@ CATCH_REGISTER_LISTENER(shared_env_listener)
 
 int main(int argc, char* argv[])
 {
+  // Install the crash backtrace handler up front so it covers the whole test
+  // run, independent of when (or whether) the extension's LoadInternal runs.
+  sirius::util::install_segfault_backtrace_handler();
+
   // Initialize the logger
   std::string log_dir = SIRIUS_UNITTEST_LOG_DIR;
   Config::LOG_DIR     = log_dir;

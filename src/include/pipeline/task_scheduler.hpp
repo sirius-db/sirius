@@ -192,6 +192,15 @@ class task_scheduler {
    */
   void drain_after_error();
 
+  /**
+   * @brief This function interrupts executors and waits for all in-flight tasks to complete.
+   * If any tasks are still in flight, an error is logged and an exception is thrown.
+   * This is used to ensure that all tasks have completed before the query returns and tears down
+   * the plan.
+   * @throws std::runtime_error if any tasks are still in flight.
+   */
+  void wait_for_completion();
+
   // for testing/stress only — see Doxygen below.
   /**
    * @brief Inject an initial value into the round-robin counter.
