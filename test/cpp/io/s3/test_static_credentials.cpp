@@ -22,7 +22,7 @@
 using sirius::io::s3::static_credentials;
 
 TEST_CASE("static_credentials default constructs to empty inert values",
-          "[s3][credential_provider][static_credentials]")
+          "[s3][authorizer][static_credentials]")
 {
   static_credentials creds;
 
@@ -33,7 +33,7 @@ TEST_CASE("static_credentials default constructs to empty inert values",
 }
 
 TEST_CASE("static_credentials preserves session token and expiration across copies",
-          "[s3][credential_provider][static_credentials]")
+          "[s3][authorizer][static_credentials]")
 {
   static_credentials creds;
   creds.access_key_id     = "access";

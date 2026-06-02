@@ -254,13 +254,30 @@ TEST_CASE("ast_from_duckdb - BOUND_COMPARISON GREATERTHANOREQUALTO translates to
   REQUIRE(out->get<comparison>().op == sirius::comparison_type::ge);
 }
 
-TEST_CASE("ast_from_duckdb - BOUND_COMPARISON DISTINCT_FROM returns nullptr", "[ast_from_duckdb]")
+TEST_CASE("ast_from_duckdb - BOUND_COMPARISON DISTINCT_FROM translates to comparison node",
+          "[ast_from_duckdb]")
 {
   auto left  = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
   auto right = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3));
   auto expr  = duckdb::make_uniq<BoundComparisonExpression>(
     ExpressionType::COMPARE_DISTINCT_FROM, std::move(left), std::move(right));
-  REQUIRE(sirius::ast::from_duckdb(*expr) == nullptr);
+  auto out = sirius::ast::from_duckdb(*expr);
+  REQUIRE(out);
+  REQUIRE(out->holds<comparison>());
+  REQUIRE(out->get<comparison>().op == sirius::comparison_type::distinct_from);
+}
+
+TEST_CASE("ast_from_duckdb - BOUND_COMPARISON NOT_DISTINCT_FROM translates to comparison node",
+          "[ast_from_duckdb]")
+{
+  auto left  = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
+  auto right = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3));
+  auto expr  = duckdb::make_uniq<BoundComparisonExpression>(
+    ExpressionType::COMPARE_NOT_DISTINCT_FROM, std::move(left), std::move(right));
+  auto out = sirius::ast::from_duckdb(*expr);
+  REQUIRE(out);
+  REQUIRE(out->holds<comparison>());
+  REQUIRE(out->get<comparison>().op == sirius::comparison_type::not_distinct_from);
 }
 
 // ============================================================================
@@ -362,12 +379,9 @@ TEST_CASE("ast_from_duckdb - BOUND_CASE WHEN/THEN/ELSE translates to case_expr",
 TEST_CASE("ast_from_duckdb - BOUND_CASE with unsupported WHEN propagates nullptr",
           "[ast_from_duckdb]")
 {
-  // The WHEN subexpression is COMPARE_DISTINCT_FROM (unsupported -> nullptr).
+  // The WHEN subexpression is a BoundParameterExpression (unsupported -> nullptr).
   // The whole CASE must collapse to nullptr.
-  auto bad_when = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_DISTINCT_FROM,
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
-    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(1)));
+  auto bad_when  = duckdb::make_uniq<BoundParameterExpression>(std::string{"p_when"});
   auto then_expr = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(10));
 
   BoundCaseCheck case_check;
@@ -630,13 +644,10 @@ TEST_CASE("ast_from_duckdb - BOUND_OPERATOR unsupported ExpressionType returns n
 TEST_CASE("ast_from_duckdb - BOUND_OPERATOR NOT with unsupported child propagates nullptr",
           "[ast_from_duckdb]")
 {
-  // COMPARE_DISTINCT_FROM is the canonical unsupported-comparison subtype that
-  // routes to nullptr; wrapping it in NOT must propagate the nullptr up.
-  auto bad_child = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_DISTINCT_FROM,
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
-    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(1)));
-  auto not_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_NOT,
+  // BoundParameterExpression translates to nullptr (BOUND_PARAMETER class).
+  // Wrapping it in NOT must propagate the nullptr up.
+  auto bad_child = duckdb::make_uniq<BoundParameterExpression>(std::string{"p_not"});
+  auto not_expr  = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_NOT,
                                                              LogicalType{LogicalTypeId::BOOLEAN});
   not_expr->children.push_back(std::move(bad_child));
 
@@ -646,11 +657,8 @@ TEST_CASE("ast_from_duckdb - BOUND_OPERATOR NOT with unsupported child propagate
 TEST_CASE("ast_from_duckdb - BOUND_OPERATOR COMPARE_IN with unsupported probe propagates nullptr",
           "[ast_from_duckdb]")
 {
-  auto bad_probe = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_DISTINCT_FROM,
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
-    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(1)));
-  auto in_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::COMPARE_IN,
+  auto bad_probe = duckdb::make_uniq<BoundParameterExpression>(std::string{"p_in"});
+  auto in_expr   = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::COMPARE_IN,
                                                             LogicalType{LogicalTypeId::BOOLEAN});
   in_expr->children.push_back(std::move(bad_probe));
   in_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(2)));
@@ -662,10 +670,7 @@ TEST_CASE("ast_from_duckdb - BOUND_OPERATOR COMPARE_IN with unsupported probe pr
 TEST_CASE("ast_from_duckdb - BOUND_OPERATOR COALESCE with unsupported child propagates nullptr",
           "[ast_from_duckdb]")
 {
-  auto bad_child = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_DISTINCT_FROM,
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
-    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(1)));
+  auto bad_child     = duckdb::make_uniq<BoundParameterExpression>(std::string{"p_coalesce"});
   auto coalesce_expr = duckdb::make_uniq<BoundOperatorExpression>(
     ExpressionType::OPERATOR_COALESCE, LogicalType{LogicalTypeId::INTEGER});
   coalesce_expr->children.push_back(

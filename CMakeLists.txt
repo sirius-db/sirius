@@ -155,6 +155,7 @@ set(EXTENSION_SOURCES
     src/expression/to_duckdb.cpp
     src/expression/value.cpp
     src/expression_executor/expression_executor_strategy.cpp
+    src/expression_executor/ast_op_counter.cpp
     src/expression_executor/gpu_expression_executor.cpp
     src/expression_executor/gpu_expression_translator.cpp
     src/expression_executor/regex/regex_playground.cpp
@@ -176,7 +177,7 @@ set(EXTENSION_SOURCES
     src/io/prefetching_cache.cpp
     src/io/s3/s3_ioctx.cpp
     src/io/s3/sigv4.cpp
-    src/io/s3/sirius_sigv4_credential_provider.cpp
+    src/io/s3/sirius_sigv4_authorizer.cpp
     src/io/sirius_datasource.cpp
     src/io/uri_parser.cpp
     src/io/uring/uring_ioctx.cpp
@@ -460,7 +461,7 @@ set(TEST_SOURCES
     test/cpp/io/s3/test_sigv4.cpp
     test/cpp/io/s3/test_s3_default_visibility_guard.cpp
     test/cpp/io/s3/test_s3_ioctx.cpp
-    test/cpp/io/s3/test_sirius_sigv4_credential_provider.cpp
+    test/cpp/io/s3/test_sirius_sigv4_authorizer.cpp
     test/cpp/io/s3/test_static_credentials.cpp
     test/cpp/io/test_datasource_factory.cpp
     test/cpp/io/test_duckdb_io_object.cpp

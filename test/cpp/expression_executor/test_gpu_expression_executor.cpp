@@ -23,7 +23,24 @@
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
+#include <expression/ast/between.hpp>
+#include <expression/ast/case_expr.hpp>
+#include <expression/ast/cast.hpp>
+#include <expression/ast/coalesce.hpp>
+#include <expression/ast/comparison.hpp>
+#include <expression/ast/conjunction.hpp>
+#include <expression/ast/constant.hpp>
+#include <expression/ast/from_duckdb.hpp>
+#include <expression/ast/function_call.hpp>
+#include <expression/ast/in_list.hpp>
+#include <expression/ast/node.hpp>
+#include <expression/ast/reference.hpp>
+#include <expression/ast/unary_op.hpp>
+#include <expression/function_id.hpp>
+#include <expression/join_condition.hpp>
+#include <expression/value.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
+#include <helper/logical_type.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 
 // duckdb
@@ -2034,4 +2051,453 @@ TEMPLATE_TEST_CASE("execute mixed arithmetic and CASE projection",
     REQUIRE(out0[i] == in0[i] + in1[i]);
     REQUIRE(out1[i] == (in0[i] > 25 ? in1[i] * 2 : in1[i]));
   }
+}
+
+// ---------------------------------------------------------------------------
+// native_ast — exercise each migrated AST alternative through the non-owning
+// AST executor ctor, building the AST by hand (no DuckDB allocation involved).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Build a single-column INT32 input batch [0..127] and return its table view.
+struct int32_batch {
+  std::shared_ptr<data_batch> batch;
+  cudf::table_view view;
+};
+
+int32_batch make_int32_input(memory_space& space)
+{
+  auto batch =
+    make_input_batch(space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 100}});
+  auto ro       = batch->to_read_only();
+  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  return {batch, in_repr.get_table_view()};
+}
+
+std::unique_ptr<sirius::ast::node> ref_node_native(uint32_t idx)
+{
+  return std::make_unique<sirius::ast::node>(sirius::ast::reference{idx});
+}
+
+std::unique_ptr<sirius::ast::node> int_const_node_native(int32_t v)
+{
+  return std::make_unique<sirius::ast::node>(
+    sirius::ast::constant{sirius::value{v}, sirius::logical_type::make(sirius::type_id::INTEGER)});
+}
+
+std::unique_ptr<cudf::table> run_native_ast(memory_space& space,
+                                            sirius::ast::node const* expr_ptr,
+                                            cudf::table_view tv,
+                                            exp_strategy_enum strategy = MAT)
+{
+  exp_executor executor(expr_ptr, get_resource_ref(space), cudf::get_default_stream(), strategy);
+  return executor.execute(tv);
+}
+
+}  // namespace
+
+TEST_CASE("native_ast - reference identity", "[expression_executor_ast_native][reference]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto in = make_int32_input(*space);
+
+  auto hand_ast = ref_node_native(0);
+  auto out      = run_native_ast(*space, hand_ast.get(), in.view, MAT);
+  REQUIRE(out);
+  auto in_host  = copy_column_to_host<int32_t>(in.view.column(0));
+  auto out_host = copy_column_to_host<int32_t>(out->view().column(0));
+  REQUIRE(out_host == in_host);
+}
+
+TEST_CASE("native_ast - constant INTEGER", "[expression_executor_ast_native][constant]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto in = make_int32_input(*space);
+
+  auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::constant{
+    sirius::value{int32_t{42}}, sirius::logical_type::make(sirius::type_id::INTEGER)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), in.view, MAT);
+  REQUIRE(out);
+  std::vector<int32_t> expected(in.view.num_rows(), 42);
+  REQUIRE(copy_column_to_host<int32_t>(out->view().column(0)) == expected);
+}
+
+TEST_CASE("native_ast - constant VARCHAR", "[expression_executor_ast_native][constant]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto input =
+    make_input_batch(*space, {cudf::data_type{cudf::type_id::STRING}}, {std::pair<int, int>{1, 5}});
+  auto ro       = input->to_read_only();
+  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  auto tv       = in_repr.get_table_view();
+
+  auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::constant{
+    sirius::value{std::string{"hello"}}, sirius::logical_type::make(sirius::type_id::VARCHAR)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), tv, MAT);
+  REQUIRE(out);
+  std::vector<std::string> expected(tv.num_rows(), "hello");
+  REQUIRE(copy_string_column_to_host(out->view().column(0)) == expected);
+}
+
+TEST_CASE("native_ast - comparison EQUAL (MATERIALIZE)",
+          "[expression_executor_ast_native][comparison]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto in = make_int32_input(*space);
+
+  auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::comparison{
+    sirius::comparison_type::equal, ref_node_native(0), int_const_node_native(42)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), in.view, MAT);
+  REQUIRE(out);
+  auto in_host  = copy_column_to_host<int32_t>(in.view.column(0));
+  auto out_host = copy_bool_column_to_host(out->view().column(0));
+  REQUIRE(out_host.size() == in_host.size());
+  for (size_t i = 0; i < in_host.size(); ++i) {
+    REQUIRE(out_host[i] == (in_host[i] == 42 ? 1U : 0U));
+  }
+}
+
+TEST_CASE("native_ast - comparison LESS_THAN (AST_INTERPRET)",
+          "[expression_executor_ast_native][comparison]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto in = make_int32_input(*space);
+
+  auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::comparison{
+    sirius::comparison_type::lt, ref_node_native(0), int_const_node_native(50)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), in.view, exp_strategy_enum::AST_INTERPRET);
+  REQUIRE(out);
+  auto in_host  = copy_column_to_host<int32_t>(in.view.column(0));
+  auto out_host = copy_bool_column_to_host(out->view().column(0));
+  REQUIRE(out_host.size() == in_host.size());
+  for (size_t i = 0; i < in_host.size(); ++i) {
+    REQUIRE(out_host[i] == (in_host[i] < 50 ? 1U : 0U));
+  }
+}
+
+TEST_CASE("native_ast - conjunction AND (MATERIALIZE)",
+          "[expression_executor_ast_native][conjunction]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  // Build a 2-column INT32 batch with col0 in [0, 100) and col1 in [0, 100).
+  auto input =
+    make_input_batch(*space,
+                     {cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT32}},
+                     {std::pair<int, int>{0, 100}, std::pair<int, int>{0, 100}});
+  auto ro       = input->to_read_only();
+  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  auto tv       = in_repr.get_table_view();
+
+  std::vector<std::unique_ptr<sirius::ast::node>> children;
+  children.push_back(std::make_unique<sirius::ast::node>(sirius::ast::comparison{
+    sirius::comparison_type::gt, ref_node_native(0), int_const_node_native(10)}));
+  children.push_back(std::make_unique<sirius::ast::node>(sirius::ast::comparison{
+    sirius::comparison_type::lt, ref_node_native(1), int_const_node_native(90)}));
+  auto hand_ast = std::make_unique<sirius::ast::node>(
+    sirius::ast::conjunction{sirius::ast::conjunction::kind::op_and, std::move(children)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), tv, MAT);
+  REQUIRE(out);
+  auto c0       = copy_column_to_host<int32_t>(tv.column(0));
+  auto c1       = copy_column_to_host<int32_t>(tv.column(1));
+  auto out_host = copy_bool_column_to_host(out->view().column(0));
+  REQUIRE(out_host.size() == c0.size());
+  for (size_t i = 0; i < c0.size(); ++i) {
+    REQUIRE(out_host[i] == ((c0[i] > 10 && c1[i] < 90) ? 1U : 0U));
+  }
+}
+
+TEST_CASE("native_ast - between (MATERIALIZE)", "[expression_executor_ast_native][between]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto in = make_int32_input(*space);
+
+  auto hand_ast =
+    std::make_unique<sirius::ast::node>(sirius::ast::between{ref_node_native(0),
+                                                             int_const_node_native(5),
+                                                             int_const_node_native(15),
+                                                             /*lower_inclusive=*/true,
+                                                             /*upper_inclusive=*/true});
+
+  auto out = run_native_ast(*space, hand_ast.get(), in.view, MAT);
+  REQUIRE(out);
+  auto in_host  = copy_column_to_host<int32_t>(in.view.column(0));
+  auto out_host = copy_bool_column_to_host(out->view().column(0));
+  REQUIRE(out_host.size() == in_host.size());
+  for (size_t i = 0; i < in_host.size(); ++i) {
+    REQUIRE(out_host[i] == ((in_host[i] >= 5 && in_host[i] <= 15) ? 1U : 0U));
+  }
+}
+
+TEST_CASE("native_ast - unary_op NOT (MATERIALIZE)", "[expression_executor_ast_native][unary_op]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto in = make_int32_input(*space);
+
+  auto cmp      = std::make_unique<sirius::ast::node>(sirius::ast::comparison{
+    sirius::comparison_type::equal, ref_node_native(0), int_const_node_native(5)});
+  auto hand_ast = std::make_unique<sirius::ast::node>(
+    sirius::ast::unary_op{sirius::ast::unary_op::kind::op_not, std::move(cmp)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), in.view, MAT);
+  REQUIRE(out);
+  auto in_host  = copy_column_to_host<int32_t>(in.view.column(0));
+  auto out_host = copy_bool_column_to_host(out->view().column(0));
+  REQUIRE(out_host.size() == in_host.size());
+  for (size_t i = 0; i < in_host.size(); ++i) {
+    REQUIRE(out_host[i] == (in_host[i] != 5 ? 1U : 0U));
+  }
+}
+
+TEST_CASE("native_ast - unary_op IS_NULL (MATERIALIZE)",
+          "[expression_executor_ast_native][unary_op]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  std::vector<int32_t> values{1, 2, 3, 4, 5};
+  std::vector<bool> valids{true, false, true, false, true};
+  auto batch    = make_int32_batch_with_nulls(*space, values, valids);
+  auto ro       = batch->to_read_only();
+  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  auto tv       = in_repr.get_table_view();
+
+  auto hand_ast = std::make_unique<sirius::ast::node>(
+    sirius::ast::unary_op{sirius::ast::unary_op::kind::op_is_null, ref_node_native(0)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), tv, MAT);
+  REQUIRE(out);
+  auto out_host = copy_bool_column_to_host(out->view().column(0));
+  REQUIRE(out_host.size() == valids.size());
+  for (size_t i = 0; i < valids.size(); ++i) {
+    REQUIRE(out_host[i] == (valids[i] ? 0U : 1U));
+  }
+}
+
+TEST_CASE("native_ast - unary_op IS_NOT_NULL (MATERIALIZE)",
+          "[expression_executor_ast_native][unary_op]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  std::vector<int32_t> values{10, 20, 30, 40};
+  std::vector<bool> valids{true, false, true, true};
+  auto batch    = make_int32_batch_with_nulls(*space, values, valids);
+  auto ro       = batch->to_read_only();
+  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  auto tv       = in_repr.get_table_view();
+
+  auto hand_ast = std::make_unique<sirius::ast::node>(
+    sirius::ast::unary_op{sirius::ast::unary_op::kind::op_is_not_null, ref_node_native(0)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), tv, MAT);
+  REQUIRE(out);
+  auto out_host = copy_bool_column_to_host(out->view().column(0));
+  REQUIRE(out_host.size() == valids.size());
+  for (size_t i = 0; i < valids.size(); ++i) {
+    REQUIRE(out_host[i] == (valids[i] ? 1U : 0U));
+  }
+}
+
+TEST_CASE("native_ast - in_list IN (MATERIALIZE)", "[expression_executor_ast_native][in_list]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto in = make_int32_input(*space);
+
+  std::vector<std::unique_ptr<sirius::ast::node>> values;
+  values.push_back(int_const_node_native(1));
+  values.push_back(int_const_node_native(3));
+  values.push_back(int_const_node_native(5));
+  auto hand_ast = std::make_unique<sirius::ast::node>(
+    sirius::ast::in_list{ref_node_native(0), std::move(values), /*negated=*/false});
+
+  auto out = run_native_ast(*space, hand_ast.get(), in.view, MAT);
+  REQUIRE(out);
+  auto in_host  = copy_column_to_host<int32_t>(in.view.column(0));
+  auto out_host = copy_bool_column_to_host(out->view().column(0));
+  REQUIRE(out_host.size() == in_host.size());
+  for (size_t i = 0; i < in_host.size(); ++i) {
+    bool const expected = (in_host[i] == 1 || in_host[i] == 3 || in_host[i] == 5);
+    REQUIRE(out_host[i] == (expected ? 1U : 0U));
+  }
+}
+
+TEST_CASE("native_ast - coalesce (MATERIALIZE)", "[expression_executor_ast_native][coalesce]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  std::vector<int32_t> values{7, 8, 9, 10, 11};
+  std::vector<bool> valids{true, false, true, false, true};
+  auto batch    = make_int32_batch_with_nulls(*space, values, valids);
+  auto ro       = batch->to_read_only();
+  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  auto tv       = in_repr.get_table_view();
+
+  std::vector<std::unique_ptr<sirius::ast::node>> children;
+  children.push_back(ref_node_native(0));
+  children.push_back(int_const_node_native(99));
+  auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::coalesce{std::move(children)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), tv, MAT);
+  REQUIRE(out);
+  auto out_host = copy_column_to_host<int32_t>(out->view().column(0));
+  REQUIRE(out_host.size() == values.size());
+  for (size_t i = 0; i < values.size(); ++i) {
+    REQUIRE(out_host[i] == (valids[i] ? values[i] : 99));
+  }
+}
+
+TEST_CASE("native_ast - cast INTEGER->BIGINT (MATERIALIZE)",
+          "[expression_executor_ast_native][cast]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto in = make_int32_input(*space);
+
+  auto hand_ast = std::make_unique<sirius::ast::node>(
+    sirius::ast::cast{ref_node_native(0),
+                      sirius::logical_type::make(sirius::type_id::BIGINT),
+                      /*try_cast=*/false});
+
+  auto out = run_native_ast(*space, hand_ast.get(), in.view, MAT);
+  REQUIRE(out);
+  auto in_host  = copy_column_to_host<int32_t>(in.view.column(0));
+  auto out_host = copy_column_to_host<int64_t>(out->view().column(0));
+  REQUIRE(out_host.size() == in_host.size());
+  for (size_t i = 0; i < in_host.size(); ++i) {
+    REQUIRE(out_host[i] == static_cast<int64_t>(in_host[i]));
+  }
+}
+
+TEST_CASE("native_ast - function_call add (MATERIALIZE)",
+          "[expression_executor_ast_native][function_call]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  // 2-column INT32 batch.
+  auto input =
+    make_input_batch(*space,
+                     {cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT32}},
+                     {std::pair<int, int>{0, 50}, std::pair<int, int>{0, 50}});
+  auto ro       = input->to_read_only();
+  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  auto tv       = in_repr.get_table_view();
+
+  std::vector<std::unique_ptr<sirius::ast::node>> args;
+  args.push_back(ref_node_native(0));
+  args.push_back(ref_node_native(1));
+  auto hand_ast = std::make_unique<sirius::ast::node>(
+    sirius::ast::function_call{sirius::function_id::add,
+                               std::move(args),
+                               sirius::logical_type::make(sirius::type_id::INTEGER)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), tv, MAT);
+  REQUIRE(out);
+  auto c0       = copy_column_to_host<int32_t>(tv.column(0));
+  auto c1       = copy_column_to_host<int32_t>(tv.column(1));
+  auto out_host = copy_column_to_host<int32_t>(out->view().column(0));
+  REQUIRE(out_host.size() == c0.size());
+  for (size_t i = 0; i < c0.size(); ++i) {
+    REQUIRE(out_host[i] == c0[i] + c1[i]);
+  }
+}
+
+TEST_CASE("native_ast - function_call add (AST_INTERPRET)",
+          "[expression_executor_ast_native][function_call]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto input =
+    make_input_batch(*space,
+                     {cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT32}},
+                     {std::pair<int, int>{0, 50}, std::pair<int, int>{0, 50}});
+  auto ro       = input->to_read_only();
+  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  auto tv       = in_repr.get_table_view();
+
+  std::vector<std::unique_ptr<sirius::ast::node>> args;
+  args.push_back(ref_node_native(0));
+  args.push_back(ref_node_native(1));
+  auto hand_ast = std::make_unique<sirius::ast::node>(
+    sirius::ast::function_call{sirius::function_id::add,
+                               std::move(args),
+                               sirius::logical_type::make(sirius::type_id::INTEGER)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), tv, exp_strategy_enum::AST_INTERPRET);
+  REQUIRE(out);
+  auto c0       = copy_column_to_host<int32_t>(tv.column(0));
+  auto c1       = copy_column_to_host<int32_t>(tv.column(1));
+  auto out_host = copy_column_to_host<int32_t>(out->view().column(0));
+  REQUIRE(out_host.size() == c0.size());
+  for (size_t i = 0; i < c0.size(); ++i) {
+    REQUIRE(out_host[i] == c0[i] + c1[i]);
+  }
+}
+
+TEST_CASE("native_ast - case_expr WHEN/THEN/ELSE (MATERIALIZE)",
+          "[expression_executor_ast_native][case_expr]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto in = make_int32_input(*space);
+
+  std::vector<sirius::ast::case_expr::when_then> cases;
+  cases.emplace_back();
+  cases.back().when_ = std::make_unique<sirius::ast::node>(sirius::ast::comparison{
+    sirius::comparison_type::equal, ref_node_native(0), int_const_node_native(5)});
+  cases.back().then_ = int_const_node_native(100);
+  auto hand_ast      = std::make_unique<sirius::ast::node>(
+    sirius::ast::case_expr{std::move(cases), int_const_node_native(0)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), in.view, MAT);
+  REQUIRE(out);
+  auto in_host  = copy_column_to_host<int32_t>(in.view.column(0));
+  auto out_host = copy_column_to_host<int32_t>(out->view().column(0));
+  REQUIRE(out_host.size() == in_host.size());
+  for (size_t i = 0; i < in_host.size(); ++i) {
+    REQUIRE(out_host[i] == (in_host[i] == 5 ? 100 : 0));
+  }
+}
+
+// Translator-only TEST_CASE: verifies that the BoundComparisonExpression shim
+// path now produces a non-null sirius::ast::node for COMPARE_DISTINCT_FROM and
+// COMPARE_NOT_DISTINCT_FROM. The executor's downstream behaviour on these
+// comparison kinds is GPU-bound and asserted by the existing
+// [expression_executor_ast_native][comparison] cases — this case only proves
+// that the lowering pipeline no longer drops these comparison kinds at the
+// from_duckdb step (sirius-db/sirius#699).
+TEST_CASE("native_ast - BoundComparisonExpression DISTINCT_FROM translates without nullptr",
+          "[expression_executor_ast_native_translate][comparison]")
+{
+  auto left  = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
+  auto right = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(7));
+  auto expr  = duckdb::make_uniq<BoundComparisonExpression>(
+    ExpressionType::COMPARE_DISTINCT_FROM, std::move(left), std::move(right));
+
+  auto node = sirius::ast::from_duckdb(*expr);
+  REQUIRE(node);
+  REQUIRE(node->holds<sirius::ast::comparison>());
+  REQUIRE(node->get<sirius::ast::comparison>().op == sirius::comparison_type::distinct_from);
+
+  auto left2  = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
+  auto right2 = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(7));
+  auto expr2  = duckdb::make_uniq<BoundComparisonExpression>(
+    ExpressionType::COMPARE_NOT_DISTINCT_FROM, std::move(left2), std::move(right2));
+
+  auto node2 = sirius::ast::from_duckdb(*expr2);
+  REQUIRE(node2);
+  REQUIRE(node2->holds<sirius::ast::comparison>());
+  REQUIRE(node2->get<sirius::ast::comparison>().op == sirius::comparison_type::not_distinct_from);
 }

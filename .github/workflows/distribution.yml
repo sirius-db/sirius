@@ -47,7 +47,7 @@ jobs:
       cuda_archs: '75-real;80-real;86-real;89-real;90a-real;100f-real;120a-real;120'
       cuda_version: '13'
       artifact_postfix: '-cuda13'
-      runners: '{"linux_x64": ["self-hosted", "ubuntu-24.04", "pixi", "cpu-xl"], "linux_arm64": ["self-hosted", "ubuntu-24.04", "pixi", "arm-xl"]}'
+      runners: '{"linux_x64": ["self-hosted", "ubuntu-24.04", "cpu-xl"], "linux_arm64": ["self-hosted", "ubuntu-24.04", "arm-xl"]}'
 
   cuda-12:
     uses: sirius-db/extension-ci-tools/.github/workflows/_extension_distribution.yml@sirius
@@ -70,4 +70,4 @@ jobs:
       cuda_archs: '75-real;80-real;86-real;89-real;90a-real'
       cuda_version: '12'
       artifact_postfix: '-cuda12'
-      runners: '{"linux_x64": ["self-hosted", "ubuntu-22.04", "pixi", "cpu-xl"], "linux_arm64": ["self-hosted", "ubuntu-22.04", "pixi", "arm-xl"]}'
+      runners: '{"linux_x64": ["self-hosted", "ubuntu-22.04", "cpu-xl"], "linux_arm64": ["self-hosted", "ubuntu-22.04", "arm-xl"]}'
