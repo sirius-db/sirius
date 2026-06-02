@@ -203,6 +203,7 @@ std::future<void> task_scheduler::start_query()
   std::lock_guard<std::mutex> lock(_priority_scans_mutex);
   for (int i = 0; i < k_initial_scans && !_priority_scans.empty(); ++i) {
     auto* scan_op = _priority_scans.front();
+    SIRIUS_LOG_WARN("task_scheduler: scheduling consumer op_id={}", scan_op->get_operator_id());
     _task_creator->schedule(scan_op);
     _priority_scans.pop();
   }
@@ -269,6 +270,24 @@ void task_scheduler::drain_after_error()
 
   if (_task_creator) { _task_creator->start_thread_pool(); }
   SIRIUS_LOG_INFO("task_scheduler: DONE draining after error");
+}
+
+void task_scheduler::drain_after_completion()
+{
+  SIRIUS_LOG_INFO("task_scheduler: draining after completion");
+  // Same quiescence as drain_after_error(), but on the success path: the worker
+  // that called mark_completed() cannot drain its own pool, so we do it here on
+  // the engine thread once the future is satisfied. Joining the task_creator
+  // manager is essential — the ASan use-after-free was a stale op-id request being
+  // dereferenced inside task_creator::manager_loop after the plan was freed.
+  if (_task_creator) { _task_creator->stop_thread_pool(); }
+  _task_queue.drain();
+  _scan_executor->drain_and_wait();
+  for (auto& [device_id, gpu_exec] : _gpu_executors) {
+    gpu_exec->drain_and_wait();
+  }
+  if (_task_creator) { _task_creator->start_thread_pool(); }
+  SIRIUS_LOG_INFO("task_scheduler: DONE draining after completion");
 }
 
 void task_scheduler::management_eventloop()

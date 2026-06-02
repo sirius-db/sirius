@@ -338,7 +338,25 @@ void gpu_pipeline_executor::manager_loop()
           if (_completion_handler) { _completion_handler->report_error(std::current_exception()); }
           return;
         }
+        auto* gpu_task                = cast_to_gpu_pipeline_task(task.get());
+        size_t orig_task_piepeline_id = 0;
+        if (!gpu_task) {
+          SIRIUS_LOG_ERROR(
+            "GPU Pipeline Executor: Failed to cast task to gpu_pipeline_task when trying to get "
+            "orig task pipeline id");
+        }
+        orig_task_piepeline_id = gpu_task->get_pipeline()->get_pipeline_id();
         task.reset();
+
+        // If we already signaled query completion on this executor, then a task is
+        // still finishing afterwards — work was in flight when we declared the query
+        // done. This is the bug we are hunting; surface it loudly with the pipeline id.
+        if (_query_complete.load(std::memory_order_acquire)) {
+          SIRIUS_LOG_WARN(
+            "gpu_pipeline_executor: task for pipeline {} finished AFTER query was already "
+            "marked complete — a task was still in flight at completion time",
+            orig_task_piepeline_id);
+        }
 
         // Check if query is complete BEFORE scheduling downstream tasks.
         // mark_completed() signals the future that engine.execute() is waiting on,
@@ -359,11 +377,20 @@ void gpu_pipeline_executor::manager_loop()
           // mid-pipeline batches need to start rotating before that point so
           // they reach all GPUs.
           for (auto* consumer : consumers) {
-            if (consumer) { _task_creator->schedule(consumer); }
+            if (consumer) {
+              SIRIUS_LOG_WARN("gpu_pipeline_executor: scheduling consumer op_id={}",
+                              consumer->get_operator_id());
+              _task_creator->schedule(consumer);
+            }
           }
         }
 
         if (query_complete && _completion_handler) {
+          SIRIUS_LOG_WARN("gpu_pipeline_executor: query complete from pipeline {}",
+                          orig_task_piepeline_id);
+          // Mark before draining/signaling so any task that finishes after this point
+          // trips the straggler warning above.
+          _query_complete.store(true, std::memory_order_release);
           _task_creator->drain_pending_tasks();
           _completion_handler->mark_completed();
         }
@@ -386,6 +413,10 @@ bool gpu_pipeline_executor::is_task_queue_empty() const noexcept { return _task_
 
 void gpu_pipeline_executor::set_completion_handler(completion_handler* handler) noexcept
 {
+  // Called at the start of every query (task_scheduler::start_query). Reset the
+  // per-query completion flag so a stale `true` from the previous query cannot
+  // make this query spuriously look already-complete.
+  _query_complete.store(false, std::memory_order_release);
   _completion_handler = handler;
 }
 

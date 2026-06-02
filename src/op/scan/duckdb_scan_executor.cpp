@@ -509,6 +509,8 @@ void duckdb_scan_executor::manager_loop()
           t.reset();
           if (_task_creator && !(_completion_handler && _completion_handler->is_completed())) {
             for (auto* consumer : consumers) {
+              SIRIUS_LOG_WARN("duckdb_scan_executor: scheduling consumer op_id={}",
+                              consumer->get_operator_id());
               _task_creator->schedule(consumer);
             }
           }

@@ -341,7 +341,12 @@ void sirius_pipeline::notify_downstream_pipelines(bool original_pipeline)
   // be done later.
   if (_task_creator && !original_pipeline) {
     for (auto* consumer : get_output_consumers()) {
-      if (!consumer->finalized) { _task_creator->schedule(consumer); }
+      if (!consumer->finalized) {
+        SIRIUS_LOG_WARN(
+          "sirius_pipeline::notify_downstream_pipelines: scheduling consumer op_id={}",
+          consumer->get_operator_id());
+        _task_creator->schedule(consumer);
+      }
     }
   }
 
@@ -375,6 +380,7 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
       if (table_scan.exhausted.load()) {
         if (tasks_created.load() == tasks_completed.load()) {
           pipeline_finished.store(true);
+          SIRIUS_LOG_WARN("pipeline_finished set to true for pipeline id={}", pipeline_id);
           for (auto& op : get_operators()) {
             op.get().finalize_operator();
           }
@@ -387,6 +393,7 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
       if (!parquet_scan.has_more_partitions.load()) {
         if (tasks_created.load() == tasks_completed.load()) {
           pipeline_finished.store(true);
+          SIRIUS_LOG_WARN("pipeline_finished set to true for pipeline id={}", pipeline_id);
           for (auto& op : get_operators()) {
             op.get().finalize_operator();
           }
@@ -399,6 +406,7 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
       if (cpu_source.exhausted.load()) {
         if (tasks_created.load() == tasks_completed.load()) {
           pipeline_finished.store(true);
+          SIRIUS_LOG_WARN("pipeline_finished set to true for pipeline id={}", pipeline_id);
           for (auto& op : get_operators()) {
             op.get().finalize_operator();
           }
@@ -423,6 +431,7 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
           (first_node->is_source_pipeline_finished() && first_node->all_ports_empty())) {
         if (tasks_created.load() == tasks_completed.load()) {
           pipeline_finished.store(true);
+          SIRIUS_LOG_WARN("pipeline_finished set to true for pipeline id={}", pipeline_id);
           for (auto& op : get_operators()) {
             op.get().finalize_operator();
           }
@@ -459,6 +468,37 @@ void sirius_pipeline::mark_task_created()
 
 void sirius_pipeline::mark_task_completed()
 {
+  // Sanity check: a task is completing here, which means this pipeline was still
+  // running work. If the pipeline was already marked finished, or any of its
+  // operators were already finalized, then we declared the pipeline done too
+  // early — i.e. a task was still in flight when we considered the pipeline
+  // complete. That mismatch can make the whole query look done while work is
+  // still running, so surface it loudly.
+  const bool pipeline_was_finished = pipeline_finished.load();
+  std::string finalized_ops;
+  auto check_op = [&finalized_ops](op::sirius_physical_operator* op) {
+    if (op != nullptr && op->finalized) {
+      if (!finalized_ops.empty()) { finalized_ops += ", "; }
+      finalized_ops += std::format("{} (id={})", op->get_name(), op->get_operator_id());
+    }
+  };
+  check_op(source.get());
+  for (auto& op_ref : operators) {
+    check_op(&op_ref.get());
+  }
+  check_op(sink.get());
+
+  if (pipeline_was_finished || !finalized_ops.empty()) {
+    SIRIUS_LOG_WARN(
+      "Pipeline {}: task completed after the pipeline was already considered done "
+      "(pipeline_finished={}, already-finalized operators=[{}]). This indicates the "
+      "pipeline was marked finished while a task was still running, which can cause the "
+      "query to be reported complete prematurely.",
+      pipeline_id,
+      pipeline_was_finished,
+      finalized_ops);
+  }
+
   tasks_completed++;
   update_pipeline_status();
 }

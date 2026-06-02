@@ -88,7 +88,7 @@ static void flush_logs_best_effort()
   signal(SIGALRM, SIG_DFL);  // ensure default (terminate) disposition
   alarm(3);                  // hard deadline for the log + flush below
   if (auto* logger = spdlog::default_logger_raw()) {
-    SPDLOG_LOGGER_INFO(logger, "SIRIUS signal handler triggered, flushing logs");
+    SPDLOG_LOGGER_WARN(logger, "SIRIUS signal handler triggered, flushing logs");
     logger->flush();
   }
   alarm(0);  // flush returned in time; cancel the deadline

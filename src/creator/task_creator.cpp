@@ -170,7 +170,7 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
 
 void task_creator::drain_pending_tasks()
 {
-  // Drain any queued task creation requests that haven't been picked up yet
+  // Stop the manager from pulling more requests, then drain what's left.
   _task_creation_queue.interrupt();
   _task_creation_queue.drain();
   // Wait for any in-flight task creation lambdas to finish. When called from
@@ -291,6 +291,8 @@ void task_creator::manager_loop()
 
     auto node = request->node;
     if (node == nullptr) { continue; }
+    SIRIUS_LOG_WARN("task_creator::manager_loop: popped request for op_id={}",
+                    node->get_operator_id());
 
     node = get_operator_for_next_task(node);
 
