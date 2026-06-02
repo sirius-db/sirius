@@ -18,6 +18,7 @@
 #include "exec/thread_pool.hpp"
 #include "helper/logical_type.hpp"
 #include "io/prefetching_cache.hpp"
+#include "io/s3/s3_async_experimental_ioctx.hpp"
 #include "io/s3/s3_ioctx.hpp"
 #include "io/s3/sirius_sigv4_authorizer.hpp"
 #include "op/scan/parquet_scan_operator_data.hpp"
@@ -25,6 +26,8 @@
 #include "scan_manager/parquet_split_provider.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "scan_manager/split_connector.hpp"
+#include "sirius_config.hpp"
+#include "sirius_context.hpp"
 
 // Include this last among sirius/test headers: it transitively pulls
 // liburing.h, whose BLOCK_SIZE macro collides with blockingconcurrentqueue.h.
@@ -56,6 +59,7 @@
 
 using sirius::io::buffer_pool;
 using sirius::io::sirius_ioctx;
+using sirius::io::s3::s3_async_experimental_ioctx;
 using sirius::io::s3::s3_ioctx;
 using sirius::io::s3::s3_ioctx_config;
 using sirius::io::s3::sirius_sigv4_presigned_authorizer;
@@ -158,6 +162,28 @@ s3_ioctx_config make_s3_config(s3_test_env const& env, bool bad_credentials = fa
   cfg.retry_backoff_base = 10ms;
   cfg.retry_jitter       = 0ms;
   cfg.honor_retry_after  = false;
+  return cfg;
+}
+
+sirius::sirius_config make_context_config(s3_test_env const& env, std::optional<bool> use_async)
+{
+  auto const config_path =
+    std::filesystem::path(__FILE__).parent_path() / "integration_s3cache.yaml";
+  sirius::sirius_config cfg{};
+  cfg.load_from_file(config_path);
+  REQUIRE_FALSE(cfg.get_memory_space_configs().empty());
+
+  cfg.object_store_config.endpoint   = env.endpoint;
+  cfg.object_store_config.region     = env.region;
+  cfg.object_store_config.access_key = env.access_key;
+  cfg.object_store_config.secret_key = env.secret_key;
+  if (use_async.has_value()) { cfg.object_store_config.s3_use_async_backend = *use_async; }
+
+  auto scan_cfg                              = cfg.get_scan_manager_config();
+  scan_cfg.use_sirius_datasource             = true;
+  scan_cfg.s3_thread_pool.num_threads        = 4;
+  scan_cfg.s3_thread_pool.thread_name_prefix = "s3_factory";
+  cfg.set_scan_manager_config(std::move(scan_cfg));
   return cfg;
 }
 
@@ -265,6 +291,96 @@ bool saw_scheme(std::vector<std::unique_ptr<parquet_scan_data>> const& splits,
 }
 
 }  // namespace
+
+TEST_CASE("SiriusContext selects the configured S3 backend implementation",
+          "[.][s3][integration][scan_manager][asynccurl]")
+{
+  auto env = read_s3_test_env();
+  if (!env) {
+    WARN("Skipping S3 backend factory test because SIRIUS_TEST_S3_* is not configured");
+    return;
+  }
+
+  SECTION("flag absent keeps the blocking backend")
+  {
+    auto cfg = make_context_config(*env, std::nullopt);
+
+    duckdb::SiriusContext context;
+    context.initialize(cfg);
+
+    {
+      auto s3_ctx = context.get_s3_ioctx();
+      REQUIRE(s3_ctx != nullptr);
+      CHECK(dynamic_cast<s3_ioctx*>(s3_ctx.get()) != nullptr);
+      CHECK(dynamic_cast<s3_async_experimental_ioctx*>(s3_ctx.get()) == nullptr);
+    }
+
+    context.terminate();
+  }
+
+  SECTION("flag false keeps the blocking backend")
+  {
+    auto cfg = make_context_config(*env, false);
+
+    duckdb::SiriusContext context;
+    context.initialize(cfg);
+
+    {
+      auto s3_ctx = context.get_s3_ioctx();
+      REQUIRE(s3_ctx != nullptr);
+      CHECK(dynamic_cast<s3_ioctx*>(s3_ctx.get()) != nullptr);
+      CHECK(dynamic_cast<s3_async_experimental_ioctx*>(s3_ctx.get()) == nullptr);
+    }
+
+    context.terminate();
+  }
+
+  SECTION("flag true selects the async backend")
+  {
+    auto cfg = make_context_config(*env, true);
+
+    duckdb::SiriusContext context;
+    context.initialize(cfg);
+
+    sirius_ioctx* raw_s3_ctx = nullptr;
+    {
+      auto s3_ctx = context.get_s3_ioctx();
+      REQUIRE(s3_ctx != nullptr);
+      CHECK(dynamic_cast<s3_async_experimental_ioctx*>(s3_ctx.get()) != nullptr);
+      CHECK(dynamic_cast<s3_ioctx*>(s3_ctx.get()) == nullptr);
+      raw_s3_ctx = s3_ctx.get();
+    }
+    CHECK(context.get_scan_manager().io_ctx_for(s3_uri(env->bucket, "parquet/nation.parquet")) ==
+          raw_s3_ctx);
+
+    context.terminate();
+  }
+}
+
+TEST_CASE("SiriusContext tears down cleanly with the async S3 backend selected",
+          "[.][s3][integration][scan_manager][asynccurl]")
+{
+  auto env = read_s3_test_env();
+  if (!env) {
+    WARN("Skipping async S3 backend teardown test because SIRIUS_TEST_S3_* is not configured");
+    return;
+  }
+
+  auto cfg = make_context_config(*env, true);
+
+  duckdb::SiriusContext context;
+  context.initialize(cfg);
+
+  {
+    auto s3_ctx = context.get_s3_ioctx();
+    REQUIRE(s3_ctx != nullptr);
+    REQUIRE(dynamic_cast<s3_async_experimental_ioctx*>(s3_ctx.get()) != nullptr);
+  }
+
+  context.terminate();
+  CHECK(context.get_s3_ioctx() == nullptr);
+  SUCCEED("async S3 backend context terminated cleanly");
+}
 
 TEST_CASE("scan_manager S3 end-to-end reads nation parquet through sirius_datasource",
           "[.][s3][integration][scan_manager]")

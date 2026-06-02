@@ -19,6 +19,7 @@
 #include "io/uri_parser.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -31,14 +32,22 @@ s3_async_experimental_ioctx::s3_async_experimental_ioctx(
   std::string ca_bundle_path,
   bool tls_verify,
   std::size_t max_connections,
-  cucascade::memory::fixed_size_host_memory_resource* host_mr)
+  cucascade::memory::fixed_size_host_memory_resource* host_mr,
+  std::optional<std::size_t> max_retry_attempts,
+  std::optional<std::chrono::milliseconds> retry_backoff_base,
+  std::optional<std::chrono::milliseconds> retry_jitter,
+  std::optional<bool> honor_retry_after)
   : templated_ioctx<s3_reactor>(1,
                                 [creds = std::move(creds),
                                  request_timeout_s,
                                  ca_bundle_path = std::move(ca_bundle_path),
                                  tls_verify,
                                  max_connections,
-                                 host_mr]() {
+                                 host_mr,
+                                 max_retry_attempts,
+                                 retry_backoff_base,
+                                 retry_jitter,
+                                 honor_retry_after]() {
                                   s3_reactor::config cfg;
                                   cfg.creds                = creds;
                                   cfg.request_timeout_s    = request_timeout_s;
@@ -46,6 +55,14 @@ s3_async_experimental_ioctx::s3_async_experimental_ioctx(
                                   cfg.tls_verify           = tls_verify;
                                   cfg.max_connections      = max_connections;
                                   cfg.host_memory_resource = host_mr;
+                                  // Only override the reactor's own retry defaults
+                                  // when explicitly provided (no duplicated literals).
+                                  if (max_retry_attempts)
+                                    cfg.max_retry_attempts = *max_retry_attempts;
+                                  if (retry_backoff_base)
+                                    cfg.retry_backoff_base = *retry_backoff_base;
+                                  if (retry_jitter) cfg.retry_jitter = *retry_jitter;
+                                  if (honor_retry_after) cfg.honor_retry_after = *honor_retry_after;
                                   return std::make_unique<s3_reactor>(std::move(cfg));
                                 })
 {

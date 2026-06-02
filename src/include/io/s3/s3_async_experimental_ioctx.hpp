@@ -20,8 +20,10 @@
 #include "io/s3/s3_request_authorizer.hpp"
 #include "io/templated_ioctx.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace sirius::io::s3 {
@@ -41,12 +43,22 @@ namespace sirius::io::s3 {
  */
 class s3_async_experimental_ioctx : public templated_ioctx<s3_reactor> {
  public:
-  s3_async_experimental_ioctx(std::shared_ptr<s3_request_authorizer> creds,
-                              long request_timeout_s,
-                              std::string ca_bundle_path,
-                              bool tls_verify,
-                              std::size_t max_connections,
-                              cucascade::memory::fixed_size_host_memory_resource* host_mr);
+  // Retry knobs are optional; when omitted (the 6-arg call sites) the reactor
+  // keeps its OWN config defaults — they are NOT duplicated here, so they can't
+  // silently drift from s3_reactor::config. The production factory passes the
+  // s3_ioctx_config values so the async backend is config-equivalent to the
+  // blocking one.
+  s3_async_experimental_ioctx(
+    std::shared_ptr<s3_request_authorizer> creds,
+    long request_timeout_s,
+    std::string ca_bundle_path,
+    bool tls_verify,
+    std::size_t max_connections,
+    cucascade::memory::fixed_size_host_memory_resource* host_mr,
+    std::optional<std::size_t> max_retry_attempts               = std::nullopt,
+    std::optional<std::chrono::milliseconds> retry_backoff_base = std::nullopt,
+    std::optional<std::chrono::milliseconds> retry_jitter       = std::nullopt,
+    std::optional<bool> honor_retry_after                       = std::nullopt);
 
   // -- F1: instance create_io_object (HEAD needs the authorizer) -------------
   std::shared_ptr<sirius_io_object> create_io_object(std::string path) override;
