@@ -341,12 +341,10 @@ void sirius_pipeline::notify_downstream_pipelines(bool original_pipeline)
   // be done later.
   if (_task_creator && !original_pipeline) {
     for (auto* consumer : get_output_consumers()) {
-      if (!consumer->finalized) {
-        SIRIUS_LOG_WARN(
-          "sirius_pipeline::notify_downstream_pipelines: scheduling consumer op_id={}",
-          consumer->get_operator_id());
-        _task_creator->schedule(consumer);
-      }
+      // If is possible to have a race condition here where one task finished and here it does to
+      // schedule a task right when the last task finished and marks the operator as finalized. That
+      // is ok. This check here is to minimize unnecessary scheduling of task creation.
+      if (!consumer->finalized.load()) { _task_creator->schedule(consumer); }
     }
   }
 
@@ -473,7 +471,7 @@ void sirius_pipeline::mark_task_completed()
   const bool pipeline_was_finished = pipeline_finished.load();
   std::string finalized_ops;
   auto check_op = [&finalized_ops](op::sirius_physical_operator* op) {
-    if (op != nullptr && op->finalized) {
+    if (op != nullptr && op->finalized.load()) {
       if (!finalized_ops.empty()) { finalized_ops += ", "; }
       finalized_ops += std::format("{} (id={})", op->get_name(), op->get_operator_id());
     }

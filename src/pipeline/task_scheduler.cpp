@@ -304,10 +304,16 @@ void task_scheduler::wait_for_completion()
       gpu_exec->wait_and_validate_empty();
     }
   } catch (...) {
-    if (_task_creator) { _task_creator->start_thread_pool(); }
+    if (_task_creator) {
+      _task_creator->drain_pending_tasks();
+      _task_creator->start_thread_pool();
+    }
     throw;
   }
-  if (_task_creator) { _task_creator->start_thread_pool(); }
+  if (_task_creator) {
+    _task_creator->drain_pending_tasks();
+    _task_creator->start_thread_pool();
+  }
 }
 
 void task_scheduler::management_eventloop()

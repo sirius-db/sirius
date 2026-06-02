@@ -191,7 +191,7 @@ void sirius_engine::execute()
     for (const auto& pipeline : query->get_pipelines()) {
       for (const auto& op_ref : pipeline->get_operators()) {
         const auto& op = op_ref.get();
-        if (!op.finalized) {
+        if (!op.finalized.load()) {
           SIRIUS_LOG_WARN("[execute] operator '{}' (id={}) was not finalized",
                           op.get_name(),
                           op.get_operator_id());
