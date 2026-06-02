@@ -72,16 +72,18 @@ std::unique_ptr<node> translate_constant(duckdb::BoundConstantExpression const& 
 
 std::unique_ptr<node> translate_comparison(duckdb::BoundComparisonExpression const& expr)
 {
-  // Distinct-from / not-distinct-from are well-formed but not carried by the
-  // Sirius comparison node; signal fallback via nullptr before consulting the
-  // shared ExpressionType mapper.
+  // Filter the BoundComparisonExpression ExpressionType down to the set that the
+  // Sirius comparison node carries (sirius::comparison_type). The set mirrors
+  // sirius::from_duckdb(duckdb::ExpressionType) in src/expression/join_condition.cpp.
   switch (expr.GetExpressionType()) {
     case duckdb::ExpressionType::COMPARE_EQUAL:
     case duckdb::ExpressionType::COMPARE_NOTEQUAL:
     case duckdb::ExpressionType::COMPARE_LESSTHAN:
     case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO:
     case duckdb::ExpressionType::COMPARE_GREATERTHAN:
-    case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO: break;
+    case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+    case duckdb::ExpressionType::COMPARE_DISTINCT_FROM:
+    case duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM: break;
     default: return nullptr;
   }
   auto left  = from_duckdb(*expr.left);

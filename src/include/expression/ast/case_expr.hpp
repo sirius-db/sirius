@@ -39,6 +39,8 @@ struct case_expr {
 
   std::vector<when_then> cases;
   std::unique_ptr<node> else_;
+
+  std::size_t cudf_ast_op_count() const;
 };
 
 }  // namespace sirius::ast

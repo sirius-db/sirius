@@ -32,6 +32,8 @@ namespace sirius::ast {
 struct constant {
   sirius::value payload;
   sirius::logical_type return_type;
+
+  std::size_t cudf_ast_op_count() const;
 };
 
 }  // namespace sirius::ast

@@ -32,6 +32,8 @@ struct between {
   std::unique_ptr<node> upper;
   bool lower_inclusive{true};
   bool upper_inclusive{true};
+
+  std::size_t cudf_ast_op_count() const;
 };
 
 }  // namespace sirius::ast

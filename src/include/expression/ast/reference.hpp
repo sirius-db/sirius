@@ -29,6 +29,8 @@ namespace sirius::ast {
  */
 struct reference {
   uint32_t column_index{0};
+
+  std::size_t cudf_ast_op_count() const;
 };
 
 }  // namespace sirius::ast

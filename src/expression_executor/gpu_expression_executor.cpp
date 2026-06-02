@@ -516,91 +516,33 @@ std::size_t gpu_expression_executor::count_ast_ops(duckdb::Expression const& exp
 execute_result gpu_expression_executor::execute(sirius::ast::node const& expr, execution_mode mode)
 {
   return std::visit(
-    [this, mode](auto const& alt) -> execute_result { return this->execute(alt, mode); }, expr.v);
-}
-
-execute_result gpu_expression_executor::execute(sirius::ast::reference const& alt,
-                                                execution_mode mode)
-{
-  auto duck_expr = sirius::ast::to_duckdb(alt);
-  return execute(*duck_expr, mode);
-}
-
-execute_result gpu_expression_executor::execute(sirius::ast::constant const& alt,
-                                                execution_mode mode)
-{
-  auto duck_expr = sirius::ast::to_duckdb(alt);
-  return execute(*duck_expr, mode);
-}
-
-execute_result gpu_expression_executor::execute(sirius::ast::comparison const& alt,
-                                                execution_mode mode)
-{
-  auto duck_expr = sirius::ast::to_duckdb(alt);
-  return execute(*duck_expr, mode);
-}
-
-execute_result gpu_expression_executor::execute(sirius::ast::conjunction const& alt,
-                                                execution_mode mode)
-{
-  auto duck_expr = sirius::ast::to_duckdb(alt);
-  return execute(*duck_expr, mode);
-}
-
-execute_result gpu_expression_executor::execute(sirius::ast::between const& alt,
-                                                execution_mode mode)
-{
-  auto duck_expr = sirius::ast::to_duckdb(alt);
-  return execute(*duck_expr, mode);
-}
-
-execute_result gpu_expression_executor::execute(sirius::ast::case_expr const& alt,
-                                                execution_mode mode)
-{
-  auto duck_expr = sirius::ast::to_duckdb(alt);
-  return execute(*duck_expr, mode);
-}
-
-execute_result gpu_expression_executor::execute(sirius::ast::cast const& alt, execution_mode mode)
-{
-  auto duck_expr = sirius::ast::to_duckdb(alt);
-  return execute(*duck_expr, mode);
-}
-
-execute_result gpu_expression_executor::execute(sirius::ast::unary_op const& alt,
-                                                execution_mode mode)
-{
-  auto duck_expr = sirius::ast::to_duckdb(alt);
-  return execute(*duck_expr, mode);
-}
-
-execute_result gpu_expression_executor::execute(sirius::ast::coalesce const& alt,
-                                                execution_mode mode)
-{
-  auto duck_expr = sirius::ast::to_duckdb(alt);
-  return execute(*duck_expr, mode);
-}
-
-execute_result gpu_expression_executor::execute(sirius::ast::in_list const& alt,
-                                                execution_mode mode)
-{
-  auto duck_expr = sirius::ast::to_duckdb(alt);
-  return execute(*duck_expr, mode);
-}
-
-execute_result gpu_expression_executor::execute(sirius::ast::function_call const& alt,
-                                                execution_mode mode)
-{
-  auto duck_expr = sirius::ast::to_duckdb(alt);
-  return execute(*duck_expr, mode);
+    [this, mode](auto const& alt) -> execute_result {
+      using T = std::decay_t<decltype(alt)>;
+      if constexpr (std::is_same_v<T, sirius::ast::reference> ||
+                    std::is_same_v<T, sirius::ast::constant> ||
+                    std::is_same_v<T, sirius::ast::comparison> ||
+                    std::is_same_v<T, sirius::ast::conjunction> ||
+                    std::is_same_v<T, sirius::ast::between> ||
+                    std::is_same_v<T, sirius::ast::case_expr> ||
+                    std::is_same_v<T, sirius::ast::cast> ||
+                    std::is_same_v<T, sirius::ast::unary_op> ||
+                    std::is_same_v<T, sirius::ast::coalesce> ||
+                    std::is_same_v<T, sirius::ast::in_list> ||
+                    std::is_same_v<T, sirius::ast::function_call>) {
+        return this->execute(alt, mode);
+      } else {
+        static_assert(sizeof(T) == 0,
+                      "Unhandled sirius::ast alternative in execute(sirius::ast::node) dispatcher");
+      }
+    },
+    expr.v);
 }
 
 std::size_t gpu_expression_executor::count_ast_ops(sirius::ast::node const& expr) const
 {
-  // Round-trip shim — the per-specialization migration phase
-  // (https://github.com/sirius-db/sirius/issues/699) replaces this with native
-  // AST traversal one specialization at a time.
-  return count_ast_ops(*sirius::ast::to_duckdb(expr));
+  // Delegates to the single-source-of-truth implementation living next to the
+  // AST struct definitions; see src/expression_executor/ast_op_counter.cpp.
+  return expr.cudf_ast_op_count();
 }
 
 }  // namespace sirius
