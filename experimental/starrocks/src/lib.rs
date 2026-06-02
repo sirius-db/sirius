@@ -704,6 +704,7 @@ fn unix_time_millis() -> u128 {
 mod tests {
     use super::*;
 
+    /// Builds a stable compute-node config for heartbeat handler tests.
     fn test_config() -> ComputeNodeConfig {
         ComputeNodeConfig {
             version: "test-version".to_string(),
@@ -711,6 +712,7 @@ mod tests {
         }
     }
 
+    /// Builds a heartbeat handler with its shared state so tests can inspect side effects.
     fn handler() -> (ComputeNodeHeartbeatHandler, SharedHeartbeatState) {
         let state = SharedHeartbeatState::new();
         (
@@ -719,6 +721,7 @@ mod tests {
         )
     }
 
+    /// Builds a valid FE master heartbeat for the requested epoch.
     fn master(epoch: types::TEpoch) -> TMasterInfo {
         TMasterInfo::new(
             types::TNetworkAddress::new("127.0.0.1".to_string(), 9020),
@@ -739,6 +742,7 @@ mod tests {
         )
     }
 
+    /// Verifies the first valid heartbeat records cluster identity and node metadata.
     #[test]
     fn first_heartbeat_succeeds_and_records_state() {
         let (handler, state) = handler();
@@ -762,6 +766,7 @@ mod tests {
         assert!(snapshot.last_heartbeat_ms.is_some());
     }
 
+    /// Verifies equal or increasing heartbeat epochs keep the handler state current.
     #[test]
     fn repeated_same_or_higher_epoch_succeeds() {
         let (handler, state) = handler();
@@ -793,6 +798,7 @@ mod tests {
         assert_eq!(state.snapshot().epoch, Some(8));
     }
 
+    /// Verifies a lower epoch is rejected and does not roll back recorded state.
     #[test]
     fn stale_epoch_fails() {
         let (handler, state) = handler();
@@ -816,6 +822,7 @@ mod tests {
         assert_eq!(state.snapshot().epoch, Some(7));
     }
 
+    /// Verifies the FE token is sticky once learned from the first valid heartbeat.
     #[test]
     fn token_mismatch_fails() {
         let (handler, state) = handler();
@@ -848,6 +855,7 @@ mod tests {
         );
     }
 
+    /// Verifies the cluster id is sticky once learned from the first valid heartbeat.
     #[test]
     fn cluster_mismatch_fails() {
         let (handler, state) = handler();
@@ -873,6 +881,7 @@ mod tests {
         assert_eq!(state.snapshot().cluster_id, Some(42));
     }
 
+    /// Verifies backend heartbeats are rejected by the compute-node heartbeat handler.
     #[test]
     fn non_compute_node_heartbeat_fails() {
         let (handler, state) = handler();
@@ -890,6 +899,7 @@ mod tests {
         assert_eq!(state.snapshot().epoch, None);
     }
 
+    /// Verifies missing node-type metadata is rejected instead of being treated as compute.
     #[test]
     fn missing_node_type_fails() {
         let (handler, state) = handler();
@@ -907,6 +917,7 @@ mod tests {
         assert_eq!(state.snapshot().epoch, None);
     }
 
+    /// Verifies FE registration uses StarRocks compute-node syntax and proc path.
     #[test]
     fn registration_uses_compute_node_surface() {
         assert_eq!(
@@ -916,6 +927,7 @@ mod tests {
         assert_eq!(COMPUTE_NODE_PROC_PATH, "/compute_nodes");
     }
 
+    /// Verifies secrets stay redacted in debug output.
     #[test]
     fn secret_string_debug_redacts_value() {
         assert_eq!(
@@ -924,6 +936,7 @@ mod tests {
         );
     }
 
+    /// Verifies the heartbeat server shutdown handle wakes and stops the accept loop.
     #[test]
     fn heartbeat_server_shutdown_stops_accept_loop() {
         let mut config = test_config();
@@ -941,6 +954,7 @@ mod tests {
         drop(stream);
     }
 
+    /// Detects sandboxed environments where binding a local listener is denied.
     fn is_permission_denied(err: &anyhow::Error) -> bool {
         err.chain().any(|cause| {
             cause

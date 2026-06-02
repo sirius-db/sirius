@@ -23,10 +23,12 @@ use starrocks_thrift::types::{
 };
 use substrait::proto::{expression, plan_rel, read_rel, rel};
 
+/// Builds a scalar StarRocks type descriptor with no length or decimal metadata.
 fn scalar_type(primitive: TPrimitiveType) -> TTypeDesc {
     scalar_type_with(primitive, None, None, None)
 }
 
+/// Builds a scalar StarRocks type descriptor with optional width, precision, and scale.
 fn scalar_type_with(
     primitive: TPrimitiveType,
     len: Option<i32>,
@@ -41,10 +43,12 @@ fn scalar_type_with(
     )]))
 }
 
+/// Builds a non-scalar StarRocks type descriptor for unsupported-type tests.
 fn complex_type(kind: TTypeNodeType) -> TTypeDesc {
     TTypeDesc::new(Some(vec![TTypeNode::new(kind, None, None, None)]))
 }
 
+/// Builds a materialized slot descriptor owned by a test tuple.
 fn slot(id: i32, tuple_id: i32, column_pos: i32, name: &str, ty: TTypeDesc) -> TSlotDescriptor {
     TSlotDescriptor::new(
         Some(id),
@@ -64,6 +68,7 @@ fn slot(id: i32, tuple_id: i32, column_pos: i32, name: &str, ty: TTypeDesc) -> T
     )
 }
 
+/// Builds a minimal descriptor table with the shared `tpch.users` table descriptor.
 fn desc_table(tuples: Vec<(i32, Option<i64>)>, slots: Vec<TSlotDescriptor>) -> TDescriptorTable {
     TDescriptorTable::new(
         Some(slots),
@@ -98,6 +103,7 @@ fn desc_table(tuples: Vec<(i32, Option<i64>)>, slots: Vec<TSlotDescriptor>) -> T
     )
 }
 
+/// Builds a StarRocks expression node with every optional expression payload cleared.
 fn base_expr_node(node_type: TExprNodeType, ty: TTypeDesc, num_children: i32) -> TExprNode {
     TExprNode {
         node_type,
@@ -146,28 +152,33 @@ fn base_expr_node(node_type: TExprNodeType, ty: TTypeDesc, num_children: i32) ->
     }
 }
 
+/// Builds a single-node slot-reference expression in StarRocks flat preorder form.
 fn slot_ref(slot_id: i32, tuple_id: i32, ty: TTypeDesc) -> TExpr {
     let mut node = base_expr_node(TExprNodeType::SLOT_REF, ty, 0);
     node.slot_ref = Some(TSlotRef::new(slot_id, tuple_id));
     TExpr::new(vec![node])
 }
 
+/// Builds a BIGINT literal expression for comparisons that do not care about width.
 fn int_literal(value: i64) -> TExpr {
     int_literal_typed(value, TPrimitiveType::BIGINT)
 }
 
+/// Builds an integer literal expression with the requested StarRocks primitive width.
 fn int_literal_typed(value: i64, primitive: TPrimitiveType) -> TExpr {
     let mut node = base_expr_node(TExprNodeType::INT_LITERAL, scalar_type(primitive), 0);
     node.int_literal = Some(TIntLiteral::new(value));
     TExpr::new(vec![node])
 }
 
+/// Builds a floating-point literal expression with the requested StarRocks primitive width.
 fn float_literal_typed(value: f64, primitive: TPrimitiveType) -> TExpr {
     let mut node = base_expr_node(TExprNodeType::FLOAT_LITERAL, scalar_type(primitive), 0);
     node.float_literal = Some(TFloatLiteral::new(value.into()));
     TExpr::new(vec![node])
 }
 
+/// Builds a VARCHAR literal expression.
 fn string_literal(value: &str) -> TExpr {
     let mut node = base_expr_node(
         TExprNodeType::STRING_LITERAL,
@@ -178,6 +189,7 @@ fn string_literal(value: &str) -> TExpr {
     TExpr::new(vec![node])
 }
 
+/// Builds a BOOLEAN literal expression.
 fn bool_literal(value: bool) -> TExpr {
     let mut node = base_expr_node(
         TExprNodeType::BOOL_LITERAL,
@@ -188,6 +200,7 @@ fn bool_literal(value: bool) -> TExpr {
     TExpr::new(vec![node])
 }
 
+/// Builds a binary predicate expression and appends child nodes in preorder.
 fn binary_pred(opcode: TExprOpcode, left: TExpr, right: TExpr) -> TExpr {
     let mut node = base_expr_node(
         TExprNodeType::BINARY_PRED,
@@ -201,6 +214,7 @@ fn binary_pred(opcode: TExprOpcode, left: TExpr, right: TExpr) -> TExpr {
     TExpr::new(nodes)
 }
 
+/// Builds a StarRocks plan node with all node-specific payloads cleared.
 fn base_plan_node(
     node_id: i32,
     node_type: TPlanNodeType,
@@ -261,12 +275,14 @@ fn base_plan_node(
     }
 }
 
+/// Builds a supported file-scan node for the given tuple.
 fn scan_node(node_id: i32, tuple_id: i32) -> TPlanNode {
     let mut node = base_plan_node(node_id, TPlanNodeType::FILE_SCAN_NODE, 0, vec![tuple_id]);
     node.file_scan_node = Some(TFileScanNode::new(tuple_id, None, None, None));
     node
 }
 
+/// Builds the execution-fragment params passed to the public translator API.
 fn params(
     plan: Option<TPlan>,
     desc_tbl: Option<TDescriptorTable>,
@@ -315,12 +331,14 @@ fn params(
     }
 }
 
+/// Builds params with an absent fragment to exercise top-level validation.
 fn params_without_fragment(desc_tbl: Option<TDescriptorTable>) -> TExecPlanFragmentParams {
     let mut params = params(Some(TPlan::new(vec![scan_node(0, 0)])), desc_tbl, None);
     params.fragment = None;
     params
 }
 
+/// Builds the default scan descriptor used by most positive translator tests.
 fn base_desc() -> TDescriptorTable {
     desc_table(
         vec![(0, Some(100))],
@@ -331,6 +349,7 @@ fn base_desc() -> TDescriptorTable {
     )
 }
 
+/// Extracts the single root relation emitted by these tests.
 fn root(plan: &substrait::proto::Plan) -> &substrait::proto::RelRoot {
     match plan.relations[0].rel_type.as_ref().unwrap() {
         plan_rel::RelType::Root(root) => root,
@@ -338,6 +357,7 @@ fn root(plan: &substrait::proto::Plan) -> &substrait::proto::RelRoot {
     }
 }
 
+/// Extracts the filter condition from a plan whose root input is a filter relation.
 fn filter_condition(plan: &substrait::proto::Plan) -> &substrait::proto::Expression {
     match root(plan)
         .input
@@ -352,6 +372,7 @@ fn filter_condition(plan: &substrait::proto::Plan) -> &substrait::proto::Express
     }
 }
 
+/// Extracts a scalar-function argument by index for expression-shape assertions.
 fn scalar_arg(expr: &substrait::proto::Expression, idx: usize) -> &substrait::proto::Expression {
     let scalar = match expr.rex_type.as_ref().unwrap() {
         expression::RexType::ScalarFunction(scalar) => scalar,
@@ -363,6 +384,7 @@ fn scalar_arg(expr: &substrait::proto::Expression, idx: usize) -> &substrait::pr
     }
 }
 
+/// Extracts the literal payload from a Substrait literal expression.
 fn literal_type(expr: &substrait::proto::Expression) -> &expression::literal::LiteralType {
     match expr.rex_type.as_ref().unwrap() {
         expression::RexType::Literal(literal) => literal.literal_type.as_ref().unwrap(),
@@ -370,6 +392,7 @@ fn literal_type(expr: &substrait::proto::Expression) -> &expression::literal::Li
     }
 }
 
+/// Verifies a scan-only fragment becomes a Substrait named-table read.
 #[test]
 fn scan_only_produces_named_table() {
     let translated = PlanTranslator::new()
@@ -397,6 +420,7 @@ fn scan_only_produces_named_table() {
     }
 }
 
+/// Verifies duplicate descriptor names are disambiguated deterministically at the root.
 #[test]
 fn duplicate_output_names_are_unique_and_match_root() {
     let desc = desc_table(
@@ -419,6 +443,7 @@ fn duplicate_output_names_are_unique_and_match_root() {
     assert_eq!(root(&translated.plan).names, translated.output_names);
 }
 
+/// Verifies translated plans have readable explain/debug output for logs.
 #[test]
 fn translated_plan_explain_and_debug_are_readable() {
     let translated = translate_fragment(&params(
@@ -437,6 +462,7 @@ fn translated_plan_explain_and_debug_are_readable() {
     assert!(debug.contains("Read"));
 }
 
+/// Verifies select-node conjuncts wrap the child read in a Substrait filter relation.
 #[test]
 fn scan_filter_wraps_filter_rel() {
     let mut select = base_plan_node(1, TPlanNodeType::SELECT_NODE, 1, vec![0]);
@@ -473,6 +499,7 @@ fn scan_filter_wraps_filter_rel() {
     }
 }
 
+/// Verifies INT StarRocks literals emit Substrait i32 literals, not widened i64 values.
 #[test]
 fn integer_literal_preserves_expr_width() {
     let mut select = base_plan_node(1, TPlanNodeType::SELECT_NODE, 1, vec![0]);
@@ -500,6 +527,7 @@ fn integer_literal_preserves_expr_width() {
     ));
 }
 
+/// Verifies FLOAT StarRocks literals emit Substrait fp32 literals, not widened fp64 values.
 #[test]
 fn float_literal_preserves_expr_width() {
     let mut select = base_plan_node(1, TPlanNodeType::SELECT_NODE, 1, vec![0]);
@@ -523,6 +551,7 @@ fn float_literal_preserves_expr_width() {
     ));
 }
 
+/// Verifies project expressions follow descriptor output order instead of map key order.
 #[test]
 fn scan_project_preserves_descriptor_output_order() {
     let mut slot_map = BTreeMap::new();
@@ -563,6 +592,7 @@ fn scan_project_preserves_descriptor_output_order() {
     }
 }
 
+/// Verifies fragment output expressions add the final root projection.
 #[test]
 fn fragment_output_exprs_add_root_projection() {
     let translated = translate_fragment(&params(
@@ -589,6 +619,7 @@ fn fragment_output_exprs_add_root_projection() {
     }
 }
 
+/// Verifies unsupported joins return a structured unsupported-plan-node error.
 #[test]
 fn unsupported_hash_join_is_structured_error() {
     let join = base_plan_node(9, TPlanNodeType::HASH_JOIN_NODE, 0, vec![0]);
@@ -608,6 +639,7 @@ fn unsupported_hash_join_is_structured_error() {
     ));
 }
 
+/// Verifies unsupported expression nodes return a structured unsupported-expression error.
 #[test]
 fn unsupported_expression_is_structured_error() {
     let mut select = base_plan_node(1, TPlanNodeType::SELECT_NODE, 1, vec![0]);
@@ -633,6 +665,7 @@ fn unsupported_expression_is_structured_error() {
     ));
 }
 
+/// Verifies unsupported complex slot types fail during descriptor normalization.
 #[test]
 fn unsupported_complex_type_is_structured_error() {
     let desc = desc_table(
@@ -654,6 +687,7 @@ fn unsupported_complex_type_is_structured_error() {
     ));
 }
 
+/// Verifies unsupported types on non-materialized slots do not block visible output.
 #[test]
 fn non_materialized_unsupported_slot_type_is_ignored() {
     let mut hidden_slot = slot(2, 0, 1, "hidden", complex_type(TTypeNodeType::ARRAY));
@@ -676,6 +710,7 @@ fn non_materialized_unsupported_slot_type_is_ignored() {
     assert_eq!(translated.output_names, vec!["id"]);
 }
 
+/// Verifies unsupported LARGEINT slots return a structured type error.
 #[test]
 fn unsupported_largeint_is_structured_error() {
     let desc = desc_table(
@@ -697,6 +732,7 @@ fn unsupported_largeint_is_structured_error() {
     ));
 }
 
+/// Verifies DECIMAL256 slots stay unsupported until wider decimal handling is added.
 #[test]
 fn unsupported_decimal256_is_structured_error() {
     let desc = desc_table(
@@ -724,6 +760,7 @@ fn unsupported_decimal256_is_structured_error() {
     ));
 }
 
+/// Verifies project-node conjuncts are rejected until that translation path is supported.
 #[test]
 fn project_node_conjuncts_are_unsupported() {
     let mut slot_map = BTreeMap::new();
@@ -761,6 +798,7 @@ fn project_node_conjuncts_are_unsupported() {
     ));
 }
 
+/// Verifies same function names in different extension URNs get distinct anchors.
 #[test]
 fn extension_registry_keys_functions_by_urn_and_name() {
     let mut registry = ExtensionRegistry::new();
@@ -772,6 +810,7 @@ fn extension_registry_keys_functions_by_urn_and_name() {
     assert_eq!(boolean_anchor, reused_boolean_anchor);
 }
 
+/// Verifies missing descriptor tables fail before plan reconstruction.
 #[test]
 fn missing_descriptor_table_is_error() {
     let err = translate_fragment(&params(Some(TPlan::new(vec![scan_node(0, 0)])), None, None))
@@ -785,6 +824,7 @@ fn missing_descriptor_table_is_error() {
     ));
 }
 
+/// Verifies missing fragment plans fail with a required-field error.
 #[test]
 fn missing_fragment_plan_is_error() {
     let err = translate_fragment(&params(None, Some(base_desc()), None)).unwrap_err();
@@ -797,6 +837,7 @@ fn missing_fragment_plan_is_error() {
     ));
 }
 
+/// Verifies missing fragments fail with a top-level required-field error.
 #[test]
 fn missing_fragment_is_error() {
     let err = translate_fragment(&params_without_fragment(Some(base_desc()))).unwrap_err();
@@ -809,6 +850,7 @@ fn missing_fragment_is_error() {
     ));
 }
 
+/// Verifies flat preorder child-count mismatches are reported as malformed plans.
 #[test]
 fn malformed_child_counts_are_errors() {
     let mut select = base_plan_node(1, TPlanNodeType::SELECT_NODE, 2, vec![0]);
@@ -822,6 +864,7 @@ fn malformed_child_counts_are_errors() {
     assert!(matches!(err, TranslateError::MalformedPlan(_)));
 }
 
+/// Verifies string and boolean literals can participate in filter conjuncts.
 #[test]
 fn bool_and_string_literals_translate() {
     let mut select = base_plan_node(1, TPlanNodeType::SELECT_NODE, 1, vec![0]);
