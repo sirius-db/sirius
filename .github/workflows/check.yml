@@ -83,7 +83,10 @@ jobs:
     runs-on: >-
       ${{ matrix.environment == 'vcpkg'
         && fromJSON('["self-hosted", "ubuntu-24.04", "cpu-xl"]')
-        || format('ubuntu-24.04{0}', case(matrix.arch == 'arm64', '-arm', '')) }}
+        || matrix.arch == 'x64'
+        && fromJSON('["self-hosted", "ubuntu-24.04", "cpu-sm"]')
+        || matrix.arch == 'arm64'
+        && fromJSON('["self-hosted", "ubuntu-24.04", "arm-sm"]') }}
     timeout-minutes: ${{ case(matrix.environment == 'vcpkg', 240, 60) }}
     continue-on-error: ${{ matrix.cudf-channel == 'nightly' }}
     steps:
