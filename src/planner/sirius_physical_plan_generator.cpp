@@ -106,7 +106,7 @@ void wrap_above(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
 //! info and `scan_op.table_filters` is left null. Mirrors the field plumbing in today's
 //! `sirius_pipeline_converter::insert_parquet_scan_operator` byte-for-byte.
 std::unique_ptr<sirius::op::scan::parquet_scan_info> build_parquet_scan_info(
-  sirius::op::sirius_physical_table_scan& scan_op)
+  sirius::op::sirius_physical_table_scan& scan_op, const sirius::operator_params& op_params)
 {
   auto const& bind_data = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
   if (!bind_data.file_list || bind_data.file_list->IsEmpty()) {
@@ -127,6 +127,15 @@ std::unique_ptr<sirius::op::scan::parquet_scan_info> build_parquet_scan_info(
   info->names             = scan_op.names;
   info->table_filters     = std::move(scan_op.table_filters);
   info->partition_indices = partition_indices;
+  // Mirror the two trailing fields the legacy `insert_parquet_scan_operator` sets
+  // (sirius_pipeline_converter.cpp:297-302). Both came in via post-B.2b upstream commits:
+  //   - `scan_output_arity` (upstream #749) drives `scan_info::make_provider`'s expected
+  //     column count. Without it, the runtime task emits only the data columns and skips
+  //     the hive-partition columns it should inject post-read, producing a 3-vs-5 column
+  //     mismatch and downstream vector::_M_range_check.
+  //   - `approximate_batch_size` (upstream #792) provides the per-task scan batch sizing.
+  info->scan_output_arity      = scan_op.types.size();
+  info->approximate_batch_size = op_params.scan_task_batch_size;
   return info;
 }
 
@@ -148,7 +157,8 @@ std::unique_ptr<sirius::op::scan::parquet_scan_info> build_parquet_scan_info(
 void wrap_table_scan_source(
   sirius::op::sirius_physical_operator& table_scan_op,
   const std::unordered_map<std::string, std::shared_ptr<const sirius::op::scan::IcebergDeleteData>>&
-    iceberg_cache)
+    iceberg_cache,
+  const sirius::operator_params& op_params)
 {
   // Table-in-out functions wear a TABLE_SCAN with children — skip per the master plan's
   // exclusion rule. Wrapping them would change their child layout in a way the converter
@@ -162,7 +172,7 @@ void wrap_table_scan_source(
   if (fn == "seq_scan") {
     leaf = duckdb::make_uniq<sirius::op::sirius_physical_duckdb_scan>(&scan);
   } else if (fn == "parquet_scan" || fn == "read_parquet") {
-    auto info = build_parquet_scan_info(scan);
+    auto info = build_parquet_scan_info(scan, op_params);
     leaf      = duckdb::make_uniq<sirius::op::scan::sirius_gpu_parquet_scan_operator>(
       scan.types, scan.estimated_cardinality, std::move(info));
   } else if (fn == "iceberg_scan") {
@@ -547,7 +557,7 @@ void insert_gpu_pipeline_operators_recursive(
 
   switch (slot->type) {
     case sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN:
-      wrap_table_scan_source(*slot, iceberg_cache);
+      wrap_table_scan_source(*slot, iceberg_cache, op_params);
       break;
     case sirius::op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN:
     case sirius::op::SiriusPhysicalOperatorType::EMPTY_RESULT: wrap_cpu_source(*slot); break;
