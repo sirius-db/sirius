@@ -25,6 +25,7 @@
 #include <cudf/wrappers/timestamps.hpp>
 
 // standard library
+#include <algorithm>
 #include <type_traits>
 #include <variant>
 
@@ -255,22 +256,23 @@ std::optional<expr_ref> gpu_expression_translator::add_join_condition(
   if (!right_expr) { return std::nullopt; }
 
   switch (condition.comparison) {
-    case sirius::comparison_type::equal:
+    using enum sirius::comparison_type;
+    case equal:
       return _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::EQUAL, *left_expr, *right_expr);
-    case sirius::comparison_type::not_equal:
+    case not_equal:
       return _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::NOT_EQUAL, *left_expr, *right_expr);
-    case sirius::comparison_type::lt:
+    case lt:
       return _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::LESS, *left_expr, *right_expr);
-    case sirius::comparison_type::gt:
+    case gt:
       return _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::GREATER, *left_expr, *right_expr);
-    case sirius::comparison_type::le:
+    case le:
       return _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::LESS_EQUAL, *left_expr, *right_expr);
-    case sirius::comparison_type::ge:
+    case ge:
       return _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::GREATER_EQUAL, *left_expr, *right_expr);
     default:
@@ -530,26 +532,27 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
 
   // Construct the comparison expression
   switch (alt.op) {
-    case sirius::comparison_type::equal:
+    using enum sirius::comparison_type;
+    case equal:
       return _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::EQUAL, *left_expr, *right_expr);
-    case sirius::comparison_type::not_equal:
+    case not_equal:
       return _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::NOT_EQUAL, *left_expr, *right_expr);
-    case sirius::comparison_type::lt:
+    case lt:
       return _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::LESS, *left_expr, *right_expr);
-    case sirius::comparison_type::gt:
+    case gt:
       return _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::GREATER, *left_expr, *right_expr);
-    case sirius::comparison_type::le:
+    case le:
       return _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::LESS_EQUAL, *left_expr, *right_expr);
-    case sirius::comparison_type::ge:
+    case ge:
       return _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::GREATER_EQUAL, *left_expr, *right_expr);
-    case sirius::comparison_type::distinct_from:
-    case sirius::comparison_type::not_distinct_from: {
+    case distinct_from:
+    case not_distinct_from: {
       SIRIUS_LOG_DEBUG(
         "[expression_translator] DISTINCT comparisons not supported in expression translator");
       return std::nullopt;
@@ -580,10 +583,11 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
     if (!child_expr) { return std::nullopt; }
 
     // Combine with previous children using AND/OR
-    if (alt.op == sirius::ast::conjunction::kind::op_and) {
+    using enum sirius::ast::conjunction::kind;
+    if (alt.op == op_and) {
       result = _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::LOGICAL_AND, *result, *child_expr);
-    } else if (alt.op == sirius::ast::conjunction::kind::op_or) {
+    } else if (alt.op == op_or) {
       result = _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::LOGICAL_OR, *result, *child_expr);
     } else {
@@ -663,17 +667,18 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
   if (!child_expr) { return std::nullopt; }
 
   switch (alt.op) {
-    case sirius::ast::unary_op::kind::op_not:
+    using enum sirius::ast::unary_op::kind;
+    case op_not:
       return _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::NOT, *child_expr);
-    case sirius::ast::unary_op::kind::op_is_null:
+    case op_is_null:
       return _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::IS_NULL, *child_expr);
-    case sirius::ast::unary_op::kind::op_is_not_null: {
+    case op_is_not_null: {
       // Add IS_NULL followed by NOT to represent IS_NOT_NULL
       expr_ref is_null_op =
         _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::IS_NULL, *child_expr);
       return _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::NOT, is_null_op);
     }
-    case sirius::ast::unary_op::kind::op_try:
+    case op_try:
     default:
       // cuDF AST cannot express TRY.
       SIRIUS_LOG_DEBUG(
@@ -728,37 +733,27 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
 std::optional<expr_ref> gpu_expression_translator::add_expression(
   sirius::ast::function_call const& alt, cudf::ast::table_reference const table_src)
 {
-  // cuDF AST only supports numeric binary functions
-  // We need to disable operations that propagate decimal types up the expression tree
-  // We are waiting on this bug fix: https://github.com/rapidsai/cudf/pull/21996
-  auto block_function_translation = [](sirius::ast::function_call const& alt) -> bool {
-    for (auto const& arg : alt.arguments()) {
-      if (node_logical_type_id(*arg) == sirius::type_id::DECIMAL) {
-        SIRIUS_LOG_DEBUG(
-          "[expression_translator] Blocking function because it propagates decimal types");
-        return true;
-      }
-    }
-    return false;
-  };
+  // cuDF AST only supports numeric binary functions. We must also disable any
+  // operation that propagates decimal types up the expression tree, pending the
+  // cuDF fix: https://github.com/rapidsai/cudf/pull/21996. Unsupported functions
+  // fall through to the default arm below, so checking decimal propagation once
+  // up front (rather than per supported case) is equivalent.
+  if (std::ranges::any_of(alt.arguments(), [](auto const& arg) {
+        return node_logical_type_id(*arg) == sirius::type_id::DECIMAL;
+      })) {
+    SIRIUS_LOG_DEBUG(
+      "[expression_translator] Blocking function because it propagates decimal types");
+    return std::nullopt;
+  }
 
   switch (alt.function()) {
-    case sirius::function_id::add:
-      if (block_function_translation(alt)) { return std::nullopt; }
-      return add_function_expression<cudf::ast::ast_operator::ADD>(alt, table_src);
-    case sirius::function_id::sub:
-      if (block_function_translation(alt)) { return std::nullopt; }
-      return add_function_expression<cudf::ast::ast_operator::SUB>(alt, table_src);
-    case sirius::function_id::mul:
-      if (block_function_translation(alt)) { return std::nullopt; }
-      return add_function_expression<cudf::ast::ast_operator::MUL>(alt, table_src);
-    case sirius::function_id::div:
-    case sirius::function_id::int_div:
-      if (block_function_translation(alt)) { return std::nullopt; }
-      return add_function_expression<cudf::ast::ast_operator::DIV>(alt, table_src);
-    case sirius::function_id::mod:
-      if (block_function_translation(alt)) { return std::nullopt; }
-      return add_function_expression<cudf::ast::ast_operator::MOD>(alt, table_src);
+    using enum sirius::function_id;
+    case add: return add_function_expression<cudf::ast::ast_operator::ADD>(alt, table_src);
+    case sub: return add_function_expression<cudf::ast::ast_operator::SUB>(alt, table_src);
+    case mul: return add_function_expression<cudf::ast::ast_operator::MUL>(alt, table_src);
+    case div:
+    case int_div: return add_function_expression<cudf::ast::ast_operator::DIV>(alt, table_src);
+    case mod: return add_function_expression<cudf::ast::ast_operator::MOD>(alt, table_src);
     default:
       SIRIUS_LOG_DEBUG("[expression_translator] Unsupported function: {}",
                        static_cast<int>(alt.function()));

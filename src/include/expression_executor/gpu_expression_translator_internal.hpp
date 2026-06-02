@@ -238,6 +238,12 @@ class gpu_expression_translator {
   std::optional<expr_ref> add_function_expression(sirius::ast::function_call const& alt,
                                                   cudf::ast::table_reference const table_src)
   {
+    // This helper builds a binary cuDF operation. DuckDB overloads some
+    // operators on arity (e.g. unary negation also binds as function "-"), so a
+    // function_call reaching here may carry a single argument; bail out rather
+    // than indexing arguments()[1] out of bounds.
+    if (alt.arguments().size() != 2) { return std::nullopt; }
+
     // Translate children
     auto left_expr  = add_expression(*alt.arguments()[0], table_src);
     auto right_expr = add_expression(*alt.arguments()[1], table_src);
