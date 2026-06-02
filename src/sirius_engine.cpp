@@ -170,24 +170,7 @@ void sirius_engine::execute()
   auto future = sirius_ctx->get_task_scheduler().start_query();
   try {
     future.get();
-    if (auto* ch = sirius_ctx->get_task_scheduler().get_completion_handler()) {
-      SIRIUS_LOG_WARN(
-        "[execute] completion future returned normally (is_completed={}, has_error={})",
-        ch->is_completed(),
-        ch->has_error());
-    } else {
-      SIRIUS_LOG_WARN(
-        "[execute] completion future returned normally but completion_handler is null");
-    }
-    // The worker that signaled completion cannot drain its own executor pool
-    // (wait_all() would self-deadlock), so we quiesce all executor and
-    // task-creation threads here, on the engine thread, before returning. This
-    // prevents stragglers from dereferencing operators that QueryEnd() is about to
-    // free, and prevents the next query's start_query() from racing a leftover
-    // worker. Any task that finishes after this point is logged loudly (see the
-    // _query_complete straggler warning), so this drains the symptom WITHOUT
-    // hiding the premature-completion bug.
-    // sirius_ctx->get_task_scheduler().drain_after_completion();
+    sirius_ctx->get_task_scheduler().wait_for_completion();
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
     // Drain all in-flight GPU tasks before returning.  QueryEnd() will call

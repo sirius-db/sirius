@@ -153,16 +153,6 @@ class task_scheduler {
   }
 
   /**
-   * @brief Get a pointer to the current query's completion handler (may be null
-   * before start_query()). Used for diagnostics after the completion future
-   * returns.
-   */
-  [[nodiscard]] completion_handler* get_completion_handler() noexcept
-  {
-    return _completion_handler.get();
-  }
-
-  /**
    * @brief Set the priority scan operators
    *
    * Sets the scan operators that should be executed with priority.
@@ -203,18 +193,13 @@ class task_scheduler {
   void drain_after_error();
 
   /**
-   * @brief Quiesce all executor + task-creation threads after the completion
-   * future has been satisfied, before the engine returns and tears down the plan.
-   *
-   * The gpu_pipeline_executor worker that signals completion cannot drain its own
-   * pool (wait_all() would self-deadlock on the still-active calling task), so the
-   * drain must happen on the engine thread once future.get() returns. This joins
-   * the task_creator manager (the thread that the ASan use-after-free was caught
-   * in), the scan executor, and every GPU executor, then restarts them for the
-   * next query. Guarantees no straggler task dereferences freed operators and that
-   * the next query's start_query() cannot race a leftover worker rebinding state.
+   * @brief This function interrupts executors and waits for all in-flight tasks to complete.
+   * If any tasks are still in flight, an error is logged and an exception is thrown.
+   * This is used to ensure that all tasks have completed before the query returns and tears down
+   * the plan.
+   * @throws std::runtime_error if any tasks are still in flight.
    */
-  void drain_after_completion();
+  void wait_for_completion();
 
   // for testing/stress only — see Doxygen below.
   /**

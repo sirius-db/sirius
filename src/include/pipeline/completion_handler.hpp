@@ -16,8 +16,6 @@
 
 #pragma once
 
-#include <log/logging.hpp>
-
 #include <atomic>
 #include <exception>
 #include <future>
@@ -55,15 +53,6 @@ class completion_handler {
     bool expected = false;
     if (_completed.compare_exchange_strong(expected, true)) {
       try {
-        std::string what = "<unknown>";
-        try {
-          if (error) { std::rethrow_exception(error); }
-        } catch (const std::exception& e) {
-          what = e.what();
-        } catch (...) {
-          what = "<non-std exception>";
-        }
-        SIRIUS_LOG_WARN("Completion handler: report_error(exception_ptr) called: {}", what);
         _has_error.store(true);
         _promise.set_exception(error);
       } catch (...) {
@@ -85,7 +74,6 @@ class completion_handler {
     bool expected = false;
     if (_completed.compare_exchange_strong(expected, true)) {
       try {
-        SIRIUS_LOG_ERROR("Completion handler: {}", error);
         _has_error.store(true);
         _promise.set_exception(std::make_exception_ptr(std::runtime_error(error.data())));
       } catch (...) {
@@ -105,7 +93,6 @@ class completion_handler {
     bool expected = false;
     if (_completed.compare_exchange_strong(expected, true)) {
       try {
-        SIRIUS_LOG_WARN("Completion handler: mark_completed() called (set_value)");
         _promise.set_value();
       } catch (...) {
         // Promise already satisfied or other error - ignore

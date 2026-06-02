@@ -31,6 +31,9 @@
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include <stdexcept>
+#include <string>
+
 namespace sirius {
 namespace pipeline {
 
@@ -272,22 +275,40 @@ void task_scheduler::drain_after_error()
   SIRIUS_LOG_INFO("task_scheduler: DONE draining after error");
 }
 
-void task_scheduler::drain_after_completion()
+void task_scheduler::wait_for_completion()
 {
-  SIRIUS_LOG_INFO("task_scheduler: draining after completion");
-  // Same quiescence as drain_after_error(), but on the success path: the worker
-  // that called mark_completed() cannot drain its own pool, so we do it here on
-  // the engine thread once the future is satisfied. Joining the task_creator
-  // manager is essential — the ASan use-after-free was a stale op-id request being
-  // dereferenced inside task_creator::manager_loop after the plan was freed.
+  // Once the query has signaled completion, NOTHING should still be queued. Rather
+  // than drain (which would hide the bug), validate that every queue is empty and
+  // throw if not — a non-empty queue means tasks were still being scheduled when we
+  // declared the query done.
+  //
+  // Halt the producer (task_creator) first so the checks are not racing new task
+  // creation. The task_creator is always restarted afterwards (even on throw) so the
+  // next query can run.
   if (_task_creator) { _task_creator->stop_thread_pool(); }
-  _task_queue.drain();
-  _scan_executor->drain_and_wait();
-  for (auto& [device_id, gpu_exec] : _gpu_executors) {
-    gpu_exec->drain_and_wait();
+  try {
+    // The task_scheduler's pipeline task queue must be empty.
+    if (const std::size_t remaining = _task_queue.size(); remaining != 0) {
+      SIRIUS_LOG_ERROR(
+        "task_scheduler::wait_for_completion: pipeline _task_queue NOT empty at query "
+        "completion — {} task(s) still queued; work was still scheduled when the query was "
+        "marked complete",
+        remaining);
+      throw std::runtime_error(
+        "task_scheduler: pipeline task queue not empty at query completion (" +
+        std::to_string(remaining) + " task(s) remaining)");
+    }
+
+    // Each executor must finish its in-flight tasks and then have an empty queue.
+    _scan_executor->wait_and_validate_empty();
+    for (auto& [device_id, gpu_exec] : _gpu_executors) {
+      gpu_exec->wait_and_validate_empty();
+    }
+  } catch (...) {
+    if (_task_creator) { _task_creator->start_thread_pool(); }
+    throw;
   }
   if (_task_creator) { _task_creator->start_thread_pool(); }
-  SIRIUS_LOG_INFO("task_scheduler: DONE draining after completion");
 }
 
 void task_scheduler::management_eventloop()
