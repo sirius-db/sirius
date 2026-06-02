@@ -22,7 +22,6 @@
 #include "helper/type_conversions.hpp"
 #include "io/io_context.hpp"
 #include "io/types.hpp"
-#include "log/logging.hpp"
 #include "op/scan/duckdb_block_layout.hpp"
 #include "op/scan/duckdb_native_scan_info.hpp"
 #include "sirius_context.hpp"
@@ -131,175 +130,12 @@ cudf::data_type sirius_to_cudf_type(sirius::logical_type const& t)
   return duckdb::GetCudfType(sirius::to_duckdb(t));
 }
 
-//===----------------------------------------------------------------------===//
-// Host bytes for a segment.
-//
-// Three sources: a pinned BufferHandle (normal block), owned host bytes
-// (CONSTANT extracted from stats, ROARING host-decoded, or main+additional
-// blocks concatenated), or both (BufferHandle pinning the main block plus
-// owned bytes from the additional-block concat that follows). We keep the
-// handle alive until H2D is queued.
-//===----------------------------------------------------------------------===//
-
+/// @brief Pinned host bytes for a segment (only for CONSTANT and ROARING validity segments for now)
 struct pinned_segment_bytes {
-  // std::vector<duckdb::BufferHandle> handles;  // empty when source is owned_bytes only
   std::vector<uint8_t> owned_bytes;  // used for CONSTANT, ROARING, concat
   uint8_t const* host_ptr = nullptr;
   std::size_t bytes       = 0;
 };
-
-// pinned_segment_bytes pin_block(duckdb::BlockManager& block_manager,
-//                                duckdb::BufferManager& buffer_manager,
-//                                duckdb_segment_descriptor const& seg)
-// {
-//   if (seg.block_id < 0) {
-//     throw std::runtime_error(std::string(kTag) +
-//                              " pin_block called with block_id<0 (CONSTANT segment?)");
-//   }
-//   auto handle = block_manager.RegisterBlock(seg.block_id);
-//   auto pinned = buffer_manager.Pin(handle);
-//   pinned_segment_bytes out;
-//   out.host_ptr = pinned.Ptr() + seg.block_offset;
-//   out.bytes    = seg.bytes_size;
-//   out.handles.push_back(std::move(pinned));
-//   return out;
-// }
-
-// // Pin main block + each additional block; concatenate into one owned buffer.
-// // The descriptor's block_offset applies only to the main block; additional
-// // blocks are taken whole-block. The resulting buffer has main-block bytes
-// // (from block_offset to end) followed by each additional block's full bytes.
-// //
-// // Whether the on-disk codec actually arranges its dictionary/heap to be
-// // readable as one contiguous slab is codec-dependent. For FSST/DICT_FSST
-// // inline-symbol-table segments the main block alone is enough; the concat
-// // is here for codecs that visit_block_ids.
-// pinned_segment_bytes pin_block_with_additional(duckdb::BlockManager& block_manager,
-//                                                duckdb::BufferManager& buffer_manager,
-//                                                duckdb_segment_descriptor const& seg)
-// {
-//   auto main_pinned      = block_manager.RegisterBlock(seg.block_id);
-//   auto main_handle      = buffer_manager.Pin(main_pinned);
-//   auto const block_size = block_manager.GetBlockSize();
-
-//   std::vector<duckdb::BufferHandle> handles;
-//   handles.push_back(std::move(main_handle));
-
-//   // Single up-front resize: main payload + one full block per additional block.
-//   std::vector<uint8_t> concat;
-//   concat.resize(seg.bytes_size + seg.additional_blocks.size() * block_size);
-//   std::memcpy(concat.data(), handles.front().Ptr() + seg.block_offset, seg.bytes_size);
-
-//   std::size_t offset = seg.bytes_size;
-//   for (auto add_id : seg.additional_blocks) {
-//     auto add_handle = block_manager.RegisterBlock(add_id);
-//     auto h          = buffer_manager.Pin(add_handle);
-//     std::memcpy(concat.data() + offset, h.Ptr(), block_size);
-//     offset += block_size;
-//     handles.push_back(std::move(h));
-//   }
-
-//   pinned_segment_bytes out;
-//   out.owned_bytes = std::move(concat);
-//   out.handles     = std::move(handles);
-//   out.host_ptr    = out.owned_bytes.data();
-//   out.bytes       = out.owned_bytes.size();
-//   return out;
-// }
-
-// sirius_io variants of pin_block / pin_block_with_additional: read .db block
-// payloads via sirius_ioctx::host_read, bypassing DuckDB's BufferManager.
-// Output shape matches the BufferManager variants. See read_block_payload for
-// the dispatch between the two.
-//===----------------------------------------------------------------------===//
-
-// pinned_segment_bytes read_block_via_io(::sirius::io::sirius_ioctx& ctx,
-//                                        ::sirius::io::sirius_io_object& obj,
-//                                        duckdb::SingleFileBlockManager const& bm,
-//                                        duckdb_segment_descriptor const& seg)
-// {
-//   pinned_segment_bytes out;
-//   if (seg.bytes_size == 0) { return out; }
-//   out.owned_bytes.resize(seg.bytes_size);
-//   const std::size_t got = ctx.host_read(
-//     obj,
-//     duckdb_block_payload_offset(bm, seg.block_id) + static_cast<std::size_t>(seg.block_offset),
-//     seg.bytes_size,
-//     out.owned_bytes.data());
-//   if (got != seg.bytes_size) {
-//     throw std::runtime_error(std::string(kTag) + " short host_read for block_id " +
-//                              std::to_string(seg.block_id) + ": got " + std::to_string(got) +
-//                              " expected " + std::to_string(seg.bytes_size));
-//   }
-//   out.host_ptr = out.owned_bytes.data();
-//   out.bytes    = seg.bytes_size;
-//   return out;
-// }
-
-// pinned_segment_bytes read_blocks_with_additional_via_io(::sirius::io::sirius_ioctx& ctx,
-//                                                         ::sirius::io::sirius_io_object& obj,
-//                                                         duckdb::SingleFileBlockManager const& bm,
-//                                                         duckdb_segment_descriptor const& seg)
-// {
-//   const std::size_t block_size        = bm.GetBlockSize();
-//   const std::size_t main_payload_size = seg.bytes_size;
-
-//   std::vector<uint8_t> concat;
-//   concat.resize(main_payload_size + seg.additional_blocks.size() * block_size);
-
-//   // Main block: read just bytes_size from (payload + block_offset). No temp + memcpy.
-//   if (main_payload_size > 0) {
-//     const std::size_t got = ctx.host_read(
-//       obj,
-//       duckdb_block_payload_offset(bm, seg.block_id) + static_cast<std::size_t>(seg.block_offset),
-//       main_payload_size,
-//       concat.data());
-//     if (got != main_payload_size) {
-//       throw std::runtime_error(std::string(kTag) + " short host_read for main block_id " +
-//                                std::to_string(seg.block_id) + ": got " + std::to_string(got) +
-//                                " expected " + std::to_string(main_payload_size));
-//     }
-//   }
-
-//   // Additional blocks: read each full-payload directly into the concat buffer.
-//   std::size_t dst_off = main_payload_size;
-//   for (auto add_id : seg.additional_blocks) {
-//     const std::size_t got = ctx.host_read(
-//       obj, duckdb_block_payload_offset(bm, add_id), block_size, concat.data() + dst_off);
-//     if (got != block_size) {
-//       throw std::runtime_error(std::string(kTag) + " short host_read for additional block_id " +
-//                                std::to_string(add_id));
-//     }
-//     dst_off += block_size;
-//   }
-
-//   pinned_segment_bytes out;
-//   out.owned_bytes = std::move(concat);
-//   out.host_ptr    = out.owned_bytes.data();
-//   out.bytes       = out.owned_bytes.size();
-//   return out;
-// }
-
-// // Picks the via-sirius_io path when ioctx + io_object + SingleFileBlockManager
-// // are all available, otherwise falls back to BufferManager::Pin. Output shape
-// // matches pin_block: host pointer + segment-exact bytes.
-// pinned_segment_bytes read_block_payload(::sirius::io::sirius_ioctx* io_ctx,
-//                                         ::sirius::io::sirius_io_object* io_obj,
-//                                         duckdb::SingleFileBlockManager const* sf_bm,
-//                                         duckdb::BlockManager& block_manager,
-//                                         duckdb::BufferManager& buffer_manager,
-//                                         duckdb_segment_descriptor const& seg)
-// {
-//   const bool via_io = (io_ctx != nullptr && io_obj != nullptr && sf_bm != nullptr);
-//   if (via_io) {
-//     return seg.additional_blocks.empty()
-//              ? read_block_via_io(*io_ctx, *io_obj, *sf_bm, seg)
-//              : read_blocks_with_additional_via_io(*io_ctx, *io_obj, *sf_bm, seg);
-//   }
-//   return seg.additional_blocks.empty()
-//            ? pin_block(block_manager, buffer_manager, seg)
-//            : pin_block_with_additional(block_manager, buffer_manager, seg);
-// }
 
 //===----------------------------------------------------------------------===//
 // CONSTANT extraction.
@@ -661,25 +497,6 @@ staged_column stage_one_varchar_column(staging_state& s,
 //===----------------------------------------------------------------------===//
 // Issue staged device reads and host copies.
 //===----------------------------------------------------------------------===//
-
-// void copy_staged_to_device(rmm::device_buffer& device_buf,
-//                            staging_state const& s,
-//                            rmm::cuda_stream_view stream)
-// {
-//   auto* device_base = static_cast<uint8_t*>(device_buf.data());
-//   for (std::size_t i = 0; i < s.src_ptrs.size(); ++i) {
-//     RMM_CUDA_TRY(cudaMemcpyAsync(device_base + s.dst_offsets[i],
-//                                  s.src_ptrs[i],
-//                                  s.src_sizes[i],
-//                                  cudaMemcpyHostToDevice,
-//                                  stream.value()));
-//   }
-//   // Pageable→cuda_async_memory_resource H2D has an empirical stream-ordering
-//   // hazard: same-stream kernels can read pool residue at the destination.
-//   // Sync once per upload batch. To drop: pinned source AND lifetime that
-//   // outlives the kernel (event-tagged pool return or operator-owned staging).
-//   RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));
-// }
 
 void submit_and_await(rmm::device_buffer& device_buf,
                       staging_state const& s,
