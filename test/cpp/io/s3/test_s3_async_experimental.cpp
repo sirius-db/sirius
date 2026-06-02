@@ -1492,7 +1492,7 @@ TEST_CASE("async-curl S3 benchmark reports real AWS S3 headline numbers",
 
   CHECK(async_bytes == blocking_bytes);
   CHECK(async->device_stream_sync_total() == 0);
-  INFO("aws key=" << key << " bytes=" << bytes << " blocking_ms=" << millis(blocking_time)
+  WARN("aws key=" << key << " bytes=" << bytes << " blocking_ms=" << millis(blocking_time)
                   << " async_mc8_ms=" << millis(async_time)
                   << " async_peak_inflight=" << async->device_peak_inflight());
 }
