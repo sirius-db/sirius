@@ -44,6 +44,8 @@ struct conjunction {
 
   kind op{kind::invalid};
   std::vector<std::unique_ptr<node>> children;
+
+  std::size_t cudf_ast_op_count() const;
 };
 
 }  // namespace sirius::ast

@@ -155,6 +155,7 @@ set(EXTENSION_SOURCES
     src/expression/to_duckdb.cpp
     src/expression/value.cpp
     src/expression_executor/expression_executor_strategy.cpp
+    src/expression_executor/ast_op_counter.cpp
     src/expression_executor/gpu_expression_executor.cpp
     src/expression_executor/gpu_expression_translator.cpp
     src/expression_executor/regex/regex_playground.cpp

@@ -36,6 +36,8 @@ struct comparison {
   sirius::comparison_type op{sirius::comparison_type::equal};
   std::unique_ptr<node> left;
   std::unique_ptr<node> right;
+
+  std::size_t cudf_ast_op_count() const;
 };
 
 }  // namespace sirius::ast
