@@ -648,7 +648,7 @@ TEST_CASE("ast_from_duckdb - BOUND_OPERATOR NOT with unsupported child propagate
   // Wrapping it in NOT must propagate the nullptr up.
   auto bad_child = duckdb::make_uniq<BoundParameterExpression>(std::string{"p_not"});
   auto not_expr  = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_NOT,
-                                                              LogicalType{LogicalTypeId::BOOLEAN});
+                                                             LogicalType{LogicalTypeId::BOOLEAN});
   not_expr->children.push_back(std::move(bad_child));
 
   REQUIRE(sirius::ast::from_duckdb(*not_expr) == nullptr);
@@ -659,7 +659,7 @@ TEST_CASE("ast_from_duckdb - BOUND_OPERATOR COMPARE_IN with unsupported probe pr
 {
   auto bad_probe = duckdb::make_uniq<BoundParameterExpression>(std::string{"p_in"});
   auto in_expr   = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::COMPARE_IN,
-                                                              LogicalType{LogicalTypeId::BOOLEAN});
+                                                            LogicalType{LogicalTypeId::BOOLEAN});
   in_expr->children.push_back(std::move(bad_probe));
   in_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(2)));
   in_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3)));

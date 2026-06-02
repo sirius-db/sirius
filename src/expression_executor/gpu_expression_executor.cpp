@@ -551,8 +551,7 @@ std::size_t gpu_expression_executor::count_ast_ops(sirius::ast::node const& expr
       } else if constexpr (std::is_same_v<T, sirius::ast::comparison>) {
         // DISTINCT_FROM lowers to NOT(NULL_EQUAL(...)) — two AST ops, not one.
         // NOT_DISTINCT_FROM is a single NULL_EQUAL and stays at one.
-        std::size_t const self =
-          (alt.op == sirius::comparison_type::distinct_from) ? 2U : 1U;
+        std::size_t const self = (alt.op == sirius::comparison_type::distinct_from) ? 2U : 1U;
         return self + count_ast_ops(*alt.left) + count_ast_ops(*alt.right);
       } else if constexpr (std::is_same_v<T, sirius::ast::conjunction>) {
         if (alt.children.empty()) {
