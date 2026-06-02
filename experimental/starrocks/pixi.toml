@@ -4,8 +4,8 @@ name = "sirius-starrocks"
 platforms = ["linux-64","linux-aarch64"]
 
 [environments]
-default = ["fe","be"]
-be = ["be"]
+default = ["fe","cn"]
+cn = ["cn"]
 fe = ["fe"]
 
 [tasks]
@@ -15,8 +15,8 @@ bash -lc 'set -euo pipefail
 cleanup() {
     status=$?
     trap - EXIT INT TERM
-    kill "${fe_pid:-}" "${be_pid:-}" 2>/dev/null || true
-    wait "${fe_pid:-}" "${be_pid:-}" 2>/dev/null || true
+    kill "${fe_pid:-}" "${cn_pid:-}" 2>/dev/null || true
+    wait "${fe_pid:-}" "${cn_pid:-}" 2>/dev/null || true
     exit "${status}"
 }
 trap cleanup EXIT INT TERM
@@ -24,21 +24,21 @@ trap cleanup EXIT INT TERM
 starrocks/output/fe/bin/start_fe.sh --logconsole &
 fe_pid="$!"
 
-target/release/sirius-starrocks-be &
-be_pid="$!"
+target/release/sirius-starrocks-cn &
+cn_pid="$!"
 
-wait -n "${fe_pid}" "${be_pid}"
+wait -n "${fe_pid}" "${cn_pid}"
 '
-""",cwd = ".",depends-on = ["fe-build","be-build"],description = "Run the local StarRocks FE and Rust BE in the foreground with logs"}
+""",cwd = ".",depends-on = ["fe-build","cn-build"],description = "Run the local StarRocks FE and Rust CN in the foreground with logs"}
 
-[feature.be.dependencies]
+[feature.cn.dependencies]
 rust = "*"
 thrift-compiler = "*"
 
-[feature.be.tasks]
-be-build = {cmd = "cargo build --release -p sirius-starrocks-be",description = "Build the Rust StarRocks BE release binary"}
-be-test = {cmd = "cargo test -p sirius-starrocks-be",description = "Run Rust StarRocks BE tests"}
-be-run = {cmd = "cargo run -p sirius-starrocks-be --",description = "Run the Rust StarRocks BE with local FE defaults"}
+[feature.cn.tasks]
+cn-build = {cmd = "cargo build --release -p sirius-starrocks-cn",description = "Build the Rust StarRocks CN release binary"}
+cn-test = {cmd = "cargo test -p sirius-starrocks-cn",description = "Run Rust StarRocks CN tests"}
+cn-run = {cmd = "cargo run -p sirius-starrocks-cn --",description = "Run the Rust StarRocks CN with local FE defaults"}
 
 [feature.fe.dependencies]
 bash = "*"

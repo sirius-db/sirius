@@ -9,7 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let workspace_dir = manifest_dir
         .parent()
-        .ok_or_else(|| io::Error::other("be crate has workspace parent"))?
+        .ok_or_else(|| io::Error::other("cn crate has workspace parent"))?
         .to_path_buf();
     let thrift_dir = manifest_dir.join("../starrocks/gensrc/thrift");
     let heartbeat_thrift = thrift_dir.join("HeartbeatService.thrift");
@@ -30,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         candidates.push(PathBuf::from(thrift));
     }
     candidates.push(PathBuf::from("thrift"));
-    candidates.push(workspace_dir.join(".pixi/envs/be/bin/thrift"));
+    candidates.push(workspace_dir.join(".pixi/envs/cn/bin/thrift"));
     candidates.push(workspace_dir.join(".pixi/envs/fe/bin/thrift"));
 
     for thrift in candidates {
@@ -49,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Err(io::Error::new(
         ErrorKind::NotFound,
-        "failed to find thrift compiler; install thrift-compiler or run through `pixi run -e be`",
+        "failed to find thrift compiler; install thrift-compiler or run through `pixi run -e cn`",
     )
     .into())
 }

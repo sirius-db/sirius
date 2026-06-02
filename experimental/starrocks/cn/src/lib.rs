@@ -34,7 +34,9 @@ use thrift::{
 };
 use tracing::{debug, info, warn};
 
-type HeartbeatProcessor = HeartbeatServiceSyncProcessor<BackendHeartbeatHandler>;
+type HeartbeatProcessor = HeartbeatServiceSyncProcessor<ComputeNodeHeartbeatHandler>;
+
+const COMPUTE_NODE_PROC_PATH: &str = "/compute_nodes";
 
 #[derive(Clone, Eq, PartialEq, Hash)]
 pub struct Host(String);
@@ -114,42 +116,46 @@ impl FromStr for SecretString {
 }
 
 #[derive(Clone, Debug, clap::Args)]
-pub struct BackendConfig {
+pub struct ComputeNodeConfig {
     #[arg(long, default_value = "0.0.0.0")]
     pub bind_host: Host,
     #[arg(long, default_value = "127.0.0.1")]
     pub advertise_host: Host,
     #[arg(long, default_value_t = 9050)]
     pub heartbeat_port: u16,
-    #[arg(long, default_value_t = 9060)]
-    pub be_port: u16,
+    #[arg(long = "thrift-port", default_value_t = 9060)]
+    pub thrift_port: u16,
     #[arg(long, default_value_t = 8040)]
     pub http_port: u16,
     #[arg(long, default_value_t = 8060)]
     pub brpc_port: u16,
     #[arg(long)]
     pub arrow_flight_port: Option<u16>,
-    #[arg(skip = default_backend_version())]
+    #[arg(skip = default_compute_node_version())]
     pub version: String,
 }
 
-impl Default for BackendConfig {
+impl Default for ComputeNodeConfig {
     fn default() -> Self {
         Self {
             bind_host: Host::unspecified(),
             advertise_host: Host::local(),
             heartbeat_port: 9050,
-            be_port: 9060,
+            thrift_port: 9060,
             http_port: 8040,
             brpc_port: 8060,
             arrow_flight_port: None,
-            version: default_backend_version(),
+            version: default_compute_node_version(),
         }
     }
 }
 
-fn default_backend_version() -> String {
+fn default_compute_node_version() -> String {
     format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+}
+
+fn compute_node_registration_sql(host: &Host, heartbeat_port: u16) -> String {
+    format!("ALTER SYSTEM ADD COMPUTE NODE \"{host}:{heartbeat_port}\"")
 }
 
 #[derive(Clone, Debug, clap::Args)]
@@ -180,7 +186,7 @@ pub struct HeartbeatStateSnapshot {
     pub cluster_id: Option<types::TClusterId>,
     pub token: Option<SecretString>,
     pub epoch: Option<types::TEpoch>,
-    pub backend_id: Option<i64>,
+    pub compute_node_id: Option<i64>,
     pub last_heartbeat_ms: Option<u128>,
 }
 
@@ -189,7 +195,7 @@ struct HeartbeatState {
     cluster_id: Option<types::TClusterId>,
     token: Option<SecretString>,
     epoch: Option<types::TEpoch>,
-    backend_id: Option<i64>,
+    compute_node_id: Option<i64>,
     last_heartbeat_ms: Option<u128>,
 }
 
@@ -207,7 +213,7 @@ impl SharedHeartbeatState {
             cluster_id: state.cluster_id,
             token: state.token.clone(),
             epoch: state.epoch,
-            backend_id: state.backend_id,
+            compute_node_id: state.compute_node_id,
             last_heartbeat_ms: state.last_heartbeat_ms,
         }
     }
@@ -229,15 +235,15 @@ impl Default for SharedHeartbeatState {
 }
 
 #[derive(Clone, Debug)]
-pub struct BackendHeartbeatHandler {
-    config: BackendConfig,
+pub struct ComputeNodeHeartbeatHandler {
+    config: ComputeNodeConfig,
     state: SharedHeartbeatState,
     reboot_time_secs: i64,
     hardware_cores: i32,
 }
 
-impl BackendHeartbeatHandler {
-    pub fn new(config: BackendConfig, state: SharedHeartbeatState) -> Self {
+impl ComputeNodeHeartbeatHandler {
+    pub fn new(config: ComputeNodeConfig, state: SharedHeartbeatState) -> Self {
         Self {
             config,
             state,
@@ -252,8 +258,13 @@ impl BackendHeartbeatHandler {
         &self,
         master_info: &TMasterInfo,
     ) -> std::result::Result<(), HeartbeatError> {
-        if master_info.node_type == Some(types::TNodeType::COMPUTE) {
-            return Err(HeartbeatError::ComputeNode);
+        let received_node_type = master_info
+            .node_type
+            .ok_or(HeartbeatError::MissingNodeType)?;
+        if received_node_type != types::TNodeType::COMPUTE {
+            return Err(HeartbeatError::UnexpectedNodeType {
+                received: received_node_type,
+            });
         }
 
         let mut state = self
@@ -295,17 +306,17 @@ impl BackendHeartbeatHandler {
         }
 
         state.epoch = Some(master_info.epoch);
-        if let Some(backend_id) = master_info.backend_id {
-            state.backend_id = Some(backend_id);
+        if let Some(compute_node_id) = master_info.backend_id {
+            state.compute_node_id = Some(compute_node_id);
         }
         state.last_heartbeat_ms = Some(unix_time_millis());
 
         Ok(())
     }
 
-    fn backend_info(&self) -> TBackendInfo {
+    fn compute_node_info(&self) -> TBackendInfo {
         TBackendInfo::new(
-            i32::from(self.config.be_port),
+            i32::from(self.config.thrift_port),
             i32::from(self.config.http_port),
             Some(-1),
             Some(i32::from(self.config.brpc_port)),
@@ -322,8 +333,14 @@ impl BackendHeartbeatHandler {
 
 #[derive(Debug, thiserror::Error)]
 enum HeartbeatError {
-    #[error("FE heartbeat targeted this node as a compute node")]
-    ComputeNode,
+    #[error(
+        "FE heartbeat did not include a node type; Sirius only supports StarRocks compute nodes"
+    )]
+    MissingNodeType,
+    #[error(
+        "FE heartbeat targeted this node as {received:?}; Sirius only supports StarRocks compute nodes"
+    )]
+    UnexpectedNodeType { received: types::TNodeType },
     #[error("heartbeat state mutex poisoned")]
     StatePoisoned,
     #[error("stale FE epoch {received}, current epoch is {current}")]
@@ -340,13 +357,13 @@ enum HeartbeatError {
     TokenChanged,
 }
 
-impl HeartbeatServiceSyncHandler for BackendHeartbeatHandler {
+impl HeartbeatServiceSyncHandler for ComputeNodeHeartbeatHandler {
     fn handle_heartbeat(&self, master_info: TMasterInfo) -> thrift::Result<THeartbeatResult> {
         debug!(
             fe_host = %master_info.network_address.hostname,
             fe_port = master_info.network_address.port,
             epoch = master_info.epoch,
-            backend_id = ?master_info.backend_id,
+            compute_node_id = ?master_info.backend_id,
             "received FE heartbeat"
         );
 
@@ -358,7 +375,7 @@ impl HeartbeatServiceSyncHandler for BackendHeartbeatHandler {
             }
         };
 
-        Ok(THeartbeatResult::new(status, self.backend_info()))
+        Ok(THeartbeatResult::new(status, self.compute_node_info()))
     }
 }
 
@@ -468,7 +485,7 @@ impl Drop for ActiveConnectionGuard {
 }
 
 pub fn start_heartbeat_server(
-    config: BackendConfig,
+    config: ComputeNodeConfig,
     state: SharedHeartbeatState,
 ) -> Result<HeartbeatServer> {
     let listen_addr = format!("{}:{}", config.bind_host, config.heartbeat_port);
@@ -493,12 +510,12 @@ pub fn start_heartbeat_server(
 
 fn run_heartbeat_server(
     listener: TcpListener,
-    config: BackendConfig,
+    config: ComputeNodeConfig,
     state: SharedHeartbeatState,
     shutdown: HeartbeatServerShutdown,
 ) -> Result<()> {
     let processor = Arc::new(HeartbeatServiceSyncProcessor::new(
-        BackendHeartbeatHandler::new(config, state),
+        ComputeNodeHeartbeatHandler::new(config, state),
     ));
 
     for stream in listener.incoming() {
@@ -574,7 +591,7 @@ fn listener_wake_addr(local_addr: SocketAddr) -> SocketAddr {
     }
 }
 
-pub async fn register_backend(fe: &FeConfig, backend: &BackendConfig) -> Result<()> {
+pub async fn register_node(fe: &FeConfig, node: &ComputeNodeConfig) -> Result<()> {
     let opts = OptsBuilder::default()
         .ip_or_hostname(fe.host.to_string())
         .tcp_port(fe.query_port)
@@ -587,11 +604,11 @@ pub async fn register_backend(fe: &FeConfig, backend: &BackendConfig) -> Result<
         .await
         .with_context(|| format!("failed to connect to FE at {}:{}", fe.host, fe.query_port))?;
 
-    if backend_is_registered(&mut conn, backend).await? {
+    if node_is_registered(&mut conn, node).await? {
         info!(
-            host = %backend.advertise_host,
-            heartbeat_port = backend.heartbeat_port,
-            "backend is already registered with FE"
+            host = %node.advertise_host,
+            heartbeat_port = node.heartbeat_port,
+            "compute node is already registered with FE"
         );
         drop(conn);
         pool.disconnect()
@@ -600,30 +617,28 @@ pub async fn register_backend(fe: &FeConfig, backend: &BackendConfig) -> Result<
         return Ok(());
     }
 
-    let sql = format!(
-        "ALTER SYSTEM ADD BACKEND \"{}:{}\"",
-        backend.advertise_host, backend.heartbeat_port
-    );
-    info!(sql = %sql, "registering backend with FE");
+    let sql = compute_node_registration_sql(&node.advertise_host, node.heartbeat_port);
+    info!(sql = %sql, "registering compute node with FE");
     if let Err(err) = conn.query_drop(sql).await {
-        warn!(error = %err, "ALTER SYSTEM ADD BACKEND failed; checking whether backend already exists");
-        if !backend_is_registered(&mut conn, backend).await? {
-            return Err(err).context("failed to register backend with FE");
+        warn!(error = %err, "ALTER SYSTEM ADD COMPUTE NODE failed; checking whether compute node already exists");
+        if !node_is_registered(&mut conn, node).await? {
+            return Err(err).context("failed to register compute node with FE");
         }
     }
 
-    if !backend_is_registered(&mut conn, backend).await? {
+    if !node_is_registered(&mut conn, node).await? {
         bail!(
-            "FE accepted registration but backend {}:{} was not found in SHOW PROC '/backends'",
-            backend.advertise_host,
-            backend.heartbeat_port
+            "FE accepted registration but compute node {}:{} was not found in SHOW PROC '{}'",
+            node.advertise_host,
+            node.heartbeat_port,
+            COMPUTE_NODE_PROC_PATH
         );
     }
 
     info!(
-        host = %backend.advertise_host,
-        heartbeat_port = backend.heartbeat_port,
-        "backend registration confirmed"
+        host = %node.advertise_host,
+        heartbeat_port = node.heartbeat_port,
+        "compute node registration confirmed"
     );
     drop(conn);
     pool.disconnect()
@@ -632,15 +647,16 @@ pub async fn register_backend(fe: &FeConfig, backend: &BackendConfig) -> Result<
     Ok(())
 }
 
-async fn backend_is_registered(
+async fn node_is_registered(
     conn: &mut mysql_async::Conn,
-    backend: &BackendConfig,
+    node: &ComputeNodeConfig,
 ) -> Result<bool> {
+    let sql = format!("SHOW PROC '{COMPUTE_NODE_PROC_PATH}'");
     let rows: Vec<Row> = conn
-        .query("SHOW PROC '/backends'")
+        .query(sql)
         .await
-        .context("failed to query FE backend list")?;
-    let heartbeat_port = backend.heartbeat_port.to_string();
+        .context("failed to query FE compute node list")?;
+    let heartbeat_port = node.heartbeat_port.to_string();
 
     for row in rows {
         let host = row
@@ -650,7 +666,7 @@ async fn backend_is_registered(
             .get::<String, _>("HeartbeatPort")
             .or_else(|| row.get::<String, _>(2));
 
-        if host.as_deref() == Some(backend.advertise_host.as_str())
+        if host.as_deref() == Some(node.advertise_host.as_str())
             && port.as_deref() == Some(heartbeat_port.as_str())
         {
             return Ok(true);
@@ -687,17 +703,17 @@ fn unix_time_millis() -> u128 {
 mod tests {
     use super::*;
 
-    fn test_config() -> BackendConfig {
-        BackendConfig {
+    fn test_config() -> ComputeNodeConfig {
+        ComputeNodeConfig {
             version: "test-version".to_string(),
-            ..BackendConfig::default()
+            ..ComputeNodeConfig::default()
         }
     }
 
-    fn handler() -> (BackendHeartbeatHandler, SharedHeartbeatState) {
+    fn handler() -> (ComputeNodeHeartbeatHandler, SharedHeartbeatState) {
         let state = SharedHeartbeatState::new();
         (
-            BackendHeartbeatHandler::new(test_config(), state.clone()),
+            ComputeNodeHeartbeatHandler::new(test_config(), state.clone()),
             state,
         )
     }
@@ -713,12 +729,12 @@ mod tests {
             Some(0),
             Some(10001),
             Some(0),
-            Some(types::TRunMode::SHARED_NOTHING),
+            Some(types::TRunMode::SHARED_DATA),
             None,
             None,
             Some(false),
             Some(true),
-            Some(types::TNodeType::BACKEND),
+            Some(types::TNodeType::COMPUTE),
         )
     }
 
@@ -741,7 +757,7 @@ mod tests {
             Some("token")
         );
         assert_eq!(snapshot.epoch, Some(7));
-        assert_eq!(snapshot.backend_id, Some(10001));
+        assert_eq!(snapshot.compute_node_id, Some(10001));
         assert!(snapshot.last_heartbeat_ms.is_some());
     }
 
@@ -857,20 +873,46 @@ mod tests {
     }
 
     #[test]
-    fn compute_node_heartbeat_fails() {
+    fn non_compute_node_heartbeat_fails() {
         let (handler, state) = handler();
-        let mut compute = master(7);
-        compute.node_type = Some(types::TNodeType::COMPUTE);
+        let mut heartbeat = master(7);
+        heartbeat.node_type = Some(types::TNodeType::BACKEND);
 
         assert_eq!(
             handler
-                .handle_heartbeat(compute)
+                .handle_heartbeat(heartbeat)
                 .unwrap()
                 .status
                 .status_code,
             TStatusCode::INTERNAL_ERROR
         );
         assert_eq!(state.snapshot().epoch, None);
+    }
+
+    #[test]
+    fn missing_node_type_fails() {
+        let (handler, state) = handler();
+        let mut heartbeat = master(7);
+        heartbeat.node_type = None;
+
+        assert_eq!(
+            handler
+                .handle_heartbeat(heartbeat)
+                .unwrap()
+                .status
+                .status_code,
+            TStatusCode::INTERNAL_ERROR
+        );
+        assert_eq!(state.snapshot().epoch, None);
+    }
+
+    #[test]
+    fn registration_uses_compute_node_surface() {
+        assert_eq!(
+            compute_node_registration_sql(&Host::local(), 9050),
+            "ALTER SYSTEM ADD COMPUTE NODE \"127.0.0.1:9050\""
+        );
+        assert_eq!(COMPUTE_NODE_PROC_PATH, "/compute_nodes");
     }
 
     #[test]
