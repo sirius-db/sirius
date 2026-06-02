@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
-use sirius_starrocks_be::{
-    BackendConfig, FeConfig, HeartbeatServer, SharedHeartbeatState, register_backend,
+use sirius_starrocks_cn::{
+    ComputeNodeConfig, FeConfig, HeartbeatServer, SharedHeartbeatState, register_node,
     start_heartbeat_server,
 };
 use tracing::{debug, error, info, warn};
@@ -17,8 +17,8 @@ struct Args {
     #[command(flatten, next_help_heading = "FE")]
     fe: FeConfig,
 
-    #[command(flatten, next_help_heading = "BE")]
-    backend: BackendConfig,
+    #[command(flatten, next_help_heading = "CN")]
+    compute_node: ComputeNodeConfig,
 
     #[command(flatten, next_help_heading = "Registration")]
     registration: RegistrationConfig,
@@ -35,29 +35,29 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "sirius_starrocks_be=info,info".into()),
+                .unwrap_or_else(|_| "sirius_starrocks_cn=info,info".into()),
         )
         .init();
 
     let args = Args::parse();
     let state = SharedHeartbeatState::new();
 
-    let server = start_heartbeat_server(args.backend.clone(), state.clone())?;
-    register_backend_with_retries(&args.fe, &args.backend, &args.registration).await?;
+    let server = start_heartbeat_server(args.compute_node.clone(), state.clone())?;
+    register_node_with_retries(&args.fe, &args.compute_node, &args.registration).await?;
 
     let registration_task = tokio::spawn(maintain_registration(
         args.fe.clone(),
-        args.backend.clone(),
+        args.compute_node.clone(),
         state.clone(),
     ));
 
-    info!("backend registered; waiting for FE heartbeats");
+    info!("compute node registered; waiting for FE heartbeats");
     wait_until_shutdown(server, registration_task).await
 }
 
-async fn register_backend_with_retries(
+async fn register_node_with_retries(
     fe: &FeConfig,
-    backend: &BackendConfig,
+    compute_node: &ComputeNodeConfig,
     registration: &RegistrationConfig,
 ) -> Result<()> {
     if registration.registration_max_attempts == 0 {
@@ -65,12 +65,12 @@ async fn register_backend_with_retries(
     }
 
     for attempt in 1..=registration.registration_max_attempts {
-        match register_backend(fe, backend).await {
+        match register_node(fe, compute_node).await {
             Ok(()) => return Ok(()),
             Err(err) => {
                 if attempt == registration.registration_max_attempts {
                     return Err(anyhow!(
-                        "failed to register backend with FE after {} attempts: {err}",
+                        "failed to register compute node with FE after {} attempts: {err}",
                         registration.registration_max_attempts
                     ));
                 }
@@ -80,7 +80,7 @@ async fn register_backend_with_retries(
                     attempt,
                     max_attempts = registration.registration_max_attempts,
                     retry_after_secs = REGISTRATION_RETRY_INTERVAL.as_secs(),
-                    "failed to register backend with FE; retrying"
+                    "failed to register compute node with FE; retrying"
                 );
                 tokio::time::sleep(REGISTRATION_RETRY_INTERVAL).await;
             }
@@ -90,7 +90,11 @@ async fn register_backend_with_retries(
     unreachable!("registration attempts loop always returns")
 }
 
-async fn maintain_registration(fe: FeConfig, backend: BackendConfig, state: SharedHeartbeatState) {
+async fn maintain_registration(
+    fe: FeConfig,
+    compute_node: ComputeNodeConfig,
+    state: SharedHeartbeatState,
+) {
     loop {
         tokio::time::sleep(REGISTRATION_REFRESH_INTERVAL).await;
 
@@ -102,13 +106,13 @@ async fn maintain_registration(fe: FeConfig, backend: BackendConfig, state: Shar
 
         debug!(
             stale_after_secs = HEARTBEAT_STALE_AFTER.as_secs(),
-            "heartbeat is stale or missing; ensuring backend registration"
+            "heartbeat is stale or missing; ensuring compute node registration"
         );
-        if let Err(err) = register_backend(&fe, &backend).await {
+        if let Err(err) = register_node(&fe, &compute_node).await {
             warn!(
                 error = %err,
                 retry_after_secs = REGISTRATION_REFRESH_INTERVAL.as_secs(),
-                "failed to refresh backend registration with FE"
+                "failed to refresh compute node registration with FE"
             );
         }
     }
