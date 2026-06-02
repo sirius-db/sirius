@@ -585,7 +585,7 @@ std::size_t gpu_expression_executor::count_ast_ops(sirius::ast::node const& expr
           case sirius::ast::unary_op::kind::op_is_null: return 1 + count_ast_ops(*alt.child);
           case sirius::ast::unary_op::kind::op_is_not_null: return 2 + count_ast_ops(*alt.child);
           case sirius::ast::unary_op::kind::op_try:
-            throw duckdb::NotImplementedException(
+            throw not_implemented_exception(
               "[gpu_expression_executor] count_ast_ops called on an unsupported TRY operator "
               "expression.");
           default:

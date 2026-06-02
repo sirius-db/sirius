@@ -165,14 +165,17 @@ execute_result gpu_expression_executor::execute(sirius::ast::function_call const
   if (resolved_id == function_id::substring) {
     auto input = execute(*args[0], execution_mode::MATERIALIZE);
 
-    // The start and len arguments of SUBSTRING are assumed to be INTEGER constants.
+    // DuckDB binds substring as (VARCHAR, BIGINT, BIGINT), so the start/len
+    // children are BIGINT constants — the payload variant holds int64_t.
     D_ASSERT(args[1]->holds<sirius::ast::constant>());
     D_ASSERT(args[2]->holds<sirius::ast::constant>());
-    auto const start_raw = std::get<int32_t>(args[1]->get<sirius::ast::constant>().payload);
-    auto const len_raw   = std::get<int32_t>(args[2]->get<sirius::ast::constant>().payload);
+    auto const start_raw = std::get<int64_t>(args[1]->get<sirius::ast::constant>().payload);
+    auto const len_raw   = std::get<int64_t>(args[2]->get<sirius::ast::constant>().payload);
 
-    // The values provided by DuckDB must be modified to be 0-indexed and <start, stop> instead of
-    // <start, len>
+    // Re-base to 0-indexed and convert <start, len> to <start, stop>. Narrow
+    // to cudf::size_type (int32_t) here because cudf::strings::slice_strings
+    // only accepts int32 bounds — the narrowing is a cudf API constraint,
+    // not a SUBSTRING semantic limit.
     auto const start_val = static_cast<cudf::size_type>(start_raw) - 1;
     auto const stop_val  = static_cast<cudf::size_type>(len_raw) + start_val;
 
