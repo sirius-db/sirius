@@ -138,7 +138,10 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   std::vector<op::sirius_physical_operator*> get_output_consumers() const;
 
   //! Notifies downstream pipelines to re-evaluate their status after this pipeline finishes
-  void notify_downstream_pipelines();
+  //! @param original_pipeline Whether this is the original pipeline whose task finished and called
+  //! update_pipeline_status. If it is, we dont want to schedule tasks for its consumers, that will
+  //! be done later.
+  void notify_downstream_pipelines(bool original_pipeline);
 
   //! Returns whether any of the operators in the pipeline care about preserving order
   bool is_order_dependent() const;
@@ -154,7 +157,10 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> dependencies;
 
   //! Updates the pipeline status
-  void update_pipeline_status();
+  //! @param original_pipeline Whether this is the original pipeline whose task finished and called
+  //! update_pipeline_status. If it is, we dont want to schedule tasks for its consumers, that will
+  //! be done later.
+  void update_pipeline_status(bool original_pipeline = true);
   //! Checks if the pipeline has been finished
   virtual bool is_pipeline_finished() const;
 
