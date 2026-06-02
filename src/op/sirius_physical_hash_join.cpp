@@ -1157,26 +1157,26 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       right_indices = std::move(join_result.first);
       left_indices  = std::move(join_result.second);
     } else if (join_type == duckdb::JoinType::SEMI) {
-      auto filtered_join_object = cudf::filtered_join(
-        right_keys, cudf::null_equality::UNEQUAL, cudf::set_as_build_table::RIGHT, stream);
+      auto filtered_join_object =
+        cudf::filtered_join(right_keys, cudf::null_equality::UNEQUAL, stream);
       left_indices = filtered_join_object.semi_join(left_keys, stream);
     } else if (join_type == duckdb::JoinType::RIGHT_SEMI) {
-      auto filtered_join_object = cudf::filtered_join(
-        left_keys, cudf::null_equality::UNEQUAL, cudf::set_as_build_table::RIGHT, stream);
+      auto filtered_join_object =
+        cudf::filtered_join(left_keys, cudf::null_equality::UNEQUAL, stream);
       right_indices = filtered_join_object.semi_join(right_keys, stream);
     } else if (join_type == duckdb::JoinType::ANTI) {
-      auto filtered_join_object = cudf::filtered_join(
-        right_keys, cudf::null_equality::UNEQUAL, cudf::set_as_build_table::RIGHT, stream);
+      auto filtered_join_object =
+        cudf::filtered_join(right_keys, cudf::null_equality::UNEQUAL, stream);
       left_indices = filtered_join_object.anti_join(left_keys, stream);
     } else if (join_type == duckdb::JoinType::RIGHT_ANTI) {
-      auto filtered_join_object = cudf::filtered_join(
-        left_keys, cudf::null_equality::UNEQUAL, cudf::set_as_build_table::RIGHT, stream);
+      auto filtered_join_object =
+        cudf::filtered_join(left_keys, cudf::null_equality::UNEQUAL, stream);
       right_indices = filtered_join_object.anti_join(right_keys, stream);
     } else if (join_type == duckdb::JoinType::MARK) {
       // MARK join: output ALL left rows + a BOOL8 column indicating match presence.
       // Use semi join to find which left rows have matches in the right table.
-      auto filtered_join_object = cudf::filtered_join(
-        right_keys, cudf::null_equality::UNEQUAL, cudf::set_as_build_table::RIGHT, stream);
+      auto filtered_join_object =
+        cudf::filtered_join(right_keys, cudf::null_equality::UNEQUAL, stream);
       auto semi_indices = filtered_join_object.semi_join(left_keys, stream);
       return resolve_mark_join_result(
         *semi_indices, left_full, lhs_output_columns.col_idxs, input_batches[0], stream);
