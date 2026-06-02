@@ -126,13 +126,6 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   sirius::parallel::downgrade_executor* _downgrade_executor{nullptr};
   sirius::creator::task_creator* _task_creator{nullptr};
   completion_handler* _completion_handler{nullptr};
-
-  //! Set true once this executor has signaled query completion (mark_completed).
-  //! Reset to false on each query start via set_completion_handler(). If a task
-  //! finishes while this is already true, a task was still in flight when we
-  //! declared the query done — a bug we log loudly.
-  // WSM: TODO this is only for one gpu executor, so this is not the best for multi-gpu execution.
-  std::atomic<bool> _query_complete{false};
 };
 
 }  // namespace pipeline

@@ -189,14 +189,10 @@ void sirius_engine::execute()
   // Warn about any intermediate operators that were never finalized.
   if (auto query = sirius_ctx->get_query()) {
     for (const auto& pipeline : query->get_pipelines()) {
-      if (!pipeline->is_pipeline_finished()) {
-        SIRIUS_LOG_WARN("[execute] on query completion, pipeline {} was not finished",
-                        pipeline->get_pipeline_id());
-      }
       for (const auto& op_ref : pipeline->get_operators()) {
         const auto& op = op_ref.get();
         if (!op.finalized) {
-          SIRIUS_LOG_WARN("[execute] on query completion, operator '{}' (id={}) was not finalized",
+          SIRIUS_LOG_WARN("[execute] operator '{}' (id={}) was not finalized",
                           op.get_name(),
                           op.get_operator_id());
         }
@@ -404,7 +400,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 
   // Auto-log the enriched query plan
   pipeline::sirius_plan_printer plan_printer(new_scheduled);
-  SIRIUS_LOG_WARN("Query Plan:\n{}", plan_printer.render());
+  SIRIUS_LOG_INFO("Query Plan:\n{}", plan_printer.render());
 }
 
 }  // namespace sirius

@@ -202,7 +202,7 @@ void SiriusContext::QueryBegin(ClientContext& context)
     sirius::op::sirius_physical_operator::next_operator_id.store(0);
 
     auto query = context.GetCurrentQuery();
-    SIRIUS_LOG_WARN("QueryBegin: {}", query.substr(0, std::min(query.size(), size_t(120))));
+    SIRIUS_LOG_INFO("QueryBegin: {}", query.substr(0, std::min(query.size(), size_t(120))));
     bool query_cache_hit = false;
     if (config_.is_scan_caching_enabled()) {
       query_cache_hit = task_scheduler_->get_scan_executor().cache_scan_results_for_query(query);

@@ -206,7 +206,6 @@ std::future<void> task_scheduler::start_query()
   std::lock_guard<std::mutex> lock(_priority_scans_mutex);
   for (int i = 0; i < k_initial_scans && !_priority_scans.empty(); ++i) {
     auto* scan_op = _priority_scans.front();
-    SIRIUS_LOG_WARN("task_scheduler: scheduling consumer op_id={}", scan_op->get_operator_id());
     _task_creator->schedule(scan_op);
     _priority_scans.pop();
   }
