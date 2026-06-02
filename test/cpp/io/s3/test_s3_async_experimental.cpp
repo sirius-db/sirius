@@ -28,7 +28,11 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 
+#include <cuda_runtime_api.h>
+
 #include <arpa/inet.h>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -155,10 +159,76 @@ std::shared_ptr<s3_async_experimental_ioctx> make_async_ioctx(
     std::move(provider), request_timeout_s, std::string{}, true, max_connections, nullptr);
 }
 
+std::shared_ptr<s3_async_experimental_ioctx> make_device_async_ioctx(
+  std::shared_ptr<s3_request_authorizer> provider,
+  cucascade::memory::fixed_size_host_memory_resource& host_mr,
+  std::size_t max_connections = 4,
+  long request_timeout_s      = 20)
+{
+  return std::make_shared<s3_async_experimental_ioctx>(
+    std::move(provider), request_timeout_s, std::string{}, true, max_connections, &host_mr);
+}
+
 std::shared_ptr<s3_async_experimental_ioctx> make_live_async_ioctx(s3_test_env const& env,
                                                                    std::size_t max_connections = 4)
 {
   return make_async_ioctx(make_live_provider(env), max_connections);
+}
+
+void require_cuda_success(cudaError_t status)
+{
+  INFO(cudaGetErrorString(status));
+  REQUIRE(status == cudaSuccess);
+}
+
+struct fsmr_test_resources {
+  fsmr_test_resources(std::size_t block_size,
+                      std::size_t capacity,
+                      std::size_t memory_limit,
+                      std::size_t pool_size     = 1,
+                      std::size_t initial_pools = 0)
+    : upstream(0, true),
+      host_mr(0, upstream, memory_limit, capacity, block_size, pool_size, initial_pools)
+  {
+  }
+
+  cucascade::memory::numa_region_pinned_host_memory_resource upstream;
+  cucascade::memory::fixed_size_host_memory_resource host_mr;
+};
+
+std::vector<std::uint8_t> copy_device_to_host(rmm::device_buffer const& device, std::size_t bytes)
+{
+  REQUIRE(bytes <= device.size());
+  std::vector<std::uint8_t> host(bytes);
+  if (bytes > 0) {
+    require_cuda_success(cudaMemcpy(host.data(), device.data(), bytes, cudaMemcpyDeviceToHost));
+  }
+  return host;
+}
+
+void require_bytes_equal(std::vector<std::uint8_t> const& got,
+                         std::vector<std::uint8_t> const& expected,
+                         std::size_t offset)
+{
+  REQUIRE(offset + got.size() <= expected.size());
+  for (std::size_t i = 0; i < got.size(); ++i) {
+    CHECK(got[i] == expected[offset + i]);
+  }
+}
+
+void fill_device_buffer(rmm::device_buffer& device, int value, rmm::cuda_stream_view stream)
+{
+  if (device.size() == 0) return;
+  require_cuda_success(cudaMemsetAsync(device.data(), value, device.size(), stream.value()));
+  require_cuda_success(cudaStreamSynchronize(stream.value()));
+}
+
+std::size_t expected_chunks(std::size_t offset, std::size_t size, std::size_t file_size)
+{
+  if (size == 0 || offset >= file_size) return 0;
+  size                             = std::min(size, file_size - offset);
+  constexpr std::size_t chunk_size = sirius::io::CHUNK_SIZE;
+  return (size + chunk_size - 1) / chunk_size;
 }
 
 struct async_read_result {
@@ -1023,19 +1093,456 @@ TEST_CASE("async-curl S3 authorizer failures are reported without killing the re
   CHECK(bytes == got.size());
 }
 
-TEST_CASE("async-curl S3 device reads are guarded until Phase 2", "[.][s3][integration][asynccurl]")
+TEST_CASE("async-curl S3 sync device read copies a single chunk without stream sync",
+          "[.][s3][integration][asynccurl]")
 {
-  range_http_server server(test_payload(256));
-  auto ctx = make_scripted_async_ioctx(server);
+  auto payload = test_payload(4096);
+  range_http_server server(payload);
+  fsmr_test_resources memory(/*block_size=*/1 << 20,
+                             /*capacity=*/4 << 20,
+                             /*memory_limit=*/4 << 20,
+                             /*pool_size=*/4,
+                             /*initial_pools=*/1);
+  auto ctx = make_device_async_ioctx(std::make_shared<fixed_url_authorizer>(server.url()),
+                                     memory.host_mr,
+                                     /*max_connections=*/2);
+  auto obj = ctx->create_io_object("s3://bucket/object.bin");
+
+  auto const offset = std::size_t{123};
+  auto const size   = std::size_t{2048};
+  auto before_fsmr  = ctx->fsmr_borrows_total();
+  auto stream       = rmm::cuda_stream_default;
+  rmm::device_buffer dst(size, stream);
+
+  auto const got =
+    ctx->device_read(*obj, offset, size, static_cast<std::uint8_t*>(dst.data()), stream);
+
+  CHECK(got == size);
+  require_bytes_equal(copy_device_to_host(dst, got), payload, offset);
+  CHECK(ctx->device_copies_total() == 1);
+  CHECK(ctx->device_stream_sync_total() == 0);
+  CHECK(ctx->fsmr_borrows_total() == before_fsmr + 1);
+}
+
+TEST_CASE("async-curl S3 multi-chunk device read uses async copies without per-chunk sync",
+          "[.][s3][integration][asynccurl]")
+{
+  constexpr std::size_t payload_size = 3 * sirius::io::CHUNK_SIZE + 123;
+  auto payload                       = test_payload(payload_size);
+  range_http_server server(payload);
+  fsmr_test_resources memory(/*block_size=*/sirius::io::CHUNK_SIZE,
+                             /*capacity=*/8 * sirius::io::CHUNK_SIZE,
+                             /*memory_limit=*/8 * sirius::io::CHUNK_SIZE,
+                             /*pool_size=*/8,
+                             /*initial_pools=*/1);
+  auto ctx = make_device_async_ioctx(std::make_shared<fixed_url_authorizer>(server.url()),
+                                     memory.host_mr,
+                                     /*max_connections=*/4);
+  auto obj = ctx->create_io_object("s3://bucket/object.bin");
+
+  auto const chunks      = expected_chunks(0, payload.size(), payload.size());
+  auto const before_fsmr = ctx->fsmr_borrows_total();
+  REQUIRE(chunks >= 3);
+  auto stream = rmm::cuda_stream_default;
+  rmm::device_buffer dst(payload.size(), stream);
+
+  auto const got =
+    ctx->device_read(*obj, 0, payload.size(), static_cast<std::uint8_t*>(dst.data()), stream);
+
+  CHECK(got == payload.size());
+  require_bytes_equal(copy_device_to_host(dst, got), payload, 0);
+  CHECK(ctx->device_copies_total() == chunks);
+  CHECK(ctx->device_stream_sync_total() == 0);
+  CHECK(ctx->fsmr_borrows_total() == before_fsmr + chunks);
+}
+
+TEST_CASE("async-curl S3 async device read resolves once and copies bytes",
+          "[.][s3][integration][asynccurl]")
+{
+  auto payload = test_payload(8192);
+  range_http_server server(payload);
+  fsmr_test_resources memory(/*block_size=*/1 << 20,
+                             /*capacity=*/2 << 20,
+                             /*memory_limit=*/2 << 20,
+                             /*pool_size=*/2,
+                             /*initial_pools=*/1);
+  auto ctx = make_device_async_ioctx(std::make_shared<fixed_url_authorizer>(server.url()),
+                                     memory.host_mr,
+                                     /*max_connections=*/2);
+  auto obj = ctx->create_io_object("s3://bucket/object.bin");
+
+  auto const offset = std::size_t{321};
+  auto const size   = std::size_t{1024};
+  auto stream       = rmm::cuda_stream_default;
+  rmm::device_buffer dst(size, stream);
+  std::atomic<int> calls{0};
+  std::promise<async_read_result> done;
+  auto fut = done.get_future();
+
+  ctx->device_read_async_io(
+    *obj, offset, size, static_cast<std::uint8_t*>(dst.data()), stream, [&](auto bytes, auto ep) {
+      calls.fetch_add(1, std::memory_order_relaxed);
+      done.set_value({bytes, ep});
+    });
+
+  REQUIRE(fut.wait_for(5s) == std::future_status::ready);
+  auto result = fut.get();
+  CHECK(calls.load(std::memory_order_relaxed) == 1);
+  REQUIRE(result.ep == nullptr);
+  CHECK(result.bytes == size);
+  require_bytes_equal(copy_device_to_host(dst, result.bytes), payload, offset);
+}
+
+TEST_CASE("async-curl S3 device GET retries transient failures", "[.][s3][integration][asynccurl]")
+{
+  auto payload = test_payload(8192);
+  range_fault_policy fault;
+  fault.fail_first_gets = 2;
+  fault.fail_status     = 503;
+  fault.fail_reason     = "Service Unavailable";
+  range_http_server server(payload, 0ms, std::move(fault));
+  fsmr_test_resources memory(/*block_size=*/1 << 20,
+                             /*capacity=*/2 << 20,
+                             /*memory_limit=*/2 << 20,
+                             /*pool_size=*/2,
+                             /*initial_pools=*/1);
+  auto ctx = make_device_async_ioctx(std::make_shared<fixed_url_authorizer>(server.url()),
+                                     memory.host_mr,
+                                     /*max_connections=*/1);
   auto obj = ctx->create_io_object("s3://bucket/object.bin");
 
   auto stream = rmm::cuda_stream_default;
-  rmm::device_buffer dst(16, stream);
-  CHECK_THROWS_AS(ctx->device_read(*obj, 0, 16, static_cast<std::uint8_t*>(dst.data()), stream),
-                  std::logic_error);
-  CHECK_THROWS_AS(
-    ctx->device_read_async(*obj, 0, 16, static_cast<std::uint8_t*>(dst.data()), stream).get(),
-    std::logic_error);
+  rmm::device_buffer dst(1024, stream);
+  auto const got = ctx->device_read(*obj, 64, 1024, static_cast<std::uint8_t*>(dst.data()), stream);
+
+  CHECK(got == 1024);
+  require_bytes_equal(copy_device_to_host(dst, got), payload, 64);
+  CHECK(server.get_count() >= 3);
+  CHECK(ctx->device_stream_sync_total() == 0);
+}
+
+TEST_CASE("async-curl S3 device retry releases staging during backoff",
+          "[.][s3][integration][asynccurl]")
+{
+  constexpr std::size_t payload_size = 3 * sirius::io::CHUNK_SIZE;
+  auto payload                       = test_payload(payload_size);
+  range_fault_policy fault;
+  fault.fail_first_gets     = 1;
+  fault.fail_status         = 503;
+  fault.fail_reason         = "Service Unavailable";
+  fault.retry_after_seconds = 1;
+  range_http_server server(payload, 0ms, std::move(fault));
+  fsmr_test_resources memory(/*block_size=*/sirius::io::CHUNK_SIZE,
+                             /*capacity=*/sirius::io::CHUNK_SIZE,
+                             /*memory_limit=*/sirius::io::CHUNK_SIZE,
+                             /*pool_size=*/1,
+                             /*initial_pools=*/1);
+  auto before_free = memory.host_mr.get_free_blocks();
+  auto ctx         = make_device_async_ioctx(std::make_shared<fixed_url_authorizer>(server.url()),
+                                     memory.host_mr,
+                                     /*max_connections=*/1);
+  auto obj         = ctx->create_io_object("s3://bucket/object.bin");
+
+  auto stream = rmm::cuda_stream_default;
+  rmm::device_buffer dst(payload.size(), stream);
+
+  auto const got =
+    ctx->device_read(*obj, 0, payload.size(), static_cast<std::uint8_t*>(dst.data()), stream);
+
+  CHECK(got == payload.size());
+  require_bytes_equal(copy_device_to_host(dst, got), payload, 0);
+  CHECK(server.get_count() >= 4);
+  CHECK(memory.host_mr.get_free_blocks() == before_free);
+  CHECK(ctx->device_stream_sync_total() == 0);
+}
+
+TEST_CASE("async-curl S3 device staging peak stays within the active window",
+          "[.][s3][integration][asynccurl]")
+{
+  constexpr std::size_t payload_size = 8 * sirius::io::CHUNK_SIZE;
+  auto payload                       = test_payload(payload_size);
+  range_http_server server(payload);
+  fsmr_test_resources memory(/*block_size=*/sirius::io::CHUNK_SIZE,
+                             /*capacity=*/16 * sirius::io::CHUNK_SIZE,
+                             /*memory_limit=*/16 * sirius::io::CHUNK_SIZE,
+                             /*pool_size=*/16,
+                             /*initial_pools=*/1);
+  auto ctx = make_device_async_ioctx(std::make_shared<fixed_url_authorizer>(server.url()),
+                                     memory.host_mr,
+                                     /*max_connections=*/2);
+  auto obj = ctx->create_io_object("s3://bucket/object.bin");
+
+  auto stream = rmm::cuda_stream_default;
+  rmm::device_buffer dst(payload.size(), stream);
+
+  auto const got =
+    ctx->device_read(*obj, 0, payload.size(), static_cast<std::uint8_t*>(dst.data()), stream);
+
+  CHECK(got == payload.size());
+  require_bytes_equal(copy_device_to_host(dst, got), payload, 0);
+  CHECK(ctx->device_peak_inflight() >= 1);
+  CHECK(ctx->device_peak_inflight() <= 2);
+  CHECK(ctx->device_stream_sync_total() == 0);
+}
+
+TEST_CASE("async-curl S3 device reads fail cleanly before copy on non-retriable GET errors",
+          "[.][s3][integration][asynccurl]")
+{
+  auto payload = test_payload(2048);
+  range_fault_policy fault;
+  fault.always_fail = true;
+  fault.fail_status = 404;
+  fault.fail_reason = "Not Found";
+  range_http_server server(payload, 0ms, std::move(fault));
+  fsmr_test_resources memory(/*block_size=*/1 << 20,
+                             /*capacity=*/2 << 20,
+                             /*memory_limit=*/2 << 20,
+                             /*pool_size=*/2,
+                             /*initial_pools=*/1);
+  auto ctx = make_device_async_ioctx(std::make_shared<fixed_url_authorizer>(server.url()),
+                                     memory.host_mr,
+                                     /*max_connections=*/1);
+  auto obj = ctx->create_io_object("s3://bucket/object.bin");
+
+  auto stream = rmm::cuda_stream_default;
+  rmm::device_buffer dst(512, stream);
+  fill_device_buffer(dst, 0x5A, stream);
+  CHECK_THROWS(ctx->device_read(*obj, 0, 512, static_cast<std::uint8_t*>(dst.data()), stream));
+  CHECK(ctx->device_stream_sync_total() == 0);
+  auto got = copy_device_to_host(dst, dst.size());
+  CHECK(std::all_of(got.begin(), got.end(), [](std::uint8_t b) { return b == 0x5A; }));
+
+  range_fault_policy bad_range;
+  bad_range.response_mode = scripted_response_mode::interior_range_200_full_body;
+  range_http_server bad_range_server(payload, 0ms, std::move(bad_range));
+  fsmr_test_resources async_memory(/*block_size=*/1 << 20,
+                                   /*capacity=*/2 << 20,
+                                   /*memory_limit=*/2 << 20,
+                                   /*pool_size=*/2,
+                                   /*initial_pools=*/1);
+  auto async_ctx =
+    make_device_async_ioctx(std::make_shared<fixed_url_authorizer>(bad_range_server.url()),
+                            async_memory.host_mr,
+                            /*max_connections=*/1);
+  auto async_obj = async_ctx->create_io_object("s3://bucket/object.bin");
+
+  rmm::device_buffer async_dst(256, stream);
+  std::atomic<int> calls{0};
+  std::promise<async_read_result> done;
+  auto fut = done.get_future();
+  async_ctx->device_read_async_io(*async_obj,
+                                  64,
+                                  256,
+                                  static_cast<std::uint8_t*>(async_dst.data()),
+                                  stream,
+                                  [&](auto bytes, auto ep) {
+                                    calls.fetch_add(1, std::memory_order_relaxed);
+                                    done.set_value({bytes, ep});
+                                  });
+  REQUIRE(fut.wait_for(5s) == std::future_status::ready);
+  auto result = fut.get();
+  CHECK(calls.load(std::memory_order_relaxed) == 1);
+  CHECK(result.ep != nullptr);
+  CHECK(async_ctx->device_stream_sync_total() == 0);
+}
+
+TEST_CASE("async-curl S3 device staging blocks are returned and reusable",
+          "[.][s3][integration][asynccurl]")
+{
+  constexpr std::size_t payload_size = 3 * sirius::io::CHUNK_SIZE + 17;
+  auto payload                       = test_payload(payload_size);
+  range_http_server server(payload);
+  fsmr_test_resources memory(/*block_size=*/sirius::io::CHUNK_SIZE,
+                             /*capacity=*/4 * sirius::io::CHUNK_SIZE,
+                             /*memory_limit=*/4 * sirius::io::CHUNK_SIZE,
+                             /*pool_size=*/4,
+                             /*initial_pools=*/1);
+  auto before_free = memory.host_mr.get_free_blocks();
+  auto ctx         = make_device_async_ioctx(std::make_shared<fixed_url_authorizer>(server.url()),
+                                     memory.host_mr,
+                                     /*max_connections=*/2);
+  auto obj         = ctx->create_io_object("s3://bucket/object.bin");
+
+  auto stream = rmm::cuda_stream_default;
+  for (int pass = 0; pass < 2; ++pass) {
+    rmm::device_buffer dst(payload.size(), stream);
+    auto const got =
+      ctx->device_read(*obj, 0, payload.size(), static_cast<std::uint8_t*>(dst.data()), stream);
+    CHECK(got == payload.size());
+    require_bytes_equal(copy_device_to_host(dst, got), payload, 0);
+    CHECK(memory.host_mr.get_free_blocks() == before_free);
+  }
+}
+
+TEST_CASE("async-curl S3 device read guards missing FSMR, exhausted FSMR, and empty reads",
+          "[.][s3][integration][asynccurl]")
+{
+  SECTION("no FSMR fails device read but leaves host reads usable")
+  {
+    auto payload = test_payload(1024);
+    range_http_server server(payload);
+    auto ctx = make_scripted_async_ioctx(server);
+    auto obj = ctx->create_io_object("s3://bucket/object.bin");
+
+    auto stream = rmm::cuda_stream_default;
+    rmm::device_buffer dst(128, stream);
+    try {
+      (void)ctx->device_read(*obj, 0, 128, static_cast<std::uint8_t*>(dst.data()), stream);
+      FAIL("expected device read without FSMR to fail");
+    } catch (std::exception const& e) {
+      CHECK(std::string{e.what()}.find("host memory resource") != std::string::npos);
+    }
+
+    std::vector<std::uint8_t> host(32);
+    REQUIRE(ctx->host_read(*obj, 16, host.size(), host.data()) == host.size());
+    CHECK(std::equal(host.begin(), host.end(), payload.begin() + 16));
+  }
+
+  SECTION("single-block FSMR streams multi-chunk device reads")
+  {
+    constexpr std::size_t payload_size = 3 * sirius::io::CHUNK_SIZE;
+    auto payload                       = test_payload(payload_size);
+    range_http_server server(payload, 50ms);
+    fsmr_test_resources memory(/*block_size=*/sirius::io::CHUNK_SIZE,
+                               /*capacity=*/sirius::io::CHUNK_SIZE,
+                               /*memory_limit=*/sirius::io::CHUNK_SIZE,
+                               /*pool_size=*/1,
+                               /*initial_pools=*/1);
+    auto before_free = memory.host_mr.get_free_blocks();
+    auto ctx         = make_device_async_ioctx(std::make_shared<fixed_url_authorizer>(server.url()),
+                                       memory.host_mr,
+                                       /*max_connections=*/1);
+    auto obj         = ctx->create_io_object("s3://bucket/object.bin");
+
+    auto const chunks      = expected_chunks(0, payload.size(), payload.size());
+    auto const before_fsmr = ctx->fsmr_borrows_total();
+    REQUIRE(chunks == 3);
+    auto stream = rmm::cuda_stream_default;
+    rmm::device_buffer dst(payload.size(), stream);
+
+    auto const got =
+      ctx->device_read(*obj, 0, payload.size(), static_cast<std::uint8_t*>(dst.data()), stream);
+
+    CHECK(got == payload.size());
+    require_bytes_equal(copy_device_to_host(dst, got), payload, 0);
+    CHECK(memory.host_mr.get_free_blocks() == before_free);
+    CHECK(ctx->fsmr_borrows_total() == before_fsmr + chunks);
+    CHECK(ctx->device_stream_sync_total() == 0);
+  }
+
+  SECTION("misconfigured block smaller than chunk fails")
+  {
+    auto payload = test_payload(4096);
+    range_http_server server(payload);
+    fsmr_test_resources memory(/*block_size=*/2048,
+                               /*capacity=*/4 * 2048,
+                               /*memory_limit=*/4 * 2048,
+                               /*pool_size=*/4,
+                               /*initial_pools=*/1);
+    auto ctx = make_device_async_ioctx(std::make_shared<fixed_url_authorizer>(server.url()),
+                                       memory.host_mr,
+                                       /*max_connections=*/1);
+    auto obj = ctx->create_io_object("s3://bucket/object.bin");
+
+    auto stream = rmm::cuda_stream_default;
+    rmm::device_buffer dst(payload.size(), stream);
+    try {
+      (void)ctx->device_read(
+        *obj, 0, payload.size(), static_cast<std::uint8_t*>(dst.data()), stream);
+      FAIL("expected block-size mismatch to fail");
+    } catch (std::exception const& e) {
+      CHECK(std::string{e.what()}.find("block size") != std::string::npos);
+    }
+  }
+
+  SECTION("empty and past-EOF reads return zero without borrowing")
+  {
+    auto payload = test_payload(128);
+    range_http_server server(payload);
+    fsmr_test_resources memory(/*block_size=*/1 << 20,
+                               /*capacity=*/1 << 20,
+                               /*memory_limit=*/1 << 20,
+                               /*pool_size=*/1,
+                               /*initial_pools=*/1);
+    auto ctx         = make_device_async_ioctx(std::make_shared<fixed_url_authorizer>(server.url()),
+                                       memory.host_mr,
+                                       /*max_connections=*/1);
+    auto obj         = ctx->create_io_object("s3://bucket/object.bin");
+    auto before_fsmr = ctx->fsmr_borrows_total();
+    auto stream      = rmm::cuda_stream_default;
+    rmm::device_buffer dst(16, stream);
+
+    CHECK(ctx->device_read(*obj, 0, 0, static_cast<std::uint8_t*>(dst.data()), stream) == 0);
+    CHECK(ctx->device_read(
+            *obj, payload.size(), 16, static_cast<std::uint8_t*>(dst.data()), stream) == 0);
+    CHECK(ctx->fsmr_borrows_total() == before_fsmr);
+  }
+}
+
+TEST_CASE("async-curl S3 shutdown resolves in-flight device reads exactly once",
+          "[.][s3][integration][asynccurl]")
+{
+  auto payload = test_payload(2 * sirius::io::CHUNK_SIZE);
+  range_http_server server(payload, 5s);
+  fsmr_test_resources memory(/*block_size=*/sirius::io::CHUNK_SIZE,
+                             /*capacity=*/2 * sirius::io::CHUNK_SIZE,
+                             /*memory_limit=*/2 * sirius::io::CHUNK_SIZE,
+                             /*pool_size=*/2,
+                             /*initial_pools=*/1);
+  auto ctx = make_device_async_ioctx(std::make_shared<fixed_url_authorizer>(server.url()),
+                                     memory.host_mr,
+                                     /*max_connections=*/1,
+                                     /*request_timeout_s=*/30);
+  auto obj = ctx->create_io_object("s3://bucket/object.bin");
+
+  auto stream = rmm::cuda_stream_default;
+  rmm::device_buffer dst(payload.size(), stream);
+  std::atomic<int> calls{0};
+  std::promise<async_read_result> done;
+  auto fut = done.get_future();
+  ctx->device_read_async_io(*obj,
+                            0,
+                            payload.size(),
+                            static_cast<std::uint8_t*>(dst.data()),
+                            stream,
+                            [&](auto bytes, auto ep) {
+                              calls.fetch_add(1, std::memory_order_relaxed);
+                              done.set_value({bytes, ep});
+                            });
+
+  auto const before = std::chrono::steady_clock::now();
+  ctx.reset();
+  auto const elapsed = std::chrono::steady_clock::now() - before;
+
+  REQUIRE(fut.wait_for(2s) == std::future_status::ready);
+  auto result = fut.get();
+  CHECK(calls.load(std::memory_order_relaxed) == 1);
+  CHECK(result.ep != nullptr);
+  CHECK(elapsed < 2s);
+  auto message = exception_message(result.ep);
+  CHECK(message.find("handler resolved by safety net") == std::string::npos);
+}
+
+TEST_CASE("async-curl S3 sync host_read authorizer failures do not poison the ioctx",
+          "[.][s3][integration][asynccurl]")
+{
+  auto payload = test_payload(512);
+  range_http_server server(payload);
+  auto provider = std::make_shared<get_throwing_then_fixed_authorizer>(server.url(), 1);
+  auto ctx      = make_async_ioctx(std::move(provider), 4);
+  auto obj      = ctx->create_io_object("s3://bucket/object.bin");
+
+  std::vector<std::uint8_t> failed(16);
+  try {
+    (void)ctx->host_read(*obj, 32, failed.size(), failed.data());
+    FAIL("expected sync host_read authorizer failure");
+  } catch (std::exception const& e) {
+    CHECK(std::string{e.what()}.find("scripted authorizer failure") != std::string::npos);
+  }
+
+  std::vector<std::uint8_t> got(16);
+  REQUIRE(ctx->host_read(*obj, 64, got.size(), got.data()) == got.size());
+  CHECK(std::equal(got.begin(), got.end(), payload.begin() + 64));
 }
 
 TEST_CASE("async-curl S3 experimental ioctx is isolated from production s3_ioctx",

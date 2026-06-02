@@ -57,22 +57,16 @@ class s3_async_experimental_ioctx : public templated_ioctx<s3_reactor> {
                                  std::span<cudf::host_span<std::byte>> dst,
                                  io_completion_handler handler) override;
 
-  // -- Device reads land in Phase 2 ------------------------------------------
-  std::size_t device_read_io(sirius_io_object& obj,
-                             std::size_t offset,
-                             std::size_t size,
-                             std::uint8_t* dst,
-                             rmm::cuda_stream_view stream) override;
-  void device_read_async_io(sirius_io_object& obj,
-                            std::size_t offset,
-                            std::size_t size,
-                            std::uint8_t* dst,
-                            rmm::cuda_stream_view stream,
-                            io_completion_handler handler) override;
+  // Device reads use the inherited templated_ioctx path (1 MiB chunking ->
+  // reactor().enqueue_bulk): async GET into a pinned staging block + async H2D
+  // copy completed by a stream callback, no per-chunk cudaStreamSynchronize.
 
   // -- F5: observability aggregated across reactors --------------------------
   [[nodiscard]] std::uint64_t bytes_read_total() const noexcept;
   [[nodiscard]] std::uint64_t fsmr_borrows_total() const noexcept;
+  [[nodiscard]] std::uint64_t device_copies_total() const noexcept;
+  [[nodiscard]] std::uint64_t device_stream_sync_total() const noexcept;
+  [[nodiscard]] std::uint64_t device_peak_inflight() const noexcept;
   std::size_t head_object_size(std::string_view bucket, std::string_view key);
 
  private:

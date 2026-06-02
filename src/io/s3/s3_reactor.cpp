@@ -16,6 +16,7 @@
 
 #include "io/s3/s3_reactor.hpp"
 
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <curl/curl.h>
 
 #include <algorithm>
@@ -208,7 +209,7 @@ std::exception_ptr validate_range(std::string_view bucket,
 // ---------------------------------------------------------------------------
 
 struct s3_reactor::transfer {
-  host_read_req_type req;
+  host_read_req_type req;  // device: req.dst is the staging block, size/offset are the GET range
   std::size_t attempt{1};
   void* easy{nullptr};  // CURL*
   curl_slist* hdrs{nullptr};
@@ -216,6 +217,18 @@ struct s3_reactor::transfer {
   std::string range_header;
   buf_sink sink{};
   header_capture hc{};
+
+  // device-read stage (all default for a host transfer)
+  bool is_device{false};
+  std::uint8_t* device_dst{nullptr};  // final GPU destination
+  std::size_t data_off{0};            // offset within the staging block
+  std::size_t data_size{0};           // bytes to copy to the GPU
+  cudaStream_t stream{nullptr};
+  int device_id{-1};
+  cucascade::memory::fixed_size_host_memory_resource::fixed_multiple_blocks_allocation staging;
+  std::atomic<bool> cuda_done{false};
+  cudaError_t cuda_status{cudaSuccess};
+  s3_reactor* owner{nullptr};  // for the stream callback (wake + counter)
 };
 
 // ---------------------------------------------------------------------------
@@ -418,12 +431,12 @@ void s3_reactor::host_enqueue_bulk(std::span<host_read_req_type> batch)
 
 void s3_reactor::enqueue_bulk(std::span<device_read_req_type> batch)
 {
-  for (auto& r : batch) {
-    if (r.ctx)
-      r.ctx->chunk_failed(
-        std::make_exception_ptr(std::logic_error("s3_reactor: device reads land in Phase 2")));
+  {
+    std::lock_guard<std::mutex> lk(_mtx);
+    for (auto& r : batch)
+      _incoming_device.push_back(std::move(r));
   }
-  throw std::logic_error("s3_reactor: device reads land in Phase 2");
+  interrupt();
 }
 
 // ---------------------------------------------------------------------------
@@ -443,6 +456,51 @@ void s3_reactor::drain_incoming()
     t->attempt = 1;
     _pending.push_back(t);
   }
+}
+
+void s3_reactor::drain_incoming_device()
+{
+  std::deque<device_read_req_type> taken;
+  {
+    std::lock_guard<std::mutex> lk(_mtx);
+    taken.swap(_incoming_device);
+  }
+  for (auto& dr : taken) {
+    if (_cfg.host_memory_resource == nullptr) {
+      if (dr.ctx)
+        dr.ctx->chunk_failed(std::make_exception_ptr(std::runtime_error(
+          "s3_reactor: device reads require a host memory resource (none configured)")));
+      continue;
+    }
+    // Build the device transfer now; its staging block is borrowed lazily at
+    // submit time (submit_pending) so the pinned footprint tracks the active
+    // window rather than the whole request.
+    auto* t       = new transfer{};
+    t->req.handle = dr.handle;
+    t->req.offset = dr.file_off;
+    t->req.size   = dr.io_size;
+    t->req.dst    = nullptr;  // set once staging is borrowed
+    t->req.ctx    = dr.ctx;
+    t->attempt    = 1;
+    t->is_device  = true;
+    t->device_dst = dr.dst;
+    t->data_off   = dr.data_off;
+    t->data_size  = dr.data_size;
+    t->stream     = dr.stream;
+    t->device_id  = dr.device_id;
+    t->owner      = this;
+    _pending.push_back(t);
+  }
+}
+
+std::size_t s3_reactor::device_blocks_in_flight() const
+{
+  std::size_t n = _copying.size();
+  for (auto const& [easy, t] : _inflight) {
+    (void)easy;
+    if (t->is_device) ++n;
+  }
+  return n;
 }
 
 void s3_reactor::promote_due_retries()
@@ -501,9 +559,53 @@ void s3_reactor::submit_pending()
 {
   while (_inflight.size() < _cfg.max_connections && !_pending.empty()) {
     transfer* t = _pending.front();
+
+    // Device transfers borrow their staging block here, not at drain, so blocks
+    // are reused as earlier chunks complete (uring-style streaming) and the
+    // pinned footprint is bounded by the active window. A retried device GET
+    // already holds its block (staging != null) and skips this.
+    if (t->is_device && !t->staging) {
+      // Unified device window: bound GETs-in-flight + H2D copies (each holds one
+      // staging block) to max_connections, so the pinned footprint stays bounded
+      // even when the network outruns the H2D copies. Wait for a copy to drain.
+      if (device_blocks_in_flight() >= _cfg.max_connections) break;
+      auto* mr = _cfg.host_memory_resource;
+      if (mr->get_block_size() < t->req.size) {
+        // One block can't hold the chunk (misconfigured pool) — never satisfiable.
+        _pending.pop_front();
+        if (t->req.ctx)
+          t->req.ctx->chunk_failed(std::make_exception_ptr(std::runtime_error(
+            "s3_reactor: FSMR block size (" + std::to_string(mr->get_block_size()) +
+            ") is smaller than the device chunk size (" + std::to_string(t->req.size) + ")")));
+        delete t;
+        continue;
+      }
+      try {
+        t->staging = mr->allocate_multiple_blocks(t->req.size);
+      } catch (...) {
+        // Pool momentarily exhausted. If device work is in flight it will free a
+        // block shortly — leave this chunk pending and retry next loop. If
+        // nothing is in flight to free one, the pool can't satisfy even a single
+        // chunk: fail permanently rather than spin.
+        if (has_device_in_flight()) break;
+        _pending.pop_front();
+        if (t->req.ctx) t->req.ctx->chunk_failed(std::current_exception());
+        delete t;
+        continue;
+      }
+      _fsmr_borrows_total.fetch_add(1, std::memory_order_relaxed);
+      t->req.dst = reinterpret_cast<std::uint8_t*>(t->staging->at(0).data());
+    }
+
     _pending.pop_front();
     try {
       build_and_add(t);  // may throw (authorize / init / add_handle) — never escapes the worker
+      if (t->is_device) {
+        // single-writer (worker thread): track the high-water mark of held blocks
+        auto n = static_cast<std::uint64_t>(device_blocks_in_flight());
+        if (n > _device_peak_inflight.load(std::memory_order_relaxed))
+          _device_peak_inflight.store(n, std::memory_order_relaxed);
+      }
     } catch (...) {
       auto ep = std::current_exception();
       if (t->easy != nullptr) {
@@ -529,6 +631,14 @@ void s3_reactor::schedule_retry(transfer* t, std::chrono::steady_clock::duration
   if (t->hdrs != nullptr) curl_slist_free_all(t->hdrs);
   t->easy = nullptr;
   t->hdrs = nullptr;
+  // A device transfer releases its staging block during backoff so the retry
+  // queue holds only metadata (not pinned memory); submit_pending re-borrows a
+  // block when the retry is promoted. Keeps the pinned footprint bounded by the
+  // active window even under a retry storm.
+  if (t->is_device && t->staging) {
+    t->staging.reset();
+    t->req.dst = nullptr;
+  }
   ++t->attempt;
   _retry_queue.emplace(std::chrono::steady_clock::now() + delay, t);
 }
@@ -551,6 +661,100 @@ void s3_reactor::finish(transfer* t, std::exception_ptr ep)
     if (t->req.ctx) t->req.ctx->chunk_done();
   }
   delete t;
+}
+
+void s3_reactor::cleanup_easy(transfer* t)
+{
+  if (t->easy != nullptr) {
+    curl_multi_remove_handle(static_cast<CURLM*>(_multi), static_cast<CURL*>(t->easy));
+    curl_easy_cleanup(static_cast<CURL*>(t->easy));
+    t->easy = nullptr;
+  }
+  if (t->hdrs != nullptr) {
+    curl_slist_free_all(t->hdrs);
+    t->hdrs = nullptr;
+  }
+}
+
+void s3_reactor::start_device_copy(transfer* t)
+{
+  // A sibling chunk already failed: don't bother copying, just decrement.
+  if (t->req.ctx && t->req.ctx->failed.load(std::memory_order_relaxed)) {
+    t->req.ctx->chunk_done();
+    delete t;  // ~transfer returns the staging block
+    return;
+  }
+  if (t->device_id >= 0) {
+    cudaError_t se = cudaSetDevice(t->device_id);
+    if (se != cudaSuccess) {
+      cudaGetLastError();  // drain the sticky error; no copy issued yet
+      if (t->req.ctx)
+        t->req.ctx->chunk_failed(std::make_exception_ptr(std::runtime_error(
+          std::string{"s3_reactor: cudaSetDevice failed: "} + cudaGetErrorString(se))));
+      delete t;  // ~transfer returns the staging block
+      return;
+    }
+  }
+  auto* host = reinterpret_cast<std::uint8_t*>(t->staging->at(0).data());
+  t->cuda_done.store(false, std::memory_order_relaxed);
+  t->cuda_status = cudaSuccess;
+  cudaError_t e  = cudaMemcpyAsync(
+    t->device_dst, host + t->data_off, t->data_size, cudaMemcpyHostToDevice, t->stream);
+  if (e != cudaSuccess) {
+    cudaGetLastError();  // drain the sticky error; nothing was queued, staging is free
+    if (t->req.ctx)
+      t->req.ctx->chunk_failed(std::make_exception_ptr(std::runtime_error(
+        std::string{"s3_reactor: cudaMemcpyAsync (H2D) failed: "} + cudaGetErrorString(e))));
+    delete t;  // ~transfer returns the staging block
+    return;
+  }
+  // Completion is signaled by the callback — NO cudaStreamSynchronize on success.
+  cudaError_t ce = cudaStreamAddCallback(t->stream, &s3_reactor::cuda_copy_done, t, 0);
+  if (ce != cudaSuccess) {
+    cudaGetLastError();
+    // The copy is already queued and may be reading from the staging block, so
+    // drain the stream before freeing it (delete t) to avoid a use-after-free.
+    cudaStreamSynchronize(t->stream);
+    _device_stream_sync_total.fetch_add(1, std::memory_order_relaxed);
+    if (t->req.ctx)
+      t->req.ctx->chunk_failed(std::make_exception_ptr(std::runtime_error(
+        std::string{"s3_reactor: cudaStreamAddCallback failed: "} + cudaGetErrorString(ce))));
+    delete t;  // ~transfer returns the staging block
+    return;
+  }
+  _copying.push_back(t);
+}
+
+void s3_reactor::poll_device_copies()
+{
+  for (auto it = _copying.begin(); it != _copying.end();) {
+    transfer* t = *it;
+    if (!t->cuda_done.load(std::memory_order_acquire)) {
+      ++it;
+      continue;
+    }
+    if (t->cuda_status != cudaSuccess) {
+      if (t->req.ctx)
+        t->req.ctx->chunk_failed(std::make_exception_ptr(std::runtime_error(
+          std::string{"s3_reactor: H2D copy failed: "} + cudaGetErrorString(t->cuda_status))));
+    } else {
+      _bytes_read_total.fetch_add(t->data_size, std::memory_order_relaxed);
+      if (t->req.ctx) t->req.ctx->chunk_done();
+    }
+    it = _copying.erase(it);
+    delete t;  // ~transfer returns the staging block
+  }
+}
+
+void CUDART_CB s3_reactor::cuda_copy_done(cudaStream_t, cudaError_t status, void* userdata)
+{
+  auto* t        = static_cast<transfer*>(userdata);
+  t->cuda_status = status;  // write before the release-store
+  t->cuda_done.store(true, std::memory_order_release);
+  if (t->owner != nullptr) {
+    t->owner->_device_copies_total.fetch_add(1, std::memory_order_relaxed);
+    curl_multi_wakeup(static_cast<CURLM*>(t->owner->_multi));  // unified wake point
+  }
 }
 
 void s3_reactor::cancel_all_on_shutdown()
@@ -583,13 +787,33 @@ void s3_reactor::cancel_all_on_shutdown()
     if (t->req.ctx) t->req.ctx->chunk_failed(cancelled());
     delete t;
   }
+  // device copies still in flight: synchronize each distinct stream once so the
+  // H2D copy is done before we free the staging block (no use-after-free), then
+  // fail + delete. This is the only place device_stream_sync_total moves.
+  std::vector<cudaStream_t> synced;
+  for (auto* t : _copying) {
+    if (std::find(synced.begin(), synced.end(), t->stream) == synced.end()) {
+      cudaStreamSynchronize(t->stream);
+      _device_stream_sync_total.fetch_add(1, std::memory_order_relaxed);
+      synced.push_back(t->stream);
+    }
+    if (t->req.ctx) t->req.ctx->chunk_failed(cancelled());
+    delete t;
+  }
+  _copying.clear();
+
   std::deque<host_read_req_type> incoming;
+  std::deque<device_read_req_type> incoming_device;
   {
     std::lock_guard<std::mutex> lk(_mtx);
     incoming.swap(_incoming);
+    incoming_device.swap(_incoming_device);
   }
   for (auto& r : incoming) {
     if (r.ctx) r.ctx->chunk_failed(cancelled());
+  }
+  for (auto& dr : incoming_device) {
+    if (dr.ctx) dr.ctx->chunk_failed(cancelled());
   }
 }
 
@@ -598,6 +822,7 @@ void s3_reactor::worker_loop()
   auto* multi = static_cast<CURLM*>(_multi);
   while (true) {
     drain_incoming();
+    drain_incoming_device();
     if (_stop.load(std::memory_order_acquire)) {
       cancel_all_on_shutdown();
       break;
@@ -655,21 +880,29 @@ void s3_reactor::worker_loop()
         os << "s3_reactor: GET " << t->req.handle->bucket << "/" << t->req.handle->key
            << " failed after " << _cfg.max_retry_attempts << " attempt(s); last: " << last_why;
         finish(t, std::make_exception_ptr(std::runtime_error(os.str())));
+      } else if (ep) {
+        finish(t, ep);  // failure (host or device GET) -> chunk_failed (releases staging)
+      } else if (t->is_device) {
+        cleanup_easy(t);
+        start_device_copy(t);  // device GET ok -> async H2D copy, completed by the callback
       } else {
-        finish(t, ep);  // ep nullptr -> chunk_done; else chunk_failed
+        finish(t, nullptr);  // host GET ok -> chunk_done
       }
     }
 
     submit_pending();
+    poll_device_copies();
 
     // Sleep until socket activity, a wakeup, or the next due retry (cap 100ms).
-    int timeout_ms = 100;
+    // The stream callback wakes us via curl_multi_wakeup, but cap the wait while
+    // copies are in flight as insurance against a missed wakeup.
+    int timeout_ms = _copying.empty() ? 100 : 20;
     if (!_retry_queue.empty()) {
       auto next = _retry_queue.begin()->first;
       auto ms   = std::chrono::duration_cast<std::chrono::milliseconds>(
                   next - std::chrono::steady_clock::now())
                   .count();
-      timeout_ms = static_cast<int>(std::clamp<long>(ms, 0, 100));
+      timeout_ms = std::min(timeout_ms, static_cast<int>(std::clamp<long>(ms, 0, 100)));
     }
     curl_multi_poll(multi, nullptr, 0, timeout_ms, nullptr);
   }

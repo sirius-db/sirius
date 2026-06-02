@@ -22,6 +22,8 @@
 
 #include <cudf/io/text/byte_range_info.hpp>
 
+#include <cuda_runtime.h>
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -34,6 +36,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 namespace cucascade::memory {
 class fixed_size_host_memory_resource;
@@ -89,12 +92,16 @@ class s3_async_io_object : public sirius_io_object {
 /// Single-threaded async-S3 reactor over libcurl's multi interface. Models the
 /// reactor concept consumed by @c templated_ioctx.
 ///
-/// Phase 0: host reads over a curl_multi worker loop with bounded submit; sync
-/// host_read/HEAD on a separate blocking easy path. Phase 1 adds: an async
-/// retry state machine (transient curl / 408 / 429 / 5xx, honoring Retry-After),
-/// a sync retry loop, range-response validation (Content-Range / overflow),
-/// exception-safe transfer setup, and connection-cache limits. Device reads land
-/// in Phase 2.
+/// Host reads run over a curl_multi worker loop with bounded submit; sync
+/// host_read/HEAD use a separate blocking easy path. A retriable completion
+/// (transient curl / 408 / 429 / 5xx, honoring Retry-After) re-arms after a
+/// backoff; range responses are validated (Content-Range / overflow); request
+/// setup is exception-safe; the connection cache is bounded by max_connections.
+/// Device reads stream through a bounded pool of pinned staging blocks: each
+/// chunk borrows one block at submit time (so the pinned footprint tracks the
+/// active window, not the whole request), the range is GET'd into it, then an
+/// async cudaMemcpyAsync H2D copy is completed by a stream callback — no
+/// per-chunk cudaStreamSynchronize on the read path.
 class s3_reactor {
  public:
   struct config {
@@ -167,18 +174,51 @@ class s3_reactor {
   {
     return _fsmr_borrows_total.load(std::memory_order_relaxed);
   }
+  /// Number of completed H2D copies (stream-callback fires; success or failure).
+  [[nodiscard]] std::uint64_t device_copies_total() const noexcept
+  {
+    return _device_copies_total.load(std::memory_order_relaxed);
+  }
+  /// `cudaStreamSynchronize` calls the reactor issued — 0 across any device read
+  /// that completes without shutdown (the observable proxy for "no per-chunk
+  /// sync"); only the shutdown drain bumps it.
+  [[nodiscard]] std::uint64_t device_stream_sync_total() const noexcept
+  {
+    return _device_stream_sync_total.load(std::memory_order_relaxed);
+  }
+  /// High-water mark of staging blocks held concurrently (device GETs in flight
+  /// plus H2D copies). Bounded by max_connections — the observable proxy for the
+  /// pinned-memory window staying bounded regardless of request size.
+  [[nodiscard]] std::uint64_t device_peak_inflight() const noexcept
+  {
+    return _device_peak_inflight.load(std::memory_order_relaxed);
+  }
 
  private:
   struct transfer;  // per-async-request state (defined in the .cpp)
 
   void worker_loop();
   void drain_incoming();
+  void drain_incoming_device();  // borrows staging, builds device GET transfers
   void promote_due_retries();
   void submit_pending();  // bounded by max_connections
   void build_and_add(transfer* t);
   void schedule_retry(transfer* t, std::chrono::steady_clock::duration delay);
+  void cleanup_easy(transfer* t);  // remove from multi + free easy/slist (no completion)
+  /// Staging blocks held right now: device GETs in _inflight + H2D copies.
+  [[nodiscard]] std::size_t device_blocks_in_flight() const;
+  [[nodiscard]] bool has_device_in_flight() const  // a device GET/copy will free a block
+  {
+    return device_blocks_in_flight() > 0;
+  }
+  void start_device_copy(transfer* t);              // cudaMemcpyAsync H2D + stream callback
+  void poll_device_copies();                        // reap callback-signaled copies -> chunk_done
   void finish(transfer* t, std::exception_ptr ep);  // chunk_done/chunk_failed + cleanup
   void cancel_all_on_shutdown();
+
+  /// Stream callback (userdata = transfer*): records status, flags done, wakes
+  /// the worker. Mirrors uring_reactor's cuda_copy_cb — fires even on error.
+  static void CUDART_CB cuda_copy_done(cudaStream_t stream, cudaError_t status, void* userdata);
 
   std::chrono::steady_clock::duration backoff_delay(
     std::size_t attempt, std::optional<std::chrono::milliseconds> retry_after) const;
@@ -200,13 +240,18 @@ class s3_reactor {
   std::atomic<bool> _stop{false};
 
   std::mutex _mtx;
-  std::deque<host_read_req_type> _incoming;  // newly enqueued reqs (API side)
-  std::deque<transfer*> _pending;            // wrapped, awaiting bounded submit
+  std::deque<host_read_req_type> _incoming;           // newly enqueued host reqs (API side)
+  std::deque<device_read_req_type> _incoming_device;  // newly enqueued device chunks (API side)
+  std::deque<transfer*> _pending;                     // wrapped, awaiting bounded submit
   std::multimap<std::chrono::steady_clock::time_point, transfer*> _retry_queue;
-  std::unordered_map<void*, transfer*> _inflight;  // easy handle -> transfer
+  std::unordered_map<void*, transfer*> _inflight;  // easy handle -> transfer (GET in flight)
+  std::vector<transfer*> _copying;                 // device transfers in the H2D-copy phase
 
   std::atomic<std::uint64_t> _bytes_read_total{0};
   std::atomic<std::uint64_t> _fsmr_borrows_total{0};
+  std::atomic<std::uint64_t> _device_copies_total{0};
+  std::atomic<std::uint64_t> _device_peak_inflight{0};
+  std::atomic<std::uint64_t> _device_stream_sync_total{0};
 };
 
 }  // namespace sirius::io::s3

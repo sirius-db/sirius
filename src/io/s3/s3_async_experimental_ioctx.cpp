@@ -123,24 +123,6 @@ void s3_async_experimental_ioctx::host_read_ranges_async_io(
   reactor().host_enqueue_bulk(std::span<s3_reactor::host_read_req_type>(reqs.data(), reqs.size()));
 }
 
-std::size_t s3_async_experimental_ioctx::device_read_io(
-  sirius_io_object&, std::size_t, std::size_t, std::uint8_t*, rmm::cuda_stream_view)
-{
-  throw std::logic_error("s3_async_experimental_ioctx: device reads land in Phase 2");
-}
-
-void s3_async_experimental_ioctx::device_read_async_io(sirius_io_object&,
-                                                       std::size_t,
-                                                       std::size_t,
-                                                       std::uint8_t*,
-                                                       rmm::cuda_stream_view,
-                                                       io_completion_handler handler)
-{
-  handler(0,
-          std::make_exception_ptr(
-            std::logic_error("s3_async_experimental_ioctx: device reads land in Phase 2")));
-}
-
 std::uint64_t s3_async_experimental_ioctx::bytes_read_total() const noexcept
 {
   std::uint64_t total = 0;
@@ -154,6 +136,32 @@ std::uint64_t s3_async_experimental_ioctx::fsmr_borrows_total() const noexcept
   std::uint64_t total = 0;
   for (auto const& r : _reactors)
     total += r->fsmr_borrows_total();
+  return total;
+}
+
+std::uint64_t s3_async_experimental_ioctx::device_copies_total() const noexcept
+{
+  std::uint64_t total = 0;
+  for (auto const& r : _reactors)
+    total += r->device_copies_total();
+  return total;
+}
+
+std::uint64_t s3_async_experimental_ioctx::device_stream_sync_total() const noexcept
+{
+  std::uint64_t total = 0;
+  for (auto const& r : _reactors)
+    total += r->device_stream_sync_total();
+  return total;
+}
+
+std::uint64_t s3_async_experimental_ioctx::device_peak_inflight() const noexcept
+{
+  // sum the per-reactor peaks: a safe upper bound on concurrent staging blocks
+  // (exact for the single-reactor S3 backend).
+  std::uint64_t total = 0;
+  for (auto const& r : _reactors)
+    total += r->device_peak_inflight();
   return total;
 }
 
