@@ -8,7 +8,7 @@
 #include "catch.hpp"
 #include "io/prefetching_cache.hpp"
 #include "io/s3/s3_ioctx.hpp"
-#include "io/s3/sirius_sigv4_credential_provider.hpp"
+#include "io/s3/sirius_sigv4_authorizer.hpp"
 #include "scan_manager/parquet_metadata.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_config.hpp"
@@ -40,7 +40,7 @@ using sirius::io::sirius_ioctx;
 using sirius::io::uring_ioctx;
 using sirius::io::s3::s3_ioctx;
 using sirius::io::s3::s3_ioctx_config;
-using sirius::io::s3::sirius_sigv4_credential_provider;
+using sirius::io::s3::sirius_sigv4_presigned_authorizer;
 using sirius::io::s3::static_credentials;
 using sirius::scan_manager::parquet_metadata;
 using sirius::scan_manager::scan_manager_config;
@@ -178,7 +178,7 @@ s3_ioctx_config make_s3_config(s3_test_env const& env)
   creds.secret_access_key = env.secret_key;
 
   s3_ioctx_config cfg{};
-  cfg.creds = std::make_shared<sirius_sigv4_credential_provider>(
+  cfg.creds = std::make_shared<sirius_sigv4_presigned_authorizer>(
     std::move(creds), env.region, env.endpoint, 30min);
   cfg.max_connections    = 4;
   cfg.request_timeout_s  = 20;

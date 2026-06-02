@@ -59,6 +59,7 @@ struct s3_test_env {
   std::string access_key;
   std::string secret_key;
   std::string bucket;
+  std::string session_token;
 };
 
 std::optional<s3_test_env> read_s3_test_env()
@@ -76,7 +77,8 @@ std::optional<s3_test_env> read_s3_test_env()
                      env_or("SIRIUS_TEST_S3_REGION", "us-east-1"),
                      std::move(access_key),
                      std::move(secret_key),
-                     std::move(bucket)};
+                     std::move(bucket),
+                     env_or("SIRIUS_TEST_S3_SESSION_TOKEN")};
 }
 
 bool skip_if_no_s3_env(std::optional<s3_test_env> const& env)
@@ -87,6 +89,18 @@ bool skip_if_no_s3_env(std::optional<s3_test_env> const& env)
   }
   SUCCEED("SIRIUS_TEST_S3_* not set; skipping live S3 SQL-surface test");
   return true;
+}
+
+std::optional<s3_test_env> require_aws_live_env()
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return std::nullopt; }
+  if (env->session_token.empty()) {
+    FAIL(
+      "SIRIUS_TEST_S3_SESSION_TOKEN is required for live AWS tests; use assume-role "
+      "temporary credentials");
+  }
+  return env;
 }
 
 std::string s3_uri(std::string_view bucket, std::string_view key)
@@ -112,6 +126,15 @@ std::string sql_quote(std::string_view value)
 }
 
 std::string yaml_quote(std::string const& value) { return sql_quote(value); }
+
+std::string read_text_file(fs::path const& path)
+{
+  std::ifstream in(path);
+  REQUIRE(in);
+  std::ostringstream out;
+  out << in.rdbuf();
+  return out.str();
+}
 
 void load_sirius_extension(duckdb::DuckDB& db)
 {
@@ -163,7 +186,9 @@ sirius_memory_limits large_sirius_memory_limits_with_chunk_prewarm(bool enabled)
 
 class sirius_config_env_guard {
  public:
-  explicit sirius_config_env_guard(s3_test_env const& env, sirius_memory_limits limits = {})
+  explicit sirius_config_env_guard(s3_test_env const& env,
+                                   sirius_memory_limits limits             = {},
+                                   std::optional<std::string> signing_mode = std::nullopt)
   {
     if (auto* current = std::getenv("SIRIUS_CONFIG_FILE"); current != nullptr) {
       had_original_config_env_ = true;
@@ -232,6 +257,12 @@ class sirius_config_env_guard {
         << "\n"
            "    secret_key: "
         << yaml_quote(env.secret_key) << "\n";
+    if (!env.session_token.empty()) {
+      out << "    session_token: " << yaml_quote(env.session_token) << "\n";
+    }
+    if (signing_mode.has_value()) {
+      out << "    signing_mode: " << yaml_quote(*signing_mode) << "\n";
+    }
     if (limits.enable_chunk_prewarm.has_value()) {
       out << "  executor:\n"
              "    scan_manager:\n"
@@ -262,6 +293,8 @@ class sirius_config_env_guard {
     fs::remove_all(dir_, ec);
   }
 
+  [[nodiscard]] fs::path const& config_path() const noexcept { return config_path_; }
+
  private:
   fs::path dir_;
   fs::path config_path_;
@@ -273,8 +306,10 @@ class sirius_config_env_guard {
 
 class s3_sql_fixture {
  public:
-  explicit s3_sql_fixture(s3_test_env const& env, sirius_memory_limits limits = {})
-    : config_env(env, std::move(limits)), db(nullptr), con(db)
+  explicit s3_sql_fixture(s3_test_env const& env,
+                          sirius_memory_limits limits             = {},
+                          std::optional<std::string> signing_mode = std::nullopt)
+    : config_env(env, std::move(limits), std::move(signing_mode)), db(nullptr), con(db)
   {
     load_sirius_extension(db);
     REQUIRE(con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state"));
@@ -1107,6 +1142,33 @@ TEST_CASE("internal sirius_read_parquet is registered as a one-argument table fu
   CHECK(result->GetValue(1, 0).ToString().find("VARCHAR") != std::string::npos);
 }
 
+TEST_CASE("S3 SQL config guard writes AWS-only options only when configured", "[s3][config]")
+{
+  s3_test_env env{"https://s3.us-east-2.amazonaws.com",
+                  "us-east-2",
+                  "temporary-access-key",
+                  "temporary-secret-key",
+                  "sirius-s3-test",
+                  ""};
+
+  {
+    sirius_config_env_guard guard(env);
+    auto const yaml = read_text_file(guard.config_path());
+    CHECK(yaml.find("object_store_config:") != std::string::npos);
+    CHECK(yaml.find("session_token:") == std::string::npos);
+    CHECK(yaml.find("signing_mode:") == std::string::npos);
+  }
+
+  env.session_token = "temporary-session-token";
+  {
+    sirius_config_env_guard guard(env, {}, std::string{"header"});
+    auto const yaml = read_text_file(guard.config_path());
+    CHECK(yaml.find("object_store_config:") != std::string::npos);
+    CHECK(yaml.find("session_token: 'temporary-session-token'") != std::string::npos);
+    CHECK(yaml.find("signing_mode: 'header'") != std::string::npos);
+  }
+}
+
 TEST_CASE("gpu_execution rewrites S3 read_parquet and scans through Sirius",
           "[.][s3][integration][sql][gpu_execution]")
 {
@@ -1135,6 +1197,86 @@ TEST_CASE("gpu_execution rewrites S3 read_parquet and scans through Sirius",
   CHECK(result->GetValue(1, 0).ToString() == "ALGERIA");
   for (auto const count : region_counts) {
     CHECK(count == 5);
+  }
+}
+
+TEST_CASE("gpu_execution reads real AWS S3 parquet through Sirius SigV4",
+          "[.][s3][aws][live][sql][gpu_execution]")
+{
+  auto env = require_aws_live_env();
+  if (!env) { return; }
+
+  duckdb::DuckDB baseline_db(nullptr);
+  duckdb::Connection baseline_con(baseline_db);
+  auto const local_query =
+    "SELECT n_nationkey, n_name, n_regionkey "
+    "FROM " +
+    local_parquet_scan("nation") + " ORDER BY n_nationkey";
+  auto baseline_result = require_query_ok(baseline_con, local_query);
+
+  auto run_s3 = [&](std::optional<std::string> signing_mode) {
+    s3_sql_fixture fixture(*env, {}, std::move(signing_mode));
+    auto const s3_query =
+      "SELECT n_nationkey, n_name, n_regionkey "
+      "FROM " +
+      s3_parquet_scan(*env, "nation") + " ORDER BY n_nationkey";
+    return require_query_ok(fixture.con, gpu_execution_sql(s3_query));
+  };
+
+  SECTION("presigned")
+  {
+    auto s3_result = run_s3(std::nullopt);
+    REQUIRE(s3_result->RowCount() == 25);
+    REQUIRE(s3_result->ColumnCount() == 3);
+    check_rows_equal_with_tolerant_columns(*s3_result, *baseline_result, {});
+  }
+
+  SECTION("header")
+  {
+    auto s3_result = run_s3(std::string{"header"});
+    REQUIRE(s3_result->RowCount() == 25);
+    REQUIRE(s3_result->ColumnCount() == 3);
+    check_rows_equal_with_tolerant_columns(*s3_result, *baseline_result, {});
+  }
+}
+
+TEST_CASE("gpu_execution aggregates real AWS S3 parquet through Sirius SigV4",
+          "[.][s3][aws][live][sql][gpu_execution]")
+{
+  auto env = require_aws_live_env();
+  if (!env) { return; }
+
+  duckdb::DuckDB baseline_db(nullptr);
+  duckdb::Connection baseline_con(baseline_db);
+  auto const local_query =
+    "SELECT count(*) AS c, min(n_nationkey) AS lo, max(n_nationkey) AS hi "
+    "FROM " +
+    local_parquet_scan("nation");
+  auto baseline_result = require_query_ok(baseline_con, local_query);
+
+  auto run_s3 = [&](std::optional<std::string> signing_mode) {
+    s3_sql_fixture fixture(*env, {}, std::move(signing_mode));
+    auto const s3_query =
+      "SELECT count(*) AS c, min(n_nationkey) AS lo, max(n_nationkey) AS hi "
+      "FROM " +
+      s3_parquet_scan(*env, "nation");
+    return require_query_ok(fixture.con, gpu_execution_sql(s3_query));
+  };
+
+  SECTION("presigned")
+  {
+    auto s3_result = run_s3(std::nullopt);
+    REQUIRE(s3_result->RowCount() == 1);
+    REQUIRE(s3_result->ColumnCount() == 3);
+    check_rows_equal_with_tolerant_columns(*s3_result, *baseline_result, {});
+  }
+
+  SECTION("header")
+  {
+    auto s3_result = run_s3(std::string{"header"});
+    REQUIRE(s3_result->RowCount() == 1);
+    REQUIRE(s3_result->ColumnCount() == 3);
+    check_rows_equal_with_tolerant_columns(*s3_result, *baseline_result, {});
   }
 }
 

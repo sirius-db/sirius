@@ -19,7 +19,7 @@
 #include "helper/logical_type.hpp"
 #include "io/prefetching_cache.hpp"
 #include "io/s3/s3_ioctx.hpp"
-#include "io/s3/sirius_sigv4_credential_provider.hpp"
+#include "io/s3/sirius_sigv4_authorizer.hpp"
 #include "op/scan/parquet_scan_operator_data.hpp"
 #include "scan_manager/parquet_split_provider.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
@@ -55,7 +55,7 @@ using sirius::io::buffer_pool;
 using sirius::io::sirius_ioctx;
 using sirius::io::s3::s3_ioctx;
 using sirius::io::s3::s3_ioctx_config;
-using sirius::io::s3::sirius_sigv4_credential_provider;
+using sirius::io::s3::sirius_sigv4_presigned_authorizer;
 using sirius::io::s3::static_credentials;
 using sirius::op::scan::parquet_scan_data;
 using sirius::scan_manager::parquet_split_provider;
@@ -204,7 +204,7 @@ s3_ioctx_config make_live_s3_config(s3_test_env const& env)
   static_credentials creds;
   creds.access_key_id     = env.access_key;
   creds.secret_access_key = env.secret_key;
-  auto provider           = std::make_shared<sirius_sigv4_credential_provider>(
+  auto provider           = std::make_shared<sirius_sigv4_presigned_authorizer>(
     std::move(creds), env.region, env.endpoint, 30min);
 
   s3_ioctx_config cfg{};
