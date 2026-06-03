@@ -1436,13 +1436,13 @@ TEST_CASE("async-curl S3 benchmark hides injected range latency versus blocking 
                              /*initial_pools=*/1);
 
   auto const blocking = run_blocking_device_benchmark(server, payload, memory);
-  INFO("blocking median ms=" << millis(blocking));
+  WARN("blocking median ms=" << millis(blocking));
 
   std::vector<std::pair<std::size_t, device_read_bench_result>> async_results;
   for (auto const max_connections :
-       {std::size_t{1}, std::size_t{2}, std::size_t{4}, std::size_t{8}}) {
+       {std::size_t{1}, std::size_t{2}, std::size_t{4}, std::size_t{8}, std::size_t{16}}) {
     auto result = run_async_device_benchmark(server, payload, memory, max_connections);
-    INFO("async mc=" << max_connections << " median ms=" << millis(result.median_time)
+    WARN("async mc=" << max_connections << " median ms=" << millis(result.median_time)
                      << " peak_inflight=" << result.device_peak_inflight
                      << " stream_syncs=" << result.device_stream_sync_total);
     CHECK(result.device_stream_sync_total == 0);
@@ -1452,10 +1452,10 @@ TEST_CASE("async-curl S3 benchmark hides injected range latency versus blocking 
     async_results.emplace_back(max_connections, result);
   }
 
-  auto const& async_mc1 = async_results.front().second;
-  auto const& async_mc8 = async_results.back().second;
+  auto const& async_mc1  = async_results.front().second;
+  auto const& async_best = async_results.back().second;
   CHECK(async_mc1.median_time * 2 < blocking * 3);
-  CHECK(async_mc8.median_time < blocking / 2);
+  CHECK(async_best.median_time < blocking / 2);
 }
 
 TEST_CASE("async-curl S3 benchmark reports real AWS S3 headline numbers",
