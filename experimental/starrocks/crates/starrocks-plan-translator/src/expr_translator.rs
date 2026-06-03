@@ -337,9 +337,12 @@ fn translate_compound_pred(
 /// Converts a StarRocks cast into a Substrait cast with throwing failure behavior.
 fn translate_cast(node: &TExprNode, children: Vec<Expression>) -> Result<Expression> {
     expect_child_count(node, &children, 1)?;
+    // Honor StarRocks' declared nullability for the cast target, matching the
+    // slot path; default to nullable when the analyzer left it unset.
+    let nullable = node.is_nullable.unwrap_or(true);
     Ok(Expression {
         rex_type: Some(expression::RexType::Cast(Box::new(expression::Cast {
-            r#type: Some(type_mapper::map_type_desc(&node.type_, true)?),
+            r#type: Some(type_mapper::map_type_desc(&node.type_, nullable)?),
             input: Some(Box::new(children.into_iter().next().unwrap())),
             failure_behavior: expression::cast::FailureBehavior::ThrowException as i32,
         }))),

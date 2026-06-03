@@ -1206,6 +1206,40 @@ fn cast_expr_emits_throwing_cast_to_target_type() {
     }
 }
 
+/// Verifies a cast preserves a declared non-nullable target type.
+#[test]
+fn cast_expr_preserves_declared_non_nullable_target() {
+    let mut cast = base_expr_node(
+        TExprNodeType::CAST_EXPR,
+        scalar_type(TPrimitiveType::INT),
+        1,
+    );
+    cast.is_nullable = Some(false);
+    let mut nodes = vec![cast];
+    nodes.extend(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)).nodes);
+    let plan = filter_with_conjunct(binary_pred(
+        TExprOpcode::EQ,
+        TExpr::new(nodes),
+        int_literal_typed(10, TPrimitiveType::INT),
+    ));
+    match scalar_arg(filter_condition(&plan), 0)
+        .rex_type
+        .as_ref()
+        .unwrap()
+    {
+        expression::RexType::Cast(cast) => {
+            match cast.r#type.as_ref().unwrap().kind.as_ref().unwrap() {
+                substrait::proto::r#type::Kind::I32(i32_type) => assert_eq!(
+                    i32_type.nullability,
+                    substrait::proto::r#type::Nullability::Required as i32
+                ),
+                other => panic!("expected i32 cast type, got {other:?}"),
+            }
+        }
+        other => panic!("expected cast, got {other:?}"),
+    }
+}
+
 /// Verifies a NULL literal becomes a typed Substrait null.
 #[test]
 fn null_literal_translates_to_typed_null() {
