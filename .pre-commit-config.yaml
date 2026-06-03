@@ -12,8 +12,8 @@
 #
 # See https://github.com/pre-commit/pre-commit
 
-# Global exclusions, csv are exclueded because it os often the answers to a test, we don't want to reformat them
-exclude: \.csv$|^legacy/queries/.*
+# Global exclusions, csv are excluded because they are often test answers, and experimental is out of lint scope.
+exclude: \.csv$|^legacy/queries/.*|^experimental/.*
 
 repos:
   # Standard hooks

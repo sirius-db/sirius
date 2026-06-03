@@ -15,12 +15,13 @@
  */
 
 // sirius
+#include <expression/ast/from_duckdb.hpp>
+#include <expression/ast/node.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <sirius/exception.hpp>
 
 // duckdb
 #include <duckdb/common/exception.hpp>
-#include <duckdb/common/typedefs.hpp>
 #include <duckdb/planner/expression/bound_conjunction_expression.hpp>
 
 // cudf
@@ -30,31 +31,53 @@
 namespace sirius {
 using execute_result = gpu_expression_executor::execute_result;
 
-execute_result gpu_expression_executor::execute(duckdb::BoundConjunctionExpression const& expr,
+namespace {
+
+cudf::ast::ast_operator conjunction_op_to_ast(sirius::ast::conjunction::kind op)
+{
+  switch (op) {
+    case sirius::ast::conjunction::kind::op_and: return cudf::ast::ast_operator::LOGICAL_AND;
+    case sirius::ast::conjunction::kind::op_or: return cudf::ast::ast_operator::LOGICAL_OR;
+    default:
+      throw invalid_input_exception(
+        "[gpu_expression_executor:conjunction] unrecognized conjunction type {}",
+        static_cast<int>(op));
+  }
+}
+
+cudf::binary_operator conjunction_op_to_binary(sirius::ast::conjunction::kind op)
+{
+  switch (op) {
+    case sirius::ast::conjunction::kind::op_and: return cudf::binary_operator::LOGICAL_AND;
+    case sirius::ast::conjunction::kind::op_or: return cudf::binary_operator::LOGICAL_OR;
+    default:
+      throw invalid_input_exception(
+        "[gpu_expression_executor:conjunction] unrecognized conjunction type {}",
+        static_cast<int>(op));
+  }
+}
+
+}  // namespace
+
+execute_result gpu_expression_executor::execute(sirius::ast::conjunction const& alt,
                                                 execution_mode mode)
 {
+  if (alt.children.empty()) {
+    throw invalid_input_exception(
+      "[gpu_expression_executor:conjunction] conjunction has no children — malformed AST.");
+  }
+  auto const ast_op_count = alt.cudf_ast_op_count();
+
   if (_strategy != expression_executor_strategy::MATERIALIZE &&
-      (mode == execution_mode::AST || count_ast_ops(expr) >= _min_ast_size)) {
-    auto conjunction_type_switch_ast =
-      [](duckdb::BoundConjunctionExpression const& expr) -> cudf::ast::ast_operator {
-      using enum duckdb::ExpressionType;
-      switch (expr.GetExpressionType()) {
-        case CONJUNCTION_AND: return cudf::ast::ast_operator::LOGICAL_AND;
-        case CONJUNCTION_OR: return cudf::ast::ast_operator::LOGICAL_OR;
-        default:
-          throw invalid_input_exception(
-            "[gpu_expression_executor:conjunction] unrecognized conjunction type {}",
-            static_cast<int>(expr.GetExpressionType()));
-      }
-    };
+      (mode == execution_mode::AST || ast_op_count >= _min_ast_size)) {
+    auto const ast_op = conjunction_op_to_ast(alt.op);
 
-    auto output = execute(*expr.children[0], execution_mode::AST);
+    auto output = execute(*alt.children[0], execution_mode::AST);
 
-    for (duckdb::idx_t i = 1; i < expr.children.size(); i++) {
-      auto child = execute(*expr.children[i], execution_mode::AST);
-
-      auto const& output_expr = _ast_tree.emplace<cudf::ast::operation>(
-        conjunction_type_switch_ast(expr), output.get_expr(), child.get_expr());
+    for (std::size_t i = 1; i < alt.children.size(); ++i) {
+      auto child = execute(*alt.children[i], execution_mode::AST);
+      auto const& output_expr =
+        _ast_tree.emplace<cudf::ast::operation>(ast_op, output.get_expr(), child.get_expr());
       output = execute_result(
         ast_result(output_expr,
                    {output.get_temp_scalar_indices(), child.get_temp_scalar_indices()},
@@ -66,46 +89,47 @@ execute_result gpu_expression_executor::execute(duckdb::BoundConjunctionExpressi
       return output;
     }
     //===----------2: MATERIALIZE Mode, evaluate node with AST----------===//
-    // Evaluate the AST subtree
     auto result_column = execute_ast(output.get_expr());
 
-    // Release consumed temporaries
     release_temporaries(output.get_temp_scalar_indices(), output.get_temp_column_indices());
     return execute_result(std::move(result_column));
   }
 
   //===----------3: MATERIALIZE Mode, evaluate node with unary/binary ops----------===//
-  auto conjunction_type_switch =
-    [](duckdb::BoundConjunctionExpression const& expr) -> cudf::binary_operator {
-    using enum duckdb::ExpressionType;
-    switch (expr.GetExpressionType()) {
-      case CONJUNCTION_AND: return cudf::binary_operator::LOGICAL_AND;
-      case CONJUNCTION_OR: return cudf::binary_operator::LOGICAL_OR;
-      default:
-        throw invalid_input_exception(
-          "[gpu_expression_executor:conjunction] unrecognized conjunction type {}",
-          static_cast<int>(expr.GetExpressionType()));
-    }
-  };
-
-  auto const output_type = GetCudfType(expr.return_type);
+  auto const binary_op = conjunction_op_to_binary(alt.op);
+  // Conjunction ops always return BOOLEAN.
+  auto const output_type = cudf::data_type{cudf::type_id::BOOL8};
 
   // Resolve the children incrementally into the output
-  auto output = execute(*expr.children[0], execution_mode::MATERIALIZE);
+  auto output = execute(*alt.children[0], execution_mode::MATERIALIZE);
   // DuckDB should prune all scalar conjuncts away
   D_ASSERT(!output.is_scalar());
-  for (duckdb::idx_t i = 1; i < expr.children.size(); i++) {
-    auto child = execute(*expr.children[i], execution_mode::MATERIALIZE);
+  for (std::size_t i = 1; i < alt.children.size(); ++i) {
+    auto child = execute(*alt.children[i], execution_mode::MATERIALIZE);
     D_ASSERT(!child.is_scalar());
-    auto output_column = cudf::binary_operation(output.get_column_view(),
-                                                child.get_column_view(),
-                                                conjunction_type_switch(expr),
-                                                output_type,
-                                                _stream,
-                                                _mr);
-    output             = execute_result(std::move(output_column));
+    auto output_column = cudf::binary_operation(
+      output.get_column_view(), child.get_column_view(), binary_op, output_type, _stream, _mr);
+    output = execute_result(std::move(output_column));
   }
   return output;
+}
+
+// DuckDB-typed entrypoint. Bridges callers that still pass duckdb::Expression
+// directly into the executor; the eventual home for this from_duckdb step is
+// the planning stage so the executor sees only native sirius::ast types, but
+// until upstream call sites are migrated this overload (and the duckdb
+// includes it requires) must stay.
+execute_result gpu_expression_executor::execute(duckdb::BoundConjunctionExpression const& expr,
+                                                execution_mode mode)
+{
+  auto node = sirius::ast::from_duckdb(expr);
+  if (!node) {
+    throw not_implemented_exception(
+      "[gpu_expression_executor:conjunction] BoundConjunctionExpression with conjunction type {} "
+      "could not be lowered to a Sirius AST node.",
+      static_cast<int>(expr.GetExpressionType()));
+  }
+  return execute(*node, mode);
 }
 
 }  // namespace sirius

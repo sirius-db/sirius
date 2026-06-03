@@ -94,7 +94,6 @@ sirius_physical_plan_generator::plan_delim_join(duckdb::LogicalComparisonJoin& o
   // we still have to create the DISTINCT clause that is used to generate the duplicate eliminated
   // chunk
   delim_join->distinct = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate>(
-    context,
     sirius::from_duckdb_vec(delim_types),
     sirius::wrap_many(std::move(distinct_expressions)),
     sirius::wrap_many(std::move(distinct_groups)),

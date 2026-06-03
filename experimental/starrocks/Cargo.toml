@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "cn"
+]
+resolver = "2"
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+mysql_async = { version = "0.36", default-features = false, features = ["minimal-rust"] }
+thiserror = "2"
+thrift = "0.17"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

@@ -703,9 +703,7 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
                     shared_data_repository* data_repo,
                     std::unique_ptr<parquet_scan_task_local_state> l_state,
                     std::shared_ptr<parquet_scan_task_global_state> g_state)
-    : pipeline::sirius_pipeline_itask(std::move(l_state), g_state),
-      _task_id(task_id),
-      _data_repo(data_repo)
+    : pipeline::sirius_pipeline_itask(task_id, std::move(l_state), g_state), _data_repo(data_repo)
   {
     if (auto pipeline = g_state->get_operator().get_pipeline()) { pipeline->mark_task_created(); }
   }
@@ -783,13 +781,6 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
   }
 
   /**
-   * @brief Get the unique ID of this task.
-   *
-   * @return The unique ID of this task.
-   */
-  [[nodiscard]] uint64_t get_task_id() const { return _task_id; }
-
-  /**
    * @brief Set whether this task should operate on materialized (decoded) columns.
    *
    * @param materialized_columns True to use materialized columns, false otherwise.
@@ -816,7 +807,6 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
                                   std::vector<std::future<std::size_t>>& read_futures);
 
   //===----------Fields----------===//
-  uint64_t _task_id;                   ///< The unique ID of this task
   shared_data_repository* _data_repo;  ///< The shared data repository to which to push batches
   std::shared_ptr<cudf::io::datasource> _datasource;  ///< The cudf datasource for the input file
   bool _wrap_in_cache{false};

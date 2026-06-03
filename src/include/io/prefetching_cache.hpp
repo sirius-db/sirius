@@ -555,6 +555,45 @@ class prefetching_cache {
   /// to absorb the full object" warm-vs-cold ratios.
   [[nodiscard]] std::size_t total_size_bytes() const noexcept { return _pool.capacity(); }
 
+  /// Cumulative count of read() calls that hit a CACHED/IN_USE entry covering
+  /// the requested range (data served from cache, no fall-through to a real
+  /// read on the ioctx).
+  [[nodiscard]] uint64_t hit_count_total() const noexcept
+  {
+    return _hit_count.load(std::memory_order_relaxed);
+  }
+
+  /// Sub-counter of hit_count_total: hits that waited on a LOADING entry
+  /// before pin-success. Sizes the prefetch-latency overlap.
+  [[nodiscard]] uint64_t hit_after_wait_total() const noexcept
+  {
+    return _hit_after_wait.load(std::memory_order_relaxed);
+  }
+
+  /// Cumulative count of reads where the file existed in cache but the
+  /// matching entry was in queued/evicting/empty state — caller falls
+  /// through to a real read on the ioctx.
+  [[nodiscard]] uint64_t partial_miss_count_total() const noexcept
+  {
+    return _partial_miss_count.load(std::memory_order_relaxed);
+  }
+
+  /// Cumulative count of reads where the file was not in cache at all.
+  [[nodiscard]] uint64_t full_miss_count_total() const noexcept
+  {
+    return _full_miss_count.load(std::memory_order_relaxed);
+  }
+
+  /// Cumulative count of reads where the file WAS in cache but find_entry()
+  /// returned no matching range — i.e. no inserted range covers the request
+  /// fully. This is the silent-return path in @c read() (and @c read_ranges()
+  /// per-range) that was previously uncounted; surfaces the primary suspect
+  /// for §26's SF10 double-fetch.
+  [[nodiscard]] uint64_t range_miss_count_total() const noexcept
+  {
+    return _range_miss_count.load(std::memory_order_relaxed);
+  }
+
  private:
   // ---- work items dispatched through the queue ------------------------------
 
@@ -642,6 +681,9 @@ class prefetching_cache {
 
   // Hits that had to wait on a loading entry (subset of _hit_count).
   std::atomic<uint64_t> _hit_after_wait{0};
+  // File was in cache but no inserted range covered the request — surfaces
+  // the silent-return path in read() / read_ranges().
+  std::atomic<uint64_t> _range_miss_count{0};
 
   // Worker skipped an entry because the reader already resolved it in this
   // epoch (consumption_ts == _cache_age on a not-yet-cached entry).

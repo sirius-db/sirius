@@ -152,8 +152,10 @@ set(EXTENSION_SOURCES
     src/expression/from_duckdb.cpp
     src/expression/function_id.cpp
     src/expression/join_condition.cpp
+    src/expression/to_duckdb.cpp
     src/expression/value.cpp
     src/expression_executor/expression_executor_strategy.cpp
+    src/expression_executor/ast_op_counter.cpp
     src/expression_executor/gpu_expression_executor.cpp
     src/expression_executor/gpu_expression_translator.cpp
     src/expression_executor/regex/regex_playground.cpp
@@ -171,10 +173,11 @@ set(EXTENSION_SOURCES
     src/io/datasource_factory.cpp
     src/io/duckdb_io_object.cpp
     src/io/io_context.cpp
+    src/io/parquet_helpers.cpp
     src/io/prefetching_cache.cpp
     src/io/s3/s3_ioctx.cpp
     src/io/s3/sigv4.cpp
-    src/io/s3/sirius_sigv4_credential_provider.cpp
+    src/io/s3/sirius_sigv4_authorizer.cpp
     src/io/sirius_datasource.cpp
     src/io/uri_parser.cpp
     src/io/uring/uring_ioctx.cpp
@@ -191,6 +194,7 @@ set(EXTENSION_SOURCES
     src/op/scan/duckdb_scan_executor.cpp
     src/op/scan/cpu_source_task.cpp
     src/op/scan/duckdb_native_metadata.cpp
+    src/op/scan/duckdb_native_decoder.cpp
     src/op/scan/duckdb_scan_task.cpp
     src/op/scan/equality_delete_filter.cpp
     src/op/scan/hive_partition.cpp
@@ -207,6 +211,7 @@ set(EXTENSION_SOURCES
     src/op/scan/prefetched_data_source.cpp
     src/op/scan/scan_plan.cpp
     src/op/scan/scan_utils.cpp
+    src/op/scan/sirius_gpu_duckdb_native_scan_operator.cpp
     src/op/scan/sirius_gpu_parquet_scan_operator.cpp
     src/op/sirius_dynamic_filter.cpp
     src/op/sirius_physical_column_data_scan.cpp
@@ -279,6 +284,7 @@ set(EXTENSION_SOURCES
     src/sirius_exchange_c_api.cpp
     src/sirius_extension.cpp
     src/sirius_interface.cpp
+    src/sirius_sql_rewrite.cpp
     src/telemetry/telemetry_context.cpp
     src/transparent/physical_sirius_execution.cpp
     src/transparent/sirius_optimizer_extension.cpp
@@ -449,26 +455,34 @@ set(TEST_SOURCES
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/expression/test_ast_from_duckdb.cpp
     test/cpp/expression/test_ast_scaffold.cpp
+    test/cpp/expression/test_ast_to_duckdb.cpp
     test/cpp/expression/test_expression.cpp
     test/cpp/expression/test_function_id.cpp
     test/cpp/expression/test_join_condition.cpp
     test/cpp/expression/test_value.cpp
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
+    test/cpp/expression_executor/test_gpu_expression_executor_ast_equivalence.cpp
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
     test/cpp/helper/test_logical_type.cpp
+    test/cpp/helper/test_transaction_utils.cpp
     test/cpp/integration/test_gpu_execution_locality.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
+    test/cpp/integration/test_gpu_execution_order_nulls.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/integration/test_transparent_execution.cpp
     test/cpp/io/s3/test_sigv4.cpp
+    test/cpp/io/s3/test_s3_default_visibility_guard.cpp
     test/cpp/io/s3/test_s3_ioctx.cpp
-    test/cpp/io/s3/test_sirius_sigv4_credential_provider.cpp
+    test/cpp/io/s3/test_sirius_sigv4_authorizer.cpp
     test/cpp/io/s3/test_static_credentials.cpp
     test/cpp/io/test_datasource_factory.cpp
     test/cpp/io/test_duckdb_io_object.cpp
+    test/cpp/io/test_parquet_helpers.cpp
+    test/cpp/io/test_prefetching_cache_telemetry.cpp
     test/cpp/io/test_uri_parser.cpp
+    test/cpp/integration/test_s3_sql_surface.cpp
     test/cpp/integration/test_s3_perf_benchmark.cpp
     test/cpp/integration/test_scan_manager_s3_end_to_end.cpp
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
@@ -502,6 +516,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
+    test/cpp/pipeline/test_sirius_read_parquet_converter.cpp
     test/cpp/pipeline/test_pipeline_memory_history.cpp
     test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
     test/cpp/pipeline/test_gpu_pipeline_disk_readback.cpp
@@ -511,6 +526,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_task_scheduler.cpp
     test/cpp/scan/bench_decode_codecs.cpp
     test/cpp/scan/test_column_builder.cpp
+    test/cpp/scan/test_duckdb_block_layout.cpp
     test/cpp/scan/test_duckdb_native_split_provider.cpp
     test/cpp/scan/test_duckdb_native_walker.cpp
     test/cpp/scan/test_gpu_decode_alp.cpp
@@ -526,7 +542,10 @@ set(TEST_SOURCES
     test/cpp/scan/test_scan_executor.cpp
     test/cpp/scan/test_split_connector.cpp
     test/cpp/scan_manager/test_sirius_scan_manager_s3.cpp
+    test/cpp/scan_manager/test_describe_parquet_s3.cpp
     test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
+    test/cpp/sirius_extension/test_sirius_read_parquet_cardinality.cpp
+    test/cpp/sql/test_sirius_sql_rewrite.cpp
     test/cpp/unittest.cpp
     test/cpp/utils/sirius_test_env.cpp
     test/cpp/utils/utils.cpp)
@@ -537,6 +556,24 @@ if(SIRIUS_LEGACY_TEST_SOURCES)
 endif()
 
 add_executable(sirius_unittest ${TEST_SOURCES})
+
+# TPC-DS integration test fixture, generated at build time (opt-in target). The
+# database is not committed; run `cmake --build . --target tpcds-fixture` once
+# before the TPC-DS integration tests. Requires the duckdb CLI (or python3 with
+# the duckdb module) on PATH; both are provided by the pixi environment.
+set(TPCDS_FIXTURE_DIR ${CMAKE_BINARY_DIR}/test-fixtures)
+set(TPCDS_FIXTURE ${TPCDS_FIXTURE_DIR}/tpcds.duckdb)
+set(TPCDS_FIXTURE_SCRIPT
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/integration/data/duckdb/generate_tpcds_duckdb.sh
+)
+add_custom_command(
+  OUTPUT ${TPCDS_FIXTURE}
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${TPCDS_FIXTURE_DIR}
+  COMMAND bash ${TPCDS_FIXTURE_SCRIPT} ${TPCDS_FIXTURE}
+  DEPENDS ${TPCDS_FIXTURE_SCRIPT}
+  COMMENT "Generating TPC-DS test fixture (SF 0.01) at ${TPCDS_FIXTURE}"
+  VERBATIM)
+add_custom_target(tpcds-fixture DEPENDS ${TPCDS_FIXTURE})
 
 if(VCPKG_BUILD)
   set_target_properties(sirius_unittest PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)

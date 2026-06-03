@@ -79,6 +79,7 @@ extern "C" int cudaProfilerStop();
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "sirius_interface.hpp"
+#include "sirius_sql_rewrite.hpp"
 #include "util/segfault_backtrace.hpp"
 
 // PinTableFunction routes parquet reads through the per-GPU sirius_ioctx
@@ -111,13 +112,68 @@ constexpr size_t EXCHANGE_CPU_PROCESSING_SIZE = 512ULL * 1024ULL * 1024ULL;
 
 unique_ptr<QueryResult> run_internal_cpu_fallback_query(ClientContext& context,
                                                         Connection& connection,
-                                                        const string& query)
+                                                        const string& query,
+                                                        const string& gpu_error = "")
 {
+  // S3 CPU fallback is not supported. Sirius reads s3:// only on the GPU path
+  // (sirius_read_parquet -> describe_parquet -> cuDF via s3_ioctx); DuckDB's CPU
+  // read_parquet has no S3 filesystem, so a query that reads s3:// cannot fall
+  // back to CPU. Surface a clear error (with the underlying GPU cause) instead
+  // of replaying a query that would fail anyway. Local / non-s3 queries are
+  // unaffected and fall through to the normal DuckDB CPU replay below.
+  if (sirius::references_sirius_owned_s3_parquet(query)) {
+    throw std::runtime_error(
+      "S3 CPU fallback is not supported: this query reads s3:// data, GPU execution failed, and "
+      "Sirius has no CPU fallback for S3 data sources. Underlying GPU error: " +
+      gpu_error);
+  }
+
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) { return connection.Query(query); }
 
   duckdb::SiriusContext::InternalQueryGuard guard(*sirius_ctx);
   return connection.Query(query);
+}
+
+// Bind callback for the sirius_read_parquet table function — a thin forwarder.
+// It resolves the URI to the connection's scan_manager and probes the parquet
+// footer through describe_parquet (footer-only, no full-file download), then
+// hands the inferred schema back to DuckDB. Bind data carries the URI and
+// footer row count so the cardinality callback can expose a real estimate to
+// the optimizer; the pipeline converter still reads the URI from parameters[0].
+unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
+                                               TableFunctionBindInput& input,
+                                               vector<LogicalType>& return_types,
+                                               vector<string>& names)
+{
+  if (input.inputs.size() != 1 || input.inputs[0].IsNull()) {
+    throw std::runtime_error("sirius_read_parquet expects a single non-null parquet URI");
+  }
+  auto const uri = input.inputs[0].GetValue<std::string>();
+
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    throw std::runtime_error("sirius_read_parquet: Sirius is not initialized on this connection");
+  }
+
+  auto bind_result = sirius_ctx->get_scan_manager().describe_parquet(uri);
+  return_types     = std::move(bind_result.return_types);
+  names            = std::move(bind_result.names);
+  return make_uniq<SiriusReadParquetBindData>(uri, bind_result.total_num_rows);
+}
+
+// Execute callback for sirius_read_parquet. The real scan runs through the
+// Sirius GPU pipeline; this table function is an internal rewrite target for
+// read_parquet('s3://...') inside gpu_execution, NOT a user-facing function.
+// A direct DuckDB (CPU) execution is rejected cleanly — query S3 Parquet via
+// read_parquet('s3://...'), which the bind-time rewrite routes here for the GPU
+// path. S3 has no CPU fallback: if GPU execution fails, an s3:// query errors
+// (S3 CPU fallback is not supported) rather than replaying on the CPU.
+void SiriusReadParquetFunction(ClientContext&, TableFunctionInput&, DataChunk&)
+{
+  throw std::runtime_error(
+    "sirius_read_parquet is an internal rewrite target; query S3 Parquet with "
+    "read_parquet('s3://...') inside gpu_execution()");
 }
 
 }  // namespace
@@ -140,6 +196,15 @@ void SiriusExtension::EnsureExchangeBufferManager()
   buffer_is_initialized = true;
 }
 
+unique_ptr<NodeStatistics> SiriusReadParquetCardinality(ClientContext&,
+                                                        FunctionData const* bind_data_p)
+{
+  if (bind_data_p == nullptr) { return nullptr; }
+  auto const* typed = dynamic_cast<SiriusReadParquetBindData const*>(bind_data_p);
+  if (typed == nullptr) { return nullptr; }
+  return make_uniq<NodeStatistics>(typed->total_num_rows, typed->total_num_rows);
+}
+
 struct SiriusTableFunctionData : public TableFunctionData {
   SiriusTableFunctionData() = default;
   shared_ptr<::sirius::sirius_prepared_statement_data> gpu_prepared;
@@ -148,9 +213,21 @@ struct SiriusTableFunctionData : public TableFunctionData {
   unique_ptr<::sirius::sirius_interface> sirius_iface;
   string query;
   string substrait_blob;  // Original Substrait bytes for from_substrait fallback
+  // Pre-rewrite query used for the CPU fallback of LOCAL (non-s3) reads. The GPU
+  // path runs the rewritten `query` (read_parquet('s3://…') ->
+  // sirius_read_parquet('s3://…')), which throws if executed on the CPU, so a
+  // fallback replays this original instead. For local / non-s3 queries the
+  // rewrite is a no-op, so this equals `query` and replays normally. For s3://
+  // queries there is no CPU fallback: run_internal_cpu_fallback_query detects the
+  // s3:// read and raises a clear "S3 CPU fallback is not supported" error.
+  string cpu_fallback_query;
   bool enable_optimizer;
   bool finished   = false;
   bool plan_error = false;
+  // Real error message from a failed GPU plan generation. The CPU fallback path
+  // surfaces it so the true cause (e.g. the unsupported operator) is preserved
+  // instead of a generic placeholder.
+  string plan_error_message;
   //! Original options from the connection
   ClientConfig original_config;
   set<OptimizerType> original_disabled_optimizers;
@@ -619,6 +696,18 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
     throw BinderException("gpu_execution cannot be called with a NULL parameter");
   }
 
+  // Route Sirius-owned remote parquet reads through Sirius's own bind:
+  // read_parquet('s3://…') -> sirius_read_parquet('s3://…'). DuckDB core has no
+  // S3 filesystem, so without this rewrite the s3:// bind fails before Sirius
+  // ever runs. Local paths and non-s3 calls are left untouched.
+  //
+  // Capture the pre-rewrite query first: a CPU fallback of a LOCAL read must
+  // replay the original read_parquet (not the rewritten sirius_read_parquet,
+  // which throws off the GPU). An s3:// query has no CPU fallback — the fallback
+  // path detects it and raises a clear error instead of replaying.
+  result->cpu_fallback_query = result->query;
+  result->query              = sirius::rewrite_sirius_owned_remote_parquet_calls(result->query);
+
   // Parse the query just to get the result type information and to create PreparedStatementData
   Parser parser(context.GetParserOptions());
   parser.ParseQuery(result->query);
@@ -645,7 +734,8 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
     ErrorData error(e);
     SIRIUS_LOG_ERROR("Error in SiriusGeneratePhysicalPlan: {}", error.RawMessage());
     if (Config::ENABLE_DUCKDB_FALLBACK) {
-      result->plan_error = true;
+      result->plan_error         = true;
+      result->plan_error_message = error.RawMessage();
     } else {
       throw std::runtime_error("Error in SiriusGeneratePhysicalPlan: " + error.RawMessage());
       return nullptr;
@@ -1617,6 +1707,19 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   CreateTableFunctionInfo gpu_execution_info(gpu_execution);
   catalog.CreateTableFunction(transaction, gpu_execution_info);
 
+  // Sirius-owned S3 parquet entry point. gpu_execution rewrites
+  // read_parquet('s3://...') to this table function so the bind runs through
+  // Sirius's footer-only S3 path instead of DuckDB's native read_parquet.
+  // Registered so the rewrite's output binds, but INTERNAL — not a public
+  // surface: users query S3 Parquet with read_parquet('s3://...'), not this.
+  TableFunction sirius_read_parquet("sirius_read_parquet",
+                                    {LogicalType::VARCHAR},
+                                    SiriusReadParquetFunction,
+                                    SiriusReadParquetBind);
+  sirius_read_parquet.cardinality = SiriusReadParquetCardinality;
+  CreateTableFunctionInfo sirius_read_parquet_info(sirius_read_parquet);
+  catalog.CreateTableFunction(transaction, sirius_read_parquet_info);
+
   TableFunction set_query_label("sirius_set_query_label",
                                 {LogicalType::VARCHAR},
                                 SiriusSetQueryLabelFunction,
@@ -2118,24 +2221,6 @@ static void SetLogFlushSeconds(ClientContext& context, SetScope scope, Value& pa
   SIRIUS_LOG_DEBUG("Updated config LOG_FLUSH_SECONDS to {}", Config::LOG_FLUSH_SECONDS);
 }
 
-static void SetEnableQuent(ClientContext& context, SetScope scope, Value& parameter)
-{
-  Config::ENABLE_QUENT = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config ENABLE_QUENT to {}", Config::ENABLE_QUENT);
-}
-
-static void SetQuentOutputDirectory(ClientContext& context, SetScope scope, Value& parameter)
-{
-  Config::QUENT_OUTPUT_DIRECTORY = StringValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config QUENT_OUTPUT_DIRECTORY to {}", Config::QUENT_OUTPUT_DIRECTORY);
-}
-
-static void SetQuentEngineName(ClientContext& context, SetScope scope, Value& parameter)
-{
-  Config::QUENT_ENGINE_NAME = StringValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config QUENT_ENGINE_NAME to {}", Config::QUENT_ENGINE_NAME);
-}
-
 static void SetMaxBuildHashTableBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2148,6 +2233,15 @@ static void SetMaxBuildHashTableBytes(ClientContext& context, SetScope scope, Va
 static void SetEnableGpuExecution(ClientContext& context, SetScope scope, Value& parameter)
 {
   SIRIUS_LOG_DEBUG("Updated gpu_execution to {}", BooleanValue::Get(parameter));
+}
+
+static void SetEnableGpuDuckdbNativeScan(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->enable_gpu_duckdb_native_scan = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_GPU_DUCKDB_NATIVE_SCAN to {}",
+                   params->enable_gpu_duckdb_native_scan);
 }
 
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
@@ -2280,24 +2374,6 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             Value::INTEGER(Config::LOG_FLUSH_SECONDS),
                             SetLogFlushSeconds);
 
-  // Quent telemetry configuration
-  config.AddExtensionOption(
-    "enable_quent",
-    "Whether to emit quent telemetry (false uses the noop exporter; true uses ndjson)",
-    LogicalType::BOOLEAN,
-    Value::BOOLEAN(Config::ENABLE_QUENT),
-    SetEnableQuent);
-  config.AddExtensionOption("quent_output_directory",
-                            "Output directory for quent telemetry exports",
-                            LogicalType::VARCHAR,
-                            Value(Config::QUENT_OUTPUT_DIRECTORY),
-                            SetQuentOutputDirectory);
-  config.AddExtensionOption("quent_engine_name",
-                            "Engine name reported via quent telemetry",
-                            LogicalType::VARCHAR,
-                            Value(Config::QUENT_ENGINE_NAME),
-                            SetQuentEngineName);
-
   config.AddExtensionOption("hash_partition_bytes",
                             "Target size in bytes per hash partition",
                             LogicalType::UBIGINT,
@@ -2329,6 +2405,14 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::BOOLEAN,
     Value::BOOLEAN(true),
     SetEnableGpuExecution);
+
+  config.AddExtensionOption(
+    "enable_gpu_duckdb_native_scan",
+    "Route DuckDB seq_scan to the GPU-native scan operator instead of the CPU fallback "
+    "(experimental; off by default)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(sirius::operator_params{}.enable_gpu_duckdb_native_scan),
+    SetEnableGpuDuckdbNativeScan);
 }
 
 static void LoadInternal(ExtensionLoader& loader)
@@ -2343,6 +2427,13 @@ static void LoadInternal(ExtensionLoader& loader)
   sirius::converter_registry::initialize();
   SiriusExtension::InitialGPUConfigs(config);
   SiriusExtension::RegisterGPUFunctions(db);
+
+  // S3 CPU fallback is not supported: there is no DuckDB CPU FileSystem for
+  // s3://. S3 parquet is read only on the GPU path (read_parquet('s3://…') is
+  // rewritten to sirius_read_parquet -> describe_parquet -> cuDF via s3_ioctx).
+  // A query that reads s3:// and fails on GPU surfaces a clear "S3 CPU fallback
+  // is not supported" error (see run_internal_cpu_fallback_query); local reads
+  // still fall back to DuckDB's CPU execution.
 
   // Register optimizer extension for transparent GPU execution.
   // Pre-hook disables incompatible optimizers; post-hook captures the plan.

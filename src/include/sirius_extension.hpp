@@ -17,10 +17,50 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "duckdb/function/function.hpp"
+#include "duckdb/storage/statistics/node_statistics.hpp"
+
+#include <cstddef>
+#include <string>
+#include <utility>
 
 namespace duckdb {
 class GPUBufferManager;
 struct DBConfig;
+
+// Bind-time payload for the sirius_read_parquet table function. Carries the
+// canonical URI (also passed in parameters[0] — the pipeline converter still
+// reads it from there) plus the parquet's footer row count, so DuckDB's
+// optimizer sees a real cardinality estimate via the registered cardinality
+// callback instead of falling back to "unknown table function output".
+struct SiriusReadParquetBindData : public FunctionData {
+  SiriusReadParquetBindData(std::string uri, std::size_t total_num_rows)
+    : uri(std::move(uri)), total_num_rows(total_num_rows)
+  {
+  }
+
+  std::string uri;
+  std::size_t total_num_rows{0};
+
+  unique_ptr<FunctionData> Copy() const override
+  {
+    return make_uniq<SiriusReadParquetBindData>(uri, total_num_rows);
+  }
+
+  bool Equals(FunctionData const& other_p) const override
+  {
+    auto const& other = other_p.Cast<SiriusReadParquetBindData>();
+    return uri == other.uri && total_num_rows == other.total_num_rows;
+  }
+};
+
+// Cardinality callback for sirius_read_parquet. Returns the footer row count
+// (exact value, doubles as both estimated and max cardinality). Returns
+// nullptr on a null or wrong-type FunctionData so DuckDB falls back to its
+// default behavior.
+unique_ptr<NodeStatistics> SiriusReadParquetCardinality(ClientContext& context,
+                                                        FunctionData const* bind_data);
+
 class SiriusExtension : public Extension {
  public:
   void Load(ExtensionLoader& loader) override;

@@ -17,6 +17,8 @@
 // sirius
 #include <cudf/cudf_utils.hpp>
 
+#include <expression/ast/node.hpp>  // sirius::ast::node + 11 alternatives
+#include <expression/ast/to_duckdb.hpp>  // sirius::ast::to_duckdb (per-alternative overloads + node dispatcher)
 #include <expression/expression_internal.hpp>
 #include <expression/function_id.hpp>
 #include <expression_executor/ast_supported_types.hpp>
@@ -53,6 +55,7 @@
 
 // standard library
 #include <numeric>
+#include <variant>
 
 namespace {
 /// Returns true if cudf::cast supports this type (fixed-width only; no STRING/LIST/STRUCT/etc.).
@@ -199,6 +202,16 @@ gpu_expression_executor::gpu_expression_executor(duckdb::Expression const* expre
   _expressions.push_back(expression);
 }
 
+gpu_expression_executor::gpu_expression_executor(sirius::ast::node const* expression,
+                                                 rmm::device_async_resource_ref resource_ref,
+                                                 rmm::cuda_stream_view stream,
+                                                 expression_executor_strategy strategy,
+                                                 std::size_t min_ast_size)
+  : _strategy(strategy), _mr(resource_ref), _stream(stream), _min_ast_size(min_ast_size)
+{
+  _ast_expressions.push_back(expression);
+}
+
 std::unique_ptr<cudf::column> gpu_expression_executor::execute_ast(expr_ref root_expr)
 {
   std::vector<cudf::column_view> combined_column_views;
@@ -266,9 +279,9 @@ void gpu_expression_executor::release_temporaries(
 
 std::unique_ptr<cudf::table> gpu_expression_executor::execute(cudf::table_view input)
 {
-  D_ASSERT(!_expressions.empty());
+  D_ASSERT(_expressions.empty() != _ast_expressions.empty());
   _output_columns.clear();
-  _output_columns.reserve(_expressions.size());
+  _output_columns.reserve(std::max(_expressions.size(), _ast_expressions.size()));
 
   // Reset AST state from any previous invocation so that the tree, temp scalars, and temp columns
   // do not accumulate stale nodes across calls.
@@ -279,11 +292,11 @@ std::unique_ptr<cudf::table> gpu_expression_executor::execute(cudf::table_view i
   // Get the table_view from the input_batch
   _input_table = std::move(input);
 
-  // Execute the expressions and emit results into _output_columns
-  for (auto& _expression : _expressions) {
-    auto const& expr = *_expression;
-    auto result      = execute(expr, execution_mode::MATERIALIZE);
-
+  // Per-result column post-processing — shared between the DuckDB and the
+  // AST branches below. The DuckDB-typed expression is the parity reference;
+  // the AST branch round-trips through sirius::ast::to_duckdb to recover the
+  // expression_class + return_type fields for the same post-processing path.
+  auto post_process = [this](duckdb::Expression const& expr, execute_result result) {
     if (expr.expression_class == duckdb::ExpressionClass::BOUND_REF) {
       // BOUND_REF: pass column through without type check
       _output_columns.push_back(
@@ -316,6 +329,25 @@ std::unique_ptr<cudf::table> gpu_expression_executor::execute(cudf::table_view i
       }
       _output_columns.push_back(std::move(result_column));
     }
+  };
+
+  if (!_ast_expressions.empty()) {
+    // AST path: iterate _ast_expressions and route through the std::visit dispatcher.
+    // The per-result post-processing recovers expression_class + return_type by
+    // round-tripping through sirius::ast::to_duckdb so the column post-processing
+    // matches the DuckDB branch exactly.
+    for (auto const* ast_expr : _ast_expressions) {
+      auto result    = execute(*ast_expr, execution_mode::MATERIALIZE);
+      auto duck_expr = sirius::ast::to_duckdb(*ast_expr);
+      post_process(*duck_expr, std::move(result));
+    }
+  } else {
+    // DuckDB path: existing call sites unchanged.
+    for (auto& _expression : _expressions) {
+      auto const& expr = *_expression;
+      auto result      = execute(expr, execution_mode::MATERIALIZE);
+      post_process(expr, std::move(result));
+    }
   }
 
   return std::make_unique<cudf::table>(std::move(_output_columns), _stream, _mr);
@@ -323,9 +355,17 @@ std::unique_ptr<cudf::table> gpu_expression_executor::execute(cudf::table_view i
 
 std::unique_ptr<cudf::table> gpu_expression_executor::select(cudf::table_view input)
 {
-  D_ASSERT(_expressions.size() == 1);
-  auto const& expr = *_expressions[0];
-  D_ASSERT(expr.return_type == duckdb::LogicalType::BOOLEAN);
+  D_ASSERT(_expressions.empty() != _ast_expressions.empty());
+  D_ASSERT(_expressions.size() + _ast_expressions.size() == 1);
+  if (!_ast_expressions.empty()) {
+    // AST branch: round-trip the single node through sirius::ast::to_duckdb so the
+    // BOOLEAN return-type assertion matches the DuckDB branch exactly (debug-only).
+    auto duck_expr = sirius::ast::to_duckdb(*_ast_expressions[0]);
+    D_ASSERT(duck_expr->return_type == duckdb::LogicalType::BOOLEAN);
+  } else {
+    auto const& expr = *_expressions[0];
+    D_ASSERT(expr.return_type == duckdb::LogicalType::BOOLEAN);
+  }
 
   // Call execute(input_batch) to set _input_table and produce the boolean mask as a single column
   auto mask_batch = execute(input);
@@ -472,4 +512,37 @@ std::size_t gpu_expression_executor::count_ast_ops(duckdb::Expression const& exp
         static_cast<int>(expr.GetExpressionClass()));
   }
 }
+
+execute_result gpu_expression_executor::execute(sirius::ast::node const& expr, execution_mode mode)
+{
+  return std::visit(
+    [this, mode](auto const& alt) -> execute_result {
+      using T = std::decay_t<decltype(alt)>;
+      if constexpr (std::is_same_v<T, sirius::ast::reference> ||
+                    std::is_same_v<T, sirius::ast::constant> ||
+                    std::is_same_v<T, sirius::ast::comparison> ||
+                    std::is_same_v<T, sirius::ast::conjunction> ||
+                    std::is_same_v<T, sirius::ast::between> ||
+                    std::is_same_v<T, sirius::ast::case_expr> ||
+                    std::is_same_v<T, sirius::ast::cast> ||
+                    std::is_same_v<T, sirius::ast::unary_op> ||
+                    std::is_same_v<T, sirius::ast::coalesce> ||
+                    std::is_same_v<T, sirius::ast::in_list> ||
+                    std::is_same_v<T, sirius::ast::function_call>) {
+        return this->execute(alt, mode);
+      } else {
+        static_assert(sizeof(T) == 0,
+                      "Unhandled sirius::ast alternative in execute(sirius::ast::node) dispatcher");
+      }
+    },
+    expr.v);
+}
+
+std::size_t gpu_expression_executor::count_ast_ops(sirius::ast::node const& expr) const
+{
+  // Delegates to the single-source-of-truth implementation living next to the
+  // AST struct definitions; see src/expression_executor/ast_op_counter.cpp.
+  return expr.cudf_ast_op_count();
+}
+
 }  // namespace sirius

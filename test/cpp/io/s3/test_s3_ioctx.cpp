@@ -18,11 +18,11 @@
 #include "exec/thread_pool.hpp"
 #include "io/io_errors.hpp"
 #include "io/prefetching_cache.hpp"
-#include "io/s3/credential_provider.hpp"
-#include "io/s3/mock_credential_provider.hpp"
+#include "io/s3/mock_request_authorizer.hpp"
 #include "io/s3/s3_io_object.hpp"
 #include "io/s3/s3_ioctx.hpp"
-#include "io/s3/sirius_sigv4_credential_provider.hpp"
+#include "io/s3/s3_request_authorizer.hpp"
+#include "io/s3/sirius_sigv4_authorizer.hpp"
 
 #include <cudf/io/text/byte_range_info.hpp>
 #include <cudf/utilities/span.hpp>
@@ -67,14 +67,16 @@
 
 using sirius::io::buffer_pool;
 using sirius::io::credential_error;
-using sirius::io::s3::credential_provider;
-using sirius::io::s3::mock_credential_provider;
-using sirius::io::s3::presign_method;
+using sirius::io::s3::mock_request_authorizer;
+using sirius::io::s3::s3_authorized_request;
 using sirius::io::s3::s3_io_object;
 using sirius::io::s3::s3_ioctx;
 using sirius::io::s3::s3_ioctx_config;
 using sirius::io::s3::s3_object_ref;
-using sirius::io::s3::sirius_sigv4_credential_provider;
+using sirius::io::s3::s3_request_authorizer;
+using sirius::io::s3::s3_request_method;
+using sirius::io::s3::sirius_sigv4_header_authorizer;
+using sirius::io::s3::sirius_sigv4_presigned_authorizer;
 using sirius::io::s3::static_credentials;
 
 namespace {
@@ -96,21 +98,25 @@ bool truthy_env(std::string_view name)
 
 struct s3_test_env {
   std::string endpoint;
+  std::string https_endpoint;
   std::string region;
   std::string access_key;
   std::string secret_key;
   std::string bucket;
   fs::path local_dir;
+  fs::path ca_bundle;
   bool strict{false};
 };
 
 std::optional<s3_test_env> read_s3_test_env()
 {
-  auto endpoint   = env_or("SIRIUS_TEST_S3_ENDPOINT");
-  auto access_key = env_or("SIRIUS_TEST_S3_ACCESS_KEY");
-  auto secret_key = env_or("SIRIUS_TEST_S3_SECRET_KEY");
-  auto bucket     = env_or("SIRIUS_TEST_S3_BUCKET");
-  auto local_dir  = env_or("SIRIUS_TEST_S3_LOCAL_DIR");
+  auto endpoint       = env_or("SIRIUS_TEST_S3_ENDPOINT");
+  auto https_endpoint = env_or("SIRIUS_TEST_S3_HTTPS_ENDPOINT");
+  auto access_key     = env_or("SIRIUS_TEST_S3_ACCESS_KEY");
+  auto secret_key     = env_or("SIRIUS_TEST_S3_SECRET_KEY");
+  auto bucket         = env_or("SIRIUS_TEST_S3_BUCKET");
+  auto local_dir      = env_or("SIRIUS_TEST_S3_LOCAL_DIR");
+  auto ca_bundle      = env_or("SIRIUS_TEST_S3_CA_BUNDLE");
 
   if (endpoint.empty() || access_key.empty() || secret_key.empty() || bucket.empty() ||
       local_dir.empty()) {
@@ -118,12 +124,30 @@ std::optional<s3_test_env> read_s3_test_env()
   }
 
   return s3_test_env{std::move(endpoint),
+                     std::move(https_endpoint),
                      env_or("SIRIUS_TEST_S3_REGION", "us-east-1"),
                      std::move(access_key),
                      std::move(secret_key),
                      std::move(bucket),
                      fs::path{local_dir},
+                     fs::path{ca_bundle},
                      truthy_env("SIRIUS_TEST_S3_STRICT")};
+}
+
+bool skip_if_no_s3_tls_env(std::optional<s3_test_env> const& env)
+{
+  if (!env) {
+    WARN("Skipping live S3 TLS test because SIRIUS_TEST_S3_* environment is not configured");
+    return true;
+  }
+  if (!env->https_endpoint.empty() && !env->ca_bundle.empty() && fs::exists(env->ca_bundle)) {
+    return false;
+  }
+  if (env->strict) {
+    FAIL("SIRIUS_TEST_S3_HTTPS_ENDPOINT and SIRIUS_TEST_S3_CA_BUNDLE are required for TLS tests");
+  }
+  WARN("Skipping live S3 TLS test because the HTTPS endpoint or CA bundle is not configured");
+  return true;
 }
 
 std::vector<std::uint8_t> read_binary_file(fs::path const& path)
@@ -144,12 +168,12 @@ std::shared_ptr<s3_io_object> make_s3_object(std::string bucket, std::string key
   return std::make_shared<s3_io_object>(std::move(bucket), std::move(key), size, std::move(path));
 }
 
-std::shared_ptr<credential_provider> make_live_provider(s3_test_env const& env)
+std::shared_ptr<s3_request_authorizer> make_live_provider(s3_test_env const& env)
 {
   static_credentials creds;
   creds.access_key_id     = env.access_key;
   creds.secret_access_key = env.secret_key;
-  return std::make_shared<sirius_sigv4_credential_provider>(
+  return std::make_shared<sirius_sigv4_presigned_authorizer>(
     std::move(creds), env.region, env.endpoint, 30min);
 }
 
@@ -159,8 +183,25 @@ std::shared_ptr<s3_ioctx> make_live_ioctx(s3_test_env const& env)
   return std::make_shared<s3_ioctx>(s3_ioctx_config{std::move(provider), 4, 20});
 }
 
+std::shared_ptr<s3_ioctx> make_live_tls_ioctx(s3_test_env const& env,
+                                              bool trust_generated_ca,
+                                              bool tls_verify)
+{
+  auto tls_env     = env;
+  tls_env.endpoint = env.https_endpoint;
+  auto provider    = make_live_provider(tls_env);
+
+  s3_ioctx_config cfg{};
+  cfg.creds             = std::move(provider);
+  cfg.max_connections   = 4;
+  cfg.request_timeout_s = 20;
+  cfg.tls_verify        = tls_verify;
+  if (trust_generated_ca) { cfg.ca_bundle_path = env.ca_bundle.string(); }
+  return std::make_shared<s3_ioctx>(std::move(cfg));
+}
+
 std::shared_ptr<s3_ioctx> make_live_ioctx_with_fsmr(
-  std::shared_ptr<credential_provider> provider,
+  std::shared_ptr<s3_request_authorizer> provider,
   cucascade::memory::fixed_size_host_memory_resource& host_mr)
 {
   s3_ioctx_config cfg{};
@@ -280,7 +321,12 @@ async_read_result read_ranges_async(s3_ioctx& ctx,
   return fut.get();
 }
 
-class blocking_throwing_provider final : public credential_provider {
+s3_authorized_request make_authorized_request(std::string url)
+{
+  return s3_authorized_request{std::move(url), {}};
+}
+
+class blocking_throwing_provider final : public s3_request_authorizer {
  public:
   blocking_throwing_provider()
     : _entered(_entered_promise.get_future().share()),
@@ -288,9 +334,11 @@ class blocking_throwing_provider final : public credential_provider {
   {
   }
 
-  std::string get_presigned_url(s3_object_ref const&, presign_method method) override
+  s3_authorized_request authorize(s3_object_ref const&,
+                                  s3_request_method method,
+                                  std::chrono::seconds) override
   {
-    _method.store(method == presign_method::GET ? 1 : 2, std::memory_order_relaxed);
+    _method.store(method == s3_request_method::GET ? 1 : 2, std::memory_order_relaxed);
     std::call_once(_entered_once, [&] { _entered_promise.set_value(); });
     _release.wait();
     throw credential_error("blocking_throwing_provider: forced failure");
@@ -306,10 +354,10 @@ class blocking_throwing_provider final : public credential_provider {
     std::call_once(_release_once, [&] { _release_promise.set_value(); });
   }
 
-  presign_method method() const
+  s3_request_method method() const
   {
-    return _method.load(std::memory_order_relaxed) == 1 ? presign_method::GET
-                                                        : presign_method::HEAD;
+    return _method.load(std::memory_order_relaxed) == 1 ? s3_request_method::GET
+                                                        : s3_request_method::HEAD;
   }
 
  private:
@@ -322,22 +370,24 @@ class blocking_throwing_provider final : public credential_provider {
   std::atomic<int> _method{1};
 };
 
-class blocking_first_get_provider final : public credential_provider {
+class blocking_first_get_provider final : public s3_request_authorizer {
  public:
-  explicit blocking_first_get_provider(std::shared_ptr<credential_provider> delegate)
+  explicit blocking_first_get_provider(std::shared_ptr<s3_request_authorizer> delegate)
     : _delegate(std::move(delegate)),
       _entered(_entered_promise.get_future().share()),
       _release(_release_promise.get_future().share())
   {
   }
 
-  std::string get_presigned_url(s3_object_ref const& obj, presign_method method) override
+  s3_authorized_request authorize(s3_object_ref const& obj,
+                                  s3_request_method method,
+                                  std::chrono::seconds timeout) override
   {
-    if (method == presign_method::GET && !_blocked_first_get.exchange(true)) {
+    if (method == s3_request_method::GET && !_blocked_first_get.exchange(true)) {
       std::call_once(_entered_once, [&] { _entered_promise.set_value(); });
       _release.wait();
     }
-    return _delegate->get_presigned_url(obj, method);
+    return _delegate->authorize(obj, method, timeout);
   }
 
   bool wait_until_first_get_entered(std::chrono::milliseconds timeout) const
@@ -351,7 +401,7 @@ class blocking_first_get_provider final : public credential_provider {
   }
 
  private:
-  std::shared_ptr<credential_provider> _delegate;
+  std::shared_ptr<s3_request_authorizer> _delegate;
   std::promise<void> _entered_promise;
   std::shared_future<void> _entered;
   std::promise<void> _release_promise;
@@ -469,6 +519,12 @@ class scripted_http_server {
 
   std::size_t request_count() const noexcept { return _request_count.load(); }
 
+  [[nodiscard]] std::vector<std::string> requests() const
+  {
+    std::lock_guard guard(_requests_mutex);
+    return _requests;
+  }
+
  private:
   void serve()
   {
@@ -479,7 +535,11 @@ class scripted_http_server {
       if (client < 0) { return; }
 
       ++_request_count;
-      read_request(client);
+      auto request = read_request(client);
+      {
+        std::lock_guard guard(_requests_mutex);
+        _requests.push_back(std::move(request));
+      }
 
       auto const index = _next_response.fetch_add(1);
       scripted_http_response response;
@@ -495,7 +555,7 @@ class scripted_http_server {
     }
   }
 
-  void read_request(int client)
+  std::string read_request(int client)
   {
     std::string request;
     std::array<char, 1024> buffer{};
@@ -504,15 +564,51 @@ class scripted_http_server {
       if (got <= 0) { break; }
       request.append(buffer.data(), static_cast<std::size_t>(got));
     }
+    return request;
   }
 
   std::vector<scripted_http_response> _responses;
   int _listen_fd{-1};
   std::uint16_t _port{0};
+  mutable std::mutex _requests_mutex;
+  std::vector<std::string> _requests;
   std::atomic<std::size_t> _next_response{0};
   std::atomic<std::size_t> _request_count{0};
   std::atomic<bool> _stop{false};
   std::thread _thread;
+};
+
+struct presign_observation {
+  std::string bucket;
+  std::string key;
+  s3_request_method method;
+  std::chrono::seconds timeout;
+  std::string url;
+};
+
+class recording_scripted_provider final : public s3_request_authorizer {
+ public:
+  explicit recording_scripted_provider(std::string url) : _url(std::move(url)) {}
+
+  s3_authorized_request authorize(s3_object_ref const& obj,
+                                  s3_request_method method,
+                                  std::chrono::seconds timeout) override
+  {
+    std::lock_guard guard(_mutex);
+    _calls.push_back({obj.bucket, obj.key, method, timeout, _url});
+    return make_authorized_request(_url);
+  }
+
+  [[nodiscard]] std::vector<presign_observation> calls() const
+  {
+    std::lock_guard guard(_mutex);
+    return _calls;
+  }
+
+ private:
+  std::string _url;
+  mutable std::mutex _mutex;
+  std::vector<presign_observation> _calls;
 };
 
 scripted_http_response http_error(long status, std::string reason, std::string body = {})
@@ -530,6 +626,16 @@ scripted_http_response range_ok(std::string body, std::size_t object_size)
     std::move(body)};
 }
 
+scripted_http_response range_ok_at(std::string body, std::size_t offset, std::size_t object_size)
+{
+  auto const end = offset + (body.empty() ? 0 : body.size() - 1);
+  return scripted_http_response{206,
+                                "Partial Content",
+                                {"Content-Range: bytes " + std::to_string(offset) + "-" +
+                                 std::to_string(end) + "/" + std::to_string(object_size)},
+                                std::move(body)};
+}
+
 scripted_http_response head_ok(std::size_t object_size)
 {
   return scripted_http_response{200, "OK", {"Content-Length: " + std::to_string(object_size)}, ""};
@@ -541,7 +647,8 @@ std::shared_ptr<s3_ioctx> make_retry_ioctx(std::string url,
                                            std::chrono::milliseconds jitter = 0ms,
                                            bool honor_retry_after           = false)
 {
-  auto provider = std::make_shared<mock_credential_provider>(std::move(url));
+  auto provider =
+    std::make_shared<mock_request_authorizer>(make_authorized_request(std::move(url)));
   s3_ioctx_config cfg{provider, 1, 1};
   cfg.max_retry_attempts = attempts;
   cfg.retry_backoff_base = base;
@@ -550,21 +657,23 @@ std::shared_ptr<s3_ioctx> make_retry_ioctx(std::string url,
   return std::make_shared<s3_ioctx>(std::move(cfg));
 }
 
-class delayed_get_provider final : public credential_provider {
+class delayed_get_provider final : public s3_request_authorizer {
  public:
-  delayed_get_provider(std::shared_ptr<credential_provider> delegate,
+  delayed_get_provider(std::shared_ptr<s3_request_authorizer> delegate,
                        std::chrono::milliseconds delay)
     : _delegate(std::move(delegate)), _delay(delay)
   {
   }
 
-  std::string get_presigned_url(s3_object_ref const& obj, presign_method method) override
+  s3_authorized_request authorize(s3_object_ref const& obj,
+                                  s3_request_method method,
+                                  std::chrono::seconds timeout) override
   {
-    if (method == presign_method::GET) {
+    if (method == s3_request_method::GET) {
       _get_count.fetch_add(1, std::memory_order_relaxed);
       std::this_thread::sleep_for(_delay);
     }
-    return _delegate->get_presigned_url(obj, method);
+    return _delegate->authorize(obj, method, timeout);
   }
 
   [[nodiscard]] int get_count() const noexcept
@@ -573,7 +682,7 @@ class delayed_get_provider final : public credential_provider {
   }
 
  private:
-  std::shared_ptr<credential_provider> _delegate;
+  std::shared_ptr<s3_request_authorizer> _delegate;
   std::chrono::milliseconds _delay;
   std::atomic<int> _get_count{0};
 };
@@ -647,7 +756,8 @@ TEST_CASE("s3_io_object object_path returns the constructor path", "[s3][io_obje
 
 TEST_CASE("s3_ioctx supports accepts S3 URIs without presigning", "[s3][ioctx]")
 {
-  auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
+  auto provider = std::make_shared<mock_request_authorizer>(
+    make_authorized_request("http://127.0.0.1:1/not-used"));
   s3_ioctx ctx{s3_ioctx_config{provider, 1, 1}};
 
   CHECK(ctx.supports("s3://bucket/key"));
@@ -656,7 +766,8 @@ TEST_CASE("s3_ioctx supports accepts S3 URIs without presigning", "[s3][ioctx]")
 
 TEST_CASE("s3_ioctx supports rejects non-S3 paths without throwing", "[s3][ioctx]")
 {
-  auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
+  auto provider = std::make_shared<mock_request_authorizer>(
+    make_authorized_request("http://127.0.0.1:1/not-used"));
   s3_ioctx ctx{s3_ioctx_config{provider, 1, 1}};
 
   CHECK_FALSE(ctx.supports("file:///tmp/foo"));
@@ -667,7 +778,8 @@ TEST_CASE("s3_ioctx supports rejects non-S3 paths without throwing", "[s3][ioctx
 
 TEST_CASE("s3_ioctx supports treats the S3 scheme case-insensitively", "[s3][ioctx]")
 {
-  auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
+  auto provider = std::make_shared<mock_request_authorizer>(
+    make_authorized_request("http://127.0.0.1:1/not-used"));
   s3_ioctx ctx{s3_ioctx_config{provider, 1, 1}};
 
   CHECK(ctx.supports("S3://bucket/key"));
@@ -677,7 +789,8 @@ TEST_CASE("s3_ioctx supports treats the S3 scheme case-insensitively", "[s3][ioc
 
 TEST_CASE("s3_ioctx create_io_object rejects non-S3 paths before presigning", "[s3][ioctx]")
 {
-  auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
+  auto provider = std::make_shared<mock_request_authorizer>(
+    make_authorized_request("http://127.0.0.1:1/not-used"));
   s3_ioctx ctx{s3_ioctx_config{provider, 1, 1}};
 
   try {
@@ -693,9 +806,10 @@ TEST_CASE("s3_ioctx validates config and clips EOF host reads before presigning"
 {
   CHECK_THROWS_AS(s3_ioctx(s3_ioctx_config{}), std::invalid_argument);
 
-  auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
-  auto ctx      = std::make_shared<s3_ioctx>(s3_ioctx_config{provider, 1, 1});
-  auto obj      = make_s3_object("bucket", "key", 8);
+  auto provider = std::make_shared<mock_request_authorizer>(
+    make_authorized_request("http://127.0.0.1:1/not-used"));
+  auto ctx = std::make_shared<s3_ioctx>(s3_ioctx_config{provider, 1, 1});
+  auto obj = make_s3_object("bucket", "key", 8);
   std::vector<std::uint8_t> dst(4, 0xAB);
 
   CHECK(ctx->host_read(*obj, 8, dst.size(), dst.data()) == 0);
@@ -715,9 +829,11 @@ TEST_CASE("s3_ioctx config exposes async pool and retry defaults", "[s3][ioctx]"
   CHECK(cfg.honor_retry_after);
 }
 
-TEST_CASE("s3_ioctx asks credential_provider for method-specific presigned URLs", "[s3][ioctx]")
+TEST_CASE("s3_ioctx asks s3_request_authorizer for method-specific authorizations",
+          "[s3][ioctx][authorizer]")
 {
-  auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
+  auto provider = std::make_shared<mock_request_authorizer>(
+    make_authorized_request("http://127.0.0.1:1/not-used"));
   provider->set_throw("stop before libcurl performs a request");
   auto ctx = std::make_shared<s3_ioctx>(s3_ioctx_config{provider, 1, 1});
   auto obj = make_s3_object("bucket", "key", 8);
@@ -734,10 +850,103 @@ TEST_CASE("s3_ioctx asks credential_provider for method-specific presigned URLs"
   CHECK(provider->last_key() == "key");
 }
 
+TEST_CASE("s3_ioctx authorizes every HTTP request inline with method and timeout",
+          "[s3][ioctx][authorizer]")
+{
+  scripted_http_server server({head_ok(6), range_ok_at("cde", 2, 6), range_ok_at("ab", 0, 6)});
+  auto provider =
+    std::make_shared<recording_scripted_provider>(server.url("/object?X-Amz-Signature=fake"));
+  s3_ioctx_config cfg{provider, 1, 7};
+  cfg.max_retry_attempts = 1;
+  auto ctx               = std::make_shared<s3_ioctx>(std::move(cfg));
+
+  CHECK(ctx->head_object_size("bucket", "key") == 6);
+
+  auto obj = make_s3_object("bucket", "key", 6);
+  std::vector<std::uint8_t> middle(3);
+  REQUIRE(ctx->host_read(*obj, 2, middle.size(), middle.data()) == middle.size());
+  CHECK(std::string(middle.begin(), middle.end()) == "cde");
+
+  std::vector<std::uint8_t> head(2);
+  REQUIRE(ctx->host_read(*obj, 0, head.size(), head.data()) == head.size());
+  CHECK(std::string(head.begin(), head.end()) == "ab");
+
+  auto calls = provider->calls();
+  REQUIRE(calls.size() == server.request_count());
+  REQUIRE(calls.size() == 3);
+  auto requests = server.requests();
+  REQUIRE(requests.size() == 3);
+
+  CHECK(calls[0].bucket == "bucket");
+  CHECK(calls[0].key == "key");
+  CHECK(calls[0].method == s3_request_method::HEAD);
+  CHECK(calls[0].timeout > std::chrono::seconds{0});
+  CHECK(calls[0].url.find("X-Amz-Signature=fake") != std::string::npos);
+  CHECK(requests[0].rfind("HEAD ", 0) == 0);
+  CHECK(requests[0].find("Range:") == std::string::npos);
+
+  CHECK(calls[1].bucket == "bucket");
+  CHECK(calls[1].key == "key");
+  CHECK(calls[1].method == s3_request_method::GET);
+  CHECK(calls[1].timeout > std::chrono::seconds{0});
+  CHECK(calls[1].url.find("X-Amz-Signature=fake") != std::string::npos);
+  CHECK(requests[1].rfind("GET ", 0) == 0);
+  CHECK(requests[1].find("Range: bytes=2-4") != std::string::npos);
+
+  CHECK(calls[2].bucket == "bucket");
+  CHECK(calls[2].key == "key");
+  CHECK(calls[2].method == s3_request_method::GET);
+  CHECK(calls[2].timeout > std::chrono::seconds{0});
+  CHECK(calls[2].url.find("X-Amz-Signature=fake") != std::string::npos);
+  CHECK(requests[2].rfind("GET ", 0) == 0);
+  CHECK(requests[2].find("Range: bytes=0-1") != std::string::npos);
+}
+
+TEST_CASE("s3_ioctx attaches SigV4 header authorizations and leaves Range unsigned",
+          "[s3][ioctx][authorizer]")
+{
+  scripted_http_server server({head_ok(6), range_ok_at("cde", 2, 6)});
+
+  static_credentials creds;
+  creds.access_key_id     = "AKIAIOSFODNN7EXAMPLE";
+  creds.secret_access_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+  auto provider =
+    std::make_shared<sirius_sigv4_header_authorizer>(std::move(creds), "us-east-1", server.url(""));
+
+  s3_ioctx_config cfg{provider, 1, 7};
+  cfg.max_retry_attempts = 1;
+  auto ctx               = std::make_shared<s3_ioctx>(std::move(cfg));
+
+  CHECK(ctx->head_object_size("bucket", "key") == 6);
+
+  auto obj = make_s3_object("bucket", "key", 6);
+  std::vector<std::uint8_t> middle(3);
+  REQUIRE(ctx->host_read(*obj, 2, middle.size(), middle.data()) == middle.size());
+  CHECK(std::string(middle.begin(), middle.end()) == "cde");
+
+  auto requests = server.requests();
+  REQUIRE(requests.size() == 2);
+
+  CHECK(requests[0].rfind("HEAD /bucket/key HTTP/", 0) == 0);
+  CHECK(requests[0].find("X-Amz-Signature") == std::string::npos);
+  CHECK(requests[0].find("Authorization: AWS4-HMAC-SHA256 ") != std::string::npos);
+  CHECK(requests[0].find("x-amz-date:") != std::string::npos);
+  CHECK(requests[0].find("x-amz-content-sha256:") != std::string::npos);
+  CHECK(requests[0].find("Range:") == std::string::npos);
+
+  CHECK(requests[1].rfind("GET /bucket/key HTTP/", 0) == 0);
+  CHECK(requests[1].find("X-Amz-Signature") == std::string::npos);
+  CHECK(requests[1].find("Authorization: AWS4-HMAC-SHA256 ") != std::string::npos);
+  CHECK(requests[1].find("x-amz-date:") != std::string::npos);
+  CHECK(requests[1].find("x-amz-content-sha256:") != std::string::npos);
+  CHECK(requests[1].find("Range: bytes=2-4") != std::string::npos);
+}
+
 TEST_CASE("s3_ioctx clips physical byte ranges to file size", "[s3][ioctx]")
 {
-  auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
-  auto ctx      = std::make_shared<s3_ioctx>(s3_ioctx_config{provider, 1, 1});
+  auto provider = std::make_shared<mock_request_authorizer>(
+    make_authorized_request("http://127.0.0.1:1/not-used"));
+  auto ctx = std::make_shared<s3_ioctx>(s3_ioctx_config{provider, 1, 1});
 
   auto clipped = ctx->compute_physical_range({4, 16}, 10);
   CHECK(clipped.offset() == 4);
@@ -770,13 +979,14 @@ TEST_CASE("s3_ioctx async host reads keep context and object alive until complet
   CHECK(bytes == 0);
   REQUIRE(ep != nullptr);
   CHECK_THROWS_AS(std::rethrow_exception(ep), credential_error);
-  CHECK(provider->method() == presign_method::GET);
+  CHECK(provider->method() == s3_request_method::GET);
 }
 
 TEST_CASE("s3_ioctx schedules async read entry points on the injected pool", "[s3][ioctx]")
 {
   sirius::exec::static_thread_pool pool(2, "s3tp");
-  auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
+  auto provider = std::make_shared<mock_request_authorizer>(
+    make_authorized_request("http://127.0.0.1:1/not-used"));
   s3_ioctx_config cfg{provider, 1, 1};
   cfg.async_thread_pool = &pool;
 
@@ -809,7 +1019,8 @@ TEST_CASE("s3_ioctx schedules async read entry points on the injected pool", "[s
 TEST_CASE("s3_ioctx keeps standalone detached async fallback when no pool is injected",
           "[s3][ioctx]")
 {
-  auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
+  auto provider = std::make_shared<mock_request_authorizer>(
+    make_authorized_request("http://127.0.0.1:1/not-used"));
   s3_ioctx_config cfg{provider, 1, 1};
   cfg.async_thread_pool = nullptr;
 
@@ -827,7 +1038,8 @@ TEST_CASE("s3_ioctx keeps standalone detached async fallback when no pool is inj
 TEST_CASE("s3_ioctx shutdown does not stop the caller-owned async pool", "[s3][ioctx]")
 {
   sirius::exec::static_thread_pool pool(1, "s3alive");
-  auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
+  auto provider = std::make_shared<mock_request_authorizer>(
+    make_authorized_request("http://127.0.0.1:1/not-used"));
   s3_ioctx_config cfg{provider, 1, 1};
   cfg.async_thread_pool = &pool;
 
@@ -952,8 +1164,108 @@ TEST_CASE("s3_ioctx retry backoff timing stays within tolerance", "[s3][ioctx][r
   CHECK(server.request_count() == 2);
 }
 
+TEST_CASE("s3_ioctx host_read_ranges short-circuits EOF-only ranges before presigning",
+          "[s3][ioctx]")
+{
+  auto provider = std::make_shared<mock_request_authorizer>(
+    make_authorized_request("http://127.0.0.1:1/not-used"));
+  auto ctx = std::make_shared<s3_ioctx>(s3_ioctx_config{provider, 1, 1});
+  auto obj = make_s3_object("bucket", "object.bin", 100);
+
+  std::vector<std::byte> a(1);
+  std::vector<std::byte> b(1);
+  std::vector<cudf::io::text::byte_range_info> ranges{{100, 16}, {128, 32}};
+  std::vector<cudf::host_span<std::byte>> dst{{a.data(), a.size()}, {b.data(), b.size()}};
+
+  auto [bytes, ep] = read_ranges_async(*ctx, *obj, ranges, std::span{dst});
+
+  CHECK(bytes == 0);
+  CHECK(ep == nullptr);
+  CHECK(provider->call_count() == 0);
+  CHECK(provider->get_count() == 0);
+}
+
+TEST_CASE("s3_ioctx host_read_ranges validates dst against EOF-clipped sizes before presigning",
+          "[s3][ioctx]")
+{
+  auto provider = std::make_shared<mock_request_authorizer>(
+    make_authorized_request("http://127.0.0.1:1/not-used"));
+  auto ctx = std::make_shared<s3_ioctx>(s3_ioctx_config{provider, 1, 1});
+  auto obj = make_s3_object("bucket", "object.bin", 100);
+
+  std::vector<std::byte> dst_bytes(3);
+  std::vector<cudf::io::text::byte_range_info> ranges{{96, 16}};
+  std::vector<cudf::host_span<std::byte>> dst{{dst_bytes.data(), dst_bytes.size()}};
+
+  auto [bytes, ep] = read_ranges_async(*ctx, *obj, ranges, std::span{dst});
+
+  CHECK(bytes == 0);
+  REQUIRE(ep != nullptr);
+  CHECK_THROWS_WITH(std::rethrow_exception(ep), "s3_ioctx::host_read_ranges: dst span too small");
+  CHECK(provider->call_count() == 0);
+  CHECK(provider->get_count() == 0);
+}
+
+TEST_CASE("s3_ioctx host_read_ranges reads the clipped EOF-crossing byte count", "[s3][ioctx]")
+{
+  scripted_http_server server({range_ok_at("tail", 96, 100)});
+  auto provider = std::make_shared<mock_request_authorizer>(make_authorized_request(server.url()));
+  auto ctx      = std::make_shared<s3_ioctx>(s3_ioctx_config{provider, 1, 1});
+  auto obj      = make_s3_object("bucket", "object.bin", 100);
+
+  std::vector<std::byte> dst_bytes(4);
+  std::vector<cudf::io::text::byte_range_info> ranges{{96, 16}};
+  std::vector<cudf::host_span<std::byte>> dst{{dst_bytes.data(), dst_bytes.size()}};
+
+  auto [bytes, ep] = read_ranges_async(*ctx, *obj, ranges, std::span{dst});
+
+  CHECK(ep == nullptr);
+  CHECK(bytes == 4);
+  CHECK(provider->get_count() == 1);
+  CHECK(server.request_count() == 1);
+  CHECK(std::string(reinterpret_cast<char const*>(dst_bytes.data()), dst_bytes.size()) == "tail");
+}
+
+TEST_CASE("s3_ioctx host_read_ranges_async_io reports validation errors asynchronously",
+          "[s3][ioctx]")
+{
+  auto exercise = [](sirius::exec::static_thread_pool* pool) {
+    auto provider = std::make_shared<mock_request_authorizer>(
+      make_authorized_request("http://127.0.0.1:1/not-used"));
+    s3_ioctx_config cfg{provider, 1, 1};
+    cfg.async_thread_pool = pool;
+    auto ctx              = std::make_shared<s3_ioctx>(std::move(cfg));
+    auto obj              = make_s3_object("bucket", "object.bin", 100);
+
+    std::vector<std::byte> dst_bytes(3);
+    std::vector<cudf::io::text::byte_range_info> ranges{{96, 16}};
+    std::vector<cudf::host_span<std::byte>> dst{{dst_bytes.data(), dst_bytes.size()}};
+    std::promise<async_read_result> done;
+    auto fut = done.get_future();
+
+    REQUIRE_NOTHROW(ctx->host_read_ranges_async_io(
+      *obj, ranges, std::span{dst}, [&done](auto bytes, auto ep) { done.set_value({bytes, ep}); }));
+    REQUIRE(fut.wait_for(5s) == std::future_status::ready);
+
+    auto [bytes, ep] = fut.get();
+    CHECK(bytes == 0);
+    REQUIRE(ep != nullptr);
+    CHECK_THROWS_WITH(std::rethrow_exception(ep), "s3_ioctx::host_read_ranges: dst span too small");
+    CHECK(provider->call_count() == 0);
+    CHECK(provider->get_count() == 0);
+  };
+
+  SECTION("no injected pool") { exercise(nullptr); }
+
+  SECTION("injected pool")
+  {
+    sirius::exec::static_thread_pool pool(1, "s3err");
+    exercise(&pool);
+  }
+}
+
 TEST_CASE("s3_ioctx reads single objects from MinIO with presigned range GETs",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -984,8 +1296,73 @@ TEST_CASE("s3_ioctx reads single objects from MinIO with presigned range GETs",
   CHECK(std::all_of(eof.begin(), eof.end(), [](auto b) { return b == 0xCC; }));
 }
 
+TEST_CASE("s3_ioctx reads MinIO over HTTPS when configured with the generated CA bundle",
+          "[.][s3][integration][tls][ioctx]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_tls_env(env)) { return; }
+
+  std::string const key = "parquet/nation.parquet";
+  auto local            = read_binary_file(env->local_dir / key);
+  auto ctx  = make_live_tls_ioctx(*env, /*trust_generated_ca=*/true, /*tls_verify=*/true);
+  auto size = try_head_or_skip(*ctx, *env, key);
+  if (!size) return;
+
+  REQUIRE(*size == local.size());
+  auto obj = make_s3_object(env->bucket, key, *size);
+
+  std::vector<std::uint8_t> head(64);
+  REQUIRE(ctx->host_read(*obj, 0, head.size(), head.data()) == head.size());
+  require_bytes_equal(head, local, 0);
+
+  std::vector<std::uint8_t> middle(128);
+  auto const offset = local.size() / 2;
+  REQUIRE(ctx->host_read(*obj, offset, middle.size(), middle.data()) == middle.size());
+  require_bytes_equal(middle, local, offset);
+}
+
+TEST_CASE("s3_ioctx rejects self-signed MinIO HTTPS when no CA bundle is configured",
+          "[.][s3][integration][tls][ioctx]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_tls_env(env)) { return; }
+
+  auto ctx = make_live_tls_ioctx(*env, /*trust_generated_ca=*/false, /*tls_verify=*/true);
+  try {
+    (void)ctx->head_object_size(env->bucket, "parquet/nation.parquet");
+    FAIL("Expected self-signed HTTPS MinIO to fail without the generated CA bundle");
+  } catch (std::exception const& e) {
+    std::string const msg = e.what();
+    INFO(msg);
+    CHECK((msg.find("SSL") != std::string::npos || msg.find("certificate") != std::string::npos ||
+           msg.find("peer") != std::string::npos || msg.find("curl 60") != std::string::npos));
+  }
+}
+
+TEST_CASE("s3_ioctx TLS scaffold leaves the existing HTTP MinIO path unchanged",
+          "[.][s3][integration][tls][ioctx]")
+{
+  auto env = read_s3_test_env();
+  if (!env) {
+    WARN("Skipping live S3 TLS regression because SIRIUS_TEST_S3_* environment is not configured");
+    return;
+  }
+
+  std::string const key = "hello.txt";
+  auto local            = read_binary_file(env->local_dir / key);
+  auto ctx              = make_live_ioctx(*env);
+  auto size             = try_head_or_skip(*ctx, *env, key);
+  if (!size) return;
+
+  REQUIRE(*size == local.size());
+  auto obj = make_s3_object(env->bucket, key, *size);
+  std::vector<std::uint8_t> got(local.size());
+  REQUIRE(ctx->host_read(*obj, 0, got.size(), got.data()) == got.size());
+  CHECK(got == local);
+}
+
 TEST_CASE("s3_ioctx create_io_object populates S3 object metadata from MinIO",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1011,7 +1388,7 @@ TEST_CASE("s3_ioctx create_io_object populates S3 object metadata from MinIO",
 }
 
 TEST_CASE("s3_ioctx create_io_object propagates missing S3 key HEAD failures",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1023,7 +1400,7 @@ TEST_CASE("s3_ioctx create_io_object propagates missing S3 key HEAD failures",
   CHECK_THROWS(ctx->create_io_object(s3_uri(env->bucket, "nonexistent-key-xyz")));
 }
 
-TEST_CASE("s3_ioctx reads multiple MinIO byte ranges", "[s3][ioctx][integration]")
+TEST_CASE("s3_ioctx reads multiple MinIO byte ranges", "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1068,7 +1445,7 @@ TEST_CASE("s3_ioctx reads multiple MinIO byte ranges", "[s3][ioctx][integration]
 }
 
 TEST_CASE("s3_ioctx async range reads copy caller span descriptors before dispatch",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1083,7 +1460,7 @@ TEST_CASE("s3_ioctx async range reads copy caller span descriptors before dispat
   static_credentials creds;
   creds.access_key_id     = env->access_key;
   creds.secret_access_key = env->secret_key;
-  auto delegate           = std::make_shared<sirius_sigv4_credential_provider>(
+  auto delegate           = std::make_shared<sirius_sigv4_presigned_authorizer>(
     std::move(creds), env->region, env->endpoint, 30min);
   auto provider = std::make_shared<blocking_first_get_provider>(std::move(delegate));
   auto ctx      = std::make_shared<s3_ioctx>(s3_ioctx_config{provider, 2, 20});
@@ -1126,7 +1503,7 @@ TEST_CASE("s3_ioctx async range reads copy caller span descriptors before dispat
 }
 
 TEST_CASE("s3_ioctx host_read_ranges clips EOF-crossing range before dst validation",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1157,7 +1534,7 @@ TEST_CASE("s3_ioctx host_read_ranges clips EOF-crossing range before dst validat
 }
 
 TEST_CASE("s3_ioctx host_read_ranges returns zero for ranges starting at EOF",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1185,7 +1562,7 @@ TEST_CASE("s3_ioctx host_read_ranges returns zero for ranges starting at EOF",
 }
 
 TEST_CASE("s3_ioctx host_read_ranges rejects dst smaller than clipped size",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1216,7 +1593,7 @@ TEST_CASE("s3_ioctx host_read_ranges rejects dst smaller than clipped size",
 }
 
 TEST_CASE("s3_ioctx host_read_ranges clips EOF-crossing ranges independently",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1251,7 +1628,7 @@ TEST_CASE("s3_ioctx host_read_ranges clips EOF-crossing ranges independently",
 }
 
 TEST_CASE("s3_ioctx device_read uses bounded FSMR staging for multi-chunk S3 objects",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1286,7 +1663,7 @@ TEST_CASE("s3_ioctx device_read uses bounded FSMR staging for multi-chunk S3 obj
 }
 
 TEST_CASE("s3_ioctx device_read with FSMR staging handles nonzero-offset remainder chunks",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1319,7 +1696,7 @@ TEST_CASE("s3_ioctx device_read with FSMR staging handles nonzero-offset remaind
 }
 
 TEST_CASE("s3_ioctx device_read with FSMR staging clips EOF-crossing reads",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1348,15 +1725,16 @@ TEST_CASE("s3_ioctx device_read with FSMR staging clips EOF-crossing reads",
 }
 
 TEST_CASE("s3_ioctx device_read with FSMR staging returns zero without borrowing a block",
-          "[s3][ioctx][integration]")
+          "[s3][ioctx]")
 {
   constexpr std::size_t block_size = 4096;
   fsmr_test_resources memory(block_size, block_size, block_size);
   auto before_peak = memory.host_mr.get_peak_total_allocated_bytes();
 
-  auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
-  auto ctx      = make_live_ioctx_with_fsmr(provider, memory.host_mr);
-  auto obj      = make_s3_object("bucket", "key", 128);
+  auto provider = std::make_shared<mock_request_authorizer>(
+    make_authorized_request("http://127.0.0.1:1/not-used"));
+  auto ctx = make_live_ioctx_with_fsmr(provider, memory.host_mr);
+  auto obj = make_s3_object("bucket", "key", 128);
 
   rmm::cuda_stream stream;
   CHECK(ctx->device_read(*obj, 0, 0, nullptr, stream.view()) == 0);
@@ -1365,7 +1743,7 @@ TEST_CASE("s3_ioctx device_read with FSMR staging returns zero without borrowing
 }
 
 TEST_CASE("s3_ioctx device_read keeps vector fallback when no FSMR is injected",
-          "[s3][ioctx][integration]")
+          "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1386,13 +1764,13 @@ TEST_CASE("s3_ioctx device_read keeps vector fallback when no FSMR is injected",
   require_bytes_equal(copy_device_to_host(dst, got), local, 0);
 }
 
-TEST_CASE("s3_ioctx device_read rejects an injected FSMR with zero block size",
-          "[s3][ioctx][integration]")
+TEST_CASE("s3_ioctx device_read rejects an injected FSMR with zero block size", "[s3][ioctx]")
 {
   fsmr_test_resources memory(/*block_size=*/0, /*capacity=*/0, /*memory_limit=*/0);
-  auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
-  auto ctx      = make_live_ioctx_with_fsmr(provider, memory.host_mr);
-  auto obj      = make_s3_object("bucket", "key", 1);
+  auto provider = std::make_shared<mock_request_authorizer>(
+    make_authorized_request("http://127.0.0.1:1/not-used"));
+  auto ctx = make_live_ioctx_with_fsmr(provider, memory.host_mr);
+  auto obj = make_s3_object("bucket", "key", 1);
 
   rmm::cuda_stream stream;
   device_byte_buffer dst(1);
@@ -1408,13 +1786,14 @@ TEST_CASE("s3_ioctx device_read rejects an injected FSMR with zero block size",
 }
 
 TEST_CASE("s3_ioctx device_read reports context when FSMR staging allocation is exhausted",
-          "[s3][ioctx][integration]")
+          "[s3][ioctx]")
 {
   constexpr std::size_t block_size = 4096;
   fsmr_test_resources memory(block_size, /*capacity=*/0, /*memory_limit=*/0);
-  auto provider = std::make_shared<mock_credential_provider>("http://127.0.0.1:1/not-used");
-  auto ctx      = make_live_ioctx_with_fsmr(provider, memory.host_mr);
-  auto obj      = make_s3_object("bucket", "key", 1);
+  auto provider = std::make_shared<mock_request_authorizer>(
+    make_authorized_request("http://127.0.0.1:1/not-used"));
+  auto ctx = make_live_ioctx_with_fsmr(provider, memory.host_mr);
+  auto obj = make_s3_object("bucket", "key", 1);
 
   rmm::cuda_stream stream;
   device_byte_buffer dst(1);
@@ -1432,7 +1811,7 @@ TEST_CASE("s3_ioctx device_read reports context when FSMR staging allocation is 
 }
 
 TEST_CASE("s3_ioctx host_read_ranges_async_io fans ranges across the injected pool",
-          "[s3][ioctx][parallel][integration]")
+          "[.][s3][integration][ioctx][parallel]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -1489,7 +1868,7 @@ TEST_CASE("s3_ioctx host_read_ranges_async_io fans ranges across the injected po
 }
 
 TEST_CASE("s3_ioctx destroys its prefetch cache before shutting down S3 async workers",
-          "[s3][ioctx][teardown][integration]")
+          "[.][s3][integration][ioctx][teardown]")
 {
   auto env = read_s3_test_env();
   if (!env) {

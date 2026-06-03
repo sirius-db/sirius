@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "io/object_store_config.hpp"
+
 #include <chrono>
 #include <optional>
 #include <string>
@@ -23,8 +25,8 @@
 namespace sirius::io::s3 {
 
 /**
- * @brief Credentials snapshot consumed by @c sirius_sigv4_credential_provider's
- *        constructor (and other static-creds-based providers).
+ * @brief Credentials snapshot consumed by @c sirius_sigv4_presigned_authorizer's
+ *        constructor (and other static-creds-based authorizers).
  *
  * Long-lived creds (typical SET s3_access_key / s3_secret_key flow): leave
  * @c session_token empty and @c expires_at @c nullopt.
@@ -35,10 +37,10 @@ namespace sirius::io::s3 {
  * may use it to schedule re-acquisition.
  *
  * This is a pure POD by design: integration code constructs it from
- * @c object_store_config string fields, hands it to the provider's
- * constructor, and the provider holds an internal copy. There is no public
- * accessor on @c credential_provider to read these back — the seam is
- * presigned-URL-only (see @c credential_provider.hpp).
+ * @c object_store_config string fields, hands it to the authorizer's
+ * constructor, and the authorizer holds an internal copy. There is no public
+ * accessor on @c s3_request_authorizer to read these back — the seam exposes
+ * only @c authorize() (see @c s3_request_authorizer.hpp).
  */
 struct static_credentials {
   std::string access_key_id;
@@ -46,5 +48,18 @@ struct static_credentials {
   std::string session_token;
   std::optional<std::chrono::system_clock::time_point> expires_at;
 };
+
+/// Map an @c object_store_config's static-credential fields into a
+/// @c static_credentials snapshot: access key, secret, and (for STS temporary
+/// credentials) session token. @c expires_at is left @c nullopt —
+/// @c object_store_config carries no expiry.
+inline static_credentials static_credentials_from(object_store_config const& cfg)
+{
+  static_credentials creds;
+  creds.access_key_id     = cfg.access_key;
+  creds.secret_access_key = cfg.secret_key;
+  creds.session_token     = cfg.session_token;
+  return creds;
+}
 
 }  // namespace sirius::io::s3

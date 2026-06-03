@@ -52,7 +52,8 @@ cpu_source_task::cpu_source_task(uint64_t task_id,
                                  cucascade::shared_data_repository* data_repo,
                                  std::unique_ptr<cpu_source_task_local_state> local_state,
                                  std::shared_ptr<cpu_source_task_global_state> global_state)
-  : sirius_pipeline_itask(std::move(local_state), std::move(global_state)), _data_repo(data_repo)
+  : sirius_pipeline_itask(task_id, std::move(local_state), std::move(global_state)),
+    _data_repo(data_repo)
 {
   if (auto* pipeline = _global_state->cast<cpu_source_task_global_state>().get_pipeline()) {
     pipeline->mark_task_created();

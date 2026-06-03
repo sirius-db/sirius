@@ -15,18 +15,16 @@
  */
 
 // sirius
+#include <expression/ast/from_duckdb.hpp>
+#include <expression/ast/node.hpp>
+#include <expression/value.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
+#include <helper/logical_type.hpp>
 #include <log/logging.hpp>
 #include <sirius/exception.hpp>
 
 // duckdb
 #include <duckdb/common/assert.hpp>
-#include <duckdb/common/exception.hpp>
-#include <duckdb/common/types/date.hpp>
-#include <duckdb/common/types/decimal.hpp>
-#include <duckdb/common/types/hugeint.hpp>
-#include <duckdb/common/types/timestamp.hpp>
-#include <duckdb/planner/expression/bound_constant_expression.hpp>
 #include <duckdb/planner/expression/bound_operator_expression.hpp>
 
 // cudf
@@ -43,18 +41,30 @@
 
 // standard library
 #include <algorithm>
+#include <string>
+#include <variant>
 
 namespace {
+
+// Read a typed constant from one of the values in a sirius::ast::in_list. Assumes
+// the AST translator has guaranteed every entry holds sirius::ast::constant.
 template <typename T>
-std::unique_ptr<cudf::column> execute_numeric_in(const duckdb::BoundOperatorExpression& expr,
-                                                 const cudf::column_view& input_view,
-                                                 rmm::device_async_resource_ref mr,
-                                                 rmm::cuda_stream_view stream)
+T const& get_const_payload(::sirius::ast::node const& n)
+{
+  auto const& c = n.get<::sirius::ast::constant>();
+  return std::get<T>(c.payload);
+}
+
+template <typename T>
+std::unique_ptr<cudf::column> execute_numeric_in_ast(const ::sirius::ast::in_list& alt,
+                                                     const cudf::column_view& input_view,
+                                                     rmm::device_async_resource_ref mr,
+                                                     rmm::cuda_stream_view stream)
 {
   std::vector<T> children_vals;
-  for (std::size_t child = 1; child < expr.children.size(); ++child) {
-    const auto& child_expression = expr.children[child]->Cast<duckdb::BoundConstantExpression>();
-    children_vals.push_back(child_expression.value.GetValue<T>());
+  children_vals.reserve(alt.values.size());
+  for (auto const& v : alt.values) {
+    children_vals.push_back(get_const_payload<T>(*v));
   }
   rmm::device_uvector<T> children_vals_d(children_vals.size(), stream, mr);
   CUDF_CUDA_TRY(cudaMemcpyAsync(children_vals_d.data(),
@@ -71,24 +81,26 @@ std::unique_ptr<cudf::column> execute_numeric_in(const duckdb::BoundOperatorExpr
   return cudf::contains(children_view, input_view, stream, mr);
 }
 
-// For decimal (fixed_point) types. Uses GetValueUnsafe<Rep> to avoid lossy conversion through
-// double, and unpacks duckdb::hugeint_t into __int128_t for decimal128.
+// For decimal (fixed_point) types. Reads the rep directly from sirius::decimal{32,64,128}.
 template <typename DecimalT>
-std::unique_ptr<cudf::column> execute_decimal_in(const duckdb::BoundOperatorExpression& expr,
-                                                 const cudf::column_view& input_view,
-                                                 rmm::device_async_resource_ref mr,
-                                                 rmm::cuda_stream_view stream)
+std::unique_ptr<cudf::column> execute_decimal_in_ast(const ::sirius::ast::in_list& alt,
+                                                     const cudf::column_view& input_view,
+                                                     rmm::device_async_resource_ref mr,
+                                                     rmm::cuda_stream_view stream)
 {
   using Rep = typename DecimalT::rep;
   std::vector<Rep> children_vals;
-  children_vals.reserve(expr.children.size() - 1);
-  for (std::size_t child = 1; child < expr.children.size(); ++child) {
-    auto const& child_expression = expr.children[child]->Cast<duckdb::BoundConstantExpression>();
-    if constexpr (std::is_same_v<DecimalT, numeric::decimal128>) {
-      auto hugeint_value = child_expression.value.GetValueUnsafe<duckdb::hugeint_t>();
-      children_vals.push_back((__int128_t(hugeint_value.upper) << 64) | hugeint_value.lower);
+  children_vals.reserve(alt.values.size());
+  for (auto const& v : alt.values) {
+    auto const& payload = v->get<::sirius::ast::constant>().payload;
+    if constexpr (std::is_same_v<DecimalT, numeric::decimal32>) {
+      children_vals.push_back(std::get<::sirius::decimal32>(payload).value);
+    } else if constexpr (std::is_same_v<DecimalT, numeric::decimal64>) {
+      children_vals.push_back(std::get<::sirius::decimal64>(payload).value);
+    } else if constexpr (std::is_same_v<DecimalT, numeric::decimal128>) {
+      children_vals.push_back(std::get<::sirius::decimal128>(payload).value);
     } else {
-      children_vals.push_back(child_expression.value.GetValueUnsafe<Rep>());
+      static_assert(sizeof(DecimalT) == 0, "Unsupported decimal type");
     }
   }
   rmm::device_uvector<Rep> children_vals_d(children_vals.size(), stream, mr);
@@ -107,29 +119,28 @@ std::unique_ptr<cudf::column> execute_decimal_in(const duckdb::BoundOperatorExpr
   return cudf::contains(children_view, input_view, stream, mr);
 }
 
-// For timestamp types. Pulls the underlying integral count out of the duckdb wrapper struct
-// (date_t.days / timestamp_*_t.value) and uploads as the cudf timestamp's rep type.
+// For timestamp types. Pulls the underlying integral count out of the matching sirius wrapper.
 template <typename CudfTimestampT>
-std::unique_ptr<cudf::column> execute_timestamp_in(const duckdb::BoundOperatorExpression& expr,
-                                                   const cudf::column_view& input_view,
-                                                   rmm::device_async_resource_ref mr,
-                                                   rmm::cuda_stream_view stream)
+std::unique_ptr<cudf::column> execute_timestamp_in_ast(const ::sirius::ast::in_list& alt,
+                                                       const cudf::column_view& input_view,
+                                                       rmm::device_async_resource_ref mr,
+                                                       rmm::cuda_stream_view stream)
 {
   using Rep = typename CudfTimestampT::rep;
   std::vector<Rep> children_vals;
-  children_vals.reserve(expr.children.size() - 1);
-  for (std::size_t child = 1; child < expr.children.size(); ++child) {
-    const auto& child_expression = expr.children[child]->Cast<duckdb::BoundConstantExpression>();
+  children_vals.reserve(alt.values.size());
+  for (auto const& v : alt.values) {
+    auto const& payload = v->get<::sirius::ast::constant>().payload;
     if constexpr (std::is_same_v<CudfTimestampT, cudf::timestamp_D>) {
-      children_vals.push_back(child_expression.value.GetValue<duckdb::date_t>().days);
+      children_vals.push_back(std::get<::sirius::date_value>(payload).days);
     } else if constexpr (std::is_same_v<CudfTimestampT, cudf::timestamp_s>) {
-      children_vals.push_back(child_expression.value.GetValue<duckdb::timestamp_sec_t>().value);
+      children_vals.push_back(std::get<::sirius::timestamp_sec_value>(payload).value);
     } else if constexpr (std::is_same_v<CudfTimestampT, cudf::timestamp_ms>) {
-      children_vals.push_back(child_expression.value.GetValue<duckdb::timestamp_ms_t>().value);
+      children_vals.push_back(std::get<::sirius::timestamp_ms_value>(payload).value);
     } else if constexpr (std::is_same_v<CudfTimestampT, cudf::timestamp_us>) {
-      children_vals.push_back(child_expression.value.GetValue<duckdb::timestamp_tz_t>().value);
+      children_vals.push_back(std::get<::sirius::timestamp_us_value>(payload).value);
     } else if constexpr (std::is_same_v<CudfTimestampT, cudf::timestamp_ns>) {
-      children_vals.push_back(child_expression.value.GetValue<duckdb::timestamp_ns_t>().value);
+      children_vals.push_back(std::get<::sirius::timestamp_ns_value>(payload).value);
     } else {
       static_assert(sizeof(CudfTimestampT) == 0, "Unsupported cudf timestamp type");
     }
@@ -149,28 +160,53 @@ std::unique_ptr<cudf::column> execute_timestamp_in(const duckdb::BoundOperatorEx
   return cudf::contains(children_view, input_view, stream, mr);
 }
 
-std::unique_ptr<cudf::column> execute_string_in(const duckdb::BoundOperatorExpression& expr,
-                                                const cudf::column_view& input_view,
-                                                rmm::device_async_resource_ref mr,
-                                                rmm::cuda_stream_view stream)
+// BOOL8 has the cudf storage type uint8_t but the AST constant payload variant
+// holds the value as `bool`. Use a separate helper that reads `bool` from the
+// variant and uploads as uint8_t (matching the cudf BOOL8 storage convention).
+std::unique_ptr<cudf::column> execute_bool_in_ast(const ::sirius::ast::in_list& alt,
+                                                  const cudf::column_view& input_view,
+                                                  rmm::device_async_resource_ref mr,
+                                                  rmm::cuda_stream_view stream)
 {
-  auto const num_strings = static_cast<cudf::size_type>(expr.children.size() - 1);
+  std::vector<uint8_t> children_vals;
+  children_vals.reserve(alt.values.size());
+  for (auto const& v : alt.values) {
+    children_vals.push_back(get_const_payload<bool>(*v) ? uint8_t{1} : uint8_t{0});
+  }
+  rmm::device_uvector<uint8_t> children_vals_d(children_vals.size(), stream, mr);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(children_vals_d.data(),
+                                children_vals.data(),
+                                children_vals.size() * sizeof(uint8_t),
+                                cudaMemcpyHostToDevice,
+                                stream));
+  cudf::column_view children_view(input_view.type(),
+                                  static_cast<cudf::size_type>(children_vals.size()),
+                                  children_vals_d.data(),
+                                  nullptr,
+                                  0,
+                                  0);
+  return cudf::contains(children_view, input_view, stream, mr);
+}
+
+std::unique_ptr<cudf::column> execute_string_in_ast(const ::sirius::ast::in_list& alt,
+                                                    const cudf::column_view& input_view,
+                                                    rmm::device_async_resource_ref mr,
+                                                    rmm::cuda_stream_view stream)
+{
+  auto const num_strings = static_cast<cudf::size_type>(alt.values.size());
   auto const num_offsets = num_strings + 1;
 
-  // We need to convert to cudf/arrow format...
   std::vector<char> chars;
   std::vector<cudf::size_type> offsets;
   cudf::size_type offset = 0;
-  for (std::size_t child = 1; child < expr.children.size(); ++child) {
-    const auto& child_expression = expr.children[child]->Cast<duckdb::BoundConstantExpression>();
-    const auto& child_string     = child_expression.value.GetValue<std::string>();
+  for (auto const& v : alt.values) {
+    auto const& child_string = get_const_payload<std::string>(*v);
     chars.insert(chars.end(), child_string.begin(), child_string.end());
     offsets.push_back(offset);
     offset += static_cast<cudf::size_type>(child_string.size());
   }
   offsets.push_back(offset);
 
-  // Allocate buffers and copy to device
   rmm::device_uvector<char> chars_buffer(offset, stream, mr);
   rmm::device_uvector<cudf::size_type> offsets_buffer(num_offsets, stream, mr);
   CUDF_CUDA_TRY(cudaMemcpyAsync(chars_buffer.data(),
@@ -184,7 +220,6 @@ std::unique_ptr<cudf::column> execute_string_in(const duckdb::BoundOperatorExpre
                                 cudaMemcpyHostToDevice,
                                 stream));
 
-  // Make CuDF things
   auto offsets_col = std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::INT32),
                                                     num_offsets,
                                                     std::move(offsets_buffer).release(),
@@ -199,7 +234,6 @@ std::unique_ptr<cudf::column> execute_string_in(const duckdb::BoundOperatorExpre
                                                        0,
                                                        std::move(children));
 
-  // Execute the search
   return cudf::contains(in_strings_col->view(), input_view, stream, mr);
 }
 
@@ -208,87 +242,53 @@ std::unique_ptr<cudf::column> execute_string_in(const duckdb::BoundOperatorExpre
 namespace sirius {
 using execute_result = gpu_expression_executor::execute_result;
 
-execute_result gpu_expression_executor::execute(duckdb::BoundOperatorExpression const& expr,
+//===----------------------------------------------------------------------===//
+// unary_op
+//===----------------------------------------------------------------------===//
+
+execute_result gpu_expression_executor::execute(sirius::ast::unary_op const& alt,
                                                 execution_mode mode)
 {
-  // COALESCE does not have AST support
-  auto const is_coalesce = expr.type == duckdb::ExpressionType::OPERATOR_COALESCE;
+  if (alt.op == sirius::ast::unary_op::kind::op_try) {
+    throw not_implemented_exception(
+      "[gpu_expression_executor] execute called on an unsupported TRY operator expression.");
+  }
 
-  if (!is_coalesce && _strategy != expression_executor_strategy::MATERIALIZE &&
-      (mode == execution_mode::AST || count_ast_ops(expr) >= _min_ast_size)) {
-    auto operator_type_switch_ast =
-      [&](duckdb::BoundOperatorExpression const& expr) -> execute_result {
-      switch (expr.type) {
-        case duckdb::ExpressionType::COMPARE_IN:  // Fallthrough
-        case duckdb::ExpressionType::COMPARE_NOT_IN: {
-          D_ASSERT(expr.children.size() > 1);
-          auto test                = execute(*expr.children[0], execution_mode::AST);
-          auto comparator          = execute(*expr.children[1], execution_mode::AST);
-          expr_ref comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
-            cudf::ast::ast_operator::EQUAL, test.get_expr(), comparator.get_expr());
-          auto output = execute_result(
-            ast_result(comparison_expr,
-                       {test.get_temp_scalar_indices(), comparator.get_temp_scalar_indices()},
-                       {test.get_temp_column_indices(), comparator.get_temp_column_indices()}));
+  auto const ast_op_count = alt.cudf_ast_op_count();
 
-          // Build an OR tree of comparisons
-          for (std::size_t child_idx = 2; child_idx < expr.children.size(); ++child_idx) {
-            auto comparator               = execute(*expr.children[child_idx], execution_mode::AST);
-            expr_ref next_comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
-              cudf::ast::ast_operator::EQUAL, test.get_expr(), comparator.get_expr());
-            comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
-              cudf::ast::ast_operator::LOGICAL_OR, comparison_expr, next_comparison_expr);
-            output = execute_result(
-              ast_result(comparison_expr,
-                         {output.get_temp_scalar_indices(), comparator.get_temp_scalar_indices()},
-                         {output.get_temp_column_indices(), comparator.get_temp_column_indices()}));
-          }
+  if (_strategy != expression_executor_strategy::MATERIALIZE &&
+      (mode == execution_mode::AST || ast_op_count >= _min_ast_size)) {
+    auto child        = execute(*alt.child, execution_mode::AST);
+    auto build_output = [&](expr_ref const& produced) -> execute_result {
+      return execute_result(
+        ast_result(produced, child.get_temp_scalar_indices(), child.get_temp_column_indices()));
+    };
 
-          if (expr.type == duckdb::ExpressionType::COMPARE_IN) { return output; }
-          auto const& not_expr =
-            _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::NOT, comparison_expr);
-          return execute_result(ast_result(
-            not_expr, output.get_temp_scalar_indices(), output.get_temp_column_indices()));
-        }
-        case duckdb::ExpressionType::OPERATOR_COALESCE:
-          // Should be unreachable
-          throw internal_exception(
-            "[gpu_expression_executor] AST mode with COALESCE operator is not supported.");
-        case duckdb::ExpressionType::OPERATOR_TRY:
-          throw not_implemented_exception(
-            "[gpu_expression_executor] AST mode with TRY operator is not implemented.");
-        case duckdb::ExpressionType::OPERATOR_NOT: {
-          D_ASSERT(expr.children.size() == 1);
-          auto child = execute(*expr.children[0], execution_mode::AST);
+    execute_result output = [&]() -> execute_result {
+      switch (alt.op) {
+        case sirius::ast::unary_op::kind::op_not: {
           auto const& not_expr =
             _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::NOT, child.get_expr());
-          return execute_result(
-            ast_result(not_expr, child.get_temp_scalar_indices(), child.get_temp_column_indices()));
+          return build_output(not_expr);
         }
-        case duckdb::ExpressionType::OPERATOR_IS_NULL:  // Fallthrough
-        case duckdb::ExpressionType::OPERATOR_IS_NOT_NULL: {
-          D_ASSERT(expr.children.size() == 1);
-          auto child               = execute(*expr.children[0], execution_mode::AST);
+        case sirius::ast::unary_op::kind::op_is_null: {
           auto const& is_null_expr = _ast_tree.emplace<cudf::ast::operation>(
             cudf::ast::ast_operator::IS_NULL, child.get_expr());
-          if (expr.type == duckdb::ExpressionType::OPERATOR_IS_NULL) {
-            return execute_result(ast_result(
-              is_null_expr, child.get_temp_scalar_indices(), child.get_temp_column_indices()));
-          } else {
-            auto const& not_expr =
-              _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::NOT, is_null_expr);
-            return execute_result(ast_result(
-              not_expr, child.get_temp_scalar_indices(), child.get_temp_column_indices()));
-          }
+          return build_output(is_null_expr);
+        }
+        case sirius::ast::unary_op::kind::op_is_not_null: {
+          auto const& is_null_expr = _ast_tree.emplace<cudf::ast::operation>(
+            cudf::ast::ast_operator::IS_NULL, child.get_expr());
+          auto const& not_expr =
+            _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::NOT, is_null_expr);
+          return build_output(not_expr);
         }
         default:
           throw internal_exception(
-            "[gpu_expression_executor] AST mode with unknown/unsupported operator type: {}",
-            static_cast<int>(expr.type));
+            "[gpu_expression_executor] AST mode with unknown/unsupported unary_op kind: {}",
+            static_cast<int>(alt.op));
       }
-    };
-
-    auto output = operator_type_switch_ast(expr);
+    }();
 
     if (mode == execution_mode::AST) {
       //===----------1: AST Mode----------===//
@@ -297,17 +297,13 @@ execute_result gpu_expression_executor::execute(duckdb::BoundOperatorExpression 
 
     //===----------2: MATERIALIZE Mode, evaluate node with AST----------===//
     auto result_column = execute_ast(output.get_expr());
-
-    // Release consumed temporaries
     release_temporaries(output.get_temp_scalar_indices(), output.get_temp_column_indices());
     return execute_result(std::move(result_column));
   }
 
   //===----------3: MATERIALIZE Mode, evaluate node with unary/binary ops----------===//
   if (mode == execution_mode::AST) {
-    auto result = execute(expr, execution_mode::MATERIALIZE);
-    // Executing an operator expression in MATERIALIZE mode should produce an owned column.
-    // Otherwise, something went wrong.
+    auto result = execute(alt, execution_mode::MATERIALIZE);
     if (!result.is_owned_column()) {
       throw internal_exception(
         "[gpu_expression_executor:operator]: Expected an owned column after executing operator "
@@ -315,199 +311,292 @@ execute_result gpu_expression_executor::execute(duckdb::BoundOperatorExpression 
     }
     return materialize_as_ast_column(result.release_column());
   }
-  switch (expr.type) {
-    case duckdb::ExpressionType::COMPARE_IN:  // Fallthrough
-    case duckdb::ExpressionType::COMPARE_NOT_IN: {
-      D_ASSERT(expr.children.size() > 1);
-      auto test = execute(*expr.children[0], execution_mode::MATERIALIZE);
-      D_ASSERT(!test.is_scalar());  // IN with scalar LHS should have been already resolved
 
-      // Optimization: special handling for case where RHS are all constants
-      if (std::all_of(expr.children.begin() + 1, expr.children.end(), [](const auto& child) {
-            return child->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT;
-          })) {
-        // All types should be the same. Mirrors the constant types supported in
-        // gpu_execute_constant.cpp.
-        std::unique_ptr<cudf::column> contains_column;
-        switch (test.get_column_view().type().id()) {
-          case cudf::type_id::INT8:
-            contains_column =
-              execute_numeric_in<int8_t>(expr, test.get_column_view(), _mr, _stream);
-            break;
-          case cudf::type_id::INT16:
-            contains_column =
-              execute_numeric_in<int16_t>(expr, test.get_column_view(), _mr, _stream);
-            break;
-          case cudf::type_id::INT32:
-            contains_column =
-              execute_numeric_in<int32_t>(expr, test.get_column_view(), _mr, _stream);
-            break;
-          case cudf::type_id::INT64:
-            contains_column =
-              execute_numeric_in<int64_t>(expr, test.get_column_view(), _mr, _stream);
-            break;
-          case cudf::type_id::UINT8:
-            contains_column =
-              execute_numeric_in<uint8_t>(expr, test.get_column_view(), _mr, _stream);
-            break;
-          case cudf::type_id::UINT16:
-            contains_column =
-              execute_numeric_in<uint16_t>(expr, test.get_column_view(), _mr, _stream);
-            break;
-          case cudf::type_id::UINT32:
-            contains_column =
-              execute_numeric_in<uint32_t>(expr, test.get_column_view(), _mr, _stream);
-            break;
-          case cudf::type_id::UINT64:
-            contains_column =
-              execute_numeric_in<uint64_t>(expr, test.get_column_view(), _mr, _stream);
-            break;
-          case cudf::type_id::FLOAT32:
-            contains_column =
-              execute_numeric_in<float_t>(expr, test.get_column_view(), _mr, _stream);
-            break;
-          case cudf::type_id::FLOAT64:
-            contains_column =
-              execute_numeric_in<double_t>(expr, test.get_column_view(), _mr, _stream);
-            break;
-          case cudf::type_id::BOOL8:
-            contains_column =
-              execute_numeric_in<uint8_t>(expr, test.get_column_view(), _mr, _stream);
-            break;
-          case cudf::type_id::DECIMAL32:
-            contains_column =
-              execute_decimal_in<numeric::decimal32>(expr, test.get_column_view(), _mr, _stream);
-            break;
-          case cudf::type_id::DECIMAL64:
-            contains_column =
-              execute_decimal_in<numeric::decimal64>(expr, test.get_column_view(), _mr, _stream);
-            break;
-          case cudf::type_id::DECIMAL128:
-            contains_column =
-              execute_decimal_in<numeric::decimal128>(expr, test.get_column_view(), _mr, _stream);
-            break;
-          case cudf::type_id::TIMESTAMP_DAYS:
-            contains_column =
-              execute_timestamp_in<cudf::timestamp_D>(expr, test.get_column_view(), _mr, _stream);
-            break;
-          case cudf::type_id::TIMESTAMP_SECONDS:
-            contains_column =
-              execute_timestamp_in<cudf::timestamp_s>(expr, test.get_column_view(), _mr, _stream);
-            break;
-          case cudf::type_id::TIMESTAMP_MILLISECONDS:
-            contains_column =
-              execute_timestamp_in<cudf::timestamp_ms>(expr, test.get_column_view(), _mr, _stream);
-            break;
-          case cudf::type_id::TIMESTAMP_MICROSECONDS:
-            contains_column =
-              execute_timestamp_in<cudf::timestamp_us>(expr, test.get_column_view(), _mr, _stream);
-            break;
-          case cudf::type_id::TIMESTAMP_NANOSECONDS:
-            contains_column =
-              execute_timestamp_in<cudf::timestamp_ns>(expr, test.get_column_view(), _mr, _stream);
-            break;
-          case cudf::type_id::STRING:
-            contains_column = execute_string_in(expr, test.get_column_view(), _mr, _stream);
-            break;
-          default:
-            throw not_implemented_exception(
-              "[gpu_expression_executor] execute IN called with unsupported scalar haystack type "
-              "{}",
-              static_cast<int>(test.get_column_view().type().id()));
-        }
-        if (expr.type == duckdb::ExpressionType::COMPARE_NOT_IN) {
-          contains_column =
-            cudf::unary_operation(contains_column->view(), cudf::unary_operator::NOT, _stream, _mr);
-        }
-        return execute_result(std::move(contains_column));
-      }
-
-      // Some hastack referent is not a scalar
-      auto const output_type = GetCudfType(expr.return_type);
-      auto comparator        = execute(*expr.children[1], execution_mode::MATERIALIZE);
-      auto comparison_column = cudf::binary_operation(test.get_column_view(),
-                                                      comparator.get_column_view(),
-                                                      cudf::binary_operator::EQUAL,
-                                                      output_type,
-                                                      _stream,
-                                                      _mr);
-      auto output            = execute_result(std::move(comparison_column));
-
-      // For every child, OR the result of the comparison with the left to get the overall result.
-      for (std::size_t child = 2; child < expr.children.size(); ++child) {
-        // Resolve the child
-        auto comparator        = execute(*expr.children[child], execution_mode::MATERIALIZE);
-        auto comparison_column = cudf::binary_operation(test.get_column_view(),
-                                                        comparator.get_column_view(),
-                                                        cudf::binary_operator::EQUAL,
-                                                        output_type,
-                                                        _stream,
-                                                        _mr);
-
-        auto combined_comparison_column = cudf::binary_operation(output.get_column_view(),
-                                                                 comparison_column->view(),
-                                                                 cudf::binary_operator::LOGICAL_OR,
-                                                                 output_type,
-                                                                 _stream,
-                                                                 _mr);
-        output                          = execute_result(std::move(combined_comparison_column));
-      }
-
-      if (expr.type == duckdb::ExpressionType::COMPARE_IN) { return output; }
-      auto not_comparison_column =
-        cudf::unary_operation(output.get_column_view(), cudf::unary_operator::NOT, _stream, _mr);
-      return execute_result(std::move(not_comparison_column));
-    }
-    case duckdb::ExpressionType::OPERATOR_COALESCE: {
-      D_ASSERT(expr.children.size() > 1);  // B/C optimizer should constant fold 1-child COALESCEs
-
-      auto current_result = execute(*expr.children[0], execution_mode::MATERIALIZE);
-      if (current_result.is_scalar()) {
-        current_result = execute_result(cudf::make_column_from_scalar(
-          current_result.get_scalar(), _input_table.num_rows(), _stream, _mr));
-      }
-
-      for (std::size_t child = 1; child < expr.children.size(); ++child) {
-        // Short-circuit if the null_count is zero
-        if (!current_result.get_column_view().has_nulls()) { break; }
-        auto replacement = execute(*expr.children[child], execution_mode::MATERIALIZE);
-        if (replacement.is_scalar()) {
-          current_result = execute_result(cudf::replace_nulls(
-            current_result.get_column_view(), replacement.get_scalar(), _stream, _mr));
-        } else {
-          current_result = execute_result(cudf::replace_nulls(
-            current_result.get_column_view(), replacement.get_column_view(), _stream, _mr));
-        }
-      }
-      return current_result;
-    }
-    case duckdb::ExpressionType::OPERATOR_TRY:
-      throw not_implemented_exception(
-        "[gpu_expression_executor] execute called on an unsupported TRY operator expression.");
-    case duckdb::ExpressionType::OPERATOR_NOT: {
-      D_ASSERT(expr.children.size() == 1);
-      auto child = execute(*expr.children[0], execution_mode::MATERIALIZE);
+  auto child = execute(*alt.child, execution_mode::MATERIALIZE);
+  switch (alt.op) {
+    case sirius::ast::unary_op::kind::op_not:
       return execute_result(
         cudf::unary_operation(child.get_column_view(), cudf::unary_operator::NOT, _stream, _mr));
-    }
-    case duckdb::ExpressionType::OPERATOR_IS_NULL:  // Fallthrough
-    case duckdb::ExpressionType::OPERATOR_IS_NOT_NULL: {
-      D_ASSERT(expr.children.size() == 1);
-      auto child          = execute(*expr.children[0], execution_mode::MATERIALIZE);
+    case sirius::ast::unary_op::kind::op_is_null:
+      return execute_result(cudf::is_null(child.get_column_view(), _stream, _mr));
+    case sirius::ast::unary_op::kind::op_is_not_null: {
       auto is_null_result = cudf::is_null(child.get_column_view(), _stream, _mr);
-      if (expr.type == duckdb::ExpressionType::OPERATOR_IS_NULL) {
-        return execute_result(std::move(is_null_result));
-      }
       return execute_result(
         cudf::unary_operation(is_null_result->view(), cudf::unary_operator::NOT, _stream, _mr));
     }
     default:
       throw internal_exception(
-        "[gpu_expression_executor] execute called on an operator expression [{}] with "
-        "unknown/unsupported operator type: {}",
-        expr.ToString(),
-        static_cast<int>(expr.type));
+        "[gpu_expression_executor] execute called on an operator expression with "
+        "unknown/unsupported unary_op kind: {}",
+        static_cast<int>(alt.op));
   }
+}
+
+//===----------------------------------------------------------------------===//
+// in_list
+//===----------------------------------------------------------------------===//
+
+execute_result gpu_expression_executor::execute(sirius::ast::in_list const& alt,
+                                                execution_mode mode)
+{
+  if (alt.values.empty()) {
+    throw invalid_input_exception(
+      "[gpu_expression_executor:in_list] in_list has no values — malformed AST.");
+  }
+  auto const ast_op_count = alt.cudf_ast_op_count();
+
+  if (_strategy != expression_executor_strategy::MATERIALIZE &&
+      (mode == execution_mode::AST || ast_op_count >= _min_ast_size)) {
+    D_ASSERT(!alt.values.empty());
+
+    auto test                = execute(*alt.probe, execution_mode::AST);
+    auto comparator          = execute(*alt.values[0], execution_mode::AST);
+    expr_ref comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
+      cudf::ast::ast_operator::EQUAL, test.get_expr(), comparator.get_expr());
+    auto output = execute_result(
+      ast_result(comparison_expr,
+                 {test.get_temp_scalar_indices(), comparator.get_temp_scalar_indices()},
+                 {test.get_temp_column_indices(), comparator.get_temp_column_indices()}));
+
+    for (std::size_t value_idx = 1; value_idx < alt.values.size(); ++value_idx) {
+      auto next_comparator          = execute(*alt.values[value_idx], execution_mode::AST);
+      expr_ref next_comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
+        cudf::ast::ast_operator::EQUAL, test.get_expr(), next_comparator.get_expr());
+      comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
+        cudf::ast::ast_operator::LOGICAL_OR, comparison_expr, next_comparison_expr);
+      output = execute_result(
+        ast_result(comparison_expr,
+                   {output.get_temp_scalar_indices(), next_comparator.get_temp_scalar_indices()},
+                   {output.get_temp_column_indices(), next_comparator.get_temp_column_indices()}));
+    }
+
+    if (!alt.negated) {
+      // produce IN result (positive)
+      if (mode == execution_mode::AST) { return output; }
+      auto result_column = execute_ast(output.get_expr());
+      release_temporaries(output.get_temp_scalar_indices(), output.get_temp_column_indices());
+      return execute_result(std::move(result_column));
+    }
+    auto const& not_expr =
+      _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::NOT, comparison_expr);
+    auto not_output = execute_result(
+      ast_result(not_expr, output.get_temp_scalar_indices(), output.get_temp_column_indices()));
+
+    if (mode == execution_mode::AST) {
+      //===----------1: AST Mode----------===//
+      return not_output;
+    }
+
+    //===----------2: MATERIALIZE Mode, evaluate node with AST----------===//
+    auto result_column = execute_ast(not_output.get_expr());
+    release_temporaries(not_output.get_temp_scalar_indices(), not_output.get_temp_column_indices());
+    return execute_result(std::move(result_column));
+  }
+
+  //===----------3: MATERIALIZE Mode, evaluate node with unary/binary ops----------===//
+  if (mode == execution_mode::AST) {
+    auto result = execute(alt, execution_mode::MATERIALIZE);
+    if (!result.is_owned_column()) {
+      throw internal_exception(
+        "[gpu_expression_executor:operator]: Expected an owned column after executing operator "
+        "expression.");
+    }
+    return materialize_as_ast_column(result.release_column());
+  }
+
+  D_ASSERT(!alt.values.empty());
+  auto test = execute(*alt.probe, execution_mode::MATERIALIZE);
+  D_ASSERT(!test.is_scalar());  // IN with scalar LHS should have been already resolved
+
+  // Optimization: special handling when every haystack entry is a constant.
+  auto const all_constants = std::all_of(alt.values.begin(), alt.values.end(), [](auto const& v) {
+    return v && v->template holds<sirius::ast::constant>();
+  });
+
+  if (all_constants) {
+    std::unique_ptr<cudf::column> contains_column;
+    switch (test.get_column_view().type().id()) {
+      case cudf::type_id::INT8:
+        contains_column = execute_numeric_in_ast<int8_t>(alt, test.get_column_view(), _mr, _stream);
+        break;
+      case cudf::type_id::INT16:
+        contains_column =
+          execute_numeric_in_ast<int16_t>(alt, test.get_column_view(), _mr, _stream);
+        break;
+      case cudf::type_id::INT32:
+        contains_column =
+          execute_numeric_in_ast<int32_t>(alt, test.get_column_view(), _mr, _stream);
+        break;
+      case cudf::type_id::INT64:
+        contains_column =
+          execute_numeric_in_ast<int64_t>(alt, test.get_column_view(), _mr, _stream);
+        break;
+      case cudf::type_id::UINT8:
+        contains_column =
+          execute_numeric_in_ast<uint8_t>(alt, test.get_column_view(), _mr, _stream);
+        break;
+      case cudf::type_id::UINT16:
+        contains_column =
+          execute_numeric_in_ast<uint16_t>(alt, test.get_column_view(), _mr, _stream);
+        break;
+      case cudf::type_id::UINT32:
+        contains_column =
+          execute_numeric_in_ast<uint32_t>(alt, test.get_column_view(), _mr, _stream);
+        break;
+      case cudf::type_id::UINT64:
+        contains_column =
+          execute_numeric_in_ast<uint64_t>(alt, test.get_column_view(), _mr, _stream);
+        break;
+      case cudf::type_id::FLOAT32:
+        contains_column = execute_numeric_in_ast<float>(alt, test.get_column_view(), _mr, _stream);
+        break;
+      case cudf::type_id::FLOAT64:
+        contains_column = execute_numeric_in_ast<double>(alt, test.get_column_view(), _mr, _stream);
+        break;
+      case cudf::type_id::BOOL8:
+        contains_column = execute_bool_in_ast(alt, test.get_column_view(), _mr, _stream);
+        break;
+      case cudf::type_id::DECIMAL32:
+        contains_column =
+          execute_decimal_in_ast<numeric::decimal32>(alt, test.get_column_view(), _mr, _stream);
+        break;
+      case cudf::type_id::DECIMAL64:
+        contains_column =
+          execute_decimal_in_ast<numeric::decimal64>(alt, test.get_column_view(), _mr, _stream);
+        break;
+      case cudf::type_id::DECIMAL128:
+        contains_column =
+          execute_decimal_in_ast<numeric::decimal128>(alt, test.get_column_view(), _mr, _stream);
+        break;
+      case cudf::type_id::TIMESTAMP_DAYS:
+        contains_column =
+          execute_timestamp_in_ast<cudf::timestamp_D>(alt, test.get_column_view(), _mr, _stream);
+        break;
+      case cudf::type_id::TIMESTAMP_SECONDS:
+        contains_column =
+          execute_timestamp_in_ast<cudf::timestamp_s>(alt, test.get_column_view(), _mr, _stream);
+        break;
+      case cudf::type_id::TIMESTAMP_MILLISECONDS:
+        contains_column =
+          execute_timestamp_in_ast<cudf::timestamp_ms>(alt, test.get_column_view(), _mr, _stream);
+        break;
+      case cudf::type_id::TIMESTAMP_MICROSECONDS:
+        contains_column =
+          execute_timestamp_in_ast<cudf::timestamp_us>(alt, test.get_column_view(), _mr, _stream);
+        break;
+      case cudf::type_id::TIMESTAMP_NANOSECONDS:
+        contains_column =
+          execute_timestamp_in_ast<cudf::timestamp_ns>(alt, test.get_column_view(), _mr, _stream);
+        break;
+      case cudf::type_id::STRING:
+        contains_column = execute_string_in_ast(alt, test.get_column_view(), _mr, _stream);
+        break;
+      default:
+        throw not_implemented_exception(
+          "[gpu_expression_executor] execute IN called with unsupported scalar haystack type {}",
+          static_cast<int>(test.get_column_view().type().id()));
+    }
+    if (alt.negated) {
+      contains_column =
+        cudf::unary_operation(contains_column->view(), cudf::unary_operator::NOT, _stream, _mr);
+    }
+    return execute_result(std::move(contains_column));
+  }
+
+  // Some haystack referent is not a scalar — fall back to a chained OR of EQUAL comparisons.
+  auto const output_type = cudf::data_type{cudf::type_id::BOOL8};
+  auto comparator        = execute(*alt.values[0], execution_mode::MATERIALIZE);
+  auto comparison_column = cudf::binary_operation(test.get_column_view(),
+                                                  comparator.get_column_view(),
+                                                  cudf::binary_operator::EQUAL,
+                                                  output_type,
+                                                  _stream,
+                                                  _mr);
+  auto output            = execute_result(std::move(comparison_column));
+
+  for (std::size_t value_idx = 1; value_idx < alt.values.size(); ++value_idx) {
+    auto next_comparator = execute(*alt.values[value_idx], execution_mode::MATERIALIZE);
+    auto next_eq_column  = cudf::binary_operation(test.get_column_view(),
+                                                 next_comparator.get_column_view(),
+                                                 cudf::binary_operator::EQUAL,
+                                                 output_type,
+                                                 _stream,
+                                                 _mr);
+    auto combined        = cudf::binary_operation(output.get_column_view(),
+                                           next_eq_column->view(),
+                                           cudf::binary_operator::LOGICAL_OR,
+                                           output_type,
+                                           _stream,
+                                           _mr);
+    output               = execute_result(std::move(combined));
+  }
+
+  if (!alt.negated) { return output; }
+  auto not_column =
+    cudf::unary_operation(output.get_column_view(), cudf::unary_operator::NOT, _stream, _mr);
+  return execute_result(std::move(not_column));
+}
+
+//===----------------------------------------------------------------------===//
+// coalesce — always materializes; no AST representation.
+//===----------------------------------------------------------------------===//
+
+execute_result gpu_expression_executor::execute(sirius::ast::coalesce const& alt,
+                                                execution_mode mode)
+{
+  D_ASSERT(alt.children.size() > 1);
+
+  auto current_result = execute(*alt.children[0], execution_mode::MATERIALIZE);
+  if (current_result.is_scalar()) {
+    current_result = execute_result(cudf::make_column_from_scalar(
+      current_result.get_scalar(), _input_table.num_rows(), _stream, _mr));
+  }
+
+  for (std::size_t child_idx = 1; child_idx < alt.children.size(); ++child_idx) {
+    // Short-circuit if the null_count is zero
+    if (!current_result.get_column_view().has_nulls()) { break; }
+    auto replacement = execute(*alt.children[child_idx], execution_mode::MATERIALIZE);
+    if (replacement.is_scalar()) {
+      current_result = execute_result(cudf::replace_nulls(
+        current_result.get_column_view(), replacement.get_scalar(), _stream, _mr));
+    } else {
+      current_result = execute_result(cudf::replace_nulls(
+        current_result.get_column_view(), replacement.get_column_view(), _stream, _mr));
+    }
+  }
+
+  if (mode == execution_mode::AST) {
+    if (!current_result.is_owned_column()) {
+      throw internal_exception(
+        "[gpu_expression_executor:operator]: Expected an owned column after executing COALESCE "
+        "expression.");
+    }
+    return materialize_as_ast_column(current_result.release_column());
+  }
+  return current_result;
+}
+
+//===----------------------------------------------------------------------===//
+// DuckDB-typed entry — routes to one of the three native bodies via the
+// public node dispatcher's std::visit over from_duckdb(expr).
+//===----------------------------------------------------------------------===//
+
+// DuckDB-typed entrypoint. Bridges callers that still pass duckdb::Expression
+// directly into the executor; the eventual home for this from_duckdb step is
+// the planning stage so the executor sees only native sirius::ast types, but
+// until upstream call sites are migrated this overload (and the duckdb
+// includes it requires) must stay.
+execute_result gpu_expression_executor::execute(duckdb::BoundOperatorExpression const& expr,
+                                                execution_mode mode)
+{
+  auto node = sirius::ast::from_duckdb(expr);
+  if (!node) {
+    throw not_implemented_exception(
+      "[gpu_expression_executor:operator] BoundOperatorExpression with operator type {} could "
+      "not be lowered to a Sirius AST node.",
+      static_cast<int>(expr.GetExpressionType()));
+  }
+  return execute(*node, mode);
 }
 
 }  // namespace sirius

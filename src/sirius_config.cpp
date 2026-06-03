@@ -94,6 +94,22 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("prefetch_inflight_budget_chunks",
              opt.prefetch_inflight_budget_chunks,
              yaml::greater_than<std::size_t>{0});
+  r.optional("enable_chunk_prewarm", opt.enable_chunk_prewarm);
+  r.reject_unknown();
+}
+
+static void from_yaml(const YAML::Node& node, sirius::io::object_store_config& opt)
+{
+  yaml::reader r(node, "object_store_config");
+  r.optional("endpoint", opt.endpoint);
+  r.optional("region", opt.region);
+  r.optional("access_key", opt.access_key);
+  r.optional("secret_key", opt.secret_key);
+  r.optional("session_token", opt.session_token);
+  r.optional("s3_transport", opt.s3_transport);
+  r.optional("signing_mode", opt.s3_signing_mode);
+  r.optional("ca_bundle_path", opt.ca_bundle_path);
+  r.optional("tls_verify", opt.tls_verify);
   r.reject_unknown();
 }
 
@@ -106,6 +122,16 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("hash_partition_bytes", yaml::bytes(opt.hash_partition_bytes));
   r.optional("concat_batch_bytes", yaml::bytes(opt.concat_batch_bytes));
   r.optional("max_build_hash_table_bytes", yaml::bytes(opt.max_build_hash_table_bytes));
+  r.optional("enable_gpu_duckdb_native_scan", opt.enable_gpu_duckdb_native_scan);
+  r.reject_unknown();
+}
+
+static void from_yaml(const YAML::Node& node, telemetry_config& opt)
+{
+  yaml::reader r(node, "telemetry");
+  r.optional("enable_quent", opt.enable_quent);
+  r.optional("output_directory", opt.output_directory);
+  r.optional("engine_name", opt.engine_name);
   r.reject_unknown();
 }
 
@@ -354,6 +380,14 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
 
     // Operator params
     if (auto n = r.optional_node("operator_params")) { sirius::from_yaml(*n, _operator_params); }
+
+    // Object store (S3) config — endpoint / credentials for the s3:// datasource.
+    if (auto n = r.optional_node("object_store_config")) {
+      sirius::from_yaml(*n, object_store_config);
+    }
+
+    // Telemetry
+    if (auto n = r.optional_node("telemetry")) { sirius::from_yaml(*n, _telemetry_config); }
 
     // Explicit space configs (low-level API)
     std::vector<cucascade::memory::gpu_memory_space_config> gpu_space_configs;

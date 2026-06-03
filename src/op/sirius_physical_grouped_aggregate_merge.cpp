@@ -90,13 +90,11 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
 }
 
 sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
-  duckdb::ClientContext& context,
   duckdb::vector<sirius::logical_type> types,
   duckdb::vector<sirius::expression> expressions,
   duckdb::vector<sirius::expression> groups_p,
   std::size_t estimated_cardinality)
-  : sirius_physical_grouped_aggregate_merge(context,
-                                            std::move(types),
+  : sirius_physical_grouped_aggregate_merge(std::move(types),
                                             std::move(expressions),
                                             std::move(groups_p),
                                             {},
@@ -115,7 +113,6 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
 // the groupby expressions (groups_p) for each grouping_sets. The first level of the vector is the
 // grouping set and the second level is the indexes to the groupby expression for that set.
 sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
-  duckdb::ClientContext& /*context*/,
   duckdb::vector<sirius::logical_type> types,
   duckdb::vector<sirius::expression> expressions,
   duckdb::vector<sirius::expression> groups_p,

@@ -366,11 +366,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
       return group_by;
     }
     throw duckdb::NotImplementedException("Non simple aggregation is not supported");
-    // auto &group_by =
-    //     Make<sirius::op::sirius_physical_grouped_aggregate>(context, op.types,
-    //     std::move(op.expressions), op.estimated_cardinality);
-    // group_by.children.push_back(plan);
-    // return group_by;
   }
 
   // groups! create a GROUP BY aggregator
@@ -381,7 +376,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
       can_use_partitioned_aggregate(context, op, *plan, partition_columns)) {
     auto group_by = duckdb::make_uniq_base<sirius::op::sirius_physical_operator,
                                            sirius::op::sirius_physical_grouped_aggregate>(
-      context,
       sirius::from_duckdb_vec(op.types),
       sirius::wrap_many(std::move(op.expressions)),
       sirius::wrap_many(std::move(op.groups)),
@@ -397,7 +391,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
   if (can_use_perfect_hash_aggregate(context, op, required_bits)) {
     auto group_by = duckdb::make_uniq_base<sirius::op::sirius_physical_operator,
                                            sirius::op::sirius_physical_grouped_aggregate>(
-      context,
       sirius::from_duckdb_vec(op.types),
       sirius::wrap_many(std::move(op.expressions)),
       sirius::wrap_many(std::move(op.groups)),
@@ -412,7 +405,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
 
   auto group_by = duckdb::make_uniq_base<sirius::op::sirius_physical_operator,
                                          sirius::op::sirius_physical_grouped_aggregate>(
-    context,
     sirius::from_duckdb_vec(op.types),
     sirius::wrap_many(std::move(op.expressions)),
     sirius::wrap_many(std::move(op.groups)),

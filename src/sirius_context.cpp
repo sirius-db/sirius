@@ -25,7 +25,7 @@
 #include "exec/thread_pool.hpp"
 #include "io/prefetching_cache.hpp"
 #include "io/s3/s3_ioctx.hpp"
-#include "io/s3/sirius_sigv4_credential_provider.hpp"
+#include "io/s3/sirius_sigv4_authorizer.hpp"
 #include "io/s3/static_credentials.hpp"
 #include "log/logging.hpp"
 #include "memory/numa_small_pinned_mr.hpp"
@@ -290,6 +290,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   if (is_initialized_) { throw std::runtime_error("Sirius context is already initialized."); }
 
   config_ = config;
+  telemetry_context_ =
+    std::make_unique<sirius::telemetry::telemetry_context>(config_.get_telemetry_config());
 
   // Validate the cached topology before any downstream construction so a stub
   // topology fails loudly rather than producing zero-GPU executors silently.
@@ -613,20 +615,33 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // s3_config == std::nullopt and the scan_manager skips s3_ioctx
   // construction. The FSMR is passed through to uring_ioctx / buffer_pool.
   auto sm_config = config_.get_scan_manager_config();
+  // duckdb-native scan needs sirius_ioctx for host_read; force it on only
+  // when that path is enabled, so the documented fallback knob stays usable
+  // for other scan paths.
+  if (host_fsmr != nullptr && config_.get_operator_params().enable_gpu_duckdb_native_scan) {
+    sm_config.use_sirius_datasource = true;
+  }
   if (!config_.object_store_config.endpoint.empty() &&
       !config_.object_store_config.access_key.empty() &&
       !config_.object_store_config.secret_key.empty()) {
-    sirius::io::s3::static_credentials creds;
-    creds.access_key_id     = config_.object_store_config.access_key;
-    creds.secret_access_key = config_.object_store_config.secret_key;
-    auto provider           = std::make_shared<sirius::io::s3::sirius_sigv4_credential_provider>(
-      std::move(creds),
-      config_.object_store_config.region,
-      config_.object_store_config.endpoint,
-      std::chrono::minutes{5});
+    auto creds = sirius::io::s3::static_credentials_from(config_.object_store_config);
+    std::shared_ptr<sirius::io::s3::s3_request_authorizer> provider;
+    if (config_.object_store_config.s3_signing_mode ==
+        sirius::io::object_store_config::signing_mode::header) {
+      provider = std::make_shared<sirius::io::s3::sirius_sigv4_header_authorizer>(
+        std::move(creds), config_.object_store_config.region, config_.object_store_config.endpoint);
+    } else {
+      provider = std::make_shared<sirius::io::s3::sirius_sigv4_presigned_authorizer>(
+        std::move(creds),
+        config_.object_store_config.region,
+        config_.object_store_config.endpoint,
+        std::chrono::minutes{5});
+    }
     sirius::io::s3::s3_ioctx_config s3_cfg{};
-    s3_cfg.creds        = std::move(provider);
-    sm_config.s3_config = std::move(s3_cfg);
+    s3_cfg.creds          = std::move(provider);
+    s3_cfg.ca_bundle_path = config_.object_store_config.ca_bundle_path;
+    s3_cfg.tls_verify     = config_.object_store_config.tls_verify;
+    sm_config.s3_config   = std::move(s3_cfg);
   }
   // Persist the composed config back onto config_ so a later get_config()
   // reflects the actual S3 wiring -- get_scan_manager_config() must not report
@@ -731,6 +746,7 @@ void SiriusContext::terminate()
   }
   downgrade_executors_.clear();
   spdlog::info("SiriusContext::terminate: downgrade executors stopped");
+  telemetry_context_.reset();
 
   // Teardown order is load-bearing: registry holds shared_ptrs to ioctxs, so
   // it must drop its refs first. Then gpu_ioctxs_ (the device-keyed view) is
@@ -951,14 +967,19 @@ const sirius::scan_manager::sirius_scan_manager& SiriusContext::get_scan_manager
   return *scan_manager_;
 }
 
+const sirius::telemetry::telemetry_context& SiriusContext::get_telemetry_context() const
+{
+  throw_if_not_initialized();
+  return *telemetry_context_;
+}
+
 void SiriusContext::create_query(
   duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
-  const quent::Context& context,
   sirius::telemetry::query_telemetry_info telemetry_info)
 {
   throw_if_not_initialized();
-  query_ =
-    duckdb::make_shared_ptr<sirius::planner::query>(std::move(pipelines), context, telemetry_info);
+  query_ = duckdb::make_shared_ptr<sirius::planner::query>(
+    std::move(pipelines), telemetry_context_->context(), telemetry_info);
   task_scheduler_->prepare_for_query(query_);
   task_creator_->prepare_for_query(*query_);
   // Pass per-GPU sirius_ioctx map to scan_manager so parquet_split_provider

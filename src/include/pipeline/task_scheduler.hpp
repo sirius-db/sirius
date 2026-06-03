@@ -35,7 +35,9 @@
 #include <atomic>
 #include <future>
 #include <map>
+#include <optional>
 #include <queue>
+#include <set>
 
 namespace sirius::op::scan {
 class duckdb_scan_executor;
@@ -190,6 +192,15 @@ class task_scheduler {
    */
   void drain_after_error();
 
+  /**
+   * @brief This function interrupts executors and waits for all in-flight tasks to complete.
+   * If any tasks are still in flight, an error is logged and an exception is thrown.
+   * This is used to ensure that all tasks have completed before the query returns and tears down
+   * the plan.
+   * @throws std::runtime_error if any tasks are still in flight.
+   */
+  void wait_for_completion();
+
   // for testing/stress only — see Doxygen below.
   /**
    * @brief Inject an initial value into the round-robin counter.
@@ -218,13 +229,26 @@ class task_scheduler {
 
   exec::inspectable_mpsc<sirius::parallel::itask> _task_queue;  ///< Queue for GPU pipeline tasks
   exec::channel<std::unique_ptr<task_request>> _task_request_channel;
+  /// Publisher used by schedule() to wake the management event loop when a new
+  /// task is pushed into _task_queue. The event loop blocks on _task_request_channel
+  /// for two event kinds: device_ready (sent by gpu_pipeline_executors when a worker
+  /// thread is reserved) and task_available (sent by schedule()).
+  std::optional<exec::publisher<std::unique_ptr<task_request>>> _self_publisher;
   std::thread _management_thread;
   std::atomic<bool> _running{false};
+
+  /// Set of GPU device_ids that have a reserved worker thread waiting for a task.
+  /// Only mutated by the management thread (matches device_ready signals from
+  /// _task_request_channel and erases on dispatch), so no synchronization needed.
+  std::set<int> _ready_devices;
 
   /// device_id -> GPU executor. std::map (not unordered_map) so iteration
   /// order is deterministic (ascending by device_id) — keeps preference-less
   /// task dispatch reproducible across runs.
   std::map<int, std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;
+  /// Deprecated as of pull-signal restoration: no-preference distribution now
+  /// arises from which executor sends a device_ready signal first, not from a
+  /// counter. Field retained for source compat with set_no_pref_rr_counter_for_testing.
   std::atomic<size_t> _no_pref_rr_counter{0};
 
   sirius::creator::task_creator* _task_creator{nullptr};

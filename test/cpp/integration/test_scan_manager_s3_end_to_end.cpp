@@ -19,7 +19,7 @@
 #include "helper/logical_type.hpp"
 #include "io/prefetching_cache.hpp"
 #include "io/s3/s3_ioctx.hpp"
-#include "io/s3/sirius_sigv4_credential_provider.hpp"
+#include "io/s3/sirius_sigv4_authorizer.hpp"
 #include "op/scan/parquet_scan_operator_data.hpp"
 #include "operator/operator_test_utils.hpp"
 #include "scan_manager/parquet_split_provider.hpp"
@@ -58,7 +58,7 @@ using sirius::io::buffer_pool;
 using sirius::io::sirius_ioctx;
 using sirius::io::s3::s3_ioctx;
 using sirius::io::s3::s3_ioctx_config;
-using sirius::io::s3::sirius_sigv4_credential_provider;
+using sirius::io::s3::sirius_sigv4_presigned_authorizer;
 using sirius::io::s3::static_credentials;
 using sirius::op::scan::parquet_scan_data;
 using sirius::scan_manager::parquet_split_provider;
@@ -147,7 +147,7 @@ s3_ioctx_config make_s3_config(s3_test_env const& env, bool bad_credentials = fa
   static_credentials creds;
   creds.access_key_id     = bad_credentials ? "definitely-wrong" : env.access_key;
   creds.secret_access_key = bad_credentials ? "definitely-wrong" : env.secret_key;
-  auto provider           = std::make_shared<sirius_sigv4_credential_provider>(
+  auto provider           = std::make_shared<sirius_sigv4_presigned_authorizer>(
     std::move(creds), env.region, env.endpoint, 30min);
 
   s3_ioctx_config cfg{};
@@ -267,7 +267,7 @@ bool saw_scheme(std::vector<std::unique_ptr<parquet_scan_data>> const& splits,
 }  // namespace
 
 TEST_CASE("scan_manager S3 end-to-end reads nation parquet through sirius_datasource",
-          "[scan_manager][s3][integration]")
+          "[.][s3][integration][scan_manager]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -299,7 +299,7 @@ TEST_CASE("scan_manager S3 end-to-end reads nation parquet through sirius_dataso
 }
 
 TEST_CASE("scan_manager S3 end-to-end routes parquet_split_provider through S3 ioctx",
-          "[scan_manager][s3][integration]")
+          "[.][s3][integration][scan_manager]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -325,7 +325,7 @@ TEST_CASE("scan_manager S3 end-to-end routes parquet_split_provider through S3 i
 }
 
 TEST_CASE("scan_manager S3 end-to-end dispatches mixed local and S3 parquet paths",
-          "[scan_manager][s3][integration]")
+          "[.][s3][integration][scan_manager]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -353,7 +353,7 @@ TEST_CASE("scan_manager S3 end-to-end dispatches mixed local and S3 parquet path
 }
 
 TEST_CASE("scan_manager S3 end-to-end surfaces missing-key failures after retries",
-          "[scan_manager][s3][integration]")
+          "[.][s3][integration][scan_manager]")
 {
   auto env = read_s3_test_env();
   if (!env) {
@@ -370,7 +370,7 @@ TEST_CASE("scan_manager S3 end-to-end surfaces missing-key failures after retrie
 }
 
 TEST_CASE("scan_manager S3 end-to-end does not retry bad credentials indefinitely",
-          "[scan_manager][s3][integration]")
+          "[.][s3][integration][scan_manager]")
 {
   auto env = read_s3_test_env();
   if (!env) {

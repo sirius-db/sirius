@@ -73,6 +73,7 @@ task_creator::~task_creator() { stop(); }
 
 void task_creator::set_client_context(::duckdb::ClientContext& client_context)
 {
+  std::lock_guard<std::mutex> lock(_global_state_mutex);
   _client_context = std::addressof(client_context);
   _thread_context = std::make_unique<duckdb::ThreadContext>(client_context);
   _execution_context =
@@ -81,6 +82,7 @@ void task_creator::set_client_context(::duckdb::ClientContext& client_context)
 
 void task_creator::set_task_scheduler(sirius::pipeline::task_scheduler& task_scheduler)
 {
+  std::lock_guard<std::mutex> lock(_global_state_mutex);
   _task_scheduler = &task_scheduler;
 }
 
@@ -170,11 +172,19 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
 
 void task_creator::drain_pending_tasks()
 {
+  std::lock_guard<std::mutex> lock(_global_state_mutex);
   // Drain any queued task creation requests that haven't been picked up yet
   _task_creation_queue.interrupt();
   _task_creation_queue.drain();
-  // Wait for any in-flight task creation lambdas to finish
-  _bounded_pool->wait_all();
+  // Wait for any in-flight task creation lambdas to finish. When called from
+  // task_scheduler::drain_after_error(), stop_thread_pool() has already joined
+  // the worker pool and reset _bounded_pool to null — in that case the pool's
+  // own destructor already drained in-flight work, so this wait_all is
+  // redundant. Dereferencing the null pointer here throws std::system_error
+  // (EPERM) from the pthread_mutex call on garbage memory, surfacing to the
+  // caller as "Operation not permitted" and breaking otherwise-successful
+  // multi-file SF1000 scans.
+  if (_bounded_pool) { _bounded_pool->wait_all(); }
   _task_creation_queue.reactivate();
 }
 
@@ -231,12 +241,14 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
 
 void task_creator::stop()
 {
+  std::lock_guard<std::mutex> lock(_global_state_mutex);
   _task_creation_queue.interrupt();
-  stop_thread_pool();
+  do_stop_thread_pool();
 }
 
 void task_creator::start_thread_pool()
 {
+  std::lock_guard<std::mutex> lock(_global_state_mutex);
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
   // Re-arm the request queue. stop_thread_pool() calls
@@ -249,7 +261,7 @@ void task_creator::start_thread_pool()
   _manager_thread = std::thread(&task_creator::manager_loop, this);
 }
 
-void task_creator::stop_thread_pool()
+void task_creator::do_stop_thread_pool()
 {
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
@@ -259,6 +271,12 @@ void task_creator::stop_thread_pool()
   _bounded_pool->wait_all();
   _bounded_pool->stop();
   _bounded_pool.reset();
+}
+
+void task_creator::stop_thread_pool()
+{
+  std::lock_guard<std::mutex> lock(_global_state_mutex);
+  do_stop_thread_pool();
 }
 
 void task_creator::schedule(op::sirius_physical_operator* node)

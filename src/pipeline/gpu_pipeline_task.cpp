@@ -166,8 +166,7 @@ gpu_pipeline_task::gpu_pipeline_task(
   std::vector<cucascade::shared_data_repository*> data_repos,
   std::unique_ptr<sirius_pipeline_task_local_state> local_state,
   std::shared_ptr<sirius_pipeline_task_global_state> global_state)
-  : sirius_pipeline_itask(std::move(local_state), std::move(global_state)),
-    _task_id(task_id),
+  : sirius_pipeline_itask(task_id, std::move(local_state), std::move(global_state)),
     _data_repos(std::move(data_repos))
 {
   // Subscribe to all input data_batches
@@ -211,8 +210,6 @@ gpu_pipeline_task::~gpu_pipeline_task()
   _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline()->mark_task_completed();
 }
 
-uint64_t gpu_pipeline_task::get_task_id() const { return _task_id; }
-
 const sirius_pipeline* gpu_pipeline_task::get_pipeline() const
 {
   return _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
@@ -229,7 +226,7 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
   if (start_index > 0) {
     SIRIUS_LOG_INFO("Pipeline {}: resuming task {} from operator index {} (of {})",
                     pipeline->get_pipeline_id(),
-                    _task_id,
+                    get_task_id(),
                     start_index,
                     operators.size());
   }
@@ -282,7 +279,7 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
           (1024.0 * 1024.0),
         reservation_bytes,
         static_cast<double>(reservation_bytes) / (1024.0 * 1024.0),
-        _task_id);
+        get_task_id());
 
       auto input_basis = _local_state->cast<gpu_pipeline_task_local_state>()
                            .get_reservation_size_info()
@@ -346,7 +343,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   auto sink_op = pipeline->get_sink();
   if (sink_op) { op_chain += std::format(" -> {}", sink_op->get_name()); }
   auto nvtx_label =
-    std::format("Pipeline {} Task {} [{}]", pipeline->get_pipeline_id(), _task_id, op_chain);
+    std::format("Pipeline {} Task {} [{}]", pipeline->get_pipeline_id(), get_task_id(), op_chain);
   nvtx3::scoped_range nvtx_range{nvtx_label.c_str()};
 
   auto const prepare_start = std::chrono::high_resolution_clock::now();

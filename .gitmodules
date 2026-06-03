@@ -3,10 +3,6 @@
 	url = https://github.com/duckdb/duckdb
 	branch = main
 	ignore = dirty
-[submodule "extension-ci-tools"]
-	path = extension-ci-tools
-	url = https://github.com/sirius-db/extension-ci-tools
-	branch = sirius
 [submodule "substrait"]
 	path = substrait
 	url = https://github.com/sirius-db/duckdb-substrait-extension.git
@@ -32,3 +28,6 @@
 [submodule "vcpkg"]
 	path = vcpkg
 	url = https://github.com/Microsoft/vcpkg.git
+[submodule "starrocks/starrocks"]
+	path = experimental/starrocks/starrocks
+	url = https://github.com/starrocks/starrocks
