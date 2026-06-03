@@ -626,14 +626,56 @@ void submit_and_await(rmm::device_buffer& device_buf,
     }
   }
 
-  // Bulk H2D: one async copy per host block (pinned -> contiguous device range).
+  // Bulk H2D: one copy per host block (pinned -> contiguous device range), issued
+  // as a single batched submission to collapse the per-block launch overhead.
   // Alignment-gap bytes between segments are copied as-is and never read by the
   // decode kernels (the device layout is identical to the staging pass).
+  std::vector<void*> h2d_dst;
+  std::vector<void const*> h2d_src;
+  std::vector<std::size_t> h2d_size;
+  std::size_t const n_blocks = (total + bsz - 1) / bsz;
+  h2d_dst.reserve(n_blocks);
+  h2d_src.reserve(n_blocks);
+  h2d_size.reserve(n_blocks);
   for (std::size_t g = 0, bi = 0; g < total; g += bsz, ++bi) {
-    std::size_t const chunk = std::min(bsz, total - g);
-    RMM_CUDA_TRY(cudaMemcpyAsync(
-      device_base + g, host_alloc->at(bi).data(), chunk, cudaMemcpyHostToDevice, stream.value()));
+    h2d_dst.push_back(device_base + g);
+    h2d_src.push_back(host_alloc->at(bi).data());
+    h2d_size.push_back(std::min(bsz, total - g));
   }
+#if CUDART_VERSION >= 12080
+  cudaMemcpyAttributes attrs{};
+  attrs.srcAccessOrder  = cudaMemcpySrcAccessOrderStream;
+  attrs.srcLocHint.type = cudaMemLocationTypeHost;
+  attrs.dstLocHint.type = cudaMemLocationTypeDevice;
+  attrs.flags           = 0;
+  std::size_t attrs_idx = 0;  // single attrs entry applies to all copies
+#if CUDART_VERSION < 13000
+  std::size_t fail_idx = 0;
+  RMM_CUDA_TRY(cudaMemcpyBatchAsync(h2d_dst.data(),
+                                    h2d_src.data(),
+                                    h2d_size.data(),
+                                    h2d_dst.size(),
+                                    &attrs,
+                                    &attrs_idx,
+                                    1,
+                                    &fail_idx,
+                                    stream.value()));
+#else
+  RMM_CUDA_TRY(cudaMemcpyBatchAsync(h2d_dst.data(),
+                                    h2d_src.data(),
+                                    h2d_size.data(),
+                                    h2d_dst.size(),
+                                    &attrs,
+                                    &attrs_idx,
+                                    1,
+                                    stream.value()));
+#endif
+#else
+  for (std::size_t i = 0; i < h2d_dst.size(); ++i) {
+    RMM_CUDA_TRY(cudaMemcpyAsync(
+      h2d_dst[i], h2d_src[i], h2d_size[i], cudaMemcpyHostToDevice, stream.value()));
+  }
+#endif
 
   // Sync before host_alloc / reservation drop so the H2D copies finish reading
   // pinned memory first.
