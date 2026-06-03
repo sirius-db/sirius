@@ -24,3 +24,5 @@ jobs:
           df -h /
           echo "Hostname: $(hostname)"
           echo "Arch: $(uname -m)"
+      - name: Keep alive for node inspection
+        run: sleep 300
