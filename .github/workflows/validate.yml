@@ -1,0 +1,26 @@
+name: Validate New Runner Sizes
+
+on:
+  workflow_dispatch:
+  pull_request:
+
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [cpu-xs, cpu-sm, cpu-md, cpu-lg, arm-xs, arm-sm, arm-md, arm-lg]
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: [self-hosted, "${{ matrix.os }}", "${{ matrix.runner }}"]
+    name: ${{ matrix.runner }} / ${{ matrix.os }}
+    steps:
+      - name: System info
+        run: |
+          echo "=== Runner: ${{ matrix.runner }} / ${{ matrix.os }} ==="
+          echo "CPUs available: $(nproc)"
+          echo "Memory:"
+          free -h
+          echo "Disk:"
+          df -h /
+          echo "Hostname: $(hostname)"
+          echo "Arch: $(uname -m)"
