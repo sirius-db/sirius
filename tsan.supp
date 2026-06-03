@@ -9,8 +9,8 @@
 # So the names must be specific enough to be unambiguous, e.g. `libcuda.so` matches
 # only libcuda.so.1 (NOT libcudart.so.13). Keep the `.so` suffix on each.
 #
-# Usage:
-#   export TSAN_OPTIONS="external_symbolizer_path=/usr/bin/llvm-symbolizer-18:suppressions=$PWD/tsan.supp:ignore_noninstrumented_modules=1:halt_on_error=0:history_size=7"
+# Usage (run inside `pixi shell` so llvm-symbolizer is auto-detected on PATH):
+#   export TSAN_OPTIONS="suppressions=$PWD/tsan.supp:ignore_noninstrumented_modules=1:halt_on_error=0:history_size=7:detect_deadlocks=0"
 #
 # Grow this list as new library noise appears. Pattern forms:
 #   race:<substring of symbol or file>     -> data-race reports

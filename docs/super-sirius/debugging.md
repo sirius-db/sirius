@@ -5,6 +5,7 @@ bugs. It is aimed at developers who are relatively new to sanitizers and core
 dumps. It covers:
 
 - [When to reach for which tool](#choosing-a-tool)
+- [Getting symbolized output](#getting-symbolized-output)
 - [Building and running with AddressSanitizer (ASan)](#addresssanitizer-asan)
 - [Building and running with ThreadSanitizer (TSan)](#threadsanitizer-tsan)
 - [The `tsan.supp` suppressions file](#the-tsansupp-suppressions-file)
@@ -46,6 +47,33 @@ Rules of thumb:
 
 ---
 
+## Getting symbolized output
+
+ASan and TSan reports are only useful if stack frames show **function names and
+`file:line`** rather than raw `binary+0xADDR` offsets. The sanitizer runtimes do
+this automatically by invoking `llvm-symbolizer` from your `PATH`.
+
+**Inside `pixi shell` this works out of the box** — the `llvm-tools` dependency
+provides an `llvm-symbolizer` matching the clang version Sirius is built with
+(kept at `21.*` in `pixi.toml`, alongside `clang`). So you do **not** need to
+set `external_symbolizer_path`; just run with the `*SAN_OPTIONS` shown below.
+
+> Keeping the symbolizer in lockstep with the compiler matters: a mismatched
+> `llvm-symbolizer` can mis-resolve or fail to parse debug info produced by a
+> newer clang. That is why we ship it via pixi rather than hardcoding a
+> system path like `/usr/bin/llvm-symbolizer-18`.
+
+If you ever see raw addresses (running **outside** pixi, or `llvm-symbolizer`
+isn't on `PATH`):
+
+- Point the runtime at one explicitly, e.g.
+  `ASAN_OPTIONS="...:external_symbolizer_path=$(which llvm-symbolizer)"`
+  (prefer one matching the build's clang version).
+- Or symbolize a single frame by hand:
+  `addr2line -f -C -e build/clang-asan/.../sirius_unittest 0x2ff9e9e`.
+
+---
+
 ## AddressSanitizer (ASan)
 
 ASan instruments host code to detect heap/stack buffer overflows,
@@ -71,7 +99,7 @@ CUDA reserves huge virtual-address ranges that collide with ASan's shadow
 memory, so a couple of options are **required** or ASan will fail at startup:
 
 ```bash
-ASAN_OPTIONS="protect_shadow_gap=0:detect_leaks=0:halt_on_error=0:abort_on_error=1:external_symbolizer_path=/usr/bin/llvm-symbolizer-18" \
+ASAN_OPTIONS="protect_shadow_gap=0:detect_leaks=0:halt_on_error=0:abort_on_error=1" \
   ./build/clang-asan/extension/sirius/test/cpp/sirius_unittest "<catch2-test-filter>"
 ```
 
@@ -81,12 +109,11 @@ ASAN_OPTIONS="protect_shadow_gap=0:detect_leaks=0:halt_on_error=0:abort_on_error
 |--------|-----|
 | `protect_shadow_gap=0` | **Required with CUDA.** The driver maps VA ranges that overlap ASan's protected shadow gap; without this ASan aborts on startup. |
 | `detect_leaks=0` | Silences the flood of "leaks" from cuDF/CUDA/RMM, which manage their own memory. Turn it back on only when hunting an actual leak. |
-| `external_symbolizer_path=/usr/bin/llvm-symbolizer-18` | Produces **symbolized** stack traces. Without it you get raw `binary+0xADDR` lines (the pixi env has no symbolizer on `PATH`). |
 | `halt_on_error=0` | Keep running after the first error so you can see whether there are earlier/related reports. |
 | `abort_on_error=1` | Abort (rather than `_exit`) on the final error, which makes the failure loud. |
 
-> If your report comes out as raw addresses anyway, you can symbolize them by
-> hand: `addr2line -f -C -e build/clang-asan/.../sirius_unittest 0x2ff9e9e`.
+See [Getting symbolized output](#getting-symbolized-output) — inside `pixi shell`
+no extra option is needed.
 
 ---
 
@@ -113,7 +140,7 @@ build/clang-tsan/extension/sirius/test/cpp/sirius_unittest
 ### Run
 
 ```bash
-export TSAN_OPTIONS="external_symbolizer_path=/usr/bin/llvm-symbolizer-18:suppressions=$PWD/tsan.supp:ignore_noninstrumented_modules=1:halt_on_error=0:history_size=7:detect_deadlocks=0"
+export TSAN_OPTIONS="suppressions=$PWD/tsan.supp:ignore_noninstrumented_modules=1:halt_on_error=0:history_size=7:detect_deadlocks=0"
 
 ./build/clang-tsan/extension/sirius/test/cpp/sirius_unittest "<catch2-test-filter>"
 ```
@@ -122,7 +149,6 @@ export TSAN_OPTIONS="external_symbolizer_path=/usr/bin/llvm-symbolizer-18:suppre
 
 | Option | Why |
 |--------|-----|
-| `external_symbolizer_path=/usr/bin/llvm-symbolizer-18` | Symbolized stacks (same reason as ASan). |
 | `suppressions=$PWD/tsan.supp` | Silence known false positives from uninstrumented libraries — see [below](#the-tsansupp-suppressions-file). |
 | `ignore_noninstrumented_modules=1` | **The biggest noise reducer.** Drops races whose accesses are entirely inside uninstrumented libs (cuDF, CUDA, RMM), so only races touching Sirius's own code surface. |
 | `halt_on_error=0` | Collect *all* races in one run instead of stopping at the first. |

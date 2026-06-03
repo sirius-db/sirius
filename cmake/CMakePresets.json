@@ -25,6 +25,14 @@
       "name": "clang-relwithdebinfo"
     },
     {
+      "configurePreset": "clang-asan",
+      "name": "clang-asan"
+    },
+    {
+      "configurePreset": "clang-tsan",
+      "name": "clang-tsan"
+    },
+    {
       "configurePreset": "legacy-release",
       "name": "legacy-release"
     },
@@ -43,14 +51,6 @@
     {
       "configurePreset": "ci-release",
       "name": "ci-release"
-    },
-    {
-      "configurePreset": "clang-asan",
-      "name": "clang-asan"
-    },
-    {
-      "configurePreset": "clang-tsan",
-      "name": "clang-tsan"
     }
   ],
   "cmakeMinimumRequired": {
@@ -148,33 +148,35 @@
       "name": "clang-relwithdebinfo"
     },
     {
-      "binaryDir": "${sourceDir}/../build/clang-asan",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
-        "CMAKE_CUDA_FLAGS": "-Xcompiler -fsanitize=address -Xcompiler -fno-omit-frame-pointer -g",
-        "CMAKE_CXX_FLAGS": "-fsanitize=address -fno-omit-frame-pointer -g",
-        "CMAKE_C_FLAGS": "-fsanitize=address -fno-omit-frame-pointer -g",
-        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=address",
-        "CMAKE_MODULE_LINKER_FLAGS": "-fsanitize=address",
-        "CMAKE_SHARED_LINKER_FLAGS": "-fsanitize=address"
+        "CMAKE_CUDA_FLAGS": "-Xcompiler -fsanitize=$env{SIRIUS_SANITIZER_TYPE} -Xcompiler -fno-omit-frame-pointer -g",
+        "CMAKE_CXX_FLAGS": "-fsanitize=$env{SIRIUS_SANITIZER_TYPE} -fno-omit-frame-pointer -g",
+        "CMAKE_C_FLAGS": "-fsanitize=$env{SIRIUS_SANITIZER_TYPE} -fno-omit-frame-pointer -g",
+        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=$env{SIRIUS_SANITIZER_TYPE}",
+        "CMAKE_MODULE_LINKER_FLAGS": "-fsanitize=$env{SIRIUS_SANITIZER_TYPE}",
+        "CMAKE_SHARED_LINKER_FLAGS": "-fsanitize=$env{SIRIUS_SANITIZER_TYPE}"
       },
-      "displayName": "Clang ASan (RelWithDebInfo)",
+      "hidden": true,
       "inherits": "base-clang",
+      "name": "clang-sanitizer-base"
+    },
+    {
+      "binaryDir": "${sourceDir}/../build/clang-asan",
+      "displayName": "Clang ASan (RelWithDebInfo)",
+      "environment": {
+        "SIRIUS_SANITIZER_TYPE": "address"
+      },
+      "inherits": "clang-sanitizer-base",
       "name": "clang-asan"
     },
     {
       "binaryDir": "${sourceDir}/../build/clang-tsan",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
-        "CMAKE_CUDA_FLAGS": "-Xcompiler -fsanitize=thread -Xcompiler -fno-omit-frame-pointer -g",
-        "CMAKE_CXX_FLAGS": "-fsanitize=thread -fno-omit-frame-pointer -g",
-        "CMAKE_C_FLAGS": "-fsanitize=thread -fno-omit-frame-pointer -g",
-        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=thread",
-        "CMAKE_MODULE_LINKER_FLAGS": "-fsanitize=thread",
-        "CMAKE_SHARED_LINKER_FLAGS": "-fsanitize=thread"
-      },
       "displayName": "Clang TSan (RelWithDebInfo)",
-      "inherits": "base-clang",
+      "environment": {
+        "SIRIUS_SANITIZER_TYPE": "thread"
+      },
+      "inherits": "clang-sanitizer-base",
       "name": "clang-tsan"
     },
     {

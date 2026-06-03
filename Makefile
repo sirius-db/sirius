@@ -83,8 +83,9 @@ ifneq ($(TEST_BUILD_TARGET),)
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-relwithdebinfo --target $(TEST_BUILD_TARGET)
 endif
 
-# AddressSanitizer build (RelWithDebInfo + clang). Run with:
-#   ASAN_OPTIONS="protect_shadow_gap=0:detect_leaks=0:external_symbolizer_path=/usr/bin/llvm-symbolizer-18" \
+# AddressSanitizer build (RelWithDebInfo + clang). Run inside `pixi shell` (so
+# llvm-symbolizer is auto-detected on PATH) with:
+#   ASAN_OPTIONS="protect_shadow_gap=0:detect_leaks=0:halt_on_error=0:abort_on_error=1" \
 #     ./build/clang-asan/extension/sirius/test/cpp/sirius_unittest
 clang-asan: build/clang-asan/build.ninja
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-asan --target $(MAIN_BUILD_TARGETS)
@@ -92,8 +93,9 @@ ifneq ($(TEST_BUILD_TARGET),)
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-asan --target $(TEST_BUILD_TARGET)
 endif
 
-# ThreadSanitizer build (RelWithDebInfo + clang). Run with:
-#   TSAN_OPTIONS="external_symbolizer_path=/usr/bin/llvm-symbolizer-18:suppressions=$$PWD/tsan.supp:ignore_noninstrumented_modules=1:halt_on_error=0:history_size=7:detect_deadlocks=0" \
+# ThreadSanitizer build (RelWithDebInfo + clang). Run inside `pixi shell` (so
+# llvm-symbolizer is auto-detected on PATH) with:
+#   TSAN_OPTIONS="suppressions=$$PWD/tsan.supp:ignore_noninstrumented_modules=1:halt_on_error=0:history_size=7:detect_deadlocks=0" \
 #     ./build/clang-tsan/extension/sirius/test/cpp/sirius_unittest
 clang-tsan: build/clang-tsan/build.ninja
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-tsan --target $(MAIN_BUILD_TARGETS)
