@@ -82,7 +82,7 @@ jobs:
       fail-fast: false
     runs-on: >-
       ${{ matrix.environment == 'vcpkg'
-        && fromJSON('["self-hosted", "ubuntu-24.04", "cpu-xl"]')
+        && fromJSON('["self-hosted", "ubuntu-24.04", "cpu-lg"]')
         || matrix.arch == 'x64'
         && fromJSON('["self-hosted", "ubuntu-24.04", "cpu-lg"]')
         || matrix.arch == 'arm64'
