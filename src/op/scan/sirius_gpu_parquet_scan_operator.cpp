@@ -21,6 +21,7 @@
 #include <op/scan/parquet_scan_operator_data.hpp>
 #include <op/scan/scan_info.hpp>
 #include <op/scan/scan_plan.hpp>
+#include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_parquet_scan_operator.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <pipeline/sirius_meta_pipeline.hpp>
@@ -211,7 +212,8 @@ std::unique_ptr<cudf::table> sirius_gpu_parquet_scan_operator::read_table_from_m
       return plan->batch_column_name(ref_index);
     };
     gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
-    ast_expression = translator.translate_expression_with_names(*filter_expression, name_resolver);
+    ast_expression = sirius::op::translate_duckdb_expression_with_names(
+      translator, *filter_expression, name_resolver);
     if (ast_expression) {
       opts.set_filter(ast_expression->back());
       SIRIUS_LOG_DEBUG(
