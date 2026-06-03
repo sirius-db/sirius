@@ -12,7 +12,20 @@ pub(crate) struct TranslatedRel {
     /// Substrait relation built for the StarRocks subtree.
     pub rel: Rel,
     /// Tuple ids visible in the relation output row.
+    ///
+    /// For multi-input relations (joins, set ops) this is the left-to-right
+    /// concatenation of the child layouts, so `DescriptorTable::slot_global_index`
+    /// resolves a right-side slot to `left_width + right_index`. New multi-input
+    /// translators MUST follow this ordering.
     pub row_tuples: Vec<i32>,
+    /// Number of columns this relation emits.
+    ///
+    /// Carried as an invariant (rather than recomputed by walking `rel`) so a
+    /// parent projection can compute its `output_mapping` base offset without
+    /// teaching a column-counting helper about every relation type — a pattern
+    /// that silently produced a wrong offset the moment an unknown relation
+    /// appeared mid-tree. Every relation built here MUST set its true width.
+    pub output_width: usize,
 }
 
 /// Mutable state shared by plan-node translators.
@@ -160,6 +173,7 @@ impl TranslatePlanNode for FileScanPlanNode<'_> {
         let input = TranslatedRel {
             rel: scan_rel(ctx.desc, tuple_id)?,
             row_tuples: vec![tuple_id],
+            output_width: ctx.desc.materialized_slot_ids(tuple_id)?.len(),
         };
         apply_conjuncts(input, self.0, ctx)
     }
@@ -189,6 +203,7 @@ impl TranslatePlanNode for HdfsScanPlanNode<'_> {
         let input = TranslatedRel {
             rel: scan_rel(ctx.desc, tuple_id)?,
             row_tuples: vec![tuple_id],
+            output_width: ctx.desc.materialized_slot_ids(tuple_id)?.len(),
         };
         apply_conjuncts(input, self.0, ctx)
     }
@@ -302,9 +317,10 @@ fn translate_project_node(
         }
     }
 
-    let input_columns = count_rel_columns(&child.rel);
+    let input_columns = child.output_width;
     let output_mapping =
         (input_columns as i32..input_columns as i32 + expressions.len() as i32).collect();
+    let output_width = expressions.len();
 
     Ok(TranslatedRel {
         rel: Rel {
@@ -321,6 +337,7 @@ fn translate_project_node(
             }))),
         },
         row_tuples: output_tuples,
+        output_width,
     })
 }
 
@@ -346,9 +363,10 @@ fn project_exprs_with_context(
         let mut expr_ctx = ctx.expr_context(&input.row_tuples);
         expressions.push(expr.translate(&mut expr_ctx)?);
     }
-    let input_columns = count_rel_columns(&input.rel);
+    let input_columns = input.output_width;
     let output_mapping =
         (input_columns as i32..input_columns as i32 + expressions.len() as i32).collect();
+    let output_width = expressions.len();
 
     Ok(TranslatedRel {
         rel: Rel {
@@ -365,6 +383,7 @@ fn project_exprs_with_context(
             }))),
         },
         row_tuples: input.row_tuples,
+        output_width,
     })
 }
 
@@ -394,6 +413,8 @@ fn apply_conjuncts(
         }
     };
 
+    // A filter does not change the column layout, so the width passes through.
+    let output_width = input.output_width;
     Ok(TranslatedRel {
         rel: Rel {
             rel_type: Some(rel::RelType::Filter(Box::new(FilterRel {
@@ -403,6 +424,7 @@ fn apply_conjuncts(
             }))),
         },
         row_tuples: input.row_tuples,
+        output_width,
     })
 }
 
@@ -426,32 +448,4 @@ fn expect_children(node: &TPlanNode, children: &[TranslatedRel], expected: usize
         )));
     }
     Ok(())
-}
-
-/// Counts visible output columns for the subset of Substrait rels emitted here.
-pub(crate) fn count_rel_columns(rel: &Rel) -> usize {
-    match rel.rel_type.as_ref() {
-        Some(rel::RelType::Read(read)) => read
-            .base_schema
-            .as_ref()
-            .and_then(|schema| schema.r#struct.as_ref())
-            .map(|schema| schema.types.len())
-            .unwrap_or(0),
-        Some(rel::RelType::Filter(filter)) => {
-            filter.input.as_deref().map(count_rel_columns).unwrap_or(0)
-        }
-        Some(rel::RelType::Project(project)) => project
-            .common
-            .as_ref()
-            .and_then(|common| common.emit_kind.as_ref())
-            .and_then(|emit_kind| match emit_kind {
-                rel_common::EmitKind::Emit(emit) => Some(emit.output_mapping.len()),
-                rel_common::EmitKind::Direct(_) => None,
-            })
-            .unwrap_or_else(|| {
-                project.input.as_deref().map(count_rel_columns).unwrap_or(0)
-                    + project.expressions.len()
-            }),
-        _ => 0,
-    }
 }

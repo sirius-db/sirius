@@ -291,3 +291,96 @@ impl DescriptorTable {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use starrocks_thrift::descriptors::{TSlotDescriptor, TTupleDescriptor};
+    use starrocks_thrift::types::{
+        TPrimitiveType, TScalarType, TTypeDesc, TTypeNode, TTypeNodeType,
+    };
+
+    /// Builds a scalar BIGINT type descriptor for slot fixtures.
+    fn bigint() -> TTypeDesc {
+        TTypeDesc::new(Some(vec![TTypeNode::new(
+            TTypeNodeType::SCALAR,
+            Some(TScalarType::new(TPrimitiveType::BIGINT, None, None, None)),
+            None,
+            None,
+        )]))
+    }
+
+    /// Builds a materialized BIGINT slot owned by `tuple_id` at `column_pos`.
+    fn slot(id: i32, tuple_id: i32, column_pos: i32, name: &str) -> TSlotDescriptor {
+        TSlotDescriptor::new(
+            Some(id),
+            Some(tuple_id),
+            Some(bigint()),
+            Some(column_pos),
+            None,
+            None,
+            None,
+            Some(name.to_string()),
+            None,
+            Some(true),
+            Some(true),
+            Some(true),
+            None,
+            None,
+        )
+    }
+
+    /// Builds a two-tuple table: tuple 0 = {1:a, 2:b}, tuple 1 = {3:c, 4:d}.
+    fn two_tuple_desc() -> DescriptorTable {
+        let desc_tbl = TDescriptorTable::new(
+            Some(vec![
+                slot(1, 0, 0, "a"),
+                slot(2, 0, 1, "b"),
+                slot(3, 1, 0, "c"),
+                slot(4, 1, 1, "d"),
+            ]),
+            vec![
+                TTupleDescriptor::new(Some(0), None, None, None, None),
+                TTupleDescriptor::new(Some(1), None, None, None, None),
+            ],
+            None,
+            None,
+        );
+        DescriptorTable::try_from(&desc_tbl).unwrap()
+    }
+
+    #[test]
+    fn slot_global_index_accumulates_offset_across_tuples() {
+        let desc = two_tuple_desc();
+        // Tuple 0 contributes two columns, so tuple 1's slots start at index 2.
+        assert_eq!(desc.slot_global_index(1, &[0, 1]).unwrap(), 0);
+        assert_eq!(desc.slot_global_index(2, &[0, 1]).unwrap(), 1);
+        assert_eq!(desc.slot_global_index(3, &[0, 1]).unwrap(), 2);
+        assert_eq!(desc.slot_global_index(4, &[0, 1]).unwrap(), 3);
+    }
+
+    #[test]
+    fn slot_global_index_follows_row_tuple_order() {
+        let desc = two_tuple_desc();
+        // Reversed layout: tuple 1's slots now come before tuple 0's.
+        assert_eq!(desc.slot_global_index(3, &[1, 0]).unwrap(), 0);
+        assert_eq!(desc.slot_global_index(4, &[1, 0]).unwrap(), 1);
+        assert_eq!(desc.slot_global_index(1, &[1, 0]).unwrap(), 2);
+        assert_eq!(desc.slot_global_index(2, &[1, 0]).unwrap(), 3);
+    }
+
+    #[test]
+    fn slot_global_index_rejects_slot_outside_row_tuples() {
+        let desc = two_tuple_desc();
+        // Slot 3 lives in tuple 1, which is absent from this row layout.
+        let err = desc.slot_global_index(3, &[0]).unwrap_err();
+        assert!(matches!(err, TranslateError::Descriptor(_)));
+    }
+
+    #[test]
+    fn slot_global_index_reports_unknown_slot() {
+        let desc = two_tuple_desc();
+        let err = desc.slot_global_index(99, &[0, 1]).unwrap_err();
+        assert!(matches!(err, TranslateError::Descriptor(_)));
+    }
+}

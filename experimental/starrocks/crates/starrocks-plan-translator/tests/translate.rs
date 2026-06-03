@@ -8,8 +8,8 @@ use starrocks_thrift::descriptors::{
     TDescriptorTable, TSlotDescriptor, TTableDescriptor, TTupleDescriptor,
 };
 use starrocks_thrift::exprs::{
-    TBoolLiteral, TExpr, TExprNode, TExprNodeType, TFloatLiteral, TIntLiteral, TSlotRef,
-    TStringLiteral,
+    TBoolLiteral, TDecimalLiteral, TExpr, TExprNode, TExprNodeType, TFloatLiteral, TIntLiteral,
+    TIsNullPredicate, TSlotRef, TStringLiteral,
 };
 use starrocks_thrift::internal_service::{InternalServiceVersion, TExecPlanFragmentParams};
 use starrocks_thrift::opcodes::TExprOpcode;
@@ -895,4 +895,546 @@ fn bool_and_string_literals_translate() {
         rel::RelType::Filter(filter) => assert!(filter.condition.is_some()),
         other => panic!("expected filter rel, got {other:?}"),
     }
+}
+
+// --- Helpers and coverage for the expression/scan/type surface ---------------
+
+/// Builds a compound predicate over already-built children in preorder.
+fn compound_pred(opcode: TExprOpcode, children: Vec<TExpr>) -> TExpr {
+    let mut node = base_expr_node(
+        TExprNodeType::COMPOUND_PRED,
+        scalar_type(TPrimitiveType::BOOLEAN),
+        children.len() as i32,
+    );
+    node.opcode = Some(opcode);
+    let mut nodes = vec![node];
+    for child in children {
+        nodes.extend(child.nodes);
+    }
+    TExpr::new(nodes)
+}
+
+/// Builds an `IS [NOT] NULL` predicate over a single child.
+fn is_null_pred(is_not_null: bool, child: TExpr) -> TExpr {
+    let mut node = base_expr_node(
+        TExprNodeType::IS_NULL_PRED,
+        scalar_type(TPrimitiveType::BOOLEAN),
+        1,
+    );
+    node.is_null_pred = Some(TIsNullPredicate::new(is_not_null));
+    let mut nodes = vec![node];
+    nodes.extend(child.nodes);
+    TExpr::new(nodes)
+}
+
+/// Builds a cast of `child` to `target` in preorder.
+fn cast_expr(target: TTypeDesc, child: TExpr) -> TExpr {
+    let node = base_expr_node(TExprNodeType::CAST_EXPR, target, 1);
+    let mut nodes = vec![node];
+    nodes.extend(child.nodes);
+    TExpr::new(nodes)
+}
+
+/// Builds a typed NULL literal expression.
+fn null_literal(primitive: TPrimitiveType) -> TExpr {
+    TExpr::new(vec![base_expr_node(
+        TExprNodeType::NULL_LITERAL,
+        scalar_type(primitive),
+        0,
+    )])
+}
+
+/// Builds a DECIMAL literal carrying its source string and precision/scale.
+fn decimal_literal(value: &str, precision: i32, scale: i32) -> TExpr {
+    let mut node = base_expr_node(
+        TExprNodeType::DECIMAL_LITERAL,
+        scalar_type_with(
+            TPrimitiveType::DECIMAL128,
+            None,
+            Some(precision),
+            Some(scale),
+        ),
+        0,
+    );
+    node.decimal_literal = Some(TDecimalLiteral::new(value.to_string(), None));
+    TExpr::new(vec![node])
+}
+
+/// Builds an HDFS scan node that resolves its tuple from `row_tuples`.
+fn hdfs_scan_node(node_id: i32, tuple_id: i32) -> TPlanNode {
+    base_plan_node(node_id, TPlanNodeType::HDFS_SCAN_NODE, 0, vec![tuple_id])
+}
+
+/// Builds a single-column descriptor whose table carries `db` (empty for fallback tests).
+fn desc_with_db(db: &str) -> TDescriptorTable {
+    TDescriptorTable::new(
+        Some(vec![slot(
+            1,
+            0,
+            0,
+            "id",
+            scalar_type(TPrimitiveType::BIGINT),
+        )]),
+        vec![TTupleDescriptor::new(Some(0), None, None, Some(7), None)],
+        Some(vec![TTableDescriptor::new(
+            7,
+            TTableType::HDFS_TABLE,
+            1,
+            0,
+            "t".to_string(),
+            db.to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )]),
+        None,
+    )
+}
+
+/// Extracts the scalar function from a Substrait expression.
+fn scalar_fn(expr: &substrait::proto::Expression) -> &expression::ScalarFunction {
+    match expr.rex_type.as_ref().unwrap() {
+        expression::RexType::ScalarFunction(scalar) => scalar,
+        other => panic!("expected scalar function, got {other:?}"),
+    }
+}
+
+/// Resolves a function anchor back to its `(extension urn, function name)`.
+fn resolved_function(plan: &substrait::proto::Plan, anchor: u32) -> (String, String) {
+    use substrait::proto::extensions::simple_extension_declaration::MappingType;
+    let func = plan
+        .extensions
+        .iter()
+        .find_map(|decl| match decl.mapping_type.as_ref().unwrap() {
+            MappingType::ExtensionFunction(func) if func.function_anchor == anchor => Some(func),
+            _ => None,
+        })
+        .expect("function anchor is declared");
+    let urn = plan
+        .extension_urns
+        .iter()
+        .find(|urn| urn.extension_urn_anchor == func.extension_urn_reference)
+        .expect("urn anchor is declared")
+        .urn
+        .clone();
+    (urn, func.name.clone())
+}
+
+/// Extracts the named-table path emitted by a scan-only plan.
+fn read_named_table_names(plan: &substrait::proto::Plan) -> Vec<String> {
+    match root(plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    {
+        rel::RelType::Read(read) => match read.read_type.as_ref().unwrap() {
+            read_rel::ReadType::NamedTable(table) => table.names.clone(),
+            other => panic!("expected named table, got {other:?}"),
+        },
+        other => panic!("expected read rel, got {other:?}"),
+    }
+}
+
+/// Translates a filter whose single conjunct is `conjunct`.
+fn filter_with_conjunct(conjunct: TExpr) -> substrait::proto::Plan {
+    let mut select = base_plan_node(1, TPlanNodeType::SELECT_NODE, 1, vec![0]);
+    select.select_node = Some(TSelectNode::new(None));
+    select.conjuncts = Some(vec![conjunct]);
+    translate_fragment(&params(
+        Some(TPlan::new(vec![select, scan_node(0, 0)])),
+        Some(base_desc()),
+        None,
+    ))
+    .unwrap()
+    .plan
+}
+
+/// Verifies every comparison opcode maps to its Substrait function name under the comparison URN.
+#[test]
+fn binary_predicate_opcodes_map_to_comparison_names() {
+    for (opcode, expected) in [
+        (TExprOpcode::EQ, "equal"),
+        (TExprOpcode::NE, "not_equal"),
+        (TExprOpcode::LT, "lt"),
+        (TExprOpcode::LE, "lte"),
+        (TExprOpcode::GT, "gt"),
+        (TExprOpcode::GE, "gte"),
+    ] {
+        let plan = filter_with_conjunct(binary_pred(
+            opcode,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            int_literal(10),
+        ));
+        let scalar = scalar_fn(filter_condition(&plan));
+        let (urn, name) = resolved_function(&plan, scalar.function_reference);
+        assert_eq!(name, expected, "opcode {opcode:?}");
+        assert_eq!(urn, URN_COMPARISON);
+    }
+}
+
+/// Verifies compound AND/OR/NOT map to boolean functions with the right arity.
+#[test]
+fn compound_predicates_map_to_boolean_functions() {
+    for (opcode, expected, child_count) in [
+        (TExprOpcode::COMPOUND_AND, "and", 2usize),
+        (TExprOpcode::COMPOUND_OR, "or", 2),
+        (TExprOpcode::COMPOUND_NOT, "not", 1),
+    ] {
+        let children = (0..child_count)
+            .map(|_| {
+                binary_pred(
+                    TExprOpcode::GT,
+                    slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+                    int_literal(10),
+                )
+            })
+            .collect();
+        let plan = filter_with_conjunct(compound_pred(opcode, children));
+        let scalar = scalar_fn(filter_condition(&plan));
+        assert_eq!(scalar.arguments.len(), child_count);
+        let (urn, name) = resolved_function(&plan, scalar.function_reference);
+        assert_eq!(name, expected);
+        assert_eq!(urn, URN_BOOLEAN);
+    }
+}
+
+/// Verifies a compound AND/OR with fewer than two children is rejected.
+#[test]
+fn compound_and_with_single_child_is_error() {
+    let mut select = base_plan_node(1, TPlanNodeType::SELECT_NODE, 1, vec![0]);
+    select.select_node = Some(TSelectNode::new(None));
+    select.conjuncts = Some(vec![compound_pred(
+        TExprOpcode::COMPOUND_AND,
+        vec![bool_literal(true)],
+    )]);
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![select, scan_node(0, 0)])),
+        Some(base_desc()),
+        None,
+    ))
+    .unwrap_err();
+    assert!(matches!(err, TranslateError::MalformedPlan(_)));
+}
+
+/// Verifies multiple filter conjuncts fold into a single boolean `and`.
+#[test]
+fn multiple_conjuncts_fold_into_boolean_and() {
+    let mut select = base_plan_node(1, TPlanNodeType::SELECT_NODE, 1, vec![0]);
+    select.select_node = Some(TSelectNode::new(None));
+    select.conjuncts = Some(vec![
+        binary_pred(
+            TExprOpcode::GT,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            int_literal(10),
+        ),
+        binary_pred(
+            TExprOpcode::LT,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            int_literal(20),
+        ),
+    ]);
+    let plan = translate_fragment(&params(
+        Some(TPlan::new(vec![select, scan_node(0, 0)])),
+        Some(base_desc()),
+        None,
+    ))
+    .unwrap()
+    .plan;
+    let scalar = scalar_fn(filter_condition(&plan));
+    assert_eq!(scalar.arguments.len(), 2);
+    let (urn, name) = resolved_function(&plan, scalar.function_reference);
+    assert_eq!(name, "and");
+    assert_eq!(urn, URN_BOOLEAN);
+}
+
+/// Verifies both IS NULL branches map to the right comparison function.
+#[test]
+fn is_null_predicates_map_to_comparison_functions() {
+    for (is_not_null, expected) in [(false, "is_null"), (true, "is_not_null")] {
+        let plan = filter_with_conjunct(is_null_pred(
+            is_not_null,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+        ));
+        let scalar = scalar_fn(filter_condition(&plan));
+        assert_eq!(scalar.arguments.len(), 1);
+        let (urn, name) = resolved_function(&plan, scalar.function_reference);
+        assert_eq!(name, expected);
+        assert_eq!(urn, URN_COMPARISON);
+    }
+}
+
+/// Verifies a cast emits a throwing Substrait cast to the declared target type.
+#[test]
+fn cast_expr_emits_throwing_cast_to_target_type() {
+    let plan = filter_with_conjunct(binary_pred(
+        TExprOpcode::EQ,
+        cast_expr(
+            scalar_type(TPrimitiveType::INT),
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+        ),
+        int_literal_typed(10, TPrimitiveType::INT),
+    ));
+    match scalar_arg(filter_condition(&plan), 0)
+        .rex_type
+        .as_ref()
+        .unwrap()
+    {
+        expression::RexType::Cast(cast) => {
+            assert_eq!(
+                cast.failure_behavior,
+                expression::cast::FailureBehavior::ThrowException as i32
+            );
+            assert!(matches!(
+                cast.r#type.as_ref().unwrap().kind.as_ref().unwrap(),
+                substrait::proto::r#type::Kind::I32(_)
+            ));
+        }
+        other => panic!("expected cast, got {other:?}"),
+    }
+}
+
+/// Verifies a NULL literal becomes a typed Substrait null.
+#[test]
+fn null_literal_translates_to_typed_null() {
+    let plan = filter_with_conjunct(binary_pred(
+        TExprOpcode::EQ,
+        slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+        null_literal(TPrimitiveType::BIGINT),
+    ));
+    match literal_type(scalar_arg(filter_condition(&plan), 1)) {
+        expression::literal::LiteralType::Null(ty) => assert!(matches!(
+            ty.kind.as_ref().unwrap(),
+            substrait::proto::r#type::Kind::I64(_)
+        )),
+        other => panic!("expected typed null literal, got {other:?}"),
+    }
+}
+
+/// Verifies decimal literals encode the little-endian unscaled integer with precision/scale.
+#[test]
+fn decimal_literal_encodes_little_endian_unscaled_value() {
+    for (text, precision, scale, expected) in [
+        ("1.50", 10, 2, 150i128),
+        ("-1.50", 10, 2, -150i128),
+        ("1.5", 10, 4, 15000i128),
+        ("0", 10, 0, 0i128),
+    ] {
+        let plan = filter_with_conjunct(binary_pred(
+            TExprOpcode::EQ,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            decimal_literal(text, precision, scale),
+        ));
+        match literal_type(scalar_arg(filter_condition(&plan), 1)) {
+            expression::literal::LiteralType::Decimal(decimal) => {
+                assert_eq!(
+                    decimal.value,
+                    expected.to_le_bytes().to_vec(),
+                    "value for {text}"
+                );
+                assert_eq!(decimal.precision, precision);
+                assert_eq!(decimal.scale, scale);
+            }
+            other => panic!("expected decimal literal, got {other:?}"),
+        }
+    }
+}
+
+/// Verifies an integer literal that overflows its declared width is a malformed plan.
+#[test]
+fn integer_literal_overflowing_declared_width_is_error() {
+    let mut select = base_plan_node(1, TPlanNodeType::SELECT_NODE, 1, vec![0]);
+    select.select_node = Some(TSelectNode::new(None));
+    select.conjuncts = Some(vec![binary_pred(
+        TExprOpcode::EQ,
+        slot_ref(1, 0, scalar_type(TPrimitiveType::INT)),
+        int_literal_typed(i64::from(i32::MAX) + 1, TPrimitiveType::INT),
+    )]);
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![select, scan_node(0, 0)])),
+        Some(base_desc()),
+        None,
+    ))
+    .unwrap_err();
+    assert!(matches!(err, TranslateError::MalformedPlan(_)));
+}
+
+/// Verifies narrow integer literals keep their Substrait width.
+#[test]
+fn integer_literals_match_narrow_widths() {
+    for primitive in [TPrimitiveType::TINYINT, TPrimitiveType::SMALLINT] {
+        let plan = filter_with_conjunct(binary_pred(
+            TExprOpcode::EQ,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            int_literal_typed(7, primitive),
+        ));
+        let lit = literal_type(scalar_arg(filter_condition(&plan), 1));
+        match primitive {
+            TPrimitiveType::TINYINT => {
+                assert!(matches!(lit, expression::literal::LiteralType::I8(7)))
+            }
+            TPrimitiveType::SMALLINT => {
+                assert!(matches!(lit, expression::literal::LiteralType::I16(7)))
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// Verifies an HDFS scan node produces the same named-table read as a file scan.
+#[test]
+fn hdfs_scan_produces_named_table() {
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![hdfs_scan_node(0, 0)])),
+        Some(base_desc()),
+        None,
+    ))
+    .unwrap();
+    assert_eq!(translated.output_names, vec!["id", "name"]);
+    assert_eq!(
+        read_named_table_names(&translated.plan),
+        vec!["tpch", "users"]
+    );
+}
+
+/// Verifies a project emits its expressions starting after the input columns.
+#[test]
+fn project_emit_mapping_starts_after_input_columns() {
+    let mut slot_map = BTreeMap::new();
+    slot_map.insert(3, slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR)));
+    slot_map.insert(4, slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)));
+
+    let mut project = base_plan_node(1, TPlanNodeType::PROJECT_NODE, 1, vec![1]);
+    project.project_node = Some(TProjectNode::new(Some(slot_map), None));
+
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(3, 1, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(4, 1, 1, "id", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![project, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap();
+
+    match root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    {
+        rel::RelType::Project(project) => {
+            let emit = match project.common.as_ref().unwrap().emit_kind.as_ref().unwrap() {
+                substrait::proto::rel_common::EmitKind::Emit(emit) => emit,
+                other => panic!("expected emit, got {other:?}"),
+            };
+            // The scan child emits two columns, so the two projected expressions
+            // map to indices [2, 3], not [0, 1].
+            assert_eq!(emit.output_mapping, vec![2, 3]);
+        }
+        other => panic!("expected project rel, got {other:?}"),
+    }
+}
+
+/// Verifies a scan over a tuple with no backing table uses a synthetic name.
+#[test]
+fn scan_table_name_falls_back_when_table_missing() {
+    let desc = desc_table(
+        vec![(0, None)],
+        vec![slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT))],
+    );
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap();
+    assert_eq!(read_named_table_names(&translated.plan), vec!["tuple_0"]);
+}
+
+/// Verifies a qualified database produces a two-part named-table path.
+#[test]
+fn scan_table_name_keeps_qualified_database() {
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![scan_node(0, 0)])),
+        Some(desc_with_db("db")),
+        None,
+    ))
+    .unwrap();
+    assert_eq!(read_named_table_names(&translated.plan), vec!["db", "t"]);
+}
+
+/// Verifies an empty database name is dropped from the named-table path.
+#[test]
+fn scan_table_name_omits_empty_database() {
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![scan_node(0, 0)])),
+        Some(desc_with_db("")),
+        None,
+    ))
+    .unwrap();
+    assert_eq!(read_named_table_names(&translated.plan), vec!["t"]);
+}
+
+/// Verifies trailing expression nodes left by the cursor are rejected.
+#[test]
+fn expression_with_trailing_nodes_is_error() {
+    let mut nodes = slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)).nodes;
+    nodes.push(base_expr_node(
+        TExprNodeType::INT_LITERAL,
+        scalar_type(TPrimitiveType::BIGINT),
+        0,
+    ));
+    let mut select = base_plan_node(1, TPlanNodeType::SELECT_NODE, 1, vec![0]);
+    select.select_node = Some(TSelectNode::new(None));
+    select.conjuncts = Some(vec![TExpr::new(nodes)]);
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![select, scan_node(0, 0)])),
+        Some(base_desc()),
+        None,
+    ))
+    .unwrap_err();
+    assert!(matches!(err, TranslateError::MalformedPlan(_)));
+}
+
+/// Verifies a node claiming a child with none following is rejected (cursor under-run).
+#[test]
+fn expression_missing_child_node_is_error() {
+    let mut node = base_expr_node(
+        TExprNodeType::COMPOUND_PRED,
+        scalar_type(TPrimitiveType::BOOLEAN),
+        1,
+    );
+    node.opcode = Some(TExprOpcode::COMPOUND_NOT);
+    let mut select = base_plan_node(1, TPlanNodeType::SELECT_NODE, 1, vec![0]);
+    select.select_node = Some(TSelectNode::new(None));
+    select.conjuncts = Some(vec![TExpr::new(vec![node])]);
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![select, scan_node(0, 0)])),
+        Some(base_desc()),
+        None,
+    ))
+    .unwrap_err();
+    assert!(matches!(err, TranslateError::MalformedPlan(_)));
 }

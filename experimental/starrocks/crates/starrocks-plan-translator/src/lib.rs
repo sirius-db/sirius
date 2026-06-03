@@ -1,8 +1,61 @@
 //! StarRocks plan-fragment to Substrait translation.
 //!
-//! This crate intentionally supports a narrow first slice: scan, filter, and
-//! projection. Everything outside that surface returns a structured
-//! `TranslateError` so later expansion has clear ownership boundaries.
+//! This crate converts a StarRocks `TExecPlanFragmentParams` (the Thrift plan a
+//! StarRocks frontend ships to a backend) into a `substrait` `Plan`. It is meant
+//! as a foundation more operators are built on, so it favours explicit, checked
+//! invariants over breadth: v1 supports scan, filter, and projection, and
+//! everything outside that surface returns a structured [`TranslateError`] that
+//! names the offending node/type — so the next contributor knows exactly what to
+//! implement next.
+//!
+//! # Wire format: flat preorder
+//!
+//! StarRocks encodes both plan trees (`TPlan.nodes`) and expression trees
+//! (`TExpr.nodes`) as a *flat* list of nodes in preorder: each node carries a
+//! `num_children` count, and its children are the nodes that immediately follow
+//! it (depth-first). The translators rebuild the tree with a cursor
+//! (`PlanNodeCursor` / `ExprNodeCursor`) that recursively consumes exactly
+//! `num_children` nodes per parent, then asserts via `ensure_consumed` that the
+//! whole slice was consumed. A malformed plan — a wrong child count, trailing
+//! nodes, or an under-run — is rejected as [`TranslateError::MalformedPlan`]
+//! instead of silently producing a truncated tree. **Any new node translator
+//! must preserve this invariant.**
+//!
+//! # Supported surface (v1)
+//!
+//! | Plan node        | Substrait relation     |
+//! |------------------|------------------------|
+//! | `FILE_SCAN_NODE` | `ReadRel` (named table) |
+//! | `HDFS_SCAN_NODE` | `ReadRel` (named table) |
+//! | `SELECT_NODE`    | `FilterRel`            |
+//! | `PROJECT_NODE`   | `ProjectRel`           |
+//!
+//! | Expression node | Substrait expression |
+//! |-----------------|----------------------|
+//! | `SLOT_REF`      | field reference (resolved by `DescriptorTable::slot_global_index`) |
+//! | `*_LITERAL`     | width-matched typed literal |
+//! | `BINARY_PRED`   | comparison function (`equal`, `not_equal`, `lt`, `lte`, `gt`, `gte`) |
+//! | `COMPOUND_PRED` | boolean function (`and`, `or`, `not`) |
+//! | `CAST_EXPR`     | cast (throwing failure behavior) |
+//! | `IS_NULL_PRED`  | `is_null` / `is_not_null` |
+//!
+//! Type mapping lives in `type_mapper`. Intentional v1 omissions return
+//! [`TranslateError::UnsupportedType`]: `LARGEINT` (128-bit), `DECIMAL256` and
+//! decimal precision &gt; 38 (both exceed the i128 decimal encoding), and
+//! non-scalar type nodes. `JSON`/`VARIANT` are surfaced as strings until richer
+//! support lands.
+//!
+//! # Adding a node
+//!
+//! 1. Add a match arm in `PlanNodeRel`/`NodeExpr` routing to a translator.
+//! 2. Build the Substrait relation/expression, translating children first.
+//! 3. For relations, set `TranslatedRel::row_tuples` (the visible row layout) and
+//!    `TranslatedRel::output_width` (emitted column count) so parent projections
+//!    compute correct field offsets. Multi-input relations concatenate child
+//!    layouts left-to-right; `DescriptorTable::slot_global_index` then resolves a
+//!    right-side slot to `left_width + right_index`.
+//! 4. Register any extension function through [`ExtensionRegistry`], which
+//!    de-duplicates anchors by `(urn, name)`.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -12,13 +65,17 @@ use starrocks_thrift::exprs::{TExpr, TExprNodeType};
 use starrocks_thrift::internal_service::TExecPlanFragmentParams;
 use substrait::proto::extensions::simple_extension_declaration;
 use substrait::proto::extensions::{SimpleExtensionDeclaration, SimpleExtensionUrn};
-use substrait::proto::{Plan, PlanRel, RelRoot, Version, plan_rel};
+use substrait::proto::{Plan, PlanRel, RelRoot, plan_rel};
 
-pub mod descriptor_table;
+// These modules are crate-internal plumbing. The public surface this foundation
+// commits to is intentionally small: `PlanTranslator`, `translate_fragment`,
+// `TranslatedPlan`, `TranslateError`, and the extension registry. Widen a module
+// to `pub` only when a real consumer needs it.
+pub(crate) mod descriptor_table;
 pub mod error;
 mod expr_translator;
-pub mod node_translator;
-pub mod type_mapper;
+mod node_translator;
+pub(crate) mod type_mapper;
 
 use descriptor_table::{DescriptorTable, SlotInfo};
 use error::Result;
@@ -153,13 +210,12 @@ impl PlanTranslator {
         let output_names = unique_names(output_names).collect::<Vec<_>>();
         let (extension_urns, extensions) = registry.into_extensions();
         let substrait_plan = Plan {
-            version: Some(Version {
-                major_number: 0,
-                minor_number: 62,
-                patch_number: 0,
-                producer: self.producer.clone(),
-                ..Default::default()
-            }),
+            // Source the spec version from the `substrait` crate so it tracks the
+            // generated proto types instead of drifting on dependency bumps (a
+            // hardcoded literal silently diverges from the crate it describes).
+            version: Some(substrait::version::version_with_producer(
+                self.producer.clone(),
+            )),
             extension_urns,
             extensions,
             relations: vec![PlanRel {
