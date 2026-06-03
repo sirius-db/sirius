@@ -23,11 +23,14 @@ important behavior is that the Quent UI receives equivalent model shapes.
 2. Start the Sirius telemetry server:
 
    ```sh
-   pixi run cargo run --manifest-path rust/Cargo.toml -p sirius-telemetry-server -- --output-dir <telemetry-dir>
+   pixi run cargo run --manifest-path rust/Cargo.toml \
+     -p sirius-telemetry-server \
+     --features ui \
+     -- \
+     --output-dir <telemetry-dir>
    ```
 
-3. Open the Quent UI against the analyzer endpoint and select the captured
-   Sirius engine/query.
+3. Open `http://localhost:8080` and select the captured Sirius engine/query.
 4. Compare the same semantic expectations:
    - Engine-rooted task resources appear in the resource tree.
    - The `task` FSM type is available.

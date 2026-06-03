@@ -570,16 +570,16 @@ void duckdb_scan_executor::manager_loop()
               .target_tier                 = "SCAN",
               .executor_thread_resource_id = executor_thread_resource_id,
             });
+
+            auto output_data = get_scan_output(scan_task, stream);
+            stream->synchronize();
+
             scan_task->telemetry_handle()->computing({
               .instance_name               = "",
               .current_operator_id         = scan_task->get_source_operator_id(),
               .input_bytes                 = 0,
               .executor_thread_resource_id = executor_thread_resource_id,
             });
-
-            auto output_data = get_scan_output(scan_task, stream);
-            stream->synchronize();
-
             scan_task->telemetry_handle()->finalizing({
               .instance_name = "",
               .success       = true,

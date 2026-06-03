@@ -214,6 +214,51 @@ sirius:
 
 Per-query labels are configured separately with `CALL sirius_set_query_label(...)` SQL function or the `query_label` named parameter on `gpu_execution(...)`.
 
+### Generating Query Telemetry
+
+To generate telemetry from Sirius queries, update the Sirius config file used by
+the query run and enable Quent export:
+
+```yaml
+sirius:
+  telemetry:
+    enable_quent: true
+    output_directory: telemetry_data
+    engine_name: siriusDB
+```
+
+Load that config through the normal config resolution path, usually by setting
+`SIRIUS_CONFIG_FILE=/path/to/sirius.yaml`. Any Sirius query run with
+`enable_quent: true` writes Quent ndjson files into `output_directory`.
+
+For TPC-H Parquet runs, the helper script runs queries and labels each
+`(query, iteration)` pair before executing it:
+
+```bash
+pixi run -- ./test/tpch_performance/run_tpch_parquet_and_generate_telemetry.sh \
+  --iterations 1 \
+  --parquet-dir /data/tpch/sf100/p16/zstd-8/ \
+  100
+```
+
+Pass `--config <path>` to use a full Sirius config. If no query numbers are
+provided, the script runs all 22 TPC-H queries.
+
+Start the Quent analyzer server over the same telemetry directory to view the
+captured telemetry:
+
+```bash
+pixi run cargo run --manifest-path rust/Cargo.toml \
+  -p sirius-telemetry-server \
+  --features ui \
+  -- \
+  --output-dir telemetry_data
+```
+
+Then open `http://localhost:8080` and select the captured Sirius engine/query.
+If the config uses a different `output_directory`, pass that path to
+`--output-dir`.
+
 ## Thread Pool Configuration
 
 | Pool | Default Threads | Thread Name Prefix | Purpose |
