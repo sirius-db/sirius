@@ -100,7 +100,7 @@ impl<'a> PlanNodeCursor<'a> {
             .map(|_| self.translate_next(ctx))
             .collect::<Result<Vec<_>>>()?;
 
-        PlanNodeRel(node).translate_node(children, ctx)
+        translate_plan_node(node, children, ctx)
     }
 
     /// Verifies that the top-level plan consumed all encoded nodes.
@@ -115,136 +115,100 @@ impl<'a> PlanNodeCursor<'a> {
     }
 }
 
-/// Trait implemented by individual StarRocks plan-node translators.
-trait TranslatePlanNode {
-    /// Translates one node after its children have already been translated.
-    fn translate_node(
-        &self,
-        children: Vec<TranslatedRel>,
-        ctx: &mut PlanContext<'_>,
-    ) -> Result<TranslatedRel>;
-}
-
-/// Dispatcher for a StarRocks plan node.
-struct PlanNodeRel<'a>(&'a TPlanNode);
-
-impl TranslatePlanNode for PlanNodeRel<'_> {
-    /// Routes a StarRocks plan node to its supported v1 translator.
-    fn translate_node(
-        &self,
-        children: Vec<TranslatedRel>,
-        ctx: &mut PlanContext<'_>,
-    ) -> Result<TranslatedRel> {
-        match self.0.node_type {
-            TPlanNodeType::FILE_SCAN_NODE => FileScanPlanNode(self.0).translate_node(children, ctx),
-            TPlanNodeType::HDFS_SCAN_NODE => HdfsScanPlanNode(self.0).translate_node(children, ctx),
-            TPlanNodeType::SELECT_NODE => SelectPlanNode(self.0).translate_node(children, ctx),
-            TPlanNodeType::PROJECT_NODE => ProjectPlanNode(self.0).translate_node(children, ctx),
-            _ => Err(TranslateError::UnsupportedPlanNode {
-                node_id: self.0.node_id,
-                node_type: self.0.node_type,
-                reason: "plan node is outside the v1 StarRocks slice",
-            }),
-        }
+/// Routes a StarRocks plan node to its supported v1 translator once its children
+/// have been translated.
+fn translate_plan_node(
+    node: &TPlanNode,
+    children: Vec<TranslatedRel>,
+    ctx: &mut PlanContext<'_>,
+) -> Result<TranslatedRel> {
+    match node.node_type {
+        TPlanNodeType::FILE_SCAN_NODE => translate_file_scan(node, children, ctx),
+        TPlanNodeType::HDFS_SCAN_NODE => translate_hdfs_scan(node, children, ctx),
+        TPlanNodeType::SELECT_NODE => translate_select(node, children, ctx),
+        TPlanNodeType::PROJECT_NODE => translate_project(node, children, ctx),
+        _ => Err(TranslateError::UnsupportedPlanNode {
+            node_id: node.node_id,
+            node_type: node.node_type,
+            reason: "plan node is outside the v1 StarRocks slice",
+        }),
     }
 }
 
-/// Translator for `FILE_SCAN_NODE`.
-struct FileScanPlanNode<'a>(&'a TPlanNode);
-
-impl TranslatePlanNode for FileScanPlanNode<'_> {
-    /// Builds a named-table read for a file scan tuple.
-    fn translate_node(
-        &self,
-        children: Vec<TranslatedRel>,
-        ctx: &mut PlanContext<'_>,
-    ) -> Result<TranslatedRel> {
-        expect_children(self.0, &children, 0)?;
-        let tuple_id = self
-            .0
-            .file_scan_node
-            .as_ref()
-            .map(|scan| scan.tuple_id)
-            .or_else(|| self.0.row_tuples.first().copied())
-            .ok_or(TranslateError::MissingField {
-                context: "FILE_SCAN_NODE",
-                field: "tuple_id",
-            })?;
-        let input = TranslatedRel {
-            rel: scan_rel(ctx.desc, tuple_id)?,
-            row_tuples: vec![tuple_id],
-            output_width: ctx.desc.materialized_slot_ids(tuple_id)?.len(),
-        };
-        apply_conjuncts(input, self.0, ctx)
-    }
+/// Builds a named-table read for a `FILE_SCAN_NODE` tuple.
+fn translate_file_scan(
+    node: &TPlanNode,
+    children: Vec<TranslatedRel>,
+    ctx: &mut PlanContext<'_>,
+) -> Result<TranslatedRel> {
+    expect_children(node, &children, 0)?;
+    let tuple_id = node
+        .file_scan_node
+        .as_ref()
+        .map(|scan| scan.tuple_id)
+        .or_else(|| node.row_tuples.first().copied())
+        .ok_or(TranslateError::MissingField {
+            context: "FILE_SCAN_NODE",
+            field: "tuple_id",
+        })?;
+    let input = TranslatedRel {
+        rel: scan_rel(ctx.desc, tuple_id)?,
+        row_tuples: vec![tuple_id],
+        output_width: ctx.desc.materialized_slot_ids(tuple_id)?.len(),
+    };
+    apply_conjuncts(input, node, ctx)
 }
 
-/// Translator for `HDFS_SCAN_NODE`.
-struct HdfsScanPlanNode<'a>(&'a TPlanNode);
-
-impl TranslatePlanNode for HdfsScanPlanNode<'_> {
-    /// Builds a named-table read for an HDFS scan tuple.
-    fn translate_node(
-        &self,
-        children: Vec<TranslatedRel>,
-        ctx: &mut PlanContext<'_>,
-    ) -> Result<TranslatedRel> {
-        expect_children(self.0, &children, 0)?;
-        let tuple_id = self
-            .0
-            .hdfs_scan_node
-            .as_ref()
-            .and_then(|scan| scan.tuple_id)
-            .or_else(|| self.0.row_tuples.first().copied())
-            .ok_or(TranslateError::MissingField {
-                context: "HDFS_SCAN_NODE",
-                field: "tuple_id",
-            })?;
-        let input = TranslatedRel {
-            rel: scan_rel(ctx.desc, tuple_id)?,
-            row_tuples: vec![tuple_id],
-            output_width: ctx.desc.materialized_slot_ids(tuple_id)?.len(),
-        };
-        apply_conjuncts(input, self.0, ctx)
-    }
+/// Builds a named-table read for an `HDFS_SCAN_NODE` tuple.
+fn translate_hdfs_scan(
+    node: &TPlanNode,
+    children: Vec<TranslatedRel>,
+    ctx: &mut PlanContext<'_>,
+) -> Result<TranslatedRel> {
+    expect_children(node, &children, 0)?;
+    let tuple_id = node
+        .hdfs_scan_node
+        .as_ref()
+        .and_then(|scan| scan.tuple_id)
+        .or_else(|| node.row_tuples.first().copied())
+        .ok_or(TranslateError::MissingField {
+            context: "HDFS_SCAN_NODE",
+            field: "tuple_id",
+        })?;
+    let input = TranslatedRel {
+        rel: scan_rel(ctx.desc, tuple_id)?,
+        row_tuples: vec![tuple_id],
+        output_width: ctx.desc.materialized_slot_ids(tuple_id)?.len(),
+    };
+    apply_conjuncts(input, node, ctx)
 }
 
-/// Translator for `SELECT_NODE`.
-struct SelectPlanNode<'a>(&'a TPlanNode);
-
-impl TranslatePlanNode for SelectPlanNode<'_> {
-    /// Wraps the child relation with filter conjuncts.
-    fn translate_node(
-        &self,
-        children: Vec<TranslatedRel>,
-        ctx: &mut PlanContext<'_>,
-    ) -> Result<TranslatedRel> {
-        expect_children(self.0, &children, 1)?;
-        apply_conjuncts(children.into_iter().next().unwrap(), self.0, ctx)
-    }
+/// Wraps the child relation of a `SELECT_NODE` with its filter conjuncts.
+fn translate_select(
+    node: &TPlanNode,
+    children: Vec<TranslatedRel>,
+    ctx: &mut PlanContext<'_>,
+) -> Result<TranslatedRel> {
+    expect_children(node, &children, 1)?;
+    apply_conjuncts(children.into_iter().next().unwrap(), node, ctx)
 }
 
-/// Translator for `PROJECT_NODE`.
-struct ProjectPlanNode<'a>(&'a TPlanNode);
-
-impl TranslatePlanNode for ProjectPlanNode<'_> {
-    /// Builds a project relation when no ambiguous project-level conjuncts exist.
-    fn translate_node(
-        &self,
-        children: Vec<TranslatedRel>,
-        ctx: &mut PlanContext<'_>,
-    ) -> Result<TranslatedRel> {
-        expect_children(self.0, &children, 1)?;
-        if has_conjuncts(self.0) {
-            return Err(TranslateError::UnsupportedPlanNode {
-                node_id: self.0.node_id,
-                node_type: self.0.node_type,
-                reason: "PROJECT_NODE conjunct row layout is ambiguous in v1",
-            });
-        }
-        let child = children.into_iter().next().unwrap();
-        translate_project_node(child, self.0, ctx)
+/// Builds a project relation for a `PROJECT_NODE` with no ambiguous conjuncts.
+fn translate_project(
+    node: &TPlanNode,
+    children: Vec<TranslatedRel>,
+    ctx: &mut PlanContext<'_>,
+) -> Result<TranslatedRel> {
+    expect_children(node, &children, 1)?;
+    if has_conjuncts(node) {
+        return Err(TranslateError::UnsupportedPlanNode {
+            node_id: node.node_id,
+            node_type: node.node_type,
+            reason: "PROJECT_NODE conjunct row layout is ambiguous in v1",
+        });
     }
+    let child = children.into_iter().next().unwrap();
+    translate_project_node(child, node, ctx)
 }
 
 /// Translates a flat preorder StarRocks plan into a Substrait relation tree.

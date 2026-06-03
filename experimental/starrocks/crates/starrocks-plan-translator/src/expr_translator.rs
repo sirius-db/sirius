@@ -88,7 +88,7 @@ impl<'a> ExprNodeCursor<'a> {
             .map(|_| self.translate_next(ctx))
             .collect::<Result<Vec<_>>>()?;
 
-        NodeExpr(node).translate_node(children, ctx)
+        translate_expr_node(node, children, ctx)
     }
 
     /// Verifies that the top-level expression consumed all encoded nodes.
@@ -103,381 +103,270 @@ impl<'a> ExprNodeCursor<'a> {
     }
 }
 
-/// Trait implemented by individual StarRocks expression-node translators.
-trait TranslateExprNode {
-    /// Translates a node after its child expressions have already been translated.
-    fn translate_node(
-        &self,
-        children: Vec<Expression>,
-        ctx: &mut ExprContext<'_>,
-    ) -> Result<Expression>;
+/// Routes a StarRocks expression node to its supported v1 translator once its
+/// child expressions have been translated.
+fn translate_expr_node(
+    node: &TExprNode,
+    children: Vec<Expression>,
+    ctx: &mut ExprContext<'_>,
+) -> Result<Expression> {
+    match node.node_type {
+        TExprNodeType::SLOT_REF => translate_slot_ref(node, children, ctx),
+        TExprNodeType::BOOL_LITERAL => translate_bool_literal(node, children),
+        TExprNodeType::INT_LITERAL => translate_int_literal(node, children),
+        TExprNodeType::FLOAT_LITERAL => translate_float_literal(node, children),
+        TExprNodeType::STRING_LITERAL => translate_string_literal(node, children),
+        TExprNodeType::NULL_LITERAL => translate_null_literal(node, children),
+        TExprNodeType::DECIMAL_LITERAL => translate_decimal_literal(node, children),
+        TExprNodeType::BINARY_PRED => translate_binary_pred(node, children, ctx),
+        TExprNodeType::COMPOUND_PRED => translate_compound_pred(node, children, ctx),
+        TExprNodeType::CAST_EXPR => translate_cast(node, children),
+        TExprNodeType::IS_NULL_PRED => translate_is_null(node, children, ctx),
+        _ => Err(TranslateError::UnsupportedExpression {
+            node_type: node.node_type,
+            reason: "expression node is outside the v1 StarRocks slice",
+        }),
+    }
 }
 
-/// Dispatcher for a StarRocks expression node.
-struct NodeExpr<'a>(&'a TExprNode);
+/// Converts a StarRocks `SLOT_REF` into a Substrait field selection.
+fn translate_slot_ref(
+    node: &TExprNode,
+    children: Vec<Expression>,
+    ctx: &mut ExprContext<'_>,
+) -> Result<Expression> {
+    expect_child_count(node, &children, 0)?;
+    let slot_ref = node.slot_ref.as_ref().ok_or(TranslateError::MissingField {
+        context: "SLOT_REF",
+        field: "slot_ref",
+    })?;
+    let field = ctx
+        .desc
+        .slot_global_index(slot_ref.slot_id, ctx.row_tuples)? as i32;
+    Ok(Expression {
+        rex_type: Some(expression::RexType::Selection(Box::new(FieldReference {
+            reference_type: Some(field_reference::ReferenceType::DirectReference(
+                ReferenceSegment {
+                    reference_type: Some(reference_segment::ReferenceType::StructField(Box::new(
+                        reference_segment::StructField { field, child: None },
+                    ))),
+                },
+            )),
+            root_type: Some(field_reference::RootType::RootReference(
+                field_reference::RootReference {},
+            )),
+        }))),
+    })
+}
 
-impl TranslateExprNode for NodeExpr<'_> {
-    /// Routes a StarRocks node to its supported v1 translator.
-    fn translate_node(
-        &self,
-        children: Vec<Expression>,
-        ctx: &mut ExprContext<'_>,
-    ) -> Result<Expression> {
-        match self.0.node_type {
-            TExprNodeType::SLOT_REF => SlotRefExpr(self.0).translate_node(children, ctx),
-            TExprNodeType::BOOL_LITERAL => BoolLiteralExpr(self.0).translate_node(children, ctx),
-            TExprNodeType::INT_LITERAL => IntLiteralExpr(self.0).translate_node(children, ctx),
-            TExprNodeType::FLOAT_LITERAL => FloatLiteralExpr(self.0).translate_node(children, ctx),
-            TExprNodeType::STRING_LITERAL => {
-                StringLiteralExpr(self.0).translate_node(children, ctx)
-            }
-            TExprNodeType::NULL_LITERAL => NullLiteralExpr(self.0).translate_node(children, ctx),
-            TExprNodeType::DECIMAL_LITERAL => {
-                DecimalLiteralExpr(self.0).translate_node(children, ctx)
-            }
-            TExprNodeType::BINARY_PRED => BinaryPredExpr(self.0).translate_node(children, ctx),
-            TExprNodeType::COMPOUND_PRED => CompoundPredExpr(self.0).translate_node(children, ctx),
-            TExprNodeType::CAST_EXPR => CastExpr(self.0).translate_node(children, ctx),
-            TExprNodeType::IS_NULL_PRED => IsNullExpr(self.0).translate_node(children, ctx),
-            _ => Err(TranslateError::UnsupportedExpression {
-                node_type: self.0.node_type,
-                reason: "expression node is outside the v1 StarRocks slice",
-            }),
+/// Converts a StarRocks `BOOL_LITERAL` into a Substrait literal.
+fn translate_bool_literal(node: &TExprNode, children: Vec<Expression>) -> Result<Expression> {
+    expect_child_count(node, &children, 0)?;
+    let lit = node
+        .bool_literal
+        .as_ref()
+        .ok_or(TranslateError::MissingField {
+            context: "BOOL_LITERAL",
+            field: "bool_literal",
+        })?;
+    Ok(literal(expression::literal::LiteralType::Boolean(
+        lit.value,
+    )))
+}
+
+/// Converts a StarRocks `INT_LITERAL` into a width-matched Substrait literal.
+fn translate_int_literal(node: &TExprNode, children: Vec<Expression>) -> Result<Expression> {
+    expect_child_count(node, &children, 0)?;
+    let lit = node
+        .int_literal
+        .as_ref()
+        .ok_or(TranslateError::MissingField {
+            context: "INT_LITERAL",
+            field: "int_literal",
+        })?;
+    Ok(literal(integer_literal_type(
+        lit.value,
+        type_mapper::scalar_primitive(&node.type_)?,
+    )?))
+}
+
+/// Converts a StarRocks `FLOAT_LITERAL` into a width-matched Substrait literal.
+fn translate_float_literal(node: &TExprNode, children: Vec<Expression>) -> Result<Expression> {
+    expect_child_count(node, &children, 0)?;
+    let lit = node
+        .float_literal
+        .as_ref()
+        .ok_or(TranslateError::MissingField {
+            context: "FLOAT_LITERAL",
+            field: "float_literal",
+        })?;
+    let value = *lit.value;
+    let literal_type = match type_mapper::scalar_primitive(&node.type_)? {
+        TPrimitiveType::FLOAT => expression::literal::LiteralType::Fp32(value as f32),
+        TPrimitiveType::DOUBLE => expression::literal::LiteralType::Fp64(value),
+        primitive => {
+            return Err(TranslateError::UnsupportedType {
+                primitive: Some(primitive),
+                node_type: Some(starrocks_thrift::types::TTypeNodeType::SCALAR),
+                reason: "FLOAT_LITERAL has non-floating scalar type",
+            });
         }
-    }
+    };
+    Ok(literal(literal_type))
 }
 
-/// Translator for `SLOT_REF` nodes.
-struct SlotRefExpr<'a>(&'a TExprNode);
-
-impl TranslateExprNode for SlotRefExpr<'_> {
-    /// Converts a StarRocks slot id into a Substrait field selection.
-    fn translate_node(
-        &self,
-        children: Vec<Expression>,
-        ctx: &mut ExprContext<'_>,
-    ) -> Result<Expression> {
-        expect_child_count(self.0, &children, 0)?;
-        let slot_ref = self
-            .0
-            .slot_ref
-            .as_ref()
-            .ok_or(TranslateError::MissingField {
-                context: "SLOT_REF",
-                field: "slot_ref",
-            })?;
-        let field = ctx
-            .desc
-            .slot_global_index(slot_ref.slot_id, ctx.row_tuples)? as i32;
-        Ok(Expression {
-            rex_type: Some(expression::RexType::Selection(Box::new(FieldReference {
-                reference_type: Some(field_reference::ReferenceType::DirectReference(
-                    ReferenceSegment {
-                        reference_type: Some(reference_segment::ReferenceType::StructField(
-                            Box::new(reference_segment::StructField { field, child: None }),
-                        )),
-                    },
-                )),
-                root_type: Some(field_reference::RootType::RootReference(
-                    field_reference::RootReference {},
-                )),
-            }))),
-        })
-    }
-}
-
-/// Translator for `BOOL_LITERAL` nodes.
-struct BoolLiteralExpr<'a>(&'a TExprNode);
-
-impl TranslateExprNode for BoolLiteralExpr<'_> {
-    /// Converts a StarRocks boolean literal into a Substrait literal.
-    fn translate_node(
-        &self,
-        children: Vec<Expression>,
-        _ctx: &mut ExprContext<'_>,
-    ) -> Result<Expression> {
-        expect_child_count(self.0, &children, 0)?;
-        let lit = self
-            .0
-            .bool_literal
-            .as_ref()
-            .ok_or(TranslateError::MissingField {
-                context: "BOOL_LITERAL",
-                field: "bool_literal",
-            })?;
-        Ok(literal(expression::literal::LiteralType::Boolean(
-            lit.value,
-        )))
-    }
-}
-
-/// Translator for `INT_LITERAL` nodes.
-struct IntLiteralExpr<'a>(&'a TExprNode);
-
-impl TranslateExprNode for IntLiteralExpr<'_> {
-    /// Converts a StarRocks integer literal into a width-matched Substrait literal.
-    fn translate_node(
-        &self,
-        children: Vec<Expression>,
-        _ctx: &mut ExprContext<'_>,
-    ) -> Result<Expression> {
-        expect_child_count(self.0, &children, 0)?;
-        let lit = self
-            .0
-            .int_literal
-            .as_ref()
-            .ok_or(TranslateError::MissingField {
-                context: "INT_LITERAL",
-                field: "int_literal",
-            })?;
-        Ok(literal(integer_literal_type(
-            lit.value,
-            type_mapper::scalar_primitive(&self.0.type_)?,
-        )?))
-    }
-}
-
-/// Translator for `FLOAT_LITERAL` nodes.
-struct FloatLiteralExpr<'a>(&'a TExprNode);
-
-impl TranslateExprNode for FloatLiteralExpr<'_> {
-    /// Converts a StarRocks floating-point literal into a width-matched Substrait literal.
-    fn translate_node(
-        &self,
-        children: Vec<Expression>,
-        _ctx: &mut ExprContext<'_>,
-    ) -> Result<Expression> {
-        expect_child_count(self.0, &children, 0)?;
-        let lit = self
-            .0
-            .float_literal
-            .as_ref()
-            .ok_or(TranslateError::MissingField {
-                context: "FLOAT_LITERAL",
-                field: "float_literal",
-            })?;
-        let value = *lit.value;
-        let literal_type = match type_mapper::scalar_primitive(&self.0.type_)? {
-            TPrimitiveType::FLOAT => expression::literal::LiteralType::Fp32(value as f32),
-            TPrimitiveType::DOUBLE => expression::literal::LiteralType::Fp64(value),
-            primitive => {
-                return Err(TranslateError::UnsupportedType {
-                    primitive: Some(primitive),
-                    node_type: Some(starrocks_thrift::types::TTypeNodeType::SCALAR),
-                    reason: "FLOAT_LITERAL has non-floating scalar type",
-                });
-            }
-        };
-        Ok(literal(literal_type))
-    }
-}
-
-/// Translator for `STRING_LITERAL` nodes.
-struct StringLiteralExpr<'a>(&'a TExprNode);
-
-impl TranslateExprNode for StringLiteralExpr<'_> {
-    /// Converts a StarRocks string literal into a Substrait string literal.
-    fn translate_node(
-        &self,
-        children: Vec<Expression>,
-        _ctx: &mut ExprContext<'_>,
-    ) -> Result<Expression> {
-        expect_child_count(self.0, &children, 0)?;
-        let lit = self
-            .0
-            .string_literal
-            .as_ref()
-            .ok_or(TranslateError::MissingField {
-                context: "STRING_LITERAL",
-                field: "string_literal",
-            })?;
-        Ok(literal(expression::literal::LiteralType::String(
-            lit.value.clone(),
-        )))
-    }
-}
-
-/// Translator for `NULL_LITERAL` nodes.
-struct NullLiteralExpr<'a>(&'a TExprNode);
-
-impl TranslateExprNode for NullLiteralExpr<'_> {
-    /// Converts a StarRocks null literal into a typed Substrait null literal.
-    fn translate_node(
-        &self,
-        children: Vec<Expression>,
-        _ctx: &mut ExprContext<'_>,
-    ) -> Result<Expression> {
-        expect_child_count(self.0, &children, 0)?;
-        let null_type = type_mapper::map_type_desc(&self.0.type_, true)?;
-        Ok(literal(expression::literal::LiteralType::Null(null_type)))
-    }
-}
-
-/// Translator for `DECIMAL_LITERAL` nodes.
-struct DecimalLiteralExpr<'a>(&'a TExprNode);
-
-impl TranslateExprNode for DecimalLiteralExpr<'_> {
-    /// Converts a StarRocks decimal string literal into Substrait's i128 encoding.
-    fn translate_node(
-        &self,
-        children: Vec<Expression>,
-        _ctx: &mut ExprContext<'_>,
-    ) -> Result<Expression> {
-        expect_child_count(self.0, &children, 0)?;
-        let lit = self
-            .0
-            .decimal_literal
-            .as_ref()
-            .ok_or(TranslateError::MissingField {
-                context: "DECIMAL_LITERAL",
-                field: "decimal_literal",
-            })?;
-        let decimal_type = type_mapper::map_type_desc(&self.0.type_, true)?;
-        let Some(substrait::proto::r#type::Kind::Decimal(decimal)) = decimal_type.kind else {
-            return Err(TranslateError::malformed(
-                "DECIMAL_LITERAL has non-decimal type",
-            ));
-        };
-        let value = encode_decimal(&lit.value, decimal.scale)?;
-        Ok(literal(expression::literal::LiteralType::Decimal(
-            expression::literal::Decimal {
-                value: value.to_vec(),
-                precision: decimal.precision,
-                scale: decimal.scale,
-            },
-        )))
-    }
-}
-
-/// Translator for `BINARY_PRED` nodes.
-struct BinaryPredExpr<'a>(&'a TExprNode);
-
-impl TranslateExprNode for BinaryPredExpr<'_> {
-    /// Converts supported comparison opcodes into Substrait comparison functions.
-    fn translate_node(
-        &self,
-        children: Vec<Expression>,
-        ctx: &mut ExprContext<'_>,
-    ) -> Result<Expression> {
-        expect_child_count(self.0, &children, 2)?;
-        let opcode = self.0.opcode.ok_or(TranslateError::MissingField {
-            context: "BINARY_PRED",
-            field: "opcode",
+/// Converts a StarRocks `STRING_LITERAL` into a Substrait string literal.
+fn translate_string_literal(node: &TExprNode, children: Vec<Expression>) -> Result<Expression> {
+    expect_child_count(node, &children, 0)?;
+    let lit = node
+        .string_literal
+        .as_ref()
+        .ok_or(TranslateError::MissingField {
+            context: "STRING_LITERAL",
+            field: "string_literal",
         })?;
-        let name = match opcode {
-            TExprOpcode::EQ => "equal",
-            TExprOpcode::NE => "not_equal",
-            TExprOpcode::LT => "lt",
-            TExprOpcode::LE => "lte",
-            TExprOpcode::GT => "gt",
-            TExprOpcode::GE => "gte",
-            _ => {
-                return Err(TranslateError::UnsupportedExpression {
-                    node_type: self.0.node_type,
-                    reason: "binary predicate opcode is unsupported",
-                });
-            }
-        };
-        let anchor = ctx.registry.register_function(URN_COMPARISON, name);
-        Ok(scalar_function(anchor, children, type_mapper::bool_type()))
-    }
+    Ok(literal(expression::literal::LiteralType::String(
+        lit.value.clone(),
+    )))
 }
 
-/// Translator for `COMPOUND_PRED` nodes.
-struct CompoundPredExpr<'a>(&'a TExprNode);
+/// Converts a StarRocks `NULL_LITERAL` into a typed Substrait null literal.
+fn translate_null_literal(node: &TExprNode, children: Vec<Expression>) -> Result<Expression> {
+    expect_child_count(node, &children, 0)?;
+    let null_type = type_mapper::map_type_desc(&node.type_, true)?;
+    Ok(literal(expression::literal::LiteralType::Null(null_type)))
+}
 
-impl TranslateExprNode for CompoundPredExpr<'_> {
-    /// Converts supported boolean opcodes into Substrait boolean functions.
-    fn translate_node(
-        &self,
-        children: Vec<Expression>,
-        ctx: &mut ExprContext<'_>,
-    ) -> Result<Expression> {
-        let opcode = self.0.opcode.ok_or(TranslateError::MissingField {
-            context: "COMPOUND_PRED",
-            field: "opcode",
+/// Converts a StarRocks `DECIMAL_LITERAL` into Substrait's i128 encoding.
+fn translate_decimal_literal(node: &TExprNode, children: Vec<Expression>) -> Result<Expression> {
+    expect_child_count(node, &children, 0)?;
+    let lit = node
+        .decimal_literal
+        .as_ref()
+        .ok_or(TranslateError::MissingField {
+            context: "DECIMAL_LITERAL",
+            field: "decimal_literal",
         })?;
-        let name = match opcode {
-            TExprOpcode::COMPOUND_AND => {
-                if children.len() < 2 {
-                    return Err(TranslateError::malformed(
-                        "COMPOUND_AND expected at least 2 children",
-                    ));
-                }
-                "and"
-            }
-            TExprOpcode::COMPOUND_OR => {
-                if children.len() < 2 {
-                    return Err(TranslateError::malformed(
-                        "COMPOUND_OR expected at least 2 children",
-                    ));
-                }
-                "or"
-            }
-            TExprOpcode::COMPOUND_NOT => {
-                expect_child_count(self.0, &children, 1)?;
-                "not"
-            }
-            _ => {
-                return Err(TranslateError::UnsupportedExpression {
-                    node_type: self.0.node_type,
-                    reason: "compound predicate opcode is unsupported",
-                });
-            }
-        };
-        let anchor = ctx.registry.register_function(URN_BOOLEAN, name);
-        Ok(scalar_function(anchor, children, type_mapper::bool_type()))
-    }
+    let decimal_type = type_mapper::map_type_desc(&node.type_, true)?;
+    let Some(substrait::proto::r#type::Kind::Decimal(decimal)) = decimal_type.kind else {
+        return Err(TranslateError::malformed(
+            "DECIMAL_LITERAL has non-decimal type",
+        ));
+    };
+    let value = encode_decimal(&lit.value, decimal.scale)?;
+    Ok(literal(expression::literal::LiteralType::Decimal(
+        expression::literal::Decimal {
+            value: value.to_vec(),
+            precision: decimal.precision,
+            scale: decimal.scale,
+        },
+    )))
 }
 
-/// Translator for `CAST_EXPR` nodes.
-struct CastExpr<'a>(&'a TExprNode);
-
-impl TranslateExprNode for CastExpr<'_> {
-    /// Converts a StarRocks cast into a Substrait cast with throwing failure behavior.
-    fn translate_node(
-        &self,
-        children: Vec<Expression>,
-        _ctx: &mut ExprContext<'_>,
-    ) -> Result<Expression> {
-        expect_child_count(self.0, &children, 1)?;
-        Ok(Expression {
-            rex_type: Some(expression::RexType::Cast(Box::new(expression::Cast {
-                r#type: Some(type_mapper::map_type_desc(&self.0.type_, true)?),
-                input: Some(Box::new(children.into_iter().next().unwrap())),
-                failure_behavior: expression::cast::FailureBehavior::ThrowException as i32,
-            }))),
-        })
-    }
+/// Converts supported comparison opcodes into Substrait comparison functions.
+fn translate_binary_pred(
+    node: &TExprNode,
+    children: Vec<Expression>,
+    ctx: &mut ExprContext<'_>,
+) -> Result<Expression> {
+    expect_child_count(node, &children, 2)?;
+    let opcode = node.opcode.ok_or(TranslateError::MissingField {
+        context: "BINARY_PRED",
+        field: "opcode",
+    })?;
+    let name = match opcode {
+        TExprOpcode::EQ => "equal",
+        TExprOpcode::NE => "not_equal",
+        TExprOpcode::LT => "lt",
+        TExprOpcode::LE => "lte",
+        TExprOpcode::GT => "gt",
+        TExprOpcode::GE => "gte",
+        _ => {
+            return Err(TranslateError::UnsupportedExpression {
+                node_type: node.node_type,
+                reason: "binary predicate opcode is unsupported",
+            });
+        }
+    };
+    let anchor = ctx.registry.register_function(URN_COMPARISON, name);
+    Ok(scalar_function(anchor, children, type_mapper::bool_type()))
 }
 
-/// Translator for `IS_NULL_PRED` nodes.
-struct IsNullExpr<'a>(&'a TExprNode);
+/// Converts supported boolean opcodes into Substrait boolean functions.
+fn translate_compound_pred(
+    node: &TExprNode,
+    children: Vec<Expression>,
+    ctx: &mut ExprContext<'_>,
+) -> Result<Expression> {
+    let opcode = node.opcode.ok_or(TranslateError::MissingField {
+        context: "COMPOUND_PRED",
+        field: "opcode",
+    })?;
+    let name = match opcode {
+        TExprOpcode::COMPOUND_AND => {
+            if children.len() < 2 {
+                return Err(TranslateError::malformed(
+                    "COMPOUND_AND expected at least 2 children",
+                ));
+            }
+            "and"
+        }
+        TExprOpcode::COMPOUND_OR => {
+            if children.len() < 2 {
+                return Err(TranslateError::malformed(
+                    "COMPOUND_OR expected at least 2 children",
+                ));
+            }
+            "or"
+        }
+        TExprOpcode::COMPOUND_NOT => {
+            expect_child_count(node, &children, 1)?;
+            "not"
+        }
+        _ => {
+            return Err(TranslateError::UnsupportedExpression {
+                node_type: node.node_type,
+                reason: "compound predicate opcode is unsupported",
+            });
+        }
+    };
+    let anchor = ctx.registry.register_function(URN_BOOLEAN, name);
+    Ok(scalar_function(anchor, children, type_mapper::bool_type()))
+}
 
-impl TranslateExprNode for IsNullExpr<'_> {
-    /// Converts StarRocks null checks into Substrait `is_null` or `is_not_null`.
-    fn translate_node(
-        &self,
-        children: Vec<Expression>,
-        ctx: &mut ExprContext<'_>,
-    ) -> Result<Expression> {
-        expect_child_count(self.0, &children, 1)?;
-        let is_not_null = self
-            .0
-            .is_null_pred
-            .as_ref()
-            .ok_or(TranslateError::MissingField {
-                context: "IS_NULL_PRED",
-                field: "is_null_pred",
-            })?
-            .is_not_null;
-        let name = match is_not_null {
-            true => "is_not_null",
-            false => "is_null",
-        };
-        let anchor = ctx.registry.register_function(URN_COMPARISON, name);
-        Ok(scalar_function(anchor, children, type_mapper::bool_type()))
-    }
+/// Converts a StarRocks cast into a Substrait cast with throwing failure behavior.
+fn translate_cast(node: &TExprNode, children: Vec<Expression>) -> Result<Expression> {
+    expect_child_count(node, &children, 1)?;
+    Ok(Expression {
+        rex_type: Some(expression::RexType::Cast(Box::new(expression::Cast {
+            r#type: Some(type_mapper::map_type_desc(&node.type_, true)?),
+            input: Some(Box::new(children.into_iter().next().unwrap())),
+            failure_behavior: expression::cast::FailureBehavior::ThrowException as i32,
+        }))),
+    })
+}
+
+/// Converts StarRocks null checks into Substrait `is_null` or `is_not_null`.
+fn translate_is_null(
+    node: &TExprNode,
+    children: Vec<Expression>,
+    ctx: &mut ExprContext<'_>,
+) -> Result<Expression> {
+    expect_child_count(node, &children, 1)?;
+    let is_not_null = node
+        .is_null_pred
+        .as_ref()
+        .ok_or(TranslateError::MissingField {
+            context: "IS_NULL_PRED",
+            field: "is_null_pred",
+        })?
+        .is_not_null;
+    let name = match is_not_null {
+        true => "is_not_null",
+        false => "is_null",
+    };
+    let anchor = ctx.registry.register_function(URN_COMPARISON, name);
+    Ok(scalar_function(anchor, children, type_mapper::bool_type()))
 }
 
 /// Verifies that an expression node has exactly the expected number of children.
