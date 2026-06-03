@@ -6,7 +6,12 @@ use starrocks_thrift::types::{TPrimitiveType, TTypeNodeType};
 pub type Result<T> = std::result::Result<T, TranslateError>;
 
 /// Structured failures emitted by the StarRocks-to-Substrait translator.
+///
+/// Marked `#[non_exhaustive]`: as the supported plan/expression/type surface
+/// grows, new variants can be added without a breaking change, so downstream
+/// matches must include a wildcard arm.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TranslateError {
     /// A Thrift field required for this conversion slice was absent.
     #[error("{context} missing required field {field}")]
