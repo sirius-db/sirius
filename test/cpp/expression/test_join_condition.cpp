@@ -18,6 +18,8 @@
 // mapping helpers.
 
 #include "catch.hpp"
+#include "expression/ast/constant.hpp"
+#include "expression/ast/node.hpp"
 #include "expression/expression_internal.hpp"
 #include "expression/join_condition.hpp"
 
@@ -28,6 +30,7 @@
 
 #include <memory>
 #include <utility>
+#include <variant>
 #include <vector>
 
 using sirius::comparison_type;
@@ -66,6 +69,16 @@ duckdb::JoinCondition make_cond(duckdb::unique_ptr<duckdb::Expression> left,
   return c;
 }
 
+// Assert the wrapped node is an INTEGER constant equal to `expected`.
+void require_int_constant(sirius::ast::node const* n, int32_t expected)
+{
+  REQUIRE(n != nullptr);
+  REQUIRE(n->holds<sirius::ast::constant>());
+  auto const& c = n->get<sirius::ast::constant>();
+  REQUIRE(std::holds_alternative<int32_t>(c.payload));
+  REQUIRE(std::get<int32_t>(c.payload) == expected);
+}
+
 }  // namespace
 
 // ============================================================================
@@ -94,8 +107,6 @@ TEST_CASE("join_condition - wrap_join_conditions transfers expressions and maps 
           "[join_condition]")
 {
   std::vector<duckdb::JoinCondition> input;
-  std::vector<duckdb::Expression const*> left_ptrs;
-  std::vector<duckdb::Expression const*> right_ptrs;
 
   struct entry {
     duckdb::ExpressionType in;
@@ -108,19 +119,15 @@ TEST_CASE("join_condition - wrap_join_conditions transfers expressions and maps 
   };
 
   for (auto const& [duckdb_type, _] : entries) {
-    auto l = make_const(10);
-    auto r = make_const(20);
-    left_ptrs.push_back(l.get());
-    right_ptrs.push_back(r.get());
-    input.push_back(make_cond(std::move(l), std::move(r), duckdb_type));
+    input.push_back(make_cond(make_const(10), make_const(20), duckdb_type));
   }
 
   auto wrapped = sirius::wrap_join_conditions(std::move(input));
 
   REQUIRE(wrapped.size() == std::size(entries));
   for (std::size_t i = 0; i < wrapped.size(); ++i) {
-    REQUIRE(sirius::unwrap(wrapped[i].left) == left_ptrs[i]);
-    REQUIRE(sirius::unwrap(wrapped[i].right) == right_ptrs[i]);
+    require_int_constant(sirius::unwrap(wrapped[i].left), 10);
+    require_int_constant(sirius::unwrap(wrapped[i].right), 20);
     REQUIRE(wrapped[i].comparison == entries[i].expected_out);
   }
 }

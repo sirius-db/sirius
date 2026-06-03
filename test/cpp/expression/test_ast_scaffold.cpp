@@ -128,16 +128,17 @@ TEST_CASE("ast_scaffold - between holds three children and inclusivity flags", "
 
 TEST_CASE("ast_scaffold - case_expr holds when/then pairs and an else clause", "[ast_scaffold]")
 {
-  case_expr c;
-  case_expr::when_then wt;
-  wt.when_ = std::make_unique<node>(reference{0});
-  wt.then_ = std::make_unique<node>(reference{1});
-  c.cases.push_back(std::move(wt));
-  c.else_ = std::make_unique<node>(reference{2});
+  std::vector<case_expr::when_then> cases;
+  cases.push_back(case_expr::when_then{std::make_unique<node>(reference{0}),
+                                       std::make_unique<node>(reference{1})});
+  case_expr c{std::move(cases),
+              std::make_unique<node>(reference{2}),
+              sirius::logical_type::make(sirius::type_id::INTEGER)};
   REQUIRE(c.cases.size() == 1);
   REQUIRE(c.cases[0].when_);
   REQUIRE(c.cases[0].then_);
   REQUIRE(c.else_);
+  REQUIRE(c.return_type().id() == sirius::type_id::INTEGER);
   node n{std::move(c)};
   REQUIRE(n.holds<case_expr>());
 }
@@ -182,11 +183,13 @@ TEST_CASE("ast_scaffold - unary_op op defaults to invalid sentinel", "[ast_scaff
 
 TEST_CASE("ast_scaffold - coalesce holds N-ary children", "[ast_scaffold]")
 {
-  coalesce co;
-  co.children.push_back(std::make_unique<node>(reference{0}));
-  co.children.push_back(std::make_unique<node>(reference{1}));
-  co.children.push_back(std::make_unique<node>(reference{2}));
+  std::vector<std::unique_ptr<node>> children;
+  children.push_back(std::make_unique<node>(reference{0}));
+  children.push_back(std::make_unique<node>(reference{1}));
+  children.push_back(std::make_unique<node>(reference{2}));
+  coalesce co{std::move(children), sirius::logical_type::make(sirius::type_id::INTEGER)};
   REQUIRE(co.children.size() == 3);
+  REQUIRE(co.return_type().id() == sirius::type_id::INTEGER);
   node n{std::move(co)};
   REQUIRE(n.holds<coalesce>());
 }
