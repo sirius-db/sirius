@@ -349,6 +349,7 @@ mod tests {
         DescriptorTable::try_from(&desc_tbl).unwrap()
     }
 
+    /// Verifies field indices accumulate each preceding tuple's materialized width.
     #[test]
     fn slot_global_index_accumulates_offset_across_tuples() {
         let desc = two_tuple_desc();
@@ -359,6 +360,7 @@ mod tests {
         assert_eq!(desc.slot_global_index(4, &[0, 1]).unwrap(), 3);
     }
 
+    /// Verifies field indices follow the order tuples appear in `row_tuples`.
     #[test]
     fn slot_global_index_follows_row_tuple_order() {
         let desc = two_tuple_desc();
@@ -369,6 +371,7 @@ mod tests {
         assert_eq!(desc.slot_global_index(2, &[1, 0]).unwrap(), 3);
     }
 
+    /// Verifies a slot whose tuple is absent from the row layout is rejected.
     #[test]
     fn slot_global_index_rejects_slot_outside_row_tuples() {
         let desc = two_tuple_desc();
@@ -377,6 +380,7 @@ mod tests {
         assert!(matches!(err, TranslateError::Descriptor(_)));
     }
 
+    /// Verifies an unknown slot id surfaces a descriptor error.
     #[test]
     fn slot_global_index_reports_unknown_slot() {
         let desc = two_tuple_desc();

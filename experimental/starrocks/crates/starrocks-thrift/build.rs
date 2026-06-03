@@ -1,3 +1,8 @@
+//! Build script that generates Rust bindings from the StarRocks Thrift IDL.
+//!
+//! It runs the Thrift compiler over `starrocks/gensrc/thrift`, normalizes the
+//! generated attributes, and writes a module index that `src/lib.rs` includes.
+
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
@@ -5,6 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Generates Rust modules for every StarRocks Thrift file into `OUT_DIR`.
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let workspace_dir = manifest_dir
@@ -59,6 +65,7 @@ fn main() {
         .expect("failed to write generated thrift module index");
 }
 
+/// Locates the Thrift compiler via `$THRIFT`, the pixi envs, then `$PATH`.
 fn find_thrift(workspace_dir: &Path) -> Option<PathBuf> {
     if let Ok(path) = env::var("THRIFT") {
         return Some(PathBuf::from(path));
@@ -73,6 +80,7 @@ fn find_thrift(workspace_dir: &Path) -> Option<PathBuf> {
     .or_else(|| find_in_path("thrift"))
 }
 
+/// Returns the first directory in `$PATH` containing `binary`.
 fn find_in_path(binary: &str) -> Option<PathBuf> {
     env::var_os("PATH").and_then(|path| {
         env::split_paths(&path)
@@ -81,6 +89,7 @@ fn find_in_path(binary: &str) -> Option<PathBuf> {
     })
 }
 
+/// Returns the sorted set of `*.thrift` files in `thrift_dir`.
 fn collect_thrift_files(thrift_dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut files = fs::read_dir(thrift_dir)?
         .map(|entry| entry.map(|entry| entry.path()))
@@ -90,6 +99,8 @@ fn collect_thrift_files(thrift_dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// Rewrites the generated files' inner attributes (`#![..]`) into outer ones so
+/// each can be included as a module via `#[path]`.
 fn rewrite_inner_attributes(gen_dir: &Path) -> io::Result<()> {
     for entry in fs::read_dir(gen_dir)? {
         let path = entry?.path();
@@ -110,6 +121,8 @@ fn rewrite_inner_attributes(gen_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Writes a module index declaring every generated file as a `pub mod`, with the
+/// lint allowances the generated code needs.
 fn write_module_index(gen_dir: &Path, output: &Path) -> io::Result<()> {
     let mut modules = fs::read_dir(gen_dir)?
         .map(|entry| entry.map(|entry| entry.path()))
