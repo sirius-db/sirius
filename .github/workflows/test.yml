@@ -72,6 +72,7 @@ jobs:
   build-cuda-12:
     env:
       SCCACHE_GHA_ENABLED: true
+    if: github.event_name != 'pull_request'
     runs-on: [self-hosted, ubuntu-22.04, cpu-xl]
     timeout-minutes: 60
     steps:
@@ -192,7 +193,7 @@ jobs:
   test-cuda-12:
     runs-on: [self-hosted, ubuntu-22.04, gpu-2xl4]
     needs: build-cuda-12
-    if: needs.build-cuda-12.result == 'success'
+    if: github.event_name != 'pull_request' && needs.build-cuda-12.result == 'success'
     timeout-minutes: 60
     env:
       CUDA_CACHE_PATH: /home/runner/actions-runner/_work/.cuda-cache
@@ -271,10 +272,10 @@ jobs:
     if: always()
     steps:
       - name: All builds ok
-        if: ${{ !(contains(needs.*.result, 'failure')) }}
+        if: ${{ needs.build-cuda-13.result == 'success' && ((github.event_name == 'pull_request' && needs.build-cuda-12.result == 'skipped') || (github.event_name != 'pull_request' && needs.build-cuda-12.result == 'success')) }}
         run: exit 0
       - name: Some builds failed
-        if: ${{ contains(needs.*.result, 'failure') }}
+        if: ${{ !(needs.build-cuda-13.result == 'success' && ((github.event_name == 'pull_request' && needs.build-cuda-12.result == 'skipped') || (github.event_name != 'pull_request' && needs.build-cuda-12.result == 'success'))) }}
         run: exit 1
 
   test:
@@ -283,8 +284,8 @@ jobs:
     if: always()
     steps:
       - name: All tests ok
-        if: ${{ !(contains(needs.*.result, 'failure')) }}
+        if: ${{ needs.test-cuda-13.result == 'success' && ((github.event_name == 'pull_request' && needs.test-cuda-12.result == 'skipped') || (github.event_name != 'pull_request' && needs.test-cuda-12.result == 'success')) }}
         run: exit 0
       - name: Some tests failed
-        if: ${{ contains(needs.*.result, 'failure') }}
+        if: ${{ !(needs.test-cuda-13.result == 'success' && ((github.event_name == 'pull_request' && needs.test-cuda-12.result == 'skipped') || (github.event_name != 'pull_request' && needs.test-cuda-12.result == 'success'))) }}
         run: exit 1
