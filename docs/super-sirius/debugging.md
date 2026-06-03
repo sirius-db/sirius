@@ -8,6 +8,7 @@ dumps. It covers:
 - [Building and running with AddressSanitizer (ASan)](#addresssanitizer-asan)
 - [Building and running with ThreadSanitizer (TSan)](#threadsanitizer-tsan)
 - [The `tsan.supp` suppressions file](#the-tsansupp-suppressions-file)
+- [GPU errors with compute-sanitizer](#compute-sanitizer-gpu-memory--kernels)
 - [Capturing and inspecting a core dump](#capturing-a-core-dump)
 
 ---
@@ -21,6 +22,7 @@ tend to fall into a few buckets. Pick the tool that matches the symptom:
 |---------|-----------|-----|
 | Segfault / `SIGSEGV`, use-after-free, heap/stack overflow, double free, memory leak | **ASan** | Reports the exact bad access with allocation + free stacks |
 | Intermittent crash, corruption that "moves around" between runs, wrong results under load, a hang | **TSan** | Finds the underlying **data race** / lock-order bug that ASan can only see *after* it has already corrupted memory |
+| Illegal-address crash inside a GPU kernel, a bad `cudaMemcpy`, device use-after-free, a GPU memory leak | **compute-sanitizer** | The only tool that inspects **GPU device memory** and CUDA API usage — ASan/TSan cover host (CPU) code only |
 | A reproducible crash you want to inspect fully (all threads, all local variables, post-mortem) | **core dump + gdb** | Frozen snapshot of the whole process at the moment it died |
 | A crash you can reproduce on demand and want to step through live | **run under gdb** | Stop at the fault, inspect, continue, set breakpoints |
 
@@ -39,7 +41,8 @@ Rules of thumb:
 
 > **Heads-up:** GPU device-side errors (illegal address inside a CUDA kernel)
 > are **not** caught by ASan/TSan — those only instrument host (CPU) code. For
-> on-GPU faults use `compute-sanitizer ./your_binary ...` instead.
+> on-GPU faults use [compute-sanitizer](#compute-sanitizer-gpu-memory--kernels)
+> instead.
 
 ---
 
@@ -190,6 +193,112 @@ called_from_lib:libcudart.so   # matches libcudart.so.13 only
 When a new false positive appears from a library, add a line for it and re-run.
 Keep suppressions as specific as possible so you don't accidentally hide a real
 bug in Sirius code.
+
+---
+
+## compute-sanitizer (GPU memory & kernels)
+
+ASan and TSan only instrument **host (CPU)** code. They cannot see anything that
+happens on the GPU. NVIDIA's **compute-sanitizer** (the successor to
+`cuda-memcheck`, shipped with the CUDA toolkit) is the tool for the *device*
+side: out-of-bounds accesses inside kernels, bad `cudaMemcpy`s, device
+use-after-free, uninitialized device reads, and intra-kernel shared-memory
+races.
+
+Reach for it when:
+
+- A crash backtrace ends inside a CUDA kernel or `libcudart`/`libcuda`, or you
+  see a sticky `cudaErrorIllegalAddress` / "an illegal memory access was
+  encountered".
+- Results are wrong or nondeterministic in a way that smells like reading
+  uninitialized or out-of-bounds device memory.
+- You suspect a bad GPU copy/allocation in Sirius (`src/cuda/`) or cuCascade —
+  a `cudaMemcpyAsync` length that overruns a buffer, a dangling/wrong-device
+  pointer, or a leaked device allocation.
+
+### No special build required
+
+Unlike ASan/TSan, compute-sanitizer does **not** need an instrumented build — it
+works on a normal binary via driver/binary-level instrumentation at runtime.
+
+It *does* give much better output with **device line info**. The `clang-debug`
+preset compiles CUDA with `-g -G -O0` (full device debug), so kernel errors in
+Sirius's own `.cu` files (`src/cuda/`) are reported with file:line:
+
+```bash
+make clang-debug -j12
+```
+
+(`clang-relwithdebinfo`/`release` do not add `-lineinfo`, so you'll get kernel
+names and PC offsets but not source lines for Sirius kernels.)
+
+### Availability
+
+compute-sanitizer ships with a full CUDA toolkit but may not be on your `PATH`
+(it is not part of the minimal pixi CUDA package). Locate it first:
+
+```bash
+which compute-sanitizer || ls "$CUDA_HOME/bin/compute-sanitizer"
+# if missing, install the toolkit component, e.g. the conda package:
+#   pixi add cuda-sanitizer-api      (or use a system CUDA toolkit install)
+```
+
+### Run
+
+```bash
+compute-sanitizer --tool memcheck --leak-check full --error-exitcode=1 \
+  ./build/clang-debug/extension/sirius/test/cpp/sirius_unittest "<catch2-test-filter>"
+```
+
+The four tools (select with `--tool`):
+
+| Tool | Detects |
+|------|---------|
+| `memcheck` (default) | Out-of-bounds / misaligned **device** memory access in kernels; invalid `cudaMemcpy*` (bad size, direction, freed/dangling pointer); device use-after-free; wrong-device/context pointers; device-side `malloc`/`free` errors; CUDA API errors the program ignored. With `--leak-check full`: device allocations never freed. |
+| `racecheck` | Data races on `__shared__` memory **within a kernel block**. |
+| `initcheck` | Kernel reads of **uninitialized** device global memory. |
+| `synccheck` | Invalid `__syncthreads()` / sync-primitive usage (e.g. divergence). |
+
+Useful flags: `--error-exitcode=1` (fail loudly so a test run's exit code
+reflects the error), `--leak-check full` (memcheck only), and
+`--launch-timeout 0` for long-running kernels.
+
+### cudf kernels: errors are caught, source is not
+
+Most GPU compute Sirius performs is inside **cudf**, which is precompiled
+(release, no `-lineinfo`) and is impractical to rebuild. compute-sanitizer
+**will still detect** an illegal access inside a cudf kernel — you just get the
+demangled kernel name plus a PC offset, not cudf source lines. In practice a
+fault in a cudf kernel usually means *we* handed cudf a bad column, size, or
+pointer, so the host-side stack of the launching call is the thing to inspect.
+
+### ⚠️ Pooled memory hides overruns
+
+This is the most important caveat for Sirius. cuCascade allocates GPU memory
+through a **CUDA memory pool** (RMM async resource), which carves many small
+allocations out of one large pool block obtained from a single `cudaMalloc`.
+compute-sanitizer's `memcheck` validates at the *granularity of the underlying
+allocation* — so to it the entire pool block is one big valid region. An
+out-of-bounds write that stays **within the pool block** (i.e. spills from one
+sub-allocation into another) is **not detected**. (This is the same blind spot
+ASan has with custom pools.)
+
+So: clean `memcheck` runs against the pooled allocator do **not** prove the
+absence of buffer overruns — they only catch accesses that escape the whole
+pool, plus API misuse, leaks, and device use-after-free at pool granularity. To
+catch sub-allocation overruns you must run against a **non-pooled** allocator
+(one real `cudaMalloc` per allocation, each with its own red zones). Whether
+Sirius/cuCascade exposes a knob to select a non-pool resource is out of scope
+here; just be aware that the pool is on by default.
+
+### Notes
+
+- **Runs on the real GPU and is slow** — `memcheck` can be 10×+; scope your run
+  to one failing test.
+- **Don't combine with ASan/TSan** — run compute-sanitizer on a normal or
+  `clang-debug` build, in its own pass. ASan's interceptors conflict with it.
+- It complements the host tools: ASan/TSan for CPU memory and threads,
+  compute-sanitizer for the GPU.
 
 ---
 
