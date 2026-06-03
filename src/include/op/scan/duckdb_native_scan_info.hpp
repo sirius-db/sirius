@@ -20,7 +20,9 @@
 #include "op/scan/duckdb_native_metadata.hpp"
 #include "op/scan/scan_info.hpp"
 
+#include <duckdb/common/types/column/column_data_collection.hpp>
 #include <duckdb/main/client_context.hpp>
+#include <duckdb/planner/table_filter.hpp>
 #include <duckdb/storage/data_table.hpp>
 
 #include <cstddef>
@@ -47,15 +49,19 @@ struct duckdb_native_scan_info : public scan_info {
   duckdb::DataTable* storage     = nullptr;
   duckdb::ClientContext* context = nullptr;
 
+  // projected_cols / projected_types are sized to the FULL scan output (includes filter-only
+  // columns appended by sirius_plan_get.cpp). Filter application + projection down to
+  // output_types happens inside decode_duckdb_native_split.
   std::vector<projected_column> projected_cols;
   std::vector<sirius::logical_type> projected_types;
+
+  /// Output types after filter-only-column projection. Set by the pipeline converter
+  /// from the original scan's `types`; scan operator projects down to these post-filter.
+  duckdb::vector<sirius::logical_type> output_types;
 
   std::string db_path;
 
   /// Single call only — moves *this into the returned split_provider.
-  /// @p manager is part of the polymorphic scan_info::make_provider contract
-  /// (parquet/S3 use it for io_ctx_shared_for path routing) but is unused here:
-  /// the .duckdb-native path runs on a single local ioctx taken from @p gpu_ioctxs.
   std::unique_ptr<scan_manager::split_provider> make_provider(
     scan_manager::sirius_scan_manager& manager,
     std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs) override;

@@ -15,7 +15,10 @@
  */
 
 // sirius
+#include <expression/ast/from_duckdb.hpp>
+#include <expression/ast/node.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
+#include <sirius/exception.hpp>
 
 // duckdb
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
@@ -24,13 +27,30 @@ namespace sirius {
 using ast_result     = gpu_expression_executor::ast_result;
 using execute_result = gpu_expression_executor::execute_result;
 
-execute_result gpu_expression_executor::execute(duckdb::BoundReferenceExpression const& expr,
+execute_result gpu_expression_executor::execute(sirius::ast::reference const& alt,
                                                 execution_mode mode)
 {
   if (mode == execution_mode::AST) {
-    auto const& col_expr = _ast_tree.emplace<cudf::ast::column_reference>(expr.index);
+    auto const& col_expr = _ast_tree.emplace<cudf::ast::column_reference>(alt.column_index);
     return execute_result(ast_result(col_expr));
   }
-  return execute_result(_input_table.column(expr.index));
+  return execute_result(_input_table.column(alt.column_index));
+}
+
+// DuckDB-typed entrypoint. Bridges callers that still pass duckdb::Expression
+// directly into the executor; the eventual home for this from_duckdb step is
+// the planning stage so the executor sees only native sirius::ast types, but
+// until upstream call sites are migrated this overload (and the duckdb
+// includes it requires) must stay.
+execute_result gpu_expression_executor::execute(duckdb::BoundReferenceExpression const& expr,
+                                                execution_mode mode)
+{
+  auto node = sirius::ast::from_duckdb(expr);
+  if (!node) {
+    throw not_implemented_exception(
+      "[gpu_expression_executor:reference] BoundReferenceExpression could not be lowered to a "
+      "Sirius AST node (sirius::ast::from_duckdb returned nullptr).");
+  }
+  return execute(*node, mode);
 }
 }  // namespace sirius

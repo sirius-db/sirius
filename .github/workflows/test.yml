@@ -28,10 +28,12 @@ jobs:
   build-cuda-13:
     env:
       SCCACHE_GHA_ENABLED: true
-    runs-on: [self-hosted, ubuntu-24.04, cuda-13, cpu-xl]
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
+    runs-on: [self-hosted, ubuntu-24.04, cpu-xl]
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
 
@@ -72,10 +74,12 @@ jobs:
   build-cuda-12:
     env:
       SCCACHE_GHA_ENABLED: true
-    runs-on: [self-hosted, ubuntu-22.04, cuda-12, cpu-xl]
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
+    runs-on: [self-hosted, ubuntu-22.04, cpu-xl]
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
 
@@ -114,7 +118,7 @@ jobs:
           retention-days: 1
 
   test-cuda-13:
-    runs-on: [self-hosted, ubuntu-24.04, cuda-13, gpu-2xl4]
+    runs-on: [self-hosted, ubuntu-24.04, gpu-2xl4]
     needs: build-cuda-13
     if: needs.build-cuda-13.result == 'success'
     timeout-minutes: 60
@@ -122,7 +126,7 @@ jobs:
       CUDA_CACHE_PATH: /home/runner/actions-runner/_work/.cuda-cache
       SIRIUS_LOG_LEVEL: trace
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
         with:
@@ -190,7 +194,7 @@ jobs:
           retention-days: 14
 
   test-cuda-12:
-    runs-on: [self-hosted, ubuntu-22.04, cuda-12, gpu-2xl4]
+    runs-on: [self-hosted, ubuntu-22.04, gpu-2xl4]
     needs: build-cuda-12
     if: needs.build-cuda-12.result == 'success'
     timeout-minutes: 60
@@ -198,7 +202,7 @@ jobs:
       CUDA_CACHE_PATH: /home/runner/actions-runner/_work/.cuda-cache
       SIRIUS_LOG_LEVEL: trace
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
         with:

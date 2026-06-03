@@ -25,7 +25,7 @@
 #include "exec/thread_pool.hpp"
 #include "io/prefetching_cache.hpp"
 #include "io/s3/s3_ioctx.hpp"
-#include "io/s3/sirius_sigv4_credential_provider.hpp"
+#include "io/s3/sirius_sigv4_authorizer.hpp"
 #include "io/s3/static_credentials.hpp"
 #include "log/logging.hpp"
 #include "memory/numa_small_pinned_mr.hpp"
@@ -610,20 +610,33 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // s3_config == std::nullopt and the scan_manager skips s3_ioctx
   // construction. The FSMR is passed through to uring_ioctx / buffer_pool.
   auto sm_config = config_.get_scan_manager_config();
+  // duckdb-native scan needs sirius_ioctx for host_read; force it on only
+  // when that path is enabled, so the documented fallback knob stays usable
+  // for other scan paths.
+  if (host_fsmr != nullptr && config_.get_operator_params().enable_gpu_duckdb_native_scan) {
+    sm_config.use_sirius_datasource = true;
+  }
   if (!config_.object_store_config.endpoint.empty() &&
       !config_.object_store_config.access_key.empty() &&
       !config_.object_store_config.secret_key.empty()) {
-    sirius::io::s3::static_credentials creds;
-    creds.access_key_id     = config_.object_store_config.access_key;
-    creds.secret_access_key = config_.object_store_config.secret_key;
-    auto provider           = std::make_shared<sirius::io::s3::sirius_sigv4_credential_provider>(
-      std::move(creds),
-      config_.object_store_config.region,
-      config_.object_store_config.endpoint,
-      std::chrono::minutes{5});
+    auto creds = sirius::io::s3::static_credentials_from(config_.object_store_config);
+    std::shared_ptr<sirius::io::s3::s3_request_authorizer> provider;
+    if (config_.object_store_config.s3_signing_mode ==
+        sirius::io::object_store_config::signing_mode::header) {
+      provider = std::make_shared<sirius::io::s3::sirius_sigv4_header_authorizer>(
+        std::move(creds), config_.object_store_config.region, config_.object_store_config.endpoint);
+    } else {
+      provider = std::make_shared<sirius::io::s3::sirius_sigv4_presigned_authorizer>(
+        std::move(creds),
+        config_.object_store_config.region,
+        config_.object_store_config.endpoint,
+        std::chrono::minutes{5});
+    }
     sirius::io::s3::s3_ioctx_config s3_cfg{};
-    s3_cfg.creds        = std::move(provider);
-    sm_config.s3_config = std::move(s3_cfg);
+    s3_cfg.creds          = std::move(provider);
+    s3_cfg.ca_bundle_path = config_.object_store_config.ca_bundle_path;
+    s3_cfg.tls_verify     = config_.object_store_config.tls_verify;
+    sm_config.s3_config   = std::move(s3_cfg);
   }
   // Persist the composed config back onto config_ so a later get_config()
   // reflects the actual S3 wiring -- get_scan_manager_config() must not report

@@ -17,7 +17,7 @@
 #pragma once
 
 #include "io/io_context.hpp"
-#include "io/s3/credential_provider.hpp"
+#include "io/s3/s3_request_authorizer.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -47,13 +47,13 @@ class s3_io_object;
 ///
 /// @c creds is required and owns the credential / signer chain; the reactor
 /// itself is signing-blind — every request path obtains a fully-qualified
-/// presigned URL from @c creds and issues an unsigned HTTP request against
-/// it. Endpoint / region / access-key material lives inside the provider's
-/// concrete implementation (e.g. @c sirius_sigv4_credential_provider's
+/// URL plus headers from @c creds and issues the HTTP request against them.
+/// Endpoint / region / access-key material lives inside the authorizer's
+/// concrete implementation (e.g. @c sirius_sigv4_presigned_authorizer's
 /// constructor takes the endpoint and region), so they intentionally do not
 /// appear here.
 struct s3_ioctx_config {
-  std::shared_ptr<credential_provider> creds;
+  std::shared_ptr<s3_request_authorizer> creds;
   std::size_t max_connections = 16;
   long request_timeout_s      = 60;
 
@@ -97,6 +97,13 @@ struct s3_ioctx_config {
   /// construction. The s3_ioctx never owns this resource; its lifetime is
   /// the caller's (sirius_scan_manager) responsibility.
   cucascade::memory::fixed_size_host_memory_resource* host_memory_resource{nullptr};
+
+  /// TLS for https endpoints. @c ca_bundle_path (non-empty) -> CURLOPT_CAINFO
+  /// so a custom / self-signed CA verifies; empty uses the system CA bundle
+  /// (AWS). @c tls_verify=false disables peer+host verification
+  /// (CURLOPT_SSL_VERIFYPEER / CURLOPT_SSL_VERIFYHOST = 0) — INSECURE, dev/test.
+  std::string ca_bundle_path;
+  bool tls_verify = true;
 };
 
 /**
@@ -108,13 +115,15 @@ struct s3_ioctx_config {
  * buffer + H2D copy (S3 has no native device path). The caching / admission
  * hooks on the base class are opt-in via @c initialize_cache.
  *
- * Authentication is delegated entirely to the @c credential_provider passed
- * via @c s3_ioctx_config — this class never sees raw access keys, never
- * computes a SigV4 signature, and never injects an Authorization header.
- * Each request path acquires a presigned URL via
- * @c credential_provider::get_presigned_url and lets libcurl follow it; the
- * only request header this class emits is @c Range (unsigned, allowed by
- * the URL's @c SignedHeaders=host).
+ * Authentication is delegated entirely to the @c s3_request_authorizer passed
+ * via @c s3_ioctx_config — this class never sees raw access keys and never
+ * computes a SigV4 signature itself. Each request path acquires an
+ * @c s3_authorized_request via @c s3_request_authorizer::authorize and lets
+ * libcurl follow the returned URL, attaching any returned headers verbatim.
+ * For the default presigned authorizer the headers are empty and the only
+ * request header this class emits is @c Range (unsigned, allowed by the URL's
+ * @c SignedHeaders=host); a header-signing authorizer may additionally return
+ * Authorization / x-amz-* headers that this class attaches as-is.
  *
  * @par Construction
  *
@@ -123,7 +132,7 @@ struct s3_ioctx_config {
  *   creds.access_key_id     = "...";
  *   creds.secret_access_key = "...";
  *   auto provider = std::make_shared<
- *     sirius::io::s3::sirius_sigv4_credential_provider>(
+ *     sirius::io::s3::sirius_sigv4_presigned_authorizer>(
  *       std::move(creds), "us-east-1", "https://s3.amazonaws.com",
  *       std::chrono::minutes{5});
  *
@@ -296,6 +305,18 @@ class s3_ioctx final : public sirius_ioctx {
     return _bytes_read_total.load(std::memory_order_relaxed);
   }
 
+  /// Cumulative count of successful FSMR block borrows performed by
+  /// @c device_read_io since construction. Each successful
+  /// @c allocate_multiple_blocks on the FSMR-staged path increments by one;
+  /// the vector-fallback path (no caller-supplied FSMR) does not contribute.
+  /// Failed allocations (out-of-memory etc.) are not counted. Intended for
+  /// tests asserting that F1's chunked-staging path is exercised at SQL
+  /// scale.
+  [[nodiscard]] std::uint64_t fsmr_borrows_total() const noexcept
+  {
+    return _fsmr_borrows_total.load(std::memory_order_relaxed);
+  }
+
  private:
   struct handle_slot;
 
@@ -361,6 +382,10 @@ class s3_ioctx final : public sirius_ioctx {
   /// See @c bytes_read_total(). Updated only inside @c range_get on the
   /// success-return path (HTTP 206 / 200 with validated body length).
   std::atomic<std::uint64_t> _bytes_read_total{0};
+
+  /// See @c fsmr_borrows_total(). Updated only on the FSMR-staged branch of
+  /// @c device_read_io, after @c allocate_multiple_blocks succeeds.
+  std::atomic<std::uint64_t> _fsmr_borrows_total{0};
 };
 
 }  // namespace sirius::io::s3

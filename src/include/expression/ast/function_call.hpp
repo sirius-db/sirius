@@ -64,6 +64,8 @@ class function_call {
   }
   [[nodiscard]] sirius::logical_type const& return_type() const noexcept { return return_type_; }
 
+  [[nodiscard]] std::size_t cudf_ast_op_count() const;
+
  private:
   sirius::function_id function_;
   std::vector<std::unique_ptr<node>> arguments_;

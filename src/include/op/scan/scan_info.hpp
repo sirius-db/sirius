@@ -67,7 +67,7 @@ struct scan_info {
   std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
   /// Number of output columns the gpu scan operator returns.
   /// Set by the pipeline converter from the scan operator's `types.size()`.
-  std::size_t scan_output_arity;
+  std::size_t scan_output_arity = 0;
 
   scan_info()                            = default;
   virtual ~scan_info()                   = default;

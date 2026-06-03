@@ -17,6 +17,8 @@
 #pragma once
 
 // standard library
+#include <concepts>
+#include <cstddef>
 #include <memory>
 #include <type_traits>
 #include <utility>
@@ -50,6 +52,29 @@ struct node;
 
 namespace sirius::ast {
 
+/// Compile-time contract: every alternative held in node::variant_t must
+/// implement `std::size_t cudf_ast_op_count() const`. Without this concept,
+/// a missing method only surfaces as a deep template-instantiation error
+/// when node::cudf_ast_op_count()'s std::visit fans out. The static_assert
+/// below uses this concept to produce a one-line, named error at the variant
+/// declaration site instead.
+template <class T>
+concept has_cudf_ast_op_count = requires(T const& t) {
+  { t.cudf_ast_op_count() } -> std::convertible_to<std::size_t>;
+};
+
+namespace detail {
+
+template <class Variant>
+struct all_have_cudf_ast_op_count;
+
+template <class... Ts>
+struct all_have_cudf_ast_op_count<std::variant<Ts...>> {
+  static constexpr bool value = (has_cudf_ast_op_count<Ts> && ...);
+};
+
+}  // namespace detail
+
 /**
  * @brief Sum type over every Sirius AST node kind.
  *
@@ -79,6 +104,11 @@ struct node {
                                  coalesce,
                                  in_list,
                                  function_call>;
+
+  static_assert(detail::all_have_cudf_ast_op_count<variant_t>::value,
+                "Every alternative in sirius::ast::node::variant_t must implement "
+                "std::size_t cudf_ast_op_count() const. Add the method to the "
+                "missing alternative struct.");
 
   variant_t v;
 
@@ -121,6 +151,8 @@ struct node {
   {
     return std::get<T>(v);
   }
+
+  [[nodiscard]] std::size_t cudf_ast_op_count() const;
 };
 
 }  // namespace sirius::ast

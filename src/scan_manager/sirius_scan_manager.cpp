@@ -17,25 +17,41 @@
 #include "scan_manager/sirius_scan_manager.hpp"
 
 #include "exec/thread_pool.hpp"
+#include "io/parquet_helpers.hpp"
 #include "io/prefetching_cache.hpp"
 #include "io/s3/s3_ioctx.hpp"
 #include "io/uring/uring_ioctx.hpp"
 #include "log/logging.hpp"
+#include "op/scan/duckdb_native_scan_info.hpp"
+#include "op/scan/parquet_scan_info.hpp"
 #include "op/scan/scan_info.hpp"
 #include "op/scan/scan_plan.hpp"
 #include "op/scan/scan_utils.hpp"
+#include "op/scan/sirius_gpu_duckdb_native_scan_operator.hpp"
 #include "op/scan/sirius_gpu_parquet_scan_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "planner/query.hpp"
 #include "scan_manager/cached_split_provider.hpp"
+#include "scan_manager/duckdb_native_split_provider.hpp"
+#include "scan_manager/parquet_metadata.hpp"
+#include "scan_manager/parquet_split_provider.hpp"
 #include "scan_manager/split_connector.hpp"
 #include "scan_manager/split_provider.hpp"
+
+#include <cudf/io/datasource.hpp>
+#include <cudf/io/experimental/hybrid_scan.hpp>
+#include <cudf/io/parquet.hpp>
+#include <cudf/io/parquet_io_utils.hpp>
+#include <cudf/io/parquet_schema.hpp>
+#include <cudf/utilities/span.hpp>
 
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 #include <algorithm>
+#include <cstdint>
 #include <exception>
+#include <memory>
 #include <stdexcept>
 #include <utility>
 
@@ -119,6 +135,49 @@ std::shared_ptr<sirius::io::sirius_ioctx> sirius_scan_manager::io_ctx_shared_for
     _io_ctxs, path, shared_copy);
 }
 
+parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri)
+{
+  auto* io_ctx = io_ctx_for(uri);
+  if (io_ctx == nullptr) {
+    throw std::runtime_error("[sirius_scan_manager::describe_parquet] no backend supports URI: " +
+                             uri);
+  }
+
+  // Footer-only fetch + Thrift parse — the same path parquet_split_provider's
+  // run_batch takes on a metadata-cache miss, so bind and scan agree on how
+  // the footer is read.
+  auto io_object  = io_ctx->create_io_object(uri);
+  auto datasource = io_ctx->make_datasource(io_object);
+
+  auto footer_buffer         = cudf::io::parquet::fetch_footer_to_host(*datasource);
+  auto const footer_byte_len = footer_buffer->size();
+  auto reader_options        = cudf::io::parquet_reader_options::builder().build();
+  cudf::io::parquet::experimental::hybrid_scan_reader reader{
+    cudf::host_span<std::uint8_t const>(footer_buffer->data(), footer_buffer->size()),
+    reader_options};
+  auto file_metadata         = reader.parquet_metadata();
+  auto const footer_num_rows = file_metadata.num_rows;
+
+  auto schema = sirius::io::parquet_helpers::extract_schema(file_metadata);
+
+  // Footer-parse reuse: a metadata-only insert (empty ranges => no chunk
+  // prefetch) lets the subsequent scan's get_metadata hit, so the footer is
+  // Thrift-parsed once instead of twice.
+  if (auto* cache = io_ctx->cache(); cache != nullptr) {
+    auto metadata = std::make_shared<parquet_metadata>(
+      std::make_shared<cudf::io::parquet::FileMetaData const>(std::move(file_metadata)),
+      footer_byte_len);
+    cache->insert(*io_object, std::move(metadata), /*ranges=*/{});
+  }
+
+  parquet_bind_result result;
+  result.return_types   = std::move(schema.types);
+  result.names          = std::move(schema.names);
+  result.object_size    = datasource->size();
+  result.total_num_rows = static_cast<std::size_t>(footer_num_rows);
+  return result;
+}
+
 void sirius_scan_manager::prepare_for_query(
   const sirius::planner::query& query,
   std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs,
@@ -145,26 +204,36 @@ void sirius_scan_manager::prepare_for_query(
     if (!pipeline) { continue; }
     auto source = pipeline->get_source();
     if (!source) { continue; }
-    if (source->type != ::sirius::op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN) { continue; }
 
-    auto* op = &source->Cast<op::scan::sirius_gpu_parquet_scan_operator>();
-    if (_providers_by_op.find(op) != _providers_by_op.end()) { continue; }
+    if (source->type == ::sirius::op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN) {
+      auto* op = &source->Cast<op::scan::sirius_gpu_parquet_scan_operator>();
+      if (_providers_by_op.find(op) != _providers_by_op.end()) { continue; }
 
-    auto provider = create_provider_for(op, gpu_ioctxs, gpu_memory_spaces);
-    if (!provider) {
-      // No scan_info parked on the operator (e.g. tests construct the operator
-      // directly). Skip — caller is responsible for the connector.
-      continue;
+      auto provider = create_provider_for(op, gpu_ioctxs, gpu_memory_spaces);
+      if (!provider) { continue; }
+      op->set_split_connector(std::make_unique<split_connector>());
+      _providers_by_op.emplace(op, std::move(provider));
+      _scan_op_order.push_back(op);
+
+      SIRIUS_LOG_DEBUG("[sirius_scan_manager::prepare_for_query] registered parquet op_id={}",
+                       op->get_operator_id());
+    } else if (source->type == ::sirius::op::SiriusPhysicalOperatorType::GPU_DUCKDB_NATIVE_SCAN) {
+      auto* op = &source->Cast<op::scan::sirius_gpu_duckdb_native_scan_operator>();
+      if (_duckdb_native_providers_by_op.find(op) != _duckdb_native_providers_by_op.end()) {
+        continue;
+      }
+      auto provider = create_provider_for(op, gpu_ioctxs, gpu_memory_spaces);
+      if (!provider) { continue; }
+      op->set_split_connector(std::make_unique<split_connector>());
+      _duckdb_native_providers_by_op.emplace(op, std::move(provider));
+      _duckdb_native_scan_op_order.push_back(op);
+
+      SIRIUS_LOG_DEBUG("[sirius_scan_manager::prepare_for_query] registered duckdb-native op_id={}",
+                       op->get_operator_id());
     }
-    op->set_split_connector(std::make_unique<split_connector>());
-    _providers_by_op.emplace(op, std::move(provider));
-    _scan_op_order.push_back(op);
-
-    SIRIUS_LOG_DEBUG("[sirius_scan_manager::prepare_for_query] registered op_id={}",
-                     op->get_operator_id());
   }
 
-  if (_scan_op_order.empty()) { return; }
+  if (_scan_op_order.empty() && _duckdb_native_scan_op_order.empty()) { return; }
 
   start_metadata_processing();
 }
@@ -190,6 +259,19 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
   // Combined-runtime: pass *this so the format provider can route per-path
   // (s3:// -> s3_ioctx via io_ctx_shared_for, local -> per-GPU uring). Upstream
   // #749's make_provider(gpu_ioctxs) only wired local; S3 needs the scan_manager.
+  return info->make_provider(*this, gpu_ioctxs);
+}
+
+std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
+  op::scan::sirius_gpu_duckdb_native_scan_operator* op,
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs,
+  std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces)
+{
+  auto info = op->take_scan_info();
+  if (!info) { return nullptr; }
+  if (auto cached = try_make_cached_provider(*info, op->get_operator_id(), gpu_memory_spaces)) {
+    return cached;
+  }
   return info->make_provider(*this, gpu_ioctxs);
 }
 
@@ -403,6 +485,19 @@ void sirius_scan_manager::start_metadata_processing()
       connector->close(std::current_exception());
     }
   }
+  for (auto* op : _duckdb_native_scan_op_order) {
+    auto it = _duckdb_native_providers_by_op.find(op);
+    if (it == _duckdb_native_providers_by_op.end()) { continue; }
+    auto* connector = op->get_split_connector();
+    if (connector == nullptr) { continue; }
+    try {
+      it->second->run(*_dispatcher, *connector);
+    } catch (const std::exception& e) {
+      SIRIUS_LOG_ERROR("[sirius_scan_manager] driver: duckdb-native provider failed to start: {}",
+                       e.what());
+      connector->close(std::current_exception());
+    }
+  }
 }
 
 void sirius_scan_manager::reset()
@@ -411,6 +506,8 @@ void sirius_scan_manager::reset()
   _dispatcher->wait_for_all();
   _scan_op_order.clear();
   _providers_by_op.clear();
+  _duckdb_native_scan_op_order.clear();
+  _duckdb_native_providers_by_op.clear();
   _dispatcher =
     std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads);
 }

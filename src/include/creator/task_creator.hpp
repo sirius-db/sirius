@@ -156,6 +156,14 @@ class task_creator {
 
  protected:
   /**
+   * @brief Stop the worker thread pool.
+   *
+   * Stops all worker threads and waits for them to finish. This method is
+   * idempotent - calling it multiple times has no additional effect.
+   */
+  void do_stop_thread_pool();
+
+  /**
    * @brief Find the operator for which to create the next task based on operator hints.
    *
    * This method queries the given node for a hint about what task to create next.

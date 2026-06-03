@@ -106,8 +106,18 @@ void gpu_pipeline_executor::manager_loop()
       SIRIUS_LOG_INFO("GPU Pipeline Executor: pool interrupted, stopping manager loop");
       break;
     }
-    // Task request sending removed: management_eventloop now pushes tasks directly
-    // to this executor based on data locality preference (push model).
+    // Pull-signal backpressure: now that we hold a reserved thread slot, tell the
+    // task_scheduler this device is ready for work. The scheduler will only move
+    // a task out of its downgrade-visible queue into our _task_queue when a
+    // ready signal has been received from us — preventing tasks from piling
+    // up here where the downgrade executor can't see them.
+    auto ready       = std::make_unique<task_request>();
+    ready->kind      = task_request_kind::device_ready;
+    ready->device_id = _memory_space->get_device_id();
+    if (!_task_request_publisher.send(std::move(ready))) {
+      SIRIUS_LOG_INFO("GPU Pipeline Executor: task_request channel closed, stopping manager loop");
+      break;
+    }
     auto pipeline_task = _task_queue.pop();  // block till a task is available
     if (!pipeline_task) {
       SIRIUS_LOG_INFO("GPU Pipeline Executor: task queue interrupted, stopping manager loop");

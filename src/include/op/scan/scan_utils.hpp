@@ -17,6 +17,7 @@
 #pragma once
 
 // sirius
+#include <expression_executor/gpu_expression_translator_internal.hpp>
 #include <helper/logical_type.hpp>
 
 // duckdb
@@ -67,5 +68,27 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
   const duckdb::vector<sirius::logical_type>& returned_types,
   const std::vector<std::optional<std::size_t>>& batch_position_by_column_id,
   const std::unordered_set<std::size_t>& skip_primary_indices = {});
+
+/**
+ * @brief Bridge a DuckDB filter expression through sirius::ast::from_duckdb into the
+ * cuDF-AST translator's column-name pathway.
+ *
+ * Converts @p expr to a Sirius AST node (returning std::nullopt if the expression cannot be
+ * lowered), then forwards it to @p translator.translate_expression_with_names. The helper owns
+ * the intermediate Sirius AST node for the duration of the call.
+ *
+ * This is a free function (not a translator member) so the translator's public surface accepts
+ * only Sirius AST; the DuckDB-to-AST conversion lives at the scan boundary.
+ *
+ * @param translator The translator to lower the converted Sirius AST into a cuDF AST.
+ * @param expr The DuckDB filter expression to translate.
+ * @param resolver Function mapping a reference column index to a column name string.
+ * @return The translated expression, or std::nullopt if conversion or translation failed.
+ */
+std::optional<gpu_expression_translator::translated_expression>
+translate_duckdb_expression_with_names(
+  gpu_expression_translator& translator,
+  duckdb::Expression const& expr,
+  gpu_expression_translator::column_name_resolver_fxn resolver);
 
 }  // namespace sirius::op

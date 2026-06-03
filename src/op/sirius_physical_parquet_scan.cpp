@@ -99,11 +99,14 @@ sirius_physical_parquet_scan::sirius_physical_parquet_scan(
     auto batch_column_map = build_batch_column_map(projection_ids, column_ids.size());
     // Drop filters on hive-partition columns — they aren't in the parquet file, so pushing
     // them into the reader crashes libcudf. DuckDB already prunes partitions at the file-list
-    // level when hive_partitioning is enabled.
+    // level when hive_partitioning is enabled. Only native read_parquet / parquet_scan binds
+    // produce MultiFileBindData; sirius_read_parquet binds a SiriusReadParquetBindData (single
+    // S3 URI, no hive partitioning), so dynamic_cast lets that path fall through with an
+    // empty partition index set instead of reinterpret-casting through the wrong type.
     std::unordered_set<std::size_t> hive_partition_primary_indices;
-    if (bind_data) {
-      auto const& multi_file_bind = bind_data->Cast<duckdb::MultiFileBindData>();
-      for (auto const& hpi : multi_file_bind.reader_bind.hive_partitioning_indexes) {
+    if (auto const* multi_file_bind =
+          dynamic_cast<duckdb::MultiFileBindData const*>(bind_data.get())) {
+      for (auto const& hpi : multi_file_bind->reader_bind.hive_partitioning_indexes) {
         hive_partition_primary_indices.insert(hpi.index);
       }
     }
@@ -144,8 +147,8 @@ sirius_physical_parquet_scan::sirius_physical_parquet_scan(
         gpu_expression_translator translator(
           translation_stream.view(),
           rmm::mr::get_per_device_resource_ref(rmm::cuda_device_id{device_id}));
-        auto translated =
-          translator.translate_expression_with_names(*duckdb_expression, name_resolver);
+        auto translated = sirius::op::translate_duckdb_expression_with_names(
+          translator, *duckdb_expression, name_resolver);
         // Synchronize BEFORE storing into translated_filter_by_device so any
         // future reader — on any stream, on any device after peer-access — is
         // guaranteed to observe the scalar allocations as already completed.
