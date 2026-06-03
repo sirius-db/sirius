@@ -26,6 +26,8 @@
 #include <duckdb/storage/storage_manager.hpp>
 #include <duckdb/storage/table_storage_info.hpp>
 
+#include <nvtx3/nvtx3.hpp>
+
 #include <algorithm>
 #include <cassert>
 #include <charconv>
@@ -302,6 +304,8 @@ duckdb_native_metadata walk_duckdb_native_metadata(
   const std::vector<projected_column>& projected_cols,
   const std::vector<sirius::logical_type>& projected_types)
 {
+  nvtx3::scoped_range nvtx_walk{"sirius::native_metadata_walk"};
+
   duckdb_native_metadata md;
   md.viable = false;
 
@@ -331,7 +335,11 @@ duckdb_native_metadata walk_duckdb_native_metadata(
 
   // PartitionStatistics order matches `RowGroupCollection::SegmentNodes()`
   // iteration order at v1.5.2 — relied on for indexing by row_group_index.
-  auto partition_stats = storage.GetPartitionStats(context);
+  std::vector<duckdb::PartitionStatistics> partition_stats;
+  {
+    nvtx3::scoped_range nvtx_ps{"sirius::native_metadata_partition_stats"};
+    partition_stats = storage.GetPartitionStats(context);
+  }
   row_group_handles handles;
   handles.reserve(partition_stats.size());
   for (std::size_t i = 0; i < partition_stats.size(); ++i) {
@@ -354,7 +362,11 @@ duckdb_native_metadata walk_duckdb_native_metadata(
   }
 
   duckdb::QueryContext qc{context};
-  auto column_segments = storage.GetColumnSegmentInfo(qc);
+  std::vector<duckdb::ColumnSegmentInfo> column_segments;
+  {
+    nvtx3::scoped_range nvtx_si{"sirius::native_metadata_segment_info"};
+    column_segments = storage.GetColumnSegmentInfo(qc);
+  }
 
   // Size to max_row_group_index + 1 so rowid-only and all-filtered row
   // groups still have an entry for rowid synthesis and trailing-empty
