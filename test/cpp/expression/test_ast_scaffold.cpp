@@ -55,8 +55,8 @@ static_assert(!std::is_copy_constructible_v<node>,
 static_assert(!std::is_copy_assignable_v<node>, "sirius::ast::node must be move-only.");
 static_assert(std::is_move_constructible_v<node>, "sirius::ast::node must be move-constructible.");
 static_assert(std::is_move_assignable_v<node>, "sirius::ast::node must be move-assignable.");
-static_assert(std::variant_size_v<node::variant_t> == 11,
-              "sirius::ast::node has exactly 11 alternatives.");
+static_assert(std::variant_size_v<node::variant_t> == 12,
+              "sirius::ast::node has exactly 12 alternatives.");
 
 // ============================================================================
 // Per-node instantiation

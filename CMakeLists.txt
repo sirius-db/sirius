@@ -148,6 +148,7 @@ set(EXTENSION_SOURCES
     src/data/host_parquet_representation.cpp
     src/data/host_parquet_representation_converters.cpp
     src/downgrade/downgrade_executor.cpp
+    src/expression/aggregate_id.cpp
     src/expression/expression.cpp
     src/expression/from_duckdb.cpp
     src/expression/function_id.cpp
@@ -439,6 +440,7 @@ set(TEST_SOURCES
     test/cpp/exec/test_bounded_thread_pool.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
+    test/cpp/expression/test_ast_aggregate.cpp
     test/cpp/expression/test_ast_from_duckdb.cpp
     test/cpp/expression/test_ast_scaffold.cpp
     test/cpp/expression/test_ast_to_duckdb.cpp
