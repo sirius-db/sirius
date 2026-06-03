@@ -177,10 +177,4 @@ inline void thread_local_executor_thread_telemtry_init(const telemetry_context& 
   telemetry_thread_handle.emplace(context, thread_name);
 }
 
-inline uuid::UUID current_executor_thread_resource_id() noexcept
-{
-  if (!telemetry_thread_handle.has_value()) { return uuid::new_nil(); }
-  return telemetry_thread_handle->uuid();
-}
-
 }  // namespace sirius::telemetry

@@ -55,7 +55,7 @@ sirius_pipeline_itask::~sirius_pipeline_itask()
   if (_telemetry_finalized) { return; }
 
   _telemetry_task_handle->finalizing({
-    .instance_name = std::string(),
+    .instance_name = "",
     .success       = false,
   });
   _telemetry_task_handle->exit();

@@ -132,7 +132,7 @@ void gpu_pipeline_executor::manager_loop()
     auto reservation_info = gpu_task->get_estimated_reservation_size_info();
     auto bytes_needs      = reservation_info.reservation_size;
     gpu_task->telemetry_handle()->reserving({
-      .instance_name              = std::string(),
+      .instance_name              = "",
       .requested_bytes            = reservation_info.reservation_size,
       .input_basis                = reservation_info.input_basis,
       .peak_estimate              = reservation_info.peak_memory_estimate,
@@ -163,7 +163,7 @@ void gpu_pipeline_executor::manager_loop()
       size_t shortfall    = bytes_needs - reservation->size();
       size_t partial_size = reservation->size();
       gpu_task->telemetry_handle()->downgrading({
-        .instance_name              = std::string(),
+        .instance_name              = "",
         .shortfall_bytes            = shortfall,
         .partial_bytes              = partial_size,
         .manager_thread_resource_id = manager_resource_id,
@@ -204,7 +204,7 @@ void gpu_pipeline_executor::manager_loop()
       }
 
       gpu_task->telemetry_handle()->reserving({
-        .instance_name              = std::string(),
+        .instance_name              = "",
         .requested_bytes            = reservation_info.reservation_size,
         .input_basis                = reservation_info.input_basis,
         .peak_estimate              = reservation_info.peak_memory_estimate,
@@ -371,7 +371,7 @@ void gpu_pipeline_executor::manager_loop()
           // to acquire a fresh reservation before execution.
           if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
             pipeline_task->telemetry_handle()->finalizing({
-              .instance_name = std::string(),
+              .instance_name = "",
               .success       = false,
             });
             pipeline_task->telemetry_handle()->exit();
@@ -392,7 +392,7 @@ void gpu_pipeline_executor::manager_loop()
         }
         if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
           pipeline_task->telemetry_handle()->finalizing({
-            .instance_name = std::string(),
+            .instance_name = "",
             .success       = true,
           });
           pipeline_task->telemetry_handle()->exit();

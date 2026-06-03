@@ -86,7 +86,7 @@ state! {
     Computing {
         attributes: {
             current_operator_id: u64,
-            output_bytes: u64,
+            input_bytes: u64,
         },
         usages: {
             executor_thread: ExecutorThread,

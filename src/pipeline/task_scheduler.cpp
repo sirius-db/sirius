@@ -43,12 +43,12 @@ task_scheduler::task_scheduler(
   const exec::thread_pool_config& gpu_executor_config,
   const exec::thread_pool_config& scan_executor_config,
   sirius::memory::sirius_memory_reservation_manager& mem_mgr,
-  std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context,
+  std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
   const cucascade::memory::system_topology_info* sys_topology,
   const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors)
   : _telemetry_context(std::move(telemetry_context))
 {
-  _task_queue_telemetry = std::make_unique<sirius::telemetry::TaskQueueHandleWrapper>(
+  _task_queue_telemetry = std::make_unique<telemetry::TaskQueueHandleWrapper>(
     *_telemetry_context, "task-scheduler-gpu-queue");
 
   // Create the scan executor with memory manager for host allocations

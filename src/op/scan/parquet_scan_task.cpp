@@ -219,7 +219,7 @@ std::vector<byte_range_info> merge_byte_ranges(std::vector<byte_range_info> cons
 parquet_scan_task_global_state::parquet_scan_task_global_state(
   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
   sirius_physical_parquet_scan* scan_op,
-  std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context,
+  std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
   std::size_t approximate_batch_size,
   std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs)
   : pipeline::sirius_pipeline_task_global_state(pipeline, std::move(telemetry_context)),
@@ -280,7 +280,7 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
 parquet_scan_task_global_state::parquet_scan_task_global_state(
   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
   sirius_physical_parquet_scan* scan_op,
-  std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context,
+  std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
   std::vector<std::string> file_paths,
   std::vector<size_t> selected_column_indices,
   std::size_t approximate_batch_size,

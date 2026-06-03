@@ -77,7 +77,7 @@ duckdb_scan_executor::duckdb_scan_executor(
   exec::thread_pool_config config,
   cucascade::memory::memory_reservation_manager* mem_mgr,
   exec::publisher<std::unique_ptr<sirius::pipeline::task_request>> task_request_publisher,
-  std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context)
+  std::shared_ptr<const telemetry::telemetry_context> telemetry_context)
   : sirius::parallel::itask_executor(config, std::move(telemetry_context)),
     _task_request_publisher(std::move(task_request_publisher)),
     _mem_mgr(mem_mgr)
@@ -358,7 +358,7 @@ std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
 
 void duckdb_scan_executor::manager_loop()
 {
-  sirius::telemetry::TaskManagerLoopThreadHandleWrapper manager_telemetry{
+  telemetry::TaskManagerLoopThreadHandleWrapper manager_telemetry{
     *_telemetry_context, fmt::format("{}-duckdb-scan-manager", _config.thread_name_prefix)};
   const auto manager_resource_id = manager_telemetry.uuid();
 
@@ -395,7 +395,7 @@ void duckdb_scan_executor::manager_loop()
     int target_gpu_id = select_target_gpu();
     if (scan_task) {
       scan_task->telemetry_handle()->routing({
-        .instance_name              = std::string(),
+        .instance_name              = "",
         .preferred_device_id        = target_gpu_id,
         .manager_thread_resource_id = manager_resource_id,
       });
@@ -440,7 +440,7 @@ void duckdb_scan_executor::manager_loop()
       }
       auto reservation_info = scan_task->get_estimated_reservation_size_info();
       scan_task->telemetry_handle()->reserving({
-        .instance_name              = std::string(),
+        .instance_name              = "",
         .requested_bytes            = reservation_info.reservation_size,
         .input_basis                = reservation_info.input_basis,
         .peak_estimate              = reservation_info.peak_memory_estimate,
@@ -469,7 +469,7 @@ void duckdb_scan_executor::manager_loop()
     } else if (scan_task && scan_task->is<duckdb_scan_task>()) {
       auto reservation_info = scan_task->get_estimated_reservation_size_info();
       scan_task->telemetry_handle()->reserving({
-        .instance_name              = std::string(),
+        .instance_name              = "",
         .requested_bytes            = reservation_info.reservation_size,
         .input_basis                = reservation_info.input_basis,
         .peak_estimate              = reservation_info.peak_memory_estimate,
@@ -488,7 +488,7 @@ void duckdb_scan_executor::manager_loop()
     } else if (scan_task && scan_task->is<cpu_source_task>()) {
       auto reservation_info = scan_task->get_estimated_reservation_size_info();
       scan_task->telemetry_handle()->reserving({
-        .instance_name              = std::string(),
+        .instance_name              = "",
         .requested_bytes            = reservation_info.reservation_size,
         .input_basis                = reservation_info.input_basis,
         .peak_estimate              = reservation_info.peak_memory_estimate,
@@ -557,28 +557,37 @@ void duckdb_scan_executor::manager_loop()
         try {
           auto consumers = scan_task->get_output_consumers();
           {
+            auto executor_thread_resource_id = uuid::new_nil();
+            if (telemetry::telemetry_thread_handle.has_value()) {
+              executor_thread_resource_id = telemetry::telemetry_thread_handle->uuid();
+            } else {
+              SIRIUS_LOG_ERROR(
+                "duckdb_scan_executor::manager_loop: executor thread telemetry handle is not "
+                "initialized before preparing scan task");
+            }
             scan_task->telemetry_handle()->preparing({
-              .instance_name = std::string(),
-              .target_tier   = std::string("SCAN"),
-              .executor_thread_resource_id =
-                sirius::telemetry::current_executor_thread_resource_id(),
+              .instance_name               = "",
+              .target_tier                 = "SCAN",
+              .executor_thread_resource_id = executor_thread_resource_id,
             });
+            scan_task->telemetry_handle()->computing({
+              .instance_name               = "",
+              .current_operator_id         = scan_task->get_source_operator_id(),
+              .input_bytes                 = 0,
+              .executor_thread_resource_id = executor_thread_resource_id,
+            });
+
             auto output_data = get_scan_output(scan_task, stream);
             stream->synchronize();
-            scan_task->telemetry_handle()->computing({
-              .instance_name       = std::string(),
-              .current_operator_id = scan_task->get_source_operator_id(),
-              .output_bytes        = output_data ? output_data->get_estimated_size_in_bytes() : 0,
-              .executor_thread_resource_id =
-                sirius::telemetry::current_executor_thread_resource_id(),
+
+            scan_task->telemetry_handle()->finalizing({
+              .instance_name = "",
+              .success       = true,
             });
+
             scan_task->publish_output(*output_data, stream);
           }
 
-          scan_task->telemetry_handle()->finalizing({
-            .instance_name = std::string(),
-            .success       = true,
-          });
           scan_task->telemetry_handle()->exit();
           scan_task->set_telemetry_finalized();
           t.reset();

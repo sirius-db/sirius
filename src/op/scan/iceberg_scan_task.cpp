@@ -110,7 +110,7 @@ iceberg_scan_task_global_state::init_data iceberg_scan_task_global_state::prepar
 iceberg_scan_task_global_state::iceberg_scan_task_global_state(
   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
   sirius_physical_iceberg_scan* scan_op,
-  std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context,
+  std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
   size_t approximate_batch_size,
   std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs)
   : iceberg_scan_task_global_state(std::move(pipeline),
@@ -133,7 +133,7 @@ iceberg_scan_task_global_state::iceberg_scan_task_global_state(
   init_data init,
   size_t approximate_batch_size,
   std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs,
-  std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context)
+  std::shared_ptr<const telemetry::telemetry_context> telemetry_context)
   : parquet_scan_task_global_state(std::move(pipeline),
                                    static_cast<sirius_physical_parquet_scan*>(scan_op),
                                    std::move(telemetry_context),

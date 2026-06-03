@@ -93,12 +93,12 @@ using batch_validator_t = void (*)(const std::vector<std::shared_ptr<cucascade::
 
 namespace {
 
-std::shared_ptr<const sirius::telemetry::telemetry_context> make_test_telemetry_context()
+std::shared_ptr<const telemetry::telemetry_context> make_test_telemetry_context()
 {
   sirius::telemetry_config config;
   config.enable_quent = false;
   config.engine_name  = "test-parquet-scan-task";
-  return sirius::telemetry::telemetry_context::create(config);
+  return telemetry::telemetry_context::create(config);
 }
 
 }  // namespace

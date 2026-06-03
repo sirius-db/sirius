@@ -80,7 +80,7 @@ class duckdb_scan_task_global_state : public pipeline::sirius_pipeline_task_glob
     pipeline::task_scheduler& pipeline_exec,
     duckdb::ClientContext& client_ctx,
     sirius_physical_duckdb_scan* scan_op,
-    std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context);
+    std::shared_ptr<const telemetry::telemetry_context> telemetry_context);
 
   //===----------Methods----------===//
   /**
