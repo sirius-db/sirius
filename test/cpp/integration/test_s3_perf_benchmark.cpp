@@ -16,7 +16,7 @@
 
 #include "catch.hpp"
 #include "io/prefetching_cache.hpp"
-#include "io/s3/s3_ioctx.hpp"
+#include "io/s3/s3_blocking_ioctx.hpp"
 #include "io/s3/s3_request_authorizer.hpp"
 #include "io/s3/sirius_sigv4_authorizer.hpp"
 
@@ -47,7 +47,7 @@
 
 using sirius::io::buffer_pool;
 using sirius::io::s3::s3_authorized_request;
-using sirius::io::s3::s3_ioctx;
+using sirius::io::s3::s3_blocking_ioctx;
 using sirius::io::s3::s3_ioctx_config;
 using sirius::io::s3::s3_object_ref;
 using sirius::io::s3::s3_request_authorizer;
@@ -146,13 +146,14 @@ class recording_request_authorizer final : public s3_request_authorizer {
   std::atomic<std::uint64_t> _get_count{0};
 };
 
-std::shared_ptr<s3_ioctx> make_bench_ioctx(std::shared_ptr<recording_request_authorizer> provider)
+std::shared_ptr<s3_blocking_ioctx> make_bench_ioctx(
+  std::shared_ptr<recording_request_authorizer> provider)
 {
   s3_ioctx_config cfg{};
   cfg.creds             = std::move(provider);
   cfg.max_connections   = 32;
   cfg.request_timeout_s = 600;
-  return std::make_shared<s3_ioctx>(std::move(cfg));
+  return std::make_shared<s3_blocking_ioctx>(std::move(cfg));
 }
 
 std::size_t cache_capacity_bytes(std::size_t block_size, std::uint32_t max_slabs)
@@ -205,7 +206,7 @@ std::unique_ptr<cudf::io::datasource::buffer> read_parquet_footer(cudf::io::data
   return source.host_read(file_size - footer_tail_size - footer_size, footer_size);
 }
 
-scan_measurement run_parquet_scan(s3_ioctx& ctx,
+scan_measurement run_parquet_scan(s3_blocking_ioctx& ctx,
                                   std::string const& path,
                                   std::vector<std::string> const& columns)
 {

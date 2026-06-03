@@ -168,7 +168,7 @@ bool parse_content_range(std::string_view v, std::size_t& start, std::size_t& en
 
 // Validate a 200/206 body actually covers the requested [offset, offset+size).
 // Returns an exception_ptr on anomaly (non-retriable wrong-bytes risk), else
-// nullptr. Mirrors the production s3_ioctx guard.
+// nullptr. Mirrors the s3_blocking_ioctx guard.
 std::exception_ptr validate_range(std::string_view bucket,
                                   std::string_view key,
                                   std::size_t offset,
@@ -938,7 +938,7 @@ bool s3_reactor::supports(std::string_view path)
 std::unique_ptr<s3_async_io_object> s3_reactor::create_io_object(std::string)
 {
   throw std::logic_error(
-    "s3_reactor::create_io_object: use s3_async_experimental_ioctx::create_io_object (needs an "
+    "s3_reactor::create_io_object: use s3_ioctx::create_io_object (needs an "
     "instance HEAD via the authorizer)");
 }
 

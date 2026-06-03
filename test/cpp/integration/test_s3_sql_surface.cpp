@@ -7,7 +7,7 @@
 
 #include "catch.hpp"
 #include "io/prefetching_cache.hpp"
-#include "io/s3/s3_async_experimental_ioctx.hpp"
+#include "io/s3/s3_blocking_ioctx.hpp"
 #include "io/s3/s3_ioctx.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
@@ -472,23 +472,22 @@ duckdb::SiriusContext& require_sirius_context(s3_sql_fixture& fixture)
   return *sirius_ctx;
 }
 
-sirius::io::s3::s3_ioctx& require_s3_ioctx(s3_sql_fixture& fixture, std::string const& uri)
+sirius::io::s3::s3_blocking_ioctx& require_s3_ioctx(s3_sql_fixture& fixture, std::string const& uri)
+{
+  auto& sirius_ctx = require_sirius_context(fixture);
+  auto* base_ctx   = sirius_ctx.get_scan_manager().io_ctx_for(uri);
+  REQUIRE(base_ctx != nullptr);
+  auto* s3_ctx = dynamic_cast<sirius::io::s3::s3_blocking_ioctx*>(base_ctx);
+  REQUIRE(s3_ctx != nullptr);
+  return *s3_ctx;
+}
+
+sirius::io::s3::s3_ioctx& require_async_s3_ioctx(s3_sql_fixture& fixture, std::string const& uri)
 {
   auto& sirius_ctx = require_sirius_context(fixture);
   auto* base_ctx   = sirius_ctx.get_scan_manager().io_ctx_for(uri);
   REQUIRE(base_ctx != nullptr);
   auto* s3_ctx = dynamic_cast<sirius::io::s3::s3_ioctx*>(base_ctx);
-  REQUIRE(s3_ctx != nullptr);
-  return *s3_ctx;
-}
-
-sirius::io::s3::s3_async_experimental_ioctx& require_async_s3_ioctx(s3_sql_fixture& fixture,
-                                                                    std::string const& uri)
-{
-  auto& sirius_ctx = require_sirius_context(fixture);
-  auto* base_ctx   = sirius_ctx.get_scan_manager().io_ctx_for(uri);
-  REQUIRE(base_ctx != nullptr);
-  auto* s3_ctx = dynamic_cast<sirius::io::s3::s3_async_experimental_ioctx*>(base_ctx);
   REQUIRE(s3_ctx != nullptr);
   return *s3_ctx;
 }
@@ -1233,8 +1232,8 @@ TEST_CASE("gpu_execution S3 SQL results match with the async backend flag",
 
   auto run_query = [&](bool use_async_backend) {
     s3_sql_fixture fixture(*env, {}, std::nullopt, use_async_backend);
-    std::uint64_t before_bytes                             = 0;
-    sirius::io::s3::s3_async_experimental_ioctx* async_ctx = nullptr;
+    std::uint64_t before_bytes          = 0;
+    sirius::io::s3::s3_ioctx* async_ctx = nullptr;
     if (use_async_backend) {
       async_ctx    = &require_async_s3_ioctx(fixture, uri);
       before_bytes = async_ctx->bytes_read_total();

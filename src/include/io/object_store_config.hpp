@@ -58,8 +58,8 @@ struct object_store_config {
   bool tls_verify = true;
 
   /// Select the async (libcurl-multi) S3 backend. Default true: the datasource
-  /// factory builds @c s3_async_experimental_ioctx (concurrent GETs + pipelined
-  /// device reads). Set false to fall back to the blocking @c s3_ioctx (a
+  /// factory builds @c s3_ioctx (concurrent GETs + pipelined
+  /// device reads). Set false to fall back to the blocking @c s3_blocking_ioctx (a
   /// per-request, serial-staging path) — the escape hatch if the async backend
   /// misbehaves against a particular store.
   bool s3_use_async_backend = true;

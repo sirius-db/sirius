@@ -175,9 +175,9 @@ set(EXTENSION_SOURCES
     src/io/io_context.cpp
     src/io/parquet_helpers.cpp
     src/io/prefetching_cache.cpp
-    src/io/s3/s3_ioctx.cpp
+    src/io/s3/s3_blocking_ioctx.cpp
     src/io/s3/s3_reactor.cpp
-    src/io/s3/s3_async_experimental_ioctx.cpp
+    src/io/s3/s3_ioctx.cpp
     src/io/s3/sigv4.cpp
     src/io/s3/sirius_sigv4_authorizer.cpp
     src/io/sirius_datasource.cpp
@@ -462,8 +462,8 @@ set(TEST_SOURCES
     test/cpp/integration/test_transparent_execution.cpp
     test/cpp/io/s3/test_sigv4.cpp
     test/cpp/io/s3/test_s3_default_visibility_guard.cpp
+    test/cpp/io/s3/test_s3_blocking_ioctx.cpp
     test/cpp/io/s3/test_s3_ioctx.cpp
-    test/cpp/io/s3/test_s3_async_experimental.cpp
     test/cpp/io/s3/test_sirius_sigv4_authorizer.cpp
     test/cpp/io/s3/test_static_credentials.cpp
     test/cpp/io/test_datasource_factory.cpp

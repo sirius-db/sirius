@@ -24,7 +24,7 @@
 #include "duckdb/planner/planner.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/prefetching_cache.hpp"
-#include "io/s3/s3_async_experimental_ioctx.hpp"
+#include "io/s3/s3_blocking_ioctx.hpp"
 #include "io/s3/s3_ioctx.hpp"
 #include "io/s3/sirius_sigv4_authorizer.hpp"
 #include "io/s3/static_credentials.hpp"
@@ -642,7 +642,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // reflects the actual S3 wiring -- get_scan_manager_config() must not report
   // s3_config == nullopt while a live S3 backend exists. The s3_ioctx_config
   // stored here carries credentials only; async_thread_pool stays null --
-  // SiriusContext (S6) injects its live s3_thread_pool_ into the s3_ioctx's own
+  // SiriusContext (S6) injects its live s3_thread_pool_ into the s3_blocking_ioctx's own
   // config copy when it builds the backend below.
   config_.set_scan_manager_config(std::move(sm_config));
   // S6 (NUMA) increment 1: SiriusContext owns the scan-side IO backends. Build
@@ -652,27 +652,26 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // gpu_ioctxs_ alias) and the s3_ioctx — so a repeated local read actually
   // hits the cache (it previously hung off a scan-manager-only uring). The
   // stored s3_config keeps async_thread_pool == nullptr; we inject our live
-  // s3_thread_pool_ into the s3_ioctx's own config copy here.
+  // s3_thread_pool_ into the s3_blocking_ioctx's own config copy here.
   auto const& scan_cfg = config_.get_scan_manager_config();
   if (scan_cfg.s3_config) {
     auto s3_cfg                 = *scan_cfg.s3_config;
     s3_cfg.host_memory_resource = host_fsmr;
     if (config_.object_store_config.s3_use_async_backend) {
-      // Experimental async backend (concurrent GETs + pipelined device reads).
+      // Async backend (default): concurrent GETs + pipelined device reads.
       // Its reactor owns the worker thread, so no s3_thread_pool is created. The
       // retry knobs are passed through so the async backend is config-equivalent
       // to the blocking one.
-      s3_ioctx_ =
-        std::make_shared<sirius::io::s3::s3_async_experimental_ioctx>(std::move(s3_cfg.creds),
-                                                                      s3_cfg.request_timeout_s,
-                                                                      s3_cfg.ca_bundle_path,
-                                                                      s3_cfg.tls_verify,
-                                                                      s3_cfg.max_connections,
-                                                                      host_fsmr,
-                                                                      s3_cfg.max_retry_attempts,
-                                                                      s3_cfg.retry_backoff_base,
-                                                                      s3_cfg.retry_jitter,
-                                                                      s3_cfg.honor_retry_after);
+      s3_ioctx_ = std::make_shared<sirius::io::s3::s3_ioctx>(std::move(s3_cfg.creds),
+                                                             s3_cfg.request_timeout_s,
+                                                             s3_cfg.ca_bundle_path,
+                                                             s3_cfg.tls_verify,
+                                                             s3_cfg.max_connections,
+                                                             host_fsmr,
+                                                             s3_cfg.max_retry_attempts,
+                                                             s3_cfg.retry_backoff_base,
+                                                             s3_cfg.retry_jitter,
+                                                             s3_cfg.honor_retry_after);
     } else {
       // Blocking backend (default): fan async work out over a dedicated pool.
       s3_thread_pool_ = std::make_unique<sirius::exec::static_thread_pool>(
@@ -680,7 +679,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
         scan_cfg.s3_thread_pool.thread_name_prefix,
         scan_cfg.s3_thread_pool.cpu_affinity_list);
       s3_cfg.async_thread_pool = s3_thread_pool_.get();
-      s3_ioctx_                = std::make_shared<sirius::io::s3::s3_ioctx>(std::move(s3_cfg));
+      s3_ioctx_ = std::make_shared<sirius::io::s3::s3_blocking_ioctx>(std::move(s3_cfg));
     }
   }
   if (scan_cfg.enable_prefetch_cache && host_fsmr != nullptr) {

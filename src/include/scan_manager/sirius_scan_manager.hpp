@@ -19,7 +19,7 @@
 #include "exec/config.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
-#include "io/s3/s3_ioctx.hpp"
+#include "io/s3/s3_blocking_ioctx.hpp"
 #include "scan_manager/split_provider.hpp"
 
 // Forward-declare sirius_ioctx via <io/types.hpp> for the gpu_ioctxs map type
@@ -112,7 +112,7 @@ struct scan_manager_config {
   /// is empty. Separate from the main @c thread_pool because S3 I/O has
   /// different concurrency characteristics (more threads, network-bound,
   /// not CPU-bound). Injected into @c s3_ioctx_config::async_thread_pool
-  /// before constructing the s3_ioctx so async S3 paths bypass detached
+  /// before constructing the s3_blocking_ioctx so async S3 paths bypass detached
   /// std::thread fallbacks.
   exec::thread_pool_config s3_thread_pool{.num_threads = 8, .thread_name_prefix = "s3_io"};
 };

@@ -28,8 +28,8 @@ namespace sirius::io::s3 {
  *
  * Stores bucket/key plus an object size cached at construction time. Size is
  * cached because the abstract @c size() is declared @c noexcept; the factory
- * (typically @c s3_ioctx::create_io_object) issues a HEAD request via
- * @c s3_ioctx::head_object_size before constructing this object.
+ * (typically @c s3_blocking_ioctx::create_io_object) issues a HEAD request via
+ * @c s3_blocking_ioctx::head_object_size before constructing this object.
  *
  * @c raw_file_cache_id() returns @c "s3://<bucket>/<key>" — distinct from local
  * file paths so the datasource-level prefetching cache does not collide across
@@ -41,9 +41,9 @@ namespace sirius::io::s3 {
  * @c raw_file_cache_id(); the two are kept distinct for forward compatibility
  * with versioned-key backends where a cache id may carry a version qualifier.
  */
-class s3_io_object final : public sirius_io_object {
+class s3_blocking_io_object final : public sirius_io_object {
  public:
-  s3_io_object(std::string bucket, std::string key, std::size_t size, std::string path)
+  s3_blocking_io_object(std::string bucket, std::string key, std::size_t size, std::string path)
     : _bucket(std::move(bucket)),
       _key(std::move(key)),
       _size(size),

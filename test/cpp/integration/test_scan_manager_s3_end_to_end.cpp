@@ -18,7 +18,7 @@
 #include "exec/thread_pool.hpp"
 #include "helper/logical_type.hpp"
 #include "io/prefetching_cache.hpp"
-#include "io/s3/s3_async_experimental_ioctx.hpp"
+#include "io/s3/s3_blocking_ioctx.hpp"
 #include "io/s3/s3_ioctx.hpp"
 #include "io/s3/sirius_sigv4_authorizer.hpp"
 #include "op/scan/parquet_scan_operator_data.hpp"
@@ -66,7 +66,7 @@
 
 using sirius::io::buffer_pool;
 using sirius::io::sirius_ioctx;
-using sirius::io::s3::s3_async_experimental_ioctx;
+using sirius::io::s3::s3_blocking_ioctx;
 using sirius::io::s3::s3_ioctx;
 using sirius::io::s3::s3_ioctx_config;
 using sirius::io::s3::sirius_sigv4_presigned_authorizer;
@@ -254,7 +254,7 @@ sirius_scan_manager make_scan_manager(s3_test_env const& env,
   auto gpu_ioctxs = sirius::scan_test_utils::make_test_gpu_ioctxs(1);
   REQUIRE_FALSE(gpu_ioctxs.empty());
   borrowed_ioctxs.push_back(gpu_ioctxs.begin()->second);
-  borrowed_ioctxs.push_back(std::make_shared<s3_ioctx>(std::move(s3_cfg)));
+  borrowed_ioctxs.push_back(std::make_shared<s3_blocking_ioctx>(std::move(s3_cfg)));
 
   return sirius_scan_manager(std::move(cfg), std::move(borrowed_ioctxs));
 }
@@ -361,8 +361,8 @@ TEST_CASE("SiriusContext selects the configured S3 backend implementation",
     {
       auto s3_ctx = context.get_s3_ioctx();
       REQUIRE(s3_ctx != nullptr);
-      CHECK(dynamic_cast<s3_async_experimental_ioctx*>(s3_ctx.get()) != nullptr);
-      CHECK(dynamic_cast<s3_ioctx*>(s3_ctx.get()) == nullptr);
+      CHECK(dynamic_cast<s3_ioctx*>(s3_ctx.get()) != nullptr);
+      CHECK(dynamic_cast<s3_blocking_ioctx*>(s3_ctx.get()) == nullptr);
     }
 
     context.terminate();
@@ -378,8 +378,8 @@ TEST_CASE("SiriusContext selects the configured S3 backend implementation",
     {
       auto s3_ctx = context.get_s3_ioctx();
       REQUIRE(s3_ctx != nullptr);
-      CHECK(dynamic_cast<s3_ioctx*>(s3_ctx.get()) != nullptr);
-      CHECK(dynamic_cast<s3_async_experimental_ioctx*>(s3_ctx.get()) == nullptr);
+      CHECK(dynamic_cast<s3_blocking_ioctx*>(s3_ctx.get()) != nullptr);
+      CHECK(dynamic_cast<s3_ioctx*>(s3_ctx.get()) == nullptr);
     }
 
     context.terminate();
@@ -396,8 +396,8 @@ TEST_CASE("SiriusContext selects the configured S3 backend implementation",
     {
       auto s3_ctx = context.get_s3_ioctx();
       REQUIRE(s3_ctx != nullptr);
-      CHECK(dynamic_cast<s3_async_experimental_ioctx*>(s3_ctx.get()) != nullptr);
-      CHECK(dynamic_cast<s3_ioctx*>(s3_ctx.get()) == nullptr);
+      CHECK(dynamic_cast<s3_ioctx*>(s3_ctx.get()) != nullptr);
+      CHECK(dynamic_cast<s3_blocking_ioctx*>(s3_ctx.get()) == nullptr);
       raw_s3_ctx = s3_ctx.get();
     }
     CHECK(context.get_scan_manager().io_ctx_for(s3_uri(env->bucket, "parquet/nation.parquet")) ==
@@ -424,7 +424,7 @@ TEST_CASE("SiriusContext tears down cleanly with the async S3 backend selected",
   {
     auto s3_ctx = context.get_s3_ioctx();
     REQUIRE(s3_ctx != nullptr);
-    REQUIRE(dynamic_cast<s3_async_experimental_ioctx*>(s3_ctx.get()) != nullptr);
+    REQUIRE(dynamic_cast<s3_ioctx*>(s3_ctx.get()) != nullptr);
   }
 
   context.terminate();
@@ -464,7 +464,7 @@ TEST_CASE("async S3 backend single-chunk device read matches the blocking backen
     {
       auto s3_ctx = context.get_s3_ioctx();
       REQUIRE(s3_ctx != nullptr);
-      REQUIRE(dynamic_cast<s3_ioctx*>(s3_ctx.get()) != nullptr);
+      REQUIRE(dynamic_cast<s3_blocking_ioctx*>(s3_ctx.get()) != nullptr);
     }
     blocking_bytes = read_s3_object_to_device(context, uri, oracle.size());
     context.terminate();
@@ -479,7 +479,7 @@ TEST_CASE("async S3 backend single-chunk device read matches the blocking backen
     {
       auto s3_ctx = context.get_s3_ioctx();
       REQUIRE(s3_ctx != nullptr);
-      REQUIRE(dynamic_cast<s3_async_experimental_ioctx*>(s3_ctx.get()) != nullptr);
+      REQUIRE(dynamic_cast<s3_ioctx*>(s3_ctx.get()) != nullptr);
     }
     async_bytes = read_s3_object_to_device(context, uri, oracle.size());
     context.terminate();
@@ -542,7 +542,7 @@ TEST_CASE("scan_manager S3 end-to-end routes parquet_split_provider through S3 i
     for (auto const& slice : split->rg_slices) {
       CHECK(slice.file_path == path);
       CHECK(slice.io_ctx.get() == manager.io_ctx_for(path));
-      CHECK(dynamic_cast<s3_ioctx*>(slice.io_ctx.get()) != nullptr);
+      CHECK(dynamic_cast<s3_blocking_ioctx*>(slice.io_ctx.get()) != nullptr);
       CHECK(slice.io_object != nullptr);
     }
   }

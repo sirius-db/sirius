@@ -7,7 +7,7 @@
 
 #include "catch.hpp"
 #include "io/prefetching_cache.hpp"
-#include "io/s3/s3_async_experimental_ioctx.hpp"
+#include "io/s3/s3_blocking_ioctx.hpp"
 #include "io/s3/s3_ioctx.hpp"
 #include "io/s3/sirius_sigv4_authorizer.hpp"
 #include "scan_manager/parquet_metadata.hpp"
@@ -39,7 +39,7 @@ using sirius::io::buffer_pool;
 using sirius::io::sirius_io_object;
 using sirius::io::sirius_ioctx;
 using sirius::io::uring_ioctx;
-using sirius::io::s3::s3_async_experimental_ioctx;
+using sirius::io::s3::s3_blocking_ioctx;
 using sirius::io::s3::s3_ioctx;
 using sirius::io::s3::s3_ioctx_config;
 using sirius::io::s3::sirius_sigv4_presigned_authorizer;
@@ -109,16 +109,16 @@ bool skip_if_no_s3_env(std::optional<s3_test_env> const& env)
 
 bool is_s3_backend(sirius_ioctx* ctx)
 {
-  return dynamic_cast<s3_ioctx*>(ctx) != nullptr ||
-         dynamic_cast<s3_async_experimental_ioctx*>(ctx) != nullptr;
+  return dynamic_cast<s3_blocking_ioctx*>(ctx) != nullptr ||
+         dynamic_cast<s3_ioctx*>(ctx) != nullptr;
 }
 
 std::uint64_t bytes_read_total(sirius_ioctx* ctx)
 {
-  if (auto* blocking = dynamic_cast<s3_ioctx*>(ctx)) { return blocking->bytes_read_total(); }
-  if (auto* async = dynamic_cast<s3_async_experimental_ioctx*>(ctx)) {
-    return async->bytes_read_total();
+  if (auto* blocking = dynamic_cast<s3_blocking_ioctx*>(ctx)) {
+    return blocking->bytes_read_total();
   }
+  if (auto* async = dynamic_cast<s3_ioctx*>(ctx)) { return async->bytes_read_total(); }
   FAIL("expected an S3 ioctx backend");
   return 0;
 }

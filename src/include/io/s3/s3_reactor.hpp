@@ -52,7 +52,7 @@ namespace sirius::io::s3 {
 /// host/device read request so the object outlives the async transfer — the
 /// templated_ioctx async path copies the native handle into each request and
 /// does NOT capture the io_object's shared_ptr (unlike the synchronous
-/// production s3_ioctx). string_view handles would dangle; a shared_ptr does
+/// s3_blocking_ioctx). string_view handles would dangle; a shared_ptr does
 /// not.
 struct s3_object_state {
   std::string bucket;
@@ -63,8 +63,8 @@ struct s3_object_state {
 /// The native handle the reactor carries per request.
 using s3_native_handle = std::shared_ptr<const s3_object_state>;
 
-/// Experimental S3 io_object for the async-curl backend. Distinct from the
-/// production @c s3_io_object. Satisfies templated_ioctx's @c io_object_c
+/// S3 io_object for the async-curl backend. Distinct from the
+/// blocking @c s3_blocking_io_object. Satisfies templated_ioctx's @c io_object_c
 /// (host_handle/device_handle returning @c s3_native_handle).
 class s3_async_io_object : public sirius_io_object {
  public:
@@ -153,7 +153,7 @@ class s3_reactor {
   [[nodiscard]] static bool supports(std::string_view path);
 
   /// Present only to satisfy the concept's compile — the sole legal entry for
-  /// building an io_object is @c s3_async_experimental_ioctx::create_io_object
+  /// building an io_object is @c s3_ioctx::create_io_object
   /// (it needs an instance HEAD via the authorizer). Always throws.
   static std::unique_ptr<s3_async_io_object> create_io_object(std::string path);
 
