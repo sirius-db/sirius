@@ -31,13 +31,23 @@ namespace {
 // `substring` and `substr` are DuckDB-side aliases for the same function id,
 // so this table has one extra entry beyond the enum cardinality.
 // Linear scan; called once per BoundFunctionExpression at executor entry.
-constexpr std::array<std::pair<std::string_view, function_id>, 28> kForwardTable = {{
+constexpr std::array<std::pair<std::string_view, function_id>, 33> kForwardTable = {{
   {"+", function_id::add},
   {"-", function_id::sub},
   {"*", function_id::mul},
   {"/", function_id::div},
   {"//", function_id::int_div},
   {"%", function_id::mod},
+  // Substrait long-form arithmetic names. The DuckDB substrait extension binds
+  // arithmetic as these names (not the operator symbols), so plans arriving via
+  // gpu_execution_substrait reach the executor as "multiply"/"add"/etc. These
+  // are non-canonical aliases for the symbol entries above (same pattern as
+  // substr/substring); the reverse table keeps the symbol as canonical.
+  {"multiply", function_id::mul},
+  {"add", function_id::add},
+  {"subtract", function_id::sub},
+  {"divide", function_id::div},
+  {"modulus", function_id::mod},
   {"substring", function_id::substring},  // canonical name
   {"substr", function_id::substring},     // alias
   {"~~", function_id::like},
@@ -77,8 +87,9 @@ static_assert(static_cast<std::size_t>(function_id::error) + 1 == 27,
               "function_id::error must be the last entry; cardinality locked at 27.");
 static_assert(kReverseTable.size() == 27,
               "kReverseTable must have one slot per function_id value.");
-static_assert(kForwardTable.size() == 28,
-              "kForwardTable has one extra entry for the substring/substr alias.");
+static_assert(kForwardTable.size() == 33,
+              "kForwardTable has non-canonical aliases beyond the 27 enum ids: substr (1) and "
+              "the Substrait long-form arithmetic names multiply/add/subtract/divide/modulus (5).");
 
 // Walks both tables to ensure every enum value has exactly one canonical
 // forward entry whose name matches the reverse table at the same index.
