@@ -38,10 +38,6 @@ namespace creator {
 class task_creator;
 }  // namespace creator
 
-namespace telemetry {
-class telemetry_context;
-}  // namespace telemetry
-
 namespace pipeline {
 
 class sirius_pipeline;
@@ -180,10 +176,6 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   [[nodiscard]] std::unique_lock<std::mutex> get_task_creation_lock();
 
   [[nodiscard]] uuid::UUID pipeline_uuid() const { return _pipeline_uuid; }
-  [[nodiscard]] const telemetry::telemetry_context* telemetry_context() const noexcept
-  {
-    return build_ctx_.telemetry_context;
-  }
 
  private:
   //! Whether or not the pipeline has been readied

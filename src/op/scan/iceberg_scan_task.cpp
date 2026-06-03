@@ -110,9 +110,14 @@ iceberg_scan_task_global_state::iceberg_scan_task_global_state(
   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
   sirius_physical_iceberg_scan* scan_op,
   size_t approximate_batch_size,
-  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs)
-  : iceberg_scan_task_global_state(
-      std::move(pipeline), scan_op, prepare(scan_op), approximate_batch_size, std::move(gpu_ioctxs))
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs,
+  const sirius::telemetry::telemetry_context* telemetry_context)
+  : iceberg_scan_task_global_state(std::move(pipeline),
+                                   scan_op,
+                                   prepare(scan_op),
+                                   approximate_batch_size,
+                                   std::move(gpu_ioctxs),
+                                   telemetry_context)
 {
   // Propagate hive partition info to the base class so it can build
   // the partition injection function (same as the public constructor does).
@@ -126,13 +131,15 @@ iceberg_scan_task_global_state::iceberg_scan_task_global_state(
   sirius_physical_iceberg_scan* scan_op,
   init_data init,
   size_t approximate_batch_size,
-  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs)
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs,
+  const sirius::telemetry::telemetry_context* telemetry_context)
   : parquet_scan_task_global_state(std::move(pipeline),
                                    static_cast<sirius_physical_parquet_scan*>(scan_op),
                                    std::move(init.file_paths),
                                    std::move(init.selected_column_indices),
                                    approximate_batch_size,
-                                   std::move(gpu_ioctxs))
+                                   std::move(gpu_ioctxs),
+                                   telemetry_context)
 {
   build_delete_pipeline(scan_op, init.extra_eq_delete_columns);
 }

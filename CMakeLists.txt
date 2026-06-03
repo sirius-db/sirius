@@ -239,7 +239,6 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_table_scan.cpp
     src/op/sirius_physical_top_n.cpp
     src/op/sirius_physical_ungrouped_aggregate.cpp
-    src/parallel/task.cpp
     src/parallel/task_executor.cpp
     src/pipeline/gpu_pipeline_executor.cpp
     src/pipeline/gpu_pipeline_task.cpp

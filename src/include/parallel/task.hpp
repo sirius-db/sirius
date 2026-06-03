@@ -90,7 +90,7 @@ class itask {
   {
   }
 
-  virtual ~itask();
+  virtual ~itask() = default;
 
   // Non-copyable and non-movable. Tasks are moved by unique_ptr, not by object move.
   itask(const itask&)            = delete;

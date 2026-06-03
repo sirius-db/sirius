@@ -45,8 +45,9 @@ duckdb_scan_task_global_state::duckdb_scan_task_global_state(
   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
   pipeline::task_scheduler& pipeline_exec,
   duckdb::ClientContext& client_ctx,
-  sirius_physical_duckdb_scan* scan_op)
-  : sirius_pipeline_task_global_state(pipeline),
+  sirius_physical_duckdb_scan* scan_op,
+  const sirius::telemetry::telemetry_context* telemetry_context)
+  : sirius_pipeline_task_global_state(pipeline, telemetry_context),
     _sirius_ctx(client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state").get()),
     _max_threads(pipeline_exec.get_scan_executor().get_num_threads()),
     _task_scheduler(pipeline_exec),

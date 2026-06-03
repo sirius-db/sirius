@@ -60,9 +60,12 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
    * @brief Construct a new sirius_pipeline_task_global_state object
    *
    * @param pipeline Shared pointer to the GPU pipeline to execute
+   * @param telemetry_context SiriusContext-wide telemetry context for task events
    */
-  explicit sirius_pipeline_task_global_state(duckdb::shared_ptr<sirius_pipeline> pipeline)
-    : _pipeline(std::move(pipeline))
+  explicit sirius_pipeline_task_global_state(
+    duckdb::shared_ptr<sirius_pipeline> pipeline,
+    const telemetry::telemetry_context* telemetry_context = nullptr)
+    : _pipeline(std::move(pipeline)), _telemetry_context(telemetry_context)
   {
   }
 
@@ -82,7 +85,7 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
 
   [[nodiscard]] const telemetry::telemetry_context* telemetry_context() const noexcept
   {
-    return _pipeline ? _pipeline->telemetry_context() : nullptr;
+    return _telemetry_context;
   }
 
   /**
@@ -113,8 +116,9 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
 
  private:
   duckdb::shared_ptr<sirius_pipeline> _pipeline;  ///< Shared pointer to the GPU pipeline to execute
-  pipeline_memory_history _memory_history;        ///< Historical memory metrics for estimation
-  std::optional<int> _preferred_device_id;        ///< Pipeline-level preferred GPU device
+  const telemetry::telemetry_context* const _telemetry_context;  ///< SiriusContext telemetry
+  pipeline_memory_history _memory_history;  ///< Historical memory metrics for estimation
+  std::optional<int> _preferred_device_id;  ///< Pipeline-level preferred GPU device
 };
 
 /**

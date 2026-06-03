@@ -92,6 +92,13 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
   _gpu_operator_global_state_map.clear();
 
   const auto& pipelines = query.get_pipelines();
+  duckdb::SiriusContext* sirius_ctx{nullptr};
+  if (_client_context != nullptr && _client_context->registered_state != nullptr) {
+    sirius_ctx =
+      _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state").get();
+  }
+  const auto* telemetry_context = sirius_ctx ? &sirius_ctx->get_telemetry_context() : nullptr;
+
   for (const auto& pipeline : pipelines) {
     // Give each pipeline a pointer to this task_creator so that when a pipeline
     // finishes (including via downstream notification), it can schedule output consumers.
@@ -107,7 +114,8 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
         pipeline,
         *_task_scheduler,
         *_client_context,
-        &source_operator->Cast<op::sirius_physical_duckdb_scan>());
+        &source_operator->Cast<op::sirius_physical_duckdb_scan>(),
+        telemetry_context);
       _scan_operator_global_state_map.emplace(operator_id, std::move(global_state));
     } else if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
       auto it = _parquet_scan_operator_global_state_map.find(operator_id);
@@ -116,20 +124,22 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
       } else {
         // Scan tasks look up the ioctx for their preferred_device_id in
         // compute_task() — the map is copied into global_state.
-        auto* sirius_ctx =
-          _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state").get();
+        if (!sirius_ctx) {
+          throw std::runtime_error("Sirius context is required to prepare parquet scan tasks");
+        }
         const auto& op_params = sirius_ctx->get_config().get_operator_params();
         auto gpu_ioctxs       = sirius_ctx->get_gpu_ioctxs();
         auto global_state     = std::make_shared<op::scan::parquet_scan_task_global_state>(
           pipeline,
           &source_operator->Cast<op::sirius_physical_parquet_scan>(),
           op_params.scan_task_batch_size,
-          std::move(gpu_ioctxs));
+          std::move(gpu_ioctxs),
+          telemetry_context);
         _parquet_scan_operator_global_state_map.emplace(operator_id, std::move(global_state));
       }
     } else if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::CPU_SOURCE) {
       auto global_state = std::make_shared<op::scan::cpu_source_task_global_state>(
-        pipeline, &source_operator->Cast<op::sirius_physical_cpu_source>());
+        pipeline, &source_operator->Cast<op::sirius_physical_cpu_source>(), telemetry_context);
       _cpu_source_operator_global_state_map.emplace(operator_id, std::move(global_state));
     } else if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
       SIRIUS_LOG_INFO("[task_creator::prepare_for_query] ICEBERG_SCAN operator_id={}", operator_id);
@@ -144,19 +154,22 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
         // Iceberg delete-file reads bypass sirius_datasource (they go through
         // DuckDB read_parquet / cudf's bundled file_source). Multi-GPU
         // residency for iceberg metadata + delete-file reads is deferred.
-        auto* sirius_ctx =
-          _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state").get();
+        if (!sirius_ctx) {
+          throw std::runtime_error("Sirius context is required to prepare iceberg scan tasks");
+        }
         const auto& op_params = sirius_ctx->get_config().get_operator_params();
         auto gpu_ioctxs       = sirius_ctx->get_gpu_ioctxs();
         auto global_state     = std::make_shared<op::scan::iceberg_scan_task_global_state>(
           pipeline,
           &source_operator->Cast<op::sirius_physical_iceberg_scan>(),
           op_params.scan_task_batch_size,
-          std::move(gpu_ioctxs));
+          std::move(gpu_ioctxs),
+          telemetry_context);
         _parquet_scan_operator_global_state_map.emplace(operator_id, std::move(global_state));
       }
     } else {
-      auto gs = std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline);
+      auto gs =
+        std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline, telemetry_context);
       _gpu_operator_global_state_map.emplace(operator_id, std::move(gs));
     }
   }

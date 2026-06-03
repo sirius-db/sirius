@@ -74,10 +74,12 @@ class duckdb_scan_task_global_state : public pipeline::sirius_pipeline_task_glob
    * @param[in] client_ctx The DuckDB client context
    * @param[in] gpu_pts The GPU physical table scan being executed
    */
-  duckdb_scan_task_global_state(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
-                                pipeline::task_scheduler& pipeline_exec,
-                                duckdb::ClientContext& client_ctx,
-                                sirius_physical_duckdb_scan* scan_op);
+  duckdb_scan_task_global_state(
+    duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
+    pipeline::task_scheduler& pipeline_exec,
+    duckdb::ClientContext& client_ctx,
+    sirius_physical_duckdb_scan* scan_op,
+    const sirius::telemetry::telemetry_context* telemetry_context = nullptr);
 
   //===----------Methods----------===//
   /**
