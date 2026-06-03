@@ -68,6 +68,31 @@ fn slot(id: i32, tuple_id: i32, column_pos: i32, name: &str, ty: TTypeDesc) -> T
     )
 }
 
+/// Builds a StarRocks table descriptor, threading only the fields these tests vary.
+fn table_descriptor(id: i64, db: &str, name: &str, num_cols: i32) -> TTableDescriptor {
+    TTableDescriptor::new(
+        id,
+        TTableType::HDFS_TABLE,
+        num_cols,
+        0,
+        name.to_string(),
+        db.to_string(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
 /// Builds a minimal descriptor table with the shared `tpch.users` table descriptor.
 fn desc_table(tuples: Vec<(i32, Option<i64>)>, slots: Vec<TSlotDescriptor>) -> TDescriptorTable {
     TDescriptorTable::new(
@@ -78,27 +103,7 @@ fn desc_table(tuples: Vec<(i32, Option<i64>)>, slots: Vec<TSlotDescriptor>) -> T
                 TTupleDescriptor::new(Some(tuple_id), None, None, table_id, None)
             })
             .collect(),
-        Some(vec![TTableDescriptor::new(
-            100,
-            TTableType::HDFS_TABLE,
-            2,
-            0,
-            "users".to_string(),
-            "tpch".to_string(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )]),
+        Some(vec![table_descriptor(100, "tpch", "users", 2)]),
         None,
     )
 }
@@ -976,27 +981,7 @@ fn desc_with_db(db: &str) -> TDescriptorTable {
             scalar_type(TPrimitiveType::BIGINT),
         )]),
         vec![TTupleDescriptor::new(Some(0), None, None, Some(7), None)],
-        Some(vec![TTableDescriptor::new(
-            7,
-            TTableType::HDFS_TABLE,
-            1,
-            0,
-            "t".to_string(),
-            db.to_string(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )]),
+        Some(vec![table_descriptor(7, db, "t", 1)]),
         None,
     )
 }
