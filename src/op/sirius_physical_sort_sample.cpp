@@ -189,7 +189,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
       size_t max_partition_bytes   = _max_partition_bytes_override > 0
                                        ? _max_partition_bytes_override
                                        : static_cast<size_t>(static_cast<double>(available_memory) *
-                                                           MAX_PARTITION_MEMORY_FRACTION);
+                                                           _max_partition_memory_fraction);
 
       if (max_partition_bytes > 0 && estimated_total_bytes > max_partition_bytes) {
         num_parts = (estimated_total_bytes + max_partition_bytes - 1) / max_partition_bytes;
