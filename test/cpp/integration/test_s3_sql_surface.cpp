@@ -7,7 +7,6 @@
 
 #include "catch.hpp"
 #include "io/prefetching_cache.hpp"
-#include "io/s3/s3_blocking_ioctx.hpp"
 #include "io/s3/s3_ioctx.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
@@ -470,16 +469,6 @@ duckdb::SiriusContext& require_sirius_context(s3_sql_fixture& fixture)
     fixture.con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
   REQUIRE(sirius_ctx);
   return *sirius_ctx;
-}
-
-sirius::io::s3::s3_blocking_ioctx& require_s3_ioctx(s3_sql_fixture& fixture, std::string const& uri)
-{
-  auto& sirius_ctx = require_sirius_context(fixture);
-  auto* base_ctx   = sirius_ctx.get_scan_manager().io_ctx_for(uri);
-  REQUIRE(base_ctx != nullptr);
-  auto* s3_ctx = dynamic_cast<sirius::io::s3::s3_blocking_ioctx*>(base_ctx);
-  REQUIRE(s3_ctx != nullptr);
-  return *s3_ctx;
 }
 
 sirius::io::s3::s3_ioctx& require_async_s3_ioctx(s3_sql_fixture& fixture, std::string const& uri)
@@ -1545,7 +1534,7 @@ TEST_CASE("gpu_execution large S3 lineitem count matches the local parquet oracl
   auto large = read_large_lineitem_fixture(fixture, *env);
   if (!large) { return; }
 
-  auto& s3_ctx              = require_s3_ioctx(fixture, large->uri);
+  auto& s3_ctx              = require_async_s3_ioctx(fixture, large->uri);
   auto const expected_rows  = local_parquet_file_row_count(large->local_path);
   auto const before_bytes   = s3_ctx.bytes_read_total();
   auto const s3_count_query = "SELECT count(l_orderkey) FROM " + s3_large_lineitem_scan(*env);
@@ -1623,7 +1612,7 @@ TEST_CASE("gpu_execution large S3 lineitem TPC-H Q1 shape matches local CPU",
   auto large = read_large_lineitem_fixture(fixture, *env);
   if (!large) { return; }
 
-  auto& s3_ctx              = require_s3_ioctx(fixture, large->uri);
+  auto& s3_ctx              = require_async_s3_ioctx(fixture, large->uri);
   auto const before_bytes   = s3_ctx.bytes_read_total();
   auto const before_borrows = s3_ctx.fsmr_borrows_total();
   auto const s3_query       = tpch_q1_shape_query(s3_large_lineitem_scan(*env));
@@ -1689,7 +1678,7 @@ TEST_CASE("gpu_execution large S3 lineitem count stays within byte budget withou
   auto large = read_large_lineitem_fixture(fixture, *env);
   if (!large) { return; }
 
-  auto& s3_ctx = require_s3_ioctx(fixture, large->uri);
+  auto& s3_ctx = require_async_s3_ioctx(fixture, large->uri);
   REQUIRE(s3_ctx.cache() != nullptr);
   auto const expected_rows       = local_parquet_file_row_count(large->local_path);
   auto const before_bytes        = s3_ctx.bytes_read_total();
@@ -1803,7 +1792,7 @@ TEST_CASE("B1 Phase 3a cache-mode bench records SF10 S3 SQL telemetry",
                                             s3_parquet_scan(*env, "orders"))},
         }};
 
-        auto& s3_ctx = require_s3_ioctx(fixture, large->uri);
+        auto& s3_ctx = require_async_s3_ioctx(fixture, large->uri);
         auto* cache  = s3_ctx.cache();
         if (config.expects_cache) {
           REQUIRE(cache != nullptr);
