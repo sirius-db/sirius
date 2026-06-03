@@ -110,6 +110,88 @@ constexpr size_t EXCHANGE_GPU_CACHE_SIZE = 512ULL * 1024ULL * 1024ULL;
 constexpr size_t EXCHANGE_GPU_PROCESSING_SIZE = 512ULL * 1024ULL * 1024ULL;
 constexpr size_t EXCHANGE_CPU_PROCESSING_SIZE = 512ULL * 1024ULL * 1024ULL;
 
+string PackedExchangeColumnSqlType(const cudf::column_view& col)
+{
+  switch (col.type().id()) {
+    case cudf::type_id::INT8: return "TINYINT";
+    case cudf::type_id::INT16: return "SMALLINT";
+    case cudf::type_id::INT32: return "INTEGER";
+    case cudf::type_id::INT64: return "BIGINT";
+    case cudf::type_id::FLOAT32: return "FLOAT";
+    case cudf::type_id::FLOAT64: return "DOUBLE";
+    case cudf::type_id::BOOL8: return "BOOLEAN";
+    case cudf::type_id::STRING: return "VARCHAR";
+    case cudf::type_id::TIMESTAMP_DAYS: return "DATE";
+    case cudf::type_id::TIMESTAMP_SECONDS:
+    case cudf::type_id::TIMESTAMP_MILLISECONDS:
+    case cudf::type_id::TIMESTAMP_MICROSECONDS:
+    case cudf::type_id::TIMESTAMP_NANOSECONDS:
+      return "TIMESTAMP";
+    case cudf::type_id::DECIMAL32:
+    case cudf::type_id::DECIMAL64:
+    case cudf::type_id::DECIMAL128: {
+      int prec = (col.type().id() == cudf::type_id::DECIMAL32) ? 9 :
+                 (col.type().id() == cudf::type_id::DECIMAL64) ? 18 : 38;
+      return "DECIMAL(" + std::to_string(prec) + "," +
+             std::to_string(-col.type().scale()) + ")";
+    }
+    default:
+      return "VARCHAR";
+  }
+}
+
+cudf::table_view ApplyPackedExchangeProjection(
+  cudf::table_view view,
+  const std::vector<int32_t>& projection_indices)
+{
+  if (projection_indices.empty()) {
+    return view;
+  }
+
+  std::vector<cudf::column_view> projected_columns;
+  projected_columns.reserve(projection_indices.size());
+  for (auto idx : projection_indices) {
+    if (idx < 0 || idx >= view.num_columns()) {
+      throw InvalidInputException(
+        "projection index %d out of range for packed table with %d columns",
+        idx,
+        view.num_columns());
+    }
+    projected_columns.push_back(view.column(idx));
+  }
+  return cudf::table_view(projected_columns);
+}
+
+string PackedExchangeCreateTableSql(const string& table_name, cudf::table_view view)
+{
+  string col_defs;
+  for (int c = 0; c < view.num_columns(); c++) {
+    if (c > 0) col_defs += ", ";
+    col_defs += "\"col_" + std::to_string(c) + "\" " +
+                PackedExchangeColumnSqlType(view.column(c));
+  }
+  return "CREATE OR REPLACE TABLE \"" + table_name + "\" (" + col_defs + ")";
+}
+
+bool TryGetPendingPackedExchangeView(
+  const string& table_name,
+  cudf::table_view& view,
+  int& num_rows_out)
+{
+  SiriusExtension::EnsureExchangeBufferManager();
+  auto& mgr = GPUBufferManager::GetInstance();
+  string up = table_name;
+  transform(up.begin(), up.end(), up.begin(), ::toupper);
+  auto it = mgr.tables.find(up);
+  if (it == mgr.tables.end() || !it->second || it->second->pending_views.empty()) {
+    return false;
+  }
+
+  view = it->second->pending_views.back();
+  num_rows_out = static_cast<int>(it->second->pending_total_rows);
+  return true;
+}
+
 unique_ptr<QueryResult> run_internal_cpu_fallback_query(ClientContext& context,
                                                         Connection& connection,
                                                         const string& query,
@@ -1770,7 +1852,8 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
 
   // sirius_register_packed_table(table_name VARCHAR, gpu_addr BIGINT, gpu_size BIGINT, metadata BLOB)
   // sirius_register_projected_packed_table(..., projection_indices INTEGER[])
-  // Unpacks a cudf::pack()'d GPU buffer and registers it as a DuckDB table.
+  // Returns schema SQL for a cudf::pack()'d GPU buffer already registered via
+  // sirius_register_packed_table_direct.
   // The projected variant reorders/selects columns zero-copy before DuckDB
   // sees the exchange table, which lets same-process local exchange stay on GPU
   // while still honoring the Doris exchange contract.
@@ -1794,61 +1877,18 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
       auto* gpu_ptr = reinterpret_cast<uint8_t*>(gpu_addr);
       std::vector<int32_t> projection_indices;
 
-      SIRIUS_LOG_INFO("[register_packed_table] table={} gpu=0x{:x} size={} md_size={} projection_cols={}",
+      SIRIUS_LOG_INFO("[register_packed_table] bind table={} gpu=0x{:x} size={} md_size={} projection_cols={}",
                       table_name, gpu_addr, gpu_size, md_blob.size(), projection_indices.size());
 
-      int num_cols = 0, num_rows_out = 0;
-      SiriusExtension::EnsureExchangeBufferManager();
-      auto& mgr = GPUBufferManager::GetInstance();
-      mgr.registerExternalTablePacked(table_name,
-                                      gpu_ptr,
-                                      gpu_size,
-                                      std::move(md_blob),
-                                      projection_indices,
-                                      num_cols,
-                                      num_rows_out);
-
       cudf::table_view view;
-      string up = table_name;
-      transform(up.begin(), up.end(), up.begin(), ::toupper);
-      auto it = mgr.tables.find(up);
-      if (it != mgr.tables.end() && !it->second->pending_views.empty()) {
-        view = it->second->pending_views.back();
-        num_cols = view.num_columns();
+      int num_rows_out = 0;
+      if (!TryGetPendingPackedExchangeView(table_name, view, num_rows_out)) {
+        auto raw_view = cudf::unpack(reinterpret_cast<const uint8_t*>(md_blob.data()), gpu_ptr);
+        view = ApplyPackedExchangeProjection(raw_view, projection_indices);
+        num_rows_out = static_cast<int>(view.num_rows());
       }
 
-      string col_defs;
-      for (int c = 0; c < num_cols; c++) {
-        if (c > 0) col_defs += ", ";
-        auto col = view.column(c);
-        string dtype;
-        switch (col.type().id()) {
-          case cudf::type_id::INT8: dtype = "TINYINT"; break;
-          case cudf::type_id::INT16: dtype = "SMALLINT"; break;
-          case cudf::type_id::INT32: dtype = "INTEGER"; break;
-          case cudf::type_id::INT64: dtype = "BIGINT"; break;
-          case cudf::type_id::FLOAT32: dtype = "FLOAT"; break;
-          case cudf::type_id::FLOAT64: dtype = "DOUBLE"; break;
-          case cudf::type_id::BOOL8: dtype = "BOOLEAN"; break;
-          case cudf::type_id::STRING: dtype = "VARCHAR"; break;
-          case cudf::type_id::TIMESTAMP_DAYS: dtype = "DATE"; break;
-          case cudf::type_id::TIMESTAMP_SECONDS:
-          case cudf::type_id::TIMESTAMP_MILLISECONDS:
-          case cudf::type_id::TIMESTAMP_MICROSECONDS:
-          case cudf::type_id::TIMESTAMP_NANOSECONDS: dtype = "TIMESTAMP"; break;
-          case cudf::type_id::DECIMAL32:
-          case cudf::type_id::DECIMAL64:
-          case cudf::type_id::DECIMAL128: {
-            int prec = (col.type().id() == cudf::type_id::DECIMAL32) ? 9 :
-                       (col.type().id() == cudf::type_id::DECIMAL64) ? 18 : 38;
-            dtype = "DECIMAL(" + std::to_string(prec) + "," + std::to_string(-col.type().scale()) + ")";
-            break;
-          }
-          default: dtype = "VARCHAR"; break;
-        }
-        col_defs += "\"col_" + std::to_string(c) + "\" " + dtype;
-      }
-      result->create_table_sql = "CREATE OR REPLACE TABLE \"" + table_name + "\" (" + col_defs + ")";
+      result->create_table_sql = PackedExchangeCreateTableSql(table_name, view);
       result->num_rows = static_cast<int64_t>(num_rows_out);
 
       return std::move(result);
@@ -1872,61 +1912,18 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
         projection_indices.push_back(IntegerValue::Get(child));
       }
 
-      SIRIUS_LOG_INFO("[register_packed_table] table={} gpu=0x{:x} size={} md_size={} projection_cols={}",
+      SIRIUS_LOG_INFO("[register_packed_table] bind table={} gpu=0x{:x} size={} md_size={} projection_cols={}",
                       table_name, gpu_addr, gpu_size, md_blob.size(), projection_indices.size());
 
-      int num_cols = 0, num_rows_out = 0;
-      SiriusExtension::EnsureExchangeBufferManager();
-      auto& mgr = GPUBufferManager::GetInstance();
-      mgr.registerExternalTablePacked(table_name,
-                                      gpu_ptr,
-                                      gpu_size,
-                                      std::move(md_blob),
-                                      projection_indices,
-                                      num_cols,
-                                      num_rows_out);
-
       cudf::table_view view;
-      string up = table_name;
-      transform(up.begin(), up.end(), up.begin(), ::toupper);
-      auto it = mgr.tables.find(up);
-      if (it != mgr.tables.end() && !it->second->pending_views.empty()) {
-        view = it->second->pending_views.back();
-        num_cols = view.num_columns();
+      int num_rows_out = 0;
+      if (!TryGetPendingPackedExchangeView(table_name, view, num_rows_out)) {
+        auto raw_view = cudf::unpack(reinterpret_cast<const uint8_t*>(md_blob.data()), gpu_ptr);
+        view = ApplyPackedExchangeProjection(raw_view, projection_indices);
+        num_rows_out = static_cast<int>(view.num_rows());
       }
 
-      string col_defs;
-      for (int c = 0; c < num_cols; c++) {
-        if (c > 0) col_defs += ", ";
-        auto col = view.column(c);
-        string dtype;
-        switch (col.type().id()) {
-          case cudf::type_id::INT8: dtype = "TINYINT"; break;
-          case cudf::type_id::INT16: dtype = "SMALLINT"; break;
-          case cudf::type_id::INT32: dtype = "INTEGER"; break;
-          case cudf::type_id::INT64: dtype = "BIGINT"; break;
-          case cudf::type_id::FLOAT32: dtype = "FLOAT"; break;
-          case cudf::type_id::FLOAT64: dtype = "DOUBLE"; break;
-          case cudf::type_id::BOOL8: dtype = "BOOLEAN"; break;
-          case cudf::type_id::STRING: dtype = "VARCHAR"; break;
-          case cudf::type_id::TIMESTAMP_DAYS: dtype = "DATE"; break;
-          case cudf::type_id::TIMESTAMP_SECONDS:
-          case cudf::type_id::TIMESTAMP_MILLISECONDS:
-          case cudf::type_id::TIMESTAMP_MICROSECONDS:
-          case cudf::type_id::TIMESTAMP_NANOSECONDS: dtype = "TIMESTAMP"; break;
-          case cudf::type_id::DECIMAL32:
-          case cudf::type_id::DECIMAL64:
-          case cudf::type_id::DECIMAL128: {
-            int prec = (col.type().id() == cudf::type_id::DECIMAL32) ? 9 :
-                       (col.type().id() == cudf::type_id::DECIMAL64) ? 18 : 38;
-            dtype = "DECIMAL(" + std::to_string(prec) + "," + std::to_string(-col.type().scale()) + ")";
-            break;
-          }
-          default: dtype = "VARCHAR"; break;
-        }
-        col_defs += "\"col_" + std::to_string(c) + "\" " + dtype;
-      }
-      result->create_table_sql = "CREATE OR REPLACE TABLE \"" + table_name + "\" (" + col_defs + ")";
+      result->create_table_sql = PackedExchangeCreateTableSql(table_name, view);
       result->num_rows = static_cast<int64_t>(num_rows_out);
 
       return std::move(result);

@@ -274,6 +274,7 @@ class GPUIntermediateRelation {
   std::vector<cudf::table_view> pending_views;
   std::vector<std::string> pending_metadata; // Keeps metadata buffers alive
   std::vector<uint8_t*> pending_gpu_ptrs;    // GPU data pointers for re-unpack
+  std::vector<size_t> pending_gpu_sizes;
   std::vector<std::vector<int32_t>> pending_projection_indices;
   size_t pending_total_rows = 0;
 
@@ -387,6 +388,9 @@ class GPUIntermediateRelation {
     packed_cudf_table = std::shared_ptr<cudf::table>(merged.release());
     pending_views.clear();
     pending_metadata.clear(); // Metadata no longer needed after concatenation.
+    pending_gpu_ptrs.clear();
+    pending_gpu_sizes.clear();
+    pending_projection_indices.clear();
     if (packed_cudf_table) {
       pending_total_rows = static_cast<size_t>(packed_cudf_table->num_rows());
     }

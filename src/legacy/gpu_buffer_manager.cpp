@@ -740,6 +740,33 @@ void GPUBufferManager::registerExternalTablePacked(
   // Store metadata FIRST so it has a stable address.
   auto existing = tables.find(up_table_name);
   if (existing != tables.end()) {
+    auto& rel = existing->second;
+    if (rel) {
+      auto pending_count = rel->pending_views.size();
+      if (rel->pending_gpu_ptrs.size() == pending_count &&
+          rel->pending_gpu_sizes.size() == pending_count &&
+          rel->pending_metadata.size() == pending_count &&
+          rel->pending_projection_indices.size() == pending_count) {
+        for (size_t i = 0; i < pending_count; i++) {
+          if (rel->pending_gpu_ptrs[i] == gpu_data &&
+              rel->pending_gpu_sizes[i] == gpu_size &&
+              rel->pending_metadata[i] == metadata &&
+              rel->pending_projection_indices[i] == projection_indices) {
+            auto view = rel->pending_views[i];
+            out_num_cols = view.num_columns();
+            out_num_rows = static_cast<int>(rel->pending_total_rows);
+            SIRIUS_LOG_INFO("[registerExternalTablePacked] duplicate '{}' gpu=0x{:x} size={} ignored ({} views, {} total rows)",
+                            up_table_name,
+                            reinterpret_cast<uintptr_t>(gpu_data),
+                            gpu_size,
+                            pending_count,
+                            rel->pending_total_rows);
+            return;
+          }
+        }
+      }
+    }
+
     existing->second->pending_metadata.push_back(std::move(metadata));
     // Full checksum at registration time — compare with transfer_complete checksum.
     cudaDeviceSynchronize();
@@ -780,6 +807,7 @@ void GPUBufferManager::registerExternalTablePacked(
 
     existing->second->pending_views.push_back(view);
     existing->second->pending_gpu_ptrs.push_back(gpu_data);
+    existing->second->pending_gpu_sizes.push_back(gpu_size);
     existing->second->pending_projection_indices.push_back(projection_indices);
     auto total_rows = existing->second->pending_total_rows + static_cast<size_t>(view.num_rows());
     existing->second->pending_total_rows = total_rows;
@@ -938,6 +966,7 @@ void GPUBufferManager::registerExternalTablePacked(
 
   rel->pending_views.push_back(view);
   rel->pending_gpu_ptrs.push_back(gpu_data);
+  rel->pending_gpu_sizes.push_back(gpu_size);
   rel->pending_projection_indices.push_back(projection_indices);
   rel->pending_total_rows = num_rows;
   tables[up_table_name] = rel;

@@ -241,7 +241,7 @@ fn send_local_packed_exchange(
                 .enumerate()
                 .filter_map(|(idx, entry)| (entry.packed_size > 0).then_some(idx))
                 .collect();
-            for _dest in destinations {
+            if !destinations.is_empty() {
                 let key = ExchangeKey { query_id, node_id };
                 if !broadcast_indices.is_empty() {
                     exchange_buffer.store_local_gpu_artifact(
@@ -366,8 +366,10 @@ pub async fn send_exchange_with_nixl(
         .cloned()
         .partition(|d| d.brpc_addr == local_brpc_addr);
 
-    // Handle local (self-transfer) destinations via ExchangeBuffer.
-    for dest in &local_dests {
+    // Handle local (self-transfer) destinations via ExchangeBuffer. ExchangeKey
+    // is per exchange node, not per destination fragment instance, so one local
+    // sender must enqueue one payload under the key.
+    for dest in local_dests.iter().take(1) {
         let key = ExchangeKey { query_id, node_id };
 
         if let Some(artifact) = packed_exchange {

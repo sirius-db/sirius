@@ -3,7 +3,7 @@
 //! Provides a unified API for executing SQL queries and returning Arrow IPC bytes.
 //! Uses a bundled DuckDB instance with Sirius GPU extensions.
 
-use std::ffi::{c_char, c_void, CStr};
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::OnceLock;
 
 /// High-level query execution engine.
@@ -38,6 +38,17 @@ type ArtifactGetPartitionFn =
     unsafe extern "C" fn(*const c_void, usize, *mut RawPackedPartitionView) -> i32;
 type ArtifactGetBroadcastFn =
     unsafe extern "C" fn(*const c_void, usize, *mut RawPackedBroadcastEntryView) -> i32;
+type RegisterPackedTableDirectFn = unsafe extern "C" fn(
+    *const c_char,
+    u64,
+    u64,
+    *const u8,
+    usize,
+    *const i32,
+    usize,
+    *mut i32,
+    *mut i32,
+) -> i32;
 
 #[derive(Clone, Copy)]
 struct ExchangeApi {
@@ -51,6 +62,7 @@ struct ExchangeApi {
     exchange_artifact_get_partition: ArtifactGetPartitionFn,
     exchange_artifact_broadcast_count: ArtifactCountFn,
     exchange_artifact_get_broadcast_entry: ArtifactGetBroadcastFn,
+    register_packed_table_direct: RegisterPackedTableDirectFn,
 }
 
 #[repr(C)]
@@ -119,6 +131,9 @@ fn load_exchange_api(sirius_ext_path: &str) -> Result<&'static ExchangeApi, Engi
         },
         exchange_artifact_get_broadcast_entry: unsafe {
             load_symbol(lib, b"sirius_exchange_artifact_get_broadcast_entry\0")?
+        },
+        register_packed_table_direct: unsafe {
+            load_symbol(lib, b"sirius_register_packed_table_direct\0")?
         },
     };
 
@@ -474,14 +489,29 @@ impl SiriusEngine {
             }
         };
         let sql = format!("SELECT * FROM {}('{}') LIMIT 0", reader_fn, file_path);
-        let mut stmt = self
-            .conn
-            .prepare(&sql)
+
+        // Schema introspection is metadata-only and must run on plain DuckDB.
+        // The connection has the Sirius transparent optimizer enabled
+        // (`gpu_execution=true` by default), which would intercept this probe and
+        // route it to the GPU engine. DuckDB prunes `LIMIT 0` to an EMPTY_RESULT
+        // plan with no scan operators, so the GPU executor blocks forever waiting
+        // for tasks that never get scheduled. Disable GPU interception for the
+        // probe, then restore it (the BE always runs with gpu_execution enabled).
+        self.conn
+            .execute_batch("SET gpu_execution=false")
             .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-        let arrow_result = stmt
-            .query_arrow([])
-            .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
-        let schema = arrow_result.get_schema();
+        let schema_result = (|| {
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let arrow_result = stmt
+                .query_arrow([])
+                .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            Ok::<_, EngineError>(arrow_result.get_schema())
+        })();
+        let _ = self.conn.execute_batch("SET gpu_execution=true");
+        let schema = schema_result?;
 
         // Write schema-only IPC stream (header + EOS, no data batches).
         let mut buf = Vec::new();
@@ -1123,18 +1153,58 @@ impl SiriusEngine {
         Ok(())
     }
 
-    /// Register a packed GPU buffer as a DuckDB table via cudf::unpack + gpu_register_table.
+    fn register_packed_table_direct(
+        &self,
+        table_name: &str,
+        gpu_addr: usize,
+        gpu_size: usize,
+        cudf_metadata: &[u8],
+        projection_indices: &[i32],
+    ) -> Result<(i32, i32), EngineError> {
+        let table_name = CString::new(table_name)
+            .map_err(|e| EngineError::ExecFailed(format!("packed table name contains NUL: {e}")))?;
+        let metadata_ptr = if cudf_metadata.is_empty() {
+            std::ptr::null()
+        } else {
+            cudf_metadata.as_ptr()
+        };
+        let projection_ptr = if projection_indices.is_empty() {
+            std::ptr::null()
+        } else {
+            projection_indices.as_ptr()
+        };
+        let mut num_cols = 0_i32;
+        let mut num_rows = 0_i32;
+        let ok = unsafe {
+            (self.exchange_api.register_packed_table_direct)(
+                table_name.as_ptr(),
+                gpu_addr as u64,
+                gpu_size as u64,
+                metadata_ptr,
+                cudf_metadata.len(),
+                projection_ptr,
+                projection_indices.len(),
+                &mut num_cols,
+                &mut num_rows,
+            )
+        };
+        if ok == 0 {
+            return Err(EngineError::ExecFailed(exchange_last_error(
+                self.exchange_api,
+            )));
+        }
+        Ok((num_cols, num_rows))
+    }
+
+    /// Register a packed GPU buffer as a DuckDB exchange table.
     ///
     /// Unpacks the cudf metadata to get a table_view pointing into the GPU buffer,
-    /// then registers the per-column GPU pointers with DuckDB's GPU execution engine.
+    /// then creates the schema-only DuckDB table used by Sirius GPU scans.
     /// Zero CPU copies — the entire path is GPU→GPU.
-    /// Unpack a cudf::pack'd GPU buffer and register it as a DuckDB table.
     ///
     /// Two steps:
-    /// 1. Call C++ sirius_register_packed_table to cudf::unpack and store
-    ///    per-column GPU pointers in LastGPUBuffers
-    /// 2. Use register_gpu_exchange_table to create the DuckDB table and
-    ///    call gpu_register_table with those pointers
+    /// 1. Call the direct C API once to cudf::unpack and store pending GPU views.
+    /// 2. Call the SQL table function only to retrieve CREATE TABLE SQL.
     pub fn register_packed_table(
         &self,
         table_name: &str,
@@ -1142,8 +1212,10 @@ impl SiriusEngine {
         gpu_size: usize,
         cudf_metadata: &[u8],
     ) -> Result<(), EngineError> {
-        // Step 1: C++ cudf::unpack → registers in GPUBufferManager::tables (zero-copy).
-        // Returns the CREATE TABLE SQL for us to execute (can't run inside the bind).
+        self.register_packed_table_direct(table_name, gpu_addr, gpu_size, cudf_metadata, &[])?;
+
+        // Step 2: retrieve CREATE TABLE SQL. The SQL bind is intentionally read-only:
+        // DuckDB can bind a table function more than once for one statement.
         let sql = "SELECT * FROM sirius_register_packed_table(?, ?, ?, ?)";
         let mut stmt = self
             .conn
@@ -1186,6 +1258,24 @@ impl SiriusEngine {
         cudf_metadata: &[u8],
         projection_indices: &[usize],
     ) -> Result<(), EngineError> {
+        let projection_i32 = projection_indices
+            .iter()
+            .map(|&idx| {
+                i32::try_from(idx).map_err(|e| {
+                    EngineError::ExecFailed(format!(
+                        "packed table projection index {idx} does not fit in i32: {e}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.register_packed_table_direct(
+            table_name,
+            gpu_addr,
+            gpu_size,
+            cudf_metadata,
+            &projection_i32,
+        )?;
+
         let indices_sql = projection_indices
             .iter()
             .map(|idx| idx.to_string())

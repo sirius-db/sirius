@@ -75,5 +75,15 @@ SIRIUS_EXCHANGE_C_API_EXPORT int sirius_exchange_artifact_get_broadcast_entry(
   const sirius_exchange_artifact_handle* handle,
   size_t index,
   sirius_packed_broadcast_entry_view* out);
+SIRIUS_EXCHANGE_C_API_EXPORT int sirius_register_packed_table_direct(
+  const char* table_name,
+  uint64_t gpu_addr,
+  uint64_t gpu_size,
+  const uint8_t* metadata_ptr,
+  size_t metadata_len,
+  const int32_t* projection_indices,
+  size_t num_projection_indices,
+  int32_t* out_num_cols,
+  int32_t* out_num_rows);
 
 }  // extern "C"

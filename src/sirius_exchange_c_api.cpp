@@ -21,6 +21,7 @@
 
 #include <exception>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -208,6 +209,62 @@ int sirius_exchange_artifact_get_broadcast_entry(
     out->metadata_len = entry.metadata ? static_cast<uint64_t>(entry.metadata->size()) : 0;
     out->num_rows = entry.num_rows;
     out->overflow_gpu_addr = static_cast<uint64_t>(entry.overflow_gpu_addr);
+    return 1;
+  });
+}
+
+int sirius_register_packed_table_direct(
+  const char* table_name,
+  uint64_t gpu_addr,
+  uint64_t gpu_size,
+  const uint8_t* metadata_ptr,
+  size_t metadata_len,
+  const int32_t* projection_indices,
+  size_t num_projection_indices,
+  int32_t* out_num_cols,
+  int32_t* out_num_rows) {
+  return with_error_boundary([&]() -> int {
+    if (!table_name) {
+      throw std::invalid_argument("sirius_register_packed_table_direct: null table_name");
+    }
+    if (metadata_len > 0 && !metadata_ptr) {
+      throw std::invalid_argument("sirius_register_packed_table_direct: null metadata_ptr");
+    }
+    if (num_projection_indices > 0 && !projection_indices) {
+      throw std::invalid_argument("sirius_register_packed_table_direct: null projection_indices");
+    }
+
+    std::string metadata;
+    if (metadata_len > 0) {
+      metadata.assign(reinterpret_cast<const char*>(metadata_ptr), metadata_len);
+    }
+
+    std::vector<int32_t> projection;
+    projection.reserve(num_projection_indices);
+    for (size_t i = 0; i < num_projection_indices; i++) {
+      projection.push_back(projection_indices[i]);
+    }
+
+    int num_cols = 0;
+    int num_rows = 0;
+    duckdb::SiriusExtension::EnsureExchangeBufferManager();
+    duckdb::GPUBufferManager::GetInstance().registerExternalTablePacked(
+      table_name,
+      reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(gpu_addr)),
+      static_cast<size_t>(gpu_size),
+      std::move(metadata),
+      projection,
+      num_cols,
+      num_rows);
+
+    if (out_num_cols) {
+      *out_num_cols = num_cols;
+    }
+    if (out_num_rows) {
+      *out_num_rows = num_rows;
+    }
+    SIRIUS_LOG_INFO("[sirius_register_packed_table_direct] table={} gpu=0x{:x} size={} projection_cols={} rows={}",
+                    table_name, gpu_addr, gpu_size, projection.size(), num_rows);
     return 1;
   });
 }
