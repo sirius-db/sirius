@@ -94,10 +94,6 @@ setuptools-scm = "*"
 [feature.duckdb-python.tasks]
 build-duckdb-python = "CMAKE_ARGS=\"-DDUCKDB_SOURCE_PATH=$PIXI_PROJECT_ROOT/duckdb\" pip install --no-build-isolation ./duckdb-python"
 
-# Lightweight env for running nightly cudf builds (no build deps needed)
-[feature.nightly-runner.dependencies]
-pixi = "0.69.*"
-
 [feature.nightly-runner.tasks]
 nightly-shell = "scripts/generate_nightly_env.sh && env -u PIXI_ENVIRONMENT_NAME pixi shell --manifest-path envs/nightly/pixi.toml"
 nightly-run = "scripts/generate_nightly_env.sh && env -u PIXI_ENVIRONMENT_NAME pixi run --manifest-path envs/nightly/pixi.toml"
