@@ -368,9 +368,7 @@ duckdb_native_metadata walk_duckdb_native_metadata(
   duckdb::vector<duckdb::ColumnSegmentInfo> column_segments;
   {
     nvtx3::scoped_range nvtx_si{"sirius::native_metadata_segment_info"};
-    // Read segment metadata for projected columns only. DataTable::GetColumnSegmentInfo
-    // would lazily load every column's segment tree via synchronous BufferManager preads;
-    // per-column GetRawColumnData (GetColumn is private) touches just what we project.
+    // Read segment metadata for projected columns only.
     auto& row_groups        = *storage.GetRowGroupCollection();
     auto const n_row_groups = row_groups.GetRowGroupCount();
     for (std::size_t rg = 0; rg < n_row_groups; ++rg) {
