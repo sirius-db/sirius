@@ -224,7 +224,6 @@ class duckdb_scan_executor : public sirius::parallel::itask_executor {
 
   sirius::creator::task_creator* _task_creator{nullptr};
   sirius::pipeline::completion_handler* _completion_handler{nullptr};
-  sirius::telemetry::telemetry_context* _telemetry_context{nullptr};
 };
 
 }  // namespace sirius::op::scan

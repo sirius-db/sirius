@@ -16,6 +16,10 @@
 
 #pragma once
 
+namespace sirius::telemetry {
+class telemetry_context;
+}  // namespace sirius::telemetry
+
 namespace sirius::pipeline {
 
 //! Lightweight context for plan-time pipeline construction.
@@ -32,6 +36,9 @@ struct pipeline_build_context {
   //! ensure big partition-consuming operators (hash_join, merge_group_by) get
   //! at least num_gpus partitions to spread work across devices.
   int num_gpus = 1;
+
+  //! Query telemetry context carried by every pipeline built from this context.
+  const telemetry::telemetry_context* telemetry_context = nullptr;
 };
 
 }  // namespace sirius::pipeline

@@ -130,7 +130,6 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   sirius::parallel::downgrade_executor* _downgrade_executor{nullptr};
   sirius::creator::task_creator* _task_creator{nullptr};
   completion_handler* _completion_handler{nullptr};
-  telemetry::telemetry_context* _telemetry_context{nullptr};
 };
 
 }  // namespace pipeline

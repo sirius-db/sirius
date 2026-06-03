@@ -68,6 +68,7 @@ class dummy_task : public sirius::parallel::itask {
  public:
   dummy_task() : itask(0, std::make_unique<dummy_task_local_state>(), nullptr) {}
   void execute(rmm::cuda_stream_view /*stream*/) override {}
+  quent::task::TaskHandle* telemetry_handle() const noexcept override { return nullptr; }
 };
 
 /// Helper: create a gpu_pipeline_task with the given data batches.

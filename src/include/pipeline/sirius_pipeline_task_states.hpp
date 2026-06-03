@@ -26,6 +26,10 @@
 #include <optional>
 
 namespace sirius {
+namespace telemetry {
+class telemetry_context;
+}  // namespace telemetry
+
 namespace pipeline {
 
 /**
@@ -74,6 +78,11 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
   void set_pipeline(duckdb::shared_ptr<sirius_pipeline> pipeline)
   {
     _pipeline = std::move(pipeline);
+  }
+
+  [[nodiscard]] const telemetry::telemetry_context* telemetry_context() const noexcept
+  {
+    return _pipeline ? _pipeline->telemetry_context() : nullptr;
   }
 
   /**

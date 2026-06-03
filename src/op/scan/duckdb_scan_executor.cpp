@@ -78,10 +78,9 @@ duckdb_scan_executor::duckdb_scan_executor(
   cucascade::memory::memory_reservation_manager* mem_mgr,
   exec::publisher<std::unique_ptr<sirius::pipeline::task_request>> task_request_publisher,
   sirius::telemetry::telemetry_context* telemetry_context)
-  : sirius::parallel::itask_executor(config),
+  : sirius::parallel::itask_executor(config, telemetry_context),
     _task_request_publisher(std::move(task_request_publisher)),
-    _mem_mgr(mem_mgr),
-    _telemetry_context(telemetry_context)
+    _mem_mgr(mem_mgr)
 {
   auto gpu_spaces = mem_mgr->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   for (auto* space : gpu_spaces) {
@@ -359,6 +358,13 @@ std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
 
 void duckdb_scan_executor::manager_loop()
 {
+  std::unique_ptr<sirius::telemetry::TaskManagerLoopThreadHandleWrapper> manager_telemetry;
+  if (_telemetry_context) {
+    manager_telemetry = std::make_unique<sirius::telemetry::TaskManagerLoopThreadHandleWrapper>(
+      *_telemetry_context, fmt::format("{}-duckdb-scan-manager", _config.thread_name_prefix));
+  }
+  const auto manager_resource_id = manager_telemetry ? manager_telemetry->uuid() : uuid::new_nil();
+
   while (_running.load()) {
     auto slot = _bounded_pool->reserve();  // block till a thread is available
     if (!slot) {
@@ -390,6 +396,13 @@ void duckdb_scan_executor::manager_loop()
     // produces a well-defined target device — cpu_source_task ignores the
     // stream anyway, and duckdb_scan_task runs on the host side until handoff.
     int target_gpu_id = select_target_gpu();
+    if (scan_task) {
+      scan_task->telemetry_handle()->routing({
+        .instance_name              = std::string(),
+        .preferred_device_id        = target_gpu_id,
+        .manager_thread_resource_id = manager_resource_id,
+      });
+    }
 
     if (scan_task && scan_task->is<parquet_scan_task>()) {
       auto* parquet_task = dynamic_cast<parquet_scan_task*>(scan_task);
@@ -429,7 +442,15 @@ void duckdb_scan_executor::manager_loop()
           wrap_batch_data, cache_decoded_table, target_gpu_space);
       }
       auto reservation_info = scan_task->get_estimated_reservation_size_info();
-      auto reservation      = _mem_mgr->request_reservation(
+      scan_task->telemetry_handle()->reserving({
+        .instance_name              = std::string(),
+        .requested_bytes            = reservation_info.reservation_size,
+        .input_basis                = reservation_info.input_basis,
+        .peak_estimate              = reservation_info.peak_memory_estimate,
+        .bytes_to_materialize       = reservation_info.bytes_to_materialize_input,
+        .manager_thread_resource_id = manager_resource_id,
+      });
+      auto reservation = _mem_mgr->request_reservation(
         cucascade::memory::any_memory_space_in_tier_with_preference{
           cucascade::memory::Tier::HOST, static_cast<size_t>(target_gpu_id)},
         reservation_info.reservation_size);
@@ -450,6 +471,14 @@ void duckdb_scan_executor::manager_loop()
       }
     } else if (scan_task && scan_task->is<duckdb_scan_task>()) {
       auto reservation_info = scan_task->get_estimated_reservation_size_info();
+      scan_task->telemetry_handle()->reserving({
+        .instance_name              = std::string(),
+        .requested_bytes            = reservation_info.reservation_size,
+        .input_basis                = reservation_info.input_basis,
+        .peak_estimate              = reservation_info.peak_memory_estimate,
+        .bytes_to_materialize       = reservation_info.bytes_to_materialize_input,
+        .manager_thread_resource_id = manager_resource_id,
+      });
       if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
             scan_task->local_state())) {
         local_state->set_reservation(nullptr, reservation_info);
@@ -461,7 +490,15 @@ void duckdb_scan_executor::manager_loop()
       }
     } else if (scan_task && scan_task->is<cpu_source_task>()) {
       auto reservation_info = scan_task->get_estimated_reservation_size_info();
-      auto reservation      = _mem_mgr->request_reservation(
+      scan_task->telemetry_handle()->reserving({
+        .instance_name              = std::string(),
+        .requested_bytes            = reservation_info.reservation_size,
+        .input_basis                = reservation_info.input_basis,
+        .peak_estimate              = reservation_info.peak_memory_estimate,
+        .bytes_to_materialize       = reservation_info.bytes_to_materialize_input,
+        .manager_thread_resource_id = manager_resource_id,
+      });
+      auto reservation = _mem_mgr->request_reservation(
         cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST},
         reservation_info.reservation_size);
       if (!reservation) {
@@ -523,11 +560,30 @@ void duckdb_scan_executor::manager_loop()
         try {
           auto consumers = scan_task->get_output_consumers();
           {
+            scan_task->telemetry_handle()->preparing({
+              .instance_name = std::string(),
+              .target_tier   = std::string("SCAN"),
+              .executor_thread_resource_id =
+                sirius::telemetry::current_executor_thread_resource_id(),
+            });
             auto output_data = get_scan_output(scan_task, stream);
             stream->synchronize();
+            scan_task->telemetry_handle()->computing({
+              .instance_name       = std::string(),
+              .current_operator_id = scan_task->get_source_operator_id(),
+              .output_bytes        = output_data ? output_data->get_estimated_size_in_bytes() : 0,
+              .executor_thread_resource_id =
+                sirius::telemetry::current_executor_thread_resource_id(),
+            });
             scan_task->publish_output(*output_data, stream);
           }
 
+          scan_task->telemetry_handle()->finalizing({
+            .instance_name = std::string(),
+            .success       = true,
+          });
+          scan_task->telemetry_handle()->exit();
+          scan_task->set_telemetry_finalized();
           t.reset();
           if (_task_creator && !(_completion_handler && _completion_handler->is_completed())) {
             for (auto* consumer : consumers) {

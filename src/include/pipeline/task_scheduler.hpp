@@ -47,6 +47,7 @@ class downgrade_executor;
 
 namespace sirius::telemetry {
 class telemetry_context;
+struct TaskQueueHandleWrapper;
 }  // namespace sirius::telemetry
 
 namespace sirius {
@@ -82,7 +83,7 @@ class task_scheduler {
                           sirius::memory::sirius_memory_reservation_manager& mem_mgr,
                           const cucascade::memory::system_topology_info* sys_topology = nullptr,
                           const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>*
-                            downgrade_executors = nullptr,
+                            downgrade_executors                                   = nullptr,
                           sirius::telemetry::telemetry_context* telemetry_context = nullptr);
 
   /**
@@ -234,6 +235,8 @@ class task_scheduler {
   sirius::creator::task_creator* _task_creator{nullptr};
   std::unique_ptr<sirius::op::scan::duckdb_scan_executor> _scan_executor;
   std::unique_ptr<completion_handler> _completion_handler;
+  sirius::telemetry::telemetry_context* _telemetry_context{nullptr};
+  std::unique_ptr<sirius::telemetry::TaskQueueHandleWrapper> _task_queue_telemetry;
 };
 
 }  // namespace pipeline

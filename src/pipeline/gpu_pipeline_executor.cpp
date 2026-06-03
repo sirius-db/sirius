@@ -49,12 +49,11 @@ gpu_pipeline_executor::gpu_pipeline_executor(
   exec::publisher<std::unique_ptr<task_request>> task_request_publisher,
   sirius::parallel::downgrade_executor* downgrade_executor,
   telemetry::telemetry_context* telemetry_context)
-  : sirius::parallel::itask_executor(config),
+  : sirius::parallel::itask_executor(config, telemetry_context),
     _stream_pool(rmm::cuda_device_id{mem_space->get_device_id()}, config.num_threads),
     _task_request_publisher(std::move(task_request_publisher)),
     _memory_space(mem_space),
-    _downgrade_executor(downgrade_executor),
-    _telemetry_context(telemetry_context)
+    _downgrade_executor(downgrade_executor)
 {
 }
 
@@ -91,6 +90,14 @@ absl::AnyInvocable<void() noexcept> gpu_pipeline_executor::get_per_thread_init()
 
 void gpu_pipeline_executor::manager_loop()
 {
+  std::unique_ptr<telemetry::TaskManagerLoopThreadHandleWrapper> manager_telemetry;
+  if (_telemetry_context) {
+    manager_telemetry = std::make_unique<telemetry::TaskManagerLoopThreadHandleWrapper>(
+      *_telemetry_context,
+      fmt::format("{}-gpu-manager-{}", _config.thread_name_prefix, _memory_space->get_device_id()));
+  }
+  const auto manager_resource_id = manager_telemetry ? manager_telemetry->uuid() : uuid::new_nil();
+
   rmm::cuda_set_device_raii set_device_guard(rmm::cuda_device_id{_memory_space->get_device_id()});
   sirius::util::enable_log_on_default_stream();
   while (_running.load()) {
@@ -117,6 +124,14 @@ void gpu_pipeline_executor::manager_loop()
     }
     auto reservation_info = gpu_task->get_estimated_reservation_size_info();
     auto bytes_needs      = reservation_info.reservation_size;
+    gpu_task->telemetry_handle()->reserving({
+      .instance_name              = std::string(),
+      .requested_bytes            = reservation_info.reservation_size,
+      .input_basis                = reservation_info.input_basis,
+      .peak_estimate              = reservation_info.peak_memory_estimate,
+      .bytes_to_materialize       = reservation_info.bytes_to_materialize_input,
+      .manager_thread_resource_id = manager_resource_id,
+    });
     SIRIUS_LOG_TRACE(
       "GPU Pipeline Executor: Acquiring memory reservation for pipeline {} of {} bytes for task "
       "{}. Memory "
@@ -140,6 +155,12 @@ void gpu_pipeline_executor::manager_loop()
     } else if (reservation->size() < bytes_needs && _downgrade_executor) {
       size_t shortfall    = bytes_needs - reservation->size();
       size_t partial_size = reservation->size();
+      gpu_task->telemetry_handle()->downgrading({
+        .instance_name              = std::string(),
+        .shortfall_bytes            = shortfall,
+        .partial_bytes              = partial_size,
+        .manager_thread_resource_id = manager_resource_id,
+      });
 
       SIRIUS_LOG_DEBUG(
         "GPU Pipeline Executor: requested reservation size {} but only got {} bytes, reservation "
@@ -175,6 +196,14 @@ void gpu_pipeline_executor::manager_loop()
         break;
       }
 
+      gpu_task->telemetry_handle()->reserving({
+        .instance_name              = std::string(),
+        .requested_bytes            = reservation_info.reservation_size,
+        .input_basis                = reservation_info.input_basis,
+        .peak_estimate              = reservation_info.peak_memory_estimate,
+        .bytes_to_materialize       = reservation_info.bytes_to_materialize_input,
+        .manager_thread_resource_id = manager_resource_id,
+      });
       if (new_reservation) {
         reservation = std::move(new_reservation);
       } else {
@@ -333,6 +362,14 @@ void gpu_pipeline_executor::manager_loop()
 
           // Schedule the rescheduled task. It goes back through manager_loop()
           // to acquire a fresh reservation before execution.
+          if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
+            pipeline_task->telemetry_handle()->finalizing({
+              .instance_name = std::string(),
+              .success       = false,
+            });
+            pipeline_task->telemetry_handle()->exit();
+            pipeline_task->set_telemetry_finalized();
+          }
           this->schedule(std::move(new_task));
           return;
         } catch (const std::exception& e) {
@@ -345,6 +382,14 @@ void gpu_pipeline_executor::manager_loop()
           if (_task_creator) { _task_creator->stop(); }
           if (_completion_handler) { _completion_handler->report_error(std::current_exception()); }
           return;
+        }
+        if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
+          pipeline_task->telemetry_handle()->finalizing({
+            .instance_name = std::string(),
+            .success       = true,
+          });
+          pipeline_task->telemetry_handle()->exit();
+          pipeline_task->set_telemetry_finalized();
         }
         task.reset();
 

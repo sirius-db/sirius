@@ -382,6 +382,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   build_ctx.preserve_insertion_order =
     duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context);
   build_ctx.num_gpus = static_cast<int>(sirius_ctx_ptr->get_config().get_hw_topology().gpus.size());
+  build_ctx.telemetry_context = &telemetry_context_;
 
   // Build meta-pipeline tree from operator plan
   pipeline::sirius_pipeline_build_state state;

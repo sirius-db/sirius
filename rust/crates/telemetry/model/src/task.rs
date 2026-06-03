@@ -48,10 +48,10 @@ state! {
 state! {
     Reserving {
         attributes: {
-            requested_bytes: i64,
-            input_basis: i64,
-            peak_estimate: i64,
-            bytes_to_materialize: i64,
+            requested_bytes: u64,
+            input_basis: u64,
+            peak_estimate: u64,
+            bytes_to_materialize: u64,
         },
         usages: {
             manager_thread: TaskManagerLoopThread,
@@ -62,8 +62,8 @@ state! {
 state! {
     Downgrading {
         attributes: {
-            shortfall_bytes: i64,
-            partial_bytes: i64
+            shortfall_bytes: u64,
+            partial_bytes: u64
         },
         usages: {
             manager_thread: TaskManagerLoopThread,
@@ -128,7 +128,7 @@ fsm! {
             routing => queued,
 
             // Scan/source tasks are routed and then reserve memory in the same scan
-            // manager loop
+            // manager loop.
             routing => reserving,
             // GPU tasks reserve after being popped from an executor queue.
             queued => reserving,
@@ -152,16 +152,19 @@ fsm! {
             // Normal completion or execution failure after compute.
             computing => finalizing,
 
-            // Reservation o preparationg failure or cancellation.
+            // A task was created but never reached a queue. This is a valid
+            // cleanup path, but should be treated as abnormal by analysis.
+            created => finalizing,
+            // Queue drain, interrupted scheduling, or cancellation before routing.
             queued => finalizing,
-            // after routing, enqueue to executor can fail/drop if the
+            // After routing, enqueue to executor can fail/drop if the
             // executor queue is interrupted.
             routing => finalizing,
-            // reservation could fail
+            // Reservation could fail.
             reserving => finalizing,
-            // downgrade request can be cancelled/fail before returning
+            // Downgrade request can be cancelled/fail before returning.
             downgrading => finalizing,
-            // upgrading data to required tier might fail.
+            // Upgrading data to required tier might fail.
             preparing => finalizing,
         },
     }

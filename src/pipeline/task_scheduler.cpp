@@ -26,10 +26,13 @@
 #include "op/scan/duckdb_scan_task.hpp"
 #include "op/scan/parquet_scan_task.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
+#include "telemetry/telemetry_context.hpp"
 
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
+
+#include <string>
 
 namespace sirius {
 namespace pipeline {
@@ -41,7 +44,13 @@ task_scheduler::task_scheduler(
   const cucascade::memory::system_topology_info* sys_topology,
   const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors,
   sirius::telemetry::telemetry_context* telemetry_context)
+  : _telemetry_context(telemetry_context)
 {
+  if (_telemetry_context) {
+    _task_queue_telemetry = std::make_unique<sirius::telemetry::TaskQueueHandleWrapper>(
+      *_telemetry_context, "task-scheduler-gpu-queue");
+  }
+
   // Create the scan executor with memory manager for host allocations
   // Pass a publisher so it can submit task requests without depending on task_scheduler
   _scan_executor = std::make_unique<sirius::op::scan::duckdb_scan_executor>(
@@ -94,6 +103,13 @@ void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> task)
   } else if (task->is<sirius::op::scan::cpu_source_task>()) {
     _scan_executor->schedule(std::move(task));
   } else {
+    if (_task_queue_telemetry) {
+      if (auto* handle = task->telemetry_handle()) {
+        handle->queued({
+          .queue_resource_id = _task_queue_telemetry->uuid(),
+        });
+      }
+    }
     [[maybe_unused]] auto _ = _task_queue.push(std::move(task));
   }
 }
@@ -230,6 +246,13 @@ void task_scheduler::drain_after_error()
 
 void task_scheduler::management_eventloop()
 {
+  std::unique_ptr<sirius::telemetry::TaskManagerLoopThreadHandleWrapper> manager_telemetry;
+  if (_telemetry_context) {
+    manager_telemetry = std::make_unique<sirius::telemetry::TaskManagerLoopThreadHandleWrapper>(
+      *_telemetry_context, "task-scheduler-manager");
+  }
+  const auto manager_resource_id = manager_telemetry ? manager_telemetry->uuid() : uuid::new_nil();
+
   while (_running.load()) {
     // Task-first: pop the next GPU pipeline task to dispatch.
     // Scan tasks are routed directly to _scan_executor in schedule(), so
@@ -277,6 +300,13 @@ void task_scheduler::management_eventloop()
     // load-bearing — verification greps depend on it.
     SIRIUS_LOG_INFO(
       "[mgpu-audit] pipeline_task dispatched to GPU {} task_id={}", target_device_id, task_id);
+    if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
+      pipeline_task->telemetry_handle()->routing({
+        .instance_name              = std::string(),
+        .preferred_device_id        = target_device_id,
+        .manager_thread_resource_id = manager_resource_id,
+      });
+    }
     // At-capacity tasks stay in the preferred executor's queue rather than
     // spilling to another GPU — preserves data locality at the cost of higher
     // tail latency. Capacity control happens in gpu_pipeline_executor; this is

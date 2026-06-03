@@ -17,12 +17,18 @@
 #pragma once
 
 #include "duckdb/common/common.hpp"
-#include "log/logging.hpp"
 #include "telemetry-bridge/gen/context.rs.h"
 #include "telemetry-bridge/gen/engine.rs.h"
 #include "telemetry-bridge/gen/executor_thread.rs.h"
+#include "telemetry-bridge/gen/task_manager_loop_thread.rs.h"
+#include "telemetry-bridge/gen/task_queue.rs.h"
 #include "telemetry-bridge/gen/uuid.rs.h"
 #include "telemetry-bridge/gen/worker.rs.h"
+
+#include <cstdint>
+#include <limits>
+#include <optional>
+#include <string>
 
 namespace sirius::pipeline {
 class sirius_pipeline;
@@ -94,7 +100,66 @@ struct ExecutorThreadHandleWrapper {
     handle->exit();
   }
 
+  [[nodiscard]] uuid::UUID uuid() const { return handle->uuid(); }
+
   rust::Box<quent::executor_thread::ExecutorThreadHandle> handle;
+};
+
+struct TaskManagerLoopThreadHandleWrapper {
+  TaskManagerLoopThreadHandleWrapper(const telemetry_context& context,
+                                     const std::string& thread_name)
+    : handle(quent::task_manager_loop_thread::create(context.context(),
+                                                     {
+                                                       .instance_name   = thread_name,
+                                                       .parent_group_id = context.engine_id(),
+                                                     }))
+  {
+    handle->operating();
+  }
+
+  TaskManagerLoopThreadHandleWrapper(const TaskManagerLoopThreadHandleWrapper&)            = delete;
+  TaskManagerLoopThreadHandleWrapper& operator=(const TaskManagerLoopThreadHandleWrapper&) = delete;
+  TaskManagerLoopThreadHandleWrapper(TaskManagerLoopThreadHandleWrapper&&)                 = delete;
+  TaskManagerLoopThreadHandleWrapper& operator=(TaskManagerLoopThreadHandleWrapper&&)      = delete;
+
+  ~TaskManagerLoopThreadHandleWrapper()
+  {
+    handle->finalizing();
+    handle->exit();
+  }
+
+  [[nodiscard]] uuid::UUID uuid() const { return handle->uuid(); }
+
+  rust::Box<quent::task_manager_loop_thread::TaskManagerLoopThreadHandle> handle;
+};
+
+struct TaskQueueHandleWrapper {
+  TaskQueueHandleWrapper(const telemetry_context& context, const std::string& queue_name)
+    : handle(quent::task_queue::create(context.context(),
+                                       {
+                                         .instance_name   = queue_name,
+                                         .parent_group_id = context.engine_id(),
+                                       }))
+  {
+    handle->operating({
+      .capacity_entries = std::numeric_limits<uint64_t>::max(),
+    });
+  }
+
+  TaskQueueHandleWrapper(const TaskQueueHandleWrapper&)            = delete;
+  TaskQueueHandleWrapper& operator=(const TaskQueueHandleWrapper&) = delete;
+  TaskQueueHandleWrapper(TaskQueueHandleWrapper&&)                 = delete;
+  TaskQueueHandleWrapper& operator=(TaskQueueHandleWrapper&&)      = delete;
+
+  ~TaskQueueHandleWrapper()
+  {
+    handle->finalizing();
+    handle->exit();
+  }
+
+  [[nodiscard]] uuid::UUID uuid() const { return handle->uuid(); }
+
+  rust::Box<quent::task_queue::TaskQueueHandle> handle;
 };
 
 // header-only shared thread-local storage handle: one per thread, shared across translation units
@@ -108,15 +173,13 @@ inline void thread_local_executor_thread_telemtry_init(const telemetry_context* 
 {
   if (not context) { return; }
 
-  try {
-    telemetry_thread_handle.emplace(*context, thread_name);
-  } catch (const std::exception& e) {
-    // Don't throw on telemetry handle creation failure.
-    SIRIUS_LOG_ERROR("{} executor thread telemetry init failed: {}", thread_name, e.what());
-  } catch (...) {
-    SIRIUS_LOG_ERROR("{} executor thread telemetry init failed with an unknown exception",
-                     thread_name);
-  }
+  telemetry_thread_handle.emplace(*context, thread_name);
+}
+
+inline uuid::UUID current_executor_thread_resource_id() noexcept
+{
+  if (!telemetry_thread_handle.has_value()) { return uuid::new_nil(); }
+  return telemetry_thread_handle->uuid();
 }
 
 }  // namespace sirius::telemetry

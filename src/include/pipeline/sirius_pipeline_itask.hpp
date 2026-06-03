@@ -19,6 +19,7 @@
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
+#include "telemetry-bridge/gen/task.rs.h"
 
 #include <cudf/utilities/default_stream.hpp>
 
@@ -47,7 +48,7 @@ class sirius_pipeline_itask : public parallel::itask {
   /**
    * @brief Destructor for proper cleanup of derived classes.
    */
-  ~sirius_pipeline_itask() override = default;
+  ~sirius_pipeline_itask() override;
 
   /**
    * @brief Compute and return the output data batches for this task.
@@ -102,6 +103,17 @@ class sirius_pipeline_itask : public parallel::itask {
     return _global_state->cast<sirius_pipeline_task_global_state>().get_pipeline_id();
   }
 
+  [[nodiscard]] uint64_t get_source_operator_id() const
+  {
+    auto* pipeline = _global_state->cast<sirius_pipeline_task_global_state>().get_pipeline();
+    if (!pipeline || !pipeline->get_source()) { return 0; }
+    return pipeline->get_source()->get_operator_id();
+  }
+
+  [[nodiscard]] quent::task::TaskHandle* telemetry_handle() const noexcept override;
+  void set_telemetry_finalized() noexcept { _telemetry_finalized = true; }
+  [[nodiscard]] bool telemetry_finalized() const noexcept { return _telemetry_finalized; }
+
  protected:
   /**
    * @brief Protected constructor for derived classes.
@@ -112,10 +124,11 @@ class sirius_pipeline_itask : public parallel::itask {
    */
   sirius_pipeline_itask(uint64_t task_id,
                         std::unique_ptr<sirius_pipeline_task_local_state> local_state,
-                        std::shared_ptr<sirius_pipeline_task_global_state> global_state)
-    : itask(task_id, std::move(local_state), std::move(global_state))
-  {
-  }
+                        std::shared_ptr<sirius_pipeline_task_global_state> global_state);
+
+ private:
+  rust::Box<quent::task::TaskHandle> _telemetry_task_handle;
+  bool _telemetry_finalized{false};
 };
 
 }  // namespace pipeline
