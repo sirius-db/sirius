@@ -96,7 +96,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   // Elect exactly one winner via CAS (0=not started → 1=computing).
   // The task_creator's while loop dispatches one task per batch, so multiple tasks
   // can be in-flight simultaneously. Losers passthrough without blocking — they don't
-  // need the boundaries themselves; sort_partition accesses them in a later pipeline.
+  // need the boundaries themselves; sort_partition runs next in the same pipeline task.
   int expected = 0;
   if (!_boundary_state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
     SIRIUS_LOG_DEBUG("Sort sample: passthrough ({} batches)", input_batches.size());
@@ -254,10 +254,8 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
       _num_partitions       = num_parts;
     }
 
-    // Pipeline framework calls stream.synchronize() after execute() returns, before
-    // publish_output(). Pipeline C only starts after all Pipeline B tasks complete,
-    // so _partition_boundaries is fully materialized on the GPU before sort_partition
-    // ever reads it. No explicit sync needed here.
+    // sort_partition runs in the same gpu_pipeline_task immediately after this
+    // execute() returns, so _partition_boundaries is visible before partition runs.
     _boundary_state.store(2, std::memory_order_release);
 
   } catch (...) {

@@ -742,12 +742,6 @@ void sirius_pipeline_converter::split_order_by_sink(
     sample_ptr->set_max_partition_bytes(op_params_.max_sort_partition_bytes);
   }
 
-  // Pipeline B: ORDER (source) -> SORT_SAMPLE (sink)
-  auto sample_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(build_ctx_);
-  sample_pipeline->source = order_op.get();
-  sample_pipeline->sink   = sample_ptr;
-  scheduled_.push_back(sample_pipeline);
-
   // Create SORT_PARTITION operator
   auto partition_op   = duckdb::make_uniq<op::sirius_physical_sort_partition>(order_ptr);
   auto* partition_ptr = partition_op.get();
@@ -755,11 +749,14 @@ void sirius_pipeline_converter::split_order_by_sink(
   // Wire sort_partition to read boundaries from sort_sample
   partition_ptr->set_sample_op(sample_ptr);
 
-  // Pipeline C: SORT_SAMPLE (source) -> SORT_PARTITION (sink)
-  auto partition_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(build_ctx_);
-  partition_pipeline->source = sample_ptr;
-  partition_pipeline->sink   = partition_ptr;
-  scheduled_.push_back(partition_pipeline);
+  // Pipeline B: ORDER (source) -> SORT_SAMPLE -> SORT_PARTITION (sink)
+  // Sample and partition run in one gpu_pipeline_task so partition sees sample
+  // boundaries immediately after sample completes on the same batch.
+  auto sample_partition_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(build_ctx_);
+  sample_partition_pipeline->source = order_op.get();
+  sample_partition_pipeline->operators.push_back(*sample_ptr);
+  sample_partition_pipeline->sink   = partition_ptr;
+  scheduled_.push_back(sample_partition_pipeline);
 
   // Create MERGE_SORT operator
   auto merge_op   = duckdb::make_uniq<op::sirius_physical_merge_sort>(order_ptr);
@@ -785,7 +782,7 @@ void sirius_pipeline_converter::split_order_by_sink(
     }
   }
 
-  // Pipeline D: SORT_PARTITION (source) -> MERGE_SORT (sink)
+  // Pipeline C: SORT_PARTITION (source) -> MERGE_SORT (sink)
   auto merge_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(build_ctx_);
   merge_pipeline->source = partition_ptr;
   merge_pipeline->sink   = merge_ptr;
@@ -1104,9 +1101,8 @@ void sirius_pipeline_converter::compute_repository_wiring()
              pipeline,
              dependent_pipeline);
       }
-    } else if (pipeline->sink->type == op::SiriusPhysicalOperatorType::ORDER_BY ||
-               pipeline->sink->type == op::SiriusPhysicalOperatorType::SORT_SAMPLE) {
-      // Pipeline barrier — sort operators process batches as they arrive
+    } else if (pipeline->sink->type == op::SiriusPhysicalOperatorType::ORDER_BY) {
+      // Pipeline barrier — downstream sample+partition pipeline processes batches as produced
       // (sort_sample overrides get_next_task_hint to wait for N batches)
       for (auto const& dependent_pipeline : source_to_pipelines[sink_op]) {
         emit("default", op::MemoryBarrierType::PIPELINE, sink_op, pipeline, dependent_pipeline);
