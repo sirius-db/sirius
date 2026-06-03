@@ -40,6 +40,9 @@
 #include <rmm/detail/error.hpp>
 #include <rmm/device_buffer.hpp>
 
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/types/validity_mask.hpp>
 #include <duckdb/common/types/vector.hpp>
@@ -495,46 +498,145 @@ staged_column stage_one_varchar_column(staging_state& s,
 }
 
 //===----------------------------------------------------------------------===//
-// Issue staged device reads and host copies.
+// Coalesce + issue staged reads into a pinned host buffer, then bulk-copy H2D.
+//
+// Buffered host_read_async into a pinned multiple_blocks_allocation that mirrors
+// the device-buffer layout (host byte offset == device byte offset), followed by
+// a bulk pinned->device copy. Versus per-segment O_DIRECT device_read_async this
+// (a) hits the OS page cache on warm runs instead of always hitting the NVMe,
+// (b) collapses N per-chunk H2D copies + stream callbacks into one async copy
+// per host block, and (c) coalesces file+buffer-contiguous reads. No segment is
+// copied twice: each read lands directly in its final pinned slot.
 //===----------------------------------------------------------------------===//
+
+using multiple_blocks_allocation =
+  cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
+
+// Merge reads that are contiguous in BOTH the file and the device/host buffer.
+// A merged read maps one contiguous file range onto one contiguous mirror-buffer
+// range, so it can be issued as a single (block-split) host read. Reads arrive
+// in device-offset order already; the sort is defensive.
+std::vector<device_read_job> coalesce_reads(std::vector<device_read_job> reads)
+{
+  std::sort(reads.begin(), reads.end(), [](auto const& a, auto const& b) {
+    return a.device_offset < b.device_offset;
+  });
+  std::vector<device_read_job> merged;
+  merged.reserve(reads.size());
+  for (auto const& r : reads) {
+    if (r.size == 0) { continue; }
+    if (!merged.empty()) {
+      auto& p = merged.back();
+      if (p.device_offset + p.size == r.device_offset && p.file_offset + p.size == r.file_offset) {
+        p.size += r.size;
+        continue;
+      }
+    }
+    merged.push_back(r);
+  }
+  return merged;
+}
+
+// memcpy `n` host bytes into the block-fragmented allocation at global byte
+// offset `g`, spanning block boundaries as needed.
+void copy_into_mirror(multiple_blocks_allocation& alloc,
+                      std::size_t g,
+                      uint8_t const* src,
+                      std::size_t n)
+{
+  std::size_t const bsz = alloc.block_size();
+  std::size_t done      = 0;
+  while (done < n) {
+    std::size_t const bi    = (g + done) / bsz;
+    std::size_t const off   = (g + done) % bsz;
+    std::size_t const chunk = std::min(n - done, bsz - off);
+    std::memcpy(reinterpret_cast<uint8_t*>(alloc.at(bi).data()) + off, src + done, chunk);
+    done += chunk;
+  }
+}
 
 void submit_and_await(rmm::device_buffer& device_buf,
                       staging_state const& s,
                       sirius::io::sirius_ioctx& io_ctx,
                       sirius::io::sirius_io_object& io_obj,
+                      cucascade::memory::memory_reservation_manager& host_mem_mgr,
                       rmm::cuda_stream_view stream)
 {
-  auto* device_base = static_cast<uint8_t*>(device_buf.data());
+  namespace ccm = cucascade::memory;
 
-  // Issue every block read concurrently. The backend fans these across reactors; only the
-  // bounce->GPU copies serialize on the stream.
-  // TODO (Kevin): coalesce adjacent reads
+  auto* device_base       = static_cast<uint8_t*>(device_buf.data());
+  std::size_t const total = s.running_offset;
+
+  // Pinned host staging buffer mirroring the device buffer (same byte offsets),
+  // drawn from the host FSMR pool so we reuse pre-pinned blocks instead of
+  // paying a cudaHostAlloc per split.
+  ccm::any_memory_space_in_tier host_req(ccm::Tier::HOST);
+  auto reservation = host_mem_mgr.request_reservation(host_req, total);
+  if (!reservation) {
+    throw std::runtime_error(std::string(kTag) + " failed to reserve " + std::to_string(total) +
+                             " bytes of host staging memory");
+  }
+  auto* host_fsmr =
+    reservation->get_memory_space().get_memory_resource_as<ccm::fixed_size_host_memory_resource>();
+  if (host_fsmr == nullptr) {
+    throw std::runtime_error(std::string(kTag) +
+                             " host memory space is not a fixed_size_host_memory_resource");
+  }
+  auto host_alloc       = host_fsmr->allocate_multiple_blocks(total, reservation.get());
+  std::size_t const bsz = host_alloc->block_size();
+
+  // Coalesce file+buffer-contiguous reads, then issue each as buffered async host
+  // reads split at host-block boundaries (the pinned buffer is fragmented into
+  // bsz-sized blocks). Each sub-read targets a contiguous region of one block and
+  // writes directly into its final pinned slot — no intermediate copy.
+  auto const merged = coalesce_reads(s.reads);
   std::vector<std::future<std::size_t>> read_futures;
-  read_futures.reserve(s.reads.size());
-  for (auto const& j : s.reads) {
-    read_futures.push_back(io_ctx.device_read_async(
-      io_obj, j.file_offset, j.size, device_base + j.device_offset, stream));
-  }
-
-  // CPU-produced segments (CONSTANT, ROARING) are already in pinned memory, so just issue the async
-  // copies.
-  for (auto const& h : s.host_copies) {
-    RMM_CUDA_TRY(cudaMemcpyAsync(
-      device_base + h.device_offset, h.src_ptr, h.size, cudaMemcpyHostToDevice, stream.value()));
-  }
-
-  // Await all the async device reads.
-  for (std::size_t i = 0; i < s.reads.size(); ++i) {
-    auto bytes_read = read_futures[i].get();
-    if (bytes_read != s.reads[i].size) {
-      throw std::runtime_error(std::string(kTag) + " short device read for file offset " +
-                               std::to_string(s.reads[i].file_offset) + ": got " +
-                               std::to_string(bytes_read) + " expected " +
-                               std::to_string(s.reads[i].size));
+  std::vector<std::size_t> expected;
+  read_futures.reserve(merged.size());
+  expected.reserve(merged.size());
+  for (auto const& r : merged) {
+    std::size_t remaining = r.size;
+    std::size_t fpos      = r.file_offset;
+    std::size_t g         = r.device_offset;
+    while (remaining > 0) {
+      std::size_t const bi    = g / bsz;
+      std::size_t const off   = g % bsz;
+      std::size_t const chunk = std::min(remaining, bsz - off);
+      auto* dst               = reinterpret_cast<uint8_t*>(host_alloc->at(bi).data()) + off;
+      read_futures.push_back(io_ctx.host_read_async(io_obj, fpos, chunk, dst));
+      expected.push_back(chunk);
+      remaining -= chunk;
+      fpos += chunk;
+      g += chunk;
     }
   }
 
-  // Ensure the pageable host copies complete before they are unpinned.
+  // CPU-produced segments (CONSTANT, ROARING) are copied into the mirror buffer so
+  // they ride the same bulk H2D copy as the file reads.
+  for (auto const& h : s.host_copies) {
+    copy_into_mirror(*host_alloc, h.device_offset, h.src_ptr, h.size);
+  }
+
+  // Await all host reads (verify full reads).
+  for (std::size_t i = 0; i < read_futures.size(); ++i) {
+    auto const got = read_futures[i].get();
+    if (got != expected[i]) {
+      throw std::runtime_error(std::string(kTag) + " short host read: got " + std::to_string(got) +
+                               " expected " + std::to_string(expected[i]));
+    }
+  }
+
+  // Bulk H2D: one async copy per host block (pinned -> contiguous device range).
+  // Alignment-gap bytes between segments are copied as-is and never read by the
+  // decode kernels (the device layout is identical to the staging pass).
+  for (std::size_t g = 0, bi = 0; g < total; g += bsz, ++bi) {
+    std::size_t const chunk = std::min(bsz, total - g);
+    RMM_CUDA_TRY(cudaMemcpyAsync(
+      device_base + g, host_alloc->at(bi).data(), chunk, cudaMemcpyHostToDevice, stream.value()));
+  }
+
+  // Sync before host_alloc / reservation drop so the H2D copies finish reading
+  // pinned memory first.
   RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));
 }
 
@@ -721,7 +823,12 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
 
   rmm::device_buffer device_buf(staging.running_offset, stream, mr_ref);
   if (staging.running_offset > 0) {
-    submit_and_await(device_buf, staging, *io_ctx, *io_obj, stream);
+    auto sirius_st = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    if (!sirius_st) {
+      throw std::runtime_error(std::string(kTag) + " no sirius_state on the ClientContext");
+    }
+    submit_and_await(
+      device_buf, staging, *io_ctx, *io_obj, sirius_st->get_memory_manager(), stream);
   }
 
   // Group fixed-width columns for a single gpu_decode_table call; varchar
