@@ -590,9 +590,11 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
   if (!seed) { return std::nullopt; }
 
   return std::accumulate(
-    std::next(alt.children.begin()), alt.children.end(), seed,
-    [&](std::optional<expr_ref> acc, std::unique_ptr<sirius::ast::node> const& child)
-      -> std::optional<expr_ref> {
+    std::next(alt.children.begin()),
+    alt.children.end(),
+    seed,
+    [&](std::optional<expr_ref> acc,
+        std::unique_ptr<sirius::ast::node> const& child) -> std::optional<expr_ref> {
       // A previous child failed to translate; propagate the failure.
       if (!acc) { return std::nullopt; }
 
