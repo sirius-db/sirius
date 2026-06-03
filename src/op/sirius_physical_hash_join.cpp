@@ -25,6 +25,7 @@
 #include "cudf/types.hpp"
 #include "cudf/unary.hpp"
 #include "cudf/utilities/memory_resource.hpp"
+#include "cudf/version_config.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -61,6 +62,17 @@ static void collect_bound_ref_indices(const duckdb::Expression& expr,
 static bool is_equality(sirius::comparison_type c)
 {
   return c == sirius::comparison_type::equal || c == sirius::comparison_type::not_distinct_from;
+}
+
+static cudf::filtered_join make_right_filtered_join(cudf::table_view const& right_keys,
+                                                    rmm::cuda_stream_view stream)
+{
+#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 8)
+  return cudf::filtered_join(right_keys, cudf::null_equality::UNEQUAL, stream);
+#else
+  return cudf::filtered_join(
+    right_keys, cudf::null_equality::UNEQUAL, cudf::set_as_build_table::RIGHT, stream);
+#endif
 }
 
 bool sirius_physical_hash_join::are_conditions_supported(
@@ -1157,27 +1169,22 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       right_indices = std::move(join_result.first);
       left_indices  = std::move(join_result.second);
     } else if (join_type == duckdb::JoinType::SEMI) {
-      auto filtered_join_object = cudf::filtered_join(
-        right_keys, cudf::null_equality::UNEQUAL, cudf::set_as_build_table::RIGHT, stream);
-      left_indices = filtered_join_object.semi_join(left_keys, stream);
+      auto filtered_join_object = make_right_filtered_join(right_keys, stream);
+      left_indices              = filtered_join_object.semi_join(left_keys, stream);
     } else if (join_type == duckdb::JoinType::RIGHT_SEMI) {
-      auto filtered_join_object = cudf::filtered_join(
-        left_keys, cudf::null_equality::UNEQUAL, cudf::set_as_build_table::RIGHT, stream);
-      right_indices = filtered_join_object.semi_join(right_keys, stream);
+      auto filtered_join_object = make_right_filtered_join(left_keys, stream);
+      right_indices             = filtered_join_object.semi_join(right_keys, stream);
     } else if (join_type == duckdb::JoinType::ANTI) {
-      auto filtered_join_object = cudf::filtered_join(
-        right_keys, cudf::null_equality::UNEQUAL, cudf::set_as_build_table::RIGHT, stream);
-      left_indices = filtered_join_object.anti_join(left_keys, stream);
+      auto filtered_join_object = make_right_filtered_join(right_keys, stream);
+      left_indices              = filtered_join_object.anti_join(left_keys, stream);
     } else if (join_type == duckdb::JoinType::RIGHT_ANTI) {
-      auto filtered_join_object = cudf::filtered_join(
-        left_keys, cudf::null_equality::UNEQUAL, cudf::set_as_build_table::RIGHT, stream);
-      right_indices = filtered_join_object.anti_join(right_keys, stream);
+      auto filtered_join_object = make_right_filtered_join(left_keys, stream);
+      right_indices             = filtered_join_object.anti_join(right_keys, stream);
     } else if (join_type == duckdb::JoinType::MARK) {
       // MARK join: output ALL left rows + a BOOL8 column indicating match presence.
       // Use semi join to find which left rows have matches in the right table.
-      auto filtered_join_object = cudf::filtered_join(
-        right_keys, cudf::null_equality::UNEQUAL, cudf::set_as_build_table::RIGHT, stream);
-      auto semi_indices = filtered_join_object.semi_join(left_keys, stream);
+      auto filtered_join_object = make_right_filtered_join(right_keys, stream);
+      auto semi_indices         = filtered_join_object.semi_join(left_keys, stream);
       return resolve_mark_join_result(
         *semi_indices, left_full, lhs_output_columns.col_idxs, input_batches[0], stream);
     } else if (join_type == duckdb::JoinType::OUTER) {

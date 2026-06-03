@@ -28,10 +28,12 @@ jobs:
   build-cuda-13:
     env:
       SCCACHE_GHA_ENABLED: true
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
     runs-on: [self-hosted, ubuntu-24.04, cpu-xl]
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
 
@@ -72,11 +74,13 @@ jobs:
   build-cuda-12:
     env:
       SCCACHE_GHA_ENABLED: true
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
     if: github.event_name != 'pull_request'
     runs-on: [self-hosted, ubuntu-22.04, cpu-xl]
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
 
@@ -123,7 +127,7 @@ jobs:
       CUDA_CACHE_PATH: /home/runner/actions-runner/_work/.cuda-cache
       SIRIUS_LOG_LEVEL: trace
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
         with:
@@ -199,7 +203,7 @@ jobs:
       CUDA_CACHE_PATH: /home/runner/actions-runner/_work/.cuda-cache
       SIRIUS_LOG_LEVEL: trace
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
         with:

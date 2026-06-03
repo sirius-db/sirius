@@ -15,6 +15,7 @@
  */
 
 // sirius
+#include <expression/ast/from_duckdb.hpp>
 #include <expression/expression_internal.hpp>
 #include <expression_executor/gpu_expression_translator_internal.hpp>
 #include <log/logging.hpp>
@@ -22,6 +23,13 @@
 // cudf
 #include <cudf/utilities/type_dispatcher.hpp>
 #include <cudf/wrappers/timestamps.hpp>
+
+// standard library
+#include <algorithm>
+#include <iterator>
+#include <numeric>
+#include <type_traits>
+#include <variant>
 
 namespace sirius {
 
@@ -204,7 +212,7 @@ std::string gpu_expression_translator::translated_expression::to_string() const
 }
 
 std::optional<gpu_expression_translator::translated_expression>
-gpu_expression_translator::translate_expression(duckdb::Expression const& expr,
+gpu_expression_translator::translate_expression(sirius::ast::node const& expr,
                                                 cudf::ast::table_reference const table_src)
 {
   reset_tree();
@@ -218,7 +226,7 @@ gpu_expression_translator::translate_expression(duckdb::Expression const& expr,
 
 std::optional<gpu_expression_translator::translated_expression>
 gpu_expression_translator::translate_expression_with_names(
-  duckdb::Expression const& expr, column_name_resolver_fxn column_name_resolver)
+  sirius::ast::node const& expr, column_name_resolver_fxn column_name_resolver)
 {
   reset_tree();
   _column_name_resolver = std::move(column_name_resolver);
@@ -239,29 +247,34 @@ std::optional<expr_ref> gpu_expression_translator::add_join_condition(
   auto right_table_ref =
     swap_sides ? cudf::ast::table_reference::LEFT : cudf::ast::table_reference::RIGHT;
 
-  auto left_expr = add_expression(*sirius::unwrap(condition.left), left_table_ref);
+  auto left_node = sirius::ast::from_duckdb(*sirius::unwrap(condition.left));
+  if (!left_node) { return std::nullopt; }
+  auto left_expr = add_expression(*left_node, left_table_ref);
   if (!left_expr) { return std::nullopt; }
 
-  auto right_expr = add_expression(*sirius::unwrap(condition.right), right_table_ref);
+  auto right_node = sirius::ast::from_duckdb(*sirius::unwrap(condition.right));
+  if (!right_node) { return std::nullopt; }
+  auto right_expr = add_expression(*right_node, right_table_ref);
   if (!right_expr) { return std::nullopt; }
 
   switch (condition.comparison) {
-    case sirius::comparison_type::equal:
+    using enum sirius::comparison_type;
+    case equal:
       return _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::EQUAL, *left_expr, *right_expr);
-    case sirius::comparison_type::not_equal:
+    case not_equal:
       return _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::NOT_EQUAL, *left_expr, *right_expr);
-    case sirius::comparison_type::lt:
+    case lt:
       return _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::LESS, *left_expr, *right_expr);
-    case sirius::comparison_type::gt:
+    case gt:
       return _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::GREATER, *left_expr, *right_expr);
-    case sirius::comparison_type::le:
+    case le:
       return _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::LESS_EQUAL, *left_expr, *right_expr);
-    case sirius::comparison_type::ge:
+    case ge:
       return _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::GREATER_EQUAL, *left_expr, *right_expr);
     default:
@@ -310,52 +323,299 @@ gpu_expression_translator::translate_join_conditions(
   return result;
 }
 
-std::optional<expr_ref> gpu_expression_translator::add_expression(
-  duckdb::Expression const& expr, cudf::ast::table_reference const table_src)
+namespace {
+
+/// @brief Recover the SQL type identifier of an AST node, where it is carried.
+///
+/// Used by the function arm's decimal-propagation guard. Node kinds that carry
+/// a logical type (reference, constant, cast, function_call) return its id;
+/// alternatives without one return INVALID, treated as a non-DECIMAL sentinel
+/// by the caller. References must be included so that direct decimal-column
+/// arithmetic (e.g. col + col) trips the guard, matching the pre-AST translator
+/// which checked every function child's return_type.
+sirius::type_id node_logical_type_id(sirius::ast::node const& expr)
 {
-  switch (expr.GetExpressionClass()) {
-    case duckdb::ExpressionClass::BOUND_BETWEEN:
-      return add_expression(expr.Cast<duckdb::BoundBetweenExpression>(), table_src);
-    case duckdb::ExpressionClass::BOUND_CASE: {
-      SIRIUS_LOG_DEBUG(
-        "[expression_translator] CASE expressions cannot be translated to cuDF ASTs: {}",
-        expr.ToString());
-      return std::nullopt;
-    }
-    case duckdb::ExpressionClass::BOUND_CAST:
-      return add_expression(expr.Cast<duckdb::BoundCastExpression>(), table_src);
-    case duckdb::ExpressionClass::BOUND_COMPARISON:
-      return add_expression(expr.Cast<duckdb::BoundComparisonExpression>(), table_src);
-    case duckdb::ExpressionClass::BOUND_CONJUNCTION:
-      return add_expression(expr.Cast<duckdb::BoundConjunctionExpression>(), table_src);
-    case duckdb::ExpressionClass::BOUND_CONSTANT:
-      return add_expression(expr.Cast<duckdb::BoundConstantExpression>(), table_src);
-    case duckdb::ExpressionClass::BOUND_FUNCTION:
-      return add_expression(expr.Cast<duckdb::BoundFunctionExpression>(), table_src);
-    case duckdb::ExpressionClass::BOUND_OPERATOR:
-      return add_expression(expr.Cast<duckdb::BoundOperatorExpression>(), table_src);
-    case duckdb::ExpressionClass::BOUND_PARAMETER: {
-      SIRIUS_LOG_DEBUG(
-        "[expression_translator] Cannot translate parameter expressions to cuDF ASTs: {}",
-        expr.ToString());
-      return std::nullopt;
-    }
-    case duckdb::ExpressionClass::BOUND_REF:
-      return add_expression(expr.Cast<duckdb::BoundReferenceExpression>(), table_src);
-    default:
-      throw duckdb::InternalException("[expression_translator] Unknown ExpressionClass: {}",
-                                      expr.GetExpressionClass());
+  return std::visit(
+    [](auto const& alt) -> sirius::type_id {
+      using T = std::decay_t<decltype(alt)>;
+      if constexpr (std::is_same_v<T, sirius::ast::reference>) {
+        return alt.return_type.id();
+      } else if constexpr (std::is_same_v<T, sirius::ast::constant>) {
+        return alt.return_type.id();
+      } else if constexpr (std::is_same_v<T, sirius::ast::cast>) {
+        return alt.target_type.id();
+      } else if constexpr (std::is_same_v<T, sirius::ast::function_call>) {
+        return alt.return_type().id();
+      } else {
+        return sirius::type_id::INVALID;
+      }
+    },
+    expr.v);
+}
+
+}  // namespace
+
+std::optional<expr_ref> gpu_expression_translator::add_expression(
+  sirius::ast::node const& expr, cudf::ast::table_reference const table_src)
+{
+  return std::visit(
+    [this, table_src](auto const& alt) -> std::optional<expr_ref> {
+      using T = std::decay_t<decltype(alt)>;
+      if constexpr (std::is_same_v<T, sirius::ast::reference> ||
+                    std::is_same_v<T, sirius::ast::constant> ||
+                    std::is_same_v<T, sirius::ast::comparison> ||
+                    std::is_same_v<T, sirius::ast::conjunction> ||
+                    std::is_same_v<T, sirius::ast::between> ||
+                    std::is_same_v<T, sirius::ast::case_expr> ||
+                    std::is_same_v<T, sirius::ast::cast> ||
+                    std::is_same_v<T, sirius::ast::unary_op> ||
+                    std::is_same_v<T, sirius::ast::coalesce> ||
+                    std::is_same_v<T, sirius::ast::in_list> ||
+                    std::is_same_v<T, sirius::ast::function_call>) {
+        return this->add_expression(alt, table_src);
+      } else {
+        static_assert(sizeof(T) == 0,
+                      "Unhandled sirius::ast alternative in add_expression dispatcher");
+      }
+    },
+    expr.v);
+}
+
+//===----------REFERENCE----------===//
+std::optional<expr_ref> gpu_expression_translator::add_expression(
+  sirius::ast::reference const& alt, cudf::ast::table_reference const table_src)
+{
+  if (_column_name_resolver) {
+    return _ast_tree.emplace<cudf::ast::column_name_reference>(
+      _column_name_resolver(alt.column_index));
   }
+  return _ast_tree.emplace<cudf::ast::column_reference>(alt.column_index, table_src);
+}
+
+//===----------CONSTANT----------===//
+std::optional<expr_ref> gpu_expression_translator::add_expression(
+  sirius::ast::constant const& alt, cudf::ast::table_reference const /*table_src*/)
+{
+  // A typed NULL constant has no cuDF AST literal representation; signal
+  // untranslatable so the caller falls back to DuckDB execution rather than
+  // unwrapping the empty payload below.
+  if (std::holds_alternative<sirius::null_value>(alt.payload)) {
+    SIRIUS_LOG_DEBUG("[expression_translator] NULL constants cannot be translated to cuDF ASTs");
+    return std::nullopt;
+  }
+
+  auto const cudf_type = sirius::get_cudf_type(alt.return_type);
+  // TODO: Expand type support as needed. See gpu_execute_constant.cpp.
+  switch (cudf_type.id()) {
+    case cudf::type_id::INT8: {
+      return add_literal_expression<cudf::numeric_scalar<int8_t>>(
+        std::get<int8_t>(alt.payload), true, _stream, _resource_ref);
+    }
+    case cudf::type_id::INT16: {
+      return add_literal_expression<cudf::numeric_scalar<int16_t>>(
+        std::get<int16_t>(alt.payload), true, _stream, _resource_ref);
+    }
+    case cudf::type_id::INT32: {
+      return add_literal_expression<cudf::numeric_scalar<int32_t>>(
+        std::get<int32_t>(alt.payload), true, _stream, _resource_ref);
+    }
+    case cudf::type_id::INT64: {
+      return add_literal_expression<cudf::numeric_scalar<int64_t>>(
+        std::get<int64_t>(alt.payload), true, _stream, _resource_ref);
+    }
+    case cudf::type_id::UINT8: {
+      return add_literal_expression<cudf::numeric_scalar<uint8_t>>(
+        std::get<uint8_t>(alt.payload), true, _stream, _resource_ref);
+    }
+    case cudf::type_id::UINT16: {
+      return add_literal_expression<cudf::numeric_scalar<uint16_t>>(
+        std::get<uint16_t>(alt.payload), true, _stream, _resource_ref);
+    }
+    case cudf::type_id::UINT32: {
+      return add_literal_expression<cudf::numeric_scalar<uint32_t>>(
+        std::get<uint32_t>(alt.payload), true, _stream, _resource_ref);
+    }
+    case cudf::type_id::UINT64: {
+      return add_literal_expression<cudf::numeric_scalar<uint64_t>>(
+        std::get<uint64_t>(alt.payload), true, _stream, _resource_ref);
+    }
+    case cudf::type_id::FLOAT32: {
+      return add_literal_expression<cudf::numeric_scalar<float>>(
+        std::get<float>(alt.payload), true, _stream, _resource_ref);
+    }
+    case cudf::type_id::FLOAT64: {
+      return add_literal_expression<cudf::numeric_scalar<double>>(
+        std::get<double>(alt.payload), true, _stream, _resource_ref);
+    }
+    case cudf::type_id::BOOL8: {
+      return add_literal_expression<cudf::numeric_scalar<bool>>(
+        std::get<bool>(alt.payload), true, _stream, _resource_ref);
+    }
+    case cudf::type_id::STRING: {
+      return add_literal_expression<cudf::string_scalar>(
+        std::get<std::string>(alt.payload), true, _stream, _resource_ref);
+    }
+    case cudf::type_id::TIMESTAMP_DAYS: {
+      return add_literal_expression<cudf::timestamp_scalar<cudf::timestamp_D>>(
+        cudf::duration_D{std::get<sirius::date_value>(alt.payload).days},
+        true,
+        _stream,
+        _resource_ref);
+    }
+    case cudf::type_id::TIMESTAMP_SECONDS: {
+      return add_literal_expression<cudf::timestamp_scalar<cudf::timestamp_s>>(
+        cudf::duration_s{std::get<sirius::timestamp_sec_value>(alt.payload).value},
+        true,
+        _stream,
+        _resource_ref);
+    }
+    case cudf::type_id::TIMESTAMP_MILLISECONDS: {
+      return add_literal_expression<cudf::timestamp_scalar<cudf::timestamp_ms>>(
+        cudf::duration_ms{std::get<sirius::timestamp_ms_value>(alt.payload).value},
+        true,
+        _stream,
+        _resource_ref);
+    }
+    case cudf::type_id::TIMESTAMP_MICROSECONDS: {
+      return add_literal_expression<cudf::timestamp_scalar<cudf::timestamp_us>>(
+        cudf::duration_us{std::get<sirius::timestamp_us_value>(alt.payload).value},
+        true,
+        _stream,
+        _resource_ref);
+    }
+    case cudf::type_id::TIMESTAMP_NANOSECONDS: {
+      return add_literal_expression<cudf::timestamp_scalar<cudf::timestamp_ns>>(
+        cudf::duration_ns{std::get<sirius::timestamp_ns_value>(alt.payload).value},
+        true,
+        _stream,
+        _resource_ref);
+    }
+    // cudf decimal type uses negative scale
+    case cudf::type_id::DECIMAL32: {
+      return add_literal_expression<cudf::fixed_point_scalar<numeric::decimal32>>(
+        std::get<sirius::decimal32>(alt.payload).value,
+        numeric::scale_type{-static_cast<int32_t>(alt.return_type.decimal_scale())},
+        true,
+        _stream,
+        _resource_ref);
+    }
+    case cudf::type_id::DECIMAL64: {
+      return add_literal_expression<cudf::fixed_point_scalar<numeric::decimal64>>(
+        std::get<sirius::decimal64>(alt.payload).value,
+        numeric::scale_type{-static_cast<int32_t>(alt.return_type.decimal_scale())},
+        true,
+        _stream,
+        _resource_ref);
+    }
+    case cudf::type_id::DECIMAL128: {
+      return add_literal_expression<cudf::fixed_point_scalar<numeric::decimal128>>(
+        std::get<sirius::decimal128>(alt.payload).value,
+        numeric::scale_type{-static_cast<int32_t>(alt.return_type.decimal_scale())},
+        true,
+        _stream,
+        _resource_ref);
+    }
+    default: {
+      SIRIUS_LOG_DEBUG("[expression_translator] Unsupported constant type_id: {}",
+                       static_cast<int>(cudf_type.id()));
+      return std::nullopt;
+    }
+  }
+}
+
+//===----------COMPARISON----------===//
+std::optional<expr_ref> gpu_expression_translator::add_expression(
+  sirius::ast::comparison const& alt, cudf::ast::table_reference const table_src)
+{
+  // Add the children
+  auto left_expr  = add_expression(*alt.left, table_src);
+  auto right_expr = add_expression(*alt.right, table_src);
+
+  // Check for failure in translating children
+  if (!left_expr || !right_expr) { return std::nullopt; }
+
+  // Construct the comparison expression
+  switch (alt.op) {
+    using enum sirius::comparison_type;
+    case equal:
+      return _ast_tree.emplace<cudf::ast::operation>(
+        cudf::ast::ast_operator::EQUAL, *left_expr, *right_expr);
+    case not_equal:
+      return _ast_tree.emplace<cudf::ast::operation>(
+        cudf::ast::ast_operator::NOT_EQUAL, *left_expr, *right_expr);
+    case lt:
+      return _ast_tree.emplace<cudf::ast::operation>(
+        cudf::ast::ast_operator::LESS, *left_expr, *right_expr);
+    case gt:
+      return _ast_tree.emplace<cudf::ast::operation>(
+        cudf::ast::ast_operator::GREATER, *left_expr, *right_expr);
+    case le:
+      return _ast_tree.emplace<cudf::ast::operation>(
+        cudf::ast::ast_operator::LESS_EQUAL, *left_expr, *right_expr);
+    case ge:
+      return _ast_tree.emplace<cudf::ast::operation>(
+        cudf::ast::ast_operator::GREATER_EQUAL, *left_expr, *right_expr);
+    case distinct_from:
+    case not_distinct_from: {
+      SIRIUS_LOG_DEBUG(
+        "[expression_translator] DISTINCT comparisons not supported in expression translator");
+      return std::nullopt;
+    }
+    default:
+      SIRIUS_LOG_DEBUG("[expression_translator] Unsupported comparison type: {}",
+                       static_cast<int>(alt.op));
+      return std::nullopt;
+  }
+}
+
+//===----------CONJUNCTION----------===//
+std::optional<expr_ref> gpu_expression_translator::add_expression(
+  sirius::ast::conjunction const& alt, cudf::ast::table_reference const table_src)
+{
+  // If there are no children, return
+  if (alt.children.empty()) { return std::nullopt; }
+
+  // Resolve the cuDF operator once up front rather than re-checking per child.
+  cudf::ast::ast_operator cudf_op{};
+  using enum sirius::ast::conjunction::kind;
+  switch (alt.op) {
+    case op_and: cudf_op = cudf::ast::ast_operator::LOGICAL_AND; break;
+    case op_or: cudf_op = cudf::ast::ast_operator::LOGICAL_OR; break;
+    default:
+      SIRIUS_LOG_DEBUG("[expression_translator] Unsupported conjunction type: {}",
+                       static_cast<int>(alt.op));
+      return std::nullopt;
+  }
+
+  // Seed with the first child, then fold the rest, combining with AND/OR as we go.
+  auto seed = add_expression(*alt.children.front(), table_src);
+  if (!seed) { return std::nullopt; }
+
+  return std::accumulate(
+    std::next(alt.children.begin()),
+    alt.children.end(),
+    seed,
+    [&](std::optional<expr_ref> acc,
+        std::unique_ptr<sirius::ast::node> const& child) -> std::optional<expr_ref> {
+      // A previous child failed to translate; propagate the failure.
+      if (!acc) { return std::nullopt; }
+
+      // Add child expression and check for failure in translating it.
+      auto child_expr = add_expression(*child, table_src);
+      if (!child_expr) { return std::nullopt; }
+
+      return _ast_tree.emplace<cudf::ast::operation>(cudf_op, *acc, *child_expr);
+    });
 }
 
 //===----------BETWEEN----------===//
 std::optional<expr_ref> gpu_expression_translator::add_expression(
-  duckdb::BoundBetweenExpression const& expr, cudf::ast::table_reference const table_src)
+  sirius::ast::between const& alt, cudf::ast::table_reference const table_src)
 {
   // Add the children.
-  auto input_expr = add_expression(*expr.input, table_src);
-  auto lower_expr = add_expression(*expr.lower, table_src);
-  auto upper_expr = add_expression(*expr.upper, table_src);
+  auto input_expr = add_expression(*alt.input, table_src);
+  auto lower_expr = add_expression(*alt.lower, table_src);
+  auto upper_expr = add_expression(*alt.upper, table_src);
 
   // Check for failure in translating children
   if (!input_expr || !lower_expr || !upper_expr) { return std::nullopt; }
@@ -369,19 +629,27 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
     cudf::ast::ast_operator::LOGICAL_AND, lower_cmp_op, upper_cmp_op);
 }
 
+//===----------CASE----------===//
+std::optional<expr_ref> gpu_expression_translator::add_expression(
+  sirius::ast::case_expr const& /*alt*/, cudf::ast::table_reference const /*table_src*/)
+{
+  SIRIUS_LOG_DEBUG("[expression_translator] CASE expressions cannot be translated to cuDF ASTs");
+  return std::nullopt;
+}
+
 //===----------CAST----------===//
 std::optional<expr_ref> gpu_expression_translator::add_expression(
-  duckdb::BoundCastExpression const& expr, cudf::ast::table_reference const table_src)
+  sirius::ast::cast const& alt, cudf::ast::table_reference const table_src)
 {
   // Add the child
-  auto child_expr = add_expression(*expr.child, table_src);
+  auto child_expr = add_expression(*alt.child, table_src);
 
   // Check for failure in translating child
   if (!child_expr) { return std::nullopt; }
 
   // Construct the CAST expression, if possible
   // CuDF AST only supports casts to INT64, UINT64, FLOAT64
-  auto const cudf_return_type = GetCudfType(expr.return_type);
+  auto const cudf_return_type = sirius::get_cudf_type(alt.target_type);
   switch (cudf_return_type.id()) {
     case cudf::type_id::INT64:
       return _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::CAST_TO_INT64,
@@ -400,326 +668,106 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
   }
 }
 
-//===----------COMPARISON----------===//
+//===----------UNARY OPERATOR----------===//
 std::optional<expr_ref> gpu_expression_translator::add_expression(
-  duckdb::BoundComparisonExpression const& expr, cudf::ast::table_reference const table_src)
+  sirius::ast::unary_op const& alt, cudf::ast::table_reference const table_src)
 {
-  // Add the children
-  auto left_expr  = add_expression(*expr.left, table_src);
-  auto right_expr = add_expression(*expr.right, table_src);
+  auto child_expr = add_expression(*alt.child, table_src);
+  if (!child_expr) { return std::nullopt; }
 
-  // Check for failure in translating children
-  if (!left_expr || !right_expr) { return std::nullopt; }
-
-  // Construct the comparison expression
-  switch (expr.GetExpressionType()) {
-    case duckdb::ExpressionType::COMPARE_EQUAL:
-      return _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::EQUAL, *left_expr, *right_expr);
-    case duckdb::ExpressionType::COMPARE_NOTEQUAL:
-      return _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::NOT_EQUAL, *left_expr, *right_expr);
-    case duckdb::ExpressionType::COMPARE_LESSTHAN:
-      return _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::LESS, *left_expr, *right_expr);
-    case duckdb::ExpressionType::COMPARE_GREATERTHAN:
-      return _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::GREATER, *left_expr, *right_expr);
-    case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO:
-      return _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::LESS_EQUAL, *left_expr, *right_expr);
-    case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO:
-      return _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::GREATER_EQUAL, *left_expr, *right_expr);
-    case duckdb::ExpressionType::COMPARE_DISTINCT_FROM:
-    case duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM: {
-      SIRIUS_LOG_DEBUG(
-        "[expression_translator] DISTINCT comparisons not supported in expression translator");
-      return std::nullopt;
+  switch (alt.op) {
+    using enum sirius::ast::unary_op::kind;
+    case op_not:
+      return _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::NOT, *child_expr);
+    case op_is_null:
+      return _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::IS_NULL, *child_expr);
+    case op_is_not_null: {
+      // Add IS_NULL followed by NOT to represent IS_NOT_NULL
+      expr_ref is_null_op =
+        _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::IS_NULL, *child_expr);
+      return _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::NOT, is_null_op);
     }
+    case op_try:
     default:
-      throw duckdb::InternalException("[expression_translator] Unknown comparison type: {}",
-                                      expr.GetExpressionType());
-  }
-}
-
-//===----------CONJUNCTION----------===//
-std::optional<expr_ref> gpu_expression_translator::add_expression(
-  duckdb::BoundConjunctionExpression const& expr, cudf::ast::table_reference const table_src)
-{
-  // If there are no children, return
-  if (expr.children.empty()) { return std::nullopt; }
-
-  // Add the children and combine with AND/OR operations as we go
-  auto result = add_expression(*expr.children[0], table_src);
-  if (!result) { return std::nullopt; }
-
-  for (size_t i = 1; i < expr.children.size(); ++i) {
-    // Add child expression
-    auto child_expr = add_expression(*expr.children[i], table_src);
-
-    // Check for failure in translating child
-    if (!child_expr) { return std::nullopt; }
-
-    // Combine with previous children using AND/OR
-    if (expr.GetExpressionType() == duckdb::ExpressionType::CONJUNCTION_AND) {
-      result = _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::LOGICAL_AND, *result, *child_expr);
-    } else if (expr.GetExpressionType() == duckdb::ExpressionType::CONJUNCTION_OR) {
-      result = _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::LOGICAL_OR, *result, *child_expr);
-    } else {
-      throw duckdb::InternalException("[expression_translator] Unknown conjunction type: {}",
-                                      expr.GetExpressionType());
-    }
-  }
-  return result;
-}
-
-//===----------CONSTANT----------===//
-std::optional<expr_ref> gpu_expression_translator::add_expression(
-  duckdb::BoundConstantExpression const& expr, cudf::ast::table_reference const table_src)
-{
-  auto const cudf_type = GetCudfType(expr.return_type);
-  // TODO: Expand type support as needed. See gpu_execute_constant.cpp.
-  switch (cudf_type.id()) {
-    case cudf::type_id::INT8: {
-      return add_literal_expression<cudf::numeric_scalar<int8_t>>(
-        expr.value.GetValue<int8_t>(), true, _stream, _resource_ref);
-    }
-    case cudf::type_id::INT16: {
-      return add_literal_expression<cudf::numeric_scalar<int16_t>>(
-        expr.value.GetValue<int16_t>(), true, _stream, _resource_ref);
-    }
-    case cudf::type_id::INT32: {
-      return add_literal_expression<cudf::numeric_scalar<int32_t>>(
-        expr.value.GetValue<int32_t>(), true, _stream, _resource_ref);
-    }
-    case cudf::type_id::INT64: {
-      return add_literal_expression<cudf::numeric_scalar<int64_t>>(
-        expr.value.GetValue<int64_t>(), true, _stream, _resource_ref);
-    }
-    case cudf::type_id::UINT8: {
-      return add_literal_expression<cudf::numeric_scalar<uint8_t>>(
-        expr.value.GetValue<uint8_t>(), true, _stream, _resource_ref);
-    }
-    case cudf::type_id::UINT16: {
-      return add_literal_expression<cudf::numeric_scalar<uint16_t>>(
-        expr.value.GetValue<uint16_t>(), true, _stream, _resource_ref);
-    }
-    case cudf::type_id::UINT32: {
-      return add_literal_expression<cudf::numeric_scalar<uint32_t>>(
-        expr.value.GetValue<uint32_t>(), true, _stream, _resource_ref);
-    }
-    case cudf::type_id::UINT64: {
-      return add_literal_expression<cudf::numeric_scalar<uint64_t>>(
-        expr.value.GetValue<uint64_t>(), true, _stream, _resource_ref);
-    }
-    case cudf::type_id::FLOAT32: {
-      return add_literal_expression<cudf::numeric_scalar<float_t>>(
-        expr.value.GetValue<float_t>(), true, _stream, _resource_ref);
-    }
-    case cudf::type_id::FLOAT64: {
-      return add_literal_expression<cudf::numeric_scalar<double_t>>(
-        expr.value.GetValue<double_t>(), true, _stream, _resource_ref);
-    }
-    case cudf::type_id::BOOL8: {
-      return add_literal_expression<cudf::numeric_scalar<bool>>(
-        expr.value.GetValue<bool>(), true, _stream, _resource_ref);
-    }
-    case cudf::type_id::STRING: {
-      return add_literal_expression<cudf::string_scalar>(
-        expr.value.GetValue<std::string>(), true, _stream, _resource_ref);
-    }
-    case cudf::type_id::TIMESTAMP_DAYS: {
-      return add_literal_expression<cudf::timestamp_scalar<cudf::timestamp_D>>(
-        cudf::duration_D{expr.value.GetValue<duckdb::date_t>().days}, true, _stream, _resource_ref);
-    }
-    case cudf::type_id::TIMESTAMP_SECONDS: {
-      return add_literal_expression<cudf::timestamp_scalar<cudf::timestamp_s>>(
-        cudf::duration_s{expr.value.GetValue<duckdb::timestamp_sec_t>().value},
-        true,
-        _stream,
-        _resource_ref);
-    }
-    case cudf::type_id::TIMESTAMP_MILLISECONDS: {
-      return add_literal_expression<cudf::timestamp_scalar<cudf::timestamp_ms>>(
-        cudf::duration_ms{expr.value.GetValue<duckdb::timestamp_ms_t>().value},
-        true,
-        _stream,
-        _resource_ref);
-    }
-    case cudf::type_id::TIMESTAMP_MICROSECONDS: {
-      return add_literal_expression<cudf::timestamp_scalar<cudf::timestamp_us>>(
-        cudf::duration_us{expr.value.GetValue<duckdb::timestamp_tz_t>().value},
-        true,
-        _stream,
-        _resource_ref);
-    }
-    case cudf::type_id::TIMESTAMP_NANOSECONDS: {
-      return add_literal_expression<cudf::timestamp_scalar<cudf::timestamp_ns>>(
-        cudf::duration_ns{expr.value.GetValue<duckdb::timestamp_tz_t>().value},
-        true,
-        _stream,
-        _resource_ref);
-    }
-    // cudf decimal type uses negative scale
-    case cudf::type_id::DECIMAL32: {
-      return add_literal_expression<cudf::fixed_point_scalar<numeric::decimal32>>(
-        expr.value.GetValueUnsafe<typename numeric::decimal32::rep>(),
-        numeric::scale_type{-duckdb::DecimalType::GetScale(expr.value.type())},
-        true,
-        _stream,
-        _resource_ref);
-    }
-    case cudf::type_id::DECIMAL64: {
-      return add_literal_expression<cudf::fixed_point_scalar<numeric::decimal64>>(
-        expr.value.GetValueUnsafe<typename numeric::decimal64::rep>(),
-        numeric::scale_type{-duckdb::DecimalType::GetScale(expr.value.type())},
-        true,
-        _stream,
-        _resource_ref);
-    }
-    case cudf::type_id::DECIMAL128: {
-      duckdb::hugeint_t const value = expr.value.GetValueUnsafe<duckdb::hugeint_t>();
-      __int128_t rep                = (static_cast<__int128_t>(value.upper) << 64) | value.lower;
-      return add_literal_expression<cudf::fixed_point_scalar<numeric::decimal128>>(
-        rep,
-        numeric::scale_type{-duckdb::DecimalType::GetScale(expr.value.type())},
-        true,
-        _stream,
-        _resource_ref);
-    }
-    default: {
-      SIRIUS_LOG_DEBUG("[expression_translator] Unsupported constant type_id: {}",
-                       static_cast<int>(cudf_type.id()));
+      // cuDF AST cannot express TRY.
+      SIRIUS_LOG_DEBUG(
+        "[expression_translator] TRY operator not supported in expression translator");
       return std::nullopt;
-    }
   }
+}
+
+//===----------COALESCE----------===//
+std::optional<expr_ref> gpu_expression_translator::add_expression(
+  sirius::ast::coalesce const& /*alt*/, cudf::ast::table_reference const /*table_src*/)
+{
+  SIRIUS_LOG_DEBUG(
+    "[expression_translator] COALESCE operator not supported in expression translator");
+  return std::nullopt;
+}
+
+//===----------IN / NOT IN----------===//
+std::optional<expr_ref> gpu_expression_translator::add_expression(
+  sirius::ast::in_list const& alt, cudf::ast::table_reference const table_src)
+{
+  // IN expressions must have at least one comparator value.
+  if (alt.values.empty()) { return std::nullopt; }
+
+  // Translate the first comparison expression
+  auto test_expr = add_expression(*alt.probe, table_src);
+  if (!test_expr) { return std::nullopt; }
+  auto comparator_expr = add_expression(*alt.values[0], table_src);
+  if (!comparator_expr) { return std::nullopt; }
+  expr_ref comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
+    cudf::ast::ast_operator::EQUAL, *test_expr, *comparator_expr);
+
+  // Loop over values, building an OR tree of comparisons.
+  // Re-translate the probe expression each time to avoid shared AST subgraphs.
+  for (size_t i = 1; i < alt.values.size(); ++i) {
+    auto probe_expr = add_expression(*alt.probe, table_src);
+    if (!probe_expr) { return std::nullopt; }
+    auto value_expr = add_expression(*alt.values[i], table_src);
+    if (!value_expr) { return std::nullopt; }
+
+    expr_ref next_comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
+      cudf::ast::ast_operator::EQUAL, *probe_expr, *value_expr);
+    comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
+      cudf::ast::ast_operator::LOGICAL_OR, comparison_expr, next_comparison_expr);
+  }
+
+  if (!alt.negated) { return comparison_expr; }
+  return _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::NOT, comparison_expr);
 }
 
 //===----------FUNCTION----------===//
 std::optional<expr_ref> gpu_expression_translator::add_expression(
-  duckdb::BoundFunctionExpression const& expr, cudf::ast::table_reference const table_src)
+  sirius::ast::function_call const& alt, cudf::ast::table_reference const table_src)
 {
-  // cuDF AST only supports numeric binary functions
-  // We need to disable operations that propagate decimal types up the expression tree
-  // We are waiting on this bug fix: https://github.com/rapidsai/cudf/pull/21996
-  auto block_function_translation = [](duckdb::BoundFunctionExpression const& expr) -> bool {
-    for (auto const& child : expr.children) {
-      auto const child_type = child->return_type;
-      if (child_type.id() == duckdb::LogicalTypeId::DECIMAL) {
-        SIRIUS_LOG_DEBUG(
-          "[expression_translator] Blocking function '{}' because it propagates decimal types",
-          expr.function.name);
-        return true;
-      }
-    }
-    return false;
-  };
-
-  auto const& func_str = expr.function.name;
-  if (func_str == "+") {
-    if (block_function_translation(expr)) { return std::nullopt; }
-    return add_function_expression<cudf::ast::ast_operator::ADD>(expr, table_src);
-  } else if (func_str == "-") {
-    if (block_function_translation(expr)) { return std::nullopt; }
-    return add_function_expression<cudf::ast::ast_operator::SUB>(expr, table_src);
-  } else if (func_str == "*") {
-    if (block_function_translation(expr)) { return std::nullopt; }
-    return add_function_expression<cudf::ast::ast_operator::MUL>(expr, table_src);
-  } else if (func_str == "/" || func_str == "//") {
-    if (block_function_translation(expr)) { return std::nullopt; }
-    return add_function_expression<cudf::ast::ast_operator::DIV>(expr, table_src);
-  } else if (func_str == "%") {
-    if (block_function_translation(expr)) { return std::nullopt; }
-    return add_function_expression<cudf::ast::ast_operator::MOD>(expr, table_src);
+  // cuDF AST only supports numeric binary functions. We must also disable any
+  // operation that propagates decimal types up the expression tree, pending the
+  // cuDF fix: https://github.com/rapidsai/cudf/pull/21996. Unsupported functions
+  // fall through to the default arm below, so checking decimal propagation once
+  // up front (rather than per supported case) is equivalent.
+  if (std::ranges::any_of(alt.arguments(), [](auto const& arg) {
+        return node_logical_type_id(*arg) == sirius::type_id::DECIMAL;
+      })) {
+    SIRIUS_LOG_DEBUG(
+      "[expression_translator] Blocking function because it propagates decimal types");
+    return std::nullopt;
   }
-  SIRIUS_LOG_DEBUG("[expression_translator] Unsupported function: {}", func_str);
-  return std::nullopt;
-}
 
-//===----------OPERATOR----------===//
-std::optional<expr_ref> gpu_expression_translator::add_expression(
-  duckdb::BoundOperatorExpression const& expr, cudf::ast::table_reference const table_src)
-{
-  switch (expr.type) {
-    case duckdb::ExpressionType::COMPARE_IN:  // Fallthrough
-    case duckdb::ExpressionType::COMPARE_NOT_IN: {
-      // [KEVIN]: It may be wise to limit the number of children for IN expressions that we
-      // attempt to translate, as a large number of children could lead to a very large/complex
-      // AST that could be very slow. For now, we will optimistically attempt to translate all
-      // IN expressions regardless of number of children, but we can revisit this if it becomes an
-      // issue.
-      assert(expr.children.size() > 1);  // IN expressions must have at least 2 children (test
-                                         // expression and at least 1 comparator expression)
-
-      // Translate the first comparison expression
-      auto test_expr = add_expression(*expr.children[0], table_src);
-      if (!test_expr) { return std::nullopt; }
-      auto comparator_expr = add_expression(*expr.children[1], table_src);
-      if (!comparator_expr) { return std::nullopt; }
-      expr_ref comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::EQUAL, *test_expr, *comparator_expr);
-
-      // Loop over children, building an OR tree of comparisons.
-      // Re-translate the test expression each time to avoid shared AST subgraphs.
-      for (size_t child = 2; child < expr.children.size(); ++child) {
-        auto test_expr = add_expression(*expr.children[0], table_src);
-        if (!test_expr) { return std::nullopt; }
-        auto comparator_expr = add_expression(*expr.children[child], table_src);
-        if (!comparator_expr) { return std::nullopt; }
-
-        expr_ref next_comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
-          cudf::ast::ast_operator::EQUAL, *test_expr, *comparator_expr);
-        comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
-          cudf::ast::ast_operator::LOGICAL_OR, comparison_expr, next_comparison_expr);
-      }
-
-      if (expr.type == duckdb::ExpressionType::COMPARE_IN) { return comparison_expr; }
-      return _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::NOT, comparison_expr);
-    }
-    case duckdb::ExpressionType::OPERATOR_COALESCE: {
-      SIRIUS_LOG_DEBUG(
-        "[expression_translator] COALESCE operator not supported in expression translator");
-      return std::nullopt;
-    }
-    case duckdb::ExpressionType::OPERATOR_TRY: {
-      SIRIUS_LOG_DEBUG(
-        "[expression_translator] TRY operator not supported in expression translator");
-      return std::nullopt;
-    }
-    case duckdb::ExpressionType::OPERATOR_NOT: {
-      auto child_expr = add_expression(*expr.children[0], table_src);
-      if (!child_expr) { return std::nullopt; }
-
-      return _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::NOT, *child_expr);
-    }
-    case duckdb::ExpressionType::OPERATOR_IS_NULL:  // Fallthrough
-    case duckdb::ExpressionType::OPERATOR_IS_NOT_NULL: {
-      auto child_expr = add_expression(*expr.children[0], table_src);
-      if (!child_expr) { return std::nullopt; }
-
-      // Add IS_NULL followed by NOT to represent IS_NOT_NULL
-      expr_ref is_null_op =
-        _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::IS_NULL, *child_expr);
-      if (expr.type == duckdb::ExpressionType::OPERATOR_IS_NULL) { return is_null_op; }
-      return _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::NOT, is_null_op);
-    }
+  switch (alt.function()) {
+    using enum sirius::function_id;
+    case add: return add_function_expression<cudf::ast::ast_operator::ADD>(alt, table_src);
+    case sub: return add_function_expression<cudf::ast::ast_operator::SUB>(alt, table_src);
+    case mul: return add_function_expression<cudf::ast::ast_operator::MUL>(alt, table_src);
+    case div:
+    case int_div: return add_function_expression<cudf::ast::ast_operator::DIV>(alt, table_src);
+    case mod: return add_function_expression<cudf::ast::ast_operator::MOD>(alt, table_src);
     default:
-      throw duckdb::InternalException("[expression_translator] Unknown operator type: {}",
-                                      expr.GetExpressionType());
+      SIRIUS_LOG_DEBUG("[expression_translator] Unsupported function: {}",
+                       static_cast<int>(alt.function()));
+      return std::nullopt;
   }
-}
-
-//===----------REFERENCE----------===//
-std::optional<expr_ref> gpu_expression_translator::add_expression(
-  duckdb::BoundReferenceExpression const& expr, cudf::ast::table_reference const table_src)
-{
-  if (_column_name_resolver) {
-    return _ast_tree.emplace<cudf::ast::column_name_reference>(_column_name_resolver(expr.index));
-  }
-  return _ast_tree.emplace<cudf::ast::column_reference>(expr.index, table_src);
 }
 
 }  // namespace sirius
