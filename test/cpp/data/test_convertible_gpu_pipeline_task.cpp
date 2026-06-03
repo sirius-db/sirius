@@ -28,10 +28,13 @@
 #include <parallel/task.hpp>
 #include <pipeline/gpu_pipeline_task.hpp>
 #include <pipeline/sirius_pipeline_task_states.hpp>
+#include <sirius_config.hpp>
+#include <telemetry/telemetry_context.hpp>
 
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -62,6 +65,14 @@ test_env& env()
   return e;
 }
 
+std::shared_ptr<const sirius::telemetry::telemetry_context> make_test_telemetry_context()
+{
+  sirius::telemetry_config config;
+  config.enable_quent = false;
+  config.engine_name  = "test-convertible-gpu-pipeline-task";
+  return sirius::telemetry::telemetry_context::create(config);
+}
+
 /// Minimal dummy task that is NOT a gpu_pipeline_task — used for predicate filtering tests.
 class dummy_task_local_state : public sirius::parallel::itask_local_state {};
 class dummy_task : public sirius::parallel::itask {
@@ -79,7 +90,8 @@ std::unique_ptr<sirius::pipeline::gpu_pipeline_task> make_test_gpu_task(
   auto op_data = std::make_unique<sirius::op::pipelineable_operator_data>(std::move(batches));
   auto local =
     std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(op_data));
-  auto global = std::make_shared<sirius::pipeline::gpu_pipeline_task_global_state>(nullptr);
+  auto global = std::make_shared<sirius::pipeline::gpu_pipeline_task_global_state>(
+    nullptr, make_test_telemetry_context());
 
   return std::make_unique<sirius::pipeline::gpu_pipeline_task>(
     task_id,

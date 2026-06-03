@@ -27,6 +27,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string>
 
@@ -43,6 +44,9 @@ namespace sirius::telemetry {
 /// Owns the top-level telemetry states for a single SiriusContext.
 class telemetry_context {
  public:
+  [[nodiscard]] static std::shared_ptr<const telemetry_context> create(
+    const sirius::telemetry_config& config);
+
   explicit telemetry_context(const sirius::telemetry_config& config);
   ~telemetry_context();
 
@@ -166,14 +170,11 @@ struct TaskQueueHandleWrapper {
 inline thread_local std::optional<ExecutorThreadHandleWrapper> telemetry_thread_handle{
   std::nullopt};
 
-// Initialize the thread local ExecutorThreadHandleWrapper. The supplied telemetry_context
-// may be null, in which case this will be a no-op.
-inline void thread_local_executor_thread_telemtry_init(const telemetry_context* context,
+// Initialize the thread local ExecutorThreadHandleWrapper for this worker thread.
+inline void thread_local_executor_thread_telemtry_init(const telemetry_context& context,
                                                        const std::string& thread_name)
 {
-  if (not context) { return; }
-
-  telemetry_thread_handle.emplace(*context, thread_name);
+  telemetry_thread_handle.emplace(context, thread_name);
 }
 
 inline uuid::UUID current_executor_thread_resource_id() noexcept

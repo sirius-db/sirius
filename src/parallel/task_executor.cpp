@@ -27,11 +27,11 @@
 namespace sirius {
 namespace parallel {
 
-itask_executor::itask_executor(exec::thread_pool_config config,
-                               telemetry::telemetry_context* telemetry_context)
-  : _config(std::move(config)), _telemetry_context(telemetry_context)
+itask_executor::itask_executor(
+  exec::thread_pool_config config,
+  std::shared_ptr<const telemetry::telemetry_context> telemetry_context)
+  : _config(std::move(config)), _telemetry_context(std::move(telemetry_context))
 {
-  if (!_telemetry_context) { return; }
   _task_queue_telemetry = std::make_unique<telemetry::TaskQueueHandleWrapper>(
     *_telemetry_context, _config.thread_name_prefix + "-task-queue");
 }
@@ -40,7 +40,7 @@ itask_executor::~itask_executor() { stop(); }
 
 void itask_executor::schedule(std::unique_ptr<itask> task)
 {
-  if (_task_queue_telemetry && task) {
+  if (task) {
     if (auto* handle = task->telemetry_handle()) {
       handle->queued({
         .queue_resource_id = _task_queue_telemetry->uuid(),

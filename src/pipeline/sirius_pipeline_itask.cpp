@@ -16,7 +16,6 @@
 
 #include "pipeline/sirius_pipeline_itask.hpp"
 
-#include "sirius_config.hpp"
 #include "telemetry/telemetry_context.hpp"
 
 #include <memory>
@@ -26,27 +25,14 @@
 namespace sirius::pipeline {
 namespace {
 
-const telemetry::telemetry_context& noop_task_telemetry_context()
-{
-  static telemetry::telemetry_context context([] {
-    telemetry_config config;
-    config.enable_quent = false;
-    config.engine_name  = "sirius-task-noop";
-    return config;
-  }());
-  return context;
-}
-
 rust::Box<quent::task::TaskHandle> create_task_handle(
   uint64_t task_id, const std::shared_ptr<sirius_pipeline_task_global_state>& global_state)
 {
-  auto* context = global_state->telemetry_context();
-  if (!context) { context = &noop_task_telemetry_context(); }
-
-  const auto instance_name = std::string("task-") + std::to_string(task_id);
-  const auto* pipeline     = global_state->get_pipeline();
-  const auto pipeline_uuid = pipeline ? pipeline->pipeline_uuid() : uuid::new_nil();
-  return quent::task::create(context->context(),
+  const auto instance_name      = std::string("task-") + std::to_string(task_id);
+  const auto* pipeline          = global_state->get_pipeline();
+  const auto pipeline_uuid      = pipeline ? pipeline->pipeline_uuid() : uuid::new_nil();
+  const auto& telemetry_context = global_state->telemetry_context();
+  return quent::task::create(telemetry_context.context(),
                              {
                                .instance_name = instance_name,
                                .pipeline_uuid = pipeline_uuid,

@@ -17,14 +17,29 @@
 #include "catch.hpp"
 #include "exec/config.hpp"
 #include "parallel/task_executor.hpp"
+#include "sirius_config.hpp"
+#include "telemetry/telemetry_context.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
 
 #include <chrono>
+#include <memory>
 #include <thread>
 
 using namespace sirius::parallel;
 using namespace std::chrono_literals;
+
+namespace {
+
+std::shared_ptr<const sirius::telemetry::telemetry_context> make_test_telemetry_context()
+{
+  sirius::telemetry_config config;
+  config.enable_quent = false;
+  config.engine_name  = "test-task-executor";
+  return sirius::telemetry::telemetry_context::create(config);
+}
+
+}  // namespace
 
 /**
  * Dummy task for tests.
@@ -67,7 +82,7 @@ class dummy_task : public itask {
 class dummy_task_executor : public itask_executor {
  public:
   explicit dummy_task_executor(sirius::exec::thread_pool_config config)
-    : itask_executor(std::move(config))
+    : itask_executor(std::move(config), make_test_telemetry_context())
   {
   }
 

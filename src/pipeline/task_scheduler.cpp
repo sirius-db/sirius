@@ -34,6 +34,7 @@
 
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace sirius {
 namespace pipeline {
@@ -42,20 +43,18 @@ task_scheduler::task_scheduler(
   const exec::thread_pool_config& gpu_executor_config,
   const exec::thread_pool_config& scan_executor_config,
   sirius::memory::sirius_memory_reservation_manager& mem_mgr,
+  std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context,
   const cucascade::memory::system_topology_info* sys_topology,
-  const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors,
-  sirius::telemetry::telemetry_context* telemetry_context)
-  : _telemetry_context(telemetry_context)
+  const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors)
+  : _telemetry_context(std::move(telemetry_context))
 {
-  if (_telemetry_context) {
-    _task_queue_telemetry = std::make_unique<sirius::telemetry::TaskQueueHandleWrapper>(
-      *_telemetry_context, "task-scheduler-gpu-queue");
-  }
+  _task_queue_telemetry = std::make_unique<sirius::telemetry::TaskQueueHandleWrapper>(
+    *_telemetry_context, "task-scheduler-gpu-queue");
 
   // Create the scan executor with memory manager for host allocations
   // Pass a publisher so it can submit task requests without depending on task_scheduler
   _scan_executor = std::make_unique<sirius::op::scan::duckdb_scan_executor>(
-    scan_executor_config, &mem_mgr, _task_request_channel.make_publisher(), telemetry_context);
+    scan_executor_config, &mem_mgr, _task_request_channel.make_publisher(), _telemetry_context);
 
   // Self-publisher: schedule() uses this to wake management_eventloop when a
   // new task is pushed, so the loop can re-run the matcher against any device
@@ -94,7 +93,7 @@ task_scheduler::task_scheduler(
                                               const_cast<cucascade::memory::memory_space*>(space),
                                               _task_request_channel.make_publisher(),
                                               dg_exec,
-                                              telemetry_context));
+                                              _telemetry_context));
   }
 }
 
@@ -109,12 +108,10 @@ void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> task)
   } else if (task->is<sirius::op::scan::cpu_source_task>()) {
     _scan_executor->schedule(std::move(task));
   } else {
-    if (_task_queue_telemetry) {
-      if (auto* handle = task->telemetry_handle()) {
-        handle->queued({
-          .queue_resource_id = _task_queue_telemetry->uuid(),
-        });
-      }
+    if (auto* handle = task->telemetry_handle()) {
+      handle->queued({
+        .queue_resource_id = _task_queue_telemetry->uuid(),
+      });
     }
     [[maybe_unused]] auto _ = _task_queue.push(std::move(task));
     if (_self_publisher) {
@@ -334,12 +331,8 @@ void task_scheduler::wait_for_completion()
 
 void task_scheduler::management_eventloop()
 {
-  std::unique_ptr<sirius::telemetry::TaskManagerLoopThreadHandleWrapper> manager_telemetry;
-  if (_telemetry_context) {
-    manager_telemetry = std::make_unique<sirius::telemetry::TaskManagerLoopThreadHandleWrapper>(
-      *_telemetry_context, "task-scheduler-manager");
-  }
-  const auto manager_resource_id = manager_telemetry ? manager_telemetry->uuid() : uuid::new_nil();
+  telemetry::TaskManagerLoopThreadHandleWrapper manager_thread_telemetry{*_telemetry_context,
+                                                                         "task-scheduler-thread"};
 
   // Pull-signal scheduler. The loop blocks on _task_request_channel for two
   // event kinds:
@@ -418,7 +411,7 @@ void task_scheduler::management_eventloop()
         pipeline_task->telemetry_handle()->routing({
           .instance_name              = "",
           .preferred_device_id        = device_id,
-          .manager_thread_resource_id = manager_resource_id,
+          .manager_thread_resource_id = manager_thread_telemetry.uuid(),
         });
       }
 

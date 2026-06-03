@@ -75,12 +75,6 @@ struct telemetry_config {
   std::string engine_name{"siriusDB"};
 };
 
-struct telemetry_config {
-  bool enable_quent{false};
-  std::string output_directory{"telemetry_data"};
-  std::string engine_name{"siriusDB"};
-};
-
 struct sirius_config {
   sirius_config();
   ~sirius_config() = default;

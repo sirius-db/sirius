@@ -77,8 +77,8 @@ duckdb_scan_executor::duckdb_scan_executor(
   exec::thread_pool_config config,
   cucascade::memory::memory_reservation_manager* mem_mgr,
   exec::publisher<std::unique_ptr<sirius::pipeline::task_request>> task_request_publisher,
-  sirius::telemetry::telemetry_context* telemetry_context)
-  : sirius::parallel::itask_executor(config, telemetry_context),
+  std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context)
+  : sirius::parallel::itask_executor(config, std::move(telemetry_context)),
     _task_request_publisher(std::move(task_request_publisher)),
     _mem_mgr(mem_mgr)
 {
@@ -124,7 +124,7 @@ absl::AnyInvocable<void() noexcept> duckdb_scan_executor::get_per_thread_init()
           thread_id_counter]() noexcept {
     const int32_t thread_id = thread_id_counter->fetch_add(1, std::memory_order_relaxed);
     thread_local_executor_thread_telemtry_init(
-      telemetry_context, fmt::format("{}-duckdb_scan_exec-{}", thread_prefix, thread_id));
+      *telemetry_context, fmt::format("{}-duckdb_scan_exec-{}", thread_prefix, thread_id));
   };
 }
 
@@ -358,12 +358,9 @@ std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
 
 void duckdb_scan_executor::manager_loop()
 {
-  std::unique_ptr<sirius::telemetry::TaskManagerLoopThreadHandleWrapper> manager_telemetry;
-  if (_telemetry_context) {
-    manager_telemetry = std::make_unique<sirius::telemetry::TaskManagerLoopThreadHandleWrapper>(
-      *_telemetry_context, fmt::format("{}-duckdb-scan-manager", _config.thread_name_prefix));
-  }
-  const auto manager_resource_id = manager_telemetry ? manager_telemetry->uuid() : uuid::new_nil();
+  sirius::telemetry::TaskManagerLoopThreadHandleWrapper manager_telemetry{
+    *_telemetry_context, fmt::format("{}-duckdb-scan-manager", _config.thread_name_prefix)};
+  const auto manager_resource_id = manager_telemetry.uuid();
 
   while (_running.load()) {
     auto slot = _bounded_pool->reserve();  // block till a thread is available

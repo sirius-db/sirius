@@ -51,7 +51,7 @@ namespace parallel {
 class itask_executor {
  public:
   explicit itask_executor(exec::thread_pool_config config,
-                          telemetry::telemetry_context* telemetry_context = nullptr);
+                          std::shared_ptr<const telemetry::telemetry_context> telemetry_context);
 
   virtual ~itask_executor();
 
@@ -167,7 +167,7 @@ class itask_executor {
   std::unique_ptr<exec::bounded_thread_pool> _bounded_pool;
   exec::inspectable_mpsc<itask> _task_queue;
   std::thread _manager_thread;
-  telemetry::telemetry_context* _telemetry_context{nullptr};
+  std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
   std::unique_ptr<telemetry::TaskQueueHandleWrapper> _task_queue_telemetry;
 };
 

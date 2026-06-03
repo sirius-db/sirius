@@ -140,9 +140,9 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   parquet_scan_task_global_state(
     duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
     sirius_physical_parquet_scan* scan_op,
+    std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context,
     std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE,
-    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs = {},
-    const sirius::telemetry::telemetry_context* telemetry_context                 = nullptr);
+    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs = {});
 
   //===----------Methods----------===//
   /**
@@ -483,11 +483,11 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   parquet_scan_task_global_state(
     duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
     sirius_physical_parquet_scan* scan_op,
+    std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context,
     std::vector<std::string> file_paths,
     std::vector<size_t> selected_column_indices,
     std::size_t approximate_batch_size,
-    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs = {},
-    const sirius::telemetry::telemetry_context* telemetry_context                 = nullptr);
+    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs = {});
 
  private:
   /**

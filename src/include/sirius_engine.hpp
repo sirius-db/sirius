@@ -34,6 +34,7 @@
 
 #include <cucascade/data/data_repository_manager.hpp>
 
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -122,7 +123,7 @@ class sirius_engine {
     iceberg_delete_data_cache_;
 
  private:
-  const telemetry::telemetry_context& telemetry_context_;
+  std::shared_ptr<const telemetry::telemetry_context> telemetry_context_;
   uuid::UUID query_group_uuid_;
   rust::Box<quent::query_group::QueryGroupObserver> query_group_observer_;
   rust::Box<quent::query::QueryHandle> query_handle_;

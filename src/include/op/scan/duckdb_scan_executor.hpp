@@ -77,7 +77,7 @@ class duckdb_scan_executor : public sirius::parallel::itask_executor {
     exec::thread_pool_config config,
     cucascade::memory::memory_reservation_manager* mem_mgr,
     exec::publisher<std::unique_ptr<sirius::pipeline::task_request>> task_request_publisher,
-    sirius::telemetry::telemetry_context* telemetry_context = nullptr);
+    std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context);
 
   /**
    * @brief Destructor for the duckdb_scan_executor.

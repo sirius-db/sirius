@@ -28,13 +28,15 @@
 #include "log/logging.hpp"
 #include "sirius_context.hpp"
 
+#include <memory>
 #include <optional>
 
 namespace sirius {
 
 namespace {
 
-const telemetry::telemetry_context& get_telemetry_context(duckdb::ClientContext& client_context)
+std::shared_ptr<const telemetry::telemetry_context> get_telemetry_context(
+  duckdb::ClientContext& client_context)
 {
   if (not client_context.registered_state) {
     throw duckdb::InvalidInputException("Sirius context is not registered.");

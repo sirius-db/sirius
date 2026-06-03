@@ -24,6 +24,8 @@
 #include "pipeline/oom_reschedule_exception.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
+#include "sirius_config.hpp"
+#include "telemetry/telemetry_context.hpp"
 #include "utils/utils.hpp"
 
 #include <rmm/cuda_stream.hpp>
@@ -45,6 +47,14 @@ namespace {
 
 // Memory layout constants:
 constexpr std::size_t kGpuCapacity = 500ULL * 1024 * 1024;  // 500 MB
+
+std::shared_ptr<const sirius::telemetry::telemetry_context> make_test_telemetry_context()
+{
+  sirius::telemetry_config config;
+  config.enable_quent = false;
+  config.engine_name  = "test-gpu-pipeline-task-history";
+  return sirius::telemetry::telemetry_context::create(config);
+}
 
 //------------------------------------------------------------------------------
 // Stub operator — minimal sirius_physical_operator with injectable behaviour.
@@ -324,8 +334,8 @@ TEST_CASE(
   // Build pipeline with a no-op operator so any failure comes from input materialization.
   auto ctx                = create_pipeline_context();
   ctx.stub_op->on_execute = make_passthrough_execute_fn();
-  auto global_state =
-    std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(ctx.pipeline);
+  auto global_state       = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+    ctx.pipeline, make_test_telemetry_context());
 
   auto task =
     create_pipeline_task(f, global_state, std::move(input_batch), kReservationSize, /*task_id=*/1);
@@ -381,8 +391,8 @@ TEST_CASE("gpu_pipeline_task execute OOM in operator execute records to pipeline
   auto ctx                = create_pipeline_context();
   ctx.stub_op->on_execute = make_allocating_execute_fn(f.gpu_space, kExecuteConsumptionSize);
 
-  auto global_state =
-    std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(ctx.pipeline);
+  auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+    ctx.pipeline, make_test_telemetry_context());
 
   auto task =
     create_pipeline_task(f, global_state, std::move(input_batch), kReservationSize, /*task_id=*/1);
@@ -430,8 +440,8 @@ TEST_CASE("gpu_pipeline_task execute successfully records to pipeline memory his
   auto ctx                = create_pipeline_context();
   ctx.stub_op->on_execute = make_allocating_execute_fn(f.gpu_space, kExecuteConsumptionSize1);
 
-  auto global_state =
-    std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(ctx.pipeline);
+  auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+    ctx.pipeline, make_test_telemetry_context());
 
   // Task 1: execute successfully with 20 MB input and 20 MB execute allocation
   auto task1 =
@@ -530,9 +540,9 @@ TEST_CASE("record_on_failure deduplicates OOM records and keeps max peak",
 
   rmm::cuda_stream stream, stream_data_init;
 
-  auto ctx = create_pipeline_context();
-  auto global_state =
-    std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(ctx.pipeline);
+  auto ctx          = create_pipeline_context();
+  auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+    ctx.pipeline, make_test_telemetry_context());
 
   // Create memory pressure to trigger OOM
   auto mem_pressure_reservation = f.manager->request_reservation(

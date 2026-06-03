@@ -68,9 +68,9 @@ class iceberg_scan_task_global_state : public parquet_scan_task_global_state {
   iceberg_scan_task_global_state(
     duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
     sirius_physical_iceberg_scan* scan_op,
+    std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context,
     size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE,
-    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs = {},
-    const sirius::telemetry::telemetry_context* telemetry_context                 = nullptr);
+    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs = {});
 
  private:
   // -------------------------------------------------------------------------
@@ -95,7 +95,7 @@ class iceberg_scan_task_global_state : public parquet_scan_task_global_state {
     init_data init,
     size_t approximate_batch_size,
     std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs,
-    const sirius::telemetry::telemetry_context* telemetry_context);
+    std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context);
 
   // -------------------------------------------------------------------------
   // Delete pipeline construction

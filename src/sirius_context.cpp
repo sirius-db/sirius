@@ -289,9 +289,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 {
   if (is_initialized_) { throw std::runtime_error("Sirius context is already initialized."); }
 
-  config_ = config;
-  telemetry_context_ =
-    std::make_unique<sirius::telemetry::telemetry_context>(config_.get_telemetry_config());
+  config_            = config;
+  telemetry_context_ = sirius::telemetry::telemetry_context::create(config_.get_telemetry_config());
 
   // Validate the cached topology before any downstream construction so a stub
   // topology fails loudly rather than producing zero-GPU executors silently.
@@ -594,9 +593,9 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     std::make_unique<sirius::pipeline::task_scheduler>(config_.get_gpu_pipeline_executor_config(),
                                                        config_.get_duckdb_scan_executor_config(),
                                                        *memory_manager_,
+                                                       telemetry_context_,
                                                        &config_.get_hw_topology(),
-                                                       &downgrade_executors_,
-                                                       telemetry_context_.get());
+                                                       &downgrade_executors_);
 
   task_creator_ = std::make_unique<sirius::creator::task_creator>(
     config_.get_task_creator_config(), *memory_manager_, &config_.get_hw_topology());
@@ -928,10 +927,11 @@ const sirius::scan_manager::sirius_scan_manager& SiriusContext::get_scan_manager
   return *scan_manager_;
 }
 
-const sirius::telemetry::telemetry_context& SiriusContext::get_telemetry_context() const
+std::shared_ptr<const sirius::telemetry::telemetry_context> SiriusContext::get_telemetry_context()
+  const
 {
   throw_if_not_initialized();
-  return *telemetry_context_;
+  return telemetry_context_;
 }
 
 void SiriusContext::create_query(

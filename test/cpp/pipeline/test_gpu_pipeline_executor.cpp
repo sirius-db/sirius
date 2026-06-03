@@ -22,6 +22,8 @@
 #include "pipeline/sirius_pipeline_task_states.hpp"
 #include "pipeline/task_request.hpp"
 #include "scan/test_utils.hpp"
+#include "sirius_config.hpp"
+#include "telemetry/telemetry_context.hpp"
 
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
@@ -32,6 +34,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -39,10 +42,21 @@ namespace {
 constexpr std::size_t kReservationBytes = 20 * 1024 * 1024;
 constexpr std::size_t kAllocationBytes  = 10 * 1024 * 1024;
 
+std::shared_ptr<const sirius::telemetry::telemetry_context> make_test_telemetry_context()
+{
+  sirius::telemetry_config config;
+  config.enable_quent = false;
+  config.engine_name  = "test-gpu-pipeline-executor";
+  return sirius::telemetry::telemetry_context::create(config);
+}
+
 class test_gpu_pipeline_task_global_state
   : public sirius::pipeline::sirius_pipeline_task_global_state {
  public:
-  test_gpu_pipeline_task_global_state() : sirius_pipeline_task_global_state(nullptr) {}
+  test_gpu_pipeline_task_global_state()
+    : sirius_pipeline_task_global_state(nullptr, make_test_telemetry_context())
+  {
+  }
 
   void add_error(std::string message)
   {
@@ -178,7 +192,8 @@ TEST_CASE("GPU pipeline executor schedules GPU tasks directly (push-model)",
   config.num_threads        = 2;
   config.thread_name_prefix = "gpu-pipeline-test";
 
-  sirius::pipeline::gpu_pipeline_executor executor(config, mem_space, request_publisher);
+  sirius::pipeline::gpu_pipeline_executor executor(
+    config, mem_space, std::move(request_publisher), nullptr, make_test_telemetry_context());
   auto global_state = std::make_shared<test_gpu_pipeline_task_global_state>();
 
   const int num_tasks = 10;

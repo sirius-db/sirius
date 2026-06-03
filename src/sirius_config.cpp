@@ -135,15 +135,6 @@ static void from_yaml(const YAML::Node& node, telemetry_config& opt)
   r.reject_unknown();
 }
 
-static void from_yaml(const YAML::Node& node, telemetry_config& opt)
-{
-  yaml::reader r(node, "telemetry");
-  r.optional("enable_quent", opt.enable_quent);
-  r.optional("output_directory", opt.output_directory);
-  r.optional("engine_name", opt.engine_name);
-  r.reject_unknown();
-}
-
 static void from_yaml(const YAML::Node& node, op::scan::scan_executor_config& opt)
 {
   yaml::reader r(node, "duckdb_scan");

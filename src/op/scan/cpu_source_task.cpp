@@ -33,6 +33,8 @@
 #include <duckdb/common/vector_size.hpp>
 
 #include <cstring>
+#include <memory>
+#include <utility>
 
 namespace sirius::op::scan {
 
@@ -42,8 +44,9 @@ namespace sirius::op::scan {
 cpu_source_task_global_state::cpu_source_task_global_state(
   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
   sirius_physical_cpu_source* source_op,
-  const sirius::telemetry::telemetry_context* telemetry_context)
-  : sirius_pipeline_task_global_state(std::move(pipeline), telemetry_context), _op(*source_op)
+  std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context)
+  : sirius_pipeline_task_global_state(std::move(pipeline), std::move(telemetry_context)),
+    _op(*source_op)
 {
 }
 

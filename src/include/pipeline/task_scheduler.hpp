@@ -35,6 +35,7 @@
 #include <atomic>
 #include <future>
 #include <map>
+#include <memory>
 #include <optional>
 #include <queue>
 #include <set>
@@ -80,13 +81,14 @@ class task_scheduler {
    * @param sys_topology Optional system topology info for CPU affinity
    * @param downgrade_executors Optional vector of downgrade executors
    */
-  explicit task_scheduler(const exec::thread_pool_config& gpu_executor_config,
-                          const exec::thread_pool_config& scan_executor_config,
-                          sirius::memory::sirius_memory_reservation_manager& mem_mgr,
-                          const cucascade::memory::system_topology_info* sys_topology = nullptr,
-                          const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>*
-                            downgrade_executors                                   = nullptr,
-                          sirius::telemetry::telemetry_context* telemetry_context = nullptr);
+  explicit task_scheduler(
+    const exec::thread_pool_config& gpu_executor_config,
+    const exec::thread_pool_config& scan_executor_config,
+    sirius::memory::sirius_memory_reservation_manager& mem_mgr,
+    std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context,
+    const cucascade::memory::system_topology_info* sys_topology = nullptr,
+    const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors =
+      nullptr);
 
   /**
    * @brief Destructor for the task_scheduler.
@@ -259,7 +261,7 @@ class task_scheduler {
   sirius::creator::task_creator* _task_creator{nullptr};
   std::unique_ptr<sirius::op::scan::duckdb_scan_executor> _scan_executor;
   std::unique_ptr<completion_handler> _completion_handler;
-  sirius::telemetry::telemetry_context* _telemetry_context{nullptr};
+  std::shared_ptr<const sirius::telemetry::telemetry_context> _telemetry_context;
   std::unique_ptr<sirius::telemetry::TaskQueueHandleWrapper> _task_queue_telemetry;
 };
 

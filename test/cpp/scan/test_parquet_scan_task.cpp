@@ -30,6 +30,8 @@
 #include <parallel/task_executor.hpp>
 #include <scan_manager/parquet_split_provider.hpp>
 #include <scan_manager/split_connector.hpp>
+#include <sirius_config.hpp>
+#include <telemetry/telemetry_context.hpp>
 
 // Phase 19 IO-15: include test_helpers_ioctx.hpp LAST among sirius/test
 // headers — it transitively pulls liburing.h via uring_ioctx.hpp ->
@@ -89,13 +91,25 @@ using batch_validator_t = void (*)(const std::vector<std::shared_ptr<cucascade::
                                    cucascade::memory::memory_reservation_manager&,
                                    rmm::cuda_stream_view);
 
+namespace {
+
+std::shared_ptr<const sirius::telemetry::telemetry_context> make_test_telemetry_context()
+{
+  sirius::telemetry_config config;
+  config.enable_quent = false;
+  config.engine_name  = "test-parquet-scan-task";
+  return sirius::telemetry::telemetry_context::create(config);
+}
+
+}  // namespace
+
 /**
  * Minimal concrete executor for scan task tests.
  */
 class scan_test_executor : public sirius::parallel::itask_executor {
  public:
   explicit scan_test_executor(sirius::exec::thread_pool_config config)
-    : itask_executor(std::move(config))
+    : itask_executor(std::move(config), make_test_telemetry_context())
   {
   }
 
@@ -398,8 +412,12 @@ static void run_parquet_scan_test(std::string const& table_name,
     make_parquet_scan(client_ctx, parquet_path.string(), std::move(projection_indices));
   REQUIRE(physical_scan);
 
-  auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr, physical_scan.get(), batch_size, make_test_gpu_ioctxs());
+  auto global_state =
+    std::make_shared<op::scan::parquet_scan_task_global_state>(nullptr,
+                                                               physical_scan.get(),
+                                                               make_test_telemetry_context(),
+                                                               batch_size,
+                                                               make_test_gpu_ioctxs());
 
   cucascade::shared_data_repository data_repo;
 
@@ -496,8 +514,12 @@ static void run_multi_file_parquet_scan_test(
     client_ctx, (parquet_dir / "*.parquet").string(), std::move(projection_indices));
   REQUIRE(physical_scan);
 
-  auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr, physical_scan.get(), batch_size, make_test_gpu_ioctxs());
+  auto global_state =
+    std::make_shared<op::scan::parquet_scan_task_global_state>(nullptr,
+                                                               physical_scan.get(),
+                                                               make_test_telemetry_context(),
+                                                               batch_size,
+                                                               make_test_gpu_ioctxs());
 
   cucascade::shared_data_repository data_repo;
 
@@ -580,8 +602,12 @@ static void run_parquet_scan_test_with_filter(
     client_ctx, parquet_path.string(), std::move(projection_indices), std::move(table_filters));
   REQUIRE(physical_scan);
 
-  auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr, physical_scan.get(), batch_size, make_test_gpu_ioctxs());
+  auto global_state =
+    std::make_shared<op::scan::parquet_scan_task_global_state>(nullptr,
+                                                               physical_scan.get(),
+                                                               make_test_telemetry_context(),
+                                                               batch_size,
+                                                               make_test_gpu_ioctxs());
 
   cucascade::shared_data_repository data_repo;
 
@@ -642,8 +668,12 @@ static size_t count_row_group_partitions(
     client_ctx, parquet_path, std::move(projection_indices), std::move(table_filters));
   REQUIRE(physical_scan);
 
-  auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr, physical_scan.get(), batch_size, make_test_gpu_ioctxs());
+  auto global_state =
+    std::make_shared<op::scan::parquet_scan_task_global_state>(nullptr,
+                                                               physical_scan.get(),
+                                                               make_test_telemetry_context(),
+                                                               batch_size,
+                                                               make_test_gpu_ioctxs());
   return global_state->get_num_row_group_partitions();
 }
 
