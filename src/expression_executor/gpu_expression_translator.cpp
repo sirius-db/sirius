@@ -327,18 +327,20 @@ namespace {
 
 /// @brief Recover the SQL type identifier of an AST node, where it is carried.
 ///
-/// Used by the function arm's decimal-propagation guard. Only the node kinds
-/// that carry a logical type return a meaningful id; alternatives without a
-/// logical type (e.g. reference) return INVALID, which is treated as a
-/// non-DECIMAL sentinel by the caller — matching the executor's return-type-only
-/// decimal skip (a reference to a decimal column is not the decimal-propagation
-/// case the cuDF intermediate-result bug targets).
+/// Used by the function arm's decimal-propagation guard. Node kinds that carry
+/// a logical type (reference, constant, cast, function_call) return its id;
+/// alternatives without one return INVALID, treated as a non-DECIMAL sentinel
+/// by the caller. References must be included so that direct decimal-column
+/// arithmetic (e.g. col + col) trips the guard, matching the pre-AST translator
+/// which checked every function child's return_type.
 sirius::type_id node_logical_type_id(sirius::ast::node const& expr)
 {
   return std::visit(
     [](auto const& alt) -> sirius::type_id {
       using T = std::decay_t<decltype(alt)>;
-      if constexpr (std::is_same_v<T, sirius::ast::constant>) {
+      if constexpr (std::is_same_v<T, sirius::ast::reference>) {
+        return alt.return_type.id();
+      } else if constexpr (std::is_same_v<T, sirius::ast::constant>) {
         return alt.return_type.id();
       } else if constexpr (std::is_same_v<T, sirius::ast::cast>) {
         return alt.target_type.id();
