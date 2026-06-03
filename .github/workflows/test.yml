@@ -28,6 +28,8 @@ jobs:
   build-cuda-13:
     env:
       SCCACHE_GHA_ENABLED: true
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
     runs-on: [self-hosted, ubuntu-24.04, cpu-xl]
     timeout-minutes: 60
     steps:
@@ -72,6 +74,8 @@ jobs:
   build-cuda-12:
     env:
       SCCACHE_GHA_ENABLED: true
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
     runs-on: [self-hosted, ubuntu-22.04, cpu-xl]
     timeout-minutes: 60
     steps:
