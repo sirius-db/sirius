@@ -26,6 +26,8 @@
 
 // standard library
 #include <algorithm>
+#include <iterator>
+#include <numeric>
 #include <type_traits>
 #include <variant>
 
@@ -571,32 +573,35 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
   // If there are no children, return
   if (alt.children.empty()) { return std::nullopt; }
 
-  // Add the children and combine with AND/OR operations as we go
-  auto result = add_expression(*alt.children[0], table_src);
-  if (!result) { return std::nullopt; }
-
-  for (size_t i = 1; i < alt.children.size(); ++i) {
-    // Add child expression
-    auto child_expr = add_expression(*alt.children[i], table_src);
-
-    // Check for failure in translating child
-    if (!child_expr) { return std::nullopt; }
-
-    // Combine with previous children using AND/OR
-    using enum sirius::ast::conjunction::kind;
-    if (alt.op == op_and) {
-      result = _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::LOGICAL_AND, *result, *child_expr);
-    } else if (alt.op == op_or) {
-      result = _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::LOGICAL_OR, *result, *child_expr);
-    } else {
+  // Resolve the cuDF operator once up front rather than re-checking per child.
+  cudf::ast::ast_operator cudf_op{};
+  using enum sirius::ast::conjunction::kind;
+  switch (alt.op) {
+    case op_and: cudf_op = cudf::ast::ast_operator::LOGICAL_AND; break;
+    case op_or: cudf_op = cudf::ast::ast_operator::LOGICAL_OR; break;
+    default:
       SIRIUS_LOG_DEBUG("[expression_translator] Unsupported conjunction type: {}",
                        static_cast<int>(alt.op));
       return std::nullopt;
-    }
   }
-  return result;
+
+  // Seed with the first child, then fold the rest, combining with AND/OR as we go.
+  auto seed = add_expression(*alt.children.front(), table_src);
+  if (!seed) { return std::nullopt; }
+
+  return std::accumulate(
+    std::next(alt.children.begin()), alt.children.end(), seed,
+    [&](std::optional<expr_ref> acc, std::unique_ptr<sirius::ast::node> const& child)
+      -> std::optional<expr_ref> {
+      // A previous child failed to translate; propagate the failure.
+      if (!acc) { return std::nullopt; }
+
+      // Add child expression and check for failure in translating it.
+      auto child_expr = add_expression(*child, table_src);
+      if (!child_expr) { return std::nullopt; }
+
+      return _ast_tree.emplace<cudf::ast::operation>(cudf_op, *acc, *child_expr);
+    });
 }
 
 //===----------BETWEEN----------===//
