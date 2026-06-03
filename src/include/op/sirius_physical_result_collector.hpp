@@ -50,6 +50,11 @@ class sirius_physical_result_collector : public sirius_physical_operator {
   duckdb::StatementProperties properties;
   sirius_physical_operator& plan;
   duckdb::vector<std::string> names;
+  //! Full DuckDB result column types (with nested child types/names). The base `types` member is
+  //! sirius::logical_type, which flattens nested types (STRUCT/LIST/MAP) and so cannot build the
+  //! nested result vectors; these bind types are used for the result collection and the chunk
+  //! reader.
+  duckdb::vector<duckdb::LogicalType> result_column_types;
 
  public:
   //! The final method used to fetch the query result from this operator

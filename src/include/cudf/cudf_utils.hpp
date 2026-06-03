@@ -117,8 +117,11 @@ inline cudf::data_type get_cudf_type(const logical_type& t)
     case type_id::TIMESTAMP: return cudf::data_type(cudf::type_id::TIMESTAMP_MICROSECONDS);
     case type_id::TIMESTAMP_NS: return cudf::data_type(cudf::type_id::TIMESTAMP_NANOSECONDS);
     case type_id::VARCHAR: return cudf::data_type(cudf::type_id::STRING);
+    // Nested containers map to the matching cuDF type id. cudf::data_type carries no child
+    // metadata (only id + scale), so this is sufficient for the by-id checks that compare against
+    // the real nested cuDF column produced by the reader. MAP rides the LIST placeholder.
     case type_id::STRUCT: return cudf::data_type(cudf::type_id::STRUCT);
-    case type_id::LIST:
+    case type_id::LIST: return cudf::data_type(cudf::type_id::LIST);
     case type_id::SQLNULL:
     case type_id::INVALID:
       throw duckdb::InvalidInputException("sirius::get_cudf_type: Type %s cannot be mapped to cuDF",

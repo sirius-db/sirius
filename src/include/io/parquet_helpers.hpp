@@ -36,15 +36,20 @@ struct schema_info {
 /// Walk the top-level columns of a parquet @c FileMetaData and map each to a
 /// DuckDB @c LogicalType.
 ///
-/// Only flat (leaf) top-level columns are supported: BOOLEAN, INT32 / INT64
-/// (and their signed/unsigned width variants), INT96, FLOAT, DOUBLE,
-/// BYTE_ARRAY / FIXED_LEN_BYTE_ARRAY (UTF8 → VARCHAR, otherwise BLOB), DECIMAL,
-/// DATE, TIME and TIMESTAMP. A nested top-level column (STRUCT / LIST / MAP)
-/// throws @c std::runtime_error — the Sirius GPU scan falls back to DuckDB CPU
-/// on nested types, so @c sirius_read_parquet does not map them in v1.
+/// Leaf columns map by physical/logical type: BOOLEAN, INT32 / INT64 (and their
+/// signed/unsigned width variants), INT96, FLOAT, DOUBLE, BYTE_ARRAY /
+/// FIXED_LEN_BYTE_ARRAY (UTF8 → VARCHAR, otherwise BLOB), DECIMAL, DATE, TIME
+/// and TIMESTAMP.
 ///
-/// @throws std::runtime_error on a nested top-level column, a malformed
-///         schema, or an unsupported physical type.
+/// Nested columns recurse over the preorder schema subtree: a plain group →
+/// @c LogicalType::STRUCT(children); a group annotated LIST (the standard
+/// 3-level @c LIST → repeated group → element encoding) → @c LogicalType::LIST;
+/// a group annotated MAP (@c MAP → repeated key_value → {key, value}) →
+/// @c LogicalType::MAP(key, value). The mapping matches DuckDB's own
+/// @c read_parquet bind shape for the same file.
+///
+/// @throws std::runtime_error on a malformed / truncated nested subtree or an
+///         unsupported physical type.
 schema_info extract_schema(cudf::io::parquet::FileMetaData const& meta);
 
 }  // namespace sirius::io::parquet_helpers

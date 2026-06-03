@@ -17,6 +17,7 @@
 
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
+#include <duckdb.hpp>
 
 #include <chrono>
 #include <cstddef>
@@ -68,6 +69,17 @@ bool truthy_env(std::string_view name)
 {
   auto value = env_or(name);
   return value == "1" || value == "true" || value == "TRUE" || value == "yes" || value == "YES";
+}
+
+std::string sql_quote(std::string_view value)
+{
+  std::string out{"'"};
+  for (char c : value) {
+    if (c == '\'') { out.push_back('\''); }
+    out.push_back(c);
+  }
+  out.push_back('\'');
+  return out;
 }
 
 struct s3_test_env {
@@ -156,6 +168,34 @@ std::filesystem::path parquet_fixture(std::string_view file_name)
 {
   return std::filesystem::path{SIRIUS_PROJECT_ROOT} / "test" / "cpp" / "integration" / "data" /
          "parquet" / file_name;
+}
+
+struct duckdb_parquet_bind_shape {
+  duckdb::vector<duckdb::LogicalType> types;
+  duckdb::vector<std::string> names;
+};
+
+duckdb_parquet_bind_shape duckdb_read_parquet_shape(std::filesystem::path const& path)
+{
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto result = con.Query("SELECT * FROM read_parquet(" + sql_quote(path.string()) + ") LIMIT 0");
+  REQUIRE(result);
+  INFO((result->HasError() ? result->GetError() : ""));
+  REQUIRE_FALSE(result->HasError());
+  return duckdb_parquet_bind_shape{result->types, result->names};
+}
+
+void check_bind_shape_matches_duckdb(sirius::scan_manager::parquet_bind_result const& actual,
+                                     duckdb_parquet_bind_shape const& expected)
+{
+  REQUIRE(actual.names == expected.names);
+  REQUIRE(actual.return_types.size() == expected.types.size());
+  for (std::size_t i = 0; i < expected.types.size(); ++i) {
+    INFO("column=" << expected.names[i] << " actual=" << actual.return_types[i].ToString()
+                   << " expected=" << expected.types[i].ToString());
+    CHECK(actual.return_types[i] == expected.types[i]);
+  }
 }
 
 s3_ioctx_config make_s3_config(s3_test_env const& env)
@@ -254,6 +294,34 @@ TEST_CASE("describe_parquet parses local parquet footer metadata through the ioc
 
     CHECK_FALSE(bind_info.names.empty());
     CHECK(bind_info.return_types.size() == bind_info.names.size());
+    CHECK(bind_info.total_num_rows > 0);
+    CHECK(bind_info.object_size > 0);
+  }
+}
+
+TEST_CASE("describe_parquet maps nested local parquet bind shape like DuckDB CPU read_parquet",
+          "[scan_manager][describe_parquet][s3][nested]")
+{
+  // Post-cleanup the scan_manager constructs its own local uring and
+  // create_datasource strips file:// itself, so no test-side ioctx wrapper or
+  // borrowed-backend list is needed.
+  scan_manager_config cfg{};
+  cfg.use_sirius_datasource = true;
+  cfg.uring_n_reactors      = 1;
+  sirius_scan_manager manager(std::move(cfg));
+
+  for (auto const fixture_name : {"nested_struct.parquet",
+                                  "nested_list.parquet",
+                                  "nested_map.parquet",
+                                  "nested_deep.parquet"}) {
+    auto const path     = parquet_fixture(fixture_name);
+    auto const expected = duckdb_read_parquet_shape(path);
+    auto const uri      = "file://" + path.string();
+
+    auto bind_info = manager.describe_parquet(uri);
+
+    INFO("fixture=" << fixture_name);
+    check_bind_shape_matches_duckdb(bind_info, expected);
     CHECK(bind_info.total_num_rows > 0);
     CHECK(bind_info.object_size > 0);
   }
@@ -390,6 +458,32 @@ TEST_CASE("describe_parquet inserts parsed parquet metadata into the prefetch ca
   CHECK(parquet->footer_byte_len() > 0);
   CHECK_FALSE(bind_info.names.empty());
   CHECK(parquet->file_metadata()->schema.size() >= bind_info.names.size() + 1);
+}
+
+TEST_CASE("describe_parquet maps nested S3 parquet bind shape like DuckDB CPU read_parquet",
+          "[.][s3][integration][describe_parquet][nested]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  describe_parquet_context fixture(*env, true);
+  auto& manager = fixture.context.get_scan_manager();
+
+  for (auto const fixture_name : {"nested_struct.parquet",
+                                  "nested_list.parquet",
+                                  "nested_map.parquet",
+                                  "nested_deep.parquet"}) {
+    auto const local_path = parquet_fixture(fixture_name);
+    auto const expected   = duckdb_read_parquet_shape(local_path);
+    auto const uri        = s3_uri(env->bucket, "parquet/" + std::string{fixture_name});
+
+    auto bind_info = manager.describe_parquet(uri);
+
+    INFO("fixture=" << fixture_name);
+    check_bind_shape_matches_duckdb(bind_info, expected);
+    CHECK(bind_info.total_num_rows > 0);
+    CHECK(bind_info.object_size > 0);
+  }
 }
 
 TEST_CASE("describe_parquet exposes the parquet footer row count for planner metadata",

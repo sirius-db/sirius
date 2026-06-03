@@ -45,8 +45,13 @@ logical_type from_duckdb(const duckdb::LogicalType& t)
     case LogicalTypeId::TIMESTAMP: return logical_type::make(type_id::TIMESTAMP);
     case LogicalTypeId::TIMESTAMP_NS: return logical_type::make(type_id::TIMESTAMP_NS);
     case LogicalTypeId::VARCHAR: return logical_type::make(type_id::VARCHAR);
+    // Nested types: sirius::logical_type is flat and cannot carry child types/names, so these are
+    // opaque placeholders. The faithful nested DuckDB type is carried separately (the result
+    // collector materializes from the bind LogicalTypes, not from these). MAP is physically a
+    // LIST<STRUCT<key,value>>, so it shares the LIST placeholder.
     case LogicalTypeId::STRUCT: return logical_type::make(type_id::STRUCT);
     case LogicalTypeId::LIST: return logical_type::make(type_id::LIST);
+    case LogicalTypeId::MAP: return logical_type::make(type_id::LIST);
     case LogicalTypeId::DECIMAL:
       return logical_type::make_decimal(duckdb::DecimalType::GetWidth(t),
                                         duckdb::DecimalType::GetScale(t));

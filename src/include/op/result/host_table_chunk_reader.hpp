@@ -77,6 +77,12 @@ class host_table_chunk_reader {
                            ///< allocation
     bool use_int64_offsets{false};  ///< Whether the offset column uses INT64 (from cudf::pack)
 
+    /// Child readers for nested columns. STRUCT: one per field, in order. LIST /
+    /// MAP: a single reader for the value child (cuDF child index 1); the list
+    /// offsets are read through @c offset_accessor_32. Empty for flat leaves and
+    /// STRING (whose offsets live in @c offset_accessor_32 / @c _64).
+    std::vector<column_reader> children;
+
     /**
      * @brief Construct a new column reader object
      * @param[in] col The column metadata describing the column's buffer layout
@@ -86,19 +92,6 @@ class host_table_chunk_reader {
 
     column_reader(cucascade::memory::column_metadata const& col,
                   std::shared_ptr<multiple_blocks_allocation> const& allocation);
-
-    /**
-     * @brief Copy the null mask to the duckdb validity mask for the given row range
-     *
-     * @param[in,out] validity The duckdb validity mask to copy into
-     * @param[in] row_offset The starting row offset to copy from
-     * @param[in] count The number of rows to copy
-     * @param[in] allocation The multiple blocks allocation containing the column data
-     */
-    void copy_mask_to_validity(duckdb::ValidityMask& validity,
-                               size_t row_offset,
-                               size_t count,
-                               std::shared_ptr<multiple_blocks_allocation> const& allocation);
 
     /**
      * @brief Copy fixed-width data into the duckdb vector for the given row range
@@ -125,6 +118,40 @@ class host_table_chunk_reader {
                      size_t row_offset,
                      size_t count,
                      std::shared_ptr<multiple_blocks_allocation> const& allocation);
+
+    /**
+     * @brief Recursively materialize a nested column (STRUCT / LIST / MAP) and its
+     * children into @p vector for the row range [row_offset, row_offset+count).
+     *
+     * STRUCT fills each child field for the same row range; LIST / MAP derives the
+     * child element range from the cuDF offsets, builds DuckDB list_entry_t, and
+     * recurses into the value child; leaves under a nest are materialized with
+     * range-based reads. Used only for nested top-level columns — flat columns use
+     * the copy_* methods directly.
+     *
+     * @param[in] client_ctx DuckDB client context (for type-widening casts on leaves)
+     * @param[in,out] vector  The (pre-typed) DuckDB vector to fill
+     * @param[in] row_offset  Absolute starting element index within this column
+     * @param[in] count       Number of elements to materialize
+     * @param[in] allocation  The multiple blocks allocation containing the column data
+     */
+    void read_into(duckdb::ClientContext& client_ctx,
+                   duckdb::Vector& vector,
+                   size_t row_offset,
+                   size_t count,
+                   std::shared_ptr<multiple_blocks_allocation> const& allocation);
+
+    /**
+     * @brief Copy this column's null mask for [row_offset, row_offset+count) into
+     * @p validity, starting at validity index 0. Bit-accurate for any row_offset
+     * (a misaligned start, as produced by LIST child slicing, is read bit-by-bit;
+     * a byte-aligned start uses a bulk copy). A column with no nulls leaves the
+     * mask all-valid.
+     */
+    void copy_validity_range(duckdb::ValidityMask& validity,
+                             size_t row_offset,
+                             size_t count,
+                             std::shared_ptr<multiple_blocks_allocation> const& allocation);
   };
 
  public:
@@ -133,10 +160,21 @@ class host_table_chunk_reader {
    *
    * @param[in] client_ctx The duckdb client context (for allocation)
    * @param[in] host_table The cucascade::host_data_representation to read from
-   * @param[in] types The duckdb logical types for the chunk columns
+   * @param[in] types The full DuckDB logical types for the chunk columns. These MUST carry nested
+   * child types/names (STRUCT fields, LIST element, MAP key/value) — the chunk's nested vectors are
+   * built from them. Prefer this overload at the result collector, which has the bind types.
    * @throw std::runtime_error If there is a mismatch in column metadata and types, if the row count
    * is negative or inconsistent across columns, or if the duckdb output logical type for any column
    * is HUGEINT.
+   */
+  host_table_chunk_reader(duckdb::ClientContext& client_ctx,
+                          cucascade::host_data_representation const& host_table,
+                          duckdb::vector<duckdb::LogicalType> const& types);
+
+  /**
+   * @brief Convenience overload taking sirius logical types. NOTE: sirius::logical_type cannot
+   * represent nested child types, so this overload only supports flat columns; nested columns must
+   * use the DuckDB-typed overload above. Retained for flat-column call sites and unit tests.
    */
   host_table_chunk_reader(duckdb::ClientContext& client_ctx,
                           cucascade::host_data_representation const& host_table,

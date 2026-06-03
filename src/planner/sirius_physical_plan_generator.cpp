@@ -22,12 +22,69 @@
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/list.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "log/logging.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 
 namespace sirius::planner {
+
+namespace {
+
+bool is_nested_logical_type(duckdb::LogicalType const& type)
+{
+  auto const id = type.id();
+  return id == duckdb::LogicalTypeId::STRUCT || id == duckdb::LogicalTypeId::LIST ||
+         id == duckdb::LogicalTypeId::MAP;
+}
+
+}  // namespace
+
+void sirius_physical_plan_generator::reject_nested_column_operation(duckdb::Expression const& expr,
+                                                                    std::string_view operation)
+{
+  // A nested-typed column reference is the clearest signal that the query operates
+  // on a nested column (WHERE / GROUP BY / JOIN ON). Report it by name.
+  if (is_nested_logical_type(expr.return_type) &&
+      expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+    auto name = expr.GetName();
+    if (name.empty()) { name = expr.ToString(); }
+    throw std::runtime_error("nested column operation on column '" + name + "' (" +
+                             expr.return_type.ToString() + ") is unsupported in " +
+                             std::string(operation) +
+                             ": Sirius reads and projects nested columns but cannot operate on "
+                             "them yet");
+  }
+
+  // Recurse first so a nested column reference nested inside the expression is
+  // reported (by name) in preference to a constructed nested value.
+  duckdb::ExpressionIterator::EnumerateChildren(expr,
+                                                [&operation](duckdb::Expression const& child) {
+                                                  reject_nested_column_operation(child, operation);
+                                                });
+
+  // A nested-typed non-reference expression (e.g. struct_pack(...) / a list
+  // constructor) cannot be evaluated on the GPU path either.
+  if (is_nested_logical_type(expr.return_type)) {
+    throw std::runtime_error("nested column operation on '" + expr.ToString() + "' (" +
+                             expr.return_type.ToString() + ") is unsupported in " +
+                             std::string(operation));
+  }
+}
+
+void sirius_physical_plan_generator::reject_nested_column_type(duckdb::LogicalType const& type,
+                                                               std::string_view column_name,
+                                                               std::string_view operation)
+{
+  if (is_nested_logical_type(type)) {
+    throw std::runtime_error("nested column operation on column '" + std::string(column_name) +
+                             "' (" + type.ToString() + ") is unsupported in " +
+                             std::string(operation) +
+                             ": Sirius reads and projects nested columns but cannot operate on "
+                             "them yet");
+  }
+}
 
 sirius_physical_plan_generator::sirius_physical_plan_generator(duckdb::ClientContext& context)
   : context(context)

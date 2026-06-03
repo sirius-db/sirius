@@ -22,8 +22,12 @@
 #include "duckdb/common/unordered_set.hpp"
 #include "op/sirius_physical_operator.hpp"
 
+#include <string_view>
+
 namespace duckdb {
 class ClientContext;
+class Expression;
+class LogicalType;
 class GPUContext;
 class ColumnDataCollection;
 class LogicalOperator;
@@ -164,6 +168,23 @@ class sirius_physical_plan_generator {
     duckdb::LogicalComparisonJoin& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_delim_join(
     duckdb::LogicalComparisonJoin& op);
+
+  // Phase-1 boundary: Sirius reads and projects nested (STRUCT / LIST / MAP) columns
+  // but cannot yet *operate* on them. Walks @p expr and, on finding a nested-typed
+  // column reference (or a nested-typed expression), throws a clear unsupported
+  // error naming the column. Call from filter / aggregate / join planning so a
+  // WHERE / GROUP BY / JOIN ON over a nested column fails cleanly instead of
+  // crashing or producing a wrong result. @p operation names the context, e.g.
+  // "a filter predicate", "GROUP BY", "a join condition".
+  static void reject_nested_column_operation(duckdb::Expression const& expr,
+                                             std::string_view operation);
+
+  // Same Phase-1 boundary, but when only a column TYPE + name are available rather
+  // than an expression (e.g. a predicate pushed into LogicalGet::table_filters).
+  // Throws the same clear unsupported error if @p type is nested (STRUCT/LIST/MAP).
+  static void reject_nested_column_type(duckdb::LogicalType const& type,
+                                        std::string_view column_name,
+                                        std::string_view operation);
 
   // private:
   bool preserve_insertion_order(sirius::op::sirius_physical_operator& plan);

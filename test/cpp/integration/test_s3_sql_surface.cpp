@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -451,6 +452,39 @@ std::string s3_sirius_parquet_scan(s3_test_env const& env, std::string_view tabl
 {
   auto const key = "parquet/" + std::string{table} + ".parquet";
   return "sirius_read_parquet(" + sql_quote(s3_uri(env.bucket, key)) + ")";
+}
+
+std::string lowercase(std::string value)
+{
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return value;
+}
+
+void require_rows_equal(duckdb::MaterializedQueryResult& actual,
+                        duckdb::MaterializedQueryResult& expected)
+{
+  REQUIRE(actual.RowCount() == expected.RowCount());
+  REQUIRE(actual.ColumnCount() == expected.ColumnCount());
+  CHECK(collect_rows(actual) == collect_rows(expected));
+}
+
+void require_nested_operation_unsupported(s3_sql_fixture& fixture,
+                                          std::string const& sql,
+                                          std::string_view column_name)
+{
+  auto result = fixture.con.Query(gpu_execution_sql(sql));
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+
+  auto const error       = result->GetError();
+  auto const lower_error = lowercase(error);
+  INFO(error);
+  CHECK(lower_error.find("nested column operation") != std::string::npos);
+  CHECK((lower_error.find("unsupported") != std::string::npos ||
+         lower_error.find("not supported") != std::string::npos));
+  CHECK(error.find(std::string{column_name}) != std::string::npos);
 }
 
 std::string s3_large_lineitem_uri(s3_test_env const& env)
@@ -1285,6 +1319,77 @@ TEST_CASE("gpu_execution S3 nested parquet probe returns oracle rows or a clear 
   auto materialized = std::unique_ptr<duckdb::MaterializedQueryResult>(
     static_cast<duckdb::MaterializedQueryResult*>(result.release()));
   check_rows_equal_with_tolerant_columns(*materialized, *baseline_result, {});
+}
+
+TEST_CASE("gpu_execution S3 nested parquet projections match local DuckDB CPU",
+          "[.][s3][integration][sql][gpu_execution][nested]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  struct nested_projection_case {
+    std::string_view table;
+    std::string_view select_list;
+  };
+
+  constexpr std::array<nested_projection_case, 5> cases{{
+    {"nested_struct", "id, payload"},
+    {"nested_list", "id, items"},
+    {"nested_map", "id, attrs"},
+    {"nested_deep", "id, struct_of_list, list_of_struct, tail"},
+    {"nested_chunk_boundary", "id, items, payload, attrs, tail"},
+  }};
+
+  s3_sql_fixture fixture(*env);
+  duckdb::DuckDB baseline_db(nullptr);
+  duckdb::Connection baseline_con(baseline_db);
+
+  for (auto const& test_case : cases) {
+    auto const s3_query = "SELECT " + std::string{test_case.select_list} + " FROM " +
+                          s3_parquet_scan(*env, test_case.table) + " ORDER BY id";
+    auto const local_query = "SELECT " + std::string{test_case.select_list} + " FROM " +
+                             local_parquet_scan(test_case.table) + " ORDER BY id";
+
+    auto s3_result       = require_query_ok(fixture.con, gpu_execution_sql(s3_query));
+    auto baseline_result = require_query_ok(baseline_con, local_query);
+
+    INFO("table=" << test_case.table);
+    require_rows_equal(*s3_result, *baseline_result);
+  }
+}
+
+TEST_CASE("gpu_execution rejects operations on nested S3 parquet columns cleanly",
+          "[.][s3][integration][sql][gpu_execution][nested][unsupported]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+
+  auto const struct_scan = s3_parquet_scan(*env, "nested_struct");
+  require_nested_operation_unsupported(
+    fixture, "SELECT id FROM " + struct_scan + " WHERE payload IS NULL", "payload");
+
+  require_nested_operation_unsupported(
+    fixture,
+    "SELECT id FROM " + struct_scan + " WHERE payload = struct_pack(a := 10, b := 'alpha')",
+    "payload");
+
+  auto const list_scan = s3_parquet_scan(*env, "nested_list");
+  require_nested_operation_unsupported(
+    fixture, "SELECT id FROM " + list_scan + " WHERE items IS NULL", "items");
+
+  require_nested_operation_unsupported(
+    fixture, "SELECT items, count(*) FROM " + list_scan + " GROUP BY items", "items");
+
+  require_nested_operation_unsupported(
+    fixture,
+    "SELECT l.id FROM " + list_scan + " l JOIN " + list_scan + " r ON l.items = r.items",
+    "items");
+
+  auto const map_scan = s3_parquet_scan(*env, "nested_map");
+  require_nested_operation_unsupported(
+    fixture, "SELECT id FROM " + map_scan + " WHERE attrs IS NULL", "attrs");
 }
 
 TEST_CASE("gpu_execution reads real AWS S3 parquet through Sirius SigV4",

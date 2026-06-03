@@ -51,6 +51,11 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalFilter& op)
 {
   D_ASSERT(op.children.size() == 1);
+  // Phase-1 boundary: reject filtering on a nested (STRUCT/LIST/MAP) column. Checked
+  // before planning the child so the clear error surfaces ahead of any scan/type work.
+  for (auto const& predicate : op.expressions) {
+    reject_nested_column_operation(*predicate, "a filter predicate");
+  }
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan = create_plan(*op.children[0]);
   if (!op.expressions.empty()) {
     D_ASSERT(plan->types.size() > 0);
