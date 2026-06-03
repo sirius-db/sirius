@@ -1814,6 +1814,28 @@ TEST_CASE("translator: nested decimal arithmetic returns nullopt", "[expression_
   REQUIRE_FALSE(ast_tree.has_value());
 }
 
+TEST_CASE("translator: direct decimal column arithmetic returns nullopt", "[expression_translator]")
+{
+  // Direct column-vs-column decimal arithmetic (col(0) + col(0)) must also be
+  // blocked (pending rapidsai/cudf#21996), not just arithmetic whose children
+  // are decimal constants or nested functions. The function's arguments are
+  // bare references here, so the guard depends on reference nodes carrying their
+  // DECIMAL return_type through from_duckdb.
+  auto const dec52 = LogicalType::DECIMAL(5, 2);
+
+  auto add =
+    duckdb::make_uniq<BoundFunctionExpression>(dec52,
+                                               ScalarFunction("+", {dec52, dec52}, dec52, nullptr),
+                                               duckdb::vector<duckdb::unique_ptr<Expression>>{},
+                                               nullptr);
+  add->children.push_back(duckdb::make_uniq<BoundReferenceExpression>(dec52, 0));
+  add->children.push_back(duckdb::make_uniq<BoundReferenceExpression>(dec52, 0));
+
+  auto translator = make_translator();
+  auto ast_tree   = translate(translator, *add);
+  REQUIRE_FALSE(ast_tree.has_value());
+}
+
 //===----------------------------------------------------------------------===//
 // Test: String column vs. string literal comparisons
 //===----------------------------------------------------------------------===//

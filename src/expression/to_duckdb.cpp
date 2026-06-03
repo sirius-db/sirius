@@ -85,10 +85,10 @@ std::unique_ptr<duckdb::Expression> from_duck_derived_ptr(duckdb::unique_ptr<T> 
 
 std::unique_ptr<duckdb::Expression> to_duckdb(reference const& alt)
 {
-  // Sirius reference carries only column_index. The downstream consumer
-  // (executor specialization) resolves the type from the input table_view,
-  // not from the reconstructed BoundReferenceExpression — so INTEGER is a
-  // safe placeholder.
+  // The downstream consumer (executor specialization) resolves the column type
+  // from the input table_view, not from the reconstructed
+  // BoundReferenceExpression — so INTEGER is a safe placeholder here regardless
+  // of reference::return_type.
   return from_duck_derived_ptr(duckdb::make_uniq<duckdb::BoundReferenceExpression>(
     duckdb::LogicalType{duckdb::LogicalTypeId::INTEGER},
     static_cast<duckdb::idx_t>(alt.column_index)));
