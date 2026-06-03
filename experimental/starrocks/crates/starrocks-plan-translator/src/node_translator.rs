@@ -1,6 +1,8 @@
 use starrocks_thrift::exprs::TExpr;
 use starrocks_thrift::plan_nodes::{TPlan, TPlanNode, TPlanNodeType};
-use substrait::proto::{FilterRel, ProjectRel, ReadRel, Rel, RelCommon, rel, rel_common};
+use substrait::proto::{
+    Expression, FilterRel, ProjectRel, ReadRel, Rel, RelCommon, rel, rel_common,
+};
 
 use crate::descriptor_table::DescriptorTable;
 use crate::error::{Result, TranslateError};
@@ -290,28 +292,7 @@ fn translate_project_node(
         }
     }
 
-    let input_columns = child.output_width;
-    let output_mapping =
-        (input_columns as i32..input_columns as i32 + expressions.len() as i32).collect();
-    let output_width = expressions.len();
-
-    Ok(TranslatedRel {
-        rel: Rel {
-            rel_type: Some(rel::RelType::Project(Box::new(ProjectRel {
-                common: Some(RelCommon {
-                    emit_kind: Some(rel_common::EmitKind::Emit(rel_common::Emit {
-                        output_mapping,
-                    })),
-                    ..Default::default()
-                }),
-                input: Some(Box::new(child.rel)),
-                expressions,
-                ..Default::default()
-            }))),
-        },
-        row_tuples: output_tuples,
-        output_width,
-    })
+    Ok(project_rel(child, expressions, output_tuples))
 }
 
 /// Adds a root projection over explicit fragment output expressions.
@@ -336,12 +317,26 @@ fn project_exprs_with_context(
         let mut expr_ctx = ctx.expr_context(&input.row_tuples);
         expressions.push(expr.translate(&mut expr_ctx)?);
     }
-    let input_columns = input.output_width;
-    let output_mapping =
-        (input_columns as i32..input_columns as i32 + expressions.len() as i32).collect();
-    let output_width = expressions.len();
+    // A root projection over fragment output expressions keeps the input layout.
+    let row_tuples = input.row_tuples.clone();
+    Ok(project_rel(input, expressions, row_tuples))
+}
 
-    Ok(TranslatedRel {
+/// Builds a Substrait project that emits exactly `expressions`.
+///
+/// The emit `output_mapping` selects the projected expressions, which sit after
+/// the input columns, so the base offset is the input's carried `output_width`.
+/// `row_tuples` is the output row layout (the project's own tuples, which may
+/// reorder or differ from the input's).
+fn project_rel(
+    input: TranslatedRel,
+    expressions: Vec<Expression>,
+    row_tuples: Vec<i32>,
+) -> TranslatedRel {
+    let base = input.output_width as i32;
+    let output_mapping = (base..base + expressions.len() as i32).collect();
+    let output_width = expressions.len();
+    TranslatedRel {
         rel: Rel {
             rel_type: Some(rel::RelType::Project(Box::new(ProjectRel {
                 common: Some(RelCommon {
@@ -355,9 +350,9 @@ fn project_exprs_with_context(
                 ..Default::default()
             }))),
         },
-        row_tuples: input.row_tuples,
+        row_tuples,
         output_width,
-    })
+    }
 }
 
 /// Wraps a relation in a Substrait filter when the StarRocks node has conjuncts.
