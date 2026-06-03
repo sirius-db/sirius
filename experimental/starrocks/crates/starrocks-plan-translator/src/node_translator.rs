@@ -135,13 +135,13 @@ fn translate_plan_node(
     }
 }
 
-/// Builds a named-table read for a `FILE_SCAN_NODE` tuple.
+/// Builds a named-table read for `FILE_SCAN_NODE`.
 fn translate_file_scan(
     node: &TPlanNode,
     children: Vec<TranslatedRel>,
     ctx: &mut PlanContext<'_>,
 ) -> Result<TranslatedRel> {
-    expect_children(node, &children, 0)?;
+    // `file_scan_node.tuple_id` is required, so a present payload always resolves.
     let tuple_id = node
         .file_scan_node
         .as_ref()
@@ -151,21 +151,16 @@ fn translate_file_scan(
             context: "FILE_SCAN_NODE",
             field: "tuple_id",
         })?;
-    let input = TranslatedRel {
-        rel: scan_rel(ctx.desc, tuple_id)?,
-        row_tuples: vec![tuple_id],
-        output_width: ctx.desc.materialized_slot_ids(tuple_id)?.len(),
-    };
-    apply_conjuncts(input, node, ctx)
+    translate_scan(node, children, tuple_id, ctx)
 }
 
-/// Builds a named-table read for an `HDFS_SCAN_NODE` tuple.
+/// Builds a named-table read for `HDFS_SCAN_NODE`.
 fn translate_hdfs_scan(
     node: &TPlanNode,
     children: Vec<TranslatedRel>,
     ctx: &mut PlanContext<'_>,
 ) -> Result<TranslatedRel> {
-    expect_children(node, &children, 0)?;
+    // `hdfs_scan_node.tuple_id` is optional, so fall back to the node row layout.
     let tuple_id = node
         .hdfs_scan_node
         .as_ref()
@@ -175,6 +170,20 @@ fn translate_hdfs_scan(
             context: "HDFS_SCAN_NODE",
             field: "tuple_id",
         })?;
+    translate_scan(node, children, tuple_id, ctx)
+}
+
+/// Builds a leaf named-table read for `tuple_id` and applies any filter conjuncts.
+///
+/// Shared by every scan node; new scan types (OLAP/connector/lake) only need to
+/// resolve their `tuple_id` and delegate here.
+fn translate_scan(
+    node: &TPlanNode,
+    children: Vec<TranslatedRel>,
+    tuple_id: i32,
+    ctx: &mut PlanContext<'_>,
+) -> Result<TranslatedRel> {
+    expect_children(node, &children, 0)?;
     let input = TranslatedRel {
         rel: scan_rel(ctx.desc, tuple_id)?,
         row_tuples: vec![tuple_id],
