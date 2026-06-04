@@ -120,11 +120,8 @@ aggregate_layout build_aggregate_layout(const duckdb::vector<sirius::expression>
   layout.aggregates.reserve(aggregates.size());
 
   for (size_t i = 0; i < aggregates.size(); ++i) {
-    auto const* agg_node = sirius::unwrap(aggregates[i]);
-    if (agg_node == nullptr || !agg_node->holds<sirius::ast::aggregate>()) {
-      throw not_implemented_exception("ungrouped aggregate: expression is not an aggregate node");
-    }
-    auto const& agg = agg_node->get<sirius::ast::aggregate>();
+    auto const& agg =
+      sirius::ast::require_aggregate(sirius::unwrap(aggregates[i]), "ungrouped aggregate");
     if (agg.distinct()) {
       throw not_implemented_exception("Distinct aggregates not supported in GPU path yet");
     }
@@ -134,9 +131,7 @@ aggregate_layout build_aggregate_layout(const duckdb::vector<sirius::expression>
     }
 
     auto agg_return_type = sirius::to_duckdb(agg.return_type());
-    auto child_ref_index = [&]() {
-      return children[0]->get<sirius::ast::reference>().column_index;
-    };
+    auto child_ref_index = [&]() { return children[0]->as_reference().column_index; };
 
     aggregate_spec spec;
     spec.input_idx       = -1;
@@ -144,79 +139,89 @@ aggregate_layout build_aggregate_layout(const duckdb::vector<sirius::expression>
     spec.local_sum_idx   = std::numeric_limits<size_t>::max();
     spec.local_count_idx = std::numeric_limits<size_t>::max();
 
-    std::string const fname{sirius::to_duckdb_aggregate_name(agg.function())};
-    if (fname == "count_star") {
-      spec.kind          = aggregate_kind::COUNT_STAR;
-      spec.return_type   = duckdb::LogicalType::BIGINT;
-      spec.local_sum_idx = local_idx++;
-      layout.local_types.push_back(duckdb::LogicalType::BIGINT);
-      layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
-      layout.merge_nth_index.push_back(std::nullopt);
-    } else if (fname == "count") {
-      if (children.empty()) {
-        throw not_implemented_exception("count() without arguments not supported");
-      }
-      spec.kind          = aggregate_kind::COUNT;
-      spec.return_type   = duckdb::LogicalType::BIGINT;
-      spec.input_idx     = child_ref_index();
-      spec.local_sum_idx = local_idx++;
-      layout.local_types.push_back(duckdb::LogicalType::BIGINT);
-      layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
-      layout.merge_nth_index.push_back(std::nullopt);
-    } else if (fname == "sum" || fname == "sum_no_overflow") {
-      if (children.empty()) {
-        throw not_implemented_exception("sum() without arguments not supported");
-      }
-      spec.kind          = aggregate_kind::SUM;
-      spec.input_idx     = child_ref_index();
-      spec.local_sum_idx = local_idx++;
-      layout.local_types.push_back(agg_return_type);
-      layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
-      layout.merge_nth_index.push_back(std::nullopt);
-    } else if (fname == "min") {
-      if (children.empty()) {
-        throw not_implemented_exception("min() without arguments not supported");
-      }
-      spec.kind          = aggregate_kind::MIN;
-      spec.input_idx     = child_ref_index();
-      spec.local_sum_idx = local_idx++;
-      layout.local_types.push_back(agg_return_type);
-      layout.merge_kinds.push_back(cudf::aggregation::Kind::MIN);
-      layout.merge_nth_index.push_back(std::nullopt);
-    } else if (fname == "max") {
-      if (children.empty()) {
-        throw not_implemented_exception("max() without arguments not supported");
-      }
-      spec.kind          = aggregate_kind::MAX;
-      spec.input_idx     = child_ref_index();
-      spec.local_sum_idx = local_idx++;
-      layout.local_types.push_back(agg_return_type);
-      layout.merge_kinds.push_back(cudf::aggregation::Kind::MAX);
-      layout.merge_nth_index.push_back(std::nullopt);
-    } else if (fname == "avg") {
-      if (children.empty()) {
-        throw not_implemented_exception("avg() without arguments not supported");
-      }
-      spec.kind          = aggregate_kind::AVG;
-      spec.input_idx     = child_ref_index();
-      spec.local_sum_idx = local_idx++;
-      layout.local_types.push_back(agg_return_type);
-      layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
-      layout.merge_nth_index.push_back(std::nullopt);
-      spec.local_count_idx = local_idx++;
-      layout.local_types.push_back(duckdb::LogicalType::BIGINT);
-      layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
-      layout.merge_nth_index.push_back(std::nullopt);
-      layout.has_avg = true;
-    } else if (fname == "first") {
-      spec.kind          = aggregate_kind::FIRST;
-      spec.input_idx     = child_ref_index();
-      spec.local_sum_idx = local_idx++;
-      layout.local_types.push_back(agg_return_type);
-      layout.merge_kinds.push_back(cudf::aggregation::Kind::NTH_ELEMENT);
-      layout.merge_nth_index.push_back(0);  // first element
-    } else {
-      throw not_implemented_exception("Aggregate not supported: " + fname);
+    switch (agg.function()) {
+      case sirius::aggregate_id::count_star:
+        spec.kind          = aggregate_kind::COUNT_STAR;
+        spec.return_type   = duckdb::LogicalType::BIGINT;
+        spec.local_sum_idx = local_idx++;
+        layout.local_types.push_back(duckdb::LogicalType::BIGINT);
+        layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
+        layout.merge_nth_index.push_back(std::nullopt);
+        break;
+      case sirius::aggregate_id::count:
+        if (children.empty()) {
+          throw not_implemented_exception("count() without arguments not supported");
+        }
+        spec.kind          = aggregate_kind::COUNT;
+        spec.return_type   = duckdb::LogicalType::BIGINT;
+        spec.input_idx     = child_ref_index();
+        spec.local_sum_idx = local_idx++;
+        layout.local_types.push_back(duckdb::LogicalType::BIGINT);
+        layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
+        layout.merge_nth_index.push_back(std::nullopt);
+        break;
+      case sirius::aggregate_id::sum:
+      case sirius::aggregate_id::sum_no_overflow:
+        if (children.empty()) {
+          throw not_implemented_exception("sum() without arguments not supported");
+        }
+        spec.kind          = aggregate_kind::SUM;
+        spec.input_idx     = child_ref_index();
+        spec.local_sum_idx = local_idx++;
+        layout.local_types.push_back(agg_return_type);
+        layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
+        layout.merge_nth_index.push_back(std::nullopt);
+        break;
+      case sirius::aggregate_id::min:
+        if (children.empty()) {
+          throw not_implemented_exception("min() without arguments not supported");
+        }
+        spec.kind          = aggregate_kind::MIN;
+        spec.input_idx     = child_ref_index();
+        spec.local_sum_idx = local_idx++;
+        layout.local_types.push_back(agg_return_type);
+        layout.merge_kinds.push_back(cudf::aggregation::Kind::MIN);
+        layout.merge_nth_index.push_back(std::nullopt);
+        break;
+      case sirius::aggregate_id::max:
+        if (children.empty()) {
+          throw not_implemented_exception("max() without arguments not supported");
+        }
+        spec.kind          = aggregate_kind::MAX;
+        spec.input_idx     = child_ref_index();
+        spec.local_sum_idx = local_idx++;
+        layout.local_types.push_back(agg_return_type);
+        layout.merge_kinds.push_back(cudf::aggregation::Kind::MAX);
+        layout.merge_nth_index.push_back(std::nullopt);
+        break;
+      case sirius::aggregate_id::avg:
+        if (children.empty()) {
+          throw not_implemented_exception("avg() without arguments not supported");
+        }
+        spec.kind          = aggregate_kind::AVG;
+        spec.input_idx     = child_ref_index();
+        spec.local_sum_idx = local_idx++;
+        layout.local_types.push_back(agg_return_type);
+        layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
+        layout.merge_nth_index.push_back(std::nullopt);
+        spec.local_count_idx = local_idx++;
+        layout.local_types.push_back(duckdb::LogicalType::BIGINT);
+        layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
+        layout.merge_nth_index.push_back(std::nullopt);
+        layout.has_avg = true;
+        break;
+      case sirius::aggregate_id::first:
+        spec.kind          = aggregate_kind::FIRST;
+        spec.input_idx     = child_ref_index();
+        spec.local_sum_idx = local_idx++;
+        layout.local_types.push_back(agg_return_type);
+        layout.merge_kinds.push_back(cudf::aggregation::Kind::NTH_ELEMENT);
+        layout.merge_nth_index.push_back(0);  // first element
+        break;
+      default:
+        throw not_implemented_exception(
+          "Aggregate not supported: {}",
+          std::string{sirius::to_duckdb_aggregate_name(agg.function())});
     }
 
     layout.aggregates.push_back(std::move(spec));

@@ -17,14 +17,24 @@
 #pragma once
 
 #include "duckdb/common/vector.hpp"
+#include "expression/aggregate_id.hpp"
 #include "expression/expression.hpp"
 
 #include <cudf/aggregation.hpp>
 
+#include <optional>
 #include <vector>
 
 namespace sirius {
 namespace op {
+
+/**
+ * @brief Map a simple Sirius aggregate_id to a single cuDF aggregation kind.
+ *
+ * Returns std::nullopt for aggregates that decompose into multiple cuDF kinds (avg) or use a
+ * different merge path (first, count distinct).
+ */
+std::optional<cudf::aggregation::Kind> to_cudf_aggregation_kind(sirius::aggregate_id id);
 
 /**
  * @brief Mapping from one original DuckDB aggregate expression to its position(s) in the expanded

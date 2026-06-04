@@ -19,10 +19,7 @@
 #include "cudf/cudf_utils.hpp"
 #include "duckdb/common/assert.hpp"
 #include "expression/aggregate_id.hpp"
-#include "expression/ast/aggregate.hpp"
-#include "expression/ast/function_call.hpp"
 #include "expression/ast/node.hpp"
-#include "expression/ast/reference.hpp"
 #include "expression/expression_internal.hpp"
 #include "sirius/exception.hpp"
 
@@ -32,6 +29,21 @@
 namespace sirius {
 namespace op {
 
+std::optional<cudf::aggregation::Kind> to_cudf_aggregation_kind(sirius::aggregate_id id)
+{
+  switch (id) {
+    case sirius::aggregate_id::sum:
+    case sirius::aggregate_id::sum_no_overflow: return cudf::aggregation::Kind::SUM;
+    case sirius::aggregate_id::count: return cudf::aggregation::Kind::COUNT_VALID;
+    case sirius::aggregate_id::count_star: return cudf::aggregation::Kind::COUNT_ALL;
+    case sirius::aggregate_id::min: return cudf::aggregation::Kind::MIN;
+    case sirius::aggregate_id::max: return cudf::aggregation::Kind::MAX;
+    case sirius::aggregate_id::avg:
+    case sirius::aggregate_id::first: return std::nullopt;
+  }
+  return std::nullopt;
+}
+
 CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
   const duckdb::vector<sirius::expression>& groups_p,
   const duckdb::vector<sirius::expression>& expressions)
@@ -40,31 +52,23 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
 
   // 1. Extract group_idx from groups_p
   for (const auto& group : groups_p) {
-    auto const* group_expr = sirius::unwrap(group);
-    if (group_expr == nullptr || !group_expr->holds<sirius::ast::reference>()) {
-      throw not_implemented_exception(
-        "[convert_duckdb_aggregates_to_cudf] group expression is not a bound reference");
-    }
-    result.group_idx.push_back(
-      static_cast<int>(group_expr->get<sirius::ast::reference>().column_index));
+    auto const& ref = sirius::ast::require_reference(sirius::unwrap(group),
+                                                     "convert_duckdb_aggregates_to_cudf group");
+    result.group_idx.push_back(static_cast<int>(ref.column_index));
   }
 
   // 2. Extract aggregates (cudf::aggregation::Kind) from expressions
   for (const auto& aggregate : expressions) {
-    auto const* anode = sirius::unwrap(aggregate);
-    if (anode == nullptr || !anode->holds<sirius::ast::aggregate>()) {
-      throw not_implemented_exception(
-        "[convert_duckdb_aggregates_to_cudf] expression is not an aggregate node");
-    }
-    auto const& aggr = anode->get<sirius::ast::aggregate>();
-    std::string const fname{sirius::to_duckdb_aggregate_name(aggr.function())};
+    auto const& aggr = sirius::ast::require_aggregate(
+      sirius::unwrap(aggregate), "convert_duckdb_aggregates_to_cudf aggregate");
+    auto const fid       = aggr.function();
     auto const& children = aggr.arguments();
 
     // Handle AVG specially: it expands into SUM + COUNT_VALID
-    if (fname == "avg") {
+    if (fid == sirius::aggregate_id::avg) {
       D_ASSERT(children.size() == 1);
-      D_ASSERT(children[0]->holds<sirius::ast::reference>());
-      auto col_idx = static_cast<int>(children[0]->get<sirius::ast::reference>().column_index);
+      D_ASSERT(children[0]->is_reference());
+      auto col_idx = static_cast<int>(children[0]->as_reference().column_index);
 
       size_t sum_position = result.cudf_aggregates.size();
       result.cudf_aggregates.push_back(cudf::aggregation::Kind::SUM);
@@ -82,26 +86,24 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
     // Handle COUNT(DISTINCT col) and COUNT(DISTINCT (col1, col2, ...)):
     // Use COLLECT_SET locally; merge via MERGE_SETS; then count list elements.
     // For multi-column, a struct column is synthesized from the component columns.
-    if (aggr.distinct() && fname == "count") {
+    if (aggr.distinct() && fid == sirius::aggregate_id::count) {
       D_ASSERT(children.size() == 1);
       auto const& child = *children[0];
       size_t position   = result.cudf_aggregates.size();
       result.cudf_aggregates.push_back(cudf::aggregation::Kind::COLLECT_SET);
 
-      if (child.holds<sirius::ast::reference>()) {
+      if (child.is_reference()) {
         // Single-column case: COUNT(DISTINCT col)
-        result.cudf_aggregate_idx.push_back(
-          static_cast<int>(child.get<sirius::ast::reference>().column_index));
+        result.cudf_aggregate_idx.push_back(static_cast<int>(child.as_reference().column_index));
         result.cudf_aggregate_struct_col_indices.push_back({});
       } else {
         // Multi-column case: COUNT(DISTINCT (col1, col2, ...)) — child is a struct_pack expression
-        D_ASSERT(child.holds<sirius::ast::function_call>());
-        auto const& func_expr = child.get<sirius::ast::function_call>();
+        D_ASSERT(child.is_function_call());
+        auto const& func_expr = child.as_function_call();
         std::vector<int> struct_indices;
         for (auto const& arg : func_expr.arguments()) {
-          D_ASSERT(arg->holds<sirius::ast::reference>());
-          struct_indices.push_back(
-            static_cast<int>(arg->get<sirius::ast::reference>().column_index));
+          D_ASSERT(arg->is_reference());
+          struct_indices.push_back(static_cast<int>(arg->as_reference().column_index));
         }
         D_ASSERT(!struct_indices.empty());
         result.cudf_aggregate_idx.push_back(-1);  // sentinel: struct column, see gpu_aggregate_impl
@@ -113,40 +115,33 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       continue;
     }
 
-    // Convert the aggregate function to a cudf::aggregation::Kind
-    cudf::aggregation::Kind agg_kind;
-    if (fname == "sum" || fname == "sum_no_overflow") {
-      agg_kind = cudf::aggregation::Kind::SUM;
-    } else if (fname == "count") {
-      agg_kind = cudf::aggregation::Kind::COUNT_VALID;
-    } else if (fname == "count_star") {
-      agg_kind = cudf::aggregation::Kind::COUNT_ALL;
-    } else if (fname == "min") {
-      agg_kind = cudf::aggregation::Kind::MIN;
-    } else if (fname == "max") {
-      agg_kind = cudf::aggregation::Kind::MAX;
-    } else {
-      throw std::runtime_error("Unsupported aggregate function: " + fname);
+    auto const agg_kind = to_cudf_aggregation_kind(fid);
+    if (!agg_kind) {
+      throw std::runtime_error(std::string{"Unsupported aggregate function: "} +
+                               std::string{sirius::to_duckdb_aggregate_name(fid)});
     }
     size_t current_position = result.cudf_aggregates.size();
-    result.cudf_aggregates.push_back(agg_kind);
+    result.cudf_aggregates.push_back(*agg_kind);
 
     // 3. Extract aggregate_idx from the children of the aggregate expression
     if (children.empty()) {
       // COUNT(*) has no children - use 0 as a placeholder (will be handled by COUNT_ALL)
-      if (fname == "count_star") {
+      if (fid == sirius::aggregate_id::count_star) {
         result.cudf_aggregate_idx.push_back(0);
       } else {
-        throw std::runtime_error("Unsupported aggregate function: " + fname + " with no children");
+        throw std::runtime_error(std::string{"Unsupported aggregate function: "} +
+                                 std::string{sirius::to_duckdb_aggregate_name(fid)} +
+                                 " with no children");
       }
     } else {
       if (children.size() == 1) {
         // Extract the column index from the first child (most aggregates have one child)
-        D_ASSERT(children[0]->holds<sirius::ast::reference>());
+        D_ASSERT(children[0]->is_reference());
         result.cudf_aggregate_idx.push_back(
-          static_cast<int>(children[0]->get<sirius::ast::reference>().column_index));
+          static_cast<int>(children[0]->as_reference().column_index));
       } else {
-        throw std::runtime_error("Unsupported aggregate function: " + fname + " with " +
+        throw std::runtime_error(std::string{"Unsupported aggregate function: "} +
+                                 std::string{sirius::to_duckdb_aggregate_name(fid)} + " with " +
                                  std::to_string(children.size()) + " children");
       }
     }
