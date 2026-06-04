@@ -38,6 +38,7 @@ struct node;
 // Per-node headers complete each alternative type below. Each header carries
 // its own `struct node;` forward declaration so it can hold
 // std::unique_ptr<node> children without depending on this file's ordering.
+#include "expression/ast/aggregate.hpp"
 #include "expression/ast/between.hpp"
 #include "expression/ast/case_expr.hpp"
 #include "expression/ast/cast.hpp"
@@ -103,7 +104,8 @@ struct node {
                                  unary_op,
                                  coalesce,
                                  in_list,
-                                 function_call>;
+                                 function_call,
+                                 aggregate>;
 
   static_assert(detail::all_have_cudf_ast_op_count<variant_t>::value,
                 "Every alternative in sirius::ast::node::variant_t must implement "

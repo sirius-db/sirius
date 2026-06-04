@@ -17,12 +17,14 @@
 // sirius
 #include <cudf/cudf_utils.hpp>
 
-#include <expression/ast/node.hpp>  // sirius::ast::node + 11 alternatives
+#include <expression/ast/aggregate.hpp>  // sirius::ast::aggregate
+#include <expression/ast/node.hpp>       // sirius::ast::node alternatives
 #include <expression/ast/to_duckdb.hpp>  // sirius::ast::to_duckdb (per-alternative overloads + node dispatcher)
 #include <expression/expression_internal.hpp>
 #include <expression/function_id.hpp>
 #include <expression_executor/ast_supported_types.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
+#include <sirius/exception.hpp>
 
 // cucascade
 #include <cucascade/data/gpu_data_representation.hpp>
@@ -513,6 +515,14 @@ std::size_t gpu_expression_executor::count_ast_ops(duckdb::Expression const& exp
   }
 }
 
+execute_result gpu_expression_executor::execute(sirius::ast::aggregate const& /*expr*/,
+                                                execution_mode /*mode*/)
+{
+  throw not_implemented_exception(
+    "[gpu_expression_executor] aggregate nodes are not executed via the expression executor "
+    "(#863).");
+}
+
 execute_result gpu_expression_executor::execute(sirius::ast::node const& expr, execution_mode mode)
 {
   return std::visit(
@@ -528,7 +538,8 @@ execute_result gpu_expression_executor::execute(sirius::ast::node const& expr, e
                     std::is_same_v<T, sirius::ast::unary_op> ||
                     std::is_same_v<T, sirius::ast::coalesce> ||
                     std::is_same_v<T, sirius::ast::in_list> ||
-                    std::is_same_v<T, sirius::ast::function_call>) {
+                    std::is_same_v<T, sirius::ast::function_call> ||
+                    std::is_same_v<T, sirius::ast::aggregate>) {
         return this->execute(alt, mode);
       } else {
         static_assert(sizeof(T) == 0,

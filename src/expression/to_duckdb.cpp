@@ -17,6 +17,7 @@
 #include "expression/ast/to_duckdb.hpp"
 
 // sirius
+#include "expression/ast/aggregate.hpp"
 #include "expression/ast/between.hpp"
 #include "expression/ast/case_expr.hpp"
 #include "expression/ast/cast.hpp"
@@ -33,6 +34,8 @@
 #include "expression/join_condition.hpp"  // sirius::to_duckdb(comparison_type)
 #include "expression/value.hpp"           // sirius::to_duckdb(value, logical_type)
 #include "helper/type_conversions.hpp"    // sirius::to_duckdb(logical_type)
+
+#include <sirius/exception.hpp>
 
 // duckdb
 #include <duckdb/common/enums/expression_type.hpp>
@@ -243,6 +246,13 @@ std::unique_ptr<duckdb::Expression> to_duckdb(function_call const& alt)
                                                        std::move(stub_fn),
                                                        std::move(children),
                                                        /*bind_info=*/nullptr));
+}
+
+std::unique_ptr<duckdb::Expression> to_duckdb(aggregate const& /*alt*/)
+{
+  throw not_implemented_exception(
+    "[sirius::ast::to_duckdb] aggregate reconstruction is not implemented; consumers read the "
+    "aggregate node natively (#863).");
 }
 
 std::unique_ptr<duckdb::Expression> to_duckdb(node const& expr)

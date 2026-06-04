@@ -48,6 +48,7 @@ std::unique_ptr<duckdb::Expression> to_duckdb(node const& expr);
 // Per-alternative overloads — called directly by gpu_expression_executor shims
 // to sidestep node's move-only constraint. The top-level to_duckdb(node) above
 // dispatches to these via std::visit.
+std::unique_ptr<duckdb::Expression> to_duckdb(aggregate const& alt);
 std::unique_ptr<duckdb::Expression> to_duckdb(between const& alt);
 std::unique_ptr<duckdb::Expression> to_duckdb(case_expr const& alt);
 std::unique_ptr<duckdb::Expression> to_duckdb(cast const& alt);

@@ -447,6 +447,7 @@ class gpu_expression_executor {
   execute_result execute(sirius::ast::unary_op const& expr, execution_mode mode);
   execute_result execute(sirius::ast::coalesce const& expr, execution_mode mode);
   execute_result execute(sirius::ast::in_list const& expr, execution_mode mode);
+  execute_result execute(sirius::ast::aggregate const& expr, execution_mode mode);
 
   // Counts the number of AST nodes that would be generated for the given expression if we
   // added it to the AST tree. This is used to determine whether we should execute in AST mode or

@@ -225,6 +225,9 @@ class gpu_expression_translator {
   /// @brief Specialized add_expression for FUNCTION expressions.
   std::optional<expr_ref> add_expression(sirius::ast::function_call const& alt,
                                          cudf::ast::table_reference const table_src);
+  /// @brief Specialized add_expression for AGGREGATE expressions (not translatable to cuDF AST).
+  std::optional<expr_ref> add_expression(sirius::ast::aggregate const& alt,
+                                         cudf::ast::table_reference const table_src);
 
   /// @brief Add a single join condition to the current AST tree without resetting it.
   /// @param condition The join condition to translate.
