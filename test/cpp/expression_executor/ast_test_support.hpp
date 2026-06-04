@@ -27,6 +27,10 @@
 // are `inline`/templates so the header can be included into multiple translation
 // units that are linked into the same sirius_unittest binary.
 
+// duckdb — defines the duckdb_base_std alias that the vendored catch.hpp relies on;
+// consumers that include this header before <catch.hpp> need it set up first.
+#include <duckdb/common/unique_ptr.hpp>
+
 // sirius — AST node construction surface
 #include <expression/ast/between.hpp>
 #include <expression/ast/case_expr.hpp>
@@ -40,7 +44,6 @@
 #include <expression/ast/node.hpp>
 #include <expression/ast/reference.hpp>
 #include <expression/ast/unary_op.hpp>
-#include <expression/expression_internal.hpp>
 #include <expression/function_id.hpp>
 #include <expression/value.hpp>
 #include <helper/logical_type.hpp>
@@ -191,14 +194,6 @@ inline std::unique_ptr<ast_node> make_unary(sirius::ast::unary_op::kind kind,
                                             std::unique_ptr<ast_node> child)
 {
   return std::make_unique<ast_node>(sirius::ast::unary_op{kind, std::move(child)});
-}
-
-// Wrap an owned Sirius AST node into a sirius::expression for the owning ctors /
-// join_condition.
-inline sirius::expression wrap_node(std::unique_ptr<ast_node> n)
-{
-  return sirius::expression{
-    std::make_unique<sirius::expression::impl>(sirius::expression::impl{std::move(n)})};
 }
 
 //===----------------------------------------------------------------------===//

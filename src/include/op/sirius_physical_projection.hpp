@@ -16,8 +16,10 @@
 
 #pragma once
 
-#include "expression/expression.hpp"
+#include "expression/ast/node.hpp"
 #include "op/sirius_physical_operator.hpp"
+
+#include <memory>
 
 namespace sirius {
 namespace op {
@@ -28,13 +30,13 @@ class sirius_physical_projection : public sirius_physical_operator {
 
  public:
   sirius_physical_projection(duckdb::vector<sirius::logical_type> types,
-                             duckdb::vector<sirius::expression> select_list,
+                             duckdb::vector<std::unique_ptr<sirius::ast::node>> select_list,
                              std::size_t estimated_cardinality);
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
-  duckdb::vector<sirius::expression> select_list;
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> select_list;
 };
 
 }  // namespace op

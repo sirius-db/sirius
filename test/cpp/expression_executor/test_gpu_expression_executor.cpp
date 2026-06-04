@@ -37,7 +37,6 @@
 #include <expression/ast/node.hpp>
 #include <expression/ast/reference.hpp>
 #include <expression/ast/unary_op.hpp>
-#include <expression/expression_internal.hpp>
 #include <expression/function_id.hpp>
 #include <expression/join_condition.hpp>
 #include <expression/value.hpp>
@@ -337,11 +336,11 @@ exec_result run_execute(memory_space& space,
                         std::vector<std::unique_ptr<ast_node>> nodes,
                         exp_strategy_enum strategy = MAT)
 {
-  duckdb::vector<sirius::expression> wrapped;
+  duckdb::vector<std::unique_ptr<ast_node>> ast_nodes;
   for (auto& n : nodes) {
-    wrapped.push_back(wrap_node(std::move(n)));
+    ast_nodes.push_back(std::move(n));
   }
-  exp_executor executor(wrapped, get_resource_ref(space), cudf::get_default_stream(), strategy);
+  exp_executor executor(ast_nodes, get_resource_ref(space), cudf::get_default_stream(), strategy);
   auto input_ro     = input_batch->to_read_only();
   auto& in_repr     = input_ro.get_data()->cast<gpu_table_representation>();
   auto output_table = executor.execute(in_repr.get_table_view());
@@ -358,8 +357,7 @@ exec_result run_select(memory_space& space,
                        std::unique_ptr<ast_node> node,
                        exp_strategy_enum strategy = MAT)
 {
-  auto wrapped = wrap_node(std::move(node));
-  exp_executor executor(wrapped, get_resource_ref(space), cudf::get_default_stream(), strategy);
+  exp_executor executor(*node, get_resource_ref(space), cudf::get_default_stream(), strategy);
   auto input_ro     = input_batch->to_read_only();
   auto& in_repr     = input_ro.get_data()->cast<gpu_table_representation>();
   auto output_table = executor.select(in_repr.get_table_view());

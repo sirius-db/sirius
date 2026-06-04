@@ -18,10 +18,11 @@
 
 #include "duckdb/common/vector.hpp"
 #include "expression/aggregate_id.hpp"
-#include "expression/expression.hpp"
+#include "expression/ast/node.hpp"
 
 #include <cudf/aggregation.hpp>
 
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -89,8 +90,8 @@ struct CudfAggregateDefinitions {
  * @throws std::runtime_error if an unsupported aggregate function is encountered
  */
 CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
-  const duckdb::vector<sirius::expression>& groups_p,
-  const duckdb::vector<sirius::expression>& expressions);
+  const duckdb::vector<std::unique_ptr<sirius::ast::node>>& groups_p,
+  const duckdb::vector<std::unique_ptr<sirius::ast::node>>& expressions);
 
 }  // namespace op
 }  // namespace sirius
