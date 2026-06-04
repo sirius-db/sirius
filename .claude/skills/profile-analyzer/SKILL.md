@@ -32,25 +32,26 @@ This is the complete workflow: profile for GPU analysis, then run without profil
 
 **Step 1: Profiled run** (for GPU analysis data)
 ```bash
-# Profile against parquet files
+# Profile TPC-H queries via nsys_report.sh (delegates to performance_test.py --nsys-profile)
 bash test/tpch_performance/nsys_report.sh --sf <scale_factor> [query_numbers...]
-
-# Profile against a DuckDB database file (native table scan path)
-bash test/tpch_performance/nsys_report.sh --db-path <path_to.duckdb> [query_numbers...]
 ```
+
+`nsys_report.sh` orchestrates the profiling under the hood: it calls `performance_test.py --nsys-profile` (the same runner the `benchmark` skill uses) to produce one `.nsys-rep` + `.sqlite` per query, then runs `nsys_analyze.sh` to emit `report.md` and `summary.json`.
 
 **Step 2: Non-profiled timing run** (for accurate cold/hot times)
 ```bash
-# Option A: Sirius-only timing
 export SIRIUS_CONFIG_FILE=<path_to_config>
-bash test/tpch_performance/run_tpch_parquet.sh sirius <scale_factor> <iterations> <query_numbers...>
 
-# Option B: Full DuckDB vs Sirius benchmark with validation
-export SIRIUS_CONFIG_FILE=<path_to_config>
-bash test/tpch_performance/benchmark_and_validate.sh <scale_factor> <iterations>
+# Sirius-only timing
+pixi run python test/tpch_performance/performance_test.py \
+    --input <parquet_dir> --engine gpu --iterations <N> [--queries 1,3,6-10]
+
+# DuckDB vs Sirius timing + result validation in one shot
+pixi run python test/tpch_performance/performance_test.py \
+    --input <parquet_dir> --engine both --iterations <N> --validation
 ```
 
-The non-profiled run produces per-query `timings.csv` files with accurate cold/hot timings. `benchmark_and_validate.sh` also validates GPU results against CPU and produces a comparison table with speedup ratios.
+The non-profiled run produces a long-format `<bench>/csv/runtimes.csv` (`engine,query,iteration,runtime_s`) and per-query `result.txt`. `--validation` additionally byte-compares the saved Sirius vs DuckDB results (with a small `abs_tol` on floats).
 
 **When comparing across runs:**
 - Use the non-profiled timings to determine if performance actually improved or regressed
@@ -59,19 +60,9 @@ The non-profiled run produces per-query `timings.csv` files with accurate cold/h
 
 **Full options for the profiled run:**
 ```bash
-# Parquet scan profiling
 bash test/tpch_performance/nsys_report.sh \
     --sf <scale_factor> \
-    --output-dir ./reports \
-    --label <custom_name> \
-    --iterations 4 \
-    --query-timeout 120 \
-    --compare <baseline_report_dir> \
-    [query_numbers...]
-
-# DuckDB native table scan profiling
-bash test/tpch_performance/nsys_report.sh \
-    --db-path <path_to.duckdb> \
+    --parquet-dir <path_to_parquet_dir> \
     --output-dir ./reports \
     --label <custom_name> \
     --iterations 4 \
@@ -80,7 +71,7 @@ bash test/tpch_performance/nsys_report.sh \
     [query_numbers...]
 ```
 
-The `--db-path` option uses `profile_tpch_nsys_duckdb_native.sh` to profile against native DuckDB tables instead of parquet views. This exercises the `duckdb_scan_task` scan path rather than the `parquet_scan_task` path.
+`--parquet-dir` defaults to `$PROJECT_DIR/test_datasets/tpch_parquet_sf<SF>`.
 
 **Output directory structure (profiled):**
 ```
@@ -89,23 +80,21 @@ reports/<label>_<YYYYMMDD_HHMMSS>/
   summary.json     - Machine-readable per-query metrics (profiled timings — use for analysis, not perf comparison)
   metadata.json    - Hardware, git commit, config, driver version
   comparison.md    - (if --compare used) Regression/improvement analysis
-  profiles/        - All raw artifacts
+  profiles/        - Flat raw artifacts (one set per query, flattened from the
+                     per-query subdirs produced by performance_test.py --nsys-profile)
     q1.sqlite, q1.nsys-rep, q1_timings.csv, q1_result.txt, ...
-    summary.txt
+  profiles_tree/   - Original per-query layout from performance_test.py:
+    sirius/q<N>/{nsys.nsys-rep, nsys.sqlite, nsys.sql, timings.csv, log_dir/}
 ```
 
-**Output from non-profiled run:**
+**Output from non-profiled run** (`performance_test.py` benchmark layout):
 ```
-# run_tpch_parquet.sh:
-timings_sirius_sf<SF>_q<N>.csv   - Per-query cold/hot timings (accurate, no profiling overhead)
-
-# benchmark_and_validate.sh:
-runs/<timestamp>_sf<SF>_<N>iter/
-  comparison.txt   - DuckDB vs Sirius timing table with speedup ratios
-  timings.csv      - Combined long-format timings (engine, query, iteration, runtime_s)
-  validation.csv   - Per-query result match status (success/validation/error)
-  sirius/q<N>/timings.csv  - Per-query Sirius timings
-  duckdb/q<N>/timings.csv  - Per-query DuckDB timings
+<benchmark_dir>/                      # default: test/tpch_performance/output/tpch_<ts>_<mode>_<engine>_iter<N>/
+  metadata.json                       # commit, branch, date, mode, iterations, engine, queries, pin
+  csv/runtimes.csv                    # long-format: engine,query,iteration,runtime_s
+  log_dir/sirius_<YYYY-MM-DD>.log     # combined Sirius spdlog daily sink
+  <engine>/q<N>/result.txt            # fetched rows, one repr(row) per line (last iter wins)
+  sirius/q<N>/sirius.log              # per-query Sirius log split (Sirius engine only)
 ```
 
 ### Workflow B: Generate Report from Existing Profiles
@@ -134,7 +123,7 @@ Default threshold is 10%. Values beyond the threshold are flagged:
 - **FIXED**: query failed in baseline but passes now
 - **BROKEN**: query passed in baseline but fails now
 
-**Important**: The timings in `summary.json` (used by `nsys_compare.sh`) are from profiled runs and include nsys overhead. These comparisons are useful for spotting large changes but should be validated with non-profiled timing runs before concluding a real regression or improvement exists. For definitive performance comparison, compare the non-profiled `timings.csv` files from `run_tpch_parquet.sh` or `benchmark_and_validate.sh`.
+**Important**: The timings in `summary.json` (used by `nsys_compare.sh`) are from profiled runs and include nsys overhead. These comparisons are useful for spotting large changes but should be validated with non-profiled timing runs before concluding a real regression or improvement exists. For definitive performance comparison, compare the `csv/runtimes.csv` files from a non-profiled `performance_test.py` run.
 
 ## Before Running
 
@@ -143,7 +132,7 @@ Default threshold is 10%. Values beyond the threshold are flagged:
   ```bash
   export SIRIUS_CONFIG_FILE=<path_to_config>
   ```
-- All paths in `profile_tpch_nsys.sh` are configurable via env vars (`DUCKDB`, `PARQUET_DIR`, `QUERY_DIR`, `OUTPUT_DIR`, `ITERATIONS`, `QUERY_TIMEOUT`).
+- For full options on the profiled run (parquet dir override, custom output dir, label, comparison baseline), see `bash test/tpch_performance/nsys_report.sh --help`.
 
 ## Analysis Sections
 
@@ -184,6 +173,9 @@ Sirius intercepts DuckDB query plans and offloads them to GPU via cuDF:
 5. **CUDA kernels** execute on the GPU
 
 ### NVTX Domain Hierarchy
+
+Domain numbers are not registered by Sirius — they're discovered from each nsys profile at analysis time (`nsys_analyze.sh` reads `NVTX_EVENTS` and groups by `domainId`). The mapping below is typical; what shows up depends on which libraries emitted NVTX ranges in your particular run.
+
 - **Domain 0 (Sirius)**: Physical operator execution (`sirius_physical_*::execute/sink`)
 - **Domain 1 (libkvikio)**: GPU-Direct Storage I/O operations (`posix_host_read`, `task`)
 - **Domain 2 (cuFile)**: cuFile handle management
@@ -193,7 +185,7 @@ Sirius intercepts DuckDB query plans and offloads them to GPU via cuDF:
 ### Key Relationships
 - **Operator -> Kernel attribution**: Correlates via `CUPTI_ACTIVITY_KIND_RUNTIME.correlationId` (links runtime API calls to kernels; runtime call timestamps fall within NVTX operator ranges)
 - **Cold vs Hot**: First iteration is "cold" (I/O, JIT). Subsequent iterations are "hot" (cached).
-- **Multi-stream**: Sirius uses 30-40 CUDA streams for parallelism
+- **Multi-stream**: Sirius uses a dynamic CUDA stream pool sized by the `pipeline.num_threads` setting in its YAML config (constructed in `src/pipeline/gpu_pipeline_executor.cpp`). The actual count depends on your config.
 
 ### Sirius Physical Operators
 | Operator | Purpose |
@@ -221,7 +213,7 @@ Sirius intercepts DuckDB query plans and offloads them to GPU via cuDF:
   - `registers`: Kernel uses too many registers per thread. Compiler flag `--maxrregcount` could help, or algorithmic changes to reduce register pressure.
   - `shared_mem`: Shared memory per block limits active blocks. The `shmem_b` column shows the *driver-allocated* amount (aligned to SM partition granularity, often 16KB/32KB/64KB/102KB). Reducing shared memory usage or using dynamic allocation may help.
   - `warps`: Block is too large relative to SM warp capacity.
-  - `hw_limit`: Hit the max blocks per SM limit (24 on Ada Lovelace).
+  - `hw_limit`: Hit the max blocks per SM limit (e.g. 24 on Ada Lovelace). `nsys_analyze.sh` reads `maxBlocksPerSm` from the profile, so the comparison auto-adapts per GPU.
 - **Note**: Low occupancy doesn't always mean poor performance — compute-bound kernels can achieve peak throughput at low occupancy if they have high ILP (instruction-level parallelism).
 
 ### Bandwidth

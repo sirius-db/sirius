@@ -65,6 +65,8 @@ EXTENSION_PATH = os.path.join(
     "build/release/extension/sirius/sirius.duckdb_extension",
 )
 
+DUCKDB_BIN = os.path.join(REPO_ROOT, "build/release/duckdb")
+
 
 def _git_capture(args):
     try:
@@ -95,6 +97,7 @@ def setup_benchmark_dir(
     config_path,
     pin,
     name=None,
+    nsys_profile=False,
 ):
     """Create the benchmark output directory and return its paths.
 
@@ -115,7 +118,8 @@ def setup_benchmark_dir(
         benchmark_name = name
     else:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        benchmark_name = f"tpch_{ts}_{mode}_{engine}_iter{iterations}"
+        suffix = "_nsys" if nsys_profile else ""
+        benchmark_name = f"tpch_{ts}_{mode}_{engine}_iter{iterations}{suffix}"
     benchmark_dir = os.path.join(output_root, benchmark_name)
     csv_dir = os.path.join(benchmark_dir, "csv")
     log_dir = os.path.join(benchmark_dir, "log_dir")
@@ -137,6 +141,7 @@ def setup_benchmark_dir(
         "engine": engine,
         "queries": [f"q{q}" for q in queries],
         "pin": pin,
+        "nsys_profile": nsys_profile,
         "runtime_file": os.path.relpath(runtime_csv, benchmark_dir),
     }
     with open(os.path.join(benchmark_dir, "metadata.json"), "w") as f:
@@ -240,21 +245,36 @@ def _resolve_parquet_files(parquet_dir, table):
     return candidates
 
 
-def open_connection(parquet_dir, gpu_execution=False):
-    """Open an in-memory DuckDB, register TPC-H parquet views, optionally LOAD Sirius."""
-    log(f"Opening DuckDB connection over parquet dir {parquet_dir}")
-    con = duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
+def _build_views_sql(parquet_dir):
+    """Return CREATE OR REPLACE VIEW SQL for the 8 TPC-H tables.
+
+    Each statement is terminated with `;\n`. Raises FileNotFoundError if any
+    table has no parquet files in `parquet_dir`.
+    """
+    parts = []
     for table in TPCH_TABLES:
         files = _resolve_parquet_files(parquet_dir, table)
         if not files:
             raise FileNotFoundError(
                 f"No parquet files found for table '{table}' in {parquet_dir}"
             )
-        log(f"  Registering view '{table}' over {len(files)} file(s)")
         file_list = ",".join(f"'{f}'" for f in files)
-        con.execute(
-            f"CREATE OR REPLACE VIEW {table} AS SELECT * FROM read_parquet([{file_list}])"
+        parts.append(
+            f"CREATE OR REPLACE VIEW {table} AS SELECT * FROM read_parquet([{file_list}]);"
         )
+    return "\n".join(parts) + "\n"
+
+
+def open_connection(parquet_dir, gpu_execution=False):
+    """Open an in-memory DuckDB, register TPC-H parquet views, optionally LOAD Sirius."""
+    log(f"Opening DuckDB connection over parquet dir {parquet_dir}")
+    con = duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
+    log("Registering TPC-H parquet views")
+    for stmt in _build_views_sql(parquet_dir).split(";"):
+        stmt = stmt.strip()
+        if not stmt:
+            continue
+        con.execute(stmt)
     log("All TPC-H views registered")
     if gpu_execution:
         log(f"Loading Sirius extension from {EXTENSION_PATH}")
@@ -466,6 +486,204 @@ RUNNERS = {
     "sequential": run_sequential,
     "isolated": run_isolated,
 }
+
+
+def _build_nsys_temp_sql(qnum, parquet_dir, iterations, pin, qdir):
+    """Write the DuckDB SQL script for one nsys-profiled query.
+
+    Mirrors profile_tpch_nsys.sh:170-208 so that the resulting timings.csv
+    has rows (views, iter_1, iter_2, ...) and the cudaProfilerApi capture
+    range brackets iterations 2..N.
+    """
+    sql_path = os.path.join(qdir, "nsys.sql")
+    timing_path = os.path.join(qdir, "timings.csv")
+
+    parts = [
+        f"LOAD '{EXTENSION_PATH}';",
+        "SET gpu_execution = true;",
+        "CREATE TEMP TABLE _timings (seq INTEGER, step VARCHAR, ts TIMESTAMP);",
+        "INSERT INTO _timings VALUES (0, 'start', current_timestamp);",
+        _build_views_sql(parquet_dir).rstrip("\n"),
+        "INSERT INTO _timings VALUES (1, 'views', current_timestamp);",
+    ]
+
+    if pin != "none":
+        parts.append(emit_pin(qnum, parquet_dir))
+
+    query_sql = QUERIES[f"q{qnum}"].rstrip().rstrip(";") + ";"
+    for i in range(1, iterations + 1):
+        if i == 2:
+            parts.append("CALL profiler_start();")
+        parts.append(query_sql)
+        parts.append(
+            f"INSERT INTO _timings VALUES ({i + 1}, 'iter_{i}', current_timestamp);"
+        )
+
+    if iterations >= 2:
+        parts.append("CALL profiler_stop();")
+
+    if pin != "none":
+        parts.append(emit_unpin(qnum))
+
+    parts.append(
+        f"""COPY (
+    SELECT step, runtime_s FROM (
+        SELECT
+            seq,
+            step,
+            extract(epoch FROM (ts - LAG(ts) OVER (ORDER BY seq))) AS runtime_s
+        FROM _timings
+    )
+    WHERE seq > 0
+    ORDER BY seq
+) TO '{timing_path}' (FORMAT CSV, HEADER);"""
+    )
+
+    with open(sql_path, "w") as f:
+        f.write("\n".join(parts))
+        f.write("\n")
+    return sql_path
+
+
+def run_nsys_profile(
+    queries,
+    parquet_dir,
+    iterations,
+    writer,
+    *,
+    benchmark_dir,
+    pin,
+    config_path,
+    query_timeout,
+):
+    """Profile each query with NVIDIA Nsight Systems: one DuckDB subprocess per query.
+
+    Per query, builds a temp SQL file that registers views, optionally pins
+    tables, runs N iterations (cold + N-1 hot) bracketed by profiler_start /
+    profiler_stop for nsys's cudaProfilerApi capture range, and emits a
+    timings.csv via DuckDB's COPY. The subprocess is wrapped by
+    `nsys profile --capture-range=cudaProfilerApi`, producing one
+    .nsys-rep + .sqlite per query under <bench>/sirius/q<N>/.
+
+    Iteration runtimes from timings.csv are written into csv/runtimes.csv with
+    engine="sirius" and iteration=0..N-1.
+    """
+    if not os.path.isfile(DUCKDB_BIN):
+        raise SystemExit(
+            f"DuckDB binary not found at {DUCKDB_BIN}. "
+            "Build with `pixi run -e clang make release` first."
+        )
+    if not shutil.which("nsys"):
+        raise SystemExit("nsys (NVIDIA Nsight Systems) not found in PATH.")
+
+    log(
+        "Mode 'nsys-profile': one nsys-wrapped DuckDB subprocess per query "
+        f"(iterations={iterations}, query_timeout={query_timeout}s)"
+    )
+    pin_enabled = pin != "none"
+
+    for qnum in queries:
+        qdir = _query_dir(benchmark_dir, "sirius", qnum)
+        sub_log_dir = os.path.join(qdir, "log_dir")
+        os.makedirs(sub_log_dir, exist_ok=True)
+
+        sql_path = _build_nsys_temp_sql(qnum, parquet_dir, iterations, pin, qdir)
+        nsys_output = os.path.join(qdir, "nsys")
+        stdout_path = os.path.join(qdir, "nsys_stdout.txt")
+
+        nsys_cmd = [
+            "nsys",
+            "profile",
+            "--trace=cuda,nvtx",
+            "--sample=none",
+            "--cudabacktrace=none",
+        ]
+        if iterations >= 2:
+            nsys_cmd.extend(
+                ["--capture-range=cudaProfilerApi", "--capture-range-end=stop"]
+            )
+        nsys_cmd.extend(
+            [
+                "--output",
+                nsys_output,
+                "--force-overwrite=true",
+                "--stats=false",
+                "--export=sqlite",
+                DUCKDB_BIN,
+                "-f",
+                sql_path,
+            ]
+        )
+
+        env = os.environ.copy()
+        if config_path:
+            env["SIRIUS_CONFIG_FILE"] = config_path
+        if pin_enabled:
+            env["SIRIUS_PIN_TIER"] = pin
+        env["SIRIUS_LOG_DIR"] = sub_log_dir
+
+        log(f"--- q{qnum} (nsys, iterations={iterations}) ---")
+        log(f"  output: {nsys_output}.nsys-rep / .sqlite")
+        start = time.perf_counter()
+        try:
+            with open(stdout_path, "w") as out:
+                proc = subprocess.run(
+                    nsys_cmd,
+                    timeout=query_timeout + 10,
+                    stdout=out,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                )
+        except subprocess.TimeoutExpired:
+            wall = time.perf_counter() - start
+            log(
+                f"  q{qnum} TIMED OUT after {wall:.1f}s "
+                f"(timeout={query_timeout + 10}s)"
+            )
+            for it in range(iterations):
+                _record(writer, "sirius", qnum, it, float("nan"))
+            continue
+        wall = time.perf_counter() - start
+        log(f"  q{qnum} subprocess returned in {wall:.2f}s (exit={proc.returncode})")
+
+        if proc.returncode != 0:
+            log(f"  q{qnum} FAILED — last lines of {stdout_path}:")
+            try:
+                with open(stdout_path) as f:
+                    tail = f.readlines()[-5:]
+                for line in tail:
+                    log(f"    > {line.rstrip()}")
+            except OSError:
+                pass
+            for it in range(iterations):
+                _record(writer, "sirius", qnum, it, float("nan"))
+            continue
+
+        # Parse the DuckDB-emitted timings.csv (rows: views, iter_1, iter_2, ...).
+        # The 'views' row is skipped; subsequent rows map to iter=0,1,...
+        timing_path = os.path.join(qdir, "timings.csv")
+        if not os.path.isfile(timing_path):
+            log(f"  q{qnum} WARNING: no timings.csv produced; recording NaN")
+            for it in range(iterations):
+                _record(writer, "sirius", qnum, it, float("nan"))
+            continue
+        with open(timing_path) as f:
+            reader = csv.reader(f)
+            next(reader, None)  # header: step,runtime_s
+            next(reader, None)  # 'views' row
+            it = 0
+            for row in reader:
+                if len(row) < 2:
+                    continue
+                try:
+                    rt = float(row[1])
+                except ValueError:
+                    rt = float("nan")
+                _record(writer, "sirius", qnum, it, rt)
+                it += 1
+            while it < iterations:
+                _record(writer, "sirius", qnum, it, float("nan"))
+                it += 1
 
 
 def split_sirius_log(log_dir, benchmark_dir, queries, iterations, mode):
@@ -688,6 +906,27 @@ def parse_args():
             "inflated vs an unprofiled baseline."
         ),
     )
+    p.add_argument(
+        "--nsys-profile",
+        action="store_true",
+        help=(
+            "Profile each query with NVIDIA Nsight Systems (nsys). Spawns one DuckDB "
+            "CLI subprocess per query wrapped in `nsys profile`; produces "
+            "<benchmark_dir>/sirius/q<N>/nsys.{nsys-rep,sqlite,sql} and a per-query "
+            "timings.csv. Requires --engine gpu and the DuckDB CLI at "
+            "build/release/duckdb plus `nsys` on PATH. Incompatible with "
+            "--validation, --duckdb-profiling, --mode sequential, --mode isolated."
+        ),
+    )
+    p.add_argument(
+        "--query-timeout",
+        type=int,
+        default=90,
+        help=(
+            "Per-query subprocess timeout in seconds for --nsys-profile mode "
+            "(default: 90). Ignored without --nsys-profile."
+        ),
+    )
     return p.parse_args()
 
 
@@ -712,6 +951,19 @@ def main():
             "--validation requires --engine both (needs both result sets to compare)"
         )
 
+    if args.nsys_profile:
+        if args.engine != "gpu":
+            raise SystemExit("--nsys-profile requires --engine gpu")
+        if args.validation:
+            raise SystemExit("--nsys-profile is incompatible with --validation")
+        if args.duckdb_profiling:
+            raise SystemExit("--nsys-profile is incompatible with --duckdb-profiling")
+        if args.mode != "grouped":
+            raise SystemExit(
+                "--nsys-profile only supports --mode grouped "
+                "(implicit per-query subprocess)"
+            )
+
     config_path = (args.config or "").strip()
     if config_path:
         os.environ["SIRIUS_CONFIG_FILE"] = config_path
@@ -733,6 +985,7 @@ def main():
         config_path,
         args.pin,
         name=args.name,
+        nsys_profile=args.nsys_profile,
     )
     os.environ["SIRIUS_LOG_DIR"] = log_dir
 
@@ -744,6 +997,7 @@ def main():
     log(f"Config:        {config_path or '(default)'}")
     log(f"Pin:           {args.pin}")
     log(f"DuckDB profiling: {args.duckdb_profiling}")
+    log(f"nsys-profile:  {args.nsys_profile}")
     log(f"Benchmark dir: {benchmark_dir}")
     log(f"Runtime CSV:   {runtime_csv}")
     log(f"Log dir:       {log_dir}")
@@ -752,21 +1006,37 @@ def main():
         writer = csv.writer(f)
         writer.writerow(["engine", "query", "iteration", "runtime_s"])
         f.flush()
-        RUNNERS[args.mode](
-            source,
-            queries,
-            engine_modes,
-            args.iterations,
-            writer,
-            benchmark_dir=benchmark_dir,
-            parquet_dir=parquet_dir,
-            pin=args.pin,
-            duckdb_profiling=args.duckdb_profiling,
-        )
+        if args.nsys_profile:
+            run_nsys_profile(
+                queries,
+                parquet_dir,
+                args.iterations,
+                writer,
+                benchmark_dir=benchmark_dir,
+                pin=args.pin,
+                config_path=config_path,
+                query_timeout=args.query_timeout,
+            )
+        else:
+            RUNNERS[args.mode](
+                source,
+                queries,
+                engine_modes,
+                args.iterations,
+                writer,
+                benchmark_dir=benchmark_dir,
+                parquet_dir=parquet_dir,
+                pin=args.pin,
+                duckdb_profiling=args.duckdb_profiling,
+            )
 
     log("Benchmark run complete")
 
-    if any(use_gpu for _, use_gpu in engine_modes):
+    # split_sirius_log post-processes the combined daily-sink log produced by
+    # the long-running Python connection. In --nsys-profile mode each query
+    # runs in its own subprocess with its own SIRIUS_LOG_DIR, so the per-query
+    # logs are already isolated under <bench>/sirius/q<N>/log_dir/.
+    if not args.nsys_profile and any(use_gpu for _, use_gpu in engine_modes):
         split_sirius_log(log_dir, benchmark_dir, queries, args.iterations, args.mode)
 
     if args.validation:

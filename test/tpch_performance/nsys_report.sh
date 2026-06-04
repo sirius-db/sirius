@@ -35,6 +35,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 OUTPUT_BASE="${OUTPUT_BASE:-$PROJECT_DIR/reports}"
 LABEL=""
 SF=""
+PARQUET_DIR=""
 PROFILE_DIR=""
 COMPARE_DIR=""
 ITERATIONS="${ITERATIONS:-2}"
@@ -50,34 +51,42 @@ usage() {
     echo ""
     echo "Options:"
     echo "  --sf SF              Scale factor for profiling (e.g., 300_rg2m, 100)"
+    echo "  --parquet-dir DIR    Override parquet directory (default: \$PROJECT_DIR/test_datasets/tpch_parquet_sf<SF>)"
     echo "  --profile-dir DIR    Use existing profiles (skip profiling)"
     echo "  --output-dir DIR     Base directory for reports (default: ./reports)"
     echo "  --label LABEL        Custom label (default: sirius_sf<SF>)"
     echo "  --compare DIR        Compare against a previous report directory"
     echo "  --iterations N       Iterations per query (default: 2)"
     echo "  --query-timeout N    Per-query timeout in seconds (default: 90)"
-    echo "  --cache-level LEVEL  Scan cache level: none, table_gpu, table_host, parquet (default: none)"
     echo "  -h, --help           Show this help"
     echo ""
     echo "Either --sf or --profile-dir is required."
+    echo ""
+    echo "To set scan_cache_level, configure it in your Sirius YAML config"
+    echo "(pointed at by \$SIRIUS_CONFIG_FILE)."
     exit 1
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --sf)           SF="$2"; shift 2 ;;
+        --parquet-dir)  PARQUET_DIR="$2"; shift 2 ;;
         --profile-dir)  PROFILE_DIR="$2"; shift 2 ;;
         --output-dir)   OUTPUT_BASE="$2"; shift 2 ;;
         --label)        LABEL="$2"; shift 2 ;;
         --compare)      COMPARE_DIR="$2"; shift 2 ;;
         --iterations)   ITERATIONS="$2"; shift 2 ;;
         --query-timeout) QUERY_TIMEOUT="$2"; shift 2 ;;
-        --cache-level)  SCAN_CACHE_LEVEL="$2"; shift 2 ;;
         -h|--help)      usage ;;
         -*)             echo "ERROR: Unknown option: $1" >&2; usage ;;
         *)              QUERIES+=("$1"); shift ;;
     esac
 done
+
+# Default parquet dir based on SF (when neither --parquet-dir nor --profile-dir is set)
+if [ -z "$PARQUET_DIR" ] && [ -n "$SF" ]; then
+    PARQUET_DIR="$PROJECT_DIR/test_datasets/tpch_parquet_sf${SF}"
+fi
 
 if [ -z "$SF" ] && [ -z "$PROFILE_DIR" ]; then
     echo "ERROR: Either --sf or --profile-dir is required" >&2
@@ -143,19 +152,56 @@ if [ -n "$PROFILE_DIR" ]; then
     echo "  Copied $(ls "$REPORT_DIR/profiles/"*.sqlite 2>/dev/null | wc -l) SQLite files"
     echo ""
 else
-    echo "[Phase 2] Running nsys profiling (sf=$SF, iterations=$ITERATIONS)..."
-    export OUTPUT_DIR="$REPORT_DIR/profiles"
-    export ITERATIONS
-    export QUERY_TIMEOUT
-    export SCAN_CACHE_LEVEL="${SCAN_CACHE_LEVEL:-}"
-    if bash "$PROJECT_DIR/test/tpch_performance/profile_tpch_nsys.sh" "$SF" "${QUERIES[@]+"${QUERIES[@]}"}"; then
-        echo ""
+    echo "[Phase 2] Running nsys profiling via performance_test.py"
+    echo "  sf=$SF, iterations=$ITERATIONS, parquet=$PARQUET_DIR"
+    if [ ! -d "$PARQUET_DIR" ]; then
+        echo "ERROR: Parquet directory not found: $PARQUET_DIR" >&2
+        echo "  Pass --parquet-dir or generate data with generate_tpch_data.sh" >&2
+        exit 1
+    fi
+
+    QUERIES_CSV=""
+    if [ ${#QUERIES[@]} -gt 0 ]; then
+        QUERIES_CSV=$(IFS=,; echo "${QUERIES[*]}")
+    fi
+
+    PY_CMD=(
+        pixi run python "$PROJECT_DIR/test/tpch_performance/performance_test.py"
+        --nsys-profile
+        --input "$PARQUET_DIR"
+        --engine gpu
+        --iterations "$ITERATIONS"
+        --output "$REPORT_DIR"
+        --name profiles_tree
+        --query-timeout "$QUERY_TIMEOUT"
+    )
+    if [ -n "$QUERIES_CSV" ]; then
+        PY_CMD+=(--queries "$QUERIES_CSV")
+    fi
+
+    if "${PY_CMD[@]}"; then
         echo "  Profiling complete."
     else
-        echo ""
         echo "  WARNING: Profiling finished with errors (some queries may have failed)"
     fi
     echo ""
+
+    # Flatten <REPORT_DIR>/profiles_tree/sirius/q<N>/ → <REPORT_DIR>/profiles/q<N>.<ext>
+    # so nsys_analyze.sh and Phase 4 metric extraction (which read flat
+    # profiles/q<N>.sqlite + q<N>_timings.csv) continue to work unchanged.
+    PROFILES_TREE="$REPORT_DIR/profiles_tree/sirius"
+    if [ -d "$PROFILES_TREE" ]; then
+        echo "[Phase 2] Flattening per-query outputs into $REPORT_DIR/profiles/"
+        for qdir in "$PROFILES_TREE"/q*/; do
+            [ -d "$qdir" ] || continue
+            q=$(basename "$qdir")  # q<N>
+            [ -f "$qdir/nsys.sqlite" ]     && cp "$qdir/nsys.sqlite"     "$REPORT_DIR/profiles/${q}.sqlite"
+            [ -f "$qdir/nsys.nsys-rep" ]   && cp "$qdir/nsys.nsys-rep"   "$REPORT_DIR/profiles/${q}.nsys-rep"
+            [ -f "$qdir/timings.csv" ]     && cp "$qdir/timings.csv"     "$REPORT_DIR/profiles/${q}_timings.csv"
+            [ -f "$qdir/nsys_stdout.txt" ] && cp "$qdir/nsys_stdout.txt" "$REPORT_DIR/profiles/${q}_result.txt"
+        done
+        echo ""
+    fi
 fi
 
 # Verify we have SQLite files
