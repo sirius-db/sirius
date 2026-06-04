@@ -336,17 +336,7 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
           "[sirius_gpu_parquet_scan_operator] Cached filter expression could not be lowered to a "
           "Sirius AST node; materializing the cached batch unfiltered.");
       }
-      // No filter but assembly is needed (the plan permutes / drops columns relative to
-      // data_columns). Materialize the cached view into an owning table so
-      // assemble_scan_output can release the columns by D-position and reassemble them
-      // in output_layout order.
-      std::vector<std::unique_ptr<cudf::column>> owned_cols;
-      owned_cols.reserve(cached_view.num_columns());
-      for (cudf::size_type i = 0; i < cached_view.num_columns(); ++i) {
-        owned_cols.push_back(std::make_unique<cudf::column>(
-          cached_view.column(i), stream, cudf::get_current_device_resource_ref()));
-      }
-      table = std::make_unique<cudf::table>(std::move(owned_cols));
+      table = gpu_rep.release_table(stream);
     }
 
     if (needs_assembly) {
