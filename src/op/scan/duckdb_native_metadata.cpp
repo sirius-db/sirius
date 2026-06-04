@@ -18,12 +18,17 @@
 
 #include "log/logging.hpp"
 
+#include <nvtx3/nvtx3.hpp>
+
 #include <duckdb/function/partition_stats.hpp>
 #include <duckdb/main/attached_database.hpp>
 #include <duckdb/storage/block_manager.hpp>
 #include <duckdb/storage/statistics/base_statistics.hpp>
 #include <duckdb/storage/statistics/string_stats.hpp>
 #include <duckdb/storage/storage_manager.hpp>
+#include <duckdb/storage/table/column_data.hpp>
+#include <duckdb/storage/table/row_group.hpp>
+#include <duckdb/storage/table/row_group_collection.hpp>
 #include <duckdb/storage/table_storage_info.hpp>
 
 #include <algorithm>
@@ -302,6 +307,8 @@ duckdb_native_metadata walk_duckdb_native_metadata(
   const std::vector<projected_column>& projected_cols,
   const std::vector<sirius::logical_type>& projected_types)
 {
+  nvtx3::scoped_range nvtx_walk{"sirius::native_metadata_walk"};
+
   duckdb_native_metadata md;
   md.viable = false;
 
@@ -331,7 +338,11 @@ duckdb_native_metadata walk_duckdb_native_metadata(
 
   // PartitionStatistics order matches `RowGroupCollection::SegmentNodes()`
   // iteration order at v1.5.2 — relied on for indexing by row_group_index.
-  auto partition_stats = storage.GetPartitionStats(context);
+  duckdb::vector<duckdb::PartitionStatistics> partition_stats;
+  {
+    nvtx3::scoped_range nvtx_ps{"sirius::native_metadata_partition_stats"};
+    partition_stats = storage.GetPartitionStats(context);
+  }
   row_group_handles handles;
   handles.reserve(partition_stats.size());
   for (std::size_t i = 0; i < partition_stats.size(); ++i) {
@@ -354,7 +365,22 @@ duckdb_native_metadata walk_duckdb_native_metadata(
   }
 
   duckdb::QueryContext qc{context};
-  auto column_segments = storage.GetColumnSegmentInfo(qc);
+  duckdb::vector<duckdb::ColumnSegmentInfo> column_segments;
+  {
+    nvtx3::scoped_range nvtx_si{"sirius::native_metadata_segment_info"};
+    // Read segment metadata for projected columns only.
+    auto& row_groups        = *storage.GetRowGroupCollection();
+    auto const n_row_groups = row_groups.GetRowGroupCount();
+    for (std::size_t rg = 0; rg < n_row_groups; ++rg) {
+      auto row_group = row_groups.GetRowGroup(rg);
+      if (!row_group) { continue; }
+      for (auto const& pc : projected_cols) {
+        if (pc.is_rowid) { continue; }
+        row_group->GetRawColumnData(pc.storage_idx)
+          .GetColumnSegmentInfo(qc, rg, {pc.storage_idx.GetPrimaryIndex()}, column_segments);
+      }
+    }
+  }
 
   // Size to max_row_group_index + 1 so rowid-only and all-filtered row
   // groups still have an entry for rowid synthesis and trailing-empty
@@ -364,7 +390,7 @@ duckdb_native_metadata walk_duckdb_native_metadata(
     max_rg_idx = std::max(max_rg_idx, seg.row_group_index);
   }
   const std::size_t num_row_groups =
-    column_segments.empty() ? 0 : static_cast<std::size_t>(max_rg_idx) + 1;
+    column_segments.empty() ? handles.size() : static_cast<std::size_t>(max_rg_idx) + 1;
   md.row_groups.resize(num_row_groups);
   for (std::size_t rg = 0; rg < num_row_groups; ++rg) {
     md.row_groups[rg].row_group_index = rg;
