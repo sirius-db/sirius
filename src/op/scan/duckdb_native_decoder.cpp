@@ -33,12 +33,15 @@
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/span.hpp>
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/detail/error.hpp>
 #include <rmm/device_buffer.hpp>
+
+#include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
@@ -65,6 +68,7 @@
 #include <cstring>
 #include <future>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -498,61 +502,61 @@ staged_column stage_one_varchar_column(staging_state& s,
 }
 
 //===----------------------------------------------------------------------===//
-// Coalesce + issue staged reads into a pinned host buffer, then bulk-copy H2D.
+// Issue staged reads into a pinned host buffer, then copy them to the device.
 //
-// Buffered host_read_async into a pinned multiple_blocks_allocation that mirrors
-// the device-buffer layout (host byte offset == device byte offset), followed by
-// a bulk pinned->device copy. This
-// (a) hits the OS page cache on warm runs instead of always hitting the NVMe,
-// (b) collapses N per-chunk H2D copies + stream callbacks into one async copy
-//     per host block, and
-// (c) coalesces file+buffer-contiguous reads.
+// File-near segment reads are coalesced into large sequential reads (bridging the
+// per-block header gaps) and dispatched as one batch via host_read_ranges_async_io,
+// packed into a pinned multiple_blocks_allocation WITHOUT 16B gaps so more reads
+// merge; the 16B device alignment the decode kernels need is imposed by the
+// per-segment H2D scatter instead. Buffered reads hit the OS page cache on warm
+// runs; coalescing cuts request count ~4x. NVTX ranges (native_reads / native_h2d,
+// plus native_metadata_walk in the metadata walker) are kept for profiling.
 //===----------------------------------------------------------------------===//
 
 using multiple_blocks_allocation =
   cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
 
-/// @brief Merge reads that are contiguous in BOTH the file and the device/host buffer.
-/// A merged read maps one contiguous file range onto one contiguous mirror-buffer
-/// range, so it can be issued as a single (block-split) host read. Reads arrive
-/// in device-offset order already; the sort is defensive.
-std::vector<device_read_job> coalesce_reads(std::vector<device_read_job> reads)
-{
-  std::sort(reads.begin(), reads.end(), [](auto const& a, auto const& b) {
-    return a.device_offset < b.device_offset;
-  });
-  std::vector<device_read_job> merged;
-  merged.reserve(reads.size());
-  for (auto const& r : reads) {
-    if (r.size == 0) { continue; }
-    if (!merged.empty()) {
-      auto& p = merged.back();
-      if (p.device_offset + p.size == r.device_offset && p.file_offset + p.size == r.file_offset) {
-        p.size += r.size;
-        continue;
-      }
-    }
-    merged.push_back(r);
-  }
-  return merged;
-}
+// Merge reads whose file gap is <= this. Consecutive .db block payloads are separated
+// by an 8B block header (and segments by small alignment gaps); bridging them
+// coalesces a column's blocks into one sequential read. Kept small so we never pull
+// the large unprojected-column waste that sits between row groups.
+constexpr std::size_t kCoalesceMaxGap = 64UL * 1024;
 
-/// @brief memcpy `n` host bytes into the block-fragmented allocation at global byte
-/// offset `g`, spanning block boundaries as needed.
-void copy_into_mirror(multiple_blocks_allocation& alloc,
-                      std::size_t g,
-                      uint8_t const* src,
-                      std::size_t n)
+/// @brief Batched pinned->device H2D (one cudaMemcpyBatchAsync launch); per-entry
+/// fallback on toolkits without the batch API.
+void batched_h2d(std::vector<void*> const& dst,
+                 std::vector<void const*> const& src,
+                 std::vector<std::size_t> const& size,
+                 rmm::cuda_stream_view stream)
 {
-  std::size_t const bsz = alloc.block_size();
-  std::size_t done      = 0;
-  while (done < n) {
-    std::size_t const bi    = (g + done) / bsz;
-    std::size_t const off   = (g + done) % bsz;
-    std::size_t const chunk = std::min(n - done, bsz - off);
-    std::memcpy(reinterpret_cast<uint8_t*>(alloc.at(bi).data()) + off, src + done, chunk);
-    done += chunk;
+  if (dst.empty()) { return; }
+#if CUDART_VERSION >= 12080
+  cudaMemcpyAttributes attrs{};
+  attrs.srcAccessOrder  = cudaMemcpySrcAccessOrderStream;
+  attrs.srcLocHint.type = cudaMemLocationTypeHost;
+  attrs.dstLocHint.type = cudaMemLocationTypeDevice;
+  attrs.flags           = 0;
+  std::size_t attrs_idx = 0;  // single attrs entry applies to all copies
+#if CUDART_VERSION < 13000
+  std::size_t fail_idx = 0;
+  RMM_CUDA_TRY(cudaMemcpyBatchAsync(dst.data(),
+                                    src.data(),
+                                    size.data(),
+                                    dst.size(),
+                                    &attrs,
+                                    &attrs_idx,
+                                    1,
+                                    &fail_idx,
+                                    stream.value()));
+#else
+  RMM_CUDA_TRY(cudaMemcpyBatchAsync(
+    dst.data(), src.data(), size.data(), dst.size(), &attrs, &attrs_idx, 1, stream.value()));
+#endif
+#else
+  for (std::size_t i = 0; i < dst.size(); ++i) {
+    RMM_CUDA_TRY(cudaMemcpyAsync(dst[i], src[i], size[i], cudaMemcpyHostToDevice, stream.value()));
   }
+#endif
 }
 
 void submit_and_await(rmm::device_buffer& device_buf,
@@ -565,21 +569,17 @@ void submit_and_await(rmm::device_buffer& device_buf,
 {
   namespace ccm = cucascade::memory;
 
-  auto* device_base       = static_cast<uint8_t*>(device_buf.data());
-  std::size_t const total = s.running_offset;
+  auto* device_base = static_cast<uint8_t*>(device_buf.data());
 
-  // Pinned host staging buffer mirroring the device buffer (same byte offsets),
-  // drawn from the host FSMR pool so we reuse pre-pinned blocks instead of
-  // paying a cudaHostAlloc per split. Host spaces are keyed by NUMA node; prefer
-  // the node local to the GPU that owns device_buf (so the H2D copy is a
-  // node-local transfer). The strategy keeps the other host spaces as fallback,
-  // so this is a no-op on single-NUMA hosts and never fails to find a space.
+  // Reserve pinned host staging from the FSMR pool, preferring the NUMA node local to
+  // the GPU that owns device_buf (host spaces are keyed by NUMA node; the strategy
+  // falls back to other nodes, so single-NUMA hosts are unaffected).
   ccm::any_memory_space_in_tier_with_preference host_req(ccm::Tier::HOST,
                                                          static_cast<std::size_t>(host_numa_node));
-  auto reservation = host_mem_mgr.request_reservation(host_req, total);
+  auto reservation = host_mem_mgr.request_reservation(host_req, s.running_offset);
   if (!reservation) {
-    throw std::runtime_error(std::string(kTag) + " failed to reserve " + std::to_string(total) +
-                             " bytes of host staging memory");
+    throw std::runtime_error(std::string(kTag) + " failed to reserve " +
+                             std::to_string(s.running_offset) + " bytes of host staging memory");
   }
   auto* host_fsmr =
     reservation->get_memory_space().get_memory_resource_as<ccm::fixed_size_host_memory_resource>();
@@ -587,104 +587,116 @@ void submit_and_await(rmm::device_buffer& device_buf,
     throw std::runtime_error(std::string(kTag) +
                              " host memory space is not a fixed_size_host_memory_resource");
   }
-  auto host_alloc       = host_fsmr->allocate_multiple_blocks(total, reservation.get());
-  std::size_t const bsz = host_alloc->block_size();
+  std::size_t const bsz = host_fsmr->get_block_size();
 
-  // Coalesce file+buffer-contiguous reads, then issue each as buffered async host
-  // reads split at host-block boundaries (the pinned buffer is fragmented into
-  // bsz-sized blocks). Each sub-read targets a contiguous region of one block and
-  // writes directly into its final pinned slot — no intermediate copy.
-  auto const merged = coalesce_reads(s.reads);
-  std::vector<std::future<std::size_t>> read_futures;
-  std::vector<std::size_t> expected;
-  read_futures.reserve(merged.size());
-  expected.reserve(merged.size());
-  for (auto const& r : merged) {
-    std::size_t remaining = r.size;
-    std::size_t fpos      = r.file_offset;
-    std::size_t g         = r.device_offset;
-    while (remaining > 0) {
-      std::size_t const bi    = g / bsz;
-      std::size_t const off   = g % bsz;
-      std::size_t const chunk = std::min(remaining, bsz - off);
-      auto* dst               = reinterpret_cast<uint8_t*>(host_alloc->at(bi).data()) + off;
-      read_futures.push_back(io_ctx.host_read_async(io_obj, fpos, chunk, dst));
-      expected.push_back(chunk);
-      remaining -= chunk;
-      fpos += chunk;
-      g += chunk;
+  // Coalesce file-near whole segments into contiguous host pieces (<= bsz, never
+  // straddling a block) — the io_utils::coalesce_ranges merge rule, plus the block-size
+  // / whole-segment caps the fragmented host buffer needs. Each piece maps to ONE
+  // host_read_ranges range; per-segment offsets within a piece let the H2D scatter each
+  // segment to its 16B-aligned device slot.
+  auto reads = s.reads;
+  std::sort(reads.begin(), reads.end(), [](auto const& a, auto const& b) {
+    return a.file_offset < b.file_offset;
+  });
+  struct piece {
+    std::size_t file_off, file_end, host_block, host_off;
+  };
+  struct seg_copy {
+    std::size_t host_block, host_off, device_off, size;
+  };
+  std::vector<piece> pieces;
+  std::vector<seg_copy> seg_copies;
+  pieces.reserve(reads.size());
+  seg_copies.reserve(reads.size());
+  std::size_t cur_block = 0, cur_off = 0;
+  for (auto const& r : reads) {
+    if (r.size == 0) { continue; }
+    bool new_piece = pieces.empty();
+    if (!new_piece) {
+      auto& p                       = pieces.back();
+      std::size_t const gap         = r.file_offset - p.file_end;
+      std::size_t const prospective = (r.file_offset + r.size) - p.file_off;
+      if (gap > kCoalesceMaxGap || p.host_off + prospective > bsz) { new_piece = true; }
+    }
+    if (new_piece) {
+      if (cur_off + r.size > bsz) {
+        ++cur_block;
+        cur_off = 0;
+      }
+      pieces.push_back({r.file_offset, r.file_offset + r.size, cur_block, cur_off});
+    } else {
+      pieces.back().file_end = r.file_offset + r.size;
+    }
+    auto& p = pieces.back();
+    seg_copies.push_back(
+      {p.host_block, p.host_off + (r.file_offset - p.file_off), r.device_offset, r.size});
+    cur_off = p.host_off + (p.file_end - p.file_off);
+  }
+
+  auto host_alloc = host_fsmr->allocate_multiple_blocks((cur_block + 1) * bsz, reservation.get());
+
+  // One coalesced range + contiguous dst span per piece.
+  std::vector<cudf::io::text::byte_range_info> ranges;
+  std::vector<cudf::host_span<std::byte>> dsts;
+  ranges.reserve(pieces.size());
+  dsts.reserve(pieces.size());
+  std::size_t total_read = 0;
+  for (auto const& p : pieces) {
+    std::size_t const sz = p.file_end - p.file_off;
+    ranges.emplace_back(static_cast<int64_t>(p.file_off), static_cast<int64_t>(sz));
+    dsts.emplace_back(
+      reinterpret_cast<std::byte*>(host_alloc->at(p.host_block).data()) + p.host_off, sz);
+    total_read += sz;
+  }
+
+  // Issue the coalesced reads as one batch and await completion.
+  {
+    nvtx3::scoped_range nvtx_reads{"native_reads"};
+    std::promise<std::size_t> prom;
+    auto fut = prom.get_future();
+    io_ctx.host_read_ranges_async_io(io_obj,
+                                     ranges,
+                                     std::span<cudf::host_span<std::byte>>(dsts),
+                                     [&prom](std::size_t n, std::exception_ptr e) {
+                                       if (e) {
+                                         prom.set_exception(std::move(e));
+                                       } else {
+                                         prom.set_value(n);
+                                       }
+                                     });
+    std::size_t const got = fut.get();
+    if (got != total_read) {
+      throw std::runtime_error(std::string(kTag) + " short coalesced host read: got " +
+                               std::to_string(got) + " expected " + std::to_string(total_read));
     }
   }
 
-  // CPU-produced segments (CONSTANT, ROARING) are copied into the mirror buffer so
-  // they ride the same bulk H2D copy as the file reads.
+  // CPU-produced segments (CONSTANT/ROARING): copy straight to their device slots; no
+  // overwrite hazard since each segment owns a disjoint device range.
   for (auto const& h : s.host_copies) {
-    copy_into_mirror(*host_alloc, h.device_offset, h.src_ptr, h.size);
+    RMM_CUDA_TRY(cudaMemcpyAsync(
+      device_base + h.device_offset, h.src_ptr, h.size, cudaMemcpyHostToDevice, stream.value()));
   }
 
-  // Await all host reads (verify full reads).
-  for (std::size_t i = 0; i < read_futures.size(); ++i) {
-    auto const got = read_futures[i].get();
-    if (got != expected[i]) {
-      throw std::runtime_error(std::string(kTag) + " short host read: got " + std::to_string(got) +
-                               " expected " + std::to_string(expected[i]));
+  // Per-segment H2D: host (packed) -> device (16B-aligned), batched. Sync before
+  // host_alloc / reservation drop so the copies finish reading pinned memory first.
+  {
+    nvtx3::scoped_range nvtx_h2d{"native_h2d"};
+    std::vector<void*> h2d_dst;
+    std::vector<void const*> h2d_src;
+    std::vector<std::size_t> h2d_size;
+    h2d_dst.reserve(seg_copies.size());
+    h2d_src.reserve(seg_copies.size());
+    h2d_size.reserve(seg_copies.size());
+    for (auto const& c : seg_copies) {
+      h2d_dst.push_back(device_base + c.device_off);
+      h2d_src.push_back(reinterpret_cast<uint8_t*>(host_alloc->at(c.host_block).data()) +
+                        c.host_off);
+      h2d_size.push_back(c.size);
     }
+    batched_h2d(h2d_dst, h2d_src, h2d_size, stream);
+    RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));
   }
-
-  // Bulk H2D: one copy per host block (pinned -> contiguous device range), issued
-  // as a single batched submission to collapse the per-block launch overhead.
-  // Alignment-gap bytes between segments are copied as-is and never read by the
-  // decode kernels (the device layout is identical to the staging pass).
-  std::vector<void*> h2d_dst;
-  std::vector<void const*> h2d_src;
-  std::vector<std::size_t> h2d_size;
-  std::size_t const n_blocks = (total + bsz - 1) / bsz;
-  h2d_dst.reserve(n_blocks);
-  h2d_src.reserve(n_blocks);
-  h2d_size.reserve(n_blocks);
-  for (std::size_t g = 0, bi = 0; g < total; g += bsz, ++bi) {
-    h2d_dst.push_back(device_base + g);
-    h2d_src.push_back(host_alloc->at(bi).data());
-    h2d_size.push_back(std::min(bsz, total - g));
-  }
-#if CUDART_VERSION >= 12080
-  cudaMemcpyAttributes attrs{};
-  attrs.srcAccessOrder  = cudaMemcpySrcAccessOrderStream;
-  attrs.srcLocHint.type = cudaMemLocationTypeHost;
-  attrs.dstLocHint.type = cudaMemLocationTypeDevice;
-  attrs.flags           = 0;
-  std::size_t attrs_idx = 0;  // single attrs entry applies to all copies
-#if CUDART_VERSION < 13000
-  std::size_t fail_idx = 0;
-  RMM_CUDA_TRY(cudaMemcpyBatchAsync(h2d_dst.data(),
-                                    h2d_src.data(),
-                                    h2d_size.data(),
-                                    h2d_dst.size(),
-                                    &attrs,
-                                    &attrs_idx,
-                                    1,
-                                    &fail_idx,
-                                    stream.value()));
-#else
-  RMM_CUDA_TRY(cudaMemcpyBatchAsync(h2d_dst.data(),
-                                    h2d_src.data(),
-                                    h2d_size.data(),
-                                    h2d_dst.size(),
-                                    &attrs,
-                                    &attrs_idx,
-                                    1,
-                                    stream.value()));
-#endif
-#else
-  for (std::size_t i = 0; i < h2d_dst.size(); ++i) {
-    RMM_CUDA_TRY(
-      cudaMemcpyAsync(h2d_dst[i], h2d_src[i], h2d_size[i], cudaMemcpyHostToDevice, stream.value()));
-  }
-#endif
-
-  // Sync before host_alloc / reservation drop so the H2D copies finish reading
-  // pinned memory first.
-  RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));
 }
 
 //===----------------------------------------------------------------------===//
