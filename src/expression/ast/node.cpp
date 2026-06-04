@@ -31,6 +31,12 @@ namespace sirius::ast {
 
 namespace {
 
+// Boundary helper for the require_* accessors below, which run during GPU operator
+// construction (under create_plan). A null or wrong-type node means the GPU path cannot
+// handle this expression shape — e.g. wrap() returned null for an unsupported aggregate, or
+// a group key that is not a bound reference. not_implemented_exception is deliberate: it is
+// caught by OnFinalizePrepare's `catch (std::exception&)` and triggers graceful CPU fallback
+// rather than signalling an internal Sirius invariant violation.
 [[noreturn]] void throw_wrong_node_type(std::string_view context, std::string_view expected)
 {
   throw not_implemented_exception("{}: expected {}", context, expected);

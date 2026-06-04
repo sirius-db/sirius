@@ -31,8 +31,13 @@ namespace op {
 /**
  * @brief Map a simple Sirius aggregate_id to a single cuDF aggregation kind.
  *
- * Returns std::nullopt for aggregates that decompose into multiple cuDF kinds (avg) or use a
- * different merge path (first, count distinct).
+ * Pure aggregate_id -> Kind mapping over the closed aggregate_id enum. DISTINCT is NOT an
+ * aggregate_id: COUNT(DISTINCT ...) is the `count` id with the distinct() modifier set, and is
+ * intercepted by the caller (COLLECT_SET path) before this helper runs — so there is no
+ * count_distinct case to add here.
+ *
+ * Returns std::nullopt for ids that do not map to a single merge-able cuDF kind: `avg`
+ * (decomposes into SUM + COUNT_VALID) and `first` (NTH_ELEMENT, handled by the caller).
  */
 std::optional<cudf::aggregation::Kind> to_cudf_aggregation_kind(sirius::aggregate_id id);
 

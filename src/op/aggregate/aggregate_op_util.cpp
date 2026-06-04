@@ -23,11 +23,28 @@
 #include "expression/expression_internal.hpp"
 #include "sirius/exception.hpp"
 
+#include <format>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace sirius {
 namespace op {
+
+namespace {
+
+// Single place that builds the "Unsupported aggregate function: <name>" diagnostic so the
+// message (and the aggregate_id -> name lookup) is not repeated at every rejection site.
+[[noreturn]] void throw_unsupported_aggregate(sirius::aggregate_id fid,
+                                              std::string_view detail = {})
+{
+  auto const name = sirius::to_duckdb_aggregate_name(fid);
+  throw std::runtime_error(detail.empty()
+                             ? std::format("Unsupported aggregate function: {}", name)
+                             : std::format("Unsupported aggregate function: {} {}", name, detail));
+}
+
+}  // namespace
 
 std::optional<cudf::aggregation::Kind> to_cudf_aggregation_kind(sirius::aggregate_id id)
 {
@@ -116,10 +133,7 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
     }
 
     auto const agg_kind = to_cudf_aggregation_kind(fid);
-    if (!agg_kind) {
-      throw std::runtime_error(std::string{"Unsupported aggregate function: "} +
-                               std::string{sirius::to_duckdb_aggregate_name(fid)});
-    }
+    if (!agg_kind) { throw_unsupported_aggregate(fid); }
     size_t current_position = result.cudf_aggregates.size();
     result.cudf_aggregates.push_back(*agg_kind);
 
@@ -129,9 +143,7 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       if (fid == sirius::aggregate_id::count_star) {
         result.cudf_aggregate_idx.push_back(0);
       } else {
-        throw std::runtime_error(std::string{"Unsupported aggregate function: "} +
-                                 std::string{sirius::to_duckdb_aggregate_name(fid)} +
-                                 " with no children");
+        throw_unsupported_aggregate(fid, "with no children");
       }
     } else {
       if (children.size() == 1) {
@@ -140,9 +152,7 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
         result.cudf_aggregate_idx.push_back(
           static_cast<int>(children[0]->as_reference().column_index));
       } else {
-        throw std::runtime_error(std::string{"Unsupported aggregate function: "} +
-                                 std::string{sirius::to_duckdb_aggregate_name(fid)} + " with " +
-                                 std::to_string(children.size()) + " children");
+        throw_unsupported_aggregate(fid, "with " + std::to_string(children.size()) + " children");
       }
     }
     result.cudf_aggregate_struct_col_indices.push_back({});
