@@ -26,6 +26,7 @@
 #include "op/scan/duckdb_scan_task.hpp"
 #include "op/scan/parquet_scan_task.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
+#include "pipeline/sirius_pipeline_itask.hpp"
 #include "telemetry/telemetry_context.hpp"
 
 #include <cucascade/memory/common.hpp>
@@ -108,8 +109,8 @@ void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> task)
   } else if (task->is<sirius::op::scan::cpu_source_task>()) {
     _scan_executor->schedule(std::move(task));
   } else {
-    if (auto* handle = task->telemetry_handle()) {
-      handle->queued({
+    if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
+      pipeline_task->telemetry_handle().queued({
         .queue_resource_id = _task_queue_telemetry->uuid(),
       });
     }
@@ -408,7 +409,7 @@ void task_scheduler::management_eventloop()
       }
 
       if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
-        pipeline_task->telemetry_handle()->routing({
+        pipeline_task->telemetry_handle().routing({
           .instance_name              = "",
           .preferred_device_id        = device_id,
           .manager_thread_resource_id = manager_thread_telemetry.uuid(),

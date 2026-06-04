@@ -394,7 +394,7 @@ void duckdb_scan_executor::manager_loop()
     // stream anyway, and duckdb_scan_task runs on the host side until handoff.
     int target_gpu_id = select_target_gpu();
     if (scan_task) {
-      scan_task->telemetry_handle()->routing({
+      scan_task->telemetry_handle().routing({
         .instance_name              = "",
         .preferred_device_id        = target_gpu_id,
         .manager_thread_resource_id = manager_resource_id,
@@ -439,7 +439,7 @@ void duckdb_scan_executor::manager_loop()
           wrap_batch_data, cache_decoded_table, target_gpu_space);
       }
       auto reservation_info = scan_task->get_estimated_reservation_size_info();
-      scan_task->telemetry_handle()->reserving({
+      scan_task->telemetry_handle().reserving({
         .instance_name              = "",
         .requested_bytes            = reservation_info.reservation_size,
         .input_basis                = reservation_info.input_basis,
@@ -468,7 +468,7 @@ void duckdb_scan_executor::manager_loop()
       }
     } else if (scan_task && scan_task->is<duckdb_scan_task>()) {
       auto reservation_info = scan_task->get_estimated_reservation_size_info();
-      scan_task->telemetry_handle()->reserving({
+      scan_task->telemetry_handle().reserving({
         .instance_name              = "",
         .requested_bytes            = reservation_info.reservation_size,
         .input_basis                = reservation_info.input_basis,
@@ -487,7 +487,7 @@ void duckdb_scan_executor::manager_loop()
       }
     } else if (scan_task && scan_task->is<cpu_source_task>()) {
       auto reservation_info = scan_task->get_estimated_reservation_size_info();
-      scan_task->telemetry_handle()->reserving({
+      scan_task->telemetry_handle().reserving({
         .instance_name              = "",
         .requested_bytes            = reservation_info.reservation_size,
         .input_basis                = reservation_info.input_basis,
@@ -565,7 +565,7 @@ void duckdb_scan_executor::manager_loop()
                 "duckdb_scan_executor::manager_loop: executor thread telemetry handle is not "
                 "initialized before preparing scan task");
             }
-            scan_task->telemetry_handle()->preparing({
+            scan_task->telemetry_handle().preparing({
               .instance_name               = "",
               .target_tier                 = "SCAN",
               .executor_thread_resource_id = executor_thread_resource_id,
@@ -574,13 +574,13 @@ void duckdb_scan_executor::manager_loop()
             auto output_data = get_scan_output(scan_task, stream);
             stream->synchronize();
 
-            scan_task->telemetry_handle()->computing({
+            scan_task->telemetry_handle().computing({
               .instance_name               = "",
-              .current_operator_id         = scan_task->get_source_operator_id(),
+              .current_operator_id         = 0,
               .input_bytes                 = 0,
               .executor_thread_resource_id = executor_thread_resource_id,
             });
-            scan_task->telemetry_handle()->finalizing({
+            scan_task->telemetry_handle().finalizing({
               .instance_name = "",
               .success       = true,
             });
@@ -588,7 +588,7 @@ void duckdb_scan_executor::manager_loop()
             scan_task->publish_output(*output_data, stream);
           }
 
-          scan_task->telemetry_handle()->exit();
+          scan_task->telemetry_handle().exit();
           scan_task->set_telemetry_finalized();
           t.reset();
           if (_task_creator && !(_completion_handler && _completion_handler->is_completed())) {

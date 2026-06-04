@@ -244,7 +244,7 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
           "gpu_pipeline_task::execute_operator: executor thread telemetry handle is not "
           "initialized");
       }
-      this->telemetry_handle()->computing({
+      this->telemetry_handle().computing({
         .instance_name               = "",
         .current_operator_id         = op.get_operator_id(),
         .input_bytes                 = operator_input_output_data->get_estimated_size_in_bytes(),
@@ -382,7 +382,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     SIRIUS_LOG_ERROR(
       "gpu_pipeline_task::execute: executor thread telemetry handle is not initialized");
   }
-  telemetry_handle()->preparing({
+  telemetry_handle().preparing({
     .instance_name               = "",
     .target_tier                 = "GPU",
     .executor_thread_resource_id = executor_thread_resource_id,

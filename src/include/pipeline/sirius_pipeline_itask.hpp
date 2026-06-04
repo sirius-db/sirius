@@ -110,7 +110,7 @@ class sirius_pipeline_itask : public parallel::itask {
     return pipeline->get_source()->get_operator_id();
   }
 
-  [[nodiscard]] quent::task::TaskHandle* telemetry_handle() const noexcept override;
+  [[nodiscard]] quent::task::TaskHandle& telemetry_handle() noexcept;
   void set_telemetry_finalized() noexcept { _telemetry_finalized = true; }
   [[nodiscard]] bool telemetry_finalized() const noexcept { return _telemetry_finalized; }
 

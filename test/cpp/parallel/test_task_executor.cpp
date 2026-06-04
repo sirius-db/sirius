@@ -70,8 +70,6 @@ class dummy_task : public itask {
     std::this_thread::sleep_for(10ms);
     g->counter.fetch_add(1 + l->_id);
   }
-
-  quent::task::TaskHandle* telemetry_handle() const noexcept override { return nullptr; }
 };
 
 /**

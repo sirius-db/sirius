@@ -94,9 +94,11 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
   _gpu_operator_global_state_map.clear();
 
   const auto& pipelines = query.get_pipelines();
+
   auto* sirius_ctx =
     _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state").get();
-  auto telemetry_context = sirius_ctx->get_telemetry_context();
+  std::shared_ptr<const telemetry::telemetry_context> telemetry_context =
+    sirius_ctx->get_telemetry_context();
 
   for (const auto& pipeline : pipelines) {
     // Give each pipeline a pointer to this task_creator so that when a pipeline
