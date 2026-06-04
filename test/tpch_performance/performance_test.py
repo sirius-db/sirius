@@ -272,11 +272,21 @@ def _execute_multi(con, sql):
         con.execute(stmt).fetchall()
 
 
-def time_query(con, qnum, use_gpu):
+def time_query(con, qnum, use_gpu, profile_path=None):
     engine_label = "GPU/sirius" if use_gpu else "CPU/duckdb"
     if use_gpu:
         log("  SET gpu_execution = true (GPU/sirius)")
         con.execute("SET gpu_execution = true;")
+    elif profile_path is not None:
+        # DuckDB CPU profiling: emit a per-operator JSON profile for the next
+        # query. 'detailed' mode includes the physical operator tree (with
+        # operator_timing / operator_cardinality) plus planner/optimizer phase
+        # timings. NOTE: profiling adds overhead, so the runtime_s recorded for
+        # profiled CPU runs is slightly inflated vs an unprofiled baseline.
+        log(f"  Enabling DuckDB JSON profiling -> {profile_path}")
+        con.execute("PRAGMA enable_profiling='json';")
+        con.execute("PRAGMA profiling_mode='detailed';")
+        con.execute(f"PRAGMA profiling_output='{profile_path}';")
     log(f"  Executing q{qnum} on {engine_label}…")
     start = time.perf_counter()
     rows = con.execute(QUERIES[f"q{qnum}"]).fetchall()
@@ -303,8 +313,17 @@ def _record(writer, name, qnum, it, runtime):
     log(f"[{name}] q{qnum} iter{it}: {runtime:.4f}s")
 
 
-def _run_one(writer, con, name, qnum, it, use_gpu, benchmark_dir):
-    elapsed, rows = time_query(con, qnum, use_gpu)
+def _run_one(
+    writer, con, name, qnum, it, use_gpu, benchmark_dir, duckdb_profiling=False
+):
+    profile_path = None
+    if duckdb_profiling and not use_gpu:
+        # Write one JSON profile per (query, iteration) so no iteration overwrites
+        # another. The comparison tooling can select whichever iteration it wants.
+        profile_path = os.path.join(
+            _query_dir(benchmark_dir, name, qnum), f"profile_iter{it}.json"
+        )
+    elapsed, rows = time_query(con, qnum, use_gpu, profile_path=profile_path)
     _record(writer, name, qnum, it, elapsed)
     _write_result(benchmark_dir, name, qnum, rows)
 
@@ -319,6 +338,7 @@ def run_grouped(
     benchmark_dir,
     parquet_dir,
     pin,
+    duckdb_profiling=False,
 ):
     """Per-query iterations back-to-back; one connection per engine. Pin per query."""
     log(
@@ -335,7 +355,16 @@ def run_grouped(
                 try:
                     for it in range(iterations):
                         log(f"--- q{qnum} iter{it} engine={name} ---")
-                        _run_one(writer, con, name, qnum, it, use_gpu, benchmark_dir)
+                        _run_one(
+                            writer,
+                            con,
+                            name,
+                            qnum,
+                            it,
+                            use_gpu,
+                            benchmark_dir,
+                            duckdb_profiling,
+                        )
                 finally:
                     if pin_enabled and use_gpu:
                         log(f"  Unpinning tables for q{qnum}")
@@ -355,6 +384,7 @@ def run_sequential(
     benchmark_dir,
     parquet_dir,
     pin,
+    duckdb_profiling=False,
 ):
     """Round-robin iterations; one connection per engine. Single union-pin at session start."""
     log("Mode 'sequential': single connection per engine, round-robin iterations")
@@ -369,7 +399,16 @@ def run_sequential(
                 for it in range(iterations):
                     for qnum in queries:
                         log(f"--- q{qnum} iter{it} engine={name} ---")
-                        _run_one(writer, con, name, qnum, it, use_gpu, benchmark_dir)
+                        _run_one(
+                            writer,
+                            con,
+                            name,
+                            qnum,
+                            it,
+                            use_gpu,
+                            benchmark_dir,
+                            duckdb_profiling,
+                        )
             finally:
                 if pin_enabled and use_gpu:
                     log("  Union-unpinning all TPC-H tables")
@@ -389,6 +428,7 @@ def run_isolated(
     benchmark_dir,
     parquet_dir,
     pin,
+    duckdb_profiling=False,
 ):
     """Fresh connection + OS cache drop per (query, iteration). Pin per execution."""
     log("Mode 'isolated': renewing connection and dropping OS cache before every run")
@@ -403,7 +443,16 @@ def run_isolated(
                     if pin_enabled and use_gpu:
                         log(f"  Pinning tables for q{qnum}")
                         _execute_multi(con, emit_pin(qnum, parquet_dir))
-                    _run_one(writer, con, name, qnum, it, use_gpu, benchmark_dir)
+                    _run_one(
+                        writer,
+                        con,
+                        name,
+                        qnum,
+                        it,
+                        use_gpu,
+                        benchmark_dir,
+                        duckdb_profiling,
+                    )
                     if pin_enabled and use_gpu:
                         log(f"  Unpinning tables for q{qnum}")
                         _execute_multi(con, emit_unpin(qnum))
@@ -627,6 +676,18 @@ def parse_args():
             "Re-runs with the same name will overwrite per-iteration outputs."
         ),
     )
+    p.add_argument(
+        "--duckdb-profiling",
+        action="store_true",
+        help=(
+            "For CPU/DuckDB runs, enable DuckDB's JSON profiler (detailed mode) "
+            "and write a per-operator profile to "
+            "<benchmark_dir>/duckdb/q<N>/profile_iter<it>.json. Has no effect on "
+            "GPU/Sirius runs (Sirius per-operator timing comes from its own logs). "
+            "Profiling adds overhead, so profiled CPU runtime_s values are slightly "
+            "inflated vs an unprofiled baseline."
+        ),
+    )
     return p.parse_args()
 
 
@@ -682,6 +743,7 @@ def main():
     log(f"Queries:       {queries}")
     log(f"Config:        {config_path or '(default)'}")
     log(f"Pin:           {args.pin}")
+    log(f"DuckDB profiling: {args.duckdb_profiling}")
     log(f"Benchmark dir: {benchmark_dir}")
     log(f"Runtime CSV:   {runtime_csv}")
     log(f"Log dir:       {log_dir}")
@@ -699,6 +761,7 @@ def main():
             benchmark_dir=benchmark_dir,
             parquet_dir=parquet_dir,
             pin=args.pin,
+            duckdb_profiling=args.duckdb_profiling,
         )
 
     log("Benchmark run complete")
