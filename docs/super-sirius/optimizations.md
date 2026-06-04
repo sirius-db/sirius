@@ -26,18 +26,17 @@ num_partitions = max(1, total_bytes / hash_partition_bytes)
 
 **Code path:** `src/creator/task_creator.cpp` — `drain_pending_tasks()`
 
-### 4-Phase Sort Pipeline (Architectural)
+### 3-Phase Sort Pipeline (PR #866)
 
-**Motivation:** Sorting datasets larger than GPU memory requires distributed sorting with dynamic partition boundaries.
+**Motivation:** Sorting datasets larger than GPU memory requires distributed sorting with dynamic partition boundaries. SORT_SAMPLE and SORT_PARTITION are tightly coupled (the partition operator reads boundaries directly from the sample operator via `_sample_op`), so colocating them in one pipeline eliminates an unnecessary repository hop and scheduling overhead.
 
-**Mechanism:** ORDER_BY is split into 4 pipeline phases:
+**Mechanism:** ORDER_BY is split into 3 pipeline phases:
 1. **ORDER_BY**: Local sort of each batch
-2. **SORT_SAMPLE**: Sample N batches, compute P-1 partition boundary rows
-3. **SORT_PARTITION**: Range-partition data using boundaries
-4. **MERGE_SORT**: Multi-way merge of pre-sorted partitions via `cudf::merge_order_by()`
+2. **SORT_SAMPLE + SORT_PARTITION**: Sample N batches to compute boundaries, then range-partition — both run back-to-back in the same `gpu_pipeline_task`
+3. **MERGE_SORT**: Multi-way merge of pre-sorted partitions via `cudf::merge_order_by()`
 
 **Code path:**
-- `src/sirius_engine.cpp` — `initialize_internal()` (pipeline splitting)
+- `src/pipeline/sirius_pipeline_converter.cpp` — `split_order_by_sink()` (pipeline splitting)
 - `src/op/sirius_physical_sort_sample.cpp` — boundary computation
 - `src/op/sirius_physical_sort_partition.cpp` — range partitioning
 - `src/op/sirius_physical_merge_sort.cpp` — multi-way merge
