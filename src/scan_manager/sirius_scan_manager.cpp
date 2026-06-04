@@ -19,7 +19,7 @@
 #include "exec/thread_pool.hpp"
 #include "io/parquet_helpers.hpp"
 #include "io/prefetching_cache.hpp"
-#include "io/s3/s3_ioctx.hpp"
+#include "io/s3/s3_blocking_ioctx.hpp"
 #include "io/uring/uring_ioctx.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_scan_info.hpp"
