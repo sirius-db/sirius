@@ -4,8 +4,9 @@
 #   source test/cpp/integration/s3/env.sh
 #   build/release/extension/sirius/test/cpp/sirius_unittest "[s3][integration]"
 #
-# The variable names match what read_env() consumes in
-# test/cpp/io/s3/test_s3_ioctx.cpp and test_s3_integration.cpp.
+# The variable names match what read_env() consumes across the [s3][integration]
+# tests (e.g. test/cpp/io/s3/test_s3_ioctx.cpp for the async backend and
+# test_s3_blocking_ioctx.cpp for the blocking fallback).
 
 export SIRIUS_TEST_S3_ENDPOINT="${SIRIUS_TEST_S3_ENDPOINT:-http://127.0.0.1:9000}"
 export SIRIUS_TEST_S3_HTTPS_ENDPOINT="${SIRIUS_TEST_S3_HTTPS_ENDPOINT:-https://127.0.0.1:9443}"

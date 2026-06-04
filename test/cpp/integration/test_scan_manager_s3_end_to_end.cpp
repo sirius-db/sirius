@@ -18,6 +18,7 @@
 #include "exec/thread_pool.hpp"
 #include "helper/logical_type.hpp"
 #include "io/prefetching_cache.hpp"
+#include "io/s3/s3_blocking_ioctx.hpp"
 #include "io/s3/s3_ioctx.hpp"
 #include "io/s3/sirius_sigv4_authorizer.hpp"
 #include "op/scan/parquet_scan_operator_data.hpp"
@@ -25,6 +26,8 @@
 #include "scan_manager/parquet_split_provider.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "scan_manager/split_connector.hpp"
+#include "sirius_config.hpp"
+#include "sirius_context.hpp"
 
 // Include this last among sirius/test headers: it transitively pulls
 // liburing.h, whose BLOCK_SIZE macro collides with blockingconcurrentqueue.h.
@@ -36,6 +39,11 @@
 #include <cudf/io/parquet.hpp>
 #include <cudf/table/table.hpp>
 
+#include <rmm/cuda_stream.hpp>
+#include <rmm/device_buffer.hpp>
+
+#include <cuda_runtime_api.h>
+
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 #include <duckdb/common/column_index.hpp>
@@ -46,6 +54,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -56,6 +66,7 @@
 
 using sirius::io::buffer_pool;
 using sirius::io::sirius_ioctx;
+using sirius::io::s3::s3_blocking_ioctx;
 using sirius::io::s3::s3_ioctx;
 using sirius::io::s3::s3_ioctx_config;
 using sirius::io::s3::sirius_sigv4_presigned_authorizer;
@@ -89,6 +100,7 @@ struct s3_test_env {
   std::string access_key;
   std::string secret_key;
   std::string bucket;
+  std::filesystem::path local_dir;
   bool strict{false};
 };
 
@@ -108,6 +120,7 @@ std::optional<s3_test_env> read_s3_test_env()
                      std::move(access_key),
                      std::move(secret_key),
                      std::move(bucket),
+                     std::filesystem::path{env_or("SIRIUS_TEST_S3_LOCAL_DIR")},
                      truthy_env("SIRIUS_TEST_S3_STRICT")};
 }
 
@@ -120,6 +133,47 @@ std::size_t cache_capacity_bytes(std::size_t block_size, std::uint32_t max_slabs
 {
   return block_size * static_cast<std::size_t>(buffer_pool::CHUNKS_PER_SLAB) *
          static_cast<std::size_t>(max_slabs);
+}
+
+std::vector<std::uint8_t> read_binary_file(std::filesystem::path const& path)
+{
+  std::ifstream in(path, std::ios::binary);
+  REQUIRE(in.good());
+  return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+void require_cuda_success(cudaError_t status)
+{
+  INFO(cudaGetErrorString(status));
+  REQUIRE(status == cudaSuccess);
+}
+
+std::vector<std::uint8_t> copy_device_to_host(rmm::device_buffer const& device, std::size_t bytes)
+{
+  REQUIRE(bytes <= device.size());
+  std::vector<std::uint8_t> host(bytes);
+  if (bytes > 0) {
+    require_cuda_success(cudaMemcpy(host.data(), device.data(), bytes, cudaMemcpyDeviceToHost));
+  }
+  return host;
+}
+
+std::vector<std::uint8_t> read_s3_object_to_device(duckdb::SiriusContext& context,
+                                                   std::string const& uri,
+                                                   std::size_t bytes)
+{
+  auto s3_ctx = context.get_s3_ioctx();
+  REQUIRE(s3_ctx != nullptr);
+  auto obj = s3_ctx->create_io_object(uri);
+  REQUIRE(obj != nullptr);
+  REQUIRE(obj->size() >= bytes);
+
+  rmm::cuda_stream stream;
+  rmm::device_buffer dst(bytes, stream);
+  auto const got =
+    s3_ctx->device_read(*obj, 0, bytes, static_cast<std::uint8_t*>(dst.data()), stream);
+  CHECK(got == bytes);
+  return copy_device_to_host(dst, got);
 }
 
 struct host_cache_memory {
@@ -161,6 +215,28 @@ s3_ioctx_config make_s3_config(s3_test_env const& env, bool bad_credentials = fa
   return cfg;
 }
 
+sirius::sirius_config make_context_config(s3_test_env const& env, std::optional<bool> use_async)
+{
+  auto const config_path =
+    std::filesystem::path(__FILE__).parent_path() / "integration_s3cache.yaml";
+  sirius::sirius_config cfg{};
+  cfg.load_from_file(config_path);
+  REQUIRE_FALSE(cfg.get_memory_space_configs().empty());
+
+  cfg.object_store_config.endpoint   = env.endpoint;
+  cfg.object_store_config.region     = env.region;
+  cfg.object_store_config.access_key = env.access_key;
+  cfg.object_store_config.secret_key = env.secret_key;
+  if (use_async.has_value()) { cfg.object_store_config.s3_use_async_backend = *use_async; }
+
+  auto scan_cfg                              = cfg.get_scan_manager_config();
+  scan_cfg.use_sirius_datasource             = true;
+  scan_cfg.s3_thread_pool.num_threads        = 4;
+  scan_cfg.s3_thread_pool.thread_name_prefix = "s3_factory";
+  cfg.set_scan_manager_config(std::move(scan_cfg));
+  return cfg;
+}
+
 sirius_scan_manager make_scan_manager(s3_test_env const& env,
                                       cucascade::memory::fixed_size_host_memory_resource& host_mr,
                                       bool bad_credentials = false)
@@ -178,7 +254,7 @@ sirius_scan_manager make_scan_manager(s3_test_env const& env,
   auto gpu_ioctxs = sirius::scan_test_utils::make_test_gpu_ioctxs(1);
   REQUIRE_FALSE(gpu_ioctxs.empty());
   borrowed_ioctxs.push_back(gpu_ioctxs.begin()->second);
-  borrowed_ioctxs.push_back(std::make_shared<s3_ioctx>(std::move(s3_cfg)));
+  borrowed_ioctxs.push_back(std::make_shared<s3_blocking_ioctx>(std::move(s3_cfg)));
 
   return sirius_scan_manager(std::move(cfg), std::move(borrowed_ioctxs));
 }
@@ -266,6 +342,154 @@ bool saw_scheme(std::vector<std::unique_ptr<parquet_scan_data>> const& splits,
 
 }  // namespace
 
+TEST_CASE("SiriusContext selects the configured S3 backend implementation",
+          "[.][s3][integration][scan_manager][asynccurl]")
+{
+  auto env = read_s3_test_env();
+  if (!env) {
+    WARN("Skipping S3 backend factory test because SIRIUS_TEST_S3_* is not configured");
+    return;
+  }
+
+  SECTION("flag absent selects the async backend by default")
+  {
+    auto cfg = make_context_config(*env, std::nullopt);
+
+    duckdb::SiriusContext context;
+    context.initialize(cfg);
+
+    {
+      auto s3_ctx = context.get_s3_ioctx();
+      REQUIRE(s3_ctx != nullptr);
+      CHECK(dynamic_cast<s3_ioctx*>(s3_ctx.get()) != nullptr);
+      CHECK(dynamic_cast<s3_blocking_ioctx*>(s3_ctx.get()) == nullptr);
+    }
+
+    context.terminate();
+  }
+
+  SECTION("flag false keeps the blocking backend")
+  {
+    auto cfg = make_context_config(*env, false);
+
+    duckdb::SiriusContext context;
+    context.initialize(cfg);
+
+    {
+      auto s3_ctx = context.get_s3_ioctx();
+      REQUIRE(s3_ctx != nullptr);
+      CHECK(dynamic_cast<s3_blocking_ioctx*>(s3_ctx.get()) != nullptr);
+      CHECK(dynamic_cast<s3_ioctx*>(s3_ctx.get()) == nullptr);
+    }
+
+    context.terminate();
+  }
+
+  SECTION("flag true selects the async backend")
+  {
+    auto cfg = make_context_config(*env, true);
+
+    duckdb::SiriusContext context;
+    context.initialize(cfg);
+
+    sirius_ioctx* raw_s3_ctx = nullptr;
+    {
+      auto s3_ctx = context.get_s3_ioctx();
+      REQUIRE(s3_ctx != nullptr);
+      CHECK(dynamic_cast<s3_ioctx*>(s3_ctx.get()) != nullptr);
+      CHECK(dynamic_cast<s3_blocking_ioctx*>(s3_ctx.get()) == nullptr);
+      raw_s3_ctx = s3_ctx.get();
+    }
+    CHECK(context.get_scan_manager().io_ctx_for(s3_uri(env->bucket, "parquet/nation.parquet")) ==
+          raw_s3_ctx);
+
+    context.terminate();
+  }
+}
+
+TEST_CASE("SiriusContext tears down cleanly with the async S3 backend selected",
+          "[.][s3][integration][scan_manager][asynccurl]")
+{
+  auto env = read_s3_test_env();
+  if (!env) {
+    WARN("Skipping async S3 backend teardown test because SIRIUS_TEST_S3_* is not configured");
+    return;
+  }
+
+  auto cfg = make_context_config(*env, true);
+
+  duckdb::SiriusContext context;
+  context.initialize(cfg);
+
+  {
+    auto s3_ctx = context.get_s3_ioctx();
+    REQUIRE(s3_ctx != nullptr);
+    REQUIRE(dynamic_cast<s3_ioctx*>(s3_ctx.get()) != nullptr);
+  }
+
+  context.terminate();
+  CHECK(context.get_s3_ioctx() == nullptr);
+  SUCCEED("async S3 backend context terminated cleanly");
+}
+
+TEST_CASE("async S3 backend single-chunk device read matches the blocking backend",
+          "[.][s3][integration][scan_manager][asynccurl]")
+{
+  auto env = read_s3_test_env();
+  if (!env) {
+    WARN(
+      "Skipping async S3 single-chunk device parity test because SIRIUS_TEST_S3_* is not "
+      "configured");
+    return;
+  }
+  if (env->local_dir.empty()) {
+    WARN(
+      "Skipping async S3 single-chunk device parity test because SIRIUS_TEST_S3_LOCAL_DIR is not "
+      "configured");
+    return;
+  }
+
+  std::string const key = "small.bin";
+  auto const oracle     = read_binary_file(env->local_dir / key);
+  REQUIRE_FALSE(oracle.empty());
+  REQUIRE(oracle.size() < sirius::io::CHUNK_SIZE);
+  auto const uri = s3_uri(env->bucket, key);
+
+  std::vector<std::uint8_t> blocking_bytes;
+  {
+    auto cfg = make_context_config(*env, false);
+
+    duckdb::SiriusContext context;
+    context.initialize(cfg);
+    {
+      auto s3_ctx = context.get_s3_ioctx();
+      REQUIRE(s3_ctx != nullptr);
+      REQUIRE(dynamic_cast<s3_blocking_ioctx*>(s3_ctx.get()) != nullptr);
+    }
+    blocking_bytes = read_s3_object_to_device(context, uri, oracle.size());
+    context.terminate();
+  }
+
+  std::vector<std::uint8_t> async_bytes;
+  {
+    auto cfg = make_context_config(*env, true);
+
+    duckdb::SiriusContext context;
+    context.initialize(cfg);
+    {
+      auto s3_ctx = context.get_s3_ioctx();
+      REQUIRE(s3_ctx != nullptr);
+      REQUIRE(dynamic_cast<s3_ioctx*>(s3_ctx.get()) != nullptr);
+    }
+    async_bytes = read_s3_object_to_device(context, uri, oracle.size());
+    context.terminate();
+  }
+
+  CHECK(blocking_bytes == oracle);
+  CHECK(async_bytes == oracle);
+  CHECK(async_bytes == blocking_bytes);
+}
+
 TEST_CASE("scan_manager S3 end-to-end reads nation parquet through sirius_datasource",
           "[.][s3][integration][scan_manager]")
 {
@@ -318,7 +542,7 @@ TEST_CASE("scan_manager S3 end-to-end routes parquet_split_provider through S3 i
     for (auto const& slice : split->rg_slices) {
       CHECK(slice.file_path == path);
       CHECK(slice.io_ctx.get() == manager.io_ctx_for(path));
-      CHECK(dynamic_cast<s3_ioctx*>(slice.io_ctx.get()) != nullptr);
+      CHECK(dynamic_cast<s3_blocking_ioctx*>(slice.io_ctx.get()) != nullptr);
       CHECK(slice.io_object != nullptr);
     }
   }

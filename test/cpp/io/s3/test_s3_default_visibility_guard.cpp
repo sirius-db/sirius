@@ -144,6 +144,7 @@ TEST_CASE("default-visible S3 tests do not silently skip live MinIO work", "[s3]
   auto const root = project_root();
   std::vector<std::filesystem::path> const files{
     "test/cpp/io/s3/test_s3_ioctx.cpp",
+    "test/cpp/io/s3/test_s3_blocking_ioctx.cpp",
     "test/cpp/scan_manager/test_sirius_scan_manager_s3.cpp",
     "test/cpp/scan_manager/test_describe_parquet_s3.cpp",
     "test/cpp/scan/test_parquet_split_provider_s3.cpp",

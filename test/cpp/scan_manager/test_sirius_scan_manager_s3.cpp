@@ -18,7 +18,8 @@
 #include "io/object_store_config.hpp"
 #include "io/prefetching_cache.hpp"
 #include "io/s3/mock_request_authorizer.hpp"
-#include "io/s3/s3_io_object.hpp"
+#include "io/s3/s3_blocking_io_object.hpp"
+#include "io/s3/s3_blocking_ioctx.hpp"
 #include "io/s3/s3_ioctx.hpp"
 #include "io/s3/s3_request_authorizer.hpp"
 #include "io/s3/sirius_sigv4_authorizer.hpp"
@@ -59,7 +60,8 @@ using sirius::io::object_store_config;
 using sirius::io::sirius_ioctx;
 using sirius::io::s3::mock_request_authorizer;
 using sirius::io::s3::s3_authorized_request;
-using sirius::io::s3::s3_io_object;
+using sirius::io::s3::s3_blocking_io_object;
+using sirius::io::s3::s3_blocking_ioctx;
 using sirius::io::s3::s3_ioctx;
 using sirius::io::s3::s3_ioctx_config;
 using sirius::io::s3::s3_object_ref;
@@ -96,12 +98,12 @@ std::shared_ptr<sirius_ioctx> make_local_ioctx()
   return gpu_ioctxs.begin()->second;
 }
 
-std::shared_ptr<s3_ioctx> make_mock_s3_ioctx(
+std::shared_ptr<s3_blocking_ioctx> make_mock_s3_ioctx(
   cucascade::memory::fixed_size_host_memory_resource* host_mr = nullptr)
 {
   auto cfg                 = make_mock_s3_config();
   cfg.host_memory_resource = host_mr;
-  return std::make_shared<s3_ioctx>(std::move(cfg));
+  return std::make_shared<s3_blocking_ioctx>(std::move(cfg));
 }
 
 std::vector<std::shared_ptr<sirius_ioctx>> make_borrowed_backends(
@@ -161,10 +163,13 @@ std::string s3_uri(std::string_view bucket, std::string_view key)
   return "s3://" + std::string{bucket} + "/" + std::string{key};
 }
 
-std::shared_ptr<s3_io_object> make_s3_object(std::string bucket, std::string key, std::size_t size)
+std::shared_ptr<s3_blocking_io_object> make_s3_object(std::string bucket,
+                                                      std::string key,
+                                                      std::size_t size)
 {
   auto path = s3_uri(bucket, key);
-  return std::make_shared<s3_io_object>(std::move(bucket), std::move(key), size, std::move(path));
+  return std::make_shared<s3_blocking_io_object>(
+    std::move(bucket), std::move(key), size, std::move(path));
 }
 
 class counting_request_authorizer final : public s3_request_authorizer {
@@ -226,7 +231,7 @@ struct host_cache_memory {
 };
 
 bool wait_until_cached(sirius::io::sirius_ioctx& io_ctx,
-                       s3_io_object& obj,
+                       sirius::io::sirius_io_object& obj,
                        cudf::io::text::byte_range_info range,
                        std::chrono::milliseconds timeout)
 {
@@ -313,7 +318,7 @@ TEST_CASE("sirius_scan_manager routes borrowed S3 backend and dispatches by path
   REQUIRE(routed_s3_ctx != nullptr);
   CHECK(routed_s3_ctx != default_ctx);
   CHECK(routed_s3_ctx == borrowed_s3_ctx.get());
-  CHECK(dynamic_cast<s3_ioctx*>(routed_s3_ctx) != nullptr);
+  CHECK(dynamic_cast<s3_blocking_ioctx*>(routed_s3_ctx) != nullptr);
 
   CHECK(manager.io_ctx_for("unsupported://bucket/key.parquet") == nullptr);
 }
@@ -403,12 +408,15 @@ TEST_CASE("sirius_scan_manager wires S3 ioctx cache and serves repeated host rea
   context.initialize(cfg);
 
   auto const path = s3_uri(env->bucket, key);
-  auto s3_ctx     = std::dynamic_pointer_cast<s3_ioctx>(context.get_s3_ioctx());
+  auto s3_ctx     = context.get_s3_ioctx();
   REQUIRE(s3_ctx != nullptr);
+  REQUIRE(dynamic_cast<s3_ioctx*>(s3_ctx.get()) != nullptr);
   CHECK(context.get_scan_manager().io_ctx_for(path) == s3_ctx.get());
   REQUIRE(s3_ctx->cache() != nullptr);
 
-  auto obj = make_s3_object(env->bucket, key, local.size());
+  auto obj = s3_ctx->create_io_object(path);
+  REQUIRE(obj != nullptr);
+  REQUIRE(obj->size() == local.size());
   std::vector<cudf::io::text::byte_range_info> ranges{{0, 128}};
   for (int i = 0; i < 64; ++i) {
     s3_ctx->cache()->insert(*obj, nullptr, ranges);
@@ -422,6 +430,7 @@ TEST_CASE("sirius_scan_manager wires S3 ioctx cache and serves repeated host rea
   CHECK(first == second);
   CHECK(provider->get_count() == 1);
 
+  s3_ctx.reset();
   context.terminate();
 }
 
@@ -480,16 +489,16 @@ TEST_CASE("SiriusContext object_store_config header signing reads MinIO bytes",
 
   auto s3_ctx = context.get_s3_ioctx();
   REQUIRE(s3_ctx != nullptr);
-  auto* s3 = dynamic_cast<sirius::io::s3::s3_ioctx*>(s3_ctx.get());
+  auto* s3 = dynamic_cast<s3_ioctx*>(s3_ctx.get());
   REQUIRE(s3 != nullptr);
-  auto const size = s3->head_object_size(env->bucket, key);
-  REQUIRE(size == local.size());
-
-  auto obj = make_s3_object(env->bucket, key, size);
+  auto obj = s3->create_io_object(s3_uri(env->bucket, key));
+  REQUIRE(obj != nullptr);
+  REQUIRE(obj->size() == local.size());
   std::vector<std::uint8_t> got(32);
   REQUIRE(s3->host_read(*obj, 0, got.size(), got.data()) == got.size());
   CHECK(std::equal(got.begin(), got.end(), local.begin()));
 
+  s3_ctx.reset();
   context.terminate();
 }
 
@@ -530,6 +539,7 @@ TEST_CASE("SiriusContext initialize wires populated object_store_config into sca
   REQUIRE(stored_scan_config.s3_config.has_value());
   CHECK(stored_scan_config.s3_config->async_thread_pool == nullptr);
 
+  owned_s3_ctx.reset();
   context.terminate();
 }
 
