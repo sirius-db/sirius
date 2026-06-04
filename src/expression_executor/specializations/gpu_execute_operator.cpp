@@ -15,7 +15,6 @@
  */
 
 // sirius
-#include <expression/ast/from_duckdb.hpp>
 #include <expression/ast/node.hpp>
 #include <expression/value.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
@@ -25,7 +24,6 @@
 
 // duckdb
 #include <duckdb/common/assert.hpp>
-#include <duckdb/planner/expression/bound_operator_expression.hpp>
 
 // cudf
 #include <cudf/binaryop.hpp>
@@ -574,29 +572,6 @@ execute_result gpu_expression_executor::execute(sirius::ast::coalesce const& alt
     return materialize_as_ast_column(current_result.release_column());
   }
   return current_result;
-}
-
-//===----------------------------------------------------------------------===//
-// DuckDB-typed entry — routes to one of the three native bodies via the
-// public node dispatcher's std::visit over from_duckdb(expr).
-//===----------------------------------------------------------------------===//
-
-// DuckDB-typed entrypoint. Bridges callers that still pass duckdb::Expression
-// directly into the executor; the eventual home for this from_duckdb step is
-// the planning stage so the executor sees only native sirius::ast types, but
-// until upstream call sites are migrated this overload (and the duckdb
-// includes it requires) must stay.
-execute_result gpu_expression_executor::execute(duckdb::BoundOperatorExpression const& expr,
-                                                execution_mode mode)
-{
-  auto node = sirius::ast::from_duckdb(expr);
-  if (!node) {
-    throw not_implemented_exception(
-      "[gpu_expression_executor:operator] BoundOperatorExpression with operator type {} could "
-      "not be lowered to a Sirius AST node.",
-      static_cast<int>(expr.GetExpressionType()));
-  }
-  return execute(*node, mode);
 }
 
 }  // namespace sirius
