@@ -133,9 +133,9 @@ duckdb_native_split_provider::duckdb_native_split_provider(
                              _metadata.viability_failure_reason);
   }
 
-  // Mint the .db io_object once per query when the manager exposes sirius_ioctx.
-  // The scan task threads this onto every split so reads of .db blocks go through
-  // sirius_ioctx::host_read instead of DuckDB's BufferManager.
+  // Mint the .db io_object when an ioctx + db path are available.
+  // When absent (io-less unit tests, in-memory tables), the io_object stays null;
+  // decode_duckdb_native_split enforces the device-read precondition.
   if (_io_ctx && !_scan_info->db_path.empty()) {
     _db_io_object = _io_ctx->create_io_object(_scan_info->db_path);
   }
