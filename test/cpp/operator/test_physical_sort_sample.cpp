@@ -17,11 +17,16 @@
 #include "helper/type_conversions.hpp"
 #include "operator_test_utils.hpp"
 
+#include <cudf/utilities/default_stream.hpp>
+
+#include <cuda_runtime.h>
+
 #include <catch.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <op/sirius_physical_sort_sample.hpp>
 #include <pipeline/sirius_pipeline.hpp>
+#include <sirius_config.hpp>
 
 #include <numeric>
 #include <vector>
@@ -99,6 +104,16 @@ void attach_port(sirius_physical_sort_sample& sample_op,
 std::size_t batch_count(const operator_data& data)
 {
   return dynamic_cast<const pipelineable_operator_data&>(data).get_data_batches().size();
+}
+
+int32_t read_int32_column(const cudf::column_view& col, cudf::size_type row)
+{
+  std::vector<int32_t> host(col.size());
+  REQUIRE(cudaMemcpy(host.data(),
+                     col.data<int32_t>(),
+                     host.size() * sizeof(int32_t),
+                     cudaMemcpyDeviceToHost) == cudaSuccess);
+  return host[row];
 }
 
 }  // namespace
@@ -200,4 +215,43 @@ TEST_CASE(
   REQUIRE(result != nullptr);
   REQUIRE(batch_count(*result) == static_cast<std::size_t>(num_batches));
   REQUIRE(sample_op.get_next_task_input_data() == nullptr);
+}
+
+TEST_CASE("sirius_physical_sort_sample merges pre-sorted batches for partition boundaries",
+          "[physical_sort_sample]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  constexpr std::size_t rows_per_batch = 50;
+  std::vector<int32_t> high_keys(rows_per_batch);
+  std::iota(high_keys.begin(), high_keys.end(), 50);
+  std::vector<int32_t> low_keys(rows_per_batch);
+  std::iota(low_keys.begin(), low_keys.end(), 0);
+
+  auto batch_high = make_numeric_batch<int32_t>(*space, high_keys, cudf::type_id::INT32);
+  auto batch_low  = make_numeric_batch<int32_t>(*space, low_keys, cudf::type_id::INT32);
+
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(make_order(0, duckdb::LogicalType::INTEGER));
+
+  // Force two partitions from estimated total size vs max_partition_bytes.
+  sirius_physical_sort_sample sample_op(
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    std::move(orders),
+    1000,
+    1'000'000,
+    2500,
+    sirius::config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION);
+
+  auto output = sample_op.execute(pipelineable_operator_data({batch_high, batch_low}),
+                                  cudf::get_default_stream());
+  REQUIRE(output != nullptr);
+  REQUIRE(sample_op.boundaries_computed());
+  REQUIRE(sample_op.get_num_partitions() == 2);
+  REQUIRE(sample_op.get_partition_boundaries().num_rows() == 1);
+
+  const auto boundary_key =
+    read_int32_column(sample_op.get_partition_boundaries().view().column(0), 0);
+  REQUIRE(boundary_key == 50);
 }

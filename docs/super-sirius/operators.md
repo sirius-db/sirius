@@ -222,7 +222,7 @@ Reassembles partitioned data back into a linear stream. Behavior depends on join
 
 Samples N input batches to compute P-1 partition boundary rows for range partitioning.
 
-- On first execution: concatenate samples, sort, compute boundaries, set `_boundaries_computed`
+- On first execution: merge pre-sorted sample batches, compute boundaries, set `_boundaries_computed`
 - On subsequent executions: pass through data unchanged
 - Custom `get_next_task_hint()`: waits for N batches before returning READY
 
