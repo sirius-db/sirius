@@ -27,8 +27,8 @@ namespace op {
 
 sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   duckdb::vector<sirius::logical_type> types,
-  duckdb::vector<sirius::expression> expressions,
-  duckdb::vector<sirius::expression> groups_p,
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions,
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> groups_p,
   std::size_t estimated_cardinality)
   : sirius_physical_grouped_aggregate(std::move(types),
                                       std::move(expressions),
@@ -50,8 +50,8 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
 // grouping set and the second level is the indexes to the groupby expression for that set.
 sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   duckdb::vector<sirius::logical_type> types,
-  duckdb::vector<sirius::expression> expressions,
-  duckdb::vector<sirius::expression> groups_p,
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions,
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> groups_p,
   duckdb::vector<duckdb::GroupingSet> grouping_sets_p,
   duckdb::vector<duckdb::unsafe_vector<std::size_t>> grouping_functions_p,
   std::size_t estimated_cardinality,

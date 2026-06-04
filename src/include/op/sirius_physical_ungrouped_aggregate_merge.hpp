@@ -21,9 +21,11 @@
 #include "duckdb/execution/operator/aggregate/distinct_aggregate_data.hpp"
 #include "duckdb/execution/operator/aggregate/grouped_aggregate_data.hpp"
 #include "duckdb/parser/group_by_node.hpp"
-#include "expression/expression.hpp"
+#include "expression/ast/node.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
+
+#include <memory>
 
 namespace sirius {
 namespace op {
@@ -37,13 +39,14 @@ class sirius_physical_ungrouped_aggregate_merge : public sirius_physical_operato
   sirius_physical_ungrouped_aggregate_merge(
     sirius_physical_ungrouped_aggregate* ungrouped_aggregate);
 
-  sirius_physical_ungrouped_aggregate_merge(duckdb::vector<sirius::logical_type> types,
-                                            duckdb::vector<sirius::expression> select_list,
-                                            std::size_t estimated_cardinality,
-                                            duckdb::TupleDataValidityType distinct_validity);
+  sirius_physical_ungrouped_aggregate_merge(
+    duckdb::vector<sirius::logical_type> types,
+    duckdb::vector<std::unique_ptr<sirius::ast::node>> select_list,
+    std::size_t estimated_cardinality,
+    duckdb::TupleDataValidityType distinct_validity);
 
   //! The aggregates that have to be computed
-  duckdb::vector<sirius::expression> aggregates;
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> aggregates;
 
   sirius_physical_operator* child_op;
   sirius_physical_operator* get_child_op() const { return child_op; }

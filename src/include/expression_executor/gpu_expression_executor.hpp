@@ -19,7 +19,6 @@
 // sirius
 #include <config.hpp>
 #include <expression/ast/node.hpp>  // sirius::ast::node + 11 alternative types
-#include <expression/expression.hpp>
 #include <expression_executor/expression_executor_strategy.hpp>
 
 // cucascades
@@ -272,7 +271,7 @@ class gpu_expression_executor {
    * adding nodes to the AST tree.
    */
   gpu_expression_executor(
-    duckdb::vector<sirius::expression> const& expressions,
+    duckdb::vector<std::unique_ptr<sirius::ast::node>> const& expressions,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
     rmm::cuda_stream_view stream                = cudf::get_default_stream(),
     expression_executor_strategy strategy       = strategy_from_config(),
@@ -293,7 +292,7 @@ class gpu_expression_executor {
    * adding nodes to the AST tree.
    */
   gpu_expression_executor(
-    sirius::expression const& expression,
+    sirius::ast::node const& expression,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
     rmm::cuda_stream_view stream                = cudf::get_default_stream(),
     expression_executor_strategy strategy       = strategy_from_config(),

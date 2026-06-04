@@ -30,13 +30,13 @@ namespace sirius {
 namespace op {
 
 sirius_physical_filter::sirius_physical_filter(duckdb::vector<sirius::logical_type> types,
-                                               sirius::expression expression_p,
+                                               std::unique_ptr<sirius::ast::node> expression_p,
                                                std::size_t estimated_cardinality)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::FILTER, std::move(types), estimated_cardinality),
     expression(std::move(expression_p))
 {
-  D_ASSERT(static_cast<bool>(expression));
+  D_ASSERT(expression != nullptr);
 }
 
 std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_data& input_data,
@@ -47,7 +47,7 @@ std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_da
   const auto& input_batches = input.get_read_only_batches();
 
   sirius::gpu_expression_executor gpu_expression_executor(
-    expression, cudf::get_current_device_resource_ref(), stream);
+    *expression, cudf::get_current_device_resource_ref(), stream);
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.reserve(input_batches.size());

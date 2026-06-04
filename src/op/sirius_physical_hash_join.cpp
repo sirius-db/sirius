@@ -32,7 +32,6 @@
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/joinside.hpp"
 #include "expression/ast/to_duckdb.hpp"
-#include "expression/expression_internal.hpp"
 #include "expression_executor/gpu_expression_translator_internal.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
@@ -103,8 +102,8 @@ bool sirius_physical_hash_join::are_conditions_supported(
   std::unordered_set<std::size_t> equality_left_cols, equality_right_cols;
   for (auto const& cond : conditions) {
     if (!is_equality(cond.comparison)) { continue; }
-    auto left_owned  = sirius::ast::to_duckdb(*sirius::unwrap(cond.left));
-    auto right_owned = sirius::ast::to_duckdb(*sirius::unwrap(cond.right));
+    auto left_owned  = sirius::ast::to_duckdb(*cond.left);
+    auto right_owned = sirius::ast::to_duckdb(*cond.right);
     collect_bound_ref_indices(*left_owned, equality_left_cols);
     collect_bound_ref_indices(*right_owned, equality_right_cols);
   }
@@ -115,8 +114,8 @@ bool sirius_physical_hash_join::are_conditions_supported(
   for (auto const& cond : conditions) {
     if (is_equality(cond.comparison)) { continue; }
     std::unordered_set<std::size_t> ineq_left_cols, ineq_right_cols;
-    auto left_owned  = sirius::ast::to_duckdb(*sirius::unwrap(cond.left));
-    auto right_owned = sirius::ast::to_duckdb(*sirius::unwrap(cond.right));
+    auto left_owned  = sirius::ast::to_duckdb(*cond.left);
+    auto right_owned = sirius::ast::to_duckdb(*cond.right);
     collect_bound_ref_indices(*left_owned, ineq_left_cols);
     collect_bound_ref_indices(*right_owned, ineq_right_cols);
     for (auto const idx : ineq_left_cols) {
@@ -238,8 +237,8 @@ sirius_physical_hash_join::sirius_physical_hash_join(
 
   for (std::size_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
     auto& condition        = conditions[cond_idx];
-    auto left_owned        = sirius::ast::to_duckdb(*sirius::unwrap(condition.left));
-    auto right_owned       = sirius::ast::to_duckdb(*sirius::unwrap(condition.right));
+    auto left_owned        = sirius::ast::to_duckdb(*condition.left);
+    auto right_owned       = sirius::ast::to_duckdb(*condition.right);
     auto const* left_expr  = left_owned.get();
     auto const* right_expr = right_owned.get();
 

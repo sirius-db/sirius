@@ -20,8 +20,6 @@
 #include "duckdb/common/assert.hpp"
 #include "expression/aggregate_id.hpp"
 #include "expression/ast/node.hpp"
-#include "expression/expression_internal.hpp"
-#include "sirius/exception.hpp"
 
 #include <format>
 #include <stdexcept>
@@ -62,14 +60,14 @@ std::optional<cudf::aggregation::Kind> to_cudf_aggregation_kind(sirius::aggregat
 }
 
 CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
-  const duckdb::vector<sirius::expression>& groups_p,
-  const duckdb::vector<sirius::expression>& expressions)
+  const duckdb::vector<std::unique_ptr<sirius::ast::node>>& groups_p,
+  const duckdb::vector<std::unique_ptr<sirius::ast::node>>& expressions)
 {
   CudfAggregateDefinitions result;
 
   // 1. Extract group_idx from groups_p
   for (const auto& group : groups_p) {
-    auto const& ref = sirius::ast::require_reference(sirius::unwrap(group),
+    auto const& ref = sirius::ast::require_reference(group.get(),
                                                      "convert_duckdb_aggregates_to_cudf group");
     result.group_idx.push_back(static_cast<int>(ref.column_index));
   }
@@ -77,7 +75,7 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
   // 2. Extract aggregates (cudf::aggregation::Kind) from expressions
   for (const auto& aggregate : expressions) {
     auto const& aggr = sirius::ast::require_aggregate(
-      sirius::unwrap(aggregate), "convert_duckdb_aggregates_to_cudf aggregate");
+      aggregate.get(), "convert_duckdb_aggregates_to_cudf aggregate");
     auto const fid       = aggr.function();
     auto const& children = aggr.arguments();
 

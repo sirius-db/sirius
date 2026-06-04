@@ -24,7 +24,6 @@
 #include "expression/ast/clone.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
-#include "expression/expression_internal.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
@@ -55,7 +54,7 @@ namespace op {
 
 sirius_physical_ungrouped_aggregate::sirius_physical_ungrouped_aggregate(
   duckdb::vector<sirius::logical_type> types,
-  duckdb::vector<sirius::expression> expressions,
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions,
   std::size_t estimated_cardinality,
   duckdb::TupleDataValidityType /*distinct_validity*/)
   : sirius_physical_operator(
@@ -113,7 +112,8 @@ struct aggregate_layout {
   bool has_avg = false;
 };
 
-aggregate_layout build_aggregate_layout(const duckdb::vector<sirius::expression>& aggregates)
+aggregate_layout build_aggregate_layout(
+  const duckdb::vector<std::unique_ptr<sirius::ast::node>>& aggregates)
 {
   aggregate_layout layout;
   size_t local_idx = 0;
@@ -121,7 +121,7 @@ aggregate_layout build_aggregate_layout(const duckdb::vector<sirius::expression>
 
   for (size_t i = 0; i < aggregates.size(); ++i) {
     auto const& agg =
-      sirius::ast::require_aggregate(sirius::unwrap(aggregates[i]), "ungrouped aggregate");
+      sirius::ast::require_aggregate(aggregates[i].get(), "ungrouped aggregate");
     if (agg.distinct()) {
       throw not_implemented_exception("Distinct aggregates not supported in GPU path yet");
     }
@@ -464,21 +464,19 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
   return std::make_unique<pipelineable_operator_data>(outputs);
 }
 
-// Helper to deep copy the wrapped aggregate expressions (used by the merge overload below).
-static duckdb::vector<sirius::expression> copy_expressions(
-  const duckdb::vector<sirius::expression>& src)
+// Helper to deep copy the aggregate AST expressions (used by the merge overload below).
+static duckdb::vector<std::unique_ptr<sirius::ast::node>> copy_expressions(
+  const duckdb::vector<std::unique_ptr<sirius::ast::node>>& src)
 {
-  duckdb::vector<sirius::expression> result;
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> result;
   result.reserve(src.size());
   for (const auto& expr : src) {
     // node is move-only and aggregate nodes cannot round-trip through to_duckdb,
-    // so deep-clone the AST node and re-wrap it directly (bypassing wrap/from_duckdb).
-    auto const* src_node = sirius::unwrap(expr);
-    if (src_node == nullptr) {
+    // so deep-clone the AST node directly.
+    if (expr == nullptr) {
       throw not_implemented_exception("copy_expressions: cannot clone a null aggregate expression");
     }
-    result.push_back(sirius::expression{std::make_unique<sirius::expression::impl>(
-      sirius::expression::impl{sirius::ast::clone(*src_node)})});
+    result.push_back(sirius::ast::clone(*expr));
   }
   return result;
 }
@@ -496,7 +494,7 @@ sirius_physical_ungrouped_aggregate_merge::sirius_physical_ungrouped_aggregate_m
 
 sirius_physical_ungrouped_aggregate_merge::sirius_physical_ungrouped_aggregate_merge(
   duckdb::vector<sirius::logical_type> types,
-  duckdb::vector<sirius::expression> expressions,
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions,
   std::size_t estimated_cardinality,
   duckdb::TupleDataValidityType /*distinct_validity*/)
   : sirius_physical_operator(
