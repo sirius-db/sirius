@@ -33,12 +33,18 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
 
   static constexpr std::size_t DEFAULT_NUM_SAMPLE_BATCHES = 5;
 
-  sirius_physical_sort_sample(sirius_physical_order* order_by);
+  sirius_physical_sort_sample(
+    sirius_physical_order* order_by,
+    uint64_t max_partition_bytes         = 0,
+    double max_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION);
 
-  sirius_physical_sort_sample(duckdb::vector<sirius::logical_type> types,
-                              duckdb::vector<duckdb::BoundOrderByNode> orders,
-                              std::size_t estimated_cardinality,
-                              std::size_t num_sample_batches = DEFAULT_NUM_SAMPLE_BATCHES);
+  sirius_physical_sort_sample(
+    duckdb::vector<sirius::logical_type> types,
+    duckdb::vector<duckdb::BoundOrderByNode> orders,
+    std::size_t estimated_cardinality,
+    std::size_t num_sample_batches       = DEFAULT_NUM_SAMPLE_BATCHES,
+    uint64_t max_partition_bytes         = 0,
+    double max_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION);
 
   //! Order specification (copied from ORDER_BY) — determines which columns to sample
   duckdb::vector<duckdb::BoundOrderByNode> orders;
@@ -70,15 +76,6 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
 
   //! Whether boundaries have been computed
   bool boundaries_computed() const { return _boundary_state.load(std::memory_order_acquire) == 2; }
-
-  //! Override the maximum bytes per partition (0 = use GPU memory fraction below)
-  void set_max_partition_bytes(size_t bytes) { _max_partition_bytes_override = bytes; }
-
-  //! Fraction of available GPU memory per partition when max_partition_bytes override is 0
-  void set_max_partition_memory_fraction(double fraction)
-  {
-    _max_partition_memory_fraction = fraction;
-  }
 
   //! Release the partition boundaries table to free GPU memory
   void clear_partition_boundaries() { _partition_boundaries.reset(); }

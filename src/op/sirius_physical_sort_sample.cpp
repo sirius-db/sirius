@@ -33,9 +33,15 @@
 namespace sirius {
 namespace op {
 
-sirius_physical_sort_sample::sirius_physical_sort_sample(sirius_physical_order* order_by)
-  : sirius_physical_sort_sample(
-      order_by->types, copy_orders(order_by->orders), order_by->estimated_cardinality)
+sirius_physical_sort_sample::sirius_physical_sort_sample(sirius_physical_order* order_by,
+                                                         uint64_t max_partition_bytes,
+                                                         double max_partition_memory_fraction)
+  : sirius_physical_sort_sample(order_by->types,
+                                copy_orders(order_by->orders),
+                                order_by->estimated_cardinality,
+                                DEFAULT_NUM_SAMPLE_BATCHES,
+                                max_partition_bytes,
+                                max_partition_memory_fraction)
 {
 }
 
@@ -43,11 +49,15 @@ sirius_physical_sort_sample::sirius_physical_sort_sample(
   duckdb::vector<sirius::logical_type> types,
   duckdb::vector<duckdb::BoundOrderByNode> orders,
   std::size_t estimated_cardinality,
-  std::size_t num_sample_batches)
+  std::size_t num_sample_batches,
+  uint64_t max_partition_bytes,
+  double max_partition_memory_fraction)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::SORT_SAMPLE, std::move(types), estimated_cardinality),
     orders(std::move(orders)),
-    num_sample_batches(num_sample_batches)
+    num_sample_batches(num_sample_batches),
+    _max_partition_bytes_override(max_partition_bytes),
+    _max_partition_memory_fraction(max_partition_memory_fraction)
 {
 }
 

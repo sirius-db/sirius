@@ -736,12 +736,9 @@ void sirius_pipeline_converter::split_order_by_sink(
   scheduled_.push_back(current_pipeline);
 
   // Create SORT_SAMPLE operator
-  auto sample_op   = duckdb::make_uniq<op::sirius_physical_sort_sample>(order_ptr);
+  auto sample_op = duckdb::make_uniq<op::sirius_physical_sort_sample>(
+    order_ptr, op_params_.max_sort_partition_bytes, op_params_.max_sort_partition_memory_fraction);
   auto* sample_ptr = sample_op.get();
-  if (op_params_.max_sort_partition_bytes > 0) {
-    sample_ptr->set_max_partition_bytes(op_params_.max_sort_partition_bytes);
-  }
-  sample_ptr->set_max_partition_memory_fraction(op_params_.max_sort_partition_memory_fraction);
 
   // Create SORT_PARTITION operator
   auto partition_op   = duckdb::make_uniq<op::sirius_physical_sort_partition>(order_ptr);
