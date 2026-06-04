@@ -14,7 +14,6 @@ command runs in the activated environment:
 
 ```bash
 pixi run make                              # full build (uses all cores)
-CMAKE_BUILD_PARALLEL_LEVEL=8 pixi run make # if the build is OOM-killed, lower parallelism
 pixi run make clean                        # wipe the build dir (after a failed build, before rebuilding)
 
 pixi run make test                         # build + run the C++ unit tests (Catch2, what CI runs); make test_debug for debug
