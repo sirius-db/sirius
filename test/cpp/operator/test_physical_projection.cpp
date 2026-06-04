@@ -20,7 +20,11 @@
 
 #include <catch.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <expression/ast/from_duckdb.hpp>
+#include <expression/ast/node.hpp>
 #include <op/sirius_physical_projection.hpp>
+
+#include <memory>
 
 using namespace duckdb;
 using namespace sirius::op;
@@ -30,6 +34,19 @@ using namespace cucascade::memory;
 namespace {
 
 using namespace sirius::test::operator_utils;
+
+// Translate a vector of DuckDB expressions into Sirius AST nodes (size/order
+// preserved, null slot for an unsupported shape).
+duckdb::vector<std::unique_ptr<sirius::ast::node>> translate_expressions(
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs)
+{
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> out;
+  out.reserve(exprs.size());
+  for (auto& e : exprs) {
+    out.push_back(e ? sirius::ast::from_duckdb(*e) : nullptr);
+  }
+  return out;
+}
 }  // namespace
 
 TEMPLATE_TEST_CASE("sirius_physical_projection executes on data_batch for multiple types",
@@ -84,7 +101,7 @@ TEMPLATE_TEST_CASE("sirius_physical_projection executes on data_batch for multip
   types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
 
   sirius_physical_projection projection(
-    sirius::from_duckdb_vec(types), sirius::wrap_many(std::move(exprs)), key_vals.size());
+    sirius::from_duckdb_vec(types), translate_expressions(std::move(exprs)), key_vals.size());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = projection.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
@@ -129,7 +146,7 @@ TEMPLATE_TEST_CASE("sirius_physical_projection can drop columns",
   types.push_back(Traits::logical_type());
 
   sirius_physical_projection projection(
-    sirius::from_duckdb_vec(types), sirius::wrap_many(std::move(exprs)), key_vals.size());
+    sirius::from_duckdb_vec(types), translate_expressions(std::move(exprs)), key_vals.size());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = projection.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
@@ -175,7 +192,7 @@ TEMPLATE_TEST_CASE("sirius_physical_projection can duplicate/reorder columns",
   types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
 
   sirius_physical_projection projection(
-    sirius::from_duckdb_vec(types), sirius::wrap_many(std::move(exprs)), key_vals.size());
+    sirius::from_duckdb_vec(types), translate_expressions(std::move(exprs)), key_vals.size());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = projection.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());

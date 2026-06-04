@@ -447,9 +447,8 @@ set(TEST_SOURCES
     test/cpp/expression/test_ast_from_duckdb.cpp
     test/cpp/expression/test_ast_scaffold.cpp
     test/cpp/expression/test_ast_to_duckdb.cpp
-    test/cpp/expression/test_expression.cpp
+    test/cpp/expression/test_comparison_type_mapping.cpp
     test/cpp/expression/test_function_id.cpp
-    test/cpp/expression/test_join_condition.cpp
     test/cpp/expression/test_value.cpp
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
     test/cpp/expression_executor/test_gpu_expression_executor_ast_equivalence.cpp

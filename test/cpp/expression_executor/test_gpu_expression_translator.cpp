@@ -33,7 +33,6 @@
 #include <expression/ast/node.hpp>
 #include <expression/ast/reference.hpp>
 #include <expression/ast/unary_op.hpp>
-#include <expression/expression_internal.hpp>
 #include <expression/function_id.hpp>
 #include <expression/join_condition.hpp>  // sirius::comparison_type, sirius::from_duckdb (enum mapper)
 #include <expression/value.hpp>
@@ -252,7 +251,7 @@ sirius::join_condition make_reference_join_condition(duckdb::ExpressionType comp
   // comparison-enum mapping still goes through sirius::from_duckdb(ExpressionType),
   // which is the join_condition comparison mapper (NOT the expression from_duckdb).
   return sirius::join_condition{
-    wrap_node(make_ref(0)), wrap_node(make_ref(0)), sirius::from_duckdb(comparison)};
+    make_ref(0), make_ref(0), sirius::from_duckdb(comparison)};
 }
 
 }  // namespace
