@@ -4,13 +4,14 @@ This document covers the scan subsystem end-to-end: how data enters Super Sirius
 
 ## Overview
 
-Super Sirius supports four scan paths:
+Super Sirius supports five scan paths:
 
 | Path | Operator | Use Case | Data Flow |
 |------|----------|----------|-----------|
 | **DuckDB Scan** | `DUCKDB_SCAN` | General DuckDB-managed tables | DuckDB table function → column builders → `host_data_representation` |
 | **Parquet Scan** | `PARQUET_SCAN` | Legacy direct Parquet reading | Parquet byte ranges → `host_parquet_representation` |
-| **GPU Parquet Scan** | `GPU_PARQUET_SCAN` | Parquet file reading via the scan manager | `sirius_scan_manager` produces `parquet_scan_data` splits → GPU read |
+| **GPU Parquet Scan** | `GPU_PARQUET_SCAN` | Parquet file reading via the scan manager (local or S3) | `sirius_scan_manager` produces `parquet_scan_data` splits → GPU read |
+| **GPU DuckDB-Native Scan** | `GPU_DUCKDB_NATIVE_SCAN` | GPU-native `.duckdb` file reading | `sirius_scan_manager` walks per-row-group segment metadata → GPU decode |
 | **Iceberg Scan** | `ICEBERG_SCAN` | Apache Iceberg V1/V2/V3 tables | Parquet scan + GPU-accelerated delete filters |
 
 The DuckDB and legacy parquet paths funnel through `duckdb_scan_executor` and the data-repository infrastructure. The GPU parquet path is driven by `sirius_scan_manager` and a dedicated `split_provider` per scan operator (see [Scan Manager](#scan-manager)).
@@ -51,15 +52,22 @@ Iceberg table scan. Inherits from `sirius_physical_parquet_scan`. Holds delete f
 ### `sirius_gpu_parquet_scan_operator` — `GPU_PARQUET_SCAN`
 **File:** `src/include/op/scan/sirius_gpu_parquet_scan_operator.hpp`
 
-Source operator for parquet scans. Carries a `parquet_scan_info` populated by the pipeline converter from the DuckDB bind data (file paths, projected column ids, table filters, hive partition indices, target batch size). The operator owns a bound `split_connector`; `get_next_task_input_data()` blocks inside `split_connector::get_next_split()` until either a `parquet_scan_data` is available or the connector is closed and drained.
+Source operator for parquet scans. Carries a `scan_info` (concrete subclass: `parquet_scan_info`) populated by the pipeline converter from the DuckDB bind data (file paths, projected column ids, table filters, hive partition indices, target batch size). The operator owns a bound `split_connector`; `get_next_task_input_data()` blocks inside `split_connector::get_next_split()` until either a `parquet_scan_data` is available or the connector is closed and drained.
 
-`execute(input_data)` runs per task: it calls `cudf::io::read_parquet` over the row-group slices in the split, optionally applies a fallback DuckDB expression filter when AST translation failed, prunes pure-filter columns, and assembles the output table according to the `scan_plan` (data columns, hive-partition synthesis, output ordering).
+`execute(input_data)` runs per task: it calls `cudf::io::read_parquet` over the row-group slices in the split, optionally applies a fallback expression filter when AST translation failed, prunes pure-filter columns, and assembles the output table according to the `scan_plan` (data columns, hive-partition synthesis, output ordering).
+
+Parquet files on S3 (`s3://…` paths) are routed through the `s3_ioctx` backend automatically — the pipeline converter detects the scheme from the bind data paths and the scan manager selects the appropriate `sirius_ioctx` per GPU device at provider-construction time.
+
+### `sirius_gpu_duckdb_native_scan_operator` — `GPU_DUCKDB_NATIVE_SCAN`
+**File:** `src/include/op/scan/sirius_gpu_duckdb_native_scan_operator.hpp`
+
+Source operator for GPU-native reading of DuckDB `.duckdb` format table entries. Carries a `duckdb_native_scan_info` populated by the pipeline converter. The scan manager walks per-row-group segment metadata once at `prepare_for_query` and emits one split per row-group batch via a `duckdb_native_split_provider`. Each split carries a slice of the row-group metadata vector plus a shared `duckdb_native_scan_info` handle. `execute()` decodes the segments described by the split into a `cudf::table` using the native DuckDB format decode kernels (`duckdb_native_decoder`).
 
 ## Scan Manager
 
 **Files:** `src/include/scan_manager/sirius_scan_manager.hpp`, `src/scan_manager/sirius_scan_manager.cpp`, `src/include/scan_manager/split_provider.hpp`, `src/include/scan_manager/split_connector.hpp`
 
-`sirius_scan_manager` owns a configurable thread pool and is responsible for producing the input splits consumed by every `GPU_PARQUET_SCAN` source operator. It runs alongside the GPU pipeline executors and is independent from the data repository / port machinery used between intermediate operators.
+`sirius_scan_manager` owns a configurable thread pool and is responsible for producing the input splits consumed by every `GPU_PARQUET_SCAN` and `GPU_DUCKDB_NATIVE_SCAN` source operator. It runs alongside the GPU pipeline executors and is independent from the data repository / port machinery used between intermediate operators.
 
 ### Components
 
@@ -67,14 +75,18 @@ Source operator for parquet scans. Carries a `parquet_scan_info` populated by th
 |-----------|------|------|
 | `sirius_scan_manager` | `scan_manager/sirius_scan_manager.{hpp,cpp}` | Owns thread pool, holds providers and pinned-table entries, drives provider execution |
 | `split_provider` | `scan_manager/split_provider.hpp` | Abstract producer of `operator_data` splits |
+| `scan_info` | `op/scan/scan_info.hpp` | Polymorphic base for per-format scan bind data; subclasses implement `make_provider()` |
+| `parquet_scan_info` | `op/scan/parquet_scan_info.hpp` | Parquet-specific bind data; `make_provider()` returns a `parquet_split_provider` |
+| `duckdb_native_scan_info` | `op/scan/duckdb_native_scan_info.hpp` | DuckDB-format-specific bind data; `make_provider()` returns a `duckdb_native_split_provider` |
 | `parquet_split_provider` | `scan_manager/parquet_split_provider.{hpp,cpp}` | Provider that parses parquet metadata and emits `parquet_scan_data` per row-group partition |
+| `duckdb_native_split_provider` | `scan_manager/duckdb_native_split_provider.{hpp,cpp}` | Provider that walks DuckDB row-group segment metadata and emits splits for native GPU decode |
 | `cached_split_provider` | `scan_manager/cached_split_provider.{hpp,cpp}` | Provider that emits zero-copy splits over pinned columns (see [Pinned Tables](#pinned-tables)) |
 | `split_connector` | `scan_manager/split_connector.hpp` | Lock-protected blocking queue between the provider and the operator |
 
 ### Lifecycle
 
-1. **Plan stage:** during pipeline conversion, `split_parquet_scan_source` packages the DuckDB bind data into a `parquet_scan_info` and constructs a `sirius_gpu_parquet_scan_operator` carrying that info. The operator is inserted at `operators[0]` of the pipeline; no separate metadata pipeline is created.
-2. **Per-query preparation:** `sirius_scan_manager::prepare_for_query(query)` walks the plan, picks each parquet scan source, and calls `create_provider_for(op)`. The factory returns either a `cached_split_provider` (when a pinned entry matches the operator's file paths) or a `parquet_split_provider`. A fresh `split_connector` is bound to the operator and the provider is stored in the manager's map.
+1. **Plan stage:** during pipeline conversion, `split_parquet_scan_source` packages the DuckDB bind data into a `scan_info` concrete subclass (`parquet_scan_info` for parquet / S3 paths, `duckdb_native_scan_info` for DuckDB-format tables) and constructs the corresponding source operator carrying that info. The operator is inserted at `operators[0]` of the pipeline; no separate metadata pipeline is created.
+2. **Per-query preparation:** `sirius_scan_manager::prepare_for_query(query)` walks the plan, picks each scan source, and calls `create_provider_for(op)`. For parquet scans the factory checks for a pinned-table cache hit first and returns a `cached_split_provider` on match; otherwise it calls `scan_info::make_provider()` to build the format-specific provider. A fresh `split_connector` is bound to the operator and the provider is stored in the manager's map.
 3. **Execution:** a driver thread runs providers **sequentially** in registration order. Each provider's `start(pool, connector)` schedules work onto the manager's thread pool and returns a future; the driver waits on it before starting the next provider. Inside the operator, `get_next_task_input_data()` blocks on `split_connector::get_next_split()` and returns each split as it arrives, so consumer-side scheduling is decoupled from production order.
 4. **Teardown:** the provider closes the connector on every termination path (success, exception); on synchronous failure the manager closes it as a safety net. Once closed and drained, the operator's `all_ports_empty()` returns true and `get_next_task_hint()` returns `nullopt`.
 
@@ -144,7 +156,7 @@ SELECT SUM(l_extendedprice * l_quantity)
 CALL unpin_table('lineitem');
 ```
 
-`tier` accepts `gpu` or `host`; only `gpu` is supported today (a `host` argument throws `NotImplementedException` and will be added later).
+`tier` accepts `gpu` (columns pinned to GPU device memory) or `host` (columns pinned to host memory). In both cases subsequent scans of the same paths are served from the pinned columns without file I/O.
 
 A `pinned_entry` stores the column projection, resolved file paths, per-column chunk vectors, and the memory space the columns reside in. When `prepare_for_query` runs, the scan manager matches the operator's `parquet_scan_info::file_paths` against pinned entries; on a hit, it constructs a `cached_split_provider` (zero-copy view-backed `data_batch` per chunk) instead of a `parquet_split_provider`. The cached provider forwards the same `scan_plan` and filter expression as the parquet path, so the operator's `execute()` is unchanged. When `needs_output_assembly(*plan)` is false (identity layout), the cached batch is forwarded straight through with no permute or prune.
 
@@ -376,6 +388,33 @@ Two C++20 concepts define the plug-in contract:
 
 A new backend is: a custom `io_object` + reactor + `templated_ioctx<your_reactor>`. `uring_ioctx = templated_ioctx<uring_reactor>` is the first instantiation.
 
+### S3 Backend
+
+**Files:** `src/include/io/s3/s3_ioctx.hpp`, `src/io/s3/s3_ioctx.cpp`, `src/include/io/s3/s3_request_authorizer.hpp`, `src/include/io/s3/s3_io_object.hpp`
+
+`sirius::io::s3::s3_ioctx` implements the `sirius_ioctx` interface for reading parquet files from S3 using libcurl HTTP Range GETs. Unlike the io_uring backend, S3 has no native device-read path — device reads bounce through a host staging buffer followed by `cudaMemcpyAsync`.
+
+Authentication is delegated to a `s3_request_authorizer` implementation passed via `s3_ioctx_config`:
+
+| Authorizer | Mechanism |
+|------------|-----------|
+| `sirius_sigv4_presigned_authorizer` | Generates AWS SigV4-signed presigned URLs for each request |
+| `sirius_sigv4_header_authorizer` | Adds `Authorization` + `x-amz-*` headers; supports STS session tokens and dual-signing modes (AWS standard + custom endpoints) |
+
+The path from SQL to S3 reads:
+
+```sql
+SELECT * FROM read_parquet('s3://bucket/key.parquet')
+```
+
+1. Pipeline converter detects `s3://` prefix in bind data paths; sets scan_info to a `parquet_scan_info` with the S3 paths.
+2. `sirius_scan_manager::prepare_for_query` calls `scan_info::make_provider()` which builds a `parquet_split_provider` backed by an `s3_ioctx`.
+3. The scan manager selects the per-GPU `s3_ioctx` via `gpu_ioctxs` map (injected at initialization from `SiriusContext`).
+4. `parquet_split_provider` fetches parquet footers via the `s3_ioctx`, then produces `parquet_scan_data` splits served from S3 range GETs.
+5. Each split's `cudf::io::read_parquet` call uses a `sirius_datasource` backed by `s3_ioctx`, routing every read through libcurl.
+
+`s3_ioctx_config` controls authentication, connection limits, per-call timeout, retry count and backoff, and optional host-memory staging (FSMR-backed bounded staging buffer for device reads).
+
 ### Cache Seam
 
 `sirius_ioctx::device_read{,_async}` is non-virtual: it consults `_cache` and falls through to pure-virtual `device_read_io{,_async}`. Backends never see the cache; the cache never sees the backend. `supports_device_read()` stays `true` even when the cache serves the read because the final copy is still `cudaMemcpyAsync` from pinned host memory to device.
@@ -499,15 +538,24 @@ graph TD
 | `src/include/op/scan/cached_ranges.hpp` | Cache range structure |
 | `src/include/op/scan/config.hpp` | Scan config, cache_level enum |
 | `src/include/op/scan/sirius_gpu_parquet_scan_operator.hpp` | GPU parquet scan source operator |
-| `src/include/op/scan/parquet_scan_info.hpp` | Bind data parked on the scan operator for the scan manager |
+| `src/include/op/scan/sirius_gpu_duckdb_native_scan_operator.hpp` | GPU DuckDB-native scan source operator |
+| `src/include/op/scan/scan_info.hpp` | Polymorphic base for per-format scan bind data |
+| `src/include/op/scan/parquet_scan_info.hpp` | Parquet-specific scan bind data (concrete `scan_info`) |
+| `src/include/op/scan/duckdb_native_scan_info.hpp` | DuckDB-format-specific scan bind data (concrete `scan_info`) |
+| `src/include/op/scan/duckdb_native_metadata.hpp` | DuckDB row-group segment metadata walker |
+| `src/include/op/scan/duckdb_native_decoder.hpp` | DuckDB format GPU decode kernels |
 | `src/include/op/scan/parquet_scan_operator_data.hpp` | `parquet_scan_data` split type emitted by providers |
 | `src/include/op/scan/scan_plan.hpp` | Index-space mapping (P/C/D), output layout, partition injection |
 | `src/include/op/scan/parquet_schema_mapping.hpp` | Name-based DuckDB→parquet column resolution |
 | `src/include/scan_manager/sirius_scan_manager.hpp` | Scan manager: thread pool, providers, pinned-table registry |
 | `src/include/scan_manager/split_provider.hpp` | Abstract split producer |
 | `src/include/scan_manager/parquet_split_provider.hpp` | Parquet metadata-driven split provider |
+| `src/include/scan_manager/duckdb_native_split_provider.hpp` | DuckDB-native metadata-driven split provider |
 | `src/include/scan_manager/cached_split_provider.hpp` | Pinned-column split provider |
 | `src/include/scan_manager/split_connector.hpp` | Blocking queue between provider and operator |
+| `src/include/io/s3/s3_ioctx.hpp` | S3 ioctx: libcurl HTTP Range GET backend |
+| `src/include/io/s3/s3_request_authorizer.hpp` | Authentication abstraction (SigV4 presigned / header-signing) |
+| `src/include/io/s3/s3_io_object.hpp` | S3 io_object with bucket/key/size metadata |
 | `src/include/pin_table.hpp` / `src/pin_table.cpp` | `pin_table` / `unpin_table` table-function bindings |
 | `src/include/op/sirius_physical_iceberg_scan.hpp` | Iceberg scan operator |
 | `src/include/op/scan/iceberg_scan_task.hpp` | Iceberg scan task with delete filters |

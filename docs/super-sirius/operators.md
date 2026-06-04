@@ -66,7 +66,12 @@ See [Scan — Iceberg Scan](scan.md#iceberg-scan) for details.
 ### `sirius_gpu_parquet_scan_operator` — `GPU_PARQUET_SCAN`
 **File:** `src/include/op/scan/sirius_gpu_parquet_scan_operator.hpp`
 
-Source operator for parquet scans. Carries a `parquet_scan_info` populated by the pipeline converter and pulls splits from a `split_connector` populated by `sirius_scan_manager` on its own thread pool. Each `parquet_scan_data` split drives a `cudf::io::read_parquet` call followed by `scan_plan`-driven output assembly (data columns, hive-partition synthesis, output ordering). See [Scan — Scan Manager](scan.md#scan-manager).
+Source operator for parquet scans (local or S3). Carries a `scan_info` (concrete subclass: `parquet_scan_info`) populated by the pipeline converter and pulls splits from a `split_connector` populated by `sirius_scan_manager` on its own thread pool. Each `parquet_scan_data` split drives a `cudf::io::read_parquet` call followed by `scan_plan`-driven output assembly (data columns, hive-partition synthesis, output ordering). See [Scan — Scan Manager](scan.md#scan-manager).
+
+### `sirius_gpu_duckdb_native_scan_operator` — `GPU_DUCKDB_NATIVE_SCAN`
+**File:** `src/include/op/scan/sirius_gpu_duckdb_native_scan_operator.hpp`
+
+Source operator for GPU-native reading of DuckDB `.duckdb` format tables. Carries a `duckdb_native_scan_info` and pulls splits from a `split_connector` fed by a `duckdb_native_split_provider`. Each split carries a slice of per-row-group segment metadata; `execute()` decodes the segments into a `cudf::table` using the native DuckDB format decode kernels. See [Scan — GPU DuckDB-Native Scan](scan.md#sirius_gpu_duckdb_native_scan_operator----gpu_duckdb_native_scan).
 
 ### `sirius_physical_dummy_scan` — `DUMMY_SCAN`
 **File:** `src/include/op/sirius_physical_dummy_scan.hpp`
@@ -299,7 +304,8 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | DUCKDB_SCAN | Scan | DuckDB table function |
 | PARQUET_SCAN | Scan | Direct Parquet reading |
 | ICEBERG_SCAN | Scan | Parquet reading with Iceberg delete filters |
-| GPU_PARQUET_SCAN | Scan | Source operator served by `sirius_scan_manager` |
+| GPU_PARQUET_SCAN | Scan | Source operator served by `sirius_scan_manager` (local or S3) |
+| GPU_DUCKDB_NATIVE_SCAN | Scan | GPU-native DuckDB format scan via `duckdb_native_split_provider` |
 | DUMMY_SCAN | Scan | Generates 1 row |
 | COLUMN_DATA_SCAN | Scan | Reads ColumnDataCollection |
 | FILTER | Relational | `gpu_expression_executor::select()` |
