@@ -52,6 +52,7 @@
 #include <sys/resource.h>  // POSIX: getrlimit(RLIMIT_MEMLOCK)
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <cstdlib>  // for std::getenv
 #include <filesystem>
@@ -202,7 +203,26 @@ void SiriusContext::QueryBegin(ClientContext& context)
     sirius::op::sirius_physical_operator::next_operator_id.store(0);
 
     auto query = context.GetCurrentQuery();
-    SIRIUS_LOG_INFO("QueryBegin: {}", query.substr(0, std::min(query.size(), size_t(120))));
+    // Collapse every run of whitespace (incl. newlines/tabs) to a single space,
+    // trim leading/trailing whitespace, and log the full normalized query so
+    // log_analysis tools can correlate by SQL text without truncation.
+    std::string normalized_query;
+    normalized_query.reserve(query.size());
+    bool in_ws = true;  // skip leading whitespace
+    for (char c : query) {
+      bool is_ws = std::isspace(static_cast<unsigned char>(c)) != 0;
+      if (is_ws) {
+        if (!in_ws) { normalized_query.push_back(' '); }
+        in_ws = true;
+      } else {
+        normalized_query.push_back(c);
+        in_ws = false;
+      }
+    }
+    if (!normalized_query.empty() && normalized_query.back() == ' ') {
+      normalized_query.pop_back();
+    }
+    SIRIUS_LOG_INFO("QueryBegin: {}", normalized_query);
     bool query_cache_hit = false;
     if (config_.is_scan_caching_enabled()) {
       query_cache_hit = task_scheduler_->get_scan_executor().cache_scan_results_for_query(query);
