@@ -506,21 +506,12 @@ staged_column stage_one_varchar_column(staging_state& s,
 //
 // File-near segment reads are coalesced into large sequential reads (bridging the
 // per-block header gaps) and dispatched as one batch via host_read_ranges_async_io,
-// packed into a pinned multiple_blocks_allocation WITHOUT 16B gaps so more reads
-// merge; the 16B device alignment the decode kernels need is imposed by the
-// per-segment H2D scatter instead. Buffered reads hit the OS page cache on warm
-// runs; coalescing cuts request count ~4x. NVTX ranges (native_reads / native_h2d,
-// plus native_metadata_walk in the metadata walker) are kept for profiling.
+// packed into a pinned multiple_blocks_allocation; the 16B device alignment the decode kernels need
+// is imposed by the per-segment H2D scatter instead.
 //===----------------------------------------------------------------------===//
 
 using multiple_blocks_allocation =
   cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
-
-// Merge reads whose file gap is <= this. Consecutive .db block payloads are separated
-// by an 8B block header (and segments by small alignment gaps); bridging them
-// coalesces a column's blocks into one sequential read. Kept small so we never pull
-// the large unprojected-column waste that sits between row groups.
-constexpr std::size_t kCoalesceMaxGap = 64UL * 1024;
 
 /// @brief Batched pinned->device H2D (one cudaMemcpyBatchAsync launch); per-entry
 /// fallback on toolkits without the batch API.
@@ -565,6 +556,7 @@ void submit_and_await(rmm::device_buffer& device_buf,
                       sirius::io::sirius_io_object& io_obj,
                       cucascade::memory::memory_reservation_manager& host_mem_mgr,
                       int host_numa_node,
+                      std::size_t coalesce_max_gap,
                       rmm::cuda_stream_view stream)
 {
   namespace ccm = cucascade::memory;
@@ -572,8 +564,7 @@ void submit_and_await(rmm::device_buffer& device_buf,
   auto* device_base = static_cast<uint8_t*>(device_buf.data());
 
   // Reserve pinned host staging from the FSMR pool, preferring the NUMA node local to
-  // the GPU that owns device_buf (host spaces are keyed by NUMA node; the strategy
-  // falls back to other nodes, so single-NUMA hosts are unaffected).
+  // the GPU that owns device_buf.
   ccm::any_memory_space_in_tier_with_preference host_req(ccm::Tier::HOST,
                                                          static_cast<std::size_t>(host_numa_node));
   auto reservation = host_mem_mgr.request_reservation(host_req, s.running_offset);
@@ -616,7 +607,7 @@ void submit_and_await(rmm::device_buffer& device_buf,
       auto& p                       = pieces.back();
       std::size_t const gap         = r.file_offset - p.file_end;
       std::size_t const prospective = (r.file_offset + r.size) - p.file_off;
-      if (gap > kCoalesceMaxGap || p.host_off + prospective > bsz) { new_piece = true; }
+      if (gap > coalesce_max_gap || p.host_off + prospective > bsz) { new_piece = true; }
     }
     if (new_piece) {
       if (cur_off + r.size > bsz) {
@@ -895,8 +886,19 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
                             ? topo.gpus[gpu_dev].numa_node
                             : -1;
     int const host_numa = (raw_numa < 0) ? 0 : raw_numa;
-    submit_and_await(
-      device_buf, staging, *io_ctx, *io_obj, sirius_st->get_memory_manager(), host_numa, stream);
+    // Coalesce reads across at most the inter-block-payload gap (the block header):
+    // consecutive full .db blocks are exactly GetBlockHeaderSize() apart, so this merges
+    // them into one sequential read without pulling the larger unprojected-column waste
+    // that sits between row groups.
+    std::size_t const coalesce_max_gap = sf_bm->GetBlockHeaderSize();
+    submit_and_await(device_buf,
+                     staging,
+                     *io_ctx,
+                     *io_obj,
+                     sirius_st->get_memory_manager(),
+                     host_numa,
+                     coalesce_max_gap,
+                     stream);
   }
 
   // Group fixed-width columns for a single gpu_decode_table call; varchar
