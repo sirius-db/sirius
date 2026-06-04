@@ -40,7 +40,7 @@ compile_commands.json
 .zed
 
 # Local-only AI assistant + planning artifacts (per-machine, not for upstream)
-AGENTS.md
+AGENTS.override.md
 CLAUDE.local.md
 newplan.md
 telemetry_data/
