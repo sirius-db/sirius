@@ -38,6 +38,9 @@ constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES       = 512ULL * 1024 * 1024;  /
 constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES         = 512ULL * 1024 * 1024;  // 512 MB
 constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES = 500ULL * 1024 * 1024;  // 500 MB
 
+/// Fraction of available GPU memory used per sort partition when max_sort_partition_bytes is 0.
+constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
+
 }  // namespace config
 
 /// Parameters controlling operator-level resource sizing.
@@ -50,8 +53,11 @@ struct operator_params {
   /// Default size estimate (bytes) for VARCHAR columns when computing rows per batch.
   uint64_t default_scan_task_varchar_size = config::DEFAULT_SCAN_TASK_VARCHAR_SIZE;
 
-  /// Maximum bytes per sort partition (0 = auto: 33% of available GPU memory).
+  /// Maximum bytes per sort partition (0 = auto based on max_sort_partition_memory_fraction).
   uint64_t max_sort_partition_bytes = 0;
+
+  /// Fraction of available GPU memory per sort partition when max_sort_partition_bytes is 0.
+  double max_sort_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION;
 
   /// Target size (bytes) per hash partition for joins and group-bys.
   uint64_t hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES;

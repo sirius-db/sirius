@@ -18,6 +18,7 @@
 
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_order.hpp"
+#include "sirius_config.hpp"
 
 #include <cudf/table/table.hpp>
 
@@ -32,15 +33,18 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
 
   static constexpr std::size_t DEFAULT_NUM_SAMPLE_BATCHES = 5;
 
-  //! Maximum fraction of available GPU memory per partition (33%)
-  static constexpr double MAX_PARTITION_MEMORY_FRACTION = 0.33;
+  sirius_physical_sort_sample(
+    sirius_physical_order* order_by,
+    uint64_t max_partition_bytes         = 0,
+    double max_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION);
 
-  sirius_physical_sort_sample(sirius_physical_order* order_by);
-
-  sirius_physical_sort_sample(duckdb::vector<sirius::logical_type> types,
-                              duckdb::vector<duckdb::BoundOrderByNode> orders,
-                              std::size_t estimated_cardinality,
-                              std::size_t num_sample_batches = DEFAULT_NUM_SAMPLE_BATCHES);
+  sirius_physical_sort_sample(
+    duckdb::vector<sirius::logical_type> types,
+    duckdb::vector<duckdb::BoundOrderByNode> orders,
+    std::size_t estimated_cardinality,
+    std::size_t num_sample_batches       = DEFAULT_NUM_SAMPLE_BATCHES,
+    uint64_t max_partition_bytes         = 0,
+    double max_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION);
 
   //! Order specification (copied from ORDER_BY) — determines which columns to sample
   duckdb::vector<duckdb::BoundOrderByNode> orders;
@@ -73,9 +77,6 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   //! Whether boundaries have been computed
   bool boundaries_computed() const { return _boundary_state.load(std::memory_order_acquire) == 2; }
 
-  //! Override the maximum bytes per partition (0 = use default GPU memory-based calculation)
-  void set_max_partition_bytes(size_t bytes) { _max_partition_bytes_override = bytes; }
-
   //! Release the partition boundaries table to free GPU memory
   void clear_partition_boundaries() { _partition_boundaries.reset(); }
 
@@ -91,8 +92,11 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   //! passthrough without blocking.
   std::atomic<int> _boundary_state{0};
 
-  //! Override for max partition bytes (0 = use default GPU memory-based calculation)
+  //! Override for max partition bytes (0 = use GPU memory fraction)
   size_t _max_partition_bytes_override = 0;
+
+  //! Fraction of available GPU memory per partition (from sirius_config operator_params)
+  double _max_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION;
 };
 
 }  // namespace op

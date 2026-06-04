@@ -119,6 +119,9 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("scan_task_batch_size", yaml::bytes(opt.scan_task_batch_size));
   r.optional("default_scan_task_varchar_size", yaml::bytes(opt.default_scan_task_varchar_size));
   r.optional("max_sort_partition_bytes", yaml::bytes(opt.max_sort_partition_bytes));
+  r.optional("max_sort_partition_memory_fraction",
+             opt.max_sort_partition_memory_fraction,
+             yaml::fraction<double>{});
   r.optional("hash_partition_bytes", yaml::bytes(opt.hash_partition_bytes));
   r.optional("concat_batch_bytes", yaml::bytes(opt.concat_batch_bytes));
   r.optional("max_build_hash_table_bytes", yaml::bytes(opt.max_build_hash_table_bytes));
