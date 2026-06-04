@@ -15,10 +15,12 @@
  */
 
 // sirius
+#include <expression/ast/aggregate.hpp>
 #include <expression/ast/from_duckdb.hpp>
 #include <expression/expression_internal.hpp>
 #include <expression_executor/gpu_expression_translator_internal.hpp>
 #include <log/logging.hpp>
+#include <sirius/exception.hpp>
 
 // cudf
 #include <cudf/utilities/type_dispatcher.hpp>
@@ -371,7 +373,8 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
                     std::is_same_v<T, sirius::ast::unary_op> ||
                     std::is_same_v<T, sirius::ast::coalesce> ||
                     std::is_same_v<T, sirius::ast::in_list> ||
-                    std::is_same_v<T, sirius::ast::function_call>) {
+                    std::is_same_v<T, sirius::ast::function_call> ||
+                    std::is_same_v<T, sirius::ast::aggregate>) {
         return this->add_expression(alt, table_src);
       } else {
         static_assert(sizeof(T) == 0,
@@ -768,6 +771,14 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
                        static_cast<int>(alt.function()));
       return std::nullopt;
   }
+}
+
+//===----------AGGREGATE----------===//
+std::optional<expr_ref> gpu_expression_translator::add_expression(
+  sirius::ast::aggregate const& /*alt*/, cudf::ast::table_reference const /*table_src*/)
+{
+  throw not_implemented_exception(
+    "[gpu_expression_translator] aggregate nodes cannot be lowered to a cuDF AST (#863).");
 }
 
 }  // namespace sirius
