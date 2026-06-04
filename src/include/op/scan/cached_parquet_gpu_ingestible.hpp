@@ -25,6 +25,7 @@
 
 // cucascade
 #include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 // duckdb

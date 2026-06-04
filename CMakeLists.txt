@@ -470,6 +470,7 @@ set(TEST_SOURCES
     test/cpp/io/s3/test_static_credentials.cpp
     test/cpp/io/test_datasource_factory.cpp
     test/cpp/io/test_duckdb_io_object.cpp
+    test/cpp/io/test_gpu_ingestible.cpp
     test/cpp/io/test_parquet_helpers.cpp
     test/cpp/io/test_prefetching_cache_telemetry.cpp
     test/cpp/io/test_uri_parser.cpp
@@ -523,6 +524,8 @@ set(TEST_SOURCES
     test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_scan_task.cpp
+    test/cpp/scan/test_parquet_gpu_ingestible.cpp
+    test/cpp/scan/test_cached_parquet_gpu_ingestible.cpp
     test/cpp/scan/test_scan_executor.cpp
     test/cpp/scan/test_split_connector.cpp
     test/cpp/scan_manager/test_sirius_scan_manager_s3.cpp
