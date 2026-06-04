@@ -151,7 +151,6 @@ set(EXTENSION_SOURCES
     src/expression/aggregate_id.cpp
     src/expression/ast/clone.cpp
     src/expression/ast/node.cpp
-    src/expression/expression.cpp
     src/expression/from_duckdb.cpp
     src/expression/function_id.cpp
     src/expression/join_condition.cpp
