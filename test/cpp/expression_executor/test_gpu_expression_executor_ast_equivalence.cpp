@@ -14,18 +14,20 @@
  * limitations under the License.
  */
 
-// Three-leg byte-equivalence tests for the dual-path gpu_expression_executor.
+// Byte-equivalence tests for the (now single-path) gpu_expression_executor.
 //
-// For each Sirius AST alternative, the test constructs the same expression
-// three ways:
-//   1. directly as a duckdb::BoundXxxExpression (DuckDB-direct leg)
-//   2. as a hand-built sirius::ast::node{<alt>{...}}            (hand-AST leg)
-//   3. via sirius::ast::from_duckdb(*duck_expr)                 (translator leg)
+// For each Sirius AST alternative, the test constructs the same expression two
+// ways:
+//   1. as a hand-built sirius::ast::node{<alt>{...}}            (hand-AST leg)
+//   2. via sirius::ast::from_duckdb(*duck_expr)                 (translator leg)
 //
-// All three are executed against the same input table and the output columns
-// are asserted byte-equivalent pairwise on host. Confirms the new
-// sirius::ast::node-typed executor surface produces identical output to the
-// existing duckdb::Expression-typed surface for every alternative.
+// Both are executed against the same input table through the surviving
+// sirius::ast::node-typed executor surface and the output columns are asserted
+// byte-equivalent on host. This confirms sirius::ast::from_duckdb lowers a
+// DuckDB expression into a node the executor evaluates identically to the
+// hand-built node. The DuckDB-typed executor entry that this file originally
+// exercised as a third leg was removed in Phase 9 (#702); the duckdb::BoundXxx
+// expression here now serves only as the input to from_duckdb.
 
 // test
 #include <catch.hpp>
@@ -280,17 +282,13 @@ TEST_CASE("ast_equivalence - reference identity round-trip", "[gpu_expression_ex
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
 
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
   auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
   auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
-  REQUIRE(duck_out);
   REQUIRE(hand_out);
   REQUIRE(translated_out);
 
-  auto duck_host       = copy_column_to_host<int32_t>(duck_out->view().column(0));
   auto hand_host       = copy_column_to_host<int32_t>(hand_out->view().column(0));
   auto translated_host = copy_column_to_host<int32_t>(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
   REQUIRE(hand_host == translated_host);
 }
 
@@ -312,14 +310,11 @@ TEST_CASE("ast_equivalence - constant INTEGER", "[gpu_expression_executor_ast]")
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
 
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
   auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
   auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
 
-  auto duck_host       = copy_column_to_host<int32_t>(duck_out->view().column(0));
   auto hand_host       = copy_column_to_host<int32_t>(hand_out->view().column(0));
   auto translated_host = copy_column_to_host<int32_t>(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
   REQUIRE(hand_host == translated_host);
 }
 
@@ -337,14 +332,11 @@ TEST_CASE("ast_equivalence - constant VARCHAR", "[gpu_expression_executor_ast]")
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
 
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
   auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
   auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
 
-  auto duck_host       = copy_string_column_to_host(duck_out->view().column(0));
   auto hand_host       = copy_string_column_to_host(hand_out->view().column(0));
   auto translated_host = copy_string_column_to_host(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
   REQUIRE(hand_host == translated_host);
 }
 
@@ -368,14 +360,11 @@ TEST_CASE("ast_equivalence - comparison EQUAL (MATERIALIZE)", "[gpu_expression_e
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
 
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
   auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
   auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
 
-  auto duck_host       = copy_bool_column_to_host(duck_out->view().column(0));
   auto hand_host       = copy_bool_column_to_host(hand_out->view().column(0));
   auto translated_host = copy_bool_column_to_host(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
   REQUIRE(hand_host == translated_host);
 }
 
@@ -394,14 +383,11 @@ TEST_CASE("ast_equivalence - comparison EQUAL (AST_INTERPRET)", "[gpu_expression
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
 
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, AST_I);
   auto hand_out       = run_one(*space, hand_ast.get(), tv, AST_I);
   auto translated_out = run_one(*space, translated_ast.get(), tv, AST_I);
 
-  auto duck_host       = copy_bool_column_to_host(duck_out->view().column(0));
   auto hand_host       = copy_bool_column_to_host(hand_out->view().column(0));
   auto translated_host = copy_bool_column_to_host(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
   REQUIRE(hand_host == translated_host);
 }
 
@@ -420,14 +406,11 @@ TEST_CASE("ast_equivalence - comparison LESSTHAN (MATERIALIZE)", "[gpu_expressio
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
 
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
   auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
   auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
 
-  auto duck_host       = copy_bool_column_to_host(duck_out->view().column(0));
   auto hand_host       = copy_bool_column_to_host(hand_out->view().column(0));
   auto translated_host = copy_bool_column_to_host(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
   REQUIRE(hand_host == translated_host);
 }
 
@@ -462,14 +445,11 @@ TEST_CASE("ast_equivalence - conjunction AND (MATERIALIZE)", "[gpu_expression_ex
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
 
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
   auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
   auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
 
-  auto duck_host       = copy_bool_column_to_host(duck_out->view().column(0));
   auto hand_host       = copy_bool_column_to_host(hand_out->view().column(0));
   auto translated_host = copy_bool_column_to_host(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
   REQUIRE(hand_host == translated_host);
 }
 
@@ -500,14 +480,11 @@ TEST_CASE("ast_equivalence - conjunction AND (AST_INTERPRET)", "[gpu_expression_
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
 
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, AST_I);
   auto hand_out       = run_one(*space, hand_ast.get(), tv, AST_I);
   auto translated_out = run_one(*space, translated_ast.get(), tv, AST_I);
 
-  auto duck_host       = copy_bool_column_to_host(duck_out->view().column(0));
   auto hand_host       = copy_bool_column_to_host(hand_out->view().column(0));
   auto translated_host = copy_bool_column_to_host(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
   REQUIRE(hand_host == translated_host);
 }
 
@@ -530,14 +507,11 @@ TEST_CASE("ast_equivalence - between (MATERIALIZE)", "[gpu_expression_executor_a
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
 
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
   auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
   auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
 
-  auto duck_host       = copy_bool_column_to_host(duck_out->view().column(0));
   auto hand_host       = copy_bool_column_to_host(hand_out->view().column(0));
   auto translated_host = copy_bool_column_to_host(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
   REQUIRE(hand_host == translated_host);
 }
 
@@ -577,14 +551,11 @@ TEST_CASE("ast_equivalence - case_expr WHEN/THEN/ELSE (MATERIALIZE)",
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
 
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
   auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
   auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
 
-  auto duck_host       = copy_column_to_host<int32_t>(duck_out->view().column(0));
   auto hand_host       = copy_column_to_host<int32_t>(hand_out->view().column(0));
   auto translated_host = copy_column_to_host<int32_t>(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
   REQUIRE(hand_host == translated_host);
 }
 
@@ -607,14 +578,11 @@ TEST_CASE("ast_equivalence - cast INTEGER->BIGINT (MATERIALIZE)", "[gpu_expressi
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
 
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
   auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
   auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
 
-  auto duck_host       = copy_column_to_host<int64_t>(duck_out->view().column(0));
   auto hand_host       = copy_column_to_host<int64_t>(hand_out->view().column(0));
   auto translated_host = copy_column_to_host<int64_t>(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
   REQUIRE(hand_host == translated_host);
 }
 
@@ -646,14 +614,11 @@ TEST_CASE("ast_equivalence - unary_op NOT (MATERIALIZE)", "[gpu_expression_execu
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
 
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
   auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
   auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
 
-  auto duck_host       = copy_bool_column_to_host(duck_out->view().column(0));
   auto hand_host       = copy_bool_column_to_host(hand_out->view().column(0));
   auto translated_host = copy_bool_column_to_host(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
   REQUIRE(hand_host == translated_host);
 }
 
@@ -675,14 +640,11 @@ TEST_CASE("ast_equivalence - unary_op IS_NULL (MATERIALIZE)", "[gpu_expression_e
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
 
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
   auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
   auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
 
-  auto duck_host       = copy_bool_column_to_host(duck_out->view().column(0));
   auto hand_host       = copy_bool_column_to_host(hand_out->view().column(0));
   auto translated_host = copy_bool_column_to_host(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
   REQUIRE(hand_host == translated_host);
 }
 
@@ -704,14 +666,11 @@ TEST_CASE("ast_equivalence - unary_op IS_NOT_NULL (MATERIALIZE)", "[gpu_expressi
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
 
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
   auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
   auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
 
-  auto duck_host       = copy_bool_column_to_host(duck_out->view().column(0));
   auto hand_host       = copy_bool_column_to_host(hand_out->view().column(0));
   auto translated_host = copy_bool_column_to_host(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
   REQUIRE(hand_host == translated_host);
 }
 
@@ -720,9 +679,9 @@ TEST_CASE("ast_equivalence - unary_op TRY translation (no exec)", "[gpu_expressi
   // OPERATOR_TRY is recognized by the AST surface but not executable by the
   // current gpu_expression_executor (it throws on dispatch through
   // gpu_execute_operator.cpp). Verify only the translation half of the contract
-  // for this kind: the three legs translate to AST shapes with matching unary_op
-  // kinds. Execution coverage is intentionally omitted until the underlying
-  // OPERATOR_TRY specialization lands.
+  // for this kind: the translated node has the expected unary_op kind and round-
+  // trips back to OPERATOR_TRY. Execution coverage is intentionally omitted until
+  // the underlying OPERATOR_TRY specialization lands.
   auto duck_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_TRY,
                                                               LogicalType{LogicalTypeId::INTEGER});
   duck_expr->children.push_back(duck_int_ref(0));
@@ -763,14 +722,11 @@ TEST_CASE("ast_equivalence - coalesce (MATERIALIZE)", "[gpu_expression_executor_
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
 
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
   auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
   auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
 
-  auto duck_host       = copy_column_to_host<int32_t>(duck_out->view().column(0));
   auto hand_host       = copy_column_to_host<int32_t>(hand_out->view().column(0));
   auto translated_host = copy_column_to_host<int32_t>(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
   REQUIRE(hand_host == translated_host);
 }
 
@@ -803,14 +759,11 @@ TEST_CASE("ast_equivalence - in_list IN (MATERIALIZE)", "[gpu_expression_executo
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
 
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
   auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
   auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
 
-  auto duck_host       = copy_bool_column_to_host(duck_out->view().column(0));
   auto hand_host       = copy_bool_column_to_host(hand_out->view().column(0));
   auto translated_host = copy_bool_column_to_host(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
   REQUIRE(hand_host == translated_host);
 }
 
@@ -839,14 +792,11 @@ TEST_CASE("ast_equivalence - in_list IN (AST_INTERPRET)", "[gpu_expression_execu
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
 
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, AST_I);
   auto hand_out       = run_one(*space, hand_ast.get(), tv, AST_I);
   auto translated_out = run_one(*space, translated_ast.get(), tv, AST_I);
 
-  auto duck_host       = copy_bool_column_to_host(duck_out->view().column(0));
   auto hand_host       = copy_bool_column_to_host(hand_out->view().column(0));
   auto translated_host = copy_bool_column_to_host(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
   REQUIRE(hand_host == translated_host);
 }
 
@@ -882,14 +832,11 @@ TEST_CASE("ast_equivalence - function_call add (MATERIALIZE)", "[gpu_expression_
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
 
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
   auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
   auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
 
-  auto duck_host       = copy_column_to_host<int32_t>(duck_out->view().column(0));
   auto hand_host       = copy_column_to_host<int32_t>(hand_out->view().column(0));
   auto translated_host = copy_column_to_host<int32_t>(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
   REQUIRE(hand_host == translated_host);
 }
 
@@ -921,13 +868,10 @@ TEST_CASE("ast_equivalence - function_call add (AST_INTERPRET)", "[gpu_expressio
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
 
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, AST_I);
   auto hand_out       = run_one(*space, hand_ast.get(), tv, AST_I);
   auto translated_out = run_one(*space, translated_ast.get(), tv, AST_I);
 
-  auto duck_host       = copy_column_to_host<int32_t>(duck_out->view().column(0));
   auto hand_host       = copy_column_to_host<int32_t>(hand_out->view().column(0));
   auto translated_host = copy_column_to_host<int32_t>(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
   REQUIRE(hand_host == translated_host);
 }
