@@ -18,6 +18,7 @@
 
 #include <duckdb/main/connection.hpp>
 
+#include <filesystem>
 #include <string>
 
 namespace sirius::test {
@@ -46,5 +47,33 @@ namespace sirius::test {
 //! Throws on parse / bind / optimize errors. Iceberg queries are not supported
 //! (no engine-side prefetch is performed) — TPC-H queries are unaffected.
 std::string convert_query_to_dump(duckdb::Connection& con, const std::string& query);
+
+//! RAII guard that captures and restores the value of
+//! `duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD`. The flag is a process-wide
+//! static; differential tests must restore it so other Catch2 test cases observe
+//! the default.
+class tree_pipeline_flag_guard {
+ public:
+  tree_pipeline_flag_guard();
+  ~tree_pipeline_flag_guard();
+
+  tree_pipeline_flag_guard(const tree_pipeline_flag_guard&)            = delete;
+  tree_pipeline_flag_guard& operator=(const tree_pipeline_flag_guard&) = delete;
+
+ private:
+  bool original_;
+};
+
+//! Toggle `USE_TREE_BASED_PIPELINE_BUILD` to `flag`, then call `convert_query_to_dump`.
+//! Wrap call sites with a `tree_pipeline_flag_guard` so the flag is restored on exit.
+std::string dump_under_flag(duckdb::Connection& con, const std::string& query, bool flag);
+
+//! Path to the 22 canonical TPC-H queries checked into the repo
+//! (`test/tpch_performance/tpch_queries/orig/`).
+std::filesystem::path tpch_queries_dir();
+
+//! Read the canonical TPC-H query `q` (1..22) from `tpch_queries_dir()`.
+//! `REQUIRE`s that the file exists.
+std::string read_tpch_query_file(int q);
 
 }  // namespace sirius::test

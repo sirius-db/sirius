@@ -15,32 +15,18 @@
  */
 
 #include <catch.hpp>
-#include <config.hpp>
 #include <duckdb.hpp>
-#include <pipeline/sirius_pipeline_converter.hpp>
 #include <utils/pipeline_conversion_test_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 
 #include <filesystem>
 #include <fstream>
 #include <set>
-#include <sstream>
 #include <string>
 
 namespace fs = std::filesystem;
 
 namespace {
-
-//! Path to the canonical 22 TPC-H queries committed to the repo.
-fs::path tpch_queries_dir()
-{
-#ifdef SIRIUS_PROJECT_ROOT
-  return fs::path(SIRIUS_PROJECT_ROOT) / "test/tpch_performance/tpch_queries/orig";
-#else
-  return fs::path(__FILE__).parent_path().parent_path().parent_path() /
-         "test/tpch_performance/tpch_queries/orig";
-#endif
-}
 
 //! Path to the integration DuckDB with the TPC-H schema pre-loaded (also used by
 //! `GPUExecutionDuckDBFixture` in test_gpu_execution_tpch.cpp).
@@ -52,37 +38,6 @@ fs::path integration_db_path()
   return fs::path(__FILE__).parent_path().parent_path() /
          "integration/data/duckdb/integration.duckdb";
 #endif
-}
-
-std::string read_query_file(int q)
-{
-  auto path = tpch_queries_dir() / ("q" + std::to_string(q) + ".sql");
-  std::ifstream in(path);
-  REQUIRE(in.good());
-  std::ostringstream ss;
-  ss << in.rdbuf();
-  return ss.str();
-}
-
-//! Capture the current value of `USE_TREE_BASED_PIPELINE_BUILD` and restore it on
-//! destruction. The flag is process-wide static so tests that toggle it must restore
-//! to avoid contaminating other test cases.
-class tree_pipeline_flag_guard {
- public:
-  tree_pipeline_flag_guard() : original_(duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {}
-  ~tree_pipeline_flag_guard() { duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD = original_; }
-
-  tree_pipeline_flag_guard(const tree_pipeline_flag_guard&)            = delete;
-  tree_pipeline_flag_guard& operator=(const tree_pipeline_flag_guard&) = delete;
-
- private:
-  bool original_;
-};
-
-std::string dump_under_flag(duckdb::Connection& con, const std::string& query, bool flag)
-{
-  duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD = flag;
-  return sirius::test::convert_query_to_dump(con, query);
 }
 
 }  // namespace
@@ -114,7 +69,7 @@ TEST_CASE("TPC-H SF1: legacy and tree-based converters produce identical pipelin
   REQUIRE(r);
   REQUIRE_FALSE(r->HasError());
 
-  tree_pipeline_flag_guard flag_guard;
+  sirius::test::tree_pipeline_flag_guard flag_guard;
 
   // Differential gate for the tree-based pipeline build (#604, sub-phase E.1).
   // Empty set means all 22 TPC-H queries produce byte-identical dumps under both
@@ -126,10 +81,10 @@ TEST_CASE("TPC-H SF1: legacy and tree-based converters produce identical pipelin
     if (kKnownFailing.count(q) != 0) { continue; }
     DYNAMIC_SECTION("q" << q)
     {
-      auto query = read_query_file(q);
+      auto query = sirius::test::read_tpch_query_file(q);
 
-      auto legacy_dump = dump_under_flag(con, query, /*flag=*/false);
-      auto tree_dump   = dump_under_flag(con, query, /*flag=*/true);
+      auto legacy_dump = sirius::test::dump_under_flag(con, query, /*flag=*/false);
+      auto tree_dump   = sirius::test::dump_under_flag(con, query, /*flag=*/true);
 
       if (legacy_dump != tree_dump) {
         // Write both dumps to /tmp for clean external diffing — Catch2's INFO

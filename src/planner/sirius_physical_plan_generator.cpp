@@ -139,12 +139,19 @@ std::unique_ptr<sirius::op::scan::parquet_scan_info> build_parquet_scan_info(
   return info;
 }
 
-//! Attach a leaf GPU scan operator as the only child of a TABLE_SCAN, mirroring today's
-//! `sirius_pipeline_converter::split_table_scan_source` and `insert_parquet_scan_operator`
-//! (which construct the same operators as separate pipelines at runtime instead of nesting
-//! them in the tree). In the tree-based path the leaf lives in the plan tree from plan time
-//! so `build_pipelines` can derive the scan pipeline structurally rather than via runtime
-//! mutation.
+//! Rewrite a TABLE_SCAN node so the tree-based converter's `build_pipelines` walk produces
+//! the same pipeline shape the legacy converter assembles at runtime.
+//!
+//! - For `parquet_scan` / `read_parquet`: the legacy
+//!   `sirius_pipeline_converter::insert_parquet_scan_operator` inserts the GPU scan at the
+//!   front of the *same* pipeline as the TABLE_SCAN's downstream operators (no extra
+//!   pipeline). We mirror that here by REPLACING the slot's TABLE_SCAN with the GPU leaf —
+//!   the leaf inherits TABLE_SCAN's position in the plan tree so the walk treats it as the
+//!   source-leaf of the existing pipeline, matching the legacy dump.
+//! - For `seq_scan` and `iceberg_scan`: the legacy
+//!   `sirius_pipeline_converter::split_table_scan_source` creates a *new* pipeline. We
+//!   reproduce that by attaching the GPU leaf as the TABLE_SCAN's only child so the walk
+//!   spins up a child meta-pipeline for it (the wrap pipeline).
 //!
 //! For `iceberg_scan`, attaches the pre-fetched `IcebergDeleteData` from
 //! `iceberg_delete_data_cache_` so the GPU operator sees the delete-merge set on every read.
@@ -155,7 +162,7 @@ std::unique_ptr<sirius::op::scan::parquet_scan_info> build_parquet_scan_info(
 //! Throws on truly unsupported scan functions to match `construct_sirius_specific_operator`'s
 //! behavior at converter line 80.
 void wrap_table_scan_source(
-  sirius::op::sirius_physical_operator& table_scan_op,
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator>& table_scan_slot,
   const std::unordered_map<std::string, std::shared_ptr<const sirius::op::scan::IcebergDeleteData>>&
     iceberg_cache,
   const sirius::operator_params& op_params)
@@ -163,18 +170,24 @@ void wrap_table_scan_source(
   // Table-in-out functions wear a TABLE_SCAN with children — skip per the master plan's
   // exclusion rule. Wrapping them would change their child layout in a way the converter
   // and downstream operators don't expect.
-  if (!table_scan_op.children.empty()) { return; }
+  if (!table_scan_slot->children.empty()) { return; }
 
-  auto& scan     = table_scan_op.Cast<sirius::op::sirius_physical_table_scan>();
+  auto& scan     = table_scan_slot->Cast<sirius::op::sirius_physical_table_scan>();
   const auto& fn = scan.function.name;
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> leaf;
+  bool replace_slot = false;
   if (fn == "seq_scan") {
     leaf = duckdb::make_uniq<sirius::op::sirius_physical_duckdb_scan>(&scan);
   } else if (fn == "parquet_scan" || fn == "read_parquet") {
     auto info = build_parquet_scan_info(scan, op_params);
     leaf      = duckdb::make_uniq<sirius::op::scan::sirius_gpu_parquet_scan_operator>(
       scan.types, scan.estimated_cardinality, std::move(info));
+    // Parquet: legacy inlines GPU_PARQUET_SCAN into the current pipeline, so replace the
+    // TABLE_SCAN in place rather than attaching as a child (which would make build_pipelines
+    // spin up a separate wrap pipeline). The TABLE_SCAN object is dropped — its bind_data
+    // and metadata have already been lifted into the parquet_scan_info.
+    replace_slot = true;
   } else if (fn == "iceberg_scan") {
     auto iceberg_scan = duckdb::make_uniq<sirius::op::sirius_physical_iceberg_scan>(&scan);
     if (!scan.parameters.empty()) {
@@ -187,7 +200,11 @@ void wrap_table_scan_source(
     throw std::runtime_error(
       "[sirius_physical_plan_generator::wrap_table_scan_source] Unsupported scan function: " + fn);
   }
-  table_scan_op.children.push_back(std::move(leaf));
+  if (replace_slot) {
+    table_scan_slot = std::move(leaf);
+  } else {
+    table_scan_slot->children.push_back(std::move(leaf));
+  }
 }
 
 //! Attach a leaf CPU_SOURCE operator as the only child of a COLUMN_DATA_SCAN (with non-null
@@ -557,7 +574,7 @@ void insert_gpu_pipeline_operators_recursive(
 
   switch (slot->type) {
     case sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN:
-      wrap_table_scan_source(*slot, iceberg_cache, op_params);
+      wrap_table_scan_source(slot, iceberg_cache, op_params);
       break;
     case sirius::op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN:
     case sirius::op::SiriusPhysicalOperatorType::EMPTY_RESULT: wrap_cpu_source(*slot); break;

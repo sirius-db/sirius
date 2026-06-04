@@ -16,6 +16,7 @@
 
 #include "utils/pipeline_conversion_test_utils.hpp"
 
+#include "config.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -32,6 +33,10 @@
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
 #include <duckdb/planner/planner.hpp>
+
+#include <fstream>
+#include <sstream>
+#include <stdexcept>
 
 namespace sirius::test {
 
@@ -164,6 +169,44 @@ std::string convert_query_to_dump(duckdb::Connection& con, const std::string& qu
   // operators (PARTITION, CONCAT, MERGE_*) are owned by result.inserted_operators_, but the
   // tree path (flag ON) has no inserted_operators_ at all — everything dangles.
   return pipeline::dump_pipeline_conversion_result(result);
+}
+
+tree_pipeline_flag_guard::tree_pipeline_flag_guard()
+  : original_(duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD)
+{
+}
+
+tree_pipeline_flag_guard::~tree_pipeline_flag_guard()
+{
+  duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD = original_;
+}
+
+std::string dump_under_flag(duckdb::Connection& con, const std::string& query, bool flag)
+{
+  duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD = flag;
+  return convert_query_to_dump(con, query);
+}
+
+std::filesystem::path tpch_queries_dir()
+{
+#ifdef SIRIUS_PROJECT_ROOT
+  return std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test/tpch_performance/tpch_queries/orig";
+#else
+  return std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path() /
+         "test/tpch_performance/tpch_queries/orig";
+#endif
+}
+
+std::string read_tpch_query_file(int q)
+{
+  auto path = tpch_queries_dir() / ("q" + std::to_string(q) + ".sql");
+  std::ifstream in(path);
+  if (!in.good()) {
+    throw std::runtime_error("[read_tpch_query_file] failed to open " + path.string());
+  }
+  std::ostringstream ss;
+  ss << in.rdbuf();
+  return ss.str();
 }
 
 }  // namespace sirius::test

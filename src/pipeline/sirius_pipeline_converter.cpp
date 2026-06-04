@@ -1174,8 +1174,10 @@ std::string_view sirius_pipeline_converter::resolve_port_id(
     return sink.Cast<op::sirius_physical_concat>().is_build_concat() ? "build" : "default";
   }
   // Leaf scans push splits onto the "scan" port of the next operator.
-  if (sink.type == T::DUCKDB_SCAN || sink.type == T::ICEBERG_SCAN ||
-      sink.type == T::GPU_PARQUET_SCAN || sink.type == T::CPU_SOURCE) {
+  // GPU_PARQUET_SCAN is intentionally excluded — legacy treats it as a regular
+  // intermediate operator with the "default" port (see compute_repository_wiring's
+  // catch-all branch). Adding it here would diverge from the legacy wiring shape.
+  if (sink.type == T::DUCKDB_SCAN || sink.type == T::ICEBERG_SCAN || sink.type == T::CPU_SOURCE) {
     return "scan";
   }
   return "default";
@@ -1186,9 +1188,10 @@ op::MemoryBarrierType sirius_pipeline_converter::resolve_barrier(
 {
   using T = op::SiriusPhysicalOperatorType;
   // Sort/scan/sample sinks process batches as they arrive — no barrier required.
+  // GPU_PARQUET_SCAN is intentionally excluded — legacy emits FULL/PARTIAL for it via
+  // the catch-all branch in compute_repository_wiring, not PIPELINE.
   if (sink.type == T::ORDER_BY || sink.type == T::SORT_SAMPLE || sink.type == T::DUCKDB_SCAN ||
-      sink.type == T::ICEBERG_SCAN || sink.type == T::GPU_PARQUET_SCAN ||
-      sink.type == T::CPU_SOURCE) {
+      sink.type == T::ICEBERG_SCAN || sink.type == T::CPU_SOURCE) {
     return op::MemoryBarrierType::PIPELINE;
   }
   // Producers that feed CONCAT can drain incrementally (PARTIAL); otherwise wait
