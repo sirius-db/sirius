@@ -18,9 +18,11 @@
 
 #include "config.hpp"
 #include "duckdb/common/helper.hpp"
+#include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "io/s3/s3_blocking_ioctx.hpp"
 #include "io/s3/sirius_sigv4_authorizer.hpp"
@@ -30,6 +32,7 @@
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "sirius_sql_rewrite.hpp"
 #include "transparent/physical_sirius_execution.hpp"
 
 #include <cudf/utilities/pinned_memory.hpp>
@@ -855,6 +858,53 @@ void SiriusContext::record_transparent_execution() noexcept
   transparent_execution_count_.fetch_add(1, std::memory_order_relaxed);
 }
 
+namespace {
+// True when any LogicalGet in the plan reads an s3:// path. Native read_parquet /
+// parquet_scan carry a MultiFileBindData with the resolved file list (this is the
+// transparent path the bind-only Sirius S3 FileSystem enables).
+bool logical_plan_reads_s3(duckdb::LogicalOperator const& op)
+{
+  if (op.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+    auto const& get = op.Cast<duckdb::LogicalGet>();
+    if (auto const* mf = dynamic_cast<duckdb::MultiFileBindData const*>(get.bind_data.get())) {
+      if (mf->file_list) {
+        for (auto const& file : mf->file_list->GetAllFiles()) {
+          auto const& p = file.path;
+          if (p.size() > 5 && (p[0] == 's' || p[0] == 'S') && p[1] == '3' && p[2] == ':' &&
+              p[3] == '/' && p[4] == '/') {
+            return true;
+          }
+        }
+      }
+    }
+  }
+  for (auto const& child : op.children) {
+    if (logical_plan_reads_s3(*child)) { return true; }
+  }
+  return false;
+}
+
+// S3 is GPU-only. When a transparent query that reads s3:// fails on the GPU
+// path, refuse to fall back to CPU: DuckDB's CPU read_parquet would re-read the
+// s3:// data through the bind-only Sirius FileSystem, which is exactly the CPU
+// fallback S3 does not support. Detection is plan-based (the SQL text is not
+// reliably available during prepare); references_sirius_owned_s3_parquet on the
+// query text is a secondary signal. Non-s3 (local) queries fall through to the
+// normal CPU fallback. Surfaces the same clear error the gpu_execution(...) path
+// raises (run_internal_cpu_fallback_query).
+void throw_if_s3_no_cpu_fallback(bool plan_reads_s3,
+                                 std::string const& query_sql,
+                                 std::string const& gpu_error)
+{
+  if (plan_reads_s3 || sirius::references_sirius_owned_s3_parquet(query_sql)) {
+    throw std::runtime_error(
+      "S3 CPU fallback is not supported: this query reads s3:// data, GPU execution failed, and "
+      "Sirius has no CPU fallback for S3 data sources. Underlying GPU error: " +
+      gpu_error);
+  }
+}
+}  // namespace
+
 RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
                                                  PreparedStatementData& prepared,
                                                  PreparedStatementMode mode)
@@ -912,16 +962,25 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       Optimizer optimizer(*planner.binder, context);
       logical_plan = optimizer.Optimize(std::move(planner.plan));
     } catch (NotImplementedException& e) {
+      // No captured plan to inspect on the replan path; guard on the SQL text so
+      // a direct read_parquet('s3://') that fails to re-plan does not CPU-fall-back.
+      throw_if_s3_no_cpu_fallback(false, current_query_sql, e.what());
       record_transparent_fallback();
       SIRIUS_LOG_INFO("Transparent execution fallback (replan unsupported): {}", e.what());
       return RebindQueryInfo::DO_NOT_REBIND;
     } catch (std::exception& e) {
+      throw_if_s3_no_cpu_fallback(false, current_query_sql, e.what());
       record_transparent_fallback();
       SIRIUS_LOG_INFO("Transparent execution fallback (replan failed): {}", e.what());
       return RebindQueryInfo::DO_NOT_REBIND;
     }
     if (!logical_plan) { return RebindQueryInfo::DO_NOT_REBIND; }
   }
+
+  // Detect an s3:// read from the plan now, while logical_plan is still intact
+  // (create_plan below consumes it). S3 is GPU-only: if GPU translation fails we
+  // must NOT fall back to CPU for s3:// (see throw_if_s3_no_cpu_fallback).
+  bool const plan_reads_s3 = logical_plan_reads_s3(*logical_plan);
 
   try {
     // Validate that the captured logical plan is GPU-translatable before we
@@ -964,9 +1023,11 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
 
     SIRIUS_LOG_INFO("Transparent execution: physical plan replaced with GPU operator");
   } catch (NotImplementedException& e) {
+    throw_if_s3_no_cpu_fallback(plan_reads_s3, current_query_sql, e.what());
     record_transparent_fallback();
     SIRIUS_LOG_INFO("Transparent execution fallback (unsupported): {}", e.what());
   } catch (std::exception& e) {
+    throw_if_s3_no_cpu_fallback(plan_reads_s3, current_query_sql, e.what());
     record_transparent_fallback();
     SIRIUS_LOG_INFO("Transparent execution fallback: {}", e.what());
   }

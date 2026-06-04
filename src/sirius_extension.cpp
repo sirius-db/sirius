@@ -63,6 +63,7 @@ extern "C" int cudaProfilerStop();
 #include "gpu_physical_plan_generator.hpp"
 #endif
 #include "duckdb/main/connection_manager.hpp"
+#include "io/s3/sirius_s3_filesystem.hpp"
 #include "log/logging.hpp"
 #include "pin_table.hpp"
 #include "sirius_context.hpp"
@@ -1678,12 +1679,16 @@ static void LoadInternal(ExtensionLoader& loader)
   SiriusExtension::InitialGPUConfigs(config);
   SiriusExtension::RegisterGPUFunctions(db);
 
-  // S3 CPU fallback is not supported: there is no DuckDB CPU FileSystem for
-  // s3://. S3 parquet is read only on the GPU path (read_parquet('s3://…') is
-  // rewritten to sirius_read_parquet -> describe_parquet -> cuDF via s3_ioctx).
-  // A query that reads s3:// and fails on GPU surfaces a clear "S3 CPU fallback
-  // is not supported" error (see run_internal_cpu_fallback_query); local reads
-  // still fall back to DuckDB's CPU execution.
+  // Register a bind-only s3:// FileSystem so DuckDB's NATIVE read_parquet can
+  // bind `read_parquet('s3://…')` (footer read via s3_ioctx) under transparent
+  // `SET gpu_execution=true` — no httpfs, no sirius_read_parquet rewrite. The
+  // resulting native scan is captured by the transparent optimizer hook and run
+  // on GPU, where column data is read via s3_ioctx (not this FileSystem). It is
+  // strictly GPU-only: OpenFile refuses s3:// unless gpu_execution is enabled,
+  // and a query that reads s3:// but fails on GPU surfaces a clear "S3 CPU
+  // fallback is not supported" error (OnFinalizePrepare / the gpu_execution(...)
+  // path). Local reads still fall back to DuckDB's CPU execution.
+  db.GetFileSystem().RegisterSubSystem(make_uniq<sirius::io::s3::sirius_s3_filesystem>());
 
   // Register optimizer extension for transparent GPU execution.
   // Pre-hook disables incompatible optimizers; post-hook captures the plan.

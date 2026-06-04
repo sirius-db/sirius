@@ -360,6 +360,14 @@ std::string gpu_execution_sql(std::string const& inner_sql)
   return "SELECT * FROM gpu_execution('" + escaped + "')";
 }
 
+void set_gpu_execution(duckdb::Connection& con, bool enabled)
+{
+  auto result = con.Query(std::string{"SET gpu_execution = "} + (enabled ? "true" : "false"));
+  REQUIRE(result);
+  INFO((result->HasError() ? result->GetError() : ""));
+  REQUIRE_FALSE(result->HasError());
+}
+
 std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result)
 {
   std::vector<std::vector<std::string>> rows;
@@ -1321,7 +1329,7 @@ TEST_CASE("gpu_execution S3 nested parquet probe returns oracle rows or a clear 
   check_rows_equal_with_tolerant_columns(*materialized, *baseline_result, {});
 }
 
-TEST_CASE("gpu_execution S3 nested parquet projections match local DuckDB CPU",
+TEST_CASE("transparent S3 nested parquet projections match local DuckDB CPU",
           "[.][s3][integration][sql][gpu_execution][nested]")
 {
   auto env = read_s3_test_env();
@@ -1341,6 +1349,7 @@ TEST_CASE("gpu_execution S3 nested parquet projections match local DuckDB CPU",
   }};
 
   s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
   duckdb::DuckDB baseline_db(nullptr);
   duckdb::Connection baseline_con(baseline_db);
 
@@ -1350,7 +1359,7 @@ TEST_CASE("gpu_execution S3 nested parquet projections match local DuckDB CPU",
     auto const local_query = "SELECT " + std::string{test_case.select_list} + " FROM " +
                              local_parquet_scan(test_case.table) + " ORDER BY id";
 
-    auto s3_result       = require_query_ok(fixture.con, gpu_execution_sql(s3_query));
+    auto s3_result       = require_query_ok(fixture.con, s3_query);
     auto baseline_result = require_query_ok(baseline_con, local_query);
 
     INFO("table=" << test_case.table);
@@ -1501,18 +1510,19 @@ TEST_CASE("gpu_execution aggregates real AWS S3 parquet through Sirius SigV4",
   }
 }
 
-TEST_CASE("gpu_execution S3 window query reports unsupported S3 CPU fallback",
+TEST_CASE("transparent S3 window query reports unsupported S3 CPU fallback",
           "[.][s3][integration][sql][gpu_execution][fallback]")
 {
   auto env = read_s3_test_env();
   if (skip_if_no_s3_env(env)) { return; }
 
   s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
   auto const s3_query =
     "SELECT n_nationkey, ROW_NUMBER() OVER (ORDER BY n_nationkey) AS rn "
     "FROM " +
     s3_parquet_scan(*env, "nation") + " ORDER BY n_nationkey";
-  auto result = fixture.con.Query(gpu_execution_sql(s3_query));
+  auto result = fixture.con.Query(s3_query);
   REQUIRE(result);
   REQUIRE(result->HasError());
   auto const error = result->GetError();
@@ -1522,22 +1532,6 @@ TEST_CASE("gpu_execution S3 window query reports unsupported S3 CPU fallback",
          error.find("WINDOW") != std::string::npos));
   CHECK(error.find("No filesystem") == std::string::npos);
   CHECK(error.find("no filesystem") == std::string::npos);
-}
-
-TEST_CASE("DuckDB CPU read_parquet does not register a Sirius S3 filesystem",
-          "[.][s3][integration][sql][filesystem]")
-{
-  auto env = read_s3_test_env();
-  if (skip_if_no_s3_env(env)) { return; }
-
-  s3_sql_fixture fixture(*env);
-  auto const uri = s3_uri(env->bucket, "parquet/nation.parquet");
-  auto result    = fixture.con.Query("SELECT count(*) FROM read_parquet('" + uri + "')");
-  REQUIRE(result);
-  REQUIRE(result->HasError());
-  auto const error = result->GetError();
-  INFO(error);
-  CHECK((error.find("s3") != std::string::npos || error.find("S3") != std::string::npos));
 }
 
 TEST_CASE("gpu_execution S3 SQL surface returns empty result sets cleanly",
