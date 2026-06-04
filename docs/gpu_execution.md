@@ -50,6 +50,38 @@ GROUP BY l_returnflag, l_linestatus
 ORDER BY l_returnflag, l_linestatus');
 ```
 
+### Transparent Execution
+
+When `gpu_execution` is enabled (the default after loading the extension), all DuckDB queries are automatically intercepted by the optimizer hook and run on GPU — no `CALL gpu_execution('...')` wrapper needed:
+
+```sql
+-- Plain SQL, runs on GPU automatically
+SELECT
+    l_returnflag,
+    l_linestatus,
+    sum(l_quantity) as sum_qty,
+    sum(l_extendedprice) as sum_base_price,
+    sum(l_extendedprice * (1 - l_discount)) as sum_disc_price
+FROM lineitem
+WHERE l_shipdate <= date '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+```
+
+Queries with unsupported operators fall back silently to DuckDB CPU execution. To disable transparent execution for a connection:
+
+```sql
+SET gpu_execution = false;
+```
+
+To re-enable:
+
+```sql
+SET gpu_execution = true;
+```
+
+**How it works:** Two optimizer extensions are registered at extension load time. A pre-optimizer hook disables DuckDB optimizers incompatible with Sirius (such as `IN_CLAUSE`, `COMPRESSED_MATERIALIZATION`, and `LATE_MATERIALIZATION`). A post-optimizer hook captures the optimized logical plan and attempts GPU plan generation via `sirius_physical_plan_generator`. If plan generation succeeds, a `PhysicalSiriusExecution` node replaces the DuckDB physical plan and the query runs on GPU; if plan generation throws, the original DuckDB CPU plan runs unchanged.
+
 ## Generating Test Datasets
 
 For TPC-H benchmarking, use the provided data generation script:

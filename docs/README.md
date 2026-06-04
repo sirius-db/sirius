@@ -32,7 +32,20 @@ Running TPC-H on 1TB data, Sirius accelerates DuckDB by 5x on DGX Station (GB300
 
 ## Building and Running Sirius
 
-Sirius provides two execution paths. See each page for how to build, run, and test:
+After loading the extension, all DuckDB queries are automatically intercepted by the optimizer hook and run on GPU — no query rewrites required. Queries with unsupported operators fall back silently to CPU.
+
+```sql
+-- Plain SQL runs on GPU once the extension is loaded
+SELECT l_returnflag, sum(l_quantity)
+FROM lineitem
+GROUP BY l_returnflag
+ORDER BY l_returnflag;
+
+-- Disable transparent GPU execution for this connection
+SET gpu_execution = false;
+```
+
+Two execution paths are available. See each page for build, configuration, and testing details:
 
 - **[`gpu_execution`](gpu_execution.md) (Recommended)** — Out-of-core execution with tiered memory management (GPU/host/disk), automatic data partitioning, and spilling. Works with **Parquet** data format.
 - **[`gpu_processing`](gpu_processing.md)** — In-memory execution where the dataset must fit in GPU memory. Works with DuckDB's native storage format.
