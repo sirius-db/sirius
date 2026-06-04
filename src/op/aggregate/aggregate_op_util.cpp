@@ -67,8 +67,8 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
 
   // 1. Extract group_idx from groups_p
   for (const auto& group : groups_p) {
-    auto const& ref = sirius::ast::require_reference(group.get(),
-                                                     "convert_duckdb_aggregates_to_cudf group");
+    auto const& ref =
+      sirius::ast::require_reference(group.get(), "convert_duckdb_aggregates_to_cudf group");
     result.group_idx.push_back(static_cast<int>(ref.column_index));
   }
 

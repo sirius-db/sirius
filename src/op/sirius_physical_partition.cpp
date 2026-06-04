@@ -85,10 +85,8 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
           condition.comparison != sirius::comparison_type::not_distinct_from) {
         continue;
       }
-      auto left_owned =
-        sirius::ast::to_duckdb(*hash_join_op.conditions[cond_idx].left);
-      auto right_owned =
-        sirius::ast::to_duckdb(*hash_join_op.conditions[cond_idx].right);
+      auto left_owned  = sirius::ast::to_duckdb(*hash_join_op.conditions[cond_idx].left);
+      auto right_owned = sirius::ast::to_duckdb(*hash_join_op.conditions[cond_idx].right);
       std::optional<std::size_t> left_index  = extract_bound_ref_index(*left_owned);
       std::optional<std::size_t> right_index = extract_bound_ref_index(*right_owned);
       if (left_index.has_value() && right_index.has_value()) {

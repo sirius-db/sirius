@@ -126,7 +126,10 @@ TEST_CASE("RIGHT_DELIM_JOIN: concatenates partition_join then distinct ports",
     duckdb::make_uniq<sirius_physical_partition>(empty_types, 0, fake_parent.get());
 
   auto distinct = duckdb::make_uniq<sirius_physical_grouped_aggregate>(
-    empty_types, duckdb::vector<std::unique_ptr<sirius::ast::node>>{}, duckdb::vector<std::unique_ptr<sirius::ast::node>>{}, 0);
+    empty_types,
+    duckdb::vector<std::unique_ptr<sirius::ast::node>>{},
+    duckdb::vector<std::unique_ptr<sirius::ast::node>>{},
+    0);
 
   sirius_physical_operator partition_consumer_x;
   sirius_physical_operator partition_consumer_y;
@@ -171,7 +174,10 @@ TEST_CASE("LEFT_DELIM_JOIN: concatenates column_data_scan then distinct ports",
     empty_types, SiriusPhysicalOperatorType::COLUMN_DATA_SCAN, 0, static_cast<std::size_t>(0));
 
   auto distinct = duckdb::make_uniq<sirius_physical_grouped_aggregate>(
-    empty_types, duckdb::vector<std::unique_ptr<sirius::ast::node>>{}, duckdb::vector<std::unique_ptr<sirius::ast::node>>{}, 0);
+    empty_types,
+    duckdb::vector<std::unique_ptr<sirius::ast::node>>{},
+    duckdb::vector<std::unique_ptr<sirius::ast::node>>{},
+    0);
 
   sirius_physical_operator scan_consumer;
   sirius_physical_operator distinct_consumer_p;

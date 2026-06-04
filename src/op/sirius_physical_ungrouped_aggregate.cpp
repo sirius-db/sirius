@@ -120,8 +120,7 @@ aggregate_layout build_aggregate_layout(
   layout.aggregates.reserve(aggregates.size());
 
   for (size_t i = 0; i < aggregates.size(); ++i) {
-    auto const& agg =
-      sirius::ast::require_aggregate(aggregates[i].get(), "ungrouped aggregate");
+    auto const& agg = sirius::ast::require_aggregate(aggregates[i].get(), "ungrouped aggregate");
     if (agg.distinct()) {
       throw not_implemented_exception("Distinct aggregates not supported in GPU path yet");
     }

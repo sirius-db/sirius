@@ -250,8 +250,7 @@ sirius::join_condition make_reference_join_condition(duckdb::ExpressionType comp
   // The join_condition's operands are hand-built Sirius AST reference nodes; the
   // comparison-enum mapping still goes through sirius::from_duckdb(ExpressionType),
   // which is the join_condition comparison mapper (NOT the expression from_duckdb).
-  return sirius::join_condition{
-    make_ref(0), make_ref(0), sirius::from_duckdb(comparison)};
+  return sirius::join_condition{make_ref(0), make_ref(0), sirius::from_duckdb(comparison)};
 }
 
 }  // namespace

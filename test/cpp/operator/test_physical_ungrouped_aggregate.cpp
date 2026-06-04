@@ -23,13 +23,12 @@
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <expression/ast/from_duckdb.hpp>
 #include <expression/ast/node.hpp>
-
-#include <memory>
 #include <op/sirius_physical_ungrouped_aggregate.hpp>
 #include <op/sirius_physical_ungrouped_aggregate_merge.hpp>
 
 #include <cstdint>
 #include <iterator>
+#include <memory>
 
 using namespace duckdb;
 using namespace sirius::op;
