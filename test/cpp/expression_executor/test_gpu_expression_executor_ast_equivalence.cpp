@@ -14,20 +14,28 @@
  * limitations under the License.
  */
 
-// Three-leg byte-equivalence tests for the dual-path gpu_expression_executor.
+// Byte-equivalence tests for the (now single-path) gpu_expression_executor.
 //
-// For each Sirius AST alternative, the test constructs the same expression
-// three ways:
-//   1. directly as a duckdb::BoundXxxExpression (DuckDB-direct leg)
-//   2. as a hand-built sirius::ast::node{<alt>{...}}            (hand-AST leg)
-//   3. via sirius::ast::from_duckdb(*duck_expr)                 (translator leg)
+// For each Sirius AST alternative, the test constructs the same expression two
+// ways:
+//   1. as a hand-built sirius::ast::node{<alt>{...}}            (hand-AST leg)
+//   2. via sirius::ast::from_duckdb(*duck_expr)                 (translator leg)
 //
-// All three are executed against the same input table and the output columns
-// are asserted byte-equivalent pairwise on host. Confirms the new
-// sirius::ast::node-typed executor surface produces identical output to the
-// existing duckdb::Expression-typed surface for every alternative.
+// Both are executed against the same input table through the surviving
+// sirius::ast::node-typed executor surface and the output columns are asserted
+// byte-equivalent on host. This confirms sirius::ast::from_duckdb lowers a
+// DuckDB expression into a node the executor evaluates identically to the
+// hand-built node. The DuckDB-typed executor entry that this file originally
+// exercised as a third leg was removed in Phase 9 (#702); the duckdb::BoundXxx
+// expression here now serves only as the input to from_duckdb.
+//
+// The per-case scaffolding (build input, run both legs, copy to host, assert
+// equal) is factored into expect_hand_eq_translated(); each TEST_CASE only
+// builds the DuckDB expression and the matching hand AST.
 
 // test
+#include "ast_test_support.hpp"
+
 #include <catch.hpp>
 #include <utils/utils.hpp>
 
@@ -36,22 +44,9 @@
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
-#include <expression/ast/between.hpp>
-#include <expression/ast/case_expr.hpp>
-#include <expression/ast/cast.hpp>
-#include <expression/ast/coalesce.hpp>
-#include <expression/ast/comparison.hpp>
-#include <expression/ast/conjunction.hpp>
-#include <expression/ast/constant.hpp>
 #include <expression/ast/from_duckdb.hpp>
-#include <expression/ast/function_call.hpp>
-#include <expression/ast/in_list.hpp>
 #include <expression/ast/node.hpp>
-#include <expression/ast/reference.hpp>
 #include <expression/ast/to_duckdb.hpp>
-#include <expression/ast/unary_op.hpp>
-#include <expression/function_id.hpp>
-#include <expression/join_condition.hpp>
 #include <expression/value.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <helper/logical_type.hpp>
@@ -70,24 +65,21 @@
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 
 // cudf
-#include <cudf/column/column_factories.hpp>
-#include <cudf/null_mask.hpp>
-#include <cudf/strings/strings_column_view.hpp>
+#include <cudf/types.hpp>
 
 #include <cuda_runtime_api.h>
 
 // standard library
 #include <cstdint>
 #include <memory>
-#include <numeric>
 #include <optional>
-#include <string>
 #include <utility>
 #include <vector>
 
 using namespace duckdb;
 using namespace cucascade;
 using namespace cucascade::memory;
+using namespace sirius::expr_test;
 
 namespace {
 
@@ -121,77 +113,6 @@ memory_space* get_default_gpu_space()
 rmm::device_async_resource_ref get_resource_ref(memory_space& space)
 {
   return space.get_default_allocator();
-}
-
-template <typename T>
-std::vector<T> copy_column_to_host(const cudf::column_view& col)
-{
-  std::vector<T> host(col.size());
-  if (col.size() > 0) {
-    cudaMemcpy(host.data(), col.data<T>(), sizeof(T) * col.size(), cudaMemcpyDeviceToHost);
-  }
-  return host;
-}
-
-std::vector<uint8_t> copy_bool_column_to_host(const cudf::column_view& col)
-{
-  std::vector<uint8_t> host(col.size());
-  if (col.size() > 0) {
-    cudaMemcpy(host.data(), col.head(), sizeof(uint8_t) * col.size(), cudaMemcpyDeviceToHost);
-  }
-  return host;
-}
-
-std::vector<std::string> copy_string_column_to_host(const cudf::column_view& col)
-{
-  std::vector<std::string> host;
-  if (col.size() == 0) { return host; }
-
-  cudf::strings_column_view str_col(col);
-  std::vector<cudf::size_type> offsets(col.size() + 1);
-  cudaMemcpy(offsets.data(),
-             str_col.offsets().data<cudf::size_type>(),
-             (col.size() + 1) * sizeof(cudf::size_type),
-             cudaMemcpyDeviceToHost);
-
-  std::vector<char> chars(offsets.back());
-  if (!chars.empty()) {
-    cudaMemcpy(chars.data(),
-               str_col.chars_begin(cudf::get_default_stream()),
-               offsets.back(),
-               cudaMemcpyDeviceToHost);
-  }
-
-  host.reserve(col.size());
-  for (cudf::size_type i = 0; i < col.size(); ++i) {
-    auto start = offsets[i];
-    auto end   = offsets[i + 1];
-    if (chars.empty()) {
-      host.emplace_back();
-    } else {
-      host.emplace_back(chars.data() + start, chars.data() + end);
-    }
-  }
-  return host;
-}
-
-std::vector<bool> copy_valids_to_host(const cudf::column_view& col)
-{
-  std::vector<bool> valids(col.size(), true);
-  if (!col.nullable() || col.null_count() == 0) { return valids; }
-  auto const num_words = cudf::num_bitmask_words(col.size());
-  std::vector<cudf::bitmask_type> host_mask(num_words);
-  cudaMemcpy(host_mask.data(),
-             col.null_mask(),
-             num_words * sizeof(cudf::bitmask_type),
-             cudaMemcpyDeviceToHost);
-  constexpr auto bits_per_word = sizeof(cudf::bitmask_type) * 8;
-  for (cudf::size_type i = 0; i < col.size(); ++i) {
-    auto word = host_mask[i / bits_per_word];
-    auto bit  = i % bits_per_word;
-    valids[i] = ((word >> bit) & 1U) != 0U;
-  }
-  return valids;
 }
 
 std::shared_ptr<data_batch> make_input_batch(
@@ -232,20 +153,6 @@ std::unique_ptr<cudf::table> run_one(memory_space& space,
   return executor.execute(tv);
 }
 
-// Small-node construction shortcuts.
-std::unique_ptr<sirius::ast::node> ref_node(uint32_t idx)
-{
-  return std::make_unique<sirius::ast::node>(sirius::ast::reference{idx});
-}
-
-std::unique_ptr<sirius::ast::node> int_const_node(int32_t v)
-{
-  return std::make_unique<sirius::ast::node>(sirius::ast::constant{
-    /*payload=*/sirius::value{v},
-    /*return_type=*/sirius::logical_type::make(sirius::type_id::INTEGER),
-  });
-}
-
 // DuckDB-side BoundReferenceExpression with INTEGER placeholder.
 duckdb::unique_ptr<Expression> duck_int_ref(uint32_t idx)
 {
@@ -260,6 +167,43 @@ duckdb::unique_ptr<Expression> duck_int_const(int32_t v)
     duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(v)).release());
 }
 
+// Shared scaffolding: build an input table, run the hand-built and the
+// translated AST through the executor, and assert their output columns are
+// byte-equal on host. `copy` extracts the comparable host representation of the
+// single output column (e.g. copy_column_to_host<int32_t>, copy_bool_column_to_host).
+template <class HostCopy>
+void expect_hand_eq_translated(duckdb::Expression& duck_expr,
+                               sirius::ast::node& hand_ast,
+                               std::vector<cudf::data_type> column_types,
+                               std::vector<std::optional<std::pair<int, int>>> ranges,
+                               exp_strategy_enum strategy,
+                               HostCopy copy)
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto input = make_input_batch(*space, std::move(column_types), std::move(ranges));
+  auto tv    = get_table_view(input);
+
+  auto translated_ast = sirius::ast::from_duckdb(duck_expr);
+  REQUIRE(translated_ast);
+
+  auto hand_out       = run_one(*space, &hand_ast, tv, strategy);
+  auto translated_out = run_one(*space, translated_ast.get(), tv, strategy);
+  REQUIRE(hand_out);
+  REQUIRE(translated_out);
+
+  auto hand_host       = copy(hand_out->view().column(0));
+  auto translated_host = copy(translated_out->view().column(0));
+  REQUIRE(hand_host == translated_host);
+}
+
+// Convenience: single-INT32-column input with the given value range.
+std::vector<cudf::data_type> int32_col() { return {cudf::data_type{cudf::type_id::INT32}}; }
+std::vector<std::optional<std::pair<int, int>>> range(int lo, int hi)
+{
+  return {std::pair<int, int>{lo, hi}};
+}
+
 }  // namespace
 
 // ============================================================================
@@ -268,30 +212,11 @@ duckdb::unique_ptr<Expression> duck_int_const(int32_t v)
 
 TEST_CASE("ast_equivalence - reference identity round-trip", "[gpu_expression_executor_ast]")
 {
-  auto* space = get_default_gpu_space();
-  REQUIRE(space != nullptr);
-  auto input = make_input_batch(
-    *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 100}});
-  auto tv = get_table_view(input);
-
   auto duck_expr =
     duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
-  auto hand_ast       = std::make_unique<sirius::ast::node>(sirius::ast::reference{0});
-  auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
-  REQUIRE(translated_ast);
-
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
-  auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
-  auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
-  REQUIRE(duck_out);
-  REQUIRE(hand_out);
-  REQUIRE(translated_out);
-
-  auto duck_host       = copy_column_to_host<int32_t>(duck_out->view().column(0));
-  auto hand_host       = copy_column_to_host<int32_t>(hand_out->view().column(0));
-  auto translated_host = copy_column_to_host<int32_t>(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
-  REQUIRE(hand_host == translated_host);
+  auto hand_ast = make_ref(0);
+  expect_hand_eq_translated(
+    *duck_expr, *hand_ast, int32_col(), range(0, 100), MAT, copy_column_to_host<int32_t>);
 }
 
 // ============================================================================
@@ -300,52 +225,18 @@ TEST_CASE("ast_equivalence - reference identity round-trip", "[gpu_expression_ex
 
 TEST_CASE("ast_equivalence - constant INTEGER", "[gpu_expression_executor_ast]")
 {
-  auto* space = get_default_gpu_space();
-  REQUIRE(space != nullptr);
-  auto input = make_input_batch(
-    *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 100}});
-  auto tv = get_table_view(input);
-
-  auto duck_expr      = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(42));
-  auto hand_ast       = std::make_unique<sirius::ast::node>(sirius::ast::constant{
-    sirius::value{int32_t{42}}, sirius::logical_type::make(sirius::type_id::INTEGER)});
-  auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
-  REQUIRE(translated_ast);
-
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
-  auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
-  auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
-
-  auto duck_host       = copy_column_to_host<int32_t>(duck_out->view().column(0));
-  auto hand_host       = copy_column_to_host<int32_t>(hand_out->view().column(0));
-  auto translated_host = copy_column_to_host<int32_t>(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
-  REQUIRE(hand_host == translated_host);
+  auto duck_expr = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(42));
+  auto hand_ast  = make_int_const(42);
+  expect_hand_eq_translated(
+    *duck_expr, *hand_ast, int32_col(), range(0, 100), MAT, copy_column_to_host<int32_t>);
 }
 
 TEST_CASE("ast_equivalence - constant VARCHAR", "[gpu_expression_executor_ast]")
 {
-  auto* space = get_default_gpu_space();
-  REQUIRE(space != nullptr);
-  auto input = make_input_batch(
-    *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 100}});
-  auto tv = get_table_view(input);
-
-  auto duck_expr      = duckdb::make_uniq<BoundConstantExpression>(Value("hello"));
-  auto hand_ast       = std::make_unique<sirius::ast::node>(sirius::ast::constant{
-    sirius::value{std::string{"hello"}}, sirius::logical_type::make(sirius::type_id::VARCHAR)});
-  auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
-  REQUIRE(translated_ast);
-
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
-  auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
-  auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
-
-  auto duck_host       = copy_string_column_to_host(duck_out->view().column(0));
-  auto hand_host       = copy_string_column_to_host(hand_out->view().column(0));
-  auto translated_host = copy_string_column_to_host(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
-  REQUIRE(hand_host == translated_host);
+  auto duck_expr = duckdb::make_uniq<BoundConstantExpression>(Value("hello"));
+  auto hand_ast  = make_str_const("hello");
+  expect_hand_eq_translated(
+    *duck_expr, *hand_ast, int32_col(), range(0, 100), MAT, copy_string_column_to_host);
 }
 
 // ============================================================================
@@ -355,94 +246,38 @@ TEST_CASE("ast_equivalence - constant VARCHAR", "[gpu_expression_executor_ast]")
 
 TEST_CASE("ast_equivalence - comparison EQUAL (MATERIALIZE)", "[gpu_expression_executor_ast]")
 {
-  auto* space = get_default_gpu_space();
-  REQUIRE(space != nullptr);
-  auto input =
-    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 10}});
-  auto tv = get_table_view(input);
-
   auto duck_expr = duckdb::make_uniq<BoundComparisonExpression>(
     ExpressionType::COMPARE_EQUAL, duck_int_ref(0), duck_int_const(5));
-  auto hand_ast = std::make_unique<sirius::ast::node>(
-    sirius::ast::comparison{sirius::comparison_type::equal, ref_node(0), int_const_node(5)});
-  auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
-  REQUIRE(translated_ast);
-
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
-  auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
-  auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
-
-  auto duck_host       = copy_bool_column_to_host(duck_out->view().column(0));
-  auto hand_host       = copy_bool_column_to_host(hand_out->view().column(0));
-  auto translated_host = copy_bool_column_to_host(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
-  REQUIRE(hand_host == translated_host);
+  auto hand_ast = make_cmp(sirius::comparison_type::equal, make_ref(0), make_int_const(5));
+  expect_hand_eq_translated(
+    *duck_expr, *hand_ast, int32_col(), range(0, 10), MAT, copy_bool_column_to_host);
 }
 
 TEST_CASE("ast_equivalence - comparison EQUAL (AST_INTERPRET)", "[gpu_expression_executor_ast]")
 {
-  auto* space = get_default_gpu_space();
-  REQUIRE(space != nullptr);
-  auto input =
-    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 10}});
-  auto tv = get_table_view(input);
-
   auto duck_expr = duckdb::make_uniq<BoundComparisonExpression>(
     ExpressionType::COMPARE_EQUAL, duck_int_ref(0), duck_int_const(5));
-  auto hand_ast = std::make_unique<sirius::ast::node>(
-    sirius::ast::comparison{sirius::comparison_type::equal, ref_node(0), int_const_node(5)});
-  auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
-  REQUIRE(translated_ast);
-
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, AST_I);
-  auto hand_out       = run_one(*space, hand_ast.get(), tv, AST_I);
-  auto translated_out = run_one(*space, translated_ast.get(), tv, AST_I);
-
-  auto duck_host       = copy_bool_column_to_host(duck_out->view().column(0));
-  auto hand_host       = copy_bool_column_to_host(hand_out->view().column(0));
-  auto translated_host = copy_bool_column_to_host(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
-  REQUIRE(hand_host == translated_host);
+  auto hand_ast = make_cmp(sirius::comparison_type::equal, make_ref(0), make_int_const(5));
+  expect_hand_eq_translated(
+    *duck_expr, *hand_ast, int32_col(), range(0, 10), AST_I, copy_bool_column_to_host);
 }
 
 TEST_CASE("ast_equivalence - comparison LESSTHAN (MATERIALIZE)", "[gpu_expression_executor_ast]")
 {
-  auto* space = get_default_gpu_space();
-  REQUIRE(space != nullptr);
-  auto input =
-    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 10}});
-  auto tv = get_table_view(input);
-
   auto duck_expr = duckdb::make_uniq<BoundComparisonExpression>(
     ExpressionType::COMPARE_LESSTHAN, duck_int_ref(0), duck_int_const(5));
-  auto hand_ast = std::make_unique<sirius::ast::node>(
-    sirius::ast::comparison{sirius::comparison_type::lt, ref_node(0), int_const_node(5)});
-  auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
-  REQUIRE(translated_ast);
-
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
-  auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
-  auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
-
-  auto duck_host       = copy_bool_column_to_host(duck_out->view().column(0));
-  auto hand_host       = copy_bool_column_to_host(hand_out->view().column(0));
-  auto translated_host = copy_bool_column_to_host(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
-  REQUIRE(hand_host == translated_host);
+  auto hand_ast = make_cmp(sirius::comparison_type::lt, make_ref(0), make_int_const(5));
+  expect_hand_eq_translated(
+    *duck_expr, *hand_ast, int32_col(), range(0, 10), MAT, copy_bool_column_to_host);
 }
 
 // ============================================================================
 // conjunction — AND (MATERIALIZE + AST_INTERPRET).
 // ============================================================================
 
-TEST_CASE("ast_equivalence - conjunction AND (MATERIALIZE)", "[gpu_expression_executor_ast]")
+namespace {
+duckdb::unique_ptr<Expression> duck_and_1_9()
 {
-  auto* space = get_default_gpu_space();
-  REQUIRE(space != nullptr);
-  auto input =
-    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 10}});
-  auto tv = get_table_view(input);
-
   auto duck_lhs = duckdb::make_uniq<BoundComparisonExpression>(
     ExpressionType::COMPARE_GREATERTHAN, duck_int_ref(0), duck_int_const(1));
   auto duck_rhs = duckdb::make_uniq<BoundComparisonExpression>(
@@ -450,65 +285,32 @@ TEST_CASE("ast_equivalence - conjunction AND (MATERIALIZE)", "[gpu_expression_ex
   auto duck_expr = duckdb::make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
   duck_expr->children.push_back(std::move(duck_lhs));
   duck_expr->children.push_back(std::move(duck_rhs));
+  return duckdb::unique_ptr<Expression>(duck_expr.release());
+}
 
+std::unique_ptr<sirius::ast::node> hand_and_1_9()
+{
   std::vector<std::unique_ptr<sirius::ast::node>> children;
-  children.push_back(std::make_unique<sirius::ast::node>(
-    sirius::ast::comparison{sirius::comparison_type::gt, ref_node(0), int_const_node(1)}));
-  children.push_back(std::make_unique<sirius::ast::node>(
-    sirius::ast::comparison{sirius::comparison_type::lt, ref_node(0), int_const_node(9)}));
-  auto hand_ast = std::make_unique<sirius::ast::node>(
-    sirius::ast::conjunction{sirius::ast::conjunction::kind::op_and, std::move(children)});
+  children.push_back(make_cmp(sirius::comparison_type::gt, make_ref(0), make_int_const(1)));
+  children.push_back(make_cmp(sirius::comparison_type::lt, make_ref(0), make_int_const(9)));
+  return make_conj(sirius::ast::conjunction::kind::op_and, std::move(children));
+}
+}  // namespace
 
-  auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
-  REQUIRE(translated_ast);
-
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
-  auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
-  auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
-
-  auto duck_host       = copy_bool_column_to_host(duck_out->view().column(0));
-  auto hand_host       = copy_bool_column_to_host(hand_out->view().column(0));
-  auto translated_host = copy_bool_column_to_host(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
-  REQUIRE(hand_host == translated_host);
+TEST_CASE("ast_equivalence - conjunction AND (MATERIALIZE)", "[gpu_expression_executor_ast]")
+{
+  auto duck_expr = duck_and_1_9();
+  auto hand_ast  = hand_and_1_9();
+  expect_hand_eq_translated(
+    *duck_expr, *hand_ast, int32_col(), range(0, 10), MAT, copy_bool_column_to_host);
 }
 
 TEST_CASE("ast_equivalence - conjunction AND (AST_INTERPRET)", "[gpu_expression_executor_ast]")
 {
-  auto* space = get_default_gpu_space();
-  REQUIRE(space != nullptr);
-  auto input =
-    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 10}});
-  auto tv = get_table_view(input);
-
-  auto duck_lhs = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_GREATERTHAN, duck_int_ref(0), duck_int_const(1));
-  auto duck_rhs = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_LESSTHAN, duck_int_ref(0), duck_int_const(9));
-  auto duck_expr = duckdb::make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
-  duck_expr->children.push_back(std::move(duck_lhs));
-  duck_expr->children.push_back(std::move(duck_rhs));
-
-  std::vector<std::unique_ptr<sirius::ast::node>> children;
-  children.push_back(std::make_unique<sirius::ast::node>(
-    sirius::ast::comparison{sirius::comparison_type::gt, ref_node(0), int_const_node(1)}));
-  children.push_back(std::make_unique<sirius::ast::node>(
-    sirius::ast::comparison{sirius::comparison_type::lt, ref_node(0), int_const_node(9)}));
-  auto hand_ast = std::make_unique<sirius::ast::node>(
-    sirius::ast::conjunction{sirius::ast::conjunction::kind::op_and, std::move(children)});
-
-  auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
-  REQUIRE(translated_ast);
-
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, AST_I);
-  auto hand_out       = run_one(*space, hand_ast.get(), tv, AST_I);
-  auto translated_out = run_one(*space, translated_ast.get(), tv, AST_I);
-
-  auto duck_host       = copy_bool_column_to_host(duck_out->view().column(0));
-  auto hand_host       = copy_bool_column_to_host(hand_out->view().column(0));
-  auto translated_host = copy_bool_column_to_host(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
-  REQUIRE(hand_host == translated_host);
+  auto duck_expr = duck_and_1_9();
+  auto hand_ast  = hand_and_1_9();
+  expect_hand_eq_translated(
+    *duck_expr, *hand_ast, int32_col(), range(0, 10), AST_I, copy_bool_column_to_host);
 }
 
 // ============================================================================
@@ -517,28 +319,11 @@ TEST_CASE("ast_equivalence - conjunction AND (AST_INTERPRET)", "[gpu_expression_
 
 TEST_CASE("ast_equivalence - between (MATERIALIZE)", "[gpu_expression_executor_ast]")
 {
-  auto* space = get_default_gpu_space();
-  REQUIRE(space != nullptr);
-  auto input =
-    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 20}});
-  auto tv = get_table_view(input);
-
   auto duck_expr = duckdb::make_uniq<BoundBetweenExpression>(
     duck_int_ref(0), duck_int_const(5), duck_int_const(15), /*lo=*/true, /*hi=*/true);
-  auto hand_ast = std::make_unique<sirius::ast::node>(
-    sirius::ast::between{ref_node(0), int_const_node(5), int_const_node(15), true, true});
-  auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
-  REQUIRE(translated_ast);
-
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
-  auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
-  auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
-
-  auto duck_host       = copy_bool_column_to_host(duck_out->view().column(0));
-  auto hand_host       = copy_bool_column_to_host(hand_out->view().column(0));
-  auto translated_host = copy_bool_column_to_host(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
-  REQUIRE(hand_host == translated_host);
+  auto hand_ast = make_between(make_ref(0), make_int_const(5), make_int_const(15), true, true);
+  expect_hand_eq_translated(
+    *duck_expr, *hand_ast, int32_col(), range(0, 20), MAT, copy_bool_column_to_host);
 }
 
 // ============================================================================
@@ -548,44 +333,25 @@ TEST_CASE("ast_equivalence - between (MATERIALIZE)", "[gpu_expression_executor_a
 TEST_CASE("ast_equivalence - case_expr WHEN/THEN/ELSE (MATERIALIZE)",
           "[gpu_expression_executor_ast]")
 {
-  auto* space = get_default_gpu_space();
-  REQUIRE(space != nullptr);
-  auto input =
-    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 10}});
-  auto tv = get_table_view(input);
-
   auto duck_when = duckdb::make_uniq<BoundComparisonExpression>(
     ExpressionType::COMPARE_EQUAL, duck_int_ref(0), duck_int_const(5));
-  auto duck_then = duck_int_const(10);
-  auto duck_else = duck_int_const(0);
   BoundCaseCheck check;
   check.when_expr = std::move(duck_when);
-  check.then_expr = std::move(duck_then);
+  check.then_expr = duck_int_const(10);
   auto duck_expr  = duckdb::make_uniq<BoundCaseExpression>(LogicalType{LogicalTypeId::INTEGER});
   duck_expr->case_checks.push_back(std::move(check));
-  duck_expr->else_expr = std::move(duck_else);
+  duck_expr->else_expr = duck_int_const(0);
 
   std::vector<sirius::ast::case_expr::when_then> cases;
   cases.push_back(sirius::ast::case_expr::when_then{
-    std::make_unique<sirius::ast::node>(
-      sirius::ast::comparison{sirius::comparison_type::equal, ref_node(0), int_const_node(5)}),
-    int_const_node(10),
+    make_cmp(sirius::comparison_type::equal, make_ref(0), make_int_const(5)),
+    make_int_const(10),
   });
   auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::case_expr{
-    std::move(cases), int_const_node(0), sirius::logical_type::make(sirius::type_id::INTEGER)});
+    std::move(cases), make_int_const(0), sirius::logical_type::make(sirius::type_id::INTEGER)});
 
-  auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
-  REQUIRE(translated_ast);
-
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
-  auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
-  auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
-
-  auto duck_host       = copy_column_to_host<int32_t>(duck_out->view().column(0));
-  auto hand_host       = copy_column_to_host<int32_t>(hand_out->view().column(0));
-  auto translated_host = copy_column_to_host<int32_t>(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
-  REQUIRE(hand_host == translated_host);
+  expect_hand_eq_translated(
+    *duck_expr, *hand_ast, int32_col(), range(0, 10), MAT, copy_column_to_host<int32_t>);
 }
 
 // ============================================================================
@@ -594,28 +360,12 @@ TEST_CASE("ast_equivalence - case_expr WHEN/THEN/ELSE (MATERIALIZE)",
 
 TEST_CASE("ast_equivalence - cast INTEGER->BIGINT (MATERIALIZE)", "[gpu_expression_executor_ast]")
 {
-  auto* space = get_default_gpu_space();
-  REQUIRE(space != nullptr);
-  auto input =
-    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 50}});
-  auto tv = get_table_view(input);
-
   auto duck_expr =
     BoundCastExpression::AddDefaultCastToType(duck_int_ref(0), LogicalType{LogicalTypeId::BIGINT});
-  auto hand_ast       = std::make_unique<sirius::ast::node>(sirius::ast::cast{
-    ref_node(0), sirius::logical_type::make(sirius::type_id::BIGINT), /*try_cast=*/false});
-  auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
-  REQUIRE(translated_ast);
-
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
-  auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
-  auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
-
-  auto duck_host       = copy_column_to_host<int64_t>(duck_out->view().column(0));
-  auto hand_host       = copy_column_to_host<int64_t>(hand_out->view().column(0));
-  auto translated_host = copy_column_to_host<int64_t>(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
-  REQUIRE(hand_host == translated_host);
+  auto hand_ast =
+    make_cast(make_ref(0), sirius::logical_type::make(sirius::type_id::BIGINT), /*try_cast=*/false);
+  expect_hand_eq_translated(
+    *duck_expr, *hand_ast, int32_col(), range(0, 50), MAT, copy_column_to_host<int64_t>);
 }
 
 // ============================================================================
@@ -624,95 +374,43 @@ TEST_CASE("ast_equivalence - cast INTEGER->BIGINT (MATERIALIZE)", "[gpu_expressi
 
 TEST_CASE("ast_equivalence - unary_op NOT (MATERIALIZE)", "[gpu_expression_executor_ast]")
 {
-  auto* space = get_default_gpu_space();
-  REQUIRE(space != nullptr);
   // Need a BOOLEAN-producing child; use a comparison.
-  auto input =
-    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 10}});
-  auto tv = get_table_view(input);
-
   auto duck_inner = duckdb::make_uniq<BoundComparisonExpression>(
     ExpressionType::COMPARE_EQUAL, duck_int_ref(0), duck_int_const(5));
   auto duck_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_NOT,
                                                               LogicalType{LogicalTypeId::BOOLEAN});
   duck_expr->children.push_back(std::move(duck_inner));
 
-  auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::unary_op{
-    sirius::ast::unary_op::kind::op_not,
-    std::make_unique<sirius::ast::node>(
-      sirius::ast::comparison{sirius::comparison_type::equal, ref_node(0), int_const_node(5)}),
-  });
+  auto hand_ast =
+    make_unary(sirius::ast::unary_op::kind::op_not,
+               make_cmp(sirius::comparison_type::equal, make_ref(0), make_int_const(5)));
 
-  auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
-  REQUIRE(translated_ast);
-
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
-  auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
-  auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
-
-  auto duck_host       = copy_bool_column_to_host(duck_out->view().column(0));
-  auto hand_host       = copy_bool_column_to_host(hand_out->view().column(0));
-  auto translated_host = copy_bool_column_to_host(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
-  REQUIRE(hand_host == translated_host);
+  expect_hand_eq_translated(
+    *duck_expr, *hand_ast, int32_col(), range(0, 10), MAT, copy_bool_column_to_host);
 }
 
 TEST_CASE("ast_equivalence - unary_op IS_NULL (MATERIALIZE)", "[gpu_expression_executor_ast]")
 {
-  auto* space = get_default_gpu_space();
-  REQUIRE(space != nullptr);
-  auto input =
-    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 50}});
-  auto tv = get_table_view(input);
-
   auto duck_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NULL,
                                                               LogicalType{LogicalTypeId::BOOLEAN});
   duck_expr->children.push_back(duck_int_ref(0));
 
-  auto hand_ast = std::make_unique<sirius::ast::node>(
-    sirius::ast::unary_op{sirius::ast::unary_op::kind::op_is_null, ref_node(0)});
+  auto hand_ast = make_unary(sirius::ast::unary_op::kind::op_is_null, make_ref(0));
 
-  auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
-  REQUIRE(translated_ast);
-
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
-  auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
-  auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
-
-  auto duck_host       = copy_bool_column_to_host(duck_out->view().column(0));
-  auto hand_host       = copy_bool_column_to_host(hand_out->view().column(0));
-  auto translated_host = copy_bool_column_to_host(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
-  REQUIRE(hand_host == translated_host);
+  expect_hand_eq_translated(
+    *duck_expr, *hand_ast, int32_col(), range(0, 50), MAT, copy_bool_column_to_host);
 }
 
 TEST_CASE("ast_equivalence - unary_op IS_NOT_NULL (MATERIALIZE)", "[gpu_expression_executor_ast]")
 {
-  auto* space = get_default_gpu_space();
-  REQUIRE(space != nullptr);
-  auto input =
-    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 50}});
-  auto tv = get_table_view(input);
-
   auto duck_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NOT_NULL,
                                                               LogicalType{LogicalTypeId::BOOLEAN});
   duck_expr->children.push_back(duck_int_ref(0));
 
-  auto hand_ast = std::make_unique<sirius::ast::node>(
-    sirius::ast::unary_op{sirius::ast::unary_op::kind::op_is_not_null, ref_node(0)});
+  auto hand_ast = make_unary(sirius::ast::unary_op::kind::op_is_not_null, make_ref(0));
 
-  auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
-  REQUIRE(translated_ast);
-
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
-  auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
-  auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
-
-  auto duck_host       = copy_bool_column_to_host(duck_out->view().column(0));
-  auto hand_host       = copy_bool_column_to_host(hand_out->view().column(0));
-  auto translated_host = copy_bool_column_to_host(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
-  REQUIRE(hand_host == translated_host);
+  expect_hand_eq_translated(
+    *duck_expr, *hand_ast, int32_col(), range(0, 50), MAT, copy_bool_column_to_host);
 }
 
 TEST_CASE("ast_equivalence - unary_op TRY translation (no exec)", "[gpu_expression_executor_ast]")
@@ -720,9 +418,9 @@ TEST_CASE("ast_equivalence - unary_op TRY translation (no exec)", "[gpu_expressi
   // OPERATOR_TRY is recognized by the AST surface but not executable by the
   // current gpu_expression_executor (it throws on dispatch through
   // gpu_execute_operator.cpp). Verify only the translation half of the contract
-  // for this kind: the three legs translate to AST shapes with matching unary_op
-  // kinds. Execution coverage is intentionally omitted until the underlying
-  // OPERATOR_TRY specialization lands.
+  // for this kind: the translated node has the expected unary_op kind and round-
+  // trips back to OPERATOR_TRY. Execution coverage is intentionally omitted until
+  // the underlying OPERATOR_TRY specialization lands.
   auto duck_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_TRY,
                                                               LogicalType{LogicalTypeId::INTEGER});
   duck_expr->children.push_back(duck_int_ref(0));
@@ -738,130 +436,75 @@ TEST_CASE("ast_equivalence - unary_op TRY translation (no exec)", "[gpu_expressi
 }
 
 // ============================================================================
-// coalesce — 3-arg INTEGER (MATERIALIZE — AST breaker).
+// coalesce — 2-arg INTEGER (MATERIALIZE — AST breaker).
 // ============================================================================
 
 TEST_CASE("ast_equivalence - coalesce (MATERIALIZE)", "[gpu_expression_executor_ast]")
 {
-  auto* space = get_default_gpu_space();
-  REQUIRE(space != nullptr);
-  auto input =
-    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 50}});
-  auto tv = get_table_view(input);
-
   auto duck_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE,
                                                               LogicalType{LogicalTypeId::INTEGER});
   duck_expr->children.push_back(duck_int_ref(0));
   duck_expr->children.push_back(duck_int_const(0));
 
   std::vector<std::unique_ptr<sirius::ast::node>> children;
-  children.push_back(ref_node(0));
-  children.push_back(int_const_node(0));
-  auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::coalesce{
-    std::move(children), sirius::logical_type::make(sirius::type_id::INTEGER)});
+  children.push_back(make_ref(0));
+  children.push_back(make_int_const(0));
+  auto hand_ast =
+    make_coalesce(std::move(children), sirius::logical_type::make(sirius::type_id::INTEGER));
 
-  auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
-  REQUIRE(translated_ast);
-
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
-  auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
-  auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
-
-  auto duck_host       = copy_column_to_host<int32_t>(duck_out->view().column(0));
-  auto hand_host       = copy_column_to_host<int32_t>(hand_out->view().column(0));
-  auto translated_host = copy_column_to_host<int32_t>(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
-  REQUIRE(hand_host == translated_host);
+  expect_hand_eq_translated(
+    *duck_expr, *hand_ast, int32_col(), range(0, 50), MAT, copy_column_to_host<int32_t>);
 }
 
 // ============================================================================
-// in_list — IN + NOT IN (MATERIALIZE + AST_INTERPRET).
+// in_list — IN (MATERIALIZE + AST_INTERPRET).
 // ============================================================================
 
-TEST_CASE("ast_equivalence - in_list IN (MATERIALIZE)", "[gpu_expression_executor_ast]")
+namespace {
+duckdb::unique_ptr<Expression> duck_in_2_5_8()
 {
-  auto* space = get_default_gpu_space();
-  REQUIRE(space != nullptr);
-  auto input =
-    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 10}});
-  auto tv = get_table_view(input);
-
   auto duck_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::COMPARE_IN,
                                                               LogicalType{LogicalTypeId::BOOLEAN});
   duck_expr->children.push_back(duck_int_ref(0));
   duck_expr->children.push_back(duck_int_const(2));
   duck_expr->children.push_back(duck_int_const(5));
   duck_expr->children.push_back(duck_int_const(8));
+  return duckdb::unique_ptr<Expression>(duck_expr.release());
+}
 
+std::unique_ptr<sirius::ast::node> hand_in_2_5_8()
+{
   std::vector<std::unique_ptr<sirius::ast::node>> values;
-  values.push_back(int_const_node(2));
-  values.push_back(int_const_node(5));
-  values.push_back(int_const_node(8));
-  auto hand_ast = std::make_unique<sirius::ast::node>(
-    sirius::ast::in_list{ref_node(0), std::move(values), /*negated=*/false});
+  values.push_back(make_int_const(2));
+  values.push_back(make_int_const(5));
+  values.push_back(make_int_const(8));
+  return make_in(make_ref(0), std::move(values), /*negated=*/false);
+}
+}  // namespace
 
-  auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
-  REQUIRE(translated_ast);
-
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
-  auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
-  auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
-
-  auto duck_host       = copy_bool_column_to_host(duck_out->view().column(0));
-  auto hand_host       = copy_bool_column_to_host(hand_out->view().column(0));
-  auto translated_host = copy_bool_column_to_host(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
-  REQUIRE(hand_host == translated_host);
+TEST_CASE("ast_equivalence - in_list IN (MATERIALIZE)", "[gpu_expression_executor_ast]")
+{
+  auto duck_expr = duck_in_2_5_8();
+  auto hand_ast  = hand_in_2_5_8();
+  expect_hand_eq_translated(
+    *duck_expr, *hand_ast, int32_col(), range(0, 10), MAT, copy_bool_column_to_host);
 }
 
 TEST_CASE("ast_equivalence - in_list IN (AST_INTERPRET)", "[gpu_expression_executor_ast]")
 {
-  auto* space = get_default_gpu_space();
-  REQUIRE(space != nullptr);
-  auto input =
-    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 10}});
-  auto tv = get_table_view(input);
-
-  auto duck_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::COMPARE_IN,
-                                                              LogicalType{LogicalTypeId::BOOLEAN});
-  duck_expr->children.push_back(duck_int_ref(0));
-  duck_expr->children.push_back(duck_int_const(2));
-  duck_expr->children.push_back(duck_int_const(5));
-  duck_expr->children.push_back(duck_int_const(8));
-
-  std::vector<std::unique_ptr<sirius::ast::node>> values;
-  values.push_back(int_const_node(2));
-  values.push_back(int_const_node(5));
-  values.push_back(int_const_node(8));
-  auto hand_ast = std::make_unique<sirius::ast::node>(
-    sirius::ast::in_list{ref_node(0), std::move(values), /*negated=*/false});
-
-  auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
-  REQUIRE(translated_ast);
-
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, AST_I);
-  auto hand_out       = run_one(*space, hand_ast.get(), tv, AST_I);
-  auto translated_out = run_one(*space, translated_ast.get(), tv, AST_I);
-
-  auto duck_host       = copy_bool_column_to_host(duck_out->view().column(0));
-  auto hand_host       = copy_bool_column_to_host(hand_out->view().column(0));
-  auto translated_host = copy_bool_column_to_host(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
-  REQUIRE(hand_host == translated_host);
+  auto duck_expr = duck_in_2_5_8();
+  auto hand_ast  = hand_in_2_5_8();
+  expect_hand_eq_translated(
+    *duck_expr, *hand_ast, int32_col(), range(0, 10), AST_I, copy_bool_column_to_host);
 }
 
 // ============================================================================
 // function_call — add (MATERIALIZE + AST_INTERPRET).
 // ============================================================================
 
-TEST_CASE("ast_equivalence - function_call add (MATERIALIZE)", "[gpu_expression_executor_ast]")
+namespace {
+duckdb::unique_ptr<Expression> duck_add_3()
 {
-  auto* space = get_default_gpu_space();
-  REQUIRE(space != nullptr);
-  auto input =
-    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 50}});
-  auto tv = get_table_view(input);
-
   auto duck_expr = duckdb::make_uniq<BoundFunctionExpression>(
     LogicalType{LogicalTypeId::INTEGER},
     ScalarFunction(
@@ -870,64 +513,32 @@ TEST_CASE("ast_equivalence - function_call add (MATERIALIZE)", "[gpu_expression_
     nullptr);
   duck_expr->children.push_back(duck_int_ref(0));
   duck_expr->children.push_back(duck_int_const(3));
+  return duckdb::unique_ptr<Expression>(duck_expr.release());
+}
 
+std::unique_ptr<sirius::ast::node> hand_add_3()
+{
   std::vector<std::unique_ptr<sirius::ast::node>> args;
-  args.push_back(ref_node(0));
-  args.push_back(int_const_node(3));
-  auto hand_ast = std::make_unique<sirius::ast::node>(
-    sirius::ast::function_call{sirius::function_id::add,
-                               std::move(args),
-                               sirius::logical_type::make(sirius::type_id::INTEGER)});
+  args.push_back(make_ref(0));
+  args.push_back(make_int_const(3));
+  return make_func(sirius::function_id::add,
+                   std::move(args),
+                   sirius::logical_type::make(sirius::type_id::INTEGER));
+}
+}  // namespace
 
-  auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
-  REQUIRE(translated_ast);
-
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, MAT);
-  auto hand_out       = run_one(*space, hand_ast.get(), tv, MAT);
-  auto translated_out = run_one(*space, translated_ast.get(), tv, MAT);
-
-  auto duck_host       = copy_column_to_host<int32_t>(duck_out->view().column(0));
-  auto hand_host       = copy_column_to_host<int32_t>(hand_out->view().column(0));
-  auto translated_host = copy_column_to_host<int32_t>(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
-  REQUIRE(hand_host == translated_host);
+TEST_CASE("ast_equivalence - function_call add (MATERIALIZE)", "[gpu_expression_executor_ast]")
+{
+  auto duck_expr = duck_add_3();
+  auto hand_ast  = hand_add_3();
+  expect_hand_eq_translated(
+    *duck_expr, *hand_ast, int32_col(), range(0, 50), MAT, copy_column_to_host<int32_t>);
 }
 
 TEST_CASE("ast_equivalence - function_call add (AST_INTERPRET)", "[gpu_expression_executor_ast]")
 {
-  auto* space = get_default_gpu_space();
-  REQUIRE(space != nullptr);
-  auto input =
-    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 50}});
-  auto tv = get_table_view(input);
-
-  auto duck_expr = duckdb::make_uniq<BoundFunctionExpression>(
-    LogicalType{LogicalTypeId::INTEGER},
-    ScalarFunction(
-      "+", {LogicalType::INTEGER, LogicalType::INTEGER}, LogicalType::INTEGER, nullptr),
-    duckdb::vector<duckdb::unique_ptr<Expression>>{},
-    nullptr);
-  duck_expr->children.push_back(duck_int_ref(0));
-  duck_expr->children.push_back(duck_int_const(3));
-
-  std::vector<std::unique_ptr<sirius::ast::node>> args;
-  args.push_back(ref_node(0));
-  args.push_back(int_const_node(3));
-  auto hand_ast = std::make_unique<sirius::ast::node>(
-    sirius::ast::function_call{sirius::function_id::add,
-                               std::move(args),
-                               sirius::logical_type::make(sirius::type_id::INTEGER)});
-
-  auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
-  REQUIRE(translated_ast);
-
-  auto duck_out       = run_one(*space, duck_expr.get(), tv, AST_I);
-  auto hand_out       = run_one(*space, hand_ast.get(), tv, AST_I);
-  auto translated_out = run_one(*space, translated_ast.get(), tv, AST_I);
-
-  auto duck_host       = copy_column_to_host<int32_t>(duck_out->view().column(0));
-  auto hand_host       = copy_column_to_host<int32_t>(hand_out->view().column(0));
-  auto translated_host = copy_column_to_host<int32_t>(translated_out->view().column(0));
-  REQUIRE(duck_host == hand_host);
-  REQUIRE(hand_host == translated_host);
+  auto duck_expr = duck_add_3();
+  auto hand_ast  = hand_add_3();
+  expect_hand_eq_translated(
+    *duck_expr, *hand_ast, int32_col(), range(0, 50), AST_I, copy_column_to_host<int32_t>);
 }

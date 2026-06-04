@@ -15,15 +15,11 @@
  */
 
 // sirius
-#include <expression/ast/from_duckdb.hpp>
 #include <expression/ast/node.hpp>
 #include <expression_executor/ast_supported_types.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <helper/logical_type.hpp>
 #include <sirius/exception.hpp>
-
-// duckdb
-#include <duckdb/planner/expression/bound_cast_expression.hpp>
 
 // cudf
 #include <cudf/cudf_utils.hpp>
@@ -90,23 +86,6 @@ execute_result gpu_expression_executor::execute(sirius::ast::cast const& alt, ex
     return materialize_as_ast_column(std::move(result_column));
   }
   return execute_result(std::move(result_column));
-}
-
-// DuckDB-typed entrypoint. Bridges callers that still pass duckdb::Expression
-// directly into the executor; the eventual home for this from_duckdb step is
-// the planning stage so the executor sees only native sirius::ast types, but
-// until upstream call sites are migrated this overload (and the duckdb
-// includes it requires) must stay.
-execute_result gpu_expression_executor::execute(duckdb::BoundCastExpression const& expr,
-                                                execution_mode mode)
-{
-  auto node = sirius::ast::from_duckdb(expr);
-  if (!node) {
-    throw not_implemented_exception(
-      "[gpu_expression_executor:cast] BoundCastExpression could not be lowered to a Sirius AST "
-      "node (the cast child is unsupported).");
-  }
-  return execute(*node, mode);
 }
 
 }  // namespace sirius

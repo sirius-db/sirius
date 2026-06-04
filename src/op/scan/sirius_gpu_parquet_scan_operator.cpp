@@ -16,6 +16,7 @@
 
 // sirius
 #include <data/data_batch_utils.hpp>
+#include <expression/ast/from_duckdb.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <log/logging.hpp>
 #include <op/scan/parquet_scan_operator_data.hpp>
@@ -243,16 +244,25 @@ std::unique_ptr<cudf::table> sirius_gpu_parquet_scan_operator::read_table_from_m
 
   // Apply the filter if it was not pushed down into the parquet scan.
   if (filter_expression && !ast_expression) {
-    sirius::gpu_expression_executor gpu_expression_executor(
-      filter_expression.get(), cudf::get_current_device_resource_ref(), stream);
-    // Hold the source table in a separate variable so its destruction (and the
-    // stream-ordered dealloc of its buffers) is sequenced after select()'s kernels
-    // have been queued. Assigning select()'s result directly back to `table` would
-    // destruct the source synchronously before the queued kernels read from it.
-    auto input_table = std::move(table);
-    table            = gpu_expression_executor.select(input_table->view());
-    SIRIUS_LOG_DEBUG(
-      "[sirius_gpu_parquet_scan_operator] Applied duckdb filter expression post parquet scan.");
+    // Translate the DuckDB filter expression to a native Sirius AST node at the boundary.
+    // `filter_node` is held in a local that outlives select()'s queued kernels.
+    auto filter_node = sirius::ast::from_duckdb(*filter_expression);
+    if (!filter_node) {
+      SIRIUS_LOG_DEBUG(
+        "[sirius_gpu_parquet_scan_operator] Filter expression could not be lowered to a Sirius "
+        "AST node; forwarding the unfiltered table.");
+    } else {
+      sirius::gpu_expression_executor gpu_expression_executor(
+        filter_node.get(), cudf::get_current_device_resource_ref(), stream);
+      // Hold the source table in a separate variable so its destruction (and the
+      // stream-ordered dealloc of its buffers) is sequenced after select()'s kernels
+      // have been queued. Assigning select()'s result directly back to `table` would
+      // destruct the source synchronously before the queued kernels read from it.
+      auto input_table = std::move(table);
+      table            = gpu_expression_executor.select(input_table->view());
+      SIRIUS_LOG_DEBUG(
+        "[sirius_gpu_parquet_scan_operator] Applied filter expression post parquet scan.");
+    }
   }
 
   // Reshape the reader's output to the scan_plan's D-order layout: reorder data
@@ -307,15 +317,25 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
       return std::make_unique<pipelineable_operator_data>(std::move(batches));
     }
 
-    if (has_filter) {
+    // Translate the cached DuckDB filter to a native Sirius AST node at the boundary, if any.
+    // `filter_node` outlives select()'s queued kernels.
+    std::unique_ptr<sirius::ast::node> filter_node;
+    if (has_filter) { filter_node = sirius::ast::from_duckdb(*cached->filter_expression); }
+
+    if (has_filter && filter_node) {
       // select() consumes the view and produces an owning table containing every D-column
       // (filter columns included) restricted to the rows that pass the predicate.
       sirius::gpu_expression_executor gpu_expression_executor(
-        cached->filter_expression.get(), cudf::get_current_device_resource_ref(), stream);
+        filter_node.get(), cudf::get_current_device_resource_ref(), stream);
       table = gpu_expression_executor.select(cached_view);
       SIRIUS_LOG_DEBUG(
-        "[sirius_gpu_parquet_scan_operator] Applied duckdb filter expression on cached batch.");
+        "[sirius_gpu_parquet_scan_operator] Applied filter expression on cached batch.");
     } else {
+      if (has_filter) {
+        SIRIUS_LOG_DEBUG(
+          "[sirius_gpu_parquet_scan_operator] Cached filter expression could not be lowered to a "
+          "Sirius AST node; materializing the cached batch unfiltered.");
+      }
       // No filter but assembly is needed (the plan permutes / drops columns relative to
       // data_columns). Materialize the cached view into an owning table so
       // assemble_scan_output can release the columns by D-position and reassemble them

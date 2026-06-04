@@ -15,14 +15,10 @@
  */
 
 // sirius
-#include <expression/ast/from_duckdb.hpp>
 #include <expression/ast/node.hpp>
 #include <expression/function_id.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <sirius/exception.hpp>
-
-// duckdb
-#include <duckdb/planner/expression/bound_case_expression.hpp>
 
 // cudf
 #include <cudf/ast/expressions.hpp>
@@ -126,23 +122,6 @@ execute_result gpu_expression_executor::execute(sirius::ast::case_expr const& al
     return materialize_as_ast_column(std::move(current_result.release_column()));
   }
   return current_result;
-}
-
-// DuckDB-typed entrypoint. Bridges callers that still pass duckdb::Expression
-// directly into the executor; the eventual home for this from_duckdb step is
-// the planning stage so the executor sees only native sirius::ast types, but
-// until upstream call sites are migrated this overload (and the duckdb
-// includes it requires) must stay.
-execute_result gpu_expression_executor::execute(duckdb::BoundCaseExpression const& expr,
-                                                execution_mode mode)
-{
-  auto node = sirius::ast::from_duckdb(expr);
-  if (!node) {
-    throw not_implemented_exception(
-      "[gpu_expression_executor:case] BoundCaseExpression could not be lowered to a Sirius AST "
-      "node (a WHEN, THEN, or ELSE subexpression is unsupported).");
-  }
-  return execute(*node, mode);
 }
 
 }  // namespace sirius

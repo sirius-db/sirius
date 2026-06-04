@@ -15,7 +15,6 @@
  */
 
 // sirius
-#include <expression/ast/from_duckdb.hpp>
 #include <expression/ast/node.hpp>
 #include <expression/value.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
@@ -24,7 +23,6 @@
 
 // duckdb
 #include <duckdb/common/exception.hpp>
-#include <duckdb/planner/expression/bound_constant_expression.hpp>
 
 // cudf
 #include <cudf/ast/expressions.hpp>
@@ -204,23 +202,6 @@ execute_result gpu_expression_executor::execute(sirius::ast::constant const& alt
       throw not_implemented_exception("[gpu_expression_executor] Unsupported scalar type: %s",
                                       alt.return_type.to_string());
   }
-}
-
-// DuckDB-typed entrypoint. Bridges callers that still pass duckdb::Expression
-// directly into the executor; the eventual home for this from_duckdb step is
-// the planning stage so the executor sees only native sirius::ast types, but
-// until upstream call sites are migrated this overload (and the duckdb
-// includes it requires) must stay.
-execute_result gpu_expression_executor::execute(duckdb::BoundConstantExpression const& expr,
-                                                execution_mode mode)
-{
-  auto node = sirius::ast::from_duckdb(expr);
-  if (!node) {
-    throw not_implemented_exception(
-      "[gpu_expression_executor:constant] BoundConstantExpression could not be lowered to a "
-      "Sirius AST node (sirius::ast::from_duckdb returned nullptr).");
-  }
-  return execute(*node, mode);
 }
 
 }  // namespace sirius
