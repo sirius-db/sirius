@@ -15,6 +15,8 @@
  */
 
 // test
+#include "ast_test_support.hpp"
+
 #include <catch.hpp>
 #include <utils/utils.hpp>
 
@@ -57,6 +59,7 @@
 
 using namespace cucascade;
 using namespace cucascade::memory;
+using namespace sirius::expr_test;
 using memory_mgr = ::sirius::memory::sirius_memory_reservation_manager;
 
 namespace {
@@ -89,77 +92,6 @@ memory_space* get_default_gpu_space()
 rmm::device_async_resource_ref get_resource_ref(memory_space& space)
 {
   return space.get_default_allocator();
-}
-
-template <typename T>
-std::vector<T> copy_column_to_host(const cudf::column_view& col)
-{
-  std::vector<T> host(col.size());
-  if (col.size() > 0) {
-    cudaMemcpy(host.data(), col.data<T>(), sizeof(T) * col.size(), cudaMemcpyDeviceToHost);
-  }
-  return host;
-}
-
-std::vector<uint8_t> copy_bool_column_to_host(const cudf::column_view& col)
-{
-  std::vector<uint8_t> host(col.size());
-  if (col.size() > 0) {
-    cudaMemcpy(host.data(), col.head(), sizeof(uint8_t) * col.size(), cudaMemcpyDeviceToHost);
-  }
-  return host;
-}
-
-std::vector<std::string> copy_string_column_to_host(const cudf::column_view& col)
-{
-  std::vector<std::string> host;
-  if (col.size() == 0) { return host; }
-
-  cudf::strings_column_view str_col(col);
-  std::vector<cudf::size_type> offsets(col.size() + 1);
-  cudaMemcpy(offsets.data(),
-             str_col.offsets().data<cudf::size_type>(),
-             (col.size() + 1) * sizeof(cudf::size_type),
-             cudaMemcpyDeviceToHost);
-
-  std::vector<char> chars(offsets.back());
-  if (!chars.empty()) {
-    cudaMemcpy(chars.data(),
-               str_col.chars_begin(cudf::get_default_stream()),
-               offsets.back(),
-               cudaMemcpyDeviceToHost);
-  }
-
-  host.reserve(col.size());
-  for (cudf::size_type i = 0; i < col.size(); ++i) {
-    auto start = offsets[i];
-    auto end   = offsets[i + 1];
-    if (chars.empty()) {
-      host.emplace_back();
-    } else {
-      host.emplace_back(chars.data() + start, chars.data() + end);
-    }
-  }
-  return host;
-}
-
-std::vector<bool> copy_valids_to_host(const cudf::column_view& col)
-{
-  std::vector<bool> valids(col.size(), true);
-  if (!col.nullable() || col.null_count() == 0) { return valids; }
-  auto const num_words = cudf::num_bitmask_words(col.size());
-  std::vector<cudf::bitmask_type> host_mask(num_words);
-  cudaMemcpy(host_mask.data(),
-             col.null_mask(),
-             num_words * sizeof(cudf::bitmask_type),
-             cudaMemcpyDeviceToHost);
-  constexpr auto bits_per_word = sizeof(cudf::bitmask_type) * 8;
-  for (cudf::size_type i = 0; i < col.size(); ++i) {
-    auto word = host_mask[i / bits_per_word];
-    auto bit  = i % bits_per_word;
-    valids[i] = ((word >> bit) & 1U) != 0U;
-  }
-  return valids;
 }
 
 std::shared_ptr<data_batch> make_input_batch(
@@ -385,116 +317,12 @@ struct ast_jit_strategy {
   static constexpr auto value = exp_strategy_enum::AST_JIT;
 };
 
-// ---------------------------------------------------------------------------
-// Native sirius::ast::node construction helpers — every test expression is
-// built directly as a Sirius AST node (no DuckDB Bound*Expression involved).
-// Mirrors the make_ref / make_int_const style used by test_ast_to_duckdb.cpp.
-// ---------------------------------------------------------------------------
+// Native sirius::ast::node construction helpers (make_ref / make_int_const / ...)
+// and GPU->host copy helpers live in ast_test_support.hpp, shared across the
+// expression_executor test suites.
 
-using ast_node = sirius::ast::node;
 using sirius::logical_type;
 using sirius::type_id;
-
-std::unique_ptr<ast_node> make_ref(uint32_t idx)
-{
-  return std::make_unique<ast_node>(sirius::ast::reference{idx});
-}
-
-std::unique_ptr<ast_node> make_int_const(int32_t v)
-{
-  return std::make_unique<ast_node>(
-    sirius::ast::constant{sirius::value{v}, logical_type::make(type_id::INTEGER)});
-}
-
-std::unique_ptr<ast_node> make_bigint_const(int64_t v)
-{
-  return std::make_unique<ast_node>(
-    sirius::ast::constant{sirius::value{v}, logical_type::make(type_id::BIGINT)});
-}
-
-std::unique_ptr<ast_node> make_str_const(std::string s)
-{
-  return std::make_unique<ast_node>(
-    sirius::ast::constant{sirius::value{std::move(s)}, logical_type::make(type_id::VARCHAR)});
-}
-
-std::unique_ptr<ast_node> make_dec32_const(int32_t unscaled, uint8_t precision, uint8_t scale)
-{
-  return std::make_unique<ast_node>(
-    sirius::ast::constant{sirius::value{sirius::decimal32{unscaled, scale}},
-                          logical_type::make_decimal(precision, scale)});
-}
-
-std::unique_ptr<ast_node> make_dec64_const(int64_t unscaled, uint8_t precision, uint8_t scale)
-{
-  return std::make_unique<ast_node>(
-    sirius::ast::constant{sirius::value{sirius::decimal64{unscaled, scale}},
-                          logical_type::make_decimal(precision, scale)});
-}
-
-std::unique_ptr<ast_node> make_dec128_const(__int128_t unscaled, uint8_t precision, uint8_t scale)
-{
-  return std::make_unique<ast_node>(
-    sirius::ast::constant{sirius::value{sirius::decimal128{unscaled, scale}},
-                          logical_type::make_decimal(precision, scale)});
-}
-
-std::unique_ptr<ast_node> make_cmp(sirius::comparison_type op,
-                                   std::unique_ptr<ast_node> left,
-                                   std::unique_ptr<ast_node> right)
-{
-  return std::make_unique<ast_node>(sirius::ast::comparison{op, std::move(left), std::move(right)});
-}
-
-std::unique_ptr<ast_node> make_func(sirius::function_id id,
-                                    std::vector<std::unique_ptr<ast_node>> args,
-                                    logical_type return_type)
-{
-  return std::make_unique<ast_node>(sirius::ast::function_call{id, std::move(args), return_type});
-}
-
-std::unique_ptr<ast_node> make_conj(sirius::ast::conjunction::kind kind,
-                                    std::vector<std::unique_ptr<ast_node>> children)
-{
-  return std::make_unique<ast_node>(sirius::ast::conjunction{kind, std::move(children)});
-}
-
-std::unique_ptr<ast_node> make_between(std::unique_ptr<ast_node> input,
-                                       std::unique_ptr<ast_node> lower,
-                                       std::unique_ptr<ast_node> upper,
-                                       bool lower_inclusive,
-                                       bool upper_inclusive)
-{
-  return std::make_unique<ast_node>(sirius::ast::between{
-    std::move(input), std::move(lower), std::move(upper), lower_inclusive, upper_inclusive});
-}
-
-std::unique_ptr<ast_node> make_coalesce(std::vector<std::unique_ptr<ast_node>> children,
-                                        logical_type return_type)
-{
-  return std::make_unique<ast_node>(sirius::ast::coalesce{std::move(children), return_type});
-}
-
-std::unique_ptr<ast_node> make_in(std::unique_ptr<ast_node> probe,
-                                  std::vector<std::unique_ptr<ast_node>> values,
-                                  bool negated)
-{
-  return std::make_unique<ast_node>(
-    sirius::ast::in_list{std::move(probe), std::move(values), negated});
-}
-
-std::unique_ptr<ast_node> make_unary(sirius::ast::unary_op::kind kind,
-                                     std::unique_ptr<ast_node> child)
-{
-  return std::make_unique<ast_node>(sirius::ast::unary_op{kind, std::move(child)});
-}
-
-// Wrap an owned Sirius AST node into a sirius::expression for the owning ctors.
-sirius::expression wrap_node(std::unique_ptr<ast_node> n)
-{
-  return sirius::expression{
-    std::make_unique<sirius::expression::impl>(sirius::expression::impl{std::move(n)})};
-}
 
 // Shorthand: build executor, run execute(), return output table view and input table view.
 struct exec_result {

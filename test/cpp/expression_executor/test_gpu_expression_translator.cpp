@@ -15,6 +15,8 @@
  */
 
 // test
+#include "ast_test_support.hpp"
+
 #include <catch.hpp>
 
 // sirius — node-construction surface (build every test expression as a
@@ -59,130 +61,15 @@
 #include <string>
 #include <vector>
 
+using namespace sirius::expr_test;
+
 namespace {
 
 auto const stream = cudf::get_default_stream();
 auto const mr     = cudf::get_current_device_resource_ref();
 
-using ast_node = sirius::ast::node;
 using sirius::logical_type;
 using sirius::type_id;
-
-//===----------------------------------------------------------------------===//
-// Native sirius::ast::node construction helpers
-//===----------------------------------------------------------------------===//
-
-std::unique_ptr<ast_node> make_ref(uint32_t idx)
-{
-  return std::make_unique<ast_node>(sirius::ast::reference{idx});
-}
-
-std::unique_ptr<ast_node> make_ref_typed(uint32_t idx, logical_type type)
-{
-  return std::make_unique<ast_node>(sirius::ast::reference{idx, type});
-}
-
-std::unique_ptr<ast_node> make_int_const(int32_t v)
-{
-  return std::make_unique<ast_node>(
-    sirius::ast::constant{sirius::value{v}, logical_type::make(type_id::INTEGER)});
-}
-
-std::unique_ptr<ast_node> make_bigint_const(int64_t v)
-{
-  return std::make_unique<ast_node>(
-    sirius::ast::constant{sirius::value{v}, logical_type::make(type_id::BIGINT)});
-}
-
-std::unique_ptr<ast_node> make_double_const(double v)
-{
-  return std::make_unique<ast_node>(
-    sirius::ast::constant{sirius::value{v}, logical_type::make(type_id::DOUBLE)});
-}
-
-std::unique_ptr<ast_node> make_str_const(std::string s)
-{
-  return std::make_unique<ast_node>(
-    sirius::ast::constant{sirius::value{std::move(s)}, logical_type::make(type_id::VARCHAR)});
-}
-
-std::unique_ptr<ast_node> make_dec32_const(int32_t unscaled, uint8_t precision, uint8_t scale)
-{
-  return std::make_unique<ast_node>(
-    sirius::ast::constant{sirius::value{sirius::decimal32{unscaled, scale}},
-                          logical_type::make_decimal(precision, scale)});
-}
-
-std::unique_ptr<ast_node> make_dec64_const(int64_t unscaled, uint8_t precision, uint8_t scale)
-{
-  return std::make_unique<ast_node>(
-    sirius::ast::constant{sirius::value{sirius::decimal64{unscaled, scale}},
-                          logical_type::make_decimal(precision, scale)});
-}
-
-// A typed NULL constant (no cuDF AST literal representation).
-std::unique_ptr<ast_node> make_null_const(logical_type type)
-{
-  return std::make_unique<ast_node>(sirius::ast::constant{sirius::value{}, type});
-}
-
-std::unique_ptr<ast_node> make_cmp(sirius::comparison_type op,
-                                   std::unique_ptr<ast_node> left,
-                                   std::unique_ptr<ast_node> right)
-{
-  return std::make_unique<ast_node>(sirius::ast::comparison{op, std::move(left), std::move(right)});
-}
-
-std::unique_ptr<ast_node> make_func(sirius::function_id id,
-                                    std::vector<std::unique_ptr<ast_node>> args,
-                                    logical_type return_type)
-{
-  return std::make_unique<ast_node>(sirius::ast::function_call{id, std::move(args), return_type});
-}
-
-std::unique_ptr<ast_node> make_conj(sirius::ast::conjunction::kind kind,
-                                    std::vector<std::unique_ptr<ast_node>> children)
-{
-  return std::make_unique<ast_node>(sirius::ast::conjunction{kind, std::move(children)});
-}
-
-std::unique_ptr<ast_node> make_between(std::unique_ptr<ast_node> input,
-                                       std::unique_ptr<ast_node> lower,
-                                       std::unique_ptr<ast_node> upper,
-                                       bool lower_inclusive,
-                                       bool upper_inclusive)
-{
-  return std::make_unique<ast_node>(sirius::ast::between{
-    std::move(input), std::move(lower), std::move(upper), lower_inclusive, upper_inclusive});
-}
-
-std::unique_ptr<ast_node> make_cast(std::unique_ptr<ast_node> child,
-                                    logical_type target_type,
-                                    bool try_cast)
-{
-  return std::make_unique<ast_node>(sirius::ast::cast{std::move(child), target_type, try_cast});
-}
-
-std::unique_ptr<ast_node> make_in(std::unique_ptr<ast_node> probe,
-                                  std::vector<std::unique_ptr<ast_node>> values,
-                                  bool negated)
-{
-  return std::make_unique<ast_node>(
-    sirius::ast::in_list{std::move(probe), std::move(values), negated});
-}
-
-std::unique_ptr<ast_node> make_unary(sirius::ast::unary_op::kind kind,
-                                     std::unique_ptr<ast_node> child)
-{
-  return std::make_unique<ast_node>(sirius::ast::unary_op{kind, std::move(child)});
-}
-
-// Wrap an owned Sirius AST node into a sirius::expression (for join_condition).
-sirius::expression wrap_node(std::unique_ptr<ast_node> n)
-{
-  return sirius::expression{
-    std::make_unique<sirius::expression::impl>(sirius::expression::impl{std::move(n)})};
-}
 
 //===----------------------------------------------------------------------===//
 // Translator bridge — translate a hand-built Sirius AST node directly.
@@ -192,29 +79,6 @@ std::optional<sirius::gpu_expression_translator::translated_expression> translat
   sirius::gpu_expression_translator& translator, ast_node const& node)
 {
   return translator.translate_expression(node);
-}
-
-//===----------------------------------------------------------------------===//
-// GPU <-> host copy helpers
-//===----------------------------------------------------------------------===//
-
-template <typename T>
-std::vector<T> copy_column_to_host(cudf::column_view const& col)
-{
-  std::vector<T> host(col.size());
-  if (col.size() > 0) {
-    cudaMemcpy(host.data(), col.data<T>(), sizeof(T) * col.size(), cudaMemcpyDeviceToHost);
-  }
-  return host;
-}
-
-std::vector<uint8_t> copy_bool_column_to_host(cudf::column_view const& col)
-{
-  std::vector<uint8_t> host(col.size());
-  if (col.size() > 0) {
-    cudaMemcpy(host.data(), col.head(), sizeof(uint8_t) * col.size(), cudaMemcpyDeviceToHost);
-  }
-  return host;
 }
 
 //===----------------------------------------------------------------------===//

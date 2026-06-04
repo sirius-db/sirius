@@ -351,28 +351,11 @@ execute_result gpu_expression_executor::execute(sirius::ast::aggregate const& /*
 
 execute_result gpu_expression_executor::execute(sirius::ast::node const& expr, execution_mode mode)
 {
+  // Every sirius::ast alternative has a matching private execute(alt, mode)
+  // overload, so overload resolution enforces dispatch completeness at compile
+  // time (a new alternative without an overload fails to compile here).
   return std::visit(
-    [this, mode](auto const& alt) -> execute_result {
-      using T = std::decay_t<decltype(alt)>;
-      if constexpr (std::is_same_v<T, sirius::ast::reference> ||
-                    std::is_same_v<T, sirius::ast::constant> ||
-                    std::is_same_v<T, sirius::ast::comparison> ||
-                    std::is_same_v<T, sirius::ast::conjunction> ||
-                    std::is_same_v<T, sirius::ast::between> ||
-                    std::is_same_v<T, sirius::ast::case_expr> ||
-                    std::is_same_v<T, sirius::ast::cast> ||
-                    std::is_same_v<T, sirius::ast::unary_op> ||
-                    std::is_same_v<T, sirius::ast::coalesce> ||
-                    std::is_same_v<T, sirius::ast::in_list> ||
-                    std::is_same_v<T, sirius::ast::function_call> ||
-                    std::is_same_v<T, sirius::ast::aggregate>) {
-        return this->execute(alt, mode);
-      } else {
-        static_assert(sizeof(T) == 0,
-                      "Unhandled sirius::ast alternative in execute(sirius::ast::node) dispatcher");
-      }
-    },
-    expr.v);
+    [this, mode](auto const& alt) -> execute_result { return this->execute(alt, mode); }, expr.v);
 }
 
 }  // namespace sirius
