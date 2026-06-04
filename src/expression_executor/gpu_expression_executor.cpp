@@ -178,9 +178,9 @@ gpu_expression_executor::gpu_expression_executor(
   std::size_t min_ast_size)
   : _strategy(strategy), _mr(resource_ref), _stream(stream), _min_ast_size(min_ast_size)
 {
-  _expressions.reserve(expressions.size());
+  _ast_expressions.reserve(expressions.size());
   for (auto const& expr : expressions) {
-    _expressions.push_back(sirius::unwrap(expr));
+    _ast_expressions.push_back(sirius::unwrap(expr));
   }
 }
 
@@ -191,7 +191,7 @@ gpu_expression_executor::gpu_expression_executor(sirius::expression const& expre
                                                  std::size_t min_ast_size)
   : _strategy(strategy), _mr(resource_ref), _stream(stream), _min_ast_size(min_ast_size)
 {
-  _expressions.push_back(sirius::unwrap(expression));
+  _ast_expressions.push_back(sirius::unwrap(expression));
 }
 
 gpu_expression_executor::gpu_expression_executor(duckdb::Expression const* expression,

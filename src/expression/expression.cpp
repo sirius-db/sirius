@@ -15,7 +15,12 @@
  */
 
 // sirius
+#include <expression/ast/from_duckdb.hpp>
 #include <expression/expression_internal.hpp>
+
+// duckdb — wrap()/wrap_many() own duckdb::Expression unique_ptrs by value, so the
+// complete type is needed for their destructors (the internal header no longer pulls it in).
+#include <duckdb/planner/expression.hpp>
 
 // standard library
 #include <memory>
@@ -36,7 +41,12 @@ expression& expression::operator=(expression&&) noexcept = default;
 expression wrap(std::unique_ptr<duckdb::Expression> expr)
 {
   if (!expr) { return expression{}; }
-  return expression{std::make_unique<expression::impl>(expression::impl{std::move(expr)})};
+  // wrap() is the DuckDB->Sirius translation boundary. from_duckdb returns nullptr
+  // for an unsupported shape (a fallback signal) -> yield a null expression; its
+  // own exceptions on a genuinely-unseen ExpressionClass propagate unchanged.
+  auto node = sirius::ast::from_duckdb(*expr);
+  if (!node) { return expression{}; }
+  return expression{std::make_unique<expression::impl>(expression::impl{std::move(node)})};
 }
 
 std::vector<expression> wrap_many(std::vector<std::unique_ptr<duckdb::Expression>> exprs)

@@ -21,6 +21,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "expression/ast/to_duckdb.hpp"
 #include "expression/expression_internal.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "expression_executor/gpu_expression_translator_internal.hpp"
@@ -189,7 +190,7 @@ bool sirius_physical_nested_loop_join::is_supported(
 {
   if (join_type == duckdb::JoinType::MARK) { return true; }
   for (auto& cond : conditions) {
-    auto const* left_expr = sirius::unwrap(cond.left);
+    auto left_expr = sirius::ast::to_duckdb(*sirius::unwrap(cond.left));
     if (left_expr->return_type.InternalType() == duckdb::PhysicalType::STRUCT ||
         left_expr->return_type.InternalType() == duckdb::PhysicalType::LIST ||
         left_expr->return_type.InternalType() == duckdb::PhysicalType::ARRAY) {
@@ -206,7 +207,8 @@ duckdb::vector<sirius::logical_type> sirius_physical_nested_loop_join::get_join_
 {
   duckdb::vector<sirius::logical_type> result;
   for (auto& op : conditions) {
-    result.push_back(sirius::from_duckdb(sirius::unwrap(op.right)->return_type));
+    auto right_expr = sirius::ast::to_duckdb(*sirius::unwrap(op.right));
+    result.push_back(sirius::from_duckdb(right_expr->return_type));
   }
   return result;
 }
@@ -533,18 +535,12 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
     };
 
     for (const auto& cond : conditions) {
-      cudf::size_type left_join_input_index  = resolve_join_col(*sirius::unwrap(cond.left),
-                                                               left_expressions_to_idx,
-                                                               left_batch,
-                                                               left,
-                                                               left_col_views,
-                                                               "left");
-      cudf::size_type right_join_input_index = resolve_join_col(*sirius::unwrap(cond.right),
-                                                                right_expressions_to_idx,
-                                                                right_batch,
-                                                                right,
-                                                                right_col_views,
-                                                                "right");
+      auto left_owned                       = sirius::ast::to_duckdb(*sirius::unwrap(cond.left));
+      auto right_owned                      = sirius::ast::to_duckdb(*sirius::unwrap(cond.right));
+      cudf::size_type left_join_input_index = resolve_join_col(
+        *left_owned, left_expressions_to_idx, left_batch, left, left_col_views, "left");
+      cudf::size_type right_join_input_index = resolve_join_col(
+        *right_owned, right_expressions_to_idx, right_batch, right, right_col_views, "right");
 
       left_refs.emplace_back(left_join_input_index, cudf::ast::table_reference::LEFT);
       right_refs.emplace_back(right_join_input_index, cudf::ast::table_reference::RIGHT);

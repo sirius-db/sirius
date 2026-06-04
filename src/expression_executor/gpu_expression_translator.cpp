@@ -16,7 +16,6 @@
 
 // sirius
 #include <expression/ast/aggregate.hpp>
-#include <expression/ast/from_duckdb.hpp>
 #include <expression/expression_internal.hpp>
 #include <expression_executor/gpu_expression_translator_internal.hpp>
 #include <log/logging.hpp>
@@ -249,12 +248,12 @@ std::optional<expr_ref> gpu_expression_translator::add_join_condition(
   auto right_table_ref =
     swap_sides ? cudf::ast::table_reference::LEFT : cudf::ast::table_reference::RIGHT;
 
-  auto left_node = sirius::ast::from_duckdb(*sirius::unwrap(condition.left));
+  auto const* left_node = sirius::unwrap(condition.left);
   if (!left_node) { return std::nullopt; }
   auto left_expr = add_expression(*left_node, left_table_ref);
   if (!left_expr) { return std::nullopt; }
 
-  auto right_node = sirius::ast::from_duckdb(*sirius::unwrap(condition.right));
+  auto const* right_node = sirius::unwrap(condition.right);
   if (!right_node) { return std::nullopt; }
   auto right_expr = add_expression(*right_node, right_table_ref);
   if (!right_expr) { return std::nullopt; }

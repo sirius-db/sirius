@@ -2348,7 +2348,8 @@ TEST_CASE("native_ast - coalesce (MATERIALIZE)", "[expression_executor_ast_nativ
   std::vector<std::unique_ptr<sirius::ast::node>> children;
   children.push_back(ref_node_native(0));
   children.push_back(int_const_node_native(99));
-  auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::coalesce{std::move(children)});
+  auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::coalesce{
+    std::move(children), sirius::logical_type::make(sirius::type_id::INTEGER)});
 
   auto out = run_native_ast(*space, hand_ast.get(), tv, MAT);
   REQUIRE(out);
@@ -2459,7 +2460,9 @@ TEST_CASE("native_ast - case_expr WHEN/THEN/ELSE (MATERIALIZE)",
     sirius::comparison_type::equal, ref_node_native(0), int_const_node_native(5)});
   cases.back().then_ = int_const_node_native(100);
   auto hand_ast      = std::make_unique<sirius::ast::node>(
-    sirius::ast::case_expr{std::move(cases), int_const_node_native(0)});
+    sirius::ast::case_expr{std::move(cases),
+                           int_const_node_native(0),
+                           sirius::logical_type::make(sirius::type_id::INTEGER)});
 
   auto out = run_native_ast(*space, hand_ast.get(), in.view, MAT);
   REQUIRE(out);

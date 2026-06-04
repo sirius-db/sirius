@@ -17,10 +17,8 @@
 #pragma once
 
 // sirius
+#include <expression/ast/node.hpp>
 #include <expression/expression.hpp>
-
-// duckdb
-#include <duckdb/planner/expression.hpp>
 
 // standard library
 #include <memory>
@@ -32,38 +30,40 @@ namespace sirius {
  * @brief Concrete layout of the sirius::expression PIMPL.
  *
  * Completed only in translation units that include this header. Everywhere else
- * `expression::impl` is an incomplete forward-declared type.
+ * `expression::impl` is an incomplete forward-declared type. The wrapper holds a
+ * Sirius-native AST node; the DuckDB->Sirius translation happens at the wrap()
+ * boundary (see expression.cpp). See https://github.com/sirius-db/sirius/issues/701.
  */
 struct expression::impl {
-  std::unique_ptr<duckdb::Expression> expr;
+  std::unique_ptr<sirius::ast::node> node;
 };
 
 //===----------------------------------------------------------------------===//
 // Read-only unwrap helpers
 //===----------------------------------------------------------------------===//
 
-inline duckdb::Expression const* unwrap(expression const& e) noexcept
+inline sirius::ast::node const* unwrap(expression const& e) noexcept
 {
   auto const* p = e.get_impl();
-  return p ? p->expr.get() : nullptr;
+  return p ? p->node.get() : nullptr;
 }
 
-inline duckdb::Expression* unwrap(expression& e) noexcept
+inline sirius::ast::node* unwrap(expression& e) noexcept
 {
   auto* p = e.get_impl();
-  return p ? p->expr.get() : nullptr;
+  return p ? p->node.get() : nullptr;
 }
 
 /**
- * @brief Transfers the underlying duckdb::Expression out of the wrapper.
+ * @brief Transfers the underlying Sirius AST node out of the wrapper.
  *
  * After this call, the sirius::expression is null.
  */
-inline std::unique_ptr<duckdb::Expression> release(expression& e) noexcept
+inline std::unique_ptr<sirius::ast::node> release(expression& e) noexcept
 {
   auto* p = e.get_impl();
   if (p == nullptr) { return nullptr; }
-  auto out = std::move(p->expr);
+  auto out = std::move(p->node);
   e        = expression{};  // drop the impl so is_null() returns true
   return out;
 }

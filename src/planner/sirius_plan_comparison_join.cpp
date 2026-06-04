@@ -26,6 +26,7 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "expression/ast/to_duckdb.hpp"
 #include "expression/expression_internal.hpp"
 #include "expression/join_condition.hpp"
 #include "helper/type_conversions.hpp"
@@ -348,7 +349,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       bool keys_extractable = true;
       for (const auto& c : hj.conditions) {
         if (c.comparison != sirius::comparison_type::equal) { continue; }
-        auto const* right_expr = sirius::unwrap(c.right);
+        auto right_expr = sirius::ast::to_duckdb(*sirius::unwrap(c.right));
         if (right_expr->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
           keys_extractable = false;
           break;

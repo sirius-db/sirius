@@ -23,6 +23,8 @@
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "expression/ast/node.hpp"
+#include "expression/ast/reference.hpp"
 #include "expression/expression.hpp"
 #include "expression/expression_internal.hpp"
 #include "helper/type_conversions.hpp"
@@ -137,9 +139,8 @@ static bool can_use_partitioned_aggregate(duckdb::ClientContext& context,
         for (auto& partition_col : partition_columns) {
           // we only support bound reference here
           auto const* expr = sirius::unwrap(projection.select_list[partition_col]);
-          if (expr->GetExpressionType() != duckdb::ExpressionType::BOUND_REF) { return false; }
-          auto& ref = expr->Cast<duckdb::BoundReferenceExpression>();
-          new_columns.push_back(ref.index);
+          if (!expr->holds<sirius::ast::reference>()) { return false; }
+          new_columns.push_back(expr->get<sirius::ast::reference>().column_index);
         }
         // continue into child node with new columns
         partition_columns = std::move(new_columns);

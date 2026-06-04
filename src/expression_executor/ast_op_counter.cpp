@@ -153,9 +153,4 @@ std::size_t aggregate::cudf_ast_op_count() const
     "[ast::aggregate::cudf_ast_op_count] aggregate nodes are not lowered to cuDF AST ops (#863).");
 }
 
-std::size_t node::cudf_ast_op_count() const
-{
-  return std::visit([](auto const& alt) { return alt.cudf_ast_op_count(); }, v);
-}
-
 }  // namespace sirius::ast
