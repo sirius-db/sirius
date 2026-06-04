@@ -17,25 +17,21 @@
 #include "scan_manager/sirius_scan_manager.hpp"
 
 #include "exec/thread_pool.hpp"
+#include "io/gpu_ingestible.hpp"
 #include "io/parquet_helpers.hpp"
 #include "io/prefetching_cache.hpp"
 #include "io/s3/s3_blocking_ioctx.hpp"
 #include "io/uring/uring_ioctx.hpp"
 #include "log/logging.hpp"
-#include "op/scan/duckdb_native_scan_info.hpp"
-#include "op/scan/parquet_scan_info.hpp"
-#include "op/scan/scan_info.hpp"
+#include "op/scan/cached_parquet_gpu_ingestible.hpp"
+#include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/scan_plan.hpp"
 #include "op/scan/scan_utils.hpp"
-#include "op/scan/sirius_gpu_duckdb_native_scan_operator.hpp"
-#include "op/scan/sirius_gpu_parquet_scan_operator.hpp"
+#include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "planner/query.hpp"
-#include "scan_manager/cached_split_provider.hpp"
-#include "scan_manager/duckdb_native_split_provider.hpp"
 #include "scan_manager/parquet_metadata.hpp"
-#include "scan_manager/parquet_split_provider.hpp"
 #include "scan_manager/split_connector.hpp"
 #include "scan_manager/split_provider.hpp"
 
@@ -204,47 +200,36 @@ void sirius_scan_manager::prepare_for_query(
     if (!pipeline) { continue; }
     auto source = pipeline->get_source();
     if (!source) { continue; }
+    if (source->type != ::sirius::op::SiriusPhysicalOperatorType::GPU_SCAN) { continue; }
 
-    if (source->type == ::sirius::op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN) {
-      auto* op = &source->Cast<op::scan::sirius_gpu_parquet_scan_operator>();
-      if (_providers_by_op.find(op) != _providers_by_op.end()) { continue; }
+    auto* op = &source->Cast<op::scan::sirius_gpu_scan_operator>();
+    if (_providers_by_op.find(op) != _providers_by_op.end()) { continue; }
 
-      auto provider = create_provider_for(op, gpu_ioctxs, gpu_memory_spaces);
-      if (!provider) { continue; }
-      op->set_split_connector(std::make_unique<split_connector>());
-      _providers_by_op.emplace(op, std::move(provider));
-      _scan_op_order.push_back(op);
+    auto ingestible = create_ingestible_for(op, gpu_ioctxs, gpu_memory_spaces);
+    if (!ingestible) { continue; }
+    op->install_ingestible(ingestible);
 
-      SIRIUS_LOG_DEBUG("[sirius_scan_manager::prepare_for_query] registered parquet op_id={}",
-                       op->get_operator_id());
-    } else if (source->type == ::sirius::op::SiriusPhysicalOperatorType::GPU_DUCKDB_NATIVE_SCAN) {
-      auto* op = &source->Cast<op::scan::sirius_gpu_duckdb_native_scan_operator>();
-      if (_duckdb_native_providers_by_op.find(op) != _duckdb_native_providers_by_op.end()) {
-        continue;
-      }
-      auto provider = create_provider_for(op, gpu_ioctxs, gpu_memory_spaces);
-      if (!provider) { continue; }
-      op->set_split_connector(std::make_unique<split_connector>());
-      _duckdb_native_providers_by_op.emplace(op, std::move(provider));
-      _duckdb_native_scan_op_order.push_back(op);
+    auto provider = std::make_unique<split_provider>(std::move(ingestible));
+    op->set_split_connector(std::make_unique<split_connector>());
+    _providers_by_op.emplace(op, std::move(provider));
+    _scan_op_order.push_back(op);
 
-      SIRIUS_LOG_DEBUG("[sirius_scan_manager::prepare_for_query] registered duckdb-native op_id={}",
-                       op->get_operator_id());
-    }
+    SIRIUS_LOG_DEBUG("[sirius_scan_manager::prepare_for_query] registered gpu scan op_id={}",
+                     op->get_operator_id());
   }
 
-  if (_scan_op_order.empty() && _duckdb_native_scan_op_order.empty()) { return; }
+  if (_scan_op_order.empty()) { return; }
 
   start_metadata_processing();
 }
 
-std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
-  op::scan::sirius_gpu_parquet_scan_operator* op,
+std::shared_ptr<io::gpu_ingestible> sirius_scan_manager::create_ingestible_for(
+  op::scan::sirius_gpu_scan_operator* op,
   std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs,
   std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces)
 {
-  auto info = op->take_scan_info();
-  if (!info) { return nullptr; }
+  auto table_info = op->take_table_info();
+  if (!table_info) { return nullptr; }
 
   // When use_sirius_datasource=false (single-GPU only — multi-GPU runs are
   // forced to true by sirius_config::enforce_sirius_datasource_for_multi_gpu()),
@@ -261,41 +246,35 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
   // prepare_for_query runs before any execute().
   op->set_gpu_ioctxs(effective_gpu_ioctxs);
 
-  // Cache short-circuit lives on the manager (format-agnostic); on miss,
-  // dispatch through the polymorphic make_provider.
-  if (auto cached = try_make_cached_provider(*info, op->get_operator_id(), gpu_memory_spaces)) {
+  // Cache short-circuit: peeks file_paths(), and on a hit steals table_info into
+  // the cached ingestible. On a miss, table_info stays valid for make_gpu_ingestible.
+  if (auto cached =
+        try_make_cached_ingestible(table_info, op->get_operator_id(), gpu_memory_spaces)) {
     return cached;
   }
-  // Combined-runtime: pass *this so the format provider can route per-path
-  // (s3:// -> s3_ioctx via io_ctx_shared_for, local -> per-GPU uring). Upstream
-  // #749's make_provider(gpu_ioctxs) only wired local; S3 needs the scan_manager.
-  return info->make_provider(*this, effective_gpu_ioctxs);
+  return io::make_gpu_ingestible(std::move(table_info), *this, gpu_ioctxs);
 }
 
-std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
-  op::scan::sirius_gpu_duckdb_native_scan_operator* op,
-  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs,
-  std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces)
-{
-  auto info = op->take_scan_info();
-  if (!info) { return nullptr; }
-  if (auto cached = try_make_cached_provider(*info, op->get_operator_id(), gpu_memory_spaces)) {
-    return cached;
-  }
-  return info->make_provider(*this, gpu_ioctxs);
-}
-
-std::unique_ptr<split_provider> sirius_scan_manager::try_make_cached_provider(
-  op::scan::scan_info const& info,
+std::shared_ptr<io::gpu_ingestible> sirius_scan_manager::try_make_cached_ingestible(
+  std::unique_ptr<io::ingestible_table_info>& table_info,
   std::size_t op_id,
   std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces)
 {
-  // If a pinned entry's file paths match this scan_info, build the same
+  if (!table_info) { return nullptr; }
+
+  // Cache is parquet-only today (no pin_duckdb_table path). Cast probe;
+  // non-parquet table_info falls through.
+  auto const* parquet_info =
+    dynamic_cast<op::scan::parquet_ingestible_table_info const*>(table_info.get());
+  if (parquet_info == nullptr) { return nullptr; }
+  auto const& info = *parquet_info;  // alias so the original cache body reads unchanged
+
+  // If a pinned entry's file paths match this table_info, build the same
   // scan_plan the parquet path would build and serve the scan from cache.
   auto matches_scan_info = [&info](const pinned_entry& entry) {
-    if (entry.file_paths.size() != info.file_paths.size()) { return false; }
+    if (entry.file_paths.size() != info.resolved_file_paths.size()) { return false; }
     auto sorted_a = entry.file_paths;
-    auto sorted_b = info.file_paths;
+    auto sorted_b = info.resolved_file_paths;
     std::sort(sorted_a.begin(), sorted_a.end());
     std::sort(sorted_b.begin(), sorted_b.end());
     return sorted_a == sorted_b;
@@ -415,12 +394,14 @@ std::unique_ptr<split_provider> sirius_scan_manager::try_make_cached_provider(
           entry.host_chunks.size(),
           op::scan::needs_output_assembly(plan));
 
-        return std::make_unique<cached_split_provider>(entry.host_chunks,
-                                                       std::move(column_indices),
-                                                       *entry.memory_space,
-                                                       gpu_memory_spaces,
-                                                       std::move(filter_expression),
-                                                       std::move(plan_shared));
+        return std::make_shared<op::scan::cached_parquet_gpu_ingestible>(
+          std::move(table_info),
+          entry.host_chunks,
+          std::move(column_indices),
+          *entry.memory_space,
+          gpu_memory_spaces,
+          std::move(filter_expression),
+          std::move(plan_shared));
       }
 
       // GPU-tier validation: every cached chunk has an owning memory_space.
@@ -463,10 +444,12 @@ std::unique_ptr<split_provider> sirius_scan_manager::try_make_cached_provider(
 
       // Each chunk's data_batch is tagged with its actual memory_space so
       // data-locality scheduling fans cached-scan tasks across GPUs.
-      return std::make_unique<cached_split_provider>(std::move(columns_per_request),
-                                                     entry.chunk_memory_spaces,
-                                                     std::move(filter_expression),
-                                                     std::move(plan_shared));
+      return std::make_shared<op::scan::cached_parquet_gpu_ingestible>(
+        std::move(table_info),
+        std::move(columns_per_request),
+        entry.chunk_memory_spaces,
+        std::move(filter_expression),
+        std::move(plan_shared));
     }
   } catch (...) {
     SIRIUS_LOG_TRACE("not all the columns are pinned for this query");
@@ -495,19 +478,6 @@ void sirius_scan_manager::start_metadata_processing()
       connector->close(std::current_exception());
     }
   }
-  for (auto* op : _duckdb_native_scan_op_order) {
-    auto it = _duckdb_native_providers_by_op.find(op);
-    if (it == _duckdb_native_providers_by_op.end()) { continue; }
-    auto* connector = op->get_split_connector();
-    if (connector == nullptr) { continue; }
-    try {
-      it->second->run(*_dispatcher, *connector);
-    } catch (const std::exception& e) {
-      SIRIUS_LOG_ERROR("[sirius_scan_manager] driver: duckdb-native provider failed to start: {}",
-                       e.what());
-      connector->close(std::current_exception());
-    }
-  }
 }
 
 void sirius_scan_manager::reset()
@@ -516,8 +486,6 @@ void sirius_scan_manager::reset()
   _dispatcher->wait_for_all();
   _scan_op_order.clear();
   _providers_by_op.clear();
-  _duckdb_native_scan_op_order.clear();
-  _duckdb_native_providers_by_op.clear();
   _dispatcher =
     std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads);
 }

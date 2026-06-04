@@ -48,6 +48,7 @@ void query::build_indices()
           source->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN ||
           source->type == op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN ||
           source->type == op::SiriusPhysicalOperatorType::GPU_DUCKDB_NATIVE_SCAN ||
+          source->type == op::SiriusPhysicalOperatorType::GPU_SCAN ||
           source->type == op::SiriusPhysicalOperatorType::CPU_SOURCE) {
         _scan_operators.push_back(source.get());
       }

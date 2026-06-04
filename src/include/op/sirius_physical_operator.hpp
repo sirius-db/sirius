@@ -68,6 +68,8 @@ enum class operator_data_type : uint8_t {
   PARTITIONED,
   PARQUET_SCAN,
   SCAN_CACHED,
+  GPU_SCAN_FRESH,
+  GPU_SCAN_PINNED,
 };
 
 /**
