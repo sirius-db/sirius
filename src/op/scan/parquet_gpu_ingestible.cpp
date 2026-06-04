@@ -511,7 +511,7 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
     }
     seal_current_file();
     // Per-file flush — see comment in parquet_split_provider::run_batch.
-    flush(reader_options, _plan);
+    if (_gpu_ioctxs.size() > 1) { flush(reader_options, _plan); }
   }
   flush(reader_options, _plan);
 }
@@ -533,17 +533,18 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::materialize_table(
   metadatas.reserve(split.rg_slices.size());
   rg_per_src.reserve(split.rg_slices.size());
 
-  if (_gpu_ioctxs.empty()) {
-    throw std::runtime_error(
-      "[parquet_gpu_ingestible::materialize_table] _gpu_ioctxs is empty; per-GPU "
-      "ioctx routing requires SiriusContext to inject the map.");
-  }
-  int const target_device_id = mem_space.get_device_id();
-  auto ioctx_it              = _gpu_ioctxs.find(target_device_id);
-  if (ioctx_it == _gpu_ioctxs.end()) {
-    throw std::out_of_range(
-      "[parquet_gpu_ingestible::materialize_table] no sirius_ioctx for device_id=" +
-      std::to_string(target_device_id) + ".");
+  bool const kvikio_fallback_mode = _gpu_ioctxs.empty();
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>>::const_iterator ioctx_it =
+    _gpu_ioctxs.end();
+  if (!kvikio_fallback_mode) {
+    int const target_device_id = mem_space.get_device_id();
+    ioctx_it                   = _gpu_ioctxs.find(target_device_id);
+    if (ioctx_it == _gpu_ioctxs.end()) {
+      throw std::out_of_range(
+        "[sirius_gpu_parquet_scan_operator::read_table_from_metadata] no sirius_ioctx for "
+        "device_id=" +
+        std::to_string(target_device_id) + ".");
+    }
   }
 
   // Hold uring_io_object shared_ptrs alive for the duration of the read — see
@@ -560,12 +561,31 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::materialize_table(
       return false;
     }();
     auto const ds_ioctx = (slice.io_ctx && !is_per_gpu_local) ? slice.io_ctx : ioctx_it->second;
-    if (slice.io_object) {
-      sources.push_back(ds_ioctx->make_datasource(slice.io_object));
+    if (kvikio_fallback_mode || !slice.io_ctx) {
+      // use_sirius_datasource=false path: use cudf's bundled datasource (kvikio).
+      sources.push_back(cudf::io::datasource::create(slice.file_path));
     } else {
-      auto io_object = ds_ioctx->create_io_object(slice.file_path);
-      sources.push_back(ds_ioctx->make_datasource(io_object));
-      io_objects.push_back(std::move(io_object));
+      // Two-dimensional ioctx selection (multi-GPU #732 × multi-backend-S3).
+      // slice.io_ctx is the backend that minted slice.io_object:
+      //   * per-GPU LOCAL backend (one of _gpu_ioctxs) → rebind the read to the
+      //     *target* GPU's local ioctx so it binds to the executing GPU's CUDA
+      //     context (dev #732 residency); the planning-time GPU may differ.
+      //   * shared REMOTE backend (e.g. the single s3_ioctx) → read through
+      //     slice.io_ctx directly; S3 is network→host and not per-GPU.
+      auto const is_per_gpu_local = [&] {
+        for (auto const& [dev, ctx] : _gpu_ioctxs) {
+          if (ctx == slice.io_ctx) { return true; }
+        }
+        return false;
+      }();
+      auto const ds_ioctx = (slice.io_ctx && !is_per_gpu_local) ? slice.io_ctx : ioctx_it->second;
+      if (slice.io_object) {
+        sources.push_back(ds_ioctx->make_datasource(slice.io_object));
+      } else {
+        auto io_object = ds_ioctx->create_io_object(slice.file_path);
+        sources.push_back(ds_ioctx->make_datasource(io_object));
+        io_objects.push_back(std::move(io_object));
+      }
     }
     metadatas.push_back(*slice.file_metadata);
     rg_per_src.push_back(slice.row_group_indices);

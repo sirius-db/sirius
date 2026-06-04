@@ -20,7 +20,7 @@
 #include <helper/logical_type.hpp>
 #include <io/gpu_ingestible.hpp>
 #include <io/types.hpp>
-#include <op/scan/parquet_scan_operator_data.hpp>  // row_group_slice (still in legacy header for this PR)
+#include <op/scan/row_group_metadata.hpp>  // row_group_slice + hybrid_scan_reader
 #include <op/scan/scan_plan.hpp>
 #include <sirius_config.hpp>
 

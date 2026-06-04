@@ -66,8 +66,6 @@ enum class operator_data_type : uint8_t {
   BASE,
   PIPELINEABLE,
   PARTITIONED,
-  PARQUET_SCAN,
-  SCAN_CACHED,
   GPU_SCAN_FRESH,
   GPU_SCAN_PINNED,
 };

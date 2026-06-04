@@ -1270,8 +1270,7 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
                           static_cast<int>(scan_port->type),
                           static_cast<void*>(scan_port->repo));
         }
-      } else if (first_op.type == op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN ||
-                 first_op.type == op::SiriusPhysicalOperatorType::GPU_DUCKDB_NATIVE_SCAN ||
+      } else if (first_op.type == op::SiriusPhysicalOperatorType::GPU_SCAN ||
                  first_op.type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
                  first_op.type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN ||
                  first_op.type == op::SiriusPhysicalOperatorType::CPU_SOURCE ||
@@ -1279,7 +1278,7 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
                  first_op.type == op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN ||
                  first_op.type == op::SiriusPhysicalOperatorType::EMPTY_RESULT ||
                  first_op.type == op::SiriusPhysicalOperatorType::DUMMY_SCAN) {
-        // scan-like operators don't have a "default" port. GPU_PARQUET_SCAN gets
+        // scan-like operators don't have a "default" port. GPU_SCAN gets
         // its splits via the scan_manager's connector, not via a port.
       } else {
         // Most operators have "default" port
@@ -1315,8 +1314,7 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
                           static_cast<int>(scan_port->type),
                           static_cast<void*>(scan_port->repo));
         }
-      } else if (sink->type == op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN ||
-                 sink->type == op::SiriusPhysicalOperatorType::GPU_DUCKDB_NATIVE_SCAN ||
+      } else if (sink->type == op::SiriusPhysicalOperatorType::GPU_SCAN ||
                  sink->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
                  sink->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN ||
                  sink->type == op::SiriusPhysicalOperatorType::CPU_SOURCE ||

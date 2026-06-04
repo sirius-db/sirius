@@ -167,29 +167,8 @@ std::shared_ptr<::cucascade::data_batch> cached_parquet_gpu_ingestible::produce_
                                                          std::move(gpu_repr));
       } else if constexpr (std::is_same_v<T, host_chunk>) {
         auto sliced = chunk->slice(std::span<const std::size_t>(_column_indices));
-
-        int current_device = -1;
-        auto cuda_err      = cudaGetDevice(&current_device);
-        if (cuda_err != cudaSuccess) {
-          throw std::runtime_error(
-            std::string("[cached_parquet_gpu_ingestible] cudaGetDevice failed during "
-                        "host->gpu conversion: ") +
-            cudaGetErrorString(cuda_err));
-        }
-        auto gpu_it = _gpu_memory_spaces.find(current_device);
-        if (gpu_it == _gpu_memory_spaces.end() || gpu_it->second == nullptr) {
-          throw std::runtime_error(
-            "[cached_parquet_gpu_ingestible] no GPU memory_space registered for device " +
-            std::to_string(current_device));
-        }
-        auto* target_gpu_space = gpu_it->second;
-        auto stream            = target_gpu_space->acquire_stream();
-        auto& registry         = ::sirius::converter_registry::get();
-        auto gpu_repr          = registry.convert<::cucascade::gpu_table_representation>(
-          *sliced, target_gpu_space, stream);
-        stream.synchronize();
         return std::make_shared<::cucascade::data_batch>(::sirius::get_next_batch_id(),
-                                                         std::move(gpu_repr));
+                                                         std::move(sliced));
       }
     },
     _batches[batch_idx]);

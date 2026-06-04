@@ -208,15 +208,11 @@ set(EXTENSION_SOURCES
     src/op/scan/iceberg_scan_task.cpp
     src/op/scan/positional_delete_filter.cpp
     src/op/scan/puffin_reader.cpp
-    src/op/scan/duckdb_native_scan_info.cpp
-    src/op/scan/parquet_scan_info.cpp
     src/op/scan/parquet_scan_task.cpp
     src/op/scan/parquet_schema_mapping.cpp
     src/op/scan/prefetched_data_source.cpp
     src/op/scan/scan_plan.cpp
     src/op/scan/scan_utils.cpp
-    src/op/scan/sirius_gpu_duckdb_native_scan_operator.cpp
-    src/op/scan/sirius_gpu_parquet_scan_operator.cpp
     src/io/gpu_ingestible.cpp
     src/op/scan/sirius_gpu_scan_operator.cpp
     src/op/scan/parquet_gpu_ingestible.cpp
@@ -280,10 +276,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_projection.cpp
     src/planner/sirius_plan_recursive_cte.cpp
     src/planner/sirius_plan_top_n.cpp
-    src/scan_manager/cached_split_provider.cpp
-    src/scan_manager/duckdb_native_split_provider.cpp
     src/pin_table.cpp
-    src/scan_manager/parquet_split_provider.cpp
     src/scan_manager/sirius_scan_manager.cpp
     src/scan_manager/split_connector.cpp
     src/scan_manager/split_provider.cpp
@@ -482,7 +475,6 @@ set(TEST_SOURCES
     test/cpp/io/test_uri_parser.cpp
     test/cpp/integration/test_s3_sql_surface.cpp
     test/cpp/integration/test_s3_perf_benchmark.cpp
-    test/cpp/integration/test_scan_manager_s3_end_to_end.cpp
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
     test/cpp/operator/test_physical_hash_join_mgpu.cpp
     test/cpp/operator/test_physical_order_mgpu.cpp
@@ -513,7 +505,6 @@ set(TEST_SOURCES
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
-    test/cpp/pipeline/test_sirius_read_parquet_converter.cpp
     test/cpp/pipeline/test_pipeline_memory_history.cpp
     test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
     test/cpp/pipeline/test_gpu_pipeline_disk_readback.cpp
@@ -524,7 +515,6 @@ set(TEST_SOURCES
     test/cpp/scan/bench_decode_codecs.cpp
     test/cpp/scan/test_column_builder.cpp
     test/cpp/scan/test_duckdb_block_layout.cpp
-    test/cpp/scan/test_duckdb_native_split_provider.cpp
     test/cpp/scan/test_duckdb_native_walker.cpp
     test/cpp/scan/test_gpu_decode_alp.cpp
     test/cpp/scan/test_gpu_decode_bitpacking.cpp
@@ -533,9 +523,6 @@ set(TEST_SOURCES
     test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_scan_task.cpp
-    test/cpp/scan/test_parquet_split_provider.cpp
-    test/cpp/scan/test_parquet_split_provider_s3.cpp
-    test/cpp/scan/test_partition_inject.cpp
     test/cpp/scan/test_scan_executor.cpp
     test/cpp/scan/test_split_connector.cpp
     test/cpp/scan_manager/test_sirius_scan_manager_s3.cpp

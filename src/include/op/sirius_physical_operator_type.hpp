@@ -149,8 +149,6 @@ enum class SiriusPhysicalOperatorType : uint8_t {
   PARQUET_SCAN,
   ICEBERG_SCAN,
   CPU_SOURCE,
-  GPU_PARQUET_SCAN,
-  GPU_DUCKDB_NATIVE_SCAN,
   GPU_SCAN
 };
 

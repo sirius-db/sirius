@@ -252,7 +252,7 @@ std::shared_ptr<io::gpu_ingestible> sirius_scan_manager::create_ingestible_for(
         try_make_cached_ingestible(table_info, op->get_operator_id(), gpu_memory_spaces)) {
     return cached;
   }
-  return io::make_gpu_ingestible(std::move(table_info), *this, gpu_ioctxs);
+  return io::make_gpu_ingestible(std::move(table_info), *this, effective_gpu_ioctxs);
 }
 
 std::shared_ptr<io::gpu_ingestible> sirius_scan_manager::try_make_cached_ingestible(
@@ -288,7 +288,8 @@ std::shared_ptr<io::gpu_ingestible> sirius_scan_manager::try_make_cached_ingesti
       // rows. Fall through to the per-format path.
       if (entry.is_partial) {
         SIRIUS_LOG_DEBUG(
-          "[sirius_scan_manager::try_make_cached_provider] pinned entry '{}' matches op_id={} but "
+          "[sirius_scan_manager::try_make_cached_ingestible] pinned entry '{}' matches op_id={} "
+          "but "
           "is partial (row-count budget at pin time); falling through to per-format split_provider",
           pinned_name,
           op_id);
@@ -313,7 +314,8 @@ std::shared_ptr<io::gpu_ingestible> sirius_scan_manager::try_make_cached_ingesti
       // which extracts partition values per file at read time.
       if (plan.has_partitions()) {
         SIRIUS_LOG_DEBUG(
-          "[sirius_scan_manager::try_make_cached_provider] pinned entry '{}' matches op_id={} but "
+          "[sirius_scan_manager::try_make_cached_ingestible] pinned entry '{}' matches op_id={} "
+          "but "
           "scan has hive partitions; falling through to per-format split_provider",
           pinned_name,
           op_id);
@@ -344,14 +346,14 @@ std::shared_ptr<io::gpu_ingestible> sirius_scan_manager::try_make_cached_ingesti
         // host_chunks vector instead.
         if (entry.host_chunks.empty()) {
           throw std::runtime_error(
-            "[sirius_scan_manager::try_make_cached_provider] pinned host entry '" + pinned_name +
+            "[sirius_scan_manager::try_make_cached_ingestible] pinned host entry '" + pinned_name +
             "' has no host_chunks");
         }
         for (std::size_t i = 0; i < entry.host_chunks.size(); ++i) {
           if (!entry.host_chunks[i]) {
             throw std::runtime_error(
-              "[sirius_scan_manager::try_make_cached_provider] pinned host entry '" + pinned_name +
-              "' host_chunks[" + std::to_string(i) + "] is null");
+              "[sirius_scan_manager::try_make_cached_ingestible] pinned host entry '" +
+              pinned_name + "' host_chunks[" + std::to_string(i) + "] is null");
           }
         }
         // The HOST cached path materializes host chunks onto the executing
@@ -360,7 +362,7 @@ std::shared_ptr<io::gpu_ingestible> sirius_scan_manager::try_make_cached_ingesti
         // through to the per-format path so the query still succeeds.
         if (gpu_memory_spaces.empty()) {
           SIRIUS_LOG_DEBUG(
-            "[sirius_scan_manager::try_make_cached_provider] pinned host entry '{}' matches "
+            "[sirius_scan_manager::try_make_cached_ingestible] pinned host entry '{}' matches "
             "op_id={} but no gpu_memory_spaces map was provided; falling through to per-format "
             "split_provider",
             pinned_name,
@@ -378,7 +380,7 @@ std::shared_ptr<io::gpu_ingestible> sirius_scan_manager::try_make_cached_ingesti
           auto it = std::find(entry.column_names.begin(), entry.column_names.end(), dc.name);
           if (it == entry.column_names.end()) {
             throw std::runtime_error(
-              "[sirius_scan_manager::try_make_cached_provider] pinned entry '" + pinned_name +
+              "[sirius_scan_manager::try_make_cached_ingestible] pinned entry '" + pinned_name +
               "' missing column '" + dc.name + "' required by scan op");
           }
           column_indices.push_back(
@@ -386,7 +388,7 @@ std::shared_ptr<io::gpu_ingestible> sirius_scan_manager::try_make_cached_ingesti
         }
 
         SIRIUS_LOG_DEBUG(
-          "[sirius_scan_manager::try_make_cached_provider] using host cached_split_provider for "
+          "[sirius_scan_manager::try_make_cached_ingestible] using host cached_split_provider for "
           "op_id={} (pinned='{}' data_cols={} chunks={} needs_assembly={})",
           op_id,
           pinned_name,
@@ -409,13 +411,14 @@ std::shared_ptr<io::gpu_ingestible> sirius_scan_manager::try_make_cached_ingesti
       // data_batches_by_column; empty vector means no chunks; null entries
       // violate the chunks-at-index-i invariant.
       if (entry.chunk_memory_spaces.empty()) {
-        throw std::runtime_error("[sirius_scan_manager::try_make_cached_provider] pinned entry '" +
-                                 pinned_name + "' has no chunk_memory_spaces");
+        throw std::runtime_error(
+          "[sirius_scan_manager::try_make_cached_ingestible] pinned entry '" + pinned_name +
+          "' has no chunk_memory_spaces");
       }
       for (std::size_t i = 0; i < entry.chunk_memory_spaces.size(); ++i) {
         if (entry.chunk_memory_spaces[i] == nullptr) {
           throw std::runtime_error(
-            "[sirius_scan_manager::try_make_cached_provider] pinned entry '" + pinned_name +
+            "[sirius_scan_manager::try_make_cached_ingestible] pinned entry '" + pinned_name +
             "' chunk_memory_spaces[" + std::to_string(i) + "] is null");
         }
       }
@@ -428,14 +431,15 @@ std::shared_ptr<io::gpu_ingestible> sirius_scan_manager::try_make_cached_ingesti
         auto it = entry.data_batches_by_column.find(dc.name);
         if (it == entry.data_batches_by_column.end()) {
           throw std::runtime_error(
-            "[sirius_scan_manager::try_make_cached_provider] pinned entry '" + pinned_name +
+            "[sirius_scan_manager::try_make_cached_ingestible] pinned entry '" + pinned_name +
             "' missing column '" + dc.name + "' required by scan op");
         }
         columns_per_request.push_back(it->second);
       }
 
       SIRIUS_LOG_DEBUG(
-        "[sirius_scan_manager::try_make_cached_provider] using cached_split_provider for op_id={} "
+        "[sirius_scan_manager::try_make_cached_ingestible] using cached_split_provider for "
+        "op_id={} "
         "(pinned='{}' data_cols={} needs_assembly={})",
         op_id,
         pinned_name,

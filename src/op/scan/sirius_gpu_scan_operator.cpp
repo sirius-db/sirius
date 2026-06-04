@@ -101,17 +101,6 @@ sirius_gpu_scan_operator::~sirius_gpu_scan_operator() = default;
 //===----------------------------------------------------------------------===//
 // Per-GPU ioctx map injection
 //===----------------------------------------------------------------------===//
-// Called by sirius_scan_manager::create_provider_for() during prepare_for_query,
-// before any execute() runs. read_table_from_metadata() reads from _gpu_ioctxs to
-// route each parquet open through ioctx->make_datasource(uring_io_object), which
-// avoids the cudf-bundled file_source factory that bypasses the ioctx framework
-// and routes through libkvikio (a source of cross-GPU context binding races).
-//
-// _gpu_ioctxs is empty in single-GPU mode with use_sirius_datasource=false; in
-// that case read_table_from_metadata falls back to cudf::io::datasource::create
-// (kvikio) since with only one GPU the per-FileHandle context binding is
-// harmless. Multi-GPU mode always populates this map — enforced by
-// sirius_config::enforce_sirius_datasource_for_multi_gpu().
 void sirius_gpu_scan_operator::set_gpu_ioctxs(
   std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> ioctxs)
 {
@@ -221,18 +210,7 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
         "prepare_for_processing must have produced a GPU-resident batch.");
     }
     auto& gpu_rep = ro_batch.get_data()->cast<::cucascade::gpu_table_representation>();
-    auto view     = gpu_rep.get_table_view();
-
-    // Materialize the cached view into an owning table so post_filter_and_project
-    // can move-consume it. Matches the existing scan_cached_operator_data branch
-    // in sirius_gpu_parquet_scan_operator::execute (one column-wise copy).
-    std::vector<std::unique_ptr<cudf::column>> owned_cols;
-    owned_cols.reserve(view.num_columns());
-    for (cudf::size_type i = 0; i < view.num_columns(); ++i) {
-      owned_cols.push_back(std::make_unique<cudf::column>(
-        view.column(i), stream, cudf::get_current_device_resource_ref()));
-    }
-    auto owning_input = std::make_unique<cudf::table>(std::move(owned_cols));
+    auto owning_input = gpu_rep.release_table(stream);
 
     table = _ingestible->post_filter_and_project(
       std::move(owning_input), *pinned->filter_info, *batch_mr, stream);

@@ -148,30 +148,6 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
       "[duckdb_native_gpu_ingestible] projected_cols and projected_types must be parallel");
   }
 
-  // Clone the bind fields into a legacy-shaped scan_info so the existing
-  // decoder (which still expects shared_ptr<duckdb_native_scan_info const>)
-  // can read them. Step 10 refactors the decoder; until then both shapes
-  // live side-by-side.
-  auto legacy                    = std::make_unique<duckdb_native_scan_info>();
-  legacy->returned_types         = bind.returned_types;
-  legacy->file_paths             = {bind.db_path};
-  legacy->column_ids             = bind.column_ids;
-  legacy->projection_ids         = bind.projection_ids;
-  legacy->names                  = bind.names;
-  legacy->partition_indices      = {};
-  legacy->approximate_batch_size = bind.approximate_batch_size;
-  legacy->scan_output_arity      = bind.output_types.size();
-  legacy->storage                = bind.storage;
-  legacy->context                = bind.context;
-  legacy->projected_cols         = bind.projected_cols;
-  legacy->projected_types        = bind.projected_types;
-  legacy->output_types           = bind.output_types;
-  legacy->db_path                = bind.db_path;
-  // table_filters is unique_ptr; we keep it on the new ingestible_table_info
-  // (read at construction below) and leave the legacy view null. The decoder
-  // doesn't consult table_filters — filter eval is post-decode.
-  _legacy_scan_info = std::move(legacy);
-
   // Walk metadata once.
   _metadata = walk_duckdb_native_metadata(
     *bind.storage, *bind.context, bind.projected_cols, bind.projected_types);
@@ -250,8 +226,9 @@ duckdb_native_gpu_ingestible::next_split_provider()
 
   return [this, claimed, apply_filter, projection_required, output_arity, has_post_processing]()
            -> std::vector<std::unique_ptr<op::operator_data>> {
-    auto split_info                  = std::make_unique<duckdb_native_split_info>();
-    split_info->payload.scan_info    = _legacy_scan_info;
+    auto split_info = std::make_unique<duckdb_native_split_info>();
+    split_info->payload.table_info =
+      &static_cast<duckdb_native_ingestible_table_info const&>(table_info());
     split_info->payload.io_ctx       = _io_ctx;
     split_info->payload.db_io_object = _db_io_object;
     split_info->payload.row_groups.reserve(claimed.count);

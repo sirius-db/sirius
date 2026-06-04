@@ -19,9 +19,8 @@
 // sirius
 #include <helper/logical_type.hpp>
 #include <io/gpu_ingestible.hpp>
+#include <op/scan/duckdb_native_decoder.hpp>  // duckdb_native_split_payload
 #include <op/scan/duckdb_native_metadata.hpp>
-#include <op/scan/duckdb_native_scan_info.hpp>            // legacy carrier still needed by decoder
-#include <scan_manager/duckdb_native_split_provider.hpp>  // split_payload (moves out in step 10)
 #include <sirius_config.hpp>
 
 // duckdb
@@ -105,7 +104,7 @@ class duckdb_native_ingestible_table_info : public io::ingestible_table_info {
  */
 class duckdb_native_split_info : public io::scan_info {
  public:
-  scan_manager::duckdb_native_split_provider::split_payload payload;
+  duckdb_native_split_payload payload;
 
   [[nodiscard]] std::size_t estimated_bytes() const noexcept override
   {
@@ -168,11 +167,6 @@ class duckdb_native_gpu_ingestible : public io::gpu_ingestible {
   };
 
   duckdb_native_metadata _metadata;
-  /// Legacy-shape clone of the bind data carried on every split_payload —
-  /// the decoder still expects @c shared_ptr<duckdb_native_scan_info const>.
-  /// Built once in the constructor from the new
-  /// @c duckdb_native_ingestible_table_info.
-  std::shared_ptr<duckdb_native_scan_info const> _legacy_scan_info;
   std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
   std::shared_ptr<sirius::io::sirius_io_object> _db_io_object;
   /// Pre-built coalesced filter expression. Empty when no translatable
