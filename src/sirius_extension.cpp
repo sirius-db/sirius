@@ -1389,6 +1389,22 @@ static void SetMaxSortPartitionBytes(ClientContext& context, SetScope scope, Val
                    params->max_sort_partition_bytes);
 }
 
+static void SetMaxSortPartitionMemoryFraction(ClientContext& context,
+                                              SetScope scope,
+                                              Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  const double fraction = parameter.GetValue<double>();
+  if (fraction < 0.0 || fraction > 1.0) {
+    throw InvalidInputException(
+      "max_sort_partition_memory_fraction must be between 0.0 and 1.0, got {}", fraction);
+  }
+  params->max_sort_partition_memory_fraction = fraction;
+  SIRIUS_LOG_DEBUG("Updated config MAX_SORT_PARTITION_MEMORY_FRACTION to {}",
+                   params->max_sort_partition_memory_fraction);
+}
+
 static void SetHashPartitionBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -1557,10 +1573,17 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 
   // Add in config option for sort partition size
   config.AddExtensionOption("max_sort_partition_bytes",
-                            "Maximum bytes per sort partition (0 = auto based on 33% GPU memory)",
+                            "Maximum bytes per sort partition (0 = auto based on "
+                            "max_sort_partition_memory_fraction of GPU memory)",
                             LogicalType::UBIGINT,
                             Value::UBIGINT(sirius::operator_params{}.max_sort_partition_bytes),
                             SetMaxSortPartitionBytes);
+  config.AddExtensionOption(
+    "max_sort_partition_memory_fraction",
+    "Fraction of available GPU memory per sort partition when max_sort_partition_bytes is 0",
+    LogicalType::DOUBLE,
+    Value::DOUBLE(sirius::operator_params{}.max_sort_partition_memory_fraction),
+    SetMaxSortPartitionMemoryFraction);
 
   // Logging configuration
   config.AddExtensionOption("sirius_log_level",
