@@ -502,20 +502,20 @@ staged_column stage_one_varchar_column(staging_state& s,
 //
 // Buffered host_read_async into a pinned multiple_blocks_allocation that mirrors
 // the device-buffer layout (host byte offset == device byte offset), followed by
-// a bulk pinned->device copy. Versus per-segment O_DIRECT device_read_async this
+// a bulk pinned->device copy. This
 // (a) hits the OS page cache on warm runs instead of always hitting the NVMe,
 // (b) collapses N per-chunk H2D copies + stream callbacks into one async copy
-// per host block, and (c) coalesces file+buffer-contiguous reads. No segment is
-// copied twice: each read lands directly in its final pinned slot.
+//     per host block, and
+// (c) coalesces file+buffer-contiguous reads.
 //===----------------------------------------------------------------------===//
 
 using multiple_blocks_allocation =
   cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
 
-// Merge reads that are contiguous in BOTH the file and the device/host buffer.
-// A merged read maps one contiguous file range onto one contiguous mirror-buffer
-// range, so it can be issued as a single (block-split) host read. Reads arrive
-// in device-offset order already; the sort is defensive.
+/// @brief Merge reads that are contiguous in BOTH the file and the device/host buffer.
+/// A merged read maps one contiguous file range onto one contiguous mirror-buffer
+/// range, so it can be issued as a single (block-split) host read. Reads arrive
+/// in device-offset order already; the sort is defensive.
 std::vector<device_read_job> coalesce_reads(std::vector<device_read_job> reads)
 {
   std::sort(reads.begin(), reads.end(), [](auto const& a, auto const& b) {
@@ -537,8 +537,8 @@ std::vector<device_read_job> coalesce_reads(std::vector<device_read_job> reads)
   return merged;
 }
 
-// memcpy `n` host bytes into the block-fragmented allocation at global byte
-// offset `g`, spanning block boundaries as needed.
+/// @brief memcpy `n` host bytes into the block-fragmented allocation at global byte
+/// offset `g`, spanning block boundaries as needed.
 void copy_into_mirror(multiple_blocks_allocation& alloc,
                       std::size_t g,
                       uint8_t const* src,
@@ -560,6 +560,7 @@ void submit_and_await(rmm::device_buffer& device_buf,
                       sirius::io::sirius_ioctx& io_ctx,
                       sirius::io::sirius_io_object& io_obj,
                       cucascade::memory::memory_reservation_manager& host_mem_mgr,
+                      int host_numa_node,
                       rmm::cuda_stream_view stream)
 {
   namespace ccm = cucascade::memory;
@@ -569,8 +570,12 @@ void submit_and_await(rmm::device_buffer& device_buf,
 
   // Pinned host staging buffer mirroring the device buffer (same byte offsets),
   // drawn from the host FSMR pool so we reuse pre-pinned blocks instead of
-  // paying a cudaHostAlloc per split.
-  ccm::any_memory_space_in_tier host_req(ccm::Tier::HOST);
+  // paying a cudaHostAlloc per split. Host spaces are keyed by NUMA node; prefer
+  // the node local to the GPU that owns device_buf (so the H2D copy is a
+  // node-local transfer). The strategy keeps the other host spaces as fallback,
+  // so this is a no-op on single-NUMA hosts and never fails to find a space.
+  ccm::any_memory_space_in_tier_with_preference host_req(ccm::Tier::HOST,
+                                                         static_cast<std::size_t>(host_numa_node));
   auto reservation = host_mem_mgr.request_reservation(host_req, total);
   if (!reservation) {
     throw std::runtime_error(std::string(kTag) + " failed to reserve " + std::to_string(total) +
@@ -672,8 +677,8 @@ void submit_and_await(rmm::device_buffer& device_buf,
 #endif
 #else
   for (std::size_t i = 0; i < h2d_dst.size(); ++i) {
-    RMM_CUDA_TRY(cudaMemcpyAsync(
-      h2d_dst[i], h2d_src[i], h2d_size[i], cudaMemcpyHostToDevice, stream.value()));
+    RMM_CUDA_TRY(
+      cudaMemcpyAsync(h2d_dst[i], h2d_src[i], h2d_size[i], cudaMemcpyHostToDevice, stream.value()));
   }
 #endif
 
@@ -869,8 +874,17 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
     if (!sirius_st) {
       throw std::runtime_error(std::string(kTag) + " no sirius_state on the ClientContext");
     }
+    // NUMA node of the GPU that owns device_buf (mem_space). Host staging is then
+    // reserved on that node. topo.gpus is indexed by device id; normalize an
+    // unknown/negative node to 0, matching SiriusContext's host-space convention.
+    auto const gpu_dev  = mem_space.get_device_id();
+    auto const& topo    = sirius_st->get_hw_topology();
+    int const raw_numa  = (gpu_dev >= 0 && static_cast<std::size_t>(gpu_dev) < topo.gpus.size())
+                            ? topo.gpus[gpu_dev].numa_node
+                            : -1;
+    int const host_numa = (raw_numa < 0) ? 0 : raw_numa;
     submit_and_await(
-      device_buf, staging, *io_ctx, *io_obj, sirius_st->get_memory_manager(), stream);
+      device_buf, staging, *io_ctx, *io_obj, sirius_st->get_memory_manager(), host_numa, stream);
   }
 
   // Group fixed-width columns for a single gpu_decode_table call; varchar
