@@ -208,7 +208,9 @@ In the diagrams below, `[A, B, C]` denotes a pipeline where A is `operators[0]` 
 
 TABLE_SCAN splits along two paths depending on the table function:
 
-**Parquet (`parquet_scan` / `read_parquet`):** TABLE_SCAN is replaced with `GPU_PARQUET_SCAN` at `operators[0]` of the same pipeline — no separate scan pipeline is created. The DuckDB bind data is captured into a `parquet_scan_info` and parked on the operator. During `prepare_for_query`, `sirius_scan_manager` reads the info, builds a `split_provider` (parquet or cached), and binds a `split_connector` to the operator. The operator pulls splits from the connector inside `get_next_task_input_data()` (see [Scan — Scan Manager](scan.md#scan-manager)).
+**Parquet (`parquet_scan` / `read_parquet`, including `s3://` paths):** TABLE_SCAN is replaced with `GPU_PARQUET_SCAN` at `operators[0]` of the same pipeline — no separate scan pipeline is created. The DuckDB bind data is captured into a `parquet_scan_info` (a concrete `scan_info` subclass) and parked on the operator. During `prepare_for_query`, `sirius_scan_manager` reads the info, builds a `split_provider` via `scan_info::make_provider()` (parquet or cached), and binds a `split_connector` to the operator. The operator pulls splits from the connector inside `get_next_task_input_data()` (see [Scan — Scan Manager](scan.md#scan-manager)).
+
+**DuckDB-native (`seq_scan` against an attached `.duckdb` file):** TABLE_SCAN is replaced with `GPU_DUCKDB_NATIVE_SCAN` at `operators[0]` when the bound table entry is a native DuckDB format table. A `duckdb_native_scan_info` is parked on the operator and consumed by a `duckdb_native_split_provider` during `prepare_for_query`.
 
 **DuckDB-managed (`seq_scan`, `iceberg_scan`):** A separate scan pipeline is created, and the original TABLE_SCAN is kept as the first operator of the main pipeline:
 
@@ -275,20 +277,18 @@ graph LR
 - Build-side CONCAT pushes to the HASH_JOIN's `"build"` port with `FULL` barrier (default)
 - The probe and build PARTITION operators are linked as siblings for partition count coordination
 
-### ORDER_BY → 4-Phase Sort
+### ORDER_BY → 3-Phase Sort
 
 ```mermaid
 graph LR
-    P1["Pipeline 1<br/>[scan, ..., ORDER_BY]"] -->|"PIPELINE"| P2["Pipeline 2<br/>[SORT_SAMPLE]"]
-    P2 -->|"PIPELINE"| P3["Pipeline 3<br/>[SORT_PARTITION]"]
-    P3 -->|"FULL"| P4["Pipeline 4<br/>[MERGE_SORT]"]
-    P4 -->|"FULL"| DS["downstream"]
+    P1["Pipeline 1<br/>[scan, ..., ORDER_BY]"] -->|"PIPELINE"| P2["Pipeline 2<br/>[SORT_SAMPLE, SORT_PARTITION]"]
+    P2 -->|"FULL"| P3["Pipeline 3<br/>[MERGE_SORT]"]
+    P3 -->|"FULL"| DS["downstream"]
 ```
 
 1. **Pipeline 1**: Current pipeline keeps ORDER_BY as sink (local sort per batch)
-2. **Pipeline 2**: SORT_SAMPLE. `PIPELINE` barrier — batches arrive as produced; sort_sample overrides `get_next_task_hint()` to wait for N samples before computing boundaries
-3. **Pipeline 3**: SORT_PARTITION. `PIPELINE` barrier — range-partitions data using computed boundaries
-4. **Pipeline 4**: MERGE_SORT. `FULL` barrier — must wait for all partitions. Downstream pipelines that previously used ORDER_BY as source are updated to use MERGE_SORT
+2. **Pipeline 2**: SORT_SAMPLE and SORT_PARTITION run back-to-back in the same `gpu_pipeline_task`. `PIPELINE` barrier from Pipeline 1 — batches arrive as produced; SORT_SAMPLE overrides `get_next_task_hint()` to wait for N samples before computing boundaries; SORT_PARTITION reads boundaries directly from SORT_SAMPLE via `_sample_op`
+3. **Pipeline 3**: MERGE_SORT. `FULL` barrier — must wait for all partitions. Downstream pipelines that previously used ORDER_BY as source are updated to use MERGE_SORT
 
 ### HASH_GROUP_BY
 
