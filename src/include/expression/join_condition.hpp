@@ -16,14 +16,12 @@
 
 #pragma once
 
-// sirius
-#include <expression/expression.hpp>
-
 // duckdb
 #include <duckdb/common/vector.hpp>
 
 // standard library
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace duckdb {
@@ -32,6 +30,14 @@ struct JoinCondition;
 }  // namespace duckdb
 
 namespace sirius {
+
+// sirius::ast::node is defined in expression/ast/node.hpp. Only a forward
+// declaration is needed here because join_condition stores it via
+// std::unique_ptr; including node.hpp would form an include cycle
+// (node.hpp -> comparison.hpp -> join_condition.hpp).
+namespace ast {
+struct node;
+}  // namespace ast
 
 /**
  * @brief Sirius-side mirror of the subset of duckdb::ExpressionType comparison operators
@@ -54,12 +60,12 @@ enum class comparison_type : uint8_t {
 /**
  * @brief Sirius-native mirror of duckdb::JoinCondition.
  *
- * Holds two opaque-wrapped expressions plus the comparison operator relating them.
- * The left/right sides are move-only by virtue of sirius::expression.
+ * Holds the two Sirius AST node sides plus the comparison operator relating them.
+ * The left/right sides are move-only by virtue of std::unique_ptr.
  */
 struct join_condition {
-  expression left;
-  expression right;
+  std::unique_ptr<sirius::ast::node> left;
+  std::unique_ptr<sirius::ast::node> right;
   comparison_type comparison{comparison_type::equal};
 };
 

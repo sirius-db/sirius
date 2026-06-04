@@ -15,7 +15,8 @@
  */
 
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "expression/expression.hpp"
+#include "expression/ast/from_duckdb.hpp"
+#include "expression/ast/node.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
@@ -23,7 +24,28 @@
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
+#include <memory>
+
 namespace sirius::planner {
+
+namespace {
+
+// Translate a vector of DuckDB expressions into Sirius AST nodes at the planner
+// boundary. The source vector is drained; size and order are preserved, with a
+// null slot wherever from_duckdb declines an unsupported shape (a fallback
+// signal) — matching the prior bulk-translation null-skip semantics.
+duckdb::vector<std::unique_ptr<sirius::ast::node>> translate_expressions(
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs)
+{
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> out;
+  out.reserve(exprs.size());
+  for (auto& e : exprs) {
+    out.push_back(e ? sirius::ast::from_duckdb(*e) : nullptr);
+  }
+  return out;
+}
+
+}  // namespace
 
 static void gather_delim_scans(
   sirius::op::sirius_physical_operator& op,
@@ -95,8 +117,8 @@ sirius_physical_plan_generator::plan_delim_join(duckdb::LogicalComparisonJoin& o
   // chunk
   delim_join->distinct = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate>(
     sirius::from_duckdb_vec(delim_types),
-    sirius::wrap_many(std::move(distinct_expressions)),
-    sirius::wrap_many(std::move(distinct_groups)),
+    translate_expressions(std::move(distinct_expressions)),
+    translate_expressions(std::move(distinct_groups)),
     op.estimated_cardinality);
 
   return std::move(delim_join);

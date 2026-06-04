@@ -22,7 +22,6 @@
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression/ast/to_duckdb.hpp"
-#include "expression/expression_internal.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "expression_executor/gpu_expression_translator_internal.hpp"
 #include "helper/type_conversions.hpp"
@@ -190,7 +189,7 @@ bool sirius_physical_nested_loop_join::is_supported(
 {
   if (join_type == duckdb::JoinType::MARK) { return true; }
   for (auto& cond : conditions) {
-    auto left_expr = sirius::ast::to_duckdb(*sirius::unwrap(cond.left));
+    auto left_expr = sirius::ast::to_duckdb(*cond.left);
     if (left_expr->return_type.InternalType() == duckdb::PhysicalType::STRUCT ||
         left_expr->return_type.InternalType() == duckdb::PhysicalType::LIST ||
         left_expr->return_type.InternalType() == duckdb::PhysicalType::ARRAY) {
@@ -207,7 +206,7 @@ duckdb::vector<sirius::logical_type> sirius_physical_nested_loop_join::get_join_
 {
   duckdb::vector<sirius::logical_type> result;
   for (auto& op : conditions) {
-    auto right_expr = sirius::ast::to_duckdb(*sirius::unwrap(op.right));
+    auto right_expr = sirius::ast::to_duckdb(*op.right);
     result.push_back(sirius::from_duckdb(right_expr->return_type));
   }
   return result;
@@ -536,8 +535,8 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
     };
 
     for (const auto& cond : conditions) {
-      auto const* left_node                 = sirius::unwrap(cond.left);
-      auto const* right_node                = sirius::unwrap(cond.right);
+      auto const* left_node                 = cond.left.get();
+      auto const* right_node                = cond.right.get();
       auto left_owned                       = sirius::ast::to_duckdb(*left_node);
       auto right_owned                      = sirius::ast::to_duckdb(*right_node);
       cudf::size_type left_join_input_index = resolve_join_col(

@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_parquet_scan.hpp"
 
+#include "expression/ast/from_duckdb.hpp"
 #include "expression_executor/gpu_expression_translator_internal.hpp"
 #include "log/logging.hpp"
 #include "op/scan/scan_utils.hpp"
@@ -176,8 +177,8 @@ sirius_physical_parquet_scan::sirius_physical_parquet_scan(
         // Instruct the sirius_physical_table_scan operator to bypass execute()
         if (table_scan) { table_scan->passthrough = true; }
       }
-      // Move the duckdb_expression into the table scan
-      if (table_scan) { table_scan->filter_expr = sirius::wrap(std::move(duckdb_expression)); }
+      // Translate the duckdb_expression into the table scan's Sirius AST filter
+      if (table_scan) { table_scan->filter_expr = sirius::ast::from_duckdb(*duckdb_expression); }
     }
   }
 }

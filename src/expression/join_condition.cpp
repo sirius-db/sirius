@@ -15,7 +15,7 @@
  */
 
 // sirius
-#include <expression/expression_internal.hpp>
+#include <expression/ast/from_duckdb.hpp>
 #include <expression/join_condition.hpp>
 
 // duckdb
@@ -70,8 +70,8 @@ std::vector<join_condition> wrap_join_conditions(std::vector<duckdb::JoinConditi
   out.reserve(conds.size());
   for (auto& c : conds) {
     out.push_back(join_condition{
-      wrap(std::move(c.left)),
-      wrap(std::move(c.right)),
+      sirius::ast::from_duckdb(*c.left),
+      sirius::ast::from_duckdb(*c.right),
       from_duckdb(c.comparison),
     });
   }
@@ -84,8 +84,8 @@ duckdb::vector<join_condition> wrap_join_conditions(duckdb::vector<duckdb::JoinC
   out.reserve(conds.size());
   for (auto& c : conds) {
     out.push_back(join_condition{
-      wrap(std::move(c.left)),
-      wrap(std::move(c.right)),
+      sirius::ast::from_duckdb(*c.left),
+      sirius::ast::from_duckdb(*c.right),
       from_duckdb(c.comparison),
     });
   }

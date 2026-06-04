@@ -17,13 +17,35 @@
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
-#include "expression/expression.hpp"
+#include "expression/ast/from_duckdb.hpp"
+#include "expression/ast/node.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_projection.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
+#include <memory>
+
 namespace sirius::planner {
+
+namespace {
+
+// Translate a vector of DuckDB expressions into Sirius AST nodes at the planner
+// boundary. The source vector is drained; size and order are preserved, with a
+// null slot wherever from_duckdb declines an unsupported shape (a fallback
+// signal) — matching the prior bulk-translation null-skip semantics.
+duckdb::vector<std::unique_ptr<sirius::ast::node>> translate_expressions(
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs)
+{
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> out;
+  out.reserve(exprs.size());
+  for (auto& e : exprs) {
+    out.push_back(e ? sirius::ast::from_duckdb(*e) : nullptr);
+  }
+  return out;
+}
+
+}  // namespace
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalFilter& op)
@@ -33,7 +55,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalFilter& op)
   if (!op.expressions.empty()) {
     D_ASSERT(plan->types.size() > 0);
     // If the filter carries multiple predicates, AND them together into a single expression so
-    // the operator only ever owns one sirius::expression.
+    // the operator only ever owns one Sirius AST node.
     duckdb::unique_ptr<duckdb::Expression> combined;
     if (op.expressions.size() > 1) {
       auto conjunction = duckdb::make_uniq<duckdb::BoundConjunctionExpression>(
@@ -46,7 +68,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalFilter& op)
       combined = std::move(op.expressions[0]);
     }
     auto filter = duckdb::make_uniq<sirius::op::sirius_physical_filter>(
-      plan->types, sirius::wrap(std::move(combined)), op.estimated_cardinality);
+      plan->types, sirius::ast::from_duckdb(*combined), op.estimated_cardinality);
     filter->children.push_back(std::move(plan));
     plan = std::move(filter);
   }
@@ -59,7 +81,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalFilter& op)
     }
     auto proj = duckdb::make_uniq<sirius::op::sirius_physical_projection>(
       sirius::from_duckdb_vec(op.types),
-      sirius::wrap_many(std::move(select_list)),
+      translate_expressions(std::move(select_list)),
       op.estimated_cardinality);
     proj->children.push_back(std::move(plan));
     plan = std::move(proj);

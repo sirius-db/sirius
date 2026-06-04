@@ -17,7 +17,6 @@
 #include <catch.hpp>
 #include <cucascade/data/data_repository_manager.hpp>
 #include <duckdb.hpp>
-#include <expression/expression.hpp>
 #include <helper/logical_type.hpp>
 #include <op/sirius_physical_column_data_scan.hpp>
 #include <op/sirius_physical_delim_join.hpp>

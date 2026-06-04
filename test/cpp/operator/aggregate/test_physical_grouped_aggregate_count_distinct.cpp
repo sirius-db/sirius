@@ -58,6 +58,19 @@ namespace {
 using namespace sirius::test::operator_utils;
 using sirius::test::vector_to_cudf_column;
 
+// Translate a vector of DuckDB expressions into Sirius AST nodes (size/order
+// preserved, null slot for an unsupported shape).
+inline duckdb::vector<std::unique_ptr<sirius::ast::node>> translate_expressions(
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs)
+{
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> out;
+  out.reserve(exprs.size());
+  for (auto& e : exprs) {
+    out.push_back(e ? sirius::ast::from_duckdb(*e) : nullptr);
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Helper: build input table [key_col (int32), val_col (T)]
 // ---------------------------------------------------------------------------
@@ -409,13 +422,13 @@ TEST_CASE("count distinct: mixed with regular aggregations, multiple batches",
   }
 
   sirius_physical_grouped_aggregate local_op(std::move(output_types),
-                                             sirius::wrap_many(std::move(aggregates)),
-                                             sirius::wrap_many(std::move(groups)),
+                                             translate_expressions(std::move(aggregates)),
+                                             translate_expressions(std::move(groups)),
                                              2 /*estimated_cardinality*/);
 
   sirius_physical_grouped_aggregate_merge merge_op(std::move(output_types2),
-                                                   sirius::wrap_many(std::move(aggregates2)),
-                                                   sirius::wrap_many(std::move(groups2)),
+                                                   translate_expressions(std::move(aggregates2)),
+                                                   translate_expressions(std::move(groups2)),
                                                    2 /*estimated_cardinality*/);
 
   auto local1 = run_local(local_op, batch1);

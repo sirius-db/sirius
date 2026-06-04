@@ -25,10 +25,11 @@
 #include "duckdb/execution/radix_partitioned_hashtable.hpp"
 #include "duckdb/parser/group_by_node.hpp"
 #include "duckdb/storage/data_table.hpp"
-#include "expression/expression.hpp"
+#include "expression/ast/node.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/sirius_physical_operator.hpp"
 
+#include <memory>
 #include <numeric>
 
 namespace sirius {
@@ -41,14 +42,14 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
 
  public:
   sirius_physical_grouped_aggregate(duckdb::vector<sirius::logical_type> types,
-                                    duckdb::vector<sirius::expression> expressions,
-                                    duckdb::vector<sirius::expression> groups,
+                                    duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions,
+                                    duckdb::vector<std::unique_ptr<sirius::ast::node>> groups,
                                     std::size_t estimated_cardinality);
 
   sirius_physical_grouped_aggregate(
     duckdb::vector<sirius::logical_type> types,
-    duckdb::vector<sirius::expression> expressions,
-    duckdb::vector<sirius::expression> groups,
+    duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions,
+    duckdb::vector<std::unique_ptr<sirius::ast::node>> groups,
     duckdb::vector<duckdb::GroupingSet> grouping_sets,
     duckdb::vector<duckdb::unsafe_vector<std::size_t>> grouping_functions,
     std::size_t estimated_cardinality,

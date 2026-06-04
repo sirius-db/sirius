@@ -20,7 +20,6 @@
 #include <expression/ast/aggregate.hpp>  // sirius::ast::aggregate
 #include <expression/ast/node.hpp>       // sirius::ast::node alternatives
 #include <expression/ast/to_duckdb.hpp>  // sirius::ast::to_duckdb (per-alternative overloads + node dispatcher)
-#include <expression/expression_internal.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <sirius/exception.hpp>
 
@@ -160,7 +159,7 @@ std::unique_ptr<cudf::column> gpu_expression_executor::execute_result::release_c
 //===----------------------------------------------------------------------===//
 
 gpu_expression_executor::gpu_expression_executor(
-  duckdb::vector<sirius::expression> const& expressions,
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> const& expressions,
   rmm::device_async_resource_ref resource_ref,
   rmm::cuda_stream_view stream,
   expression_executor_strategy strategy,
@@ -169,18 +168,17 @@ gpu_expression_executor::gpu_expression_executor(
 {
   _ast_expressions.reserve(expressions.size());
   for (auto const& expr : expressions) {
-    _ast_expressions.push_back(sirius::unwrap(expr));
+    _ast_expressions.push_back(expr.get());
   }
 }
 
-gpu_expression_executor::gpu_expression_executor(sirius::expression const& expression,
+gpu_expression_executor::gpu_expression_executor(sirius::ast::node const& expression,
                                                  rmm::device_async_resource_ref resource_ref,
                                                  rmm::cuda_stream_view stream,
                                                  expression_executor_strategy strategy,
                                                  std::size_t min_ast_size)
-  : _strategy(strategy), _mr(resource_ref), _stream(stream), _min_ast_size(min_ast_size)
+  : gpu_expression_executor(&expression, resource_ref, stream, strategy, min_ast_size)
 {
-  _ast_expressions.push_back(sirius::unwrap(expression));
 }
 
 gpu_expression_executor::gpu_expression_executor(sirius::ast::node const* expression,

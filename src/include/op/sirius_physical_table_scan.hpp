@@ -21,8 +21,10 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/data_table.hpp"
-#include "expression/expression.hpp"
+#include "expression/ast/node.hpp"
 #include "op/sirius_physical_operator.hpp"
+
+#include <memory>
 
 namespace sirius {
 namespace op {
@@ -126,7 +128,7 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   bool passthrough = false;
 
   //! The composite filter expression from the table filter set, if any
-  sirius::expression filter_expr;
+  std::unique_ptr<sirius::ast::node> filter_expr;
 
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
