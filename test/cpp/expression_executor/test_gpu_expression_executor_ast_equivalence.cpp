@@ -571,8 +571,8 @@ TEST_CASE("ast_equivalence - case_expr WHEN/THEN/ELSE (MATERIALIZE)",
       sirius::ast::comparison{sirius::comparison_type::equal, ref_node(0), int_const_node(5)}),
     int_const_node(10),
   });
-  auto hand_ast = std::make_unique<sirius::ast::node>(
-    sirius::ast::case_expr{std::move(cases), int_const_node(0)});
+  auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::case_expr{
+    std::move(cases), int_const_node(0), sirius::logical_type::make(sirius::type_id::INTEGER)});
 
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
@@ -757,7 +757,8 @@ TEST_CASE("ast_equivalence - coalesce (MATERIALIZE)", "[gpu_expression_executor_
   std::vector<std::unique_ptr<sirius::ast::node>> children;
   children.push_back(ref_node(0));
   children.push_back(int_const_node(0));
-  auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::coalesce{std::move(children)});
+  auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::coalesce{
+    std::move(children), sirius::logical_type::make(sirius::type_id::INTEGER)});
 
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);

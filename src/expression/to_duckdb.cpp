@@ -88,13 +88,17 @@ std::unique_ptr<duckdb::Expression> from_duck_derived_ptr(duckdb::unique_ptr<T> 
 
 std::unique_ptr<duckdb::Expression> to_duckdb(reference const& alt)
 {
-  // The downstream consumer (executor specialization) resolves the column type
-  // from the input table_view, not from the reconstructed
-  // BoundReferenceExpression — so INTEGER is a safe placeholder here regardless
-  // of reference::return_type.
+  // Reconstruct the reference with its recorded return_type. Executor
+  // specializations resolve the column type from the input table_view and
+  // ignore this field, but join-key resolution (nested-loop / hash join) reads
+  // BoundReferenceExpression::return_type directly to decide whether a cast is
+  // needed, so the real type must be preserved. Fall back to INTEGER only when
+  // the node carries no type (default-constructed SQLNULL sentinel).
+  auto return_type = alt.return_type.id() == sirius::type_id::SQLNULL
+                       ? duckdb::LogicalType{duckdb::LogicalTypeId::INTEGER}
+                       : sirius::to_duckdb(alt.return_type);
   return from_duck_derived_ptr(duckdb::make_uniq<duckdb::BoundReferenceExpression>(
-    duckdb::LogicalType{duckdb::LogicalTypeId::INTEGER},
-    static_cast<duckdb::idx_t>(alt.column_index)));
+    std::move(return_type), static_cast<duckdb::idx_t>(alt.column_index)));
 }
 
 std::unique_ptr<duckdb::Expression> to_duckdb(constant const& alt)
@@ -143,11 +147,12 @@ std::unique_ptr<duckdb::Expression> to_duckdb(between const& alt)
 
 std::unique_ptr<duckdb::Expression> to_duckdb(case_expr const& alt)
 {
-  // case_expr carries no top-level return_type; INTEGER placeholder is safe —
-  // the executor's BoundCaseExpression specialization derives the type from
-  // the THEN branches at evaluation time, not from this stub.
-  auto out = duckdb::make_uniq<duckdb::BoundCaseExpression>(
-    duckdb::LogicalType{duckdb::LogicalTypeId::INTEGER});
+  // Reconstruct the case expression with its recorded return_type. Executor
+  // specializations derive the result type from the THEN branches at evaluation
+  // time and ignore this field, but the AST-path post_process recovers each
+  // expression's return_type via to_duckdb, so the real type must be preserved
+  // here to avoid spurious down-casts of the materialized result.
+  auto out = duckdb::make_uniq<duckdb::BoundCaseExpression>(sirius::to_duckdb(alt.return_type()));
   out->case_checks.reserve(alt.cases.size());
   for (auto const& wt : alt.cases) {
     duckdb::BoundCaseCheck check;
@@ -202,9 +207,11 @@ std::unique_ptr<duckdb::Expression> to_duckdb(coalesce const& alt)
 {
   // COALESCE result type is the common type of its children. The downstream
   // executor specialization re-derives this from the children at evaluation
-  // time; INTEGER is a safe placeholder for this stub.
+  // time and ignores this field, but the AST-path post_process recovers each
+  // expression's return_type via to_duckdb, so the real type must be preserved
+  // here to avoid spurious down-casts of the materialized result.
   auto out = duckdb::make_uniq<duckdb::BoundOperatorExpression>(
-    duckdb::ExpressionType::OPERATOR_COALESCE, duckdb::LogicalType{duckdb::LogicalTypeId::INTEGER});
+    duckdb::ExpressionType::OPERATOR_COALESCE, sirius::to_duckdb(alt.return_type()));
   for (auto const& child : alt.children) {
     out->children.push_back(to_duck_ptr(to_duckdb(*child)));
   }

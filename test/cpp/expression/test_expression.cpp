@@ -14,10 +14,15 @@
  * limitations under the License.
  */
 
-// Tests for sirius::expression — the opaque wrapper around duckdb::Expression
-// that lets Super Sirius operator headers stay free of duckdb/planner/expression/ includes.
+// Tests for sirius::expression — the opaque wrapper that now holds a Sirius AST
+// node. wrap() is the DuckDB->Sirius translation boundary (via ast::from_duckdb),
+// so these tests assert AST node structure/values rather than duckdb pointer
+// identity (which the backing-type flip intentionally destroys). See
+// https://github.com/sirius-db/sirius/issues/701.
 
 #include "catch.hpp"
+#include "expression/ast/constant.hpp"
+#include "expression/ast/node.hpp"
 #include "expression/expression.hpp"
 #include "expression/expression_internal.hpp"
 
@@ -27,6 +32,7 @@
 #include <memory>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 using sirius::expression;
@@ -51,6 +57,16 @@ namespace {
 std::unique_ptr<duckdb::Expression> make_const(int32_t v)
 {
   return std::make_unique<duckdb::BoundConstantExpression>(duckdb::Value::INTEGER(v));
+}
+
+// Assert the wrapped node is an INTEGER constant equal to `expected`.
+void require_int_constant(sirius::ast::node const* n, int32_t expected)
+{
+  REQUIRE(n != nullptr);
+  REQUIRE(n->holds<sirius::ast::constant>());
+  auto const& c = n->get<sirius::ast::constant>();
+  REQUIRE(std::holds_alternative<int32_t>(c.payload));
+  REQUIRE(std::get<int32_t>(c.payload) == expected);
 }
 
 }  // namespace
@@ -78,36 +94,27 @@ TEST_CASE("expression - wrap(nullptr) yields a null expression", "[expression]")
 // wrap / unwrap round-trip
 // ============================================================================
 
-TEST_CASE("expression - wrap preserves pointer identity via unwrap", "[expression]")
-{
-  auto raw      = make_const(42);
-  auto* raw_ptr = raw.get();
-
-  expression e = sirius::wrap(std::move(raw));
-  REQUIRE_FALSE(e.is_null());
-  REQUIRE(static_cast<bool>(e));
-  REQUIRE(sirius::unwrap(e) == raw_ptr);
-}
-
-TEST_CASE("expression - wrap preserves underlying expression state", "[expression]")
+TEST_CASE("expression - wrap translates to a Sirius AST node", "[expression]")
 {
   expression e = sirius::wrap(make_const(42));
+  REQUIRE_FALSE(e.is_null());
+  REQUIRE(static_cast<bool>(e));
+  require_int_constant(sirius::unwrap(e), 42);
+}
 
-  auto const* casted = dynamic_cast<duckdb::BoundConstantExpression const*>(sirius::unwrap(e));
-  REQUIRE(casted != nullptr);
-  REQUIRE(casted->value == duckdb::Value::INTEGER(42));
+TEST_CASE("expression - wrap preserves the underlying constant value", "[expression]")
+{
+  expression e = sirius::wrap(make_const(42));
+  require_int_constant(sirius::unwrap(e), 42);
 }
 
 TEST_CASE("expression - const unwrap overload returns pointer-to-const", "[expression]")
 {
-  auto raw      = make_const(5);
-  auto* raw_ptr = raw.get();
-
-  expression mutable_e = sirius::wrap(std::move(raw));
+  expression mutable_e = sirius::wrap(make_const(5));
   expression const& ce = mutable_e;
 
-  duckdb::Expression const* p = sirius::unwrap(ce);  // picks const overload
-  REQUIRE(p == raw_ptr);
+  sirius::ast::node const* p = sirius::unwrap(ce);  // picks const overload
+  require_int_constant(p, 5);
 }
 
 // ============================================================================
@@ -116,29 +123,23 @@ TEST_CASE("expression - const unwrap overload returns pointer-to-const", "[expre
 
 TEST_CASE("expression - move-construction nulls the source", "[expression]")
 {
-  auto raw      = make_const(7);
-  auto* raw_ptr = raw.get();
-
-  expression a = sirius::wrap(std::move(raw));
+  expression a = sirius::wrap(make_const(7));
   expression b{std::move(a)};
 
   REQUIRE(a.is_null());
   REQUIRE_FALSE(b.is_null());
-  REQUIRE(sirius::unwrap(b) == raw_ptr);
+  require_int_constant(sirius::unwrap(b), 7);
 }
 
 TEST_CASE("expression - move-assignment nulls the source", "[expression]")
 {
-  auto raw      = make_const(11);
-  auto* raw_ptr = raw.get();
-
-  expression a = sirius::wrap(std::move(raw));
+  expression a = sirius::wrap(make_const(11));
   expression b;
   b = std::move(a);
 
   REQUIRE(a.is_null());
   REQUIRE_FALSE(b.is_null());
-  REQUIRE(sirius::unwrap(b) == raw_ptr);
+  require_int_constant(sirius::unwrap(b), 11);
 }
 
 // ============================================================================
@@ -147,14 +148,11 @@ TEST_CASE("expression - move-assignment nulls the source", "[expression]")
 
 TEST_CASE("expression - release transfers ownership and nulls the source", "[expression]")
 {
-  auto raw      = make_const(99);
-  auto* raw_ptr = raw.get();
-
-  expression e                             = sirius::wrap(std::move(raw));
-  std::unique_ptr<duckdb::Expression> back = sirius::release(e);
+  expression e                            = sirius::wrap(make_const(99));
+  std::unique_ptr<sirius::ast::node> back = sirius::release(e);
 
   REQUIRE(e.is_null());
-  REQUIRE(back.get() == raw_ptr);
+  require_int_constant(back.get(), 99);
 }
 
 TEST_CASE("expression - release on a null expression returns nullptr", "[expression]")
@@ -181,21 +179,18 @@ TEST_CASE("expression - double release is safe", "[expression]")
 // wrap_many
 // ============================================================================
 
-TEST_CASE("expression - wrap_many preserves size, order, and per-element identity", "[expression]")
+TEST_CASE("expression - wrap_many preserves size and order", "[expression]")
 {
   std::vector<std::unique_ptr<duckdb::Expression>> input;
-  std::vector<duckdb::Expression const*> originals;
   for (int32_t i = 0; i < 4; ++i) {
-    auto e = make_const(i);
-    originals.push_back(e.get());
-    input.push_back(std::move(e));
+    input.push_back(make_const(i));
   }
 
   auto wrapped = sirius::wrap_many(std::move(input));
 
-  REQUIRE(wrapped.size() == originals.size());
-  for (std::size_t i = 0; i < wrapped.size(); ++i) {
-    REQUIRE(sirius::unwrap(wrapped[i]) == originals[i]);
+  REQUIRE(wrapped.size() == 4);
+  for (int32_t i = 0; i < 4; ++i) {
+    require_int_constant(sirius::unwrap(wrapped[static_cast<std::size_t>(i)]), i);
   }
 }
 
@@ -207,20 +202,15 @@ TEST_CASE("expression - wrap_many on empty input returns empty vector", "[expres
 
 TEST_CASE("expression - wrap_many handles mixed null and non-null slots", "[expression]")
 {
-  auto a      = make_const(1);
-  auto c      = make_const(3);
-  auto* a_ptr = a.get();
-  auto* c_ptr = c.get();
-
   std::vector<std::unique_ptr<duckdb::Expression>> input;
-  input.push_back(std::move(a));
+  input.push_back(make_const(1));
   input.push_back(nullptr);
-  input.push_back(std::move(c));
+  input.push_back(make_const(3));
 
   auto wrapped = sirius::wrap_many(std::move(input));
 
   REQUIRE(wrapped.size() == 3);
-  REQUIRE(sirius::unwrap(wrapped[0]) == a_ptr);
+  require_int_constant(sirius::unwrap(wrapped[0]), 1);
   REQUIRE(wrapped[1].is_null());
-  REQUIRE(sirius::unwrap(wrapped[2]) == c_ptr);
+  require_int_constant(sirius::unwrap(wrapped[2]), 3);
 }

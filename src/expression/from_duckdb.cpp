@@ -145,7 +145,8 @@ std::unique_ptr<node> translate_case(duckdb::BoundCaseExpression const& expr)
   }
   auto else_node = from_duckdb(*expr.else_expr);
   if (!else_node) { return nullptr; }
-  return std::make_unique<node>(case_expr{std::move(cases), std::move(else_node)});
+  return std::make_unique<node>(
+    case_expr{std::move(cases), std::move(else_node), sirius::from_duckdb(expr.return_type)});
 }
 
 std::unique_ptr<node> translate_cast(duckdb::BoundCastExpression const& expr)
@@ -222,7 +223,8 @@ std::unique_ptr<node> translate_operator(duckdb::BoundOperatorExpression const& 
       if (!translated) { return nullptr; }
       children.push_back(std::move(translated));
     }
-    return std::make_unique<node>(coalesce{std::move(children)});
+    return std::make_unique<node>(
+      coalesce{std::move(children), sirius::from_duckdb(expr.return_type)});
   }
 
   if (op_type == duckdb::ExpressionType::COMPARE_IN ||

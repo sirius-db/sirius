@@ -20,6 +20,7 @@
 #include <concepts>
 #include <cstddef>
 #include <memory>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -154,7 +155,21 @@ struct node {
     return std::get<T>(v);
   }
 
+  [[nodiscard]] bool is_reference() const noexcept;
+  [[nodiscard]] bool is_aggregate() const noexcept;
+  [[nodiscard]] bool is_function_call() const noexcept;
+
+  /// Returns the held alternative; throws std::bad_variant_access if the type does not match.
+  [[nodiscard]] reference const& as_reference() const;
+  [[nodiscard]] aggregate const& as_aggregate() const;
+  [[nodiscard]] function_call const& as_function_call() const;
+
   [[nodiscard]] std::size_t cudf_ast_op_count() const;
 };
+
+/// Strict accessors for operator boundaries: return the held alternative or throw
+/// not_implemented_exception (with `context`) when `n` is null or holds a different type.
+[[nodiscard]] reference const& require_reference(node const* n, std::string_view context);
+[[nodiscard]] aggregate const& require_aggregate(node const* n, std::string_view context);
 
 }  // namespace sirius::ast

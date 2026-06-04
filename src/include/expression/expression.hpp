@@ -29,17 +29,18 @@ class Expression;
 namespace sirius {
 
 /**
- * @brief Opaque, move-only wrapper around a duckdb::Expression*.
+ * @brief Opaque, move-only wrapper around a Sirius AST node.
  *
  * Lets Super Sirius operator headers, the expression-executor public header, and the
  * physical-plan-generator header avoid including any duckdb/planner/expression/... header.
  *
  * Internally stores a std::unique_ptr<impl>, where `impl` is forward-declared here and
- * defined in expression_internal.hpp. Code that needs to reach the underlying
- * duckdb::Expression includes expression_internal.hpp and uses the free `unwrap` / `release`
- * helpers; no friend declarations are required.
+ * defined in expression_internal.hpp. wrap() translates an incoming duckdb::Expression
+ * into a sirius::ast::node at the boundary; code that needs to reach the underlying node
+ * includes expression_internal.hpp and uses the free `unwrap` / `release` helpers; no
+ * friend declarations are required. See https://github.com/sirius-db/sirius/issues/701.
  *
- * Semantics mirror std::unique_ptr<duckdb::Expression>: unique ownership, move-only.
+ * Semantics mirror std::unique_ptr<sirius::ast::node>: unique ownership, move-only.
  */
 class expression {
  public:
@@ -60,10 +61,10 @@ class expression {
   expression(const expression&)            = delete;
   expression& operator=(const expression&) = delete;
 
-  /// Returns true if this wrapper does not hold a duckdb::Expression.
+  /// Returns true if this wrapper does not hold a Sirius AST node.
   [[nodiscard]] bool is_null() const noexcept { return !_impl; }
 
-  /// Returns true if this wrapper holds a duckdb::Expression.
+  /// Returns true if this wrapper holds a Sirius AST node.
   explicit operator bool() const noexcept { return static_cast<bool>(_impl); }
 
   /**
@@ -85,9 +86,13 @@ class expression {
 //===----------------------------------------------------------------------===//
 
 /**
- * @brief Wraps a duckdb::Expression unique_ptr in a sirius::expression.
+ * @brief Translates a duckdb::Expression unique_ptr into a sirius::expression.
  *
- * @param expr  The DuckDB expression to wrap. May be null; a null input produces a null
+ * This is the DuckDB->Sirius translation boundary: the incoming expression is lowered
+ * to a sirius::ast::node via sirius::ast::from_duckdb and the resulting node is stored.
+ *
+ * @param expr  The DuckDB expression to translate. May be null; a null input — or an
+ *              unsupported shape that from_duckdb declines to translate — produces a null
  *              sirius::expression.
  * @return The wrapped sirius::expression.
  */
