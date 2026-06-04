@@ -563,38 +563,36 @@ void submit_and_await(rmm::device_buffer& device_buf,
 
   auto* device_base = static_cast<uint8_t*>(device_buf.data());
 
-  // Reserve pinned host staging from the FSMR pool, preferring the NUMA node local to
-  // the GPU that owns device_buf.
-  ccm::any_memory_space_in_tier_with_preference host_req(ccm::Tier::HOST,
-                                                         static_cast<std::size_t>(host_numa_node));
-  auto reservation = host_mem_mgr.request_reservation(host_req, s.running_offset);
-  if (!reservation) {
-    throw std::runtime_error(std::string(kTag) + " failed to reserve " +
-                             std::to_string(s.running_offset) + " bytes of host staging memory");
+  // The FSMR block size is uniform across the per-NUMA host spaces (one host config), so
+  // probe any host space for it up front: we need it to lay out the pieces below, and we
+  // want to reserve exactly the host bytes we end up allocating (not the device-buffer size).
+  auto const host_spaces = host_mem_mgr.get_memory_spaces_for_tier(ccm::Tier::HOST);
+  if (host_spaces.empty()) {
+    throw std::runtime_error(std::string(kTag) + " no HOST-tier memory space registered");
   }
-  auto* host_fsmr =
-    reservation->get_memory_space().get_memory_resource_as<ccm::fixed_size_host_memory_resource>();
-  if (host_fsmr == nullptr) {
+  auto const* probe_fsmr =
+    host_spaces.front()->get_memory_resource_as<ccm::fixed_size_host_memory_resource>();
+  if (probe_fsmr == nullptr) {
     throw std::runtime_error(std::string(kTag) +
                              " host memory space is not a fixed_size_host_memory_resource");
   }
-  std::size_t const bsz = host_fsmr->get_block_size();
+  auto const bsz = probe_fsmr->get_block_size();
 
-  // Coalesce file-near whole segments into contiguous host pieces (<= bsz, never
-  // straddling a block) — the io_utils::coalesce_ranges merge rule, plus the block-size
-  // / whole-segment caps the fragmented host buffer needs. Each piece maps to ONE
-  // host_read_ranges range; per-segment offsets within a piece let the H2D scatter each
-  // segment to its 16B-aligned device slot.
+  // Coalesce file-near whole segments into contiguous host pieces
   auto reads = s.reads;
   std::sort(reads.begin(), reads.end(), [](auto const& a, auto const& b) {
     return a.file_offset < b.file_offset;
   });
+
+  // Map a coalesced range of disk-resident data to its corresponding pinned host block + offset
   struct piece {
     std::size_t file_off, file_end, host_block, host_off;
   };
+  // Map a pinned host block + offset to its corresponding device buffer destination
   struct seg_copy {
     std::size_t host_block, host_off, device_off, size;
   };
+
   std::vector<piece> pieces;
   std::vector<seg_copy> seg_copies;
   pieces.reserve(reads.size());
@@ -624,7 +622,26 @@ void submit_and_await(rmm::device_buffer& device_buf,
     cur_off = p.host_off + (p.file_end - p.file_off);
   }
 
-  auto host_alloc = host_fsmr->allocate_multiple_blocks((cur_block + 1) * bsz, reservation.get());
+  // Reserve and allocate exactly the host bytes the pieces occupy (cur_block + 1 blocks),
+  // not the device-buffer size, preferring the GPU's local NUMA node. The strategy may fall
+  // back to another host space; guard that it shares the block size the pieces were laid out
+  // against, otherwise the per-block offsets would be wrong.
+  std::size_t const host_bytes = (cur_block + 1) * bsz;
+  ccm::any_memory_space_in_tier_with_preference host_req(ccm::Tier::HOST,
+                                                         static_cast<std::size_t>(host_numa_node));
+  auto reservation = host_mem_mgr.request_reservation(host_req, host_bytes);
+  if (!reservation) {
+    throw std::runtime_error(std::string(kTag) + " failed to reserve " +
+                             std::to_string(host_bytes) + " bytes of host staging memory");
+  }
+  auto* host_fsmr =
+    reservation->get_memory_space().get_memory_resource_as<ccm::fixed_size_host_memory_resource>();
+  if (host_fsmr == nullptr || host_fsmr->get_block_size() != bsz) {
+    throw std::runtime_error(std::string(kTag) +
+                             " host memory space is not a fixed_size_host_memory_resource with the "
+                             "expected block size");
+  }
+  auto host_alloc = host_fsmr->allocate_multiple_blocks(host_bytes, reservation.get());
 
   // One coalesced range + contiguous dst span per piece.
   std::vector<cudf::io::text::byte_range_info> ranges;
