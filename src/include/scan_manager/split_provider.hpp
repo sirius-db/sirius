@@ -64,11 +64,14 @@ class split_provider {
   /// deleted.
   split_provider() = default;
 
-  /// Concrete construction path — composes the given ingestible.
-  explicit split_provider(std::shared_ptr<io::gpu_ingestible> ingestible)
-    : _ingestible(std::move(ingestible))
-  {
-  }
+  /// Concrete construction path — borrows the given ingestible non-owningly.
+  /// The ingestible must outlive the provider; in practice the operator owns
+  /// the ingestible (single shared_ptr) and the provider is created after
+  /// install and torn down by scan_manager reset() before the operator goes
+  /// away. Callers that need a shared_ptr can promote via
+  /// `provider.get_ingestible().shared_from_this()` (enabled by
+  /// @c gpu_ingestible inheriting @c std::enable_shared_from_this).
+  explicit split_provider(io::gpu_ingestible& ingestible) : _ingestible(&ingestible) {}
 
   virtual ~split_provider() = default;
 
@@ -118,12 +121,11 @@ class split_provider {
     return _ingestible->next_split_provider();
   }
 
-  /// Accessor for the composed ingestible (null for the legacy ctor path).
-  [[nodiscard]] io::gpu_ingestible* get_ingestible() const noexcept { return _ingestible.get(); }
-  [[nodiscard]] std::shared_ptr<io::gpu_ingestible> get_ingestible_shared() const noexcept
-  {
-    return _ingestible;
-  }
+  /// Accessor for the composed ingestible. Undefined behavior on the legacy
+  /// default-ctor path (which never calls this). Callers that need a
+  /// @c shared_ptr<gpu_ingestible> can promote via
+  /// `provider.get_ingestible().shared_from_this()`.
+  [[nodiscard]] io::gpu_ingestible& get_ingestible() const noexcept { return *_ingestible; }
 
  protected:
   /**
@@ -142,8 +144,10 @@ class split_provider {
                                 std::unique_ptr<op::operator_data> split);
 
  private:
-  /// Composed ingestible (null on the legacy default-ctor path).
-  std::shared_ptr<io::gpu_ingestible> _ingestible;
+  /// Non-owning pointer to the composed ingestible (null on the legacy
+  /// default-ctor path). The operator owns the lifetime; the provider is
+  /// always destroyed first via @c sirius_scan_manager::reset.
+  io::gpu_ingestible* _ingestible{nullptr};
 
   /// RAII coordination shared across the enqueued tasks. Destructor closes
   /// the connector with the captured exception (if any) once the last task

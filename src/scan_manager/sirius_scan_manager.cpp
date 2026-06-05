@@ -223,9 +223,12 @@ void sirius_scan_manager::prepare_for_query(
     auto ingestible = _factory.produce(
       std::move(table_info), *this, effective_gpu_ioctxs, gpu_memory_spaces, op->get_operator_id());
     if (!ingestible) { continue; }
-    op->install_ingestible(ingestible);
+    op->install_ingestible(std::move(ingestible));
 
-    auto provider = std::make_unique<split_provider>(std::move(ingestible));
+    // Operator is now the sole shared_ptr owner; provider borrows the
+    // ingestible by reference. enable_shared_from_this lets any consumer
+    // promote to shared_ptr on demand.
+    auto provider = std::make_unique<split_provider>(op->get_ingestible());
     op->set_split_connector(std::make_unique<split_connector>());
     _providers_by_op.emplace(op, std::move(provider));
     _scan_op_order.push_back(op);
