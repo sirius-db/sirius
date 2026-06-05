@@ -29,6 +29,8 @@ namespace op {
 
 class sirius_physical_sort_sample : public sirius_physical_operator {
  public:
+  enum class BoundaryState : uint8_t { NOT_DONE, SCHEDULED, DONE };
+
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::SORT_SAMPLE;
 
   sirius_physical_sort_sample(
@@ -74,7 +76,10 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   size_t get_num_partitions() const { return _num_partitions; }
 
   //! Whether boundaries have been computed
-  bool boundaries_computed() const { return _boundary_state.load(std::memory_order_acquire) == 2; }
+  bool boundaries_computed() const
+  {
+    return _boundary_state.load(std::memory_order_acquire) == BoundaryState::DONE;
+  }
 
   //! Release the partition boundaries table to free GPU memory
   void clear_partition_boundaries() { _partition_boundaries.reset(); }
@@ -86,10 +91,10 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   //! Number of partitions computed from the sample
   size_t _num_partitions = 1;
 
-  //! Boundary computation state: 0 = not started, 1 = computing, 2 = done.
-  //! compare_exchange on this elects exactly one task as the winner; all others
-  //! passthrough without blocking.
-  std::atomic<int> _boundary_state{0};
+  //! Boundary computation lifecycle: NOT_DONE → SCHEDULED (input claimed) → DONE.
+  //! get_next_task_input_data() transitions to SCHEDULED under the task-creation lock;
+  //! execute() completes the transition to DONE.
+  std::atomic<BoundaryState> _boundary_state{BoundaryState::NOT_DONE};
 
   //! Target bytes to accumulate for the boundary sample (from sirius_config operator_params)
   uint64_t _sort_sample_bytes = config::DEFAULT_SORT_SAMPLE_BYTES;

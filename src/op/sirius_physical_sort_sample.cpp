@@ -96,12 +96,15 @@ sirius_physical_sort_sample::sirius_physical_sort_sample(
 
 std::optional<task_creation_hint> sirius_physical_sort_sample::get_next_task_hint()
 {
-  // If boundaries already computed, use default behavior (process batches as they arrive)
-  if (_boundary_state.load(std::memory_order_acquire) == 2) {
-    return sirius_physical_operator::get_next_task_hint();
-  }
+  const auto state = _boundary_state.load(std::memory_order_acquire);
 
-  // Need to wait for enough sample bytes before computing boundaries
+  // Boundaries already computed — process batches one at a time.
+  if (state == BoundaryState::DONE) { return sirius_physical_operator::get_next_task_hint(); }
+
+  // Boundary task already scheduled; wait for it to finish before creating more tasks.
+  if (state == BoundaryState::SCHEDULED) { return std::nullopt; }
+
+  // NOT_DONE: wait for enough sample bytes before scheduling the boundary task.
   auto port_ids = get_port_ids();
   if (port_ids.empty()) { return std::nullopt; }
 
@@ -123,14 +126,16 @@ std::optional<task_creation_hint> sirius_physical_sort_sample::get_next_task_hin
 
 std::unique_ptr<operator_data> sirius_physical_sort_sample::get_next_task_input_data()
 {
-  // After boundaries are computed, process one batch at a time (passthrough mode).
-  if (_boundary_state.load(std::memory_order_acquire) == 2) {
-    return sirius_physical_operator::get_next_task_input_data();
-  }
+  const auto state = _boundary_state.load(std::memory_order_acquire);
 
-  // Before boundary computation: accumulate batches up to the sample byte threshold so
-  // execute() can merge pre-sorted runs and derive partition boundaries from a representative
-  // sample without pulling a fixed batch count that may be too large for big batches.
+  // After boundaries are computed, process one batch at a time (passthrough mode).
+  if (state == BoundaryState::DONE) { return sirius_physical_operator::get_next_task_input_data(); }
+
+  // Boundary input already claimed by the in-flight boundary task.
+  if (state == BoundaryState::SCHEDULED) { return nullptr; }
+
+  // NOT_DONE: accumulate batches up to the sample byte threshold so execute() can merge
+  // pre-sorted runs and derive partition boundaries from a representative sample.
   auto port_ids = get_port_ids();
   if (port_ids.empty()) { return nullptr; }
 
@@ -148,6 +153,8 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::get_next_task_input_
   }
 
   if (input_batch.empty()) { return nullptr; }
+
+  _boundary_state.store(BoundaryState::SCHEDULED, std::memory_order_release);
   return std::make_unique<pipelineable_operator_data>(std::move(input_batch));
 }
 
@@ -159,17 +166,23 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   const auto& input_batches = input.get_read_only_batches();
 
   // Fast path: boundaries already computed — just pass through.
-  if (_boundary_state.load(std::memory_order_acquire) == 2) {
+  if (_boundary_state.load(std::memory_order_acquire) == BoundaryState::DONE) {
     SIRIUS_LOG_DEBUG("Sort sample: passthrough ({} batches)", input_batches.size());
     return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
   }
 
-  // Elect exactly one winner via CAS (0=not started → 1=computing).
-  // The task_creator's while loop dispatches one task per batch, so multiple tasks
-  // can be in-flight simultaneously. Losers passthrough without blocking — they don't
-  // need the boundaries themselves; sort_partition runs next in the same pipeline task.
-  int expected = 0;
-  if (!_boundary_state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+  const auto state = _boundary_state.load(std::memory_order_acquire);
+  if (state == BoundaryState::SCHEDULED) {
+    // Normal path: input was claimed by get_next_task_input_data().
+  } else if (state == BoundaryState::NOT_DONE) {
+    // OOM retry or direct unit-test invoke — claim boundary computation.
+    auto expected = BoundaryState::NOT_DONE;
+    if (!_boundary_state.compare_exchange_strong(
+          expected, BoundaryState::SCHEDULED, std::memory_order_acq_rel)) {
+      SIRIUS_LOG_DEBUG("Sort sample: passthrough ({} batches)", input_batches.size());
+      return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
+    }
+  } else {
     SIRIUS_LOG_DEBUG("Sort sample: passthrough ({} batches)", input_batches.size());
     return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
   }
@@ -188,12 +201,12 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   }
 
   if (valid_batches.empty() || !space) {
-    _boundary_state.store(2, std::memory_order_release);
+    _boundary_state.store(BoundaryState::DONE, std::memory_order_release);
     return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
   }
 
   // Wrap GPU work in try/catch: if any allocation throws (e.g. rmm::out_of_memory),
-  // reset state to NOT_STARTED so the rescheduled task can win the CAS and retry.
+  // reset to NOT_DONE so the rescheduled task can retry boundary computation.
   try {
     size_t total_sample_bytes = 0;
     for (auto const& batch : valid_batches) {
@@ -315,12 +328,11 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
 
     // sort_partition runs in the same gpu_pipeline_task immediately after this
     // execute() returns, so _partition_boundaries is visible before partition runs.
-    _boundary_state.store(2, std::memory_order_release);
+    _boundary_state.store(BoundaryState::DONE, std::memory_order_release);
 
   } catch (...) {
-    // Reset to NOT_STARTED so the rescheduled task (or another in-flight task) can
-    // win the CAS election and retry boundary computation.
-    _boundary_state.store(0, std::memory_order_release);
+    // Reset to NOT_DONE so the rescheduled task can retry boundary computation.
+    _boundary_state.store(BoundaryState::NOT_DONE, std::memory_order_release);
     throw;
   }
 

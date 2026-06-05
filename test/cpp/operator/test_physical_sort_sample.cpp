@@ -137,6 +137,10 @@ TEST_CASE("sirius_physical_sort_sample stops sampling at sort_sample_bytes thres
   REQUIRE(result != nullptr);
   REQUIRE(batch_count(*result) < static_cast<std::size_t>(num_batches));
   REQUIRE(batch_count(*result) >= 1);
+  REQUIRE(sample_op.get_next_task_input_data() == nullptr);
+
+  (void)sample_op.execute(*result, cudf::get_default_stream());
+  REQUIRE(sample_op.boundaries_computed());
 
   std::size_t total_batches_returned = batch_count(*result);
   while (true) {
@@ -208,6 +212,25 @@ TEST_CASE("sirius_physical_sort_sample is ready when upstream finished with empt
   REQUIRE(sample_op.get_next_task_input_data() == nullptr);
 }
 
+TEST_CASE("sirius_physical_sort_sample get_next_task_hint returns nullopt while scheduled",
+          "[physical_sort_sample]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  constexpr uint64_t threshold         = 6144;
+  constexpr std::size_t rows_per_batch = 1000;
+
+  auto sample_op = make_sort_sample(threshold);
+  auto repo      = std::make_unique<cucascade::shared_data_repository>();
+  add_int_batches(*repo, *space, 2, rows_per_batch);
+  attach_port(sample_op, *repo);
+
+  REQUIRE(sample_op.get_next_task_hint()->hint == TaskCreationHint::READY);
+  REQUIRE(sample_op.get_next_task_input_data() != nullptr);
+  REQUIRE_FALSE(sample_op.get_next_task_hint().has_value());
+}
+
 TEST_CASE(
   "sirius_physical_sort_sample pulls all remaining data when upstream finished below threshold",
   "[physical_sort_sample]")
@@ -235,6 +258,10 @@ TEST_CASE(
   auto result = sample_op.get_next_task_input_data();
   REQUIRE(result != nullptr);
   REQUIRE(batch_count(*result) == static_cast<std::size_t>(num_batches));
+  REQUIRE(sample_op.get_next_task_input_data() == nullptr);
+
+  (void)sample_op.execute(*result, cudf::get_default_stream());
+  REQUIRE(sample_op.boundaries_computed());
   REQUIRE(sample_op.get_next_task_input_data() == nullptr);
 }
 
