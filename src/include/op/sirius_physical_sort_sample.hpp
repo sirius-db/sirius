@@ -31,10 +31,9 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::SORT_SAMPLE;
 
-  static constexpr std::size_t DEFAULT_NUM_SAMPLE_BATCHES = 5;
-
   sirius_physical_sort_sample(
     sirius_physical_order* order_by,
+    uint64_t sort_sample_bytes           = config::DEFAULT_SORT_SAMPLE_BYTES,
     uint64_t max_partition_bytes         = 0,
     double max_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION);
 
@@ -42,15 +41,12 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
     duckdb::vector<sirius::logical_type> types,
     duckdb::vector<duckdb::BoundOrderByNode> orders,
     std::size_t estimated_cardinality,
-    std::size_t num_sample_batches       = DEFAULT_NUM_SAMPLE_BATCHES,
+    uint64_t sort_sample_bytes           = config::DEFAULT_SORT_SAMPLE_BYTES,
     uint64_t max_partition_bytes         = 0,
     double max_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION);
 
   //! Order specification (copied from ORDER_BY) — determines which columns to sample
   duckdb::vector<duckdb::BoundOrderByNode> orders;
-
-  //! Number of batches to sample before computing partition boundaries
-  std::size_t num_sample_batches;
 
  public:
   bool is_source() const override { return true; }
@@ -65,8 +61,11 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
-  //! Override to wait for N batches before returning READY
+  //! Override to wait for enough sample bytes before returning READY
   std::optional<task_creation_hint> get_next_task_hint() override;
+
+  //! Override to pull sample bytes before boundary computation, then one batch at a time
+  std::unique_ptr<operator_data> get_next_task_input_data() override;
 
   //! Get the computed partition boundaries (P-1 rows, sort key columns only)
   const cudf::table& get_partition_boundaries() const { return *_partition_boundaries; }
@@ -91,6 +90,9 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   //! compare_exchange on this elects exactly one task as the winner; all others
   //! passthrough without blocking.
   std::atomic<int> _boundary_state{0};
+
+  //! Target bytes to accumulate for the boundary sample (from sirius_config operator_params)
+  uint64_t _sort_sample_bytes = config::DEFAULT_SORT_SAMPLE_BYTES;
 
   //! Override for max partition bytes (0 = use GPU memory fraction)
   size_t _max_partition_bytes_override = 0;

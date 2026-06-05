@@ -36,6 +36,7 @@ constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE       = 512ULL * 1024 * 1024;  /
 constexpr uint64_t DEFAULT_SCAN_TASK_VARCHAR_SIZE     = 256LL;
 constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES       = 512ULL * 1024 * 1024;  // 512 MB
 constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES         = 512ULL * 1024 * 1024;  // 512 MB
+constexpr uint64_t DEFAULT_SORT_SAMPLE_BYTES          = 512ULL * 1024 * 1024;  // 512 MB
 constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES = 500ULL * 1024 * 1024;  // 500 MB
 
 /// Fraction of available GPU memory used per sort partition when max_sort_partition_bytes is 0.
@@ -64,6 +65,9 @@ struct operator_params {
 
   /// Target size (bytes) for the concat operator output batch.
   uint64_t concat_batch_bytes = config::DEFAULT_CONCAT_BATCH_BYTES;
+
+  /// Target size (bytes) of data to sample before computing sort partition boundaries.
+  uint64_t sort_sample_bytes = config::DEFAULT_SORT_SAMPLE_BYTES;
 
   /// Maximum build-side bytes for switching to BUILD_PROBE join mode.
   /// May be larger than concat_batch_bytes; build-side batches will be concatenated if needed.

@@ -1426,6 +1426,14 @@ static void SetConcatBatchBytes(ClientContext& context, SetScope scope, Value& p
   SIRIUS_LOG_DEBUG("Updated config CONCAT_BATCH_BYTES to {}", params->concat_batch_bytes);
 }
 
+static void SetSortSampleBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->sort_sample_bytes = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config SORT_SAMPLE_BYTES to {}", params->sort_sample_bytes);
+}
+
 static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::LOG_LEVEL = StringValue::Get(parameter);
@@ -1618,6 +1626,12 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::UBIGINT,
                             Value::UBIGINT(sirius::operator_params{}.concat_batch_bytes),
                             SetConcatBatchBytes);
+
+  config.AddExtensionOption("sort_sample_bytes",
+                            "Target bytes to sample before computing sort partition boundaries",
+                            LogicalType::UBIGINT,
+                            Value::UBIGINT(sirius::operator_params{}.sort_sample_bytes),
+                            SetSortSampleBytes);
 
   config.AddExtensionOption("scan_cache_level",
                             "Scan result caching level: none, table_gpu, table_host, parquet",
