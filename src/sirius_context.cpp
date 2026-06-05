@@ -953,7 +953,18 @@ void SiriusContext::create_query(
     gpu_memory_spaces[gpu_space->get_device_id()] =
       const_cast<cucascade::memory::memory_space*>(gpu_space);
   }
-  scan_manager_->prepare_for_query(*query_, gpu_ioctxs_, gpu_memory_spaces);
+  // NUMA node -> GPU device ids on that node, from the hardware topology. The
+  // HOST-tier cached_split_provider uses this to materialize each host-pinned
+  // chunk on a NUMA-local GPU (round-robin within the node), balancing across
+  // NUMA nodes and across GPUs within a node instead of dumping everything on
+  // GPU 0. Normalize numa_node=-1 (non-NUMA hosts) to 0 to match the host
+  // memory_space device_id convention.
+  std::unordered_map<int, std::vector<int>> numa_to_gpus;
+  for (auto const& gpu : config_.get_hw_topology().gpus) {
+    int numa = gpu.numa_node < 0 ? 0 : gpu.numa_node;
+    numa_to_gpus[numa].push_back(static_cast<int>(gpu.id));
+  }
+  scan_manager_->prepare_for_query(*query_, gpu_ioctxs_, gpu_memory_spaces, numa_to_gpus);
 }
 
 duckdb::shared_ptr<sirius::planner::query> SiriusContext::get_query()

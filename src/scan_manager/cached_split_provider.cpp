@@ -24,6 +24,8 @@
 #include <cudf/column/column_view.hpp>
 #include <cudf/table/table_view.hpp>
 
+#include <rmm/cuda_device.hpp>
+
 #include <cuda_runtime.h>
 
 #include <cucascade/data/cpu_data_representation.hpp>
@@ -33,6 +35,7 @@
 
 #include <span>
 #include <stdexcept>
+#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -77,6 +80,7 @@ cached_split_provider::cached_split_provider(
   std::vector<std::size_t> column_indices,
   cucascade::memory::memory_space& memory_space,
   std::unordered_map<int, cucascade::memory::memory_space*> gpu_memory_spaces,
+  std::unordered_map<int, std::vector<int>> numa_to_gpus,
   std::shared_ptr<duckdb::Expression> filter_expression,
   std::shared_ptr<op::scan::scan_plan const> plan)
   : _column_indices(std::move(column_indices)),
@@ -90,12 +94,30 @@ cached_split_provider::cached_split_provider(
       "[cached_split_provider] HOST-tier constructor requires non-empty gpu_memory_spaces "
       "so produce_split can convert host chunks to the executing GPU's space");
   }
+  // Precompute the target GPU for each host chunk. Balance two levels:
+  //   1. across NUMA nodes  — each chunk was pinned on a NUMA-local host space
+  //      (pin_table tier='host'), so chunk->get_device_id() is its NUMA id;
+  //   2. across GPUs within that NUMA — round-robin over numa_to_gpus[numa].
+  // This keeps the host->GPU copy NUMA-local and spreads work across all GPUs,
+  // instead of materializing every chunk on cudaGetDevice()==GPU 0 (which sends
+  // every cached-scan task to GPU 0 and OOMs large tables). A chunk whose NUMA
+  // is absent from numa_to_gpus gets -1 → produce_split falls back to the
+  // executing GPU.
+  std::unordered_map<int, std::size_t> numa_rr;
   _batches.reserve(host_chunks.size());
+  _chunk_target_gpu.reserve(host_chunks.size());
   for (auto& chunk : host_chunks) {
     if (!chunk) {
       throw std::runtime_error(
         "[cached_split_provider] null host_data_representation in pinned chunks");
     }
+    int numa = chunk->get_device_id();
+    if (numa < 0) { numa = 0; }  // Linux non-NUMA convention → node 0
+    int target = -1;
+    if (auto it = numa_to_gpus.find(numa); it != numa_to_gpus.end() && !it->second.empty()) {
+      target = it->second[numa_rr[numa]++ % it->second.size()];
+    }
+    _chunk_target_gpu.push_back(target);
     _batches.emplace_back(std::move(chunk));
   }
 }
@@ -139,28 +161,40 @@ std::vector<std::unique_ptr<op::operator_data>> cached_split_provider::produce_s
                                                        std::move(gpu_repr));
       } else if constexpr (std::is_same_v<T, host_chunk>) {
         // Slice the host_data_representation down to only the columns the scan
-        // requests, then materialize on the executing GPU. The conversion is
-        // eager (vs returning a HOST batch and letting the scan operator
+        // requests, then materialize on the chunk's assigned GPU. The conversion
+        // is eager (vs returning a HOST batch and letting the scan operator
         // convert) so downstream consumers — sirius_gpu_parquet_scan_operator,
         // assemble_scan_output, expression executor — only ever see GPU
         // batches and can stay tier-agnostic.
         auto sliced = chunk->slice(std::span<const std::size_t>(_column_indices));
 
-        int current_device = -1;
-        auto cuda_err      = cudaGetDevice(&current_device);
-        if (cuda_err != cudaSuccess) {
-          throw std::runtime_error(
-            std::string("[cached_split_provider] cudaGetDevice failed during host->gpu "
-                        "conversion: ") +
-            cudaGetErrorString(cuda_err));
+        // Target GPU: the NUMA-local, round-robin device precomputed in the
+        // ctor. -1 (NUMA not in numa_to_gpus / empty map) falls back to the
+        // executing device. Without this every chunk would convert on
+        // cudaGetDevice()==GPU 0 (the scan worker pool's default device),
+        // funneling all cached-scan tasks to GPU 0.
+        int target_device =
+          (batch_idx < _chunk_target_gpu.size()) ? _chunk_target_gpu[batch_idx] : -1;
+        if (target_device < 0) {
+          auto cuda_err = cudaGetDevice(&target_device);
+          if (cuda_err != cudaSuccess) {
+            throw std::runtime_error(
+              std::string("[cached_split_provider] cudaGetDevice failed during host->gpu "
+                          "conversion: ") +
+              cudaGetErrorString(cuda_err));
+          }
         }
-        auto gpu_it = _gpu_memory_spaces.find(current_device);
+        auto gpu_it = _gpu_memory_spaces.find(target_device);
         if (gpu_it == _gpu_memory_spaces.end() || gpu_it->second == nullptr) {
           throw std::runtime_error(
             "[cached_split_provider] no GPU memory_space registered for device " +
-            std::to_string(current_device) +
+            std::to_string(target_device) +
             " — pin_table(tier='host') cached scan cannot materialize chunk on this GPU");
         }
+        // Bind the target device so the converter's allocations and stream land
+        // on the GPU we routed this chunk to (the scan worker thread's current
+        // device is otherwise GPU 0 for every chunk).
+        rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{target_device}};
         auto* target_gpu_space = gpu_it->second;
         auto stream            = target_gpu_space->acquire_stream();
         auto& registry         = ::sirius::converter_registry::get();

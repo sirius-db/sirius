@@ -181,9 +181,13 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
 void sirius_scan_manager::prepare_for_query(
   const sirius::planner::query& query,
   std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs,
-  std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces)
+  std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces,
+  std::unordered_map<int, std::vector<int>> const& numa_to_gpus)
 {
   reset();
+  // Stored for try_make_cached_provider → HOST-tier cached_split_provider, which
+  // routes each host-pinned chunk to a NUMA-local GPU using this map.
+  _numa_to_gpus = numa_to_gpus;
 
   // Advance the cache age so the evictor can score this query's inserts
   // against entries left over from prior queries. The buffer_pool (and the
@@ -409,6 +413,7 @@ std::unique_ptr<split_provider> sirius_scan_manager::try_make_cached_provider(
                                                        std::move(column_indices),
                                                        *entry.memory_space,
                                                        gpu_memory_spaces,
+                                                       _numa_to_gpus,
                                                        std::move(filter_expression),
                                                        std::move(plan_shared));
       }

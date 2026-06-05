@@ -99,14 +99,21 @@ class cached_split_provider : public split_provider {
   /// do not need a separate host-aware code path.
   ///
   /// @param gpu_memory_spaces device_id -> memory_space lookup; cached_split_provider
-  ///                          calls cudaGetDevice() to identify the executing GPU
-  ///                          and converts host chunks onto the matching space.
-  ///                          Empty map throws at conversion time.
+  ///                          materializes each host chunk onto its assigned GPU's
+  ///                          space. Empty map throws at conversion time.
+  /// @param numa_to_gpus NUMA node id -> GPU device ids on that node. Each host
+  ///                     chunk is materialized on a GPU local to the NUMA node it
+  ///                     was pinned on (round-robin within the node), so chunks
+  ///                     balance across NUMA nodes AND across GPUs within a node
+  ///                     and the host->GPU copy stays NUMA-local. Empty map (or a
+  ///                     chunk whose NUMA is absent) falls back to the executing
+  ///                     GPU (cudaGetDevice()).
   cached_split_provider(
     std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
     std::vector<std::size_t> column_indices,
     cucascade::memory::memory_space& memory_space,
     std::unordered_map<int, cucascade::memory::memory_space*> gpu_memory_spaces,
+    std::unordered_map<int, std::vector<int>> numa_to_gpus,
     std::shared_ptr<duckdb::Expression> filter_expression,
     std::shared_ptr<op::scan::scan_plan const> plan);
 
@@ -128,8 +135,13 @@ class cached_split_provider : public split_provider {
   std::vector<std::size_t> _column_indices;
   cucascade::memory::memory_space* _memory_space;
   // HOST-mode only: device_id -> GPU memory_space lookup used at produce_split
-  // time to materialize host chunks onto the executing GPU.
+  // time to materialize host chunks onto their assigned GPU.
   std::unordered_map<int, cucascade::memory::memory_space*> _gpu_memory_spaces;
+  // HOST-mode only: per-chunk target GPU device id, parallel to _batches.
+  // Precomputed in the host ctor by round-robin within each chunk's NUMA-local
+  // GPU set so host-pinned chunks balance across NUMA nodes and across GPUs
+  // within a node. -1 => fall back to the executing GPU (cudaGetDevice()).
+  std::vector<int> _chunk_target_gpu;
   std::shared_ptr<duckdb::Expression> _filter_expression;
   std::shared_ptr<op::scan::scan_plan const> _plan;
   std::atomic<std::size_t> _next_batch_idx{0};

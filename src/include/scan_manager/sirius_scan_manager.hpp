@@ -241,7 +241,8 @@ class sirius_scan_manager {
   void prepare_for_query(
     const sirius::planner::query& query,
     std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs = {},
-    std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces   = {});
+    std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces   = {},
+    std::unordered_map<int, std::vector<int>> const& numa_to_gpus                        = {});
 
   /// \brief Clear the providers map and join the driver thread if it is
   ///        still running.
@@ -429,6 +430,10 @@ class sirius_scan_manager {
     _duckdb_native_providers_by_op;
   std::vector<op::scan::sirius_gpu_duckdb_native_scan_operator*> _duckdb_native_scan_op_order;
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
+  // NUMA node id -> GPU device ids on that node. Set by prepare_for_query and
+  // forwarded to the HOST-tier cached_split_provider so host-pinned chunks are
+  // materialized on a NUMA-local GPU (round-robin within the node).
+  std::unordered_map<int, std::vector<int>> _numa_to_gpus;
 };
 
 }  // namespace sirius::scan_manager
