@@ -71,3 +71,18 @@ jobs:
       cuda_version: '12'
       artifact_postfix: '-cuda12'
       runners: '{"linux_x64": ["self-hosted", "ubuntu-22.04", "cpu-xl"], "linux_arm64": ["self-hosted", "ubuntu-22.04", "arm-xl"]}'
+
+  # Single stable status context that aggregates every matrix build above, so it can be
+  # added as one required status check (the cuda-12/cuda-13 jobs have dynamic matrix names).
+  # This is what lets the merge queue reject a PR whose distribution build fails.
+  distribution:
+    runs-on: ubuntu-slim
+    needs: [cuda-12, cuda-13]
+    if: always()
+    steps:
+      - name: All distribution builds ok
+        if: ${{ needs.cuda-12.result == 'success' && needs.cuda-13.result == 'success' }}
+        run: exit 0
+      - name: Some distribution builds failed
+        if: ${{ !(needs.cuda-12.result == 'success' && needs.cuda-13.result == 'success') }}
+        run: exit 1
