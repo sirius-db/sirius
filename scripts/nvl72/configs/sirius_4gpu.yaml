@@ -1,0 +1,34 @@
+# Sirius config for TPC-H SF1000 multi-GPU benchmark — 4 GPUs.
+# Only `topology.num_gpus` differs across the 1/2/4-GPU configs in this dir.
+# GPU usage fraction 0.9 of a ~189 GiB GB200 ~= 170 GiB per GPU.
+# Host capacity is PER host space, and Sirius creates one host space per CPU
+# NUMA node. On this GB200 there are 2 such nodes (Grace LPDDR, ~478 GiB each,
+# nodes 0/1); the other NUMA nodes (2,10,18,26) are GPU HBM and belong to the
+# GPU tier, not the host tier. 430 GiB ~= 90% of one Grace node -> ~860 GiB
+# total host tier. (free/htop's 1.65 TiB = ~957 GiB Grace LPDDR + ~736 GiB HBM.)
+sirius:
+  topology:
+    num_gpus: 4
+  memory:
+    gpu:
+      usage_limit_fraction: 0.9
+      reservation_limit_fraction: 0.9
+    host:
+      capacity_bytes: 430 GiB
+  executor:
+    pipeline:
+      num_threads: 4
+    duckdb_scan:
+      num_threads: 2
+    task_creator:
+      num_threads: 2
+    downgrade:
+      num_threads: 1
+      monitor_period_ms: 10
+  operator_params:
+    scan_task_batch_size: 5368709120   # 5 GiB: fewer, larger scan tasks -> ~8x fewer allocations (q9 256s->32s); see scan-batch sweep
+    default_scan_task_varchar_size: 256
+    max_sort_partition_bytes: 0
+    hash_partition_bytes: 100000000
+    concat_batch_bytes: 5368709120
+    max_build_hash_table_bytes: 90000000
