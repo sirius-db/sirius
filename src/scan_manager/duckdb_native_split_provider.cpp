@@ -133,11 +133,24 @@ duckdb_native_split_provider::duckdb_native_split_provider(
                              _metadata.viability_failure_reason);
   }
 
-  // Mint the .db io_object once per query when the manager exposes sirius_ioctx.
-  // The scan task threads this onto every split so reads of .db blocks go through
-  // sirius_ioctx::host_read instead of DuckDB's BufferManager.
-  if (_io_ctx && !_scan_info->db_path.empty()) {
-    _db_io_object = _io_ctx->create_io_object(_scan_info->db_path);
+  // Mint the .db io_object once per query when the manager exposes sirius_ioctx AND the
+  // database is file-backed. The scan task threads this onto every split so reads of .db
+  // blocks go through sirius_ioctx::host_read instead of DuckDB's BufferManager.
+  //
+  // In-memory databases (":memory:") have no file to open, and some environments lack
+  // working io_uring / O_DIRECT. In those cases leave _db_io_object null so the decoder
+  // reads blocks via DuckDB's BufferManager (read_block_payload's fallback). This keeps
+  // the GPU-native scan — now the default path — robust everywhere instead of hard-failing.
+  if (_io_ctx && !_scan_info->db_path.empty() && _scan_info->db_path != ":memory:") {
+    try {
+      _db_io_object = _io_ctx->create_io_object(_scan_info->db_path);
+    } catch (const std::exception& e) {
+      SPDLOG_DEBUG("[duckdb_native_split_provider] sirius_io unavailable for '{}' ({}); "
+                   "falling back to DuckDB BufferManager for block reads",
+                   _scan_info->db_path,
+                   e.what());
+      _db_io_object = nullptr;
+    }
   }
 
   _batches = partition_row_groups_into_batches(

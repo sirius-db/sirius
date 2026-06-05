@@ -18,10 +18,17 @@
 #   --timeout <seconds>   Kill DuckDB session after N seconds (default: 1200)
 #   --cache-level <lvl>   Default Sirius scan_cache_level (sirius only)
 #   --multi-session       Run each query in its own DuckDB process
+#   --gpu-native-scan     Re-assert the GPU-native DuckDB scan (sirius only). REDUNDANT:
+#                         the GPU-native scan is the engine default now, so the plain
+#                         `sirius` engine already routes seq_scan to it. Kept for
+#                         backward compatibility and for SIRIUS_NATIVE_SCAN_VERIFY.
 #
 # Example:
-#   ./test/tpch_performance/run_tpch_duckdb.sh sirius 1 `seq 1 22`
+#   ./test/tpch_performance/run_tpch_duckdb.sh sirius 1 `seq 1 22`   # uses GPU-native scan by default
 #   ./test/tpch_performance/run_tpch_duckdb.sh --duckdb-file ./data/perf.duckdb duckdb 1 1 6
+#
+# Set SIRIUS_NATIVE_SCAN_VERIFY=1 to also emit `SET sirius_log_level='debug'`, exposing the
+# GPU-native-scan log markers (off by default to keep query timings clean).
 #
 # The scale_factor argument is kept for compatibility with benchmark drivers
 # (output filenames, logs). It does not select data inside performance_test.duckdb —
@@ -43,7 +50,8 @@ NUM_ITERATIONS=2
 SESSION_TIMEOUT=1200
 DROP_OS_CACHE=false
 MULTI_SESSION=false
-while [ "${1:-}" = "--duckdb-file" ] || [ "${1:-}" = "--iterations" ] || [ "${1:-}" = "--timeout" ] || [ "${1:-}" = "--drop-os-cache" ] || [ "${1:-}" = "--multi-session" ]; do
+GPU_NATIVE_SCAN=false
+while [ "${1:-}" = "--duckdb-file" ] || [ "${1:-}" = "--iterations" ] || [ "${1:-}" = "--timeout" ] || [ "${1:-}" = "--drop-os-cache" ] || [ "${1:-}" = "--multi-session" ] || [ "${1:-}" = "--gpu-native-scan" ]; do
     if [ "$1" = "--duckdb-file" ]; then
         DUCKDB_FILE="$2"
         shift 2
@@ -59,17 +67,21 @@ while [ "${1:-}" = "--duckdb-file" ] || [ "${1:-}" = "--iterations" ] || [ "${1:
     elif [ "$1" = "--multi-session" ]; then
         MULTI_SESSION=true
         shift
+    elif [ "$1" = "--gpu-native-scan" ]; then
+        GPU_NATIVE_SCAN=true
+        shift
     fi
 done
 
 if [ $# -lt 3 ]; then
-    echo "Usage: $0 [--duckdb-file <path>] [--iterations <N>] [--timeout <seconds>] [--multi-session] [--drop-os-cache] <engine> <scale_factor> <query_numbers...>"
+    echo "Usage: $0 [--duckdb-file <path>] [--iterations <N>] [--timeout <seconds>] [--multi-session] [--drop-os-cache] [--gpu-native-scan] <engine> <scale_factor> <query_numbers...>"
     echo "Example: $0 sirius 1 \`seq 1 22\`"
     echo "  Default database: \$PROJECT_DIR/performance_test.duckdb"
     echo "  --iterations N    Number of iterations per query (default: 2, 1 cold + N-1 warm)"
     echo "  --timeout N       Kill the DuckDB session after N seconds (default: 1200, 0 = no timeout)"
     echo "  --multi-session   Run each query in its own DuckDB process (fresh state per query)"
     echo "  --drop-os-cache   Drop OS filesystem cache before each query (requires --multi-session and sudo)"
+    echo "  --gpu-native-scan Re-assert GPU-native scan (redundant: it is the sirius default now)"
     exit 1
 fi
 
@@ -153,6 +165,9 @@ echo "Running TPC-H queries from DuckDB file (sf label: ${SF})"
 echo "Engine: $ENGINE"
 echo "Database: $DUCKDB_FILE"
 echo "Session: $SESSION_MODE"
+if [ "$ENGINE" = "sirius" ] && [ "$GPU_NATIVE_SCAN" = true ]; then
+    echo "GPU-native scan: enabled (SET enable_gpu_duckdb_native_scan = true)"
+fi
 if [ "$DROP_OS_CACHE" = true ]; then
     echo "Drop OS cache: enabled"
 fi
@@ -172,6 +187,19 @@ run_single_session() {
     local TEMP_SQL
     TEMP_SQL=$(mktemp /tmp/tpch_all_XXXXXX.sql)
     echo ".timer on" >> "$TEMP_SQL"
+
+    # The GPU-native DuckDB scan is the engine default, so the sirius engine already routes
+    # seq_scan to it without any SET. SIRIUS_NATIVE_SCAN_VERIFY=1 raises the log level so the
+    # native-scan markers appear; --gpu-native-scan re-asserts the default explicitly. Emitted
+    # once before the first query marker so the SET Run Time stays outside every timing window.
+    if [ "$ENGINE" = "sirius" ]; then
+        if [ "${SIRIUS_NATIVE_SCAN_VERIFY:-0}" = 1 ]; then
+            echo "SET sirius_log_level = 'debug';" >> "$TEMP_SQL"
+        fi
+        if [ "$GPU_NATIVE_SCAN" = true ]; then
+            echo "SET enable_gpu_duckdb_native_scan = true;" >> "$TEMP_SQL"
+        fi
+    fi
 
     for q in "${VALID_QUERIES[@]}"; do
         local QUERY_FILE="$QUERY_DIR/q${q}.sql"
@@ -332,6 +360,14 @@ run_multi_session() {
         {
             if [ "$ENGINE" = "sirius" ] && [ -n "${QUERY_CACHE_LEVEL[$q]:-}" ]; then
                 printf "SET scan_cache_level = '%s';\n" "${QUERY_CACHE_LEVEL[$q]}"
+            fi
+            if [ "$ENGINE" = "sirius" ]; then
+                if [ "${SIRIUS_NATIVE_SCAN_VERIFY:-0}" = 1 ]; then
+                    printf "SET sirius_log_level = 'debug';\n"
+                fi
+                if [ "$GPU_NATIVE_SCAN" = true ]; then
+                    printf "SET enable_gpu_duckdb_native_scan = true;\n"
+                fi
             fi
             printf ".timer on\n"
             for ((iter = 0; iter < NUM_ITERATIONS; iter++)); do

@@ -609,12 +609,14 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // s3_config == std::nullopt and the scan_manager skips s3_ioctx
   // construction. The FSMR is passed through to uring_ioctx / buffer_pool.
   auto sm_config = config_.get_scan_manager_config();
-  // duckdb-native scan needs sirius_ioctx for host_read; force it on only
-  // when that path is enabled, so the documented fallback knob stays usable
-  // for other scan paths.
-  if (host_fsmr != nullptr && config_.get_operator_params().enable_gpu_duckdb_native_scan) {
-    sm_config.use_sirius_datasource = true;
-  }
+  // The GPU-native duckdb scan reads segments via DuckDB's BufferManager by default
+  // (duckdb_native_decoder::read_block_payload falls back to BufferManager::Pin when
+  // no sirius_ioctx is available). The sirius_ioctx (io_uring + O_DIRECT) datasource is
+  // an opt-in optimization — enable it explicitly with `use_sirius_datasource: true` in
+  // the scan_manager config on hosts where io_uring/O_DIRECT is available. It is NOT
+  // force-enabled by enable_gpu_duckdb_native_scan: that flag is on by default now, and
+  // forcing the uring path here would break the native scan (and parquet scans) on
+  // environments without working io_uring/O_DIRECT.
   if (!config_.object_store_config.endpoint.empty() &&
       !config_.object_store_config.access_key.empty() &&
       !config_.object_store_config.secret_key.empty()) {

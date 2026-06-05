@@ -397,6 +397,18 @@ duckdb_native_metadata walk_duckdb_native_metadata(
 
     auto desc = build_segment_descriptor(seg, compression);
 
+    // Transient / in-memory segments have no persisted block to read by id (e.g. tables in
+    // a ":memory:" database, or data not yet checkpointed to disk). CONSTANT segments
+    // legitimately carry block_id<0 — their value comes from statistics and is handled
+    // separately at decode. Any other negative block_id means the GPU-native scan cannot
+    // read this table from storage, so refuse and let the query fall back to the CPU scan.
+    if (compression != duckdb::CompressionType::COMPRESSION_CONSTANT && desc.block_id < 0) {
+      refuse(std::string{validity_seg ? "validity" : "data"} + " segment on column " +
+             std::to_string(seg.column_id) + " row group " + std::to_string(rg_idx) +
+             ": transient/in-memory segment (block_id<0) not readable by the GPU-native scan");
+      return md;
+    }
+
     if (!validity_seg && projected_types[ci].is_varchar()) {
       // Refuse on absent stat so downstream consumers can deref unchecked.
       // Some(0) is legal data (all-empty row group); decode produces 0 chars.

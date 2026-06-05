@@ -381,7 +381,11 @@ void sirius_pipeline_converter::split_table_scan_source(
     return;
   }
 
-  if (scan_op.function.name == "seq_scan" && op_params_.enable_gpu_duckdb_native_scan) {
+  // The GPU-native scan only supports seq_scan over base tables (TableScanBindData).
+  // It is the default path, so anything else (e.g. a seq_scan whose bind_data is not a
+  // base-table binding) must fall through to the CPU scan below rather than hard-fail.
+  if (scan_op.function.name == "seq_scan" && op_params_.enable_gpu_duckdb_native_scan &&
+      dynamic_cast<duckdb::TableScanBindData*>(scan_op.bind_data.get()) != nullptr) {
     insert_duckdb_native_scan_operator(current_pipeline);
     return;
   }

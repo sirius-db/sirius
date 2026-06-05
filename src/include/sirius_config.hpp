@@ -65,8 +65,9 @@ struct operator_params {
 
   /// Route DuckDB native `seq_scan` to the GPU-native scan operator
   /// (sirius_gpu_duckdb_native_scan_operator) instead of the CPU fallback
-  /// (sirius_physical_duckdb_scan). Off by default.
-  bool enable_gpu_duckdb_native_scan = false;
+  /// (sirius_physical_duckdb_scan). On by default — the GPU-native scan is the
+  /// standard path for DuckDB-managed tables. Set false to use the legacy CPU scan.
+  bool enable_gpu_duckdb_native_scan = true;
 };
 
 struct telemetry_config {
