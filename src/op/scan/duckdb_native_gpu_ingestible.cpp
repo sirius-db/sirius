@@ -15,6 +15,7 @@
  */
 
 // sirius
+#include <expression/ast/from_duckdb.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <io/io_context.hpp>
 #include <log/logging.hpp>
@@ -290,7 +291,8 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
 
   if (pf.apply_filter && _filter_expression) {
-    sirius::gpu_expression_executor exec(_filter_expression.get(), mr_ref, stream);
+    auto sirius_filter_ast = sirius::ast::from_duckdb(*_filter_expression);
+    sirius::gpu_expression_executor exec(sirius_filter_ast.get(), mr_ref, stream);
     auto src = std::move(input);
     input    = exec.select(src->view());
   }

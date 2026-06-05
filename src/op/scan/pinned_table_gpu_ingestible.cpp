@@ -17,6 +17,7 @@
 // sirius
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
+#include <expression/ast/from_duckdb.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <log/logging.hpp>
 #include <op/scan/pinned_table_gpu_ingestible.hpp>
@@ -196,8 +197,9 @@ std::unique_ptr<cudf::table> pinned_table_gpu_ingestible::post_filter_and_projec
   auto const& pf = static_cast<pinned_table_post_filter_and_projection_info const&>(info);
 
   if (pf.apply_filter && _filter_expression) {
+    auto sirius_filter_ast = sirius::ast::from_duckdb(*_filter_expression);
     sirius::gpu_expression_executor exec(
-      _filter_expression.get(), cudf::get_current_device_resource_ref(), stream);
+      sirius_filter_ast.get(), cudf::get_current_device_resource_ref(), stream);
     auto src = std::move(input);
     input    = exec.select(src->view());
     SIRIUS_LOG_DEBUG(

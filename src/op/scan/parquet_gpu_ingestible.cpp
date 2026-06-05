@@ -15,6 +15,7 @@
  */
 
 // sirius
+#include <expression/ast/from_duckdb.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <expression_executor/gpu_expression_translator_internal.hpp>
 #include <io/io_context.hpp>
@@ -193,8 +194,8 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
       return _plan->batch_column_name(ref_index);
     };
     gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
-    ast_expression =
-      translator.translate_expression_with_names(*_duckdb_filter_expression, name_resolver);
+    auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
+    ast_expression = translator.translate_expression_with_names(*sirius_filter_ast, name_resolver);
     if (ast_expression) {
       // FLBA-decimal pushdown probe — see parquet_split_provider.cpp:276-326.
       if (planning_ioctx_it == _gpu_ioctxs.end()) {
@@ -552,15 +553,6 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::materialize_table(
   std::vector<std::shared_ptr<sirius::io::sirius_io_object>> io_objects;
   io_objects.reserve(split.rg_slices.size());
   for (auto const& slice : split.rg_slices) {
-    // Two-dimensional ioctx selection (multi-GPU #732 × multi-backend-S3) —
-    // mirrors sirius_gpu_parquet_scan_operator::read_table_from_metadata.
-    auto const is_per_gpu_local = [&] {
-      for (auto const& [dev, ctx] : _gpu_ioctxs) {
-        if (ctx == slice.io_ctx) { return true; }
-      }
-      return false;
-    }();
-    auto const ds_ioctx = (slice.io_ctx && !is_per_gpu_local) ? slice.io_ctx : ioctx_it->second;
     if (kvikio_fallback_mode || !slice.io_ctx) {
       // use_sirius_datasource=false path: use cudf's bundled datasource (kvikio).
       sources.push_back(cudf::io::datasource::create(slice.file_path));
@@ -595,16 +587,21 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::materialize_table(
 
   // Per-task AST translation. set_filter is gated on translation success AND on
   // the per-batch disable_filter_pushdown flag (set when the FLBA-decimal probe
-  // failed).
+  // failed). `sirius_filter_ast` is hoisted so the post-decode fallback can
+  // reuse it on a pushdown miss.
+  std::unique_ptr<sirius::ast::node> sirius_filter_ast;
   std::optional<gpu_expression_translator::translated_expression> ast_expression = std::nullopt;
-  if (_duckdb_filter_expression && !split.disable_filter_pushdown) {
-    auto name_resolver = [plan = split.plan](duckdb::idx_t ref_index) -> std::string {
-      return plan->batch_column_name(ref_index);
-    };
-    gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
-    ast_expression =
-      translator.translate_expression_with_names(*_duckdb_filter_expression, name_resolver);
-    if (ast_expression) { opts.set_filter(ast_expression->back()); }
+  if (_duckdb_filter_expression) {
+    sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
+    if (!split.disable_filter_pushdown) {
+      auto name_resolver = [plan = split.plan](duckdb::idx_t ref_index) -> std::string {
+        return plan->batch_column_name(ref_index);
+      };
+      gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
+      ast_expression =
+        translator.translate_expression_with_names(*sirius_filter_ast, name_resolver);
+      if (ast_expression) { opts.set_filter(ast_expression->back()); }
+    }
   }
 
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
@@ -619,10 +616,11 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::materialize_table(
     table->num_rows(),
     table->num_columns());
 
-  // Post-decode filter when pushdown was not engaged.
-  if (_duckdb_filter_expression && !ast_expression) {
+  // Post-decode filter when pushdown was not engaged. `sirius_filter_ast` must
+  // outlive `exec` — the executor only borrows the AST.
+  if (sirius_filter_ast && !ast_expression) {
     sirius::gpu_expression_executor exec(
-      _duckdb_filter_expression.get(), cudf::get_current_device_resource_ref(), stream);
+      sirius_filter_ast.get(), cudf::get_current_device_resource_ref(), stream);
     auto input = std::move(table);
     table      = exec.select(input->view());
     SIRIUS_LOG_DEBUG(
