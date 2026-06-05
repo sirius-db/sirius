@@ -555,8 +555,11 @@ io::filtered_table parquet_gpu_ingestible::materialize_table(
   std::vector<std::shared_ptr<sirius::io::sirius_io_object>> io_objects;
   io_objects.reserve(split.rg_slices.size());
   for (auto const& slice : split.rg_slices) {
-    if (kvikio_fallback_mode || !slice.io_ctx) {
-      // use_sirius_datasource=false path: use cudf's bundled datasource (kvikio).
+    if (!slice.io_ctx) {
+      // No sirius backend minted this slice (local file, single-GPU
+      // use_sirius_datasource=false): use cudf's bundled datasource (kvikio).
+      // Slices that carry an io_ctx (e.g. the shared s3_ioctx for s3://) fall
+      // through to the make_datasource path below even when kvikio_fallback_mode.
       sources.push_back(cudf::io::datasource::create(slice.file_path));
     } else {
       // Two-dimensional ioctx selection (multi-GPU #732 × multi-backend-S3).
