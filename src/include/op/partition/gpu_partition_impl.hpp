@@ -58,6 +58,30 @@ class gpu_partition_impl {
     rmm::cuda_stream_view stream,
     cucascade::memory::memory_space& memory_space);
 
+  /**
+   * @brief Hash partition, returning the single reordered table plus zero-copy per-partition
+   * views into it (instead of materializing each partition as its own table).
+   *
+   * cudf::hash_partition already produces ONE reordered table whose rows are grouped by
+   * partition; this returns that table together with `num_partitions` `cudf::table_view`
+   * slices (with any transient hash-cast columns dropped). The caller MUST keep the returned
+   * table alive for as long as it uses the views, and MUST materialize (copy / concatenate)
+   * before any view crosses a task boundary — views are not downgradable/spillable and a
+   * sliced (offset) view cannot be safely peer-copied. This lets a caller that immediately
+   * re-groups the partitions (e.g. cross-GPU shuffle coalescing) materialize exactly once at
+   * the concat step rather than copying every fine partition and then concatenating again.
+   *
+   * @return {reordered_table, per-partition views into reordered_table}. View `i` covers the
+   *         rows of partition `i`; views reference `reordered_table`'s device buffers.
+   */
+  static std::pair<std::unique_ptr<cudf::table>, std::vector<cudf::table_view>>
+  hash_partition_sliced(const cucascade::read_only_data_batch& input,
+                        const std::vector<int>& partition_key_idx,
+                        const std::vector<cudf::data_type>& partition_key_cast_types,
+                        int num_partitions,
+                        rmm::cuda_stream_view stream,
+                        cucascade::memory::memory_space& memory_space);
+
   /// Overload without cast types (all keys hashed as-is). Kept for backward compatibility.
   static std::vector<std::shared_ptr<cucascade::data_batch>> hash_partition(
     const cucascade::read_only_data_batch& input,

@@ -30,6 +30,31 @@ namespace op {
 
 enum class PartitionType { HASH, RANGE, EVENLY, CUSTOM, NONE };
 
+/**
+ * @brief Pipelineable data carrying coalesced partition batches with explicit GPU slots.
+ *
+ * Extends pipelineable_operator_data with a parallel `slots` vector: slots[i] is the
+ * GPU slot (partition index in the consumer repo) that batch i must be pushed to.
+ * Produced by the partition operator's cross-GPU shuffle coalescing step so that each
+ * target GPU receives a small number of large batches instead of many tiny fine
+ * partitions. The slot is `fine_partition % num_gpus`, matching task_creator's routing
+ * rule, so matching keys co-locate in the same slot on build and probe sides.
+ */
+class partition_slotted_operator_data : public pipelineable_operator_data {
+ public:
+  partition_slotted_operator_data(
+    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches,
+    std::vector<std::size_t> slots)
+    : pipelineable_operator_data(std::move(data_batches)), _slots(std::move(slots))
+  {
+  }
+
+  [[nodiscard]] const std::vector<std::size_t>& get_slots() const { return _slots; }
+
+ private:
+  std::vector<std::size_t> _slots;
+};
+
 // PartitionType to string
 inline std::string partition_type_to_string(PartitionType type)
 {
@@ -99,6 +124,14 @@ class sirius_physical_partition : public sirius_physical_operator {
     _small_table_bytes  = small_table_bytes;
   }
 
+  /// Set the byte cap used when coalescing fine partitions into per-GPU-slot batches.
+  /// Each coalesced build batch becomes a cuco hash table, so this is capped at the
+  /// build-table limit by default (see ctor). Plumbed for future runtime configuration.
+  void set_coalesce_batch_bytes(uint64_t coalesce_batch_bytes)
+  {
+    _coalesce_batch_bytes = coalesce_batch_bytes;
+  }
+
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const op::input_stats& stats) const override;
 
@@ -125,6 +158,9 @@ class sirius_physical_partition : public sirius_physical_operator {
   uint64_t s_partition_size;
   int _min_num_partitions{1};
   uint64_t _small_table_bytes{0};
+  /// Byte cap for a single coalesced per-slot batch. Each coalesced build batch
+  /// becomes a cuco hash table, so default to the build-table size limit.
+  uint64_t _coalesce_batch_bytes{sirius::config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES};
 };
 
 }  // namespace op

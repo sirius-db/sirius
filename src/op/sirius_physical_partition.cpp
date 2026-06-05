@@ -27,9 +27,13 @@
 #include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
+#include <cudf/concatenate.hpp>
+
 #include <nvtx3/nvtx3.hpp>
 
+#include <algorithm>
 #include <mutex>
+#include <vector>
 
 namespace sirius {
 namespace op {
@@ -174,6 +178,110 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
     return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
   }
 
+  const std::size_t num_gpus = static_cast<std::size_t>(std::max(1, _min_num_partitions));
+  const std::size_t num_fine = static_cast<std::size_t>(_num_partitions.value());
+
+  // Cross-GPU shuffle coalescing (fast path).
+  //
+  // task_creator routes partition slot s to GPU `s % num_gpus`. Without coalescing,
+  // each of the `_num_partitions` fine partitions is pushed as its own batch tagged
+  // with a running slot index, so every fine partition whose target GPU differs from
+  // the producer triggers an independent tiny cross-GPU peer copy. Here we bucket the
+  // fine partitions into `num_gpus` GPU slots (using EXACTLY task_creator's routing
+  // rule, slot = p % num_gpus) and concat the members of each slot up to a byte cap, so
+  // each target GPU receives a small number of large batches.
+  //
+  // Materialization happens EXACTLY ONCE here: hash_partition_sliced returns the single
+  // reordered table plus zero-copy per-partition views, and we concat (or copy) each
+  // slot group straight from those views into one contiguous, downgradable table. The
+  // views never leave this task — only the materialized per-slot tables cross into the
+  // sink — so a sliced view is never peer-copied or asked to spill. (The previous
+  // implementation materialized every fine partition AND then concatenated, copying the
+  // shuffled data twice.)
+  //
+  // Correctness: build and probe partition operators share `_num_partitions`, the same
+  // murmur3 hash, and the same key cast types, so a key lands in the same fine partition
+  // p on both sides; slot = p % num_gpus is deterministic in p, so matching keys
+  // co-locate in the same slot on both sides (and thus the same GPU). The hash join
+  // walks a per-slot build x probe grid, so every matching pair is still seen.
+  // Coalescing only unions disjoint fine-partition key sets within a slot; the join /
+  // aggregate re-hashes within each batch, so no matches are lost (a slot that emits
+  // more than one batch yields some extra non-matching grid cells, which is bounded and
+  // correctness-neutral).
+  //
+  // The gate requires `num_fine > num_gpus`, which guarantees every slot in
+  // [0, num_gpus) has at least one member; both sides therefore emit the SAME number of
+  // slots, satisfying the hash join's `default.num_partitions() == build.num_partitions()`
+  // requirement. When the gate is false (single GPU / non-HASH / few fine partitions),
+  // we fall through to the per-partition materialization below.
+  if (_partition_type == PartitionType::HASH && num_gpus > 1 && num_fine > num_gpus) {
+    auto [reordered, partition_views] =
+      gpu_partition_impl::hash_partition_sliced(input_batch_ro,
+                                                _partition_keys,
+                                                _partition_key_cast_types,
+                                                static_cast<int>(num_fine),
+                                                stream,
+                                                *space);
+
+    // Approximate each partition's byte size from the parent table proportionally to its
+    // row count (all views share the parent's column layout). Used only to bound the
+    // coalesced batch size against _coalesce_batch_bytes.
+    const std::size_t parent_rows  = static_cast<std::size_t>(reordered->num_rows());
+    const std::size_t parent_bytes = reordered->alloc_size();
+
+    // Bucket fine partition p into GPU slot g = p % num_gpus.
+    std::vector<std::vector<std::size_t>> slot_members(num_gpus);
+    for (std::size_t p = 0; p < num_fine; p++) {
+      slot_members[p % num_gpus].push_back(p);
+    }
+
+    std::vector<std::shared_ptr<cucascade::data_batch>> coalesced_batches;
+    std::vector<std::size_t> coalesced_slots;
+    coalesced_batches.reserve(num_gpus);
+    coalesced_slots.reserve(num_gpus);
+
+    for (std::size_t g = 0; g < num_gpus; g++) {
+      std::vector<cudf::table_view> group;
+      uint64_t group_bytes = 0;
+
+      auto flush_group = [&]() {
+        if (group.empty()) { return; }
+        // The ONLY materialization: copy a single-member group as-is, or concatenate a
+        // multi-member group, into one contiguous owned table that can cross the task
+        // boundary and be downgraded/spilled.
+        std::unique_ptr<cudf::table> merged =
+          (group.size() == 1)
+            ? std::make_unique<cudf::table>(group[0], stream, space->get_default_allocator())
+            : cudf::concatenate(group, stream, space->get_default_allocator());
+        coalesced_batches.push_back(make_data_batch(std::move(merged), *space, stream));
+        coalesced_slots.push_back(g);
+        group.clear();
+        group_bytes = 0;
+      };
+
+      for (auto p : slot_members[g]) {
+        const std::size_t view_rows = static_cast<std::size_t>(partition_views[p].num_rows());
+        const uint64_t p_bytes      = parent_rows
+                                        ? static_cast<uint64_t>(static_cast<double>(parent_bytes) *
+                                                           static_cast<double>(view_rows) /
+                                                           static_cast<double>(parent_rows))
+                                        : 0;
+        // Flush the accumulated group before adding a member that would exceed the cap,
+        // but keep at least one member per group so a single oversized fine partition
+        // still forms its own group.
+        if (!group.empty() && group_bytes + p_bytes > _coalesce_batch_bytes) { flush_group(); }
+        group.push_back(partition_views[p]);
+        group_bytes += p_bytes;
+      }
+      flush_group();
+    }
+
+    // `reordered` and its views are released here, after every group is materialized.
+    return std::make_unique<partition_slotted_operator_data>(std::move(coalesced_batches),
+                                                             std::move(coalesced_slots));
+  }
+
+  // Fallback: produce one materialized batch per partition (no cross-GPU coalescing).
   std::vector<std::shared_ptr<cucascade::data_batch>> partitioned_results;
   switch (_partition_type) {
     case PartitionType::HASH:
@@ -200,6 +308,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
       throw std::runtime_error("Unsupported partition type: " +
                                partition_type_to_string(_partition_type));
   }
+
   return std::make_unique<pipelineable_operator_data>(partitioned_results);
 }
 
@@ -209,8 +318,18 @@ void sirius_physical_partition::sink(const operator_data& input_data, rmm::cuda_
   auto& pipelineable_input  = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = pipelineable_input.get_data_batches();
   (void)stream;  // sink does not use stream for push_data_batch_partitioned
-  int partition_id = 0;
-  for (auto& batch : input_batches) {
+
+  // When the coalescing step produced slotted data, each batch carries an explicit GPU
+  // slot (fine_partition % num_gpus). Push it to that slot so task_creator routes the
+  // coalesced batch to the intended GPU. Otherwise fall back to the running-index path
+  // where slot == fine partition index.
+  const auto* slotted = dynamic_cast<const partition_slotted_operator_data*>(&input_data);
+  const std::vector<std::size_t>* slots = slotted ? &slotted->get_slots() : nullptr;
+
+  std::size_t partition_id = 0;
+  for (std::size_t i = 0; i < input_batches.size(); i++) {
+    auto& batch                  = input_batches[i];
+    const std::size_t target_idx = slots ? (*slots)[i] : partition_id;
     for (auto& next_port_info : next_port_after_sink) {
       // the next operator is a partition consumer operator, so we need to push the batch into the
       // specific partition
@@ -218,7 +337,7 @@ void sirius_physical_partition::sink(const operator_data& input_data, rmm::cuda_
         dynamic_cast<sirius_physical_partition_consumer_operator*>(next_port_info.next_operator);
       if (partition_consumer_op) {
         partition_consumer_op->push_data_batch_partitioned(
-          next_port_info.next_operator_port_name, batch, partition_id);
+          next_port_info.next_operator_port_name, batch, target_idx);
       } else {
         throw std::runtime_error("Next operator is not a partition consumer operator");
       }
