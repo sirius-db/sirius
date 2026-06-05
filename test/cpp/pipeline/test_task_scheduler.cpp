@@ -19,8 +19,7 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "scan/test_utils.hpp"
-#include "sirius_config.hpp"
-#include "telemetry/telemetry_context.hpp"
+#include "utils/telemetry_utils.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
 
@@ -37,18 +36,6 @@ using namespace sirius::parallel;
 using namespace std::chrono_literals;
 using namespace sirius::op;
 
-namespace {
-
-std::shared_ptr<const sirius::telemetry::telemetry_context> make_test_telemetry_context()
-{
-  sirius::telemetry_config config;
-  config.enable_quent = false;
-  config.engine_name  = "test-task-scheduler";
-  return sirius::telemetry::telemetry_context::create(config);
-}
-
-}  // namespace
-
 /**
  * Mock GPU pipeline task for testing.
  * This task simulates work without actually executing GPU operations.
@@ -56,7 +43,7 @@ std::shared_ptr<const sirius::telemetry::telemetry_context> make_test_telemetry_
 class mock_gpu_pipeline_task_global_state : public gpu_pipeline_task_global_state {
  public:
   mock_gpu_pipeline_task_global_state()
-    : gpu_pipeline_task_global_state(nullptr, make_test_telemetry_context()),
+    : gpu_pipeline_task_global_state(nullptr, sirius::test::make_test_telemetry_context()),
       executed_count(0),
       gpu_ids_used()
   {
@@ -117,7 +104,8 @@ TEST_CASE("Task scheduler can start and stop gracefully", "[task_scheduler]")
   auto manager = initialize_memory_manager(1);
   sirius::exec::thread_pool_config gpu_config{2};
   sirius::exec::thread_pool_config scan_config{2};
-  task_scheduler executor(gpu_config, scan_config, *manager, make_test_telemetry_context());
+  task_scheduler executor(
+    gpu_config, scan_config, *manager, sirius::test::make_test_telemetry_context());
 
   REQUIRE_NOTHROW(executor.start());
   REQUIRE_NOTHROW(executor.stop());
@@ -128,7 +116,8 @@ TEST_CASE("Task scheduler executes tasks through pipeline_queue", "[task_schedul
   auto manager = initialize_memory_manager(1);
   sirius::exec::thread_pool_config gpu_config{2};
   sirius::exec::thread_pool_config scan_config{2};
-  task_scheduler executor(gpu_config, scan_config, *manager, make_test_telemetry_context());
+  task_scheduler executor(
+    gpu_config, scan_config, *manager, sirius::test::make_test_telemetry_context());
 
   auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
 
@@ -162,7 +151,8 @@ TEST_CASE("Task queue handles empty queue gracefully", "[pipeline_queue]")
   auto manager = initialize_memory_manager(1);
   sirius::exec::thread_pool_config gpu_config{2};
   sirius::exec::thread_pool_config scan_config{2};
-  task_scheduler executor(gpu_config, scan_config, *manager, make_test_telemetry_context());
+  task_scheduler executor(
+    gpu_config, scan_config, *manager, sirius::test::make_test_telemetry_context());
 
   auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
 
@@ -191,7 +181,8 @@ TEST_CASE("Task scheduler dispatches tasks with device preference", "[task_sched
   auto manager = initialize_memory_manager(2);
   sirius::exec::thread_pool_config gpu_config{2};
   sirius::exec::thread_pool_config scan_config{2};
-  task_scheduler sched(gpu_config, scan_config, *manager, make_test_telemetry_context());
+  task_scheduler sched(
+    gpu_config, scan_config, *manager, sirius::test::make_test_telemetry_context());
 
   auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
   sched.start();

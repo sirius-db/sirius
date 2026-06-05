@@ -24,8 +24,7 @@
 #include "pipeline/sirius_pipeline_task_states.hpp"
 #include "pipeline/task_request.hpp"
 #include "scan/test_utils.hpp"
-#include "sirius_config.hpp"
-#include "telemetry/telemetry_context.hpp"
+#include "utils/telemetry_utils.hpp"
 
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
@@ -48,21 +47,13 @@ namespace {
 constexpr std::size_t kGpuCapacity     = 1100ULL * 1024 * 1024;  // 1100 MB
 constexpr std::size_t kReservationSize = 50ULL * 1024 * 1024;    // 50 MB
 
-std::shared_ptr<const sirius::telemetry::telemetry_context> make_test_telemetry_context()
-{
-  sirius::telemetry_config config;
-  config.enable_quent = false;
-  config.engine_name  = "test-oom-reschedule";
-  return sirius::telemetry::telemetry_context::create(config);
-}
-
 //------------------------------------------------------------------------------
 // Test global state — shared across all tasks
 //------------------------------------------------------------------------------
 class oom_test_global_state : public sirius::pipeline::sirius_pipeline_task_global_state {
  public:
   oom_test_global_state()
-    : sirius_pipeline_task_global_state(nullptr, make_test_telemetry_context())
+    : sirius_pipeline_task_global_state(nullptr, sirius::test::make_test_telemetry_context())
   {
   }
 
@@ -119,7 +110,11 @@ struct oom_test_fixture {
     config.thread_name_prefix = thread_name_prefix;
 
     executor = std::make_unique<sirius::pipeline::gpu_pipeline_executor>(
-      config, mem_space, std::move(request_publisher), nullptr, make_test_telemetry_context());
+      config,
+      mem_space,
+      std::move(request_publisher),
+      nullptr,
+      sirius::test::make_test_telemetry_context());
     executor->set_completion_handler(&completion);
     return true;
   }
