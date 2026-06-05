@@ -14,11 +14,13 @@
  * limitations under the License.
  */
 
-// Tests for sirius::join_condition and the duckdb::ExpressionType <-> sirius::comparison_type
-// mapping helpers.
+// Tests for the surviving sirius::join_condition surface: the
+// duckdb::ExpressionType <-> sirius::comparison_type mapping helpers and the
+// wrap_join_conditions boundary builder (which now produces AST-node sides).
 
 #include "catch.hpp"
-#include "expression/expression_internal.hpp"
+#include "expression/ast/constant.hpp"
+#include "expression/ast/node.hpp"
 #include "expression/join_condition.hpp"
 
 #include <duckdb/common/enums/expression_type.hpp>
@@ -28,6 +30,7 @@
 
 #include <memory>
 #include <utility>
+#include <variant>
 #include <vector>
 
 using sirius::comparison_type;
@@ -66,13 +69,23 @@ duckdb::JoinCondition make_cond(duckdb::unique_ptr<duckdb::Expression> left,
   return c;
 }
 
+// Assert the AST node is an INTEGER constant equal to `expected`.
+void require_int_constant(sirius::ast::node const* n, int32_t expected)
+{
+  REQUIRE(n != nullptr);
+  REQUIRE(n->holds<sirius::ast::constant>());
+  auto const& c = n->get<sirius::ast::constant>();
+  REQUIRE(std::holds_alternative<int32_t>(c.payload));
+  REQUIRE(std::get<int32_t>(c.payload) == expected);
+}
+
 }  // namespace
 
 // ============================================================================
 // from_duckdb / to_duckdb round-trip
 // ============================================================================
 
-TEST_CASE("join_condition - to_duckdb then from_duckdb round-trips every comparison_type",
+TEST_CASE("comparison_type - to_duckdb then from_duckdb round-trips every comparison_type",
           "[join_condition]")
 {
   for (auto c : k_all_comparisons) {
@@ -80,7 +93,7 @@ TEST_CASE("join_condition - to_duckdb then from_duckdb round-trips every compari
   }
 }
 
-TEST_CASE("join_condition - from_duckdb throws on an unsupported ExpressionType",
+TEST_CASE("comparison_type - from_duckdb throws on an unsupported ExpressionType",
           "[join_condition]")
 {
   REQUIRE_THROWS_AS(sirius::from_duckdb(duckdb::ExpressionType::COMPARE_IN), std::runtime_error);
@@ -90,12 +103,9 @@ TEST_CASE("join_condition - from_duckdb throws on an unsupported ExpressionType"
 // wrap_join_conditions
 // ============================================================================
 
-TEST_CASE("join_condition - wrap_join_conditions transfers expressions and maps comparisons",
-          "[join_condition]")
+TEST_CASE("wrap_join_conditions transfers expressions and maps comparisons", "[join_condition]")
 {
   std::vector<duckdb::JoinCondition> input;
-  std::vector<duckdb::Expression const*> left_ptrs;
-  std::vector<duckdb::Expression const*> right_ptrs;
 
   struct entry {
     duckdb::ExpressionType in;
@@ -108,31 +118,26 @@ TEST_CASE("join_condition - wrap_join_conditions transfers expressions and maps 
   };
 
   for (auto const& [duckdb_type, _] : entries) {
-    auto l = make_const(10);
-    auto r = make_const(20);
-    left_ptrs.push_back(l.get());
-    right_ptrs.push_back(r.get());
-    input.push_back(make_cond(std::move(l), std::move(r), duckdb_type));
+    input.push_back(make_cond(make_const(10), make_const(20), duckdb_type));
   }
 
   auto wrapped = sirius::wrap_join_conditions(std::move(input));
 
   REQUIRE(wrapped.size() == std::size(entries));
   for (std::size_t i = 0; i < wrapped.size(); ++i) {
-    REQUIRE(sirius::unwrap(wrapped[i].left) == left_ptrs[i]);
-    REQUIRE(sirius::unwrap(wrapped[i].right) == right_ptrs[i]);
+    require_int_constant(wrapped[i].left.get(), 10);
+    require_int_constant(wrapped[i].right.get(), 20);
     REQUIRE(wrapped[i].comparison == entries[i].expected_out);
   }
 }
 
-TEST_CASE("join_condition - wrap_join_conditions on empty input returns empty vector",
-          "[join_condition]")
+TEST_CASE("wrap_join_conditions on empty input returns empty vector", "[join_condition]")
 {
   auto out = sirius::wrap_join_conditions(std::vector<duckdb::JoinCondition>{});
   REQUIRE(out.empty());
 }
 
-TEST_CASE("join_condition - wrap_join_conditions propagates from_duckdb throws", "[join_condition]")
+TEST_CASE("wrap_join_conditions propagates from_duckdb throws", "[join_condition]")
 {
   std::vector<duckdb::JoinCondition> input;
   input.push_back(make_cond(make_const(1), make_const(2), duckdb::ExpressionType::COMPARE_IN));

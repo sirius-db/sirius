@@ -19,7 +19,6 @@
 // sirius
 #include <config.hpp>
 #include <expression/ast/node.hpp>  // sirius::ast::node + 11 alternative types
-#include <expression/expression.hpp>
 #include <expression_executor/expression_executor_strategy.hpp>
 
 // cucascades
@@ -42,15 +41,6 @@
 
 namespace duckdb {
 class Expression;
-class BoundBetweenExpression;
-class BoundCaseExpression;
-class BoundCastExpression;
-class BoundComparisonExpression;
-class BoundConjunctionExpression;
-class BoundConstantExpression;
-class BoundFunctionExpression;
-class BoundOperatorExpression;
-class BoundReferenceExpression;
 }  // namespace duckdb
 
 namespace sirius {
@@ -281,7 +271,7 @@ class gpu_expression_executor {
    * adding nodes to the AST tree.
    */
   gpu_expression_executor(
-    duckdb::vector<sirius::expression> const& expressions,
+    duckdb::vector<std::unique_ptr<sirius::ast::node>> const& expressions,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
     rmm::cuda_stream_view stream                = cudf::get_default_stream(),
     expression_executor_strategy strategy       = strategy_from_config(),
@@ -302,31 +292,17 @@ class gpu_expression_executor {
    * adding nodes to the AST tree.
    */
   gpu_expression_executor(
-    sirius::expression const& expression,
+    sirius::ast::node const& expression,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
     rmm::cuda_stream_view stream                = cudf::get_default_stream(),
     expression_executor_strategy strategy       = strategy_from_config(),
     std::size_t min_ast_size                    = 2);
 
   /**
-   * @brief Non-owning ctor for internal call sites that already hold a raw duckdb::Expression
-   * pointer (e.g., NLJ lambda over cuDF expressions, parquet scan filter pushdown). The caller
-   * retains ownership; the executor only reads from the expression.
-   */
-  gpu_expression_executor(
-    duckdb::Expression const* expression,
-    rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
-    rmm::cuda_stream_view stream                = cudf::get_default_stream(),
-    expression_executor_strategy strategy       = strategy_from_config(),
-    std::size_t min_ast_size                    = 2);
-
-  /**
-   * @brief Non-owning ctor for call sites that hold a raw sirius::ast::node pointer.
+   * @brief Non-owning ctor for call sites that hold a raw sirius::ast::node pointer
+   * (e.g., NLJ lambda over cuDF expressions, parquet scan filter pushdown).
    *
    * The caller retains ownership; the executor only reads from the node tree.
-   * Parallel to the duckdb::Expression const* ctor above. The class invariant
-   * after construction is that exactly one of _expressions / _ast_expressions
-   * is non-empty.
    */
   gpu_expression_executor(
     sirius::ast::node const* expression,
@@ -371,10 +347,7 @@ class gpu_expression_executor {
   execute_result execute(sirius::ast::node const& expr, execution_mode mode = execution_mode::AST);
 
  private:
-  std::vector<duckdb::Expression const*> _expressions;  ///< The expressions to execute
-  std::vector<sirius::ast::node const*>
-    _ast_expressions;  ///< AST expressions (additive dual-path surface). Mutually exclusive with
-                       ///< _expressions per the class invariant.
+  std::vector<sirius::ast::node const*> _ast_expressions;  ///< The AST expressions to execute
   expression_executor_strategy _strategy;  ///< The strategy to use for expression evaluation
   rmm::device_async_resource_ref _mr;  ///< The allocator to pass to cudf APIs for any allocations
   rmm::cuda_stream_view _stream;       ///< The stream in which to execute any cuDF operations
@@ -414,22 +387,6 @@ class gpu_expression_executor {
   void release_temporaries(std::vector<std::vector<std::size_t>> const& scalar_indices,
                            std::vector<std::vector<std::size_t>> const& column_indices);
 
-  // Generic execute method
-  execute_result execute(duckdb::Expression const& expr, execution_mode mode = execution_mode::AST);
-
-  // Leaf expression nodes
-  execute_result execute(duckdb::BoundReferenceExpression const& expr, execution_mode mode);
-  execute_result execute(duckdb::BoundConstantExpression const& expr, execution_mode mode);
-
-  // Interior expression nodes
-  execute_result execute(duckdb::BoundBetweenExpression const& expr, execution_mode mode);
-  execute_result execute(duckdb::BoundCaseExpression const& expr, execution_mode mode);
-  execute_result execute(duckdb::BoundCastExpression const& expr, execution_mode mode);
-  execute_result execute(duckdb::BoundComparisonExpression const& expr, execution_mode mode);
-  execute_result execute(duckdb::BoundConjunctionExpression const& expr, execution_mode mode);
-  execute_result execute(duckdb::BoundFunctionExpression const& expr, execution_mode mode);
-  execute_result execute(duckdb::BoundOperatorExpression const& expr, execution_mode mode);
-
   // Leaf Sirius-AST nodes — dispatch targets for the std::visit-based
   // execute(sirius::ast::node, mode) above.
   execute_result execute(sirius::ast::reference const& expr, execution_mode mode);
@@ -447,12 +404,7 @@ class gpu_expression_executor {
   execute_result execute(sirius::ast::unary_op const& expr, execution_mode mode);
   execute_result execute(sirius::ast::coalesce const& expr, execution_mode mode);
   execute_result execute(sirius::ast::in_list const& expr, execution_mode mode);
-
-  // Counts the number of AST nodes that would be generated for the given expression if we
-  // added it to the AST tree. This is used to determine whether we should execute in AST mode or
-  // MATERIALIZE mode for the expression (by comparing the count to `min_ast_size`).
-  [[nodiscard]] std::size_t count_ast_ops(duckdb::Expression const& expr) const;
-  [[nodiscard]] std::size_t count_ast_ops(sirius::ast::node const& expr) const;
+  execute_result execute(sirius::ast::aggregate const& expr, execution_mode mode);
 };
 
 }  // namespace sirius

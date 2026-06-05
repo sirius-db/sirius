@@ -16,6 +16,9 @@
 
 #pragma once
 
+// sirius
+#include "helper/logical_type.hpp"  // sirius::logical_type
+
 // standard library
 #include <memory>
 #include <vector>
@@ -31,11 +34,34 @@ struct node;
  * OPERATOR_COALESCE kind of duckdb::BoundOperatorExpression. Split out of
  * the broader `unary_op` node because coalesce is the only non-unary member
  * of that family.
+ *
+ * `return_type` is set by the translator at construction time so the executor
+ * does not need to re-derive it. Move-only (children hold `unique_ptr<node>`);
+ * the return type accessor exposes the recorded type. Moved-from instances are
+ * left in the standard valid-but-unspecified state.
  */
-struct coalesce {
+class coalesce {
+ public:
+  coalesce(std::vector<std::unique_ptr<node>> children, sirius::logical_type return_type)
+    : children(std::move(children)), return_type_(std::move(return_type))
+  {
+  }
+
+  coalesce()                               = delete;
+  coalesce(coalesce const&)                = delete;
+  coalesce& operator=(coalesce const&)     = delete;
+  coalesce(coalesce&&) noexcept            = default;
+  coalesce& operator=(coalesce&&) noexcept = default;
+  ~coalesce()                              = default;
+
+  [[nodiscard]] sirius::logical_type const& return_type() const noexcept { return return_type_; }
+
   std::vector<std::unique_ptr<node>> children;
 
   std::size_t cudf_ast_op_count() const;
+
+ private:
+  sirius::logical_type return_type_;
 };
 
 }  // namespace sirius::ast

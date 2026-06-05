@@ -84,9 +84,22 @@ void validate_operator_output_types(const op::operator_data* data,
   }
 }
 
+// Authoritative source for the GPU id used by per-task log lines: the
+// executor's _per_thread_init runs cudaSetDevice(executor_gpu) on every
+// worker thread, and compute_task wraps the per-task work in
+// rmm::cuda_set_device_raii on the same id, so cudaGetDevice here reflects
+// the executor that is running this task.
+int current_gpu_id()
+{
+  int dev = -1;
+  (void)::cudaGetDevice(&dev);
+  return dev;
+}
+
 void log_operator_data(const op::sirius_physical_operator& op,
                        const op::operator_data& data,
                        const sirius_pipeline* pipeline,
+                       uint64_t task_id,
                        const char* label,
                        const std::string& extra_info = "")
 {
@@ -105,21 +118,26 @@ void log_operator_data(const op::sirius_physical_operator& op,
       }
     }
   } else {
-    SIRIUS_LOG_TRACE("Pipeline {}: operator {} (id={}) {} non-pipelineable data. {}",
-                     pipeline->get_pipeline_id(),
-                     op.get_name(),
-                     op.get_operator_id(),
-                     label,
-                     extra_info);
+    SIRIUS_LOG_TRACE(
+      "[GPU:{}] Pipeline {}: operator {} (id={}) task={} {} non-pipelineable data. {}",
+      current_gpu_id(),
+      pipeline->get_pipeline_id(),
+      op.get_name(),
+      op.get_operator_id(),
+      task_id,
+      label,
+      extra_info);
     return;
   }
 
   SIRIUS_LOG_TRACE(
-    "Pipeline {}: operator {} (id={}) {} {} batches, num rows: {}, "
+    "[GPU:{}] Pipeline {}: operator {} (id={}) task={} {} {} batches, num rows: {}, "
     "size: {} bytes ({:.2f} MB). {}",
+    current_gpu_id(),
     pipeline->get_pipeline_id(),
     op.get_name(),
     op.get_operator_id(),
+    task_id,
     label,
     num_batches,
     batch_rows,
@@ -133,10 +151,11 @@ std::unique_ptr<op::operator_data> run_one_operator(
   const op::operator_data& operator_input_data,
   rmm::cuda_stream_view stream,
   const sirius_pipeline* pipeline,
+  uint64_t task_id,
   size_t num_operators,
   cucascade::memory::reservation_aware_resource_adaptor* allocator)
 {
-  log_operator_data(op, operator_input_data, pipeline, "executing on");
+  log_operator_data(op, operator_input_data, pipeline, task_id, "executing on");
 
   auto nvtx_label = std::format(
     "Pipeline {}: {} (id={})", pipeline->get_pipeline_id(), op.get_name(), op.get_operator_id());
@@ -154,7 +173,7 @@ std::unique_ptr<op::operator_data> run_one_operator(
     duration.count() / 1000.0,
     peak_bytes,
     static_cast<double>(peak_bytes) / (1024.0 * 1024.0));
-  log_operator_data(op, *operator_output_data, pipeline, "produced", extra_info);
+  log_operator_data(op, *operator_output_data, pipeline, task_id, "produced", extra_info);
 
   validate_operator_output_types(operator_output_data.get(), op);
   return operator_output_data;
@@ -251,7 +270,7 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
         .executor_thread_resource_id = executor_thread_resource_id,
       });
       operator_input_output_data = run_one_operator(
-        op, *operator_input_output_data, stream, pipeline, operators.size(), _allocator);
+        op, *operator_input_output_data, stream, pipeline, _task_id, operators.size(), _allocator);
     } catch (const rmm::out_of_memory& oom) {
       auto peak_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
       // Subtract the peak allocated bytes to the input data to get the peak allocated bytes for the
@@ -389,6 +408,9 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   });
   try {
     local_state._input_data->prepare_for_processing(requested_memory_space, stream);
+    // synchronizing here to ensure the timing collected by Quent and logging for preparing the task
+    // is accurate.
+    stream.synchronize();
   } catch (const rmm::out_of_memory& oom) {
     auto peak_bytes  = allocator->get_peak_allocated_bytes(stream);
     auto input_basis = local_state.get_reservation_size_info()->input_basis;
@@ -448,9 +470,11 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
     global.get_memory_history().record({input_basis, peak_bytes, output_bytes});
     SIRIUS_LOG_TRACE(
-      "Pipeline {}: memory history record - input_basis={}, output_bytes={}, reservation_bytes={}, "
-      "peak_bytes={}, peak_bytes_to_materialize_input={}",
+      "[GPU:{}] Pipeline {}: memory history record - task={}, input_basis={}, output_bytes={}, "
+      "reservation_bytes={}, peak_bytes={}, peak_bytes_to_materialize_input={}",
+      current_gpu_id(),
       pipeline->get_pipeline_id(),
+      _task_id,
       input_basis,
       output_bytes,
       reservation_bytes,

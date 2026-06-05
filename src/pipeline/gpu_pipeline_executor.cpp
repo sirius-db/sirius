@@ -138,9 +138,9 @@ void gpu_pipeline_executor::manager_loop()
       .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
     });
     SIRIUS_LOG_TRACE(
-      "GPU Pipeline Executor: Acquiring memory reservation for pipeline {} of {} bytes for task "
-      "{}. Memory "
-      "available: {}, total reserved: {}, max: {}",
+      "[GPU:{}] GPU Pipeline Executor: Acquiring memory reservation for pipeline {} of {} bytes "
+      "for task {}. Memory available: {}, total reserved: {}, max: {}",
+      _memory_space->get_device_id(),
       gpu_task->get_pipeline_id(),
       bytes_needs,
       gpu_task->get_task_id(),

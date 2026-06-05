@@ -24,6 +24,7 @@
 #include "duckdb/planner/planner.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/prefetching_cache.hpp"
+#include "io/s3/s3_blocking_ioctx.hpp"
 #include "io/s3/s3_ioctx.hpp"
 #include "io/s3/sirius_sigv4_authorizer.hpp"
 #include "io/s3/static_credentials.hpp"
@@ -52,6 +53,7 @@
 #include <sys/resource.h>  // POSIX: getrlimit(RLIMIT_MEMLOCK)
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <cstdlib>  // for std::getenv
 #include <filesystem>
@@ -202,7 +204,26 @@ void SiriusContext::QueryBegin(ClientContext& context)
     sirius::op::sirius_physical_operator::next_operator_id.store(0);
 
     auto query = context.GetCurrentQuery();
-    SIRIUS_LOG_INFO("QueryBegin: {}", query.substr(0, std::min(query.size(), size_t(120))));
+    // Collapse every run of whitespace (incl. newlines/tabs) to a single space,
+    // trim leading/trailing whitespace, and log the full normalized query so
+    // log_analysis tools can correlate by SQL text without truncation.
+    std::string normalized_query;
+    normalized_query.reserve(query.size());
+    bool in_ws = true;  // skip leading whitespace
+    for (char c : query) {
+      bool is_ws = std::isspace(static_cast<unsigned char>(c)) != 0;
+      if (is_ws) {
+        if (!in_ws) { normalized_query.push_back(' '); }
+        in_ws = true;
+      } else {
+        normalized_query.push_back(c);
+        in_ws = false;
+      }
+    }
+    if (!normalized_query.empty() && normalized_query.back() == ' ') {
+      normalized_query.pop_back();
+    }
+    SIRIUS_LOG_INFO("QueryBegin: {}", normalized_query);
     bool query_cache_hit = false;
     if (config_.is_scan_caching_enabled()) {
       query_cache_hit = task_scheduler_->get_scan_executor().cache_scan_results_for_query(query);
@@ -641,7 +662,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // reflects the actual S3 wiring -- get_scan_manager_config() must not report
   // s3_config == nullopt while a live S3 backend exists. The s3_ioctx_config
   // stored here carries credentials only; async_thread_pool stays null --
-  // SiriusContext (S6) injects its live s3_thread_pool_ into the s3_ioctx's own
+  // SiriusContext (S6) injects its live s3_thread_pool_ into the s3_blocking_ioctx's own
   // config copy when it builds the backend below.
   config_.set_scan_manager_config(std::move(sm_config));
   // S6 (NUMA) increment 1: SiriusContext owns the scan-side IO backends. Build
@@ -651,17 +672,35 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // gpu_ioctxs_ alias) and the s3_ioctx — so a repeated local read actually
   // hits the cache (it previously hung off a scan-manager-only uring). The
   // stored s3_config keeps async_thread_pool == nullptr; we inject our live
-  // s3_thread_pool_ into the s3_ioctx's own config copy here.
+  // s3_thread_pool_ into the s3_blocking_ioctx's own config copy here.
   auto const& scan_cfg = config_.get_scan_manager_config();
   if (scan_cfg.s3_config) {
-    s3_thread_pool_ =
-      std::make_unique<sirius::exec::static_thread_pool>(scan_cfg.s3_thread_pool.num_threads,
-                                                         scan_cfg.s3_thread_pool.thread_name_prefix,
-                                                         scan_cfg.s3_thread_pool.cpu_affinity_list);
     auto s3_cfg                 = *scan_cfg.s3_config;
-    s3_cfg.async_thread_pool    = s3_thread_pool_.get();
     s3_cfg.host_memory_resource = host_fsmr;
-    s3_ioctx_                   = std::make_shared<sirius::io::s3::s3_ioctx>(std::move(s3_cfg));
+    if (config_.object_store_config.s3_use_async_backend) {
+      // Async backend (default): concurrent GETs + pipelined device reads.
+      // Its reactor owns the worker thread, so no s3_thread_pool is created. The
+      // retry knobs are passed through so the async backend is config-equivalent
+      // to the blocking one.
+      s3_ioctx_ = std::make_shared<sirius::io::s3::s3_ioctx>(std::move(s3_cfg.creds),
+                                                             s3_cfg.request_timeout_s,
+                                                             s3_cfg.ca_bundle_path,
+                                                             s3_cfg.tls_verify,
+                                                             s3_cfg.max_connections,
+                                                             host_fsmr,
+                                                             s3_cfg.max_retry_attempts,
+                                                             s3_cfg.retry_backoff_base,
+                                                             s3_cfg.retry_jitter,
+                                                             s3_cfg.honor_retry_after);
+    } else {
+      // Blocking backend (default): fan async work out over a dedicated pool.
+      s3_thread_pool_ = std::make_unique<sirius::exec::static_thread_pool>(
+        scan_cfg.s3_thread_pool.num_threads,
+        scan_cfg.s3_thread_pool.thread_name_prefix,
+        scan_cfg.s3_thread_pool.cpu_affinity_list);
+      s3_cfg.async_thread_pool = s3_thread_pool_.get();
+      s3_ioctx_ = std::make_shared<sirius::io::s3::s3_blocking_ioctx>(std::move(s3_cfg));
+    }
   }
   if (scan_cfg.enable_prefetch_cache && host_fsmr != nullptr) {
     auto const slab_bytes = host_fsmr->get_block_size() *
@@ -671,11 +710,15 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     prefetch_buffer_pool_ = std::make_unique<sirius::io::buffer_pool>(*host_fsmr, max_slabs);
     // Initialize the cache on the REAL read-path backends: the per-NUMA urings
     // (gpu_ioctxs_ alias these, so covering numa_ioctxs_ covers every per-GPU
-    // local read path) and the s3_ioctx.
-    for (auto& kv : numa_ioctxs_) {
-      if (kv.second) {
-        kv.second->initialize_cache(*prefetch_buffer_pool_,
-                                    scan_cfg.prefetch_inflight_budget_chunks);
+    // local read path) and the s3_ioctx. Skip the per-NUMA urings when the
+    // sirius local read path is disabled — local reads will go through
+    // cudf::io::datasource::create and never touch this cache.
+    if (scan_cfg.use_sirius_datasource) {
+      for (auto& kv : numa_ioctxs_) {
+        if (kv.second) {
+          kv.second->initialize_cache(*prefetch_buffer_pool_,
+                                      scan_cfg.prefetch_inflight_budget_chunks);
+        }
       }
     }
     if (s3_ioctx_) {
@@ -686,8 +729,11 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // (lowest-GPU uring, matching datasource_registry's kFileScheme target) plus
   // the s3_ioctx when configured. The scan_manager dispatches over these but
   // does not own them — SiriusContext releases them in terminate().
+  // When use_sirius_datasource=false, omit the local uring so the scan_manager
+  // reports no backend for local paths and parquet_split_provider falls through
+  // to cudf::io::datasource::create. S3 still routes through its own backend.
   std::vector<std::shared_ptr<sirius::io::sirius_ioctx>> borrowed_io_ctxs;
-  if (!gpu_ioctxs_.empty()) {
+  if (scan_cfg.use_sirius_datasource && !gpu_ioctxs_.empty()) {
     auto const lowest =
       std::min_element(gpu_ioctxs_.begin(), gpu_ioctxs_.end(), [](auto const& a, auto const& b) {
         return a.first < b.first;

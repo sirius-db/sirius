@@ -148,7 +148,9 @@ set(EXTENSION_SOURCES
     src/data/host_parquet_representation.cpp
     src/data/host_parquet_representation_converters.cpp
     src/downgrade/downgrade_executor.cpp
-    src/expression/expression.cpp
+    src/expression/aggregate_id.cpp
+    src/expression/ast/clone.cpp
+    src/expression/ast/node.cpp
     src/expression/from_duckdb.cpp
     src/expression/function_id.cpp
     src/expression/join_condition.cpp
@@ -175,6 +177,8 @@ set(EXTENSION_SOURCES
     src/io/io_context.cpp
     src/io/parquet_helpers.cpp
     src/io/prefetching_cache.cpp
+    src/io/s3/s3_blocking_ioctx.cpp
+    src/io/s3/s3_reactor.cpp
     src/io/s3/s3_ioctx.cpp
     src/io/s3/sigv4.cpp
     src/io/s3/sirius_sigv4_authorizer.cpp
@@ -440,16 +444,18 @@ set(TEST_SOURCES
     test/cpp/exec/test_bounded_thread_pool.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
+    test/cpp/expression/test_ast_aggregate.cpp
+    test/cpp/expression/test_ast_clone.cpp
     test/cpp/expression/test_ast_from_duckdb.cpp
     test/cpp/expression/test_ast_scaffold.cpp
     test/cpp/expression/test_ast_to_duckdb.cpp
-    test/cpp/expression/test_expression.cpp
+    test/cpp/expression/test_comparison_type_mapping.cpp
     test/cpp/expression/test_function_id.cpp
-    test/cpp/expression/test_join_condition.cpp
     test/cpp/expression/test_value.cpp
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
     test/cpp/expression_executor/test_gpu_expression_executor_ast_equivalence.cpp
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
+    test/cpp/expression_executor/test_nonduckdb_frontend_proof.cpp
     test/cpp/helper/test_logical_type.cpp
     test/cpp/helper/test_transaction_utils.cpp
     test/cpp/integration/test_gpu_execution_locality.cpp
@@ -461,6 +467,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_transparent_execution.cpp
     test/cpp/io/s3/test_sigv4.cpp
     test/cpp/io/s3/test_s3_default_visibility_guard.cpp
+    test/cpp/io/s3/test_s3_blocking_ioctx.cpp
     test/cpp/io/s3/test_s3_ioctx.cpp
     test/cpp/io/s3/test_sirius_sigv4_authorizer.cpp
     test/cpp/io/s3/test_static_credentials.cpp

@@ -250,9 +250,14 @@ TEST_CASE("datasource_factory strict create rejects malformed input", "[datasour
 // Phase 22.1 D-07/D-09/D-10 made datasource_factory::create() strict — every scheme
 // (including kFileScheme) MUST be resolved via the registry. The pre-22.1 cudf-default
 // fallback for file:// paths was removed because it routed through libkvikio which
-// binds a single CUDA context per FileHandle and breaks multi-GPU residency. Production
-// code registers kFileScheme via SiriusContext::initialize (sirius_context.cpp:334);
-// these tests intentionally do NOT register one and assert that strict policy fires.
+// binds a single CUDA context per FileHandle and breaks multi-GPU residency.
+// Single-GPU users that opt out via use_sirius_datasource=false bypass this factory
+// entirely and call cudf::io::datasource::create directly instead of routing kvikio
+// through here; multi-GPU mode is always required to use sirius_datasource (see
+// sirius_config::enforce_sirius_datasource_for_multi_gpu()). Production code
+// registers kFileScheme via SiriusContext::initialize whenever use_sirius_datasource
+// is true; these tests intentionally do NOT register one and assert that strict
+// policy fires.
 TEST_CASE("datasource_factory create rejects file paths without registered file ioctx",
           "[datasource_factory]")
 {

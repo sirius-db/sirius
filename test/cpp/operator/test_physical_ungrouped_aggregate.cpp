@@ -21,11 +21,14 @@
 #include <catch.hpp>
 #include <duckdb/planner/expression/bound_aggregate_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <expression/ast/from_duckdb.hpp>
+#include <expression/ast/node.hpp>
 #include <op/sirius_physical_ungrouped_aggregate.hpp>
 #include <op/sirius_physical_ungrouped_aggregate_merge.hpp>
 
 #include <cstdint>
 #include <iterator>
+#include <memory>
 
 using namespace duckdb;
 using namespace sirius::op;
@@ -42,6 +45,19 @@ inline uint64_t int128_low64(__int128_t value)
 inline int64_t int128_high64(__int128_t value)
 {
   return static_cast<int64_t>(static_cast<unsigned __int128>(value) >> 64);
+}
+
+// Translate a vector of DuckDB expressions into Sirius AST nodes (size/order
+// preserved, null slot for an unsupported shape).
+inline duckdb::vector<std::unique_ptr<sirius::ast::node>> translate_expressions(
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs)
+{
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> out;
+  out.reserve(exprs.size());
+  for (auto& e : exprs) {
+    out.push_back(e ? sirius::ast::from_duckdb(*e) : nullptr);
+  }
+  return out;
 }
 }  // namespace
 
@@ -173,12 +189,12 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
 
   sirius_physical_ungrouped_aggregate local_op(
     sirius::from_duckdb_vec(local_types),
-    sirius::wrap_many(std::move(local_aggregates)),
+    translate_expressions(std::move(local_aggregates)),
     0,
     duckdb::TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
   sirius_physical_ungrouped_aggregate_merge merge_op(
     sirius::from_duckdb_vec(merge_types),
-    sirius::wrap_many(std::move(merge_aggregates)),
+    translate_expressions(std::move(merge_aggregates)),
     0,
     duckdb::TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 
@@ -299,12 +315,12 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate resolves AVG in merge",
 
   sirius_physical_ungrouped_aggregate local_op(
     sirius::from_duckdb_vec(local_types),
-    sirius::wrap_many(std::move(local_aggregates)),
+    translate_expressions(std::move(local_aggregates)),
     0,
     duckdb::TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
   sirius_physical_ungrouped_aggregate_merge merge_op(
     sirius::from_duckdb_vec(merge_types),
-    sirius::wrap_many(std::move(merge_aggregates)),
+    translate_expressions(std::move(merge_aggregates)),
     0,
     duckdb::TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 

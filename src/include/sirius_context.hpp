@@ -362,8 +362,10 @@ class SiriusContext : public ClientContextState {
   // enable_prefetch_cache is set. prefetching_cache holds it as a buffer_pool&,
   // so it must outlive all caches — declared first, destroyed last.
   std::unique_ptr<sirius::io::buffer_pool> prefetch_buffer_pool_;
-  // Dedicated S3 async worker pool, injected into the s3_ioctx. Built only when
-  // an S3 backend is configured. Must outlive s3_ioctx_ (declared before it).
+  // Dedicated S3 async worker pool, injected into the blocking s3_ioctx. Built
+  // only for the blocking backend (the async backend's reactor owns its own
+  // worker thread, so this stays null when s3_use_async_backend is set). Must
+  // outlive s3_ioctx_ (declared before it).
   std::unique_ptr<sirius::exec::static_thread_pool> s3_thread_pool_;
   // The S3 backend (S6 increment 1: single shared instance), owned here and
   // borrowed by the scan_manager. nullptr when no object_store_config is wired.

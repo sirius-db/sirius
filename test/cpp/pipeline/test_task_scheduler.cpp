@@ -24,6 +24,8 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
+#include <cuda_runtime_api.h>
+
 #include <atomic>
 #include <chrono>
 #include <memory>
@@ -176,6 +178,16 @@ TEST_CASE("Task queue handles empty queue gracefully", "[pipeline_queue]")
 
 TEST_CASE("Task scheduler dispatches tasks with device preference", "[task_scheduler]")
 {
+  // Multi-GPU device-preference dispatch needs a real 2-GPU host; skip on
+  // single-GPU machines (mirrors the require_two_gpus() convention used by the
+  // MGPU operator tests in mgpu_test_utils.hpp).
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  if (device_count < 2) {
+    WARN("Task scheduler device-preference test requires >=2 GPUs; single-GPU host — skipping");
+    return;
+  }
+
   auto manager = initialize_memory_manager(2);
   sirius::exec::thread_pool_config gpu_config{2};
   sirius::exec::thread_pool_config scan_config{2};

@@ -21,7 +21,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "expression/expression_internal.hpp"
+#include "expression/ast/to_duckdb.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "expression_executor/gpu_expression_translator_internal.hpp"
 #include "helper/type_conversions.hpp"
@@ -189,7 +189,7 @@ bool sirius_physical_nested_loop_join::is_supported(
 {
   if (join_type == duckdb::JoinType::MARK) { return true; }
   for (auto& cond : conditions) {
-    auto const* left_expr = sirius::unwrap(cond.left);
+    auto left_expr = sirius::ast::to_duckdb(*cond.left);
     if (left_expr->return_type.InternalType() == duckdb::PhysicalType::STRUCT ||
         left_expr->return_type.InternalType() == duckdb::PhysicalType::LIST ||
         left_expr->return_type.InternalType() == duckdb::PhysicalType::ARRAY) {
@@ -206,7 +206,8 @@ duckdb::vector<sirius::logical_type> sirius_physical_nested_loop_join::get_join_
 {
   duckdb::vector<sirius::logical_type> result;
   for (auto& op : conditions) {
-    result.push_back(sirius::from_duckdb(sirius::unwrap(op.right)->return_type));
+    auto right_expr = sirius::ast::to_duckdb(*op.right);
+    result.push_back(sirius::from_duckdb(right_expr->return_type));
   }
   return result;
 }
@@ -483,6 +484,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
     // Resolves one side of a join condition to a column index in col_views, evaluating or casting
     // as needed. Returns the index to use as the cudf::ast::column_reference offset.
     auto resolve_join_col = [&](const duckdb::Expression& expr,
+                                const sirius::ast::node& ast_expr,
                                 std::map<uint64_t, cudf::size_type>& expr_to_idx,
                                 const ::cucascade::read_only_data_batch& batch,
                                 const cudf::table_view& table,
@@ -495,7 +497,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
       expr_to_idx[cond_hash]           = join_input_index;
       cudf::size_type source_idx       = 0;
       if (!get_column_index(expr, source_idx)) {
-        sirius::gpu_expression_executor executor(&expr, mr, stream);
+        sirius::gpu_expression_executor executor(&ast_expr, mr, stream);
         auto expr_result_table = executor.execute(table);
         auto expr_view         = expr_result_table->view();
         if (expr_view.num_columns() != 1) {
@@ -533,13 +535,14 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
     };
 
     for (const auto& cond : conditions) {
-      cudf::size_type left_join_input_index  = resolve_join_col(*sirius::unwrap(cond.left),
-                                                               left_expressions_to_idx,
-                                                               left_batch,
-                                                               left,
-                                                               left_col_views,
-                                                               "left");
-      cudf::size_type right_join_input_index = resolve_join_col(*sirius::unwrap(cond.right),
+      auto const* left_node                 = cond.left.get();
+      auto const* right_node                = cond.right.get();
+      auto left_owned                       = sirius::ast::to_duckdb(*left_node);
+      auto right_owned                      = sirius::ast::to_duckdb(*right_node);
+      cudf::size_type left_join_input_index = resolve_join_col(
+        *left_owned, *left_node, left_expressions_to_idx, left_batch, left, left_col_views, "left");
+      cudf::size_type right_join_input_index = resolve_join_col(*right_owned,
+                                                                *right_node,
                                                                 right_expressions_to_idx,
                                                                 right_batch,
                                                                 right,

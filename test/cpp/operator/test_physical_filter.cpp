@@ -24,6 +24,7 @@
 #include <duckdb/planner/expression/bound_comparison_expression.hpp>
 #include <duckdb/planner/expression/bound_constant_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <expression/ast/from_duckdb.hpp>
 #include <op/sirius_physical_filter.hpp>
 
 using namespace duckdb;
@@ -79,11 +80,12 @@ TEMPLATE_TEST_CASE("sirius_physical_filter executes on data_batch for multiple n
       *space, filter_vals, data_vals, Traits::cudf_type, std::nullopt);
   }
 
-  auto filter_expr = sirius::wrap(duckdb::make_uniq<BoundComparisonExpression>(
+  auto filter_duckdb = duckdb::make_uniq<BoundComparisonExpression>(
     ExpressionType::COMPARE_GREATERTHAN,
     duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT),
                                                 0),
-    duckdb::make_uniq<BoundConstantExpression>(duckdb::Value::BIGINT(3))));
+    duckdb::make_uniq<BoundConstantExpression>(duckdb::Value::BIGINT(3)));
+  auto filter_expr = sirius::ast::from_duckdb(*filter_duckdb);
 
   duckdb::vector<duckdb::LogicalType> types;
   types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));  // filter column

@@ -1,0 +1,35 @@
+# ThreadSanitizer suppressions for Sirius
+# ---------------------------------------
+# The primary noise filter is the TSAN_OPTIONS flag `ignore_noninstrumented_modules=1`,
+# which drops races whose accesses live entirely in uninstrumented libs (cuDF, CUDA,
+# RMM, ...). The `called_from_lib` entries below are a backup for residual noise.
+#
+# IMPORTANT: each `called_from_lib` value is matched as a SUBSTRING against every
+# loaded library name, and TSan errors if one entry matches more than one library.
+# So the names must be specific enough to be unambiguous, e.g. `libcuda.so` matches
+# only libcuda.so.1 (NOT libcudart.so.13). Keep the `.so` suffix on each.
+#
+# Usage (run inside `pixi shell` so llvm-symbolizer is auto-detected on PATH):
+#   export TSAN_OPTIONS="suppressions=$PWD/tsan.supp:ignore_noninstrumented_modules=1:halt_on_error=0:history_size=7:detect_deadlocks=0"
+#
+# Grow this list as new library noise appears. Pattern forms:
+#   race:<substring of symbol or file>     -> data-race reports
+#   called_from_lib:<shared lib name>      -> anything called from that .so
+#   deadlock:<substring>                   -> lock-order reports
+#   signal:<substring>                     -> signal-unsafe reports
+
+# --- Uninstrumented GPU / runtime libraries (must be unambiguous .so names) ---
+called_from_lib:libcudf.so
+called_from_lib:librmm.so
+called_from_lib:libcudart.so
+called_from_lib:libcuda.so
+called_from_lib:libnvrtc.so
+called_from_lib:libkvikio.so
+called_from_lib:libcufile.so
+
+# --- Logging internals: spdlog/fmt do their own buffering; not our bug ---
+race:spdlog::
+race:fmt::
+
+# --- Our own crash handler installs signal handlers; ignore signal noise ---
+signal:sirius::util
