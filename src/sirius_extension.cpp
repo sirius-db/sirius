@@ -73,7 +73,10 @@ extern "C" int cudaProfilerStop();
 
 // PinTableFunction routes parquet reads through the per-GPU sirius_ioctx
 // instead of cudf's bundled file_source factory (which uses kvikio internally
-// and binds to a single CUDA context).
+// and binds to a single CUDA context). This is mandatory in multi-GPU
+// configurations (enforced by sirius_config::enforce_sirius_datasource_for_multi_gpu()).
+// Single-GPU users may still opt out via use_sirius_datasource=false; the
+// pin pipeline always routes through sirius_ioctx when one is available.
 //
 // Ordering rule: include uring_reactor LAST among sirius headers — liburing.h
 // transitively pulled by uring_reactor.hpp defines a BLOCK_SIZE preprocessor
@@ -970,7 +973,9 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     // instead of cudf's bundled file_source factory (kvikio). The string-form
     // source_info routes reads through libkvikio's FileHandle which binds a
     // single CUDA context per file, breaking multi-GPU residency (the columns
-    // end up on the wrong GPU under sanitizer races).
+    // end up on the wrong GPU under sanitizer races). Use of sirius_ioctx is
+    // mandatory whenever more than one GPU is configured — enforced upstream
+    // by sirius_config::enforce_sirius_datasource_for_multi_gpu().
     auto target_ioctx = sirius_ctx->get_ioctx_for(target_gpu_id);
     if (!target_ioctx) {
       throw InvalidInputException("pin_table: no sirius_ioctx for target GPU " +

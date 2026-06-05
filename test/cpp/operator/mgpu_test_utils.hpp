@@ -96,6 +96,8 @@ inline void write_mgpu_yaml(std::filesystem::path const& yaml_path,
        "      pool_size: 512\n"
        "      block_size: 1048576\n"
        "  executor:\n"
+       "    scan_manager:\n"
+       "      use_sirius_datasource: true\n"
        "    pipeline:\n"
        "      num_threads: "
     << params.pipeline_num_threads

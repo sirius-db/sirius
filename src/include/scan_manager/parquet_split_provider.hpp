@@ -23,6 +23,10 @@
 
 // Per-GPU sirius_ioctx for routing parquet reads through io_uring
 // (sirius_datasource) instead of cudf's bundled kvikio-backed file_source.
+// Required whenever more than one GPU is configured (enforced by
+// sirius_config::enforce_sirius_datasource_for_multi_gpu()); a single-GPU
+// configuration may opt out via use_sirius_datasource=false and fall back to
+// the bundled cudf file_source instead.
 // <io/types.hpp> declares sirius_ioctx; the uring_io_object concrete type is
 // referenced only in the .cpp via <io/uring/uring_reactor.hpp> (LAST among
 // sirius headers — liburing's BLOCK_SIZE macro collides with
@@ -98,16 +102,23 @@ class parquet_split_provider : public split_provider {
    *                                of cudf's bundled file_source factory —
    *                                the latter routes through kvikio and
    *                                bypasses the io_uring + per-GPU
-   *                                CUDA-context binding.
+   *                                CUDA-context binding (the per-GPU binding
+   *                                is what makes kvikio unsafe under multi-GPU;
+   *                                see
+   *                                sirius_config::enforce_sirius_datasource_for_multi_gpu()).
    */
   /// No-scan_manager overload (dev #732 + tests). @c _scan_manager stays
   /// nullptr; local reads route through @p gpu_ioctxs (per-GPU local backends,
   /// injected by tests via @c make_test_gpu_ioctxs). When both @p gpu_ioctxs is
-  /// empty AND there is no scan_manager, @c run_batch throws (the cudf/kvikio
-  /// local file_source is forbidden under the multi-GPU model) — so this
-  /// overload requires a non-empty @p gpu_ioctxs. The @c cudf::io::datasource
-  /// fallback now only triggers when a scan_manager is wired but reports no
-  /// backend for a local path (e.g. @c use_sirius_datasource=false).
+  /// empty AND there is no scan_manager, @c run_batch throws — so this overload
+  /// requires a non-empty @p gpu_ioctxs. (Production single-GPU runs with
+  /// @c use_sirius_datasource=false reach @c cudf::io::datasource::create
+  /// through the scan_manager branch below, not this overload.) The
+  /// @c cudf::io::datasource fallback triggers when a scan_manager is wired
+  /// but reports no backend for a local path (i.e. single-GPU
+  /// @c use_sirius_datasource=false; multi-GPU mode forces
+  /// @c use_sirius_datasource=true via
+  /// @c sirius_config::enforce_sirius_datasource_for_multi_gpu()).
   parquet_split_provider(
     duckdb::vector<sirius::logical_type> const& returned_types,
     std::vector<std::string> const& file_paths,

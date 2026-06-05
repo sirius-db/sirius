@@ -122,19 +122,24 @@ class datasource_factory {
   /**
    * @brief Create a @c cudf::io::datasource for @p uri.
    *
-   * Dispatch (kvikio-free invariant):
+   * Dispatch:
    *   - Every URI scheme MUST resolve through the registry to a registered
    *     @c sirius_ioctx whose @c make_datasource builds a @c sirius_datasource.
    *     The factory NEVER falls back to cudf's bundled @c file_source factory
-   *     (kvikio-backed) — that path is forbidden because kvikio's per-FileHandle
-   *     CUDA-context binding breaks multi-GPU residency.
+   *     (kvikio-backed) from inside @c create — single-GPU users that opt out
+   *     of @c sirius_datasource bypass this factory entirely instead of routing
+   *     a kvikio fallback through it. In multi-GPU mode kvikio is forbidden
+   *     because its per-FileHandle CUDA-context binding breaks multi-GPU
+   *     residency; @c sirius_config::enforce_sirius_datasource_for_multi_gpu()
+   *     ensures @c use_sirius_datasource is true whenever >1 GPU is configured.
    *   - Local file paths (@c "/data/foo.parquet", @c "file:///data/foo.parquet")
    *     route through @c kFileScheme, which is registered in
-   *     @c SiriusContext::initialize() with a uring-backed @c sirius_ioctx.
+   *     @c SiriusContext::initialize() with a uring-backed @c sirius_ioctx
+   *     (registration is skipped when @c use_sirius_datasource is false in a
+   *     single-GPU configuration).
    *   - Object-store schemes (@c s3://, etc.) require their backend to register
    *     a @c sirius_ioctx for that scheme at startup. If no ioctx is registered,
-   *     the factory throws "kvikio path is forbidden" rather than silently
-   *     falling back.
+   *     the factory throws rather than silently falling back to kvikio.
    *
    * @param uri      The resource URI (e.g. @c "/data/file.parquet",
    *                 @c "file:///data/file.parquet", @c "s3://bucket/key").
@@ -164,7 +169,9 @@ class datasource_factory {
    *     paths like @c "test/cpp/integration/data/...parquet".
    *   - Anything else (absolute path, @c file:///..., @c s3://..., object-store
    *     schemes): delegate to the strict @c create above. Every path resolves
-   *     through the registry to a @c sirius_ioctx — no kvikio fallback.
+   *     through the registry to a @c sirius_ioctx — this factory does not emit
+   *     a kvikio fallback (single-GPU @c use_sirius_datasource=false routing
+   *     uses cudf's datasource directly outside this factory).
    *
    * The strict @c create keeps its parser-strict contract — prefer it for
    * callers that should reject unscheme'd input as a real bug.

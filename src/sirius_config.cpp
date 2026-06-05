@@ -17,6 +17,7 @@
 #include "sirius_config.hpp"
 
 #include "exec/config.hpp"
+#include "log/logging.hpp"
 #include "yaml_reader.hpp"
 
 #include <cucascade/memory/config.hpp>
@@ -436,9 +437,26 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
       _memory_space_configs = builder.build(_hw_topology);
     }
 
+    enforce_sirius_datasource_for_multi_gpu();
+
   } catch (const std::exception& e) {
     throw std::runtime_error("Failed to load config from " + config_path.string() + ": " +
                              e.what());
+  }
+}
+
+void sirius_config::enforce_sirius_datasource_for_multi_gpu()
+{
+  size_t num_gpus = std::ranges::count_if(_memory_space_configs, [](auto const& space) {
+    return std::holds_alternative<cucascade::memory::gpu_memory_space_config>(space);
+  });
+  if (num_gpus > 1 && !_scan_manager_config.use_sirius_datasource) {
+    SIRIUS_LOG_WARN(
+      "sirius_config: use_sirius_datasource was false but {} GPUs are configured; "
+      "the sirius datasource is required for multi-GPU IO routing. Overriding "
+      "use_sirius_datasource to true.",
+      num_gpus);
+    _scan_manager_config.use_sirius_datasource = true;
   }
 }
 

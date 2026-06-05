@@ -172,16 +172,18 @@ The probe runs once at startup per (src, dst) pair: allocate small buffers on ea
 
 ## Multi-GPU-Safe Parquet I/O
 
-The I/O path is **kvikio-free** (GATE-22.1-A invariant). The reasoning: cudf's bundled `file_source` factory uses kvikio, which binds the file handle to whichever CUDA context was active at construction time. In multi-GPU execution that's a hidden source of corruption — a file_handle bound to GPU 0 will silently funnel reads through GPU 0 even when the consumer is on GPU 1.
+The multi-GPU I/O path is **kvikio-free**. The reasoning: cudf's bundled `file_source` factory uses kvikio, which binds the file handle to whichever CUDA context was active at construction time. In multi-GPU execution that's a hidden source of corruption — a file_handle bound to GPU 0 will silently funnel reads through GPU 0 even when the consumer is on GPU 1. `sirius_config::enforce_sirius_datasource_for_multi_gpu()` therefore forces `scan_manager_config::use_sirius_datasource = true` whenever more than one GPU memory space is configured, and emits a warning if the user-supplied value was `false`.
+
+Single-GPU configurations may still opt out via `use_sirius_datasource=false`; the per-FileHandle context binding is harmless with only one CUDA context in play, and the engine routes those reads through `cudf::io::datasource::create` (kvikio) at the same sites that would otherwise use `sirius_datasource`. The rest of this section describes the multi-GPU (`use_sirius_datasource=true`) path.
 
 The Sirius path:
 
-1. **All file reads go through `sirius_ioctx::make_datasource(io_object)`.** Never `cudf::io::datasource::create(path)` and never `cudf::io::source_info{path}`. A grep gate enforces this in `src/`.
+1. **All file reads go through `sirius_ioctx::make_datasource(io_object)`.** Never `cudf::io::datasource::create(path)` and never `cudf::io::source_info{path}`. Single-GPU `use_sirius_datasource=false` is the only configuration that takes the cudf-bundled path.
 2. **`sirius_ioctx` is per-GPU.** Construction binds `cudaSetDevice(gpu_id)` via RAII; the underlying `uring_reactor` runs in a worker thread that holds that device's context.
 3. **Schemes are resolved through `datasource_registry_`.** A scan task that wants to read `file:///path/to/x.parquet` passes the URL to the registry, which returns a factory bound to the per-GPU `sirius_ioctx`. No silent fallback.
 4. **Pin-table chunk reads route through the owning GPU's ioctx.** Chunk `i` reads through `gpu_ioctxs_.at(chunk_memory_spaces[i]->get_device_id())`. The read lands directly in the target GPU's pinned memory region.
 
-The 7 historical sites that bypassed this contract (kvikio-fallback in `sirius_gpu_parquet_scan_operator`, `sirius_extension`, `iceberg_metadata_reader`, `datasource_factory`, `parquet_split_provider`) were all migrated to `sirius_ioctx::make_datasource` over Phase 22.1. The unit-test fallback in `parquet_split_provider:295` (D-08 site #7) was deleted outright.
+The 7 historical sites that bypassed this contract (kvikio-fallback in `sirius_gpu_parquet_scan_operator`, `sirius_extension`, `iceberg_metadata_reader`, `datasource_factory`, `parquet_split_provider`) were all migrated to `sirius_ioctx::make_datasource` over Phase 22.1; the remaining `cudf::io::datasource::create` callsites are reached only under the single-GPU `use_sirius_datasource=false` opt-out.
 
 ## Memory Pressure: Reservations and Downgrade
 
@@ -211,7 +213,7 @@ After a downgrade frees enough space, the rescheduled task retries. The reservat
 | `_per_thread_init` in `downgrade_executor` gated on `tier == GPU` | `src/downgrade/downgrade_executor.cpp` (Phase 22.2 K.6) | HOST-tier workers must not call `cudaSetDevice(-1)` |
 | `chunk_memory_spaces[i]` parallel to `data_batches_by_column[col][i]` | `src/include/scan_manager/sirius_scan_manager.hpp` | Pin-table merge must preserve owning-space per chunk (Phase 22 Pitfall 3) |
 | HYG-02 invariant: 0 new `rmm::cuda_stream_default` in `src/` outside `legacy/` | grep gate | Default-stream usage breaks per-task-device contract under SCHED-RR |
-| GATE-22.1-A: 0 `cudf::io::datasource::create(path)` / `source_info{path}` in `src/` | grep gate | Any file-path datasource silently uses kvikio |
+| Multi-GPU runs use `sirius_datasource` everywhere | `sirius_config::enforce_sirius_datasource_for_multi_gpu()` forces `use_sirius_datasource=true` when >1 GPU is configured | Any file-path datasource via cudf silently uses kvikio, which binds to a single CUDA context |
 
 ## Hardware Caveats
 
@@ -228,7 +230,7 @@ After a downgrade frees enough space, the rescheduled task retries. The reservat
 | `src/memory/sirius_memory_reservation_manager.{hpp,cpp}` | Extends `cucascade::memory_reservation_manager`; sets cudf device resource refs per GPU; synchronizes on destruction |
 | `src/include/scan_manager/sirius_scan_manager.hpp` | `pinned_entry`, `chunk_memory_spaces` invariant |
 | `src/scan_manager/parquet_split_provider.cpp` + `cached_split_provider.cpp` | Per-chunk memory_space lookup, GPU-mode + host-mode split providers |
-| `src/io/datasource_factory.{hpp,cpp}` | Strict scheme registry, kvikio-free file resolution |
+| `src/io/datasource_factory.{hpp,cpp}` | Strict scheme registry; routes every resolved URI through a registered `sirius_ioctx`. Used when `use_sirius_datasource=true` (always in multi-GPU). |
 | `src/io/uring/uring_reactor.cpp` | Per-GPU `uring_reactor` with RAII `cudaSetDevice` |
 | `src/op/scan/sirius_gpu_parquet_scan_operator.cpp` | Multi-GPU-aware GPU parquet scan |
 | `src/op/scan/duckdb_scan_executor.cpp` | NUMA-preference reservation requests |

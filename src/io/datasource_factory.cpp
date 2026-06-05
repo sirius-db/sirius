@@ -109,8 +109,11 @@ std::unique_ptr<cudf::io::datasource> datasource_factory::create_for_parquet_sca
   std::string_view uri, datasource_registry const& registry, sirius_config const& config)
 {
   // Relative bare paths normalize to file:///<absolute> and dispatch through
-  // create(). Bypassing to cudf's default datasource would route through
-  // libkvikio internally — the forbidden kvikio path.
+  // create(). We do not emit a cudf-default fallback here: callers that want
+  // the bundled kvikio path use cudf::io::datasource::create directly outside
+  // this factory (single-GPU use_sirius_datasource=false). In multi-GPU mode
+  // kvikio is forbidden — sirius_config::enforce_sirius_datasource_for_multi_gpu()
+  // forces use_sirius_datasource=true whenever >1 GPU is configured.
   //
   // DuckDB's iceberg / hive fixtures hand out paths like
   // "test/cpp/integration/data/...parquet"; we resolve those against the
@@ -137,15 +140,20 @@ std::unique_ptr<cudf::io::datasource> datasource_factory::create(
 {
   auto p = parse(uri);
 
-  // ALL schemes (including kFileScheme) MUST be resolved via the registry.
-  // Bypassing kFileScheme to the cudf default datasource would route through
-  // libkvikio internally (binds a single CUDA context per FileHandle, breaks
-  // multi-GPU residency). SiriusContext::initialize() registers kFileScheme
-  // -> sirius_ioctx so this lookup succeeds.
+  // ALL schemes (including kFileScheme) MUST be resolved via the registry —
+  // this factory does not silently fall back to the cudf default datasource
+  // (which routes through libkvikio and binds a single CUDA context per
+  // FileHandle, breaking multi-GPU residency). SiriusContext::initialize()
+  // registers kFileScheme -> sirius_ioctx whenever use_sirius_datasource is
+  // true; in a single-GPU configuration with use_sirius_datasource=false the
+  // file scheme is intentionally not registered and callers route through
+  // cudf::io::datasource::create directly instead of invoking this factory.
+  // Multi-GPU mode always uses sirius_datasource (enforced by
+  // sirius_config::enforce_sirius_datasource_for_multi_gpu()).
   auto ioctx = registry.lookup(p.scheme);
   if (!ioctx) {
     throw std::runtime_error("datasource_factory: no ioctx registered for scheme '" + p.scheme +
-                             "' — kvikio path is forbidden (uri=" + std::string{uri} + ")");
+                             "' (uri=" + std::string{uri} + ")");
   }
 
   return ioctx->open_datasource(std::move(p.path));
