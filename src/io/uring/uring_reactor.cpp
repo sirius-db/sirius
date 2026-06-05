@@ -358,12 +358,17 @@ void uring_reactor::worker_loop()
       io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
       if (!sqe) break;
       auto& req = pending.front();
-      io_uring_prep_read_fixed(sqe,
-                               req.handle,
-                               _bounce[si].buf,
-                               (unsigned)req.io_size,
-                               (unsigned long long)req.file_off,
-                               si);
+      // TEMP(GPFS): GPFS rejects io_uring fixed-buffer reads (IORING_OP_READ_FIXED)
+      // on O_DIRECT fds with -ENOMEM. Plain io_uring_prep_read into the same pinned
+      // bounce buffer works. Revert to prep_read_fixed for local/NVMe filesystems.
+      //
+      // TODO(Amin, William): this is a TEMPORARY workaround to benchmark SF1000 off
+      // GPFS (/scratch). It unconditionally drops the registered-buffer fast path,
+      // which costs throughput on local/NVMe. Fix properly: detect the filesystem (or
+      // catch -ENOMEM on the fixed-read submission) and fall back to prep_read only
+      // when fixed reads are unsupported, keeping prep_read_fixed elsewhere.
+      io_uring_prep_read(
+        sqe, req.handle, _bounce[si].buf, (unsigned)req.io_size, (unsigned long long)req.file_off);
       io_uring_sqe_set_data64(sqe, (uint64_t)si);
       slots[si].state      = slot_state::READING;
       slots[si].bytes_read = 0;  // fresh request → reset retry accumulator
@@ -459,12 +464,14 @@ void uring_reactor::worker_loop()
         if (!fully_read && !eof) {
           io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
           if (sqe) {
-            io_uring_prep_read_fixed(sqe,
-                                     req.handle,
-                                     (uint8_t*)_bounce[si].buf + sinfo.bytes_read,
-                                     (unsigned)(req.io_size - sinfo.bytes_read),
-                                     (__u64)(req.file_off + sinfo.bytes_read),
-                                     si);
+            // TEMP(GPFS): plain prep_read for the short-read retry tail. See the
+            // TODO(Amin, William) at the main submission site above — same temporary
+            // workaround, same proper fix needed.
+            io_uring_prep_read(sqe,
+                               req.handle,
+                               (uint8_t*)_bounce[si].buf + sinfo.bytes_read,
+                               (unsigned)(req.io_size - sinfo.bytes_read),
+                               (__u64)(req.file_off + sinfo.bytes_read));
             io_uring_sqe_set_data64(sqe, (uint64_t)si);
             ++inflight;
             need_resubmit = true;
