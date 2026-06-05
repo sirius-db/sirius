@@ -76,6 +76,12 @@ sirius_gpu_parquet_scan_operator::~sirius_gpu_parquet_scan_operator() = default;
 // route each parquet open through ioctx->make_datasource(uring_io_object), which
 // avoids the cudf-bundled file_source factory that bypasses the ioctx framework
 // and routes through libkvikio (a source of cross-GPU context binding races).
+//
+// _gpu_ioctxs is empty in single-GPU mode with use_sirius_datasource=false; in
+// that case read_table_from_metadata falls back to cudf::io::datasource::create
+// (kvikio) since with only one GPU the per-FileHandle context binding is
+// harmless. Multi-GPU mode always populates this map — enforced by
+// sirius_config::enforce_sirius_datasource_for_multi_gpu().
 void sirius_gpu_parquet_scan_operator::set_gpu_ioctxs(
   std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> ioctxs)
 {
@@ -147,25 +153,33 @@ std::unique_ptr<cudf::table> sirius_gpu_parquet_scan_operator::read_table_from_m
   // by the chunk's memory_space->get_device_id(). The cudf-bundled
   // file_source factory bypasses the ioctx framework and routes through
   // libkvikio's per-FileHandle CUDA-context binding, breaking multi-GPU
-  // residency.
-  if (_gpu_ioctxs.empty()) {
-    throw std::runtime_error(
-      "[sirius_gpu_parquet_scan_operator::read_table_from_metadata] _gpu_ioctxs is empty; "
-      "set_gpu_ioctxs() must be called by sirius_scan_manager::create_provider_for() before "
-      "execute().");
-  }
-  if (scan_data.gpu_memory_space == nullptr) {
-    throw std::runtime_error(
-      "[sirius_gpu_parquet_scan_operator::read_table_from_metadata] scan_data.gpu_memory_space "
-      "is null; cannot select per-chunk ioctx.");
-  }
-  int const target_device_id = scan_data.gpu_memory_space->get_device_id();
-  auto ioctx_it              = _gpu_ioctxs.find(target_device_id);
-  if (ioctx_it == _gpu_ioctxs.end()) {
-    throw std::out_of_range(
-      "[sirius_gpu_parquet_scan_operator::read_table_from_metadata] no sirius_ioctx for "
-      "device_id=" +
-      std::to_string(target_device_id) + ".");
+  // residency. Multi-GPU configurations therefore always supply a populated
+  // _gpu_ioctxs map (enforced by
+  // sirius_config::enforce_sirius_datasource_for_multi_gpu(), which forces
+  // use_sirius_datasource=true whenever >1 GPU is configured).
+  //
+  // When use_sirius_datasource=false (single-GPU only), the scan_manager
+  // hands the operator an empty _gpu_ioctxs map and the provider emits
+  // slices with null io_ctx / io_object. In that case we use
+  // cudf::io::datasource::create for every slice — kvikio's per-FileHandle
+  // CUDA-context binding is harmless with only one GPU in play.
+  bool const kvikio_fallback_mode = _gpu_ioctxs.empty();
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>>::const_iterator ioctx_it =
+    _gpu_ioctxs.end();
+  if (!kvikio_fallback_mode) {
+    if (scan_data.gpu_memory_space == nullptr) {
+      throw std::runtime_error(
+        "[sirius_gpu_parquet_scan_operator::read_table_from_metadata] scan_data.gpu_memory_space "
+        "is null; cannot select per-chunk ioctx.");
+    }
+    int const target_device_id = scan_data.gpu_memory_space->get_device_id();
+    ioctx_it                   = _gpu_ioctxs.find(target_device_id);
+    if (ioctx_it == _gpu_ioctxs.end()) {
+      throw std::out_of_range(
+        "[sirius_gpu_parquet_scan_operator::read_table_from_metadata] no sirius_ioctx for "
+        "device_id=" +
+        std::to_string(target_device_id) + ".");
+    }
   }
   // Hold uring_io_object shared_ptrs for the duration of the read so the
   // sirius_datasources keep a valid handle (sirius_datasource holds a raw
@@ -173,26 +187,31 @@ std::unique_ptr<cudf::table> sirius_gpu_parquet_scan_operator::read_table_from_m
   std::vector<std::shared_ptr<sirius::io::sirius_io_object>> io_objects;
   io_objects.reserve(scan_data.rg_slices.size());
   for (auto const& slice : scan_data.rg_slices) {
-    // Two-dimensional ioctx selection (multi-GPU #732 × multi-backend-S3).
-    // slice.io_ctx is the backend that minted slice.io_object:
-    //   * per-GPU LOCAL backend (one of _gpu_ioctxs) → rebind the read to the
-    //     *target* GPU's local ioctx so it binds to the executing GPU's CUDA
-    //     context (dev #732 residency); the planning-time GPU may differ.
-    //   * shared REMOTE backend (e.g. the single s3_ioctx) → read through
-    //     slice.io_ctx directly; S3 is network→host and not per-GPU.
-    auto const is_per_gpu_local = [&] {
-      for (auto const& [dev, ctx] : _gpu_ioctxs) {
-        if (ctx == slice.io_ctx) { return true; }
-      }
-      return false;
-    }();
-    auto const ds_ioctx = (slice.io_ctx && !is_per_gpu_local) ? slice.io_ctx : ioctx_it->second;
-    if (slice.io_object) {
-      sources.push_back(ds_ioctx->make_datasource(slice.io_object));
+    if (kvikio_fallback_mode || !slice.io_ctx) {
+      // use_sirius_datasource=false path: use cudf's bundled datasource (kvikio).
+      sources.push_back(cudf::io::datasource::create(slice.file_path));
     } else {
-      auto io_object = ds_ioctx->create_io_object(slice.file_path);
-      sources.push_back(ds_ioctx->make_datasource(io_object));
-      io_objects.push_back(std::move(io_object));
+      // Two-dimensional ioctx selection (multi-GPU #732 × multi-backend-S3).
+      // slice.io_ctx is the backend that minted slice.io_object:
+      //   * per-GPU LOCAL backend (one of _gpu_ioctxs) → rebind the read to the
+      //     *target* GPU's local ioctx so it binds to the executing GPU's CUDA
+      //     context (dev #732 residency); the planning-time GPU may differ.
+      //   * shared REMOTE backend (e.g. the single s3_ioctx) → read through
+      //     slice.io_ctx directly; S3 is network→host and not per-GPU.
+      auto const is_per_gpu_local = [&] {
+        for (auto const& [dev, ctx] : _gpu_ioctxs) {
+          if (ctx == slice.io_ctx) { return true; }
+        }
+        return false;
+      }();
+      auto const ds_ioctx = (slice.io_ctx && !is_per_gpu_local) ? slice.io_ctx : ioctx_it->second;
+      if (slice.io_object) {
+        sources.push_back(ds_ioctx->make_datasource(slice.io_object));
+      } else {
+        auto io_object = ds_ioctx->create_io_object(slice.file_path);
+        sources.push_back(ds_ioctx->make_datasource(io_object));
+        io_objects.push_back(std::move(io_object));
+      }
     }
     metadatas.push_back(*slice.file_metadata);  // copy unavoidable: cudf takes by value
     rg_per_src.push_back(slice.row_group_indices);
