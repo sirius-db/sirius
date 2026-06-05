@@ -185,7 +185,7 @@ std::unique_ptr<cudf::table> sirius_gpu_parquet_scan_operator::read_table_from_m
   std::vector<std::shared_ptr<sirius::io::sirius_io_object>> io_objects;
   io_objects.reserve(scan_data.rg_slices.size());
   for (auto const& slice : scan_data.rg_slices) {
-    if (kvikio_fallback_mode || (!slice.io_ctx && !slice.io_object)) {
+    if (kvikio_fallback_mode || !slice.io_ctx) {
       // use_sirius_datasource=false path: use cudf's bundled datasource (kvikio).
       sources.push_back(cudf::io::datasource::create(slice.file_path));
     } else {
