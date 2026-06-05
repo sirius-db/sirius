@@ -19,7 +19,7 @@
 #include <data/sirius_converter_registry.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <log/logging.hpp>
-#include <op/scan/cached_parquet_gpu_ingestible.hpp>
+#include <op/scan/pinned_table_gpu_ingestible.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 
 // cudf
@@ -46,7 +46,7 @@
 
 namespace sirius::op::scan {
 
-cached_parquet_gpu_ingestible::cached_parquet_gpu_ingestible(
+pinned_table_gpu_ingestible::pinned_table_gpu_ingestible(
   std::unique_ptr<io::ingestible_table_info> table_info,
   std::vector<std::vector<std::shared_ptr<cudf::column>>> columns_per_request,
   std::vector<::cucascade::memory::memory_space*> chunk_memory_spaces,
@@ -62,7 +62,7 @@ cached_parquet_gpu_ingestible::cached_parquet_gpu_ingestible(
   for (auto const& col_chunks : columns_per_request) {
     if (col_chunks.size() != num_batches) {
       throw std::runtime_error(
-        "[cached_parquet_gpu_ingestible] mismatched chunk count across requested columns");
+        "[pinned_table_gpu_ingestible] mismatched chunk count across requested columns");
     }
   }
 
@@ -77,7 +77,7 @@ cached_parquet_gpu_ingestible::cached_parquet_gpu_ingestible(
   }
 }
 
-cached_parquet_gpu_ingestible::cached_parquet_gpu_ingestible(
+pinned_table_gpu_ingestible::pinned_table_gpu_ingestible(
   std::unique_ptr<io::ingestible_table_info> table_info,
   std::vector<std::shared_ptr<::cucascade::host_data_representation>> host_chunks,
   std::vector<std::size_t> column_indices,
@@ -94,7 +94,7 @@ cached_parquet_gpu_ingestible::cached_parquet_gpu_ingestible(
 {
   if (_gpu_memory_spaces.empty()) {
     throw std::runtime_error(
-      "[cached_parquet_gpu_ingestible] HOST-tier constructor requires non-empty "
+      "[pinned_table_gpu_ingestible] HOST-tier constructor requires non-empty "
       "gpu_memory_spaces so produce_batch can convert host chunks to the executing "
       "GPU's space");
   }
@@ -102,21 +102,21 @@ cached_parquet_gpu_ingestible::cached_parquet_gpu_ingestible(
   for (auto& chunk : host_chunks) {
     if (!chunk) {
       throw std::runtime_error(
-        "[cached_parquet_gpu_ingestible] null host_data_representation in pinned chunks");
+        "[pinned_table_gpu_ingestible] null host_data_representation in pinned chunks");
     }
     _batches.emplace_back(std::move(chunk));
   }
 }
 
-cached_parquet_gpu_ingestible::~cached_parquet_gpu_ingestible() = default;
+pinned_table_gpu_ingestible::~pinned_table_gpu_ingestible() = default;
 
-bool cached_parquet_gpu_ingestible::has_more_splits() const
+bool pinned_table_gpu_ingestible::has_more_splits() const
 {
   return _next_batch_idx.load(std::memory_order_relaxed) < _batches.size();
 }
 
 std::function<std::vector<std::unique_ptr<op::operator_data>>()>
-cached_parquet_gpu_ingestible::next_split_provider()
+pinned_table_gpu_ingestible::next_split_provider()
 {
   auto const batch_idx = _next_batch_idx.fetch_add(1, std::memory_order_relaxed);
   if (batch_idx >= _batches.size()) { return nullptr; }
@@ -131,7 +131,7 @@ cached_parquet_gpu_ingestible::next_split_provider()
 
     std::unique_ptr<io::post_filter_and_projection_info> filter_info;
     if (need_post_processing) {
-      auto pf            = std::make_unique<cached_parquet_post_filter_and_projection_info>();
+      auto pf            = std::make_unique<pinned_table_post_filter_and_projection_info>();
       pf->apply_filter   = apply_filter;
       pf->apply_assembly = apply_assembly;
       filter_info        = std::move(pf);
@@ -144,7 +144,7 @@ cached_parquet_gpu_ingestible::next_split_provider()
   };
 }
 
-std::shared_ptr<::cucascade::data_batch> cached_parquet_gpu_ingestible::produce_batch(
+std::shared_ptr<::cucascade::data_batch> pinned_table_gpu_ingestible::produce_batch(
   std::size_t batch_idx)
 {
   return std::visit(
@@ -174,7 +174,7 @@ std::shared_ptr<::cucascade::data_batch> cached_parquet_gpu_ingestible::produce_
     _batches[batch_idx]);
 }
 
-std::unique_ptr<cudf::table> cached_parquet_gpu_ingestible::materialize_table(
+std::unique_ptr<cudf::table> pinned_table_gpu_ingestible::materialize_table(
   io::scan_info const& /*info*/,
   ::cucascade::memory::memory_space const& /*mem_space*/,
   rmm::cuda_stream_view /*stream*/)
@@ -183,17 +183,17 @@ std::unique_ptr<cudf::table> cached_parquet_gpu_ingestible::materialize_table(
   // type is scan_operator_with_pinned_table_input, which dispatches directly
   // into post_filter_and_project. Throwing here makes any mis-routing loud.
   throw std::runtime_error(
-    "[cached_parquet_gpu_ingestible::materialize_table] not reachable; cached path "
+    "[pinned_table_gpu_ingestible::materialize_table] not reachable; cached path "
     "uses scan_operator_with_pinned_table_input + post_filter_and_project only.");
 }
 
-std::unique_ptr<cudf::table> cached_parquet_gpu_ingestible::post_filter_and_project(
+std::unique_ptr<cudf::table> pinned_table_gpu_ingestible::post_filter_and_project(
   std::unique_ptr<cudf::table> input,
   io::post_filter_and_projection_info const& info,
   ::cucascade::memory::memory_space const& /*mem_space*/,
   rmm::cuda_stream_view stream)
 {
-  auto const& pf = static_cast<cached_parquet_post_filter_and_projection_info const&>(info);
+  auto const& pf = static_cast<pinned_table_post_filter_and_projection_info const&>(info);
 
   if (pf.apply_filter && _filter_expression) {
     sirius::gpu_expression_executor exec(
@@ -201,7 +201,7 @@ std::unique_ptr<cudf::table> cached_parquet_gpu_ingestible::post_filter_and_proj
     auto src = std::move(input);
     input    = exec.select(src->view());
     SIRIUS_LOG_DEBUG(
-      "[cached_parquet_gpu_ingestible::post_filter_and_project] Applied duckdb filter "
+      "[pinned_table_gpu_ingestible::post_filter_and_project] Applied duckdb filter "
       "expression on cached batch.");
   }
 
@@ -211,7 +211,7 @@ std::unique_ptr<cudf::table> cached_parquet_gpu_ingestible::post_filter_and_proj
     // never exercised.
     input = assemble_scan_output(*_plan, std::move(input), /*partition_values=*/{}, stream);
     SIRIUS_LOG_DEBUG(
-      "[cached_parquet_gpu_ingestible::post_filter_and_project] Assembled cached batch "
+      "[pinned_table_gpu_ingestible::post_filter_and_project] Assembled cached batch "
       "to plan layout.");
   }
 

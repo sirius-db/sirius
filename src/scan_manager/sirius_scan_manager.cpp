@@ -23,8 +23,8 @@
 #include "io/s3/s3_blocking_ioctx.hpp"
 #include "io/uring/uring_ioctx.hpp"
 #include "log/logging.hpp"
-#include "op/scan/cached_parquet_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
+#include "op/scan/pinned_table_gpu_ingestible.hpp"
 #include "op/scan/scan_plan.hpp"
 #include "op/scan/scan_utils.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
@@ -396,14 +396,13 @@ std::shared_ptr<io::gpu_ingestible> sirius_scan_manager::try_make_cached_ingesti
           entry.host_chunks.size(),
           op::scan::needs_output_assembly(plan));
 
-        return std::make_shared<op::scan::cached_parquet_gpu_ingestible>(
-          std::move(table_info),
-          entry.host_chunks,
-          std::move(column_indices),
-          *entry.memory_space,
-          gpu_memory_spaces,
-          std::move(filter_expression),
-          std::move(plan_shared));
+        return std::make_shared<op::scan::pinned_table_gpu_ingestible>(std::move(table_info),
+                                                                       entry.host_chunks,
+                                                                       std::move(column_indices),
+                                                                       *entry.memory_space,
+                                                                       gpu_memory_spaces,
+                                                                       std::move(filter_expression),
+                                                                       std::move(plan_shared));
       }
 
       // GPU-tier validation: every cached chunk has an owning memory_space.
@@ -448,12 +447,11 @@ std::shared_ptr<io::gpu_ingestible> sirius_scan_manager::try_make_cached_ingesti
 
       // Each chunk's data_batch is tagged with its actual memory_space so
       // data-locality scheduling fans cached-scan tasks across GPUs.
-      return std::make_shared<op::scan::cached_parquet_gpu_ingestible>(
-        std::move(table_info),
-        std::move(columns_per_request),
-        entry.chunk_memory_spaces,
-        std::move(filter_expression),
-        std::move(plan_shared));
+      return std::make_shared<op::scan::pinned_table_gpu_ingestible>(std::move(table_info),
+                                                                     std::move(columns_per_request),
+                                                                     entry.chunk_memory_spaces,
+                                                                     std::move(filter_expression),
+                                                                     std::move(plan_shared));
     }
   } catch (...) {
     SIRIUS_LOG_TRACE("not all the columns are pinned for this query");

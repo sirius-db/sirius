@@ -217,7 +217,7 @@ set(EXTENSION_SOURCES
     src/op/scan/sirius_gpu_scan_operator.cpp
     src/op/scan/parquet_gpu_ingestible.cpp
     src/op/scan/duckdb_native_gpu_ingestible.cpp
-    src/op/scan/cached_parquet_gpu_ingestible.cpp
+    src/op/scan/pinned_table_gpu_ingestible.cpp
     src/op/sirius_dynamic_filter.cpp
     src/op/sirius_physical_column_data_scan.cpp
     src/op/sirius_physical_cpu_source.cpp
@@ -525,7 +525,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_scan_task.cpp
     test/cpp/scan/test_parquet_gpu_ingestible.cpp
-    test/cpp/scan/test_cached_parquet_gpu_ingestible.cpp
+    test/cpp/scan/test_pinned_table_gpu_ingestible.cpp
     test/cpp/scan/test_scan_executor.cpp
     test/cpp/scan/test_split_connector.cpp
     test/cpp/scan_manager/test_sirius_scan_manager_s3.cpp

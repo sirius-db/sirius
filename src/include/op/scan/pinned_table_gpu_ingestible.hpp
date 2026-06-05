@@ -42,20 +42,20 @@
 
 namespace sirius::op::scan {
 
-class cached_parquet_post_filter_and_projection_info : public io::post_filter_and_projection_info {
+class pinned_table_post_filter_and_projection_info : public io::post_filter_and_projection_info {
  public:
   bool apply_filter   = false;
   bool apply_assembly = false;
 };
 
-class cached_parquet_gpu_ingestible : public io::gpu_ingestible {
+class pinned_table_gpu_ingestible : public io::gpu_ingestible {
  public:
   using gpu_chunk     = std::vector<std::shared_ptr<cudf::column>>;
   using host_chunk    = std::shared_ptr<::cucascade::host_data_representation>;
   using chunk_variant = std::variant<gpu_chunk, host_chunk>;
 
   /// GPU-tier constructor.
-  cached_parquet_gpu_ingestible(
+  pinned_table_gpu_ingestible(
     std::unique_ptr<io::ingestible_table_info> table_info,
     std::vector<std::vector<std::shared_ptr<cudf::column>>> columns_per_request,
     std::vector<::cucascade::memory::memory_space*> chunk_memory_spaces,
@@ -63,7 +63,7 @@ class cached_parquet_gpu_ingestible : public io::gpu_ingestible {
     std::shared_ptr<scan_plan const> plan);
 
   /// HOST-tier constructor.
-  cached_parquet_gpu_ingestible(
+  pinned_table_gpu_ingestible(
     std::unique_ptr<io::ingestible_table_info> table_info,
     std::vector<std::shared_ptr<::cucascade::host_data_representation>> host_chunks,
     std::vector<std::size_t> column_indices,
@@ -72,7 +72,7 @@ class cached_parquet_gpu_ingestible : public io::gpu_ingestible {
     std::shared_ptr<duckdb::Expression> filter_expression,
     std::shared_ptr<scan_plan const> plan);
 
-  ~cached_parquet_gpu_ingestible() override;
+  ~pinned_table_gpu_ingestible() override;
 
   [[nodiscard]] bool has_more_splits() const override;
   std::function<std::vector<std::unique_ptr<op::operator_data>>()> next_split_provider() override;
