@@ -8,7 +8,7 @@ vcpkg_from_github(
   REF
   v${VERSION}
   SHA512
-  ef9ecc51efdde4e73ea231cd59628dad3347ac4c10a4d2e45be789a2307fdccfca16844373a296f61f89a6e2aa95b04e71175d50ac488eb925fb4217eaaf20cc
+  630c7ec1195b0aaefd738715379981951fb43575e22ef50d35ec3645a3f7e2f66fa0feb2ad72e6164dfbfce8515205616a4da9d633fb8b7864acb727e4d60240
   HEAD_REF
   main)
 
@@ -20,7 +20,7 @@ vcpkg_from_github(
   REF
   v${VERSION}
   SHA512
-  de9234549a96b2a73caa4bbbaf10500419c5f16069a430d172432c23e6d404b3ab9e595f6c0958d15f4f190fb50e1cd7dd02945b93cf428180df8feb8822ed94
+  d3d7a1f807a9b71ed15c972742a4dbee0746cc65b1bfa7eef9a8e036a992a37fcfdfbff79fc27cf053dc5a37978abf86b93b56bc6f605f04244e8f6776595bdd
   HEAD_REF
   main)
 
@@ -167,12 +167,9 @@ file(REMOVE "${CURRENT_PACKAGES_DIR}/include/zstd_errors.h")
 file(REMOVE "${CURRENT_PACKAGES_DIR}/lib/libzstd.a")
 file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/lib/pkgconfig")
 
-# Move CPM-installed cuco cmake config to share/ before vcpkg_cmake_config_fixup
-# which cleans lib/cmake/. cuco is built as part of cudf via CPM, not as a
-# separate vcpkg port, but cudf-dependencies.cmake calls find_dependency(cuco).
-file(INSTALL "${CURRENT_PACKAGES_DIR}/lib/cmake/cuco/"
-     DESTINATION "${CURRENT_PACKAGES_DIR}/share/cuco")
-file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/lib/cmake/cuco")
+# cudf 26.06 fully vendors cuco: it no longer installs lib/cmake/cuco, and
+# cudf-dependencies.cmake no longer calls find_dependency(cuco), so the old
+# move-to-share step (needed for 26.04) is obsolete and would fail here.
 
 vcpkg_cmake_config_fixup(PACKAGE_NAME cudf CONFIG_PATH lib/cmake/cudf)
 
@@ -218,5 +215,14 @@ file(REMOVE "${CURRENT_PACKAGES_DIR}/debug/lib/librapids_logger.a")
 # paths that aren't portable.
 vcpkg_replace_string("${CURRENT_PACKAGES_DIR}/share/cudf/cudf-targets.cmake"
                      ";\$<LINK_ONLY:cudf::conda_env>" "")
+
+# cudf 26.06 exports the bare target name `nanoarrow_static` in its link
+# interface, but the vcpkg nanoarrow port provides the namespaced imported
+# target `nanoarrow::nanoarrow_static`. Without this, consumers get an
+# unresolved `-lnanoarrow_static` and the link fails. Point it at the namespaced
+# target (carries IMPORTED_LOCATION for libnanoarrow_static.a).
+vcpkg_replace_string(
+  "${CURRENT_PACKAGES_DIR}/share/cudf/cudf-targets.cmake"
+  "\$<LINK_ONLY:nanoarrow_static>" "\$<LINK_ONLY:nanoarrow::nanoarrow_static>")
 
 vcpkg_install_copyright(FILE_LIST "${SOURCE_PATH}/LICENSE")

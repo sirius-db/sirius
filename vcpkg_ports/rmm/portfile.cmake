@@ -8,7 +8,7 @@ vcpkg_from_github(
   REF
   v${VERSION}
   SHA512
-  9e30d3c1ee5bdcaf545c72934fb8c2dc4c0a65bc51b439d305a8330d1753f496f8ef414a8ffbbbbccda42c63880fd740199bf391217c227bd12bd1125984de47
+  c3959c0e2ddec29cfd5a5978e8499e7e51fac02c609b847aa826159209112d1e0c6ec05aea4f8f0cea81157055b202ff2c318d68b943c3623c4d4f9022b7c119
   HEAD_REF
   main)
 
@@ -20,7 +20,7 @@ vcpkg_from_github(
   REF
   v${VERSION}
   SHA512
-  de9234549a96b2a73caa4bbbaf10500419c5f16069a430d172432c23e6d404b3ab9e595f6c0958d15f4f190fb50e1cd7dd02945b93cf428180df8feb8822ed94
+  d3d7a1f807a9b71ed15c972742a4dbee0746cc65b1bfa7eef9a8e036a992a37fcfdfbff79fc27cf053dc5a37978abf86b93b56bc6f605f04244e8f6776595bdd
   HEAD_REF
   main)
 
@@ -71,6 +71,12 @@ file(
   "${CURRENT_BUILDTREES_DIR}/${TARGET_TRIPLET}-rel/_deps/rapids_logger-build/create_logger_macros.cmake"
 )
 file(INSTALL ${RAPIDS_LOGGER_CMAKE_FILES}
+     DESTINATION "${CURRENT_PACKAGES_DIR}/share/rapids_logger")
+
+# create_logger_macros.cmake calls configure_file() on logger_macros.hpp.in,
+# resolved relative to its own install dir. kvikio/cudf 26.06 invoke this macro
+# generator (26.04 did not), so the template must sit alongside it.
+file(INSTALL "${RAPIDS_LOGGER_PATH}/cmake/logger_macros.hpp.in"
      DESTINATION "${CURRENT_PACKAGES_DIR}/share/rapids_logger")
 
 # Fix paths in rapids_logger cmake config

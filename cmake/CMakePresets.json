@@ -91,7 +91,7 @@
       "binaryDir": "${sourceDir}/../build/debug",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "CMAKE_CUDA_FLAGS_DEBUG": "-g -G -O0",
+        "CMAKE_CUDA_FLAGS_DEBUG": "-g -lineinfo -O0",
         "CMAKE_CXX_FLAGS_DEBUG": "-g -O0",
         "CMAKE_C_FLAGS_DEBUG": "-g -O0"
       },
@@ -121,7 +121,7 @@
       "binaryDir": "${sourceDir}/../build/clang-debug",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "CMAKE_CUDA_FLAGS_DEBUG": "-g -G -O0",
+        "CMAKE_CUDA_FLAGS_DEBUG": "-g -lineinfo -O0",
         "CMAKE_CXX_FLAGS_DEBUG": "-g -O0",
         "CMAKE_C_FLAGS_DEBUG": "-g -O0"
       },
@@ -208,7 +208,7 @@
       "binaryDir": "${sourceDir}/../build/vcpkg-debug",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "CMAKE_CUDA_FLAGS_DEBUG": "-g -G -O0",
+        "CMAKE_CUDA_FLAGS_DEBUG": "-g -lineinfo -O0",
         "CMAKE_CXX_FLAGS_DEBUG": "-g -O0",
         "CMAKE_C_FLAGS_DEBUG": "-g -O0"
       },

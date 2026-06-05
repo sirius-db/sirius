@@ -4,9 +4,10 @@ vcpkg_from_github(
   REPO
   NVIDIA/cccl
   REF
-  v${VERSION}
+  # CCCL 3.4.0 has no release tag yet; pin the commit rapids-cmake 26.06 uses.
+  207502e57019cefacf6f21d3bb6045aeebef2a3e
   SHA512
-  e4e6cb31c211edbd145bdb12e6eca1ecb08570051617bbb930e14050f85e475d2c1a1fbda867bf6a8cd9e16ff81f59235eb0099f4c5636e8b9c2034b53a74e85
+  9dfdb0ba4100f8a37859a1918a7adacea7de06714d7153cbb130342468149ce4b96d306d2262ba346ca326a385a9af053ee57b4c0d41c4736574e5b9825a4686
   HEAD_REF
   main)
 
