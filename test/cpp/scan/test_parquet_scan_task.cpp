@@ -24,8 +24,11 @@
 #include <exec/thread_pool.hpp>
 #include <helper/logical_type.hpp>
 #include <helper/type_conversions.hpp>
+#include <io/io_context.hpp>
 #include <op/scan/parquet_scan_operator_data.hpp>
 #include <op/scan/parquet_scan_task.hpp>
+#include <op/scan/scan_info.hpp>
+#include <op/scan/sirius_gpu_parquet_scan_operator.hpp>
 #include <op/sirius_physical_parquet_scan.hpp>
 #include <parallel/task_executor.hpp>
 #include <scan_manager/parquet_split_provider.hpp>
@@ -53,6 +56,8 @@
 
 // cudf
 #include <cudf/logger.hpp>
+#include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/span.hpp>
 
 #include <rapids_logger/logger.hpp>
 
@@ -69,10 +74,14 @@
 // standard library
 #include <algorithm>
 #include <cstddef>
+#include <exception>
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <span>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 
@@ -367,6 +376,196 @@ static void create_synthetic_table_with_offset(duckdb::Connection& con,
     REQUIRE(result);
     REQUIRE(!result->HasError());
   }
+}
+
+struct routing_guard_schema {
+  duckdb::vector<duckdb::ColumnIndex> column_ids;
+  duckdb::vector<std::string> names;
+  duckdb::vector<duckdb::LogicalType> types;
+};
+
+static routing_guard_schema make_routing_guard_schema()
+{
+  routing_guard_schema schema;
+  schema.column_ids.emplace_back(duckdb::ColumnIndex(0));
+  schema.column_ids.emplace_back(duckdb::ColumnIndex(1));
+  schema.column_ids.emplace_back(duckdb::ColumnIndex(2));
+  schema.column_ids.emplace_back(duckdb::ColumnIndex(3));
+
+  schema.names = {"id", "value", "price", "name"};
+  schema.types = {duckdb::LogicalType::INTEGER,
+                  duckdb::LogicalType::BIGINT,
+                  duckdb::LogicalType::DOUBLE,
+                  duckdb::LogicalType::VARCHAR};
+  return schema;
+}
+
+class routing_test_io_object final : public sirius::io::sirius_io_object {
+ public:
+  routing_test_io_object(std::string path, std::size_t size) : _path(std::move(path)), _size(size)
+  {
+  }
+
+  [[nodiscard]] std::string const& raw_file_cache_id() const noexcept override { return _path; }
+  [[nodiscard]] std::string const& object_path() const noexcept override { return _path; }
+  [[nodiscard]] std::size_t size() const noexcept override { return _size; }
+
+ private:
+  std::string _path;
+  std::size_t _size;
+};
+
+class routing_spy_ioctx final : public sirius::io::sirius_ioctx {
+ public:
+  explicit routing_spy_ioctx(std::filesystem::path local_parquet_path)
+    : _local_parquet_path(std::move(local_parquet_path))
+  {
+  }
+
+  void shutdown() override {}
+
+  std::shared_ptr<sirius::io::sirius_io_object> create_io_object(std::string path) override
+  {
+    return std::make_shared<routing_test_io_object>(
+      std::move(path), std::filesystem::file_size(_local_parquet_path));
+  }
+
+  std::unique_ptr<cudf::io::datasource> make_datasource(
+    std::shared_ptr<sirius::io::sirius_io_object>) override
+  {
+    ++make_datasource_calls;
+    return cudf::io::datasource::create(_local_parquet_path.string());
+  }
+
+  [[nodiscard]] bool supports(std::string_view path) const override
+  {
+    return path.rfind("s3://", 0) == 0;
+  }
+
+  std::size_t host_read_io(sirius::io::sirius_io_object&,
+                           std::size_t,
+                           std::size_t,
+                           std::uint8_t*) override
+  {
+    throw std::logic_error("routing_spy_ioctx: host_read_io should not be used");
+  }
+
+  void host_read_async_io(sirius::io::sirius_io_object&,
+                          std::size_t,
+                          std::size_t,
+                          std::uint8_t*,
+                          sirius::io::io_completion_handler handler) override
+  {
+    handler(0,
+            std::make_exception_ptr(
+              std::logic_error("routing_spy_ioctx: host_read_async_io should not be used")));
+  }
+
+  std::size_t device_read_io(sirius::io::sirius_io_object&,
+                             std::size_t,
+                             std::size_t,
+                             std::uint8_t*,
+                             rmm::cuda_stream_view) override
+  {
+    throw std::logic_error("routing_spy_ioctx: device_read_io should not be used");
+  }
+
+  void device_read_async_io(sirius::io::sirius_io_object&,
+                            std::size_t,
+                            std::size_t,
+                            std::uint8_t*,
+                            rmm::cuda_stream_view,
+                            sirius::io::io_completion_handler handler) override
+  {
+    handler(0,
+            std::make_exception_ptr(
+              std::logic_error("routing_spy_ioctx: device_read_async_io should not be used")));
+  }
+
+  void host_read_ranges_async_io(sirius::io::sirius_io_object&,
+                                 std::vector<cudf::io::text::byte_range_info> const&,
+                                 std::span<cudf::host_span<std::byte>>,
+                                 sirius::io::io_completion_handler handler) override
+  {
+    handler(0,
+            std::make_exception_ptr(
+              std::logic_error("routing_spy_ioctx: host_read_ranges_async_io should not be used")));
+  }
+
+  cudf::io::text::byte_range_info compute_physical_range(cudf::io::text::byte_range_info logical,
+                                                         std::size_t) const override
+  {
+    return logical;
+  }
+
+  int make_datasource_calls{0};
+
+ private:
+  std::filesystem::path _local_parquet_path;
+};
+
+static std::unique_ptr<sirius::op::scan::parquet_scan_data> make_single_slice_routing_scan_data(
+  std::filesystem::path const& local_parquet_path,
+  std::string slice_path,
+  std::shared_ptr<sirius::io::sirius_ioctx> io_ctx = nullptr)
+{
+  auto schema = make_routing_guard_schema();
+
+  sirius::scan_manager::parquet_split_provider provider(
+    sirius::from_duckdb_vec(schema.types),
+    {local_parquet_path.string()},
+    schema.column_ids,
+    /*projection_ids=*/{},
+    schema.names,
+    schema.types.size(),
+    /*table_filter_set=*/nullptr,
+    /*partition_indices=*/{},
+    /*approximate_batch_size=*/std::size_t{1} << 30,
+    /*max_file_processed=*/10,
+    make_test_gpu_ioctxs());
+
+  sirius::exec::static_thread_pool pool(2, "routing_guard_psp");
+  sirius::scan_manager::split_connector connector;
+  provider.run(pool, connector);
+
+  std::vector<std::unique_ptr<sirius::op::scan::parquet_scan_data>> splits;
+  while (true) {
+    auto next = connector.get_next_split();
+    if (!next.has_value()) { break; }
+    std::unique_ptr<sirius::op::operator_data> base = std::move(*next);
+    auto* raw                                       = base.release();
+    auto* parquet = dynamic_cast<sirius::op::scan::parquet_scan_data*>(raw);
+    REQUIRE(parquet != nullptr);
+    splits.emplace_back(std::unique_ptr<sirius::op::scan::parquet_scan_data>(parquet));
+  }
+  REQUIRE(splits.size() == 1);
+
+  auto scan_data = std::move(splits.front());
+  REQUIRE(scan_data->rg_slices.size() == 1);
+
+  auto& slice     = scan_data->rg_slices.front();
+  slice.file_path = std::move(slice_path);
+  slice.io_ctx    = std::move(io_ctx);
+  if (slice.io_ctx) {
+    slice.io_object = std::make_shared<routing_test_io_object>(
+      slice.file_path, std::filesystem::file_size(local_parquet_path));
+  } else {
+    slice.io_object.reset();
+  }
+
+  return scan_data;
+}
+
+static std::unique_ptr<sirius::op::operator_data> execute_routing_scan_data(
+  sirius::op::scan::parquet_scan_data& scan_data,
+  cucascade::memory::memory_space& gpu_space,
+  rmm::cuda_stream_view stream = cudf::get_default_stream())
+{
+  auto schema = make_routing_guard_schema();
+  sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(
+    sirius::from_duckdb_vec(schema.types), 0, nullptr);
+  scan_data.prepare_for_processing(&gpu_space, stream);
+  return gpu_op.execute(scan_data, stream);
 }
 
 static void run_parquet_scan_test(std::string const& table_name,
@@ -688,6 +887,49 @@ static void run_row_group_pruning_test(std::string const& table_name,
 //------------------------------------------------------------------------------//
 // Test cases
 //------------------------------------------------------------------------------//
+
+TEST_CASE("gpu parquet scan honors non-null slice ioctx in single-GPU fallback mode",
+          "[scan][s3][datasource-routing][shared_context]")
+{
+  auto memory_manager = initialize_memory_manager();
+  auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
+  REQUIRE(gpu_space != nullptr);
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  create_synthetic_table(con, "s3_route_guard", 128);
+  auto path = write_parquet_from_table(con, "s3_route_guard", 128);
+
+  auto spy = std::make_shared<routing_spy_ioctx>(path);
+  auto scan_data =
+    make_single_slice_routing_scan_data(path, "s3://fake-bucket/s3_route_guard.parquet", spy);
+
+  auto output = execute_routing_scan_data(*scan_data, *gpu_space);
+  REQUIRE(output);
+  CHECK(spy->make_datasource_calls == 1);
+
+  std::filesystem::remove(path);
+}
+
+TEST_CASE("gpu parquet scan keeps local null-ioctx KvikIO fallback in single-GPU mode",
+          "[scan][s3][datasource-routing][shared_context]")
+{
+  auto memory_manager = initialize_memory_manager();
+  auto* gpu_space     = get_space(*memory_manager, Tier::GPU);
+  REQUIRE(gpu_space != nullptr);
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  create_synthetic_table(con, "local_kvikio_guard", 128);
+  auto path = write_parquet_from_table(con, "local_kvikio_guard", 128);
+
+  auto scan_data = make_single_slice_routing_scan_data(path, path.string());
+
+  auto output = execute_routing_scan_data(*scan_data, *gpu_space);
+  REQUIRE(output);
+
+  std::filesystem::remove(path);
+}
 
 TEST_CASE("parquet_scan_task - single threaded small table",
           "[parquet_scan_task][single_thread][shared_context]")

@@ -159,10 +159,16 @@ std::unique_ptr<cudf::table> sirius_gpu_parquet_scan_operator::read_table_from_m
   // use_sirius_datasource=true whenever >1 GPU is configured).
   //
   // When use_sirius_datasource=false (single-GPU only), the scan_manager
-  // hands the operator an empty _gpu_ioctxs map and the provider emits
-  // slices with null io_ctx / io_object. In that case we use
-  // cudf::io::datasource::create for every slice — kvikio's per-FileHandle
-  // CUDA-context binding is harmless with only one GPU in play.
+  // hands the operator an empty _gpu_ioctxs map and the provider emits LOCAL
+  // slices with null io_ctx / io_object; those use cudf::io::datasource::create
+  // (kvikio's per-FileHandle CUDA-context binding is harmless with one GPU).
+  //
+  // A slice that DOES carry an io_ctx must still be read through it, even when
+  // _gpu_ioctxs is empty: a remote (e.g. s3://) slice is minted with the shared
+  // s3_ioctx regardless of use_sirius_datasource, and kvikio cannot read s3://
+  // (it has no remote scheme support) — routing it to the cudf default would
+  // fail with "Unsupported URL scheme". So the kvikio fallback is keyed on a
+  // null io_ctx (the slice's own contract), NOT on _gpu_ioctxs being empty.
   bool const kvikio_fallback_mode = _gpu_ioctxs.empty();
   std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>>::const_iterator ioctx_it =
     _gpu_ioctxs.end();
@@ -187,8 +193,11 @@ std::unique_ptr<cudf::table> sirius_gpu_parquet_scan_operator::read_table_from_m
   std::vector<std::shared_ptr<sirius::io::sirius_io_object>> io_objects;
   io_objects.reserve(scan_data.rg_slices.size());
   for (auto const& slice : scan_data.rg_slices) {
-    if (kvikio_fallback_mode || !slice.io_ctx) {
-      // use_sirius_datasource=false path: use cudf's bundled datasource (kvikio).
+    if (!slice.io_ctx) {
+      // No sirius backend minted this slice (local file, single-GPU
+      // use_sirius_datasource=false): use cudf's bundled datasource (kvikio).
+      // Slices that carry an io_ctx (e.g. the shared s3_ioctx for s3://) fall
+      // through to the make_datasource path below even when kvikio_fallback_mode.
       sources.push_back(cudf::io::datasource::create(slice.file_path));
     } else {
       // Two-dimensional ioctx selection (multi-GPU #732 × multi-backend-S3).
