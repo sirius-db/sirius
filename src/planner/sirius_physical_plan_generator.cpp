@@ -294,10 +294,15 @@ void wrap_top_n(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
 //!   - ORDER_BY's `projections` is overwritten with the identity projection over the input's
 //!     types, and its `types` is replaced with the input's types — so the per-batch sort
 //!     keeps every column visible to SORT_SAMPLE / SORT_PARTITION.
-//!   - SORT_SAMPLE optionally receives `max_partition_bytes` from `op_params`.
+//!   - SORT_SAMPLE is constructed with the sample-sizing params from `op_params`
+//!     (`sort_sample_bytes`, `max_sort_partition_bytes`, `max_sort_partition_memory_fraction`).
 //!   - SORT_PARTITION's `set_sample_op` is wired to the SORT_SAMPLE just inserted.
 //!   - MERGE_SORT receives the original projection back via `set_final_projections` when the
 //!     original was non-identity (otherwise the chain already projects all columns).
+//!
+//! Post-#866/#876: SORT_SAMPLE has `is_sink()==false`, so under the tree-based build it lands
+//! in `operators[]` of the SORT_PARTITION pipeline (3-pipeline shape) — matching what
+//! `split_order_by_sink` produces on the legacy path.
 void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
                    const sirius::operator_params& op_params)
 {
@@ -319,11 +324,12 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
     order_ptr->projections = std::move(identity_proj);
     order_ptr->types       = child_types;
 
-    auto sample      = duckdb::make_uniq<sirius::op::sirius_physical_sort_sample>(order_ptr);
+    auto sample = duckdb::make_uniq<sirius::op::sirius_physical_sort_sample>(
+      order_ptr,
+      op_params.sort_sample_bytes,
+      op_params.max_sort_partition_bytes,
+      op_params.max_sort_partition_memory_fraction);
     auto* sample_ptr = sample.get();
-    if (op_params.max_sort_partition_bytes > 0) {
-      sample_ptr->set_max_partition_bytes(op_params.max_sort_partition_bytes);
-    }
     sample->children.push_back(std::move(order_op));
 
     auto partition = duckdb::make_uniq<sirius::op::sirius_physical_sort_partition>(order_ptr);

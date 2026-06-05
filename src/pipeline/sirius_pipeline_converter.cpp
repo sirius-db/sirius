@@ -1188,11 +1188,13 @@ op::MemoryBarrierType sirius_pipeline_converter::resolve_barrier(
   const op::sirius_physical_operator& sink, const sirius_pipeline& dest)
 {
   using T = op::SiriusPhysicalOperatorType;
-  // Sort/scan/sample sinks process batches as they arrive — no barrier required.
+  // Sort/scan sinks process batches as they arrive — no barrier required.
   // GPU_PARQUET_SCAN is intentionally excluded — legacy emits FULL/PARTIAL for it via
   // the catch-all branch in compute_repository_wiring, not PIPELINE.
-  if (sink.type == T::ORDER_BY || sink.type == T::SORT_SAMPLE || sink.type == T::DUCKDB_SCAN ||
-      sink.type == T::ICEBERG_SCAN || sink.type == T::CPU_SOURCE) {
+  // SORT_SAMPLE is no longer a pipeline sink (it runs as an intermediate operator in the
+  // SORT_PARTITION pipeline post-#866), so it's not listed here.
+  if (sink.type == T::ORDER_BY || sink.type == T::DUCKDB_SCAN || sink.type == T::ICEBERG_SCAN ||
+      sink.type == T::CPU_SOURCE) {
     return op::MemoryBarrierType::PIPELINE;
   }
   // Producers that feed CONCAT can drain incrementally (PARTIAL); otherwise wait
