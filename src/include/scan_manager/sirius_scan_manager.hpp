@@ -22,6 +22,7 @@
 #include "io/s3/s3_blocking_ioctx.hpp"
 #include "io/gpu_ingestible.hpp"
 #include "io/s3/s3_ioctx.hpp"
+#include "scan_manager/gpu_ingestible_factory.hpp"
 #include "scan_manager/split_provider.hpp"
 
 // Forward-declare sirius_ioctx via <io/types.hpp> for the gpu_ioctxs map type
@@ -381,35 +382,6 @@ class sirius_scan_manager {
   [[nodiscard]] parquet_bind_result describe_parquet(std::string const& uri);
 
  private:
-  /// \brief Build the gpu_ingestible for @p op.
-  ///
-  /// Steals the operator's parked table_info, tries the pinned-cache
-  /// short-circuit (parquet today), and otherwise dispatches through
-  /// @c io::make_gpu_ingestible. The returned ingestible is installed on
-  /// the operator by @c prepare_for_query before any split_provider drives
-  /// it.
-  ///
-  /// @param op                The scan operator.
-  /// @param gpu_ioctxs        Per-GPU sirius_ioctx map for multi-GPU IO routing.
-  /// @param gpu_memory_spaces device_id -> GPU memory_space lookup forwarded
-  ///                          to the HOST-tier cached_parquet_gpu_ingestible
-  ///                          for HOST->GPU materialization.
-  std::shared_ptr<io::gpu_ingestible> create_ingestible_for(
-    op::scan::sirius_gpu_scan_operator* op,
-    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs,
-    std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces);
-
-  /// \brief Build a cached_parquet_gpu_ingestible when a pinned entry matches
-  ///        the operator's file paths. Returns nullptr on miss. Peeks @p table_info
-  ///        (does not consume) for the match check; on a hit, steals it into
-  ///        the cached ingestible. Reads only the format-agnostic
-  ///        @c file_paths() span; the typed downcast to
-  ///        @c parquet_ingestible_table_info happens only after the match wins.
-  std::shared_ptr<io::gpu_ingestible> try_make_cached_ingestible(
-    std::unique_ptr<io::ingestible_table_info>& table_info,
-    std::size_t op_id,
-    std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces);
-
   /// \brief Run providers sequentially: start each, wait on its future, advance.
   void start_metadata_processing();
 
@@ -428,6 +400,11 @@ class sirius_scan_manager {
     _providers_by_op;
   std::vector<op::scan::sirius_gpu_scan_operator*> _scan_op_order;
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
+  /// Produces the right gpu_ingestible per scan source during
+  /// prepare_for_query. Holds a borrowed reference to @c _pinned_entries
+  /// — declared AFTER it so its constructor's reference is bound to a
+  /// fully-constructed member.
+  gpu_ingestible_factory _factory;
 };
 
 }  // namespace sirius::scan_manager
