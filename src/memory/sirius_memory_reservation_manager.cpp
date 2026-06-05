@@ -22,10 +22,13 @@
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_device.hpp>
+#include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime_api.h>
 
 #include <cucascade/memory/memory_reservation_manager.hpp>
+
+#include <memory>
 
 namespace sirius {
 namespace memory {
@@ -39,10 +42,22 @@ sirius_memory_reservation_manager::sirius_memory_reservation_manager(
     throw std::runtime_error("At least one GPU memory space must be configured");
   }
   for (const auto* space : gpu_spaces) {
+    int const dev        = space->get_device_id();
     auto const device_mr = space->get_default_allocator();
-    rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{space->get_device_id()}};
+    rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{dev}};
     prev_device_mrs_.push_back(cudf::get_current_device_resource_ref());
     cudf::set_current_device_resource_ref(device_mr);
+    // FIX: install a forwarding shim as the LEGACY current device resource. cuDF default
+    // allocations resolve through get_current_device_resource_ref, which (when no _ref is
+    // effective) wraps the legacy resource — so this routes them to the shim. The shim
+    // forwards to device_mr (== space->get_default_allocator()), which is cuCascade's
+    // reservation_aware_resource_adaptor. This preserves reservation/spill tracking AND
+    // keeps allocations stream-ordered (no raw, device-syncing cudaMalloc), because the
+    // adaptor's upstream is cuCascade's stream-ordered pool.
+    auto shim = std::make_unique<cucascade_forwarding_resource>(device_mr);
+    rmm::mr::device_memory_resource* prev_legacy = rmm::mr::set_current_device_resource(shim.get());
+    prev_legacy_mrs_.push_back({dev, prev_legacy});
+    legacy_forwarding_mrs_.push_back(std::move(shim));
   }
 }
 
@@ -54,17 +69,23 @@ sirius_memory_reservation_manager::~sirius_memory_reservation_manager()
   // resource that crashes subsequent allocations in other tests or code paths.
   //
   // Before restoring the device resource refs, drain each GPU so any pending
-  // stream-ordered frees (cudaFreeAsync) against the cuda_async_memory_resource
-  // pool we are about to destroy have completed. Without this drain, callers
-  // that leave async deallocations un-synchronized (e.g., a TEST_CASE that lets
-  // its cuda_stream + data_batches fall out of scope without an explicit sync)
-  // can corrupt the driver's per-device pool list, which then crashes the next
-  // sirius_memory_reservation_manager that constructs a fresh pool on the same
-  // device. The cost is a single device sync per managed GPU at teardown.
+  // stream-ordered frees forwarded through our shims to cuCascade's allocator
+  // have completed. Without this drain, callers that leave async deallocations
+  // un-synchronized (e.g., a TEST_CASE that lets its cuda_stream + data_batches
+  // fall out of scope without an explicit sync) can leave in-flight work
+  // referencing resources that are about to be torn down. The cost is a single
+  // device sync per managed GPU at teardown.
   for (std::size_t i = 0; i < gpu_spaces.size() && i < prev_device_mrs_.size(); ++i) {
     rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{gpu_spaces[i]->get_device_id()}};
     cudaDeviceSynchronize();
     cudf::set_current_device_resource_ref(prev_device_mrs_[i]);
+  }
+  // Restore the legacy current-device resource before our forwarding shims are destroyed
+  // (members destruct after this body), so nothing points at a freed resource.
+  for (auto const& [dev, prev_legacy] : prev_legacy_mrs_) {
+    rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{dev}};
+    cudaDeviceSynchronize();
+    if (prev_legacy) { rmm::mr::set_current_device_resource(prev_legacy); }
   }
 }
 
