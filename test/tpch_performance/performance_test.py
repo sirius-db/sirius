@@ -610,6 +610,10 @@ def run_nsys_profile(
                 "--stats=false",
                 "--export=sqlite",
                 DUCKDB_BIN,
+                # -unsigned mirrors the Python runner's allow_unsigned_extensions
+                # config (open_connection): without it, the DuckDB CLI rejects
+                # locally-built (unsigned) Sirius extensions.
+                "-unsigned",
                 "-f",
                 sql_path,
             ]
