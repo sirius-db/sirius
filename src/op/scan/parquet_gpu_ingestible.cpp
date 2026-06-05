@@ -274,6 +274,8 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
     split_info->reader_options          = std::move(shared_opts);
     split_info->plan                    = std::move(shared_plan);
     split_info->disable_filter_pushdown = skip_pushdown_due_to_flba;
+    split_info->needs_assembly          = needs_post_processing;
+    split_info->partition_values = accum.partition_values.value_or(std::vector<std::string>{});
     auto metadata = std::make_unique<io::scan_and_filter_metadata>(std::move(split_info),
                                                                    build_post_filter_info());
     out.push_back(std::make_unique<scan_operator_input>(std::move(metadata)));
@@ -518,9 +520,9 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
 }
 
 //===----------------------------------------------------------------------===//
-// materialize_table — ports read_table_from_metadata (minus assembly)
+// materialize_table — ports read_table_from_metadata
 //===----------------------------------------------------------------------===//
-std::unique_ptr<cudf::table> parquet_gpu_ingestible::materialize_table(
+io::filtered_table parquet_gpu_ingestible::materialize_table(
   io::scan_info const& info,
   ::cucascade::memory::memory_space const& mem_space,
   rmm::cuda_stream_view stream)
@@ -616,18 +618,35 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::materialize_table(
     table->num_rows(),
     table->num_columns());
 
-  // Post-decode filter when pushdown was not engaged. `sirius_filter_ast` must
+  // Determine filter state. When pushdown engaged the reader applied the
+  // filter; otherwise we apply post-decode here. `sirius_filter_ast` must
   // outlive `exec` — the executor only borrows the AST.
-  if (sirius_filter_ast && !ast_expression) {
-    sirius::gpu_expression_executor exec(
-      sirius_filter_ast.get(), cudf::get_current_device_resource_ref(), stream);
-    auto input = std::move(table);
-    table      = exec.select(input->view());
-    SIRIUS_LOG_DEBUG(
-      "[parquet_gpu_ingestible::materialize_table] Applied duckdb filter expression post-decode.");
+  io::filter_state state = io::filter_state::UNFILTERED;
+  if (sirius_filter_ast) {
+    if (!ast_expression) {
+      sirius::gpu_expression_executor exec(
+        sirius_filter_ast.get(), cudf::get_current_device_resource_ref(), stream);
+      auto input = std::move(table);
+      table      = exec.select(input->view());
+      SIRIUS_LOG_DEBUG(
+        "[parquet_gpu_ingestible::materialize_table] Applied duckdb filter expression "
+        "post-decode.");
+    }
+    state = io::filter_state::ROW_FILTERED;
   }
 
-  return std::move(table);
+  // Reader-side pushdown succeeded and the plan needs assembly — inline it
+  // here so the scan operator can skip post_filter_and_project entirely.
+  // (post-decode fallback keeps assembly external because re-allocating after
+  // exec.select is the same shape either way.)
+  if (state == io::filter_state::ROW_FILTERED && ast_expression && split.needs_assembly) {
+    table = assemble_scan_output(*_plan, std::move(table), split.partition_values, stream);
+    state = io::filter_state::ROW_FILTERED_AND_PROJECTED;
+    SIRIUS_LOG_DEBUG(
+      "[parquet_gpu_ingestible::materialize_table] Assembled inline on reader-side pushdown path.");
+  }
+
+  return io::filtered_table{std::move(table), state};
 }
 
 //===----------------------------------------------------------------------===//

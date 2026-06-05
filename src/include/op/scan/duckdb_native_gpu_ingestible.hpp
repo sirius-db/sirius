@@ -150,9 +150,9 @@ class duckdb_native_gpu_ingestible : public io::gpu_ingestible {
   [[nodiscard]] bool has_more_splits() const override;
   std::function<std::vector<std::unique_ptr<op::operator_data>>()> next_split_provider() override;
 
-  std::unique_ptr<cudf::table> materialize_table(io::scan_info const& info,
-                                                 ::cucascade::memory::memory_space const& mem_space,
-                                                 rmm::cuda_stream_view stream) override;
+  io::filtered_table materialize_table(io::scan_info const& info,
+                                       ::cucascade::memory::memory_space const& mem_space,
+                                       rmm::cuda_stream_view stream) override;
 
   std::unique_ptr<cudf::table> post_filter_and_project(
     std::unique_ptr<cudf::table> input,

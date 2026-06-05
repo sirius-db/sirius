@@ -199,7 +199,7 @@ std::shared_ptr<::cucascade::data_batch> pinned_table_gpu_ingestible::produce_ba
     _batches[batch_idx]);
 }
 
-std::unique_ptr<cudf::table> pinned_table_gpu_ingestible::materialize_table(
+io::filtered_table pinned_table_gpu_ingestible::materialize_table(
   io::scan_info const& /*info*/,
   ::cucascade::memory::memory_space const& /*mem_space*/,
   rmm::cuda_stream_view /*stream*/)

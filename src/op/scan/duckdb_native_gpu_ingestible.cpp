@@ -257,7 +257,7 @@ duckdb_native_gpu_ingestible::next_split_provider()
 //===----------------------------------------------------------------------===//
 // materialize_table
 //===----------------------------------------------------------------------===//
-std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::materialize_table(
+io::filtered_table duckdb_native_gpu_ingestible::materialize_table(
   io::scan_info const& info,
   ::cucascade::memory::memory_space const& mem_space,
   rmm::cuda_stream_view stream)
@@ -274,7 +274,9 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::materialize_table(
     split.payload.row_groups.size(),
     table->num_rows(),
     table->num_columns());
-  return table;
+  // duckdb-native applies filter + projection inside post_filter_and_project,
+  // never during materialization — always UNFILTERED here.
+  return io::filtered_table{std::move(table), io::filter_state::UNFILTERED};
 }
 
 //===----------------------------------------------------------------------===//

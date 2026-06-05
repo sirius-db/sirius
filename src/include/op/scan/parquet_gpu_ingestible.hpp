@@ -119,6 +119,15 @@ class parquet_split_info : public io::scan_info {
   /// row-group stats cudf cannot compare against an AST literal. The
   /// filter still applies post-decode via @c gpu_expression_executor.
   bool disable_filter_pushdown = false;
+  /// Hive partition values for this split, in @c scan_plan::partition_columns
+  /// order. Empty when the plan has no partition columns. Duplicated here
+  /// (also lives on @c parquet_post_filter_and_projection_info) so
+  /// @ref materialize_table can call @c assemble_scan_output inline on the
+  /// reader-side pushdown path and emit @c filter_state::ROW_FILTERED_AND_PROJECTED.
+  std::vector<std::string> partition_values;
+  /// Whether the scan plan needs post-decode assembly (hive partition
+  /// injection or column reordering). Mirrors @c needs_output_assembly(*plan).
+  bool needs_assembly = false;
 
   [[nodiscard]] std::size_t estimated_bytes() const noexcept override
   {
@@ -182,9 +191,9 @@ class parquet_gpu_ingestible : public io::gpu_ingestible {
   [[nodiscard]] bool has_more_splits() const override;
   std::function<std::vector<std::unique_ptr<op::operator_data>>()> next_split_provider() override;
 
-  std::unique_ptr<cudf::table> materialize_table(io::scan_info const& info,
-                                                 ::cucascade::memory::memory_space const& mem_space,
-                                                 rmm::cuda_stream_view stream) override;
+  io::filtered_table materialize_table(io::scan_info const& info,
+                                       ::cucascade::memory::memory_space const& mem_space,
+                                       rmm::cuda_stream_view stream) override;
 
   std::unique_ptr<cudf::table> post_filter_and_project(
     std::unique_ptr<cudf::table> input,

@@ -181,11 +181,13 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
         "[sirius_gpu_scan_operator::execute] fresh input missing gpu_memory_space; "
         "prepare_for_processing must run before execute().");
     }
-    auto const& md = *fresh->metadata;
-    table          = _ingestible->materialize_table(md.scan(), *fresh->gpu_memory_space, stream);
-    if (md.has_filter()) {
+    auto const& md    = *fresh->metadata;
+    auto materialized = _ingestible->materialize_table(md.scan(), *fresh->gpu_memory_space, stream);
+    if (md.has_filter() && materialized.state != io::filter_state::ROW_FILTERED_AND_PROJECTED) {
       table = _ingestible->post_filter_and_project(
-        std::move(table), md.filter_and_project(), *fresh->gpu_memory_space, stream);
+        std::move(materialized.table), md.filter_and_project(), *fresh->gpu_memory_space, stream);
+    } else {
+      table = std::move(materialized.table);
     }
     mem_space = fresh->gpu_memory_space;
   } else if (auto const* pinned =
