@@ -41,6 +41,7 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Optimizations](optimizations.md) | Performance optimizations with PRs, code paths, configs |
 | [Multi-GPU Architecture](multi-gpu-architecture.md) | How Sirius executes SQL across every GPU on a node — tiers, pin tables, SCHED-RR, cross-GPU transfers, downgrade, concurrency invariants |
 | [Dynamic Filters](dynamic-filters.md) | Framework for runtime-computed filter predicates: zone maps, bloom filters, SIP, adaptive pushdown |
+| [Debugging](debugging.md) | Practical guide to debugging crashes and races — building/running with ASan & TSan, the `tsan.supp` file, and capturing/inspecting core dumps with gdb |
 
 ## Suggested Reading Order
 

@@ -19,7 +19,7 @@ MAIN_BUILD_TARGETS ?= duckdb duckdb_local_extension_repo
 
 .PHONY: all release debug reldebug relwithdebinfo debug-release \
 	legacy-release \
-	clang-release clang-debug clang-relwithdebinfo \
+	clang-release clang-debug clang-relwithdebinfo clang-asan clang-tsan \
 	ci-release configure_ci set_duckdb_version \
 	test test_release test_debug test_reldebug test_ci-release clean list-presets \
 	s3-up s3-up-large s3-down s3-test s3-test-large \
@@ -81,6 +81,26 @@ clang-relwithdebinfo: build/clang-relwithdebinfo/build.ninja
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-relwithdebinfo --target $(MAIN_BUILD_TARGETS)
 ifneq ($(TEST_BUILD_TARGET),)
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-relwithdebinfo --target $(TEST_BUILD_TARGET)
+endif
+
+# AddressSanitizer build (RelWithDebInfo + clang). Run inside `pixi shell` (so
+# llvm-symbolizer is auto-detected on PATH) with:
+#   ASAN_OPTIONS="protect_shadow_gap=0:detect_leaks=0:halt_on_error=0:abort_on_error=1" \
+#     ./build/clang-asan/extension/sirius/test/cpp/sirius_unittest
+clang-asan: build/clang-asan/build.ninja
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-asan --target $(MAIN_BUILD_TARGETS)
+ifneq ($(TEST_BUILD_TARGET),)
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-asan --target $(TEST_BUILD_TARGET)
+endif
+
+# ThreadSanitizer build (RelWithDebInfo + clang). Run inside `pixi shell` (so
+# llvm-symbolizer is auto-detected on PATH) with:
+#   TSAN_OPTIONS="suppressions=$$PWD/tsan.supp:ignore_noninstrumented_modules=1:halt_on_error=0:history_size=7:detect_deadlocks=0" \
+#     ./build/clang-tsan/extension/sirius/test/cpp/sirius_unittest
+clang-tsan: build/clang-tsan/build.ninja
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-tsan --target $(MAIN_BUILD_TARGETS)
+ifneq ($(TEST_BUILD_TARGET),)
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-tsan --target $(TEST_BUILD_TARGET)
 endif
 
 ci-release: build/ci-release/build.ninja

@@ -33,6 +33,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <cctype>
 #include <csignal>
 #include <cstring>
 #include <memory>
@@ -179,8 +180,38 @@ static void segfault_handler(int sig)
 
 }  // namespace
 
+// Returns true for "1", "true", "yes", "on" (case-insensitive). Used to let
+// developers opt out of the crash handler so the OS can write a core dump.
+static bool env_flag_enabled(const char* name)
+{
+  const char* v = std::getenv(name);
+  if (v == nullptr || v[0] == '\0') { return false; }
+  if (std::strcmp(v, "1") == 0) { return true; }
+  auto ieq = [](const char* a, const char* b) {
+    for (; *a && *b; ++a, ++b) {
+      if (std::tolower(static_cast<unsigned char>(*a)) !=
+          std::tolower(static_cast<unsigned char>(*b))) {
+        return false;
+      }
+    }
+    return *a == *b;
+  };
+  return ieq(v, "true") || ieq(v, "yes") || ieq(v, "on");
+}
+
 void install_segfault_backtrace_handler()
 {
+  // Escape hatch: when DISABLE_SIRIUS_SIGNAL_HANDLER is set, do NOT install the
+  // handler. The handler calls _exit(1) on a crash, which prevents the OS from
+  // writing a core dump; leaving it uninstalled lets the default disposition
+  // produce a core (with `ulimit -c unlimited`). See docs/super-sirius/debugging.md.
+  if (env_flag_enabled("DISABLE_SIRIUS_SIGNAL_HANDLER")) {
+    spdlog::warn(
+      "Sirius crash backtrace handler DISABLED via DISABLE_SIRIUS_SIGNAL_HANDLER — "
+      "the OS default disposition is in effect (core dumps enabled if `ulimit -c` allows)");
+    return;
+  }
+
   const char* log_dir = std::getenv("SIRIUS_LOG_DIR");
   if (log_dir != nullptr) {
     size_t dlen = strlen(log_dir);

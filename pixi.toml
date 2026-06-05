@@ -25,6 +25,9 @@ wget = "*"
 pre-commit = "*"
 identify = ">=2.6"
 clang-tools = "21.*"
+# Provides llvm-symbolizer (and friends) matching the clang version above, so
+# ASan/TSan reports are symbolized. Kept in lockstep with `clang` at 21.*.
+llvm-tools = "21.*"
 pkg-config = "*"
 mold = "*"
 libprotobuf = "*"
