@@ -16,7 +16,7 @@
 
 #include "catch.hpp"
 #include "io/prefetching_cache.hpp"
-#include "io/s3/s3_blocking_ioctx.hpp"
+#include "io/s3/s3_ioctx.hpp"
 #include "io/s3/s3_request_authorizer.hpp"
 #include "io/s3/sirius_sigv4_authorizer.hpp"
 
@@ -48,8 +48,7 @@
 
 using sirius::io::buffer_pool;
 using sirius::io::s3::s3_authorized_request;
-using sirius::io::s3::s3_blocking_ioctx;
-using sirius::io::s3::s3_ioctx_config;
+using sirius::io::s3::s3_ioctx;
 using sirius::io::s3::s3_object_ref;
 using sirius::io::s3::s3_request_authorizer;
 using sirius::io::s3::s3_request_method;
@@ -147,14 +146,16 @@ class recording_request_authorizer final : public s3_request_authorizer {
   std::atomic<std::uint64_t> _get_count{0};
 };
 
-std::shared_ptr<s3_blocking_ioctx> make_bench_ioctx(
-  std::shared_ptr<recording_request_authorizer> provider)
+std::shared_ptr<s3_ioctx> make_bench_ioctx(
+  std::shared_ptr<recording_request_authorizer> provider,
+  cucascade::memory::fixed_size_host_memory_resource& host_mr)
 {
-  s3_ioctx_config cfg{};
-  cfg.creds             = std::move(provider);
-  cfg.max_connections   = 32;
-  cfg.request_timeout_s = 600;
-  return std::make_shared<s3_blocking_ioctx>(std::move(cfg));
+  return std::make_shared<s3_ioctx>(std::move(provider),
+                                    /*request_timeout_s=*/600L,
+                                    std::string{},
+                                    true,
+                                    /*max_connections=*/32,
+                                    &host_mr);
 }
 
 std::size_t cache_capacity_bytes(std::size_t block_size, std::uint32_t max_slabs)
@@ -207,7 +208,7 @@ std::unique_ptr<cudf::io::datasource::buffer> read_parquet_footer(cudf::io::data
   return source.host_read(file_size - footer_tail_size - footer_size, footer_size);
 }
 
-scan_measurement run_parquet_scan(s3_blocking_ioctx& ctx,
+scan_measurement run_parquet_scan(s3_ioctx& ctx,
                                   std::string const& path,
                                   std::vector<std::string> const& columns)
 {
@@ -361,8 +362,21 @@ TEST_CASE("S3 parquet perf benchmark emits portable JSON baseline", "[!benchmark
   }
 
   auto provider = std::make_shared<recording_request_authorizer>(*env);
-  auto ctx      = make_bench_ioctx(provider);
-  auto path     = s3_uri(*env);
+  // The async backend stages device reads through a host MR (the blocking
+  // backend reads host-side and needs none). Provide a dedicated CHUNK_SIZE
+  // (1 MiB) block host MR with headroom for the in-flight bounce buffers.
+  cucascade::memory::numa_region_pinned_host_memory_resource async_upstream(0, true);
+  std::size_t const async_capacity = cache_capacity_bytes(bench_cache_memory::block_size, 8);
+  cucascade::memory::fixed_size_host_memory_resource async_host_mr(
+    0,
+    async_upstream,
+    async_capacity,
+    async_capacity,
+    bench_cache_memory::block_size,
+    static_cast<std::size_t>(buffer_pool::CHUNKS_PER_SLAB),
+    1);
+  auto ctx  = make_bench_ioctx(provider, async_host_mr);
+  auto path = s3_uri(*env);
 
   std::uint64_t dataset_bytes = 0;
   try {
