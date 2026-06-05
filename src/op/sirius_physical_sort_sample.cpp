@@ -46,8 +46,10 @@ bool repo_has_enough_sample_bytes(::cucascade::shared_data_repository* repo,
                                   uint64_t sort_sample_bytes,
                                   bool upstream_finished)
 {
-  if (!repo || repo->total_size() == 0) { return false; }
+  if (!repo) { return false; }
+  // Upstream done with no rows still needs a READY signal so the pipeline can drain.
   if (upstream_finished) { return true; }
+  if (repo->total_size() == 0) { return false; }
 
   uint64_t accumulated = 0;
   for (size_t part = 0; part < repo->num_partitions(); ++part) {

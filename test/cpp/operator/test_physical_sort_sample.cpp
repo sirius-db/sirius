@@ -187,6 +187,27 @@ TEST_CASE("sirius_physical_sort_sample get_next_task_hint waits for sample bytes
   REQUIRE(ready_hint->producer == &sample_op);
 }
 
+TEST_CASE("sirius_physical_sort_sample is ready when upstream finished with empty repo",
+          "[physical_sort_sample]")
+{
+  auto sample_op = make_sort_sample(100000);
+  auto repo      = std::make_unique<cucascade::shared_data_repository>();
+
+  const sirius::pipeline::pipeline_build_context build_ctx{true};
+  auto src_pipeline = duckdb::make_shared_ptr<mock_gpu_pipeline>(build_ctx);
+  src_pipeline->set_finished(true);
+  attach_port(sample_op, *repo, src_pipeline);
+
+  // Upstream finished but produced no batches — must not block waiting for sample bytes.
+  auto hint = sample_op.get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::READY);
+  REQUIRE(hint->producer == &sample_op);
+
+  // No batches to pull; execute() should still be able to mark boundaries done.
+  REQUIRE(sample_op.get_next_task_input_data() == nullptr);
+}
+
 TEST_CASE(
   "sirius_physical_sort_sample pulls all remaining data when upstream finished below threshold",
   "[physical_sort_sample]")
