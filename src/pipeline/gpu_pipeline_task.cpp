@@ -386,6 +386,9 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
 
   try {
     local_state._input_data->prepare_for_processing(requested_memory_space, stream);
+    // synchronizing here to ensure the timing collected by Quent and logging for preparing the task
+    // is accurate.
+    stream.synchronize();
   } catch (const rmm::out_of_memory& oom) {
     auto peak_bytes  = allocator->get_peak_allocated_bytes(stream);
     auto input_basis = local_state.get_reservation_size_info()->input_basis;
