@@ -208,7 +208,7 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
         "[sirius_gpu_scan_operator::execute] pinned batch has no memory_space; "
         "prepare_for_processing must have produced a GPU-resident batch.");
     }
-    auto& gpu_rep = ro_batch.get_data()->cast<::cucascade::gpu_table_representation>();
+    auto& gpu_rep     = ro_batch.get_data()->cast<::cucascade::gpu_table_representation>();
     auto owning_input = gpu_rep.release_table(stream);
 
     table = _ingestible->post_filter_and_project(
