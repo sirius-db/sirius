@@ -64,6 +64,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace sirius::pipeline {
@@ -1402,6 +1403,31 @@ void sirius_pipeline_converter::compute_repository_wiring_tree_based(
     // Uniform tree-parent lookup for everything else.
     auto* parent_op = sink_op->get_parent_op();
     if (!parent_op) { continue; }
+
+    // B.7 (#604): when sink_op is the `delim.join` of a RIGHT_DELIM_JOIN, the
+    // legacy split_delim_join_sink wires the inner join out to the next HJ
+    // above the RDJ (via the legacy-constructed external partition_join), not
+    // to the RDJ itself. Mirror that: redirect to the RDJ's tree parent so
+    // the inner HJ skips over the RDJ. Without this, both `RDJ.children[0]`'s
+    // root HJ AND `RDJ.delim.join` resolve to the same RDJ pipeline, and the
+    // RDJ-sink emission's CONCAT fallback (line 1300) closes a cycle back
+    // through the inner HJ's own build CONCAT.
+    if ((parent_op->type == T::RIGHT_DELIM_JOIN) &&
+        parent_op->Cast<op::sirius_physical_delim_join>().join.get() == sink_op) {
+      auto* grand = parent_op->get_parent_op();
+      if (grand) {
+        auto it_gp = dest_for_op.find(grand);
+        if (it_gp != dest_for_op.end()) {
+          emit(resolve_port_id(*sink_op, *grand),
+               resolve_barrier(*sink_op, *it_gp->second),
+               sink_op,
+               pipeline,
+               it_gp->second);
+          continue;
+        }
+      }
+    }
+
     auto it = dest_for_op.find(parent_op);
     if (it == dest_for_op.end()) { continue; }
 
@@ -1717,16 +1743,25 @@ std::string dump_pipeline_conversion_result(const pipeline_conversion_result& re
   // same set of consumers reach the same signature. Memoized; assumes acyclic graph
   // (TPC-H plans are DAGs).
   std::unordered_map<const sirius_pipeline*, std::string> sig_cache;
+  // Defensive cycle guard: if the wiring graph ever contains a cycle, compute_sig
+  // would otherwise infinite-recurse. Returning "CYCLE" on re-entry keeps the dump
+  // function safe; the underlying bug surfaces as a dump mismatch which is easier
+  // to triage than a hang. TPC-H plans are DAGs in correct converter output, so
+  // this guard should never fire in green CI.
+  std::unordered_set<const sirius_pipeline*> sig_visiting;
   std::function<std::string(const sirius_pipeline*)> compute_sig =
     [&](const sirius_pipeline* p) -> std::string {
     auto it = sig_cache.find(p);
     if (it != sig_cache.end()) { return it->second; }
+    if (sig_visiting.count(p)) { return "CYCLE"; }
+    sig_visiting.insert(p);
     std::vector<std::string> down;
     for (const auto& w : result.repository_wirings) {
       if (w.source_pipeline.get() == p) {
         down.push_back(std::string{w.port_id} + ":" + compute_sig(w.dest_pipeline.get()));
       }
     }
+    sig_visiting.erase(p);
     std::sort(down.begin(), down.end());
     std::string s = local_sig(p);
     for (const auto& d : down) {

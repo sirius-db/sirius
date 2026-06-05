@@ -204,8 +204,35 @@ void sirius_physical_right_delim_join::build_pipelines(
   // via the legacy converter's runtime partition_join construction. Under
   // flag OFF, build_rhs=false preserves today's behavior (legacy converter
   // builds partition_join at runtime).
-  sirius_physical_hash_join::build_join_pipelines(
-    current, meta_pipeline, *join, duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD);
+  //
+  // B.7 (#604): in a nested RIGHT_DELIM_JOIN plan (e.g. q21 parquet), the
+  // inner RDJ's build_pipelines is called with `current` already containing
+  // the outer RDJ as its pre-populated sink. Routing *join (inner HJ) through
+  // the standard build_join_pipelines path would add it to that same pipeline,
+  // fusing source:HJ,sink:RDJ instead of producing two standalone pipelines.
+  // Mirror legacy's split_delim_join_sink (converter.cpp:912): when `current`'s
+  // sink is a barrier op (RIGHT_DELIM_JOIN or PARTITION), route *join into its
+  // own standalone child meta pipeline instead. INNER_HJ fusing with other op
+  // types (PROJECTION, FILTER, etc.) is correct and does not trigger the split.
+  auto current_ops = current.get_operators();
+  const bool needs_split =
+    duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD && !current_ops.empty() &&
+    (current_ops.front().get().type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN ||
+     current_ops.front().get().type == SiriusPhysicalOperatorType::PARTITION);
+
+  if (needs_split) {
+    auto& join_meta = meta_pipeline.create_child_meta_pipeline(current, *join);
+    auto& join_base = *join_meta.get_base_pipeline();
+    // create_child_meta_pipeline pre-populates join_base.operators=[join] (USE_TREE path).
+    // Clear it so build_join_pipelines re-adds join via add_pipeline_operator in the
+    // correct join_meta context — probe/build recursion then stays inside join_meta.
+    meta_pipeline.get_state().set_pipeline_operators(join_base, {});
+    sirius_physical_hash_join::build_join_pipelines(
+      join_base, join_meta, *join, duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD);
+  } else {
+    sirius_physical_hash_join::build_join_pipelines(
+      current, meta_pipeline, *join, duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD);
+  }
 
   if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD && distinct_root) {
     // Phase 3.2 (#604): spawn a child meta_pipeline rooted at the distinct chain.

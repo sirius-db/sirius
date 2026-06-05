@@ -82,16 +82,14 @@ TEST_CASE("TPC-H SF1 parquet: legacy and tree-based converters produce identical
 
   sirius::test::tree_pipeline_flag_guard flag_guard;
 
-  // q21: under the parquet plan shape, legacy's `split_delim_join_sink`
-  // (sirius_pipeline_converter.cpp:911) splits the inner HJ of q21's chained
-  // RIGHT_DELIM_JOINs into its own single-op pipeline before the delim sink,
-  // while tree fuses the inner HJ with the delim sink. The decision site for
-  // tree is `build_join_pipelines`'s unconditional `state.add_pipeline_operator`
-  // — not `HJ::is_sink`, which is bypassed for the inner HJ of a delim. The
-  // DuckDB-attached gate clears q21 because its plan shape lands the inner HJ
-  // as a pipeline source (operators empty), where legacy's breaker condition
-  // (`operators.size() > 0`) doesn't fire. Tracked as a Phase 3 follow-up.
-  static const std::set<int> kKnownFailing = {21};
+  // q21 (fixed by B.7 #604): under the parquet plan shape, the inner RDJ's
+  // build_pipelines was called with `current` pre-populated with the outer RDJ
+  // as its sink, causing build_join_pipelines to fuse the inner HJ with the
+  // outer RDJ (source:HJ,sink:RDJ). Fixed by checking `current`'s sink type
+  // in sirius_physical_right_delim_join::build_pipelines — when the sink is a
+  // RIGHT_DELIM_JOIN or PARTITION (barrier ops), the inner HJ is routed into
+  // its own standalone child meta pipeline instead, matching legacy's output.
+  static const std::set<int> kKnownFailing = {};
 
   for (int q = 1; q <= 22; ++q) {
     if (kKnownFailing.count(q) != 0) { continue; }
