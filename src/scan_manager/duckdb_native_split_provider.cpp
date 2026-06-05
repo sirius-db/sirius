@@ -17,88 +17,36 @@
 #include "scan_manager/duckdb_native_split_provider.hpp"
 
 #include "io/io_context.hpp"
-#include "io/types.hpp"
-#include "log/logging.hpp"
 
+#include <algorithm>
+#include <cstddef>
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
 #include <utility>
-
-// Work placement note: diverges from `parquet_split_provider`. For parquet a
-// scan-manager worker thread parses metadata and emits splits, because each
-// parquet file means real IO. For duckdb-native the metadata is already in
-// memory, so the walker + batch partitioning runs here in the ctor on the
-// query-executor thread; worker threads only claim pre-built batches.
 
 namespace sirius::scan_manager {
 
 namespace {
 
-std::vector<duckdb_native_split_provider::row_group_batch> partition_row_groups_into_batches(
-  const std::vector<op::scan::duckdb_row_group_metadata>& row_groups,
-  std::size_t approximate_batch_size,
-  const std::vector<sirius::logical_type>& projected_types)
+// Row groups per parse range. Smaller ranges balance load and keep the read
+// queue full across the worker pool; larger ranges cut per-range dispatch
+// overhead. Overridable via SIRIUS_METADATA_PARSE_CHUNK for tuning.
+// A `parse range` (row group range) is the unit of work for a scan manager thread
+// providing splits.
+constexpr std::size_t kDefaultParseChunkRowGroups = 8;
+
+std::size_t parse_chunk_row_groups()
 {
-  std::vector<duckdb_native_split_provider::row_group_batch> batches;
-  if (row_groups.empty()) return batches;
-
-  const std::size_t num_cols = projected_types.size();
-  std::vector<bool> is_varchar(num_cols, false);
-  bool any_varchar = false;
-  for (std::size_t c = 0; c < num_cols; ++c) {
-    is_varchar[c] = projected_types[c].is_varchar();
-    any_varchar   = any_varchar || is_varchar[c];
-  }
-
-  // No caps in play → single batch.
-  if (approximate_batch_size == 0 && !any_varchar) {
-    batches.push_back({0, row_groups.size()});
-    return batches;
-  }
-
-  std::size_t batch_first = 0;
-  std::size_t batch_bytes = 0;
-  std::vector<std::size_t> col_bytes(num_cols, 0);
-
-  for (std::size_t i = 0; i < row_groups.size(); ++i) {
-    const auto& rg                  = row_groups[i];
-    const std::size_t this_rg_bytes = rg.decoded_bytes_budget;
-
-    // Only close a non-empty batch; an over-cap row group always lands in
-    // the current batch as its first member (singleton if it's alone).
-    if (i > batch_first) {
-      const bool would_exceed_total =
-        (approximate_batch_size > 0) && (batch_bytes + this_rg_bytes > approximate_batch_size);
-
-      bool would_exceed_varchar = false;
-      if (any_varchar) {
-        for (std::size_t c = 0; c < num_cols; ++c) {
-          if (is_varchar[c] &&
-              col_bytes[c] + rg.varchar_bytes_per_col[c] >= op::scan::kCudfInt32StringsThreshold) {
-            would_exceed_varchar = true;
-            break;
-          }
-        }
-      }
-
-      if (would_exceed_total || would_exceed_varchar) {
-        batches.push_back({batch_first, i - batch_first});
-        batch_first = i;
-        batch_bytes = 0;
-        std::fill(col_bytes.begin(), col_bytes.end(), 0);
-      }
-    }
-
-    batch_bytes += this_rg_bytes;
-    if (any_varchar) {
-      for (std::size_t c = 0; c < num_cols; ++c) {
-        col_bytes[c] += rg.varchar_bytes_per_col[c];
-      }
+  if (char const* env = std::getenv("SIRIUS_METADATA_PARSE_CHUNK")) {
+    try {
+      auto const v = std::stoull(env);
+      if (v > 0) { return static_cast<std::size_t>(v); }
+    } catch (...) {
+      // Unparsable value → fall through to the default.
     }
   }
-  if (batch_first < row_groups.size()) {
-    batches.push_back({batch_first, row_groups.size() - batch_first});
-  }
-  return batches;
+  return kDefaultParseChunkRowGroups;
 }
 
 }  // namespace
@@ -118,57 +66,72 @@ duckdb_native_split_provider::duckdb_native_split_provider(
     throw std::invalid_argument(
       "duckdb_native_split_provider: projected_cols and projected_types must be parallel");
   }
+  if (_io_ctx == nullptr) {
+    throw std::invalid_argument("duckdb_native_split_provider: io_ctx must be non-null");
+  }
+  if (_scan_info->db_path.empty()) {
+    throw std::invalid_argument(
+      "duckdb_native_split_provider: scan_info.db_path must be non-empty");
+  }
 
-  _metadata = op::scan::walk_duckdb_native_metadata(*_scan_info->storage,
-                                                    *_scan_info->context,
-                                                    _scan_info->projected_cols,
-                                                    _scan_info->projected_types);
-  if (!_metadata.viable) {
-    // Empty splits would hang the pipeline on the FULL barrier. The throw
-    // surfaces as a query error and the extension's transparent fallback
-    // routes to DuckDB CPU.
-    SPDLOG_DEBUG("[duckdb_native_split_provider] non-viable: {}",
-                 _metadata.viability_failure_reason);
+  _plan = op::scan::prepare_duckdb_native_walk(*_scan_info->storage,
+                                               *_scan_info->context,
+                                               _scan_info->projected_cols,
+                                               _scan_info->projected_types);
+  if (!_plan.viable) {
+    SPDLOG_DEBUG("[duckdb_native_split_provider] non-viable: {}", _plan.viability_failure_reason);
     throw std::runtime_error("duckdb-native scan rejected query: " +
-                             _metadata.viability_failure_reason);
+                             _plan.viability_failure_reason);
+  }
+  if (_plan.n_row_groups == 0) {
+    // Zero ranges would close the connector empty; keep the historical refuse so
+    // an empty/unreadable table routes to DuckDB CPU.
+    throw std::runtime_error("duckdb-native scan rejected query: no row groups in table");
   }
 
-  // Mint the .db io_object once per query when the manager exposes sirius_ioctx.
-  // The scan task threads this onto every split so reads of .db blocks go through
-  // sirius_ioctx::host_read instead of DuckDB's BufferManager.
-  if (_io_ctx && !_scan_info->db_path.empty()) {
-    _db_io_object = _io_ctx->create_io_object(_scan_info->db_path);
-  }
+  // Mint the .db io_object once per query; the scan task threads it onto every
+  // split so reads of .db blocks go through sirius_ioctx::host_read.
+  _db_io_object = _io_ctx->create_io_object(_scan_info->db_path);
 
-  _batches = partition_row_groups_into_batches(
-    _metadata.row_groups, _scan_info->approximate_batch_size, _scan_info->projected_types);
+  _chunk_row_groups = parse_chunk_row_groups();
+  _num_ranges       = (_plan.n_row_groups + _chunk_row_groups - 1) / _chunk_row_groups;
 }
 
 duckdb_native_split_provider::~duckdb_native_split_provider() = default;
 
 bool duckdb_native_split_provider::has_more_splits() const
 {
-  return _next_batch_idx.load(std::memory_order_relaxed) < _batches.size();
+  return _next_range_idx.load(std::memory_order_relaxed) < _num_ranges;
 }
 
 std::function<std::vector<std::unique_ptr<op::operator_data>>()>
 duckdb_native_split_provider::next_split_provider()
 {
-  std::size_t idx = _next_batch_idx.fetch_add(1, std::memory_order_relaxed);
-  if (idx >= _batches.size()) { return {}; }
+  auto const idx = _next_range_idx.fetch_add(1, std::memory_order_relaxed);
+  if (idx >= _num_ranges) { return {}; }
 
-  row_group_batch batch = _batches[idx];
-  // `_metadata.row_groups[i]` is moved out — batches are disjoint and each
-  // batch is claimed exactly once, so the source entry is never read again.
-  return [this, batch]() -> std::vector<std::unique_ptr<op::operator_data>> {
+  auto const rg_begin = idx * _chunk_row_groups;
+  auto const rg_end   = std::min(rg_begin + _chunk_row_groups, _plan.n_row_groups);
+
+  // The walk reads `_plan` (const after the ctor) and builds its own
+  // QueryContext, so disjoint ranges run concurrently on the worker pool. The
+  // provider outlives every thunk it hands out (split_provider contract).
+  return [this, rg_begin, rg_end]() -> std::vector<std::unique_ptr<op::operator_data>> {
+    auto range = op::scan::walk_duckdb_native_row_group_range(_plan, rg_begin, rg_end);
+    if (!range.viable) {
+      // Rides the worker_state -> connector.close(eptr) channel; the scan
+      // operator rethrows it. Compression-unsupported is a hard error for now;
+      // type-based fallback was already handled by the ctor's prepare step.
+      throw std::runtime_error("duckdb-native scan rejected query: " +
+                               range.viability_failure_reason);
+    }
+
     auto payload          = std::make_unique<split_payload>();
     payload->scan_info    = _scan_info;
     payload->io_ctx       = _io_ctx;
     payload->db_io_object = _db_io_object;
-    payload->row_groups.reserve(batch.count);
-    for (std::size_t i = batch.first_idx; i < batch.first_idx + batch.count; ++i) {
-      payload->row_groups.push_back(std::move(_metadata.row_groups[i]));
-    }
+    payload->row_groups   = std::move(range.row_groups);
+
     std::vector<std::unique_ptr<op::operator_data>> out;
     out.push_back(std::move(payload));
     return out;

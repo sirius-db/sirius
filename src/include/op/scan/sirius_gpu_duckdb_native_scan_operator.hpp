@@ -28,7 +28,14 @@ class split_connector;
 class sirius_scan_manager;
 }  // namespace sirius::scan_manager
 
+namespace sirius::io {
+class sirius_ioctx;
+class sirius_io_object;
+}  // namespace sirius::io
+
 namespace sirius::op::scan {
+
+class batch_coalescer;
 
 //===----------------------------------------------------------------------===//
 // GPU-native DuckDB scan operator.
@@ -72,6 +79,18 @@ class sirius_gpu_duckdb_native_scan_operator : public sirius_physical_operator {
 
   std::unique_ptr<scan_manager::split_connector> _split_connector;
   std::unique_ptr<duckdb_native_scan_info> _scan_info;
+
+  // Consumer-side coalescing of the parallel walk's per-range row groups into
+  // cap-sized batches (exactly one tail batch per scan). Lazily created on the
+  // first pulled split — by then scan_info has been moved to the split provider,
+  // so the batch caps and projected types are read off the pulled payloads, and
+  // the shared scan_info / io handles are captured to rebuild coalesced payloads.
+  // Reset per query in set_split_connector. The task creator drives a single
+  // self-perpetuating worker per scan operator, so this state needs no lock.
+  std::unique_ptr<batch_coalescer> _coalescer;
+  std::shared_ptr<duckdb_native_scan_info const> _batch_scan_info;
+  std::shared_ptr<sirius::io::sirius_ioctx> _batch_io_ctx;
+  std::shared_ptr<sirius::io::sirius_io_object> _batch_db_io_object;
 };
 
 }  // namespace sirius::op::scan

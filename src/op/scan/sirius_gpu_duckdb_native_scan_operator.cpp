@@ -23,6 +23,7 @@
 #include <expression/ast/from_duckdb.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <log/logging.hpp>
+#include <op/scan/duckdb_native_batch_coalescer.hpp>
 #include <op/scan/duckdb_native_decoder.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_duckdb_native_scan_operator.hpp>
@@ -57,6 +58,11 @@ void sirius_gpu_duckdb_native_scan_operator::set_split_connector(
   std::unique_ptr<scan_manager::split_connector> connector)
 {
   _split_connector = std::move(connector);
+  // Fresh connector → fresh coalescer state for this query.
+  _coalescer.reset();
+  _batch_scan_info.reset();
+  _batch_io_ctx.reset();
+  _batch_db_io_object.reset();
 }
 
 std::optional<task_creation_hint> sirius_gpu_duckdb_native_scan_operator::get_next_task_hint()
@@ -72,9 +78,56 @@ bool sirius_gpu_duckdb_native_scan_operator::all_ports_empty()
 
 std::unique_ptr<operator_data> sirius_gpu_duckdb_native_scan_operator::get_next_task_input_data()
 {
-  auto next = _split_connector->get_next_split();
-  if (!next.has_value()) { return nullptr; }
-  return std::move(*next);
+  // The split provider's worker threads parse row-group *ranges* in parallel and
+  // push them (out of order) as raw split_payloads. We coalesce those into
+  // cap-sized batches here, on the single consumer the task creator drives, so
+  // there is exactly one undersized tail batch per scan. get_next_split() blocks
+  // when no range is ready yet, providing natural back-pressure-free waiting.
+  auto make_batch =
+    [this](std::vector<duckdb_row_group_metadata> row_groups) -> std::unique_ptr<operator_data> {
+    auto payload = std::make_unique<scan_manager::duckdb_native_split_provider::split_payload>();
+    payload->scan_info    = _batch_scan_info;
+    payload->io_ctx       = _batch_io_ctx;
+    payload->db_io_object = _batch_db_io_object;
+    payload->row_groups   = std::move(row_groups);
+    return payload;
+  };
+
+  for (;;) {
+    if (_coalescer && _coalescer->has_ready()) { return make_batch(_coalescer->pop_ready()); }
+
+    auto next = _split_connector->get_next_split();
+    if (!next.has_value()) {
+      // Producer closed and drained: emit the single tail batch, if any remains.
+      if (_coalescer) {
+        auto tail = _coalescer->flush();
+        if (!tail.empty()) { return make_batch(std::move(tail)); }
+      }
+      return nullptr;
+    }
+
+    auto* slice =
+      dynamic_cast<scan_manager::duckdb_native_split_provider::split_payload*>(next->get());
+    if (slice == nullptr) {
+      throw std::runtime_error(
+        "[sirius_gpu_duckdb_native_scan_operator] get_next_task_input_data: unexpected "
+        "operator_data type from split connector; expected split_payload.");
+    }
+
+    if (!_coalescer) {
+      // First range: capture the shared scan_info / io handles (identical across
+      // ranges) and size the coalescer from the scan's batch caps + types.
+      _batch_scan_info    = slice->scan_info;
+      _batch_io_ctx       = slice->io_ctx;
+      _batch_db_io_object = slice->db_io_object;
+      _coalescer = std::make_unique<batch_coalescer>(slice->scan_info->approximate_batch_size,
+                                                     slice->scan_info->projected_types);
+    }
+
+    for (auto& rg : slice->row_groups) {
+      _coalescer->push(std::move(rg));
+    }
+  }
 }
 
 std::unique_ptr<operator_data> sirius_gpu_duckdb_native_scan_operator::execute(

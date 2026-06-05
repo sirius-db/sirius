@@ -39,21 +39,16 @@ class duckdb_native_split_provider : public split_provider {
   struct split_payload : public op::operator_data {
     std::vector<op::scan::duckdb_row_group_metadata> row_groups;
     std::shared_ptr<op::scan::duckdb_native_scan_info const> scan_info;
-    /// sirius_io substrate handles. Set by the regular (non-cached) split path so
-    /// the scan task can read .db blocks via sirius_ioctx::host_read instead of
-    /// going through DuckDB's BufferManager. Both null when the scan_manager
-    /// was configured with use_sirius_datasource=false (falls back to BufferManager).
+    /// sirius_io substrate handles for reading .db blocks via
+    /// sirius_ioctx. Always non-null (the provider requires a
+    /// non-null io_ctx); the scan task threads them onto every
+    // decode.
     std::shared_ptr<sirius::io::sirius_ioctx> io_ctx;
     std::shared_ptr<sirius::io::sirius_io_object> db_io_object;
   };
 
-  struct row_group_batch {
-    std::size_t first_idx;
-    std::size_t count;
-  };
-
   explicit duckdb_native_split_provider(op::scan::duckdb_native_scan_info info,
-                                        std::shared_ptr<sirius::io::sirius_ioctx> io_ctx = nullptr);
+                                        std::shared_ptr<sirius::io::sirius_ioctx> io_ctx);
 
   ~duckdb_native_split_provider() override;
 
@@ -64,16 +59,22 @@ class duckdb_native_split_provider : public split_provider {
 
   [[nodiscard]] bool has_more_splits() const override;
 
+  // Each claimed split is a *row-group range*, not a finished batch. The
+  // thunk emits one raw split_payload carrying the range's parsed row groups;
+  // the scan operator's batch_coalescer packs those into cap-sized batches
+  // (with a single tail batch). next_split_provider() itself only does the
+  // cheap atomic claim.
   std::function<std::vector<std::unique_ptr<op::operator_data>>()> next_split_provider() override;
 
  private:
   std::shared_ptr<op::scan::duckdb_native_scan_info const> _scan_info;
-  op::scan::duckdb_native_metadata _metadata;
-  std::vector<row_group_batch> _batches;
-  std::atomic<std::size_t> _next_batch_idx{0};
-  /// Parked for the downstream scan task to read .db blocks via
-  /// sirius_ioctx::host_read. Null when the scan_manager runs without
-  /// sirius_datasource.
+  op::scan::duckdb_native_walk_plan _plan;
+  std::size_t _chunk_row_groups = 1;  ///< The number of row groups claimed per range (tunable via
+                                      ///< config SIRIUS_METADATA_PARSE_CHUNK)
+  std::size_t _num_ranges = 0;
+  std::atomic<std::size_t> _next_range_idx{0};
+  /// sirius_io handles threaded onto every split so the scan task reads .db
+  /// blocks via sirius_ioctx. Both non-null (validated in the ctor).
   std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
   std::shared_ptr<sirius::io::sirius_io_object> _db_io_object;
 };

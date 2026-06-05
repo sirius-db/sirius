@@ -31,6 +31,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace sirius::op::scan {
@@ -82,8 +83,7 @@ struct duckdb_row_group_metadata {
   std::size_t decoded_bytes_budget = 0;
   /// Parallel to `columns`. For varchar columns: Σ(seg.segment_count ×
   /// *seg.max_string_length) — the upper bound used against the cudf int32
-  /// chars threshold. 0 for non-varchar columns. Populated by the walker so
-  /// downstream partitioning never re-walks segments.
+  /// chars threshold. 0 for non-varchar columns.
   std::vector<std::size_t> varchar_bytes_per_col;
 };
 
@@ -98,33 +98,75 @@ struct duckdb_row_group_metadata {
 constexpr std::size_t kCudfInt32StringsThreshold =
   static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
 
-/// When `viable` is false the walker bailed at the first unsupported
-/// segment or type; `row_groups` is partial and must not be consumed.
-struct duckdb_native_metadata {
-  std::vector<duckdb_row_group_metadata> row_groups;
-  bool viable = false;
-  std::string viability_failure_reason;
-};
-
-/// Metadata-only walk of `storage` via `DataTable::GetColumnSegmentInfo`
-/// and `GetPartitionStats`. Pins no blocks and reads no bytes.
-///
-/// Returns `viable = false` with a populated `viability_failure_reason`
-/// on the first unsupported segment or type.
-///
-/// Caller is responsible for the operator-level escape gates
-/// (`dynamic_filters`, sample options, virtual columns, type pushdown)
-/// on the originating `LogicalGet`.
-duckdb_native_metadata walk_duckdb_native_metadata(
-  duckdb::DataTable& storage,
-  duckdb::ClientContext& context,
-  const std::vector<projected_column>& projected_cols,
-  const std::vector<sirius::logical_type>& projected_types);
-
 /// Exposed for direct unit-testing of the codec-rejection logic without
 /// going through DuckDB's codec selection (which is hard to drive into
 /// unsupported codecs in a test).
 bool is_supported_data_compression(duckdb::CompressionType c);
 bool is_supported_validity_compression(duckdb::CompressionType c);
+
+//===----------------------------------------------------------------------===//
+// 2 phase metadata walk:
+//  - 1) serial prepare_duckdb_native_walk(), invoked in duckdb_native_split_provider ctor
+//  - 2) parallel walk_duckdb_native_row_group_range(), dispatched to scan_manager worker threads
+//===----------------------------------------------------------------------===//
+
+/// @brief Serial prepare: read PartitionStatistics, validate projected types and
+/// partition `row_start`, and capture the row-group count, block size, and a
+/// storage primary index -> projected column index map. No per-segment IO.
+/// PartitionStatistics touches ClientContext / LocalStorage, which are not thread-safe
+struct duckdb_native_walk_plan {
+  duckdb::DataTable* storage     = nullptr;
+  duckdb::ClientContext* context = nullptr;
+
+  const std::vector<projected_column>* projected_cols      = nullptr;
+  const std::vector<sirius::logical_type>* projected_types = nullptr;
+  std::unordered_map<duckdb::idx_t, std::size_t>
+    projected_lookup;  /// Map storage primary index -> projected column index (rowid cols
+                       /// excluded).
+
+  //===----------RowGroupCollection data----------===//
+  std::size_t n_row_groups = 0;
+  std::size_t block_size   = 0;
+
+  //===----------PartitionStatistics data: vector across row groups----------===//
+  std::vector<duckdb::idx_t> row_group_start;  ///< Absolute first-row index per row group
+                                               ///< (PartitionStatistics::row_start).
+  std::vector<duckdb::idx_t>
+    row_count;  ///< Rows per row group (PartitionStatistics::count); 0 where unavailable.
+
+  //===----------Error Handling----------===//
+  // `viable == false` (with reason) for:
+  //  - unsupported projected types,
+  //  - an invalid partition `row_start`, or
+  //  - an empty table.
+  bool viable = false;
+  std::string viability_failure_reason;
+};
+duckdb_native_walk_plan prepare_duckdb_native_walk(
+  duckdb::DataTable& storage,
+  duckdb::ClientContext& context,
+  const std::vector<projected_column>& projected_cols,
+  const std::vector<sirius::logical_type>& projected_types);
+
+/// @brief Walk the projected-column segment metadata for row groups [rg_begin, rg_end)
+/// of `plan`, filling per-row-group
+///  - `decoded_bytes_budget`,
+///  - `varchar_bytes_per_col`, and
+///  - segment `bytes_size`.
+struct duckdb_native_row_group_range {
+  //===----------ColumnSegmentInfo data----------===//
+  std::vector<duckdb_row_group_metadata>
+    row_groups;  ///< rg metadata ranging over [rg_begin, rg_end)
+
+  //===----------Error Handling----------===//
+  //`viable == false` (with reason) on the first
+  //  - unsupported segment compression, or
+  //  - absent/over-threshold varchar stat.
+  // `row_groups` is then partial and must not be consumed.
+  bool viable = true;
+  std::string viability_failure_reason;
+};
+duckdb_native_row_group_range walk_duckdb_native_row_group_range(
+  const duckdb_native_walk_plan& plan, std::size_t rg_begin, std::size_t rg_end);
 
 }  // namespace sirius::op::scan
