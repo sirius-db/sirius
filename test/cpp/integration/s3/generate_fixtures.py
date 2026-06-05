@@ -10,12 +10,12 @@ Writes files under ``<out_dir>`` which the test harness
 the host via Sirius's SigV4 signer. Text/binary fixtures are regenerated
 deterministically each run, and the standard integration Parquet fixtures are
 copied from ``test/cpp/integration/data/parquet`` so S3 tests exercise the same
-known TPCH data as the regular GPU integration suite.
+known TPCH, nested, and edge-case data as the regular GPU integration suite.
 
   hello.txt        -- 16-byte ASCII blob; HEAD + tiny-range test
   small.bin        -- 20 KiB deterministic binary blob; bit-equal read via factory
   medium.bin       -- 8 MiB deterministic binary blob; multi-range reads
-  parquet/*.parquet -- standard TPCH Parquet fixtures used by semantic tests
+  parquet/*.parquet -- standard integration Parquet fixtures used by semantic tests
 
 The binary blobs are opaque bytes (NOT real parquet) -- the byte-equality
 tests in test_s3_integration.cpp only need deterministic, size-known objects.
