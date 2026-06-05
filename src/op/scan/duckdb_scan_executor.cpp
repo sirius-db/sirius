@@ -358,9 +358,8 @@ std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
 
 void duckdb_scan_executor::manager_loop()
 {
-  telemetry::TaskManagerLoopThreadHandleWrapper manager_telemetry{
-    *_telemetry_context, fmt::format("{}-duckdb-scan-manager", _config.thread_name_prefix)};
-  const auto manager_resource_id = manager_telemetry.uuid();
+  telemetry::TaskManagerLoopThreadHandleWrapper manager_thread_telemetry{
+    *_telemetry_context, "duckdb-scan-exec-manager"};
 
   while (_running.load()) {
     auto slot = _bounded_pool->reserve();  // block till a thread is available
@@ -397,9 +396,10 @@ void duckdb_scan_executor::manager_loop()
       scan_task->telemetry_handle().routing({
         .instance_name              = "",
         .preferred_device_id        = target_gpu_id,
-        .manager_thread_resource_id = manager_resource_id,
+        .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
       });
     }
+    uint64_t scan_operator_id = 0;  // sentinel value set below conditionally
 
     if (scan_task && scan_task->is<parquet_scan_task>()) {
       auto* parquet_task = dynamic_cast<parquet_scan_task*>(scan_task);
@@ -445,7 +445,7 @@ void duckdb_scan_executor::manager_loop()
         .input_basis                = reservation_info.input_basis,
         .peak_estimate              = reservation_info.peak_memory_estimate,
         .bytes_to_materialize       = reservation_info.bytes_to_materialize_input,
-        .manager_thread_resource_id = manager_resource_id,
+        .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
       });
       auto reservation = _mem_mgr->request_reservation(
         cucascade::memory::any_memory_space_in_tier_with_preference{
@@ -466,6 +466,11 @@ void duckdb_scan_executor::manager_loop()
         SIRIUS_LOG_ERROR("DuckDB Scan Executor: Failed to cast local state for task");
         break;
       }
+
+      if (auto* global = dynamic_cast<parquet_scan_task_global_state*>(scan_task->global_state())) {
+        scan_operator_id = global->get_operator().operator_id;
+      }
+
     } else if (scan_task && scan_task->is<duckdb_scan_task>()) {
       auto reservation_info = scan_task->get_estimated_reservation_size_info();
       scan_task->telemetry_handle().reserving({
@@ -474,7 +479,7 @@ void duckdb_scan_executor::manager_loop()
         .input_basis                = reservation_info.input_basis,
         .peak_estimate              = reservation_info.peak_memory_estimate,
         .bytes_to_materialize       = reservation_info.bytes_to_materialize_input,
-        .manager_thread_resource_id = manager_resource_id,
+        .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
       });
       if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
             scan_task->local_state())) {
@@ -485,6 +490,10 @@ void duckdb_scan_executor::manager_loop()
         SIRIUS_LOG_ERROR("DuckDB Scan Executor: Failed to cast local state for duckdb_scan_task");
         break;
       }
+
+      if (auto* global = dynamic_cast<duckdb_scan_task_global_state*>(scan_task->global_state())) {
+        scan_operator_id = global->get_scan_op().operator_id;
+      }
     } else if (scan_task && scan_task->is<cpu_source_task>()) {
       auto reservation_info = scan_task->get_estimated_reservation_size_info();
       scan_task->telemetry_handle().reserving({
@@ -493,7 +502,7 @@ void duckdb_scan_executor::manager_loop()
         .input_basis                = reservation_info.input_basis,
         .peak_estimate              = reservation_info.peak_memory_estimate,
         .bytes_to_materialize       = reservation_info.bytes_to_materialize_input,
-        .manager_thread_resource_id = manager_resource_id,
+        .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
       });
       auto reservation = _mem_mgr->request_reservation(
         cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST},
@@ -513,6 +522,10 @@ void duckdb_scan_executor::manager_loop()
           "DuckDB Scan Executor: Failed to cast local state for cpu_source_task");
         SIRIUS_LOG_ERROR("DuckDB Scan Executor: Failed to cast local state for cpu_source_task");
         break;
+      }
+
+      if (auto* global = dynamic_cast<cpu_source_task_global_state*>(scan_task->global_state())) {
+        scan_operator_id = global->get_source_op().operator_id;
       }
     }
 
@@ -545,10 +558,11 @@ void duckdb_scan_executor::manager_loop()
     _bounded_pool->dispatch(
       std::move(slot),
       [this,
-       stream        = std::move(exc_stream),
-       t             = std::move(task),
-       scan_task     = std::move(scan_task),
-       target_gpu_id = target_gpu_id]() mutable {
+       stream           = std::move(exc_stream),
+       t                = std::move(task),
+       scan_task        = std::move(scan_task),
+       target_gpu_id    = target_gpu_id,
+       scan_operator_id = scan_operator_id]() mutable {
         // _bounded_pool workers are GPU-agnostic; cudaSetDevice is
         // thread-local. Pin this worker to target_gpu_id BEFORE any cudf/RMM
         // call so the (stream, current_device) pair stays consistent through
@@ -558,8 +572,9 @@ void duckdb_scan_executor::manager_loop()
           auto consumers = scan_task->get_output_consumers();
           {
             auto executor_thread_resource_id = uuid::new_nil();
-            if (telemetry::telemetry_thread_handle.has_value()) {
-              executor_thread_resource_id = telemetry::telemetry_thread_handle->uuid();
+            if (telemetry::executor_thread_telemetry_handle.has_value()) {
+              executor_thread_resource_id =
+                telemetry::executor_thread_telemetry_handle->handle->uuid();
             } else {
               SIRIUS_LOG_ERROR(
                 "duckdb_scan_executor::manager_loop: executor thread telemetry handle is not "
@@ -570,16 +585,16 @@ void duckdb_scan_executor::manager_loop()
               .target_tier                 = "SCAN",
               .executor_thread_resource_id = executor_thread_resource_id,
             });
+            scan_task->telemetry_handle().computing({
+              .instance_name               = "",
+              .current_operator_id         = scan_operator_id,
+              .input_bytes                 = 0,
+              .executor_thread_resource_id = executor_thread_resource_id,
+            });
 
             auto output_data = get_scan_output(scan_task, stream);
             stream->synchronize();
 
-            scan_task->telemetry_handle().computing({
-              .instance_name               = "",
-              .current_operator_id         = 0,
-              .input_bytes                 = 0,
-              .executor_thread_resource_id = executor_thread_resource_id,
-            });
             scan_task->telemetry_handle().finalizing({
               .instance_name = "",
               .success       = true,

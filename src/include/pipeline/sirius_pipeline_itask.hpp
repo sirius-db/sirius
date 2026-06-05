@@ -103,16 +103,8 @@ class sirius_pipeline_itask : public parallel::itask {
     return _global_state->cast<sirius_pipeline_task_global_state>().get_pipeline_id();
   }
 
-  [[nodiscard]] uint64_t get_source_operator_id() const
-  {
-    auto* pipeline = _global_state->cast<sirius_pipeline_task_global_state>().get_pipeline();
-    if (!pipeline || !pipeline->get_source()) { return 0; }
-    return pipeline->get_source()->get_operator_id();
-  }
-
   [[nodiscard]] quent::task::TaskHandle& telemetry_handle() noexcept;
   void set_telemetry_finalized() noexcept { _telemetry_finalized = true; }
-  [[nodiscard]] bool telemetry_finalized() const noexcept { return _telemetry_finalized; }
 
  protected:
   /**

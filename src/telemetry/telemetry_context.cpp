@@ -27,6 +27,7 @@
 
 #include <unistd.h>
 
+#include <memory>
 #include <ranges>
 #include <string>
 
@@ -35,7 +36,7 @@ namespace sirius::telemetry {
 std::shared_ptr<const telemetry_context> telemetry_context::create(
   const sirius::telemetry_config& config)
 {
-  return std::make_shared<telemetry_context>(config);
+  return std::shared_ptr<telemetry_context>(new telemetry_context(config));
 }
 
 telemetry_context::telemetry_context(const sirius::telemetry_config& config)

@@ -133,7 +133,6 @@ std::unique_ptr<op::operator_data> run_one_operator(
   const op::operator_data& operator_input_data,
   rmm::cuda_stream_view stream,
   const sirius_pipeline* pipeline,
-  size_t op_index,
   size_t num_operators,
   cucascade::memory::reservation_aware_resource_adaptor* allocator)
 {
@@ -233,17 +232,18 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
                     operators.size());
   }
 
+  auto executor_thread_resource_id = uuid::new_nil();
+  if (telemetry::executor_thread_telemetry_handle.has_value()) {
+    executor_thread_resource_id = telemetry::executor_thread_telemetry_handle->handle->uuid();
+  } else {
+    SIRIUS_LOG_ERROR(
+      "gpu_pipeline_task::execute_operator: executor thread telemetry handle is not "
+      "initialized");
+  }
+
   for (size_t i = start_index; i < operators.size(); i++) {
     auto& op = operators[i].get();
     try {
-      auto executor_thread_resource_id = uuid::new_nil();
-      if (telemetry::telemetry_thread_handle.has_value()) {
-        executor_thread_resource_id = telemetry::telemetry_thread_handle->uuid();
-      } else {
-        SIRIUS_LOG_ERROR(
-          "gpu_pipeline_task::execute_operator: executor thread telemetry handle is not "
-          "initialized");
-      }
       this->telemetry_handle().computing({
         .instance_name               = "",
         .current_operator_id         = op.get_operator_id(),
@@ -251,7 +251,7 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
         .executor_thread_resource_id = executor_thread_resource_id,
       });
       operator_input_output_data = run_one_operator(
-        op, *operator_input_output_data, stream, pipeline, i, operators.size(), _allocator);
+        op, *operator_input_output_data, stream, pipeline, operators.size(), _allocator);
     } catch (const rmm::out_of_memory& oom) {
       auto peak_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
       // Subtract the peak allocated bytes to the input data to get the peak allocated bytes for the
@@ -376,8 +376,8 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   }
 
   auto executor_thread_resource_id = uuid::new_nil();
-  if (telemetry::telemetry_thread_handle.has_value()) {
-    executor_thread_resource_id = telemetry::telemetry_thread_handle->uuid();
+  if (telemetry::executor_thread_telemetry_handle.has_value()) {
+    executor_thread_resource_id = telemetry::executor_thread_telemetry_handle->handle->uuid();
   } else {
     SIRIUS_LOG_ERROR(
       "gpu_pipeline_task::execute: executor thread telemetry handle is not initialized");

@@ -17,7 +17,6 @@
 #pragma once
 
 #include "helper/helper.hpp"
-#include "telemetry-bridge/gen/task.rs.h"
 
 #include <cudf/utilities/default_stream.hpp>
 

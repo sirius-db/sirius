@@ -17,6 +17,7 @@
 #pragma once
 
 #include "duckdb/common/common.hpp"
+#include "log/logging.hpp"
 #include "telemetry-bridge/gen/context.rs.h"
 #include "telemetry-bridge/gen/engine.rs.h"
 #include "telemetry-bridge/gen/executor_thread.rs.h"
@@ -47,7 +48,6 @@ class telemetry_context {
   [[nodiscard]] static std::shared_ptr<const telemetry_context> create(
     const sirius::telemetry_config& config);
 
-  explicit telemetry_context(const sirius::telemetry_config& config);
   ~telemetry_context();
 
   // Non-copyable, non-movable (owns opaque Rust boxes)
@@ -61,6 +61,8 @@ class telemetry_context {
   [[nodiscard]] const quent::Context& context() const { return *context_; }
 
  private:
+  explicit telemetry_context(const sirius::telemetry_config& config);
+
   uuid::UUID engine_uuid_;
   uuid::UUID worker_uuid_;
   rust::Box<quent::Context> context_;
@@ -104,8 +106,6 @@ struct ExecutorThreadHandleWrapper {
     handle->exit();
   }
 
-  [[nodiscard]] uuid::UUID uuid() const { return handle->uuid(); }
-
   rust::Box<quent::executor_thread::ExecutorThreadHandle> handle;
 };
 
@@ -131,8 +131,6 @@ struct TaskManagerLoopThreadHandleWrapper {
     handle->finalizing();
     handle->exit();
   }
-
-  [[nodiscard]] uuid::UUID uuid() const { return handle->uuid(); }
 
   rust::Box<quent::task_manager_loop_thread::TaskManagerLoopThreadHandle> handle;
 };
@@ -161,20 +159,21 @@ struct TaskQueueHandleWrapper {
     handle->exit();
   }
 
-  [[nodiscard]] uuid::UUID uuid() const { return handle->uuid(); }
-
   rust::Box<quent::task_queue::TaskQueueHandle> handle;
 };
 
 // header-only shared thread-local storage handle: one per thread, shared across translation units
-inline thread_local std::optional<ExecutorThreadHandleWrapper> telemetry_thread_handle{
+inline thread_local std::optional<ExecutorThreadHandleWrapper> executor_thread_telemetry_handle{
   std::nullopt};
 
 // Initialize the thread local ExecutorThreadHandleWrapper for this worker thread.
 inline void thread_local_executor_thread_telemtry_init(const telemetry_context& context,
                                                        const std::string& thread_name)
 {
-  telemetry_thread_handle.emplace(context, thread_name);
+  if (executor_thread_telemetry_handle.has_value()) {
+    SIRIUS_LOG_WARN("ExecutorThreadHandleWrapper was already initialized; overriding.");
+  }
+  executor_thread_telemetry_handle.emplace(context, thread_name);
 }
 
 }  // namespace sirius::telemetry

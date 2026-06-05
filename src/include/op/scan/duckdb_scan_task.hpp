@@ -146,6 +146,9 @@ class duckdb_scan_task_global_state : public pipeline::sirius_pipeline_task_glob
     return _total_task_count.load(std::memory_order_acquire) < _max_threads;
   }
 
+  // Returns the physical table scan operator being executed
+  const sirius_physical_duckdb_scan& get_scan_op() const noexcept { return _op; }
+
  private:
   std::atomic<std::size_t> _total_task_count{0};
   //===----------Fields----------===//

@@ -84,7 +84,7 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
     _pipeline = std::move(pipeline);
   }
 
-  [[nodiscard]] const telemetry::telemetry_context& telemetry_context() const noexcept
+  [[nodiscard]] const telemetry::telemetry_context& get_telemetry_context() const noexcept
   {
     return *_telemetry_context;
   }
@@ -117,10 +117,10 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
 
  private:
   duckdb::shared_ptr<sirius_pipeline> _pipeline;  ///< Shared pointer to the GPU pipeline to execute
+  pipeline_memory_history _memory_history;        ///< Historical memory metrics for estimation
+  std::optional<int> _preferred_device_id;        ///< Pipeline-level preferred GPU device
   std::shared_ptr<const telemetry::telemetry_context>
-    _telemetry_context;                     ///< SiriusContext telemetry
-  pipeline_memory_history _memory_history;  ///< Historical memory metrics for estimation
-  std::optional<int> _preferred_device_id;  ///< Pipeline-level preferred GPU device
+    _telemetry_context;  ///< SiriusContext telemetry
 };
 
 /**

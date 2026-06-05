@@ -90,10 +90,8 @@ absl::AnyInvocable<void() noexcept> gpu_pipeline_executor::get_per_thread_init()
 
 void gpu_pipeline_executor::manager_loop()
 {
-  telemetry::TaskManagerLoopThreadHandleWrapper manager_telemetry{
-    *_telemetry_context,
-    fmt::format("{}-gpu-manager-{}", _config.thread_name_prefix, _memory_space->get_device_id())};
-  const auto manager_resource_id = manager_telemetry.uuid();
+  telemetry::TaskManagerLoopThreadHandleWrapper manager_thread_telemetry{
+    *_telemetry_context, fmt::format("gpu-{}-exec-manager", _memory_space->get_device_id())};
 
   rmm::cuda_set_device_raii set_device_guard(rmm::cuda_device_id{_memory_space->get_device_id()});
   sirius::util::enable_log_on_default_stream();
@@ -137,7 +135,7 @@ void gpu_pipeline_executor::manager_loop()
       .input_basis                = reservation_info.input_basis,
       .peak_estimate              = reservation_info.peak_memory_estimate,
       .bytes_to_materialize       = reservation_info.bytes_to_materialize_input,
-      .manager_thread_resource_id = manager_resource_id,
+      .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
     });
     SIRIUS_LOG_TRACE(
       "GPU Pipeline Executor: Acquiring memory reservation for pipeline {} of {} bytes for task "
@@ -167,7 +165,7 @@ void gpu_pipeline_executor::manager_loop()
         .instance_name              = "",
         .shortfall_bytes            = shortfall,
         .partial_bytes              = partial_size,
-        .manager_thread_resource_id = manager_resource_id,
+        .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
       });
 
       SIRIUS_LOG_DEBUG(
@@ -210,7 +208,7 @@ void gpu_pipeline_executor::manager_loop()
         .input_basis                = reservation_info.input_basis,
         .peak_estimate              = reservation_info.peak_memory_estimate,
         .bytes_to_materialize       = reservation_info.bytes_to_materialize_input,
-        .manager_thread_resource_id = manager_resource_id,
+        .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
       });
       if (new_reservation) {
         reservation = std::move(new_reservation);

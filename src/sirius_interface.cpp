@@ -28,28 +28,9 @@
 #include "log/logging.hpp"
 #include "sirius_context.hpp"
 
-#include <memory>
 #include <optional>
 
 namespace sirius {
-
-namespace {
-
-std::shared_ptr<const telemetry::telemetry_context> get_telemetry_context(
-  duckdb::ClientContext& client_context)
-{
-  if (not client_context.registered_state) {
-    throw duckdb::InvalidInputException("Sirius context is not registered.");
-  }
-
-  auto sirius_ctx = client_context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (not sirius_ctx || not sirius_ctx->is_initialized()) {
-    throw duckdb::InvalidInputException("Sirius context is not initialized.");
-  }
-  return sirius_ctx->get_telemetry_context();
-}
-
-}  // namespace
 
 void bind_prepared_statement_parameters(duckdb::PreparedStatementData& statement,
                                         const duckdb::PendingQueryParameters& parameters)
