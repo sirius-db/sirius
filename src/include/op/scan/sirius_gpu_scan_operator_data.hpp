@@ -58,7 +58,7 @@ class scan_operator_input : public op::operator_data {
 
   [[nodiscard]] op::operator_data_type get_type() const override
   {
-    return op::operator_data_type::GPU_SCAN_FRESH;
+    return op::operator_data_type::GPU_SCAN;
   }
 
   void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
@@ -104,8 +104,10 @@ class scan_operator_with_pinned_table_input : public op::operator_data {
 
   [[nodiscard]] op::operator_data_type get_type() const override
   {
-    return op::operator_data_type::GPU_SCAN_PINNED;
+    return op::operator_data_type::GPU_SCAN;
   }
+
+  [[nodiscard]] bool is_resident() const noexcept override { return true; }
 
   /**
    * @brief Move host-tier cached batches onto the requested GPU memory space.

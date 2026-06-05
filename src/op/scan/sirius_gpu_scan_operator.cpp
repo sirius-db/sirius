@@ -236,7 +236,7 @@ std::size_t sirius_gpu_scan_operator::no_history_peak_memory_estimate(
   // input substantially (decompression + decode), so the parquet operator used
   // an 8× factor. duckdb-native used 4×. Pick 8× as the safe upper bound — the
   // reservation system clamps via downstream operator estimates anyway.
-  if (stats.type == op::operator_data_type::GPU_SCAN_PINNED) { return stats.bytes; }
+  if (stats.resident) { return stats.bytes; }
   return stats.bytes * 8;
 }
 

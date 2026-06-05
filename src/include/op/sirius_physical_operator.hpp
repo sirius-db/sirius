@@ -66,8 +66,7 @@ enum class operator_data_type : uint8_t {
   BASE,
   PIPELINEABLE,
   PARTITIONED,
-  GPU_SCAN_FRESH,
-  GPU_SCAN_PINNED,
+  GPU_SCAN,
 };
 
 /**
@@ -93,6 +92,16 @@ class operator_data {
    * implementation returns operator_data_type::BASE.
    */
   [[nodiscard]] virtual operator_data_type get_type() const { return operator_data_type::BASE; }
+
+  /**
+   * @brief Whether this operator_data refers to GPU-resident data already paid
+   *        for upstream (e.g. a pinned-cache batch). Defaults to false.
+   *
+   * Used by memory estimation in sirius_gpu_scan_operator to distinguish a
+   * pass-through over an already-resident batch from a fresh decode that
+   * still needs allocation. Overridden by scan_operator_with_pinned_table_input.
+   */
+  [[nodiscard]] virtual bool is_resident() const noexcept { return false; }
 
   /**
    * @brief Per-task preparation hook invoked before the operator consumes this data.
@@ -265,6 +274,10 @@ struct input_stats {
   std::size_t num_batches = 0;
   std::size_t bytes       = 0;
   operator_data_type type = operator_data_type::BASE;
+  /// Mirrors @ref operator_data::is_resident on the data that fed this task,
+  /// captured at stats-build time. Used by sirius_gpu_scan_operator's memory
+  /// estimate to skip the decode-expansion factor on already-resident inputs.
+  bool resident = false;
 };
 
 //! sirius_physical_operator is the base class of the physical operators present in the
