@@ -169,7 +169,7 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   std::unique_ptr<io::ingestible_table_info> _table_info;
   std::shared_ptr<io::gpu_ingestible> _ingestible;
   std::unique_ptr<scan_manager::split_connector> _split_connector;
-  
+
   // Per-GPU ioctx map for ioctx->make_datasource(uring_io_object) routing in
   // read_table_from_metadata. Populated by set_gpu_ioctxs(); empty until
   // sirius_scan_manager::create_provider_for() injects it (the operator can

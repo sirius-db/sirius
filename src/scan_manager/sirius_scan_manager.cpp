@@ -220,11 +220,8 @@ void sirius_scan_manager::prepare_for_query(
     // prepare_for_query runs before any execute().
     op->set_gpu_ioctxs(effective_gpu_ioctxs);
 
-    auto ingestible = _factory.produce(std::move(table_info),
-                                       *this,
-                                       effective_gpu_ioctxs,
-                                       gpu_memory_spaces,
-                                       op->get_operator_id());
+    auto ingestible = _factory.produce(
+      std::move(table_info), *this, effective_gpu_ioctxs, gpu_memory_spaces, op->get_operator_id());
     if (!ingestible) { continue; }
     op->install_ingestible(ingestible);
 
