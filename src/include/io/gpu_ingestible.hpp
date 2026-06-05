@@ -151,6 +151,36 @@ class post_filter_and_projection_info {
 };
 
 //===----------------------------------------------------------------------===//
+// filter_state / filtered_table
+//===----------------------------------------------------------------------===//
+/**
+ * @brief How much of the per-split filter + projection work the ingestible
+ *        already absorbed during @ref gpu_ingestible::materialize_table.
+ *
+ * Returned alongside the materialized table so the scan operator can skip
+ * a redundant @ref gpu_ingestible::post_filter_and_project call when the
+ * ingestible already applied both the row-level filter and projection
+ * inline (the parquet reader-side pushdown path).
+ */
+enum class filter_state {
+  UNFILTERED,
+  ROWGROUP_FILTERED,
+  ROW_FILTERED,
+  ROW_FILTERED_AND_PROJECTED,
+};
+
+/**
+ * @brief Result of @ref gpu_ingestible::materialize_table.
+ *
+ * Bundles the materialized cudf::table with a tag describing how much of
+ * the split's filter + projection work was applied during materialization.
+ */
+struct filtered_table {
+  std::unique_ptr<cudf::table> table;
+  filter_state state{filter_state::UNFILTERED};
+};
+
+//===----------------------------------------------------------------------===//
 // scan_and_filter_metadata
 //===----------------------------------------------------------------------===//
 /**
@@ -198,7 +228,7 @@ class scan_and_filter_metadata {
  * Implementations today: @c parquet_gpu_ingestible,
  * @c duckdb_native_gpu_ingestible, @c cached_parquet_gpu_ingestible.
  */
-class gpu_ingestible {
+class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
  public:
   explicit gpu_ingestible(std::unique_ptr<ingestible_table_info> info)
     : _table_info(std::move(info))
@@ -243,10 +273,9 @@ class gpu_ingestible {
    * sirius_ioctx for the read — implementations route the read through
    * that ioctx so per-GPU CUDA contexts bind correctly.
    */
-  virtual std::unique_ptr<cudf::table> materialize_table(
-    scan_info const& info,
-    ::cucascade::memory::memory_space const& mem_space,
-    rmm::cuda_stream_view stream) = 0;
+  virtual filtered_table materialize_table(scan_info const& info,
+                                           ::cucascade::memory::memory_space const& mem_space,
+                                           rmm::cuda_stream_view stream) = 0;
 
   /**
    * @brief Apply post-decode filter and/or projection to the materialized
