@@ -23,6 +23,7 @@
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 #include "log/logging.hpp"
+#include "op/scan/duckdb_native_metadata.hpp"
 #include "op/scan/duckdb_native_scan_info.hpp"
 #include "op/scan/parquet_scan_info.hpp"
 #include "op/scan/sirius_gpu_duckdb_native_scan_operator.hpp"
@@ -288,28 +289,38 @@ void sirius_pipeline_converter::insert_parquet_scan_operator(
   inserted_operators_.push_back(std::move(gpu_scan_op));
 }
 
-void sirius_pipeline_converter::insert_duckdb_native_scan_operator(
+// Tries to insert a GPU-native scan operator for a seq_scan. Returns true on success.
+// Returns false (without modifying the pipeline) when the scan cannot use the GPU-native
+// path — non-base-table bind data, missing client context, or a table the metadata walker
+// rejects (in-memory / transient segments, unsupported types/codecs). The caller then falls
+// back to the CPU duckdb scan. The viability decision is made here, at plan-conversion time,
+// because the scan-manager's runtime non-viable throw does NOT trigger transparent fallback.
+bool sirius_pipeline_converter::insert_duckdb_native_scan_operator(
   duckdb::shared_ptr<sirius_pipeline>& current_pipeline)
 {
   auto& scan_op = current_pipeline->get_source()->Cast<op::sirius_physical_table_scan>();
-  if (!scan_op.bind_data) {
-    throw std::runtime_error(
-      "[sirius_pipeline_converter::insert_duckdb_native_scan_operator] seq_scan has no bind_data");
-  }
+  if (!scan_op.bind_data) { return false; }
   auto* table_scan_bind = dynamic_cast<duckdb::TableScanBindData*>(scan_op.bind_data.get());
   if (table_scan_bind == nullptr) {
-    throw std::runtime_error(
-      "[sirius_pipeline_converter::insert_duckdb_native_scan_operator] seq_scan bind_data is not "
-      "TableScanBindData; the GPU-native duckdb scan path supports only seq_scan over base "
-      "tables. Disable enable_gpu_duckdb_native_scan for this query.");
+    // Only seq_scan over base tables (TableScanBindData) is supported; fall back to CPU.
+    return false;
   }
   auto& bind_data = *table_scan_bind;
   auto& table     = bind_data.table.Cast<duckdb::DuckTableEntry>();
 
   if (client_context_ == nullptr) {
-    throw std::runtime_error(
-      "[sirius_pipeline_converter::insert_duckdb_native_scan_operator] no client_context passed "
-      "to converter; seq_scan GPU-native path requires it");
+    SIRIUS_LOG_DEBUG("[sirius_pipeline_converter] no client_context for GPU-native scan; "
+                     "using CPU duckdb scan");
+    return false;
+  }
+
+  // The GPU-native scan reads persisted on-disk blocks; an in-memory database has only
+  // transient segments with no readable block id, so fall back to the CPU scan. This is
+  // checked here, before the metadata walk, because the walk requires an active transaction
+  // that is not present on every plan-generation path (e.g. plan printing / EXPLAIN).
+  if (table.GetStorage().GetAttached().GetStorageManager().InMemory()) {
+    SIRIUS_LOG_DEBUG("[sirius_pipeline_converter] in-memory database; using CPU duckdb scan");
+    return false;
   }
 
   auto scan_info     = std::make_unique<op::scan::duckdb_native_scan_info>();
@@ -360,12 +371,65 @@ void sirius_pipeline_converter::insert_duckdb_native_scan_operator(
   scan_info->returned_types = scan_op.returned_types;
   scan_info->output_types   = scan_op.types;
 
+  // Plan-time viability gate: the metadata walk decides whether the GPU-native scan can read
+  // this table. Non-viable cases (in-memory ":memory:" / transient uncheckpointed segments,
+  // unsupported types or codecs) fall back to the CPU duckdb scan here, before the plan
+  // commits, instead of hard-failing mid-execution.
+  op::scan::duckdb_native_metadata native_metadata;
+  try {
+    native_metadata = op::scan::walk_duckdb_native_metadata(*scan_info->storage,
+                                                            *scan_info->context,
+                                                            scan_info->projected_cols,
+                                                            scan_info->projected_types);
+  } catch (const std::exception& e) {
+    // The walk reads storage metadata under the active transaction; if that is unavailable
+    // (or any other walk failure occurs) fall back to the CPU scan rather than hard-failing.
+    SIRIUS_LOG_DEBUG("[sirius_pipeline_converter] GPU-native metadata walk failed ({}); "
+                     "using CPU duckdb scan",
+                     e.what());
+    return false;
+  }
+  if (!native_metadata.viable) {
+    SIRIUS_LOG_DEBUG("[sirius_pipeline_converter] GPU-native scan not viable ({}); "
+                     "using CPU duckdb scan",
+                     native_metadata.viability_failure_reason);
+    return false;
+  }
+
+  // Readability gate: the GPU-native scan reads persisted blocks by id. Segments with no
+  // persisted block (block_id < 0) — in-memory (":memory:") databases, or data not yet
+  // checkpointed to disk — cannot be read by the decoder. CONSTANT segments legitimately
+  // carry block_id < 0 (their value comes from statistics and is materialized separately).
+  // If any non-CONSTANT segment lacks a block, fall back to the CPU duckdb scan.
+  auto has_unreadable_segment = [](const op::scan::duckdb_native_metadata& md) {
+    auto bad = [](const op::scan::duckdb_segment_descriptor& s) {
+      return s.compression != duckdb::CompressionType::COMPRESSION_CONSTANT && s.block_id < 0;
+    };
+    for (auto const& rg : md.row_groups) {
+      for (auto const& col : rg.columns) {
+        for (auto const& s : col.data_segments) {
+          if (bad(s)) { return true; }
+        }
+        for (auto const& s : col.validity_segments) {
+          if (bad(s)) { return true; }
+        }
+      }
+    }
+    return false;
+  };
+  if (has_unreadable_segment(native_metadata)) {
+    SIRIUS_LOG_DEBUG("[sirius_pipeline_converter] GPU-native scan: table has transient/in-memory "
+                     "segments (block_id<0); using CPU duckdb scan");
+    return false;
+  }
+
   auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_duckdb_native_scan_operator>(
     scan_op.types, scan_op.estimated_cardinality, std::move(scan_info));
 
   auto* gpu_scan_ptr = gpu_scan_op.get();
   current_pipeline->operators.insert(current_pipeline->operators.begin(), *gpu_scan_ptr);
   inserted_operators_.push_back(std::move(gpu_scan_op));
+  return true;
 }
 
 void sirius_pipeline_converter::split_table_scan_source(
@@ -381,13 +445,11 @@ void sirius_pipeline_converter::split_table_scan_source(
     return;
   }
 
-  // The GPU-native scan only supports seq_scan over base tables (TableScanBindData).
-  // It is the default path, so anything else (e.g. a seq_scan whose bind_data is not a
-  // base-table binding) must fall through to the CPU scan below rather than hard-fail.
-  if (scan_op.function.name == "seq_scan" && op_params_.enable_gpu_duckdb_native_scan &&
-      dynamic_cast<duckdb::TableScanBindData*>(scan_op.bind_data.get()) != nullptr) {
-    insert_duckdb_native_scan_operator(current_pipeline);
-    return;
+  // The GPU-native scan is the default path for seq_scan. insert_duckdb_native_scan_operator
+  // returns false when the table can't use it (non-base-table bind data, in-memory / transient
+  // segments, unsupported types) — in that case fall through to the CPU scan below.
+  if (scan_op.function.name == "seq_scan" && op_params_.enable_gpu_duckdb_native_scan) {
+    if (insert_duckdb_native_scan_operator(current_pipeline)) { return; }
   }
 
   if (scan_op.function.name == "seq_scan" || scan_op.function.name == "iceberg_scan") {
