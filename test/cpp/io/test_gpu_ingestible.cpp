@@ -52,9 +52,9 @@ class fake_gpu_ingestible : public sirius::io::gpu_ingestible {
   {
     return nullptr;
   }
-  std::unique_ptr<cudf::table> materialize_table(sirius::io::scan_info const&,
-                                                 cucascade::memory::memory_space const&,
-                                                 rmm::cuda_stream_view) override
+  sirius::io::filtered_table materialize_table(sirius::io::scan_info const&,
+                                               cucascade::memory::memory_space const&,
+                                               rmm::cuda_stream_view) override
   {
     throw std::runtime_error("not reachable in this test");
   }
