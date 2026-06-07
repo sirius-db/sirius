@@ -508,6 +508,7 @@ set(TEST_SOURCES
     test/cpp/parallel/test_task_executor.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
+    test/cpp/pipeline/test_pipeline_merge_fusion.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
     test/cpp/pipeline/test_sirius_read_parquet_converter.cpp
     test/cpp/pipeline/test_pipeline_memory_history.cpp
