@@ -126,6 +126,7 @@ pipeline_conversion_result sirius_pipeline_converter::convert(sirius_meta_pipeli
   scheduled_.clear();
   inserted_operators_.clear();
   repository_wirings_.clear();
+  absorbed_pipelines_.clear();
 
   auto copied_scheduled = schedule_and_copy_pipelines(root_pipeline);
   split_pipelines(copied_scheduled);
@@ -646,6 +647,103 @@ void sirius_pipeline_converter::split_join_sink(
   inserted_operators_.push_back(std::move(concat_op));
 }
 
+namespace {
+
+bool is_fusable_downstream_operator(const op::sirius_physical_operator& op)
+{
+  return !op.is_sink() && !op.is_source();
+}
+
+// Must stay in sync with split_pipelines() sink dispatch: any sink handled by a
+// dedicated split_* function must not be absorbed via downstream fusion.
+bool sink_needs_pipeline_split(op::SiriusPhysicalOperatorType type)
+{
+  return type == op::SiriusPhysicalOperatorType::HASH_JOIN ||
+         type == op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN ||
+         type == op::SiriusPhysicalOperatorType::HASH_GROUP_BY ||
+         type == op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE ||
+         type == op::SiriusPhysicalOperatorType::ORDER_BY ||
+         type == op::SiriusPhysicalOperatorType::TOP_N ||
+         type == op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
+         type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN;
+}
+
+}  // namespace
+
+bool sirius_pipeline_converter::try_fuse_downstream_pipelineable(
+  duckdb::shared_ptr<sirius_pipeline>& merge_pipeline,
+  op::sirius_physical_operator* merge_op,
+  op::sirius_physical_operator* original_agg_source,
+  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
+  size_t from_pipeline_idx)
+{
+  // If any downstream pipeline from this aggregate ends in a structural sink, do not fuse.
+  for (size_t j = from_pipeline_idx + 1; j < copied_scheduled.size(); j++) {
+    auto& downstream = copied_scheduled[j];
+    if (downstream->source.get() != original_agg_source) { continue; }
+    if (sink_needs_pipeline_split(downstream->get_sink()->type)) { return false; }
+  }
+
+  for (size_t j = from_pipeline_idx + 1; j < copied_scheduled.size(); j++) {
+    auto& downstream = copied_scheduled[j];
+    if (downstream->source.get() != original_agg_source) { continue; }
+
+    // Do not fuse a pipelineable downstream when a later structural pipeline reads
+    // from its output (e.g. GROUP_BY -> PROJECTION then PROJECTION -> HASH_JOIN).
+    for (size_t k = j + 1; k < copied_scheduled.size(); k++) {
+      auto& later = copied_scheduled[k];
+      if (!sink_needs_pipeline_split(later->get_sink()->type)) { continue; }
+      const auto* later_source = later->source.get();
+      if (later_source == downstream->get_sink().get()) { return false; }
+      for (auto& op_ref : downstream->operators) {
+        if (later_source == &op_ref.get()) { return false; }
+      }
+    }
+
+    for (auto& op_ref : downstream->operators) {
+      if (!is_fusable_downstream_operator(op_ref.get())) { return false; }
+    }
+
+    merge_pipeline->operators.push_back(*merge_op);
+    for (auto& op_ref : downstream->operators) {
+      merge_pipeline->operators.push_back(op_ref);
+    }
+    merge_pipeline->sink = downstream->sink;
+
+    absorbed_pipelines_.insert(downstream.get());
+    return true;
+  }
+  return false;
+}
+
+void sirius_pipeline_converter::attach_merge_and_fuse_downstream(
+  duckdb::shared_ptr<sirius_pipeline>& merge_pipeline,
+  op::sirius_physical_operator* merge_op,
+  op::sirius_physical_operator* original_agg_source,
+  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
+  size_t from_pipeline_idx)
+{
+  // UNGROUPED_AGGREGATE uses the same physical op as both the partial-aggregate sink and the
+  // merge pipeline source. Folding the downstream pipeline (typically RESULT_COLLECTOR) into the
+  // merge pipeline breaks partial→merge repository wiring and produces wrong merged results
+  // (e.g. avg off by orders of magnitude). Keep merge and downstream as separate pipelines.
+  const bool allow_fusion =
+    original_agg_source->type != op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE;
+  const bool fused =
+    allow_fusion &&
+    try_fuse_downstream_pipelineable(
+      merge_pipeline, merge_op, original_agg_source, copied_scheduled, from_pipeline_idx);
+
+  if (!fused) { merge_pipeline->sink = merge_op; }
+
+  // Repoint not-yet-split downstream pipelines to read from the merge op.
+  for (size_t j = from_pipeline_idx + 1; j < copied_scheduled.size(); j++) {
+    auto& downstream = copied_scheduled[j];
+    if (absorbed_pipelines_.count(downstream.get()) > 0) { continue; }
+    if (downstream->source.get() == original_agg_source) { downstream->source = merge_op; }
+  }
+}
+
 void sirius_pipeline_converter::split_group_aggregate_sink(
   duckdb::shared_ptr<sirius_pipeline>& current_pipeline,
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
@@ -674,18 +772,15 @@ void sirius_pipeline_converter::split_group_aggregate_sink(
     partition_pipeline->sink   = partition_ptr;
     scheduled_.push_back(partition_pipeline);
 
-    // Create merge pipeline: PARTITION (source) -> MERGE_OP (sink)
+    // Create merge pipeline: PARTITION (source) -> MERGE_OP -> pipelineable downstream ops
     auto merge_op          = construct_sirius_specific_operator(*group_agg_op, iceberg_cache_);
+    auto* merge_op_ptr     = merge_op.get();
     auto merge_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(build_ctx_);
     merge_pipeline->source = partition_ptr;
-    merge_pipeline->sink   = merge_op.get();
 
-    // Update downstream pipelines to use MERGE_OP as source
-    for (size_t j = pipeline_idx + 1; j < copied_scheduled.size(); j++) {
-      if (copied_scheduled[j]->source.get() == group_agg_op.get()) {
-        copied_scheduled[j]->source = merge_op.get();
-      }
-    }
+    attach_merge_and_fuse_downstream(
+      merge_pipeline, merge_op_ptr, group_agg_op.get(), copied_scheduled, pipeline_idx);
+
     scheduled_.push_back(merge_pipeline);
     inserted_operators_.push_back(std::move(merge_op));
   } else {
@@ -693,16 +788,13 @@ void sirius_pipeline_converter::split_group_aggregate_sink(
     scheduled_.push_back(current_pipeline);
 
     auto merge_op        = construct_sirius_specific_operator(*group_agg_op, iceberg_cache_);
+    auto* merge_op_ptr   = merge_op.get();
     auto new_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(build_ctx_);
     new_pipeline->source = group_agg_op;
-    new_pipeline->sink   = merge_op.get();
 
-    // Update downstream pipelines to use MERGE_OP as source
-    for (size_t j = pipeline_idx + 1; j < copied_scheduled.size(); j++) {
-      if (copied_scheduled[j]->source.get() == group_agg_op.get()) {
-        copied_scheduled[j]->source = merge_op.get();
-      }
-    }
+    attach_merge_and_fuse_downstream(
+      new_pipeline, merge_op_ptr, group_agg_op.get(), copied_scheduled, pipeline_idx);
+
     scheduled_.push_back(new_pipeline);
     inserted_operators_.push_back(std::move(merge_op));
   }
@@ -818,18 +910,14 @@ void sirius_pipeline_converter::split_top_n_sink(
     new op::sirius_physical_top_n_merge(topn_ptr));
   auto* merge_ptr = merge_op.get();
 
-  // Pipeline B: TOP_N (source) -> MERGE_TOP_N (sink)
+  // Pipeline B: TOP_N (source) -> MERGE_TOP_N -> pipelineable downstream ops
   auto merge_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(build_ctx_);
   merge_pipeline->source = top_n_op.get();
-  merge_pipeline->sink   = merge_ptr;
-  scheduled_.push_back(merge_pipeline);
 
-  // Update downstream pipelines to use MERGE_TOP_N as source
-  for (size_t j = pipeline_idx + 1; j < copied_scheduled.size(); j++) {
-    if (copied_scheduled[j]->source.get() == top_n_op.get()) {
-      copied_scheduled[j]->source = merge_ptr;
-    }
-  }
+  attach_merge_and_fuse_downstream(
+    merge_pipeline, merge_ptr, top_n_op.get(), copied_scheduled, pipeline_idx);
+
+  scheduled_.push_back(merge_pipeline);
 
   // Store ownership
   inserted_operators_.push_back(std::move(merge_op));
@@ -950,6 +1038,7 @@ void sirius_pipeline_converter::split_pipelines(
 {
   for (size_t i = 0; i < copied_scheduled.size(); i++) {
     auto current_pipeline = copied_scheduled[i];  // Copy duckdb::shared_ptr to avoid invalidation
+    if (absorbed_pipelines_.count(current_pipeline.get()) > 0) { continue; }
 
     // Preprocessing: replace TABLE_SCAN source with concrete scan operator
     split_table_scan_source(current_pipeline);

@@ -25,6 +25,7 @@
 
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace duckdb {
@@ -109,6 +110,22 @@ class sirius_pipeline_converter {
                              duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
                              size_t pipeline_idx);
 
+  //! Fold pipelineable downstream operators into the merge pipeline when possible.
+  //! Returns true when a downstream pipeline was fully absorbed.
+  bool try_fuse_downstream_pipelineable(
+    duckdb::shared_ptr<sirius_pipeline>& merge_pipeline,
+    op::sirius_physical_operator* merge_op,
+    op::sirius_physical_operator* original_agg_source,
+    duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
+    size_t from_pipeline_idx);
+
+  void attach_merge_and_fuse_downstream(
+    duckdb::shared_ptr<sirius_pipeline>& merge_pipeline,
+    op::sirius_physical_operator* merge_op,
+    op::sirius_physical_operator* original_agg_source,
+    duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
+    size_t from_pipeline_idx);
+
   // Phase 3: Compute plan-time wiring descriptors
   // Runtime materialization is done by `materialize_repository_wiring()` from
   // `pipeline/repository_wiring.hpp`.
@@ -140,6 +157,8 @@ class sirius_pipeline_converter {
   duckdb::vector<duckdb::unique_ptr<op::sirius_physical_operator>> inserted_operators_;
   std::vector<repository_wiring> repository_wirings_;
   std::size_t meta_pipeline_count_ = 0;
+  //! Pipelines absorbed into an upstream merge pipeline during splitting.
+  std::unordered_set<sirius_pipeline*> absorbed_pipelines_;
 };
 
 }  // namespace pipeline
