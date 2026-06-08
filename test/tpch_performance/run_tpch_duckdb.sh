@@ -20,8 +20,8 @@
 #   --multi-session       Run each query in its own DuckDB process
 #   --gpu-native-scan     Re-assert the GPU-native DuckDB scan (sirius only). REDUNDANT:
 #                         the GPU-native scan is the engine default now, so the plain
-#                         `sirius` engine already routes seq_scan to it. Kept for
-#                         backward compatibility and for SIRIUS_NATIVE_SCAN_VERIFY.
+#                         `sirius` engine already routes seq_scan to it. Kept as a no-op
+#                         backward-compatibility alias.
 #
 # Example:
 #   ./test/tpch_performance/run_tpch_duckdb.sh sirius 1 `seq 1 22`   # uses GPU-native scan by default

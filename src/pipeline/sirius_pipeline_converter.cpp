@@ -423,6 +423,12 @@ bool sirius_pipeline_converter::insert_duckdb_native_scan_operator(
     return false;
   }
 
+  // Hand the validated walk to the split provider so it does not re-walk the segment
+  // metadata at execution time (the walk is the dominant cold-scan cost). Safe to reuse:
+  // the split provider runs within this same query transaction over the same storage and
+  // projection, so a re-walk would produce identical metadata.
+  scan_info->prewalked_metadata = std::move(native_metadata);
+
   auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_duckdb_native_scan_operator>(
     scan_op.types, scan_op.estimated_cardinality, std::move(scan_info));
 

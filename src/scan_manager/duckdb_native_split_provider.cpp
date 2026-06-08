@@ -105,24 +105,30 @@ std::vector<duckdb_native_split_provider::row_group_batch> partition_row_groups_
 
 duckdb_native_split_provider::duckdb_native_split_provider(
   op::scan::duckdb_native_scan_info info, std::shared_ptr<sirius::io::sirius_ioctx> io_ctx)
-  : _scan_info(std::make_shared<op::scan::duckdb_native_scan_info const>(std::move(info))),
-    _io_ctx(std::move(io_ctx))
+  : _io_ctx(std::move(io_ctx))
 {
-  if (_scan_info->storage == nullptr) {
+  if (info.storage == nullptr) {
     throw std::invalid_argument("duckdb_native_split_provider: scan_info.storage must be non-null");
   }
-  if (_scan_info->context == nullptr) {
+  if (info.context == nullptr) {
     throw std::invalid_argument("duckdb_native_split_provider: scan_info.context must be non-null");
   }
-  if (_scan_info->projected_cols.size() != _scan_info->projected_types.size()) {
+  if (info.projected_cols.size() != info.projected_types.size()) {
     throw std::invalid_argument(
       "duckdb_native_split_provider: projected_cols and projected_types must be parallel");
   }
 
-  _metadata = op::scan::walk_duckdb_native_metadata(*_scan_info->storage,
-                                                    *_scan_info->context,
-                                                    _scan_info->projected_cols,
-                                                    _scan_info->projected_types);
+  // Reuse the pipeline converter's plan-time walk when it cached one; the walk
+  // (DataTable::GetColumnSegmentInfo over every segment) is the dominant cold-scan cost
+  // and the converter has already paid it for the viability gate. Move it out of `info`
+  // before `info` is sealed into the const _scan_info below. Direct constructions (unit
+  // tests) carry no pre-walk and fall through to walking here.
+  if (info.prewalked_metadata.has_value()) {
+    _metadata = std::move(*info.prewalked_metadata);
+  } else {
+    _metadata = op::scan::walk_duckdb_native_metadata(
+      *info.storage, *info.context, info.projected_cols, info.projected_types);
+  }
   if (!_metadata.viable) {
     // Empty splits would hang the pipeline on the FULL barrier. The throw
     // surfaces as a query error and the extension's transparent fallback
@@ -132,6 +138,9 @@ duckdb_native_split_provider::duckdb_native_split_provider(
     throw std::runtime_error("duckdb-native scan rejected query: " +
                              _metadata.viability_failure_reason);
   }
+
+  // Seal the bind data now that any pre-walked metadata has been moved out of `info`.
+  _scan_info = std::make_shared<op::scan::duckdb_native_scan_info const>(std::move(info));
 
   // Mint the .db io_object once per query when the manager exposes sirius_ioctx AND the
   // database is file-backed. The scan task threads this onto every split so reads of .db

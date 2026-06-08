@@ -27,6 +27,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -60,6 +61,14 @@ struct duckdb_native_scan_info : public scan_info {
   duckdb::vector<sirius::logical_type> output_types;
 
   std::string db_path;
+
+  /// Metadata walk produced by the pipeline converter's plan-time viability gate.
+  /// When engaged, the split_provider reuses it instead of re-running
+  /// walk_duckdb_native_metadata — that walk (DataTable::GetColumnSegmentInfo over every
+  /// segment) is the dominant cold-scan cost, and the converter has already paid it once
+  /// to decide viability. nullopt when scan_info is built without a prior walk (e.g. unit
+  /// tests construct the provider directly); the provider then walks for itself.
+  std::optional<duckdb_native_metadata> prewalked_metadata;
 
   /// Single call only — moves *this into the returned split_provider.
   std::unique_ptr<scan_manager::split_provider> make_provider(
