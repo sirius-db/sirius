@@ -13,7 +13,10 @@ use sirius_telemetry_ui::TaskFilter;
 use smallvec::SmallVec;
 use uuid::Uuid;
 
+/// The reconstructed Task FSM.
 pub type Task = FsmEvents<ModelTaskTransition>;
+
+/// Builder for Task FSMs.
 pub type TaskBuilder = FsmEventsBuilder<ModelTaskTransition>;
 
 static QUEUE_ENTRY_CAPACITY: CapacityValue = CapacityValue {

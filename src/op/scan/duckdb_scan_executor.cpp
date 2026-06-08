@@ -595,12 +595,11 @@ void duckdb_scan_executor::manager_loop()
             auto output_data = get_scan_output(scan_task, stream);
             stream->synchronize();
 
+            scan_task->publish_output(*output_data, stream);
             scan_task->telemetry_handle().finalizing({
               .instance_name = "",
               .success       = true,
             });
-
-            scan_task->publish_output(*output_data, stream);
           }
 
           scan_task->telemetry_handle().exit();

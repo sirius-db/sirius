@@ -43,7 +43,7 @@ const QUEUE_ENTRIES_CAPACITY_NAME: &str = "capacity_entries";
 
 pub struct SiriusModel {
     pub(crate) query_engine: InMemoryQueryEngineModel,
-    pub(crate) task_resources: InMemoryResources,
+    pub(crate) arbitrary_resources: InMemoryResources,
     pub(crate) tasks: HashMap<Uuid, Task>,
     pub(crate) resource_group_types: HashMap<String, ResourceGroupTypeDecl>,
 }
@@ -68,9 +68,13 @@ impl Model for SiriusModel {
                 QueryEngineEntityId::Operator(uuid) => EntityRef::Operator(uuid),
                 QueryEngineEntityId::Port(uuid) => EntityRef::Port(uuid),
             })
-        } else if self.task_resources.resources.contains_key(&entity_id) {
+        } else if self.arbitrary_resources.resources.contains_key(&entity_id) {
             Ok(EntityRef::Resource(entity_id))
-        } else if self.task_resources.resource_groups.contains_key(&entity_id) {
+        } else if self
+            .arbitrary_resources
+            .resource_groups
+            .contains_key(&entity_id)
+        {
             Ok(EntityRef::ResourceGroup(entity_id))
         } else {
             self.tasks
@@ -163,19 +167,19 @@ impl
 
 impl ResourceCollection for SiriusModel {
     fn resources(&self) -> impl Iterator<Item = &dyn Resource> {
-        self.task_resources
+        self.arbitrary_resources
             .resources()
             .chain(self.query_engine.resources())
     }
 
     fn resource_groups(&self) -> impl Iterator<Item = &dyn ResourceGroup> {
-        self.task_resources
+        self.arbitrary_resources
             .resource_groups()
             .chain(self.query_engine.resource_groups())
     }
 
     fn resource(&self, resource_id: Uuid) -> AnalyzerResult<&dyn Resource> {
-        self.task_resources
+        self.arbitrary_resources
             .resource(resource_id)
             .or_else(|_| self.query_engine.resource(resource_id))
     }
@@ -183,13 +187,13 @@ impl ResourceCollection for SiriusModel {
     fn resource_type(&self, resource_type_name: &str) -> AnalyzerResult<&ResourceTypeDecl> {
         self.query_engine
             .resource_type(resource_type_name)
-            .or_else(|_| self.task_resources.resource_type(resource_type_name))
+            .or_else(|_| self.arbitrary_resources.resource_type(resource_type_name))
     }
 
     fn resource_group(&self, resource_group_id: Uuid) -> AnalyzerResult<&dyn ResourceGroup> {
         self.query_engine
             .resource_group(resource_group_id)
-            .or_else(|_| self.task_resources.resource_group(resource_group_id))
+            .or_else(|_| self.arbitrary_resources.resource_group(resource_group_id))
     }
 
     fn resource_group_child_groups(
@@ -201,15 +205,15 @@ impl ResourceCollection for SiriusModel {
             .query_engine
             .resource_group_child_groups(resource_group_id)
             .ok();
-        let task_resources =
-            self.task_resources
-                .resource_groups
-                .values()
-                .filter_map(move |group| {
-                    group
-                        .parent_group_id
-                        .and_then(|parent| (parent == resource_group_id).then_some(group.id))
-                });
+        let task_resources = self
+            .arbitrary_resources
+            .resource_groups
+            .values()
+            .filter_map(move |group| {
+                group
+                    .parent_group_id
+                    .and_then(|parent| (parent == resource_group_id).then_some(group.id))
+            });
         Ok(query_engine.into_iter().flatten().chain(task_resources))
     }
 
@@ -222,13 +226,13 @@ impl ResourceCollection for SiriusModel {
             .query_engine
             .resource_group_child_resources(resource_group_id)
             .ok();
-        let task_resources = self
-            .task_resources
-            .resources
-            .values()
-            .filter_map(move |resource| {
-                (resource.parent_group_id() == resource_group_id).then_some(resource.id)
-            });
+        let task_resources =
+            self.arbitrary_resources
+                .resources
+                .values()
+                .filter_map(move |resource| {
+                    (resource.parent_group_id() == resource_group_id).then_some(resource.id)
+                });
         Ok(query_engine.into_iter().flatten().chain(task_resources))
     }
 }
@@ -481,7 +485,7 @@ impl SiriusModelBuilder {
 
         let temp_model = SiriusModel {
             query_engine,
-            task_resources,
+            arbitrary_resources: task_resources,
             tasks,
             resource_group_types: HashMap::default(),
         };
@@ -489,7 +493,7 @@ impl SiriusModelBuilder {
         for group_type_decl in resource_group_types.values_mut() {
             for contained_resource_type in &group_type_decl.contains_resource_types {
                 if let Ok(resource_type) = temp_model
-                    .task_resources
+                    .arbitrary_resources
                     .resource_type(contained_resource_type)
                 {
                     for entity_type in &resource_type.used_by {
@@ -503,7 +507,7 @@ impl SiriusModelBuilder {
 
         Ok(SiriusModel {
             query_engine: temp_model.query_engine,
-            task_resources: temp_model.task_resources,
+            arbitrary_resources: temp_model.arbitrary_resources,
             tasks: temp_model.tasks,
             resource_group_types,
         })

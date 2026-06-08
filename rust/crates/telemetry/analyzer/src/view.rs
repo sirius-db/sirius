@@ -1,7 +1,7 @@
 use quent_analyzer::{
     AnalyzerError, AnalyzerResult, Entity, Model,
     resource::{
-        Resource, ResourceGroup, ResourceGroupTypeDecl, ResourceTypeDecl,
+        Resource, ResourceGroup, ResourceGroupTypeDecl, ResourceTypeDecl, Usage, Using,
         collection::ResourceCollection,
     },
 };
@@ -43,45 +43,42 @@ impl<'a> SiriusModelQueryView<'a> {
         let query_engine = InMemoryQueryEngineModelView::try_new(&model.query_engine, query_id)?;
         let pipeline_ids: HashSet<Uuid> = query_engine.operators.keys().copied().collect();
 
-        let tasks = model
-            .tasks
-            .values()
-            .filter(|task| {
-                task.pipeline_uuid()
-                    .is_some_and(|pipeline_uuid| pipeline_ids.contains(&pipeline_uuid))
-            })
-            .map(|task| (task.id(), task))
-            .collect::<HashMap<_, _>>();
+        // QE scoped to single query
+        let query_engine_view =
+            InMemoryQueryEngineModelView::try_new(&model.query_engine, query_id)?;
 
-        let resource_ids = tasks
-            .values()
-            .flat_map(|task| task.normalized_usages())
-            .map(|usage| usage.resource_id())
-            .collect::<HashSet<_>>();
-
-        let resources = model
-            .task_resources
-            .resources
-            .iter()
-            .filter(|(resource_id, _)| resource_ids.contains(resource_id))
-            .map(|(resource_id, resource)| (*resource_id, resource))
-            .collect::<HashMap<_, _>>();
-
+        // Only keep arbitrary groups that reference one of the QE model groups
         let resource_groups = model
-            .task_resources
+            .arbitrary_resources
             .resource_groups
             .iter()
-            .filter(|(_, group)| {
-                group
-                    .parent_group_id
-                    .is_some_and(|parent| query_engine.resource_group(parent).is_ok())
+            .filter(|(_, v)| {
+                v.parent_group_id
+                    .and_then(|parent| query_engine_view.resource_group(parent).ok())
+                    .is_some()
             })
-            .map(|(group_id, group)| (*group_id, group))
+            .map(|(k, v)| (*k, v))
             .collect::<HashMap<_, _>>();
 
-        Ok(Self {
+        let resources = model
+            .arbitrary_resources
+            .resources
+            .iter()
+            .filter(|(_, resource)| {
+                // This needs to reference a QE resource group:
+                let in_qe = query_engine_view
+                    .resource_group(resource.parent_group_id())
+                    .is_ok();
+                // Or an arbitrary resource group.
+                let in_sirius = resource_groups.contains_key(&resource.parent_group_id());
+                in_qe || in_sirius
+            })
+            .map(|(k, v)| (*k, v))
+            .collect::<HashMap<_, _>>();
+
+        let mut result = Self {
             resource_types: model
-                .task_resources
+                .arbitrary_resources
                 .resource_types
                 .iter()
                 .map(|(name, resource_type)| (name.clone(), resource_type))
@@ -94,8 +91,20 @@ impl<'a> SiriusModelQueryView<'a> {
             query_engine,
             resources,
             resource_groups,
-            tasks,
-        })
+            tasks: HashMap::default(),
+        };
+
+        result.tasks = model
+            .tasks
+            .values()
+            .map(|task| (task.id(), task))
+            .filter(|(_, task)| {
+                task.usages()
+                    .any(|usage| result.resource(usage.resource_id()).is_ok())
+            })
+            .collect();
+
+        Ok(result)
     }
 
     pub(crate) fn tasks(&self) -> impl Iterator<Item = &'a Task> + '_ {

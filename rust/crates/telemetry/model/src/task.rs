@@ -55,6 +55,7 @@ state! {
         },
         usages: {
             manager_thread: TaskManagerLoopThread,
+            // TODO: add memory resource usage
         },
     }
 }

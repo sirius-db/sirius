@@ -130,9 +130,9 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             plans = query_engine.plans.len(),
             operators = query_engine.operators.len(),
             ports = query_engine.ports.len(),
-            task_resources = model.task_resources.resources.len(),
-            task_resource_groups = model.task_resources.resource_groups.len(),
-            task_resource_types = model.task_resources.resource_types.len(),
+            task_resources = model.arbitrary_resources.resources.len(),
+            task_resource_groups = model.arbitrary_resources.resource_groups.len(),
+            task_resource_types = model.arbitrary_resources.resource_types.len(),
             resource_group_types = model.resource_group_types.len(),
             tasks = model.tasks.len(),
         );
@@ -184,7 +184,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             .collect();
         let resource_groups = self
             .model
-            .task_resources
+            .arbitrary_resources
             .resource_groups()
             .map(|group| (group.id(), group.into()))
             .collect();
@@ -1202,7 +1202,7 @@ mod tests {
                     task::TaskTransition::Computing(task::Computing {
                         instance_name: String::new(),
                         current_operator_id: 42,
-                        output_bytes: 2048,
+                        input_bytes: 2048,
                         executor_thread: Some(Usage {
                             resource_id: Ref::new(executor_id),
                             capacity: Default::default(),
