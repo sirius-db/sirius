@@ -59,8 +59,8 @@ class uring_io_object;
 // rmm
 #include <rmm/cuda_stream_view.hpp>
 
-// sirius scan operator data
-#include <op/scan/parquet_scan_operator_data.hpp>
+// sirius row-group metadata (shared with parquet_gpu_ingestible)
+#include <op/scan/row_group_metadata.hpp>
 
 // standard library
 #include <atomic>

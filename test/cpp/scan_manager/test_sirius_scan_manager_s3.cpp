@@ -35,6 +35,11 @@
 
 #include <cudf/io/text/byte_range_info.hpp>
 
+#include <rmm/cuda_stream.hpp>
+#include <rmm/device_buffer.hpp>
+
+#include <cuda_runtime_api.h>
+
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 
@@ -156,6 +161,40 @@ std::vector<std::uint8_t> read_binary_file(fs::path const& path)
   std::ifstream in(path, std::ios::binary);
   REQUIRE(in.good());
   return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+void require_cuda_success(cudaError_t status)
+{
+  INFO(cudaGetErrorString(status));
+  REQUIRE(status == cudaSuccess);
+}
+
+std::vector<std::uint8_t> copy_device_to_host(rmm::device_buffer const& device, std::size_t bytes)
+{
+  REQUIRE(bytes <= device.size());
+  std::vector<std::uint8_t> host(bytes);
+  if (bytes > 0) {
+    require_cuda_success(cudaMemcpy(host.data(), device.data(), bytes, cudaMemcpyDeviceToHost));
+  }
+  return host;
+}
+
+std::vector<std::uint8_t> read_s3_object_to_device(duckdb::SiriusContext& context,
+                                                   std::string const& uri,
+                                                   std::size_t bytes)
+{
+  auto s3_ctx = context.get_s3_ioctx();
+  REQUIRE(s3_ctx != nullptr);
+  auto obj = s3_ctx->create_io_object(uri);
+  REQUIRE(obj != nullptr);
+  REQUIRE(obj->size() >= bytes);
+
+  rmm::cuda_stream stream;
+  rmm::device_buffer dst(bytes, stream);
+  auto const got =
+    s3_ctx->device_read(*obj, 0, bytes, static_cast<std::uint8_t*>(dst.data()), stream);
+  CHECK(got == bytes);
+  return copy_device_to_host(dst, got);
 }
 
 std::string s3_uri(std::string_view bucket, std::string_view key)
@@ -570,6 +609,85 @@ TEST_CASE("SiriusContext owns S3 ioctx beyond borrowed scan_manager lifetime",
   CHECK_FALSE(weak_s3.expired());
   context.terminate();
   CHECK(weak_s3.expired());
+}
+
+TEST_CASE("SiriusContext with s3_use_async_backend=false selects the blocking backend",
+          "[.][s3][integration][scan_manager]")
+{
+  auto env = read_s3_test_env();
+  if (!env) {
+    WARN("Skipping blocking-backend selection test because SIRIUS_TEST_S3_* is not configured");
+    return;
+  }
+
+  auto cfg                                     = make_context_config("integration_s3cache.yaml");
+  cfg.object_store_config.endpoint             = env->endpoint;
+  cfg.object_store_config.region               = env->region;
+  cfg.object_store_config.access_key           = env->access_key;
+  cfg.object_store_config.secret_key           = env->secret_key;
+  cfg.object_store_config.s3_use_async_backend = false;
+
+  duckdb::SiriusContext context;
+  context.initialize(cfg);
+
+  auto s3_ctx = context.get_s3_ioctx();
+  REQUIRE(s3_ctx != nullptr);
+  CHECK(dynamic_cast<s3_blocking_ioctx*>(s3_ctx.get()) != nullptr);
+  CHECK(dynamic_cast<s3_ioctx*>(s3_ctx.get()) == nullptr);
+
+  s3_ctx.reset();
+  context.terminate();
+}
+
+TEST_CASE("async and blocking S3 backends device_read the same bytes as the local oracle",
+          "[.][s3][integration][scan_manager][asynccurl]")
+{
+  auto env = read_s3_test_env();
+  if (!env) {
+    WARN("Skipping S3 device_read parity test because SIRIUS_TEST_S3_* is not configured");
+    return;
+  }
+  if (env->local_dir.empty()) {
+    WARN("Skipping S3 device_read parity test because SIRIUS_TEST_S3_LOCAL_DIR is not configured");
+    return;
+  }
+
+  std::string const key = "small.bin";
+  auto const oracle     = read_binary_file(env->local_dir / key);
+  REQUIRE_FALSE(oracle.empty());
+  REQUIRE(oracle.size() < sirius::io::CHUNK_SIZE);
+  auto const uri = s3_uri(env->bucket, key);
+
+  auto run_with_backend = [&](bool use_async) {
+    auto cfg                                     = make_context_config("integration_s3cache.yaml");
+    cfg.object_store_config.endpoint             = env->endpoint;
+    cfg.object_store_config.region               = env->region;
+    cfg.object_store_config.access_key           = env->access_key;
+    cfg.object_store_config.secret_key           = env->secret_key;
+    cfg.object_store_config.s3_use_async_backend = use_async;
+
+    duckdb::SiriusContext context;
+    context.initialize(cfg);
+    {
+      auto s3_ctx = context.get_s3_ioctx();
+      REQUIRE(s3_ctx != nullptr);
+      if (use_async) {
+        REQUIRE(dynamic_cast<s3_ioctx*>(s3_ctx.get()) != nullptr);
+      } else {
+        REQUIRE(dynamic_cast<s3_blocking_ioctx*>(s3_ctx.get()) != nullptr);
+      }
+    }
+    auto bytes = read_s3_object_to_device(context, uri, oracle.size());
+    context.terminate();
+    return bytes;
+  };
+
+  auto const blocking_bytes = run_with_backend(false);
+  auto const async_bytes    = run_with_backend(true);
+
+  CHECK(blocking_bytes == oracle);
+  CHECK(async_bytes == oracle);
+  CHECK(async_bytes == blocking_bytes);
 }
 
 TEST_CASE("SiriusContext initializes prefetch cache on real local gpu ioctxs",
