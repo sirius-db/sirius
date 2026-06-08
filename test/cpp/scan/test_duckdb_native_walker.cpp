@@ -31,6 +31,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 using namespace sirius;
 using namespace sirius::op::scan;
@@ -100,6 +101,35 @@ filter_ctx make_constant_filter(duckdb::idx_t col_key,
   return ctx;
 }
 
+/// Runs the pre-step plus a single full-table range and combines them into one
+/// result. Exercises `prepare_duckdb_native_walk` and
+/// `walk_duckdb_native_row_group_range`. Optional filters drive statistics
+/// pruning.
+struct walk_result {
+  std::vector<duckdb_row_group_metadata> row_groups;
+  bool viable = false;
+  std::string viability_failure_reason;
+  std::size_t pruned_row_groups    = 0;
+  std::size_t pruned_decoded_bytes = 0;
+};
+
+walk_result walk_all(duckdb::DataTable& storage,
+                     duckdb::ClientContext& ctx,
+                     const std::vector<projected_column>& cols,
+                     const std::vector<sirius::logical_type>& types,
+                     const duckdb::TableFilterSet* table_filters           = nullptr,
+                     const duckdb::vector<duckdb::ColumnIndex>* column_ids = nullptr)
+{
+  auto plan = prepare_duckdb_native_walk(storage, ctx, cols, types, table_filters, column_ids);
+  if (!plan.viable) { return {{}, false, std::move(plan.viability_failure_reason), 0, 0}; }
+  auto range = walk_duckdb_native_row_group_range(plan, 0, plan.n_row_groups);
+  return {std::move(range.row_groups),
+          range.viable,
+          std::move(range.viability_failure_reason),
+          range.pruned_row_groups,
+          range.pruned_decoded_bytes};
+}
+
 }  // namespace
 
 TEST_CASE("walker refuses empty projection", "[scan][duckdb_native_walker]")
@@ -109,7 +139,7 @@ TEST_CASE("walker refuses empty projection", "[scan][duckdb_native_walker]")
   exec_ok(con, "INSERT INTO t SELECT range FROM range(0, 100)");
   auto& storage = get_storage(con, "t");
 
-  auto md = walk_duckdb_native_metadata(storage, *con.context, {}, {});
+  auto md = walk_all(storage, *con.context, {}, {});
   REQUIRE_FALSE(md.viable);
   REQUIRE(md.viability_failure_reason.find("no projected columns") != std::string::npos);
 }
@@ -122,7 +152,7 @@ TEST_CASE("walker refuses parallel-vector mismatch", "[scan][duckdb_native_walke
 
   std::vector<projected_column> cols   = {real_col(0)};
   std::vector<sirius::logical_type> ts = {};
-  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  auto md                              = walk_all(storage, *con.context, cols, ts);
   REQUIRE_FALSE(md.viable);
   REQUIRE(md.viability_failure_reason.find("size mismatch") != std::string::npos);
 }
@@ -136,7 +166,7 @@ TEST_CASE("walker refuses HUGEINT type", "[scan][duckdb_native_walker]")
 
   std::vector<projected_column> cols   = {real_col(0)};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::HUGEINT)};
-  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  auto md                              = walk_all(storage, *con.context, cols, ts);
   REQUIRE_FALSE(md.viable);
   REQUIRE(md.viability_failure_reason.find("HUGEINT") != std::string::npos);
 }
@@ -152,7 +182,7 @@ TEST_CASE("walker emits descriptors for INTEGER table", "[scan][duckdb_native_wa
 
   std::vector<projected_column> cols   = {real_col(0)};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::INTEGER)};
-  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  auto md                              = walk_all(storage, *con.context, cols, ts);
   REQUIRE(md.viable);
   REQUIRE(md.viability_failure_reason.empty());
   REQUIRE_FALSE(md.row_groups.empty());
@@ -184,7 +214,7 @@ TEST_CASE("walker emits rowid sentinels with no segments", "[scan][duckdb_native
     sirius::logical_type::make(sirius::type_id::INTEGER),
     sirius::logical_type::make(sirius::type_id::BIGINT),
   };
-  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  auto md = walk_all(storage, *con.context, cols, ts);
   REQUIRE(md.viable);
   REQUIRE_FALSE(md.row_groups.empty());
 
@@ -213,7 +243,7 @@ TEST_CASE("walker rowid-only projection gets row_count from PartitionStats",
 
   std::vector<projected_column> cols   = {rowid_col()};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::BIGINT)};
-  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  auto md                              = walk_all(storage, *con.context, cols, ts);
   REQUIRE(md.viable);
   REQUIRE_FALSE(md.row_groups.empty());
 
@@ -243,7 +273,7 @@ TEST_CASE("walker separates data and validity segments by column_path",
 
   std::vector<projected_column> cols   = {real_col(0)};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::INTEGER)};
-  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  auto md                              = walk_all(storage, *con.context, cols, ts);
   REQUIRE(md.viable);
   REQUIRE_FALSE(md.row_groups.empty());
 
@@ -269,7 +299,7 @@ TEST_CASE("walker populates per-segment max_string_length for VARCHAR",
 
   std::vector<projected_column> cols   = {real_col(0)};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::VARCHAR)};
-  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  auto md                              = walk_all(storage, *con.context, cols, ts);
   REQUIRE(md.viable);
   REQUIRE_FALSE(md.row_groups.empty());
   for (const auto& rg : md.row_groups) {
@@ -294,7 +324,7 @@ TEST_CASE("walker accepts all-empty varchar row group (Some(0))", "[scan][duckdb
 
   std::vector<projected_column> cols   = {real_col(0)};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::VARCHAR)};
-  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  auto md                              = walk_all(storage, *con.context, cols, ts);
 
   REQUIRE(md.viable);
   REQUIRE_FALSE(md.row_groups.empty());
@@ -326,7 +356,7 @@ TEST_CASE("walker per-segment max_string_length reflects long strings",
 
   std::vector<projected_column> cols   = {real_col(0)};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::VARCHAR)};
-  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  auto md                              = walk_all(storage, *con.context, cols, ts);
   REQUIRE(md.viable);
   REQUIRE_FALSE(md.row_groups.empty());
 
@@ -347,7 +377,7 @@ TEST_CASE("walker refuses DECIMAL128 (precision > 18)", "[scan][duckdb_native_wa
 
   std::vector<projected_column> cols   = {real_col(0)};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make_decimal(38, 0)};
-  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  auto md                              = walk_all(storage, *con.context, cols, ts);
   REQUIRE_FALSE(md.viable);
   REQUIRE(md.viability_failure_reason.find("DECIMAL128") != std::string::npos);
 }
@@ -362,7 +392,7 @@ TEST_CASE("walker accepts DECIMAL64 (precision <= 18)", "[scan][duckdb_native_wa
 
   std::vector<projected_column> cols   = {real_col(0)};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make_decimal(18, 2)};
-  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  auto md                              = walk_all(storage, *con.context, cols, ts);
   REQUIRE(md.viable);
   REQUIRE_FALSE(md.row_groups.empty());
 }
@@ -378,7 +408,7 @@ TEST_CASE("walker refuses STRUCT projected type", "[scan][duckdb_native_walker]"
 
   std::vector<projected_column> cols   = {real_col(0)};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::STRUCT)};
-  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  auto md                              = walk_all(storage, *con.context, cols, ts);
   REQUIRE_FALSE(md.viable);
   REQUIRE(md.viability_failure_reason.find("STRUCT") != std::string::npos);
 }
@@ -392,7 +422,7 @@ TEST_CASE("walker refuses LIST projected type", "[scan][duckdb_native_walker]")
 
   std::vector<projected_column> cols   = {real_col(0)};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::LIST)};
-  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  auto md                              = walk_all(storage, *con.context, cols, ts);
   REQUIRE_FALSE(md.viable);
   REQUIRE(md.viability_failure_reason.find("LIST") != std::string::npos);
 }
@@ -500,7 +530,7 @@ TEST_CASE("statistics pruning drops row groups below a lower-bound filter",
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::INTEGER)};
 
   // Baseline: no filter → nothing pruned.
-  auto base = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  auto base = walk_all(storage, *con.context, cols, ts);
   REQUIRE(base.viable);
   REQUIRE(base.pruned_row_groups == 0);
   REQUIRE(base.row_groups.size() >= 2);  // 300k rows > one 122880-row group
@@ -508,8 +538,7 @@ TEST_CASE("statistics pruning drops row groups below a lower-bound filter",
   // a >= 250000 → row groups entirely below 250000 are FILTER_ALWAYS_FALSE.
   auto ctx = make_constant_filter(
     0, 0, duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::INTEGER(250000));
-  auto pruned =
-    walk_duckdb_native_metadata(storage, *con.context, cols, ts, &ctx.filters, &ctx.column_ids);
+  auto pruned = walk_all(storage, *con.context, cols, ts, &ctx.filters, &ctx.column_ids);
 
   REQUIRE(pruned.viable);
   REQUIRE(pruned.pruned_row_groups >= 1);
@@ -540,15 +569,14 @@ TEST_CASE("statistics pruning keeps every row group when the filter matches all"
   // a >= 0 is always true for this data → no row group can be pruned.
   auto ctx = make_constant_filter(
     0, 0, duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::INTEGER(0));
-  auto md =
-    walk_duckdb_native_metadata(storage, *con.context, cols, ts, &ctx.filters, &ctx.column_ids);
+  auto md = walk_all(storage, *con.context, cols, ts, &ctx.filters, &ctx.column_ids);
 
   REQUIRE(md.viable);
   REQUIRE(md.pruned_row_groups == 0);
   REQUIRE(md.pruned_decoded_bytes == 0);
 }
 
-TEST_CASE("statistics pruning refuses (CPU fallback) when every row group is pruned",
+TEST_CASE("statistics pruning drops every row group when the filter excludes all data",
           "[scan][duckdb_native_walker][pruning]")
 {
   auto [db_owner, con] = sirius::make_test_db_and_connection();
@@ -557,16 +585,18 @@ TEST_CASE("statistics pruning refuses (CPU fallback) when every row group is pru
   std::vector<projected_column> cols   = {real_col(0)};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::INTEGER)};
 
-  // a >= 1_000_000 exceeds every value → all row groups FILTER_ALWAYS_FALSE.
-  // The walker drops them all and refuses so the query routes to DuckDB CPU
-  // (which correctly returns the empty result).
+  auto base = walk_all(storage, *con.context, cols, ts);
+  REQUIRE(base.viable);
+
+  // a >= 1_000_000 exceeds every value → every row group is FILTER_ALWAYS_FALSE
+  // and the walk keeps none, yielding a viable empty result.
   auto ctx = make_constant_filter(
     0, 0, duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::INTEGER(1000000));
-  auto md =
-    walk_duckdb_native_metadata(storage, *con.context, cols, ts, &ctx.filters, &ctx.column_ids);
+  auto md = walk_all(storage, *con.context, cols, ts, &ctx.filters, &ctx.column_ids);
 
-  REQUIRE_FALSE(md.viable);
-  REQUIRE(md.viability_failure_reason.find("pruned") != std::string::npos);
+  REQUIRE(md.viable);
+  REQUIRE(md.row_groups.empty());
+  REQUIRE(md.pruned_row_groups == base.row_groups.size());
 }
 
 // Guards the relaxation that lets us prune on any static filter, not just the
@@ -588,8 +618,7 @@ TEST_CASE("statistics pruning prunes through an OPTIONAL_FILTER wrapper",
       duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::INTEGER(250000)));
   ctx.column_ids.push_back(duckdb::ColumnIndex(0));
 
-  auto md =
-    walk_duckdb_native_metadata(storage, *con.context, cols, ts, &ctx.filters, &ctx.column_ids);
+  auto md = walk_all(storage, *con.context, cols, ts, &ctx.filters, &ctx.column_ids);
 
   REQUIRE(md.viable);
   REQUIRE(md.pruned_row_groups >= 1);
