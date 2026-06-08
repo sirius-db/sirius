@@ -29,6 +29,14 @@
 
 #include "catch.hpp"
 #include "test_helpers_ioctx.hpp"
+#include "test_utils.hpp"
+
+#include <cudf/io/datasource.hpp>
+#include <cudf/io/text/byte_range_info.hpp>
+#include <cudf/utilities/span.hpp>
+
+#include <rmm/cuda_stream.hpp>
+#include <rmm/cuda_stream_view.hpp>
 
 #include <duckdb.hpp>
 #include <duckdb/common/types.hpp>
@@ -36,13 +44,22 @@
 #include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/table_filter.hpp>
 #include <helper/logical_type.hpp>
+#include <io/io_context.hpp>
+#include <io/types.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 
+#include <cstddef>
+#include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <memory>
+#include <span>
+#include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -138,6 +155,161 @@ duckdb::unique_ptr<duckdb::TableFilterSet> make_amount_lt_filter(int precision, 
                         duckdb::ExpressionType::COMPARE_LESSTHAN,
                         duckdb::Value::DECIMAL(static_cast<int64_t>(625000), precision, scale)));
   return filters;
+}
+
+// =====================================================================
+// Helpers for the kvikio-fallback datasource-routing guards (port of
+// upstream sirius-db/sirius#889 to the gpu_ingestible architecture).
+// =====================================================================
+
+class routing_test_io_object final : public sirius::io::sirius_io_object {
+ public:
+  routing_test_io_object(std::string path, std::size_t size) : _path(std::move(path)), _size(size)
+  {
+  }
+
+  [[nodiscard]] std::string const& raw_file_cache_id() const noexcept override { return _path; }
+  [[nodiscard]] std::string const& object_path() const noexcept override { return _path; }
+  [[nodiscard]] std::size_t size() const noexcept override { return _size; }
+
+ private:
+  std::string _path;
+  std::size_t _size;
+};
+
+// Spy ioctx — counts make_datasource() calls and returns a cudf datasource
+// backed by a real local parquet file. Every other override reports an
+// error so the test fails loudly if materialize_table takes an unexpected
+// read route through the spy.
+class routing_spy_ioctx final : public sirius::io::sirius_ioctx {
+ public:
+  explicit routing_spy_ioctx(std::filesystem::path local_parquet_path)
+    : _local_parquet_path(std::move(local_parquet_path))
+  {
+  }
+
+  void shutdown() override {}
+
+  std::shared_ptr<sirius::io::sirius_io_object> create_io_object(std::string path) override
+  {
+    return std::make_shared<routing_test_io_object>(
+      std::move(path), std::filesystem::file_size(_local_parquet_path));
+  }
+
+  std::unique_ptr<cudf::io::datasource> make_datasource(
+    std::shared_ptr<sirius::io::sirius_io_object>) override
+  {
+    ++make_datasource_calls;
+    return cudf::io::datasource::create(_local_parquet_path.string());
+  }
+
+  [[nodiscard]] bool supports(std::string_view path) const override
+  {
+    return path.rfind("s3://", 0) == 0;
+  }
+
+  std::size_t host_read_io(sirius::io::sirius_io_object&,
+                           std::size_t,
+                           std::size_t,
+                           std::uint8_t*) override
+  {
+    throw std::logic_error("routing_spy_ioctx: host_read_io should not be used");
+  }
+
+  void host_read_async_io(sirius::io::sirius_io_object&,
+                          std::size_t,
+                          std::size_t,
+                          std::uint8_t*,
+                          sirius::io::io_completion_handler handler) override
+  {
+    handler(0,
+            std::make_exception_ptr(
+              std::logic_error("routing_spy_ioctx: host_read_async_io should not be used")));
+  }
+
+  std::size_t device_read_io(sirius::io::sirius_io_object&,
+                             std::size_t,
+                             std::size_t,
+                             std::uint8_t*,
+                             rmm::cuda_stream_view) override
+  {
+    throw std::logic_error("routing_spy_ioctx: device_read_io should not be used");
+  }
+
+  void device_read_async_io(sirius::io::sirius_io_object&,
+                            std::size_t,
+                            std::size_t,
+                            std::uint8_t*,
+                            rmm::cuda_stream_view,
+                            sirius::io::io_completion_handler handler) override
+  {
+    handler(0,
+            std::make_exception_ptr(
+              std::logic_error("routing_spy_ioctx: device_read_async_io should not be used")));
+  }
+
+  void host_read_ranges_async_io(sirius::io::sirius_io_object&,
+                                 std::vector<cudf::io::text::byte_range_info> const&,
+                                 std::span<cudf::host_span<std::byte>>,
+                                 sirius::io::io_completion_handler handler) override
+  {
+    handler(0,
+            std::make_exception_ptr(
+              std::logic_error("routing_spy_ioctx: host_read_ranges_async_io should not be used")));
+  }
+
+  cudf::io::text::byte_range_info compute_physical_range(cudf::io::text::byte_range_info logical,
+                                                         std::size_t) const override
+  {
+    return logical;
+  }
+
+  int make_datasource_calls{0};
+
+ private:
+  std::filesystem::path _local_parquet_path;
+};
+
+// Drain the ingestible once to grab a real parquet_split_info (so the test
+// inherits real reader_options, scan_plan, file_metadata, and row_group
+// indices), then mint a fresh single-slice parquet_split_info whose
+// file_path and io_ctx are swapped for the routing-test fixtures.
+std::unique_ptr<sscan::parquet_split_info> make_routing_split_info(
+  std::filesystem::path const& local_parquet_path,
+  sscan::parquet_gpu_ingestible& ingestible,
+  std::string slice_path,
+  std::shared_ptr<sirius::io::sirius_ioctx> io_ctx)
+{
+  auto splits = drain_ingestible(ingestible);
+  REQUIRE_FALSE(splits.empty());
+
+  auto* input = dynamic_cast<sscan::scan_operator_input*>(splits.front().get());
+  REQUIRE(input != nullptr);
+  REQUIRE(input->metadata != nullptr);
+  auto const& real_pinfo = dynamic_cast<sscan::parquet_split_info const&>(input->metadata->scan());
+  REQUIRE_FALSE(real_pinfo.rg_slices.empty());
+  auto const& real_slice = real_pinfo.rg_slices.front();
+
+  auto fake_pinfo                     = std::make_unique<sscan::parquet_split_info>();
+  fake_pinfo->reader_options          = real_pinfo.reader_options;
+  fake_pinfo->plan                    = real_pinfo.plan;
+  fake_pinfo->disable_filter_pushdown = real_pinfo.disable_filter_pushdown;
+  fake_pinfo->partition_values        = real_pinfo.partition_values;
+  fake_pinfo->needs_assembly          = real_pinfo.needs_assembly;
+
+  std::shared_ptr<sirius::io::sirius_io_object> io_object;
+  if (io_ctx) {
+    io_object = std::make_shared<routing_test_io_object>(
+      slice_path, std::filesystem::file_size(local_parquet_path));
+  }
+  fake_pinfo->rg_slices.emplace_back(real_slice.file_metadata,
+                                     std::move(slice_path),
+                                     real_slice.row_group_indices,
+                                     real_slice.reserved_uncompressed_bytes,
+                                     real_slice.reserved_compressed_bytes,
+                                     std::move(io_ctx),
+                                     std::move(io_object));
+  return fake_pinfo;
 }
 
 }  // namespace
@@ -256,6 +428,87 @@ TEST_CASE("parquet_gpu_ingestible - no-filter scan emits a single scan_operator_
   REQUIRE(parquet_info->reader_options != nullptr);
   REQUIRE(parquet_info->plan != nullptr);
   REQUIRE_FALSE(parquet_info->rg_slices.empty());
+
+  std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("parquet_gpu_ingestible - s3 slice with non-null io_ctx routes through spy",
+          "[scan][parquet_gpu_ingestible][s3][datasource-routing]")
+{
+  // Guard for sirius-db/sirius#889 (commit 498ea6c03 on this branch): when
+  // _gpu_ioctxs is empty (single-GPU use_sirius_datasource=false / kvikio
+  // fallback), the materialize path must still honor slice.io_ctx and route
+  // the read through it. The pre-fix code gated the cudf fallback on
+  // kvikio_fallback_mode || !slice.io_ctx, which broke s3:// reads because
+  // kvikio has no S3 scheme support — calling
+  // cudf::io::datasource::create("s3://...") would fail with
+  // "Unsupported URL scheme".
+  auto const dir  = std::filesystem::temp_directory_path() / "pgi_s3_route_test";
+  auto const path = write_decimal_parquet(dir,
+                                          "s3_route",
+                                          /*precision=*/10,
+                                          /*scale=*/2,
+                                          /*row_count=*/2000,
+                                          /*row_group_size=*/1000);
+
+  auto table_info = make_table_info(path,
+                                    /*precision=*/10,
+                                    /*scale=*/2,
+                                    /*filters=*/nullptr);
+
+  sirius::scan_manager::sirius_scan_manager mgr({});
+  // Empty gpu_ioctxs forces kvikio_fallback_mode = true inside
+  // materialize_table — this is the scenario the bug regressed on.
+  sscan::parquet_gpu_ingestible ingestible(std::move(table_info), mgr, /*gpu_ioctxs=*/{});
+
+  auto spy = std::make_shared<routing_spy_ioctx>(path);
+  auto fake_pinfo =
+    make_routing_split_info(path, ingestible, "s3://fake-bucket/s3_route.parquet", spy);
+
+  auto mem_mgr    = initialize_memory_manager(/*n_gpus=*/1);
+  auto* gpu_space = sirius::scan_test_utils::get_space(*mem_mgr, cucascade::memory::Tier::GPU);
+  REQUIRE(gpu_space != nullptr);
+  rmm::cuda_stream stream;
+
+  auto filtered = ingestible.materialize_table(*fake_pinfo, *gpu_space, stream.view());
+
+  CHECK(spy->make_datasource_calls == 1);
+  REQUIRE(filtered.table != nullptr);
+
+  std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("parquet_gpu_ingestible - local slice with null io_ctx falls through to kvikio",
+          "[scan][parquet_gpu_ingestible][datasource-routing]")
+{
+  // Complement of the s3 routing guard above: a slice with io_ctx == nullptr
+  // must continue to use cudf's bundled datasource (kvikio) — the local
+  // single-GPU fast path the bug fix preserves.
+  auto const dir  = std::filesystem::temp_directory_path() / "pgi_local_kvikio_test";
+  auto const path = write_decimal_parquet(dir,
+                                          "local_kvikio",
+                                          /*precision=*/10,
+                                          /*scale=*/2,
+                                          /*row_count=*/2000,
+                                          /*row_group_size=*/1000);
+
+  auto table_info = make_table_info(path,
+                                    /*precision=*/10,
+                                    /*scale=*/2,
+                                    /*filters=*/nullptr);
+
+  sirius::scan_manager::sirius_scan_manager mgr({});
+  sscan::parquet_gpu_ingestible ingestible(std::move(table_info), mgr, /*gpu_ioctxs=*/{});
+
+  auto fake_pinfo = make_routing_split_info(path, ingestible, path.string(), /*io_ctx=*/nullptr);
+
+  auto mem_mgr    = initialize_memory_manager(/*n_gpus=*/1);
+  auto* gpu_space = sirius::scan_test_utils::get_space(*mem_mgr, cucascade::memory::Tier::GPU);
+  REQUIRE(gpu_space != nullptr);
+  rmm::cuda_stream stream;
+
+  auto filtered = ingestible.materialize_table(*fake_pinfo, *gpu_space, stream.view());
+  REQUIRE(filtered.table != nullptr);
 
   std::filesystem::remove_all(dir);
 }
