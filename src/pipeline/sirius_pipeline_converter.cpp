@@ -647,8 +647,11 @@ void sirius_pipeline_converter::split_join_sink(
   inserted_operators_.push_back(std::move(concat_op));
 }
 
+// Merge-pipeline downstream fusion: fold streaming ops (e.g. RESULT_COLLECTOR) into the
+// merge pipeline so they run in the same gpu_pipeline_task as MERGE_GROUP_BY / MERGE_TOP_N.
 namespace {
 
+// Pipelineable intermediates only — not scans (is_source) or structural sinks (is_sink).
 bool is_fusable_downstream_operator(const op::sirius_physical_operator& op)
 {
   return !op.is_sink() && !op.is_source();
@@ -677,7 +680,8 @@ bool sirius_pipeline_converter::try_fuse_downstream_pipelineable(
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
   size_t from_pipeline_idx)
 {
-  // If any downstream pipeline from this aggregate ends in a structural sink, do not fuse.
+  // Guard 1: direct consumer is a structural sink — fusion would skip its split_* path.
+  // e.g. GROUP_BY -> HASH_JOIN; join needs its own PARTITION/CONCAT pipelines.
   for (size_t j = from_pipeline_idx + 1; j < copied_scheduled.size(); j++) {
     auto& downstream = copied_scheduled[j];
     if (downstream->source.get() != original_agg_source) { continue; }
@@ -688,8 +692,10 @@ bool sirius_pipeline_converter::try_fuse_downstream_pipelineable(
     auto& downstream = copied_scheduled[j];
     if (downstream->source.get() != original_agg_source) { continue; }
 
-    // Do not fuse a pipelineable downstream when a later structural pipeline reads
-    // from its output (e.g. GROUP_BY -> PROJECTION then PROJECTION -> HASH_JOIN).
+    // Guard 2: a later structural pipeline reads from this candidate's output — keep the
+    // candidate as its own pipeline boundary. e.g. GROUP_BY -> PROJECTION -> HASH_JOIN:
+    // fusing PROJECTION into MERGE_GROUP_BY leaves HASH_JOIN still sourced at PROJECTION, but
+    // attach_merge_and_fuse_downstream only repoints source==GROUP_BY, not source==PROJECTION.
     for (size_t k = j + 1; k < copied_scheduled.size(); k++) {
       auto& later = copied_scheduled[k];
       if (!sink_needs_pipeline_split(later->get_sink()->type)) { continue; }
@@ -700,10 +706,14 @@ bool sirius_pipeline_converter::try_fuse_downstream_pipelineable(
       }
     }
 
+    // Guard 3: every op in the candidate must be a plain intermediate (not source/sink).
+    // e.g. reject a downstream pipeline that still contains a scan or blocking operator.
     for (auto& op_ref : downstream->operators) {
       if (!is_fusable_downstream_operator(op_ref.get())) { return false; }
     }
 
+    // Success: one pipeline runs PARTITION/TOP_N input -> merge -> downstream chain.
+    // The absorbed pipeline must not be scheduled again (see split_pipelines).
     merge_pipeline->operators.push_back(*merge_op);
     for (auto& op_ref : downstream->operators) {
       merge_pipeline->operators.push_back(op_ref);
@@ -736,7 +746,9 @@ void sirius_pipeline_converter::attach_merge_and_fuse_downstream(
 
   if (!fused) { merge_pipeline->sink = merge_op; }
 
-  // Repoint not-yet-split downstream pipelines to read from the merge op.
+  // Always repoint, even when fusion failed — downstream must read merged output, not
+  // partial aggregate/top-N. Only pipelines still sourced at original_agg_source are updated;
+  // consumers wired to intermediate ops (e.g. PROJECTION) are left unchanged.
   for (size_t j = from_pipeline_idx + 1; j < copied_scheduled.size(); j++) {
     auto& downstream = copied_scheduled[j];
     if (absorbed_pipelines_.count(downstream.get()) > 0) { continue; }
@@ -1038,6 +1050,7 @@ void sirius_pipeline_converter::split_pipelines(
 {
   for (size_t i = 0; i < copied_scheduled.size(); i++) {
     auto current_pipeline = copied_scheduled[i];  // Copy duckdb::shared_ptr to avoid invalidation
+    // Downstream pipelines folded into a merge pipeline are already part of scheduled_.
     if (absorbed_pipelines_.count(current_pipeline.get()) > 0) { continue; }
 
     // Preprocessing: replace TABLE_SCAN source with concrete scan operator

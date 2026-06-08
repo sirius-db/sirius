@@ -328,6 +328,7 @@ size_t count_operator_type(const duckdb::vector<duckdb::shared_ptr<sirius_pipeli
 
 }  // namespace
 
+// Downstream is only RESULT_COLLECTOR — no structural consumer, fusion allowed.
 TEST_CASE("merge fusion folds downstream after GROUP BY", "[pipeline_converter][merge_fusion]")
 {
   auto state = setup_and_convert(R"(
@@ -342,6 +343,7 @@ TEST_CASE("merge fusion folds downstream after GROUP BY", "[pipeline_converter][
     has_standalone_merge_pipeline(pipelines, SiriusPhysicalOperatorType::MERGE_GROUP_BY));
 }
 
+// Same dead-end shape as GROUP BY; exercises split_top_n_sink fusion path.
 TEST_CASE("merge fusion folds downstream after TOP_N", "[pipeline_converter][merge_fusion]")
 {
   auto state = setup_and_convert(R"(
@@ -366,7 +368,7 @@ TEST_CASE("merge fusion stops before ORDER BY after GROUP BY", "[pipeline_conver
   )");
 
   const auto& pipelines = state.conversion.scheduled_pipelines;
-  // ORDER BY is a structural sink — fusion is blocked and merge stays on its own pipeline.
+  // Guard 1: ORDER BY is a direct structural sink — fusion blocked, merge stays separate.
   REQUIRE(has_standalone_merge_pipeline(pipelines, SiriusPhysicalOperatorType::MERGE_GROUP_BY));
   REQUIRE_FALSE(has_fused_merge_pipeline(pipelines, SiriusPhysicalOperatorType::MERGE_GROUP_BY));
   REQUIRE_FALSE(pipeline_has_merge_with_sink(
@@ -389,7 +391,7 @@ TEST_CASE("merge fusion stops before HASH JOIN after GROUP BY",
   )");
 
   const auto& pipelines = state.conversion.scheduled_pipelines;
-  // Join follows the grouped subquery; merge must not absorb the join sink.
+  // Guard 2: join reads from subquery output; merge must not absorb projection/collector.
   REQUIRE_FALSE(pipeline_has_merge_with_sink(
     pipelines, SiriusPhysicalOperatorType::MERGE_GROUP_BY, SiriusPhysicalOperatorType::HASH_JOIN));
   REQUIRE(count_build_join_partitions(pipelines) >= 1);
@@ -402,7 +404,7 @@ TEST_CASE("merge fusion does not fold UNGROUPED_AGGREGATE downstream",
   auto state = setup_and_convert("SELECT avg(l_quantity) FROM lineitem");
 
   const auto& pipelines = state.conversion.scheduled_pipelines;
-  // UNGROUPED uses the same op as partial sink and merge source — keep merge separate.
+  // UNGROUPED: same op is partial sink and merge source — fusion disabled in attach_merge.
   REQUIRE(has_standalone_merge_pipeline(pipelines, SiriusPhysicalOperatorType::MERGE_AGGREGATE));
   REQUIRE_FALSE(has_fused_merge_pipeline(pipelines, SiriusPhysicalOperatorType::MERGE_AGGREGATE));
 }

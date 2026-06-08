@@ -110,8 +110,11 @@ class sirius_pipeline_converter {
                              duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
                              size_t pipeline_idx);
 
-  //! Fold pipelineable downstream operators into the merge pipeline when possible.
-  //! Returns true when a downstream pipeline was fully absorbed.
+  //! Try to absorb the first downstream pipeline sourced from @p original_agg_source
+  //! (HASH_GROUP_BY, UNGROUPED_AGGREGATE, or TOP_N) into @p merge_pipeline.
+  //! Returns true when a downstream pipeline was fully absorbed and should be skipped
+  //! in split_pipelines(). Safe only when downstream is a dead end — see guards in
+  //! the implementation.
   bool try_fuse_downstream_pipelineable(
     duckdb::shared_ptr<sirius_pipeline>& merge_pipeline,
     op::sirius_physical_operator* merge_op,
@@ -119,6 +122,9 @@ class sirius_pipeline_converter {
     duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
     size_t from_pipeline_idx);
 
+  //! Finalize a merge pipeline after split_group_aggregate_sink / split_top_n_sink:
+  //! optionally fuse pipelineable downstream ops, set merge as sink if not fused, and
+  //! repoint remaining downstream pipelines from the partial op to @p merge_op.
   void attach_merge_and_fuse_downstream(
     duckdb::shared_ptr<sirius_pipeline>& merge_pipeline,
     op::sirius_physical_operator* merge_op,
