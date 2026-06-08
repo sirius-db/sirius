@@ -98,10 +98,10 @@ async fn maintain_registration(
     loop {
         tokio::time::sleep(REGISTRATION_REFRESH_INTERVAL).await;
 
-        if let Some(elapsed) = state.last_heartbeat_elapsed() {
-            if elapsed < HEARTBEAT_STALE_AFTER {
-                continue;
-            }
+        if let Some(elapsed) = state.last_heartbeat_elapsed()
+            && elapsed < HEARTBEAT_STALE_AFTER
+        {
+            continue;
         }
 
         debug!(
