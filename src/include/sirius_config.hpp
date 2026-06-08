@@ -36,7 +36,11 @@ constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE       = 512ULL * 1024 * 1024;  /
 constexpr uint64_t DEFAULT_SCAN_TASK_VARCHAR_SIZE     = 256LL;
 constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES       = 512ULL * 1024 * 1024;  // 512 MB
 constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES         = 512ULL * 1024 * 1024;  // 512 MB
+constexpr uint64_t DEFAULT_SORT_SAMPLE_BYTES          = 512ULL * 1024 * 1024;  // 512 MB
 constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES = 500ULL * 1024 * 1024;  // 500 MB
+
+/// Fraction of available GPU memory used per sort partition when max_sort_partition_bytes is 0.
+constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
 
 }  // namespace config
 
@@ -50,14 +54,20 @@ struct operator_params {
   /// Default size estimate (bytes) for VARCHAR columns when computing rows per batch.
   uint64_t default_scan_task_varchar_size = config::DEFAULT_SCAN_TASK_VARCHAR_SIZE;
 
-  /// Maximum bytes per sort partition (0 = auto: 33% of available GPU memory).
+  /// Maximum bytes per sort partition (0 = auto based on max_sort_partition_memory_fraction).
   uint64_t max_sort_partition_bytes = 0;
+
+  /// Fraction of available GPU memory per sort partition when max_sort_partition_bytes is 0.
+  double max_sort_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION;
 
   /// Target size (bytes) per hash partition for joins and group-bys.
   uint64_t hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES;
 
   /// Target size (bytes) for the concat operator output batch.
   uint64_t concat_batch_bytes = config::DEFAULT_CONCAT_BATCH_BYTES;
+
+  /// Target size (bytes) of data to sample before computing sort partition boundaries.
+  uint64_t sort_sample_bytes = config::DEFAULT_SORT_SAMPLE_BYTES;
 
   /// Maximum build-side bytes for switching to BUILD_PROBE join mode.
   /// May be larger than concat_batch_bytes; build-side batches will be concatenated if needed.
@@ -142,6 +152,12 @@ struct sirius_config {
   sirius::io::object_store_config object_store_config{};
 
  private:
+  /// When @c _memory_space_configs contains more than one GPU memory space,
+  /// force @c _scan_manager_config.use_sirius_datasource to true (sirius
+  /// datasource is required for multi-GPU IO routing). Emits a WARNING when
+  /// the override takes effect. Called from the end of @ref load_from_file.
+  void enforce_sirius_datasource_for_multi_gpu();
+
   cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   exec::thread_pool_config _task_creator_config{.num_threads        = 2,

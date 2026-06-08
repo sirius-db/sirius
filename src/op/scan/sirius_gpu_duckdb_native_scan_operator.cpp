@@ -20,7 +20,7 @@
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <data/data_batch_utils.hpp>
-#include <expression/expression.hpp>
+#include <expression/ast/from_duckdb.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <log/logging.hpp>
 #include <op/scan/duckdb_native_decoder.hpp>
@@ -131,9 +131,11 @@ std::unique_ptr<operator_data> sirius_gpu_duckdb_native_scan_operator::execute(
     auto filter_expr_duckdb = convert_table_filters_to_expression(
       *info.table_filters, info.column_ids, info.returned_types, emission_order_map);
     if (filter_expr_duckdb) {
-      auto filter_expr = sirius::wrap(std::move(filter_expr_duckdb));
-      sirius::gpu_expression_executor exec(filter_expr, mr_ref, stream);
-      table = exec.select(table->view());
+      auto filter_expr = sirius::ast::from_duckdb(*filter_expr_duckdb);
+      if (filter_expr) {
+        sirius::gpu_expression_executor exec(*filter_expr, mr_ref, stream);
+        table = exec.select(table->view());
+      }
     }
   }
 

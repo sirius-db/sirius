@@ -18,8 +18,8 @@
 #include "exec/thread_pool.hpp"
 #include "helper/logical_type.hpp"
 #include "io/prefetching_cache.hpp"
-#include "io/s3/s3_ioctx.hpp"
-#include "io/s3/sirius_sigv4_credential_provider.hpp"
+#include "io/s3/s3_blocking_ioctx.hpp"
+#include "io/s3/sirius_sigv4_authorizer.hpp"
 #include "op/scan/parquet_scan_operator_data.hpp"
 #include "scan_manager/parquet_split_provider.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
@@ -53,9 +53,9 @@
 
 using sirius::io::buffer_pool;
 using sirius::io::sirius_ioctx;
-using sirius::io::s3::s3_ioctx;
+using sirius::io::s3::s3_blocking_ioctx;
 using sirius::io::s3::s3_ioctx_config;
-using sirius::io::s3::sirius_sigv4_credential_provider;
+using sirius::io::s3::sirius_sigv4_presigned_authorizer;
 using sirius::io::s3::static_credentials;
 using sirius::op::scan::parquet_scan_data;
 using sirius::scan_manager::parquet_split_provider;
@@ -204,7 +204,7 @@ s3_ioctx_config make_live_s3_config(s3_test_env const& env)
   static_credentials creds;
   creds.access_key_id     = env.access_key;
   creds.secret_access_key = env.secret_key;
-  auto provider           = std::make_shared<sirius_sigv4_credential_provider>(
+  auto provider           = std::make_shared<sirius_sigv4_presigned_authorizer>(
     std::move(creds), env.region, env.endpoint, 30min);
 
   s3_ioctx_config cfg{};
@@ -236,7 +236,7 @@ sirius_scan_manager make_scan_manager(cucascade::memory::fixed_size_host_memory_
     cfg.s3_config                         = s3_cfg;
     cfg.s3_thread_pool.num_threads        = 4;
     cfg.s3_thread_pool.thread_name_prefix = "s3_psp";
-    borrowed_ioctxs.push_back(std::make_shared<s3_ioctx>(std::move(s3_cfg)));
+    borrowed_ioctxs.push_back(std::make_shared<s3_blocking_ioctx>(std::move(s3_cfg)));
   }
   return sirius_scan_manager(std::move(cfg), std::move(borrowed_ioctxs));
 }
@@ -336,7 +336,7 @@ TEST_CASE("parquet_split_provider routes pure S3 batches through scan_manager S3
     for (auto const& slice : split->rg_slices) {
       CHECK(slice.file_path == path);
       CHECK(slice.io_ctx.get() == manager.io_ctx_for(path));
-      CHECK(dynamic_cast<s3_ioctx*>(slice.io_ctx.get()) != nullptr);
+      CHECK(dynamic_cast<s3_blocking_ioctx*>(slice.io_ctx.get()) != nullptr);
       CHECK(slice.io_object != nullptr);
     }
   }

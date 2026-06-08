@@ -17,6 +17,7 @@
 // sirius
 #include <duckdb/planner/expression/bound_conjunction_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <expression/ast/from_duckdb.hpp>
 #include <helper/type_conversions.hpp>
 #include <log/logging.hpp>
 #include <op/scan/scan_utils.hpp>
@@ -24,6 +25,7 @@
 // standard library
 #include <format>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace sirius::op {
@@ -107,6 +109,16 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
     conjunction->children.push_back(std::move(expr));
   }
   return conjunction;
+}
+
+std::optional<gpu_expression_translator::translated_expression>
+translate_duckdb_expression_with_names(gpu_expression_translator& translator,
+                                       duckdb::Expression const& expr,
+                                       gpu_expression_translator::column_name_resolver_fxn resolver)
+{
+  auto node = sirius::ast::from_duckdb(expr);
+  if (!node) { return std::nullopt; }
+  return translator.translate_expression_with_names(*node, std::move(resolver));
 }
 
 }  // namespace sirius::op

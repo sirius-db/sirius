@@ -25,266 +25,167 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }} # cancel existing runs on PRs but run on all `dev` and merge queue commits
 
 jobs:
-  build-cuda-13:
-    env:
-      SCCACHE_GHA_ENABLED: true
-    runs-on: [self-hosted, ubuntu-24.04, pixi, cpu-xl]
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          submodules: recursive
-
-      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
-        with:
-          cache: false
-          pixi-version: v0.69.0
-          activate-environment: default
-
-      - name: Configure sccache backend
-        run: |
-          if [[ -n "${SCCACHE_BUCKET}" ]]; then
-            echo "SCCACHE_BUCKET DEFINED -> Self Hosted Runner, Disable GHA sccache"
-            echo "SCCACHE_GHA_ENABLED=false" >> $GITHUB_ENV
-          else
-            echo "SCCACHE_BUCKET UNDEFINED -> GitHub Runner, Enable GHA sccache"
-            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
-          fi
-
-      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
-
-      - name: Build
-        env:
-          CUDAARCHS: "89" # 75 for T4 capability; 89 for L4 capability
-        run: make -j$(nproc)
-
-      - name: Package build artifacts
-        run: tar -cf build.tar build/release/
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: build-cuda-13
-          path: build.tar
-          if-no-files-found: error
-          retention-days: 1
-
-  build-cuda-12:
-    env:
-      SCCACHE_GHA_ENABLED: true
-    runs-on: [self-hosted, ubuntu-22.04, pixi, cpu-xl]
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          submodules: recursive
-
-      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
-        with:
-          cache: false
-          pixi-version: v0.69.0
-          activate-environment: cuda12
-
-      - name: Configure sccache backend
-        run: |
-          if [[ -n "${SCCACHE_BUCKET}" ]]; then
-            echo "SCCACHE_BUCKET DEFINED -> Self Hosted Runner, Disable GHA sccache"
-            echo "SCCACHE_GHA_ENABLED=false" >> $GITHUB_ENV
-          else
-            echo "SCCACHE_BUCKET UNDEFINED -> GitHub Runner, Enable GHA sccache"
-            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
-          fi
-
-      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
-
-      - name: Build
-        env:
-          CUDAARCHS: "89" # 75 for T4 capability; 89 for L4 capability
-        run: make -j$(nproc)
-
-      - name: Package build artifacts
-        run: tar -cf build.tar build/release/
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: build-cuda-12
-          path: build.tar
-          if-no-files-found: error
-          retention-days: 1
-
-  test-cuda-13:
-    runs-on: [self-hosted, ubuntu-24.04, pixi, gpu-2xl4]
-    needs: build-cuda-13
-    if: needs.build-cuda-13.result == 'success'
-    timeout-minutes: 60
-    env:
-      CUDA_CACHE_PATH: /home/runner/actions-runner/_work/.cuda-cache
-      SIRIUS_LOG_LEVEL: trace
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
-        with:
-          cache: false
-          pixi-version: v0.69.0
-          activate-environment: default
-
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: build-cuda-13
-
-      - name: Extract build artifacts
-        run: tar -xf build.tar
-
-      - name: Run C++ unit tests
-        run: |
-            nvidia-smi
-            timeout 45m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort
-
-      - name: Upload unit test logs
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: unittest-logs-cuda13-${{ github.run_id }}
-          path: build/release/extension/sirius/test/cpp/log/
-          if-no-files-found: ignore
-          retention-days: 14
-
-      - name: Prepare SQL test datasets
-        run: |
-          ./setup_test_datasets.sh
-          chmod -R a+r test_datasets/
-          mkdir -p test_datasets/tpch_parquet_sf1
-          ./build/release/duckdb -f scripts/tpch_to_parquet.sql
-
-      - name: TPC-H performance snapshot
-        id: tpch
-        env:
-          SIRIUS_CONFIG_FILE: ${{ github.workspace }}/test/cpp/integration/integration.yaml
-          PARQUET_DIR: ${{ github.workspace }}/test_datasets/tpch_parquet_sf1
-        run: |
-          ./test/tpch_performance/benchmark_and_validate.sh 1
-          RUN_DIR=$(ls -td runs/*/ | head -1)
-          echo "run_dir=$RUN_DIR" >> "$GITHUB_OUTPUT"
-          {
-            echo "## TPC-H Performance (SF1)"
-            echo '```'
-            cat "$RUN_DIR/comparison.txt"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          ERRORS=$(tail -n +2 "$RUN_DIR/validation.csv" | grep -cE ',error$' || true)
-          if [ "$ERRORS" -gt 0 ]; then
-            echo "::error::TPC-H snapshot: $ERRORS queries errored"
-            if [ "${{ github.event_name }}" = "merge_group" ]; then
-              exit 1
-            fi
-          fi
-
-      - name: Upload TPC-H run artifacts
-        if: always() && steps.tpch.outputs.run_dir != ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: tpch-run-${{ github.run_id }}-cuda-13
-          path: ${{ steps.tpch.outputs.run_dir }}
-          retention-days: 14
-
-  test-cuda-12:
-    runs-on: [self-hosted, ubuntu-22.04, pixi, gpu-2xl4]
-    needs: build-cuda-12
-    if: needs.build-cuda-12.result == 'success'
-    timeout-minutes: 60
-    env:
-      CUDA_CACHE_PATH: /home/runner/actions-runner/_work/.cuda-cache
-      SIRIUS_LOG_LEVEL: trace
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
-        with:
-          cache: false
-          pixi-version: v0.69.0
-          activate-environment: cuda12
-
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: build-cuda-12
-
-      - name: Extract build artifacts
-        run: tar -xf build.tar
-
-      - name: Run C++ unit tests
-        run: |
-            nvidia-smi
-            timeout 45m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort
-
-      - name: Upload unit test logs
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: unittest-logs-cuda12-${{ github.run_id }}
-          path: build/release/extension/sirius/test/cpp/log/
-          if-no-files-found: ignore
-          retention-days: 14
-
-      - name: Prepare SQL test datasets
-        run: |
-          ./setup_test_datasets.sh
-          chmod -R a+r test_datasets/
-          mkdir -p test_datasets/tpch_parquet_sf1
-          ./build/release/duckdb -f scripts/tpch_to_parquet.sql
-
-      - name: TPC-H performance snapshot
-        id: tpch
-        env:
-          SIRIUS_CONFIG_FILE: ${{ github.workspace }}/test/cpp/integration/integration.yaml
-          PARQUET_DIR: ${{ github.workspace }}/test_datasets/tpch_parquet_sf1
-        run: |
-          ./test/tpch_performance/benchmark_and_validate.sh 1
-          RUN_DIR=$(ls -td runs/*/ | head -1)
-          echo "run_dir=$RUN_DIR" >> "$GITHUB_OUTPUT"
-          {
-            echo "## TPC-H Performance (SF1)"
-            echo '```'
-            cat "$RUN_DIR/comparison.txt"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          ERRORS=$(tail -n +2 "$RUN_DIR/validation.csv" | grep -cE ',error$' || true)
-          if [ "$ERRORS" -gt 0 ]; then
-            echo "::error::TPC-H snapshot: $ERRORS queries errored"
-            if [ "${{ github.event_name }}" = "merge_group" ]; then
-              exit 1
-            fi
-          fi
-
-      - name: Upload TPC-H run artifacts
-        if: always() && steps.tpch.outputs.run_dir != ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: tpch-run-${{ github.run_id }}-cuda-12
-          path: ${{ steps.tpch.outputs.run_dir }}
-          retention-days: 14
-
   build:
-    runs-on: ubuntu-slim
-    needs: [build-cuda-13, build-cuda-12]
-    if: always()
+    env:
+      SCCACHE_GHA_ENABLED: true
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
+    strategy:
+      matrix:
+        cuda:
+          - version: "13"
+            pixi-environment: default
+            runner: ubuntu-24.04
+            run-on-pr: true
+          - version: "12"
+            pixi-environment: cuda12
+            runner: ubuntu-22.04
+            run-on-pr: false
+        exclude:
+          # On PRs, drop CUDA variants marked merge/dev-only; on merge_group/dev, match nothing.
+          - cuda:
+              run-on-pr: ${{ fromJSON(github.event_name == 'pull_request' && 'false' || 'null') }}
+      fail-fast: false
+    runs-on: ${{ fromJSON(format('["self-hosted", "{0}", "cpu-xl"]', matrix.cuda.runner)) }}
+    timeout-minutes: 60
     steps:
-      - name: All builds ok
-        if: ${{ !(contains(needs.*.result, 'failure')) }}
-        run: exit 0
-      - name: Some builds failed
-        if: ${{ contains(needs.*.result, 'failure') }}
-        run: exit 1
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          submodules: recursive
+
+      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
+        with:
+          cache: false
+          pixi-version: v0.70.1
+          activate-environment: ${{ matrix.cuda.pixi-environment }}
+
+      - name: Configure sccache backend
+        run: |
+          if [[ -n "${SCCACHE_BUCKET}" ]]; then
+            echo "SCCACHE_BUCKET DEFINED -> Self Hosted Runner, Disable GHA sccache"
+            echo "SCCACHE_GHA_ENABLED=false" >> $GITHUB_ENV
+          else
+            echo "SCCACHE_BUCKET UNDEFINED -> GitHub Runner, Enable GHA sccache"
+            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+          fi
+
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
+      - name: Build
+        env:
+          CUDAARCHS: "89" # 75 for T4 capability; 89 for L4 capability
+        run: make -j$(nproc)
+
+      - name: Package build artifacts
+        run: tar -cf build.tar build/release/
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: build-cuda-${{ matrix.cuda.version }}
+          path: build.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  test-run:
+    needs: build
+    strategy:
+      matrix:
+        cuda:
+          - version: "13"
+            pixi-environment: default
+            runner: ubuntu-24.04
+            run-on-pr: true
+          - version: "12"
+            pixi-environment: cuda12
+            runner: ubuntu-22.04
+            run-on-pr: false
+        exclude:
+          # On PRs, drop CUDA variants marked merge/dev-only; on merge_group/dev, match nothing.
+          - cuda:
+              run-on-pr: ${{ fromJSON(github.event_name == 'pull_request' && 'false' || 'null') }}
+      fail-fast: false
+    runs-on: ${{ fromJSON(format('["self-hosted", "{0}", "gpu-2xl4"]', matrix.cuda.runner)) }}
+    timeout-minutes: 60
+    env:
+      CUDA_CACHE_PATH: /home/runner/actions-runner/_work/.cuda-cache
+      SIRIUS_LOG_LEVEL: trace
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
+        with:
+          cache: false
+          pixi-version: v0.70.1
+          activate-environment: ${{ matrix.cuda.pixi-environment }}
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: build-cuda-${{ matrix.cuda.version }}
+
+      - name: Extract build artifacts
+        run: tar -xf build.tar
+
+      - name: Run C++ unit tests
+        run: |
+            nvidia-smi
+            timeout 45m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort
+
+      - name: Upload unit test logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unittest-logs-cuda${{ matrix.cuda.version }}-${{ github.run_id }}
+          path: build/release/extension/sirius/test/cpp/log/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Prepare SQL test datasets
+        run: |
+          ./setup_test_datasets.sh
+          chmod -R a+r test_datasets/
+          mkdir -p test_datasets/tpch_parquet_sf1
+          ./build/release/duckdb -f scripts/tpch_to_parquet.sql
+
+      - name: TPC-H performance snapshot
+        id: tpch
+        env:
+          SIRIUS_CONFIG_FILE: ${{ github.workspace }}/test/cpp/integration/integration.yaml
+          PARQUET_DIR: ${{ github.workspace }}/test_datasets/tpch_parquet_sf1
+        run: |
+          ./test/tpch_performance/benchmark_and_validate.sh 1
+          RUN_DIR=$(ls -td runs/*/ | head -1)
+          echo "run_dir=$RUN_DIR" >> "$GITHUB_OUTPUT"
+          {
+            echo "## TPC-H Performance (SF1)"
+            echo '```'
+            cat "$RUN_DIR/comparison.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          ERRORS=$(tail -n +2 "$RUN_DIR/validation.csv" | grep -cE ',error$' || true)
+          if [ "$ERRORS" -gt 0 ]; then
+            echo "::error::TPC-H snapshot: $ERRORS queries errored"
+            if [ "${{ github.event_name }}" = "merge_group" ]; then
+              exit 1
+            fi
+          fi
+
+      - name: Upload TPC-H run artifacts
+        if: always() && steps.tpch.outputs.run_dir != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tpch-run-${{ github.run_id }}-cuda-${{ matrix.cuda.version }}
+          path: ${{ steps.tpch.outputs.run_dir }}
+          retention-days: 14
 
   test:
     runs-on: ubuntu-slim
-    needs: [test-cuda-13, test-cuda-12]
+    needs: test-run
     if: always()
     steps:
-      - name: All tests ok
-        if: ${{ !(contains(needs.*.result, 'failure')) }}
+      - name: Test workflow ok
+        if: ${{ needs['test-run'].result == 'success' }}
         run: exit 0
-      - name: Some tests failed
-        if: ${{ contains(needs.*.result, 'failure') }}
+      - name: Test workflow failed
+        if: ${{ needs['test-run'].result != 'success' }}
         run: exit 1

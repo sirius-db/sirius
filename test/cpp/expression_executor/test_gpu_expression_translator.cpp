@@ -15,13 +15,32 @@
  */
 
 // test
+#include "ast_test_support.hpp"
+
 #include <catch.hpp>
 
-// sirius
+// sirius — node-construction surface (build every test expression as a
+// sirius::ast::node directly; no DuckDB Bound*Expression in the test body).
+#include <expression/ast/between.hpp>
+#include <expression/ast/case_expr.hpp>
+#include <expression/ast/cast.hpp>
+#include <expression/ast/coalesce.hpp>
+#include <expression/ast/comparison.hpp>
+#include <expression/ast/conjunction.hpp>
+#include <expression/ast/constant.hpp>
+#include <expression/ast/function_call.hpp>
+#include <expression/ast/in_list.hpp>
+#include <expression/ast/node.hpp>
+#include <expression/ast/reference.hpp>
+#include <expression/ast/unary_op.hpp>
+#include <expression/function_id.hpp>
+#include <expression/join_condition.hpp>  // sirius::comparison_type, sirius::from_duckdb (enum mapper)
+#include <expression/value.hpp>
 #include <expression_executor/gpu_expression_translator_internal.hpp>
+#include <helper/logical_type.hpp>
 
-// duckdb
-#include <duckdb/common/helper.hpp>
+// duckdb — only the comparison-type enum the join-condition test parameterizes over.
+#include <duckdb/common/enums/expression_type.hpp>
 
 // cudf
 #include <cudf/ast/expressions.hpp>
@@ -41,34 +60,24 @@
 #include <string>
 #include <vector>
 
-using namespace duckdb;
+using namespace sirius::expr_test;
 
 namespace {
 
 auto const stream = cudf::get_default_stream();
 auto const mr     = cudf::get_current_device_resource_ref();
 
+using sirius::logical_type;
+using sirius::type_id;
+
 //===----------------------------------------------------------------------===//
-// GPU <-> host copy helpers
+// Translator bridge — translate a hand-built Sirius AST node directly.
 //===----------------------------------------------------------------------===//
 
-template <typename T>
-std::vector<T> copy_column_to_host(cudf::column_view const& col)
+std::optional<sirius::gpu_expression_translator::translated_expression> translate(
+  sirius::gpu_expression_translator& translator, ast_node const& node)
 {
-  std::vector<T> host(col.size());
-  if (col.size() > 0) {
-    cudaMemcpy(host.data(), col.data<T>(), sizeof(T) * col.size(), cudaMemcpyDeviceToHost);
-  }
-  return host;
-}
-
-std::vector<uint8_t> copy_bool_column_to_host(cudf::column_view const& col)
-{
-  std::vector<uint8_t> host(col.size());
-  if (col.size() > 0) {
-    cudaMemcpy(host.data(), col.head(), sizeof(uint8_t) * col.size(), cudaMemcpyDeviceToHost);
-  }
-  return host;
+  return translator.translate_expression(node);
 }
 
 //===----------------------------------------------------------------------===//
@@ -238,15 +247,10 @@ std::unique_ptr<cudf::table> make_string_table(std::vector<std::string> const& v
 
 sirius::join_condition make_reference_join_condition(duckdb::ExpressionType comparison)
 {
-  duckdb::JoinCondition condition;
-  condition.left =
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
-  condition.right =
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
-  condition.comparison = comparison;
-  return sirius::join_condition{sirius::wrap(std::move(condition.left)),
-                                sirius::wrap(std::move(condition.right)),
-                                sirius::from_duckdb(condition.comparison)};
+  // The join_condition's operands are hand-built Sirius AST reference nodes; the
+  // comparison-enum mapping still goes through sirius::from_duckdb(ExpressionType),
+  // which is the join_condition comparison mapper (NOT the expression from_duckdb).
+  return sirius::join_condition{make_ref(0), make_ref(0), sirius::from_duckdb(comparison)};
 }
 
 }  // namespace
@@ -262,10 +266,10 @@ TEST_CASE("translator: column reference produces identity", "[expression_transla
   auto tv                     = table->view();
 
   // Build: col_ref(0)
-  auto expr = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
+  auto expr = make_ref(0);
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*expr);
+  auto ast_tree   = translate(translator, *expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -284,13 +288,10 @@ TEST_CASE("translator: comparison EQUAL", "[expression_translator]")
   auto tv                     = table->view();
 
   // Build: col(0) == 3
-  auto left  = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
-  auto right = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3));
-  auto expr  = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_EQUAL, std::move(left), std::move(right));
+  auto expr = make_cmp(sirius::comparison_type::equal, make_ref(0), make_int_const(3));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*expr);
+  auto ast_tree   = translate(translator, *expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -309,13 +310,10 @@ TEST_CASE("translator: comparison NOT EQUAL", "[expression_translator]")
   auto table                  = make_int32_table(values);
   auto tv                     = table->view();
 
-  auto left  = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
-  auto right = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3));
-  auto expr  = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_NOTEQUAL, std::move(left), std::move(right));
+  auto expr = make_cmp(sirius::comparison_type::not_equal, make_ref(0), make_int_const(3));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*expr);
+  auto ast_tree   = translate(translator, *expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -334,13 +332,10 @@ TEST_CASE("translator: comparison LESS THAN", "[expression_translator]")
   auto table                  = make_int32_table(values);
   auto tv                     = table->view();
 
-  auto left  = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
-  auto right = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3));
-  auto expr  = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_LESSTHAN, std::move(left), std::move(right));
+  auto expr = make_cmp(sirius::comparison_type::lt, make_ref(0), make_int_const(3));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*expr);
+  auto ast_tree   = translate(translator, *expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -359,13 +354,10 @@ TEST_CASE("translator: comparison GREATER THAN", "[expression_translator]")
   auto table                  = make_int32_table(values);
   auto tv                     = table->view();
 
-  auto left  = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
-  auto right = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3));
-  auto expr  = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_GREATERTHAN, std::move(left), std::move(right));
+  auto expr = make_cmp(sirius::comparison_type::gt, make_ref(0), make_int_const(3));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*expr);
+  auto ast_tree   = translate(translator, *expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -384,13 +376,10 @@ TEST_CASE("translator: comparison LESS THAN OR EQUAL", "[expression_translator]"
   auto table                  = make_int32_table(values);
   auto tv                     = table->view();
 
-  auto left  = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
-  auto right = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3));
-  auto expr  = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_LESSTHANOREQUALTO, std::move(left), std::move(right));
+  auto expr = make_cmp(sirius::comparison_type::le, make_ref(0), make_int_const(3));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*expr);
+  auto ast_tree   = translate(translator, *expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -409,13 +398,10 @@ TEST_CASE("translator: comparison GREATER THAN OR EQUAL", "[expression_translato
   auto table                  = make_int32_table(values);
   auto tv                     = table->view();
 
-  auto left  = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
-  auto right = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3));
-  auto expr  = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_GREATERTHANOREQUALTO, std::move(left), std::move(right));
+  auto expr = make_cmp(sirius::comparison_type::ge, make_ref(0), make_int_const(3));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*expr);
+  auto ast_tree   = translate(translator, *expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -436,13 +422,10 @@ TEST_CASE("translator: comparison between two columns", "[expression_translator]
   auto tv                   = table->view();
 
   // Build: col(0) > col(1)
-  auto left  = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
-  auto right = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 1);
-  auto expr  = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_GREATERTHAN, std::move(left), std::move(right));
+  auto expr = make_cmp(sirius::comparison_type::gt, make_ref(0), make_ref(1));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*expr);
+  auto ast_tree   = translate(translator, *expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -457,13 +440,21 @@ TEST_CASE("translator: comparison between two columns", "[expression_translator]
 
 TEST_CASE("translator: DISTINCT FROM returns nullopt", "[expression_translator]")
 {
-  auto left  = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
-  auto right = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3));
-  auto expr  = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_DISTINCT_FROM, std::move(left), std::move(right));
+  auto expr = make_cmp(sirius::comparison_type::distinct_from, make_ref(0), make_int_const(3));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*expr);
+  auto ast_tree   = translate(translator, *expr);
+  REQUIRE_FALSE(ast_tree.has_value());
+}
+
+TEST_CASE("translator: NULL constant returns nullopt", "[expression_translator]")
+{
+  // A typed NULL has no cuDF AST literal representation; the translator must
+  // report untranslatable rather than unwrapping the empty constant payload.
+  auto expr = make_null_const(logical_type::make(type_id::INTEGER));
+
+  auto translator = make_translator();
+  auto ast_tree   = translate(translator, *expr);
   REQUIRE_FALSE(ast_tree.has_value());
 }
 
@@ -536,19 +527,15 @@ TEST_CASE("translator: addition col(0) + 10", "[expression_translator]")
   auto table                  = make_int32_table(values);
   auto tv                     = table->view();
 
-  // Build: col(0) + 10  via BoundFunctionExpression with name "+"
-  auto func_expr = duckdb::make_uniq<BoundFunctionExpression>(
-    LogicalType{LogicalTypeId::INTEGER},
-    ScalarFunction(
-      "+", {LogicalType::INTEGER, LogicalType::INTEGER}, LogicalType::INTEGER, nullptr),
-    duckdb::vector<duckdb::unique_ptr<Expression>>{},
-    nullptr);
-  func_expr->children.push_back(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-  func_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(10)));
+  // Build: col(0) + 10
+  std::vector<std::unique_ptr<ast_node>> args;
+  args.push_back(make_ref(0));
+  args.push_back(make_int_const(10));
+  auto expr =
+    make_func(sirius::function_id::add, std::move(args), logical_type::make(type_id::INTEGER));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*func_expr);
+  auto ast_tree   = translate(translator, *expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -567,18 +554,14 @@ TEST_CASE("translator: subtraction col(0) - 3", "[expression_translator]")
   auto table                  = make_int32_table(values);
   auto tv                     = table->view();
 
-  auto func_expr = duckdb::make_uniq<BoundFunctionExpression>(
-    LogicalType{LogicalTypeId::INTEGER},
-    ScalarFunction(
-      "-", {LogicalType::INTEGER, LogicalType::INTEGER}, LogicalType::INTEGER, nullptr),
-    duckdb::vector<duckdb::unique_ptr<Expression>>{},
-    nullptr);
-  func_expr->children.push_back(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-  func_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3)));
+  std::vector<std::unique_ptr<ast_node>> args;
+  args.push_back(make_ref(0));
+  args.push_back(make_int_const(3));
+  auto expr =
+    make_func(sirius::function_id::sub, std::move(args), logical_type::make(type_id::INTEGER));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*func_expr);
+  auto ast_tree   = translate(translator, *expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -597,18 +580,14 @@ TEST_CASE("translator: multiplication col(0) * 2", "[expression_translator]")
   auto table                  = make_int32_table(values);
   auto tv                     = table->view();
 
-  auto func_expr = duckdb::make_uniq<BoundFunctionExpression>(
-    LogicalType{LogicalTypeId::INTEGER},
-    ScalarFunction(
-      "*", {LogicalType::INTEGER, LogicalType::INTEGER}, LogicalType::INTEGER, nullptr),
-    duckdb::vector<duckdb::unique_ptr<Expression>>{},
-    nullptr);
-  func_expr->children.push_back(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-  func_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(2)));
+  std::vector<std::unique_ptr<ast_node>> args;
+  args.push_back(make_ref(0));
+  args.push_back(make_int_const(2));
+  auto expr =
+    make_func(sirius::function_id::mul, std::move(args), logical_type::make(type_id::INTEGER));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*func_expr);
+  auto ast_tree   = translate(translator, *expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -627,18 +606,14 @@ TEST_CASE("translator: division col(0) / 3", "[expression_translator]")
   auto table                  = make_int32_table(values);
   auto tv                     = table->view();
 
-  auto func_expr = duckdb::make_uniq<BoundFunctionExpression>(
-    LogicalType{LogicalTypeId::INTEGER},
-    ScalarFunction(
-      "/", {LogicalType::INTEGER, LogicalType::INTEGER}, LogicalType::INTEGER, nullptr),
-    duckdb::vector<duckdb::unique_ptr<Expression>>{},
-    nullptr);
-  func_expr->children.push_back(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-  func_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3)));
+  std::vector<std::unique_ptr<ast_node>> args;
+  args.push_back(make_ref(0));
+  args.push_back(make_int_const(3));
+  auto expr =
+    make_func(sirius::function_id::div, std::move(args), logical_type::make(type_id::INTEGER));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*func_expr);
+  auto ast_tree   = translate(translator, *expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -657,18 +632,14 @@ TEST_CASE("translator: integer division col(0) // 3", "[expression_translator]")
   auto table                  = make_int32_table(values);
   auto tv                     = table->view();
 
-  auto func_expr = duckdb::make_uniq<BoundFunctionExpression>(
-    LogicalType{LogicalTypeId::INTEGER},
-    ScalarFunction(
-      "//", {LogicalType::INTEGER, LogicalType::INTEGER}, LogicalType::INTEGER, nullptr),
-    duckdb::vector<duckdb::unique_ptr<Expression>>{},
-    nullptr);
-  func_expr->children.push_back(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-  func_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3)));
+  std::vector<std::unique_ptr<ast_node>> args;
+  args.push_back(make_ref(0));
+  args.push_back(make_int_const(3));
+  auto expr =
+    make_func(sirius::function_id::int_div, std::move(args), logical_type::make(type_id::INTEGER));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*func_expr);
+  auto ast_tree   = translate(translator, *expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -687,18 +658,14 @@ TEST_CASE("translator: modulo col(0) % 3", "[expression_translator]")
   auto table                  = make_int32_table(values);
   auto tv                     = table->view();
 
-  auto func_expr = duckdb::make_uniq<BoundFunctionExpression>(
-    LogicalType{LogicalTypeId::INTEGER},
-    ScalarFunction(
-      "%", {LogicalType::INTEGER, LogicalType::INTEGER}, LogicalType::INTEGER, nullptr),
-    duckdb::vector<duckdb::unique_ptr<Expression>>{},
-    nullptr);
-  func_expr->children.push_back(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-  func_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3)));
+  std::vector<std::unique_ptr<ast_node>> args;
+  args.push_back(make_ref(0));
+  args.push_back(make_int_const(3));
+  auto expr =
+    make_func(sirius::function_id::mod, std::move(args), logical_type::make(type_id::INTEGER));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*func_expr);
+  auto ast_tree   = translate(translator, *expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -718,19 +685,14 @@ TEST_CASE("translator: col(0) + col(1)", "[expression_translator]")
   auto table                = make_int32x2_table(col0, col1);
   auto tv                   = table->view();
 
-  auto func_expr = duckdb::make_uniq<BoundFunctionExpression>(
-    LogicalType{LogicalTypeId::INTEGER},
-    ScalarFunction(
-      "+", {LogicalType::INTEGER, LogicalType::INTEGER}, LogicalType::INTEGER, nullptr),
-    duckdb::vector<duckdb::unique_ptr<Expression>>{},
-    nullptr);
-  func_expr->children.push_back(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-  func_expr->children.push_back(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 1));
+  std::vector<std::unique_ptr<ast_node>> args;
+  args.push_back(make_ref(0));
+  args.push_back(make_ref(1));
+  auto expr =
+    make_func(sirius::function_id::add, std::move(args), logical_type::make(type_id::INTEGER));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*func_expr);
+  auto ast_tree   = translate(translator, *expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -745,16 +707,15 @@ TEST_CASE("translator: col(0) + col(1)", "[expression_translator]")
 
 TEST_CASE("translator: unsupported function returns nullopt", "[expression_translator]")
 {
-  auto func_expr = duckdb::make_uniq<BoundFunctionExpression>(
-    LogicalType{LogicalTypeId::INTEGER},
-    ScalarFunction("abs", {LogicalType::INTEGER}, LogicalType::INTEGER, nullptr),
-    duckdb::vector<duckdb::unique_ptr<Expression>>{},
-    nullptr);
-  func_expr->children.push_back(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
+  // A non-arithmetic function (substring) has no cuDF-AST binary-op lowering;
+  // the translator must report untranslatable.
+  std::vector<std::unique_ptr<ast_node>> args;
+  args.push_back(make_ref(0));
+  auto expr = make_func(
+    sirius::function_id::substring, std::move(args), logical_type::make(type_id::INTEGER));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*func_expr);
+  auto ast_tree   = translate(translator, *expr);
   REQUIRE_FALSE(ast_tree.has_value());
 }
 
@@ -764,25 +725,21 @@ TEST_CASE("translator: unsupported function returns nullopt", "[expression_trans
 TEST_CASE("translator: conjunction with unsupported first child returns nullopt",
           "[expression_translator]")
 {
-  auto unsupported = duckdb::make_uniq<BoundFunctionExpression>(
-    LogicalType{LogicalTypeId::INTEGER},
-    ScalarFunction("abs", {LogicalType::INTEGER}, LogicalType::INTEGER, nullptr),
-    duckdb::vector<duckdb::unique_ptr<Expression>>{},
-    nullptr);
-  unsupported->children.push_back(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
+  std::vector<std::unique_ptr<ast_node>> unsupported_args;
+  unsupported_args.push_back(make_ref(0));
+  auto unsupported = make_func(sirius::function_id::substring,
+                               std::move(unsupported_args),
+                               logical_type::make(type_id::INTEGER));
 
-  auto supported = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_GREATERTHAN,
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
-    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(0)));
+  auto supported = make_cmp(sirius::comparison_type::gt, make_ref(0), make_int_const(0));
 
-  auto conjunction = duckdb::make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
-  conjunction->children.push_back(std::move(unsupported));
-  conjunction->children.push_back(std::move(supported));
+  std::vector<std::unique_ptr<ast_node>> children;
+  children.push_back(std::move(unsupported));
+  children.push_back(std::move(supported));
+  auto conjunction = make_conj(sirius::ast::conjunction::kind::op_and, std::move(children));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*conjunction);
+  auto ast_tree   = translate(translator, *conjunction);
   REQUIRE_FALSE(ast_tree.has_value());
 }
 
@@ -793,22 +750,16 @@ TEST_CASE("translator: conjunction AND", "[expression_translator]")
   auto tv                     = table->view();
 
   // Build: col(0) > 3 AND col(0) < 8
-  auto left1  = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
-  auto right1 = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3));
-  auto cmp1   = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_GREATERTHAN, std::move(left1), std::move(right1));
+  auto cmp1 = make_cmp(sirius::comparison_type::gt, make_ref(0), make_int_const(3));
+  auto cmp2 = make_cmp(sirius::comparison_type::lt, make_ref(0), make_int_const(8));
 
-  auto left2  = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
-  auto right2 = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(8));
-  auto cmp2   = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_LESSTHAN, std::move(left2), std::move(right2));
-
-  auto conj = duckdb::make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
-  conj->children.push_back(std::move(cmp1));
-  conj->children.push_back(std::move(cmp2));
+  std::vector<std::unique_ptr<ast_node>> children;
+  children.push_back(std::move(cmp1));
+  children.push_back(std::move(cmp2));
+  auto conj = make_conj(sirius::ast::conjunction::kind::op_and, std::move(children));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*conj);
+  auto ast_tree   = translate(translator, *conj);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -828,22 +779,16 @@ TEST_CASE("translator: conjunction OR", "[expression_translator]")
   auto tv                     = table->view();
 
   // Build: col(0) <= 2 OR col(0) >= 9
-  auto left1  = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
-  auto right1 = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(2));
-  auto cmp1   = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_LESSTHANOREQUALTO, std::move(left1), std::move(right1));
+  auto cmp1 = make_cmp(sirius::comparison_type::le, make_ref(0), make_int_const(2));
+  auto cmp2 = make_cmp(sirius::comparison_type::ge, make_ref(0), make_int_const(9));
 
-  auto left2  = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
-  auto right2 = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(9));
-  auto cmp2   = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_GREATERTHANOREQUALTO, std::move(left2), std::move(right2));
-
-  auto conj = duckdb::make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_OR);
-  conj->children.push_back(std::move(cmp1));
-  conj->children.push_back(std::move(cmp2));
+  std::vector<std::unique_ptr<ast_node>> children;
+  children.push_back(std::move(cmp1));
+  children.push_back(std::move(cmp2));
+  auto conj = make_conj(sirius::ast::conjunction::kind::op_or, std::move(children));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*conj);
+  auto ast_tree   = translate(translator, *conj);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -863,28 +808,18 @@ TEST_CASE("translator: conjunction with three children", "[expression_translator
   auto tv                     = table->view();
 
   // Build: col(0) > 2 AND col(0) < 9 AND col(0) != 5
-  auto cmp1 = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_GREATERTHAN,
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
-    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(2)));
+  auto cmp1 = make_cmp(sirius::comparison_type::gt, make_ref(0), make_int_const(2));
+  auto cmp2 = make_cmp(sirius::comparison_type::lt, make_ref(0), make_int_const(9));
+  auto cmp3 = make_cmp(sirius::comparison_type::not_equal, make_ref(0), make_int_const(5));
 
-  auto cmp2 = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_LESSTHAN,
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
-    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(9)));
-
-  auto cmp3 = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_NOTEQUAL,
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
-    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(5)));
-
-  auto conj = duckdb::make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
-  conj->children.push_back(std::move(cmp1));
-  conj->children.push_back(std::move(cmp2));
-  conj->children.push_back(std::move(cmp3));
+  std::vector<std::unique_ptr<ast_node>> children;
+  children.push_back(std::move(cmp1));
+  children.push_back(std::move(cmp2));
+  children.push_back(std::move(cmp3));
+  auto conj = make_conj(sirius::ast::conjunction::kind::op_and, std::move(children));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*conj);
+  auto ast_tree   = translate(translator, *conj);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -899,11 +834,11 @@ TEST_CASE("translator: conjunction with three children", "[expression_translator
 
 TEST_CASE("translator: empty conjunction returns nullopt", "[expression_translator]")
 {
-  auto conj = duckdb::make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
   // No children
+  auto conj = make_conj(sirius::ast::conjunction::kind::op_and, {});
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*conj);
+  auto ast_tree   = translate(translator, *conj);
   REQUIRE_FALSE(ast_tree.has_value());
 }
 
@@ -918,16 +853,10 @@ TEST_CASE("translator: BETWEEN expression", "[expression_translator]")
   auto tv                     = table->view();
 
   // Build: col(0) BETWEEN 3 AND 7  ->  col(0) >= 3 AND col(0) <= 7
-  auto input_expr =
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
-  auto lower_expr = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3));
-  auto upper_expr = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(7));
-
-  auto between = duckdb::make_uniq<BoundBetweenExpression>(
-    std::move(input_expr), std::move(lower_expr), std::move(upper_expr), true, true);
+  auto between = make_between(make_ref(0), make_int_const(3), make_int_const(7), true, true);
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*between);
+  auto ast_tree   = translate(translator, *between);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -947,16 +876,10 @@ TEST_CASE("translator: BETWEEN with tight range", "[expression_translator]")
   auto tv                     = table->view();
 
   // BETWEEN 3 AND 3 -> only 3 matches
-  auto input_expr =
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
-  auto lower_expr = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3));
-  auto upper_expr = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3));
-
-  auto between = duckdb::make_uniq<BoundBetweenExpression>(
-    std::move(input_expr), std::move(lower_expr), std::move(upper_expr), true, true);
+  auto between = make_between(make_ref(0), make_int_const(3), make_int_const(3), true, true);
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*between);
+  auto ast_tree   = translate(translator, *between);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -977,12 +900,10 @@ TEST_CASE("translator: CAST to INT64", "[expression_translator]")
   auto tv                     = table->view();
 
   // Build: CAST(col(0) AS BIGINT)
-  auto child = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
-  auto cast_expr =
-    BoundCastExpression::AddDefaultCastToType(std::move(child), LogicalType{LogicalTypeId::BIGINT});
+  auto cast_expr = make_cast(make_ref(0), logical_type::make(type_id::BIGINT), /*try_cast=*/false);
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*cast_expr);
+  auto ast_tree   = translate(translator, *cast_expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -1001,12 +922,10 @@ TEST_CASE("translator: CAST to FLOAT64", "[expression_translator]")
   auto table                  = make_int32_table(values);
   auto tv                     = table->view();
 
-  auto child = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
-  auto cast_expr =
-    BoundCastExpression::AddDefaultCastToType(std::move(child), LogicalType{LogicalTypeId::DOUBLE});
+  auto cast_expr = make_cast(make_ref(0), logical_type::make(type_id::DOUBLE), /*try_cast=*/false);
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*cast_expr);
+  auto ast_tree   = translate(translator, *cast_expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -1022,12 +941,10 @@ TEST_CASE("translator: CAST to FLOAT64", "[expression_translator]")
 TEST_CASE("translator: unsupported CAST returns nullopt", "[expression_translator]")
 {
   // CAST to VARCHAR is not supported
-  auto child = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
-  auto cast_expr = BoundCastExpression::AddDefaultCastToType(std::move(child),
-                                                             LogicalType{LogicalTypeId::VARCHAR});
+  auto cast_expr = make_cast(make_ref(0), logical_type::make(type_id::VARCHAR), /*try_cast=*/false);
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*cast_expr);
+  auto ast_tree   = translate(translator, *cast_expr);
   REQUIRE_FALSE(ast_tree.has_value());
 }
 
@@ -1042,16 +959,14 @@ TEST_CASE("translator: IN operator", "[expression_translator]")
   auto tv                     = table->view();
 
   // Build: col(0) IN (2, 5, 8)
-  auto in_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::COMPARE_IN,
-                                                            LogicalType{LogicalTypeId::BOOLEAN});
-  in_expr->children.push_back(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-  in_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(2)));
-  in_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(5)));
-  in_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(8)));
+  std::vector<std::unique_ptr<ast_node>> in_values;
+  in_values.push_back(make_int_const(2));
+  in_values.push_back(make_int_const(5));
+  in_values.push_back(make_int_const(8));
+  auto in_expr = make_in(make_ref(0), std::move(in_values), /*negated=*/false);
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*in_expr);
+  auto ast_tree   = translate(translator, *in_expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -1071,15 +986,13 @@ TEST_CASE("translator: NOT IN operator", "[expression_translator]")
   auto tv                     = table->view();
 
   // Build: col(0) NOT IN (2, 4)
-  auto in_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::COMPARE_NOT_IN,
-                                                            LogicalType{LogicalTypeId::BOOLEAN});
-  in_expr->children.push_back(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-  in_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(2)));
-  in_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(4)));
+  std::vector<std::unique_ptr<ast_node>> in_values;
+  in_values.push_back(make_int_const(2));
+  in_values.push_back(make_int_const(4));
+  auto in_expr = make_in(make_ref(0), std::move(in_values), /*negated=*/true);
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*in_expr);
+  auto ast_tree   = translate(translator, *in_expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -1099,14 +1012,12 @@ TEST_CASE("translator: IN with single comparator", "[expression_translator]")
   auto tv                     = table->view();
 
   // Build: col(0) IN (2) -- single-element IN list
-  auto in_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::COMPARE_IN,
-                                                            LogicalType{LogicalTypeId::BOOLEAN});
-  in_expr->children.push_back(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-  in_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(2)));
+  std::vector<std::unique_ptr<ast_node>> in_values;
+  in_values.push_back(make_int_const(2));
+  auto in_expr = make_in(make_ref(0), std::move(in_values), /*negated=*/false);
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*in_expr);
+  auto ast_tree   = translate(translator, *in_expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -1127,17 +1038,11 @@ TEST_CASE("translator: NOT operator", "[expression_translator]")
   auto tv                     = table->view();
 
   // Build: NOT (col(0) > 3)
-  auto cmp = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_GREATERTHAN,
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
-    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3)));
-
-  auto not_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_NOT,
-                                                             LogicalType{LogicalTypeId::BOOLEAN});
-  not_expr->children.push_back(std::move(cmp));
+  auto cmp      = make_cmp(sirius::comparison_type::gt, make_ref(0), make_int_const(3));
+  auto not_expr = make_unary(sirius::ast::unary_op::kind::op_not, std::move(cmp));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*not_expr);
+  auto ast_tree   = translate(translator, *not_expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -1157,13 +1062,10 @@ TEST_CASE("translator: IS NULL operator", "[expression_translator]")
   auto table                  = make_int32_table(values);
   auto tv                     = table->view();
 
-  auto is_null_expr = duckdb::make_uniq<BoundOperatorExpression>(
-    ExpressionType::OPERATOR_IS_NULL, LogicalType{LogicalTypeId::BOOLEAN});
-  is_null_expr->children.push_back(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
+  auto is_null_expr = make_unary(sirius::ast::unary_op::kind::op_is_null, make_ref(0));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*is_null_expr);
+  auto ast_tree   = translate(translator, *is_null_expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -1181,13 +1083,10 @@ TEST_CASE("translator: IS NOT NULL operator", "[expression_translator]")
   auto table                  = make_int32_table(values);
   auto tv                     = table->view();
 
-  auto is_not_null_expr = duckdb::make_uniq<BoundOperatorExpression>(
-    ExpressionType::OPERATOR_IS_NOT_NULL, LogicalType{LogicalTypeId::BOOLEAN});
-  is_not_null_expr->children.push_back(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
+  auto is_not_null_expr = make_unary(sirius::ast::unary_op::kind::op_is_not_null, make_ref(0));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*is_not_null_expr);
+  auto ast_tree   = translate(translator, *is_not_null_expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -1204,49 +1103,37 @@ TEST_CASE("translator: IS NOT NULL operator", "[expression_translator]")
 
 TEST_CASE("translator: CASE expression returns nullopt", "[expression_translator]")
 {
-  // BoundCaseExpression: CASE WHEN col(0)=1 THEN 10 ELSE 0 END
-  auto check = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_EQUAL,
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
-    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(1)));
-  auto result_expr = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(10));
-
-  duckdb::BoundCaseCheck case_check;
-  case_check.when_expr = std::move(check);
-  case_check.then_expr = std::move(result_expr);
-
-  auto else_expr = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(0));
-  auto case_expr = duckdb::make_uniq<BoundCaseExpression>(LogicalType{LogicalTypeId::INTEGER});
-  case_expr->else_expr = std::move(else_expr);
-  case_expr->case_checks.push_back(std::move(case_check));
+  // CASE WHEN col(0)=1 THEN 10 ELSE 0 END
+  std::vector<sirius::ast::case_expr::when_then> cases;
+  cases.push_back(sirius::ast::case_expr::when_then{
+    make_cmp(sirius::comparison_type::equal, make_ref(0), make_int_const(1)), make_int_const(10)});
+  auto case_expr = std::make_unique<ast_node>(sirius::ast::case_expr{
+    std::move(cases), make_int_const(0), logical_type::make(type_id::INTEGER)});
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*case_expr);
+  auto ast_tree   = translate(translator, *case_expr);
   REQUIRE_FALSE(ast_tree.has_value());
 }
 
 TEST_CASE("translator: COALESCE operator returns nullopt", "[expression_translator]")
 {
-  auto coalesce_expr = duckdb::make_uniq<BoundOperatorExpression>(
-    ExpressionType::OPERATOR_COALESCE, LogicalType{LogicalTypeId::INTEGER});
-  coalesce_expr->children.push_back(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-  coalesce_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(0)));
+  std::vector<std::unique_ptr<ast_node>> children;
+  children.push_back(make_ref(0));
+  children.push_back(make_int_const(0));
+  auto coalesce_expr = std::make_unique<ast_node>(
+    sirius::ast::coalesce{std::move(children), logical_type::make(type_id::INTEGER)});
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*coalesce_expr);
+  auto ast_tree   = translate(translator, *coalesce_expr);
   REQUIRE_FALSE(ast_tree.has_value());
 }
 
 TEST_CASE("translator: TRY operator returns nullopt", "[expression_translator]")
 {
-  auto try_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_TRY,
-                                                             LogicalType{LogicalTypeId::INTEGER});
-  try_expr->children.push_back(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
+  auto try_expr = make_unary(sirius::ast::unary_op::kind::op_try, make_ref(0));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*try_expr);
+  auto ast_tree   = translate(translator, *try_expr);
   REQUIRE_FALSE(ast_tree.has_value());
 }
 
@@ -1262,37 +1149,26 @@ TEST_CASE("translator: nested arithmetic (col(0) + 1) * (col(1) - 2)", "[express
   auto tv                   = table->view();
 
   // Build: (col(0) + 1) * (col(1) - 2)
-  auto add_expr = duckdb::make_uniq<BoundFunctionExpression>(
-    LogicalType{LogicalTypeId::INTEGER},
-    ScalarFunction(
-      "+", {LogicalType::INTEGER, LogicalType::INTEGER}, LogicalType::INTEGER, nullptr),
-    duckdb::vector<duckdb::unique_ptr<Expression>>{},
-    nullptr);
-  add_expr->children.push_back(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-  add_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(1)));
+  std::vector<std::unique_ptr<ast_node>> add_args;
+  add_args.push_back(make_ref(0));
+  add_args.push_back(make_int_const(1));
+  auto add_expr =
+    make_func(sirius::function_id::add, std::move(add_args), logical_type::make(type_id::INTEGER));
 
-  auto sub_expr = duckdb::make_uniq<BoundFunctionExpression>(
-    LogicalType{LogicalTypeId::INTEGER},
-    ScalarFunction(
-      "-", {LogicalType::INTEGER, LogicalType::INTEGER}, LogicalType::INTEGER, nullptr),
-    duckdb::vector<duckdb::unique_ptr<Expression>>{},
-    nullptr);
-  sub_expr->children.push_back(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 1));
-  sub_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(2)));
+  std::vector<std::unique_ptr<ast_node>> sub_args;
+  sub_args.push_back(make_ref(1));
+  sub_args.push_back(make_int_const(2));
+  auto sub_expr =
+    make_func(sirius::function_id::sub, std::move(sub_args), logical_type::make(type_id::INTEGER));
 
-  auto mul_expr = duckdb::make_uniq<BoundFunctionExpression>(
-    LogicalType{LogicalTypeId::INTEGER},
-    ScalarFunction(
-      "*", {LogicalType::INTEGER, LogicalType::INTEGER}, LogicalType::INTEGER, nullptr),
-    duckdb::vector<duckdb::unique_ptr<Expression>>{},
-    nullptr);
-  mul_expr->children.push_back(std::move(add_expr));
-  mul_expr->children.push_back(std::move(sub_expr));
+  std::vector<std::unique_ptr<ast_node>> mul_args;
+  mul_args.push_back(std::move(add_expr));
+  mul_args.push_back(std::move(sub_expr));
+  auto mul_expr =
+    make_func(sirius::function_id::mul, std::move(mul_args), logical_type::make(type_id::INTEGER));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*mul_expr);
+  auto ast_tree   = translate(translator, *mul_expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -1313,32 +1189,23 @@ TEST_CASE("translator: comparison with arithmetic col(0)*2 > col(1)+3", "[expres
   auto tv                   = table->view();
 
   // Build LHS: col(0) * 2
-  auto lhs = duckdb::make_uniq<BoundFunctionExpression>(
-    LogicalType{LogicalTypeId::INTEGER},
-    ScalarFunction(
-      "*", {LogicalType::INTEGER, LogicalType::INTEGER}, LogicalType::INTEGER, nullptr),
-    duckdb::vector<duckdb::unique_ptr<Expression>>{},
-    nullptr);
-  lhs->children.push_back(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-  lhs->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(2)));
+  std::vector<std::unique_ptr<ast_node>> lhs_args;
+  lhs_args.push_back(make_ref(0));
+  lhs_args.push_back(make_int_const(2));
+  auto lhs =
+    make_func(sirius::function_id::mul, std::move(lhs_args), logical_type::make(type_id::INTEGER));
 
   // Build RHS: col(1) + 3
-  auto rhs = duckdb::make_uniq<BoundFunctionExpression>(
-    LogicalType{LogicalTypeId::INTEGER},
-    ScalarFunction(
-      "+", {LogicalType::INTEGER, LogicalType::INTEGER}, LogicalType::INTEGER, nullptr),
-    duckdb::vector<duckdb::unique_ptr<Expression>>{},
-    nullptr);
-  rhs->children.push_back(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 1));
-  rhs->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3)));
+  std::vector<std::unique_ptr<ast_node>> rhs_args;
+  rhs_args.push_back(make_ref(1));
+  rhs_args.push_back(make_int_const(3));
+  auto rhs =
+    make_func(sirius::function_id::add, std::move(rhs_args), logical_type::make(type_id::INTEGER));
 
-  auto cmp = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_GREATERTHAN, std::move(lhs), std::move(rhs));
+  auto cmp = make_cmp(sirius::comparison_type::gt, std::move(lhs), std::move(rhs));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*cmp);
+  auto ast_tree   = translate(translator, *cmp);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -1359,27 +1226,23 @@ TEST_CASE("translator: IN combined with AND/OR and comparison", "[expression_tra
   auto tv                        = table->view();
 
   // Build: col(0) IN (1, 3, 5, 7, 9) AND col(1) >= 50
-  auto in_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::COMPARE_IN,
-                                                            LogicalType{LogicalTypeId::BOOLEAN});
-  in_expr->children.push_back(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-  in_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(1)));
-  in_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3)));
-  in_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(5)));
-  in_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(7)));
-  in_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(9)));
+  std::vector<std::unique_ptr<ast_node>> in_values;
+  in_values.push_back(make_int_const(1));
+  in_values.push_back(make_int_const(3));
+  in_values.push_back(make_int_const(5));
+  in_values.push_back(make_int_const(7));
+  in_values.push_back(make_int_const(9));
+  auto in_expr = make_in(make_ref(0), std::move(in_values), /*negated=*/false);
 
-  auto cmp = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_GREATERTHANOREQUALTO,
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::BIGINT}, 1),
-    duckdb::make_uniq<BoundConstantExpression>(Value::BIGINT(50)));
+  auto cmp = make_cmp(sirius::comparison_type::ge, make_ref(1), make_bigint_const(50));
 
-  auto conj = duckdb::make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
-  conj->children.push_back(std::move(in_expr));
-  conj->children.push_back(std::move(cmp));
+  std::vector<std::unique_ptr<ast_node>> children;
+  children.push_back(std::move(in_expr));
+  children.push_back(std::move(cmp));
+  auto conj = make_conj(sirius::ast::conjunction::kind::op_and, std::move(children));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*conj);
+  auto ast_tree   = translate(translator, *conj);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -1401,19 +1264,11 @@ TEST_CASE("translator: deeply nested NOT(col(0) BETWEEN 3 AND 7)", "[expression_
   auto tv                     = table->view();
 
   // Build: NOT (col(0) BETWEEN 3 AND 7)
-  auto between = duckdb::make_uniq<BoundBetweenExpression>(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
-    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3)),
-    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(7)),
-    true,
-    true);
-
-  auto not_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_NOT,
-                                                             LogicalType{LogicalTypeId::BOOLEAN});
-  not_expr->children.push_back(std::move(between));
+  auto between  = make_between(make_ref(0), make_int_const(3), make_int_const(7), true, true);
+  auto not_expr = make_unary(sirius::ast::unary_op::kind::op_not, std::move(between));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*not_expr);
+  auto ast_tree   = translate(translator, *not_expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -1436,17 +1291,14 @@ TEST_CASE("translator: float64 arithmetic col(0) + 0.5", "[expression_translator
   auto table                 = make_float64_table(values);
   auto tv                    = table->view();
 
-  auto func_expr = duckdb::make_uniq<BoundFunctionExpression>(
-    LogicalType{LogicalTypeId::DOUBLE},
-    ScalarFunction("+", {LogicalType::DOUBLE, LogicalType::DOUBLE}, LogicalType::DOUBLE, nullptr),
-    duckdb::vector<duckdb::unique_ptr<Expression>>{},
-    nullptr);
-  func_expr->children.push_back(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::DOUBLE}, 0));
-  func_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::DOUBLE(0.5)));
+  std::vector<std::unique_ptr<ast_node>> args;
+  args.push_back(make_ref(0));
+  args.push_back(make_double_const(0.5));
+  auto func_expr =
+    make_func(sirius::function_id::add, std::move(args), logical_type::make(type_id::DOUBLE));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*func_expr);
+  auto ast_tree   = translate(translator, *func_expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -1464,13 +1316,10 @@ TEST_CASE("translator: float64 comparison col(0) < 3.5", "[expression_translator
   auto table                 = make_float64_table(values);
   auto tv                    = table->view();
 
-  auto left  = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::DOUBLE}, 0);
-  auto right = duckdb::make_uniq<BoundConstantExpression>(Value::DOUBLE(3.5));
-  auto expr  = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_LESSTHAN, std::move(left), std::move(right));
+  auto expr = make_cmp(sirius::comparison_type::lt, make_ref(0), make_double_const(3.5));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*expr);
+  auto ast_tree   = translate(translator, *expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -1497,17 +1346,13 @@ TEST_CASE("translator: reuse translator for multiple expressions", "[expression_
 
   // First translation: col(0) + 10
   {
-    auto func_expr = duckdb::make_uniq<BoundFunctionExpression>(
-      LogicalType{LogicalTypeId::INTEGER},
-      ScalarFunction(
-        "+", {LogicalType::INTEGER, LogicalType::INTEGER}, LogicalType::INTEGER, nullptr),
-      duckdb::vector<duckdb::unique_ptr<Expression>>{},
-      nullptr);
-    func_expr->children.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-    func_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(10)));
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(make_ref(0));
+    args.push_back(make_int_const(10));
+    auto func_expr =
+      make_func(sirius::function_id::add, std::move(args), logical_type::make(type_id::INTEGER));
 
-    auto ast_tree = translator.translate_expression(*func_expr);
+    auto ast_tree = translate(translator, *func_expr);
     REQUIRE(ast_tree.has_value());
 
     auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -1522,17 +1367,13 @@ TEST_CASE("translator: reuse translator for multiple expressions", "[expression_
 
   // Second translation with same translator: col(0) * 3
   {
-    auto func_expr = duckdb::make_uniq<BoundFunctionExpression>(
-      LogicalType{LogicalTypeId::INTEGER},
-      ScalarFunction(
-        "*", {LogicalType::INTEGER, LogicalType::INTEGER}, LogicalType::INTEGER, nullptr),
-      duckdb::vector<duckdb::unique_ptr<Expression>>{},
-      nullptr);
-    func_expr->children.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-    func_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3)));
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(make_ref(0));
+    args.push_back(make_int_const(3));
+    auto func_expr =
+      make_func(sirius::function_id::mul, std::move(args), logical_type::make(type_id::INTEGER));
 
-    auto ast_tree = translator.translate_expression(*func_expr);
+    auto ast_tree = translate(translator, *func_expr);
     REQUIRE(ast_tree.has_value());
 
     auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -1557,21 +1398,16 @@ TEST_CASE("translator: CAST(col(0) AS BIGINT) + 100", "[expression_translator]")
   auto tv                     = table->view();
 
   // Build: CAST(col(0) AS BIGINT) + 100
-  auto cast_child =
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
-  auto cast_expr = BoundCastExpression::AddDefaultCastToType(std::move(cast_child),
-                                                             LogicalType{LogicalTypeId::BIGINT});
+  auto cast_expr = make_cast(make_ref(0), logical_type::make(type_id::BIGINT), /*try_cast=*/false);
 
-  auto func_expr = duckdb::make_uniq<BoundFunctionExpression>(
-    LogicalType{LogicalTypeId::BIGINT},
-    ScalarFunction("+", {LogicalType::BIGINT, LogicalType::BIGINT}, LogicalType::BIGINT, nullptr),
-    duckdb::vector<duckdb::unique_ptr<Expression>>{},
-    nullptr);
-  func_expr->children.push_back(std::move(cast_expr));
-  func_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::BIGINT(100)));
+  std::vector<std::unique_ptr<ast_node>> args;
+  args.push_back(std::move(cast_expr));
+  args.push_back(make_bigint_const(100));
+  auto func_expr =
+    make_func(sirius::function_id::add, std::move(args), logical_type::make(type_id::BIGINT));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*func_expr);
+  auto ast_tree   = translate(translator, *func_expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -1594,13 +1430,10 @@ TEST_CASE("translator: single-row table", "[expression_translator]")
   auto table                  = make_int32_table(values);
   auto tv                     = table->view();
 
-  auto left  = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
-  auto right = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(42));
-  auto expr  = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_EQUAL, std::move(left), std::move(right));
+  auto expr = make_cmp(sirius::comparison_type::equal, make_ref(0), make_int_const(42));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*expr);
+  auto ast_tree   = translate(translator, *expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -1622,24 +1455,16 @@ TEST_CASE("translator: 100-row table with complex expression", "[expression_tran
   auto tv    = table->view();
 
   // Build: (col(0) + col(1)) == 100
-  auto add_expr = duckdb::make_uniq<BoundFunctionExpression>(
-    LogicalType{LogicalTypeId::INTEGER},
-    ScalarFunction(
-      "+", {LogicalType::INTEGER, LogicalType::INTEGER}, LogicalType::INTEGER, nullptr),
-    duckdb::vector<duckdb::unique_ptr<Expression>>{},
-    nullptr);
-  add_expr->children.push_back(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-  add_expr->children.push_back(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 1));
+  std::vector<std::unique_ptr<ast_node>> add_args;
+  add_args.push_back(make_ref(0));
+  add_args.push_back(make_ref(1));
+  auto add_expr =
+    make_func(sirius::function_id::add, std::move(add_args), logical_type::make(type_id::INTEGER));
 
-  auto cmp = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_EQUAL,
-    std::move(add_expr),
-    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(100)));
+  auto cmp = make_cmp(sirius::comparison_type::equal, std::move(add_expr), make_int_const(100));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*cmp);
+  auto ast_tree   = translate(translator, *cmp);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -1654,10 +1479,10 @@ TEST_CASE("translator: 100-row table with complex expression", "[expression_tran
 // Test: Decimal column vs. decimal literal comparisons
 //
 // NOTE: decimal column-vs-literal comparisons work once rapidsai/cudf#21447 is
-// included. Decimal arithmetic (BoundFunctionExpression children returning
-// DECIMAL) is currently blocked by the translator pending rapidsai/cudf#21996,
-// so the positive tests here stay inside the comparison pattern and a negative
-// test below pins the blocking behavior.
+// included. Decimal arithmetic (function_call children returning DECIMAL) is
+// currently blocked by the translator pending rapidsai/cudf#21996, so the
+// positive tests here stay inside the comparison pattern and a negative test
+// below pins the blocking behavior.
 //===----------------------------------------------------------------------===//
 
 TEST_CASE("translator: decimal32 column EQUAL decimal literal", "[expression_translator]")
@@ -1667,17 +1492,14 @@ TEST_CASE("translator: decimal32 column EQUAL decimal literal", "[expression_tra
   auto table                    = make_decimal32_table(col_reps, -2);
   auto tv                       = table->view();
 
-  auto const dec52 = LogicalType::DECIMAL(5, 2);
+  auto const dec52 = logical_type::make_decimal(5, 2);
 
   // col(0) == 2.50
-  auto left = duckdb::make_uniq<BoundReferenceExpression>(dec52, 0);
-  auto right =
-    duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(250, uint8_t{5}, uint8_t{2}));
-  auto expr = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_EQUAL, std::move(left), std::move(right));
+  auto expr =
+    make_cmp(sirius::comparison_type::equal, make_ref_typed(0, dec52), make_dec32_const(250, 5, 2));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*expr);
+  auto ast_tree   = translate(translator, *expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -1692,17 +1514,14 @@ TEST_CASE("translator: decimal64 column LESS decimal literal", "[expression_tran
   auto table                    = make_decimal64_table(col_reps, -4);
   auto tv                       = table->view();
 
-  auto const dec124 = LogicalType::DECIMAL(12, 4);
+  auto const dec124 = logical_type::make_decimal(12, 4);
 
   // col(0) < 2.5000
-  auto left  = duckdb::make_uniq<BoundReferenceExpression>(dec124, 0);
-  auto right = duckdb::make_uniq<BoundConstantExpression>(
-    Value::DECIMAL(int64_t{25000}, uint8_t{12}, uint8_t{4}));
-  auto expr = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_LESSTHAN, std::move(left), std::move(right));
+  auto expr = make_cmp(
+    sirius::comparison_type::lt, make_ref_typed(0, dec124), make_dec64_const(25000, 12, 4));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*expr);
+  auto ast_tree   = translate(translator, *expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -1718,27 +1537,24 @@ TEST_CASE("translator: nested decimal comparison col(0) >= 2.00 AND col(0) <= 4.
   auto table                    = make_decimal32_table(col_reps, -2);
   auto tv                       = table->view();
 
-  auto const dec52 = LogicalType::DECIMAL(5, 2);
+  auto const dec52 = logical_type::make_decimal(5, 2);
 
   // col(0) >= 2.00
-  auto geq = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_GREATERTHANOREQUALTO,
-    duckdb::make_uniq<BoundReferenceExpression>(dec52, 0),
-    duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(200, uint8_t{5}, uint8_t{2})));
+  auto geq =
+    make_cmp(sirius::comparison_type::ge, make_ref_typed(0, dec52), make_dec32_const(200, 5, 2));
 
   // col(0) <= 4.00
-  auto leq = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_LESSTHANOREQUALTO,
-    duckdb::make_uniq<BoundReferenceExpression>(dec52, 0),
-    duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(400, uint8_t{5}, uint8_t{2})));
+  auto leq =
+    make_cmp(sirius::comparison_type::le, make_ref_typed(0, dec52), make_dec32_const(400, 5, 2));
 
   // (col(0) >= 2.00) AND (col(0) <= 4.00)
-  auto conj = duckdb::make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
-  conj->children.push_back(std::move(geq));
-  conj->children.push_back(std::move(leq));
+  std::vector<std::unique_ptr<ast_node>> children;
+  children.push_back(std::move(geq));
+  children.push_back(std::move(leq));
+  auto conj = make_conj(sirius::ast::conjunction::kind::op_and, std::move(children));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*conj);
+  auto ast_tree   = translate(translator, *conj);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -1748,33 +1564,45 @@ TEST_CASE("translator: nested decimal comparison col(0) >= 2.00 AND col(0) <= 4.
 
 TEST_CASE("translator: nested decimal arithmetic returns nullopt", "[expression_translator]")
 {
-  // Any BoundFunctionExpression whose children have DECIMAL return_type must be
-  // blocked by the translator (pending rapidsai/cudf#21996). Build a nested
-  // expression (col(0) + col(0)) * 2.00 over a DECIMAL(5,2) column and confirm
-  // the translator refuses both the inner and outer functions.
-  auto const dec52 = LogicalType::DECIMAL(5, 2);
+  // Any function_call whose children have DECIMAL return_type must be blocked by
+  // the translator (pending rapidsai/cudf#21996). Build a nested expression
+  // (col(0) + col(0)) * 2.00 over a DECIMAL(5,2) column and confirm the
+  // translator refuses both the inner and outer functions.
+  auto const dec52 = logical_type::make_decimal(5, 2);
 
   // col(0) + col(0)
-  auto add =
-    duckdb::make_uniq<BoundFunctionExpression>(dec52,
-                                               ScalarFunction("+", {dec52, dec52}, dec52, nullptr),
-                                               duckdb::vector<duckdb::unique_ptr<Expression>>{},
-                                               nullptr);
-  add->children.push_back(duckdb::make_uniq<BoundReferenceExpression>(dec52, 0));
-  add->children.push_back(duckdb::make_uniq<BoundReferenceExpression>(dec52, 0));
+  std::vector<std::unique_ptr<ast_node>> add_args;
+  add_args.push_back(make_ref_typed(0, dec52));
+  add_args.push_back(make_ref_typed(0, dec52));
+  auto add = make_func(sirius::function_id::add, std::move(add_args), dec52);
 
   // (col(0) + col(0)) * 2.00
-  auto mul =
-    duckdb::make_uniq<BoundFunctionExpression>(dec52,
-                                               ScalarFunction("*", {dec52, dec52}, dec52, nullptr),
-                                               duckdb::vector<duckdb::unique_ptr<Expression>>{},
-                                               nullptr);
-  mul->children.push_back(std::move(add));
-  mul->children.push_back(
-    duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(200, uint8_t{5}, uint8_t{2})));
+  std::vector<std::unique_ptr<ast_node>> mul_args;
+  mul_args.push_back(std::move(add));
+  mul_args.push_back(make_dec32_const(200, 5, 2));
+  auto mul = make_func(sirius::function_id::mul, std::move(mul_args), dec52);
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*mul);
+  auto ast_tree   = translate(translator, *mul);
+  REQUIRE_FALSE(ast_tree.has_value());
+}
+
+TEST_CASE("translator: direct decimal column arithmetic returns nullopt", "[expression_translator]")
+{
+  // Direct column-vs-column decimal arithmetic (col(0) + col(0)) must also be
+  // blocked (pending rapidsai/cudf#21996), not just arithmetic whose children
+  // are decimal constants or nested functions. The function's arguments are
+  // bare references here, so the guard depends on reference nodes carrying their
+  // DECIMAL return_type.
+  auto const dec52 = logical_type::make_decimal(5, 2);
+
+  std::vector<std::unique_ptr<ast_node>> add_args;
+  add_args.push_back(make_ref_typed(0, dec52));
+  add_args.push_back(make_ref_typed(0, dec52));
+  auto add = make_func(sirius::function_id::add, std::move(add_args), dec52);
+
+  auto translator = make_translator();
+  auto ast_tree   = translate(translator, *add);
   REQUIRE_FALSE(ast_tree.has_value());
 }
 
@@ -1788,13 +1616,10 @@ TEST_CASE("translator: string column EQUAL string literal", "[expression_transla
   auto tv    = table->view();
 
   // col(0) == 'bravo'
-  auto left  = duckdb::make_uniq<BoundReferenceExpression>(LogicalType::VARCHAR, 0);
-  auto right = duckdb::make_uniq<BoundConstantExpression>(Value("bravo"));
-  auto expr  = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_EQUAL, std::move(left), std::move(right));
+  auto expr = make_cmp(sirius::comparison_type::equal, make_ref(0), make_str_const("bravo"));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*expr);
+  auto ast_tree   = translate(translator, *expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
@@ -1808,13 +1633,10 @@ TEST_CASE("translator: string column NOT EQUAL string literal", "[expression_tra
   auto tv    = table->view();
 
   // col(0) != 'foo'
-  auto left  = duckdb::make_uniq<BoundReferenceExpression>(LogicalType::VARCHAR, 0);
-  auto right = duckdb::make_uniq<BoundConstantExpression>(Value("foo"));
-  auto expr  = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_NOTEQUAL, std::move(left), std::move(right));
+  auto expr = make_cmp(sirius::comparison_type::not_equal, make_ref(0), make_str_const("foo"));
 
   auto translator = make_translator();
-  auto ast_tree   = translator.translate_expression(*expr);
+  auto ast_tree   = translate(translator, *expr);
   REQUIRE(ast_tree.has_value());
 
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);

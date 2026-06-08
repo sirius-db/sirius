@@ -17,6 +17,7 @@
 #include "sirius_config.hpp"
 
 #include "exec/config.hpp"
+#include "log/logging.hpp"
 #include "yaml_reader.hpp"
 
 #include <cucascade/memory/config.hpp>
@@ -105,7 +106,12 @@ static void from_yaml(const YAML::Node& node, sirius::io::object_store_config& o
   r.optional("region", opt.region);
   r.optional("access_key", opt.access_key);
   r.optional("secret_key", opt.secret_key);
+  r.optional("session_token", opt.session_token);
   r.optional("s3_transport", opt.s3_transport);
+  r.optional("signing_mode", opt.s3_signing_mode);
+  r.optional("ca_bundle_path", opt.ca_bundle_path);
+  r.optional("tls_verify", opt.tls_verify);
+  r.optional("s3_use_async_backend", opt.s3_use_async_backend);
   r.reject_unknown();
 }
 
@@ -115,8 +121,12 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("scan_task_batch_size", yaml::bytes(opt.scan_task_batch_size));
   r.optional("default_scan_task_varchar_size", yaml::bytes(opt.default_scan_task_varchar_size));
   r.optional("max_sort_partition_bytes", yaml::bytes(opt.max_sort_partition_bytes));
+  r.optional("max_sort_partition_memory_fraction",
+             opt.max_sort_partition_memory_fraction,
+             yaml::fraction<double>{});
   r.optional("hash_partition_bytes", yaml::bytes(opt.hash_partition_bytes));
   r.optional("concat_batch_bytes", yaml::bytes(opt.concat_batch_bytes));
+  r.optional("sort_sample_bytes", yaml::bytes(opt.sort_sample_bytes));
   r.optional("max_build_hash_table_bytes", yaml::bytes(opt.max_build_hash_table_bytes));
   r.optional("enable_gpu_duckdb_native_scan", opt.enable_gpu_duckdb_native_scan);
   r.reject_unknown();
@@ -428,9 +438,26 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
       _memory_space_configs = builder.build(_hw_topology);
     }
 
+    enforce_sirius_datasource_for_multi_gpu();
+
   } catch (const std::exception& e) {
     throw std::runtime_error("Failed to load config from " + config_path.string() + ": " +
                              e.what());
+  }
+}
+
+void sirius_config::enforce_sirius_datasource_for_multi_gpu()
+{
+  size_t num_gpus = std::ranges::count_if(_memory_space_configs, [](auto const& space) {
+    return std::holds_alternative<cucascade::memory::gpu_memory_space_config>(space);
+  });
+  if (num_gpus > 1 && !_scan_manager_config.use_sirius_datasource) {
+    SIRIUS_LOG_WARN(
+      "sirius_config: use_sirius_datasource was false but {} GPUs are configured; "
+      "the sirius datasource is required for multi-GPU IO routing. Overriding "
+      "use_sirius_datasource to true.",
+      num_gpus);
+    _scan_manager_config.use_sirius_datasource = true;
   }
 }
 

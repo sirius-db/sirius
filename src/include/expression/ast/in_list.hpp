@@ -37,6 +37,8 @@ struct in_list {
   std::unique_ptr<node> probe;
   std::vector<std::unique_ptr<node>> values;
   bool negated{false};
+
+  std::size_t cudf_ast_op_count() const;
 };
 
 }  // namespace sirius::ast

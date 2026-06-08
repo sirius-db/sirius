@@ -272,8 +272,8 @@ void parquet_split_provider::run_batch(file_batch const& batch,
       return _plan->batch_column_name(ref_index);
     };
     gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
-    ast_expression =
-      translator.translate_expression_with_names(*_duckdb_filter_expression, name_resolver);
+    ast_expression = sirius::op::translate_duckdb_expression_with_names(
+      translator, *_duckdb_filter_expression, name_resolver);
     if (ast_expression) {
       // Probe the first file's schema before committing to filter pushdown. The probe
       // result is reused below by the main file loop via the prefetch cache.
@@ -386,9 +386,12 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     //     Footer reads are GPU-agnostic; per-GPU column placement is decided
     //     downstream by the scan operator's task affinity, so any GPU's ioctx
     //     is safe for planning, and routing through io_uring (not cudf's kvikio
-    //     file_source) preserves per-GPU CUDA-context binding.
-    //   * neither (legacy test fixture with no scan_manager and empty
-    //     gpu_ioctxs) → cudf::io::datasource::create.
+    //     file_source) preserves per-GPU CUDA-context binding. Multi-GPU runs
+    //     always reach this branch — enforced by
+    //     sirius_config::enforce_sirius_datasource_for_multi_gpu().
+    //   * neither (single-GPU use_sirius_datasource=false, or legacy test
+    //     fixture with no scan_manager and empty gpu_ioctxs) →
+    //     cudf::io::datasource::create (kvikio is safe with one GPU).
     //
     // Path normalization: uring_reactor::supports / create_io_object only
     // accept bare absolute paths (they call is_regular_file on the raw
@@ -428,8 +431,12 @@ void parquet_split_provider::run_batch(file_batch const& batch,
       // Local file → dev #732's per-GPU planning ioctx.
       file_io_ctx = planning_ioctx_it->second;
     } else if (_scan_manager != nullptr) {
-      // Local file, no gpu_ioctxs injected → scan_manager's uring backend
-      // (still keeps the read off cudf's kvikio file_source).
+      // Local file, no gpu_ioctxs injected → scan_manager's uring backend.
+      // Used when use_sirius_datasource=true was requested but no per-GPU map
+      // was forwarded; routes the read through sirius_datasource instead of
+      // cudf's bundled kvikio file_source. In single-GPU mode with
+      // use_sirius_datasource=false, the scan_manager reports no backend for
+      // local paths and dispatch falls through to the cudf datasource below.
       file_io_ctx = _scan_manager->io_ctx_shared_for(lookup_path);
     }
     std::shared_ptr<sirius::io::sirius_io_object> file_io_object;
@@ -668,13 +675,13 @@ void parquet_split_provider::run_batch(file_batch const& batch,
       cur_rgs.push_back(rg_idx);
     }
     seal_current_file();
-    // Emit at least one split per file so source pipelines (GPU_PARQUET_SCAN
-    // -> ...) generate multiple gpu_pipeline_tasks when scanning multiple
-    // files. The task_scheduler's round-robin counter then distributes those
-    // tasks across GPUs. Without this flush, small workloads bundle all files
-    // under the _approximate_batch_size threshold into one split → one task →
-    // one GPU.
-    flush();
+    // Multi-GPU only: emit at least one split per file so source pipelines
+    // (GPU_PARQUET_SCAN -> ...) generate multiple gpu_pipeline_tasks when
+    // scanning multiple files. The task_scheduler's round-robin counter then
+    // distributes those tasks across GPUs. On a single-GPU system there is no
+    // GPU to balance across, so we keep the BASE byte-budget bundling (more
+    // tasks just add pipeline-start overhead without parallelism benefit).
+    if (_gpu_ioctxs.size() > 1) { flush(); }
   }
   flush();
 }

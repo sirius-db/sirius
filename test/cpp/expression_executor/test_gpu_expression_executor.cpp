@@ -15,6 +15,8 @@
  */
 
 // test
+#include "ast_test_support.hpp"
+
 #include <catch.hpp>
 #include <utils/utils.hpp>
 
@@ -23,19 +25,24 @@
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
+#include <expression/ast/between.hpp>
+#include <expression/ast/case_expr.hpp>
+#include <expression/ast/cast.hpp>
+#include <expression/ast/coalesce.hpp>
+#include <expression/ast/comparison.hpp>
+#include <expression/ast/conjunction.hpp>
+#include <expression/ast/constant.hpp>
+#include <expression/ast/function_call.hpp>
+#include <expression/ast/in_list.hpp>
+#include <expression/ast/node.hpp>
+#include <expression/ast/reference.hpp>
+#include <expression/ast/unary_op.hpp>
+#include <expression/function_id.hpp>
+#include <expression/join_condition.hpp>
+#include <expression/value.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
+#include <helper/logical_type.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
-
-// duckdb
-#include <duckdb/common/helper.hpp>
-#include <duckdb/planner/expression/bound_between_expression.hpp>
-#include <duckdb/planner/expression/bound_case_expression.hpp>
-#include <duckdb/planner/expression/bound_comparison_expression.hpp>
-#include <duckdb/planner/expression/bound_conjunction_expression.hpp>
-#include <duckdb/planner/expression/bound_constant_expression.hpp>
-#include <duckdb/planner/expression/bound_function_expression.hpp>
-#include <duckdb/planner/expression/bound_operator_expression.hpp>
-#include <duckdb/planner/expression/bound_reference_expression.hpp>
 
 // cudf, etc.
 #include <cudf/column/column_factories.hpp>
@@ -49,9 +56,9 @@
 #include <memory>
 #include <numeric>
 
-using namespace duckdb;
 using namespace cucascade;
 using namespace cucascade::memory;
+using namespace sirius::expr_test;
 using memory_mgr = ::sirius::memory::sirius_memory_reservation_manager;
 
 namespace {
@@ -84,77 +91,6 @@ memory_space* get_default_gpu_space()
 rmm::device_async_resource_ref get_resource_ref(memory_space& space)
 {
   return space.get_default_allocator();
-}
-
-template <typename T>
-std::vector<T> copy_column_to_host(const cudf::column_view& col)
-{
-  std::vector<T> host(col.size());
-  if (col.size() > 0) {
-    cudaMemcpy(host.data(), col.data<T>(), sizeof(T) * col.size(), cudaMemcpyDeviceToHost);
-  }
-  return host;
-}
-
-std::vector<uint8_t> copy_bool_column_to_host(const cudf::column_view& col)
-{
-  std::vector<uint8_t> host(col.size());
-  if (col.size() > 0) {
-    cudaMemcpy(host.data(), col.head(), sizeof(uint8_t) * col.size(), cudaMemcpyDeviceToHost);
-  }
-  return host;
-}
-
-std::vector<std::string> copy_string_column_to_host(const cudf::column_view& col)
-{
-  std::vector<std::string> host;
-  if (col.size() == 0) { return host; }
-
-  cudf::strings_column_view str_col(col);
-  std::vector<cudf::size_type> offsets(col.size() + 1);
-  cudaMemcpy(offsets.data(),
-             str_col.offsets().data<cudf::size_type>(),
-             (col.size() + 1) * sizeof(cudf::size_type),
-             cudaMemcpyDeviceToHost);
-
-  std::vector<char> chars(offsets.back());
-  if (!chars.empty()) {
-    cudaMemcpy(chars.data(),
-               str_col.chars_begin(cudf::get_default_stream()),
-               offsets.back(),
-               cudaMemcpyDeviceToHost);
-  }
-
-  host.reserve(col.size());
-  for (cudf::size_type i = 0; i < col.size(); ++i) {
-    auto start = offsets[i];
-    auto end   = offsets[i + 1];
-    if (chars.empty()) {
-      host.emplace_back();
-    } else {
-      host.emplace_back(chars.data() + start, chars.data() + end);
-    }
-  }
-  return host;
-}
-
-std::vector<bool> copy_valids_to_host(const cudf::column_view& col)
-{
-  std::vector<bool> valids(col.size(), true);
-  if (!col.nullable() || col.null_count() == 0) { return valids; }
-  auto const num_words = cudf::num_bitmask_words(col.size());
-  std::vector<cudf::bitmask_type> host_mask(num_words);
-  cudaMemcpy(host_mask.data(),
-             col.null_mask(),
-             num_words * sizeof(cudf::bitmask_type),
-             cudaMemcpyDeviceToHost);
-  constexpr auto bits_per_word = sizeof(cudf::bitmask_type) * 8;
-  for (cudf::size_type i = 0; i < col.size(); ++i) {
-    auto word = host_mask[i / bits_per_word];
-    auto bit  = i % bits_per_word;
-    valids[i] = ((word >> bit) & 1U) != 0U;
-  }
-  return valids;
 }
 
 std::shared_ptr<data_batch> make_input_batch(
@@ -380,6 +316,13 @@ struct ast_jit_strategy {
   static constexpr auto value = exp_strategy_enum::AST_JIT;
 };
 
+// Native sirius::ast::node construction helpers (make_ref / make_int_const / ...)
+// and GPU->host copy helpers live in ast_test_support.hpp, shared across the
+// expression_executor test suites.
+
+using sirius::logical_type;
+using sirius::type_id;
+
 // Shorthand: build executor, run execute(), return output table view and input table view.
 struct exec_result {
   std::shared_ptr<data_batch> input;
@@ -390,11 +333,14 @@ struct exec_result {
 
 exec_result run_execute(memory_space& space,
                         std::shared_ptr<data_batch> const& input_batch,
-                        duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs,
+                        std::vector<std::unique_ptr<ast_node>> nodes,
                         exp_strategy_enum strategy = MAT)
 {
-  auto wrapped = sirius::wrap_many(std::move(exprs));
-  exp_executor executor(wrapped, get_resource_ref(space), cudf::get_default_stream(), strategy);
+  duckdb::vector<std::unique_ptr<ast_node>> ast_nodes;
+  for (auto& n : nodes) {
+    ast_nodes.push_back(std::move(n));
+  }
+  exp_executor executor(ast_nodes, get_resource_ref(space), cudf::get_default_stream(), strategy);
   auto input_ro     = input_batch->to_read_only();
   auto& in_repr     = input_ro.get_data()->cast<gpu_table_representation>();
   auto output_table = executor.execute(in_repr.get_table_view());
@@ -408,11 +354,10 @@ exec_result run_execute(memory_space& space,
 
 exec_result run_select(memory_space& space,
                        std::shared_ptr<data_batch> const& input_batch,
-                       duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs,
+                       std::unique_ptr<ast_node> node,
                        exp_strategy_enum strategy = MAT)
 {
-  auto wrapped = sirius::wrap_many(std::move(exprs));
-  exp_executor executor(wrapped, get_resource_ref(space), cudf::get_default_stream(), strategy);
+  exp_executor executor(*node, get_resource_ref(space), cudf::get_default_stream(), strategy);
   auto input_ro     = input_batch->to_read_only();
   auto& in_repr     = input_ro.get_data()->cast<gpu_table_representation>();
   auto output_table = executor.select(in_repr.get_table_view());
@@ -424,22 +369,12 @@ exec_result run_select(memory_space& space,
   return {input_batch, output_batch, in_repr.get_table_view(), out_repr.get_table_view()};
 }
 
-// Helper: make a BoundFunctionExpression with the given name, arg types, return type, and children.
-duckdb::unique_ptr<BoundFunctionExpression> make_func_expr(
-  const std::string& name,
-  LogicalType const& return_type,
-  std::vector<LogicalType> arg_types,
-  duckdb::vector<duckdb::unique_ptr<Expression>> children)
+// Convenience: pack a single node into the projection driver's vector.
+std::vector<std::unique_ptr<ast_node>> one(std::unique_ptr<ast_node> n)
 {
-  auto expr = duckdb::make_uniq<BoundFunctionExpression>(
-    return_type,
-    ScalarFunction(name, std::move(arg_types), return_type, nullptr),
-    duckdb::vector<duckdb::unique_ptr<Expression>>{},
-    nullptr);
-  for (auto& child : children) {
-    expr->children.push_back(std::move(child));
-  }
-  return expr;
+  std::vector<std::unique_ptr<ast_node>> v;
+  v.push_back(std::move(n));
+  return v;
 }
 }  // namespace
 
@@ -462,14 +397,10 @@ TEMPLATE_TEST_CASE("execute projects references, constants, and comparisons",
     auto input = make_input_batch(
       *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 100}});
 
-    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-    exprs.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(42)));
-    auto lhs = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
-    auto rhs = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(50));
-    exprs.push_back(duckdb::make_uniq<BoundComparisonExpression>(
-      ExpressionType::COMPARE_GREATERTHAN, std::move(lhs), std::move(rhs)));
+    std::vector<std::unique_ptr<ast_node>> exprs;
+    exprs.push_back(make_ref(0));
+    exprs.push_back(make_int_const(42));
+    exprs.push_back(make_cmp(sirius::comparison_type::gt, make_ref(0), make_int_const(50)));
 
     auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
     REQUIRE(ov.num_columns() == 3);
@@ -496,15 +427,11 @@ TEMPLATE_TEST_CASE("execute projects references, constants, and comparisons",
     std::iota(raw.begin(), raw.end(), 0);
     auto input = make_decimal64_batch(*space, static_cast<int8_t>(scale), raw);
 
-    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
+    std::vector<std::unique_ptr<ast_node>> exprs;
+    exprs.push_back(make_ref(0));
+    exprs.push_back(make_dec64_const(42, 18, scale));
     exprs.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType::DECIMAL(18, scale), 0));
-    exprs.push_back(
-      duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(int64_t{42}, 18, scale)));
-    auto lhs = duckdb::make_uniq<BoundReferenceExpression>(LogicalType::DECIMAL(18, scale), 0);
-    auto rhs = duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(int64_t{64}, 18, scale));
-    exprs.push_back(duckdb::make_uniq<BoundComparisonExpression>(
-      ExpressionType::COMPARE_LESSTHAN, std::move(lhs), std::move(rhs)));
+      make_cmp(sirius::comparison_type::lt, make_ref(0), make_dec64_const(64, 18, scale)));
 
     auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
     REQUIRE(ov.num_columns() == 3);
@@ -528,14 +455,10 @@ TEMPLATE_TEST_CASE("execute projects references, constants, and comparisons",
     auto input = make_input_batch(
       *space, {cudf::data_type{cudf::type_id::STRING}}, {std::pair<int, int>{1, 5}});
 
-    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::VARCHAR}, 0));
-    exprs.push_back(duckdb::make_uniq<BoundConstantExpression>(Value("hello")));
-    auto lhs = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::VARCHAR}, 0);
-    auto rhs = duckdb::make_uniq<BoundConstantExpression>(Value("str_3"));
-    exprs.push_back(duckdb::make_uniq<BoundComparisonExpression>(
-      ExpressionType::COMPARE_EQUAL, std::move(lhs), std::move(rhs)));
+    std::vector<std::unique_ptr<ast_node>> exprs;
+    exprs.push_back(make_ref(0));
+    exprs.push_back(make_str_const("hello"));
+    exprs.push_back(make_cmp(sirius::comparison_type::equal, make_ref(0), make_str_const("str_3")));
 
     auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
     REQUIRE(ov.num_columns() == 3);
@@ -574,13 +497,9 @@ TEMPLATE_TEST_CASE("select filters rows and handles edge cases",
     auto input = make_input_batch(
       *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 9}});
 
-    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    auto lhs = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
-    auto rhs = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(5));
-    exprs.push_back(duckdb::make_uniq<BoundComparisonExpression>(
-      ExpressionType::COMPARE_GREATERTHAN, std::move(lhs), std::move(rhs)));
+    auto expr = make_cmp(sirius::comparison_type::gt, make_ref(0), make_int_const(5));
 
-    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
+    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(expr), strategy);
     auto in_vals                       = copy_column_to_host<int32_t>(iv.column(0));
     std::vector<int32_t> expected;
     for (auto v : in_vals) {
@@ -594,13 +513,9 @@ TEMPLATE_TEST_CASE("select filters rows and handles edge cases",
     auto input = make_input_batch(
       *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 9}});
 
-    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    auto lhs = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
-    auto rhs = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(1000));
-    exprs.push_back(duckdb::make_uniq<BoundComparisonExpression>(
-      ExpressionType::COMPARE_GREATERTHAN, std::move(lhs), std::move(rhs)));
+    auto expr = make_cmp(sirius::comparison_type::gt, make_ref(0), make_int_const(1000));
 
-    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
+    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(expr), strategy);
     REQUIRE(ov.num_rows() == 0);
     REQUIRE(ov.num_columns() == iv.num_columns());
   }
@@ -612,13 +527,9 @@ TEMPLATE_TEST_CASE("select filters rows and handles edge cases",
     std::iota(raw.begin(), raw.end(), 0);
     auto input = make_decimal64_batch(*space, static_cast<int8_t>(scale), raw);
 
-    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    auto lhs = duckdb::make_uniq<BoundReferenceExpression>(LogicalType::DECIMAL(18, scale), 0);
-    auto rhs = duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(int64_t{64}, 18, scale));
-    exprs.push_back(duckdb::make_uniq<BoundComparisonExpression>(
-      ExpressionType::COMPARE_GREATERTHAN, std::move(lhs), std::move(rhs)));
+    auto expr = make_cmp(sirius::comparison_type::gt, make_ref(0), make_dec64_const(64, 18, scale));
 
-    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
+    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(expr), strategy);
     auto in_vals                       = copy_column_to_host<int64_t>(iv.column(0));
     std::vector<int64_t> expected;
     for (auto v : in_vals) {
@@ -632,13 +543,9 @@ TEMPLATE_TEST_CASE("select filters rows and handles edge cases",
     auto input = make_input_batch(
       *space, {cudf::data_type{cudf::type_id::STRING}}, {std::pair<int, int>{1, 3}});
 
-    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    auto lhs = duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::VARCHAR}, 0);
-    auto rhs = duckdb::make_uniq<BoundConstantExpression>(Value("str_2"));
-    exprs.push_back(duckdb::make_uniq<BoundComparisonExpression>(
-      ExpressionType::COMPARE_EQUAL, std::move(lhs), std::move(rhs)));
+    auto expr = make_cmp(sirius::comparison_type::equal, make_ref(0), make_str_const("str_2"));
 
-    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
+    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(expr), strategy);
     auto in_strs                       = copy_string_column_to_host(iv.column(0));
     std::vector<std::string> expected;
     for (auto const& v : in_strs) {
@@ -669,18 +576,13 @@ TEMPLATE_TEST_CASE("execute arithmetic functions",
 
   SECTION("col0 + 10")
   {
-    duckdb::vector<duckdb::unique_ptr<Expression>> children;
-    children.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-    children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(10)));
-    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(
-      make_func_expr("+",
-                     LogicalType{LogicalTypeId::INTEGER},
-                     {LogicalType{LogicalTypeId::INTEGER}, LogicalType{LogicalTypeId::INTEGER}},
-                     std::move(children)));
+    std::vector<std::unique_ptr<ast_node>> children;
+    children.push_back(make_ref(0));
+    children.push_back(make_int_const(10));
+    auto expr = make_func(
+      sirius::function_id::add, std::move(children), logical_type::make(type_id::INTEGER));
 
-    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, one(std::move(expr)), strategy);
     REQUIRE(ov.num_columns() == 1);
     auto in0  = copy_column_to_host<int32_t>(iv.column(0));
     auto out0 = copy_column_to_host<int32_t>(ov.column(0));
@@ -691,19 +593,13 @@ TEMPLATE_TEST_CASE("execute arithmetic functions",
 
   SECTION("col0 * col1")
   {
-    duckdb::vector<duckdb::unique_ptr<Expression>> children;
-    children.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-    children.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 1));
-    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(
-      make_func_expr("*",
-                     LogicalType{LogicalTypeId::INTEGER},
-                     {LogicalType{LogicalTypeId::INTEGER}, LogicalType{LogicalTypeId::INTEGER}},
-                     std::move(children)));
+    std::vector<std::unique_ptr<ast_node>> children;
+    children.push_back(make_ref(0));
+    children.push_back(make_ref(1));
+    auto expr = make_func(
+      sirius::function_id::mul, std::move(children), logical_type::make(type_id::INTEGER));
 
-    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, one(std::move(expr)), strategy);
     auto in0                           = copy_column_to_host<int32_t>(iv.column(0));
     auto in1                           = copy_column_to_host<int32_t>(iv.column(1));
     auto out0                          = copy_column_to_host<int32_t>(ov.column(0));
@@ -714,18 +610,13 @@ TEMPLATE_TEST_CASE("execute arithmetic functions",
 
   SECTION("col0 % 3")
   {
-    duckdb::vector<duckdb::unique_ptr<Expression>> children;
-    children.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-    children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3)));
-    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(
-      make_func_expr("%",
-                     LogicalType{LogicalTypeId::INTEGER},
-                     {LogicalType{LogicalTypeId::INTEGER}, LogicalType{LogicalTypeId::INTEGER}},
-                     std::move(children)));
+    std::vector<std::unique_ptr<ast_node>> children;
+    children.push_back(make_ref(0));
+    children.push_back(make_int_const(3));
+    auto expr = make_func(
+      sirius::function_id::mod, std::move(children), logical_type::make(type_id::INTEGER));
 
-    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, one(std::move(expr)), strategy);
     auto in0                           = copy_column_to_host<int32_t>(iv.column(0));
     auto out0                          = copy_column_to_host<int32_t>(ov.column(0));
     for (size_t i = 0; i < in0.size(); ++i) {
@@ -752,7 +643,7 @@ TEMPLATE_TEST_CASE("execute decimal arithmetic (DECIMAL64)",
 
   uint8_t const width = 18;
   uint8_t const scale = 2;
-  auto const dec_type = LogicalType::DECIMAL(width, scale);
+  auto const dec_type = logical_type::make_decimal(width, scale);
 
   // Values: 0.00, 0.01, ... 0.09 (stored as 0, 1, ... 9 at scale 2)
   std::vector<int64_t> raw_a = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
@@ -763,15 +654,12 @@ TEMPLATE_TEST_CASE("execute decimal arithmetic (DECIMAL64)",
     auto input = make_decimal64_batch(*space, static_cast<int8_t>(scale), raw_a);
 
     // 1.25 at scale 2 → raw value 125
-    duckdb::vector<duckdb::unique_ptr<Expression>> children;
-    children.push_back(duckdb::make_uniq<BoundReferenceExpression>(dec_type, 0));
-    children.push_back(
-      duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(int64_t{125}, width, scale)));
+    std::vector<std::unique_ptr<ast_node>> children;
+    children.push_back(make_ref(0));
+    children.push_back(make_dec64_const(125, width, scale));
+    auto expr = make_func(sirius::function_id::add, std::move(children), dec_type);
 
-    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(make_func_expr("+", dec_type, {dec_type, dec_type}, std::move(children)));
-
-    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, one(std::move(expr)), strategy);
     REQUIRE(ov.num_columns() == 1);
     REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL64);
     REQUIRE(ov.column(0).type().scale() == -static_cast<int32_t>(scale));
@@ -789,14 +677,12 @@ TEMPLATE_TEST_CASE("execute decimal arithmetic (DECIMAL64)",
   {
     auto input = make_decimal64_two_col_batch(*space, static_cast<int8_t>(scale), raw_b, raw_a);
 
-    duckdb::vector<duckdb::unique_ptr<Expression>> children;
-    children.push_back(duckdb::make_uniq<BoundReferenceExpression>(dec_type, 0));
-    children.push_back(duckdb::make_uniq<BoundReferenceExpression>(dec_type, 1));
+    std::vector<std::unique_ptr<ast_node>> children;
+    children.push_back(make_ref(0));
+    children.push_back(make_ref(1));
+    auto expr = make_func(sirius::function_id::sub, std::move(children), dec_type);
 
-    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(make_func_expr("-", dec_type, {dec_type, dec_type}, std::move(children)));
-
-    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, one(std::move(expr)), strategy);
     REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL64);
     REQUIRE(ov.column(0).type().scale() == -static_cast<int32_t>(scale));
 
@@ -815,17 +701,12 @@ TEMPLATE_TEST_CASE("execute decimal arithmetic (DECIMAL64)",
 
     // 2 as DECIMAL(18, 0) → same cudf type_id (DECIMAL64), scale 0.
     // cudf MUL: output scale = lhs_scale + rhs_scale = -2 + 0 = -2.
-    auto const dec_int_type = LogicalType::DECIMAL(width, 0);
+    std::vector<std::unique_ptr<ast_node>> children;
+    children.push_back(make_ref(0));
+    children.push_back(make_dec64_const(2, width, /*scale=*/0));
+    auto expr = make_func(sirius::function_id::mul, std::move(children), dec_type);
 
-    duckdb::vector<duckdb::unique_ptr<Expression>> children;
-    children.push_back(duckdb::make_uniq<BoundReferenceExpression>(dec_type, 0));
-    children.push_back(
-      duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(int64_t{2}, width, uint8_t{0})));
-
-    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(make_func_expr("*", dec_type, {dec_type, dec_int_type}, std::move(children)));
-
-    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, one(std::move(expr)), strategy);
     REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL64);
     REQUIRE(ov.column(0).type().scale() == -static_cast<int32_t>(scale));
 
@@ -853,22 +734,19 @@ TEMPLATE_TEST_CASE("execute decimal arithmetic (DECIMAL32)",
   // DECIMAL32 branches in gpu_execute_constant.cpp and GetCudfType.
   uint8_t const width = 8;
   uint8_t const scale = 2;
-  auto const dec_type = LogicalType::DECIMAL(width, scale);
+  auto const dec_type = logical_type::make_decimal(width, scale);
 
   // 1.00, 2.00, 3.00 ... 10.00 (raw: 100, 200, ... 1000 at scale 2)
   std::vector<int32_t> raw = {100, 200, 300, 400, 500, 600, 700, 800, 900, 1000};
   auto input               = make_decimal32_batch(*space, static_cast<int8_t>(scale), raw);
 
   // col0 + 0.50 → raw add 50
-  duckdb::vector<duckdb::unique_ptr<Expression>> children;
-  children.push_back(duckdb::make_uniq<BoundReferenceExpression>(dec_type, 0));
-  children.push_back(
-    duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(int32_t{50}, width, scale)));
+  std::vector<std::unique_ptr<ast_node>> children;
+  children.push_back(make_ref(0));
+  children.push_back(make_dec32_const(50, width, scale));
+  auto expr = make_func(sirius::function_id::add, std::move(children), dec_type);
 
-  duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-  exprs.push_back(make_func_expr("+", dec_type, {dec_type, dec_type}, std::move(children)));
-
-  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
+  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, one(std::move(expr)), strategy);
   REQUIRE(ov.num_columns() == 1);
   REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL32);
   REQUIRE(ov.column(0).type().scale() == -static_cast<int32_t>(scale));
@@ -899,30 +777,25 @@ TEMPLATE_TEST_CASE("execute nested decimal arithmetic (col + 1.00) * 2",
 
   uint8_t const width = 18;
   uint8_t const scale = 2;
-  auto const dec_type = LogicalType::DECIMAL(width, scale);
-  auto const dec_int  = LogicalType::DECIMAL(width, 0);
+  auto const dec_type = logical_type::make_decimal(width, scale);
 
   // 0.00, 0.01 ... 0.09
   std::vector<int64_t> raw = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
   auto input               = make_decimal64_batch(*space, static_cast<int8_t>(scale), raw);
 
   // Inner: col + 1.00 (both scale 2) → result scale 2
-  duckdb::vector<duckdb::unique_ptr<Expression>> add_children;
-  add_children.push_back(duckdb::make_uniq<BoundReferenceExpression>(dec_type, 0));
-  add_children.push_back(
-    duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(int64_t{100}, width, scale)));
-  auto add_expr = make_func_expr("+", dec_type, {dec_type, dec_type}, std::move(add_children));
+  std::vector<std::unique_ptr<ast_node>> add_children;
+  add_children.push_back(make_ref(0));
+  add_children.push_back(make_dec64_const(100, width, scale));
+  auto add_expr = make_func(sirius::function_id::add, std::move(add_children), dec_type);
 
   // Outer: (col + 1.00) * 2 where 2 is DECIMAL(18, 0) so MUL output scale = -2 + 0 = -2
-  duckdb::vector<duckdb::unique_ptr<Expression>> mul_children;
+  std::vector<std::unique_ptr<ast_node>> mul_children;
   mul_children.push_back(std::move(add_expr));
-  mul_children.push_back(
-    duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(int64_t{2}, width, uint8_t{0})));
+  mul_children.push_back(make_dec64_const(2, width, /*scale=*/0));
+  auto expr = make_func(sirius::function_id::mul, std::move(mul_children), dec_type);
 
-  duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-  exprs.push_back(make_func_expr("*", dec_type, {dec_type, dec_int}, std::move(mul_children)));
-
-  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
+  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, one(std::move(expr)), strategy);
   REQUIRE(ov.num_columns() == 1);
   REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL64);
   REQUIRE(ov.column(0).type().scale() == -static_cast<int32_t>(scale));
@@ -951,22 +824,19 @@ TEMPLATE_TEST_CASE("execute decimal arithmetic (DECIMAL128)",
 
   uint8_t const width = 38;
   uint8_t const scale = 2;
-  auto const dec_type = LogicalType::DECIMAL(width, scale);
+  auto const dec_type = logical_type::make_decimal(width, scale);
 
   // 1.00, 2.00, 3.00 (raw: 100, 200, 300 at scale 2)
   std::vector<__int128_t> raw = {100, 200, 300};
   auto input                  = make_decimal128_batch(*space, static_cast<int8_t>(scale), raw);
 
   // col + 1.25 → raw add 125
-  duckdb::vector<duckdb::unique_ptr<Expression>> children;
-  children.push_back(duckdb::make_uniq<BoundReferenceExpression>(dec_type, 0));
-  children.push_back(duckdb::make_uniq<BoundConstantExpression>(
-    Value::DECIMAL(duckdb::hugeint_t{125}, width, scale)));
+  std::vector<std::unique_ptr<ast_node>> children;
+  children.push_back(make_ref(0));
+  children.push_back(make_dec128_const(__int128_t{125}, width, scale));
+  auto expr = make_func(sirius::function_id::add, std::move(children), dec_type);
 
-  duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-  exprs.push_back(make_func_expr("+", dec_type, {dec_type, dec_type}, std::move(children)));
-
-  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
+  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, one(std::move(expr)), strategy);
   REQUIRE(ov.num_columns() == 1);
   REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL128);
   REQUIRE(ov.column(0).type().scale() == -static_cast<int32_t>(scale));
@@ -994,8 +864,7 @@ TEMPLATE_TEST_CASE("execute decimal DIV (DECIMAL64)",
 
   uint8_t const width = 18;
   uint8_t const scale = 2;
-  auto const dec_type = LogicalType::DECIMAL(width, scale);
-  auto const dec_int  = LogicalType::DECIMAL(width, 0);
+  auto const dec_type = logical_type::make_decimal(width, scale);
 
   // 4.00, 5.00, 6.00, 7.00 (raw 400, 500, 600, 700 at scale 2)
   std::vector<int64_t> raw = {400, 500, 600, 700};
@@ -1003,15 +872,12 @@ TEMPLATE_TEST_CASE("execute decimal DIV (DECIMAL64)",
 
   // col / 2 (2 as DECIMAL(18, 0)) → fixed_point div truncates toward zero in
   // the output scale; 500/2 = 250, 700/2 = 350.
-  duckdb::vector<duckdb::unique_ptr<Expression>> children;
-  children.push_back(duckdb::make_uniq<BoundReferenceExpression>(dec_type, 0));
-  children.push_back(
-    duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(int64_t{2}, width, uint8_t{0})));
+  std::vector<std::unique_ptr<ast_node>> children;
+  children.push_back(make_ref(0));
+  children.push_back(make_dec64_const(2, width, /*scale=*/0));
+  auto expr = make_func(sirius::function_id::div, std::move(children), dec_type);
 
-  duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-  exprs.push_back(make_func_expr("/", dec_type, {dec_type, dec_int}, std::move(children)));
-
-  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
+  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, one(std::move(expr)), strategy);
   REQUIRE(ov.num_columns() == 1);
   REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL64);
   REQUIRE(ov.column(0).type().scale() == -static_cast<int32_t>(scale));
@@ -1044,9 +910,9 @@ TEMPLATE_TEST_CASE("execute decimal TPC-H Q1 shape price * (1 - discount)",
   uint8_t const width     = 18;
   uint8_t const scale2    = 2;
   uint8_t const scale4    = 4;
-  auto const price_type   = LogicalType::DECIMAL(width, scale2);  // DECIMAL(18,2)
-  auto const discount_t   = LogicalType::DECIMAL(width, scale2);  // DECIMAL(18,2)
-  auto const mul_ret_type = LogicalType::DECIMAL(width, scale4);  // DECIMAL(18,4)
+  auto const price_type   = logical_type::make_decimal(width, scale2);  // DECIMAL(18,2)
+  auto const discount_t   = logical_type::make_decimal(width, scale2);  // DECIMAL(18,2)
+  auto const mul_ret_type = logical_type::make_decimal(width, scale4);  // DECIMAL(18,4)
 
   // price: 1000.00, 2000.00, 3000.00
   std::vector<int64_t> raw_price = {100000, 200000, 300000};
@@ -1056,23 +922,18 @@ TEMPLATE_TEST_CASE("execute decimal TPC-H Q1 shape price * (1 - discount)",
     make_decimal64_two_col_batch(*space, static_cast<int8_t>(scale2), raw_price, raw_discount);
 
   // Inner: 1.00 - discount (scalar on left, column on right)
-  duckdb::vector<duckdb::unique_ptr<Expression>> sub_children;
-  sub_children.push_back(
-    duckdb::make_uniq<BoundConstantExpression>(Value::DECIMAL(int64_t{100}, width, scale2)));
-  sub_children.push_back(duckdb::make_uniq<BoundReferenceExpression>(discount_t, 1));
-  auto sub_expr =
-    make_func_expr("-", discount_t, {discount_t, discount_t}, std::move(sub_children));
+  std::vector<std::unique_ptr<ast_node>> sub_children;
+  sub_children.push_back(make_dec64_const(100, width, scale2));
+  sub_children.push_back(make_ref(1));
+  auto sub_expr = make_func(sirius::function_id::sub, std::move(sub_children), discount_t);
 
   // Outer: price * (1.00 - discount) → return type DECIMAL(18, 4)
-  duckdb::vector<duckdb::unique_ptr<Expression>> mul_children;
-  mul_children.push_back(duckdb::make_uniq<BoundReferenceExpression>(price_type, 0));
+  std::vector<std::unique_ptr<ast_node>> mul_children;
+  mul_children.push_back(make_ref(0));
   mul_children.push_back(std::move(sub_expr));
+  auto expr = make_func(sirius::function_id::mul, std::move(mul_children), mul_ret_type);
 
-  duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-  exprs.push_back(
-    make_func_expr("*", mul_ret_type, {price_type, discount_t}, std::move(mul_children)));
-
-  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
+  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, one(std::move(expr)), strategy);
   REQUIRE(ov.num_columns() == 1);
   REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL64);
   REQUIRE(ov.column(0).type().scale() == -static_cast<int32_t>(scale4));
@@ -1111,18 +972,13 @@ TEMPLATE_TEST_CASE("select LIKE and NOT LIKE",
   SECTION("LIKE 'str_2'")
   {
     // col0 LIKE 'str_2' — exact match via LIKE
-    duckdb::vector<duckdb::unique_ptr<Expression>> children;
-    children.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::VARCHAR}, 0));
-    children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value("str_2")));
-    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(
-      make_func_expr("~~",
-                     LogicalType{LogicalTypeId::BOOLEAN},
-                     {LogicalType{LogicalTypeId::VARCHAR}, LogicalType{LogicalTypeId::VARCHAR}},
-                     std::move(children)));
+    std::vector<std::unique_ptr<ast_node>> children;
+    children.push_back(make_ref(0));
+    children.push_back(make_str_const("str_2"));
+    auto expr = make_func(
+      sirius::function_id::like, std::move(children), logical_type::make(type_id::BOOLEAN));
 
-    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
+    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(expr), strategy);
     auto in_strs                       = copy_string_column_to_host(iv.column(0));
     std::vector<std::string> expected;
     for (auto const& s : in_strs) {
@@ -1134,36 +990,26 @@ TEMPLATE_TEST_CASE("select LIKE and NOT LIKE",
   SECTION("LIKE 'str_%' — wildcard")
   {
     // col0 LIKE 'str_%' — should match all rows
-    duckdb::vector<duckdb::unique_ptr<Expression>> children;
-    children.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::VARCHAR}, 0));
-    children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value("str_%")));
-    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(
-      make_func_expr("~~",
-                     LogicalType{LogicalTypeId::BOOLEAN},
-                     {LogicalType{LogicalTypeId::VARCHAR}, LogicalType{LogicalTypeId::VARCHAR}},
-                     std::move(children)));
+    std::vector<std::unique_ptr<ast_node>> children;
+    children.push_back(make_ref(0));
+    children.push_back(make_str_const("str_%"));
+    auto expr = make_func(
+      sirius::function_id::like, std::move(children), logical_type::make(type_id::BOOLEAN));
 
-    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
+    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(expr), strategy);
     REQUIRE(ov.num_rows() == iv.num_rows());
   }
 
   SECTION("NOT LIKE 'str_1'")
   {
     // col0 NOT LIKE 'str_1' — should exclude 'str_1' rows
-    duckdb::vector<duckdb::unique_ptr<Expression>> children;
-    children.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::VARCHAR}, 0));
-    children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value("str_1")));
-    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(
-      make_func_expr("!~~",
-                     LogicalType{LogicalTypeId::BOOLEAN},
-                     {LogicalType{LogicalTypeId::VARCHAR}, LogicalType{LogicalTypeId::VARCHAR}},
-                     std::move(children)));
+    std::vector<std::unique_ptr<ast_node>> children;
+    children.push_back(make_ref(0));
+    children.push_back(make_str_const("str_1"));
+    auto expr = make_func(
+      sirius::function_id::not_like, std::move(children), logical_type::make(type_id::BOOLEAN));
 
-    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
+    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(expr), strategy);
     auto in_strs                       = copy_string_column_to_host(iv.column(0));
     std::vector<std::string> expected;
     for (auto const& s : in_strs) {
@@ -1191,24 +1037,13 @@ TEMPLATE_TEST_CASE("execute CASE expression",
   auto input = make_input_batch(
     *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 100}});
 
-  auto when_expr = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_GREATERTHAN,
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
-    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(50)));
-  auto then_expr = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(1));
-  auto else_expr = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(0));
+  std::vector<sirius::ast::case_expr::when_then> cases;
+  cases.push_back(sirius::ast::case_expr::when_then{
+    make_cmp(sirius::comparison_type::gt, make_ref(0), make_int_const(50)), make_int_const(1)});
+  auto expr = std::make_unique<ast_node>(sirius::ast::case_expr{
+    std::move(cases), make_int_const(0), logical_type::make(type_id::INTEGER)});
 
-  auto case_expr = duckdb::make_uniq<BoundCaseExpression>(LogicalType{LogicalTypeId::INTEGER});
-  BoundCaseCheck check;
-  check.when_expr = std::move(when_expr);
-  check.then_expr = std::move(then_expr);
-  case_expr->case_checks.push_back(std::move(check));
-  case_expr->else_expr = std::move(else_expr);
-
-  duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-  exprs.push_back(std::move(case_expr));
-
-  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
+  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, one(std::move(expr)), strategy);
   REQUIRE(ov.num_columns() == 1);
   REQUIRE(ov.num_rows() == iv.num_rows());
 
@@ -1233,30 +1068,15 @@ TEMPLATE_TEST_CASE("execute CASE with multiple WHEN branches",
   auto input = make_input_batch(
     *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 100}});
 
-  auto case_expr = duckdb::make_uniq<BoundCaseExpression>(LogicalType{LogicalTypeId::INTEGER});
+  std::vector<sirius::ast::case_expr::when_then> cases;
+  cases.push_back(sirius::ast::case_expr::when_then{
+    make_cmp(sirius::comparison_type::lt, make_ref(0), make_int_const(30)), make_int_const(-1)});
+  cases.push_back(sirius::ast::case_expr::when_then{
+    make_cmp(sirius::comparison_type::gt, make_ref(0), make_int_const(70)), make_int_const(1)});
+  auto expr = std::make_unique<ast_node>(sirius::ast::case_expr{
+    std::move(cases), make_int_const(0), logical_type::make(type_id::INTEGER)});
 
-  BoundCaseCheck check1;
-  check1.when_expr = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_LESSTHAN,
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
-    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(30)));
-  check1.then_expr = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(-1));
-  case_expr->case_checks.push_back(std::move(check1));
-
-  BoundCaseCheck check2;
-  check2.when_expr = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_GREATERTHAN,
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
-    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(70)));
-  check2.then_expr = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(1));
-  case_expr->case_checks.push_back(std::move(check2));
-
-  case_expr->else_expr = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(0));
-
-  duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-  exprs.push_back(std::move(case_expr));
-
-  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
+  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, one(std::move(expr)), strategy);
   auto in_vals                       = copy_column_to_host<int32_t>(iv.column(0));
   auto out_vals                      = copy_column_to_host<int32_t>(ov.column(0));
   for (size_t i = 0; i < in_vals.size(); ++i) {
@@ -1280,17 +1100,13 @@ TEMPLATE_TEST_CASE(
     *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 100}});
 
   // col0 BETWEEN 20 AND 50 (inclusive)
-  auto between = duckdb::make_uniq<BoundBetweenExpression>(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
-    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(20)),
-    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(50)),
-    true,   // lower_inclusive
-    true);  // upper_inclusive
+  auto expr = make_between(make_ref(0),
+                           make_int_const(20),
+                           make_int_const(50),
+                           /*lower_inclusive=*/true,
+                           /*upper_inclusive=*/true);
 
-  duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-  exprs.push_back(std::move(between));
-
-  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
+  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(expr), strategy);
   auto in_vals                       = copy_column_to_host<int32_t>(iv.column(0));
   std::vector<int32_t> expected;
   for (auto v : in_vals) {
@@ -1318,18 +1134,13 @@ TEMPLATE_TEST_CASE("select IN and NOT IN",
 
   SECTION("IN (2, 4, 6)")
   {
-    auto in_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::COMPARE_IN,
-                                                              LogicalType{LogicalTypeId::BOOLEAN});
-    in_expr->children.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-    in_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(2)));
-    in_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(4)));
-    in_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(6)));
+    std::vector<std::unique_ptr<ast_node>> values;
+    values.push_back(make_int_const(2));
+    values.push_back(make_int_const(4));
+    values.push_back(make_int_const(6));
+    auto expr = make_in(make_ref(0), std::move(values), /*negated=*/false);
 
-    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(std::move(in_expr));
-
-    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
+    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(expr), strategy);
     auto in_vals                       = copy_column_to_host<int32_t>(iv.column(0));
     std::vector<int32_t> expected;
     for (auto v : in_vals) {
@@ -1340,19 +1151,14 @@ TEMPLATE_TEST_CASE("select IN and NOT IN",
 
   SECTION("NOT IN (0, 1, 2, 3)")
   {
-    auto not_in_expr = duckdb::make_uniq<BoundOperatorExpression>(
-      ExpressionType::COMPARE_NOT_IN, LogicalType{LogicalTypeId::BOOLEAN});
-    not_in_expr->children.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-    not_in_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(0)));
-    not_in_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(1)));
-    not_in_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(2)));
-    not_in_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3)));
+    std::vector<std::unique_ptr<ast_node>> values;
+    values.push_back(make_int_const(0));
+    values.push_back(make_int_const(1));
+    values.push_back(make_int_const(2));
+    values.push_back(make_int_const(3));
+    auto expr = make_in(make_ref(0), std::move(values), /*negated=*/true);
 
-    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(std::move(not_in_expr));
-
-    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
+    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(expr), strategy);
     auto in_vals                       = copy_column_to_host<int32_t>(iv.column(0));
     std::vector<int32_t> expected;
     for (auto v : in_vals) {
@@ -1382,30 +1188,18 @@ TEMPLATE_TEST_CASE("select IS NULL and IS NOT NULL",
 
   SECTION("IS NULL")
   {
-    auto is_null = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NULL,
-                                                              LogicalType{LogicalTypeId::BOOLEAN});
-    is_null->children.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
+    auto expr = make_unary(sirius::ast::unary_op::kind::op_is_null, make_ref(0));
 
-    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(std::move(is_null));
-
-    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
+    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(expr), strategy);
     // Null rows should pass the IS NULL filter
     REQUIRE(ov.num_rows() == 2);
   }
 
   SECTION("IS NOT NULL")
   {
-    auto is_not_null = duckdb::make_uniq<BoundOperatorExpression>(
-      ExpressionType::OPERATOR_IS_NOT_NULL, LogicalType{LogicalTypeId::BOOLEAN});
-    is_not_null->children.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
+    auto expr = make_unary(sirius::ast::unary_op::kind::op_is_not_null, make_ref(0));
 
-    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(std::move(is_not_null));
-
-    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
+    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(expr), strategy);
     // Non-null rows should pass
     REQUIRE(ov.num_rows() == 3);
     auto out_vals = copy_column_to_host<int32_t>(ov.column(0));
@@ -1433,16 +1227,12 @@ TEMPLATE_TEST_CASE("execute COALESCE",
     std::vector<bool> valids    = {true, false, true, false, true};
     auto input                  = make_int32_batch_with_nulls(*space, values, valids);
 
-    auto coalesce = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE,
-                                                               LogicalType{LogicalTypeId::INTEGER});
-    coalesce->children.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-    coalesce->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(-1)));
+    std::vector<std::unique_ptr<ast_node>> children;
+    children.push_back(make_ref(0));
+    children.push_back(make_int_const(-1));
+    auto expr = make_coalesce(std::move(children), logical_type::make(type_id::INTEGER));
 
-    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(std::move(coalesce));
-
-    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, one(std::move(expr)), strategy);
     REQUIRE(ov.num_columns() == 1);
     REQUIRE(ov.num_rows() == iv.num_rows());
     REQUIRE(ov.column(0).null_count() == 0);
@@ -1467,17 +1257,12 @@ TEMPLATE_TEST_CASE("execute COALESCE",
     std::vector<bool> valids_b    = {false, true, false, true, false};
     auto input = make_two_int32_batch_with_nulls(*space, values_a, valids_a, values_b, valids_b);
 
-    auto coalesce = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE,
-                                                               LogicalType{LogicalTypeId::INTEGER});
-    coalesce->children.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-    coalesce->children.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 1));
+    std::vector<std::unique_ptr<ast_node>> children;
+    children.push_back(make_ref(0));
+    children.push_back(make_ref(1));
+    auto expr = make_coalesce(std::move(children), logical_type::make(type_id::INTEGER));
 
-    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(std::move(coalesce));
-
-    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, one(std::move(expr)), strategy);
     REQUIRE(ov.num_columns() == 1);
     REQUIRE(ov.num_rows() == iv.num_rows());
     REQUIRE(ov.column(0).null_count() == 1);
@@ -1500,18 +1285,13 @@ TEMPLATE_TEST_CASE("execute COALESCE",
     std::vector<bool> valids_b    = {false, true, false, false};
     auto input = make_two_int32_batch_with_nulls(*space, values_a, valids_a, values_b, valids_b);
 
-    auto coalesce = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE,
-                                                               LogicalType{LogicalTypeId::INTEGER});
-    coalesce->children.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-    coalesce->children.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 1));
-    coalesce->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(-7)));
+    std::vector<std::unique_ptr<ast_node>> children;
+    children.push_back(make_ref(0));
+    children.push_back(make_ref(1));
+    children.push_back(make_int_const(-7));
+    auto expr = make_coalesce(std::move(children), logical_type::make(type_id::INTEGER));
 
-    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(std::move(coalesce));
-
-    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, one(std::move(expr)), strategy);
     REQUIRE(ov.column(0).null_count() == 0);
     std::vector<int32_t> expected = {10, 200, -7, -7};
     REQUIRE(copy_column_to_host<int32_t>(ov.column(0)) == expected);
@@ -1526,21 +1306,15 @@ TEMPLATE_TEST_CASE("execute COALESCE",
     std::vector<bool> valids_b    = {false, true, false, false};
     auto input = make_two_int32_batch_with_nulls(*space, values_a, valids_a, values_b, valids_b);
 
-    auto coalesce = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE,
-                                                               LogicalType{LogicalTypeId::INTEGER});
-    coalesce->children.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-    coalesce->children.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 1));
+    std::vector<std::unique_ptr<ast_node>> children;
+    children.push_back(make_ref(0));
+    children.push_back(make_ref(1));
     // Third child is col_a again (same column still has the same nulls) — drives the
     // column-replacement branch a second time with residual nulls surviving.
-    coalesce->children.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
+    children.push_back(make_ref(0));
+    auto expr = make_coalesce(std::move(children), logical_type::make(type_id::INTEGER));
 
-    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(std::move(coalesce));
-
-    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, one(std::move(expr)), strategy);
     REQUIRE(ov.column(0).null_count() == 2);
 
     auto out_vals                     = copy_column_to_host<int32_t>(ov.column(0));
@@ -1560,18 +1334,13 @@ TEMPLATE_TEST_CASE("execute COALESCE",
     std::vector<bool> valids_all_true     = {true, true, true, true, true};
     auto input = make_int32_batch_with_nulls(*space, values_all_valid, valids_all_true);
 
-    auto coalesce = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE,
-                                                               LogicalType{LogicalTypeId::INTEGER});
-    coalesce->children.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
+    std::vector<std::unique_ptr<ast_node>> children;
+    children.push_back(make_ref(0));
     // Poison: out-of-range reference. Only safe if short-circuit skips it.
-    coalesce->children.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 999));
+    children.push_back(make_ref(999));
+    auto expr = make_coalesce(std::move(children), logical_type::make(type_id::INTEGER));
 
-    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(std::move(coalesce));
-
-    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
+    auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, one(std::move(expr)), strategy);
     REQUIRE(ov.num_columns() == 1);
     REQUIRE(ov.column(0).null_count() == 0);
     REQUIRE(copy_column_to_host<int32_t>(ov.column(0)) == values_all_valid);
@@ -1586,17 +1355,12 @@ TEMPLATE_TEST_CASE("execute COALESCE",
     std::vector<bool> valids    = {true, false, true};
     auto input                  = make_int32_batch_with_nulls(*space, values, valids);
 
-    auto coalesce = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE,
-                                                               LogicalType{LogicalTypeId::INTEGER});
-    coalesce->children.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-    coalesce->children.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 999));
+    std::vector<std::unique_ptr<ast_node>> children;
+    children.push_back(make_ref(0));
+    children.push_back(make_ref(999));
+    auto expr = make_coalesce(std::move(children), logical_type::make(type_id::INTEGER));
 
-    duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-    exprs.push_back(std::move(coalesce));
-
-    REQUIRE_THROWS(run_execute(*space, input, std::move(exprs), strategy));
+    REQUIRE_THROWS(run_execute(*space, input, one(std::move(expr)), strategy));
   }
 }
 
@@ -1617,21 +1381,14 @@ TEMPLATE_TEST_CASE("select COALESCE nested in predicate",
   std::vector<bool> valids    = {true, false, true, false, true};
   auto input                  = make_int32_batch_with_nulls(*space, values, valids);
 
-  auto coalesce = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE,
-                                                             LogicalType{LogicalTypeId::INTEGER});
-  coalesce->children.push_back(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-  coalesce->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(0)));
+  std::vector<std::unique_ptr<ast_node>> children;
+  children.push_back(make_ref(0));
+  children.push_back(make_int_const(0));
+  auto coalesce = make_coalesce(std::move(children), logical_type::make(type_id::INTEGER));
 
-  auto cmp = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_GREATERTHAN,
-    std::move(coalesce),
-    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(20)));
+  auto expr = make_cmp(sirius::comparison_type::gt, std::move(coalesce), make_int_const(20));
 
-  duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-  exprs.push_back(std::move(cmp));
-
-  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
+  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(expr), strategy);
   REQUIRE(ov.num_rows() == 2);
   REQUIRE(copy_column_to_host<int32_t>(ov.column(0)) == std::vector<int32_t>{30, 50});
 }
@@ -1650,15 +1407,9 @@ TEMPLATE_TEST_CASE("select respects null mask under plain comparison",
   std::vector<bool> valids    = {true, false, true, false, true};
   auto input                  = make_int32_batch_with_nulls(*space, values, valids);
 
-  auto cmp = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_GREATERTHAN,
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
-    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(2)));
+  auto expr = make_cmp(sirius::comparison_type::gt, make_ref(0), make_int_const(2));
 
-  duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-  exprs.push_back(std::move(cmp));
-
-  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
+  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(expr), strategy);
 
   std::vector<int32_t> expected;
   for (size_t i = 0; i < values.size(); ++i) {
@@ -1684,15 +1435,9 @@ TEMPLATE_TEST_CASE("select COMPARE_NOT_DISTINCT_FROM",
   std::vector<bool> valids    = {true, false, true, false, true};
   auto input                  = make_int32_batch_with_nulls(*space, values, valids);
 
-  auto cmp = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_NOT_DISTINCT_FROM,
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
-    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(30)));
+  auto expr = make_cmp(sirius::comparison_type::not_distinct_from, make_ref(0), make_int_const(30));
 
-  duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-  exprs.push_back(std::move(cmp));
-
-  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
+  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(expr), strategy);
   REQUIRE(ov.num_rows() == 1);
   REQUIRE(ov.column(0).null_count() == 0);
   REQUIRE(copy_column_to_host<int32_t>(ov.column(0)) == std::vector<int32_t>{30});
@@ -1713,15 +1458,9 @@ TEMPLATE_TEST_CASE("select COMPARE_DISTINCT_FROM",
   std::vector<bool> valids    = {true, false, true, false, true};
   auto input                  = make_int32_batch_with_nulls(*space, values, valids);
 
-  auto cmp = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_DISTINCT_FROM,
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
-    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(30)));
+  auto expr = make_cmp(sirius::comparison_type::distinct_from, make_ref(0), make_int_const(30));
 
-  duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-  exprs.push_back(std::move(cmp));
-
-  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
+  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(expr), strategy);
   REQUIRE(ov.num_rows() == 4);
   REQUIRE(ov.column(0).null_count() == 2);
 }
@@ -1740,19 +1479,10 @@ TEMPLATE_TEST_CASE("select NOT operator",
     make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 9}});
 
   // NOT (col0 > 5) — should keep rows where col0 <= 5
-  auto cmp = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_GREATERTHAN,
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
-    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(5)));
+  auto cmp  = make_cmp(sirius::comparison_type::gt, make_ref(0), make_int_const(5));
+  auto expr = make_unary(sirius::ast::unary_op::kind::op_not, std::move(cmp));
 
-  auto not_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_NOT,
-                                                             LogicalType{LogicalTypeId::BOOLEAN});
-  not_expr->children.push_back(std::move(cmp));
-
-  duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-  exprs.push_back(std::move(not_expr));
-
-  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
+  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(expr), strategy);
   auto in_vals                       = copy_column_to_host<int32_t>(iv.column(0));
   std::vector<int32_t> expected;
   for (auto v : in_vals) {
@@ -1783,29 +1513,20 @@ TEMPLATE_TEST_CASE("select conjunction with AST breaker",
 
   // WHERE col0 > 3 AND col1 LIKE 'str_%'
   // col0 > 3 is AST-capable, LIKE is not — forces mixed materialization
-  auto cmp = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_GREATERTHAN,
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
-    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3)));
+  auto cmp = make_cmp(sirius::comparison_type::gt, make_ref(0), make_int_const(3));
 
-  duckdb::vector<duckdb::unique_ptr<Expression>> like_children;
-  like_children.push_back(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::VARCHAR}, 1));
-  like_children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value("str_%")));
-  auto like =
-    make_func_expr("~~",
-                   LogicalType{LogicalTypeId::BOOLEAN},
-                   {LogicalType{LogicalTypeId::VARCHAR}, LogicalType{LogicalTypeId::VARCHAR}},
-                   std::move(like_children));
+  std::vector<std::unique_ptr<ast_node>> like_children;
+  like_children.push_back(make_ref(1));
+  like_children.push_back(make_str_const("str_%"));
+  auto like = make_func(
+    sirius::function_id::like, std::move(like_children), logical_type::make(type_id::BOOLEAN));
 
-  auto conjunction = duckdb::make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
-  conjunction->children.push_back(std::move(cmp));
-  conjunction->children.push_back(std::move(like));
+  std::vector<std::unique_ptr<ast_node>> conj_children;
+  conj_children.push_back(std::move(cmp));
+  conj_children.push_back(std::move(like));
+  auto expr = make_conj(sirius::ast::conjunction::kind::op_and, std::move(conj_children));
 
-  duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-  exprs.push_back(std::move(conjunction));
-
-  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
+  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(expr), strategy);
   auto in_col0                       = copy_column_to_host<int32_t>(iv.column(0));
   auto in_col1                       = copy_string_column_to_host(iv.column(1));
 
@@ -1831,23 +1552,15 @@ TEMPLATE_TEST_CASE("select OR conjunction",
     make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 20}});
 
   // col0 < 3 OR col0 > 17
-  auto lt = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_LESSTHAN,
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
-    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3)));
-  auto gt = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_GREATERTHAN,
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
-    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(17)));
+  auto lt = make_cmp(sirius::comparison_type::lt, make_ref(0), make_int_const(3));
+  auto gt = make_cmp(sirius::comparison_type::gt, make_ref(0), make_int_const(17));
 
-  auto disjunction = duckdb::make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_OR);
-  disjunction->children.push_back(std::move(lt));
-  disjunction->children.push_back(std::move(gt));
+  std::vector<std::unique_ptr<ast_node>> children;
+  children.push_back(std::move(lt));
+  children.push_back(std::move(gt));
+  auto expr = make_conj(sirius::ast::conjunction::kind::op_or, std::move(children));
 
-  duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-  exprs.push_back(std::move(disjunction));
-
-  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
+  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(expr), strategy);
   auto in_vals                       = copy_column_to_host<int32_t>(iv.column(0));
   std::vector<int32_t> expected;
   for (auto v : in_vals) {
@@ -1875,26 +1588,15 @@ TEMPLATE_TEST_CASE("select with nested CASE in predicate",
     *space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 100}});
 
   // WHERE (CASE WHEN col0 > 50 THEN col0 ELSE 0 END) > 75
-  auto case_expr = duckdb::make_uniq<BoundCaseExpression>(LogicalType{LogicalTypeId::INTEGER});
-  BoundCaseCheck check;
-  check.when_expr = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_GREATERTHAN,
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
-    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(50)));
-  check.then_expr =
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
-  case_expr->case_checks.push_back(std::move(check));
-  case_expr->else_expr = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(0));
+  std::vector<sirius::ast::case_expr::when_then> cases;
+  cases.push_back(sirius::ast::case_expr::when_then{
+    make_cmp(sirius::comparison_type::gt, make_ref(0), make_int_const(50)), make_ref(0)});
+  auto case_node = std::make_unique<ast_node>(sirius::ast::case_expr{
+    std::move(cases), make_int_const(0), logical_type::make(type_id::INTEGER)});
 
-  auto outer_cmp = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_GREATERTHAN,
-    std::move(case_expr),
-    duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(75)));
+  auto expr = make_cmp(sirius::comparison_type::gt, std::move(case_node), make_int_const(75));
 
-  duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-  exprs.push_back(std::move(outer_cmp));
-
-  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
+  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(expr), strategy);
   auto in_vals                       = copy_column_to_host<int32_t>(iv.column(0));
   std::vector<int32_t> expected;
   for (auto v : in_vals) {
@@ -1924,28 +1626,21 @@ TEMPLATE_TEST_CASE("select IN with conjunction multi-column",
                      {std::pair<int, int>{0, 9}, std::pair<int, int>{0, 50}});
 
   // WHERE col0 IN (1, 3, 5, 7) AND col1 >= 20
-  auto in_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::COMPARE_IN,
-                                                            LogicalType{LogicalTypeId::BOOLEAN});
-  in_expr->children.push_back(
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-  in_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(1)));
-  in_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(3)));
-  in_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(5)));
-  in_expr->children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(7)));
+  std::vector<std::unique_ptr<ast_node>> in_values;
+  in_values.push_back(make_int_const(1));
+  in_values.push_back(make_int_const(3));
+  in_values.push_back(make_int_const(5));
+  in_values.push_back(make_int_const(7));
+  auto in_expr = make_in(make_ref(0), std::move(in_values), /*negated=*/false);
 
-  auto cmp = duckdb::make_uniq<BoundComparisonExpression>(
-    ExpressionType::COMPARE_GREATERTHANOREQUALTO,
-    duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::BIGINT}, 1),
-    duckdb::make_uniq<BoundConstantExpression>(Value::BIGINT(20)));
+  auto cmp = make_cmp(sirius::comparison_type::ge, make_ref(1), make_bigint_const(20));
 
-  auto conjunction = duckdb::make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
-  conjunction->children.push_back(std::move(in_expr));
-  conjunction->children.push_back(std::move(cmp));
+  std::vector<std::unique_ptr<ast_node>> conj_children;
+  conj_children.push_back(std::move(in_expr));
+  conj_children.push_back(std::move(cmp));
+  auto expr = make_conj(sirius::ast::conjunction::kind::op_and, std::move(conj_children));
 
-  duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
-  exprs.push_back(std::move(conjunction));
-
-  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(exprs), strategy);
+  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(expr), strategy);
   auto in_col0                       = copy_column_to_host<int32_t>(iv.column(0));
   auto in_col1                       = copy_column_to_host<int64_t>(iv.column(1));
   std::vector<int32_t> expected_col0;
@@ -1981,45 +1676,31 @@ TEMPLATE_TEST_CASE("execute mixed arithmetic and CASE projection",
                      {std::pair<int, int>{1, 50}, std::pair<int, int>{1, 10}});
 
   // Output: [col0 + col1, CASE WHEN col0 > 25 THEN col1 * 2 ELSE col1 END]
-  duckdb::vector<duckdb::unique_ptr<Expression>> exprs;
+  std::vector<std::unique_ptr<ast_node>> exprs;
 
   // Expression 0: col0 + col1
   {
-    duckdb::vector<duckdb::unique_ptr<Expression>> children;
-    children.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
-    children.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 1));
-    exprs.push_back(
-      make_func_expr("+",
-                     LogicalType{LogicalTypeId::INTEGER},
-                     {LogicalType{LogicalTypeId::INTEGER}, LogicalType{LogicalTypeId::INTEGER}},
-                     std::move(children)));
+    std::vector<std::unique_ptr<ast_node>> children;
+    children.push_back(make_ref(0));
+    children.push_back(make_ref(1));
+    exprs.push_back(make_func(
+      sirius::function_id::add, std::move(children), logical_type::make(type_id::INTEGER)));
   }
 
   // Expression 1: CASE WHEN col0 > 25 THEN col1 * 2 ELSE col1 END
   {
-    duckdb::vector<duckdb::unique_ptr<Expression>> mul_children;
-    mul_children.push_back(
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 1));
-    mul_children.push_back(duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(2)));
-    auto then_expr =
-      make_func_expr("*",
-                     LogicalType{LogicalTypeId::INTEGER},
-                     {LogicalType{LogicalTypeId::INTEGER}, LogicalType{LogicalTypeId::INTEGER}},
-                     std::move(mul_children));
+    std::vector<std::unique_ptr<ast_node>> mul_children;
+    mul_children.push_back(make_ref(1));
+    mul_children.push_back(make_int_const(2));
+    auto then_expr = make_func(
+      sirius::function_id::mul, std::move(mul_children), logical_type::make(type_id::INTEGER));
 
-    auto case_expr = duckdb::make_uniq<BoundCaseExpression>(LogicalType{LogicalTypeId::INTEGER});
-    BoundCaseCheck check;
-    check.when_expr = duckdb::make_uniq<BoundComparisonExpression>(
-      ExpressionType::COMPARE_GREATERTHAN,
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0),
-      duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(25)));
-    check.then_expr = std::move(then_expr);
-    case_expr->case_checks.push_back(std::move(check));
-    case_expr->else_expr =
-      duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 1);
-    exprs.push_back(std::move(case_expr));
+    std::vector<sirius::ast::case_expr::when_then> cases;
+    cases.push_back(sirius::ast::case_expr::when_then{
+      make_cmp(sirius::comparison_type::gt, make_ref(0), make_int_const(25)),
+      std::move(then_expr)});
+    exprs.push_back(std::make_unique<ast_node>(
+      sirius::ast::case_expr{std::move(cases), make_ref(1), logical_type::make(type_id::INTEGER)}));
   }
 
   auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
@@ -2033,5 +1714,477 @@ TEMPLATE_TEST_CASE("execute mixed arithmetic and CASE projection",
   for (size_t i = 0; i < in0.size(); ++i) {
     REQUIRE(out0[i] == in0[i] + in1[i]);
     REQUIRE(out1[i] == (in0[i] > 25 ? in1[i] * 2 : in1[i]));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// native_ast — exercise each migrated AST alternative through the non-owning
+// AST executor ctor, building the AST by hand (no DuckDB allocation involved).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Build a single-column INT32 input batch [0..127] and return its table view.
+struct int32_batch {
+  std::shared_ptr<data_batch> batch;
+  cudf::table_view view;
+};
+
+int32_batch make_int32_input(memory_space& space)
+{
+  auto batch =
+    make_input_batch(space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 100}});
+  auto ro       = batch->to_read_only();
+  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  return {batch, in_repr.get_table_view()};
+}
+
+std::unique_ptr<sirius::ast::node> ref_node_native(uint32_t idx) { return make_ref(idx); }
+
+std::unique_ptr<sirius::ast::node> int_const_node_native(int32_t v) { return make_int_const(v); }
+
+std::unique_ptr<cudf::table> run_native_ast(memory_space& space,
+                                            sirius::ast::node const* expr_ptr,
+                                            cudf::table_view tv,
+                                            exp_strategy_enum strategy = MAT)
+{
+  exp_executor executor(expr_ptr, get_resource_ref(space), cudf::get_default_stream(), strategy);
+  return executor.execute(tv);
+}
+
+}  // namespace
+
+TEST_CASE("native_ast - reference identity", "[expression_executor_ast_native][reference]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto in = make_int32_input(*space);
+
+  auto hand_ast = ref_node_native(0);
+  auto out      = run_native_ast(*space, hand_ast.get(), in.view, MAT);
+  REQUIRE(out);
+  auto in_host  = copy_column_to_host<int32_t>(in.view.column(0));
+  auto out_host = copy_column_to_host<int32_t>(out->view().column(0));
+  REQUIRE(out_host == in_host);
+}
+
+TEST_CASE("native_ast - constant INTEGER", "[expression_executor_ast_native][constant]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto in = make_int32_input(*space);
+
+  auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::constant{
+    sirius::value{int32_t{42}}, sirius::logical_type::make(sirius::type_id::INTEGER)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), in.view, MAT);
+  REQUIRE(out);
+  std::vector<int32_t> expected(in.view.num_rows(), 42);
+  REQUIRE(copy_column_to_host<int32_t>(out->view().column(0)) == expected);
+}
+
+TEST_CASE("native_ast - constant VARCHAR", "[expression_executor_ast_native][constant]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto input =
+    make_input_batch(*space, {cudf::data_type{cudf::type_id::STRING}}, {std::pair<int, int>{1, 5}});
+  auto ro       = input->to_read_only();
+  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  auto tv       = in_repr.get_table_view();
+
+  auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::constant{
+    sirius::value{std::string{"hello"}}, sirius::logical_type::make(sirius::type_id::VARCHAR)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), tv, MAT);
+  REQUIRE(out);
+  std::vector<std::string> expected(tv.num_rows(), "hello");
+  REQUIRE(copy_string_column_to_host(out->view().column(0)) == expected);
+}
+
+TEST_CASE("native_ast - comparison EQUAL (MATERIALIZE)",
+          "[expression_executor_ast_native][comparison]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto in = make_int32_input(*space);
+
+  auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::comparison{
+    sirius::comparison_type::equal, ref_node_native(0), int_const_node_native(42)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), in.view, MAT);
+  REQUIRE(out);
+  auto in_host  = copy_column_to_host<int32_t>(in.view.column(0));
+  auto out_host = copy_bool_column_to_host(out->view().column(0));
+  REQUIRE(out_host.size() == in_host.size());
+  for (size_t i = 0; i < in_host.size(); ++i) {
+    REQUIRE(out_host[i] == (in_host[i] == 42 ? 1U : 0U));
+  }
+}
+
+TEST_CASE("native_ast - comparison LESS_THAN (AST_INTERPRET)",
+          "[expression_executor_ast_native][comparison]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto in = make_int32_input(*space);
+
+  auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::comparison{
+    sirius::comparison_type::lt, ref_node_native(0), int_const_node_native(50)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), in.view, exp_strategy_enum::AST_INTERPRET);
+  REQUIRE(out);
+  auto in_host  = copy_column_to_host<int32_t>(in.view.column(0));
+  auto out_host = copy_bool_column_to_host(out->view().column(0));
+  REQUIRE(out_host.size() == in_host.size());
+  for (size_t i = 0; i < in_host.size(); ++i) {
+    REQUIRE(out_host[i] == (in_host[i] < 50 ? 1U : 0U));
+  }
+}
+
+TEST_CASE("native_ast - conjunction AND (MATERIALIZE)",
+          "[expression_executor_ast_native][conjunction]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  // Build a 2-column INT32 batch with col0 in [0, 100) and col1 in [0, 100).
+  auto input =
+    make_input_batch(*space,
+                     {cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT32}},
+                     {std::pair<int, int>{0, 100}, std::pair<int, int>{0, 100}});
+  auto ro       = input->to_read_only();
+  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  auto tv       = in_repr.get_table_view();
+
+  std::vector<std::unique_ptr<sirius::ast::node>> children;
+  children.push_back(std::make_unique<sirius::ast::node>(sirius::ast::comparison{
+    sirius::comparison_type::gt, ref_node_native(0), int_const_node_native(10)}));
+  children.push_back(std::make_unique<sirius::ast::node>(sirius::ast::comparison{
+    sirius::comparison_type::lt, ref_node_native(1), int_const_node_native(90)}));
+  auto hand_ast = std::make_unique<sirius::ast::node>(
+    sirius::ast::conjunction{sirius::ast::conjunction::kind::op_and, std::move(children)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), tv, MAT);
+  REQUIRE(out);
+  auto c0       = copy_column_to_host<int32_t>(tv.column(0));
+  auto c1       = copy_column_to_host<int32_t>(tv.column(1));
+  auto out_host = copy_bool_column_to_host(out->view().column(0));
+  REQUIRE(out_host.size() == c0.size());
+  for (size_t i = 0; i < c0.size(); ++i) {
+    REQUIRE(out_host[i] == ((c0[i] > 10 && c1[i] < 90) ? 1U : 0U));
+  }
+}
+
+TEST_CASE("native_ast - between (MATERIALIZE)", "[expression_executor_ast_native][between]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto in = make_int32_input(*space);
+
+  auto hand_ast =
+    std::make_unique<sirius::ast::node>(sirius::ast::between{ref_node_native(0),
+                                                             int_const_node_native(5),
+                                                             int_const_node_native(15),
+                                                             /*lower_inclusive=*/true,
+                                                             /*upper_inclusive=*/true});
+
+  auto out = run_native_ast(*space, hand_ast.get(), in.view, MAT);
+  REQUIRE(out);
+  auto in_host  = copy_column_to_host<int32_t>(in.view.column(0));
+  auto out_host = copy_bool_column_to_host(out->view().column(0));
+  REQUIRE(out_host.size() == in_host.size());
+  for (size_t i = 0; i < in_host.size(); ++i) {
+    REQUIRE(out_host[i] == ((in_host[i] >= 5 && in_host[i] <= 15) ? 1U : 0U));
+  }
+}
+
+TEST_CASE("native_ast - unary_op NOT (MATERIALIZE)", "[expression_executor_ast_native][unary_op]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto in = make_int32_input(*space);
+
+  auto cmp      = std::make_unique<sirius::ast::node>(sirius::ast::comparison{
+    sirius::comparison_type::equal, ref_node_native(0), int_const_node_native(5)});
+  auto hand_ast = std::make_unique<sirius::ast::node>(
+    sirius::ast::unary_op{sirius::ast::unary_op::kind::op_not, std::move(cmp)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), in.view, MAT);
+  REQUIRE(out);
+  auto in_host  = copy_column_to_host<int32_t>(in.view.column(0));
+  auto out_host = copy_bool_column_to_host(out->view().column(0));
+  REQUIRE(out_host.size() == in_host.size());
+  for (size_t i = 0; i < in_host.size(); ++i) {
+    REQUIRE(out_host[i] == (in_host[i] != 5 ? 1U : 0U));
+  }
+}
+
+TEST_CASE("native_ast - unary_op IS_NULL (MATERIALIZE)",
+          "[expression_executor_ast_native][unary_op]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  std::vector<int32_t> values{1, 2, 3, 4, 5};
+  std::vector<bool> valids{true, false, true, false, true};
+  auto batch    = make_int32_batch_with_nulls(*space, values, valids);
+  auto ro       = batch->to_read_only();
+  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  auto tv       = in_repr.get_table_view();
+
+  auto hand_ast = std::make_unique<sirius::ast::node>(
+    sirius::ast::unary_op{sirius::ast::unary_op::kind::op_is_null, ref_node_native(0)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), tv, MAT);
+  REQUIRE(out);
+  auto out_host = copy_bool_column_to_host(out->view().column(0));
+  REQUIRE(out_host.size() == valids.size());
+  for (size_t i = 0; i < valids.size(); ++i) {
+    REQUIRE(out_host[i] == (valids[i] ? 0U : 1U));
+  }
+}
+
+TEST_CASE("native_ast - unary_op IS_NOT_NULL (MATERIALIZE)",
+          "[expression_executor_ast_native][unary_op]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  std::vector<int32_t> values{10, 20, 30, 40};
+  std::vector<bool> valids{true, false, true, true};
+  auto batch    = make_int32_batch_with_nulls(*space, values, valids);
+  auto ro       = batch->to_read_only();
+  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  auto tv       = in_repr.get_table_view();
+
+  auto hand_ast = std::make_unique<sirius::ast::node>(
+    sirius::ast::unary_op{sirius::ast::unary_op::kind::op_is_not_null, ref_node_native(0)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), tv, MAT);
+  REQUIRE(out);
+  auto out_host = copy_bool_column_to_host(out->view().column(0));
+  REQUIRE(out_host.size() == valids.size());
+  for (size_t i = 0; i < valids.size(); ++i) {
+    REQUIRE(out_host[i] == (valids[i] ? 1U : 0U));
+  }
+}
+
+TEST_CASE("native_ast - in_list IN (MATERIALIZE)", "[expression_executor_ast_native][in_list]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto in = make_int32_input(*space);
+
+  std::vector<std::unique_ptr<sirius::ast::node>> values;
+  values.push_back(int_const_node_native(1));
+  values.push_back(int_const_node_native(3));
+  values.push_back(int_const_node_native(5));
+  auto hand_ast = std::make_unique<sirius::ast::node>(
+    sirius::ast::in_list{ref_node_native(0), std::move(values), /*negated=*/false});
+
+  auto out = run_native_ast(*space, hand_ast.get(), in.view, MAT);
+  REQUIRE(out);
+  auto in_host  = copy_column_to_host<int32_t>(in.view.column(0));
+  auto out_host = copy_bool_column_to_host(out->view().column(0));
+  REQUIRE(out_host.size() == in_host.size());
+  for (size_t i = 0; i < in_host.size(); ++i) {
+    bool const expected = (in_host[i] == 1 || in_host[i] == 3 || in_host[i] == 5);
+    REQUIRE(out_host[i] == (expected ? 1U : 0U));
+  }
+}
+
+TEST_CASE("native_ast - coalesce (MATERIALIZE)", "[expression_executor_ast_native][coalesce]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  std::vector<int32_t> values{7, 8, 9, 10, 11};
+  std::vector<bool> valids{true, false, true, false, true};
+  auto batch    = make_int32_batch_with_nulls(*space, values, valids);
+  auto ro       = batch->to_read_only();
+  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  auto tv       = in_repr.get_table_view();
+
+  std::vector<std::unique_ptr<sirius::ast::node>> children;
+  children.push_back(ref_node_native(0));
+  children.push_back(int_const_node_native(99));
+  auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::coalesce{
+    std::move(children), sirius::logical_type::make(sirius::type_id::INTEGER)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), tv, MAT);
+  REQUIRE(out);
+  auto out_host = copy_column_to_host<int32_t>(out->view().column(0));
+  REQUIRE(out_host.size() == values.size());
+  for (size_t i = 0; i < values.size(); ++i) {
+    REQUIRE(out_host[i] == (valids[i] ? values[i] : 99));
+  }
+}
+
+TEST_CASE("native_ast - cast INTEGER->BIGINT (MATERIALIZE)",
+          "[expression_executor_ast_native][cast]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto in = make_int32_input(*space);
+
+  auto hand_ast = std::make_unique<sirius::ast::node>(
+    sirius::ast::cast{ref_node_native(0),
+                      sirius::logical_type::make(sirius::type_id::BIGINT),
+                      /*try_cast=*/false});
+
+  auto out = run_native_ast(*space, hand_ast.get(), in.view, MAT);
+  REQUIRE(out);
+  auto in_host  = copy_column_to_host<int32_t>(in.view.column(0));
+  auto out_host = copy_column_to_host<int64_t>(out->view().column(0));
+  REQUIRE(out_host.size() == in_host.size());
+  for (size_t i = 0; i < in_host.size(); ++i) {
+    REQUIRE(out_host[i] == static_cast<int64_t>(in_host[i]));
+  }
+}
+
+TEST_CASE("native_ast - function_call add (MATERIALIZE)",
+          "[expression_executor_ast_native][function_call]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  // 2-column INT32 batch.
+  auto input =
+    make_input_batch(*space,
+                     {cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT32}},
+                     {std::pair<int, int>{0, 50}, std::pair<int, int>{0, 50}});
+  auto ro       = input->to_read_only();
+  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  auto tv       = in_repr.get_table_view();
+
+  std::vector<std::unique_ptr<sirius::ast::node>> args;
+  args.push_back(ref_node_native(0));
+  args.push_back(ref_node_native(1));
+  auto hand_ast = std::make_unique<sirius::ast::node>(
+    sirius::ast::function_call{sirius::function_id::add,
+                               std::move(args),
+                               sirius::logical_type::make(sirius::type_id::INTEGER)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), tv, MAT);
+  REQUIRE(out);
+  auto c0       = copy_column_to_host<int32_t>(tv.column(0));
+  auto c1       = copy_column_to_host<int32_t>(tv.column(1));
+  auto out_host = copy_column_to_host<int32_t>(out->view().column(0));
+  REQUIRE(out_host.size() == c0.size());
+  for (size_t i = 0; i < c0.size(); ++i) {
+    REQUIRE(out_host[i] == c0[i] + c1[i]);
+  }
+}
+
+TEST_CASE("native_ast - function_call add (AST_INTERPRET)",
+          "[expression_executor_ast_native][function_call]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto input =
+    make_input_batch(*space,
+                     {cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT32}},
+                     {std::pair<int, int>{0, 50}, std::pair<int, int>{0, 50}});
+  auto ro       = input->to_read_only();
+  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  auto tv       = in_repr.get_table_view();
+
+  std::vector<std::unique_ptr<sirius::ast::node>> args;
+  args.push_back(ref_node_native(0));
+  args.push_back(ref_node_native(1));
+  auto hand_ast = std::make_unique<sirius::ast::node>(
+    sirius::ast::function_call{sirius::function_id::add,
+                               std::move(args),
+                               sirius::logical_type::make(sirius::type_id::INTEGER)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), tv, exp_strategy_enum::AST_INTERPRET);
+  REQUIRE(out);
+  auto c0       = copy_column_to_host<int32_t>(tv.column(0));
+  auto c1       = copy_column_to_host<int32_t>(tv.column(1));
+  auto out_host = copy_column_to_host<int32_t>(out->view().column(0));
+  REQUIRE(out_host.size() == c0.size());
+  for (size_t i = 0; i < c0.size(); ++i) {
+    REQUIRE(out_host[i] == c0[i] + c1[i]);
+  }
+}
+
+TEST_CASE("native_ast - case_expr WHEN/THEN/ELSE (MATERIALIZE)",
+          "[expression_executor_ast_native][case_expr]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto in = make_int32_input(*space);
+
+  std::vector<sirius::ast::case_expr::when_then> cases;
+  cases.emplace_back();
+  cases.back().when_ = std::make_unique<sirius::ast::node>(sirius::ast::comparison{
+    sirius::comparison_type::equal, ref_node_native(0), int_const_node_native(5)});
+  cases.back().then_ = int_const_node_native(100);
+  auto hand_ast      = std::make_unique<sirius::ast::node>(
+    sirius::ast::case_expr{std::move(cases),
+                           int_const_node_native(0),
+                           sirius::logical_type::make(sirius::type_id::INTEGER)});
+
+  auto out = run_native_ast(*space, hand_ast.get(), in.view, MAT);
+  REQUIRE(out);
+  auto in_host  = copy_column_to_host<int32_t>(in.view.column(0));
+  auto out_host = copy_column_to_host<int32_t>(out->view().column(0));
+  REQUIRE(out_host.size() == in_host.size());
+  for (size_t i = 0; i < in_host.size(); ++i) {
+    REQUIRE(out_host[i] == (in_host[i] == 5 ? 100 : 0));
+  }
+}
+
+// Native-AST executor coverage for the null-safe comparison kinds
+// (COMPARE_DISTINCT_FROM / COMPARE_NOT_DISTINCT_FROM) built directly as
+// sirius::ast::comparison nodes — the comparison-kind enum is preserved end to
+// end through the executor without any DuckDB Bound*Expression round-trip
+// (sirius-db/sirius#699). DuckDB->Sirius lowering of these kinds is covered by
+// the dedicated [ast_from_duckdb] suite.
+TEST_CASE("native_ast - comparison DISTINCT_FROM / NOT_DISTINCT_FROM executes",
+          "[expression_executor_ast_native][comparison]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  // Input: {10, NULL, 30, NULL, 50}.
+  std::vector<int32_t> values = {10, 99, 30, 99, 50};
+  std::vector<bool> valids    = {true, false, true, false, true};
+
+  {
+    auto batch    = make_int32_batch_with_nulls(*space, values, valids);
+    auto ro       = batch->to_read_only();
+    auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+    auto tv       = in_repr.get_table_view();
+
+    auto node = std::make_unique<sirius::ast::node>(sirius::ast::comparison{
+      sirius::comparison_type::not_distinct_from, ref_node_native(0), int_const_node_native(30)});
+    REQUIRE(node->holds<sirius::ast::comparison>());
+    REQUIRE(node->get<sirius::ast::comparison>().op == sirius::comparison_type::not_distinct_from);
+
+    // Only the real 30 is null-safe-equal to 30; the two NULLs are not.
+    auto out = run_native_ast(*space, node.get(), tv, MAT);
+    REQUIRE(out);
+    auto out_host = copy_bool_column_to_host(out->view().column(0));
+    REQUIRE(out_host.size() == values.size());
+    for (size_t i = 0; i < values.size(); ++i) {
+      REQUIRE(out_host[i] == ((valids[i] && values[i] == 30) ? 1U : 0U));
+    }
+  }
+
+  {
+    auto batch    = make_int32_batch_with_nulls(*space, values, valids);
+    auto ro       = batch->to_read_only();
+    auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+    auto tv       = in_repr.get_table_view();
+
+    auto node = std::make_unique<sirius::ast::node>(sirius::ast::comparison{
+      sirius::comparison_type::distinct_from, ref_node_native(0), int_const_node_native(30)});
+    REQUIRE(node->holds<sirius::ast::comparison>());
+    REQUIRE(node->get<sirius::ast::comparison>().op == sirius::comparison_type::distinct_from);
+
+    // Everything except the real 30 is null-safe-distinct from 30 (both NULLs included).
+    auto out = run_native_ast(*space, node.get(), tv, MAT);
+    REQUIRE(out);
+    auto out_host = copy_bool_column_to_host(out->view().column(0));
+    REQUIRE(out_host.size() == values.size());
+    for (size_t i = 0; i < values.size(); ++i) {
+      REQUIRE(out_host[i] == ((valids[i] && values[i] == 30) ? 0U : 1U));
+    }
   }
 }

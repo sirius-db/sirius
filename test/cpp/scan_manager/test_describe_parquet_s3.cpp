@@ -7,8 +7,9 @@
 
 #include "catch.hpp"
 #include "io/prefetching_cache.hpp"
+#include "io/s3/s3_blocking_ioctx.hpp"
 #include "io/s3/s3_ioctx.hpp"
-#include "io/s3/sirius_sigv4_credential_provider.hpp"
+#include "io/s3/sirius_sigv4_authorizer.hpp"
 #include "scan_manager/parquet_metadata.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_config.hpp"
@@ -38,9 +39,10 @@ using sirius::io::buffer_pool;
 using sirius::io::sirius_io_object;
 using sirius::io::sirius_ioctx;
 using sirius::io::uring_ioctx;
+using sirius::io::s3::s3_blocking_ioctx;
 using sirius::io::s3::s3_ioctx;
 using sirius::io::s3::s3_ioctx_config;
-using sirius::io::s3::sirius_sigv4_credential_provider;
+using sirius::io::s3::sirius_sigv4_presigned_authorizer;
 using sirius::io::s3::static_credentials;
 using sirius::scan_manager::parquet_metadata;
 using sirius::scan_manager::scan_manager_config;
@@ -103,6 +105,22 @@ bool skip_if_no_s3_env(std::optional<s3_test_env> const& env)
   }
   SUCCEED("SIRIUS_TEST_S3_* not set; skipping live S3 describe_parquet test");
   return true;
+}
+
+bool is_s3_backend(sirius_ioctx* ctx)
+{
+  return dynamic_cast<s3_blocking_ioctx*>(ctx) != nullptr ||
+         dynamic_cast<s3_ioctx*>(ctx) != nullptr;
+}
+
+std::uint64_t bytes_read_total(sirius_ioctx* ctx)
+{
+  if (auto* blocking = dynamic_cast<s3_blocking_ioctx*>(ctx)) {
+    return blocking->bytes_read_total();
+  }
+  if (auto* async = dynamic_cast<s3_ioctx*>(ctx)) { return async->bytes_read_total(); }
+  FAIL("expected an S3 ioctx backend");
+  return 0;
 }
 
 std::string s3_uri(std::string_view bucket, std::string_view key)
@@ -178,7 +196,7 @@ s3_ioctx_config make_s3_config(s3_test_env const& env)
   creds.secret_access_key = env.secret_key;
 
   s3_ioctx_config cfg{};
-  cfg.creds = std::make_shared<sirius_sigv4_credential_provider>(
+  cfg.creds = std::make_shared<sirius_sigv4_presigned_authorizer>(
     std::move(creds), env.region, env.endpoint, 30min);
   cfg.max_connections    = 4;
   cfg.request_timeout_s  = 20;
@@ -326,12 +344,11 @@ TEST_CASE("describe_parquet fetches only the footer over S3",
 
   auto* base_ctx = manager.io_ctx_for(uri);
   REQUIRE(base_ctx != nullptr);
-  auto* s3_ctx = dynamic_cast<s3_ioctx*>(base_ctx);
-  REQUIRE(s3_ctx != nullptr);
+  REQUIRE(is_s3_backend(base_ctx));
 
-  auto const before = s3_ctx->bytes_read_total();
+  auto const before = bytes_read_total(base_ctx);
   auto result       = manager.describe_parquet(uri);
-  auto const delta  = s3_ctx->bytes_read_total() - before;
+  auto const delta  = bytes_read_total(base_ctx) - before;
 
   if (result.object_size < one_hundred_mib) {
     WARN(
@@ -353,12 +370,12 @@ TEST_CASE("describe_parquet inserts parsed parquet metadata into the prefetch ca
   auto const uri = s3_uri(env->bucket, "parquet/nation.parquet");
   auto bind_info = manager.describe_parquet(uri);
   auto* base_ctx = manager.io_ctx_for(uri);
-  auto* s3_ctx   = dynamic_cast<s3_ioctx*>(base_ctx);
-  REQUIRE(s3_ctx != nullptr);
-  REQUIRE(s3_ctx->cache() != nullptr);
+  REQUIRE(base_ctx != nullptr);
+  REQUIRE(is_s3_backend(base_ctx));
+  REQUIRE(base_ctx->cache() != nullptr);
 
-  auto io_object = s3_ctx->create_io_object(uri);
-  auto metadata  = s3_ctx->cache()->get_metadata(*io_object);
+  auto io_object = base_ctx->create_io_object(uri);
+  auto metadata  = base_ctx->cache()->get_metadata(*io_object);
   REQUIRE(metadata != nullptr);
 
   auto parquet = std::dynamic_pointer_cast<parquet_metadata>(metadata);
@@ -382,12 +399,12 @@ TEST_CASE("describe_parquet exposes the parquet footer row count for planner met
   auto bind_info = manager.describe_parquet(uri);
 
   auto* base_ctx = manager.io_ctx_for(uri);
-  auto* s3_ctx   = dynamic_cast<s3_ioctx*>(base_ctx);
-  REQUIRE(s3_ctx != nullptr);
-  REQUIRE(s3_ctx->cache() != nullptr);
+  REQUIRE(base_ctx != nullptr);
+  REQUIRE(is_s3_backend(base_ctx));
+  REQUIRE(base_ctx->cache() != nullptr);
 
-  auto io_object = s3_ctx->create_io_object(uri);
-  auto metadata  = s3_ctx->cache()->get_metadata(*io_object);
+  auto io_object = base_ctx->create_io_object(uri);
+  auto metadata  = base_ctx->cache()->get_metadata(*io_object);
   auto parquet   = std::dynamic_pointer_cast<parquet_metadata>(metadata);
   REQUIRE(parquet != nullptr);
   REQUIRE(parquet->file_metadata() != nullptr);

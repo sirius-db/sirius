@@ -19,19 +19,11 @@
 // sirius
 #include <cudf/cudf_utils.hpp>
 
+#include <expression/ast/node.hpp>
 #include <expression/join_condition.hpp>
 
 // duckdb
 #include <duckdb/common/types.hpp>
-#include <duckdb/planner/expression/bound_between_expression.hpp>
-#include <duckdb/planner/expression/bound_case_expression.hpp>
-#include <duckdb/planner/expression/bound_cast_expression.hpp>
-#include <duckdb/planner/expression/bound_comparison_expression.hpp>
-#include <duckdb/planner/expression/bound_conjunction_expression.hpp>
-#include <duckdb/planner/expression/bound_constant_expression.hpp>
-#include <duckdb/planner/expression/bound_function_expression.hpp>
-#include <duckdb/planner/expression/bound_operator_expression.hpp>
-#include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/joinside.hpp>
 
 // cudf
@@ -123,9 +115,9 @@ class gpu_expression_translator {
   }
 
   /**
-   * @brief Try to translate a DuckDB expression into a cuDF AST.
+   * @brief Try to translate a Sirius AST expression into a cuDF AST.
    *
-   * @param expr The DuckDB expression to translate.
+   * @param expr The Sirius AST expression to translate.
    * @param table_src The table reference (LEFT, RIGHT, or NONE) to use for any column references in
    * the expression (DEFAULT is LEFT, and the argument is immaterial for single-table expressions,
    * i.e., not join conditions).
@@ -134,25 +126,25 @@ class gpu_expression_translator {
    * expression that could not be translated to cuDF AST.
    */
   std::optional<translated_expression> translate_expression(
-    duckdb::Expression const& expr,
+    sirius::ast::node const& expr,
     cudf::ast::table_reference const table_src = cudf::ast::table_reference::LEFT);
 
   /**
-   * @brief Try to translate a DuckDB expression into a cuDF AST, using column name references
+   * @brief Try to translate a Sirius AST expression into a cuDF AST, using column name references
    * instead of column index references.
    *
    * This is needed for cudf's parquet predicate pushdown (e.g. hybrid scan), which expects
    * filter expressions to use cudf::ast::column_name_reference (by name) rather than
    * cudf::ast::column_reference (by index).
    *
-   * @param expr The DuckDB expression to translate.
-   * @param column_name_resolver A function mapping BoundReferenceExpression::index to a column
+   * @param expr The Sirius AST expression to translate.
+   * @param column_name_resolver A function mapping a reference column index to a column
    * name string.
    * @return An optional containing the translated expression, or std::nullopt if translation
    * failed.
    */
   std::optional<translated_expression> translate_expression_with_names(
-    duckdb::Expression const& expr, column_name_resolver_fxn column_name_resolver);
+    sirius::ast::node const& expr, column_name_resolver_fxn column_name_resolver);
 
   /**
    * @brief Try to translate a sirius join condition into a cuDF AST.
@@ -198,31 +190,43 @@ class gpu_expression_translator {
 
   /// @brief Add the given expression to the AST, returning a reference to the added expression if
   /// translation was successful, or std::nullopt if translation failed.
-  std::optional<expr_ref> add_expression(duckdb::Expression const& expr,
-                                         cudf::ast::table_reference const table_src);
-  /// @brief Specialized add_expression for BETWEEN expressions.
-  std::optional<expr_ref> add_expression(duckdb::BoundBetweenExpression const& expr,
-                                         cudf::ast::table_reference const table_src);
-  /// @brief Specialized add_expression for CAST expressions.
-  std::optional<expr_ref> add_expression(duckdb::BoundCastExpression const& expr,
-                                         cudf::ast::table_reference const table_src);
-  /// @brief Specialized add_expression for COMPARISON expressions.
-  std::optional<expr_ref> add_expression(duckdb::BoundComparisonExpression const& expr,
-                                         cudf::ast::table_reference const table_src);
-  /// @brief Specialized add_expression for CONJUNCTION expressions.
-  std::optional<expr_ref> add_expression(duckdb::BoundConjunctionExpression const& expr,
-                                         cudf::ast::table_reference const table_src);
-  /// @brief Specialized add_expression for CONSTANT expressions.
-  std::optional<expr_ref> add_expression(duckdb::BoundConstantExpression const& expr,
-                                         cudf::ast::table_reference const table_src);
-  /// @brief Specialized add_expression for FUNCTION expressions.
-  std::optional<expr_ref> add_expression(duckdb::BoundFunctionExpression const& expr,
-                                         cudf::ast::table_reference const table_src);
-  /// @brief Specialized add_expression for OPERATOR expressions.
-  std::optional<expr_ref> add_expression(duckdb::BoundOperatorExpression const& expr,
+  std::optional<expr_ref> add_expression(sirius::ast::node const& expr,
                                          cudf::ast::table_reference const table_src);
   /// @brief Specialized add_expression for column REFERENCE expressions.
-  std::optional<expr_ref> add_expression(duckdb::BoundReferenceExpression const& expr,
+  std::optional<expr_ref> add_expression(sirius::ast::reference const& alt,
+                                         cudf::ast::table_reference const table_src);
+  /// @brief Specialized add_expression for CONSTANT expressions.
+  std::optional<expr_ref> add_expression(sirius::ast::constant const& alt,
+                                         cudf::ast::table_reference const table_src);
+  /// @brief Specialized add_expression for COMPARISON expressions.
+  std::optional<expr_ref> add_expression(sirius::ast::comparison const& alt,
+                                         cudf::ast::table_reference const table_src);
+  /// @brief Specialized add_expression for CONJUNCTION expressions.
+  std::optional<expr_ref> add_expression(sirius::ast::conjunction const& alt,
+                                         cudf::ast::table_reference const table_src);
+  /// @brief Specialized add_expression for BETWEEN expressions.
+  std::optional<expr_ref> add_expression(sirius::ast::between const& alt,
+                                         cudf::ast::table_reference const table_src);
+  /// @brief Specialized add_expression for CASE expressions (not translatable to cuDF AST).
+  std::optional<expr_ref> add_expression(sirius::ast::case_expr const& alt,
+                                         cudf::ast::table_reference const table_src);
+  /// @brief Specialized add_expression for CAST expressions.
+  std::optional<expr_ref> add_expression(sirius::ast::cast const& alt,
+                                         cudf::ast::table_reference const table_src);
+  /// @brief Specialized add_expression for unary SQL operators (NOT, IS NULL, IS NOT NULL, TRY).
+  std::optional<expr_ref> add_expression(sirius::ast::unary_op const& alt,
+                                         cudf::ast::table_reference const table_src);
+  /// @brief Specialized add_expression for COALESCE expressions (not translatable to cuDF AST).
+  std::optional<expr_ref> add_expression(sirius::ast::coalesce const& alt,
+                                         cudf::ast::table_reference const table_src);
+  /// @brief Specialized add_expression for IN / NOT IN expressions.
+  std::optional<expr_ref> add_expression(sirius::ast::in_list const& alt,
+                                         cudf::ast::table_reference const table_src);
+  /// @brief Specialized add_expression for FUNCTION expressions.
+  std::optional<expr_ref> add_expression(sirius::ast::function_call const& alt,
+                                         cudf::ast::table_reference const table_src);
+  /// @brief Specialized add_expression for AGGREGATE expressions (not translatable to cuDF AST).
+  std::optional<expr_ref> add_expression(sirius::ast::aggregate const& alt,
                                          cudf::ast::table_reference const table_src);
 
   /// @brief Add a single join condition to the current AST tree without resetting it.
@@ -234,12 +238,18 @@ class gpu_expression_translator {
   /// @brief Helper function for adding a binary function expression (e.g. addition) to the AST.
   /// OP is the cuDF AST operator corresponding to the function (e.g. cudf::ast::ast_operator::ADD).
   template <cudf::ast::ast_operator OP>
-  std::optional<expr_ref> add_function_expression(duckdb::BoundFunctionExpression const& expr,
+  std::optional<expr_ref> add_function_expression(sirius::ast::function_call const& alt,
                                                   cudf::ast::table_reference const table_src)
   {
+    // This helper builds a binary cuDF operation. DuckDB overloads some
+    // operators on arity (e.g. unary negation also binds as function "-"), so a
+    // function_call reaching here may carry a single argument; bail out rather
+    // than indexing arguments()[1] out of bounds.
+    if (alt.arguments().size() != 2) { return std::nullopt; }
+
     // Translate children
-    auto left_expr  = add_expression(*expr.children[0], table_src);
-    auto right_expr = add_expression(*expr.children[1], table_src);
+    auto left_expr  = add_expression(*alt.arguments()[0], table_src);
+    auto right_expr = add_expression(*alt.arguments()[1], table_src);
 
     // Check for failure in translating children
     if (!left_expr || !right_expr) { return std::nullopt; }

@@ -19,7 +19,7 @@
 #include "exec/thread_pool.hpp"
 #include "io/parquet_helpers.hpp"
 #include "io/prefetching_cache.hpp"
-#include "io/s3/s3_ioctx.hpp"
+#include "io/s3/s3_blocking_ioctx.hpp"
 #include "io/uring/uring_ioctx.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_scan_info.hpp"
@@ -246,10 +246,20 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
   auto info = op->take_scan_info();
   if (!info) { return nullptr; }
 
+  // When use_sirius_datasource=false (single-GPU only — multi-GPU runs are
+  // forced to true by sirius_config::enforce_sirius_datasource_for_multi_gpu()),
+  // suppress the per-GPU uring map. The provider then routes local files
+  // through cudf::io::datasource::create (kvikio fallback, safe with one GPU),
+  // and the operator reads slices without any sirius_ioctx. S3 paths are
+  // unaffected — they dispatch through the scan_manager's _io_ctxs vector
+  // independently.
+  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const empty_gpu_ioctxs;
+  auto const& effective_gpu_ioctxs = _config.use_sirius_datasource ? gpu_ioctxs : empty_gpu_ioctxs;
+
   // Inject the per-GPU ioctx map into the operator before any provider returns —
   // read_table_from_metadata needs it before its first invocation, and
   // prepare_for_query runs before any execute().
-  op->set_gpu_ioctxs(gpu_ioctxs);
+  op->set_gpu_ioctxs(effective_gpu_ioctxs);
 
   // Cache short-circuit lives on the manager (format-agnostic); on miss,
   // dispatch through the polymorphic make_provider.
@@ -259,7 +269,7 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
   // Combined-runtime: pass *this so the format provider can route per-path
   // (s3:// -> s3_ioctx via io_ctx_shared_for, local -> per-GPU uring). Upstream
   // #749's make_provider(gpu_ioctxs) only wired local; S3 needs the scan_manager.
-  return info->make_provider(*this, gpu_ioctxs);
+  return info->make_provider(*this, effective_gpu_ioctxs);
 }
 
 std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(

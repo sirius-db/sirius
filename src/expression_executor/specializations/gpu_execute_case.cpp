@@ -15,13 +15,10 @@
  */
 
 // sirius
+#include <expression/ast/node.hpp>
+#include <expression/function_id.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <sirius/exception.hpp>
-
-// duckdb
-#include <duckdb/common/exception.hpp>
-#include <duckdb/planner/expression/bound_case_expression.hpp>
-#include <duckdb/planner/expression/bound_function_expression.hpp>
 
 // cudf
 #include <cudf/ast/expressions.hpp>
@@ -29,12 +26,13 @@
 #include <cudf/cudf_utils.hpp>
 #include <cudf/reduction.hpp>
 
-// We need to handle implicit error checks inserted as CASE statements by DuckDB
-#define ERROR_FUNC_STR "error"
+// standard library
+#include <ranges>
 
 namespace sirius {
 using execute_result = gpu_expression_executor::execute_result;
-execute_result gpu_expression_executor::execute(duckdb::BoundCaseExpression const& expr,
+
+execute_result gpu_expression_executor::execute(sirius::ast::case_expr const& alt,
                                                 execution_mode mode)
 {
   //===----------MATERIALIZE (AST breaker)----------===//
@@ -44,24 +42,22 @@ execute_result gpu_expression_executor::execute(duckdb::BoundCaseExpression cons
   std::unique_ptr<cudf::column> output;
 
   // First, execute the ELSE
-  auto current_result = execute(*expr.else_expr, execution_mode::MATERIALIZE);
+  auto current_result = execute(*alt.else_, execution_mode::MATERIALIZE);
 
-  // Loop backwards, so that the THEN of the first true WHEN is copied to the output column
-  auto const num_checks = static_cast<int32_t>(
-    expr.case_checks.size());  // This is sane, and needed for the descending loop index
-  D_ASSERT(num_checks > 0);
+  // Iterate in reverse so the THEN of the first true WHEN is copied to the
+  // output column last (overwrites any later match). SQL CASE semantics:
+  // first matching WHEN wins.
+  D_ASSERT(!alt.cases.empty());
 
-  for (int32_t i = num_checks - 1; i >= 0; --i) {
-    auto& case_check = expr.case_checks[i];
+  for (auto const& case_check : std::views::reverse(alt.cases)) {
+    // Execute the WHEN expression to get a boolean array intermediate.
+    auto current_mask = execute(*case_check.when_, execution_mode::MATERIALIZE);
 
-    // Fist, execute the WHEN expression to get boolean array intermediate
-    auto current_mask = execute(*case_check.when_expr, execution_mode::MATERIALIZE);
-
-    // Check for error functions
-    if (case_check.then_expr->GetExpressionClass() == duckdb::ExpressionClass::BOUND_FUNCTION &&
-        case_check.then_expr->Cast<duckdb::BoundFunctionExpression>().function.name ==
-          ERROR_FUNC_STR) {
-      // If the THEN is true anywhere, throw error()
+    // Check for the implicit error() function that DuckDB inserts as a CASE THEN.
+    if (case_check.then_->holds<sirius::ast::function_call>() &&
+        case_check.then_->get<sirius::ast::function_call>().function() ==
+          sirius::function_id::error) {
+      // If the THEN is true anywhere, raise the error eagerly.
       bool throw_error = false;
       if (current_mask.is_scalar()) {
         auto const& bool_scalar =
@@ -76,7 +72,6 @@ execute_result gpu_expression_executor::execute(duckdb::BoundCaseExpression cons
         throw_error     = static_cast<cudf::scalar_type_t<bool>*>(any_result.get())->value(_stream);
       }
       if (throw_error) {
-        // Assume that this arises for the stated error
         throw internal_exception(
           "[gpu_expression_executor:case]: More than one row returned by a subquery used as an "
           "expression.");
@@ -84,8 +79,8 @@ execute_result gpu_expression_executor::execute(duckdb::BoundCaseExpression cons
       continue;
     }
 
-    // Otherwise, execute the THEN and selectively copy to the output
-    auto current_then = execute(*case_check.then_expr, execution_mode::MATERIALIZE);
+    // Otherwise, execute the THEN and selectively copy to the output.
+    auto current_then = execute(*case_check.then_, execution_mode::MATERIALIZE);
     if (current_result.is_scalar()) {
       // This can only possibly happen when i = num_checks - 1
       if (current_then.is_scalar()) {
@@ -128,4 +123,5 @@ execute_result gpu_expression_executor::execute(duckdb::BoundCaseExpression cons
   }
   return current_result;
 }
+
 }  // namespace sirius

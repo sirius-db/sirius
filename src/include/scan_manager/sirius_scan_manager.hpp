@@ -19,7 +19,7 @@
 #include "exec/config.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
-#include "io/s3/s3_ioctx.hpp"
+#include "io/s3/s3_blocking_ioctx.hpp"
 #include "scan_manager/split_provider.hpp"
 
 // Forward-declare sirius_ioctx via <io/types.hpp> for the gpu_ioctxs map type
@@ -68,7 +68,11 @@ namespace sirius::scan_manager {
  * @c use_sirius_datasource controls whether the manager builds a
  * @c sirius_ioctx and routes parquet reads through @c sirius_datasource.
  * Set to @c false to fall back to @c cudf::io::datasource::create() at
- * every read site (e.g. when the sirius IO path is misbehaving).
+ * every read site (e.g. when the sirius IO path is misbehaving). Only
+ * valid in single-GPU configurations — when more than one GPU is
+ * configured, @c sirius_config::enforce_sirius_datasource_for_multi_gpu()
+ * forces this field to @c true because kvikio's per-FileHandle CUDA-context
+ * binding breaks multi-GPU residency.
  */
 struct scan_manager_config {
   exec::thread_pool_config thread_pool{.num_threads = 8, .thread_name_prefix = "scan_manager"};
@@ -112,7 +116,7 @@ struct scan_manager_config {
   /// is empty. Separate from the main @c thread_pool because S3 I/O has
   /// different concurrency characteristics (more threads, network-bound,
   /// not CPU-bound). Injected into @c s3_ioctx_config::async_thread_pool
-  /// before constructing the s3_ioctx so async S3 paths bypass detached
+  /// before constructing the s3_blocking_ioctx so async S3 paths bypass detached
   /// std::thread fallbacks.
   exec::thread_pool_config s3_thread_pool{.num_threads = 8, .thread_name_prefix = "s3_io"};
 };
@@ -230,9 +234,14 @@ class sirius_scan_manager {
   ///                     reads route through io_uring instead of cudf's
   ///                     bundled kvikio path. Empty map is permitted for
   ///                     callers (test harnesses) that pre-populate scan_info
-  ///                     another way; production callers
+  ///                     another way, and for the single-GPU
+  ///                     @c use_sirius_datasource=false configuration where
+  ///                     footer reads intentionally fall back to cudf's
+  ///                     kvikio datasource. Production callers
   ///                     (SiriusContext::create_query) MUST pass the map
-  ///                     from SiriusContext::get_gpu_ioctxs().
+  ///                     from SiriusContext::get_gpu_ioctxs(); multi-GPU
+  ///                     runs always populate it (enforced by
+  ///                     @c sirius_config::enforce_sirius_datasource_for_multi_gpu()).
   /// @param gpu_memory_spaces device_id -> GPU memory_space lookup used by the
   ///                     HOST-tier cached_split_provider to materialize host
   ///                     chunks onto the executing GPU. Empty map disables the

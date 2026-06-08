@@ -16,15 +16,24 @@
 
 #include "util/segfault_backtrace.hpp"
 
+// Pull in libc feature macros so __GLIBC__ is defined before we test it below.
+// Without a prior libc include, __GLIBC__ is undefined at the #if and the entire
+// implementation silently compiles to the no-op fallback (so the handler never
+// installs). <cstdlib> transitively includes <features.h> on glibc and is
+// harmless elsewhere.
+#include <cstdlib>
+
 #if defined(__linux__) && defined(__GLIBC__)
 
 #include <cxxabi.h>
 #include <execinfo.h>
 #include <fcntl.h>
+#include <spdlog/spdlog.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
 #include <array>
+#include <cctype>
 #include <csignal>
 #include <cstring>
 #include <memory>
@@ -68,21 +77,61 @@ static void write_backtrace_line(int fd, int frame_no, const char* raw_line)
   write(fd, "\n", 1);
 }
 
+// Best-effort flush of the spdlog logger so the most recent log lines reach
+// disk before we terminate. This is NOT async-signal-safe: the _mt sink takes
+// a mutex and may allocate, so if the crash happened while a thread held the
+// logging mutex (or inside the allocator) the flush could deadlock. We bound
+// that risk with alarm(): SIGALRM's default disposition terminates the
+// process, so a hung flush kills us within the deadline instead of hanging the
+// crash handler forever. alarm() and signal() are themselves signal-safe.
+static void flush_logs_best_effort()
+{
+  signal(SIGALRM, SIG_DFL);  // ensure default (terminate) disposition
+  alarm(3);                  // hard deadline for the log + flush below
+  if (auto* logger = spdlog::default_logger_raw()) {
+    SPDLOG_LOGGER_WARN(logger, "SIRIUS signal handler triggered, flushing logs");
+    logger->flush();
+  }
+  alarm(0);  // flush returned in time; cancel the deadline
+}
+
+static const char* signal_name(int sig)
+{
+  switch (sig) {
+    case SIGSEGV: return "SIGSEGV";
+    case SIGBUS: return "SIGBUS";
+    case SIGABRT: return "SIGABRT";
+    case SIGFPE: return "SIGFPE";
+    case SIGILL: return "SIGILL";
+    default: return "SIGNAL";
+  }
+}
+
 static void segfault_handler(int sig)
 {
   std::array<void*, kBacktraceMaxFrames> frames{};
   int n = backtrace(frames.data(), kBacktraceMaxFrames);
-  if (n <= 0) { _exit(1); }
+  if (n <= 0) {
+    flush_logs_best_effort();
+    _exit(1);
+  }
 
   char** symbols = backtrace_symbols(frames.data(), n);
   if (!symbols) {
     backtrace_symbols_fd(frames.data(), n, STDERR_FILENO);
+    flush_logs_best_effort();
     _exit(1);
   }
 
-  long tid           = static_cast<long>(syscall(SYS_gettid));
-  const char* header = (sig == SIGSEGV) ? "\n*** SIGSEGV — backtrace from faulting thread ***\n"
-                                        : "\n*** SIGBUS — backtrace from faulting thread ***\n";
+  long tid          = static_cast<long>(syscall(SYS_gettid));
+  const char* sname = signal_name(sig);
+
+  auto write_header = [sname](int fd) {
+    const char* suffix = " — backtrace from faulting thread ***\n";
+    write(fd, "\n*** ", 5);
+    write(fd, sname, strlen(sname));
+    write(fd, suffix, __builtin_strlen(suffix));
+  };
 
   auto write_tid = [tid](int fd) {
     write(fd, "Faulting thread id: ", 19);
@@ -108,7 +157,7 @@ static void segfault_handler(int sig)
   if (s_segfault_log_path[0] != '\0') {
     int log_fd = open(s_segfault_log_path.data(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (log_fd >= 0) {
-      write(log_fd, header, __builtin_strlen(header));
+      write_header(log_fd);
       write_tid(log_fd);
       write_backtrace(log_fd);
       const char* tail = "*** end backtrace ***\n";
@@ -117,19 +166,52 @@ static void segfault_handler(int sig)
     }
   }
 
-  write(STDERR_FILENO, header, __builtin_strlen(header));
+  write_header(STDERR_FILENO);
   write_tid(STDERR_FILENO);
   write_backtrace(STDERR_FILENO);
   const char* tail = "*** end backtrace ***\n";
   write(STDERR_FILENO, tail, __builtin_strlen(tail));
   free(symbols);
+
+  // Backtrace is safely out on both sinks; now attempt the (riskier) log flush.
+  flush_logs_best_effort();
   _exit(1);
 }
 
 }  // namespace
 
+// Returns true for "1", "true", "yes", "on" (case-insensitive). Used to let
+// developers opt out of the crash handler so the OS can write a core dump.
+static bool env_flag_enabled(const char* name)
+{
+  const char* v = std::getenv(name);
+  if (v == nullptr || v[0] == '\0') { return false; }
+  if (std::strcmp(v, "1") == 0) { return true; }
+  auto ieq = [](const char* a, const char* b) {
+    for (; *a && *b; ++a, ++b) {
+      if (std::tolower(static_cast<unsigned char>(*a)) !=
+          std::tolower(static_cast<unsigned char>(*b))) {
+        return false;
+      }
+    }
+    return *a == *b;
+  };
+  return ieq(v, "true") || ieq(v, "yes") || ieq(v, "on");
+}
+
 void install_segfault_backtrace_handler()
 {
+  // Escape hatch: when DISABLE_SIRIUS_SIGNAL_HANDLER is set, do NOT install the
+  // handler. The handler calls _exit(1) on a crash, which prevents the OS from
+  // writing a core dump; leaving it uninstalled lets the default disposition
+  // produce a core (with `ulimit -c unlimited`). See docs/super-sirius/debugging.md.
+  if (env_flag_enabled("DISABLE_SIRIUS_SIGNAL_HANDLER")) {
+    spdlog::warn(
+      "Sirius crash backtrace handler DISABLED via DISABLE_SIRIUS_SIGNAL_HANDLER — "
+      "the OS default disposition is in effect (core dumps enabled if `ulimit -c` allows)");
+    return;
+  }
+
   const char* log_dir = std::getenv("SIRIUS_LOG_DIR");
   if (log_dir != nullptr) {
     size_t dlen = strlen(log_dir);
@@ -143,12 +225,29 @@ void install_segfault_backtrace_handler()
       }
     }
   }
+  // Install an alternate signal stack so a stack-overflow SIGSEGV — which
+  // leaves no room on the normal stack — can still run the handler. Static
+  // storage so it outlives this function; sized generously since
+  // backtrace()/demangle() allocate on the heap, not here. Note: sigaltstack
+  // is per-thread, so this only covers stack-overflow crashes on the thread
+  // that called install (typically main). SIGABRT/SIGFPE/SIGILL do not exhaust
+  // the stack, so they are handled correctly on any thread regardless.
+  static std::array<char, 1 << 16> s_altstack;  // 64 KiB
+  stack_t ss{};
+  ss.ss_sp    = s_altstack.data();
+  ss.ss_size  = s_altstack.size();
+  ss.ss_flags = 0;
+  sigaltstack(&ss, nullptr);
+
   struct sigaction sa{};
   sa.sa_handler = segfault_handler;
   sigemptyset(&sa.sa_mask);
-  sa.sa_flags = SA_RESETHAND;
+  sa.sa_flags = SA_RESETHAND | SA_ONSTACK;
   sigaction(SIGSEGV, &sa, nullptr);
   sigaction(SIGBUS, &sa, nullptr);
+  sigaction(SIGABRT, &sa, nullptr);
+  sigaction(SIGFPE, &sa, nullptr);
+  sigaction(SIGILL, &sa, nullptr);
 }
 
 }  // namespace util

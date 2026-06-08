@@ -17,14 +17,30 @@
 #pragma once
 
 #include "duckdb/common/vector.hpp"
-#include "expression/expression.hpp"
+#include "expression/aggregate_id.hpp"
+#include "expression/ast/node.hpp"
 
 #include <cudf/aggregation.hpp>
 
+#include <memory>
+#include <optional>
 #include <vector>
 
 namespace sirius {
 namespace op {
+
+/**
+ * @brief Map a simple Sirius aggregate_id to a single cuDF aggregation kind.
+ *
+ * Pure aggregate_id -> Kind mapping over the closed aggregate_id enum. DISTINCT is NOT an
+ * aggregate_id: COUNT(DISTINCT ...) is the `count` id with the distinct() modifier set, and is
+ * intercepted by the caller (COLLECT_SET path) before this helper runs — so there is no
+ * count_distinct case to add here.
+ *
+ * Returns std::nullopt for ids that do not map to a single merge-able cuDF kind: `avg`
+ * (decomposes into SUM + COUNT_VALID) and `first` (NTH_ELEMENT, handled by the caller).
+ */
+std::optional<cudf::aggregation::Kind> to_cudf_aggregation_kind(sirius::aggregate_id id);
 
 /**
  * @brief Mapping from one original DuckDB aggregate expression to its position(s) in the expanded
@@ -74,8 +90,8 @@ struct CudfAggregateDefinitions {
  * @throws std::runtime_error if an unsupported aggregate function is encountered
  */
 CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
-  const duckdb::vector<sirius::expression>& groups_p,
-  const duckdb::vector<sirius::expression>& expressions);
+  const duckdb::vector<std::unique_ptr<sirius::ast::node>>& groups_p,
+  const duckdb::vector<std::unique_ptr<sirius::ast::node>>& expressions);
 
 }  // namespace op
 }  // namespace sirius

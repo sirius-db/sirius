@@ -170,6 +170,7 @@ void sirius_engine::execute()
   auto future = sirius_ctx->get_task_scheduler().start_query();
   try {
     future.get();
+    sirius_ctx->get_task_scheduler().wait_for_completion();
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
     // Drain all in-flight GPU tasks before returning.  QueryEnd() will call
@@ -183,22 +184,6 @@ void sirius_engine::execute()
     sirius_ctx->get_task_scheduler().drain_after_error();
     throw;
   }
-  // Success path: drain task_creator + executors before returning.
-  // mark_completed() signals the future as soon as the result_collector
-  // pipeline finishes, but other pipelines may still be notifying downstream
-  // consumers (which push task_creation_requests referencing operator
-  // pointers in this engine). Once execute() returns, the engine is
-  // destroyed via sirius_active_query.reset() in cleanup_internal; any
-  // request popped after that point hits a use-after-free in
-  // task_creator::get_operator_for_next_task. Reproduces under multi-thread
-  // sort with many partitions (test "gpu_execution - order by multipartition")
-  // and across consecutive integration tests that share a SiriusContext.
-  // drain_after_error() interrupts + restarts task_creator and every executor,
-  // so leftover dispatch state from this query cannot bleed into the next.
-  // The pairing of stop_thread_pool() + start_thread_pool() now re-arms
-  // _task_creation_queue (see start_thread_pool: reactivate()), so the next
-  // query can enqueue requests cleanly.
-  sirius_ctx->get_task_scheduler().drain_after_error();
 
   // All tasks completed — operators and pipelines are still alive here.
   // Warn about any intermediate operators that were never finalized.
@@ -206,7 +191,7 @@ void sirius_engine::execute()
     for (const auto& pipeline : query->get_pipelines()) {
       for (const auto& op_ref : pipeline->get_operators()) {
         const auto& op = op_ref.get();
-        if (!op.finalized) {
+        if (!op.finalized.load()) {
           SIRIUS_LOG_WARN("[execute] operator '{}' (id={}) was not finalized",
                           op.get_name(),
                           op.get_operator_id());
@@ -354,7 +339,8 @@ void sirius_engine::prefetch_iceberg_delete_data(op::sirius_physical_operator& p
   if (gpu_ioctxs.empty()) {
     throw std::runtime_error(
       "[sirius_engine] read_iceberg_delete_data: SiriusContext has no GPU sirius_ioctxs "
-      "(kvikio path is forbidden).");
+      "(read_iceberg_delete_data routes through sirius_datasource and does not implement "
+      "a kvikio fallback).");
   }
   // Pick the lowest-numbered GPU id (deterministic ordering — get_gpu_ioctxs
   // returns an unordered_map, so use std::min_element rather than .begin()).
