@@ -54,7 +54,7 @@ cuda = "13"
 
 [feature.cuda13.dependencies]
 cuda-version = "13.2.*"
-libcudf = "26.04.*"
+libcudf = "26.06.*"
 
 [feature.cuda13.activation.env]
 # GPU architectures: Turing through Blackwell (75, 80, 86, 89, 90a, 100f, 120a, 120)
@@ -66,7 +66,7 @@ cuda = "12"
 
 [feature.cuda12.dependencies]
 cuda-version = "12.*"
-libcudf = "26.04.*"
+libcudf = "26.06.*"
 
 [feature.cuda12.activation.env]
 # GPU architectures: Turing through Hopper (75, 80, 86, 89, 90a)

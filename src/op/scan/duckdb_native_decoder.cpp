@@ -530,9 +530,11 @@ void batched_h2d(std::vector<void*> const& dst,
   std::size_t attrs_idx = 0;  // single attrs entry applies to all copies
 #if CUDART_VERSION < 13000
   std::size_t fail_idx = 0;
-  RMM_CUDA_TRY(cudaMemcpyBatchAsync(dst.data(),
-                                    src.data(),
-                                    size.data(),
+  // The CUDA 12.x batch API takes non-const pointers (it was made const-correct in 13.0).
+  // These arrays are read-only inputs to the copy, so casting away const is safe here.
+  RMM_CUDA_TRY(cudaMemcpyBatchAsync(const_cast<void**>(dst.data()),
+                                    const_cast<void**>(src.data()),
+                                    const_cast<std::size_t*>(size.data()),
                                     dst.size(),
                                     &attrs,
                                     &attrs_idx,
