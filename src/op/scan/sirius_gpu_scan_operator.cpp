@@ -49,8 +49,12 @@ void scan_operator_with_pinned_table_input::prepare_for_processing(
   // Convert host-tier cached batches onto the requested GPU memory space.
   // GPU-tier batches need no work — execute() consumes them directly.
   if (batch && requested_memory_space) {
-    auto ro = batch->to_read_only();
-    if (ro.get_data() && ro.get_current_tier() != ::cucascade::memory::Tier::GPU) {
+    bool needs_upload = false;
+    {
+      auto ro      = batch->to_read_only();
+      needs_upload = ro.get_data() && ro.get_current_tier() != ::cucascade::memory::Tier::GPU;
+    }
+    if (needs_upload) {
       auto& registry = ::sirius::converter_registry::get();
       auto mut       = batch->to_mutable();
       mut.convert_to<::cucascade::gpu_table_representation>(
