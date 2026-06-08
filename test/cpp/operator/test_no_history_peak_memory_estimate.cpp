@@ -18,8 +18,8 @@
 #include "expression/join_condition.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/sirius_physical_concat.hpp"
+#include "op/sirius_physical_iceberg_scan.hpp"
 #include "op/sirius_physical_operator.hpp"
-#include "op/sirius_physical_parquet_scan.hpp"
 #include "op/sirius_physical_partition.hpp"
 
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
@@ -186,15 +186,15 @@ TEST_CASE("partition no_history_peak_memory_estimate: many partitions returns by
 }
 
 // ---------------------------------------------------------------------------
-// sirius_physical_parquet_scan
+// sirius_physical_iceberg_scan
 // ---------------------------------------------------------------------------
 
-TEST_CASE("parquet scan no_history_peak_memory_estimate returns 8x bytes",
-          "[no_history_peak_memory_estimate][parquet_scan]")
+TEST_CASE("iceberg scan no_history_peak_memory_estimate returns 8x bytes",
+          "[no_history_peak_memory_estimate][iceberg_scan]")
 {
   // Constructed with all-empty/nullptr args; constructor body is a no-op when
   // table_filters is nullptr (skips filter-translation path entirely).
-  sirius_physical_parquet_scan scan{/*types=*/{},
+  sirius_physical_iceberg_scan scan{/*types=*/{},
                                     /*function=*/{},
                                     /*bind_data=*/nullptr,
                                     /*returned_types=*/{},
@@ -205,8 +205,7 @@ TEST_CASE("parquet scan no_history_peak_memory_estimate returns 8x bytes",
                                     /*estimated_cardinality=*/0,
                                     /*extra_info=*/{},
                                     /*parameters=*/{},
-                                    /*virtual_columns=*/{},
-                                    /*physical_table_scan=*/nullptr};
+                                    /*virtual_columns=*/{}};
 
   REQUIRE(scan.no_history_peak_memory_estimate({0, 0}) == 0);
   REQUIRE(scan.no_history_peak_memory_estimate({1, 100}) == 800);

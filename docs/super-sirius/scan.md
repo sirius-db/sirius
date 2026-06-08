@@ -9,19 +9,18 @@ Super Sirius supports five scan paths:
 | Path | Operator | Use Case | Data Flow |
 |------|----------|----------|-----------|
 | **DuckDB Scan** | `DUCKDB_SCAN` | General DuckDB-managed tables | DuckDB table function → column builders → `host_data_representation` |
-| **Parquet Scan** | `PARQUET_SCAN` | Legacy direct Parquet reading | Parquet byte ranges → `host_parquet_representation` |
 | **GPU Parquet Scan** | `GPU_PARQUET_SCAN` | Parquet file reading via the scan manager (local or S3) | `sirius_scan_manager` produces `parquet_scan_data` splits → GPU read |
 | **GPU DuckDB-Native Scan** | `GPU_DUCKDB_NATIVE_SCAN` | GPU-native `.duckdb` file reading | `sirius_scan_manager` walks per-row-group segment metadata → GPU decode |
 | **Iceberg Scan** | `ICEBERG_SCAN` | Apache Iceberg V1/V2/V3 tables | Parquet scan + GPU-accelerated delete filters |
 
-The DuckDB and legacy parquet paths funnel through `duckdb_scan_executor` and the data-repository infrastructure. The GPU parquet path is driven by `sirius_scan_manager` and a dedicated `split_provider` per scan operator (see [Scan Manager](#scan-manager)).
+The DuckDB path funnels through `duckdb_scan_executor` and the data-repository infrastructure. The GPU parquet path is driven by `sirius_scan_manager` and a dedicated `split_provider` per scan operator (see [Scan Manager](#scan-manager)). Iceberg reuses the legacy parquet task machinery because delete filtering still hooks into post-conversion table batches.
 
 ## Scan Operators
 
 ### `sirius_physical_table_scan`
 **File:** `src/include/op/sirius_physical_table_scan.hpp`
 
-Base scan operator wrapping a DuckDB table function. During pipeline construction (`initialize_internal()`), it is converted to either DUCKDB_SCAN or PARQUET_SCAN based on the table function bind data.
+Base scan operator wrapping a DuckDB table function. During pipeline construction (`initialize_internal()`), it is converted to DUCKDB_SCAN, ICEBERG_SCAN, or GPU_PARQUET_SCAN based on the table function bind data.
 
 Key members:
 - `function` — DuckDB `TableFunction`
@@ -36,19 +35,10 @@ Key members:
 
 Sequential scan using DuckDB's execution engine. Tracks an atomic `exhausted` flag. The `scanned_types` vector defines the column types for building output batches.
 
-### `sirius_physical_parquet_scan`
-**File:** `src/include/op/sirius_physical_parquet_scan.hpp`
-
-Direct Parquet file scan. Maintains:
-- `scanned_ids` — mapping of projection IDs to file column indices
-- `has_more_partitions` — atomic flag for pipeline completion
-- Row groups are partitioned by `approximate_batch_size` in the global state
-
 ### `sirius_physical_iceberg_scan`
 **File:** `src/include/op/sirius_physical_iceberg_scan.hpp`
 
-Iceberg table scan. Inherits from `sirius_physical_parquet_scan`. Holds delete file lists (`positional_delete_files`, `equality_delete_files`) and routes through the GPU parquet scan pipeline with a post-convert delete filter hook. See [Iceberg Scan](#iceberg-scan) below.
-
+Iceberg table scan. Holds delete file lists (`positional_delete_files`, `equality_delete_files`) and routes through the GPU parquet scan pipeline with a post-convert delete filter hook. See [Iceberg Scan](#iceberg-scan) below.
 ### `sirius_gpu_parquet_scan_operator` — `GPU_PARQUET_SCAN`
 **File:** `src/include/op/scan/sirius_gpu_parquet_scan_operator.hpp`
 
@@ -464,8 +454,7 @@ When the GPU parquet scan applies filter+projection via the cuDF reader (passthr
 
 **File:** `src/include/op/sirius_physical_iceberg_scan.hpp`, `src/op/scan/iceberg_scan_task.cpp`
 
-`sirius_physical_iceberg_scan` inherits from `sirius_physical_parquet_scan` and adds support for Iceberg V1, V2, and V3 tables.
-
+`sirius_physical_iceberg_scan` adds support for Iceberg V1, V2, and V3 tables.
 ### Supported Iceberg Features
 
 | Version | Feature | Implementation |

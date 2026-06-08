@@ -34,7 +34,6 @@
 #include "op/sirius_physical_merge_sort.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "op/sirius_physical_order.hpp"
-#include "op/sirius_physical_parquet_scan.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_result_collector.hpp"
 #include "op/sirius_physical_sort_partition.hpp"
@@ -206,22 +205,7 @@ duckdb::unique_ptr<op::sirius_physical_operator> sirius_engine::construct_sirius
 {
   if (op->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
     auto& scan_physical_op = op->Cast<op::sirius_physical_table_scan>();
-    if (scan_physical_op.function.name == "parquet_scan" ||
-        scan_physical_op.function.name == "read_parquet") {
-      // Gather the configured GPU device ids so the parquet-scan op can build
-      // one translated filter tree per GPU (scalars end up on the right device
-      // for each task's dispatch target). Falls back to the current device if
-      // SiriusContext is not yet registered.
-      std::vector<int> gpu_device_ids;
-      auto ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-      if (ctx != nullptr) {
-        for (auto const& kv : ctx->get_gpu_ioctxs()) {
-          gpu_device_ids.push_back(kv.first);
-        }
-      }
-      return duckdb::make_uniq<op::sirius_physical_parquet_scan>(&scan_physical_op,
-                                                                 std::move(gpu_device_ids));
-    } else if (scan_physical_op.function.name == "iceberg_scan") {
+    if (scan_physical_op.function.name == "iceberg_scan") {
       return construct_iceberg_scan_operator(scan_physical_op);
     } else if (scan_physical_op.function.name == "seq_scan") {
       return duckdb::make_uniq<op::sirius_physical_duckdb_scan>(&scan_physical_op);

@@ -128,7 +128,7 @@ iceberg_scan_task_global_state::iceberg_scan_task_global_state(
   size_t approximate_batch_size,
   std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs)
   : parquet_scan_task_global_state(std::move(pipeline),
-                                   static_cast<sirius_physical_parquet_scan*>(scan_op),
+                                   scan_op,
                                    std::move(init.file_paths),
                                    std::move(init.selected_column_indices),
                                    approximate_batch_size,

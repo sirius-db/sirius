@@ -166,7 +166,6 @@ What this PR adds:
 
 - `sirius_physical_plan_generator::dynamic_filter_channels` map (the router)
 - `sirius_physical_table_scan::sirius_dynamic_filters` field (consumer endpoint)
-- `sirius_physical_parquet_scan::sirius_dynamic_filters` field (consumer endpoint, propagated from table_scan)
 - `sirius_physical_hash_join::probe_target` struct + `probe_targets` vector (producer endpoint)
 - Plan-gen wiring in `sirius_plan_get.cpp` and `sirius_plan_comparison_join.cpp`
 - Producer-side push in `sirius_physical_hash_join::finalize_operator()`: `cudf::reduce` to compute global (min, max) per join key, emit a single-zone `sirius_dynamic_zone_map_filter`, push into each probe target's channel

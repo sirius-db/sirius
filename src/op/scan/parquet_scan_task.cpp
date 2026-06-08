@@ -25,7 +25,7 @@
 #include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
 #include <op/scan/parquet_scan_task.hpp>
-#include <op/sirius_physical_parquet_scan.hpp>
+#include <op/sirius_physical_iceberg_scan.hpp>
 #include <pipeline/sirius_pipeline.hpp>
 // Include uring_reactor LAST among sirius headers — liburing.h transitively
 // pulled by uring_reactor.hpp defines a BLOCK_SIZE macro that collides with
@@ -218,27 +218,27 @@ std::vector<byte_range_info> merge_byte_ranges(std::vector<byte_range_info> cons
 //===----------------------------------------------------------------------===//
 parquet_scan_task_global_state::parquet_scan_task_global_state(
   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
-  sirius_physical_parquet_scan* scan_op,
+  sirius_physical_iceberg_scan* iceberg_scan_op,
   std::size_t approximate_batch_size,
   std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs)
   : pipeline::sirius_pipeline_task_global_state(pipeline),
     _approximate_batch_size(approximate_batch_size),
-    _scan_op(scan_op),
+    _iceberg_scan_op(iceberg_scan_op),
     _gpu_ioctxs(std::move(gpu_ioctxs))
 {
-  if (scan_op->function.in_out_function) {
+  if (iceberg_scan_op->function.in_out_function) {
     throw std::runtime_error(
       "[parquet_scan_task_global_state] In-out table functions are not supported in sirius "
       "parquet scans.");
   }
-  if (scan_op->dynamic_filters) {
+  if (iceberg_scan_op->dynamic_filters) {
     throw std::runtime_error(
       "[parquet_scan_task_global_state] Dynamic table filters are not supported in sirius "
       "parquet scans.");
   }
 
   // Expect parquet_scan to be bound through the multi-file reader
-  auto& bind_data = scan_op->bind_data->Cast<duckdb::MultiFileBindData>();
+  auto& bind_data = iceberg_scan_op->bind_data->Cast<duckdb::MultiFileBindData>();
   if (!bind_data.file_list || bind_data.file_list->IsEmpty()) {
     throw std::runtime_error("[parquet_scan_task_global_state] No input files to scan");
   }
@@ -253,7 +253,7 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
   // Build selected column indices, then drop any hive partition columns (they are injected
   // post-read from the directory path, not read from the parquet file itself).
   _selected_column_indices =
-    detail::make_selected_column_indices(scan_op->column_ids, scan_op->projection_ids);
+    detail::make_selected_column_indices(iceberg_scan_op->column_ids, iceberg_scan_op->projection_ids);
   if (!_hive_partition_index_set.empty()) {
     _selected_column_indices.erase(
       std::remove_if(_selected_column_indices.begin(),
@@ -270,7 +270,7 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
   initialize_from_files();
 
   // Build partition injection function if this scan has partition columns.
-  init_hive_partitions(bind_data, scan_op);
+  init_hive_partitions(bind_data, iceberg_scan_op);
 }
 
 // Protected constructor: caller supplies pre-resolved file paths and column indices.
@@ -278,14 +278,14 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
 // constructor (footer reads, metadata parsing, row-group partitioning).
 parquet_scan_task_global_state::parquet_scan_task_global_state(
   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
-  sirius_physical_parquet_scan* scan_op,
+  sirius_physical_iceberg_scan* scan_op,
   std::vector<std::string> file_paths,
   std::vector<size_t> selected_column_indices,
   std::size_t approximate_batch_size,
   std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs)
   : pipeline::sirius_pipeline_task_global_state(pipeline),
     _approximate_batch_size(approximate_batch_size),
-    _scan_op(scan_op),
+    _iceberg_scan_op(scan_op),
     _selected_column_indices(std::move(selected_column_indices)),
     _file_paths(std::move(file_paths)),
     _gpu_ioctxs(std::move(gpu_ioctxs))
@@ -368,10 +368,10 @@ void parquet_scan_task_global_state::initialize_from_files()
   _reader_options = cudf::io::parquet_reader_options::builder().build();
 
   // If filtering or projecting, we need column names
-  bool const do_filter    = !_scan_op->translated_filter_by_device.empty();
-  bool const is_projected = !_scan_op->projection_ids.empty();
+  bool const do_filter    = !_iceberg_scan_op->translated_filter_by_device.empty();
+  bool const is_projected = !_iceberg_scan_op->projection_ids.empty();
   if (do_filter || is_projected) {
-    if (_scan_op->names.empty()) {
+    if (_iceberg_scan_op->names.empty()) {
       throw std::runtime_error(
         "[parquet_scan_task_global_state] Cannot apply filter or projection: scan has no column "
         "names");
@@ -403,7 +403,7 @@ void parquet_scan_task_global_state::initialize_from_files()
   // Detected partition columns are removed from _selected_column_indices and
   // recorded in _hive_partition_columns for injection after GPU read.
   // -----------------------------------------------------------------------
-  if (!_file_metadatas.empty() && !_selected_column_indices.empty() && !_scan_op->names.empty()) {
+  if (!_file_metadatas.empty() && !_selected_column_indices.empty() && !_iceberg_scan_op->names.empty()) {
     std::unordered_set<std::string> union_parquet_col_names;
     for (auto const& meta : _file_metadatas) {
       for (size_t i = 1; i < meta.schema.size(); ++i) {
@@ -416,11 +416,11 @@ void parquet_scan_task_global_state::initialize_from_files()
     std::vector<size_t> filtered_indices;
     filtered_indices.reserve(_selected_column_indices.size());
     for (auto idx : _selected_column_indices) {
-      if (idx < _scan_op->names.size() && union_parquet_col_names.count(_scan_op->names[idx])) {
+      if (idx < _iceberg_scan_op->names.size() && union_parquet_col_names.count(_iceberg_scan_op->names[idx])) {
         filtered_indices.push_back(idx);
-      } else if (idx < _scan_op->names.size()) {
+      } else if (idx < _iceberg_scan_op->names.size()) {
         _hive_partition_index_set.insert(idx);
-        _hive_partition_columns.push_back(hive_partition_column{_scan_op->names[idx], idx});
+        _hive_partition_columns.push_back(hive_partition_column{_iceberg_scan_op->names[idx], idx});
         SIRIUS_LOG_DEBUG(
           "[parquet_scan] Column '{}' (idx={}) not in any parquet file — "
           "treating as partition column.",
@@ -438,7 +438,7 @@ void parquet_scan_task_global_state::initialize_from_files()
   // Build per-file column sets and detect schema evolution (columns missing
   // from SOME but not ALL files). If detected, populate _per_file_column_names
   // for the schema reconciliation injection function.
-  if (_file_metadatas.size() > 1 && !_selected_column_indices.empty() && !_scan_op->names.empty()) {
+  if (_file_metadatas.size() > 1 && !_selected_column_indices.empty() && !_iceberg_scan_op->names.empty()) {
     std::vector<std::unordered_set<std::string>> per_file_cols(_file_metadatas.size());
     for (size_t f = 0; f < _file_metadatas.size(); ++f) {
       for (size_t i = 1; i < _file_metadatas[f].schema.size(); ++i) {
@@ -451,7 +451,7 @@ void parquet_scan_task_global_state::initialize_from_files()
     bool has_schema_evolution = false;
     for (size_t f = 0; f < per_file_cols.size() && !has_schema_evolution; ++f) {
       for (auto idx : _selected_column_indices) {
-        if (idx < _scan_op->names.size() && !per_file_cols[f].count(_scan_op->names[idx])) {
+        if (idx < _iceberg_scan_op->names.size() && !per_file_cols[f].count(_iceberg_scan_op->names[idx])) {
           has_schema_evolution = true;
           break;
         }
@@ -461,8 +461,8 @@ void parquet_scan_task_global_state::initialize_from_files()
       _per_file_column_names.resize(_file_metadatas.size());
       for (size_t f = 0; f < _file_metadatas.size(); ++f) {
         for (auto idx : _selected_column_indices) {
-          if (idx < _scan_op->names.size()) {
-            auto const& name = _scan_op->names[idx];
+          if (idx < _iceberg_scan_op->names.size()) {
+            auto const& name = _iceberg_scan_op->names[idx];
             if (per_file_cols[f].count(name)) { _per_file_column_names[f].push_back(name); }
           }
         }
@@ -476,15 +476,15 @@ void parquet_scan_task_global_state::initialize_from_files()
   std::unordered_set<std::size_t> pure_filter_column_indices;
   std::vector<std::string> projected_column_names;
   bool selected_row_count_carrier = false;
-  if (_selected_column_indices.empty() && !_file_metadatas.empty() && !_scan_op->names.empty()) {
+  if (_selected_column_indices.empty() && !_file_metadatas.empty() && !_iceberg_scan_op->names.empty()) {
     auto const& first_meta = _file_metadatas[0];
     for (size_t i = 1; i < first_meta.schema.size(); ++i) {
       if (first_meta.schema[i].num_children != 0) { continue; }
       auto const& leaf_name = first_meta.schema[i].name;
-      auto it               = std::find(_scan_op->names.begin(), _scan_op->names.end(), leaf_name);
-      if (it == _scan_op->names.end()) { continue; }
+      auto it               = std::find(_iceberg_scan_op->names.begin(), _iceberg_scan_op->names.end(), leaf_name);
+      if (it == _iceberg_scan_op->names.end()) { continue; }
 
-      auto const duckdb_idx = static_cast<size_t>(std::distance(_scan_op->names.begin(), it));
+      auto const duckdb_idx = static_cast<size_t>(std::distance(_iceberg_scan_op->names.begin(), it));
       _selected_column_indices.push_back(duckdb_idx);
       projected_column_names.push_back(leaf_name);
       selected_row_count_carrier = true;
@@ -503,7 +503,7 @@ void parquet_scan_task_global_state::initialize_from_files()
       std::for_each(_selected_column_indices.begin(),
                     _selected_column_indices.end(),
                     [this, &projected_column_names](std::size_t col_idx) {
-                      projected_column_names.push_back(_scan_op->names[col_idx]);
+                      projected_column_names.push_back(_iceberg_scan_op->names[col_idx]);
                     });
     }
 #if CUDF_VERSION_NUM >= 2604
@@ -514,14 +514,14 @@ void parquet_scan_task_global_state::initialize_from_files()
     // We only prune the pure filter columns from the projected set when the reader performs the
     // filter. Otherwise, the expression executor will not find the filter columns.
     if (do_filter) {
-      _post_filter_projection_ids.reserve(_scan_op->types.size());
-      for (std::size_t i = 0; i < _scan_op->projection_ids.size(); i++) {
-        if (i < _scan_op->types.size()) {
-          _post_filter_projection_ids.push_back(_scan_op->projection_ids[i]);
+      _post_filter_projection_ids.reserve(_iceberg_scan_op->types.size());
+      for (std::size_t i = 0; i < _iceberg_scan_op->projection_ids.size(); i++) {
+        if (i < _iceberg_scan_op->types.size()) {
+          _post_filter_projection_ids.push_back(_iceberg_scan_op->projection_ids[i]);
         } else {
           // This is a pure filter column that is not among the expected output columns.
-          auto const projection_id = _scan_op->projection_ids[i];
-          pure_filter_column_indices.insert(_scan_op->column_ids[projection_id].GetPrimaryIndex());
+          auto const projection_id = _iceberg_scan_op->projection_ids[i];
+          pure_filter_column_indices.insert(_iceberg_scan_op->column_ids[projection_id].GetPrimaryIndex());
         }
       }
     }
@@ -539,7 +539,7 @@ void parquet_scan_task_global_state::initialize_from_files()
     // copy under target_device_raii.
     _translated_filter_by_device =
       std::make_shared<std::unordered_map<int, gpu_expression_translator::translated_expression>>(
-        std::move(_scan_op->translated_filter_by_device));
+        std::move(_iceberg_scan_op->translated_filter_by_device));
   }
 
   // Verify projected columns are flat (we don't support nested projections yet).
@@ -622,8 +622,8 @@ void parquet_scan_task_global_state::initialize_from_files()
         }
       }
       for (auto duckdb_idx : _selected_column_indices) {
-        if (duckdb_idx < _scan_op->names.size()) {
-          auto it = name_to_pq_idx.find(_scan_op->names[duckdb_idx]);
+        if (duckdb_idx < _iceberg_scan_op->names.size()) {
+          auto it = name_to_pq_idx.find(_iceberg_scan_op->names[duckdb_idx]);
           if (it != name_to_pq_idx.end()) {
             parquet_col_indices.push_back(it->second);
             if (pure_filter_column_indices.count(duckdb_idx)) {
@@ -678,7 +678,7 @@ void parquet_scan_task_global_state::initialize_from_files()
 }
 
 void parquet_scan_task_global_state::init_hive_partitions(
-  duckdb::MultiFileBindData const& bind_data, sirius_physical_parquet_scan* scan_op)
+  duckdb::MultiFileBindData const& bind_data, sirius_physical_iceberg_scan* scan_op)
 {
   // Populate metadata from DuckDB's hive_partitioning_indexes if not already
   // populated (e.g. by the public constructor or by schema-based detection).
@@ -700,7 +700,7 @@ void parquet_scan_task_global_state::init_hive_partitions(
 }
 
 void parquet_scan_task_global_state::build_schema_reconciliation(
-  sirius_physical_parquet_scan* scan_op)
+  sirius_physical_iceberg_scan* scan_op)
 {
   // Builds a UNIFIED inject fn that handles:
   //   1. Hive partition columns (always from file path)

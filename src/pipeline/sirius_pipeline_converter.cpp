@@ -40,7 +40,6 @@
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "op/sirius_physical_order.hpp"
-#include "op/sirius_physical_parquet_scan.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_result_collector.hpp"
 #include "op/sirius_physical_sort_partition.hpp"
@@ -65,11 +64,7 @@ duckdb::unique_ptr<op::sirius_physical_operator> construct_sirius_specific_opera
 {
   if (physical_op.type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
     auto& scan_physical_op = physical_op.Cast<op::sirius_physical_table_scan>();
-    if (scan_physical_op.function.name == "parquet_scan" ||
-        scan_physical_op.function.name == "read_parquet" ||
-        scan_physical_op.function.name == "sirius_read_parquet") {
-      return duckdb::make_uniq<op::sirius_physical_parquet_scan>(&scan_physical_op);
-    } else if (scan_physical_op.function.name == "iceberg_scan") {
+    if (scan_physical_op.function.name == "iceberg_scan") {
       if (!iceberg_cache) {
         throw duckdb::InternalException(
           "iceberg_cache must be provided when constructing iceberg scan operators");
@@ -943,7 +938,7 @@ void sirius_pipeline_converter::split_pipelines(
     split_table_scan_source(current_pipeline);
 
     // Preprocessing: split COLUMN_DATA_SCAN/EMPTY_RESULT/DUMMY_SCAN sources
-    // into a CPU_SOURCE scan pipeline (analogous to TABLE_SCAN → PARQUET_SCAN).
+    // into a CPU_SOURCE scan pipeline.
     split_cpu_source(current_pipeline);
 
     // Preprocessing: split intermediate joins (modifies current_pipeline in place)

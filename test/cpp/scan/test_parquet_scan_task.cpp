@@ -25,7 +25,7 @@
 #include <helper/logical_type.hpp>
 #include <helper/type_conversions.hpp>
 #include <op/scan/parquet_scan_task.hpp>
-#include <op/sirius_physical_parquet_scan.hpp>
+#include <op/sirius_physical_iceberg_scan.hpp>
 #include <parallel/task_executor.hpp>
 #include <scan_manager/split_connector.hpp>
 
@@ -117,7 +117,7 @@ class scan_test_executor : public sirius::parallel::itask_executor {
 // reuse the same helper. Uses sirius::scan_test_utils::make_test_gpu_ioctxs.
 using sirius::scan_test_utils::make_test_gpu_ioctxs;
 
-static std::unique_ptr<sirius::op::sirius_physical_parquet_scan> make_parquet_scan(
+static std::unique_ptr<sirius::op::sirius_physical_iceberg_scan> make_parquet_scan(
   duckdb::ClientContext& ctx,
   std::string const& parquet_path,
   duckdb::vector<duckdb::idx_t> const& projection_indices  = {},
@@ -225,7 +225,7 @@ static std::unique_ptr<sirius::op::sirius_physical_parquet_scan> make_parquet_sc
     }
   }
 
-  return std::make_unique<sirius::op::sirius_physical_parquet_scan>(
+  return std::make_unique<sirius::op::sirius_physical_iceberg_scan>(
     sirius::from_duckdb_vec(output_types),
     table_function,
     std::move(bind_data),
@@ -237,8 +237,7 @@ static std::unique_ptr<sirius::op::sirius_physical_parquet_scan> make_parquet_sc
     0,
     std::move(extra_info),
     duckdb::vector<duckdb::Value>(),
-    std::move(virtual_columns),
-    nullptr);
+    std::move(virtual_columns));
 }
 
 static duckdb::unique_ptr<duckdb::TableFilterSet> make_id_constant_filter(

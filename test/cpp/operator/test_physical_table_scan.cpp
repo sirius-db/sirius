@@ -24,7 +24,7 @@
 #include <duckdb/function/table_function.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/table_filter.hpp>
-#include <op/sirius_physical_parquet_scan.hpp>
+#include <op/sirius_physical_iceberg_scan.hpp>
 #include <op/sirius_physical_table_scan.hpp>
 
 using namespace duckdb;
@@ -341,7 +341,7 @@ TEST_CASE("sirius_physical_table_scan filters all rows", "[physical_table_scan]"
   REQUIRE(view.num_rows() == 0);
 }
 
-TEST_CASE("parquet_scan with translatable filter sets table_scan passthrough",
+TEST_CASE("iceberg_scan with translatable filter sets table_scan passthrough",
           "[physical_table_scan][passthrough]")
 {
   auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
@@ -391,12 +391,12 @@ TEST_CASE("parquet_scan with translatable filter sets table_scan passthrough",
                                         std::move(parameters),
                                         std::move(virtual_columns));
 
-  // Construct parquet_scan from table_scan — triggers filter translation
-  sirius_physical_parquet_scan parquet_scan(&table_scan);
+  // Construct iceberg_scan from table_scan — triggers filter translation
+  sirius_physical_iceberg_scan iceberg_scan(&table_scan);
 
   // INT64 > 3 should translate successfully
   REQUIRE(table_scan.passthrough == true);
-  REQUIRE(!parquet_scan.translated_filter_by_device.empty());
+  REQUIRE(!iceberg_scan.translated_filter_by_device.empty());
   REQUIRE(table_scan.filter_expr != nullptr);
 
   // In passthrough mode, execute() returns input data unchanged
@@ -414,7 +414,7 @@ TEST_CASE("parquet_scan with translatable filter sets table_scan passthrough",
   REQUIRE(host_data == data_vals);
 }
 
-TEST_CASE("parquet_scan with decimal filter sets table_scan passthrough",
+TEST_CASE("iceberg_scan with decimal filter sets table_scan passthrough",
           "[physical_table_scan][passthrough]")
 {
   auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
@@ -495,12 +495,12 @@ TEST_CASE("parquet_scan with decimal filter sets table_scan passthrough",
                                         std::move(parameters),
                                         std::move(virtual_columns));
 
-  // Construct parquet_scan from table_scan — triggers filter translation
-  sirius_physical_parquet_scan parquet_scan(&table_scan);
+  // Construct iceberg_scan from table_scan — triggers filter translation
+  sirius_physical_iceberg_scan iceberg_scan(&table_scan);
 
   // DECIMAL64 > 3.00 should translate successfully
   REQUIRE(table_scan.passthrough == true);
-  REQUIRE(!parquet_scan.translated_filter_by_device.empty());
+  REQUIRE(!iceberg_scan.translated_filter_by_device.empty());
   REQUIRE(table_scan.filter_expr != nullptr);
 
   // In passthrough mode, execute() returns input data unchanged

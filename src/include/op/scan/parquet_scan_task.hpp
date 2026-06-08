@@ -21,7 +21,7 @@
 #include <data/host_parquet_representation.hpp>
 #include <memory/multiple_blocks_allocation_accessor.hpp>
 #include <op/scan/hive_partition.hpp>
-#include <op/sirius_physical_parquet_scan.hpp>
+#include <op/sirius_physical_iceberg_scan.hpp>
 #include <op/sirius_physical_table_scan.hpp>
 #include <pipeline/sirius_pipeline_itask.hpp>
 #include <pipeline/sirius_pipeline_task_states.hpp>
@@ -130,7 +130,7 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    * @brief Construct the global state for the parquet scan task.
    *
    * @param[in] pipeline The pipeline associated with this task
-   * @param[in] scan_op The physical table scan operator
+   * @param[in] iceberg_scan_op The physical table scan operator
    * @param[in] approximate_batch_size The target approximate batch size for the scan tasks
    * @param[in] gpu_ioctxs Per-GPU sirius_ioctx instances indexed by device_id.
    *            Seeded by task_creator from SiriusContext::get_gpu_ioctxs().
@@ -139,17 +139,17 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    */
   parquet_scan_task_global_state(
     duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
-    sirius_physical_parquet_scan* scan_op,
+    sirius_physical_iceberg_scan* iceberg_scan_op,
     std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE,
     std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs = {});
 
   //===----------Methods----------===//
   /**
-   * @brief Get the physical parquet scan operator associated with this global state.
+   * @brief Get the physical Iceberg scan operator associated with this global state.
    *
-   * @return A reference to the physical parquet scan operator.
+   * @return A reference to the physical Iceberg scan operator.
    */
-  [[nodiscard]] sirius_physical_parquet_scan& get_operator() { return *_scan_op; }
+  [[nodiscard]] sirius_physical_iceberg_scan& get_operator() { return *_iceberg_scan_op; }
 
   /**
    * @brief Get the file path of the Parquet file to scan.
@@ -247,13 +247,13 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    * and the partition counter are updated.
    */
   void rebind(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
-              sirius_physical_parquet_scan* scan_op)
+              sirius_physical_iceberg_scan* iceberg_scan_op)
   {
     set_pipeline(std::move(pipeline));
-    _scan_op = scan_op;
+    _iceberg_scan_op = iceberg_scan_op;
     _next_rg_partition.store(0, std::memory_order_relaxed);
-    scan_op->has_more_partitions.store(true, std::memory_order_relaxed);
-    scan_op->exhausted.store(false, std::memory_order_relaxed);
+    iceberg_scan_op->has_more_partitions.store(true, std::memory_order_relaxed);
+    iceberg_scan_op->exhausted.store(false, std::memory_order_relaxed);
   }
 
   /**
@@ -433,7 +433,7 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    * subclass constructor. Safe to call after base construction.
    */
   void init_hive_partitions(duckdb::MultiFileBindData const& bind_data,
-                            sirius_physical_parquet_scan* scan_op);
+                            sirius_physical_iceberg_scan* iceberg_scan_op);
 
   /**
    * @brief Detect missing/schema-evolution columns and set up per-file projection.
@@ -444,7 +444,7 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    *
    * Called from both constructors after file metadata is available.
    */
-  void detect_columns_and_apply_projection(sirius_physical_parquet_scan* scan_op);
+  void detect_columns_and_apply_projection(sirius_physical_iceberg_scan* iceberg_scan_op);
 
   /**
    * @brief Build a schema reconciliation function for schema evolution.
@@ -455,7 +455,7 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    *
    * Must be called AFTER init_hive_partitions (chains with any existing inject fn).
    */
-  void build_schema_reconciliation(sirius_physical_parquet_scan* scan_op);
+  void build_schema_reconciliation(sirius_physical_iceberg_scan* iceberg_scan_op);
 
  protected:
   /**
@@ -470,7 +470,7 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    * delete files before constructing the base state.
    *
    * @param pipeline                The pipeline for this scan.
-   * @param scan_op                 The physical scan operator (provides column
+   * @param iceberg_scan_op         The physical iceberg scan operator (provides column
    *                                names for projection, exhausted flag, etc.).
    * @param file_paths              Pre-filtered list of DATA-file paths only.
    * @param selected_column_indices Column indices to read (may be widened for
@@ -481,7 +481,7 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    */
   parquet_scan_task_global_state(
     duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
-    sirius_physical_parquet_scan* scan_op,
+    sirius_physical_iceberg_scan* iceberg_scan_op,
     std::vector<std::string> file_paths,
     std::vector<size_t> selected_column_indices,
     std::size_t approximate_batch_size,
@@ -498,7 +498,7 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
 
   //===----------Fields----------===//
   std::size_t _approximate_batch_size;     ///< Target approximate batch size for scan tasks
-  sirius_physical_parquet_scan* _scan_op;  ///< The physical parquet scan operator being executed
+  sirius_physical_iceberg_scan* _iceberg_scan_op;  ///< The physical Iceberg scan operator being executed
 
   /// DuckDB primary indices of data-only columns to read, in cudf table order.
   /// Hive partition columns are excluded.

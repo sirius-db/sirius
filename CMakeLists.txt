@@ -238,7 +238,6 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_operator_type.cpp
     src/op/sirius_physical_order.cpp
     src/op/sirius_physical_iceberg_scan.cpp
-    src/op/sirius_physical_parquet_scan.cpp
     src/op/sirius_physical_partition.cpp
     src/op/sirius_physical_partition_consumer_operator.cpp
     src/op/sirius_physical_projection.cpp

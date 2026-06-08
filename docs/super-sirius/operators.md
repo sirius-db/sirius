@@ -41,22 +41,17 @@ These operators produce data for pipelines. See [Scan](scan.md) for in-depth cov
 ### `sirius_physical_table_scan` — `TABLE_SCAN`
 **File:** `src/include/op/sirius_physical_table_scan.hpp`
 
-Base scan operator wrapping a DuckDB table function. Stores column IDs, projection IDs, and optional table filters for predicate pushdown. During pipeline construction, converted to either DUCKDB_SCAN or PARQUET_SCAN.
+Base scan operator wrapping a DuckDB table function. Stores column IDs, projection IDs, and optional table filters for predicate pushdown. During pipeline construction, converted to DUCKDB_SCAN, ICEBERG_SCAN, or GPU_PARQUET_SCAN.
 
 ### `sirius_physical_duckdb_scan` — `DUCKDB_SCAN`
 **File:** `src/include/op/sirius_physical_duckdb_scan.hpp`
 
 Sequential scan using DuckDB's execution engine. Accumulates chunks into fixed-size batches via column builders. Tracks an atomic `exhausted` flag for pipeline completion.
 
-### `sirius_physical_parquet_scan` — `PARQUET_SCAN`
-**File:** `src/include/op/sirius_physical_parquet_scan.hpp`
-
-Direct Parquet file scan. Reads column-chunk byte ranges and optionally materializes (decompresses) to table format. Tracks `has_more_partitions` atomic flag. Row groups are partitioned by `approximate_batch_size`.
-
 ### `sirius_physical_iceberg_scan` — `ICEBERG_SCAN`
 **File:** `src/include/op/sirius_physical_iceberg_scan.hpp`
 
-Apache Iceberg table scan with GPU-accelerated delete filters. Inherits from `sirius_physical_parquet_scan` since Iceberg uses Parquet as the data layer. Supports Iceberg V1 (append-only), V2 (positional and equality deletes, including heterogeneous equality-delete schemas), and V3 (deletion vectors via PUFFIN files). Handles schema evolution, snapshot time-travel, and partition evolution.
+Apache Iceberg table scan with GPU-accelerated delete filters. Supports Iceberg V1 (append-only), V2 (positional and equality deletes, including heterogeneous equality-delete schemas), and V3 (deletion vectors via PUFFIN files). Handles schema evolution, snapshot time-travel, and partition evolution.
 
 - **Delete filter pipeline:** Composes `positional_delete_filter`, `equality_delete_filter` (per-key-schema groups, sequence-scoped), and a deletion-vector filter for V3 to apply deletes entirely on GPU with no D2H copies
 - **Metadata:** Manifest discovery delegates to DuckDB's `iceberg_metadata()`; the custom `iceberg_avro_reader` is the fallback for V3 deletion-vector PUFFIN files

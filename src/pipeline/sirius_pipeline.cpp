@@ -26,7 +26,6 @@
 #include "op/sirius_physical_duckdb_scan.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_iceberg_scan.hpp"
-#include "op/sirius_physical_parquet_scan.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "sirius/exception.hpp"
 
@@ -386,8 +385,8 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
         end_nvtx_range_if_finished();
       }
     } else if (get_source()->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
-      auto& parquet_scan = static_cast<op::sirius_physical_parquet_scan&>(*get_source());
-      if (!parquet_scan.has_more_partitions.load()) {
+      auto& iceberg_scan = get_source()->Cast<op::sirius_physical_iceberg_scan>();
+      if (!iceberg_scan.has_more_partitions.load()) {
         if (tasks_created.load() == tasks_completed.load()) {
           pipeline_finished.store(true);
           for (auto& op : get_operators()) {
