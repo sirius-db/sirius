@@ -178,7 +178,13 @@ std::string rewrite_sirius_owned_remote_parquet_calls(std::string const& query)
     }
 
     auto const remaining = std::string_view(query).substr(i);
-    if ((i == 0 || !is_identifier_char(query[i - 1])) &&
+    // Left boundary: reject when the token continues an identifier (e.g.
+    // `xread_parquet`) *or* when it is schema/catalog-qualified (`main.read_parquet`,
+    // `cat.sch.read_parquet`). A qualifier dot binds tightly to the name that
+    // follows it and names a specific catalog object, which is not the
+    // Sirius-owned unqualified `read_parquet` — rewriting it would produce the
+    // unresolvable `main.sirius_read_parquet`.
+    if ((i == 0 || (!is_identifier_char(query[i - 1]) && query[i - 1] != '.')) &&
         iequals_prefix(remaining, NATIVE_READ_PARQUET_FN) &&
         (i + NATIVE_READ_PARQUET_FN.size() >= query.size() ||
          !is_identifier_char(query[i + NATIVE_READ_PARQUET_FN.size()])) &&

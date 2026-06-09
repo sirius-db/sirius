@@ -88,6 +88,10 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("thread_name_prefix", opt.thread_pool.thread_name_prefix);
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
   r.optional("use_sirius_datasource", opt.use_sirius_datasource);
+  // Reserved knobs: parsed and validated for forward compatibility, but not
+  // currently wired to the production uring_ioctx (SiriusContext scales the
+  // reactor pool with GPU count and hardcodes ring_entries=64). See
+  // scan_manager_config for details.
   r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("uring_ring_entries", opt.uring_ring_entries, yaml::greater_than<unsigned>{0});
   r.optional("enable_prefetch_cache", opt.enable_prefetch_cache);
