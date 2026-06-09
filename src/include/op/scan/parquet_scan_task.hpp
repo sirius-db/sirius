@@ -497,8 +497,9 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   void initialize_from_files();
 
   //===----------Fields----------===//
-  std::size_t _approximate_batch_size;     ///< Target approximate batch size for scan tasks
-  sirius_physical_iceberg_scan* _iceberg_scan_op;  ///< The physical Iceberg scan operator being executed
+  std::size_t _approximate_batch_size;  ///< Target approximate batch size for scan tasks
+  sirius_physical_iceberg_scan*
+    _iceberg_scan_op;  ///< The physical Iceberg scan operator being executed
 
   /// DuckDB primary indices of data-only columns to read, in cudf table order.
   /// Hive partition columns are excluded.

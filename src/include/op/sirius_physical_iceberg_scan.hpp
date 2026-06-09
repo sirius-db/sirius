@@ -41,8 +41,8 @@ namespace op {
 /**
  * @brief Physical operator for scanning Apache Iceberg tables on the GPU.
  *
-* Owns the scan machinery and the iceberg-specific additions are the delete file lists for V2
-* row-level delete support.
+ * Owns the scan machinery and the iceberg-specific additions are the delete file lists for V2
+ * row-level delete support.
  *
  * For V1 Iceberg tables (append-only), positional_delete_files and
  * equality_delete_files are both empty and execution is identical to a plain

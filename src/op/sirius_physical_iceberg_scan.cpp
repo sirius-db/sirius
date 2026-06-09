@@ -109,7 +109,7 @@ sirius_physical_iceberg_scan::sirius_physical_iceberg_scan(
     // empty partition index set instead of reinterpret-casting through the wrong type.
     std::unordered_set<std::size_t> hive_partition_primary_indices;
     if (auto const* multi_file_bind =
-           dynamic_cast<duckdb::MultiFileBindData const*>(bind_data.get())) {
+          dynamic_cast<duckdb::MultiFileBindData const*>(bind_data.get())) {
       for (auto const& hpi : multi_file_bind->reader_bind.hive_partitioning_indexes) {
         hive_partition_primary_indices.insert(hpi.index);
       }
