@@ -32,6 +32,8 @@ wait -n "${fe_pid}" "${cn_pid}"
 """,cwd = ".",depends-on = ["fe-build","cn-build"],description = "Run the local StarRocks FE and Rust CN in the foreground with logs"}
 
 [feature.cn.dependencies]
+# Provides protoc for prost-build in the Substrait crates on fresh CN envs.
+libprotobuf = ">=7.35,<8"
 rust = "*"
 thrift-compiler = "*"
 

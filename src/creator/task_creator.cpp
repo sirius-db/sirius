@@ -22,8 +22,8 @@
 #include "op/scan/duckdb_scan_executor.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
 #include "op/scan/iceberg_scan_task.hpp"
-#include "op/scan/parquet_scan_operator_data.hpp"
 #include "op/scan/parquet_scan_task.hpp"
+#include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
 #include "op/sirius_physical_iceberg_scan.hpp"
@@ -512,17 +512,18 @@ void task_creator::manager_loop()
                   host_bytes.size(),
                   preferred_device_id.value_or(-1));
               }
-              // Cached-scan locality: scan_cached_operator_data is NOT a
-              // pipelineable_operator_data (see parquet_scan_operator_data.hpp),
-              // so the data-locality block above skipped it wholesale. Without
-              // this branch, every pinned-table scan task gets dispatched
-              // round-robin by the scheduler and triggers a peer DMA or host
-              // staging when the consumer GPU differs from the chunk's home
-              // GPU. The pinned chunk's GPU residency is preserved on the
-              // batch (cached_split_provider pins each chunk_memory_space into
-              // the gpu_table_representation), so we just read it here.
+              // Cached-scan locality: scan_operator_with_pinned_table_input is
+              // NOT a pipelineable_operator_data (see
+              // sirius_gpu_scan_operator_data.hpp), so the data-locality block
+              // above skipped it wholesale. Without this branch, every
+              // pinned-table scan task gets dispatched round-robin by the
+              // scheduler and triggers a peer DMA or host staging when the
+              // consumer GPU differs from the chunk's home GPU. The pinned
+              // chunk's GPU residency is preserved on the batch
+              // (cached_parquet_gpu_ingestible pins each chunk_memory_space
+              // into the gpu_table_representation), so we just read it here.
               if (!preferred_device_id.has_value()) {
-                if (auto* cached = dynamic_cast<op::scan::scan_cached_operator_data*>(
+                if (auto* cached = dynamic_cast<op::scan::scan_operator_with_pinned_table_input*>(
                       local_state->_input_data.get())) {
                   if (cached->batch) {
                     auto ro     = cached->batch->to_read_only();

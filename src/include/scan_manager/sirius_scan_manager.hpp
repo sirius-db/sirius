@@ -19,7 +19,10 @@
 #include "exec/config.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
+#include "io/gpu_ingestible.hpp"
 #include "io/s3/s3_blocking_ioctx.hpp"
+#include "io/s3/s3_ioctx.hpp"
+#include "scan_manager/gpu_ingestible_factory.hpp"
 #include "scan_manager/split_provider.hpp"
 
 // Forward-declare sirius_ioctx via <io/types.hpp> for the gpu_ioctxs map type
@@ -51,9 +54,7 @@ class buffer_pool;
 }  // namespace sirius::io
 
 namespace sirius::op::scan {
-class sirius_gpu_parquet_scan_operator;
-class sirius_gpu_duckdb_native_scan_operator;
-struct scan_info;
+class sirius_gpu_scan_operator;
 }  // namespace sirius::op::scan
 
 namespace sirius::planner {
@@ -77,11 +78,17 @@ namespace sirius::scan_manager {
 struct scan_manager_config {
   exec::thread_pool_config thread_pool{.num_threads = 8, .thread_name_prefix = "scan_manager"};
   bool use_sirius_datasource{false};
-  /// Number of @c uring_reactor instances in the ioctx pool.  Ignored when
-  /// @c use_sirius_datasource is false.
+  /// Reserved (not currently consumed). Intended size of the @c uring_reactor
+  /// pool, but the production @c uring_ioctx is built by @c SiriusContext, which
+  /// scales the reactor count with the number of GPUs the NUMA node serves
+  /// (@c clamp(4 * devices, 4, 16)) rather than reading this field. Parsed from
+  /// YAML and kept for forward compatibility / tests; setting it has no effect
+  /// on the engine today.
   std::size_t uring_n_reactors{4};
-  /// io_uring submission/completion queue depth per reactor.  Ignored when
-  /// @c use_sirius_datasource is false.
+  /// Reserved (not currently consumed). Intended io_uring submission/completion
+  /// queue depth per reactor; the production @c uring_ioctx hardcodes 64. Parsed
+  /// from YAML and kept for forward compatibility / tests; setting it has no
+  /// effect on the engine today.
   unsigned uring_ring_entries{64};
   /// Enable the prefetching cache.  Requires @c use_sirius_datasource=true;
   /// when true, SiriusContext (S6) allocates a pinned-host buffer_pool and
@@ -381,41 +388,6 @@ class sirius_scan_manager {
   [[nodiscard]] parquet_bind_result describe_parquet(std::string const& uri);
 
  private:
-  /// \brief Build a split_provider for @p op by reading its scan_info.
-  ///        Tries the pinned-cache short-circuit (format-agnostic; uses only
-  ///        the common scan_info fields) and otherwise dispatches through
-  ///        scan_info::make_provider() to the format-specific provider.
-  ///
-  /// @param op           The scan operator.
-  /// @param gpu_ioctxs   Per-GPU sirius_ioctx map forwarded to the
-  ///                     format-specific provider (via scan_info::make_provider)
-  ///                     for multi-GPU IO routing.
-  /// @param gpu_memory_spaces device_id -> GPU memory_space lookup forwarded to
-  ///                     HOST-tier cached_split_provider for HOST->GPU
-  ///                     materialization at produce_split time.
-  std::unique_ptr<split_provider> create_provider_for(
-    op::scan::sirius_gpu_parquet_scan_operator* op,
-    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs,
-    std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces);
-
-  /// \brief Build a cached_split_provider when a pinned entry matches the
-  ///        scan's file paths. Returns nullptr on miss. Reads only the
-  ///        format-agnostic base fields on @p info; not consumed.
-  ///        @p gpu_memory_spaces is forwarded to the HOST-tier
-  ///        cached_split_provider; an empty map disables the HOST-tier path.
-  std::unique_ptr<split_provider> try_make_cached_provider(
-    op::scan::scan_info const& info,
-    std::size_t op_id,
-    std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces);
-
-  /// \brief Factory for the duckdb-native scan path. Cache-probes via
-  ///        try_make_cached_provider, otherwise dispatches through
-  ///        scan_info::make_provider() — mirrors the parquet overload.
-  std::unique_ptr<split_provider> create_provider_for(
-    op::scan::sirius_gpu_duckdb_native_scan_operator* op,
-    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs,
-    std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces);
-
   /// \brief Run providers sequentially: start each, wait on its future, advance.
   void start_metadata_processing();
 
@@ -430,14 +402,15 @@ class sirius_scan_manager {
   /// The scan_manager never destroys these — SiriusContext owns their lifecycle
   /// (it also owns the prefetch buffer_pool + the S3 async thread pool).
   std::vector<std::shared_ptr<sirius::io::sirius_ioctx>> _io_ctxs;
-  std::unordered_map<op::scan::sirius_gpu_parquet_scan_operator*, std::unique_ptr<split_provider>>
+  std::unordered_map<op::scan::sirius_gpu_scan_operator*, std::unique_ptr<split_provider>>
     _providers_by_op;
-  std::vector<op::scan::sirius_gpu_parquet_scan_operator*> _scan_op_order;
-  std::unordered_map<op::scan::sirius_gpu_duckdb_native_scan_operator*,
-                     std::unique_ptr<split_provider>>
-    _duckdb_native_providers_by_op;
-  std::vector<op::scan::sirius_gpu_duckdb_native_scan_operator*> _duckdb_native_scan_op_order;
+  std::vector<op::scan::sirius_gpu_scan_operator*> _scan_op_order;
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
+  /// Produces the right gpu_ingestible per scan source during
+  /// prepare_for_query. Holds a borrowed reference to @c _pinned_entries
+  /// — declared AFTER it so its constructor's reference is bound to a
+  /// fully-constructed member.
+  gpu_ingestible_factory _factory;
 };
 
 }  // namespace sirius::scan_manager

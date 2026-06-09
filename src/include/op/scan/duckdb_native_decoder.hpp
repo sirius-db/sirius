@@ -16,35 +16,65 @@
 
 #pragma once
 
-#include "scan_manager/duckdb_native_split_provider.hpp"
+// sirius
+#include <io/io_context.hpp>  // sirius_ioctx + sirius_io_object
+#include <op/scan/duckdb_native_metadata.hpp>
 
+// cudf
 #include <cudf/table/table.hpp>
 
+// rmm
 #include <rmm/cuda_stream_view.hpp>
 
+// cucascade
 #include <cucascade/memory/memory_space.hpp>
 
+// standard library
 #include <memory>
+#include <vector>
 
 namespace sirius::op::scan {
 
-struct duckdb_native_scan_info;
+class duckdb_native_ingestible_table_info;
 
-/// Resolve a GPU memory space to allocate the decoded table into. Looks up
-/// the sirius_state on the scan_info's ClientContext and picks the first
-/// GPU-tier space from the memory manager.
-cucascade::memory::memory_space* pick_gpu_memory_space_for_duckdb_native_scan(
-  duckdb_native_scan_info const& scan_info);
+//===----------------------------------------------------------------------===//
+// duckdb_native_split_payload
+//===----------------------------------------------------------------------===//
+/**
+ * @brief Per-split payload consumed by @ref decode_duckdb_native_split.
+ *
+ * Built by @c duckdb_native_gpu_ingestible::next_split_provider from a
+ * contiguous run of the walker's @c duckdb_row_group_metadata. The
+ * @ref table_info pointer aliases the ingestible's owned bind data and is
+ * valid for the lifetime of every emitted split (the ingestible outlives
+ * its splits).
+ */
+struct duckdb_native_split_payload {
+  std::vector<duckdb_row_group_metadata> row_groups;
+  /// Stable alias into the ingestible's owned bind data. Carries
+  /// @c storage / @c context / @c projected_cols / @c projected_types that
+  /// the decoder reads.
+  duckdb_native_ingestible_table_info const* table_info = nullptr;
+  /// Sirius IO substrate handles. Set by the regular (non-cached) split
+  /// path so the decoder can read .db blocks via @c sirius_ioctx::host_read
+  /// instead of going through DuckDB's BufferManager. Both null when the
+  /// scan_manager runs without sirius_datasource (decoder falls back to
+  /// BufferManager).
+  std::shared_ptr<sirius::io::sirius_ioctx> io_ctx;
+  std::shared_ptr<sirius::io::sirius_io_object> db_io_object;
+};
 
+//===----------------------------------------------------------------------===//
+// decode_duckdb_native_split
+//===----------------------------------------------------------------------===//
 /// Decode a single split (contiguous run of row-group metadata from the
 /// walker) into a cudf::table. Supported: fixed-width data (UNCOMPRESSED /
 /// RLE / BITPACKING / CONSTANT), varchar data (UNCOMPRESSED / DICTIONARY /
 /// FSST / DICT_FSST), validity (UNCOMPRESSED / EMPTY / CONSTANT / ROARING),
 /// rowid synthesis. Throws std::runtime_error on any codec the walker
 /// accepted but this decoder does not implement.
-std::unique_ptr<cudf::table> decode_duckdb_native_split(
-  scan_manager::duckdb_native_split_provider::split_payload const& split,
-  cucascade::memory::memory_space& mem_space,
-  rmm::cuda_stream_view stream);
+std::unique_ptr<cudf::table> decode_duckdb_native_split(duckdb_native_split_payload const& split,
+                                                        cucascade::memory::memory_space& mem_space,
+                                                        rmm::cuda_stream_view stream);
 
 }  // namespace sirius::op::scan

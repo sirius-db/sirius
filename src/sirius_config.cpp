@@ -88,6 +88,10 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("thread_name_prefix", opt.thread_pool.thread_name_prefix);
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
   r.optional("use_sirius_datasource", opt.use_sirius_datasource);
+  // Reserved knobs: parsed and validated for forward compatibility, but not
+  // currently wired to the production uring_ioctx (SiriusContext scales the
+  // reactor pool with GPU count and hardcodes ring_entries=64). See
+  // scan_manager_config for details.
   r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("uring_ring_entries", opt.uring_ring_entries, yaml::greater_than<unsigned>{0});
   r.optional("enable_prefetch_cache", opt.enable_prefetch_cache);
@@ -126,6 +130,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
              yaml::fraction<double>{});
   r.optional("hash_partition_bytes", yaml::bytes(opt.hash_partition_bytes));
   r.optional("concat_batch_bytes", yaml::bytes(opt.concat_batch_bytes));
+  r.optional("sort_sample_bytes", yaml::bytes(opt.sort_sample_bytes));
   r.optional("max_build_hash_table_bytes", yaml::bytes(opt.max_build_hash_table_bytes));
   r.optional("enable_gpu_duckdb_native_scan", opt.enable_gpu_duckdb_native_scan);
   r.reject_unknown();
