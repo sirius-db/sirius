@@ -32,8 +32,8 @@
 #include <cudf/types.hpp>
 
 // cucascade
-#include <data/host_data_representation.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <data/host_data_representation.hpp>
 #include <memory/host_table.hpp>
 
 // standard library

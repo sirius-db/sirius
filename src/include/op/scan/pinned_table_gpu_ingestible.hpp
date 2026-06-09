@@ -24,9 +24,9 @@
 #include <cudf/column/column.hpp>
 
 // cucascade
-#include <data/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <data/host_data_representation.hpp>
 
 // duckdb
 #include <duckdb/planner/expression.hpp>

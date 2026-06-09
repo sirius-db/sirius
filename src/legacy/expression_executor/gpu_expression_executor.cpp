@@ -24,8 +24,8 @@
 #include <operator/gpu_materialize.hpp>
 
 // cucascade
-#include <data/gpu_table_representation.hpp>
 #include <data/data_batch_utils.hpp>
+#include <data/gpu_table_representation.hpp>
 
 // duckdb
 #include <duckdb/common/exception.hpp>

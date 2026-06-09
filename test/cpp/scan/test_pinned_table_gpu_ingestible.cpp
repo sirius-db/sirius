@@ -23,8 +23,8 @@
 
 #include "catch.hpp"
 
-#include <data/host_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <data/host_data_representation.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/pinned_table_gpu_ingestible.hpp>
 #include <op/scan/scan_plan.hpp>

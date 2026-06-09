@@ -22,20 +22,6 @@
 
 #include "cudf/contiguous_split.hpp"
 
-#include <cucascade/data/disk_data_representation.hpp>
-#include <cucascade/data/disk_file_format.hpp>
-#include <cucascade/data/disk_io_backend.hpp>
-#include <cucascade/data/representation_converter.hpp>
-#include <cucascade/error.hpp>
-#include <cucascade/memory/common.hpp>
-#include <cucascade/memory/disk_access_limiter.hpp>
-#include <cucascade/memory/disk_table.hpp>
-#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
-#include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
-#include <data/gpu_table_representation.hpp>
-#include <data/host_data_representation.hpp>
-#include <data/representation_converters.hpp>
-
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
@@ -53,6 +39,20 @@
 #include <rmm/resource_ref.hpp>
 
 #include <cuda_runtime.h>
+
+#include <cucascade/data/disk_data_representation.hpp>
+#include <cucascade/data/disk_file_format.hpp>
+#include <cucascade/data/disk_io_backend.hpp>
+#include <cucascade/data/representation_converter.hpp>
+#include <cucascade/error.hpp>
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/disk_access_limiter.hpp>
+#include <cucascade/memory/disk_table.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
+#include <data/gpu_table_representation.hpp>
+#include <data/host_data_representation.hpp>
+#include <data/representation_converters.hpp>
 
 #include <algorithm>
 #include <cassert>
@@ -72,8 +72,8 @@ namespace sirius {
 
 // cuCascade-owned generic types referenced unqualified by the vendored converter bodies below
 // (the code was written inside namespace cucascade). Surfacing them here keeps the bodies verbatim.
-using cucascade::DISK_FILE_ALIGNMENT;
 using cucascade::disk_data_representation;
+using cucascade::DISK_FILE_ALIGNMENT;
 using cucascade::idata_representation;
 using cucascade::idisk_io_backend;
 using cucascade::io_batch_entry;
@@ -372,7 +372,8 @@ static memory::column_metadata plan_column_copy(const cudf::column_view& col,
   meta.null_count = col.null_count();
   meta.scale      = 0;
 
-  if (static_cast<cudf::type_id>(meta.type_id) == cudf::type_id::DECIMAL32 || static_cast<cudf::type_id>(meta.type_id) == cudf::type_id::DECIMAL64 ||
+  if (static_cast<cudf::type_id>(meta.type_id) == cudf::type_id::DECIMAL32 ||
+      static_cast<cudf::type_id>(meta.type_id) == cudf::type_id::DECIMAL64 ||
       static_cast<cudf::type_id>(meta.type_id) == cudf::type_id::DECIMAL128) {
     meta.scale = col.type().scale();
   }
@@ -1143,9 +1144,10 @@ static std::unique_ptr<cudf::column> reconstruct_column(
       std::move(keys_col), std::move(indices_col), std::move(null_mask), null_count);
   }
 
-  const cudf::data_type dtype = cudf::is_fixed_point(cudf::data_type{static_cast<cudf::type_id>(meta.type_id)})
-                                  ? cudf::data_type{static_cast<cudf::type_id>(meta.type_id), meta.scale}
-                                  : cudf::data_type{static_cast<cudf::type_id>(meta.type_id)};
+  const cudf::data_type dtype =
+    cudf::is_fixed_point(cudf::data_type{static_cast<cudf::type_id>(meta.type_id)})
+      ? cudf::data_type{static_cast<cudf::type_id>(meta.type_id), meta.scale}
+      : cudf::data_type{static_cast<cudf::type_id>(meta.type_id)};
   return std::make_unique<cudf::column>(
     dtype,
     meta.num_rows,
@@ -1767,9 +1769,10 @@ static std::unique_ptr<cudf::column> reconstruct_column_from_disk(
       std::move(keys_col), std::move(indices_col), std::move(null_mask), null_count);
   }
 
-  const cudf::data_type dtype = cudf::is_fixed_point(cudf::data_type{static_cast<cudf::type_id>(meta.type_id)})
-                                  ? cudf::data_type{static_cast<cudf::type_id>(meta.type_id), meta.scale}
-                                  : cudf::data_type{static_cast<cudf::type_id>(meta.type_id)};
+  const cudf::data_type dtype =
+    cudf::is_fixed_point(cudf::data_type{static_cast<cudf::type_id>(meta.type_id)})
+      ? cudf::data_type{static_cast<cudf::type_id>(meta.type_id), meta.scale}
+      : cudf::data_type{static_cast<cudf::type_id>(meta.type_id)};
   return std::make_unique<cudf::column>(
     dtype,
     meta.num_rows,
@@ -1874,6 +1877,5 @@ void register_converters(representation_converter_registry& registry)
   registry.register_converter<disk_data_representation, gpu_table_representation>(
     convert_disk_to_gpu);
 }
-
 
 }  // namespace sirius

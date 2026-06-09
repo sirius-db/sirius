@@ -35,12 +35,12 @@
 #include <io/uring/uring_reactor.hpp>
 
 // cucascade
-#include <data/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
-#include <data/gpu_table_representation.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
+#include <data/gpu_table_representation.hpp>
+#include <data/host_data_representation.hpp>
 
 // duckdb
 #include <duckdb/common/hive_partitioning.hpp>

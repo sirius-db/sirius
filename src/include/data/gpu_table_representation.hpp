@@ -22,15 +22,15 @@
 
 #pragma once
 
-#include <cucascade/data/common.hpp>
-#include <cucascade/memory/memory_space.hpp>
-
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 
 #include <cuda_runtime.h>
+
+#include <cucascade/data/common.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 #include <any>
 #include <cstddef>

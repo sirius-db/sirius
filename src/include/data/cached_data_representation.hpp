@@ -20,8 +20,8 @@
 #include "host_parquet_representation.hpp"
 
 #include <cucascade/data/common.hpp>
-#include <data/host_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <data/host_data_representation.hpp>
 
 // standard library
 #include <concepts>

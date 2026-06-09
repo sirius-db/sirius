@@ -16,9 +16,9 @@
 
 #pragma once
 
-#include <data/host_data_representation.hpp>
-#include <data/gpu_table_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
+#include <data/gpu_table_representation.hpp>
+#include <data/host_data_representation.hpp>
 #include <data/host_parquet_representation_converters.hpp>
 #include <data/representation_converters.hpp>
 #include <spdlog/spdlog.h>

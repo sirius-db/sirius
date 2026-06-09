@@ -124,9 +124,8 @@ class host_data_packed_representation : public idata_representation {
    * @param host_table The underlying allocation owning the actual data
    * @param memory_space The memory space where the host table resides
    */
-  host_data_packed_representation(
-    std::unique_ptr<memory::host_table_packed_allocation> host_table,
-    cucascade::memory::memory_space* memory_space);
+  host_data_packed_representation(std::unique_ptr<memory::host_table_packed_allocation> host_table,
+                                  cucascade::memory::memory_space* memory_space);
 
   /**
    * @brief Get the size of the data representation in bytes

@@ -140,8 +140,8 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     }
     if (table_views.size() > 1 && space) {
       auto concatenated = cudf::concatenate(table_views, stream, space->get_default_allocator());
-      auto concat_rep   = std::make_unique<sirius::gpu_table_representation>(
-        std::move(concatenated), *space, stream);
+      auto concat_rep =
+        std::make_unique<sirius::gpu_table_representation>(std::move(concatenated), *space, stream);
       single_batch = std::make_shared<cucascade::data_batch>(0, std::move(concat_rep));
     }
   }

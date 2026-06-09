@@ -29,11 +29,11 @@
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 
-#include <data/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
-#include <data/gpu_table_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <data/gpu_table_representation.hpp>
+#include <data/host_data_representation.hpp>
 
 // Forward-declare CUDA profiler API functions (linked via libcudart).
 extern "C" int cudaProfilerStart();

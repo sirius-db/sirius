@@ -25,11 +25,11 @@
 
 #include <rmm/cuda_stream.hpp>
 
-#include <data/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/disk_data_representation.hpp>
-#include <data/gpu_table_representation.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
+#include <data/gpu_table_representation.hpp>
+#include <data/host_data_representation.hpp>
 
 #include <filesystem>
 #include <memory>
@@ -143,8 +143,7 @@ TEST_CASE("DISK->GPU round-trip conversion via converter registry", "[gpu_pipeli
   // disk-resident and the target memory space is GPU.
   {
     auto mut = batch->to_mutable();
-    REQUIRE_NOTHROW(
-      mut.convert_to<sirius::gpu_table_representation>(registry, gpu_space, stream));
+    REQUIRE_NOTHROW(mut.convert_to<sirius::gpu_table_representation>(registry, gpu_space, stream));
   }
 
   REQUIRE(batch->to_read_only().get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
@@ -193,8 +192,7 @@ TEST_CASE("DISK->GPU conversion preserves data correctness", "[gpu_pipeline_disk
   // DISK -> GPU
   {
     auto mut = batch->to_mutable();
-    REQUIRE_NOTHROW(
-      mut.convert_to<sirius::gpu_table_representation>(registry, gpu_space, stream));
+    REQUIRE_NOTHROW(mut.convert_to<sirius::gpu_table_representation>(registry, gpu_space, stream));
   }
   REQUIRE(batch->to_read_only().get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
 

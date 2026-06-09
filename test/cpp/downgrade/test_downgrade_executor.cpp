@@ -25,12 +25,12 @@
 #include <utils/utils.hpp>
 
 // cucascade
-#include <data/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/data/data_repository_manager.hpp>
-#include <data/gpu_table_representation.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
+#include <data/gpu_table_representation.hpp>
+#include <data/host_data_representation.hpp>
 
 // cudf / rmm
 #include <cudf/table/table.hpp>

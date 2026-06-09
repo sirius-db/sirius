@@ -30,8 +30,8 @@
 
 // cucascade
 #include <cucascade/data/data_batch.hpp>
-#include <data/gpu_table_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <data/gpu_table_representation.hpp>
 
 // standard library
 #include <stdexcept>
@@ -57,8 +57,7 @@ void scan_operator_with_pinned_table_input::prepare_for_processing(
     if (needs_upload) {
       auto& registry = ::sirius::converter_registry::get();
       auto mut       = batch->to_mutable();
-      mut.convert_to<::sirius::gpu_table_representation>(
-        registry, requested_memory_space, stream);
+      mut.convert_to<::sirius::gpu_table_representation>(registry, requested_memory_space, stream);
     }
   }
   // Capture the actual memory_space the batch lives on (post any conversion)

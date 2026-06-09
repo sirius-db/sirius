@@ -28,8 +28,8 @@
 // cucascade
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
-#include <data/gpu_table_representation.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
+#include <data/gpu_table_representation.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <helper/helper.hpp>
 

@@ -19,8 +19,8 @@
 #include "operator_test_utils.hpp"
 
 #include <catch.hpp>
-#include <data/gpu_table_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <data/gpu_table_representation.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <op/sirius_physical_hash_join.hpp>

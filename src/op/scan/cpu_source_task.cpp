@@ -24,13 +24,13 @@
 
 #include <nvtx3/nvtx3.hpp>
 
-#include <data/host_data_representation.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
-#include <memory/host_table.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
+#include <data/host_data_representation.hpp>
 #include <duckdb/common/types/validity_mask.hpp>
 #include <duckdb/common/types/vector.hpp>
 #include <duckdb/common/vector_size.hpp>
+#include <memory/host_table.hpp>
 
 #include <cstring>
 

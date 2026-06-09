@@ -28,8 +28,8 @@
 #include <op/scan/duckdb_scan_task.hpp>
 
 // cucascade
-#include <data/host_data_representation.hpp>
 #include <data/gpu_table_representation.hpp>
+#include <data/host_data_representation.hpp>
 
 // cudf
 #include <cudf/null_mask.hpp>

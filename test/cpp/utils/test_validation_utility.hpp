@@ -33,8 +33,8 @@
 #include <cuda_runtime_api.h>
 
 #include <cucascade/data/data_batch.hpp>
-#include <data/gpu_table_representation.hpp>
 #include <data/data_batch_utils.hpp>
+#include <data/gpu_table_representation.hpp>
 
 #include <iostream>
 #include <memory>

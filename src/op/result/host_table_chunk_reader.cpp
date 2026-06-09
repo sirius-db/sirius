@@ -41,8 +41,8 @@ host_table_chunk_reader::column_reader::column_reader(
     throw std::runtime_error(
       "[host_table_chunk_reader::column_reader::column_reader] Invalid allocation.");
   }
-  size       = static_cast<size_t>(col.num_rows);
-  null_count = static_cast<size_t>(col.null_count);
+  size          = static_cast<size_t>(col.num_rows);
+  null_count    = static_cast<size_t>(col.null_count);
   cudf_col_type = col.scale != 0
                     ? cudf::data_type(static_cast<cudf::type_id>(col.type_id), col.scale)
                     : cudf::data_type(static_cast<cudf::type_id>(col.type_id));

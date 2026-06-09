@@ -27,13 +27,13 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
-#include <data/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
-#include <data/gpu_table_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <data/gpu_table_representation.hpp>
+#include <data/host_data_representation.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 
 #include <cstddef>

@@ -25,11 +25,11 @@
 #include <cuda_runtime_api.h>
 
 #include <cucascade/data/data_batch.hpp>
-#include <data/gpu_table_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 #include <data/data_batch_utils.hpp>
+#include <data/gpu_table_representation.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <duckdb.hpp>
 #include <duckdb/execution/execution_context.hpp>
@@ -326,8 +326,7 @@ TEST_CASE("converter_registry has gpu_to_gpu converter (MEM-03)", "[multi_gpu_fo
 
   // Validate that GPU-to-GPU converter is registered (prerequisite for MEM-03 cross-GPU transfer)
   bool has_gpu_to_gpu =
-    registry
-      .has_converter<sirius::gpu_table_representation, sirius::gpu_table_representation>();
+    registry.has_converter<sirius::gpu_table_representation, sirius::gpu_table_representation>();
   REQUIRE(has_gpu_to_gpu);
 
   sirius::converter_registry::shutdown();
@@ -348,8 +347,7 @@ TEST_CASE("converter_registry exposes gpu_to_gpu converter after initialize() (M
   auto& registry = sirius::converter_registry::get();
 
   bool has_gpu_to_gpu =
-    registry
-      .has_converter<sirius::gpu_table_representation, sirius::gpu_table_representation>();
+    registry.has_converter<sirius::gpu_table_representation, sirius::gpu_table_representation>();
   REQUIRE(has_gpu_to_gpu);
 
   sirius::converter_registry::shutdown();

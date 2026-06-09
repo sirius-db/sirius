@@ -33,10 +33,10 @@
 #include <cuda_runtime.h>
 
 // cucascade
-#include <data/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
-#include <data/gpu_table_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
+#include <data/gpu_table_representation.hpp>
+#include <data/host_data_representation.hpp>
 
 // standard library
 #include <span>

@@ -920,11 +920,9 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                                  stream);
       cudf::table_view probe_keys = probe_keys_result.keys;
 
-      left_full  = get_cudf_table_view(input_batches[0]);
-      right_full = _build_table.value()
-                     .get_data()
-                     ->cast<sirius::gpu_table_representation>()
-                     .get_table_view();
+      left_full = get_cudf_table_view(input_batches[0]);
+      right_full =
+        _build_table.value().get_data()->cast<sirius::gpu_table_representation>().get_table_view();
 
       if (_distinct_hash_table) {
         // Distinct hash join path (unique build keys, INNER or LEFT only).

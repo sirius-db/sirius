@@ -19,13 +19,13 @@
 
 #include <rmm/cuda_stream.hpp>
 
-#include <data/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <data/convertible_data_batch.hpp>
 #include <data/data_batch_utils.hpp>
+#include <data/host_data_representation.hpp>
 
 #include <memory>
 #include <vector>

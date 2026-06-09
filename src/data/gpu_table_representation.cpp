@@ -18,11 +18,11 @@
 // Vendored from cuCascade (b4abc2d:src/data/gpu_data_representation.cpp); see
 // src/include/data/gpu_table_representation.hpp for migration context.
 
-#include <cucascade/error.hpp>
-#include <data/gpu_table_representation.hpp>
-
 #include <cudf/copying.hpp>
 #include <cudf/utilities/traits.hpp>
+
+#include <cucascade/error.hpp>
+#include <data/gpu_table_representation.hpp>
 
 namespace sirius {
 

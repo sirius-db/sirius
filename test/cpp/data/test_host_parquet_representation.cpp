@@ -27,12 +27,12 @@
 #include <memory/sirius_memory_reservation_manager.hpp>
 
 // cucascade
-#include <data/gpu_table_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
+#include <data/gpu_table_representation.hpp>
 
 // cudf
 #include <cudf/io/datasource.hpp>
@@ -459,8 +459,7 @@ TEST_CASE("register_parquet_converters is idempotent", "[host_parquet_representa
   REQUIRE_NOTHROW(register_parquet_converters(registry));
 
   // Both converters should still be registered
-  REQUIRE(
-    registry.has_converter<host_parquet_representation, sirius::gpu_table_representation>());
+  REQUIRE(registry.has_converter<host_parquet_representation, sirius::gpu_table_representation>());
   REQUIRE(registry.has_converter<host_parquet_representation, host_parquet_representation>());
 }
 
@@ -739,10 +738,9 @@ TEST_CASE("host_parquet_representation clone then convert to GPU",
   REQUIRE(cloned != nullptr);
 
   // Convert both original and clone to GPU
-  auto stream   = gpu_space->acquire_stream();
-  auto gpu_orig = registry.convert<sirius::gpu_table_representation>(*repr, gpu_space, stream);
-  auto gpu_cloned =
-    registry.convert<sirius::gpu_table_representation>(*cloned, gpu_space, stream);
+  auto stream     = gpu_space->acquire_stream();
+  auto gpu_orig   = registry.convert<sirius::gpu_table_representation>(*repr, gpu_space, stream);
+  auto gpu_cloned = registry.convert<sirius::gpu_table_representation>(*cloned, gpu_space, stream);
   stream.synchronize();
 
   REQUIRE(gpu_orig != nullptr);

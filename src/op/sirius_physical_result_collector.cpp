@@ -27,10 +27,10 @@
 #include <sirius_interface.hpp>
 
 // cucascade
-#include <data/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
+#include <data/host_data_representation.hpp>
 
 // sirius exceptions
 #include "sirius/exception.hpp"
@@ -156,8 +156,8 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       auto next_batch_id  = data_repo_mgr.get_next_data_batch_id();
 
       // clone_to: creates new batch with data converted to host_data_representation
-      auto result_batch = ro.clone_to<sirius::host_data_representation>(
-        registry, next_batch_id, &mem_space, stream);
+      auto result_batch =
+        ro.clone_to<sirius::host_data_representation>(registry, next_batch_id, &mem_space, stream);
 
       // Access the result batch's data. Declared outside the if-block so result_ro outlives
       // the branch — data points into it and must not dangle when we reach the assert below.

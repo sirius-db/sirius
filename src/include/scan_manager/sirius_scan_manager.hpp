@@ -30,8 +30,8 @@
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
 
-#include <data/host_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <data/host_data_representation.hpp>
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/vector.hpp>
 #include <io/types.hpp>
