@@ -41,9 +41,6 @@
 #include <utility>
 #include <vector>
 
-#include "config.hpp"
-#include "pipeline/sirius_meta_pipeline.hpp"
-
 namespace sirius::op::scan {
 
 //===----------------------------------------------------------------------===//

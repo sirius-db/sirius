@@ -43,7 +43,7 @@ struct pipeline_conversion_result {
   //! The execution-ready pipelines in dependency order
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> scheduled_pipelines;
   //! Ownership container for operators inserted during splitting (PARTITION, CONCAT, MERGE,
-  //! and source-side operators such as DUCKDB_SCAN, GPU_PARQUET_SCAN, CPU_SOURCE).
+  //! and source-side operators such as DUCKDB_SCAN, GPU_SCAN, CPU_SOURCE).
   duckdb::vector<duckdb::unique_ptr<op::sirius_physical_operator>> inserted_operators;
   //! Plan-time wiring descriptors. Materialized into runtime repositories and ports by
   //! `materialize_repository_wiring()` after the converter returns.

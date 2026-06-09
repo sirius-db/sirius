@@ -1175,7 +1175,7 @@ std::string_view sirius_pipeline_converter::resolve_port_id(
     return sink.Cast<op::sirius_physical_concat>().is_build_concat() ? "build" : "default";
   }
   // Leaf scans push splits onto the "scan" port of the next operator.
-  // GPU_PARQUET_SCAN is intentionally excluded — legacy treats it as a regular
+  // GPU_SCAN is intentionally excluded — legacy treats it as a regular
   // intermediate operator with the "default" port (see compute_repository_wiring's
   // catch-all branch). Adding it here would diverge from the legacy wiring shape.
   if (sink.type == T::DUCKDB_SCAN || sink.type == T::ICEBERG_SCAN || sink.type == T::CPU_SOURCE) {
@@ -1189,7 +1189,7 @@ op::MemoryBarrierType sirius_pipeline_converter::resolve_barrier(
 {
   using T = op::SiriusPhysicalOperatorType;
   // Sort/scan sinks process batches as they arrive — no barrier required.
-  // GPU_PARQUET_SCAN is intentionally excluded — legacy emits FULL/PARTIAL for it via
+  // GPU_SCAN is intentionally excluded — legacy emits FULL/PARTIAL for it via
   // the catch-all branch in compute_repository_wiring, not PIPELINE.
   // SORT_SAMPLE is no longer a pipeline sink (it runs as an intermediate operator in the
   // SORT_PARTITION pipeline post-#866), so it's not listed here.

@@ -30,8 +30,8 @@
 #include "duckdb/planner/table_filter.hpp"
 #include "log/logging.hpp"
 #include "op/scan/iceberg_metadata_reader.hpp"
-#include "op/scan/parquet_scan_info.hpp"
-#include "op/scan/sirius_gpu_parquet_scan_operator.hpp"
+#include "op/scan/parquet_gpu_ingestible.hpp"
+#include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
@@ -101,17 +101,17 @@ void wrap_above(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
   slot          = std::forward<WrapperFactory>(factory)(std::move(original));
 }
 
-//! Build a `parquet_scan_info` describing a parquet read by lifting fields out of a
-//! `sirius_physical_table_scan`. **Destructive**: `scan_op.table_filters` is moved into the
-//! info and `scan_op.table_filters` is left null. Mirrors the field plumbing in today's
+//! Build a `parquet_ingestible_table_info` describing a parquet read by lifting fields out
+//! of a `sirius_physical_table_scan`. **Destructive**: `scan_op.table_filters` is moved into
+//! the info and `scan_op.table_filters` is left null. Mirrors the field plumbing in today's
 //! `sirius_pipeline_converter::insert_parquet_scan_operator` byte-for-byte.
-std::unique_ptr<sirius::op::scan::parquet_scan_info> build_parquet_scan_info(
+std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_table_info(
   sirius::op::sirius_physical_table_scan& scan_op, const sirius::operator_params& op_params)
 {
   auto const& bind_data = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
   if (!bind_data.file_list || bind_data.file_list->IsEmpty()) {
     throw std::runtime_error(
-      "[sirius_physical_plan_generator::build_parquet_scan_info] No input files to scan");
+      "[sirius_physical_plan_generator::build_parquet_table_info] No input files to scan");
   }
   std::vector<std::string> file_paths;
   for (auto const& file : bind_data.file_list->GetAllFiles()) {
@@ -119,14 +119,14 @@ std::unique_ptr<sirius::op::scan::parquet_scan_info> build_parquet_scan_info(
   }
   auto const& partition_indices = bind_data.reader_bind.hive_partitioning_indexes;
 
-  auto info               = std::make_unique<sirius::op::scan::parquet_scan_info>();
-  info->returned_types    = scan_op.returned_types;
-  info->file_paths        = std::move(file_paths);
-  info->column_ids        = scan_op.column_ids;
-  info->projection_ids    = scan_op.projection_ids;
-  info->names             = scan_op.names;
-  info->table_filters     = std::move(scan_op.table_filters);
-  info->partition_indices = partition_indices;
+  auto info                 = std::make_unique<sirius::op::scan::parquet_ingestible_table_info>();
+  info->returned_types      = scan_op.returned_types;
+  info->resolved_file_paths = std::move(file_paths);
+  info->column_ids          = scan_op.column_ids;
+  info->projection_ids      = scan_op.projection_ids;
+  info->names               = scan_op.names;
+  info->table_filters       = std::move(scan_op.table_filters);
+  info->partition_indices   = partition_indices;
   // Mirror the two trailing fields the legacy `insert_parquet_scan_operator` sets
   // (sirius_pipeline_converter.cpp:297-302). Both came in via post-B.2b upstream commits:
   //   - `scan_output_arity` (upstream #749) drives `scan_info::make_provider`'s expected
@@ -180,13 +180,13 @@ void wrap_table_scan_source(
   if (fn == "seq_scan") {
     leaf = duckdb::make_uniq<sirius::op::sirius_physical_duckdb_scan>(&scan);
   } else if (fn == "parquet_scan" || fn == "read_parquet") {
-    auto info = build_parquet_scan_info(scan, op_params);
-    leaf      = duckdb::make_uniq<sirius::op::scan::sirius_gpu_parquet_scan_operator>(
-      scan.types, scan.estimated_cardinality, std::move(info));
-    // Parquet: legacy inlines GPU_PARQUET_SCAN into the current pipeline, so replace the
-    // TABLE_SCAN in place rather than attaching as a child (which would make build_pipelines
-    // spin up a separate wrap pipeline). The TABLE_SCAN object is dropped — its bind_data
-    // and metadata have already been lifted into the parquet_scan_info.
+    auto info = build_parquet_table_info(scan, op_params);
+    leaf      = duckdb::make_uniq<sirius::op::scan::sirius_gpu_scan_operator>(
+      scan.types, scan.estimated_cardinality, sirius::op::scan::make_ingestible(std::move(info)));
+    // Parquet: legacy inlines GPU_SCAN into the current pipeline, so replace the TABLE_SCAN
+    // in place rather than attaching as a child (which would make build_pipelines spin up a
+    // separate wrap pipeline). The TABLE_SCAN object is dropped — its bind_data and metadata
+    // have already been lifted into the parquet_ingestible_table_info.
     replace_slot = true;
   } else if (fn == "iceberg_scan") {
     auto iceberg_scan = duckdb::make_uniq<sirius::op::sirius_physical_iceberg_scan>(&scan);
