@@ -73,13 +73,13 @@ namespace fs = std::filesystem;
 
 // Pinned MinIO image — kept in sync with the (now-retired) docker-compose.yml so
 // the same Sirius commit produces reproducible S3 test behavior over time.
-constexpr char const* kMinioImage  = "minio/minio:RELEASE.2025-09-07T16-13-09Z-cpuv1";
-constexpr int kMinioPort           = 9000;
-constexpr char const* kAccessKey   = "minioadmin";
-constexpr char const* kSecretKey   = "minioadmin";
-constexpr char const* kRegion      = "us-east-1";
-constexpr char const* kBucket      = "sirius-test";
-constexpr char const* kDefaultKey  = "hello.txt";
+constexpr char const* kMinioImage = "minio/minio:RELEASE.2025-09-07T16-13-09Z-cpuv1";
+constexpr int kMinioPort          = 9000;
+constexpr char const* kAccessKey  = "minioadmin";
+constexpr char const* kSecretKey  = "minioadmin";
+constexpr char const* kRegion     = "us-east-1";
+constexpr char const* kBucket     = "sirius-test";
+constexpr char const* kDefaultKey = "hello.txt";
 
 // ---- small helpers ---------------------------------------------------------
 
@@ -95,7 +95,8 @@ int run_process(std::vector<std::string> const& argv)
 {
   std::vector<char*> c_argv;
   c_argv.reserve(argv.size() + 1);
-  for (auto const& a : argv) c_argv.push_back(const_cast<char*>(a.c_str()));
+  for (auto const& a : argv)
+    c_argv.push_back(const_cast<char*>(a.c_str()));
   c_argv.push_back(nullptr);
 
   pid_t pid = fork();
@@ -114,10 +115,10 @@ int run_process(std::vector<std::string> const& argv)
 std::vector<int> g_running_containers;  // ids to terminate at shutdown
 
 struct minio_instance {
-  std::string host;      // e.g. "localhost"
-  int port{0};           // dynamically-mapped host port
-  std::string endpoint;  // "<scheme>://<host>:<port>"
-  std::string authority; // "<host>:<port>" (Host header / signing)
+  std::string host;       // e.g. "localhost"
+  int port{0};            // dynamically-mapped host port
+  std::string endpoint;   // "<scheme>://<host>:<port>"
+  std::string authority;  // "<host>:<port>" (Host header / signing)
 };
 
 // Configure the common MinIO request (image, creds, command, exposed port).
@@ -144,16 +145,15 @@ minio_instance run_minio(int req, char const* scheme)
   char* run_err = nullptr;
   int id        = tc_container_run(req, &run_err);
   if (id < 0) {
-    std::string msg = run_err != nullptr ? std::string{run_err}
-                                         : std::string{"unknown error"};
+    std::string msg = run_err != nullptr ? std::string{run_err} : std::string{"unknown error"};
     std::free(run_err);
-    throw std::runtime_error("failed to start MinIO container (is Docker running and reachable?): " +
-                             msg);
+    throw std::runtime_error(
+      "failed to start MinIO container (is Docker running and reachable?): " + msg);
   }
   g_running_containers.push_back(id);
 
-  char* herr = nullptr;
-  char* hp   = tc_container_get_hostname(id, &herr);
+  char* herr       = nullptr;
+  char* hp         = tc_container_get_hostname(id, &herr);
   std::string host = (hp != nullptr) ? std::string{hp} : std::string{"localhost"};
   std::free(hp);
   std::free(herr);
@@ -180,9 +180,21 @@ fs::path generate_self_signed_cert(fs::path const& dir)
   fs::create_directories(dir);
   fs::path cert = dir / "public.crt";
   fs::path key  = dir / "private.key";
-  int rc        = run_process({"openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-                               "-days", "365", "-keyout", key.string(), "-out", cert.string(),
-                               "-subj", "/CN=localhost", "-addext",
+  int rc        = run_process({"openssl",
+                               "req",
+                               "-x509",
+                               "-newkey",
+                               "rsa:2048",
+                               "-nodes",
+                               "-days",
+                               "365",
+                               "-keyout",
+                               key.string(),
+                               "-out",
+                               cert.string(),
+                               "-subj",
+                               "/CN=localhost",
+                               "-addext",
                                "subjectAltName=IP:127.0.0.1,DNS:localhost,DNS:host.docker.internal"});
   if (rc != 0) throw std::runtime_error("openssl failed to generate self-signed cert");
   return cert;
@@ -191,13 +203,14 @@ fs::path generate_self_signed_cert(fs::path const& dir)
 // Run generate_fixtures.py into out_dir; returns the populated directory.
 fs::path generate_fixtures(fs::path const& out_dir)
 {
-  fs::path root         = SIRIUS_PROJECT_ROOT;
-  fs::path script       = root / "test" / "cpp" / "integration" / "s3" / "generate_fixtures.py";
-  fs::path parquet_src  = env_or("SIRIUS_TEST_S3_PARQUET_SOURCE",
-                                (root / "test" / "cpp" / "integration" / "data" / "parquet").string());
+  fs::path root   = SIRIUS_PROJECT_ROOT;
+  fs::path script = root / "test" / "cpp" / "integration" / "s3" / "generate_fixtures.py";
+  fs::path parquet_src =
+    env_or("SIRIUS_TEST_S3_PARQUET_SOURCE",
+           (root / "test" / "cpp" / "integration" / "data" / "parquet").string());
   fs::create_directories(out_dir);
-  int rc = run_process({"python3", script.string(), "--out", out_dir.string(),
-                        "--parquet-source", parquet_src});
+  int rc = run_process(
+    {"python3", script.string(), "--out", out_dir.string(), "--parquet-source", parquet_src});
   if (rc != 0) throw std::runtime_error("generate_fixtures.py failed");
   return out_dir;
 }
@@ -228,14 +241,19 @@ long s3_put(minio_instance const& inst,
 
   // UNSIGNED-PAYLOAD lets us stream arbitrarily large bodies (e.g. the SF10
   // lineitem fixture) without hashing them; MinIO accepts it.
-  auto signed_req = sirius::io::s3::sign_request("PUT", inst.authority, canonical_uri,
-                                                 /*query=*/"", "UNSIGNED-PAYLOAD",
-                                                 /*extra_headers=*/{}, creds, std::time(nullptr));
+  auto signed_req = sirius::io::s3::sign_request("PUT",
+                                                 inst.authority,
+                                                 canonical_uri,
+                                                 /*query=*/"",
+                                                 "UNSIGNED-PAYLOAD",
+                                                 /*extra_headers=*/{},
+                                                 creds,
+                                                 std::time(nullptr));
 
   CURL* curl = curl_easy_init();
   if (curl == nullptr) return -1;
 
-  std::string url = inst.endpoint + canonical_uri;
+  std::string url  = inst.endpoint + canonical_uri;
   curl_slist* hdrs = nullptr;
   for (auto const& [k, v] : signed_req.headers) {
     hdrs = curl_slist_append(hdrs, (k + ": " + v).c_str());
@@ -349,9 +367,10 @@ void maybe_upload_large_fixture(minio_instance const& http, fs::path const& work
     fs::path parquet_tmp = work / "lineitem_sf10.parquet.tmp";
     fs::remove(db, ec);
     fs::remove(parquet_tmp, ec);
-    std::string sql = "INSTALL tpch; LOAD tpch; CALL dbgen(sf=10); "
-                      "COPY (SELECT * FROM lineitem) TO '" +
-                      parquet_tmp.string() + "' (FORMAT PARQUET);";
+    std::string sql =
+      "INSTALL tpch; LOAD tpch; CALL dbgen(sf=10); "
+      "COPY (SELECT * FROM lineitem) TO '" +
+      parquet_tmp.string() + "' (FORMAT PARQUET);";
     int rc = run_process({duckdb_bin.string(), db.string(), "-c", sql});
     fs::remove(db, ec);
     if (rc != 0) {
@@ -369,8 +388,12 @@ void maybe_upload_large_fixture(minio_instance const& http, fs::path const& work
   std::string key = env_or("SIRIUS_BENCH_S3_KEY", "tpch/lineitem_sf10.parquet");
   std::FILE* f    = std::fopen(parquet.c_str(), "rb");
   if (f == nullptr) throw std::runtime_error("cannot open generated SF10 parquet");
-  long pc = s3_put(http, "http", uri_path_for(kBucket, key), f,
-                   static_cast<std::int64_t>(fs::file_size(parquet)), std::nullopt);
+  long pc = s3_put(http,
+                   "http",
+                   uri_path_for(kBucket, key),
+                   f,
+                   static_cast<std::int64_t>(fs::file_size(parquet)),
+                   std::nullopt);
   std::fclose(f);
   if (!(pc == 200 || pc == 204)) {
     throw std::runtime_error("SF10 upload failed (HTTP " + std::to_string(pc) + ")");
@@ -388,7 +411,7 @@ bool bring_up()
 {
   curl_global_init(CURL_GLOBAL_DEFAULT);
 
-  fs::path work = fs::temp_directory_path() / "sirius-s3-testcontainers";
+  fs::path work        = fs::temp_directory_path() / "sirius-s3-testcontainers";
   fs::path certs_dir   = work / "certs";
   fs::path fixture_dir = work / "fixtures" / "local";
 
@@ -405,9 +428,9 @@ bool bring_up()
   // NOTE: the bridge reads these host paths lazily (C.GoString runs inside the
   // run-time customizer, not at registration), so the strings must outlive the
   // run_minio() call below — keep them in locals, not temporaries.
-  int tls_req                = make_minio_request();
-  std::string tls_cert_path  = (certs_dir / "public.crt").string();
-  std::string tls_key_path   = (certs_dir / "private.key").string();
+  int tls_req               = make_minio_request();
+  std::string tls_cert_path = (certs_dir / "public.crt").string();
+  std::string tls_key_path  = (certs_dir / "private.key").string();
   tc_container_with_file(tls_req, tls_cert_path.c_str(), "/root/.minio/certs/public.crt");
   tc_container_with_file(tls_req, tls_key_path.c_str(), "/root/.minio/certs/private.key");
   minio_instance tls = run_minio(tls_req, "https");
@@ -435,8 +458,8 @@ bool bring_up()
   setenv_kv("SIRIUS_TEST_S3_LOCAL_DIR", fixture_dir.string());
   setenv_kv("SIRIUS_TEST_S3_CA_BUNDLE", ca_bundle.string());
 
-  std::cout << "[s3] testcontainers MinIO ready: " << http.endpoint << " (http), "
-            << tls.endpoint << " (https); fixtures in " << fixture_dir << std::endl;
+  std::cout << "[s3] testcontainers MinIO ready: " << http.endpoint << " (http), " << tls.endpoint
+            << " (https); fixtures in " << fixture_dir << std::endl;
   return true;
 }
 
