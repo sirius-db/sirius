@@ -260,7 +260,7 @@ TEST_CASE("describe_parquet parses local parquet footer metadata through the ioc
 }
 
 TEST_CASE("describe_parquet metadata-only insert round-trips local parquet footer through cache",
-          "[scan_manager][describe_parquet][s3][cache]")
+          "[.][scan_manager][describe_parquet][s3][cache]")
 {
   host_cache_memory cache_memory;
 

@@ -43,11 +43,34 @@
 #include <algorithm>
 #include <cstdint>
 #include <exception>
+#include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <utility>
 
 namespace sirius::scan_manager {
+
+namespace {
+
+/// Strip a leading "file://" scheme (case-insensitive) so the path can be
+/// resolved by a local-file backend.
+std::string normalize_path(std::string const& p)
+{
+  static constexpr std::string_view kFile = "file://";
+  if (p.size() > kFile.size()) {
+    bool is_file_uri = true;
+    for (std::size_t i = 0; i < kFile.size(); ++i) {
+      if (std::tolower(static_cast<unsigned char>(p[i])) != static_cast<unsigned char>(kFile[i])) {
+        is_file_uri = false;
+        break;
+      }
+    }
+    if (is_file_uri) { return p.substr(kFile.size()); }
+  }
+  return p;
+}
+
+}  // namespace
 
 sirius_scan_manager::sirius_scan_manager(
   scan_manager_config config, cucascade::memory::fixed_size_host_memory_resource* host_fsmr)
@@ -59,14 +82,14 @@ sirius_scan_manager::sirius_scan_manager(
       std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads)),
     _factory(_pinned_entries)
 {
-  if (_config.use_sirius_datasource) {
-    auto ioctx = std::make_shared<sirius::io::uring_ioctx>(
-      /*host_ring_depth=*/16u,
-      /*ring_entries=*/_config.uring_ring_entries,
-      /*n_reactors=*/_config.uring_n_reactors,
-      /*bounce_slot_size=*/sirius::io::CHUNK_SIZE);
-    _io_ctxs.push_back(std::move(ioctx));
-  }
+  // if (_config.use_sirius_datasource) {
+  auto ioctx = std::make_shared<sirius::io::uring_ioctx>(
+    /*host_ring_depth=*/16u,
+    /*ring_entries=*/_config.uring_ring_entries,
+    /*n_reactors=*/_config.uring_n_reactors,
+    /*bounce_slot_size=*/sirius::io::CHUNK_SIZE);
+  _io_ctxs.push_back(std::move(ioctx));
+  //}
 
   if (_config.s3_config) {
     auto s3_cfg                 = *_config.s3_config;
@@ -428,9 +451,10 @@ void sirius_scan_manager::insert_pinned_entry_host(
 std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datasource(
   std::string_view path) const noexcept
 {
+  auto file_path = normalize_path(std::string(path));
   for (auto const& ctx : _io_ctxs) {
-    if (ctx && ctx->supports(path)) {
-      auto io_object = ctx->create_io_object(path.data());
+    if (ctx && ctx->supports(file_path)) {
+      auto io_object = ctx->create_io_object(file_path.data());
       return ctx->make_datasource(io_object);
     }
   }
