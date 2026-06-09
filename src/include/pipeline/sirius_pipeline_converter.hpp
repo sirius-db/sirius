@@ -105,6 +105,9 @@ class sirius_pipeline_converter {
   void split_top_n_sink(duckdb::shared_ptr<sirius_pipeline>& current_pipeline,
                         duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
                         size_t pipeline_idx);
+  void split_vss_sink(duckdb::shared_ptr<sirius_pipeline>& current_pipeline,
+                      duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
+                      size_t pipeline_idx);
   void split_delim_join_sink(duckdb::shared_ptr<sirius_pipeline>& current_pipeline,
                              duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
                              size_t pipeline_idx);

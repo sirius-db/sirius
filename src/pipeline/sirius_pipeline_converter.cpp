@@ -53,6 +53,8 @@
 #include "op/sirius_physical_top_n.hpp"
 #include "op/sirius_physical_top_n_merge.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
+#include "op/sirius_physical_vss.hpp"
+#include "op/sirius_physical_vss_merge.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "sirius_config.hpp"
 
@@ -101,6 +103,9 @@ duckdb::unique_ptr<op::sirius_physical_operator> construct_sirius_specific_opera
   } else if (physical_op.type == op::SiriusPhysicalOperatorType::TOP_N) {
     auto& topn_physical_op = physical_op.Cast<op::sirius_physical_top_n>();
     return duckdb::make_uniq<op::sirius_physical_top_n_merge>(&topn_physical_op);
+  } else if (physical_op.type == op::SiriusPhysicalOperatorType::VSS) {
+    auto& vss_physical_op = physical_op.Cast<op::sirius_physical_vss>();
+    return duckdb::make_uniq<op::sirius_physical_vss_merge>(&vss_physical_op);
   } else if (physical_op.type == op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE) {
     auto& ungrouped_agg_physical_op = physical_op.Cast<op::sirius_physical_ungrouped_aggregate>();
     return duckdb::make_uniq<op::sirius_physical_ungrouped_aggregate_merge>(
@@ -840,6 +845,39 @@ void sirius_pipeline_converter::split_top_n_sink(
   inserted_operators_.push_back(std::move(merge_op));
 }
 
+void sirius_pipeline_converter::split_vss_sink(
+  duckdb::shared_ptr<sirius_pipeline>& current_pipeline,
+  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
+  size_t pipeline_idx)
+{
+  auto vss_op   = current_pipeline->sink;
+  auto* vss_ptr = static_cast<op::sirius_physical_vss*>(vss_op.get());
+
+  // Pipeline A: current pipeline keeps VSS as sink
+  scheduled_.push_back(current_pipeline);
+
+  // Create MERGE_VSS operator
+  auto merge_op = duckdb::unique_ptr<op::sirius_physical_vss_merge>(
+    new op::sirius_physical_vss_merge(vss_ptr));
+  auto* merge_ptr = merge_op.get();
+
+  // Pipeline B: VSS (source) -> MERGE_VSS (sink)
+  auto merge_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(build_ctx_);
+  merge_pipeline->source = vss_op.get();
+  merge_pipeline->sink   = merge_ptr;
+  scheduled_.push_back(merge_pipeline);
+
+  // Update downstream pipelines to use MERGE_VSS as source
+  for (size_t j = pipeline_idx + 1; j < copied_scheduled.size(); j++) {
+    if (copied_scheduled[j]->source.get() == vss_op.get()) {
+      copied_scheduled[j]->source = merge_ptr;
+    }
+  }
+
+  // Store ownership
+  inserted_operators_.push_back(std::move(merge_op));
+}
+
 void sirius_pipeline_converter::split_delim_join_sink(
   duckdb::shared_ptr<sirius_pipeline>& current_pipeline,
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
@@ -978,6 +1016,8 @@ void sirius_pipeline_converter::split_pipelines(
       split_order_by_sink(current_pipeline, copied_scheduled, i);
     } else if (sink_type == op::SiriusPhysicalOperatorType::TOP_N) {
       split_top_n_sink(current_pipeline, copied_scheduled, i);
+    } else if (sink_type == op::SiriusPhysicalOperatorType::VSS) {
+      split_vss_sink(current_pipeline, copied_scheduled, i);
     } else if (sink_type == op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
                sink_type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
       split_delim_join_sink(current_pipeline, copied_scheduled, i);
@@ -1017,6 +1057,7 @@ void sirius_pipeline_converter::compute_repository_wiring()
     if (pipeline->sink->type == op::SiriusPhysicalOperatorType::MERGE_GROUP_BY ||
         pipeline->sink->type == op::SiriusPhysicalOperatorType::MERGE_SORT ||
         pipeline->sink->type == op::SiriusPhysicalOperatorType::MERGE_TOP_N ||
+        pipeline->sink->type == op::SiriusPhysicalOperatorType::MERGE_VSS ||
         pipeline->sink->type == op::SiriusPhysicalOperatorType::MERGE_AGGREGATE) {
       for (auto const& dependent_pipeline : source_to_pipelines[sink_op]) {
         emit("default", op::MemoryBarrierType::FULL, sink_op, pipeline, dependent_pipeline);
@@ -1090,6 +1131,7 @@ void sirius_pipeline_converter::compute_repository_wiring()
     } else if (pipeline->sink->type == op::SiriusPhysicalOperatorType::PARTITION ||
                pipeline->sink->type == op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE ||
                pipeline->sink->type == op::SiriusPhysicalOperatorType::TOP_N ||
+               pipeline->sink->type == op::SiriusPhysicalOperatorType::VSS ||
                pipeline->sink->type == op::SiriusPhysicalOperatorType::MERGE_SORT ||
                pipeline->sink->type == op::SiriusPhysicalOperatorType::SORT_PARTITION) {
       for (auto const& dependent_pipeline : source_to_pipelines[sink_op]) {
