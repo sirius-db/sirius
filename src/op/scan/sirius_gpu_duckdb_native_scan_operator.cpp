@@ -17,7 +17,7 @@
 #include <cudf/utilities/default_stream.hpp>
 
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <data/gpu_table_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <data/data_batch_utils.hpp>
 #include <expression/ast/from_duckdb.hpp>

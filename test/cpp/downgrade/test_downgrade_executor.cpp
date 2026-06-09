@@ -25,11 +25,11 @@
 #include <utils/utils.hpp>
 
 // cucascade
-#include <cucascade/data/cpu_data_representation.hpp>
+#include <data/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/data/data_repository_manager.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <data/gpu_table_representation.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 
 // cudf / rmm
@@ -371,7 +371,7 @@ TEST_CASE("request_free_memory skips batches already on HOST", "[downgrade_execu
   {
     // Acquire exclusive lock and convert to host representation
     auto mut = gpu_batch->to_mutable();
-    mut.convert_to<cucascade::host_data_representation>(registry, host_space, conv_stream);
+    mut.convert_to<sirius::host_data_representation>(registry, host_space, conv_stream);
     // mut goes out of scope → releases exclusive lock, batch returns to idle
   }
   REQUIRE(get_batch_tier(*gpu_batch) == cucascade::memory::Tier::HOST);

@@ -17,9 +17,9 @@
 #include "op/scan/duckdb_scan_executor.hpp"
 
 #include "creator/task_creator.hpp"
-#include "cucascade/data/cpu_data_representation.hpp"
+#include "data/host_data_representation.hpp"
 #include "cucascade/data/data_batch.hpp"
-#include "cucascade/data/gpu_data_representation.hpp"
+#include "data/gpu_table_representation.hpp"
 #include "data/cached_data_representation.hpp"
 #include "data/data_batch_utils.hpp"
 #include "data/host_parquet_representation.hpp"

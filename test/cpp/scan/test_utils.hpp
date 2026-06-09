@@ -28,7 +28,7 @@
 // cucascade
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <data/gpu_table_representation.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <helper/helper.hpp>
@@ -205,7 +205,7 @@ inline void validate_scanned_batches(
     REQUIRE(batch != nullptr);
     {
       auto mut = batch->to_mutable();
-      mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
+      mut.convert_to<sirius::gpu_table_representation>(registry, gpu_space, stream);
     }
     auto table_view = sirius::get_cudf_table_view(*batch);
 
@@ -294,7 +294,7 @@ inline void validate_projected_id_price_batches(
     REQUIRE(batch != nullptr);
     {
       auto mut = batch->to_mutable();
-      mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
+      mut.convert_to<sirius::gpu_table_representation>(registry, gpu_space, stream);
     }
     auto table_view = sirius::get_cudf_table_view(*batch);
 

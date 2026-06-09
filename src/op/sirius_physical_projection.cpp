@@ -23,7 +23,7 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <data/gpu_table_representation.hpp>
 #include <duckdb/common/exception.hpp>
 
 namespace sirius {
@@ -57,7 +57,7 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
 
   for (auto const& batch : input_batches) {
     auto projected_table = gpu_expression_executor.execute(
-      batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
+      batch.get_data()->cast<sirius::gpu_table_representation>().get_table_view());
     output_batches.push_back(
       sirius::make_data_batch(std::move(projected_table), *batch.get_memory_space(), stream));
   }

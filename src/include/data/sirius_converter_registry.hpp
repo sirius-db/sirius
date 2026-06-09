@@ -16,10 +16,11 @@
 
 #pragma once
 
-#include <cucascade/data/cpu_data_representation.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <data/host_data_representation.hpp>
+#include <data/gpu_table_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <data/host_parquet_representation_converters.hpp>
+#include <data/representation_converters.hpp>
 #include <spdlog/spdlog.h>
 
 #include <memory>
@@ -52,7 +53,7 @@ class converter_registry {
     std::lock_guard<std::mutex> lock(mutex_);
     if (instance_) { return; }  // Already initialized, no-op
     instance_ = std::make_unique<registry_type>();
-    cucascade::register_builtin_converters(*instance_);
+    sirius::register_converters(*instance_);
     sirius::register_parquet_converters(*instance_);
   }
 

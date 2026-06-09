@@ -25,10 +25,10 @@
 
 #include <rmm/cuda_stream.hpp>
 
-#include <cucascade/data/cpu_data_representation.hpp>
+#include <data/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/disk_data_representation.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <data/gpu_table_representation.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 
 #include <filesystem>
@@ -114,7 +114,7 @@ TEST_CASE("DISK->GPU round-trip conversion via converter registry", "[gpu_pipeli
   // The Tier::GPU arm of lock_or_prepare_batch calls
   //   batch->convert_to<gpu_table_representation>(registry, gpu_space, stream)
   // The registry dispatches on typeid(*source). When source is disk_data_representation,
-  // the DISK->GPU converter registered in Phase 1 (register_builtin_converters with pipeline
+  // the DISK->GPU converter registered in Phase 1 (sirius::register_converters with pipeline
   // backend) is selected automatically. This test verifies the round-trip works end-to-end.
   auto [mgr, tmp_dir] = make_test_memory_manager_with_disk();
 
@@ -144,7 +144,7 @@ TEST_CASE("DISK->GPU round-trip conversion via converter registry", "[gpu_pipeli
   {
     auto mut = batch->to_mutable();
     REQUIRE_NOTHROW(
-      mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream));
+      mut.convert_to<sirius::gpu_table_representation>(registry, gpu_space, stream));
   }
 
   REQUIRE(batch->to_read_only().get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
@@ -194,7 +194,7 @@ TEST_CASE("DISK->GPU conversion preserves data correctness", "[gpu_pipeline_disk
   {
     auto mut = batch->to_mutable();
     REQUIRE_NOTHROW(
-      mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream));
+      mut.convert_to<sirius::gpu_table_representation>(registry, gpu_space, stream));
   }
   REQUIRE(batch->to_read_only().get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
 

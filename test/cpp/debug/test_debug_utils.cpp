@@ -33,7 +33,7 @@
 
 #include <catch.hpp>
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <data/gpu_table_representation.hpp>
 
 #include <cstdint>
 #include <memory>

@@ -923,7 +923,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       left_full  = get_cudf_table_view(input_batches[0]);
       right_full = _build_table.value()
                      .get_data()
-                     ->cast<cucascade::gpu_table_representation>()
+                     ->cast<sirius::gpu_table_representation>()
                      .get_table_view();
 
       if (_distinct_hash_table) {

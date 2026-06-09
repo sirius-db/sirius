@@ -25,7 +25,7 @@
 #include <cuda_runtime_api.h>
 
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <data/gpu_table_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
@@ -91,7 +91,7 @@ uint64_t compute_batch_checksum_fnv1a64(cucascade::data_batch& batch, rmm::cuda_
   // Phase 18 / DB-03 Recipe R1: scoped read-only accessor for the lifetime
   // of gpu_rep, packed, and host_buf — released at function exit.
   auto ro             = batch.to_read_only();
-  auto const& gpu_rep = ro.get_data()->cast<cucascade::gpu_table_representation>();
+  auto const& gpu_rep = ro.get_data()->cast<sirius::gpu_table_representation>();
   auto packed         = cudf::pack(gpu_rep.get_table_view(), stream);
   stream.synchronize();
 
@@ -327,15 +327,15 @@ TEST_CASE("converter_registry has gpu_to_gpu converter (MEM-03)", "[multi_gpu_fo
   // Validate that GPU-to-GPU converter is registered (prerequisite for MEM-03 cross-GPU transfer)
   bool has_gpu_to_gpu =
     registry
-      .has_converter<cucascade::gpu_table_representation, cucascade::gpu_table_representation>();
+      .has_converter<sirius::gpu_table_representation, sirius::gpu_table_representation>();
   REQUIRE(has_gpu_to_gpu);
 
   sirius::converter_registry::shutdown();
 }
 
-// MGPU-04 registration gate: cucascade::register_builtin_converters (called
+// MGPU-04 registration gate: sirius::register_converters (called
 // by sirius::converter_registry::initialize()) registers a GPU->GPU
-// peer-async converter at cucascade/src/data/representation_converter.cpp:1464.
+// peer-async converter in src/data/representation_converters.cpp.
 // This test is the grep-verifiable gate that proves the registration
 // survives SiriusContext init. See 06-RESEARCH.md Finding 2 for why we do
 // not register a second converter here.
@@ -349,7 +349,7 @@ TEST_CASE("converter_registry exposes gpu_to_gpu converter after initialize() (M
 
   bool has_gpu_to_gpu =
     registry
-      .has_converter<cucascade::gpu_table_representation, cucascade::gpu_table_representation>();
+      .has_converter<sirius::gpu_table_representation, sirius::gpu_table_representation>();
   REQUIRE(has_gpu_to_gpu);
 
   sirius::converter_registry::shutdown();
@@ -483,7 +483,7 @@ TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-0
   // Phase 18 / DB-03 Recipe R8 + R3: scoped mutable accessor.
   {
     auto mut = batch->to_mutable();
-    mut.convert_to<cucascade::gpu_table_representation>(registry, gpu1, stream.view());
+    mut.convert_to<sirius::gpu_table_representation>(registry, gpu1, stream.view());
   }
 
   {
@@ -499,7 +499,7 @@ TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-0
   // Phase 18 / DB-03 Recipe R8 + R3: scoped mutable accessor.
   {
     auto mut = batch->to_mutable();
-    mut.convert_to<cucascade::gpu_table_representation>(registry, gpu0, stream.view());
+    mut.convert_to<sirius::gpu_table_representation>(registry, gpu0, stream.view());
   }
 
   {

@@ -29,9 +29,9 @@
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 
-#include <cucascade/data/cpu_data_representation.hpp>
+#include <data/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <data/gpu_table_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
@@ -938,7 +938,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   // precondition check (size==data_tables.size).
   std::vector<cucascade::memory::memory_space*> chunk_memory_spaces;
   // HOST-tier storage: one host_data_representation per chunk.
-  std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;
+  std::vector<std::shared_ptr<sirius::host_data_representation>> host_chunks;
   std::vector<std::string> read_column_names;  // captured from parquet metadata
   int64_t remaining_rows = data.args.n_rows.value_or(-1);
   // Per-call local counter (NOT std::atomic, NOT global). PinTableFunction is
@@ -1015,9 +1015,9 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
         (void)inserted;
         rmm::cuda_stream_view target_stream = stream_it->second.view();
         auto* target_host_space             = host_space_by_gpu.at(target_gpu_id);
-        cucascade::gpu_table_representation gpu_repr(
+        sirius::gpu_table_representation gpu_repr(
           std::move(chunk.tbl), *target_space, target_stream);
-        auto host_repr = registry_ptr->convert<cucascade::host_data_representation>(
+        auto host_repr = registry_ptr->convert<sirius::host_data_representation>(
           gpu_repr, target_host_space, target_stream);
         // Sync before gpu_repr leaves scope so the async D2H copies finish before its
         // device buffers are freed.

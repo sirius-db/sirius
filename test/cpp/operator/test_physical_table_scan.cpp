@@ -20,7 +20,7 @@
 #include "operator_type_traits.hpp"
 
 #include <catch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <data/gpu_table_representation.hpp>
 #include <duckdb/function/table_function.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/table_filter.hpp>
@@ -455,7 +455,7 @@ TEST_CASE("parquet_scan with decimal filter sets table_scan passthrough",
   cols.push_back(std::move(col0));
   cols.push_back(std::move(col1));
   auto table    = std::make_unique<cudf::table>(std::move(cols));
-  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
+  auto gpu_repr = std::make_unique<sirius::gpu_table_representation>(
     std::move(table), *space, cudf::get_default_stream());
   auto input_batch = std::make_shared<cucascade::data_batch>(0, std::move(gpu_repr));
 

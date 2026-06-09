@@ -20,9 +20,9 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
-#include <cucascade/data/cpu_data_representation.hpp>
+#include <data/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <data/gpu_table_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <data/sirius_converter_registry.hpp>
 
@@ -73,10 +73,10 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
 
   switch (target_space->get_tier()) {
     case cucascade::memory::Tier::GPU:
-      mut_accessor.convert_to<cucascade::gpu_table_representation>(registry, target_space, stream);
+      mut_accessor.convert_to<sirius::gpu_table_representation>(registry, target_space, stream);
       break;
     case cucascade::memory::Tier::HOST:
-      mut_accessor.convert_to<cucascade::host_data_representation>(registry, target_space, stream);
+      mut_accessor.convert_to<sirius::host_data_representation>(registry, target_space, stream);
       break;
     default:
       SIRIUS_LOG_ERROR("lock_or_prepare_batch: unsupported target tier for batch {}",

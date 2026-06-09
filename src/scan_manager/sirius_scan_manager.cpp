@@ -663,7 +663,7 @@ void sirius_scan_manager::insert_pinned_entry_host(
   const std::string& name,
   std::vector<std::string> column_names,
   std::vector<std::string> file_paths,
-  std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
+  std::vector<std::shared_ptr<sirius::host_data_representation>> host_chunks,
   cucascade::memory::memory_space& memory_space,
   bool is_partial)
 {

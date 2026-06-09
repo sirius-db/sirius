@@ -27,7 +27,7 @@
 #include <sirius_interface.hpp>
 
 // cucascade
-#include <cucascade/data/cpu_data_representation.hpp>
+#include <data/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
@@ -156,7 +156,7 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       auto next_batch_id  = data_repo_mgr.get_next_data_batch_id();
 
       // clone_to: creates new batch with data converted to host_data_representation
-      auto result_batch = ro.clone_to<cucascade::host_data_representation>(
+      auto result_batch = ro.clone_to<sirius::host_data_representation>(
         registry, next_batch_id, &mem_space, stream);
 
       // Access the result batch's data. Declared outside the if-block so result_ro outlives
@@ -170,10 +170,10 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
         "[GPUPhysicalMaterializedCollector] Expected host_data_representation in HOST tier");
     }
     // Data already in HOST tier -- read directly through the read_only accessor
-    assert(dynamic_cast<cucascade::host_data_representation*>(data) != nullptr);
+    assert(dynamic_cast<sirius::host_data_representation*>(data) != nullptr);
 
     using host_table_chunk_reader = ::sirius::op::result::host_table_chunk_reader;
-    auto const& host_table        = data->cast<cucascade::host_data_representation>();
+    auto const& host_table        = data->cast<sirius::host_data_representation>();
     // host_table_chunk_reader expects get_host_table() and ->allocation to be non-null;
     // otherwise it will dereference a null unique_ptr (e.g. in column_reader::initialize).
     auto const* ht = host_table.get_host_table().get();

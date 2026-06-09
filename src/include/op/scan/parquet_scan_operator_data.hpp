@@ -32,7 +32,7 @@
 
 // cucascade
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <data/gpu_table_representation.hpp>
 #include <cucascade/memory/common.hpp>
 
 // standard library
@@ -255,7 +255,7 @@ class scan_cached_operator_data : public op::operator_data {
     }
     auto& registry = ::sirius::converter_registry::get();
     auto mut       = batch->to_mutable();
-    mut.convert_to<cucascade::gpu_table_representation>(registry, requested_memory_space, stream);
+    mut.convert_to<sirius::gpu_table_representation>(registry, requested_memory_space, stream);
   }
 
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override

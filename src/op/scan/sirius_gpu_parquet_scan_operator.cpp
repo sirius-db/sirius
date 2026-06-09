@@ -41,7 +41,7 @@
 
 // cucascade
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <data/gpu_table_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 // standard library
@@ -316,7 +316,7 @@ std::unique_ptr<operator_data> sirius_gpu_parquet_scan_operator::execute(
     mem_space = scan_data->gpu_memory_space;
   } else if (auto const* cached = dynamic_cast<const scan_cached_operator_data*>(&input_data)) {
     auto ro_batch    = cached->batch->to_read_only();
-    auto& gpu_rep    = ro_batch.get_data()->cast<cucascade::gpu_table_representation>();
+    auto& gpu_rep    = ro_batch.get_data()->cast<sirius::gpu_table_representation>();
     auto cached_view = gpu_rep.get_table_view();
 
     // The cached path carries only a DuckDB-expression filter (AST translation /

@@ -21,7 +21,7 @@
 #include <utils/utils.hpp>
 
 // sirius
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <data/gpu_table_representation.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
@@ -102,7 +102,7 @@ std::shared_ptr<data_batch> make_input_batch(
   auto table = ::sirius::create_cudf_table_with_random_data(
     128, column_types, ranges, cudf::get_default_stream(), mr);
   auto gpu_repr =
-    std::make_unique<gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
+    std::make_unique<sirius::gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
   auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
 }
@@ -138,7 +138,7 @@ std::shared_ptr<data_batch> make_int32_batch_with_nulls(memory_space& space,
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
   auto gpu_repr =
-    std::make_unique<gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
+    std::make_unique<sirius::gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
   auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
 }
@@ -178,7 +178,7 @@ std::shared_ptr<data_batch> make_two_int32_batch_with_nulls(memory_space& space,
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
   auto gpu_repr =
-    std::make_unique<gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
+    std::make_unique<sirius::gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
   auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
 }
@@ -206,7 +206,7 @@ std::shared_ptr<data_batch> make_decimal64_batch(memory_space& space,
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
   auto gpu_repr =
-    std::make_unique<gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
+    std::make_unique<sirius::gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
   auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
 }
@@ -239,7 +239,7 @@ std::shared_ptr<data_batch> make_decimal64_two_col_batch(memory_space& space,
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
   auto gpu_repr =
-    std::make_unique<gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
+    std::make_unique<sirius::gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
   auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
 }
@@ -267,7 +267,7 @@ std::shared_ptr<data_batch> make_decimal32_batch(memory_space& space,
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
   auto gpu_repr =
-    std::make_unique<gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
+    std::make_unique<sirius::gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
   auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
 }
@@ -295,7 +295,7 @@ std::shared_ptr<data_batch> make_decimal128_batch(memory_space& space,
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
   auto gpu_repr =
-    std::make_unique<gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
+    std::make_unique<sirius::gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
   auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
 }
@@ -342,13 +342,13 @@ exec_result run_execute(memory_space& space,
   }
   exp_executor executor(ast_nodes, get_resource_ref(space), cudf::get_default_stream(), strategy);
   auto input_ro     = input_batch->to_read_only();
-  auto& in_repr     = input_ro.get_data()->cast<gpu_table_representation>();
+  auto& in_repr     = input_ro.get_data()->cast<sirius::gpu_table_representation>();
   auto output_table = executor.execute(in_repr.get_table_view());
   REQUIRE(output_table != nullptr);
   auto output_batch = sirius::make_data_batch(
     std::move(output_table), *input_ro.get_memory_space(), cudf::get_default_stream());
   auto output_ro = output_batch->to_read_only();
-  auto& out_repr = output_ro.get_data()->cast<gpu_table_representation>();
+  auto& out_repr = output_ro.get_data()->cast<sirius::gpu_table_representation>();
   return {input_batch, output_batch, in_repr.get_table_view(), out_repr.get_table_view()};
 }
 
@@ -359,13 +359,13 @@ exec_result run_select(memory_space& space,
 {
   exp_executor executor(*node, get_resource_ref(space), cudf::get_default_stream(), strategy);
   auto input_ro     = input_batch->to_read_only();
-  auto& in_repr     = input_ro.get_data()->cast<gpu_table_representation>();
+  auto& in_repr     = input_ro.get_data()->cast<sirius::gpu_table_representation>();
   auto output_table = executor.select(in_repr.get_table_view());
   REQUIRE(output_table != nullptr);
   auto output_batch = sirius::make_data_batch(
     std::move(output_table), *input_ro.get_memory_space(), cudf::get_default_stream());
   auto output_ro = output_batch->to_read_only();
-  auto& out_repr = output_ro.get_data()->cast<gpu_table_representation>();
+  auto& out_repr = output_ro.get_data()->cast<sirius::gpu_table_representation>();
   return {input_batch, output_batch, in_repr.get_table_view(), out_repr.get_table_view()};
 }
 
@@ -1735,7 +1735,7 @@ int32_batch make_int32_input(memory_space& space)
   auto batch =
     make_input_batch(space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 100}});
   auto ro       = batch->to_read_only();
-  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  auto& in_repr = ro.get_data()->cast<sirius::gpu_table_representation>();
   return {batch, in_repr.get_table_view()};
 }
 
@@ -1790,7 +1790,7 @@ TEST_CASE("native_ast - constant VARCHAR", "[expression_executor_ast_native][con
   auto input =
     make_input_batch(*space, {cudf::data_type{cudf::type_id::STRING}}, {std::pair<int, int>{1, 5}});
   auto ro       = input->to_read_only();
-  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  auto& in_repr = ro.get_data()->cast<sirius::gpu_table_representation>();
   auto tv       = in_repr.get_table_view();
 
   auto hand_ast = std::make_unique<sirius::ast::node>(sirius::ast::constant{
@@ -1853,7 +1853,7 @@ TEST_CASE("native_ast - conjunction AND (MATERIALIZE)",
                      {cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT32}},
                      {std::pair<int, int>{0, 100}, std::pair<int, int>{0, 100}});
   auto ro       = input->to_read_only();
-  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  auto& in_repr = ro.get_data()->cast<sirius::gpu_table_representation>();
   auto tv       = in_repr.get_table_view();
 
   std::vector<std::unique_ptr<sirius::ast::node>> children;
@@ -1928,7 +1928,7 @@ TEST_CASE("native_ast - unary_op IS_NULL (MATERIALIZE)",
   std::vector<bool> valids{true, false, true, false, true};
   auto batch    = make_int32_batch_with_nulls(*space, values, valids);
   auto ro       = batch->to_read_only();
-  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  auto& in_repr = ro.get_data()->cast<sirius::gpu_table_representation>();
   auto tv       = in_repr.get_table_view();
 
   auto hand_ast = std::make_unique<sirius::ast::node>(
@@ -1952,7 +1952,7 @@ TEST_CASE("native_ast - unary_op IS_NOT_NULL (MATERIALIZE)",
   std::vector<bool> valids{true, false, true, true};
   auto batch    = make_int32_batch_with_nulls(*space, values, valids);
   auto ro       = batch->to_read_only();
-  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  auto& in_repr = ro.get_data()->cast<sirius::gpu_table_representation>();
   auto tv       = in_repr.get_table_view();
 
   auto hand_ast = std::make_unique<sirius::ast::node>(
@@ -1999,7 +1999,7 @@ TEST_CASE("native_ast - coalesce (MATERIALIZE)", "[expression_executor_ast_nativ
   std::vector<bool> valids{true, false, true, false, true};
   auto batch    = make_int32_batch_with_nulls(*space, values, valids);
   auto ro       = batch->to_read_only();
-  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  auto& in_repr = ro.get_data()->cast<sirius::gpu_table_representation>();
   auto tv       = in_repr.get_table_view();
 
   std::vector<std::unique_ptr<sirius::ast::node>> children;
@@ -2050,7 +2050,7 @@ TEST_CASE("native_ast - function_call add (MATERIALIZE)",
                      {cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT32}},
                      {std::pair<int, int>{0, 50}, std::pair<int, int>{0, 50}});
   auto ro       = input->to_read_only();
-  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  auto& in_repr = ro.get_data()->cast<sirius::gpu_table_representation>();
   auto tv       = in_repr.get_table_view();
 
   std::vector<std::unique_ptr<sirius::ast::node>> args;
@@ -2082,7 +2082,7 @@ TEST_CASE("native_ast - function_call add (AST_INTERPRET)",
                      {cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT32}},
                      {std::pair<int, int>{0, 50}, std::pair<int, int>{0, 50}});
   auto ro       = input->to_read_only();
-  auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+  auto& in_repr = ro.get_data()->cast<sirius::gpu_table_representation>();
   auto tv       = in_repr.get_table_view();
 
   std::vector<std::unique_ptr<sirius::ast::node>> args;
@@ -2149,7 +2149,7 @@ TEST_CASE("native_ast - comparison DISTINCT_FROM / NOT_DISTINCT_FROM executes",
   {
     auto batch    = make_int32_batch_with_nulls(*space, values, valids);
     auto ro       = batch->to_read_only();
-    auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+    auto& in_repr = ro.get_data()->cast<sirius::gpu_table_representation>();
     auto tv       = in_repr.get_table_view();
 
     auto node = std::make_unique<sirius::ast::node>(sirius::ast::comparison{
@@ -2170,7 +2170,7 @@ TEST_CASE("native_ast - comparison DISTINCT_FROM / NOT_DISTINCT_FROM executes",
   {
     auto batch    = make_int32_batch_with_nulls(*space, values, valids);
     auto ro       = batch->to_read_only();
-    auto& in_repr = ro.get_data()->cast<gpu_table_representation>();
+    auto& in_repr = ro.get_data()->cast<sirius::gpu_table_representation>();
     auto tv       = in_repr.get_table_view();
 
     auto node = std::make_unique<sirius::ast::node>(sirius::ast::comparison{

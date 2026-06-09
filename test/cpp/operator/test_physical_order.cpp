@@ -79,7 +79,7 @@ std::shared_ptr<data_batch> make_3col_batch(memory_space& space,
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
   auto gpu_repr =
-    std::make_unique<gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
+    std::make_unique<sirius::gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
   auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
 }

@@ -29,8 +29,8 @@
 #include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
 
-#include <cucascade/data/cpu_data_representation.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <data/host_data_representation.hpp>
+#include <data/gpu_table_representation.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
@@ -137,7 +137,7 @@ struct pipeline_task_history_fixture {
     auto& registry = sirius::converter_registry::get();
     {
       auto mut = batch->to_mutable();
-      mut.convert_to<cucascade::host_data_representation>(registry, host_space, stream);
+      mut.convert_to<sirius::host_data_representation>(registry, host_space, stream);
     }
     stream.synchronize();
 

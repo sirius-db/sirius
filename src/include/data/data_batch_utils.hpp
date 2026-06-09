@@ -21,7 +21,7 @@
 #include <rmm/cuda_stream_view.hpp>
 
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <data/gpu_table_representation.hpp>
 
 #include <atomic>
 #include <cstdint>
@@ -60,7 +60,7 @@ inline cudf::table_view get_cudf_table_view(const cucascade::read_only_data_batc
 {
   auto* data = batch.get_data();
   if (data == nullptr) { throw std::runtime_error("data_batch has no data representation"); }
-  return data->cast<cucascade::gpu_table_representation>().get_table_view();
+  return data->cast<sirius::gpu_table_representation>().get_table_view();
 }
 
 /**
@@ -84,7 +84,7 @@ inline cudf::table_view get_cudf_table_view(cucascade::data_batch& batch)
   auto ro    = batch.to_read_only();
   auto* data = ro.get_data();
   if (data == nullptr) { throw std::runtime_error("data_batch has no data representation"); }
-  return data->cast<cucascade::gpu_table_representation>().get_table_view();
+  return data->cast<sirius::gpu_table_representation>().get_table_view();
 }
 
 /**
@@ -109,7 +109,7 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
   cucascade::memory::memory_space& memory_space,
   rmm::cuda_stream_view writer_stream)
 {
-  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
+  auto gpu_repr = std::make_unique<sirius::gpu_table_representation>(
     std::make_unique<cudf::table>(std::move(table)), memory_space, writer_stream);
   return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(gpu_repr));
 }
@@ -126,7 +126,7 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
   cucascade::memory::memory_space& memory_space,
   rmm::cuda_stream_view writer_stream)
 {
-  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
+  auto gpu_repr = std::make_unique<sirius::gpu_table_representation>(
     std::move(table), memory_space, writer_stream);
   return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(gpu_repr));
 }

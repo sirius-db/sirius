@@ -43,7 +43,7 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <data/gpu_table_representation.hpp>
 
 #include <cmath>
 #include <limits>
@@ -356,7 +356,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
     auto* space = batch.get_memory_space();
     if (!space) { continue; }
 
-    auto view = batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+    auto view = batch.get_data()->cast<sirius::gpu_table_representation>().get_table_view();
 
     std::vector<std::unique_ptr<cudf::column>> cols;
     cols.reserve(layout.local_types.size());
@@ -454,7 +454,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
     // on `stream`; the constructor records the writer event for downstream
     // cross-device readers.
     auto out_repr =
-      std::make_unique<cucascade::gpu_table_representation>(std::move(out_table), *space, stream);
+      std::make_unique<sirius::gpu_table_representation>(std::move(out_table), *space, stream);
     std::unique_ptr<cucascade::idata_representation> output_data = std::move(out_repr);
     auto const batch_id                                          = ::sirius::get_next_batch_id();
     outputs.push_back(std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data)));
@@ -541,7 +541,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   // Acquire read access to merged batch to extract table
   auto merged_ro = merged_batch->to_read_only();
   auto merged_view =
-    merged_ro.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+    merged_ro.get_data()->cast<sirius::gpu_table_representation>().get_table_view();
 
   std::vector<std::unique_ptr<cudf::column>> output_cols;
   output_cols.reserve(layout.aggregates.size());
@@ -563,7 +563,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   // the constructor records the writer event for downstream cross-device
   // readers.
   auto out_repr =
-    std::make_unique<cucascade::gpu_table_representation>(std::move(out_table), *space, stream);
+    std::make_unique<sirius::gpu_table_representation>(std::move(out_table), *space, stream);
   std::unique_ptr<cucascade::idata_representation> output_data = std::move(out_repr);
   auto const batch_id                                          = ::sirius::get_next_batch_id();
   auto output_batch = std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data));

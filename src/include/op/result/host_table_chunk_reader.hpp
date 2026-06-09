@@ -32,9 +32,9 @@
 #include <cudf/types.hpp>
 
 // cucascade
-#include <cucascade/data/cpu_data_representation.hpp>
+#include <data/host_data_representation.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
-#include <cucascade/memory/host_table.hpp>
+#include <memory/host_table.hpp>
 
 // standard library
 #include <memory>
@@ -47,7 +47,7 @@ namespace sirius::op::result {
 //===----------------------------------------------------------------------===//
 
 /**
- * @brief Reads chunks of data from a cucascade::host_data_representation into duckdb data chunks
+ * @brief Reads chunks of data from a sirius::host_data_representation into duckdb data chunks
  */
 class host_table_chunk_reader {
   using multiple_blocks_allocation =
@@ -82,7 +82,7 @@ class host_table_chunk_reader {
      * @param[in] col The column metadata describing the column's buffer layout
      * @param[in] allocation The multiple blocks allocation containing the column data
      */
-    using allocation_ptr = cucascade::memory::host_table_allocation::buffers_ptr;
+    using allocation_ptr = sirius::memory::host_table_allocation::buffers_ptr;
 
     column_reader(cucascade::memory::column_metadata const& col,
                   std::shared_ptr<multiple_blocks_allocation> const& allocation);
@@ -132,14 +132,14 @@ class host_table_chunk_reader {
    * @brief Construct a new host table chunk reader object
    *
    * @param[in] client_ctx The duckdb client context (for allocation)
-   * @param[in] host_table The cucascade::host_data_representation to read from
+   * @param[in] host_table The sirius::host_data_representation to read from
    * @param[in] types The duckdb logical types for the chunk columns
    * @throw std::runtime_error If there is a mismatch in column metadata and types, if the row count
    * is negative or inconsistent across columns, or if the duckdb output logical type for any column
    * is HUGEINT.
    */
   host_table_chunk_reader(duckdb::ClientContext& client_ctx,
-                          cucascade::host_data_representation const& host_table,
+                          sirius::host_data_representation const& host_table,
                           duckdb::vector<sirius::logical_type> const& types);
   ~host_table_chunk_reader() = default;
 
@@ -164,7 +164,7 @@ class host_table_chunk_reader {
   }
 
  private:
-  using allocation_ptr = cucascade::memory::host_table_allocation::buffers_ptr;
+  using allocation_ptr = sirius::memory::host_table_allocation::buffers_ptr;
   duckdb::ClientContext& _client_ctx;  ///< The duckdb client context (for allocation)
   allocation_ptr _allocation;          ///< The multiple blocks allocation for the data batch
   duckdb::vector<duckdb::LogicalType> _types;  ///< The duckdb logical types for each column

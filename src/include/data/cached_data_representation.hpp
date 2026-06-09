@@ -20,7 +20,7 @@
 #include "host_parquet_representation.hpp"
 
 #include <cucascade/data/common.hpp>
-#include <cucascade/data/cpu_data_representation.hpp>
+#include <data/host_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 // standard library
@@ -106,6 +106,6 @@ class cached_shared_representation : public cucascade::idata_representation {
 using cached_host_parquet_representation =
   cached_shared_representation<host_parquet_representation>;
 using cached_host_data_representation =
-  cached_shared_representation<cucascade::host_data_representation>;
+  cached_shared_representation<sirius::host_data_representation>;
 
 }  // namespace sirius

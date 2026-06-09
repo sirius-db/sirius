@@ -210,7 +210,7 @@ size_t estimate_packed_data_bytes(cudf::table_view const& view)
   return total_bytes;
 }
 
-host_data_representation const& convert_to_host_table(
+sirius::host_data_representation const& convert_to_host_table(
   duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx,
   std::shared_ptr<data_batch> const& batch,
   rmm::cuda_stream_view stream)
@@ -236,12 +236,12 @@ host_data_representation const& convert_to_host_table(
   auto& registry = sirius::converter_registry::get();
   {
     auto mut = batch->to_mutable();
-    mut.convert_to<host_data_representation>(registry, host_space, stream);
+    mut.convert_to<sirius::host_data_representation>(registry, host_space, stream);
   }
 
   auto ro = batch->to_read_only();
   if (!ro.get_data()) { throw std::runtime_error("data_batch has no data after conversion"); }
-  return ro.get_data()->cast<host_data_representation>();
+  return ro.get_data()->cast<sirius::host_data_representation>();
 }
 
 }  // namespace

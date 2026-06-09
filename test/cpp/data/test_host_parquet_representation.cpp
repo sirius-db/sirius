@@ -27,7 +27,7 @@
 #include <memory/sirius_memory_reservation_manager.hpp>
 
 // cucascade
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <data/gpu_table_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -439,7 +439,7 @@ TEST_CASE("register_parquet_converters registers expected converters",
   SECTION("HOST Parquet -> GPU converter is registered")
   {
     REQUIRE(
-      registry.has_converter<host_parquet_representation, cucascade::gpu_table_representation>());
+      registry.has_converter<host_parquet_representation, sirius::gpu_table_representation>());
   }
 
   SECTION("HOST Parquet -> HOST Parquet converter is registered")
@@ -460,7 +460,7 @@ TEST_CASE("register_parquet_converters is idempotent", "[host_parquet_representa
 
   // Both converters should still be registered
   REQUIRE(
-    registry.has_converter<host_parquet_representation, cucascade::gpu_table_representation>());
+    registry.has_converter<host_parquet_representation, sirius::gpu_table_representation>());
   REQUIRE(registry.has_converter<host_parquet_representation, host_parquet_representation>());
 }
 
@@ -468,12 +468,12 @@ TEST_CASE("register_parquet_converters is idempotent", "[host_parquet_representa
 // host_parquet_representation -> GPU Conversion Tests
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("host_parquet_representation converts to gpu_table_representation",
+TEST_CASE("host_parquet_representation converts to sirius::gpu_table_representation",
           "[host_parquet_representation][converters][gpu]")
 {
   sirius_memory_reservation_manager mgr(create_test_configs());
   cucascade::representation_converter_registry registry;
-  cucascade::register_builtin_converters(registry);
+  sirius::register_converters(registry);
   register_parquet_converters(registry);
 
   auto* host_space = const_cast<memory_space*>(mgr.get_memory_space(Tier::HOST, 0));
@@ -515,7 +515,7 @@ TEST_CASE("host_parquet_representation converts to gpu_table_representation",
   // Use a stream from the GPU memory space's pool so it outlives the reader
   // (the hybrid_scan_reader destructor frees internal device memory that needs a valid stream)
   auto stream     = gpu_space->acquire_stream();
-  auto gpu_result = registry.convert<cucascade::gpu_table_representation>(*repr, gpu_space, stream);
+  auto gpu_result = registry.convert<sirius::gpu_table_representation>(*repr, gpu_space, stream);
   stream.synchronize();
 
   REQUIRE(gpu_result != nullptr);
@@ -535,7 +535,7 @@ TEST_CASE("host_parquet_representation converts to GPU with projected columns",
 {
   sirius_memory_reservation_manager mgr(create_test_configs());
   cucascade::representation_converter_registry registry;
-  cucascade::register_builtin_converters(registry);
+  sirius::register_converters(registry);
   register_parquet_converters(registry);
 
   auto* host_space = const_cast<memory_space*>(mgr.get_memory_space(Tier::HOST, 0));
@@ -620,7 +620,7 @@ TEST_CASE("host_parquet_representation converts to GPU with projected columns",
                                                             datasource);
 
   auto stream     = gpu_space->acquire_stream();
-  auto gpu_result = registry.convert<cucascade::gpu_table_representation>(*repr, gpu_space, stream);
+  auto gpu_result = registry.convert<sirius::gpu_table_representation>(*repr, gpu_space, stream);
   stream.synchronize();
 
   REQUIRE(gpu_result != nullptr);
@@ -640,7 +640,7 @@ TEST_CASE("host_parquet_representation converts to GPU with post-filter projecte
 {
   sirius_memory_reservation_manager mgr(create_test_configs());
   cucascade::representation_converter_registry registry;
-  cucascade::register_builtin_converters(registry);
+  sirius::register_converters(registry);
   register_parquet_converters(registry);
 
   auto* host_space = const_cast<memory_space*>(mgr.get_memory_space(Tier::HOST, 0));
@@ -682,7 +682,7 @@ TEST_CASE("host_parquet_representation converts to GPU with post-filter projecte
   REQUIRE(repr->get_post_filter_projection_ids() == post_filter_projection_ids);
 
   auto stream     = gpu_space->acquire_stream();
-  auto gpu_result = registry.convert<cucascade::gpu_table_representation>(*repr, gpu_space, stream);
+  auto gpu_result = registry.convert<sirius::gpu_table_representation>(*repr, gpu_space, stream);
   stream.synchronize();
 
   REQUIRE(gpu_result != nullptr);
@@ -718,7 +718,7 @@ TEST_CASE("host_parquet_representation clone then convert to GPU",
 {
   sirius_memory_reservation_manager mgr(create_test_configs());
   cucascade::representation_converter_registry registry;
-  cucascade::register_builtin_converters(registry);
+  sirius::register_converters(registry);
   register_parquet_converters(registry);
 
   auto* host_space = const_cast<memory_space*>(mgr.get_memory_space(Tier::HOST, 0));
@@ -740,9 +740,9 @@ TEST_CASE("host_parquet_representation clone then convert to GPU",
 
   // Convert both original and clone to GPU
   auto stream   = gpu_space->acquire_stream();
-  auto gpu_orig = registry.convert<cucascade::gpu_table_representation>(*repr, gpu_space, stream);
+  auto gpu_orig = registry.convert<sirius::gpu_table_representation>(*repr, gpu_space, stream);
   auto gpu_cloned =
-    registry.convert<cucascade::gpu_table_representation>(*cloned, gpu_space, stream);
+    registry.convert<sirius::gpu_table_representation>(*cloned, gpu_space, stream);
   stream.synchronize();
 
   REQUIRE(gpu_orig != nullptr);
@@ -785,7 +785,7 @@ TEST_CASE("host_parquet_representation cross-host copy converter",
 
   sirius_memory_reservation_manager mgr(builder.build());
   cucascade::representation_converter_registry registry;
-  cucascade::register_builtin_converters(registry);
+  sirius::register_converters(registry);
   register_parquet_converters(registry);
 
   auto* host_space_0 = const_cast<memory_space*>(mgr.get_memory_space(Tier::HOST, 0));

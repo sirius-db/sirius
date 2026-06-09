@@ -35,9 +35,9 @@
 #include <io/uring/uring_reactor.hpp>
 
 // cucascade
-#include <cucascade/data/cpu_data_representation.hpp>
+#include <data/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <data/gpu_table_representation.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
@@ -988,11 +988,11 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
   std::shared_ptr<cucascade::data_batch> batch;
   if (_materialized_columns) {
     auto& registry          = sirius::converter_registry::get();
-    auto materialized_table = registry.convert<cucascade::gpu_table_representation>(
+    auto materialized_table = registry.convert<sirius::gpu_table_representation>(
       *parquet_representation, _gpu_memory_space, stream);
     stream.synchronize();
     parquet_representation.reset();
-    auto host_table = registry.convert<cucascade::host_data_representation>(
+    auto host_table = registry.convert<sirius::host_data_representation>(
       *materialized_table, l_state.get_memory_space(), stream);
     if (_wrap_in_cache) {
       batch = std::make_shared<cucascade::data_batch>(

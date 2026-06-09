@@ -29,7 +29,7 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <data/gpu_table_representation.hpp>
 
 #include <format>
 
@@ -133,14 +133,14 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     cucascade::memory::memory_space* space = nullptr;
     for (const auto& batch : ro_input_batches) {
       if (batch.get_data()) {
-        auto& gpu_rep = batch.get_data()->cast<cucascade::gpu_table_representation>();
+        auto& gpu_rep = batch.get_data()->cast<sirius::gpu_table_representation>();
         table_views.push_back(gpu_rep.get_table_view());
         if (!space) { space = batch.get_memory_space(); }
       }
     }
     if (table_views.size() > 1 && space) {
       auto concatenated = cudf::concatenate(table_views, stream, space->get_default_allocator());
-      auto concat_rep   = std::make_unique<cucascade::gpu_table_representation>(
+      auto concat_rep   = std::make_unique<sirius::gpu_table_representation>(
         std::move(concatenated), *space, stream);
       single_batch = std::make_shared<cucascade::data_batch>(0, std::move(concat_rep));
     }
@@ -165,7 +165,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     sirius::gpu_expression_executor gpu_expression_executor(
       *local_filter_expr, cudf::get_current_device_resource_ref(), stream);
     auto filtered_table = gpu_expression_executor.select(
-      batch_ref.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
+      batch_ref.get_data()->cast<sirius::gpu_table_representation>().get_table_view());
     output_batch =
       sirius::make_data_batch(std::move(filtered_table), *batch_ref.get_memory_space(), stream);
   } else {
@@ -185,7 +185,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   std::size_t num_batch_cols = 0;
   {
     auto output_ro = output_batch->to_read_only();
-    auto& gpu_rep  = output_ro.get_data()->cast<cucascade::gpu_table_representation>();
+    auto& gpu_rep  = output_ro.get_data()->cast<sirius::gpu_table_representation>();
     num_batch_cols = static_cast<std::size_t>(gpu_rep.get_table_view().num_columns());
   }  // read lock released here
 
@@ -210,7 +210,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     {
       auto output_ro = output_batch->to_read_only();
       space          = output_ro.get_memory_space();
-      auto& gpu_rep  = output_ro.get_data()->cast<cucascade::gpu_table_representation>();
+      auto& gpu_rep  = output_ro.get_data()->cast<sirius::gpu_table_representation>();
       auto table     = gpu_rep.release_table(stream);
       columns        = table->release();
     }  // read lock released here
@@ -235,7 +235,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     }
 
     auto projected_table = std::make_unique<cudf::table>(std::move(selected));
-    auto projected_rep   = std::make_unique<cucascade::gpu_table_representation>(
+    auto projected_rep   = std::make_unique<sirius::gpu_table_representation>(
       std::move(projected_table), *space, stream);
     output_batch = std::make_shared<cucascade::data_batch>(batch_id, std::move(projected_rep));
   }

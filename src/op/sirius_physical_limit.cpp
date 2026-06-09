@@ -23,7 +23,7 @@
 
 #include <nvtx3/nvtx3.hpp>
 
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <data/gpu_table_representation.hpp>
 
 namespace sirius {
 namespace op {
@@ -87,7 +87,7 @@ std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(
     // Check if limit is already exhausted
     if (_remaining_limit.load(std::memory_order_acquire) <= 0) { break; }
 
-    auto view     = batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+    auto view     = batch.get_data()->cast<sirius::gpu_table_representation>().get_table_view();
     auto num_rows = static_cast<int64_t>(view.num_rows());
 
     if (num_rows == 0) { continue; }
@@ -110,7 +110,7 @@ std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(
     auto sliced_table = std::make_unique<cudf::table>(
       slices.front(), stream, batch.get_memory_space()->get_default_allocator());
     std::unique_ptr<cucascade::idata_representation> output_data =
-      std::make_unique<cucascade::gpu_table_representation>(
+      std::make_unique<sirius::gpu_table_representation>(
         std::move(sliced_table), *batch.get_memory_space(), stream);
 
     auto const batch_id = ::sirius::get_next_batch_id();

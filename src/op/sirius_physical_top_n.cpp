@@ -33,7 +33,7 @@
 
 #include <nvtx3/nvtx3.hpp>
 
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <data/gpu_table_representation.hpp>
 
 #include <algorithm>
 #include <memory>
@@ -180,7 +180,7 @@ std::unique_ptr<operator_data> sirius_physical_top_n::execute(const operator_dat
   }
 
   auto input_table_view =
-    input_batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+    input_batch.get_data()->cast<sirius::gpu_table_representation>().get_table_view();
   auto output_table = compute_top_n_table(
     input_table_view, orders, limit, offset, stream, space->get_default_allocator());
   // ro released at end of function
@@ -190,7 +190,7 @@ std::unique_ptr<operator_data> sirius_physical_top_n::execute(const operator_dat
   // the constructor records the writer event so cross-device readers honor
   // the producer-consumer ordering.
   auto output_repr =
-    std::make_unique<cucascade::gpu_table_representation>(std::move(output_table), *space, stream);
+    std::make_unique<sirius::gpu_table_representation>(std::move(output_table), *space, stream);
   std::unique_ptr<cucascade::idata_representation> output_data = std::move(output_repr);
   outputs.push_back(
     std::make_shared<cucascade::data_batch>(::sirius::get_next_batch_id(), std::move(output_data)));
@@ -257,7 +257,7 @@ std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operat
   std::vector<cudf::table_view> concat_views;
   for (auto const& batch : input_batches) {
     concat_views.push_back(
-      batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
+      batch.get_data()->cast<sirius::gpu_table_representation>().get_table_view());
   }
 
   if (concat_views.empty()) {
@@ -289,7 +289,7 @@ std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operat
   // STREAM-LINEAGE: compute_top_n_table + slice write on `stream`; the
   // constructor records the writer event for downstream cross-device readers.
   auto output_repr =
-    std::make_unique<cucascade::gpu_table_representation>(std::move(output_table), *space, stream);
+    std::make_unique<sirius::gpu_table_representation>(std::move(output_table), *space, stream);
   std::unique_ptr<cucascade::idata_representation> output_data = std::move(output_repr);
   outputs.push_back(
     std::make_shared<cucascade::data_batch>(::sirius::get_next_batch_id(), std::move(output_data)));

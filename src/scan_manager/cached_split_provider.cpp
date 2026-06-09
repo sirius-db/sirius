@@ -26,9 +26,9 @@
 
 #include <cuda_runtime.h>
 
-#include <cucascade/data/cpu_data_representation.hpp>
+#include <data/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <data/gpu_table_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
 
 #include <span>
@@ -73,7 +73,7 @@ cached_split_provider::cached_split_provider(
 }
 
 cached_split_provider::cached_split_provider(
-  std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
+  std::vector<std::shared_ptr<sirius::host_data_representation>> host_chunks,
   std::vector<std::size_t> column_indices,
   cucascade::memory::memory_space& memory_space,
   std::unordered_map<int, cucascade::memory::memory_space*> gpu_memory_spaces,
@@ -133,7 +133,7 @@ std::vector<std::unique_ptr<op::operator_data>> cached_split_provider::produce_s
         cudf::table_view view(col_views);
         auto* chunk_space =
           !_chunk_memory_spaces.empty() ? _chunk_memory_spaces.at(batch_idx) : _memory_space;
-        auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
+        auto gpu_repr = std::make_unique<sirius::gpu_table_representation>(
           view, std::move(chunk), alloc_size, *chunk_space, rmm::cuda_stream_view{});
         return std::make_shared<cucascade::data_batch>(::sirius::get_next_batch_id(),
                                                        std::move(gpu_repr));

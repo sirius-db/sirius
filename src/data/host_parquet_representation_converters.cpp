@@ -23,7 +23,7 @@
 #include <op/scan/prefetched_data_source.hpp>
 
 // cucascade
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <data/gpu_table_representation.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
@@ -206,7 +206,7 @@ convert_host_parquet_to_gpu_with_prefetched_data_source(
   // identity that any cross-device reader (cucascade::convert_gpu_to_gpu) must
   // observe — record the writer event so the subsequent reader's
   // cudaStreamWaitEvent receives a real ordering primitive.
-  auto repr = std::make_unique<cucascade::gpu_table_representation>(
+  auto repr = std::make_unique<sirius::gpu_table_representation>(
     std::move(table),
     *const_cast<cucascade::memory::memory_space*>(target_memory_space),
     target_stream);
@@ -294,8 +294,8 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_host_pa
 void register_parquet_converters(cucascade::representation_converter_registry& registry)
 {
   // HOST Parquet -> GPU
-  if (!registry.has_converter<host_parquet_representation, cucascade::gpu_table_representation>()) {
-    registry.register_converter<host_parquet_representation, cucascade::gpu_table_representation>(
+  if (!registry.has_converter<host_parquet_representation, sirius::gpu_table_representation>()) {
+    registry.register_converter<host_parquet_representation, sirius::gpu_table_representation>(
       detail::convert_host_parquet_to_gpu_with_prefetched_data_source);
   }
 
@@ -306,27 +306,27 @@ void register_parquet_converters(cucascade::representation_converter_registry& r
   }
 
   if (!registry
-         .has_converter<cached_host_data_representation, cucascade::gpu_table_representation>()) {
+         .has_converter<cached_host_data_representation, sirius::gpu_table_representation>()) {
     registry
-      .register_converter<cached_host_data_representation, cucascade::gpu_table_representation>(
+      .register_converter<cached_host_data_representation, sirius::gpu_table_representation>(
         [&registry](cucascade::idata_representation& source,
                     const cucascade::memory::memory_space* target_memory_space,
                     rmm::cuda_stream_view stream) {
           auto r = source.cast<cached_host_data_representation>().get_representation();
-          return registry.convert<cucascade::gpu_table_representation>(
+          return registry.convert<sirius::gpu_table_representation>(
             *r, target_memory_space, stream);
         });
   }
 
   if (!registry.has_converter<cached_host_parquet_representation,
-                              cucascade::gpu_table_representation>()) {
+                              sirius::gpu_table_representation>()) {
     registry
-      .register_converter<cached_host_parquet_representation, cucascade::gpu_table_representation>(
+      .register_converter<cached_host_parquet_representation, sirius::gpu_table_representation>(
         [&registry](cucascade::idata_representation& source,
                     const cucascade::memory::memory_space* target_memory_space,
                     rmm::cuda_stream_view stream) {
           auto r = source.cast<cached_host_parquet_representation>().get_representation();
-          return registry.convert<cucascade::gpu_table_representation>(
+          return registry.convert<sirius::gpu_table_representation>(
             *r, target_memory_space, stream);
         });
   }

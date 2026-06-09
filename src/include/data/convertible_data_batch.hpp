@@ -22,11 +22,11 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
-#include <cucascade/data/cpu_data_representation.hpp>
+#include <data/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/data/disk_data_representation.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <data/gpu_table_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
@@ -115,11 +115,11 @@ class convertible_data_batch : public convertible_data {
 
       switch (space->get_tier()) {
         case cucascade::memory::Tier::GPU:
-          mut.convert_to<cucascade::gpu_table_representation>(
+          mut.convert_to<sirius::gpu_table_representation>(
             converter_registry, mem_space, stream);
           break;
         case cucascade::memory::Tier::HOST:
-          mut.convert_to<cucascade::host_data_representation>(
+          mut.convert_to<sirius::host_data_representation>(
             converter_registry, mem_space, stream);
           break;
         case cucascade::memory::Tier::DISK:

@@ -204,7 +204,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   auto merged_mut    = merged->to_mutable();
   auto* space        = merged_mut.get_memory_space();
   auto mr            = space->get_default_allocator();
-  auto& gpu_rep      = merged_mut.get_data()->cast<cucascade::gpu_table_representation>();
+  auto& gpu_rep      = merged_mut.get_data()->cast<sirius::gpu_table_representation>();
   auto merged_cols   = gpu_rep.release_table(stream)->release();
   int num_group_cols = static_cast<int>(group_idx.size());
 

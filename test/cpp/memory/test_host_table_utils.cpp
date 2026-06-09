@@ -28,8 +28,8 @@
 #include <op/scan/duckdb_scan_task.hpp>
 
 // cucascade
-#include <cucascade/data/cpu_data_representation.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <data/host_data_representation.hpp>
+#include <data/gpu_table_representation.hpp>
 
 // cudf
 #include <cudf/null_mask.hpp>
@@ -326,7 +326,7 @@ size_t estimate_packed_data_bytes(cudf::table_view const& view)
   return total_bytes;
 }
 
-cucascade::host_data_representation const& convert_to_host_table(
+sirius::host_data_representation const& convert_to_host_table(
   duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx,
   std::shared_ptr<cucascade::data_batch> const& batch,
   rmm::cuda_stream_view stream)
@@ -346,13 +346,13 @@ cucascade::host_data_representation const& convert_to_host_table(
   auto& registry = sirius::converter_registry::get();
   {
     auto mut = batch->to_mutable();
-    mut.convert_to<cucascade::host_data_representation>(registry, host_space, stream);
+    mut.convert_to<sirius::host_data_representation>(registry, host_space, stream);
   }
 
   auto ro    = batch->to_read_only();
   auto* data = ro.get_data();
   if (!data) { throw std::runtime_error("data_batch has no data after conversion"); }
-  return data->cast<cucascade::host_data_representation>();
+  return data->cast<sirius::host_data_representation>();
 }
 
 }  // namespace
@@ -473,16 +473,16 @@ TEST_CASE("host_table_utils - pack metadata with gaps across multiple blocks",
 
   auto const sz = allocation->size_bytes();
   auto table_allocation =
-    cucascade::memory::host_table_allocation::create(std::move(allocation), std::move(columns), sz);
+    sirius::memory::host_table_allocation::create(std::move(allocation), std::move(columns), sz);
   auto host_table =
-    std::make_unique<cucascade::host_data_representation>(std::move(table_allocation), host_space);
+    std::make_unique<sirius::host_data_representation>(std::move(table_allocation), host_space);
   auto batch =
     std::make_shared<cucascade::data_batch>(sirius::get_next_batch_id(), std::move(host_table));
 
   auto& registry = sirius::converter_registry::get();
   {
     auto mut = batch->to_mutable();
-    mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
+    mut.convert_to<sirius::gpu_table_representation>(registry, gpu_space, stream);
   }
 
   cudf::table_view table_view = sirius::get_cudf_table_view(*batch);
@@ -603,16 +603,16 @@ TEST_CASE("host_table_utils - underfilled varchar column truncates rows",
 
   auto const sz = allocation->size_bytes();
   auto table_allocation =
-    cucascade::memory::host_table_allocation::create(std::move(allocation), std::move(columns), sz);
+    sirius::memory::host_table_allocation::create(std::move(allocation), std::move(columns), sz);
   auto host_table =
-    std::make_unique<cucascade::host_data_representation>(std::move(table_allocation), host_space);
+    std::make_unique<sirius::host_data_representation>(std::move(table_allocation), host_space);
   auto batch =
     std::make_shared<cucascade::data_batch>(sirius::get_next_batch_id(), std::move(host_table));
 
   auto& registry = sirius::converter_registry::get();
   {
     auto mut = batch->to_mutable();
-    mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
+    mut.convert_to<sirius::gpu_table_representation>(registry, gpu_space, stream);
   }
 
   cudf::table_view table_view = sirius::get_cudf_table_view(*batch);
@@ -702,7 +702,7 @@ TEST_CASE("host_table_utils - metadata offsets match packed data",
 
   auto const& string_col = cols[2];
   REQUIRE(string_col.children.size() == 1);
-  REQUIRE(string_col.children[0].type_id == cudf::type_id::INT64);
+  REQUIRE(static_cast<cudf::type_id>(string_col.children[0].type_id) == cudf::type_id::INT64);
 
   sirius::memory::multiple_blocks_allocation_accessor<int64_t> offset_accessor;
   offset_accessor.initialize(string_col.children[0].data_offset, allocation);

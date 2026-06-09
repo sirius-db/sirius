@@ -21,7 +21,7 @@
 
 #include <cudf/column/column.hpp>
 
-#include <cucascade/data/cpu_data_representation.hpp>
+#include <data/host_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/planner/expression.hpp>
 
@@ -74,7 +74,7 @@ class cached_split_provider : public split_provider {
   using gpu_chunk = std::vector<std::shared_ptr<cudf::column>>;
   /// One emitted batch's worth of host-resident data; produce_split() slices it
   /// down to the requested column indices before wrapping it as a data_batch.
-  using host_chunk = std::shared_ptr<cucascade::host_data_representation>;
+  using host_chunk = std::shared_ptr<sirius::host_data_representation>;
   /// Per-batch storage — exactly one of the two alternatives is populated per
   /// emitted chunk. The same provider only ever holds chunks of one tier (set
   /// at construction by which ctor was called).
@@ -103,7 +103,7 @@ class cached_split_provider : public split_provider {
   ///                          and converts host chunks onto the matching space.
   ///                          Empty map throws at conversion time.
   cached_split_provider(
-    std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
+    std::vector<std::shared_ptr<sirius::host_data_representation>> host_chunks,
     std::vector<std::size_t> column_indices,
     cucascade::memory::memory_space& memory_space,
     std::unordered_map<int, cucascade::memory::memory_space*> gpu_memory_spaces,

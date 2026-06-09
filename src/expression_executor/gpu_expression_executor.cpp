@@ -24,7 +24,7 @@
 #include <sirius/exception.hpp>
 
 // cucascade
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <data/gpu_table_representation.hpp>
 #include <data/data_batch_utils.hpp>
 
 // duckdb

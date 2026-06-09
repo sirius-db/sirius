@@ -27,7 +27,7 @@
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
 
-#include <cucascade/data/cpu_data_representation.hpp>
+#include <data/host_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/vector.hpp>
@@ -147,7 +147,7 @@ struct pinned_entry {
   /// HOST-tier storage: one host_data_representation per chunk, each holding all
   /// pinned columns. The cached_split_provider slices these by column index when
   /// serving a particular scan. Populated by @ref insert_pinned_entry_host.
-  std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;
+  std::vector<std::shared_ptr<sirius::host_data_representation>> host_chunks;
   /// Tier the pinned data resides in. Drives which storage member above is used
   /// and which cached_split_provider variant @ref create_provider_for builds.
   cucascade::memory::Tier tier{cucascade::memory::Tier::GPU};
@@ -318,7 +318,7 @@ class sirius_scan_manager {
     const std::string& name,
     std::vector<std::string> column_names,
     std::vector<std::string> file_paths,
-    std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
+    std::vector<std::shared_ptr<sirius::host_data_representation>> host_chunks,
     cucascade::memory::memory_space& memory_space,
     bool is_partial = false);
 
