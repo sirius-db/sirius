@@ -143,7 +143,9 @@ int main(int argc, char* argv[])
   // suite is run with SIRIUS_TEST_S3_AUTO=1; a no-op otherwise. Doing it here
   // (rather than per-test) keeps it out of the default `make test` path and lets
   // a strict bring-up failure abort with a clear message instead of silently
-  // skipping every [s3] test green.
+  // skipping every [s3] test green. Compiled only when the testcontainers
+  // harness is built (SIRIUS_BUILD_S3_TESTS).
+#ifdef SIRIUS_HAVE_TESTCONTAINERS
   try {
     sirius::test::ensure_s3_container_env();
   } catch (std::exception const& e) {
@@ -151,12 +153,15 @@ int main(int argc, char* argv[])
     sirius::test::shutdown_s3_container_env();
     return EXIT_FAILURE;
   }
+#endif
 
   Catch::Session session;
   session.applyCommandLine(argc, argv);
   int result = session.run();
 
+#ifdef SIRIUS_HAVE_TESTCONTAINERS
   sirius::test::shutdown_s3_container_env();
+#endif
 
   sirius::test::g_integration_env_2gpu = nullptr;
   sirius::test::g_integration_env      = nullptr;
