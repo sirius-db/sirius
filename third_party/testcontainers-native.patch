@@ -108,4 +108,3 @@ index ba44bbe..1ecab3d 100644
 +
  int tc_container_send_http_get(int container_id, int port, const char* endpoint, char* response_body, char* error) {
      struct tc_bridge_send_http_get_return result = tc_bridge_send_http_get(container_id, port, endpoint);
-
