@@ -78,11 +78,17 @@ namespace sirius::scan_manager {
 struct scan_manager_config {
   exec::thread_pool_config thread_pool{.num_threads = 8, .thread_name_prefix = "scan_manager"};
   bool use_sirius_datasource{false};
-  /// Number of @c uring_reactor instances in the ioctx pool.  Ignored when
-  /// @c use_sirius_datasource is false.
+  /// Reserved (not currently consumed). Intended size of the @c uring_reactor
+  /// pool, but the production @c uring_ioctx is built by @c SiriusContext, which
+  /// scales the reactor count with the number of GPUs the NUMA node serves
+  /// (@c clamp(4 * devices, 4, 16)) rather than reading this field. Parsed from
+  /// YAML and kept for forward compatibility / tests; setting it has no effect
+  /// on the engine today.
   std::size_t uring_n_reactors{4};
-  /// io_uring submission/completion queue depth per reactor.  Ignored when
-  /// @c use_sirius_datasource is false.
+  /// Reserved (not currently consumed). Intended io_uring submission/completion
+  /// queue depth per reactor; the production @c uring_ioctx hardcodes 64. Parsed
+  /// from YAML and kept for forward compatibility / tests; setting it has no
+  /// effect on the engine today.
   unsigned uring_ring_entries{64};
   /// Enable the prefetching cache.  Requires @c use_sirius_datasource=true;
   /// when true, SiriusContext (S6) allocates a pinned-host buffer_pool and
