@@ -16,12 +16,34 @@
 
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
-#include "expression/expression.hpp"
+#include "expression/ast/from_duckdb.hpp"
+#include "expression/ast/node.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/sirius_physical_projection.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
+#include <memory>
+
 namespace sirius::planner {
+
+namespace {
+
+// Translate a vector of DuckDB expressions into Sirius AST nodes at the planner
+// boundary. The source vector is drained; size and order are preserved, with a
+// null slot wherever from_duckdb declines an unsupported shape (a fallback
+// signal) — matching the prior bulk-translation null-skip semantics.
+duckdb::vector<std::unique_ptr<sirius::ast::node>> translate_expressions(
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs)
+{
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> out;
+  out.reserve(exprs.size());
+  for (auto& e : exprs) {
+    out.push_back(e ? sirius::ast::from_duckdb(*e) : nullptr);
+  }
+  return out;
+}
+
+}  // namespace
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalProjection& op)
@@ -56,7 +78,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalProjection& op)
 
   auto projection = duckdb::make_uniq<sirius::op::sirius_physical_projection>(
     sirius::from_duckdb_vec(op.types),
-    sirius::wrap_many(std::move(op.expressions)),
+    translate_expressions(std::move(op.expressions)),
     op.estimated_cardinality);
   projection->children.push_back(std::move(plan));
   return std::move(projection);

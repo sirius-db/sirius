@@ -510,11 +510,14 @@ TEST_CASE("ast_to_duckdb - case_expr (single WHEN/THEN + ELSE) translates to Bou
       comparison{sirius::comparison_type::equal, make_ref(0), make_int_const(1)}),
     /*then_=*/make_int_const(10),
   });
-  node orig{case_expr{std::move(cases), /*else_=*/make_int_const(0)}};
+  node orig{case_expr{std::move(cases),
+                      /*else_=*/make_int_const(0),
+                      sirius::logical_type::make(sirius::type_id::INTEGER)}};
   auto out = sirius::ast::to_duckdb(orig);
   REQUIRE(out);
   REQUIRE(out->GetExpressionClass() == ExpressionClass::BOUND_CASE);
   auto const& ce = out->Cast<BoundCaseExpression>();
+  REQUIRE(ce.return_type.id() == LogicalTypeId::INTEGER);
   REQUIRE(ce.case_checks.size() == 1);
   REQUIRE(ce.case_checks[0].when_expr);
   REQUIRE(ce.case_checks[0].then_expr);
@@ -535,7 +538,8 @@ TEST_CASE("ast_to_duckdb - case_expr (two WHEN/THEN + ELSE) translates to BoundC
       comparison{sirius::comparison_type::equal, make_ref(0), make_int_const(2)}),
     make_int_const(20),
   });
-  node orig{case_expr{std::move(cases), make_int_const(0)}};
+  node orig{case_expr{
+    std::move(cases), make_int_const(0), sirius::logical_type::make(sirius::type_id::INTEGER)}};
   auto out = sirius::ast::to_duckdb(orig);
   REQUIRE(out);
   REQUIRE(out->GetExpressionClass() == ExpressionClass::BOUND_CASE);
@@ -627,10 +631,11 @@ TEST_CASE("ast_to_duckdb - coalesce (3 args) translates to OPERATOR_COALESCE", "
   children.push_back(make_ref(0));
   children.push_back(make_ref(1));
   children.push_back(make_int_const(0));
-  node orig{coalesce{std::move(children)}};
+  node orig{coalesce{std::move(children), sirius::logical_type::make(sirius::type_id::INTEGER)}};
   auto out = sirius::ast::to_duckdb(orig);
   REQUIRE(out);
   REQUIRE(out->GetExpressionType() == ExpressionType::OPERATOR_COALESCE);
+  REQUIRE(out->Cast<BoundOperatorExpression>().return_type.id() == LogicalTypeId::INTEGER);
   REQUIRE(out->Cast<BoundOperatorExpression>().children.size() == 3);
 }
 
@@ -763,6 +768,50 @@ TEST_CASE("ast_to_duckdb - function_call year translates to BoundFunctionExpress
 }
 
 // ============================================================================
+// case_expr / coalesce return_type fidelity — regression guard (#701)
+//
+// The AST-path executor recovers each expression's return_type by round-tripping
+// the node through to_duckdb, so case_expr and coalesce MUST emit their recorded
+// return_type rather than a placeholder. The earlier INTEGER-typed cases above
+// cannot catch a placeholder regression (the placeholder itself was INTEGER), so
+// these assert a non-INTEGER (DECIMAL) return type survives the Sirius->DuckDB
+// translation. A DECIMAL silently narrowed to INTEGER corrupts the materialized
+// result and trips a downstream join type-mismatch.
+// ============================================================================
+
+TEST_CASE("ast_to_duckdb - case_expr preserves non-INTEGER (DECIMAL) return_type",
+          "[ast_to_duckdb]")
+{
+  std::vector<case_expr::when_then> cases;
+  cases.push_back(case_expr::when_then{
+    std::make_unique<node>(comparison{sirius::comparison_type::gt, make_ref(0), make_int_const(1)}),
+    make_int_const(10),
+  });
+  node orig{case_expr{std::move(cases),
+                      /*else_=*/make_int_const(0),
+                      sirius::logical_type::make_decimal(/*precision=*/38, /*scale=*/12)}};
+  auto out = sirius::ast::to_duckdb(orig);
+  REQUIRE(out);
+  REQUIRE(out->GetExpressionClass() == ExpressionClass::BOUND_CASE);
+  // Must be the recorded DECIMAL type, NOT an INTEGER placeholder.
+  REQUIRE(out->Cast<BoundCaseExpression>().return_type.id() == LogicalTypeId::DECIMAL);
+}
+
+TEST_CASE("ast_to_duckdb - coalesce preserves non-INTEGER (DECIMAL) return_type", "[ast_to_duckdb]")
+{
+  std::vector<std::unique_ptr<node>> children;
+  children.push_back(make_ref(0));
+  children.push_back(make_ref(1));
+  node orig{coalesce{std::move(children),
+                     sirius::logical_type::make_decimal(/*precision=*/38, /*scale=*/12)}};
+  auto out = sirius::ast::to_duckdb(orig);
+  REQUIRE(out);
+  REQUIRE(out->GetExpressionType() == ExpressionType::OPERATOR_COALESCE);
+  // Must be the recorded DECIMAL type, NOT an INTEGER placeholder.
+  REQUIRE(out->Cast<BoundOperatorExpression>().return_type.id() == LogicalTypeId::DECIMAL);
+}
+
+// ============================================================================
 // Self-equivalence sweep — for every alternative, round-trip through
 // from_duckdb(*to_duckdb(node)) and check structural equivalence with the
 // original node tree.
@@ -840,7 +889,8 @@ TEST_CASE("ast_to_duckdb - case_expr self-equivalence via from_duckdb", "[ast_to
       comparison{sirius::comparison_type::equal, make_ref(0), make_int_const(1)}),
     make_int_const(10),
   });
-  node orig{case_expr{std::move(cases), make_int_const(0)}};
+  node orig{case_expr{
+    std::move(cases), make_int_const(0), sirius::logical_type::make(sirius::type_id::INTEGER)}};
   auto duck_expr = sirius::ast::to_duckdb(orig);
   REQUIRE(duck_expr);
   auto round = sirius::ast::from_duckdb(*duck_expr);
@@ -878,7 +928,7 @@ TEST_CASE("ast_to_duckdb - coalesce self-equivalence via from_duckdb", "[ast_to_
   children.push_back(make_ref(0));
   children.push_back(make_ref(1));
   children.push_back(make_int_const(0));
-  node orig{coalesce{std::move(children)}};
+  node orig{coalesce{std::move(children), sirius::logical_type::make(sirius::type_id::INTEGER)}};
   auto duck_expr = sirius::ast::to_duckdb(orig);
   REQUIRE(duck_expr);
   auto round = sirius::ast::from_duckdb(*duck_expr);

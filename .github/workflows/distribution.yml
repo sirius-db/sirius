@@ -19,55 +19,67 @@ on:
       - dev
   merge_group:
   pull_request:
-    paths:
-      - .github/workflows/distribution.yml
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
 
 jobs:
   cuda-13:
+    if: github.event_name != 'pull_request'
     uses: sirius-db/extension-ci-tools/.github/workflows/_extension_distribution.yml@sirius
     with:
       extension_name: sirius
       duckdb_version: v1.5.3
       ci_tools_version: sirius
-      exclude_archs: 'linux_amd64_musl;linux_arm64_musl;osx_amd64;osx_arm64;windows_amd64;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
-      extra_toolchains: 'cuda;rust;protobuf'
-      vcpkg_url: 'https://github.com/microsoft/vcpkg.git'
-      vcpkg_commit: 'ffc071e0c08432c60c9b64f00334c0227667931b'
+      exclude_archs: "linux_amd64_musl;linux_arm64_musl;osx_amd64;osx_arm64;windows_amd64;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads"
+      extra_toolchains: "cuda;rust;protobuf"
+      vcpkg_url: "https://github.com/microsoft/vcpkg.git"
+      vcpkg_commit: "ffc071e0c08432c60c9b64f00334c0227667931b"
       vcpkg_binary_cache_enabled: true
       skip_tests: true
-      reduced_ci_mode: 'disabled'
-      override_ci_tools_repository: 'sirius-db/extension-ci-tools'
+      reduced_ci_mode: "disabled"
+      override_ci_tools_repository: "sirius-db/extension-ci-tools"
       build_type: ci-release
       build_duckdb_shell: false
-      vcpkg_overlay_ports: 'vcpkg_ports'
-      vcpkg_overlay_triplets: 'vcpkg_triplets'
-      cuda_archs: '75-real;80-real;86-real;89-real;90a-real;100f-real;120a-real;120'
-      cuda_version: '13'
-      artifact_postfix: '-cuda13'
+      vcpkg_overlay_ports: "vcpkg_ports"
+      vcpkg_overlay_triplets: "vcpkg_triplets"
+      cuda_archs: "75-real;80-real;86-real;89-real;90a-real;100f-real;120a-real;120"
+      cuda_version: "13"
+      artifact_postfix: "-cuda13"
       runners: '{"linux_x64": ["self-hosted", "ubuntu-24.04", "cpu-xl"], "linux_arm64": ["self-hosted", "ubuntu-24.04", "arm-xl"]}'
 
   cuda-12:
+    if: github.event_name != 'pull_request'
     uses: sirius-db/extension-ci-tools/.github/workflows/_extension_distribution.yml@sirius
     with:
       extension_name: sirius
       duckdb_version: v1.5.3
       ci_tools_version: sirius
-      exclude_archs: 'linux_amd64_musl;linux_arm64_musl;osx_amd64;osx_arm64;windows_amd64;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
-      extra_toolchains: 'cuda;rust;protobuf'
-      vcpkg_url: 'https://github.com/microsoft/vcpkg.git'
-      vcpkg_commit: 'ffc071e0c08432c60c9b64f00334c0227667931b'
+      exclude_archs: "linux_amd64_musl;linux_arm64_musl;osx_amd64;osx_arm64;windows_amd64;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads"
+      extra_toolchains: "cuda;rust;protobuf"
+      vcpkg_url: "https://github.com/microsoft/vcpkg.git"
+      vcpkg_commit: "ffc071e0c08432c60c9b64f00334c0227667931b"
       vcpkg_binary_cache_enabled: true
       skip_tests: true
-      reduced_ci_mode: 'disabled'
-      override_ci_tools_repository: 'sirius-db/extension-ci-tools'
+      reduced_ci_mode: "disabled"
+      override_ci_tools_repository: "sirius-db/extension-ci-tools"
       build_type: ci-release
       build_duckdb_shell: false
-      vcpkg_overlay_ports: 'vcpkg_ports'
-      vcpkg_overlay_triplets: 'vcpkg_triplets'
-      cuda_archs: '75-real;80-real;86-real;89-real;90a-real'
-      cuda_version: '12'
-      artifact_postfix: '-cuda12'
+      vcpkg_overlay_ports: "vcpkg_ports"
+      vcpkg_overlay_triplets: "vcpkg_triplets"
+      cuda_archs: "75-real;80-real;86-real;89-real;90a-real"
+      cuda_version: "12"
+      artifact_postfix: "-cuda12"
       runners: '{"linux_x64": ["self-hosted", "ubuntu-22.04", "cpu-xl"], "linux_arm64": ["self-hosted", "ubuntu-22.04", "arm-xl"]}'
+
+  distribution:
+    runs-on: ubuntu-slim
+    needs: [cuda-12, cuda-13]
+    if: always()
+    steps:
+      - name: Check
+        run: |
+          for r in "${{ needs.cuda-12.result }}" "${{ needs.cuda-13.result }}"; do
+            case "$r" in failure|cancelled) echo "distribution build $r"; exit 1 ;; esac
+          done
+          echo "ok (cuda-12=${{ needs.cuda-12.result }}, cuda-13=${{ needs.cuda-13.result }})"

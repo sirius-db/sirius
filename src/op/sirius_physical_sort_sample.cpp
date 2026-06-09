@@ -21,10 +21,9 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
 #include "op/cudf_sort_order.hpp"
+#include "op/merge/gpu_merge_impl.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
-
-#include <cudf/concatenate.hpp>
 
 #include <nvtx3/nvtx3.hpp>
 
@@ -33,9 +32,49 @@
 namespace sirius {
 namespace op {
 
-sirius_physical_sort_sample::sirius_physical_sort_sample(sirius_physical_order* order_by)
-  : sirius_physical_sort_sample(
-      order_by->types, copy_orders(order_by->orders), order_by->estimated_cardinality)
+namespace {
+
+uint64_t get_batch_bytes(const std::shared_ptr<::cucascade::data_batch>& batch)
+{
+  if (!batch) { return 0; }
+  auto ro = batch->to_read_only();
+  if (!ro.get_data()) { return 0; }
+  return ro.get_data()->get_size_in_bytes();
+}
+
+bool repo_has_enough_sample_bytes(::cucascade::shared_data_repository* repo,
+                                  uint64_t sort_sample_bytes,
+                                  bool upstream_finished)
+{
+  if (!repo) { return false; }
+  // Upstream done with no rows still needs a READY signal so the pipeline can drain.
+  if (upstream_finished) { return true; }
+  if (repo->total_size() == 0) { return false; }
+
+  uint64_t accumulated = 0;
+  for (size_t part = 0; part < repo->num_partitions(); ++part) {
+    for (auto batch_id : repo->get_batch_ids(part)) {
+      auto batch = repo->get_data_batch_by_id(batch_id, part);
+      if (!batch) { continue; }
+      accumulated += get_batch_bytes(batch);
+      if (accumulated >= sort_sample_bytes) { return true; }
+    }
+  }
+  return false;
+}
+
+}  // namespace
+
+sirius_physical_sort_sample::sirius_physical_sort_sample(sirius_physical_order* order_by,
+                                                         uint64_t sort_sample_bytes,
+                                                         uint64_t max_partition_bytes,
+                                                         double max_partition_memory_fraction)
+  : sirius_physical_sort_sample(order_by->types,
+                                copy_orders(order_by->orders),
+                                order_by->estimated_cardinality,
+                                sort_sample_bytes,
+                                max_partition_bytes,
+                                max_partition_memory_fraction)
 {
 }
 
@@ -43,11 +82,15 @@ sirius_physical_sort_sample::sirius_physical_sort_sample(
   duckdb::vector<sirius::logical_type> types,
   duckdb::vector<duckdb::BoundOrderByNode> orders,
   std::size_t estimated_cardinality,
-  std::size_t num_sample_batches)
+  uint64_t sort_sample_bytes,
+  uint64_t max_partition_bytes,
+  double max_partition_memory_fraction)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::SORT_SAMPLE, std::move(types), estimated_cardinality),
     orders(std::move(orders)),
-    num_sample_batches(num_sample_batches)
+    _sort_sample_bytes(sort_sample_bytes),
+    _max_partition_bytes_override(max_partition_bytes),
+    _max_partition_memory_fraction(max_partition_memory_fraction)
 {
 }
 
@@ -58,17 +101,15 @@ std::optional<task_creation_hint> sirius_physical_sort_sample::get_next_task_hin
     return sirius_physical_operator::get_next_task_hint();
   }
 
-  // Need to wait for N batches before computing boundaries
+  // Need to wait for enough sample bytes before computing boundaries
   auto port_ids = get_port_ids();
   if (port_ids.empty()) { return std::nullopt; }
 
   auto* p = get_port(port_ids[0]);
-  if (!p) { return std::nullopt; }
+  if (!p || !p->repo) { return std::nullopt; }
 
   bool upstream_finished = p->src_pipeline && p->src_pipeline->is_pipeline_finished();
-  bool has_enough        = p->repo->size() >= static_cast<size_t>(num_sample_batches);
-
-  if (has_enough || (upstream_finished && p->repo->size() > 0)) {
+  if (repo_has_enough_sample_bytes(p->repo, _sort_sample_bytes, upstream_finished)) {
     return task_creation_hint{TaskCreationHint::READY, this};
   }
 
@@ -78,6 +119,36 @@ std::optional<task_creation_hint> sirius_physical_sort_sample::get_next_task_hin
   }
 
   return std::nullopt;
+}
+
+std::unique_ptr<operator_data> sirius_physical_sort_sample::get_next_task_input_data()
+{
+  // After boundaries are computed, process one batch at a time (passthrough mode).
+  if (_boundary_state.load(std::memory_order_acquire) == 2) {
+    return sirius_physical_operator::get_next_task_input_data();
+  }
+
+  // Before boundary computation: accumulate batches up to the sample byte threshold so
+  // execute() can merge pre-sorted runs and derive partition boundaries from a representative
+  // sample without pulling a fixed batch count that may be too large for big batches.
+  auto port_ids = get_port_ids();
+  if (port_ids.empty()) { return nullptr; }
+
+  auto* p = get_port(port_ids[0]);
+  if (!p || !p->repo) { return nullptr; }
+
+  std::vector<std::shared_ptr<::cucascade::data_batch>> input_batch;
+  uint64_t accumulated_bytes = 0;
+  while (true) {
+    auto batch = p->repo->pop_next_data_batch();
+    if (!batch) { break; }
+    accumulated_bytes += get_batch_bytes(batch);
+    input_batch.push_back(std::move(batch));
+    if (accumulated_bytes >= _sort_sample_bytes) { break; }
+  }
+
+  if (input_batch.empty()) { return nullptr; }
+  return std::make_unique<pipelineable_operator_data>(std::move(input_batch));
 }
 
 std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operator_data& input_data,
@@ -96,15 +167,16 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   // Elect exactly one winner via CAS (0=not started → 1=computing).
   // The task_creator's while loop dispatches one task per batch, so multiple tasks
   // can be in-flight simultaneously. Losers passthrough without blocking — they don't
-  // need the boundaries themselves; sort_partition accesses them in a later pipeline.
+  // need the boundaries themselves; sort_partition runs next in the same pipeline task.
   int expected = 0;
   if (!_boundary_state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
     SIRIUS_LOG_DEBUG("Sort sample: passthrough ({} batches)", input_batches.size());
     return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
   }
 
-  SIRIUS_LOG_DEBUG("Sort sample: computing partition boundaries from {} batches",
-                   input_batches.size());
+  SIRIUS_LOG_DEBUG("Sort sample: computing partition boundaries from {} batches ({} bytes target)",
+                   input_batches.size(),
+                   _sort_sample_bytes);
   auto start = std::chrono::high_resolution_clock::now();
 
   // 1. Collect valid batches and find memory space
@@ -123,19 +195,12 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   // Wrap GPU work in try/catch: if any allocation throws (e.g. rmm::out_of_memory),
   // reset state to NOT_STARTED so the rescheduled task can win the CAS and retry.
   try {
-    // 2. Concatenate all sample batches into one table
-    std::vector<cudf::table_view> sample_views;
     size_t total_sample_bytes = 0;
-    sample_views.reserve(valid_batches.size());
     for (auto const& batch : valid_batches) {
-      auto view = get_cudf_table_view(batch);
-      sample_views.push_back(view);
       total_sample_bytes += batch.get_data()->get_size_in_bytes();
     }
 
-    auto concat_table = cudf::concatenate(sample_views, stream, space->get_default_allocator());
-
-    // 3. Build cudf order vectors from BoundOrderByNode
+    // 2. Build cudf order vectors from BoundOrderByNode
     std::vector<int> order_key_idx;
     std::vector<cudf::order> column_order;
     std::vector<cudf::null_order> null_precedence;
@@ -153,25 +218,19 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
       null_precedence.push_back(to_cudf_null_order(ord.type, ord.null_order));
     }
 
-    // 4. Sort the concatenated sample by sort keys
-    std::vector<cudf::column_view> sort_cols;
-    for (int idx : order_key_idx) {
-      sort_cols.push_back(concat_table->view().column(idx));
+    // 3. Merge pre-sorted sample batches (ORDER_BY sorts each batch locally).
+    cudf::table_view merged_sample_view;
+    std::shared_ptr<::cucascade::data_batch> merged_sample_batch;
+    if (valid_batches.size() == 1) {
+      merged_sample_view = get_cudf_table_view(valid_batches[0]);
+    } else {
+      merged_sample_batch = gpu_merge_impl::merge_order_by(
+        valid_batches, order_key_idx, column_order, null_precedence, stream, *space);
+      merged_sample_view = get_cudf_table_view(merged_sample_batch->to_read_only());
     }
-    auto sorted_indices = cudf::sorted_order(cudf::table_view(sort_cols),
-                                             column_order,
-                                             null_precedence,
-                                             stream,
-                                             space->get_default_allocator());
 
-    auto sorted_table = cudf::gather(concat_table->view(),
-                                     sorted_indices->view(),
-                                     cudf::out_of_bounds_policy::DONT_CHECK,
-                                     stream,
-                                     space->get_default_allocator());
-
-    // 5. Compute number of partitions
-    size_t total_rows      = static_cast<size_t>(sorted_table->num_rows());
+    // 4. Compute number of partitions
+    size_t total_rows      = static_cast<size_t>(merged_sample_view.num_rows());
     size_t avg_batch_bytes = valid_batches.empty() ? 0 : total_sample_bytes / valid_batches.size();
     size_t avg_rows_per_batch = valid_batches.empty() ? 0 : total_rows / valid_batches.size();
     size_t num_parts          = 1;
@@ -189,7 +248,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
       size_t max_partition_bytes   = _max_partition_bytes_override > 0
                                        ? _max_partition_bytes_override
                                        : static_cast<size_t>(static_cast<double>(available_memory) *
-                                                           MAX_PARTITION_MEMORY_FRACTION);
+                                                           _max_partition_memory_fraction);
 
       if (max_partition_bytes > 0 && estimated_total_bytes > max_partition_bytes) {
         num_parts = (estimated_total_bytes + max_partition_bytes - 1) / max_partition_bytes;
@@ -210,7 +269,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
         num_parts);
     }
 
-    // 6. Pick P-1 evenly-spaced boundary rows from the sorted sample (sort key columns only)
+    // 5. Pick P-1 evenly-spaced boundary rows from the merged sample (sort key columns only)
     if (num_parts <= 1 || total_rows == 0) {
       // Single partition — no boundaries needed
       _num_partitions = 1;
@@ -238,10 +297,10 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
                                     cudaMemcpyHostToDevice,
                                     stream.value()));
 
-      // Extract only the sort key columns from sorted table for the boundaries
+      // Extract only the sort key columns from merged sample for the boundaries
       std::vector<cudf::column_view> sort_key_cols;
       for (int idx : order_key_idx) {
-        sort_key_cols.push_back(sorted_table->view().column(idx));
+        sort_key_cols.push_back(merged_sample_view.column(idx));
       }
       cudf::table_view sort_keys_view(sort_key_cols);
 
@@ -254,10 +313,8 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
       _num_partitions       = num_parts;
     }
 
-    // Pipeline framework calls stream.synchronize() after execute() returns, before
-    // publish_output(). Pipeline C only starts after all Pipeline B tasks complete,
-    // so _partition_boundaries is fully materialized on the GPU before sort_partition
-    // ever reads it. No explicit sync needed here.
+    // sort_partition runs in the same gpu_pipeline_task immediately after this
+    // execute() returns, so _partition_boundaries is visible before partition runs.
     _boundary_state.store(2, std::memory_order_release);
 
   } catch (...) {

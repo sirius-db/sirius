@@ -188,7 +188,8 @@ class sirius_config_env_guard {
  public:
   explicit sirius_config_env_guard(s3_test_env const& env,
                                    sirius_memory_limits limits             = {},
-                                   std::optional<std::string> signing_mode = std::nullopt)
+                                   std::optional<std::string> signing_mode = std::nullopt,
+                                   std::optional<bool> use_async_backend   = std::nullopt)
   {
     if (auto* current = std::getenv("SIRIUS_CONFIG_FILE"); current != nullptr) {
       had_original_config_env_ = true;
@@ -263,6 +264,9 @@ class sirius_config_env_guard {
     if (signing_mode.has_value()) {
       out << "    signing_mode: " << yaml_quote(*signing_mode) << "\n";
     }
+    if (use_async_backend.has_value()) {
+      out << "    s3_use_async_backend: " << (*use_async_backend ? "true" : "false") << "\n";
+    }
     if (limits.enable_chunk_prewarm.has_value()) {
       out << "  executor:\n"
              "    scan_manager:\n"
@@ -308,8 +312,11 @@ class s3_sql_fixture {
  public:
   explicit s3_sql_fixture(s3_test_env const& env,
                           sirius_memory_limits limits             = {},
-                          std::optional<std::string> signing_mode = std::nullopt)
-    : config_env(env, std::move(limits), std::move(signing_mode)), db(nullptr), con(db)
+                          std::optional<std::string> signing_mode = std::nullopt,
+                          std::optional<bool> use_async_backend   = std::nullopt)
+    : config_env(env, std::move(limits), std::move(signing_mode), use_async_backend),
+      db(nullptr),
+      con(db)
   {
     load_sirius_extension(db);
     REQUIRE(con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state"));
@@ -464,7 +471,7 @@ duckdb::SiriusContext& require_sirius_context(s3_sql_fixture& fixture)
   return *sirius_ctx;
 }
 
-sirius::io::s3::s3_ioctx& require_s3_ioctx(s3_sql_fixture& fixture, std::string const& uri)
+sirius::io::s3::s3_ioctx& require_async_s3_ioctx(s3_sql_fixture& fixture, std::string const& uri)
 {
   auto& sirius_ctx = require_sirius_context(fixture);
   auto* base_ctx   = sirius_ctx.get_scan_manager().io_ctx_for(uri);
@@ -1200,6 +1207,42 @@ TEST_CASE("gpu_execution rewrites S3 read_parquet and scans through Sirius",
   }
 }
 
+TEST_CASE("gpu_execution S3 SQL results match with the async backend flag",
+          "[.][s3][integration][sql][gpu_execution][asynccurl]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  auto const uri = s3_uri(env->bucket, "parquet/nation.parquet");
+  auto const query =
+    "SELECT n_nationkey, n_name, n_regionkey "
+    "FROM read_parquet('" +
+    uri + "') ORDER BY n_nationkey";
+
+  auto run_query = [&](bool use_async_backend) {
+    s3_sql_fixture fixture(*env, {}, std::nullopt, use_async_backend);
+    std::uint64_t before_bytes          = 0;
+    sirius::io::s3::s3_ioctx* async_ctx = nullptr;
+    if (use_async_backend) {
+      async_ctx    = &require_async_s3_ioctx(fixture, uri);
+      before_bytes = async_ctx->bytes_read_total();
+    }
+
+    auto result = require_query_ok(fixture.con, gpu_execution_sql(query));
+
+    std::uint64_t byte_delta = 0;
+    if (async_ctx != nullptr) { byte_delta = async_ctx->bytes_read_total() - before_bytes; }
+    return std::pair{collect_rows(*result), byte_delta};
+  };
+
+  auto const blocking = run_query(false);
+  auto const async    = run_query(true);
+
+  CHECK(async.first == blocking.first);
+  CHECK(async.first.size() == 25);
+  CHECK(async.second > 0);
+}
+
 TEST_CASE("gpu_execution reads real AWS S3 parquet through Sirius SigV4",
           "[.][s3][aws][live][sql][gpu_execution]")
 {
@@ -1238,6 +1281,35 @@ TEST_CASE("gpu_execution reads real AWS S3 parquet through Sirius SigV4",
     REQUIRE(s3_result->ColumnCount() == 3);
     check_rows_equal_with_tolerant_columns(*s3_result, *baseline_result, {});
   }
+}
+
+TEST_CASE("gpu_execution reads real AWS S3 parquet through the async backend flag",
+          "[.][s3][aws][live][sql][gpu_execution][asynccurl]")
+{
+  auto env = require_aws_live_env();
+  if (!env) { return; }
+
+  duckdb::DuckDB baseline_db(nullptr);
+  duckdb::Connection baseline_con(baseline_db);
+  auto const local_query =
+    "SELECT n_nationkey, n_name, n_regionkey "
+    "FROM " +
+    local_parquet_scan("nation") + " ORDER BY n_nationkey";
+  auto baseline_result = require_query_ok(baseline_con, local_query);
+
+  auto const uri = s3_uri(env->bucket, "parquet/nation.parquet");
+  s3_sql_fixture fixture(*env, {}, std::nullopt, true);
+  auto& async_ctx   = require_async_s3_ioctx(fixture, uri);
+  auto const before = async_ctx.bytes_read_total();
+  auto const s3_query =
+    "SELECT n_nationkey, n_name, n_regionkey FROM read_parquet('" + uri + "') ORDER BY n_nationkey";
+  auto const s3_result = require_query_ok(fixture.con, gpu_execution_sql(s3_query));
+  auto const bytes     = async_ctx.bytes_read_total() - before;
+
+  REQUIRE(s3_result->RowCount() == 25);
+  REQUIRE(s3_result->ColumnCount() == 3);
+  check_rows_equal_with_tolerant_columns(*s3_result, *baseline_result, {});
+  CHECK(bytes > 0);
 }
 
 TEST_CASE("gpu_execution aggregates real AWS S3 parquet through Sirius SigV4",
@@ -1462,7 +1534,7 @@ TEST_CASE("gpu_execution large S3 lineitem count matches the local parquet oracl
   auto large = read_large_lineitem_fixture(fixture, *env);
   if (!large) { return; }
 
-  auto& s3_ctx              = require_s3_ioctx(fixture, large->uri);
+  auto& s3_ctx              = require_async_s3_ioctx(fixture, large->uri);
   auto const expected_rows  = local_parquet_file_row_count(large->local_path);
   auto const before_bytes   = s3_ctx.bytes_read_total();
   auto const s3_count_query = "SELECT count(l_orderkey) FROM " + s3_large_lineitem_scan(*env);
@@ -1479,6 +1551,57 @@ TEST_CASE("gpu_execution large S3 lineitem count matches the local parquet oracl
   CHECK(within_large_s3_byte_budget(byte_delta, large->object_size));
 }
 
+TEST_CASE("gpu_execution large S3 lineitem count matches with the async backend flag",
+          "[.][s3][sql][large][large-count][gpu_execution][integration][asynccurl]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  struct run_result {
+    int64_t count{0};
+    std::uint64_t bytes_read{0};
+    std::uint64_t device_copies{0};
+    std::uint64_t device_stream_syncs{0};
+  };
+
+  auto run_query = [&](bool use_async_backend) -> std::optional<run_result> {
+    s3_sql_fixture fixture(*env, large_sirius_memory_limits(), std::nullopt, use_async_backend);
+    auto large = read_large_lineitem_fixture(fixture, *env);
+    if (!large) { return std::nullopt; }
+
+    auto const query = "SELECT count(l_orderkey) FROM " + s3_large_lineitem_scan(*env);
+    if (!use_async_backend) {
+      auto result = require_query_ok(fixture.con, gpu_execution_sql(query));
+      REQUIRE(result->RowCount() == 1);
+      return run_result{result->GetValue(0, 0).GetValue<int64_t>(), 0, 0, 0};
+    }
+
+    auto& async_ctx          = require_async_s3_ioctx(fixture, large->uri);
+    auto const before_bytes  = async_ctx.bytes_read_total();
+    auto const before_copies = async_ctx.device_copies_total();
+    auto const before_syncs  = async_ctx.device_stream_sync_total();
+    auto result              = require_query_ok(fixture.con, gpu_execution_sql(query));
+    auto const byte_delta    = async_ctx.bytes_read_total() - before_bytes;
+    auto const copy_delta    = async_ctx.device_copies_total() - before_copies;
+    auto const sync_delta    = async_ctx.device_stream_sync_total() - before_syncs;
+
+    REQUIRE(result->RowCount() == 1);
+    return run_result{
+      result->GetValue(0, 0).GetValue<int64_t>(), byte_delta, copy_delta, sync_delta};
+  };
+
+  auto const blocking = run_query(false);
+  if (!blocking) { return; }
+  auto const async = run_query(true);
+  if (!async) { return; }
+
+  CHECK(async->count == blocking->count);
+  CHECK(blocking->count > 50'000'000);
+  CHECK(async->bytes_read > 0);
+  CHECK(async->device_copies > 0);
+  CHECK(async->device_stream_syncs == 0);
+}
+
 TEST_CASE("gpu_execution large S3 lineitem TPC-H Q1 shape matches local CPU",
           "[.][s3][sql][large][large-q1][gpu_execution][integration]")
 {
@@ -1489,7 +1612,7 @@ TEST_CASE("gpu_execution large S3 lineitem TPC-H Q1 shape matches local CPU",
   auto large = read_large_lineitem_fixture(fixture, *env);
   if (!large) { return; }
 
-  auto& s3_ctx              = require_s3_ioctx(fixture, large->uri);
+  auto& s3_ctx              = require_async_s3_ioctx(fixture, large->uri);
   auto const before_bytes   = s3_ctx.bytes_read_total();
   auto const before_borrows = s3_ctx.fsmr_borrows_total();
   auto const s3_query       = tpch_q1_shape_query(s3_large_lineitem_scan(*env));
@@ -1555,7 +1678,7 @@ TEST_CASE("gpu_execution large S3 lineitem count stays within byte budget withou
   auto large = read_large_lineitem_fixture(fixture, *env);
   if (!large) { return; }
 
-  auto& s3_ctx = require_s3_ioctx(fixture, large->uri);
+  auto& s3_ctx = require_async_s3_ioctx(fixture, large->uri);
   REQUIRE(s3_ctx.cache() != nullptr);
   auto const expected_rows       = local_parquet_file_row_count(large->local_path);
   auto const before_bytes        = s3_ctx.bytes_read_total();
@@ -1669,7 +1792,7 @@ TEST_CASE("B1 Phase 3a cache-mode bench records SF10 S3 SQL telemetry",
                                             s3_parquet_scan(*env, "orders"))},
         }};
 
-        auto& s3_ctx = require_s3_ioctx(fixture, large->uri);
+        auto& s3_ctx = require_async_s3_ioctx(fixture, large->uri);
         auto* cache  = s3_ctx.cache();
         if (config.expects_cache) {
           REQUIRE(cache != nullptr);

@@ -209,7 +209,10 @@ struct equality_delete_read_result {
  *
  * Routes both cudf::io::read_parquet (table) and cudf::io::read_parquet_footers
  * (field-id extraction) through the supplied single-GPU sirius_ioctx. The
- * caller MUST provide a non-null ioctx — the kvikio bypass path is forbidden.
+ * caller MUST provide a non-null ioctx — this entry point does not implement
+ * a kvikio bypass (callers that want the bundled cudf datasource use it
+ * directly outside this helper; multi-GPU mode requires sirius_datasource and
+ * is enforced by sirius_config::enforce_sirius_datasource_for_multi_gpu()).
  */
 equality_delete_read_result read_equality_delete_file(std::string const& delete_file_path,
                                                       sirius::io::sirius_ioctx& ioctx)
@@ -431,8 +434,8 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
 
   if (!metadata_ioctx) {
     throw std::invalid_argument(
-      "[iceberg] read_iceberg_delete_data: metadata_ioctx is null (kvikio path is forbidden; "
-      "caller must provide a sirius_ioctx).");
+      "[iceberg] read_iceberg_delete_data: metadata_ioctx is null; caller must provide a "
+      "sirius_ioctx (this entry point does not implement a kvikio fallback).");
   }
 
   try {

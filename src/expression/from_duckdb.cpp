@@ -17,6 +17,8 @@
 #include "expression/ast/from_duckdb.hpp"
 
 // sirius
+#include "expression/aggregate_id.hpp"
+#include "expression/ast/aggregate.hpp"
 #include "expression/ast/between.hpp"
 #include "expression/ast/case_expr.hpp"
 #include "expression/ast/cast.hpp"
@@ -39,6 +41,7 @@
 #include <duckdb/common/enums/expression_type.hpp>
 #include <duckdb/common/exception.hpp>
 #include <duckdb/planner/expression.hpp>
+#include <duckdb/planner/expression/bound_aggregate_expression.hpp>
 #include <duckdb/planner/expression/bound_between_expression.hpp>
 #include <duckdb/planner/expression/bound_case_expression.hpp>
 #include <duckdb/planner/expression/bound_cast_expression.hpp>
@@ -142,7 +145,8 @@ std::unique_ptr<node> translate_case(duckdb::BoundCaseExpression const& expr)
   }
   auto else_node = from_duckdb(*expr.else_expr);
   if (!else_node) { return nullptr; }
-  return std::make_unique<node>(case_expr{std::move(cases), std::move(else_node)});
+  return std::make_unique<node>(
+    case_expr{std::move(cases), std::move(else_node), sirius::from_duckdb(expr.return_type)});
 }
 
 std::unique_ptr<node> translate_cast(duckdb::BoundCastExpression const& expr)
@@ -171,6 +175,22 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
   auto return_type = sirius::from_duckdb(expr.return_type);
   return std::make_unique<node>(
     function_call{*func_id_opt, std::move(arguments), std::move(return_type)});
+}
+
+std::unique_ptr<node> translate_aggregate(duckdb::BoundAggregateExpression const& aggr)
+{
+  auto agg_id_opt = sirius::from_duckdb_aggregate_name(aggr.function.name);
+  if (!agg_id_opt.has_value()) { return nullptr; }
+  std::vector<std::unique_ptr<node>> arguments;
+  arguments.reserve(aggr.children.size());
+  for (auto const& child : aggr.children) {
+    auto translated = from_duckdb(*child);
+    if (!translated) { return nullptr; }
+    arguments.push_back(std::move(translated));
+  }
+  auto return_type = sirius::from_duckdb(aggr.return_type);
+  return std::make_unique<node>(
+    aggregate{*agg_id_opt, std::move(arguments), std::move(return_type), aggr.IsDistinct()});
 }
 
 std::unique_ptr<node> translate_operator(duckdb::BoundOperatorExpression const& expr)
@@ -203,7 +223,8 @@ std::unique_ptr<node> translate_operator(duckdb::BoundOperatorExpression const& 
       if (!translated) { return nullptr; }
       children.push_back(std::move(translated));
     }
-    return std::make_unique<node>(coalesce{std::move(children)});
+    return std::make_unique<node>(
+      coalesce{std::move(children), sirius::from_duckdb(expr.return_type)});
   }
 
   if (op_type == duckdb::ExpressionType::COMPARE_IN ||
@@ -233,6 +254,8 @@ std::unique_ptr<node> translate_operator(duckdb::BoundOperatorExpression const& 
 std::unique_ptr<node> from_duckdb(duckdb::Expression const& expr)
 {
   switch (expr.GetExpressionClass()) {
+    case duckdb::ExpressionClass::BOUND_AGGREGATE:
+      return translate_aggregate(expr.Cast<duckdb::BoundAggregateExpression>());
     case duckdb::ExpressionClass::BOUND_BETWEEN:
       return translate_between(expr.Cast<duckdb::BoundBetweenExpression>());
     case duckdb::ExpressionClass::BOUND_CASE:

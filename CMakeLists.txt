@@ -148,7 +148,9 @@ set(EXTENSION_SOURCES
     src/data/host_parquet_representation.cpp
     src/data/host_parquet_representation_converters.cpp
     src/downgrade/downgrade_executor.cpp
-    src/expression/expression.cpp
+    src/expression/aggregate_id.cpp
+    src/expression/ast/clone.cpp
+    src/expression/ast/node.cpp
     src/expression/from_duckdb.cpp
     src/expression/function_id.cpp
     src/expression/join_condition.cpp
@@ -175,6 +177,8 @@ set(EXTENSION_SOURCES
     src/io/io_context.cpp
     src/io/parquet_helpers.cpp
     src/io/prefetching_cache.cpp
+    src/io/s3/s3_blocking_ioctx.cpp
+    src/io/s3/s3_reactor.cpp
     src/io/s3/s3_ioctx.cpp
     src/io/s3/sigv4.cpp
     src/io/s3/sirius_sigv4_authorizer.cpp
@@ -204,15 +208,16 @@ set(EXTENSION_SOURCES
     src/op/scan/iceberg_scan_task.cpp
     src/op/scan/positional_delete_filter.cpp
     src/op/scan/puffin_reader.cpp
-    src/op/scan/duckdb_native_scan_info.cpp
-    src/op/scan/parquet_scan_info.cpp
     src/op/scan/parquet_scan_task.cpp
     src/op/scan/parquet_schema_mapping.cpp
     src/op/scan/prefetched_data_source.cpp
     src/op/scan/scan_plan.cpp
     src/op/scan/scan_utils.cpp
-    src/op/scan/sirius_gpu_duckdb_native_scan_operator.cpp
-    src/op/scan/sirius_gpu_parquet_scan_operator.cpp
+    src/io/gpu_ingestible.cpp
+    src/op/scan/sirius_gpu_scan_operator.cpp
+    src/op/scan/parquet_gpu_ingestible.cpp
+    src/op/scan/duckdb_native_gpu_ingestible.cpp
+    src/op/scan/pinned_table_gpu_ingestible.cpp
     src/op/sirius_dynamic_filter.cpp
     src/op/sirius_physical_column_data_scan.cpp
     src/op/sirius_physical_cpu_source.cpp
@@ -271,10 +276,8 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_projection.cpp
     src/planner/sirius_plan_recursive_cte.cpp
     src/planner/sirius_plan_top_n.cpp
-    src/scan_manager/cached_split_provider.cpp
-    src/scan_manager/duckdb_native_split_provider.cpp
     src/pin_table.cpp
-    src/scan_manager/parquet_split_provider.cpp
+    src/scan_manager/gpu_ingestible_factory.cpp
     src/scan_manager/sirius_scan_manager.cpp
     src/scan_manager/split_connector.cpp
     src/scan_manager/split_provider.cpp
@@ -439,16 +442,18 @@ set(TEST_SOURCES
     test/cpp/exec/test_bounded_thread_pool.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
+    test/cpp/expression/test_ast_aggregate.cpp
+    test/cpp/expression/test_ast_clone.cpp
     test/cpp/expression/test_ast_from_duckdb.cpp
     test/cpp/expression/test_ast_scaffold.cpp
     test/cpp/expression/test_ast_to_duckdb.cpp
-    test/cpp/expression/test_expression.cpp
+    test/cpp/expression/test_comparison_type_mapping.cpp
     test/cpp/expression/test_function_id.cpp
-    test/cpp/expression/test_join_condition.cpp
     test/cpp/expression/test_value.cpp
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
     test/cpp/expression_executor/test_gpu_expression_executor_ast_equivalence.cpp
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
+    test/cpp/expression_executor/test_nonduckdb_frontend_proof.cpp
     test/cpp/helper/test_logical_type.cpp
     test/cpp/helper/test_transaction_utils.cpp
     test/cpp/integration/test_gpu_execution_locality.cpp
@@ -460,17 +465,18 @@ set(TEST_SOURCES
     test/cpp/integration/test_transparent_execution.cpp
     test/cpp/io/s3/test_sigv4.cpp
     test/cpp/io/s3/test_s3_default_visibility_guard.cpp
+    test/cpp/io/s3/test_s3_blocking_ioctx.cpp
     test/cpp/io/s3/test_s3_ioctx.cpp
     test/cpp/io/s3/test_sirius_sigv4_authorizer.cpp
     test/cpp/io/s3/test_static_credentials.cpp
     test/cpp/io/test_datasource_factory.cpp
     test/cpp/io/test_duckdb_io_object.cpp
+    test/cpp/io/test_gpu_ingestible.cpp
     test/cpp/io/test_parquet_helpers.cpp
     test/cpp/io/test_prefetching_cache_telemetry.cpp
     test/cpp/io/test_uri_parser.cpp
     test/cpp/integration/test_s3_sql_surface.cpp
     test/cpp/integration/test_s3_perf_benchmark.cpp
-    test/cpp/integration/test_scan_manager_s3_end_to_end.cpp
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
     test/cpp/operator/test_physical_hash_join_mgpu.cpp
     test/cpp/operator/test_physical_order_mgpu.cpp
@@ -484,6 +490,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_gpu_partition_impl.cpp
     test/cpp/operator/test_host_table_chunk_reader.cpp
     test/cpp/operator/test_physical_concat.cpp
+    test/cpp/operator/test_physical_sort_sample.cpp
     test/cpp/operator/test_physical_filter.cpp
     test/cpp/operator/test_physical_limit.cpp
     test/cpp/operator/test_physical_mark_join.cpp
@@ -501,7 +508,6 @@ set(TEST_SOURCES
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
-    test/cpp/pipeline/test_sirius_read_parquet_converter.cpp
     test/cpp/pipeline/test_pipeline_memory_history.cpp
     test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
     test/cpp/pipeline/test_gpu_pipeline_disk_readback.cpp
@@ -512,7 +518,6 @@ set(TEST_SOURCES
     test/cpp/scan/bench_decode_codecs.cpp
     test/cpp/scan/test_column_builder.cpp
     test/cpp/scan/test_duckdb_block_layout.cpp
-    test/cpp/scan/test_duckdb_native_split_provider.cpp
     test/cpp/scan/test_duckdb_native_walker.cpp
     test/cpp/scan/test_gpu_decode_alp.cpp
     test/cpp/scan/test_gpu_decode_bitpacking.cpp
@@ -521,9 +526,8 @@ set(TEST_SOURCES
     test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_scan_task.cpp
-    test/cpp/scan/test_parquet_split_provider.cpp
-    test/cpp/scan/test_parquet_split_provider_s3.cpp
-    test/cpp/scan/test_partition_inject.cpp
+    test/cpp/scan/test_parquet_gpu_ingestible.cpp
+    test/cpp/scan/test_pinned_table_gpu_ingestible.cpp
     test/cpp/scan/test_scan_executor.cpp
     test/cpp/scan/test_split_connector.cpp
     test/cpp/scan_manager/test_sirius_scan_manager_s3.cpp

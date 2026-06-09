@@ -73,7 +73,10 @@ extern "C" int cudaProfilerStop();
 
 // PinTableFunction routes parquet reads through the per-GPU sirius_ioctx
 // instead of cudf's bundled file_source factory (which uses kvikio internally
-// and binds to a single CUDA context).
+// and binds to a single CUDA context). This is mandatory in multi-GPU
+// configurations (enforced by sirius_config::enforce_sirius_datasource_for_multi_gpu()).
+// Single-GPU users may still opt out via use_sirius_datasource=false; the
+// pin pipeline always routes through sirius_ioctx when one is available.
 //
 // Ordering rule: include uring_reactor LAST among sirius headers — liburing.h
 // transitively pulled by uring_reactor.hpp defines a BLOCK_SIZE preprocessor
@@ -970,7 +973,9 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     // instead of cudf's bundled file_source factory (kvikio). The string-form
     // source_info routes reads through libkvikio's FileHandle which binds a
     // single CUDA context per file, breaking multi-GPU residency (the columns
-    // end up on the wrong GPU under sanitizer races).
+    // end up on the wrong GPU under sanitizer races). Use of sirius_ioctx is
+    // mandatory whenever more than one GPU is configured — enforced upstream
+    // by sirius_config::enforce_sirius_datasource_for_multi_gpu().
     auto target_ioctx = sirius_ctx->get_ioctx_for(target_gpu_id);
     if (!target_ioctx) {
       throw InvalidInputException("pin_table: no sirius_ioctx for target GPU " +
@@ -1389,6 +1394,22 @@ static void SetMaxSortPartitionBytes(ClientContext& context, SetScope scope, Val
                    params->max_sort_partition_bytes);
 }
 
+static void SetMaxSortPartitionMemoryFraction(ClientContext& context,
+                                              SetScope scope,
+                                              Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  const double fraction = parameter.GetValue<double>();
+  if (fraction < 0.0 || fraction > 1.0) {
+    throw InvalidInputException(
+      "max_sort_partition_memory_fraction must be between 0.0 and 1.0, got {}", fraction);
+  }
+  params->max_sort_partition_memory_fraction = fraction;
+  SIRIUS_LOG_DEBUG("Updated config MAX_SORT_PARTITION_MEMORY_FRACTION to {}",
+                   params->max_sort_partition_memory_fraction);
+}
+
 static void SetHashPartitionBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -1403,6 +1424,14 @@ static void SetConcatBatchBytes(ClientContext& context, SetScope scope, Value& p
   if (!params) { return; }
   params->concat_batch_bytes = UBigIntValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config CONCAT_BATCH_BYTES to {}", params->concat_batch_bytes);
+}
+
+static void SetSortSampleBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->sort_sample_bytes = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config SORT_SAMPLE_BYTES to {}", params->sort_sample_bytes);
 }
 
 static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter)
@@ -1557,10 +1586,17 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 
   // Add in config option for sort partition size
   config.AddExtensionOption("max_sort_partition_bytes",
-                            "Maximum bytes per sort partition (0 = auto based on 33% GPU memory)",
+                            "Maximum bytes per sort partition (0 = auto based on "
+                            "max_sort_partition_memory_fraction of GPU memory)",
                             LogicalType::UBIGINT,
                             Value::UBIGINT(sirius::operator_params{}.max_sort_partition_bytes),
                             SetMaxSortPartitionBytes);
+  config.AddExtensionOption(
+    "max_sort_partition_memory_fraction",
+    "Fraction of available GPU memory per sort partition when max_sort_partition_bytes is 0",
+    LogicalType::DOUBLE,
+    Value::DOUBLE(sirius::operator_params{}.max_sort_partition_memory_fraction),
+    SetMaxSortPartitionMemoryFraction);
 
   // Logging configuration
   config.AddExtensionOption("sirius_log_level",
@@ -1591,6 +1627,12 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             Value::UBIGINT(sirius::operator_params{}.concat_batch_bytes),
                             SetConcatBatchBytes);
 
+  config.AddExtensionOption("sort_sample_bytes",
+                            "Target bytes to sample before computing sort partition boundaries",
+                            LogicalType::UBIGINT,
+                            Value::UBIGINT(sirius::operator_params{}.sort_sample_bytes),
+                            SetSortSampleBytes);
+
   config.AddExtensionOption("scan_cache_level",
                             "Scan result caching level: none, table_gpu, table_host, parquet",
                             LogicalType::VARCHAR,
@@ -1613,8 +1655,8 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 
   config.AddExtensionOption(
     "enable_gpu_duckdb_native_scan",
-    "Route DuckDB seq_scan to the GPU-native scan operator (the default). Set false to use "
-    "the legacy CPU scan fallback.",
+    "Route DuckDB seq_scan to the GPU-native scan operator instead of the CPU fallback "
+    "(experimental; off by default)",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(sirius::operator_params{}.enable_gpu_duckdb_native_scan),
     SetEnableGpuDuckdbNativeScan);

@@ -19,7 +19,7 @@
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "expression/expression_internal.hpp"
+#include "expression/ast/to_duckdb.hpp"
 #include "log/logging.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
 #include "op/sirius_physical_concat.hpp"
@@ -85,10 +85,10 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
           condition.comparison != sirius::comparison_type::not_distinct_from) {
         continue;
       }
-      std::optional<std::size_t> left_index =
-        extract_bound_ref_index(*sirius::unwrap(hash_join_op.conditions[cond_idx].left));
-      std::optional<std::size_t> right_index =
-        extract_bound_ref_index(*sirius::unwrap(hash_join_op.conditions[cond_idx].right));
+      auto left_owned  = sirius::ast::to_duckdb(*hash_join_op.conditions[cond_idx].left);
+      auto right_owned = sirius::ast::to_duckdb(*hash_join_op.conditions[cond_idx].right);
+      std::optional<std::size_t> left_index  = extract_bound_ref_index(*left_owned);
+      std::optional<std::size_t> right_index = extract_bound_ref_index(*right_owned);
       if (left_index.has_value() && right_index.has_value()) {
         // Determine if a type cast is needed for hash alignment.
         // When the join condition has a BOUND_CAST on one side, the two sides have different
@@ -96,8 +96,7 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
         // values for the same integer in different representations, so without a cast, matching
         // keys would land in different partitions. We apply the same cast used by the join
         // condition so both sides hash identically.
-        const auto& key_expr = is_build ? *sirius::unwrap(hash_join_op.conditions[cond_idx].right)
-                                        : *sirius::unwrap(hash_join_op.conditions[cond_idx].left);
+        const auto& key_expr = is_build ? *right_owned : *left_owned;
         if (is_build) {
           _partition_keys.push_back(right_index.value());
         } else {

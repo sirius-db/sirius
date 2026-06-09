@@ -15,6 +15,7 @@
  */
 
 // sirius
+#include <expression/ast/aggregate.hpp>
 #include <expression/ast/between.hpp>
 #include <expression/ast/case_expr.hpp>
 #include <expression/ast/cast.hpp>
@@ -142,9 +143,14 @@ std::size_t function_call::cudf_ast_op_count() const
   return count;
 }
 
-std::size_t node::cudf_ast_op_count() const
+std::size_t aggregate::cudf_ast_op_count() const
 {
-  return std::visit([](auto const& alt) { return alt.cudf_ast_op_count(); }, v);
+  // Aggregate nodes never lower to cuDF AST ops — the method exists solely to
+  // keep the node variant exhaustive (node.hpp's has_cudf_ast_op_count concept).
+  // Dead at runtime: nothing constructs or visits an aggregate node in the
+  // expression-executor path. See https://github.com/sirius-db/sirius/issues/863.
+  throw not_implemented_exception(
+    "[ast::aggregate::cudf_ast_op_count] aggregate nodes are not lowered to cuDF AST ops (#863).");
 }
 
 }  // namespace sirius::ast

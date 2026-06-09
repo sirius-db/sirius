@@ -15,7 +15,6 @@
  */
 
 // sirius
-#include <expression/ast/from_duckdb.hpp>
 #include <expression/ast/node.hpp>
 #include <expression/function_id.hpp>
 #include <expression/value.hpp>
@@ -27,7 +26,6 @@
 
 // duckdb
 #include <duckdb/common/assert.hpp>
-#include <duckdb/planner/expression/bound_function_expression.hpp>
 
 // cudf
 #include <cudf/binaryop.hpp>
@@ -389,25 +387,6 @@ execute_result gpu_expression_executor::execute(sirius::ast::function_call const
   throw internal_exception(
     "[gpu_expression_executor:function]: registered function_id has no GPU dispatch arm: id={}",
     static_cast<int>(resolved_id));
-}
-
-// DuckDB-typed entrypoint. Bridges callers that still pass duckdb::Expression
-// directly into the executor; the eventual home for this from_duckdb step is
-// the planning stage so the executor sees only native sirius::ast types, but
-// until upstream call sites are migrated this overload (and the duckdb
-// includes it requires) must stay.
-execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression const& expr,
-                                                execution_mode mode)
-{
-  auto node = sirius::ast::from_duckdb(expr);
-  if (!node) {
-    throw not_implemented_exception(
-      "[gpu_expression_executor:function] BoundFunctionExpression could not be lowered to a "
-      "Sirius AST node (function '{}' has no Sirius function_id mapping, or an argument is "
-      "unsupported).",
-      expr.function.name);
-  }
-  return execute(*node, mode);
 }
 
 }  // namespace sirius

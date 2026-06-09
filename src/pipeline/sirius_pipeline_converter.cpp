@@ -23,11 +23,9 @@
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 #include "log/logging.hpp"
-#include "op/scan/duckdb_native_metadata.hpp"
-#include "op/scan/duckdb_native_scan_info.hpp"
-#include "op/scan/parquet_scan_info.hpp"
-#include "op/scan/sirius_gpu_duckdb_native_scan_operator.hpp"
-#include "op/scan/sirius_gpu_parquet_scan_operator.hpp"
+#include "op/scan/duckdb_native_gpu_ingestible.hpp"
+#include "op/scan/parquet_gpu_ingestible.hpp"
+#include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cpu_source.hpp"
@@ -241,25 +239,21 @@ void sirius_pipeline_converter::insert_parquet_scan_operator(
 {
   auto& scan_op = current_pipeline->get_source()->Cast<op::sirius_physical_table_scan>();
 
-  auto scan_info            = std::make_unique<op::scan::parquet_scan_info>();
-  scan_info->returned_types = scan_op.returned_types;
-  scan_info->column_ids     = scan_op.column_ids;
-  scan_info->projection_ids = scan_op.projection_ids;
-  scan_info->names          = scan_op.names;
-  scan_info->table_filters  = std::move(scan_op.table_filters);
+  auto table_info            = std::make_unique<op::scan::parquet_ingestible_table_info>();
+  table_info->returned_types = scan_op.returned_types;
+  table_info->column_ids     = scan_op.column_ids;
+  table_info->projection_ids = scan_op.projection_ids;
+  table_info->names          = scan_op.names;
+  table_info->table_filters  = std::move(scan_op.table_filters);
 
   if (scan_op.function.name == "sirius_read_parquet") {
-    // Sirius-owned S3 table function: the single URI lives in parameters[0]
-    // (its bind returns no MultiFileBindData). No hive partitioning on the S3
-    // single-file path, so partition_indices is left empty.
     if (scan_op.parameters.empty() || scan_op.parameters.front().IsNull()) {
       throw std::runtime_error(
         "[sirius_pipeline_converter::insert_parquet_scan_operator] sirius_read_parquet scan "
         "has no URI parameter");
     }
-    scan_info->file_paths = {scan_op.parameters.front().GetValue<std::string>()};
+    table_info->resolved_file_paths = {scan_op.parameters.front().GetValue<std::string>()};
   } else {
-    // Native read_parquet / parquet_scan: file paths come from MultiFileBindData.
     auto const& bind_data = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
     if (!bind_data.file_list || bind_data.file_list->IsEmpty()) {
       throw std::runtime_error(
@@ -269,17 +263,14 @@ void sirius_pipeline_converter::insert_parquet_scan_operator(
     for (auto const& file : bind_data.file_list->GetAllFiles()) {
       file_paths.push_back(file.path);
     }
-    scan_info->file_paths        = std::move(file_paths);
-    scan_info->partition_indices = bind_data.reader_bind.hive_partitioning_indexes;
+    table_info->resolved_file_paths = std::move(file_paths);
+    table_info->partition_indices   = bind_data.reader_bind.hive_partitioning_indexes;
   }
-  // upstream #749's polymorphic scan_info requires scan_output_arity (consumed by
-  // scan_info::make_provider). sql-surface's branch above didn't set it.
-  scan_info->scan_output_arity = scan_op.types.size();
-  // upstream #792 added approximate_batch_size, driven by operator_params.
-  scan_info->approximate_batch_size = op_params_.scan_task_batch_size;
+  table_info->scan_output_arity      = scan_op.types.size();
+  table_info->approximate_batch_size = op_params_.scan_task_batch_size;
 
-  auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_parquet_scan_operator>(
-    scan_op.types, scan_op.estimated_cardinality, std::move(scan_info));
+  auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_scan_operator>(
+    scan_op.types, scan_op.estimated_cardinality, std::move(table_info));
 
   auto* gpu_scan_ptr = gpu_scan_op.get();
 
@@ -289,45 +280,35 @@ void sirius_pipeline_converter::insert_parquet_scan_operator(
   inserted_operators_.push_back(std::move(gpu_scan_op));
 }
 
-// Tries to insert a GPU-native scan operator for a seq_scan. Returns true on success.
-// Returns false (without modifying the pipeline) when the scan cannot use the GPU-native
-// path — non-base-table bind data, missing client context, or a table the metadata walker
-// rejects (in-memory / transient segments, unsupported types/codecs). The caller then falls
-// back to the CPU duckdb scan. The viability decision is made here, at plan-conversion time,
-// because the scan-manager's runtime non-viable throw does NOT trigger transparent fallback.
-bool sirius_pipeline_converter::insert_duckdb_native_scan_operator(
+void sirius_pipeline_converter::insert_duckdb_native_scan_operator(
   duckdb::shared_ptr<sirius_pipeline>& current_pipeline)
 {
   auto& scan_op = current_pipeline->get_source()->Cast<op::sirius_physical_table_scan>();
-  if (!scan_op.bind_data) { return false; }
+  if (!scan_op.bind_data) {
+    throw std::runtime_error(
+      "[sirius_pipeline_converter::insert_duckdb_native_scan_operator] seq_scan has no bind_data");
+  }
   auto* table_scan_bind = dynamic_cast<duckdb::TableScanBindData*>(scan_op.bind_data.get());
   if (table_scan_bind == nullptr) {
-    // Only seq_scan over base tables (TableScanBindData) is supported; fall back to CPU.
-    return false;
+    throw std::runtime_error(
+      "[sirius_pipeline_converter::insert_duckdb_native_scan_operator] seq_scan bind_data is not "
+      "TableScanBindData; the GPU-native duckdb scan path supports only seq_scan over base "
+      "tables. Disable enable_gpu_duckdb_native_scan for this query.");
   }
   auto& bind_data = *table_scan_bind;
   auto& table     = bind_data.table.Cast<duckdb::DuckTableEntry>();
 
   if (client_context_ == nullptr) {
-    SIRIUS_LOG_DEBUG("[sirius_pipeline_converter] no client_context for GPU-native scan; "
-                     "using CPU duckdb scan");
-    return false;
+    throw std::runtime_error(
+      "[sirius_pipeline_converter::insert_duckdb_native_scan_operator] no client_context passed "
+      "to converter; seq_scan GPU-native path requires it");
   }
 
-  // The GPU-native scan reads persisted on-disk blocks; an in-memory database has only
-  // transient segments with no readable block id, so fall back to the CPU scan. This is
-  // checked here, before the metadata walk, because the walk requires an active transaction
-  // that is not present on every plan-generation path (e.g. plan printing / EXPLAIN).
-  if (table.GetStorage().GetAttached().GetStorageManager().InMemory()) {
-    SIRIUS_LOG_DEBUG("[sirius_pipeline_converter] in-memory database; using CPU duckdb scan");
-    return false;
-  }
-
-  auto scan_info     = std::make_unique<op::scan::duckdb_native_scan_info>();
-  scan_info->storage = &table.GetStorage();
-  scan_info->context = client_context_;
-  scan_info->db_path = table.GetStorage().GetAttached().GetStorageManager().GetDBPath();
-  scan_info->approximate_batch_size = op_params_.scan_task_batch_size;
+  auto table_info     = std::make_unique<op::scan::duckdb_native_ingestible_table_info>();
+  table_info->storage = &table.GetStorage();
+  table_info->context = client_context_;
+  table_info->db_path = table.GetStorage().GetAttached().GetStorageManager().GetDBPath();
+  table_info->approximate_batch_size = op_params_.scan_task_batch_size;
 
   std::vector<std::size_t> source_ids_fallback;
   if (scan_op.projection_ids.empty()) {
@@ -337,18 +318,15 @@ bool sirius_pipeline_converter::insert_duckdb_native_scan_operator(
   auto const& source_ids =
     scan_op.projection_ids.empty() ? source_ids_fallback : scan_op.projection_ids;
 
-  // source_ids may exceed scan_op.types when sirius_plan_get.cpp appends filter-only columns
-  // (merge_pushdown_filters). decode_duckdb_native_split applies table_filters and projects
-  // down to output_types — same pattern as sirius_physical_table_scan::execute.
-  scan_info->projected_cols.reserve(source_ids.size());
-  scan_info->projected_types.reserve(source_ids.size());
+  table_info->projected_cols.reserve(source_ids.size());
+  table_info->projected_types.reserve(source_ids.size());
   for (std::size_t k = 0; k < source_ids.size(); ++k) {
     auto pid            = source_ids[k];
     auto const& col_idx = scan_op.column_ids[pid];
     op::scan::projected_column pc;
     pc.is_rowid = col_idx.IsRowIdColumn();
     if (!pc.is_rowid) { pc.storage_idx = duckdb::StorageIndex(col_idx.GetPrimaryIndex()); }
-    scan_info->projected_cols.push_back(pc);
+    table_info->projected_cols.push_back(pc);
 
     sirius::logical_type t;
     if (k < scan_op.types.size()) {
@@ -356,86 +334,26 @@ bool sirius_pipeline_converter::insert_duckdb_native_scan_operator(
     } else {
       t = scan_op.returned_types.at(col_idx.GetPrimaryIndex());
     }
-    scan_info->projected_types.push_back(t);
+    table_info->projected_types.push_back(t);
   }
 
-  // Pass filter context to decode_duckdb_native_split (table_filters apply post-decode).
   if (scan_op.table_filters) {
-    scan_info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+    table_info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
     for (auto& [col_idx, filt] : scan_op.table_filters->filters) {
-      scan_info->table_filters->filters[col_idx] = filt->Copy();
+      table_info->table_filters->filters[col_idx] = filt->Copy();
     }
   }
-  scan_info->column_ids     = scan_op.column_ids;
-  scan_info->projection_ids = scan_op.projection_ids;
-  scan_info->returned_types = scan_op.returned_types;
-  scan_info->output_types   = scan_op.types;
+  table_info->column_ids     = scan_op.column_ids;
+  table_info->projection_ids = scan_op.projection_ids;
+  table_info->returned_types = scan_op.returned_types;
+  table_info->output_types   = scan_op.types;
 
-  // Plan-time viability gate: the metadata walk decides whether the GPU-native scan can read
-  // this table. Non-viable cases (in-memory ":memory:" / transient uncheckpointed segments,
-  // unsupported types or codecs) fall back to the CPU duckdb scan here, before the plan
-  // commits, instead of hard-failing mid-execution.
-  op::scan::duckdb_native_metadata native_metadata;
-  try {
-    native_metadata = op::scan::walk_duckdb_native_metadata(*scan_info->storage,
-                                                            *scan_info->context,
-                                                            scan_info->projected_cols,
-                                                            scan_info->projected_types);
-  } catch (const std::exception& e) {
-    // The walk reads storage metadata under the active transaction; if that is unavailable
-    // (or any other walk failure occurs) fall back to the CPU scan rather than hard-failing.
-    SIRIUS_LOG_DEBUG("[sirius_pipeline_converter] GPU-native metadata walk failed ({}); "
-                     "using CPU duckdb scan",
-                     e.what());
-    return false;
-  }
-  if (!native_metadata.viable) {
-    SIRIUS_LOG_DEBUG("[sirius_pipeline_converter] GPU-native scan not viable ({}); "
-                     "using CPU duckdb scan",
-                     native_metadata.viability_failure_reason);
-    return false;
-  }
-
-  // Readability gate: the GPU-native scan reads persisted blocks by id. Segments with no
-  // persisted block (block_id < 0) — in-memory (":memory:") databases, or data not yet
-  // checkpointed to disk — cannot be read by the decoder. CONSTANT segments legitimately
-  // carry block_id < 0 (their value comes from statistics and is materialized separately).
-  // If any non-CONSTANT segment lacks a block, fall back to the CPU duckdb scan.
-  auto has_unreadable_segment = [](const op::scan::duckdb_native_metadata& md) {
-    auto bad = [](const op::scan::duckdb_segment_descriptor& s) {
-      return s.compression != duckdb::CompressionType::COMPRESSION_CONSTANT && s.block_id < 0;
-    };
-    for (auto const& rg : md.row_groups) {
-      for (auto const& col : rg.columns) {
-        for (auto const& s : col.data_segments) {
-          if (bad(s)) { return true; }
-        }
-        for (auto const& s : col.validity_segments) {
-          if (bad(s)) { return true; }
-        }
-      }
-    }
-    return false;
-  };
-  if (has_unreadable_segment(native_metadata)) {
-    SIRIUS_LOG_DEBUG("[sirius_pipeline_converter] GPU-native scan: table has transient/in-memory "
-                     "segments (block_id<0); using CPU duckdb scan");
-    return false;
-  }
-
-  // Hand the validated walk to the split provider so it does not re-walk the segment
-  // metadata at execution time (the walk is the dominant cold-scan cost). Safe to reuse:
-  // the split provider runs within this same query transaction over the same storage and
-  // projection, so a re-walk would produce identical metadata.
-  scan_info->prewalked_metadata = std::move(native_metadata);
-
-  auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_duckdb_native_scan_operator>(
-    scan_op.types, scan_op.estimated_cardinality, std::move(scan_info));
+  auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_scan_operator>(
+    scan_op.types, scan_op.estimated_cardinality, std::move(table_info));
 
   auto* gpu_scan_ptr = gpu_scan_op.get();
   current_pipeline->operators.insert(current_pipeline->operators.begin(), *gpu_scan_ptr);
   inserted_operators_.push_back(std::move(gpu_scan_op));
-  return true;
 }
 
 void sirius_pipeline_converter::split_table_scan_source(
@@ -451,11 +369,9 @@ void sirius_pipeline_converter::split_table_scan_source(
     return;
   }
 
-  // The GPU-native scan is the default path for seq_scan. insert_duckdb_native_scan_operator
-  // returns false when the table can't use it (non-base-table bind data, in-memory / transient
-  // segments, unsupported types) — in that case fall through to the CPU scan below.
   if (scan_op.function.name == "seq_scan" && op_params_.enable_gpu_duckdb_native_scan) {
-    if (insert_duckdb_native_scan_operator(current_pipeline)) { return; }
+    insert_duckdb_native_scan_operator(current_pipeline);
+    return;
   }
 
   if (scan_op.function.name == "seq_scan" || scan_op.function.name == "iceberg_scan") {
@@ -808,17 +724,12 @@ void sirius_pipeline_converter::split_order_by_sink(
   scheduled_.push_back(current_pipeline);
 
   // Create SORT_SAMPLE operator
-  auto sample_op   = duckdb::make_uniq<op::sirius_physical_sort_sample>(order_ptr);
+  auto sample_op = duckdb::make_uniq<op::sirius_physical_sort_sample>(
+    order_ptr,
+    op_params_.sort_sample_bytes,
+    op_params_.max_sort_partition_bytes,
+    op_params_.max_sort_partition_memory_fraction);
   auto* sample_ptr = sample_op.get();
-  if (op_params_.max_sort_partition_bytes > 0) {
-    sample_ptr->set_max_partition_bytes(op_params_.max_sort_partition_bytes);
-  }
-
-  // Pipeline B: ORDER (source) -> SORT_SAMPLE (sink)
-  auto sample_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(build_ctx_);
-  sample_pipeline->source = order_op.get();
-  sample_pipeline->sink   = sample_ptr;
-  scheduled_.push_back(sample_pipeline);
 
   // Create SORT_PARTITION operator
   auto partition_op   = duckdb::make_uniq<op::sirius_physical_sort_partition>(order_ptr);
@@ -827,11 +738,14 @@ void sirius_pipeline_converter::split_order_by_sink(
   // Wire sort_partition to read boundaries from sort_sample
   partition_ptr->set_sample_op(sample_ptr);
 
-  // Pipeline C: SORT_SAMPLE (source) -> SORT_PARTITION (sink)
-  auto partition_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(build_ctx_);
-  partition_pipeline->source = sample_ptr;
-  partition_pipeline->sink   = partition_ptr;
-  scheduled_.push_back(partition_pipeline);
+  // Pipeline B: ORDER (source) -> SORT_SAMPLE -> SORT_PARTITION (sink)
+  // Sample and partition run in one gpu_pipeline_task so partition sees sample
+  // boundaries immediately after sample completes on the same batch.
+  auto sample_partition_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(build_ctx_);
+  sample_partition_pipeline->source = order_op.get();
+  sample_partition_pipeline->operators.push_back(*sample_ptr);
+  sample_partition_pipeline->sink = partition_ptr;
+  scheduled_.push_back(sample_partition_pipeline);
 
   // Create MERGE_SORT operator
   auto merge_op   = duckdb::make_uniq<op::sirius_physical_merge_sort>(order_ptr);
@@ -857,7 +771,7 @@ void sirius_pipeline_converter::split_order_by_sink(
     }
   }
 
-  // Pipeline D: SORT_PARTITION (source) -> MERGE_SORT (sink)
+  // Pipeline C: SORT_PARTITION (source) -> MERGE_SORT (sink)
   auto merge_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(build_ctx_);
   merge_pipeline->source = partition_ptr;
   merge_pipeline->sink   = merge_ptr;
@@ -1176,9 +1090,8 @@ void sirius_pipeline_converter::compute_repository_wiring()
              pipeline,
              dependent_pipeline);
       }
-    } else if (pipeline->sink->type == op::SiriusPhysicalOperatorType::ORDER_BY ||
-               pipeline->sink->type == op::SiriusPhysicalOperatorType::SORT_SAMPLE) {
-      // Pipeline barrier — sort operators process batches as they arrive
+    } else if (pipeline->sink->type == op::SiriusPhysicalOperatorType::ORDER_BY) {
+      // Pipeline barrier — downstream sample+partition pipeline processes batches as produced
       // (sort_sample overrides get_next_task_hint to wait for N batches)
       for (auto const& dependent_pipeline : source_to_pipelines[sink_op]) {
         emit("default", op::MemoryBarrierType::PIPELINE, sink_op, pipeline, dependent_pipeline);
@@ -1360,8 +1273,7 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
                           static_cast<int>(scan_port->type),
                           static_cast<void*>(scan_port->repo));
         }
-      } else if (first_op.type == op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN ||
-                 first_op.type == op::SiriusPhysicalOperatorType::GPU_DUCKDB_NATIVE_SCAN ||
+      } else if (first_op.type == op::SiriusPhysicalOperatorType::GPU_SCAN ||
                  first_op.type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
                  first_op.type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN ||
                  first_op.type == op::SiriusPhysicalOperatorType::CPU_SOURCE ||
@@ -1369,7 +1281,7 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
                  first_op.type == op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN ||
                  first_op.type == op::SiriusPhysicalOperatorType::EMPTY_RESULT ||
                  first_op.type == op::SiriusPhysicalOperatorType::DUMMY_SCAN) {
-        // scan-like operators don't have a "default" port. GPU_PARQUET_SCAN gets
+        // scan-like operators don't have a "default" port. GPU_SCAN gets
         // its splits via the scan_manager's connector, not via a port.
       } else {
         // Most operators have "default" port
@@ -1405,8 +1317,7 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
                           static_cast<int>(scan_port->type),
                           static_cast<void*>(scan_port->repo));
         }
-      } else if (sink->type == op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN ||
-                 sink->type == op::SiriusPhysicalOperatorType::GPU_DUCKDB_NATIVE_SCAN ||
+      } else if (sink->type == op::SiriusPhysicalOperatorType::GPU_SCAN ||
                  sink->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
                  sink->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN ||
                  sink->type == op::SiriusPhysicalOperatorType::CPU_SOURCE ||
