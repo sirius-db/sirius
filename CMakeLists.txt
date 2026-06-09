@@ -139,6 +139,13 @@ endif()
 # Rust telemetry instrumentation (C++ FFI via Corrosion)
 add_subdirectory(rust/crates/telemetry/bridge)
 
+# Upstream testcontainers-native, fetched + patched at configure time (see
+# cmake/testcontainers_native.cmake), used by the S3 integration test harness to
+# start MinIO containers from the test binary. Builds a Go c-archive, so a Go
+# toolchain (provided by pixi) and network access on the first configure/build
+# are required.
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/testcontainers_native.cmake")
+
 # cmake-format: off
 set(EXTENSION_SOURCES
     src/config.cpp
@@ -536,6 +543,7 @@ set(TEST_SOURCES
     test/cpp/sirius_extension/test_sirius_read_parquet_cardinality.cpp
     test/cpp/sql/test_sirius_sql_rewrite.cpp
     test/cpp/unittest.cpp
+    test/cpp/utils/s3_container.cpp
     test/cpp/utils/sirius_test_env.cpp
     test/cpp/utils/utils.cpp)
 # cmake-format: on
@@ -580,6 +588,10 @@ target_include_directories(
 
 target_link_libraries(sirius_unittest sirius_extension duckdb_static)
 link_extension_libraries(sirius_unittest "")
+
+# S3 container harness: the testcontainers-native bridge plus libcurl for
+# host-side fixture upload (SigV4 signing comes from sirius_extension).
+target_link_libraries(sirius_unittest testcontainers_native PkgConfig::CURL)
 # DuckDB v1.5.0 unity builds emit strong symbols for static constexpr members
 # that conflict with inline definitions from headers included in test files.
 target_link_options(sirius_unittest PRIVATE
