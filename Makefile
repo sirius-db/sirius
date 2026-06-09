@@ -146,11 +146,8 @@ list-presets: $(PRESETS_LINK)
 #
 # `make test`         runs the default Catch2 suite; AUTO is unset, so no Docker.
 # `make s3-test`      standard S3 correctness gate: runs [s3][integration] except
-#                     [large]/[aws] with MinIO auto-managed, in strict mode.
-#                     [gpu_execution] is excluded: those small-budget S3 SQL
-#                     tests hardcode a 256 MiB GPU limit with no disk spill, which
-#                     loops in the downgrade executor on large-VRAM GPUs (RMM pool
-#                     sizing); re-include once that is addressed.
+#                     [large]/[aws] (incl. the SQL-over-S3 surface) with MinIO
+#                     auto-managed, in strict mode.
 # `make s3-test-large`
 #                     large-SF10 SQL-over-S3 gate. SIRIUS_TEST_S3_LARGE=1 makes
 #                     the harness generate + upload lineitem_sf10.parquet (needs
@@ -181,21 +178,21 @@ s3-test:
 	fi
 	@set -e; \
 	export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_STRICT=1; \
-	$(S3_TEST_BIN) "[s3][integration]~[large]~[aws]~[gpu_execution]"
+	$(S3_TEST_BIN) "[s3][integration]~[large]~[aws]"
 
 s3-test-large:
 	@if [ ! -x $(S3_TEST_BIN) ]; then \
 	  echo "s3-test-large: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
 	  exit 1; \
 	fi
+	@# Grouped by config (chunk-prewarm on vs off) so MinIO is brought up once per
+	@# group. Catch2 OR-combines specs within one argument via commas (multiple
+	@# positional args are AND-concatenated instead), so each group runs in a
+	@# single process where same-config cases share one SiriusContext lifecycle.
 	@set -e; \
 	export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_LARGE=1 SIRIUS_TEST_S3_STRICT=1; \
-	$(S3_TEST_BIN) "[s3][sql][large][large-count]"; \
-	$(S3_TEST_BIN) "[s3][sql][large][large-q1]"; \
-	$(S3_TEST_BIN) "[s3][sql][large][large-join]"; \
-	$(S3_TEST_BIN) "[s3][sql][large][large-count-no-prewarm]"; \
-	$(S3_TEST_BIN) "[s3][sql][large][large-q1-no-prewarm]"; \
-	$(S3_TEST_BIN) "[s3][sql][large][large-join-no-prewarm]"
+	$(S3_TEST_BIN) "[s3][sql][large][large-count],[s3][sql][large][large-q1],[s3][sql][large][large-join]"; \
+	$(S3_TEST_BIN) "[s3][sql][large][large-count-no-prewarm],[s3][sql][large][large-q1-no-prewarm],[s3][sql][large][large-join-no-prewarm]"
 
 # Manual real-AWS gates. These never start MinIO/Docker and are excluded from
 # CI. Export the AWS environment yourself before invoking (regional S3 endpoint,

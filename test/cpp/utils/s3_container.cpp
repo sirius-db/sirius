@@ -400,6 +400,14 @@ void maybe_upload_large_fixture(minio_instance const& http, fs::path const& work
   }
   std::cout << "[s3] uploaded SF10 lineitem fixture (" << fs::file_size(parquet) << " bytes) to "
             << http.endpoint << "/" << kBucket << "/" << key << std::endl;
+
+  // The large tests read the same SF10 file locally to build a CPU oracle to
+  // compare the GPU-over-S3 result against. Point them at the file we just
+  // uploaded so the local copy and the S3 object are byte-identical. (Respect an
+  // explicit override.)
+  if (!env_set("SIRIUS_PR6_LARGE_LOCAL_PARQUET")) {
+    ::setenv("SIRIUS_PR6_LARGE_LOCAL_PARQUET", parquet.c_str(), /*overwrite=*/1);
+  }
 }
 
 // ---- orchestration ---------------------------------------------------------

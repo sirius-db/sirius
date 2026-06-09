@@ -153,7 +153,11 @@ struct sirius_memory_limits {
   std::string gpu_usage{"256 MiB"};
   std::string gpu_reservation{"128 MiB"};
   std::string host_capacity{"512 MiB"};
-  std::string disk_capacity;
+  // A small disk tier so the downgrade executor can spill instead of looping
+  // when GPU pressure is hit. Without it, on large-VRAM GPUs (where RMM's pool
+  // can exceed the 256 MiB usage cap at init) even a tiny scan spins forever at
+  // the no-disk-spill boundary. `large_sirius_memory_limits()` overrides this.
+  std::string disk_capacity{"2 GiB"};
   std::optional<bool> enable_chunk_prewarm;
 };
 
