@@ -168,6 +168,8 @@ set(EXTENSION_SOURCES
     src/expression/aggregate_id.cpp
     src/expression/ast/clone.cpp
     src/expression/ast/node.cpp
+    src/expression/ast/substitute.cpp
+    src/expression/ast/visit.cpp
     src/expression/from_duckdb.cpp
     src/expression/function_id.cpp
     src/expression/join_condition.cpp
@@ -286,6 +288,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_limit.cpp
     src/planner/sirius_plan_order.cpp
     src/planner/sirius_plan_projection.cpp
+    src/planner/sirius_plan_projection_utils.cpp
     src/planner/sirius_plan_recursive_cte.cpp
     src/planner/sirius_plan_top_n.cpp
     src/pin_table.cpp
@@ -463,6 +466,7 @@ set(TEST_SOURCES
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/expression/test_ast_aggregate.cpp
     test/cpp/expression/test_ast_clone.cpp
+    test/cpp/expression/test_ast_substitute.cpp
     test/cpp/expression/test_ast_from_duckdb.cpp
     test/cpp/expression/test_ast_scaffold.cpp
     test/cpp/expression/test_ast_to_duckdb.cpp
@@ -522,6 +526,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_sirius_dynamic_filter.cpp
     test/cpp/parallel/test_task_executor.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
+    test/cpp/planner/test_projection_fold.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
     test/cpp/pipeline/test_pipeline_memory_history.cpp
