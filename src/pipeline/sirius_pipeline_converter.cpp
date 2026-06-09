@@ -280,29 +280,21 @@ void sirius_pipeline_converter::insert_parquet_scan_operator(
   inserted_operators_.push_back(std::move(gpu_scan_op));
 }
 
-void sirius_pipeline_converter::insert_duckdb_native_scan_operator(
+bool sirius_pipeline_converter::insert_duckdb_native_scan_operator(
   duckdb::shared_ptr<sirius_pipeline>& current_pipeline)
 {
   auto& scan_op = current_pipeline->get_source()->Cast<op::sirius_physical_table_scan>();
-  if (!scan_op.bind_data) {
-    throw std::runtime_error(
-      "[sirius_pipeline_converter::insert_duckdb_native_scan_operator] seq_scan has no bind_data");
-  }
+  if (!scan_op.bind_data) { return false; }
+  // Only seq_scan over base tables (TableScanBindData) is supported.
   auto* table_scan_bind = dynamic_cast<duckdb::TableScanBindData*>(scan_op.bind_data.get());
-  if (table_scan_bind == nullptr) {
-    throw std::runtime_error(
-      "[sirius_pipeline_converter::insert_duckdb_native_scan_operator] seq_scan bind_data is not "
-      "TableScanBindData; the GPU-native duckdb scan path supports only seq_scan over base "
-      "tables. Disable enable_gpu_duckdb_native_scan for this query.");
-  }
+  if (table_scan_bind == nullptr) { return false; }
   auto& bind_data = *table_scan_bind;
   auto& table     = bind_data.table.Cast<duckdb::DuckTableEntry>();
 
-  if (client_context_ == nullptr) {
-    throw std::runtime_error(
-      "[sirius_pipeline_converter::insert_duckdb_native_scan_operator] no client_context passed "
-      "to converter; seq_scan GPU-native path requires it");
-  }
+  if (client_context_ == nullptr) { return false; }
+
+  // In-memory tables have no persisted blocks for the native scan to read; use the CPU scan.
+  if (table.GetStorage().GetAttached().GetStorageManager().InMemory()) { return false; }
 
   auto table_info     = std::make_unique<op::scan::duckdb_native_ingestible_table_info>();
   table_info->storage = &table.GetStorage();
@@ -354,6 +346,7 @@ void sirius_pipeline_converter::insert_duckdb_native_scan_operator(
   auto* gpu_scan_ptr = gpu_scan_op.get();
   current_pipeline->operators.insert(current_pipeline->operators.begin(), *gpu_scan_ptr);
   inserted_operators_.push_back(std::move(gpu_scan_op));
+  return true;
 }
 
 void sirius_pipeline_converter::split_table_scan_source(
@@ -369,9 +362,10 @@ void sirius_pipeline_converter::split_table_scan_source(
     return;
   }
 
+  // GPU-native scan is the default for seq_scan; on a non-viable table it returns false and
+  // we fall through to the CPU duckdb scan below.
   if (scan_op.function.name == "seq_scan" && op_params_.enable_gpu_duckdb_native_scan) {
-    insert_duckdb_native_scan_operator(current_pipeline);
-    return;
+    if (insert_duckdb_native_scan_operator(current_pipeline)) { return; }
   }
 
   if (scan_op.function.name == "seq_scan" || scan_op.function.name == "iceberg_scan") {

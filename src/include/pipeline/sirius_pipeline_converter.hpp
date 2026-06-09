@@ -90,7 +90,9 @@ class sirius_pipeline_converter {
   // Phase 2: Split pipelines by operator type
   void split_pipelines(duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled);
   void insert_parquet_scan_operator(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
-  void insert_duckdb_native_scan_operator(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
+  // Returns false (leaving the pipeline unchanged) when the table can't use the GPU-native
+  // scan, so the caller falls back to the CPU duckdb scan.
+  bool insert_duckdb_native_scan_operator(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
   void split_table_scan_source(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
   void split_cpu_source(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
   void split_intermediate_joins(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);

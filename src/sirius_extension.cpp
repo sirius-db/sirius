@@ -1655,8 +1655,8 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 
   config.AddExtensionOption(
     "enable_gpu_duckdb_native_scan",
-    "Route DuckDB seq_scan to the GPU-native scan operator instead of the CPU fallback "
-    "(experimental; off by default)",
+    "Route DuckDB seq_scan to the GPU-native scan operator (the default). Set false to use "
+    "the CPU duckdb scan instead.",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(sirius::operator_params{}.enable_gpu_duckdb_native_scan),
     SetEnableGpuDuckdbNativeScan);

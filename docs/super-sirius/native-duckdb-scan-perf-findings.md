@@ -8,6 +8,9 @@
 **Data:** TPC-H SF30 (lineitem 179,998,372 rows; orders 45,000,000), generated in both parquet and
 DuckDB-native formats from the same spec (validated identical, all 22 queries byte/tolerance-exact).
 
+> **Note:** These SF30 measurements may not reflect current performance; treat them as a
+> directional baseline pending re-measurement.
+
 ## Headline (warm, all 22 queries, seconds)
 
 | Mode | Warm total | vs DuckDB CPU |
@@ -32,8 +35,8 @@ actionable gap.
 
 ## Root cause: the native scan has no predicate pushdown into decode
 
-The GPU-native scan operator
-([`src/op/scan/sirius_gpu_duckdb_native_scan_operator.cpp:80-137`](../../src/op/scan/sirius_gpu_duckdb_native_scan_operator.cpp))
+The GPU-native scan decoder
+([`src/op/scan/duckdb_native_decoder.cpp`](../../src/op/scan/duckdb_native_decoder.cpp))
 **decodes 100% of every row group to the GPU first, then applies `table_filters` as a post-decode GPU
 `select`** (`exec.select(table->view())`). It has no in-decode predicate evaluation and no
 statistics-based row-group skipping.

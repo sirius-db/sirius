@@ -73,10 +73,9 @@ struct operator_params {
   /// May be larger than concat_batch_bytes; build-side batches will be concatenated if needed.
   uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
 
-  /// Route DuckDB native `seq_scan` to the GPU-native scan operator
-  /// (sirius_gpu_duckdb_native_scan_operator) instead of the CPU fallback
-  /// (sirius_physical_duckdb_scan). Off by default.
-  bool enable_gpu_duckdb_native_scan = false;
+  /// Route DuckDB `seq_scan` over base tables to the GPU-native scan operator.
+  /// On by default; set false to use the CPU duckdb scan instead.
+  bool enable_gpu_duckdb_native_scan = true;
 };
 
 struct telemetry_config {
