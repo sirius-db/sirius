@@ -149,9 +149,14 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
       "[duckdb_native_gpu_ingestible] projected_cols and projected_types must be parallel");
   }
 
-  // Walk metadata once.
-  _metadata = walk_duckdb_native_metadata(
-    *bind.storage, *bind.context, bind.projected_cols, bind.projected_types);
+  // Walk metadata once. Pushed-down filters drive row-group pruning in the walk;
+  // column_ids maps each filter to its storage index.
+  _metadata = walk_duckdb_native_metadata(*bind.storage,
+                                          *bind.context,
+                                          bind.projected_cols,
+                                          bind.projected_types,
+                                          bind.table_filters.get(),
+                                          &bind.column_ids);
   if (!_metadata.viable) {
     SPDLOG_DEBUG("[duckdb_native_gpu_ingestible] non-viable: {}",
                  _metadata.viability_failure_reason);

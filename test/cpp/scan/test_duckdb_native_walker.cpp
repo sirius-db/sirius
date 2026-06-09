@@ -19,12 +19,17 @@
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/catalog/catalog_entry/table_catalog_entry.hpp>
+#include <duckdb/common/column_index.hpp>
 #include <duckdb/common/enums/compression_type.hpp>
 #include <duckdb/main/client_context.hpp>
+#include <duckdb/planner/filter/constant_filter.hpp>
+#include <duckdb/planner/filter/optional_filter.hpp>
+#include <duckdb/planner/table_filter.hpp>
 #include <duckdb/storage/data_table.hpp>
 #include <op/scan/duckdb_native_metadata.hpp>
 #include <utils/utils.hpp>
 
+#include <cstdint>
 #include <string>
 
 using namespace sirius;
@@ -71,6 +76,28 @@ projected_column rowid_col()
   projected_column pc;
   pc.is_rowid = true;
   return pc;
+}
+
+// A one-column TableFilterSet keyed by the relative scan-column index `col_key`
+// (matching create_table_filter_set's remapping), plus the parallel column_ids
+// mapping that key back to storage index `storage_idx`.
+struct filter_ctx {
+  duckdb::TableFilterSet filters;
+  duckdb::vector<duckdb::ColumnIndex> column_ids;
+};
+
+filter_ctx make_constant_filter(duckdb::idx_t col_key,
+                                duckdb::idx_t storage_idx,
+                                duckdb::ExpressionType cmp,
+                                duckdb::Value constant)
+{
+  filter_ctx ctx;
+  ctx.filters.filters[col_key] =
+    duckdb::make_uniq<duckdb::ConstantFilter>(cmp, std::move(constant));
+  // column_ids must be indexable at col_key; pad with the same storage_idx.
+  ctx.column_ids.resize(col_key + 1, duckdb::ColumnIndex(storage_idx));
+  ctx.column_ids[col_key] = duckdb::ColumnIndex(storage_idx);
+  return ctx;
 }
 
 }  // namespace
@@ -442,4 +469,128 @@ TEST_CASE("CompressionTypeToString output matches walker reverse-map keys",
   REQUIRE(std::string(CompressionTypeToString(CompressionType::COMPRESSION_ROARING)) == "Roaring");
   REQUIRE(std::string(CompressionTypeToString(CompressionType::COMPRESSION_EMPTY)) ==
           "Empty Validity");
+}
+
+//===--------------------------------------------------------------------===//
+// Row-group filter-statistics pruning
+//===--------------------------------------------------------------------===//
+
+// 300k monotonically increasing ints span 3 row groups (122880 each), with tight
+// per-row-group min/max. A `a >= 250000` lower bound makes every row group whose
+// max < 250000 FILTER_ALWAYS_FALSE, so the walker should drop them.
+namespace {
+constexpr int kManyRows = 300000;
+
+duckdb::DataTable& make_monotonic_int_table(duckdb::Connection& con)
+{
+  exec_ok(con, "CREATE TABLE t(a INTEGER)");
+  exec_ok(con, "INSERT INTO t SELECT range FROM range(0, " + std::to_string(kManyRows) + ")");
+  exec_ok(con, "CHECKPOINT");
+  return get_storage(con, "t");
+}
+}  // namespace
+
+TEST_CASE("statistics pruning drops row groups below a lower-bound filter",
+          "[scan][duckdb_native_walker][pruning]")
+{
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto& storage        = make_monotonic_int_table(con);
+
+  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::INTEGER)};
+
+  // Baseline: no filter → nothing pruned.
+  auto base = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  REQUIRE(base.viable);
+  REQUIRE(base.pruned_row_groups == 0);
+  REQUIRE(base.row_groups.size() >= 2);  // 300k rows > one 122880-row group
+
+  // a >= 250000 → row groups entirely below 250000 are FILTER_ALWAYS_FALSE.
+  auto ctx = make_constant_filter(
+    0, 0, duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::INTEGER(250000));
+  auto pruned =
+    walk_duckdb_native_metadata(storage, *con.context, cols, ts, &ctx.filters, &ctx.column_ids);
+
+  REQUIRE(pruned.viable);
+  REQUIRE(pruned.pruned_row_groups >= 1);
+  // Consistency: survivors + pruned == baseline row groups.
+  REQUIRE(pruned.row_groups.size() + pruned.pruned_row_groups == base.row_groups.size());
+  REQUIRE(pruned.row_groups.size() >= 1);
+
+  // Survivors carry fewer rows than the full table (we dropped low row groups),
+  // and none of the pruned bytes are zero (we accounted for real decode work).
+  duckdb::idx_t surviving_rows = 0;
+  for (const auto& rg : pruned.row_groups) {
+    surviving_rows += rg.row_count;
+  }
+  REQUIRE(surviving_rows > 0);
+  REQUIRE(surviving_rows < static_cast<duckdb::idx_t>(kManyRows));
+  REQUIRE(pruned.pruned_decoded_bytes > 0);
+}
+
+TEST_CASE("statistics pruning keeps every row group when the filter matches all",
+          "[scan][duckdb_native_walker][pruning]")
+{
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto& storage        = make_monotonic_int_table(con);
+
+  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::INTEGER)};
+
+  // a >= 0 is always true for this data → no row group can be pruned.
+  auto ctx = make_constant_filter(
+    0, 0, duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::INTEGER(0));
+  auto md =
+    walk_duckdb_native_metadata(storage, *con.context, cols, ts, &ctx.filters, &ctx.column_ids);
+
+  REQUIRE(md.viable);
+  REQUIRE(md.pruned_row_groups == 0);
+  REQUIRE(md.pruned_decoded_bytes == 0);
+}
+
+TEST_CASE("statistics pruning refuses (CPU fallback) when every row group is pruned",
+          "[scan][duckdb_native_walker][pruning]")
+{
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto& storage        = make_monotonic_int_table(con);
+
+  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::INTEGER)};
+
+  // a >= 1_000_000 exceeds every value → all row groups FILTER_ALWAYS_FALSE.
+  // The walker drops them all and refuses so the query routes to DuckDB CPU
+  // (which correctly returns the empty result).
+  auto ctx = make_constant_filter(
+    0, 0, duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::INTEGER(1000000));
+  auto md =
+    walk_duckdb_native_metadata(storage, *con.context, cols, ts, &ctx.filters, &ctx.column_ids);
+
+  REQUIRE_FALSE(md.viable);
+  REQUIRE(md.viability_failure_reason.find("pruned") != std::string::npos);
+}
+
+// Guards the relaxation that lets us prune on any static filter, not just the
+// subset re-applied post-decode. An OPTIONAL_FILTER ("not required for query
+// correctness") wrapping a lower-bound still prunes, because OptionalFilter
+// delegates CheckStatistics to its child. Pre-relaxation this pruned nothing.
+TEST_CASE("statistics pruning prunes through an OPTIONAL_FILTER wrapper",
+          "[scan][duckdb_native_walker][pruning]")
+{
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto& storage        = make_monotonic_int_table(con);
+
+  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::INTEGER)};
+
+  filter_ctx ctx;
+  ctx.filters.filters[0] =
+    duckdb::make_uniq<duckdb::OptionalFilter>(duckdb::make_uniq<duckdb::ConstantFilter>(
+      duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::INTEGER(250000)));
+  ctx.column_ids.push_back(duckdb::ColumnIndex(0));
+
+  auto md =
+    walk_duckdb_native_metadata(storage, *con.context, cols, ts, &ctx.filters, &ctx.column_ids);
+
+  REQUIRE(md.viable);
+  REQUIRE(md.pruned_row_groups >= 1);
 }

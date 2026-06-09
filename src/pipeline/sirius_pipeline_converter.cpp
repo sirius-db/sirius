@@ -337,6 +337,7 @@ void sirius_pipeline_converter::insert_duckdb_native_scan_operator(
     table_info->projected_types.push_back(t);
   }
 
+  // Filters drive row-group pruning in the metadata walk and post-decode filtering.
   if (scan_op.table_filters) {
     table_info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
     for (auto& [col_idx, filt] : scan_op.table_filters->filters) {

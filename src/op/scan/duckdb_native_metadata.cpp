@@ -20,8 +20,11 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <duckdb/common/column_index.hpp>
+#include <duckdb/common/enums/filter_propagate_result.hpp>
 #include <duckdb/function/partition_stats.hpp>
 #include <duckdb/main/attached_database.hpp>
+#include <duckdb/planner/table_filter.hpp>
 #include <duckdb/storage/block_manager.hpp>
 #include <duckdb/storage/statistics/base_statistics.hpp>
 #include <duckdb/storage/statistics/string_stats.hpp>
@@ -270,6 +273,59 @@ void drop_empty_trailing_row_groups(duckdb_native_metadata& md)
   }
 }
 
+/// @brief Check if the filter can be applied to row-group pruning.
+///
+/// The only filter type we must exclude from statistics pruning is DYNAMIC_FILTER:
+/// its bounds come from a runtime source (e.g. a hash-join build) and are not
+/// currently populated at metadata-walk time.
+bool filter_is_prunable(duckdb::TableFilterType t)
+{
+  return t != duckdb::TableFilterType::DYNAMIC_FILTER;
+}
+
+/// @brief Drop row groups a pushed-down filter proves can hold no matching rows.
+///
+/// Mirrors duckdb::RowGroup::CheckZonemap: for each prunable filter, evaluate
+/// DuckDB's own TableFilter::CheckStatistics against the row group's aggregated
+/// per-column statistics (PartitionRowGroup::GetColumnStatistics).
+void prune_row_groups_by_filter_stats(duckdb_native_metadata& md,
+                                      const row_group_handles& handles,
+                                      const duckdb::TableFilterSet& table_filters,
+                                      const duckdb::vector<duckdb::ColumnIndex>& column_ids)
+{
+  std::vector<duckdb_row_group_metadata> kept;
+  kept.reserve(md.row_groups.size());
+  std::size_t pruned_bytes = 0;
+
+  for (auto& rg_md : md.row_groups) {
+    auto const rg = rg_md.row_group_index;
+    bool prune    = false;
+    if (rg < handles.size() && handles[rg].second) {
+      auto& prg = *handles[rg].second;
+      for (auto const& [col_idx, filter] : table_filters.filters) {
+        if (!filter_is_prunable(filter->filter_type)) { continue; }
+        if (col_idx >= column_ids.size()) { continue; }  // defensive
+        auto stats =
+          prg.GetColumnStatistics(duckdb::StorageIndex(column_ids[col_idx].GetPrimaryIndex()));
+        if (!stats) { continue; }  // no stats → cannot prune
+        if (filter->CheckStatistics(*stats) == duckdb::FilterPropagateResult::FILTER_ALWAYS_FALSE) {
+          prune = true;
+          break;
+        }
+      }
+    }
+    if (prune) {
+      pruned_bytes += rg_md.decoded_bytes_budget;
+    } else {
+      kept.push_back(std::move(rg_md));
+    }
+  }
+
+  md.pruned_row_groups    = md.row_groups.size() - kept.size();
+  md.pruned_decoded_bytes = pruned_bytes;
+  md.row_groups           = std::move(kept);
+}
+
 }  // namespace
 
 bool is_supported_data_compression(duckdb::CompressionType c)
@@ -305,7 +361,9 @@ duckdb_native_metadata walk_duckdb_native_metadata(
   duckdb::DataTable& storage,
   duckdb::ClientContext& context,
   const std::vector<projected_column>& projected_cols,
-  const std::vector<sirius::logical_type>& projected_types)
+  const std::vector<sirius::logical_type>& projected_types,
+  const duckdb::TableFilterSet* table_filters,
+  const duckdb::vector<duckdb::ColumnIndex>* column_ids)
 {
   nvtx3::scoped_range nvtx_walk{"sirius::native_metadata_walk"};
 
@@ -484,6 +542,14 @@ duckdb_native_metadata walk_duckdb_native_metadata(
 
   compute_row_counts(md, partition_stats);
   compute_decoded_byte_budgets(md, projected_types);
+
+  // Row-group pruning
+  if (table_filters != nullptr && !table_filters->filters.empty() && column_ids != nullptr &&
+      !column_ids->empty()) {
+    nvtx3::scoped_range nvtx_prune{"sirius::native_metadata_filter_stats_prune"};
+    prune_row_groups_by_filter_stats(md, handles, *table_filters, *column_ids);
+  }
+
   drop_empty_trailing_row_groups(md);
 
   // Per-column varchar upper bound, cached on each row group so the
@@ -518,9 +584,12 @@ duckdb_native_metadata walk_duckdb_native_metadata(
 
   md.viable = true;
   SIRIUS_LOG_DEBUG(
-    "[duckdb_native_metadata] walked {} row groups across {} projected columns; viable=true",
+    "[duckdb_native_metadata] walked {} row groups across {} projected columns; "
+    "stats-pruned {} row groups (~{} decoded bytes); viable=true",
     md.row_groups.size(),
-    projected_cols.size());
+    projected_cols.size(),
+    md.pruned_row_groups,
+    md.pruned_decoded_bytes);
   return md;
 }
 
