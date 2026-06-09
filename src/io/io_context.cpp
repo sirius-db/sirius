@@ -18,6 +18,7 @@
 
 #include "driver_types.h"
 #include "io/prefetching_cache.hpp"
+#include "io/sirius_datasource.hpp"
 
 #include <rmm/device_buffer.hpp>
 

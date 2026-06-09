@@ -50,31 +50,61 @@
 namespace sirius::scan_manager {
 
 sirius_scan_manager::sirius_scan_manager(
-  scan_manager_config config, std::vector<std::shared_ptr<sirius::io::sirius_ioctx>> io_ctxs)
+  scan_manager_config config, cucascade::memory::fixed_size_host_memory_resource* host_fsmr)
   : _config(std::move(config)),
     _thread_pool(_config.thread_pool.num_threads,
                  _config.thread_pool.thread_name_prefix,
                  _config.thread_pool.cpu_affinity_list),
     _dispatcher(
       std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads)),
-    _io_ctxs(std::move(io_ctxs)),
     _factory(_pinned_entries)
 {
-  // S6 (NUMA) increment 1: the scan_manager no longer constructs IO backends.
-  // SiriusContext owns the uring(s) + s3_ioctx + S3 async thread pool + prefetch
-  // buffer_pool/cache and passes the routing backends in as borrowed
-  // shared_ptrs. io_ctx_for / io_ctx_shared_for dispatch over this borrowed
-  // list; stop() and the destructor must NOT shut down or destroy them.
-  SIRIUS_LOG_DEBUG("[sirius_scan_manager] constructed with {} borrowed IO backend(s)",
-                   _io_ctxs.size());
+  if (_config.use_sirius_datasource) {
+    auto ioctx = std::make_shared<sirius::io::uring_ioctx>(
+      /*host_ring_depth=*/16u,
+      /*ring_entries=*/_config.uring_ring_entries,
+      /*n_reactors=*/_config.uring_n_reactors,
+      /*bounce_slot_size=*/sirius::io::CHUNK_SIZE);
+    _io_ctxs.push_back(std::move(ioctx));
+  }
+
+  if (_config.s3_config) {
+    auto s3_cfg                 = *_config.s3_config;
+    s3_cfg.host_memory_resource = host_fsmr;
+    if (s3_cfg.async_thread_pool == nullptr) {
+      _s3_thread_pool = std::make_unique<sirius::exec::static_thread_pool>(
+        _config.s3_thread_pool.num_threads,
+        _config.s3_thread_pool.thread_name_prefix,
+        _config.s3_thread_pool.cpu_affinity_list);
+      s3_cfg.async_thread_pool = _s3_thread_pool.get();
+    }
+    auto s3_ioctx = std::make_shared<sirius::io::s3::s3_blocking_ioctx>(std::move(s3_cfg));
+    _io_ctxs.push_back(std::move(s3_ioctx));
+  }
+
+  if (_config.enable_prefetch_cache && host_fsmr != nullptr) {
+    auto const slab_bytes = host_fsmr->get_block_size() *
+                            static_cast<std::size_t>(sirius::io::buffer_pool::CHUNKS_PER_SLAB);
+    auto const max_slabs =
+      static_cast<uint32_t>((_config.prefetch_buffer_pool_bytes + slab_bytes - 1) / slab_bytes);
+    _prefetch_buffer_pool = std::make_unique<sirius::io::buffer_pool>(*host_fsmr, max_slabs);
+    for (auto& ctx : _io_ctxs) {
+      if (ctx) {
+        ctx->initialize_cache(*_prefetch_buffer_pool, _config.prefetch_inflight_budget_chunks);
+      }
+    }
+  }
+
+  SIRIUS_LOG_DEBUG("[sirius_scan_manager] constructed with {} IO backend(s)", _io_ctxs.size());
 }
 
 sirius_scan_manager::~sirius_scan_manager()
 {
-  // S6: backends + their caches are owned by SiriusContext (which logs cache
-  // summaries on its own teardown). Only stop our scan-orchestration pool here;
-  // do not touch the borrowed backends.
   stop();
+  _io_ctxs.clear();
+  if (_s3_thread_pool) { _s3_thread_pool->stop(); }
+  _s3_thread_pool.reset();
+  _prefetch_buffer_pool.reset();
 }
 
 namespace {
@@ -103,35 +133,12 @@ Out lookup_supporting(Container const& ioctxs,
   return Out{};
 }
 
-sirius::io::sirius_ioctx* raw_ptr(std::shared_ptr<sirius::io::sirius_ioctx> const& ctx)
-{
-  return ctx.get();
-}
-
-std::shared_ptr<sirius::io::sirius_ioctx> shared_copy(
-  std::shared_ptr<sirius::io::sirius_ioctx> const& ctx)
-{
-  return ctx;
-}
-
 }  // namespace
-
-sirius::io::sirius_ioctx* sirius_scan_manager::io_ctx_for(std::string_view path) const noexcept
-{
-  return lookup_supporting<decltype(_io_ctxs), sirius::io::sirius_ioctx*>(_io_ctxs, path, raw_ptr);
-}
-
-std::shared_ptr<sirius::io::sirius_ioctx> sirius_scan_manager::io_ctx_shared_for(
-  std::string_view path) const noexcept
-{
-  return lookup_supporting<decltype(_io_ctxs), std::shared_ptr<sirius::io::sirius_ioctx>>(
-    _io_ctxs, path, shared_copy);
-}
 
 parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri)
 {
-  auto* io_ctx = io_ctx_for(uri);
-  if (io_ctx == nullptr) {
+  auto datasource = create_datasource(uri);
+  if (!datasource) {
     throw std::runtime_error("[sirius_scan_manager::describe_parquet] no backend supports URI: " +
                              uri);
   }
@@ -139,9 +146,6 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
   // Footer-only fetch + Thrift parse — the same path parquet_split_provider's
   // run_batch takes on a metadata-cache miss, so bind and scan agree on how
   // the footer is read.
-  auto io_object  = io_ctx->create_io_object(uri);
-  auto datasource = io_ctx->make_datasource(io_object);
-
   auto footer_buffer         = cudf::io::parquet::fetch_footer_to_host(*datasource);
   auto const footer_byte_len = footer_buffer->size();
   auto reader_options        = cudf::io::parquet_reader_options::builder().build();
@@ -156,11 +160,11 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
   // Footer-parse reuse: a metadata-only insert (empty ranges => no chunk
   // prefetch) lets the subsequent scan's get_metadata hit, so the footer is
   // Thrift-parsed once instead of twice.
-  if (auto* cache = io_ctx->cache(); cache != nullptr) {
+  if (auto* cache = datasource->io_ctx()->cache(); cache != nullptr) {
     auto metadata = std::make_shared<parquet_metadata>(
       std::make_shared<cudf::io::parquet::FileMetaData const>(std::move(file_metadata)),
       footer_byte_len);
-    cache->insert(*io_object, std::move(metadata), /*ranges=*/{});
+    cache->insert(*datasource->io_object(), std::move(metadata), /*ranges=*/{});
   }
 
   parquet_bind_result result;
@@ -173,25 +177,17 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
 
 void sirius_scan_manager::prepare_for_query(
   const sirius::planner::query& query,
-  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs,
   std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces)
 {
   reset();
 
-  // Advance the cache age so the evictor can score this query's inserts
-  // against entries left over from prior queries. The buffer_pool (and the
-  // prefetching_cache on each ioctx that draws from it) is shared across all
-  // registered backends, so refreshing one cache covers all of them — but
-  // calling refresh on each is safe and explicit; pick whichever has one.
   for (auto const& ctx : _io_ctxs) {
     if (ctx && ctx->cache()) { ctx->cache()->refresh_cache(); }
   }
 
-  SIRIUS_LOG_DEBUG(
-    "[sirius_scan_manager::prepare_for_query] pipelines={} gpu_ioctxs={} gpu_memory_spaces={}",
-    query.get_pipelines().size(),
-    gpu_ioctxs.size(),
-    gpu_memory_spaces.size());
+  SIRIUS_LOG_DEBUG("[sirius_scan_manager::prepare_for_query] pipelines={} gpu_memory_spaces={}",
+                   query.get_pipelines().size(),
+                   gpu_memory_spaces.size());
 
   for (auto const& pipeline : query.get_pipelines()) {
     if (!pipeline) { continue; }
@@ -205,23 +201,8 @@ void sirius_scan_manager::prepare_for_query(
     auto table_info = op->take_table_info();
     if (!table_info) { continue; }
 
-    // When use_sirius_datasource=false (single-GPU only — multi-GPU runs are
-    // forced to true by sirius_config::enforce_sirius_datasource_for_multi_gpu()),
-    // suppress the per-GPU uring map. Local files then route through
-    // cudf::io::datasource::create (kvikio fallback, safe with one GPU); S3
-    // paths are unaffected (they dispatch through the scan_manager's _io_ctxs
-    // vector independently).
-    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const empty_gpu_ioctxs;
-    auto const& effective_gpu_ioctxs =
-      _config.use_sirius_datasource ? gpu_ioctxs : empty_gpu_ioctxs;
-
-    // Inject the per-GPU ioctx map into the operator before any provider returns
-    // — read_table_from_metadata needs it before its first invocation, and
-    // prepare_for_query runs before any execute().
-    op->set_gpu_ioctxs(effective_gpu_ioctxs);
-
-    auto ingestible = _factory.produce(
-      std::move(table_info), *this, effective_gpu_ioctxs, gpu_memory_spaces, op->get_operator_id());
+    auto ingestible =
+      _factory.produce(std::move(table_info), *this, gpu_memory_spaces, op->get_operator_id());
     if (!ingestible) { continue; }
     op->install_ingestible(std::move(ingestible));
 
@@ -442,6 +423,18 @@ void sirius_scan_manager::insert_pinned_entry_host(
   entry.is_partial   = is_partial;
 
   _pinned_entries[name] = std::move(entry);
+}
+
+std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datasource(
+  std::string_view path) const noexcept
+{
+  for (auto const& ctx : _io_ctxs) {
+    if (ctx && ctx->supports(path)) {
+      auto io_object = ctx->create_io_object(path.data());
+      return ctx->make_datasource(io_object);
+    }
+  }
+  return nullptr;
 }
 
 void sirius_scan_manager::remove_pinned_entry(const std::string& name)

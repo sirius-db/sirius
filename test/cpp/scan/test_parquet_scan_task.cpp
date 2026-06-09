@@ -397,7 +397,7 @@ static void run_parquet_scan_test(std::string const& table_name,
   REQUIRE(physical_scan);
 
   auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr, physical_scan.get(), batch_size, make_test_gpu_ioctxs());
+    nullptr, physical_scan.get(), batch_size, sirius::scan_test_utils::make_test_ioctx());
 
   cucascade::shared_data_repository data_repo;
 
@@ -495,7 +495,7 @@ static void run_multi_file_parquet_scan_test(
   REQUIRE(physical_scan);
 
   auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr, physical_scan.get(), batch_size, make_test_gpu_ioctxs());
+    nullptr, physical_scan.get(), batch_size, sirius::scan_test_utils::make_test_ioctx());
 
   cucascade::shared_data_repository data_repo;
 
@@ -579,7 +579,7 @@ static void run_parquet_scan_test_with_filter(
   REQUIRE(physical_scan);
 
   auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr, physical_scan.get(), batch_size, make_test_gpu_ioctxs());
+    nullptr, physical_scan.get(), batch_size, sirius::scan_test_utils::make_test_ioctx());
 
   cucascade::shared_data_repository data_repo;
 
@@ -641,7 +641,7 @@ static size_t count_row_group_partitions(
   REQUIRE(physical_scan);
 
   auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr, physical_scan.get(), batch_size, make_test_gpu_ioctxs());
+    nullptr, physical_scan.get(), batch_size, sirius::scan_test_utils::make_test_ioctx());
   return global_state->get_num_row_group_partitions();
 }
 

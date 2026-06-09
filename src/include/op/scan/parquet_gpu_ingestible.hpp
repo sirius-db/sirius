@@ -19,7 +19,6 @@
 // sirius
 #include <helper/logical_type.hpp>
 #include <io/gpu_ingestible.hpp>
-#include <io/types.hpp>
 #include <op/scan/row_group_metadata.hpp>  // row_group_slice + hybrid_scan_reader
 #include <op/scan/scan_plan.hpp>
 #include <sirius_config.hpp>
@@ -80,8 +79,7 @@ class parquet_ingestible_table_info : public io::ingestible_table_info {
 
   std::shared_ptr<io::gpu_ingestible> make_ingestible(
     std::unique_ptr<io::ingestible_table_info> self,
-    scan_manager::sirius_scan_manager const& mgr,
-    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs) override;
+    scan_manager::sirius_scan_manager const& mgr) override;
 
   [[nodiscard]] std::span<std::string const> file_paths() const override
   {
@@ -181,10 +179,8 @@ class parquet_gpu_ingestible : public io::gpu_ingestible {
   /// Built by @c parquet_ingestible_table_info::make_ingestible. The base
   /// @c _table_info owns the parquet bind data; this constructor casts it
   /// back to @c parquet_ingestible_table_info for typed access.
-  parquet_gpu_ingestible(
-    std::unique_ptr<io::ingestible_table_info> info,
-    scan_manager::sirius_scan_manager const& mgr,
-    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs);
+  parquet_gpu_ingestible(std::unique_ptr<io::ingestible_table_info> info,
+                         scan_manager::sirius_scan_manager const& mgr);
 
   ~parquet_gpu_ingestible() override;
 
@@ -222,10 +218,6 @@ class parquet_gpu_ingestible : public io::gpu_ingestible {
   std::size_t _max_file_processed{};
   std::size_t _total_files{};
   scan_manager::sirius_scan_manager const* _scan_manager{nullptr};
-  /// Per-GPU sirius_ioctx map. Used both for the local-file footer read
-  /// in @ref run_batch and (via the executing task's gpu_memory_space)
-  /// for the per-GPU datasource selection in @ref materialize_table.
-  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> _gpu_ioctxs;
 
   std::vector<file_batch> _batches;
   std::atomic<std::size_t> _next_batch_idx{0};

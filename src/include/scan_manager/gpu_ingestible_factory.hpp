@@ -44,8 +44,8 @@ struct pinned_entry;
  *      virtual factory.
  *
  * The factory holds a borrowed reference to scan_manager's pinned-entries
- * map. Per-query state (gpu_ioctxs, gpu_memory_spaces, scan_manager
- * reference) is passed in each @ref produce call, so the factory itself
+ * map. Per-query state (gpu_memory_spaces, scan_manager reference) is
+ * passed in each @ref produce call, so the factory itself
  * has a stable lifetime — it's held as a scan_manager member and lives
  * with the manager.
  *
@@ -74,7 +74,6 @@ class gpu_ingestible_factory {
    * @param table_info        Operator's bind data, taken via @c op->take_table_info().
    * @param mgr               Scan manager reference; forwarded to
    *                          @c io::make_gpu_ingestible for ioctx routing.
-   * @param gpu_ioctxs        Per-GPU sirius_ioctx instances.
    * @param gpu_memory_spaces device_id -> GPU memory_space lookup; used by
    *                          the HOST-tier cached path to materialize host
    *                          chunks onto the executing GPU.
@@ -83,7 +82,6 @@ class gpu_ingestible_factory {
   std::shared_ptr<io::gpu_ingestible> produce(
     std::unique_ptr<io::ingestible_table_info> table_info,
     sirius_scan_manager const& mgr,
-    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs,
     std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces,
     std::size_t op_id);
 

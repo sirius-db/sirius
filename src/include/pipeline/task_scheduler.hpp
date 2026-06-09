@@ -16,17 +16,12 @@
 
 #pragma once
 
-#include "config.hpp"
 #include "exec/channel.hpp"
 #include "exec/config.hpp"
 #include "exec/inspectable_mpsc.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
-#include "op/scan/config.hpp"
-#include "op/sirius_physical_duckdb_scan.hpp"
-#include "op/sirius_physical_operator.hpp"
 #include "parallel/task.hpp"
 #include "pipeline/completion_handler.hpp"
-#include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_request.hpp"
 #include "planner/query.hpp"
 
@@ -36,12 +31,7 @@
 #include <future>
 #include <map>
 #include <optional>
-#include <queue>
 #include <set>
-
-namespace sirius::op::scan {
-class duckdb_scan_executor;
-}  // namespace sirius::op::scan
 
 namespace sirius::parallel {
 class downgrade_executor;
@@ -70,13 +60,11 @@ class task_scheduler {
    * @brief Constructs a new task_scheduler with task execution configuration
    *
    * @param gpu_executor_config Configuration for the GPU pipeline executor thread pool
-   * @param scan_executor_config Configuration for the scan executor thread pool
    * @param mem_mgr Reference to the memory reservation manager
    * @param sys_topology Optional system topology info for CPU affinity
    * @param downgrade_executors Optional vector of downgrade executors
    */
   explicit task_scheduler(const exec::thread_pool_config& gpu_executor_config,
-                          const exec::thread_pool_config& scan_executor_config,
                           sirius::memory::sirius_memory_reservation_manager& mem_mgr,
                           const cucascade::memory::system_topology_info* sys_topology = nullptr,
                           const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>*
@@ -127,22 +115,6 @@ class task_scheduler {
    * @param task_creator Reference to the task creator
    */
   void set_task_creator(sirius::creator::task_creator& task_creator);
-
-  /**
-   * @brief Get the scan executor reference
-   *
-   * @return Reference to the duckdb scan executor
-   */
-  [[nodiscard]] sirius::op::scan::duckdb_scan_executor& get_scan_executor() noexcept;
-
-  [[nodiscard]] const sirius::op::scan::duckdb_scan_executor& get_scan_executor() const noexcept;
-
-  /**
-   * @brief Configure scan result caching level
-   *
-   * @param level The cache level to use
-   */
-  void set_scan_caching_config(sirius::op::scan::cache_level level);
 
   /**
    * @brief Get a pointer to the pipeline-level task queue.
@@ -223,8 +195,8 @@ class task_scheduler {
  private:
   void management_eventloop();
 
-  std::mutex _priority_scans_mutex;
-  std::queue<op::sirius_physical_operator*> _priority_scans;
+  std::mutex _query_mutex;
+  duckdb::shared_ptr<planner::query> _query;
 
   exec::inspectable_mpsc<sirius::parallel::itask> _task_queue;  ///< Queue for GPU pipeline tasks
   exec::channel<std::unique_ptr<task_request>> _task_request_channel;
@@ -251,7 +223,6 @@ class task_scheduler {
   std::atomic<size_t> _no_pref_rr_counter{0};
 
   sirius::creator::task_creator* _task_creator{nullptr};
-  std::unique_ptr<sirius::op::scan::duckdb_scan_executor> _scan_executor;
   std::unique_ptr<completion_handler> _completion_handler;
 };
 

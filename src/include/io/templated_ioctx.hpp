@@ -137,10 +137,10 @@ class templated_ioctx : public sirius_ioctx {
     }
   }
 
-  std::unique_ptr<cudf::io::datasource> make_datasource(
+  std::unique_ptr<io::sirius_datasource> make_datasource(
     std::shared_ptr<sirius_io_object> io_object) override
   {
-    return std::make_unique<sirius_datasource>(shared_from_this(), std::move(io_object));
+    return std::make_unique<io::sirius_datasource>(shared_from_this(), std::move(io_object));
   }
 
   std::shared_ptr<sirius_io_object> create_io_object(std::string path) override
