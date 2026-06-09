@@ -109,7 +109,7 @@ sirius:
     concat_batch_bytes: 5Gi
     max_build_hash_table_bytes: 500Mi
   telemetry:
-    enable_quent: false
+    enable_quent: true
     output_directory: telemetry_data
     engine_name: siriusDB
 ```
@@ -208,7 +208,7 @@ sirius:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enable_quent` | bool | false | Emit Quent telemetry using the ndjson exporter. When false, telemetry uses the noop exporter. |
+| `enable_quent` | bool | true | Emit Quent telemetry using the ndjson exporter. When false, telemetry uses the noop exporter. |
 | `output_directory` | string | `telemetry_data` | Directory for Quent ndjson files. |
 | `engine_name` | string | `siriusDB` | Engine name reported in engine-level telemetry. |
 
