@@ -23,7 +23,7 @@
 #include "io/io_context.hpp"
 #include "io/types.hpp"
 #include "op/scan/duckdb_block_layout.hpp"
-#include "op/scan/duckdb_native_scan_info.hpp"
+#include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "sirius_context.hpp"
 
 #include <cudf/column/column.hpp>
@@ -791,41 +791,20 @@ std::unique_ptr<cudf::column> build_rowid_column(
 }  // namespace
 
 //===----------------------------------------------------------------------===//
-// Public entry: pick_gpu_memory_space_for_duckdb_native_scan
-//===----------------------------------------------------------------------===//
-
-cucascade::memory::memory_space* pick_gpu_memory_space_for_duckdb_native_scan(
-  duckdb_native_scan_info const& scan_info)
-{
-  if (scan_info.context == nullptr) {
-    throw std::runtime_error(std::string(kTag) + " scan_info.context is null");
-  }
-  auto& ctx      = *scan_info.context;
-  auto sirius_st = ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!sirius_st) {
-    throw std::runtime_error(std::string(kTag) + " no sirius_state on the ClientContext");
-  }
-  auto& mem_mgr   = sirius_st->get_memory_manager();
-  auto gpu_spaces = mem_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
-  if (gpu_spaces.empty()) {
-    throw std::runtime_error(std::string(kTag) + " no GPU-tier memory space registered");
-  }
-  return const_cast<cucascade::memory::memory_space*>(gpu_spaces[0]);
-}
-
-//===----------------------------------------------------------------------===//
 // Public entry: decode_duckdb_native_split
 //===----------------------------------------------------------------------===//
 
-std::unique_ptr<cudf::table> decode_duckdb_native_split(
-  scan_manager::duckdb_native_split_provider::split_payload const& split,
-  cucascade::memory::memory_space& mem_space,
-  rmm::cuda_stream_view stream)
+std::unique_ptr<cudf::table> decode_duckdb_native_split(duckdb_native_split_payload const& split,
+                                                        cucascade::memory::memory_space& mem_space,
+                                                        rmm::cuda_stream_view stream)
 {
   if (split.row_groups.empty()) {
     return std::make_unique<cudf::table>(std::vector<std::unique_ptr<cudf::column>>{});
   }
-  auto const& scan_info = *split.scan_info;
+  if (split.table_info == nullptr) {
+    throw std::runtime_error(std::string(kTag) + " split.table_info is null");
+  }
+  auto const& scan_info = *split.table_info;
   auto& storage         = *scan_info.storage;
   auto& context         = *scan_info.context;
 
