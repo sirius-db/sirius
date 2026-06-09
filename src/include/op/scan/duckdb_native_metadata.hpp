@@ -20,9 +20,12 @@
 
 #include <cudf/types.hpp>
 
+#include <duckdb/common/column_index.hpp>
 #include <duckdb/common/enums/compression_type.hpp>
 #include <duckdb/common/types.hpp>
+#include <duckdb/common/vector.hpp>
 #include <duckdb/main/client_context.hpp>
+#include <duckdb/planner/table_filter.hpp>
 #include <duckdb/storage/data_table.hpp>
 #include <duckdb/storage/storage_index.hpp>
 
@@ -104,6 +107,10 @@ struct duckdb_native_metadata {
   std::vector<duckdb_row_group_metadata> row_groups;
   bool viable = false;
   std::string viability_failure_reason;
+  /// Row-group filter-statistics pruning counters (0 when no filters / pruning disabled).
+  std::size_t pruned_row_groups = 0;  ///< Number of row groups pruned.
+  /// Sum of decoded-byte budgets of pruned row groups.
+  std::size_t pruned_decoded_bytes = 0;
 };
 
 /// Metadata-only walk of `storage` via `DataTable::GetColumnSegmentInfo`
@@ -115,11 +122,15 @@ struct duckdb_native_metadata {
 /// Caller is responsible for the operator-level escape gates
 /// (`dynamic_filters`, sample options, virtual columns, type pushdown)
 /// on the originating `LogicalGet`.
+///
+/// @note When both `table_filters` and `column_ids` are non-null, row group pruning is applied
 duckdb_native_metadata walk_duckdb_native_metadata(
   duckdb::DataTable& storage,
   duckdb::ClientContext& context,
   const std::vector<projected_column>& projected_cols,
-  const std::vector<sirius::logical_type>& projected_types);
+  const std::vector<sirius::logical_type>& projected_types,
+  const duckdb::TableFilterSet* table_filters           = nullptr,
+  const duckdb::vector<duckdb::ColumnIndex>* column_ids = nullptr);
 
 /// Exposed for direct unit-testing of the codec-rejection logic without
 /// going through DuckDB's codec selection (which is hard to drive into
