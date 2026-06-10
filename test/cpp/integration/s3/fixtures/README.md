@@ -1,42 +1,29 @@
 # S3 Perf Benchmark Fixture
 
-`test/cpp/integration/s3/fixtures.sh --perf` prepares the hidden
-`[!benchmark][perf][bench]` Catch2 benchmark fixture:
+The hidden `[!benchmark][perf][bench]` Catch2 benchmark uses an SF=10 `lineitem`
+Parquet fixture. It is now generated and uploaded **by the test binary itself**
+(`test/cpp/utils/s3_container.*`) when `SIRIUS_TEST_S3_LARGE=1`, which:
 
-1. Uses DuckDB's `tpch` extension to generate SF=10 data.
-2. Exports the full `lineitem` table used by the benchmark to Parquet.
-3. Uploads the Parquet file to a MinIO/S3-compatible bucket with the same
-   dockerized `minio/mc` wrapper used by the regular S3 fixtures.
+1. uses the in-tree DuckDB CLI (`build/release/duckdb`, or `SIRIUS_TEST_DUCKDB`)
+   and its `tpch` extension to generate SF=10 data,
+2. exports the full `lineitem` table to Parquet (cached across invocations), and
+3. uploads it from the host via Sirius's SigV4 signer + libcurl (no `mc`).
 
-The benchmark defaults are:
+The benchmark reads `SIRIUS_BENCH_S3_*` and falls back to the harness-published
+`SIRIUS_TEST_S3_*`, with `SIRIUS_BENCH_S3_KEY` defaulting to
+`tpch/lineitem_sf10.parquet`.
 
-```sh
-SIRIUS_BENCH_S3_ENDPOINT=http://127.0.0.1:9000
-SIRIUS_BENCH_S3_BUCKET=${SIRIUS_TEST_S3_BUCKET:-sirius-test}
-SIRIUS_BENCH_S3_KEY=tpch/lineitem_sf10.parquet
-```
-
-For local MinIO, run:
+For local MinIO, just run:
 
 ```sh
-make s3-up
-make s3-bench-fixtures
 make s3-bench
 ```
 
-`make s3-up` only uploads the standard small fixtures. The SF10 parquet
-generation stays behind `make s3-bench-fixtures` / `fixtures.sh --perf`, so the
-regular `[s3]` test gate does not pay the benchmark setup cost.
+`make s3-bench` sets `SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_LARGE=1` for the
+default MinIO backend, so MinIO is auto-managed and the SF10 fixture is prepared
+in-process — no separate fixture/up step.
 
-The `--perf` path uses `${DUCKDB:-build/release/duckdb}`. Run `make release`
-first, or pass `DUCKDB=/path/to/duckdb`. The script sets
-`SIRIUS_CONFIG_FILE=test/cpp/integration/s3/sirius.yaml` by default so the
-autoloaded Sirius extension uses the small integration-test GPU reservation.
-
-The in-tree DuckDB build includes the `tpch` extension, so the fixture script
-uses `LOAD tpch` without `INSTALL tpch` and does not require outbound network.
-
-AWS portability uses the same benchmark test with:
+AWS portability uses the same benchmark test with the MinIO auto-path off:
 
 ```sh
 SIRIUS_BENCH_BACKEND=aws-s3
