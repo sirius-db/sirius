@@ -21,6 +21,7 @@
 #include <log/logging.hpp>
 #include <op/scan/duckdb_native_decoder.hpp>
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
+#include <op/scan/scan_plan.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
@@ -52,16 +53,16 @@ struct row_group_batch_local {
 std::vector<row_group_batch_local> partition_row_groups_into_batches(
   const std::vector<duckdb_row_group_metadata>& row_groups,
   std::size_t approximate_batch_size,
-  const std::vector<sirius::logical_type>& projected_types)
+  scan_plan const& plan)
 {
   std::vector<row_group_batch_local> batches;
   if (row_groups.empty()) return batches;
 
-  const std::size_t num_cols = projected_types.size();
+  const std::size_t num_cols = plan.data_columns.size();
   std::vector<bool> is_varchar(num_cols, false);
   bool any_varchar = false;
   for (std::size_t c = 0; c < num_cols; ++c) {
-    is_varchar[c] = projected_types[c].is_varchar();
+    is_varchar[c] = plan.data_columns[c].type->is_varchar();
     any_varchar   = any_varchar || is_varchar[c];
   }
 
@@ -144,19 +145,15 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
     throw std::invalid_argument(
       "[duckdb_native_gpu_ingestible] table_info.context must be non-null");
   }
-  if (bind.projected_cols.size() != bind.projected_types.size()) {
-    throw std::invalid_argument(
-      "[duckdb_native_gpu_ingestible] projected_cols and projected_types must be parallel");
+  if (!bind.plan) {
+    throw std::invalid_argument("[duckdb_native_gpu_ingestible] table_info.plan must be non-null");
   }
+  _plan = bind.plan;
 
   // Walk metadata once. Pushed-down filters drive row-group pruning in the walk;
   // column_ids maps each filter to its storage index.
-  _metadata = walk_duckdb_native_metadata(*bind.storage,
-                                          *bind.context,
-                                          bind.projected_cols,
-                                          bind.projected_types,
-                                          bind.table_filters.get(),
-                                          &bind.column_ids);
+  _metadata = walk_duckdb_native_metadata(
+    *bind.storage, *bind.context, *_plan, bind.table_filters.get(), &bind.column_ids);
   if (!_metadata.viable) {
     SPDLOG_DEBUG("[duckdb_native_gpu_ingestible] non-viable: {}",
                  _metadata.viability_failure_reason);
@@ -165,43 +162,27 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
   }
 
   // Mint the .db io_object once per query when the manager exposes a
-  // backend for db_path (matches duckdb_native_split_provider).
+  // backend for db_path.
   _io_ctx = !bind.db_path.empty() ? mgr.io_ctx_shared_for(bind.db_path) : nullptr;
   if (_io_ctx && !bind.db_path.empty()) { _db_io_object = _io_ctx->create_io_object(bind.db_path); }
 
-  // Pre-build the coalesced filter expression once.
+  // Pre-build the coalesced filter expression once. The plan's C → D map resolves
+  // each filter column to its batch position (rowid included).
   if (bind.table_filters && !bind.table_filters->filters.empty()) {
-    duckdb::vector<duckdb::idx_t> source_ids_fallback;
-    if (bind.projection_ids.empty()) {
-      source_ids_fallback.reserve(bind.column_ids.size());
-      for (duckdb::idx_t i = 0; i < bind.column_ids.size(); ++i) {
-        source_ids_fallback.push_back(i);
-      }
-    }
-    auto const& source_ids =
-      bind.projection_ids.empty() ? source_ids_fallback : bind.projection_ids;
-
-    std::vector<std::optional<std::size_t>> emission_order_map(bind.column_ids.size());
-    for (std::size_t k = 0; k < source_ids.size(); ++k) {
-      emission_order_map[source_ids[k]] = k;
-    }
-
-    auto filter_expr_duckdb = sirius::op::convert_table_filters_to_expression(
-      *bind.table_filters, bind.column_ids, bind.returned_types, emission_order_map);
+    auto filter_expr_duckdb =
+      sirius::op::convert_table_filters_to_expression(*bind.table_filters,
+                                                      bind.column_ids,
+                                                      bind.returned_types,
+                                                      _plan->batch_position_by_column_id);
     if (filter_expr_duckdb) {
       _filter_expression = std::shared_ptr<duckdb::Expression>(filter_expr_duckdb.release());
     }
   }
 
-  // Decoder emits one column per source_id; projection-down is needed when
-  // the planner injected pure-filter trailing columns beyond output_types.
-  std::size_t const decoded_cols =
-    bind.projection_ids.empty() ? bind.column_ids.size() : bind.projection_ids.size();
-  _output_arity        = bind.output_types.size();
-  _projection_required = (_output_arity > 0) && (decoded_cols > _output_arity);
+  _needs_assembly = needs_output_assembly(*_plan);
 
-  auto batches = partition_row_groups_into_batches(
-    _metadata.row_groups, bind.approximate_batch_size, bind.projected_types);
+  auto batches =
+    partition_row_groups_into_batches(_metadata.row_groups, bind.approximate_batch_size, *_plan);
   _batches.reserve(batches.size());
   for (auto const& b : batches) {
     _batches.push_back({b.first_idx, b.count});
@@ -226,11 +207,10 @@ duckdb_native_gpu_ingestible::next_split_provider()
   row_group_batch claimed = _batches[idx];
 
   bool const apply_filter        = static_cast<bool>(_filter_expression);
-  bool const has_post_processing = apply_filter || _projection_required;
-  std::size_t const output_arity = _output_arity;
-  bool const projection_required = _projection_required;
+  bool const needs_assembly      = _needs_assembly;
+  bool const has_post_processing = apply_filter || needs_assembly;
 
-  return [this, claimed, apply_filter, projection_required, output_arity, has_post_processing]()
+  return [this, claimed, apply_filter, needs_assembly, has_post_processing]()
            -> std::vector<std::unique_ptr<op::operator_data>> {
     auto split_info = std::make_unique<duckdb_native_split_info>();
     split_info->payload.table_info =
@@ -244,10 +224,10 @@ duckdb_native_gpu_ingestible::next_split_provider()
 
     std::unique_ptr<io::post_filter_and_projection_info> filter_info;
     if (has_post_processing) {
-      auto pf          = std::make_unique<duckdb_native_post_filter_and_projection_info>();
-      pf->apply_filter = apply_filter;
-      pf->output_arity = projection_required ? output_arity : 0;
-      filter_info      = std::move(pf);
+      auto pf            = std::make_unique<duckdb_native_post_filter_and_projection_info>();
+      pf->apply_filter   = apply_filter;
+      pf->needs_assembly = needs_assembly;
+      filter_info        = std::move(pf);
     }
 
     auto metadata =
@@ -304,14 +284,10 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
     input    = exec.select(src->view());
   }
 
-  if (pf.output_arity > 0 && static_cast<std::size_t>(input->num_columns()) > pf.output_arity) {
-    auto cols = input->release();
-    std::vector<std::unique_ptr<cudf::column>> selected;
-    selected.reserve(pf.output_arity);
-    for (std::size_t i = 0; i < pf.output_arity; ++i) {
-      selected.push_back(std::move(cols[i]));
-    }
-    input = std::make_unique<cudf::table>(std::move(selected));
+  // Reshape the decoder's D-order batch to the plan's output layout: drop
+  // pure-filter columns and reorder to the operator's expected output.
+  if (pf.needs_assembly) {
+    input = assemble_scan_output(*_plan, std::move(input), /*partition_values=*/{}, stream);
   }
 
   return input;

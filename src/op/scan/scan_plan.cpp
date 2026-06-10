@@ -159,7 +159,8 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
                           duckdb::vector<std::string> const& names,
                           duckdb::vector<sirius::logical_type> const& returned_types,
                           std::size_t output_types_size,
-                          duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices)
+                          duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
+                          build_scan_plan_options const& options)
 {
   scan_plan plan;
 
@@ -190,11 +191,23 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
   std::unordered_map<std::size_t, std::size_t> primary_to_batch;  // P → D
 
   auto handle_position = [&](std::size_t column_ids_pos, bool is_output) {
-    auto const primary_idx = column_ids.at(column_ids_pos).GetPrimaryIndex();
-    if (duckdb::IsVirtualColumn(primary_idx)) { return; }
+    auto const& col_idx    = column_ids.at(column_ids_pos);
+    auto const primary_idx = col_idx.GetPrimaryIndex();
+
+    // Rowid becomes a data column only when the reader can synthesize it
+    // (decode_rowid_columns). Other virtual columns are never decodable and are
+    // always dropped.
+    bool const is_rowid = col_idx.IsRowIdColumn();
+    if (is_rowid) {
+      if (!options.decode_rowid_columns) { return; }
+    } else if (duckdb::IsVirtualColumn(primary_idx)) {
+      return;
+    }
+    // Rowid carries DuckDB's sentinel primary index, so two rowid references
+    // collapse to one batch column (both output_layout entries point at it).
     if (!seen_primary_indices.insert(primary_idx).second) { return; }
 
-    bool const is_partition = plan.partition_primary_indices.count(primary_idx) > 0;
+    bool const is_partition = !is_rowid && plan.partition_primary_indices.count(primary_idx) > 0;
 
     if (is_partition) {
       // Filter-only partition columns are dropped: DuckDB prunes at the file
@@ -207,14 +220,16 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
       plan.output_layout.push_back(
         scan_plan::output_entry{scan_plan::output_entry::PARTITION, partition_cols_idx});
     } else {
-      // Data column — always added to the batch (even if filter-only, we need
-      // it for filter evaluation). Store an empty name when @c names is empty:
-      // the caller's guard only forces non-empty names for name-dependent paths
-      // (projection, filter, partitions), and the plain-read case populates
-      // data_columns without ever consuming the name downstream.
+      // Data column — always added to the batch (filter-only columns are read for
+      // filter evaluation). Empty name for rowid (no schema slot) or when @c names
+      // is empty (the plain-read case never consumes it).
       auto const batch_idx = plan.data_columns.size();
-      std::string col_name = names.empty() ? std::string{} : names.at(primary_idx);
-      plan.data_columns.push_back(scan_plan::data_column{primary_idx, std::move(col_name)});
+      scan_plan::data_column dc;
+      dc.primary_idx = primary_idx;
+      dc.name        = (is_rowid || names.empty()) ? std::string{} : names.at(primary_idx);
+      dc.is_rowid    = is_rowid;
+      if (options.type_for) { dc.type = options.type_for(col_idx); }
+      plan.data_columns.push_back(std::move(dc));
       primary_to_batch[primary_idx] = batch_idx;
       if (is_output) {
         plan.output_layout.push_back(
@@ -235,14 +250,34 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
   }
 
   // Build the C → D map. An entry is nullopt when the column is a hive
-  // partition, virtual, or simply not referenced by projection_ids.
+  // partition, a non-rowid virtual column, or simply not referenced by
+  // projection_ids. Rowid resolves to its data column when decoded so a filter
+  // that references rowid still maps.
   plan.batch_position_by_column_id.assign(column_ids.size(), std::nullopt);
   for (std::size_t c = 0; c < column_ids.size(); ++c) {
-    auto const primary_idx = column_ids[c].GetPrimaryIndex();
-    if (duckdb::IsVirtualColumn(primary_idx)) { continue; }
+    auto const& col_idx    = column_ids[c];
+    auto const primary_idx = col_idx.GetPrimaryIndex();
+    if (col_idx.IsRowIdColumn()) {
+      if (!options.decode_rowid_columns) { continue; }
+    } else if (duckdb::IsVirtualColumn(primary_idx)) {
+      continue;
+    }
     auto it = primary_to_batch.find(primary_idx);
     if (it == primary_to_batch.end()) { continue; }
     plan.batch_position_by_column_id[c] = it->second;
+  }
+
+  // On the reader-typed path every data column must carry a type (the
+  // decoder/walker dereference it); fail here rather than deref nullopt later.
+  if (options.decode_rowid_columns || options.type_for) {
+    for (auto const& dc : plan.data_columns) {
+      if (!dc.type.has_value()) {
+        throw sirius::internal_exception(
+          "[build_scan_plan] data column (primary_idx {}) has no logical type; the reader-typed "
+          "scan_plan path requires options.type_for to resolve every column.",
+          dc.primary_idx);
+      }
+    }
   }
 
   SIRIUS_LOG_DEBUG("[scan_plan] built plan: {} data col(s), {} partition col(s), {} output entries",

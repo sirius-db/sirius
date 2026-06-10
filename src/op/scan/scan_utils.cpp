@@ -70,14 +70,19 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
       continue;
     }
 
-    auto primary_idx = column_ids.at(column_index).GetPrimaryIndex();
+    auto const& col_idx = column_ids.at(column_index);
+    auto primary_idx    = col_idx.GetPrimaryIndex();
     if (skip_primary_indices.count(primary_idx)) {
       SIRIUS_LOG_DEBUG(
         "TABLE_SCAN filter: skipping filter on primary_idx={} (hive partition or equivalent)",
         primary_idx);
       continue;
     }
-    auto const col_type = returned_types.at(primary_idx);
+    // Rowid has no slot in returned_types (its primary index is DuckDB's
+    // sentinel), so resolve its type directly. Rowid is synthesized as BIGINT.
+    auto const col_type = col_idx.IsRowIdColumn()
+                            ? sirius::logical_type::make(sirius::type_id::BIGINT)
+                            : returned_types.at(primary_idx);
 
     SIRIUS_LOG_DEBUG("TABLE_SCAN filter: column_index={}, primary_idx={}, type={}, filter_type={}",
                      column_index,

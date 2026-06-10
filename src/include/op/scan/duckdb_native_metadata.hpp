@@ -38,11 +38,7 @@
 
 namespace sirius::op::scan {
 
-/// Synthetic rowid columns carry no `storage_idx`.
-struct projected_column {
-  duckdb::StorageIndex storage_idx;
-  bool is_rowid = false;
-};
+struct scan_plan;  // op/scan/scan_plan.hpp — walker takes it by const ref
 
 /// Mirrors `duckdb::ColumnSegmentInfo` with the compression string resolved
 /// to the enum.
@@ -80,7 +76,7 @@ struct duckdb_row_group_metadata {
   /// Absolute row index of the row group's first row.
   duckdb::idx_t row_group_start;
   duckdb::idx_t row_count;
-  /// Parallel to the walker's `projected_cols` argument.
+  /// Parallel to the plan's `data_columns`.
   std::vector<duckdb_column_metadata> columns;
   std::size_t decoded_bytes_budget = 0;
   /// Parallel to `columns`. For varchar columns: Σ(seg.segment_count ×
@@ -127,8 +123,7 @@ struct duckdb_native_metadata {
 duckdb_native_metadata walk_duckdb_native_metadata(
   duckdb::DataTable& storage,
   duckdb::ClientContext& context,
-  const std::vector<projected_column>& projected_cols,
-  const std::vector<sirius::logical_type>& projected_types,
+  scan_plan const& plan,
   const duckdb::TableFilterSet* table_filters           = nullptr,
   const duckdb::vector<duckdb::ColumnIndex>* column_ids = nullptr);
 

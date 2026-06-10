@@ -31,6 +31,7 @@
 // standard library
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -39,28 +40,34 @@
 namespace sirius::op::scan {
 
 /**
- * @brief Canonical plan for a parquet-style scan.
+ * @brief Canonical plan for a file-format scan.
  *
- * Built once by the scan operator from DuckDB planner inputs (column_ids,
- * projection_ids, names, returned_types, partition_indices). All downstream
- * consumers — reader column projection, filter-expression building, hive
- * injection, post-filter output assembly — read from this single structure
- * instead of maintaining parallel vectors.
+ * Format-agnostic: the same structure drives the parquet scan and the
+ * DuckDB-native scan. Built once by the scan operator from DuckDB planner inputs
+ * (column_ids, projection_ids, names, returned_types, partition_indices). All
+ * downstream consumers — reader column projection, filter-expression building,
+ * partition injection, post-filter output assembly — read from this single
+ * structure instead of maintaining parallel vectors.
  *
  * Three index spaces appear throughout the scan pipeline:
  *   P = primary index       (position in DuckDB's full schema @c names / @c returned_types)
  *   C = column_ids position (position in the operator's @c column_ids list)
- *   D = batch position      (position in the reader's output table, after hive removal)
+ *   D = batch position      (position in the reader's output table, after partition removal)
  *
- * Hive-partition columns live in P-space but are not in the parquet file, so
+ * Hive-partition columns live in P-space but are not stored in the data file, so
  * they never appear in D-space. They are injected post-read into the final
  * output in the order column_ids expects.
  */
 struct scan_plan {
-  /// A column produced by the parquet reader, in batch order.
+  /// A column produced by the reader, in batch order.
   struct data_column {
-    std::size_t primary_idx;  ///< P — index into the DuckDB schema
-    std::string name;         ///< parquet column name
+    std::size_t primary_idx;  ///< P — index into the DuckDB schema. Holds DuckDB's rowid
+                              ///<     sentinel when @c is_rowid.
+    std::string name;         ///< reader column name. Empty for rowid and the plain-read case.
+    bool is_rowid = false;    ///< true for a synthesized rowid column (duckdb-native only).
+    std::optional<sirius::logical_type>
+      type;  ///< Logical type, set via @c build_scan_plan_options::type_for.
+             ///< @c nullopt when the reader resolves types itself.
   };
 
   /// A column synthesized from the file path, injected after read.
@@ -78,7 +85,7 @@ struct scan_plan {
       idx;  ///< index into @c data_columns (if DATA) or @c partition_columns (if PARTITION)
   };
 
-  /// Columns read from parquet, in D order.
+  /// Columns produced by the reader, in D order.
   std::vector<data_column> data_columns;
 
   /// Partition columns injected post-read.
@@ -93,7 +100,7 @@ struct scan_plan {
 
   /// Primary indices of hive-partition columns. Supplied to
   /// @c convert_table_filters_to_expression so those filters are dropped
-  /// from pushdown (they aren't in the parquet file).
+  /// from pushdown (they aren't stored in the data file).
   std::unordered_set<std::size_t> partition_primary_indices;
 
   /// True iff the reader needs explicit column projection — set when the planner
@@ -118,7 +125,7 @@ struct scan_plan {
   /// and as the D-indexed resolver for AST filter translation.
   [[nodiscard]] std::vector<std::string> data_column_names() const;
 
-  /// Resolve a D-space index to a parquet column name, for use as the AST
+  /// Resolve a D-space index to a reader column name, for use as the AST
   /// translator's name resolver.
   [[nodiscard]] std::string batch_column_name(duckdb::idx_t batch_position) const;
 
@@ -168,6 +175,18 @@ struct scan_plan {
   std::vector<std::string> const& partition_values,
   rmm::cuda_stream_view stream);
 
+/// Optional knobs for @ref build_scan_plan; the duckdb-native scan opts in.
+struct build_scan_plan_options {
+  /// When true, rowid columns are kept in @c data_columns (flagged @c is_rowid)
+  /// and @c output_layout for the reader to synthesize, instead of dropped.
+  bool decode_rowid_columns = false;
+
+  /// Resolves each column's logical type into @c data_column::type; empty leaves
+  /// types @c nullopt. Receives the @c ColumnIndex so the caller can special-case
+  /// rowid, which has no @c returned_types slot.
+  std::function<std::optional<sirius::logical_type>(duckdb::ColumnIndex const&)> type_for = {};
+};
+
 /// Build a scan_plan from DuckDB planner inputs. See @c scan_plan for semantics.
 ///
 /// @param column_ids          Column ids exposed by the table function.
@@ -183,11 +202,13 @@ struct scan_plan {
 /// @param partition_indices   Hive partition indices advertised by the bind data.
 ///                            TODO: other partition indices may need to be supported for other
 ///                            formats.
+/// @param options             Optional knobs (rowid routing, type resolution).
 scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
                           duckdb::vector<duckdb::idx_t> const& projection_ids,
                           duckdb::vector<std::string> const& names,
                           duckdb::vector<sirius::logical_type> const& returned_types,
                           std::size_t output_types_size,
-                          duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices);
+                          duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
+                          build_scan_plan_options const& options = {});
 
 }  // namespace sirius::op::scan

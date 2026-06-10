@@ -52,8 +52,7 @@ class duckdb_native_ingestible_table_info;
 struct duckdb_native_split_payload {
   std::vector<duckdb_row_group_metadata> row_groups;
   /// Stable alias into the ingestible's owned bind data. Carries
-  /// @c storage / @c context / @c projected_cols / @c projected_types that
-  /// the decoder reads.
+  /// @c storage / @c context / @c plan that the decoder reads.
   duckdb_native_ingestible_table_info const* table_info = nullptr;
   /// Sirius IO substrate handles. Set by the regular (non-cached) split
   /// path so the decoder can read .db blocks via @c sirius_ioctx::host_read

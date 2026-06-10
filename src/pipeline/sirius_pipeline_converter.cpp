@@ -25,6 +25,7 @@
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
+#include "op/scan/scan_plan.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
@@ -310,6 +311,8 @@ void sirius_pipeline_converter::insert_duckdb_native_scan_operator(
   table_info->db_path = table.GetStorage().GetAttached().GetStorageManager().GetDBPath();
   table_info->approximate_batch_size = op_params_.scan_task_batch_size;
 
+  // Output-first read order: the first scan_op.types.size() entries are emitted
+  // columns; the rest are filter-only columns read for a predicate but not emitted.
   std::vector<std::size_t> source_ids_fallback;
   if (scan_op.projection_ids.empty()) {
     source_ids_fallback.resize(scan_op.column_ids.size());
@@ -318,24 +321,37 @@ void sirius_pipeline_converter::insert_duckdb_native_scan_operator(
   auto const& source_ids =
     scan_op.projection_ids.empty() ? source_ids_fallback : scan_op.projection_ids;
 
-  table_info->projected_cols.reserve(source_ids.size());
-  table_info->projected_types.reserve(source_ids.size());
-  for (std::size_t k = 0; k < source_ids.size(); ++k) {
-    auto pid            = source_ids[k];
-    auto const& col_idx = scan_op.column_ids[pid];
-    op::scan::projected_column pc;
-    pc.is_rowid = col_idx.IsRowIdColumn();
-    if (!pc.is_rowid) { pc.storage_idx = duckdb::StorageIndex(col_idx.GetPrimaryIndex()); }
-    table_info->projected_cols.push_back(pc);
-
-    sirius::logical_type t;
-    if (k < scan_op.types.size()) {
-      t = scan_op.types[k];
-    } else {
-      t = scan_op.returned_types.at(col_idx.GetPrimaryIndex());
+  // Resolve the rowid output type. Rowid's primary index is DuckDB's virtual-column
+  // sentinel, so returned_types cannot supply it; the planner records it in
+  // scan_op.types at the rowid output position. Default BIGINT when rowid is filter-only.
+  std::size_t const output_arity = scan_op.types.size();
+  auto rowid_type                = sirius::logical_type::make(sirius::type_id::BIGINT);
+  for (std::size_t k = 0; k < source_ids.size() && k < output_arity; ++k) {
+    if (scan_op.column_ids[source_ids[k]].IsRowIdColumn()) {
+      rowid_type = scan_op.types[k];
+      break;
     }
-    table_info->projected_types.push_back(t);
   }
+
+  // Build the canonical scan plan once. decode_rowid_columns keeps synthesized
+  // rowid columns in the plan; type_for supplies the per-column types the walker
+  // and decoder need. No hive partitioning on a base-table seq_scan.
+  op::scan::build_scan_plan_options plan_opts;
+  plan_opts.decode_rowid_columns = true;
+  plan_opts.type_for =
+    [&](duckdb::ColumnIndex const& col_idx) -> std::optional<sirius::logical_type> {
+    if (col_idx.IsRowIdColumn()) { return rowid_type; }
+    return scan_op.returned_types.at(col_idx.GetPrimaryIndex());
+  };
+  duckdb::vector<duckdb::HivePartitioningIndex> const no_partition_indices;
+  table_info->plan =
+    std::make_shared<op::scan::scan_plan const>(op::scan::build_scan_plan(scan_op.column_ids,
+                                                                          scan_op.projection_ids,
+                                                                          scan_op.names,
+                                                                          scan_op.returned_types,
+                                                                          output_arity,
+                                                                          no_partition_indices,
+                                                                          std::move(plan_opts)));
 
   // Filters drive row-group pruning in the metadata walk and post-decode filtering.
   if (scan_op.table_filters) {
@@ -345,9 +361,7 @@ void sirius_pipeline_converter::insert_duckdb_native_scan_operator(
     }
   }
   table_info->column_ids     = scan_op.column_ids;
-  table_info->projection_ids = scan_op.projection_ids;
   table_info->returned_types = scan_op.returned_types;
-  table_info->output_types   = scan_op.types;
 
   auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_scan_operator>(
     scan_op.types, scan_op.estimated_cardinality, std::move(table_info));

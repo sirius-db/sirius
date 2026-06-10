@@ -24,6 +24,7 @@
 #include "io/types.hpp"
 #include "op/scan/duckdb_block_layout.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
+#include "op/scan/scan_plan.hpp"
 #include "sirius_context.hpp"
 
 #include <cudf/column/column.hpp>
@@ -829,7 +830,8 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(duckdb_native_split_payl
 
   auto mr_ref = mem_space.get_default_allocator();
 
-  std::size_t const num_cols = scan_info.projected_cols.size();
+  auto const& plan           = *scan_info.plan;
+  std::size_t const num_cols = plan.data_columns.size();
 
   std::size_t total_rows = 0;
   for (auto const& rg : split.row_groups) {
@@ -846,14 +848,14 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(duckdb_native_split_payl
   std::vector<bool> is_rowid_col(num_cols, false);
 
   for (std::size_t ci = 0; ci < num_cols; ++ci) {
-    auto const& pcol = scan_info.projected_cols[ci];
-    if (pcol.is_rowid) {
+    auto const& dc = plan.data_columns[ci];
+    if (dc.is_rowid) {
       is_rowid_col[ci] = true;
       staged_cols.emplace_back();
       staged_cols.back().total_rows = total_rows;
       continue;
     }
-    if (scan_info.projected_types[ci].is_varchar()) {
+    if (dc.type->is_varchar()) {
       staged_cols.push_back(
         stage_one_varchar_column(staging, db, block_manager, *sf_bm, split.row_groups, ci));
     } else {
@@ -865,7 +867,7 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(duckdb_native_split_payl
                                                          owned_stats_cache,
                                                          split.row_groups,
                                                          ci,
-                                                         scan_info.projected_types[ci]));
+                                                         *dc.type));
     }
   }
 
@@ -921,7 +923,7 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(duckdb_native_split_payl
       vc_to_final_idx.push_back(ci);
     } else {
       gpu_column_decode_input input;
-      input.out_type   = sirius_to_cudf_type(scan_info.projected_types[ci]);
+      input.out_type   = sirius_to_cudf_type(*plan.data_columns[ci].type);
       input.total_rows = static_cast<uint32_t>(staged.total_rows);
       input.has_nulls  = staged.has_nulls;
       fill_fixed_width_runs(staged.data, device_buf, input.data);

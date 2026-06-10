@@ -63,16 +63,14 @@ class duckdb_native_ingestible_table_info : public io::ingestible_table_info {
  public:
   duckdb::vector<sirius::logical_type> returned_types;
   duckdb::vector<duckdb::ColumnIndex> column_ids;
-  duckdb::vector<duckdb::idx_t> projection_ids;
-  duckdb::vector<std::string> names;
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters;
   std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
 
   duckdb::DataTable* storage     = nullptr;
   duckdb::ClientContext* context = nullptr;
-  std::vector<projected_column> projected_cols;
-  std::vector<sirius::logical_type> projected_types;
-  duckdb::vector<sirius::logical_type> output_types;
+  /// Canonical scan plan, built by the pipeline converter. Single source of truth
+  /// for the walker, decoder, filter building, and output assembly.
+  std::shared_ptr<scan_plan const> plan;
   std::string db_path;
 
   duckdb_native_ingestible_table_info() = default;
@@ -120,19 +118,16 @@ class duckdb_native_split_info : public io::scan_info {
 // duckdb_native_post_filter_and_projection_info
 //===----------------------------------------------------------------------===//
 /**
- * @brief Per-split post-decode filter + projection description.
+ * @brief Per-split post-decode filter + assembly description.
  *
- * Emitted by @c duckdb_native_gpu_ingestible whenever the @c table_filters
- * survived translation OR the scan emitted more columns than
- * @c output_types requested (trailing filter-only columns).
- * @c apply_filter triggers the @c gpu_expression_executor pass against the
- * ingestible's shared filter expression; @c output_arity drives the
- * projection-down step.
+ * Emitted when a filter survived translation or the plan needs output assembly.
+ * @c apply_filter runs the filter expression; @c needs_assembly runs
+ * @c assemble_scan_output to reshape the decoded batch to the plan's layout.
  */
 class duckdb_native_post_filter_and_projection_info : public io::post_filter_and_projection_info {
  public:
-  bool apply_filter        = false;
-  std::size_t output_arity = 0;
+  bool apply_filter   = false;
+  bool needs_assembly = false;
 };
 
 //===----------------------------------------------------------------------===//
@@ -169,11 +164,15 @@ class duckdb_native_gpu_ingestible : public io::gpu_ingestible {
   duckdb_native_metadata _metadata;
   std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
   std::shared_ptr<sirius::io::sirius_io_object> _db_io_object;
+  /// Canonical scan plan, shared from the bind data. Drives filter building
+  /// and post-decode output assembly.
+  std::shared_ptr<scan_plan const> _plan;
   /// Pre-built coalesced filter expression. Empty when no translatable
   /// filters survived. Reused across every emitted split.
   std::shared_ptr<duckdb::Expression> _filter_expression;
-  bool _projection_required = false;
-  std::size_t _output_arity = 0;
+  /// Mirrors needs_output_assembly(*_plan): reshape the decoded batch to the
+  /// plan's output layout post-decode.
+  bool _needs_assembly = false;
 
   std::vector<row_group_batch> _batches;
   std::atomic<std::size_t> _next_batch_idx{0};

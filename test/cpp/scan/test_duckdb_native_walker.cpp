@@ -27,10 +27,12 @@
 #include <duckdb/planner/table_filter.hpp>
 #include <duckdb/storage/data_table.hpp>
 #include <op/scan/duckdb_native_metadata.hpp>
+#include <op/scan/scan_plan.hpp>
 #include <utils/utils.hpp>
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 using namespace sirius;
 using namespace sirius::op::scan;
@@ -63,19 +65,30 @@ duckdb::DataTable& get_storage(duckdb::Connection& con, const std::string& table
   return entry->Cast<duckdb::DuckTableEntry>().GetStorage();
 }
 
-projected_column real_col(duckdb::idx_t col_id)
-{
-  projected_column pc;
-  pc.storage_idx = duckdb::StorageIndex(col_id);
-  pc.is_rowid    = false;
-  return pc;
-}
+// A projected-column spec for the walker tests: a storage primary index plus
+// the rowid flag. make_plan() zips these with their logical types into the
+// scan_plan the walker consumes (mirroring build_scan_plan's data_columns).
+struct col_spec {
+  duckdb::idx_t primary_idx = 0;
+  bool is_rowid             = false;
+};
 
-projected_column rowid_col()
+col_spec real_col(duckdb::idx_t col_id) { return {col_id, false}; }
+col_spec rowid_col() { return {0, true}; }
+
+scan_plan make_plan(std::vector<col_spec> const& cols,
+                    std::vector<sirius::logical_type> const& types)
 {
-  projected_column pc;
-  pc.is_rowid = true;
-  return pc;
+  scan_plan plan;
+  plan.data_columns.reserve(cols.size());
+  for (std::size_t i = 0; i < cols.size(); ++i) {
+    scan_plan::data_column dc;
+    dc.primary_idx = cols[i].primary_idx;
+    dc.is_rowid    = cols[i].is_rowid;
+    if (i < types.size()) { dc.type = types[i]; }
+    plan.data_columns.push_back(std::move(dc));
+  }
+  return plan;
 }
 
 // A one-column TableFilterSet keyed by the relative scan-column index `col_key`
@@ -109,22 +122,9 @@ TEST_CASE("walker refuses empty projection", "[scan][duckdb_native_walker]")
   exec_ok(con, "INSERT INTO t SELECT range FROM range(0, 100)");
   auto& storage = get_storage(con, "t");
 
-  auto md = walk_duckdb_native_metadata(storage, *con.context, {}, {});
+  auto md = walk_duckdb_native_metadata(storage, *con.context, scan_plan{});
   REQUIRE_FALSE(md.viable);
   REQUIRE(md.viability_failure_reason.find("no projected columns") != std::string::npos);
-}
-
-TEST_CASE("walker refuses parallel-vector mismatch", "[scan][duckdb_native_walker]")
-{
-  auto [db_owner, con] = sirius::make_test_db_and_connection();
-  exec_ok(con, "CREATE TABLE t(a INTEGER)");
-  auto& storage = get_storage(con, "t");
-
-  std::vector<projected_column> cols   = {real_col(0)};
-  std::vector<sirius::logical_type> ts = {};
-  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
-  REQUIRE_FALSE(md.viable);
-  REQUIRE(md.viability_failure_reason.find("size mismatch") != std::string::npos);
 }
 
 TEST_CASE("walker refuses HUGEINT type", "[scan][duckdb_native_walker]")
@@ -134,9 +134,9 @@ TEST_CASE("walker refuses HUGEINT type", "[scan][duckdb_native_walker]")
   exec_ok(con, "INSERT INTO t VALUES (1), (2), (3)");
   auto& storage = get_storage(con, "t");
 
-  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<col_spec> cols           = {real_col(0)};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::HUGEINT)};
-  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  auto md = walk_duckdb_native_metadata(storage, *con.context, make_plan(cols, ts));
   REQUIRE_FALSE(md.viable);
   REQUIRE(md.viability_failure_reason.find("HUGEINT") != std::string::npos);
 }
@@ -150,9 +150,9 @@ TEST_CASE("walker emits descriptors for INTEGER table", "[scan][duckdb_native_wa
   exec_ok(con, "CHECKPOINT");
   auto& storage = get_storage(con, "t");
 
-  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<col_spec> cols           = {real_col(0)};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::INTEGER)};
-  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  auto md = walk_duckdb_native_metadata(storage, *con.context, make_plan(cols, ts));
   REQUIRE(md.viable);
   REQUIRE(md.viability_failure_reason.empty());
   REQUIRE_FALSE(md.row_groups.empty());
@@ -179,12 +179,12 @@ TEST_CASE("walker emits rowid sentinels with no segments", "[scan][duckdb_native
   exec_ok(con, "CHECKPOINT");
   auto& storage = get_storage(con, "t");
 
-  std::vector<projected_column> cols   = {real_col(0), rowid_col()};
+  std::vector<col_spec> cols           = {real_col(0), rowid_col()};
   std::vector<sirius::logical_type> ts = {
     sirius::logical_type::make(sirius::type_id::INTEGER),
     sirius::logical_type::make(sirius::type_id::BIGINT),
   };
-  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  auto md = walk_duckdb_native_metadata(storage, *con.context, make_plan(cols, ts));
   REQUIRE(md.viable);
   REQUIRE_FALSE(md.row_groups.empty());
 
@@ -211,9 +211,9 @@ TEST_CASE("walker rowid-only projection gets row_count from PartitionStats",
   exec_ok(con, "CHECKPOINT");
   auto& storage = get_storage(con, "t");
 
-  std::vector<projected_column> cols   = {rowid_col()};
+  std::vector<col_spec> cols           = {rowid_col()};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::BIGINT)};
-  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  auto md = walk_duckdb_native_metadata(storage, *con.context, make_plan(cols, ts));
   REQUIRE(md.viable);
   REQUIRE_FALSE(md.row_groups.empty());
 
@@ -241,9 +241,9 @@ TEST_CASE("walker separates data and validity segments by column_path",
   exec_ok(con, "CHECKPOINT");
   auto& storage = get_storage(con, "t");
 
-  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<col_spec> cols           = {real_col(0)};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::INTEGER)};
-  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  auto md = walk_duckdb_native_metadata(storage, *con.context, make_plan(cols, ts));
   REQUIRE(md.viable);
   REQUIRE_FALSE(md.row_groups.empty());
 
@@ -267,9 +267,9 @@ TEST_CASE("walker populates per-segment max_string_length for VARCHAR",
   exec_ok(con, "CHECKPOINT");
   auto& storage = get_storage(con, "t");
 
-  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<col_spec> cols           = {real_col(0)};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::VARCHAR)};
-  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  auto md = walk_duckdb_native_metadata(storage, *con.context, make_plan(cols, ts));
   REQUIRE(md.viable);
   REQUIRE_FALSE(md.row_groups.empty());
   for (const auto& rg : md.row_groups) {
@@ -292,9 +292,9 @@ TEST_CASE("walker accepts all-empty varchar row group (Some(0))", "[scan][duckdb
   exec_ok(con, "CHECKPOINT");
   auto& storage = get_storage(con, "t");
 
-  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<col_spec> cols           = {real_col(0)};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::VARCHAR)};
-  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  auto md = walk_duckdb_native_metadata(storage, *con.context, make_plan(cols, ts));
 
   REQUIRE(md.viable);
   REQUIRE_FALSE(md.row_groups.empty());
@@ -324,9 +324,9 @@ TEST_CASE("walker per-segment max_string_length reflects long strings",
   exec_ok(con, "CHECKPOINT");
   auto& storage = get_storage(con, "t");
 
-  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<col_spec> cols           = {real_col(0)};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::VARCHAR)};
-  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  auto md = walk_duckdb_native_metadata(storage, *con.context, make_plan(cols, ts));
   REQUIRE(md.viable);
   REQUIRE_FALSE(md.row_groups.empty());
 
@@ -345,9 +345,9 @@ TEST_CASE("walker refuses DECIMAL128 (precision > 18)", "[scan][duckdb_native_wa
   exec_ok(con, "INSERT INTO t VALUES (1), (2), (3)");
   auto& storage = get_storage(con, "t");
 
-  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<col_spec> cols           = {real_col(0)};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make_decimal(38, 0)};
-  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  auto md = walk_duckdb_native_metadata(storage, *con.context, make_plan(cols, ts));
   REQUIRE_FALSE(md.viable);
   REQUIRE(md.viability_failure_reason.find("DECIMAL128") != std::string::npos);
 }
@@ -360,9 +360,9 @@ TEST_CASE("walker accepts DECIMAL64 (precision <= 18)", "[scan][duckdb_native_wa
   exec_ok(con, "CHECKPOINT");
   auto& storage = get_storage(con, "t");
 
-  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<col_spec> cols           = {real_col(0)};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make_decimal(18, 2)};
-  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  auto md = walk_duckdb_native_metadata(storage, *con.context, make_plan(cols, ts));
   REQUIRE(md.viable);
   REQUIRE_FALSE(md.row_groups.empty());
 }
@@ -376,9 +376,9 @@ TEST_CASE("walker refuses STRUCT projected type", "[scan][duckdb_native_walker]"
   exec_ok(con, "INSERT INTO t VALUES (1)");
   auto& storage = get_storage(con, "t");
 
-  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<col_spec> cols           = {real_col(0)};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::STRUCT)};
-  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  auto md = walk_duckdb_native_metadata(storage, *con.context, make_plan(cols, ts));
   REQUIRE_FALSE(md.viable);
   REQUIRE(md.viability_failure_reason.find("STRUCT") != std::string::npos);
 }
@@ -390,9 +390,9 @@ TEST_CASE("walker refuses LIST projected type", "[scan][duckdb_native_walker]")
   exec_ok(con, "INSERT INTO t VALUES (1)");
   auto& storage = get_storage(con, "t");
 
-  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<col_spec> cols           = {real_col(0)};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::LIST)};
-  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  auto md = walk_duckdb_native_metadata(storage, *con.context, make_plan(cols, ts));
   REQUIRE_FALSE(md.viable);
   REQUIRE(md.viability_failure_reason.find("LIST") != std::string::npos);
 }
@@ -496,11 +496,11 @@ TEST_CASE("statistics pruning drops row groups below a lower-bound filter",
   auto [db_owner, con] = sirius::make_test_db_and_connection();
   auto& storage        = make_monotonic_int_table(con);
 
-  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<col_spec> cols           = {real_col(0)};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::INTEGER)};
 
   // Baseline: no filter → nothing pruned.
-  auto base = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+  auto base = walk_duckdb_native_metadata(storage, *con.context, make_plan(cols, ts));
   REQUIRE(base.viable);
   REQUIRE(base.pruned_row_groups == 0);
   REQUIRE(base.row_groups.size() >= 2);  // 300k rows > one 122880-row group
@@ -508,8 +508,8 @@ TEST_CASE("statistics pruning drops row groups below a lower-bound filter",
   // a >= 250000 → row groups entirely below 250000 are FILTER_ALWAYS_FALSE.
   auto ctx = make_constant_filter(
     0, 0, duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::INTEGER(250000));
-  auto pruned =
-    walk_duckdb_native_metadata(storage, *con.context, cols, ts, &ctx.filters, &ctx.column_ids);
+  auto pruned = walk_duckdb_native_metadata(
+    storage, *con.context, make_plan(cols, ts), &ctx.filters, &ctx.column_ids);
 
   REQUIRE(pruned.viable);
   REQUIRE(pruned.pruned_row_groups >= 1);
@@ -534,14 +534,14 @@ TEST_CASE("statistics pruning keeps every row group when the filter matches all"
   auto [db_owner, con] = sirius::make_test_db_and_connection();
   auto& storage        = make_monotonic_int_table(con);
 
-  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<col_spec> cols           = {real_col(0)};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::INTEGER)};
 
   // a >= 0 is always true for this data → no row group can be pruned.
   auto ctx = make_constant_filter(
     0, 0, duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::INTEGER(0));
-  auto md =
-    walk_duckdb_native_metadata(storage, *con.context, cols, ts, &ctx.filters, &ctx.column_ids);
+  auto md = walk_duckdb_native_metadata(
+    storage, *con.context, make_plan(cols, ts), &ctx.filters, &ctx.column_ids);
 
   REQUIRE(md.viable);
   REQUIRE(md.pruned_row_groups == 0);
@@ -554,7 +554,7 @@ TEST_CASE("statistics pruning refuses (CPU fallback) when every row group is pru
   auto [db_owner, con] = sirius::make_test_db_and_connection();
   auto& storage        = make_monotonic_int_table(con);
 
-  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<col_spec> cols           = {real_col(0)};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::INTEGER)};
 
   // a >= 1_000_000 exceeds every value → all row groups FILTER_ALWAYS_FALSE.
@@ -562,8 +562,8 @@ TEST_CASE("statistics pruning refuses (CPU fallback) when every row group is pru
   // (which correctly returns the empty result).
   auto ctx = make_constant_filter(
     0, 0, duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::INTEGER(1000000));
-  auto md =
-    walk_duckdb_native_metadata(storage, *con.context, cols, ts, &ctx.filters, &ctx.column_ids);
+  auto md = walk_duckdb_native_metadata(
+    storage, *con.context, make_plan(cols, ts), &ctx.filters, &ctx.column_ids);
 
   REQUIRE_FALSE(md.viable);
   REQUIRE(md.viability_failure_reason.find("pruned") != std::string::npos);
@@ -579,7 +579,7 @@ TEST_CASE("statistics pruning prunes through an OPTIONAL_FILTER wrapper",
   auto [db_owner, con] = sirius::make_test_db_and_connection();
   auto& storage        = make_monotonic_int_table(con);
 
-  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<col_spec> cols           = {real_col(0)};
   std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::INTEGER)};
 
   filter_ctx ctx;
@@ -588,8 +588,8 @@ TEST_CASE("statistics pruning prunes through an OPTIONAL_FILTER wrapper",
       duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::INTEGER(250000)));
   ctx.column_ids.push_back(duckdb::ColumnIndex(0));
 
-  auto md =
-    walk_duckdb_native_metadata(storage, *con.context, cols, ts, &ctx.filters, &ctx.column_ids);
+  auto md = walk_duckdb_native_metadata(
+    storage, *con.context, make_plan(cols, ts), &ctx.filters, &ctx.column_ids);
 
   REQUIRE(md.viable);
   REQUIRE(md.pruned_row_groups >= 1);
