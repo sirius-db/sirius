@@ -150,7 +150,6 @@ fn start_brpc_server_with_service<S>(
 ) -> Result<BrpcServer>
 where
     S: Service<prpc::Request, Response = prpc::Response, Error = prpc::Error> + Send + 'static,
-    S::Future: Send,
 {
     let listen_addr = format!("{bind_host}:{brpc_port}");
     let listener = TcpListener::bind(&listen_addr)

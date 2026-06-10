@@ -44,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Emits a BRPC/Tower service facade from StarRocks' protobuf service
+/// Emits an async BRPC/Tower service facade from StarRocks' protobuf service
 /// descriptor. This plays the role tonic-build would normally play for gRPC,
 /// while keeping the generated API independent of HTTP/2 and gRPC framing.
 struct BrpcServiceGenerator;
@@ -58,7 +58,9 @@ impl ServiceGenerator for BrpcServiceGenerator {
 
         output.push_str("pub mod p_internal_service_brpc {\n");
         output.push_str("    use prost::Message as _;\n");
-        output.push_str("    use std::{future::{Ready, ready}, task::{Context, Poll}};\n");
+        output.push_str(
+            "    use std::{future::Future, pin::Pin, sync::Arc, task::{Context, Poll}};\n",
+        );
         output.push_str("    use super::*;\n");
         output.push_str(&format!(
             "    pub const SERVICE_NAME: &str = {:?};\n",
@@ -108,6 +110,7 @@ impl ServiceGenerator for BrpcServiceGenerator {
         output.push_str("        }\n");
         output.push_str("    }\n");
 
+        output.push_str("    #[allow(async_fn_in_trait)]\n");
         output.push_str(&format!("    pub(crate) trait {} {{\n", service.name));
         for method in &service.methods {
             if method.client_streaming || method.server_streaming {
@@ -117,7 +120,7 @@ impl ServiceGenerator for BrpcServiceGenerator {
                 );
             }
             output.push_str(&format!(
-                "        fn {}(&self, _request: {}, _attachment: &[u8]) -> Result<{}, crate::prpc::Error> {{\n",
+                "        async fn {}(&self, _request: {}, _attachment: Vec<u8>) -> Result<{}, crate::prpc::Error> {{\n",
                 method.name, method.input_type, method.output_type
             ));
             output.push_str(&format!(
@@ -133,12 +136,12 @@ impl ServiceGenerator for BrpcServiceGenerator {
             "    pub(crate) struct {}Router<T> {{\n",
             service.name
         ));
-        output.push_str("        inner: T,\n");
+        output.push_str("        inner: Arc<T>,\n");
         output.push_str("    }\n");
 
         output.push_str(&format!("    impl<T> {}Router<T> {{\n", service.name));
         output.push_str("        pub(crate) fn new(inner: T) -> Self {\n");
-        output.push_str("            Self { inner }\n");
+        output.push_str("            Self { inner: Arc::new(inner) }\n");
         output.push_str("        }\n");
         output.push_str("    }\n");
 
@@ -146,11 +149,16 @@ impl ServiceGenerator for BrpcServiceGenerator {
             "    impl<T> tower::Service<crate::prpc::Request> for {}Router<T>\n",
             service.name
         ));
-        output.push_str(&format!("    where\n        T: {},\n", service.name));
+        output.push_str(&format!(
+            "    where\n        T: {} + 'static,\n",
+            service.name
+        ));
         output.push_str("    {\n");
         output.push_str("        type Response = crate::prpc::Response;\n");
         output.push_str("        type Error = crate::prpc::Error;\n");
-        output.push_str("        type Future = Ready<Result<Self::Response, Self::Error>>;\n\n");
+        output.push_str(
+            "        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>>>>;\n\n",
+        );
         output.push_str(
             "        fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {\n",
         );
@@ -159,14 +167,20 @@ impl ServiceGenerator for BrpcServiceGenerator {
         output.push_str(
             "        fn call(&mut self, request: crate::prpc::Request) -> Self::Future {\n",
         );
-        output.push_str("            ready(self.dispatch(request))\n");
+        output.push_str("            let inner = Arc::clone(&self.inner);\n");
+        output.push_str(
+            "            Box::pin(async move { Self::dispatch(inner, request).await })\n",
+        );
         output.push_str("        }\n");
         output.push_str("    }\n");
 
         output.push_str(&format!("    impl<T> {}Router<T>\n", service.name));
-        output.push_str(&format!("    where\n        T: {},\n", service.name));
+        output.push_str(&format!(
+            "    where\n        T: {} + 'static,\n",
+            service.name
+        ));
         output.push_str("    {\n");
-        output.push_str("        fn dispatch(&self, request: crate::prpc::Request) -> Result<crate::prpc::Response, crate::prpc::Error> {\n");
+        output.push_str("        async fn dispatch(inner: Arc<T>, request: crate::prpc::Request) -> Result<crate::prpc::Response, crate::prpc::Error> {\n");
         output.push_str("            if request.service_name != SERVICE_NAME {\n");
         output.push_str(
             "                return Err(crate::prpc::Error::service_not_found(format!(\n",
@@ -187,7 +201,7 @@ impl ServiceGenerator for BrpcServiceGenerator {
         output.push_str("            match method {\n");
         for method in &service.methods {
             output.push_str(&format!(
-                "                Method::{} => self.call_{}(&request.body, &request.attachment),\n",
+                "                Method::{} => Self::call_{}(inner, request.body, request.attachment).await,\n",
                 method_variant(method),
                 method.name
             ));
@@ -197,11 +211,11 @@ impl ServiceGenerator for BrpcServiceGenerator {
 
         for method in &service.methods {
             output.push_str(&format!(
-                "        fn call_{}(&self, request_bytes: &[u8], attachment: &[u8]) -> Result<crate::prpc::Response, crate::prpc::Error> {{\n",
+                "        async fn call_{}(inner: Arc<T>, request_bytes: Vec<u8>, attachment: Vec<u8>) -> Result<crate::prpc::Response, crate::prpc::Error> {{\n",
                 method.name
             ));
             output.push_str(&format!(
-                "            let request = {}::decode(request_bytes)\n",
+                "            let request = {}::decode(request_bytes.as_slice())\n",
                 method.input_type
             ));
             output.push_str(&format!(
@@ -209,7 +223,7 @@ impl ServiceGenerator for BrpcServiceGenerator {
                 const_name(&method.proto_name)
             ));
             output.push_str(&format!(
-                "            let response = self.inner.{}(request, attachment)?;\n",
+                "            let response = inner.{}(request, attachment).await?;\n",
                 method.name
             ));
             output

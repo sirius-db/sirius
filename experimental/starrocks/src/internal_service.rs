@@ -30,14 +30,14 @@ impl PlanFragmentTranslatorService {
 
 impl PInternalService for PlanFragmentTranslatorService {
     /// Handles a single FE-dispatched plan fragment thrift attachment.
-    fn exec_plan_fragment(
+    async fn exec_plan_fragment(
         &self,
         request: PExecPlanFragmentRequest,
-        attachment: &[u8],
+        attachment: Vec<u8>,
     ) -> Result<PExecPlanFragmentResult, crate::prpc::Error> {
         Ok(
             match self
-                .translate_single_attachment(request.attachment_protocol.as_deref(), attachment)
+                .translate_single_attachment(request.attachment_protocol.as_deref(), &attachment)
             {
                 Ok(()) => exec_plan_result(ok_status()),
                 Err(err) => exec_plan_result(internal_error(err)),
@@ -46,14 +46,14 @@ impl PInternalService for PlanFragmentTranslatorService {
     }
 
     /// Handles FE batch fragment dispatch by translating every per-instance fragment.
-    fn exec_batch_plan_fragments(
+    async fn exec_batch_plan_fragments(
         &self,
         request: PExecBatchPlanFragmentsRequest,
-        attachment: &[u8],
+        attachment: Vec<u8>,
     ) -> Result<PExecBatchPlanFragmentsResult, crate::prpc::Error> {
         Ok(
             match self
-                .translate_batch_attachment(request.attachment_protocol.as_deref(), attachment)
+                .translate_batch_attachment(request.attachment_protocol.as_deref(), &attachment)
             {
                 Ok(()) => PExecBatchPlanFragmentsResult {
                     status: Some(ok_status()),
@@ -338,7 +338,7 @@ mod tests {
 
     fn call_router(request: prpc::Request) -> std::result::Result<prpc::Response, prpc::Error> {
         // The generated router is a Tower service; a tiny current-thread runtime is
-        // enough because dispatch is synchronous today.
+        // enough because these tests do not spawn the service futures.
         let mut router = PInternalServiceRouter::new(PlanFragmentTranslatorService::new());
         tokio::runtime::Builder::new_current_thread()
             .build()
