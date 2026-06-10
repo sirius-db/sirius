@@ -28,6 +28,14 @@ endif()
 option(ENABLE_STREAM_CHECK
        "Enable stream check library for debugging default stream usage" OFF)
 
+# The [s3] integration tests launch MinIO via a patched build of upstream
+# testcontainers-native, fetched + patched at configure time and built as a Go
+# c-archive — so it needs a Go toolchain and network at configure/build time. ON
+# by default (the pixi env provides Go); turn OFF for offline / Go-less /
+# release / package builds, which then skip the S3 container harness entirely.
+option(SIRIUS_BUILD_S3_TESTS
+       "Build the testcontainers-backed S3 integration test harness" ON)
+
 # In the vcpkg build, vcpkg headers must take priority over: 1) conda's CCCL
 # 3.1.4 (injected via CXXFLAGS as -I.../include/cccl) 2) DuckDB's bundled fmt
 # 6.1.2 (uses duckdb_fmt namespace, incompatible with spdlog) Fix: strip conda
@@ -138,6 +146,15 @@ endif()
 
 # Rust telemetry instrumentation (C++ FFI via Corrosion)
 add_subdirectory(rust/crates/telemetry/bridge)
+
+# Upstream testcontainers-native, fetched + patched at configure time (see
+# cmake/testcontainers_native.cmake), used by the S3 integration test harness to
+# start MinIO containers from the test binary. Builds a Go c-archive, so a Go
+# toolchain (provided by pixi) and network access on the first configure/build
+# are required — hence gated behind SIRIUS_BUILD_S3_TESTS.
+if(SIRIUS_BUILD_S3_TESTS)
+  include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/testcontainers_native.cmake")
+endif()
 
 # cmake-format: off
 set(EXTENSION_SOURCES
@@ -544,6 +561,12 @@ if(SIRIUS_LEGACY_TEST_SOURCES)
   list(APPEND TEST_SOURCES ${SIRIUS_LEGACY_TEST_SOURCES})
 endif()
 
+# The testcontainers-backed S3 harness only compiles when its dependency is
+# built; unittest.cpp guards its use behind SIRIUS_HAVE_TESTCONTAINERS.
+if(SIRIUS_BUILD_S3_TESTS)
+  list(APPEND TEST_SOURCES test/cpp/utils/s3_container.cpp)
+endif()
+
 add_executable(sirius_unittest ${TEST_SOURCES})
 
 # TPC-DS integration test fixture, generated at build time (opt-in target). The
@@ -580,6 +603,16 @@ target_include_directories(
 
 target_link_libraries(sirius_unittest sirius_extension duckdb_static)
 link_extension_libraries(sirius_unittest "")
+
+# S3 container harness: the testcontainers-native bridge plus libcurl for
+# host-side fixture upload (SigV4 signing comes from sirius_extension). Gated so
+# offline/Go-less builds skip it; the harness calls in unittest.cpp are guarded
+# by SIRIUS_HAVE_TESTCONTAINERS.
+if(SIRIUS_BUILD_S3_TESTS)
+  target_link_libraries(sirius_unittest testcontainers_native PkgConfig::CURL)
+  target_compile_definitions(sirius_unittest
+                             PRIVATE SIRIUS_HAVE_TESTCONTAINERS=1)
+endif()
 # DuckDB v1.5.0 unity builds emit strong symbols for static constexpr members
 # that conflict with inline definitions from headers included in test files.
 target_link_options(sirius_unittest PRIVATE
