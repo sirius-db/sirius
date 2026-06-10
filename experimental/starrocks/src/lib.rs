@@ -40,7 +40,7 @@ mod internal_service;
 mod proto;
 mod prpc;
 
-pub use brpc::{BrpcServer, BrpcServerShutdown, start_brpc_server};
+pub use brpc::BrpcServer;
 
 type HeartbeatProcessor = HeartbeatServiceSyncProcessor<ComputeNodeHeartbeatHandler>;
 

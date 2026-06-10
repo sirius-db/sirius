@@ -4,8 +4,9 @@ use anyhow::{Result, anyhow};
 use clap::Parser;
 use sirius_starrocks_cn::{
     BrpcServer, ComputeNodeConfig, FeConfig, HeartbeatServer, SharedHeartbeatState, register_node,
-    start_brpc_server, start_heartbeat_server,
+    start_heartbeat_server,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 const REGISTRATION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -40,10 +41,7 @@ impl Args {
         let state = SharedHeartbeatState::new();
 
         let heartbeat_server = start_heartbeat_server(self.compute_node.clone(), state.clone())?;
-        let brpc_server = start_brpc_server(
-            self.compute_node.bind_host.as_str(),
-            self.compute_node.brpc_port,
-        )?;
+        let brpc_runtime = BrpcRuntime::start(&self.compute_node)?;
         self.registration
             .register_node_with_retries(&self.fe, &self.compute_node)
             .await?;
@@ -54,7 +52,7 @@ impl Args {
         info!("compute node registered; waiting for FE heartbeats");
         RunningComputeNode {
             heartbeat_server,
-            brpc_server,
+            brpc_runtime,
             registration_task,
         }
         .wait_until_shutdown()
@@ -146,12 +144,41 @@ impl RegistrationMonitor {
     }
 }
 
+/// Dedicated current-thread Tokio runtime used for the BRPC service future.
+struct BrpcRuntime {
+    /// Cancellation token passed into `BrpcServer::serve_with_listener_shutdown`.
+    shutdown: CancellationToken,
+    /// Blocking task that owns the current-thread runtime and BRPC listener.
+    join: tokio::task::JoinHandle<Result<()>>,
+}
+
+impl BrpcRuntime {
+    /// Binds the BRPC listener and starts serving it on a dedicated runtime.
+    fn start(compute_node: &ComputeNodeConfig) -> Result<Self> {
+        let listener = BrpcServer::bind(compute_node.bind_host.as_str(), compute_node.brpc_port)?;
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let join = tokio::task::spawn_blocking(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .build()
+                .map_err(|err| anyhow!("failed to create BRPC service runtime: {err}"))?;
+            runtime.block_on(
+                BrpcServer::new()
+                    .serve_with_listener_shutdown(listener, server_shutdown.cancelled_owned()),
+            )
+        });
+
+        Ok(Self { shutdown, join })
+    }
+}
+
 /// Active CN listener handles plus the background registration task.
 struct RunningComputeNode {
     /// Blocking thrift heartbeat server handle.
     heartbeat_server: HeartbeatServer,
-    /// BRPC internal-service server handle.
-    brpc_server: BrpcServer,
+    /// BRPC runtime task and shutdown token.
+    brpc_runtime: BrpcRuntime,
     /// Background task that refreshes FE registration when heartbeats are stale.
     registration_task: tokio::task::JoinHandle<()>,
 }
@@ -160,9 +187,9 @@ impl RunningComputeNode {
     /// Waits until a signal, server exit, or monitor exit requires process shutdown.
     async fn wait_until_shutdown(self) -> Result<()> {
         let heartbeat_shutdown = self.heartbeat_server.shutdown_handle();
-        let brpc_shutdown = self.brpc_server.shutdown_handle();
+        let brpc_shutdown = self.brpc_runtime.shutdown.clone();
         let mut heartbeat_join = tokio::task::spawn_blocking(move || self.heartbeat_server.join());
-        let mut brpc_join = tokio::task::spawn_blocking(move || self.brpc_server.join());
+        let mut brpc_join = self.brpc_runtime.join;
         let mut registration_task = self.registration_task;
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -174,7 +201,7 @@ impl RunningComputeNode {
                 info!(signal = "ctrl-c", "shutdown signal received");
                 registration_task.abort();
                 heartbeat_shutdown.shutdown();
-                brpc_shutdown.shutdown();
+                brpc_shutdown.cancel();
                 heartbeat_join
                     .await
                     .map_err(|err| anyhow!("heartbeat server join task failed: {err}"))??;
@@ -188,7 +215,7 @@ impl RunningComputeNode {
                 info!(signal = "sigterm", "shutdown signal received");
                 registration_task.abort();
                 heartbeat_shutdown.shutdown();
-                brpc_shutdown.shutdown();
+                brpc_shutdown.cancel();
                 heartbeat_join
                     .await
                     .map_err(|err| anyhow!("heartbeat server join task failed: {err}"))??;
@@ -200,7 +227,7 @@ impl RunningComputeNode {
             }
             result = &mut heartbeat_join => {
                 registration_task.abort();
-                brpc_shutdown.shutdown();
+                brpc_shutdown.cancel();
                 let result = result
                     .map_err(|err| anyhow!("heartbeat server join task failed: {err}"))?;
                 brpc_join
@@ -226,7 +253,7 @@ impl RunningComputeNode {
             }
             result = &mut registration_task => {
                 heartbeat_shutdown.shutdown();
-                brpc_shutdown.shutdown();
+                brpc_shutdown.cancel();
                 heartbeat_join
                     .await
                     .map_err(|err| anyhow!("heartbeat server join task failed: {err}"))??;

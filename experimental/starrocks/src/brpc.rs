@@ -1,127 +1,157 @@
-use std::{
-    mem::ManuallyDrop,
-    net::{SocketAddr, TcpListener as StdTcpListener},
-    thread::{self, JoinHandle},
-};
+use std::{future::Future, net::TcpListener as StdTcpListener, pin::Pin};
 
 use crate::{
     internal_service::PlanFragmentTranslatorService,
     proto::starrocks::p_internal_service_brpc::PInternalServiceRouter, prpc,
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_util::sync::CancellationToken;
 use tower::{Service, ServiceExt};
 use tracing::{info, warn};
 
-/// Handle for the blocking BRPC listener thread.
+/// BRPC service runner for StarRocks PInternalService.
 pub struct BrpcServer {
-    /// Dedicated listener thread running a current-thread Tokio runtime.
-    join_handle: JoinHandle<Result<()>>,
-    /// Cancellation handle shared with the listener and active connection.
-    shutdown: BrpcServerShutdown,
-    /// Address selected by the operating system after binding.
-    local_addr: SocketAddr,
+    /// Generic Tower service runner hidden behind the public default service.
+    inner: BrpcServiceServer<PInternalServiceRouter<PlanFragmentTranslatorService>>,
+}
+
+/// Generic BRPC service runner over StarRocks PRPC frames.
+struct BrpcServiceServer<S> {
+    /// Tower service invoked for each decoded PRPC request.
+    service: S,
 }
 
 impl BrpcServer {
-    /// Starts the StarRocks BRPC server using the generated PInternalService router.
-    pub(crate) fn start(bind_host: &str, brpc_port: u16) -> Result<Self> {
+    /// Builds a BRPC server for StarRocks PInternalService plan-fragment RPCs.
+    pub fn new() -> Self {
         let service = PInternalServiceRouter::new(PlanFragmentTranslatorService::new());
-        Self::start_with_service(bind_host, brpc_port, service)
+        Self {
+            inner: BrpcServiceServer::with_service(service),
+        }
     }
 
-    /// Starts a BRPC server with an injected Tower service.
-    fn start_with_service<S>(bind_host: &str, brpc_port: u16, service: S) -> Result<Self>
-    where
-        S: Service<prpc::Request, Response = prpc::Response, Error = prpc::Error> + Send + 'static,
-    {
+    /// Binds a std listener that can be moved into the runtime that serves it.
+    pub fn bind(bind_host: &str, brpc_port: u16) -> Result<StdTcpListener> {
         let listen_addr = format!("{bind_host}:{brpc_port}");
         let listener = StdTcpListener::bind(&listen_addr)
             .with_context(|| format!("failed to bind BRPC server at {listen_addr}"))?;
         listener
             .set_nonblocking(true)
             .context("failed to put BRPC listener in nonblocking mode")?;
+        Ok(listener)
+    }
+
+    /// Serves BRPC requests on `bind_host:brpc_port` until the task is cancelled.
+    pub async fn serve(self, bind_host: &str, brpc_port: u16) -> Result<()> {
+        self.inner.serve(bind_host, brpc_port).await
+    }
+
+    /// Serves BRPC requests on `bind_host:brpc_port` until `signal` resolves.
+    pub async fn serve_with_shutdown<F>(
+        self,
+        bind_host: &str,
+        brpc_port: u16,
+        signal: F,
+    ) -> Result<()>
+    where
+        F: Future<Output = ()>,
+    {
+        self.inner
+            .serve_with_shutdown(bind_host, brpc_port, signal)
+            .await
+    }
+
+    /// Serves BRPC requests from an existing listener until the task is cancelled.
+    pub async fn serve_with_listener(self, listener: StdTcpListener) -> Result<()> {
+        self.inner.serve_with_listener(listener).await
+    }
+
+    /// Serves BRPC requests from an existing listener until `signal` resolves.
+    pub async fn serve_with_listener_shutdown<F>(
+        self,
+        listener: StdTcpListener,
+        signal: F,
+    ) -> Result<()>
+    where
+        F: Future<Output = ()>,
+    {
+        self.inner
+            .serve_with_listener_shutdown(listener, signal)
+            .await
+    }
+}
+
+impl Default for BrpcServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<S> BrpcServiceServer<S> {
+    /// Builds a BRPC server with an injected Tower service.
+    fn with_service(service: S) -> Self {
+        Self { service }
+    }
+}
+
+impl<S> BrpcServiceServer<S>
+where
+    S: Service<prpc::Request, Response = prpc::Response, Error = prpc::Error>,
+{
+    /// Serves BRPC requests on `bind_host:brpc_port` until the task is cancelled.
+    pub async fn serve(self, bind_host: &str, brpc_port: u16) -> Result<()> {
+        self.serve_with_shutdown(bind_host, brpc_port, std::future::pending::<()>())
+            .await
+    }
+
+    /// Serves BRPC requests on `bind_host:brpc_port` until `signal` resolves.
+    pub async fn serve_with_shutdown<F>(
+        self,
+        bind_host: &str,
+        brpc_port: u16,
+        signal: F,
+    ) -> Result<()>
+    where
+        F: Future<Output = ()>,
+    {
+        let listener = BrpcServer::bind(bind_host, brpc_port)?;
+        self.serve_with_listener_shutdown(listener, signal).await
+    }
+
+    /// Serves BRPC requests from an existing listener until the task is cancelled.
+    pub async fn serve_with_listener(self, listener: StdTcpListener) -> Result<()> {
+        self.serve_with_listener_shutdown(listener, std::future::pending::<()>())
+            .await
+    }
+
+    /// Serves BRPC requests from an existing listener until `signal` resolves.
+    pub async fn serve_with_listener_shutdown<F>(
+        self,
+        listener: StdTcpListener,
+        signal: F,
+    ) -> Result<()>
+    where
+        F: Future<Output = ()>,
+    {
         let local_addr = listener
             .local_addr()
             .context("failed to read BRPC server address")?;
-        let shutdown = BrpcServerShutdown::new();
-        let server_shutdown = shutdown.clone();
-
         info!(address = %local_addr, "starting BRPC server");
-        let join_handle = thread::spawn(move || Self::run(listener, server_shutdown, service));
-
-        Ok(Self {
-            join_handle,
-            shutdown,
-            local_addr,
-        })
-    }
-
-    /// Returns a cloneable shutdown handle for coordinating process shutdown.
-    pub fn shutdown_handle(&self) -> BrpcServerShutdown {
-        self.shutdown.clone()
-    }
-
-    /// Requests listener and active-connection shutdown.
-    pub fn shutdown(&self) {
-        self.shutdown.shutdown();
-    }
-
-    /// Returns the address the BRPC listener bound to.
-    pub fn local_addr(&self) -> SocketAddr {
-        self.local_addr
-    }
-
-    /// Waits for the listener thread to exit.
-    pub fn join(self) -> Result<()> {
-        let this = ManuallyDrop::new(self);
-        // SAFETY: `join` consumes `self`, wraps it in `ManuallyDrop` so `Drop`
-        // will not run, and reads each non-Copy field exactly once.
-        let join_handle = unsafe { std::ptr::read(&this.join_handle) };
-        // SAFETY: this is the matching single read of the shutdown token so it
-        // is dropped normally without requesting shutdown.
-        let shutdown = unsafe { std::ptr::read(&this.shutdown) };
-        drop(shutdown);
-
-        join_handle
-            .join()
-            .map_err(|panic| anyhow!("BRPC server thread panicked: {panic:?}"))?
-    }
-
-    /// Runs the async listener runtime on the dedicated BRPC thread.
-    fn run<S>(listener: StdTcpListener, shutdown: BrpcServerShutdown, service: S) -> Result<()>
-    where
-        S: Service<prpc::Request, Response = prpc::Response, Error = prpc::Error>,
-    {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .build()
-            .context("failed to create BRPC service runtime")?;
-        runtime.block_on(Self::run_async(listener, shutdown.token, service))
-    }
-
-    /// Runs the async BRPC accept loop until the shutdown token is cancelled.
-    async fn run_async<S>(
-        listener: StdTcpListener,
-        shutdown: CancellationToken,
-        mut service: S,
-    ) -> Result<()>
-    where
-        S: Service<prpc::Request, Response = prpc::Response, Error = prpc::Error>,
-    {
         let listener =
             TcpListener::from_std(listener).context("failed to create async BRPC listener")?;
+        let mut service = self.service;
+        tokio::pin!(signal);
 
         loop {
             tokio::select! {
-                _ = shutdown.cancelled() => break,
+                _ = signal.as_mut() => break,
                 accepted = listener.accept() => {
                     match accepted {
                         Ok((stream, _addr)) => {
-                            Self::handle_connection(&mut service, stream, shutdown.clone()).await?;
+                            if Self::handle_connection(&mut service, stream, signal.as_mut()).await? == ConnectionExit::Shutdown {
+                                break;
+                            }
                         }
-                        Err(_) if shutdown.is_cancelled() => break,
                         Err(err) => warn!(error = %err, "failed to accept BRPC connection"),
                     }
                 },
@@ -133,27 +163,27 @@ impl BrpcServer {
     }
 
     /// Reads PRPC frames from one connection and writes one response per request.
-    async fn handle_connection<S>(
+    async fn handle_connection(
         service: &mut S,
         mut stream: TcpStream,
-        shutdown: CancellationToken,
-    ) -> Result<()>
+        mut signal: Pin<&mut impl Future<Output = ()>>,
+    ) -> Result<ConnectionExit>
     where
         S: Service<prpc::Request, Response = prpc::Response, Error = prpc::Error>,
     {
         loop {
             let frame = tokio::select! {
-                _ = shutdown.cancelled() => return Ok(()),
+                _ = signal.as_mut() => return Ok(ConnectionExit::Shutdown),
                 frame = prpc::Frame::read_async(&mut stream) => frame?,
             };
             let Some(frame) = frame else {
-                return Ok(());
+                return Ok(ConnectionExit::Closed);
             };
 
             let response = match frame.request() {
                 Ok(request) => {
                     tokio::select! {
-                        _ = shutdown.cancelled() => return Ok(()),
+                        _ = signal.as_mut() => return Ok(ConnectionExit::Shutdown),
                         response = Self::call_service(service, request) => response,
                     }
                 }
@@ -161,14 +191,14 @@ impl BrpcServer {
             };
             let response_frame = frame.into_response_frame(response);
             tokio::select! {
-                _ = shutdown.cancelled() => return Ok(()),
+                _ = signal.as_mut() => return Ok(ConnectionExit::Shutdown),
                 result = response_frame.write_async(&mut stream) => result?,
             }
         }
     }
 
     /// Awaits Tower readiness and dispatches one decoded PRPC request.
-    async fn call_service<S>(
+    async fn call_service(
         service: &mut S,
         request: prpc::Request,
     ) -> std::result::Result<prpc::Response, prpc::Error>
@@ -179,36 +209,13 @@ impl BrpcServer {
     }
 }
 
-impl Drop for BrpcServer {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
-
-/// Cloneable signal used to stop the BRPC listener and current connection.
-#[derive(Clone)]
-pub struct BrpcServerShutdown {
-    /// Tokio cancellation token observed by the listener and connection loop.
-    token: CancellationToken,
-}
-
-impl BrpcServerShutdown {
-    /// Creates a shutdown handle shared by the listener and connection loop.
-    fn new() -> Self {
-        Self {
-            token: CancellationToken::new(),
-        }
-    }
-
-    /// Requests shutdown for the listener and any active connection.
-    pub fn shutdown(&self) {
-        self.token.cancel();
-    }
-}
-
-/// Starts the StarRocks BRPC server using the generated PInternalService router.
-pub fn start_brpc_server(bind_host: &str, brpc_port: u16) -> Result<BrpcServer> {
-    BrpcServer::start(bind_host, brpc_port)
+/// Outcome of processing one accepted BRPC connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectionExit {
+    /// The peer closed the connection normally.
+    Closed,
+    /// The server shutdown signal resolved while the connection was active.
+    Shutdown,
 }
 
 #[cfg(test)]
@@ -217,22 +224,37 @@ mod tests {
         future::{Ready, ready},
         net::TcpStream as StdTcpStream,
         task::{Context, Poll},
+        thread,
     };
 
     use super::*;
+    use tokio_util::sync::CancellationToken;
 
     /// Verifies BRPC shutdown cancels an accepted connection waiting for PRPC input.
     #[test]
     fn brpc_server_shutdown_cancels_active_connection() {
-        let server = match BrpcServer::start_with_service("127.0.0.1", 0, EmptyService) {
-            Ok(server) => server,
+        let listener = match BrpcServer::bind("127.0.0.1", 0) {
+            Ok(listener) => listener,
             Err(err) if is_permission_denied(&err) => return,
             Err(err) => panic!("{err:?}"),
         };
-        let stream = StdTcpStream::connect(server.local_addr()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let join = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .build()
+                .unwrap();
+            runtime.block_on(
+                BrpcServiceServer::with_service(EmptyService)
+                    .serve_with_listener_shutdown(listener, server_shutdown.cancelled_owned()),
+            )
+        });
+        let stream = StdTcpStream::connect(addr).unwrap();
 
-        server.shutdown();
-        server.join().unwrap();
+        shutdown.cancel();
+        join.join().unwrap().unwrap();
         drop(stream);
     }
 
