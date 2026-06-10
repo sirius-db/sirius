@@ -81,9 +81,11 @@ class sirius_physical_parquet_scan : public sirius_physical_operator {
   duckdb::ExtraOperatorInfo extra_info;
   //! Parameters
   duckdb::vector<duckdb::Value> parameters;
-  //! Contains a reference to dynamically generated table filters (through e.g. a join up in the
-  //! tree)
+  /// The duckdb::DynamicTableFilterSet pointer planted by plan-gen for this scan, if any. Used as
+  /// the route key identity for Sirius-side dynamic filters @ref sirius_dynamic_filters. Read by
+  /// the scan consumer to merge into the parquet reader's AST filter.
   duckdb::shared_ptr<duckdb::DynamicTableFilterSet> dynamic_filters;
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> sirius_dynamic_filters;
   //! Virtual columns
   duckdb::virtual_column_map_t virtual_columns;
 

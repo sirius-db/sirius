@@ -53,6 +53,7 @@
 #include "sirius_config.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <numeric>
 #include <stdexcept>
 
@@ -268,6 +269,9 @@ void sirius_pipeline_converter::insert_parquet_scan_operator(
   }
   table_info->scan_output_arity      = scan_op.types.size();
   table_info->approximate_batch_size = op_params_.scan_task_batch_size;
+
+  // Thread Sirius-side dynamic filters into the ingestible alongside the other scan metadata.
+  table_info->sirius_dynamic_filters = scan_op.sirius_dynamic_filters;
 
   auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_scan_operator>(
     scan_op.types, scan_op.estimated_cardinality, std::move(table_info));

@@ -16,17 +16,21 @@
 
 #include "op/sirius_physical_hash_join.hpp"
 
+#include "cudf/aggregation.hpp"
 #include "cudf/copying.hpp"
 #include "cudf/join/distinct_hash_join.hpp"
 #include "cudf/join/filtered_join.hpp"
 #include "cudf/join/join.hpp"
 #include "cudf/join/mixed_join.hpp"
+#include "cudf/reduction.hpp"
+#include "cudf/stream_compaction.hpp"
 #include "cudf/table/table_view.hpp"
 #include "cudf/types.hpp"
 #include "cudf/unary.hpp"
 #include "cudf/utilities/memory_resource.hpp"
 #include "cudf/version_config.hpp"
 #include "data/data_batch_utils.hpp"
+#include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
@@ -35,13 +39,20 @@
 #include "expression_executor/gpu_expression_translator_internal.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
+#include "op/sirius_dynamic_filter.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
 
+#include <cuda_runtime_api.h>
 #include <nvtx3/nvtx3.hpp>
 
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/memory_space.hpp>
+
 #include <cstdio>
+#include <optional>
+#include <string_view>
 #include <unordered_set>
 
 namespace sirius {
@@ -907,6 +918,15 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         stream.synchronize();  // Ensure the hash table is fully built before we allow any probe
                                // batches to proceed.
         _hash_table_build_state = BUILD_HASH_TABLE_STATE::BUILT;
+
+        // Fallback dynamic-filter publish. The primary publish happens earlier, in
+        // push_data_batch_partitioned the moment the build batch is delivered — before any probe
+        // batch, which is what lets the probe scan prune at read (see that hook). This call only
+        // does work if that one was skipped (e.g. the build batch was not GPU-resident at
+        // delivery); it publishes here from the now-materialized build keys, but only after the
+        // first probe batch has reached the join, so it is too late to prune already-read splits.
+        // The _dynamic_filters_published guard makes it a no-op when the hook already published.
+        publish_dynamic_filters_locked(sirius::get_cudf_table_view(*_build_table), stream);
       }
     }
     if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::BUILT) {
@@ -1214,9 +1234,230 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                             stream);
 }
 
+namespace {
+// Device L2 cache size in bytes for the current device (queried once; 0 if unavailable). The
+// membership-filter L2-fit policy compares each candidate structure's footprint against this.
+std::size_t device_l2_cache_bytes() noexcept
+{
+  static std::size_t const cached = [] {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) { return std::size_t{0}; }
+    int l2 = 0;
+    if (cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, dev) != cudaSuccess) {
+      return std::size_t{0};
+    }
+    return static_cast<std::size_t>(l2);
+  }();
+  return cached;
+}
+}  // namespace
+
+void sirius_physical_hash_join::push_build_side_dynamic_filters(cudf::table_view const& build_view,
+                                                                rmm::cuda_stream_view stream)
+{
+  nvtx3::scoped_range nvtx_range{"dynfilter::push_build_side"};
+  // Caller (publish_dynamic_filters_locked) holds op_state_mutex and has already checked
+  //  - filter_pushdown != nullptr
+  //  - !probe_targets.empty()
+  assert(filter_pushdown);
+  assert(!probe_targets.empty());
+
+  if (build_view.num_rows() == 0) {
+    SIRIUS_LOG_DEBUG(
+      "[sirius_physical_hash_join] Skipping dynamic filter push: empty build table.");
+    return;
+  }
+
+  auto allocator_ref = cudf::get_current_device_resource_ref();
+
+  // Build up to two complementary filters per join key, indexed by filter_pushdown->join_condition
+  // and reused across all targets for fan-out (channels co-own filters):
+  //  - a zone-map (read-time ROW-GROUP pruning, the only path that cuts scan I/O), built whenever
+  //  the
+  //    build's min/max are valid; and
+  //  - a membership filter (IN-list / Bloom, post-decode) chosen by L2-cache fit.
+  // The two ride different consumer paths and compose; either may be absent for a key.
+  std::vector<std::shared_ptr<sirius_dynamic_filter const>> per_key_zone_map(
+    filter_pushdown->join_condition.size());
+  std::vector<std::shared_ptr<sirius_dynamic_filter const>> per_key_membership(
+    filter_pushdown->join_condition.size());
+
+  for (std::size_t k = 0; k < filter_pushdown->join_condition.size(); ++k) {
+    auto const cond_idx = filter_pushdown->join_condition[k];
+    // Skip cast keys for Phase 1.1: the reduced scalar's type does not match the parquet
+    // storage type; casting it would need a separate code path. Pushdown is opportunistic —
+    // skipping a key here just leaves that column unpruned.
+    if (cond_idx < key_casts.size() && key_casts[cond_idx].cast_right) { continue; }
+    if (cond_idx >= static_cast<std::size_t>(right_key_col_indices.size())) { continue; }
+
+    auto const build_col_idx = right_key_col_indices[cond_idx];
+    auto const& col          = build_view.column(build_col_idx);
+
+    // (1) Zone-map — read-time ROW-GROUP pruning. A cheap min/max reduce; the only filter that can
+    // cut scan I/O, when the probe key is clustered into a subset of row groups. Off by default
+    // (enable_dynamic_zone_map_filter): on TPC-H-shaped joins DuckDB's static transitive-predicate
+    // pushdown already prunes range-derivable builds and scattered keys prune nothing, so it pays
+    // off only on clustered-keyset joins. When on, the consumer's zone-map gate disables the
+    // per-split stats check after the first non-pruning split. Rides its own (AST / row-group)
+    // consumer path.
+    if (emit_zone_map_filters) {
+      nvtx3::scoped_range vr{"dynfilter::build_zone_map"};
+      auto min_s = cudf::reduce(col,
+                                *cudf::make_min_aggregation<cudf::reduce_aggregation>(),
+                                col.type(),
+                                stream,
+                                allocator_ref);
+      auto max_s = cudf::reduce(col,
+                                *cudf::make_max_aggregation<cudf::reduce_aggregation>(),
+                                col.type(),
+                                stream,
+                                allocator_ref);
+      if (min_s && max_s && min_s->is_valid(stream) && max_s->is_valid(stream)) {
+        std::vector<sirius::op::zone_map_entry> zones;
+        zones.push_back({std::move(min_s), std::move(max_s)});
+        per_key_zone_map[k] =
+          std::make_shared<sirius::op::sirius_dynamic_zone_map_filter>(std::move(zones));
+      }
+    }
+
+    // (2) Membership filter — post-decode. Choose the structure that fits the device L2 cache, so
+    // its random per-row probe runs at cache bandwidth instead of thrashing HBM. Size the exact
+    // IN-list set (the cuco::static_set that cudf::contains builds) and the ~8x-smaller Bloom bit
+    // array from the build row count — an upper bound on the distinct-key count, and exact for the
+    // Bloom, which inserts all rows. Prefer the exact IN-list if it fits; else the Bloom if it
+    // fits; else none — a structure that spills L2 makes the post-decode probe cost more than the
+    // pruning saves.
+    auto const n  = static_cast<std::size_t>(build_view.num_rows());
+    auto const l2 = device_l2_cache_bytes();
+    auto const set_bytes =
+      sirius::op::sirius_dynamic_in_list_filter::estimated_set_bytes(n, col.type());
+    auto const bloom_bytes = sirius::op::sirius_dynamic_bloom_filter::estimated_bytes(n);
+    char const* choice     = "none";
+    if (l2 > 0 && set_bytes <= l2) {
+      nvtx3::scoped_range vr{"dynfilter::build_in_list"};
+      auto const key_only = cudf::table_view{std::vector<cudf::column_view>{col}};
+      auto distinct       = cudf::stable_distinct(key_only,
+                                            std::vector<cudf::size_type>{0},
+                                            cudf::duplicate_keep_option::KEEP_ANY,
+                                            cudf::null_equality::EQUAL,
+                                            cudf::nan_equality::ALL_EQUAL,
+                                            stream,
+                                            allocator_ref);
+      auto cols           = distinct->release();
+      per_key_membership[k] =
+        std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(std::move(cols.front()));
+      choice = "in_list";
+    } else if (l2 > 0 && sirius::op::sirius_dynamic_bloom_filter::supports(col.type()) &&
+               bloom_bytes <= l2) {
+      nvtx3::scoped_range vr{"dynfilter::build_bloom"};
+      per_key_membership[k] =
+        std::make_shared<sirius::op::sirius_dynamic_bloom_filter>(col, stream, allocator_ref);
+      choice = "bloom";
+    }
+    SIRIUS_LOG_DEBUG(
+      "[sirius_physical_hash_join] dynamic filter key {}: build_rows={} zone_map={} membership: "
+      "in_list_set={}B bloom={}B L2={}B -> {}",
+      k,
+      n,
+      per_key_zone_map[k] ? "yes" : "no",
+      set_bytes,
+      bloom_bytes,
+      l2,
+      choice);
+  }
+
+  // Fan out across probe targets. Per-target column count matches join_condition by DuckDB's
+  // construction; the zone-map and the membership filter (each when present) publish for the probe
+  // column and ride their own consumer paths.
+  std::size_t total_pushed = 0;
+  for (auto const& tgt : probe_targets) {
+    // Purely defensive min guard.
+    auto const n = std::min(tgt.probe_col_idx.size(), per_key_membership.size());
+    for (std::size_t k = 0; k < n; ++k) {
+      if (per_key_zone_map[k]) {
+        tgt.filter_set->push_filter(tgt.probe_col_idx[k], per_key_zone_map[k]);
+        ++total_pushed;
+      }
+      if (per_key_membership[k]) {
+        tgt.filter_set->push_filter(tgt.probe_col_idx[k], per_key_membership[k]);
+        ++total_pushed;
+      }
+    }
+  }
+  SIRIUS_LOG_INFO(
+    "[sirius_physical_hash_join] Pushed {} dynamic filter(s) across {} target(s) "
+    "({} build rows, {} keys).",
+    total_pushed,
+    probe_targets.size(),
+    build_view.num_rows(),
+    filter_pushdown->join_condition.size());
+}
+
+void sirius_physical_hash_join::publish_dynamic_filters_locked(
+  std::optional<cudf::table_view> build_view, rmm::cuda_stream_view stream)
+{
+  // Caller holds op_state_mutex. Publish-once guard.
+  if (_dynamic_filters_published) { return; }
+  _dynamic_filters_published = true;
+
+  if (build_view.has_value() && filter_pushdown && !probe_targets.empty()) {
+    push_build_side_dynamic_filters(*build_view, stream);
+  }
+}
+
+void sirius_physical_hash_join::push_data_batch_partitioned(
+  std::string_view port_id,
+  std::shared_ptr<::cucascade::data_batch> batch,
+  std::size_t partition_idx)
+{
+  // Route the batch to the target port exactly as the base does.
+  sirius_physical_partition_consumer_operator::push_data_batch_partitioned(
+    port_id, batch, partition_idx);
+
+  //===----------Dynamic Table Filters----------===//
+  // Build-side dynamic-filter publish: the moment the (single, concat-folded) build batch arrives,
+  // compute and publish the zone-map filter from the build keys.
+  // This is the earliest point the filter can reach the concurrently-running probe scan so it
+  // prunes row groups at read. Only meaningful for the build port of a BUILD_PROBE join (which
+  // guarantees one folded build batch).
+  if (port_id != "build" || !batch) { return; }
+
+  // NVTX covers lock acquisition + publish, so a long range here vs. the inner reduce/sync ranges
+  // exposes op_state_mutex contention with the probe-processing execute() path.
+  nvtx3::scoped_range nvtx_range{"dynfilter::publish_hook"};
+  std::lock_guard<std::mutex> lg(op_state_mutex);
+  if (_dynamic_filters_published) { return; }
+  // Skip non-BUILD_PROBE (multi-batch build → a single batch's min/max would be a wrong, partial
+  // bound) at this phase, and unwired joins.
+  if (_join_mode != HASH_JOIN_MODE::BUILD_PROBE || !filter_pushdown || probe_targets.empty()) {
+    return;
+  }
+
+  // If for any reason the build batch is not GPU-resident, skip
+  // and let the BUILT-transition publish handle it. However, as the batch was just produced by the
+  // build CONCAT, and the executor synchronized the task stream after that execute() before this
+  // sink runs, the batch should be fully materialized.
+  auto ro  = batch->to_read_only();
+  auto* ms = ro.get_data() ? ro.get_memory_space() : nullptr;
+  if (!ms || ro.get_current_tier() != ::cucascade::memory::Tier::GPU) { return; }
+
+  // Run the reduce. The (min,max) scalars are synchronized inside push_build_side_dynamic_filters
+  // via is_valid(stream), so they are fully materialized before any consumer reads them on its own
+  // stream.
+  publish_dynamic_filters_locked(sirius::get_cudf_table_view(ro), ms->acquire_stream());
+}
+
 void sirius_physical_hash_join::on_finalize_operator()
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
+
+  // Guarantee readiness is signalled (and filters published, if not already at the BUILT
+  // transition) for every wired channel — including non-BUILD_PROBE modes and builds that never
+  // reached BUILT — so a probe scan waiting on the channel is never left hanging. No stream is
+  // available at finalize; pass no build view (just mark readiness) since the actual publish has
+  // already happened at build delivery / the BUILT transition for any join that produces filters.
+  publish_dynamic_filters_locked(std::nullopt, rmm::cuda_stream_default);
+
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
     _hash_table.reset();
     _distinct_hash_table.reset();

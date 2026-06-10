@@ -133,6 +133,8 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("sort_sample_bytes", yaml::bytes(opt.sort_sample_bytes));
   r.optional("max_build_hash_table_bytes", yaml::bytes(opt.max_build_hash_table_bytes));
   r.optional("enable_gpu_duckdb_native_scan", opt.enable_gpu_duckdb_native_scan);
+  r.optional("enable_dynamic_filter_pushdown", opt.enable_dynamic_filter_pushdown);
+  r.optional("enable_dynamic_zone_map_filter", opt.enable_dynamic_zone_map_filter);
   r.reject_unknown();
 }
 

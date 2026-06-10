@@ -22,10 +22,12 @@
 #include <io/prefetching_cache.hpp>
 #include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
+#include <op/scan/dynamic_filter_merge.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/parquet_schema_mapping.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
+#include <op/sirius_dynamic_filter.hpp>
 #include <scan_manager/parquet_metadata.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 
@@ -134,6 +136,7 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(
   _approximate_batch_size = bind.approximate_batch_size;
   _max_file_processed     = bind.max_file_processed;
   _total_files            = _file_paths.size();
+  _sirius_dynamic_filters = bind.sirius_dynamic_filters;
 
   for (std::size_t start = 0; start < _total_files; start += _max_file_processed) {
     auto const end = std::min(start + _max_file_processed, _total_files);
@@ -522,6 +525,32 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
 //===----------------------------------------------------------------------===//
 // materialize_table — ports read_table_from_metadata
 //===----------------------------------------------------------------------===//
+std::unique_ptr<cudf::table> parquet_gpu_ingestible::apply_membership_filter(
+  std::unique_ptr<cudf::table> table, rmm::cuda_stream_view stream)
+{
+  static constexpr std::uint8_t kGateUnknown = 0, kGateActive = 1, kGateDisabled = 2;
+  static constexpr double kKeepThreshold = 0.5;  // disable if a split keeps > 50% of its rows
+  if (!_sirius_dynamic_filters || !_sirius_dynamic_filters->has_filters() ||
+      _membership_gate.load(std::memory_order_relaxed) == kGateDisabled) {
+    return table;
+  }
+  // Zone-maps are consumed as row-group pruning at read, so this applies only the membership kind.
+  auto const rows_before = table->num_rows();
+  table                  = apply_dynamic_filters_to_output_table(
+    std::move(table), *_sirius_dynamic_filters, *_plan, stream, /*include_ast_lowerable=*/false);
+  // The first split to finish records the keep ratio and disables the rest of the scan if the
+  // filter barely prunes, so a non-selective build can't regress the whole scan.
+  if (_membership_gate.load(std::memory_order_relaxed) == kGateUnknown && rows_before > 0) {
+    auto const kept = static_cast<double>(table->num_rows()) / static_cast<double>(rows_before);
+    _membership_gate.store(kept > kKeepThreshold ? kGateDisabled : kGateActive,
+                           std::memory_order_relaxed);
+    SIRIUS_LOG_DEBUG("[parquet_gpu_ingestible] Membership selectivity gate: kept {:.3f} -> {}.",
+                     kept,
+                     kept > kKeepThreshold ? "DISABLED" : "ACTIVE");
+  }
+  return table;
+}
+
 io::filtered_table parquet_gpu_ingestible::materialize_table(
   io::scan_info const& info,
   ::cucascade::memory::memory_space const& mem_space,
@@ -588,6 +617,45 @@ io::filtered_table parquet_gpu_ingestible::materialize_table(
     rg_per_src.push_back(slice.row_group_indices);
   }
   auto opts = *split.reader_options;
+
+  // Dynamic-filter row-group pruning: a dynamic join filter is redundant with the join that
+  // produced it, so it never removes individual rows — it only skips whole row groups whose stats
+  // rule out a join match, saving their I/O and decode. A no-op when nothing can be excluded (e.g.
+  // scattered keys), so an unprunable scan is never slowed; the static filter stays authoritative.
+  // The first split with row groups decides the gate: if it prunes nothing, the rest of the scan
+  // skips the check. has_filters() is a lock-free read of the published channel.
+  static constexpr std::uint8_t kZgUnknown = 0, kZgActive = 1, kZgDisabled = 2;
+  if (_sirius_dynamic_filters && _sirius_dynamic_filters->has_filters() &&
+      _zonemap_gate.load(std::memory_order_relaxed) != kZgDisabled) {
+    std::vector<cudf::io::parquet::FileMetaData const*> per_source_metadata;
+    per_source_metadata.reserve(split.rg_slices.size());
+    for (auto const& slice : split.rg_slices) {
+      per_source_metadata.push_back(slice.file_metadata.get());
+    }
+    std::size_t total_before = 0;
+    for (auto const& v : rg_per_src) {
+      total_before += v.size();
+    }
+    std::size_t pruned = 0;
+    rg_per_src         = prune_row_groups_by_dynamic_filters(
+      per_source_metadata, rg_per_src, opts, *_sirius_dynamic_filters, *split.plan, stream, pruned);
+    if (_zonemap_gate.load(std::memory_order_relaxed) == kZgUnknown && total_before > 0) {
+      _zonemap_gate.store(pruned > 0 ? kZgActive : kZgDisabled, std::memory_order_relaxed);
+      SIRIUS_LOG_DEBUG("[parquet_gpu_ingestible] Zone-map row-group gate: pruned {}/{} -> {}.",
+                       pruned,
+                       total_before,
+                       pruned > 0 ? "ACTIVE" : "DISABLED");
+    }
+    if (pruned > 0) {
+      SIRIUS_LOG_INFO(
+        "[parquet_gpu_ingestible] Dynamic-filter row-group pruning: {} -> {} row groups "
+        "(pruned {}).",
+        total_before,
+        total_before - pruned,
+        pruned);
+    }
+  }
+
   opts.set_row_groups(std::move(rg_per_src));
 
   // Per-task AST translation. set_filter is gated on translation success AND on
@@ -649,6 +717,12 @@ io::filtered_table parquet_gpu_ingestible::materialize_table(
       "[parquet_gpu_ingestible::materialize_table] Assembled inline on reader-side pushdown path.");
   }
 
+  // Apply the membership filter once the table is in output layout. When assembly is still pending
+  // (deferred to post_filter_and_project) this skips it and that call applies it instead.
+  if (!split.needs_assembly || state == io::filter_state::ROW_FILTERED_AND_PROJECTED) {
+    table = apply_membership_filter(std::move(table), stream);
+  }
+
   return io::filtered_table{std::move(table), state};
 }
 
@@ -668,6 +742,9 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
   auto out = assemble_scan_output(*_plan, std::move(input), pf.partition_values, stream);
   SIRIUS_LOG_DEBUG(
     "[parquet_gpu_ingestible::post_filter_and_project] Assembled scan output to plan layout.");
+  // Membership apply on the assembled output-layout table; also covers cached/pinned scans, whose
+  // final table is produced here.
+  out = apply_membership_filter(std::move(out), stream);
   return out;
 }
 

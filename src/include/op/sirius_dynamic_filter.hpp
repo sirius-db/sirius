@@ -19,10 +19,17 @@
 // cudf
 #include <cudf/ast/ast_operator.hpp>
 #include <cudf/ast/expressions.hpp>
+#include <cudf/column/column.hpp>
+#include <cudf/column/column_view.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/types.hpp>
 
+// rmm
+#include <rmm/cuda_stream_view.hpp>
+#include <rmm/resource_ref.hpp>
+
 // standard library
+#include <atomic>
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -38,7 +45,7 @@ namespace sirius::op {
  * Extend this enum as new filter kinds (bloom, IN-list, etc.) are added in later phases.
  * See @c docs/super-sirius/dynamic-filters.md for the staged rollout.
  */
-enum class sirius_dynamic_filter_kind { ZONE_MAP };
+enum class sirius_dynamic_filter_kind { ZONE_MAP, IN_LIST, BLOOM };
 
 //===----------------------------------------------------------------------===//
 // sirius_dynamic_filter
@@ -168,6 +175,132 @@ class sirius_dynamic_zone_map_filter final : public sirius_dynamic_filter,
 };
 
 //===----------------------------------------------------------------------===//
+// Runtime-apply mix-in
+//===----------------------------------------------------------------------===//
+/**
+ * @brief Capability mixin: filter can compute a per-row BOOL keep-mask over a probe column.
+ *
+ * For filter kinds whose predicate cannot be (cheaply) expressed as a cuDF AST — notably set
+ * membership (IN-list, bloom) — the consumer applies them at runtime: it calls @ref compute_mask
+ * with the materialized probe column and drops rows where the result is false via
+ * @c cudf::apply_boolean_mask. This is distinct from @ref sirius_ast_lowerable (which feeds the
+ * parquet reader's @c set_filter and row-group stats pruning); a filter may implement either, both,
+ * or — for membership — only this one.
+ */
+class sirius_apply_lowerable {
+ public:
+  virtual ~sirius_apply_lowerable() = default;
+
+  /**
+   * @brief Compute a BOOL8 keep-mask: @c true where @p probe's value passes this filter.
+   *
+   * @param probe  The materialized probe column to test (size == output rows).
+   * @param stream Stream the work and result are ordered on.
+   * @param mr     Allocator for the result.
+   * @return A BOOL8 column of size @c probe.size() (true == keep the row), or @c nullptr if the
+   *         filter cannot apply to this column (e.g. a type mismatch) — the caller skips it.
+   */
+  [[nodiscard]] virtual std::unique_ptr<cudf::column> compute_mask(
+    cudf::column_view const& probe,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const = 0;
+};
+
+//===----------------------------------------------------------------------===//
+// sirius_dynamic_in_list_filter
+//===----------------------------------------------------------------------===//
+/**
+ * @brief Exact set-membership filter: keeps rows whose key is one of the build's distinct keys.
+ *
+ * Built from a hash-join build's distinct join keys (one device-resident column). Where the
+ * zone-map only captures the build keys' @c [min,max] range — useless when the keys are scattered
+ * across the domain (e.g. a selective dimension subset) — this tests exact membership, so it prunes
+ * exactly the rows the join would discard. It cannot be expressed as a cheap AST or row-group stats
+ * predicate, so it rides the @ref sirius_apply_lowerable path: a row-level @c cudf::contains probe
+ * applied post-decode. Intended for small-to-moderate key sets; larger builds use a bloom filter.
+ */
+class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
+                                            public sirius_apply_lowerable {
+ public:
+  /// @param keys The build's distinct join keys (ownership transferred). Must be non-null; its type
+  ///             must match the probe column the filter is applied to (membership compares values).
+  explicit sirius_dynamic_in_list_filter(std::unique_ptr<cudf::column> keys);
+
+  [[nodiscard]] sirius_dynamic_filter_kind kind() const override
+  {
+    return sirius_dynamic_filter_kind::IN_LIST;
+  }
+
+  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(
+    cudf::column_view const& probe,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const override;
+
+  /// Number of distinct keys in the set.
+  [[nodiscard]] std::size_t size() const noexcept;
+
+  /// Estimated device footprint (bytes) of the @c cuco::static_set that @c cudf::contains builds
+  /// over an IN-list of @p num_keys keys of @p key_type — the structure that must stay L2-resident
+  /// for the per-row membership probe to run at cache bandwidth (capacity ≈ num_keys / load_factor
+  /// slots, each @c sizeof(key)). Consumed by the producer's L2-fit filter-kind policy.
+  [[nodiscard]] static std::size_t estimated_set_bytes(std::size_t num_keys,
+                                                       cudf::data_type key_type) noexcept;
+
+ private:
+  std::unique_ptr<cudf::column> _keys;
+};
+
+//===----------------------------------------------------------------------===//
+// sirius_dynamic_bloom_filter
+//===----------------------------------------------------------------------===//
+/**
+ * @brief Probabilistic set-membership filter backed by a GPU blocked Bloom filter (cuCollections).
+ *
+ * The scale-up of @ref sirius_dynamic_in_list_filter for *large* selective builds (e.g. a
+ * date-filtered @c orders, millions of keys) whose exact key set is too big to store and probe
+ * cheaply. A Bloom filter is a few bits per key and answers membership with no false negatives —
+ * false *positives* only let through a few extra rows, which is harmless because the join is
+ * authoritative. Applied row-level (post-decode) via the @ref sirius_apply_lowerable path.
+ *
+ * Implementation (the @c cuco::bloom_filter and its kernels) is hidden behind a PIMPL so this
+ * header stays compilable by the host toolchain; the definitions live in a @c .cu translation unit.
+ */
+class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
+                                          public sirius_apply_lowerable {
+ public:
+  /// Build a Bloom filter over the build's join keys. @p keys must be of a @ref supports type.
+  /// @throws std::invalid_argument if @c keys.type() is unsupported.
+  sirius_dynamic_bloom_filter(cudf::column_view const& keys,
+                              rmm::cuda_stream_view stream,
+                              rmm::device_async_resource_ref mr);
+  ~sirius_dynamic_bloom_filter() override;
+
+  sirius_dynamic_bloom_filter(sirius_dynamic_bloom_filter const&)            = delete;
+  sirius_dynamic_bloom_filter& operator=(sirius_dynamic_bloom_filter const&) = delete;
+
+  [[nodiscard]] sirius_dynamic_filter_kind kind() const override
+  {
+    return sirius_dynamic_filter_kind::BLOOM;
+  }
+
+  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(
+    cudf::column_view const& probe,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const override;
+
+  /// Whether a key/probe column of type @p t can back a Bloom filter (currently INT64 only).
+  [[nodiscard]] static bool supports(cudf::data_type t) noexcept;
+
+  /// Estimated device footprint (bytes) of the Bloom bit array for @p num_keys keys at this
+  /// filter's fixed bits-per-key budget. Consumed by the producer's L2-fit filter-kind policy.
+  [[nodiscard]] static std::size_t estimated_bytes(std::size_t num_keys) noexcept;
+
+ private:
+  struct impl;
+  std::unique_ptr<impl> _impl;
+};
+
+//===----------------------------------------------------------------------===//
 // sirius_dynamic_filter_set
 //===----------------------------------------------------------------------===//
 /**
@@ -180,6 +313,15 @@ class sirius_dynamic_zone_map_filter final : public sirius_dynamic_filter,
  * @note A producer pushes filters for the consumer's column index — i.e. the column index in the
  *       downstream operator's output schema, not the producer's. The plan-gen layer is
  *       responsible for translating between the two when wiring producers and consumers.
+ *
+ * ## Filter availability
+ *
+ * In Sirius the consumer (probe scan) executes *concurrently* with the producer (hash-join build):
+ * injected partition/concat pipelines decouple the probe scan from the join's build dependency, so
+ * a scan task may run before, during, or after the producing build finalizes. Consumption is
+ * opportunistic: a consumer cheaply tests whether any filter has arrived yet (@ref has_filters) and
+ * applies whatever is present when each split runs. A filter that publishes after a split was read
+ * simply does not prune it — correctness is unaffected because the join remains authoritative.
  */
 class sirius_dynamic_filter_set {
  public:
@@ -208,10 +350,24 @@ class sirius_dynamic_filter_set {
   /// True iff no filters have been pushed for any column.
   [[nodiscard]] bool empty() const;
 
+  //===--------------------------------------------------------------------===//
+  // Filter availability
+  //===--------------------------------------------------------------------===//
+
+  /// Lock-free fast path: true iff at least one filter has been pushed. Cheaper than
+  /// @ref empty (no lock) — the consumer's per-task hot check.
+  [[nodiscard]] bool has_filters() const noexcept
+  {
+    return _filter_count.load(std::memory_order_acquire) > 0;
+  }
+
  private:
   mutable std::mutex _mu;
   std::unordered_map<std::size_t, std::vector<std::shared_ptr<sirius_dynamic_filter const>>>
     _filters;
+
+  /// Total filters pushed across all columns; backs the lock-free @ref has_filters.
+  std::atomic<std::size_t> _filter_count{0};
 };
 
 /// Resolves a consumer column index to an AST expression already emplaced in the tree (typically

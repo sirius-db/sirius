@@ -1478,6 +1478,24 @@ static void SetEnableGpuDuckdbNativeScan(ClientContext& context, SetScope scope,
                    params->enable_gpu_duckdb_native_scan);
 }
 
+static void SetEnableDynamicFilterPushdown(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->enable_dynamic_filter_pushdown = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_FILTER_PUSHDOWN to {}",
+                   params->enable_dynamic_filter_pushdown);
+}
+
+static void SetEnableDynamicZoneMapFilter(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->enable_dynamic_zone_map_filter = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_ZONE_MAP_FILTER to {}",
+                   params->enable_dynamic_zone_map_filter);
+}
+
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 {
   // Add in config option for gpu buffer manager
@@ -1660,6 +1678,24 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::BOOLEAN,
     Value::BOOLEAN(sirius::operator_params{}.enable_gpu_duckdb_native_scan),
     SetEnableGpuDuckdbNativeScan);
+
+  config.AddExtensionOption(
+    "enable_dynamic_filter_pushdown",
+    "Wire dynamic table-filter pushdown: a hash-join build publishes a runtime membership filter "
+    "(IN-list / Bloom, chosen by L2-cache fit) into the probe-side scan to drop non-matching rows "
+    "before the join (off by default)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_filter_pushdown),
+    SetEnableDynamicFilterPushdown);
+
+  config.AddExtensionOption(
+    "enable_dynamic_zone_map_filter",
+    "Additionally emit a runtime zone-map (build-key min/max) for read-time row-group pruning at "
+    "the "
+    "probe scan; requires enable_dynamic_filter_pushdown (off by default)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_zone_map_filter),
+    SetEnableDynamicZoneMapFilter);
 }
 
 static void LoadInternal(ExtensionLoader& loader)

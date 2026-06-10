@@ -77,6 +77,18 @@ find_package(yaml-cpp REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
+
+# cuCollections (cuco): header-only, used by the dynamic Bloom filter. libcudf no longer ships its
+# bundled copy, so fetch the same commit cudf is built against. Header-only — populate the sources
+# without add_subdirectory (CCCL comes from cudf); only the include dir is consumed.
+include(FetchContent)
+FetchContent_Declare(
+  cuco
+  URL https://github.com/NVIDIA/cuCollections/archive/f517bbb1277753b1852dfd388993383e401eaa38.tar.gz
+  URL_HASH
+    SHA256=d17e2f6d58cfb2cd473efcbd741c633e7607717102cedc08173a4a69bb2a8ba9
+  SOURCE_SUBDIR do-not-build)
+FetchContent_MakeAvailable(cuco)
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
 pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
@@ -219,6 +231,7 @@ set(EXTENSION_SOURCES
     src/op/scan/duckdb_scan_task.cpp
     src/op/scan/equality_delete_filter.cpp
     src/op/scan/hive_partition.cpp
+    src/op/scan/dynamic_filter_merge.cpp
     src/op/scan/iceberg_avro_reader.cpp
     src/op/scan/iceberg_delete_pipeline.cpp
     src/op/scan/iceberg_metadata_reader.cpp
@@ -313,8 +326,13 @@ set(EXTENSION_SOURCES
 # cmake-format: on
 
 # Legacy Sirius — all legacy-specific config lives in src/legacy/CMakeLists.txt.
+# cuCollections (cuco) device code — used by the dynamic Bloom filter — requires nvcc's extended
+# device lambda and relaxed constexpr support.
+string(APPEND CMAKE_CUDA_FLAGS " --expt-extended-lambda --expt-relaxed-constexpr")
+
 # Deleting src/legacy/ cleanly removes legacy build support.
 set(CUDA_SOURCES
+    src/cuda/sirius_dynamic_bloom_filter.cu
     src/op/scan/equality_delete_mask.cu src/cuda/scan/gpu_decode_alp.cu
     src/cuda/scan/gpu_decode_bitpacking.cu src/cuda/scan/gpu_decode_rle.cu
     src/cuda/scan/gpu_decode_strings.cu src/cuda/scan/gpu_native_decode.cu)
@@ -356,6 +374,7 @@ foreach(_target sirius_extension sirius_loadable_extension)
     ${_target}
     PRIVATE
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
+      $<BUILD_INTERFACE:${cuco_SOURCE_DIR}/include>
       $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
   )
 

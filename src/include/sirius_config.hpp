@@ -77,6 +77,19 @@ struct operator_params {
   /// (sirius_gpu_duckdb_native_scan_operator) instead of the CPU fallback
   /// (sirius_physical_duckdb_scan). Off by default.
   bool enable_gpu_duckdb_native_scan = false;
+
+  /// Wire dynamic table-filter pushdown: a hash-join build publishes a runtime membership filter
+  /// (IN-list / Bloom, chosen by L2-cache fit) into the probe-side scan, which applies it
+  /// post-decode to drop non-matching rows before the join. Off by default; the master switch for
+  /// the feature.
+  bool enable_dynamic_filter_pushdown = false;
+
+  /// Additionally emit a runtime zone-map (build-key [min,max]) alongside the membership filter,
+  /// for READ-time row-group pruning at the probe scan. Off by default and requires
+  /// enable_dynamic_filter_pushdown: on TPC-H-shaped joins DuckDB's static transitive-predicate
+  /// pushdown already prunes range-derivable builds, and scattered keys prune nothing, so the
+  /// zone-map only pays off on clustered-keyset joins whose narrow key range is runtime-determined.
+  bool enable_dynamic_zone_map_filter = false;
 };
 
 struct telemetry_config {

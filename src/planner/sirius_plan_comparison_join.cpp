@@ -15,6 +15,7 @@
  */
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
@@ -26,10 +27,13 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/table_filter.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/to_duckdb.hpp"
 #include "expression/join_condition.hpp"
 #include "helper/type_conversions.hpp"
+#include "log/logging.hpp"
+#include "op/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -330,6 +334,31 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       op_params.max_build_hash_table_bytes);
     auto& hj      = join->Cast<sirius::op::sirius_physical_hash_join>();
     hj.join_stats = std::move(op.join_stats);
+
+    // --- Wire dynamic-filter producer targets ---
+    // For each downstream scan DuckDB has paired with this join, look up the shared channel by
+    // the DynamicTableFilterSet pointer (the route key) and stash it along with the per-key
+    // consumer column indices on the join. The producer push at finalize uses this to compute
+    // (min, max) per build key and fan it out across targets.
+    if (hj.filter_pushdown) {
+      hj.probe_targets.reserve(hj.filter_pushdown->probe_info.size());
+      for (auto const& pi : hj.filter_pushdown->probe_info) {
+        auto channel = get_or_create_dynamic_filter_channel(pi.dynamic_filters.get());
+        if (!channel) { continue; }
+        sirius::op::sirius_physical_hash_join::probe_target tgt{std::move(channel), {}};
+        tgt.probe_col_idx.reserve(pi.columns.size());
+        for (auto const& col : pi.columns) {
+          tgt.probe_col_idx.push_back(col.probe_column_index.column_index);
+        }
+        hj.probe_targets.push_back(std::move(tgt));
+      }
+      hj.emit_zone_map_filters = op_params.enable_dynamic_zone_map_filter;
+      if (!hj.probe_targets.empty()) {
+        SIRIUS_LOG_INFO(
+          "[sirius_plan_comparison_join] Wired hash join with {} dynamic-filter probe target(s).",
+          hj.probe_targets.size());
+      }
+    }
 
     // --- Detect build-side key uniqueness ---
     // Gate: only for pure equal conditions (not_distinct_from needs null_equality::EQUAL).

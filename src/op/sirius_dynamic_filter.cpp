@@ -20,6 +20,8 @@
 // cudf
 #include <cudf/ast/expressions.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>
+#include <cudf/search.hpp>
+#include <cudf/utilities/traits.hpp>
 #include <cudf/wrappers/timestamps.hpp>
 
 // standard library
@@ -158,14 +160,63 @@ cudf::ast::expression const& sirius_dynamic_zone_map_filter::to_ast(
 }
 
 //===----------------------------------------------------------------------===//
+// sirius_dynamic_in_list_filter
+//===----------------------------------------------------------------------===//
+sirius_dynamic_in_list_filter::sirius_dynamic_in_list_filter(std::unique_ptr<cudf::column> keys)
+  : _keys(std::move(keys))
+{
+  if (!_keys) {
+    throw std::invalid_argument("[sirius_dynamic_in_list_filter] keys column must be non-null.");
+  }
+}
+
+std::unique_ptr<cudf::column> sirius_dynamic_in_list_filter::compute_mask(
+  cudf::column_view const& probe,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr) const
+{
+  // cudf::contains requires matching dtypes. The producer skips keys whose type would need a cast,
+  // so this normally holds; guard defensively and decline (caller keeps every row) on a mismatch.
+  if (probe.type() != _keys->type()) { return nullptr; }
+  // BOOL8 column, true where probe value ∈ the build key set (a null key yields null → dropped by
+  // apply_boolean_mask, which is correct: a null key can never satisfy an equi-join).
+  return cudf::contains(_keys->view(), probe, stream, mr);
+}
+
+std::size_t sirius_dynamic_in_list_filter::size() const noexcept
+{
+  return static_cast<std::size_t>(_keys->size());
+}
+
+std::size_t sirius_dynamic_in_list_filter::estimated_set_bytes(std::size_t num_keys,
+                                                               cudf::data_type key_type) noexcept
+{
+  // cudf::contains builds a cuco::static_set over the haystack (these distinct keys) on every
+  // probe; its capacity is ~num_keys / load_factor slots, each the width of the key. That set — not
+  // the raw key column — is what the per-row membership lookups hit, so its footprint is what must
+  // fit in L2 for the probe to run at cache bandwidth.
+  constexpr double kSetLoadFactor = 0.5;  // cudf::contains' set occupancy (≈ capacity 2x)
+  std::size_t const slot          = cudf::is_fixed_width(key_type)
+                                      ? static_cast<std::size_t>(cudf::size_of(key_type))
+                                      : sizeof(std::int64_t);  // variable-width keys hash to ~8B slots
+  return static_cast<std::size_t>(static_cast<double>(num_keys) * static_cast<double>(slot) /
+                                  kSetLoadFactor);
+}
+
+//===----------------------------------------------------------------------===//
 // sirius_dynamic_filter_set
 //===----------------------------------------------------------------------===//
 void sirius_dynamic_filter_set::push_filter(std::size_t col_idx,
                                             std::shared_ptr<sirius_dynamic_filter const> f)
 {
   if (!f) { return; }
-  std::lock_guard<std::mutex> lk(_mu);
-  _filters[col_idx].push_back(std::move(f));
+  {
+    std::lock_guard<std::mutex> lk(_mu);
+    _filters[col_idx].push_back(std::move(f));
+  }
+  // Release-store so a consumer that observes has_filters() (acquire) is guaranteed to then see the
+  // map write above when it re-locks _mu in filters_for_column().
+  _filter_count.fetch_add(1, std::memory_order_release);
 }
 
 std::vector<std::shared_ptr<sirius_dynamic_filter const>>
