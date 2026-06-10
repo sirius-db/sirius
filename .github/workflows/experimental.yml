@@ -17,6 +17,7 @@ on:
   pull_request:
     paths:
       - 'experimental/**'
+      - '.github/workflows/experimental.yml'
   merge_group:
 
 concurrency:
