@@ -273,6 +273,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_top_n.cpp
     src/pin_table.cpp
     src/scan_manager/gpu_ingestible_factory.cpp
+    src/scan_manager/round_robin_strategy.cpp
     src/scan_manager/sirius_scan_manager.cpp
     src/scan_manager/split_connector.cpp
     src/scan_manager/split_provider.cpp

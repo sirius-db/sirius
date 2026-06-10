@@ -28,6 +28,7 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "planner/query.hpp"
 #include "scan_manager/parquet_metadata.hpp"
+#include "scan_manager/round_robin_strategy.hpp"
 #include "scan_manager/split_connector.hpp"
 #include "scan_manager/split_provider.hpp"
 
@@ -43,7 +44,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <exception>
-#include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <utility>
@@ -212,6 +212,20 @@ void sirius_scan_manager::prepare_for_query(
                    query.get_pipelines().size(),
                    gpu_memory_spaces.size());
 
+  // Device placement for fresh-read scan splits. Snapshot the query's GPU set
+  // in a stable (sorted) order and build one round-robin strategy shared across
+  // every provider, so the walk spreads splits evenly over all GPUs across the
+  // whole scan stage instead of restarting per scan operator. A provider stamps
+  // the chosen device onto its splits' operating data; the task creator reads
+  // it back when building the pipeline task.
+  std::vector<int> device_ids;
+  device_ids.reserve(gpu_memory_spaces.size());
+  for (auto const& [device_id, space] : gpu_memory_spaces) {
+    device_ids.push_back(device_id);
+  }
+  std::sort(device_ids.begin(), device_ids.end());
+  auto round_robin = std::make_shared<round_robin_strategy>(std::move(device_ids));
+
   for (auto const& pipeline : query.get_pipelines()) {
     if (!pipeline) { continue; }
     auto source = pipeline->get_source();
@@ -233,6 +247,12 @@ void sirius_scan_manager::prepare_for_query(
     // ingestible by reference. enable_shared_from_this lets any consumer
     // promote to shared_ptr on demand.
     auto provider = std::make_unique<split_provider>(op->get_ingestible());
+    // Spread fresh-read splits across GPUs for every scan source — parquet and
+    // duckdb-native alike both emit non-resident scan_operator_input splits.
+    // Installing the strategy on every provider is safe: resident pinned-cache
+    // splits are left untouched by split_provider::apply_balancing's
+    // is_resident() guard, so their data-locality placement is preserved.
+    provider->set_balancing_strategy(round_robin, pipeline->get_pipeline_id());
     op->set_split_connector(std::make_unique<split_connector>());
     _providers_by_op.emplace(op, std::move(provider));
     _scan_op_order.push_back(op);

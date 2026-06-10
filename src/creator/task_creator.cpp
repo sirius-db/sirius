@@ -253,6 +253,14 @@ void task_creator::manager_loop()
           // ownership without relocating the object.
           {
             std::optional<int> preferred_device_id;
+            // Operating-data preference (highest priority): the scan manager
+            // round-robins fresh-read scan splits across the available GPUs and
+            // stamps the chosen device onto the split's operating data. Honor it
+            // first so each split's task lands on its assigned GPU; the locality
+            // heuristics below only run when no upstream preference was set.
+            if (local_state->_input_data) {
+              preferred_device_id = local_state->_input_data->get_preferred_device_id();
+            }
             // Partition affinity: if the input is tagged with a partition
             // index, pin the task to partition_idx % num_gpus.
             // Partition-based operators (hash_join, grouped_aggregate_merge,
@@ -264,7 +272,8 @@ void task_creator::manager_loop()
             // partitions across GPUs.
             if (auto* partitioned =
                   dynamic_cast<op::partitioned_operator_data*>(pipelineable_input);
-                partitioned && _sys_topology && !_sys_topology->gpus.empty()) {
+                !preferred_device_id.has_value() && partitioned && _sys_topology &&
+                !_sys_topology->gpus.empty()) {
               auto n_gpus         = _sys_topology->gpus.size();
               auto idx            = partitioned->get_partition_idx() % n_gpus;
               preferred_device_id = static_cast<int>(_sys_topology->gpus[idx].id);

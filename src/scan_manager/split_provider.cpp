@@ -17,6 +17,7 @@
 #include "scan_manager/split_provider.hpp"
 
 #include "op/sirius_physical_operator.hpp"
+#include "scan_manager/balancing_strategy.hpp"
 #include "scan_manager/split_connector.hpp"
 
 #include <utility>
@@ -27,6 +28,16 @@ void split_provider::push_to_connector(split_connector& connector,
                                        std::unique_ptr<op::operator_data> split)
 {
   connector.push_split(std::move(split));
+}
+
+void split_provider::apply_balancing(op::operator_data& split)
+{
+  if (!_balancing_strategy) { return; }
+  // Resident splits already live on a specific GPU; let downstream data
+  // locality decide their placement instead of overriding it here. Also
+  // respect a preference an upstream producer already set.
+  if (split.is_resident() || split.get_preferred_device_id().has_value()) { return; }
+  _balancing_strategy->get_next_gpu(_pipeline_id, split);
 }
 
 }  // namespace sirius::scan_manager
