@@ -191,6 +191,7 @@
       "cacheVariables": {
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/../vcpkg/scripts/buildsystems/vcpkg.cmake",
         "CPM_LOCAL_PACKAGES_ONLY": "ON",
+        "SIRIUS_BUILD_S3_TESTS": "OFF",
         "VCPKG_BUILD": "ON",
         "VCPKG_INSTALL_OPTIONS": "--clean-buildtrees-after-build",
         "VCPKG_MANIFEST_DIR": "${sourceDir}/.."
