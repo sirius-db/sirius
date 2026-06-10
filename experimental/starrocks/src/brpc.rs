@@ -1,4 +1,5 @@
 use std::{
+    mem::ManuallyDrop,
     net::{SocketAddr, TcpListener as StdTcpListener},
     thread::{self, JoinHandle},
 };
@@ -15,7 +16,7 @@ use tracing::{info, warn};
 
 /// Handle for the blocking BRPC listener thread.
 pub struct BrpcServer {
-    join_handle: Option<JoinHandle<Result<()>>>,
+    join_handle: JoinHandle<Result<()>>,
     shutdown: BrpcServerShutdown,
     local_addr: SocketAddr,
 }
@@ -37,11 +38,16 @@ impl BrpcServer {
     }
 
     /// Waits for the listener thread to exit.
-    pub fn join(mut self) -> Result<()> {
-        let join_handle = self
-            .join_handle
-            .take()
-            .context("BRPC server join handle was already consumed")?;
+    pub fn join(self) -> Result<()> {
+        let this = ManuallyDrop::new(self);
+        // SAFETY: `join` consumes `self`, wraps it in `ManuallyDrop` so `Drop`
+        // will not run, and reads each non-Copy field exactly once.
+        let join_handle = unsafe { std::ptr::read(&this.join_handle) };
+        // SAFETY: this is the matching single read of the shutdown token so it
+        // is dropped normally without requesting shutdown.
+        let shutdown = unsafe { std::ptr::read(&this.shutdown) };
+        drop(shutdown);
+
         join_handle
             .join()
             .map_err(|panic| anyhow!("BRPC server thread panicked: {panic:?}"))?
@@ -50,9 +56,7 @@ impl BrpcServer {
 
 impl Drop for BrpcServer {
     fn drop(&mut self) {
-        if self.join_handle.is_some() {
-            self.shutdown();
-        }
+        self.shutdown();
     }
 }
 
@@ -107,7 +111,7 @@ where
     let join_handle = thread::spawn(move || run_brpc_server(listener, server_shutdown, service));
 
     Ok(BrpcServer {
-        join_handle: Some(join_handle),
+        join_handle,
         shutdown,
         local_addr,
     })
