@@ -16,6 +16,7 @@ use tracing::info;
 /// PInternalService implementation that translates incoming plan fragments and logs Substrait.
 #[derive(Clone, Debug)]
 pub(crate) struct PlanFragmentTranslatorService {
+    /// Reusable StarRocks thrift-to-Substrait fragment translator.
     translator: PlanTranslator,
 }
 
@@ -39,8 +40,8 @@ impl PInternalService for PlanFragmentTranslatorService {
             match self
                 .translate_single_attachment(request.attachment_protocol.as_deref(), &attachment)
             {
-                Ok(()) => exec_plan_result(ok_status()),
-                Err(err) => exec_plan_result(internal_error(err)),
+                Ok(()) => Self::exec_plan_result(Self::ok_status()),
+                Err(err) => Self::exec_plan_result(Self::internal_error(err)),
             },
         )
     }
@@ -56,10 +57,10 @@ impl PInternalService for PlanFragmentTranslatorService {
                 .translate_batch_attachment(request.attachment_protocol.as_deref(), &attachment)
             {
                 Ok(()) => PExecBatchPlanFragmentsResult {
-                    status: Some(ok_status()),
+                    status: Some(Self::ok_status()),
                 },
                 Err(err) => PExecBatchPlanFragmentsResult {
-                    status: Some(internal_error(err)),
+                    status: Some(Self::internal_error(err)),
                 },
             },
         )
@@ -73,8 +74,8 @@ impl PlanFragmentTranslatorService {
         protocol: Option<&str>,
         attachment: &[u8],
     ) -> std::result::Result<(), String> {
-        ensure_binary_protocol(protocol)?;
-        let params = deserialize_binary::<TExecPlanFragmentParams>(attachment)
+        Self::ensure_binary_protocol(protocol)?;
+        let params = Self::deserialize_binary::<TExecPlanFragmentParams>(attachment)
             .map_err(|err| format!("failed to deserialize TExecPlanFragmentParams: {err}"))?;
         self.translate_and_log_fragment(&params)
     }
@@ -85,8 +86,8 @@ impl PlanFragmentTranslatorService {
         protocol: Option<&str>,
         attachment: &[u8],
     ) -> std::result::Result<(), String> {
-        ensure_binary_protocol(protocol)?;
-        let batch = deserialize_binary::<TExecBatchPlanFragmentsParams>(attachment)
+        Self::ensure_binary_protocol(protocol)?;
+        let batch = Self::deserialize_binary::<TExecBatchPlanFragmentsParams>(attachment)
             .map_err(|err| format!("failed to deserialize TExecBatchPlanFragmentsParams: {err}"))?;
         let common = batch
             .common_param
@@ -140,56 +141,56 @@ impl PlanFragmentTranslatorService {
         );
         Ok(())
     }
-}
 
-/// Deserializes a thrift struct using the StarRocks binary attachment protocol.
-fn deserialize_binary<T>(bytes: &[u8]) -> thrift::Result<T>
-where
-    T: TSerializable,
-{
-    let mut channel = TBufferChannel::with_capacity(bytes.len(), 0);
-    let bytes_copied = channel.set_readable_bytes(bytes);
-    if bytes_copied != bytes.len() {
-        return Err(thrift::Error::Application(thrift::ApplicationError::new(
-            thrift::ApplicationErrorKind::Unknown,
-            "failed to stage complete thrift payload".to_string(),
-        )));
+    /// Deserializes a thrift struct using the StarRocks binary attachment protocol.
+    fn deserialize_binary<T>(bytes: &[u8]) -> thrift::Result<T>
+    where
+        T: TSerializable,
+    {
+        let mut channel = TBufferChannel::with_capacity(bytes.len(), 0);
+        let bytes_copied = channel.set_readable_bytes(bytes);
+        if bytes_copied != bytes.len() {
+            return Err(thrift::Error::Application(thrift::ApplicationError::new(
+                thrift::ApplicationErrorKind::Unknown,
+                "failed to stage complete thrift payload".to_string(),
+            )));
+        }
+        let mut protocol = TBinaryInputProtocol::new(channel, true);
+        T::read_from_in_protocol(&mut protocol)
     }
-    let mut protocol = TBinaryInputProtocol::new(channel, true);
-    T::read_from_in_protocol(&mut protocol)
-}
 
-/// Rejects thrift attachment protocols that are not implemented by the Rust CN yet.
-fn ensure_binary_protocol(protocol: Option<&str>) -> std::result::Result<(), String> {
-    match protocol.unwrap_or("binary").to_ascii_lowercase().as_str() {
-        "binary" => Ok(()),
-        other => Err(format!(
-            "attachment protocol '{other}' is not supported yet; expected binary"
-        )),
+    /// Rejects thrift attachment protocols that are not implemented by the Rust CN yet.
+    fn ensure_binary_protocol(protocol: Option<&str>) -> std::result::Result<(), String> {
+        match protocol.unwrap_or("binary").to_ascii_lowercase().as_str() {
+            "binary" => Ok(()),
+            other => Err(format!(
+                "attachment protocol '{other}' is not supported yet; expected binary"
+            )),
+        }
     }
-}
 
-/// Builds the required single-fragment response wrapper around a StarRocks status.
-fn exec_plan_result(status: StatusPb) -> PExecPlanFragmentResult {
-    PExecPlanFragmentResult {
-        status,
-        closed_scan_nodes: Vec::new(),
+    /// Builds the required single-fragment response wrapper around a StarRocks status.
+    fn exec_plan_result(status: StatusPb) -> PExecPlanFragmentResult {
+        PExecPlanFragmentResult {
+            status,
+            closed_scan_nodes: Vec::new(),
+        }
     }
-}
 
-/// StarRocks OK status.
-fn ok_status() -> StatusPb {
-    StatusPb {
-        status_code: TStatusCode::OK.0,
-        error_msgs: Vec::new(),
+    /// StarRocks OK status.
+    fn ok_status() -> StatusPb {
+        StatusPb {
+            status_code: TStatusCode::OK.0,
+            error_msgs: Vec::new(),
+        }
     }
-}
 
-/// StarRocks INTERNAL_ERROR status carrying a user-visible error message.
-fn internal_error(message: impl Into<String>) -> StatusPb {
-    StatusPb {
-        status_code: TStatusCode::INTERNAL_ERROR.0,
-        error_msgs: vec![message.into()],
+    /// StarRocks INTERNAL_ERROR status carrying a user-visible error message.
+    fn internal_error(message: impl Into<String>) -> StatusPb {
+        StatusPb {
+            status_code: TStatusCode::INTERNAL_ERROR.0,
+            error_msgs: vec![message.into()],
+        }
     }
 }
 

@@ -57,6 +57,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// while keeping the generated API independent of HTTP/2 and gRPC framing.
 struct BrpcServiceGenerator;
 
+impl BrpcServiceGenerator {
+    /// Converts a protobuf method name into a Rust constant name.
+    fn const_name(proto_name: &str) -> String {
+        proto_name
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    }
+
+    /// Converts a protobuf method descriptor into a Rust enum variant name.
+    fn method_variant(method: &Method) -> String {
+        method.proto_name.to_upper_camel_case()
+    }
+}
+
 impl ServiceGenerator for BrpcServiceGenerator {
     /// Generates the StarRocks PInternalService interface and request router.
     fn generate(&mut self, service: Service, output: &mut String) {
@@ -78,7 +99,7 @@ impl ServiceGenerator for BrpcServiceGenerator {
         for method in &service.methods {
             output.push_str(&format!(
                 "        pub const {}: &str = {:?};\n",
-                const_name(&method.proto_name),
+                Self::const_name(&method.proto_name),
                 method.proto_name
             ));
         }
@@ -87,7 +108,7 @@ impl ServiceGenerator for BrpcServiceGenerator {
         output.push_str("    #[derive(Clone, Copy, Debug, Eq, PartialEq)]\n");
         output.push_str("    pub enum Method {\n");
         for method in &service.methods {
-            output.push_str(&format!("        {},\n", method_variant(method)));
+            output.push_str(&format!("        {},\n", Self::method_variant(method)));
         }
         output.push_str("    }\n");
 
@@ -98,7 +119,7 @@ impl ServiceGenerator for BrpcServiceGenerator {
             output.push_str(&format!(
                 "                {:?} => Some(Self::{}),\n",
                 method.proto_name,
-                method_variant(method)
+                Self::method_variant(method)
             ));
         }
         output.push_str("                _ => None,\n");
@@ -110,7 +131,7 @@ impl ServiceGenerator for BrpcServiceGenerator {
         for method in &service.methods {
             output.push_str(&format!(
                 "                Self::{} => {:?},\n",
-                method_variant(method),
+                Self::method_variant(method),
                 method.proto_name
             ));
         }
@@ -133,7 +154,7 @@ impl ServiceGenerator for BrpcServiceGenerator {
             ));
             output.push_str(&format!(
                 "            Err(crate::prpc::Error::method_not_implemented(methods::{}))\n",
-                const_name(&method.proto_name)
+                Self::const_name(&method.proto_name)
             ));
             output.push_str("        }\n");
         }
@@ -144,6 +165,7 @@ impl ServiceGenerator for BrpcServiceGenerator {
             "    pub(crate) struct {}Router<T> {{\n",
             service.name
         ));
+        output.push_str("        /// Shared concrete service implementation.\n");
         output.push_str("        inner: Arc<T>,\n");
         output.push_str("    }\n");
 
@@ -210,7 +232,7 @@ impl ServiceGenerator for BrpcServiceGenerator {
         for method in &service.methods {
             output.push_str(&format!(
                 "                Method::{} => Self::call_{}(inner, request.body, request.attachment).await,\n",
-                method_variant(method),
+                Self::method_variant(method),
                 method.name
             ));
         }
@@ -228,7 +250,7 @@ impl ServiceGenerator for BrpcServiceGenerator {
             ));
             output.push_str(&format!(
                 "                .map_err(|err| crate::prpc::Error::invalid_request(methods::{}, err))?;\n",
-                const_name(&method.proto_name)
+                Self::const_name(&method.proto_name)
             ));
             output.push_str(&format!(
                 "            let response = inner.{}(request, attachment).await?;\n",
@@ -241,23 +263,4 @@ impl ServiceGenerator for BrpcServiceGenerator {
         output.push_str("    }\n");
         output.push_str("}\n");
     }
-}
-
-/// Converts a protobuf method name into a Rust constant name.
-fn const_name(proto_name: &str) -> String {
-    proto_name
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-/// Converts a protobuf method descriptor into a Rust enum variant name.
-fn method_variant(method: &Method) -> String {
-    method.proto_name.to_upper_camel_case()
 }

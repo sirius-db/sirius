@@ -70,7 +70,9 @@ impl Response {
 /// PRPC-level error, separate from StarRocks StatusPB method failures.
 #[derive(Clone, Debug)]
 pub(crate) struct Error {
+    /// BRPC/PRPC error code returned in response metadata.
     code: i32,
+    /// Human-readable error text returned in response metadata.
     text: String,
 }
 
@@ -123,8 +125,11 @@ impl std::error::Error for Error {}
 /// Raw PRPC frame after the 12-byte TCP header has been decoded.
 #[derive(Debug)]
 pub(crate) struct Frame {
+    /// BRPC metadata protobuf decoded from the frame prefix.
     meta: RpcMeta,
+    /// Protobuf-encoded RPC request or response body.
     body: Vec<u8>,
+    /// Optional raw attachment bytes following the protobuf body.
     attachment: Vec<u8>,
 }
 
@@ -216,171 +221,171 @@ impl Frame {
             attachment,
         }
     }
-}
 
-/// Reads one PRPC frame from a stream, returning `None` on normal connection close.
-#[cfg(test)]
-pub(crate) fn read_frame(stream: &mut impl Read) -> Result<Option<Frame>> {
-    let mut header = [0u8; PRPC_HEAD_SIZE];
-    match stream.read_exact(&mut header) {
-        Ok(()) => {}
-        Err(err)
-            if matches!(
-                err.kind(),
-                io::ErrorKind::UnexpectedEof
-                    | io::ErrorKind::ConnectionReset
-                    | io::ErrorKind::ConnectionAborted
-            ) =>
-        {
-            return Ok(None);
+    /// Reads one PRPC frame from a stream, returning `None` on normal connection close.
+    #[cfg(test)]
+    pub(crate) fn read(stream: &mut impl Read) -> Result<Option<Self>> {
+        let mut header = [0u8; PRPC_HEAD_SIZE];
+        match stream.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(err) => return Err(err).context("failed to read PRPC header"),
         }
-        Err(err) => return Err(err).context("failed to read PRPC header"),
+
+        let sizes = FrameSizes::parse_header(&header)?;
+        let mut payload = vec![0u8; sizes.message_size];
+        stream
+            .read_exact(&mut payload)
+            .context("failed to read PRPC body")?;
+        Self::decode_payload(sizes.meta_size, payload).map(Some)
     }
 
-    let sizes = frame_sizes(&header)?;
-    let mut payload = vec![0u8; sizes.message_size];
-    stream
-        .read_exact(&mut payload)
-        .context("failed to read PRPC body")?;
-    decode_payload(sizes.meta_size, payload).map(Some)
-}
-
-/// Reads one PRPC frame from an async stream, returning `None` on normal connection close.
-pub(crate) async fn read_frame_async(
-    stream: &mut (impl AsyncRead + Unpin),
-) -> Result<Option<Frame>> {
-    let mut header = [0u8; PRPC_HEAD_SIZE];
-    match stream.read_exact(&mut header).await {
-        Ok(_) => {}
-        Err(err)
-            if matches!(
-                err.kind(),
-                io::ErrorKind::UnexpectedEof
-                    | io::ErrorKind::ConnectionReset
-                    | io::ErrorKind::ConnectionAborted
-            ) =>
-        {
-            return Ok(None);
+    /// Reads one PRPC frame from an async stream, returning `None` on normal connection close.
+    pub(crate) async fn read_async(stream: &mut (impl AsyncRead + Unpin)) -> Result<Option<Self>> {
+        let mut header = [0u8; PRPC_HEAD_SIZE];
+        match stream.read_exact(&mut header).await {
+            Ok(_) => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(err) => return Err(err).context("failed to read PRPC header"),
         }
-        Err(err) => return Err(err).context("failed to read PRPC header"),
+
+        let sizes = FrameSizes::parse_header(&header)?;
+        let mut payload = vec![0u8; sizes.message_size];
+        stream
+            .read_exact(&mut payload)
+            .await
+            .context("failed to read PRPC body")?;
+        Self::decode_payload(sizes.meta_size, payload).map(Some)
     }
 
-    let sizes = frame_sizes(&header)?;
-    let mut payload = vec![0u8; sizes.message_size];
-    stream
-        .read_exact(&mut payload)
-        .await
-        .context("failed to read PRPC body")?;
-    decode_payload(sizes.meta_size, payload).map(Some)
+    /// Writes this encoded PRPC frame to an async stream.
+    pub(crate) async fn write_async(&self, stream: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
+        let bytes = self.encode();
+        stream
+            .write_all(&bytes)
+            .await
+            .context("failed to write PRPC response")?;
+        stream
+            .flush()
+            .await
+            .context("failed to flush PRPC response")?;
+        Ok(())
+    }
+
+    /// Encodes this PRPC frame as `PRPC` magic, message size, metadata size, and body.
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut meta = self.meta.clone();
+        meta.attachment_size = Some(self.attachment.len().min(i32::MAX as usize) as i32);
+        let meta_bytes = meta.encode_to_vec();
+        let message_size = meta_bytes.len() + self.body.len() + self.attachment.len();
+
+        let mut bytes = Vec::with_capacity(PRPC_HEAD_SIZE + message_size);
+        bytes.extend_from_slice(PRPC_MAGIC);
+        bytes.extend_from_slice(&(message_size as i32).to_be_bytes());
+        bytes.extend_from_slice(&(meta_bytes.len() as i32).to_be_bytes());
+        bytes.extend_from_slice(&meta_bytes);
+        bytes.extend_from_slice(&self.body);
+        bytes.extend_from_slice(&self.attachment);
+        bytes
+    }
+
+    /// Decodes a complete PRPC payload after the fixed header has been parsed.
+    fn decode_payload(meta_size: usize, payload: Vec<u8>) -> Result<Self> {
+        let message_size = payload.len();
+        let meta =
+            RpcMeta::decode(&payload[..meta_size]).context("failed to decode PRPC metadata")?;
+
+        if meta.compress_type.unwrap_or(0) != 0 {
+            return Err(anyhow!(
+                "compressed PRPC payloads are not supported by the Rust CN"
+            ));
+        }
+        if meta.chunk_info.is_some() {
+            return Err(anyhow!(
+                "chunked PRPC payloads are not supported by the Rust CN"
+            ));
+        }
+        if meta.stream_settings.is_some() {
+            return Err(anyhow!(
+                "streaming PRPC payloads are not supported by the Rust CN"
+            ));
+        }
+
+        let attachment_size = meta.attachment_size.unwrap_or(0);
+        if attachment_size < 0 {
+            return Err(anyhow!("negative PRPC attachment size"));
+        }
+        let attachment_size = attachment_size as usize;
+        let body_size = message_size - meta_size;
+        if attachment_size > body_size {
+            return Err(anyhow!("PRPC attachment size exceeds payload size"));
+        }
+
+        let body_start = meta_size;
+        let body_end = message_size - attachment_size;
+        let body = payload[body_start..body_end].to_vec();
+        let attachment = payload[body_end..].to_vec();
+
+        Ok(Self {
+            meta,
+            body,
+            attachment,
+        })
+    }
 }
 
 /// Decoded payload sizes from the fixed PRPC header.
 struct FrameSizes {
+    /// Total payload bytes following the fixed 12-byte header.
     message_size: usize,
+    /// Bytes occupied by the metadata protobuf at the start of the payload.
     meta_size: usize,
 }
 
-/// Validates a PRPC header and extracts body sizes.
-fn frame_sizes(header: &[u8; PRPC_HEAD_SIZE]) -> Result<FrameSizes> {
-    if &header[..4] != PRPC_MAGIC {
-        return Err(anyhow!("invalid PRPC magic code"));
+impl FrameSizes {
+    /// Validates a PRPC header and extracts body sizes.
+    fn parse_header(header: &[u8; PRPC_HEAD_SIZE]) -> Result<Self> {
+        if &header[..4] != PRPC_MAGIC {
+            return Err(anyhow!("invalid PRPC magic code"));
+        }
+
+        let message_size = i32::from_be_bytes(header[4..8].try_into().unwrap());
+        let meta_size = i32::from_be_bytes(header[8..12].try_into().unwrap());
+        if message_size < 0 || meta_size < 0 {
+            return Err(anyhow!("negative PRPC message size"));
+        }
+        let message_size = message_size as usize;
+        let meta_size = meta_size as usize;
+        if message_size > MAX_PRPC_MESSAGE_SIZE {
+            return Err(anyhow!("PRPC message exceeds maximum size"));
+        }
+        if meta_size > message_size {
+            return Err(anyhow!("PRPC meta size exceeds message size"));
+        }
+
+        Ok(Self {
+            message_size,
+            meta_size,
+        })
     }
-
-    let message_size = i32::from_be_bytes(header[4..8].try_into().unwrap());
-    let meta_size = i32::from_be_bytes(header[8..12].try_into().unwrap());
-    if message_size < 0 || meta_size < 0 {
-        return Err(anyhow!("negative PRPC message size"));
-    }
-    let message_size = message_size as usize;
-    let meta_size = meta_size as usize;
-    if message_size > MAX_PRPC_MESSAGE_SIZE {
-        return Err(anyhow!("PRPC message exceeds maximum size"));
-    }
-    if meta_size > message_size {
-        return Err(anyhow!("PRPC meta size exceeds message size"));
-    }
-
-    Ok(FrameSizes {
-        message_size,
-        meta_size,
-    })
-}
-
-/// Decodes a complete PRPC payload after the fixed header has been parsed.
-fn decode_payload(meta_size: usize, payload: Vec<u8>) -> Result<Frame> {
-    let message_size = payload.len();
-    let meta = RpcMeta::decode(&payload[..meta_size]).context("failed to decode PRPC metadata")?;
-
-    if meta.compress_type.unwrap_or(0) != 0 {
-        return Err(anyhow!(
-            "compressed PRPC payloads are not supported by the Rust CN"
-        ));
-    }
-    if meta.chunk_info.is_some() {
-        return Err(anyhow!(
-            "chunked PRPC payloads are not supported by the Rust CN"
-        ));
-    }
-    if meta.stream_settings.is_some() {
-        return Err(anyhow!(
-            "streaming PRPC payloads are not supported by the Rust CN"
-        ));
-    }
-
-    let attachment_size = meta.attachment_size.unwrap_or(0);
-    if attachment_size < 0 {
-        return Err(anyhow!("negative PRPC attachment size"));
-    }
-    let attachment_size = attachment_size as usize;
-    let body_size = message_size - meta_size;
-    if attachment_size > body_size {
-        return Err(anyhow!("PRPC attachment size exceeds payload size"));
-    }
-
-    let body_start = meta_size;
-    let body_end = message_size - attachment_size;
-    let body = payload[body_start..body_end].to_vec();
-    let attachment = payload[body_end..].to_vec();
-
-    Ok(Frame {
-        meta,
-        body,
-        attachment,
-    })
-}
-
-/// Writes one encoded PRPC frame to an async stream.
-pub(crate) async fn write_frame_async(
-    stream: &mut (impl AsyncWrite + Unpin),
-    frame: &Frame,
-) -> Result<()> {
-    let bytes = encode_frame(frame);
-    stream
-        .write_all(&bytes)
-        .await
-        .context("failed to write PRPC response")?;
-    stream
-        .flush()
-        .await
-        .context("failed to flush PRPC response")?;
-    Ok(())
-}
-
-/// Encodes a PRPC frame as `PRPC` magic, message size, metadata size, and body.
-pub(crate) fn encode_frame(frame: &Frame) -> Vec<u8> {
-    let mut meta = frame.meta.clone();
-    meta.attachment_size = Some(frame.attachment.len().min(i32::MAX as usize) as i32);
-    let meta_bytes = meta.encode_to_vec();
-    let message_size = meta_bytes.len() + frame.body.len() + frame.attachment.len();
-
-    let mut bytes = Vec::with_capacity(PRPC_HEAD_SIZE + message_size);
-    bytes.extend_from_slice(PRPC_MAGIC);
-    bytes.extend_from_slice(&(message_size as i32).to_be_bytes());
-    bytes.extend_from_slice(&(meta_bytes.len() as i32).to_be_bytes());
-    bytes.extend_from_slice(&meta_bytes);
-    bytes.extend_from_slice(&frame.body);
-    bytes.extend_from_slice(&frame.attachment);
-    bytes
 }
 
 #[cfg(test)]
@@ -405,12 +410,12 @@ mod tests {
             Some(42),
         );
 
-        let bytes = encode_frame(&request);
+        let bytes = request.encode();
         let server = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = server.local_addr().unwrap();
         let join = thread::spawn(move || {
             let (mut stream, _) = server.accept().unwrap();
-            read_frame(&mut stream).unwrap().unwrap()
+            Frame::read(&mut stream).unwrap().unwrap()
         });
         let mut client = TcpStream::connect(addr).unwrap();
         client.write_all(&bytes).unwrap();

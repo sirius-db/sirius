@@ -46,41 +46,53 @@ type HeartbeatProcessor = HeartbeatServiceSyncProcessor<ComputeNodeHeartbeatHand
 
 const COMPUTE_NODE_PROC_PATH: &str = "/compute_nodes";
 
+/// Non-empty host string accepted by StarRocks FE and CN configuration.
 #[derive(Clone, Eq, PartialEq, Hash)]
-pub struct Host(String);
+pub struct Host {
+    /// Hostname or IP address text used in StarRocks-facing network metadata.
+    value: String,
+}
 
 impl Host {
+    /// Creates a host value after rejecting empty or whitespace-only input.
     pub fn new(value: impl Into<String>) -> std::result::Result<Self, HostParseError> {
         let value = value.into();
         if value.trim().is_empty() {
             Err(HostParseError)
         } else {
-            Ok(Self(value))
+            Ok(Self { value })
         }
     }
 
+    /// Returns the loopback host used by local StarRocks defaults.
     pub fn local() -> Self {
-        Self("127.0.0.1".to_string())
+        Self {
+            value: "127.0.0.1".to_string(),
+        }
     }
 
+    /// Returns the wildcard bind host used by local listeners.
     pub fn unspecified() -> Self {
-        Self("0.0.0.0".to_string())
+        Self {
+            value: "0.0.0.0".to_string(),
+        }
     }
 
+    /// Borrows the underlying host string.
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.value
     }
 }
 
 impl fmt::Debug for Host {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_tuple("Host").field(&self.0).finish()
+        formatter.debug_tuple("Host").field(&self.value).finish()
     }
 }
 
 impl fmt::Display for Host {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(&self.value)
     }
 }
 
@@ -92,20 +104,29 @@ impl FromStr for Host {
     }
 }
 
+/// Parse error returned for an empty host string.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 #[error("host must not be empty")]
 pub struct HostParseError;
 
+/// Secret CLI/config string that redacts its debug representation.
 #[derive(Clone, Default, Eq, PartialEq)]
-pub struct SecretString(String);
+pub struct SecretString {
+    /// Sensitive text kept out of debug output.
+    value: String,
+}
 
 impl SecretString {
+    /// Wraps a secret string without validation.
     pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+        Self {
+            value: value.into(),
+        }
     }
 
+    /// Exposes the raw secret for APIs that need plaintext credentials.
     pub fn expose_secret(&self) -> &str {
-        &self.0
+        &self.value
     }
 }
 
@@ -123,24 +144,75 @@ impl FromStr for SecretString {
     }
 }
 
+/// Rust compute-node listener ports and StarRocks-facing advertised metadata.
 #[derive(Clone, Debug, clap::Args)]
 pub struct ComputeNodeConfig {
+    /// Local interface address for the Rust CN listeners.
     #[arg(long, default_value = "0.0.0.0")]
     pub bind_host: Host,
+    /// Hostname or IP address advertised to StarRocks FE.
     #[arg(long, default_value = "127.0.0.1")]
     pub advertise_host: Host,
+    /// Thrift heartbeat port expected by StarRocks FE.
     #[arg(long, default_value_t = 9050)]
     pub heartbeat_port: u16,
+    /// Legacy backend thrift port reported to FE metadata.
     #[arg(long = "thrift-port", default_value_t = 9060)]
     pub thrift_port: u16,
+    /// HTTP port reported to FE metadata.
     #[arg(long, default_value_t = 8040)]
     pub http_port: u16,
+    /// BRPC port used for PInternalService plan-fragment dispatch.
     #[arg(long, default_value_t = 8060)]
     pub brpc_port: u16,
+    /// Optional Arrow Flight SQL port reported to FE metadata.
     #[arg(long)]
     pub arrow_flight_port: Option<u16>,
-    #[arg(skip = default_compute_node_version())]
+    /// Version string advertised through StarRocks heartbeat responses.
+    #[arg(skip = ComputeNodeConfig::default_version())]
     pub version: String,
+}
+
+impl ComputeNodeConfig {
+    /// Returns the default version string advertised to StarRocks FE.
+    fn default_version() -> String {
+        format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+    }
+
+    /// Builds the StarRocks registration statement for this compute node.
+    fn registration_sql(&self) -> String {
+        format!(
+            "ALTER SYSTEM ADD COMPUTE NODE \"{}:{}\"",
+            self.advertise_host, self.heartbeat_port
+        )
+    }
+
+    /// Checks whether this compute node is present in FE's compute-node registry.
+    async fn is_registered_in(&self, conn: &mut mysql_async::Conn) -> Result<bool> {
+        let sql = format!("SHOW PROC '{COMPUTE_NODE_PROC_PATH}'");
+        let rows: Vec<Row> = conn
+            .query(sql)
+            .await
+            .context("failed to query FE compute node list")?;
+        let heartbeat_port = self.heartbeat_port.to_string();
+
+        for row in rows {
+            let host = row
+                .get::<String, _>("IP")
+                .or_else(|| row.get::<String, _>(1));
+            let port = row
+                .get::<String, _>("HeartbeatPort")
+                .or_else(|| row.get::<String, _>(2));
+
+            if host.as_deref() == Some(self.advertise_host.as_str())
+                && port.as_deref() == Some(heartbeat_port.as_str())
+            {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
 }
 
 impl Default for ComputeNodeConfig {
@@ -153,27 +225,24 @@ impl Default for ComputeNodeConfig {
             http_port: 8040,
             brpc_port: 8060,
             arrow_flight_port: None,
-            version: default_compute_node_version(),
+            version: Self::default_version(),
         }
     }
 }
 
-fn default_compute_node_version() -> String {
-    format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
-}
-
-fn compute_node_registration_sql(host: &Host, heartbeat_port: u16) -> String {
-    format!("ALTER SYSTEM ADD COMPUTE NODE \"{host}:{heartbeat_port}\"")
-}
-
+/// StarRocks FE connection settings used for compute-node registration.
 #[derive(Clone, Debug, clap::Args)]
 pub struct FeConfig {
+    /// StarRocks FE MySQL protocol host.
     #[arg(long = "fe-host", default_value = "127.0.0.1")]
     pub host: Host,
+    /// StarRocks FE MySQL protocol query port.
     #[arg(long = "fe-query-port", default_value_t = 9030)]
     pub query_port: u16,
+    /// StarRocks FE user used for compute-node registration.
     #[arg(long = "fe-user", default_value = "root")]
     pub user: String,
+    /// StarRocks FE password used for compute-node registration.
     #[arg(long = "fe-password", default_value = "")]
     pub password: SecretString,
 }
@@ -189,34 +258,115 @@ impl Default for FeConfig {
     }
 }
 
+impl FeConfig {
+    /// Registers the compute node with this FE through the StarRocks MySQL protocol.
+    pub async fn register_compute_node(&self, node: &ComputeNodeConfig) -> Result<()> {
+        let opts = OptsBuilder::default()
+            .ip_or_hostname(self.host.to_string())
+            .tcp_port(self.query_port)
+            .prefer_socket(false)
+            .user(Some(self.user.clone()))
+            .pass(Some(self.password.expose_secret().to_string()));
+        let pool = Pool::new(opts);
+        let mut conn = pool.get_conn().await.with_context(|| {
+            format!(
+                "failed to connect to FE at {}:{}",
+                self.host, self.query_port
+            )
+        })?;
+
+        if node.is_registered_in(&mut conn).await? {
+            info!(
+                host = %node.advertise_host,
+                heartbeat_port = node.heartbeat_port,
+                "compute node is already registered with FE"
+            );
+            drop(conn);
+            pool.disconnect()
+                .await
+                .context("failed to disconnect FE MySQL pool")?;
+            return Ok(());
+        }
+
+        let sql = node.registration_sql();
+        info!(sql = %sql, "registering compute node with FE");
+        if let Err(err) = conn.query_drop(sql).await {
+            warn!(error = %err, "ALTER SYSTEM ADD COMPUTE NODE failed; checking whether compute node already exists");
+            if !node.is_registered_in(&mut conn).await? {
+                return Err(err).context("failed to register compute node with FE");
+            }
+        }
+
+        if !node.is_registered_in(&mut conn).await? {
+            bail!(
+                "FE accepted registration but compute node {}:{} was not found in SHOW PROC '{}'",
+                node.advertise_host,
+                node.heartbeat_port,
+                COMPUTE_NODE_PROC_PATH
+            );
+        }
+
+        info!(
+            host = %node.advertise_host,
+            heartbeat_port = node.heartbeat_port,
+            "compute node registration confirmed"
+        );
+        drop(conn);
+        pool.disconnect()
+            .await
+            .context("failed to disconnect FE MySQL pool")?;
+        Ok(())
+    }
+}
+
+/// Point-in-time copy of heartbeat state accepted from StarRocks FE.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HeartbeatStateSnapshot {
+    /// Cluster id accepted from the first FE heartbeat that supplies one.
     pub cluster_id: Option<types::TClusterId>,
+    /// FE token accepted from the first FE heartbeat that supplies one.
     pub token: Option<SecretString>,
+    /// Highest FE epoch accepted so far.
     pub epoch: Option<types::TEpoch>,
+    /// Compute-node id assigned by FE.
     pub compute_node_id: Option<i64>,
+    /// Wall-clock millisecond timestamp of the most recent accepted heartbeat.
     pub last_heartbeat_ms: Option<u128>,
 }
 
+/// Mutable heartbeat state protected by `SharedHeartbeatState`.
 #[derive(Debug, Default)]
 struct HeartbeatState {
+    /// Cluster id accepted from the first FE heartbeat that supplies one.
     cluster_id: Option<types::TClusterId>,
+    /// FE token accepted from the first FE heartbeat that supplies one.
     token: Option<SecretString>,
+    /// Highest FE epoch accepted so far.
     epoch: Option<types::TEpoch>,
+    /// Compute-node id assigned by FE.
     compute_node_id: Option<i64>,
+    /// Wall-clock millisecond timestamp of the most recent accepted heartbeat.
     last_heartbeat_ms: Option<u128>,
 }
 
+/// Shared heartbeat state updated by the thrift heartbeat handler.
 #[derive(Clone, Debug)]
-pub struct SharedHeartbeatState(Arc<Mutex<HeartbeatState>>);
+pub struct SharedHeartbeatState {
+    /// Shared mutable heartbeat state guarded for the thrift listener thread.
+    inner: Arc<Mutex<HeartbeatState>>,
+}
 
 impl SharedHeartbeatState {
+    /// Creates empty heartbeat state for a newly started compute node.
     pub fn new() -> Self {
-        Self(Arc::new(Mutex::new(HeartbeatState::default())))
+        Self {
+            inner: Arc::new(Mutex::new(HeartbeatState::default())),
+        }
     }
 
+    /// Captures the currently accepted FE heartbeat metadata.
     pub fn snapshot(&self) -> HeartbeatStateSnapshot {
-        let state = self.0.lock().expect("heartbeat state mutex poisoned");
+        let state = self.inner.lock().expect("heartbeat state mutex poisoned");
         HeartbeatStateSnapshot {
             cluster_id: state.cluster_id,
             token: state.token.clone(),
@@ -226,10 +376,11 @@ impl SharedHeartbeatState {
         }
     }
 
+    /// Returns how long ago the most recent accepted heartbeat arrived.
     pub fn last_heartbeat_elapsed(&self) -> Option<Duration> {
-        let state = self.0.lock().expect("heartbeat state mutex poisoned");
+        let state = self.inner.lock().expect("heartbeat state mutex poisoned");
         let last_heartbeat_ms = state.last_heartbeat_ms?;
-        let elapsed_ms = unix_time_millis().saturating_sub(last_heartbeat_ms);
+        let elapsed_ms = WallClock::unix_time_millis().saturating_sub(last_heartbeat_ms);
         Some(Duration::from_millis(
             elapsed_ms.min(u64::MAX as u128) as u64
         ))
@@ -242,20 +393,26 @@ impl Default for SharedHeartbeatState {
     }
 }
 
+/// Thrift heartbeat handler that reports this process as a StarRocks compute node.
 #[derive(Clone, Debug)]
 pub struct ComputeNodeHeartbeatHandler {
+    /// Static compute-node ports and advertised metadata.
     config: ComputeNodeConfig,
+    /// Shared heartbeat state updated after accepted FE heartbeats.
     state: SharedHeartbeatState,
+    /// Process start time reported as backend reboot time.
     reboot_time_secs: i64,
+    /// Hardware thread count reported to StarRocks FE.
     hardware_cores: i32,
 }
 
 impl ComputeNodeHeartbeatHandler {
+    /// Creates a heartbeat handler bound to static CN configuration and shared state.
     pub fn new(config: ComputeNodeConfig, state: SharedHeartbeatState) -> Self {
         Self {
             config,
             state,
-            reboot_time_secs: unix_time_secs(),
+            reboot_time_secs: WallClock::unix_time_secs(),
             hardware_cores: std::thread::available_parallelism()
                 .map(|parallelism| parallelism.get().min(i32::MAX as usize) as i32)
                 .unwrap_or(0),
@@ -277,7 +434,7 @@ impl ComputeNodeHeartbeatHandler {
 
         let mut state = self
             .state
-            .0
+            .inner
             .lock()
             .map_err(|_| HeartbeatError::StatePoisoned)?;
 
@@ -317,7 +474,7 @@ impl ComputeNodeHeartbeatHandler {
         if let Some(compute_node_id) = master_info.backend_id {
             state.compute_node_id = Some(compute_node_id);
         }
-        state.last_heartbeat_ms = Some(unix_time_millis());
+        state.last_heartbeat_ms = Some(WallClock::unix_time_millis());
 
         Ok(())
     }
@@ -337,8 +494,19 @@ impl ComputeNodeHeartbeatHandler {
             Some(self.config.arrow_flight_port.map(i32::from).unwrap_or(-1)),
         )
     }
+
+    /// Builds a successful StarRocks heartbeat status.
+    fn ok_status() -> TStatus {
+        TStatus::new(TStatusCode::OK, None)
+    }
+
+    /// Builds a failed StarRocks heartbeat status with the rejection reason.
+    fn error_status(message: String) -> TStatus {
+        TStatus::new(TStatusCode::INTERNAL_ERROR, Some(vec![message]))
+    }
 }
 
+/// Reasons a FE heartbeat can be rejected.
 #[derive(Debug, thiserror::Error)]
 enum HeartbeatError {
     #[error(
@@ -348,17 +516,24 @@ enum HeartbeatError {
     #[error(
         "FE heartbeat targeted this node as {received:?}; Sirius only supports StarRocks compute nodes"
     )]
-    UnexpectedNodeType { received: types::TNodeType },
+    UnexpectedNodeType {
+        /// Node type supplied by FE.
+        received: types::TNodeType,
+    },
     #[error("heartbeat state mutex poisoned")]
     StatePoisoned,
     #[error("stale FE epoch {received}, current epoch is {current}")]
     StaleEpoch {
+        /// FE epoch from the rejected heartbeat.
         received: types::TEpoch,
+        /// Highest accepted FE epoch.
         current: types::TEpoch,
     },
     #[error("cluster id changed from {current} to {received}")]
     ClusterChanged {
+        /// Cluster id supplied by the rejected heartbeat.
         received: types::TClusterId,
+        /// Cluster id accepted from previous heartbeats.
         current: types::TClusterId,
     },
     #[error("FE token changed")]
@@ -376,10 +551,10 @@ impl HeartbeatServiceSyncHandler for ComputeNodeHeartbeatHandler {
         );
 
         let status = match self.handle_master_info(&master_info) {
-            Ok(()) => ok_status(),
+            Ok(()) => Self::ok_status(),
             Err(err) => {
                 warn!(error = %err, "rejecting FE heartbeat");
-                error_status(err.to_string())
+                Self::error_status(err.to_string())
             }
         };
 
@@ -387,31 +562,148 @@ impl HeartbeatServiceSyncHandler for ComputeNodeHeartbeatHandler {
     }
 }
 
+/// Handle for the blocking thrift heartbeat listener thread.
 pub struct HeartbeatServer {
+    /// Dedicated thread running the blocking thrift heartbeat server.
     join_handle: Option<JoinHandle<Result<()>>>,
+    /// Shutdown handle used to wake the listener and close an active socket.
     shutdown: HeartbeatServerShutdown,
+    /// Address selected by the operating system after binding.
     local_addr: SocketAddr,
 }
 
 impl HeartbeatServer {
+    /// Starts the blocking thrift heartbeat server on a dedicated thread.
+    pub fn start(config: ComputeNodeConfig, state: SharedHeartbeatState) -> Result<Self> {
+        let listen_addr = format!("{}:{}", config.bind_host, config.heartbeat_port);
+        let listener = TcpListener::bind(&listen_addr)
+            .with_context(|| format!("failed to bind heartbeat Thrift server at {listen_addr}"))?;
+        let local_addr = listener
+            .local_addr()
+            .context("failed to read heartbeat Thrift server address")?;
+        let shutdown = HeartbeatServerShutdown::new(Self::listener_wake_addr(local_addr));
+        let server_shutdown = shutdown.clone();
+
+        info!(address = %local_addr, "starting heartbeat Thrift server");
+        let join_handle =
+            thread::spawn(move || Self::run(listener, config, state, server_shutdown));
+
+        Ok(Self {
+            join_handle: Some(join_handle),
+            shutdown,
+            local_addr,
+        })
+    }
+
+    /// Returns a cloneable shutdown handle for coordinating process shutdown.
     pub fn shutdown_handle(&self) -> HeartbeatServerShutdown {
         self.shutdown.clone()
     }
 
+    /// Requests listener and active-connection shutdown.
     pub fn shutdown(&self) {
         self.shutdown.shutdown();
     }
 
+    /// Returns the address the heartbeat listener bound to.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
+    /// Waits for the heartbeat listener thread to exit.
     pub fn join(mut self) -> Result<()> {
         let join_handle = self
             .join_handle
             .take()
             .context("heartbeat server join handle was already consumed")?;
-        join_heartbeat_thread(join_handle)
+        Self::join_thread(join_handle)
+    }
+
+    /// Runs the blocking thrift accept loop until shutdown is requested.
+    fn run(
+        listener: TcpListener,
+        config: ComputeNodeConfig,
+        state: SharedHeartbeatState,
+        shutdown: HeartbeatServerShutdown,
+    ) -> Result<()> {
+        let processor = Arc::new(HeartbeatServiceSyncProcessor::new(
+            ComputeNodeHeartbeatHandler::new(config, state),
+        ));
+
+        for stream in listener.incoming() {
+            if shutdown.is_requested() {
+                break;
+            }
+
+            match stream {
+                Ok(stream) => {
+                    if shutdown.is_requested() {
+                        break;
+                    }
+                    let active_connection = shutdown.track_connection(&stream)?;
+                    Self::handle_connection(processor.clone(), stream, active_connection)?;
+                    if shutdown.is_requested() {
+                        break;
+                    }
+                }
+                Err(_) if shutdown.is_requested() => break,
+                Err(err) => warn!(error = %err, "failed to accept heartbeat connection"),
+            }
+        }
+
+        shutdown.close_active_connection();
+        info!("heartbeat Thrift server stopped");
+        Ok(())
+    }
+
+    /// Processes thrift heartbeat messages on one accepted TCP connection.
+    fn handle_connection(
+        processor: Arc<HeartbeatProcessor>,
+        stream: TcpStream,
+        active_connection: ActiveConnectionGuard,
+    ) -> Result<()> {
+        let _active_connection = active_connection;
+        let channel = TTcpChannel::with_stream(stream);
+        let (read_channel, write_channel) = channel
+            .split()
+            .map_err(|err| anyhow!("failed to split heartbeat connection: {err}"))?;
+        let read_transport = TBufferedReadTransportFactory::new().create(Box::new(read_channel));
+        let write_transport = TBufferedWriteTransportFactory::new().create(Box::new(write_channel));
+        let mut input_protocol = TBinaryInputProtocolFactory::new().create(read_transport);
+        let mut output_protocol = TBinaryOutputProtocolFactory::new().create(write_transport);
+
+        loop {
+            match processor.process(&mut *input_protocol, &mut *output_protocol) {
+                Ok(()) => {}
+                Err(thrift::Error::Transport(err)) if err.kind == TransportErrorKind::EndOfFile => {
+                    return Ok(());
+                }
+                Err(err) => {
+                    warn!(error = %err, "heartbeat processor completed with error");
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// Joins the heartbeat server thread and converts a panic into an error.
+    fn join_thread(join_handle: JoinHandle<Result<()>>) -> Result<()> {
+        join_handle
+            .join()
+            .map_err(|panic| anyhow!("heartbeat server thread panicked: {panic:?}"))?
+    }
+
+    /// Returns a loopback address that can wake the listener from another thread.
+    fn listener_wake_addr(local_addr: SocketAddr) -> SocketAddr {
+        match local_addr.ip() {
+            IpAddr::V4(ip) if ip.is_unspecified() => {
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_addr.port())
+            }
+            IpAddr::V6(ip) if ip.is_unspecified() => {
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), local_addr.port())
+            }
+            _ => local_addr,
+        }
     }
 }
 
@@ -423,29 +715,36 @@ impl Drop for HeartbeatServer {
     }
 }
 
+/// Cloneable signal used to stop the heartbeat listener and active connection.
 #[derive(Clone)]
-pub struct HeartbeatServerShutdown(Arc<HeartbeatServerShutdownState>);
+pub struct HeartbeatServerShutdown {
+    /// Shared shutdown state for the blocking heartbeat listener.
+    inner: Arc<HeartbeatServerShutdownState>,
+}
 
 impl HeartbeatServerShutdown {
     fn new(wake_addr: SocketAddr) -> Self {
-        Self(Arc::new(HeartbeatServerShutdownState {
-            requested: AtomicBool::new(false),
-            active_connection: Arc::new(Mutex::new(None)),
-            wake_addr,
-        }))
+        Self {
+            inner: Arc::new(HeartbeatServerShutdownState {
+                requested: AtomicBool::new(false),
+                active_connection: Arc::new(Mutex::new(None)),
+                wake_addr,
+            }),
+        }
     }
 
+    /// Requests shutdown for the listener and any active connection.
     pub fn shutdown(&self) {
-        if self.0.requested.swap(true, Ordering::SeqCst) {
+        if self.inner.requested.swap(true, Ordering::SeqCst) {
             return;
         }
 
         self.close_active_connection();
-        let _ = TcpStream::connect(self.0.wake_addr);
+        let _ = TcpStream::connect(self.inner.wake_addr);
     }
 
     fn is_requested(&self) -> bool {
-        self.0.requested.load(Ordering::SeqCst)
+        self.inner.requested.load(Ordering::SeqCst)
     }
 
     fn track_connection(&self, stream: &TcpStream) -> Result<ActiveConnectionGuard> {
@@ -454,19 +753,19 @@ impl HeartbeatServerShutdown {
             .context("failed to clone heartbeat client connection")?;
 
         let mut active_connection = self
-            .0
+            .inner
             .active_connection
             .lock()
             .map_err(|_| anyhow!("active heartbeat connection mutex poisoned"))?;
         *active_connection = Some(shutdown_stream);
 
         Ok(ActiveConnectionGuard {
-            active_connection: self.0.active_connection.clone(),
+            active_connection: self.inner.active_connection.clone(),
         })
     }
 
     fn close_active_connection(&self) {
-        if let Ok(active_connection) = self.0.active_connection.lock()
+        if let Ok(active_connection) = self.inner.active_connection.lock()
             && let Some(connection) = active_connection.as_ref()
         {
             let _ = connection.shutdown(Shutdown::Both);
@@ -474,13 +773,19 @@ impl HeartbeatServerShutdown {
     }
 }
 
+/// Shared shutdown state observed by the blocking heartbeat listener.
 struct HeartbeatServerShutdownState {
+    /// True after shutdown has been requested.
     requested: AtomicBool,
+    /// Clone of the currently accepted socket, used to interrupt blocking reads.
     active_connection: Arc<Mutex<Option<TcpStream>>>,
+    /// Loopback address used to wake `TcpListener::incoming`.
     wake_addr: SocketAddr,
 }
 
+/// Guard that clears the tracked heartbeat connection when processing ends.
 struct ActiveConnectionGuard {
+    /// Shared slot cleared when connection handling returns.
     active_connection: Arc<Mutex<Option<TcpStream>>>,
 }
 
@@ -492,219 +797,39 @@ impl Drop for ActiveConnectionGuard {
     }
 }
 
+/// Starts the StarRocks thrift heartbeat server.
 pub fn start_heartbeat_server(
     config: ComputeNodeConfig,
     state: SharedHeartbeatState,
 ) -> Result<HeartbeatServer> {
-    let listen_addr = format!("{}:{}", config.bind_host, config.heartbeat_port);
-    let listener = TcpListener::bind(&listen_addr)
-        .with_context(|| format!("failed to bind heartbeat Thrift server at {listen_addr}"))?;
-    let local_addr = listener
-        .local_addr()
-        .context("failed to read heartbeat Thrift server address")?;
-    let shutdown = HeartbeatServerShutdown::new(listener_wake_addr(local_addr));
-    let server_shutdown = shutdown.clone();
-
-    info!(address = %local_addr, "starting heartbeat Thrift server");
-    let join_handle =
-        thread::spawn(move || run_heartbeat_server(listener, config, state, server_shutdown));
-
-    Ok(HeartbeatServer {
-        join_handle: Some(join_handle),
-        shutdown,
-        local_addr,
-    })
+    HeartbeatServer::start(config, state)
 }
 
-fn run_heartbeat_server(
-    listener: TcpListener,
-    config: ComputeNodeConfig,
-    state: SharedHeartbeatState,
-    shutdown: HeartbeatServerShutdown,
-) -> Result<()> {
-    let processor = Arc::new(HeartbeatServiceSyncProcessor::new(
-        ComputeNodeHeartbeatHandler::new(config, state),
-    ));
-
-    for stream in listener.incoming() {
-        if shutdown.is_requested() {
-            break;
-        }
-
-        match stream {
-            Ok(stream) => {
-                if shutdown.is_requested() {
-                    break;
-                }
-                let active_connection = shutdown.track_connection(&stream)?;
-                handle_heartbeat_connection(processor.clone(), stream, active_connection)?;
-                if shutdown.is_requested() {
-                    break;
-                }
-            }
-            Err(_) if shutdown.is_requested() => break,
-            Err(err) => warn!(error = %err, "failed to accept heartbeat connection"),
-        }
-    }
-
-    shutdown.close_active_connection();
-    info!("heartbeat Thrift server stopped");
-    Ok(())
-}
-
-fn handle_heartbeat_connection(
-    processor: Arc<HeartbeatProcessor>,
-    stream: TcpStream,
-    active_connection: ActiveConnectionGuard,
-) -> Result<()> {
-    let _active_connection = active_connection;
-    let channel = TTcpChannel::with_stream(stream);
-    let (read_channel, write_channel) = channel
-        .split()
-        .map_err(|err| anyhow!("failed to split heartbeat connection: {err}"))?;
-    let read_transport = TBufferedReadTransportFactory::new().create(Box::new(read_channel));
-    let write_transport = TBufferedWriteTransportFactory::new().create(Box::new(write_channel));
-    let mut input_protocol = TBinaryInputProtocolFactory::new().create(read_transport);
-    let mut output_protocol = TBinaryOutputProtocolFactory::new().create(write_transport);
-
-    loop {
-        match processor.process(&mut *input_protocol, &mut *output_protocol) {
-            Ok(()) => {}
-            Err(thrift::Error::Transport(err)) if err.kind == TransportErrorKind::EndOfFile => {
-                return Ok(());
-            }
-            Err(err) => {
-                warn!(error = %err, "heartbeat processor completed with error");
-                return Ok(());
-            }
-        }
-    }
-}
-
-fn join_heartbeat_thread(join_handle: JoinHandle<Result<()>>) -> Result<()> {
-    join_handle
-        .join()
-        .map_err(|panic| anyhow!("heartbeat server thread panicked: {panic:?}"))?
-}
-
-fn listener_wake_addr(local_addr: SocketAddr) -> SocketAddr {
-    match local_addr.ip() {
-        IpAddr::V4(ip) if ip.is_unspecified() => {
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_addr.port())
-        }
-        IpAddr::V6(ip) if ip.is_unspecified() => {
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), local_addr.port())
-        }
-        _ => local_addr,
-    }
-}
-
+/// Registers the compute node with StarRocks FE through the MySQL protocol.
 pub async fn register_node(fe: &FeConfig, node: &ComputeNodeConfig) -> Result<()> {
-    let opts = OptsBuilder::default()
-        .ip_or_hostname(fe.host.to_string())
-        .tcp_port(fe.query_port)
-        .prefer_socket(false)
-        .user(Some(fe.user.clone()))
-        .pass(Some(fe.password.expose_secret().to_string()));
-    let pool = Pool::new(opts);
-    let mut conn = pool
-        .get_conn()
-        .await
-        .with_context(|| format!("failed to connect to FE at {}:{}", fe.host, fe.query_port))?;
+    fe.register_compute_node(node).await
+}
 
-    if node_is_registered(&mut conn, node).await? {
-        info!(
-            host = %node.advertise_host,
-            heartbeat_port = node.heartbeat_port,
-            "compute node is already registered with FE"
-        );
-        drop(conn);
-        pool.disconnect()
-            .await
-            .context("failed to disconnect FE MySQL pool")?;
-        return Ok(());
+/// Thin wall-clock wrapper for associated time helpers.
+struct WallClock;
+
+impl WallClock {
+    /// Returns the current Unix timestamp in whole seconds.
+    fn unix_time_secs() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .min(i64::MAX as u64) as i64
     }
 
-    let sql = compute_node_registration_sql(&node.advertise_host, node.heartbeat_port);
-    info!(sql = %sql, "registering compute node with FE");
-    if let Err(err) = conn.query_drop(sql).await {
-        warn!(error = %err, "ALTER SYSTEM ADD COMPUTE NODE failed; checking whether compute node already exists");
-        if !node_is_registered(&mut conn, node).await? {
-            return Err(err).context("failed to register compute node with FE");
-        }
+    /// Returns the current Unix timestamp in milliseconds.
+    fn unix_time_millis() -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
     }
-
-    if !node_is_registered(&mut conn, node).await? {
-        bail!(
-            "FE accepted registration but compute node {}:{} was not found in SHOW PROC '{}'",
-            node.advertise_host,
-            node.heartbeat_port,
-            COMPUTE_NODE_PROC_PATH
-        );
-    }
-
-    info!(
-        host = %node.advertise_host,
-        heartbeat_port = node.heartbeat_port,
-        "compute node registration confirmed"
-    );
-    drop(conn);
-    pool.disconnect()
-        .await
-        .context("failed to disconnect FE MySQL pool")?;
-    Ok(())
-}
-
-async fn node_is_registered(
-    conn: &mut mysql_async::Conn,
-    node: &ComputeNodeConfig,
-) -> Result<bool> {
-    let sql = format!("SHOW PROC '{COMPUTE_NODE_PROC_PATH}'");
-    let rows: Vec<Row> = conn
-        .query(sql)
-        .await
-        .context("failed to query FE compute node list")?;
-    let heartbeat_port = node.heartbeat_port.to_string();
-
-    for row in rows {
-        let host = row
-            .get::<String, _>("IP")
-            .or_else(|| row.get::<String, _>(1));
-        let port = row
-            .get::<String, _>("HeartbeatPort")
-            .or_else(|| row.get::<String, _>(2));
-
-        if host.as_deref() == Some(node.advertise_host.as_str())
-            && port.as_deref() == Some(heartbeat_port.as_str())
-        {
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
-}
-
-fn ok_status() -> TStatus {
-    TStatus::new(TStatusCode::OK, None)
-}
-
-fn error_status(message: String) -> TStatus {
-    TStatus::new(TStatusCode::INTERNAL_ERROR, Some(vec![message]))
-}
-
-fn unix_time_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .min(i64::MAX as u64) as i64
-}
-
-fn unix_time_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
 }
 
 #[cfg(test)]
@@ -927,8 +1052,14 @@ mod tests {
     /// Verifies FE registration uses StarRocks compute-node syntax and proc path.
     #[test]
     fn registration_uses_compute_node_surface() {
+        let config = ComputeNodeConfig {
+            advertise_host: Host::local(),
+            heartbeat_port: 9050,
+            ..ComputeNodeConfig::default()
+        };
+
         assert_eq!(
-            compute_node_registration_sql(&Host::local(), 9050),
+            config.registration_sql(),
             "ALTER SYSTEM ADD COMPUTE NODE \"127.0.0.1:9050\""
         );
         assert_eq!(COMPUTE_NODE_PROC_PATH, "/compute_nodes");
