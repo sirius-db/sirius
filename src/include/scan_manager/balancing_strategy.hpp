@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cstddef>
+#include <variant>
 
 namespace sirius::op {
 class operator_data;
@@ -38,6 +39,14 @@ class balancing_strategy {
  public:
   virtual ~balancing_strategy() = default;
 
+  struct gpu_id_hint {
+    int device_id;
+  };
+  struct numa_id_hint {
+    int numa_id;
+  };
+  using device_id_hint = std::variant<std::monostate, gpu_id_hint, numa_id_hint>;
+
   /**
    * @brief Choose a GPU for @p data and record it on @p data.
    *
@@ -46,11 +55,14 @@ class balancing_strategy {
    *                     (e.g. round-robin) may ignore it.
    * @param data         The split's operating data; the chosen device is
    *                     stamped onto it via @c set_preferred_device_id.
+   * @param hint         Optional hint for device selection, e.g., a preferred GPU or NUMA node.
    * @return The chosen device id, or -1 when no device could be assigned (e.g.
    *         the strategy has no GPUs to place onto), in which case @p data is
    *         left unchanged.
    */
-  virtual int get_next_gpu(std::size_t pipeline_id, op::operator_data& data) = 0;
+  virtual int get_next_gpu(std::size_t pipeline_id,
+                           const op::operator_data* data = nullptr,
+                           device_id_hint hint           = {}) = 0;
 };
 
 }  // namespace sirius::scan_manager

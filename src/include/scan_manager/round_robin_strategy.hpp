@@ -39,7 +39,9 @@ class round_robin_strategy : public balancing_strategy {
   ///                   set turns @ref get_next_gpu into a no-op returning -1.
   explicit round_robin_strategy(std::vector<int> device_ids);
 
-  int get_next_gpu(std::size_t pipeline_id, op::operator_data& data) override;
+  int get_next_gpu(std::size_t pipeline_id,
+                   const op::operator_data* data,
+                   device_id_hint hint) override;
 
  private:
   std::vector<int> _device_ids;

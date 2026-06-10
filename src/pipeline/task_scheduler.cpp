@@ -278,13 +278,13 @@ void task_scheduler::management_eventloop()
       break;
     }
     if (evt->kind == task_request_kind::device_ready && !evt->is_scan) {
-      _ready_devices.insert(evt->device_id);
+      _ready_devices.emplace_back(evt->device_id);
     }
     // Drain any further events that are already queued, so a single matcher
     // pass handles a burst of ready signals plus task pushes together.
     while (auto more = _task_request_channel.try_get()) {
       if (more->kind == task_request_kind::device_ready && !more->is_scan) {
-        _ready_devices.insert(more->device_id);
+        _ready_devices.emplace_back(more->device_id);
       }
     }
 

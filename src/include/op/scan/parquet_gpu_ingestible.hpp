@@ -71,9 +71,12 @@ class parquet_ingestible_table_info : public io::ingestible_table_info {
   duckdb::vector<duckdb::HivePartitioningIndex> partition_indices;
   std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
   std::size_t scan_output_arity      = 0;
-  /// Maximum number of files handled by one metadata-scan task. Matches
-  /// @c parquet_split_provider::DEFAULT_MAX_FILE_PROCESSED.
-  std::size_t max_file_processed = 8;
+  /// Maximum number of files handled by one metadata-scan task. One file per
+  /// task gives the scan-side balancing_strategy the finest placement
+  /// granularity: each file lands on a different GPU via round-robin, spreading
+  /// I/O and decode work evenly across all GPUs. Coarser values (e.g. 8) would
+  /// batch all files into a single task and prevent cross-GPU distribution.
+  std::size_t max_file_processed = 1;
 
   parquet_ingestible_table_info() = default;
 
