@@ -151,8 +151,7 @@ async fn wait_until_shutdown(
             Ok(())
         }
         _ = terminate.recv() => {
-            let signal = "sigterm";
-            info!(signal, "shutdown signal received");
+            info!(signal = "sigterm", "shutdown signal received");
             registration_task.abort();
             heartbeat_shutdown.shutdown();
             brpc_shutdown.shutdown();
