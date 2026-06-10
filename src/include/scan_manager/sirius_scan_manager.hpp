@@ -22,6 +22,7 @@
 #include "io/gpu_ingestible.hpp"
 #include "io/s3/s3_blocking_ioctx.hpp"
 #include "io/s3/s3_ioctx.hpp"
+#include "io/sirius_datasource.hpp"
 #include "scan_manager/gpu_ingestible_factory.hpp"
 #include "scan_manager/split_provider.hpp"
 
@@ -119,12 +120,22 @@ struct scan_manager_config {
   /// requests S3.
   std::optional<sirius::io::s3::s3_ioctx_config> s3_config{};
 
-  /// Thread pool config for S3 async workers. Ignored when @c s3_config
-  /// is empty. Separate from the main @c thread_pool because S3 I/O has
-  /// different concurrency characteristics (more threads, network-bound,
-  /// not CPU-bound). Injected into @c s3_ioctx_config::async_thread_pool
-  /// before constructing the s3_blocking_ioctx so async S3 paths bypass detached
-  /// std::thread fallbacks.
+  /// Selects which S3 backend the scan_manager builds when @c s3_config is set.
+  /// Mirrors @c object_store_config::s3_use_async_backend (SiriusContext copies
+  /// it across in initialize()). When true (default) the manager builds the
+  /// async @c s3_ioctx (libcurl-multi reactor: concurrent GETs + pipelined
+  /// device reads); when false it builds the serial @c s3_blocking_ioctx fed by
+  /// @c s3_thread_pool. Ignored when @c s3_config is empty.
+  bool s3_use_async_backend{true};
+
+  /// Thread pool config for the blocking S3 backend's async workers. Ignored
+  /// when @c s3_config is empty or when @c s3_use_async_backend is true (the
+  /// async @c s3_ioctx reactor owns its own worker thread). Separate from the
+  /// main @c thread_pool because S3 I/O has different concurrency
+  /// characteristics (more threads, network-bound, not CPU-bound). Injected
+  /// into @c s3_ioctx_config::async_thread_pool before constructing the
+  /// @c s3_blocking_ioctx so its async paths bypass detached std::thread
+  /// fallbacks.
   exec::thread_pool_config s3_thread_pool{.num_threads = 8, .thread_name_prefix = "s3_io"};
 };
 
@@ -198,22 +209,18 @@ class sirius_scan_manager {
   /**
    * @brief Construct a new scan manager.
    *
-   * S6 (NUMA): the scan_manager no longer constructs IO backends. SiriusContext
-   * owns the uring(s) + s3_ioctx + s3 async pool + prefetch buffer_pool/cache and
-   * passes the routing backends in here as BORROWED shared_ptrs. The manager
-   * dispatches over them (io_ctx_for / io_ctx_shared_for) but never owns or
-   * destroys them — stop()/dtor only tear down the scan-orchestration pool.
+   * The scan_manager owns a single io_context (uring_ioctx) and optionally
+   * an S3 backend and a prefetch buffer pool, all created from @p config.
    *
-   * @param config  Scan-manager configuration (scan-orchestration thread pool +
-   *                toggles). The @c s3_config / prefetch knobs are consumed by
-   *                SiriusContext (which builds the backends), not here.
-   * @param io_ctxs Borrowed routing backends, in priority order — typically
-   *                @c [default-local-uring, s3_ioctx]. Empty for harnesses that
-   *                pre-route another way; an empty list means @c io_ctx() /
-   *                @c io_ctx_for return nullptr and no backend is available.
+   * @param config   Scan-manager configuration (thread pool, io settings,
+   *                 S3 credentials, prefetch cache knobs).
+   * @param host_fsmr  Host fixed-size memory resource for S3 backend and
+   *                   prefetch cache buffer pool. May be nullptr when prefetch
+   *                   cache is disabled and no S3 backend is configured.
    */
-  explicit sirius_scan_manager(scan_manager_config config,
-                               std::vector<std::shared_ptr<sirius::io::sirius_ioctx>> io_ctxs = {});
+  explicit sirius_scan_manager(
+    scan_manager_config config,
+    cucascade::memory::fixed_size_host_memory_resource* host_fsmr = nullptr);
 
   ~sirius_scan_manager();
 
@@ -236,19 +243,6 @@ class sirius_scan_manager {
   /// needed.
   ///
   /// @param query        The query whose scan operators must be prepared.
-  /// @param gpu_ioctxs   Per-GPU sirius_ioctx instances. Forwarded to
-  ///                     parquet_split_provider so that footer metadata
-  ///                     reads route through io_uring instead of cudf's
-  ///                     bundled kvikio path. Empty map is permitted for
-  ///                     callers (test harnesses) that pre-populate scan_info
-  ///                     another way, and for the single-GPU
-  ///                     @c use_sirius_datasource=false configuration where
-  ///                     footer reads intentionally fall back to cudf's
-  ///                     kvikio datasource. Production callers
-  ///                     (SiriusContext::create_query) MUST pass the map
-  ///                     from SiriusContext::get_gpu_ioctxs(); multi-GPU
-  ///                     runs always populate it (enforced by
-  ///                     @c sirius_config::enforce_sirius_datasource_for_multi_gpu()).
   /// @param gpu_memory_spaces device_id -> GPU memory_space lookup used by the
   ///                     HOST-tier cached_split_provider to materialize host
   ///                     chunks onto the executing GPU. Empty map disables the
@@ -256,8 +250,7 @@ class sirius_scan_manager {
   ///                     through to parquet).
   void prepare_for_query(
     const sirius::planner::query& query,
-    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs = {},
-    std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces   = {});
+    std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces = {});
 
   /// \brief Clear the providers map and join the driver thread if it is
   ///        still running.
@@ -341,28 +334,7 @@ class sirius_scan_manager {
     return _pinned_entries;
   }
 
-  /// \brief Process-wide ioctx used to mint @c sirius_datasource instances.
-  ///        Returns the FIRST registered ioctx (currently uring) for
-  ///        backward compatibility with callers that don't yet do
-  ///        per-path dispatch. Returns nullptr when @c use_sirius_datasource
-  ///        is false AND no S3 backend is configured.
-  [[nodiscard]] sirius::io::sirius_ioctx* io_ctx() const noexcept
-  {
-    return _io_ctxs.empty() ? nullptr : _io_ctxs.front().get();
-  }
-
-  /// \brief Per-path dispatch: returns the first registered ioctx whose
-  ///        @c supports(path) is true. Returns nullptr when no backend
-  ///        claims @p path. Used by @c parquet_split_provider::run_batch
-  ///        to route each file to its supporting backend (local-disk
-  ///        paths to @c uring_ioctx, @c s3:// paths to @c s3_ioctx, etc.).
-  [[nodiscard]] sirius::io::sirius_ioctx* io_ctx_for(std::string_view path) const noexcept;
-
-  /// \brief Same as @c io_ctx_for but returns a shared_ptr — needed by
-  ///        @c parquet_split_provider to thread ioctx ownership through
-  ///        each emitted @c row_group_slice. Returns an empty shared_ptr
-  ///        when no backend supports @p path.
-  [[nodiscard]] std::shared_ptr<sirius::io::sirius_ioctx> io_ctx_shared_for(
+  [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> create_datasource(
     std::string_view path) const noexcept;
 
   /// \brief Whether parquet_split_provider should prewarm column-chunk byte
@@ -394,13 +366,12 @@ class sirius_scan_manager {
   scan_manager_config _config;
   exec::static_thread_pool _thread_pool;
   std::unique_ptr<exec::scoped_dispatcher> _dispatcher;
-  /// BORROWED ioctx backends, in priority order (S6) — owned by SiriusContext,
-  /// passed in at construction. The first entry is the default local-file
-  /// backend (@c uring_ioctx); subsequent entries are object-store backends
-  /// (@c s3_ioctx). Per-path dispatch in @c io_ctx_for / @c io_ctx_shared_for
-  /// walks the vector and returns the first whose @c supports(path) is true.
-  /// The scan_manager never destroys these — SiriusContext owns their lifecycle
-  /// (it also owns the prefetch buffer_pool + the S3 async thread pool).
+  std::unique_ptr<sirius::io::buffer_pool> _prefetch_buffer_pool;
+  std::unique_ptr<sirius::exec::static_thread_pool> _s3_thread_pool;
+  /// Owned io_context backends, in priority order. The first entry is the
+  /// local-file backend (uring_ioctx); subsequent entries are object-store
+  /// backends (s3_ioctx). Per-path dispatch in io_ctx_for / io_ctx_shared_for
+  /// walks the vector and returns the first whose supports(path) is true.
   std::vector<std::shared_ptr<sirius::io::sirius_ioctx>> _io_ctxs;
   std::unordered_map<op::scan::sirius_gpu_scan_operator*, std::unique_ptr<split_provider>>
     _providers_by_op;

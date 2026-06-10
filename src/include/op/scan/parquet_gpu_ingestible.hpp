@@ -19,7 +19,6 @@
 // sirius
 #include <helper/logical_type.hpp>
 #include <io/gpu_ingestible.hpp>
-#include <io/types.hpp>
 #include <op/scan/row_group_metadata.hpp>  // row_group_slice + hybrid_scan_reader
 #include <op/scan/scan_plan.hpp>
 #include <sirius_config.hpp>
@@ -72,16 +71,18 @@ class parquet_ingestible_table_info : public io::ingestible_table_info {
   duckdb::vector<duckdb::HivePartitioningIndex> partition_indices;
   std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
   std::size_t scan_output_arity      = 0;
-  /// Maximum number of files handled by one metadata-scan task. Matches
-  /// @c parquet_split_provider::DEFAULT_MAX_FILE_PROCESSED.
-  std::size_t max_file_processed = 8;
+  /// Maximum number of files handled by one metadata-scan task. One file per
+  /// task gives the scan-side balancing_strategy the finest placement
+  /// granularity: each file lands on a different GPU via round-robin, spreading
+  /// I/O and decode work evenly across all GPUs. Coarser values (e.g. 8) would
+  /// batch all files into a single task and prevent cross-GPU distribution.
+  std::size_t max_file_processed = 1;
 
   parquet_ingestible_table_info() = default;
 
   std::shared_ptr<io::gpu_ingestible> make_ingestible(
     std::unique_ptr<io::ingestible_table_info> self,
-    scan_manager::sirius_scan_manager const& mgr,
-    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs) override;
+    scan_manager::sirius_scan_manager const& mgr) override;
 
   [[nodiscard]] std::span<std::string const> file_paths() const override
   {
@@ -181,10 +182,8 @@ class parquet_gpu_ingestible : public io::gpu_ingestible {
   /// Built by @c parquet_ingestible_table_info::make_ingestible. The base
   /// @c _table_info owns the parquet bind data; this constructor casts it
   /// back to @c parquet_ingestible_table_info for typed access.
-  parquet_gpu_ingestible(
-    std::unique_ptr<io::ingestible_table_info> info,
-    scan_manager::sirius_scan_manager const& mgr,
-    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs);
+  parquet_gpu_ingestible(std::unique_ptr<io::ingestible_table_info> info,
+                         scan_manager::sirius_scan_manager const& mgr);
 
   ~parquet_gpu_ingestible() override;
 
@@ -222,10 +221,6 @@ class parquet_gpu_ingestible : public io::gpu_ingestible {
   std::size_t _max_file_processed{};
   std::size_t _total_files{};
   scan_manager::sirius_scan_manager const* _scan_manager{nullptr};
-  /// Per-GPU sirius_ioctx map. Used both for the local-file footer read
-  /// in @ref run_batch and (via the executing task's gpu_memory_space)
-  /// for the per-GPU datasource selection in @ref materialize_table.
-  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> _gpu_ioctxs;
 
   std::vector<file_batch> _batches;
   std::atomic<std::size_t> _next_batch_idx{0};

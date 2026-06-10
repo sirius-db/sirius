@@ -293,7 +293,7 @@ void sirius_pipeline_converter::insert_duckdb_native_scan_operator(
     throw std::runtime_error(
       "[sirius_pipeline_converter::insert_duckdb_native_scan_operator] seq_scan bind_data is not "
       "TableScanBindData; the GPU-native duckdb scan path supports only seq_scan over base "
-      "tables. Disable enable_gpu_duckdb_native_scan for this query.");
+      "tables.");
   }
   auto& bind_data = *table_scan_bind;
   auto& table     = bind_data.table.Cast<duckdb::DuckTableEntry>();
@@ -370,30 +370,16 @@ void sirius_pipeline_converter::split_table_scan_source(
     return;
   }
 
-  if (scan_op.function.name == "seq_scan" && op_params_.enable_gpu_duckdb_native_scan) {
+  if (scan_op.function.name == "seq_scan") {
     insert_duckdb_native_scan_operator(current_pipeline);
     return;
   }
 
-  if (scan_op.function.name == "seq_scan" || scan_op.function.name == "iceberg_scan") {
-    auto new_pipeline = duckdb::make_shared_ptr<sirius_pipeline>(build_ctx_);
-
-    auto new_scan_op = construct_sirius_specific_operator(scan_op, iceberg_cache_);
-    // todo(bobbi) currently this can be set to any operator since it's never used, and now we
-    // set it to scan_op
-    new_pipeline->source = nullptr;
-    new_pipeline->sink   = new_scan_op.get();
-
-    current_pipeline->source = new_scan_op.get();
-    // move scan_op to current_pipeline.operator[0], current_pipeline.operator[0] to
-    // current_pipeline.operator[1], ...
-    current_pipeline->operators.insert(current_pipeline->operators.begin(), scan_op);
-
-    scheduled_.push_back(new_pipeline);
-    inserted_operators_.push_back(std::move(new_scan_op));
-  } else {
-    throw std::runtime_error("Unsupported scan function: " + scan_op.function.name);
-  }
+  // The legacy seq_scan / iceberg_scan path built duckdb_scan / iceberg_scan
+  // operators (executed by the now-removed scan tasks).  Parquet and GPU-native
+  // seq_scan are handled above via the GPU scan operators; anything else is
+  // unsupported.
+  throw std::runtime_error("Unsupported scan function: " + scan_op.function.name);
 }
 
 void sirius_pipeline_converter::split_cpu_source(
@@ -1097,9 +1083,7 @@ void sirius_pipeline_converter::compute_repository_wiring()
       for (auto const& dependent_pipeline : source_to_pipelines[sink_op]) {
         emit("default", op::MemoryBarrierType::PIPELINE, sink_op, pipeline, dependent_pipeline);
       }
-    } else if (pipeline->sink->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
-               pipeline->sink->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN ||
-               pipeline->sink->type == op::SiriusPhysicalOperatorType::CPU_SOURCE) {
+    } else if (pipeline->sink->type == op::SiriusPhysicalOperatorType::CPU_SOURCE) {
       for (auto const& dependent_pipeline : source_to_pipelines[sink_op]) {
         emit("scan", op::MemoryBarrierType::PIPELINE, sink_op, pipeline, dependent_pipeline);
       }
@@ -1275,8 +1259,6 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
                           static_cast<void*>(scan_port->repo));
         }
       } else if (first_op.type == op::SiriusPhysicalOperatorType::GPU_SCAN ||
-                 first_op.type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
-                 first_op.type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN ||
                  first_op.type == op::SiriusPhysicalOperatorType::CPU_SOURCE ||
                  first_op.type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR ||
                  first_op.type == op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN ||
@@ -1319,8 +1301,6 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
                           static_cast<void*>(scan_port->repo));
         }
       } else if (sink->type == op::SiriusPhysicalOperatorType::GPU_SCAN ||
-                 sink->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
-                 sink->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN ||
                  sink->type == op::SiriusPhysicalOperatorType::CPU_SOURCE ||
                  sink->type == op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN ||
                  sink->type == op::SiriusPhysicalOperatorType::EMPTY_RESULT ||

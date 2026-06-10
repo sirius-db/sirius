@@ -16,6 +16,8 @@
 
 #include "io/s3/s3_reactor.hpp"
 
+#include "io/sirius_datasource.hpp"
+
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <curl/curl.h>
 

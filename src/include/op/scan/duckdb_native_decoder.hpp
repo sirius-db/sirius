@@ -55,11 +55,9 @@ struct duckdb_native_split_payload {
   /// @c storage / @c context / @c projected_cols / @c projected_types that
   /// the decoder reads.
   duckdb_native_ingestible_table_info const* table_info = nullptr;
-  /// Sirius IO substrate handles. Set by the regular (non-cached) split
-  /// path so the decoder can read .db blocks via @c sirius_ioctx::host_read
-  /// instead of going through DuckDB's BufferManager. Both null when the
-  /// scan_manager runs without sirius_datasource (decoder falls back to
-  /// BufferManager).
+  /// Sirius IO substrate handles used to read .db blocks via
+  /// @c sirius_ioctx::host_read. Required by the decoder, which throws if
+  /// either is absent.
   std::shared_ptr<sirius::io::sirius_ioctx> io_ctx;
   std::shared_ptr<sirius::io::sirius_io_object> db_io_object;
 };

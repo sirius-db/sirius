@@ -18,6 +18,7 @@
 #include <duckdb/parser/expression/constant_expression.hpp>
 #include <duckdb/parser/expression/function_expression.hpp>
 #include <duckdb/parser/tableref/table_function_ref.hpp>
+#include <io/sirius_datasource.hpp>
 
 #include <algorithm>
 #include <array>
@@ -478,9 +479,9 @@ duckdb::SiriusContext& require_sirius_context(s3_sql_fixture& fixture)
 sirius::io::s3::s3_ioctx& require_async_s3_ioctx(s3_sql_fixture& fixture, std::string const& uri)
 {
   auto& sirius_ctx = require_sirius_context(fixture);
-  auto* base_ctx   = sirius_ctx.get_scan_manager().io_ctx_for(uri);
-  REQUIRE(base_ctx != nullptr);
-  auto* s3_ctx = dynamic_cast<sirius::io::s3::s3_ioctx*>(base_ctx);
+  auto datasource  = sirius_ctx.get_scan_manager().create_datasource(uri);
+  REQUIRE(datasource != nullptr);
+  auto* s3_ctx = dynamic_cast<sirius::io::s3::s3_ioctx*>(datasource->io_ctx().get());
   REQUIRE(s3_ctx != nullptr);
   return *s3_ctx;
 }

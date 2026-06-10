@@ -373,42 +373,6 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
     // Skip if already finished — avoids redundant re-evaluation and re-notification.
     if (pipeline_finished.load()) {
       should_notify = true;
-    } else if (get_source()->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
-      auto& table_scan = get_source()->Cast<op::sirius_physical_duckdb_scan>();
-      if (table_scan.exhausted.load()) {
-        if (tasks_created.load() == tasks_completed.load()) {
-          pipeline_finished.store(true);
-          for (auto& op : get_operators()) {
-            op.get().finalize_operator();
-          }
-          should_notify = true;
-        }
-        end_nvtx_range_if_finished();
-      }
-    } else if (get_source()->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN) {
-      auto& parquet_scan = static_cast<op::sirius_physical_parquet_scan&>(*get_source());
-      if (!parquet_scan.has_more_partitions.load()) {
-        if (tasks_created.load() == tasks_completed.load()) {
-          pipeline_finished.store(true);
-          for (auto& op : get_operators()) {
-            op.get().finalize_operator();
-          }
-          should_notify = true;
-        }
-        end_nvtx_range_if_finished();
-      }
-    } else if (get_source()->type == op::SiriusPhysicalOperatorType::CPU_SOURCE) {
-      auto& cpu_source = get_source()->Cast<op::sirius_physical_cpu_source>();
-      if (cpu_source.exhausted.load()) {
-        if (tasks_created.load() == tasks_completed.load()) {
-          pipeline_finished.store(true);
-          for (auto& op : get_operators()) {
-            op.get().finalize_operator();
-          }
-          should_notify = true;
-        }
-        end_nvtx_range_if_finished();
-      }
     } else {
       op::sirius_physical_operator* first_node =
         operators.size() > 0 ? &operators[0].get() : (sink ? sink.get() : nullptr);
