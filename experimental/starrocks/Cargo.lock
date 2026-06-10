@@ -1511,6 +1511,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "heck",
  "mysql_async",
  "prost",
  "prost-build",

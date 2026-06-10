@@ -1,5 +1,6 @@
 use std::{env, path::PathBuf};
 
+use heck::ToUpperCamelCase;
 use prost_build::{Method, Service, ServiceGenerator};
 
 const BRPC_PROTOS: &[&str] = &[
@@ -258,23 +259,5 @@ fn const_name(proto_name: &str) -> String {
 
 /// Converts a protobuf method descriptor into a Rust enum variant name.
 fn method_variant(method: &Method) -> String {
-    upper_camel(&method.proto_name)
-}
-
-/// Converts StarRocks snake_case RPC names to UpperCamelCase.
-fn upper_camel(value: &str) -> String {
-    value
-        .split('_')
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            let mut chars = part.chars();
-            let Some(first) = chars.next() else {
-                return String::new();
-            };
-            let mut result = String::new();
-            result.push(first.to_ascii_uppercase());
-            result.extend(chars);
-            result
-        })
-        .collect()
+    method.proto_name.to_upper_camel_case()
 }
