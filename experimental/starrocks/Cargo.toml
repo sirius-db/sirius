@@ -18,11 +18,13 @@ mysql_async = { version = "0.36", default-features = false, features = ["minimal
 # types emitted by `substrait`, and so generated messages share one `prost`
 # runtime across the translator crate.
 prost = "0.14"
+prost-build = "0.14"
 substrait = "0.62.2"
 substrait-explain = "0.3.2"
 thiserror = "2"
 thrift = "0.17"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
@@ -30,9 +32,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 anyhow.workspace = true
 clap.workspace = true
 mysql_async.workspace = true
+prost.workspace = true
+starrocks-plan-translator = { path = "crates/starrocks-plan-translator" }
 starrocks-thrift = { path = "crates/starrocks-thrift" }
 thiserror.workspace = true
 thrift.workspace = true
 tokio.workspace = true
+tower.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true

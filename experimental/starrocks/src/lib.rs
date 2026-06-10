@@ -35,6 +35,13 @@ use thrift::{
 };
 use tracing::{debug, info, warn};
 
+mod brpc;
+mod internal_service;
+mod proto;
+mod prpc;
+
+pub use brpc::{BrpcServer, BrpcServerShutdown, start_brpc_server};
+
 type HeartbeatProcessor = HeartbeatServiceSyncProcessor<ComputeNodeHeartbeatHandler>;
 
 const COMPUTE_NODE_PROC_PATH: &str = "/compute_nodes";
