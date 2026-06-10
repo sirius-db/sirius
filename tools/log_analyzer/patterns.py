@@ -14,7 +14,7 @@ that consumes this data can detect mismatched parser versions.
 
 import re
 
-SHAPE_VERSION = "1.2"
+SHAPE_VERSION = "1.3"
 
 # Timestamp at the start of every log line, e.g. "[2026-05-20 14:25:02.368]"
 TS_RE = re.compile(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)\]")
@@ -27,6 +27,26 @@ DEBUG_TAG = "[debug]"
 # Example: "[2026-05-20 14:25:02.368] [info] [:] [query_pool] QueryBegin allocated=5242880 bytes peak=307232768 bytes free_blocks=5115"
 QUERY_BEGIN_ANCHOR = "[info] [:] [query_pool] QueryBegin allocated="
 QUERY_END_ANCHOR = "[info] [:] [query_pool] QueryEnd allocated="
+# Strict regex to extract stats from the host-pool boundary lines.
+QUERY_POOL_RE = re.compile(
+    r"\[(?P<ts>[\d\-: .]+)\] \[info\] \[[^\]]+\] \[query_pool\] "
+    r"(?P<tag>QueryBegin|QueryEnd) "
+    r"allocated=(?P<allocated_bytes>\d+) bytes "
+    r"peak=(?P<peak_bytes>\d+) bytes "
+    r"free_blocks=(?P<free_blocks>\d+)"
+)
+
+# --- GPU device memory pool stats at query boundaries (info-level) -----------
+# Example: "[2026-06-10 10:00:00.000] [info] [:] [gpu_pool] GPU:0 QueryBegin allocated=1234567890 bytes peak=1234567890 bytes reserved=1234567890 bytes"
+# One line per configured GPU; tag is QueryBegin or QueryEnd.
+GPU_POOL_ANCHOR = "[info] [:] [gpu_pool]"
+GPU_POOL_RE = re.compile(
+    r"\[(?P<ts>[\d\-: .]+)\] \[info\] \[[^\]]+\] \[gpu_pool\] "
+    r"GPU:(?P<gpu_id>\d+) (?P<tag>QueryBegin|QueryEnd) "
+    r"allocated=(?P<allocated_bytes>\d+) bytes "
+    r"peak=(?P<peak_bytes>\d+) bytes "
+    r"reserved=(?P<reserved_bytes>\d+) bytes"
+)
 
 # Example (old): "[2026-05-20 14:25:02.368] [info] [:] QueryBegin: with revenue_view as ..."
 # Example (new): "[2026-05-22 17:33:13.408] [info] [sirius_context.cpp:205] QueryBegin: select ..."

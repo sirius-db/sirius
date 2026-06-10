@@ -152,6 +152,10 @@ class SiriusContext : public ClientContextState {
   ///        peak, free blocks) at a labeled tag — used for verifying leaks.
   void log_host_pool_stats(std::string_view tag) const;
 
+  /// \brief Log the GPU reservation_aware_resource_adaptor stats (allocated,
+  ///        peak, reserved) per GPU at a labeled tag — used for verifying leaks.
+  void log_gpu_pool_stats(std::string_view tag) const;
+
   [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept
   {
     return config_.get_hw_topology();

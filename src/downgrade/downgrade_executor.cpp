@@ -259,7 +259,7 @@ void downgrade_executor::processing_loop()
                 if (req_ptr->predicate && req_ptr->predicate()) { req_ptr->satisfied.store(true); }
               }
             } catch (const std::exception& e) {
-              SIRIUS_LOG_ERROR("[downgrade] convert failed: {}", e.what());
+              SIRIUS_LOG_ERROR("[downgrade] convert failed from data repository: {}", e.what());
             }
           });
       }
@@ -319,7 +319,7 @@ void downgrade_executor::processing_loop()
                 if (req_ptr->predicate && req_ptr->predicate()) { req_ptr->satisfied.store(true); }
               }
             } catch (const std::exception& e) {
-              SIRIUS_LOG_ERROR("[downgrade] convert failed: {}", e.what());
+              SIRIUS_LOG_ERROR("[downgrade] convert failed from task queue: {}", e.what());
             }
           });
       }
@@ -346,6 +346,9 @@ void downgrade_executor::processing_loop()
     double throughput_mbs =
       (duration_ms > 0.0) ? (total_bytes / (1024.0 * 1024.0)) / (duration_ms / 1000.0) : 0.0;
     std::string request_label = req->is_monitor_request ? "monitor " : "";
+    if (req->is_monitor_request) {
+      _monitor_request_enqueued.store(false, std::memory_order_relaxed);
+    }
 
     SIRIUS_LOG_DEBUG(
       "[downgrade] [{}] request {}done: {} batches, {} bytes in {:.2f} ms ({:.1f} MB/s) | "
@@ -425,6 +428,7 @@ void downgrade_executor::monitor_loop()
   bool backed_off = false;
 
   while (_running.load()) {
+<<<<<<< HEAD
     if (_memory_space && _memory_space->should_downgrade_memory()) {
       // Stateless viability gate: only issue a downgrade request when one could plausibly free
       // memory. When idle GPU batches' only lower tier is a full HOST and no DISK is configured,
@@ -452,6 +456,22 @@ void downgrade_executor::monitor_loop()
           "space to enable spilling.",
           _source_label);
         backed_off = true;
+=======
+    if (_memory_space && _memory_space->should_downgrade_memory() &&
+        !_monitor_request_enqueued.load(std::memory_order_relaxed)) {
+      size_t amount = _memory_space->get_amount_to_downgrade();
+      if (amount > 0) {
+        auto req                = std::make_unique<downgrade_request>();
+        req->is_monitor_request = true;
+        req->predicate          = [&freed = req->bytes_freed, amount]() {
+          return freed.load(std::memory_order_relaxed) >= amount;
+        };
+        SIRIUS_LOG_DEBUG(
+          "[downgrade] monitor_loop:  for memory space {} for {} bytes", _source_label, amount);
+        _monitor_request_enqueued.store(true, std::memory_order_relaxed);
+        // Fire-and-forget: monitor does not wait for the result
+        _request_queue.push(std::move(req));
+>>>>>>> 906ad8f0 (working stream rebind implementation. Also reduces redundant monitor requests)
       }
     } else {
       // Pressure gone -- reset so the next stall episode warns again.
@@ -484,6 +504,9 @@ void downgrade_executor::set_pipeline_task_queue(
 
 std::future<size_t> downgrade_executor::request_free_memory(size_t bytes)
 {
+  SIRIUS_LOG_DEBUG("[downgrade] request_free_memory: for memory space {} requesting {} bytes",
+                   _source_label,
+                   bytes);
   auto req       = std::make_unique<downgrade_request>();
   req->predicate = [&freed = req->bytes_freed, bytes]() {
     return freed.load(std::memory_order_relaxed) >= bytes;
@@ -503,6 +526,8 @@ size_t downgrade_executor::request_free_memory_and_wait(size_t bytes)
 
 std::future<size_t> downgrade_executor::request_downgrade(std::function<bool()> predicate)
 {
+  SIRIUS_LOG_DEBUG("[downgrade] request_downgrade: for memory space {} requesting downgrade",
+                   _source_label);
   auto req       = std::make_unique<downgrade_request>();
   req->predicate = std::move(predicate);
   auto future    = req->result.get_future();

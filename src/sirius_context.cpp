@@ -39,6 +39,7 @@
 #include <cuda_runtime_api.h>
 
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 #include <duckdb/common/allocator.hpp>
 #include <duckdb/execution/physical_plan_generator.hpp>
@@ -183,6 +184,27 @@ void SiriusContext::log_host_pool_stats(std::string_view tag) const
                fs_mr->get_free_blocks());
 }
 
+// Log the GPU reservation_aware_resource_adaptor stats at a labeled point, one
+// line per configured GPU. Lets us verify that allocated bytes return to
+// baseline at the end of each query — the leak signature is
+// "QueryEnd allocated != QueryBegin allocated".
+void SiriusContext::log_gpu_pool_stats(std::string_view tag) const
+{
+  if (!memory_manager_) { return; }
+  auto gpu_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  for (auto const* space : gpu_spaces) {
+    auto* ra_mr =
+      space->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
+    if (!ra_mr) { continue; }
+    spdlog::info("[gpu_pool] GPU:{} {} allocated={} bytes peak={} bytes reserved={} bytes",
+                 space->get_device_id(),
+                 tag,
+                 ra_mr->get_total_allocated_bytes(),
+                 ra_mr->get_peak_total_allocated_bytes(),
+                 ra_mr->get_total_reserved_bytes());
+  }
+}
+
 void SiriusContext::QueryBegin(ClientContext& context)
 {
   // Suppress all state mutations for internal connections (e.g. iceberg metadata lookups).
@@ -192,6 +214,7 @@ void SiriusContext::QueryBegin(ClientContext& context)
 
   try {
     log_host_pool_stats("QueryBegin");
+    log_gpu_pool_stats("QueryBegin");
 
     // Clear any stale captured plan from a previous query.
     captured_logical_plan_.reset();
@@ -269,6 +292,7 @@ void SiriusContext::QueryEnd()
     if (scan_manager_) { scan_manager_->reset(); }
 
     log_host_pool_stats("QueryEnd");
+    log_gpu_pool_stats("QueryEnd");
   } catch (...) {
     release_query_lifecycle_slot();
     throw;
