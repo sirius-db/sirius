@@ -1,7 +1,7 @@
 use std::{future::Future, net::TcpListener as StdTcpListener, pin::Pin};
 
 use crate::{
-    internal_service::PlanFragmentTranslatorService,
+    internal_service::SiriusComputeNodeService,
     proto::starrocks::p_internal_service_brpc::PInternalServiceRouter, prpc,
 };
 use anyhow::{Context, Result};
@@ -12,7 +12,7 @@ use tracing::{info, warn};
 /// BRPC service runner for StarRocks PInternalService.
 pub struct BrpcServer {
     /// Generic Tower service runner hidden behind the public default service.
-    inner: BrpcServiceServer<PInternalServiceRouter<PlanFragmentTranslatorService>>,
+    inner: BrpcServiceServer<PInternalServiceRouter<SiriusComputeNodeService>>,
 }
 
 /// Generic BRPC service runner over StarRocks PRPC frames.
@@ -22,9 +22,9 @@ struct BrpcServiceServer<S> {
 }
 
 impl BrpcServer {
-    /// Builds a BRPC server for StarRocks PInternalService plan-fragment RPCs.
+    /// Builds a BRPC server for Sirius compute-node RPCs over StarRocks PInternalService.
     pub fn new() -> Self {
-        let service = PInternalServiceRouter::new(PlanFragmentTranslatorService::new());
+        let service = PInternalServiceRouter::new(SiriusComputeNodeService::new());
         Self {
             inner: BrpcServiceServer::with_service(service),
         }

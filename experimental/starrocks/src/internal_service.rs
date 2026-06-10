@@ -13,15 +13,18 @@ use thrift::{
 };
 use tracing::info;
 
-/// PInternalService implementation that translates incoming plan fragments and logs Substrait.
+/// Sirius compute-node implementation of StarRocks PInternalService.
+///
+/// Plan-fragment translation is the first implemented RPC path; future
+/// compute-node tasks should land here behind the generated service facade.
 #[derive(Clone, Debug)]
-pub(crate) struct PlanFragmentTranslatorService {
+pub(crate) struct SiriusComputeNodeService {
     /// Reusable StarRocks thrift-to-Substrait fragment translator.
     translator: PlanTranslator,
 }
 
-impl PlanFragmentTranslatorService {
-    /// Builds a translator-backed StarRocks internal service implementation.
+impl SiriusComputeNodeService {
+    /// Builds the Sirius compute-node service with its current RPC task dependencies.
     pub(crate) fn new() -> Self {
         Self {
             translator: PlanTranslator::new(),
@@ -29,7 +32,7 @@ impl PlanFragmentTranslatorService {
     }
 }
 
-impl PInternalService for PlanFragmentTranslatorService {
+impl PInternalService for SiriusComputeNodeService {
     /// Handles a single FE-dispatched plan fragment thrift attachment.
     async fn exec_plan_fragment(
         &self,
@@ -67,7 +70,7 @@ impl PInternalService for PlanFragmentTranslatorService {
     }
 }
 
-impl PlanFragmentTranslatorService {
+impl SiriusComputeNodeService {
     /// Deserializes and translates one binary-thrift TExecPlanFragmentParams attachment.
     fn translate_single_attachment(
         &self,
@@ -340,7 +343,7 @@ mod tests {
     fn call_router(request: prpc::Request) -> std::result::Result<prpc::Response, prpc::Error> {
         // The generated router is a Tower service; a tiny current-thread runtime is
         // enough because these tests do not spawn the service futures.
-        let mut router = PInternalServiceRouter::new(PlanFragmentTranslatorService::new());
+        let mut router = PInternalServiceRouter::new(SiriusComputeNodeService::new());
         tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
