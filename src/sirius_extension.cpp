@@ -976,13 +976,11 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     // end up on the wrong GPU under sanitizer races). Use of sirius_ioctx is
     // mandatory whenever more than one GPU is configured — enforced upstream
     // by sirius_config::enforce_sirius_datasource_for_multi_gpu().
-    auto target_ioctx = sirius_ctx->get_ioctx_for(target_gpu_id);
-    if (!target_ioctx) {
-      throw InvalidInputException("pin_table: no sirius_ioctx for target GPU " +
-                                  std::to_string(target_gpu_id) + ".");
+    auto& scan_mgr  = sirius_ctx->get_scan_manager();
+    auto datasource = scan_mgr.create_datasource(path);
+    if (!datasource) {
+      throw InvalidInputException("pin_table: no IO backend supports path: " + path);
     }
-    auto io_object  = target_ioctx->create_io_object(path);
-    auto datasource = target_ioctx->make_datasource(io_object);
 
     auto file_opts =
       cudf::io::parquet_reader_options::builder(cudf::io::source_info{datasource.get()}).build();
@@ -1469,15 +1467,6 @@ static void SetEnableGpuExecution(ClientContext& context, SetScope scope, Value&
   SIRIUS_LOG_DEBUG("Updated gpu_execution to {}", BooleanValue::Get(parameter));
 }
 
-static void SetEnableGpuDuckdbNativeScan(ClientContext& context, SetScope scope, Value& parameter)
-{
-  auto* params = get_operator_params(context);
-  if (!params) { return; }
-  params->enable_gpu_duckdb_native_scan = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config ENABLE_GPU_DUCKDB_NATIVE_SCAN to {}",
-                   params->enable_gpu_duckdb_native_scan);
-}
-
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 {
   // Add in config option for gpu buffer manager
@@ -1652,14 +1641,6 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::BOOLEAN,
     Value::BOOLEAN(true),
     SetEnableGpuExecution);
-
-  config.AddExtensionOption(
-    "enable_gpu_duckdb_native_scan",
-    "Route DuckDB seq_scan to the GPU-native scan operator instead of the CPU fallback "
-    "(experimental; off by default)",
-    LogicalType::BOOLEAN,
-    Value::BOOLEAN(sirius::operator_params{}.enable_gpu_duckdb_native_scan),
-    SetEnableGpuDuckdbNativeScan);
 }
 
 static void LoadInternal(ExtensionLoader& loader)

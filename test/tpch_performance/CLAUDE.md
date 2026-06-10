@@ -78,6 +78,39 @@ Each run creates a directory under `runs/<timestamp>_sf<SF>_2iter/` containing:
 - `comparison.txt` — cold/warm timing table with speedup ratios
 - `timings.csv` — long-format iteration runtimes (engine,query,iteration,runtime_s)
 
+#### `--data-source parquet | duckdb | duckdb-native` (scan path)
+
+`--data-source` selects which engine scan path is exercised:
+
+| Value | Runner | Input | Sirius scan path |
+|-------|--------|-------|------------------|
+| `parquet` (default) | `run_tpch_parquet.sh` | `test_datasets/tpch_parquet_sf<SF>/` or `--parquet-dir` | `read_parquet` → `GPU_PARQUET_SCAN` |
+| `duckdb` | `run_tpch_duckdb.sh` | `performance_test.duckdb` or `--duckdb-file` | `seq_scan` → `GPU_DUCKDB_NATIVE_SCAN` (the engine default) |
+| `duckdb-native` | `run_tpch_duckdb.sh` | same `.duckdb` file as `duckdb` | alias of `duckdb` — kept for compatibility |
+
+The **GPU-native DuckDB scan is the only `seq_scan` path** in the engine, so the `duckdb` data source routes `seq_scan` to `GPU_DUCKDB_NATIVE_SCAN` via `insert_duckdb_native_scan_operator` (`src/pipeline/sirius_pipeline_converter.cpp`). `duckdb-native` and the `--gpu-native-scan` flag are redundant no-op aliases. The `duckdb` engine remains the unchanged DuckDB CPU baseline (it runs with `SIRIUS_DISABLE=1`), so `validation.csv` validates GPU-native-scan output against DuckDB CPU.
+
+```bash
+# Generate the native .duckdb tables
+pixi run bash test/tpch_performance/generate_tpch_data.sh 1 --format duckdb   # → test_datasets/tpch_sf1.duckdb
+
+# Benchmark + validate the GPU-native scan (now the default duckdb path)
+./test/tpch_performance/benchmark_and_validate.sh --data-source duckdb --duckdb-file ./test_datasets/tpch_sf1.duckdb 1
+```
+
+**Verifying the native operator actually ran.** A passing result alone does not show which scan path ran. The native-scan log markers are `SIRIUS_LOG_DEBUG`, and timed runs stay at the default `info` level to keep query timings clean. To expose the markers, set `SIRIUS_NATIVE_SCAN_VERIFY=1` (it emits `SET sirius_log_level='debug'`). Run this as a separate, untimed check:
+
+```bash
+SIRIUS_NATIVE_SCAN_VERIFY=1 OUTPUT_DIR=/tmp/native_verify \
+  ./test/tpch_performance/run_tpch_duckdb.sh \
+    --duckdb-file ./test_datasets/tpch_sf1.duckdb sirius 1 1 6
+# decoded-split count >= 1 with refused = 0 proves the native path ran:
+grep -c 'duckdb_native_gpu_ingestible::materialize_table] decoded split' /tmp/native_verify/sirius_*.log
+grep -c 'duckdb_native_metadata] refused'                       /tmp/native_verify/sirius_*.log   # expect 0
+```
+
+> **Note:** `--pinning-mode per-query` is parquet-only — `run_tpch_duckdb.sh` does not accept `--pinning-mode`, so do not combine it with `--data-source duckdb` or `duckdb-native`. The Python harness (`performance_test.py`) is also parquet-only and does not support the native scan.
+
 #### `--pinning-mode per-query` (PR #721 pin_table)
 
 When passed `--pinning-mode per-query`, the Sirius engine wraps each query block with `CALL pin_table(<glob>, tier='gpu', name=<table>, cols=[...])` for every table the query reads, runs the query for `--iterations` runs back-to-back, then `CALL unpin_table(<table>)` for each pinned table. This isolates per-query pinning cost from query execution: the query-iteration timings written to `timings.csv` reflect query-only time on the pinned-cache scan path.
@@ -222,8 +255,9 @@ Output: `reports/<label>_<YYYYMMDD_HHMMSS>/` containing `report.md`, `summary.js
 |------|---------|
 | `benchmark_and_validate.sh` | Full DuckDB vs Sirius benchmark with validation and timestamped runs |
 | `run_tpch_parquet.sh` | Unified query runner for both engines (sirius/duckdb), single-session with cold+warm |
+| `run_tpch_duckdb.sh` | Query runner over a `.duckdb` file (native tables); `--duckdb-file`; `--gpu-native-scan` is a no-op alias |
 | `run_tpch_parquet_duckdb.sh` | DuckDB-only baseline runner |
-| `generate_tpch_data.sh` | Generate TPC-H parquet data via tpchgen-rs (auto-builds from source) |
+| `generate_tpch_data.sh` | Generate TPC-H parquet or duckdb data via tpchgen-rs / dbgen (`--format duckdb`) |
 | `sweep_threads.sh` | Thread configuration sweep (Sirius-only) |
 | `profile_tpch_nsys.sh` | Profile queries with nsys, producing .nsys-rep and .sqlite per query |
 | `nsys_analyze.sh` | Analyze nsys SQLite profiles (kernels, memory, NVTX, I/O) |

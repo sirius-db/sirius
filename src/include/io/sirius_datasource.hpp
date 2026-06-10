@@ -49,6 +49,17 @@ class sirius_datasource : public cudf::io::datasource {
 
   [[nodiscard]] std::shared_ptr<sirius_ioctx> io_ctx() const { return _io_ctx; }
 
+  /// The backing io_object this datasource reads from.
+  [[nodiscard]] std::shared_ptr<sirius_io_object> io_object() const { return _io_object; }
+
+  /// Cached backend metadata (e.g. a parsed parquet footer) for this
+  /// datasource's io_object, fetched from the prefetching cache.  Returns
+  /// nullptr when the backend has no cache or holds no entry for this object.
+  /// Lets callers reuse parsed metadata without depending on the cache (or the
+  /// scan_manager / io_context) directly — downcast the result to the concrete
+  /// metadata type (e.g. scan_manager::parquet_metadata).
+  [[nodiscard]] std::shared_ptr<sirius_io_object_metadata> metadata() const;
+
   // ---- cudf::io::datasource overrides ---------------------------------------
 
   [[nodiscard]] size_t size() const override;

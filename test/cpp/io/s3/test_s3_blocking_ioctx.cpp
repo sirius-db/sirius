@@ -35,6 +35,7 @@
 #include <arpa/inet.h>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
+#include <io/sirius_datasource.hpp>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <sys/socket.h>

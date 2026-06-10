@@ -18,6 +18,7 @@
 #include <expression/ast/from_duckdb.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <io/io_context.hpp>
+#include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
 #include <op/scan/duckdb_native_decoder.hpp>
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
@@ -118,20 +119,16 @@ std::vector<row_group_batch_local> partition_row_groups_into_batches(
 // duckdb_native_ingestible_table_info::make_ingestible
 //===----------------------------------------------------------------------===//
 std::shared_ptr<io::gpu_ingestible> duckdb_native_ingestible_table_info::make_ingestible(
-  std::unique_ptr<io::ingestible_table_info> self,
-  scan_manager::sirius_scan_manager const& mgr,
-  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs)
+  std::unique_ptr<io::ingestible_table_info> self, scan_manager::sirius_scan_manager const& mgr)
 {
-  return std::make_shared<duckdb_native_gpu_ingestible>(std::move(self), mgr, gpu_ioctxs);
+  return std::make_shared<duckdb_native_gpu_ingestible>(std::move(self), mgr);
 }
 
 //===----------------------------------------------------------------------===//
 // duckdb_native_gpu_ingestible — construction
 //===----------------------------------------------------------------------===//
 duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
-  std::unique_ptr<io::ingestible_table_info> info,
-  scan_manager::sirius_scan_manager const& mgr,
-  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& /*gpu_ioctxs*/)
+  std::unique_ptr<io::ingestible_table_info> info, scan_manager::sirius_scan_manager const& mgr)
   : io::gpu_ingestible(std::move(info))
 {
   auto const& bind = static_cast<duckdb_native_ingestible_table_info const&>(table_info());
@@ -164,10 +161,12 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
                              _metadata.viability_failure_reason);
   }
 
-  // Mint the .db io_object once per query when the manager exposes a
-  // backend for db_path (matches duckdb_native_split_provider).
-  _io_ctx = !bind.db_path.empty() ? mgr.io_ctx_shared_for(bind.db_path) : nullptr;
-  if (_io_ctx && !bind.db_path.empty()) { _db_io_object = _io_ctx->create_io_object(bind.db_path); }
+  // Resolve the .db file to a datasource once per query when the manager
+  // exposes a backend for db_path; derive the io_ctx + io_object from it
+  // (matches duckdb_native_split_provider) instead of reaching into io_context.
+  auto db_datasource = !bind.db_path.empty() ? mgr.create_datasource(bind.db_path) : nullptr;
+  _io_ctx            = db_datasource ? db_datasource->io_ctx() : nullptr;
+  _db_io_object      = db_datasource ? db_datasource->io_object() : nullptr;
 
   // Pre-build the coalesced filter expression once.
   if (bind.table_filters && !bind.table_filters->filters.empty()) {

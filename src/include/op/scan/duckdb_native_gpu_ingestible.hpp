@@ -79,8 +79,7 @@ class duckdb_native_ingestible_table_info : public io::ingestible_table_info {
 
   std::shared_ptr<io::gpu_ingestible> make_ingestible(
     std::unique_ptr<io::ingestible_table_info> self,
-    scan_manager::sirius_scan_manager const& mgr,
-    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs) override;
+    scan_manager::sirius_scan_manager const& mgr) override;
 
   /// db_path-as-span. The cache match in @c sirius_scan_manager never
   /// matches duckdb-native ingestibles (pinned-cache key is parquet file
@@ -140,10 +139,8 @@ class duckdb_native_post_filter_and_projection_info : public io::post_filter_and
 //===----------------------------------------------------------------------===//
 class duckdb_native_gpu_ingestible : public io::gpu_ingestible {
  public:
-  duckdb_native_gpu_ingestible(
-    std::unique_ptr<io::ingestible_table_info> info,
-    scan_manager::sirius_scan_manager const& mgr,
-    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs);
+  duckdb_native_gpu_ingestible(std::unique_ptr<io::ingestible_table_info> info,
+                               scan_manager::sirius_scan_manager const& mgr);
 
   ~duckdb_native_gpu_ingestible() override;
 

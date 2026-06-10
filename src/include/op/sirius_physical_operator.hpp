@@ -147,6 +147,28 @@ class operator_data {
    * represent GPU-resident data should override to return a meaningful estimate.
    */
   [[nodiscard]] virtual std::size_t get_estimated_size_in_bytes() const { return 0; }
+
+  /**
+   * @brief Record the GPU this data should be processed on.
+   *
+   * Set upstream of task creation when the producer of this data has already
+   * chosen a device — e.g. the scan manager round-robins fresh-read scan
+   * splits across the available GPUs and stamps the chosen device here. The
+   * task creator reads this back via @ref get_preferred_device_id and forwards
+   * it onto the pipeline task so the scheduler dispatches the task to that GPU.
+   */
+  void set_preferred_device_id(int device_id) { _preferred_device_id = device_id; }
+
+  /**
+   * @brief The GPU this data was assigned to, or std::nullopt when no producer
+   *        expressed a preference (the task creator then falls back to its own
+   *        locality heuristics).
+   */
+  [[nodiscard]] std::optional<int> get_preferred_device_id() const { return _preferred_device_id; }
+
+ private:
+  /// Producer-assigned device preference; nullopt until set_preferred_device_id.
+  std::optional<int> _preferred_device_id;
 };
 
 /**

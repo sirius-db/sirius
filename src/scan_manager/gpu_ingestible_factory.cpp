@@ -41,17 +41,13 @@ gpu_ingestible_factory::gpu_ingestible_factory(
 std::shared_ptr<io::gpu_ingestible> gpu_ingestible_factory::produce(
   std::unique_ptr<io::ingestible_table_info> table_info,
   sirius_scan_manager const& mgr,
-  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs,
   std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces,
   std::size_t op_id)
 {
   if (!table_info) { return nullptr; }
 
-  // Cache short-circuit: peeks file_paths(), and on a hit steals table_info
-  // into the cached ingestible. On a miss, table_info stays valid for
-  // io::make_gpu_ingestible.
   if (auto cached = try_cached(table_info, gpu_memory_spaces, op_id)) { return cached; }
-  return io::make_gpu_ingestible(std::move(table_info), mgr, gpu_ioctxs);
+  return io::make_gpu_ingestible(std::move(table_info), mgr);
 }
 
 std::shared_ptr<io::gpu_ingestible> gpu_ingestible_factory::try_cached(

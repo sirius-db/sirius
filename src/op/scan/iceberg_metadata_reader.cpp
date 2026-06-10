@@ -15,6 +15,7 @@
  */
 
 #include "io/io_context.hpp"
+#include "io/sirius_datasource.hpp"
 #include "io/types.hpp"
 
 #include <cudf/concatenate.hpp>

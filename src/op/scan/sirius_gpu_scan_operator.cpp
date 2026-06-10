@@ -103,15 +103,6 @@ sirius_gpu_scan_operator::sirius_gpu_scan_operator(
 sirius_gpu_scan_operator::~sirius_gpu_scan_operator() = default;
 
 //===----------------------------------------------------------------------===//
-// Per-GPU ioctx map injection
-//===----------------------------------------------------------------------===//
-void sirius_gpu_scan_operator::set_gpu_ioctxs(
-  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> ioctxs)
-{
-  _gpu_ioctxs = std::move(ioctxs);
-}
-
-//===----------------------------------------------------------------------===//
 // Source / scheduling interface
 //===----------------------------------------------------------------------===//
 std::optional<task_creation_hint> sirius_gpu_scan_operator::get_next_task_hint()

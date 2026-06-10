@@ -187,7 +187,7 @@ class s3_blocking_ioctx final : public sirius_ioctx {
 
   void shutdown() override;
 
-  std::unique_ptr<cudf::io::datasource> make_datasource(
+  std::unique_ptr<io::sirius_datasource> make_datasource(
     std::shared_ptr<sirius_io_object> io_object) override;
 
   /// Backend factory: parses @p path as @c s3://bucket/key, issues a HEAD
