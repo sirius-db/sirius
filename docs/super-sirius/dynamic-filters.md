@@ -4,13 +4,13 @@ A **dynamic filter** is a predicate that is computed at query runtime by one ope
 
 This is a category, not a single feature. It spans:
 
-- **Dynamic table-filter pushdown** — a hash-join build pushes a filter into a downstream parquet scan, so row-group pruning and post-decode filtering can happen against the actual build-side keys instead of the static predicates.
+- **Dynamic table-filter pushdown** — a hash-join build pushes a runtime zone-map into a downstream parquet scan, so the scan can prune row groups against the actual build-side key range (skipping their I/O and decode) instead of relying only on the static predicates. It is a pure optimization — redundant with the join, so it never changes results — and ships **off by default**.
 - **Sideways information passing (SIP)** — a hash-join build pushes a filter into another join's probe input, so the second join can reject probe-side rows that can't possibly match.
 - **Aggregation-driven pushdown** — a `GROUP BY` or `DISTINCT` exposes its distinct-value set to downstream consumers.
 - **Sort- or top-N-driven pruning** — a post-sort min/max is exact and free; a top-N's current threshold tightens upstream filters.
 - **Adaptive runtime predicates** — operators that observe data and refine filters over the lifetime of a pipeline.
 
-This document describes the general dynamic-filter framework in Sirius and the phased plan for delivering it. **The current PR adds the framework scaffolding only — no producers, no consumers, no behavior change.** Phase 1 is the first concrete use case (dynamic table-filter pushdown) and lands in follow-up PRs that plug into the scaffolding introduced here.
+This document describes the general dynamic-filter framework in Sirius and the phased plan for delivering it. **The framework scaffolding — the `sirius_dynamic_filter` base and the `sirius_dynamic_filter_set` channel — landed in an earlier PR. This PR delivers Phase 1: the first concrete use case (dynamic table-filter pushdown), with a hash-join-build producer, a parquet-scan consumer, and three filter kinds (zone-map, IN-list, bloom).** It ships **off by default** and is net-neutral on full TPC-H with concentrated wins (Q21, Q2 — see *Measured* below). Phases 2–4 below remain design-only.
 
 ## How the phases generalize
 
@@ -21,7 +21,7 @@ The framework has four axes of generality. Each phase opens one axis:
 | Filter kind | zone map → bloom → IN-list | (reuses Phase 1's filter zoo) | (reuses) | (reuses) |
 | Consumer kind | parquet metadata scan only | + hash-join probe | + any operator with a column input | (unchanged) |
 | Producer kind | hash-join build only | (unchanged) | + agg, sort, filter | (unchanged) |
-| Coordination | implicit (meta-pipeline ordering) | explicit readiness for non-implicit pairs | (unchanged) | streaming / incremental refinement |
+| Coordination | opportunistic (build-side publish) | explicit readiness for non-implicit pairs | (unchanged) | streaming / incremental refinement |
 
 Anything implemented in Phase 1 is reused unchanged by later phases. We do not replace DuckDB's static table-filter pushdown — static filters continue to flow through the existing translator path and are AND-merged with dynamic filters at the consumer.
 
@@ -31,10 +31,10 @@ The framework has four pieces, all designed to be filter-kind, producer-kind, an
 
 1. **`sirius_dynamic_filter`** — polymorphic base class for runtime-computed filters. Each subclass knows how to lower itself to a cuDF AST fragment, to a runtime apply pass, or both.
 2. **`sirius_dynamic_filter_set`** — thread-safe append-only channel that connects producers and consumers. Keyed by the consumer's column index in its output schema.
-3. **Filter router** *(future)* — keeps a map of channels keyed by a *route key*, so multiple operators can attach to the same channel during plan construction.
-4. **Producer / consumer roles** *(future)* — concrete operators that push filters into channels (producers) or read them out (consumers). An operator can be both for different channels.
+3. **Filter router** *(Phase 1.1)* — keeps a map of channels keyed by a *route key*, so multiple operators can attach to the same channel during plan construction.
+4. **Producer / consumer roles** *(Phase 1.1)* — concrete operators that push filters into channels (producers) or read them out (consumers). An operator can be both for different channels.
 
-Pieces 1 and 2 (and the `merge_ast_dynamic_filters_into_tree` helper) are introduced in the scaffolding PR. Pieces 3 and 4 land with the first producer and consumer (Phase 1.1).
+Pieces 1 and 2 (and the `merge_ast_dynamic_filters_into_tree` helper) were introduced in the earlier scaffolding PR. Pieces 3 and 4 are added by this PR, alongside the first producer and consumer (Phase 1.1).
 
 ```
    PRODUCERS                     CHANNEL                          CONSUMERS
@@ -135,15 +135,16 @@ A **consumer** holds the channel directly via `std::shared_ptr<sirius_dynamic_fi
 
 **Scalar lifetime.** Scalars referenced by AST literals or apply kernels are owned by the filter instance, which is owned by the set. The set must outlive any AST tree or apply invocation built from filters it contains.
 
-**Producer-consumer ordering.** The consumer must not read filters until every producer has pushed. In Phases 1-3 this is guaranteed implicitly by meta-pipeline structure: the consumer is downstream of the producer in the engine's pipeline graph, so the producer's finalization runs before the consumer's task executes. This is an invariant of the engine, not of the framework. Phase 4 adds explicit readiness signals (`signal_ready` / `wait_ready`) for patterns where this implicit ordering does not hold; Phases 1-3 do not call them.
+**Producer-consumer ordering.** The consumer cannot rely on reading *after* the producer pushed: Sirius injects `PARTITION`+`CONCAT` pipelines between the probe scan and the join probe, so the probe scan runs in its own pipeline *concurrently* with the build and is not ordered after the build's finalize (see *Producer/consumer timing* below). Consumption is therefore **purely opportunistic** — each split applies whatever filters are present in the channel when it runs (`has_filters()`, lock-free), and a filter that publishes after a split was read simply does not prune it. Correctness is never at stake because the join is authoritative; only pruning is lost. The build-side producer publish (below) is what makes the filter available early enough to prune most splits without any consumer-side waiting.
 
-## Static + dynamic filter mixing at the consumer
+## Static + dynamic filter at the consumer
 
-A parquet partition's static filter is a `shared_ptr<duckdb::Expression>` (`parquet_scan_operator_data::filter_expression`). At execute time, `sirius_gpu_parquet_scan_operator` calls `gpu_expression_translator::translate_expression_with_names` to lower it to a cuDF AST. The translation outcome is what the dynamic-filter merge has to interleave with:
+The static and dynamic filters live on **separate, non-interfering paths**, which is what lets the dynamic side be a pure optimization:
 
-- **No static filter.** The consumer builds an AST tree containing only the dynamic-filter fragments and installs it via `reader_options::set_filter`.
-- **Static filter, translation succeeds.** The consumer takes the translated AST, calls `merge_ast_dynamic_filters_into_tree(tree, static_root, set, resolver)` to AND-conjoin every dynamic fragment into it, and installs the resulting root via `set_filter`. Parquet row-group pruning sees the combined predicate.
-- **Static filter, translation fails.** The static filter falls through to post-decode evaluation by `gpu_expression_executor`. **AST-path dynamic pushdown is skipped** here — we cannot mix an AST fragment with a DuckDB expression in `reader_options::set_filter`. Phase 1.2's runtime apply path lifts this restriction for filter kinds that support `apply`.
+- **Static filter** — a `shared_ptr<duckdb::Expression>` (`parquet_scan_operator_data::filter_expression`), lowered by `gpu_expression_translator::translate_expression_with_names` to a cuDF AST and installed via `reader_options::set_filter` (or, if translation fails, evaluated post-decode by `gpu_expression_executor`). It is authoritative for correctness and is never touched by the dynamic side.
+- **Dynamic filter** — built into its *own* zone-map AST (`merge_dynamic_filters_into_ast`, column-name references) and used **only** to compute a surviving row-group set via `filter_row_groups_with_stats`, which feeds `reader_options::set_row_groups`. It is never merged into `set_filter` (that would re-evaluate it per row — redundant with the join) and never changes which rows are returned.
+
+Because the dynamic predicate is row-group-only, the earlier static/dynamic-AST-mixing cases (and the "translation failed ⇒ dynamic pushdown skipped" restriction) no longer apply: the dynamic side prunes row groups regardless of the static filter's translation outcome, and the static filter keeps its own path unchanged.
 
 This mixing rule is a property of the consumer (parquet metadata scan), not the framework. Other consumers (hash-join probe in Phase 2) have their own merge rules.
 
@@ -156,22 +157,78 @@ This mixing rule is a property of the consumer (parquet metadata scan), not the 
 **Producer:** hash-join build side.
 **Consumer:** parquet scan task (`parquet_scan_task_global_state`).
 **Routing:** DuckDB-paired (`DynamicTableFilterSet*` route key).
-**Coordination:** implicit (meta-pipeline ordering).
+**Coordination:** opportunistic (build-side publish; no consumer-side wait).
 
 ### 1.1 Foundational wiring
 
 Wires the scaffolding into operators end-to-end against a degenerate single-zone (N=1) zone-map filter — equivalent to a global min/max bound. Validates the channel + router + consumer-merge plumbing in a real query.
 
-What this PR adds:
+Plan-gen / type plumbing:
 
-- `sirius_physical_plan_generator::dynamic_filter_channels` map (the router)
-- `sirius_physical_table_scan::sirius_dynamic_filters` field (consumer endpoint)
-- `sirius_physical_parquet_scan::sirius_dynamic_filters` field (consumer endpoint, propagated from table_scan)
+- `sirius_physical_plan_generator::dynamic_filter_channels` map (the router), gated by `enable_dynamic_filter_pushdown`
+- `sirius_physical_table_scan` / `sirius_physical_parquet_scan` `sirius_dynamic_filters` field (consumer endpoint, propagated to the runtime `sirius_gpu_parquet_scan_operator`)
 - `sirius_physical_hash_join::probe_target` struct + `probe_targets` vector (producer endpoint)
-- Plan-gen wiring in `sirius_plan_get.cpp` and `sirius_plan_comparison_join.cpp`
-- Producer-side push in `sirius_physical_hash_join::finalize_operator()`: `cudf::reduce` to compute global (min, max) per join key, emit a single-zone `sirius_dynamic_zone_map_filter`, push into each probe target's channel
-- Consumer-side merge in `parquet_scan_task_global_state`: replace the current "Dynamic table filters are not supported" `throw` with a call to `merge_ast_dynamic_filters_into_tree`, AND-conjoin with the static filter, install via `reader_options::set_filter`
-- E2E TPC-H test (Q14, Q19) verifying row-group pruning fires
+- Plan-gen wiring in `sirius_plan_get.cpp` and `sirius_plan_comparison_join.cpp`; the join attaches a channel per target
+
+#### Producer/consumer timing — the problem this phase actually had to solve
+
+The naïve producer (push the filter at the hash join's `finalize_operator`) and naïve consumer (read the channel opportunistically at parquet-read time) are **correct but deliver no pruning**, because the producer publishes far too late relative to the concurrently-running probe scan. Two facts, both measured on SF30:
+
+1. The probe scan's footer-parse + split generation runs eagerly at `prepare_for_query`, and its read tasks run in a pipeline that is **not** ordered after the build (injected `PARTITION`/`CONCAT`). With opportunistic consumption, `merged@read = 0` — every split is read before any filter exists.
+2. The probe side's `CONCAT` withholds probe batches from the join until the *entire* probe scan finishes, so a build/probe-coupled producer (which needs a probe batch to build its hash table) cannot publish the filter until the scan is already done. Even throttling the probe scan to wait for the filter then **deadlocks the filter on the probe batch it is waiting for** — measured: a wait made the query 12× *slower* with `merged@read` still 0.
+
+Phase 1.1 resolves this with two changes, both reused unchanged by later phases:
+
+**(a) Opportunistic consumption (no consumer-side wait).** The channel exposes only a lock-free `has_filters()`; each split applies whatever filters are present when it runs. An earlier design added a producer-counted readiness signal (`register_producer` / `mark_producer_ready` / `ready`) and a bounded `wait_until_filters` so a scan could throttle until the build published — but that wait was evaluated *per split*, compounded across a large fact scan while a nested-join build had not yet published, and measured catastrophic (+74 % at 150 ms, +154 % at 300 ms on full TPC-H). Since the build-side publish (b) already makes the filter available early enough to prune most splits, the wait bought nothing; it, the `dynamic_filter_wait_ms` knob, and the entire readiness protocol were removed. Consumption is opportunistic only — a late filter costs pruning on the splits already read, never correctness.
+
+**(b) Build-side producer publish — independent of any probe batch.** The fundamental obstacle (fact 2) is that in `BUILD_PROBE` the hash table — and so any filter computed in `execute()` — is built from the *first probe batch*, which the probe-side `CONCAT` withholds until the whole scan finishes. The fix is to compute and publish the filter the moment the **build batch is delivered to the join's build port**, before any probe batch and entirely outside the join's task state machine: `sirius_physical_hash_join::push_data_batch_partitioned` overrides the build-port delivery, and when the (single, concat-folded) build batch arrives for a wired `BUILD_PROBE` join it reduces per-key `(min,max)` on a private stream and `publish_dynamic_filters_locked`s. This is safe because the build side completes independently of the probe scan (the build PARTITION sets `BUILD_PROBE` + enables build-concat-all *before* the build CONCAT folds and delivers). An attempt to instead make the join's *first task* build-only (no probe batch) was reverted — it deadlocks the `task_creator`: the join's `NOT_BUILT` hint returning `WAITING(probe producer)` is what drives probe production via `get_operator_for_next_task`, so short-circuiting it to `READY` parks the creator in `sem_wait`. The build-port hook avoids the scheduler entirely. Publish is idempotent (`_dynamic_filters_published`); the `BUILT` transition in `execute()` and `on_finalize_operator` are fallbacks.
+
+**(c) Application in the probe scan = row-GROUP pruning only.** A dynamic join filter is *redundant with the join that produced it*: the join discards every non-matching probe row, so the filter never has to filter at the row level — its only worthwhile effect is to **skip whole row groups** that cannot contain a match, saving their I/O and decode. On the disk path (`read_table_from_metadata`), before the read, each split's already-(statically)-pruned row groups are passed through `hybrid_scan_reader::filter_row_groups_with_stats` against the dynamic zone-map predicate (`prune_row_groups_by_dynamic_filters`, evaluated on a *private* stream so its sync never blocks behind the scan's decode); the surviving set is handed to `reader_options::set_row_groups`. The cached/pinned path, which has no row groups to prune, still applies the filter at the row level via `apply_dynamic_filters_to_output_table` (the Phase 1.2 `apply` capability). The static filter is untouched and remains authoritative.
+
+> **Redesign note (nsys-driven, SF50).** The original 1.1 applied the dynamic filter at the **row level** — AND-merged into `reader_options::set_filter` *and* a post-decode `compute_column`+`apply_boolean_mask`. nsys + NVTX profiling showed *that* was the TPC-H regression source (not the publish, which is ~1.5 ms): on scattered keys the reader evaluated a predicate that pruned nothing, and the post-decode pass filtered the whole table for ~0 rows. (The earlier "`merged@read=0` ⇒ never applies" reading was an **artifact of grepping `SIRIUS_LOG_DEBUG` apply logs that are suppressed at `info`** — the NVTX `dynfilter::apply_output` range is ground truth: the filter *was* applying and costing time.) Switching to row-group pruning makes an unprunable scan a no-op (a cheap stats check) instead of a regression, while keeping the prune-at-read win where keys cluster. The filter never affects results because the join is authoritative.
+
+#### Measured
+
+- **SF50, full TPC-H (22 queries), regression guard — OFF vs ON:** aggregate **+0.2 %** (136.17 s → 136.39 s), i.e. net-zero within the per-query noise floor (~±9 % on the small queries; the large queries are all ≤ ±3 %). **All 22 results bit-identical** OFF vs ON. `pruned=0` on every query — TPC-H's scattered keys (and the leaf-scan-vs-late-build timing) prune nothing, but now that costs nothing. Full unit suite passes.
+- **SF30, `lineitem ⋈ keyset` on clustered `l_orderkey`** (the case the zone-map is *for*): the zone-map excludes the non-overlapping row groups, ≈1.6× — preserved by the row-group path. This requires the keyset's narrow range be *runtime*-determined: for a literal/range-derivable build, DuckDB's static transitive pushdown already prunes (measured feature-OFF == ON on SF50), so the dynamic zone-map adds nothing — hence it is gated off by default (`enable_dynamic_zone_map_filter`).
+
+Zone-map pruning only pays off when the build-side join key is range-restricted on a *clustered* fact (e.g. `l_orderkey`) **and** the filter publishes before the probe reads. TPC-H joins on scattered keys (`l_partkey` in Q14/Q17/Q19) prune nothing — those are handled by the membership filters below.
+
+### 1.3–1.4 Membership filters (IN-list + Bloom)
+
+The zone-map captures only the build keys' `[min,max]` range, which is useless for *scattered* keys — even a 0.24%-selective `part` build spans the whole partkey domain (measured). Set **membership** is what distinguishes those keys, so two kinds were added as a new capability, `sirius_apply_lowerable` (a `compute_mask(probe) → BOOL` mask, distinct from `sirius_ast_lowerable`):
+
+- **`sirius_dynamic_in_list_filter`** — exact membership via `cudf::stable_distinct` (build) + `cudf::contains` (probe). For *small* selective builds.
+- **`sirius_dynamic_bloom_filter`** — a `cuco::bloom_filter` (PIMPL'd in a `.cu`; INT64 keys), a few bits/key, for *large* builds (millions of keys) where an exact IN-list is too big. False positives only let a few extra rows through — harmless, the join is authoritative; no false negatives, so a true match is never dropped.
+
+**Producer policy** (`push_build_side_dynamic_filters`). The master switch `enable_dynamic_filter_pushdown` emits a **membership filter** per key, chosen by **L2-cache fit**: build the structure whose device footprint fits the GPU's L2 cache, so its random per-row probe runs at L2 bandwidth instead of thrashing HBM. Prefer the exact **IN-list** (the `cuco::static_set` `cudf::contains` builds, ≈ `16·N` bytes for INT64) if it fits L2; else the ~8×-smaller **Bloom** (≈ `2·N` bytes) if it fits; else **none** — a structure that spills L2 would make the post-decode probe cost more than the pruning saves. Sizes come from `sirius_dynamic_in_list_filter::estimated_set_bytes` / `sirius_dynamic_bloom_filter::estimated_bytes` against `cudaDevAttrL2CacheSize`, computed from the build row count (an upper bound on distinct keys; exact for the Bloom).
+
+A second switch, `enable_dynamic_zone_map_filter` (default **off**, requires the master), *additionally* emits a **zone-map** (build-key min/max) per key for **read-time row-group pruning** — a complementary consumer path. It is off by default because on TPC-H-shaped joins DuckDB's static transitive-predicate pushdown already prunes range-derivable builds (measured: feature OFF == ON), and scattered keys prune nothing; the zone-map pays off only on clustered-keyset joins whose narrow key range is runtime-determined. The consumer **gates** it (`_zonemap_gate`, mirroring `_membership_gate`): if the first split with row groups prunes none, the per-split stats check is disabled for the rest of the scan.
+
+**Consumer**: membership rides the post-decode `apply_dynamic_filters_to_output_table` path (`include_ast_lowerable=false`); the zone-map rides the read-time `prune_row_groups_by_dynamic_filters` path. Because membership is applied *post-decode*, it never saves the scan I/O/decode — only the *downstream* work on dropped rows; so it wins on selective builds feeding expensive downstream and is neutral on scan-dominated single joins.
+
+The cutover is **hardware-adaptive** — it replaced an earlier fixed `2M`-row-count threshold — landing at ≈1.5M INT64 keys on a 24 MB L2, ~2.5M at 40 MB, ~6M at 96 MB. A TPC-H SF50 sweep showed the IN-list↔bloom choice is **wall-clock-neutral** (every query whose kind flips is flat across `[500K, 8M]`; forcing the affected builds all the way to *none* moved them ≤1.5%, within run-to-run noise) — membership is post-decode behind the adaptive gate, so the structure, and even whether one exists, barely moves the clock. The L2 policy was adopted not for an SF50 win but because it is principled and its *none* branch avoids an L2-spilling Bloom on very large builds (a post-decode probe that thrashes HBM and prunes nothing would otherwise regress). All result sets stay bit-identical across IN-list / Bloom / none.
+
+**Adaptive selectivity gate** (`_membership_gate`): the first split(s) apply the filter and record the keep ratio (free — `apply_boolean_mask` already sized the output); if a split keeps `> 50%` of its rows the gate flips to DISABLED and the rest of that scan skips the membership apply — so a non-selective build costs at most a few splits instead of regressing the whole scan.
+
+**Measured (SF50, full TPC-H, ON vs OFF, robust medians):** real wins where a selective build feeds expensive downstream — **Q21 −10.6%** (bloom on F-status `orders`, ~37M keys, drops half of lineitem before its 3-way self-join), **Q2 −7.9%** (IN-list on the selective `part` build). Net suite ≈ **−1.5%** (concentrated on Q21/Q2; the wins are percentage-large but partly on cheap queries). All 22 results bit-identical OFF vs ON; the gate keeps Q21/Q2 ACTIVE and protects non-selective builds. Q21's win is timing-dependent (the bloom must publish before lineitem's self-joins — see the producer/consumer timing problem above). Off by default.
+
+> **Cold vs warm.** The numbers above are **warm** (page-cache-resident) medians. A cold/deployment-representative sweep (drop OS cache before each run) shows the wins **largely evaporate** — membership applies *post-decode*, so it cannot cut scan I/O, and the big nominal wins are on I/O-bound queries: full-suite net ≈ **−0.5 % cold** vs ≈ −1.5 / −2.2 % warm. The durable benefit is on small-selective-build, *compute-bound* queries (Q2-shaped); benefit ∝ 1/(how I/O-bound the query is). *Q21 caveat:* a per-query SF50 diagnostic found Q21 wires only a ~20K-key IN-list on the Phase-1 scan-pushdown path (not the ~37M-key `orders` bloom the −10.6 % was attributed to), and its measured swing is within run-to-run noise — a bloom over the F-status `orders` self-join would be a Phase-2 SIP consumer, which does not exist yet.
+
+*Follow-ups:* non-INT64 bloom keys. (The RMM-backed bloom allocator landed in `88a9326`. The per-split consumer wait was removed as a net regression; a *one-shot* readiness wait could be revisited only if Q21's timing-dependent win is ever shown worth making reliable.)
+
+> **Residual cost / tracked optimization.** `filter_row_groups_with_stats` is ~46 ms/call (host work, O(file row groups)) and is invoked per split; the SF50 net-zero shows it is fully absorbed by scan-thread parallelism (the scan is not the TPC-H critical path), but it is still redundant per-split work. A per-file pruning cache (compute once per file, intersect each split host-side — identical results) would remove it; deferred since it adds thread-safety for no measured gain on an off-by-default feature.
+
+#### Configuration
+
+- `enable_dynamic_filter_pushdown` (bool, default **false**) — master switch; when off (the default), the router hands out no channels so neither side wires anything and there is zero overhead. Enable to wire the membership (IN-list / Bloom) filters.
+- `enable_dynamic_zone_map_filter` (bool, default **false**, requires the master) — additionally emit a read-time zone-map for row-group pruning. Off by default: measured net-neutral / inert on TPC-H (DuckDB's static pushdown already prunes range-derivable builds and scattered keys prune nothing — feature OFF == ON), so it is reserved for clustered-keyset workloads whose narrow key range is runtime-determined. The consumer gate bounds its cost to one split when it can't prune.
+#### Filter availability & late filters (read before Phase 1.3)
+
+Consumption is opportunistic — there is no consumer-side wait (see §1.1 (a)). Two properties keep "a zone-map is present before the bloom arrives" from being a problem once a channel carries **more than one filter kind** (e.g. a zone-map *and* a bloom, Phase 1.3):
+
+1. **Correctness is never affected.** Dynamic filters are conjunctive *superset* predicates — applying a subset (or none) keeps a superset of the rows that can join, and the join does the exact match. A missing or late filter costs *pruning*, never correctness.
+2. **The consumer re-snapshots the channel per split, not once.** `merge_dynamic_filters_into_ast` / `apply_dynamic_filters_to_output_table` run on every split's `execute()` and AND-conjoin *all* filters currently present, so a filter that lands late (a bloom built after the zone-map) is automatically applied to every split read after it arrives — an early filter does **not** lock out a later one. (Because bloom is not `sirius_ast_lowerable`, it rides the post-decode `apply` path while the zone-map rides `set_filter` — they compose, they don't compete.)
 
 ### 1.2 Multi-zone zone maps
 
@@ -185,7 +242,9 @@ This sub-stage adds the runtime apply path (`sirius_dynamic_filter::apply`) so t
 
 Bloom filters are runtime-only — there is no AST node that evaluates "is this hash in this bitset" without a custom kernel.
 
-**Build heuristic: only build the bloom if it fits in L2 cache.** A bloom probe is bandwidth-bound — every probed row issues a small number of random loads against the bitset. If the bitset fits in L2, those loads land in L2 and the probe runs at L2 bandwidth; if it spills, every probe pays full HBM bandwidth and the bloom is no longer worth its construction cost. The producer queries the GPU's L2 size at build time (`cudaDeviceGetAttribute(cudaDevAttrL2CacheSize)`) and skips bloom when the sized bitset would exceed it; if the FPR target cannot be met within that budget, it falls back to zone-map / IN-list filters.
+This is the first time a channel carries two filter kinds (zone-map at read + bloom post-decode). Because consumption is opportunistic and the consumer re-snapshots the channel per split (see §1.1 *Filter availability & late filters*), the two kinds compose without coordination: the zone-map prunes row groups at read, while the bloom — which lands later — is picked up post-decode on every split read after it arrives, so the slow bloom build never blocks the scan.
+
+**Build heuristic: the structure must fit L2 (implemented).** A membership probe is bandwidth-bound — every probed row issues a few random loads against the set/bitset. If it fits L2 those loads run at L2 bandwidth; if it spills, every probe pays full HBM bandwidth and the filter is no longer worth its post-decode cost. The producer queries the GPU's L2 size (`cudaDeviceGetAttribute(cudaDevAttrL2CacheSize)`) and applies the L2-fit decision described under *Producer policy* above — exact IN-list if its set fits L2, else Bloom if its bitset fits, else no filter — which subsumed the original fixed row-count cutover.
 
 ### 1.4 IN-list / hash set
 
@@ -232,18 +291,21 @@ This phase is opportunistic — its value depends on where bottlenecks land afte
 
 **Goal:** generalize the *coordination* axis — producers update filters incrementally as they observe more data; consumers wait for finalization or apply progressively-tightening filters as they arrive. Use cases: streaming refinement, cross-pipeline channels with no implicit edge, adaptive runtime predicates.
 
-This adds explicit lifecycle methods on the channel (`signal_ready` / `wait_ready` / `ready`) and may version filters so consumers can opt into "latest" semantics. Phases 1-3 do not call any of this. The phase is speculative and included so the channel's lifecycle is not silently locked to "push once at finalization" by earlier phases. No work is planned until a concrete use case justifies it.
+This adds explicit lifecycle methods on the channel (`signal_ready` / `wait_ready` / `ready`) and may version filters so consumers can opt into "latest" semantics. Phases 1-3 do not call any of this. The phase is speculative and included so the channel's lifecycle is not silently locked to "push once at finalization" by earlier phases. No work is planned until a concrete use case justifies it. (Phase 1.1 briefly implemented a concrete version — `register_producer` / `mark_producer_ready` / `ready` plus a bounded `wait_until_filters` — to let the probe scan wait for the build; it was removed when the per-split wait proved a net regression and opportunistic consumption proved sufficient. A future refinement would use a *one-shot*, not per-split, wait.)
 
 ---
 
 ## Open questions
 
-1. **Meta-pipeline ordering verification.** Phase 1.1's correctness depends on the build pipeline finalizing before the scan task runs. We believe this holds for join → scan pushdown via meta-pipeline structure, but it has not been verified end-to-end. Phase 1.1's E2E test is the validation.
+1. ~~**Meta-pipeline ordering verification.**~~ **Resolved (negatively), then closed.** The implicit ordering does *not* hold (probe scan runs concurrently with the build; the probe-side `CONCAT` withholds probe batches until the scan finishes). Phase 1.1 therefore does not rely on ordering: it uses runtime apply on materialized data (cached + post-decode) **and** a build-side producer publish (`push_data_batch_partitioned` build-port hook) that publishes the filter the moment the build side completes — independent of any probe batch — so consumption point 1 (skip a split's read I/O) is reached without any consumer-side wait.
 2. **AST-size threshold for multi-zone maps.** Phase 1.2's fallback-to-global threshold should be tuned with a microbenchmark on TPC-H Q14 / Q19 once 1.2 lands.
 3. **Bloom build-cost gate.** Phase 1.3 sizes bloom against L2, but a separate lower bound on build cardinality (below which bloom is dominated by zone-map / IN-list) is unspecified. Candidate: skip bloom when build cardinality < 10k.
 
 ## References
 
-- `src/include/op/sirius_dynamic_filter.hpp`, `src/op/sirius_dynamic_filter.cpp`, `test/cpp/operator/test_sirius_dynamic_filter.cpp` — framework API, implementation, and tests added by this PR
+- `src/include/op/sirius_dynamic_filter.hpp`, `src/op/sirius_dynamic_filter.cpp`, `test/cpp/operator/test_sirius_dynamic_filter.cpp` — framework API, implementation, and tests; the base + channel landed in the scaffolding PR and are extended here with the IN-list/zone-map filter kinds and the `sirius_apply_lowerable` capability
+- `src/cuda/sirius_dynamic_bloom_filter.cu` — `sirius_dynamic_bloom_filter` (PIMPL'd `cuco::bloom_filter`, INT64 keys), added by this PR
+- `src/include/op/scan/dynamic_filter_merge.hpp`, `src/op/scan/dynamic_filter_merge.cpp`, `test/cpp/scan/test_dynamic_filter_merge.cpp` — consumer-side merge/apply helpers (`merge_dynamic_filters_into_ast`, `apply_dynamic_filters_to_output_table`, `prune_row_groups_by_dynamic_filters`), added by this PR
+- `src/planner/sirius_plan_comparison_join.cpp`, `src/planner/sirius_plan_get.cpp`, `test/cpp/planner/test_dynamic_filter_router.cpp` — producer/consumer plan-gen wiring and the router, added by this PR
 - `src/include/expression_executor/gpu_expression_translator_internal.hpp` — existing AST construction patterns (`cudf::ast::tree::emplace`, scalar lifetime)
 - `duckdb/src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp` — `JoinFilterPushdownInfo`, `JoinFilterPushdownFilter` (consumed by Phase 1.1)
