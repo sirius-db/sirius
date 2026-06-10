@@ -2,7 +2,11 @@ use std::{env, path::PathBuf};
 
 use prost_build::{Method, Service, ServiceGenerator};
 
-const PRPC_PROTO: &str = "proto/prpc.proto";
+const BRPC_PROTOS: &[&str] = &[
+    "src/brpc/options.proto",
+    "src/brpc/policy/baidu_rpc_meta.proto",
+    "src/brpc/streaming_rpc_meta.proto",
+];
 const STARROCKS_PROTOS: &[&str] = &[
     "binlog.proto",
     "data.proto",
@@ -16,30 +20,33 @@ const STARROCKS_PROTOS: &[&str] = &[
     "types.proto",
 ];
 
-/// Generates StarRocks protobuf bindings, local PRPC metadata bindings, and the BRPC service facade.
+/// Generates StarRocks protobuf bindings, BRPC metadata bindings, and the BRPC service facade.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
+    let brpc_dir = manifest_dir.join("brpc");
     let proto_dir = manifest_dir.join("starrocks/gensrc/proto");
-    let local_proto_dir = manifest_dir.join("proto");
-    let prpc_proto = manifest_dir.join(PRPC_PROTO);
 
+    println!("cargo:rerun-if-changed={}", brpc_dir.display());
     println!("cargo:rerun-if-changed={}", proto_dir.display());
-    println!("cargo:rerun-if-changed={}", prpc_proto.display());
 
-    let mut protos = STARROCKS_PROTOS
+    let mut protos = BRPC_PROTOS
         .iter()
         .map(|proto| {
-            let path = proto_dir.join(proto);
+            let path = brpc_dir.join(proto);
             println!("cargo:rerun-if-changed={}", path.display());
             path
         })
         .collect::<Vec<_>>();
-    protos.push(prpc_proto);
+    protos.extend(STARROCKS_PROTOS.iter().map(|proto| {
+        let path = proto_dir.join(proto);
+        println!("cargo:rerun-if-changed={}", path.display());
+        path
+    }));
 
     let mut config = prost_build::Config::new();
     config.disable_comments(["."]);
     config.service_generator(Box::new(BrpcServiceGenerator));
-    config.compile_protos(&protos, &[proto_dir, local_proto_dir])?;
+    config.compile_protos(&protos, &[brpc_dir.join("src"), proto_dir])?;
 
     Ok(())
 }

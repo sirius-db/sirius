@@ -1,10 +1,13 @@
-use std::io::{self, Read, Write};
+use std::io;
 
 #[cfg(test)]
-use crate::proto::prpc::RpcRequestMeta;
-use crate::proto::prpc::{RpcMeta, RpcResponseMeta};
+use crate::proto::brpc::policy::RpcRequestMeta;
+use crate::proto::brpc::policy::{RpcMeta, RpcResponseMeta};
 use anyhow::{Context, Result, anyhow};
 use prost::Message;
+#[cfg(test)]
+use std::io::Read;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Magic prefix for Baidu PRPC frames. StarRocks FE sends backend RPCs with
 /// this raw TCP frame format rather than gRPC over HTTP/2.
@@ -171,6 +174,8 @@ impl Frame {
                 attachment_size: Some(attachment.len().min(i32::MAX as usize) as i32),
                 chunk_info: None,
                 authentication_data: None,
+                stream_settings: None,
+                user_fields: Default::default(),
             },
             body,
             attachment,
@@ -195,9 +200,8 @@ impl Frame {
                     trace_id: None,
                     span_id: None,
                     parent_span_id: None,
-                    ext_fields: Vec::new(),
-                    extra_param: None,
-                    trace_key: None,
+                    request_id: None,
+                    timeout_ms: None,
                 }),
                 response: None,
                 compress_type: Some(0),
@@ -205,6 +209,8 @@ impl Frame {
                 attachment_size: None,
                 chunk_info: None,
                 authentication_data: None,
+                stream_settings: None,
+                user_fields: Default::default(),
             },
             body,
             attachment,
@@ -213,6 +219,7 @@ impl Frame {
 }
 
 /// Reads one PRPC frame from a stream, returning `None` on normal connection close.
+#[cfg(test)]
 pub(crate) fn read_frame(stream: &mut impl Read) -> Result<Option<Frame>> {
     let mut header = [0u8; PRPC_HEAD_SIZE];
     match stream.read_exact(&mut header) {
@@ -230,6 +237,51 @@ pub(crate) fn read_frame(stream: &mut impl Read) -> Result<Option<Frame>> {
         Err(err) => return Err(err).context("failed to read PRPC header"),
     }
 
+    let sizes = frame_sizes(&header)?;
+    let mut payload = vec![0u8; sizes.message_size];
+    stream
+        .read_exact(&mut payload)
+        .context("failed to read PRPC body")?;
+    decode_payload(sizes.meta_size, payload).map(Some)
+}
+
+/// Reads one PRPC frame from an async stream, returning `None` on normal connection close.
+pub(crate) async fn read_frame_async(
+    stream: &mut (impl AsyncRead + Unpin),
+) -> Result<Option<Frame>> {
+    let mut header = [0u8; PRPC_HEAD_SIZE];
+    match stream.read_exact(&mut header).await {
+        Ok(_) => {}
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(err) => return Err(err).context("failed to read PRPC header"),
+    }
+
+    let sizes = frame_sizes(&header)?;
+    let mut payload = vec![0u8; sizes.message_size];
+    stream
+        .read_exact(&mut payload)
+        .await
+        .context("failed to read PRPC body")?;
+    decode_payload(sizes.meta_size, payload).map(Some)
+}
+
+/// Decoded payload sizes from the fixed PRPC header.
+struct FrameSizes {
+    message_size: usize,
+    meta_size: usize,
+}
+
+/// Validates a PRPC header and extracts body sizes.
+fn frame_sizes(header: &[u8; PRPC_HEAD_SIZE]) -> Result<FrameSizes> {
     if &header[..4] != PRPC_MAGIC {
         return Err(anyhow!("invalid PRPC magic code"));
     }
@@ -248,10 +300,15 @@ pub(crate) fn read_frame(stream: &mut impl Read) -> Result<Option<Frame>> {
         return Err(anyhow!("PRPC meta size exceeds message size"));
     }
 
-    let mut payload = vec![0u8; message_size];
-    stream
-        .read_exact(&mut payload)
-        .context("failed to read PRPC body")?;
+    Ok(FrameSizes {
+        message_size,
+        meta_size,
+    })
+}
+
+/// Decodes a complete PRPC payload after the fixed header has been parsed.
+fn decode_payload(meta_size: usize, payload: Vec<u8>) -> Result<Frame> {
+    let message_size = payload.len();
     let meta = RpcMeta::decode(&payload[..meta_size]).context("failed to decode PRPC metadata")?;
 
     if meta.compress_type.unwrap_or(0) != 0 {
@@ -262,6 +319,11 @@ pub(crate) fn read_frame(stream: &mut impl Read) -> Result<Option<Frame>> {
     if meta.chunk_info.is_some() {
         return Err(anyhow!(
             "chunked PRPC payloads are not supported by the Rust CN"
+        ));
+    }
+    if meta.stream_settings.is_some() {
+        return Err(anyhow!(
+            "streaming PRPC payloads are not supported by the Rust CN"
         ));
     }
 
@@ -280,20 +342,27 @@ pub(crate) fn read_frame(stream: &mut impl Read) -> Result<Option<Frame>> {
     let body = payload[body_start..body_end].to_vec();
     let attachment = payload[body_end..].to_vec();
 
-    Ok(Some(Frame {
+    Ok(Frame {
         meta,
         body,
         attachment,
-    }))
+    })
 }
 
-/// Writes one encoded PRPC frame to a stream.
-pub(crate) fn write_frame(stream: &mut impl Write, frame: &Frame) -> Result<()> {
+/// Writes one encoded PRPC frame to an async stream.
+pub(crate) async fn write_frame_async(
+    stream: &mut (impl AsyncWrite + Unpin),
+    frame: &Frame,
+) -> Result<()> {
     let bytes = encode_frame(frame);
     stream
         .write_all(&bytes)
+        .await
         .context("failed to write PRPC response")?;
-    stream.flush().context("failed to flush PRPC response")?;
+    stream
+        .flush()
+        .await
+        .context("failed to flush PRPC response")?;
     Ok(())
 }
 
@@ -317,6 +386,7 @@ pub(crate) fn encode_frame(frame: &Frame) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use std::{
+        io::Write,
         net::{TcpListener, TcpStream},
         thread,
     };

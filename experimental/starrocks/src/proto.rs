@@ -1,7 +1,13 @@
-/// Generated metadata messages for the Baidu PRPC/BRPC frame envelope.
+/// Generated metadata messages from the Apache BRPC protobuf definitions.
 #[allow(dead_code)]
-pub mod prpc {
-    include!(concat!(env!("OUT_DIR"), "/prpc.rs"));
+pub mod brpc {
+    include!(concat!(env!("OUT_DIR"), "/brpc.rs"));
+
+    /// Generated messages for the Baidu PRPC/BRPC frame envelope.
+    #[allow(dead_code)]
+    pub mod policy {
+        include!(concat!(env!("OUT_DIR"), "/brpc.policy.rs"));
+    }
 }
 
 /// Generated StarRocks protobuf messages plus the generated BRPC service facade.
