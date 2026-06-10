@@ -179,14 +179,15 @@ jobs:
           retention-days: 14
 
       # S3 integration gate (issue #904).
-      # Phase 1: run on this branch's CUDA-13 test-run so we can verify Docker
-      # availability on the gpu-2xl4 runner under a draft PR.
+      # Phase 1: run on this branch's CUDA-13 test-run.
       # Phase 2 (before merge): gate each step behind
       #   github.event_name == 'merge_group' &&
-      # so PR CI stays Docker-free and only the merge queue pays the Docker cost.
-      - name: Docker availability
+      # so PR CI stays Docker-free and only the merge queue pays the MinIO cost.
+      - name: Start Docker daemon
         if: ${{ matrix.cuda.version == '13' }}
-        run: docker info || echo "::warning::Docker not available on this runner"
+        run: |
+          sudo systemctl start docker
+          sudo systemctl is-active --quiet docker
 
       - name: S3 integration tests
         if: ${{ matrix.cuda.version == '13' }}
