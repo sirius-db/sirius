@@ -1,8 +1,13 @@
 use std::io::{self, Read, Write};
 
+#[cfg(test)]
+use crate::proto::prpc::RpcRequestMeta;
+use crate::proto::prpc::{RpcMeta, RpcResponseMeta};
 use anyhow::{Context, Result, anyhow};
 use prost::Message;
 
+/// Magic prefix for Baidu PRPC frames. StarRocks FE sends backend RPCs with
+/// this raw TCP frame format rather than gRPC over HTTP/2.
 const PRPC_MAGIC: &[u8; 4] = b"PRPC";
 const PRPC_HEAD_SIZE: usize = 12;
 const MAX_PRPC_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
@@ -10,79 +15,21 @@ const PRPC_SUCCESS: i32 = 0;
 const PRPC_SERVICE_NOT_FOUND: i32 = 1001;
 const PRPC_ERROR: i32 = 2001;
 
-#[derive(Clone, PartialEq, Message)]
-struct RpcMeta {
-    #[prost(message, optional, tag = "1")]
-    request: Option<RpcRequestMeta>,
-    #[prost(message, optional, tag = "2")]
-    response: Option<RpcResponseMeta>,
-    #[prost(int32, optional, tag = "3")]
-    compress_type: Option<i32>,
-    #[prost(int64, optional, tag = "4")]
-    correlation_id: Option<i64>,
-    #[prost(int32, optional, tag = "5")]
-    attachment_size: Option<i32>,
-    #[prost(message, optional, tag = "6")]
-    chunk_info: Option<ChunkInfo>,
-    #[prost(bytes = "vec", optional, tag = "7")]
-    authentication_data: Option<Vec<u8>>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct RpcRequestMeta {
-    #[prost(string, required, tag = "1")]
-    service_name: String,
-    #[prost(string, required, tag = "2")]
-    method_name: String,
-    #[prost(int64, optional, tag = "3")]
-    log_id: Option<i64>,
-    #[prost(int64, optional, tag = "4")]
-    trace_id: Option<i64>,
-    #[prost(int64, optional, tag = "5")]
-    span_id: Option<i64>,
-    #[prost(int64, optional, tag = "6")]
-    parent_span_id: Option<i64>,
-    #[prost(message, repeated, tag = "7")]
-    ext_fields: Vec<RpcRequestMetaExtField>,
-    #[prost(bytes = "vec", optional, tag = "110")]
-    extra_param: Option<Vec<u8>>,
-    #[prost(string, optional, tag = "111")]
-    trace_key: Option<String>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct RpcRequestMetaExtField {
-    #[prost(string, required, tag = "1")]
-    key: String,
-    #[prost(string, required, tag = "2")]
-    value: String,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct RpcResponseMeta {
-    #[prost(int32, optional, tag = "1")]
-    error_code: Option<i32>,
-    #[prost(string, optional, tag = "2")]
-    error_text: Option<String>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct ChunkInfo {
-    #[prost(int64, required, tag = "1")]
-    stream_id: i64,
-    #[prost(int64, required, tag = "2")]
-    chunk_id: i64,
-}
-
+/// Decoded PRPC request passed from the transport layer to a Tower service.
 #[derive(Clone, Debug)]
 pub(crate) struct Request {
+    /// BRPC service name from request metadata.
     pub(crate) service_name: String,
+    /// BRPC method name from request metadata.
     pub(crate) method_name: String,
+    /// Protobuf-encoded method request body.
     pub(crate) body: Vec<u8>,
+    /// Optional BRPC attachment; StarRocks sends thrift plan fragments here.
     pub(crate) attachment: Vec<u8>,
 }
 
 impl Request {
+    /// Builds a decoded request for service dispatch and tests.
     pub(crate) fn new(
         service_name: impl Into<String>,
         method_name: impl Into<String>,
@@ -98,13 +45,17 @@ impl Request {
     }
 }
 
+/// Service response before it is wrapped back into a PRPC frame.
 #[derive(Clone, Debug)]
 pub(crate) struct Response {
+    /// Protobuf-encoded method response body.
     pub(crate) body: Vec<u8>,
+    /// Optional response attachment. The current CN plan path does not use it.
     pub(crate) attachment: Vec<u8>,
 }
 
 impl Response {
+    /// Builds a protobuf-body-only response.
     pub(crate) fn new(body: Vec<u8>) -> Self {
         Self {
             body,
@@ -113,6 +64,7 @@ impl Response {
     }
 }
 
+/// PRPC-level error, separate from StarRocks StatusPB method failures.
 #[derive(Clone, Debug)]
 pub(crate) struct Error {
     code: i32,
@@ -120,6 +72,7 @@ pub(crate) struct Error {
 }
 
 impl Error {
+    /// Returns a PRPC error for an unknown service name.
     pub(crate) fn service_not_found(text: impl Into<String>) -> Self {
         Self {
             code: PRPC_SERVICE_NOT_FOUND,
@@ -127,16 +80,19 @@ impl Error {
         }
     }
 
+    /// Returns a PRPC error for an unknown method name.
     pub(crate) fn method_not_found(text: impl Into<String>) -> Self {
         Self::service_not_found(text)
     }
 
+    /// Returns the default generated-service response for an RPC we do not implement.
     pub(crate) fn method_not_implemented(method_name: impl std::fmt::Display) -> Self {
         Self::method_not_found(format!(
             "method '{method_name}' is not implemented by the Rust CN"
         ))
     }
 
+    /// Returns a PRPC server error for a protobuf body that does not decode.
     pub(crate) fn invalid_request(
         method_name: impl std::fmt::Display,
         err: impl std::fmt::Display,
@@ -144,6 +100,7 @@ impl Error {
         Self::server(format!("invalid {method_name} request: {err}"))
     }
 
+    /// Returns a generic PRPC server error.
     fn server(text: impl Into<String>) -> Self {
         Self {
             code: PRPC_ERROR,
@@ -160,6 +117,7 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Raw PRPC frame after the 12-byte TCP header has been decoded.
 #[derive(Debug)]
 pub(crate) struct Frame {
     meta: RpcMeta,
@@ -168,6 +126,7 @@ pub(crate) struct Frame {
 }
 
 impl Frame {
+    /// Converts the request metadata, protobuf body, and attachment into a service request.
     pub(crate) fn request(&self) -> std::result::Result<Request, Error> {
         let Some(request) = self.meta.request.as_ref() else {
             return Err(Error::server("missing PRPC request metadata"));
@@ -181,6 +140,7 @@ impl Frame {
         ))
     }
 
+    /// Wraps a service result in response metadata, preserving the request correlation id.
     pub(crate) fn into_response_frame(
         self,
         response: std::result::Result<Response, Error>,
@@ -191,6 +151,7 @@ impl Frame {
         }
     }
 
+    /// Constructs a response frame with PRPC response metadata.
     fn response(
         &self,
         error_code: i32,
@@ -216,6 +177,7 @@ impl Frame {
         }
     }
 
+    /// Builds a request frame without going through the TCP reader.
     #[cfg(test)]
     fn for_request(
         service_name: impl Into<String>,
@@ -250,6 +212,7 @@ impl Frame {
     }
 }
 
+/// Reads one PRPC frame from a stream, returning `None` on normal connection close.
 pub(crate) fn read_frame(stream: &mut impl Read) -> Result<Option<Frame>> {
     let mut header = [0u8; PRPC_HEAD_SIZE];
     match stream.read_exact(&mut header) {
@@ -324,6 +287,7 @@ pub(crate) fn read_frame(stream: &mut impl Read) -> Result<Option<Frame>> {
     }))
 }
 
+/// Writes one encoded PRPC frame to a stream.
 pub(crate) fn write_frame(stream: &mut impl Write, frame: &Frame) -> Result<()> {
     let bytes = encode_frame(frame);
     stream
@@ -333,6 +297,7 @@ pub(crate) fn write_frame(stream: &mut impl Write, frame: &Frame) -> Result<()> 
     Ok(())
 }
 
+/// Encodes a PRPC frame as `PRPC` magic, message size, metadata size, and body.
 pub(crate) fn encode_frame(frame: &Frame) -> Vec<u8> {
     let mut meta = frame.meta.clone();
     meta.attachment_size = Some(frame.attachment.len().min(i32::MAX as usize) as i32);
@@ -360,6 +325,8 @@ mod tests {
 
     #[test]
     fn frame_round_trip_preserves_attachment_and_correlation() {
+        // StarRocks uses the PRPC correlation id to match responses, while
+        // FE-to-CN plan fragments travel in the attachment bytes.
         let request = Frame::for_request(
             "PInternalService",
             "exec_plan_fragment",

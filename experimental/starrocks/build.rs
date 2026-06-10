@@ -2,6 +2,7 @@ use std::{env, path::PathBuf};
 
 use prost_build::{Method, Service, ServiceGenerator};
 
+const PRPC_PROTO: &str = "proto/prpc.proto";
 const STARROCKS_PROTOS: &[&str] = &[
     "binlog.proto",
     "data.proto",
@@ -15,13 +16,17 @@ const STARROCKS_PROTOS: &[&str] = &[
     "types.proto",
 ];
 
+/// Generates StarRocks protobuf bindings, local PRPC metadata bindings, and the BRPC service facade.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let proto_dir = manifest_dir.join("starrocks/gensrc/proto");
+    let local_proto_dir = manifest_dir.join("proto");
+    let prpc_proto = manifest_dir.join(PRPC_PROTO);
 
     println!("cargo:rerun-if-changed={}", proto_dir.display());
+    println!("cargo:rerun-if-changed={}", prpc_proto.display());
 
-    let protos = STARROCKS_PROTOS
+    let mut protos = STARROCKS_PROTOS
         .iter()
         .map(|proto| {
             let path = proto_dir.join(proto);
@@ -29,18 +34,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             path
         })
         .collect::<Vec<_>>();
+    protos.push(prpc_proto);
 
     let mut config = prost_build::Config::new();
     config.disable_comments(["."]);
     config.service_generator(Box::new(BrpcServiceGenerator));
-    config.compile_protos(&protos, &[proto_dir])?;
+    config.compile_protos(&protos, &[proto_dir, local_proto_dir])?;
 
     Ok(())
 }
 
+/// Emits a BRPC/Tower service facade from StarRocks' protobuf service
+/// descriptor. This plays the role tonic-build would normally play for gRPC,
+/// while keeping the generated API independent of HTTP/2 and gRPC framing.
 struct BrpcServiceGenerator;
 
 impl ServiceGenerator for BrpcServiceGenerator {
+    /// Generates the StarRocks PInternalService interface and request router.
     fn generate(&mut self, service: Service, output: &mut String) {
         if service.package != "starrocks" || service.proto_name != "PInternalService" {
             return;
@@ -211,6 +221,7 @@ impl ServiceGenerator for BrpcServiceGenerator {
     }
 }
 
+/// Converts a protobuf method name into a Rust constant name.
 fn const_name(proto_name: &str) -> String {
     proto_name
         .chars()
@@ -224,10 +235,12 @@ fn const_name(proto_name: &str) -> String {
         .collect()
 }
 
+/// Converts a protobuf method descriptor into a Rust enum variant name.
 fn method_variant(method: &Method) -> String {
     upper_camel(&method.proto_name)
 }
 
+/// Converts StarRocks snake_case RPC names to UpperCamelCase.
 fn upper_camel(value: &str) -> String {
     value
         .split('_')

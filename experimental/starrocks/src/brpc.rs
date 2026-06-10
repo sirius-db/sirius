@@ -16,6 +16,7 @@ use tokio::runtime::Runtime;
 use tower::{Service, ServiceExt};
 use tracing::{info, warn};
 
+/// Handle for the blocking BRPC listener thread.
 pub struct BrpcServer {
     join_handle: Option<JoinHandle<Result<()>>>,
     shutdown: BrpcServerShutdown,
@@ -23,18 +24,22 @@ pub struct BrpcServer {
 }
 
 impl BrpcServer {
+    /// Returns a cloneable shutdown handle for coordinating process shutdown.
     pub fn shutdown_handle(&self) -> BrpcServerShutdown {
         self.shutdown.clone()
     }
 
+    /// Requests listener and active-connection shutdown.
     pub fn shutdown(&self) {
         self.shutdown.shutdown();
     }
 
+    /// Returns the address the BRPC listener bound to.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
+    /// Waits for the listener thread to exit.
     pub fn join(mut self) -> Result<()> {
         let join_handle = self
             .join_handle
@@ -54,10 +59,12 @@ impl Drop for BrpcServer {
     }
 }
 
+/// Cloneable signal used to stop the BRPC listener and current connection.
 #[derive(Clone)]
 pub struct BrpcServerShutdown(Arc<BrpcServerShutdownState>);
 
 impl BrpcServerShutdown {
+    /// Creates a shutdown handle that wakes the listener by connecting locally.
     fn new(wake_addr: SocketAddr) -> Self {
         Self(Arc::new(BrpcServerShutdownState {
             requested: AtomicBool::new(false),
@@ -66,6 +73,7 @@ impl BrpcServerShutdown {
         }))
     }
 
+    /// Requests shutdown and closes the active connection, if any.
     pub fn shutdown(&self) {
         if self.0.requested.swap(true, Ordering::SeqCst) {
             return;
@@ -75,10 +83,12 @@ impl BrpcServerShutdown {
         let _ = TcpStream::connect(self.0.wake_addr);
     }
 
+    /// Reports whether shutdown has been requested.
     fn is_requested(&self) -> bool {
         self.0.requested.load(Ordering::SeqCst)
     }
 
+    /// Tracks the accepted connection so shutdown can interrupt a blocking read.
     fn track_connection(&self, stream: &TcpStream) -> Result<BrpcActiveConnectionGuard> {
         let shutdown_stream = stream
             .try_clone()
@@ -96,6 +106,7 @@ impl BrpcServerShutdown {
         })
     }
 
+    /// Closes the currently tracked connection if one exists.
     fn close_active_connection(&self) {
         if let Ok(active_connection) = self.0.active_connection.lock()
             && let Some(connection) = active_connection.as_ref()
@@ -105,12 +116,14 @@ impl BrpcServerShutdown {
     }
 }
 
+/// Shared shutdown state for the blocking listener thread.
 struct BrpcServerShutdownState {
     requested: AtomicBool,
     active_connection: Arc<Mutex<Option<TcpStream>>>,
     wake_addr: SocketAddr,
 }
 
+/// Clears the tracked active connection when connection handling returns.
 struct BrpcActiveConnectionGuard {
     active_connection: Arc<Mutex<Option<TcpStream>>>,
 }
@@ -123,11 +136,13 @@ impl Drop for BrpcActiveConnectionGuard {
     }
 }
 
+/// Starts the StarRocks BRPC server using the generated PInternalService router.
 pub fn start_brpc_server(bind_host: &str, brpc_port: u16) -> Result<BrpcServer> {
     let service = PInternalServiceRouter::new(PlanFragmentTranslatorService::new());
     start_brpc_server_with_service(bind_host, brpc_port, service)
 }
 
+/// Starts a BRPC server with an injected Tower service, primarily for tests and future layering.
 fn start_brpc_server_with_service<S>(
     bind_host: &str,
     brpc_port: u16,
@@ -156,6 +171,7 @@ where
     })
 }
 
+/// Runs the blocking accept loop and dispatches each connection to the service.
 fn run_brpc_server<S>(
     listener: TcpListener,
     shutdown: BrpcServerShutdown,
@@ -194,6 +210,7 @@ where
     Ok(())
 }
 
+/// Reads PRPC frames from one connection and writes one response per request.
 fn handle_brpc_connection<S>(
     service: &mut S,
     runtime: &Runtime,
@@ -218,6 +235,7 @@ where
     }
 }
 
+/// Awaits Tower readiness and dispatches one decoded PRPC request.
 async fn call_service<S>(
     service: &mut S,
     request: prpc::Request,
@@ -228,6 +246,7 @@ where
     service.ready().await?.call(request).await
 }
 
+/// Chooses a loopback wake address when the listener is bound to an unspecified address.
 fn listener_wake_addr(local_addr: SocketAddr) -> SocketAddr {
     match local_addr.ip() {
         IpAddr::V4(ip) if ip.is_unspecified() => {

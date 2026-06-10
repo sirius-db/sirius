@@ -13,12 +13,14 @@ use thrift::{
 };
 use tracing::info;
 
+/// PInternalService implementation that translates incoming plan fragments and logs Substrait.
 #[derive(Clone, Debug)]
 pub(crate) struct PlanFragmentTranslatorService {
     translator: PlanTranslator,
 }
 
 impl PlanFragmentTranslatorService {
+    /// Builds a translator-backed StarRocks internal service implementation.
     pub(crate) fn new() -> Self {
         Self {
             translator: PlanTranslator::new(),
@@ -27,6 +29,7 @@ impl PlanFragmentTranslatorService {
 }
 
 impl PInternalService for PlanFragmentTranslatorService {
+    /// Handles a single FE-dispatched plan fragment thrift attachment.
     fn exec_plan_fragment(
         &self,
         request: PExecPlanFragmentRequest,
@@ -42,6 +45,7 @@ impl PInternalService for PlanFragmentTranslatorService {
         )
     }
 
+    /// Handles FE batch fragment dispatch by translating every per-instance fragment.
     fn exec_batch_plan_fragments(
         &self,
         request: PExecBatchPlanFragmentsRequest,
@@ -63,6 +67,7 @@ impl PInternalService for PlanFragmentTranslatorService {
 }
 
 impl PlanFragmentTranslatorService {
+    /// Deserializes and translates one binary-thrift TExecPlanFragmentParams attachment.
     fn translate_single_attachment(
         &self,
         protocol: Option<&str>,
@@ -74,6 +79,7 @@ impl PlanFragmentTranslatorService {
         self.translate_and_log_fragment(&params)
     }
 
+    /// Deserializes a FE batch attachment and merges common params into each instance.
     fn translate_batch_attachment(
         &self,
         protocol: Option<&str>,
@@ -118,6 +124,7 @@ impl PlanFragmentTranslatorService {
         Ok(())
     }
 
+    /// Converts a StarRocks thrift plan fragment to Substrait and logs substrait-explain output.
     fn translate_and_log_fragment(
         &self,
         params: &TExecPlanFragmentParams,
@@ -135,6 +142,7 @@ impl PlanFragmentTranslatorService {
     }
 }
 
+/// Deserializes a thrift struct using the StarRocks binary attachment protocol.
 fn deserialize_binary<T>(bytes: &[u8]) -> thrift::Result<T>
 where
     T: TSerializable,
@@ -151,6 +159,7 @@ where
     T::read_from_in_protocol(&mut protocol)
 }
 
+/// Rejects thrift attachment protocols that are not implemented by the Rust CN yet.
 fn ensure_binary_protocol(protocol: Option<&str>) -> std::result::Result<(), String> {
     match protocol.unwrap_or("binary").to_ascii_lowercase().as_str() {
         "binary" => Ok(()),
@@ -160,6 +169,7 @@ fn ensure_binary_protocol(protocol: Option<&str>) -> std::result::Result<(), Str
     }
 }
 
+/// Builds the required single-fragment response wrapper around a StarRocks status.
 fn exec_plan_result(status: StatusPb) -> PExecPlanFragmentResult {
     PExecPlanFragmentResult {
         status,
@@ -167,6 +177,7 @@ fn exec_plan_result(status: StatusPb) -> PExecPlanFragmentResult {
     }
 }
 
+/// StarRocks OK status.
 fn ok_status() -> StatusPb {
     StatusPb {
         status_code: TStatusCode::OK.0,
@@ -174,6 +185,7 @@ fn ok_status() -> StatusPb {
     }
 }
 
+/// StarRocks INTERNAL_ERROR status carrying a user-visible error message.
 fn internal_error(message: impl Into<String>) -> StatusPb {
     StatusPb {
         status_code: TStatusCode::INTERNAL_ERROR.0,
@@ -205,6 +217,7 @@ mod tests {
 
     #[test]
     fn exec_plan_fragment_translates_supported_scan() {
+        // A supported one-node file scan should translate successfully and return OK.
         let result = call_exec_plan_fragment(
             PExecPlanFragmentRequest {
                 attachment_protocol: Some("binary".to_string()),
@@ -217,6 +230,7 @@ mod tests {
 
     #[test]
     fn exec_plan_fragment_returns_internal_error_for_bad_attachment() {
+        // Malformed thrift attachments are method-level StarRocks failures, not PRPC failures.
         let result = call_exec_plan_fragment(
             PExecPlanFragmentRequest {
                 attachment_protocol: Some("binary".to_string()),
@@ -234,6 +248,8 @@ mod tests {
 
     #[test]
     fn exec_plan_fragment_rejects_unsupported_attachment_protocol() {
+        // The generated service accepts the protobuf request, but the CN currently only
+        // implements binary thrift attachments.
         let result = call_exec_plan_fragment(
             PExecPlanFragmentRequest {
                 attachment_protocol: Some("compact".to_string()),
@@ -251,6 +267,8 @@ mod tests {
 
     #[test]
     fn exec_batch_plan_fragments_translates_tpch_single_node_scans() {
+        // This mirrors FE batch dispatch: shared descriptor metadata in common_param,
+        // with per-instance fragments carrying only their scan plan.
         let batch = TExecBatchPlanFragmentsParams::new(
             Some(fragment_params(None, Some(tpch_desc_table()))),
             Some(vec![
@@ -270,6 +288,8 @@ mod tests {
 
     #[test]
     fn router_rejects_unknown_service_at_prpc_layer() {
+        // Unknown services are rejected by the generated BRPC router before protobuf
+        // request decoding reaches the concrete PInternalService implementation.
         let request = prpc::Request::new(
             "OtherService",
             methods::EXEC_PLAN_FRAGMENT,
@@ -289,6 +309,8 @@ mod tests {
         request: PExecPlanFragmentRequest,
         attachment: Vec<u8>,
     ) -> PExecPlanFragmentResult {
+        // Route through the generated Tower service so tests cover protobuf decoding,
+        // method lookup, service dispatch, and response encoding.
         let response = call_router(prpc::Request::new(
             SERVICE_NAME,
             methods::EXEC_PLAN_FRAGMENT,
@@ -303,6 +325,7 @@ mod tests {
         request: PExecBatchPlanFragmentsRequest,
         attachment: Vec<u8>,
     ) -> PExecBatchPlanFragmentsResult {
+        // Route batch requests through the same generated service path used by BRPC.
         let response = call_router(prpc::Request::new(
             SERVICE_NAME,
             methods::EXEC_BATCH_PLAN_FRAGMENTS,
@@ -314,6 +337,8 @@ mod tests {
     }
 
     fn call_router(request: prpc::Request) -> std::result::Result<prpc::Response, prpc::Error> {
+        // The generated router is a Tower service; a tiny current-thread runtime is
+        // enough because dispatch is synchronous today.
         let mut router = PInternalServiceRouter::new(PlanFragmentTranslatorService::new());
         tokio::runtime::Builder::new_current_thread()
             .build()
@@ -322,6 +347,7 @@ mod tests {
     }
 
     fn supported_fragment() -> TExecPlanFragmentParams {
+        // Minimal single-node fragment with a descriptor table for direct translation.
         fragment_params(Some(scan_plan(0, 0)), Some(desc_table()))
     }
 
@@ -329,6 +355,7 @@ mod tests {
         plan: Option<TPlan>,
         desc_tbl: Option<TDescriptorTable>,
     ) -> TExecPlanFragmentParams {
+        // Only the fields required by the translator are populated in these fixtures.
         TExecPlanFragmentParams {
             protocol_version: InternalServiceVersion::V1,
             fragment: Some(TPlanFragment {
@@ -373,6 +400,7 @@ mod tests {
     }
 
     fn scan_plan(node_id: i32, tuple_id: i32) -> TPlan {
+        // Build a single-node scan plan so coverage is focused on one-node fragments first.
         TPlan::new(vec![scan_node(node_id, tuple_id)])
     }
 
@@ -380,6 +408,7 @@ mod tests {
     where
         T: TSerializable,
     {
+        // Serialize fixtures exactly like FE BRPC attachments: thrift binary protocol bytes.
         let channel = TBufferChannel::with_capacity(0, 64 * 1024);
         let (_, write) = channel.clone().split().unwrap();
         let mut protocol = TBinaryOutputProtocol::new(write, true);
@@ -388,6 +417,7 @@ mod tests {
     }
 
     fn scalar_type(primitive: TPrimitiveType) -> TTypeDesc {
+        // Descriptor-table slots use StarRocks thrift scalar type descriptors.
         TTypeDesc::new(Some(vec![TTypeNode::new(
             TTypeNodeType::SCALAR,
             Some(TScalarType::new(primitive, None, None, None)),
@@ -397,6 +427,7 @@ mod tests {
     }
 
     fn slot(id: i32, tuple_id: i32, column_pos: i32, name: &str, ty: TTypeDesc) -> TSlotDescriptor {
+        // Materialized slots define the output schema visible to the translator.
         TSlotDescriptor::new(
             Some(id),
             Some(tuple_id),
@@ -416,6 +447,7 @@ mod tests {
     }
 
     fn table_descriptor(id: i64, db: &str, name: &str, num_cols: i32) -> TTableDescriptor {
+        // HDFS table descriptors are enough for the translator to recover table names.
         TTableDescriptor::new(
             id,
             TTableType::HDFS_TABLE,
@@ -440,6 +472,7 @@ mod tests {
     }
 
     fn desc_table() -> TDescriptorTable {
+        // Generic descriptor table for the single-fragment smoke test.
         TDescriptorTable::new(
             Some(vec![
                 slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
@@ -452,6 +485,7 @@ mod tests {
     }
 
     fn tpch_desc_table() -> TDescriptorTable {
+        // Two TPCH tables let the batch test exercise multiple one-node scan fragments.
         TDescriptorTable::new(
             Some(vec![
                 slot(1, 0, 0, "l_orderkey", scalar_type(TPrimitiveType::BIGINT)),
@@ -472,6 +506,7 @@ mod tests {
     }
 
     fn scan_node(node_id: i32, tuple_id: i32) -> TPlanNode {
+        // File scan nodes are currently a supported translator surface.
         TPlanNode::new(
             node_id,
             TPlanNodeType::FILE_SCAN_NODE,
