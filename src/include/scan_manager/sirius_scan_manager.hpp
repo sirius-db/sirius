@@ -120,12 +120,22 @@ struct scan_manager_config {
   /// requests S3.
   std::optional<sirius::io::s3::s3_ioctx_config> s3_config{};
 
-  /// Thread pool config for S3 async workers. Ignored when @c s3_config
-  /// is empty. Separate from the main @c thread_pool because S3 I/O has
-  /// different concurrency characteristics (more threads, network-bound,
-  /// not CPU-bound). Injected into @c s3_ioctx_config::async_thread_pool
-  /// before constructing the s3_blocking_ioctx so async S3 paths bypass detached
-  /// std::thread fallbacks.
+  /// Selects which S3 backend the scan_manager builds when @c s3_config is set.
+  /// Mirrors @c object_store_config::s3_use_async_backend (SiriusContext copies
+  /// it across in initialize()). When true (default) the manager builds the
+  /// async @c s3_ioctx (libcurl-multi reactor: concurrent GETs + pipelined
+  /// device reads); when false it builds the serial @c s3_blocking_ioctx fed by
+  /// @c s3_thread_pool. Ignored when @c s3_config is empty.
+  bool s3_use_async_backend{true};
+
+  /// Thread pool config for the blocking S3 backend's async workers. Ignored
+  /// when @c s3_config is empty or when @c s3_use_async_backend is true (the
+  /// async @c s3_ioctx reactor owns its own worker thread). Separate from the
+  /// main @c thread_pool because S3 I/O has different concurrency
+  /// characteristics (more threads, network-bound, not CPU-bound). Injected
+  /// into @c s3_ioctx_config::async_thread_pool before constructing the
+  /// @c s3_blocking_ioctx so its async paths bypass detached std::thread
+  /// fallbacks.
   exec::thread_pool_config s3_thread_pool{.num_threads = 8, .thread_name_prefix = "s3_io"};
 };
 

@@ -551,13 +551,18 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     s3_cfg.ca_bundle_path = config_.object_store_config.ca_bundle_path;
     s3_cfg.tls_verify     = config_.object_store_config.tls_verify;
     sm_config.s3_config   = std::move(s3_cfg);
+    // Carry the async/blocking backend choice across to the scan_manager, which
+    // owns S3 backend construction. Without this the flag is parsed but dropped,
+    // and the manager always builds the blocking backend.
+    sm_config.s3_use_async_backend = config_.object_store_config.s3_use_async_backend;
   }
   // Persist the composed config back onto config_ so a later get_config()
   // reflects the actual S3 wiring -- get_scan_manager_config() must not report
   // s3_config == nullopt while a live S3 backend exists. The s3_ioctx_config
-  // stored here carries credentials only; async_thread_pool stays null --
-  // SiriusContext (S6) injects its live s3_thread_pool_ into the s3_blocking_ioctx's own
-  // config copy when it builds the backend below.
+  // stored here carries credentials only; async_thread_pool stays null -- the
+  // scan_manager constructor builds the chosen S3 backend (async s3_ioctx or
+  // blocking s3_blocking_ioctx, per s3_use_async_backend) and, for the blocking
+  // case, injects its own s3_thread_pool into the config copy.
   config_.set_scan_manager_config(std::move(sm_config));
   scan_manager_ = std::make_unique<sirius::scan_manager::sirius_scan_manager>(
     config_.get_scan_manager_config(), host_fsmr);

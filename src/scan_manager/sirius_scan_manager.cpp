@@ -21,6 +21,7 @@
 #include "io/parquet_helpers.hpp"
 #include "io/prefetching_cache.hpp"
 #include "io/s3/s3_blocking_ioctx.hpp"
+#include "io/s3/s3_ioctx.hpp"
 #include "io/uring/uring_ioctx.hpp"
 #include "log/logging.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
@@ -94,15 +95,33 @@ sirius_scan_manager::sirius_scan_manager(
   if (_config.s3_config) {
     auto s3_cfg                 = *_config.s3_config;
     s3_cfg.host_memory_resource = host_fsmr;
-    if (s3_cfg.async_thread_pool == nullptr) {
-      _s3_thread_pool = std::make_unique<sirius::exec::static_thread_pool>(
-        _config.s3_thread_pool.num_threads,
-        _config.s3_thread_pool.thread_name_prefix,
-        _config.s3_thread_pool.cpu_affinity_list);
-      s3_cfg.async_thread_pool = _s3_thread_pool.get();
+    std::shared_ptr<sirius::io::sirius_ioctx> s3_backend;
+    if (_config.s3_use_async_backend) {
+      // Async backend (default): the libcurl-multi reactor owns its own worker
+      // thread, so no s3_thread_pool is created. Retry knobs are forwarded so
+      // the async backend is config-equivalent to the blocking one.
+      s3_backend = std::make_shared<sirius::io::s3::s3_ioctx>(std::move(s3_cfg.creds),
+                                                              s3_cfg.request_timeout_s,
+                                                              s3_cfg.ca_bundle_path,
+                                                              s3_cfg.tls_verify,
+                                                              s3_cfg.max_connections,
+                                                              host_fsmr,
+                                                              s3_cfg.max_retry_attempts,
+                                                              s3_cfg.retry_backoff_base,
+                                                              s3_cfg.retry_jitter,
+                                                              s3_cfg.honor_retry_after);
+    } else {
+      // Blocking backend (fallback): fan async work out over a dedicated pool.
+      if (s3_cfg.async_thread_pool == nullptr) {
+        _s3_thread_pool = std::make_unique<sirius::exec::static_thread_pool>(
+          _config.s3_thread_pool.num_threads,
+          _config.s3_thread_pool.thread_name_prefix,
+          _config.s3_thread_pool.cpu_affinity_list);
+        s3_cfg.async_thread_pool = _s3_thread_pool.get();
+      }
+      s3_backend = std::make_shared<sirius::io::s3::s3_blocking_ioctx>(std::move(s3_cfg));
     }
-    auto s3_ioctx = std::make_shared<sirius::io::s3::s3_blocking_ioctx>(std::move(s3_cfg));
-    _io_ctxs.push_back(std::move(s3_ioctx));
+    _io_ctxs.push_back(std::move(s3_backend));
   }
 
   if (_config.enable_prefetch_cache && host_fsmr != nullptr) {
