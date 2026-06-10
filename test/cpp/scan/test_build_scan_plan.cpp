@@ -74,14 +74,14 @@ TEST_CASE("build_scan_plan native routes rowid into data_columns with a type",
                               native_options(returned_types));
 
   REQUIRE(plan.data_columns.size() == 2);
-  REQUIRE_FALSE(plan.data_columns[0].is_rowid);
+  REQUIRE(plan.data_columns[0].reader_info.has_value());
+  REQUIRE_FALSE(plan.data_columns[0].reader_info->is_rowid);
   REQUIRE(plan.data_columns[0].primary_idx == 0);
-  REQUIRE(plan.data_columns[0].type.has_value());
-  REQUIRE(plan.data_columns[0].type->id() == type_id::INTEGER);
+  REQUIRE(plan.data_columns[0].reader_info->type.id() == type_id::INTEGER);
 
-  REQUIRE(plan.data_columns[1].is_rowid);
-  REQUIRE(plan.data_columns[1].type.has_value());
-  REQUIRE(plan.data_columns[1].type->id() == type_id::BIGINT);
+  REQUIRE(plan.data_columns[1].reader_info.has_value());
+  REQUIRE(plan.data_columns[1].reader_info->is_rowid);
+  REQUIRE(plan.data_columns[1].reader_info->type.id() == type_id::BIGINT);
 
   REQUIRE(plan.output_layout.size() == 2);
   REQUIRE(plan.output_layout[0].source == scan_plan::output_entry::DATA);
@@ -104,9 +104,9 @@ TEST_CASE("build_scan_plan parquet defaults drop rowid and leave types unset",
     column_ids, projection_ids, names, returned_types, /*output_types_size=*/2, no_partitions);
 
   REQUIRE(plan.data_columns.size() == 1);  // rowid dropped
-  REQUIRE_FALSE(plan.data_columns[0].is_rowid);
   REQUIRE(plan.data_columns[0].primary_idx == 0);
-  REQUIRE_FALSE(plan.data_columns[0].type.has_value());  // parquet derives types from the footer
+  // parquet leaves reader_info unset and derives types from the footer.
+  REQUIRE_FALSE(plan.data_columns[0].reader_info.has_value());
 
   REQUIRE(plan.output_layout.size() == 1);
   REQUIRE(plan.output_layout[0].source == scan_plan::output_entry::DATA);
@@ -122,8 +122,9 @@ TEST_CASE("build_scan_plan native throws when type_for is missing", "[scan][buil
   duckdb::vector<duckdb::HivePartitioningIndex> no_partitions;
 
   // decode_rowid_columns opts into the reader-typed path but no type_for is
-  // supplied, so every data column ends up with a null type — build_scan_plan
-  // must reject this at build time rather than defer a null deref to the decoder.
+  // supplied, so every data column ends up with no reader_decode_info —
+  // build_scan_plan must reject this at build time rather than defer a null
+  // deref to the decoder.
   build_scan_plan_options opts;
   opts.decode_rowid_columns = true;
 

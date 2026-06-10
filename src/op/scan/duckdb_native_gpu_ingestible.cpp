@@ -62,7 +62,7 @@ std::vector<row_group_batch_local> partition_row_groups_into_batches(
   std::vector<bool> is_varchar(num_cols, false);
   bool any_varchar = false;
   for (std::size_t c = 0; c < num_cols; ++c) {
-    is_varchar[c] = plan.data_columns[c].type->is_varchar();
+    is_varchar[c] = plan.data_columns[c].reader_info->type.is_varchar();
     any_varchar   = any_varchar || is_varchar[c];
   }
 

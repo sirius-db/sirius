@@ -210,7 +210,7 @@ void compute_decoded_byte_budgets(duckdb_native_metadata& md, scan_plan const& p
         budget += static_cast<std::size_t>(rg_md.row_count) * sizeof(std::int64_t);
         continue;
       }
-      auto const& type = *plan.data_columns[ci].type;
+      auto const& type = plan.data_columns[ci].reader_info->type;
       if (type.is_varchar()) {
         std::size_t chars_total = 0;
         for (const auto& seg : col_md.data_segments) {
@@ -380,9 +380,9 @@ duckdb_native_metadata walk_duckdb_native_metadata(
   }
 
   for (auto const& dc : plan.data_columns) {
-    if (dc.is_rowid) { continue; }
+    if (dc.reader_info->is_rowid) { continue; }
     std::string reason;
-    if (!is_supported_logical_type(*dc.type, reason)) {
+    if (!is_supported_logical_type(dc.reader_info->type, reason)) {
       refuse("column " + std::to_string(dc.primary_idx) + ": " + reason);
       return md;
     }
@@ -412,7 +412,7 @@ duckdb_native_metadata walk_duckdb_native_metadata(
   std::unordered_map<duckdb::idx_t, std::size_t> projected_lookup;
   projected_lookup.reserve(plan.data_columns.size());
   for (std::size_t ci = 0; ci < plan.data_columns.size(); ++ci) {
-    if (plan.data_columns[ci].is_rowid) { continue; }
+    if (plan.data_columns[ci].reader_info->is_rowid) { continue; }
     projected_lookup.emplace(plan.data_columns[ci].primary_idx, ci);
   }
 
@@ -427,7 +427,7 @@ duckdb_native_metadata walk_duckdb_native_metadata(
       auto row_group = row_groups.GetRowGroup(rg);
       if (!row_group) { continue; }
       for (auto const& dc : plan.data_columns) {
-        if (dc.is_rowid) { continue; }
+        if (dc.reader_info->is_rowid) { continue; }
         duckdb::StorageIndex const storage_idx(dc.primary_idx);
         row_group->GetRawColumnData(storage_idx)
           .GetColumnSegmentInfo(qc, rg, {dc.primary_idx}, column_segments);
@@ -451,8 +451,8 @@ duckdb_native_metadata walk_duckdb_native_metadata(
     for (std::size_t ci = 0; ci < plan.data_columns.size(); ++ci) {
       auto const& dc = plan.data_columns[ci];
       md.row_groups[rg].columns[ci].column_id =
-        dc.is_rowid ? std::numeric_limits<duckdb::idx_t>::max() : dc.primary_idx;
-      md.row_groups[rg].columns[ci].is_rowid = dc.is_rowid;
+        dc.reader_info->is_rowid ? std::numeric_limits<duckdb::idx_t>::max() : dc.primary_idx;
+      md.row_groups[rg].columns[ci].is_rowid = dc.reader_info->is_rowid;
     }
     if (rg < handles.size()) { md.row_groups[rg].row_group_start = handles[rg].first; }
   }
@@ -476,7 +476,7 @@ duckdb_native_metadata walk_duckdb_native_metadata(
 
     auto desc = build_segment_descriptor(seg, compression);
 
-    if (!validity_seg && plan.data_columns[ci].type->is_varchar()) {
+    if (!validity_seg && plan.data_columns[ci].reader_info->type.is_varchar()) {
       // Refuse on absent stat so downstream consumers can deref unchecked.
       // Some(0) is legal data (all-empty row group); decode produces 0 chars.
       desc.max_string_length = parse_segment_max_string_length(seg.segment_stats);
@@ -503,7 +503,7 @@ duckdb_native_metadata walk_duckdb_native_metadata(
     if (!prg) { continue; }
     for (std::size_t ci = 0; ci < plan.data_columns.size(); ++ci) {
       auto const& dc = plan.data_columns[ci];
-      if (dc.is_rowid || !dc.type->is_varchar()) { continue; }
+      if (dc.reader_info->is_rowid || !dc.reader_info->type.is_varchar()) { continue; }
       auto stats = prg->GetColumnStatistics(duckdb::StorageIndex(dc.primary_idx));
       if (!stats || !duckdb::StringStats::HasMaxStringLength(*stats)) { continue; }
       const auto rg_typed_max   = duckdb::StringStats::MaxStringLength(*stats);
@@ -555,7 +555,10 @@ duckdb_native_metadata walk_duckdb_native_metadata(
   for (auto& rg : md.row_groups) {
     rg.varchar_bytes_per_col.assign(plan.data_columns.size(), 0);
     for (std::size_t ci = 0; ci < plan.data_columns.size(); ++ci) {
-      if (plan.data_columns[ci].is_rowid || !plan.data_columns[ci].type->is_varchar()) { continue; }
+      if (plan.data_columns[ci].reader_info->is_rowid ||
+          !plan.data_columns[ci].reader_info->type.is_varchar()) {
+        continue;
+      }
       std::size_t total = 0;
       for (const auto& seg : rg.columns[ci].data_segments) {
         total += static_cast<std::size_t>(seg.segment_count) *

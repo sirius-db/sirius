@@ -61,14 +61,25 @@ namespace sirius::op::scan {
 struct scan_plan {
   /// A column produced by the reader, in batch order.
   struct data_column {
-    std::size_t primary_idx;  ///< P — index into the DuckDB schema. Holds DuckDB's rowid
-                              ///<     sentinel when @c is_rowid.
+    /// Decode info the reader-typed (duckdb-native) path needs per column. Set as
+    /// a unit or not at all: parquet/pinned leave it empty and let the reader
+    /// resolve types from the file itself.
+    struct reader_decode_info {
+      sirius::logical_type type;  ///< Logical type the decoder and walker read.
+      bool is_rowid = false;      ///< true for a synthesized rowid column.
+    };
+
+    std::size_t primary_idx;  ///< P — index into the DuckDB schema. Holds DuckDB's
+                              ///<     rowid sentinel when @c reader_info->is_rowid.
     std::string name;         ///< reader column name. Empty for rowid and the plain-read case.
-    bool is_rowid = false;    ///< true for a synthesized rowid column (duckdb-native only).
-    std::optional<sirius::logical_type>
-      type;  ///< Logical type, set via @c build_scan_plan_options::type_for.
-             ///< @c nullopt when the reader resolves types itself.
+    std::optional<reader_decode_info> reader_info;  ///< Set only on the reader-typed path.
   };
+
+  // FUTURE: duckdb-native is the only reader that needs per-column decode info
+  // today, so data_column::reader_info is a plain optional. When a second reader
+  // needs its own (e.g. ORC/Arrow codec or dictionary state), promote reader_info
+  // to a std::variant. Define each format's arm as its own type beside that
+  // format's reader — not nested in scan_plan — so the formats stay decoupled.
 
   /// A column synthesized from the file path, injected after read.
   struct partition_column {
@@ -177,13 +188,14 @@ struct scan_plan {
 
 /// Optional knobs for @ref build_scan_plan; the duckdb-native scan opts in.
 struct build_scan_plan_options {
-  /// When true, rowid columns are kept in @c data_columns (flagged @c is_rowid)
-  /// and @c output_layout for the reader to synthesize, instead of dropped.
+  /// When true, rowid columns are kept in @c data_columns (flagged via
+  /// @c reader_info->is_rowid) and @c output_layout for the reader to
+  /// synthesize, instead of dropped.
   bool decode_rowid_columns = false;
 
-  /// Resolves each column's logical type into @c data_column::type; empty leaves
-  /// types @c nullopt. Receives the @c ColumnIndex so the caller can special-case
-  /// rowid, which has no @c returned_types slot.
+  /// Resolves each column's logical type into its @c reader_decode_info; empty
+  /// leaves @c reader_info unset. Receives the @c ColumnIndex so the caller can
+  /// special-case rowid, which has no @c returned_types slot.
   std::function<std::optional<sirius::logical_type>(duckdb::ColumnIndex const&)> type_for = {};
 };
 

@@ -227,8 +227,13 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
       scan_plan::data_column dc;
       dc.primary_idx = primary_idx;
       dc.name        = (is_rowid || names.empty()) ? std::string{} : names.at(primary_idx);
-      dc.is_rowid    = is_rowid;
-      if (options.type_for) { dc.type = options.type_for(col_idx); }
+      // Reader-typed path: carry the per-column type and rowid flag as a unit.
+      // type_for must resolve a type for every such column (checked below).
+      if (options.type_for) {
+        if (auto type = options.type_for(col_idx)) {
+          dc.reader_info = scan_plan::data_column::reader_decode_info{std::move(*type), is_rowid};
+        }
+      }
       plan.data_columns.push_back(std::move(dc));
       primary_to_batch[primary_idx] = batch_idx;
       if (is_output) {
@@ -267,14 +272,14 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
     plan.batch_position_by_column_id[c] = it->second;
   }
 
-  // On the reader-typed path every data column must carry a type (the
+  // On the reader-typed path every data column must carry reader_decode_info (the
   // decoder/walker dereference it); fail here rather than deref nullopt later.
   if (options.decode_rowid_columns || options.type_for) {
     for (auto const& dc : plan.data_columns) {
-      if (!dc.type.has_value()) {
+      if (!dc.reader_info.has_value()) {
         throw sirius::internal_exception(
-          "[build_scan_plan] data column (primary_idx {}) has no logical type; the reader-typed "
-          "scan_plan path requires options.type_for to resolve every column.",
+          "[build_scan_plan] data column (primary_idx {}) has no reader_decode_info; the "
+          "reader-typed scan_plan path requires options.type_for to resolve every column.",
           dc.primary_idx);
       }
     }

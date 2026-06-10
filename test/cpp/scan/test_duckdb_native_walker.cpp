@@ -84,8 +84,9 @@ scan_plan make_plan(std::vector<col_spec> const& cols,
   for (std::size_t i = 0; i < cols.size(); ++i) {
     scan_plan::data_column dc;
     dc.primary_idx = cols[i].primary_idx;
-    dc.is_rowid    = cols[i].is_rowid;
-    if (i < types.size()) { dc.type = types[i]; }
+    if (i < types.size()) {
+      dc.reader_info = scan_plan::data_column::reader_decode_info{types[i], cols[i].is_rowid};
+    }
     plan.data_columns.push_back(std::move(dc));
   }
   return plan;

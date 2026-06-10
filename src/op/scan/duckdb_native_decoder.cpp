@@ -849,13 +849,13 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(duckdb_native_split_payl
 
   for (std::size_t ci = 0; ci < num_cols; ++ci) {
     auto const& dc = plan.data_columns[ci];
-    if (dc.is_rowid) {
+    if (dc.reader_info->is_rowid) {
       is_rowid_col[ci] = true;
       staged_cols.emplace_back();
       staged_cols.back().total_rows = total_rows;
       continue;
     }
-    if (dc.type->is_varchar()) {
+    if (dc.reader_info->type.is_varchar()) {
       staged_cols.push_back(
         stage_one_varchar_column(staging, db, block_manager, *sf_bm, split.row_groups, ci));
     } else {
@@ -867,7 +867,7 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(duckdb_native_split_payl
                                                          owned_stats_cache,
                                                          split.row_groups,
                                                          ci,
-                                                         *dc.type));
+                                                         dc.reader_info->type));
     }
   }
 
@@ -923,7 +923,7 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(duckdb_native_split_payl
       vc_to_final_idx.push_back(ci);
     } else {
       gpu_column_decode_input input;
-      input.out_type   = sirius_to_cudf_type(*plan.data_columns[ci].type);
+      input.out_type   = sirius_to_cudf_type(plan.data_columns[ci].reader_info->type);
       input.total_rows = static_cast<uint32_t>(staged.total_rows);
       input.has_nulls  = staged.has_nulls;
       fill_fixed_width_runs(staged.data, device_buf, input.data);
