@@ -179,15 +179,17 @@ jobs:
           retention-days: 14
 
       # S3 integration gate (issue #904).
+      # Requires the Docker daemon to be running on the runner (testcontainers
+      # starts MinIO via the Docker socket). Infra tracks enabling this on the
+      # gpu-2xl4 runners; the diagnostic step below will turn green once done.
+      #
       # Phase 1: run on this branch's CUDA-13 test-run.
       # Phase 2 (before merge): gate each step behind
       #   github.event_name == 'merge_group' &&
       # so PR CI stays Docker-free and only the merge queue pays the MinIO cost.
-      - name: Start Docker daemon
+      - name: Check Docker availability
         if: ${{ matrix.cuda.version == '13' }}
-        run: |
-          sudo systemctl start docker
-          sudo systemctl is-active --quiet docker
+        run: docker info
 
       - name: S3 integration tests
         if: ${{ matrix.cuda.version == '13' }}
