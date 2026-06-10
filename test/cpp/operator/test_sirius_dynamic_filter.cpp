@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -161,6 +162,20 @@ TEST_CASE("sirius_dynamic_filter_set::push_filter is thread-safe", "[dynamic_fil
     total += set.filters_for_column(col).size();
   }
   REQUIRE(total == static_cast<std::size_t>(kThreads) * kPushesPerThread);
+}
+
+//===----------------------------------------------------------------------===//
+// Filter availability
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("has_filters reflects pushed filters and ignores null", "[dynamic_filter]")
+{
+  sirius_dynamic_filter_set set;
+  REQUIRE_FALSE(set.has_filters());
+  set.push_filter(0, nullptr);
+  REQUIRE_FALSE(set.has_filters());
+  set.push_filter(0, make_single_zone_filter(0, 100));
+  REQUIRE(set.has_filters());
 }
 
 TEST_CASE("sirius_dynamic_zone_map_filter rejects empty zones", "[dynamic_filter]")
