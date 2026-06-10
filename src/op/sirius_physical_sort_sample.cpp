@@ -171,21 +171,12 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
     return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
   }
 
-  const auto state = _boundary_state.load(std::memory_order_acquire);
-  if (state == BoundaryState::SCHEDULED) {
-    // Normal path: input was claimed by get_next_task_input_data().
-  } else if (state == BoundaryState::NOT_DONE) {
-    // OOM retry or direct unit-test invoke — claim boundary computation.
-    auto expected = BoundaryState::NOT_DONE;
-    if (!_boundary_state.compare_exchange_strong(
-          expected, BoundaryState::SCHEDULED, std::memory_order_acq_rel)) {
-      SIRIUS_LOG_DEBUG("Sort sample: passthrough ({} batches)", input_batches.size());
-      return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
-    }
-  } else {
-    SIRIUS_LOG_DEBUG("Sort sample: passthrough ({} batches)", input_batches.size());
-    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
-  }
+  // Otherwise this is the boundary-computation task. get_next_task_input_data() already moved the
+  // state to SCHEDULED, and the SCHEDULED guard in get_next_task_hint()/get_next_task_input_data()
+  // ensures only this single task is ever created — so no concurrent or duplicate boundary task can
+  // race here. On OOM below we leave the state at SCHEDULED (rather than resetting to NOT_DONE) so
+  // the rescheduled task, which carries the same input, resumes this computation while
+  // task_creator continues to see the operator as scheduled.
 
   SIRIUS_LOG_DEBUG("Sort sample: computing partition boundaries from {} batches ({} bytes target)",
                    input_batches.size(),
@@ -205,8 +196,9 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
     return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
   }
 
-  // Wrap GPU work in try/catch: if any allocation throws (e.g. rmm::out_of_memory),
-  // reset to NOT_DONE so the rescheduled task can retry boundary computation.
+  // Wrap GPU work in try/catch: if any allocation throws (e.g. rmm::out_of_memory), leave the state
+  // at SCHEDULED and rethrow. The rescheduled task carries the same input and re-enters here to
+  // retry, and keeping SCHEDULED prevents task_creator from spawning a duplicate boundary task.
   try {
     size_t total_sample_bytes = 0;
     for (auto const& batch : valid_batches) {
@@ -331,8 +323,8 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
     _boundary_state.store(BoundaryState::DONE, std::memory_order_release);
 
   } catch (...) {
-    // Reset to NOT_DONE so the rescheduled task can retry boundary computation.
-    _boundary_state.store(BoundaryState::NOT_DONE, std::memory_order_release);
+    // Leave the state at SCHEDULED so the rescheduled task retries boundary computation without
+    // task_creator treating the operator as unscheduled and creating its own duplicate task.
     throw;
   }
 

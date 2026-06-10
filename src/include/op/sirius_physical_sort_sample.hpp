@@ -93,7 +93,8 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
 
   //! Boundary computation lifecycle: NOT_DONE → SCHEDULED (input claimed) → DONE.
   //! get_next_task_input_data() transitions to SCHEDULED under the task-creation lock;
-  //! execute() completes the transition to DONE.
+  //! execute() completes the transition to DONE. On OOM the state stays SCHEDULED so the
+  //! rescheduled task retries while task_creator does not spawn a duplicate boundary task.
   std::atomic<BoundaryState> _boundary_state{BoundaryState::NOT_DONE};
 
   //! Target bytes to accumulate for the boundary sample (from sirius_config operator_params)
