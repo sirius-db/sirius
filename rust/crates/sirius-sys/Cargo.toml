@@ -1,0 +1,23 @@
+[package]
+name = "sirius-sys"
+version.workspace = true
+edition.workspace = true
+description = "Low-level cxx (cxx.rs) bindings to the Sirius C++ API."
+license = "Apache-2.0"
+# Links a local Sirius build-tree artifact; not self-contained for crates.io.
+publish = false
+
+[lib]
+name = "sirius_sys"
+
+[features]
+# Link the self-contained `libsirius.a` (Sirius + all static deps bundled; no
+# runtime deps — the fully static vcpkg build) instead of the default
+# `libsirius.so`. Point SIRIUS_BUILD_DIR at the build tree that has the artifact.
+static = []
+
+[dependencies]
+cxx.workspace = true
+
+[build-dependencies]
+cxx-build.workspace = true

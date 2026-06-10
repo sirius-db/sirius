@@ -302,6 +302,7 @@ set(EXTENSION_SOURCES
     src/sirius_context.cpp
     src/sirius_engine.cpp
     src/sirius_extension.cpp
+    src/sirius_ffi.cpp
     src/sirius_interface.cpp
     src/sirius_sql_rewrite.cpp
     src/telemetry/telemetry_context.cpp
@@ -387,6 +388,11 @@ target_link_libraries(
 
 target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING
                       PkgConfig::CURL OpenSSL::Crypto)
+
+# The sirius-sys + sirius Rust crates are built by cargo, not CMake (unlike the
+# telemetry bridge above, which CMake drives via Corrosion). Their build.rs
+# discovers the Sirius headers (repo + conda) and links the libsirius artifact
+# this build produces under build/<preset>/; see rust/crates/sirius-sys.
 
 # cucascade upstream PRs #126/#128/#130 moved cucascade to static-CUDA linkage
 # and pulled the NVML *static stub* (libnvidia-ml.a) into libcucascade.a via the
