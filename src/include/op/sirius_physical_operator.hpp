@@ -503,6 +503,7 @@ class sirius_physical_operator {
 
   //! Get the input batch
   virtual std::unique_ptr<operator_data> get_next_task_input_data();
+
   //! Check if all ports are empty
   [[nodiscard]] virtual bool all_ports_empty();
   //! Check if the pipeline is finished
