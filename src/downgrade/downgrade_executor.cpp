@@ -428,7 +428,6 @@ void downgrade_executor::monitor_loop()
   bool backed_off = false;
 
   while (_running.load()) {
-<<<<<<< HEAD
     if (_memory_space && _memory_space->should_downgrade_memory()) {
       // Stateless viability gate: only issue a downgrade request when one could plausibly free
       // memory. When idle GPU batches' only lower tier is a full HOST and no DISK is configured,
@@ -446,6 +445,7 @@ void downgrade_executor::monitor_loop()
             return freed.load(std::memory_order_relaxed) >= amount;
           };
           _monitor_requests_issued.fetch_add(1, std::memory_order_relaxed);
+          _monitor_request_enqueued.store(true, std::memory_order_relaxed);
           // Fire-and-forget: monitor does not wait for the result
           _request_queue.push(std::move(req));
         }
@@ -456,22 +456,6 @@ void downgrade_executor::monitor_loop()
           "space to enable spilling.",
           _source_label);
         backed_off = true;
-=======
-    if (_memory_space && _memory_space->should_downgrade_memory() &&
-        !_monitor_request_enqueued.load(std::memory_order_relaxed)) {
-      size_t amount = _memory_space->get_amount_to_downgrade();
-      if (amount > 0) {
-        auto req                = std::make_unique<downgrade_request>();
-        req->is_monitor_request = true;
-        req->predicate          = [&freed = req->bytes_freed, amount]() {
-          return freed.load(std::memory_order_relaxed) >= amount;
-        };
-        SIRIUS_LOG_DEBUG(
-          "[downgrade] monitor_loop:  for memory space {} for {} bytes", _source_label, amount);
-        _monitor_request_enqueued.store(true, std::memory_order_relaxed);
-        // Fire-and-forget: monitor does not wait for the result
-        _request_queue.push(std::move(req));
->>>>>>> 906ad8f0 (working stream rebind implementation. Also reduces redundant monitor requests)
       }
     } else {
       // Pressure gone -- reset so the next stall episode warns again.
