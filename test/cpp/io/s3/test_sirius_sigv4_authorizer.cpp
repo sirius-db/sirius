@@ -128,14 +128,14 @@ TEST_CASE("sirius_sigv4_presigned_authorizer normalizes HTTPS endpoint", "[s3][a
 TEST_CASE("sirius_sigv4_presigned_authorizer preserves HTTP endpoint ports", "[s3][authorizer]")
 {
   sirius_sigv4_presigned_authorizer provider(
-    example_static_credentials(), "us-east-1", "http://minio.local:9000");
+    example_static_credentials(), "us-east-1", "http://s3.local:9000");
 
   auto request =
     provider.authorize({"bucket", "object.parquet"}, s3_request_method::GET, k_presign_timeout);
   CHECK(request.headers.empty());
   auto const& url = request.url;
 
-  CHECK(starts_with(url, "http://minio.local:9000/bucket/object.parquet?"));
+  CHECK(starts_with(url, "http://s3.local:9000/bucket/object.parquet?"));
   CHECK(is_lower_hex_64(query_value(url, "X-Amz-Signature")));
 }
 
@@ -209,12 +209,12 @@ TEST_CASE("sirius_sigv4_header_authorizer omits session-token header for long-li
           "[s3][authorizer]")
 {
   sirius_sigv4_header_authorizer provider(
-    example_static_credentials(), "us-east-1", "http://minio.local:9000");
+    example_static_credentials(), "us-east-1", "http://s3.local:9000");
 
   auto request = provider.authorize(
     {"bucket", "nested/object.parquet"}, s3_request_method::GET, std::chrono::seconds{10});
 
-  CHECK(request.url == "http://minio.local:9000/bucket/nested/object.parquet");
+  CHECK(request.url == "http://s3.local:9000/bucket/nested/object.parquet");
   CHECK_FALSE(contains(request.url, "X-Amz-"));
   CHECK(starts_with(header_value(request.headers, "Authorization"), "AWS4-HMAC-SHA256 "));
   CHECK(header_value(request.headers, "x-amz-security-token").empty());

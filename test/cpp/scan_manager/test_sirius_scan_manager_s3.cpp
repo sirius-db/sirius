@@ -497,7 +497,7 @@ TEST_CASE("sirius_scan_manager leaves S3 ioctx cache disabled when prefetch cach
   context.terminate();
 }
 
-TEST_CASE("SiriusContext object_store_config header signing reads MinIO bytes",
+TEST_CASE("SiriusContext object_store_config header signing reads S3 bytes",
           "[.][s3][integration][scan_manager][authorizer]")
 {
   auto env = read_s3_test_env();
@@ -560,8 +560,8 @@ TEST_CASE("SiriusContext initialize wires populated object_store_config into sca
   auto cfg                           = make_context_config();
   cfg.object_store_config.endpoint   = "http://127.0.0.1:9000";
   cfg.object_store_config.region     = "us-east-1";
-  cfg.object_store_config.access_key = "minioadmin";
-  cfg.object_store_config.secret_key = "minioadmin";
+  cfg.object_store_config.access_key = "siriustest";
+  cfg.object_store_config.secret_key = "siriustest-secret";
 
   duckdb::SiriusContext context;
   context.initialize(cfg);
@@ -588,8 +588,8 @@ TEST_CASE("SiriusContext owns S3 ioctx beyond borrowed scan_manager lifetime",
   auto cfg                           = make_context_config();
   cfg.object_store_config.endpoint   = "http://127.0.0.1:9000";
   cfg.object_store_config.region     = "us-east-1";
-  cfg.object_store_config.access_key = "minioadmin";
-  cfg.object_store_config.secret_key = "minioadmin";
+  cfg.object_store_config.access_key = "siriustest";
+  cfg.object_store_config.secret_key = "siriustest-secret";
 
   std::weak_ptr<sirius_ioctx> weak_s3;
 

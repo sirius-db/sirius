@@ -45,10 +45,10 @@ rust-src = "*"
 liburing = "*"
 openssl = "*"
 libcurl = "*"
-# Go toolchain (with cgo) to build the patched testcontainers-native bridge used
-# by the C++ S3 integration tests (fetched at configure time; see
-# cmake/testcontainers_native.cmake). Upstream go.mod requires >=1.25.
-go-cgo = ">=1.25"
+# SeaweedFS provides the `weed` binary used by the C++ S3 integration tests: the
+# test binary spawns it as a local process to serve an S3-compatible endpoint
+# (no Docker; see test/cpp/utils/s3_backend.*).
+seaweedfs = ">=4.32"
 
 [tasks]
 

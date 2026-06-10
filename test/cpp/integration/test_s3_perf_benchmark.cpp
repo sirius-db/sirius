@@ -80,7 +80,7 @@ struct bench_env {
 
 std::optional<bench_env> read_bench_env()
 {
-  auto backend = env_or("SIRIUS_BENCH_BACKEND", "minio");
+  auto backend = env_or("SIRIUS_BENCH_BACKEND", "s3");
   if (backend == "aws-s3") {
     auto access_key = env_or("SIRIUS_BENCH_AWS_S3_ACCESS_KEY");
     auto secret_key = env_or("SIRIUS_BENCH_AWS_S3_SECRET_KEY");

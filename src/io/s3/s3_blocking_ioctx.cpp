@@ -168,7 +168,7 @@ bool is_retriable_status(long http_status)
 
 // libcurl transport-level failures that are usually transient: connection
 // failure, timeout, mid-stream drops. Deliberately narrow — protocol errors
-// (CURLE_RECV_ERROR is borderline but included since MinIO under load can
+// (CURLE_RECV_ERROR is borderline but included since an S3 backend under load can
 // drop reads mid-body) are kept retriable; logic errors like
 // CURLE_URL_MALFORMAT are surfaced immediately.
 bool is_retriable_curl_code(CURLcode code)
