@@ -488,9 +488,6 @@ void downgrade_executor::set_pipeline_task_queue(
 
 std::future<size_t> downgrade_executor::request_free_memory(size_t bytes)
 {
-  SIRIUS_LOG_DEBUG("[downgrade] request_free_memory: for memory space {} requesting {} bytes",
-                   _source_label,
-                   bytes);
   auto req       = std::make_unique<downgrade_request>();
   req->predicate = [&freed = req->bytes_freed, bytes]() {
     return freed.load(std::memory_order_relaxed) >= bytes;
@@ -510,8 +507,6 @@ size_t downgrade_executor::request_free_memory_and_wait(size_t bytes)
 
 std::future<size_t> downgrade_executor::request_downgrade(std::function<bool()> predicate)
 {
-  SIRIUS_LOG_DEBUG("[downgrade] request_downgrade: for memory space {} requesting downgrade",
-                   _source_label);
   auto req       = std::make_unique<downgrade_request>();
   req->predicate = std::move(predicate);
   auto future    = req->result.get_future();

@@ -69,23 +69,8 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
     if (current_space != nullptr && rebind_target != nullptr &&
         current_space->get_id() == rebind_target->get_id() &&
         rebind_target->get_tier() == cucascade::memory::Tier::GPU) {
-      // TEMP DIAGNOSTIC (stream-rebind deadlock investigation): log immediately before and
-      // after the rebind so the last rebound batch is pinpointable in a wedged log.
-      SIRIUS_LOG_DEBUG(
-        "[rebind] lock_or_prepare_batch: rebinding batch {} on GPU:{} to stream {} (begin)",
-        batch->get_batch_id(),
-        current_space->get_id().device_id,
-        static_cast<const void*>(stream.value()));
       mut->rebind_stream(stream);
-      SIRIUS_LOG_DEBUG(
-        "[rebind] lock_or_prepare_batch: rebound batch {} on GPU:{} to stream {} (end)",
-        batch->get_batch_id(),
-        current_space->get_id().device_id,
-        static_cast<const void*>(stream.value()));
     }
-  } else {
-    SIRIUS_LOG_DEBUG("[rebind] lock_or_prepare_batch: failed to acquire mutable lock for batch {}",
-                     batch->get_batch_id());
   }
 
   // Acquire a read-only lock

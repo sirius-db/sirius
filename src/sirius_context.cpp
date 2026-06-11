@@ -177,7 +177,7 @@ void SiriusContext::log_host_pool_stats(std::string_view tag) const
   auto* fs_mr =
     host_spaces[0]->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
   if (!fs_mr) { return; }
-  spdlog::info("[query_pool] {} allocated={} bytes peak={} bytes free_blocks={}",
+  spdlog::info("[host_pool] {} allocated={} bytes peak={} bytes free_blocks={}",
                tag,
                fs_mr->get_total_allocated_bytes(),
                fs_mr->get_peak_total_allocated_bytes(),

@@ -24,12 +24,12 @@ TRACE_TAG = "[trace]"
 DEBUG_TAG = "[debug]"
 
 # --- Query boundaries (info-level) -------------------------------------------
-# Example: "[2026-05-20 14:25:02.368] [info] [:] [query_pool] QueryBegin allocated=5242880 bytes peak=307232768 bytes free_blocks=5115"
-QUERY_BEGIN_ANCHOR = "[info] [:] [query_pool] QueryBegin allocated="
-QUERY_END_ANCHOR = "[info] [:] [query_pool] QueryEnd allocated="
+# Example: "[2026-05-20 14:25:02.368] [info] [:] [host_pool] QueryBegin allocated=5242880 bytes peak=307232768 bytes free_blocks=5115"
+QUERY_BEGIN_ANCHOR = "[info] [:] [host_pool] QueryBegin allocated="
+QUERY_END_ANCHOR = "[info] [:] [host_pool] QueryEnd allocated="
 # Strict regex to extract stats from the host-pool boundary lines.
-QUERY_POOL_RE = re.compile(
-    r"\[(?P<ts>[\d\-: .]+)\] \[info\] \[[^\]]+\] \[query_pool\] "
+HOST_POOL_RE = re.compile(
+    r"\[(?P<ts>[\d\-: .]+)\] \[info\] \[[^\]]+\] \[host_pool\] "
     r"(?P<tag>QueryBegin|QueryEnd) "
     r"allocated=(?P<allocated_bytes>\d+) bytes "
     r"peak=(?P<peak_bytes>\d+) bytes "

@@ -1,7 +1,7 @@
 """Split a log file into analytical-SQL query segments.
 
-A "query" runs from a `[query_pool] QueryBegin allocated=` line to the
-matching `[query_pool] QueryEnd allocated=` line. The very next line after
+A "query" runs from a `[host_pool] QueryBegin allocated=` line to the
+matching `[host_pool] QueryEnd allocated=` line. The very next line after
 QueryBegin is expected to carry the SQL text (`QueryBegin: <sql>`); we keep
 only queries whose SQL (case-insensitive) starts with `select ` or `with `.
 

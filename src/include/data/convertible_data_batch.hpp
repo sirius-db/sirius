@@ -118,9 +118,7 @@ class convertible_data_batch : public convertible_data {
       // synchronizes `stream` after the D2H copy and before destroying the source
       // representation, so the free is correctly ordered. No-op for non-GPU-table sources.
       if (cur_space != nullptr && cur_space->get_tier() == cucascade::memory::Tier::GPU) {
-        SIRIUS_LOG_DEBUG("[rebind] convertible_data_batch: (begin)");
         mut.rebind_stream(stream);
-        SIRIUS_LOG_DEBUG("[rebind] convertible_data_batch: (end)");
       }
 
       auto& converter_registry = sirius::converter_registry::get();
