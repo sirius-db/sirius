@@ -105,6 +105,11 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   mutable bool unique_probe_keys = false;
 
+  //! Row-count ratio gate for switching STANDARD-mode MARK joins to cudf::mark_join (build on the
+  //! left/output side) instead of filtered_join (build on the right side). Switch when
+  //! right_rows >= ratio * left_rows; 0 disables. Set from operator_params at planning time.
+  double mark_join_build_switch_ratio = config::DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO;
+
   static void build_join_pipelines(pipeline::sirius_pipeline& current,
                                    pipeline::sirius_meta_pipeline& meta_pipeline,
                                    sirius_physical_operator& op,
