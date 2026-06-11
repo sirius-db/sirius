@@ -148,9 +148,10 @@ class SiriusContext : public ClientContextState {
   /// \brief Terminate the Sirius context, releasing all resources.
   void terminate();
 
-  /// \brief Log the host fixed_size_host_memory_resource stats (allocated,
-  ///        peak, free blocks) at a labeled tag — used for verifying leaks.
-  void log_host_pool_stats(std::string_view tag) const;
+  /// \brief Log host and GPU memory pool stats (allocated, peak, and
+  ///        tier-specific capacity fields) at a labeled tag — used for
+  ///        verifying that allocations return to baseline after each query.
+  void log_pool_stats(std::string_view tag) const;
 
   [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept
   {

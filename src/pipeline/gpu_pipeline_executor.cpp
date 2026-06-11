@@ -252,6 +252,9 @@ void gpu_pipeline_executor::manager_loop()
             return;
           }
 
+          // Sync the stream to ensure all memory is released before the reschedule.
+          exc_stream->synchronize();
+
           // Determine retry count and original task ID for this rescheduled attempt.
           auto* cur_local = dynamic_cast<gpu_pipeline_task_local_state*>(gpu_task->local_state());
           uint32_t next_retry_count = 1;

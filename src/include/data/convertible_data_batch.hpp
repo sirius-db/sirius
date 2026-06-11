@@ -111,6 +111,16 @@ class convertible_data_batch : public convertible_data {
       auto reservation = mem_space->make_reservation_or_null(data_size);
       if (!reservation) { continue; }
 
+      // When downgrading off the GPU, rebind the source buffers' deallocation stream to this
+      // downgrade stream so that when the conversion below frees the GPU representation, the
+      // free lands on the active (downgrade) stream rather than the stream the data was
+      // originally produced on. We hold the exclusive (mutable) lock here, and convert_to()
+      // synchronizes `stream` after the D2H copy and before destroying the source
+      // representation, so the free is correctly ordered. No-op for non-GPU-table sources.
+      if (cur_space != nullptr && cur_space->get_tier() == cucascade::memory::Tier::GPU) {
+        mut.rebind_stream(stream);
+      }
+
       auto& converter_registry = sirius::converter_registry::get();
 
       switch (space->get_tier()) {

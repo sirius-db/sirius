@@ -97,6 +97,48 @@ def _extract_overview_text(lines):
     return "\n".join(out) if out else ""
 
 
+def _extract_pool_stats(lines) -> dict:
+    """Extract host (pinned) and GPU device memory pool stats from boundary lines.
+
+    Returns a dict with keys "host" and "gpu":
+      - host: {"begin": {allocated_bytes, peak_bytes, free_blocks}, "end": {...}}
+      - gpu: [{"device_id": N, "begin": {allocated_bytes, peak_bytes, reserved_bytes}, "end": {...}}, ...]
+    """
+    host: dict = {}
+    gpu: dict = {}  # device_id -> {"begin": ..., "end": ...}
+
+    for line in lines:
+        if patterns.is_query_begin_line(line) or patterns.is_query_end_line(line):
+            m = patterns.HOST_POOL_RE.match(line)
+            if m:
+                key = "begin" if m.group("tag") == "QueryBegin" else "end"
+                host[key] = {
+                    "allocated_bytes": int(m.group("allocated_bytes")),
+                    "peak_bytes": int(m.group("peak_bytes")),
+                    "free_blocks": int(m.group("free_blocks")),
+                }
+        if patterns.GPU_POOL_ANCHOR in line:
+            m = patterns.GPU_POOL_RE.match(line)
+            if m:
+                dev_id = int(m.group("gpu_id"))
+                key = "begin" if m.group("tag") == "QueryBegin" else "end"
+                if dev_id not in gpu:
+                    gpu[dev_id] = {}
+                gpu[dev_id][key] = {
+                    "allocated_bytes": int(m.group("allocated_bytes")),
+                    "peak_bytes": int(m.group("peak_bytes")),
+                    "reserved_bytes": int(m.group("reserved_bytes")),
+                }
+
+    return {
+        "host": host,
+        "gpu": [
+            {"device_id": dev_id, **dev_stats}
+            for dev_id, dev_stats in sorted(gpu.items())
+        ],
+    }
+
+
 def process_query(seg, out_dir: Path, warnings: FormatWarnings) -> dict:
     """Process a single query segment. Returns the index-row dict."""
     folder_name = _ts_to_folder_name(seg.begin_ts)
@@ -142,12 +184,14 @@ def process_query(seg, out_dir: Path, warnings: FormatWarnings) -> dict:
             duration_ms = None
 
     sql_preview = seg.sql[:120]
+    pool_stats = _extract_pool_stats(seg.lines)
     meta = {
         "begin_ts": seg.begin_ts,
         "end_ts": seg.end_ts,
         "status": seg.status,
         "duration_ms": duration_ms,
         "sql_preview": sql_preview,
+        "pool_stats": pool_stats,
         "counts": {
             "memory_reservations": len(mr_rows),
             "task_inputs": len(ti_rows),

@@ -39,6 +39,7 @@
 #include <cuda_runtime_api.h>
 
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 #include <duckdb/common/allocator.hpp>
 #include <duckdb/execution/physical_plan_generator.hpp>
@@ -165,22 +166,41 @@ SiriusContext::~SiriusContext() noexcept
   if (is_initialized_) { terminate(); }
 }
 
-// Log the host fixed_size_host_memory_resource stats at a labeled point.
+// Log host and GPU memory pool stats at a labeled point.
 // Lets us verify that allocated bytes return to baseline at the end of each
 // query — the leak signature is "QueryEnd allocated != QueryBegin allocated".
-void SiriusContext::log_host_pool_stats(std::string_view tag) const
+void SiriusContext::log_pool_stats(std::string_view tag) const
 {
   if (!memory_manager_) { return; }
-  auto host_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
-  if (host_spaces.empty()) { return; }
-  auto* fs_mr =
-    host_spaces[0]->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
-  if (!fs_mr) { return; }
-  spdlog::info("[query_pool] {} allocated={} bytes peak={} bytes free_blocks={}",
-               tag,
-               fs_mr->get_total_allocated_bytes(),
-               fs_mr->get_peak_total_allocated_bytes(),
-               fs_mr->get_free_blocks());
+
+  // Host pinned pool (fixed_size_host_memory_resource).
+  for (auto const* space :
+       memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST)) {
+    auto* fs_mr =
+      space->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
+    if (fs_mr) {
+      spdlog::info("[host_pool] HOST:{} {} allocated={} bytes peak={} bytes free_blocks={}",
+                   space->get_id().device_id,
+                   tag,
+                   fs_mr->get_total_allocated_bytes(),
+                   fs_mr->get_peak_total_allocated_bytes(),
+                   fs_mr->get_free_blocks());
+    }
+  }
+
+  // GPU device memory pools (reservation_aware_resource_adaptor), one line per GPU.
+  for (auto const* space :
+       memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+    auto* ra_mr =
+      space->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
+    if (!ra_mr) { continue; }
+    spdlog::info("[gpu_pool] GPU:{} {} allocated={} bytes peak={} bytes reserved={} bytes",
+                 space->get_device_id(),
+                 tag,
+                 ra_mr->get_total_allocated_bytes(),
+                 ra_mr->get_peak_total_allocated_bytes(),
+                 ra_mr->get_total_reserved_bytes());
+  }
 }
 
 void SiriusContext::QueryBegin(ClientContext& context)
@@ -191,7 +211,7 @@ void SiriusContext::QueryBegin(ClientContext& context)
   acquire_query_lifecycle_slot();
 
   try {
-    log_host_pool_stats("QueryBegin");
+    log_pool_stats("QueryBegin");
 
     // Clear any stale captured plan from a previous query.
     captured_logical_plan_.reset();
@@ -219,7 +239,7 @@ void SiriusContext::QueryBegin(ClientContext& context)
     if (!normalized_query.empty() && normalized_query.back() == ' ') {
       normalized_query.pop_back();
     }
-    SIRIUS_LOG_INFO("QueryBegin: {}", normalized_query);
+    SIRIUS_LOG_INFO("QueryBegin: SQL: {}", normalized_query);
 
     task_creator_->reset();
     task_creator_->set_client_context(context);
@@ -268,7 +288,7 @@ void SiriusContext::QueryEnd()
     // sliced host_data_representation are gone before we drop the providers.
     if (scan_manager_) { scan_manager_->reset(); }
 
-    log_host_pool_stats("QueryEnd");
+    log_pool_stats("QueryEnd");
   } catch (...) {
     release_query_lifecycle_slot();
     throw;
