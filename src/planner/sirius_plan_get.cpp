@@ -21,9 +21,9 @@
 #include "expression/ast/node.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/sirius_physical_filter.hpp"
-#include "op/sirius_physical_projection.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "planner/sirius_plan_projection_utils.hpp"
 
 #include <memory>
 #include <unordered_set>
@@ -227,18 +227,17 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         expressions.push_back(duckdb::make_uniq<duckdb::BoundReferenceExpression>(type, col_id));
       }
     }
-    duckdb::unique_ptr<sirius::op::sirius_physical_projection> projection =
-      duckdb::make_uniq<sirius::op::sirius_physical_projection>(
-        sirius::from_duckdb_vec(types),
-        translate_expressions(std::move(expressions)),
-        op.estimated_cardinality);
+    duckdb::unique_ptr<sirius::op::sirius_physical_operator> scan_child;
     if (filter) {
       filter->children.push_back(std::move(node));
-      projection->children.push_back(std::move(filter));
+      scan_child = std::move(filter);
     } else {
-      projection->children.push_back(std::move(node));
+      scan_child = std::move(node);
     }
-    return std::move(projection);
+    return push_projection(std::move(scan_child),
+                           sirius::from_duckdb_vec(types),
+                           translate_expressions(std::move(expressions)),
+                           op.estimated_cardinality);
   }
 
   auto node = duckdb::make_uniq<sirius::op::sirius_physical_table_scan>(
