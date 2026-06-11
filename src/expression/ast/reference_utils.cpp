@@ -22,7 +22,6 @@
 
 // standard library
 #include <algorithm>
-#include <functional>
 #include <iterator>
 #include <memory>
 #include <type_traits>
@@ -33,12 +32,6 @@
 namespace sirius::ast {
 
 namespace {
-
-void visit_child(std::unique_ptr<node> const& child,
-                 std::function<void(reference const&)> const& fn)
-{
-  if (child) { visit_references(*child, fn); }
-}
 
 // Recurse into an optional child; null slots stay null.
 std::unique_ptr<node> substitute_child(std::unique_ptr<node> const& child,
@@ -61,63 +54,6 @@ std::vector<std::unique_ptr<node>> substitute_children(
 }
 
 }  // namespace
-
-void visit_references(node const& root, std::function<void(reference const&)> const& fn)
-{
-  std::visit(
-    [&](auto const& alt) {
-      using T = std::decay_t<decltype(alt)>;
-
-      if constexpr (std::is_same_v<T, reference>) {
-        fn(alt);
-      } else if constexpr (std::is_same_v<T, constant>) {
-        // leaf, no references
-      } else if constexpr (std::is_same_v<T, comparison>) {
-        visit_child(alt.left, fn);
-        visit_child(alt.right, fn);
-      } else if constexpr (std::is_same_v<T, conjunction>) {
-        for (auto const& child : alt.children) {
-          visit_child(child, fn);
-        }
-      } else if constexpr (std::is_same_v<T, between>) {
-        visit_child(alt.input, fn);
-        visit_child(alt.lower, fn);
-        visit_child(alt.upper, fn);
-      } else if constexpr (std::is_same_v<T, case_expr>) {
-        for (auto const& wt : alt.cases) {
-          visit_child(wt.when_, fn);
-          visit_child(wt.then_, fn);
-        }
-        visit_child(alt.else_, fn);
-      } else if constexpr (std::is_same_v<T, cast>) {
-        visit_child(alt.child, fn);
-      } else if constexpr (std::is_same_v<T, unary_op>) {
-        visit_child(alt.child, fn);
-      } else if constexpr (std::is_same_v<T, coalesce>) {
-        for (auto const& child : alt.children) {
-          visit_child(child, fn);
-        }
-      } else if constexpr (std::is_same_v<T, in_list>) {
-        visit_child(alt.probe, fn);
-        for (auto const& child : alt.values) {
-          visit_child(child, fn);
-        }
-      } else if constexpr (std::is_same_v<T, function_call>) {
-        for (auto const& child : alt.arguments()) {
-          visit_child(child, fn);
-        }
-      } else if constexpr (std::is_same_v<T, aggregate>) {
-        for (auto const& child : alt.arguments()) {
-          visit_child(child, fn);
-        }
-      } else {
-        static_assert(sizeof(T) == 0,
-                      "Unhandled sirius::ast alternative in visit_references — add a "
-                      "traversal arm for the new variant member");
-      }
-    },
-    root.v);
-}
 
 // Deep-copy @p src, remapping every reference #i to a clone of inner_select_list[i].
 // Used when folding adjacent projections: outer references index the inner

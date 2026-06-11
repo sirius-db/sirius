@@ -20,11 +20,24 @@
 #include "expression/ast/node.hpp"  // sirius::ast::node, sirius::ast::reference
 
 // standard library
-#include <functional>
 #include <memory>
+#include <type_traits>
 #include <vector>
 
 namespace sirius::ast {
+
+template <typename Fn>
+void visit_references(node const& root, Fn&& fn);
+
+namespace detail {
+
+template <typename Fn>
+void visit_child(std::unique_ptr<node> const& child, Fn& fn)
+{
+  if (child) { visit_references(*child, fn); }
+}
+
+}  // namespace detail
 
 /**
  * @brief Invoke @p fn on every reference node in the tree rooted at @p root
@@ -33,7 +46,63 @@ namespace sirius::ast {
  * A single reusable traversal primitive so callers (e.g. projection folding's
  * use-count analysis) do not each re-enumerate the variant alternatives.
  */
-void visit_references(node const& root, std::function<void(reference const&)> const& fn);
+template <typename Fn>
+void visit_references(node const& root, Fn&& fn)
+{
+  std::visit(
+    [&](auto const& alt) {
+      using T = std::decay_t<decltype(alt)>;
+
+      if constexpr (std::is_same_v<T, reference>) {
+        fn(alt);
+      } else if constexpr (std::is_same_v<T, constant>) {
+        // leaf, no references
+      } else if constexpr (std::is_same_v<T, comparison>) {
+        detail::visit_child(alt.left, fn);
+        detail::visit_child(alt.right, fn);
+      } else if constexpr (std::is_same_v<T, conjunction>) {
+        for (auto const& child : alt.children) {
+          detail::visit_child(child, fn);
+        }
+      } else if constexpr (std::is_same_v<T, between>) {
+        detail::visit_child(alt.input, fn);
+        detail::visit_child(alt.lower, fn);
+        detail::visit_child(alt.upper, fn);
+      } else if constexpr (std::is_same_v<T, case_expr>) {
+        for (auto const& wt : alt.cases) {
+          detail::visit_child(wt.when_, fn);
+          detail::visit_child(wt.then_, fn);
+        }
+        detail::visit_child(alt.else_, fn);
+      } else if constexpr (std::is_same_v<T, cast>) {
+        detail::visit_child(alt.child, fn);
+      } else if constexpr (std::is_same_v<T, unary_op>) {
+        detail::visit_child(alt.child, fn);
+      } else if constexpr (std::is_same_v<T, coalesce>) {
+        for (auto const& child : alt.children) {
+          detail::visit_child(child, fn);
+        }
+      } else if constexpr (std::is_same_v<T, in_list>) {
+        detail::visit_child(alt.probe, fn);
+        for (auto const& child : alt.values) {
+          detail::visit_child(child, fn);
+        }
+      } else if constexpr (std::is_same_v<T, function_call>) {
+        for (auto const& child : alt.arguments()) {
+          detail::visit_child(child, fn);
+        }
+      } else if constexpr (std::is_same_v<T, aggregate>) {
+        for (auto const& child : alt.arguments()) {
+          detail::visit_child(child, fn);
+        }
+      } else {
+        static_assert(sizeof(T) == 0,
+                      "Unhandled sirius::ast alternative in visit_references — add a "
+                      "traversal arm for the new variant member");
+      }
+    },
+    root.v);
+}
 
 /**
  * @brief Replace every column reference in @p expr with a deep clone of the
