@@ -105,6 +105,22 @@ void visit_references(node const& root, Fn&& fn)
 }
 
 /**
+ * @brief Deep-clone a Sirius AST node tree.
+ *
+ * `node` is move-only (children are owned via std::unique_ptr<node>), so it has
+ * no copy constructor. clone walks @p src via std::visit, reconstructs each
+ * alternative from its public fields/accessors, and recursively deep-clones
+ * every child unique_ptr. The returned tree is an independent allocation that
+ * shares no ownership with @p src.
+ *
+ * Used by the aggregate copy path (sirius_physical_ungrouped_aggregate's
+ * copy_expressions), where an aggregate node must be duplicated and a
+ * to_duckdb round-trip is impossible (to_duckdb(aggregate) throws by design).
+ * See https://github.com/sirius-db/sirius/issues/701.
+ */
+std::unique_ptr<node> clone(node const& src);
+
+/**
  * @brief Replace every column reference in @p expr with a deep clone of the
  * corresponding expression from @p inner_select_list.
  *
