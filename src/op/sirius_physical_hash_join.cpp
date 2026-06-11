@@ -76,6 +76,19 @@ static cudf::filtered_join make_right_filtered_join(cudf::table_view const& righ
 #endif
 }
 
+// Heap-allocated variant for BUILD_PROBE mode, where one filtered_join is built once on the right
+// (filter) keys and reused across many streamed left probe batches via semi_join.
+static std::unique_ptr<cudf::filtered_join> make_right_filtered_join_ptr(
+  cudf::table_view const& right_keys, rmm::cuda_stream_view stream)
+{
+#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 8)
+  return std::make_unique<cudf::filtered_join>(right_keys, cudf::null_equality::UNEQUAL, stream);
+#else
+  return std::make_unique<cudf::filtered_join>(
+    right_keys, cudf::null_equality::UNEQUAL, cudf::set_as_build_table::RIGHT, stream);
+#endif
+}
+
 // Build the semi-join hash table on the left/output side and probe with the (larger) right side.
 // Wins over make_right_filtered_join only when the left side is substantially smaller than the
 // right; gated by mark_join_build_switch_ratio at the call site.
@@ -400,11 +413,14 @@ void sirius_physical_hash_join::update_join_exec_mode(int num_partitions,
                                                       bool build_foldable_to_single_batch)
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
+  // MARK joins are eligible for BUILD_PROBE: a persistent cudf::filtered_join is built once on the
+  // right (filter) side and reused across streamed left probe batches via semi_join.
+  // SEMI/ANTI/RIGHT remain excluded (handled in STANDARD mode for now).
   if (num_partitions == 1 && build_side_bytes < _max_build_hash_table_bytes &&
       build_foldable_to_single_batch && join_type != duckdb::JoinType::SEMI &&
       join_type != duckdb::JoinType::RIGHT_SEMI && join_type != duckdb::JoinType::ANTI &&
       join_type != duckdb::JoinType::RIGHT_ANTI && join_type != duckdb::JoinType::RIGHT &&
-      join_type != duckdb::JoinType::MARK && _join_mode != HASH_JOIN_MODE::MIXED_JOIN) {
+      _join_mode != HASH_JOIN_MODE::MIXED_JOIN) {
     // Switch to a more efficient join strategy for small datasets. The
     // build_foldable_to_single_batch gate matches the runtime invariant in
     // get_next_task_input_data_for_build_probe — BUILD_PROBE requires the
@@ -903,8 +919,15 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         std::lock_guard<std::mutex> lg(op_state_mutex);
         _built_table_cast_columns = std::move(build_keys_result.owned_cast_columns);
         _build_table              = build_batch_ro;
-        if (unique_build_keys &&
-            (join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::LEFT)) {
+        if (join_type == duckdb::JoinType::MARK) {
+          // MARK: build a reusable filtered_join on the right (filter) keys; each probe batch's
+          // semi_join returns left-row match indices for resolve_mark_join_result.
+          _filtered_table = make_right_filtered_join_ptr(build_keys, stream);
+          SIRIUS_LOG_DEBUG(
+            "sirius_physical_hash_join id {}: using filtered_join (BUILD_PROBE MARK)",
+            this->get_operator_id());
+        } else if (unique_build_keys &&
+                   (join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::LEFT)) {
           _distinct_hash_table = std::make_unique<cudf::distinct_hash_join>(
             build_keys, cudf::null_equality::UNEQUAL, 0.5, stream);
           SIRIUS_LOG_DEBUG(
@@ -930,7 +953,16 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                                  stream);
       cudf::table_view probe_keys = probe_keys_result.keys;
 
-      left_full  = get_cudf_table_view(input_batches[0]);
+      left_full = get_cudf_table_view(input_batches[0]);
+
+      if (join_type == duckdb::JoinType::MARK) {
+        // Reuse the persistent filtered_join (built on the right/filter side): probe with this left
+        // batch to get its matched left-row indices, then materialize all left rows + BOOL8 mark.
+        auto semi_indices = _filtered_table->semi_join(probe_keys, stream);
+        return resolve_mark_join_result(
+          *semi_indices, left_full, lhs_output_columns.col_idxs, input_batches[0], stream);
+      }
+
       right_full = _build_table.value()
                      .get_data()
                      ->cast<cucascade::gpu_table_representation>()
@@ -1250,6 +1282,7 @@ void sirius_physical_hash_join::on_finalize_operator()
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
     _hash_table.reset();
     _distinct_hash_table.reset();
+    _filtered_table.reset();
     _build_table = std::nullopt;
     _built_table_cast_columns.clear();
     _hash_table_build_state = BUILD_HASH_TABLE_STATE::DESTROYED;
