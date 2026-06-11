@@ -206,6 +206,36 @@ duckdb_native_gpu_ingestible::next_split_provider()
 //===----------------------------------------------------------------------===//
 // consumer-side coalescing
 //===----------------------------------------------------------------------===//
+void duckdb_native_gpu_ingestible::finalize_metadata(scan_manager::split_connector& connector)
+{
+  if (_metadata_finalized) { return; }
+
+  std::vector<duckdb_row_group_metadata> row_groups;
+  for (;;) {
+    auto next = connector.get_next_split();
+    if (!next.has_value()) { break; }
+
+    auto* range = dynamic_cast<duckdb_native_range_input*>(next->get());
+    if (range == nullptr) {
+      throw std::runtime_error(
+        "[duckdb_native_gpu_ingestible::finalize_metadata] unexpected operator_data type from "
+        "split connector; expected duckdb_native_range_input.");
+    }
+    for (auto& rg : range->row_groups) {
+      row_groups.push_back(std::move(rg));
+    }
+  }
+
+  std::sort(row_groups.begin(), row_groups.end(), [](auto const& a, auto const& b) {
+    return a.row_group_index < b.row_group_index;
+  });
+  finalize_duckdb_native_segment_bytes(row_groups, _plan.block_size);
+  for (auto& rg : row_groups) {
+    _coalescer->push(std::move(rg));
+  }
+  _metadata_finalized = true;
+}
+
 std::unique_ptr<op::operator_data> duckdb_native_gpu_ingestible::make_batch(
   std::vector<duckdb_row_group_metadata> row_groups)
 {
@@ -233,35 +263,21 @@ std::unique_ptr<op::operator_data> duckdb_native_gpu_ingestible::make_batch(
 std::unique_ptr<op::operator_data> duckdb_native_gpu_ingestible::consume_next_input(
   scan_manager::split_connector& connector)
 {
-  // Pull raw row-group ranges off the connector and coalesce them into cap-sized
-  // batches. Rowids are absolute per row group, so packing order is unconstrained.
-  // get_next_split blocks until a range is ready.
-  for (;;) {
-    if (_coalescer->has_ready()) { return make_batch(_coalescer->pop_ready()); }
+  // The first consumer call drains every parsed range so segment byte sizes can
+  // be finalized with table-wide visibility. Subsequent calls serve already
+  // coalesced batches.
+  finalize_metadata(connector);
 
-    auto next = connector.get_next_split();
-    if (!next.has_value()) {
-      // Connector closed and drained: emit the tail batch, if any.
-      auto tail = _coalescer->flush();
-      if (!tail.empty()) { return make_batch(std::move(tail)); }
-      return nullptr;
-    }
+  if (_coalescer->has_ready()) { return make_batch(_coalescer->pop_ready()); }
 
-    auto* range = dynamic_cast<duckdb_native_range_input*>(next->get());
-    if (range == nullptr) {
-      throw std::runtime_error(
-        "[duckdb_native_gpu_ingestible::consume_next_input] unexpected operator_data type from "
-        "split connector; expected duckdb_native_range_input.");
-    }
-    for (auto& rg : range->row_groups) {
-      _coalescer->push(std::move(rg));
-    }
-  }
+  auto tail = _coalescer->flush();
+  if (!tail.empty()) { return make_batch(std::move(tail)); }
+  return nullptr;
 }
 
 bool duckdb_native_gpu_ingestible::consumer_drained() const
 {
-  return _coalescer == nullptr || _coalescer->empty();
+  return _metadata_finalized && (_coalescer == nullptr || _coalescer->empty());
 }
 
 //===----------------------------------------------------------------------===//

@@ -24,6 +24,7 @@
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/catalog/catalog_entry/table_catalog_entry.hpp>
 #include <duckdb/main/client_context.hpp>
+#include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/storage/data_table.hpp>
 #include <helper/logical_type.hpp>
 #include <io/io_context.hpp>
@@ -261,6 +262,31 @@ TEST_CASE("duckdb_native_gpu_ingestible throws when walker rejects the table",
                               {real_col(0)},
                               {sirius::logical_type::make(sirius::type_id::HUGEINT)});
   REQUIRE_THROWS_AS((duckdb_native_gpu_ingestible{std::move(info), *mgr}), std::runtime_error);
+}
+
+TEST_CASE("duckdb_native_gpu_ingestible rejects fully stats-pruned scans",
+          "[scan][duckdb_native_gpu_ingestible]")
+{
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  exec_ok(con, "CREATE TABLE t(a INTEGER)");
+  exec_ok(con, "INSERT INTO t SELECT range FROM range(0, 300000)");
+  exec_ok(con, "CHECKPOINT");
+  auto& storage = get_storage(con, "t");
+
+  auto mgr          = make_scan_manager();
+  auto info         = make_table_info(&storage,
+                              con.context.get(),
+                                      {real_col(0)},
+                                      {sirius::logical_type::make(sirius::type_id::INTEGER)});
+  auto* native_info = dynamic_cast<duckdb_native_ingestible_table_info*>(info.get());
+  REQUIRE(native_info != nullptr);
+  native_info->table_filters             = duckdb::make_uniq<duckdb::TableFilterSet>();
+  native_info->table_filters->filters[0] = duckdb::make_uniq<duckdb::ConstantFilter>(
+    duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::INTEGER(1000000));
+  native_info->column_ids.push_back(duckdb::ColumnIndex(0));
+
+  REQUIRE_THROWS_WITH((duckdb_native_gpu_ingestible{std::move(info), *mgr}),
+                      Catch::Contains("fully pruned"));
 }
 
 //===----------------------------------------------------------------------===//

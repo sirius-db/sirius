@@ -195,6 +195,11 @@ class duckdb_native_gpu_ingestible : public io::gpu_ingestible {
   [[nodiscard]] bool consumer_drained() const override;
 
  private:
+  /// Drain all parsed ranges from the connector, finalize global segment byte
+  /// sizes, and feed the coalescer. Blocks until the split provider closes the
+  /// connector.
+  void finalize_metadata(scan_manager::split_connector& connector);
+
   /// Wrap a batch of row groups into a @c scan_operator_input
   /// (@c duckdb_native_split_info plus optional filter/projection info).
   std::unique_ptr<op::operator_data> make_batch(std::vector<duckdb_row_group_metadata> row_groups);
@@ -215,6 +220,7 @@ class duckdb_native_gpu_ingestible : public io::gpu_ingestible {
   std::atomic<std::size_t> _next_range_idx{0};
 
   // ---- Consumer-side coalescer ----
+  bool _metadata_finalized = false;
   std::unique_ptr<batch_coalescer> _coalescer;
 };
 

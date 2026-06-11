@@ -208,52 +208,89 @@ bool filter_is_prunable(duckdb::TableFilterType t)
   return t != duckdb::TableFilterType::DYNAMIC_FILTER;
 }
 
-/// @brief Drop row groups a pushed-down filter proves can hold no matching rows.
-///
-/// For each prunable filter, evaluate TableFilter::CheckStatistics against the
-/// row group's aggregated per-column statistics
-/// (PartitionRowGroup::GetColumnStatistics). Each range owns a disjoint set of
-/// row groups, so each handle is read by a single thread.
-void prune_row_groups_by_filter_stats(duckdb_native_row_group_range& result,
-                                      const duckdb_native_walk_plan& plan)
+std::size_t estimate_decoded_bytes_budget(duckdb::idx_t row_count,
+                                          const std::vector<projected_column>& projected_cols,
+                                          const std::vector<sirius::logical_type>& projected_types)
 {
-  const auto& table_filters = *plan.table_filters;
-  const auto& column_ids    = *plan.column_ids;
-
-  std::vector<duckdb_row_group_metadata> kept;
-  kept.reserve(result.row_groups.size());
-  std::size_t pruned_bytes = 0;
-
-  for (auto& rg_md : result.row_groups) {
-    auto const rg = rg_md.row_group_index;
-    bool prune    = false;
-    if (rg < plan.partition_row_groups.size() && plan.partition_row_groups[rg]) {
-      auto& prg = *plan.partition_row_groups[rg];
-      for (auto const& [col_idx, filter] : table_filters.filters) {
-        if (!filter_is_prunable(filter->filter_type)) { continue; }
-        if (col_idx >= column_ids.size()) { continue; }  // defensive
-        auto stats =
-          prg.GetColumnStatistics(duckdb::StorageIndex(column_ids[col_idx].GetPrimaryIndex()));
-        if (!stats) { continue; }  // no stats → cannot prune
-        if (filter->CheckStatistics(*stats) == duckdb::FilterPropagateResult::FILTER_ALWAYS_FALSE) {
-          prune = true;
-          break;
-        }
-      }
-    }
-    if (prune) {
-      pruned_bytes += rg_md.decoded_bytes_budget;
+  std::size_t budget = 0;
+  for (std::size_t ci = 0; ci < projected_cols.size(); ++ci) {
+    if (projected_cols[ci].is_rowid) {
+      budget += static_cast<std::size_t>(row_count) * sizeof(std::int64_t);
+    } else if (projected_types[ci].is_varchar()) {
+      // String payload bytes require segment-level max-string stats. At prepare
+      // time we can only account for offsets; this counter is diagnostic.
+      budget += static_cast<std::size_t>(row_count) * sizeof(std::uint32_t);
     } else {
-      kept.push_back(std::move(rg_md));
+      budget += static_cast<std::size_t>(row_count) * projected_types[ci].fixed_width_byte_size();
     }
   }
+  return budget;
+}
 
-  result.pruned_row_groups    = result.row_groups.size() - kept.size();
-  result.pruned_decoded_bytes = pruned_bytes;
-  result.row_groups           = std::move(kept);
+bool column_index_can_have_storage_stats(const duckdb::ColumnIndex& column_id)
+{
+  return column_id.HasPrimaryIndex() && !column_id.IsRowIdColumn() && !column_id.IsEmptyColumn() &&
+         !column_id.IsVirtualColumn();
+}
+
+bool row_group_pruned_by_filter_stats(duckdb::PartitionRowGroup& prg,
+                                      const duckdb::TableFilterSet& table_filters,
+                                      const duckdb::vector<duckdb::ColumnIndex>& column_ids)
+{
+  for (auto const& [col_idx, filter] : table_filters.filters) {
+    if (!filter_is_prunable(filter->filter_type)) { continue; }
+    if (col_idx >= column_ids.size()) { continue; }  // defensive
+    auto const& column_id = column_ids[col_idx];
+    if (!column_index_can_have_storage_stats(column_id)) { continue; }
+
+    auto stats = prg.GetColumnStatistics(duckdb::StorageIndex(column_id.GetPrimaryIndex()));
+    if (!stats) { continue; }  // no stats -> cannot prune
+    if (filter->CheckStatistics(*stats) == duckdb::FilterPropagateResult::FILTER_ALWAYS_FALSE) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// @brief Mark row groups a pushed-down filter proves can hold no matching rows.
+///
+/// Runs during prepare, before worker-thread segment walks, because statistics
+/// are available from PartitionRowGroup handles and do not require segment
+/// metadata. This avoids parsing metadata for row groups that will be skipped
+/// and lets the all-pruned case route to DuckDB CPU before the async scan starts.
+void mark_row_groups_pruned_by_filter_stats(duckdb_native_walk_plan& plan)
+{
+  if (plan.table_filters == nullptr || plan.table_filters->filters.empty() ||
+      plan.column_ids == nullptr || plan.column_ids->empty()) {
+    return;
+  }
+
+  const auto& table_filters   = *plan.table_filters;
+  const auto& column_ids      = *plan.column_ids;
+  const auto& projected_cols  = *plan.projected_cols;
+  const auto& projected_types = *plan.projected_types;
+
+  for (std::size_t rg = 0; rg < plan.n_row_groups; ++rg) {
+    if (rg >= plan.partition_row_groups.size() || !plan.partition_row_groups[rg]) { continue; }
+    auto& prg = *plan.partition_row_groups[rg];
+    if (!row_group_pruned_by_filter_stats(prg, table_filters, column_ids)) { continue; }
+
+    plan.row_group_pruned_by_stats[rg] = true;
+    auto const pruned_bytes =
+      estimate_decoded_bytes_budget(plan.row_count[rg], projected_cols, projected_types);
+    plan.pruned_decoded_bytes_by_row_group[rg] = pruned_bytes;
+    ++plan.pruned_row_groups;
+    plan.pruned_decoded_bytes += pruned_bytes;
+  }
 }
 
 }  // namespace
+
+void finalize_duckdb_native_segment_bytes(std::vector<duckdb_row_group_metadata>& row_groups,
+                                          std::size_t block_size)
+{
+  compute_segment_bytes_size(row_groups, block_size);
+}
 
 bool is_supported_data_compression(duckdb::CompressionType c)
 {
@@ -346,6 +383,8 @@ duckdb_native_walk_plan prepare_duckdb_native_walk(
   plan.row_group_start.assign(plan.n_row_groups, 0);
   plan.row_count.assign(plan.n_row_groups, 0);
   plan.partition_row_groups.assign(plan.n_row_groups, nullptr);
+  plan.row_group_pruned_by_stats.assign(plan.n_row_groups, false);
+  plan.pruned_decoded_bytes_by_row_group.assign(plan.n_row_groups, 0);
   for (std::size_t i = 0; i < partition_stats.size(); ++i) {
     auto const& ps = partition_stats[i];
     if (!ps.row_start.IsValid()) {
@@ -367,6 +406,18 @@ duckdb_native_walk_plan prepare_duckdb_native_walk(
   for (std::size_t ci = 0; ci < projected_cols.size(); ++ci) {
     if (projected_cols[ci].is_rowid) { continue; }
     plan.projected_lookup.emplace(projected_cols[ci].storage_idx.GetPrimaryIndex(), ci);
+  }
+
+  mark_row_groups_pruned_by_filter_stats(plan);
+  if (plan.pruned_row_groups > 0) {
+    SIRIUS_LOG_DEBUG(
+      "[duckdb_native_metadata] prepare stats-pruned {} row groups (~{} decoded bytes)",
+      plan.pruned_row_groups,
+      plan.pruned_decoded_bytes);
+  }
+  if (plan.n_row_groups > 0 && plan.pruned_row_groups == plan.n_row_groups) {
+    refuse("no row groups in table (empty or fully pruned)");
+    return plan;
   }
 
   plan.viable = true;
@@ -392,29 +443,25 @@ duckdb_native_row_group_range walk_duckdb_native_row_group_range(
                      result.viability_failure_reason);
   };
 
-  // Get column segment metadata
-  duckdb::QueryContext qc{*plan.context};
-  duckdb::vector<duckdb::ColumnSegmentInfo> column_segments;
-  {
-    nvtx3::scoped_range nvtx_si{"sirius::native_metadata_segment_info"};
-    auto& row_groups = *plan.storage->GetRowGroupCollection();
-    for (std::size_t rg = rg_begin; rg < rg_end; ++rg) {
-      auto row_group = row_groups.GetRowGroup(static_cast<duckdb::idx_t>(rg));
-      if (!row_group) { continue; }
-      for (auto const& pc : projected_cols) {
-        if (pc.is_rowid) { continue; }
-        row_group->GetRawColumnData(pc.storage_idx)
-          .GetColumnSegmentInfo(qc, rg, {pc.storage_idx.GetPrimaryIndex()}, column_segments);
-      }
-    }
-  }
+  auto const n     = rg_end - rg_begin;
+  auto const n_pos = std::numeric_limits<std::size_t>::max();
+  std::vector<std::size_t> local_index_by_rg(n, n_pos);
 
-  // One entry per row group in [rg_begin, rg_end)
-  auto const n = rg_end - rg_begin;
-  result.row_groups.resize(n);
+  // One entry per surviving row group in [rg_begin, rg_end). Row groups that
+  // were stats-pruned during prepare are skipped before any segment metadata is
+  // requested from DuckDB.
   for (std::size_t i = 0; i < n; ++i) {
-    auto const rg         = rg_begin + i;
-    auto& rg_md           = result.row_groups[i];
+    auto const rg = rg_begin + i;
+    if (rg < plan.row_group_pruned_by_stats.size() && plan.row_group_pruned_by_stats[rg]) {
+      ++result.pruned_row_groups;
+      if (rg < plan.pruned_decoded_bytes_by_row_group.size()) {
+        result.pruned_decoded_bytes += plan.pruned_decoded_bytes_by_row_group[rg];
+      }
+      continue;
+    }
+
+    local_index_by_rg[i]  = result.row_groups.size();
+    auto& rg_md           = result.row_groups.emplace_back();
     rg_md.row_group_index = rg;
     rg_md.row_group_start = plan.row_group_start[rg];
     rg_md.row_count       = plan.row_count[rg];
@@ -427,14 +474,35 @@ duckdb_native_row_group_range walk_duckdb_native_row_group_range(
     }
   }
 
+  if (result.row_groups.empty()) { return result; }
+
+  // Get column segment metadata for surviving row groups only.
+  duckdb::QueryContext qc{*plan.context};
+  duckdb::vector<duckdb::ColumnSegmentInfo> column_segments;
+  {
+    nvtx3::scoped_range nvtx_si{"sirius::native_metadata_segment_info"};
+    auto& row_groups = *plan.storage->GetRowGroupCollection();
+    for (std::size_t rg = rg_begin; rg < rg_end; ++rg) {
+      if (local_index_by_rg[rg - rg_begin] == n_pos) { continue; }
+      auto row_group = row_groups.GetRowGroup(static_cast<duckdb::idx_t>(rg));
+      if (!row_group) { continue; }
+      for (auto const& pc : projected_cols) {
+        if (pc.is_rowid) { continue; }
+        row_group->GetRawColumnData(pc.storage_idx)
+          .GetColumnSegmentInfo(qc, rg, {pc.storage_idx.GetPrimaryIndex()}, column_segments);
+      }
+    }
+  }
+
   // Build segment descriptors
   for (const auto& seg : column_segments) {
     auto pl = plan.projected_lookup.find(seg.column_id);
     if (pl == plan.projected_lookup.end()) { continue; }  // not projected
     auto const rg_idx = seg.row_group_index;
     if (rg_idx < rg_begin || rg_idx >= rg_end) { continue; }
-    auto const ci             = pl->second;
-    auto const local_rgi      = static_cast<std::size_t>(rg_idx) - rg_begin;
+    auto const ci        = pl->second;
+    auto const local_rgi = local_index_by_rg[static_cast<std::size_t>(rg_idx) - rg_begin];
+    if (local_rgi == n_pos) { continue; }
     auto const validity_seg   = is_validity_path(seg.column_path);
     auto const compression    = parse_compression_string(seg.compression_type);
     auto const compression_ok = validity_seg ? is_supported_validity_compression(compression)
@@ -500,9 +568,6 @@ duckdb_native_row_group_range walk_duckdb_native_row_group_range(
     }
   }
 
-  // Per-segment on-disk byte sizes.
-  compute_segment_bytes_size(result.row_groups, plan.block_size);
-
   // Per row group, compute the decoded-byte budget and per-column varchar char
   // count. Refuse a varchar column whose char count would overflow cudf's int32
   // string offsets.
@@ -535,21 +600,6 @@ duckdb_native_row_group_range walk_duckdb_native_row_group_range(
       }
     }
     rg_md.decoded_bytes_budget = budget;
-  }
-
-  // Drop any row group a pushed-down filter proves can hold no matching rows.
-  if (plan.table_filters != nullptr && !plan.table_filters->filters.empty() &&
-      plan.column_ids != nullptr && !plan.column_ids->empty()) {
-    nvtx3::scoped_range nvtx_prune{"sirius::native_metadata_filter_stats_prune"};
-    prune_row_groups_by_filter_stats(result, plan);
-    if (result.pruned_row_groups > 0) {
-      SIRIUS_LOG_DEBUG(
-        "[duckdb_native_metadata] range [{}, {}) stats-pruned {} row groups (~{} decoded bytes)",
-        rg_begin,
-        rg_end,
-        result.pruned_row_groups,
-        result.pruned_decoded_bytes);
-    }
   }
 
   return result;

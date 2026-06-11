@@ -20,6 +20,7 @@
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/catalog/catalog_entry/table_catalog_entry.hpp>
 #include <duckdb/common/column_index.hpp>
+#include <duckdb/common/constants.hpp>
 #include <duckdb/common/enums/compression_type.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
@@ -27,9 +28,12 @@
 #include <duckdb/planner/table_filter.hpp>
 #include <duckdb/storage/data_table.hpp>
 #include <op/scan/duckdb_native_metadata.hpp>
+#include <unistd.h>
 #include <utils/utils.hpp>
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -87,6 +91,35 @@ struct filter_ctx {
   duckdb::vector<duckdb::ColumnIndex> column_ids;
 };
 
+class scoped_temp_db_path {
+ public:
+  scoped_temp_db_path()
+  {
+    char tmpl[] = "/tmp/sirius_native_range_bytes_XXXXXX";
+    int fd      = ::mkstemp(tmpl);
+    REQUIRE(fd >= 0);
+    ::close(fd);
+    ::unlink(tmpl);
+    _path = tmpl;
+  }
+
+  ~scoped_temp_db_path()
+  {
+    if (!_path.empty()) {
+      std::remove(_path.c_str());
+      std::remove((_path + ".wal").c_str());
+    }
+  }
+
+  scoped_temp_db_path(const scoped_temp_db_path&)            = delete;
+  scoped_temp_db_path& operator=(const scoped_temp_db_path&) = delete;
+
+  const std::string& path() const { return _path; }
+
+ private:
+  std::string _path;
+};
+
 filter_ctx make_constant_filter(duckdb::idx_t col_key,
                                 duckdb::idx_t storage_idx,
                                 duckdb::ExpressionType cmp,
@@ -121,8 +154,15 @@ walk_result walk_all(duckdb::DataTable& storage,
                      const duckdb::vector<duckdb::ColumnIndex>* column_ids = nullptr)
 {
   auto plan = prepare_duckdb_native_walk(storage, ctx, cols, types, table_filters, column_ids);
-  if (!plan.viable) { return {{}, false, std::move(plan.viability_failure_reason), 0, 0}; }
+  if (!plan.viable) {
+    return {{},
+            false,
+            std::move(plan.viability_failure_reason),
+            plan.pruned_row_groups,
+            plan.pruned_decoded_bytes};
+  }
   auto range = walk_duckdb_native_row_group_range(plan, 0, plan.n_row_groups);
+  finalize_duckdb_native_segment_bytes(range.row_groups, plan.block_size);
   return {std::move(range.row_groups),
           range.viable,
           std::move(range.viability_failure_reason),
@@ -576,7 +616,7 @@ TEST_CASE("statistics pruning keeps every row group when the filter matches all"
   REQUIRE(md.pruned_decoded_bytes == 0);
 }
 
-TEST_CASE("statistics pruning drops every row group when the filter excludes all data",
+TEST_CASE("statistics pruning refuses CPU fallback when every row group is pruned",
           "[scan][duckdb_native_walker][pruning]")
 {
   auto [db_owner, con] = sirius::make_test_db_and_connection();
@@ -588,14 +628,15 @@ TEST_CASE("statistics pruning drops every row group when the filter excludes all
   auto base = walk_all(storage, *con.context, cols, ts);
   REQUIRE(base.viable);
 
-  // a >= 1_000_000 exceeds every value → every row group is FILTER_ALWAYS_FALSE
-  // and the walk keeps none, yielding a viable empty result.
+  // a >= 1_000_000 exceeds every value -> every row group is
+  // FILTER_ALWAYS_FALSE. Reject so the query routes to DuckDB CPU, which can
+  // produce the correct empty result without relying on a zero-split GPU scan.
   auto ctx = make_constant_filter(
     0, 0, duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::INTEGER(1000000));
   auto md = walk_all(storage, *con.context, cols, ts, &ctx.filters, &ctx.column_ids);
 
-  REQUIRE(md.viable);
-  REQUIRE(md.row_groups.empty());
+  REQUIRE_FALSE(md.viable);
+  REQUIRE(md.viability_failure_reason.find("pruned") != std::string::npos);
   REQUIRE(md.pruned_row_groups == base.row_groups.size());
 }
 
@@ -622,4 +663,92 @@ TEST_CASE("statistics pruning prunes through an OPTIONAL_FILTER wrapper",
 
   REQUIRE(md.viable);
   REQUIRE(md.pruned_row_groups >= 1);
+}
+
+TEST_CASE("statistics pruning ignores rowid filters", "[scan][duckdb_native_walker][pruning]")
+{
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  exec_ok(con, "CREATE TABLE t(a INTEGER)");
+  exec_ok(con, "INSERT INTO t SELECT range FROM range(0, 3000)");
+  exec_ok(con, "CHECKPOINT");
+  auto& storage = get_storage(con, "t");
+
+  std::vector<projected_column> cols   = {rowid_col()};
+  std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::BIGINT)};
+
+  filter_ctx ctx;
+  ctx.filters.filters[0] = duckdb::make_uniq<duckdb::ConstantFilter>(
+    duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::BIGINT(0));
+  ctx.column_ids.push_back(duckdb::ColumnIndex(duckdb::COLUMN_IDENTIFIER_ROW_ID));
+
+  auto md = walk_all(storage, *con.context, cols, ts, &ctx.filters, &ctx.column_ids);
+
+  REQUIRE(md.viable);
+  REQUIRE_FALSE(md.row_groups.empty());
+  REQUIRE(md.pruned_row_groups == 0);
+}
+
+TEST_CASE("walker finalizes segment bytes consistently across parse ranges",
+          "[scan][duckdb_native_walker][range_bytes]")
+{
+  scoped_temp_db_path tmp;
+  auto db_owner = std::make_unique<duckdb::DuckDB>(tmp.path());
+  duckdb::Connection con(*db_owner);
+  exec_ok(con, "CREATE TABLE t(a INTEGER)");
+  exec_ok(con, "INSERT INTO t SELECT range FROM range(0, 600000)");
+  exec_ok(con, "CHECKPOINT");
+  auto& storage = get_storage(con, "t");
+
+  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::INTEGER)};
+
+  auto plan = prepare_duckdb_native_walk(storage, *con.context, cols, ts);
+  REQUIRE(plan.viable);
+  REQUIRE(plan.n_row_groups >= 2);
+
+  auto full = walk_duckdb_native_row_group_range(plan, 0, plan.n_row_groups);
+  REQUIRE(full.viable);
+  finalize_duckdb_native_segment_bytes(full.row_groups, plan.block_size);
+
+  std::vector<duckdb_row_group_metadata> chunked;
+  for (std::size_t rg = 0; rg < plan.n_row_groups; ++rg) {
+    auto range = walk_duckdb_native_row_group_range(plan, rg, rg + 1);
+    REQUIRE(range.viable);
+    for (auto& rg_md : range.row_groups) {
+      chunked.push_back(std::move(rg_md));
+    }
+  }
+  finalize_duckdb_native_segment_bytes(chunked, plan.block_size);
+
+  std::sort(full.row_groups.begin(), full.row_groups.end(), [](auto const& a, auto const& b) {
+    return a.row_group_index < b.row_group_index;
+  });
+  std::sort(chunked.begin(), chunked.end(), [](auto const& a, auto const& b) {
+    return a.row_group_index < b.row_group_index;
+  });
+
+  REQUIRE(chunked.size() == full.row_groups.size());
+  bool saw_disk_segment = false;
+  for (std::size_t rg = 0; rg < full.row_groups.size(); ++rg) {
+    REQUIRE(chunked[rg].row_group_index == full.row_groups[rg].row_group_index);
+    REQUIRE(chunked[rg].columns.size() == full.row_groups[rg].columns.size());
+    for (std::size_t ci = 0; ci < full.row_groups[rg].columns.size(); ++ci) {
+      auto const& full_col    = full.row_groups[rg].columns[ci];
+      auto const& chunked_col = chunked[rg].columns[ci];
+      REQUIRE(chunked_col.data_segments.size() == full_col.data_segments.size());
+      for (std::size_t si = 0; si < full_col.data_segments.size(); ++si) {
+        auto const& a = full_col.data_segments[si];
+        auto const& b = chunked_col.data_segments[si];
+        REQUIRE(b.block_id == a.block_id);
+        REQUIRE(b.block_offset == a.block_offset);
+        REQUIRE(b.segment_start == a.segment_start);
+        REQUIRE(b.bytes_size == a.bytes_size);
+        if (b.block_id >= 0) {
+          saw_disk_segment = true;
+          REQUIRE(b.bytes_size > 0);
+        }
+      }
+    }
+  }
+  REQUIRE(saw_disk_segment);
 }

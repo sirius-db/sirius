@@ -141,14 +141,22 @@ struct duckdb_native_walk_plan {
     row_count;  ///< Rows per row group (PartitionStatistics::count); 0 where unavailable.
 
   //===----------Row-group pruning inputs----------===//
-  /// Per-row-group handles. Each range walk reads its own row groups' column
-  /// statistics through them while pruning. Ranges are disjoint, so a handle is
-  /// only ever touched by one worker.
+  /// Per-row-group handles used during the serial prepare step for
+  /// statistics pruning.
   std::vector<duckdb::shared_ptr<duckdb::PartitionRowGroup>> partition_row_groups;
   /// Pushed-down filters and their storage-index mapping. Both non-null and
-  /// non-empty enables statistics pruning in the range walk.
+  /// non-empty enables statistics pruning during prepare.
   const duckdb::TableFilterSet* table_filters           = nullptr;
   const duckdb::vector<duckdb::ColumnIndex>* column_ids = nullptr;
+  /// True for row groups proven empty by pushed-down filter statistics. Range
+  /// workers skip these row groups entirely.
+  std::vector<bool> row_group_pruned_by_stats;
+  /// Approximate decoded-byte budget for each stat-pruned row group. Exact for
+  /// fixed-width projections; conservative for VARCHAR because per-segment max
+  /// string length is only available after the segment walk.
+  std::vector<std::size_t> pruned_decoded_bytes_by_row_group;
+  std::size_t pruned_row_groups    = 0;
+  std::size_t pruned_decoded_bytes = 0;
 
   //===----------Error Handling----------===//
   // `viable == false` (with reason) for:
@@ -167,19 +175,18 @@ duckdb_native_walk_plan prepare_duckdb_native_walk(
 
 /// @brief Walk the projected-column segment metadata for row groups [rg_begin, rg_end)
 /// of `plan`, filling per-row-group
-///  - `decoded_bytes_budget`,
-///  - `varchar_bytes_per_col`, and
-///  - segment `bytes_size`.
-/// When `plan` carries pushed-down filters, row groups a filter proves can hold
-/// no matching rows are dropped from `row_groups`.
+///  - `decoded_bytes_budget`, and
+///  - `varchar_bytes_per_col`.
+/// Row groups pruned during prepare are skipped. Segment `bytes_size` is filled
+/// later by `finalize_duckdb_native_segment_bytes` after all ranges are collected.
 struct duckdb_native_row_group_range {
   //===----------ColumnSegmentInfo data----------===//
   std::vector<duckdb_row_group_metadata>
     row_groups;  ///< rg metadata ranging over [rg_begin, rg_end)
 
   //===----------Filter-statistics pruning counters----------===//
-  std::size_t pruned_row_groups    = 0;  ///< Row groups dropped by a pushed-down filter.
-  std::size_t pruned_decoded_bytes = 0;  ///< Sum of their decoded-byte budgets.
+  std::size_t pruned_row_groups    = 0;  ///< Row groups skipped by prepare-time pruning.
+  std::size_t pruned_decoded_bytes = 0;  ///< Diagnostic decoded-byte estimate for skipped groups.
 
   //===----------Error Handling----------===//
   //`viable == false` (with reason) on the first
@@ -191,5 +198,12 @@ struct duckdb_native_row_group_range {
 };
 duckdb_native_row_group_range walk_duckdb_native_row_group_range(
   const duckdb_native_walk_plan& plan, std::size_t rg_begin, std::size_t rg_end);
+
+/// Finalize per-segment main-block byte sizes once the complete set of
+/// surviving row groups has been collected. This must see all emitted ranges so
+/// segments at metadata parse chunk boundaries can use the true next segment in
+/// the same DuckDB block instead of falling back to the end of the block.
+void finalize_duckdb_native_segment_bytes(std::vector<duckdb_row_group_metadata>& row_groups,
+                                          std::size_t block_size);
 
 }  // namespace sirius::op::scan
