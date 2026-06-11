@@ -165,10 +165,14 @@ streaming source/sink are net-new (#836/#837).*
 The **stream session** (#839) is the public entry point. It builds a streaming plan and starts it on the
 **existing** `task_scheduler` *without blocking* the caller. The wrapper feeds inputs with
 `push(stream_id, batch)` and signals end-of-stream with `close_input(stream_id)`; it drains outputs with
-`pull()` / `wait()`. Inputs and outputs are **bounded channels** of `shared_ptr<cucascade::data_batch>`;
-channel entries are **repository-registered** `data_batch`es (not bare buffers) so batches queued under
-backpressure stay accounted and spillable (see §6, option A). The session routes a pushed batch to the
-correct streaming source **by stream id**.
+`pull()` / `wait()`. Inputs and outputs are **bounded channels** of `shared_ptr<cucascade::data_batch>`. The
+**owner of record** is the cuCascade `shared_data_repository` registered with the memory manager; a channel
+carries *references* to those repository-registered batches (not bare buffers), so batches queued under
+backpressure stay accounted and spillable (see §6, option A). Because a `data_batch` is a `shared_ptr`, its
+GPU memory is freed only when the last holder drops it (and it is idle) — co-holders across a batch's life
+are the repository, the channel, the in-flight task's `read_only`/`mutable` accessor, the downgrade executor
+(transiently, while spilling), and the `nixl` send path (until the `transfer_complete` handshake). The
+session routes a pushed batch to the correct streaming source **by stream id**.
 
 ```mermaid
 flowchart LR
@@ -256,6 +260,13 @@ Because the source is multi-shot and the sink is incremental, the three stages o
 while batch *N* computes, batch *N+1* is still arriving over `nixl` and batch *N−1* is being sent. The
 per-device `exclusive_stream_pool` lets async copies overlap compute, and reserve-before-dispatch keeps the
 in-flight working set within budget.
+
+These two terms are about behavior over the stream's lifetime, not about how many CNs feed the stage.
+*Multi-shot source*: the source operator is driven **repeatedly** — it publishes a task each time a batch
+arrives on its input channel, until `close_input`, unlike today's one-shot scan that materializes its whole
+input once (#836). *Incremental sink*: the sink pushes **each** output batch as it is produced, per `sink()`
+call, instead of materializing the full result into a `ColumnDataCollection` first (#837). Fan-in from one
+or many upstream CNs is orthogonal — it is handled by stream-id routing into the source's input channel(s).
 
 ```mermaid
 sequenceDiagram
@@ -484,6 +495,19 @@ reservation-aware adaptor `src/memory/sirius_memory_reservation_manager.cpp:42-4
   destination's partition is kept from starving shared input.
 - **Accounting nixl buffers.** Under every option, `nixl`'s registered/staging GPU buffers must be counted
   against the budget; otherwise the boundary OOMs even when "Sirius" looks within budget.
-- **Sink → nixl ownership.** Whether the streaming sink hands `data_batch`es to `nixl` by `shared_ptr`
-  (true zero-copy) or via a staging copy, and the `transfer_complete` handshake that finally releases the
-  batch.
+- **Sink → nixl ownership.** How the sink obtains an owning `cudf::table` to feed the transfer. cuCascade
+  `data_batch::release_or_copy_table()` (cuCascade PR #148, once merged + bumped) does this safely at
+  runtime: a zero-copy **steal** when the sink is the sole owner (`use_count()==1`), or a deep **copy** when
+  the batch is still shared (broadcast to several peers, or still parked in the repository for spill). Open
+  tension: keeping a batch repository-registered for spill means `use_count()>1` at send time → copy; a
+  zero-copy steal requires dropping the repository ref first, giving up spill-eligibility during the
+  in-flight send. Plus the `transfer_complete` handshake that finally releases the batch.
+- **Batch ownership graph.** Pin down whether a channel is a second, independent owner or only a handle into
+  the repository (the intended model), and enumerate every holder — repository, channel, in-flight accessor,
+  downgrade executor, `nixl` send — so that "idle ⇒ spillable" and free-on-last-drop are unambiguous.
+- **Deadlock / liveness.** Backpressure on bounded channels plus a shared GPU budget can stall progress —
+  e.g. every worker slot parked on a full output channel with none left to drain inputs, or a blocked sink
+  pinning memory that spilling needs. Mitigations: the plan is a DAG (no channel cycles), a blocked sink
+  should **yield its task** rather than block a worker thread, and a queued batch should sit *idle* in its
+  repository (still spillable) while it waits. Even so, we likely want a stall/credit **watchdog** that flags
+  "all channels full, no forward progress" so a sink (or a monitor) can surface it rather than hang silently.
