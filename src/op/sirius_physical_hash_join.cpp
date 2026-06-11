@@ -20,6 +20,7 @@
 #include "cudf/join/distinct_hash_join.hpp"
 #include "cudf/join/filtered_join.hpp"
 #include "cudf/join/join.hpp"
+#include "cudf/join/mark_join.hpp"
 #include "cudf/join/mixed_join.hpp"
 #include "cudf/table/table_view.hpp"
 #include "cudf/types.hpp"
@@ -73,6 +74,15 @@ static cudf::filtered_join make_right_filtered_join(cudf::table_view const& righ
   return cudf::filtered_join(
     right_keys, cudf::null_equality::UNEQUAL, cudf::set_as_build_table::RIGHT, stream);
 #endif
+}
+
+// Build the semi-join hash table on the left/output side and probe with the (larger) right side.
+// Wins over make_right_filtered_join only when the left side is substantially smaller than the
+// right; gated by mark_join_build_switch_ratio at the call site.
+static cudf::mark_join make_left_mark_join(cudf::table_view const& left_keys,
+                                           rmm::cuda_stream_view stream)
+{
+  return cudf::mark_join(left_keys, cudf::null_equality::UNEQUAL, cudf::join_prefilter::NO, stream);
 }
 
 bool sirius_physical_hash_join::are_conditions_supported(
@@ -1188,7 +1198,27 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       right_indices             = filtered_join_object.anti_join(right_keys, stream);
     } else if (join_type == duckdb::JoinType::MARK) {
       // MARK join: output ALL left rows + a BOOL8 column indicating match presence.
-      // Use semi join to find which left rows have matches in the right table.
+      // Use a semi join to find which left rows have matches in the right table; both APIs
+      // return left-side match indices that resolve_mark_join_result scatters into the BOOL8 mark.
+      //
+      // Adaptive build side: filtered_join builds on the right; when the right (probe) side is
+      // much larger than the left (output) side, building on the smaller left via cudf::mark_join
+      // is faster (see issue #510 microbenchmark). Crossover is hardware-dependent and configured
+      // via operator_params::mark_join_build_switch_ratio (0 disables).
+      if (mark_join_build_switch_ratio > 0.0 && left_full.num_rows() > 0 &&
+          static_cast<double>(right_full.num_rows()) >=
+            mark_join_build_switch_ratio * static_cast<double>(left_full.num_rows())) {
+        SIRIUS_LOG_DEBUG(
+          "sirius_physical_hash_join id {}: MARK using cudf::mark_join (build on left, "
+          "left_rows={}, right_rows={})",
+          this->get_operator_id(),
+          left_full.num_rows(),
+          right_full.num_rows());
+        auto mark_join_object = make_left_mark_join(left_keys, stream);
+        auto semi_indices     = mark_join_object.semi_join(right_keys, stream);
+        return resolve_mark_join_result(
+          *semi_indices, left_full, lhs_output_columns.col_idxs, input_batches[0], stream);
+      }
       auto filtered_join_object = make_right_filtered_join(right_keys, stream);
       auto semi_indices         = filtered_join_object.semi_join(left_keys, stream);
       return resolve_mark_join_result(
