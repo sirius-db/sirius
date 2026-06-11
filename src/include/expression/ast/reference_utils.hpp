@@ -21,6 +21,8 @@
 
 // standard library
 #include <functional>
+#include <memory>
+#include <vector>
 
 namespace sirius::ast {
 
@@ -32,5 +34,16 @@ namespace sirius::ast {
  * use-count analysis) do not each re-enumerate the variant alternatives.
  */
 void visit_references(node const& root, std::function<void(reference const&)> const& fn);
+
+/**
+ * @brief Replace every column reference in @p expr with a deep clone of the
+ * corresponding expression from @p inner_select_list.
+ *
+ * Used when folding adjacent physical projections: the outer projection's
+ * references index into the inner projection's output columns, so composition
+ * substitutes each reference with the inner expression tree.
+ */
+std::unique_ptr<node> substitute_references(
+  node const& expr, std::vector<std::unique_ptr<node>> const& inner_select_list);
 
 }  // namespace sirius::ast
