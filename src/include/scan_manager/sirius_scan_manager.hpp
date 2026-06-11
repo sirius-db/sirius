@@ -334,8 +334,12 @@ class sirius_scan_manager {
     return _pinned_entries;
   }
 
+  /// \brief Open a datasource for @p path via the first backend that supports
+  /// it, or nullptr if no backend claims the path. NOT noexcept: opening the
+  /// backend handle (e.g. the S3 HEAD) may throw on an unreachable path -- a
+  /// missing object surfaces as an HTTP 404 -- and that must propagate.
   [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> create_datasource(
-    std::string_view path) const noexcept;
+    std::string_view path) const;
 
   /// \brief Whether parquet_split_provider should prewarm column-chunk byte
   /// ranges via @c cache->insert(obj, metadata, ranges). Mirrors
