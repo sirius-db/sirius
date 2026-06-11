@@ -28,7 +28,7 @@
 #include <cxxabi.h>
 #include <execinfo.h>
 #include <fcntl.h>
-#include <spdlog/spdlog.h>
+#include <log/logging.hpp>
 #include <sys/syscall.h>
 #include <unistd.h>
 

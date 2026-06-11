@@ -26,14 +26,25 @@
 #define SIRIUS_LOG_FATAL(...)
 #else  // !__CUDACC__
 
+// Compile in every log level by default. This must be set before spdlog is
+// first included in a translation unit, so this header is the single entry
+// point for spdlog: include <log/logging.hpp> rather than <spdlog/...> so the
+// level is set here first. If spdlog is pulled in earlier, it defaults the
+// level to INFO and silently drops TRACE/DEBUG statements — the post-include
+// check below catches that case.
 #ifndef SPDLOG_ACTIVE_LEVEL
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LEVEL_TRACE
-#else
-#warning "SPDLOG_ACTIVE_LEVEL is overridden, output may be lost"
 #endif
 
 #include <spdlog/sinks/daily_file_sink.h>
 #include <spdlog/spdlog.h>
+
+// Warn only if the level was actually raised above TRACE, which compiles out
+// lower-level log statements (e.g. because spdlog was included before this
+// header). SPDLOG_LEVEL_* is defined by the headers above.
+#if SPDLOG_ACTIVE_LEVEL > SPDLOG_LEVEL_TRACE
+#warning "SPDLOG_ACTIVE_LEVEL is above TRACE; lower-level log output is compiled out"
+#endif
 
 #include <string>
 
