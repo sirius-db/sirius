@@ -259,7 +259,7 @@ void downgrade_executor::processing_loop()
                 if (req_ptr->predicate && req_ptr->predicate()) { req_ptr->satisfied.store(true); }
               }
             } catch (const std::exception& e) {
-              SIRIUS_LOG_ERROR("[downgrade] convert failed: {}", e.what());
+              SIRIUS_LOG_ERROR("[downgrade] convert failed from data repository: {}", e.what());
             }
           });
       }
@@ -319,7 +319,7 @@ void downgrade_executor::processing_loop()
                 if (req_ptr->predicate && req_ptr->predicate()) { req_ptr->satisfied.store(true); }
               }
             } catch (const std::exception& e) {
-              SIRIUS_LOG_ERROR("[downgrade] convert failed: {}", e.what());
+              SIRIUS_LOG_ERROR("[downgrade] convert failed from task queue: {}", e.what());
             }
           });
       }
@@ -346,6 +346,9 @@ void downgrade_executor::processing_loop()
     double throughput_mbs =
       (duration_ms > 0.0) ? (total_bytes / (1024.0 * 1024.0)) / (duration_ms / 1000.0) : 0.0;
     std::string request_label = req->is_monitor_request ? "monitor " : "";
+    if (req->is_monitor_request) {
+      _monitor_request_enqueued.store(false, std::memory_order_relaxed);
+    }
 
     SIRIUS_LOG_DEBUG(
       "[downgrade] [{}] request {}done: {} batches, {} bytes in {:.2f} ms ({:.1f} MB/s) | "
@@ -425,7 +428,8 @@ void downgrade_executor::monitor_loop()
   bool backed_off = false;
 
   while (_running.load()) {
-    if (_memory_space && _memory_space->should_downgrade_memory()) {
+    if (_memory_space && _memory_space->should_downgrade_memory() &&
+        !_monitor_request_enqueued.load(std::memory_order_relaxed)) {
       // Stateless viability gate: only issue a downgrade request when one could plausibly free
       // memory. When idle GPU batches' only lower tier is a full HOST and no DISK is configured,
       // re-firing would just re-scan every repository and the task queue, free nothing, and spam
@@ -442,6 +446,7 @@ void downgrade_executor::monitor_loop()
             return freed.load(std::memory_order_relaxed) >= amount;
           };
           _monitor_requests_issued.fetch_add(1, std::memory_order_relaxed);
+          _monitor_request_enqueued.store(true, std::memory_order_relaxed);
           // Fire-and-forget: monitor does not wait for the result
           _request_queue.push(std::move(req));
         }
