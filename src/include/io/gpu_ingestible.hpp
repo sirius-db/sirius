@@ -30,14 +30,7 @@ class memory_space;
 // standard library
 #include <functional>
 #include <memory>
-#include <span>
-#include <string>
-#include <unordered_map>
 #include <vector>
-
-namespace sirius::io {
-class sirius_ioctx;
-}  // namespace sirius::io
 
 namespace sirius::op {
 class operator_data;
@@ -85,12 +78,9 @@ class ingestible_table_info {
    * @param mgr         Owning scan_manager. Forwarded so the ingestible
    *                    can route each path to its backend via
    *                    @c sirius_scan_manager::io_ctx_shared_for.
-   * @param gpu_ioctxs  Per-GPU sirius_ioctx map for multi-GPU IO routing.
    */
   virtual std::shared_ptr<gpu_ingestible> make_ingestible(
-    std::unique_ptr<ingestible_table_info> self,
-    scan_manager::sirius_scan_manager const& mgr,
-    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs) = 0;
+    std::unique_ptr<ingestible_table_info> self, scan_manager::sirius_scan_manager const& mgr) = 0;
 
   /**
    * @brief Resolved file paths captured at bind time.
@@ -310,9 +300,7 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
  * build the format-specific ingestible from the operator's bind data.
  * Throws when @p info is null.
  */
-std::shared_ptr<gpu_ingestible> make_gpu_ingestible(
-  std::unique_ptr<ingestible_table_info> info,
-  scan_manager::sirius_scan_manager const& mgr,
-  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs);
+std::shared_ptr<gpu_ingestible> make_gpu_ingestible(std::unique_ptr<ingestible_table_info> info,
+                                                    scan_manager::sirius_scan_manager const& mgr);
 
 }  // namespace sirius::io

@@ -45,6 +45,7 @@
 #include <duckdb/planner/table_filter.hpp>
 #include <helper/logical_type.hpp>
 #include <io/io_context.hpp>
+#include <io/sirius_datasource.hpp>
 #include <io/types.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
@@ -196,11 +197,12 @@ class routing_spy_ioctx final : public sirius::io::sirius_ioctx {
       std::move(path), std::filesystem::file_size(_local_parquet_path));
   }
 
-  std::unique_ptr<cudf::io::datasource> make_datasource(
-    std::shared_ptr<sirius::io::sirius_io_object>) override
+  std::unique_ptr<sirius::io::sirius_datasource> make_datasource(
+    std::shared_ptr<sirius::io::sirius_io_object> io_object) override
   {
     ++make_datasource_calls;
-    return cudf::io::datasource::create(_local_parquet_path.string());
+    return std::make_unique<sirius::io::sirius_datasource>(
+      std::static_pointer_cast<sirius::io::sirius_ioctx>(shared_from_this()), std::move(io_object));
   }
 
   [[nodiscard]] bool supports(std::string_view path) const override
@@ -297,18 +299,18 @@ std::unique_ptr<sscan::parquet_split_info> make_routing_split_info(
   fake_pinfo->partition_values        = real_pinfo.partition_values;
   fake_pinfo->needs_assembly          = real_pinfo.needs_assembly;
 
-  std::shared_ptr<sirius::io::sirius_io_object> io_object;
+  std::shared_ptr<cudf::io::datasource> ds;
   if (io_ctx) {
-    io_object = std::make_shared<routing_test_io_object>(
+    auto io_object = std::make_shared<routing_test_io_object>(
       slice_path, std::filesystem::file_size(local_parquet_path));
+    ds = std::shared_ptr<cudf::io::datasource>(io_ctx->make_datasource(io_object));
   }
   fake_pinfo->rg_slices.emplace_back(real_slice.file_metadata,
                                      std::move(slice_path),
                                      real_slice.row_group_indices,
                                      real_slice.reserved_uncompressed_bytes,
                                      real_slice.reserved_compressed_bytes,
-                                     std::move(io_ctx),
-                                     std::move(io_object));
+                                     std::move(ds));
   return fake_pinfo;
 }
 
@@ -335,8 +337,7 @@ TEST_CASE("parquet_gpu_ingestible - FLBA decimal disables filter pushdown",
     path, /*precision=*/25, /*scale=*/2, make_amount_lt_filter(/*precision=*/25, /*scale=*/2));
 
   sirius::scan_manager::sirius_scan_manager mgr({});
-  auto gpu_ioctxs = sirius::scan_test_utils::make_test_gpu_ioctxs();
-  sscan::parquet_gpu_ingestible ingestible(std::move(table_info), mgr, std::move(gpu_ioctxs));
+  sscan::parquet_gpu_ingestible ingestible(std::move(table_info), mgr);
 
   auto splits = drain_ingestible(ingestible);
   REQUIRE_FALSE(splits.empty());
@@ -370,8 +371,7 @@ TEST_CASE("parquet_gpu_ingestible - INT64 decimal allows filter pushdown",
     path, /*precision=*/10, /*scale=*/2, make_amount_lt_filter(/*precision=*/10, /*scale=*/2));
 
   sirius::scan_manager::sirius_scan_manager mgr({});
-  auto gpu_ioctxs = sirius::scan_test_utils::make_test_gpu_ioctxs();
-  sscan::parquet_gpu_ingestible ingestible(std::move(table_info), mgr, std::move(gpu_ioctxs));
+  sscan::parquet_gpu_ingestible ingestible(std::move(table_info), mgr);
 
   auto splits = drain_ingestible(ingestible);
   REQUIRE_FALSE(splits.empty());
@@ -410,8 +410,7 @@ TEST_CASE("parquet_gpu_ingestible - no-filter scan emits a single scan_operator_
                                     /*filters=*/nullptr);
 
   sirius::scan_manager::sirius_scan_manager mgr({});
-  auto gpu_ioctxs = sirius::scan_test_utils::make_test_gpu_ioctxs();
-  sscan::parquet_gpu_ingestible ingestible(std::move(table_info), mgr, std::move(gpu_ioctxs));
+  sscan::parquet_gpu_ingestible ingestible(std::move(table_info), mgr);
 
   auto splits = drain_ingestible(ingestible);
   REQUIRE_FALSE(splits.empty());
@@ -433,16 +432,11 @@ TEST_CASE("parquet_gpu_ingestible - no-filter scan emits a single scan_operator_
 }
 
 TEST_CASE("parquet_gpu_ingestible - s3 slice with non-null io_ctx routes through spy",
-          "[scan][parquet_gpu_ingestible][s3][datasource-routing]")
+          "[.][scan][parquet_gpu_ingestible][s3][datasource-routing]")
 {
-  // Guard for sirius-db/sirius#889 (commit 498ea6c03 on this branch): when
-  // _gpu_ioctxs is empty (single-GPU use_sirius_datasource=false / kvikio
-  // fallback), the materialize path must still honor slice.io_ctx and route
-  // the read through it. The pre-fix code gated the cudf fallback on
-  // kvikio_fallback_mode || !slice.io_ctx, which broke s3:// reads because
-  // kvikio has no S3 scheme support — calling
-  // cudf::io::datasource::create("s3://...") would fail with
-  // "Unsupported URL scheme".
+  // Guard for sirius-db/sirius#889: when the scan_manager has no ioctx,
+  // the materialize path must still honor slice.io_ctx and route
+  // the read through it.
   auto const dir  = std::filesystem::temp_directory_path() / "pgi_s3_route_test";
   auto const path = write_decimal_parquet(dir,
                                           "s3_route",
@@ -457,9 +451,7 @@ TEST_CASE("parquet_gpu_ingestible - s3 slice with non-null io_ctx routes through
                                     /*filters=*/nullptr);
 
   sirius::scan_manager::sirius_scan_manager mgr({});
-  // Empty gpu_ioctxs forces kvikio_fallback_mode = true inside
-  // materialize_table — this is the scenario the bug regressed on.
-  sscan::parquet_gpu_ingestible ingestible(std::move(table_info), mgr, /*gpu_ioctxs=*/{});
+  sscan::parquet_gpu_ingestible ingestible(std::move(table_info), mgr);
 
   auto spy = std::make_shared<routing_spy_ioctx>(path);
   auto fake_pinfo =
@@ -479,7 +471,7 @@ TEST_CASE("parquet_gpu_ingestible - s3 slice with non-null io_ctx routes through
 }
 
 TEST_CASE("parquet_gpu_ingestible - local slice with null io_ctx falls through to kvikio",
-          "[scan][parquet_gpu_ingestible][datasource-routing]")
+          "[.][scan][parquet_gpu_ingestible][datasource-routing]")
 {
   // Complement of the s3 routing guard above: a slice with io_ctx == nullptr
   // must continue to use cudf's bundled datasource (kvikio) — the local
@@ -498,7 +490,7 @@ TEST_CASE("parquet_gpu_ingestible - local slice with null io_ctx falls through t
                                     /*filters=*/nullptr);
 
   sirius::scan_manager::sirius_scan_manager mgr({});
-  sscan::parquet_gpu_ingestible ingestible(std::move(table_info), mgr, /*gpu_ioctxs=*/{});
+  sscan::parquet_gpu_ingestible ingestible(std::move(table_info), mgr);
 
   auto fake_pinfo = make_routing_split_info(path, ingestible, path.string(), /*io_ctx=*/nullptr);
 

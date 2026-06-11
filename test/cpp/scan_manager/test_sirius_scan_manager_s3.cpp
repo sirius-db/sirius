@@ -27,12 +27,6 @@
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 
-// Include this last among sirius/test headers: it transitively pulls
-// liburing.h, whose BLOCK_SIZE macro collides with blockingconcurrentqueue.h.
-// clang-format off
-#include <scan/test_helpers_ioctx.hpp>
-// clang-format on
-
 #include <cudf/io/text/byte_range_info.hpp>
 
 #include <rmm/cuda_stream.hpp>
@@ -94,30 +88,6 @@ s3_ioctx_config make_mock_s3_config()
   cfg.retry_jitter       = std::chrono::milliseconds{0};
   cfg.honor_retry_after  = false;
   return cfg;
-}
-
-std::shared_ptr<sirius_ioctx> make_local_ioctx()
-{
-  auto gpu_ioctxs = sirius::scan_test_utils::make_test_gpu_ioctxs(1);
-  REQUIRE_FALSE(gpu_ioctxs.empty());
-  return gpu_ioctxs.begin()->second;
-}
-
-std::shared_ptr<s3_blocking_ioctx> make_mock_s3_ioctx(
-  cucascade::memory::fixed_size_host_memory_resource* host_mr = nullptr)
-{
-  auto cfg                 = make_mock_s3_config();
-  cfg.host_memory_resource = host_mr;
-  return std::make_shared<s3_blocking_ioctx>(std::move(cfg));
-}
-
-std::vector<std::shared_ptr<sirius_ioctx>> make_borrowed_backends(
-  std::shared_ptr<sirius_ioctx> local_ctx = nullptr, std::shared_ptr<sirius_ioctx> s3_ctx = nullptr)
-{
-  std::vector<std::shared_ptr<sirius_ioctx>> backends;
-  if (local_ctx) { backends.push_back(std::move(local_ctx)); }
-  if (s3_ctx) { backends.push_back(std::move(s3_ctx)); }
-  return backends;
 }
 
 std::string env_or(std::string_view name, std::string fallback = {})
@@ -183,7 +153,7 @@ std::vector<std::uint8_t> read_s3_object_to_device(duckdb::SiriusContext& contex
                                                    std::string const& uri,
                                                    std::size_t bytes)
 {
-  auto s3_ctx = context.get_s3_ioctx();
+  auto s3_ctx = context.get_scan_manager().s3_ioctx();
   REQUIRE(s3_ctx != nullptr);
   auto obj = s3_ctx->create_io_object(uri);
   REQUIRE(obj != nullptr);
@@ -341,22 +311,16 @@ TEST_CASE("sirius_scan_manager routes borrowed S3 backend and dispatches by path
   cfg.s3_thread_pool.thread_name_prefix = "s3_io_test";
 
   host_cache_memory memory;
-  auto local_ctx       = make_local_ioctx();
-  auto borrowed_s3_ctx = make_mock_s3_ioctx(&memory.host_mr);
-  sirius_scan_manager manager(
-    std::move(cfg),
-    make_borrowed_backends(local_ctx, std::static_pointer_cast<sirius_ioctx>(borrowed_s3_ctx)));
+  sirius_scan_manager manager(std::move(cfg), &memory.host_mr);
 
   auto* default_ctx = manager.io_ctx();
   REQUIRE(default_ctx != nullptr);
-  CHECK(default_ctx == local_ctx.get());
 
   CHECK(manager.io_ctx_for(local_uri) == default_ctx);
 
   auto* routed_s3_ctx = manager.io_ctx_for("s3://bucket/key.parquet");
   REQUIRE(routed_s3_ctx != nullptr);
   CHECK(routed_s3_ctx != default_ctx);
-  CHECK(routed_s3_ctx == borrowed_s3_ctx.get());
   CHECK(dynamic_cast<s3_blocking_ioctx*>(routed_s3_ctx) != nullptr);
 
   CHECK(manager.io_ctx_for("unsupported://bucket/key.parquet") == nullptr);
@@ -367,11 +331,9 @@ TEST_CASE("sirius_scan_manager leaves S3 disabled when s3_config is empty", "[sc
   scan_manager_config cfg{};
   cfg.use_sirius_datasource = true;
   cfg.uring_n_reactors      = 1;
-  auto local_ctx            = make_local_ioctx();
-  sirius_scan_manager manager(std::move(cfg), make_borrowed_backends(local_ctx));
+  sirius_scan_manager manager(std::move(cfg));
 
   REQUIRE(manager.io_ctx() != nullptr);
-  CHECK(manager.io_ctx() == local_ctx.get());
   CHECK(manager.io_ctx_for("s3://bucket/key.parquet") == nullptr);
   CHECK(manager.io_ctx_for("unsupported://bucket/key.parquet") == nullptr);
 }
@@ -384,32 +346,26 @@ TEST_CASE("sirius_scan_manager stop does not destroy borrowed S3 backend", "[sca
   cfg.s3_config             = make_mock_s3_config();
 
   host_cache_memory memory;
-  auto s3_ctx = make_mock_s3_ioctx(&memory.host_mr);
-  std::weak_ptr<sirius_ioctx> weak_s3{s3_ctx};
-
-  sirius_scan_manager manager(
-    std::move(cfg),
-    make_borrowed_backends(make_local_ioctx(), std::static_pointer_cast<sirius_ioctx>(s3_ctx)));
+  sirius_scan_manager manager(std::move(cfg), &memory.host_mr);
   REQUIRE(manager.io_ctx_for("s3://bucket/key.parquet") != nullptr);
+
+  auto s3_ctx = manager.s3_ioctx();
+  REQUIRE(s3_ctx != nullptr);
+  std::weak_ptr<sirius_ioctx> weak_s3{s3_ctx};
+  s3_ctx.reset();
 
   manager.stop();
   manager.stop();
   CHECK_FALSE(weak_s3.expired());
 }
 
-TEST_CASE("sirius_scan_manager empty borrowed backend list constructs no backends",
+TEST_CASE("sirius_scan_manager with no datasource or S3 config constructs no backends",
           "[scan_manager][s3][ownership]")
 {
   scan_manager_config cfg{};
-  cfg.use_sirius_datasource = true;
-  cfg.uring_n_reactors      = 1;
-  cfg.s3_config             = make_mock_s3_config();
-  cfg.enable_prefetch_cache = true;
-  cfg.prefetch_buffer_pool_bytes =
-    cache_capacity_bytes(host_cache_memory::block_size, host_cache_memory::max_slabs);
+  cfg.use_sirius_datasource = false;
 
-  sirius_scan_manager manager(std::move(cfg),
-                              std::vector<std::shared_ptr<sirius::io::sirius_ioctx>>{});
+  sirius_scan_manager manager(std::move(cfg));
 
   CHECK(manager.io_ctx() == nullptr);
   CHECK(manager.io_ctx_for("file:///tmp/does-not-matter.parquet") == nullptr);
@@ -447,7 +403,7 @@ TEST_CASE("sirius_scan_manager wires S3 ioctx cache and serves repeated host rea
   context.initialize(cfg);
 
   auto const path = s3_uri(env->bucket, key);
-  auto s3_ctx     = context.get_s3_ioctx();
+  auto s3_ctx     = context.get_scan_manager().s3_ioctx();
   REQUIRE(s3_ctx != nullptr);
   REQUIRE(dynamic_cast<s3_ioctx*>(s3_ctx.get()) != nullptr);
   CHECK(context.get_scan_manager().io_ctx_for(path) == s3_ctx.get());
@@ -489,7 +445,7 @@ TEST_CASE("sirius_scan_manager leaves S3 ioctx cache disabled when prefetch cach
   duckdb::SiriusContext context;
   context.initialize(cfg);
 
-  auto s3_ctx = context.get_s3_ioctx();
+  auto s3_ctx = context.get_scan_manager().s3_ioctx();
   REQUIRE(s3_ctx != nullptr);
   CHECK(context.get_scan_manager().io_ctx_for(s3_uri(env->bucket, "medium.bin")) == s3_ctx.get());
   CHECK(s3_ctx->cache() == nullptr);
@@ -526,7 +482,7 @@ TEST_CASE("SiriusContext object_store_config header signing reads S3 bytes",
   duckdb::SiriusContext context;
   context.initialize(cfg);
 
-  auto s3_ctx = context.get_s3_ioctx();
+  auto s3_ctx = context.get_scan_manager().s3_ioctx();
   REQUIRE(s3_ctx != nullptr);
   auto* s3 = dynamic_cast<s3_ioctx*>(s3_ctx.get());
   REQUIRE(s3 != nullptr);
@@ -548,7 +504,7 @@ TEST_CASE("SiriusContext initialize keeps empty object_store_config inert",
 
   duckdb::SiriusContext context;
   context.initialize(cfg);
-  CHECK(context.get_s3_ioctx() == nullptr);
+  CHECK(context.get_scan_manager().s3_ioctx() == nullptr);
   CHECK(context.get_scan_manager().io_ctx_for("s3://bucket/key.parquet") == nullptr);
   CHECK_FALSE(context.get_config().get_scan_manager_config().s3_config.has_value());
   context.terminate();
@@ -566,7 +522,7 @@ TEST_CASE("SiriusContext initialize wires populated object_store_config into sca
   duckdb::SiriusContext context;
   context.initialize(cfg);
 
-  auto owned_s3_ctx = context.get_s3_ioctx();
+  auto owned_s3_ctx = context.get_scan_manager().s3_ioctx();
   REQUIRE(owned_s3_ctx != nullptr);
 
   auto* s3_ctx = context.get_scan_manager().io_ctx_for("s3://bucket/nation.parquet");
@@ -596,14 +552,12 @@ TEST_CASE("SiriusContext owns S3 ioctx beyond borrowed scan_manager lifetime",
   duckdb::SiriusContext context;
   context.initialize(cfg);
   {
-    auto owned_s3_ctx = context.get_s3_ioctx();
+    auto owned_s3_ctx = context.get_scan_manager().s3_ioctx();
     REQUIRE(owned_s3_ctx != nullptr);
     weak_s3 = owned_s3_ctx;
 
-    sirius_scan_manager borrowed_manager(
-      context.get_config().get_scan_manager_config(),
-      make_borrowed_backends(nullptr, std::static_pointer_cast<sirius_ioctx>(owned_s3_ctx)));
-    CHECK(borrowed_manager.io_ctx_for("s3://bucket/key.parquet") == owned_s3_ctx.get());
+    sirius_scan_manager borrowed_manager(context.get_config().get_scan_manager_config());
+    CHECK(borrowed_manager.io_ctx_for("s3://bucket/key.parquet") != nullptr);
   }
 
   CHECK_FALSE(weak_s3.expired());
@@ -630,7 +584,7 @@ TEST_CASE("SiriusContext with s3_use_async_backend=false selects the blocking ba
   duckdb::SiriusContext context;
   context.initialize(cfg);
 
-  auto s3_ctx = context.get_s3_ioctx();
+  auto s3_ctx = context.get_scan_manager().s3_ioctx();
   REQUIRE(s3_ctx != nullptr);
   CHECK(dynamic_cast<s3_blocking_ioctx*>(s3_ctx.get()) != nullptr);
   CHECK(dynamic_cast<s3_ioctx*>(s3_ctx.get()) == nullptr);
@@ -669,7 +623,7 @@ TEST_CASE("async and blocking S3 backends device_read the same bytes as the loca
     duckdb::SiriusContext context;
     context.initialize(cfg);
     {
-      auto s3_ctx = context.get_s3_ioctx();
+      auto s3_ctx = context.get_scan_manager().s3_ioctx();
       REQUIRE(s3_ctx != nullptr);
       if (use_async) {
         REQUIRE(dynamic_cast<s3_ioctx*>(s3_ctx.get()) != nullptr);
@@ -706,12 +660,9 @@ TEST_CASE("SiriusContext initializes prefetch cache on real local gpu ioctxs",
   duckdb::SiriusContext context;
   context.initialize(cfg);
 
-  REQUIRE_FALSE(context.get_gpu_ioctxs().empty());
-  for (auto const& [device_id, io_ctx] : context.get_gpu_ioctxs()) {
-    INFO("device_id=" << device_id);
-    REQUIRE(io_ctx != nullptr);
-    CHECK(io_ctx->cache() != nullptr);
-  }
+  auto* ioctx = context.get_scan_manager().io_ctx();
+  REQUIRE(ioctx != nullptr);
+  CHECK(ioctx->cache() != nullptr);
 
   context.terminate();
 }

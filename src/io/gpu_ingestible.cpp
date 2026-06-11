@@ -21,20 +21,14 @@
 
 namespace sirius::io {
 
-std::shared_ptr<gpu_ingestible> make_gpu_ingestible(
-  std::unique_ptr<ingestible_table_info> info,
-  scan_manager::sirius_scan_manager const& mgr,
-  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs)
+std::shared_ptr<gpu_ingestible> make_gpu_ingestible(std::unique_ptr<ingestible_table_info> info,
+                                                    scan_manager::sirius_scan_manager const& mgr)
 {
   if (!info) {
     throw std::runtime_error("[sirius::io::make_gpu_ingestible] table_info must not be null.");
   }
-  // Dispatch through the table_info's virtual factory. Pass self by move so
-  // the constructed ingestible can co-own the bind data through
-  // gpu_ingestible's _table_info member — overrides retain typed access via
-  // static_cast on table_info().
   auto* raw = info.get();
-  return raw->make_ingestible(std::move(info), mgr, gpu_ioctxs);
+  return raw->make_ingestible(std::move(info), mgr);
 }
 
 }  // namespace sirius::io

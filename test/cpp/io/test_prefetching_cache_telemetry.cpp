@@ -16,6 +16,7 @@
 
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
+#include <io/sirius_datasource.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -100,7 +101,8 @@ class memory_ioctx final : public sirius_ioctx {
     return std::make_shared<test_io_object>(std::move(path), _data.size());
   }
 
-  std::unique_ptr<cudf::io::datasource> make_datasource(std::shared_ptr<sirius_io_object>) override
+  std::unique_ptr<sirius::io::sirius_datasource> make_datasource(
+    std::shared_ptr<sirius_io_object>) override
   {
     throw std::runtime_error("memory_ioctx does not implement make_datasource");
   }

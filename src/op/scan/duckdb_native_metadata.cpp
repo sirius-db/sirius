@@ -482,6 +482,12 @@ duckdb_native_metadata walk_duckdb_native_metadata(
     auto desc = build_segment_descriptor(seg, compression);
 
     if (!validity_seg && projected_types[ci].is_varchar()) {
+      // The varchar decoder cannot read CONSTANT-compressed segments.
+      if (compression == duckdb::CompressionType::COMPRESSION_CONSTANT) {
+        refuse("varchar segment on column " + std::to_string(seg.column_id) + " row group " +
+               std::to_string(rg_idx) + ": CONSTANT compression is unsupported for varchar");
+        return md;
+      }
       // Refuse on absent stat so downstream consumers can deref unchecked.
       // Some(0) is legal data (all-empty row group); decode produces 0 chars.
       desc.max_string_length = parse_segment_max_string_length(seg.segment_stats);
@@ -576,8 +582,7 @@ duckdb_native_metadata walk_duckdb_native_metadata(
   }
 
   if (md.row_groups.empty()) {
-    // Zero splits would hang the pipeline on the FULL barrier; refuse so
-    // the transparent fallback routes to DuckDB CPU.
+    // Zero splits would hang the pipeline on the FULL barrier; refuse instead.
     refuse("no row groups in table (empty or fully pruned)");
     return md;
   }
