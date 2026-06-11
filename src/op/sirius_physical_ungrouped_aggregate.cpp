@@ -21,7 +21,7 @@
 #include "duckdb/common/types/decimal.hpp"
 #include "expression/aggregate_id.hpp"
 #include "expression/ast/aggregate.hpp"
-#include "expression/ast/clone.hpp"
+#include "expression/ast/utils.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
 #include "helper/type_conversions.hpp"

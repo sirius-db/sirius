@@ -14,10 +14,9 @@
  * limitations under the License.
  */
 
-#include "expression/ast/reference_utils.hpp"
+#include "expression/ast/utils.hpp"
 
 // sirius
-#include "expression/ast/clone.hpp"
 #include "expression/ast/node.hpp"
 
 // standard library
