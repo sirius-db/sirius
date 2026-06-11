@@ -108,7 +108,7 @@ def _extract_pool_stats(lines) -> dict:
     gpu: dict = {}  # device_id -> {"begin": ..., "end": ...}
 
     for line in lines:
-        if patterns.QUERY_BEGIN_ANCHOR in line or patterns.QUERY_END_ANCHOR in line:
+        if patterns.is_query_begin_line(line) or patterns.is_query_end_line(line):
             m = patterns.HOST_POOL_RE.match(line)
             if m:
                 key = "begin" if m.group("tag") == "QueryBegin" else "end"

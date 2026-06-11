@@ -239,7 +239,7 @@ void SiriusContext::QueryBegin(ClientContext& context)
     if (!normalized_query.empty() && normalized_query.back() == ' ') {
       normalized_query.pop_back();
     }
-    SIRIUS_LOG_INFO("QueryBegin: {}", normalized_query);
+    SIRIUS_LOG_INFO("QueryBegin: SQL: {}", normalized_query);
 
     task_creator_->reset();
     task_creator_->set_client_context(context);

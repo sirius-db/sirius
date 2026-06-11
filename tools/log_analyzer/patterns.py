@@ -14,7 +14,7 @@ that consumes this data can detect mismatched parser versions.
 
 import re
 
-SHAPE_VERSION = "1.3"
+SHAPE_VERSION = "1.6"
 
 # Timestamp at the start of every log line, e.g. "[2026-05-20 14:25:02.368]"
 TS_RE = re.compile(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)\]")
@@ -24,17 +24,32 @@ TRACE_TAG = "[trace]"
 DEBUG_TAG = "[debug]"
 
 # --- Query boundaries (info-level) -------------------------------------------
-# Example: "[2026-05-20 14:25:02.368] [info] [:] [host_pool] QueryBegin allocated=5242880 bytes peak=307232768 bytes free_blocks=5115"
-QUERY_BEGIN_ANCHOR = "[info] [:] [host_pool] QueryBegin allocated="
-QUERY_END_ANCHOR = "[info] [:] [host_pool] QueryEnd allocated="
+# Example: "[2026-06-10 19:52:14.000] [info] [:] [host_pool] HOST:0 QueryBegin allocated=5242880 bytes peak=307232768 bytes free_blocks=5115"
+# HOST:{device_id} was added in the DRY-cleanup refactor (commit e863fd4c).
+# The device_id varies by system so we use helper predicates (below) instead
+# of hardcoding it in anchor strings.
+#
 # Strict regex to extract stats from the host-pool boundary lines.
+# HOST:{device_id} group is optional so older logs (pre-e863fd4c) still parse.
 HOST_POOL_RE = re.compile(
     r"\[(?P<ts>[\d\-: .]+)\] \[info\] \[[^\]]+\] \[host_pool\] "
+    r"(?:HOST:(?P<host_device_id>-?\d+) )?"
     r"(?P<tag>QueryBegin|QueryEnd) "
     r"allocated=(?P<allocated_bytes>\d+) bytes "
     r"peak=(?P<peak_bytes>\d+) bytes "
     r"free_blocks=(?P<free_blocks>\d+)"
 )
+
+
+# Predicates used by segmenter.py and parse_logs.py to detect query-boundary
+# lines without hardcoding the HOST device_id.
+def is_query_begin_line(line: str) -> bool:
+    return "[host_pool]" in line and "QueryBegin allocated=" in line
+
+
+def is_query_end_line(line: str) -> bool:
+    return "[host_pool]" in line and "QueryEnd allocated=" in line
+
 
 # --- GPU device memory pool stats at query boundaries (info-level) -----------
 # Example: "[2026-06-10 10:00:00.000] [info] [:] [gpu_pool] GPU:0 QueryBegin allocated=1234567890 bytes peak=1234567890 bytes reserved=1234567890 bytes"
@@ -48,13 +63,12 @@ GPU_POOL_RE = re.compile(
     r"reserved=(?P<reserved_bytes>\d+) bytes"
 )
 
-# Example (old): "[2026-05-20 14:25:02.368] [info] [:] QueryBegin: with revenue_view as ..."
-# Example (new): "[2026-05-22 17:33:13.408] [info] [sirius_context.cpp:205] QueryBegin: select ..."
-# Both forms appear in the wild; the second element changed from [:] to a
-# file:line tag in newer Sirius builds.
-QUERY_SQL_ANCHOR = "QueryBegin: "  # distinguished from "QueryBegin allocated=" by ": "
+# Example: "[2026-06-11 ...] [info] [sirius_context.cpp:246] QueryBegin: SQL: select ..."
+# "SQL: " was added to distinguish the SQL line from the pool-stat lines that
+# also begin with "QueryBegin" (e.g. "[host_pool] HOST:-1 QueryBegin allocated=").
+QUERY_SQL_ANCHOR = "QueryBegin: SQL: "
 QUERY_SQL_RE = re.compile(
-    r"\[(?P<ts>[\d\-: .]+)\] \[info\] \[[^\]]+\] QueryBegin: (?P<sql>.*)$"
+    r"\[(?P<ts>[\d\-: .]+)\] \[info\] \[[^\]]+\] QueryBegin: SQL: (?P<sql>.*)$"
 )
 
 # --- Pipeline Overview block -------------------------------------------------

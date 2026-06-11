@@ -428,7 +428,8 @@ void downgrade_executor::monitor_loop()
   bool backed_off = false;
 
   while (_running.load()) {
-    if (_memory_space && _memory_space->should_downgrade_memory()) {
+    if (_memory_space && _memory_space->should_downgrade_memory() &&
+        !_monitor_request_enqueued.load(std::memory_order_relaxed)) {
       // Stateless viability gate: only issue a downgrade request when one could plausibly free
       // memory. When idle GPU batches' only lower tier is a full HOST and no DISK is configured,
       // re-firing would just re-scan every repository and the task queue, free nothing, and spam

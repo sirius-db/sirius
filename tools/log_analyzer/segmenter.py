@@ -1,9 +1,9 @@
 """Split a log file into analytical-SQL query segments.
 
-A "query" runs from a `[host_pool] QueryBegin allocated=` line to the
-matching `[host_pool] QueryEnd allocated=` line. The very next line after
-QueryBegin is expected to carry the SQL text (`QueryBegin: <sql>`); we keep
-only queries whose SQL (case-insensitive) starts with `select ` or `with `.
+A "query" runs from a `[host_pool] HOST:<id> QueryBegin` line to the
+matching `[host_pool] HOST:<id> QueryEnd` line. The SQL text is emitted on a
+separate line as `QueryBegin: SQL: <sql>`; we keep only queries whose SQL
+(case-insensitive) starts with `select ` or `with `.
 
 If a QueryBegin has no QueryEnd (log truncated, crash), the segment is still
 returned with status="incomplete" so downstream can analyze what was captured.
@@ -49,7 +49,7 @@ def segment(lines: List[str]) -> List[QuerySegment]:
     n = len(lines)
     while i < n:
         line = lines[i]
-        if patterns.QUERY_BEGIN_ANCHOR not in line:
+        if not patterns.is_query_begin_line(line):
             i += 1
             continue
 
@@ -83,12 +83,12 @@ def segment(lines: List[str]) -> List[QuerySegment]:
         end_ts = None
         stop_idx = None  # last line that belongs to this segment (inclusive)
         for k in range(sql_idx + 1, n):
-            if patterns.QUERY_END_ANCHOR in lines[k]:
+            if patterns.is_query_end_line(lines[k]):
                 end_idx = k
                 end_ts = _extract_ts(lines[k])
                 stop_idx = k
                 break
-            if patterns.QUERY_BEGIN_ANCHOR in lines[k]:
+            if patterns.is_query_begin_line(lines[k]):
                 # Next query started without our QueryEnd; mark incomplete and
                 # stop just before that next QueryBegin.
                 stop_idx = k - 1
