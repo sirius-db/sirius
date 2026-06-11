@@ -15,12 +15,15 @@
  */
 
 #include "catch.hpp"
+#include "expression/ast/constant.hpp"
 #include "expression/ast/function_call.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
 #include "expression/function_id.hpp"
+#include "expression/value.hpp"
 #include "helper/logical_type.hpp"
 #include "op/sirius_physical_dummy_scan.hpp"
+#include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_projection.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 
@@ -30,6 +33,7 @@
 #include <vector>
 
 using sirius::op::sirius_physical_dummy_scan;
+using sirius::op::sirius_physical_filter;
 using sirius::op::sirius_physical_projection;
 using sirius::op::SiriusPhysicalOperatorType;
 
@@ -64,6 +68,18 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_projection(
     make_integer_types(select_list.size()), std::move(select_list), child->estimated_cardinality);
   projection->children.push_back(std::move(child));
   return projection;
+}
+
+duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_filter(
+  duckdb::vector<sirius::logical_type> types,
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> child)
+{
+  auto filter_expr = std::make_unique<sirius::ast::node>(sirius::ast::constant{
+    sirius::value{true}, sirius::logical_type::make(sirius::type_id::BOOLEAN)});
+  auto filter      = duckdb::make_uniq<sirius_physical_filter>(
+    std::move(types), std::move(filter_expr), child->estimated_cardinality);
+  filter->children.push_back(std::move(child));
+  return filter;
 }
 
 std::size_t count_projection_operators(sirius::op::sirius_physical_operator const& op)
@@ -130,6 +146,39 @@ TEST_CASE("projection_fold - fold_adjacent_projections collapses a three-deep ch
   REQUIRE(folded.select_list.size() == 1);
   // third [#0] → second col 0 → first col 1 → scan col 0
   REQUIRE(folded.select_list[0]->get<sirius::ast::reference>().column_index == 0);
+}
+
+TEST_CASE(
+  "projection_fold - fold_adjacent_projections collapses nested stack under non-projection parent",
+  "[projection_fold]")
+{
+  // FILTER → PROJ(outer) → PROJ(inner) → SCAN
+  // Mimics stacks built without push_projection (e.g. under joins) that only the
+  // post-pass in sirius_physical_plan_generator folds.
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> inner_select;
+  inner_select.push_back(make_reference(1));
+  inner_select.push_back(make_reference(0));
+  auto plan = make_projection(std::move(inner_select), make_dummy_scan(2));
+
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> outer_select;
+  outer_select.push_back(make_reference(0));
+  plan = make_projection(std::move(outer_select), std::move(plan));
+
+  plan = make_filter(make_integer_types(1), std::move(plan));
+
+  REQUIRE(plan->type == SiriusPhysicalOperatorType::FILTER);
+  REQUIRE(count_projection_operators(*plan) == 2);
+
+  plan = sirius::planner::fold_adjacent_projections(std::move(plan));
+
+  REQUIRE(plan->type == SiriusPhysicalOperatorType::FILTER);
+  REQUIRE(plan->children.size() == 1);
+  REQUIRE(plan->children[0]->type == SiriusPhysicalOperatorType::PROJECTION);
+  REQUIRE(count_projection_operators(*plan) == 1);
+  auto& folded = plan->children[0]->Cast<sirius_physical_projection>();
+  REQUIRE(folded.select_list.size() == 1);
+  // outer [#0] → inner col 0 → scan col 1
+  REQUIRE(folded.select_list[0]->get<sirius::ast::reference>().column_index == 1);
 }
 
 TEST_CASE("projection_fold - null select-list slot prevents folding", "[projection_fold]")
