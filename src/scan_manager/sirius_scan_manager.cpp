@@ -323,10 +323,11 @@ void sirius_scan_manager::start() {}
 void sirius_scan_manager::stop()
 {
   reset();
-  // S6: the IO backends + the S3 async pool are owned by SiriusContext, which
-  // drains (shutdown) the s3_ioctx and stops the S3 pool during its own
-  // teardown. The scan_manager only stops its scan-orchestration pool here and
-  // must NOT shut down the borrowed backends.
+  // Since the scan-manager cleanup (#913) the scan_manager OWNS the IO
+  // backends, the S3 thread pool and the prefetch buffer pool; they are torn
+  // down in the destructor (_io_ctxs.clear() -> S3 pool stop -> buffer pool
+  // reset). stop() only halts the scan-orchestration pool so it stays safe to
+  // call while backends may still serve in-flight reads.
   _thread_pool.stop();
 }
 
@@ -488,7 +489,7 @@ void sirius_scan_manager::insert_pinned_entry_host(
 }
 
 std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datasource(
-  std::string_view path) const noexcept
+  std::string_view path) const
 {
   auto file_path = normalize_path(std::string(path));
   for (auto const& ctx : _io_ctxs) {

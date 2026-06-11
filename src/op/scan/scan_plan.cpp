@@ -42,8 +42,8 @@ bool scan_plan::is_projected() const
   // cannot derive this from @c data_columns alone: the factory populates
   // data_columns even for the plain "read everything" case, so checking
   // !data_columns.empty() would treat SELECT * as projected and spuriously
-  // trigger set_column_names / projected_columns_are_flat / per-file name
-  // resolution — silently regressing support for nested-schema SELECT *.
+  // trigger set_column_names / per-file name resolution — silently regressing
+  // support for nested-schema SELECT *.
   return needs_reader_projection;
 }
 

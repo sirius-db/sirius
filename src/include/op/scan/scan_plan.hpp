@@ -100,8 +100,8 @@ struct scan_plan {
   /// pruned or reordered columns (non-empty @c projection_ids) or hive-partition
   /// columns must be dropped from the physical read. When false, the reader's
   /// natural "read everything in column_ids order" output already matches what
-  /// the pipeline expects, and the scan can skip @c set_column_names,
-  /// @c projected_columns_are_flat, and per-file name-based leaf resolution.
+  /// the pipeline expects, and the scan can skip @c set_column_names and
+  /// per-file name-based leaf resolution.
   bool needs_reader_projection = false;
 
   //===--------------------------------------------------------------------===//
