@@ -18,7 +18,6 @@
 
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
-#include "duckdb/common/types/decimal.hpp"
 #include "expression/aggregate_id.hpp"
 #include "expression/ast/aggregate.hpp"
 #include "expression/ast/node.hpp"
@@ -29,13 +28,14 @@
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "sirius/exception.hpp"
 
+#include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
-#include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/types.hpp>
+#include <cudf/unary.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/resource_ref.hpp>
@@ -45,7 +45,6 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 
-#include <cmath>
 #include <limits>
 #include <optional>
 
@@ -235,104 +234,32 @@ std::unique_ptr<cudf::column> make_avg_column(const cudf::column_view& sum_view,
                                               rmm::cuda_stream_view stream,
                                               rmm::device_async_resource_ref memory_resource)
 {
-  auto sum_agg = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
-  // Reduce the sum column using its own type (cudf requires output type == input type
-  // for fixed-point reductions). The final AVG return type is applied after division.
-  auto sum_type    = sum_view.type();
-  auto sum_value   = cudf::reduce(sum_view, *sum_agg, sum_type, stream, memory_resource);
-  auto count_value = cudf::reduce(
-    count_view, *sum_agg, cudf::data_type(cudf::type_id::INT64), stream, memory_resource);
+  // The merged sum/count columns are already single-row, so divide them on-device
+  // rather than copying scalars to the host and converting through long double.
+  // This mirrors sirius_physical_grouped_aggregate_merge and avoids the precision
+  // loss of the host-side decimal->long double->decimal round trips.
+  auto out_type = ToCudfType(return_type);
 
-  auto const count_host = scalar_cast<cudf::numeric_scalar<int64_t>>(*count_value).value();
-
-  // Step 1: Extract the sum value as long double, regardless of the source type.
-  // The sum column type may differ from the return type (e.g., sum is DECIMAL64 but
-  // DuckDB's avg return type is DOUBLE).
-  long double sum_host = 0.0L;
-  bool sum_is_decimal  = sirius::IsCudfTypeDecimal(sum_type);
-  if (sum_is_decimal) {
-    auto denom = std::pow(10.0L, static_cast<long double>(-sum_type.scale()));
-    switch (sum_type.id()) {
-      case cudf::type_id::DECIMAL32: {
-        auto& s  = static_cast<cudf::fixed_point_scalar<numeric::decimal32>&>(*sum_value);
-        sum_host = static_cast<long double>(s.value(stream)) / denom;
-        break;
-      }
-      case cudf::type_id::DECIMAL64: {
-        auto& s  = static_cast<cudf::fixed_point_scalar<numeric::decimal64>&>(*sum_value);
-        sum_host = static_cast<long double>(s.value(stream)) / denom;
-        break;
-      }
-      case cudf::type_id::DECIMAL128: {
-        auto& s  = static_cast<cudf::fixed_point_scalar<numeric::decimal128>&>(*sum_value);
-        sum_host = static_cast<long double>(s.value(stream)) / denom;
-        break;
-      }
-      default: break;
-    }
-  } else {
-    switch (sum_type.id()) {
-      case cudf::type_id::FLOAT32:
-        sum_host = scalar_cast<cudf::numeric_scalar<float>>(*sum_value).value();
-        break;
-      case cudf::type_id::FLOAT64:
-        sum_host = scalar_cast<cudf::numeric_scalar<double>>(*sum_value).value();
-        break;
-      case cudf::type_id::INT32:
-        sum_host = scalar_cast<cudf::numeric_scalar<int32_t>>(*sum_value).value();
-        break;
-      case cudf::type_id::INT64:
-        sum_host = scalar_cast<cudf::numeric_scalar<int64_t>>(*sum_value).value();
-        break;
-      default: throw not_implemented_exception("AVG: unsupported sum column type");
-    }
+  if (sirius::IsCudfTypeDecimal(out_type)) {
+    // DECIMAL output: divide directly in fixed-point to preserve precision.
+    return cudf::binary_operation(
+      sum_view, count_view, cudf::binary_operator::DIV, out_type, stream, memory_resource);
   }
 
-  // Step 2: Compute avg and produce the output scalar in the DuckDB return type.
-  long double avg_host = (count_host == 0) ? 0.0L : (sum_host / count_host);
-  std::unique_ptr<cudf::scalar> out_scalar;
-
-  if (return_type.id() == duckdb::LogicalTypeId::DECIMAL) {
-    auto scale         = duckdb::DecimalType::GetScale(return_type);
-    auto width         = duckdb::DecimalType::GetWidth(return_type);
-    auto scale_type    = numeric::scale_type{-scale};
-    auto denom         = std::pow(10.0L, static_cast<long double>(scale));
-    long double scaled = avg_host * denom;
-    if (width <= duckdb::Decimal::MAX_WIDTH_INT32) {
-      out_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal32>>(
-        static_cast<int32_t>(std::llround(scaled)), scale_type, true, stream, memory_resource);
-    } else if (width <= duckdb::Decimal::MAX_WIDTH_INT64) {
-      out_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal64>>(
-        static_cast<int64_t>(std::llround(scaled)), scale_type, true, stream, memory_resource);
-    } else {
-      out_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(
-        static_cast<__int128_t>(std::llround(scaled)), scale_type, true, stream, memory_resource);
-    }
-  } else {
-    // Non-decimal return type (typically DOUBLE)
-    auto out_cudf_type = ToCudfType(return_type);
-    switch (out_cudf_type.id()) {
-      case cudf::type_id::FLOAT64:
-        out_scalar = make_numeric_scalar_with_value<double>(
-          out_cudf_type, static_cast<double>(avg_host), stream);
-        break;
-      case cudf::type_id::FLOAT32:
-        out_scalar = make_numeric_scalar_with_value<float>(
-          out_cudf_type, static_cast<float>(avg_host), stream);
-        break;
-      case cudf::type_id::INT64:
-        out_scalar = make_numeric_scalar_with_value<int64_t>(
-          out_cudf_type, static_cast<int64_t>(avg_host), stream);
-        break;
-      case cudf::type_id::INT32:
-        out_scalar = make_numeric_scalar_with_value<int32_t>(
-          out_cudf_type, static_cast<int32_t>(avg_host), stream);
-        break;
-      default: throw not_implemented_exception("AVG: unsupported return type");
-    }
-  }
-
-  return cudf::make_column_from_scalar(*out_scalar, 1, stream, memory_resource);
+  // Non-DECIMAL output (typically DOUBLE): cast both operands to FLOAT64 and divide.
+  auto sum_f64 =
+    cudf::cast(sum_view, cudf::data_type{cudf::type_id::FLOAT64}, stream, memory_resource);
+  auto count_f64 =
+    cudf::cast(count_view, cudf::data_type{cudf::type_id::FLOAT64}, stream, memory_resource);
+  auto avg_f64 = cudf::binary_operation(sum_f64->view(),
+                                        count_f64->view(),
+                                        cudf::binary_operator::DIV,
+                                        cudf::data_type{cudf::type_id::FLOAT64},
+                                        stream,
+                                        memory_resource);
+  if (out_type.id() == cudf::type_id::FLOAT64) { return avg_f64; }
+  // Defensive: cast to the requested numeric return type if it isn't already FLOAT64.
+  return cudf::cast(avg_f64->view(), out_type, stream, memory_resource);
 }
 
 }  // namespace
