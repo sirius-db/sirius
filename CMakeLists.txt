@@ -561,6 +561,28 @@ if(SIRIUS_BUILD_S3_TESTS)
   list(APPEND TEST_SOURCES test/cpp/utils/s3_container.cpp)
 endif()
 
+# Orphan-test guard: a test_*.cpp present in the tree but missing from
+# TEST_SOURCES never compiles, so its coverage silently vanishes (this happened
+# twice during the scan-manager cleanup). Fail the configure for any unlisted
+# test file; the only escape hatch is an explicit, reasoned entry in
+# test/cpp/ORPHAN_ALLOWLIST.cmake. Test files added behind a CMake option must
+# be appended to TEST_SOURCES inside their option block ABOVE this check.
+include("${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/ORPHAN_ALLOWLIST.cmake")
+file(
+  GLOB_RECURSE _sirius_tree_test_sources
+  RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
+  CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_*.cpp")
+foreach(_sirius_test_file IN LISTS _sirius_tree_test_sources)
+  if(NOT _sirius_test_file IN_LIST TEST_SOURCES
+     AND NOT _sirius_test_file IN_LIST SIRIUS_ORPHAN_TEST_ALLOWLIST)
+    message(
+      FATAL_ERROR
+        "Orphaned test file: ${_sirius_test_file} exists but is not in "
+        "TEST_SOURCES, so it would never compile. Add it to TEST_SOURCES (or, "
+        "with a reason, to test/cpp/ORPHAN_ALLOWLIST.cmake).")
+  endif()
+endforeach()
+
 add_executable(sirius_unittest ${TEST_SOURCES})
 
 # TPC-DS integration test fixture, generated at build time (opt-in target). The
