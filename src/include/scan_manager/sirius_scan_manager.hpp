@@ -67,14 +67,17 @@ namespace sirius::scan_manager {
 /**
  * @brief Configuration for the scan_manager.
  *
- * @c use_sirius_datasource controls whether the manager builds a
- * @c sirius_ioctx and routes parquet reads through @c sirius_datasource.
- * Set to @c false to fall back to @c cudf::io::datasource::create() at
- * every read site (e.g. when the sirius IO path is misbehaving). Only
- * valid in single-GPU configurations — when more than one GPU is
- * configured, @c sirius_config::enforce_sirius_datasource_for_multi_gpu()
- * forces this field to @c true because kvikio's per-FileHandle CUDA-context
- * binding breaks multi-GPU residency.
+ * @c use_sirius_datasource gates whether LOCAL parquet paths are claimed by
+ * the Sirius local-file backend in @c create_datasource. When false, local
+ * paths resolve to no datasource and reads fall back to
+ * @c cudf::io::datasource::create() (KvikIO); object-store paths (s3://)
+ * always resolve through their backend regardless. The local @c uring_ioctx
+ * itself is constructed unconditionally — the DuckDB-native GPU scan needs
+ * it for host reads. Only valid in single-GPU configurations — when more
+ * than one GPU is configured,
+ * @c sirius_config::enforce_sirius_datasource_for_multi_gpu() forces this
+ * field to @c true because kvikio's per-FileHandle CUDA-context binding
+ * breaks multi-GPU residency.
  */
 struct scan_manager_config {
   exec::thread_pool_config thread_pool{.num_threads = 8, .thread_name_prefix = "scan_manager"};
@@ -99,11 +102,12 @@ struct scan_manager_config {
   /// control).  Ignored when @c enable_prefetch_cache is false.
   std::size_t prefetch_inflight_budget_chunks{2048};
 
-  /// When true (default — current behavior), parquet_split_provider prewarms
-  /// per-row-group column-chunk byte ranges via @c cache->insert(obj,
-  /// metadata, ranges).  When false, prewarm is skipped: insert is called
-  /// with empty ranges (metadata-only, as in §24 describe_parquet).  Lets
-  /// the B1 micro-bench A/B compare prefetch overlap on SF10.  Ignored when
+  /// When true (default), the scan-side split build (parquet_gpu_ingestible)
+  /// prewarms the selected row groups' merged column-chunk byte ranges via
+  /// @c cache->insert(obj, metadata, ranges) once projection and row-group
+  /// pruning are final. When false, no ranges enter the cache at scan time
+  /// (describe_parquet's metadata-only insert is unaffected). Lets the
+  /// micro-bench A/B compare prefetch overlap on SF10. Ignored when
   /// @c enable_prefetch_cache is false (no cache → no prewarm regardless).
   bool enable_chunk_prewarm{true};
 
@@ -343,11 +347,10 @@ class sirius_scan_manager {
   [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> create_datasource(
     std::string_view path) const;
 
-  /// \brief Whether parquet_split_provider should prewarm column-chunk byte
-  /// ranges via @c cache->insert(obj, metadata, ranges). Mirrors
-  /// @c scan_manager_config::enable_chunk_prewarm. False disables the
-  /// prewarm (insert is called with empty ranges — metadata-only, §24
-  /// describe_parquet shape), letting B1 micro-bench A/B prefetch overlap.
+  /// \brief Whether the scan-side split build should prewarm column-chunk
+  /// byte ranges via @c cache->insert(obj, metadata, ranges). Mirrors
+  /// @c scan_manager_config::enable_chunk_prewarm. False means no ranges are
+  /// inserted at scan time (describe_parquet stays metadata-only either way).
   [[nodiscard]] bool chunk_prewarm_enabled() const noexcept { return _config.enable_chunk_prewarm; }
 
   /// \brief Probe a parquet file's schema for the SQL bind path.
