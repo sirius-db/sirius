@@ -78,14 +78,14 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> fold_once(projection co
 }
 
 // Drop a passthrough [#0, #1, ...] projection when its child already exposes the
-// same column count — avoids a no-op GPU pipeline stage.
+// exact same output schema (column types) — avoids a no-op GPU pipeline stage.
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> try_elide_identity_projection(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> projection_op)
 {
   auto& proj = projection_op->Cast<projection>();
   if (!is_identity_ast_projection(proj.select_list)) { return projection_op; }
   if (proj.children.size() != 1) { return projection_op; }
-  if (proj.children[0]->types.size() != proj.types.size()) { return projection_op; }
+  if (proj.children[0]->types != proj.types) { return projection_op; }
   return std::move(proj.children[0]);
 }
 
@@ -161,9 +161,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> push_projection(
   duckdb::vector<std::unique_ptr<sirius::ast::node>> select_list,
   std::size_t estimated_cardinality)
 {
-  if (is_identity_ast_projection(select_list) && child->types.size() == types.size()) {
-    return child;
-  }
+  if (is_identity_ast_projection(select_list) && child->types == types) { return child; }
 
   auto projection_op =
     duckdb::make_uniq<projection>(std::move(types), std::move(select_list), estimated_cardinality);
