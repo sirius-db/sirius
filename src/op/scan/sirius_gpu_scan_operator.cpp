@@ -198,15 +198,17 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
       batches.push_back(pinned->batch);
       return std::make_unique<pipelineable_operator_data>(std::move(batches));
     }
-    auto ro_batch  = pinned->batch->to_read_only();
-    auto* batch_mr = ro_batch.get_memory_space();
+    ::cucascade::memory::memory_space* batch_mr = nullptr;
+    {
+      auto ro_batch = pinned->batch->to_read_only();
+      batch_mr      = ro_batch.get_memory_space();
+    }
     if (!batch_mr) {
       throw std::runtime_error(
         "[sirius_gpu_scan_operator::execute] pinned batch has no memory_space; "
         "prepare_for_processing must have produced a GPU-resident batch.");
     }
-    auto& gpu_rep     = ro_batch.get_data()->cast<::cucascade::gpu_table_representation>();
-    auto owning_input = gpu_rep.release_table(stream);
+    auto owning_input = ::cucascade::data_batch::release_or_copy_table(pinned->batch, stream);
 
     table = _ingestible->post_filter_and_project(
       std::move(owning_input), *pinned->filter_info, *batch_mr, stream);

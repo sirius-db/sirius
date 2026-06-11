@@ -210,10 +210,9 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     {
       auto output_ro = output_batch->to_read_only();
       space          = output_ro.get_memory_space();
-      auto& gpu_rep  = output_ro.get_data()->cast<cucascade::gpu_table_representation>();
-      auto table     = gpu_rep.release_table(stream);
-      columns        = table->release();
     }  // read lock released here
+    columns =
+      cucascade::data_batch::release_or_copy_table(std::move(output_batch), stream)->release();
 
     // Select output columns using the batch column map.
     // projection_ids[0..expected_output_columns) are the output columns
