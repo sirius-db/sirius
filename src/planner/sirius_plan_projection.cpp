@@ -19,8 +19,8 @@
 #include "expression/ast/from_duckdb.hpp"
 #include "expression/ast/node.hpp"
 #include "helper/type_conversions.hpp"
-#include "op/sirius_physical_projection.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "planner/sirius_plan_projection_utils.hpp"
 
 #include <memory>
 
@@ -76,12 +76,10 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalProjection& op)
     }
   }
 
-  auto projection = duckdb::make_uniq<sirius::op::sirius_physical_projection>(
-    sirius::from_duckdb_vec(op.types),
-    translate_expressions(std::move(op.expressions)),
-    op.estimated_cardinality);
-  projection->children.push_back(std::move(plan));
-  return std::move(projection);
+  return push_projection(std::move(plan),
+                         sirius::from_duckdb_vec(op.types),
+                         translate_expressions(std::move(op.expressions)),
+                         op.estimated_cardinality);
 }
 
 }  // namespace sirius::planner
