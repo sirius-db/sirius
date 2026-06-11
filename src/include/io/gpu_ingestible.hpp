@@ -38,6 +38,7 @@ class operator_data;
 
 namespace sirius::scan_manager {
 class sirius_scan_manager;
+class split_connector;
 }  // namespace sirius::scan_manager
 
 namespace sirius::io {
@@ -283,6 +284,28 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
     post_filter_and_projection_info const& info,
     ::cucascade::memory::memory_space const& mem_space,
     rmm::cuda_stream_view stream) = 0;
+
+  /**
+   * @brief Produce the next per-task input from the connector.
+   *
+   * Called on the scan operator's single consumer thread. The default returns
+   * the next split unchanged; @c duckdb_native_gpu_ingestible coalesces
+   * row-group ranges into cap-sized batches.
+   *
+   * @return The next per-task operator_data, or nullptr once the connector is
+   *         closed and all buffered work has been served.
+   */
+  virtual std::unique_ptr<op::operator_data> consume_next_input(
+    scan_manager::split_connector& connector);
+
+  /**
+   * @brief Whether the ingestible still holds buffered consumer-side work.
+   *
+   * Default: true (no buffer). The duckdb-native override returns false while
+   * its coalescer still holds batches, so the scan is not reported done before
+   * its last batch is served.
+   */
+  [[nodiscard]] virtual bool consumer_drained() const { return true; }
 
   [[nodiscard]] ingestible_table_info const& table_info() const noexcept { return *_table_info; }
 

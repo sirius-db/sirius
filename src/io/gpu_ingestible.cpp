@@ -16,10 +16,25 @@
 
 #include "io/gpu_ingestible.hpp"
 
+#include "scan_manager/split_connector.hpp"
+
 #include <stdexcept>
 #include <utility>
 
 namespace sirius::io {
+
+//===----------------------------------------------------------------------===//
+// gpu_ingestible — default consumer-side adaptation
+//===----------------------------------------------------------------------===//
+// Returns the next split unchanged. Formats that batch on the consumer side
+// override this.
+std::unique_ptr<op::operator_data> gpu_ingestible::consume_next_input(
+  scan_manager::split_connector& connector)
+{
+  auto next = connector.get_next_split();
+  if (!next.has_value()) { return nullptr; }
+  return std::move(*next);
+}
 
 std::shared_ptr<gpu_ingestible> make_gpu_ingestible(std::unique_ptr<ingestible_table_info> info,
                                                     scan_manager::sirius_scan_manager const& mgr)

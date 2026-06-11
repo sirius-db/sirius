@@ -17,14 +17,17 @@
 // sirius
 #include <expression/ast/from_duckdb.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
+#include <helper/utils.hpp>
 #include <io/io_context.hpp>
 #include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
+#include <op/scan/duckdb_native_batch_coalescer.hpp>
 #include <op/scan/duckdb_native_decoder.hpp>
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
+#include <scan_manager/split_connector.hpp>
 
 // cudf
 #include <cudf/table/table.hpp>
@@ -35,8 +38,11 @@
 
 // standard library
 #include <algorithm>
+#include <cstddef>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -44,73 +50,21 @@ namespace sirius::op::scan {
 
 namespace {
 
-// Mirrors duckdb_native_split_provider::partition_row_groups_into_batches.
-struct row_group_batch_local {
-  std::size_t first_idx;
-  std::size_t count;
-};
+// Number of row groups a worker claims and walks per range. Overridable via
+// SIRIUS_METADATA_PARSE_CHUNK.
+constexpr std::size_t DEFAULT_PARSE_CHUNK_ROW_GROUPS = 8;
 
-std::vector<row_group_batch_local> partition_row_groups_into_batches(
-  const std::vector<duckdb_row_group_metadata>& row_groups,
-  std::size_t approximate_batch_size,
-  const std::vector<sirius::logical_type>& projected_types)
+std::size_t parse_chunk_row_groups()
 {
-  std::vector<row_group_batch_local> batches;
-  if (row_groups.empty()) return batches;
-
-  const std::size_t num_cols = projected_types.size();
-  std::vector<bool> is_varchar(num_cols, false);
-  bool any_varchar = false;
-  for (std::size_t c = 0; c < num_cols; ++c) {
-    is_varchar[c] = projected_types[c].is_varchar();
-    any_varchar   = any_varchar || is_varchar[c];
-  }
-
-  if (approximate_batch_size == 0 && !any_varchar) {
-    batches.push_back({0, row_groups.size()});
-    return batches;
-  }
-
-  std::size_t batch_first = 0;
-  std::size_t batch_bytes = 0;
-  std::vector<std::size_t> col_bytes(num_cols, 0);
-
-  for (std::size_t i = 0; i < row_groups.size(); ++i) {
-    const auto& rg                  = row_groups[i];
-    const std::size_t this_rg_bytes = rg.decoded_bytes_budget;
-
-    if (i > batch_first) {
-      const bool would_exceed_total =
-        (approximate_batch_size > 0) && (batch_bytes + this_rg_bytes > approximate_batch_size);
-      bool would_exceed_varchar = false;
-      if (any_varchar) {
-        for (std::size_t c = 0; c < num_cols; ++c) {
-          if (is_varchar[c] &&
-              col_bytes[c] + rg.varchar_bytes_per_col[c] >= kCudfInt32StringsThreshold) {
-            would_exceed_varchar = true;
-            break;
-          }
-        }
-      }
-      if (would_exceed_total || would_exceed_varchar) {
-        batches.push_back({batch_first, i - batch_first});
-        batch_first = i;
-        batch_bytes = 0;
-        std::fill(col_bytes.begin(), col_bytes.end(), 0);
-      }
-    }
-
-    batch_bytes += this_rg_bytes;
-    if (any_varchar) {
-      for (std::size_t c = 0; c < num_cols; ++c) {
-        col_bytes[c] += rg.varchar_bytes_per_col[c];
-      }
+  if (char const* env = std::getenv("SIRIUS_METADATA_PARSE_CHUNK")) {
+    try {
+      auto const v = std::stoull(env);
+      if (v > 0) { return static_cast<std::size_t>(v); }
+    } catch (...) {
+      // Unparsable value → fall through to the default.
     }
   }
-  if (batch_first < row_groups.size()) {
-    batches.push_back({batch_first, row_groups.size() - batch_first});
-  }
-  return batches;
+  return DEFAULT_PARSE_CHUNK_ROW_GROUPS;
 }
 
 }  // namespace
@@ -146,24 +100,27 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
       "[duckdb_native_gpu_ingestible] projected_cols and projected_types must be parallel");
   }
 
-  // Walk metadata once. Pushed-down filters drive row-group pruning in the walk;
-  // column_ids maps each filter to its storage index.
-  _metadata = walk_duckdb_native_metadata(*bind.storage,
-                                          *bind.context,
-                                          bind.projected_cols,
-                                          bind.projected_types,
-                                          bind.table_filters.get(),
-                                          &bind.column_ids);
-  if (!_metadata.viable) {
-    SPDLOG_DEBUG("[duckdb_native_gpu_ingestible] non-viable: {}",
-                 _metadata.viability_failure_reason);
+  // Table-global metadata parse. Pushed-down filters drive row-group pruning in
+  // the range walks; column_ids maps each filter to its storage index.
+  _plan = prepare_duckdb_native_walk(*bind.storage,
+                                     *bind.context,
+                                     bind.projected_cols,
+                                     bind.projected_types,
+                                     bind.table_filters.get(),
+                                     &bind.column_ids);
+  if (!_plan.viable) {
+    SPDLOG_DEBUG("[duckdb_native_gpu_ingestible] non-viable: {}", _plan.viability_failure_reason);
     throw std::runtime_error("duckdb-native scan rejected query: " +
-                             _metadata.viability_failure_reason);
+                             _plan.viability_failure_reason);
+  }
+  if (_plan.n_row_groups == 0) {
+    // Nothing to scan; reject so the table falls back to DuckDB CPU.
+    throw std::runtime_error("duckdb-native scan rejected query: no row groups in table");
   }
 
-  // Resolve the .db file to a datasource once per query when the manager
-  // exposes a backend for db_path; derive the io_ctx + io_object from it
-  // (matches duckdb_native_split_provider) instead of reaching into io_context.
+  // Resolve the .db file to a datasource when the manager exposes a backend for
+  // db_path, and derive the io_ctx + io_object from it. io_ctx stays null when no
+  // backend supports db_path; the decoder rejects the scan at decode time then.
   auto db_datasource = !bind.db_path.empty() ? mgr.create_datasource(bind.db_path) : nullptr;
   _io_ctx            = db_datasource ? db_datasource->io_ctx() : nullptr;
   _db_io_object      = db_datasource ? db_datasource->io_object() : nullptr;
@@ -199,12 +156,13 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
   _output_arity        = bind.output_types.size();
   _projection_required = (_output_arity > 0) && (decoded_cols > _output_arity);
 
-  auto batches = partition_row_groups_into_batches(
-    _metadata.row_groups, bind.approximate_batch_size, bind.projected_types);
-  _batches.reserve(batches.size());
-  for (auto const& b : batches) {
-    _batches.push_back({b.first_idx, b.count});
-  }
+  // Coalescer that packs parsed ranges into cap-sized batches with one tail
+  // batch per scan.
+  _coalescer = std::make_unique<batch_coalescer>(bind.approximate_batch_size, bind.projected_types);
+
+  // Divide the row groups into ranges of _chunk_row_groups each.
+  _chunk_row_groups = parse_chunk_row_groups();
+  _num_ranges       = utils::ceil_div(_plan.n_row_groups, _chunk_row_groups);
 }
 
 duckdb_native_gpu_ingestible::~duckdb_native_gpu_ingestible() = default;
@@ -214,48 +172,100 @@ duckdb_native_gpu_ingestible::~duckdb_native_gpu_ingestible() = default;
 //===----------------------------------------------------------------------===//
 bool duckdb_native_gpu_ingestible::has_more_splits() const
 {
-  return _next_batch_idx.load(std::memory_order_relaxed) < _batches.size();
+  return _next_range_idx.load(std::memory_order_relaxed) < _num_ranges;
 }
 
 std::function<std::vector<std::unique_ptr<op::operator_data>>()>
 duckdb_native_gpu_ingestible::next_split_provider()
 {
-  std::size_t idx = _next_batch_idx.fetch_add(1, std::memory_order_relaxed);
-  if (idx >= _batches.size()) { return {}; }
-  row_group_batch claimed = _batches[idx];
+  auto const idx = _next_range_idx.fetch_add(1, std::memory_order_relaxed);
+  if (idx >= _num_ranges) { return {}; }
 
-  bool const apply_filter        = static_cast<bool>(_filter_expression);
-  bool const has_post_processing = apply_filter || _projection_required;
-  std::size_t const output_arity = _output_arity;
-  bool const projection_required = _projection_required;
+  auto const rg_begin = idx * _chunk_row_groups;
+  auto const rg_end   = std::min(rg_begin + _chunk_row_groups, _plan.n_row_groups);
 
-  return [this, claimed, apply_filter, projection_required, output_arity, has_post_processing]()
-           -> std::vector<std::unique_ptr<op::operator_data>> {
-    auto split_info = std::make_unique<duckdb_native_split_info>();
-    split_info->payload.table_info =
-      &static_cast<duckdb_native_ingestible_table_info const&>(table_info());
-    split_info->payload.io_ctx       = _io_ctx;
-    split_info->payload.db_io_object = _db_io_object;
-    split_info->payload.row_groups.reserve(claimed.count);
-    for (std::size_t i = claimed.first_idx; i < claimed.first_idx + claimed.count; ++i) {
-      split_info->payload.row_groups.push_back(std::move(_metadata.row_groups[i]));
+  // Runs on a worker thread: walk this range and emit one raw range carrier for
+  // the consumer to coalesce. Reads the read-only _plan.
+  return [this, rg_begin, rg_end]() -> std::vector<std::unique_ptr<op::operator_data>> {
+    auto range = walk_duckdb_native_row_group_range(_plan, rg_begin, rg_end);
+    if (!range.viable) {
+      // Surfaced to the consumer through the connector; rejects the query.
+      throw std::runtime_error("duckdb-native scan rejected query: " +
+                               range.viability_failure_reason);
     }
 
-    std::unique_ptr<io::post_filter_and_projection_info> filter_info;
-    if (has_post_processing) {
-      auto pf          = std::make_unique<duckdb_native_post_filter_and_projection_info>();
-      pf->apply_filter = apply_filter;
-      pf->output_arity = projection_required ? output_arity : 0;
-      filter_info      = std::move(pf);
-    }
-
-    auto metadata =
-      std::make_unique<io::scan_and_filter_metadata>(std::move(split_info), std::move(filter_info));
+    auto carrier        = std::make_unique<duckdb_native_range_input>();
+    carrier->row_groups = std::move(range.row_groups);
 
     std::vector<std::unique_ptr<op::operator_data>> out;
-    out.push_back(std::make_unique<scan_operator_input>(std::move(metadata)));
+    out.push_back(std::move(carrier));
     return out;
   };
+}
+
+//===----------------------------------------------------------------------===//
+// consumer-side coalescing
+//===----------------------------------------------------------------------===//
+std::unique_ptr<op::operator_data> duckdb_native_gpu_ingestible::make_batch(
+  std::vector<duckdb_row_group_metadata> row_groups)
+{
+  auto split_info = std::make_unique<duckdb_native_split_info>();
+  split_info->payload.table_info =
+    &static_cast<duckdb_native_ingestible_table_info const&>(table_info());
+  split_info->payload.io_ctx       = _io_ctx;
+  split_info->payload.db_io_object = _db_io_object;
+  split_info->payload.row_groups   = std::move(row_groups);
+
+  std::unique_ptr<io::post_filter_and_projection_info> filter_info;
+  bool const apply_filter = static_cast<bool>(_filter_expression);
+  if (apply_filter || _projection_required) {
+    auto pf          = std::make_unique<duckdb_native_post_filter_and_projection_info>();
+    pf->apply_filter = apply_filter;
+    pf->output_arity = _projection_required ? _output_arity : 0;
+    filter_info      = std::move(pf);
+  }
+
+  auto metadata =
+    std::make_unique<io::scan_and_filter_metadata>(std::move(split_info), std::move(filter_info));
+  return std::make_unique<scan_operator_input>(std::move(metadata));
+}
+
+std::unique_ptr<op::operator_data> duckdb_native_gpu_ingestible::consume_next_input(
+  scan_manager::split_connector& connector)
+{
+  // Coalesce parsed ranges into cap-sized batches as they arrive, so early
+  // batches decode while later ranges are still being walked. Rowids are
+  // absolute per row group, so packing order is unconstrained. get_next_split
+  // blocks until a range is ready.
+  for (;;) {
+    if (_coalescer->has_ready()) { return make_batch(_coalescer->pop_ready()); }
+
+    auto next = connector.get_next_split();
+    if (!next.has_value()) {
+      // Connector closed and drained: emit the single tail batch, if any.
+      auto tail = _coalescer->flush();
+      if (!tail.empty()) { return make_batch(std::move(tail)); }
+      return nullptr;
+    }
+
+    auto* range = dynamic_cast<duckdb_native_range_input*>(next->get());
+    if (range == nullptr) {
+      throw std::runtime_error(
+        "[duckdb_native_gpu_ingestible::consume_next_input] unexpected operator_data type from "
+        "split connector; expected duckdb_native_range_input.");
+    }
+    for (auto& rg : range->row_groups) {
+      _coalescer->push(std::move(rg));
+    }
+  }
+}
+
+bool duckdb_native_gpu_ingestible::consumer_drained() const
+{
+  // The scan operator conjoins this with split_connector::is_closed(). Gating on
+  // an empty coalescer ensures a single-split scan (small table, or chunk >=
+  // row-group count) still serves every queued batch, including the tail.
+  return _coalescer == nullptr || _coalescer->empty();
 }
 
 //===----------------------------------------------------------------------===//
