@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "ast_test_builders.hpp"
 #include "catch.hpp"
 #include "expression/ast/function_call.hpp"
 #include "expression/ast/node.hpp"
@@ -30,25 +31,16 @@ using sirius::ast::function_call;
 using sirius::ast::node;
 using sirius::ast::reference;
 using sirius::ast::substitute_references;
-
-namespace {
-
-std::unique_ptr<node> make_reference(uint32_t column_index)
-{
-  return std::make_unique<node>(
-    reference{column_index, sirius::logical_type::make(sirius::type_id::INTEGER)});
-}
-
-}  // namespace
+using sirius::ast::test::make_ref;
 
 TEST_CASE("ast_substitute - remaps a reference through a reordering inner projection",
           "[ast_substitute]")
 {
   std::vector<std::unique_ptr<node>> inner_select_list;
-  inner_select_list.push_back(make_reference(2));
-  inner_select_list.push_back(make_reference(0));
+  inner_select_list.push_back(make_ref(2));
+  inner_select_list.push_back(make_ref(0));
 
-  auto substituted = substitute_references(*make_reference(0), inner_select_list);
+  auto substituted = substitute_references(*make_ref(0), inner_select_list);
 
   REQUIRE(substituted->holds<reference>());
   REQUIRE(substituted->get<reference>().column_index == 2);
@@ -57,11 +49,11 @@ TEST_CASE("ast_substitute - remaps a reference through a reordering inner projec
 TEST_CASE("ast_substitute - substitutes references inside a function call", "[ast_substitute]")
 {
   std::vector<std::unique_ptr<node>> inner_select_list;
-  inner_select_list.push_back(make_reference(4));
+  inner_select_list.push_back(make_ref(4));
 
   std::vector<std::unique_ptr<node>> args;
-  args.push_back(make_reference(0));
-  args.push_back(make_reference(0));
+  args.push_back(make_ref(0));
+  args.push_back(make_ref(0));
   auto outer =
     std::make_unique<node>(function_call{sirius::function_id::add,
                                          std::move(args),
