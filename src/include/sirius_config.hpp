@@ -98,7 +98,7 @@ struct operator_params {
 };
 
 struct telemetry_config {
-  bool enable_quent{false};
+  bool enable_quent{true};
   std::string output_directory{"telemetry_data"};
   std::string engine_name{"siriusDB"};
 };
