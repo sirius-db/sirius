@@ -666,24 +666,47 @@ TEST_CASE("parquet_gpu_ingestible leaves local slices unclaimed when Sirius data
                                           /*row_count=*/2000,
                                           /*row_group_size=*/1000);
 
-  auto table_info = make_table_info(path,
-                                    /*precision=*/10,
-                                    /*scale=*/2,
-                                    /*filters=*/nullptr);
+  auto exercise_local_fallback = [&](std::string scan_path, bool materialize) {
+    auto table_info                 = make_table_info(path,
+                                      /*precision=*/10,
+                                      /*scale=*/2,
+                                      /*filters=*/nullptr);
+    table_info->resolved_file_paths = {std::move(scan_path)};
 
-  sirius::scan_manager::scan_manager_config cfg{};
-  cfg.use_sirius_datasource = false;
-  sirius::scan_manager::sirius_scan_manager mgr(std::move(cfg));
-  sscan::parquet_gpu_ingestible ingestible(std::move(table_info), mgr);
+    sirius::scan_manager::scan_manager_config cfg{};
+    cfg.use_sirius_datasource = false;
+    sirius::scan_manager::sirius_scan_manager mgr(std::move(cfg));
+    sscan::parquet_gpu_ingestible ingestible(std::move(table_info), mgr);
 
-  auto splits = drain_ingestible(ingestible);
-  REQUIRE_FALSE(splits.empty());
-  for (auto const* parquet_info : split_infos(splits)) {
-    REQUIRE_FALSE(parquet_info->rg_slices.empty());
-    for (auto const& slice : parquet_info->rg_slices) {
-      INFO("local slice " << slice.file_path);
-      CHECK(slice.datasource == nullptr);
+    auto splits = drain_ingestible(ingestible);
+    REQUIRE_FALSE(splits.empty());
+
+    auto infos = split_infos(splits);
+    for (auto const* parquet_info : infos) {
+      REQUIRE_FALSE(parquet_info->rg_slices.empty());
+      for (auto const& slice : parquet_info->rg_slices) {
+        INFO("local slice " << slice.file_path);
+        CHECK(slice.datasource == nullptr);
+      }
     }
+
+    if (materialize) {
+      auto mem_mgr    = initialize_memory_manager(/*n_gpus=*/1);
+      auto* gpu_space = sirius::scan_test_utils::get_space(*mem_mgr, cucascade::memory::Tier::GPU);
+      REQUIRE(gpu_space != nullptr);
+      rmm::cuda_stream stream;
+      for (auto const* parquet_info : infos) {
+        auto filtered = ingestible.materialize_table(*parquet_info, *gpu_space, stream.view());
+        REQUIRE(filtered.table != nullptr);
+      }
+    }
+  };
+
+  SECTION("bare local path") { exercise_local_fallback(path.string(), /*materialize=*/false); }
+
+  SECTION("explicit file URI materializes through cudf fallback")
+  {
+    exercise_local_fallback("file://" + path.string(), /*materialize=*/true);
   }
 
   std::filesystem::remove_all(dir);

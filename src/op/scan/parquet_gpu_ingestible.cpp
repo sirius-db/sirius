@@ -75,6 +75,26 @@ struct rg_accumulator {
 
 bool has_uri_scheme(std::string const& p) { return p.find("://") != std::string::npos; }
 
+// Case-insensitively strip a leading "file://" so explicit local URIs behave
+// exactly like bare paths (mirrors the scan_manager's normalize_path): the
+// scheme check must not classify file:// as object-store, and cudf's bundled
+// datasource wants a plain filesystem path.
+std::string strip_file_uri(std::string const& p)
+{
+  static constexpr std::string_view kFile = "file://";
+  if (p.size() > kFile.size()) {
+    bool is_file_uri = true;
+    for (std::size_t i = 0; i < kFile.size(); ++i) {
+      if (std::tolower(static_cast<unsigned char>(p[i])) != static_cast<unsigned char>(kFile[i])) {
+        is_file_uri = false;
+        break;
+      }
+    }
+    if (is_file_uri) { return p.substr(kFile.size()); }
+  }
+  return p;
+}
+
 }  // namespace
 
 //===----------------------------------------------------------------------===//
@@ -202,10 +222,11 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
           std::unique_ptr<cudf::io::datasource> probe_fallback;
           cudf::io::datasource* probe_src = probe_ds.get();
           if (probe_src == nullptr) {
-            if (has_uri_scheme(probe_path)) {
+            auto const probe_local = strip_file_uri(probe_path);
+            if (has_uri_scheme(probe_local)) {
               throw std::runtime_error("no backend supports path: " + probe_path);
             }
-            probe_fallback = cudf::io::datasource::create(probe_path);
+            probe_fallback = cudf::io::datasource::create(probe_local);
             probe_src      = probe_fallback.get();
           }
           std::shared_ptr<cudf::io::parquet::FileMetaData const> probe_meta;
@@ -306,7 +327,10 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
     // into io_context. Fall back to a plain cudf datasource only for local
     // paths no sirius backend claims.
     auto sirius_ds = _scan_manager->create_datasource(file_path);
-    if (!sirius_ds && has_uri_scheme(file_path)) {
+    // file:// counts as local: create_datasource strips it before deciding the
+    // local fallback, so the scheme check here must strip it too.
+    auto const local_file_path = strip_file_uri(file_path);
+    if (!sirius_ds && has_uri_scheme(local_file_path)) {
       throw std::runtime_error("[parquet_gpu_ingestible] no backend supports path: " + file_path);
     }
 
@@ -333,7 +357,7 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
       std::unique_ptr<cudf::io::datasource> footer_fallback;
       cudf::io::datasource* footer_src = sirius_ds.get();
       if (footer_src == nullptr) {
-        footer_fallback = cudf::io::datasource::create(file_path);
+        footer_fallback = cudf::io::datasource::create(local_file_path);
         footer_src      = footer_fallback.get();
       }
       auto footer_buffer = cudf::io::parquet::fetch_footer_to_host(*footer_src);
@@ -521,7 +545,9 @@ io::filtered_table parquet_gpu_ingestible::materialize_table(
     if (slice.datasource) {
       sources.push_back(cudf::io::datasource::create(slice.datasource.get()));
     } else {
-      sources.push_back(cudf::io::datasource::create(slice.file_path));
+      // Unclaimed local slice (use_sirius_datasource=false): cudf's bundled
+      // datasource wants a plain path, so strip an explicit file:// scheme.
+      sources.push_back(cudf::io::datasource::create(strip_file_uri(slice.file_path)));
     }
     metadatas.push_back(*slice.file_metadata);
     rg_per_src.push_back(slice.row_group_indices);
