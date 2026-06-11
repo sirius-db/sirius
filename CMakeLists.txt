@@ -166,9 +166,8 @@ set(EXTENSION_SOURCES
     src/data/host_parquet_representation_converters.cpp
     src/downgrade/downgrade_executor.cpp
     src/expression/aggregate_id.cpp
-    src/expression/ast/clone.cpp
     src/expression/ast/node.cpp
-    src/expression/ast/reference_utils.cpp
+    src/expression/ast/utils.cpp
     src/expression/from_duckdb.cpp
     src/expression/function_id.cpp
     src/expression/join_condition.cpp

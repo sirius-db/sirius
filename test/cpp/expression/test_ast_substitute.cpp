@@ -18,7 +18,7 @@
 #include "expression/ast/function_call.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
-#include "expression/ast/reference_utils.hpp"
+#include "expression/ast/utils.hpp"
 #include "expression/function_id.hpp"
 #include "helper/logical_type.hpp"
 

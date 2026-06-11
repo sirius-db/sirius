@@ -19,7 +19,7 @@
 // recursively duplicate every child unique_ptr into an independent allocation.
 
 #include "catch.hpp"
-#include "expression/ast/clone.hpp"
+#include "expression/ast/utils.hpp"
 
 // sirius — node accessors and per-node struct types
 #include "expression/aggregate_id.hpp"

@@ -16,7 +16,7 @@
 
 #include "planner/sirius_plan_projection_utils.hpp"
 
-#include "expression/ast/reference_utils.hpp"
+#include "expression/ast/utils.hpp"
 #include "op/sirius_physical_projection.hpp"
 
 #include <cstddef>
