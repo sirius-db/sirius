@@ -286,12 +286,6 @@ void mark_row_groups_pruned_by_filter_stats(duckdb_native_walk_plan& plan)
 
 }  // namespace
 
-void finalize_duckdb_native_segment_bytes(std::vector<duckdb_row_group_metadata>& row_groups,
-                                          std::size_t block_size)
-{
-  compute_segment_bytes_size(row_groups, block_size);
-}
-
 bool is_supported_data_compression(duckdb::CompressionType c)
 {
   switch (c) {
@@ -567,6 +561,11 @@ duckdb_native_row_group_range walk_duckdb_native_row_group_range(
       }
     }
   }
+
+  // Per-segment on-disk byte sizes, over this range's segments. A segment whose
+  // DuckDB block extends past the range is sized to the block end: an upper
+  // bound, since decoders self-bound reads via their segment headers.
+  compute_segment_bytes_size(result.row_groups, plan.block_size);
 
   // Per row group, compute the decoded-byte budget and per-column varchar char
   // count. Refuse a varchar column whose char count would overflow cudf's int32

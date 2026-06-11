@@ -175,10 +175,13 @@ duckdb_native_walk_plan prepare_duckdb_native_walk(
 
 /// @brief Walk the projected-column segment metadata for row groups [rg_begin, rg_end)
 /// of `plan`, filling per-row-group
-///  - `decoded_bytes_budget`, and
-///  - `varchar_bytes_per_col`.
-/// Row groups pruned during prepare are skipped. Segment `bytes_size` is filled
-/// later by `finalize_duckdb_native_segment_bytes` after all ranges are collected.
+///  - `decoded_bytes_budget`,
+///  - `varchar_bytes_per_col`, and
+///  - segment `bytes_size`.
+/// Row groups pruned during prepare are skipped. Segment `bytes_size` is a
+/// per-range upper bound: a segment whose DuckDB block extends past this range is
+/// sized to the block end. Decoders self-bound reads via their segment headers,
+/// so the overshoot only inflates H2D/staging bytes.
 struct duckdb_native_row_group_range {
   //===----------ColumnSegmentInfo data----------===//
   std::vector<duckdb_row_group_metadata>
@@ -198,12 +201,5 @@ struct duckdb_native_row_group_range {
 };
 duckdb_native_row_group_range walk_duckdb_native_row_group_range(
   const duckdb_native_walk_plan& plan, std::size_t rg_begin, std::size_t rg_end);
-
-/// Finalize per-segment main-block byte sizes once the complete set of
-/// surviving row groups has been collected. This must see all emitted ranges so
-/// segments at metadata parse chunk boundaries can use the true next segment in
-/// the same DuckDB block instead of falling back to the end of the block.
-void finalize_duckdb_native_segment_bytes(std::vector<duckdb_row_group_metadata>& row_groups,
-                                          std::size_t block_size);
 
 }  // namespace sirius::op::scan

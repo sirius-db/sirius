@@ -162,7 +162,6 @@ walk_result walk_all(duckdb::DataTable& storage,
             plan.pruned_decoded_bytes};
   }
   auto range = walk_duckdb_native_row_group_range(plan, 0, plan.n_row_groups);
-  finalize_duckdb_native_segment_bytes(range.row_groups, plan.block_size);
   return {std::move(range.row_groups),
           range.viable,
           std::move(range.viability_failure_reason),
@@ -688,9 +687,14 @@ TEST_CASE("statistics pruning ignores rowid filters", "[scan][duckdb_native_walk
   REQUIRE(md.pruned_row_groups == 0);
 }
 
-TEST_CASE("walker finalizes segment bytes consistently across parse ranges",
+TEST_CASE("walker per-range segment bytes are a safe over-estimate of the full walk",
           "[scan][duckdb_native_walker][range_bytes]")
 {
+  // The walk sizes each segment's bytes per range, so a segment whose DuckDB
+  // block extends past its range is sized to the block end. Pin the invariant
+  // that makes that safe: per-range bytes_size never under-counts the full-walk
+  // value and never extends past the segment's block, keeping the staged disk
+  // read in bounds. Decoders self-bound reads via their segment headers.
   scoped_temp_db_path tmp;
   auto db_owner = std::make_unique<duckdb::DuckDB>(tmp.path());
   duckdb::Connection con(*db_owner);
@@ -706,10 +710,13 @@ TEST_CASE("walker finalizes segment bytes consistently across parse ranges",
   REQUIRE(plan.viable);
   REQUIRE(plan.n_row_groups >= 2);
 
+  // Full-range walk: every segment sees its in-block neighbor, so bytes_size is
+  // tight.
   auto full = walk_duckdb_native_row_group_range(plan, 0, plan.n_row_groups);
   REQUIRE(full.viable);
-  finalize_duckdb_native_segment_bytes(full.row_groups, plan.block_size);
 
+  // Per-row-group walks: the finest chunking, maximizing the chance a block
+  // straddles a range boundary.
   std::vector<duckdb_row_group_metadata> chunked;
   for (std::size_t rg = 0; rg < plan.n_row_groups; ++rg) {
     auto range = walk_duckdb_native_row_group_range(plan, rg, rg + 1);
@@ -718,7 +725,6 @@ TEST_CASE("walker finalizes segment bytes consistently across parse ranges",
       chunked.push_back(std::move(rg_md));
     }
   }
-  finalize_duckdb_native_segment_bytes(chunked, plan.block_size);
 
   std::sort(full.row_groups.begin(), full.row_groups.end(), [](auto const& a, auto const& b) {
     return a.row_group_index < b.row_group_index;
@@ -739,13 +745,17 @@ TEST_CASE("walker finalizes segment bytes consistently across parse ranges",
       for (std::size_t si = 0; si < full_col.data_segments.size(); ++si) {
         auto const& a = full_col.data_segments[si];
         auto const& b = chunked_col.data_segments[si];
+        // Same underlying segments: only the derived byte size may differ.
         REQUIRE(b.block_id == a.block_id);
         REQUIRE(b.block_offset == a.block_offset);
         REQUIRE(b.segment_start == a.segment_start);
-        REQUIRE(b.bytes_size == a.bytes_size);
         if (b.block_id >= 0) {
           saw_disk_segment = true;
           REQUIRE(b.bytes_size > 0);
+          // Never an under-estimate ...
+          REQUIRE(b.bytes_size >= a.bytes_size);
+          // ... and never reads past the end of the segment's block.
+          REQUIRE(static_cast<std::size_t>(b.block_offset) + b.bytes_size <= plan.block_size);
         }
       }
     }
