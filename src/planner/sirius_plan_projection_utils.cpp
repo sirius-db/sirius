@@ -29,6 +29,18 @@ namespace {
 
 using projection = sirius::op::sirius_physical_projection;
 
+// True when the select list is exactly [#0, #1, ..., #n-1] with no reordering.
+bool is_identity_ast_projection(
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> const& select_list)
+{
+  for (std::size_t i = 0; i < select_list.size(); i++) {
+    auto const& expr = select_list[i];
+    if (!expr || !expr->holds<sirius::ast::reference>()) { return false; }
+    if (expr->get<sirius::ast::reference>().column_index != i) { return false; }
+  }
+  return true;
+}
+
 // A select-list entry is "fully supported" only if every slot is non-null.
 // A null slot is the from_duckdb fallback signal for an unsupported expression;
 // folding through it would silently hide the CPU-fallback trigger.
@@ -47,6 +59,36 @@ bool select_list_is_fully_supported(
 bool is_trivial_node(sirius::ast::node const& n)
 {
   return n.holds<sirius::ast::reference>() || n.holds<sirius::ast::constant>();
+}
+
+// Returns true when outer (parent) and inner (child) projections may be folded into one.
+// Outer references index inner's output columns; inner must be a single-child link so
+// fold_once can splice it out of the chain. Refuses null select-list slots (unsupported
+// expressions) and non-trivial inner expressions referenced more than once in the outer
+// list (substitution would re-execute GPU work at each reference site).
+bool can_combine_projections(projection const& outer, projection const& inner)
+{
+  if (inner.children.size() != 1) { return false; }
+  if (!select_list_is_fully_supported(outer.select_list) ||
+      !select_list_is_fully_supported(inner.select_list)) {
+    return false;
+  }
+
+  // Safety guard against expression-duplication blowup: substitution clones each
+  // inner expression into every outer reference site. Count how often the outer
+  // list references each inner column; folding is only safe when every inner
+  // column referenced more than once holds a trivial (free-to-duplicate)
+  // expression. Otherwise non-trivial GPU work would be re-executed per use.
+  std::vector<std::size_t> use_count(inner.select_list.size(), 0);
+  for (auto const& outer_expr : outer.select_list) {
+    sirius::ast::visit_references(*outer_expr, [&](sirius::ast::reference const& ref) {
+      if (ref.column_index < use_count.size()) { use_count[ref.column_index]++; }
+    });
+  }
+  for (std::size_t i = 0; i < inner.select_list.size(); i++) {
+    if (use_count[i] > 1 && !is_trivial_node(*inner.select_list[i])) { return false; }
+  }
+  return true;
 }
 
 // Compose an outer select list over an inner one: each outer reference #i is
@@ -105,52 +147,6 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> fold_projection_with_ch
 }
 
 }  // namespace
-
-// True when the select list is exactly [#0, #1, ..., #n-1] with no reordering.
-bool is_identity_ast_projection(
-  duckdb::vector<std::unique_ptr<sirius::ast::node>> const& select_list)
-{
-  for (std::size_t i = 0; i < select_list.size(); i++) {
-    auto const& expr = select_list[i];
-    if (!expr || !expr->holds<sirius::ast::reference>()) { return false; }
-    if (expr->get<sirius::ast::reference>().column_index != i) { return false; }
-  }
-  return true;
-}
-
-bool can_combine_projections(sirius::op::sirius_physical_projection const& outer,
-                             sirius::op::sirius_physical_projection const& inner)
-{
-  // fold_once splices inner out of the chain; inner must be a single-child link.
-  if (inner.children.size() != 1) { return false; }
-  if (!select_list_is_fully_supported(outer.select_list) ||
-      !select_list_is_fully_supported(inner.select_list)) {
-    return false;
-  }
-
-  // Safety guard against expression-duplication blowup: substitution clones each
-  // inner expression into every outer reference site. Count how often the outer
-  // list references each inner column; folding is only safe when every inner
-  // column referenced more than once holds a trivial (free-to-duplicate)
-  // expression. Otherwise non-trivial GPU work would be re-executed per use.
-  std::vector<std::size_t> use_count(inner.select_list.size(), 0);
-  for (auto const& outer_expr : outer.select_list) {
-    sirius::ast::visit_references(*outer_expr, [&](sirius::ast::reference const& ref) {
-      if (ref.column_index < use_count.size()) { use_count[ref.column_index]++; }
-    });
-  }
-  for (std::size_t i = 0; i < inner.select_list.size(); i++) {
-    if (use_count[i] > 1 && !is_trivial_node(*inner.select_list[i])) { return false; }
-  }
-  return true;
-}
-
-duckdb::unique_ptr<sirius::op::sirius_physical_operator> combine_projections(
-  sirius::op::sirius_physical_projection const& outer,
-  duckdb::unique_ptr<sirius::op::sirius_physical_projection> inner)
-{
-  return fold_once(outer, *inner);
-}
 
 // Plan-builder entry: wrap @p child in a projection, skipping creation when the
 // select list is identity, then fold with an adjacent child projection if safe.
