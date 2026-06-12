@@ -260,7 +260,7 @@ TEST_CASE("describe_parquet parses local parquet footer metadata through the ioc
 }
 
 TEST_CASE("describe_parquet metadata-only insert round-trips local parquet footer through cache",
-          "[.][scan_manager][describe_parquet][s3][cache]")
+          "[scan_manager][describe_parquet][s3][cache]")
 {
   host_cache_memory cache_memory;
 
@@ -271,13 +271,12 @@ TEST_CASE("describe_parquet metadata-only insert round-trips local parquet foote
   cfg.prefetch_inflight_budget_chunks = 8;
   sirius_scan_manager manager(std::move(cfg), &cache_memory.host_mr);
 
-  auto const uri  = "file://" + parquet_fixture("orders.parquet").string();
-  auto bind_info  = manager.describe_parquet(uri);
-  auto* local_ctx = resolve_io_ctx(manager, uri);
-  REQUIRE(local_ctx != nullptr);
-  REQUIRE(local_ctx->cache() != nullptr);
-  auto io_object = local_ctx->create_io_object(uri);
-  auto metadata  = local_ctx->cache()->get_metadata(*io_object);
+  auto const uri = "file://" + parquet_fixture("orders.parquet").string();
+  auto bind_info = manager.describe_parquet(uri);
+  auto ds        = manager.create_datasource(uri);
+  REQUIRE(ds != nullptr);
+  REQUIRE(ds->io_ctx()->cache() != nullptr);
+  auto metadata = ds->io_ctx()->cache()->get_metadata(*ds->io_object());
 
   REQUIRE(metadata != nullptr);
   auto parquet = std::dynamic_pointer_cast<parquet_metadata>(metadata);
@@ -300,6 +299,42 @@ TEST_CASE("describe_parquet surfaces S3 missing-object errors cleanly",
   auto const uri = s3_uri(env->bucket, "parquet/definitely-missing-pr6-object.parquet");
 
   REQUIRE_THROWS_WITH(manager.describe_parquet(uri), Catch::Contains("404"));
+}
+
+TEST_CASE("scan_manager create_datasource selects async or blocking S3 backend",
+          "[.][s3][integration][scan_manager][datasource-routing]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  auto const uri = s3_uri(env->bucket, "parquet/nation.parquet");
+
+  auto make_config = [&](bool use_async_backend) {
+    auto cfg                       = make_s3_scan_manager_config(*env, /*enable_cache=*/false);
+    cfg.s3_use_async_backend       = use_async_backend;
+    cfg.s3_thread_pool.num_threads = 2;
+    return cfg;
+  };
+
+  SECTION("async")
+  {
+    auto cfg = make_config(true);
+    sirius_scan_manager manager(std::move(cfg));
+    auto ds = manager.create_datasource(uri);
+    REQUIRE(ds != nullptr);
+    CHECK(dynamic_cast<s3_ioctx*>(ds->io_ctx().get()) != nullptr);
+    CHECK(dynamic_cast<s3_blocking_ioctx*>(ds->io_ctx().get()) == nullptr);
+  }
+
+  SECTION("blocking")
+  {
+    auto cfg = make_config(false);
+    sirius_scan_manager manager(std::move(cfg));
+    auto ds = manager.create_datasource(uri);
+    REQUIRE(ds != nullptr);
+    CHECK(dynamic_cast<s3_blocking_ioctx*>(ds->io_ctx().get()) != nullptr);
+    CHECK(dynamic_cast<s3_ioctx*>(ds->io_ctx().get()) == nullptr);
+  }
 }
 
 TEST_CASE("describe_parquet fetches only the footer over S3",

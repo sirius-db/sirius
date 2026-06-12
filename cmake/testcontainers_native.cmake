@@ -41,9 +41,10 @@ set(TCN_BRIDGE_HEADER "${TCN_OUT}/testcontainers-bridge.h")
 
 # Keep the Go module/build caches inside the build tree (no $HOME pollution).
 # -mod=readonly: download into the cache but never mutate the fetched
-# go.mod/sum.
+# go.mod/sum. -modcacherw: write the module cache user-writable — Go's default
+# read-only cache makes `rm -rf build` (make clean) fail on the .gopath files.
 set(TCN_GO_ENV "GOPATH=${TCN_OUT}/.gopath" "GOCACHE=${TCN_OUT}/.gocache"
-               "GOFLAGS=-mod=readonly" "CGO_ENABLED=1")
+               "GOFLAGS=-mod=readonly -modcacherw" "CGO_ENABLED=1")
 
 add_custom_command(
   OUTPUT "${TCN_BRIDGE_ARCHIVE}" "${TCN_BRIDGE_HEADER}"

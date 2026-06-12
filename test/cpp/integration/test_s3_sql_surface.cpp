@@ -1248,6 +1248,45 @@ TEST_CASE("gpu_execution S3 SQL results match with the async backend flag",
   CHECK(async.second > 0);
 }
 
+TEST_CASE("gpu_execution S3 nested parquet probe returns oracle rows or a clear unsupported error",
+          "[.][s3][integration][sql][gpu_execution][nested]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  auto nested_key        = env_or("SIRIUS_TEST_S3_NESTED_KEY");
+  auto nested_local_path = fs::path{env_or("SIRIUS_TEST_S3_NESTED_LOCAL_PARQUET")};
+  if (nested_key.empty() || nested_local_path.empty() || !fs::exists(nested_local_path)) {
+    SUCCEED(
+      "Nested parquet fixture not configured; set SIRIUS_TEST_S3_NESTED_KEY and "
+      "SIRIUS_TEST_S3_NESTED_LOCAL_PARQUET to run the S14 probe");
+    return;
+  }
+
+  duckdb::DuckDB baseline_db(nullptr);
+  duckdb::Connection baseline_con(baseline_db);
+  auto baseline_result = require_query_ok(
+    baseline_con, "SELECT * FROM read_parquet(" + sql_quote(nested_local_path.string()) + ")");
+
+  s3_sql_fixture fixture(*env);
+  auto const uri = s3_uri(env->bucket, nested_key);
+  auto result =
+    fixture.con.Query(gpu_execution_sql("SELECT * FROM read_parquet(" + sql_quote(uri) + ")"));
+  REQUIRE(result);
+  if (result->HasError()) {
+    auto const error = result->GetError();
+    INFO(error);
+    CHECK((error.find("unsupported") != std::string::npos ||
+           error.find("Unsupported") != std::string::npos ||
+           error.find("nested") != std::string::npos || error.find("Nested") != std::string::npos));
+    return;
+  }
+
+  auto materialized = std::unique_ptr<duckdb::MaterializedQueryResult>(
+    static_cast<duckdb::MaterializedQueryResult*>(result.release()));
+  check_rows_equal_with_tolerant_columns(*materialized, *baseline_result, {});
+}
+
 TEST_CASE("gpu_execution reads real AWS S3 parquet through Sirius SigV4",
           "[.][s3][aws][live][sql][gpu_execution]")
 {

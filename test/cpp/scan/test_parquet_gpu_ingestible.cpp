@@ -28,6 +28,9 @@
 //     batch).
 
 #include "catch.hpp"
+#include "io/prefetching_cache.hpp"
+#include "io/s3/s3_ioctx.hpp"
+#include "io/s3/sirius_sigv4_authorizer.hpp"
 #include "test_helpers_ioctx.hpp"
 #include "test_utils.hpp"
 
@@ -38,6 +41,10 @@
 #include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
 
+#include <cuda_runtime.h>
+
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 #include <duckdb.hpp>
 #include <duckdb/common/types.hpp>
 #include <duckdb/planner/expression.hpp>
@@ -51,21 +58,127 @@
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 
+#include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <memory>
+#include <numeric>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
 namespace {
 
 namespace sscan = sirius::op::scan;
+using namespace std::chrono_literals;
+
+constexpr std::uint32_t cache_max_slabs = 3;
+constexpr std::size_t cache_block_size  = 4096;
+
+std::string env_or(std::string_view name, std::string fallback = {})
+{
+  auto const* value = std::getenv(std::string{name}.c_str());
+  return value ? std::string{value} : std::move(fallback);
+}
+
+bool truthy_env(std::string_view name)
+{
+  auto value = env_or(name);
+  return value == "1" || value == "true" || value == "TRUE" || value == "yes" || value == "YES";
+}
+
+struct s3_test_env {
+  std::string endpoint;
+  std::string region;
+  std::string access_key;
+  std::string secret_key;
+  std::string bucket;
+};
+
+std::optional<s3_test_env> read_s3_test_env()
+{
+  auto endpoint   = env_or("SIRIUS_TEST_S3_ENDPOINT");
+  auto access_key = env_or("SIRIUS_TEST_S3_ACCESS_KEY");
+  auto secret_key = env_or("SIRIUS_TEST_S3_SECRET_KEY");
+  auto bucket     = env_or("SIRIUS_TEST_S3_BUCKET");
+
+  if (endpoint.empty() || access_key.empty() || secret_key.empty() || bucket.empty()) {
+    return std::nullopt;
+  }
+
+  return s3_test_env{std::move(endpoint),
+                     env_or("SIRIUS_TEST_S3_REGION", "us-east-1"),
+                     std::move(access_key),
+                     std::move(secret_key),
+                     std::move(bucket)};
+}
+
+bool skip_if_no_s3_env(std::optional<s3_test_env> const& env)
+{
+  if (env) { return false; }
+  if (truthy_env("SIRIUS_TEST_S3_STRICT")) {
+    FAIL("SIRIUS_TEST_S3_* environment is required in strict mode");
+  }
+  SUCCEED("SIRIUS_TEST_S3_* not set; skipping live S3 parquet_gpu_ingestible test");
+  return true;
+}
+
+std::string s3_uri(std::string_view bucket, std::string_view key)
+{
+  return "s3://" + std::string{bucket} + "/" + std::string{key};
+}
+
+std::size_t cache_capacity_bytes(std::size_t block_size, std::uint32_t max_slabs)
+{
+  return block_size * static_cast<std::size_t>(sirius::io::buffer_pool::CHUNKS_PER_SLAB) *
+         static_cast<std::size_t>(max_slabs);
+}
+
+struct host_cache_memory {
+  host_cache_memory()
+    : upstream(0, true),
+      host_mr(0,
+              upstream,
+              cache_capacity_bytes(cache_block_size, cache_max_slabs),
+              cache_capacity_bytes(cache_block_size, cache_max_slabs),
+              cache_block_size,
+              static_cast<std::size_t>(sirius::io::buffer_pool::CHUNKS_PER_SLAB),
+              1)
+  {
+  }
+
+  cucascade::memory::numa_region_pinned_host_memory_resource upstream;
+  cucascade::memory::fixed_size_host_memory_resource host_mr;
+};
+
+sirius::io::s3::s3_ioctx_config make_s3_config(s3_test_env const& env)
+{
+  sirius::io::s3::static_credentials creds;
+  creds.access_key_id     = env.access_key;
+  creds.secret_access_key = env.secret_key;
+
+  sirius::io::s3::s3_ioctx_config cfg{};
+  cfg.creds = std::make_shared<sirius::io::s3::sirius_sigv4_presigned_authorizer>(
+    std::move(creds), env.region, env.endpoint, 30min);
+  cfg.max_connections    = 4;
+  cfg.request_timeout_s  = 20;
+  cfg.max_retry_attempts = 3;
+  cfg.retry_backoff_base = 10ms;
+  cfg.retry_jitter       = 0ms;
+  cfg.honor_retry_after  = false;
+  return cfg;
+}
 
 // Drain an ingestible synchronously (no scheduler), collecting every
 // emitted operator_data. The base split_provider::run loop is trivially
@@ -178,10 +291,10 @@ class routing_test_io_object final : public sirius::io::sirius_io_object {
   std::size_t _size;
 };
 
-// Spy ioctx — counts make_datasource() calls and returns a cudf datasource
-// backed by a real local parquet file. Every other override reports an
-// error so the test fails loudly if materialize_table takes an unexpected
-// read route through the spy.
+// Spy ioctx — counts datasource/read calls and returns a cudf datasource whose
+// public path looks like s3:// while its bytes come from a real local parquet
+// file. This lets the routing guard materialize through the Sirius datasource
+// without depending on MinIO.
 class routing_spy_ioctx final : public sirius::io::sirius_ioctx {
  public:
   explicit routing_spy_ioctx(std::filesystem::path local_parquet_path)
@@ -211,53 +324,86 @@ class routing_spy_ioctx final : public sirius::io::sirius_ioctx {
   }
 
   std::size_t host_read_io(sirius::io::sirius_io_object&,
-                           std::size_t,
-                           std::size_t,
-                           std::uint8_t*) override
+                           std::size_t offset,
+                           std::size_t size,
+                           std::uint8_t* dst) override
   {
-    throw std::logic_error("routing_spy_ioctx: host_read_io should not be used");
+    ++host_read_calls;
+    return read_from_local(offset, size, dst);
   }
 
-  void host_read_async_io(sirius::io::sirius_io_object&,
-                          std::size_t,
-                          std::size_t,
-                          std::uint8_t*,
+  void host_read_async_io(sirius::io::sirius_io_object& obj,
+                          std::size_t offset,
+                          std::size_t size,
+                          std::uint8_t* dst,
                           sirius::io::io_completion_handler handler) override
   {
-    handler(0,
-            std::make_exception_ptr(
-              std::logic_error("routing_spy_ioctx: host_read_async_io should not be used")));
+    try {
+      handler(host_read_io(obj, offset, size, dst), nullptr);
+    } catch (...) {
+      handler(0, std::current_exception());
+    }
   }
 
   std::size_t device_read_io(sirius::io::sirius_io_object&,
-                             std::size_t,
-                             std::size_t,
-                             std::uint8_t*,
-                             rmm::cuda_stream_view) override
+                             std::size_t offset,
+                             std::size_t size,
+                             std::uint8_t* dst,
+                             rmm::cuda_stream_view stream) override
   {
-    throw std::logic_error("routing_spy_ioctx: device_read_io should not be used");
+    ++device_read_calls;
+    std::vector<std::uint8_t> host(size);
+    auto const got = read_from_local(offset, size, host.data());
+    auto rc        = cudaMemcpyAsync(dst, host.data(), got, cudaMemcpyHostToDevice, stream.value());
+    if (rc != cudaSuccess) {
+      throw std::runtime_error(std::string{"routing_spy_ioctx: cudaMemcpyAsync failed: "} +
+                               cudaGetErrorString(rc));
+    }
+    rc = cudaStreamSynchronize(stream.value());
+    if (rc != cudaSuccess) {
+      throw std::runtime_error(std::string{"routing_spy_ioctx: cudaStreamSynchronize failed: "} +
+                               cudaGetErrorString(rc));
+    }
+    return got;
   }
 
-  void device_read_async_io(sirius::io::sirius_io_object&,
-                            std::size_t,
-                            std::size_t,
-                            std::uint8_t*,
-                            rmm::cuda_stream_view,
+  void device_read_async_io(sirius::io::sirius_io_object& obj,
+                            std::size_t offset,
+                            std::size_t size,
+                            std::uint8_t* dst,
+                            rmm::cuda_stream_view stream,
                             sirius::io::io_completion_handler handler) override
   {
-    handler(0,
-            std::make_exception_ptr(
-              std::logic_error("routing_spy_ioctx: device_read_async_io should not be used")));
+    try {
+      handler(device_read_io(obj, offset, size, dst, stream), nullptr);
+    } catch (...) {
+      handler(0, std::current_exception());
+    }
   }
 
   void host_read_ranges_async_io(sirius::io::sirius_io_object&,
-                                 std::vector<cudf::io::text::byte_range_info> const&,
-                                 std::span<cudf::host_span<std::byte>>,
+                                 std::vector<cudf::io::text::byte_range_info> const& ranges,
+                                 std::span<cudf::host_span<std::byte>> dst,
                                  sirius::io::io_completion_handler handler) override
   {
-    handler(0,
-            std::make_exception_ptr(
-              std::logic_error("routing_spy_ioctx: host_read_ranges_async_io should not be used")));
+    try {
+      if (ranges.size() != dst.size()) {
+        throw std::invalid_argument("routing_spy_ioctx: ranges/dst size mismatch");
+      }
+      ++range_read_calls;
+      std::size_t total = 0;
+      for (std::size_t i = 0; i < ranges.size(); ++i) {
+        auto const offset = static_cast<std::size_t>(ranges[i].offset());
+        auto const size   = static_cast<std::size_t>(ranges[i].size());
+        if (dst[i].size() < size) {
+          throw std::runtime_error("routing_spy_ioctx: dst span too small");
+        }
+        total += read_from_local(offset, size, reinterpret_cast<std::uint8_t*>(dst[i].data()));
+      }
+      handler(total, nullptr);
+    } catch (...) {
+      handler(0, std::current_exception());
+    }
   }
 
   cudf::io::text::byte_range_info compute_physical_range(cudf::io::text::byte_range_info logical,
@@ -267,8 +413,28 @@ class routing_spy_ioctx final : public sirius::io::sirius_ioctx {
   }
 
   int make_datasource_calls{0};
+  int host_read_calls{0};
+  int device_read_calls{0};
+  int range_read_calls{0};
 
  private:
+  std::size_t read_from_local(std::size_t offset, std::size_t size, std::uint8_t* dst) const
+  {
+    auto const file_size = std::filesystem::file_size(_local_parquet_path);
+    if (offset >= file_size) { return 0; }
+    auto const clipped = std::min(size, file_size - offset);
+    std::ifstream in(_local_parquet_path, std::ios::binary);
+    if (!in) {
+      throw std::runtime_error("routing_spy_ioctx: failed to open local backing parquet");
+    }
+    in.seekg(static_cast<std::streamoff>(offset));
+    in.read(reinterpret_cast<char*>(dst), static_cast<std::streamsize>(clipped));
+    if (in.gcount() != static_cast<std::streamsize>(clipped)) {
+      throw std::runtime_error("routing_spy_ioctx: short read from local backing parquet");
+    }
+    return clipped;
+  }
+
   std::filesystem::path _local_parquet_path;
 };
 
@@ -312,6 +478,61 @@ std::unique_ptr<sscan::parquet_split_info> make_routing_split_info(
                                      real_slice.reserved_compressed_bytes,
                                      std::move(ds));
   return fake_pinfo;
+}
+
+std::vector<sscan::parquet_split_info const*> split_infos(
+  std::vector<std::unique_ptr<sirius::op::operator_data>> const& splits)
+{
+  std::vector<sscan::parquet_split_info const*> out;
+  out.reserve(splits.size());
+  for (auto const& split : splits) {
+    auto* input = dynamic_cast<sscan::scan_operator_input*>(split.get());
+    REQUIRE(input != nullptr);
+    REQUIRE(input->metadata != nullptr);
+    auto const* parquet_info =
+      dynamic_cast<sscan::parquet_split_info const*>(&input->metadata->scan());
+    REQUIRE(parquet_info != nullptr);
+    out.push_back(parquet_info);
+  }
+  return out;
+}
+
+std::vector<cudf::io::text::byte_range_info> column_chunk_ranges(
+  sscan::parquet_split_info const& info)
+{
+  REQUIRE_FALSE(info.rg_slices.empty());
+  auto const& slice = info.rg_slices.front();
+  REQUIRE(slice.file_metadata != nullptr);
+  REQUIRE(info.reader_options != nullptr);
+  sscan::hybrid_scan_reader reader(*slice.file_metadata, *info.reader_options);
+  auto rg_span = cudf::host_span<cudf::size_type const>(slice.row_group_indices.data(),
+                                                        slice.row_group_indices.size());
+  auto ranges  = reader.all_column_chunks_byte_ranges(rg_span, *info.reader_options);
+  REQUIRE_FALSE(ranges.empty());
+  return ranges;
+}
+
+bool wait_for_cached_range(sirius::io::prefetching_cache& cache,
+                           sirius::io::sirius_io_object const& obj,
+                           cudf::io::text::byte_range_info const& range,
+                           std::chrono::milliseconds timeout)
+{
+  // Give the worker a chance to claim queued prefetch entries before the first
+  // read; reading a still-queued entry is a legitimate miss and can consume the
+  // entry's request budget.
+  std::this_thread::sleep_for(250ms);
+  auto const deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (auto view = cache.read(obj,
+                               static_cast<std::size_t>(range.offset()),
+                               static_cast<std::size_t>(range.size()),
+                               nullptr);
+        view) {
+      return true;
+    }
+    std::this_thread::sleep_for(50ms);
+  }
+  return false;
 }
 
 }  // namespace
@@ -431,8 +652,183 @@ TEST_CASE("parquet_gpu_ingestible - no-filter scan emits a single scan_operator_
   std::filesystem::remove_all(dir);
 }
 
+TEST_CASE("parquet_gpu_ingestible leaves local slices unclaimed when Sirius datasource is disabled",
+          "[scan][parquet_gpu_ingestible][datasource-routing]")
+{
+  // PR913 keeps the local uring backend constructed by scan_manager, but
+  // use_sirius_datasource=false still means local parquet files are not claimed
+  // by Sirius and materialize_table will fall back to cudf/kvikio.
+  auto const dir  = std::filesystem::temp_directory_path() / "pgi_local_fallback_test";
+  auto const path = write_decimal_parquet(dir,
+                                          "local_fallback",
+                                          /*precision=*/10,
+                                          /*scale=*/2,
+                                          /*row_count=*/2000,
+                                          /*row_group_size=*/1000);
+
+  auto exercise_local_fallback = [&](std::string scan_path, bool materialize) {
+    auto table_info                 = make_table_info(path,
+                                      /*precision=*/10,
+                                      /*scale=*/2,
+                                      /*filters=*/nullptr);
+    table_info->resolved_file_paths = {std::move(scan_path)};
+
+    sirius::scan_manager::scan_manager_config cfg{};
+    cfg.use_sirius_datasource = false;
+    sirius::scan_manager::sirius_scan_manager mgr(std::move(cfg));
+    sscan::parquet_gpu_ingestible ingestible(std::move(table_info), mgr);
+
+    auto splits = drain_ingestible(ingestible);
+    REQUIRE_FALSE(splits.empty());
+
+    auto infos = split_infos(splits);
+    for (auto const* parquet_info : infos) {
+      REQUIRE_FALSE(parquet_info->rg_slices.empty());
+      for (auto const& slice : parquet_info->rg_slices) {
+        INFO("local slice " << slice.file_path);
+        CHECK(slice.datasource == nullptr);
+      }
+    }
+
+    if (materialize) {
+      auto mem_mgr    = initialize_memory_manager(/*n_gpus=*/1);
+      auto* gpu_space = sirius::scan_test_utils::get_space(*mem_mgr, cucascade::memory::Tier::GPU);
+      REQUIRE(gpu_space != nullptr);
+      rmm::cuda_stream stream;
+      for (auto const* parquet_info : infos) {
+        auto filtered = ingestible.materialize_table(*parquet_info, *gpu_space, stream.view());
+        REQUIRE(filtered.table != nullptr);
+      }
+    }
+  };
+
+  SECTION("bare local path") { exercise_local_fallback(path.string(), /*materialize=*/false); }
+
+  SECTION("explicit file URI materializes through cudf fallback")
+  {
+    exercise_local_fallback("file://" + path.string(), /*materialize=*/true);
+  }
+
+  std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("parquet_gpu_ingestible keeps S3 slices claimed when local Sirius datasource is disabled",
+          "[.][s3][integration][scan][parquet_gpu_ingestible][datasource-routing]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  auto table_info                 = make_table_info(std::filesystem::path{},
+                                    /*precision=*/10,
+                                    /*scale=*/2,
+                                    /*filters=*/nullptr);
+  table_info->resolved_file_paths = {s3_uri(env->bucket, "parquet/nation.parquet")};
+
+  sirius::scan_manager::scan_manager_config cfg{};
+  cfg.use_sirius_datasource      = false;
+  cfg.s3_config                  = make_s3_config(*env);
+  cfg.s3_use_async_backend       = true;
+  cfg.uring_n_reactors           = 1;
+  cfg.s3_thread_pool.num_threads = 2;
+  sirius::scan_manager::sirius_scan_manager mgr(std::move(cfg));
+  sscan::parquet_gpu_ingestible ingestible(std::move(table_info), mgr);
+
+  auto splits = drain_ingestible(ingestible);
+  REQUIRE_FALSE(splits.empty());
+  for (auto const* parquet_info : split_infos(splits)) {
+    REQUIRE_FALSE(parquet_info->rg_slices.empty());
+    for (auto const& slice : parquet_info->rg_slices) {
+      INFO("S3 slice " << slice.file_path);
+      REQUIRE(slice.datasource != nullptr);
+      auto sirius_ds = std::dynamic_pointer_cast<sirius::io::sirius_datasource>(slice.datasource);
+      REQUIRE(sirius_ds != nullptr);
+      auto* s3_backend = dynamic_cast<sirius::io::s3::s3_ioctx*>(sirius_ds->io_ctx().get());
+      CHECK(s3_backend != nullptr);
+    }
+  }
+}
+
+TEST_CASE("parquet_gpu_ingestible scan-side prewarm inserts column chunk ranges only when enabled",
+          "[scan][parquet_gpu_ingestible][prefetch]")
+{
+  auto const dir  = std::filesystem::temp_directory_path() / "pgi_chunk_prewarm_test";
+  auto const path = write_decimal_parquet(dir,
+                                          "chunk_prewarm",
+                                          /*precision=*/10,
+                                          /*scale=*/2,
+                                          /*row_count=*/2000,
+                                          /*row_group_size=*/1000);
+
+  auto run = [&](bool enable_chunk_prewarm) {
+    host_cache_memory memory;
+    sirius::scan_manager::scan_manager_config cfg{};
+    cfg.use_sirius_datasource           = true;
+    cfg.enable_prefetch_cache           = true;
+    cfg.enable_chunk_prewarm            = enable_chunk_prewarm;
+    cfg.prefetch_buffer_pool_bytes      = cache_capacity_bytes(cache_block_size, cache_max_slabs);
+    cfg.prefetch_inflight_budget_chunks = 8;
+    cfg.uring_n_reactors                = 1;
+    sirius::scan_manager::sirius_scan_manager mgr(std::move(cfg), &memory.host_mr);
+
+    auto table_info = make_table_info(path,
+                                      /*precision=*/10,
+                                      /*scale=*/2,
+                                      /*filters=*/nullptr);
+    sscan::parquet_gpu_ingestible ingestible(std::move(table_info), mgr);
+
+    auto splits = drain_ingestible(ingestible);
+    REQUIRE_FALSE(splits.empty());
+    auto infos = split_infos(splits);
+    REQUIRE_FALSE(infos.empty());
+
+    auto ranges = column_chunk_ranges(*infos.front());
+    REQUIRE_FALSE(ranges.empty());
+    auto const& first_range = ranges.front();
+
+    auto ds = mgr.create_datasource(path.string());
+    REQUIRE(ds != nullptr);
+    auto ctx = ds->io_ctx();
+    REQUIRE(ctx != nullptr);
+    REQUIRE(ctx->cache() != nullptr);
+
+    auto* cache               = ctx->cache();
+    auto const hits_before    = cache->hit_count_total();
+    auto const range_before   = cache->range_miss_count_total();
+    auto const partial_before = cache->partial_miss_count_total();
+
+    auto const hit = wait_for_cached_range(*cache, *ds->io_object(), first_range, 5s);
+
+    return std::tuple{hit,
+                      cache->hit_count_total() - hits_before,
+                      cache->range_miss_count_total() - range_before,
+                      cache->partial_miss_count_total() - partial_before};
+  };
+
+  SECTION("prewarm enabled")
+  {
+    auto const [hit, hit_delta, range_miss_delta, partial_miss_delta] =
+      run(/*enable_chunk_prewarm=*/true);
+    CHECK(hit);
+    CHECK(hit_delta > 0);
+    CHECK(range_miss_delta == 0);
+    INFO("partial misses while waiting for prewarm: " << partial_miss_delta);
+  }
+
+  SECTION("prewarm disabled")
+  {
+    auto const [hit, hit_delta, range_miss_delta, partial_miss_delta] =
+      run(/*enable_chunk_prewarm=*/false);
+    CHECK_FALSE(hit);
+    CHECK(hit_delta == 0);
+    INFO("range misses with prewarm disabled: " << range_miss_delta);
+    INFO("partial misses with prewarm disabled: " << partial_miss_delta);
+  }
+
+  std::filesystem::remove_all(dir);
+}
+
 TEST_CASE("parquet_gpu_ingestible - s3 slice with non-null io_ctx routes through spy",
-          "[.][scan][parquet_gpu_ingestible][s3][datasource-routing]")
+          "[scan][parquet_gpu_ingestible][s3][datasource-routing]")
 {
   // Guard for sirius-db/sirius#889: when the scan_manager has no ioctx,
   // the materialize path must still honor slice.io_ctx and route
@@ -466,12 +862,13 @@ TEST_CASE("parquet_gpu_ingestible - s3 slice with non-null io_ctx routes through
 
   CHECK(spy->make_datasource_calls == 1);
   REQUIRE(filtered.table != nullptr);
+  CHECK((spy->host_read_calls + spy->device_read_calls + spy->range_read_calls) > 0);
 
   std::filesystem::remove_all(dir);
 }
 
 TEST_CASE("parquet_gpu_ingestible - local slice with null io_ctx falls through to kvikio",
-          "[.][scan][parquet_gpu_ingestible][datasource-routing]")
+          "[scan][parquet_gpu_ingestible][datasource-routing]")
 {
   // Complement of the s3 routing guard above: a slice with io_ctx == nullptr
   // must continue to use cudf's bundled datasource (kvikio) — the local
