@@ -113,6 +113,12 @@ set(CUCASCADE_WARNINGS_AS_ERRORS
     CACHE BOOL "" FORCE)
 add_subdirectory(cucascade "${CMAKE_BINARY_DIR}/cucascade" EXCLUDE_FROM_ALL)
 
+# Simpatico GPU compression engine (Phase 1 integration) Tests disabled here —
+# run them via the standalone simpatico_codegen build. Benchmark harness
+# (compress_with_plan_benchmark) is built by default.
+add_subdirectory(src/compression/simpatico_codegen
+                 "${CMAKE_BINARY_DIR}/simpatico_codegen" EXCLUDE_FROM_ALL)
+
 if(VCPKG_BUILD AND TARGET CUDA::cudart_static)
   function(sirius_prefer_static_cudart target_name)
     foreach(_prop LINK_LIBRARIES INTERFACE_LINK_LIBRARIES)

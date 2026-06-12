@@ -1,0 +1,100 @@
+/**
+ * Dictionary compressor: STRING column -> dictionary column (encode); decompress via decode.
+ * Stores the encoded dictionary column to avoid copying keys chars from cuDF (invalid pointers).
+ */
+
+#include "codegen/plan/representation.hpp"
+
+#include <cudf/column/column.hpp>
+#include <cudf/column/column_factories.hpp>
+#include <cudf/column/column_view.hpp>
+#include <cudf/dictionary/dictionary_factories.hpp>
+#include <cudf/dictionary/encode.hpp>
+#include <cudf/types.hpp>
+#include <cudf/utilities/default_stream.hpp>
+
+#include <rmm/mr/per_device_resource.hpp>
+
+#include <cuda_runtime.h>
+#include <nvtx3/nvtx3.hpp>
+
+#include <cstdio>
+#include <exception>
+#include <memory>
+#include <stdexcept>
+
+namespace simpatico {
+
+namespace {
+
+constexpr size_t MAX_INDICES = 1 << 28;  // 256M rows (sanity bound)
+
+std::unique_ptr<dictionary_compressed_representation> dictionary_compress_impl(
+  cudf::column_view const& col, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
+{
+  if (col.type().id() != cudf::type_id::STRING) {
+    throw std::runtime_error("dictionary_compressor: column must be STRING, got '" +
+                             type_id_to_name(col.type()) + "'");
+  }
+  auto const n = col.size();
+  if (n < 0) { throw std::runtime_error("dictionary_compressor: column size is negative"); }
+  if (static_cast<size_t>(n) > MAX_INDICES) {
+    throw std::runtime_error("dictionary_compressor: column size exceeds maximum");
+  }
+  if (n == 0) {
+    auto empty_dict = cudf::make_empty_column(cudf::data_type(cudf::type_id::DICTIONARY32));
+    return std::make_unique<dictionary_compressed_representation>(std::move(empty_dict));
+  }
+
+  auto dict_col = cudf::dictionary::encode(col, cudf::data_type(cudf::type_id::INT32), stream, mr);
+  cudaStreamSynchronize(stream.value());
+  return std::make_unique<dictionary_compressed_representation>(std::move(dict_col));
+}
+
+}  // namespace
+
+std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress(
+  rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const
+{
+  nvtx3::scoped_range r{"dictionary_decompress"};
+  // Fast reconstruction mode: create dictionary from keys + indices directly
+  if (fast_mode) {
+    if (!keys_column || !indices_only) { return nullptr; }
+    if (indices_only->size() == 0) {
+      return cudf::make_empty_column(cudf::data_type(cudf::type_id::STRING));
+    }
+    // Create dictionary column from keys and indices, then decode
+    // This avoids the expensive make_strings_column reconstruction from offsets+chars
+    auto dict_col =
+      cudf::make_dictionary_column(keys_column->view(), indices_only->view(), stream, mr);
+    return cudf::dictionary::decode(dict_col->view(), stream, mr);
+  }
+
+  // Full dict_column mode: decode from the stored dictionary column.
+  if (dict_column == nullptr) { return nullptr; }
+  if (dict_column->size() == 0) {
+    return cudf::make_empty_column(cudf::data_type(cudf::type_id::STRING));
+  }
+  return cudf::dictionary::decode(dict_column->view(), stream, mr);
+}
+
+std::unique_ptr<compressed_representation> dictionary_compressor::compress(
+  cudf::column_view column_to_compress,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  return dictionary_compress_impl(column_to_compress, stream, mr);
+}
+
+std::unique_ptr<cudf::column> dictionary_compressor::decompress(
+  compressed_representation const& data_to_decompress,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  auto const* dict_repr =
+    dynamic_cast<dictionary_compressed_representation const*>(&data_to_decompress);
+  if (dict_repr == nullptr) { return nullptr; }
+  return dict_repr->decompress(stream, mr);
+}
+
+}  // namespace simpatico
