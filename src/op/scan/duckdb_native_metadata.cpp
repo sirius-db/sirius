@@ -21,7 +21,9 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <duckdb/common/column_index.hpp>
+#include <duckdb/common/enums/compression_type.hpp>
 #include <duckdb/common/enums/filter_propagate_result.hpp>
+#include <duckdb/function/compression_function.hpp>
 #include <duckdb/function/partition_stats.hpp>
 #include <duckdb/main/attached_database.hpp>
 #include <duckdb/planner/table_filter.hpp>
@@ -30,8 +32,11 @@
 #include <duckdb/storage/statistics/string_stats.hpp>
 #include <duckdb/storage/storage_manager.hpp>
 #include <duckdb/storage/table/column_data.hpp>
+#include <duckdb/storage/table/column_segment.hpp>
 #include <duckdb/storage/table/row_group.hpp>
 #include <duckdb/storage/table/row_group_collection.hpp>
+#include <duckdb/storage/table/segment_tree.hpp>
+#include <duckdb/storage/table/standard_column_data.hpp>
 #include <duckdb/storage/table_storage_info.hpp>
 
 #include <algorithm>
@@ -51,47 +56,14 @@ namespace sirius::op::scan {
 
 namespace {
 
-// Keys sourced from `duckdb/common/enums/compression_type.cpp` at v1.5.2.
-// "Empty Validity" (not "Empty") is the canonical spelling for COMPRESSION_EMPTY.
-const std::unordered_map<std::string, duckdb::CompressionType>& compression_string_to_enum()
-{
-  static const std::unordered_map<std::string, duckdb::CompressionType> map = {
-    {"Auto", duckdb::CompressionType::COMPRESSION_AUTO},
-    {"Uncompressed", duckdb::CompressionType::COMPRESSION_UNCOMPRESSED},
-    {"Constant", duckdb::CompressionType::COMPRESSION_CONSTANT},
-    {"RLE", duckdb::CompressionType::COMPRESSION_RLE},
-    {"Dictionary", duckdb::CompressionType::COMPRESSION_DICTIONARY},
-    {"PFOR", duckdb::CompressionType::COMPRESSION_PFOR_DELTA},
-    {"BitPacking", duckdb::CompressionType::COMPRESSION_BITPACKING},
-    {"FSST", duckdb::CompressionType::COMPRESSION_FSST},
-    {"Chimp", duckdb::CompressionType::COMPRESSION_CHIMP},
-    {"Patas", duckdb::CompressionType::COMPRESSION_PATAS},
-    {"ZSTD", duckdb::CompressionType::COMPRESSION_ZSTD},
-    {"ALP", duckdb::CompressionType::COMPRESSION_ALP},
-    {"ALPRD", duckdb::CompressionType::COMPRESSION_ALPRD},
-    {"Roaring", duckdb::CompressionType::COMPRESSION_ROARING},
-    {"DICT_FSST", duckdb::CompressionType::COMPRESSION_DICT_FSST},
-    {"Empty Validity", duckdb::CompressionType::COMPRESSION_EMPTY},
-  };
-  return map;
-}
-
-// Unrecognized strings map to COMPRESSION_COUNT, DuckDB's trailing sentinel
-// — `is_supported_*` rejects it via the default arm.
-duckdb::CompressionType parse_compression_string(const std::string& s)
-{
-  const auto& map = compression_string_to_enum();
-  auto it         = map.find(s);
-  if (it == map.end()) { return duckdb::CompressionType::COMPRESSION_COUNT; }
-  return it->second;
-}
-
-// `StandardColumnData::GetColumnSegmentInfo` recurses into the validity child
-// with `col_path.push_back(0)` — "[col, 0]" for validity, "[col]" for data.
-bool is_validity_path(const std::string& column_path)
-{
-  return column_path.find(',') != std::string::npos;
-}
+// Collects a segment's compression-function "additional" block ids (overflow blocks for FSST tables
+// etc.) into a vector. It visits ONLY the compression function's extra blocks, NOT the segment's
+// main block.
+struct collect_block_ids : public duckdb::BlockIdVisitor {
+  explicit collect_block_ids(std::vector<duckdb::block_id_t>& out) : out(out) {}
+  void Visit(duckdb::block_id_t block_id) override { out.push_back(block_id); }
+  std::vector<duckdb::block_id_t>& out;
+};
 
 // Exhaustive switch: a new `sirius::type_id` enumerator should compile-fail
 // here rather than be silently accepted.
@@ -140,32 +112,87 @@ bool is_supported_logical_type(const sirius::logical_type& type, std::string& re
   return false;
 }
 
-// Extract "Max String Length: N" from a StringStats text blob. The token
-// only appears in StringStats, so a forward find is safe. nullopt = field
-// absent from the blob (segment was written without the stat).
-std::optional<std::uint32_t> parse_segment_max_string_length(std::string_view blob)
-{
-  constexpr std::string_view kNeedle = "Max String Length: ";
-  auto pos                           = blob.find(kNeedle);
-  if (pos == std::string_view::npos) { return std::nullopt; }
-  pos += kNeedle.size();
-  std::uint32_t value = 0;
-  auto [ptr, ec]      = std::from_chars(blob.data() + pos, blob.data() + blob.size(), value);
-  if (ec != std::errc{}) { return std::nullopt; }
-  return value;
-}
-
-duckdb_segment_descriptor build_segment_descriptor(const duckdb::ColumnSegmentInfo& seg,
-                                                   duckdb::CompressionType compression)
+// Build a descriptor from a persistent/transient segment, reading typed fields
+// directly (block id/offset, compression enum, row counts, additional blocks).
+// bytes_size and max_string_length are filled by the caller.
+duckdb_segment_descriptor fill_segment_descriptor(duckdb::ColumnSegment& segment,
+                                                  duckdb::idx_t segment_start)
 {
   duckdb_segment_descriptor desc{};
-  desc.block_id          = seg.block_id;
-  desc.additional_blocks = seg.additional_blocks;
-  desc.block_offset      = seg.block_offset;
-  desc.segment_start     = seg.segment_start;
-  desc.segment_count     = seg.segment_count;
-  desc.compression       = compression;
+  desc.compression   = segment.GetCompressionFunction().type;
+  desc.segment_start = segment_start;
+  desc.segment_count = segment.count;
+  if (segment.segment_type == duckdb::ColumnSegmentType::PERSISTENT) {
+    desc.block_id     = segment.GetBlockId();
+    desc.block_offset = segment.GetBlockOffset();
+  } else {
+    desc.block_id     = INVALID_BLOCK;
+    desc.block_offset = 0;
+  }
+  // additional_blocks: compression-function extra blocks only (guarded by the
+  // segment's compressed state)
+  auto const& cf = segment.GetCompressionFunction();
+  auto seg_state = segment.GetSegmentState();
+  if (seg_state && cf.visit_block_ids) {
+    collect_block_ids visitor(desc.additional_blocks);
+    cf.visit_block_ids(segment, visitor);
+  }
   return desc;
+}
+
+// Walks the segment trees of a projected column, collecting metadata about its data and validity
+// segments. Returns a viability-failure reason, or nullopt on success.
+std::optional<std::string> walk_typed_column(duckdb::ColumnData& col_data,
+                                             bool is_varchar,
+                                             duckdb::idx_t column_id,
+                                             std::size_t rg_idx,
+                                             duckdb_column_metadata& col_md)
+{
+  auto* std_col = dynamic_cast<duckdb::StandardColumnData*>(&col_data);
+  if (!std_col) {
+    return "column " + std::to_string(column_id) + " row group " + std::to_string(rg_idx) +
+           ": column storage is not StandardColumnData (nested/unsupported)";
+  }
+
+  // Data segments (tree order is row-start order; the caller re-sorts anyway).
+  for (auto& node : std_col->GetSegmentTree().SegmentNodes()) {
+    auto& segment          = node.GetNode();
+    auto const compression = segment.GetCompressionFunction().type;
+    if (!is_supported_data_compression(compression)) {
+      return "data segment on column " + std::to_string(column_id) + " row group " +
+             std::to_string(rg_idx) + ": unsupported compression " +
+             duckdb::CompressionTypeToString(compression);
+    }
+    auto desc = fill_segment_descriptor(segment, node.GetRowStart());
+    if (is_varchar) {
+      // The varchar decoder cannot read CONSTANT-compressed segments.
+      if (compression == duckdb::CompressionType::COMPRESSION_CONSTANT) {
+        return "varchar segment on column " + std::to_string(column_id) + " row group " +
+               std::to_string(rg_idx) + ": CONSTANT compression is unsupported for varchar";
+      }
+      // Read the per-segment Max String Length stat TYPED (exact)
+      // Absent stat -> refuse so consumers deref unchecked.
+      if (!duckdb::StringStats::HasMaxStringLength(segment.stats.statistics)) {
+        return "varchar segment on column " + std::to_string(column_id) + " row group " +
+               std::to_string(rg_idx) + ": Max String Length stat absent from segment stats";
+      }
+      desc.max_string_length = duckdb::StringStats::MaxStringLength(segment.stats.statistics);
+    }
+    col_md.data_segments.push_back(std::move(desc));
+  }
+
+  // Validity child segments (StandardColumnData always has a validity child).
+  for (auto& node : std_col->GetValidityData().GetSegmentTree().SegmentNodes()) {
+    auto& segment          = node.GetNode();
+    auto const compression = segment.GetCompressionFunction().type;
+    if (!is_supported_validity_compression(compression)) {
+      return "validity segment on column " + std::to_string(column_id) + " row group " +
+             std::to_string(rg_idx) + ": unsupported compression " +
+             duckdb::CompressionTypeToString(compression);
+    }
+    col_md.validity_segments.push_back(fill_segment_descriptor(segment, node.GetRowStart()));
+  }
+  return std::nullopt;
 }
 
 // ColumnSegmentInfo lacks segment_size. Derive via sorted-by-(block_id,
@@ -395,13 +422,6 @@ duckdb_native_walk_plan prepare_duckdb_native_walk(
     }
   }
 
-  // Lookup to skip non-projected columns in the GetColumnSegmentInfo loop.
-  plan.projected_lookup.reserve(projected_cols.size());
-  for (std::size_t ci = 0; ci < projected_cols.size(); ++ci) {
-    if (projected_cols[ci].is_rowid) { continue; }
-    plan.projected_lookup.emplace(projected_cols[ci].storage_idx.GetPrimaryIndex(), ci);
-  }
-
   mark_row_groups_pruned_by_filter_stats(plan);
   if (plan.pruned_row_groups > 0) {
     SIRIUS_LOG_DEBUG(
@@ -470,68 +490,30 @@ duckdb_native_row_group_range walk_duckdb_native_row_group_range(
 
   if (result.row_groups.empty()) { return result; }
 
-  // Get column segment metadata for surviving row groups only.
-  duckdb::QueryContext qc{*plan.context};
-  duckdb::vector<duckdb::ColumnSegmentInfo> column_segments;
+  // Walk segment metadata for surviving row groups only — reading the typed
+  // segment trees directly
   {
     nvtx3::scoped_range nvtx_si{"sirius::native_metadata_segment_info"};
     auto& row_groups = *plan.storage->GetRowGroupCollection();
     for (std::size_t rg = rg_begin; rg < rg_end; ++rg) {
-      if (local_index_by_rg[rg - rg_begin] == n_pos) { continue; }
+      auto const local_rgi = local_index_by_rg[rg - rg_begin];
+      if (local_rgi == n_pos) { continue; }
       auto row_group = row_groups.GetRowGroup(static_cast<duckdb::idx_t>(rg));
       if (!row_group) { continue; }
-      for (auto const& pc : projected_cols) {
+      auto& rg_md = result.row_groups[local_rgi];
+      for (std::size_t ci = 0; ci < projected_cols.size(); ++ci) {
+        auto const& pc = projected_cols[ci];
         if (pc.is_rowid) { continue; }
-        row_group->GetRawColumnData(pc.storage_idx)
-          .GetColumnSegmentInfo(qc, rg, {pc.storage_idx.GetPrimaryIndex()}, column_segments);
+        auto reason = walk_typed_column(row_group->GetRawColumnData(pc.storage_idx),
+                                        projected_types[ci].is_varchar(),
+                                        pc.storage_idx.GetPrimaryIndex(),
+                                        rg,
+                                        rg_md.columns[ci]);
+        if (reason) {
+          refuse(std::move(*reason));
+          return result;
+        }
       }
-    }
-  }
-
-  // Build segment descriptors
-  for (const auto& seg : column_segments) {
-    auto pl = plan.projected_lookup.find(seg.column_id);
-    if (pl == plan.projected_lookup.end()) { continue; }  // not projected
-    auto const rg_idx = seg.row_group_index;
-    if (rg_idx < rg_begin || rg_idx >= rg_end) { continue; }
-    auto const ci        = pl->second;
-    auto const local_rgi = local_index_by_rg[static_cast<std::size_t>(rg_idx) - rg_begin];
-    if (local_rgi == n_pos) { continue; }
-    auto const validity_seg   = is_validity_path(seg.column_path);
-    auto const compression    = parse_compression_string(seg.compression_type);
-    auto const compression_ok = validity_seg ? is_supported_validity_compression(compression)
-                                             : is_supported_data_compression(compression);
-    if (!compression_ok) {
-      refuse(std::string{validity_seg ? "validity" : "data"} + " segment on column " +
-             std::to_string(seg.column_id) + " row group " + std::to_string(rg_idx) +
-             ": unsupported compression \"" + seg.compression_type + "\"");
-      return result;
-    }
-
-    auto desc = build_segment_descriptor(seg, compression);
-
-    if (!validity_seg && projected_types[ci].is_varchar()) {
-      // The varchar decoder cannot read CONSTANT-compressed segments.
-      if (compression == duckdb::CompressionType::COMPRESSION_CONSTANT) {
-        refuse("varchar segment on column " + std::to_string(seg.column_id) + " row group " +
-               std::to_string(rg_idx) + ": CONSTANT compression is unsupported for varchar");
-        return result;
-      }
-      // Refuse on absent stat so downstream consumers can deref unchecked.
-      // Some(0) is legal data (all-empty row group); decode produces 0 chars.
-      desc.max_string_length = parse_segment_max_string_length(seg.segment_stats);
-      if (!desc.max_string_length.has_value()) {
-        refuse("varchar segment on column " + std::to_string(seg.column_id) + " row group " +
-               std::to_string(rg_idx) + ": Max String Length stat absent from segment_stats");
-        return result;
-      }
-    }
-
-    auto& col_md = result.row_groups[local_rgi].columns[ci];
-    if (validity_seg) {
-      col_md.validity_segments.push_back(std::move(desc));
-    } else {
-      col_md.data_segments.push_back(std::move(desc));
     }
   }
 
