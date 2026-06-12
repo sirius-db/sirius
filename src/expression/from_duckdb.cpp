@@ -53,13 +53,33 @@
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 
 // standard library
+#include <cstddef>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
 namespace sirius::ast {
 
 namespace {
+
+// Translate a sequence of DuckDB child expressions (skipping the first @p start
+// entries), short-circuiting to std::nullopt the moment any child is
+// unsupported (i.e. from_duckdb returns null). Callers treat nullopt as "this
+// whole expression is unsupported" and propagate a null node upward.
+template <class Children>
+std::optional<std::vector<std::unique_ptr<node>>> translate_children(Children const& children,
+                                                                     std::size_t start = 0)
+{
+  std::vector<std::unique_ptr<node>> out;
+  out.reserve(children.size() > start ? children.size() - start : 0);
+  for (std::size_t i = start; i < children.size(); ++i) {
+    auto translated = from_duckdb(*children[i]);
+    if (!translated) { return std::nullopt; }
+    out.push_back(std::move(translated));
+  }
+  return out;
+}
 
 std::unique_ptr<node> translate_reference(duckdb::BoundReferenceExpression const& expr)
 {
@@ -108,14 +128,9 @@ std::unique_ptr<node> translate_conjunction(duckdb::BoundConjunctionExpression c
     case duckdb::ExpressionType::CONJUNCTION_OR: op = conjunction::kind::op_or; break;
     default: return nullptr;
   }
-  std::vector<std::unique_ptr<node>> children;
-  children.reserve(expr.children.size());
-  for (auto const& child : expr.children) {
-    auto translated = from_duckdb(*child);
-    if (!translated) { return nullptr; }
-    children.push_back(std::move(translated));
-  }
-  return std::make_unique<node>(conjunction{op, std::move(children)});
+  auto children = translate_children(expr.children);
+  if (!children) { return nullptr; }
+  return std::make_unique<node>(conjunction{op, std::move(*children)});
 }
 
 std::unique_ptr<node> translate_between(duckdb::BoundBetweenExpression const& expr)
@@ -165,32 +180,22 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
 {
   auto func_id_opt = sirius::from_duckdb_function_name(expr.function.name);
   if (!func_id_opt.has_value()) { return nullptr; }
-  std::vector<std::unique_ptr<node>> arguments;
-  arguments.reserve(expr.children.size());
-  for (auto const& child : expr.children) {
-    auto translated = from_duckdb(*child);
-    if (!translated) { return nullptr; }
-    arguments.push_back(std::move(translated));
-  }
+  auto arguments = translate_children(expr.children);
+  if (!arguments) { return nullptr; }
   auto return_type = sirius::from_duckdb(expr.return_type);
   return std::make_unique<node>(
-    function_call{*func_id_opt, std::move(arguments), std::move(return_type)});
+    function_call{*func_id_opt, std::move(*arguments), std::move(return_type)});
 }
 
 std::unique_ptr<node> translate_aggregate(duckdb::BoundAggregateExpression const& aggr)
 {
   auto agg_id_opt = sirius::from_duckdb_aggregate_name(aggr.function.name);
   if (!agg_id_opt.has_value()) { return nullptr; }
-  std::vector<std::unique_ptr<node>> arguments;
-  arguments.reserve(aggr.children.size());
-  for (auto const& child : aggr.children) {
-    auto translated = from_duckdb(*child);
-    if (!translated) { return nullptr; }
-    arguments.push_back(std::move(translated));
-  }
+  auto arguments = translate_children(aggr.children);
+  if (!arguments) { return nullptr; }
   auto return_type = sirius::from_duckdb(aggr.return_type);
   return std::make_unique<node>(
-    aggregate{*agg_id_opt, std::move(arguments), std::move(return_type), aggr.IsDistinct()});
+    aggregate{*agg_id_opt, std::move(*arguments), std::move(return_type), aggr.IsDistinct()});
 }
 
 std::unique_ptr<node> translate_operator(duckdb::BoundOperatorExpression const& expr)
@@ -216,15 +221,10 @@ std::unique_ptr<node> translate_operator(duckdb::BoundOperatorExpression const& 
   }
 
   if (op_type == duckdb::ExpressionType::OPERATOR_COALESCE) {
-    std::vector<std::unique_ptr<node>> children;
-    children.reserve(expr.children.size());
-    for (auto const& child : expr.children) {
-      auto translated = from_duckdb(*child);
-      if (!translated) { return nullptr; }
-      children.push_back(std::move(translated));
-    }
+    auto children = translate_children(expr.children);
+    if (!children) { return nullptr; }
     return std::make_unique<node>(
-      coalesce{std::move(children), sirius::from_duckdb(expr.return_type)});
+      coalesce{std::move(*children), sirius::from_duckdb(expr.return_type)});
   }
 
   if (op_type == duckdb::ExpressionType::COMPARE_IN ||
@@ -232,16 +232,11 @@ std::unique_ptr<node> translate_operator(duckdb::BoundOperatorExpression const& 
     D_ASSERT(!expr.children.empty());
     auto probe = from_duckdb(*expr.children[0]);
     if (!probe) { return nullptr; }
-    std::vector<std::unique_ptr<node>> values;
-    values.reserve(expr.children.size() > 0 ? expr.children.size() - 1 : 0);
-    for (size_t i = 1; i < expr.children.size(); ++i) {
-      auto translated = from_duckdb(*expr.children[i]);
-      if (!translated) { return nullptr; }
-      values.push_back(std::move(translated));
-    }
+    auto values = translate_children(expr.children, /*start=*/1);
+    if (!values) { return nullptr; }
     return std::make_unique<node>(in_list{
       /*probe=*/std::move(probe),
-      /*values=*/std::move(values),
+      /*values=*/std::move(*values),
       /*negated=*/op_type == duckdb::ExpressionType::COMPARE_NOT_IN,
     });
   }
