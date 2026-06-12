@@ -28,8 +28,6 @@
 #include <pipeline/sirius_pipeline_task_states.hpp>
 #include <pipeline/task_scheduler.hpp>
 
-#include <memory>
-
 namespace sirius::op::scan {
 
 //===----------------------------------------------------------------------===//
@@ -37,10 +35,8 @@ namespace sirius::op::scan {
 //===----------------------------------------------------------------------===//
 class cpu_source_task_global_state : public pipeline::sirius_pipeline_task_global_state {
  public:
-  cpu_source_task_global_state(
-    duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
-    sirius_physical_cpu_source* source_op,
-    std::shared_ptr<const telemetry::telemetry_context> telemetry_context);
+  cpu_source_task_global_state(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
+                               sirius_physical_cpu_source* source_op);
 
   sirius_physical_cpu_source& get_source_op() { return _op; }
 

@@ -17,7 +17,6 @@
 // test
 #include <catch.hpp>
 #include <scan/test_utils.hpp>
-#include <utils/telemetry_utils.hpp>
 #include <utils/utils.hpp>
 
 // sirius
@@ -94,7 +93,7 @@ using batch_validator_t = void (*)(const std::vector<std::shared_ptr<cucascade::
 class scan_test_executor : public sirius::parallel::itask_executor {
  public:
   explicit scan_test_executor(sirius::exec::thread_pool_config config)
-    : itask_executor(std::move(config), sirius::test::make_test_telemetry_context())
+    : itask_executor(std::move(config))
   {
   }
 
@@ -397,13 +396,8 @@ static void run_parquet_scan_test(std::string const& table_name,
     make_parquet_scan(client_ctx, parquet_path.string(), std::move(projection_indices));
   REQUIRE(physical_scan);
 
-  auto telemetry_context = sirius::test::make_test_telemetry_context();
-  auto global_state      = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr,
-    physical_scan.get(),
-    telemetry_context,
-    batch_size,
-    sirius::scan_test_utils::make_test_ioctx());
+  auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
+    nullptr, physical_scan.get(), batch_size, sirius::scan_test_utils::make_test_ioctx());
 
   cucascade::shared_data_repository data_repo;
 
@@ -500,13 +494,8 @@ static void run_multi_file_parquet_scan_test(
     client_ctx, (parquet_dir / "*.parquet").string(), std::move(projection_indices));
   REQUIRE(physical_scan);
 
-  auto telemetry_context = sirius::test::make_test_telemetry_context();
-  auto global_state      = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr,
-    physical_scan.get(),
-    telemetry_context,
-    batch_size,
-    sirius::scan_test_utils::make_test_ioctx());
+  auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
+    nullptr, physical_scan.get(), batch_size, sirius::scan_test_utils::make_test_ioctx());
 
   cucascade::shared_data_repository data_repo;
 
@@ -589,13 +578,8 @@ static void run_parquet_scan_test_with_filter(
     client_ctx, parquet_path.string(), std::move(projection_indices), std::move(table_filters));
   REQUIRE(physical_scan);
 
-  auto telemetry_context = sirius::test::make_test_telemetry_context();
-  auto global_state      = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr,
-    physical_scan.get(),
-    telemetry_context,
-    batch_size,
-    sirius::scan_test_utils::make_test_ioctx());
+  auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
+    nullptr, physical_scan.get(), batch_size, sirius::scan_test_utils::make_test_ioctx());
 
   cucascade::shared_data_repository data_repo;
 
@@ -656,13 +640,8 @@ static size_t count_row_group_partitions(
     client_ctx, parquet_path, std::move(projection_indices), std::move(table_filters));
   REQUIRE(physical_scan);
 
-  auto telemetry_context = sirius::test::make_test_telemetry_context();
-  auto global_state      = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr,
-    physical_scan.get(),
-    telemetry_context,
-    batch_size,
-    sirius::scan_test_utils::make_test_ioctx());
+  auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
+    nullptr, physical_scan.get(), batch_size, sirius::scan_test_utils::make_test_ioctx());
   return global_state->get_num_row_group_partitions();
 }
 

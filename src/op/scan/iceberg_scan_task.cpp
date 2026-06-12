@@ -39,7 +39,6 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
-#include <utility>
 #include <vector>
 
 namespace sirius::op::scan {
@@ -110,15 +109,10 @@ iceberg_scan_task_global_state::init_data iceberg_scan_task_global_state::prepar
 iceberg_scan_task_global_state::iceberg_scan_task_global_state(
   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
   sirius_physical_iceberg_scan* scan_op,
-  std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
   size_t approximate_batch_size,
   std::shared_ptr<sirius::io::sirius_ioctx> ioctx)
-  : iceberg_scan_task_global_state(std::move(pipeline),
-                                   scan_op,
-                                   prepare(scan_op),
-                                   approximate_batch_size,
-                                   std::move(ioctx),
-                                   std::move(telemetry_context))
+  : iceberg_scan_task_global_state(
+      std::move(pipeline), scan_op, prepare(scan_op), approximate_batch_size, std::move(ioctx))
 {
   // Propagate hive partition info to the base class so it can build
   // the partition injection function (same as the public constructor does).
@@ -132,11 +126,9 @@ iceberg_scan_task_global_state::iceberg_scan_task_global_state(
   sirius_physical_iceberg_scan* scan_op,
   init_data init,
   size_t approximate_batch_size,
-  std::shared_ptr<sirius::io::sirius_ioctx> ioctx,
-  std::shared_ptr<const telemetry::telemetry_context> telemetry_context)
+  std::shared_ptr<sirius::io::sirius_ioctx> ioctx)
   : parquet_scan_task_global_state(std::move(pipeline),
                                    static_cast<sirius_physical_parquet_scan*>(scan_op),
-                                   std::move(telemetry_context),
                                    std::move(init.file_paths),
                                    std::move(init.selected_column_indices),
                                    approximate_batch_size,

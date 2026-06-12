@@ -29,7 +29,6 @@
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
-#include "telemetry/telemetry_context.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
 
@@ -38,15 +37,9 @@
 #include <cucascade/memory/common.hpp>
 
 #include <algorithm>
-#include <atomic>
 #include <cctype>
-#include <cstdint>
-#include <exception>
 #include <limits>
-#include <memory>
 #include <mutex>
-#include <string>
-#include <utility>
 
 namespace sirius::op::scan {
 
@@ -76,9 +69,8 @@ bool is_cacheable_query_text(const std::string& query)
 duckdb_scan_executor::duckdb_scan_executor(
   exec::thread_pool_config config,
   cucascade::memory::memory_reservation_manager* mem_mgr,
-  exec::publisher<std::unique_ptr<sirius::pipeline::task_request>> task_request_publisher,
-  std::shared_ptr<const telemetry::telemetry_context> telemetry_context)
-  : sirius::parallel::itask_executor(config, std::move(telemetry_context)),
+  exec::publisher<std::unique_ptr<sirius::pipeline::task_request>> task_request_publisher)
+  : sirius::parallel::itask_executor(config),
     _task_request_publisher(std::move(task_request_publisher)),
     _mem_mgr(mem_mgr)
 {
@@ -113,19 +105,6 @@ duckdb_scan_executor::~duckdb_scan_executor()
     _cache.clear();
   }
   stop();
-}
-
-absl::AnyInvocable<void() noexcept> duckdb_scan_executor::get_per_thread_init()
-{
-  auto thread_id_counter = std::make_shared<std::atomic<uint32_t>>(0);
-
-  return [telemetry_context = _telemetry_context,
-          thread_prefix     = _config.thread_name_prefix,
-          thread_id_counter]() noexcept {
-    const int32_t thread_id = thread_id_counter->fetch_add(1, std::memory_order_relaxed);
-    thread_local_executor_thread_telemtry_init(
-      *telemetry_context, fmt::format("{}-duckdb_scan_exec-{}", thread_prefix, thread_id));
-  };
 }
 
 void duckdb_scan_executor::set_task_creator(sirius::creator::task_creator* task_creator)
@@ -358,9 +337,6 @@ std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
 
 void duckdb_scan_executor::manager_loop()
 {
-  telemetry::TaskManagerLoopThreadHandleWrapper manager_thread_telemetry{
-    *_telemetry_context, "duckdb-scan-exec-manager"};
-
   while (_running.load()) {
     auto slot = _bounded_pool->reserve();  // block till a thread is available
     if (!slot) {
@@ -392,14 +368,6 @@ void duckdb_scan_executor::manager_loop()
     // produces a well-defined target device — cpu_source_task ignores the
     // stream anyway, and duckdb_scan_task runs on the host side until handoff.
     int target_gpu_id = select_target_gpu();
-    if (scan_task) {
-      scan_task->telemetry_handle().routing({
-        .instance_name              = "",
-        .preferred_device_id        = target_gpu_id,
-        .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
-      });
-    }
-    uint64_t scan_operator_id = 0;  // sentinel value set below conditionally
 
     if (scan_task && scan_task->is<parquet_scan_task>()) {
       auto* parquet_task = dynamic_cast<parquet_scan_task*>(scan_task);
@@ -439,15 +407,7 @@ void duckdb_scan_executor::manager_loop()
           wrap_batch_data, cache_decoded_table, target_gpu_space);
       }
       auto reservation_info = scan_task->get_estimated_reservation_size_info();
-      scan_task->telemetry_handle().reserving({
-        .instance_name              = "",
-        .requested_bytes            = reservation_info.reservation_size,
-        .input_basis                = reservation_info.input_basis,
-        .peak_estimate              = reservation_info.peak_memory_estimate,
-        .bytes_to_materialize       = reservation_info.bytes_to_materialize_input,
-        .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
-      });
-      auto reservation = _mem_mgr->request_reservation(
+      auto reservation      = _mem_mgr->request_reservation(
         cucascade::memory::any_memory_space_in_tier_with_preference{
           cucascade::memory::Tier::HOST, static_cast<size_t>(target_gpu_id)},
         reservation_info.reservation_size);
@@ -466,21 +426,8 @@ void duckdb_scan_executor::manager_loop()
         SIRIUS_LOG_ERROR("DuckDB Scan Executor: Failed to cast local state for task");
         break;
       }
-
-      if (auto* global = dynamic_cast<parquet_scan_task_global_state*>(scan_task->global_state())) {
-        scan_operator_id = global->get_operator().operator_id;
-      }
-
     } else if (scan_task && scan_task->is<duckdb_scan_task>()) {
       auto reservation_info = scan_task->get_estimated_reservation_size_info();
-      scan_task->telemetry_handle().reserving({
-        .instance_name              = "",
-        .requested_bytes            = reservation_info.reservation_size,
-        .input_basis                = reservation_info.input_basis,
-        .peak_estimate              = reservation_info.peak_memory_estimate,
-        .bytes_to_materialize       = reservation_info.bytes_to_materialize_input,
-        .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
-      });
       if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
             scan_task->local_state())) {
         local_state->set_reservation(nullptr, reservation_info);
@@ -490,21 +437,9 @@ void duckdb_scan_executor::manager_loop()
         SIRIUS_LOG_ERROR("DuckDB Scan Executor: Failed to cast local state for duckdb_scan_task");
         break;
       }
-
-      if (auto* global = dynamic_cast<duckdb_scan_task_global_state*>(scan_task->global_state())) {
-        scan_operator_id = global->get_scan_op().operator_id;
-      }
     } else if (scan_task && scan_task->is<cpu_source_task>()) {
       auto reservation_info = scan_task->get_estimated_reservation_size_info();
-      scan_task->telemetry_handle().reserving({
-        .instance_name              = "",
-        .requested_bytes            = reservation_info.reservation_size,
-        .input_basis                = reservation_info.input_basis,
-        .peak_estimate              = reservation_info.peak_memory_estimate,
-        .bytes_to_materialize       = reservation_info.bytes_to_materialize_input,
-        .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
-      });
-      auto reservation = _mem_mgr->request_reservation(
+      auto reservation      = _mem_mgr->request_reservation(
         cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST},
         reservation_info.reservation_size);
       if (!reservation) {
@@ -522,10 +457,6 @@ void duckdb_scan_executor::manager_loop()
           "DuckDB Scan Executor: Failed to cast local state for cpu_source_task");
         SIRIUS_LOG_ERROR("DuckDB Scan Executor: Failed to cast local state for cpu_source_task");
         break;
-      }
-
-      if (auto* global = dynamic_cast<cpu_source_task_global_state*>(scan_task->global_state())) {
-        scan_operator_id = global->get_source_op().operator_id;
       }
     }
 
@@ -558,11 +489,10 @@ void duckdb_scan_executor::manager_loop()
     _bounded_pool->dispatch(
       std::move(slot),
       [this,
-       stream           = std::move(exc_stream),
-       t                = std::move(task),
-       scan_task        = std::move(scan_task),
-       target_gpu_id    = target_gpu_id,
-       scan_operator_id = scan_operator_id]() mutable {
+       stream        = std::move(exc_stream),
+       t             = std::move(task),
+       scan_task     = std::move(scan_task),
+       target_gpu_id = target_gpu_id]() mutable {
         // _bounded_pool workers are GPU-agnostic; cudaSetDevice is
         // thread-local. Pin this worker to target_gpu_id BEFORE any cudf/RMM
         // call so the (stream, current_device) pair stays consistent through
@@ -571,40 +501,11 @@ void duckdb_scan_executor::manager_loop()
         try {
           auto consumers = scan_task->get_output_consumers();
           {
-            auto executor_thread_resource_id = uuid::new_nil();
-            if (telemetry::executor_thread_telemetry_handle.has_value()) {
-              executor_thread_resource_id =
-                telemetry::executor_thread_telemetry_handle->handle->uuid();
-            } else {
-              SIRIUS_LOG_ERROR(
-                "duckdb_scan_executor::manager_loop: executor thread telemetry handle is not "
-                "initialized before preparing scan task");
-            }
-            scan_task->telemetry_handle().preparing({
-              .instance_name               = "",
-              .target_tier                 = "SCAN",
-              .executor_thread_resource_id = executor_thread_resource_id,
-            });
-            scan_task->telemetry_handle().computing({
-              .instance_name       = "",
-              .current_operator_id = static_cast<uint32_t>(
-                scan_operator_id),  // TODO(dhruv9vats): look into possible overflow
-              .input_bytes                 = 0,
-              .executor_thread_resource_id = executor_thread_resource_id,
-            });
-
             auto output_data = get_scan_output(scan_task, stream);
             stream->synchronize();
-
             scan_task->publish_output(*output_data, stream);
-            scan_task->telemetry_handle().finalizing({
-              .instance_name = "",
-              .success       = true,
-            });
           }
 
-          scan_task->telemetry_handle().exit();
-          scan_task->set_telemetry_finalized();
           t.reset();
           if (_task_creator && !(_completion_handler && _completion_handler->is_completed())) {
             for (auto* consumer : consumers) {

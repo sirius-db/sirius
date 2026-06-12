@@ -149,7 +149,7 @@ static void run_scan_test(std::string const& table_name,
 
   // Create global state
   auto global_state = std::make_shared<op::scan::duckdb_scan_task_global_state>(
-    nullptr, task_sched, client_ctx, physical_scan.get(), sirius_ctx->get_telemetry_context());
+    nullptr, task_sched, client_ctx, physical_scan.get());
 
   // Create data repository manager (empty, unused for this test)
   cucascade::shared_data_repository data_repo;

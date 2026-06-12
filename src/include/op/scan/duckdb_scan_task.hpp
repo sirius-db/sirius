@@ -50,7 +50,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 
 namespace sirius::op::scan {
 //===----------------------------------------------------------------------===//
@@ -75,12 +74,10 @@ class duckdb_scan_task_global_state : public pipeline::sirius_pipeline_task_glob
    * @param[in] client_ctx The DuckDB client context
    * @param[in] gpu_pts The GPU physical table scan being executed
    */
-  duckdb_scan_task_global_state(
-    duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
-    pipeline::task_scheduler& pipeline_exec,
-    duckdb::ClientContext& client_ctx,
-    sirius_physical_duckdb_scan* scan_op,
-    std::shared_ptr<const telemetry::telemetry_context> telemetry_context);
+  duckdb_scan_task_global_state(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
+                                pipeline::task_scheduler& pipeline_exec,
+                                duckdb::ClientContext& client_ctx,
+                                sirius_physical_duckdb_scan* scan_op);
 
   //===----------Methods----------===//
   /**
@@ -145,9 +142,6 @@ class duckdb_scan_task_global_state : public pipeline::sirius_pipeline_task_glob
   {
     return _total_task_count.load(std::memory_order_acquire) < _max_threads;
   }
-
-  // Returns the physical table scan operator being executed
-  const sirius_physical_duckdb_scan& get_scan_op() const noexcept { return _op; }
 
  private:
   std::atomic<std::size_t> _total_task_count{0};

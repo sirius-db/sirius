@@ -63,7 +63,6 @@ class iceberg_scan_task_global_state : public parquet_scan_task_global_state {
   iceberg_scan_task_global_state(
     duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
     sirius_physical_iceberg_scan* scan_op,
-    std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
     size_t approximate_batch_size                   = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE,
     std::shared_ptr<sirius::io::sirius_ioctx> ioctx = {});
 
@@ -84,13 +83,11 @@ class iceberg_scan_task_global_state : public parquet_scan_task_global_state {
 
   /// Private delegating constructor — receives pre-computed @p init so that
   /// the base constructor can be called in the member initialiser list.
-  iceberg_scan_task_global_state(
-    duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
-    sirius_physical_iceberg_scan* scan_op,
-    init_data init,
-    size_t approximate_batch_size,
-    std::shared_ptr<sirius::io::sirius_ioctx> ioctx,
-    std::shared_ptr<const telemetry::telemetry_context> telemetry_context);
+  iceberg_scan_task_global_state(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
+                                 sirius_physical_iceberg_scan* scan_op,
+                                 init_data init,
+                                 size_t approximate_batch_size,
+                                 std::shared_ptr<sirius::io::sirius_ioctx> ioctx);
 
   // -------------------------------------------------------------------------
   // Delete pipeline construction

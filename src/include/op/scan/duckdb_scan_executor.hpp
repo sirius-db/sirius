@@ -48,10 +48,6 @@ namespace sirius::pipeline {
 class completion_handler;
 }  // namespace sirius::pipeline
 
-namespace sirius::telemetry {
-class telemetry_context;
-}  // namespace sirius::telemetry
-
 namespace sirius::op::scan {
 
 //===----------------------------------------------------------------------===//
@@ -76,8 +72,7 @@ class duckdb_scan_executor : public sirius::parallel::itask_executor {
   explicit duckdb_scan_executor(
     exec::thread_pool_config config,
     cucascade::memory::memory_reservation_manager* mem_mgr,
-    exec::publisher<std::unique_ptr<sirius::pipeline::task_request>> task_request_publisher,
-    std::shared_ptr<const telemetry::telemetry_context> telemetry_context);
+    exec::publisher<std::unique_ptr<sirius::pipeline::task_request>> task_request_publisher);
 
   /**
    * @brief Destructor for the duckdb_scan_executor.
@@ -162,7 +157,6 @@ class duckdb_scan_executor : public sirius::parallel::itask_executor {
 
  protected:
   void manager_loop() override;
-  absl::AnyInvocable<void() noexcept> get_per_thread_init() override;
 
  private:
   /**
