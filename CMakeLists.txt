@@ -566,6 +566,11 @@ if(SIRIUS_BUILD_S3_TESTS)
   list(APPEND TEST_SOURCES test/cpp/utils/s3_container.cpp)
 endif()
 
+# Orphaned test files (present in the tree but missing from TEST_SOURCES) are
+# caught by the check-orphan-tests pre-commit hook
+# (scripts/check_orphan_tests.py) rather than a configure-time glob — see
+# test/cpp/orphan_test_allowlist.txt.
+
 add_executable(sirius_unittest ${TEST_SOURCES})
 
 # TPC-DS integration test fixture, generated at build time (opt-in target). The
