@@ -25,6 +25,7 @@
 // through from_duckdb(*to_duckdb(node)) and confirms structural equivalence
 // with the original Sirius AST.
 
+#include "ast_test_builders.hpp"
 #include "catch.hpp"
 #include "expression/ast/from_duckdb.hpp"
 #include "expression/ast/to_duckdb.hpp"
@@ -99,27 +100,9 @@ using sirius::ast::unary_op;
 
 namespace {
 
-// ----------------------------------------------------------------------------
-// Helpers — small node-construction shortcuts for the test bodies.
-// ----------------------------------------------------------------------------
-
-std::unique_ptr<node> make_ref(uint32_t idx) { return std::make_unique<node>(reference{idx}); }
-
-std::unique_ptr<node> make_int_const(int32_t v)
-{
-  return std::make_unique<node>(constant{
-    /*payload=*/sirius::value{v},
-    /*return_type=*/sirius::logical_type::make(sirius::type_id::INTEGER),
-  });
-}
-
-std::unique_ptr<node> make_str_const(std::string s)
-{
-  return std::make_unique<node>(constant{
-    /*payload=*/sirius::value{std::move(s)},
-    /*return_type=*/sirius::logical_type::make(sirius::type_id::VARCHAR),
-  });
-}
+using sirius::ast::test::make_int_const;
+using sirius::ast::test::make_ref;
+using sirius::ast::test::make_str_const;
 
 // ----------------------------------------------------------------------------
 // Structural-equality helpers — used by the self-equivalence sweep below to

@@ -25,7 +25,6 @@
 // standard library
 #include <stdexcept>
 #include <string>
-#include <utility>
 
 namespace sirius {
 
@@ -64,16 +63,31 @@ duckdb::ExpressionType to_duckdb(comparison_type c)
                            std::to_string(static_cast<int>(c)));
 }
 
+namespace {
+
+// Shared per-condition construction for both wrap_join_conditions overloads.
+// Each side's bound expression is translated to a Sirius AST node and the
+// comparison operator is mapped across; the overloads differ only in their
+// container type, which this helper is agnostic to. Takes a non-const
+// reference to mirror the by-value/drain contract of the callers (the input
+// conditions vector is consumed at the call boundary).
+join_condition wrap_one(duckdb::JoinCondition& c)
+{
+  return join_condition{
+    sirius::ast::from_duckdb(*c.left),
+    sirius::ast::from_duckdb(*c.right),
+    from_duckdb(c.comparison),
+  };
+}
+
+}  // namespace
+
 std::vector<join_condition> wrap_join_conditions(std::vector<duckdb::JoinCondition> conds)
 {
   std::vector<join_condition> out;
   out.reserve(conds.size());
   for (auto& c : conds) {
-    out.push_back(join_condition{
-      sirius::ast::from_duckdb(*c.left),
-      sirius::ast::from_duckdb(*c.right),
-      from_duckdb(c.comparison),
-    });
+    out.push_back(wrap_one(c));
   }
   return out;
 }
@@ -83,11 +97,7 @@ duckdb::vector<join_condition> wrap_join_conditions(duckdb::vector<duckdb::JoinC
   duckdb::vector<join_condition> out;
   out.reserve(conds.size());
   for (auto& c : conds) {
-    out.push_back(join_condition{
-      sirius::ast::from_duckdb(*c.left),
-      sirius::ast::from_duckdb(*c.right),
-      from_duckdb(c.comparison),
-    });
+    out.push_back(wrap_one(c));
   }
   return out;
 }
