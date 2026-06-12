@@ -1,7 +1,6 @@
 # Simpatico Compression Integration Plan
 
-Status: **Draft for review**
-Owner: (you)
+Status: **Draft for review** — §5.3 DISK serialization resolved (shipped in `simpatico_codegen`)
 Scope: Integrate `simpatico_codegen` (GPU plan-based columnar compression) into Sirius to
 compress data on spill, with later extensions for plan discovery (`explore`) and
 distributed (multi-GPU / multi-node) transfer.
@@ -21,10 +20,10 @@ distributed (multi-GPU / multi-node) transfer.
 5. (Later) Use compression for distributed workloads when shipping data between GPUs, distinguishing
    **intra-node** (high bandwidth, e.g. NVLink/peer DMA) from **inter-node** (lower bandwidth).
 
-### Vendoring decision
+### Source location
 
-`simpatico_codegen` source is **copied into the Sirius repo** (vendored fork), not added as a
-submodule. See §6 for the proposed location and sync strategy.
+`simpatico_codegen` lives at `src/compression/simpatico_codegen/` — a first-class part of the
+Sirius compression subsystem. See §6 for the CMake wiring.
 
 ---
 
@@ -66,11 +65,14 @@ the registry, so once a `compressed_* → gpu_table_representation` converter is
 
 ## 3. Simpatico API surface we consume
 
-Vendored target libs (CMake, static): `codegen_runtime`, `codegen_jit`, `codegen_kernels`.
+Vendored target lib (CMake, static): `simpatico`.
 Runtime deps: `cudf`, `rmm`, `nvcomp`, `nvrtc`, `cuda`, `cudart`, `dl`. (Sirius already links
 cudf/rmm; **new** deps are `nvrtc` and `nvcomp`.)
 
-Public header: `simpatico_codegen/include/api/simpatico_codegen.hpp` (namespace `simpatico`).
+Public headers (namespace `simpatico`):
+
+- `simpatico_codegen/include/api/simpatico_codegen.hpp` — compress / decompress
+- `simpatico_codegen/include/api/compressed_table_io.hpp` — file serialization (v6 `.hpln`)
 
 ```cpp
 // Compress an entire cudf table with a multi-column DSL ("---"-separated, one block per column).
@@ -86,22 +88,28 @@ simpatico::compress_with_plan(cudf::table_view table,
 std::unique_ptr<cudf::table>
 simpatico::decompress(const simpatico::compressed_table&,
                       rmm::cuda_stream_view, rmm::mr::device_memory_resource*);
+
+// Write a compressed_table to a .hpln v6 file. Returns "" on success, error string on failure.
+std::string
+simpatico::write_compressed_table(const simpatico::compressed_table& table,
+                                  const std::string& path);
+
+// Read a .hpln v6 file back into a compressed_table (device buffers allocated on stream/mr).
+// On failure writes an error to *error_out and returns an empty compressed_table.
+simpatico::compressed_table
+simpatico::read_compressed_table(const std::string& path,
+                                 rmm::cuda_stream_view stream,
+                                 rmm::mr::device_memory_resource* mr,
+                                 std::string* error_out);
 ```
 
-`compressed_table` is **in-memory**: a vector of `compressed_column`, each owning a
-`plan_compound` (the canonical plan DSL string + a `PlanTree` whose nodes own the compressed
-device buffers / cudf columns and per-leaf metadata `leaf_meta_v`). There is **no on-disk
-serializer** in `simpatico_codegen` — Sirius must define byte (de)serialization for the DISK tier
-(see §5.3).
+`compressed_table` is a vector of `compressed_column`, each owning a `plan_compound` (the
+canonical plan DSL string + a `PlanTree` whose nodes own the compressed device buffers / cudf
+columns and per-leaf metadata `leaf_meta_v`). The library now ships a **native binary
+serializer** (`compressed_table_io`) that handles the DISK tier directly — see §5.3.
 
 Init requirement: call `codegen::jit::ensure_cuda_context()` once before the first compress
 (retains the CUDA primary context for NVRTC). Hook this into Sirius extension load.
-
-### Non-blocker note (resolved)
-
-An earlier pass reported `src/api/compress_internals.hpp` as missing. It is **present** (added in
-commit `6bf19dd`, "reorganize public API"). The `#include "api/compress_internals.hpp"` in
-`src/simpatico_codegen.cpp` resolves relative to `src/`. The library compiles as-is.
 
 ---
 
@@ -109,11 +117,14 @@ commit `6bf19dd`, "reorganize public API"). The `#include "api/compress_internal
 
 ```
 src/compression/                          (new, Sirius-owned)
-  simpatico_bridge.hpp / .cpp             thin wrapper around simpatico_codegen + ensure_cuda_context
+  simpatico_codegen/                      compression engine (CMake subproject, built as libsimpatico)
+    include/                              public headers (simpatico_codegen.hpp, compressed_table_io.hpp, …)
+    src/                                  library sources
+    CMakeLists.txt
+  simpatico_bridge.hpp / .cpp             thin wrapper: ensure_cuda_context + stream / mr helpers
   compressed_representation.hpp / .cpp    idata_representation subclasses (GPU/HOST/DISK)
   compression_converters.hpp / .cpp       register_compression_converters(registry)
   plan_register.hpp / .cpp                per-node plan store
-third_party/simpatico_codegen/            (vendored copy of the subproject)
 ```
 
 ---
@@ -182,13 +193,121 @@ needs no edit beyond registering the converter.
 
 ### 5.3 DISK serialization
 
-`simpatico_codegen` keeps `compressed_table` in memory only. For the DISK tier we define a Sirius
-byte format: iterate `compound->tree` nodes, write each `named_channels()` buffer + `describe_meta()`
-(`leaf_meta_v`) + the canonical `plan_dsl` string + table schema/row count. Deserialization rebuilds
-the `compressed_table` (Simpatico exposes `reconstruct_representation(...)` for rebuilding reps from
-compressor name + buffers + meta). This is the largest net-new piece of work in Phase 2.
+**This is now provided by `simpatico_codegen` itself** — no Sirius-owned byte format is needed.
 
-### 5.4 Per-node plan register
+`simpatico::write_compressed_table(table, path)` writes a self-describing binary `.hpln v6` file:
+
+- A human-readable DSL section (one plan block per column, `---`-separated) followed by an
+  end-marker, then a binary header and a contiguous payload blob.
+- The binary header records per-column: name, dtype tag, row count, plan DSL, and for each leaf
+  a path, `PlanLeafKind`, element type tag, `leaf_meta_v` (variant encoding compressor-specific
+  metadata such as uncompressed size for ANS/Snappy/LZ4/Deflate, or ALP-RD right-bitwidth), and
+  per-buffer (name, type, byte size, payload offset).
+- The payload is all compressed device buffers concatenated, copied D→H at write time.
+
+`simpatico::read_compressed_table(path, stream, mr)` inverts the above: parses the header,
+copies each buffer H→D on `stream`/`mr`, reconstructs each `compressed_representation` via the
+existing `reconstruct_representation` / `plan_compound_from_leaves` machinery, and returns a
+fully-wired `compressed_table` ready to `decompress()`.
+
+**Sirius DISK tier work reduces to**: call `write_compressed_table` in the HOST→DISK spill
+converter, call `read_compressed_table` in the DISK→GPU prepare converter, and wrap the result
+in a `compressed_disk_representation`. The custom serialization logic that was previously the
+largest net-new piece of Phase 2 is already implemented and tested.
+
+One thing to consider here is the alternative of keeping the metadata classes live in memory
+while the actual buffers are just dumped directly into a file.
+
+### 5.4 GPU memory resource interplay
+
+Simpatico's public API takes `rmm::mr::device_memory_resource* mr`. cuCascade does not expose
+one. Understanding why — and how to bridge it — is a prerequisite before Phase 2 starts.
+
+#### What cuCascade actually exposes
+
+cuCascade manages GPU memory through a two-layer stack:
+
+1. **Upstream pool** — `rmm::mr::cuda_async_memory_resource` (CUDA async mempool, one per GPU
+   space; sized by `memory_capacity`).
+2. **Reservation wrapper** — `cucascade::memory::reservation_aware_resource_adaptor`, which
+   inherits from CCCL `cuda::mr::shared_resource`, **not** from
+   `rmm::mr::device_memory_resource`. It enforces global capacity (`_capacity`), per-reservation
+   arenas (`device_reserved_arena`), and optional per-stream/per-thread accounting.
+
+The public handle is `rmm::device_async_resource_ref`, returned by
+`memory_space::get_default_allocator()`. This is what all existing converters and operators
+receive. `sirius_memory_reservation_manager` also installs it as cuDF's per-device resource via
+`cudf::set_current_device_resource_ref(space->get_default_allocator())`.
+
+#### The type mismatch
+
+`reservation_aware_resource_adaptor` cannot be cast or implicitly converted to
+`rmm::mr::device_memory_resource*`. Direct pass-through is not possible.
+
+#### Recommended approach: pass `nullptr`, rely on the cuDF current resource
+
+Simpatico uses the RMM default (`rmm::mr::get_current_device_resource()`) when `mr == nullptr`.
+Because `sirius_memory_reservation_manager` already installed the adaptor as the cuDF default,
+passing `nullptr` routes Simpatico's internal allocations through the adaptor — the same path
+`cudf::pack()` takes today. No bridge code is required.
+
+```cpp
+// In the compress-on-spill converter:
+auto ct = simpatico::compress_with_plan(table_view, dsl, stream, /*mr=*/nullptr);
+
+// In the decompress-on-prepare converter:
+auto table = simpatico::decompress(ct, stream, /*mr=*/nullptr);
+
+// In read_compressed_table (DISK→GPU):
+auto ct = simpatico::read_compressed_table(path, stream, /*mr=*/nullptr);
+```
+
+All allocations count against the adaptor's global `_capacity` limit, which is what matters for
+OOM safety.
+
+#### Stream-path differences
+
+| Path | Stream | Reservation attached to stream? | Effect on Simpatico allocs |
+|------|--------|--------------------------------|---------------------------|
+| Prepare (pipeline task) | task stream | Yes — `attach_reservation_to_tracker` | Allocs counted per-reservation arena; OOM respects reservation budget |
+| Spill/compress (downgrade) | `exc_stream` | **No** | Allocs hit adaptor's unmanaged path (global cap only, no per-reservation enforcement) |
+
+Compression scratch during spill will not cause accounting errors, but will not be bounded by a
+per-task reservation. This matches the existing behaviour of `cudf::pack()` on the spill path
+and is acceptable.
+
+This is important and needs consideration; if Sirius is under memory pressure we may want to disable
+compression as it can increase memory pressure.
+If Sirius is trying to resolve an OOM situation, we should always skip compression.
+In any case, Sirius should just ignore failures during compression and in those cases just use
+raw data. _DE_compression however is not optional. Which is why it's good that this path does use
+the memory reservation.
+
+In general we should look into how much memory simpatico needs.
+
+#### Reservation sizing
+
+The `memory_space::make_reservation_or_null(size)` call in the spill path reserves space on the
+**target** tier (HOST/DISK) before the convert. It does not pre-reserve GPU scratch for
+compression. If GPU headroom is tight during compression, the adaptor's `defragmenter_oom_policy`
+(CUDA mempool trim + retry) fires as a backstop. No changes needed here — existing OOM policy
+is sufficient.
+
+#### Device context
+
+When the prepare converter runs on a different thread from the pipeline task, it must ensure the
+right device is active. Mirror the pattern in
+`host_parquet_representation_converters.cpp` (`rmm::cuda_set_device_raii`) before calling
+`read_compressed_table` or `decompress`.
+
+#### Open question
+
+If fine-grained per-reservation accounting of compression scratch is needed in the future, a
+thin bridge `device_memory_resource` subclass that forwards to a
+`rmm::device_async_resource_ref` on a known stream would suffice. Defer until measured to be
+necessary.
+
+### 5.5 Per-node plan register
 
 Node outputs flow through `repository_wiring → port → shared_data_repository`, identified by a stable
 `port_id` (`src/include/pipeline/repository_wiring.hpp`, `src/include/op/sirius_physical_operator.hpp`).
@@ -207,21 +326,54 @@ plan_register : node_output_id  ->  per-column Simpatico DSL string
 
 ---
 
-## 6. Vendoring (copy) strategy
+## 6. Source integration strategy
 
-- Copy `simpatico_codegen/{include,src,CMakeLists.txt,README.md}` into
-  `third_party/simpatico_codegen/` in the Sirius repo.
-- Add `add_subdirectory(third_party/simpatico_codegen EXCLUDE_FROM_ALL)` to the top-level
-  `CMakeLists.txt`, near the cuCascade `add_subdirectory`.
-- Link the Sirius extension target against:
+The simpatico_codegen code lives at `src/compression/simpatico_codegen/` — a first-class
+subdirectory of the Sirius compression subsystem, not a third-party vendor directory.
+
+- Add `add_subdirectory(src/compression/simpatico_codegen)` to the compression subsystem's
+  `CMakeLists.txt` (or to the top-level, near the cuCascade `add_subdirectory`).
+- Link the Sirius compression target against:
   ```cmake
-  -Wl,--start-group codegen_runtime codegen_jit codegen_kernels -Wl,--end-group
-  cudf::cudf rmm::rmm nvcomp nvrtc cuda cudart dl
+  simpatico cudf::cudf rmm::rmm nvcomp nvrtc cuda cudart dl
   ```
-  (cudf/rmm already linked; add `nvcomp`/`nvrtc` discovery — both ship in the RAPIDS/CUDA conda env.)
-- Record provenance: note the upstream commit hash this copy was taken from in a
-  `third_party/simpatico_codegen/VENDORED.md` so future re-syncs are diffable.
+  (cudf/rmm already linked by Sirius; add `nvcomp`/`nvrtc` discovery — both ship in the
+  RAPIDS/CUDA conda env.)
 - Confirm CUDA arch flags match Sirius (`CMAKE_CUDA_ARCHITECTURES`).
+
+### `compress_with_plan_benchmark` harness
+
+`simpatico_codegen/bench/compress_with_plan_benchmark.cpp` compiles to a standalone
+`compress_with_plan_benchmark` executable as a side-effect of `add_subdirectory` — no extra CMake
+wiring required. It is **not** registered as a ctest (it requires explicit `--input`/`--plan`
+arguments).
+
+It is self-contained: it installs its own `cuda_async_memory_resource` and calls Simpatico with
+`mr=nullptr`, so it does **not** need Sirius initialization or cuCascade's reservation manager.
+
+Practical use: dump a batch to Parquet from a Sirius pipeline, then run:
+
+```bash
+compress_with_plan_benchmark --input batch.parquet --plan config/plan.txt \
+            --mode full-table --warmup 5 --iters 20 --csv-out results.csv
+```
+
+to profile candidate plans before committing one to the plan register. The `--csv-out` output is
+suitable for CI benchmarking dashboards.
+
+If the extra build-time cost is unwanted in Sirius CI, gate it with an upstream CMake option:
+
+```cmake
+# in simpatico_codegen/CMakeLists.txt
+option(SIMPATICO_BUILD_BENCH "Build plan_runner benchmark harness" ON)
+if(SIMPATICO_BUILD_BENCH)
+  add_executable(plan_runner bench/plan_runner.cpp)
+  ...
+endif()
+```
+
+then pass `-DSIMPATICO_BUILD_BENCH=OFF` from Sirius's cmake configure step when desired.
+
 
 ---
 
@@ -234,9 +386,11 @@ plan_register : node_output_id  ->  per-column Simpatico DSL string
   roundtrip equality. Confirms toolchain, NVRTC JIT, and linkage.
 
 ### Phase 2 — Spill compression (core deliverable)
-- `simpatico_bridge`, the three compressed representations, DISK serialization.
+- `simpatico_bridge`, the three compressed representations.
 - `register_compression_converters` + wire into `converter_registry::initialize`.
 - Edit `convertible_data_batch::convert` (HOST/DISK) to target compressed reps behind a config flag.
+- DISK tier: call `write_compressed_table` / `read_compressed_table` directly — no custom
+  serialization to write (§5.3 resolved upstream).
 - Per-node plan register, stamped at sink publish; static/hand-authored plans for now.
 - Tests: spill→reload roundtrip; downgrade under memory pressure; fallback when no plan registered;
   memory accounting (compressed vs uncompressed sizes correct).
@@ -261,8 +415,6 @@ plan_register : node_output_id  ->  per-column Simpatico DSL string
    and matches `compress_with_plan(table_view, ...)`.
 2. **Spill threading**: downgrade runs on its own threads — use the sequential `compress_with_plan`
    overload, or a caller-owned `simpatico::stream_pool` for column parallelism?
-3. **Fallback / error policy**: if compression fails or expands data, fall back to uncompressed rep
-   for that batch? (Recommended: yes, log + fall back.)
 4. **Config surface**: flags for enable/disable, min batch size to bother compressing, default plan.
 5. **Plan register persistence**: in-memory only per session, or persisted across runs?
 6. **`explore` integration shape** (Phase 3): vendor vs offline import.
@@ -272,8 +424,12 @@ plan_register : node_output_id  ->  per-column Simpatico DSL string
 ## 9. Touch list (files)
 
 New (Sirius):
+- `src/compression/simpatico_codegen/**` (compression engine, built as `libsimpatico`)
 - `src/compression/{simpatico_bridge,compressed_representation,compression_converters,plan_register}.{hpp,cpp}`
-- `third_party/simpatico_codegen/**` (vendored)
+
+Consumed headers from the engine:
+- `src/compression/simpatico_codegen/include/api/simpatico_codegen.hpp`
+- `src/compression/simpatico_codegen/include/api/compressed_table_io.hpp`
 
 Edited (Sirius):
 - `CMakeLists.txt` (add_subdirectory + link nvrtc/nvcomp + new src/compression sources)
