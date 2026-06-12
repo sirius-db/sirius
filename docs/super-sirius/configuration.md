@@ -212,7 +212,27 @@ sirius:
 | `output_directory` | string | `telemetry_data` | Directory for Quent ndjson files. |
 | `engine_name` | string | `siriusDB` | Engine name reported in engine-level telemetry. |
 
-Per-query labels are configured separately with `CALL sirius_set_query_label(...)` SQL function or the `query_label` named parameter on `gpu_execution(...)`.
+Per-query labels are configured separately from YAML. They can be set with the
+`sirius_set_query_label` SQL function or inline with the `query_label` named
+parameter on `gpu_execution(...)`:
+
+```sql
+-- Applies to the next Sirius query, including transparent plain-SQL execution.
+CALL sirius_set_query_label('tpch_q1_iter1');
+SELECT *
+FROM lineitem
+WHERE l_orderkey < 100;
+
+-- Inline label for an explicit gpu_execution call.
+CALL gpu_execution(
+  'SELECT * FROM lineitem WHERE l_orderkey < 100',
+  query_label = 'tpch_q1_iter1'
+);
+```
+
+`sirius_set_query_label` is consumed once by the next Sirius query. For explicit
+`gpu_execution(...)`, an inline `query_label` parameter takes precedence over a
+pending label set with `sirius_set_query_label`.
 
 ### Generating Query Telemetry
 
@@ -248,16 +268,18 @@ Start the Quent analyzer server over the same telemetry directory to view the
 captured telemetry:
 
 ```bash
-pixi run cargo run --manifest-path rust/Cargo.toml \
-  -p sirius-telemetry-server \
-  --features ui \
-  -- \
-  --output-dir telemetry_data
+pixi run quent
+```
+
+The `quent` Pixi task defaults to `telemetry_data`, and runs the telemetry
+server with the UI enabled. If the config uses a different `output_directory`,
+pass that path as the task argument:
+
+```bash
+pixi run quent /path/to/telemetry_data
 ```
 
 Then open `http://localhost:8080` and select the captured Sirius engine/query.
-If the config uses a different `output_directory`, pass that path to
-`--output-dir`.
 
 ## Thread Pool Configuration
 

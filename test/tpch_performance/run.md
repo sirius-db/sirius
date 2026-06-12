@@ -128,18 +128,41 @@ pixi run -- ./test/tpch_performance/run_tpch_parquet_and_generate_telemetry.sh \
 The custom config is used as-is, so it must include
 `sirius.telemetry.enable_quent: true`.
 
+Query labels are optional but make the Quent UI easier to navigate. They can be
+set in either of two ways:
+
+```sql
+-- Applies to the next Sirius query, including transparent plain-SQL execution.
+CALL sirius_set_query_label('tpch_q1_iter1');
+SELECT *
+FROM lineitem
+WHERE l_orderkey < 100;
+
+-- Inline label for an explicit gpu_execution call.
+CALL gpu_execution(
+  'SELECT * FROM lineitem WHERE l_orderkey < 100',
+  query_label = 'tpch_q1_iter1'
+);
+```
+
+The telemetry helper script uses `sirius_set_query_label` so plain SQL queries
+keep the same execution path as the normal TPC-H runner.
+
 Start the Quent analyzer server over the telemetry directory:
 
 ```bash
-pixi run cargo run --manifest-path rust/Cargo.toml \
-  -p sirius-telemetry-server \
-  --features ui \
-  -- \
-  --output-dir telemetry_data
+pixi run quent
 ```
 
-Open `http://localhost:8080` and select the captured Sirius engine/query. If
-the config writes telemetry somewhere else, pass that path to `--output-dir`.
+The `quent` Pixi task defaults to `telemetry_data` and runs the telemetry server
+with the UI enabled. If the config writes telemetry somewhere else, pass that
+path as the task argument:
+
+```bash
+pixi run quent /path/to/telemetry_data
+```
+
+Open `http://localhost:8080` and select the captured Sirius engine/query.
 
 ## Query Files
 
