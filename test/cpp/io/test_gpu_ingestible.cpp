@@ -77,8 +77,7 @@ class fake_table_info : public sirius::io::ingestible_table_info {
 
   std::shared_ptr<sirius::io::gpu_ingestible> make_ingestible(
     std::unique_ptr<sirius::io::ingestible_table_info> self,
-    sirius::scan_manager::sirius_scan_manager const&,
-    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const&) override
+    sirius::scan_manager::sirius_scan_manager const&) override
   {
     dispatch_count.fetch_add(1, std::memory_order_relaxed);
     return std::make_shared<fake_gpu_ingestible>(std::move(self));
@@ -94,9 +93,7 @@ class fake_table_info : public sirius::io::ingestible_table_info {
 TEST_CASE("make_gpu_ingestible - throws on null table_info", "[io][gpu_ingestible]")
 {
   sirius::scan_manager::sirius_scan_manager mgr({});
-  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs;
-  REQUIRE_THROWS_AS(sirius::io::make_gpu_ingestible(/*info=*/nullptr, mgr, gpu_ioctxs),
-                    std::runtime_error);
+  REQUIRE_THROWS_AS(sirius::io::make_gpu_ingestible(/*info=*/nullptr, mgr), std::runtime_error);
 }
 
 TEST_CASE("make_gpu_ingestible - dispatches through table_info::make_ingestible",
@@ -108,9 +105,8 @@ TEST_CASE("make_gpu_ingestible - dispatches through table_info::make_ingestible"
   auto* info_alias = info.get();
 
   sirius::scan_manager::sirius_scan_manager mgr({});
-  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs;
 
-  auto ingestible = sirius::io::make_gpu_ingestible(std::move(info), mgr, gpu_ioctxs);
+  auto ingestible = sirius::io::make_gpu_ingestible(std::move(info), mgr);
   REQUIRE(ingestible != nullptr);
   REQUIRE(info_alias->dispatch_count.load() == 1);
 

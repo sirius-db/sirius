@@ -26,6 +26,7 @@
 
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
+#include <io/sirius_datasource.hpp>
 
 #include <atomic>
 #include <chrono>

@@ -18,6 +18,7 @@
 #include "io/datasource_factory.hpp"
 #include "sirius_config.hpp"
 
+#include <io/sirius_datasource.hpp>
 #include <unistd.h>
 
 #include <atomic>
@@ -50,7 +51,7 @@ class mock_ioctx : public sirius_ioctx {
     throw std::logic_error("unused");
   }
 
-  std::unique_ptr<cudf::io::datasource> make_datasource(std::shared_ptr<sirius_io_object>) override
+  std::unique_ptr<sirius_datasource> make_datasource(std::shared_ptr<sirius_io_object>) override
   {
     ++make_datasource_calls;
     throw std::logic_error("mock_ioctx::make_datasource should not run in PR1");

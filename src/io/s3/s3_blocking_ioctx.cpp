@@ -329,10 +329,10 @@ void s3_blocking_ioctx::shutdown()
     curl_easy_cleanup(static_cast<CURL*>(h));
 }
 
-std::unique_ptr<cudf::io::datasource> s3_blocking_ioctx::make_datasource(
+std::unique_ptr<io::sirius_datasource> s3_blocking_ioctx::make_datasource(
   std::shared_ptr<sirius_io_object> io_object)
 {
-  return std::make_unique<sirius_datasource>(shared_from_this(), std::move(io_object));
+  return std::make_unique<io::sirius_datasource>(shared_from_this(), std::move(io_object));
 }
 
 std::shared_ptr<sirius_io_object> s3_blocking_ioctx::create_io_object(std::string path)

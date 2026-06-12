@@ -18,6 +18,7 @@
 #include <duckdb/parser/expression/constant_expression.hpp>
 #include <duckdb/parser/expression/function_expression.hpp>
 #include <duckdb/parser/tableref/table_function_ref.hpp>
+#include <io/sirius_datasource.hpp>
 
 #include <algorithm>
 #include <array>
@@ -153,7 +154,11 @@ struct sirius_memory_limits {
   std::string gpu_usage{"256 MiB"};
   std::string gpu_reservation{"128 MiB"};
   std::string host_capacity{"512 MiB"};
-  std::string disk_capacity;
+  // A small disk tier so the downgrade executor can spill instead of looping
+  // when GPU pressure is hit. Without it, on large-VRAM GPUs (where RMM's pool
+  // can exceed the 256 MiB usage cap at init) even a tiny scan spins forever at
+  // the no-disk-spill boundary. `large_sirius_memory_limits()` overrides this.
+  std::string disk_capacity{"2 GiB"};
   std::optional<bool> enable_chunk_prewarm;
 };
 
@@ -474,9 +479,9 @@ duckdb::SiriusContext& require_sirius_context(s3_sql_fixture& fixture)
 sirius::io::s3::s3_ioctx& require_async_s3_ioctx(s3_sql_fixture& fixture, std::string const& uri)
 {
   auto& sirius_ctx = require_sirius_context(fixture);
-  auto* base_ctx   = sirius_ctx.get_scan_manager().io_ctx_for(uri);
-  REQUIRE(base_ctx != nullptr);
-  auto* s3_ctx = dynamic_cast<sirius::io::s3::s3_ioctx*>(base_ctx);
+  auto datasource  = sirius_ctx.get_scan_manager().create_datasource(uri);
+  REQUIRE(datasource != nullptr);
+  auto* s3_ctx = dynamic_cast<sirius::io::s3::s3_ioctx*>(datasource->io_ctx().get());
   REQUIRE(s3_ctx != nullptr);
   return *s3_ctx;
 }

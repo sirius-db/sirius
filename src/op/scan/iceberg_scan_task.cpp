@@ -112,12 +112,12 @@ iceberg_scan_task_global_state::iceberg_scan_task_global_state(
   sirius_physical_iceberg_scan* scan_op,
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
   size_t approximate_batch_size,
-  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs)
+  std::shared_ptr<sirius::io::sirius_ioctx> ioctx)
   : iceberg_scan_task_global_state(std::move(pipeline),
                                    scan_op,
                                    prepare(scan_op),
                                    approximate_batch_size,
-                                   std::move(gpu_ioctxs),
+                                   std::move(ioctx),
                                    std::move(telemetry_context))
 {
   // Propagate hive partition info to the base class so it can build
@@ -132,7 +132,7 @@ iceberg_scan_task_global_state::iceberg_scan_task_global_state(
   sirius_physical_iceberg_scan* scan_op,
   init_data init,
   size_t approximate_batch_size,
-  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs,
+  std::shared_ptr<sirius::io::sirius_ioctx> ioctx,
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context)
   : parquet_scan_task_global_state(std::move(pipeline),
                                    static_cast<sirius_physical_parquet_scan*>(scan_op),
@@ -140,7 +140,7 @@ iceberg_scan_task_global_state::iceberg_scan_task_global_state(
                                    std::move(init.file_paths),
                                    std::move(init.selected_column_indices),
                                    approximate_batch_size,
-                                   std::move(gpu_ioctxs))
+                                   std::move(ioctx))
 {
   build_delete_pipeline(scan_op, init.extra_eq_delete_columns);
 }
@@ -164,11 +164,10 @@ void iceberg_scan_task_global_state::build_delete_pipeline(sirius_physical_icebe
   // ioctx map is therefore not needed here; we still require at least one
   // ioctx be configured so the base parquet_scan_task_global_state's
   // planning-time footer reads can resolve a datasource.
-  auto const& gpu_ioctxs = this->get_gpu_ioctxs();
-  if (gpu_ioctxs.empty()) {
+  if (!this->get_ioctx()) {
     throw std::runtime_error(
-      "[iceberg] No GPU sirius_ioctxs available — "
-      "SiriusContext must have registered at least one ioctx.");
+      "[iceberg] No sirius_ioctx available — "
+      "SiriusContext must have configured an IO backend.");
   }
 
   // -----------------------------------------------------------------------

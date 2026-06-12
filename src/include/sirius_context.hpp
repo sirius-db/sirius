@@ -35,8 +35,6 @@
 #include <duckdb/main/prepared_statement_data.hpp>
 #include <duckdb/planner/extension_callback.hpp>
 #include <duckdb/planner/logical_operator.hpp>
-#include <io/datasource_factory.hpp>
-#include <io/types.hpp>
 
 #include <atomic>
 #include <memory>
@@ -44,7 +42,6 @@
 #include <optional>
 #include <set>
 #include <string_view>
-#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -56,14 +53,6 @@ class small_pinned_host_memory_resource;
 namespace sirius::memory {
 class numa_small_pinned_mr;
 }  // namespace sirius::memory
-
-namespace sirius::io {
-class buffer_pool;
-}  // namespace sirius::io
-
-namespace sirius::exec {
-class static_thread_pool;
-}  // namespace sirius::exec
 
 namespace sirius {
 class sirius_engine;
@@ -159,9 +148,10 @@ class SiriusContext : public ClientContextState {
   /// \brief Terminate the Sirius context, releasing all resources.
   void terminate();
 
-  /// \brief Log the host fixed_size_host_memory_resource stats (allocated,
-  ///        peak, free blocks) at a labeled tag — used for verifying leaks.
-  void log_host_pool_stats(std::string_view tag) const;
+  /// \brief Log host and GPU memory pool stats (allocated, peak, and
+  ///        tier-specific capacity fields) at a labeled tag — used for
+  ///        verifying that allocations return to baseline after each query.
+  void log_pool_stats(std::string_view tag) const;
 
   [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept
   {
@@ -188,57 +178,6 @@ class SiriusContext : public ClientContextState {
   /// \brief Get all downgrade executors.
   [[nodiscard]] const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>&
   get_downgrade_executors() const;
-
-  /// @brief Resolve the sirius_ioctx serving the given device.
-  ///
-  /// Since per-NUMA construction (Phase: numa-ioctx), sirius_ioctx instances
-  /// are owned per NUMA node rather than per GPU — every GPU on the same
-  /// node shares the same shared_ptr. This accessor resolves
-  /// device_id -> NUMA node -> ioctx so callers that previously held device
-  /// keys continue to work transparently. The reactor's pinned bounce slots
-  /// are NUMA-bound at ctor time (numa_alloc_onnode + cudaHostRegister) so
-  /// device_read_req's cudaMemcpyAsync still lands on the right NUMA domain.
-  ///
-  /// @param device_id GPU device id (must match a configured GPU memory space).
-  /// @return Shared pointer to the sirius_ioctx whose reactor pool serves
-  ///         this device (NUMA-anchored).
-  /// @throws std::out_of_range if no ioctx was registered for device_id.
-  [[nodiscard]] std::shared_ptr<sirius::io::sirius_ioctx> get_ioctx_for(int device_id) const;
-
-  /// @brief Read-only device_id-keyed view of the sirius_ioctx cache.
-  ///
-  /// Callers (task_creator seeding parquet_scan_task_global_state,
-  /// planning-time first-available picks, etc.) still consume a
-  /// device_id->ioctx map. Multiple entries on the same NUMA node alias a
-  /// shared_ptr so destruction order matches numa_ioctxs_; the map itself
-  /// is rebuilt from numa_ioctxs_ at initialize() time. Returns by
-  /// const-reference — lifetime is tied to SiriusContext; callers must not
-  /// hold the reference past terminate().
-  [[nodiscard]] std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const&
-  get_gpu_ioctxs() const
-  {
-    return gpu_ioctxs_;
-  }
-
-  /// @brief The SiriusContext-owned S3 backend, or nullptr when no
-  ///        object_store_config is wired (S6 increment 1: a single shared
-  ///        instance; increment 2 shards it per NUMA node). The scan_manager
-  ///        borrows this for s3:// routing; SiriusContext is the owner and
-  ///        releases it in terminate(). Returns a shared_ptr copy — callers
-  ///        must not extend its lifetime past terminate().
-  [[nodiscard]] std::shared_ptr<sirius::io::sirius_ioctx> get_s3_ioctx() const { return s3_ioctx_; }
-
-  /// @brief Read-only access to the datasource registry populated at startup.
-  /// @details kFileScheme is registered at the end of initialize() against
-  ///          the lowest-numbered GPU's sirius_ioctx; object-store schemes
-  ///          (s3://, gs://, azure://) are not yet registered.
-  ///          datasource_factory::create() throws on unknown scheme — this
-  ///          accessor is the read-side hook that lets the factory consult
-  ///          the registry at every parquet read.
-  [[nodiscard]] sirius::io::datasource_registry const& get_datasource_registry() const
-  {
-    return datasource_registry_;
-  }
 
   /// @brief Check whether cudaDeviceEnablePeerAccess succeeded for the given
   ///        (src, dst) GPU pair at SiriusContext::initialize() time.
@@ -339,59 +278,6 @@ class SiriusContext : public ClientContextState {
   bool is_initialized_ = false;
   sirius::sirius_config config_;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;
-  // Per-NUMA sirius_ioctx. We build one ioctx per distinct NUMA node hosting
-  // a managed GPU instead of one per GPU — a single ioctx already supports
-  // multi-GPU correctly (each device_read_req carries its own device_id and
-  // stream; the reactor switches device before cudaMemcpyAsync). Going
-  // per-NUMA cuts the reactor worker-thread count on multi-GPU hosts and
-  // matches cucascade's NUMA-pinned host space layout.
-  //
-  // Construction: in initialize(), under rmm::cuda_set_device_raii of the
-  // lowest-numbered GPU on the node, with the reactor told to bind its
-  // pinned bounce slots (numa_alloc_onnode + cudaHostRegister Portable|Mapped)
-  // to the same node.
-  //
-  // S6 (NUMA): SiriusContext owns the scan-side IO backends; the scan_manager
-  // only borrows them for routing. These three are declared BEFORE numa_ioctxs_
-  // / s3_ioctx_ so the implicit-destructor backstop frees the prefetch
-  // buffer_pool LAST, after every cache that references it (the per-NUMA uring
-  // caches and the s3 cache). The authoritative path is the explicit ordering
-  // in terminate().
-  //
-  // Pinned-host pool backing every backend's prefetching cache. Built only when
-  // enable_prefetch_cache is set. prefetching_cache holds it as a buffer_pool&,
-  // so it must outlive all caches — declared first, destroyed last.
-  std::unique_ptr<sirius::io::buffer_pool> prefetch_buffer_pool_;
-  // Dedicated S3 async worker pool, injected into the blocking s3_ioctx. Built
-  // only for the blocking backend (the async backend's reactor owns its own
-  // worker thread, so this stays null when s3_use_async_backend is set). Must
-  // outlive s3_ioctx_ (declared before it).
-  std::unique_ptr<sirius::exec::static_thread_pool> s3_thread_pool_;
-  // The S3 backend (S6 increment 1: single shared instance), owned here and
-  // borrowed by the scan_manager. nullptr when no object_store_config is wired.
-  std::shared_ptr<sirius::io::sirius_ioctx> s3_ioctx_;
-  // Teardown order in terminate(): scan_manager_ (drops borrowed aliases) ->
-  // datasource_registry_ -> gpu_ioctxs_ (view, drops references) -> numa_ioctxs_
-  // (destroys reactor pools + uring caches under a live CUDA context) ->
-  // s3_ioctx_ (destroys s3 cache) -> s3_thread_pool_ -> prefetch_buffer_pool_
-  // (last, after every cache that references it), all BEFORE memory_manager_
-  // shutdown.
-  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> numa_ioctxs_;
-  // device_id -> normalized NUMA node id ((-1) -> 0). Computed once at
-  // initialize() from get_hw_topology().gpus[].numa_node. get_ioctx_for()
-  // and the per-NUMA cuDF pinned MR dispatcher both consult this map.
-  std::unordered_map<int, int> device_to_numa_;
-  // Device-id-keyed view of numa_ioctxs_. Every entry holds a shared_ptr
-  // aliasing the per-NUMA ioctx that serves its device; multiple GPUs on
-  // the same NUMA node alias the same target. Existing callers continue to
-  // treat it as a per-GPU map.
-  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs_;
-  // Registry mapping URI scheme -> ioctx, populated by initialize() with
-  // kFileScheme -> gpu_ioctxs_.at(<lowest_gpu_id>). datasource_factory::create()
-  // reads this registry to resolve schemes; throws if no entry exists.
-  // Cleared BEFORE gpu_ioctxs_ in shutdown to avoid dangling shared_ptrs
-  // (terminate() ordering in src/sirius_context.cpp).
-  sirius::io::datasource_registry datasource_registry_;
   // P2P: set of (src, dst) GPU pairs where cudaDeviceEnablePeerAccess
   // succeeded in initialize(). Populated under rmm::cuda_set_device_raii, one
   // call per pair. Consumed by is_peer_access_enabled() and any Sirius-side

@@ -31,6 +31,10 @@ namespace sirius::io {
 
 class buffer_pool;
 class prefetching_cache;
+// sirius_datasource is only referenced through std::unique_ptr in declarations
+// here; a forward declaration breaks the include cycle with sirius_datasource.hpp
+// (which includes this header for sirius_ioctx).
+class sirius_datasource;
 
 // ---------------------------------------------------------------------------
 // sirius_ioctx
@@ -55,11 +59,11 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   /// @c supports()).
   virtual std::shared_ptr<sirius_io_object> create_io_object(std::string path) = 0;
 
-  virtual std::unique_ptr<cudf::io::datasource> make_datasource(
+  virtual std::unique_ptr<io::sirius_datasource> make_datasource(
     std::shared_ptr<sirius_io_object> io_object) = 0;
 
   /// Convenience: @c create_io_object + @c make_datasource in one shot.
-  std::unique_ptr<cudf::io::datasource> open_datasource(std::string path)
+  std::unique_ptr<io::sirius_datasource> open_datasource(std::string path)
   {
     return make_datasource(create_io_object(std::move(path)));
   }

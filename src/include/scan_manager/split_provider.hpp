@@ -20,6 +20,7 @@
 #include "scan_manager/split_connector.hpp"
 
 #include <atomic>
+#include <cstddef>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -31,6 +32,8 @@ class operator_data;
 }  // namespace sirius::op
 
 namespace sirius::scan_manager {
+
+class balancing_strategy;
 
 /**
  * @brief Driver of splits for a scan operator.
@@ -127,6 +130,24 @@ class split_provider {
   /// `provider.get_ingestible().shared_from_this()`.
   [[nodiscard]] io::gpu_ingestible& get_ingestible() const noexcept { return *_ingestible; }
 
+  /**
+   * @brief Install the balancing strategy that places this provider's splits.
+   *
+   * Wired up by @c sirius_scan_manager::prepare_for_query. @p strategy is
+   * consulted for each fresh-read split the provider emits (see
+   * @ref apply_balancing); it may be shared across providers so a stateful
+   * policy (e.g. round-robin) balances across the whole scan stage. @p pipeline_id
+   * identifies the pipeline this provider's scan belongs to and is forwarded to
+   * @c balancing_strategy::get_next_gpu. Leaving the strategy unset (null)
+   * disables placement — splits then carry no preference and the task creator
+   * falls back to its own locality logic.
+   */
+  void set_balancing_strategy(std::shared_ptr<balancing_strategy> strategy, std::size_t pipeline_id)
+  {
+    _balancing_strategy = std::move(strategy);
+    _pipeline_id        = pipeline_id;
+  }
+
  protected:
   /**
    * @brief Push a split into a connector.
@@ -143,11 +164,32 @@ class split_provider {
   static void push_to_connector(split_connector& connector,
                                 std::unique_ptr<op::operator_data> split);
 
+  /**
+   * @brief Ask the balancing strategy to place a fresh-read split on a GPU.
+   *
+   * No-op when no strategy was installed (see @ref set_balancing_strategy) or
+   * when @p split already carries a device preference. Resident splits
+   * (pinned-cache batches, @c operator_data::is_resident) are skipped: their
+   * data already lives on a specific GPU, so placement is decided downstream by
+   * data locality rather than overridden here. Defined out-of-line because it
+   * touches the complete @c op::operator_data and @c balancing_strategy types,
+   * kept forward-declared in this header.
+   */
+  void apply_balancing(op::operator_data& split);
+
  private:
   /// Non-owning pointer to the composed ingestible (null on the legacy
   /// default-ctor path). The operator owns the lifetime; the provider is
   /// always destroyed first via @c sirius_scan_manager::reset.
   io::gpu_ingestible* _ingestible{nullptr};
+
+  /// Placement policy for the splits this provider emits. May be shared with
+  /// other providers. Null until @ref set_balancing_strategy is called, which
+  /// disables placement.
+  std::shared_ptr<balancing_strategy> _balancing_strategy;
+
+  /// Pipeline this provider's scan belongs to, forwarded to the strategy.
+  std::size_t _pipeline_id{0};
 
   /// RAII coordination shared across the enqueued tasks. Destructor closes
   /// the connector with the captured exception (if any) once the last task
@@ -194,10 +236,11 @@ void split_provider::run(Scheduler& scheduler, split_connector& connector)
     // Concurrent observer could have drained the last batch between the
     // has_more_splits() check and our claim; skip the empty handoff.
     if (!work) { continue; }
-    scheduler.enqueue([state, work = std::move(work)]() mutable {
+    scheduler.enqueue([this, state, work = std::move(work)]() mutable {
       try {
         auto splits = work();
         for (auto& split : splits) {
+          if (split) { apply_balancing(*split); }
           push_to_connector(state->connector, std::move(split));
         }
       } catch (...) {

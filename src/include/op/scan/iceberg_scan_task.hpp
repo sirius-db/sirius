@@ -58,19 +58,14 @@ class iceberg_scan_task_global_state : public parquet_scan_task_global_state {
    * @param pipeline             The pipeline for this scan.
    * @param scan_op              The physical iceberg scan operator.
    * @param approximate_batch_size  Target uncompressed batch size.
-   * @param gpu_ioctxs           Per-GPU sirius_ioctx instances indexed by
-   *                             device_id. Seeded by task_creator from
-   *                             SiriusContext::get_gpu_ioctxs(). Forwarded
-   *                             to the base parquet_scan_task_global_state
-   *                             so that the data-file footer pre-reads can
-   *                             resolve ioctxs via get_gpu_ioctxs().
+   * @param ioctx                Shared sirius_ioctx for I/O.
    */
   iceberg_scan_task_global_state(
     duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
     sirius_physical_iceberg_scan* scan_op,
     std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
-    size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE,
-    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs = {});
+    size_t approximate_batch_size                   = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE,
+    std::shared_ptr<sirius::io::sirius_ioctx> ioctx = {});
 
  private:
   // -------------------------------------------------------------------------
@@ -94,7 +89,7 @@ class iceberg_scan_task_global_state : public parquet_scan_task_global_state {
     sirius_physical_iceberg_scan* scan_op,
     init_data init,
     size_t approximate_batch_size,
-    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> gpu_ioctxs,
+    std::shared_ptr<sirius::io::sirius_ioctx> ioctx,
     std::shared_ptr<const telemetry::telemetry_context> telemetry_context);
 
   // -------------------------------------------------------------------------

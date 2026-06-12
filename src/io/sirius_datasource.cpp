@@ -21,7 +21,7 @@
 #include <rmm/device_buffer.hpp>
 
 #include <fcntl.h>
-#include <spdlog/spdlog.h>
+#include <log/logging.hpp>
 #include <sys/stat.h>
 
 #include <algorithm>
@@ -39,6 +39,14 @@ sirius_datasource::sirius_datasource(std::shared_ptr<sirius_ioctx> io_ctx,
 }
 
 sirius_datasource::~sirius_datasource() {}
+
+std::shared_ptr<sirius_io_object_metadata> sirius_datasource::metadata() const
+{
+  if (!_io_ctx || !_io_object) { return nullptr; }
+  auto* cache = _io_ctx->cache();
+  if (cache == nullptr) { return nullptr; }
+  return cache->get_metadata(*_io_object);
+}
 
 size_t sirius_datasource::size() const { return _io_object->size(); }
 

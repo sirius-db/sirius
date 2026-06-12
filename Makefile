@@ -22,8 +22,8 @@ MAIN_BUILD_TARGETS ?= duckdb duckdb_local_extension_repo
 	clang-release clang-debug clang-relwithdebinfo clang-asan clang-tsan \
 	ci-release configure_ci set_duckdb_version \
 	test test_release test_debug test_reldebug test_ci-release clean list-presets \
-	s3-up s3-up-large s3-down s3-test s3-test-large \
-	s3-test-aws s3-test-aws-sigv4 s3-test-aws-broker s3-bench s3-bench-fixtures
+	s3-test s3-test-large \
+	s3-test-aws s3-test-aws-sigv4 s3-test-aws-broker s3-bench
 
 PRESETS_LINK := $(DUCKDB_DIR)/CMakePresets.json
 
@@ -136,27 +136,29 @@ list-presets: $(PRESETS_LINK)
 	cd $(DUCKDB_DIR) && $(CMAKE) --list-presets
 
 # -----------------------------------------------------------------------------
-# S3 integration test scaffolding
+# S3 integration test gates
 # -----------------------------------------------------------------------------
-# `make s3-up`        starts the pinned MinIO container and populates fixtures
-#                     (binary blobs plus the standard integration parquet
-#                     fixtures under test/cpp/integration/data/parquet).
-# `make s3-down`      tears it down (including the data volume).
-# `make test`         runs the default Catch2 suite without starting MinIO.
-# `make s3-test`      one-shot standard S3 correctness gate: starts MinIO,
-#                     sources env.sh, runs every Catch2 test tagged
-#                     [s3][integration] except [large] and [aws] in strict
-#                     mode (this includes the SQL-over-S3 subset), then tears
-#                     MinIO down even on failure.
-# `make s3-test-large`
-#                     one-shot large-SF10 SQL-over-S3 gate: starts MinIO,
-#                     uploads standard fixtures plus lineitem_sf10.parquet via
-#                     fixtures.sh --perf, then runs [s3][sql][large].
+# MinIO is now started by the test binary itself (test/cpp/utils/s3_container.*,
+# via the vendored testcontainers-native bridge) when SIRIUS_TEST_S3_AUTO=1 is
+# set. There is no separate `s3-up`/`s3-down` step, no docker-compose, and no
+# env.sh to source: the binary spins up HTTP + TLS MinIO on dynamic ports,
+# uploads fixtures, runs the tests, and tears the containers down on exit.
 #
-# The s3-test-aws* targets are MANUAL real-AWS gates: they never start MinIO or
-# Docker and are deliberately excluded from CI. Export the AWS environment
-# yourself first (regional S3 endpoint, real bucket, and assume-role TEMPORARY
-# credentials including the session token); keep usage bounded.
+# `make test`         runs the default Catch2 suite; AUTO is unset, so no Docker.
+# `make s3-test`      standard S3 correctness gate: runs [s3][integration] except
+#                     [large]/[aws] (incl. the SQL-over-S3 surface) with MinIO
+#                     auto-managed, in strict mode.
+# `make s3-test-large`
+#                     large-SF10 SQL-over-S3 gate. SIRIUS_TEST_S3_LARGE=1 makes
+#                     the harness generate + upload lineitem_sf10.parquet (needs
+#                     the DuckDB CLI from `make release`), then runs
+#                     [s3][sql][large].
+#
+# The s3-test-aws* targets are MANUAL real-AWS gates: they never start MinIO
+# (AUTO is unset) and are deliberately excluded from CI. Export the AWS
+# environment yourself first — including SIRIUS_TEST_S3_ENDPOINT — (regional S3
+# endpoint, real bucket, and assume-role TEMPORARY credentials including the
+# session token); keep usage bounded.
 # `make s3-test-aws`  runs the live [s3][aws] tests against a real S3 endpoint.
 # `make s3-test-aws-sigv4`
 #                     subset using Sirius's built-in SigV4 presigner only
@@ -167,60 +169,36 @@ list-presets: $(PRESETS_LINK)
 #
 # See test/cpp/integration/s3/README.md for details.
 
-S3_DIR := test/cpp/integration/s3
-S3_COMPOSE := $(S3_DIR)/docker-compose.yml
 S3_TEST_BIN ?= build/release/extension/sirius/test/cpp/sirius_unittest
 
-s3-up:
-	$(S3_DIR)/ensure_tls_certs.sh
-	docker compose -f $(S3_COMPOSE) up -d
-	$(S3_DIR)/fixtures.sh
-
-s3-up-large:
-	$(S3_DIR)/ensure_tls_certs.sh
-	docker compose -f $(S3_COMPOSE) up -d
-	$(S3_DIR)/fixtures.sh --perf
-
-s3-down:
-	docker compose -f $(S3_COMPOSE) down -v
-
-s3-test: SHELL := /bin/bash
 s3-test:
 	@if [ ! -x $(S3_TEST_BIN) ]; then \
 	  echo "s3-test: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
 	  exit 1; \
 	fi
 	@set -e; \
-	trap '$(MAKE) s3-down' EXIT; \
-	$(MAKE) s3-up; \
-	source $(S3_DIR)/env.sh; \
-	export SIRIUS_TEST_S3_STRICT=1; \
+	export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_STRICT=1; \
 	$(S3_TEST_BIN) "[s3][integration]~[large]~[aws]"
 
-s3-test-large: SHELL := /bin/bash
 s3-test-large:
 	@if [ ! -x $(S3_TEST_BIN) ]; then \
 	  echo "s3-test-large: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
 	  exit 1; \
 	fi
+	@# Grouped by config (chunk-prewarm on vs off) so MinIO is brought up once per
+	@# group. Catch2 OR-combines specs within one argument via commas (multiple
+	@# positional args are AND-concatenated instead), so each group runs in a
+	@# single process where same-config cases share one SiriusContext lifecycle.
 	@set -e; \
-	trap '$(MAKE) s3-down' EXIT; \
-	$(MAKE) s3-up-large; \
-	source $(S3_DIR)/env.sh; \
-	export SIRIUS_TEST_S3_STRICT=1; \
-	$(S3_TEST_BIN) "[s3][sql][large][large-count]"; \
-	$(S3_TEST_BIN) "[s3][sql][large][large-q1]"; \
-	$(S3_TEST_BIN) "[s3][sql][large][large-join]"; \
-	$(S3_TEST_BIN) "[s3][sql][large][large-count-no-prewarm]"; \
-	$(S3_TEST_BIN) "[s3][sql][large][large-q1-no-prewarm]"; \
-	$(S3_TEST_BIN) "[s3][sql][large][large-join-no-prewarm]"
+	export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_LARGE=1 SIRIUS_TEST_S3_STRICT=1; \
+	$(S3_TEST_BIN) "[s3][sql][large][large-count],[s3][sql][large][large-q1],[s3][sql][large][large-join]"; \
+	$(S3_TEST_BIN) "[s3][sql][large][large-count-no-prewarm],[s3][sql][large][large-q1-no-prewarm],[s3][sql][large][large-join-no-prewarm]"
 
 # Manual real-AWS gates. These never start MinIO/Docker and are excluded from
 # CI. Export the AWS environment yourself before invoking (regional S3 endpoint,
 # real bucket, and assume-role TEMPORARY credentials including the session
 # token); keep usage bounded. SIRIUS_TEST_S3_STRICT=1 turns a missing-env skip
 # into a hard failure so a misconfigured run is loud rather than silently green.
-s3-test-aws: SHELL := /bin/bash
 s3-test-aws:
 	@if [ ! -x $(S3_TEST_BIN) ]; then \
 	  echo "s3-test-aws: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
@@ -230,7 +208,6 @@ s3-test-aws:
 	export SIRIUS_TEST_S3_STRICT=1; \
 	$(S3_TEST_BIN) "[s3][aws]"
 
-s3-test-aws-sigv4: SHELL := /bin/bash
 s3-test-aws-sigv4:
 	@if [ ! -x $(S3_TEST_BIN) ]; then \
 	  echo "s3-test-aws-sigv4: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
@@ -240,7 +217,6 @@ s3-test-aws-sigv4:
 	export SIRIUS_TEST_S3_STRICT=1; \
 	$(S3_TEST_BIN) "[s3][aws]~[broker]"
 
-s3-test-aws-broker: SHELL := /bin/bash
 s3-test-aws-broker:
 	@if [ ! -x $(S3_TEST_BIN) ]; then \
 	  echo "s3-test-aws-broker: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
@@ -253,34 +229,23 @@ s3-test-aws-broker:
 # -----------------------------------------------------------------------------
 # S3 perf benchmark (Catch2 [!benchmark][perf][bench] hidden tag - not in the
 # default CI suite, and deliberately NOT tagged [s3] so the [s3] integration
-# gate does not pull the benchmark in). `make s3-bench-fixtures` runs
-# fixtures.sh --perf, which first uploads the standard fixtures and then adds
-# the SF10 lineitem parquet. Generates a JSON record under
+# gate does not pull the benchmark in). For the default MinIO backend the
+# harness auto-manages MinIO (SIRIUS_TEST_S3_AUTO=1) and generates/uploads the
+# SF10 lineitem fixture (SIRIUS_TEST_S3_LARGE=1); the benchmark reads
+# SIRIUS_BENCH_S3_* and falls back to the harness-published SIRIUS_TEST_S3_*.
+# Generates a JSON record under
 # build/release/extension/sirius/test/cpp/log/perf_<ts>.json for tracking.
-# Override SIRIUS_BENCH_BACKEND=aws-s3 to portably hit AWS instead of MinIO;
-# see test/cpp/integration/s3/fixtures/README.md for the env-var contract.
+# Set SIRIUS_BENCH_BACKEND=aws-s3 (and the SIRIUS_BENCH_AWS_S3_* vars) to hit AWS
+# instead of MinIO; AUTO stays off in that case.
 
-s3-bench-fixtures: SHELL := /bin/bash
-s3-bench-fixtures:
-	@if [ ! -x $(S3_DIR)/fixtures.sh ]; then \
-	  echo "s3-bench-fixtures: $(S3_DIR)/fixtures.sh not executable" >&2; \
-	  exit 1; \
-	fi
-	@$(S3_DIR)/fixtures.sh --perf
-
-s3-bench: SHELL := /bin/bash
 s3-bench:
 	@if [ ! -x $(S3_TEST_BIN) ]; then \
 	  echo "s3-bench: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
 	  exit 1; \
 	fi
-	@if [ "$${SIRIUS_BENCH_BACKEND:-minio}" = "minio" ]; then \
-	  source $(S3_DIR)/env.sh; \
-	  export SIRIUS_BENCH_S3_ENDPOINT="$${SIRIUS_BENCH_S3_ENDPOINT:-$$SIRIUS_TEST_S3_ENDPOINT}"; \
-	  export SIRIUS_BENCH_S3_REGION="$${SIRIUS_BENCH_S3_REGION:-$$SIRIUS_TEST_S3_REGION}"; \
-	  export SIRIUS_BENCH_S3_ACCESS_KEY="$${SIRIUS_BENCH_S3_ACCESS_KEY:-$$SIRIUS_TEST_S3_ACCESS_KEY}"; \
-	  export SIRIUS_BENCH_S3_SECRET_KEY="$${SIRIUS_BENCH_S3_SECRET_KEY:-$$SIRIUS_TEST_S3_SECRET_KEY}"; \
-	  export SIRIUS_BENCH_S3_BUCKET="$${SIRIUS_BENCH_S3_BUCKET:-$$SIRIUS_TEST_S3_BUCKET}"; \
+	@set -e; \
+	if [ "$${SIRIUS_BENCH_BACKEND:-minio}" = "minio" ]; then \
+	  export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_LARGE=1; \
 	fi; \
 	export SIRIUS_BENCH_GIT_SHA="$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"; \
 	$(S3_TEST_BIN) "[!benchmark][perf][bench]"

@@ -21,8 +21,8 @@
 #include "expression/ast/node.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/sirius_physical_filter.hpp"
-#include "op/sirius_physical_projection.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "planner/sirius_plan_projection_utils.hpp"
 
 #include <memory>
 
@@ -79,12 +79,10 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalFilter& op)
       select_list.push_back(
         duckdb::make_uniq<duckdb::BoundReferenceExpression>(op.types[i], op.projection_map[i]));
     }
-    auto proj = duckdb::make_uniq<sirius::op::sirius_physical_projection>(
-      sirius::from_duckdb_vec(op.types),
-      translate_expressions(std::move(select_list)),
-      op.estimated_cardinality);
-    proj->children.push_back(std::move(plan));
-    plan = std::move(proj);
+    plan = push_projection(std::move(plan),
+                           sirius::from_duckdb_vec(op.types),
+                           translate_expressions(std::move(select_list)),
+                           op.estimated_cardinality);
   }
   return plan;
 }

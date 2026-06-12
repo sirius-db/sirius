@@ -89,4 +89,13 @@ inline std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> make_t
   return ioctxs;
 }
 
+inline std::shared_ptr<sirius::io::sirius_ioctx> make_test_ioctx()
+{
+  return std::make_shared<sirius::io::uring_ioctx>(
+    /*host_ring_depth=*/static_cast<unsigned>(16),
+    /*ring_entries=*/static_cast<unsigned>(64),
+    /*n_reactors=*/static_cast<size_t>(4),
+    /*bounce_slot_size=*/sirius::io::CHUNK_SIZE);
+}
+
 }  // namespace sirius::scan_test_utils

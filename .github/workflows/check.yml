@@ -146,6 +146,24 @@ jobs:
         env:
           CUDAARCHS: "100"
 
+      # Rust bindings (sirius-sys + sirius) — fmt/clippy + build/link the test.
+      # Run on a single representative entry. `cargo test --no-run` compiles the
+      # cxx glue against the Sirius FFI header and links the proof-of-life test
+      # against the single Sirius library built above (build.rs discovers it under
+      # build/release). It is NOT run here: constructing a context does GPU
+      # bring-up, and these are CPU runners — the actual run belongs on a GPU
+      # runner (test workflow).
+      - name: Rust bindings checks
+        if: >-
+          matrix.build.arch == 'x64' && matrix.build.compiler == 'gcc'
+          && matrix.build.build-type == 'release' && matrix.build.environment == 'default'
+          && matrix.build.cudf-channel == 'stable' && matrix.build.variant == 'super'
+        run: |
+          set -euo pipefail
+          pixi run cargo fmt --manifest-path rust/Cargo.toml --package sirius --package sirius-sys --check
+          pixi run cargo clippy --manifest-path rust/Cargo.toml --package sirius --package sirius-sys --all-targets -- -D warnings
+          pixi run cargo test --no-run --manifest-path rust/Cargo.toml --package sirius --package sirius-sys
+
       - name: Build (vcpkg)
         if: matrix.build.environment == 'vcpkg'
         run: |

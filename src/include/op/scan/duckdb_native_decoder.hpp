@@ -43,23 +43,18 @@ class duckdb_native_ingestible_table_info;
 /**
  * @brief Per-split payload consumed by @ref decode_duckdb_native_split.
  *
- * Built by @c duckdb_native_gpu_ingestible::next_split_provider from a
- * contiguous run of the walker's @c duckdb_row_group_metadata. The
- * @ref table_info pointer aliases the ingestible's owned bind data and is
- * valid for the lifetime of every emitted split (the ingestible outlives
- * its splits).
+ * Built by @c duckdb_native_gpu_ingestible from a run of
+ * @c duckdb_row_group_metadata. The @ref table_info pointer aliases the
+ * ingestible's owned bind data and is valid for the split's lifetime.
  */
 struct duckdb_native_split_payload {
   std::vector<duckdb_row_group_metadata> row_groups;
-  /// Stable alias into the ingestible's owned bind data. Carries
-  /// @c storage / @c context / @c projected_cols / @c projected_types that
-  /// the decoder reads.
+  /// Alias into the ingestible's owned bind data. Carries @c storage /
+  /// @c context / @c projected_cols / @c projected_types that the decoder reads.
   duckdb_native_ingestible_table_info const* table_info = nullptr;
-  /// Sirius IO substrate handles. Set by the regular (non-cached) split
-  /// path so the decoder can read .db blocks via @c sirius_ioctx::host_read
-  /// instead of going through DuckDB's BufferManager. Both null when the
-  /// scan_manager runs without sirius_datasource (decoder falls back to
-  /// BufferManager).
+  /// Sirius IO substrate handles used to read .db blocks via
+  /// @c sirius_ioctx::host_read. Required by the decoder, which throws if
+  /// either is absent.
   std::shared_ptr<sirius::io::sirius_ioctx> io_ctx;
   std::shared_ptr<sirius::io::sirius_io_object> db_io_object;
 };

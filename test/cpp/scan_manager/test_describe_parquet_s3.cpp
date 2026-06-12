@@ -15,12 +15,6 @@
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 
-// Include this last among sirius/test headers: it transitively pulls
-// liburing.h, whose BLOCK_SIZE macro collides with blockingconcurrentqueue.h.
-// clang-format off
-#include <scan/test_helpers_ioctx.hpp>
-// clang-format on
-
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 
@@ -36,9 +30,7 @@
 #include <utility>
 
 using sirius::io::buffer_pool;
-using sirius::io::sirius_io_object;
 using sirius::io::sirius_ioctx;
-using sirius::io::uring_ioctx;
 using sirius::io::s3::s3_blocking_ioctx;
 using sirius::io::s3::s3_ioctx;
 using sirius::io::s3::s3_ioctx_config;
@@ -49,6 +41,15 @@ using sirius::scan_manager::scan_manager_config;
 using sirius::scan_manager::sirius_scan_manager;
 
 namespace {
+
+// Shim for the removed scan_manager io_ctx getters: resolve a path to its
+// backend through create_datasource (which now owns the routing). The backend
+// outlives the temporary datasource because the scan_manager owns it.
+inline sirius_ioctx* resolve_io_ctx(sirius_scan_manager& mgr, std::string const& uri)
+{
+  auto ds = mgr.create_datasource(uri);
+  return ds ? ds->io_ctx().get() : nullptr;
+}
 
 using namespace std::chrono_literals;
 
@@ -134,36 +135,6 @@ std::size_t cache_capacity_bytes(std::size_t block_size, std::uint32_t max_slabs
          static_cast<std::size_t>(max_slabs);
 }
 
-std::string strip_file_scheme(std::string_view path)
-{
-  static constexpr std::string_view file_scheme = "file://";
-  if (path.size() > file_scheme.size() && path.substr(0, file_scheme.size()) == file_scheme) {
-    return std::string{path.substr(file_scheme.size())};
-  }
-  return std::string{path};
-}
-
-class file_uri_uring_ioctx final : public uring_ioctx {
- public:
-  file_uri_uring_ioctx()
-    : uring_ioctx(/*host_ring_depth=*/16,
-                  /*ring_entries=*/64,
-                  /*n_reactors=*/1,
-                  /*bounce_slot_size=*/1UL * 1024 * 1024)
-  {
-  }
-
-  std::shared_ptr<sirius_io_object> create_io_object(std::string path) override
-  {
-    return uring_ioctx::create_io_object(strip_file_scheme(path));
-  }
-
-  [[nodiscard]] bool supports(std::string_view path) const override
-  {
-    return uring_ioctx::supports(strip_file_scheme(path));
-  }
-};
-
 struct host_cache_memory {
   host_cache_memory()
     : upstream(0, true),
@@ -173,14 +144,12 @@ struct host_cache_memory {
               cache_capacity_bytes(cache_block_size, cache_max_slabs),
               cache_block_size,
               static_cast<std::size_t>(buffer_pool::CHUNKS_PER_SLAB),
-              1),
-      pool(host_mr, cache_max_slabs)
+              1)
   {
   }
 
   cucascade::memory::numa_region_pinned_host_memory_resource upstream;
   cucascade::memory::fixed_size_host_memory_resource host_mr;
-  buffer_pool pool;
 };
 
 std::filesystem::path parquet_fixture(std::string_view file_name)
@@ -275,11 +244,9 @@ TEST_CASE("describe_parquet reports no matching backend with the URI in the erro
 TEST_CASE("describe_parquet parses local parquet footer metadata through the ioctx path",
           "[scan_manager][describe_parquet][s3]")
 {
-  auto local_ctx = std::make_shared<file_uri_uring_ioctx>();
-
   scan_manager_config cfg{};
   cfg.use_sirius_datasource = true;
-  sirius_scan_manager manager(std::move(cfg), {std::static_pointer_cast<sirius_ioctx>(local_ctx)});
+  sirius_scan_manager manager(std::move(cfg));
 
   for (auto const fixture_name : {"nation.parquet", "orders.parquet"}) {
     auto const uri = "file://" + parquet_fixture(fixture_name).string();
@@ -293,18 +260,22 @@ TEST_CASE("describe_parquet parses local parquet footer metadata through the ioc
 }
 
 TEST_CASE("describe_parquet metadata-only insert round-trips local parquet footer through cache",
-          "[scan_manager][describe_parquet][s3][cache]")
+          "[.][scan_manager][describe_parquet][s3][cache]")
 {
   host_cache_memory cache_memory;
-  auto local_ctx = std::make_shared<file_uri_uring_ioctx>();
-  local_ctx->initialize_cache(cache_memory.pool, 8);
 
   scan_manager_config cfg{};
-  cfg.use_sirius_datasource = true;
-  sirius_scan_manager manager(std::move(cfg), {std::static_pointer_cast<sirius_ioctx>(local_ctx)});
+  cfg.use_sirius_datasource           = true;
+  cfg.enable_prefetch_cache           = true;
+  cfg.prefetch_buffer_pool_bytes      = cache_capacity_bytes(cache_block_size, cache_max_slabs);
+  cfg.prefetch_inflight_budget_chunks = 8;
+  sirius_scan_manager manager(std::move(cfg), &cache_memory.host_mr);
 
-  auto const uri = "file://" + parquet_fixture("orders.parquet").string();
-  auto bind_info = manager.describe_parquet(uri);
+  auto const uri  = "file://" + parquet_fixture("orders.parquet").string();
+  auto bind_info  = manager.describe_parquet(uri);
+  auto* local_ctx = resolve_io_ctx(manager, uri);
+  REQUIRE(local_ctx != nullptr);
+  REQUIRE(local_ctx->cache() != nullptr);
   auto io_object = local_ctx->create_io_object(uri);
   auto metadata  = local_ctx->cache()->get_metadata(*io_object);
 
@@ -342,7 +313,7 @@ TEST_CASE("describe_parquet fetches only the footer over S3",
   auto const key = env_or("SIRIUS_PR6_LARGE_S3_KEY", "parquet/lineitem.parquet");
   auto const uri = s3_uri(env->bucket, key);
 
-  auto* base_ctx = manager.io_ctx_for(uri);
+  auto* base_ctx = resolve_io_ctx(manager, uri);
   REQUIRE(base_ctx != nullptr);
   REQUIRE(is_s3_backend(base_ctx));
 
@@ -369,7 +340,7 @@ TEST_CASE("describe_parquet inserts parsed parquet metadata into the prefetch ca
   auto& manager  = fixture.context.get_scan_manager();
   auto const uri = s3_uri(env->bucket, "parquet/nation.parquet");
   auto bind_info = manager.describe_parquet(uri);
-  auto* base_ctx = manager.io_ctx_for(uri);
+  auto* base_ctx = resolve_io_ctx(manager, uri);
   REQUIRE(base_ctx != nullptr);
   REQUIRE(is_s3_backend(base_ctx));
   REQUIRE(base_ctx->cache() != nullptr);
@@ -398,7 +369,7 @@ TEST_CASE("describe_parquet exposes the parquet footer row count for planner met
 
   auto bind_info = manager.describe_parquet(uri);
 
-  auto* base_ctx = manager.io_ctx_for(uri);
+  auto* base_ctx = resolve_io_ctx(manager, uri);
   REQUIRE(base_ctx != nullptr);
   REQUIRE(is_s3_backend(base_ctx));
   REQUIRE(base_ctx->cache() != nullptr);

@@ -21,10 +21,6 @@
 #include "exec/config.hpp"
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
-#include "op/scan/cpu_source_task.hpp"
-#include "op/scan/duckdb_scan_executor.hpp"
-#include "op/scan/duckdb_scan_task.hpp"
-#include "op/scan/parquet_scan_task.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/sirius_pipeline_itask.hpp"
 #include "telemetry/telemetry_context.hpp"
@@ -33,6 +29,7 @@
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -42,7 +39,6 @@ namespace pipeline {
 
 task_scheduler::task_scheduler(
   const exec::thread_pool_config& gpu_executor_config,
-  const exec::thread_pool_config& scan_executor_config,
   sirius::memory::sirius_memory_reservation_manager& mem_mgr,
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
   const cucascade::memory::system_topology_info* sys_topology,
@@ -51,11 +47,6 @@ task_scheduler::task_scheduler(
 {
   _task_queue_telemetry = std::make_unique<telemetry::TaskQueueHandleWrapper>(
     *_telemetry_context, "task-scheduler-gpu-queue");
-
-  // Create the scan executor with memory manager for host allocations
-  // Pass a publisher so it can submit task requests without depending on task_scheduler
-  _scan_executor = std::make_unique<sirius::op::scan::duckdb_scan_executor>(
-    scan_executor_config, &mem_mgr, _task_request_channel.make_publisher(), _telemetry_context);
 
   // Self-publisher: schedule() uses this to wake management_eventloop when a
   // new task is pushed, so the loop can re-run the matcher against any device
@@ -102,25 +93,17 @@ task_scheduler::~task_scheduler() { stop(); }
 
 void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
-  if (task->is<sirius::op::scan::duckdb_scan_task>()) {
-    _scan_executor->schedule(std::move(task));
-  } else if (task->is<sirius::op::scan::parquet_scan_task>()) {
-    _scan_executor->schedule(std::move(task));
-  } else if (task->is<sirius::op::scan::cpu_source_task>()) {
-    _scan_executor->schedule(std::move(task));
-  } else {
-    if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
-      pipeline_task->telemetry_handle().queued({
-        .queue_resource_id      = _task_queue_telemetry->handle->uuid(),
-        .queue_capacity_entries = 1,
-      });
-    }
-    [[maybe_unused]] auto _ = _task_queue.push(std::move(task));
-    if (_self_publisher) {
-      auto wake                 = std::make_unique<task_request>();
-      wake->kind                = task_request_kind::task_available;
-      [[maybe_unused]] auto _ok = _self_publisher->send(std::move(wake));
-    }
+  if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
+    pipeline_task->telemetry_handle().queued({
+      .queue_resource_id      = _task_queue_telemetry->handle->uuid(),
+      .queue_capacity_entries = 1,
+    });
+  }
+  [[maybe_unused]] auto _ = _task_queue.push(std::move(task));
+  if (_self_publisher) {
+    auto wake                 = std::make_unique<task_request>();
+    wake->kind                = task_request_kind::task_available;
+    [[maybe_unused]] auto _ok = _self_publisher->send(std::move(wake));
   }
 }
 
@@ -128,7 +111,6 @@ void task_scheduler::start()
 {
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
-  _scan_executor->start();
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->start();
   }
@@ -148,7 +130,6 @@ void task_scheduler::stop()
   // Join the management thread first so it can finish processing any drained
   // events without dispatching to executors that are about to be stopped.
   if (_management_thread.joinable()) { _management_thread.join(); }
-  _scan_executor->stop();
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->stop();
   }
@@ -158,79 +139,48 @@ void task_scheduler::set_task_creator(sirius::creator::task_creator& task_creato
 {
   _task_creator = &task_creator;
 
-  _scan_executor->set_task_creator(_task_creator);
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->set_task_creator(_task_creator);
   }
 }
 
-[[nodiscard]] sirius::op::scan::duckdb_scan_executor& task_scheduler::get_scan_executor() noexcept
-{
-  return *_scan_executor;
-}
-
-[[nodiscard]] const sirius::op::scan::duckdb_scan_executor& task_scheduler::get_scan_executor()
-  const noexcept
-{
-  return *_scan_executor;
-}
-
-void task_scheduler::set_scan_caching_config(sirius::op::scan::cache_level level)
-{
-  _scan_executor->set_scan_caching_enabled(level);
-}
-
 void task_scheduler::prepare_for_query(duckdb::shared_ptr<planner::query> query)
 {
   // Drain leftover tasks from previous query
-  _scan_executor->drain_leftover_tasks();
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->drain_leftover_tasks();
   }
+
+  std::lock_guard lock(_query_mutex);
+  _query = std::move(query);
+
+  _completion_handler = std::make_unique<completion_handler>();
+
+  // Set completion handler on all executors
+  for (auto& [device_id, gpu_exec] : _gpu_executors) {
+    gpu_exec->set_completion_handler(_completion_handler.get());
+  }
+
   // Reset the round-robin counter so the walk is reproducible across
   // iterations of the same query (cache=table_gpu warm path keys cache
   // entries by device_id; without this reset the second iteration's source
   // tasks would assign to a different GPU and miss the cache entries).
   _no_pref_rr_counter.store(0, std::memory_order_relaxed);
-
-  auto scans = query->get_scan_operators();
-  _scan_executor->prepare_cache_for_scan_operators(scans);
-
-  std::lock_guard<std::mutex> lock(_priority_scans_mutex);
-  while (!_priority_scans.empty()) {
-    _priority_scans.pop();
-  }
-  for (auto* scan : scans) {
-    _priority_scans.push(scan);
-  }
 }
 
 std::future<void> task_scheduler::start_query()
 {
-  // Create a new completion handler for this query
-  _completion_handler      = std::make_unique<completion_handler>();
-  std::future<void> future = _completion_handler->get_awaitable();
+  std::scoped_lock lock(_query_mutex);
+  const auto& scans = _query->get_scan_operators();
 
-  // Set completion handler on all executors
-  _scan_executor->set_completion_handler(_completion_handler.get());
-  for (auto& [device_id, gpu_exec] : _gpu_executors) {
-    gpu_exec->set_completion_handler(_completion_handler.get());
-  }
+  _task_creator->schedule(scans.front());
 
-  constexpr int k_initial_scans = 2;
-  std::lock_guard<std::mutex> lock(_priority_scans_mutex);
-  for (int i = 0; i < k_initial_scans && !_priority_scans.empty(); ++i) {
-    auto* scan_op = _priority_scans.front();
-    _task_creator->schedule(scan_op);
-    _priority_scans.pop();
-  }
-
-  return future;
+  return _completion_handler->get_awaitable();
 }
 
 void task_scheduler::terminate_query(std::exception_ptr error)
 {
-  _completion_handler->report_error(error);
+  _completion_handler->report_error(std::move(error));
   stop();
 }
 
@@ -258,13 +208,6 @@ void task_scheduler::drain_after_error()
   // Drain the top-level task queue so management_eventloop doesn't dispatch
   // stale tasks from the failed query.
   _task_queue.drain();
-
-  // Stop the scan executor's manager loop, wait for in-flight scan tasks to
-  // finish, then restart the manager for the next query.  We must use
-  // drain_and_wait() (not just drain + wait_all) because the scan manager
-  // thread holds a kiosk ticket while blocked on pop(); without interrupting
-  // the queue and stopping the kiosk first, wait_all() deadlocks.
-  _scan_executor->drain_and_wait();
 
   // Interrupt each GPU executor's manager loop, wait for in-flight thread-pool
   // tasks to finish, then restart the manager for the next query.
@@ -314,7 +257,6 @@ void task_scheduler::wait_for_completion()
     }
 
     // Each executor must finish its in-flight tasks and then have an empty queue.
-    _scan_executor->wait_and_validate_empty();
     for (auto& [device_id, gpu_exec] : _gpu_executors) {
       gpu_exec->wait_and_validate_empty();
     }
@@ -354,13 +296,13 @@ void task_scheduler::management_eventloop()
       break;
     }
     if (evt->kind == task_request_kind::device_ready && !evt->is_scan) {
-      _ready_devices.insert(evt->device_id);
+      _ready_devices.emplace_back(evt->device_id);
     }
     // Drain any further events that are already queued, so a single matcher
     // pass handles a burst of ready signals plus task pushes together.
     while (auto more = _task_request_channel.try_get()) {
       if (more->kind == task_request_kind::device_ready && !more->is_scan) {
-        _ready_devices.insert(more->device_id);
+        _ready_devices.emplace_back(more->device_id);
       }
     }
 

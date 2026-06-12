@@ -21,6 +21,7 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/thread_context.hpp"
+#include "io/sirius_datasource.hpp"
 #include "log/logging.hpp"
 #include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/sirius_physical_concat.hpp"
@@ -47,6 +48,7 @@
 #include "pipeline/repository_wiring.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"
 #include "pipeline/sirius_plan_printer.hpp"
+#include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius/exception.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
@@ -216,8 +218,9 @@ duckdb::unique_ptr<op::sirius_physical_operator> sirius_engine::construct_sirius
       std::vector<int> gpu_device_ids;
       auto ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
       if (ctx != nullptr) {
-        for (auto const& kv : ctx->get_gpu_ioctxs()) {
-          gpu_device_ids.push_back(kv.first);
+        for (auto const* space :
+             ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+          gpu_device_ids.push_back(space->get_device_id());
         }
       }
       return duckdb::make_uniq<op::sirius_physical_parquet_scan>(&scan_physical_op,
@@ -333,22 +336,14 @@ void sirius_engine::prefetch_iceberg_delete_data(op::sirius_physical_operator& p
 
   duckdb::SiriusContext::InternalQueryGuard guard(*sirius_ctx);
 
-  // Iceberg metadata reads use a single GPU's sirius_ioctx (planning-time /
-  // pre-execution; not on the multi-GPU column-chunk hot path). Multi-GPU
-  // residency for iceberg metadata is deferred.
-  auto const& gpu_ioctxs = sirius_ctx->get_gpu_ioctxs();
-  if (gpu_ioctxs.empty()) {
+  auto& scan_mgr  = sirius_ctx->get_scan_manager();
+  auto datasource = scan_mgr.create_datasource(table_path);
+  if (!datasource) {
     throw std::runtime_error(
-      "[sirius_engine] read_iceberg_delete_data: SiriusContext has no GPU sirius_ioctxs "
-      "(read_iceberg_delete_data routes through sirius_datasource and does not implement "
-      "a kvikio fallback).");
+      "[sirius_engine] read_iceberg_delete_data: no IO backend supports path: " + table_path);
   }
-  // Pick the lowest-numbered GPU id (deterministic ordering — get_gpu_ioctxs
-  // returns an unordered_map, so use std::min_element rather than .begin()).
-  auto lowest = std::min_element(gpu_ioctxs.begin(),
-                                 gpu_ioctxs.end(),
-                                 [](auto const& a, auto const& b) { return a.first < b.first; });
-  auto data = op::scan::read_iceberg_delete_data(context, table_path, lowest->second, snapshot_id);
+  auto data =
+    op::scan::read_iceberg_delete_data(context, table_path, datasource->io_ctx(), snapshot_id);
   iceberg_delete_data_cache_.emplace(table_path, std::move(data));
 }
 

@@ -5,9 +5,9 @@
 # See the LICENSE file at the repo root for the full text.
 """Prepare local fixtures for the [s3][integration] tests.
 
-Writes files under ``<out_dir>`` (default:
-``test/cpp/integration/s3/fixtures/local``) which ``fixtures.sh`` uploads to
-the MinIO container via ``mc``. Text/binary fixtures are regenerated
+Writes files under ``<out_dir>`` which the test harness
+(``test/cpp/utils/s3_container.*``) then uploads to the MinIO containers from
+the host via Sirius's SigV4 signer. Text/binary fixtures are regenerated
 deterministically each run, and the standard integration Parquet fixtures are
 copied from ``test/cpp/integration/data/parquet`` so S3 tests exercise the same
 known TPCH data as the regular GPU integration suite.

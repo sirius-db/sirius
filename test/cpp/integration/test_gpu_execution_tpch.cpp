@@ -312,6 +312,25 @@ class GPUExecutionDuckDBFixture : public GPUExecutionFixtureBase {
     REQUIRE(result);
     REQUIRE_FALSE(result->HasError());
   }
+
+  // // Disabled: these tests scan native (DuckDB-storage) tables via seq_scan. The
+  // // legacy duckdb_scan path was removed and GPU native scan has no IO backend
+  // // wired in this harness ("missing io_ctx, io_obj"), so every query throws
+  // // "Unsupported scan function: seq_scan" and poisons the shared integration
+  // // DB. Shadow the comparison helpers to skip until native scan is supported.
+  // void compare_gpu_vs_cpu(const std::string& /*query*/,
+  //                         std::optional<float> /*float_tolerance*/ = std::nullopt)
+  // {
+  //   WARN("duckdb-native tpch scan skipped — legacy duckdb_scan path removed");
+  // }
+
+  // bool compare_gpu_vs_cpu_for(int /*num_gpus*/,
+  //                             const std::string& /*query*/,
+  //                             std::optional<float> /*float_tolerance*/ = std::nullopt)
+  // {
+  //   WARN("duckdb-native tpch scan skipped — legacy duckdb_scan path removed");
+  //   return false;  // RUN_TPCH_MGPU returns out of the test on false
+  // }
 };
 
 /**
@@ -1610,6 +1629,40 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
   compare_gpu_vs_cpu(
     "select n.n_name from nation n semi join customer c "
     "on n.n_nationkey = c.c_nationkey;");
+}
+
+//===----------------------------------------------------------------------===//
+// MARK join tests (issue #921: BUILD_PROBE mode for MARK join)
+//
+// `OR` combined with `IN (subquery)`, and `IN (subquery)` projected as a value,
+// both lower to a HASH_JOIN with "Join Type: MARK" in DuckDB. A large probe
+// (orders, 150k) over a small build/filter subquery (customer subset) drives the
+// planner into BUILD_PROBE, where one cudf::filtered_join is built on the right
+// (filter) side and reused across the streamed left probe batches.
+//===----------------------------------------------------------------------===//
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - mark join via OR + IN subquery parquet",
+                 "[integration][gpu_execution][parquet][markjoin]")
+{
+  // OR forces the IN membership to be materialized as a MARK join rather than a
+  // semi join; the customer subset is the small build side.
+  compare_gpu_vs_cpu(
+    "select count(*) as n from orders "
+    "where o_orderkey < 0 "
+    "   or o_custkey in (select c_custkey from customer where c_nationkey < 3);");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - mark join via projected IN subquery parquet",
+                 "[integration][gpu_execution][parquet][markjoin]")
+{
+  // Projecting the IN result as a boolean value produces a MARK join; grouping on
+  // the mark exercises both the matched (true) and unmatched (false) partitions.
+  compare_gpu_vs_cpu(
+    "select (o_custkey in (select c_custkey from customer where c_nationkey < 3)) as is_member, "
+    "       count(*) as n "
+    "from orders group by 1 order by 1;");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,

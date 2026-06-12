@@ -259,7 +259,7 @@ void downgrade_executor::processing_loop()
                 if (req_ptr->predicate && req_ptr->predicate()) { req_ptr->satisfied.store(true); }
               }
             } catch (const std::exception& e) {
-              SIRIUS_LOG_ERROR("[downgrade] convert failed: {}", e.what());
+              SIRIUS_LOG_ERROR("[downgrade] convert failed from data repository: {}", e.what());
             }
           });
       }
@@ -319,7 +319,7 @@ void downgrade_executor::processing_loop()
                 if (req_ptr->predicate && req_ptr->predicate()) { req_ptr->satisfied.store(true); }
               }
             } catch (const std::exception& e) {
-              SIRIUS_LOG_ERROR("[downgrade] convert failed: {}", e.what());
+              SIRIUS_LOG_ERROR("[downgrade] convert failed from task queue: {}", e.what());
             }
           });
       }
@@ -328,7 +328,9 @@ void downgrade_executor::processing_loop()
     // Wait for all in-flight work to finish (predicate also checked in workers)
     _pool->wait_all();
 
-    if (disk_not_configured && !req->satisfied.load()) {
+    // Monitor requests are gated by has_viable_downgrade_target() and warn once per stall episode
+    // in monitor_loop(); only warn here for one-shot (external) requests to avoid log spam.
+    if (disk_not_configured && !req->satisfied.load() && !req->is_monitor_request) {
       SIRIUS_LOG_WARN(
         "[downgrade] [{}] downgrade request not satisfied and disk memory space is not configured; "
         "data cannot be spilled to disk. Consider configuring a disk memory space to enable "
@@ -344,6 +346,9 @@ void downgrade_executor::processing_loop()
     double throughput_mbs =
       (duration_ms > 0.0) ? (total_bytes / (1024.0 * 1024.0)) / (duration_ms / 1000.0) : 0.0;
     std::string request_label = req->is_monitor_request ? "monitor " : "";
+    if (req->is_monitor_request) {
+      _monitor_request_enqueued.store(false, std::memory_order_relaxed);
+    }
 
     SIRIUS_LOG_DEBUG(
       "[downgrade] [{}] request {}done: {} batches, {} bytes in {:.2f} ms ({:.1f} MB/s) | "
@@ -369,22 +374,93 @@ void downgrade_executor::processing_loop()
   }
 }
 
+bool downgrade_executor::has_disk_tier() const
+{
+  return !_reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::DISK).empty();
+}
+
+bool downgrade_executor::has_viable_downgrade_target() const
+{
+  using cucascade::memory::Tier;
+
+  // DISK is an effectively unbounded sink and a valid target for any source tier.
+  if (has_disk_tier()) { return true; }
+
+  // Without a disk tier, only a GPU source has a lower tier to downgrade to (HOST). processing_loop
+  // only adds HOST target spaces when the source is GPU, so a HOST (or other) source has no target
+  // at all and can never free anything -- it must back off rather than re-fire.
+  if (_space_id.tier != Tier::GPU) { return false; }
+
+  // GPU source, no disk: viable iff some HOST space can currently accept a reservation. Probe with
+  // exactly the operation a downgrade performs -- make_reservation_or_null of one chunk, released
+  // immediately (RAII). This is the ground truth: HOST reserve() is bounded by _allocated_bytes,
+  // which reflects BOTH live reservations AND already-stored downgraded data, so neither
+  // get_total_reserved_memory nor get_available_memory alone captures whether a downgrade can land.
+  // (The chunk-sized probe matches the chunked allocator's rounding; a sub-chunk request would
+  // succeed against a remainder that no real batch could use.)
+  for (const auto* hs : _reservation_manager.get_memory_spaces_for_tier(Tier::HOST)) {
+    if (!hs) { continue; }
+    // The manager owns these spaces mutably; the span just exposes them as const. make_reservation
+    // mutates accounting, so we need a mutable handle.
+    auto* host         = const_cast<cucascade::memory::memory_space*>(hs);
+    size_t probe_bytes = 1;
+    if (const auto* chunked = host->get_chunked_resource_info()) {
+      probe_bytes = chunked->max_chunk_bytes();
+    }
+    // A chunk larger than this space's reservation limit can never be reserved (the HOST allocator
+    // throws on an over-limit request), so such a space cannot accept a downgrade -- skip it. The
+    // try/catch is belt-and-suspenders: this runs on the monitor thread, which must never throw.
+    if (probe_bytes > host->get_max_memory()) { continue; }
+    try {
+      if (auto probe = host->make_reservation_or_null(probe_bytes)) { return true; }
+    } catch (const std::exception& e) {
+      SIRIUS_LOG_DEBUG("[downgrade] [{}] host viability probe failed: {}", _source_label, e.what());
+    }
+  }
+  return false;
+}
+
 void downgrade_executor::monitor_loop()
 {
   using namespace std::chrono_literals;
 
+  // Monitor-thread-local; throttles the back-off warning to once per stall episode.
+  bool backed_off = false;
+
   while (_running.load()) {
-    if (_memory_space && _memory_space->should_downgrade_memory()) {
-      size_t amount = _memory_space->get_amount_to_downgrade();
-      if (amount > 0) {
-        auto req                = std::make_unique<downgrade_request>();
-        req->is_monitor_request = true;
-        req->predicate          = [&freed = req->bytes_freed, amount]() {
-          return freed.load(std::memory_order_relaxed) >= amount;
-        };
-        // Fire-and-forget: monitor does not wait for the result
-        _request_queue.push(std::move(req));
+    if (_memory_space && _memory_space->should_downgrade_memory() &&
+        !_monitor_request_enqueued.load(std::memory_order_relaxed)) {
+      // Stateless viability gate: only issue a downgrade request when one could plausibly free
+      // memory. When idle GPU batches' only lower tier is a full HOST and no DISK is configured,
+      // re-firing would just re-scan every repository and the task queue, free nothing, and spam
+      // the log every monitor_period_ms (~100x/s by default) forever. Skipping the cycle backs
+      // off cleanly; because this is re-checked every cycle the monitor resumes the instant host
+      // frees or pressure drops -- there is no latched state to get wedged on.
+      if (has_viable_downgrade_target()) {
+        backed_off    = false;
+        size_t amount = _memory_space->get_amount_to_downgrade();
+        if (amount > 0) {
+          auto req                = std::make_unique<downgrade_request>();
+          req->is_monitor_request = true;
+          req->predicate          = [&freed = req->bytes_freed, amount]() {
+            return freed.load(std::memory_order_relaxed) >= amount;
+          };
+          _monitor_requests_issued.fetch_add(1, std::memory_order_relaxed);
+          _monitor_request_enqueued.store(true, std::memory_order_relaxed);
+          // Fire-and-forget: monitor does not wait for the result
+          _request_queue.push(std::move(req));
+        }
+      } else if (!backed_off) {
+        SIRIUS_LOG_WARN(
+          "[downgrade] [{}] memory pressure but no viable downgrade target (host full, no disk "
+          "configured); backing off until memory is released. Consider configuring a disk memory "
+          "space to enable spilling.",
+          _source_label);
+        backed_off = true;
       }
+    } else {
+      // Pressure gone -- reset so the next stall episode warns again.
+      backed_off = false;
     }
     // Brief sleep to avoid busy-spinning; the monitor re-checks after each interval
     std::this_thread::sleep_for(std::chrono::milliseconds(_config.monitor_period_ms));

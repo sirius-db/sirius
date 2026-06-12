@@ -16,17 +16,12 @@
 
 #pragma once
 
-#include "config.hpp"
 #include "exec/channel.hpp"
 #include "exec/config.hpp"
 #include "exec/inspectable_mpsc.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
-#include "op/scan/config.hpp"
-#include "op/sirius_physical_duckdb_scan.hpp"
-#include "op/sirius_physical_operator.hpp"
 #include "parallel/task.hpp"
 #include "pipeline/completion_handler.hpp"
-#include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_request.hpp"
 #include "planner/query.hpp"
 
@@ -34,15 +29,9 @@
 
 #include <atomic>
 #include <future>
-#include <map>
 #include <memory>
 #include <optional>
-#include <queue>
-#include <set>
-
-namespace sirius::op::scan {
-class duckdb_scan_executor;
-}  // namespace sirius::op::scan
+#include <unordered_map>
 
 namespace sirius::parallel {
 class downgrade_executor;
@@ -76,13 +65,11 @@ class task_scheduler {
    * @brief Constructs a new task_scheduler with task execution configuration
    *
    * @param gpu_executor_config Configuration for the GPU pipeline executor thread pool
-   * @param scan_executor_config Configuration for the scan executor thread pool
    * @param mem_mgr Reference to the memory reservation manager
    * @param sys_topology Optional system topology info for CPU affinity
    * @param downgrade_executors Optional vector of downgrade executors
    */
   explicit task_scheduler(const exec::thread_pool_config& gpu_executor_config,
-                          const exec::thread_pool_config& scan_executor_config,
                           sirius::memory::sirius_memory_reservation_manager& mem_mgr,
                           std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
                           const cucascade::memory::system_topology_info* sys_topology = nullptr,
@@ -134,22 +121,6 @@ class task_scheduler {
    * @param task_creator Reference to the task creator
    */
   void set_task_creator(sirius::creator::task_creator& task_creator);
-
-  /**
-   * @brief Get the scan executor reference
-   *
-   * @return Reference to the duckdb scan executor
-   */
-  [[nodiscard]] sirius::op::scan::duckdb_scan_executor& get_scan_executor() noexcept;
-
-  [[nodiscard]] const sirius::op::scan::duckdb_scan_executor& get_scan_executor() const noexcept;
-
-  /**
-   * @brief Configure scan result caching level
-   *
-   * @param level The cache level to use
-   */
-  void set_scan_caching_config(sirius::op::scan::cache_level level);
 
   /**
    * @brief Get a pointer to the pipeline-level task queue.
@@ -230,8 +201,8 @@ class task_scheduler {
  private:
   void management_eventloop();
 
-  std::mutex _priority_scans_mutex;
-  std::queue<op::sirius_physical_operator*> _priority_scans;
+  std::mutex _query_mutex;
+  duckdb::shared_ptr<planner::query> _query;
 
   exec::inspectable_mpsc<sirius::parallel::itask> _task_queue;  ///< Queue for GPU pipeline tasks
   exec::channel<std::unique_ptr<task_request>> _task_request_channel;
@@ -246,19 +217,18 @@ class task_scheduler {
   /// Set of GPU device_ids that have a reserved worker thread waiting for a task.
   /// Only mutated by the management thread (matches device_ready signals from
   /// _task_request_channel and erases on dispatch), so no synchronization needed.
-  std::set<int> _ready_devices;
+  std::vector<int> _ready_devices;
 
   /// device_id -> GPU executor. std::map (not unordered_map) so iteration
   /// order is deterministic (ascending by device_id) — keeps preference-less
   /// task dispatch reproducible across runs.
-  std::map<int, std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;
+  std::unordered_map<int, std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;
   /// Deprecated as of pull-signal restoration: no-preference distribution now
   /// arises from which executor sends a device_ready signal first, not from a
   /// counter. Field retained for source compat with set_no_pref_rr_counter_for_testing.
   std::atomic<size_t> _no_pref_rr_counter{0};
 
   sirius::creator::task_creator* _task_creator{nullptr};
-  std::unique_ptr<sirius::op::scan::duckdb_scan_executor> _scan_executor;
   std::unique_ptr<completion_handler> _completion_handler;
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
   std::unique_ptr<telemetry::TaskQueueHandleWrapper> _task_queue_telemetry;
