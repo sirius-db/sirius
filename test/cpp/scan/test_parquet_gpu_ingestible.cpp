@@ -828,7 +828,7 @@ TEST_CASE("parquet_gpu_ingestible scan-side prewarm inserts column chunk ranges 
 }
 
 TEST_CASE("parquet_gpu_ingestible - s3 slice with non-null io_ctx routes through spy",
-          "[.][scan][parquet_gpu_ingestible][s3][datasource-routing]")
+          "[scan][parquet_gpu_ingestible][s3][datasource-routing]")
 {
   // Guard for sirius-db/sirius#889: when the scan_manager has no ioctx,
   // the materialize path must still honor slice.io_ctx and route
@@ -868,7 +868,7 @@ TEST_CASE("parquet_gpu_ingestible - s3 slice with non-null io_ctx routes through
 }
 
 TEST_CASE("parquet_gpu_ingestible - local slice with null io_ctx falls through to kvikio",
-          "[.][scan][parquet_gpu_ingestible][datasource-routing]")
+          "[scan][parquet_gpu_ingestible][datasource-routing]")
 {
   // Complement of the s3 routing guard above: a slice with io_ctx == nullptr
   // must continue to use cudf's bundled datasource (kvikio) — the local

@@ -260,7 +260,7 @@ TEST_CASE("describe_parquet parses local parquet footer metadata through the ioc
 }
 
 TEST_CASE("describe_parquet metadata-only insert round-trips local parquet footer through cache",
-          "[.][scan_manager][describe_parquet][s3][cache]")
+          "[scan_manager][describe_parquet][s3][cache]")
 {
   host_cache_memory cache_memory;
 
@@ -271,13 +271,12 @@ TEST_CASE("describe_parquet metadata-only insert round-trips local parquet foote
   cfg.prefetch_inflight_budget_chunks = 8;
   sirius_scan_manager manager(std::move(cfg), &cache_memory.host_mr);
 
-  auto const uri  = "file://" + parquet_fixture("orders.parquet").string();
-  auto bind_info  = manager.describe_parquet(uri);
-  auto* local_ctx = resolve_io_ctx(manager, uri);
-  REQUIRE(local_ctx != nullptr);
-  REQUIRE(local_ctx->cache() != nullptr);
-  auto io_object = local_ctx->create_io_object(uri);
-  auto metadata  = local_ctx->cache()->get_metadata(*io_object);
+  auto const uri = "file://" + parquet_fixture("orders.parquet").string();
+  auto bind_info = manager.describe_parquet(uri);
+  auto ds        = manager.create_datasource(uri);
+  REQUIRE(ds != nullptr);
+  REQUIRE(ds->io_ctx()->cache() != nullptr);
+  auto metadata = ds->io_ctx()->cache()->get_metadata(*ds->io_object());
 
   REQUIRE(metadata != nullptr);
   auto parquet = std::dynamic_pointer_cast<parquet_metadata>(metadata);
