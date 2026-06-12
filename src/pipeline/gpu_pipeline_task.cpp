@@ -31,6 +31,7 @@
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <data/data_batch_utils.hpp>
 
+#include <cstdint>
 #include <format>
 #include <optional>
 #include <string>
@@ -264,8 +265,9 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
     auto& op = operators[i].get();
     try {
       this->telemetry_handle().computing({
-        .instance_name               = "",
-        .current_operator_id         = op.get_operator_id(),
+        .instance_name       = "",
+        .current_operator_id = static_cast<uint32_t>(
+          op.get_operator_id()),  // TODO(dhruv9vats): look into possible overflow
         .input_bytes                 = operator_input_output_data->get_estimated_size_in_bytes(),
         .executor_thread_resource_id = executor_thread_resource_id,
       });

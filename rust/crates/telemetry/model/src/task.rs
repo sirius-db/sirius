@@ -86,7 +86,7 @@ state! {
 state! {
     Computing {
         attributes: {
-            current_operator_id: u64,
+            current_operator_id: u32,
             input_bytes: u64,
         },
         usages: {

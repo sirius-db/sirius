@@ -586,8 +586,9 @@ void duckdb_scan_executor::manager_loop()
               .executor_thread_resource_id = executor_thread_resource_id,
             });
             scan_task->telemetry_handle().computing({
-              .instance_name               = "",
-              .current_operator_id         = scan_operator_id,
+              .instance_name       = "",
+              .current_operator_id = static_cast<uint32_t>(
+                scan_operator_id),  // TODO(dhruv9vats): look into possible overflow
               .input_bytes                 = 0,
               .executor_thread_resource_id = executor_thread_resource_id,
             });

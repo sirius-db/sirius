@@ -111,7 +111,8 @@ void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> task)
   } else {
     if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
       pipeline_task->telemetry_handle().queued({
-        .queue_resource_id = _task_queue_telemetry->handle->uuid(),
+        .queue_resource_id      = _task_queue_telemetry->handle->uuid(),
+        .queue_capacity_entries = 1,
       });
     }
     [[maybe_unused]] auto _ = _task_queue.push(std::move(task));

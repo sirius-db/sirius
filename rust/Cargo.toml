@@ -5,7 +5,7 @@ members = [
     "crates/telemetry/model",
     "crates/telemetry/ui",
     "crates/telemetry/analyzer",
-    "crates/telemetry/server"
+    "crates/telemetry/server",
 ]
 
 [workspace.package]

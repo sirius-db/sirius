@@ -1,8 +1,11 @@
+//! Types shared with the UI.
+
 use quent_analyzer::EntityId;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 use uuid::Uuid;
 
+/// A reference to an entity
 #[derive(TS, Debug, Serialize)]
 pub enum EntityRef {
     Engine(Uuid),
@@ -45,28 +48,30 @@ pub struct QueryFilter {
 #[derive(TS, Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct TaskFilter {
     pub pipeline_uuid: Option<Uuid>,
-    pub current_operator_id: Option<u64>,
+    pub physical_operator_id: Option<u32>,
 }
 
 impl<'de> Deserialize<'de> for TaskFilter {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
-        D: Deserializer<'de>,
+        D: serde::Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        struct RawTaskFilter {
+        struct TaskFilterWire {
             #[serde(default)]
             pipeline_uuid: Option<Uuid>,
             #[serde(default)]
             operator_id: Option<Uuid>,
             #[serde(default)]
-            current_operator_id: Option<u64>,
+            physical_operator_id: Option<u32>,
+            #[serde(default)]
+            current_operator_id: Option<u32>,
         }
 
-        let raw = RawTaskFilter::deserialize(deserializer)?;
+        let wire = TaskFilterWire::deserialize(deserializer)?;
         Ok(Self {
-            pipeline_uuid: raw.pipeline_uuid.or(raw.operator_id),
-            current_operator_id: raw.current_operator_id,
+            pipeline_uuid: wire.pipeline_uuid.or(wire.operator_id),
+            physical_operator_id: wire.physical_operator_id.or(wire.current_operator_id),
         })
     }
 }
