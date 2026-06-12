@@ -1631,6 +1631,40 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
     "on n.n_nationkey = c.c_nationkey;");
 }
 
+//===----------------------------------------------------------------------===//
+// MARK join tests (issue #921: BUILD_PROBE mode for MARK join)
+//
+// `OR` combined with `IN (subquery)`, and `IN (subquery)` projected as a value,
+// both lower to a HASH_JOIN with "Join Type: MARK" in DuckDB. A large probe
+// (orders, 150k) over a small build/filter subquery (customer subset) drives the
+// planner into BUILD_PROBE, where one cudf::filtered_join is built on the right
+// (filter) side and reused across the streamed left probe batches.
+//===----------------------------------------------------------------------===//
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - mark join via OR + IN subquery parquet",
+                 "[integration][gpu_execution][parquet][markjoin]")
+{
+  // OR forces the IN membership to be materialized as a MARK join rather than a
+  // semi join; the customer subset is the small build side.
+  compare_gpu_vs_cpu(
+    "select count(*) as n from orders "
+    "where o_orderkey < 0 "
+    "   or o_custkey in (select c_custkey from customer where c_nationkey < 3);");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - mark join via projected IN subquery parquet",
+                 "[integration][gpu_execution][parquet][markjoin]")
+{
+  // Projecting the IN result as a boolean value produces a MARK join; grouping on
+  // the mark exercises both the matched (true) and unmatched (false) partitions.
+  compare_gpu_vs_cpu(
+    "select (o_custkey in (select c_custkey from customer where c_nationkey < 3)) as is_member, "
+    "       count(*) as n "
+    "from orders group by 1 order by 1;");
+}
+
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - basic semi join misfit 0",
                  "[integration][gpu_execution][semijoin]")
