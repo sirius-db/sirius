@@ -31,6 +31,7 @@
 // every synchronous CUDA API call is individually wrapped in `RMM_CUDA_TRY`.
 //===----------------------------------------------------------------------===//
 
+#include "cuda/scan/detail/vectorized_store.cuh"
 #include "cuda/scan/gpu_decode_alp.cuh"
 #include "cuda/scan/gpu_decode_bitpacking.cuh"
 #include "cuda/scan/gpu_decode_rle.cuh"
@@ -130,46 +131,20 @@ void validate_segment_bounds(std::vector<gpu_codec_run> const& runs,
 // that has to be checked.
 //===----------------------------------------------------------------------===//
 
-/// Reads a single value from `*src` (already on device) and writes it to
-/// every position in `dest[0..rows)`. When `sizeof(T)` divides 16 AND `dest`
-/// is 16-byte aligned, we pack the value into an `int4` and store 16 bytes
-/// per thread; otherwise we fall back to scalar stores (covers misaligned
-/// destinations, e.g. an odd `row_offset` for a small type, plus types that
-/// don't divide 16 such as decimal128's 16-byte storage where TPV would be 1
-/// anyway).
+/// Reads a single value from `*src` (already on device) and writes it to every
+/// position in `dest[0..rows)` via `detail::vec_fill`: int4 stores over the
+/// 16B-aligned interior, scalar prologue/tail for the unaligned head and ragged
+/// tail. decimal128's 16-byte storage falls to the scalar path (one int4 would
+/// hold a single value anyway).
 template <typename T>
 __global__ void kernel_broadcast_constant(T* __restrict__ dest,
                                           T const* __restrict__ src,
                                           uint32_t rows)
 {
-  T val           = *src;
-  uint32_t tid    = blockIdx.x * blockDim.x + threadIdx.x;
-  uint32_t stride = gridDim.x * blockDim.x;
-
-  if constexpr (sizeof(T) <= 8 && 16u % sizeof(T) == 0) {
-    if ((reinterpret_cast<uintptr_t>(dest) & 15u) == 0) {
-      constexpr uint32_t TPV = 16u / sizeof(T);  // Ts per int4
-      int4 vpacked;
-      T* lanes = reinterpret_cast<T*>(&vpacked);
-#pragma unroll
-      for (uint32_t i = 0; i < TPV; ++i)
-        lanes[i] = val;
-
-      uint32_t v_rows = rows / TPV;
-      int4* d4        = reinterpret_cast<int4*>(dest);
-      for (uint32_t i = tid; i < v_rows; i += stride)
-        d4[i] = vpacked;
-
-      // Tail rows that didn't fit a full int4.
-      uint32_t tail_start = v_rows * TPV;
-      for (uint32_t i = tail_start + tid; i < rows; i += stride)
-        dest[i] = val;
-      return;
-    }
-    // dest is not 16-byte aligned; fall through to scalar stores below.
-  }
-  for (uint32_t i = tid; i < rows; i += stride)
-    dest[i] = val;
+  T const val           = *src;
+  uint32_t const tid    = blockIdx.x * blockDim.x + threadIdx.x;
+  uint32_t const stride = gridDim.x * blockDim.x;
+  detail::vec_fill<T>(dest, rows, tid, stride, [val](uint32_t) { return val; });
 }
 
 /// Functor for `cudf::type_dispatcher`. We project each cudf type to its
