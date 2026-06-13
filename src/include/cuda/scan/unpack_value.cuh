@@ -24,7 +24,6 @@
 
 #include <cuda/scan/detail/bit_unpack.cuh>
 
-namespace sirius::cuda::scan
-{
+namespace sirius::cuda::scan {
 using detail::unpack_value;
-} // namespace sirius::cuda::scan
+}  // namespace sirius::cuda::scan

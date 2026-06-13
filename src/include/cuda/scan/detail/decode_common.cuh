@@ -22,25 +22,21 @@
 #pragma once
 
 #include <cub/config.cuh>
-
 #include <cuda/cmath>
+#include <cuda/scan/gpu_native_decode.cuh>  // gpu_codec_run
 #include <cuda/std/cstdint>
-
-#include <cuda/scan/gpu_native_decode.cuh> // gpu_codec_run
 
 #include <vector>
 
-namespace sirius::cuda::scan::detail
-{
+namespace sirius::cuda::scan::detail {
 
 //! One CTA's unit of work: a fixed-row-count block within one segment.
-struct cta_block_desc
-{
-  const uint8_t* d_segment;   ///< Device pointer to the segment's first byte.
-  uint32_t segment_bytes;     ///< Size of the staged segment buffer.
-  uint32_t block_idx;         ///< Block index within the segment.
-  uint32_t block_row_count;   ///< Rows in this block (the last block of a segment may be short).
-  uint32_t global_row_offset; ///< Output offset, in rows, for this block.
+struct cta_block_desc {
+  const uint8_t* d_segment;    ///< Device pointer to the segment's first byte.
+  uint32_t segment_bytes;      ///< Size of the staged segment buffer.
+  uint32_t block_idx;          ///< Block index within the segment.
+  uint32_t block_row_count;    ///< Rows in this block (the last block of a segment may be short).
+  uint32_t global_row_offset;  ///< Output offset, in rows, for this block.
 };
 
 //! @brief Build one `cta_block_desc` per @p RowsPerBlock block across every live segment of @p run,
@@ -50,20 +46,14 @@ template <uint32_t RowsPerBlock>
 {
   std::vector<cta_block_desc> descs;
   size_t total = 0;
-  for (auto const& seg : run.segments)
-  {
+  for (auto const& seg : run.segments) {
     total += ::cuda::ceil_div(seg.row_count, RowsPerBlock);
   }
   descs.reserve(total);
-  for (auto const& seg : run.segments)
-  {
-    if (seg.row_count == 0)
-    {
-      continue;
-    }
+  for (auto const& seg : run.segments) {
+    if (seg.row_count == 0) { continue; }
     const uint32_t n = ::cuda::ceil_div(seg.row_count, RowsPerBlock);
-    for (uint32_t b = 0; b < n; ++b)
-    {
+    for (uint32_t b = 0; b < n; ++b) {
       const uint32_t rows = (b + 1u < n) ? RowsPerBlock : seg.row_count - b * RowsPerBlock;
       descs.push_back({seg.d_bytes, seg.bytes_size, b, rows, seg.row_offset + b * RowsPerBlock});
     }
@@ -71,4 +61,4 @@ template <uint32_t RowsPerBlock>
   return descs;
 }
 
-} // namespace sirius::cuda::scan::detail
+}  // namespace sirius::cuda::scan::detail

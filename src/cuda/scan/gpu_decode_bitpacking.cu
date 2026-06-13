@@ -247,7 +247,8 @@ __global__ void kernel_decode_bitpacking(detail::cta_block_desc const* __restric
   // Anything other than FOR / DELTA_FOR is INVALID metadata or an unknown
   // mode: zero-fill the descriptor's row range.
   if (mode != BitpackingMode::FOR && mode != BitpackingMode::DELTA_FOR) {
-    detail::vec_fill<T>(out, desc.block_row_count, threadIdx.x, blockDim.x, [](uint32_t) { return T(0); });
+    detail::vec_fill<T>(
+      out, desc.block_row_count, threadIdx.x, blockDim.x, [](uint32_t) { return T(0); });
     return;
   }
 
