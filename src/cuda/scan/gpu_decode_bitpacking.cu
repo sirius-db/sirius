@@ -41,14 +41,13 @@
 // count, not the parsed metadata).
 //===----------------------------------------------------------------------===//
 
+#include "cuda/scan/detail/shared_staging.cuh"
 #include "cuda/scan/gpu_decode_bitpacking.cuh"
 #include "cuda/scan/unpack_value.cuh"
 
 #include <rmm/detail/error.hpp>
 #include <rmm/device_uvector.hpp>
 
-#include <cooperative_groups.h>
-#include <cooperative_groups/memcpy_async.h>
 #include <cub/warp/warp_scan.cuh>
 #include <cuda/std/numeric>
 #include <cuda_runtime.h>
@@ -90,7 +89,6 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
                                          T* __restrict__ d_output,
                                          uint32_t num_groups)
 {
-  namespace cg              = cooperative_groups;
   using vec_t               = int4;
   auto constexpr VEC_BYTES  = sizeof(vec_t);
   auto constexpr WORD_BYTES = sizeof(uint32_t);
@@ -312,15 +310,9 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
   alignas(TARGET_ALIGNMENT_BYTES) __shared__ uint32_t shmem[SHMEM_BYTES / WORD_BYTES];
   auto const* packed_bytes  = seg_base + sm_data_offset;
   auto const n_packed_words = ::cuda::ceil_div(rc * width, WORD_BITS);
-  auto const block          = cg::this_thread_block();
 
-  // Async copy the packed bytes into shared memory.
-  cg::memcpy_async(
-    block, reinterpret_cast<uint8_t*>(shmem), packed_bytes, n_packed_words * WORD_BYTES);
-
-  // Guard word — set after async-copy issue; wait below covers both.
-  if (threadIdx.x == 0) shmem[n_packed_words] = 0;
-  cg::wait(block);
+  // Stage the packed bytes into shared memory; one guard word covers unpack_value's straddle read.
+  detail::stage_packed_to_shmem<BLOCK_DIM>(shmem, packed_bytes, n_packed_words, /*guard_words=*/1);
 
   //===--------------------------------------------------------------------===//
   // FOR -- frame + value.

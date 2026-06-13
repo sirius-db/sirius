@@ -72,6 +72,7 @@
 //===----------------------------------------------------------------------===//
 // clang-format on
 
+#include "cuda/scan/detail/shared_staging.cuh"
 #include "cuda/scan/gpu_decode_alp.cuh"
 #include "cuda/scan/unpack_value.cuh"
 
@@ -269,35 +270,6 @@ __device__ __host__ __forceinline__ uint32_t bp_required_bytes(uint32_t row_coun
 }
 
 /**
- * @brief Copy bytes from @p src to @p dst_words in SMEM. memcpy is used because there is no
- * guarantee on the byte alignment for @p src pointer.
- */
-__device__ __forceinline__ void stage_bytes_to_shmem(uint32_t* dst_words,
-                                                     uint8_t const* src,
-                                                     uint32_t byte_count,
-                                                     uint32_t pad_words)
-{
-  constexpr uint32_t WORD_BYTES = sizeof(uint32_t);
-
-  auto const live_words = ::cuda::ceil_div(byte_count, WORD_BYTES);
-  for (uint32_t w = threadIdx.x; w < live_words; w += blockDim.x) {
-    auto const byte_offset = w * WORD_BYTES;
-    uint32_t v             = 0;
-    if (byte_offset + WORD_BYTES <= byte_count) {
-      memcpy(&v, src + byte_offset, WORD_BYTES);
-    } else {
-      // Tail: at most 3 leftover bytes. Zero-pad the high bytes.
-      auto const left = byte_count - byte_offset;
-      memcpy(&v, src + byte_offset, left);
-    }
-    dst_words[w] = v;
-  }
-  for (uint32_t w = live_words + threadIdx.x; w < live_words + pad_words; w += blockDim.x) {
-    dst_words[w] = 0;
-  }
-}
-
-/**
  * @brief Zero-fill @p out buffer with @p row_count zeros in the case of malfomation.
  */
 template <typename T>
@@ -422,7 +394,11 @@ __global__ void kernel_decode_alp(alp_vector_desc const* __restrict__ descs,
   }
 
   //===----------Compressed----------===//
-  stage_bytes_to_shmem(shmem, sh_meta.packed_bytes_p, sh_meta.packed_bytes_count, /*pad_words=*/2);
+  detail::stage_packed_to_shmem<BLOCK_DIM>(
+    shmem,
+    sh_meta.packed_bytes_p,
+    static_cast<uint32_t>(::cuda::ceil_div(sh_meta.packed_bytes_count, sizeof(uint32_t))),
+    /*guard_words=*/2);
   __syncthreads();
 
   auto const fact_t = static_cast<T>(d_alp_fact[sh_meta.fac]);
@@ -626,17 +602,16 @@ __global__ void kernel_decode_alprd(alp_vector_desc const* __restrict__ descs,
 
   //===----------Compressed----------===//
   // Stage left and right packed streams into shmem with 2 guard words after each region.
-  auto const left_live = ::cuda::ceil_div(sh_meta.left_packed_bytes_count, sizeof(uint32_t));
-  auto* left_words     = shmem;
-  auto* right_words    = shmem + left_live + 2;
-  stage_bytes_to_shmem(left_words,
-                       sh_meta.left_packed_bytes_p,
-                       sh_meta.left_packed_bytes_count,
-                       /*pad_words=*/2);
-  stage_bytes_to_shmem(right_words,
-                       sh_meta.right_packed_bytes_p,
-                       sh_meta.right_packed_bytes_count,
-                       /*pad_words=*/2);
+  auto const left_live =
+    static_cast<uint32_t>(::cuda::ceil_div(sh_meta.left_packed_bytes_count, sizeof(uint32_t)));
+  auto const right_live =
+    static_cast<uint32_t>(::cuda::ceil_div(sh_meta.right_packed_bytes_count, sizeof(uint32_t)));
+  auto* left_words  = shmem;
+  auto* right_words = shmem + left_live + 2;
+  detail::stage_packed_to_shmem<BLOCK_DIM>(
+    left_words, sh_meta.left_packed_bytes_p, left_live, /*guard_words=*/2);
+  detail::stage_packed_to_shmem<BLOCK_DIM>(
+    right_words, sh_meta.right_packed_bytes_p, right_live, /*guard_words=*/2);
   __syncthreads();
 
   auto const right_bw = sh_meta.right_bw;
