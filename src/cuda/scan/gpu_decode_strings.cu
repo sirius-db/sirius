@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "cuda/scan/detail/byte_copy.cuh"
 #include "cuda/scan/gpu_decode_strings.cuh"
 #include "cuda/scan/unpack_value.cuh"
 
@@ -155,10 +156,9 @@ constexpr uint32_t BLOCK_DIM = 256;  // see FSST_WARPS_PER_CTA static_assert
 constexpr uint32_t MIN_ROWS_PER_CHUNK =
   64;  ///< Minimum rows per segment chunk; BLOCK_DIM=256 threads -> 8 warps
        ///< per chunk -> 8 rows per warp at this minimum.
-constexpr uint32_t WARP_THREADS           = 32;
-constexpr uint32_t FULL_MASK              = 0xFFFFFFFFu;
-constexpr uint32_t WARP_BULK_STRIDE_BYTES = WARP_THREADS * 4u;
-constexpr uint32_t MAX_BITPACKING_WIDTH   = 32;
+constexpr uint32_t WARP_THREADS         = 32;
+constexpr uint32_t FULL_MASK            = 0xFFFFFFFFu;
+constexpr uint32_t MAX_BITPACKING_WIDTH = 32;
 
 /// Above this, take the exact-total sync rather than trust the host upper
 /// bound — a pathological max_string_length could otherwise force a GB-class
@@ -549,21 +549,7 @@ __global__ void kernel_gather_dict_warp(string_chunk_desc const* __restrict__ de
     auto const str_len    = end_off - d_idx[sel - 1];
     auto const offset_ptr = static_cast<uint32_t>(d_offsets[desc.global_row_start + i]);
     auto const* src       = dict_end - end_off;
-
-    // Try to concentrate stores in 4B/word.
-    constexpr uint32_t WORD_BYTES = 4;
-    auto const n_full_words       = str_len / WORD_BYTES;
-    auto word_id                  = lane;  // word index, stride = WARP_THREADS
-    while (word_id < n_full_words) {
-      uint32_t v;
-      memcpy(&v, src + word_id * WORD_BYTES, WORD_BYTES);
-      memcpy(d_chars + offset_ptr + word_id * WORD_BYTES, &v, WORD_BYTES);
-      word_id += WARP_THREADS;
-    }
-    // Trailing bytes
-    for (uint32_t t = n_full_words * WORD_BYTES + lane; t < str_len; t += WARP_THREADS) {
-      d_chars[offset_ptr + t] = src[t];
-    }
+    detail::warp_copy_bytes(d_chars + offset_ptr, src, str_len, lane);
   }
 }
 
@@ -933,30 +919,6 @@ constexpr uint32_t FSST_MAX_CHUNK_EMIT =
 constexpr uint32_t FSST_WARPS_PER_CTA = BLOCK_DIM / WARP_THREADS;
 
 /**
- * @brief Drain the per-warp scratch buffer to global memory, with warp lanes cooperating in
- * stride-4 chunks plus a per-byte cleanup for the last <4 bytes. Used in both the lazy-flush path
- * when scratch is full and the final drain at the end of a chunk.
- */
-__device__ __forceinline__ void warp_drain_scratch(uint8_t* __restrict__ dst,
-                                                   uint32_t const* __restrict__ scratch_u32,
-                                                   uint8_t const* __restrict__ scratch_u8,
-                                                   uint32_t n,
-                                                   uint32_t lane)
-{
-  constexpr uint32_t WORD_BYTES = 4;
-  auto const n_full_words       = n / WORD_BYTES;
-  auto word_id                  = lane;  // word index, stride = WARP_THREADS
-  while (word_id < n_full_words) {
-    auto const v = scratch_u32[word_id];
-    memcpy(dst + word_id * WORD_BYTES, &v, WORD_BYTES);
-    word_id += WARP_THREADS;
-  }
-  for (uint32_t t = n_full_words * WORD_BYTES + lane; t < n; t += WARP_THREADS) {
-    dst[t] = scratch_u8[t];
-  }
-}
-
-/**
  * @brief Decode a chunk of compressed bytes using the FSST algorithm.
  *
  * One warp decodes `comp_len` compressed bytes in 32-byte input chunks. Decoded symbols accumulate
@@ -1045,8 +1007,7 @@ __device__ __forceinline__ void warp_decode_fsst(uint8_t const* __restrict__ com
     auto const more_chunks = (off + WARP_THREADS) < comp_len;
     if (more_chunks && scratch_used + FSST_MAX_CHUNK_EMIT > FSST_SCRATCH_BYTES_PER_WARP) {
       __syncwarp();
-      warp_drain_scratch(
-        dst + cumulative_out_offset, warp_scratch_u32, warp_scratch_u8, scratch_used, lane);
+      detail::warp_copy_bytes(dst + cumulative_out_offset, warp_scratch_u8, scratch_used, lane);
       __syncwarp();
       cumulative_out_offset += scratch_used;
       scratch_used = 0;
@@ -1056,8 +1017,7 @@ __device__ __forceinline__ void warp_decode_fsst(uint8_t const* __restrict__ com
   // Final flush at end of row — always required, scratch holds the tail.
   if (scratch_used > 0) {
     __syncwarp();
-    warp_drain_scratch(
-      dst + cumulative_out_offset, warp_scratch_u32, warp_scratch_u8, scratch_used, lane);
+    detail::warp_copy_bytes(dst + cumulative_out_offset, warp_scratch_u8, scratch_used, lane);
     __syncwarp();
   }
 }
@@ -1558,17 +1518,7 @@ __global__ void kernel_gather_dict_fsst(dict_fsst_desc const* __restrict__ descs
       uint32_t entry_start = memcpy_off[idx];
       uint32_t entry_len   = memcpy_off[idx + 1] - entry_start;
       uint8_t const* src   = memcpy_src + entry_start;
-      uint32_t n4          = entry_len & ~3u;
-      uint32_t k           = lane * 4u;
-      while (k < n4) {
-        uint32_t v;
-        memcpy(&v, src + k, 4);
-        memcpy(d_chars + op + k, &v, 4);
-        k += WARP_BULK_STRIDE_BYTES;
-      }
-      for (uint32_t t = n4 + lane; t < entry_len; t += WARP_THREADS) {
-        d_chars[op + t] = src[t];
-      }
+      detail::warp_copy_bytes(d_chars + op, src, entry_len, lane);
       continue;
     }
 
