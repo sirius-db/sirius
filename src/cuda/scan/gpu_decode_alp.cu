@@ -73,6 +73,7 @@
 // clang-format on
 
 #include "cuda/scan/gpu_decode_alp.cuh"
+#include "cuda/scan/unpack_value.cuh"
 
 #include <rmm/detail/error.hpp>
 #include <rmm/device_uvector.hpp>
@@ -268,43 +269,6 @@ __device__ __host__ __forceinline__ uint32_t bp_required_bytes(uint32_t row_coun
 }
 
 /**
- * @brief Unpack a value of type ResT from @p packed bitstream.
- * @note The caller must supply 2 trailing guard words past the live data.
- */
-template <typename ResT>
-__device__ __forceinline__ ResT unpack_from_shmem(uint32_t const* packed,
-                                                  uint32_t idx,
-                                                  uint32_t width)
-{
-  constexpr uint32_t WORD_BYTES       = sizeof(uint32_t);
-  constexpr uint32_t WORD_BITS        = ::cuda::std::numeric_limits<uint32_t>::digits;
-  constexpr uint32_t DOUBLE_WORD_BITS = ::cuda::std::numeric_limits<uint64_t>::digits;
-  constexpr uint64_t DOUBLE_WORD_MAX  = ::cuda::std::numeric_limits<uint64_t>::max();
-
-  if (width == 0) return 0;
-
-  auto const bit_pos  = static_cast<uint64_t>(idx) * width;
-  auto const word_idx = static_cast<uint32_t>(bit_pos / WORD_BITS);
-  auto const bit_off  = static_cast<uint32_t>(bit_pos % WORD_BITS);
-
-  auto combined = static_cast<uint64_t>(packed[word_idx]);
-  if (bit_off + width > WORD_BITS) {
-    combined |= static_cast<uint64_t>(packed[word_idx + 1]) << WORD_BITS;
-  }
-  auto result = combined >> bit_off;
-
-  if constexpr (sizeof(ResT) > WORD_BYTES) {
-    static_assert(::cuda::std::is_same_v<ResT, uint64_t>);
-    if (bit_off > 0 && bit_off + width > DOUBLE_WORD_BITS) {
-      result |= static_cast<uint64_t>(packed[word_idx + 2]) << (DOUBLE_WORD_BITS - bit_off);
-    }
-  }
-
-  auto const mask = (width >= DOUBLE_WORD_BITS) ? DOUBLE_WORD_MAX : ((uint64_t{1} << width) - 1u);
-  return static_cast<ResT>(result & mask);
-}
-
-/**
  * @brief Copy bytes from @p src to @p dst_words in SMEM. memcpy is used because there is no
  * guarantee on the byte alignment for @p src pointer.
  */
@@ -466,7 +430,7 @@ __global__ void kernel_decode_alp(alp_vector_desc const* __restrict__ descs,
   auto const for_v  = sh_meta.for_val;
   auto const bw     = sh_meta.bw;
   for (uint32_t i = threadIdx.x; i < fill_rows; i += blockDim.x) {
-    auto const u = unpack_from_shmem<uint64_t>(shmem, i, bw);
+    auto const u = unpack_value<uint64_t>(shmem, i, bw);
     // FOR add is unsigned-wraparound; cast to int64 before applying FACT/FRAC.
     auto const enc   = static_cast<int64_t>(u + for_v);
     auto const decod = static_cast<T>(enc) * fact_t * frac_t;
@@ -681,12 +645,12 @@ __global__ void kernel_decode_alprd(alp_vector_desc const* __restrict__ descs,
   auto const full_right = right_bw >= T_BITS;
 
   for (uint32_t i = threadIdx.x; i < fill_rows; i += blockDim.x) {
-    auto const right_val = unpack_from_shmem<raw_t>(right_words, i, right_bw);
+    auto const right_val = unpack_value<raw_t>(right_words, i, right_bw);
     raw_t bits;
     if (full_right) {
       bits = right_val;
     } else {
-      auto const left_idx = unpack_from_shmem<uint16_t>(left_words, i, left_bw);
+      auto const left_idx = unpack_value<uint16_t>(left_words, i, left_bw);
       auto const left_val = static_cast<raw_t>(sh_dict[left_idx]);
       bits                = (left_val << right_bw) | right_val;
     }
