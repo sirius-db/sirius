@@ -22,22 +22,18 @@
 
 #pragma once
 
-#include <cub/config.cuh>
-
 #include <cooperative_groups.h>
 #include <cooperative_groups/memcpy_async.h>
-
+#include <cub/config.cuh>
 #include <cuda/__memory/aligned_size.h>
 #include <cuda/std/cstddef>
 #include <cuda/std/cstdint>
+#include <cuda/std/cstring>
 
-#include <cstring>
+namespace sirius::cuda::scan::detail {
 
-namespace sirius::cuda::scan::detail
-{
-
-//! @brief Stage @p n_live_words 32-bit words of a packed bitstream from global @p src_bytes into the
-//! shared @p dst_words buffer, then zero @p guard_words trailing words so the bit-unpacker's
+//! @brief Stage @p n_live_words 32-bit words of a packed bitstream from global @p src_bytes into
+//! the shared @p dst_words buffer, then zero @p guard_words trailing words so the bit-unpacker's
 //! cross-word reads stay in bounds.
 //!
 //! Block-wide collective: every thread must call it. @p src_bytes may be arbitrarily aligned; the
@@ -54,59 +50,52 @@ namespace sirius::cuda::scan::detail
 //!     beats the 1-byte `cp.async` path — and `cp.async` has no 2-byte specialization to inform.
 //!
 //! @tparam BlockThreads  Block width (compile-time; also the grid stride of the manual path).
-//! @param dst_words    Shared buffer of at least `n_live_words + guard_words` words (>= 4B aligned).
+//! @param dst_words    Shared buffer of at least `n_live_words + guard_words` words (>= 4B
+//! aligned).
 //! @param src_bytes    Global source holding at least `n_live_words * 4` readable bytes.
 //! @param n_live_words Number of live 32-bit words to copy.
 //! @param guard_words  Trailing words to zero past the live data (1 when the unpack target is
 //!                     <= 32-bit, 2 when a 64-bit value can straddle into a third word).
 template <int BlockThreads>
-_CCCL_DEVICE _CCCL_FORCEINLINE void
-stage_packed_to_shmem(uint32_t* dst_words, const uint8_t* src_bytes, uint32_t n_live_words, uint32_t guard_words)
+_CCCL_DEVICE _CCCL_FORCEINLINE void stage_packed_to_shmem(uint32_t* dst_words,
+                                                          const uint8_t* src_bytes,
+                                                          uint32_t n_live_words,
+                                                          uint32_t guard_words)
 {
   namespace cg          = cooperative_groups;
-  const auto block      = cg::this_thread_block();
+  auto const block      = cg::this_thread_block();
   auto* const dst_bytes = reinterpret_cast<uint8_t*>(dst_words);
-  const auto n_bytes    = static_cast<::cuda::std::size_t>(n_live_words) * sizeof(uint32_t);
-  const auto low        = reinterpret_cast<::cuda::std::uintptr_t>(src_bytes)
-                 | reinterpret_cast<::cuda::std::uintptr_t>(dst_bytes) | n_bytes;
+  auto const n_bytes    = static_cast<::cuda::std::size_t>(n_live_words) * sizeof(uint32_t);
+  auto const low        = reinterpret_cast<::cuda::std::uintptr_t>(src_bytes) |
+                   reinterpret_cast<::cuda::std::uintptr_t>(dst_bytes) | n_bytes;
 
-  if ((low & 0x3u) == 0)
-  {
+  if ((low & 0x3u) == 0) {
     // Aligned: inform memcpy_async of the widest cp.async transaction the data jointly supports.
-    if ((low & 0xFu) == 0)
-    {
+    if ((low & 0xFu) == 0) {
       cg::memcpy_async(block, dst_bytes, src_bytes, ::cuda::aligned_size_t<16>{n_bytes});
-    }
-    else if ((low & 0x7u) == 0)
-    {
+    } else if ((low & 0x7u) == 0) {
       cg::memcpy_async(block, dst_bytes, src_bytes, ::cuda::aligned_size_t<8>{n_bytes});
-    }
-    else
-    {
+    } else {
       cg::memcpy_async(block, dst_bytes, src_bytes, ::cuda::aligned_size_t<4>{n_bytes});
     }
     // Guard words lie past the copied range, so this write never races the async copy.
-    for (uint32_t w = threadIdx.x; w < guard_words; w += BlockThreads)
-    {
+    for (uint32_t w = threadIdx.x; w < guard_words; w += BlockThreads) {
       dst_words[n_live_words + w] = 0;
     }
-    cg::wait(block); // publishes both the copied words and the guard words
-  }
-  else
-  {
+    cg::wait(block);  // publishes both the copied words and the guard words
+  } else {
     // Sub-word source: a 4-byte memcpy per word beats the 1-byte cp.async fallback.
-    for (uint32_t w = threadIdx.x; w < n_live_words; w += BlockThreads)
-    {
+    for (uint32_t w = threadIdx.x; w < n_live_words; w += BlockThreads) {
       uint32_t v;
-      ::memcpy(&v, src_bytes + static_cast<::cuda::std::size_t>(w) * sizeof(uint32_t), sizeof(uint32_t));
+      ::cuda::std::memcpy(
+        &v, src_bytes + static_cast<::cuda::std::size_t>(w) * sizeof(uint32_t), sizeof(uint32_t));
       dst_words[w] = v;
     }
-    for (uint32_t w = threadIdx.x; w < guard_words; w += BlockThreads)
-    {
+    for (uint32_t w = threadIdx.x; w < guard_words; w += BlockThreads) {
       dst_words[n_live_words + w] = 0;
     }
-    __syncthreads(); // publishes the manually copied words and the guard words
+    __syncthreads();  // publishes the manually copied words and the guard words
   }
 }
 
-} // namespace sirius::cuda::scan::detail
+}  // namespace sirius::cuda::scan::detail

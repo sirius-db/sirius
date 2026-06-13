@@ -36,6 +36,7 @@
 //         CTAs. ('Expand' kernel)
 //===----------------------------------------------------------------------===//
 
+#include "cuda/scan/detail/warp.cuh"
 #include "cuda/scan/gpu_decode_rle.cuh"
 
 #include <rmm/detail/error.hpp>
@@ -80,7 +81,7 @@ constexpr uint32_t RLE_BUILD_MAX_ENTRIES =
   ::cuda::ceil_div(RLE_DUCKDB_MAX_EC, BUILD_TILE_ENTRIES) * BUILD_TILE_ENTRIES;  // 90112
 
 constexpr uint32_t MALFORMED_FLAG = 0u;
-constexpr int WARP_THREADS        = 32;
+using detail::WARP_THREADS;
 
 /**
  * @brief Per-CTA input for segment-level prefix sum kernel over counts array.

@@ -15,6 +15,7 @@
  */
 
 #include "cuda/scan/detail/byte_copy.cuh"
+#include "cuda/scan/detail/warp.cuh"
 #include "cuda/scan/gpu_decode_strings.cuh"
 #include "cuda/scan/unpack_value.cuh"
 
@@ -156,8 +157,8 @@ constexpr uint32_t BLOCK_DIM = 256;  // see FSST_WARPS_PER_CTA static_assert
 constexpr uint32_t MIN_ROWS_PER_CHUNK =
   64;  ///< Minimum rows per segment chunk; BLOCK_DIM=256 threads -> 8 warps
        ///< per chunk -> 8 rows per warp at this minimum.
-constexpr uint32_t WARP_THREADS         = 32;
-constexpr uint32_t FULL_MASK            = 0xFFFFFFFFu;
+using detail::FULL_MASK;
+using detail::WARP_THREADS;
 constexpr uint32_t MAX_BITPACKING_WIDTH = 32;
 
 /// Above this, take the exact-total sync rather than trust the host upper
