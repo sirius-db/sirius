@@ -32,6 +32,7 @@
 // One CTA per chunk, grid-stride within the chunk.
 //===----------------------------------------------------------------------===//
 
+#include "cuda/scan/detail/load_unaligned.cuh"
 #include "cuda/scan/strings/uncompressed.cuh"
 
 #include <cstdint>
@@ -40,6 +41,13 @@
 namespace sirius::cuda::scan {
 
 namespace {
+
+// Backward-cumulative offsets are int32 at base+8. The segment base is not guaranteed
+// int32-aligned, so read each offset alignment-agnostically.
+__device__ __forceinline__ int32_t duck_offset(uint8_t const* off_bytes, uint32_t seg_i)
+{
+  return detail::load_unaligned<int32_t>(off_bytes + static_cast<size_t>(seg_i) * sizeof(int32_t));
+}
 
 /**
  * @brief Compute decoded string lengths for an UNCOMPRESSED varchar segment.
@@ -69,11 +77,11 @@ __global__ void kernel_compute_lengths_uncomp(string_chunk_desc const* __restric
     return;
   }
 
-  auto const* duck_offsets = reinterpret_cast<int32_t const*>(base + 8);
+  auto const* off_bytes = base + 8;
   for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
     auto const seg_i                     = desc.seg_row_start + i;
-    auto const cur                       = duck_offsets[seg_i];
-    auto const prev                      = (seg_i > 0) ? duck_offsets[seg_i - 1] : 0;
+    auto const cur                       = duck_offset(off_bytes, seg_i);
+    auto const prev                      = (seg_i > 0) ? duck_offset(off_bytes, seg_i - 1) : 0;
     auto const abs_cur                   = static_cast<uint32_t>(cur >= 0 ? cur : -cur);
     auto const abs_prev                  = static_cast<uint32_t>(prev >= 0 ? prev : -prev);
     d_lengths[desc.global_row_start + i] = abs_cur - abs_prev;
@@ -107,13 +115,13 @@ __global__ void kernel_gather_uncomp(string_chunk_desc const* __restrict__ descs
   __syncthreads();
   if (!sm_ok) return;
 
-  auto const* duck_offsets = reinterpret_cast<int32_t const*>(base + 8);
-  auto const* dict_end     = base + sm_dict_end;
+  auto const* off_bytes = base + 8;
+  auto const* dict_end  = base + sm_dict_end;
 
   for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
     auto const seg_i    = desc.seg_row_start + i;
-    auto const cur      = duck_offsets[seg_i];
-    auto const prev     = (seg_i > 0) ? duck_offsets[seg_i - 1] : 0;
+    auto const cur      = duck_offset(off_bytes, seg_i);
+    auto const prev     = (seg_i > 0) ? duck_offset(off_bytes, seg_i - 1) : 0;
     auto const abs_cur  = static_cast<uint32_t>(cur >= 0 ? cur : -cur);
     auto const abs_prev = static_cast<uint32_t>(prev >= 0 ? prev : -prev);
     auto const str_len  = abs_cur - abs_prev;

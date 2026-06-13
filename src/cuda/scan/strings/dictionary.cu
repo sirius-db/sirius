@@ -33,6 +33,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "cuda/scan/detail/byte_copy.cuh"
+#include "cuda/scan/detail/load_unaligned.cuh"
 #include "cuda/scan/strings/dictionary.cuh"
 #include "cuda/scan/unpack_value.cuh"
 
@@ -67,6 +68,13 @@ __device__ __forceinline__ bool parse_dict_header(uint8_t const* base,
          hdr->dict_end <= limit && hdr->bitpacking_width <= MAX_BITPACKING_WIDTH;
 }
 
+// The index buffer holds uint32 forward-cumulative byte offsets at base+index_buffer_offset. The
+// segment base is not guaranteed uint32-aligned, so read each entry alignment-agnostically.
+__device__ __forceinline__ uint32_t dict_index_at(uint8_t const* idx_bytes, uint32_t i)
+{
+  return detail::load_unaligned<uint32_t>(idx_bytes + static_cast<size_t>(i) * sizeof(uint32_t));
+}
+
 /**
  * @brief Compute decoded string lengths for a DICTIONARY segment.
  *
@@ -97,13 +105,15 @@ __global__ void kernel_compute_lengths_dict(string_chunk_desc const* __restrict_
 
   // Calculate lengths by unpacking the selection buffer to get dict indices, then looking up
   // lengths from the index buffer.
-  auto const* d_sel = reinterpret_cast<uint32_t const*>(segment_base + sizeof(dict_header_t));
-  auto const* d_idx = reinterpret_cast<uint32_t const*>(segment_base + sm_hdr.index_buffer_offset);
+  auto const* d_sel     = reinterpret_cast<uint32_t const*>(segment_base + sizeof(dict_header_t));
+  auto const* idx_bytes = segment_base + sm_hdr.index_buffer_offset;
   for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
     auto const segment_idx = desc.seg_row_start + i;
     auto const sel         = unpack_value<uint32_t>(d_sel, segment_idx, sm_hdr.bitpacking_width);
     uint32_t len           = 0u;
-    if (sel != 0u && sel < sm_hdr.index_buffer_count) { len = d_idx[sel] - d_idx[sel - 1]; }
+    if (sel != 0u && sel < sm_hdr.index_buffer_count) {
+      len = dict_index_at(idx_bytes, sel) - dict_index_at(idx_bytes, sel - 1);
+    }
     d_lengths[desc.global_row_start + i] = len;
   }
 }
@@ -131,16 +141,16 @@ __global__ void kernel_gather_dict(string_chunk_desc const* __restrict__ descs,
   __syncthreads();
   if (!sm_ok) return;
 
-  auto const* d_sel = reinterpret_cast<uint32_t const*>(segment_base + sizeof(dict_header_t));
-  auto const* d_idx = reinterpret_cast<uint32_t const*>(segment_base + sm_hdr.index_buffer_offset);
-  auto const* dict_end = segment_base + sm_hdr.dict_end;
+  auto const* d_sel     = reinterpret_cast<uint32_t const*>(segment_base + sizeof(dict_header_t));
+  auto const* idx_bytes = segment_base + sm_hdr.index_buffer_offset;
+  auto const* dict_end  = segment_base + sm_hdr.dict_end;
 
   for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
     auto const segment_idx = desc.seg_row_start + i;
     auto const sel         = unpack_value<uint32_t>(d_sel, segment_idx, sm_hdr.bitpacking_width);
     if (sel == 0) continue;
-    auto const end_off = d_idx[sel];
-    auto const str_len = end_off - d_idx[sel - 1];
+    auto const end_off = dict_index_at(idx_bytes, sel);
+    auto const str_len = end_off - dict_index_at(idx_bytes, sel - 1);
     auto const out_pos = d_offsets[desc.global_row_start + i];
     auto const* src    = dict_end - end_off;
     memcpy(d_chars + out_pos, src, str_len);
@@ -168,9 +178,9 @@ __global__ void kernel_gather_dict_warp(string_chunk_desc const* __restrict__ de
   __syncthreads();
   if (!sm_ok) return;
 
-  auto const* d_sel = reinterpret_cast<uint32_t const*>(segment_base + sizeof(dict_header_t));
-  auto const* d_idx = reinterpret_cast<uint32_t const*>(segment_base + sm_hdr.index_buffer_offset);
-  auto const* dict_end = segment_base + sm_hdr.dict_end;
+  auto const* d_sel     = reinterpret_cast<uint32_t const*>(segment_base + sizeof(dict_header_t));
+  auto const* idx_bytes = segment_base + sm_hdr.index_buffer_offset;
+  auto const* dict_end  = segment_base + sm_hdr.dict_end;
 
   uint32_t const lane          = threadIdx.x % WARP_THREADS;
   uint32_t const warp_id       = threadIdx.x / WARP_THREADS;
@@ -180,8 +190,8 @@ __global__ void kernel_gather_dict_warp(string_chunk_desc const* __restrict__ de
     auto const segment_idx = desc.seg_row_start + i;
     auto const sel         = unpack_value<uint32_t>(d_sel, segment_idx, sm_hdr.bitpacking_width);
     if (sel == 0) continue;
-    auto const end_off    = d_idx[sel];
-    auto const str_len    = end_off - d_idx[sel - 1];
+    auto const end_off    = dict_index_at(idx_bytes, sel);
+    auto const str_len    = end_off - dict_index_at(idx_bytes, sel - 1);
     auto const offset_ptr = static_cast<uint32_t>(d_offsets[desc.global_row_start + i]);
     auto const* src       = dict_end - end_off;
     detail::warp_copy_bytes(d_chars + offset_ptr, src, str_len, lane);
