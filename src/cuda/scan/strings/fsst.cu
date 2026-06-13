@@ -94,7 +94,7 @@ __device__ __forceinline__ bool parse_fsst_header(uint8_t const* base,
  * Coalesced load of the symbol table blob for the segment into shared memory, then single-threaded
  * parse into the fsst_decoder_compact format in global memory. One CTA per segment.
  */
-__global__ __launch_bounds__(BLOCK_DIM, 4) void kernel_build_fsst_decoders(
+__global__ __launch_bounds__(BLOCK_DIM) void kernel_build_fsst_decoders(
   string_chunk_desc const* __restrict__ descs,
   uint32_t num_segments,
   fsst_decoder_compact* __restrict__ d_decoders)
@@ -200,7 +200,7 @@ __global__ void kernel_compute_compressed_offsets_fsst(
  * for longer rows (coalesced LDG dominates). 2 × WARP_THREADS = 64 B / row crossover matches the
  * empirical sweet spot.
  */
-__global__ __launch_bounds__(BLOCK_DIM, 8) void kernel_compute_decompressed_lengths_fsst(
+__global__ __launch_bounds__(BLOCK_DIM) void kernel_compute_decompressed_lengths_fsst(
   fsst_chunk_desc const* __restrict__ descs,
   uint32_t* __restrict__ d_lengths,
   uint32_t const* __restrict__ d_comp_offsets,
@@ -299,7 +299,7 @@ __global__ __launch_bounds__(BLOCK_DIM, 8) void kernel_compute_decompressed_leng
  * walks the compressed byte stream for its row, decodes on the fly into a per-warp scratch buffer,
  * and flushes to global when the next chunk's worst-case emit would overflow scratch.
  */
-__global__ __launch_bounds__(BLOCK_DIM, 8) void kernel_gather_fsst_chunked(
+__global__ __launch_bounds__(BLOCK_DIM) void kernel_gather_fsst_chunked(
   fsst_chunk_desc const* __restrict__ descs,
   int32_t const* __restrict__ d_offsets,
   uint8_t* __restrict__ d_chars,

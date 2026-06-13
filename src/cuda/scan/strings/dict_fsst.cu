@@ -105,7 +105,7 @@ static_assert(sizeof(dict_fsst_pre_desc) % 4 == 0);
  * (total decoded bytes + inline-null flag) for the host to aggregate.
  * Same pattern as `kernel_build_fsst_decoders`.
  */
-__global__ __launch_bounds__(BLOCK_DIM, 4) void kernel_build_dict_fsst_data(
+__global__ __launch_bounds__(BLOCK_DIM) void kernel_build_dict_fsst_data(
   dict_fsst_pre_desc const* __restrict__ pre,
   uint32_t num_segments,
   fsst_decoder_compact* __restrict__ d_decoders,
