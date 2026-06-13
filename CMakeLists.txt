@@ -319,6 +319,7 @@ set(CUDA_SOURCES
     src/cuda/scan/gpu_decode_strings.cu
     src/cuda/scan/gpu_native_decode.cu
     src/cuda/scan/strings/dictionary.cu
+    src/cuda/scan/strings/fsst.cu
     src/cuda/scan/strings/uncompressed.cu)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
   add_subdirectory(src/legacy)
