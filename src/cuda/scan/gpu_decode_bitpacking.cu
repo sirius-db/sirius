@@ -41,6 +41,7 @@
 // count, not the parsed metadata).
 //===----------------------------------------------------------------------===//
 
+#include "cuda/scan/detail/decode_common.cuh"
 #include "cuda/scan/detail/shared_staging.cuh"
 #include "cuda/scan/detail/vectorized_store.cuh"
 #include "cuda/scan/gpu_decode_bitpacking.cuh"
@@ -73,20 +74,11 @@ static_assert(BLOCK_DIM % 32 == 0,
               "BLOCK_DIM must be a multiple of warpSize for the DELTA_FOR "
               "warp-aggregate scan");
 
-/// One CTA's unit of work: one metadata group within one segment.
-struct bp_group_desc {
-  uint8_t const* d_segment;    ///< Device pointer to the segment's first byte.
-  uint32_t segment_bytes;      ///< Size of the staged segment buffer.
-  uint32_t group_idx;          ///< Metadata-group index within the segment.
-  uint32_t group_row_count;    ///< Rows in this group (last group may be < 2048).
-  uint32_t global_row_offset;  ///< Output offset, in rows, for this group.
-};
-
 //===----------------------------------------------------------------------===//
-// Batched decode kernel.
+// Batched decode kernel. One CTA decodes one metadata group (a detail::cta_block_desc).
 //===----------------------------------------------------------------------===//
 template <typename T, int SHMEM_BYTES>
-__global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs,
+__global__ void kernel_decode_bitpacking(detail::cta_block_desc const* __restrict__ descs,
                                          T* __restrict__ d_output,
                                          uint32_t num_groups)
 {
@@ -142,17 +134,17 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
     // metadata_end; entry K (0-based) lives at metadata_end - (K+1) * 4.
     // The trailer must fit *and* lie inside the segment buffer.
     bool metadata_ok =
-      metadata_end >= sizeof(uint64_t) + (uint64_t{desc.group_idx} + 1) * sizeof(uint32_t) &&
+      metadata_end >= sizeof(uint64_t) + (uint64_t{desc.block_idx} + 1) * sizeof(uint32_t) &&
       metadata_end <= seg_bytes;
 
     if (metadata_ok) {
-      auto const* entry_addr = seg_base + metadata_end - (desc.group_idx + 1) * sizeof(uint32_t);
+      auto const* entry_addr = seg_base + metadata_end - (desc.block_idx + 1) * sizeof(uint32_t);
       uint32_t encoded       = 0;
       memcpy(&encoded, entry_addr, sizeof(uint32_t));
 
       auto const data_off    = encoded & 0x00FFFFFFu;
       auto const parsed_mode = (encoded >> 24) & 0xFFu;
-      sm_row_count           = desc.group_row_count;
+      sm_row_count           = desc.block_row_count;
 
       // `data_off` is a within-segment offset; the kernel reads v0 and v1
       // unconditionally (2*sizeof(T)) for every mode below, then reads a
@@ -255,10 +247,7 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
   // Anything other than FOR / DELTA_FOR is INVALID metadata or an unknown
   // mode: zero-fill the descriptor's row range.
   if (mode != BitpackingMode::FOR && mode != BitpackingMode::DELTA_FOR) {
-    auto const fill_rows = desc.group_row_count;
-    for (uint32_t i = threadIdx.x; i < fill_rows; i += blockDim.x) {
-      __stcs(out + i, T(0));
-    }
+    detail::vec_fill<T>(out, desc.block_row_count, threadIdx.x, blockDim.x, [](uint32_t) { return T(0); });
     return;
   }
 
@@ -367,28 +356,8 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
 // Type-erased dispatch.
 //===----------------------------------------------------------------------===//
 
-/// Build per-group descriptors covering every metadata group across every
-/// segment of `run`. Returns a host-side vector ready to be uploaded.
-std::vector<bp_group_desc> build_group_descs(gpu_codec_run const& run)
-{
-  std::vector<bp_group_desc> descs;
-  // Each segment contributes ceil(row_count / BP_META_GROUP_SIZE) groups;
-  for (auto const& seg : run.segments) {
-    if (seg.row_count == 0) continue;
-    auto const num_groups = ::cuda::ceil_div(seg.row_count, BP_META_GROUP_SIZE);
-    for (uint32_t g = 0; g < num_groups; ++g) {
-      // If it's the last group, ceiling the number of rows based on the segment row count
-      auto const group_rows =
-        (g + 1u < num_groups) ? BP_META_GROUP_SIZE : seg.row_count - g * BP_META_GROUP_SIZE;
-      descs.push_back(
-        {seg.d_bytes, seg.bytes_size, g, group_rows, seg.row_offset + g * BP_META_GROUP_SIZE});
-    }
-  }
-  return descs;
-}
-
 template <typename T>
-void launch_typed(bp_group_desc const* h_descs,
+void launch_typed(detail::cta_block_desc const* h_descs,
                   size_t num_groups,
                   T* d_output,
                   rmm::cuda_stream_view stream,
@@ -403,10 +372,10 @@ void launch_typed(bp_group_desc const* h_descs,
 
   if (num_groups == 0) return;
 
-  rmm::device_uvector<bp_group_desc> d_descs(num_groups, stream, mr);
+  rmm::device_uvector<detail::cta_block_desc> d_descs(num_groups, stream, mr);
   RMM_CUDA_TRY(cudaMemcpyAsync(d_descs.data(),
                                h_descs,
-                               num_groups * sizeof(bp_group_desc),
+                               num_groups * sizeof(detail::cta_block_desc),
                                cudaMemcpyHostToDevice,
                                stream.value()));
 
@@ -433,7 +402,7 @@ void decode_bitpacking_data(gpu_codec_run const& run,
                             rmm::cuda_stream_view stream,
                             rmm::device_async_resource_ref mr)
 {
-  auto descs = build_group_descs(run);
+  auto descs = detail::build_block_descs<BP_META_GROUP_SIZE>(run);
   if (descs.empty()) return;
 
   switch (type_size) {

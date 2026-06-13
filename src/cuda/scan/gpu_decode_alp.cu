@@ -17,7 +17,7 @@
 //===----------------------------------------------------------------------===//
 // clang-format off
 // ALP / ALPRD decode kernels. The work partitioning is 1 CTA per 1024-row vector.
-// On any bounds check failure the kernel zero-fills `desc.vec_row_count` rows.
+// On any bounds check failure the kernel zero-fills `desc.block_row_count` rows.
 //
 // On-disk layouts (see: duckdb/src/include/duckdb/storage/compression/{alp,alprd}/):
 //
@@ -72,7 +72,9 @@
 //===----------------------------------------------------------------------===//
 // clang-format on
 
+#include "cuda/scan/detail/decode_common.cuh"
 #include "cuda/scan/detail/shared_staging.cuh"
+#include "cuda/scan/detail/vectorized_store.cuh"
 #include "cuda/scan/gpu_decode_alp.cuh"
 #include "cuda/scan/unpack_value.cuh"
 
@@ -103,17 +105,6 @@ namespace {
 constexpr uint32_t BLOCK_DIM = 256;
 constexpr uint8_t ALP_MAX_FACTOR =
   static_cast<uint8_t>(std::extent_v<decltype(duckdb::AlpConstants::FACT_ARR)> - 1);
-
-/**
- * @brief Vector-level descriptor for a CTA
- */
-struct alp_vector_desc {
-  uint8_t const* d_segment;    ///< Device pointer to the segment's first byte.
-  uint32_t segment_bytes;      ///< Size of the staged segment buffer.
-  uint32_t vec_idx;            ///< Vector index within the segment.
-  uint32_t vec_row_count;      ///< Rows in this vector (last may be < 1024).
-  uint32_t global_row_offset;  ///< Output offset, in rows, for this vector.
-};
 
 /**
  * @brief Per-vector parse outcome. Routes the CTA to one of three paths:
@@ -269,17 +260,6 @@ __device__ __host__ __forceinline__ uint32_t bp_required_bytes(uint32_t row_coun
   return (n_rounded * width) / 8;
 }
 
-/**
- * @brief Zero-fill @p out buffer with @p row_count zeros in the case of malfomation.
- */
-template <typename T>
-__device__ __forceinline__ void zero_fill_vector(T* out, uint32_t row_count)
-{
-  for (uint32_t i = threadIdx.x; i < row_count; i += blockDim.x) {
-    __stwt(out + i, T(0));
-  }
-}
-
 //===----------------------------------------------------------------------===//
 // ALP
 //===----------------------------------------------------------------------===//
@@ -355,7 +335,7 @@ __device__ alp_vector_meta parse_alp_metadata(uint8_t const* seg_base,
  * @brief Decoding kernel for ALP encoded values. Work partitioning is 1 CTA per 1024-row vector.
  */
 template <int SMEM_WORDS, typename T>
-__global__ void kernel_decode_alp(alp_vector_desc const* __restrict__ descs,
+__global__ void kernel_decode_alp(detail::cta_block_desc const* __restrict__ descs,
                                   T* __restrict__ d_output,
                                   uint32_t num_vecs)
 {
@@ -370,16 +350,16 @@ __global__ void kernel_decode_alp(alp_vector_desc const* __restrict__ descs,
   auto const desc      = descs[vector_id];
   auto const* seg_base = desc.d_segment;
   auto const seg_bytes = desc.segment_bytes;
-  auto const fill_rows = desc.vec_row_count;
+  auto const fill_rows = desc.block_row_count;
   auto* out            = d_output + desc.global_row_offset;
 
   if (threadIdx.x == 0) {
-    sh_meta = parse_alp_metadata<T>(seg_base, seg_bytes, desc.vec_idx, fill_rows);
+    sh_meta = parse_alp_metadata<T>(seg_base, seg_bytes, desc.block_idx, fill_rows);
   }
   __syncthreads();
 
   if (sh_meta.status == alp_parse_status::invalid) {
-    zero_fill_vector<T>(out, fill_rows);
+    detail::vec_fill<T>(out, fill_rows, threadIdx.x, blockDim.x, [](uint32_t) { return T(0); });
     return;
   }
 
@@ -435,7 +415,7 @@ __global__ void kernel_decode_alp(alp_vector_desc const* __restrict__ descs,
  * @brief HOST-side ALP decoding kernel dispatcher.
  */
 template <typename T>
-void launch_alp_typed(alp_vector_desc const* h_descs,
+void launch_alp_typed(detail::cta_block_desc const* h_descs,
                       size_t num_vecs,
                       T* d_output,
                       rmm::cuda_stream_view stream,
@@ -447,10 +427,10 @@ void launch_alp_typed(alp_vector_desc const* h_descs,
 
   if (num_vecs == 0) return;
 
-  rmm::device_uvector<alp_vector_desc> d_descs(num_vecs, stream, mr);
+  rmm::device_uvector<detail::cta_block_desc> d_descs(num_vecs, stream, mr);
   RMM_CUDA_TRY(cudaMemcpyAsync(d_descs.data(),
                                h_descs,
-                               num_vecs * sizeof(alp_vector_desc),
+                               num_vecs * sizeof(detail::cta_block_desc),
                                cudaMemcpyHostToDevice,
                                stream.value()));
 
@@ -549,7 +529,7 @@ __device__ alprd_vector_meta parse_alprd_metadata(uint8_t const* seg_base,
  * @brief Decoding kernel for ALPRD encoded values. Work partitioning is 1 CTA per 1024-row vector.
  */
 template <int SMEM_WORDS, typename T>
-__global__ void kernel_decode_alprd(alp_vector_desc const* __restrict__ descs,
+__global__ void kernel_decode_alprd(detail::cta_block_desc const* __restrict__ descs,
                                     T* __restrict__ d_output,
                                     uint32_t num_vecs)
 {
@@ -567,11 +547,11 @@ __global__ void kernel_decode_alprd(alp_vector_desc const* __restrict__ descs,
   auto const desc      = descs[vector_id];
   auto const* seg_base = desc.d_segment;
   auto const seg_bytes = desc.segment_bytes;
-  auto const fill_rows = desc.vec_row_count;
+  auto const fill_rows = desc.block_row_count;
   auto* out            = d_output + desc.global_row_offset;
 
   if (threadIdx.x == 0) {
-    sh_meta = parse_alprd_metadata<T>(seg_base, seg_bytes, desc.vec_idx, fill_rows);
+    sh_meta = parse_alprd_metadata<T>(seg_base, seg_bytes, desc.block_idx, fill_rows);
   }
 
   // Cooperatively zero-init the dict so a corrupt left_idx ≥ dict_size lands
@@ -586,7 +566,7 @@ __global__ void kernel_decode_alprd(alp_vector_desc const* __restrict__ descs,
   __syncthreads();
 
   if (sh_meta.status == alprd_parse_status::invalid) {
-    zero_fill_vector<T>(out, fill_rows);
+    detail::vec_fill<T>(out, fill_rows, threadIdx.x, blockDim.x, [](uint32_t) { return T(0); });
     return;
   }
 
@@ -673,7 +653,7 @@ __global__ void kernel_decode_alprd(alp_vector_desc const* __restrict__ descs,
  * @brief HOST-side ALPRD decoding kernel dispatcher.
  */
 template <typename T>
-void launch_alprd_typed(alp_vector_desc const* h_descs,
+void launch_alprd_typed(detail::cta_block_desc const* h_descs,
                         size_t num_vecs,
                         T* d_output,
                         rmm::cuda_stream_view stream,
@@ -691,41 +671,16 @@ void launch_alprd_typed(alp_vector_desc const* h_descs,
 
   if (num_vecs == 0) return;
 
-  rmm::device_uvector<alp_vector_desc> d_descs(num_vecs, stream, mr);
+  rmm::device_uvector<detail::cta_block_desc> d_descs(num_vecs, stream, mr);
   RMM_CUDA_TRY(cudaMemcpyAsync(d_descs.data(),
                                h_descs,
-                               num_vecs * sizeof(alp_vector_desc),
+                               num_vecs * sizeof(detail::cta_block_desc),
                                cudaMemcpyHostToDevice,
                                stream.value()));
 
   kernel_decode_alprd<SHMEM_WORDS, T>
     <<<static_cast<uint32_t>(num_vecs), BLOCK_DIM, 0, stream.value()>>>(
       d_descs.data(), d_output, static_cast<uint32_t>(num_vecs));
-}
-
-//===----------------------------------------------------------------------===//
-// CTA-level descriptors
-//===----------------------------------------------------------------------===//
-std::vector<alp_vector_desc> build_vector_descs(gpu_codec_run const& run)
-{
-  std::vector<alp_vector_desc> descs;
-  // Calculate the number of required descriptors
-  size_t total_vecs = 0;
-  for (auto const& seg : run.segments) {
-    total_vecs += ::cuda::ceil_div(seg.row_count, ALP_VECTOR_SIZE);
-  }
-  descs.reserve(total_vecs);
-  for (auto const& seg : run.segments) {
-    if (seg.row_count == 0) continue;
-    auto const num_vecs = ::cuda::ceil_div(seg.row_count, ALP_VECTOR_SIZE);
-    for (uint32_t v = 0; v < num_vecs; ++v) {
-      auto const vec_rows =
-        (v < num_vecs - 1) ? ALP_VECTOR_SIZE : seg.row_count - v * ALP_VECTOR_SIZE;
-      descs.push_back(
-        {seg.d_bytes, seg.bytes_size, v, vec_rows, seg.row_offset + v * ALP_VECTOR_SIZE});
-    }
-  }
-  return descs;
 }
 
 }  // anonymous namespace
@@ -737,7 +692,7 @@ std::vector<alp_vector_desc> build_vector_descs(gpu_codec_run const& run)
  * @brief Decode a set of ALP-encoded segments into a contiguous output buffer.
  *
  * One CTA decodes one 1024-row vector; segments are split across vectors via
- * `build_vector_descs`. Each segment writes to `d_output` at its own
+ * `build_block_descs`. Each segment writes to `d_output` at its own
  * `row_offset * type_size`. Malformed vectors are zero-filled rather than
  * faulted.
  *
@@ -757,7 +712,7 @@ void decode_alp_data(gpu_codec_run const& run,
                      rmm::cuda_stream_view stream,
                      rmm::device_async_resource_ref mr)
 {
-  auto const descs = build_vector_descs(run);
+  auto const descs = detail::build_block_descs<ALP_VECTOR_SIZE>(run);
   if (descs.empty()) return;
 
   switch (type_size) {
@@ -779,7 +734,7 @@ void decode_alp_data(gpu_codec_run const& run,
  * @brief Decode a set of ALPRD-encoded segments into a contiguous output buffer.
  *
  * One CTA decodes one 1024-row vector; segments are split across vectors via
- * `build_vector_descs`. Each segment writes to `d_output` at its own
+ * `build_block_descs`. Each segment writes to `d_output` at its own
  * `row_offset * type_size`. Malformed vectors are zero-filled rather than
  * faulted.
  *
@@ -799,7 +754,7 @@ void decode_alprd_data(gpu_codec_run const& run,
                        rmm::cuda_stream_view stream,
                        rmm::device_async_resource_ref mr)
 {
-  auto const descs = build_vector_descs(run);
+  auto const descs = detail::build_block_descs<ALP_VECTOR_SIZE>(run);
   if (descs.empty()) return;
 
   switch (type_size) {
