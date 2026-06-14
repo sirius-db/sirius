@@ -18,9 +18,8 @@
 //! Vectorized fill of a contiguous output range, shared by the codecs that
 //! materialize one value per row (CONSTANT broadcast, BITPACKING CONSTANT and
 //! CONSTANT_DELTA). int4 stores cover the 16B-aligned interior; a scalar
-//! prologue/epilogue absorb the unaligned head and ragged tail — so the
-//! vectorized path no longer requires `out` itself to be 16B aligned, only the
-//! 256B column buffer it points into (which RMM already guarantees).
+//! prologue/epilogue absorb the unaligned head and ragged tail, so `out` need
+//! not be 16B-aligned itself — only the 256B column buffer it points into.
 
 #pragma once
 

@@ -32,30 +32,21 @@
 
 namespace sirius::cuda::scan::detail {
 
-//! @brief Stage @p n_live_words 32-bit words of a packed bitstream from global @p src_bytes into
-//! the shared @p dst_words buffer, then zero @p guard_words trailing words so the bit-unpacker's
+//! @brief Stage @p n_live_words 32-bit words of a packed bitstream from @p src_bytes into the
+//! shared @p dst_words buffer, then zero @p guard_words trailing words so the bit-unpacker's
 //! cross-word reads stay in bounds.
 //!
-//! Block-wide collective: every thread must call it. @p src_bytes may be arbitrarily aligned; the
-//! bytes land in @p dst_words at offset 0 (no shift), so reading them back as words via
-//! `unpack_value` is correct regardless of source alignment. The whole-word copy is exact for every
-//! caller here: each codec's packed stream length is a FastPFor 32-value-group multiple, hence a
-//! multiple of 4 bytes.
+//! Block-wide collective (every thread must call it). @p src_bytes may be arbitrarily aligned; the
+//! bytes land at @p dst_words offset 0, so reading them back as words via `unpack_value` is correct
+//! regardless of source alignment.
 //!
-//! The copy path is chosen by the joint alignment of `src`, `dst`, and the byte count:
-//!   - >= 4-byte aligned: pass `cuda::aligned_size_t<N>` so `cg::memcpy_async` knows the run is
-//!     N-byte aligned and uses the 4/8/16-byte `cp.async` engine (SM80+). A plain size would fall
-//!     to the 1-byte path (it infers `alignof(uint8_t) == 1`).
-//!   - sub-word (e.g. ALPRD's `+2` streams): a manual per-word copy reads 4 bytes per thread, which
-//!     beats the 1-byte `cp.async` path — and `cp.async` has no 2-byte specialization to inform.
-//!
-//! @tparam BlockThreads  Block width (compile-time; also the grid stride of the manual path).
+//! @tparam BlockThreads  Block width (also the grid stride of the manual copy path).
 //! @param dst_words    Shared buffer of at least `n_live_words + guard_words` words (>= 4B
 //! aligned).
 //! @param src_bytes    Global source holding at least `n_live_words * 4` readable bytes.
 //! @param n_live_words Number of live 32-bit words to copy.
-//! @param guard_words  Trailing words to zero past the live data (1 when the unpack target is
-//!                     <= 32-bit, 2 when a 64-bit value can straddle into a third word).
+//! @param guard_words  Trailing words to zero (1 for a <= 32-bit unpack target, 2 if a 64-bit value
+//!                     can straddle into a third word).
 template <int BlockThreads>
 _CCCL_DEVICE _CCCL_FORCEINLINE void stage_packed_to_shmem(uint32_t* dst_words,
                                                           const uint8_t* src_bytes,
@@ -84,7 +75,7 @@ _CCCL_DEVICE _CCCL_FORCEINLINE void stage_packed_to_shmem(uint32_t* dst_words,
     }
     cg::wait(block);  // publishes both the copied words and the guard words
   } else {
-    // Sub-word source: a 4-byte memcpy per word beats the 1-byte cp.async fallback.
+    // Sub-word alignment: copy one word per thread.
     for (int w = threadIdx.x; w < n_live_words; w += BlockThreads) {
       uint32_t v;
       ::cuda::std::memcpy(

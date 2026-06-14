@@ -284,13 +284,9 @@ __global__ void kernel_decode_bitpacking(detail::cta_block_desc const* __restric
   //===--------------------------------------------------------------------===//
   // DELTA_FOR — frame + per-row delta, prefix-sum, then add delta_offset.
   //===--------------------------------------------------------------------===//
-  // Two-stage scan in blocked layout The block-wide prefix-sum is built from per-warp
-  // `cub::WarpScan` plus a single shmem exchange of the per-warp totals; one thread serially scans
-  // those 8 totals and broadcasts back. Final values are exchanged through shmem
-  // into striped layout for coalesced global stores.
-  //
-  // Used instead of `cub::BlockScan<T, 256>` to reduce register pressure and SMEM usage for
-  // improved occupancy.
+  // Two-stage block-wide prefix sum: a per-warp `cub::WarpScan`, then one thread
+  // serially scans the per-warp totals and broadcasts them back. Final values are
+  // exchanged through shmem into striped layout for coalesced global stores.
 
   T thread_data[VPT];
 #pragma unroll

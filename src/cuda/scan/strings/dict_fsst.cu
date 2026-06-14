@@ -342,12 +342,10 @@ __global__ void kernel_predecode_dict_fsst(dict_fsst_desc const* __restrict__ de
 }
 
 /// Per-row gather for the DICT_FSST codec (see codec banner above). Templated on
-/// @p FsstOnly so the rare mode-2 inline-decode machinery — the symbol table
-/// staged in shared memory plus the warp_decode_fsst scratch — is compiled out
-/// of the common DICTIONARY / DICT_FSST instantiation, keeping that path's
-/// register and shared-memory footprint low enough for higher occupancy. Each
-/// instantiation early-returns on segments outside its mode class, so the host
-/// launches both over the same descriptor array.
+/// @p FsstOnly so the mode-2 inline-decode path (symbol table in shared memory +
+/// warp_decode_fsst) compiles out of the common DICTIONARY / DICT_FSST
+/// instantiation. Each instantiation early-returns on segments outside its mode
+/// class, so the host launches both over the same descriptor array.
 template <bool FsstOnly>
 __global__ void kernel_gather_dict_fsst(dict_fsst_desc const* __restrict__ descs,
                                         int32_t const* __restrict__ d_offsets,
@@ -475,10 +473,8 @@ dict_fsst_desc make_stub_dict_fsst_desc(gpu_string_segment_desc const& seg)
 }
 
 /**
- * @brief Resizable pinned-host scratch pool. cudaMallocHost is expensive
- * (~ms per call for MB-class allocations) so we keep a single buffer per
- * usage site and grow it on demand — once warm, subsequent calls pay zero
- * allocation cost.
+ * @brief Resizable pinned-host scratch buffer, grown on demand and reused
+ * across calls (one instance per usage site).
  */
 class pinned_host_pool {
   void* ptr_  = nullptr;
@@ -533,10 +529,7 @@ prepared_dict_fsst prepare_dict_fsst(gpu_string_codec_run const& run,
   uint32_t const num_segs = static_cast<uint32_t>(run.segments.size());
   if (num_segs == 0) return out;
 
-  // Phase 1: batched async D2H of all headers into pinned host memory.
-  // Replaces N synchronous cudaMemcpy(header) calls with a single sync. The
-  // pinned pool amortizes cudaMallocHost across calls — first call pays, the
-  // rest are zero-cost.
+  // Phase 1: batched async D2H of all headers into pinned host memory, one sync.
   static thread_local pinned_host_pool headers_pool;
   auto* headers =
     static_cast<dict_fsst_header_t*>(headers_pool.get(sizeof(dict_fsst_header_t) * num_segs));
@@ -595,8 +588,7 @@ prepared_dict_fsst prepare_dict_fsst(gpu_string_codec_run const& run,
     return out;
   }
 
-  // Phase 3: launch the on-device prep kernel. Replaces the per-segment host
-  // pipeline (D2H prefix + duckdb_fsst_import + host walks).
+  // Phase 3: launch the on-device prep kernel.
   rmm::device_buffer d_pre_buf(pre.size() * sizeof(dict_fsst_pre_desc), stream, mr);
   RMM_CUDA_TRY(cudaMemcpyAsync(d_pre_buf.data(),
                                pre.data(),
@@ -752,12 +744,9 @@ void launch_dict_fsst_gather(dict_fsst_desc const* d_chunks,
                              rmm::cuda_stream_view stream)
 {
   if (n_chunks == 0) return;
-  // Two instantiations over the same descriptor array: the common DICTIONARY /
-  // DICT_FSST path (FsstOnly=false) and the rare inline-decode FSST_ONLY path
-  // (FsstOnly=true). Each early-returns on segments belonging to the other mode
-  // class, so the split keeps the mode-2 symbol-table machinery out of the
-  // common path's register/shared-memory budget. A column whose segments are all
-  // one mode leaves the other launch as cheap all-early-return blocks.
+  // Launch both instantiations over the full descriptor array: FsstOnly=false
+  // handles DICTIONARY / DICT_FSST, FsstOnly=true handles FSST_ONLY. Each
+  // early-returns on segments outside its mode class.
   kernel_gather_dict_fsst<false><<<n_chunks, BLOCK_DIM, 0, stream.value()>>>(d_chunks,
                                                                              d_offsets,
                                                                              d_chars,

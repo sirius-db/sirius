@@ -41,11 +41,10 @@ constexpr uint32_t FSST_MAX_CHUNK_EMIT =
 constexpr uint32_t FSST_WARPS_PER_CTA = BLOCK_DIM / WARP_THREADS;
 
 /**
- * @brief Import FSST symbol table on device from the opaque on-disk blob format.
+ * @brief Import an FSST symbol table from its on-disk blob into @p out.
  *
- * Device port of duckdb_fsst_import (libfsst.cpp:429). Same opaque blob layout (8B version | 1B
- * zeroTerminated | 8B lenHisto | packed symbols by length group 1..8,1). Used by
- * kernel_build_fsst_decoders to populate per-segment decoders without round-tripping through host.
+ * Device port of DuckDB's duckdb_fsst_import. Blob layout: 8B version | 1B
+ * zeroTerminated | 8B lenHisto | packed symbols by length group 1..8,1.
  */
 __device__ __forceinline__ bool device_fsst_import(uint8_t const* buf, fsst_decoder_compact* out)
 {
@@ -95,9 +94,8 @@ __device__ __forceinline__ bool device_fsst_import(uint8_t const* buf, fsst_deco
 }
 
 /**
- * @brief Compute the compressed length of a row in the FSST compressed stream, where @p comp_ptr
- * points to the start of the compressed bytes for that row, and @p sm_len is the symbol length
- * table from the FSST header.
+ * @brief Decompressed byte length of one row's `comp_len` FSST-compressed bytes,
+ * computed cooperatively by a warp. @p sm_len is the symbol length table.
  */
 __device__ __forceinline__ uint32_t warp_compute_decomp_len(uint8_t const* __restrict__ comp_ptr,
                                                             uint32_t comp_len,
@@ -143,17 +141,13 @@ __device__ __forceinline__ uint32_t warp_compute_decomp_len(uint8_t const* __res
 }
 
 /**
- * @brief Decode a chunk of compressed bytes using the FSST algorithm.
+ * @brief Decode `comp_len` FSST-compressed bytes with one warp, in 32-byte chunks.
  *
- * One warp decodes `comp_len` compressed bytes in 32-byte input chunks. Decoded symbols accumulate
- * in a per-warp scratch slab; we flush to `dst` only when the next chunk's worst-case emit (256 B)
- * would overflow scratch, or once at the end of the row.
- * `sm_sym` is split lo/hi so the common short-symbol load is one 4 B bank read.
- * `sm_sym_hi` is only read when len[code] > 4.
+ * Decoded symbols accumulate in a per-warp scratch slab and flush to `dst` when
+ * the next chunk's worst-case emit would overflow it, then once at end of row.
+ * The symbol table is split lo/hi; `sm_sym_hi` is read only when len[code] > 4.
  *
  * @note Reused by DICT_FSST mode-2 inline decompress.
- * @note Direct lane-to-global stores were measured 30-68 % slower than the shmem-staged drain
- * (small byte stores generated many partial L2 sectors).
  */
 __device__ __forceinline__ void warp_decode_fsst(uint8_t const* __restrict__ comp_ptr,
                                                  uint32_t comp_len,

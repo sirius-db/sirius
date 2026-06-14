@@ -149,10 +149,8 @@ struct prepared_dict_fsst {
 constexpr uint32_t align_up8(uint32_t n) { return (n + 7u) & ~7u; }
 
 /**
- * @brief Get a target number of CTAs for chunking segments, based on the current device's
- * occupancy.
- *
- * Two waves of full occupancy at BLOCK_DIM threads, per current device.
+ * @brief Target CTA count for chunking segments: two full device waves at
+ * BLOCK_DIM threads. Cached per device.
  */
 inline uint32_t get_target_ctas()
 {

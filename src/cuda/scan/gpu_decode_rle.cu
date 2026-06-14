@@ -47,7 +47,6 @@
 #include <cuda/std/algorithm>
 #include <cuda/std/functional>
 #include <cuda/std/limits>
-#include <cuda/warp>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -81,6 +80,7 @@ constexpr uint32_t RLE_BUILD_MAX_ENTRIES =
   ::cuda::ceil_div(RLE_DUCKDB_MAX_EC, BUILD_TILE_ENTRIES) * BUILD_TILE_ENTRIES;  // 90112
 
 constexpr uint32_t MALFORMED_FLAG = 0u;
+using detail::FULL_MASK;
 using detail::WARP_THREADS;
 
 /**
@@ -396,8 +396,8 @@ __device__ __forceinline__ void decode_chunk_rle(uint32_t const* __restrict__ pr
         lane_0_entry      = find_entry(chunk_entry_lo, chunk_entry_hi, lane_0_segment_row);
         lane_0_prefix_sum = prefix_sums[lane_0_entry];
       }
-      lane_0_entry      = ::cuda::device::warp_shuffle_idx(lane_0_entry, 0);
-      lane_0_prefix_sum = ::cuda::device::warp_shuffle_idx(lane_0_prefix_sum, 0);
+      lane_0_entry      = cub::ShuffleIndex<WARP_THREADS>(lane_0_entry, 0, FULL_MASK);
+      lane_0_prefix_sum = cub::ShuffleIndex<WARP_THREADS>(lane_0_prefix_sum, 0, FULL_MASK);
 
       auto const lane_31_row = lane_0_segment_row + WARP_THREADS - 1;
 

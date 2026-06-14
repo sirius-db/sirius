@@ -14,6 +14,25 @@
  * limitations under the License.
  */
 
+//===----------------------------------------------------------------------===//
+// String column decode — orchestrator.
+//
+// gpu_decode_strings_column decodes one VARCHAR column. The four string codecs
+// each live in strings/<codec>.cu and expose host wrappers:
+//   prepare_*         build per-run descriptors (some also run on-device prep,
+//                     e.g. FSST symbol tables, DICT_FSST dictionary predecode)
+//   launch_*_lengths  phase 1: write each row's decoded byte length
+//   launch_*_gather   phase 2: copy each row's decoded bytes to the output
+//
+// All codecs share one two-phase flow:
+//   1. each codec writes its rows' lengths into a single d_lengths array
+//   2. one exclusive scan turns d_lengths into the column's d_offsets
+//   3. each codec gathers its bytes into d_chars at those offsets
+// then the cudf strings column is assembled (offsets + chars + null mask).
+//
+// Each codec's on-disk segment layout is documented at the top of its file.
+//===----------------------------------------------------------------------===//
+
 #include "cuda/scan/gpu_decode_strings.cuh"
 #include "cuda/scan/strings/common.cuh"
 #include "cuda/scan/strings/dict_fsst.cuh"
@@ -45,16 +64,8 @@ namespace sirius::cuda::scan {
 
 namespace {
 
-//===----------------------------------------------------------------------===//
-// 6. Orchestrator
-//
-// `gpu_decode_strings_column` aggregates per-codec `prepared_*` state across
-// all runs in a column, uploads descriptors, dispatches the codec kernels in
-// the correct order (lengths → prefix sum → gather), and assembles the cudf
-// strings column.
-//===----------------------------------------------------------------------===//
-
-/// Sibling to `dispatch_validity_run` in gpu_native_decode.cu.
+/// Overlays an UNCOMPRESSED validity run onto the null mask (sibling to
+/// `dispatch_validity_run` in gpu_native_decode.cu).
 void overlay_validity_run(gpu_codec_run const& run, uint8_t* d_mask, rmm::cuda_stream_view stream)
 {
   if (run.codec != duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
@@ -83,6 +94,9 @@ void overlay_validity_run(gpu_codec_run const& run, uint8_t* d_mask, rmm::cuda_s
 
 }  // namespace
 
+/// Decodes one VARCHAR column via the shared two-phase flow (see file banner):
+/// aggregate per-codec prepared state, write per-row lengths, scan to offsets,
+/// gather bytes, then build the cudf strings column.
 std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode_input const& col,
                                                         rmm::cuda_stream_view stream,
                                                         rmm::device_async_resource_ref mr)

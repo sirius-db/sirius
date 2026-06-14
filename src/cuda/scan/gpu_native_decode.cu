@@ -15,20 +15,28 @@
  */
 
 //===----------------------------------------------------------------------===//
-// GPU-native decode dispatcher.
+// GPU decode pipeline — entry point and codec dispatch.
 //
-// Top-down structure of this file:
-//   1. CONSTANT broadcast (cudf::type_dispatcher → typed kernel).
-//   2. UNCOMPRESSED data copy (single-segment DMA fast path; multi-segment
-//      batched-memcpy kernel).
-//   3. Per-run dispatcher switches (data, validity).
-//   4. Per-column helpers (decode_column_data, decode_column_validity).
-//   5. Public `gpu_decode_table` entry — drives the per-column loop, then
-//      issues one batched cudf::batch_null_count to compute every null mask's
-//      null count in a single call.
+// gpu_decode_table decodes one row-group slice. For each column it runs the
+// data codec(s) into a values buffer and the validity codec(s) into a null
+// mask, builds a cudf::column, then finishes the table with one batched
+// null-count.
 //
-// Kernel-launch errors are caught at the end via `cudaPeekAtLastError`;
-// every synchronous CUDA API call is individually wrapped in `RMM_CUDA_TRY`.
+// A column's data is a sequence of runs, each carrying one codec.
+// dispatch_data_run routes a run by codec:
+//
+//   UNCOMPRESSED   device-to-device copy                   (this file)
+//   CONSTANT       broadcast one value to every row        (this file)
+//   RLE            prefix-sum build + value scatter        (gpu_decode_rle.cu)
+//   BITPACKING     bit-unpack per 2048-row group           (gpu_decode_bitpacking.cu)
+//   ALP / ALPRD    bit-unpack + float reconstruction       (gpu_decode_alp.cu)
+//   string codecs  two-phase length / scan / gather        (gpu_decode_strings.cu)
+//
+// The fixed-width codecs share one-CTA-per-block work partitioning
+// (detail/decode_common.cuh) and the device primitives in detail/
+// (bit_unpack, shared_staging, vectorized_store, byte_copy). Each on-disk
+// layout is documented at the top of its codec file. Malformed metadata
+// decodes to a zero-filled output instead of faulting.
 //===----------------------------------------------------------------------===//
 
 #include "cuda/scan/detail/vectorized_store.cuh"
@@ -62,16 +70,10 @@ namespace sirius::cuda::scan {
 
 namespace {
 
-/// Block dim used by every kernel in this file. Arch-portable (a multiple
-/// of warp size on every supported arch).
+/// Block dim used by every kernel in this file.
 constexpr uint32_t BLOCK_DIM = 256;
 
-/// Maximum bytes one block of `kernel_batched_memcpy` will copy.
-///
-/// Tuned empirically on Turing (sm_75); the kernels themselves are
-/// arch-portable, but the chunk size that maximises bandwidth varies with
-/// L2 capacity and DRAM scheduling. If you target Ampere/Hopper as the
-/// primary, re-run the [!benchmark][scan][decode] cases and update this.
+/// Maximum bytes one block of `kernel_batched_memcpy` copies.
 constexpr uint32_t COPY_CHUNK_BYTES = 64u << 10;
 
 /// `cudf::size_type` is signed int32. Catch a `total_rows` overflow before
@@ -79,13 +81,8 @@ constexpr uint32_t COPY_CHUNK_BYTES = 64u << 10;
 constexpr uint32_t MAX_ROWS_PER_COLUMN =
   static_cast<uint32_t>(std::numeric_limits<cudf::size_type>::max());
 
-/// Validates that every segment in `runs` covers a row range inside
-/// `[0, total_rows)`. The dispatcher allocates output buffers sized to
-/// `total_rows`; a segment overshooting that range would produce an
-/// out-of-bounds write in the codec memcpy/kernel. The viability walker
-/// upstream is supposed to guarantee this, but we re-check here so a
-/// malformed descriptor surfaces as a thrown exception rather than a CUDA
-/// fault or silent corruption.
+/// Throws if any segment's row range falls outside `[0, total_rows)`. Output
+/// buffers are sized to `total_rows`, so an overshoot would write out of bounds.
 void validate_segment_bounds(std::vector<gpu_codec_run> const& runs,
                              uint32_t total_rows,
                              char const* what)
@@ -104,38 +101,10 @@ void validate_segment_bounds(std::vector<gpu_codec_run> const& runs,
 }
 
 //===----------------------------------------------------------------------===//
-// CONSTANT broadcast.
-//
-// The constant value arrives as raw bytes already on device (the I/O layer
-// staged them there). The kernel below dereferences the device pointer on
-// every thread and writes it across the column.
-//
-// The cudf-native alternative is `cudf::make_column_from_scalar`. We don't
-// use it because its fill path does ≥3 D2H syncs per call (verified against
-// libcudf source on the version we link). Each sync answers a question that
-// our code does not need to ask:
-//   - column_factories.cu:30  `is_valid(stream)` — "is the whole scalar
-//                              NULL?". For us, per-row nullness lives in the
-//                              `validity` runs; a CONSTANT segment always
-//                              carries a real value.
-//   - fill.cu:41              `value(stream)`    — "host T for thrust::fill_n".
-//                              We bypass thrust and dereference the device
-//                              pointer on every thread instead.
-//   - fill.cu:42              `is_valid(stream)` — "validity iterator for
-//                              copy_range". Not applicable; we don't go
-//                              through copy_range.
-//
-// We keep one safety check cudf can skip: the segment-size guard in
-// `decode_constant_data` rejects bytes_size < type_size. cudf's scalar
-// storage is sized at construction; our segment bytes are external input
-// that has to be checked.
+// CONSTANT broadcast — write one device-resident value across the column.
 //===----------------------------------------------------------------------===//
 
-/// Reads a single value from `*src` (already on device) and writes it to every
-/// position in `dest[0..rows)` via `detail::vec_fill`: int4 stores over the
-/// 16B-aligned interior, scalar prologue/tail for the unaligned head and ragged
-/// tail. decimal128's 16-byte storage falls to the scalar path (one int4 would
-/// hold a single value anyway).
+/// Writes `*src` to every position in `dest[0, rows)` via `detail::vec_fill`.
 template <typename T>
 __global__ void kernel_broadcast_constant(T* __restrict__ dest, T const* __restrict__ src, int rows)
 {
@@ -145,12 +114,9 @@ __global__ void kernel_broadcast_constant(T* __restrict__ dest, T const* __restr
   detail::vec_fill<T>(dest, rows, tid, stride, [val](int) { return val; });
 }
 
-/// Functor for `cudf::type_dispatcher`. We project each cudf type to its
-/// on-device storage type via `device_storage_type_t<T>` — for plain numeric
-/// types this is just `T`, but for fixed-point types the dispatched class
-/// (e.g. `numeric::decimal128`) is wider than its actual column storage
-/// (the underlying `Rep`, e.g. `__int128_t`). Without this projection the
-/// kernel's stride would mismatch the column's physical width.
+/// `cudf::type_dispatcher` functor. Projects each cudf type to its on-device
+/// storage type (`device_storage_type_t<T>`, e.g. decimal128 -> __int128_t) so
+/// the broadcast stride matches the column's physical width.
 struct broadcast_dispatch {
   template <typename T, std::enable_if_t<cudf::is_fixed_width<T>(), int> = 0>
   void operator()(uint8_t* d_dest,
@@ -215,14 +181,8 @@ struct copy_chunk_desc {
   uint32_t bytes;
 };
 
-/// Each block copies one chunk. Picks the widest aligned access path the
-/// chunk's pointers + length jointly support: 16-byte (int4), 4-byte
-/// (uint32_t), or per-byte. DuckDB segment offsets aren't always 16-byte
-/// aligned, so the narrower fallbacks really do trigger.
-// Loop counters/index math here stay uint32_t: int indexing inflated this
-// kernel's register footprint (16 -> 38 on sm_86) in the relocatable production
-// build for no readability gain in a trivial memcpy loop. (Same rationale as the
-// FSST warp decode core.)
+/// Each block copies one chunk, picking the widest aligned access the chunk's
+/// pointers and length jointly support: 16-byte (int4), 4-byte, or per-byte.
 __global__ void kernel_batched_memcpy(copy_chunk_desc const* __restrict__ chunks, uint32_t n_chunks)
 {
   uint32_t cid = blockIdx.x;
@@ -255,11 +215,9 @@ __global__ void kernel_batched_memcpy(copy_chunk_desc const* __restrict__ chunks
     c.dst[i] = c.src[i];
 }
 
-/// Single-segment runs go through a direct `cudaMemcpyAsync` (the GPU's DMA
-/// fast path). Multi-segment runs are issued as one batched-kernel launch:
-/// the per-call CUDA API setup cost otherwise dominates once the run has
-/// more than a few dozen segments — the per-arch baseline JSON in
-/// `test/data/decode_baselines/` carries the measurements that justify this.
+/// Copies UNCOMPRESSED segments to the output. A single live segment uses a
+/// direct `cudaMemcpyAsync`; multiple segments are split into `COPY_CHUNK_BYTES`
+/// chunks and copied by one `kernel_batched_memcpy` launch.
 void decode_uncompressed_data(gpu_codec_run const& run,
                               uint8_t* d_output,
                               uint32_t type_size,
@@ -327,11 +285,8 @@ void decode_uncompressed_data(gpu_codec_run const& run,
     d_chunks.data(), static_cast<uint32_t>(n));
 }
 
-//===----------CUB Uncompressed Decode Alternatvie----------===//
-/// @note [KEVIN] The CUB algorithms provide device tuning automatically, which we are doing
-/// manually here (with, e.g., COPY_CHUNK_BYTES, BLOCK_DIM), and also perform TMA on machines that
-/// support it, making it a more portable alternative to manual kernel writing for batched copies.
-/// It is currently unused, but I expect it may replace the hand-written kernels in the future.
+/// Unused `cub::DeviceMemcpy::Batched` alternative to `decode_uncompressed_data`,
+/// kept as a portable reference path.
 [[maybe_unused]] void decode_uncompressed_data_cub(gpu_codec_run const& run,
                                                    uint8_t* d_output,
                                                    uint32_t type_size,

@@ -194,11 +194,10 @@ __global__ void kernel_compute_compressed_offsets_fsst(
 }
 
 /**
- * @brief Compute the decompressed lengths for each row in the FSST compressed stream.
+ * @brief Compute the decompressed length of each row in the FSST stream.
  *
- * Adaptive per CTA: thread-per-row for short rows (lower warp-coord tax dominates), warp-per-row
- * for longer rows (coalesced LDG dominates). 2 × WARP_THREADS = 64 B / row crossover matches the
- * empirical sweet spot.
+ * Adaptive per CTA: thread-per-row when the chunk averages < 64 compressed
+ * bytes/row, warp-per-row above that.
  */
 __global__ __launch_bounds__(BLOCK_DIM) void kernel_compute_decompressed_lengths_fsst(
   fsst_chunk_desc const* __restrict__ descs,
@@ -443,9 +442,8 @@ void launch_fsst_lengths(fsst_decoder_compact* d_decoders,
                          rmm::cuda_stream_view stream)
 {
   if (n_segments == 0) return;
-  // On-device symbol-table parse: one CTA per segment, coalesced symtab load into shmem then
-  // serial host-style parse. Replaces the per-segment sync D2H + duckdb_fsst_import that used to
-  // happen in prepare_fsst.
+  // On-device symbol-table parse: one CTA per segment, coalesced symtab load into
+  // shmem then a single-thread parse into d_decoders.
   kernel_build_fsst_decoders<<<n_segments, BLOCK_DIM, 0, stream.value()>>>(
     d_length_descs, n_segments, d_decoders);
   // A+B per-segment (prefix-sum state lives in one CTA); C per-chunk.
