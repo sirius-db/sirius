@@ -47,17 +47,17 @@ namespace sirius::cuda::scan::detail {
 //! @return The unpacked value, zero-extended into @p T.
 template <typename T>
 [[nodiscard]] _CCCL_DEVICE _CCCL_FORCEINLINE T unpack_value(const uint32_t* packed,
-                                                            uint32_t idx,
-                                                            uint32_t width)
+                                                            int idx,
+                                                            int width)
 {
-  constexpr uint32_t WORD_BITS  = ::cuda::std::numeric_limits<uint32_t>::digits;
-  constexpr uint32_t WORD_BYTES = sizeof(uint32_t);
-  constexpr uint32_t DWORD_BITS = ::cuda::std::numeric_limits<uint64_t>::digits;
+  int constexpr WORD_BITS  = ::cuda::std::numeric_limits<uint32_t>::digits;
+  int constexpr WORD_BYTES = sizeof(uint32_t);
+  int constexpr DWORD_BITS = ::cuda::std::numeric_limits<uint64_t>::digits;
   if (width == 0) { return T(0); }
 
-  auto const bit_pos  = static_cast<uint64_t>(idx) * width;
-  auto const word_idx = static_cast<uint32_t>(bit_pos / WORD_BITS);
-  auto const bit_off  = static_cast<uint32_t>(bit_pos % WORD_BITS);
+  auto const bit_pos  = idx * width;
+  auto const word_idx = bit_pos / WORD_BITS;
+  auto const bit_off  = bit_pos % WORD_BITS;
 
   // Accumulate in 64 bits; OR in the next word when the value crosses the 32-bit boundary.
   auto result = static_cast<uint64_t>(packed[word_idx]);
@@ -73,8 +73,12 @@ template <typename T>
     }
   }
 
-  auto const mask = (width >= DWORD_BITS) ? ~uint64_t{0} : (uint64_t{1} << width) - 1;
-  return static_cast<T>(result & mask);
+  if (width < DWORD_BITS) {
+    auto const mask = (1ULL << width) - 1;
+    return static_cast<T>(result & mask);
+  } else {
+    return static_cast<T>(result);
+  }
 }
 
 }  // namespace sirius::cuda::scan::detail

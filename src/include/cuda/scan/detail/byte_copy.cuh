@@ -42,25 +42,27 @@ namespace sirius::cuda::scan::detail {
 //! @param lane  Caller's lane id in [0, 32).
 _CCCL_DEVICE _CCCL_FORCEINLINE void warp_copy_bytes(uint8_t* dst,
                                                     const uint8_t* src,
-                                                    uint32_t n,
-                                                    uint32_t lane)
+                                                    int n,
+                                                    int lane)
 {
-  constexpr uint32_t WORD_BYTES = sizeof(uint32_t);
-  uint32_t const n_full_words   = n / WORD_BYTES;
+  int constexpr WORD_BYTES = sizeof(uint32_t);
+  int const n_full_words   = n / WORD_BYTES;
 
-  if ((reinterpret_cast<::cuda::std::uintptr_t>(src) & (WORD_BYTES - 1)) == 0) {
+  if ((reinterpret_cast<::cuda::std::uintptr_t>(src) % WORD_BYTES) == 0) {
+    // 4B aligned
     auto const* const src_words = reinterpret_cast<const uint32_t*>(src);
-    for (uint32_t w = lane; w < n_full_words; w += WARP_THREADS) {
-      uint32_t const v = src_words[w];
+    for (int w = lane; w < n_full_words; w += WARP_THREADS) {
+      auto const v = src_words[w];
       ::cuda::std::memcpy(dst + w * WORD_BYTES, &v, WORD_BYTES);
     }
   } else {
-    for (uint32_t w = lane; w < n_full_words; w += WARP_THREADS) {
+    // Unaligned
+    for (int w = lane; w < n_full_words; w += WARP_THREADS) {
       ::cuda::std::memcpy(dst + w * WORD_BYTES, src + w * WORD_BYTES, WORD_BYTES);
     }
   }
 
-  for (uint32_t t = n_full_words * WORD_BYTES + lane; t < n; t += WARP_THREADS) {
+  for (int t = n_full_words * WORD_BYTES + lane; t < n; t += WARP_THREADS) {
     dst[t] = src[t];
   }
 }

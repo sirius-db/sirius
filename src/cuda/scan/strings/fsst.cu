@@ -96,7 +96,7 @@ __device__ __forceinline__ bool parse_fsst_header(uint8_t const* base,
  */
 __global__ __launch_bounds__(BLOCK_DIM) void kernel_build_fsst_decoders(
   string_chunk_desc const* __restrict__ descs,
-  uint32_t num_segments,
+  int num_segments,
   fsst_decoder_compact* __restrict__ d_decoders)
 {
   auto const seg_idx = blockIdx.x;
@@ -110,7 +110,7 @@ __global__ __launch_bounds__(BLOCK_DIM) void kernel_build_fsst_decoders(
   __syncthreads();
 
   if (!sm_ok) {
-    for (uint32_t i = threadIdx.x; i < FSST_NUM_SYMBOLS; i += blockDim.x) {
+    for (int i = threadIdx.x; i < FSST_NUM_SYMBOLS; i += blockDim.x) {
       d_decoders[seg_idx].len[i]    = 0;
       d_decoders[seg_idx].symbol[i] = 0;
     }
@@ -121,7 +121,7 @@ __global__ __launch_bounds__(BLOCK_DIM) void kernel_build_fsst_decoders(
   auto const symtab_size =
     ::cuda::std::min(desc.bytes_size - symtab_off, uint32_t{FSST_SYMTAB_MAX_BYTES});
   auto const* sym_src = desc.d_bytes + symtab_off;
-  for (uint32_t i = threadIdx.x; i < symtab_size; i += blockDim.x) {
+  for (int i = threadIdx.x; i < symtab_size; i += blockDim.x) {
     sm_symtab[i] = sym_src[i];
   }
   __syncthreads();
@@ -139,7 +139,7 @@ __global__ void kernel_compute_compressed_offsets_fsst(
   uint32_t* __restrict__ d_comp_offsets,
   string_chunk_desc const* __restrict__ descs,
   uint32_t const* __restrict__ d_fsst_row_starts,
-  uint32_t num_segments)
+  int num_segments)
 {
   using BlockScanT = cub::BlockScan<uint32_t, BLOCK_DIM>;
 
@@ -161,14 +161,14 @@ __global__ void kernel_compute_compressed_offsets_fsst(
 
   if (!sm_ok) {
     // Zero the offsets for the segment so phase-C emits empty strings.
-    for (uint32_t i = threadIdx.x; i < segment_row_count; i += blockDim.x)
+    for (int i = threadIdx.x; i < segment_row_count; i += blockDim.x)
       segment_comp_offsets[i] = 0;
     return;
   }
 
   // Phase A: unpack compressed lengths from the bitpacked length stream after the header.
   auto const* packed = reinterpret_cast<uint32_t const*>(base + sizeof(fsst_header_t));
-  for (uint32_t i = threadIdx.x; i < segment_row_count; i += blockDim.x) {
+  for (int i = threadIdx.x; i < segment_row_count; i += blockDim.x) {
     segment_comp_offsets[i] = unpack_value<uint32_t>(packed, i, sm_hdr.bitpacking_width);
   }
   __syncthreads();
@@ -205,7 +205,7 @@ __global__ __launch_bounds__(BLOCK_DIM) void kernel_compute_decompressed_lengths
   uint32_t* __restrict__ d_lengths,
   uint32_t const* __restrict__ d_comp_offsets,
   fsst_decoder_compact const* __restrict__ d_decoders,
-  uint32_t num_chunks)
+  int num_chunks)
 {
   auto const chunk_id = blockIdx.x;
   if (chunk_id >= num_chunks) return;
@@ -220,14 +220,14 @@ __global__ __launch_bounds__(BLOCK_DIM) void kernel_compute_decompressed_lengths
 
   // Zero-fill lengths for the chunk if the metadata is malformed.
   if (!sm_ok) {
-    for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
+    for (int i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
       d_lengths[desc.global_row_start + i] = 0;
     }
     return;
   }
 
   fsst_decoder_compact const& dec = d_decoders[desc.seg_decoder_idx];
-  for (uint32_t i = threadIdx.x; i < FSST_NUM_SYMBOLS; i += blockDim.x) {
+  for (int i = threadIdx.x; i < FSST_NUM_SYMBOLS; i += blockDim.x) {
     sm_len[i] = dec.len[i];
   }
   __syncthreads();
@@ -246,7 +246,7 @@ __global__ __launch_bounds__(BLOCK_DIM) void kernel_compute_decompressed_lengths
     auto const lane          = threadIdx.x % WARP_THREADS;
     auto const warp_id       = threadIdx.x / WARP_THREADS;
     auto const warps_per_cta = blockDim.x / WARP_THREADS;
-    for (uint32_t i = warp_id; i < desc.row_count; i += warps_per_cta) {
+    for (int i = warp_id; i < desc.row_count; i += warps_per_cta) {
       auto const cumsum      = compressed_cumsum_ptr[i];
       auto const prev_cumsum = (i > 0) ? compressed_cumsum_ptr[i - 1] : start;
       if (cumsum > sm_hdr.dict_end || prev_cumsum > cumsum) {
@@ -259,12 +259,12 @@ __global__ __launch_bounds__(BLOCK_DIM) void kernel_compute_decompressed_lengths
         continue;
       }
       auto const* comp_length_ptr = dict_end_ptr - cumsum;
-      uint32_t decomp_len = warp_compute_decomp_len(comp_length_ptr, comp_len, sm_len, lane);
+      int decomp_len = warp_compute_decomp_len(comp_length_ptr, comp_len, sm_len, lane);
       if (lane == 0) { d_lengths[desc.global_row_start + i] = decomp_len; }
     }
   } else {
     // Thread-per-row: short rows; warp-coord tax of cooperative scan dominates.
-    for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
+    for (int i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
       auto const cumsum      = compressed_cumsum_ptr[i];
       auto const prev_cumsum = (i > 0) ? compressed_cumsum_ptr[i - 1] : start;
       if (cumsum > sm_hdr.dict_end || prev_cumsum > cumsum) {
@@ -305,7 +305,7 @@ __global__ __launch_bounds__(BLOCK_DIM) void kernel_gather_fsst_chunked(
   uint8_t* __restrict__ d_chars,
   uint32_t const* __restrict__ d_comp_offsets,
   fsst_decoder_compact const* __restrict__ d_decoders,
-  uint32_t num_chunks)
+  int num_chunks)
 {
   __shared__ bool sm_ok;
   __shared__ fsst_header_t sm_hdr;
@@ -329,7 +329,7 @@ __global__ __launch_bounds__(BLOCK_DIM) void kernel_gather_fsst_chunked(
 
   // Load the symbol table into SMEM.
   fsst_decoder_compact const& dec = d_decoders[desc.seg_decoder_idx];
-  for (uint32_t i = threadIdx.x; i < FSST_SIZE; i += blockDim.x) {
+  for (int i = threadIdx.x; i < FSST_SIZE; i += blockDim.x) {
     sm_len[i]          = (i < FSST_NUM_SYMBOLS) ? dec.len[i] : 0;
     uint64_t const sym = (i < FSST_NUM_SYMBOLS) ? dec.symbol[i] : 0;
     sm_sym_lo[i]       = static_cast<uint32_t>(sym);
@@ -344,7 +344,7 @@ __global__ __launch_bounds__(BLOCK_DIM) void kernel_gather_fsst_chunked(
   auto const warp_id        = threadIdx.x / WARP_THREADS;
   auto const warps_per_cta  = blockDim.x / WARP_THREADS;
 
-  for (uint32_t i = warp_id; i < desc.row_count; i += warps_per_cta) {
+  for (int i = warp_id; i < desc.row_count; i += warps_per_cta) {
     auto const my_cumsum = my_cumsum_ptr[i];
     auto const prev_cumsum =
       (i > 0) ? my_cumsum_ptr[i - 1] : (desc.is_first_chunk ? 0 : *(my_cumsum_ptr - 1));

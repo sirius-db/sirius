@@ -25,6 +25,7 @@
 #include "cuda/scan/detail/byte_copy.cuh"
 #include "cuda/scan/strings/common.cuh"
 
+#include <cub/util_ptx.cuh>
 #include <cuda/std/algorithm>
 
 #include <cstdint>
@@ -111,7 +112,7 @@ __device__ __forceinline__ uint32_t warp_compute_decomp_len(uint8_t const* __res
     uint8_t const my_byte     = is_active ? comp_ptr[off + lane] : 0;
     int const is_esc          = is_active && my_byte == FSST_ESC ? 1 : 0;
 
-    auto const neighbor_is_esc = __shfl_up_sync(FULL_MASK, is_esc, 1);
+    auto const neighbor_is_esc = ::cub::ShuffleUp<WARP_THREADS>(is_esc, 1, 0, FULL_MASK);
     auto const prev_is_esc     = (lane == 0) ? prev_chunk_last_is_esc : neighbor_is_esc;
 
     // Per-lane contribution: 0 for inactive / escape-sentinel;
@@ -126,7 +127,8 @@ __device__ __forceinline__ uint32_t warp_compute_decomp_len(uint8_t const* __res
       }
     }
 
-    // Warp-reduce per-lane lengths.
+    // Warp-reduce per-lane lengths. CUB has no ShuffleXor, so the butterfly
+    // all-reduce keeps the raw `__shfl_xor_sync` intrinsic.
 #pragma unroll
     for (uint32_t s = WARP_THREADS / 2; s > 0; s /= 2) {
       my_len += __shfl_xor_sync(FULL_MASK, my_len, s);
@@ -135,7 +137,7 @@ __device__ __forceinline__ uint32_t warp_compute_decomp_len(uint8_t const* __res
 
     // Broadcast whether the last byte in this 32B stripe was an escape for the next stripe.
     auto const last_active_lane = bytes_in_chunk - 1;
-    prev_chunk_last_is_esc      = __shfl_sync(FULL_MASK, is_esc, last_active_lane);
+    prev_chunk_last_is_esc = ::cub::ShuffleIndex<WARP_THREADS>(is_esc, last_active_lane, FULL_MASK);
   }
   return total;
 }
@@ -172,7 +174,7 @@ __device__ __forceinline__ void warp_decode_fsst(uint8_t const* __restrict__ com
     auto const active         = lane < bytes_in_chunk;
     uint8_t const my_byte     = active ? comp_ptr[off + lane] : 0;
     int const is_esc          = (active && my_byte == FSST_ESC) ? 1 : 0;
-    auto const neighbor_esc   = __shfl_up_sync(FULL_MASK, is_esc, 1);
+    auto const neighbor_esc   = ::cub::ShuffleUp<WARP_THREADS>(is_esc, 1, 0, FULL_MASK);
     auto const prev_was_esc   = (lane == 0) ? prev_chunk_last_is_esc : neighbor_esc;
 
     // Decode the symbol for this lane, if active and not an escape byte.
@@ -198,12 +200,12 @@ __device__ __forceinline__ void warp_decode_fsst(uint8_t const* __restrict__ com
     auto scan = my_len;
 #pragma unroll
     for (uint32_t step = 1; step < WARP_THREADS; step <<= 1) {
-      auto const add = __shfl_up_sync(FULL_MASK, scan, step);
+      auto const add = ::cub::ShuffleUp<WARP_THREADS>(scan, step, 0, FULL_MASK);
       if (lane >= step) { scan += add; }
     }
     auto const exclusive   = scan - my_len;
     auto const base        = scratch_used + exclusive;
-    auto const chunk_total = __shfl_sync(FULL_MASK, scan, WARP_THREADS - 1);
+    auto const chunk_total = ::cub::ShuffleIndex<WARP_THREADS>(scan, WARP_THREADS - 1, FULL_MASK);
 
     // Copy the decoded symbol into the scratch pad at the offset computed from the scan.
     if (my_len > 0) {
@@ -223,7 +225,7 @@ __device__ __forceinline__ void warp_decode_fsst(uint8_t const* __restrict__ com
 
     scratch_used += chunk_total;
     auto const last_active_lane = bytes_in_chunk - 1;
-    prev_chunk_last_is_esc      = __shfl_sync(FULL_MASK, is_esc, last_active_lane);
+    prev_chunk_last_is_esc = ::cub::ShuffleIndex<WARP_THREADS>(is_esc, last_active_lane, FULL_MASK);
 
     // Lazy flush: only when the next chunk might overflow scratch.
     auto const more_chunks = (off + WARP_THREADS) < comp_len;

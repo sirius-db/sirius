@@ -70,7 +70,7 @@ __device__ __forceinline__ bool parse_dict_header(uint8_t const* base,
 
 // The index buffer holds uint32 forward-cumulative byte offsets at base+index_buffer_offset. The
 // segment base is not guaranteed uint32-aligned, so read each entry alignment-agnostically.
-__device__ __forceinline__ uint32_t dict_index_at(uint8_t const* idx_bytes, uint32_t i)
+__device__ __forceinline__ uint32_t dict_index_at(uint8_t const* idx_bytes, int i)
 {
   return detail::load_unaligned<uint32_t>(idx_bytes + static_cast<size_t>(i) * sizeof(uint32_t));
 }
@@ -83,7 +83,7 @@ __device__ __forceinline__ uint32_t dict_index_at(uint8_t const* idx_bytes, uint
  */
 __global__ void kernel_compute_lengths_dict(string_chunk_desc const* __restrict__ descs,
                                             uint32_t* __restrict__ d_lengths,
-                                            uint32_t num_chunks)
+                                            int num_chunks)
 {
   auto const chunk_id = blockIdx.x;
   if (chunk_id >= num_chunks) return;
@@ -97,7 +97,7 @@ __global__ void kernel_compute_lengths_dict(string_chunk_desc const* __restrict_
 
   // Malformed metadata → zero-fill using the trusted descriptor row count.
   if (!sm_ok) {
-    for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
+    for (int i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
       d_lengths[desc.global_row_start + i] = 0;
     }
     return;
@@ -107,10 +107,10 @@ __global__ void kernel_compute_lengths_dict(string_chunk_desc const* __restrict_
   // lengths from the index buffer.
   auto const* d_sel     = reinterpret_cast<uint32_t const*>(segment_base + sizeof(dict_header_t));
   auto const* idx_bytes = segment_base + sm_hdr.index_buffer_offset;
-  for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
+  for (int i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
     auto const segment_idx = desc.seg_row_start + i;
     auto const sel         = unpack_value<uint32_t>(d_sel, segment_idx, sm_hdr.bitpacking_width);
-    uint32_t len           = 0u;
+    int len                = 0;
     if (sel != 0u && sel < sm_hdr.index_buffer_count) {
       len = dict_index_at(idx_bytes, sel) - dict_index_at(idx_bytes, sel - 1);
     }
@@ -128,7 +128,7 @@ __global__ void kernel_compute_lengths_dict(string_chunk_desc const* __restrict_
 __global__ void kernel_gather_dict(string_chunk_desc const* __restrict__ descs,
                                    int32_t const* __restrict__ d_offsets,
                                    uint8_t* __restrict__ d_chars,
-                                   uint32_t num_chunks)
+                                   int num_chunks)
 {
   auto const chunk_id = blockIdx.x;
   if (chunk_id >= num_chunks) return;
@@ -145,7 +145,7 @@ __global__ void kernel_gather_dict(string_chunk_desc const* __restrict__ descs,
   auto const* idx_bytes = segment_base + sm_hdr.index_buffer_offset;
   auto const* dict_end  = segment_base + sm_hdr.dict_end;
 
-  for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
+  for (int i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
     auto const segment_idx = desc.seg_row_start + i;
     auto const sel         = unpack_value<uint32_t>(d_sel, segment_idx, sm_hdr.bitpacking_width);
     if (sel == 0) continue;
@@ -165,7 +165,7 @@ __global__ void kernel_gather_dict(string_chunk_desc const* __restrict__ descs,
 __global__ void kernel_gather_dict_warp(string_chunk_desc const* __restrict__ descs,
                                         int32_t const* __restrict__ d_offsets,
                                         uint8_t* __restrict__ d_chars,
-                                        uint32_t num_chunks)
+                                        int num_chunks)
 {
   auto const chunk_id = blockIdx.x;
   if (chunk_id >= num_chunks) return;
@@ -182,11 +182,11 @@ __global__ void kernel_gather_dict_warp(string_chunk_desc const* __restrict__ de
   auto const* idx_bytes = segment_base + sm_hdr.index_buffer_offset;
   auto const* dict_end  = segment_base + sm_hdr.dict_end;
 
-  uint32_t const lane          = threadIdx.x % WARP_THREADS;
-  uint32_t const warp_id       = threadIdx.x / WARP_THREADS;
-  uint32_t const warps_per_cta = blockDim.x / WARP_THREADS;
+  int const lane          = threadIdx.x % WARP_THREADS;
+  int const warp_id       = threadIdx.x / WARP_THREADS;
+  int const warps_per_cta = blockDim.x / WARP_THREADS;
 
-  for (uint32_t i = warp_id; i < desc.row_count; i += warps_per_cta) {
+  for (int i = warp_id; i < desc.row_count; i += warps_per_cta) {
     auto const segment_idx = desc.seg_row_start + i;
     auto const sel         = unpack_value<uint32_t>(d_sel, segment_idx, sm_hdr.bitpacking_width);
     if (sel == 0) continue;

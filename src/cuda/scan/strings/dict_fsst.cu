@@ -107,7 +107,7 @@ static_assert(sizeof(dict_fsst_pre_desc) % 4 == 0);
  */
 __global__ __launch_bounds__(BLOCK_DIM) void kernel_build_dict_fsst_data(
   dict_fsst_pre_desc const* __restrict__ pre,
-  uint32_t num_segments,
+  int num_segments,
   fsst_decoder_compact* __restrict__ d_decoders,
   uint32_t* __restrict__ d_byte_offsets,
   uint32_t* __restrict__ d_decoded_offsets,
@@ -128,7 +128,7 @@ __global__ __launch_bounds__(BLOCK_DIM) void kernel_build_dict_fsst_data(
     if (threadIdx.x == 0) {
       d_per_seg_decoded_total[seg_idx] = 0;
       d_per_seg_inline_null[seg_idx]   = 0;
-      for (uint32_t i = 0; i < FSST_NUM_SYMBOLS; ++i) {
+      for (int i = 0; i < FSST_NUM_SYMBOLS; ++i) {
         d_decoders[seg_idx].len[i]    = 0;
         d_decoders[seg_idx].symbol[i] = 0;
       }
@@ -144,18 +144,18 @@ __global__ __launch_bounds__(BLOCK_DIM) void kernel_build_dict_fsst_data(
   if (has_fsst) {
     auto const symtab_size =
       ::cuda::std::min(d.bytes_size - d.off_symtab, uint32_t{FSST_SYMTAB_MAX_BYTES});
-    for (uint32_t i = threadIdx.x; i < symtab_size; i += blockDim.x) {
+    for (int i = threadIdx.x; i < symtab_size; i += blockDim.x) {
       sm_symtab[i] = d.d_bytes[d.off_symtab + i];
     }
     __syncthreads();
     if (threadIdx.x == 0) { device_fsst_import(sm_symtab, &d_decoders[seg_idx]); }
     __syncthreads();
     // Cache sm_len[] for the per-entry walks below.
-    for (uint32_t i = threadIdx.x; i < FSST_NUM_SYMBOLS; i += blockDim.x) {
+    for (int i = threadIdx.x; i < FSST_NUM_SYMBOLS; i += blockDim.x) {
       sm_len[i] = d_decoders[seg_idx].len[i];
     }
   } else {
-    for (uint32_t i = threadIdx.x; i < FSST_NUM_SYMBOLS; i += blockDim.x) {
+    for (int i = threadIdx.x; i < FSST_NUM_SYMBOLS; i += blockDim.x) {
       d_decoders[seg_idx].len[i]    = 0;
       d_decoders[seg_idx].symbol[i] = 0;
     }
@@ -167,7 +167,7 @@ __global__ __launch_bounds__(BLOCK_DIM) void kernel_build_dict_fsst_data(
   // sum (decoded_offsets[k] = sum of entry_lens[0..k-1]).
   if (threadIdx.x == 0) my_byte_off[0] = 0;
   auto const* slens_packed = reinterpret_cast<uint32_t const*>(d.d_bytes + d.off_slens);
-  for (uint32_t k = threadIdx.x; k < d.dict_count; k += blockDim.x) {
+  for (int k = threadIdx.x; k < d.dict_count; k += blockDim.x) {
     my_byte_off[k + 1] = unpack_value<uint32_t>(slens_packed, k, d.string_lengths_width);
   }
   __syncthreads();
@@ -196,7 +196,7 @@ __global__ __launch_bounds__(BLOCK_DIM) void kernel_build_dict_fsst_data(
   // Phase 3: decoded_offsets.
   if (!has_fsst) {
     // Mode 0 (raw DICTIONARY): decoded_offsets = byte_offsets.
-    for (uint32_t k = threadIdx.x; k <= d.dict_count; k += blockDim.x) {
+    for (int k = threadIdx.x; k <= d.dict_count; k += blockDim.x) {
       my_dec_off[k] = my_byte_off[k];
     }
     __syncthreads();
@@ -208,12 +208,12 @@ __global__ __launch_bounds__(BLOCK_DIM) void kernel_build_dict_fsst_data(
     if (threadIdx.x == 0) my_dec_off[0] = 0;
     if (threadIdx.x == 0 && d.dict_count >= 1) my_dec_off[1] = 0;  // entry 0 is NULL
     auto const* dict_bytes_base = d.d_bytes + d.off_dict;
-    for (uint32_t k = threadIdx.x + 1; k < d.dict_count; k += blockDim.x) {
+    for (int k = threadIdx.x + 1; k < d.dict_count; k += blockDim.x) {
       auto const comp_start = my_byte_off[k];
       auto const comp_len   = my_byte_off[k + 1] - comp_start;
       auto const* cp        = dict_bytes_base + comp_start;
-      uint32_t decomp_len   = 0;
-      uint32_t pos          = 0;
+      int decomp_len        = 0;
+      int pos               = 0;
       while (pos < comp_len) {
         uint8_t code = cp[pos++];
         if (code < FSST_ESC) {
@@ -233,14 +233,14 @@ __global__ __launch_bounds__(BLOCK_DIM) void kernel_build_dict_fsst_data(
     auto const start          = threadIdx.x * max_per_thread;
     auto const end            = ::cuda::std::min(start + max_per_thread, N);
     uint32_t thread_sum       = 0;
-    for (uint32_t i = start; i < end; ++i) {
+    for (int i = start; i < end; ++i) {
       thread_sum += my_dec_off[i];
       my_dec_off[i] = thread_sum;
     }
     uint32_t exclusive_sum = 0;
     BlockScanT(scan_temp).ExclusiveSum(thread_sum, exclusive_sum);
     if (exclusive_sum > 0) {
-      for (uint32_t i = start; i < end; ++i) {
+      for (int i = start; i < end; ++i) {
         my_dec_off[i] += exclusive_sum;
       }
     }
@@ -260,9 +260,9 @@ __global__ __launch_bounds__(BLOCK_DIM) void kernel_build_dict_fsst_data(
 __global__ void kernel_compute_lengths_dict_fsst(dict_fsst_desc const* __restrict__ descs,
                                                  uint32_t* __restrict__ d_lengths,
                                                  uint32_t const* __restrict__ d_decoded_offsets,
-                                                 uint32_t num_segments)
+                                                 int num_segments)
 {
-  uint32_t seg_idx = blockIdx.x;
+  int seg_idx = blockIdx.x;
   if (seg_idx >= num_segments) return;
   auto const desc         = descs[seg_idx];
   uint32_t const* dec_off = d_decoded_offsets + desc.seg_dict_offset_base;
@@ -270,12 +270,12 @@ __global__ void kernel_compute_lengths_dict_fsst(dict_fsst_desc const* __restric
     reinterpret_cast<uint32_t const*>(desc.d_bytes + desc.dict_indices_offset);
   bool const fsst_only = (desc.mode == DICT_FSST_MODE_FSST_ONLY);
 
-  for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
-    uint32_t seg_i = desc.seg_row_start + i;
-    uint32_t idx =
-      fsst_only ? (seg_i + 1u) : unpack_value<uint32_t>(d_idx, seg_i, desc.dict_indices_width);
-    uint32_t len = 0u;
-    if (idx != 0u && idx < desc.dict_count) { len = dec_off[idx + 1] - dec_off[idx]; }
+  for (int i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
+    int seg_i = desc.seg_row_start + i;
+    int idx =
+      fsst_only ? (seg_i + 1) : unpack_value<uint32_t>(d_idx, seg_i, desc.dict_indices_width);
+    int len = 0;
+    if (idx != 0 && idx < desc.dict_count) { len = dec_off[idx + 1] - dec_off[idx]; }
     d_lengths[desc.global_row_start + i] = len;
   }
 }
@@ -287,9 +287,9 @@ __global__ void kernel_predecode_dict_fsst(dict_fsst_desc const* __restrict__ de
                                            uint32_t const* __restrict__ d_decoded_offsets,
                                            fsst_decoder_compact const* __restrict__ d_decoders,
                                            uint8_t* __restrict__ predecode_buf,
-                                           uint32_t num_segments)
+                                           int num_segments)
 {
-  uint32_t seg_idx = blockIdx.x;
+  int seg_idx = blockIdx.x;
   if (seg_idx >= num_segments) return;
   auto const desc = descs[seg_idx];
   if (desc.mode != DICT_FSST_MODE_DICT_FSST) return;
@@ -299,7 +299,7 @@ __global__ void kernel_predecode_dict_fsst(dict_fsst_desc const* __restrict__ de
   __shared__ unsigned long long sm_sym[FSST_NUM_SYMBOLS];
 
   fsst_decoder_compact const& dec = d_decoders[desc.seg_decoder_idx];
-  for (uint32_t i = threadIdx.x; i < FSST_NUM_SYMBOLS; i += blockDim.x) {
+  for (int i = threadIdx.x; i < FSST_NUM_SYMBOLS; i += blockDim.x) {
     sm_len[i] = dec.len[i];
     sm_sym[i] = dec.symbol[i];
   }
@@ -311,16 +311,16 @@ __global__ void kernel_predecode_dict_fsst(dict_fsst_desc const* __restrict__ de
   uint8_t* out_base        = predecode_buf + desc.predecode_seg_offset;
 
   // Skip k=0 (reserved NULL slot, length 0). One thread per dict entry.
-  for (uint32_t k = threadIdx.x + 1u; k < desc.dict_count; k += blockDim.x) {
-    uint32_t comp_start = byte_off[k];
-    uint32_t comp_end   = byte_off[k + 1];
-    uint32_t comp_len   = comp_end - comp_start;
-    uint32_t out_pos    = dec_off[k];
+  for (int k = threadIdx.x + 1; k < desc.dict_count; k += blockDim.x) {
+    int comp_start = byte_off[k];
+    int comp_end   = byte_off[k + 1];
+    int comp_len   = comp_end - comp_start;
+    int out_pos    = dec_off[k];
 
     uint8_t const* comp_ptr = dict_data + comp_start;
     uint8_t* out_ptr        = out_base + out_pos;
-    uint32_t pos            = 0;
-    uint32_t op             = 0;
+    int pos                 = 0;
+    int op                  = 0;
     while (pos < comp_len) {
       uint8_t code = comp_ptr[pos++];
       if (code < FSST_ESC) {
@@ -356,9 +356,9 @@ __global__ void kernel_gather_dict_fsst(dict_fsst_desc const* __restrict__ descs
                                         uint32_t const* __restrict__ d_decoded_offsets,
                                         uint8_t const* __restrict__ predecode_buf,
                                         fsst_decoder_compact const* __restrict__ d_decoders,
-                                        uint32_t num_segments)
+                                        int num_segments)
 {
-  uint32_t seg_idx = blockIdx.x;
+  int seg_idx = blockIdx.x;
   if (seg_idx >= num_segments) return;
   auto const desc = descs[seg_idx];
   // This instantiation handles only its own mode class; the complementary
@@ -368,9 +368,9 @@ __global__ void kernel_gather_dict_fsst(dict_fsst_desc const* __restrict__ descs
   uint8_t const* base           = desc.d_bytes;
   uint32_t const* dict_byte_off = d_byte_offsets + desc.seg_dict_offset_base;
 
-  uint32_t const lane          = threadIdx.x & (WARP_THREADS - 1u);
-  uint32_t const warp_id       = threadIdx.x / WARP_THREADS;
-  uint32_t const warps_per_cta = blockDim.x / WARP_THREADS;
+  int const lane          = threadIdx.x & (WARP_THREADS - 1u);
+  int const warp_id       = threadIdx.x / WARP_THREADS;
+  int const warps_per_cta = blockDim.x / WARP_THREADS;
 
   if constexpr (!FsstOnly) {
     // Modes 0/1: warp-cooperative memcpy. Mode 1 (DICT_FSST) copies the
@@ -383,13 +383,13 @@ __global__ void kernel_gather_dict_fsst(dict_fsst_desc const* __restrict__ descs
       mode_dict_fsst ? (predecode_buf + desc.predecode_seg_offset) : (base + desc.dict_data_offset);
     uint32_t const* d_idx = reinterpret_cast<uint32_t const*>(base + desc.dict_indices_offset);
 
-    for (uint32_t i = warp_id; i < desc.row_count; i += warps_per_cta) {
-      uint32_t seg_i = desc.seg_row_start + i;
-      uint32_t idx   = unpack_value<uint32_t>(d_idx, seg_i, desc.dict_indices_width);
-      if (idx == 0u) continue;  // NULL — pass-1 emitted length 0
-      uint32_t op          = static_cast<uint32_t>(d_offsets[desc.global_row_start + i]);
-      uint32_t entry_start = memcpy_off[idx];
-      uint32_t entry_len   = memcpy_off[idx + 1] - entry_start;
+    for (int i = warp_id; i < desc.row_count; i += warps_per_cta) {
+      int seg_i = desc.seg_row_start + i;
+      int idx   = unpack_value<uint32_t>(d_idx, seg_i, desc.dict_indices_width);
+      if (idx == 0) continue;  // NULL — pass-1 emitted length 0
+      int op          = d_offsets[desc.global_row_start + i];
+      int entry_start = memcpy_off[idx];
+      int entry_len   = memcpy_off[idx + 1] - entry_start;
       detail::warp_copy_bytes(d_chars + op, memcpy_src + entry_start, entry_len, lane);
     }
   } else {
@@ -402,7 +402,7 @@ __global__ void kernel_gather_dict_fsst(dict_fsst_desc const* __restrict__ descs
     __shared__ uint32_t sm_scratch_u32[FSST_WARPS_PER_CTA][FSST_SCRATCH_U32_PER_WARP];
 
     fsst_decoder_compact const& dec = d_decoders[desc.seg_decoder_idx];
-    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) {
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) {
       sm_len[i]    = (i < FSST_NUM_SYMBOLS) ? dec.len[i] : uint8_t{0};
       uint64_t sym = (i < FSST_NUM_SYMBOLS) ? dec.symbol[i] : 0ull;
       sm_sym_lo[i] = static_cast<uint32_t>(sym);
@@ -411,13 +411,13 @@ __global__ void kernel_gather_dict_fsst(dict_fsst_desc const* __restrict__ descs
     __syncthreads();
 
     uint8_t const* comp_base = base + desc.dict_data_offset;
-    for (uint32_t i = warp_id; i < desc.row_count; i += warps_per_cta) {
-      uint32_t seg_i      = desc.seg_row_start + i;
-      uint32_t idx        = seg_i + 1u;
-      uint32_t byte_start = dict_byte_off[idx];
-      uint32_t comp_len   = dict_byte_off[idx + 1] - byte_start;
+    for (int i = warp_id; i < desc.row_count; i += warps_per_cta) {
+      int seg_i      = desc.seg_row_start + i;
+      int idx        = seg_i + 1;
+      int byte_start = dict_byte_off[idx];
+      int comp_len   = dict_byte_off[idx + 1] - byte_start;
       if (comp_len == 0) continue;
-      uint32_t op = static_cast<uint32_t>(d_offsets[desc.global_row_start + i]);
+      int op = d_offsets[desc.global_row_start + i];
       warp_decode_fsst(comp_base + byte_start,
                        comp_len,
                        d_chars + op,
@@ -434,9 +434,9 @@ __global__ void kernel_gather_dict_fsst(dict_fsst_desc const* __restrict__ descs
 /// COMPRESSION_EMPTY validity for these, which the overlay path skips.
 __global__ void kernel_dict_fsst_mark_nulls(dict_fsst_desc const* __restrict__ descs,
                                             uint8_t* __restrict__ d_mask,
-                                            uint32_t num_segments)
+                                            int num_segments)
 {
-  uint32_t seg_idx = blockIdx.x;
+  int seg_idx = blockIdx.x;
   if (seg_idx >= num_segments) return;
   auto const desc = descs[seg_idx];
   uint32_t const* d_idx =
@@ -446,11 +446,11 @@ __global__ void kernel_dict_fsst_mark_nulls(dict_fsst_desc const* __restrict__ d
   if (desc.mode == DICT_FSST_MODE_FSST_ONLY) return;
 
   auto* d_mask_words = reinterpret_cast<unsigned int*>(d_mask);
-  for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
-    uint32_t seg_i = desc.seg_row_start + i;
-    uint32_t idx   = unpack_value<uint32_t>(d_idx, seg_i, desc.dict_indices_width);
-    if (idx != 0u) continue;
-    uint32_t row = desc.global_row_start + i;
+  for (int i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
+    int seg_i = desc.seg_row_start + i;
+    int idx   = unpack_value<uint32_t>(d_idx, seg_i, desc.dict_indices_width);
+    if (idx != 0) continue;
+    int row = desc.global_row_start + i;
     atomicAnd(d_mask_words + (row >> 5), ~(1u << (row & 31u)));
   }
 }

@@ -44,7 +44,7 @@ namespace {
 
 // Backward-cumulative offsets are int32 at base+8. The segment base is not guaranteed
 // int32-aligned, so read each offset alignment-agnostically.
-__device__ __forceinline__ int32_t duck_offset(uint8_t const* off_bytes, uint32_t seg_i)
+__device__ __forceinline__ int32_t duck_offset(uint8_t const* off_bytes, int seg_i)
 {
   return detail::load_unaligned<int32_t>(off_bytes + static_cast<size_t>(seg_i) * sizeof(int32_t));
 }
@@ -58,7 +58,7 @@ __device__ __forceinline__ int32_t duck_offset(uint8_t const* off_bytes, uint32_
  */
 __global__ void kernel_compute_lengths_uncomp(string_chunk_desc const* __restrict__ descs,
                                               uint32_t* __restrict__ d_lengths,
-                                              uint32_t num_chunks)
+                                              int num_chunks)
 {
   auto const chunk_id = blockIdx.x;
   if (chunk_id >= num_chunks) return;
@@ -71,14 +71,14 @@ __global__ void kernel_compute_lengths_uncomp(string_chunk_desc const* __restric
   if (threadIdx.x == 0) { sm_ok = (limit >= 8u + size_t{end_row} * 4u); }
   __syncthreads();
   if (!sm_ok) {
-    for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
+    for (int i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
       d_lengths[desc.global_row_start + i] = 0u;
     }
     return;
   }
 
   auto const* off_bytes = base + 8;
-  for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
+  for (int i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
     auto const seg_i                     = desc.seg_row_start + i;
     auto const cur                       = duck_offset(off_bytes, seg_i);
     auto const prev                      = (seg_i > 0) ? duck_offset(off_bytes, seg_i - 1) : 0;
@@ -97,7 +97,7 @@ __global__ void kernel_compute_lengths_uncomp(string_chunk_desc const* __restric
 __global__ void kernel_gather_uncomp(string_chunk_desc const* __restrict__ descs,
                                      int32_t const* __restrict__ d_offsets,
                                      uint8_t* __restrict__ d_chars,
-                                     uint32_t num_chunks)
+                                     int num_chunks)
 {
   auto const chunk_id = blockIdx.x;
   if (chunk_id >= num_chunks) return;
@@ -118,7 +118,7 @@ __global__ void kernel_gather_uncomp(string_chunk_desc const* __restrict__ descs
   auto const* off_bytes = base + 8;
   auto const* dict_end  = base + sm_dict_end;
 
-  for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
+  for (int i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
     auto const seg_i    = desc.seg_row_start + i;
     auto const cur      = duck_offset(off_bytes, seg_i);
     auto const prev     = (seg_i > 0) ? duck_offset(off_bytes, seg_i - 1) : 0;
