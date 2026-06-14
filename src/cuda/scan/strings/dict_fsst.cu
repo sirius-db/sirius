@@ -341,7 +341,14 @@ __global__ void kernel_predecode_dict_fsst(dict_fsst_desc const* __restrict__ de
   }
 }
 
-/// Per-row gather for all three DICT_FSST modes (see codec banner above).
+/// Per-row gather for the DICT_FSST codec (see codec banner above). Templated on
+/// @p FsstOnly so the rare mode-2 inline-decode machinery — the symbol table
+/// staged in shared memory plus the warp_decode_fsst scratch — is compiled out
+/// of the common DICTIONARY / DICT_FSST instantiation, keeping that path's
+/// register and shared-memory footprint low enough for higher occupancy. Each
+/// instantiation early-returns on segments outside its mode class, so the host
+/// launches both over the same descriptor array.
+template <bool FsstOnly>
 __global__ void kernel_gather_dict_fsst(dict_fsst_desc const* __restrict__ descs,
                                         int32_t const* __restrict__ d_offsets,
                                         uint8_t* __restrict__ d_chars,
@@ -353,20 +360,47 @@ __global__ void kernel_gather_dict_fsst(dict_fsst_desc const* __restrict__ descs
 {
   uint32_t seg_idx = blockIdx.x;
   if (seg_idx >= num_segments) return;
-  auto const desc               = descs[seg_idx];
+  auto const desc = descs[seg_idx];
+  // This instantiation handles only its own mode class; the complementary
+  // instantiation (launched over the same array) covers the rest.
+  if ((desc.mode == DICT_FSST_MODE_FSST_ONLY) != FsstOnly) return;
+
   uint8_t const* base           = desc.d_bytes;
   uint32_t const* dict_byte_off = d_byte_offsets + desc.seg_dict_offset_base;
-  uint32_t const* dict_dec_off  = d_decoded_offsets + desc.seg_dict_offset_base;
-  uint32_t const* d_idx     = reinterpret_cast<uint32_t const*>(base + desc.dict_indices_offset);
-  bool const fsst_only      = (desc.mode == DICT_FSST_MODE_FSST_ONLY);
-  bool const mode_dict_fsst = (desc.mode == DICT_FSST_MODE_DICT_FSST);
 
-  __shared__ uint8_t sm_len[256];
-  __shared__ uint32_t sm_sym_lo[256];
-  __shared__ uint32_t sm_sym_hi[256];
-  __shared__ uint32_t sm_scratch_u32[FSST_WARPS_PER_CTA][FSST_SCRATCH_U32_PER_WARP];
+  uint32_t const lane          = threadIdx.x & (WARP_THREADS - 1u);
+  uint32_t const warp_id       = threadIdx.x / WARP_THREADS;
+  uint32_t const warps_per_cta = blockDim.x / WARP_THREADS;
 
-  if (fsst_only) {  // mode 2 inline decompresses; needs the symtab in shmem
+  if constexpr (!FsstOnly) {
+    // Modes 0/1: warp-cooperative memcpy. Mode 1 (DICT_FSST) copies the
+    // predecoded bytes at decoded offsets; mode 0 (DICTIONARY) copies the raw
+    // dict bytes at byte offsets.
+    bool const mode_dict_fsst    = (desc.mode == DICT_FSST_MODE_DICT_FSST);
+    uint32_t const* dict_dec_off = d_decoded_offsets + desc.seg_dict_offset_base;
+    uint32_t const* memcpy_off   = mode_dict_fsst ? dict_dec_off : dict_byte_off;
+    uint8_t const* memcpy_src =
+      mode_dict_fsst ? (predecode_buf + desc.predecode_seg_offset) : (base + desc.dict_data_offset);
+    uint32_t const* d_idx = reinterpret_cast<uint32_t const*>(base + desc.dict_indices_offset);
+
+    for (uint32_t i = warp_id; i < desc.row_count; i += warps_per_cta) {
+      uint32_t seg_i = desc.seg_row_start + i;
+      uint32_t idx   = unpack_value<uint32_t>(d_idx, seg_i, desc.dict_indices_width);
+      if (idx == 0u) continue;  // NULL — pass-1 emitted length 0
+      uint32_t op          = static_cast<uint32_t>(d_offsets[desc.global_row_start + i]);
+      uint32_t entry_start = memcpy_off[idx];
+      uint32_t entry_len   = memcpy_off[idx + 1] - entry_start;
+      detail::warp_copy_bytes(d_chars + op, memcpy_src + entry_start, entry_len, lane);
+    }
+  } else {
+    // Mode 2 (FSST_ONLY): row i → dict entry i+1 (never NULL); inline-decompress
+    // each row through the warp FSST helper, which needs the symbol table staged
+    // in shared memory.
+    __shared__ uint8_t sm_len[256];
+    __shared__ uint32_t sm_sym_lo[256];
+    __shared__ uint32_t sm_sym_hi[256];
+    __shared__ uint32_t sm_scratch_u32[FSST_WARPS_PER_CTA][FSST_SCRATCH_U32_PER_WARP];
+
     fsst_decoder_compact const& dec = d_decoders[desc.seg_decoder_idx];
     for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) {
       sm_len[i]    = (i < FSST_NUM_SYMBOLS) ? dec.len[i] : uint8_t{0};
@@ -375,45 +409,24 @@ __global__ void kernel_gather_dict_fsst(dict_fsst_desc const* __restrict__ descs
       sm_sym_hi[i] = static_cast<uint32_t>(sym >> 32);
     }
     __syncthreads();
-  }
 
-  // Modes 0/1 share the same warp-cooperative memcpy; only (offsets, source) differ.
-  uint32_t const* memcpy_off = mode_dict_fsst ? dict_dec_off : dict_byte_off;
-  uint8_t const* memcpy_src =
-    mode_dict_fsst ? (predecode_buf + desc.predecode_seg_offset) : (base + desc.dict_data_offset);
-
-  uint32_t const lane          = threadIdx.x & (WARP_THREADS - 1u);
-  uint32_t const warp_id       = threadIdx.x / WARP_THREADS;
-  uint32_t const warps_per_cta = blockDim.x / WARP_THREADS;
-
-  for (uint32_t i = warp_id; i < desc.row_count; i += warps_per_cta) {
-    uint32_t seg_i = desc.seg_row_start + i;
-    uint32_t idx =
-      fsst_only ? (seg_i + 1u) : unpack_value<uint32_t>(d_idx, seg_i, desc.dict_indices_width);
-    if (idx == 0u) continue;  // NULL — pass-1 emitted length 0
-
-    uint32_t op = static_cast<uint32_t>(d_offsets[desc.global_row_start + i]);
-
-    if (!fsst_only) {
-      uint32_t entry_start = memcpy_off[idx];
-      uint32_t entry_len   = memcpy_off[idx + 1] - entry_start;
-      uint8_t const* src   = memcpy_src + entry_start;
-      detail::warp_copy_bytes(d_chars + op, src, entry_len, lane);
-      continue;
+    uint8_t const* comp_base = base + desc.dict_data_offset;
+    for (uint32_t i = warp_id; i < desc.row_count; i += warps_per_cta) {
+      uint32_t seg_i      = desc.seg_row_start + i;
+      uint32_t idx        = seg_i + 1u;
+      uint32_t byte_start = dict_byte_off[idx];
+      uint32_t comp_len   = dict_byte_off[idx + 1] - byte_start;
+      if (comp_len == 0) continue;
+      uint32_t op = static_cast<uint32_t>(d_offsets[desc.global_row_start + i]);
+      warp_decode_fsst(comp_base + byte_start,
+                       comp_len,
+                       d_chars + op,
+                       sm_len,
+                       sm_sym_lo,
+                       sm_sym_hi,
+                       &sm_scratch_u32[warp_id][0],
+                       lane);
     }
-
-    // Mode 2: inline decompress via the FSST gather helper.
-    uint32_t byte_start = dict_byte_off[idx];
-    uint32_t comp_len   = dict_byte_off[idx + 1] - byte_start;
-    if (comp_len == 0) continue;
-    warp_decode_fsst(memcpy_src + byte_start,
-                     comp_len,
-                     d_chars + op,
-                     sm_len,
-                     sm_sym_lo,
-                     sm_sym_hi,
-                     &sm_scratch_u32[warp_id][0],
-                     lane);
   }
 }
 
@@ -739,14 +752,28 @@ void launch_dict_fsst_gather(dict_fsst_desc const* d_chunks,
                              rmm::cuda_stream_view stream)
 {
   if (n_chunks == 0) return;
-  kernel_gather_dict_fsst<<<n_chunks, BLOCK_DIM, 0, stream.value()>>>(d_chunks,
-                                                                      d_offsets,
-                                                                      d_chars,
-                                                                      d_byte_offsets,
-                                                                      d_decoded_offsets,
-                                                                      d_predecode,
-                                                                      d_decoders,
-                                                                      n_chunks);
+  // Two instantiations over the same descriptor array: the common DICTIONARY /
+  // DICT_FSST path (FsstOnly=false) and the rare inline-decode FSST_ONLY path
+  // (FsstOnly=true). Each early-returns on segments belonging to the other mode
+  // class, so the split keeps the mode-2 symbol-table machinery out of the
+  // common path's register/shared-memory budget. A column whose segments are all
+  // one mode leaves the other launch as cheap all-early-return blocks.
+  kernel_gather_dict_fsst<false><<<n_chunks, BLOCK_DIM, 0, stream.value()>>>(d_chunks,
+                                                                             d_offsets,
+                                                                             d_chars,
+                                                                             d_byte_offsets,
+                                                                             d_decoded_offsets,
+                                                                             d_predecode,
+                                                                             d_decoders,
+                                                                             n_chunks);
+  kernel_gather_dict_fsst<true><<<n_chunks, BLOCK_DIM, 0, stream.value()>>>(d_chunks,
+                                                                            d_offsets,
+                                                                            d_chars,
+                                                                            d_byte_offsets,
+                                                                            d_decoded_offsets,
+                                                                            d_predecode,
+                                                                            d_decoders,
+                                                                            n_chunks);
 }
 
 void launch_dict_fsst_mark_nulls(dict_fsst_desc const* d_descs,
