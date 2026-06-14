@@ -189,7 +189,7 @@ __device__ __forceinline__ rle_parsed_metadata parse_rle_metadata(rle_segment_de
  */
 template <int BLOCK_THREADS, int ITEMS_PER_THREAD, int PREFIX_SUM_BUFFER_ENTRIES_PER_SEGMENT>
 __global__ void kernel_build_rle(rle_segment_desc const* __restrict__ segment_descriptors,
-                                 uint32_t num_segments,
+                                 int num_segments,
                                  uint32_t* __restrict__ d_prefix_sums,
                                  uint32_t* __restrict__ d_counts)
 {
@@ -248,7 +248,7 @@ __global__ void kernel_build_rle(rle_segment_desc const* __restrict__ segment_de
 
   //===----------Divide segment into tiles----------===//
   auto const n_tiles = ::cuda::ceil_div(n_counts_max, ITEMS_PER_TILE);
-  for (uint32_t tile = 0; tile < n_tiles; ++tile) {
+  for (int tile = 0; tile < n_tiles; ++tile) {
     auto const tile_offset          = tile * ITEMS_PER_TILE;
     auto const n_counts_max_current = n_counts_max - tile_offset;
     //===----------Process tile----------===//
@@ -402,13 +402,15 @@ __device__ __forceinline__ void decode_chunk_rle(uint32_t const* __restrict__ pr
       auto const lane_31_row = lane_0_segment_row + WARP_THREADS - 1;
 
       if (lane_31_row < lane_0_prefix_sum) {
-        __stwt(out_chunk + chunk_row, __ldg(values + lane_0_entry));
+        cub::ThreadStore<cub::STORE_WT>(out_chunk + chunk_row,
+                                        cub::ThreadLoad<cub::LOAD_LDG>(values + lane_0_entry));
       } else {
         // Warp straddles an entry boundary — per-lane fallback.
         if (chunk_row >= chunk_rows) { break; }
         auto const segment_row = chunk_first_row + chunk_row;
         auto const entry       = find_entry(chunk_entry_lo, chunk_entry_hi, segment_row);
-        __stwt(out_chunk + chunk_row, __ldg(values + entry));
+        cub::ThreadStore<cub::STORE_WT>(out_chunk + chunk_row,
+                                        cub::ThreadLoad<cub::LOAD_LDG>(values + entry));
       }
     }
   } else {
@@ -418,7 +420,8 @@ __device__ __forceinline__ void decode_chunk_rle(uint32_t const* __restrict__ pr
       if (chunk_row >= chunk_rows) break;
       auto const segment_row = chunk_first_row + chunk_row;
       auto const entry       = find_entry(chunk_entry_lo, chunk_entry_hi, segment_row);
-      __stwt(out_chunk + chunk_row, __ldg(values + entry));
+      cub::ThreadStore<cub::STORE_WT>(out_chunk + chunk_row,
+                                      cub::ThreadLoad<cub::LOAD_LDG>(values + entry));
     }
   }
 }
@@ -429,7 +432,7 @@ __device__ __forceinline__ void decode_chunk_rle(uint32_t const* __restrict__ pr
  */
 template <int ITEMS_PER_THREAD, typename T>
 __global__ void kernel_expand_rle(rle_chunk_desc const* __restrict__ chunk_descs,
-                                  uint32_t num_chunks,
+                                  int num_chunks,
                                   uint32_t const* __restrict__ d_segment_entry_counts,
                                   T* __restrict__ d_output)
 {
@@ -447,7 +450,7 @@ __global__ void kernel_expand_rle(rle_chunk_desc const* __restrict__ chunk_descs
 
   if (segment_entry_count == MALFORMED_FLAG) {
     // Zero-fill the output
-    for (uint32_t i = threadIdx.x; i < chunk_rows; i += blockDim.x) {
+    for (int i = threadIdx.x; i < chunk_rows; i += blockDim.x) {
       out_chunk_values[i] = 0;
     }
     return;
@@ -455,7 +458,7 @@ __global__ void kernel_expand_rle(rle_chunk_desc const* __restrict__ chunk_descs
 
   // Try to use SMEM for the binary search space for a chunk
   if (segment_entry_count <= RLE_SMEM_MAX_ENTRIES) {
-    for (uint32_t i = threadIdx.x; i < segment_entry_count; i += blockDim.x) {
+    for (int i = threadIdx.x; i < segment_entry_count; i += blockDim.x) {
       s_segment_prefix_sums[i] = chunk_desc.d_prefix_sums[i];
     }
     __syncthreads();

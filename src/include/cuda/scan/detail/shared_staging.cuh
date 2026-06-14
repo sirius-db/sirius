@@ -59,8 +59,8 @@ namespace sirius::cuda::scan::detail {
 template <int BlockThreads>
 _CCCL_DEVICE _CCCL_FORCEINLINE void stage_packed_to_shmem(uint32_t* dst_words,
                                                           const uint8_t* src_bytes,
-                                                          uint32_t n_live_words,
-                                                          uint32_t guard_words)
+                                                          int n_live_words,
+                                                          int guard_words)
 {
   namespace cg          = cooperative_groups;
   auto const block      = cg::this_thread_block();
@@ -79,19 +79,19 @@ _CCCL_DEVICE _CCCL_FORCEINLINE void stage_packed_to_shmem(uint32_t* dst_words,
       cg::memcpy_async(block, dst_bytes, src_bytes, ::cuda::aligned_size_t<4>{n_bytes});
     }
     // Guard words lie past the copied range, so this write never races the async copy.
-    for (uint32_t w = threadIdx.x; w < guard_words; w += BlockThreads) {
+    for (int w = threadIdx.x; w < guard_words; w += BlockThreads) {
       dst_words[n_live_words + w] = 0;
     }
     cg::wait(block);  // publishes both the copied words and the guard words
   } else {
     // Sub-word source: a 4-byte memcpy per word beats the 1-byte cp.async fallback.
-    for (uint32_t w = threadIdx.x; w < n_live_words; w += BlockThreads) {
+    for (int w = threadIdx.x; w < n_live_words; w += BlockThreads) {
       uint32_t v;
       ::cuda::std::memcpy(
         &v, src_bytes + static_cast<::cuda::std::size_t>(w) * sizeof(uint32_t), sizeof(uint32_t));
       dst_words[w] = v;
     }
-    for (uint32_t w = threadIdx.x; w < guard_words; w += BlockThreads) {
+    for (int w = threadIdx.x; w < guard_words; w += BlockThreads) {
       dst_words[n_live_words + w] = 0;
     }
     __syncthreads();  // publishes the manually copied words and the guard words

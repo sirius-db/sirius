@@ -137,14 +137,12 @@ void validate_segment_bounds(std::vector<gpu_codec_run> const& runs,
 /// tail. decimal128's 16-byte storage falls to the scalar path (one int4 would
 /// hold a single value anyway).
 template <typename T>
-__global__ void kernel_broadcast_constant(T* __restrict__ dest,
-                                          T const* __restrict__ src,
-                                          uint32_t rows)
+__global__ void kernel_broadcast_constant(T* __restrict__ dest, T const* __restrict__ src, int rows)
 {
-  T const val           = *src;
-  uint32_t const tid    = blockIdx.x * blockDim.x + threadIdx.x;
-  uint32_t const stride = gridDim.x * blockDim.x;
-  detail::vec_fill<T>(dest, rows, tid, stride, [val](uint32_t) { return val; });
+  T const val      = *src;
+  int const tid    = blockIdx.x * blockDim.x + threadIdx.x;
+  int const stride = gridDim.x * blockDim.x;
+  detail::vec_fill<T>(dest, rows, tid, stride, [val](int) { return val; });
 }
 
 /// Functor for `cudf::type_dispatcher`. We project each cudf type to its
@@ -221,6 +219,10 @@ struct copy_chunk_desc {
 /// chunk's pointers + length jointly support: 16-byte (int4), 4-byte
 /// (uint32_t), or per-byte. DuckDB segment offsets aren't always 16-byte
 /// aligned, so the narrower fallbacks really do trigger.
+// Loop counters/index math here stay uint32_t: int indexing inflated this
+// kernel's register footprint (16 -> 38 on sm_86) in the relocatable production
+// build for no readability gain in a trivial memcpy loop. (Same rationale as the
+// FSST warp decode core.)
 __global__ void kernel_batched_memcpy(copy_chunk_desc const* __restrict__ chunks, uint32_t n_chunks)
 {
   uint32_t cid = blockIdx.x;

@@ -337,7 +337,7 @@ __device__ alp_vector_meta parse_alp_metadata(uint8_t const* seg_base,
 template <int SMEM_WORDS, typename T>
 __global__ void kernel_decode_alp(detail::cta_block_desc const* __restrict__ descs,
                                   T* __restrict__ d_output,
-                                  uint32_t num_vecs)
+                                  int num_vecs)
 {
   static_assert(::cuda::std::is_same_v<T, float> || ::cuda::std::is_same_v<T, double>,
                 "ALP only supports float / double; the dispatcher rejects other widths");
@@ -359,7 +359,7 @@ __global__ void kernel_decode_alp(detail::cta_block_desc const* __restrict__ des
   __syncthreads();
 
   if (sh_meta.status == alp_parse_status::invalid) {
-    detail::vec_fill<T>(out, fill_rows, threadIdx.x, blockDim.x, [](uint32_t) { return T(0); });
+    detail::vec_fill<T>(out, fill_rows, threadIdx.x, blockDim.x, [](int) { return T(0); });
     return;
   }
 
@@ -367,8 +367,8 @@ __global__ void kernel_decode_alp(detail::cta_block_desc const* __restrict__ des
   if (sh_meta.status == alp_parse_status::uncompressed) {
     // 1B pad before the array of uncompressed values
     auto const* raw_p = seg_base + sh_meta.data_off + 1;
-    for (uint32_t i = threadIdx.x; i < fill_rows; i += blockDim.x) {
-      __stwt(out + i, ld_unaligned<T>(raw_p + i * sizeof(T)));
+    for (int i = threadIdx.x; i < fill_rows; i += blockDim.x) {
+      cub::ThreadStore<cub::STORE_WT>(out + i, ld_unaligned<T>(raw_p + i * sizeof(T)));
     }
     return;
   }
@@ -390,7 +390,7 @@ __global__ void kernel_decode_alp(detail::cta_block_desc const* __restrict__ des
     // FOR add is unsigned-wraparound; cast to int64 before applying FACT/FRAC.
     auto const enc   = static_cast<int64_t>(u + for_v);
     auto const decod = static_cast<T>(enc) * fact_t * frac_t;
-    __stwt(out + i, decod);
+    cub::ThreadStore<cub::STORE_WT>(out + i, decod);
   }
 
   //===----------Exceptions----------===//
@@ -401,12 +401,14 @@ __global__ void kernel_decode_alp(detail::cta_block_desc const* __restrict__ des
     __syncthreads();
     auto const* exc_base          = sh_meta.packed_bytes_p + sh_meta.packed_bytes_count;
     auto const* exc_position_base = exc_base + uint32_t{exc_count} * sizeof(T);
-    for (uint32_t e = threadIdx.x; e < exc_count; e += blockDim.x) {
+    for (int e = threadIdx.x; e < exc_count; e += blockDim.x) {
       uint16_t pos;
       memcpy(&pos,
              exc_position_base + e * duckdb::AlpConstants::EXCEPTION_POSITION_SIZE,
              sizeof(uint16_t));
-      if (pos < fill_rows) { __stwt(out + pos, ld_unaligned<T>(exc_base + e * sizeof(T))); }
+      if (pos < fill_rows) {
+        cub::ThreadStore<cub::STORE_WT>(out + pos, ld_unaligned<T>(exc_base + e * sizeof(T)));
+      }
     }
   }
 }
@@ -531,7 +533,7 @@ __device__ alprd_vector_meta parse_alprd_metadata(uint8_t const* seg_base,
 template <int SMEM_WORDS, typename T>
 __global__ void kernel_decode_alprd(detail::cta_block_desc const* __restrict__ descs,
                                     T* __restrict__ d_output,
-                                    uint32_t num_vecs)
+                                    int num_vecs)
 {
   static_assert(::cuda::std::is_same_v<T, float> || ::cuda::std::is_same_v<T, double>,
                 "ALPRD only supports float / double; the dispatcher rejects other widths");
@@ -566,7 +568,7 @@ __global__ void kernel_decode_alprd(detail::cta_block_desc const* __restrict__ d
   __syncthreads();
 
   if (sh_meta.status == alprd_parse_status::invalid) {
-    detail::vec_fill<T>(out, fill_rows, threadIdx.x, blockDim.x, [](uint32_t) { return T(0); });
+    detail::vec_fill<T>(out, fill_rows, threadIdx.x, blockDim.x, [](int) { return T(0); });
     return;
   }
 
@@ -574,8 +576,8 @@ __global__ void kernel_decode_alprd(detail::cta_block_desc const* __restrict__ d
   if (sh_meta.status == alprd_parse_status::uncompressed) {
     // 2B sentinel before the array of uncompressed values
     auto const* raw_p = seg_base + sh_meta.data_off + 2;
-    for (uint32_t i = threadIdx.x; i < fill_rows; i += blockDim.x) {
-      __stwt(out + i, ld_unaligned<T>(raw_p + i * sizeof(T)));
+    for (int i = threadIdx.x; i < fill_rows; i += blockDim.x) {
+      cub::ThreadStore<cub::STORE_WT>(out + i, ld_unaligned<T>(raw_p + i * sizeof(T)));
     }
     return;
   }
@@ -611,7 +613,7 @@ __global__ void kernel_decode_alprd(detail::cta_block_desc const* __restrict__ d
     }
     T v;
     memcpy(&v, &bits, sizeof(T));
-    __stwt(out + i, v);
+    cub::ThreadStore<cub::STORE_WT>(out + i, v);
   }
 
   //===----------Exceptions----------===//
@@ -627,7 +629,7 @@ __global__ void kernel_decode_alprd(detail::cta_block_desc const* __restrict__ d
     auto const r_mask =
       full_right ? ::cuda::std::numeric_limits<raw_t>::max() : ((raw_t{1} << right_bw) - raw_t{1});
 
-    for (uint32_t e = threadIdx.x; e < exc_count; e += blockDim.x) {
+    for (int e = threadIdx.x; e < exc_count; e += blockDim.x) {
       uint16_t pos;
       memcpy(&pos,
              exc_position_base + e * duckdb::AlpRDConstants::EXCEPTION_POSITION_SIZE,
@@ -644,7 +646,7 @@ __global__ void kernel_decode_alprd(detail::cta_block_desc const* __restrict__ d
         full_right ? right_part : ((static_cast<raw_t>(exc_left) << right_bw) | right_part);
       T v;
       memcpy(&v, &bits, sizeof(T));
-      __stwt(out + pos, v);
+      cub::ThreadStore<cub::STORE_WT>(out + pos, v);
     }
   }
 }

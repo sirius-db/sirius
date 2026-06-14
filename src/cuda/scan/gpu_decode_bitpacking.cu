@@ -80,7 +80,7 @@ static_assert(BLOCK_DIM % 32 == 0,
 template <typename T, int SHMEM_BYTES>
 __global__ void kernel_decode_bitpacking(detail::cta_block_desc const* __restrict__ descs,
                                          T* __restrict__ d_output,
-                                         uint32_t num_groups)
+                                         int num_groups)
 {
   using vec_t               = int4;
   auto constexpr VEC_BYTES  = sizeof(vec_t);
@@ -224,7 +224,7 @@ __global__ void kernel_decode_bitpacking(detail::cta_block_desc const* __restric
   //===--------------------------------------------------------------------===//
   if (mode == BitpackingMode::CONSTANT) {
     auto const val = sm_aux;
-    detail::vec_fill<T>(out, rc, threadIdx.x, blockDim.x, [val](uint32_t) { return val; });
+    detail::vec_fill<T>(out, rc, threadIdx.x, blockDim.x, [val](int) { return val; });
     return;
   }
 
@@ -234,7 +234,7 @@ __global__ void kernel_decode_bitpacking(detail::cta_block_desc const* __restric
   if (mode == BitpackingMode::CONSTANT_DELTA) {
     auto const frame = sm_frame;
     auto const delta = sm_aux;
-    detail::vec_fill<T>(out, rc, threadIdx.x, blockDim.x, [frame, delta](uint32_t i) {
+    detail::vec_fill<T>(out, rc, threadIdx.x, blockDim.x, [frame, delta](int i) {
       return static_cast<T>(frame + static_cast<T>(i) * delta);
     });
     return;
@@ -248,7 +248,7 @@ __global__ void kernel_decode_bitpacking(detail::cta_block_desc const* __restric
   // mode: zero-fill the descriptor's row range.
   if (mode != BitpackingMode::FOR && mode != BitpackingMode::DELTA_FOR) {
     detail::vec_fill<T>(
-      out, desc.block_row_count, threadIdx.x, blockDim.x, [](uint32_t) { return T(0); });
+      out, desc.block_row_count, threadIdx.x, blockDim.x, [](int) { return T(0); });
     return;
   }
 
@@ -270,10 +270,13 @@ __global__ void kernel_decode_bitpacking(detail::cta_block_desc const* __restric
   if (mode == BitpackingMode::FOR) {
     // Striped fill
 #pragma unroll
-    for (uint32_t v = 0; v < VPT; ++v) {
+    for (int v = 0; v < VPT; ++v) {
       auto const idx = v * blockDim.x + threadIdx.x;
       if (idx >= rc) break;
-      __stcs(out + idx, frame + unpack_value<T>(shmem, idx, width));
+      // cub::ThreadStore deduces the store width from the value type, so cast the
+      // (integer-promoted) sum back to T — otherwise a small T stores 4 bytes.
+      cub::ThreadStore<cub::STORE_CS>(out + idx,
+                                      static_cast<T>(frame + unpack_value<T>(shmem, idx, width)));
     }
     return;
   }
@@ -291,12 +294,12 @@ __global__ void kernel_decode_bitpacking(detail::cta_block_desc const* __restric
 
   T thread_data[VPT];
 #pragma unroll
-  for (uint32_t v = 0; v < VPT; ++v) {
+  for (int v = 0; v < VPT; ++v) {
     auto const idx = threadIdx.x * VPT + v;
     thread_data[v] = (idx < rc) ? static_cast<T>(frame + unpack_value<T>(shmem, idx, width)) : T(0);
   }
 #pragma unroll
-  for (uint32_t v = 1; v < VPT; ++v) {
+  for (int v = 1; v < VPT; ++v) {
     thread_data[v] = static_cast<T>(thread_data[v] + thread_data[v - 1]);
   }
 
@@ -320,7 +323,7 @@ __global__ void kernel_decode_bitpacking(detail::cta_block_desc const* __restric
   if (warp_id == 0 && lane_id == 0) {
     T running = T(0);
 #pragma unroll
-    for (uint32_t w = 0; w < NUM_WARPS; ++w) {
+    for (int w = 0; w < NUM_WARPS; ++w) {
       auto const t       = warp_aggregates[w];
       warp_aggregates[w] = running;
       running            = static_cast<T>(running + t);
@@ -341,15 +344,15 @@ __global__ void kernel_decode_bitpacking(detail::cta_block_desc const* __restric
   // no longer read after the unpack loop) for coalesced stores.
   auto* shmem_t = reinterpret_cast<T*>(shmem);
 #pragma unroll
-  for (uint32_t v = 0; v < VPT; ++v) {
+  for (int v = 0; v < VPT; ++v) {
     auto const idx = threadIdx.x * VPT + v;
     if (idx < rc) shmem_t[idx] = static_cast<T>(thread_data[v] + prefix);
   }
   __syncthreads();
 #pragma unroll
-  for (uint32_t v = 0; v < VPT; ++v) {
+  for (int v = 0; v < VPT; ++v) {
     auto const idx = v * blockDim.x + threadIdx.x;
-    if (idx < rc) __stcs(out + idx, shmem_t[idx]);
+    if (idx < rc) cub::ThreadStore<cub::STORE_CS>(out + idx, shmem_t[idx]);
   }
 }
 
