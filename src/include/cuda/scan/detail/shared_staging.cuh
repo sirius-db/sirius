@@ -78,7 +78,7 @@ _CCCL_DEVICE _CCCL_FORCEINLINE void stage_packed_to_shmem(uint32_t* dst_words,
     // Sub-word alignment: copy one word per thread.
     for (int w = threadIdx.x; w < n_live_words; w += BlockThreads) {
       uint32_t v;
-      ::cuda::std::memcpy(
+      memcpy(
         &v, src_bytes + static_cast<::cuda::std::size_t>(w) * sizeof(uint32_t), sizeof(uint32_t));
       dst_words[w] = v;
     }

@@ -51,18 +51,18 @@ _CCCL_DEVICE _CCCL_FORCEINLINE void warp_copy_bytes(uint8_t* dst,
   if ((reinterpret_cast<::cuda::std::uintptr_t>(src) % WORD_BYTES) == 0) {
     // 4B aligned
     auto const* const src_words = reinterpret_cast<const uint32_t*>(src);
-    for (int w = lane; w < n_full_words; w += WARP_THREADS) {
+    for (int w = lane; w < n_full_words; w += cub::detail::warp_threads) {
       auto const v = src_words[w];
-      ::cuda::std::memcpy(dst + w * WORD_BYTES, &v, WORD_BYTES);
+      memcpy(dst + w * WORD_BYTES, &v, WORD_BYTES);
     }
   } else {
     // Unaligned
-    for (int w = lane; w < n_full_words; w += WARP_THREADS) {
-      ::cuda::std::memcpy(dst + w * WORD_BYTES, src + w * WORD_BYTES, WORD_BYTES);
+    for (int w = lane; w < n_full_words; w += cub::detail::warp_threads) {
+      memcpy(dst + w * WORD_BYTES, src + w * WORD_BYTES, WORD_BYTES);
     }
   }
 
-  for (int t = n_full_words * WORD_BYTES + lane; t < n; t += WARP_THREADS) {
+  for (int t = n_full_words * WORD_BYTES + lane; t < n; t += cub::detail::warp_threads) {
     dst[t] = src[t];
   }
 }

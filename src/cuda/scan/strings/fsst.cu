@@ -240,11 +240,11 @@ __global__ __launch_bounds__(BLOCK_DIM) void kernel_compute_decompressed_lengths
   auto const end             = compressed_cumsum_ptr[desc.row_count - 1];
   auto const avg_comp_length = (end - start) / desc.row_count;
 
-  if (avg_comp_length >= 2 * WARP_THREADS) {
+  if (avg_comp_length >= 2 * cub::detail::warp_threads) {
     // Warp-per-row: 32 lanes coalesce LDG over a row's compressed bytes.
-    auto const lane          = threadIdx.x % WARP_THREADS;
-    auto const warp_id       = threadIdx.x / WARP_THREADS;
-    auto const warps_per_cta = blockDim.x / WARP_THREADS;
+    auto const lane          = threadIdx.x % cub::detail::warp_threads;
+    auto const warp_id       = threadIdx.x / cub::detail::warp_threads;
+    auto const warps_per_cta = blockDim.x / cub::detail::warp_threads;
     for (int i = warp_id; i < desc.row_count; i += warps_per_cta) {
       auto const cumsum      = compressed_cumsum_ptr[i];
       auto const prev_cumsum = (i > 0) ? compressed_cumsum_ptr[i - 1] : start;
@@ -339,9 +339,9 @@ __global__ __launch_bounds__(BLOCK_DIM) void kernel_gather_fsst_chunked(
   // Warp-per-row gather + decode.
   auto const* dict_end_ptr  = segment_base + sm_hdr.dict_end;
   auto const* my_cumsum_ptr = d_comp_offsets + desc.fsst_row_start;
-  auto const lane           = threadIdx.x % WARP_THREADS;
-  auto const warp_id        = threadIdx.x / WARP_THREADS;
-  auto const warps_per_cta  = blockDim.x / WARP_THREADS;
+  auto const lane           = threadIdx.x % cub::detail::warp_threads;
+  auto const warp_id        = threadIdx.x / cub::detail::warp_threads;
+  auto const warps_per_cta  = blockDim.x / cub::detail::warp_threads;
 
   for (int i = warp_id; i < desc.row_count; i += warps_per_cta) {
     auto const my_cumsum = my_cumsum_ptr[i];

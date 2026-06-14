@@ -35,7 +35,7 @@ template <typename T>
 [[nodiscard]] _CCCL_DEVICE _CCCL_FORCEINLINE T load_unaligned(const void* p)
 {
   T v;
-  ::cuda::std::memcpy(&v, p, sizeof(T));
+  memcpy(&v, p, sizeof(T));
   return v;
 }
 

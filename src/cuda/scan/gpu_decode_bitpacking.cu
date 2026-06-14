@@ -41,6 +41,7 @@
 // count, not the parsed metadata).
 //===----------------------------------------------------------------------===//
 
+#include "cub/util_arch.cuh"
 #include "cuda/scan/detail/decode_common.cuh"
 #include "cuda/scan/detail/shared_staging.cuh"
 #include "cuda/scan/detail/vectorized_store.cuh"
@@ -63,14 +64,11 @@ namespace sirius::cuda::scan {
 
 namespace {
 
-constexpr uint32_t BLOCK_DIM = 256;
-
-/// VPT (= Values Per Thread) for the FOR / DELTA_FOR loop. With BLOCK_DIM=256 this
-/// covers BP_META_GROUP_SIZE (2048) in one pass without tail iterations.
-constexpr uint32_t VPT = BP_META_GROUP_SIZE / BLOCK_DIM;
-static_assert(BLOCK_DIM * VPT == BP_META_GROUP_SIZE,
+constexpr uint32_t BLOCK_DIM         = 256;
+constexpr uint32_t VALUES_PER_THREAD = BP_META_GROUP_SIZE / BLOCK_DIM;
+static_assert(BLOCK_DIM * VALUES_PER_THREAD == BP_META_GROUP_SIZE,
               "BLOCK_DIM and VPT must tile the metadata group exactly");
-static_assert(BLOCK_DIM % 32 == 0,
+static_assert(BLOCK_DIM % cub::detail::warp_threads == 0,
               "BLOCK_DIM must be a multiple of warpSize for the DELTA_FOR "
               "warp-aggregate scan");
 
@@ -270,7 +268,7 @@ __global__ void kernel_decode_bitpacking(detail::cta_block_desc const* __restric
   if (mode == BitpackingMode::FOR) {
     // Striped fill
 #pragma unroll
-    for (int v = 0; v < VPT; ++v) {
+    for (int v = 0; v < VALUES_PER_THREAD; ++v) {
       auto const idx = v * blockDim.x + threadIdx.x;
       if (idx >= rc) break;
       // cub::ThreadStore deduces the store width from the value type, so cast the
@@ -288,14 +286,14 @@ __global__ void kernel_decode_bitpacking(detail::cta_block_desc const* __restric
   // serially scans the per-warp totals and broadcasts them back. Final values are
   // exchanged through shmem into striped layout for coalesced global stores.
 
-  T thread_data[VPT];
+  T thread_data[VALUES_PER_THREAD];
 #pragma unroll
-  for (int v = 0; v < VPT; ++v) {
-    auto const idx = threadIdx.x * VPT + v;
+  for (int v = 0; v < VALUES_PER_THREAD; ++v) {
+    auto const idx = threadIdx.x * VALUES_PER_THREAD + v;
     thread_data[v] = (idx < rc) ? static_cast<T>(frame + unpack_value<T>(shmem, idx, width)) : T(0);
   }
 #pragma unroll
-  for (int v = 1; v < VPT; ++v) {
+  for (int v = 1; v < VALUES_PER_THREAD; ++v) {
     thread_data[v] = static_cast<T>(thread_data[v] + thread_data[v - 1]);
   }
 
@@ -308,7 +306,7 @@ __global__ void kernel_decode_bitpacking(detail::cta_block_desc const* __restric
   auto const warp_id = threadIdx.x / 32;
   auto const lane_id = threadIdx.x % 32;
 
-  T thread_agg = thread_data[VPT - 1];
+  T thread_agg = thread_data[VALUES_PER_THREAD - 1];
   T warp_inclusive;
   T warp_total;
   WarpScanT(warp_scan_temp[warp_id]).InclusiveSum(thread_agg, warp_inclusive, warp_total);
@@ -340,13 +338,13 @@ __global__ void kernel_decode_bitpacking(detail::cta_block_desc const* __restric
   // no longer read after the unpack loop) for coalesced stores.
   auto* shmem_t = reinterpret_cast<T*>(shmem);
 #pragma unroll
-  for (int v = 0; v < VPT; ++v) {
-    auto const idx = threadIdx.x * VPT + v;
+  for (int v = 0; v < VALUES_PER_THREAD; ++v) {
+    auto const idx = threadIdx.x * VALUES_PER_THREAD + v;
     if (idx < rc) shmem_t[idx] = static_cast<T>(thread_data[v] + prefix);
   }
   __syncthreads();
 #pragma unroll
-  for (int v = 0; v < VPT; ++v) {
+  for (int v = 0; v < VALUES_PER_THREAD; ++v) {
     auto const idx = v * blockDim.x + threadIdx.x;
     if (idx < rc) cub::ThreadStore<cub::STORE_CS>(out + idx, shmem_t[idx]);
   }

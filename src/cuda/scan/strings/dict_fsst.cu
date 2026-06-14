@@ -366,9 +366,9 @@ __global__ void kernel_gather_dict_fsst(dict_fsst_desc const* __restrict__ descs
   uint8_t const* base           = desc.d_bytes;
   uint32_t const* dict_byte_off = d_byte_offsets + desc.seg_dict_offset_base;
 
-  int const lane          = threadIdx.x & (WARP_THREADS - 1u);
-  int const warp_id       = threadIdx.x / WARP_THREADS;
-  int const warps_per_cta = blockDim.x / WARP_THREADS;
+  int const lane          = threadIdx.x & (cub::detail::warp_threads - 1u);
+  int const warp_id       = threadIdx.x / cub::detail::warp_threads;
+  int const warps_per_cta = blockDim.x / cub::detail::warp_threads;
 
   if constexpr (!FsstOnly) {
     // Modes 0/1: warp-cooperative memcpy. Mode 1 (DICT_FSST) copies the

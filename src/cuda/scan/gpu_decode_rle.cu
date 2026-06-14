@@ -81,7 +81,6 @@ constexpr uint32_t RLE_BUILD_MAX_ENTRIES =
 
 constexpr uint32_t MALFORMED_FLAG = 0u;
 using detail::FULL_MASK;
-using detail::WARP_THREADS;
 
 /**
  * @brief Per-CTA input for segment-level prefix sum kernel over counts array.
@@ -381,12 +380,12 @@ __device__ __forceinline__ void decode_chunk_rle(uint32_t const* __restrict__ pr
   // Heuristic: if the average number of rows per warp in this chunk is >= the number of RLE entries
   // in the chunk, try to use a single search into the prefix_sums array for each warp in case all
   // the threads in the warp fill the same value. This is an optimization for long runs.
-  if (chunk_rows >= WARP_THREADS * (chunk_entry_hi - chunk_entry_lo)) {
-    auto const lane = threadIdx.x % WARP_THREADS;
+  if (chunk_rows >= cub::detail::warp_threads * (chunk_entry_hi - chunk_entry_lo)) {
+    auto const lane = threadIdx.x % cub::detail::warp_threads;
 #pragma unroll
     for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
       auto const chunk_row        = i * blockDim.x + threadIdx.x;
-      auto const lane_0_chunk_row = chunk_row - (chunk_row % WARP_THREADS);
+      auto const lane_0_chunk_row = chunk_row - (chunk_row % cub::detail::warp_threads);
       if (lane_0_chunk_row >= chunk_rows) break;
       auto const lane_0_segment_row = chunk_first_row + lane_0_chunk_row;
 
@@ -396,10 +395,11 @@ __device__ __forceinline__ void decode_chunk_rle(uint32_t const* __restrict__ pr
         lane_0_entry      = find_entry(chunk_entry_lo, chunk_entry_hi, lane_0_segment_row);
         lane_0_prefix_sum = prefix_sums[lane_0_entry];
       }
-      lane_0_entry      = cub::ShuffleIndex<WARP_THREADS>(lane_0_entry, 0, FULL_MASK);
-      lane_0_prefix_sum = cub::ShuffleIndex<WARP_THREADS>(lane_0_prefix_sum, 0, FULL_MASK);
+      lane_0_entry = cub::ShuffleIndex<cub::detail::warp_threads>(lane_0_entry, 0, FULL_MASK);
+      lane_0_prefix_sum =
+        cub::ShuffleIndex<cub::detail::warp_threads>(lane_0_prefix_sum, 0, FULL_MASK);
 
-      auto const lane_31_row = lane_0_segment_row + WARP_THREADS - 1;
+      auto const lane_31_row = lane_0_segment_row + cub::detail::warp_threads - 1;
 
       if (lane_31_row < lane_0_prefix_sum) {
         cub::ThreadStore<cub::STORE_WT>(out_chunk + chunk_row,

@@ -182,9 +182,9 @@ __global__ void kernel_gather_dict_warp(string_chunk_desc const* __restrict__ de
   auto const* idx_bytes = segment_base + sm_hdr.index_buffer_offset;
   auto const* dict_end  = segment_base + sm_hdr.dict_end;
 
-  int const lane          = threadIdx.x % WARP_THREADS;
-  int const warp_id       = threadIdx.x / WARP_THREADS;
-  int const warps_per_cta = blockDim.x / WARP_THREADS;
+  int const lane          = threadIdx.x % cub::detail::warp_threads;
+  int const warp_id       = threadIdx.x / cub::detail::warp_threads;
+  int const warps_per_cta = blockDim.x / cub::detail::warp_threads;
 
   for (int i = warp_id; i < desc.row_count; i += warps_per_cta) {
     auto const segment_idx = desc.seg_row_start + i;

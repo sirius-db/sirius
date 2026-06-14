@@ -54,7 +54,7 @@ template <uint32_t RowsPerBlock>
     if (seg.row_count == 0) { continue; }
     const uint32_t n = ::cuda::ceil_div(seg.row_count, RowsPerBlock);
     for (uint32_t b = 0; b < n; ++b) {
-      const uint32_t rows = (b + 1u < n) ? RowsPerBlock : seg.row_count - b * RowsPerBlock;
+      const uint32_t rows = (b + 1 < n) ? RowsPerBlock : seg.row_count - b * RowsPerBlock;
       descs.push_back({seg.d_bytes, seg.bytes_size, b, rows, seg.row_offset + b * RowsPerBlock});
     }
   }

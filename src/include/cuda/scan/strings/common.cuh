@@ -38,7 +38,6 @@
 namespace sirius::cuda::scan {
 
 using detail::FULL_MASK;
-using detail::WARP_THREADS;
 
 //----- FSST decoder types (shared: FSST + DICT_FSST modes 1+2) --------------//
 /// 255 codes (0..254); byte 255 is the escape sentinel.
@@ -184,8 +183,8 @@ std::vector<Desc> expand_chunks(std::vector<Desc> const& descs, uint32_t target_
   uint32_t chunk_size = total_rows / target_ctas;
   chunk_size          = std::max(chunk_size, MIN_ROWS_PER_CHUNK);
   // Round down to warp size for store coalescing within a chunk.
-  chunk_size = (chunk_size / WARP_THREADS) * WARP_THREADS;
-  if (chunk_size == 0) chunk_size = WARP_THREADS;
+  chunk_size = (chunk_size / cub::detail::warp_threads) * cub::detail::warp_threads;
+  if (chunk_size == 0) chunk_size = cub::detail::warp_threads;
 
   std::vector<Desc> out;
   out.reserve(target_ctas + descs.size());

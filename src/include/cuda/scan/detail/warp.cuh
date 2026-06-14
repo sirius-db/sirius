@@ -19,15 +19,12 @@
 
 #pragma once
 
-#include <cub/config.cuh>
+#include <cub/util_arch.cuh>  // cub::detail::warp_threads
 #include <cuda/std/cstdint>
 
 namespace sirius::cuda::scan::detail {
 
-//! Threads per warp on every supported architecture.
-constexpr uint32_t WARP_THREADS = 32;
-
-//! All-lanes mask for the warp `__shfl_*_sync` / ballot collectives.
+//! All-lanes mask for the warp shuffle / ballot collectives.
 constexpr uint32_t FULL_MASK = 0xFFFFFFFFu;
 
 }  // namespace sirius::cuda::scan::detail

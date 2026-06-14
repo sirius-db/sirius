@@ -25,6 +25,7 @@
 #include "cuda/scan/detail/byte_copy.cuh"
 #include "cuda/scan/strings/common.cuh"
 
+#include <cub/config.cuh>
 #include <cub/util_ptx.cuh>
 #include <cuda/std/algorithm>
 
@@ -37,16 +38,15 @@ namespace sirius::cuda::scan::detail {
 constexpr uint32_t FSST_SCRATCH_U32_PER_WARP   = 256;
 constexpr uint32_t FSST_SCRATCH_BYTES_PER_WARP = FSST_SCRATCH_U32_PER_WARP * sizeof(uint32_t);
 constexpr uint32_t FSST_MAX_CHUNK_EMIT =
-  WARP_THREADS * 8;  ///< worst-case bytes emitted per 32B input chunk (8B max symbol)
-constexpr uint32_t FSST_WARPS_PER_CTA = BLOCK_DIM / WARP_THREADS;
+  cub::detail::warp_threads * 8;  ///< worst-case bytes emitted per 32B input chunk (8B max symbol)
+constexpr uint32_t FSST_WARPS_PER_CTA = BLOCK_DIM / cub::detail::warp_threads;
 
-/**
- * @brief Import an FSST symbol table from its on-disk blob into @p out.
- *
- * Device port of DuckDB's duckdb_fsst_import. Blob layout: 8B version | 1B
- * zeroTerminated | 8B lenHisto | packed symbols by length group 1..8,1.
- */
-__device__ __forceinline__ bool device_fsst_import(uint8_t const* buf, fsst_decoder_compact* out)
+//! @brief Import an FSST symbol table from its on-disk blob into @p out.
+//!
+//! Device port of DuckDB's duckdb_fsst_import. Blob layout: 8B version | 1B
+//! zeroTerminated | 8B lenHisto | packed symbols by length group 1..8,1.
+_CCCL_DEVICE _CCCL_FORCEINLINE bool device_fsst_import(uint8_t const* buf,
+                                                       fsst_decoder_compact* out)
 {
   constexpr uint32_t FSST_VERSION_LO = 20190218;
   constexpr uint64_t FSST_CORRUPT    = 32774747032022883;  // "corrupt" in LE
@@ -93,25 +93,26 @@ __device__ __forceinline__ bool device_fsst_import(uint8_t const* buf, fsst_deco
   return true;
 }
 
-/**
- * @brief Decompressed byte length of one row's `comp_len` FSST-compressed bytes,
- * computed cooperatively by a warp. @p sm_len is the symbol length table.
- */
-__device__ __forceinline__ uint32_t warp_compute_decomp_len(uint8_t const* __restrict__ comp_ptr,
-                                                            uint32_t comp_len,
-                                                            uint8_t const* __restrict__ sm_len,
-                                                            uint32_t lane)
+//! @brief Decompressed byte length of one row's `comp_len` FSST-compressed bytes,
+//! computed cooperatively by a warp. @p sm_len is the symbol length table.
+_CCCL_DEVICE _CCCL_FORCEINLINE uint32_t
+warp_compute_decomp_len(uint8_t const* __restrict__ comp_ptr,
+                        uint32_t comp_len,
+                        uint8_t const* __restrict__ sm_len,
+                        uint32_t lane)
 {
   uint32_t total             = 0;
   int prev_chunk_last_is_esc = 0;
-  for (uint32_t off = 0; off < comp_len; off += WARP_THREADS) {
-    auto const bytes_in_chunk = ::cuda::std::min(comp_len - off, uint32_t{WARP_THREADS});
-    auto const is_active      = lane < bytes_in_chunk;
-    uint8_t const my_byte     = is_active ? comp_ptr[off + lane] : 0;
-    int const is_esc          = is_active && my_byte == FSST_ESC ? 1 : 0;
+  for (uint32_t off = 0; off < comp_len; off += cub::detail::warp_threads) {
+    auto const bytes_in_chunk =
+      ::cuda::std::min(comp_len - off, uint32_t{cub::detail::warp_threads});
+    auto const is_active  = lane < bytes_in_chunk;
+    uint8_t const my_byte = is_active ? comp_ptr[off + lane] : 0;
+    int const is_esc      = is_active && my_byte == FSST_ESC ? 1 : 0;
 
-    auto const neighbor_is_esc = ::cub::ShuffleUp<WARP_THREADS>(is_esc, 1, 0, FULL_MASK);
-    auto const prev_is_esc     = (lane == 0) ? prev_chunk_last_is_esc : neighbor_is_esc;
+    auto const neighbor_is_esc =
+      ::cub::ShuffleUp<cub::detail::warp_threads>(is_esc, 1, 0, FULL_MASK);
+    auto const prev_is_esc = (lane == 0) ? prev_chunk_last_is_esc : neighbor_is_esc;
 
     // Per-lane contribution: 0 for inactive / escape-sentinel;
     //                        1 for the literal byte that follows an escape;
@@ -125,51 +126,49 @@ __device__ __forceinline__ uint32_t warp_compute_decomp_len(uint8_t const* __res
       }
     }
 
-    // Warp-reduce per-lane lengths. CUB has no ShuffleXor, so the butterfly
-    // all-reduce keeps the raw `__shfl_xor_sync` intrinsic.
 #pragma unroll
-    for (uint32_t s = WARP_THREADS / 2; s > 0; s /= 2) {
+    for (uint32_t s = cub::detail::warp_threads / 2; s > 0; s /= 2) {
       my_len += __shfl_xor_sync(FULL_MASK, my_len, s);
     }
     total += my_len;
 
     // Broadcast whether the last byte in this 32B stripe was an escape for the next stripe.
     auto const last_active_lane = bytes_in_chunk - 1;
-    prev_chunk_last_is_esc = ::cub::ShuffleIndex<WARP_THREADS>(is_esc, last_active_lane, FULL_MASK);
+    prev_chunk_last_is_esc =
+      ::cub::ShuffleIndex<cub::detail::warp_threads>(is_esc, last_active_lane, FULL_MASK);
   }
   return total;
 }
 
-/**
- * @brief Decode `comp_len` FSST-compressed bytes with one warp, in 32-byte chunks.
- *
- * Decoded symbols accumulate in a per-warp scratch slab and flush to `dst` when
- * the next chunk's worst-case emit would overflow it, then once at end of row.
- * The symbol table is split lo/hi; `sm_sym_hi` is read only when len[code] > 4.
- *
- * @note Reused by DICT_FSST mode-2 inline decompress.
- */
-__device__ __forceinline__ void warp_decode_fsst(uint8_t const* __restrict__ comp_ptr,
-                                                 uint32_t comp_len,
-                                                 uint8_t* __restrict__ dst,
-                                                 uint8_t const* __restrict__ sm_len,
-                                                 uint32_t const* __restrict__ sm_sym_lo,
-                                                 uint32_t const* __restrict__ sm_sym_hi,
-                                                 uint32_t* __restrict__ warp_scratch_u32,
-                                                 uint32_t lane)
+//! @brief Decode `comp_len` FSST-compressed bytes with one warp, in 32-byte chunks.
+//!
+//! Decoded symbols accumulate in a per-warp scratch slab and flush to `dst` when
+//! the next chunk's worst-case emit would overflow it, then once at end of row.
+//! The symbol table is split lo/hi; `sm_sym_hi` is read only when len[code] > 4.
+//!
+//! @note Reused by DICT_FSST mode-2 inline decompress.
+_CCCL_DEVICE _CCCL_FORCEINLINE void warp_decode_fsst(uint8_t const* __restrict__ comp_ptr,
+                                                     uint32_t comp_len,
+                                                     uint8_t* __restrict__ dst,
+                                                     uint8_t const* __restrict__ sm_len,
+                                                     uint32_t const* __restrict__ sm_sym_lo,
+                                                     uint32_t const* __restrict__ sm_sym_hi,
+                                                     uint32_t* __restrict__ warp_scratch_u32,
+                                                     uint32_t lane)
 {
   auto* warp_scratch_u8           = reinterpret_cast<uint8_t*>(warp_scratch_u32);
   uint32_t cumulative_out_offset  = 0;  ///< bytes already flushed to dst
   uint32_t scratch_used           = 0;  ///< bytes pending in scratch
   uint32_t prev_chunk_last_is_esc = 0;
 
-  for (uint32_t off = 0; off < comp_len; off += WARP_THREADS) {
-    auto const bytes_in_chunk = ::cuda::std::min(comp_len - off, uint32_t{WARP_THREADS});
-    auto const active         = lane < bytes_in_chunk;
-    uint8_t const my_byte     = active ? comp_ptr[off + lane] : 0;
-    int const is_esc          = (active && my_byte == FSST_ESC) ? 1 : 0;
-    auto const neighbor_esc   = ::cub::ShuffleUp<WARP_THREADS>(is_esc, 1, 0, FULL_MASK);
-    auto const prev_was_esc   = (lane == 0) ? prev_chunk_last_is_esc : neighbor_esc;
+  for (uint32_t off = 0; off < comp_len; off += cub::detail::warp_threads) {
+    auto const bytes_in_chunk =
+      ::cuda::std::min(comp_len - off, uint32_t{cub::detail::warp_threads});
+    auto const active       = lane < bytes_in_chunk;
+    uint8_t const my_byte   = active ? comp_ptr[off + lane] : 0;
+    int const is_esc        = (active && my_byte == FSST_ESC) ? 1 : 0;
+    auto const neighbor_esc = cub::ShuffleUp<cub::detail::warp_threads>(is_esc, 1, 0, FULL_MASK);
+    auto const prev_was_esc = (lane == 0) ? prev_chunk_last_is_esc : neighbor_esc;
 
     // Decode the symbol for this lane, if active and not an escape byte.
     // my_len == 0 → no write (inactive or unresolved escape sentinel).
@@ -193,13 +192,14 @@ __device__ __forceinline__ void warp_decode_fsst(uint8_t const* __restrict__ com
     // inclusive scan of the decoded lengths.
     auto scan = my_len;
 #pragma unroll
-    for (uint32_t step = 1; step < WARP_THREADS; step <<= 1) {
-      auto const add = ::cub::ShuffleUp<WARP_THREADS>(scan, step, 0, FULL_MASK);
+    for (uint32_t step = 1; step < cub::detail::warp_threads; step <<= 1) {
+      auto const add = cub::ShuffleUp<cub::detail::warp_threads>(scan, step, 0, FULL_MASK);
       if (lane >= step) { scan += add; }
     }
-    auto const exclusive   = scan - my_len;
-    auto const base        = scratch_used + exclusive;
-    auto const chunk_total = ::cub::ShuffleIndex<WARP_THREADS>(scan, WARP_THREADS - 1, FULL_MASK);
+    auto const exclusive = scan - my_len;
+    auto const base      = scratch_used + exclusive;
+    auto const chunk_total =
+      cub::ShuffleIndex<cub::detail::warp_threads>(scan, cub::detail::warp_threads - 1, FULL_MASK);
 
     // Copy the decoded symbol into the scratch pad at the offset computed from the scan.
     if (my_len > 0) {
@@ -219,10 +219,11 @@ __device__ __forceinline__ void warp_decode_fsst(uint8_t const* __restrict__ com
 
     scratch_used += chunk_total;
     auto const last_active_lane = bytes_in_chunk - 1;
-    prev_chunk_last_is_esc = ::cub::ShuffleIndex<WARP_THREADS>(is_esc, last_active_lane, FULL_MASK);
+    prev_chunk_last_is_esc =
+      cub::ShuffleIndex<cub::detail::warp_threads>(is_esc, last_active_lane, FULL_MASK);
 
     // Lazy flush: only when the next chunk might overflow scratch.
-    auto const more_chunks = (off + WARP_THREADS) < comp_len;
+    auto const more_chunks = (off + cub::detail::warp_threads) < comp_len;
     if (more_chunks && scratch_used + FSST_MAX_CHUNK_EMIT > FSST_SCRATCH_BYTES_PER_WARP) {
       __syncwarp();
       warp_copy_bytes(dst + cumulative_out_offset, warp_scratch_u8, scratch_used, lane);
