@@ -106,17 +106,13 @@ constexpr uint32_t BLOCK_DIM = 256;
 constexpr uint8_t ALP_MAX_FACTOR =
   static_cast<uint8_t>(std::extent_v<decltype(duckdb::AlpConstants::FACT_ARR)> - 1);
 
-/**
- * @brief Per-vector parse outcome. Routes the CTA to one of three paths:
- * zero-fill (invalid), raw bit-cast (uncompressed sentinel), or bitpacked
- * decode (compressed).
- */
+//! @brief Per-vector parse outcome. Routes the CTA to one of three paths:
+//! zero-fill (invalid), raw bit-cast (uncompressed sentinel), or bitpacked
+//! decode (compressed).
 enum class alp_parse_status : uint8_t { invalid, uncompressed, compressed };
 
-/**
- * @brief Parsed per-vector metadata. Thread 0 populates this from the
- * segment header + trailer; the rest of the CTA reads it through shmem.
- */
+//! @brief Parsed per-vector metadata. Thread 0 populates this from the
+//! segment header + trailer; the rest of the CTA reads it through shmem.
 struct alp_vector_meta {
   alp_parse_status status;
   uint32_t data_off;              ///< Byte offset of this vector's data within the segment.
@@ -129,17 +125,13 @@ struct alp_vector_meta {
   uint32_t packed_bytes_count;    ///< Size of the bitpacked stream in bytes.
 };
 
-/**
- * @brief Per-vector ALPRD parse outcome — see `alp_parse_status` for the
- * three routing paths.
- */
+//! @brief Per-vector ALPRD parse outcome — see `alp_parse_status` for the
+//! three routing paths.
 enum class alprd_parse_status : uint8_t { invalid, uncompressed, compressed };
 
-/**
- * @brief Parsed per-vector ALPRD metadata. Thread 0 populates this from the
- * segment header + trailer; the rest of the CTA reads it through shmem. The
- * segment dictionary is loaded separately by a cooperative dict-load.
- */
+//! @brief Parsed per-vector ALPRD metadata. Thread 0 populates this from the
+//! segment header + trailer; the rest of the CTA reads it through shmem. The
+//! segment dictionary is loaded separately by a cooperative dict-load.
 struct alprd_vector_meta {
   alprd_parse_status status;
   uint32_t data_off;                    ///< Byte offset of this vector's data within the segment.
@@ -153,11 +145,9 @@ struct alprd_vector_meta {
   uint32_t right_packed_bytes_count;    ///< Size of the right bitpacked stream in bytes.
 };
 
-/**
- * @brief Factor and exponent tables for ALP decoding: decoded val = code * fact[fac] * frac[exp].
- * Placed in constant memory. Mirrors of `AlpConstants::FACT_ARR` and
- * `AlpTypedConstants<T>::FRAC_ARR`.
- */
+//! @brief Factor and exponent tables for ALP decoding: decoded val = code * fact[fac] * frac[exp].
+//! Placed in constant memory. Mirrors of `AlpConstants::FACT_ARR` and
+//! `AlpTypedConstants<T>::FRAC_ARR`.
 __device__ __constant__ int64_t d_alp_fact[] = {1LL,
                                                 10LL,
                                                 100LL,
@@ -212,9 +202,7 @@ __device__ __constant__ double d_alp_frac_f64[] = {1.0,
                                                    0.0000000000000000001,
                                                    0.00000000000000000001};
 
-/**
- * @brief Get the pointer to the fraction array in constant memory for float/double
- */
+//! @brief Get the pointer to the fraction array in constant memory for float/double
 template <typename T>
 __device__ __forceinline__ T const* alp_frac_ptr();
 template <>
@@ -228,12 +216,10 @@ __device__ __forceinline__ double const* alp_frac_ptr<double>()
   return d_alp_frac_f64;
 }
 
-/**
- * @brief Perform an unaligned load of type @p T from buffer @p p.
- *
- * Per-vector data starts at arbitrary byte offsets, so metadata reads cannot make alignment
- * assumptions.
- */
+//! @brief Perform an unaligned load of type @p T from buffer @p p.
+//!
+//! Per-vector data starts at arbitrary byte offsets, so metadata reads cannot make alignment
+//! assumptions.
 template <typename T>
 __device__ __forceinline__ T ld_unaligned(uint8_t const* p)
 {
@@ -242,12 +228,10 @@ __device__ __forceinline__ T ld_unaligned(uint8_t const* p)
   return v;
 }
 
-/**
- * @brief Calculate the number of bytes for a bitpacked buffer given @p row_count rows and @p width
- * bits per row.
- *
- * Mirror of DuckDB's `BitpackingPrimitives::GetRequiredBytes`.
- */
+//! @brief Calculate the number of bytes for a bitpacked buffer given @p row_count rows and @p width
+//! bits per row.
+//!
+//! Mirror of DuckDB's `BitpackingPrimitives::GetRequiredBytes`.
 __device__ __host__ __forceinline__ uint32_t bp_required_bytes(uint32_t row_count, uint32_t width)
 {
   // DuckDB packs values in groups of 32
@@ -263,9 +247,7 @@ __device__ __host__ __forceinline__ uint32_t bp_required_bytes(uint32_t row_coun
 //===----------------------------------------------------------------------===//
 // ALP
 //===----------------------------------------------------------------------===//
-/**
- * @brief Parse the ALP segment trailer + per-vector header.
- */
+//! @brief Parse the ALP segment trailer + per-vector header.
 template <typename T>
 __device__ alp_vector_meta parse_alp_metadata(uint8_t const* seg_base,
                                               uint32_t seg_bytes,
@@ -331,9 +313,7 @@ __device__ alp_vector_meta parse_alp_metadata(uint8_t const* seg_base,
   return meta;
 }
 
-/**
- * @brief Decoding kernel for ALP encoded values. Work partitioning is 1 CTA per 1024-row vector.
- */
+//! @brief Decoding kernel for ALP encoded values. Work partitioning is 1 CTA per 1024-row vector.
 template <int SMEM_WORDS, typename T>
 __global__ void kernel_decode_alp(detail::cta_block_desc const* __restrict__ descs,
                                   T* __restrict__ d_output,
@@ -413,9 +393,7 @@ __global__ void kernel_decode_alp(detail::cta_block_desc const* __restrict__ des
   }
 }
 
-/**
- * @brief HOST-side ALP decoding kernel dispatcher.
- */
+//! @brief HOST-side ALP decoding kernel dispatcher.
 template <typename T>
 void launch_alp_typed(detail::cta_block_desc const* h_descs,
                       size_t num_vecs,
@@ -444,9 +422,7 @@ void launch_alp_typed(detail::cta_block_desc const* h_descs,
 //===----------------------------------------------------------------------===//
 // ALPRD
 //===----------------------------------------------------------------------===//
-/**
- * @brief Parse the ALPRD segment header + per-vector header.
- */
+//! @brief Parse the ALPRD segment header + per-vector header.
 template <typename T>
 __device__ alprd_vector_meta parse_alprd_metadata(uint8_t const* seg_base,
                                                   uint32_t seg_bytes,
@@ -527,9 +503,7 @@ __device__ alprd_vector_meta parse_alprd_metadata(uint8_t const* seg_base,
   return meta;
 }
 
-/**
- * @brief Decoding kernel for ALPRD encoded values. Work partitioning is 1 CTA per 1024-row vector.
- */
+//! @brief Decoding kernel for ALPRD encoded values. Work partitioning is 1 CTA per 1024-row vector.
 template <int SMEM_WORDS, typename T>
 __global__ void kernel_decode_alprd(detail::cta_block_desc const* __restrict__ descs,
                                     T* __restrict__ d_output,
@@ -651,9 +625,7 @@ __global__ void kernel_decode_alprd(detail::cta_block_desc const* __restrict__ d
   }
 }
 
-/**
- * @brief HOST-side ALPRD decoding kernel dispatcher.
- */
+//! @brief HOST-side ALPRD decoding kernel dispatcher.
 template <typename T>
 void launch_alprd_typed(detail::cta_block_desc const* h_descs,
                         size_t num_vecs,
@@ -690,23 +662,21 @@ void launch_alprd_typed(detail::cta_block_desc const* h_descs,
 //===----------------------------------------------------------------------===//
 // Public Entry Points for ALP(RD) Decoding
 //===----------------------------------------------------------------------===//
-/**
- * @brief Decode a set of ALP-encoded segments into a contiguous output buffer.
- *
- * One CTA decodes one 1024-row vector; segments are split across vectors via
- * `build_block_descs`. Each segment writes to `d_output` at its own
- * `row_offset * type_size`. Malformed vectors are zero-filled rather than
- * faulted.
- *
- * @param run        Segments tagged with the ALP codec.
- * @param d_output   Device-side output buffer, sized for `run.total_rows * type_size` bytes.
- * @param type       Output element type (unused; `type_size` alone selects the kernel).
- * @param type_size  Output element width in bytes — must be 4 (float) or 8 (double).
- * @param stream     CUDA stream for the descriptor upload and kernel launches.
- * @param mr         Device memory resource for the per-launch descriptor buffer.
- *
- * @throws std::runtime_error if `type_size` is not 4 or 8.
- */
+//! @brief Decode a set of ALP-encoded segments into a contiguous output buffer.
+//!
+//! One CTA decodes one 1024-row vector; segments are split across vectors via
+//! `build_block_descs`. Each segment writes to `d_output` at its own
+//! `row_offset * type_size`. Malformed vectors are zero-filled rather than
+//! faulted.
+//!
+//! @param run        Segments tagged with the ALP codec.
+//! @param d_output   Device-side output buffer, sized for `run.total_rows * type_size` bytes.
+//! @param type       Output element type (unused; `type_size` alone selects the kernel).
+//! @param type_size  Output element width in bytes — must be 4 (float) or 8 (double).
+//! @param stream     CUDA stream for the descriptor upload and kernel launches.
+//! @param mr         Device memory resource for the per-launch descriptor buffer.
+//!
+//! @throws std::runtime_error if `type_size` is not 4 or 8.
 void decode_alp_data(gpu_codec_run const& run,
                      uint8_t* d_output,
                      cudf::data_type /*type*/,
@@ -732,23 +702,21 @@ void decode_alp_data(gpu_codec_run const& run,
   }
 }
 
-/**
- * @brief Decode a set of ALPRD-encoded segments into a contiguous output buffer.
- *
- * One CTA decodes one 1024-row vector; segments are split across vectors via
- * `build_block_descs`. Each segment writes to `d_output` at its own
- * `row_offset * type_size`. Malformed vectors are zero-filled rather than
- * faulted.
- *
- * @param run        Segments tagged with the ALPRD codec.
- * @param d_output   Device-side output buffer, sized for `run.total_rows * type_size` bytes.
- * @param type       Output element type (unused; `type_size` alone selects the kernel).
- * @param type_size  Output element width in bytes — must be 4 (float) or 8 (double).
- * @param stream     CUDA stream for the descriptor upload and kernel launches.
- * @param mr         Device memory resource for the per-launch descriptor buffer.
- *
- * @throws std::runtime_error if `type_size` is not 4 or 8.
- */
+//! @brief Decode a set of ALPRD-encoded segments into a contiguous output buffer.
+//!
+//! One CTA decodes one 1024-row vector; segments are split across vectors via
+//! `build_block_descs`. Each segment writes to `d_output` at its own
+//! `row_offset * type_size`. Malformed vectors are zero-filled rather than
+//! faulted.
+//!
+//! @param run        Segments tagged with the ALPRD codec.
+//! @param d_output   Device-side output buffer, sized for `run.total_rows * type_size` bytes.
+//! @param type       Output element type (unused; `type_size` alone selects the kernel).
+//! @param type_size  Output element width in bytes — must be 4 (float) or 8 (double).
+//! @param stream     CUDA stream for the descriptor upload and kernel launches.
+//! @param mr         Device memory resource for the per-launch descriptor buffer.
+//!
+//! @throws std::runtime_error if `type_size` is not 4 or 8.
 void decode_alprd_data(gpu_codec_run const& run,
                        uint8_t* d_output,
                        cudf::data_type /*type*/,

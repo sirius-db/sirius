@@ -18,10 +18,7 @@
 //! Alignment-agnostic scalar load for on-disk segment reads whose byte address
 //! is not guaranteed to satisfy `alignof(T)` (e.g. a typed field at a
 //! byte-granular segment offset). Reading through a typed pointer there is
-//! undefined behaviour; `load_unaligned` reads via `memcpy` instead, which the
-//! compiler lowers to the same single load as a typed dereference when the
-//! address happens to be aligned (the common case) and to an alignment-safe
-//! access otherwise.
+//! undefined behaviour; `load_unaligned` reads via `memcpy` instead.
 
 #pragma once
 

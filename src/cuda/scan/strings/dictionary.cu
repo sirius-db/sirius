@@ -53,11 +53,9 @@ struct dict_header_t {
   uint32_t bitpacking_width;  ///< selection buffer
 };
 
-/**
- * @brief Parse DICTIONARY header @p hdr from @p base, bounded by the buffer size @p limit.
- * @return true if the header was successfully parsed (i.e. the header fits within the buffer), and
- * if the header metadata is valid; false otherwise.
- */
+//! @brief Parse DICTIONARY header @p hdr from @p base, bounded by the buffer size @p limit.
+//! @return true if the header was successfully parsed (i.e. the header fits within the buffer), and
+//! if the header metadata is valid; false otherwise.
 __device__ __forceinline__ bool parse_dict_header(uint8_t const* base,
                                                   uint32_t limit,
                                                   dict_header_t* hdr)
@@ -75,12 +73,10 @@ __device__ __forceinline__ uint32_t dict_index_at(uint8_t const* idx_bytes, int 
   return detail::load_unaligned<uint32_t>(idx_bytes + static_cast<size_t>(i) * sizeof(uint32_t));
 }
 
-/**
- * @brief Compute decoded string lengths for a DICTIONARY segment.
- *
- * Walks the selection buffer to get dictionary indices, looks up lengths from the index buffer, and
- * writes per-row lengths to d_lengths.
- */
+//! @brief Compute decoded string lengths for a DICTIONARY segment.
+//!
+//! Walks the selection buffer to get dictionary indices, looks up lengths from the index buffer,
+//! and writes per-row lengths to d_lengths.
 __global__ void kernel_compute_lengths_dict(string_chunk_desc const* __restrict__ descs,
                                             uint32_t* __restrict__ d_lengths,
                                             int num_chunks)
@@ -118,13 +114,11 @@ __global__ void kernel_compute_lengths_dict(string_chunk_desc const* __restrict_
   }
 }
 
-/**
- * @brief Gather DICTIONARY segment strings to the output chars buffer.
- *
- * Walk the selection buffer to get dict indices, look up offsets from the index buffer, then copy
- * from the dict bytes to the output chars buffer at positions from d_offsets.
- * Work granularity is one thread per row.
- */
+//! @brief Gather DICTIONARY segment strings to the output chars buffer.
+//!
+//! Walk the selection buffer to get dict indices, look up offsets from the index buffer, then copy
+//! from the dict bytes to the output chars buffer at positions from d_offsets.
+//! Work granularity is one thread per row.
 __global__ void kernel_gather_dict(string_chunk_desc const* __restrict__ descs,
                                    int32_t const* __restrict__ d_offsets,
                                    uint8_t* __restrict__ d_chars,
@@ -157,11 +151,9 @@ __global__ void kernel_gather_dict(string_chunk_desc const* __restrict__ descs,
   }
 }
 
-/**
- * @brief Gather DICTIONARY segment strings to the output chars buffer.
- *
- * Similar to kernel_gather_dict but with warp-cooperative copying for long strings.
- */
+//! @brief Gather DICTIONARY segment strings to the output chars buffer.
+//!
+//! Similar to kernel_gather_dict but with warp-cooperative copying for long strings.
 __global__ void kernel_gather_dict_warp(string_chunk_desc const* __restrict__ descs,
                                         int32_t const* __restrict__ d_offsets,
                                         uint8_t* __restrict__ d_chars,

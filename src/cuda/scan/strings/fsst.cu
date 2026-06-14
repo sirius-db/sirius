@@ -73,11 +73,9 @@ struct fsst_header_t {
   uint32_t fsst_symbol_table_offset;
 };
 
-/**
- * @brief Copy FSST header @p hdr into @p base, bounded by the buffer size @p limit.
- * @return true if the header was successfully copied (i.e. the header fits within the buffer), and
- * if the header metadata is valid; false otherwise.
- */
+//! @brief Copy FSST header @p hdr into @p base, bounded by the buffer size @p limit.
+//! @return true if the header was successfully copied (i.e. the header fits within the buffer), and
+//! if the header metadata is valid; false otherwise.
 __device__ __forceinline__ bool parse_fsst_header(uint8_t const* base,
                                                   uint32_t limit,
                                                   fsst_header_t* hdr)
@@ -88,12 +86,10 @@ __device__ __forceinline__ bool parse_fsst_header(uint8_t const* base,
          hdr->bitpacking_width <= MAX_BITPACKING_WIDTH;
 }
 
-/**
- * @brief Build per-segment FSST decoders from the on-disk symbol table blob.
- *
- * Coalesced load of the symbol table blob for the segment into shared memory, then single-threaded
- * parse into the fsst_decoder_compact format in global memory. One CTA per segment.
- */
+//! @brief Build per-segment FSST decoders from the on-disk symbol table blob.
+//!
+//! Coalesced load of the symbol table blob for the segment into shared memory, then single-threaded
+//! parse into the fsst_decoder_compact format in global memory. One CTA per segment.
 __global__ __launch_bounds__(BLOCK_DIM) void kernel_build_fsst_decoders(
   string_chunk_desc const* __restrict__ descs,
   int num_segments,
@@ -129,12 +125,10 @@ __global__ __launch_bounds__(BLOCK_DIM) void kernel_build_fsst_decoders(
   if (threadIdx.x == 0) { device_fsst_import(sm_symtab, &d_decoders[seg_idx]); }
 }
 
-/**
- * @brief Compute the per-row offsets into the FSST compressed byte stream for an FSST segment.
- *
- * One CTA per segment; in-CTA cub::BlockScan over per-thread chunk sums produces the inclusive
- * prefix sum the gather kernel reads.
- */
+//! @brief Compute the per-row offsets into the FSST compressed byte stream for an FSST segment.
+//!
+//! One CTA per segment; in-CTA cub::BlockScan over per-thread chunk sums produces the inclusive
+//! prefix sum the gather kernel reads.
 __global__ void kernel_compute_compressed_offsets_fsst(
   uint32_t* __restrict__ d_comp_offsets,
   string_chunk_desc const* __restrict__ descs,
@@ -193,12 +187,10 @@ __global__ void kernel_compute_compressed_offsets_fsst(
   }
 }
 
-/**
- * @brief Compute the decompressed length of each row in the FSST stream.
- *
- * Adaptive per CTA: thread-per-row when the chunk averages < 64 compressed
- * bytes/row, warp-per-row above that.
- */
+//! @brief Compute the decompressed length of each row in the FSST stream.
+//!
+//! Each CTA dispatches per chunk between thread-per-row and warp-per-row based on the average
+//! compressed bytes per row.
 __global__ __launch_bounds__(BLOCK_DIM) void kernel_compute_decompressed_lengths_fsst(
   fsst_chunk_desc const* __restrict__ descs,
   uint32_t* __restrict__ d_lengths,
@@ -262,7 +254,7 @@ __global__ __launch_bounds__(BLOCK_DIM) void kernel_compute_decompressed_lengths
       if (lane == 0) { d_lengths[desc.global_row_start + i] = decomp_len; }
     }
   } else {
-    // Thread-per-row: short rows; warp-coord tax of cooperative scan dominates.
+    // Thread-per-row: each thread byte-walks one short row.
     for (int i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
       auto const cumsum      = compressed_cumsum_ptr[i];
       auto const prev_cumsum = (i > 0) ? compressed_cumsum_ptr[i - 1] : start;
@@ -293,11 +285,9 @@ __global__ __launch_bounds__(BLOCK_DIM) void kernel_compute_decompressed_lengths
   }
 }
 
-/**
- * @brief Gather kernel for FSST-compressed segments, with the same chunking as phase-C. Each warp
- * walks the compressed byte stream for its row, decodes on the fly into a per-warp scratch buffer,
- * and flushes to global when the next chunk's worst-case emit would overflow scratch.
- */
+//! @brief Gather kernel for FSST-compressed segments, with the same chunking as phase-C. Each warp
+//! walks the compressed byte stream for its row, decodes on the fly into a per-warp scratch buffer,
+//! and flushes to global when the next chunk's worst-case emit would overflow scratch.
 __global__ __launch_bounds__(BLOCK_DIM) void kernel_gather_fsst_chunked(
   fsst_chunk_desc const* __restrict__ descs,
   int32_t const* __restrict__ d_offsets,

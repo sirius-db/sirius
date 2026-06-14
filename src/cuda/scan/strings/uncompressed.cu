@@ -49,13 +49,11 @@ __device__ __forceinline__ int32_t duck_offset(uint8_t const* off_bytes, int seg
   return detail::load_unaligned<int32_t>(off_bytes + static_cast<size_t>(seg_i) * sizeof(int32_t));
 }
 
-/**
- * @brief Compute decoded string lengths for an UNCOMPRESSED varchar segment.
- *
- * Lengths come from successive differences of the backward-cumulative offsets
- * array. If the segment is too short to contain the offsets region the kernel
- * zero-fills.
- */
+//! @brief Compute decoded string lengths for an UNCOMPRESSED varchar segment.
+//!
+//! Lengths come from successive differences of the backward-cumulative offsets
+//! array. If the segment is too short to contain the offsets region the kernel
+//! zero-fills.
 __global__ void kernel_compute_lengths_uncomp(string_chunk_desc const* __restrict__ descs,
                                               uint32_t* __restrict__ d_lengths,
                                               int num_chunks)
@@ -88,12 +86,10 @@ __global__ void kernel_compute_lengths_uncomp(string_chunk_desc const* __restric
   }
 }
 
-/**
- * @brief Gather UNCOMPRESSED segment strings to the output chars buffer.
- *
- * Chars region grows backward from `dict_end`, so row i starts at
- * `dict_end - |offsets[i]|`. Work granularity is one thread per row.
- */
+//! @brief Gather UNCOMPRESSED segment strings to the output chars buffer.
+//!
+//! Chars region grows backward from `dict_end`, so row i starts at
+//! `dict_end - |offsets[i]|`. Work granularity is one thread per row.
 __global__ void kernel_gather_uncomp(string_chunk_desc const* __restrict__ descs,
                                      int32_t const* __restrict__ d_offsets,
                                      uint8_t* __restrict__ d_chars,

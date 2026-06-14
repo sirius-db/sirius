@@ -140,17 +140,13 @@ struct prepared_dict_fsst {
 };
 
 //----- Host chunking helpers ------------------------------------------------//
-/**
- * @brief Align a value to the next 8-byte boundary.
- *
- * Mirror of DuckDB's AlignValue<idx_t> for 64-bit idx_t.
- */
+//! @brief Align a value to the next 8-byte boundary.
+//!
+//! Mirror of DuckDB's AlignValue<idx_t> for 64-bit idx_t.
 constexpr uint32_t align_up8(uint32_t n) { return (n + 7u) & ~7u; }
 
-/**
- * @brief Target CTA count for chunking segments: two full device waves at
- * BLOCK_DIM threads. Cached per device.
- */
+//! @brief Target CTA count for chunking segments: two full device waves at
+//! BLOCK_DIM threads. Cached per device.
 inline uint32_t get_target_ctas()
 {
   int device = 0;
@@ -166,12 +162,10 @@ inline uint32_t get_target_ctas()
   return cached;
 }
 
-/**
- * @brief Expand segment descriptors into smaller chunks.
- *
- * Used for per-row work (compute_lengths, gather); per-dict work (predecode, mark_nulls) keeps
- * one-CTA-per-segment so dictionaries are not decoded per chunk.
- */
+//! @brief Expand segment descriptors into smaller chunks.
+//!
+//! Used for per-row work (compute_lengths, gather); per-dict work (predecode, mark_nulls) keeps
+//! one-CTA-per-segment so dictionaries are not decoded per chunk.
 template <typename Desc>
 std::vector<Desc> expand_chunks(std::vector<Desc> const& descs, uint32_t target_ctas)
 {

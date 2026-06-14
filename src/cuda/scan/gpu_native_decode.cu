@@ -285,8 +285,7 @@ void decode_uncompressed_data(gpu_codec_run const& run,
     d_chunks.data(), static_cast<uint32_t>(n));
 }
 
-/// Unused `cub::DeviceMemcpy::Batched` alternative to `decode_uncompressed_data`,
-/// kept as a portable reference path.
+/// `cub::DeviceMemcpy::Batched` alternative to `decode_uncompressed_data`.
 [[maybe_unused]] void decode_uncompressed_data_cub(gpu_codec_run const& run,
                                                    uint8_t* d_output,
                                                    uint32_t type_size,

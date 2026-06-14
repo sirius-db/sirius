@@ -34,7 +34,9 @@
 
 namespace sirius::cuda::scan::detail {
 
-//----- FSST decode scratch tuning -------------------------------------------//
+//===----------------------------------------------------------------------===//
+// FSST decode scratch tuning
+//===----------------------------------------------------------------------===//
 constexpr uint32_t FSST_SCRATCH_U32_PER_WARP   = 256;
 constexpr uint32_t FSST_SCRATCH_BYTES_PER_WARP = FSST_SCRATCH_U32_PER_WARP * sizeof(uint32_t);
 constexpr uint32_t FSST_MAX_CHUNK_EMIT =
@@ -145,8 +147,6 @@ warp_compute_decomp_len(uint8_t const* __restrict__ comp_ptr,
 //! Decoded symbols accumulate in a per-warp scratch slab and flush to `dst` when
 //! the next chunk's worst-case emit would overflow it, then once at end of row.
 //! The symbol table is split lo/hi; `sm_sym_hi` is read only when len[code] > 4.
-//!
-//! @note Reused by DICT_FSST mode-2 inline decompress.
 _CCCL_DEVICE _CCCL_FORCEINLINE void warp_decode_fsst(uint8_t const* __restrict__ comp_ptr,
                                                      uint32_t comp_len,
                                                      uint8_t* __restrict__ dst,

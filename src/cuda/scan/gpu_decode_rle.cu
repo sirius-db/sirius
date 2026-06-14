@@ -82,9 +82,7 @@ constexpr uint32_t RLE_BUILD_MAX_ENTRIES =
 constexpr uint32_t MALFORMED_FLAG = 0u;
 using detail::FULL_MASK;
 
-/**
- * @brief Per-CTA input for segment-level prefix sum kernel over counts array.
- */
+//! @brief Per-CTA input for segment-level prefix sum kernel over counts array.
 struct rle_segment_desc {
   uint8_t const* d_bytes;
   uint32_t bytes_size;
@@ -95,9 +93,7 @@ struct rle_segment_desc {
   uint32_t type_size;
 };
 
-/**
- * @brief Per-CTA input for chunk-level value filling kernel into the output column.
- */
+//! @brief Per-CTA input for chunk-level value filling kernel into the output column.
 struct rle_chunk_desc {
   uint8_t const* d_values;
   uint32_t const* d_prefix_sums;
@@ -111,10 +107,8 @@ struct rle_chunk_desc {
 // Segment-level prefix sum kernel over counts array.
 //===----------------------------------------------------------------------===//
 
-/**
- * @brief Stateful prefix functor that carries running total across successive `cub::BlockScan`
- * invocations; used to scan a single segment in tiles.
- */
+//! @brief Stateful prefix functor that carries running total across successive `cub::BlockScan`
+//! invocations; used to scan a single segment in tiles.
 struct BlockPrefixCallbackOp {
   uint32_t running_total;
   __device__ uint32_t operator()(uint32_t block_aggregate)
@@ -125,15 +119,13 @@ struct BlockPrefixCallbackOp {
   }
 };
 
-/**
- * @brief Result of parsing a segment's RLE header.
- *
- * `is_malformed` is true if any header-level invariant fails:
- *  - segment smaller than the 8-byte header
- *  - counts_offset out of range
- * When malformed, the pointer/count fields are unspecified and the caller must zero-fill rather
- * than dereference.
- */
+//! @brief Result of parsing a segment's RLE header.
+//!
+//! `is_malformed` is true if any header-level invariant fails:
+//!  - segment smaller than the 8-byte header
+//!  - counts_offset out of range
+//! When malformed, the pointer/count fields are unspecified and the caller must zero-fill rather
+//! than dereference.
 struct rle_parsed_metadata {
   rle_count_t const* counts_ptr;
   /// Real entry count of the counts[] region, computed from the values
@@ -143,10 +135,8 @@ struct rle_parsed_metadata {
   bool is_malformed;
 };
 
-/**
- * @brief Decode an RLE segment's 8-byte header and bound the counts[] region.
- * Intended for single-thread execution and shared memory broadcast.
- */
+//! @brief Decode an RLE segment's 8-byte header and bound the counts[] region.
+//! Intended for single-thread execution and shared memory broadcast.
 __device__ __forceinline__ rle_parsed_metadata parse_rle_metadata(rle_segment_desc const& desc)
 {
   rle_parsed_metadata md{};
@@ -180,12 +170,10 @@ __device__ __forceinline__ rle_parsed_metadata parse_rle_metadata(rle_segment_de
   return md;
 }
 
-/**
- * @brief Compute the prefix sums over the counts in the segment to determine the positions in the
- * output columns into which to fill values.
- *
- * The work partitioning is 1 CTA per segment.
- */
+//! @brief Compute the prefix sums over the counts in the segment to determine the positions in the
+//! output columns into which to fill values.
+//!
+//! The work partitioning is 1 CTA per segment.
 template <int BLOCK_THREADS, int ITEMS_PER_THREAD, int PREFIX_SUM_BUFFER_ENTRIES_PER_SEGMENT>
 __global__ void kernel_build_rle(rle_segment_desc const* __restrict__ segment_descriptors,
                                  int num_segments,
@@ -332,12 +320,10 @@ __global__ void kernel_build_rle(rle_segment_desc const* __restrict__ segment_de
 // Expand kernel.
 //===----------------------------------------------------------------------===//
 
-/**
- * @brief Fill the values into the output array based on the corresponding output position
- * determined by the segment-local prefix sum. @p segment_entry_count is the per-segment number of
- * counts, @p chunk_rows is the number of rows in this segment chunk, and @p chunk_first_row is the
- * segment-local row index of this chunk's first row.
- */
+//! @brief Fill the values into the output array based on the corresponding output position
+//! determined by the segment-local prefix sum. @p segment_entry_count is the per-segment number of
+//! counts, @p chunk_rows is the number of rows in this segment chunk, and @p chunk_first_row is the
+//! segment-local row index of this chunk's first row.
 template <int ITEMS_PER_THREAD, typename T>
 __device__ __forceinline__ void decode_chunk_rle(uint32_t const* __restrict__ prefix_sums,
                                                  T const* __restrict__ values,
@@ -426,10 +412,8 @@ __device__ __forceinline__ void decode_chunk_rle(uint32_t const* __restrict__ pr
   }
 }
 
-/**
- * @brief Wrapper kernel for `decode_chunk_rle` that loads the chunk descriptor and stages the
- * segment prefix sums in shared memory, if possible, for faster binary search.
- */
+//! @brief Wrapper kernel for `decode_chunk_rle` that loads the chunk descriptor and stages the
+//! segment prefix sums in shared memory, if possible, for faster binary search.
 template <int ITEMS_PER_THREAD, typename T>
 __global__ void kernel_expand_rle(rle_chunk_desc const* __restrict__ chunk_descs,
                                   int num_chunks,
@@ -484,25 +468,23 @@ __global__ void kernel_expand_rle(rle_chunk_desc const* __restrict__ chunk_descs
 // Public entry.
 //===----------------------------------------------------------------------===//
 
-/**
- * @brief Decode all RLE-encoded segments in @p run into @p d_output.
- *
- * Runs the two-pass pipeline: a per-segment prefix-sum build kernel that
- * computes the cumulative row counts and the per-segment entry count,
- * followed by a per-chunk expand kernel that scatters run values to their
- * output positions. Malformed segments are zero-filled.
- *
- * @param run        Column of segments sharing the RLE codec.
- * @param d_output   Device pointer to the output column buffer; must hold
- *                   at least `sum(segment.row_count) * type_size` bytes.
- * @param type       Cudf type of the output column (unused; kept for API
- *                   parity with the dispatcher's other codec entry points).
- * @param type_size  Width of one output value in bytes. Must be 1, 2, 4, or
- *                   8; otherwise the function throws.
- * @param stream     Stream on which all kernels and allocations are issued.
- * @param mr         Memory resource for the transient prefix-sum / descriptor
- *                   buffers allocated during decode.
- */
+//! @brief Decode all RLE-encoded segments in @p run into @p d_output.
+//!
+//! Runs the two-pass pipeline: a per-segment prefix-sum build kernel that
+//! computes the cumulative row counts and the per-segment entry count,
+//! followed by a per-chunk expand kernel that scatters run values to their
+//! output positions. Malformed segments are zero-filled.
+//!
+//! @param run        Column of segments sharing the RLE codec.
+//! @param d_output   Device pointer to the output column buffer; must hold
+//!                   at least `sum(segment.row_count) * type_size` bytes.
+//! @param type       Cudf type of the output column (unused; kept for API
+//!                   parity with the dispatcher's other codec entry points).
+//! @param type_size  Width of one output value in bytes. Must be 1, 2, 4, or
+//!                   8; otherwise the function throws.
+//! @param stream     Stream on which all kernels and allocations are issued.
+//! @param mr         Memory resource for the transient prefix-sum / descriptor
+//!                   buffers allocated during decode.
 void decode_rle_data(gpu_codec_run const& run,
                      uint8_t* d_output,
                      cudf::data_type /*type*/,

@@ -76,13 +76,11 @@ struct dict_fsst_header_t {
   uint32_t symbol_table_size;
 };
 
-/**
- * @brief Per-segment scratch input for `kernel_build_dict_fsst_data`. Filled
- * host-side after a single batched header D2H so the kernel has all metadata
- * it needs without re-reading the header on device. `base_off` is the
- * cumulative `(dict_count + 1)` over prior valid segments — it indexes into
- * the global d_byte_offsets / d_decoded_offsets arrays.
- */
+//! @brief Per-segment scratch input for `kernel_build_dict_fsst_data`. Filled
+//! host-side after a single batched header D2H so the kernel has all metadata
+//! it needs without re-reading the header on device. `base_off` is the
+//! cumulative `(dict_count + 1)` over prior valid segments — it indexes into
+//! the global d_byte_offsets / d_decoded_offsets arrays.
 struct dict_fsst_pre_desc {
   uint8_t const* d_bytes;
   uint32_t bytes_size;
@@ -98,13 +96,10 @@ struct dict_fsst_pre_desc {
 };
 static_assert(sizeof(dict_fsst_pre_desc) % 4 == 0);
 
-/**
- * @brief One CTA per segment: parse the symbol table on device, unpack
- * string_lengths into byte_offsets and inclusive-scan it, then for FSST modes
- * walk each dict entry to fill decoded_offsets. Writes per-segment outputs
- * (total decoded bytes + inline-null flag) for the host to aggregate.
- * Same pattern as `kernel_build_fsst_decoders`.
- */
+//! @brief One CTA per segment: parse the symbol table on device, unpack
+//! string_lengths into byte_offsets and inclusive-scan it, then for FSST modes
+//! walk each dict entry to fill decoded_offsets. Writes per-segment outputs
+//! (total decoded bytes + inline-null flag) for the host to aggregate.
 __global__ __launch_bounds__(BLOCK_DIM) void kernel_build_dict_fsst_data(
   dict_fsst_pre_desc const* __restrict__ pre,
   int num_segments,
@@ -472,10 +467,8 @@ dict_fsst_desc make_stub_dict_fsst_desc(gpu_string_segment_desc const& seg)
           {0, 0, 0, 0, 0, 0}};
 }
 
-/**
- * @brief Resizable pinned-host scratch buffer, grown on demand and reused
- * across calls (one instance per usage site).
- */
+//! @brief Resizable pinned-host scratch buffer, grown on demand and reused
+//! across calls (one instance per usage site).
 class pinned_host_pool {
   void* ptr_  = nullptr;
   size_t cap_ = 0;
@@ -502,20 +495,18 @@ class pinned_host_pool {
 
 }  // namespace
 
-/**
- * @brief Build per-segment DICT_FSST predecode state on device.
- *
- * Pipeline:
- *   1. Batched async D2H of all headers (one stream-sync, pinned host pool).
- *   2. Validate headers + compute per-segment region offsets and a cumulative
- *      `base_off` into the flat byte_offsets / decoded_offsets arrays.
- *   3. Launch `kernel_build_dict_fsst_data` — one CTA per segment does symbol
- *      table import, string_lengths unpack + scan, FSST per-entry decoded
- *      length walks, and per-segment scalar outputs.
- *   4. Batched async D2H of the small result buffers (one stream-sync).
- *   5. Host-side build of `dict_fsst_desc[]` with the cross-segment
- *      `predecode_seg_offset` prefix sum.
- */
+//! @brief Build per-segment DICT_FSST predecode state on device.
+//!
+//! Pipeline:
+//!   1. Batched async D2H of all headers (one stream-sync, pinned host pool).
+//!   2. Validate headers + compute per-segment region offsets and a cumulative
+//!      `base_off` into the flat byte_offsets / decoded_offsets arrays.
+//!   3. Launch `kernel_build_dict_fsst_data` — one CTA per segment does symbol
+//!      table import, string_lengths unpack + scan, FSST per-entry decoded
+//!      length walks, and per-segment scalar outputs.
+//!   4. Batched async D2H of the small result buffers (one stream-sync).
+//!   5. Host-side build of `dict_fsst_desc[]` with the cross-segment
+//!      `predecode_seg_offset` prefix sum.
 prepared_dict_fsst prepare_dict_fsst(gpu_string_codec_run const& run,
                                      rmm::cuda_stream_view stream,
                                      rmm::device_async_resource_ref mr)
@@ -610,8 +601,7 @@ prepared_dict_fsst prepare_dict_fsst(gpu_string_codec_run const& run,
     static_cast<uint32_t*>(d_per_seg_total_buf.data()),
     static_cast<uint8_t*>(d_per_seg_inline_null_buf.data()));
 
-  // Phase 4: pull results back into host vectors (small — single ~5 MB D2H
-  // for typical TPC-H multi-segment workloads).
+  // Phase 4: pull results back into host vectors via a single batched D2H.
   out.decoders.resize(num_segs);
   out.byte_offsets.resize(total_dict_entries);
   out.decoded_offsets.resize(total_dict_entries);

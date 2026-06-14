@@ -16,19 +16,13 @@
 
 #pragma once
 
-//===----------------------------------------------------------------------===//
-// Public entry for the GPU-native DuckDB scan decode path.
-//
-// What it does: takes per-column descriptors that point at on-device segment
-// bytes and decodes them into a `cudf::table`. The dispatcher does no I/O —
-// the caller is responsible for staging segment bytes on device first.
-//
-// What it does NOT do: parse codec headers in the descriptors. Codec metadata
-// (bitpacking mode, dictionary refs, FSST symbol table, ...) lives inside the
-// segment bytes themselves; per-codec kernels parse their own headers. Adding
-// a new codec is therefore additive: drop in an impl file and one switch case
-// in `dispatch_data_run`. These descriptor types stay frozen.
-//===----------------------------------------------------------------------===//
+//! @file
+//! Public entry for the GPU-native DuckDB scan decode path. Takes per-column
+//! descriptors that point at on-device segment bytes and decodes them into a
+//! `cudf::table`. The dispatcher does no I/O — the caller stages segment bytes
+//! on device first. Codec metadata (bitpacking mode, dictionary refs, FSST
+//! symbol table, ...) lives inside the segment bytes; per-codec kernels parse
+//! their own headers.
 
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
@@ -69,11 +63,7 @@ struct gpu_codec_run {
 };
 
 /// Inputs for one column. `data` and `validity` are runs grouped by codec.
-///
-/// This struct is intentionally minimal — it only fits codecs whose state is
-/// per-segment. Future string codecs (DICTIONARY, FSST, DICT_FSST) will need
-/// column-level state (dictionary blob, FSST symbol table) and are expected
-/// to introduce a sibling input variant rather than extending this struct.
+/// Fits codecs whose state is per-segment.
 struct gpu_column_decode_input {
   cudf::data_type out_type;
   std::vector<gpu_codec_run> data;

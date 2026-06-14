@@ -32,9 +32,8 @@ namespace sirius::cuda::scan::detail {
 //! per-byte tail for the last < 4 bytes.
 //!
 //! Either pointer may be arbitrarily aligned. When @p src is 4-byte aligned the word reads are
-//! direct `uint32_t` loads (the FSST scratch drain depends on this fast path off word-aligned
-//! shared memory); otherwise they go through `memcpy`. Stores always go through `memcpy` because
-//! the output chars buffer is byte-addressed.
+//! direct `uint32_t` loads; otherwise they go through `memcpy`. Stores always go through `memcpy`
+//! because the output chars buffer is byte-addressed.
 //!
 //! @param dst   Output (byte-addressed; any alignment).
 //! @param src   Source bytes (any alignment).
