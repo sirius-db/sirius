@@ -449,6 +449,21 @@ with a bump allocator and make **no** further reservation (that memory is alread
 both), so its tier is a deployment choice — host staging can be preferable on some topologies (e.g. GB/VR-class
 nodes).
 
+For an **all-to-all** exchange the scarce resource is the fixed receive-staging arena (its **leases**), not
+just total GPU bytes, and a logical plan DAG does not prevent a physical lease cycle (see §7). Option A
+therefore needs two further constraints:
+
+1. **Lease-aware spill.** Generic spilling picks idle batches by memory *tier*, not by pool origin, so it
+   frees GPU bytes without necessarily releasing a staging lease. Releasing a lease requires the received
+   batch's GPU representation to **own** it, so that **copying the batch out of staging** (into ordinary,
+   spillable memory) returns the lease to the allocator. This makes the fast-path-vs-copy-out choice
+   explicit: a received batch can stay **staging-backed** (zero-copy, holds its lease until consumed or
+   copied out) or be **copied out on arrival** (frees the lease immediately) — and spill must be able to
+   force the copy-out.
+2. **Reserved receive-staging floor.** Hold back a **non-borrowable** slice of staging (a credit budget)
+   that compute can never consume, so there is always room to copy out / reclaim a receive lease —
+   guaranteeing forward progress even under a fully shared budget.
+
 ### Spill lifecycle of an exchange batch under option A
 
 This works **only because** the incoming batch is parked as a `data_batch` in a *registered* repository —
@@ -502,12 +517,15 @@ reservation-aware adaptor `src/memory/sirius_memory_reservation_manager.cpp:42-4
 - **Batch ownership graph.** Pin down whether a channel is a second, independent owner or only a handle into
   the repository (the intended model), and enumerate every holder — repository, channel, in-flight accessor,
   downgrade executor, `nixl` send — so that "idle ⇒ spillable" and free-on-last-drop are unambiguous.
-- **Deadlock / liveness.** Backpressure on bounded channels plus a shared GPU budget can stall progress —
-  e.g. every worker slot parked on a full output channel with none left to drain inputs, or a blocked sink
-  pinning memory that spilling needs. Mitigations: the plan is a DAG (no channel cycles), a blocked sink
-  should **yield its task** rather than block a worker thread, and a queued batch should sit *idle* in its
-  repository (still spillable) while it waits. Even so, we likely want a stall/credit **watchdog** that flags
-  "all channels full, no forward progress" so a sink (or a monitor) can surface it rather than hang silently.
+- **Deadlock / liveness.** Two hazards. *(a) Thread/queue stalls* — every worker slot parked on a full
+  output channel with none left to drain inputs, or a blocked sink pinning memory that spilling needs;
+  mitigated by a blocked sink **yielding its task** (not blocking a worker thread) and keeping queued batches
+  *idle* in their repository (still spillable). *(b) Staging-lease cycle* — a logical plan DAG does **not**
+  rule this out: CN A's receive-staging fills with batches from B so A stops granting leases, while B holds
+  pinned output waiting to send to A (and symmetrically) → mutual wait. Per-destination channels isolate slow
+  receivers at the *queue* level, but a shared budget re-couples them at the *staging* level. The fix is the
+  §6 lease-aware spill + reserved receive-staging floor, plus a stall/credit **watchdog** that flags "no
+  forward progress" rather than hanging silently.
 - **Transport retry / fallback.** On a failed `nixl` transfer, retry once over `nixl`, then fall back to the
   bRPC/CPU path, and only fail the query if that also fails (cf. the Doris `TransferHealth` fallback after N
   consecutive failures). The retry/fallback runs on the wrapper's `nixl` send path (which has its own
