@@ -19,7 +19,7 @@
 #include "telemetry-bridge/gen/uuid.rs.h"
 #include "telemetry/telemetry_context.hpp"
 
-#include <spdlog/fmt/bundled/core.h>
+#include <spdlog/fmt/fmt.h>
 
 #include <memory>
 #include <utility>
