@@ -172,7 +172,8 @@ The **wrapper⇄engine boundary is the channel itself** (exposed over the cxx FF
 the producer and the engine operator the consumer; for a sink it is reversed. The streaming source and sink
 are ordinary Sirius **operators** that run as tasks on the existing scheduler/worker pool — there is **no
 dedicated thread pool** for them — while `nixl`'s own threads live in the **wrapper**. So each channel is a
-hand-off between wrapper threads and engine worker threads.
+hand-off between wrapper threads and engine worker threads. The bounded channel is also the source's and
+sink's **only** queue — the operators hold no separate internal buffer.
 
 ```mermaid
 flowchart LR
