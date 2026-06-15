@@ -48,31 +48,6 @@ impl BrpcServer {
         Ok(listener)
     }
 
-    /// Serves BRPC requests on `bind_host:brpc_port` until the task is cancelled.
-    pub async fn serve(self, bind_host: &str, brpc_port: u16) -> Result<()> {
-        self.inner.serve(bind_host, brpc_port).await
-    }
-
-    /// Serves BRPC requests on `bind_host:brpc_port` until `signal` resolves.
-    pub async fn serve_with_shutdown<F>(
-        self,
-        bind_host: &str,
-        brpc_port: u16,
-        signal: F,
-    ) -> Result<()>
-    where
-        F: Future<Output = ()>,
-    {
-        self.inner
-            .serve_with_shutdown(bind_host, brpc_port, signal)
-            .await
-    }
-
-    /// Serves BRPC requests from an existing listener until the task is cancelled.
-    pub async fn serve_with_listener(self, listener: StdTcpListener) -> Result<()> {
-        self.inner.serve_with_listener(listener).await
-    }
-
     /// Serves BRPC requests from an existing listener until `signal` resolves.
     pub async fn serve_with_listener_shutdown<F>(
         self,
@@ -109,32 +84,6 @@ where
         + 'static,
     S::Future: Send,
 {
-    /// Serves BRPC requests on `bind_host:brpc_port` until the task is cancelled.
-    pub async fn serve(self, bind_host: &str, brpc_port: u16) -> Result<()> {
-        self.serve_with_shutdown(bind_host, brpc_port, std::future::pending::<()>())
-            .await
-    }
-
-    /// Serves BRPC requests on `bind_host:brpc_port` until `signal` resolves.
-    pub async fn serve_with_shutdown<F>(
-        self,
-        bind_host: &str,
-        brpc_port: u16,
-        signal: F,
-    ) -> Result<()>
-    where
-        F: Future<Output = ()>,
-    {
-        let listener = BrpcServer::bind(bind_host, brpc_port)?;
-        self.serve_with_listener_shutdown(listener, signal).await
-    }
-
-    /// Serves BRPC requests from an existing listener until the task is cancelled.
-    pub async fn serve_with_listener(self, listener: StdTcpListener) -> Result<()> {
-        self.serve_with_listener_shutdown(listener, std::future::pending::<()>())
-            .await
-    }
-
     /// Serves BRPC requests from an existing listener until `signal` resolves.
     pub async fn serve_with_listener_shutdown<F>(
         self,

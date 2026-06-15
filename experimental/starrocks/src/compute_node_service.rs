@@ -37,7 +37,7 @@ impl PInternalService for SiriusComputeNodeService {
     ///
     /// An OK status here means the fragment was accepted and translated, which is the correct
     /// dispatch-RPC response; actually executing the fragment and streaming results back is a
-    /// separate, not-yet-implemented RPC surface (see the PR notes).
+    /// separate, not-yet-implemented RPC surface.
     #[instrument(skip_all)]
     async fn exec_plan_fragment(
         &self,
