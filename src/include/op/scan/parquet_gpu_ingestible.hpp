@@ -217,6 +217,10 @@ class parquet_gpu_ingestible : public io::gpu_ingestible {
   // partition-column drop pass.
   std::shared_ptr<duckdb::Expression> _duckdb_filter_expression;
   std::vector<std::string> _file_paths;
+  // DuckDB schema types (P-space), indexed by scan_plan::data_column::primary_idx.
+  // Used to estimate the decoded (GPU-resident) byte size of each projected
+  // column when partitioning row groups into splits — see run_batch().
+  duckdb::vector<sirius::logical_type> _returned_types;
   std::size_t _approximate_batch_size{};
   std::size_t _max_file_processed{};
   std::size_t _total_files{};

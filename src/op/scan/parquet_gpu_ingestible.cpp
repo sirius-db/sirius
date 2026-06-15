@@ -147,6 +147,7 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<io::ingestible_ta
   }
 
   _file_paths             = bind.resolved_file_paths;
+  _returned_types         = bind.returned_types;
   _approximate_batch_size = bind.approximate_batch_size;
   _max_file_processed     = bind.max_file_processed;
   _total_files            = _file_paths.size();
@@ -372,10 +373,15 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
     auto const& metadata = *file_metadata;
 
     std::vector<std::size_t> selected_chunk_indices;
+    // Parallel to selected_chunk_indices: the decoded (GPU) byte width of each
+    // selected leaf chunk's column, or 0 for VARCHAR / nested / unknown types
+    // (which fall back to the parquet encoded-uncompressed size in rg_contribution).
+    std::vector<std::size_t> selected_chunk_decoded_width;
     std::unordered_set<std::size_t> pure_filter_chunk_indices;
     if (_plan->is_projected()) {
       auto const pure_filter_positions = _plan->pure_filter_batch_positions();
       selected_chunk_indices.reserve(data_column_names.size());
+      selected_chunk_decoded_width.reserve(data_column_names.size());
       for (std::size_t k = 0; k < data_column_names.size(); ++k) {
         auto leaves = detail::leaf_indices_for_column(metadata, data_column_names[k]);
         if (leaves.empty()) {
@@ -383,9 +389,25 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
                                    data_column_names[k] +
                                    "' not found in parquet file: " + file_path);
         }
+        // Decoded byte width for this data column: fixed-width types use their
+        // cuDF decoded width; VARCHAR (fixed_width_byte_size()==0) and nested
+        // types (which throw) get 0, signalling rg_contribution to fall back to
+        // the encoded-uncompressed byte size.
+        std::size_t decoded_width = 0;
+        if (k < _plan->data_columns.size()) {
+          auto const primary_idx = _plan->data_columns[k].primary_idx;
+          if (primary_idx < _returned_types.size()) {
+            try {
+              decoded_width = _returned_types[primary_idx].fixed_width_byte_size();
+            } catch (...) {
+              decoded_width = 0;  // LIST/STRUCT/etc — fall back to encoded size
+            }
+          }
+        }
         bool const is_pure_filter = pure_filter_positions.count(k);
         for (auto const leaf : leaves) {
           selected_chunk_indices.push_back(leaf);
+          selected_chunk_decoded_width.push_back(decoded_width);
           if (is_pure_filter) { pure_filter_chunk_indices.insert(leaf); }
         }
       }
@@ -481,26 +503,65 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
       cur_compressed_bytes   = 0;
     };
 
+    // Estimate the DECODED (GPU-resident) byte size of a row group's projected
+    // columns, NOT the parquet encoded-uncompressed size. Dictionary/RLE-encoded
+    // fixed-width columns decode to far more than their encoded size, so capping
+    // splits on the encoded size badly under-counts the GPU memory a batch needs
+    // (e.g. a heavily-duplicated lineitem decodes ~10x its encoded size), which
+    // produces oversized batches that OOM under a tight GPU budget. Returns
+    // {estimated_decoded_bytes, compressed_bytes}; the decoded estimate drives
+    // both split partitioning and the split's reservation size (estimated_bytes).
     auto rg_contribution = [&](cudf::io::parquet::RowGroup const& row_group) {
-      std::size_t rg_uncompressed = 0;
-      std::size_t rg_compressed   = 0;
-      auto add_chunk = [&](cudf::io::parquet::ColumnChunk const& chunk, bool is_pure_filter) {
+      std::size_t rg_decoded    = 0;
+      std::size_t rg_compressed = 0;
+      auto const row_count      = static_cast<std::size_t>(row_group.num_rows);
+      auto add_chunk            = [&](cudf::io::parquet::ColumnChunk const& chunk,
+                           bool is_pure_filter,
+                           std::size_t decoded_width) {
         auto const& column_metadata = chunk.meta_data;
         if (!is_pure_filter) {
-          rg_uncompressed += static_cast<std::size_t>(column_metadata.total_uncompressed_size);
+          if (decoded_width > 0) {
+            // Fixed-width column: row_count x decoded width, plus a validity mask.
+            rg_decoded += row_count * decoded_width + row_count / 8;
+          } else {
+            // VARCHAR / nested / unknown: encoded-uncompressed size is the best
+            // pre-decode proxy for the char data; add offset + validity bytes.
+            rg_decoded += static_cast<std::size_t>(column_metadata.total_uncompressed_size) +
+                          row_count * sizeof(std::uint32_t) + row_count / 8;
+          }
         }
         rg_compressed += static_cast<std::size_t>(column_metadata.total_compressed_size);
       };
       if (_plan->is_projected()) {
-        for (auto const chunk_idx : selected_chunk_indices) {
-          add_chunk(row_group.columns[chunk_idx], pure_filter_chunk_indices.contains(chunk_idx));
+        for (std::size_t i = 0; i < selected_chunk_indices.size(); ++i) {
+          auto const chunk_idx = selected_chunk_indices[i];
+          add_chunk(row_group.columns[chunk_idx],
+                    pure_filter_chunk_indices.contains(chunk_idx),
+                    selected_chunk_decoded_width[i]);
+        }
+      } else if (_returned_types.size() == row_group.columns.size()) {
+        // Unprojected (identity) scan: the reader materializes every file column
+        // in order, so column ci aligns 1:1 with returned_types[ci]. Estimate
+        // decoded bytes per column the same way as the projected path — fixed
+        // widths from the type, VARCHAR/nested falling back to encoded size.
+        for (std::size_t ci = 0; ci < row_group.columns.size(); ++ci) {
+          std::size_t decoded_width = 0;
+          try {
+            decoded_width = _returned_types[ci].fixed_width_byte_size();
+          } catch (...) {
+            decoded_width = 0;
+          }
+          add_chunk(row_group.columns[ci], /*is_pure_filter=*/false, decoded_width);
         }
       } else {
+        // Column count does not match returned_types (cannot safely align types
+        // to chunks): keep the original parquet encoded-uncompressed sizing.
         for (auto const& chunk : row_group.columns) {
-          add_chunk(chunk, false);
+          rg_decoded += static_cast<std::size_t>(chunk.meta_data.total_uncompressed_size);
+          rg_compressed += static_cast<std::size_t>(chunk.meta_data.total_compressed_size);
         }
       }
-      return std::pair{rg_uncompressed, rg_compressed};
+      return std::pair{rg_decoded, rg_compressed};
     };
 
     for (auto const rg_idx : row_group_indices) {
