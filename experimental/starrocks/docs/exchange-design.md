@@ -213,7 +213,10 @@ A batch received by `nixl` lands on an input bounded channel; the streaming sour
 pipeline and drives task creation as batches arrive; the GPU executor reserves memory **before** dispatching
 and runs on a per-device stream pool; the streaming sink emits results incrementally; the partitioned sink
 (#838) splits partitions across **per-destination** output channels so one slow receiver cannot
-head-of-line-block the others; `nixl` sends each output batch.
+head-of-line-block the others; `nixl` sends each output batch. Because partitioning fragments each batch into
+many small per-destination slices, the sink **coalesces** a destination's slices (a GPU concat) up to a size
+or time threshold before flushing one combined batch to its channel — otherwise we ship a flood of tiny RDMA
+transfers.
 
 The unit that flows everywhere is a `shared_ptr<cucascade::data_batch>` wrapping a `cudf::table` (GPU device
 buffers), guarded by a 3-state reader/writer lock (`idle` / `read_only` / `mutable_locked`). Hand-off across
@@ -232,9 +235,10 @@ flowchart LR
     sched["task_scheduler + GPU executor<br/>reserve-before-dispatch · stream pool"]:::exists
     sink["streaming sink — #837"]:::proposed
     part["partition — #838"]:::proposed
-    inCh --> src --> repo --> sched --> sink --> part
+    coal["coalesce per destination<br/>(concat to threshold)"]:::proposed
+    inCh --> src --> repo --> sched --> sink --> part --> coal
   end
-  part -->|"per-destination"| outCh["output bounded channels"]:::proposed
+  coal -->|"per-destination"| outCh["output bounded channels"]:::proposed
   outCh --> nixlOut["nixl send"]:::priorart
   classDef exists fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#1a1a1a;
   classDef proposed fill:#fff8e1,stroke:#f9a825,stroke-width:2px,stroke-dasharray:5 4,color:#1a1a1a;
@@ -427,6 +431,12 @@ batches and spills any that are idle (it filters on `idle` state, not batch orig
    them — must be reserved against the same budget explicitly. Without this, a shared manager still leaves
    queued exchange data uncounted and unspillable.
 
+This yields **two** levels of nixl-buffer accounting. The pre-registered staging arena is reserved **once**
+against the cuCascade budget at startup; per-transfer sends/receives then **lease** sub-regions of that arena
+with a bump allocator and make **no** further reservation (that memory is already accounted). Only the
+**fallback** path needs a fresh per-transfer reservation — when the arena is full and `nixl` resorts to
+`cuMemAlloc` + register for that transfer.
+
 ### Spill lifecycle of an exchange batch under option A
 
 This works **only because** the incoming batch is parked as a `data_batch` in a *registered* repository —
@@ -467,8 +477,9 @@ reservation-aware adaptor `src/memory/sirius_memory_reservation_manager.cpp:42-4
 - **#838 — backpressure policy.** §4 describes how pressure propagates; still open: the channel bound/size,
   whether a full input channel **blocks** `push` or **spills** the queued batch, and how a persistently slow
   destination's partition is kept from starving shared input.
-- **Accounting nixl buffers.** Under every option, `nixl`'s registered/staging GPU buffers must be counted
-  against the budget; otherwise the boundary OOMs even when "Sirius" looks within budget.
+- **Accounting nixl buffers.** §6 covers the main case (staging arena reserved once; per-transfer leases are
+  sub-allocations that skip cuCascade). Still open: accounting the **fallback** allocations
+  (`cuMemAlloc` + register when the arena is full) and sizing the arena so the fallback stays rare.
 - **Sink → nixl ownership.** How the sink obtains an owning `cudf::table` to feed the transfer. cuCascade
   `data_batch::release_or_copy_table()` (cuCascade PR #148) does this safely at
   runtime: a zero-copy **steal** when the sink is the sole owner (`use_count()==1`), or a deep **copy** when
@@ -485,3 +496,7 @@ reservation-aware adaptor `src/memory/sirius_memory_reservation_manager.cpp:42-4
   should **yield its task** rather than block a worker thread, and a queued batch should sit *idle* in its
   repository (still spillable) while it waits. Even so, we likely want a stall/credit **watchdog** that flags
   "all channels full, no forward progress" so a sink (or a monitor) can surface it rather than hang silently.
+- **Transport retry / fallback.** On a failed `nixl` transfer, retry once over `nixl`, then fall back to the
+  bRPC/CPU path, and only fail the query if that also fails (cf. the Doris `TransferHealth` fallback after N
+  consecutive failures). This presumes the sink can hold the batch across the retry (i.e. the sink owns a
+  queue + worker thread).
