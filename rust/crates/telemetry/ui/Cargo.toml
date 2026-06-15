@@ -1,0 +1,10 @@
+[package]
+name = "sirius-telemetry-ui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+quent-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "5f405cbf4f4b21bf9153669f2fa52baab51d2d10", features = ["ts"] }
+serde = { version = "1", features = ["derive"] }
+ts-rs = { version = "11", features = ["uuid-impl", "serde-json-impl"] }
+uuid = { version = "1", features = ["serde"] }

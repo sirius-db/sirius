@@ -1,0 +1,26 @@
+[package]
+name = "sirius-telemetry-server"
+version.workspace = true
+edition.workspace = true
+
+[features]
+ui = ["quent-query-engine-server/ui"]
+swagger = ["quent-query-engine-server/swagger"]
+
+[dependencies]
+axum = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+instrumentation-model = { path = "../model" }
+sirius-telemetry-analyzer = { path = "../analyzer" }
+quent-collector = { git = "https://github.com/rapidsai/quent.git", rev = "5f405cbf4f4b21bf9153669f2fa52baab51d2d10" }
+quent-exporter = { git = "https://github.com/rapidsai/quent.git", rev = "5f405cbf4f4b21bf9153669f2fa52baab51d2d10" }
+quent-query-engine-server = { git = "https://github.com/rapidsai/quent.git", rev = "5f405cbf4f4b21bf9153669f2fa52baab51d2d10" }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
+tracing = "0.1"
+uuid = "1"
+
+[build-dependencies]
+sirius-telemetry-ui = { path = "../ui" }
+quent-query-engine-ui = { git = "https://github.com/rapidsai/quent.git", rev = "5f405cbf4f4b21bf9153669f2fa52baab51d2d10" }
+quent-ui = { git = "https://github.com/rapidsai/quent.git", rev = "5f405cbf4f4b21bf9153669f2fa52baab51d2d10" }
+ts-rs = { version = "11", features = ["uuid-impl", "serde-json-impl"] }

@@ -28,6 +28,11 @@
 #include <thread>
 
 namespace sirius {
+namespace telemetry {
+class telemetry_context;
+struct TaskQueueHandleWrapper;
+}  // namespace telemetry
+
 namespace parallel {
 
 /**
@@ -45,9 +50,10 @@ namespace parallel {
  */
 class itask_executor {
  public:
-  explicit itask_executor(exec::thread_pool_config config) : _config(std::move(config)) {}
+  explicit itask_executor(exec::thread_pool_config config,
+                          std::shared_ptr<const telemetry::telemetry_context> telemetry_context);
 
-  virtual ~itask_executor() { stop(); }
+  virtual ~itask_executor();
 
   // Non-copyable and non-movable
   itask_executor(const itask_executor&)            = delete;
@@ -161,6 +167,8 @@ class itask_executor {
   std::unique_ptr<exec::bounded_thread_pool> _bounded_pool;
   exec::inspectable_mpsc<itask> _task_queue;
   std::thread _manager_thread;
+  std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
+  std::unique_ptr<telemetry::TaskQueueHandleWrapper> _task_queue_telemetry;
 };
 
 }  // namespace parallel
