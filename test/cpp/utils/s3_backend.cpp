@@ -415,17 +415,27 @@ void upload_fixtures(s3_endpoint const& ep,
   }
 }
 
-// Opt-in (SIRIUS_TEST_S3_LARGE=1): generate the SF10 lineitem parquet with the
-// DuckDB CLI and upload it for the [s3][sql][large] / benchmark tests. Uploaded
-// over the HTTP endpoint (the HTTPS endpoint shares the same backend).
-// `cache_dir` is the stable, shared base dir where the (expensive-to-generate)
-// SF10 parquet is cached so it is reused across the separate-process invocations
-// the large gate runs (each prewarm/no-prewarm case needs its own process).
+// Opt-in (SIRIUS_TEST_S3_LARGE=1): build the large lineitem parquet and upload
+// it for the [s3][sql][large] / benchmark tests. Uploaded over the HTTP endpoint
+// (the HTTPS endpoint shares the same backend). `cache_dir` is the stable,
+// shared base dir where the (expensive-to-generate) fixture is cached so it is
+// reused across the separate-process invocations the large gate runs (each
+// prewarm/no-prewarm case needs its own process).
+//
+// The large gate only cares about the *scale* of the object (the >50M-row floor,
+// a ~GB body spanning many row groups, and enough data to push Sirius into GPU
+// memory tiering) — every correctness check compares the GPU-over-S3 result
+// against a CPU read of this same file, so the values need not be statistically
+// faithful TPC-H. So instead of regenerating real SF10 data (the repo's DuckDB
+// build has no tpch extension to CALL dbgen, and tpchgen-rs would mean building a
+// Rust tool in CI), we replicate the SF1 lineitem parquet that the job already
+// produces 10x with the in-tree DuckDB CLI: SF1 (~6M rows) x10 clears the >50M
+// floor at ~SF10 scale, using only DuckDB's core `range()` (no extension).
 void maybe_upload_large_fixture(s3_endpoint const& http, fs::path const& cache_dir)
 {
   if (!env_truthy("SIRIUS_TEST_S3_LARGE")) return;
 
-  // The SF10 generation costs minutes, so cache the parquet at a stable path and
+  // The generation costs minutes, so cache the parquet at a stable path and
   // reuse it across processes. Only the first generates it.
   fs::path parquet = cache_dir / "lineitem_sf10.parquet";
   std::error_code ec;
@@ -433,22 +443,31 @@ void maybe_upload_large_fixture(s3_endpoint const& http, fs::path const& cache_d
     fs::path duckdb_bin =
       env_or("SIRIUS_TEST_DUCKDB",
              (fs::path{SIRIUS_PROJECT_ROOT} / "build" / "release" / "duckdb").string());
-    fs::path db = cache_dir / "tpch_sf10.duckdb";
+    // SF1 lineitem parquet produced by the "Prepare SQL test datasets" CI step
+    // (scripts/tpch_to_parquet.sql). Replicated 10x to reach SF10 scale.
+    fs::path source = env_or(
+      "SIRIUS_TEST_S3_LARGE_SOURCE",
+      (fs::path{SIRIUS_PROJECT_ROOT} / "test_datasets" / "tpch_parquet_sf1" / "lineitem.parquet")
+        .string());
+    if (!fs::exists(source, ec)) {
+      throw std::runtime_error(
+        "SF1 lineitem source parquet not found at " + source.string() +
+        "; run scripts/tpch_to_parquet.sql (the CI \"Prepare SQL test datasets\" step) "
+        "or set SIRIUS_TEST_S3_LARGE_SOURCE");
+    }
     // Generate to a temp file and atomically rename, so an interrupted run never
-    // leaves a truncated-but-non-empty file that the cache check would reuse.
+    // leaves a truncated-but-non-empty file that the cache check would reuse. The
+    // 10-row `range` cross join replicates every source row 10x; DuckDB streams
+    // it (range is the build side), so it stays memory-light despite the size.
     fs::path parquet_tmp = cache_dir / "lineitem_sf10.parquet.tmp";
-    fs::remove(db, ec);
     fs::remove(parquet_tmp, ec);
-    std::string sql =
-      "LOAD tpch; CALL dbgen(sf=10); "
-      "COPY (SELECT * FROM lineitem) TO '" +
-      parquet_tmp.string() + "' (FORMAT PARQUET);";
-    int rc = run_process({duckdb_bin.string(), db.string(), "-c", sql});
-    fs::remove(db, ec);
+    std::string sql = "COPY (SELECT l.* FROM read_parquet('" + source.string() +
+                      "') AS l, range(10)) TO '" + parquet_tmp.string() + "' (FORMAT PARQUET);";
+    int rc = run_process({duckdb_bin.string(), "-c", sql});
     if (rc != 0) {
       fs::remove(parquet_tmp, ec);
-      throw std::runtime_error("failed to generate SF10 lineitem via DuckDB CLI (" +
-                               duckdb_bin.string() +
+      throw std::runtime_error("failed to build SF10 lineitem from " + source.string() +
+                               " via DuckDB CLI (" + duckdb_bin.string() +
                                "); run `make release` or set SIRIUS_TEST_DUCKDB");
     }
     fs::rename(parquet_tmp, parquet, ec);

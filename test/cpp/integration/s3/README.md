@@ -43,7 +43,11 @@ never spawns a server. The behavior:
   `SIRIUS_TEST_WEED` to a `weed` of your choice). No Docker.
 - Python 3.9+ (stdlib only) and `openssl` at run time, both from the pixi env.
 - For the large gate: the in-tree `build/release/duckdb` CLI (or
-  `SIRIUS_TEST_DUCKDB`) to generate the SF10 fixture.
+  `SIRIUS_TEST_DUCKDB`) and an SF1 `lineitem` parquet at
+  `test_datasets/tpch_parquet_sf1/lineitem.parquet` (or `SIRIUS_TEST_S3_LARGE_SOURCE`),
+  which the harness replicates 10x to reach ~SF10 scale. Generate the SF1 source
+  with `scripts/tpch_to_parquet.sql`. The DuckDB build has no `tpch` extension, so
+  `CALL dbgen` is not used.
 
 ## Typical flow
 
