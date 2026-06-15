@@ -42,6 +42,21 @@ constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES = 500ULL * 1024 * 1024;  /
 /// Fraction of available GPU memory used per sort partition when max_sort_partition_bytes is 0.
 constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
 
+/// Row-count ratio gate for switching STANDARD-mode MARK joins to cudf::mark_join (build on the
+/// left/output side) instead of cudf::filtered_join (build on the right side). mark_join only
+/// wins when the left side is much smaller than the right (probe) side.
+///
+/// Provenance: a standalone microbenchmark (see issue #510) compared filtered_join (build right,
+/// probe left) vs. mark_join (build left, probe right) — including the BOOL8 scatter that
+/// resolve_mark_join_result performs — across many left/right size ratios on an NVIDIA L4. The
+/// scatter cost was negligible and identical for both. filtered_join won at or near parity and
+/// only lost once the right side was roughly >= 3-4x the left side, i.e. when mark_join's build
+/// side (left) was substantially smaller. We default to 8.0 (well above the measured ~3-4x
+/// crossover) so the switch only triggers when it is a clear win, leaving headroom for the fact
+/// that the crossover is hardware- and workload-dependent. Recalibrate per GPU; set to 0 to
+/// disable (always use filtered_join).
+constexpr double DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO = 8.0;
+
 }  // namespace config
 
 /// Parameters controlling operator-level resource sizing.
@@ -72,10 +87,18 @@ struct operator_params {
   /// Maximum build-side bytes for switching to BUILD_PROBE join mode.
   /// May be larger than concat_batch_bytes; build-side batches will be concatenated if needed.
   uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
+
+  /// For STANDARD-mode MARK joins: build the hash table on the left/output side via
+  /// cudf::mark_join (instead of on the right side via filtered_join) when the right (probe)
+  /// side has at least this many times more rows than the left side. mark_join only wins when
+  /// the left side is substantially smaller; the crossover is hardware-dependent (~3-4x on an
+  /// L4 in the issue #510 microbenchmark, defaulted higher to stay conservative). Set to 0 to
+  /// disable (always use filtered_join).
+  double mark_join_build_switch_ratio = config::DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO;
 };
 
 struct telemetry_config {
-  bool enable_quent{false};
+  bool enable_quent{true};
   std::string output_directory{"telemetry_data"};
   std::string engine_name{"siriusDB"};
 };

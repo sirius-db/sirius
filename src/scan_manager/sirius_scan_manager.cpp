@@ -83,14 +83,16 @@ sirius_scan_manager::sirius_scan_manager(
       std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads)),
     _factory(_pinned_entries)
 {
-  // if (_config.use_sirius_datasource) {
+  // The local uring backend is constructed unconditionally: the DuckDB-native
+  // GPU scan needs it for host reads even when use_sirius_datasource=false.
+  // That flag instead gates local-path CLAIMING in create_datasource (local
+  // parquet falls back to cudf/KvikIO when false).
   auto ioctx = std::make_shared<sirius::io::uring_ioctx>(
     /*host_ring_depth=*/16u,
     /*ring_entries=*/_config.uring_ring_entries,
     /*n_reactors=*/_config.uring_n_reactors,
     /*bounce_slot_size=*/sirius::io::CHUNK_SIZE);
   _io_ctxs.push_back(std::move(ioctx));
-  //}
 
   if (_config.s3_config) {
     auto s3_cfg                 = *_config.s3_config;
@@ -323,10 +325,11 @@ void sirius_scan_manager::start() {}
 void sirius_scan_manager::stop()
 {
   reset();
-  // S6: the IO backends + the S3 async pool are owned by SiriusContext, which
-  // drains (shutdown) the s3_ioctx and stops the S3 pool during its own
-  // teardown. The scan_manager only stops its scan-orchestration pool here and
-  // must NOT shut down the borrowed backends.
+  // Since the scan-manager cleanup (#913) the scan_manager OWNS the IO
+  // backends, the S3 thread pool and the prefetch buffer pool; they are torn
+  // down in the destructor (_io_ctxs.clear() -> S3 pool stop -> buffer pool
+  // reset). stop() only halts the scan-orchestration pool so it stays safe to
+  // call while backends may still serve in-flight reads.
   _thread_pool.stop();
 }
 
@@ -491,6 +494,14 @@ std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datas
   std::string_view path) const
 {
   auto file_path = normalize_path(std::string(path));
+  // use_sirius_datasource=false keeps LOCAL paths on cudf's bundled datasource
+  // (KvikIO fallback): they are deliberately left unclaimed so slices carry a
+  // null datasource and reads fall back to cudf::io::datasource::create.
+  // Object-store paths (s3:// etc.) always resolve through their backend —
+  // this flag does not disable S3.
+  if (!_config.use_sirius_datasource && file_path.find("://") == std::string::npos) {
+    return nullptr;
+  }
   for (auto const& ctx : _io_ctxs) {
     if (ctx && ctx->supports(file_path)) {
       // create_io_object opens the backend handle (an S3 HEAD for the async/

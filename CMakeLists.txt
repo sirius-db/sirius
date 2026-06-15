@@ -525,6 +525,8 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_task_scheduler.cpp
     test/cpp/scan/bench_decode_codecs.cpp
     test/cpp/scan/test_duckdb_block_layout.cpp
+    test/cpp/scan/test_duckdb_native_batch_coalescer.cpp
+    test/cpp/scan/test_duckdb_native_gpu_ingestible.cpp
     test/cpp/scan/test_duckdb_native_walker.cpp
     test/cpp/scan/test_gpu_decode_alp.cpp
     test/cpp/scan/test_gpu_decode_bitpacking.cpp
@@ -553,6 +555,11 @@ endif()
 if(SIRIUS_BUILD_S3_TESTS)
   list(APPEND TEST_SOURCES test/cpp/utils/s3_backend.cpp)
 endif()
+
+# Orphaned test files (present in the tree but missing from TEST_SOURCES) are
+# caught by the check-orphan-tests pre-commit hook
+# (scripts/check_orphan_tests.py) rather than a configure-time glob — see
+# test/cpp/orphan_test_allowlist.txt.
 
 add_executable(sirius_unittest ${TEST_SOURCES})
 

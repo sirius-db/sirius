@@ -22,7 +22,7 @@
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/config.hpp>
-#include <spdlog/spdlog.h>
+#include <log/logging.hpp>
 
 namespace sirius::transparent {
 

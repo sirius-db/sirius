@@ -132,6 +132,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("concat_batch_bytes", yaml::bytes(opt.concat_batch_bytes));
   r.optional("sort_sample_bytes", yaml::bytes(opt.sort_sample_bytes));
   r.optional("max_build_hash_table_bytes", yaml::bytes(opt.max_build_hash_table_bytes));
+  r.optional("mark_join_build_switch_ratio", opt.mark_join_build_switch_ratio);
   r.reject_unknown();
 }
 

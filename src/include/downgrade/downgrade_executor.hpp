@@ -188,6 +188,7 @@ class downgrade_executor {
   exec::interruptible_mpmc<std::unique_ptr<downgrade_request>> _request_queue;
   std::thread _processing_thread;
   std::thread _monitor_thread;
+  std::atomic<bool> _monitor_request_enqueued{false};
   std::atomic<bool> _running{false};
   std::atomic<size_t> _monitor_requests_issued{0};
   std::unique_ptr<cucascade::memory::exclusive_stream_pool> _stream_pool;

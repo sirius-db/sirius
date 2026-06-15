@@ -26,8 +26,8 @@
 #include "scan_manager/gpu_ingestible_factory.hpp"
 #include "scan_manager/split_provider.hpp"
 
-// Forward-declare sirius_ioctx via <io/types.hpp> for the gpu_ioctxs map type
-// used by prepare_for_query / create_provider_for.
+// Forward-declare sirius_ioctx via <io/types.hpp> for the owned-backend
+// vector used by create_datasource / create_ingestible_for.
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
 
@@ -67,34 +67,32 @@ namespace sirius::scan_manager {
 /**
  * @brief Configuration for the scan_manager.
  *
- * @c use_sirius_datasource controls whether the manager builds a
- * @c sirius_ioctx and routes parquet reads through @c sirius_datasource.
- * Set to @c false to fall back to @c cudf::io::datasource::create() at
- * every read site (e.g. when the sirius IO path is misbehaving). Only
- * valid in single-GPU configurations — when more than one GPU is
- * configured, @c sirius_config::enforce_sirius_datasource_for_multi_gpu()
- * forces this field to @c true because kvikio's per-FileHandle CUDA-context
- * binding breaks multi-GPU residency.
+ * @c use_sirius_datasource gates whether LOCAL parquet paths are claimed by
+ * the Sirius local-file backend in @c create_datasource. When false, local
+ * paths resolve to no datasource and reads fall back to
+ * @c cudf::io::datasource::create() (KvikIO); object-store paths (s3://)
+ * always resolve through their backend regardless. The local @c uring_ioctx
+ * itself is constructed unconditionally — the DuckDB-native GPU scan needs
+ * it for host reads. Only valid in single-GPU configurations — when more
+ * than one GPU is configured,
+ * @c sirius_config::enforce_sirius_datasource_for_multi_gpu() forces this
+ * field to @c true because kvikio's per-FileHandle CUDA-context binding
+ * breaks multi-GPU residency.
  */
 struct scan_manager_config {
   exec::thread_pool_config thread_pool{.num_threads = 8, .thread_name_prefix = "scan_manager"};
   bool use_sirius_datasource{false};
-  /// Reserved (not currently consumed). Intended size of the @c uring_reactor
-  /// pool, but the production @c uring_ioctx is built by @c SiriusContext, which
-  /// scales the reactor count with the number of GPUs the NUMA node serves
-  /// (@c clamp(4 * devices, 4, 16)) rather than reading this field. Parsed from
-  /// YAML and kept for forward compatibility / tests; setting it has no effect
-  /// on the engine today.
+  /// Size of the @c uring_reactor pool for the local-file backend. Since the
+  /// scan-manager cleanup (#913) the scan_manager constructs the @c uring_ioctx
+  /// itself and passes this through.
   std::size_t uring_n_reactors{4};
-  /// Reserved (not currently consumed). Intended io_uring submission/completion
-  /// queue depth per reactor; the production @c uring_ioctx hardcodes 64. Parsed
-  /// from YAML and kept for forward compatibility / tests; setting it has no
-  /// effect on the engine today.
+  /// io_uring submission/completion queue depth per reactor, passed through to
+  /// the scan_manager-constructed @c uring_ioctx.
   unsigned uring_ring_entries{64};
   /// Enable the prefetching cache.  Requires @c use_sirius_datasource=true;
-  /// when true, SiriusContext (S6) allocates a pinned-host buffer_pool and
-  /// initializes the cache on the IO backends it owns (the per-NUMA urings and
-  /// the s3_ioctx).  Off by default.
+  /// when true, the scan_manager allocates a pinned-host buffer_pool and
+  /// initializes the cache on the IO backends it constructs (the local uring
+  /// and the S3 backend).  Off by default.
   bool enable_prefetch_cache{false};
   /// Total pinned-host bytes reserved for the prefetch cache.  Rounded
   /// up to the nearest 500 MiB slab.  Ignored when
@@ -104,20 +102,21 @@ struct scan_manager_config {
   /// control).  Ignored when @c enable_prefetch_cache is false.
   std::size_t prefetch_inflight_budget_chunks{2048};
 
-  /// When true (default — current behavior), parquet_split_provider prewarms
-  /// per-row-group column-chunk byte ranges via @c cache->insert(obj,
-  /// metadata, ranges).  When false, prewarm is skipped: insert is called
-  /// with empty ranges (metadata-only, as in §24 describe_parquet).  Lets
-  /// the B1 micro-bench A/B compare prefetch overlap on SF10.  Ignored when
+  /// When true (default), the scan-side split build (parquet_gpu_ingestible)
+  /// prewarms the selected row groups' merged column-chunk byte ranges via
+  /// @c cache->insert(obj, metadata, ranges) once projection and row-group
+  /// pruning are final. When false, no ranges enter the cache at scan time
+  /// (describe_parquet's metadata-only insert is unaffected). Lets the
+  /// micro-bench A/B compare prefetch overlap on SF10. Ignored when
   /// @c enable_prefetch_cache is false (no cache → no prewarm regardless).
   bool enable_chunk_prewarm{true};
 
-  /// S3 backend opt-in. When set, SiriusContext (S6) constructs an @c s3_ioctx
-  /// from these credentials/knobs and hands it to the scan_manager as a borrowed
-  /// backend (the scan_manager itself constructs nothing). Default construction
-  /// (empty optional) leaves the S3 backend disabled. SiriusContext populates
-  /// this from object_store_config during initialize() when the engine config
-  /// requests S3.
+  /// S3 backend opt-in. When set, the scan_manager constructs and owns the S3
+  /// backend from these credentials/knobs — the async @c s3_ioctx or the
+  /// blocking @c s3_blocking_ioctx, selected by @c s3_use_async_backend.
+  /// Default construction (empty optional) leaves the S3 backend disabled.
+  /// SiriusContext populates this from object_store_config during initialize()
+  /// when the engine config requests S3.
   std::optional<sirius::io::s3::s3_ioctx_config> s3_config{};
 
   /// Selects which S3 backend the scan_manager builds when @c s3_config is set.
@@ -163,14 +162,14 @@ struct pinned_entry {
   /// chunked_parquet_reader::read_chunk() call.
   std::vector<cucascade::memory::memory_space*> chunk_memory_spaces;
   /// HOST-tier storage: one host_data_representation per chunk, each holding all
-  /// pinned columns. The cached_split_provider slices these by column index when
-  /// serving a particular scan. Populated by @ref insert_pinned_entry_host.
+  /// pinned columns. The pinned_table_gpu_ingestible slices these by column index
+  /// when serving a particular scan. Populated by @ref insert_pinned_entry_host.
   std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;
   /// Tier the pinned data resides in. Drives which storage member above is used
-  /// and which cached_split_provider variant @ref create_provider_for builds.
+  /// and which pinned_table_gpu_ingestible variant @ref create_ingestible_for builds.
   cucascade::memory::Tier tier{cucascade::memory::Tier::GPU};
   /// Memory space the pinned data resides in. Captured at pin time so the
-  /// cached_split_provider can wrap copied tables as data_batch instances.
+  /// pinned_table_gpu_ingestible can wrap copied tables as data_batch instances.
   cucascade::memory::memory_space* memory_space{nullptr};
   /// Total number of rows across all pinned chunks. Used by insert_pinned_entry
   /// to decide whether a re-insert merges into the existing entry (same row
@@ -244,7 +243,7 @@ class sirius_scan_manager {
   ///
   /// @param query        The query whose scan operators must be prepared.
   /// @param gpu_memory_spaces device_id -> GPU memory_space lookup used by the
-  ///                     HOST-tier cached_split_provider to materialize host
+  ///                     HOST-tier pinned_table_gpu_ingestible to materialize host
   ///                     chunks onto the executing GPU. Empty map disables the
   ///                     HOST-tier cache path (queries against a host pin fall
   ///                     through to parquet).
@@ -300,7 +299,7 @@ class sirius_scan_manager {
   ///
   /// Each entry in @p host_chunks describes one batch's worth of pinned data
   /// (covering all pinned columns) as a host_data_representation. The
-  /// cached_split_provider built from this entry slices each chunk by column
+  /// pinned_table_gpu_ingestible built from this entry slices each chunk by column
   /// index at scan time. Re-insert with a different row count drops the
   /// existing entry; otherwise the call replaces the entry's chunks.
   ///
@@ -334,23 +333,29 @@ class sirius_scan_manager {
     return _pinned_entries;
   }
 
-  /// \brief Open a datasource for @p path via the first backend that supports
-  /// it, or nullptr if no backend claims the path. NOT noexcept: opening the
-  /// backend handle (e.g. the S3 HEAD) may throw on an unreachable path -- a
-  /// missing object surfaces as an HTTP 404 -- and that must propagate.
+  /// \brief Resolve @p path to the IO backend that claims it and build a
+  /// sirius_datasource for it (the datasource carries its io context, io
+  /// object and any cached metadata).
+  ///
+  /// Returns nullptr when no backend claims the path (e.g. a local file with
+  /// no local backend configured) — callers fall back to
+  /// cudf::io::datasource::create. Throws when the claiming backend fails to
+  /// materialize the object: for S3 this performs a HEAD request, so
+  /// missing-key (404), authorization and network failures propagate as
+  /// exceptions for the query layer to surface — they must NOT terminate the
+  /// process (deliberately not noexcept).
   [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> create_datasource(
     std::string_view path) const;
 
-  /// \brief Whether parquet_split_provider should prewarm column-chunk byte
-  /// ranges via @c cache->insert(obj, metadata, ranges). Mirrors
-  /// @c scan_manager_config::enable_chunk_prewarm. False disables the
-  /// prewarm (insert is called with empty ranges — metadata-only, §24
-  /// describe_parquet shape), letting B1 micro-bench A/B prefetch overlap.
+  /// \brief Whether the scan-side split build should prewarm column-chunk
+  /// byte ranges via @c cache->insert(obj, metadata, ranges). Mirrors
+  /// @c scan_manager_config::enable_chunk_prewarm. False means no ranges are
+  /// inserted at scan time (describe_parquet stays metadata-only either way).
   [[nodiscard]] bool chunk_prewarm_enabled() const noexcept { return _config.enable_chunk_prewarm; }
 
   /// \brief Probe a parquet file's schema for the SQL bind path.
   ///
-  /// Resolves @p uri to a backend via @c io_ctx_for, fetches only the parquet
+  /// Resolves @p uri to a backend via @c create_datasource, fetches only the parquet
   /// footer (no full-file download), and infers the column types and names.
   /// When the resolved backend has a prefetch cache, the parsed footer is
   /// inserted as metadata-only so a subsequent scan reuses it instead of
@@ -374,8 +379,8 @@ class sirius_scan_manager {
   std::unique_ptr<sirius::exec::static_thread_pool> _s3_thread_pool;
   /// Owned io_context backends, in priority order. The first entry is the
   /// local-file backend (uring_ioctx); subsequent entries are object-store
-  /// backends (s3_ioctx). Per-path dispatch in io_ctx_for / io_ctx_shared_for
-  /// walks the vector and returns the first whose supports(path) is true.
+  /// backends (s3_ioctx). Per-path dispatch in create_datasource walks the
+  /// vector and uses the first whose supports(path) is true.
   std::vector<std::shared_ptr<sirius::io::sirius_ioctx>> _io_ctxs;
   std::unordered_map<op::scan::sirius_gpu_scan_operator*, std::unique_ptr<split_provider>>
     _providers_by_op;

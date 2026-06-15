@@ -76,3 +76,11 @@ repos:
       - id: cmake-lint
         args:
           [--line-width  220, --disabled-codes=C0307, --suppress-decorations]
+  - repo: local
+    hooks:
+      - id: check-orphan-tests
+        name: check for orphaned test files
+        entry: python3 scripts/check_orphan_tests.py
+        language: system
+        files: ^(test/cpp/.*\.cpp|CMakeLists\.txt|test/cpp/orphan_test_allowlist\.txt)$
+        pass_filenames: false

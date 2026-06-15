@@ -227,11 +227,13 @@ s3-test-aws-broker:
 	$(S3_TEST_BIN) "[s3][aws][broker]"
 
 # -----------------------------------------------------------------------------
-# S3 perf benchmark (Catch2 [!benchmark][perf][bench] hidden tag - not in the
-# default CI suite, and deliberately NOT tagged [s3] so the [s3] integration
-# gate does not pull the benchmark in). For the default local (SeaweedFS) backend the
-# harness auto-manages it (SIRIUS_TEST_S3_AUTO=1) and generates/uploads the
-# SF10 lineitem fixture (SIRIUS_TEST_S3_LARGE=1); the benchmark reads
+# S3 perf benchmarks. The portable SF10 benchmark uses the
+# [!benchmark][perf][bench] hidden tag and is deliberately NOT tagged [s3] so
+# the [s3] integration gate does not pull it in. The scripted async-vs-blocking
+# microbench is selected by [s3][benchmark]~[aws]. For the default local
+# (SeaweedFS) backend the harness auto-manages it (SIRIUS_TEST_S3_AUTO=1) and
+# generates/uploads the SF10 lineitem fixture (SIRIUS_TEST_S3_LARGE=1); the
+# benchmark reads
 # SIRIUS_BENCH_S3_* and falls back to the harness-published SIRIUS_TEST_S3_*.
 # Generates a JSON record under
 # build/release/extension/sirius/test/cpp/log/perf_<ts>.json for tracking.
@@ -248,4 +250,4 @@ s3-bench:
 	  export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_LARGE=1; \
 	fi; \
 	export SIRIUS_BENCH_GIT_SHA="$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"; \
-	$(S3_TEST_BIN) "[!benchmark][perf][bench]"
+	$(S3_TEST_BIN) "[!benchmark][perf][bench],[s3][benchmark]~[aws]"

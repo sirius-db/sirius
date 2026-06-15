@@ -21,7 +21,7 @@
 
 #include <cuda_runtime.h>
 
-#include <spdlog/spdlog.h>
+#include <log/logging.hpp>
 
 #include <algorithm>
 #include <cassert>
