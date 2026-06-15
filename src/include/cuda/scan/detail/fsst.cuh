@@ -41,7 +41,7 @@ constexpr uint32_t FSST_SCRATCH_U32_PER_WARP   = 256;
 constexpr uint32_t FSST_SCRATCH_BYTES_PER_WARP = FSST_SCRATCH_U32_PER_WARP * sizeof(uint32_t);
 constexpr uint32_t FSST_MAX_CHUNK_EMIT =
   cub::detail::warp_threads * 8;  ///< worst-case bytes emitted per 32B input chunk (8B max symbol)
-constexpr uint32_t FSST_WARPS_PER_CTA = BLOCK_DIM / cub::detail::warp_threads;
+constexpr uint32_t FSST_WARPS_PER_CTA = STRINGS_BLOCK_DIM / cub::detail::warp_threads;
 
 //! @brief Import an FSST symbol table from its on-disk blob into @p out.
 //!
@@ -112,9 +112,8 @@ warp_compute_decomp_len(uint8_t const* __restrict__ comp_ptr,
     uint8_t const my_byte = is_active ? comp_ptr[off + lane] : 0;
     int const is_esc      = is_active && my_byte == FSST_ESC ? 1 : 0;
 
-    auto const neighbor_is_esc =
-      ::cub::ShuffleUp<cub::detail::warp_threads>(is_esc, 1, 0, FULL_MASK);
-    auto const prev_is_esc = (lane == 0) ? prev_chunk_last_is_esc : neighbor_is_esc;
+    auto const neighbor_is_esc = cub::ShuffleUp<cub::detail::warp_threads>(is_esc, 1, 0, FULL_MASK);
+    auto const prev_is_esc     = (lane == 0) ? prev_chunk_last_is_esc : neighbor_is_esc;
 
     // Per-lane contribution: 0 for inactive / escape-sentinel;
     //                        1 for the literal byte that follows an escape;
@@ -137,7 +136,7 @@ warp_compute_decomp_len(uint8_t const* __restrict__ comp_ptr,
     // Broadcast whether the last byte in this 32B stripe was an escape for the next stripe.
     auto const last_active_lane = bytes_in_chunk - 1;
     prev_chunk_last_is_esc =
-      ::cub::ShuffleIndex<cub::detail::warp_threads>(is_esc, last_active_lane, FULL_MASK);
+      cub::ShuffleIndex<cub::detail::warp_threads>(is_esc, last_active_lane, FULL_MASK);
   }
   return total;
 }

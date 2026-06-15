@@ -148,7 +148,7 @@ void launch_uncomp_lengths(string_chunk_desc const* d_chunks,
                            rmm::cuda_stream_view stream)
 {
   if (n_chunks == 0) return;
-  kernel_compute_lengths_uncomp<<<n_chunks, BLOCK_DIM, 0, stream.value()>>>(
+  kernel_compute_lengths_uncomp<<<n_chunks, STRINGS_BLOCK_DIM, 0, stream.value()>>>(
     d_chunks, d_lengths, n_chunks);
 }
 
@@ -159,7 +159,7 @@ void launch_uncomp_gather(string_chunk_desc const* d_chunks,
                           rmm::cuda_stream_view stream)
 {
   if (n_chunks == 0) return;
-  kernel_gather_uncomp<<<n_chunks, BLOCK_DIM, 0, stream.value()>>>(
+  kernel_gather_uncomp<<<n_chunks, STRINGS_BLOCK_DIM, 0, stream.value()>>>(
     d_chunks, d_offsets, d_chars, n_chunks);
 }
 

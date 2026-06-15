@@ -64,12 +64,12 @@ namespace sirius::cuda::scan {
 
 namespace {
 
-constexpr uint32_t BLOCK_DIM         = 256;
-constexpr uint32_t VALUES_PER_THREAD = BP_META_GROUP_SIZE / BLOCK_DIM;
-static_assert(BLOCK_DIM * VALUES_PER_THREAD == BP_META_GROUP_SIZE,
-              "BLOCK_DIM and VPT must tile the metadata group exactly");
-static_assert(BLOCK_DIM % cub::detail::warp_threads == 0,
-              "BLOCK_DIM must be a multiple of warpSize for the DELTA_FOR "
+constexpr uint32_t BITPACK_BLOCK_DIM = 256;
+constexpr uint32_t VALUES_PER_THREAD = BP_META_GROUP_SIZE / BITPACK_BLOCK_DIM;
+static_assert(BITPACK_BLOCK_DIM * VALUES_PER_THREAD == BP_META_GROUP_SIZE,
+              "BITPACK_BLOCK_DIM and VALUES_PER_THREAD must tile the metadata group exactly");
+static_assert(BITPACK_BLOCK_DIM % cub::detail::warp_threads == 0,
+              "BITPACK_BLOCK_DIM must be a multiple of warpSize for the DELTA_FOR "
               "warp-aggregate scan");
 
 //===----------------------------------------------------------------------===//
@@ -259,7 +259,8 @@ __global__ void kernel_decode_bitpacking(detail::cta_block_desc const* __restric
   auto const n_packed_words = ::cuda::ceil_div(rc * width, WORD_BITS);
 
   // Stage the packed bytes into shared memory; one guard word covers unpack_value's straddle read.
-  detail::stage_packed_to_shmem<BLOCK_DIM>(shmem, packed_bytes, n_packed_words, /*guard_words=*/1);
+  detail::stage_packed_to_shmem<BITPACK_BLOCK_DIM>(
+    shmem, packed_bytes, n_packed_words, /*guard_words=*/1);
 
   //===--------------------------------------------------------------------===//
   // FOR -- frame + value.
@@ -271,8 +272,6 @@ __global__ void kernel_decode_bitpacking(detail::cta_block_desc const* __restric
     for (int v = 0; v < VALUES_PER_THREAD; ++v) {
       auto const idx = v * blockDim.x + threadIdx.x;
       if (idx >= rc) break;
-      // cub::ThreadStore deduces the store width from the value type, so cast the
-      // (integer-promoted) sum back to T — otherwise a small T stores 4 bytes.
       cub::ThreadStore<cub::STORE_CS>(out + idx,
                                       static_cast<T>(frame + unpack_value<T>(shmem, idx, width)));
     }
@@ -299,12 +298,12 @@ __global__ void kernel_decode_bitpacking(detail::cta_block_desc const* __restric
 
   // Stage 1 — per-warp inclusive scan of thread aggregates.
   using WarpScanT          = cub::WarpScan<T>;
-  auto constexpr NUM_WARPS = BLOCK_DIM / 32;
+  auto constexpr NUM_WARPS = BITPACK_BLOCK_DIM / cub::detail::warp_threads;
   __shared__ typename WarpScanT::TempStorage warp_scan_temp[NUM_WARPS];
   __shared__ T warp_aggregates[NUM_WARPS];
 
-  auto const warp_id = threadIdx.x / 32;
-  auto const lane_id = threadIdx.x % 32;
+  auto const warp_id = threadIdx.x / cub::detail::warp_threads;
+  auto const lane_id = threadIdx.x % cub::detail::warp_threads;
 
   T thread_agg = thread_data[VALUES_PER_THREAD - 1];
   T warp_inclusive;
@@ -378,7 +377,7 @@ void launch_typed(detail::cta_block_desc const* h_descs,
                                stream.value()));
 
   kernel_decode_bitpacking<T, SHMEM_BYTES>
-    <<<static_cast<uint32_t>(num_groups), BLOCK_DIM, 0, stream.value()>>>(
+    <<<static_cast<uint32_t>(num_groups), BITPACK_BLOCK_DIM, 0, stream.value()>>>(
       d_descs.data(), d_output, static_cast<uint32_t>(num_groups));
 }
 

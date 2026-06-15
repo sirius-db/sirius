@@ -71,7 +71,7 @@ namespace sirius::cuda::scan {
 namespace {
 
 /// Block dim used by every kernel in this file.
-constexpr uint32_t BLOCK_DIM = 256;
+constexpr uint32_t DECODE_BLOCK_DIM = 256;
 
 /// Maximum bytes one block of `kernel_batched_memcpy` copies.
 constexpr uint32_t COPY_CHUNK_BYTES = 64u << 10;
@@ -127,8 +127,8 @@ struct broadcast_dispatch {
     using StorageT = cudf::device_storage_type_t<T>;
     constexpr uint32_t TPV =
       (sizeof(StorageT) <= 8 && 16u % sizeof(StorageT) == 0) ? 16u / sizeof(StorageT) : 1u;
-    uint32_t blocks = std::max(1u, (row_count / TPV + BLOCK_DIM - 1) / BLOCK_DIM);
-    kernel_broadcast_constant<StorageT><<<blocks, BLOCK_DIM, 0, stream.value()>>>(
+    uint32_t blocks = std::max(1u, (row_count / TPV + DECODE_BLOCK_DIM - 1) / DECODE_BLOCK_DIM);
+    kernel_broadcast_constant<StorageT><<<blocks, DECODE_BLOCK_DIM, 0, stream.value()>>>(
       reinterpret_cast<StorageT*>(d_dest), reinterpret_cast<StorageT const*>(d_val_src), row_count);
   }
   // Strings, lists, structs etc. should never reach here — the public entry
@@ -281,7 +281,7 @@ void decode_uncompressed_data(gpu_codec_run const& run,
                                n * sizeof(copy_chunk_desc),
                                cudaMemcpyHostToDevice,
                                stream.value()));
-  kernel_batched_memcpy<<<static_cast<uint32_t>(n), BLOCK_DIM, 0, stream.value()>>>(
+  kernel_batched_memcpy<<<static_cast<uint32_t>(n), DECODE_BLOCK_DIM, 0, stream.value()>>>(
     d_chunks.data(), static_cast<uint32_t>(n));
 }
 

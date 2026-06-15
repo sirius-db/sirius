@@ -102,7 +102,7 @@ namespace sirius::cuda::scan {
 
 namespace {
 
-constexpr uint32_t BLOCK_DIM = 256;
+constexpr uint32_t ALP_BLOCK_DIM = 256;
 constexpr uint8_t ALP_MAX_FACTOR =
   static_cast<uint8_t>(std::extent_v<decltype(duckdb::AlpConstants::FACT_ARR)> - 1);
 
@@ -354,7 +354,7 @@ __global__ void kernel_decode_alp(detail::cta_block_desc const* __restrict__ des
   }
 
   //===----------Compressed----------===//
-  detail::stage_packed_to_shmem<BLOCK_DIM>(
+  detail::stage_packed_to_shmem<ALP_BLOCK_DIM>(
     shmem,
     sh_meta.packed_bytes_p,
     static_cast<uint32_t>(::cuda::ceil_div(sh_meta.packed_bytes_count, sizeof(uint32_t))),
@@ -415,7 +415,7 @@ void launch_alp_typed(detail::cta_block_desc const* h_descs,
                                stream.value()));
 
   kernel_decode_alp<MAX_PACKED_WORDS, T>
-    <<<static_cast<uint32_t>(num_vecs), BLOCK_DIM, 0, stream.value()>>>(
+    <<<static_cast<uint32_t>(num_vecs), ALP_BLOCK_DIM, 0, stream.value()>>>(
       d_descs.data(), d_output, static_cast<uint32_t>(num_vecs));
 }
 
@@ -564,9 +564,9 @@ __global__ void kernel_decode_alprd(detail::cta_block_desc const* __restrict__ d
     static_cast<uint32_t>(::cuda::ceil_div(sh_meta.right_packed_bytes_count, sizeof(uint32_t)));
   auto* left_words  = shmem;
   auto* right_words = shmem + left_live + 2;
-  detail::stage_packed_to_shmem<BLOCK_DIM>(
+  detail::stage_packed_to_shmem<ALP_BLOCK_DIM>(
     left_words, sh_meta.left_packed_bytes_p, left_live, /*guard_words=*/2);
-  detail::stage_packed_to_shmem<BLOCK_DIM>(
+  detail::stage_packed_to_shmem<ALP_BLOCK_DIM>(
     right_words, sh_meta.right_packed_bytes_p, right_live, /*guard_words=*/2);
   __syncthreads();
 
@@ -653,7 +653,7 @@ void launch_alprd_typed(detail::cta_block_desc const* h_descs,
                                stream.value()));
 
   kernel_decode_alprd<SHMEM_WORDS, T>
-    <<<static_cast<uint32_t>(num_vecs), BLOCK_DIM, 0, stream.value()>>>(
+    <<<static_cast<uint32_t>(num_vecs), ALP_BLOCK_DIM, 0, stream.value()>>>(
       d_descs.data(), d_output, static_cast<uint32_t>(num_vecs));
 }
 

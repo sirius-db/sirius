@@ -90,7 +90,7 @@ __device__ __forceinline__ bool parse_fsst_header(uint8_t const* base,
 //!
 //! Coalesced load of the symbol table blob for the segment into shared memory, then single-threaded
 //! parse into the fsst_decoder_compact format in global memory. One CTA per segment.
-__global__ __launch_bounds__(BLOCK_DIM) void kernel_build_fsst_decoders(
+__global__ __launch_bounds__(STRINGS_BLOCK_DIM) void kernel_build_fsst_decoders(
   string_chunk_desc const* __restrict__ descs,
   int num_segments,
   fsst_decoder_compact* __restrict__ d_decoders)
@@ -135,7 +135,7 @@ __global__ void kernel_compute_compressed_offsets_fsst(
   uint32_t const* __restrict__ d_fsst_row_starts,
   int num_segments)
 {
-  using BlockScanT = cub::BlockScan<uint32_t, BLOCK_DIM>;
+  using BlockScanT = cub::BlockScan<uint32_t, STRINGS_BLOCK_DIM>;
 
   __shared__ typename BlockScanT::TempStorage scan_temp;
   __shared__ bool sm_ok;
@@ -191,7 +191,7 @@ __global__ void kernel_compute_compressed_offsets_fsst(
 //!
 //! Each CTA dispatches per chunk between thread-per-row and warp-per-row based on the average
 //! compressed bytes per row.
-__global__ __launch_bounds__(BLOCK_DIM) void kernel_compute_decompressed_lengths_fsst(
+__global__ __launch_bounds__(STRINGS_BLOCK_DIM) void kernel_compute_decompressed_lengths_fsst(
   fsst_chunk_desc const* __restrict__ descs,
   uint32_t* __restrict__ d_lengths,
   uint32_t const* __restrict__ d_comp_offsets,
@@ -288,7 +288,7 @@ __global__ __launch_bounds__(BLOCK_DIM) void kernel_compute_decompressed_lengths
 //! @brief Gather kernel for FSST-compressed segments, with the same chunking as phase-C. Each warp
 //! walks the compressed byte stream for its row, decodes on the fly into a per-warp scratch buffer,
 //! and flushes to global when the next chunk's worst-case emit would overflow scratch.
-__global__ __launch_bounds__(BLOCK_DIM) void kernel_gather_fsst_chunked(
+__global__ __launch_bounds__(STRINGS_BLOCK_DIM) void kernel_gather_fsst_chunked(
   fsst_chunk_desc const* __restrict__ descs,
   int32_t const* __restrict__ d_offsets,
   uint8_t* __restrict__ d_chars,
@@ -434,12 +434,12 @@ void launch_fsst_lengths(fsst_decoder_compact* d_decoders,
   if (n_segments == 0) return;
   // On-device symbol-table parse: one CTA per segment, coalesced symtab load into
   // shmem then a single-thread parse into d_decoders.
-  kernel_build_fsst_decoders<<<n_segments, BLOCK_DIM, 0, stream.value()>>>(
+  kernel_build_fsst_decoders<<<n_segments, STRINGS_BLOCK_DIM, 0, stream.value()>>>(
     d_length_descs, n_segments, d_decoders);
   // A+B per-segment (prefix-sum state lives in one CTA); C per-chunk.
-  kernel_compute_compressed_offsets_fsst<<<n_segments, BLOCK_DIM, 0, stream.value()>>>(
+  kernel_compute_compressed_offsets_fsst<<<n_segments, STRINGS_BLOCK_DIM, 0, stream.value()>>>(
     d_comp_offsets, d_length_descs, d_row_starts, n_segments);
-  kernel_compute_decompressed_lengths_fsst<<<n_chunks, BLOCK_DIM, 0, stream.value()>>>(
+  kernel_compute_decompressed_lengths_fsst<<<n_chunks, STRINGS_BLOCK_DIM, 0, stream.value()>>>(
     d_gather_chunks, d_lengths, d_comp_offsets, d_decoders, n_chunks);
 }
 
@@ -452,7 +452,7 @@ void launch_fsst_gather(fsst_chunk_desc const* d_gather_chunks,
                         rmm::cuda_stream_view stream)
 {
   if (n_chunks == 0) return;
-  kernel_gather_fsst_chunked<<<n_chunks, BLOCK_DIM, 0, stream.value()>>>(
+  kernel_gather_fsst_chunked<<<n_chunks, STRINGS_BLOCK_DIM, 0, stream.value()>>>(
     d_gather_chunks, d_offsets, d_chars, d_comp_offsets, d_decoders, n_chunks);
 }
 

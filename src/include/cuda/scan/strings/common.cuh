@@ -93,9 +93,9 @@ struct alignas(8) dict_fsst_desc {
 };
 
 //----- Tuning constants -----------------------------------------------------//
-constexpr uint32_t BLOCK_DIM = 256;  // see FSST_WARPS_PER_CTA static_assert
+constexpr uint32_t STRINGS_BLOCK_DIM = 256;
 constexpr uint32_t MIN_ROWS_PER_CHUNK =
-  64;  ///< Minimum rows per segment chunk; BLOCK_DIM=256 threads -> 8 warps
+  64;  ///< Minimum rows per segment chunk; STRINGS_BLOCK_DIM=256 threads -> 8 warps
        ///< per chunk -> 8 rows per warp at this minimum.
 constexpr uint32_t MAX_BITPACKING_WIDTH = 32;
 
@@ -146,7 +146,7 @@ struct prepared_dict_fsst {
 constexpr uint32_t align_up8(uint32_t n) { return (n + 7u) & ~7u; }
 
 //! @brief Target CTA count for chunking segments: two full device waves at
-//! BLOCK_DIM threads. Cached per device.
+//! STRINGS_BLOCK_DIM threads. Cached per device.
 inline uint32_t get_target_ctas()
 {
   int device = 0;
@@ -156,7 +156,7 @@ inline uint32_t get_target_ctas()
   if (cached_device == device) return cached;
   cudaDeviceProp prop;
   RMM_CUDA_TRY(cudaGetDeviceProperties(&prop, device));
-  int occupancy_blocks = prop.maxThreadsPerMultiProcessor / BLOCK_DIM;
+  int occupancy_blocks = prop.maxThreadsPerMultiProcessor / STRINGS_BLOCK_DIM;
   cached_device        = device;
   cached               = static_cast<uint32_t>(prop.multiProcessorCount * occupancy_blocks * 2);
   return cached;
