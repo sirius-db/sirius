@@ -173,9 +173,9 @@ the producer and the engine operator the consumer; for a sink it is reversed. Th
 are ordinary Sirius **operators** that run as tasks on the existing scheduler/worker pool — there is **no
 dedicated thread pool** for them — while `nixl`'s own threads live in the **wrapper**. So each channel is a
 hand-off between wrapper threads and engine worker threads. The bounded channel is also the source's and
-sink's **only** queue — the operators hold no separate internal buffer. Any batching helper layered on top
-of the sink, such as the per-destination coalescer in §4, must be treated as an explicit bounded/accounted
-stage rather than as a hidden unbounded queue.
+sink's **only hand-off queue**. The partitioned sink may keep bounded per-destination coalescing state
+internally (see §4), but that state is part of the sink's accounted operator state, not a second unbounded
+queue.
 
 ```mermaid
 flowchart LR
@@ -222,18 +222,19 @@ A batch received by `nixl` is first wrapped as a repository-registered `data_bat
 channel carries a reference/handle to that registered batch. The streaming source consumes those channel
 entries, publishes work into the pipeline, and drives task creation as batches arrive; the GPU executor
 reserves memory **before** dispatching and runs on a per-device stream pool; the streaming sink emits results
-incrementally; the partitioned sink (#838) splits partitions across **per-destination** output channels so one
-slow receiver cannot head-of-line-block the others; `nixl` sends each output batch. Because partitioning
-fragments each batch into many small per-destination slices, the sink **coalesces** a destination's slices up
-to a size or time threshold before flushing one combined batch to its channel — otherwise we ship a flood of
-tiny RDMA transfers. That coalescing accumulator is itself bounded and repository-visible, so accumulated
-slices remain accounted and spillable while they wait to be concatenated/flushed.
+incrementally; the partitioned sink (#838) owns both partitioning and per-destination coalescing. It splits
+partitions across **per-destination** output channels so one slow receiver cannot head-of-line-block the
+others, and it coalesces a destination's small slices up to a size or time threshold before flushing one
+combined batch to that destination's channel — otherwise we ship a flood of tiny RDMA transfers. That
+coalescing state is bounded and repository-visible, so accumulated slices remain accounted and spillable
+while they wait to be concatenated/flushed. `nixl` sends each flushed output batch.
 
 The unit that flows everywhere is a `shared_ptr<cucascade::data_batch>` wrapping a `cudf::table` (GPU device
-buffers) or, for a host-staged receive, a host representation that will be materialized to GPU before compute,
-guarded by a 3-state reader/writer lock (`idle` / `read_only` / `mutable_locked`). Hand-off across a channel
-is **zero-copy with respect to the channel itself**: the `shared_ptr`/handle moves, the underlying
-representation does not move until an explicit tier conversion, copy-out, or coalescing concat requires it.
+buffers) or, for a fallback/topology-specific host-staged receive, a host representation that will be
+materialized to GPU before compute, guarded by a 3-state reader/writer lock (`idle` / `read_only` /
+`mutable_locked`). Hand-off across a channel is **zero-copy with respect to the channel itself**: the
+`shared_ptr`/handle moves, the underlying representation does not move until an explicit tier conversion,
+copy-out, or coalescing concat requires it.
 
 ```mermaid
 flowchart LR
@@ -247,13 +248,11 @@ flowchart LR
     src["streaming source — #836<br/>drives task creation"]:::proposed
     pipeRepo["pipeline repositories<br/>shared_ptr&lt;data_batch&gt;"]:::exists
     sched["task_scheduler + GPU executor<br/>reserve-before-dispatch · stream pool"]:::exists
-    sink["streaming sink — #837"]:::proposed
-    part["partition — #838"]:::proposed
-    coal["bounded coalesce per destination<br/>(repo-visible concat to threshold)"]:::proposed
-    repo -->|"ref / handle"| inCh --> src --> pipeRepo --> sched --> sink --> part --> coal
+    sink["partitioned streaming sink — #837/#838<br/>partition + bounded coalesce"]:::proposed
+    repo -->|"ref / handle"| inCh --> src --> pipeRepo --> sched --> sink
   end
   nixlIn -->|"wrap + register"| repo
-  coal -->|"per-destination"| outCh["output bounded channels"]:::proposed
+  sink -->|"per-destination"| outCh["output bounded channels"]:::proposed
   outCh --> nixlOut["nixl send"]:::priorart
   classDef exists fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#1a1a1a;
   classDef proposed fill:#fff8e1,stroke:#f9a825,stroke-width:2px,stroke-dasharray:5 4,color:#1a1a1a;
@@ -343,15 +342,16 @@ memory **reservations block** when the budget is exhausted, and the GPU executor
 ## §5 Cross-node transport with nixl
 
 `nixl` (NVIDIA Inference Xfer Library) moves registered buffers between CNs. The preferred path is
-GPU-to-GPU over GPUDirect RDMA; a deployment may also use host staging as the registered receive tier. At
-startup each CN creates one agent and computes its **local metadata** (`get_local_md`, covering its registered
-staging memory). The first transfer to a new peer exchanges that agent metadata over the side-channel, and
-both sides **cache it per peer** (invalidated on restart) — so later transfers skip the handshake. For each
-transfer the sender then exchanges **buffer** metadata over the side-channel; the receiver leases a
-**pre-registered staging buffer** (GPU or host; bump-allocated, RAII lease) and returns destination addresses;
-the sender issues the transfer and polls for completion; a `transfer_complete` handshake lets the receiver
-wrap the staged bytes as a repository-registered `data_batch` and enqueue a reference on the destination
-stream's input channel. If `nixl` is unavailable (or for a self-transfer), it falls back to a bRPC/CPU path.
+GPU-to-GPU over GPUDirect RDMA; host staging is fallback/topology-specific when a deployment cannot or should
+not use GPU-backed receive staging. At startup each CN creates one agent and computes its **local metadata**
+(`get_local_md`, covering its registered staging memory). The first transfer to a new peer exchanges that
+agent metadata over the side-channel, and both sides **cache it per peer** (invalidated on restart) — so
+later transfers skip the handshake. For each transfer the sender then exchanges **buffer** metadata over the
+side-channel; the receiver leases a **pre-registered staging buffer** (GPU by default, or host for the
+fallback/topology-specific path; bump-allocated, RAII lease) and returns destination addresses; the sender
+issues the transfer and polls for completion; a `transfer_complete` handshake lets the receiver wrap the
+staged bytes as a repository-registered `data_batch` and enqueue a reference on the destination stream's input
+channel. If `nixl` is unavailable (or for a self-transfer), it falls back to a bRPC/CPU path.
 
 ```mermaid
 sequenceDiagram
@@ -460,7 +460,7 @@ nodes).
 
 For an **all-to-all** exchange the scarce resource is the fixed receive-staging arena (its **leases**), not
 just total GPU bytes, and a logical plan DAG does not prevent a physical lease cycle (see §7). Option A
-therefore needs two further constraints:
+therefore needs three further constraints:
 
 1. **Lease-aware spill.** Generic spilling picks idle batches by memory *tier*, not by pool origin, so it
    frees GPU bytes without necessarily releasing a staging lease. Releasing a lease requires the received
@@ -471,8 +471,11 @@ therefore needs two further constraints:
    force the copy-out.
 2. **Reserved receive-staging floor.** Hold back a **non-borrowable** slice of staging (a credit budget)
    that compute can never consume, so there is always at least one receive lease available for progress.
-   Copying a staging-backed batch out also needs ordinary destination capacity (GPU/host/disk); how that
-   capacity is reserved is still an open liveness detail (§7).
+3. **Reserved copy-out credit.** Hold back a separate **non-borrowable** ordinary-memory credit for copying a
+   staging-backed batch out of receive staging. Without this, lease reclamation can still deadlock: the
+   receiver may have a staging lease to reclaim, but no destination capacity to copy the batch into. The first
+   implementation should prefer host/disk-backed credit, sized for one max receive batch or one chunked
+   copy-out unit, so forward progress does not steal GPU memory from compute.
 
 Eviction *ordering* (MRU vs LRU) is a secondary concern — the first-order contract is that spill can reclaim
 the **specific** lease progress needs, not which idle batch is chosen first.
@@ -520,10 +523,9 @@ reservation-aware adaptor `src/memory/sirius_memory_reservation_manager.cpp:42-4
 - **Accounting nixl buffers.** §6 covers the main case (staging arena reserved once; per-transfer leases are
   sub-allocations that skip cuCascade). Still open: accounting the **fallback** allocations
   (`cuMemAlloc` + register when the arena is full) and sizing the arena so the fallback stays rare.
-- **Copy-out destination credit.** §6 reserves a receive-staging floor, but lease reclamation also needs
-  capacity to copy a staging-backed batch into ordinary spillable memory. Decide whether that capacity is a
-  separate non-borrowable GPU/host/disk reservation, an emergency downgrade reservation, or part of the same
-  credit system.
+- **Copy-out credit sizing.** §6 chooses a separate non-borrowable copy-out credit. Still open: whether the
+  credit is sized by max receive batch, by a smaller chunked copy-out unit, or by a topology-specific profile,
+  and whether HOST should always be preferred before DISK for this reserve.
 - **Sink → nixl ownership.** How the sink obtains an owning `cudf::table` to feed the transfer. cuCascade
   `data_batch::release_or_copy_table()` (proposed in cuCascade PR #148; not available in the current tree)
   would do this safely at
