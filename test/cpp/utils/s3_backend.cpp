@@ -440,7 +440,7 @@ void maybe_upload_large_fixture(s3_endpoint const& http, fs::path const& cache_d
     fs::remove(db, ec);
     fs::remove(parquet_tmp, ec);
     std::string sql =
-      "INSTALL tpch; LOAD tpch; CALL dbgen(sf=10); "
+      "LOAD tpch; CALL dbgen(sf=10); "
       "COPY (SELECT * FROM lineitem) TO '" +
       parquet_tmp.string() + "' (FORMAT PARQUET);";
     int rc = run_process({duckdb_bin.string(), db.string(), "-c", sql});
