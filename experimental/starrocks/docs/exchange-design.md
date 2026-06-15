@@ -464,6 +464,9 @@ therefore needs two further constraints:
    that compute can never consume, so there is always room to copy out / reclaim a receive lease —
    guaranteeing forward progress even under a fully shared budget.
 
+Eviction *ordering* (MRU vs LRU) is a secondary concern — the first-order contract is that spill can reclaim
+the **specific** lease progress needs, not which idle batch is chosen first.
+
 ### Spill lifecycle of an exchange batch under option A
 
 This works **only because** the incoming batch is parked as a `data_batch` in a *registered* repository —
