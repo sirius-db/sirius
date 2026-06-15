@@ -17,17 +17,14 @@ flowchart LR
   l1["EXISTS today — in src/"]:::exists
   l2["PROPOSED — #835–#841, not yet built"]:::proposed
   l3["prior art — origin/doris experiment"]:::priorart
-  l4["MERGED, experimental — experimental/starrocks/"]:::merged
   classDef exists fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#1a1a1a;
   classDef proposed fill:#fff8e1,stroke:#f9a825,stroke-width:2px,stroke-dasharray:5 4,color:#1a1a1a;
   classDef priorart fill:#ede7f6,stroke:#6a1b9a,stroke-width:1.5px,stroke-dasharray:2 2,color:#1a1a1a;
-  classDef merged fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,color:#1a1a1a;
 ```
 
 - **Solid green** = already in the Super Sirius engine (`src/`).
 - **Dashed amber** = proposed in the StarRocks sub-issues.
 - **Dotted purple** = prior art that exists only on the `origin/doris` branch and is being adapted.
-- **Solid blue** = merged into the StarRocks experiment (`experimental/starrocks/`), not yet the core engine.
 
 ---
 
@@ -63,7 +60,6 @@ flowchart LR
   classDef exists fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#1a1a1a;
   classDef proposed fill:#fff8e1,stroke:#f9a825,stroke-width:2px,stroke-dasharray:5 4,color:#1a1a1a;
   classDef priorart fill:#ede7f6,stroke:#6a1b9a,stroke-width:1.5px,stroke-dasharray:2 2,color:#1a1a1a;
-  classDef merged fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,color:#1a1a1a;
 ```
 
 *Refs (prior art): `doris/crates/sirius-ffi/src/lib.rs:26-27,929,1006`
@@ -85,8 +81,8 @@ flowchart LR
   client -->|"SQL"| fe
   subgraph CN1["Sirius CN #1"]
     direction TB
-    w1["CN thrift / RPC skeleton"]:::merged
-    t1["plan translator → Substrait"]:::merged
+    w1["CN thrift / RPC skeleton"]:::proposed
+    t1["plan translator → Substrait"]:::proposed
     b1["sirius / sirius-sys (cxx)"]:::proposed
     e1["Sirius engine"]:::exists
     nx1["nixl agent"]:::priorart
@@ -108,11 +104,10 @@ flowchart LR
   classDef exists fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#1a1a1a;
   classDef proposed fill:#fff8e1,stroke:#f9a825,stroke-width:2px,stroke-dasharray:5 4,color:#1a1a1a;
   classDef priorart fill:#ede7f6,stroke:#6a1b9a,stroke-width:1.5px,stroke-dasharray:2 2,color:#1a1a1a;
-  classDef merged fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,color:#1a1a1a;
 ```
 
-*Refs: CN RPC skeleton merged (PR #856); plan translator merged (PR #852, #841 closed); cxx bindings #835
-(PR #908); nixl adapted from `doris/crates/doris-rpc/src/nixl_exchange.rs`.*
+*Refs: CN RPC skeleton (PR #856); plan translator (PR #852, #841); cxx bindings (#835, PR #908); nixl
+adapted from `doris/crates/doris-rpc/src/nixl_exchange.rs`.*
 
 ---
 
@@ -127,7 +122,7 @@ on another CN.
 ```mermaid
 flowchart TB
   tp["TExecPlanFragmentParams (thrift)"]:::proposed
-  tr["translate_fragment() — #841"]:::merged
+  tr["translate_fragment() — #841"]:::proposed
   sub["Substrait Plan"]:::proposed
   dd["DuckDB plan"]:::exists
   sp["Sirius streaming plan"]:::exists
@@ -152,7 +147,6 @@ flowchart TB
   classDef exists fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#1a1a1a;
   classDef proposed fill:#fff8e1,stroke:#f9a825,stroke-width:2px,stroke-dasharray:5 4,color:#1a1a1a;
   classDef priorart fill:#ede7f6,stroke:#6a1b9a,stroke-width:1.5px,stroke-dasharray:2 2,color:#1a1a1a;
-  classDef merged fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,color:#1a1a1a;
 ```
 
 *Refs: `#841` (Substrait→DuckDB→Sirius lowering); scan operators bind a `split_connector` today; the
@@ -202,7 +196,6 @@ flowchart LR
   classDef exists fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#1a1a1a;
   classDef proposed fill:#fff8e1,stroke:#f9a825,stroke-width:2px,stroke-dasharray:5 4,color:#1a1a1a;
   classDef priorart fill:#ede7f6,stroke:#6a1b9a,stroke-width:1.5px,stroke-dasharray:2 2,color:#1a1a1a;
-  classDef merged fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,color:#1a1a1a;
 ```
 
 > Today, operators source data **only** from scans (bound to a `split_connector`) or a pre-materialized
@@ -246,7 +239,6 @@ flowchart LR
   classDef exists fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#1a1a1a;
   classDef proposed fill:#fff8e1,stroke:#f9a825,stroke-width:2px,stroke-dasharray:5 4,color:#1a1a1a;
   classDef priorart fill:#ede7f6,stroke:#6a1b9a,stroke-width:1.5px,stroke-dasharray:2 2,color:#1a1a1a;
-  classDef merged fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,color:#1a1a1a;
 ```
 
 *Refs: operator hints `src/include/op/sirius_physical_operator.hpp:476,492`; reserve-before-dispatch +
@@ -314,7 +306,6 @@ flowchart LR
   classDef exists fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#1a1a1a;
   classDef proposed fill:#fff8e1,stroke:#f9a825,stroke-width:2px,stroke-dasharray:5 4,color:#1a1a1a;
   classDef priorart fill:#ede7f6,stroke:#6a1b9a,stroke-width:1.5px,stroke-dasharray:2 2,color:#1a1a1a;
-  classDef merged fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,color:#1a1a1a;
 ```
 
 Two things shape this. First, the **partitioned sink** (#838) gives each destination its **own** output
@@ -411,7 +402,6 @@ flowchart TB
   classDef exists fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#1a1a1a;
   classDef proposed fill:#fff8e1,stroke:#f9a825,stroke-width:2px,stroke-dasharray:5 4,color:#1a1a1a;
   classDef priorart fill:#ede7f6,stroke:#6a1b9a,stroke-width:1.5px,stroke-dasharray:2 2,color:#1a1a1a;
-  classDef merged fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,color:#1a1a1a;
 ```
 
 | Dimension | A: Shared cucascade mgr | B: Partitioned budget | C: Wrapper RMM allocator |
@@ -460,7 +450,6 @@ flowchart TB
   classDef exists fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#1a1a1a;
   classDef proposed fill:#fff8e1,stroke:#f9a825,stroke-width:2px,stroke-dasharray:5 4,color:#1a1a1a;
   classDef priorart fill:#ede7f6,stroke:#6a1b9a,stroke-width:1.5px,stroke-dasharray:2 2,color:#1a1a1a;
-  classDef merged fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,color:#1a1a1a;
 ```
 
 *Refs: single manager per context `src/include/sirius_context.hpp:340`, subclass of
@@ -470,22 +459,7 @@ reservation-aware adaptor `src/memory/sirius_memory_reservation_manager.cpp:42-4
 
 ---
 
-## §7 Open questions & mapping to issues
-
-### Mapping of diagram regions to tracked issues
-
-| Diagram region | Issue | Status |
-|---|---|---|
-| `sirius` / `sirius-sys` cxx bindings (CN ↔ Sirius boundary) | [#835](https://github.com/sirius-db/sirius/issues/835) | in progress — PR #908 (scaffolding) |
-| Streaming source op + input channels | [#836](https://github.com/sirius-db/sirius/issues/836) | proposed |
-| Streaming sink op + output channels | [#837](https://github.com/sirius-db/sirius/issues/837) | proposed |
-| Partitioned sink (per-destination output streams) | [#838](https://github.com/sirius-db/sirius/issues/838) | proposed |
-| Stream session (`push` / `close_input` / `pull` / `wait`, route by stream id) | [#839](https://github.com/sirius-db/sirius/issues/839) | proposed |
-| Resource-management API (3 options) | [#840](https://github.com/sirius-db/sirius/issues/840) | proposed |
-| Plan fragment → Substrait translation | [#841](https://github.com/sirius-db/sirius/issues/841) | done — PR #852 merged (#841 closed) |
-| CN thrift / RPC (`exec_plan_fragment`, `transmit_data`) | [#826](https://github.com/sirius-db/sirius/issues/826) / PR #856 | skeleton merged (PR #856); exec/transmit still `NOT_IMPLEMENTED` stubs |
-
-### Open questions
+## §7 Open questions
 
 - **#840 — sharing model.** Which model ships first (recommendation: A). How borrow/lifetime and
   reentrancy of a shared manager across **concurrent queries** is handled, and where cross-domain
@@ -496,7 +470,7 @@ reservation-aware adaptor `src/memory/sirius_memory_reservation_manager.cpp:42-4
 - **Accounting nixl buffers.** Under every option, `nixl`'s registered/staging GPU buffers must be counted
   against the budget; otherwise the boundary OOMs even when "Sirius" looks within budget.
 - **Sink → nixl ownership.** How the sink obtains an owning `cudf::table` to feed the transfer. cuCascade
-  `data_batch::release_or_copy_table()` (cuCascade PR #148, once merged + bumped) does this safely at
+  `data_batch::release_or_copy_table()` (cuCascade PR #148) does this safely at
   runtime: a zero-copy **steal** when the sink is the sole owner (`use_count()==1`), or a deep **copy** when
   the batch is still shared (broadcast to several peers, or still parked in the repository for spill). Open
   tension: keeping a batch repository-registered for spill means `use_count()>1` at send time → copy; a
