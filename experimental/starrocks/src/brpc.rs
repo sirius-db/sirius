@@ -1,4 +1,7 @@
-use std::{future::Future, net::TcpListener as StdTcpListener};
+use std::{
+    future::Future,
+    net::{SocketAddr, TcpListener as StdTcpListener},
+};
 
 use crate::{
     compute_node_service::SiriusComputeNodeService,
@@ -11,7 +14,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tower::{Service, ServiceExt};
-use tracing::{info, warn};
+use tracing::{info, instrument, warn};
 
 /// BRPC service runner for StarRocks PInternalService.
 pub struct BrpcServer {
@@ -160,10 +163,11 @@ where
                     match accepted {
                         // Spawn per connection (tonic-style) so a slow or long-lived peer cannot
                         // block the accept loop, and so one connection's failure stays isolated.
-                        Ok((stream, _addr)) => {
+                        Ok((stream, peer)) => {
                             connections.spawn(Self::handle_connection(
                                 service.clone(),
                                 stream,
+                                peer,
                                 shutdown.clone(),
                             ));
                         }
@@ -186,7 +190,13 @@ where
 
     /// Reads PRPC frames from one connection and writes one response per request. Read, decode,
     /// and write failures are logged and close only this connection, never the whole server.
-    async fn handle_connection(mut service: S, mut stream: TcpStream, shutdown: CancellationToken) {
+    #[instrument(skip_all, fields(peer = %peer))]
+    async fn handle_connection(
+        mut service: S,
+        mut stream: TcpStream,
+        peer: SocketAddr,
+        shutdown: CancellationToken,
+    ) {
         loop {
             let frame = tokio::select! {
                 _ = shutdown.cancelled() => return,

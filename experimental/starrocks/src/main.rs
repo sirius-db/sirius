@@ -1,6 +1,7 @@
-use std::time::Duration;
+use std::{num::NonZeroU32, time::Duration};
 
 use anyhow::{Result, anyhow};
+use backon::{ExponentialBuilder, Retryable};
 use clap::Parser;
 use sirius_starrocks_cn::{
     BackendServer, BackendServerShutdown, BrpcServer, ComputeNodeConfig, FeConfig, HeartbeatServer,
@@ -8,9 +9,13 @@ use sirius_starrocks_cn::{
     start_backend_server, start_heartbeat_server,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, instrument, warn};
+use tracing_subscriber::fmt::format::FmtSpan;
 
+// Initial delay for the startup registration backoff; doubles up to the cap on each retry.
 const REGISTRATION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+// Upper bound on the exponential backoff delay so a large attempt count stays bounded.
+const REGISTRATION_MAX_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const REGISTRATION_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(30);
 // StarRocks BEs/CNs regularly report inventory; this skeleton reports empty state.
@@ -34,12 +39,13 @@ struct Args {
 #[derive(Clone, Debug, clap::Args)]
 struct RegistrationConfig {
     /// Maximum FE registration attempts before startup fails.
-    #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u32).range(1..))]
-    registration_max_attempts: u32,
+    #[arg(long, default_value_t = NonZeroU32::new(120).expect("nonzero literal"))]
+    registration_max_attempts: NonZeroU32,
 }
 
 impl Args {
     /// Starts the CN listeners, registers with FE, and waits for shutdown.
+    #[instrument(name = "compute_node", skip_all)]
     async fn run(self) -> Result<()> {
         let state = SharedHeartbeatState::new();
 
@@ -80,40 +86,36 @@ impl Args {
 }
 
 impl RegistrationConfig {
-    /// Registers the compute node with retry handling used during startup.
+    /// Registers the compute node with FE, retrying with exponential backoff during FE startup
+    /// or transient failures up to the configured maximum number of attempts.
+    #[instrument(skip_all, fields(max_attempts = self.registration_max_attempts.get()))]
     async fn register_node_with_retries(
         &self,
         fe: &FeConfig,
         compute_node: &ComputeNodeConfig,
     ) -> Result<()> {
-        if self.registration_max_attempts == 0 {
-            return Err(anyhow!("registration-max-attempts must be at least 1"));
-        }
+        let max_attempts = self.registration_max_attempts.get();
+        // `with_max_times` counts retries after the first attempt, so total tries == max_attempts.
+        let backoff = ExponentialBuilder::default()
+            .with_min_delay(REGISTRATION_RETRY_INTERVAL)
+            .with_max_delay(REGISTRATION_MAX_RETRY_INTERVAL)
+            .with_max_times(max_attempts as usize - 1);
 
-        for attempt in 1..=self.registration_max_attempts {
-            match register_node(fe, compute_node).await {
-                Ok(()) => return Ok(()),
-                Err(err) => {
-                    if attempt == self.registration_max_attempts {
-                        return Err(anyhow!(
-                            "failed to register compute node with FE after {} attempts: {err}",
-                            self.registration_max_attempts
-                        ));
-                    }
-
-                    warn!(
-                        error = %err,
-                        attempt,
-                        max_attempts = self.registration_max_attempts,
-                        retry_after_secs = REGISTRATION_RETRY_INTERVAL.as_secs(),
-                        "failed to register compute node with FE; retrying"
-                    );
-                    tokio::time::sleep(REGISTRATION_RETRY_INTERVAL).await;
-                }
-            }
-        }
-
-        unreachable!("registration attempts loop always returns")
+        (|| register_node(fe, compute_node))
+            .retry(backoff)
+            .notify(|err, delay| {
+                warn!(
+                    error = %err,
+                    retry_after_secs = delay.as_secs(),
+                    "failed to register compute node with FE; retrying"
+                );
+            })
+            .await
+            .map_err(|err| {
+                anyhow!(
+                    "failed to register compute node with FE after {max_attempts} attempts: {err}"
+                )
+            })
     }
 }
 
@@ -370,6 +372,8 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "sirius_starrocks_cn=info,info".into()),
         )
+        // Emit span close events so instrumented spans report their busy/idle timings.
+        .with_span_events(FmtSpan::CLOSE)
         .init();
 
     Args::parse().run().await

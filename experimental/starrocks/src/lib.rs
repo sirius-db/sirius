@@ -42,7 +42,7 @@ use thrift::{
         TWriteTransportFactory,
     },
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info, instrument, warn};
 
 mod brpc;
 mod compute_node_service;
@@ -1038,6 +1038,7 @@ fn listener_wake_addr(local_addr: SocketAddr) -> SocketAddr {
 }
 
 /// Sends one empty inventory report to FE if heartbeat has provided FE address and CN id.
+#[instrument(skip_all)]
 pub fn report_to_frontend_once(
     node: &ComputeNodeConfig,
     state: &SharedHeartbeatState,
@@ -1161,6 +1162,16 @@ fn build_report_request(
     )
 }
 
+/// Registers the compute node with FE over the MySQL protocol.
+#[instrument(
+    skip_all,
+    fields(
+        fe_host = %fe.host,
+        fe_query_port = fe.query_port,
+        advertise_host = %node.advertise_host,
+        heartbeat_port = node.heartbeat_port,
+    )
+)]
 pub async fn register_node(fe: &FeConfig, node: &ComputeNodeConfig) -> Result<()> {
     let opts = OptsBuilder::default()
         .ip_or_hostname(fe.host.to_string())

@@ -12,6 +12,7 @@ resolver = "2"
 
 [workspace.dependencies]
 anyhow = "1"
+backon = { version = "1", default-features = false, features = ["tokio-sleep"] }
 clap = { version = "4", features = ["derive", "env"] }
 mysql_async = { version = "0.36", default-features = false, features = ["minimal-rust"] }
 # Keep this stack aligned so `substrait-explain` can format the same protobuf
@@ -36,6 +37,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dependencies]
 anyhow.workspace = true
+backon.workspace = true
 clap.workspace = true
 mysql_async.workspace = true
 prost.workspace = true

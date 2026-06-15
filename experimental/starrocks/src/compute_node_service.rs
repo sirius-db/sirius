@@ -11,7 +11,7 @@ use thrift::{
     protocol::{TBinaryInputProtocol, TSerializable},
     transport::TBufferChannel,
 };
-use tracing::info;
+use tracing::{info, instrument};
 
 /// Sirius compute-node implementation of StarRocks PInternalService.
 ///
@@ -38,6 +38,7 @@ impl PInternalService for SiriusComputeNodeService {
     /// An OK status here means the fragment was accepted and translated, which is the correct
     /// dispatch-RPC response; actually executing the fragment and streaming results back is a
     /// separate, not-yet-implemented RPC surface (see the PR notes).
+    #[instrument(skip_all)]
     async fn exec_plan_fragment(
         &self,
         request: PExecPlanFragmentRequest,
@@ -54,6 +55,7 @@ impl PInternalService for SiriusComputeNodeService {
     }
 
     /// Handles FE batch fragment dispatch by translating every per-instance fragment.
+    #[instrument(skip_all)]
     async fn exec_batch_plan_fragments(
         &self,
         request: PExecBatchPlanFragmentsRequest,
@@ -133,6 +135,7 @@ impl SiriusComputeNodeService {
     }
 
     /// Converts a StarRocks thrift plan fragment to Substrait and logs substrait-explain output.
+    #[instrument(skip_all)]
     fn translate_and_log_fragment(
         &self,
         params: &TExecPlanFragmentParams,
