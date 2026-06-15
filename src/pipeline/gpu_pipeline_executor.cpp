@@ -202,14 +202,6 @@ void gpu_pipeline_executor::manager_loop()
         break;
       }
 
-      gpu_task->telemetry_handle().reserving({
-        .instance_name              = "",
-        .requested_bytes            = reservation_info.reservation_size,
-        .input_basis                = reservation_info.input_basis,
-        .peak_estimate              = reservation_info.peak_memory_estimate,
-        .bytes_to_materialize       = reservation_info.bytes_to_materialize_input,
-        .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
-      });
       if (new_reservation) {
         reservation = std::move(new_reservation);
       } else {

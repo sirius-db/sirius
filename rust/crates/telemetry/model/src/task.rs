@@ -134,14 +134,17 @@ fsm! {
             // GPU tasks reserve after being popped from an executor queue.
             queued => reserving,
 
-            // The reservation request could not be fully satisfied, so the task asks the
-            // downgrade path to reduce required work/input.
+            // The reservation request could not be fully satisfied, so the task invokes
+            // a downgrade request to free up space.
             reserving => downgrading,
-            // A task retries reservation after a downgrade request was completed
-            downgrading => reserving,
+
 
             // Reservation succeeded and the task is ready to be prepared on a worker.
             reserving => preparing,
+            // A task may fail to acquire a reservation right-away, and requests the engine to free up space
+            // via downgrading to retry the reservation, which, if successful, allows the task to start preparing.
+            downgrading => preparing,
+
 
             // Worker preparation completed and operator execution has started.
             preparing => computing,
@@ -163,7 +166,7 @@ fsm! {
             routing => finalizing,
             // Reservation could fail.
             reserving => finalizing,
-            // Downgrade request can be cancelled/fail before returning.
+            // Downgrade request can be canceled/fail before returning.
             downgrading => finalizing,
             // Upgrading data to required tier might fail.
             preparing => finalizing,
