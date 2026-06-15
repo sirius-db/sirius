@@ -34,6 +34,10 @@ impl SiriusComputeNodeService {
 
 impl PInternalService for SiriusComputeNodeService {
     /// Handles a single FE-dispatched plan fragment thrift attachment.
+    ///
+    /// An OK status here means the fragment was accepted and translated, which is the correct
+    /// dispatch-RPC response; actually executing the fragment and streaming results back is a
+    /// separate, not-yet-implemented RPC surface (see the PR notes).
     async fn exec_plan_fragment(
         &self,
         request: PExecPlanFragmentRequest,
@@ -180,7 +184,8 @@ impl SiriusComputeNodeService {
         }
     }
 
-    /// StarRocks OK status.
+    /// StarRocks OK status. For these RPCs OK means "fragment accepted and translated", not
+    /// "fragment executed" — execution and result delivery are not implemented yet.
     fn ok_status() -> StatusPb {
         StatusPb {
             status_code: TStatusCode::OK.0,

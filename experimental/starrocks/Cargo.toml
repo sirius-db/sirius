@@ -20,6 +20,10 @@ mysql_async = { version = "0.36", default-features = false, features = ["minimal
 prost = "0.14"
 prost-build = "0.14"
 heck = "0.5"
+prettyplease = "0.2"
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full", "parsing"] }
 substrait = "0.62.2"
 substrait-explain = "0.3.2"
 thiserror = "2"
@@ -47,4 +51,8 @@ tracing-subscriber.workspace = true
 
 [build-dependencies]
 heck.workspace = true
+prettyplease.workspace = true
+proc-macro2.workspace = true
 prost-build.workspace = true
+quote.workspace = true
+syn.workspace = true

@@ -14,8 +14,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 const PRPC_MAGIC: &[u8; 4] = b"PRPC";
 const PRPC_HEAD_SIZE: usize = 12;
 const MAX_PRPC_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
+// Cap the up-front body allocation so a frame that declares a large size but never sends the
+// bytes cannot pin `MAX_PRPC_MESSAGE_SIZE` per connection; the buffer grows as data arrives.
+const PRPC_READ_CHUNK: usize = 64 * 1024;
 const PRPC_SUCCESS: i32 = 0;
+// brpc/baidu-rpc status codes: ENOSERVICE/ENOMETHOD are distinct, and EINTERNAL covers the rest.
 const PRPC_SERVICE_NOT_FOUND: i32 = 1001;
+const PRPC_METHOD_NOT_FOUND: i32 = 1002;
 const PRPC_ERROR: i32 = 2001;
 
 /// Decoded PRPC request passed from the transport layer to a Tower service.
@@ -87,7 +92,10 @@ impl Error {
 
     /// Returns a PRPC error for an unknown method name.
     pub(crate) fn method_not_found(text: impl Into<String>) -> Self {
-        Self::service_not_found(text)
+        Self {
+            code: PRPC_METHOD_NOT_FOUND,
+            text: text.into(),
+        }
     }
 
     /// Returns the default generated-service response for an RPC we do not implement.
@@ -176,7 +184,8 @@ impl Frame {
                 }),
                 compress_type: Some(0),
                 correlation_id: self.meta.correlation_id,
-                attachment_size: Some(attachment.len().min(i32::MAX as usize) as i32),
+                // `encode` is the single source of truth for attachment_size; leave it unset here.
+                attachment_size: None,
                 chunk_info: None,
                 authentication_data: None,
                 stream_settings: None,
@@ -189,7 +198,7 @@ impl Frame {
 
     /// Builds a request frame without going through the TCP reader.
     #[cfg(test)]
-    fn for_request(
+    pub(crate) fn for_request(
         service_name: impl Into<String>,
         method_name: impl Into<String>,
         body: Vec<u8>,
@@ -242,10 +251,7 @@ impl Frame {
         }
 
         let sizes = FrameSizes::parse_header(&header)?;
-        let mut payload = vec![0u8; sizes.message_size];
-        stream
-            .read_exact(&mut payload)
-            .context("failed to read PRPC body")?;
+        let payload = read_payload_sync(stream, sizes.message_size)?;
         Self::decode_payload(sizes.meta_size, payload).map(Some)
     }
 
@@ -268,11 +274,7 @@ impl Frame {
         }
 
         let sizes = FrameSizes::parse_header(&header)?;
-        let mut payload = vec![0u8; sizes.message_size];
-        stream
-            .read_exact(&mut payload)
-            .await
-            .context("failed to read PRPC body")?;
+        let payload = read_payload(stream, sizes.message_size).await?;
         Self::decode_payload(sizes.meta_size, payload).map(Some)
     }
 
@@ -350,6 +352,37 @@ impl Frame {
             attachment,
         })
     }
+}
+
+/// Reads exactly `len` bytes from an async stream, growing the buffer in bounded chunks so a
+/// large declared size cannot force a full up-front allocation before the bytes arrive.
+async fn read_payload(stream: &mut (impl AsyncRead + Unpin), len: usize) -> Result<Vec<u8>> {
+    let mut payload = Vec::with_capacity(len.min(PRPC_READ_CHUNK));
+    while payload.len() < len {
+        let chunk = (len - payload.len()).min(PRPC_READ_CHUNK);
+        let start = payload.len();
+        payload.resize(start + chunk, 0);
+        stream
+            .read_exact(&mut payload[start..])
+            .await
+            .context("failed to read PRPC body")?;
+    }
+    Ok(payload)
+}
+
+/// Synchronous counterpart to [`read_payload`] used by the test frame reader.
+#[cfg(test)]
+fn read_payload_sync(stream: &mut impl Read, len: usize) -> Result<Vec<u8>> {
+    let mut payload = Vec::with_capacity(len.min(PRPC_READ_CHUNK));
+    while payload.len() < len {
+        let chunk = (len - payload.len()).min(PRPC_READ_CHUNK);
+        let start = payload.len();
+        payload.resize(start + chunk, 0);
+        stream
+            .read_exact(&mut payload[start..])
+            .context("failed to read PRPC body")?;
+    }
+    Ok(payload)
 }
 
 /// Decoded payload sizes from the fixed PRPC header.

@@ -1,11 +1,15 @@
-use std::{future::Future, net::TcpListener as StdTcpListener, pin::Pin};
+use std::{future::Future, net::TcpListener as StdTcpListener};
 
 use crate::{
     compute_node_service::SiriusComputeNodeService,
     proto::starrocks::p_internal_service_brpc::PInternalServiceRouter, prpc,
 };
 use anyhow::{Context, Result};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    task::JoinSet,
+};
+use tokio_util::sync::CancellationToken;
 use tower::{Service, ServiceExt};
 use tracing::{info, warn};
 
@@ -96,7 +100,11 @@ impl<S> BrpcServiceServer<S> {
 
 impl<S> BrpcServiceServer<S>
 where
-    S: Service<prpc::Request, Response = prpc::Response, Error = prpc::Error>,
+    S: Service<prpc::Request, Response = prpc::Response, Error = prpc::Error>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send,
 {
     /// Serves BRPC requests on `bind_host:brpc_port` until the task is cancelled.
     pub async fn serve(self, bind_host: &str, brpc_port: u16) -> Result<()> {
@@ -139,7 +147,10 @@ where
         info!(address = %local_addr, "starting BRPC server");
         let listener =
             TcpListener::from_std(listener).context("failed to create async BRPC listener")?;
-        let mut service = self.service;
+        let service = self.service;
+        // An internal token fans the external shutdown signal out to every spawned connection.
+        let shutdown = CancellationToken::new();
+        let mut connections = JoinSet::new();
         tokio::pin!(signal);
 
         loop {
@@ -147,52 +158,69 @@ where
                 _ = signal.as_mut() => break,
                 accepted = listener.accept() => {
                     match accepted {
+                        // Spawn per connection (tonic-style) so a slow or long-lived peer cannot
+                        // block the accept loop, and so one connection's failure stays isolated.
                         Ok((stream, _addr)) => {
-                            if Self::handle_connection(&mut service, stream, signal.as_mut()).await? == ConnectionExit::Shutdown {
-                                break;
-                            }
+                            connections.spawn(Self::handle_connection(
+                                service.clone(),
+                                stream,
+                                shutdown.clone(),
+                            ));
                         }
                         Err(err) => warn!(error = %err, "failed to accept BRPC connection"),
                     }
                 },
+                // Reap finished connection tasks as they complete so the set does not grow with
+                // the total number of historical connections on a long-running server.
+                Some(_joined) = connections.join_next(), if !connections.is_empty() => {}
             }
         }
+
+        // Ask in-flight connections to stop, then drain them for a graceful shutdown.
+        shutdown.cancel();
+        while connections.join_next().await.is_some() {}
 
         info!("BRPC server stopped");
         Ok(())
     }
 
-    /// Reads PRPC frames from one connection and writes one response per request.
-    async fn handle_connection(
-        service: &mut S,
-        mut stream: TcpStream,
-        mut signal: Pin<&mut impl Future<Output = ()>>,
-    ) -> Result<ConnectionExit>
-    where
-        S: Service<prpc::Request, Response = prpc::Response, Error = prpc::Error>,
-    {
+    /// Reads PRPC frames from one connection and writes one response per request. Read, decode,
+    /// and write failures are logged and close only this connection, never the whole server.
+    async fn handle_connection(mut service: S, mut stream: TcpStream, shutdown: CancellationToken) {
         loop {
             let frame = tokio::select! {
-                _ = signal.as_mut() => return Ok(ConnectionExit::Shutdown),
-                frame = prpc::Frame::read_async(&mut stream) => frame?,
+                _ = shutdown.cancelled() => return,
+                frame = prpc::Frame::read_async(&mut stream) => frame,
             };
-            let Some(frame) = frame else {
-                return Ok(ConnectionExit::Closed);
+            let frame = match frame {
+                Ok(Some(frame)) => frame,
+                // A clean connection close ends this task.
+                Ok(None) => return,
+                // A malformed/unsupported frame or transport error closes only this connection.
+                Err(err) => {
+                    warn!(error = %err, "failed to read PRPC frame; closing connection");
+                    return;
+                }
             };
 
             let response = match frame.request() {
                 Ok(request) => {
                     tokio::select! {
-                        _ = signal.as_mut() => return Ok(ConnectionExit::Shutdown),
-                        response = Self::call_service(service, request) => response,
+                        _ = shutdown.cancelled() => return,
+                        response = Self::call_service(&mut service, request) => response,
                     }
                 }
                 Err(err) => Err(err),
             };
             let response_frame = frame.into_response_frame(response);
             tokio::select! {
-                _ = signal.as_mut() => return Ok(ConnectionExit::Shutdown),
-                result = response_frame.write_async(&mut stream) => result?,
+                _ = shutdown.cancelled() => return,
+                result = response_frame.write_async(&mut stream) => {
+                    if let Err(err) = result {
+                        warn!(error = %err, "failed to write PRPC response; closing connection");
+                        return;
+                    }
+                }
             }
         }
     }
@@ -201,27 +229,16 @@ where
     async fn call_service(
         service: &mut S,
         request: prpc::Request,
-    ) -> std::result::Result<prpc::Response, prpc::Error>
-    where
-        S: Service<prpc::Request, Response = prpc::Response, Error = prpc::Error>,
-    {
+    ) -> std::result::Result<prpc::Response, prpc::Error> {
         service.ready().await?.call(request).await
     }
-}
-
-/// Outcome of processing one accepted BRPC connection.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ConnectionExit {
-    /// The peer closed the connection normally.
-    Closed,
-    /// The server shutdown signal resolved while the connection was active.
-    Shutdown,
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
         future::{Ready, ready},
+        io::{Read, Write},
         net::TcpStream as StdTcpStream,
         task::{Context, Poll},
         thread,
@@ -229,6 +246,57 @@ mod tests {
 
     use super::*;
     use tokio_util::sync::CancellationToken;
+
+    /// A malformed frame from one peer must close only that connection; the server keeps
+    /// accepting and serving later connections instead of crashing the whole process.
+    #[test]
+    fn brpc_server_isolates_bad_frame_and_keeps_serving() {
+        let listener = match BrpcServer::bind("127.0.0.1", 0) {
+            Ok(listener) => listener,
+            Err(err) if is_permission_denied(&err) => return,
+            Err(err) => panic!("{err:?}"),
+        };
+        let addr = listener.local_addr().unwrap();
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let join = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .build()
+                .unwrap();
+            runtime.block_on(
+                BrpcServiceServer::with_service(EmptyService)
+                    .serve_with_listener_shutdown(listener, server_shutdown.cancelled_owned()),
+            )
+        });
+
+        // First connection sends garbage; the server should drop just this connection. The read
+        // returns once the server closes the socket (EOF, or a reset because unread bytes remain),
+        // confirming the server handled the bad frame and closed it rather than dying.
+        let mut bad = StdTcpStream::connect(addr).unwrap();
+        bad.write_all(b"not a valid prpc frame").unwrap();
+        let mut drained = Vec::new();
+        let _ = bad.read_to_end(&mut drained);
+
+        // A second connection with a well-formed frame still gets a response.
+        let request = prpc::Frame::for_request(
+            "PInternalService",
+            "exec_plan_fragment",
+            b"body".to_vec(),
+            Vec::new(),
+            Some(7),
+        );
+        let mut good = StdTcpStream::connect(addr).unwrap();
+        good.write_all(&request.encode()).unwrap();
+        let response = prpc::Frame::read(&mut good).unwrap();
+        assert!(
+            response.is_some(),
+            "server should still serve a second connection after a bad frame"
+        );
+
+        shutdown.cancel();
+        join.join().unwrap().unwrap();
+    }
 
     /// Verifies BRPC shutdown cancels an accepted connection waiting for PRPC input.
     #[test]
