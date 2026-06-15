@@ -341,12 +341,31 @@ run_single_session() {
     TOTAL_ELAPSED=$(echo "$END_TIME - $START_TIME" | bc)
     echo "Total wall-clock time: ${TOTAL_ELAPSED}s"
 
+    local SESSION_OUTPUT_FILE
+    if [ -n "${OUTPUT_DIR:-}" ]; then
+        SESSION_OUTPUT_FILE="$OUTPUT_DIR/session_output.txt"
+    else
+        SESSION_OUTPUT_FILE="$PROJECT_DIR/session_output_${ENGINE}_sf${SF}.txt"
+    fi
+    printf '%s\n' "$FULL_OUTPUT" > "$SESSION_OUTPUT_FILE"
+
     local RUN_STATUS=0
     if [ "$SESSION_EXIT" -eq 124 ]; then
         echo "SESSION TIMEOUT: DuckDB was killed after ${SESSION_TIMEOUT}s"
         RUN_STATUS=124
     elif [ "$SESSION_EXIT" -ne 0 ]; then
         echo "SESSION FAILED: DuckDB exited with code $SESSION_EXIT"
+        echo "DuckDB output saved to $SESSION_OUTPUT_FILE"
+        echo "DuckDB error excerpt:"
+        local ERROR_EXCERPT
+        ERROR_EXCERPT=$(printf '%s\n' "$FULL_OUTPUT" \
+            | grep -iE '(^Error:|Invalid Error|IO Error|Catalog Error|Parser Error|Binder Error|Out of Memory|std::bad_alloc|CUDA|RMM|Exception)' \
+            | head -20)
+        if [ -n "$ERROR_EXCERPT" ]; then
+            printf '%s\n' "$ERROR_EXCERPT"
+        else
+            printf '%s\n' "$FULL_OUTPUT" | tail -40
+        fi
         RUN_STATUS=$SESSION_EXIT
     fi
 
@@ -386,7 +405,10 @@ run_single_session() {
 
         if [ -z "$SECTION" ]; then
             echo "  NO OUTPUT (session may have timed out or crashed before this query)"
-            echo "error: no output (session may have timed out or crashed before this query)" > "$RESULT_FILE"
+            {
+                echo "error: no output (session may have timed out or crashed before this query)"
+                echo "session_output: $SESSION_OUTPUT_FILE"
+            } > "$RESULT_FILE"
             {
                 echo "step,runtime_s"
                 for ((i = 0; i < NUM_ITERATIONS; i++)); do
@@ -609,7 +631,7 @@ fi
 # Split the Sirius log into per-query segments.
 #
 # Under Super Sirius transparent execution, each query iteration is logged as
-# "QueryBegin: <raw SQL>" — there is no `call gpu_execution(...)` wrapper.
+# "QueryBegin: SQL: <raw SQL>" — there is no `call gpu_execution(...)` wrapper.
 # Skip the session prologue (CREATE VIEW for view setup) and any pinning-mode
 # CALLs (pin_table / unpin_table) so the remaining QueryBegin lines correspond
 # 1:1 to user query iterations. We group every NUM_ITERATIONS consecutive
@@ -627,7 +649,7 @@ if [ "$ENGINE" = "sirius" ] && [ "$MULTI_SESSION" = false ] && [ -n "${OUTPUT_DI
         echo "Splitting Sirius log per query (${NUM_ITERATIONS} iterations per query)..."
         readarray -t QB_LINES < <(
             grep -nE 'QueryBegin:' "$LOG_FILE" \
-                | grep -ivE 'QueryBegin: (CREATE VIEW|CALL (pin_table|unpin_table))' \
+                | grep -ivE 'QueryBegin:[[:space:]]*(SQL:[[:space:]]*)?(CREATE VIEW|CALL[[:space:]]+(pin_table|unpin_table))' \
                 | cut -d: -f1
         )
         TOTAL_LOG_LINES=$(wc -l < "$LOG_FILE")
