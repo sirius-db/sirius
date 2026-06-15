@@ -29,12 +29,18 @@
 
 #include <atomic>
 #include <future>
+#include <memory>
 #include <optional>
 #include <unordered_map>
 
 namespace sirius::parallel {
 class downgrade_executor;
 }  // namespace sirius::parallel
+
+namespace sirius::telemetry {
+class telemetry_context;
+struct TaskQueueHandleWrapper;
+}  // namespace sirius::telemetry
 
 namespace sirius {
 
@@ -65,6 +71,7 @@ class task_scheduler {
    */
   explicit task_scheduler(const exec::thread_pool_config& gpu_executor_config,
                           sirius::memory::sirius_memory_reservation_manager& mem_mgr,
+                          std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
                           const cucascade::memory::system_topology_info* sys_topology = nullptr,
                           const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>*
                             downgrade_executors = nullptr);
@@ -223,6 +230,8 @@ class task_scheduler {
 
   sirius::creator::task_creator* _task_creator{nullptr};
   std::unique_ptr<completion_handler> _completion_handler;
+  std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
+  std::unique_ptr<telemetry::TaskQueueHandleWrapper> _task_queue_telemetry;
 };
 
 }  // namespace pipeline

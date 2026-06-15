@@ -1,5 +1,7 @@
 use quent_model::{instrumentation, model};
 
+pub mod task;
+
 model! {
     Sirius {
         root: quent_query_engine_model::engine::Engine,
@@ -9,6 +11,10 @@ model! {
         quent_query_engine_model::plan::Plan,
         quent_query_engine_model::operator::Operator,
         quent_query_engine_model::port::Port,
+        task::Task,
+        task::TaskQueue,
+        task::TaskManagerLoopThread,
+        task::ExecutorThread,
     }
 }
 

@@ -85,6 +85,85 @@ Environment variables:
 - `TIMING_CSV` — path to write per-query timing CSV (optional)
 - `OUTPUT_DIR` — directory for structured output (set by `benchmark_and_validate.sh`)
 
+### Generating telemetry
+
+Telemetry is controlled by the Sirius YAML config used for the run. Enable Quent
+export and choose the output directory:
+
+```yaml
+sirius:
+  telemetry:
+    enable_quent: true
+    output_directory: telemetry_data
+    engine_name: siriusDB
+```
+
+`run_tpch_parquet_and_generate_telemetry.sh` runs TPC-H queries in Sirius,
+labels each `(query, iteration)` pair with `sirius_set_query_label`, and writes
+Quent ndjson files to `sirius.telemetry.output_directory`.
+
+```bash
+pixi run -- ./test/tpch_performance/run_tpch_parquet_and_generate_telemetry.sh \
+  --iterations 1 \
+  --parquet-dir /data/tpch/sf100/p16/zstd-8/ \
+  100
+```
+
+The final `100` is the TPC-H scale factor. If no query numbers are provided,
+all 22 queries are run; append query numbers to limit the run, for example
+`100 1 6 9`.
+
+The script uses `test/tpch_performance/tpch_telemetry_sirius.yaml` by default.
+That config only enables telemetry, so pass `--config <path>` when the workload
+also needs custom memory, executor, scan-cache, or operator settings:
+
+```bash
+pixi run -- ./test/tpch_performance/run_tpch_parquet_and_generate_telemetry.sh \
+  --config ~/.sirius/sirius.yaml \
+  --iterations 1 \
+  --parquet-dir /data/tpch/sf100/p16/zstd-8/ \
+  100 1 6 9
+```
+
+The custom config is used as-is, so it must include
+`sirius.telemetry.enable_quent: true`.
+
+Query labels are optional but make the Quent UI easier to navigate. They can be
+set in either of two ways:
+
+```sql
+-- Applies to the next Sirius query, including transparent plain-SQL execution.
+CALL sirius_set_query_label('tpch_q1_iter1');
+SELECT *
+FROM lineitem
+WHERE l_orderkey < 100;
+
+-- Inline label for an explicit gpu_execution call.
+CALL gpu_execution(
+  'SELECT * FROM lineitem WHERE l_orderkey < 100',
+  query_label = 'tpch_q1_iter1'
+);
+```
+
+The telemetry helper script uses `sirius_set_query_label` so plain SQL queries
+keep the same execution path as the normal TPC-H runner.
+
+Start the Quent analyzer server over the telemetry directory:
+
+```bash
+pixi run quent
+```
+
+The `quent` Pixi task defaults to `telemetry_data` and runs the telemetry server
+with the UI enabled. If the config writes telemetry somewhere else, pass that
+path as the task argument:
+
+```bash
+pixi run quent /path/to/telemetry_data
+```
+
+Open `http://localhost:8080` and select the captured Sirius engine/query.
+
 ## Query Files
 
 - `tpch_queries/orig/q*.sql` — Plain SQL queries used by both Sirius and DuckDB runners
@@ -99,19 +178,6 @@ The Sirius config file (e.g. `~/.sirius/sirius.yaml`) controls:
 - **Scan cache**: `duckdb_scan.cache` (values: `"none"`, `"parquet"`, `"table_gpu"`, `"table_host"`)
 - **Operator params**: `scan_task_batch_size`, `hash_partition_bytes`, `concat_batch_bytes`
 - **Telemetry**: `telemetry.enable_quent`, `telemetry.output_directory`, `telemetry.engine_name`
-
-`run_tpch_parquet_and_generate_telemetry.sh` uses
-`test/tpch_performance/tpch_telemetry_sirius.yaml` by default. Pass
-`--config <path>` to use a full custom Sirius config for telemetry runs:
-
-```bash
-./test/tpch_performance/run_tpch_parquet_and_generate_telemetry.sh \
-  --config ~/.sirius/sirius.yaml \
-  100 1 6 9
-```
-
-Custom configs are used as-is and must enable telemetry, for example
-`sirius.telemetry.enable_quent: true`.
 
 ### Example config (GB300, SF1000)
 

@@ -16,14 +16,40 @@
 
 #include "parallel/task_executor.hpp"
 
+#include "log/logging.hpp"
+#include "pipeline/sirius_pipeline_itask.hpp"
+#include "telemetry/telemetry_context.hpp"
+
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace sirius {
 namespace parallel {
 
+itask_executor::itask_executor(
+  exec::thread_pool_config config,
+  std::shared_ptr<const telemetry::telemetry_context> telemetry_context)
+  : _config(std::move(config)),
+    _telemetry_context(std::move(telemetry_context)),
+    _task_queue_telemetry(std::make_unique<telemetry::TaskQueueHandleWrapper>(
+      *_telemetry_context, _config.thread_name_prefix + "-task-queue"))
+{
+}
+
+itask_executor::~itask_executor() { stop(); }
+
 void itask_executor::schedule(std::unique_ptr<itask> task)
 {
+  if (task) {
+    if (auto* pipeline_task = dynamic_cast<pipeline::sirius_pipeline_itask*>(task.get())) {
+      pipeline_task->telemetry_handle().queued({
+        .queue_resource_id      = _task_queue_telemetry->handle->uuid(),
+        .queue_capacity_entries = 1,
+      });
+    }
+  }
   if (!_task_queue.push(std::move(task))) {
     SIRIUS_LOG_WARN("Task queue interrupted, dropping task");
   }
