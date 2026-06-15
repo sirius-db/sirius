@@ -72,7 +72,11 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
                      all_batches.size(),
                      _current_partition_index - 1);
     if (all_batches.empty()) { return nullptr; }
-    return std::make_unique<pipelineable_operator_data>(all_batches);
+    // Tag with the source partition index so the scheduler pins this task to
+    // partition_idx % num_gpus and spreads partitions across GPUs, independent of
+    // where the upstream scan placed the bytes (mirrors grouped_aggregate_merge).
+    return std::make_unique<partitioned_operator_data>(std::move(all_batches),
+                                                       _current_partition_index - 1);
   }
   return nullptr;
 }
