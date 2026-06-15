@@ -1,0 +1,14 @@
+[package]
+name = "starrocks-test-harness"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+libc.workspace = true
+mysql_async.workspace = true
+sirius-starrocks-cn = { path = "../.." }
+tempfile.workspace = true
+tokio.workspace = true
+tracing.workspace = true

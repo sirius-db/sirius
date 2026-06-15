@@ -45,16 +45,23 @@ jobs:
           cache: false
           pixi-version: v0.70.2
           manifest-path: experimental/starrocks/pixi.toml
-          environments: cn
+          # `cn` runs the Rust-only fmt/clippy; `default` (= fe + cn) provides the Java/Maven
+          # toolchain the FE↔CN integration tests build and boot a real StarRocks FE with.
+          environments: |
+            cn
+            default
 
       - name: fmt
         run: pixi run -e cn cargo fmt --all -- --check
 
       - name: clippy
-        run: pixi run -e cn cargo clippy --all-targets -- -D warnings
+        run: pixi run -e cn cargo clippy --workspace --all-targets -- -D warnings
 
+      # Runs unit tests plus the FE↔CN integration tests in tests/integration.rs. The harness
+      # builds the StarRocks FE on demand (via `pixi run fe-build`) on the first run, so this step
+      # is heavyweight (Maven FE build + booting the JVM). The `default` env supplies Java + Maven.
       - name: test
-        run: pixi run -e cn cargo test --workspace
+        run: pixi run -e default cargo test --workspace
 
   experimental:
     name: experimental

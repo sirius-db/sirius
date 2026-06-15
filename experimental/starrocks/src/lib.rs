@@ -42,7 +42,7 @@ use thrift::{
         TWriteTransportFactory,
     },
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 const COMPUTE_NODE_PROC_PATH: &str = "/compute_nodes";
 
@@ -1304,6 +1304,369 @@ fn frontend_host_trusted(expected_host: &str, advertised_host: &str) -> bool {
         || expected_ips.iter().any(|ip| advertised_ips.contains(ip))
 }
 
+// Interval between initial FE registration attempts during FE startup or transient failures.
+const REGISTRATION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+// The CN periodically refreshes registration when heartbeats stop arriving.
+const REGISTRATION_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+// If no heartbeat arrives within this window, registration is considered stale.
+const HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(30);
+// StarRocks BEs/CNs regularly report inventory; this skeleton reports empty state.
+const FRONTEND_REPORT_INTERVAL: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Debug, clap::Args)]
+/// Registration retry settings for initial FE registration.
+pub struct RegistrationConfig {
+    #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u32).range(1..))]
+    pub registration_max_attempts: u32,
+}
+
+impl Default for RegistrationConfig {
+    fn default() -> Self {
+        Self {
+            registration_max_attempts: 120,
+        }
+    }
+}
+
+/// Running StarRocks compute node: the heartbeat and backend Thrift servers plus the
+/// registration-refresh and FE-report maintenance loops. Created by [`ComputeNode::start`];
+/// stop it with [`ComputeNode::shutdown`] or drive it to completion (the binary's behaviour)
+/// with [`ComputeNode::wait_for_shutdown`].
+pub struct ComputeNode {
+    // Held in `Option` so `shutdown`/`wait_for_shutdown` can take ownership to join the blocking
+    // accept loops, while `Drop` still requests shutdown for any server left behind on an error
+    // path. `ThriftServer`'s own `Drop` requests shutdown when one is dropped while still present.
+    heartbeat_server: Option<HeartbeatServer>,
+    backend_server: Option<BackendServer>,
+    registration_task: tokio::task::JoinHandle<()>,
+    report_task: tokio::task::JoinHandle<()>,
+    state: SharedHeartbeatState,
+    heartbeat_addr: SocketAddr,
+    backend_addr: SocketAddr,
+}
+
+impl ComputeNode {
+    /// Starts both Thrift servers, performs the initial FE registration (retried while the FE is
+    /// still starting), and spawns the registration-refresh and FE-report maintenance loops.
+    pub async fn start(
+        fe: FeConfig,
+        compute_node: ComputeNodeConfig,
+        registration: RegistrationConfig,
+    ) -> Result<Self> {
+        // The CN advertises these ports to the FE verbatim (in the registration SQL and the
+        // heartbeat `TBackendInfo`), so the FE uses them to reach this node. Port 0 would bind an
+        // OS-assigned port while still advertising 0, registering a node the FE cannot route to;
+        // reject it rather than register an unreachable CN. (`start_heartbeat_server` still allows
+        // port 0 for in-process tests that read back the bound address.)
+        if compute_node.heartbeat_port == 0 || compute_node.thrift_port == 0 {
+            return Err(anyhow!(
+                "compute node heartbeat_port and thrift_port must be non-zero so the FE can reach \
+                 the CN (got heartbeat_port={}, thrift_port={})",
+                compute_node.heartbeat_port,
+                compute_node.thrift_port
+            ));
+        }
+
+        let state = SharedHeartbeatState::new();
+
+        // HeartbeatService tells FE this process is alive and captures FE identity. The configured
+        // FE host pins the report target so a hostile heartbeat cannot redirect outbound reports.
+        let heartbeat_server =
+            start_heartbeat_server(compute_node.clone(), state.clone(), Some(fe.host.clone()))?;
+        // BackendService exposes the shallow CN RPC skeleton on the normal thrift port.
+        let backend_server = start_backend_server(&compute_node)?;
+        let heartbeat_addr = heartbeat_server.local_addr();
+        let backend_addr = backend_server.local_addr();
+
+        // Initial SQL registration is needed before FE starts heartbeating this CN.
+        register_node_with_retries(&fe, &compute_node, &registration).await?;
+
+        // Registration stays active if FE heartbeats disappear after startup.
+        let registration_task = tokio::spawn(maintain_registration(
+            fe.clone(),
+            compute_node.clone(),
+            state.clone(),
+        ));
+        // Reports start after heartbeat records FE thrift address and backend id.
+        let report_task = tokio::spawn(maintain_frontend_report(compute_node, state.clone()));
+
+        info!("compute node registered; waiting for FE heartbeats");
+        Ok(Self {
+            heartbeat_server: Some(heartbeat_server),
+            backend_server: Some(backend_server),
+            registration_task,
+            report_task,
+            state,
+            heartbeat_addr,
+            backend_addr,
+        })
+    }
+
+    /// Shared heartbeat state, primarily so tests can assert the FE identity learned via
+    /// heartbeats and the report sequencing.
+    pub fn state(&self) -> SharedHeartbeatState {
+        self.state.clone()
+    }
+
+    /// Actual heartbeat listener address, resolving the OS-selected port when bound to port zero.
+    pub fn heartbeat_addr(&self) -> SocketAddr {
+        self.heartbeat_addr
+    }
+
+    /// Actual backend listener address, resolving the OS-selected port when bound to port zero.
+    pub fn backend_addr(&self) -> SocketAddr {
+        self.backend_addr
+    }
+
+    /// Stops the maintenance loops and both Thrift servers, waiting for the accept loops to exit.
+    /// Tests use this for deterministic teardown; the binary uses [`Self::wait_for_shutdown`].
+    pub async fn shutdown(mut self) -> Result<()> {
+        let heartbeat_server = self.heartbeat_server.take();
+        let backend_server = self.backend_server.take();
+        self.registration_task.abort();
+        self.report_task.abort();
+
+        let mut result = Ok(());
+        if let Some(server) = heartbeat_server {
+            server.shutdown();
+            let join = tokio::task::spawn_blocking(move || server.join());
+            if let Err(err) = join_server(join, "heartbeat").await {
+                result = Err(err);
+            }
+        }
+        if let Some(server) = backend_server {
+            server.shutdown();
+            let join = tokio::task::spawn_blocking(move || server.join());
+            if let Err(err) = join_server(join, "backend").await
+                && result.is_ok()
+            {
+                result = Err(err);
+            }
+        }
+        result
+    }
+
+    /// Drives the compute node until a shutdown signal (SIGTERM/Ctrl-C) arrives or one of the
+    /// servers or maintenance loops exits. The maintenance loops are expected to run forever, so
+    /// an early exit is reported as an error. Consumes `self`; tests prefer [`Self::shutdown`].
+    pub async fn wait_for_shutdown(mut self) -> Result<()> {
+        let heartbeat_server = self
+            .heartbeat_server
+            .take()
+            .expect("heartbeat server is present until shutdown");
+        let backend_server = self
+            .backend_server
+            .take()
+            .expect("backend server is present until shutdown");
+
+        let heartbeat_shutdown = heartbeat_server.shutdown_handle();
+        let backend_shutdown = backend_server.shutdown_handle();
+        let mut heartbeat_join = tokio::task::spawn_blocking(move || heartbeat_server.join());
+        let mut backend_join = tokio::task::spawn_blocking(move || backend_server.join());
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(|err| anyhow!("failed to install SIGTERM handler: {err}"))?;
+
+        tokio::select! {
+            // Interactive shutdown path.
+            signal = tokio::signal::ctrl_c() => {
+                signal.map_err(|err| anyhow!("failed to wait for ctrl-c: {err}"))?;
+                info!(signal = "ctrl-c", "shutdown signal received");
+                request_stop(&self.registration_task, &self.report_task, &heartbeat_shutdown, &backend_shutdown);
+                join_server(heartbeat_join, "heartbeat").await?;
+                join_server(backend_join, "backend").await?;
+                info!("shutdown complete");
+                Ok(())
+            }
+            // Service-manager shutdown path.
+            _ = terminate.recv() => {
+                info!(signal = "sigterm", "shutdown signal received");
+                request_stop(&self.registration_task, &self.report_task, &heartbeat_shutdown, &backend_shutdown);
+                join_server(heartbeat_join, "heartbeat").await?;
+                join_server(backend_join, "backend").await?;
+                info!("shutdown complete");
+                Ok(())
+            }
+            // If the heartbeat server exits first, stop everything else and surface its result.
+            result = &mut heartbeat_join => {
+                request_stop(&self.registration_task, &self.report_task, &heartbeat_shutdown, &backend_shutdown);
+                let result = result
+                    .map_err(|err| anyhow!("heartbeat server join task failed: {err}"))?;
+                if let Err(err) = &result {
+                    error!(error = %err, "heartbeat server exited");
+                }
+                join_server(backend_join, "backend").await?;
+                result
+            }
+            // If the backend server exits first, stop everything else and surface its result.
+            result = &mut backend_join => {
+                request_stop(&self.registration_task, &self.report_task, &heartbeat_shutdown, &backend_shutdown);
+                let result = result
+                    .map_err(|err| anyhow!("backend server join task failed: {err}"))?;
+                if let Err(err) = &result {
+                    error!(error = %err, "backend server exited");
+                }
+                join_server(heartbeat_join, "heartbeat").await?;
+                result
+            }
+            // The registration loop is expected to run forever; an exit is treated as a failure.
+            result = &mut self.registration_task => {
+                request_stop(&self.registration_task, &self.report_task, &heartbeat_shutdown, &backend_shutdown);
+                join_server(heartbeat_join, "heartbeat").await?;
+                join_server(backend_join, "backend").await?;
+                result.map_err(|err| anyhow!("registration monitor task failed: {err}"))?;
+                Err(anyhow!("registration monitor exited unexpectedly"))
+            }
+            // The report loop is expected to run forever; an exit is treated as a failure.
+            result = &mut self.report_task => {
+                request_stop(&self.registration_task, &self.report_task, &heartbeat_shutdown, &backend_shutdown);
+                join_server(heartbeat_join, "heartbeat").await?;
+                join_server(backend_join, "backend").await?;
+                result.map_err(|err| anyhow!("FE report task failed: {err}"))?;
+                Err(anyhow!("FE report task exited unexpectedly"))
+            }
+        }
+    }
+}
+
+impl Drop for ComputeNode {
+    fn drop(&mut self) {
+        // Best-effort cleanup for error paths that drop the handle without an explicit shutdown:
+        // stop the maintenance loops and request server shutdown. `abort()` on a finished task and
+        // the servers' own `Drop` shutdown are idempotent no-ops once `shutdown`/`wait_for_shutdown`
+        // has already taken the servers and aborted the tasks.
+        self.registration_task.abort();
+        self.report_task.abort();
+    }
+}
+
+/// Registers the CN with FE SQL, retrying during FE startup or transient failures.
+async fn register_node_with_retries(
+    fe: &FeConfig,
+    compute_node: &ComputeNodeConfig,
+    registration: &RegistrationConfig,
+) -> Result<()> {
+    if registration.registration_max_attempts == 0 {
+        return Err(anyhow!("registration-max-attempts must be at least 1"));
+    }
+
+    for attempt in 1..=registration.registration_max_attempts {
+        match register_node(fe, compute_node).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                // The last attempt returns the original registration error with context.
+                if attempt == registration.registration_max_attempts {
+                    return Err(anyhow!(
+                        "failed to register compute node with FE after {} attempts: {err}",
+                        registration.registration_max_attempts
+                    ));
+                }
+
+                warn!(
+                    error = %err,
+                    attempt,
+                    max_attempts = registration.registration_max_attempts,
+                    retry_after_secs = REGISTRATION_RETRY_INTERVAL.as_secs(),
+                    "failed to register compute node with FE; retrying"
+                );
+                tokio::time::sleep(REGISTRATION_RETRY_INTERVAL).await;
+            }
+        }
+    }
+
+    unreachable!("registration attempts loop always returns")
+}
+
+/// Periodically re-registers when heartbeat state indicates FE is no longer contacting us.
+async fn maintain_registration(
+    fe: FeConfig,
+    compute_node: ComputeNodeConfig,
+    state: SharedHeartbeatState,
+) {
+    loop {
+        tokio::time::sleep(REGISTRATION_REFRESH_INTERVAL).await;
+
+        // Recent heartbeat means FE still knows this CN, so no SQL refresh is needed.
+        if let Some(elapsed) = state.last_heartbeat_elapsed()
+            && elapsed < HEARTBEAT_STALE_AFTER
+        {
+            continue;
+        }
+
+        debug!(
+            stale_after_secs = HEARTBEAT_STALE_AFTER.as_secs(),
+            "heartbeat is stale or missing; ensuring compute node registration"
+        );
+        if let Err(err) = register_node(&fe, &compute_node).await {
+            warn!(
+                error = %err,
+                retry_after_secs = REGISTRATION_REFRESH_INTERVAL.as_secs(),
+                "failed to refresh compute node registration with FE"
+            );
+        }
+    }
+}
+
+/// Periodically sends the FE a truthful empty inventory report after heartbeat identity exists.
+async fn maintain_frontend_report(compute_node: ComputeNodeConfig, state: SharedHeartbeatState) {
+    loop {
+        tokio::time::sleep(FRONTEND_REPORT_INTERVAL).await;
+
+        // Thrift clients are blocking, so run the single report call off the async runtime.
+        let compute_node = compute_node.clone();
+        let state = state.clone();
+        match tokio::task::spawn_blocking(move || report_to_frontend_once(&compute_node, &state))
+            .await
+        {
+            // FE accepted the empty inventory report.
+            Ok(Ok(Some(_result))) => {
+                debug!("reported compute node inventory to FE");
+            }
+            // Heartbeat has not yet supplied both FE address and backend id.
+            Ok(Ok(None)) => {
+                debug!("skipping FE report until heartbeat provides FE address and backend id");
+            }
+            // Network or FE thrift failures are retried by the next loop iteration.
+            Ok(Err(err)) => {
+                warn!(
+                    error = %err,
+                    retry_after_secs = FRONTEND_REPORT_INTERVAL.as_secs(),
+                    "failed to report compute node inventory to FE"
+                );
+            }
+            // A panic or cancellation in the blocking worker should not stop the CN process.
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    retry_after_secs = FRONTEND_REPORT_INTERVAL.as_secs(),
+                    "FE report worker failed"
+                );
+            }
+        }
+    }
+}
+
+/// Aborts the background maintenance tasks and asks both thrift servers to stop. Safe to call
+/// even when a component has already exited: `abort()` on a finished task and `shutdown()` on an
+/// already-stopped server are idempotent no-ops, so every shutdown path can stop everything.
+fn request_stop(
+    registration_task: &tokio::task::JoinHandle<()>,
+    report_task: &tokio::task::JoinHandle<()>,
+    heartbeat_shutdown: &HeartbeatServerShutdown,
+    backend_shutdown: &BackendServerShutdown,
+) {
+    registration_task.abort();
+    report_task.abort();
+    heartbeat_shutdown.shutdown();
+    backend_shutdown.shutdown();
+}
+
+/// Awaits a server's blocking-join task, flattening the join-task error and the server result.
+async fn join_server(join: tokio::task::JoinHandle<Result<()>>, label: &str) -> Result<()> {
+    join.await
+        .map_err(|err| anyhow!("{label} server join task failed: {err}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1314,6 +1677,25 @@ mod tests {
             version: "test-version".to_string(),
             ..ComputeNodeConfig::default()
         }
+    }
+
+    /// `ComputeNode::start` must reject an OS-assigned (zero) heartbeat/thrift port before binding
+    /// or registering, so the FE never learns an address it cannot route to.
+    #[tokio::test]
+    async fn compute_node_start_rejects_zero_ports() {
+        let mut config = test_config();
+        config.heartbeat_port = 0;
+        let err =
+            match ComputeNode::start(FeConfig::default(), config, RegistrationConfig::default())
+                .await
+            {
+                Ok(_) => panic!("port zero must be rejected"),
+                Err(err) => err,
+            };
+        assert!(
+            err.to_string().contains("non-zero"),
+            "unexpected error: {err}"
+        );
     }
 
     /// Builds a heartbeat handler with its shared state so tests can inspect side effects.
