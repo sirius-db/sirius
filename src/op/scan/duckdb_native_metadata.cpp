@@ -151,7 +151,8 @@ std::optional<std::string> walk_typed_column(duckdb::ColumnData& col_data,
   auto* std_col = dynamic_cast<duckdb::StandardColumnData*>(&col_data);
   if (!std_col) {
     return "column " + std::to_string(column_id) + " row group " + std::to_string(rg_idx) +
-           ": column storage is not StandardColumnData (nested/unsupported)";
+           ": column storage for type " + col_data.GetType().ToString() +
+           " is not StandardColumnData (nested/unsupported)";
   }
 
   // Data segments (tree order is row-start order; the caller re-sorts anyway).
