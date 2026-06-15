@@ -168,6 +168,12 @@ are the repository, the channel, the in-flight task's `read_only`/`mutable` acce
 (transiently, while spilling), and the `nixl` send path (until the `transfer_complete` handshake). The
 session routes a pushed batch to the correct streaming source **by stream id**.
 
+The **wrapper⇄engine boundary is the channel itself** (exposed over the cxx FFI): for a source the wrapper is
+the producer and the engine operator the consumer; for a sink it is reversed. The streaming source and sink
+are ordinary Sirius **operators** that run as tasks on the existing scheduler/worker pool — there is **no
+dedicated thread pool** for them — while `nixl`'s own threads live in the **wrapper**. So each channel is a
+hand-off between wrapper threads and engine worker threads.
+
 ```mermaid
 flowchart LR
   subgraph wrapper["CN wrapper (Rust, via sirius / sirius-sys)"]
@@ -292,7 +298,10 @@ sequenceDiagram
 
 The bounded channels are not just buffers — they are the flow-control mechanism, and pressure propagates
 **backwards**, against the direction of data flow. When a downstream CN is slow, the sender's output channel
-fills; the streaming sink can no longer enqueue, so that pipeline stops being scheduled; the input channel
+fills; the streaming sink — the **final operator** of its pipeline, which pulls compute results from a
+`shared_data_repository` and pushes them to that channel — can no longer enqueue; because **enqueue is a
+scheduling condition**, the scheduler creates no further sink tasks, the repository between compute and sink
+fills, and upstream backs up via the existing port barriers. The input channel
 drains more slowly and fills; `push(stream_id, batch)` then blocks (or signals not-ready), so the wrapper
 stops draining `nixl` receives, which throttles the upstream sender. The result is end-to-end, cross-node
 flow control with a bounded in-flight working set.
@@ -328,8 +337,8 @@ memory **reservations block** when the budget is exhausted, and the GPU executor
 agent and computes its **local metadata** (`get_local_md`, covering its registered staging memory). The first
 transfer to a new peer exchanges that agent metadata over the side-channel, and both sides **cache it per
 peer** (invalidated on restart) — so later transfers skip the handshake. For each transfer the sender then
-exchanges **buffer** metadata over the side-channel; the receiver leases a **pre-registered GPU staging
-buffer** (bump-allocated, RAII lease) and returns destination addresses; the sender issues a GPUDirect RDMA
+exchanges **buffer** metadata over the side-channel; the receiver leases a **pre-registered staging buffer**
+(GPU or host; bump-allocated, RAII lease) and returns destination addresses; the sender issues a GPUDirect RDMA
 transfer and polls for completion; a `transfer_complete` handshake lets the receiver wrap the buffer as a
 `data_batch` and push it onto the destination stream's input channel. If `nixl` is unavailable (or for a
 self-transfer), it falls back to a bRPC/CPU path.
@@ -435,7 +444,9 @@ This yields **two** levels of nixl-buffer accounting. The pre-registered staging
 against the cuCascade budget at startup; per-transfer sends/receives then **lease** sub-regions of that arena
 with a bump allocator and make **no** further reservation (that memory is already accounted). Only the
 **fallback** path needs a fresh per-transfer reservation — when the arena is full and `nixl` resorts to
-`cuMemAlloc` + register for that transfer.
+`cuMemAlloc` + register for that transfer. The arena can live on **GPU or host** memory (`nixl` supports
+both), so its tier is a deployment choice — host staging can be preferable on some topologies (e.g. GB/VR-class
+nodes).
 
 ### Spill lifecycle of an exchange batch under option A
 
@@ -498,5 +509,5 @@ reservation-aware adaptor `src/memory/sirius_memory_reservation_manager.cpp:42-4
   "all channels full, no forward progress" so a sink (or a monitor) can surface it rather than hang silently.
 - **Transport retry / fallback.** On a failed `nixl` transfer, retry once over `nixl`, then fall back to the
   bRPC/CPU path, and only fail the query if that also fails (cf. the Doris `TransferHealth` fallback after N
-  consecutive failures). This presumes the sink can hold the batch across the retry (i.e. the sink owns a
-  queue + worker thread).
+  consecutive failures). The retry/fallback runs on the wrapper's `nixl` send path (which has its own
+  threads); the batch stays alive across attempts via the output-channel / send-in-flight reference.
