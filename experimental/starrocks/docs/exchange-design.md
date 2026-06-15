@@ -159,14 +159,21 @@ streaming source/sink are net-new (#836/#837).*
 The **stream session** (#839) is the public entry point. It builds a streaming plan and starts it on the
 **existing** `task_scheduler` *without blocking* the caller. The wrapper feeds inputs with
 `push(stream_id, batch)` and signals end-of-stream with `close_input(stream_id)`; it drains outputs with
-`pull()` / `wait()`. Inputs and outputs are **bounded channels** of `shared_ptr<cucascade::data_batch>`. The
-**owner of record** is the cuCascade `shared_data_repository` registered with the memory manager; a channel
-carries *references* to those repository-registered batches (not bare buffers), so batches queued under
-backpressure stay accounted and spillable (see §6, option A). Because a `data_batch` is a `shared_ptr`, its
-GPU memory is freed only when the last holder drops it (and it is idle) — co-holders across a batch's life
-are the repository, the channel, the in-flight task's `read_only`/`mutable` accessor, the downgrade executor
-(transiently, while spilling), and the `nixl` send path (until the `transfer_complete` handshake). The
-session routes a pushed batch to the correct streaming source **by stream id**.
+`pull()` / `wait()`. Inputs and outputs are **bounded channels** of *handles* (repository batch-ids) to
+repository-registered `cucascade::data_batch`es. The **owner of record** is the cuCascade
+`shared_data_repository` registered with the memory manager; because a channel carries handles rather than
+owning `shared_ptr`s or bare buffers, batches queued under backpressure stay accounted and spillable **via the
+repository** (see §6, option A). Because a `data_batch` is a `shared_ptr`, its GPU memory is freed only when
+the last *owning* holder drops it (and it is idle). The owning holders across a batch's life are the
+repository, the in-flight task's `read_only`/`mutable` accessor, the downgrade executor (transiently, while
+spilling), and the `nixl` send path (until the `transfer_complete` handshake). The channel is deliberately
+**not** an owner — keeping it a handle means a queued batch's `use_count()` reflects only real owners, which
+is what lets the sink's zero-copy steal (§7) ever observe `use_count()==1`. The session routes a pushed batch
+to the correct streaming source **by stream id**. For the **root** fragment the output channels *are* the
+query result: the wrapper drains them with `pull()`/`wait()` and returns rows to the FE via `fetch_data`, with
+no `nixl` peer — it is the same streaming-sink operator as an exchange sink, just with partitioning degenerate
+to a single destination and a different drain (intermediate fragments' sinks instead feed a peer CN over
+`nixl`, §4–§5).
 
 The **wrapper⇄engine boundary is the channel itself** (exposed over the cxx FFI): for a source the wrapper is
 the producer and the engine operator the consumer; for a sink it is reversed. The streaming source and sink
@@ -193,7 +200,7 @@ flowchart LR
     srcA["streaming source A — #836"]:::proposed
     srcB["streaming source B — #836"]:::proposed
     sched["task_scheduler<br/>(existing, non-blocking)"]:::exists
-    sink["streaming sink — #837 / #838"]:::proposed
+    sink["streaming sink — #837"]:::proposed
     outCh["output channel(s) (bounded)"]:::proposed
     route --> inA --> srcA --> sched
     route --> inB --> srcB --> sched
@@ -209,32 +216,52 @@ flowchart LR
 
 > Today, operators source data **only** from scans (bound to a `split_connector`) or a pre-materialized
 > `COLUMN_DATA_SCAN`, and a query's result is fully materialized into a `ColumnDataCollection`
-> (`src/op/sirius_physical_result_collector.cpp:91-213`). The stream session replaces **both** ends with
-> channel-backed streaming, reusing the operator interface that already exists
-> (`execute` / `sink` / `is_source` / `is_sink` / `get_next_task_hint` / `get_next_task_input_data` —
-> `src/include/op/sirius_physical_operator.hpp:350,371,361,373,476,492`).
+> (`sirius_physical_materialized_collector` in `src/op/sirius_physical_result_collector.cpp`). The stream
+> session replaces **both** ends with channel-backed streaming, reusing the operator interface that already
+> exists (`execute` / `sink` / `is_source` / `is_sink` / `get_next_task_hint` / `get_next_task_input_data`
+> in `src/include/op/sirius_physical_operator.hpp`).
 
 ---
 
 ## §4 The data path: in → compute → out
 
 A batch received by `nixl` is first wrapped as a repository-registered `data_batch`; the input bounded
-channel carries a reference/handle to that registered batch. The streaming source consumes those channel
+channel carries a handle to that registered batch. The streaming source consumes those channel
 entries, publishes work into the pipeline, and drives task creation as batches arrive; the GPU executor
 reserves memory **before** dispatching and runs on a per-device stream pool; the streaming sink emits results
-incrementally; the partitioned sink (#838) owns both partitioning and per-destination coalescing. It splits
+incrementally; the partitioned sink (#837) owns both partitioning and per-destination coalescing. It splits
 partitions across **per-destination** output channels so one slow receiver cannot head-of-line-block the
 others, and it coalesces a destination's small slices up to a size or time threshold before flushing one
 combined batch to that destination's channel — otherwise we ship a flood of tiny RDMA transfers. That
 coalescing state is bounded and repository-visible, so accumulated slices remain accounted and spillable
 while they wait to be concatenated/flushed. `nixl` sends each flushed output batch.
 
-The unit that flows everywhere is a `shared_ptr<cucascade::data_batch>` wrapping a `cudf::table` (GPU device
-buffers) or, for a fallback/topology-specific host-staged receive, a host representation that will be
-materialized to GPU before compute, guarded by a 3-state reader/writer lock (`idle` / `read_only` /
-`mutable_locked`). Hand-off across a channel is **zero-copy with respect to the channel itself**: the
-`shared_ptr`/handle moves, the underlying representation does not move until an explicit tier conversion,
-copy-out, or coalescing concat requires it.
+**Partition hash compatibility (correctness-critical).** The FE plans shuffle and bucket joins assuming a
+specific partition function, so the sink must reproduce StarRocks' hash **bit-exactly, per partition type** —
+get it wrong and co-located rows land on the wrong CN, silently corrupting shuffle joins/aggregations.
+StarRocks' `exchange_sink_operator` uses **three** regimes (`be/src/exec/pipeline/exchange/exchange_sink_operator.cpp`):
+- `HASH_PARTITIONED` → the `exchange_hash_function_version` session variable: **fnv_hash** (v0, default) or
+  **xxh3_hash** (v1).
+- `BUCKET_SHUFFLE_HASH_PARTITIONED` with no bucket properties → **CRC32** (seeded 0), to match the table's
+  on-disk bucket distribution.
+- `BUCKET_SHUFFLE_HASH_PARTITIONED` with bucket properties → a bucket-id mapping
+  (`_calc_hash_values_and_bucket_ids`).
+
+So the sink must dispatch on partition type *and* version exactly as StarRocks does (see
+`test/sql/test_exchange_hash_function`). Note CRC32 here is **not** merely the Doris prior art of §0 — it is a
+live StarRocks bucket-shuffle path. (Tracked in §7.)
+
+**Order is not preserved.** Incremental emission and per-destination coalescing both reorder rows. That is
+fine for order-insensitive consumers (hash-join build, aggregation) but **not** for StarRocks' *merging*
+exchange behind `ORDER BY` / top-N, where the receiver merges sorted runs. v1 targets order-insensitive
+exchanges only; a merging sink (coalescing disabled, plus a receiver-side merge) is future work (§7).
+
+The data unit is a `shared_ptr<cucascade::data_batch>` (owned by the repository) wrapping a `cudf::table`
+(GPU device buffers) or, for a host-staged receive on a deployment that selects host staging, a host
+representation that will be materialized to GPU before compute, guarded by a 3-state reader/writer lock
+(`idle` / `read_only` / `mutable_locked`). Hand-off across a channel is **zero-copy with respect to the
+channel itself**: only the handle moves, the underlying representation does not move until an explicit tier
+conversion, copy-out, or coalescing concat requires it.
 
 ```mermaid
 flowchart LR
@@ -244,12 +271,12 @@ flowchart LR
   subgraph sirius["Sirius engine (this CN)"]
     direction LR
     repo["exchange input repository<br/>registered data_batch"]:::exists
-    inCh["input bounded channel<br/>(refs / handles)"]:::proposed
+    inCh["input bounded channel<br/>(handles)"]:::proposed
     src["streaming source — #836<br/>drives task creation"]:::proposed
     pipeRepo["pipeline repositories<br/>shared_ptr&lt;data_batch&gt;"]:::exists
     sched["task_scheduler + GPU executor<br/>reserve-before-dispatch · stream pool"]:::exists
-    sink["partitioned streaming sink — #837/#838<br/>partition + bounded coalesce"]:::proposed
-    repo -->|"ref / handle"| inCh --> src --> pipeRepo --> sched --> sink
+    sink["partitioned streaming sink — #837<br/>partition + bounded coalesce"]:::proposed
+    repo -->|"handle"| inCh --> src --> pipeRepo --> sched --> sink
   end
   nixlIn -->|"wrap + register"| repo
   sink -->|"per-destination"| outCh["output bounded channels"]:::proposed
@@ -259,10 +286,10 @@ flowchart LR
   classDef priorart fill:#ede7f6,stroke:#6a1b9a,stroke-width:1.5px,stroke-dasharray:2 2,color:#1a1a1a;
 ```
 
-*Refs: operator hints `src/include/op/sirius_physical_operator.hpp:476,492`; reserve-before-dispatch +
-stream pool `src/pipeline/gpu_pipeline_executor.cpp:122,228`; data unit + lock states
-`cucascade/include/cucascade/data/data_batch.hpp:49,69-267`; port barriers PIPELINE/PARTIAL/FULL
-`sirius_physical_operator.hpp:51`.*
+*Refs: operator hints `get_next_task_hint` / `get_next_task_input_data` in `sirius_physical_operator.hpp`;
+reserve-before-dispatch (`make_reservation`) + stream pool in `gpu_pipeline_executor.cpp`; data unit +
+`batch_state` lock states in `cucascade/include/cucascade/data/data_batch.hpp`; port barriers
+`MemoryBarrierType { PIPELINE, PARTIAL, FULL }` in `sirius_physical_operator.hpp`.*
 
 ### Overlap
 
@@ -277,6 +304,12 @@ arrives on its input channel, until `close_input`, unlike today's one-shot scan 
 input once (#836). *Incremental sink*: the sink pushes **each** output batch as it is produced, per `sink()`
 call, instead of materializing the full result into a `ColumnDataCollection` first (#837). Fan-in from one
 or many upstream CNs is orthogonal — it is handled by stream-id routing into the source's input channel(s).
+
+What stream-id routing does **not** settle is **completion**. A source is done only once *every* upstream
+sender has finished, so end-of-stream must be propagated **across** `nixl`/bRPC as a terminal marker — not
+just locally via `close_input` — and the source must learn the **sender count** from the plan so it
+finalizes only after it has seen that many EOS markers. Cross-CN EOS propagation and sender-count wiring are
+tracked in §7.
 
 ```mermaid
 sequenceDiagram
@@ -307,10 +340,11 @@ sequenceDiagram
 The bounded channels are not just buffers — they are the flow-control mechanism, and pressure propagates
 **backwards**, against the direction of data flow. When a downstream CN is slow, the sender's output channel
 fills; the streaming sink — the **final operator** of its pipeline, which pulls compute results from a
-`shared_data_repository` and pushes them to that channel — can no longer enqueue; because **enqueue is a
-scheduling condition**, the scheduler creates no further sink tasks, the repository between compute and sink
-fills, and upstream backs up via the existing port barriers. The input channel
-drains more slowly and fills; `push(stream_id, batch)` then blocks (or signals not-ready), so the wrapper
+`shared_data_repository` and pushes them to that channel — can no longer enqueue. Rather than block a worker
+thread, the sink task **yields** (it is re-queued, not parked) and makes no further progress while the
+channel is full; the repository between compute and sink fills, and upstream backs up via the existing port
+barriers. The input channel drains more slowly and fills; `push(stream_id, batch)` then blocks (or signals
+not-ready), so the wrapper
 stops draining `nixl` receives, which throttles the upstream sender. The result is end-to-end, cross-node
 flow control with a bounded in-flight working set.
 
@@ -329,29 +363,34 @@ flowchart LR
   classDef priorart fill:#ede7f6,stroke:#6a1b9a,stroke-width:1.5px,stroke-dasharray:2 2,color:#1a1a1a;
 ```
 
-Two things shape this. First, the **partitioned sink** (#838) gives each destination its **own** output
+Two things shape this. First, the **partitioned sink** (#837) gives each destination its **own** output
 channel, so a single slow receiver backs up only its partition rather than head-of-line-blocking every
 destination — though a persistently slow partition still eventually pressures shared input (see the §7 open
 question). Second, two throttles **already exist** in the engine and compose with channel flow control: GPU
 memory **reservations block** when the budget is exhausted, and the GPU executor dispatches through a
 **bounded worker pool**, so compute is naturally rate-limited even before a channel fills
-(`src/pipeline/gpu_pipeline_executor.cpp:122`, reserve-before-dispatch).
+(reserve-before-dispatch via `make_reservation` in `gpu_pipeline_executor.cpp`).
 
 ---
 
 ## §5 Cross-node transport with nixl
 
-`nixl` (NVIDIA Inference Xfer Library) moves registered buffers between CNs. The preferred path is
-GPU-to-GPU over GPUDirect RDMA; host staging is fallback/topology-specific when a deployment cannot or should
-not use GPU-backed receive staging. At startup each CN creates one agent and computes its **local metadata**
+`nixl` (NVIDIA Inference Xfer Library) moves registered buffers between CNs. There are three tiers: **GPU
+staging** over GPUDirect RDMA (preferred); **host staging**, a *deployment/tier choice* selected when a
+topology cannot or should not use GPU-backed receive staging (a configured choice, not a failure path); and
+the **bRPC/CPU fallback** (the true last-resort path, below). At startup each CN creates one agent and
+computes its **local metadata**
 (`get_local_md`, covering its registered staging memory). The first transfer to a new peer exchanges that
 agent metadata over the side-channel, and both sides **cache it per peer** (invalidated on restart) — so
 later transfers skip the handshake. For each transfer the sender then exchanges **buffer** metadata over the
-side-channel; the receiver leases a **pre-registered staging buffer** (GPU by default, or host for the
-fallback/topology-specific path; bump-allocated, RAII lease) and returns destination addresses; the sender
+side-channel; the receiver leases a **pre-registered staging buffer** (GPU by default, or host when the deployment selects
+host staging; bump-allocated, RAII lease) and returns destination addresses; the sender
 issues the transfer and polls for completion; a `transfer_complete` handshake lets the receiver wrap the
-staged bytes as a repository-registered `data_batch` and enqueue a reference on the destination stream's input
-channel. If `nixl` is unavailable (or for a self-transfer), it falls back to a bRPC/CPU path.
+staged bytes as a repository-registered `data_batch` and enqueue a handle on the destination stream's input
+channel. A **same-CN** exchange (sink and source on this node) skips the network entirely: the batch handle
+is handed off in-process between the sink's and source's channels (StarRocks' local-exchange equivalent),
+with no serialization. If `nixl` is genuinely unavailable for a cross-CN transfer, it falls back to a
+bRPC/CPU path.
 
 ```mermaid
 sequenceDiagram
@@ -360,6 +399,7 @@ sequenceDiagram
   participant SC as side-channel (NixlMetadataService)
   participant RX as Receiver CN
   participant RB as Receiver staging buffer (GPU or host)
+  Note over TX,RX: same-CN exchange skips all of this — in-process channel hand-off
   Note over TX,RX: startup — each agent computes local metadata (get_local_md), covering registered staging memory
   opt first transfer to a new peer
     TX->>SC: send local agent metadata
@@ -377,8 +417,8 @@ sequenceDiagram
   end
   TX->>SC: transfer_complete
   SC->>RX: transfer_complete
-  RX->>RX: wrap/register data_batch -> push input-channel ref
-  alt nixl unavailable (try_new -> None) or self-transfer
+  RX->>RX: wrap/register data_batch -> push input-channel handle
+  alt nixl unavailable for a cross-CN transfer (try_new -> None)
     TX->>RX: bRPC / CPU fallback (serialize + send PBlock)
   end
 ```
@@ -437,13 +477,15 @@ flowchart TB
 
 **Recommendation: option A (shared cucascade manager).** It is the only option that *can* make in/out
 exchange batches downgrade spill candidates alongside compute, by reusing the existing downgrade executor.
-But that reuse only covers data the executor can see: its sweep walks **registered `shared_data_repository`**
-batches and spills any that are idle (it filters on `idle` state, not batch origin —
-`src/include/data/convertible_data_batch.hpp:303`; candidate sweep
-`src/downgrade/downgrade_executor.cpp:206-252`). So option A takes **two** changes, not one:
+Option A forces the wrapper to depend on cuCascade, which is acceptable for the StarRocks CN now; cuCascade-free
+entry points (option C-style, for embedders that don't want it) can be added later for other use-cases without
+changing the engine side. That reuse only covers data the executor can see: its sweep walks **registered
+`shared_data_repository`** batches and spills any that are idle (it filters on `idle` state, not batch origin
+— see the idle check in `convertible_data_batch_provider`; candidate sweep in
+`src/downgrade/downgrade_executor.cpp`). So option A takes **two** changes, not one:
 
 1. **Borrow the manager** — the Sirius context uses the wrapper's `cucascade::memory_reservation_manager`
-   instead of constructing its own (`src/sirius_context.cpp:336`).
+   instead of constructing its own (`sirius_context::sirius_context` in `src/sirius_context.cpp`).
 2. **Make exchange memory visible to it** — queued in/out batches must be held as `data_batch`es in a
    repository registered with that manager (not in opaque bounded channels), and `nixl`'s
    registered/staging GPU buffers — which are RAII leases, not repository batches, so the sweep never sees
@@ -460,7 +502,7 @@ nodes).
 
 For an **all-to-all** exchange the scarce resource is the fixed receive-staging arena (its **leases**), not
 just total GPU bytes, and a logical plan DAG does not prevent a physical lease cycle (see §7). Option A
-therefore needs three further constraints:
+therefore needs four further constraints:
 
 1. **Lease-aware spill.** Generic spilling picks idle batches by memory *tier*, not by pool origin, so it
    frees GPU bytes without necessarily releasing a staging lease. Releasing a lease requires the received
@@ -476,6 +518,11 @@ therefore needs three further constraints:
    receiver may have a staging lease to reclaim, but no destination capacity to copy the batch into. The first
    implementation should prefer host/disk-backed credit, sized for one max receive batch or one chunked
    copy-out unit, so forward progress does not steal GPU memory from compute.
+4. **Reserved send-copy credit.** Symmetric to the copy-out credit, on the send side. When an output batch is
+   still repository-registered for spill (`use_count()>1`), feeding it to `nixl` requires a deep copy (see §7,
+   "Sink → nixl ownership") and that copy needs ordinary memory. Without a reserved, non-borrowable send-copy
+   credit the sink can deadlock symmetrically: it must send to free memory, but the send needs memory it
+   cannot get. Size it like the copy-out credit (one max send batch, or one chunked unit).
 
 Eviction *ordering* (MRU vs LRU) is a secondary concern — the first-order contract is that spill can reclaim
 the **specific** lease progress needs, not which idle batch is chosen first.
@@ -505,10 +552,10 @@ flowchart TB
   classDef priorart fill:#ede7f6,stroke:#6a1b9a,stroke-width:1.5px,stroke-dasharray:2 2,color:#1a1a1a;
 ```
 
-*Refs: single manager per context `src/include/sirius_context.hpp:340`, subclass of
-`cucascade::memory::memory_reservation_manager` `src/include/memory/sirius_memory_reservation_manager.hpp:29`;
-reservation + downgrade trigger `src/pipeline/gpu_pipeline_executor.cpp:122,132-162`; cuDF routed through the
-reservation-aware adaptor `src/memory/sirius_memory_reservation_manager.cpp:42-45`.*
+*Refs: single `memory_manager_` per context (`src/include/sirius_context.hpp`), a subclass of
+`cucascade::memory::memory_reservation_manager` (`src/include/memory/sirius_memory_reservation_manager.hpp`);
+reservation + downgrade trigger in `gpu_pipeline_executor.cpp`; cuDF routed through the reservation-aware
+adaptor in `src/memory/sirius_memory_reservation_manager.cpp`.*
 
 ---
 
@@ -533,10 +580,24 @@ reservation-aware adaptor `src/memory/sirius_memory_reservation_manager.cpp:42-4
   the batch is still shared (broadcast to several peers, or still parked in the repository for spill). Open
   tension: keeping a batch repository-registered for spill means `use_count()>1` at send time → copy; a
   zero-copy steal requires dropping the repository ref first, giving up spill-eligibility during the
-  in-flight send. Plus the `transfer_complete` handshake that finally releases the batch.
-- **Batch ownership graph.** Pin down whether a channel is a second, independent owner or only a handle into
-  the repository (the intended model), and enumerate every holder — repository, channel, in-flight accessor,
-  downgrade executor, `nixl` send — so that "idle ⇒ spillable" and free-on-last-drop are unambiguous.
+  in-flight send. The deep-copy case is what the §6 **send-copy credit** (constraint 4) reserves memory for.
+  Plus the `transfer_complete` handshake that finally releases the batch.
+- **Batch ownership graph.** *Settled* (§3): the channel is **not** an owner — it carries a repository
+  batch-id handle, so the owning holders are the repository, the in-flight accessor, the downgrade executor
+  (transiently), and the `nixl` send path. This keeps "idle ⇒ spillable" and free-on-last-drop unambiguous,
+  and is what lets the sink's zero-copy steal (above) ever observe `use_count()==1`. Remaining work is to
+  enforce the handle-not-`shared_ptr` discipline in the channel type itself.
+- **Cross-CN completion (EOS).** §4 flags the gap: how end-of-stream is carried **across** `nixl`/bRPC (a
+  terminal marker, not just a local `close_input`), and how a source learns the **sender count** from the
+  plan so it finalizes only after every upstream CN has signaled done. Fan-in routing alone does not settle
+  completion.
+- **Order-preserving (merging) exchange.** v1 emits and coalesces out of order (§4). Open: how to support
+  StarRocks' merging exchange (`ORDER BY` / top-N) — disable coalescing and add a receiver-side k-way merge,
+  or keep merging exchanges on the CPU/bRPC path for now.
+- **Partition-hash parity.** §4 lists StarRocks' three regimes (fnv/xxh3 by `exchange_hash_function_version`,
+  CRC32 for bucket-shuffle without bucket props, bucket-id mapping with them). Open: reproducing each
+  bit-exactly on the GPU in cuDF and dispatching on partition type/version, validated against
+  `test/sql/test_exchange_hash_function`.
 - **Deadlock / liveness.** Two hazards. *(a) Thread/queue stalls* — every worker slot parked on a full
   output channel with none left to drain inputs, or a blocked sink pinning memory that spilling needs;
   mitigated by a blocked sink **yielding its task** (not blocking a worker thread) and keeping queued batches
