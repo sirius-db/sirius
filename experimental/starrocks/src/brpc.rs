@@ -1,7 +1,7 @@
 use std::{future::Future, net::TcpListener as StdTcpListener, pin::Pin};
 
 use crate::{
-    internal_service::SiriusComputeNodeService,
+    compute_node_service::SiriusComputeNodeService,
     proto::starrocks::p_internal_service_brpc::PInternalServiceRouter, prpc,
 };
 use anyhow::{Context, Result};

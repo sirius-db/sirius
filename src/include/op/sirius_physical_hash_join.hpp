@@ -18,6 +18,7 @@
 
 #include "cudf/cudf_utils.hpp"
 #include "cudf/join/distinct_hash_join.hpp"
+#include "cudf/join/filtered_join.hpp"
 #include "duckdb/common/value_operations/value_operations.hpp"
 #include "duckdb/execution/join_hashtable.hpp"
 #include "duckdb/execution/operator/join/perfect_hash_join_executor.hpp"
@@ -25,6 +26,7 @@
 #include "duckdb/execution/operator/join/physical_join.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
+#include "expression/ast/node.hpp"  // complete sirius::ast::node for join_condition's destructor
 #include "expression/join_condition.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "sirius_config.hpp"
@@ -104,6 +106,11 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   mutable bool unique_probe_keys = false;
 
+  //! Row-count ratio gate for switching STANDARD-mode MARK joins to cudf::mark_join (build on the
+  //! left/output side) instead of filtered_join (build on the right side). Switch when
+  //! right_rows >= ratio * left_rows; 0 disables. Set from operator_params at planning time.
+  double mark_join_build_switch_ratio = config::DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO;
+
   static void build_join_pipelines(pipeline::sirius_pipeline& current,
                                    pipeline::sirius_meta_pipeline& meta_pipeline,
                                    sirius_physical_operator& op,
@@ -173,6 +180,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   std::unique_ptr<cudf::hash_join> _hash_table;  // hash object to be used in BUILD_PROBE mode
   std::unique_ptr<cudf::distinct_hash_join>
     _distinct_hash_table;  // used instead of _hash_table when build keys are proven unique
+  std::unique_ptr<cudf::filtered_join>
+    _filtered_table;  // reusable build-on-right semi-join object for MARK joins in BUILD_PROBE mode
   std::optional<::cucascade::read_only_data_batch>
     _build_table;  // owned build table for BUILD_PROBE mode, to materialize build side results
   std::vector<std::unique_ptr<cudf::column>>

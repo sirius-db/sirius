@@ -1,0 +1,17 @@
+[package]
+name = "sirius"
+version.workspace = true
+edition.workspace = true
+description = "Safe, idiomatic Rust bindings for Sirius, the GPU-native SQL engine."
+license = "Apache-2.0"
+# Transitively links a local Sirius build-tree artifact; not for crates.io.
+publish = false
+
+[features]
+# Forwarded to sirius-sys: link the self-contained libsirius.a (no runtime deps)
+# instead of the default libsirius.so. See sirius-sys for details.
+static = ["sirius-sys/static"]
+
+[dependencies]
+cxx.workspace = true
+sirius-sys.workspace = true

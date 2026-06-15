@@ -17,9 +17,7 @@
 #include "pipeline/sirius_plan_printer.hpp"
 
 #include "duckdb/common/enums/join_type.hpp"
-#include "op/sirius_physical_duckdb_scan.hpp"
 #include "op/sirius_physical_hash_join.hpp"
-#include "op/sirius_physical_iceberg_scan.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "op/sirius_physical_parquet_scan.hpp"
@@ -318,14 +316,8 @@ std::vector<std::string> sirius_plan_printer::get_operator_detail_lines(
     case op::SiriusPhysicalOperatorType::TABLE_SCAN:
       scan_name = op.Cast<op::sirius_physical_table_scan>().function.name;
       break;
-    case op::SiriusPhysicalOperatorType::DUCKDB_SCAN:
-      scan_name = op.Cast<op::sirius_physical_duckdb_scan>().function.name;
-      break;
     case op::SiriusPhysicalOperatorType::PARQUET_SCAN:
       scan_name = op.Cast<op::sirius_physical_parquet_scan>().function.name;
-      break;
-    case op::SiriusPhysicalOperatorType::ICEBERG_SCAN:
-      scan_name = op.Cast<op::sirius_physical_iceberg_scan>().function.name;
       break;
     default: break;
   }

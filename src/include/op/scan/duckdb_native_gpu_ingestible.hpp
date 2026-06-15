@@ -21,6 +21,7 @@
 #include <io/gpu_ingestible.hpp>
 #include <op/scan/duckdb_native_decoder.hpp>  // duckdb_native_split_payload
 #include <op/scan/duckdb_native_metadata.hpp>
+#include <op/sirius_physical_operator.hpp>  // op::operator_data (raw-range carrier base)
 #include <sirius_config.hpp>
 
 // duckdb
@@ -45,9 +46,12 @@
 
 namespace sirius::scan_manager {
 class sirius_scan_manager;
+class split_connector;
 }  // namespace sirius::scan_manager
 
 namespace sirius::op::scan {
+
+class batch_coalescer;
 
 //===----------------------------------------------------------------------===//
 // duckdb_native_ingestible_table_info
@@ -79,8 +83,7 @@ class duckdb_native_ingestible_table_info : public io::ingestible_table_info {
 
   std::shared_ptr<io::gpu_ingestible> make_ingestible(
     std::unique_ptr<io::ingestible_table_info> self,
-    scan_manager::sirius_scan_manager const& mgr,
-    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs) override;
+    scan_manager::sirius_scan_manager const& mgr) override;
 
   /// db_path-as-span. The cache match in @c sirius_scan_manager never
   /// matches duckdb-native ingestibles (pinned-cache key is parquet file
@@ -136,14 +139,33 @@ class duckdb_native_post_filter_and_projection_info : public io::post_filter_and
 };
 
 //===----------------------------------------------------------------------===//
+// duckdb_native_range_input
+//===----------------------------------------------------------------------===//
+/**
+ * @brief Carrier for one parsed row-group range.
+ *
+ * @c consume_next_input feeds the row groups through the @c batch_coalescer to
+ * form @c duckdb_native_split_info batches. Holds only the parsed row groups;
+ * the ingestible owns the shared bind data and IO handles. Never reaches
+ * @c execute().
+ */
+class duckdb_native_range_input : public op::operator_data {
+ public:
+  std::vector<duckdb_row_group_metadata> row_groups;
+
+  [[nodiscard]] op::operator_data_type get_type() const override
+  {
+    return op::operator_data_type::GPU_SCAN;
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // duckdb_native_gpu_ingestible
 //===----------------------------------------------------------------------===//
 class duckdb_native_gpu_ingestible : public io::gpu_ingestible {
  public:
-  duckdb_native_gpu_ingestible(
-    std::unique_ptr<io::ingestible_table_info> info,
-    scan_manager::sirius_scan_manager const& mgr,
-    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs);
+  duckdb_native_gpu_ingestible(std::unique_ptr<io::ingestible_table_info> info,
+                               scan_manager::sirius_scan_manager const& mgr);
 
   ~duckdb_native_gpu_ingestible() override;
 
@@ -160,13 +182,25 @@ class duckdb_native_gpu_ingestible : public io::gpu_ingestible {
     ::cucascade::memory::memory_space const& mem_space,
     rmm::cuda_stream_view stream) override;
 
- private:
-  struct row_group_batch {
-    std::size_t first_idx;
-    std::size_t count;
-  };
+  // -----------------------------
+  // Consumer-side coalescing
+  // -----------------------------
+  /// Pull row-group ranges off the connector, feed them through @ref _coalescer,
+  /// and return cap-sized batches. Flushes the tail batch once the connector is
+  /// closed and drained.
+  std::unique_ptr<op::operator_data> consume_next_input(
+    scan_manager::split_connector& connector) override;
 
-  duckdb_native_metadata _metadata;
+  /// False while @ref _coalescer still holds unserved row groups.
+  [[nodiscard]] bool consumer_drained() const override;
+
+ private:
+  /// Wrap a batch of row groups into a @c scan_operator_input
+  /// (@c duckdb_native_split_info plus optional filter/projection info).
+  std::unique_ptr<op::operator_data> make_batch(std::vector<duckdb_row_group_metadata> row_groups);
+
+  // ---- Walk plan + range claiming (producer side) ----
+  duckdb_native_walk_plan _plan;
   std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
   std::shared_ptr<sirius::io::sirius_io_object> _db_io_object;
   /// Pre-built coalesced filter expression. Empty when no translatable
@@ -175,8 +209,13 @@ class duckdb_native_gpu_ingestible : public io::gpu_ingestible {
   bool _projection_required = false;
   std::size_t _output_arity = 0;
 
-  std::vector<row_group_batch> _batches;
-  std::atomic<std::size_t> _next_batch_idx{0};
+  /// Row groups claimed per range (tunable via SIRIUS_METADATA_PARSE_CHUNK).
+  std::size_t _chunk_row_groups = 1;
+  std::size_t _num_ranges       = 0;
+  std::atomic<std::size_t> _next_range_idx{0};
+
+  // ---- Consumer-side coalescer ----
+  std::unique_ptr<batch_coalescer> _coalescer;
 };
 
 }  // namespace sirius::op::scan

@@ -16,6 +16,8 @@
 
 #include "io/s3/s3_reactor.hpp"
 
+#include "io/sirius_datasource.hpp"
+
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <curl/curl.h>
 
@@ -748,13 +750,23 @@ void s3_reactor::poll_device_copies()
 
 void CUDART_CB s3_reactor::cuda_copy_done(cudaStream_t, cudaError_t status, void* userdata)
 {
-  auto* t        = static_cast<transfer*>(userdata);
+  auto* t = static_cast<transfer*>(userdata);
+  // Lifetime contract: the release-store of cuda_done is the LAST access this
+  // callback makes — to the transfer AND to the reactor. Before the store, t
+  // is still listed in _copying, which pins both lifetimes: poll_device_copies
+  // only deletes t after seeing cuda_done, and cancel_all_on_shutdown stream-
+  // synchronizes every _copying stream (waiting this callback out) before the
+  // reactor tears down _multi. Touching either after the store races with
+  // that delete / teardown (seen as a SIGSEGV on the CUDA callback thread
+  // under SF10 load). The wakeup therefore fires BEFORE the store: it is
+  // sticky (socketpair write), so the worker either wakes into the published
+  // flag or catches it on the next poll tick.
   t->cuda_status = status;  // write before the release-store
-  t->cuda_done.store(true, std::memory_order_release);
   if (t->owner != nullptr) {
     t->owner->_device_copies_total.fetch_add(1, std::memory_order_relaxed);
     curl_multi_wakeup(static_cast<CURLM*>(t->owner->_multi));  // unified wake point
   }
+  t->cuda_done.store(true, std::memory_order_release);
 }
 
 void s3_reactor::cancel_all_on_shutdown()

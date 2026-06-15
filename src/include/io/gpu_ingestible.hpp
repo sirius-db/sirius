@@ -30,14 +30,7 @@ class memory_space;
 // standard library
 #include <functional>
 #include <memory>
-#include <span>
-#include <string>
-#include <unordered_map>
 #include <vector>
-
-namespace sirius::io {
-class sirius_ioctx;
-}  // namespace sirius::io
 
 namespace sirius::op {
 class operator_data;
@@ -45,6 +38,7 @@ class operator_data;
 
 namespace sirius::scan_manager {
 class sirius_scan_manager;
+class split_connector;
 }  // namespace sirius::scan_manager
 
 namespace sirius::io {
@@ -85,12 +79,9 @@ class ingestible_table_info {
    * @param mgr         Owning scan_manager. Forwarded so the ingestible
    *                    can route each path to its backend via
    *                    @c sirius_scan_manager::io_ctx_shared_for.
-   * @param gpu_ioctxs  Per-GPU sirius_ioctx map for multi-GPU IO routing.
    */
   virtual std::shared_ptr<gpu_ingestible> make_ingestible(
-    std::unique_ptr<ingestible_table_info> self,
-    scan_manager::sirius_scan_manager const& mgr,
-    std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs) = 0;
+    std::unique_ptr<ingestible_table_info> self, scan_manager::sirius_scan_manager const& mgr) = 0;
 
   /**
    * @brief Resolved file paths captured at bind time.
@@ -294,6 +285,28 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
     ::cucascade::memory::memory_space const& mem_space,
     rmm::cuda_stream_view stream) = 0;
 
+  /**
+   * @brief Produce the next per-task input from the connector.
+   *
+   * Called on the scan operator's single consumer thread. The default returns
+   * the next split unchanged; @c duckdb_native_gpu_ingestible coalesces
+   * row-group ranges into cap-sized batches.
+   *
+   * @return The next per-task operator_data, or nullptr once the connector is
+   *         closed and all buffered work has been served.
+   */
+  virtual std::unique_ptr<op::operator_data> consume_next_input(
+    scan_manager::split_connector& connector);
+
+  /**
+   * @brief Whether the ingestible still holds buffered consumer-side work.
+   *
+   * Default: true (no buffer). The duckdb-native override returns false while
+   * its coalescer still holds batches, so the scan is not reported done before
+   * its last batch is served.
+   */
+  [[nodiscard]] virtual bool consumer_drained() const { return true; }
+
   [[nodiscard]] ingestible_table_info const& table_info() const noexcept { return *_table_info; }
 
  protected:
@@ -310,9 +323,7 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
  * build the format-specific ingestible from the operator's bind data.
  * Throws when @p info is null.
  */
-std::shared_ptr<gpu_ingestible> make_gpu_ingestible(
-  std::unique_ptr<ingestible_table_info> info,
-  scan_manager::sirius_scan_manager const& mgr,
-  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> const& gpu_ioctxs);
+std::shared_ptr<gpu_ingestible> make_gpu_ingestible(std::unique_ptr<ingestible_table_info> info,
+                                                    scan_manager::sirius_scan_manager const& mgr);
 
 }  // namespace sirius::io

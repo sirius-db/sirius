@@ -18,6 +18,7 @@
 #include <duckdb/parser/expression/constant_expression.hpp>
 #include <duckdb/parser/expression/function_expression.hpp>
 #include <duckdb/parser/tableref/table_function_ref.hpp>
+#include <io/sirius_datasource.hpp>
 
 #include <algorithm>
 #include <array>
@@ -153,7 +154,11 @@ struct sirius_memory_limits {
   std::string gpu_usage{"256 MiB"};
   std::string gpu_reservation{"128 MiB"};
   std::string host_capacity{"512 MiB"};
-  std::string disk_capacity;
+  // A small disk tier so the downgrade executor can spill instead of looping
+  // when GPU pressure is hit. Without it, on large-VRAM GPUs (where RMM's pool
+  // can exceed the 256 MiB usage cap at init) even a tiny scan spins forever at
+  // the no-disk-spill boundary. `large_sirius_memory_limits()` overrides this.
+  std::string disk_capacity{"2 GiB"};
   std::optional<bool> enable_chunk_prewarm;
 };
 
@@ -474,9 +479,9 @@ duckdb::SiriusContext& require_sirius_context(s3_sql_fixture& fixture)
 sirius::io::s3::s3_ioctx& require_async_s3_ioctx(s3_sql_fixture& fixture, std::string const& uri)
 {
   auto& sirius_ctx = require_sirius_context(fixture);
-  auto* base_ctx   = sirius_ctx.get_scan_manager().io_ctx_for(uri);
-  REQUIRE(base_ctx != nullptr);
-  auto* s3_ctx = dynamic_cast<sirius::io::s3::s3_ioctx*>(base_ctx);
+  auto datasource  = sirius_ctx.get_scan_manager().create_datasource(uri);
+  REQUIRE(datasource != nullptr);
+  auto* s3_ctx = dynamic_cast<sirius::io::s3::s3_ioctx*>(datasource->io_ctx().get());
   REQUIRE(s3_ctx != nullptr);
   return *s3_ctx;
 }
@@ -1241,6 +1246,45 @@ TEST_CASE("gpu_execution S3 SQL results match with the async backend flag",
   CHECK(async.first == blocking.first);
   CHECK(async.first.size() == 25);
   CHECK(async.second > 0);
+}
+
+TEST_CASE("gpu_execution S3 nested parquet probe returns oracle rows or a clear unsupported error",
+          "[.][s3][integration][sql][gpu_execution][nested]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  auto nested_key        = env_or("SIRIUS_TEST_S3_NESTED_KEY");
+  auto nested_local_path = fs::path{env_or("SIRIUS_TEST_S3_NESTED_LOCAL_PARQUET")};
+  if (nested_key.empty() || nested_local_path.empty() || !fs::exists(nested_local_path)) {
+    SUCCEED(
+      "Nested parquet fixture not configured; set SIRIUS_TEST_S3_NESTED_KEY and "
+      "SIRIUS_TEST_S3_NESTED_LOCAL_PARQUET to run the S14 probe");
+    return;
+  }
+
+  duckdb::DuckDB baseline_db(nullptr);
+  duckdb::Connection baseline_con(baseline_db);
+  auto baseline_result = require_query_ok(
+    baseline_con, "SELECT * FROM read_parquet(" + sql_quote(nested_local_path.string()) + ")");
+
+  s3_sql_fixture fixture(*env);
+  auto const uri = s3_uri(env->bucket, nested_key);
+  auto result =
+    fixture.con.Query(gpu_execution_sql("SELECT * FROM read_parquet(" + sql_quote(uri) + ")"));
+  REQUIRE(result);
+  if (result->HasError()) {
+    auto const error = result->GetError();
+    INFO(error);
+    CHECK((error.find("unsupported") != std::string::npos ||
+           error.find("Unsupported") != std::string::npos ||
+           error.find("nested") != std::string::npos || error.find("Nested") != std::string::npos));
+    return;
+  }
+
+  auto materialized = std::unique_ptr<duckdb::MaterializedQueryResult>(
+    static_cast<duckdb::MaterializedQueryResult*>(result.release()));
+  check_rows_equal_with_tolerant_columns(*materialized, *baseline_result, {});
 }
 
 TEST_CASE("gpu_execution reads real AWS S3 parquet through Sirius SigV4",

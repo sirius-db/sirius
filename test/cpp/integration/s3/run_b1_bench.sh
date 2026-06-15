@@ -19,16 +19,10 @@ if [[ ! -x "${S3_TEST_BIN}" ]]; then
   exit 1
 fi
 
-cleanup()
-{
-  make -C "${PROJECT_ROOT}" s3-down
-}
-trap cleanup EXIT
-
-make -C "${PROJECT_ROOT}" s3-up-large
-
-# shellcheck disable=SC1091
-source "${SCRIPT_DIR}/env.sh"
+# MinIO is now started by the test binary itself (testcontainers); just opt in
+# and request the SF10 fixture. No s3-up/s3-down, no env.sh to source.
+export SIRIUS_TEST_S3_AUTO=1
+export SIRIUS_TEST_S3_LARGE=1
 export SIRIUS_TEST_S3_STRICT=1
 export SIRIUS_BENCH_BRANCH="$(git -C "${PROJECT_ROOT}" rev-parse --abbrev-ref HEAD)"
 export SIRIUS_BENCH_SHA="$(git -C "${PROJECT_ROOT}" rev-parse --short HEAD)"

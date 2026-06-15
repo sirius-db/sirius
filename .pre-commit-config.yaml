@@ -13,7 +13,9 @@
 # See https://github.com/pre-commit/pre-commit
 
 # Global exclusions, csv are excluded because they are often test answers, and experimental is out of lint scope.
-exclude: \.csv$|^legacy/queries/.*|^experimental/.*
+# .patch files are verbatim diffs: formatters (trailing-whitespace, end-of-file-fixer)
+# strip the leading context space on blank lines and corrupt `git apply`.
+exclude: \.csv$|\.patch$|^legacy/queries/.*|^experimental/.*
 
 repos:
   # Standard hooks
@@ -74,3 +76,11 @@ repos:
       - id: cmake-lint
         args:
           [--line-width  220, --disabled-codes=C0307, --suppress-decorations]
+  - repo: local
+    hooks:
+      - id: check-orphan-tests
+        name: check for orphaned test files
+        entry: python3 scripts/check_orphan_tests.py
+        language: system
+        files: ^(test/cpp/.*\.cpp|CMakeLists\.txt|test/cpp/orphan_test_allowlist\.txt)$
+        pass_filenames: false
