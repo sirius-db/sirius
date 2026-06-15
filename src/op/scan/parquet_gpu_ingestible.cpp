@@ -22,6 +22,7 @@
 #include <io/prefetching_cache.hpp>
 #include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
+#include <op/scan/coalescing_carrier.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/parquet_schema_mapping.hpp>
 #include <op/scan/scan_utils.hpp>
@@ -44,8 +45,8 @@
 // duckdb
 #include <duckdb/common/hive_partitioning.hpp>
 
-// uring_reactor MUST be included last among sirius headers — see
-// parquet_split_provider.cpp for the BLOCK_SIZE macro-collision rationale.
+// uring_reactor MUST be included last among sirius headers: its BLOCK_SIZE macro
+// collides with the cudf/parquet symbols pulled in above.
 #include <io/uring/uring_reactor.hpp>
 
 // standard library
@@ -62,16 +63,6 @@
 namespace sirius::op::scan {
 
 namespace {
-
-struct rg_accumulator {
-  std::vector<row_group_slice> slices;
-  std::size_t total_uncompressed_bytes = 0;
-  // Partition values for the files currently bundled, in scan_plan::partition_columns order.
-  // nullopt until the first file is added. Bundling is only safe across files with identical
-  // values: post_filter_and_project synthesizes constant scalar columns from this single vector
-  // on behalf of every file in the bundle, so all files in the bundle must share those values.
-  std::optional<std::vector<std::string>> partition_values;
-};
 
 bool has_uri_scheme(std::string const& p) { return p.find("://") != std::string::npos; }
 
@@ -111,12 +102,12 @@ std::shared_ptr<io::gpu_ingestible> parquet_ingestible_table_info::make_ingestib
 //===----------------------------------------------------------------------===//
 parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<io::ingestible_table_info> info,
                                                scan_manager::sirius_scan_manager const& mgr)
-  : io::gpu_ingestible(std::move(info)), _scan_manager(&mgr)
+  : coalescing_gpu_ingestible(std::move(info)), _scan_manager(&mgr)
 {
   auto const& bind = static_cast<parquet_ingestible_table_info const&>(table_info());
 
   // Any non-trivial scan shape — reader-side projection, filter pushdown, or hive-partition
-  // injection — needs column names. Matches parquet_split_provider's ctor invariant.
+  // injection — must resolve columns by name, so names are required here.
   bool const needs_names = !bind.projection_ids.empty() ||
                            (bind.table_filters && !bind.table_filters->filters.empty()) ||
                            !bind.partition_indices.empty();
@@ -151,6 +142,14 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<io::ingestible_ta
   _max_file_processed     = bind.max_file_processed;
   _total_files            = _file_paths.size();
 
+  // Shared column-projection options for every split.
+  _reader_options = std::make_shared<cudf::io::parquet_reader_options>(
+    cudf::io::parquet_reader_options::builder().build());
+  if (_plan->is_projected()) { _reader_options->set_column_names(_plan->data_column_names()); }
+
+  // Construct the coalescer
+  _coalescer = std::make_unique<batch_coalescer>(_approximate_batch_size);
+
   for (std::size_t start = 0; start < _total_files; start += _max_file_processed) {
     auto const end = std::min(start + _max_file_processed, _total_files);
     file_batch batch;
@@ -183,7 +182,7 @@ parquet_gpu_ingestible::next_split_provider()
 }
 
 //===----------------------------------------------------------------------===//
-// run_batch — ports parquet_split_provider::run_batch
+// run_batch — producer: read footers, prune row groups, box each into a unit, emit one carrier
 //===----------------------------------------------------------------------===//
 void parquet_gpu_ingestible::run_batch(file_batch const& batch,
                                        std::vector<std::unique_ptr<op::operator_data>>& out)
@@ -191,10 +190,8 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
   auto stream = cudf::get_default_stream();
 
   auto const data_column_names = _plan->data_column_names();
-  auto reader_options          = std::make_shared<cudf::io::parquet_reader_options>(
-    cudf::io::parquet_reader_options::builder().build());
-
-  if (_plan->is_projected()) { reader_options->set_column_names(data_column_names); }
+  // Local copy of the reader options for filter pushdown (must be FLBA-aware)
+  auto reader_options = std::make_shared<cudf::io::parquet_reader_options>(*_reader_options);
 
   if (_scan_manager == nullptr) {
     throw std::runtime_error("parquet_gpu_ingestible: no scan_manager is wired.");
@@ -210,7 +207,8 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
     auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
     ast_expression = translator.translate_expression_with_names(*sirius_filter_ast, name_resolver);
     if (ast_expression) {
-      // FLBA-decimal pushdown probe — see parquet_split_provider.cpp:276-326.
+      // FLBA-decimal pushdown probe: a DECIMAL stored as FIXED_LEN_BYTE_ARRAY carries
+      // byte-array stats cudf cannot compare to a numeric literal, so skip pushdown for it.
       if (!batch.file_paths.empty()) {
         auto const& probe_path = batch.file_paths.front();
         try {
@@ -279,47 +277,18 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
     }
   }
 
-  rg_accumulator accum;
-  bool const needs_post_processing = needs_output_assembly(*_plan);
-
-  auto build_post_filter_info =
-    [&accum, needs_post_processing]() -> std::unique_ptr<io::post_filter_and_projection_info> {
-    if (!needs_post_processing) { return nullptr; }
-    auto info              = std::make_unique<parquet_post_filter_and_projection_info>();
-    info->partition_values = accum.partition_values.value_or(std::vector<std::string>{});
-    return info;
-  };
-
-  auto flush = [&](std::shared_ptr<cudf::io::parquet_reader_options> shared_opts,
-                   std::shared_ptr<scan_plan const> shared_plan) {
-    if (accum.slices.empty()) { return; }
-    auto split_info                     = std::make_unique<parquet_split_info>();
-    split_info->rg_slices               = std::move(accum.slices);
-    split_info->reader_options          = std::move(shared_opts);
-    split_info->plan                    = std::move(shared_plan);
-    split_info->disable_filter_pushdown = skip_pushdown_due_to_flba;
-    split_info->needs_assembly          = needs_post_processing;
-    split_info->partition_values = accum.partition_values.value_or(std::vector<std::string>{});
-    auto metadata = std::make_unique<io::scan_and_filter_metadata>(std::move(split_info),
-                                                                   build_post_filter_info());
-    out.push_back(std::make_unique<scan_operator_input>(std::move(metadata)));
-    accum.slices.clear();
-    accum.total_uncompressed_bytes = 0;
-  };
+  // The unit of parsed metadata to carry into the coalescer.
+  auto carrier = std::make_unique<coalescing_carrier>();
 
   for (auto const& file_path : batch.file_paths) {
+    std::vector<std::string> file_partition_values;
     if (!_plan->partition_columns.empty()) {
-      std::vector<std::string> file_partition_values;
       file_partition_values.reserve(_plan->partition_columns.size());
       auto parsed = duckdb::HivePartitioning::Parse(file_path);
       for (auto const& pc : _plan->partition_columns) {
         auto it = parsed.find(pc.name);
         file_partition_values.push_back(it != parsed.end() ? it->second : std::string{});
       }
-      if (accum.partition_values && *accum.partition_values != file_partition_values) {
-        flush(reader_options, _plan);
-      }
-      accum.partition_values = std::move(file_partition_values);
     }
 
     // Resolve the file to a sirius_datasource — it carries its own io backend,
@@ -408,7 +377,7 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
 
     // Scan-side chunk prewarm: projection and row-group pruning are final for
     // this file, so hand the prefetch cache the merged column-chunk byte
-    // ranges (plus parquet magic + footer) to stage while slices are built.
+    // ranges (plus parquet magic + footer) to stage while units are boxed.
     // describe_parquet()'s insert stays metadata-only — this is the only
     // place ranges enter the cache, and only when the knob is on.
     if (sirius_ds && _scan_manager->chunk_prewarm_enabled() && !row_group_indices.empty()) {
@@ -463,24 +432,6 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
       }
     }
 
-    std::vector<cudf::size_type> cur_rgs;
-    std::size_t cur_uncompressed_bytes = 0;
-    std::size_t cur_compressed_bytes   = 0;
-
-    auto seal_current_file = [&]() {
-      if (cur_rgs.empty()) { return; }
-      accum.slices.emplace_back(file_metadata,
-                                file_path,
-                                std::move(cur_rgs),
-                                cur_uncompressed_bytes,
-                                cur_compressed_bytes,
-                                sirius_ds);
-      accum.total_uncompressed_bytes += cur_uncompressed_bytes;
-      cur_rgs.clear();
-      cur_uncompressed_bytes = 0;
-      cur_compressed_bytes   = 0;
-    };
-
     auto rg_contribution = [&](cudf::io::parquet::RowGroup const& row_group) {
       std::size_t rg_uncompressed = 0;
       std::size_t rg_compressed   = 0;
@@ -504,28 +455,74 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
     };
 
     for (auto const rg_idx : row_group_indices) {
-      auto const& row_group        = metadata.row_groups[rg_idx];
-      auto const [rg_unc, rg_comp] = rg_contribution(row_group);
+      auto const& row_group           = metadata.row_groups[rg_idx];
+      auto const [rg_uncomp, rg_comp] = rg_contribution(row_group);
 
-      if (!accum.slices.empty() || !cur_rgs.empty()) {
-        if (accum.total_uncompressed_bytes + cur_uncompressed_bytes + rg_unc >
-            _approximate_batch_size) {
-          seal_current_file();
-          flush(reader_options, _plan);
-        }
-      }
+      coalescing_unit unit;
+      unit.row_count     = static_cast<std::size_t>(row_group.num_rows);
+      unit.decoded_bytes = rg_uncomp;
+      unit.group_key     = file_partition_values;
 
-      cur_uncompressed_bytes += rg_unc;
-      cur_compressed_bytes += rg_comp;
-      cur_rgs.push_back(rg_idx);
+      std::vector<cudf::size_type> rg_one{static_cast<cudf::size_type>(rg_idx)};
+      auto payload                     = std::make_unique<parquet_payload>(row_group_slice{
+        file_metadata, file_path, std::move(rg_one), rg_uncomp, rg_comp, sirius_ds});
+      payload->disable_filter_pushdown = skip_pushdown_due_to_flba;
+      unit.payload                     = std::move(payload);
+
+      carrier->units.push_back(std::move(unit));
     }
-    seal_current_file();
-  }
-  flush(reader_options, _plan);
+  }  // end per-file loop
+
+  if (!carrier->units.empty()) { out.push_back(std::move(carrier)); }
 }
 
 //===----------------------------------------------------------------------===//
-// materialize_table — ports read_table_from_metadata
+// make_batch
+//  merge same-file coalescing units into multi-RG slices expected by materialize_table()
+//===----------------------------------------------------------------------===//
+std::unique_ptr<op::operator_data> parquet_gpu_ingestible::make_batch(
+  std::vector<coalescing_unit> units)
+{
+  std::vector<row_group_slice> rg_slices;
+  bool disable_pushdown = false;
+  for (auto& unit : units) {
+    auto* p          = static_cast<parquet_payload*>(unit.payload.get());
+    disable_pushdown = disable_pushdown || p->disable_filter_pushdown;
+    auto& s          = p->slice;
+    if (!rg_slices.empty() && rg_slices.back().file_path == s.file_path) {
+      auto& back = rg_slices.back();
+      back.row_group_indices.insert(
+        back.row_group_indices.end(), s.row_group_indices.begin(), s.row_group_indices.end());
+      back.reserved_uncompressed_bytes += s.reserved_uncompressed_bytes;
+      back.reserved_compressed_bytes += s.reserved_compressed_bytes;
+    } else {
+      rg_slices.push_back(std::move(s));
+    }
+  }
+
+  auto split_info                     = std::make_unique<parquet_split_info>();
+  split_info->rg_slices               = std::move(rg_slices);
+  split_info->reader_options          = _reader_options;  // shared, immutable
+  split_info->plan                    = _plan;
+  split_info->disable_filter_pushdown = disable_pushdown;
+  split_info->needs_assembly          = needs_output_assembly(*_plan);
+  split_info->partition_values =
+    units.empty() ? std::vector<std::string>{} : units.front().group_key;
+
+  std::unique_ptr<io::post_filter_and_projection_info> filter_info;
+  if (split_info->needs_assembly) {
+    auto pf              = std::make_unique<parquet_post_filter_and_projection_info>();
+    pf->partition_values = split_info->partition_values;
+    filter_info          = std::move(pf);
+  }
+
+  auto metadata =
+    std::make_unique<io::scan_and_filter_metadata>(std::move(split_info), std::move(filter_info));
+  return std::make_unique<scan_operator_input>(std::move(metadata));
+}
+
+//===----------------------------------------------------------------------===//
+// materialize_table — read the row-group slices and apply the filter (pushdown or post-decode)
 //===----------------------------------------------------------------------===//
 io::filtered_table parquet_gpu_ingestible::materialize_table(
   io::scan_info const& info,

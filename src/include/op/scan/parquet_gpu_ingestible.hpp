@@ -19,6 +19,7 @@
 // sirius
 #include <helper/logical_type.hpp>
 #include <io/gpu_ingestible.hpp>
+#include <op/scan/coalescing_gpu_ingestible.hpp>
 #include <op/scan/row_group_metadata.hpp>  // row_group_slice + hybrid_scan_reader
 #include <op/scan/scan_plan.hpp>
 #include <sirius_config.hpp>
@@ -161,23 +162,43 @@ class parquet_post_filter_and_projection_info : public io::post_filter_and_proje
 };
 
 //===----------------------------------------------------------------------===//
+// parquet_payload
+//===----------------------------------------------------------------------===//
+/**
+ * @brief One row-group slice carried opaquely as a @c coalescing_unit payload.
+ *
+ * The coalescing mechanism treats it as an opaque @c coalescing_payload; only
+ * parquet's @c make_batch (and its tests) downcast back to it.
+ */
+struct parquet_payload : public coalescing_payload {
+  explicit parquet_payload(row_group_slice slice) : slice(std::move(slice)) {}
+  row_group_slice slice;
+  /// FLBA-decimal probe result for the file-batch this row group came from;
+  /// make_batch OR-combines these into parquet_split_info::disable_filter_pushdown.
+  bool disable_filter_pushdown = false;
+};
+
+//===----------------------------------------------------------------------===//
 // parquet_gpu_ingestible
 //===----------------------------------------------------------------------===//
 /**
- * @brief Concrete @c io::gpu_ingestible for parquet sources.
+ * @brief Concrete @c coalescing_gpu_ingestible for parquet sources.
  *
- * Owns the shared scan plan and coalesced filter expression; pre-decomposes
- * the file list into per-task batches in its constructor (one batch per
- * @c max_file_processed files). @ref next_split_provider atomically claims
- * the next batch index and returns a callable that runs the footer-read /
- * row-group-pruning / partition-by-bytes work — port of
- * @c parquet_split_provider::run_batch.
+ * Owns the shared scan plan, reader options, and coalesced filter expression;
+ * pre-decomposes the file list into per-task batches in its constructor (one
+ * batch per @c max_file_processed files). @ref next_split_provider atomically
+ * claims the next batch index and returns a callable (@ref run_batch) that does
+ * the footer-read / row-group-pruning work and emits one @c coalescing_carrier
+ * of per-row-group units. The base's coalescer packs those units into cap-sized
+ * batches (honoring @c group_key hive-partition affinity), and @ref make_batch
+ * rebuilds a @c parquet_split_info, merging consecutive same-file units back into
+ * multi-row-group slices.
  *
- * @ref materialize_table is the per-task read + filter step (port of
- * @c sirius_gpu_parquet_scan_operator::read_table_from_metadata, minus
- * assembly). @ref post_filter_and_project does assembly only.
+ * @ref materialize_table reads the slices and applies the filter (reader-side
+ * pushdown, or post-decode when pushdown is unsafe); @ref post_filter_and_project
+ * assembles the decoded columns to the plan's output layout.
  */
-class parquet_gpu_ingestible : public io::gpu_ingestible {
+class parquet_gpu_ingestible : public coalescing_gpu_ingestible {
  public:
   /// Built by @c parquet_ingestible_table_info::make_ingestible. The base
   /// @c _table_info owns the parquet bind data; this constructor casts it
@@ -202,13 +223,18 @@ class parquet_gpu_ingestible : public io::gpu_ingestible {
 
  private:
   /// One per-task batch of files. The footer-read loop in @ref run_batch
-  /// walks these files sequentially, building up a single output vector
-  /// of @c scan_operator_input splits.
+  /// walks these files sequentially, boxing each row group into a
+  /// @c coalescing_unit and emitting a single @c coalescing_carrier.
   struct file_batch {
     std::vector<std::string> file_paths;
   };
 
   void run_batch(file_batch const& batch, std::vector<std::unique_ptr<op::operator_data>>& out);
+
+  /// Rebuild a @c parquet_split_info from a coalesced set of units, merging
+  /// consecutive same-file units back into multi-row-group slices (data batches).
+  // Called by the base's sealed @c consume_next_input.
+  std::unique_ptr<op::operator_data> make_batch(std::vector<coalescing_unit> units) override;
 
   // Canonical scan plan — built once in the constructor, shared by every
   // emitted split via its parquet_split_info::plan member.
@@ -216,6 +242,9 @@ class parquet_gpu_ingestible : public io::gpu_ingestible {
   // Coalesced DuckDB filter expression. Empty when no filters survived the
   // partition-column drop pass.
   std::shared_ptr<duckdb::Expression> _duckdb_filter_expression;
+  // Shared, immutable column-projection reader options, built once in the constructor.
+  // The pushdown filter is NOT set here.
+  std::shared_ptr<cudf::io::parquet_reader_options> _reader_options;
   std::vector<std::string> _file_paths;
   std::size_t _approximate_batch_size{};
   std::size_t _max_file_processed{};

@@ -21,13 +21,14 @@
 #include <io/io_context.hpp>
 #include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
-#include <op/scan/duckdb_native_batch_coalescer.hpp>
+#include <op/scan/batch_coalescer.hpp>
+#include <op/scan/coalescing_carrier.hpp>
+#include <op/scan/coalescing_gpu_ingestible.hpp>
 #include <op/scan/duckdb_native_decoder.hpp>
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
-#include <scan_manager/split_connector.hpp>
 
 // cudf
 #include <cudf/table/table.hpp>
@@ -67,6 +68,24 @@ std::size_t parse_chunk_row_groups()
   return DEFAULT_PARSE_CHUNK_ROW_GROUPS;
 }
 
+/**
+ * @brief Creates a coalescing unit from the given DuckDB native row group metadata.
+ *
+ * @param metadata The DuckDB native row group metadata to include in the coalescing unit.
+ * @return A coalescing unit containing the provided metadata.
+ */
+coalescing_unit make_coalescing_unit(duckdb_row_group_metadata metadata)
+{
+  coalescing_unit unit;
+  unit.row_count             = metadata.row_count;
+  unit.decoded_bytes         = metadata.decoded_bytes_budget;
+  unit.varchar_bytes_per_col = metadata.varchar_bytes_per_col;
+  auto p                     = std::make_unique<duckdb_native_payload>();
+  p->rg_md                   = std::move(metadata);
+  unit.payload               = std::move(p);
+  return unit;
+}
+
 }  // namespace
 
 //===----------------------------------------------------------------------===//
@@ -83,7 +102,7 @@ std::shared_ptr<io::gpu_ingestible> duckdb_native_ingestible_table_info::make_in
 //===----------------------------------------------------------------------===//
 duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
   std::unique_ptr<io::ingestible_table_info> info, scan_manager::sirius_scan_manager const& mgr)
-  : io::gpu_ingestible(std::move(info))
+  : coalescing_gpu_ingestible(std::move(info))
 {
   auto const& bind = static_cast<duckdb_native_ingestible_table_info const&>(table_info());
 
@@ -185,7 +204,7 @@ duckdb_native_gpu_ingestible::next_split_provider()
   auto const rg_end   = std::min(rg_begin + _chunk_row_groups, _plan.n_row_groups);
 
   // Runs on a worker thread: walk this range and emit one raw range carrier for
-  // the consumer to coalesce. Reads the read-only _plan.
+  // the consumer to coalesce.
   return [this, rg_begin, rg_end]() -> std::vector<std::unique_ptr<op::operator_data>> {
     auto range = walk_duckdb_native_row_group_range(_plan, rg_begin, rg_end);
     if (!range.viable) {
@@ -194,8 +213,12 @@ duckdb_native_gpu_ingestible::next_split_provider()
                                range.viability_failure_reason);
     }
 
-    auto carrier        = std::make_unique<duckdb_native_range_input>();
-    carrier->row_groups = std::move(range.row_groups);
+    // Box each row group into a coalescing unit.
+    auto carrier = std::make_unique<coalescing_carrier>();
+    carrier->units.reserve(range.row_groups.size());
+    for (auto& rg : range.row_groups) {
+      carrier->units.push_back(make_coalescing_unit(std::move(rg)));
+    }
 
     std::vector<std::unique_ptr<op::operator_data>> out;
     out.push_back(std::move(carrier));
@@ -207,8 +230,14 @@ duckdb_native_gpu_ingestible::next_split_provider()
 // consumer-side coalescing
 //===----------------------------------------------------------------------===//
 std::unique_ptr<op::operator_data> duckdb_native_gpu_ingestible::make_batch(
-  std::vector<duckdb_row_group_metadata> row_groups)
+  std::vector<coalescing_unit> units)
 {
+  std::vector<duckdb_row_group_metadata> row_groups;
+  for (auto& unit : units) {
+    auto* p = static_cast<duckdb_native_payload*>(unit.payload.get());
+    row_groups.push_back(std::move(p->rg_md));
+  }
+
   auto split_info = std::make_unique<duckdb_native_split_info>();
   split_info->payload.table_info =
     &static_cast<duckdb_native_ingestible_table_info const&>(table_info());
@@ -228,44 +257,6 @@ std::unique_ptr<op::operator_data> duckdb_native_gpu_ingestible::make_batch(
   auto metadata =
     std::make_unique<io::scan_and_filter_metadata>(std::move(split_info), std::move(filter_info));
   return std::make_unique<scan_operator_input>(std::move(metadata));
-}
-
-std::unique_ptr<op::operator_data> duckdb_native_gpu_ingestible::consume_next_input(
-  scan_manager::split_connector& connector)
-{
-  // Coalesce parsed ranges into cap-sized batches as they arrive, so early
-  // batches decode while later ranges are still being walked. Rowids are
-  // absolute per row group, so packing order is unconstrained. get_next_split
-  // blocks until a range is ready.
-  for (;;) {
-    if (_coalescer->has_ready()) { return make_batch(_coalescer->pop_ready()); }
-
-    auto next = connector.get_next_split();
-    if (!next.has_value()) {
-      // Connector closed and drained: emit the single tail batch, if any.
-      auto tail = _coalescer->flush();
-      if (!tail.empty()) { return make_batch(std::move(tail)); }
-      return nullptr;
-    }
-
-    auto* range = dynamic_cast<duckdb_native_range_input*>(next->get());
-    if (range == nullptr) {
-      throw std::runtime_error(
-        "[duckdb_native_gpu_ingestible::consume_next_input] unexpected operator_data type from "
-        "split connector; expected duckdb_native_range_input.");
-    }
-    for (auto& rg : range->row_groups) {
-      _coalescer->push(std::move(rg));
-    }
-  }
-}
-
-bool duckdb_native_gpu_ingestible::consumer_drained() const
-{
-  // The scan operator conjoins this with split_connector::is_closed(). Gating on
-  // an empty coalescer ensures a single-split scan (small table, or chunk >=
-  // row-group count) still serves every queued batch, including the tail.
-  return _coalescer == nullptr || _coalescer->empty();
 }
 
 //===----------------------------------------------------------------------===//

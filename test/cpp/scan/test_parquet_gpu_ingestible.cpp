@@ -14,18 +14,13 @@
  * limitations under the License.
  */
 
-// Unit tests for parquet_gpu_ingestible. These cover the pieces that were
-// previously exercised by test_parquet_split_provider.cpp before step 10
-// deleted the legacy provider:
-//   - FLBA-decimal pushdown probe (DECIMAL(25,2) forces
-//     FIXED_LEN_BYTE_ARRAY physical type; cudf's stats filter cannot
-//     compare against a fixed_point_scalar AST literal, so the ingestible
-//     must skip pushdown).
-//   - INT64-decimal allow-pushdown (DECIMAL(10,2) fits in INT64; pushdown
-//     should remain enabled).
-//   - No-filter smoke (has_more_splits / next_split_provider drive a
-//     batch end-to-end and emit one scan_operator_input per row-group
-//     batch).
+// Unit tests for parquet_gpu_ingestible. They cover:
+//   - FLBA-decimal pushdown probe: DECIMAL(25,2) is stored as FIXED_LEN_BYTE_ARRAY,
+//     whose stats cudf cannot compare to a numeric literal, so pushdown is skipped.
+//   - INT64-decimal allow-pushdown: DECIMAL(10,2) fits in INT64, so pushdown stays on.
+//   - Coalescing: a file's row groups merge back into one slice, and a small byte cap
+//     splits them across multiple batches stamped round-robin across GPUs.
+//   - Datasource routing: local vs S3 slices, the cudf/kvikio fallback, and chunk prewarm.
 
 #include "catch.hpp"
 #include "io/prefetching_cache.hpp"
@@ -56,7 +51,10 @@
 #include <io/types.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
+#include <scan_manager/round_robin_strategy.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
+#include <scan_manager/split_connector.hpp>
+#include <scan_manager/split_provider.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -180,22 +178,34 @@ sirius::io::s3::s3_ioctx_config make_s3_config(s3_test_env const& env)
   return cfg;
 }
 
-// Drain an ingestible synchronously (no scheduler), collecting every
-// emitted operator_data. The base split_provider::run loop is trivially
-// reproducible by hand here — has_more_splits then claim then invoke —
-// and avoids dragging in static_thread_pool just to test the claim/work
-// behavior in isolation.
+// Scheduler that runs each enqueued thunk synchronously, so split_provider::run()
+// produces every carrier and closes the connector before returning.
+struct inline_scheduler {
+  template <typename F>
+  void enqueue(F&& f)
+  {
+    f();
+  }
+};
+
+// Drive the full producer -> connector -> coalescing-consumer path and collect
+// every emitted scan_operator_input. The producer now emits format-blind
+// coalescing_carriers; the sealed consume_next_input packs their units and calls
+// make_batch, so the scan_operator_inputs only exist on the consumer side. Run
+// the producer inline (no thread pool) just to exercise claim/work behavior.
 std::vector<std::unique_ptr<sirius::op::operator_data>> drain_ingestible(
   sscan::parquet_gpu_ingestible& ingestible)
 {
+  sirius::scan_manager::split_connector connector;
+  sirius::scan_manager::split_provider provider{ingestible};
+  inline_scheduler sched;
+  provider.run(sched, connector);  // pushes all carriers; closes the connector on return
+
   std::vector<std::unique_ptr<sirius::op::operator_data>> splits;
-  while (ingestible.has_more_splits()) {
-    auto work = ingestible.next_split_provider();
-    if (!work) { continue; }
-    auto batch = work();
-    for (auto& s : batch) {
-      splits.push_back(std::move(s));
-    }
+  for (;;) {
+    auto batch = ingestible.consume_next_input(connector);
+    if (!batch) { break; }
+    splits.push_back(std::move(batch));
   }
   return splits;
 }
@@ -272,8 +282,8 @@ duckdb::unique_ptr<duckdb::TableFilterSet> make_amount_lt_filter(int precision, 
 }
 
 // =====================================================================
-// Helpers for the kvikio-fallback datasource-routing guards (port of
-// upstream sirius-db/sirius#889 to the gpu_ingestible architecture).
+// Helpers for the datasource-routing guards: confirm materialize_table honors a
+// slice's own datasource and falls back to cudf/kvikio for unclaimed local files.
 // =====================================================================
 
 class routing_test_io_object final : public sirius::io::sirius_io_object {
@@ -827,12 +837,97 @@ TEST_CASE("parquet_gpu_ingestible scan-side prewarm inserts column chunk ranges 
   std::filesystem::remove_all(dir);
 }
 
+TEST_CASE("parquet_gpu_ingestible - coalescer merges same-file row groups into one slice",
+          "[scan][parquet_gpu_ingestible]")
+{
+  // One file with several row groups, and a batch cap large enough to hold them
+  // all. The producer boxes one coalescing_unit per row group; make_batch must
+  // merge those consecutive same-file units back into ONE row_group_slice whose
+  // indices are contiguous and in walk order (the shape materialize_table reads).
+  auto const dir  = std::filesystem::temp_directory_path() / "pgi_merge_test";
+  auto const path = write_decimal_parquet(dir,
+                                          "merge",
+                                          /*precision=*/10,
+                                          /*scale=*/2,
+                                          /*row_count=*/10000,
+                                          /*row_group_size=*/1000);  // ~10 row groups
+
+  auto table_info = make_table_info(path,
+                                    /*precision=*/10,
+                                    /*scale=*/2,
+                                    /*filters=*/nullptr);  // default cap = 1 GiB
+
+  sirius::scan_manager::sirius_scan_manager mgr({});
+  sscan::parquet_gpu_ingestible ingestible(std::move(table_info), mgr);
+
+  auto splits = drain_ingestible(ingestible);
+  REQUIRE(splits.size() == 1);  // the 1 GiB cap holds every row group in one batch
+
+  auto* input = dynamic_cast<sscan::scan_operator_input*>(splits.front().get());
+  REQUIRE(input != nullptr);
+  auto const& parquet_info =
+    dynamic_cast<sscan::parquet_split_info const&>(input->metadata->scan());
+
+  REQUIRE(parquet_info.rg_slices.size() == 1);  // one file ⇒ all units merged into one slice
+  auto const& idx = parquet_info.rg_slices.front().row_group_indices;
+  REQUIRE(idx.size() >= 2);  // multiple row groups actually coalesced
+  for (std::size_t i = 1; i < idx.size(); ++i) {
+    REQUIRE(idx[i] == idx[i - 1] + 1);  // contiguous, in producer walk order
+  }
+
+  std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("parquet_gpu_ingestible - stamps coalesced batches round-robin across GPUs",
+          "[scan][parquet_gpu_ingestible]")
+{
+  // Many row groups + a small byte cap → several coalesced batches. With a
+  // balancing strategy installed on the (coalescing) ingestible, every emitted
+  // batch must carry the next GPU in round-robin order. This is the parquet
+  // analogue of the native test and is the consumer-side multi-GPU guarantee:
+  // the producer's carriers are discarded, so the device id is stamped only on
+  // the real decode batch in coalescing_gpu_ingestible::emit_batch. drain_ingestible
+  // builds a split_provider with no strategy of its own, so a producer-side
+  // double-stamp would break the strict 0,1,0,1 sequence and fail this test.
+  auto const dir  = std::filesystem::temp_directory_path() / "pgi_multigpu_test";
+  auto const path = write_decimal_parquet(dir,
+                                          "multigpu",
+                                          /*precision=*/10,
+                                          /*scale=*/2,
+                                          /*row_count=*/12000,
+                                          /*row_group_size=*/1000);  // ~12 row groups
+
+  auto table_info                    = make_table_info(path,
+                                    /*precision=*/10,
+                                    /*scale=*/2,
+                                    /*filters=*/nullptr);
+  table_info->approximate_batch_size = 4096;  // override the 1 GiB default to force >1 batch
+
+  sirius::scan_manager::sirius_scan_manager mgr({});
+  sscan::parquet_gpu_ingestible ingestible(std::move(table_info), mgr);
+
+  // Two synthetic device ids: round_robin hands them out in order regardless of
+  // how many physical GPUs exist, so the assertion is hardware-independent.
+  std::vector<int> const devices{0, 1};
+  ingestible.install_balancing(
+    std::make_shared<sirius::scan_manager::round_robin_strategy>(devices), /*pipeline_id=*/0);
+
+  auto splits = drain_ingestible(ingestible);
+  REQUIRE(splits.size() >= 2);  // small cap → multiple coalesced batches to alternate over
+  for (std::size_t i = 0; i < splits.size(); ++i) {
+    auto const dev = splits[i]->get_preferred_device_id();
+    REQUIRE(dev.has_value());
+    REQUIRE(*dev == devices[i % devices.size()]);  // 0, 1, 0, 1, ...
+  }
+
+  std::filesystem::remove_all(dir);
+}
+
 TEST_CASE("parquet_gpu_ingestible - s3 slice with non-null io_ctx routes through spy",
           "[scan][parquet_gpu_ingestible][s3][datasource-routing]")
 {
-  // Guard for sirius-db/sirius#889: when the scan_manager has no ioctx,
-  // the materialize path must still honor slice.io_ctx and route
-  // the read through it.
+  // When the scan_manager exposes no ioctx, materialize_table must still honor a
+  // slice's own datasource and route the read through it.
   auto const dir  = std::filesystem::temp_directory_path() / "pgi_s3_route_test";
   auto const path = write_decimal_parquet(dir,
                                           "s3_route",

@@ -24,6 +24,7 @@
 #include "io/s3/s3_ioctx.hpp"
 #include "io/uring/uring_ioctx.hpp"
 #include "log/logging.hpp"
+#include "op/scan/coalescing_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -268,12 +269,19 @@ void sirius_scan_manager::prepare_for_query(
     // ingestible by reference. enable_shared_from_this lets any consumer
     // promote to shared_ptr on demand.
     auto provider = std::make_unique<split_provider>(op->get_ingestible());
-    // Spread fresh-read splits across GPUs for every scan source — parquet and
-    // duckdb-native alike both emit non-resident scan_operator_input splits.
-    // Installing the strategy on every provider is safe: resident pinned-cache
-    // splits are left untouched by split_provider::apply_balancing's
-    // is_resident() guard, so their data-locality placement is preserved.
-    provider->set_balancing_strategy(round_robin, pipeline->get_pipeline_id());
+    // Spread fresh-read splits across GPUs. A coalescing format builds its final
+    // batches on the consumer side, so it balances them there (its producer's
+    // carriers are intermediate and discarded); installing the strategy on the
+    // provider too would double-advance the round-robin cursor. A non-coalescing
+    // format emits final batches straight from the producer, so balance them on
+    // the provider. Resident pinned-cache splits are skipped by the is_resident()
+    // guard either way, preserving their data-locality placement.
+    if (auto* coalescing =
+          dynamic_cast<op::scan::coalescing_gpu_ingestible*>(&op->get_ingestible())) {
+      coalescing->install_balancing(round_robin, pipeline->get_pipeline_id());
+    } else {
+      provider->set_balancing_strategy(round_robin, pipeline->get_pipeline_id());
+    }
     op->set_split_connector(std::make_unique<split_connector>());
     _providers_by_op.emplace(op, std::move(provider));
     _scan_op_order.push_back(op);

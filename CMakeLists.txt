@@ -229,6 +229,7 @@ set(EXTENSION_SOURCES
     src/op/scan/sirius_gpu_scan_operator.cpp
     src/op/scan/parquet_gpu_ingestible.cpp
     src/op/scan/duckdb_native_gpu_ingestible.cpp
+    src/op/scan/coalescing_gpu_ingestible.cpp
     src/op/scan/pinned_table_gpu_ingestible.cpp
     src/op/sirius_dynamic_filter.cpp
     src/op/sirius_physical_column_data_scan.cpp

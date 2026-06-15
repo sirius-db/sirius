@@ -17,6 +17,7 @@
 #pragma once
 
 #include "helper/logical_type.hpp"
+#include "op/scan/coalescing_unit.hpp"  // kCudfInt32StringsThreshold
 
 #include <cudf/types.hpp>
 
@@ -90,17 +91,6 @@ struct duckdb_row_group_metadata {
   /// chars threshold. 0 for non-varchar columns.
   std::vector<std::size_t> varchar_bytes_per_col;
 };
-
-/// Default-mode cudf strings columns use int32 offsets;
-/// `make_offsets_child_column` throws `std::overflow_error` ("Size of output
-/// exceeds the column size limit") when total chars per strings column
-/// `>= std::numeric_limits<cudf::size_type>::max()` unless
-/// `LIBCUDF_LARGE_STRINGS_ENABLED` is set. Sirius does not opt in and its
-/// strings-decode kernels (`gpu_decode_strings.cu`) are hard-coded to
-/// int32 offsets, so the walker refuses any row group whose per-column
-/// varchar upper bound hits this threshold.
-constexpr std::size_t kCudfInt32StringsThreshold =
-  static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
 
 /// Exposed for direct unit-testing of the codec-rejection logic without
 /// going through DuckDB's codec selection (which is hard to drive into

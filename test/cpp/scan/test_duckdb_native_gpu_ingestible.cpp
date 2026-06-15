@@ -29,8 +29,10 @@
 #include <helper/logical_type.hpp>
 #include <io/io_context.hpp>
 #include <io/types.hpp>
+#include <op/scan/coalescing_carrier.hpp>
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
+#include <scan_manager/round_robin_strategy.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 #include <scan_manager/split_connector.hpp>
 #include <scan_manager/split_provider.hpp>
@@ -138,10 +140,11 @@ drained drain_ranges(duckdb_native_gpu_ingestible& ingestible)
     if (carriers.empty()) break;
     ++out.range_count;
     for (auto& c : carriers) {
-      auto* range = dynamic_cast<duckdb_native_range_input*>(c.get());
-      REQUIRE(range != nullptr);
-      for (auto& rg : range->row_groups) {
-        out.row_groups.push_back(std::move(rg));
+      auto* carrier = dynamic_cast<coalescing_carrier*>(c.get());
+      REQUIRE(carrier != nullptr);
+      for (auto& unit : carrier->units) {
+        auto* payload = static_cast<duckdb_native_payload*>(unit.payload.get());
+        out.row_groups.push_back(std::move(payload->rg_md));
       }
     }
   }
@@ -313,9 +316,9 @@ TEST_CASE("duckdb_native_gpu_ingestible emits one range for a small INTEGER tabl
   auto carriers = factory();
   REQUIRE(carriers.size() == 1);
 
-  auto* range = dynamic_cast<duckdb_native_range_input*>(carriers[0].get());
-  REQUIRE(range != nullptr);
-  REQUIRE_FALSE(range->row_groups.empty());
+  auto* carrier = dynamic_cast<coalescing_carrier*>(carriers[0].get());
+  REQUIRE(carrier != nullptr);
+  REQUIRE_FALSE(carrier->units.empty());
 
   // After the only range is claimed both signals report exhaustion.
   REQUIRE_FALSE(ingestible.has_more_splits());
@@ -428,4 +431,41 @@ TEST_CASE("duckdb_native_gpu_ingestible single-split scan serves its batch then 
 
   auto const& payload = payload_of(*batches[0]);
   REQUIRE_FALSE(payload.row_groups.empty());
+}
+
+//===----------------------------------------------------------------------===//
+// consumer: multi-GPU device-id stamping
+//===----------------------------------------------------------------------===//
+TEST_CASE("duckdb_native_gpu_ingestible stamps coalesced batches round-robin across GPUs",
+          "[scan][duckdb_native_gpu_ingestible]")
+{
+  // Multiple row groups + a small byte cap → several coalesced batches. With a
+  // balancing strategy installed, every emitted batch must carry the next GPU in
+  // round-robin order (and the producer must not also stamp the discarded
+  // carriers, which would double-advance the cursor).
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  exec_ok(con, "CREATE TABLE t(a INTEGER)");
+  exec_ok(con, "INSERT INTO t SELECT range FROM range(0, 1200000)");
+  auto& storage = get_storage(con, "t");
+
+  auto mgr  = make_scan_manager();
+  auto info = make_table_info(&storage,
+                              con.context.get(),
+                              {real_col(0)},
+                              {sirius::logical_type::make(sirius::type_id::INTEGER)},
+                              /*approximate_batch_size=*/4096);
+  duckdb_native_gpu_ingestible ingestible{std::move(info), *mgr};
+
+  // Two synthetic device ids: round_robin hands them out in order regardless of
+  // how many physical GPUs exist, so the assertion is hardware-independent.
+  std::vector<int> const devices{0, 1};
+  ingestible.install_balancing(std::make_shared<round_robin_strategy>(devices), /*pipeline_id=*/0);
+
+  auto batches = run_and_consume(ingestible);
+  REQUIRE(batches.size() >= 2);
+  for (std::size_t i = 0; i < batches.size(); ++i) {
+    auto const dev = batches[i]->get_preferred_device_id();
+    REQUIRE(dev.has_value());
+    REQUIRE(*dev == devices[i % devices.size()]);  // 0, 1, 0, 1, ...
+  }
 }
