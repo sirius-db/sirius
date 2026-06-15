@@ -17,10 +17,12 @@
 #include "catch.hpp"
 #include "exec/config.hpp"
 #include "parallel/task_executor.hpp"
+#include "utils/telemetry_utils.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
 
 #include <chrono>
+#include <memory>
 #include <thread>
 
 using namespace sirius::parallel;
@@ -65,7 +67,7 @@ class dummy_task : public itask {
 class dummy_task_executor : public itask_executor {
  public:
   explicit dummy_task_executor(sirius::exec::thread_pool_config config)
-    : itask_executor(std::move(config))
+    : itask_executor(std::move(config), sirius::test::make_test_telemetry_context())
   {
   }
 

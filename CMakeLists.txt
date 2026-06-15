@@ -263,6 +263,7 @@ set(EXTENSION_SOURCES
     src/parallel/task_executor.cpp
     src/pipeline/gpu_pipeline_executor.cpp
     src/pipeline/gpu_pipeline_task.cpp
+    src/pipeline/sirius_pipeline_itask.cpp
     src/pipeline/task_scheduler.cpp
     src/pipeline/sirius_meta_pipeline.cpp
     src/pipeline/sirius_pipeline.cpp

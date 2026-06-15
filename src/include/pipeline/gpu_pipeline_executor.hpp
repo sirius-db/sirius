@@ -26,6 +26,7 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/stream_pool.hpp>
 
+#include <memory>
 #include <thread>
 
 namespace sirius::op {
@@ -35,6 +36,10 @@ class sirius_physical_operator;
 namespace sirius::parallel {
 class downgrade_executor;
 }  // namespace sirius::parallel
+
+namespace sirius::telemetry {
+class telemetry_context;
+}  // namespace sirius::telemetry
 
 namespace sirius {
 
@@ -67,7 +72,8 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
     exec::thread_pool_config config,
     cucascade::memory::memory_space* mem_space,
     exec::publisher<std::unique_ptr<task_request>> task_request_publisher,
-    sirius::parallel::downgrade_executor* downgrade_executor = nullptr);
+    sirius::parallel::downgrade_executor* downgrade_executor,
+    std::shared_ptr<const telemetry::telemetry_context> telemetry_context);
 
   /**
    * @brief Destructor for the gpu_pipeline_executor.
@@ -85,7 +91,7 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
    *
    * @param task_creator Pointer to the task creator
    */
-  void set_task_creator(sirius::creator::task_creator* task_creator);
+  void set_task_creator(creator::task_creator* task_creator);
 
   /**
    * @brief Check if the internal task queue is empty.

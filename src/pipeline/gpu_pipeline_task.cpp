@@ -20,6 +20,7 @@
 #include "log/logging.hpp"
 #include "memory/defragmenter_oom_policy.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
+#include "telemetry/telemetry_context.hpp"
 
 #include <nvtx3/nvtx3.hpp>
 
@@ -30,8 +31,10 @@
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <data/data_batch_utils.hpp>
 
+#include <cstdint>
 #include <format>
 #include <optional>
+#include <string>
 
 namespace sirius {
 namespace pipeline {
@@ -150,7 +153,6 @@ std::unique_ptr<op::operator_data> run_one_operator(
   rmm::cuda_stream_view stream,
   const sirius_pipeline* pipeline,
   uint64_t task_id,
-  size_t op_index,
   size_t num_operators,
   cucascade::memory::reservation_aware_resource_adaptor* allocator)
 {
@@ -250,17 +252,27 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
                     operators.size());
   }
 
+  auto executor_thread_resource_id = uuid::new_nil();
+  if (telemetry::executor_thread_telemetry_handle.has_value()) {
+    executor_thread_resource_id = telemetry::executor_thread_telemetry_handle->handle->uuid();
+  } else {
+    SIRIUS_LOG_ERROR(
+      "gpu_pipeline_task::execute_operator: executor thread telemetry handle is not "
+      "initialized");
+  }
+
   for (size_t i = start_index; i < operators.size(); i++) {
     auto& op = operators[i].get();
     try {
-      operator_input_output_data = run_one_operator(op,
-                                                    *operator_input_output_data,
-                                                    stream,
-                                                    pipeline,
-                                                    _task_id,
-                                                    i,
-                                                    operators.size(),
-                                                    _allocator);
+      this->telemetry_handle().computing({
+        .instance_name       = "",
+        .current_operator_id = static_cast<uint32_t>(
+          op.get_operator_id()),  // TODO(dhruv9vats): look into possible overflow
+        .input_bytes                 = operator_input_output_data->get_estimated_size_in_bytes(),
+        .executor_thread_resource_id = executor_thread_resource_id,
+      });
+      operator_input_output_data = run_one_operator(
+        op, *operator_input_output_data, stream, pipeline, _task_id, operators.size(), _allocator);
     } catch (const rmm::out_of_memory& oom) {
       auto peak_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
       // Subtract the peak allocated bytes to the input data to get the peak allocated bytes for the
@@ -384,6 +396,18 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     throw std::runtime_error("gpu_pipeline_task::execute: input_data is null");
   }
 
+  auto executor_thread_resource_id = uuid::new_nil();
+  if (telemetry::executor_thread_telemetry_handle.has_value()) {
+    executor_thread_resource_id = telemetry::executor_thread_telemetry_handle->handle->uuid();
+  } else {
+    SIRIUS_LOG_ERROR(
+      "gpu_pipeline_task::execute: executor thread telemetry handle is not initialized");
+  }
+  telemetry_handle().preparing({
+    .instance_name               = "",
+    .target_tier                 = "GPU",
+    .executor_thread_resource_id = executor_thread_resource_id,
+  });
   try {
     local_state._input_data->prepare_for_processing(requested_memory_space, stream);
     // synchronizing here to ensure the timing collected by Quent and logging for preparing the task

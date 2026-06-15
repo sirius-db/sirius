@@ -18,6 +18,7 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
+#include "utils/telemetry_utils.hpp"
 
 #include <cuda_runtime_api.h>
 
@@ -84,8 +85,8 @@ TEST_CASE("pipeline tasks can have different preferred_device_ids", "[data_local
 TEST_CASE("global state preferred_device_id serves as pipeline default", "[data_locality]")
 {
   // SCHED-04: Pipeline-level default from global state
-  auto global_state =
-    std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(nullptr);
+  auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+    nullptr, sirius::test::make_test_telemetry_context());
 
   REQUIRE_FALSE(global_state->get_preferred_device_id().has_value());
 
@@ -101,9 +102,9 @@ TEST_CASE("global state preferred_device_id serves as pipeline default", "[data_
 TEST_CASE("local state preferred_device_id takes precedence over global", "[data_locality]")
 {
   // SCHED-01: Per-task locality score (local) overrides pipeline default (global)
-  auto local_state = std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(nullptr);
-  auto global_state =
-    std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(nullptr);
+  auto local_state  = std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(nullptr);
+  auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+    nullptr, sirius::test::make_test_telemetry_context());
 
   global_state->set_preferred_device_id(0);
   local_state->set_preferred_device_id(1);

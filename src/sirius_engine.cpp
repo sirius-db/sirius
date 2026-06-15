@@ -59,13 +59,14 @@
 #include <cucascade/data/data_repository_manager.hpp>
 
 #include <algorithm>
+#include <memory>
 #include <stdexcept>
 
 namespace sirius {
 
 namespace {
 
-const telemetry::telemetry_context& get_telemetry_context_from_client_context(
+std::shared_ptr<const telemetry::telemetry_context> get_telemetry_context_from_client_context(
   duckdb::ClientContext& context)
 {
   if (not context.registered_state) {
@@ -87,9 +88,9 @@ sirius_engine::sirius_engine(duckdb::ClientContext& context, sirius_interface& s
     sirius_iface(sirius_iface),
     telemetry_context_(get_telemetry_context_from_client_context(this->context)),
     query_group_uuid_(uuid::now_v7()),
-    query_group_observer_(quent::query_group::create_observer(telemetry_context_.context())),
+    query_group_observer_(quent::query_group::create_observer(telemetry_context_->context())),
     query_handle_(
-      quent::query::create(telemetry_context_.context(),
+      quent::query::create(telemetry_context_->context(),
                            quent::query::Init{
                              .instance_name  = sirius_iface.query_label.value_or("unnamed_query"),
                              .query_group_id = query_group_uuid_,
@@ -99,7 +100,7 @@ sirius_engine::sirius_engine(duckdb::ClientContext& context, sirius_interface& s
   query_group_observer_->declaration(query_group_uuid_,
                                      quent::query_group::Declaration{
                                        .instance_name = "default_group",
-                                       .engine_id     = telemetry_context_.engine_id(),
+                                       .engine_id     = telemetry_context_->engine_id(),
                                      });
 }
 
@@ -167,7 +168,7 @@ void sirius_engine::execute()
   sirius_ctx->create_query(std::move(new_scheduled),
                            telemetry::query_telemetry_info{
                              .query_id  = query_handle_->uuid(),
-                             .worker_id = telemetry_context_.worker_id(),
+                             .worker_id = telemetry_context_->worker_id(),
                            });
   auto future = sirius_ctx->get_task_scheduler().start_query();
   try {

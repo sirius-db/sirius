@@ -28,10 +28,12 @@
 #include <parallel/task.hpp>
 #include <pipeline/gpu_pipeline_task.hpp>
 #include <pipeline/sirius_pipeline_task_states.hpp>
+#include <utils/telemetry_utils.hpp>
 
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -78,7 +80,8 @@ std::unique_ptr<sirius::pipeline::gpu_pipeline_task> make_test_gpu_task(
   auto op_data = std::make_unique<sirius::op::pipelineable_operator_data>(std::move(batches));
   auto local =
     std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(op_data));
-  auto global = std::make_shared<sirius::pipeline::gpu_pipeline_task_global_state>(nullptr);
+  auto global = std::make_shared<sirius::pipeline::gpu_pipeline_task_global_state>(
+    nullptr, sirius::test::make_test_telemetry_context());
 
   return std::make_unique<sirius::pipeline::gpu_pipeline_task>(
     task_id,

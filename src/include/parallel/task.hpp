@@ -90,11 +90,11 @@ class itask {
 
   virtual ~itask() = default;
 
-  // Non-copyable and movable.
+  // Non-copyable and non-movable. Tasks are moved by unique_ptr, not by object move.
   itask(const itask&)            = delete;
   itask& operator=(const itask&) = delete;
-  itask(itask&&)                 = default;
-  itask& operator=(itask&&)      = default;
+  itask(itask&&)                 = delete;
+  itask& operator=(itask&&)      = delete;
 
   // Execution function.
   virtual void execute(rmm::cuda_stream_view stream) = 0;
