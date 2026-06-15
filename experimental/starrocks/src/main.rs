@@ -4,10 +4,10 @@ use anyhow::{Result, anyhow};
 use backon::{ExponentialBuilder, Retryable};
 use clap::Parser;
 use sirius_starrocks_cn::{
-    BackendServer, BackendServerShutdown, BrpcServer, ComputeNodeConfig, FeConfig, HeartbeatServer,
-    HeartbeatServerShutdown, SharedHeartbeatState, register_node, report_to_frontend_once,
-    start_backend_server, start_heartbeat_server,
+    BackendServer, BrpcServer, ComputeNodeConfig, FeConfig, HeartbeatServer, SharedHeartbeatState,
+    register_node, report_to_frontend_once, start_backend_server, start_heartbeat_server,
 };
+use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -248,121 +248,90 @@ struct RunningComputeNode {
 }
 
 impl RunningComputeNode {
-    /// Waits until a signal, server exit, or task exit requires process shutdown.
+    /// Waits until a signal, a server exit, or a background-task exit requires shutdown, then
+    /// stops every component and drains the servers.
     async fn wait_until_shutdown(self) -> Result<()> {
         let heartbeat_shutdown = self.heartbeat_server.shutdown_handle();
         let backend_shutdown = self.backend_server.shutdown_handle();
         let brpc_shutdown = self.brpc_runtime.shutdown.clone();
-        let mut heartbeat_join = tokio::task::spawn_blocking(move || self.heartbeat_server.join());
-        let mut backend_join = tokio::task::spawn_blocking(move || self.backend_server.join());
-        let mut brpc_join = self.brpc_runtime.join;
+
+        // Drive every server's join as a labelled task so the first exit can be observed in the
+        // select and the rest drained with one loop, instead of repeating the join logic per arm.
+        let mut servers: JoinSet<(&'static str, Result<()>)> = JoinSet::new();
+        let heartbeat_server = self.heartbeat_server;
+        servers.spawn_blocking(move || ("heartbeat", heartbeat_server.join()));
+        let backend_server = self.backend_server;
+        servers.spawn_blocking(move || ("backend", backend_server.join()));
+        let brpc_join = self.brpc_runtime.join;
+        servers.spawn(async move {
+            let result = brpc_join
+                .await
+                .unwrap_or_else(|err| Err(anyhow!("BRPC service task failed: {err}")));
+            ("BRPC", result)
+        });
+
         let mut registration_task = self.registration_task;
         let mut report_task = self.report_task;
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .map_err(|err| anyhow!("failed to install SIGTERM handler: {err}"))?;
 
-        tokio::select! {
-            // Interactive shutdown path.
+        // Identify the first shutdown trigger and the result to report.
+        let outcome = tokio::select! {
             signal = tokio::signal::ctrl_c() => {
                 signal.map_err(|err| anyhow!("failed to wait for ctrl-c: {err}"))?;
                 info!(signal = "ctrl-c", "shutdown signal received");
-                request_stop(&registration_task, &report_task, &heartbeat_shutdown, &backend_shutdown, &brpc_shutdown);
-                join_server(heartbeat_join, "heartbeat").await?;
-                join_server(backend_join, "backend").await?;
-                join_server(brpc_join, "BRPC").await?;
-                info!("shutdown complete");
                 Ok(())
             }
-            // Service-manager shutdown path.
             _ = terminate.recv() => {
                 info!(signal = "sigterm", "shutdown signal received");
-                request_stop(&registration_task, &report_task, &heartbeat_shutdown, &backend_shutdown, &brpc_shutdown);
-                join_server(heartbeat_join, "heartbeat").await?;
-                join_server(backend_join, "backend").await?;
-                join_server(brpc_join, "BRPC").await?;
-                info!("shutdown complete");
                 Ok(())
             }
-            // If the heartbeat server exits first, stop everything else and surface its result.
-            result = &mut heartbeat_join => {
-                request_stop(&registration_task, &report_task, &heartbeat_shutdown, &backend_shutdown, &brpc_shutdown);
-                let result = result
-                    .map_err(|err| anyhow!("heartbeat server join task failed: {err}"))?;
-                if let Err(err) = &result {
-                    error!(error = %err, "heartbeat server exited");
-                }
-                join_server(backend_join, "backend").await?;
-                join_server(brpc_join, "BRPC").await?;
-                result
-            }
-            // If the backend server exits first, stop everything else and surface its result.
-            result = &mut backend_join => {
-                request_stop(&registration_task, &report_task, &heartbeat_shutdown, &backend_shutdown, &brpc_shutdown);
-                let result = result
-                    .map_err(|err| anyhow!("backend server join task failed: {err}"))?;
-                if let Err(err) = &result {
-                    error!(error = %err, "backend server exited");
-                }
-                join_server(heartbeat_join, "heartbeat").await?;
-                join_server(brpc_join, "BRPC").await?;
-                result
-            }
-            // If the BRPC server exits first, stop everything else and surface its result.
-            result = &mut brpc_join => {
-                request_stop(&registration_task, &report_task, &heartbeat_shutdown, &backend_shutdown, &brpc_shutdown);
-                let result = result
-                    .map_err(|err| anyhow!("BRPC server join task failed: {err}"))?;
-                if let Err(err) = &result {
-                    error!(error = %err, "BRPC server exited");
-                }
-                join_server(heartbeat_join, "heartbeat").await?;
-                join_server(backend_join, "backend").await?;
-                result
-            }
-            // The registration loop is expected to run forever; an exit is treated as a failure.
+            Some(joined) = servers.join_next() => server_result(joined),
             result = &mut registration_task => {
-                request_stop(&registration_task, &report_task, &heartbeat_shutdown, &backend_shutdown, &brpc_shutdown);
-                join_server(heartbeat_join, "heartbeat").await?;
-                join_server(backend_join, "backend").await?;
-                join_server(brpc_join, "BRPC").await?;
                 result.map_err(|err| anyhow!("registration monitor task failed: {err}"))?;
                 Err(anyhow!("registration monitor exited unexpectedly"))
             }
-            // The report loop is expected to run forever; an exit is treated as a failure.
             result = &mut report_task => {
-                request_stop(&registration_task, &report_task, &heartbeat_shutdown, &backend_shutdown, &brpc_shutdown);
-                join_server(heartbeat_join, "heartbeat").await?;
-                join_server(backend_join, "backend").await?;
-                join_server(brpc_join, "BRPC").await?;
                 result.map_err(|err| anyhow!("FE report task failed: {err}"))?;
                 Err(anyhow!("FE report task exited unexpectedly"))
             }
+        };
+
+        // Stop the background tasks and every server (all idempotent), then drain the servers
+        // that have not exited yet, keeping the first failure as the reported error.
+        registration_task.abort();
+        report_task.abort();
+        heartbeat_shutdown.shutdown();
+        backend_shutdown.shutdown();
+        brpc_shutdown.cancel();
+
+        let mut result = outcome;
+        while let Some(joined) = servers.join_next().await {
+            if let Err(err) = server_result(joined)
+                && result.is_ok()
+            {
+                result = Err(err);
+            }
         }
+        if result.is_ok() {
+            info!("shutdown complete");
+        }
+        result
     }
 }
 
-/// Aborts the background tasks and asks every server to stop. Safe to call even when a component
-/// has already exited: `abort()` on a finished task, `shutdown()` on a stopped thrift server, and
-/// `cancel()` on a fired token are all idempotent no-ops, so every shutdown path can stop everything.
-fn request_stop(
-    registration_task: &tokio::task::JoinHandle<()>,
-    report_task: &tokio::task::JoinHandle<()>,
-    heartbeat_shutdown: &HeartbeatServerShutdown,
-    backend_shutdown: &BackendServerShutdown,
-    brpc_shutdown: &CancellationToken,
-) {
-    registration_task.abort();
-    report_task.abort();
-    heartbeat_shutdown.shutdown();
-    backend_shutdown.shutdown();
-    brpc_shutdown.cancel();
-}
-
-/// Awaits a server's blocking-join task, flattening the join-task error and the server result.
-async fn join_server(join: tokio::task::JoinHandle<Result<()>>, label: &str) -> Result<()> {
-    join.await
-        .map_err(|err| anyhow!("{label} server join task failed: {err}"))?
+/// Flattens a server join task's outcome into a single result, logging a server-side error.
+fn server_result(joined: Result<(&'static str, Result<()>), JoinError>) -> Result<()> {
+    match joined {
+        Ok((server, result)) => {
+            if let Err(err) = &result {
+                error!(error = %err, server, "server exited");
+            }
+            result
+        }
+        Err(err) => Err(anyhow!("server join task failed: {err}")),
+    }
 }
 
 #[tokio::main]

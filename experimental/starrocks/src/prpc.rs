@@ -142,39 +142,36 @@ pub(crate) struct Frame {
 }
 
 impl Frame {
-    /// Converts the request metadata, protobuf body, and attachment into a service request.
-    pub(crate) fn request(&self) -> std::result::Result<Request, Error> {
-        let Some(request) = self.meta.request.as_ref() else {
+    /// The PRPC correlation id, used to match a response frame back to its request.
+    pub(crate) fn correlation_id(&self) -> Option<i64> {
+        self.meta.correlation_id
+    }
+
+    /// Consumes the frame, moving its metadata, protobuf body, and attachment into a service
+    /// request without cloning the (potentially large) body or attachment.
+    pub(crate) fn into_request(self) -> std::result::Result<Request, Error> {
+        let Some(request) = self.meta.request else {
             return Err(Error::server("missing PRPC request metadata"));
         };
 
         Ok(Request::new(
-            request.service_name.clone(),
-            request.method_name.clone(),
-            self.body.clone(),
-            self.attachment.clone(),
+            request.service_name,
+            request.method_name,
+            self.body,
+            self.attachment,
         ))
     }
 
-    /// Wraps a service result in response metadata, preserving the request correlation id.
-    pub(crate) fn into_response_frame(
-        self,
+    /// Builds a response frame for `correlation_id`, wrapping a service result in PRPC response
+    /// metadata. `encode` is the single source of truth for `attachment_size`, so it is left unset.
+    pub(crate) fn response_frame(
+        correlation_id: Option<i64>,
         response: std::result::Result<Response, Error>,
     ) -> Self {
-        match response {
-            Ok(response) => self.response(PRPC_SUCCESS, None, response.body, response.attachment),
-            Err(error) => self.response(error.code, Some(error.text), Vec::new(), Vec::new()),
-        }
-    }
-
-    /// Constructs a response frame with PRPC response metadata.
-    fn response(
-        &self,
-        error_code: i32,
-        error_text: Option<String>,
-        body: Vec<u8>,
-        attachment: Vec<u8>,
-    ) -> Self {
+        let (error_code, error_text, body, attachment) = match response {
+            Ok(response) => (PRPC_SUCCESS, None, response.body, response.attachment),
+            Err(error) => (error.code, Some(error.text), Vec::new(), Vec::new()),
+        };
         Self {
             meta: RpcMeta {
                 request: None,
@@ -183,8 +180,7 @@ impl Frame {
                     error_text,
                 }),
                 compress_type: Some(0),
-                correlation_id: self.meta.correlation_id,
-                // `encode` is the single source of truth for attachment_size; leave it unset here.
+                correlation_id,
                 attachment_size: None,
                 chunk_info: None,
                 authentication_data: None,
@@ -386,6 +382,7 @@ fn read_payload_sync(stream: &mut impl Read, len: usize) -> Result<Vec<u8>> {
 }
 
 /// Decoded payload sizes from the fixed PRPC header.
+#[derive(Clone, Copy, Debug)]
 struct FrameSizes {
     /// Total payload bytes following the fixed 12-byte header.
     message_size: usize,
@@ -453,9 +450,9 @@ mod tests {
         let mut client = TcpStream::connect(addr).unwrap();
         client.write_all(&bytes).unwrap();
         let decoded = join.join().unwrap();
-        let decoded_request = decoded.request().unwrap();
+        assert_eq!(decoded.correlation_id(), Some(42));
 
-        assert_eq!(decoded.meta.correlation_id, Some(42));
+        let decoded_request = decoded.into_request().unwrap();
         assert_eq!(decoded_request.attachment, b"thrift attachment");
         assert_eq!(decoded_request.body, b"request body");
     }

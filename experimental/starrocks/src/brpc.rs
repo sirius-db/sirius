@@ -213,7 +213,8 @@ where
                 }
             };
 
-            let response = match frame.request() {
+            let correlation_id = frame.correlation_id();
+            let response = match frame.into_request() {
                 Ok(request) => {
                     tokio::select! {
                         _ = shutdown.cancelled() => return,
@@ -222,7 +223,7 @@ where
                 }
                 Err(err) => Err(err),
             };
-            let response_frame = frame.into_response_frame(response);
+            let response_frame = prpc::Frame::response_frame(correlation_id, response);
             tokio::select! {
                 _ = shutdown.cancelled() => return,
                 result = response_frame.write_async(&mut stream) => {
