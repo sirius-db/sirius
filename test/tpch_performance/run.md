@@ -51,6 +51,7 @@ Options:
 - `--config <path>` — Sirius config file (default: `~/.sirius/sirius.yaml`)
 - `--parquet-dir <path>` — parquet dataset directory (default: `test_datasets/tpch_parquet_sf<SF>`)
 - `--engines <list>` — space-separated engine list (default: `"sirius duckdb"`)
+- `--pinning-mode none|per-query|pinned-hot` — Sirius-only parquet pinning mode. `per-query` pins each query's referenced columns around that query block; `pinned-hot` pins the union of referenced columns once before the single-session run and unpins after all queries.
 
 Each run creates a directory under `runs/<timestamp>_sf<SF>_2iter/` containing:
 - `run_info.txt` — git branch/revision, tree clean/dirty, build freshness, hostname, memory, CPUs, GPUs, filesystem read benchmark
@@ -78,6 +79,10 @@ SIRIUS_CONFIG_FILE=~/.sirius/sirius.yaml \
 # Run specific queries with custom parquet directory
 SIRIUS_CONFIG_FILE=~/.sirius/sirius.yaml \
   ./test/tpch_performance/run_tpch_parquet.sh --parquet-dir /data/tpch sirius 100 1 3 6
+
+# Run Sirius with union-pinned hot cache across the query stream
+SIRIUS_CONFIG_FILE=~/.sirius/sirius.yaml \
+  ./test/tpch_performance/run_tpch_parquet.sh --pinning-mode pinned-hot --iterations 5 sirius 100 $(seq 1 22)
 ```
 
 Environment variables:
