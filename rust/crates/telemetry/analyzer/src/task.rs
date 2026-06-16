@@ -57,9 +57,6 @@ impl TaskExt for Task {
         filter
             .operator_id
             .is_none_or(|pipeline_uuid| self.pipeline_uuid() == Some(pipeline_uuid))
-        // && filter
-        //     .physical_operator_id
-        //     .is_none_or(|id| self.executes_physical_operation(id))
     }
 
     fn active_span(&self) -> Option<SpanUnixNanoSec> {

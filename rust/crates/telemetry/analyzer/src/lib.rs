@@ -77,29 +77,6 @@ impl UiAnalyzer for SiriusUiAnalyzer {
     type TimelineGlobalParams = QueryFilter;
     type TimelineParams = TaskFilter;
 
-    fn extract_engine(
-        engine_id: Uuid,
-        events: impl Iterator<Item = Event<SiriusEvent>>,
-    ) -> AnalyzerResult<quent_query_engine_ui::Engine> {
-        use quent_query_engine_model::engine::EngineEvent;
-        for event in events {
-            if let SiriusEvent::Engine(EngineEvent::Init(init)) = event.data {
-                return Ok(quent_query_engine_ui::Engine {
-                    id: engine_id,
-                    start_time_unix_ns: Some(event.timestamp),
-                    duration_s: None,
-                    instance_name: init.instance_name,
-                    implementation: Some(
-                        quent_query_engine_ui::EngineImplementationAttributes::from(
-                            &init.implementation,
-                        ),
-                    ),
-                });
-            }
-        }
-        Ok(quent_query_engine_ui::Engine::new(engine_id))
-    }
-
     fn try_new(
         engine_id: Uuid,
         events: impl Iterator<Item = Event<SiriusEvent>>,
@@ -132,6 +109,29 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         );
 
         Ok(Self { model })
+    }
+
+    fn extract_engine(
+        engine_id: Uuid,
+        events: impl Iterator<Item = Event<SiriusEvent>>,
+    ) -> AnalyzerResult<quent_query_engine_ui::Engine> {
+        use quent_query_engine_model::engine::EngineEvent;
+        for event in events {
+            if let SiriusEvent::Engine(EngineEvent::Init(init)) = event.data {
+                return Ok(quent_query_engine_ui::Engine {
+                    id: engine_id,
+                    start_time_unix_ns: Some(event.timestamp),
+                    duration_s: None,
+                    instance_name: init.instance_name,
+                    implementation: Some(
+                        quent_query_engine_ui::EngineImplementationAttributes::from(
+                            &init.implementation,
+                        ),
+                    ),
+                });
+            }
+        }
+        Ok(quent_query_engine_ui::Engine::new(engine_id))
     }
 
     fn query_bundle(&self, query_id: Uuid) -> AnalyzerResult<QueryBundle<EntityRef>> {
