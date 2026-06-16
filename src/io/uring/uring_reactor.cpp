@@ -24,6 +24,7 @@
 #include <fcntl.h>
 #include <log/logging.hpp>
 #include <numa.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 
 #include <algorithm>
@@ -71,54 +72,104 @@ size_t uring_reactor::size(int fd)
 uring_reactor::uring_reactor(unsigned ring_entries, size_t bounce_slot_size, int numa_node)
   : _ring_entries(ring_entries), _bounce_slot_size(bounce_slot_size), _numa_node(numa_node)
 {
+  // Allocate the bounce slots exception-safely: if any slot fails to allocate
+  // (numa_alloc/mmap) or pin (cudaHostRegister/cudaHostAlloc), the dtor will
+  // NOT run because the object is only partially constructed, so we must
+  // release the slots already populated before rethrowing — otherwise each
+  // failed construction leaks up to a reactor's worth of pinned host memory.
+  try {
+    allocate_bounce_slots();
+  } catch (...) {
+    for (auto& slot : _bounce) {
+      if (slot.buf == nullptr) continue;
+      release_bounce_slot(slot.buf);
+      slot.buf = nullptr;
+    }
+    throw;
+  }
+
+  _worker = std::thread([this] { worker_loop(); });
+}
+
+void uring_reactor::allocate_bounce_slots()
+{
   for (int i = 0; i < static_cast<int>(NUM_CHUNKS); ++i) {
     void* raw = nullptr;
     if (_numa_node >= 0) {
-      raw = numa_alloc_onnode(bounce_slot_size, _numa_node);
+      raw = numa_alloc_onnode(_bounce_slot_size, _numa_node);
       if (raw == nullptr) {
         throw std::runtime_error("uring_reactor: numa_alloc_onnode failed for node=" +
                                  std::to_string(_numa_node));
       }
       cudaError_t reg_err =
         cudaHostRegister(raw,
-                         bounce_slot_size,
+                         _bounce_slot_size,
                          static_cast<unsigned>(cudaHostRegisterPortable | cudaHostRegisterMapped));
       if (reg_err != cudaSuccess) {
-        numa_free(raw, bounce_slot_size);
+        numa_free(raw, _bounce_slot_size);
         throw std::runtime_error(std::string("uring_reactor: cudaHostRegister failed: ") +
                                  cudaGetErrorString(reg_err));
       }
     } else {
-      CUDA_CHECK(cudaHostAlloc(&raw, bounce_slot_size, cudaHostAllocPortable));
+      // Allocate anonymous, page-aligned host memory and pin it with the CUDA
+      // driver instead of using cudaHostAlloc(). cudaHostAlloc() returns memory
+      // whose VMA is backed by the NVIDIA device file; io_uring_register_buffers()
+      // requires anonymous, non-file-backed memory and rejects file-backed VMAs
+      // with EOPNOTSUPP ("Operation not supported") on kernels that still carry
+      // the explicit vma->vm_file check (pre-6.x, e.g. 5.4). mmap(MAP_ANONYMOUS)
+      // keeps the VMA anonymous and cudaHostRegister() page-locks it in place
+      // without changing the backing, so both io_uring buffer registration and
+      // GPU-pinned H2D copies work. This is exactly the NUMA path below minus the
+      // node binding (numa_alloc_onnode is itself anonymous mmap + mbind), and
+      // MAP_ANONYMOUS is page-aligned, satisfying the O_DIRECT device-read fd.
+      raw = ::mmap(nullptr,
+                   _bounce_slot_size,
+                   PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS,
+                   -1,
+                   0);
+      if (raw == MAP_FAILED) {
+        raw = nullptr;
+        throw std::runtime_error(std::string("uring_reactor: mmap(MAP_ANONYMOUS) failed: ") +
+                                 strerror(errno));
+      }
+      cudaError_t reg_err = cudaHostRegister(raw, _bounce_slot_size, cudaHostRegisterPortable);
+      if (reg_err != cudaSuccess) {
+        ::munmap(raw, _bounce_slot_size);
+        throw std::runtime_error(std::string("uring_reactor: cudaHostRegister failed: ") +
+                                 cudaGetErrorString(reg_err));
+      }
     }
     _bounce[i].buf = raw;
     _cb_args[i]    = {this, i};
   }
+}
 
-  _worker = std::thread([this] { worker_loop(); });
+void uring_reactor::release_bounce_slot(void* buf) noexcept
+{
+  // Inverse of the allocation policy chosen by the ctor (see allocate_bounce_slots).
+  // Errors here are unrecoverable on the cleanup/dtor paths — log and continue.
+  cudaError_t unreg = cudaHostUnregister(buf);
+  if (unreg != cudaSuccess) {
+    spdlog::warn("uring_reactor: cudaHostUnregister failed: {}", cudaGetErrorString(unreg));
+  }
+  if (_numa_node >= 0) {
+    numa_free(buf, _bounce_slot_size);
+  } else {
+    if (::munmap(buf, _bounce_slot_size) != 0) {
+      spdlog::warn("uring_reactor: munmap failed: {}", strerror(errno));
+    }
+  }
 }
 
 uring_reactor::~uring_reactor()
 {
   shutdown();
-  // Free bounce slots in the inverse of the allocation policy chosen by
-  // the ctor. shutdown() above joins the worker thread, so no callback
-  // can race the unregister/free.
+  // shutdown() above joins the worker thread, so no callback can race the
+  // unregister/free.
   for (auto& slot : _bounce) {
     if (slot.buf == nullptr) continue;
-    if (_numa_node >= 0) {
-      // Errors here are unrecoverable in a noexcept dtor — log and continue.
-      cudaError_t unreg = cudaHostUnregister(slot.buf);
-      if (unreg != cudaSuccess) {
-        spdlog::warn("uring_reactor: cudaHostUnregister failed: {}", cudaGetErrorString(unreg));
-      }
-      numa_free(slot.buf, _bounce_slot_size);
-    } else {
-      cudaError_t fr = cudaFreeHost(slot.buf);
-      if (fr != cudaSuccess) {
-        spdlog::warn("uring_reactor: cudaFreeHost failed: {}", cudaGetErrorString(fr));
-      }
-    }
+    release_bounce_slot(slot.buf);
     slot.buf = nullptr;
   }
 }

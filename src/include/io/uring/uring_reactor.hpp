@@ -102,8 +102,10 @@ inline double to_mb(size_t bytes) noexcept
  * @brief One pinned-memory staging buffer with a completion flag.
  *
  * The backing buffer is allocated by uring_reactor's ctor and freed in its
- * dtor. Two allocation modes are supported:
- *   - numa_node < 0 : cudaHostAlloc(cudaHostAllocPortable)
+ * dtor. Two allocation modes are supported, both producing anonymous (non
+ * file-backed) host memory so io_uring_register_buffers() accepts it — see the
+ * ctor for why cudaHostAlloc() can't be used here:
+ *   - numa_node < 0 : mmap(MAP_ANONYMOUS) + cudaHostRegister(Portable)
  *   - numa_node >= 0: numa_alloc_onnode + cudaHostRegister(Portable|Mapped)
  * The matching free path is selected from `_numa_node`/`_size` recorded on
  * the reactor — bounce_slot itself stays POD.
@@ -231,6 +233,15 @@ class uring_reactor {
 
  private:
   void worker_loop();
+
+  // Allocate and pin all NUM_CHUNKS bounce slots per the `_numa_node` policy.
+  // May throw mid-loop; the ctor releases any already-populated slots.
+  void allocate_bounce_slots();
+
+  // Release one bounce slot's backing memory using the inverse of the
+  // allocation policy selected by `_numa_node` (see ctor). noexcept so it is
+  // safe both in the dtor and on the ctor's partial-construction cleanup path.
+  void release_bounce_slot(void* buf) noexcept;
 
   struct cb_arg {
     uring_reactor* self;
