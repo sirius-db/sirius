@@ -20,7 +20,7 @@ tracing = "0.1"
 uuid = "1"
 
 [build-dependencies]
-sirius-telemetry-ui = { path = "../ui" }
+quent-simulator-ui = { git = "https://github.com/rapidsai/quent.git", rev = "5f405cbf4f4b21bf9153669f2fa52baab51d2d10" }
 quent-query-engine-ui = { git = "https://github.com/rapidsai/quent.git", rev = "5f405cbf4f4b21bf9153669f2fa52baab51d2d10" }
 quent-ui = { git = "https://github.com/rapidsai/quent.git", rev = "5f405cbf4f4b21bf9153669f2fa52baab51d2d10" }
 ts-rs = { version = "11", features = ["uuid-impl", "serde-json-impl"] }

@@ -47,7 +47,7 @@ pub struct QueryFilter {
 
 #[derive(TS, Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct TaskFilter {
-    pub pipeline_uuid: Option<Uuid>,
+    pub operator_id: Option<Uuid>,
     pub physical_operator_id: Option<u32>,
 }
 
@@ -70,7 +70,7 @@ impl<'de> Deserialize<'de> for TaskFilter {
 
         let wire = TaskFilterWire::deserialize(deserializer)?;
         Ok(Self {
-            pipeline_uuid: wire.pipeline_uuid.or(wire.operator_id),
+            operator_id: wire.pipeline_uuid.or(wire.operator_id),
             physical_operator_id: wire.physical_operator_id.or(wire.current_operator_id),
         })
     }

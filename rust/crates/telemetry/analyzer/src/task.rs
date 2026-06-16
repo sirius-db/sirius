@@ -17,7 +17,7 @@ use quent_analyzer::{
 };
 use quent_time::{TimeUnixNanoSec, Timestamp, span::SpanUnixNanoSec, to_secs_relative};
 use quent_ui::{FiniteStateMachine, FsmTransition, FsmUsage};
-use sirius_telemetry_ui::TaskFilter;
+use quent_simulator_ui::TaskFilter;
 use uuid::Uuid;
 
 /// The reconstructed Task FSM.
@@ -55,11 +55,11 @@ impl TaskExt for Task {
 
     fn matches_filter(&self, filter: &TaskFilter) -> bool {
         filter
-            .pipeline_uuid
+            .operator_id
             .is_none_or(|pipeline_uuid| self.pipeline_uuid() == Some(pipeline_uuid))
-            && filter
-                .physical_operator_id
-                .is_none_or(|id| self.executes_physical_operation(id))
+        // && filter
+        //     .physical_operator_id
+        //     .is_none_or(|id| self.executes_physical_operation(id))
     }
 
     fn active_span(&self) -> Option<SpanUnixNanoSec> {

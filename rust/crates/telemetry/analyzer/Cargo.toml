@@ -5,7 +5,7 @@ edition.workspace = true
 
 [dependencies]
 instrumentation-model = { path = "../model" }
-sirius-telemetry-ui = { path = "../ui" }
+quent-simulator-ui = { git = "https://github.com/rapidsai/quent.git", rev = "5f405cbf4f4b21bf9153669f2fa52baab51d2d10" }
 quent-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "5f405cbf4f4b21bf9153669f2fa52baab51d2d10" }
 quent-events = { git = "https://github.com/rapidsai/quent.git", rev = "5f405cbf4f4b21bf9153669f2fa52baab51d2d10" }
 quent-model = { git = "https://github.com/rapidsai/quent.git", rev = "5f405cbf4f4b21bf9153669f2fa52baab51d2d10" }

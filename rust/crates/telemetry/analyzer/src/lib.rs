@@ -36,7 +36,7 @@ use quent_analyzer::{
     },
 };
 use quent_time::{SpanNanoSec, TimeNanoSec, TimeUnixNanoSec, to_nanosecs, to_secs};
-use sirius_telemetry_ui::{EntityRef, QueryFilter, TaskFilter};
+use quent_simulator_ui::{EntityRef, QueryFilter, TaskFilter};
 use uuid::Uuid;
 
 use crate::{

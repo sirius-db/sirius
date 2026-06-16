@@ -31,7 +31,7 @@ use quent_query_engine_analyzer::{
     worker::Worker,
 };
 use quent_query_engine_model::QueryEngineEvent;
-use sirius_telemetry_ui::EntityRef;
+use quent_simulator_ui::EntityRef;
 use uuid::Uuid;
 
 use crate::{
