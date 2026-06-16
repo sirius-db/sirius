@@ -122,12 +122,8 @@ void uring_reactor::allocate_bounce_slots()
       // GPU-pinned H2D copies work. This is exactly the NUMA path below minus the
       // node binding (numa_alloc_onnode is itself anonymous mmap + mbind), and
       // MAP_ANONYMOUS is page-aligned, satisfying the O_DIRECT device-read fd.
-      raw = ::mmap(nullptr,
-                   _bounce_slot_size,
-                   PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS,
-                   -1,
-                   0);
+      raw = ::mmap(
+        nullptr, _bounce_slot_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
       if (raw == MAP_FAILED) {
         raw = nullptr;
         throw std::runtime_error(std::string("uring_reactor: mmap(MAP_ANONYMOUS) failed: ") +
