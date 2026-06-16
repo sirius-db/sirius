@@ -3,7 +3,7 @@ use quent_ui::timeline::{
     request::{BulkTimelineRequest, SingleTimelineRequest},
     response::{BulkTimelinesResponse, SingleTimelineResponse},
 };
-use sirius_telemetry_ui::{EntityRef, QueryFilter, TaskFilter};
+use quent_simulator_ui::{EntityRef, QueryFilter, TaskFilter};
 use ts_rs::TS;
 
 const TS_OUT_DIR: &str = "./ts-bindings/";
