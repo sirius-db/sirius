@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Emit `CALL pin_table(...)` / `CALL unpin_table(...)` SQL for a TPC-H query.
+"""Emit `CALL pin_table(...)` / `CALL unpin_table(...)` SQL for TPC-H.
 
-Used by run_tpch_parquet.sh when --pinning-mode per-query is set.
+Used by run_tpch_parquet.sh when --pinning-mode per-query or pinned-hot is set.
 The path argument passed to pin_table is a glob whose FileSystem::GlobFiles
 expansion must match the file list in the corresponding CREATE VIEW
 read_parquet([...]) call — otherwise the scan_manager path-equality check
@@ -289,10 +289,12 @@ def emit_unpin_all() -> str:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) < 3:
+    if len(argv) < 2:
         print(
             "Usage: tpch_pin_columns.py pin   <q_num> <parquet_dir>\n"
             "       tpch_pin_columns.py unpin <q_num>\n"
+            "       tpch_pin_columns.py pin-all <parquet_dir>\n"
+            "       tpch_pin_columns.py unpin-all\n"
             "\n"
             "Tier: defaults to 'gpu'; SIRIUS_PIN_TIER=host overrides once host-tier\n"
             "support lands. tier='host' is NOT supported right now — use it today and\n"
@@ -300,7 +302,37 @@ def main(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return 1
-    cmd, q_str, *rest = argv[1:]
+    cmd, *args = argv[1:]
+
+    if cmd == "pin-all":
+        if len(args) != 1:
+            print("pin-all requires <parquet_dir>", file=sys.stderr)
+            return 1
+        try:
+            sys.stdout.write(emit_pin_all(args[0]))
+        except RuntimeError as e:
+            print(str(e), file=sys.stderr)
+            return 1
+        return 0
+    if cmd == "unpin-all":
+        if args:
+            print("unpin-all takes no further arguments", file=sys.stderr)
+            return 1
+        sys.stdout.write(emit_unpin_all())
+        return 0
+
+    if cmd not in {"pin", "unpin"}:
+        print(
+            f"unknown command: {cmd!r} (valid: pin, unpin, pin-all, unpin-all)",
+            file=sys.stderr,
+        )
+        return 1
+
+    if len(args) < 1:
+        print(f"{cmd} requires <q_num>", file=sys.stderr)
+        return 1
+
+    q_str, *rest = args
     try:
         q = int(q_str)
     except ValueError:
@@ -324,9 +356,6 @@ def main(argv: list[str]) -> int:
             print("unpin takes no further arguments", file=sys.stderr)
             return 1
         sys.stdout.write(emit_unpin(q))
-    else:
-        print(f"unknown command: {cmd!r} (valid: pin, unpin)", file=sys.stderr)
-        return 1
     return 0
 
 

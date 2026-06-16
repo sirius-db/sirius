@@ -109,9 +109,9 @@ grep -c 'duckdb_native_gpu_ingestible::materialize_table] decoded split' /tmp/na
 grep -c 'duckdb_native_metadata] refused'                       /tmp/native_verify/sirius_*.log   # expect 0
 ```
 
-> **Note:** `--pinning-mode per-query` is parquet-only — `run_tpch_duckdb.sh` does not accept `--pinning-mode`, so do not combine it with `--data-source duckdb` or `duckdb-native`. The Python harness (`performance_test.py`) is also parquet-only and does not support the native scan.
+> **Note:** `--pinning-mode per-query` and `--pinning-mode pinned-hot` are parquet-only — `run_tpch_duckdb.sh` does not accept `--pinning-mode`, so do not combine either with `--data-source duckdb` or `duckdb-native`. The Python harness (`performance_test.py`) is also parquet-only and does not support the native scan.
 
-#### `--pinning-mode per-query` (PR #721 pin_table)
+#### `--pinning-mode per-query | pinned-hot` (PR #721 pin_table)
 
 When passed `--pinning-mode per-query`, the Sirius engine wraps each query block with `CALL pin_table(<glob>, tier='gpu', name=<table>, cols=[...])` for every table the query reads, runs the query for `--iterations` runs back-to-back, then `CALL unpin_table(<table>)` for each pinned table. This isolates per-query pinning cost from query execution: the query-iteration timings written to `timings.csv` reflect query-only time on the pinned-cache scan path.
 
@@ -122,6 +122,12 @@ The per-query column-set is sourced from `tpch_pin_columns.py` (must be a supers
 ```
 
 The DuckDB engine ignores the flag (pinning is Sirius-only) and runs as the unchanged baseline. Pinning time is **not** measured — markers (`__TPCH_PIN_BEGIN__`, `__TPCH_UNPIN_BEGIN__`, …) keep pin/unpin `Run Time` lines outside the iteration-time parser window. In single-session mode, every pinned table is unpinned at the end of its query block before the next query's pin calls run — no carry-over even when consecutive queries reference the same table. In multi-session mode the unpin still runs before each per-query process exits, defensively releasing GPU memory back to the allocator.
+
+When passed `--pinning-mode pinned-hot`, the Sirius engine emits one union `CALL pin_table(...)` set before the timed query stream, using the union of referenced columns across all TPC-H queries, then emits one union `CALL unpin_table(...)` set after all queries finish. This keeps the pinned cache hot across query boundaries and excludes pin/unpin time from `timings.csv`. `pinned-hot` requires the default single-session mode; it is rejected with `--multi-session` because fresh DuckDB processes cannot preserve the cross-query cache.
+
+```bash
+./test/tpch_performance/benchmark_and_validate.sh --pinning-mode pinned-hot --iterations 5 100
+```
 
 To verify a query actually hit the cache, grep `runs/.../sirius/q<N>/sirius.log` for `using cached_split_provider`; the matching-fallback log line is `not all the columns are pinned for this query`.
 
@@ -267,7 +273,7 @@ Output: `reports/<label>_<YYYYMMDD_HHMMSS>/` containing `report.md`, `summary.js
 | `rewrite_parquet.py` | Rewrite parquet with GPU-optimized row groups (cudf or pyarrow fallback) |
 | `performance_test.py` | Python-based benchmark with result verification |
 | `queries.py` | TPC-H query definitions (base SQL) |
-| `tpch_pin_columns.py` | Per-query column → table mapping for `--pinning-mode per-query`; emits `CALL pin_table(...)` / `CALL unpin_table(...)` SQL |
+| `tpch_pin_columns.py` | Per-query and union column → table mapping for `--pinning-mode per-query` / `pinned-hot`; emits `CALL pin_table(...)` / `CALL unpin_table(...)` SQL |
 | `generate_test_data.py` | Generate test data via dbgen |
 | `generate_test_data_tpchgen-rs.py` | Generate test data via tpchgen-rs Python wrapper + query files |
 | `pixi.toml` | Python environment with cudf, pyarrow, rust for tooling |

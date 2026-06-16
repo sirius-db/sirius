@@ -25,6 +25,7 @@
 # Usage:
 #   export SIRIUS_CONFIG_FILE=...
 #   ./test/tpch_performance/benchmark_and_validate.sh <scale_factor>
+#   ./test/tpch_performance/benchmark_and_validate.sh --pinning-mode pinned-hot <scale_factor>
 #   ./test/tpch_performance/benchmark_and_validate.sh --data-source duckdb <scale_factor>
 #   ./test/tpch_performance/benchmark_and_validate.sh --data-source duckdb-native <scale_factor>
 #   ./test/tpch_performance/benchmark_and_validate.sh --report <run_dir>
@@ -32,6 +33,7 @@
 #
 # Example:
 #   ./test/tpch_performance/benchmark_and_validate.sh 1
+#   ./test/tpch_performance/benchmark_and_validate.sh --pinning-mode pinned-hot --iterations 5 1
 #   ./test/tpch_performance/benchmark_and_validate.sh --data-source duckdb --duckdb-file ./performance_test.duckdb 1
 #   ./test/tpch_performance/benchmark_and_validate.sh --data-source duckdb-native --duckdb-file ./test_datasets/tpch_sf1.duckdb 1
 #   ./test/tpch_performance/benchmark_and_validate.sh --report runs/2026-03-10_12-00-00_sf1_2iter
@@ -378,9 +380,9 @@ NUM_ITERATIONS="${NUM_ITERATIONS:-2}"
 QUERY_TIMEOUT="${QUERY_TIMEOUT:-1200}"
 
 case "$PINNING_MODE" in
-    none|per-query) ;;
+    none|per-query|pinned-hot) ;;
     *)
-        echo "ERROR: --pinning-mode must be 'none' or 'per-query' (got: $PINNING_MODE)"
+        echo "ERROR: --pinning-mode must be 'none', 'per-query', or 'pinned-hot' (got: $PINNING_MODE)"
         exit 1
         ;;
 esac
@@ -388,7 +390,7 @@ esac
 if [ $# -ne 1 ]; then
     echo "Usage: $0 [--config <config_file>] [--data-source parquet|duckdb|duckdb-native] [--parquet-dir <path>] [--duckdb-file <path>]"
     echo "          [--engines 'sirius duckdb'] [--iterations N] [--timeout <seconds>] [--duckdb-results <run_dir>]"
-    echo "          [--multi-session] [--drop-os-cache] [--pinning-mode none|per-query]"
+    echo "          [--multi-session] [--drop-os-cache] [--pinning-mode none|per-query|pinned-hot]"
     echo "          [--float-tolerance <value>] <scale_factor>"
     echo "       $0 --report [--float-tolerance <value>] <run_dir>"
     echo "  --data-source parquet       (default) → run_tpch_parquet.sh + test_datasets/tpch_parquet_sf<SF> or --parquet-dir"
@@ -400,6 +402,16 @@ if [ $# -ne 1 ]; then
     echo "         $0 --data-source duckdb --duckdb-file ./performance_test.duckdb 1"
     echo "         $0 --data-source duckdb-native --duckdb-file ./test_datasets/tpch_sf1.duckdb 1"
     echo "         $0 --multi-session --drop-os-cache --engines sirius 1000  # cold-run with OS cache drops"
+    exit 1
+fi
+
+if [ "$PINNING_MODE" != "none" ] && is_duckdb_source; then
+    echo "ERROR: --pinning-mode is parquet-only; do not combine it with --data-source $DATA_SOURCE."
+    exit 1
+fi
+
+if [ "$PINNING_MODE" = "pinned-hot" ] && [ "$MULTI_SESSION" = true ]; then
+    echo "ERROR: --pinning-mode pinned-hot requires single-session mode; remove --multi-session."
     exit 1
 fi
 
