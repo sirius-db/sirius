@@ -22,7 +22,7 @@ use quent_query_engine_analyzer::{
     worker::Worker,
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use sirius_telemetry_ui::EntityRef;
+use quent_simulator_ui::EntityRef;
 use uuid::Uuid;
 
 use crate::{

@@ -1700,6 +1700,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "quent-simulator-ui"
+version = "0.1.0"
+source = "git+https://github.com/rapidsai/quent.git?rev=023b8c2179aba16f1bdefe430049f4fa2a424fc7#023b8c2179aba16f1bdefe430049f4fa2a424fc7"
+dependencies = [
+ "quent-analyzer",
+ "serde",
+ "ts-rs",
+ "uuid",
+]
+
+[[package]]
 name = "quent-stdlib"
 version = "0.1.0"
 source = "git+https://github.com/rapidsai/quent.git?rev=023b8c2179aba16f1bdefe430049f4fa2a424fc7#023b8c2179aba16f1bdefe430049f4fa2a424fc7"
@@ -2024,17 +2035,14 @@ version = "0.1.0"
 dependencies = [
  "instrumentation-model",
  "quent-analyzer",
- "quent-attributes",
  "quent-events",
- "quent-model",
  "quent-query-engine-analyzer",
  "quent-query-engine-model",
  "quent-query-engine-ui",
+ "quent-simulator-ui",
  "quent-time",
  "quent-ui",
  "rustc-hash",
- "sirius-telemetry-ui",
- "smallvec",
  "tracing",
  "uuid",
 ]
@@ -2050,21 +2058,11 @@ dependencies = [
  "quent-exporter",
  "quent-query-engine-server",
  "quent-query-engine-ui",
+ "quent-simulator-ui",
  "quent-ui",
  "sirius-telemetry-analyzer",
- "sirius-telemetry-ui",
  "tokio",
  "tracing",
- "ts-rs",
- "uuid",
-]
-
-[[package]]
-name = "sirius-telemetry-ui"
-version = "0.1.0"
-dependencies = [
- "quent-analyzer",
- "serde",
  "ts-rs",
  "uuid",
 ]

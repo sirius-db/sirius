@@ -43,7 +43,7 @@ telemetry_context::telemetry_context(const sirius::telemetry_config& config)
   : engine_uuid_(uuid::now_v7()),
     worker_uuid_(uuid::now_v7()),
     context_(quent::create_context(
-      uuid::now_v7(), config.enable_quent ? "ndjson" : "noop", config.output_directory)),
+      engine_uuid_, config.enable_quent ? "ndjson" : "noop", config.output_directory)),
     engine_observer_(quent::engine::create_observer(*context_)),
     worker_observer_(quent::worker::create_observer(*context_))
 {
