@@ -35,12 +35,23 @@ tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
+[features]
+# On by default so a normal build links the GPU engine. CI disables it
+# (`--no-default-features`) to keep the pure-Rust thrift/translator build and
+# tests buildable without a Sirius build tree or a GPU.
+default = ["sirius-engine"]
+# Bring up an embedded Sirius engine context for the compute node.
+sirius-engine = ["dep:sirius"]
+
 [dependencies]
 anyhow.workspace = true
 backon.workspace = true
 clap.workspace = true
 mysql_async.workspace = true
 prost.workspace = true
+# Optional: links the local Sirius engine build tree (gated by the
+# `sirius-engine` feature). Path dependency on the sibling `rust/` workspace.
+sirius = { path = "../../rust/crates/sirius", optional = true }
 starrocks-plan-translator = { path = "crates/starrocks-plan-translator" }
 starrocks-thrift = { path = "crates/starrocks-thrift" }
 thiserror.workspace = true
