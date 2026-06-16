@@ -4,8 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-quent-attributes = { git = "https://github.com/rapidsai/quent.git", rev = "5f405cbf4f4b21bf9153669f2fa52baab51d2d10" }
-quent-model = { git = "https://github.com/rapidsai/quent.git", rev = "5f405cbf4f4b21bf9153669f2fa52baab51d2d10" }
-quent-query-engine-model = { git = "https://github.com/rapidsai/quent.git", rev = "5f405cbf4f4b21bf9153669f2fa52baab51d2d10" }
-quent-stdlib = { git = "https://github.com/rapidsai/quent.git", rev = "5f405cbf4f4b21bf9153669f2fa52baab51d2d10" }
+# Tracks a pinned commit from quent's main branch.
+quent-attributes = { git = "https://github.com/rapidsai/quent.git", rev = "023b8c2179aba16f1bdefe430049f4fa2a424fc7" }
+quent-model = { git = "https://github.com/rapidsai/quent.git", rev = "023b8c2179aba16f1bdefe430049f4fa2a424fc7" }
+quent-query-engine-model = { git = "https://github.com/rapidsai/quent.git", rev = "023b8c2179aba16f1bdefe430049f4fa2a424fc7" }
+quent-stdlib = { git = "https://github.com/rapidsai/quent.git", rev = "023b8c2179aba16f1bdefe430049f4fa2a424fc7" }
 uuid = "1"
