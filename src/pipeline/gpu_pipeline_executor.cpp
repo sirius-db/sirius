@@ -137,6 +137,29 @@ void gpu_pipeline_executor::manager_loop()
       .bytes_to_materialize       = reservation_info.bytes_to_materialize_input,
       .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
     });
+    // Clamp the reservation request to what this memory space can actually
+    // grant (its reservation limit). The history-based estimate can balloon far
+    // past capacity — a small input that once drove a near-cap peak yields a
+    // huge peak/estimate ratio that extrapolates to multi-GiB estimates on a
+    // GiB-budget GPU. make_reservation() then returns only a partial reservation
+    // and the downgrade predicate below (which must reserve the *full*
+    // bytes_needs) can never succeed, so the task livelocks through the
+    // OOM-reschedule loop until the retry cap trips and the query fails. Capping
+    // at get_max_memory() keeps both the reservation and the downgrade target
+    // achievable; any per-batch overflow during execution is still handled by
+    // the OOM-reschedule + tiering path. (Telemetry above intentionally reports
+    // the pre-clamp estimate so the estimator can still be analyzed.)
+    if (auto const space_max = _memory_space->get_max_memory();
+        space_max > 0 && bytes_needs > space_max) {
+      SIRIUS_LOG_DEBUG(
+        "GPU Pipeline Executor: clamping reservation request {} -> {} bytes (space max) for "
+        "pipeline {} task {}",
+        bytes_needs,
+        space_max,
+        gpu_task->get_pipeline_id(),
+        gpu_task->get_task_id());
+      bytes_needs = space_max;
+    }
     SIRIUS_LOG_TRACE(
       "[GPU:{}] GPU Pipeline Executor: Acquiring memory reservation for pipeline {} of {} bytes "
       "for task {}. Memory available: {}, total reserved: {}, max: {}",
