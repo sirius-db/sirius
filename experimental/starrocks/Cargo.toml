@@ -12,27 +12,49 @@ resolver = "2"
 
 [workspace.dependencies]
 anyhow = "1"
+backon = { version = "1", default-features = false, features = ["tokio-sleep"] }
 clap = { version = "4", features = ["derive", "env"] }
 mysql_async = { version = "0.36", default-features = false, features = ["minimal-rust"] }
 # Keep this stack aligned so `substrait-explain` can format the same protobuf
 # types emitted by `substrait`, and so generated messages share one `prost`
 # runtime across the translator crate.
 prost = "0.14"
+prost-build = "0.14"
+heck = "0.5"
+prettyplease = "0.2"
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full", "parsing"] }
 substrait = "0.62.2"
 substrait-explain = "0.3.2"
 thiserror = "2"
 thrift = "0.17"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dependencies]
 anyhow.workspace = true
+backon.workspace = true
 clap.workspace = true
 mysql_async.workspace = true
+prost.workspace = true
+starrocks-plan-translator = { path = "crates/starrocks-plan-translator" }
 starrocks-thrift = { path = "crates/starrocks-thrift" }
 thiserror.workspace = true
 thrift.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
+tower.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[build-dependencies]
+heck.workspace = true
+prettyplease.workspace = true
+proc-macro2.workspace = true
+prost-build.workspace = true
+quote.workspace = true
+syn.workspace = true

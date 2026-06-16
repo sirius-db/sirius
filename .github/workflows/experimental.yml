@@ -36,9 +36,9 @@ jobs:
         with:
           submodules: false
 
-      - name: Init starrocks submodule
+      - name: Init starrocks submodules
         working-directory: ${{ github.workspace }}
-        run: git submodule update --init --depth=1 experimental/starrocks/starrocks
+        run: git submodule update --init --depth=1 experimental/starrocks/starrocks experimental/starrocks/brpc
 
       - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
         with:
