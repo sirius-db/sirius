@@ -68,7 +68,7 @@ static bool is_equality(sirius::comparison_type c)
 static cudf::filtered_join make_right_filtered_join(cudf::table_view const& right_keys,
                                                     rmm::cuda_stream_view stream)
 {
-#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 8)
+#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 6)
   return cudf::filtered_join(right_keys, cudf::null_equality::UNEQUAL, stream);
 #else
   return cudf::filtered_join(
@@ -81,7 +81,7 @@ static cudf::filtered_join make_right_filtered_join(cudf::table_view const& righ
 static std::unique_ptr<cudf::filtered_join> make_right_filtered_join_ptr(
   cudf::table_view const& right_keys, rmm::cuda_stream_view stream)
 {
-#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 8)
+#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 6)
   return std::make_unique<cudf::filtered_join>(right_keys, cudf::null_equality::UNEQUAL, stream);
 #else
   return std::make_unique<cudf::filtered_join>(
