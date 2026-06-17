@@ -14,7 +14,7 @@ resolver = "2"
 anyhow = "1"
 backon = { version = "1", default-features = false, features = ["tokio-sleep"] }
 clap = { version = "4", features = ["derive", "env"] }
-mysql_async = { version = "0.36", default-features = false, features = ["minimal-rust"] }
+mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust"] }
 # Keep this stack aligned so `substrait-explain` can format the same protobuf
 # types emitted by `substrait`, and so generated messages share one `prost`
 # runtime across the translator crate.
