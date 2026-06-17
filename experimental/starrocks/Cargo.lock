@@ -1612,7 +1612,7 @@ version = "0.1.0"
 dependencies = [
  "prost",
  "starrocks-thrift",
- "substrait 0.62.2",
+ "substrait",
  "substrait-explain",
  "thiserror",
 ]
@@ -1629,28 +1629,6 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
-
-[[package]]
-name = "substrait"
-version = "0.62.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62fc4b483a129b9772ccb9c3f7945a472112fdd9140da87f8a4e7f1d44e045d0"
-dependencies = [
- "heck",
- "prettyplease",
- "prost",
- "prost-build",
- "prost-types",
- "regress",
- "schemars",
- "semver",
- "serde",
- "serde_json",
- "serde_yaml",
- "syn",
- "typify",
- "walkdir",
-]
 
 [[package]]
 name = "substrait"
@@ -1698,7 +1676,7 @@ dependencies = [
  "protox",
  "serde_json",
  "serde_yaml",
- "substrait 0.63.0",
+ "substrait",
  "thiserror",
 ]
 
