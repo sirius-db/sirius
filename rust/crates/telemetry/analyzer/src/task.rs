@@ -17,7 +17,7 @@ use quent_analyzer::{
 };
 use quent_time::{TimeUnixNanoSec, Timestamp, span::SpanUnixNanoSec, to_secs_relative};
 use quent_ui::{FiniteStateMachine, FsmTransition, FsmUsage};
-use quent_simulator_ui::TaskFilter;
+use quent_query_engine_ui::OperatorFilter;
 use uuid::Uuid;
 
 /// The reconstructed Task FSM.
@@ -30,7 +30,7 @@ pub type TaskBuilder = FsmEventsBuilder<ModelTaskTransition>;
 pub trait TaskExt {
     fn pipeline_uuid(&self) -> Option<Uuid>;
     fn executes_physical_operation(&self, physical_operator_id: u32) -> bool;
-    fn matches_filter(&self, filter: &TaskFilter) -> bool;
+    fn matches_filter(&self, filter: &OperatorFilter) -> bool;
     fn active_span(&self) -> Option<SpanUnixNanoSec>;
     fn try_to_ui_fsm(&self, epoch: TimeUnixNanoSec) -> AnalyzerResult<FiniteStateMachine>;
 }
@@ -53,7 +53,7 @@ impl TaskExt for Task {
         })
     }
 
-    fn matches_filter(&self, filter: &TaskFilter) -> bool {
+    fn matches_filter(&self, filter: &OperatorFilter) -> bool {
         filter
             .operator_id
             .is_none_or(|pipeline_uuid| self.pipeline_uuid() == Some(pipeline_uuid))
