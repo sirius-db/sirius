@@ -175,7 +175,7 @@ This reaffirms the inherited `rdma-s3-ioctx-plan.md` v8 decision.
 
 | Phase | Scope | Hardware |
 |---|---|---|
-| P0 | **Migrate** the benchmark to the standard wire protocol (drop the 4 non-standard headers; server derives the slot address from the token, not a header) **and** harden: short-write = error (authoritative check is the `cuObjGet` result), capacity from the `cuObjGet` `size` arg, O_DIRECT edges, document callback-once (Appendix C.3) | none |
+| P0 — **migration landed** | Standard wire protocol **merged** into `s3RDMA-benchmarktool` `main`: 4 non-standard headers dropped, server decodes the slot address from the token, `x-amz-rdma-reply` status, callback-once documented. Residual hardening tracked in C.3 (strict descriptor parse; explicit short-write / capacity checks) | none |
 | P1 | Wire `object_store_config.s3_transport` into `scan_manager_config`; the scan-manager constructor selects the HTTP/RDMA backend; `AUTO`→HTTP; config tests | none |
 | P2 | `cuobj_rdma_reactor` against a **mock** client; full hardware-free test matrix (slot state machine, error paths, concept check) | none |
 | P3 | Real cuObject path: single GPU, arena + D2D, flush semantics, visibility stress test on the dev rig | CX-6 rig |
@@ -469,25 +469,33 @@ the inherited `bytes_read_total` / `device_copies_total` /
 Pushing IO counters into `telemetry_context` (today pull-only) is the open part
 — see §8 Q5.
 
-## C.3 P0 — benchmark protocol migration + hardening (lands in `s3RDMA-benchmarktool`)
+## C.3 P0 — benchmark protocol migration + hardening (in `s3RDMA-benchmarktool`)
 
-P0 is a **wire-protocol migration**, not just hardening: the benchmark today
-sends `x-cuobj-remote-addr` / `x-cuobj-size` / `x-cuobj-chunk-size` and its
-server *requires* the remote-addr header (`client/s3_client.cpp`,
-`server/s3_server.cpp`). Moving to the standard cuObject protocol means:
+**Status — the migration landed (2026-06-17), merged into
+`s3RDMA-benchmarktool` `main`.** The standard-protocol move is done; the
+remaining items below tagged *(open)* are hardening follow-ups.
 
-- Drop the four non-standard headers; the server obtains the slot address by
-  **decoding it from the token** rather than reading `x-cuobj-remote-addr`.
-  Implementation caveat: the pinned SDK is cuObject **1.0.0**, whose
-  `handleGetObject` still takes `remote_buf_start` as an explicit param — so
-  this needs either a server-side token-decode path or an SDK bump toward the
-  public **1.2.0** protocol. Do not assume the old benchmark server runs
-  unchanged.
-- Server enforces the destination capacity (from the `cuObjGet` `size` arg /
-  the fixed arena `slot_size`) and rejects writes larger than the destination.
-- Short positive RDMA writes are errors — the **authoritative** check is
-  `cuObjGet`'s returned `n == expected`; `x-amz-rdma-reply` is the standard
-  status tag (do not assume it itself equals the byte count).
+P0 was a **wire-protocol migration**, not just hardening: the benchmark used to
+send `x-cuobj-remote-addr` / `x-cuobj-size` / `x-cuobj-chunk-size` with the
+server requiring the remote-addr header. The move to the standard cuObject
+protocol:
+
+- **(done)** Dropped the four non-standard headers; the server now obtains the
+  slot address by **decoding it from the token** — `parse_rdma_remote_addr`
+  reads the DC_V1 descriptor's first field. The server-side token-decode path
+  worked on the pinned cuObject **1.0.0** (no SDK bump needed).
+  **(open)** That parse is currently minimal — a marker-prefixed descriptor
+  (cuObject defines `OBJ_RDMA_V1 "CUOBJ"`) could yield a wrong address rather
+  than failing; strict hex validation was reviewed and **deferred** pending a
+  format lock against a real `rdma->desc_str` on the rig.
+- **(open)** Explicit destination-capacity enforcement: today the transfer is
+  bounded by `Range` + the `cuObjGet` `size` arg; no separate server-side
+  "reject writes larger than the destination" check has been added.
+- **(open)** Explicit short-write check: failures surface via the HTTP status
+  (client returns -1 on non-200), but an independent client-side
+  `n == expected` check is not yet wired. `x-amz-rdma-reply` is the standard
+  status tag (don't assume it equals the byte count).
+- **(done)** Callback-once-per-object semantics documented (benchmark
+  `internals.md`).
 - O_DIRECT alignment edge cases.
-- Document callback-once-per-object semantics.
 - Optional stretch: SigV4 validation mode in the benchmark server.
