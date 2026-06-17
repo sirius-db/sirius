@@ -2,7 +2,7 @@ use instrumentation_model::SiriusEvent;
 use quent_events::Event;
 pub use quent_query_engine_analyzer::QueryEngineModel;
 use quent_query_engine_analyzer::ui::UiAnalyzer;
-use quent_query_engine_ui::{QueryBundle, QueryEntities};
+use quent_query_engine_ui::{OperatorFilter, QueryBundle, QueryEntities, QueryFilter};
 use quent_ui::{
     FiniteStateMachine, ResourceGroupNode, ResourceTree, convert_resource_tree,
     quantity::QuantitySpec,
@@ -36,7 +36,7 @@ use quent_analyzer::{
     },
 };
 use quent_time::{SpanNanoSec, TimeNanoSec, TimeUnixNanoSec, to_nanosecs, to_secs};
-use quent_simulator_ui::{EntityRef, QueryFilter, TaskFilter};
+use quent_simulator_ui::EntityRef;
 use uuid::Uuid;
 
 use crate::{
@@ -60,7 +60,7 @@ struct PlainBuilderSlot<'a> {
     config_idx: usize,
     builder: ResourceTimelineBuilder<'a>,
     resource_id_filter: Arc<HashSet<Uuid>>,
-    task_filter: TaskFilter,
+    task_filter: OperatorFilter,
 }
 
 struct PerStateBuilderSlot<'a> {
@@ -68,14 +68,12 @@ struct PerStateBuilderSlot<'a> {
     config_idx: usize,
     builder: ResourceTimelineByKeyBuilder<'a, &'a str>,
     resource_id_filter: Arc<HashSet<Uuid>>,
-    task_filter: TaskFilter,
+    task_filter: OperatorFilter,
 }
 
 impl UiAnalyzer for SiriusUiAnalyzer {
     type Event = SiriusEvent;
     type EntityRef = EntityRef;
-    type TimelineGlobalParams = QueryFilter;
-    type TimelineParams = TaskFilter;
 
     fn try_new(
         engine_id: Uuid,
@@ -245,7 +243,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
     // TODO(johanpel): consider reusing the bulk request API with a single entry for requests like this.
     fn single_resource_timeline(
         &self,
-        request: SingleTimelineRequest<Self::TimelineGlobalParams, Self::TimelineParams>,
+        request: SingleTimelineRequest<QueryFilter, OperatorFilter>,
     ) -> AnalyzerResult<SingleTimelineResponse> {
         // TODO(johanpel): we may want to sanity-check whether the requested
         // resource/group is actually in the resource tree for a given query.
@@ -363,7 +361,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
 
     fn bulk_resource_timeline(
         &self,
-        request: BulkTimelineRequest<Self::TimelineGlobalParams, Self::TimelineParams>,
+        request: BulkTimelineRequest<QueryFilter, OperatorFilter>,
     ) -> AnalyzerResult<BulkTimelinesResponse> {
         // Calculate this ASAP to help fail quickly.
         let epoch = self
@@ -380,7 +378,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         // each bulk entry. After populating this, we'll build a reverse index,
         // that maps a resource_id to a list of indices in these vecs, for which
         // that resource's usages are relevant.
-        let mut plain_builders: Vec<(String, ResourceTimelineBuilder, HashSet<Uuid>, TaskFilter)> =
+        let mut plain_builders: Vec<(String, ResourceTimelineBuilder, HashSet<Uuid>, OperatorFilter)> =
             Vec::new();
 
         // Prepare them also for keyed builders (building by state).
@@ -388,7 +386,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             String,
             ResourceTimelineByKeyBuilder<&str>,
             HashSet<Uuid>,
-            TaskFilter,
+            OperatorFilter,
         )> = Vec::new();
 
         for (entry_id, entry) in request.entries {
@@ -526,7 +524,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
 
     fn bulk_chunked_resource_timeline(
         &self,
-        request: BulkChunkedTimelineRequest<Self::TimelineGlobalParams, Self::TimelineParams>,
+        request: BulkChunkedTimelineRequest<QueryFilter, OperatorFilter>,
     ) -> AnalyzerResult<BulkChunkedTimelinesResponse> {
         let epoch = self
             .query_engine_model()
@@ -696,7 +694,7 @@ impl SiriusUiAnalyzer {
         &self,
         view: &'a SiriusModelQueryView<'a>,
         entity_filter: EntityFilter,
-        task_filter: &TaskFilter,
+        task_filter: &OperatorFilter,
         time_window: SpanNanoSec,
     ) -> AnalyzerResult<Vec<&'a Task>> {
         if let Some(entity_type_name) = entity_filter.entity_type_name
@@ -723,7 +721,7 @@ impl SiriusUiAnalyzer {
     fn try_prepare_bulk_entry<'a>(
         &self,
         view: &'a SiriusModelQueryView<'a>,
-        request: TimelineRequest<TaskFilter>,
+        request: TimelineRequest<OperatorFilter>,
         tree: &ResourceTreeNode,
     ) -> AnalyzerResult<BulkEntryPrep<'a>> {
         Ok(match request {
@@ -842,6 +840,6 @@ struct BulkEntryPrep<'a> {
     resource_type: &'a ResourceTypeDecl,
     resource_id_filter: HashSet<Uuid>,
     entity_filter: EntityFilter,
-    task_filter: TaskFilter,
+    task_filter: OperatorFilter,
     long_entities_threshold: Option<TimeNanoSec>,
 }
