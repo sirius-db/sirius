@@ -1,6 +1,9 @@
-<!-- ![Sirius](sirius-full.png) -->
 <p align="center">
-  <img src="sirius-full.png" alt="Diagram" width="500"/>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="sirius-full-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="sirius-full.png">
+    <img src="sirius-full.png" alt="Sirius" width="500"/>
+  </picture>
   <br/>
   <a href="https://join.slack.com/t/sirius-db/shared_invite/zt-33tuwt1sk-aa2dk0EU_dNjklSjIGW3vg">
     <img src="https://img.shields.io/badge/Slack-Join%20Us-blue?logo=slack" alt="Slack"/>
@@ -9,9 +12,12 @@
 
 Sirius is a GPU-native SQL engine. It plugs into existing databases such as DuckDB via the standard Substrait query format, requiring no query rewrites or major system changes. Sirius currently supports DuckDB and Doris (coming soon), other systems marked with * are on our roadmap. Built on NVIDIA CUDA-X libraries including cuDF and RAPIDS Memory Manager (RMM), Sirius delivers high-performance GPU-accelerated analytics.
 
-<!-- ![Architecture](sirius-architecture.png) -->
 <p align="center">
-  <img src="super-sirius-arch.png" alt="Diagram" width="700"/>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="super-sirius-arch-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="super-sirius-arch.png">
+    <img src="super-sirius-arch.png" alt="Sirius architecture" width="700"/>
+  </picture>
 </p>
 
 ## Performance
@@ -78,16 +84,22 @@ For a full list of current limitations and ongoing work, please refer to our [Gi
 
 ## Contributors and Partners
 
-<p align="center">
-  <a href="https://www.nvidia.com/"><img src="https://www.nvidia.com/content/nvidiaGDC/us/en_US/about-nvidia/legal-info/logo-brand-usage/_jcr_content/root/responsivegrid/nv_container_392921705/nv_container_412055486/nv_image.coreimg.100.1290.png/1703060329095/nvidia-logo-horz.png" alt="NVIDIA" width="250" align="middle"/></a>
-  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://www.wisc.edu/"><img src="uw-madison-logo.png" alt="UW-Madison" width="250" align="middle"/></a>
-</p>
-<p align="center">
-  <a href="https://duckdblabs.com/"><img src="https://duckdb.org/images/logo-dl/DuckDB_Logo-horizontal.svg" alt="DuckDB Labs" width="200" align="middle"/></a>
-  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://www.vastdata.com/"><img src="https://upload.wikimedia.org/wikipedia/commons/3/36/VAST_Data_logo.svg" alt="VAST Data" width="200" align="middle"/></a>
-</p>
+<table>
+  <tr>
+    <td align="center" bgcolor="#ffffff">
+      <p>
+        <a href="https://www.nvidia.com/"><img src="https://www.nvidia.com/content/nvidiaGDC/us/en_US/about-nvidia/legal-info/logo-brand-usage/_jcr_content/root/responsivegrid/nv_container_392921705/nv_container_412055486/nv_image.coreimg.100.1290.png/1703060329095/nvidia-logo-horz.png" alt="NVIDIA" width="250" align="middle"/></a>
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+        <a href="https://www.wisc.edu/"><img src="uw-madison-logo.png" alt="UW-Madison" width="250" align="middle"/></a>
+      </p>
+      <p>
+        <a href="https://duckdblabs.com/"><img src="https://duckdb.org/images/logo-dl/DuckDB_Logo-horizontal.svg" alt="DuckDB Labs" width="200" align="middle"/></a>
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+        <a href="https://www.vastdata.com/"><img src="https://upload.wikimedia.org/wikipedia/commons/3/36/VAST_Data_logo.svg" alt="VAST Data" width="200" align="middle"/></a>
+      </p>
+    </td>
+  </tr>
+</table>
 
 ## Future Roadmap
 Sirius is still under major development and we are working on adding more features to Sirius, such as disk spilling, multi-GPUs, multi-node, more operators, data types, accelerating more engines, and many more.
