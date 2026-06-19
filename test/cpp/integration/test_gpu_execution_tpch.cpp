@@ -4674,6 +4674,27 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
   compare_gpu_vs_cpu("select count(*), min(l_orderkey), max(l_orderkey) from lineitem;");
 }
 
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - empty result (WHERE false)",
+                 "[integration][gpu_execution][cpu_source]")
+{
+  compare_gpu_vs_cpu("select n_nationkey from nation where 1=0;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - dummy scan (SELECT literal)",
+                 "[integration][gpu_execution][cpu_source]")
+{
+  compare_gpu_vs_cpu("select 42 as x;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - values CPU source",
+                 "[integration][gpu_execution][cpu_source]")
+{
+  compare_gpu_vs_cpu("select b from (values (1), (2), (3)) t(b);");
+}
+
 //===----------------------------------------------------------------------===//
 // pin_table tests
 //===----------------------------------------------------------------------===//

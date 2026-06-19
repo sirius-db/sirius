@@ -40,8 +40,11 @@ namespace sirius::op::scan {
 // cpu_source_task_global_state
 //===----------------------------------------------------------------------===//
 cpu_source_task_global_state::cpu_source_task_global_state(
-  duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline, sirius_physical_cpu_source* source_op)
-  : sirius_pipeline_task_global_state(std::move(pipeline)), _op(*source_op)
+  duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
+  sirius_physical_cpu_source* source_op,
+  std::shared_ptr<const telemetry::telemetry_context> telemetry_context)
+  : sirius_pipeline_task_global_state(std::move(pipeline), std::move(telemetry_context)),
+    _op(*source_op)
 {
 }
 
@@ -49,11 +52,11 @@ cpu_source_task_global_state::cpu_source_task_global_state(
 // cpu_source_task
 //===----------------------------------------------------------------------===//
 cpu_source_task::cpu_source_task(uint64_t task_id,
-                                 cucascade::shared_data_repository* data_repo,
+                                 std::vector<cucascade::shared_data_repository*> data_repos,
                                  std::unique_ptr<cpu_source_task_local_state> local_state,
                                  std::shared_ptr<cpu_source_task_global_state> global_state)
   : sirius_pipeline_itask(task_id, std::move(local_state), std::move(global_state)),
-    _data_repo(data_repo)
+    _data_repos(std::move(data_repos))
 {
   if (auto* pipeline = _global_state->cast<cpu_source_task_global_state>().get_pipeline()) {
     pipeline->mark_task_created();
@@ -293,9 +296,9 @@ std::unique_ptr<op::operator_data> cpu_source_task::compute_task(rmm::cuda_strea
   auto& g_state = _global_state->cast<cpu_source_task_global_state>();
   auto& source  = g_state.get_source_op();
 
-  // The reservation was acquired by duckdb_scan_executor::manager_loop before
-  // this task was dispatched. Batches produced below reference memory backed
-  // by this reservation, so it must stay alive on the local state until the
+  // The reservation was acquired by task_creator::manager_loop before this
+  // task was dispatched. Batches produced below reference memory backed by
+  // this reservation, so it must stay alive on the local state until the
   // batches are consumed downstream.
   auto* local = dynamic_cast<cpu_source_task_local_state*>(local_state());
   if (!local) { throw std::runtime_error("[cpu_source_task] Unexpected local state type"); }
@@ -323,30 +326,36 @@ std::unique_ptr<op::operator_data> cpu_source_task::compute_task(rmm::cuda_strea
       chunk.Reset();
     }
   } else if (source.produce_single_row) {
-    // DUMMY_SCAN: produce one row with all-null values. DuckDB's
-    // DataChunk::Initialize allocates but does NOT zero the backing storage,
-    // and chunk_to_data_batch memcpys that backing into the pinned host
-    // allocation. Mark the validity invalid AND zero each fixed-width
-    // vector's data bytes so the produced batch never carries uninitialized
-    // bytes out to downstream operators (which would trip ASAN/MSAN even
-    // though the null mask makes it semantically safe). VARCHAR vectors are
-    // handled safely in chunk_to_data_batch: the loop checks validity before
-    // reading the string_t payload.
+    // DUMMY_SCAN: produce one row. All output columns are set to null.
+    // DuckDB's DataChunk::Initialize allocates but does NOT zero backing
+    // storage, so we explicitly zero and mark invalid to keep ASAN/MSAN clean.
+    //
+    // When source.types is empty (0-output-column DUMMY_SCAN, e.g. SELECT 42),
+    // a 0-column batch would convert to a 0-row cudf::table — cudf derives row
+    // count from columns. We add a TINYINT sentinel column so the cudf table
+    // has exactly 1 row. Downstream constant-expression GPU operators (e.g.
+    // PROJECTION of literals) use num_rows() from the input table; the sentinel
+    // column value is never read.
     duckdb::DataChunk chunk;
-    // source.types is sirius::logical_type post-#643. DataChunk still speaks
-    // DuckDB types — to_duckdb_vec is the unavoidable boundary conversion.
-    chunk.Initialize(duckdb::Allocator::DefaultAllocator(), sirius::to_duckdb_vec(source.types));
+    duckdb::vector<sirius::logical_type> effective_types = source.types;
+    if (effective_types.empty()) {
+      effective_types.push_back(sirius::logical_type::make(sirius::type_id::TINYINT));
+      chunk.Initialize(duckdb::Allocator::DefaultAllocator(), {duckdb::LogicalType::TINYINT});
+    } else {
+      chunk.Initialize(duckdb::Allocator::DefaultAllocator(),
+                       sirius::to_duckdb_vec(effective_types));
+    }
     chunk.SetCardinality(1);
     for (size_t c = 0; c < chunk.data.size(); c++) {
       auto& vec      = chunk.data[c];
       auto& validity = duckdb::FlatVector::Validity(vec);
       validity.SetAllInvalid(1);
-      if (!source.types[c].is_varchar()) {
-        auto type_size = source.types[c].fixed_width_byte_size();
+      if (!effective_types[c].is_varchar()) {
+        auto type_size = effective_types[c].fixed_width_byte_size();
         if (type_size > 0) { std::memset(duckdb::FlatVector::GetData(vec), 0, type_size); }
       }
     }
-    batches.push_back(chunk_to_data_batch(chunk, source.types, mem_space, reservation_ptr));
+    batches.push_back(chunk_to_data_batch(chunk, effective_types, mem_space, reservation_ptr));
   }
   // else: EMPTY_RESULT — produce no data batches
 
@@ -362,9 +371,9 @@ std::unique_ptr<op::operator_data> cpu_source_task::compute_task(rmm::cuda_strea
 
 void cpu_source_task::publish_output(op::operator_data& output_data, rmm::cuda_stream_view stream)
 {
-  // DUMMY_SCAN batches are legitimately 0-byte (0 columns, 1 row of "nothing"),
-  // so publish every valid batch rather than filtering on size_in_bytes.
-  // Downstream operators still need to see the batch to know a row existed.
+  // Publish all valid batches regardless of size. DUMMY_SCAN batches carry a
+  // TINYINT sentinel column (1 row) so downstream cudf-based operators see
+  // the correct row count.
   auto& pipelineable_output = dynamic_cast<op::pipelineable_operator_data&>(output_data);
   for (auto& batch : pipelineable_output.get_data_batches()) {
     if (!batch) { continue; }
@@ -372,7 +381,9 @@ void cpu_source_task::publish_output(op::operator_data& output_data, rmm::cuda_s
       auto ro = batch->to_read_only();
       if (!ro.get_data()) { continue; }
     }
-    _data_repo->add_data_batch(batch);
+    for (auto* repo : _data_repos) {
+      repo->add_data_batch(batch);
+    }
   }
 }
 

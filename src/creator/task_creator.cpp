@@ -17,7 +17,9 @@
 #include "creator/task_creator.hpp"
 
 #include "log/logging.hpp"
+#include "op/scan/cpu_source_task.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
+#include "op/sirius_physical_cpu_source.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_scheduler.hpp"
@@ -114,6 +116,11 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
       std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline, telemetry_context);
     _gpu_operator_global_state_map.emplace(operator_id, std::move(gs));
   }
+}
+
+void task_creator::signal_query_complete()
+{
+  if (_task_scheduler) { _task_scheduler->signal_query_complete(); }
 }
 
 void task_creator::drain_pending_tasks()
@@ -230,6 +237,103 @@ void task_creator::manager_loop()
     node = get_operator_for_next_task(node);
 
     if (node == nullptr) { continue; }
+
+    // CPU_SOURCE operators are run as cpu_source_task on the bounded pool rather
+    // than as gpu_pipeline_task. The base all_ports_empty() returns true for
+    // source-only operators (no input ports), so the normal while-loop below
+    // would never fire. Instead we create, reserve memory for, and execute the
+    // cpu_source_task inline, then schedule the downstream consumers.
+    if (auto* cpu_src = dynamic_cast<op::sirius_physical_cpu_source*>(node)) {
+      _bounded_pool->dispatch(std::move(slot), [this, cpu_src]() mutable {
+        try {
+          auto pipeline = cpu_src->get_pipeline();
+
+          // Collect ALL downstream data repositories — one per dependent pipeline
+          // (e.g. CTE reuse can fan the same scan output to multiple pipelines).
+          std::vector<cucascade::shared_data_repository*> data_repos;
+          for (const auto& port_info : pipeline->get_next_ports_after_sink()) {
+            if (auto* repo =
+                  port_info.next_operator->get_port(port_info.next_operator_port_name)->repo) {
+              data_repos.push_back(repo);
+            }
+          }
+          // Terminal pipelines (sink = RESULT_COLLECTOR) have no next ports;
+          // an empty data_repos vector is valid in that case.
+          if (data_repos.empty()) {
+            auto sink = pipeline->get_sink();
+            if (!sink || sink->type != op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
+              throw std::runtime_error(
+                "task_creator: cpu_source_op has no downstream data repository");
+            }
+          }
+
+          auto* sirius_ctx_ptr =
+            _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state").get();
+          auto telemetry_ctx = sirius_ctx_ptr ? sirius_ctx_ptr->get_telemetry_context() : nullptr;
+          auto global_state  = std::make_shared<op::scan::cpu_source_task_global_state>(
+            pipeline, cpu_src, std::move(telemetry_ctx));
+          auto local_state = std::make_unique<op::scan::cpu_source_task_local_state>();
+          auto task_id     = get_next_task_id();
+          auto task        = std::make_unique<op::scan::cpu_source_task>(
+            task_id, std::move(data_repos), std::move(local_state), global_state);
+
+          auto reservation_info = task->get_estimated_reservation_size_info();
+          auto reservation      = _mem_res_mgr.request_reservation(
+            cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST},
+            reservation_info.reservation_size);
+          if (!reservation) {
+            // Unlike the GPU path (which blocks for backpressure via the
+            // reservation manager), this throws immediately. CPU sources carry
+            // small data (subquery ColumnDataCollections, statistics results)
+            // so memory exhaustion is rare in practice. A proper retry/backpressure
+            // path could be considered in the future if needed.
+            throw std::runtime_error(
+              "task_creator: failed to acquire HOST memory reservation for cpu_source_task");
+          }
+          task->local_state()->cast<pipeline::sirius_pipeline_task_local_state>().set_reservation(
+            std::move(reservation), reservation_info);
+
+          auto consumers   = task->get_output_consumers();
+          auto stream      = cudf::get_default_stream();
+          auto output_data = task->compute_task(stream);
+          task->publish_output(*output_data, stream);
+          task->telemetry_handle().finalizing({
+            .instance_name = "",
+            .success       = true,
+          });
+          task->telemetry_handle().exit();
+          task->set_telemetry_finalized();
+          task.reset();  // triggers mark_task_completed()
+
+          // Mirror gpu_pipeline_executor's terminal detection: if this is the
+          // terminal pipeline (sink = RESULT_COLLECTOR) and has no downstream
+          // consumers, no GPU task will ever run to call mark_completed().
+          // We must signal completion here. Note: drain_pending_tasks() must NOT
+          // be called from inside the bounded_pool lambda — it calls wait_all()
+          // which would deadlock. wait_for_completion() drains the queues anyway.
+          bool query_complete = false;
+          if (consumers.empty()) {
+            auto sink = pipeline->get_sink();
+            if (sink && sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
+              query_complete = true;
+            }
+          }
+
+          if (!query_complete) {
+            for (auto* consumer : consumers) {
+              this->schedule(consumer);
+            }
+          } else {
+            _task_scheduler->signal_query_complete();
+          }
+        } catch (...) {
+          SIRIUS_LOG_ERROR("Task Creator: Exception during cpu_source_task execution");
+          _task_scheduler->terminate_query(std::current_exception());
+          stop();
+        }
+      });
+      continue;
+    }
 
     // Dispatch the task creation work to the pool
     _bounded_pool->dispatch(std::move(slot), [this, node]() mutable {
