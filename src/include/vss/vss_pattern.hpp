@@ -16,13 +16,13 @@
 
 #pragma once
 
-#include <cstdint>
-#include <optional>
-#include <vector>
-
 #include <cudf/types.hpp>
 
 #include <cuvs/distance/distance.hpp>
+
+#include <cstdint>
+#include <optional>
+#include <vector>
 
 namespace duckdb {
 class LogicalTopN;
