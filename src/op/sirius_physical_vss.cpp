@@ -18,6 +18,7 @@
 
 #include "data/data_batch_utils.hpp"
 #include "op/sirius_physical_vss_merge.hpp"
+#include "op/vss_top_k.hpp"
 #include "sirius/exception.hpp"
 #include "vss/brute_force_search.hpp"
 #include "vss/cudf_raft_interop.hpp"
@@ -68,6 +69,8 @@ std::unique_ptr<cudf::table> make_empty_vss_output(cudf::table_view input,
   }
   return std::make_unique<cudf::table>(std::move(cols));
 }
+
+}  // namespace
 
 std::unique_ptr<cudf::table> compute_vss_top_k(cudf::table_view input,
                                                sirius::vss::vss_top_k_pattern const& pattern,
@@ -155,8 +158,6 @@ std::unique_ptr<cudf::table> merge_vss_top_k(cudf::table_view input,
                            memory_resource);
 }
 
-}  // namespace
-
 sirius_physical_vss::sirius_physical_vss(duckdb::vector<sirius::logical_type> types_p,
                                          sirius::vss::vss_top_k_pattern pattern_p,
                                          std::size_t limit,
@@ -232,7 +233,9 @@ sirius_physical_vss_merge::sirius_physical_vss_merge(sirius_physical_vss* vss)
                               vss->limit,
                               vss->offset,
                               vss->estimated_cardinality)
-{ child_op = vss; }
+{
+  child_op = vss;
+}
 
 sirius_physical_vss_merge::sirius_physical_vss_merge(duckdb::vector<sirius::logical_type> types_p,
                                                      sirius::vss::vss_top_k_pattern pattern_p,

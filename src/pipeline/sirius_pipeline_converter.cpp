@@ -53,9 +53,9 @@
 #include "op/sirius_physical_top_n.hpp"
 #include "op/sirius_physical_top_n_merge.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
+#include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "op/sirius_physical_vss.hpp"
 #include "op/sirius_physical_vss_merge.hpp"
-#include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "sirius_config.hpp"
 
 #include <algorithm>
@@ -857,8 +857,8 @@ void sirius_pipeline_converter::split_vss_sink(
   scheduled_.push_back(current_pipeline);
 
   // Create MERGE_VSS operator
-  auto merge_op = duckdb::unique_ptr<op::sirius_physical_vss_merge>(
-    new op::sirius_physical_vss_merge(vss_ptr));
+  auto merge_op =
+    duckdb::unique_ptr<op::sirius_physical_vss_merge>(new op::sirius_physical_vss_merge(vss_ptr));
   auto* merge_ptr = merge_op.get();
 
   // Pipeline B: VSS (source) -> MERGE_VSS (sink)

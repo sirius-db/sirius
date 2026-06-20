@@ -110,11 +110,15 @@ std::optional<vss_top_k_pattern> match_vss_top_n(duckdb::LogicalTopN const& op)
   auto const& order = op.orders[0];
 
   if (order.type != duckdb::OrderType::ASCENDING) { return std::nullopt; }
-  if (order.expression->expression_class != duckdb::ExpressionClass::BOUND_REF) { return std::nullopt; }
+  if (order.expression->expression_class != duckdb::ExpressionClass::BOUND_REF) {
+    return std::nullopt;
+  }
   auto const distance_index = order.expression->Cast<duckdb::BoundReferenceExpression>().index;
 
   if (op.children.size() != 1) { return std::nullopt; }
-  if (op.children[0]->type != duckdb::LogicalOperatorType::LOGICAL_PROJECTION) { return std::nullopt; }
+  if (op.children[0]->type != duckdb::LogicalOperatorType::LOGICAL_PROJECTION) {
+    return std::nullopt;
+  }
   auto const& proj  = op.children[0]->Cast<duckdb::LogicalProjection>();
   auto const& exprs = proj.expressions;
   if (distance_index >= exprs.size()) { return std::nullopt; }
