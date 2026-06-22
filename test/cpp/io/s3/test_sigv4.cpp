@@ -390,12 +390,12 @@ TEST_CASE("presign_url preserves the caller-selected scheme", "[s3][sigv4]")
 {
   auto url = presign_url("GET",
                          "http",
-                         "minio.local:9000",
+                         "s3.local:9000",
                          "/bucket/test.txt",
                          aws_example_creds(),
                          1369353600,
                          std::chrono::seconds{300});
 
-  CHECK(url.find("http://minio.local:9000/bucket/test.txt?") == 0);
+  CHECK(url.find("http://s3.local:9000/bucket/test.txt?") == 0);
   CHECK(is_lower_hex_64(query_value(url, "X-Amz-Signature")));
 }

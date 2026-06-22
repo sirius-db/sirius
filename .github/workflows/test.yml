@@ -106,7 +106,7 @@ jobs:
               run-on-pr: ${{ fromJSON(github.event_name == 'pull_request' && 'false' || 'null') }}
       fail-fast: false
     runs-on: ${{ fromJSON(format('["self-hosted", "{0}", "gpu-2xl4"]', matrix.cuda.runner)) }}
-    timeout-minutes: 60
+    timeout-minutes: 90 # extra budget for the merge-queue SF10 S3 large gate
     env:
       CUDA_CACHE_PATH: /home/runner/actions-runner/_work/.cuda-cache
       SIRIUS_LOG_LEVEL: trace
@@ -177,6 +177,18 @@ jobs:
           name: tpch-run-${{ github.run_id }}-cuda-${{ matrix.cuda.version }}
           path: ${{ steps.tpch.outputs.run_dir }}
           retention-days: 14
+
+      # S3 integration gate. The backend is a SeaweedFS `weed` process the test
+      # binary spawns itself (no Docker), so the standard gate is cheap enough to
+      # run on PR CI; the expensive SF10 SQL-over-S3 gate (multi-minute fixture
+      # generation + large upload) is left to the merge queue.
+      - name: S3 integration tests
+        if: ${{ matrix.cuda.version == '13' }}
+        run: make s3-test
+
+      - name: S3 large SQL-over-S3 tests
+        if: ${{ matrix.cuda.version == '13' && github.event_name == 'merge_group' }}
+        run: make s3-test-large
 
   test:
     runs-on: ubuntu-slim

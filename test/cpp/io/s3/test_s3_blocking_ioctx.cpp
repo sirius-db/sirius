@@ -1279,7 +1279,7 @@ TEST_CASE("s3_blocking_ioctx host_read_ranges_async_io reports validation errors
   }
 }
 
-TEST_CASE("s3_blocking_ioctx reads single objects from MinIO with presigned range GETs",
+TEST_CASE("s3_blocking_ioctx reads single objects from S3 with presigned range GETs",
           "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
@@ -1311,7 +1311,7 @@ TEST_CASE("s3_blocking_ioctx reads single objects from MinIO with presigned rang
   CHECK(std::all_of(eof.begin(), eof.end(), [](auto b) { return b == 0xCC; }));
 }
 
-TEST_CASE("s3_blocking_ioctx reads MinIO over HTTPS when configured with the generated CA bundle",
+TEST_CASE("s3_blocking_ioctx reads S3 over HTTPS when configured with the generated CA bundle",
           "[.][s3][integration][tls][ioctx]")
 {
   auto env = read_s3_test_env();
@@ -1336,7 +1336,7 @@ TEST_CASE("s3_blocking_ioctx reads MinIO over HTTPS when configured with the gen
   require_bytes_equal(middle, local, offset);
 }
 
-TEST_CASE("s3_blocking_ioctx rejects self-signed MinIO HTTPS when no CA bundle is configured",
+TEST_CASE("s3_blocking_ioctx rejects self-signed S3 HTTPS when no CA bundle is configured",
           "[.][s3][integration][tls][ioctx]")
 {
   auto env = read_s3_test_env();
@@ -1345,7 +1345,7 @@ TEST_CASE("s3_blocking_ioctx rejects self-signed MinIO HTTPS when no CA bundle i
   auto ctx = make_live_tls_ioctx(*env, /*trust_generated_ca=*/false, /*tls_verify=*/true);
   try {
     (void)ctx->head_object_size(env->bucket, "parquet/nation.parquet");
-    FAIL("Expected self-signed HTTPS MinIO to fail without the generated CA bundle");
+    FAIL("Expected self-signed HTTPS S3 to fail without the generated CA bundle");
   } catch (std::exception const& e) {
     std::string const msg = e.what();
     INFO(msg);
@@ -1354,7 +1354,7 @@ TEST_CASE("s3_blocking_ioctx rejects self-signed MinIO HTTPS when no CA bundle i
   }
 }
 
-TEST_CASE("s3_blocking_ioctx TLS scaffold leaves the existing HTTP MinIO path unchanged",
+TEST_CASE("s3_blocking_ioctx TLS scaffold leaves the existing HTTP S3 path unchanged",
           "[.][s3][integration][tls][ioctx]")
 {
   auto env = read_s3_test_env();
@@ -1376,7 +1376,7 @@ TEST_CASE("s3_blocking_ioctx TLS scaffold leaves the existing HTTP MinIO path un
   CHECK(got == local);
 }
 
-TEST_CASE("s3_blocking_ioctx create_io_object populates S3 object metadata from MinIO",
+TEST_CASE("s3_blocking_ioctx create_io_object populates S3 object metadata from S3",
           "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
@@ -1415,7 +1415,7 @@ TEST_CASE("s3_blocking_ioctx create_io_object propagates missing S3 key HEAD fai
   CHECK_THROWS(ctx->create_io_object(s3_uri(env->bucket, "nonexistent-key-xyz")));
 }
 
-TEST_CASE("s3_blocking_ioctx reads multiple MinIO byte ranges", "[.][s3][integration][ioctx]")
+TEST_CASE("s3_blocking_ioctx reads multiple S3 byte ranges", "[.][s3][integration][ioctx]")
 {
   auto env = read_s3_test_env();
   if (!env) {

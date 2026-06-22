@@ -54,7 +54,7 @@ struct sigv4_signed_request {
  *
  * @param method             HTTP method (`"GET"`, `"HEAD"`).
  * @param host               Host header value (e.g. `"s3.us-west-2.amazonaws.com"`
- *                           or `"minio.local:9000"`).
+ *                           or `"s3.local:9000"`).
  * @param canonical_uri      URI path, already RFC3986-encoded (e.g. `"/bucket/key"`).
  * @param canonical_query    Canonical query string, already encoded & sorted; empty if none.
  * @param payload_sha256_hex Hex SHA256 of the request body. For GET/HEAD with

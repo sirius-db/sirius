@@ -117,8 +117,8 @@ TEST_CASE("sirius_config loads object_store_config from YAML", "[object_store_co
            "  object_store_config:\n"
            "    endpoint: http://127.0.0.1:9000\n"
            "    region: us-east-1\n"
-           "    access_key: minioadmin\n"
-           "    secret_key: minioadmin-secret\n"
+           "    access_key: siriustest\n"
+           "    secret_key: siriustest-secret\n"
            "    session_token: TESTSESSIONTOKEN\n"
            "    signing_mode: header\n"
            "    s3_transport: rdma\n";
@@ -130,8 +130,8 @@ TEST_CASE("sirius_config loads object_store_config from YAML", "[object_store_co
 
   CHECK(cfg.object_store_config.endpoint == "http://127.0.0.1:9000");
   CHECK(cfg.object_store_config.region == "us-east-1");
-  CHECK(cfg.object_store_config.access_key == "minioadmin");
-  CHECK(cfg.object_store_config.secret_key == "minioadmin-secret");
+  CHECK(cfg.object_store_config.access_key == "siriustest");
+  CHECK(cfg.object_store_config.secret_key == "siriustest-secret");
   CHECK(cfg.object_store_config.session_token == "TESTSESSIONTOKEN");
   CHECK(cfg.object_store_config.s3_signing_mode == object_store_config::signing_mode::header);
   CHECK(cfg.object_store_config.s3_transport == object_store_config::transport::RDMA);
@@ -150,8 +150,8 @@ TEST_CASE("sirius_config loads presigned object_store_config signing mode from Y
            "  object_store_config:\n"
            "    endpoint: http://127.0.0.1:9000\n"
            "    region: us-east-1\n"
-           "    access_key: minioadmin\n"
-           "    secret_key: minioadmin-secret\n"
+           "    access_key: siriustest\n"
+           "    secret_key: siriustest-secret\n"
            "    signing_mode: presigned\n";
     REQUIRE(out);
   }
@@ -175,8 +175,8 @@ TEST_CASE("sirius_config rejects unknown object_store_config signing modes",
            "  object_store_config:\n"
            "    endpoint: http://127.0.0.1:9000\n"
            "    region: us-east-1\n"
-           "    access_key: minioadmin\n"
-           "    secret_key: minioadmin-secret\n"
+           "    access_key: siriustest\n"
+           "    secret_key: siriustest-secret\n"
            "    signing_mode: query-string\n";
     REQUIRE(out);
   }

@@ -297,7 +297,7 @@ std::string join_lines(std::vector<std::string> const& values)
 
 }  // namespace
 
-TEST_CASE("default-visible S3 tests do not silently skip live MinIO work", "[s3][test_hygiene]")
+TEST_CASE("default-visible S3 tests do not silently skip live S3 work", "[s3][test_hygiene]")
 {
   auto const root  = project_root();
   auto const files = discover_cpp_test_files(root);
@@ -311,7 +311,7 @@ TEST_CASE("default-visible S3 tests do not silently skip live MinIO work", "[s3]
 
   INFO(
     "Default-visible [s3] TEST_CASE bodies must not call read_s3_test_env/"
-    "skip_if_no_s3_env; use [.][s3][integration] for live MinIO tests. Offenders:"
+    "skip_if_no_s3_env; use [.][s3][integration] for live S3 tests. Offenders:"
     << join_lines(violations));
   CHECK(violations.empty());
 }

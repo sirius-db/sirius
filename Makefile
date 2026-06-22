@@ -138,24 +138,24 @@ list-presets: $(PRESETS_LINK)
 # -----------------------------------------------------------------------------
 # S3 integration test gates
 # -----------------------------------------------------------------------------
-# MinIO is now started by the test binary itself (test/cpp/utils/s3_container.*,
-# via the vendored testcontainers-native bridge) when SIRIUS_TEST_S3_AUTO=1 is
-# set. There is no separate `s3-up`/`s3-down` step, no docker-compose, and no
-# env.sh to source: the binary spins up HTTP + TLS MinIO on dynamic ports,
-# uploads fixtures, runs the tests, and tears the containers down on exit.
+# The S3 backend is started by the test binary itself (test/cpp/utils/s3_backend.*,
+# which spawns a SeaweedFS `weed` process) when SIRIUS_TEST_S3_AUTO=1 is set.
+# There is no separate `s3-up`/`s3-down` step, no docker-compose, and no env.sh
+# to source: the binary spins up an S3 endpoint on HTTP + TLS on dynamic ports,
+# uploads fixtures, runs the tests, and tears the process down on exit.
 #
-# `make test`         runs the default Catch2 suite; AUTO is unset, so no Docker.
+# `make test`         runs the default Catch2 suite; AUTO is unset, so no server.
 # `make s3-test`      standard S3 correctness gate: runs [s3][integration] except
-#                     [large]/[aws] (incl. the SQL-over-S3 surface) with MinIO
-#                     auto-managed, in strict mode.
+#                     [large]/[aws] (incl. the SQL-over-S3 surface) with the
+#                     SeaweedFS backend auto-managed, in strict mode.
 # `make s3-test-large`
 #                     large-SF10 SQL-over-S3 gate. SIRIUS_TEST_S3_LARGE=1 makes
 #                     the harness generate + upload lineitem_sf10.parquet (needs
 #                     the DuckDB CLI from `make release`), then runs
 #                     [s3][sql][large].
 #
-# The s3-test-aws* targets are MANUAL real-AWS gates: they never start MinIO
-# (AUTO is unset) and are deliberately excluded from CI. Export the AWS
+# The s3-test-aws* targets are MANUAL real-AWS gates: they never start the local
+# backend (AUTO is unset) and are deliberately excluded from CI. Export the AWS
 # environment yourself first — including SIRIUS_TEST_S3_ENDPOINT — (regional S3
 # endpoint, real bucket, and assume-role TEMPORARY credentials including the
 # session token); keep usage bounded.
@@ -185,7 +185,7 @@ s3-test-large:
 	  echo "s3-test-large: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
 	  exit 1; \
 	fi
-	@# Grouped by config (chunk-prewarm on vs off) so MinIO is brought up once per
+	@# Grouped by config (chunk-prewarm on vs off) so the S3 backend is brought up once per
 	@# group. Catch2 OR-combines specs within one argument via commas (multiple
 	@# positional args are AND-concatenated instead), so each group runs in a
 	@# single process where same-config cases share one SiriusContext lifecycle.
@@ -194,7 +194,7 @@ s3-test-large:
 	$(S3_TEST_BIN) "[s3][sql][large][large-count],[s3][sql][large][large-q1],[s3][sql][large][large-join]"; \
 	$(S3_TEST_BIN) "[s3][sql][large][large-count-no-prewarm],[s3][sql][large][large-q1-no-prewarm],[s3][sql][large][large-join-no-prewarm]"
 
-# Manual real-AWS gates. These never start MinIO/Docker and are excluded from
+# Manual real-AWS gates. These never start the local backend/Docker and are excluded from
 # CI. Export the AWS environment yourself before invoking (regional S3 endpoint,
 # real bucket, and assume-role TEMPORARY credentials including the session
 # token); keep usage bounded. SIRIUS_TEST_S3_STRICT=1 turns a missing-env skip
@@ -230,14 +230,15 @@ s3-test-aws-broker:
 # S3 perf benchmarks. The portable SF10 benchmark uses the
 # [!benchmark][perf][bench] hidden tag and is deliberately NOT tagged [s3] so
 # the [s3] integration gate does not pull it in. The scripted async-vs-blocking
-# microbench is selected by [s3][benchmark]~[aws]. For the default MinIO backend
-# the harness auto-manages MinIO (SIRIUS_TEST_S3_AUTO=1) and generates/uploads
-# the SF10 lineitem fixture (SIRIUS_TEST_S3_LARGE=1); the benchmark reads
+# microbench is selected by [s3][benchmark]~[aws]. For the default local
+# (SeaweedFS) backend the harness auto-manages it (SIRIUS_TEST_S3_AUTO=1) and
+# generates/uploads the SF10 lineitem fixture (SIRIUS_TEST_S3_LARGE=1); the
+# benchmark reads
 # SIRIUS_BENCH_S3_* and falls back to the harness-published SIRIUS_TEST_S3_*.
 # Generates a JSON record under
 # build/release/extension/sirius/test/cpp/log/perf_<ts>.json for tracking.
 # Set SIRIUS_BENCH_BACKEND=aws-s3 (and the SIRIUS_BENCH_AWS_S3_* vars) to hit AWS
-# instead of MinIO; AUTO stays off in that case.
+# instead of the local backend; AUTO stays off in that case.
 
 s3-bench:
 	@if [ ! -x $(S3_TEST_BIN) ]; then \
@@ -245,7 +246,7 @@ s3-bench:
 	  exit 1; \
 	fi
 	@set -e; \
-	if [ "$${SIRIUS_BENCH_BACKEND:-minio}" = "minio" ]; then \
+	if [ "$${SIRIUS_BENCH_BACKEND:-s3}" = "s3" ]; then \
 	  export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_LARGE=1; \
 	fi; \
 	export SIRIUS_BENCH_GIT_SHA="$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"; \

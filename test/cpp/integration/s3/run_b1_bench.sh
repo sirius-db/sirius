@@ -19,7 +19,7 @@ if [[ ! -x "${S3_TEST_BIN}" ]]; then
   exit 1
 fi
 
-# MinIO is now started by the test binary itself (testcontainers); just opt in
+# The S3 backend (SeaweedFS) is started by the test binary itself; just opt in
 # and request the SF10 fixture. No s3-up/s3-down, no env.sh to source.
 export SIRIUS_TEST_S3_AUTO=1
 export SIRIUS_TEST_S3_LARGE=1

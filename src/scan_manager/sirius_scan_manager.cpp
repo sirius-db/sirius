@@ -504,10 +504,17 @@ std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datas
   }
   for (auto const& ctx : _io_ctxs) {
     if (ctx && ctx->supports(file_path)) {
+      // create_io_object opens the backend handle (an S3 HEAD for the async/
+      // blocking S3 backends) and is documented to throw on unreachable paths
+      // -- e.g. a missing object surfaces as an HTTP 404 runtime_error. That
+      // exception must propagate to the caller (describe_parquet relays it so
+      // callers see a clean failure); this function is therefore NOT noexcept.
       auto io_object = ctx->create_io_object(file_path.data());
       return ctx->make_datasource(io_object);
     }
   }
+  // nullptr only means "no registered backend claims this path"; a supported
+  // path that cannot be opened throws above rather than returning nullptr.
   return nullptr;
 }
 
