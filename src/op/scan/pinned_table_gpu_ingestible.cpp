@@ -164,15 +164,13 @@ std::shared_ptr<::cucascade::data_batch> pinned_table_gpu_ingestible::produce_ba
           !_chunk_memory_spaces.empty() ? _chunk_memory_spaces.at(batch_idx) : _memory_space;
         auto gpu_repr = std::make_unique<::cucascade::gpu_table_representation>(
           view, std::move(chunk), alloc_size, *chunk_space, rmm::cuda_stream_view{});
-        return std::make_shared<::cucascade::data_batch>(::sirius::get_next_batch_id(),
-                                                         std::move(gpu_repr));
+        return ::cucascade::data_batch::make(::sirius::get_next_batch_id(), std::move(gpu_repr));
       } else if constexpr (std::is_same_v<T, host_chunk>) {
         // Emit a host-resident batch; the host->GPU upload is deferred to
         // scan_operator_with_pinned_table_input::prepare_for_processing,
         // which has the scheduler-provided target memory_space.
         auto sliced = chunk->slice(std::span<const std::size_t>(_column_indices));
-        return std::make_shared<::cucascade::data_batch>(::sirius::get_next_batch_id(),
-                                                         std::move(sliced));
+        return ::cucascade::data_batch::make(::sirius::get_next_batch_id(), std::move(sliced));
       }
     },
     _batches[batch_idx]);

@@ -61,23 +61,23 @@ test_env& env()
 /// Helper: get the tier of a data_batch using a temporary read-only lock.
 inline cucascade::memory::Tier get_batch_tier(cucascade::data_batch& batch)
 {
-  auto ro = batch.to_read_only();
-  return ro.get_memory_space()->get_tier();
+  auto ro = batch.get_read_only();
+  return ro->get_memory_space()->get_tier();
 }
 
 /// Helper: get the size in bytes of a data_batch's data using a temporary read-only lock.
 inline size_t get_batch_size(cucascade::data_batch& batch)
 {
-  auto ro = batch.to_read_only();
-  return ro.get_data()->get_size_in_bytes();
+  auto ro = batch.get_read_only();
+  return ro->get_data()->get_size_in_bytes();
 }
 
 /// Helper: compare batch's memory_space pointer (returns true if same as given space).
 inline bool batch_in_space(cucascade::data_batch& batch,
                            const cucascade::memory::memory_space* space)
 {
-  auto ro = batch.to_read_only();
-  return ro.get_memory_space() == space;
+  auto ro = batch.get_read_only();
+  return ro->get_memory_space() == space;
 }
 
 }  // anonymous namespace
@@ -139,7 +139,7 @@ TEST_CASE("convertible_data_batch_provider get_next_convertible returns last idl
   auto batch2_size = get_batch_size(*batch2);
 
   // Make batch3 non-idle by holding a read-only lock on it
-  auto batch3_lock = batch3->to_read_only();
+  auto batch3_lock = batch3->get_read_only();
 
   repo.add_data_batch(batch1);
   repo.add_data_batch(batch2);
@@ -168,7 +168,7 @@ TEST_CASE("convertible_data_batch_provider get_all_convertible returns all idle 
     *e.gpu_space, std::vector<int32_t>{6, 7, 8, 9}, cudf::type_id::INT32);
 
   // Make batch3 non-idle by holding a read-only lock on it
-  auto batch3_lock = batch3->to_read_only();
+  auto batch3_lock = batch3->get_read_only();
 
   repo.add_data_batch(batch1);
   repo.add_data_batch(batch2);
@@ -215,11 +215,11 @@ TEST_CASE("convertible_data_batch convert fails when batch exclusively locked",
   auto batch = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
 
-  // Hold an exclusive (mutable) lock so that try_to_mutable() inside convert() fails
-  auto exclusive_lock = batch->to_mutable();
+  // Hold an exclusive (mutable) lock so that try_get_mutable() inside convert() fails
+  auto exclusive_lock = batch->get_mutable();
 
   sirius::convertible_data_batch wrapper(batch);
-  // Non-blocking convert: uses try_to_mutable() internally, must return nullopt
+  // Non-blocking convert: uses try_get_mutable() internally, must return nullopt
   auto result = wrapper.convert({e.host_space}, e.stream(), *e.mgr, /*blocking=*/false);
 
   REQUIRE_FALSE(result.has_value());

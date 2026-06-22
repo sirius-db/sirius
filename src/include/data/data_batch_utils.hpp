@@ -48,8 +48,8 @@ inline uint64_t get_next_batch_id() { return g_next_batch_id++; }
  * @brief Get a cudf::table_view from a read-only data_batch accessor.
  *
  * Assumes the underlying data_batch contains a gpu_table_representation.
- * The caller MUST already hold the read_only_data_batch (shared lock) — this
- * helper deliberately does NOT internally call batch.to_read_only() because
+ * The caller MUST already hold the read_only_data_batch (shared lock) -- this
+ * helper deliberately does NOT internally call batch.get_read_only() because
  * doing so would let a misuse pattern hide a P1 self-deadlock (acquiring a
  * read lock on a batch that the caller is about to upgrade to mutable).
  *
@@ -58,7 +58,7 @@ inline uint64_t get_next_batch_id() { return g_next_batch_id++; }
  */
 inline cudf::table_view get_cudf_table_view(const cucascade::read_only_data_batch& batch)
 {
-  auto* data = batch.get_data();
+  auto* data = batch->get_data();
   if (data == nullptr) { throw std::runtime_error("data_batch has no data representation"); }
   return data->cast<cucascade::gpu_table_representation>().get_table_view();
 }
@@ -78,11 +78,11 @@ inline cudf::table_view get_cudf_table_view(const cucascade::read_only_data_batc
  * @param batch The idle data batch to extract the table view from.
  * @return cudf::table_view The underlying cudf table view.
  */
-// NOLINTNEXTLINE(readability-non-const-parameter) -- to_read_only() is non-const
+// NOLINTNEXTLINE(readability-non-const-parameter) -- get_read_only() is non-const
 inline cudf::table_view get_cudf_table_view(cucascade::data_batch& batch)
 {
-  auto ro    = batch.to_read_only();
-  auto* data = ro.get_data();
+  auto ro    = batch.get_read_only();
+  auto* data = ro->get_data();
   if (data == nullptr) { throw std::runtime_error("data_batch has no data representation"); }
   return data->cast<cucascade::gpu_table_representation>().get_table_view();
 }
@@ -111,7 +111,7 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
 {
   auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
     std::make_unique<cudf::table>(std::move(table)), memory_space, writer_stream);
-  return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(gpu_repr));
+  return cucascade::data_batch::make(get_next_batch_id(), std::move(gpu_repr));
 }
 
 /**
@@ -128,7 +128,7 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
 {
   auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
     std::move(table), memory_space, writer_stream);
-  return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(gpu_repr));
+  return cucascade::data_batch::make(get_next_batch_id(), std::move(gpu_repr));
 }
 
 }  // namespace sirius

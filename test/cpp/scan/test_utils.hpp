@@ -204,8 +204,8 @@ inline void validate_scanned_batches(
   for (auto const& batch : batches) {
     REQUIRE(batch != nullptr);
     {
-      auto mut = batch->to_mutable();
-      mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
+      auto mut = batch->get_mutable();
+      mut->convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
     }
     auto table_view = sirius::get_cudf_table_view(*batch);
 
@@ -293,8 +293,8 @@ inline void validate_projected_id_price_batches(
   for (auto const& batch : batches) {
     REQUIRE(batch != nullptr);
     {
-      auto mut = batch->to_mutable();
-      mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
+      auto mut = batch->get_mutable();
+      mut->convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
     }
     auto table_view = sirius::get_cudf_table_view(*batch);
 

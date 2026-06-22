@@ -57,9 +57,9 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
 
   for (auto const& batch : input_batches) {
     auto projected_table = gpu_expression_executor.execute(
-      batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
+      batch->get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
     output_batches.push_back(
-      sirius::make_data_batch(std::move(projected_table), *batch.get_memory_space(), stream));
+      sirius::make_data_batch(std::move(projected_table), *batch->get_memory_space(), stream));
   }
   return std::make_unique<pipelineable_operator_data>(output_batches);
 }

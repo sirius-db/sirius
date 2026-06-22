@@ -45,7 +45,7 @@ void print_table_contents(cudf::table_view const& table, cudf::size_type max_row
 /**
  * Print the contents of a cucascade::data_batch to stdout (printf).
  * Equivalent to printing the underlying cudf table view.
- * Note: takes non-const ref because to_read_only() acquires a shared lock (non-const).
+ * Note: takes non-const ref because get_read_only() acquires a shared lock.
  */
 // NOLINTNEXTLINE(readability-non-const-parameter)
 void print_data_batch_contents(cucascade::data_batch& batch, cudf::size_type max_rows = 20);

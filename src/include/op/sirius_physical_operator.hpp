@@ -174,11 +174,9 @@ class operator_data {
 /**
  * @brief Operator data carrying data batches for pipeline execution.
  *
- * Unifies idle and read-only-locked batch access in a single container. Holds an
- * optional vector of idle data_batch shared_ptrs and/or an optional vector of
- * read_only_data_batch RAII accessors. Lazy conversion is performed on demand:
- *   - get_data_batches() populates _data_batches from _read_only_data_batches if needed
- *   - get_read_only_batches() populates _read_only_data_batches from _data_batches if needed
+ * Unifies idle and read-only-locked batch access in a single container. The
+ * idle data_batch shared_ptr vector is canonical ownership. The optional
+ * read_only_data_batch vector is only a temporary lock cache.
  *
  * prepare_for_processing() locks idle batches and stores the result in
  * _read_only_data_batches. remove_read_only_lock() releases all shared locks.
@@ -196,8 +194,13 @@ class pipelineable_operator_data : public operator_data {
   }
   explicit pipelineable_operator_data(
     std::vector<::cucascade::read_only_data_batch> read_only_data_batches)
-    : _read_only_data_batches(std::move(read_only_data_batches))
   {
+    std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
+    batches.reserve(read_only_data_batches.size());
+    for (auto& ro : read_only_data_batches) {
+      batches.push_back(::cucascade::read_only_data_batch::to_idle(std::move(ro)));
+    }
+    _data_batches = std::move(batches);
   }
 
   [[nodiscard]] operator_data_type get_type() const override
@@ -244,7 +247,7 @@ class pipelineable_operator_data : public operator_data {
     std::size_t total = 0;
     auto ro_batches   = get_read_only_batches(false);
     for (auto const& ro : ro_batches) {
-      if (ro.get_data()) { total += ro.get_data()->get_uncompressed_data_size_in_bytes(); }
+      if (ro->get_data()) { total += ro->get_data()->get_uncompressed_data_size_in_bytes(); }
     }
     return total;
   }

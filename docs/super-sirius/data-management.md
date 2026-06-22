@@ -14,8 +14,8 @@ A data batch flows through the system in these stages:
                    converting to GPU memory space if needed (lock_or_prepare_batch)
 5. Execution:      GPU task reads data through read_only_data_batch accessors
 6. Output:         operators produce new idle batches, pushed to downstream repositories
-7. Downgrade:      if GPU memory pressure, downgrade executor upgrades to mutable,
-                   converts representation to HOST, releases back to idle
+7. Downgrade:      if GPU memory pressure, downgrade executor acquires a mutable
+                   accessor, converts representation to HOST, releases back to idle
 8. Cleanup:        batch destroyed when shared_ptr ref count reaches zero
 ```
 
@@ -27,7 +27,6 @@ accessible through RAII accessor objects — the idle `shared_ptr<data_batch>` g
 ```
 idle ←→ read_only      (shared lock; multiple concurrent readers)
 idle ←→ mutable_locked (exclusive lock; one writer, no readers)
-read_only ←→ mutable_locked (upgrade/downgrade)
 ```
 
 - **`idle`**: No active locks. Available for locking, cloning, or tier movement.
@@ -35,12 +34,16 @@ read_only ←→ mutable_locked (upgrade/downgrade)
 - **`mutable_locked`**: One `mutable_data_batch` exclusive lock active. Data can be read and mutated.
 
 Key methods on `data_batch`:
-- `batch->to_read_only()` — blocking shared lock → `read_only_data_batch`
-- `batch->to_mutable()` — blocking exclusive lock → `mutable_data_batch`
-- `batch->try_to_read_only()` / `try_to_mutable()` — non-blocking variants returning `std::optional`
-- `data_batch::to_idle(std::move(accessor))` — release lock, return `shared_ptr<data_batch>`
-- `data_batch::readonly_to_mutable(std::move(ro))` — upgrade shared → exclusive
-- `data_batch::mutable_to_readonly(std::move(mut))` — downgrade exclusive → shared
+- `data_batch::make(id, std::unique_ptr<idata_representation>)` - create an idle batch
+- `batch->get_read_only()` - blocking shared lock -> `read_only_data_batch`
+- `batch->get_mutable()` - blocking exclusive lock -> `mutable_data_batch`
+- `batch->try_get_read_only()` / `try_get_mutable()` - non-blocking variants returning `std::optional`
+- `read_only_data_batch::to_idle(std::move(ro))` - release a shared lock, return `shared_ptr<data_batch>`
+- `mutable_data_batch::to_idle(std::move(mut))` - release an exclusive lock, return `shared_ptr<data_batch>`
+
+`read_only_data_batch` and `mutable_data_batch` expose the locked batch core through
+`operator->`. There are no direct read-only-to-mutable or mutable-to-read-only transition
+helpers; release the current accessor, then acquire the next lock mode if needed.
 
 ## Data Repositories
 
@@ -111,14 +114,14 @@ Minimal empty base class. Provides a generic extension point for any type of ope
 
 Extends `operator_data` with batch-based data flow. Holds two optional internal stores that are
 lazily populated from each other on demand:
-- `_data_batches` — `std::vector<shared_ptr<data_batch>>` (idle pointers)
-- `_read_only_data_batches` — `std::vector<read_only_data_batch>` (shared-locked accessors)
+- `_data_batches` — `std::vector<shared_ptr<data_batch>>` (canonical idle batch owners)
+- `_read_only_data_batches` — `std::vector<read_only_data_batch>` (temporary shared-lock cache)
 
 Key methods:
-- `get_data_batches()` — returns idle batch pointers; if only `_read_only_data_batches` exist, calls `data_batch::to_idle()` on copies to populate `_data_batches`.
-- `get_read_only_batches(bool leave_locked)` — acquires `to_read_only()` on each idle batch; if `leave_locked=true`, caches result in `_read_only_data_batches`.
+- `get_data_batches()` — returns canonical idle batch pointers from `_data_batches`; throws if no canonical batch owners exist.
+- `get_read_only_batches(bool leave_locked)` — acquires `get_read_only()` on each idle batch; if `leave_locked=true`, caches result in `_read_only_data_batches`; if a cache already exists, returns cloned read-only locks.
 - `prepare_for_processing(memory_space*, stream)` — **void**, throws on failure. Calls `lock_or_prepare_batch()` for each batch (converts to the target memory space if needed, then acquires a shared lock). Stores resulting `read_only_data_batch` handles in `_read_only_data_batches`. Called by the GPU pipeline executor before `execute()`.
-- `remove_read_only_lock()` — releases `_read_only_data_batches` while ensuring `_data_batches` is populated first (so the data stays alive).
+- `remove_read_only_lock()` — releases `_read_only_data_batches`; `_data_batches` keeps the batches alive.
 - Created by `get_next_task_input_data()` from port pops.
 - Passed through the operator chain during `execute()`.
 

@@ -92,7 +92,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
 
   for (auto const& batch : input_batches) {
-    auto* space = batch.get_memory_space();
+    auto* space = batch->get_memory_space();
     if (!space) { continue; }
     auto input_table = get_cudf_table_view(batch);
     auto num_rows    = input_table.num_rows();

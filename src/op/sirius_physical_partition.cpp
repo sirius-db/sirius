@@ -167,7 +167,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
   }
 
   auto const& input_batch_ro = input_batches[0];
-  auto* space                = input_batch_ro.get_memory_space();
+  auto* space                = input_batch_ro->get_memory_space();
 
   if (_num_partitions.value() < 2 || _partition_keys.empty()) {
     return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
@@ -190,7 +190,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
         input_batch_ro, _num_partitions.value(), stream, *space);
       break;
     case PartitionType::NONE: {
-      partitioned_results = {input_batch_ro.clone(sirius::get_next_batch_id(), stream)};
+      partitioned_results = {input_batch_ro->clone(sirius::get_next_batch_id(), stream)};
       break;
     }
     case PartitionType::CUSTOM:
@@ -239,8 +239,8 @@ std::pair<int, uint64_t> sirius_physical_partition::determine_num_partitions()
   for (auto batch_id : batch_ids) {
     auto batch = repo->get_data_batch_by_id(batch_id, 0);
     if (batch) {
-      auto ro = batch->to_read_only();
-      if (ro.get_data()) { total_bytes += ro.get_data()->get_size_in_bytes(); }
+      auto ro = batch->get_read_only();
+      if (ro->get_data()) { total_bytes += ro->get_data()->get_size_in_bytes(); }
     }
   }
   int num_partitions = static_cast<int>(std::max(uint64_t{1}, total_bytes / s_partition_size));

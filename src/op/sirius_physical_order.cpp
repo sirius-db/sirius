@@ -71,7 +71,7 @@ std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_dat
   output_batches.reserve(input_batches.size());
 
   for (auto const& batch : input_batches) {
-    auto* space = batch.get_memory_space();
+    auto* space = batch->get_memory_space();
     if (!space) { continue; }
 
     auto sorted_batch = gpu_order_impl::local_order_by(

@@ -52,7 +52,7 @@ namespace sirius {
  * all code paths.
  *
  * The convert() method uses the RAII mutable lock pattern: for each data_batch in the
- * task's input data, it acquires a mutable_data_batch via to_mutable() or try_to_mutable(),
+ * task's input data, it acquires a mutable_data_batch via get_mutable() or try_get_mutable(),
  * attempts conversion to a target memory space, and relies on the mutable_data_batch RAII
  * destructor to restore idle state on all exit paths (success, failure, exception).
  */
@@ -98,8 +98,8 @@ class convertible_gpu_pipeline_task : public convertible_data {
    * @param target_spaces  Candidate destination memory spaces (tried in order).
    * @param stream         CUDA stream for asynchronous memory operations.
    * @param res_mgr        Reservation manager for acquiring memory in the target space.
-   * @param blocking       When true, uses to_mutable() (blocks until exclusive lock acquired).
-   *                       When false, uses try_to_mutable() (returns nullopt immediately if
+   * @param blocking       When true, uses get_mutable() (blocks until exclusive lock acquired).
+   *                       When false, uses try_get_mutable() (returns nullopt immediately if
    *                       the lock is unavailable).
    * @return A vector of bytes converted per target space index on success, or nullopt if
    *         no batches were converted.
@@ -122,8 +122,8 @@ class convertible_gpu_pipeline_task : public convertible_data {
 
       // Quick check: skip batches already at a target space (avoid unnecessary locking)
       {
-        auto ro           = batch->to_read_only();
-        auto* batch_space = ro.get_memory_space();
+        auto ro           = batch->get_read_only();
+        auto* batch_space = ro->get_memory_space();
         bool at_target    = false;
         for (const auto* ts : target_spaces) {
           if (batch_space == ts) {
@@ -134,7 +134,7 @@ class convertible_gpu_pipeline_task : public convertible_data {
         if (at_target) { continue; }
       }
 
-      // Delegate to convertible_data_batch which handles to_mutable() internally
+      // Delegate to convertible_data_batch which handles get_mutable() internally
       sirius::convertible_data_batch batch_converter(batch);
       auto result = batch_converter.convert(target_spaces, stream, res_mgr, blocking);
       if (result) {
@@ -153,7 +153,7 @@ class convertible_gpu_pipeline_task : public convertible_data {
    * @brief Get the size in bytes of this task's data in the specified memory space.
    *
    * Sums bytes across all data_batches in the task's input that reside in the
-   * given memory space. Accesses memory space via to_read_only() as required by
+   * given memory space. Accesses memory space via get_read_only() as required by
    * the new cucascade API.
    *
    * @param space The memory space to query.
@@ -166,7 +166,7 @@ class convertible_gpu_pipeline_task : public convertible_data {
 
     std::size_t total = 0;
     for (const auto& ro : operator_data->get_read_only_batches(false)) {
-      if (ro.get_memory_space() == space) { total += ro.get_data()->get_size_in_bytes(); }
+      if (ro->get_memory_space() == space) { total += ro->get_data()->get_size_in_bytes(); }
     }
     return total;
   }
@@ -287,7 +287,7 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
    *        batch_state::idle?
    *
    * Lightweight -- only performs dynamic_casts and state checks. Accesses memory
-   * space via to_read_only().
+   * space via get_read_only().
    *
    * @param task  The task to inspect.
    * @param space The memory space to match.
@@ -302,9 +302,9 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
     for (const auto& batch : operator_data->get_data_batches()) {
       if (!batch) { continue; }
       if (batch->get_state() != cucascade::batch_state::idle) { continue; }
-      auto ro = batch->try_to_read_only();
+      auto ro = batch->try_get_read_only();
       if (!ro) { continue; }
-      if (ro->get_memory_space() == space) { return true; }
+      if ((*ro)->get_memory_space() == space) { return true; }
     }
 
     return false;

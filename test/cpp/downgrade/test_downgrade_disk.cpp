@@ -55,8 +55,8 @@ namespace {
 /// Helper: get the tier of a data_batch using a temporary read-only lock.
 inline cucascade::memory::Tier get_batch_tier(cucascade::data_batch& batch)
 {
-  auto ro = batch.to_read_only();
-  return ro.get_memory_space()->get_tier();
+  auto ro = batch.get_read_only();
+  return ro->get_memory_space()->get_tier();
 }
 
 cucascade::memory::memory_space* get_gpu_space(

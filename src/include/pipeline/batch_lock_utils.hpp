@@ -56,56 +56,64 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
   // Opportunistic stream rebind (best-effort, non-blocking): if the batch already resides in
   // the target GPU memory space, rebind its deallocation stream to this task's stream so that
   // when the task later frees the data the free lands on the active stream's free list rather
-  // than on the stream the data was produced on. We use try_to_mutable() so we never block --
+  // than on the stream the data was produced on. We use try_get_mutable() so we never block --
   // if another reader holds the batch (e.g. a probe task on another GPU sharing a build batch)
   // or it is otherwise busy, we simply skip the rebind; correctness is unaffected. Gating on a
   // space match guarantees the stream and the data live on the same device (important for
   // multi-GPU). The mismatch case below converts via `stream`, which already allocates the new
   // table on it, so no rebind is needed there.
-  if (auto mut = batch->try_to_mutable()) {
-    const auto* current_space = mut->get_memory_space();
+  if (auto mut = batch->try_get_mutable()) {
+    const auto* current_space = (*mut)->get_memory_space();
     const auto* rebind_target =
       requested_memory_space != nullptr ? requested_memory_space : current_space;
     if (current_space != nullptr && rebind_target != nullptr &&
         current_space->get_id() == rebind_target->get_id() &&
         rebind_target->get_tier() == cucascade::memory::Tier::GPU) {
-      mut->rebind_stream(stream);
+      (*mut)->rebind_stream(stream);
     }
   }
 
   // Acquire a read-only lock
-  auto read_accessor = batch->to_read_only();
+  auto read_accessor = batch->get_read_only();
 
   // Determine the target memory space
   const auto* target_space =
-    requested_memory_space != nullptr ? requested_memory_space : read_accessor.get_memory_space();
+    requested_memory_space != nullptr ? requested_memory_space : read_accessor->get_memory_space();
   if (target_space == nullptr) { return std::nullopt; }
 
   // Memory space matches — return the read-only accessor directly
-  if (read_accessor.get_memory_space() != nullptr &&
-      read_accessor.get_memory_space()->get_id() == target_space->get_id()) {
+  if (read_accessor->get_memory_space() != nullptr &&
+      read_accessor->get_memory_space()->get_id() == target_space->get_id()) {
     return std::move(read_accessor);
   }
 
-  // Memory space mismatch — go to mutable, convert in-place, go back to read-only
+  // Memory space mismatch: release the shared lock, take the exclusive lock,
+  // convert in-place, then return a fresh read-only accessor.
+  cucascade::read_only_data_batch::to_idle(std::move(read_accessor));
   auto& registry    = sirius::converter_registry::get();
-  auto mut_accessor = cucascade::data_batch::readonly_to_mutable(std::move(read_accessor));
+  auto mut_accessor = batch->get_mutable();
+
+  if (mut_accessor->get_memory_space() != nullptr &&
+      mut_accessor->get_memory_space()->get_id() == target_space->get_id()) {
+    cucascade::mutable_data_batch::to_idle(std::move(mut_accessor));
+    return batch->get_read_only();
+  }
 
   switch (target_space->get_tier()) {
     case cucascade::memory::Tier::GPU:
-      mut_accessor.convert_to<cucascade::gpu_table_representation>(registry, target_space, stream);
+      mut_accessor->convert_to<cucascade::gpu_table_representation>(registry, target_space, stream);
       break;
     case cucascade::memory::Tier::HOST:
-      mut_accessor.convert_to<cucascade::host_data_representation>(registry, target_space, stream);
+      mut_accessor->convert_to<cucascade::host_data_representation>(registry, target_space, stream);
       break;
     default:
       SIRIUS_LOG_ERROR("lock_or_prepare_batch: unsupported target tier for batch {}",
-                       mut_accessor.get_batch_id());
+                       mut_accessor->get_batch_id());
       return std::nullopt;
   }
 
-  // Downgrade the exclusive lock back to a shared read-only lock
-  return cucascade::data_batch::mutable_to_readonly(std::move(mut_accessor));
+  cucascade::mutable_data_batch::to_idle(std::move(mut_accessor));
+  return batch->get_read_only();
 }
 
 }  // namespace pipeline

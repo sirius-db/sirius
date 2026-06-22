@@ -37,9 +37,9 @@ namespace {
 uint64_t get_batch_bytes(const std::shared_ptr<::cucascade::data_batch>& batch)
 {
   if (!batch) { return 0; }
-  auto ro = batch->to_read_only();
-  if (!ro.get_data()) { return 0; }
-  return ro.get_data()->get_size_in_bytes();
+  auto ro = batch->get_read_only();
+  if (!ro->get_data()) { return 0; }
+  return ro->get_data()->get_size_in_bytes();
 }
 
 bool repo_has_enough_sample_bytes(::cucascade::shared_data_repository* repo,
@@ -162,8 +162,8 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
                                                                     rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_sort_sample::execute"};
-  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_read_only_batches();
+  auto& input        = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  auto input_batches = input.get_read_only_batches();
 
   // Fast path: boundaries already computed — just pass through.
   if (_boundary_state.load(std::memory_order_acquire) == BoundaryState::DONE) {
@@ -180,9 +180,9 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   // 1. Collect valid batches and find memory space
   std::vector<::cucascade::read_only_data_batch> valid_batches;
   cucascade::memory::memory_space* space = nullptr;
-  for (auto const& batch : input_batches) {
-    if (!space) { space = batch.get_memory_space(); }
-    valid_batches.push_back(batch);
+  for (auto& batch : input_batches) {
+    if (!space) { space = batch->get_memory_space(); }
+    valid_batches.push_back(std::move(batch));
   }
 
   if (valid_batches.empty() || !space) {
@@ -196,7 +196,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   try {
     size_t total_sample_bytes = 0;
     for (auto const& batch : valid_batches) {
-      total_sample_bytes += batch.get_data()->get_size_in_bytes();
+      total_sample_bytes += batch->get_data()->get_size_in_bytes();
     }
 
     // 2. Build cudf order vectors from BoundOrderByNode
@@ -225,7 +225,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
     } else {
       merged_sample_batch = gpu_merge_impl::merge_order_by(
         valid_batches, order_key_idx, column_order, null_precedence, stream, *space);
-      merged_sample_view = get_cudf_table_view(merged_sample_batch->to_read_only());
+      merged_sample_view = get_cudf_table_view(merged_sample_batch->get_read_only());
     }
 
     // 4. Compute number of partitions

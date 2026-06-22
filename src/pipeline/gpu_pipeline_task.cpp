@@ -112,10 +112,10 @@ void log_operator_data(const op::sirius_physical_operator& op,
     const auto& batches = p_data->get_read_only_batches();
     num_batches         = batches.size();
     for (auto const& batch : batches) {
-      if (batch.get_data()) {
+      if (batch->get_data()) {
         auto view = get_cudf_table_view(batch);
         batch_rows += std::to_string(view.num_rows()) + "  ";
-        total_bytes += batch.get_data()->get_size_in_bytes();
+        total_bytes += batch->get_data()->get_size_in_bytes();
       }
     }
   } else {
@@ -466,7 +466,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
       dynamic_cast<const op::pipelineable_operator_data*>(output_data.get());
     if (pipelineable_output) {
       for (const auto& batch : pipelineable_output->get_read_only_batches(false)) {
-        output_bytes += batch.get_data()->get_size_in_bytes();
+        output_bytes += batch->get_data()->get_size_in_bytes();
       }
     }
     auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
@@ -499,7 +499,7 @@ std::size_t gpu_pipeline_task::get_input_size() const
     dynamic_cast<const op::pipelineable_operator_data*>(local_state._input_data.get());
   if (!pipelineable_input) { return 0; }
   for (const auto& batch : pipelineable_input->get_read_only_batches(false)) {
-    input_size += batch.get_data()->get_size_in_bytes();
+    input_size += batch->get_data()->get_size_in_bytes();
   }
   return input_size;
 }

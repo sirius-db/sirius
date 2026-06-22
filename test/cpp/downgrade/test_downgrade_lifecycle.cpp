@@ -56,8 +56,8 @@ const auto GPU_SPACE_ID = cucascade::memory::memory_space_id(cucascade::memory::
 /// Helper: get the tier of a data_batch using a temporary read-only lock.
 inline cucascade::memory::Tier get_batch_tier(cucascade::data_batch& batch)
 {
-  auto ro = batch.to_read_only();
-  return ro.get_memory_space()->get_tier();
+  auto ro = batch.get_read_only();
+  return ro->get_memory_space()->get_tier();
 }
 
 std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> make_test_memory_manager()

@@ -84,14 +84,14 @@ bool enable_p2p_for_test(int num_gpus)
 // equivalent helper in test/cpp/downgrade/test_downgrade_executor.cpp lives
 // in an anonymous namespace and is not reachable from this TU.
 // Phase 18 / DB-03: const dropped from data_batch& parameter (mirrors
-// debug_utils.hpp pattern from plan 18-04). cucascade #117's to_read_only is
-// non-const because it acquires the shared lock.
+// debug_utils.hpp pattern from plan 18-04). cuCascade read accessors are
+// non-const because they acquire a shared lock.
 uint64_t compute_batch_checksum_fnv1a64(cucascade::data_batch& batch, rmm::cuda_stream_view stream)
 {
   // Phase 18 / DB-03 Recipe R1: scoped read-only accessor for the lifetime
   // of gpu_rep, packed, and host_buf — released at function exit.
-  auto ro             = batch.to_read_only();
-  auto const& gpu_rep = ro.get_data()->cast<cucascade::gpu_table_representation>();
+  auto ro             = batch.get_read_only();
+  auto const& gpu_rep = ro->get_data()->cast<cucascade::gpu_table_representation>();
   auto packed         = cudf::pack(gpu_rep.get_table_view(), stream);
   stream.synchronize();
 
@@ -463,13 +463,13 @@ TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-0
   REQUIRE(batch != nullptr);
   size_t original_bytes = 0;
   {
-    auto __ro_1    = batch->to_read_only();
-    original_bytes = __ro_1.get_data()->get_size_in_bytes();
+    auto __ro_1    = batch->get_read_only();
+    original_bytes = __ro_1->get_data()->get_size_in_bytes();
   }
   REQUIRE(original_bytes > 0);
   {
-    auto __ro_2 = batch->to_read_only();
-    REQUIRE(__ro_2.get_memory_space()->get_device_id() == 0);
+    auto __ro_2 = batch->get_read_only();
+    REQUIRE(__ro_2->get_memory_space()->get_device_id() == 0);
   }
 
   rmm::cuda_stream stream;
@@ -482,14 +482,14 @@ TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-0
   // GPU0 -> GPU1 forward leg.
   // Phase 18 / DB-03 Recipe R8 + R3: scoped mutable accessor.
   {
-    auto mut = batch->to_mutable();
-    mut.convert_to<cucascade::gpu_table_representation>(registry, gpu1, stream.view());
+    auto mut = batch->get_mutable();
+    mut->convert_to<cucascade::gpu_table_representation>(registry, gpu1, stream.view());
   }
 
   {
-    auto __ro_3 = batch->to_read_only();
-    REQUIRE(__ro_3.get_memory_space()->get_device_id() == 1);
-    REQUIRE(__ro_3.get_data()->get_size_in_bytes() == original_bytes);
+    auto __ro_3 = batch->get_read_only();
+    REQUIRE(__ro_3->get_memory_space()->get_device_id() == 1);
+    REQUIRE(__ro_3->get_data()->get_size_in_bytes() == original_bytes);
   }
 
   // MGPU-06 return leg: Phase 7 Plan 07-01's peer-access enable loop at
@@ -498,15 +498,15 @@ TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-0
   // corruption on Ada Lovelace + Sapphire Rapids).
   // Phase 18 / DB-03 Recipe R8 + R3: scoped mutable accessor.
   {
-    auto mut = batch->to_mutable();
-    mut.convert_to<cucascade::gpu_table_representation>(registry, gpu0, stream.view());
+    auto mut = batch->get_mutable();
+    mut->convert_to<cucascade::gpu_table_representation>(registry, gpu0, stream.view());
   }
 
   {
-    auto __ro_4 = batch->to_read_only();
-    REQUIRE(__ro_4.get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
-    REQUIRE(__ro_4.get_memory_space()->get_device_id() == gpu0->get_device_id());
-    REQUIRE(__ro_4.get_data()->get_size_in_bytes() == original_bytes);
+    auto __ro_4 = batch->get_read_only();
+    REQUIRE(__ro_4->get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+    REQUIRE(__ro_4->get_memory_space()->get_device_id() == gpu0->get_device_id());
+    REQUIRE(__ro_4->get_data()->get_size_in_bytes() == original_bytes);
   }
 
   // Final data-integrity gate: post-round-trip checksum must equal

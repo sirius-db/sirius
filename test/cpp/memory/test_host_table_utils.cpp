@@ -345,12 +345,12 @@ cucascade::host_data_representation const& convert_to_host_table(
 
   auto& registry = sirius::converter_registry::get();
   {
-    auto mut = batch->to_mutable();
-    mut.convert_to<cucascade::host_data_representation>(registry, host_space, stream);
+    auto mut = batch->get_mutable();
+    mut->convert_to<cucascade::host_data_representation>(registry, host_space, stream);
   }
 
-  auto ro    = batch->to_read_only();
-  auto* data = ro.get_data();
+  auto ro    = batch->get_read_only();
+  auto* data = ro->get_data();
   if (!data) { throw std::runtime_error("data_batch has no data after conversion"); }
   return data->cast<cucascade::host_data_representation>();
 }
@@ -476,13 +476,12 @@ TEST_CASE("host_table_utils - pack metadata with gaps across multiple blocks",
     cucascade::memory::host_table_allocation::create(std::move(allocation), std::move(columns), sz);
   auto host_table =
     std::make_unique<cucascade::host_data_representation>(std::move(table_allocation), host_space);
-  auto batch =
-    std::make_shared<cucascade::data_batch>(sirius::get_next_batch_id(), std::move(host_table));
+  auto batch = cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(host_table));
 
   auto& registry = sirius::converter_registry::get();
   {
-    auto mut = batch->to_mutable();
-    mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
+    auto mut = batch->get_mutable();
+    mut->convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
   }
 
   cudf::table_view table_view = sirius::get_cudf_table_view(*batch);
@@ -606,13 +605,12 @@ TEST_CASE("host_table_utils - underfilled varchar column truncates rows",
     cucascade::memory::host_table_allocation::create(std::move(allocation), std::move(columns), sz);
   auto host_table =
     std::make_unique<cucascade::host_data_representation>(std::move(table_allocation), host_space);
-  auto batch =
-    std::make_shared<cucascade::data_batch>(sirius::get_next_batch_id(), std::move(host_table));
+  auto batch = cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(host_table));
 
   auto& registry = sirius::converter_registry::get();
   {
-    auto mut = batch->to_mutable();
-    mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
+    auto mut = batch->get_mutable();
+    mut->convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
   }
 
   cudf::table_view table_view = sirius::get_cudf_table_view(*batch);

@@ -44,8 +44,8 @@ namespace sirius {
  * @brief Concrete convertible_data wrapping a cucascade::data_batch.
  *
  * Implements the RAII mutable lock / convert / auto-release pattern for a single
- * data_batch. Acquires mutable_data_batch via to_mutable() (blocking) or
- * try_to_mutable() (non-blocking), calls convert_to on the accessor, and relies on
+ * data_batch. Acquires mutable_data_batch via get_mutable() (blocking) or
+ * try_get_mutable() (non-blocking), calls convert_to on the accessor, and relies on
  * the mutable_data_batch destructor to restore the batch to idle on all exit paths
  * (success, failure, exception). No manual state save/restore is needed.
  */
@@ -72,8 +72,8 @@ class convertible_data_batch : public convertible_data {
    * @param target_spaces  Candidate memory spaces to convert into (tried in order).
    * @param stream         CUDA stream for asynchronous memory operations.
    * @param res_mgr        Reservation manager for acquiring memory in the target space.
-   * @param blocking       When true, uses to_mutable() (blocks until exclusive lock acquired).
-   *                       When false, uses try_to_mutable() (returns nullopt immediately if
+   * @param blocking       When true, uses get_mutable() (blocks until exclusive lock acquired).
+   *                       When false, uses try_get_mutable() (returns nullopt immediately if
    *                       the lock is unavailable).
    * @return A vector of bytes converted per target space index on success, or nullopt if
    *         no conversion occurred.
@@ -86,21 +86,21 @@ class convertible_data_batch : public convertible_data {
   {
     std::optional<cucascade::mutable_data_batch> mut_opt;
     if (blocking) {
-      mut_opt.emplace(_batch->to_mutable());
+      mut_opt.emplace(_batch->get_mutable());
     } else {
-      mut_opt = _batch->try_to_mutable();
+      mut_opt = _batch->try_get_mutable();
       if (!mut_opt) { return std::nullopt; }
     }
     auto& mut = *mut_opt;
 
     // Check if the batch is already in the target space
-    auto cur_space = mut.get_memory_space();
+    auto cur_space = mut->get_memory_space();
     for (std::size_t idx = 0; idx < target_spaces.size(); ++idx) {
       const auto* space = target_spaces[idx];
       if (cur_space == space) { return std::nullopt; }
     }
 
-    auto data_size = mut.get_data()->get_size_in_bytes();
+    auto data_size = mut->get_data()->get_size_in_bytes();
 
     for (std::size_t idx = 0; idx < target_spaces.size(); ++idx) {
       const auto* space = target_spaces[idx];
@@ -118,22 +118,22 @@ class convertible_data_batch : public convertible_data {
       // synchronizes `stream` after the D2H copy and before destroying the source
       // representation, so the free is correctly ordered. No-op for non-GPU-table sources.
       if (cur_space != nullptr && cur_space->get_tier() == cucascade::memory::Tier::GPU) {
-        mut.rebind_stream(stream);
+        mut->rebind_stream(stream);
       }
 
       auto& converter_registry = sirius::converter_registry::get();
 
       switch (space->get_tier()) {
         case cucascade::memory::Tier::GPU:
-          mut.convert_to<cucascade::gpu_table_representation>(
+          mut->convert_to<cucascade::gpu_table_representation>(
             converter_registry, mem_space, stream);
           break;
         case cucascade::memory::Tier::HOST:
-          mut.convert_to<cucascade::host_data_representation>(
+          mut->convert_to<cucascade::host_data_representation>(
             converter_registry, mem_space, stream);
           break;
         case cucascade::memory::Tier::DISK:
-          mut.convert_to<cucascade::disk_data_representation>(
+          mut->convert_to<cucascade::disk_data_representation>(
             converter_registry, mem_space, stream);
           break;
         default: continue;
@@ -160,8 +160,8 @@ class convertible_data_batch : public convertible_data {
    */
   std::size_t bytes_in_space(cucascade::memory::memory_space* space) const override
   {
-    auto ro = _batch->to_read_only();
-    if (ro.get_memory_space() == space) { return ro.get_data()->get_size_in_bytes(); }
+    auto ro = _batch->get_read_only();
+    if (ro->get_memory_space() == space) { return ro->get_data()->get_size_in_bytes(); }
     return 0;
   }
 
@@ -266,7 +266,7 @@ class convertible_data_batch_provider : public convertible_data_provider {
    * @brief Get the total byte size of all batches in the given memory space.
    *
    * Iterates all partitions front-to-back, summing bytes for batches residing
-   * in the specified space. Accesses batch data via to_read_only() as required
+   * in the specified space. Accesses batch data via get_read_only() as required
    * by the new cucascade API.
    *
    * @param space The memory space to query.
@@ -282,8 +282,8 @@ class convertible_data_batch_provider : public convertible_data_provider {
       for (auto batch_id : batch_ids) {
         auto batch = _repo->get_data_batch_by_id(batch_id, p);
         if (!batch) { continue; }
-        auto ro = batch->to_read_only();
-        if (ro.get_memory_space() == space) { total += ro.get_data()->get_size_in_bytes(); }
+        auto ro = batch->get_read_only();
+        if (ro->get_memory_space() == space) { total += ro->get_data()->get_size_in_bytes(); }
       }
     }
 
@@ -295,7 +295,7 @@ class convertible_data_batch_provider : public convertible_data_provider {
    * @brief Try to get a matching batch by id, checking idle state and memory space.
    *
    * Only considers batches in batch_state::idle. Accesses the memory space via
-   * to_read_only() as required by the new cucascade API (get_memory_space() is
+   * get_read_only() as required by the new cucascade API (get_memory_space() is
    * private on idle data_batch).
    *
    * @param batch_id       The batch ID to retrieve.
@@ -312,9 +312,9 @@ class convertible_data_batch_provider : public convertible_data_provider {
 
     if (batch->get_state() != cucascade::batch_state::idle) { return nullptr; }
 
-    auto ro = batch->try_to_read_only();
+    auto ro = batch->try_get_read_only();
     if (!ro) { return nullptr; }
-    if (ro->get_memory_space() == space) {
+    if ((*ro)->get_memory_space() == space) {
       return std::make_unique<convertible_data_batch>(std::move(batch));
     }
 

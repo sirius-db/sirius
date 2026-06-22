@@ -407,7 +407,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
   cudf::table_view left  = get_cudf_table_view(left_batch);
   cudf::table_view right = get_cudf_table_view(right_batch);
 
-  cucascade::memory::memory_space* space = left_batch.get_memory_space();
+  cucascade::memory::memory_space* space = left_batch->get_memory_space();
   if (!space) {
     SIRIUS_LOG_DEBUG(
       "Pipeline {}: nested loop join, 0 output batches because left batch had no memory space",

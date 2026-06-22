@@ -282,8 +282,8 @@ std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
         // clone() lives on the accessors (not on data_batch) — take a scoped
         // read-only accessor (concurrent shared locks are permitted) and
         // clone through it.
-        auto ro = batch->to_read_only();
-        cloned_batches.push_back(ro.clone(get_next_batch_id(), stream));
+        auto ro = batch->get_read_only();
+        cloned_batches.push_back(ro->clone(get_next_batch_id(), stream));
       }
     } else if (is_parquet_scan) {
       for (auto& batch : batches) {
@@ -292,16 +292,16 @@ std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
         // idata_representation owned by a brand-new data_batch — its lifetime
         // is independent of the source accessor, so dropping `ro` at
         // end-of-iteration is safe.
-        auto ro         = batch->to_read_only();
-        auto* idata_rep = ro.get_data();
+        auto ro         = batch->get_read_only();
+        auto* idata_rep = ro->get_data();
         if (auto* host_data = dynamic_cast<cached_host_data_representation*>(idata_rep);
             host_data) {
-          cloned_batches.push_back(std::make_shared<cucascade::data_batch>(
-            get_next_batch_id(), host_data->shallow_clone()));
+          cloned_batches.push_back(
+            cucascade::data_batch::make(get_next_batch_id(), host_data->shallow_clone()));
         } else if (auto* parquet_rep = dynamic_cast<cached_host_parquet_representation*>(idata_rep);
                    parquet_rep) {
-          cloned_batches.push_back(std::make_shared<cucascade::data_batch>(
-            get_next_batch_id(), parquet_rep->shallow_clone()));
+          cloned_batches.push_back(
+            cucascade::data_batch::make(get_next_batch_id(), parquet_rep->shallow_clone()));
         } else {
           throw std::runtime_error("Invalid data representation type");
         }

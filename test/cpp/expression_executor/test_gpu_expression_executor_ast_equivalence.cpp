@@ -126,7 +126,7 @@ std::shared_ptr<data_batch> make_input_batch(
   auto gpu_repr =
     std::make_unique<gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
   auto batch_id = ::sirius::get_next_batch_id();
-  return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
+  return data_batch::make(batch_id, std::move(gpu_repr));
 }
 
 using exp_executor      = ::sirius::gpu_expression_executor;
@@ -137,8 +137,8 @@ auto constexpr AST_I    = exp_strategy_enum::AST_INTERPRET;
 // Helper — pull the cudf::table_view out of a data_batch's read-only handle.
 cudf::table_view get_table_view(std::shared_ptr<data_batch> const& batch)
 {
-  auto input_ro = batch->to_read_only();
-  return input_ro.get_data()->cast<gpu_table_representation>().get_table_view();
+  auto input_ro = batch->get_read_only();
+  return input_ro->get_data()->cast<gpu_table_representation>().get_table_view();
 }
 
 // Run a non-owning executor over the given expression pointer and return the

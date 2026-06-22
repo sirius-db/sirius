@@ -100,7 +100,7 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
   // host allocation. allocate_multiple_blocks(0, ...) is not guaranteed to
   // return an allocation with a usable block, so skip it entirely.
   if (num_rows == 0 || num_cols == 0) {
-    return std::make_shared<cucascade::data_batch>(
+    return cucascade::data_batch::make(
       get_next_batch_id(),
       std::make_unique<host_data_representation>(
         host_table_allocation::create(
@@ -136,7 +136,7 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
   }
 
   if (total_size == 0) {
-    return std::make_shared<cucascade::data_batch>(
+    return cucascade::data_batch::make(
       get_next_batch_id(),
       std::make_unique<host_data_representation>(
         host_table_allocation::create(
@@ -266,7 +266,7 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
   auto table_allocation =
     host_table_allocation::create(std::move(allocation), std::move(columns), offset);
   auto table = std::make_unique<host_data_representation>(std::move(table_allocation), &mem_space);
-  return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(table));
+  return cucascade::data_batch::make(get_next_batch_id(), std::move(table));
 }
 
 pipeline::reservation_size_info cpu_source_task::get_estimated_reservation_size_info() const
@@ -369,8 +369,8 @@ void cpu_source_task::publish_output(op::operator_data& output_data, rmm::cuda_s
   for (auto& batch : pipelineable_output.get_data_batches()) {
     if (!batch) { continue; }
     {
-      auto ro = batch->to_read_only();
-      if (!ro.get_data()) { continue; }
+      auto ro = batch->get_read_only();
+      if (!ro->get_data()) { continue; }
     }
     _data_repo->add_data_batch(batch);
   }

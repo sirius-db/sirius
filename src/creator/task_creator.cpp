@@ -291,10 +291,10 @@ void task_creator::manager_loop()
               std::unordered_map<int, size_t> host_bytes;
               for (const auto& batch : pipelineable_input->get_data_batches()) {
                 if (!batch) { continue; }
-                auto ro     = batch->to_read_only();
-                auto* space = ro.get_memory_space();
-                if (!space || !ro.get_data()) { continue; }
-                auto size = ro.get_data()->get_size_in_bytes();
+                auto ro     = batch->get_read_only();
+                auto* space = ro->get_memory_space();
+                if (!space || !ro->get_data()) { continue; }
+                auto size = ro->get_data()->get_size_in_bytes();
                 if (space->get_tier() == cucascade::memory::Tier::GPU) {
                   gpu_bytes[space->get_device_id()] += size;
                 } else if (space->get_tier() == cucascade::memory::Tier::HOST) {
@@ -354,8 +354,8 @@ void task_creator::manager_loop()
               if (auto* cached = dynamic_cast<op::scan::scan_operator_with_pinned_table_input*>(
                     local_state->_input_data.get())) {
                 if (cached->batch) {
-                  auto ro     = cached->batch->to_read_only();
-                  auto* space = ro.get_memory_space();
+                  auto ro     = cached->batch->get_read_only();
+                  auto* space = ro->get_memory_space();
                   if (space) {
                     if (space->get_tier() == cucascade::memory::Tier::GPU) {
                       preferred_device_id = space->get_device_id();

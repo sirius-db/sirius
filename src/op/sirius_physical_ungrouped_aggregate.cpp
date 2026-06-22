@@ -280,10 +280,10 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
   outputs.reserve(input_batches.size());
 
   for (auto const& batch : input_batches) {
-    auto* space = batch.get_memory_space();
+    auto* space = batch->get_memory_space();
     if (!space) { continue; }
 
-    auto view = batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+    auto view = batch->get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
 
     std::vector<std::unique_ptr<cudf::column>> cols;
     cols.reserve(layout.local_types.size());
@@ -384,7 +384,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
       std::make_unique<cucascade::gpu_table_representation>(std::move(out_table), *space, stream);
     std::unique_ptr<cucascade::idata_representation> output_data = std::move(out_repr);
     auto const batch_id                                          = ::sirius::get_next_batch_id();
-    outputs.push_back(std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data)));
+    outputs.push_back(cucascade::data_batch::make(batch_id, std::move(output_data)));
   }
 
   return std::make_unique<pipelineable_operator_data>(outputs);
@@ -445,7 +445,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
-  cucascade::memory::memory_space* space = input_batches[0].get_memory_space();
+  cucascade::memory::memory_space* space = input_batches[0]->get_memory_space();
   if (space == nullptr) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
@@ -454,7 +454,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   auto layout = build_aggregate_layout(aggregates);
   std::shared_ptr<cucascade::data_batch> merged_batch;
   if (input_batches.size() == 1) {
-    merged_batch = cucascade::data_batch::to_idle(std::move(input_batches[0]));
+    merged_batch = cucascade::read_only_data_batch::to_idle(std::move(input_batches[0]));
   } else {
     merged_batch = gpu_merge_impl::merge_ungrouped_aggregate(
       input_batches, layout.merge_kinds, layout.merge_nth_index, stream, *space);
@@ -466,9 +466,9 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   }
 
   // Acquire read access to merged batch to extract table
-  auto merged_ro = merged_batch->to_read_only();
+  auto merged_ro = merged_batch->get_read_only();
   auto merged_view =
-    merged_ro.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+    merged_ro->get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
 
   std::vector<std::unique_ptr<cudf::column>> output_cols;
   output_cols.reserve(layout.aggregates.size());
@@ -493,7 +493,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
     std::make_unique<cucascade::gpu_table_representation>(std::move(out_table), *space, stream);
   std::unique_ptr<cucascade::idata_representation> output_data = std::move(out_repr);
   auto const batch_id                                          = ::sirius::get_next_batch_id();
-  auto output_batch = std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data));
+  auto output_batch = cucascade::data_batch::make(batch_id, std::move(output_data));
 
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(output_batch)});

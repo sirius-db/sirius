@@ -137,15 +137,15 @@ struct pipeline_task_history_fixture {
 
     auto& registry = sirius::converter_registry::get();
     {
-      auto mut = batch->to_mutable();
-      mut.convert_to<cucascade::host_data_representation>(registry, host_space, stream);
+      auto mut = batch->get_mutable();
+      mut->convert_to<cucascade::host_data_representation>(registry, host_space, stream);
     }
     stream.synchronize();
 
     {
-      auto ro = batch->to_read_only();
-      REQUIRE(ro.get_data() != nullptr);
-      REQUIRE(ro.get_data()->get_current_tier() == cucascade::memory::Tier::HOST);
+      auto ro = batch->get_read_only();
+      REQUIRE(ro->get_data() != nullptr);
+      REQUIRE(ro->get_data()->get_current_tier() == cucascade::memory::Tier::HOST);
     }
     return batch;
   }

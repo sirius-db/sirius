@@ -93,15 +93,15 @@ std::unique_ptr<sirius::pipeline::gpu_pipeline_task> make_test_gpu_task(
 /// Helper: get the tier of a data_batch using a temporary read-only lock.
 inline cucascade::memory::Tier get_batch_tier(cucascade::data_batch& batch)
 {
-  auto ro = batch.to_read_only();
-  return ro.get_memory_space()->get_tier();
+  auto ro = batch.get_read_only();
+  return ro->get_memory_space()->get_tier();
 }
 
 /// Helper: get the size in bytes of a data_batch's data using a temporary read-only lock.
 inline size_t get_batch_size(cucascade::data_batch& batch)
 {
-  auto ro = batch.to_read_only();
-  return ro.get_data()->get_size_in_bytes();
+  auto ro = batch.get_read_only();
+  return ro->get_data()->get_size_in_bytes();
 }
 
 }  // anonymous namespace
@@ -234,7 +234,7 @@ TEST_CASE("non-idle batch skipped by predicate", "[convertible_gpu_pipeline_task
   queue.push(std::move(task));
 
   // Hold an exclusive lock so batch is not idle — provider should skip it
-  auto exclusive_lock = batch->to_mutable();
+  auto exclusive_lock = batch->get_mutable();
 
   sirius::convertible_gpu_pipeline_task_provider provider(queue);
   auto cd = provider.get_next_convertible(e.gpu_space, false);

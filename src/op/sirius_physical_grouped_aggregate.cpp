@@ -79,7 +79,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
   const auto& input_batches = input.get_read_only_batches();
   std::vector<std::shared_ptr<::cucascade::data_batch>> results;
   for (auto const& input_batch : input_batches) {
-    auto* space = input_batch.get_memory_space();
+    auto* space = input_batch->get_memory_space();
     if (!space) { continue; }
     auto result = gpu_aggregate_impl::local_grouped_aggregate(input_batch,
                                                               group_idx,

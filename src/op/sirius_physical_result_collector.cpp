@@ -126,8 +126,8 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
   auto sink_single_batch = [this,
                             stream](std::shared_ptr<cucascade::data_batch> const& input_batch) {
     // Acquire read-only access to inspect the batch
-    auto ro    = input_batch->to_read_only();
-    auto* data = ro.get_data();
+    auto ro    = input_batch->get_read_only();
+    auto* data = ro->get_data();
 
     if (!data) {
       throw invalid_input_exception(
@@ -156,13 +156,13 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       auto next_batch_id  = data_repo_mgr.get_next_data_batch_id();
 
       // clone_to: creates new batch with data converted to host_data_representation
-      auto result_batch = ro.clone_to<cucascade::host_data_representation>(
+      auto result_batch = ro->clone_to<cucascade::host_data_representation>(
         registry, next_batch_id, &mem_space, stream);
 
       // Access the result batch's data. Declared outside the if-block so result_ro outlives
       // the branch — data points into it and must not dangle when we reach the assert below.
-      result_ro_opt = result_batch->to_read_only();
-      data          = result_ro_opt->get_data();
+      result_ro_opt = result_batch->get_read_only();
+      data          = (*result_ro_opt)->get_data();
 
     } else if (data->get_current_tier() != cucascade::memory::Tier::HOST) {
       // Data must be in HOST tier (i.e., cannot currently reside in DISK tier)

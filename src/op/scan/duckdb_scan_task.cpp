@@ -464,7 +464,7 @@ std::shared_ptr<cucascade::data_batch> duckdb_scan_task_local_state::make_data_b
   auto table = std::make_unique<host_data_representation>(std::move(table_allocation), _host_space);
 
   // Create the data batch and return
-  return std::make_shared<data_batch>(get_next_batch_id(), std::move(table));
+  return data_batch::make(get_next_batch_id(), std::move(table));
 }
 
 //===----------------------------------------------------------------------===//
@@ -540,8 +540,8 @@ void duckdb_scan_task::execute(rmm::cuda_stream_view stream)
     std::size_t output_bytes       = 0;
     for (const auto& batch : pipelineable_output_data.get_data_batches()) {
       if (batch) {
-        auto ro = batch->to_read_only();
-        if (ro.get_data()) { output_bytes += ro.get_data()->get_size_in_bytes(); }
+        auto ro = batch->get_read_only();
+        if (ro->get_data()) { output_bytes += ro->get_data()->get_size_in_bytes(); }
       }
     }
     auto& g_state = _global_state->cast<duckdb_scan_task_global_state>();

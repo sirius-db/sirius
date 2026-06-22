@@ -41,13 +41,8 @@ pipelineable_operator_data::get_data_batches() const
     if (!_read_only_data_batches) {
       throw std::runtime_error("pipelineable_operator_data:get_data_batches no data batches");
     }
-    std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
-    batches.reserve(_read_only_data_batches->size());
-    for (const auto& ro : *_read_only_data_batches) {
-      auto copy = ro;
-      batches.push_back(::cucascade::data_batch::to_idle(std::move(copy)));
-    }
-    _data_batches = std::move(batches);
+    throw std::runtime_error(
+      "pipelineable_operator_data:get_data_batches missing canonical data batch owners");
   }
   return *_data_batches;
 }
@@ -63,7 +58,7 @@ std::vector<::cucascade::read_only_data_batch> pipelineable_operator_data::get_r
     ro_batches.reserve(_data_batches->size());
     for (const auto& batch : *_data_batches) {
       if (batch) {
-        ro_batches.push_back(batch->to_read_only());
+        ro_batches.push_back(batch->get_read_only());
       } else {
         SIRIUS_LOG_WARN("pipelineable_operator_data: null batch encountered, skipping");
       }
@@ -74,7 +69,12 @@ std::vector<::cucascade::read_only_data_batch> pipelineable_operator_data::get_r
       return std::move(ro_batches);
     }
   }
-  return *_read_only_data_batches;
+  std::vector<::cucascade::read_only_data_batch> ro_batches;
+  ro_batches.reserve(_read_only_data_batches->size());
+  for (const auto& ro : *_read_only_data_batches) {
+    ro_batches.push_back(ro.clone_read_only_access());
+  }
+  return ro_batches;
 }
 
 void pipelineable_operator_data::prepare_for_processing(

@@ -217,8 +217,8 @@ host_data_representation const& convert_to_host_table(
 {
   // Verify batch has data (use read-only accessor to check).
   {
-    auto ro = batch->to_read_only();
-    if (!ro.get_data()) { throw std::runtime_error("data_batch has no data representation"); }
+    auto ro = batch->get_read_only();
+    if (!ro->get_data()) { throw std::runtime_error("data_batch has no data representation"); }
   }
 
   auto& manager = sirius_ctx->get_memory_manager();
@@ -235,13 +235,13 @@ host_data_representation const& convert_to_host_table(
 
   auto& registry = sirius::converter_registry::get();
   {
-    auto mut = batch->to_mutable();
-    mut.convert_to<host_data_representation>(registry, host_space, stream);
+    auto mut = batch->get_mutable();
+    mut->convert_to<host_data_representation>(registry, host_space, stream);
   }
 
-  auto ro = batch->to_read_only();
-  if (!ro.get_data()) { throw std::runtime_error("data_batch has no data after conversion"); }
-  return ro.get_data()->cast<host_data_representation>();
+  auto ro = batch->get_read_only();
+  if (!ro->get_data()) { throw std::runtime_error("data_batch has no data after conversion"); }
+  return ro->get_data()->cast<host_data_representation>();
 }
 
 }  // namespace

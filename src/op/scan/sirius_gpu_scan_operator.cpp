@@ -51,21 +51,21 @@ void scan_operator_with_pinned_table_input::prepare_for_processing(
   if (batch && requested_memory_space) {
     bool needs_upload = false;
     {
-      auto ro      = batch->to_read_only();
-      needs_upload = ro.get_data() && ro.get_current_tier() != ::cucascade::memory::Tier::GPU;
+      auto ro      = batch->get_read_only();
+      needs_upload = ro->get_data() && ro->get_current_tier() != ::cucascade::memory::Tier::GPU;
     }
     if (needs_upload) {
       auto& registry = ::sirius::converter_registry::get();
-      auto mut       = batch->to_mutable();
-      mut.convert_to<::cucascade::gpu_table_representation>(
+      auto mut       = batch->get_mutable();
+      mut->convert_to<::cucascade::gpu_table_representation>(
         registry, requested_memory_space, stream);
     }
   }
   // Capture the actual memory_space the batch lives on (post any conversion)
   // so execute() can tag its output batch with the right placement.
   if (batch) {
-    auto ro          = batch->to_read_only();
-    gpu_memory_space = ro.get_memory_space();
+    auto ro          = batch->get_read_only();
+    gpu_memory_space = ro->get_memory_space();
   }
 }
 
@@ -75,8 +75,8 @@ std::size_t scan_operator_with_pinned_table_input::get_estimated_size_in_bytes()
   // Use the generic representation accessor so this works for both GPU-resident
   // batches and host_data_representation batches that prepare_for_processing
   // will upgrade to GPU.
-  auto ro          = batch->to_read_only();
-  auto const* data = ro.get_data();
+  auto ro          = batch->get_read_only();
+  auto const* data = ro->get_data();
   if (!data) { return 0; }
   return data->get_size_in_bytes();
 }
@@ -205,14 +205,14 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
       batches.push_back(pinned->batch);
       return std::make_unique<pipelineable_operator_data>(std::move(batches));
     }
-    auto ro_batch  = pinned->batch->to_read_only();
-    auto* batch_mr = ro_batch.get_memory_space();
+    auto ro_batch  = pinned->batch->get_read_only();
+    auto* batch_mr = ro_batch->get_memory_space();
     if (!batch_mr) {
       throw std::runtime_error(
         "[sirius_gpu_scan_operator::execute] pinned batch has no memory_space; "
         "prepare_for_processing must have produced a GPU-resident batch.");
     }
-    auto& gpu_rep     = ro_batch.get_data()->cast<::cucascade::gpu_table_representation>();
+    auto& gpu_rep     = ro_batch->get_data()->cast<::cucascade::gpu_table_representation>();
     auto owning_input = gpu_rep.release_table(stream);
 
     table = _ingestible->post_filter_and_project(
