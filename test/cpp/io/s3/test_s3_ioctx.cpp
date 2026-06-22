@@ -635,6 +635,22 @@ std::shared_ptr<s3_blocking_ioctx> make_device_blocking_ioctx(
   return std::make_shared<s3_blocking_ioctx>(std::move(cfg));
 }
 
+std::shared_ptr<s3_ioctx> make_perf_device_async_ioctx(
+  std::shared_ptr<s3_request_authorizer> provider,
+  fsmr_test_resources& memory,
+  bool enable_perf_instrumentation,
+  std::size_t max_connections = 4,
+  long request_timeout_s      = 20)
+{
+  s3_ioctx_config cfg{};
+  cfg.creds                   = std::move(provider);
+  cfg.max_connections         = max_connections;
+  cfg.request_timeout_s       = request_timeout_s;
+  cfg.host_memory_resource    = &memory.host_mr;
+  cfg.s3_perf_instrumentation = enable_perf_instrumentation;
+  return std::make_shared<s3_ioctx>(std::move(cfg));
+}
+
 std::vector<std::uint8_t> test_payload(std::size_t size = 4096)
 {
   std::vector<std::uint8_t> out(size);
@@ -1424,7 +1440,7 @@ TEST_CASE("async-curl S3 device staging peak stays within the active window",
 }
 
 TEST_CASE("async-curl S3 benchmark hides injected range latency versus blocking S3",
-          "[.][s3][benchmark]")
+          "[.][s3][bench]")
 {
   constexpr std::size_t payload_size = 16 * sirius::io::CHUNK_SIZE;
   auto payload                       = test_payload(payload_size);
@@ -1458,8 +1474,40 @@ TEST_CASE("async-curl S3 benchmark hides injected range latency versus blocking 
   CHECK(async_best.median_time < blocking / 2);
 }
 
+TEST_CASE("async-curl S3 perf instrumentation reports transient retry counters", "[.][s3][bench]")
+{
+  auto payload = test_payload(4096);
+  range_fault_policy fault;
+  fault.fail_first_gets = 1;
+  fault.fail_status     = 503;
+  fault.fail_reason     = "Service Unavailable";
+  range_http_server server(payload, 0ms, std::move(fault));
+  fsmr_test_resources memory(/*block_size=*/sirius::io::CHUNK_SIZE,
+                             /*capacity=*/2 * sirius::io::CHUNK_SIZE,
+                             /*memory_limit=*/2 * sirius::io::CHUNK_SIZE,
+                             /*pool_size=*/2,
+                             /*initial_pools=*/1);
+  auto ctx = make_perf_device_async_ioctx(std::make_shared<fixed_url_authorizer>(server.url()),
+                                          memory,
+                                          /*enable_perf_instrumentation=*/true,
+                                          /*max_connections=*/1);
+  auto obj = ctx->create_io_object("s3://bucket/object.bin");
+
+  auto stream = rmm::cuda_stream_default;
+  rmm::device_buffer dst(payload.size(), stream);
+  auto const got =
+    ctx->device_read(*obj, 0, payload.size(), static_cast<std::uint8_t*>(dst.data()), stream);
+
+  CHECK(got == payload.size());
+  require_bytes_equal(copy_device_to_host(dst, got), payload, 0);
+  CHECK(ctx->retries_total() >= 1);
+  CHECK(ctx->terminal_failures_total() == 0);
+  WARN("s3 perf retry bucket=bucket key=object.bin attempts=" << server.get_count() << " retries="
+                                                              << ctx->retries_total());
+}
+
 TEST_CASE("async-curl S3 benchmark reports real AWS S3 headline numbers",
-          "[.][s3][aws][live][benchmark]")
+          "[.][s3][bench][aws][live]")
 {
   auto env = read_aws_live_env();
   if (!env) { return; }

@@ -347,8 +347,11 @@ void upload_fixtures(minio_instance const& inst,
 
 // Opt-in (SIRIUS_TEST_S3_LARGE=1): generate the SF10 lineitem parquet with the
 // DuckDB CLI and upload it for the [s3][sql][large] / benchmark tests. Replaces
-// the old `fixtures.sh --perf` path. Uploaded to the HTTP endpoint only.
-void maybe_upload_large_fixture(minio_instance const& http, fs::path const& work)
+// the old `fixtures.sh --perf` path. Uploaded to both HTTP and TLS endpoints.
+void maybe_upload_large_fixture(minio_instance const& http,
+                                minio_instance const& tls,
+                                std::optional<fs::path> const& ca,
+                                fs::path const& work)
 {
   if (!env_truthy("SIRIUS_TEST_S3_LARGE")) return;
 
@@ -398,8 +401,21 @@ void maybe_upload_large_fixture(minio_instance const& http, fs::path const& work
   if (!(pc == 200 || pc == 204)) {
     throw std::runtime_error("SF10 upload failed (HTTP " + std::to_string(pc) + ")");
   }
+  std::FILE* ft = std::fopen(parquet.c_str(), "rb");
+  if (ft == nullptr) throw std::runtime_error("cannot reopen SF10 parquet for TLS upload");
+  long tc = s3_put(tls,
+                   "https",
+                   uri_path_for(kBucket, key),
+                   ft,
+                   static_cast<std::int64_t>(fs::file_size(parquet)),
+                   ca);
+  std::fclose(ft);
+  if (!(tc == 200 || tc == 204)) {
+    throw std::runtime_error("SF10 TLS upload failed (HTTP " + std::to_string(tc) + ")");
+  }
   std::cout << "[s3] uploaded SF10 lineitem fixture (" << fs::file_size(parquet) << " bytes) to "
-            << http.endpoint << "/" << kBucket << "/" << key << std::endl;
+            << http.endpoint << "/" << kBucket << "/" << key << " and " << tls.endpoint << "/"
+            << kBucket << "/" << key << std::endl;
 
   // The large tests read the same SF10 file locally to build a CPU oracle to
   // compare the GPU-over-S3 result against. Point them at the file we just
@@ -453,7 +469,7 @@ bool bring_up()
 
   upload_fixtures(http, "http", fixture_dir, std::nullopt);
   upload_fixtures(tls, "https", fixture_dir, ca);
-  maybe_upload_large_fixture(http, work);
+  maybe_upload_large_fixture(http, tls, ca, work);
 
   // Publish the env contract the [s3] tests consume (mirrors the old env.sh).
   setenv_kv("SIRIUS_TEST_S3_ENDPOINT", http.endpoint);

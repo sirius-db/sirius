@@ -117,6 +117,12 @@ class s3_reactor {
     std::chrono::milliseconds retry_backoff_base{50};  // exponential base
     std::chrono::milliseconds retry_jitter{20};        // +/- bound
     bool honor_retry_after{true};
+
+    // Opt-in per-chunk perf instrumentation (ns-level accumulators). Default off:
+    // when false the device path takes no steady_clock::now() and no extra
+    // atomics (one predicted-not-taken branch per chunk). The retry / terminal
+    // counters below are always-on regardless of this flag.
+    bool s3_perf_instrumentation{false};
   };
 
   using native_handle_type   = s3_native_handle;
@@ -194,6 +200,61 @@ class s3_reactor {
     return _device_peak_inflight.load(std::memory_order_relaxed);
   }
 
+  // -- Per-chunk perf micro (gated by config.s3_perf_instrumentation) ---------
+  // Raw ns totals/counts/max; the consumer computes means (ns_total / count).
+  // All zero when instrumentation is off. Populated on the async device path
+  // only (footer/HEAD go through the separate blocking path and are not seen).
+  [[nodiscard]] std::uint64_t chunk_get_ns_total() const noexcept
+  {
+    return _chunk_get_ns_total.load(std::memory_order_relaxed);
+  }
+  [[nodiscard]] std::uint64_t chunk_get_ns_count() const noexcept
+  {
+    return _chunk_get_ns_count.load(std::memory_order_relaxed);
+  }
+  [[nodiscard]] std::uint64_t chunk_get_ns_max() const noexcept
+  {
+    return _chunk_get_ns_max.load(std::memory_order_relaxed);
+  }
+  [[nodiscard]] std::uint64_t queue_wait_ns_total() const noexcept
+  {
+    return _queue_wait_ns_total.load(std::memory_order_relaxed);
+  }
+  [[nodiscard]] std::uint64_t queue_wait_ns_count() const noexcept
+  {
+    return _queue_wait_ns_count.load(std::memory_order_relaxed);
+  }
+  /// memcpy issue -> worker-observed cuda_done. NOT a pure GPU copy time: it
+  /// includes the CUDA-callback + wakeup + poll observation latency.
+  [[nodiscard]] std::uint64_t h2d_observed_ns_total() const noexcept
+  {
+    return _h2d_observed_ns_total.load(std::memory_order_relaxed);
+  }
+  [[nodiscard]] std::uint64_t h2d_observed_ns_count() const noexcept
+  {
+    return _h2d_observed_ns_count.load(std::memory_order_relaxed);
+  }
+  [[nodiscard]] std::uint64_t h2d_observed_ns_max() const noexcept
+  {
+    return _h2d_observed_ns_max.load(std::memory_order_relaxed);
+  }
+  /// First GET submit -> first GET completion of the reactor's lifetime
+  /// (excludes queue-wait by construction).
+  [[nodiscard]] std::uint64_t ttfb_ns() const noexcept
+  {
+    return _ttfb_ns.load(std::memory_order_relaxed);
+  }
+
+  // -- Retry / failure counters (always-on, off-happy-path) -------------------
+  [[nodiscard]] std::uint64_t retries_total() const noexcept
+  {
+    return _retries_total.load(std::memory_order_relaxed);
+  }
+  [[nodiscard]] std::uint64_t terminal_failures_total() const noexcept
+  {
+    return _terminal_failures_total.load(std::memory_order_relaxed);
+  }
+
  private:
   struct transfer;  // per-async-request state (defined in the .cpp)
 
@@ -252,6 +313,24 @@ class s3_reactor {
   std::atomic<std::uint64_t> _device_copies_total{0};
   std::atomic<std::uint64_t> _device_peak_inflight{0};
   std::atomic<std::uint64_t> _device_stream_sync_total{0};
+
+  // Gated per-chunk perf micro (written by the worker thread only).
+  std::atomic<std::uint64_t> _chunk_get_ns_total{0};
+  std::atomic<std::uint64_t> _chunk_get_ns_count{0};
+  std::atomic<std::uint64_t> _chunk_get_ns_max{0};
+  std::atomic<std::uint64_t> _queue_wait_ns_total{0};
+  std::atomic<std::uint64_t> _queue_wait_ns_count{0};
+  std::atomic<std::uint64_t> _h2d_observed_ns_total{0};
+  std::atomic<std::uint64_t> _h2d_observed_ns_count{0};
+  std::atomic<std::uint64_t> _h2d_observed_ns_max{0};
+  std::atomic<std::uint64_t> _ttfb_ns{0};
+  // TTFB start point: the first GET submit of the reactor's lifetime. Worker-only.
+  std::chrono::steady_clock::time_point _ttfb_first_submit{};
+  bool _ttfb_first_submit_set{false};
+
+  // Always-on retry / failure counters.
+  std::atomic<std::uint64_t> _retries_total{0};
+  std::atomic<std::uint64_t> _terminal_failures_total{0};
 };
 
 }  // namespace sirius::io::s3

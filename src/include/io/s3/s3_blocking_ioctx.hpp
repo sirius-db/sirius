@@ -104,6 +104,14 @@ struct s3_ioctx_config {
   /// (CURLOPT_SSL_VERIFYPEER / CURLOPT_SSL_VERIFYHOST = 0) — INSECURE, dev/test.
   std::string ca_bundle_path;
   bool tls_verify = true;
+
+  /// Opt-in per-chunk perf instrumentation for the async device-read path
+  /// (ns-level GET / queue-wait / H2D-observed latency + TTFB accumulators).
+  /// Default off so production carries no per-chunk timestamping; the benchmark
+  /// sets it true. The retry / terminal-failure counters are NOT gated by this
+  /// (they are always-on, off-happy-path). This is a bench/test knob, not a
+  /// user-facing one.
+  bool s3_perf_instrumentation = false;
 };
 
 /**
