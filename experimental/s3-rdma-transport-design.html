@@ -70,6 +70,13 @@ plane** (RDMA) writes object bytes straight into the GPU arena. Versus
 staging for a small GPU arena and the H2D copy for a GPU-local D2D (<1%
 overhead). Host reads (footers / HEAD) still go over HTTP.
 
+The arena is a **fixed per-chunk staging window** (`max_inflight × 1 MiB`),
+**not** object-sized: `templated_ioctx` splits the read into 1 MiB chunks that
+stream through the arena in waves, each chunk D2D-copied to its offset in the
+**full-size RMM destination buffer**. So a 128 MiB (or multi-GB) read flows
+through the same ~8–16 MiB arena — exactly how `s3_reactor` streams through its
+host staging blocks today.
+
 ## 2. How one read works
 
 ```mermaid
