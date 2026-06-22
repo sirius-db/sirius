@@ -244,9 +244,17 @@ TEST_CASE("sirius_physical_projection mixes evaluated and passthrough columns (p
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = projection.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
-  auto out_view = sirius::get_cudf_table_view(
-    *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
+  auto out_batch =
+    dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().at(0);
 
+  // Drop every external handle to the input batch and sync the stream before validating. The
+  // output's composite owner (input read-only lock) must keep the passthrough columns' memory
+  // alive even after the input variable disappears.
+  inputs.clear();
+  input_batch.reset();
+  REQUIRE(cudaStreamSynchronize(cudf::get_default_stream().value()) == cudaSuccess);
+
+  auto out_view = sirius::get_cudf_table_view(*out_batch);
   REQUIRE(out_view.num_columns() == 3);
   REQUIRE(copy_column_to_host<int64_t>(out_view.column(0)) == data_vals);
   REQUIRE(copy_column_to_host<int64_t>(out_view.column(1)) ==

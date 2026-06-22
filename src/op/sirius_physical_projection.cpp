@@ -22,9 +22,6 @@
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "log/logging.hpp"
 
-#include <cudf/null_mask.hpp>
-#include <cudf/utilities/traits.hpp>
-
 #include <cuda_runtime.h>
 #include <nvtx3/nvtx3.hpp>
 
@@ -41,24 +38,6 @@ namespace sirius {
 namespace op {
 
 namespace {
-
-/// Conservative, sync-free estimate of the device bytes referenced by a column_view, used for
-/// the owning_table_view's alloc_size (memory accounting). Counts the validity bitmask and
-/// fixed-width data buffers, and recurses into children (string/list offsets, struct fields).
-/// Variable-length leaf payloads (string chars) are intentionally NOT device-read here so the
-/// projection hot path stays free of stream synchronization; the result is an estimate.
-std::size_t estimate_column_view_bytes(cudf::column_view const& col)
-{
-  std::size_t bytes = 0;
-  if (col.nullable()) { bytes += cudf::bitmask_allocation_size_bytes(col.size()); }
-  if (cudf::is_fixed_width(col.type()) && col.size() > 0) {
-    bytes += static_cast<std::size_t>(col.size()) * cudf::size_of(col.type());
-  }
-  for (cudf::size_type i = 0; i < col.num_children(); ++i) {
-    bytes += estimate_column_view_bytes(col.child(i));
-  }
-  return bytes;
-}
 
 /// Where an output column of the projection comes from.
 enum class projection_source { passthrough, evaluated };
@@ -115,7 +94,6 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
   /// understand of the trade-offs between the different strategies. See:
   /// https://github.com/sirius-db/sirius/issues/636
   // Construct the executor once (reused across batches; execute() resets its state each call).
-  // Path 2 (all passthrough) never evaluates anything, so skip building it.
   std::optional<sirius::gpu_expression_executor> gpu_expression_executor;
   if (!all_passthrough) {
     gpu_expression_executor.emplace(
@@ -129,33 +107,24 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
     auto input_view = sirius::get_cudf_table_view(input_ro);
     auto& mem       = *input_ro.get_memory_space();  // owned by the manager; valid after the move
 
-    // ---- Path 1: every output column is an evaluated expression (legacy behavior). ----
+    // ---- Path 1: every output column is an evaluated expression ----
     if (all_evaluated) {
       auto projected_table = gpu_expression_executor->execute(input_view);
       output_batches.push_back(sirius::make_data_batch(std::move(projected_table), mem, stream));
       continue;
     }
 
-    // Paths 2 & 3 expose input memory through a view. Order `stream` after the input's writes so
-    // the writer event recorded on the output batch correctly bounds the referenced data.
-    if (auto* ev = input_ro.get_writer_event(); ev != nullptr) {
-      if (auto err = cudaStreamWaitEvent(stream.value(), ev, 0); err != cudaSuccess) {
-        SIRIUS_LOG_WARN("[projection] cudaStreamWaitEvent on input writer event failed: {}",
-                        cudaGetErrorString(err));
-      }
-    }
-
     // ---- Path 2: every output column is a pure passthrough — zero device copies. ----
     if (all_passthrough) {
       std::vector<cudf::column_view> cols;
       cols.reserve(column_plan.size());
-      std::size_t referenced_bytes = 0;
       for (auto const& p : column_plan) {
-        auto const& cv = input_view.column(p.index);
-        cols.push_back(cv);
-        referenced_bytes += estimate_column_view_bytes(cv);
+        cols.push_back(input_view.column(p.index));
       }
       cudf::table_view out_view(cols);
+      // We pin the whole input batch alive (its read-only lock is the owner below), so charge its
+      // full size. No new columns are allocated.
+      std::size_t const referenced_bytes = input_ro.get_data()->get_size_in_bytes();
       // Owner = the input read-only lock: keeps the source columns alive AND pinned read-only for
       // the output batch's lifetime, so the view can never be freed/downgraded out from under us.
       output_batches.push_back(sirius::make_data_batch_from_view(
@@ -165,8 +134,10 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
 
     // ---- Path 3: mix of evaluated columns and passthroughs. ----
     auto evaluated_owned = gpu_expression_executor->execute(input_view);
-    std::size_t referenced_bytes =
-      evaluated_owned->alloc_size();  // (A) charge full referenced size
+    // Charge the full input batch (pinned alive for the passthrough columns) plus the real size of
+    // the freshly-evaluated columns we just allocated.
+    std::size_t const referenced_bytes =
+      input_ro.get_data()->get_size_in_bytes() + evaluated_owned->alloc_size();
     // Move the evaluated table into a shared_ptr so it can live inside the (copy-constructible)
     // std::any owner alongside the input lock.
     std::shared_ptr<cudf::table> evaluated(std::move(evaluated_owned));
@@ -175,13 +146,8 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
     std::vector<cudf::column_view> cols(column_plan.size());
     for (std::size_t i = 0; i < column_plan.size(); ++i) {
       auto const& p = column_plan[i];
-      if (p.kind == projection_source::passthrough) {
-        auto const& cv = input_view.column(p.index);
-        cols[i]        = cv;
-        referenced_bytes += estimate_column_view_bytes(cv);
-      } else {
-        cols[i] = eval_view.column(p.index);
-      }
+      cols[i]       = (p.kind == projection_source::passthrough) ? input_view.column(p.index)
+                                                                 : eval_view.column(p.index);
     }
     cudf::table_view out_view(cols);
 
