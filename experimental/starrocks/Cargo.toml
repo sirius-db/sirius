@@ -25,8 +25,8 @@ prettyplease = "0.2"
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["full", "parsing"] }
-substrait = "0.62.2"
-substrait-explain = "0.3.2"
+substrait = "0.63.0"
+substrait-explain = "0.6.0"
 thiserror = "2"
 thrift = "0.23"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "time"] }
