@@ -77,24 +77,29 @@ struct bench_env {
   std::string secret_key;
   std::string bucket;
   std::string key;
+  std::string session_token;
 };
 
 std::optional<bench_env> read_bench_env()
 {
   auto backend = env_or("SIRIUS_BENCH_BACKEND", "minio");
   if (backend == "aws-s3") {
-    auto access_key = env_or("SIRIUS_BENCH_AWS_S3_ACCESS_KEY");
-    auto secret_key = env_or("SIRIUS_BENCH_AWS_S3_SECRET_KEY");
-    auto bucket     = env_or("SIRIUS_BENCH_AWS_S3_BUCKET");
-    auto key        = env_or("SIRIUS_BENCH_AWS_S3_KEY", "tpch/lineitem_sf10.parquet");
-    if (access_key.empty() || secret_key.empty() || bucket.empty()) { return std::nullopt; }
+    auto access_key    = env_or("SIRIUS_BENCH_AWS_S3_ACCESS_KEY");
+    auto secret_key    = env_or("SIRIUS_BENCH_AWS_S3_SECRET_KEY");
+    auto bucket        = env_or("SIRIUS_BENCH_AWS_S3_BUCKET");
+    auto key           = env_or("SIRIUS_BENCH_AWS_S3_KEY", "tpch/lineitem_sf10.parquet");
+    auto session_token = env_or("SIRIUS_BENCH_AWS_S3_SESSION_TOKEN");
+    if (access_key.empty() || secret_key.empty() || bucket.empty() || session_token.empty()) {
+      return std::nullopt;
+    }
     return bench_env{std::move(backend),
                      env_or("SIRIUS_BENCH_AWS_S3_ENDPOINT", "https://s3.amazonaws.com"),
                      env_or("SIRIUS_BENCH_AWS_S3_REGION", "us-east-1"),
                      std::move(access_key),
                      std::move(secret_key),
                      std::move(bucket),
-                     std::move(key)};
+                     std::move(key),
+                     std::move(session_token)};
   }
 
   bool const use_tls = !env_or("SIRIUS_BENCH_S3_USE_TLS").empty();
@@ -126,6 +131,7 @@ class recording_request_authorizer final : public s3_request_authorizer {
     static_credentials creds;
     creds.access_key_id     = env.access_key;
     creds.secret_access_key = env.secret_key;
+    creds.session_token     = env.session_token;
     _delegate               = std::make_shared<sirius_sigv4_presigned_authorizer>(
       std::move(creds), env.region, env.endpoint, std::chrono::minutes{30});
   }
@@ -518,6 +524,26 @@ TEST_CASE("S3 async perf instrumentation accessors are noexcept", "[.][s3][bench
   STATIC_REQUIRE(noexcept(std::declval<s3_ioctx const&>().ttfb_ns()));
   STATIC_REQUIRE(noexcept(std::declval<s3_ioctx const&>().retries_total()));
   STATIC_REQUIRE(noexcept(std::declval<s3_ioctx const&>().terminal_failures_total()));
+}
+
+TEST_CASE("S3 bench AWS session token reaches presigned URLs", "[s3][bench]")
+{
+  bench_env env{"aws-s3",
+                "https://s3.us-east-2.amazonaws.com",
+                "us-east-2",
+                "AKIAFAKEBENCHKEY",
+                "fake-secret-key",
+                "sirius-bench",
+                "tpch/lineitem_sf10.parquet",
+                "fake-session-token"};
+  recording_request_authorizer authorizer(env);
+
+  auto request = authorizer.authorize(
+    s3_object_ref{env.bucket, env.key}, s3_request_method::GET, std::chrono::seconds{60});
+
+  CHECK(request.headers.empty());
+  CHECK(request.url.find("X-Amz-Security-Token=") != std::string::npos);
+  CHECK(request.url.find("fake-session-token") != std::string::npos);
 }
 
 TEST_CASE("S3 parquet perf benchmark emits async JSON baseline", "[.][s3][bench]")
