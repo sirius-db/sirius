@@ -1,3 +1,25 @@
+<!doctype html>
+<!-- Generated preview of s3-rdma-transport-design.md (Mermaid via CDN).
+     This is a SNAPSHOT of the .md at generation time — regenerate if the .md
+     changes. GitHub also renders the .md's Mermaid natively in the PR/blob view. -->
+<html><head><meta charset="utf-8">
+<title>S3 RDMA Transport — Design preview</title>
+<style>
+ body{max-width:920px;margin:2rem auto;padding:0 1.2rem;line-height:1.55;
+   font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#1f2328}
+ h1{border-bottom:1px solid #d0d7de;padding-bottom:.3em}
+ h2{border-bottom:1px solid #eaecef;padding-bottom:.2em;margin-top:1.6em}
+ table{border-collapse:collapse;margin:1em 0;display:block;overflow:auto}
+ th,td{border:1px solid #d0d7de;padding:6px 10px;text-align:left;vertical-align:top}
+ th{background:#f6f8fa}
+ code{background:#eff1f3;padding:.15em .35em;border-radius:4px;font-size:90%}
+ pre{background:#f6f8fa;padding:12px;border-radius:6px;overflow:auto}
+ pre code{background:none;padding:0}
+ .mermaid{background:#fff;margin:1.2em 0;text-align:center}
+ blockquote{color:#57606a;border-left:.25em solid #d0d7de;padding:0 1em;margin-left:0}
+</style></head><body>
+<div id="out">rendering…</div>
+<script type="text/markdown" id="src">
 # S3 RDMA Transport for Sirius — Design for Team Review
 
 | | |
@@ -177,3 +199,16 @@ the `cuObjGet` `size` arg); optional SigV4 in the dev server.
 
 > Deeper implementation notes + verified file:line references live in the
 > offline working spec, not this doc.
+</script>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script type="module">
+import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+const md = document.getElementById('src').textContent;
+document.getElementById('out').innerHTML = marked.parse(md);
+document.querySelectorAll('code.language-mermaid').forEach(c=>{
+  const div=document.createElement('div'); div.className='mermaid';
+  div.textContent=c.textContent; c.closest('pre').replaceWith(div);
+});
+mermaid.initialize({startOnLoad:false,theme:'default'});
+try{ await mermaid.run(); }catch(e){ console.error(e); }
+</script></body></html>
