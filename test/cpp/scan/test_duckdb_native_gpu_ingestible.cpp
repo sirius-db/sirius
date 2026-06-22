@@ -18,7 +18,10 @@
 // consumer-side coalescing of ranges into cap-sized batches (including the
 // single-split tail case).
 
+#include <cudf/utilities/span.hpp>
+
 #include <catch.hpp>
+#include <curl/curl.h>
 #include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
@@ -26,9 +29,16 @@
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/storage/data_table.hpp>
+#include <duckdb/storage/single_file_block_manager.hpp>
+#include <duckdb/storage/storage_manager.hpp>
 #include <helper/logical_type.hpp>
 #include <io/io_context.hpp>
+#include <io/s3/s3_blocking_ioctx.hpp>
+#include <io/s3/s3_ioctx.hpp>
+#include <io/s3/sigv4.hpp>
+#include <io/s3/sirius_sigv4_authorizer.hpp>
 #include <io/types.hpp>
+#include <op/scan/duckdb_block_layout.hpp>
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
@@ -37,11 +47,21 @@
 #include <utils/utils.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <future>
 #include <memory>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -50,6 +70,9 @@ using namespace sirius::op::scan;
 using namespace sirius::scan_manager;
 
 namespace {
+
+namespace fs = std::filesystem;
+using namespace std::chrono_literals;
 
 void exec_ok(duckdb::Connection& con, std::string const& q)
 {
@@ -181,6 +204,361 @@ duckdb_native_split_payload const& payload_of(op::operator_data const& batch)
   return split_info->payload;
 }
 
+std::string env_or(std::string_view name, std::string fallback = {})
+{
+  auto const* value = std::getenv(std::string{name}.c_str());
+  return value ? std::string{value} : std::move(fallback);
+}
+
+bool truthy_env(std::string_view name)
+{
+  auto value = env_or(name);
+  return value == "1" || value == "true" || value == "TRUE" || value == "yes" || value == "YES";
+}
+
+struct s3_test_env {
+  std::string endpoint;
+  std::string region;
+  std::string access_key;
+  std::string secret_key;
+  std::string session_token;
+  std::string bucket;
+  bool strict{false};
+};
+
+std::optional<s3_test_env> read_s3_test_env()
+{
+  auto endpoint   = env_or("SIRIUS_TEST_S3_ENDPOINT");
+  auto access_key = env_or("SIRIUS_TEST_S3_ACCESS_KEY");
+  auto secret_key = env_or("SIRIUS_TEST_S3_SECRET_KEY");
+  auto bucket     = env_or("SIRIUS_TEST_S3_BUCKET");
+
+  if (endpoint.empty() || access_key.empty() || secret_key.empty() || bucket.empty()) {
+    return std::nullopt;
+  }
+
+  return s3_test_env{std::move(endpoint),
+                     env_or("SIRIUS_TEST_S3_REGION", "us-east-1"),
+                     std::move(access_key),
+                     std::move(secret_key),
+                     env_or("SIRIUS_TEST_S3_SESSION_TOKEN"),
+                     std::move(bucket),
+                     truthy_env("SIRIUS_TEST_S3_STRICT")};
+}
+
+bool skip_if_no_s3_env(std::optional<s3_test_env> const& env)
+{
+  if (env) { return false; }
+  if (truthy_env("SIRIUS_TEST_S3_STRICT")) {
+    FAIL("SIRIUS_TEST_S3_* environment is required in strict mode");
+  }
+  SUCCEED("SIRIUS_TEST_S3_* not set; skipping duckdb-native S3 integration test");
+  return true;
+}
+
+std::string endpoint_authority(std::string const& endpoint)
+{
+  auto start = endpoint.find("://");
+  start      = start == std::string::npos ? 0 : start + 3;
+  auto end   = endpoint.find('/', start);
+  return endpoint.substr(start, end == std::string::npos ? std::string::npos : end - start);
+}
+
+std::string trim_trailing_slash(std::string endpoint)
+{
+  while (!endpoint.empty() && endpoint.back() == '/') {
+    endpoint.pop_back();
+  }
+  return endpoint;
+}
+
+std::string s3_uri(std::string_view bucket, std::string_view key)
+{
+  return "s3://" + std::string{bucket} + "/" + std::string{key};
+}
+
+std::string s3_uri_path(std::string_view bucket, std::string_view key)
+{
+  return "/" + sirius::io::s3::uri_encode(bucket, false) + "/" +
+         sirius::io::s3::uri_encode(key, false);
+}
+
+std::size_t curl_read_file(char* buffer, std::size_t size, std::size_t nitems, void* userdata)
+{
+  auto* file = static_cast<std::FILE*>(userdata);
+  if (file == nullptr) { return 0; }
+  return std::fread(buffer, 1, size * nitems, file);
+}
+
+void upload_file_to_s3(s3_test_env const& env, fs::path const& path, std::string_view key)
+{
+  auto* body = std::fopen(path.string().c_str(), "rb");
+  REQUIRE(body != nullptr);
+
+  auto const close_body = [&] { std::fclose(body); };
+  auto const body_len   = static_cast<std::int64_t>(fs::file_size(path));
+  auto const authority  = endpoint_authority(env.endpoint);
+  auto const uri        = s3_uri_path(env.bucket, key);
+
+  sirius::io::s3::sigv4_signer_config creds;
+  creds.access_key    = env.access_key;
+  creds.secret_key    = env.secret_key;
+  creds.region        = env.region;
+  creds.service       = "s3";
+  creds.session_token = env.session_token;
+
+  auto signed_req = sirius::io::s3::sign_request("PUT",
+                                                 authority,
+                                                 uri,
+                                                 /*canonical_query=*/"",
+                                                 "UNSIGNED-PAYLOAD",
+                                                 /*extra_headers=*/{},
+                                                 creds,
+                                                 std::time(nullptr));
+
+  REQUIRE(curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK);
+  CURL* curl = curl_easy_init();
+  REQUIRE(curl != nullptr);
+
+  curl_slist* headers = nullptr;
+  for (auto const& [name, value] : signed_req.headers) {
+    headers = curl_slist_append(headers, (name + ": " + value).c_str());
+  }
+  headers = curl_slist_append(headers, "Expect:");
+
+  auto const url = trim_trailing_slash(env.endpoint) + uri;
+  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+  curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
+  curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(body_len));
+  curl_easy_setopt(curl, CURLOPT_READFUNCTION, curl_read_file);
+  curl_easy_setopt(curl, CURLOPT_READDATA, body);
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+  long code   = -1;
+  CURLcode rc = curl_easy_perform(curl);
+  if (rc == CURLE_OK) { curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code); }
+
+  curl_slist_free_all(headers);
+  curl_easy_cleanup(curl);
+  close_body();
+
+  INFO("PUT " << url << " returned curl=" << static_cast<int>(rc) << " http=" << code);
+  REQUIRE(rc == CURLE_OK);
+  REQUIRE((code == 200 || code == 201 || code == 204));
+}
+
+sirius::io::s3::s3_ioctx_config make_s3_config(s3_test_env const& env)
+{
+  sirius::io::s3::static_credentials creds;
+  creds.access_key_id     = env.access_key;
+  creds.secret_access_key = env.secret_key;
+  creds.session_token     = env.session_token;
+
+  sirius::io::s3::s3_ioctx_config cfg{};
+  cfg.creds = std::make_shared<sirius::io::s3::sirius_sigv4_presigned_authorizer>(
+    std::move(creds), env.region, env.endpoint, 30min);
+  cfg.max_connections    = 8;
+  cfg.request_timeout_s  = 20;
+  cfg.max_retry_attempts = 3;
+  cfg.retry_backoff_base = 10ms;
+  cfg.retry_jitter       = 0ms;
+  cfg.honor_retry_after  = false;
+  return cfg;
+}
+
+std::unique_ptr<sirius_scan_manager> make_s3_scan_manager(s3_test_env const& env)
+{
+  scan_manager_config cfg{};
+  cfg.use_sirius_datasource             = true;
+  cfg.uring_n_reactors                  = 1;
+  cfg.s3_config                         = make_s3_config(env);
+  cfg.s3_use_async_backend              = true;
+  cfg.s3_thread_pool.num_threads        = 4;
+  cfg.s3_thread_pool.thread_name_prefix = "native_s3";
+  return std::make_unique<sirius_scan_manager>(std::move(cfg));
+}
+
+class uploaded_native_db_fixture {
+ public:
+  explicit uploaded_native_db_fixture(s3_test_env const& env)
+    : _dir(fs::temp_directory_path() /
+           ("sirius_native_s3_" + std::to_string(reinterpret_cast<std::uintptr_t>(this)))),
+      _local_path(_dir / "blocks.duckdb"),
+      _key("native/blocks-" + std::to_string(reinterpret_cast<std::uintptr_t>(this)) + ".duckdb"),
+      _uri(s3_uri(env.bucket, _key))
+  {
+    fs::remove_all(_dir);
+    fs::create_directories(_dir);
+
+    {
+      duckdb::DuckDB writer(_local_path.string());
+      duckdb::Connection con(writer);
+      exec_ok(con,
+              "CREATE TABLE native_blocks AS "
+              "SELECT i::BIGINT AS id, "
+              "       hash(i)::UBIGINT AS h0, "
+              "       hash(i * 1315423911)::UBIGINT AS h1, "
+              "       hash(i + 2654435761)::UBIGINT AS h2 "
+              "FROM range(0, 400000) tbl(i)");
+      exec_ok(con, "CHECKPOINT");
+    }
+
+    REQUIRE(fs::exists(_local_path));
+    REQUIRE(fs::file_size(_local_path) > 0);
+    upload_file_to_s3(env, _local_path, _key);
+
+    _db_owner = std::make_unique<duckdb::DuckDB>(_local_path.string());
+    _con      = std::make_unique<duckdb::Connection>(*_db_owner);
+    _storage  = &get_storage(*_con, "native_blocks");
+
+    auto& sm = _storage->GetAttached().GetStorageManager();
+    _blocks  = dynamic_cast<duckdb::SingleFileBlockManager*>(&sm.GetBlockManager());
+    REQUIRE(_blocks != nullptr);
+    REQUIRE(_blocks->TotalBlocks() >= 4);
+  }
+
+  ~uploaded_native_db_fixture()
+  {
+    std::error_code ec;
+    fs::remove_all(_dir, ec);
+  }
+
+  fs::path const& local_path() const noexcept { return _local_path; }
+  std::string const& uri() const noexcept { return _uri; }
+  duckdb::DataTable& storage() const noexcept { return *_storage; }
+  duckdb::Connection& connection() const noexcept { return *_con; }
+  duckdb::SingleFileBlockManager& block_manager() const noexcept { return *_blocks; }
+
+ private:
+  fs::path _dir;
+  fs::path _local_path;
+  std::string _key;
+  std::string _uri;
+  std::unique_ptr<duckdb::DuckDB> _db_owner;
+  std::unique_ptr<duckdb::Connection> _con;
+  duckdb::DataTable* _storage{nullptr};
+  duckdb::SingleFileBlockManager* _blocks{nullptr};
+};
+
+cudf::io::text::byte_range_info range(std::size_t offset, std::size_t size)
+{
+  return cudf::io::text::byte_range_info{static_cast<int64_t>(offset), static_cast<int64_t>(size)};
+}
+
+std::vector<std::uint8_t> read_local_range(fs::path const& path,
+                                           std::size_t offset,
+                                           std::size_t size)
+{
+  REQUIRE(offset + size <= fs::file_size(path));
+  std::vector<std::uint8_t> out(size);
+  std::ifstream in(path, std::ios::binary);
+  REQUIRE(in.good());
+  in.seekg(static_cast<std::streamoff>(offset));
+  in.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(out.size()));
+  REQUIRE(static_cast<std::size_t>(in.gcount()) == size);
+  return out;
+}
+
+std::vector<std::vector<std::uint8_t>> read_s3_ranges(
+  sirius::io::sirius_ioctx& ctx,
+  sirius::io::sirius_io_object& obj,
+  std::vector<cudf::io::text::byte_range_info> const& ranges)
+{
+  std::vector<std::vector<std::byte>> buffers;
+  buffers.reserve(ranges.size());
+  std::vector<cudf::host_span<std::byte>> spans;
+  spans.reserve(ranges.size());
+
+  std::size_t expected_total = 0;
+  for (auto const& r : ranges) {
+    REQUIRE(r.size() >= 0);
+    auto const size = static_cast<std::size_t>(r.size());
+    expected_total += size;
+    buffers.emplace_back(size);
+    spans.emplace_back(buffers.back().data(), buffers.back().size());
+  }
+
+  auto done   = std::make_shared<std::promise<std::pair<std::size_t, std::exception_ptr>>>();
+  auto future = done->get_future();
+  ctx.host_read_ranges_async_io(obj,
+                                ranges,
+                                std::span<cudf::host_span<std::byte>>{spans.data(), spans.size()},
+                                [done](std::size_t bytes, std::exception_ptr ep) mutable {
+                                  try {
+                                    done->set_value({bytes, ep});
+                                  } catch (std::future_error const&) {
+                                    // A backend bug that fires the completion twice should fail
+                                    // through the first observed result, not crash the test
+                                    // process.
+                                  }
+                                });
+
+  REQUIRE(future.wait_for(30s) == std::future_status::ready);
+  auto [bytes, ep] = future.get();
+  if (ep) { std::rethrow_exception(ep); }
+  REQUIRE(bytes == expected_total);
+
+  std::vector<std::vector<std::uint8_t>> out;
+  out.reserve(buffers.size());
+  for (auto const& buf : buffers) {
+    std::vector<std::uint8_t> bytes_out(buf.size());
+    std::transform(buf.begin(), buf.end(), bytes_out.begin(), [](std::byte b) {
+      return std::to_integer<std::uint8_t>(b);
+    });
+    out.push_back(std::move(bytes_out));
+  }
+  return out;
+}
+
+void require_s3_ranges_match_local(sirius::io::sirius_ioctx& ctx,
+                                   sirius::io::sirius_io_object& obj,
+                                   fs::path const& local_path,
+                                   std::vector<cudf::io::text::byte_range_info> const& ranges)
+{
+  auto got = read_s3_ranges(ctx, obj, ranges);
+  REQUIRE(got.size() == ranges.size());
+  for (std::size_t i = 0; i < ranges.size(); ++i) {
+    auto const offset = static_cast<std::size_t>(ranges[i].offset());
+    auto const size   = static_cast<std::size_t>(ranges[i].size());
+    CHECK(got[i] == read_local_range(local_path, offset, size));
+  }
+}
+
+std::vector<cudf::io::text::byte_range_info> duckdb_header_ranges()
+{
+  auto const header = static_cast<std::size_t>(duckdb::Storage::FILE_HEADER_SIZE);
+  REQUIRE(sirius::op::scan::DUCKDB_BLOCK_START == 3 * header);
+  return {range(0, header), range(header, header), range(2 * header, header)};
+}
+
+std::vector<cudf::io::text::byte_range_info> duckdb_payload_ranges(
+  duckdb::SingleFileBlockManager& bm, std::size_t file_size)
+{
+  std::vector<cudf::io::text::byte_range_info> ranges;
+  auto const block_size   = static_cast<std::size_t>(bm.GetBlockSize());
+  auto const total_blocks = bm.TotalBlocks();
+  for (duckdb::idx_t block = 0; block < total_blocks; ++block) {
+    auto const offset =
+      sirius::op::scan::duckdb_block_payload_offset(bm, static_cast<duckdb::block_id_t>(block));
+    if (offset + block_size <= file_size) { ranges.push_back(range(offset, block_size)); }
+  }
+  return ranges;
+}
+
+std::vector<cudf::io::text::byte_range_info> small_interleaved_ranges(std::size_t file_size)
+{
+  REQUIRE(file_size > 4096);
+  std::vector<cudf::io::text::byte_range_info> ranges;
+  ranges.reserve(36);
+  for (std::size_t i = 0; i < 36; ++i) {
+    auto const size   = (i == 0) ? std::size_t{1} : std::size_t{1 + ((i * 17) % 97)};
+    auto const stride = (i % 2 == 0) ? 9973 : 4099;
+    auto const offset = (i * stride) % (file_size - size);
+    ranges.push_back(range(offset, size));
+  }
+  return ranges;
+}
+
 }  // namespace
 
 //===----------------------------------------------------------------------===//
@@ -244,6 +622,83 @@ TEST_CASE("duckdb_native_gpu_ingestible leaves io handles null for an empty db_p
   auto const& payload = payload_of(*batches[0]);
   REQUIRE(payload.io_ctx == nullptr);
   REQUIRE(payload.db_io_object == nullptr);
+}
+
+TEST_CASE("S3 ioctx serves DuckDB-native block range shapes byte-identically",
+          "[.][s3][integration][duckdbnative]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  uploaded_native_db_fixture fixture{*env};
+  auto mgr = make_s3_scan_manager(*env);
+  auto ds  = mgr->create_datasource(fixture.uri());
+  REQUIRE(ds != nullptr);
+  REQUIRE(ds->io_ctx() != nullptr);
+  REQUIRE(ds->io_object() != nullptr);
+  CHECK(dynamic_cast<sirius::io::s3::s3_ioctx*>(ds->io_ctx().get()) != nullptr);
+  auto const object_size = static_cast<std::size_t>(fs::file_size(fixture.local_path()));
+  CHECK(ds->io_object()->size() == object_size);
+
+  auto& ctx = *ds->io_ctx();
+  auto& obj = *ds->io_object();
+
+  require_s3_ranges_match_local(ctx, obj, fixture.local_path(), duckdb_header_ranges());
+
+  auto payload_ranges = duckdb_payload_ranges(fixture.block_manager(), object_size);
+  REQUIRE(payload_ranges.size() >= 4);
+  require_s3_ranges_match_local(ctx, obj, fixture.local_path(), payload_ranges);
+
+  require_s3_ranges_match_local(ctx, obj, fixture.local_path(), {range(0, object_size)});
+
+  auto tiny_ranges = small_interleaved_ranges(object_size);
+  REQUIRE(tiny_ranges.size() >= 32);
+  require_s3_ranges_match_local(ctx, obj, fixture.local_path(), tiny_ranges);
+
+  sirius_scan_manager no_s3_mgr{scan_manager_config{}};
+  CHECK(no_s3_mgr.create_datasource(fixture.uri()) == nullptr);
+}
+
+TEST_CASE("duckdb_native_gpu_ingestible carries S3 handles for remote DuckDB-native db_path",
+          "[.][s3][integration][duckdbnative]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  uploaded_native_db_fixture fixture{*env};
+
+  auto s3_mgr  = make_s3_scan_manager(*env);
+  auto s3_info = make_table_info(&fixture.storage(),
+                                 fixture.connection().context.get(),
+                                 {real_col(0)},
+                                 {sirius::logical_type::make(sirius::type_id::BIGINT)},
+                                 sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE,
+                                 fixture.uri());
+  duckdb_native_gpu_ingestible s3_ingestible{std::move(s3_info), *s3_mgr};
+
+  auto s3_batches = run_and_consume(s3_ingestible);
+  REQUIRE_FALSE(s3_batches.empty());
+  auto const& s3_payload = payload_of(*s3_batches[0]);
+  REQUIRE(s3_payload.io_ctx != nullptr);
+  REQUIRE(s3_payload.db_io_object != nullptr);
+  CHECK(dynamic_cast<sirius::io::s3::s3_ioctx*>(s3_payload.io_ctx.get()) != nullptr);
+  CHECK(s3_payload.db_io_object->size() ==
+        static_cast<std::size_t>(fs::file_size(fixture.local_path())));
+
+  auto no_s3_mgr  = make_scan_manager();
+  auto no_s3_info = make_table_info(&fixture.storage(),
+                                    fixture.connection().context.get(),
+                                    {real_col(0)},
+                                    {sirius::logical_type::make(sirius::type_id::BIGINT)},
+                                    sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE,
+                                    fixture.uri());
+  duckdb_native_gpu_ingestible no_s3_ingestible{std::move(no_s3_info), *no_s3_mgr};
+
+  auto no_s3_batches = run_and_consume(no_s3_ingestible);
+  REQUIRE_FALSE(no_s3_batches.empty());
+  auto const& no_s3_payload = payload_of(*no_s3_batches[0]);
+  REQUIRE(no_s3_payload.io_ctx == nullptr);
+  REQUIRE(no_s3_payload.db_io_object == nullptr);
 }
 
 TEST_CASE("duckdb_native_gpu_ingestible throws when walker rejects the table",
