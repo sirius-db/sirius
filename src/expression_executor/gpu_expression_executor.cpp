@@ -191,6 +191,19 @@ gpu_expression_executor::gpu_expression_executor(sirius::ast::node const* expres
   _ast_expressions.push_back(expression);
 }
 
+gpu_expression_executor::gpu_expression_executor(std::vector<sirius::ast::node const*> expressions,
+                                                 rmm::device_async_resource_ref resource_ref,
+                                                 rmm::cuda_stream_view stream,
+                                                 expression_executor_strategy strategy,
+                                                 std::size_t min_ast_size)
+  : _ast_expressions(std::move(expressions)),
+    _strategy(strategy),
+    _mr(resource_ref),
+    _stream(stream),
+    _min_ast_size(min_ast_size)
+{
+}
+
 std::unique_ptr<cudf::column> gpu_expression_executor::execute_ast(expr_ref root_expr)
 {
   std::vector<cudf::column_view> combined_column_views;
