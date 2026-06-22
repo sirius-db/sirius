@@ -97,7 +97,10 @@ std::optional<bench_env> read_bench_env()
                      std::move(key)};
   }
 
-  auto endpoint   = env_or("SIRIUS_BENCH_S3_ENDPOINT", env_or("SIRIUS_TEST_S3_ENDPOINT"));
+  bool const use_tls = !env_or("SIRIUS_BENCH_S3_USE_TLS").empty();
+  auto endpoint =
+    env_or("SIRIUS_BENCH_S3_ENDPOINT",
+           use_tls ? env_or("SIRIUS_TEST_S3_HTTPS_ENDPOINT") : env_or("SIRIUS_TEST_S3_ENDPOINT"));
   auto access_key = env_or("SIRIUS_BENCH_S3_ACCESS_KEY", env_or("SIRIUS_TEST_S3_ACCESS_KEY"));
   auto secret_key = env_or("SIRIUS_BENCH_S3_SECRET_KEY", env_or("SIRIUS_TEST_S3_SECRET_KEY"));
   auto bucket     = env_or("SIRIUS_BENCH_S3_BUCKET", env_or("SIRIUS_TEST_S3_BUCKET"));
@@ -167,10 +170,11 @@ std::shared_ptr<s3_ioctx> make_async_bench_ioctx(
   bool enable_perf_instrumentation)
 {
   s3_ioctx_config cfg{};
-  cfg.creds                   = std::move(provider);
-  cfg.max_connections         = kBenchMaxConnections;
-  cfg.request_timeout_s       = 600;
-  cfg.host_memory_resource    = &memory.host_mr;
+  cfg.creds                = std::move(provider);
+  cfg.max_connections      = kBenchMaxConnections;
+  cfg.request_timeout_s    = 600;
+  cfg.host_memory_resource = &memory.host_mr;
+  cfg.ca_bundle_path = env_or("SIRIUS_BENCH_S3_CA_BUNDLE", env_or("SIRIUS_TEST_S3_CA_BUNDLE"));
   cfg.s3_perf_instrumentation = enable_perf_instrumentation;
   return std::make_shared<s3_ioctx>(std::move(cfg));
 }
