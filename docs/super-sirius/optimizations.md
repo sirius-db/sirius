@@ -94,7 +94,7 @@ Only applies to INNER and LEFT joins with pure equality conditions (excludes IS 
 
 **Config:** `max_build_hash_table_bytes` (default: 500 MB) — now independent from `concat_batch_bytes`, enabling larger build sides in BUILD_PROBE mode without affecting other joins.
 
-### Zero-Copy Projection Passthrough (PR #TBD)
+### Zero-Copy Projection Passthrough (PR #991)
 
 **Motivation:** A projection that simply re-references input columns (`SELECT a, c, a`) previously deep-copied every output column on device via the expression executor's BOUND_REF path, even though the data already lived on the GPU.
 
