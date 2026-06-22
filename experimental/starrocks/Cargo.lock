@@ -1466,6 +1466,7 @@ version = "1.0.150"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8014e44b4736ed0538adeecded0fce2a272f22dc9578a7eb6b2d9993c74cfb9"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",
@@ -1631,11 +1632,12 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "substrait"
-version = "0.62.2"
+version = "0.63.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62fc4b483a129b9772ccb9c3f7945a472112fdd9140da87f8a4e7f1d44e045d0"
+checksum = "e620ff4d5c02fd6f7752931aa74b16a26af66a63022cc1ad412c77edbe0bab47"
 dependencies = [
  "heck",
+ "indexmap",
  "pbjson",
  "pbjson-build",
  "pbjson-types",
@@ -1656,9 +1658,9 @@ dependencies = [
 
 [[package]]
 name = "substrait-explain"
-version = "0.3.2"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81d7142175ce4b44cef2ab41276828d5ab4945eb23fc6f7a43663f276afc27c3"
+checksum = "4dc29cf7805f02d51903093a9a73bef692fc195061b02decea1af74dfb3d99b1"
 dependencies = [
  "anyhow",
  "chrono",
