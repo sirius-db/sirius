@@ -296,9 +296,11 @@ TEST_CASE("sirius_physical_projection passthrough output outlives input batch ha
   auto out_batch =
     dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().at(0);
 
-  // Drop every external handle to the input batch; only the output owner's read-only lock remains.
+  // Drop every external handle to the input batch and sync the stream before validating; only the
+  // output owner's read-only lock keeps the data alive.
   inputs.clear();
   input_batch.reset();
+  REQUIRE(cudaStreamSynchronize(cudf::get_default_stream().value()) == cudaSuccess);
 
   auto out_view = sirius::get_cudf_table_view(*out_batch);
   REQUIRE(out_view.num_columns() == 2);

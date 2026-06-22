@@ -20,16 +20,15 @@
 #include "data/data_batch_utils.hpp"
 #include "expression/ast/reference.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
-#include "log/logging.hpp"
 
-#include <cuda_runtime.h>
+#include <cudf/types.hpp>
+
 #include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <duckdb/common/exception.hpp>
 
-#include <cstdint>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -46,7 +45,7 @@ enum class projection_source { passthrough, evaluated };
 /// evaluated expression (index = position within the evaluated output table).
 struct projection_column_plan {
   projection_source kind;
-  std::uint32_t index;
+  cudf::size_type index;
 };
 
 }  // namespace
@@ -66,8 +65,7 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_projection::execute"};
   auto& input = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  // Bind to a non-const local (default get_read_only_batches() returns a fresh, uncached vector):
-  // we move each read_only lock into the owner of any zero-copy output batch we produce.
+  // Mutable local: we move each read-only lock out of this vector into an output batch's owner.
   auto input_batches = input.get_read_only_batches();
 
   // Classify select_list once (batch-independent): pure BOUND_REF entries (sirius::ast::reference)
@@ -80,10 +78,11 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
   for (auto const& expr : select_list) {
     if (expr->holds<sirius::ast::reference>()) {
       column_plan.push_back(
-        {projection_source::passthrough, expr->get<sirius::ast::reference>().column_index});
+        {projection_source::passthrough,
+         static_cast<cudf::size_type>(expr->get<sirius::ast::reference>().column_index)});
     } else {
       column_plan.push_back(
-        {projection_source::evaluated, static_cast<std::uint32_t>(evaluated_exprs.size())});
+        {projection_source::evaluated, static_cast<cudf::size_type>(evaluated_exprs.size())});
       evaluated_exprs.push_back(expr.get());
     }
   }
@@ -105,7 +104,7 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
 
   for (auto& input_ro : input_batches) {
     auto input_view = sirius::get_cudf_table_view(input_ro);
-    auto& mem       = *input_ro.get_memory_space();  // owned by the manager; valid after the move
+    auto& mem = *input_ro.get_memory_space();  // owned by the memory manager (outlives input_ro)
 
     // ---- Path 1: every output column is an evaluated expression ----
     if (all_evaluated) {
