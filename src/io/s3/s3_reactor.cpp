@@ -38,7 +38,10 @@ namespace {
 
 using namespace std::chrono_literals;
 
-// Perf-instrumentation helpers (worker-thread only; single-writer atomics).
+// Perf-instrumentation helpers. The max/set-once updates are written only by the
+// reactor worker thread today, but use real atomic RMWs (relaxed) so they are
+// correct regardless of writer count and match the `atomic_*` naming. `fetch_max`
+// is C++26; this project is C++20, so a compare_exchange loop implements the max.
 inline std::uint64_t ns_between(std::chrono::steady_clock::time_point a,
                                 std::chrono::steady_clock::time_point b) noexcept
 {
@@ -47,7 +50,8 @@ inline std::uint64_t ns_between(std::chrono::steady_clock::time_point a,
 }
 inline void atomic_max_relaxed(std::atomic<std::uint64_t>& a, std::uint64_t v) noexcept
 {
-  if (v > a.load(std::memory_order_relaxed)) a.store(v, std::memory_order_relaxed);
+  auto cur = a.load(std::memory_order_relaxed);
+  while (v > cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {}
 }
 
 struct curl_global_init_once {
@@ -639,10 +643,10 @@ void s3_reactor::submit_pending()
     try {
       build_and_add(t);  // may throw (authorize / init / add_handle) — never escapes the worker
       if (t->is_device) {
-        // single-writer (worker thread): track the high-water mark of held blocks
-        auto n = static_cast<std::uint64_t>(device_blocks_in_flight());
-        if (n > _device_peak_inflight.load(std::memory_order_relaxed))
-          _device_peak_inflight.store(n, std::memory_order_relaxed);
+        // Track the high-water mark of held blocks (atomic max, same helper as the
+        // perf counters).
+        atomic_max_relaxed(_device_peak_inflight,
+                           static_cast<std::uint64_t>(device_blocks_in_flight()));
         if (_cfg.s3_perf_instrumentation) {
           auto const now = std::chrono::steady_clock::now();
           t->t_submit    = now;  // GET submit; chunk_get is measured to completion
@@ -738,8 +742,12 @@ void s3_reactor::start_device_copy(transfer* t)
     _chunk_get_ns_total.fetch_add(get_ns, std::memory_order_relaxed);
     _chunk_get_ns_count.fetch_add(1, std::memory_order_relaxed);
     atomic_max_relaxed(_chunk_get_ns_max, get_ns);
+    // Atomic set-once: the relaxed load is a fast-path guard so only the first
+    // chunk runs the CAS; the compare_exchange_strong from 0 is the atomic gate.
     if (_ttfb_first_submit_set && _ttfb_ns.load(std::memory_order_relaxed) == 0) {
-      _ttfb_ns.store(ns_between(_ttfb_first_submit, now), std::memory_order_relaxed);
+      auto expected = std::uint64_t{0};
+      _ttfb_ns.compare_exchange_strong(
+        expected, ns_between(_ttfb_first_submit, now), std::memory_order_relaxed);
     }
     t->t_h2d_start = now;  // H2D issue point (memcpy below)
   }
