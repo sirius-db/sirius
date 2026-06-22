@@ -25,6 +25,48 @@ pixi run bash generate_tpch_data.sh 100
 pixi run bash generate_tpch_data.sh 100 /data/tpch_sf100 16
 ```
 
+### Clustered (sorted) DuckDB datasets for zone-map pruning
+
+`--cluster` (duckdb format only) physically sorts tables at load so each row group's
+per-column min/max becomes selective. This is what makes Sirius's native-scan row-group
+pruning (`mark_row_groups_pruned_by_filter_stats`) actually skip work on date-filtered
+queries — on an unsorted dbgen dataset every row group spans the full date range and
+nothing prunes. It writes a fresh, compact `tpch_sf<SF>_sorted.duckdb` (dbgen → staging →
+sorted copy, so there is no dead-block bloat).
+
+```bash
+# Sort lineitem by l_shipdate and orders by o_orderdate (defaults)
+pixi run bash generate_tpch_data.sh 10 --format duckdb --cluster
+# → test_datasets/tpch_sf10_sorted.duckdb
+
+# Override the sort keys (implies --cluster); "table:col,table:col,..."
+pixi run bash generate_tpch_data.sh 10 --format duckdb \
+    --cluster-keys "lineitem:l_shipdate,orders:o_orderdate"
+```
+
+Benchmark it through the unchanged native runner and validate against DuckDB CPU:
+
+```bash
+export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
+./test/tpch_performance/benchmark_and_validate.sh \
+    --data-source duckdb --duckdb-file ./test_datasets/tpch_sf10_sorted.duckdb 10
+```
+
+Confirm pruning fired (looking for `stats-pruned N row groups` / a reduced `decoded split`):
+
+```bash
+SIRIUS_NATIVE_SCAN_VERIFY=1 OUTPUT_DIR=/tmp/cluster_verify \
+  ./test/tpch_performance/run_tpch_duckdb.sh \
+    --duckdb-file ./test_datasets/tpch_sf10_sorted.duckdb sirius 10 1 6
+grep -oE 'stats-pruned [0-9]+ row groups' /tmp/cluster_verify/sirius_*.log
+```
+
+> **Why duckdb-only.** Sorting works for parquet too in principle, but the default
+> tpchgen-rs (Arrow) writes `DECIMAL` as `FIXED_LEN_BYTE_ARRAY`, which trips Sirius's
+> `skip_pushdown_due_to_flba` and disables row-group pruning for the *whole* parquet file —
+> so a sorted parquet wouldn't prune. The duckdb path stores decimals as `INT64` and prunes
+> correctly. `--cluster` therefore errors if combined with `--format parquet`.
+
 ### From DuckDB's built-in TPC-H generator
 
 ```bash
