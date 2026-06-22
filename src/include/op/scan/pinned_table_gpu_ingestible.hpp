@@ -24,7 +24,7 @@
 #include <cudf/column/column.hpp>
 
 // cucascade
-#include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
