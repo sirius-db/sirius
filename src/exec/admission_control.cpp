@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
-#include "io/admission_control.hpp"
+#include <exec/admission_control.hpp>
 
-namespace sirius::io {
+namespace sirius::exec {
 
 admission_control::admission_control(size_t budget) noexcept : _budget(budget) {}
 
@@ -54,7 +54,16 @@ void admission_control::release(size_t reserved) noexcept
     _in_use -= reserved;
     --_active_slots;
   }
+  // notify_all (rather than notify_one) is required: both acquire() waiters
+  // and wait_for_idle() waiters park on this same _cv, and only the latter
+  // care that _active_slots dropped to zero.
   _cv.notify_all();
+}
+
+void admission_control::wait_for_idle()
+{
+  std::unique_lock lk(_mtx);
+  _cv.wait(lk, [&] { return _active_slots == 0; });
 }
 
 admission_control::slot::~slot()
@@ -80,4 +89,4 @@ admission_control::slot& admission_control::slot::operator=(slot&& o) noexcept
   return *this;
 }
 
-}  // namespace sirius::io
+}  // namespace sirius::exec
