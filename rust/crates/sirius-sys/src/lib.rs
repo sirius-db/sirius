@@ -11,6 +11,10 @@
 //! (cudf/rmm/duckdb). It is the seed of the public API `libsirius` will expose;
 //! the bindings link whichever Sirius artifact provides these symbols (the DuckDB
 //! extension today, a dedicated `libsirius` later — see `build.rs`).
+//!
+//! The `make_context*` functions are bound as fallible (`Result`): bringing up
+//! the engine (or parsing a config file) can throw, and cxx turns a C++ exception
+//! into `Err(cxx::Exception)` instead of aborting, so consumers can fail fast.
 
 #[cxx::bridge(namespace = "sirius::ffi")]
 mod ffi {
@@ -20,9 +24,15 @@ mod ffi {
         /// RAII handle to an initialized Sirius engine context.
         type Context;
 
-        /// Construct an initialized [`Context`], owned by the returned `UniquePtr`.
-        fn make_context() -> UniquePtr<Context>;
+        /// Construct an initialized [`Context`] from built-in defaults, owned by
+        /// the returned `UniquePtr`.
+        fn make_context() -> Result<UniquePtr<Context>>;
+
+        /// Construct an initialized [`Context`] from the YAML config file at
+        /// `config_path`, owned by the returned `UniquePtr`. `config_path` binds
+        /// to the C++ `const std::string&` parameter.
+        fn make_context_from_config(config_path: &CxxString) -> Result<UniquePtr<Context>>;
     }
 }
 
-pub use ffi::{Context, make_context};
+pub use ffi::{Context, make_context, make_context_from_config};

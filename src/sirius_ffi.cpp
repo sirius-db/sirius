@@ -32,10 +32,23 @@ Context::Context() : context_(std::make_unique<duckdb::SiriusContext>())
   context_->initialize(config);
 }
 
+Context::Context(const std::string& config_path)
+  : context_(std::make_unique<duckdb::SiriusContext>())
+{
+  sirius::sirius_config config;
+  config.load_from_file(config_path);  // throws on a missing/invalid config file
+  context_->initialize(config);
+}
+
 // Defined here, where duckdb::SiriusContext is complete: destroying `context_`
 // runs ~SiriusContext (which tears down the initialized engine).
 Context::~Context() = default;
 
 std::unique_ptr<Context> make_context() { return std::make_unique<Context>(); }
+
+std::unique_ptr<Context> make_context_from_config(const std::string& config_path)
+{
+  return std::make_unique<Context>(config_path);
+}
 
 }  // namespace sirius::ffi
