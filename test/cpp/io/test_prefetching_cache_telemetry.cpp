@@ -6,8 +6,8 @@
  */
 
 #include "catch.hpp"
+#include "io/cache/prefetching_cache.hpp"
 #include "io/io_context.hpp"
-#include "io/prefetching_cache.hpp"
 
 #include <cudf/io/text/byte_range_info.hpp>
 #include <cudf/utilities/span.hpp>
