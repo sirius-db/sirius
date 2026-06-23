@@ -23,6 +23,7 @@
 
 // standard library
 #include <memory>
+#include <mutex>
 #include <optional>
 
 namespace sirius::scan_manager {
@@ -158,6 +159,9 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   std::unique_ptr<io::ingestible_table_info> _table_info;
   std::shared_ptr<io::gpu_ingestible> _ingestible;
   std::unique_ptr<scan_manager::split_connector> _split_connector;
+  // Serializes split-pull and pre_assigned_batch_id assignment so that batch IDs
+  // reflect split-pull order (scan order) rather than task-completion order.
+  std::mutex _scan_order_mutex_;
 };
 
 }  // namespace sirius::op::scan

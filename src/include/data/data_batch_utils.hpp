@@ -114,6 +114,33 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
   return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(gpu_repr));
 }
 
+/// Overload that uses a caller-supplied @p batch_id instead of allocating a fresh one.
+/// Used by sirius_gpu_scan_operator::execute() to propagate the ID pre-assigned in
+/// get_next_task_input_data() (under the scan-order mutex) so that output batch IDs
+/// reflect split-pull order rather than task-completion order.
+inline std::shared_ptr<cucascade::data_batch> make_data_batch(
+  cudf::table&& table,
+  cucascade::memory::memory_space& memory_space,
+  rmm::cuda_stream_view writer_stream,
+  uint64_t batch_id)
+{
+  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
+    std::make_unique<cudf::table>(std::move(table)), memory_space, writer_stream);
+  return std::make_shared<cucascade::data_batch>(batch_id, std::move(gpu_repr));
+}
+
+/// @copydoc make_data_batch(cudf::table&&, memory_space&, rmm::cuda_stream_view, uint64_t)
+inline std::shared_ptr<cucascade::data_batch> make_data_batch(
+  std::unique_ptr<cudf::table> table,
+  cucascade::memory::memory_space& memory_space,
+  rmm::cuda_stream_view writer_stream,
+  uint64_t batch_id)
+{
+  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
+    std::move(table), memory_space, writer_stream);
+  return std::make_shared<cucascade::data_batch>(batch_id, std::move(gpu_repr));
+}
+
 /**
  * @brief Create a shared_ptr<data_batch> from a unique_ptr<cudf::table>, recording the writer
  * event.

@@ -441,7 +441,8 @@ void duckdb_scan_task_local_state::initialize_local_table_function_state(
   }
 }
 
-std::shared_ptr<cucascade::data_batch> duckdb_scan_task_local_state::make_data_batch()
+std::shared_ptr<cucascade::data_batch> duckdb_scan_task_local_state::make_data_batch(
+  std::optional<uint64_t> batch_id)
 {
   using data_batch               = cucascade::data_batch;
   using host_table_allocation    = cucascade::memory::host_table_allocation;
@@ -463,8 +464,8 @@ std::shared_ptr<cucascade::data_batch> duckdb_scan_task_local_state::make_data_b
   // Make the host table representation
   auto table = std::make_unique<host_data_representation>(std::move(table_allocation), _host_space);
 
-  // Create the data batch and return
-  return std::make_shared<data_batch>(get_next_batch_id(), std::move(table));
+  // Use the pre-assigned ID if provided, otherwise allocate a fresh one.
+  return std::make_shared<data_batch>(batch_id.value_or(get_next_batch_id()), std::move(table));
 }
 
 //===----------------------------------------------------------------------===//
@@ -582,6 +583,14 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
     if (STANDARD_VECTOR_SIZE + l_state._row_offset >= l_state._estimated_rows_per_batch) { break; }
   }
 
+  // Pre-assign this task's batch ID BEFORE scheduling the successor task.
+  // Without this, a concurrent successor task could race to call get_next_batch_id() first
+  // and receive a lower ID than this task's batch, breaking scan order in batch IDs.
+  // Holding a lower ID here guarantees: batch_id(task N) < batch_id(task N+1) for any N,
+  // which the first() aggregate merge uses to select the earliest-scanned value.
+  auto const this_batch_id =
+    l_state._row_offset > 0 ? std::make_optional(get_next_batch_id()) : std::nullopt;
+
   // Add tasks back to the queue if the local scan state is not finished
   if (!l_state._local_state_drained) {
     // Create a new local state, passing the existing local_tf_state to continue the scan
@@ -605,7 +614,7 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
   // Make data batch and push to repository
   if (l_state._row_offset > 0) {
     return std::make_unique<op::pipelineable_operator_data>(
-      std::vector<std::shared_ptr<cucascade::data_batch>>{l_state.make_data_batch()});
+      std::vector<std::shared_ptr<cucascade::data_batch>>{l_state.make_data_batch(this_batch_id)});
   }
 
   return std::make_unique<op::pipelineable_operator_data>(

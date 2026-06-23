@@ -93,6 +93,12 @@ class operator_data {
    */
   [[nodiscard]] virtual operator_data_type get_type() const { return operator_data_type::BASE; }
 
+  // Batch ID pre-assigned by sirius_gpu_scan_operator::get_next_task_input_data() while
+  // holding the scan-order mutex, so that assignment order matches split-pull order.
+  // execute() uses this as the output data_batch's ID instead of calling get_next_batch_id()
+  // at completion time, which would be non-deterministic under concurrent execution.
+  uint64_t pre_assigned_batch_id = 0;
+
   /**
    * @brief Whether this operator_data refers to GPU-resident data already paid
    *        for upstream (e.g. a pinned-cache batch). Defaults to false.

@@ -4642,6 +4642,35 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 }
 
 //===----------------------------------------------------------------------===//
+// first() ungrouped aggregate tests
+//
+// first() uses NTH_ELEMENT(0) in the merge phase. Before the batch-ordering
+// fix, results were non-deterministic when the table spanned multiple scan
+// batches.
+//
+// Note: compare_gpu_vs_cpu() is only reliable for first() on tables small
+// enough to fit in a single scan batch. For multi-batch tables (e.g. lineitem
+// parquet), Sirius and DuckDB may read row groups in different physical orders,
+// so they legitimately disagree on which row is "first" — this is not a bug.
+// Multi-batch ordering correctness is covered by the C++ unit test
+// [merge_ungrouped_agg][first] in test_gpu_merge_impl.cpp.
+//===----------------------------------------------------------------------===//
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - first() integer on nation",
+                 "[integration][gpu_execution][cpu_source][first]")
+{
+  compare_gpu_vs_cpu("select first(n_nationkey) from nation;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - first() varchar on nation",
+                 "[integration][gpu_execution][cpu_source][first]")
+{
+  compare_gpu_vs_cpu("select first(n_name) from nation;");
+}
+
+//===----------------------------------------------------------------------===//
 // pin_table tests
 //===----------------------------------------------------------------------===//
 

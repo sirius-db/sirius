@@ -45,6 +45,7 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 
+#include <algorithm>
 #include <limits>
 #include <optional>
 
@@ -384,10 +385,25 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
       std::make_unique<cucascade::gpu_table_representation>(std::move(out_table), *space, stream);
     std::unique_ptr<cucascade::idata_representation> output_data = std::move(out_repr);
     auto const batch_id                                          = ::sirius::get_next_batch_id();
+
+    // Record output_batch_id -> source (scan) batch_id so the merge operator can restore
+    // scan order when selecting NTH_ELEMENT(0) for first() aggregates.
+    {
+      std::lock_guard<std::mutex> lg(source_id_mutex_);
+      output_to_source_id_[batch_id] = batch.get_batch_id();
+    }
+
     outputs.push_back(std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data)));
   }
 
   return std::make_unique<pipelineable_operator_data>(outputs);
+}
+
+uint64_t sirius_physical_ungrouped_aggregate::get_source_batch_id(uint64_t output_batch_id) const
+{
+  std::lock_guard<std::mutex> lg(source_id_mutex_);
+  auto it = output_to_source_id_.find(output_batch_id);
+  return (it != output_to_source_id_.end()) ? it->second : output_batch_id;
 }
 
 // Helper to deep copy the aggregate AST expressions (used by the merge overload below).
@@ -452,6 +468,31 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   }
 
   auto layout = build_aggregate_layout(aggregates);
+
+  // For NTH_ELEMENT (first()) aggregates, sort partial results by their source scan
+  // batch ID so that NTH_ELEMENT(0) always selects the value from the earliest-scanned
+  // batch, matching DuckDB's first() semantics. Without this, concurrent pipeline tasks
+  // push results in non-deterministic completion order and first() may return a value
+  // from any batch.
+  if (input_batches.size() > 1) {
+    bool has_nth_element = std::any_of(
+      layout.merge_kinds.begin(), layout.merge_kinds.end(), [](cudf::aggregation::Kind k) {
+        return k == cudf::aggregation::Kind::NTH_ELEMENT;
+      });
+    if (has_nth_element) {
+      auto* local_agg = dynamic_cast<sirius_physical_ungrouped_aggregate*>(child_op);
+      if (local_agg) {
+        std::stable_sort(input_batches.begin(),
+                         input_batches.end(),
+                         [&local_agg](const cucascade::read_only_data_batch& a,
+                                      const cucascade::read_only_data_batch& b) {
+                           return local_agg->get_source_batch_id(a.get_batch_id()) <
+                                  local_agg->get_source_batch_id(b.get_batch_id());
+                         });
+      }
+    }
+  }
+
   std::shared_ptr<cucascade::data_batch> merged_batch;
   if (input_batches.size() == 1) {
     merged_batch = cucascade::data_batch::to_idle(std::move(input_batches[0]));

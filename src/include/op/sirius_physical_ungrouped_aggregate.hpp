@@ -24,7 +24,10 @@
 #include "expression/ast/node.hpp"
 #include "op/sirius_physical_operator.hpp"
 
+#include <cstdint>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 
 namespace sirius {
 namespace op {
@@ -46,10 +49,21 @@ class sirius_physical_ungrouped_aggregate : public sirius_physical_operator {
 
   bool is_source() const override { return true; }
 
+  // Returns the source (scan) batch ID that produced the local aggregate output with
+  // `output_batch_id`. Used by the merge operator to sort partial results in scan order
+  // before selecting NTH_ELEMENT(0) for the first() aggregate.
+  uint64_t get_source_batch_id(uint64_t output_batch_id) const;
+
  public:
   bool is_sink() const override { return true; }
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
+
+ private:
+  // Maps output_batch_id -> source (scan) batch_id.  Populated by execute() and
+  // read by sirius_physical_ungrouped_aggregate_merge to restore scan order.
+  mutable std::mutex source_id_mutex_;
+  std::unordered_map<uint64_t, uint64_t> output_to_source_id_;
 };
 
 }  // namespace op

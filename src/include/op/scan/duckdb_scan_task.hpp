@@ -50,6 +50,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 
 namespace sirius::op::scan {
 //===----------------------------------------------------------------------===//
@@ -317,9 +318,13 @@ class duckdb_scan_task_local_state : public sirius::pipeline::sirius_pipeline_ta
   /**
    * @brief Creates a data batch from the current state of the column builders.
    *
+   * @param batch_id Pre-assigned batch ID to use. If omitted, a new ID is allocated via
+   *                 get_next_batch_id(). Pass a pre-assigned ID (obtained before scheduling the
+   *                 successor task) to guarantee that this batch's ID is lower than any batch
+   *                 the successor task could produce, preserving scan order in batch IDs.
    * @return A shared pointer to the created data batch.
    */
-  std::shared_ptr<data_batch> make_data_batch();
+  std::shared_ptr<data_batch> make_data_batch(std::optional<uint64_t> batch_id = std::nullopt);
 
  private:
   //===----------Fields----------===//

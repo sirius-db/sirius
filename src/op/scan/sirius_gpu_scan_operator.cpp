@@ -124,11 +124,24 @@ bool sirius_gpu_scan_operator::all_ports_empty()
 
 std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input_data()
 {
-  // Delegate to the ingestible. The unprepared path pulls directly from the connector.
-  if (_ingestible) { return _ingestible->consume_next_input(*_split_connector); }
-  auto next = _split_connector->get_next_split();
-  if (!next.has_value()) { return nullptr; }
-  return std::move(*next);
+  // Hold the scan-order mutex for the entire pull + batch-ID assignment so that
+  // pre_assigned_batch_id values reflect split-pull order (scan order).
+  // Without this, concurrent callers could race: thread A pulls split 0 then
+  // thread B pulls split 1, but B calls get_next_batch_id() first, giving split 0
+  // a higher ID than split 1 and breaking the ordering that first() relies on.
+  std::lock_guard<std::mutex> lg(_scan_order_mutex_);
+
+  std::unique_ptr<op::operator_data> input;
+  if (_ingestible) {
+    input = _ingestible->consume_next_input(*_split_connector);
+  } else {
+    auto next = _split_connector->get_next_split();
+    if (!next.has_value()) { return nullptr; }
+    input = std::move(*next);
+  }
+
+  if (input) { input->pre_assigned_batch_id = get_next_batch_id(); }
+  return input;
 }
 
 //===----------------------------------------------------------------------===//
@@ -224,7 +237,11 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
       "scan_operator_input or scan_operator_with_pinned_table_input.");
   }
 
-  auto batch = sirius::make_data_batch(std::move(table), *mem_space, stream);
+  // Use the batch ID pre-assigned in get_next_task_input_data() rather than calling
+  // get_next_batch_id() here. Pre-assignment happens under _scan_order_mutex_ so IDs
+  // reflect split-pull order (scan order); assigning here would be completion order.
+  auto batch =
+    sirius::make_data_batch(std::move(table), *mem_space, stream, input_data.pre_assigned_batch_id);
   std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
   batches.push_back(std::move(batch));
   return std::make_unique<pipelineable_operator_data>(std::move(batches));
