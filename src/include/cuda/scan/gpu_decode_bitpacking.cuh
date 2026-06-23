@@ -16,25 +16,18 @@
 
 #pragma once
 
-//===----------------------------------------------------------------------===//
-// BITPACKING decode entry for the GPU-native scan path.
-//
-// The dispatcher in `gpu_native_decode.cu` routes a `gpu_codec_run` whose
-// codec is COMPRESSION_BITPACKING here. Per-segment metadata (mode, width,
-// FOR base, delta offset) lives inside each segment's bytes and is parsed
-// on device by the kernel — the descriptor surface stays codec-agnostic.
-//
-// Modes covered: CONSTANT, CONSTANT_DELTA, FOR, DELTA_FOR. AUTO is a meta-
-// mode that DuckDB resolves to one of the four concrete modes per segment;
-// it never appears at this layer. INVALID / unknown modes are handled
-// deterministically: the kernel zero-fills the affected group's output
-// range so the column buffer never carries uninitialised device contents
-// downstream. Viability is expected to keep malformed segments out of
-// this dispatcher; zero-fill is a defensive backstop, not a runtime fallback.
-//
-// The constants and enum below are public so test fixtures can synthesise
-// segment bytes without standing up a DuckDB connection.
-//===----------------------------------------------------------------------===//
+//! @file
+//! BITPACKING decode entry for the GPU-native scan path.
+//!
+//! The dispatcher in `gpu_native_decode.cu` routes a `gpu_codec_run` whose
+//! codec is COMPRESSION_BITPACKING here. Per-segment metadata (mode, width,
+//! FOR base, delta offset) lives inside each segment's bytes and is parsed
+//! on device by the kernel.
+//!
+//! Modes covered: CONSTANT, CONSTANT_DELTA, FOR, DELTA_FOR. AUTO is a meta-
+//! mode that DuckDB resolves to one of the four concrete modes per segment;
+//! it never appears at this layer. INVALID / unknown modes zero-fill the
+//! affected group's output range.
 
 #include <cudf/types.hpp>
 
@@ -49,19 +42,20 @@
 
 namespace sirius::cuda::scan {
 
-/// Number of values per metadata group within a bitpacked segment. Fixed by
-/// DuckDB's on-disk format — every metadata-group entry encodes the mode and
-/// data offset for exactly this many rows (the last group of a segment may
-/// be short). See duckdb/src/storage/compression/bitpacking.cpp. We statically
-/// catch redefinitions of STANDARD_VECTOR_SIZE that break this mirror based on
-/// the definition of BITPACKING_METADATA_GROUP_SIZE there.
+//! Number of values per metadata group within a bitpacked segment. Fixed by
+//! DuckDB's on-disk format — every metadata-group entry encodes the mode and
+//! data offset for exactly this many rows (the last group of a segment may
+//! be short). See duckdb/src/storage/compression/bitpacking.cpp. The
+//! static_assert catches redefinitions of STANDARD_VECTOR_SIZE that break this
+//! mirror of BITPACKING_METADATA_GROUP_SIZE.
 static constexpr uint32_t BP_META_GROUP_SIZE = 2048;
 static_assert(STANDARD_VECTOR_SIZE <= 512 || STANDARD_VECTOR_SIZE == 2048);
 
-/// Mirrors `duckdb::BitpackingMode`. Values must match the encoding DuckDB
-/// writes into the high byte of each 32-bit metadata-group entry. See
-/// duckdb/src/include/duckdb/storage/compression/bitpacking.hpp.
-/// KEVIN: the DuckDB enum does not explicitly enumerate -- potential for mismatch.
+//! Mirrors `duckdb::BitpackingMode`. Values must match the encoding DuckDB
+//! writes into the high byte of each 32-bit metadata-group entry. See
+//! duckdb/src/include/duckdb/storage/compression/bitpacking.hpp.
+//! @note The DuckDB enum does not assign explicit values, so this mirror can
+//! drift if upstream reorders the variants.
 enum class BitpackingMode : uint8_t {
   INVALID        = 0,
   AUTO           = 1,
@@ -71,12 +65,12 @@ enum class BitpackingMode : uint8_t {
   FOR            = 5
 };
 
-/// Decode a bitpacking codec run into `d_output`. Every segment in `run` is
-/// split into its metadata groups; one CTA decodes one group in a single
-/// batched kernel launch.
-///
-/// `d_output` must be sized for the column's full row count; each segment
-/// writes `seg.row_count` rows starting at `seg.row_offset * type_size`.
+//! Decode a bitpacking codec run into `d_output`. Every segment in `run` is
+//! split into its metadata groups; one CTA decodes one group in a single
+//! batched kernel launch.
+//!
+//! `d_output` must be sized for the column's full row count; each segment
+//! writes `seg.row_count` rows starting at `seg.row_offset * type_size`.
 void decode_bitpacking_data(gpu_codec_run const& run,
                             uint8_t* d_output,
                             cudf::data_type type,
