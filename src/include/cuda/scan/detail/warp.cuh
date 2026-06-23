@@ -15,15 +15,16 @@
  */
 
 //! @file
-//! Compatibility entry point for the shared bit-unpacking primitive. The
-//! implementation lives in `detail/bit_unpack.cuh`; this header re-exports it
-//! into `sirius::cuda::scan` so every codec decoder can call `unpack_value`
-//! through one include.
+//! Warp-level constants shared across the decode kernels.
 
 #pragma once
 
-#include <cuda/scan/detail/bit_unpack.cuh>
+#include <cub/util_arch.cuh>  // cub::detail::warp_threads
+#include <cuda/std/cstdint>
 
-namespace sirius::cuda::scan {
-using detail::unpack_value;
-}  // namespace sirius::cuda::scan
+namespace sirius::cuda::scan::detail {
+
+//! All-lanes mask for the warp shuffle / ballot collectives.
+constexpr uint32_t FULL_MASK = 0xFFFFFFFFu;
+
+}  // namespace sirius::cuda::scan::detail

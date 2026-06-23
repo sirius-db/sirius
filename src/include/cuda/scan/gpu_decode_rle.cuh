@@ -31,9 +31,7 @@ namespace sirius::cuda::scan {
 /// See `duckdb/src/storage/compression/rle.cpp::RLEConstants::RLE_HEADER_SIZE`.
 static constexpr uint32_t RLE_HEADER_SIZE = sizeof(uint64_t);
 
-/// Decode an RLE codec run into `d_output`. Two device kernels: a
-/// per-segment cumsum build, and a per-chunk expand via upper_bound +
-/// value gather. No D2H syncs.
+//! @brief Decode an RLE codec run into `d_output`.
 void decode_rle_data(gpu_codec_run const& run,
                      uint8_t* d_output,
                      cudf::data_type type,
