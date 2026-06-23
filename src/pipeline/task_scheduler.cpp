@@ -37,8 +37,10 @@ namespace pipeline {
 task_scheduler::task_scheduler(
   const exec::thread_pool_config& gpu_executor_config,
   sirius::memory::sirius_memory_reservation_manager& mem_mgr,
+  exec::queue_ordering task_queue_ordering,
   const cucascade::memory::system_topology_info* sys_topology,
   const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors)
+  : _task_queue(task_queue_ordering)
 {
   // Self-publisher: schedule() uses this to wake management_eventloop when a
   // new task is pushed, so the loop can re-run the matcher against any device

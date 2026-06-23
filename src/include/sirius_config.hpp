@@ -18,9 +18,10 @@
 
 #include "config.hpp"
 #include "exec/config.hpp"
+#include "exec/inspectable_mpsc.hpp"
 #include "io/object_store_config.hpp"
 #include "op/scan/config.hpp"
-#include "scan_manager/sirius_scan_manager.hpp"
+#include "scan_manager/config.hpp"
 
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
@@ -111,6 +112,13 @@ struct sirius_config {
 
   [[nodiscard]] const exec::thread_pool_config& get_duckdb_scan_executor_config() const noexcept;
 
+  /// Pop ordering for the task_scheduler's pipeline-level task queue. See
+  /// exec::queue_ordering for semantics. Defaults to FIFO (legacy behavior).
+  [[nodiscard]] exec::queue_ordering get_task_queue_ordering() const noexcept
+  {
+    return _task_queue_ordering;
+  }
+
   [[nodiscard]] bool is_scan_caching_enabled() const noexcept
   {
     return _scan_executor_config.cache != op::scan::cache_level::NONE;
@@ -164,6 +172,7 @@ struct sirius_config {
   op::scan::scan_executor_config _scan_executor_config;
   operator_params _operator_params;
   telemetry_config _telemetry_config;
+  exec::queue_ordering _task_queue_ordering{exec::queue_ordering::FIFO};
 };
 
 }  // namespace sirius

@@ -512,6 +512,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   task_scheduler_ =
     std::make_unique<sirius::pipeline::task_scheduler>(config_.get_gpu_pipeline_executor_config(),
                                                        *memory_manager_,
+                                                       config_.get_task_queue_ordering(),
                                                        &config_.get_hw_topology(),
                                                        &downgrade_executors_);
 

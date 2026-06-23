@@ -60,11 +60,14 @@ class task_scheduler {
    *
    * @param gpu_executor_config Configuration for the GPU pipeline executor thread pool
    * @param mem_mgr Reference to the memory reservation manager
+   * @param task_queue_ordering Pop ordering for the pipeline-level task queue
+   *        (FIFO = oldest-first, LIFO = newest-first). Configured via sirius_config.
    * @param sys_topology Optional system topology info for CPU affinity
    * @param downgrade_executors Optional vector of downgrade executors
    */
   explicit task_scheduler(const exec::thread_pool_config& gpu_executor_config,
                           sirius::memory::sirius_memory_reservation_manager& mem_mgr,
+                          exec::queue_ordering task_queue_ordering = exec::queue_ordering::FIFO,
                           const cucascade::memory::system_topology_info* sys_topology = nullptr,
                           const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>*
                             downgrade_executors = nullptr);
