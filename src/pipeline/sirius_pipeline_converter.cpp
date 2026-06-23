@@ -139,9 +139,8 @@ pipeline_conversion_result sirius_pipeline_converter::convert(sirius_meta_pipeli
 
   auto copied_scheduled = schedule_and_copy_pipelines(root_pipeline);
   if (!duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
-    // Phase 3.3 (#604): under the tree-based path, the plan generator + build_pipelines
-    // virtuals already place every operator. There is nothing to split or insert at
-    // convert time.
+    // Under the tree-based path, the plan generator + build_pipelines virtuals already
+    // place every operator. There is nothing to split or insert at convert time.
     split_pipelines(copied_scheduled);
   } else {
     // Under flag ON, split_pipelines never runs to populate scheduled_, so the post-build
@@ -1306,8 +1305,8 @@ void sirius_pipeline_converter::compute_repository_wiring_tree_based(
       auto* distinct_op    = right_delim.distinct;
       if (partition_join) {
         auto it = dest_for_op.find(partition_join);
-        // B.3+B.4+B.6 (#604): partition_join is owned by the DELIM_JOIN and executed
-        // inline (RIGHT_DELIM_JOIN::sink). Under flag ON it has no pipeline of its own —
+        // partition_join is owned by the DELIM_JOIN and executed inline
+        // (RIGHT_DELIM_JOIN::sink). Under flag ON it has no pipeline of its own —
         // build_join_pipelines skips the recursion that would have created one — so the
         // direct lookup misses. Fall back to its tree parent (CONCAT_build), which is
         // the build_meta sink and resolves to the externalized [CONCAT_build] single-op
@@ -1321,7 +1320,7 @@ void sirius_pipeline_converter::compute_repository_wiring_tree_based(
       }
       if (distinct_op) {
         auto it = dest_for_op.find(distinct_op);
-        // B.5 (#604): the bare DISTINCT is owned by DELIM_JOIN and executed inline
+        // The bare DISTINCT is owned by DELIM_JOIN and executed inline
         // (RIGHT_DELIM_JOIN::sink). Under flag ON it has no pipeline of its own —
         // its build_pipelines override short-circuits when `_owned_by_delim_join`
         // is set — so the direct lookup misses. Fall back to its tree parent
@@ -1345,12 +1344,11 @@ void sirius_pipeline_converter::compute_repository_wiring_tree_based(
       auto* column_data_scan = left_delim.column_data_scan;
       if (column_data_scan) {
         auto it = dest_for_op.find(column_data_scan);
-        // LEFT_DELIM_JOIN ownership (#604): column_data_scan is owned by the
-        // delim join and executed inline (LEFT_DELIM_JOIN::sink). Under flag ON
-        // its build_pipelines is a no-op, so the direct lookup misses. Fall
-        // back to its tree parent (PARTITION_probe), which carries the
-        // externalized [PARTITION] pipeline that consumes the cached chunk
-        // scan's output. Matches legacy's
+        // column_data_scan is owned by the delim join and executed inline
+        // (LEFT_DELIM_JOIN::sink). Under flag ON its build_pipelines is a no-op,
+        // so the direct lookup misses. Fall back to its tree parent
+        // (PARTITION_probe), which carries the externalized [PARTITION] pipeline
+        // that consumes the cached chunk scan's output. Matches legacy's
         // `COLUMN_DATA_SCAN (src=DELIM_JOIN) → PARTITION (dst=PARTITION_probe)`.
         // Use resolve_barrier so the dest type (PARTITION_probe) dictates the
         // barrier (PARTIAL for probe-side partition, per join-feeder rule).
@@ -1367,8 +1365,9 @@ void sirius_pipeline_converter::compute_repository_wiring_tree_based(
       }
       if (distinct_op) {
         auto it = dest_for_op.find(distinct_op);
-        // Same fallback as B.5 for RIGHT: bare DISTINCT has no pipeline of its
-        // own under flag ON, so resolve to its tree parent (PARTITION_distinct).
+        // Same fallback as the RIGHT_DELIM_JOIN's bare DISTINCT above: it has
+        // no pipeline of its own under flag ON, so resolve to its tree parent
+        // (PARTITION_distinct).
         if (it == dest_for_op.end()) {
           if (auto* parent = distinct_op->get_parent_op()) { it = dest_for_op.find(parent); }
         }
@@ -1379,13 +1378,13 @@ void sirius_pipeline_converter::compute_repository_wiring_tree_based(
       continue;
     }
 
-    // B.1' (#604): the distinct chain top of a DELIM_JOIN (MERGE_GROUP_BY) sits
-    // under DELIM_JOIN in the tree, so the uniform tree-parent walk below would
-    // emit `merge_top -> DELIM_JOIN`. Legacy split_delim_join_sink instead
-    // retargets the merged output to each delim_scan's downstream consumer
-    // (the inner-HJ probe partition). Mirror that here. Detection uses the
-    // explicit `_owning_delim_join` back-pointer set in wrap_delim_distinct —
-    // only the distinct_root carries it.
+    // The distinct chain top of a DELIM_JOIN (MERGE_GROUP_BY) sits under
+    // DELIM_JOIN in the tree, so the uniform tree-parent walk below would emit
+    // `merge_top -> DELIM_JOIN`. Legacy split_delim_join_sink instead retargets
+    // the merged output to each delim_scan's downstream consumer (the inner-HJ
+    // probe partition). Mirror that here. Detection uses the explicit
+    // `_owning_delim_join` back-pointer set in wrap_delim_distinct — only the
+    // distinct_root carries it.
     if (auto* owning_delim = sink_op->owning_delim_join()) {
       for (auto& delim_scan_ref : owning_delim->delim_scans) {
         auto& delim_scan  = delim_scan_ref.get();
@@ -1406,14 +1405,14 @@ void sirius_pipeline_converter::compute_repository_wiring_tree_based(
     auto* parent_op = sink_op->get_parent_op();
     if (!parent_op) { continue; }
 
-    // B.7 (#604): when sink_op is the `delim.join` of a RIGHT_DELIM_JOIN, the
-    // legacy split_delim_join_sink wires the inner join out to the next HJ
-    // above the RDJ (via the legacy-constructed external partition_join), not
-    // to the RDJ itself. Mirror that: redirect to the RDJ's tree parent so
-    // the inner HJ skips over the RDJ. Without this, both `RDJ.children[0]`'s
-    // root HJ AND `RDJ.delim.join` resolve to the same RDJ pipeline, and the
-    // RDJ-sink emission's CONCAT fallback (line 1300) closes a cycle back
-    // through the inner HJ's own build CONCAT.
+    // When sink_op is the `delim.join` of a RIGHT_DELIM_JOIN, the legacy
+    // split_delim_join_sink wires the inner join out to the next HJ above the
+    // RDJ (via the legacy-constructed external partition_join), not to the RDJ
+    // itself. Mirror that: redirect to the RDJ's tree parent so the inner HJ
+    // skips over the RDJ. Without this, both `RDJ.children[0]`'s root HJ AND
+    // `RDJ.delim.join` resolve to the same RDJ pipeline, and the RDJ-sink
+    // emission's CONCAT fallback closes a cycle back through the inner HJ's own
+    // build CONCAT.
     if ((parent_op->type == T::RIGHT_DELIM_JOIN) &&
         parent_op->Cast<op::sirius_physical_delim_join>().join.get() == sink_op) {
       auto* grand = parent_op->get_parent_op();
@@ -1465,11 +1464,10 @@ void sirius_pipeline_converter::finalize_pipeline_structure()
   // source = &operators[0], sink = operators.back().
   for (const auto& pipeline : scheduled_) {
     if (!duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
-      // Phase 3.2 (#604): under USE_TREE_BASED_PIPELINE_BUILD, is_ready (C.1)
-      // already pushed sink into operators[] and set source = &operators[0].
-      // Skip the redoing here; the parent->dependency reverse map still needs
-      // to be populated (next loop), so the function as a whole is still
-      // called under both flag states until Sub-phase E deletes it.
+      // Under USE_TREE_BASED_PIPELINE_BUILD, `is_ready` already pushed sink into
+      // operators[] and set source = &operators[0]. Skip the redoing here; the
+      // parent->dependency reverse map still needs to be populated (next loop),
+      // so the function as a whole is still called under both flag states.
       pipeline->operators.push_back(*pipeline->sink);
       pipeline->source = &pipeline->operators[0].get();
     }

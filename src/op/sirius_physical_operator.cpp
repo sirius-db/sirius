@@ -166,10 +166,10 @@ void sirius_physical_operator::build_pipelines(pipeline::sirius_pipeline& curren
       // Legacy protocol: source field tracks pre-finalize source.
       state.set_pipeline_source(current, *this);
     }
-    // Phase 3.2 (#604): under the new protocol, create_child_meta_pipeline
-    // pre-populates the new child_meta's operators[] with [*this], so *this
-    // lands at operators.back() post-reverse — source/sink derive from
-    // operators[] in is_ready, so no separate set_pipeline_source is needed.
+    // Under the new protocol, create_child_meta_pipeline pre-populates the new
+    // child_meta's operators[] with [*this], so *this lands at operators.back()
+    // post-reverse — source/sink derive from operators[] in `is_ready`, so no
+    // separate set_pipeline_source is needed.
 
     // we create a new pipeline starting from the child (or just [*this] for leaf-sinks)
     auto& child_meta_pipeline = meta_pipeline.create_child_meta_pipeline(current, *this);
@@ -179,8 +179,8 @@ void sirius_physical_operator::build_pipelines(pipeline::sirius_pipeline& curren
     if (children.empty()) {
       // source-leaf
       if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
-        // Phase 3.2 (#604): source-leaves land at operators[0] post-reverse, so
-        // append to operators[] rather than only setting the source field.
+        // Source-leaves land at operators[0] post-reverse, so append to
+        // operators[] rather than only setting the source field.
         state.add_pipeline_operator(current, *this);
       } else {
         state.set_pipeline_source(current, *this);

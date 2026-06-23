@@ -84,11 +84,11 @@ void sirius_physical_result_collector::build_pipelines(
   // single operator: the operator becomes the data source of the current pipeline
   auto& state = meta_pipeline.get_state();
   if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
-    // Phase 3.2 (#604): source is derived from operators[0] post-reverse.
-    // RESULT_COLLECTOR is both the root operator of `current` and the sink of
-    // its own child_meta — appending here makes it operators[0] of `current`
-    // post-reverse; create_child_meta_pipeline pre-populates [*this] in the
-    // child_meta so it's operators.back() there.
+    // Source is derived from operators[0] post-reverse. RESULT_COLLECTOR is both
+    // the root operator of `current` and the sink of its own child_meta —
+    // appending here makes it operators[0] of `current` post-reverse;
+    // create_child_meta_pipeline pre-populates [*this] in the child_meta so it's
+    // operators.back() there.
     state.add_pipeline_operator(current, *this);
   } else {
     state.set_pipeline_source(current, *this);

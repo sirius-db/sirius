@@ -80,15 +80,15 @@ void sirius_physical_column_data_scan::build_pipelines(
       auto& delim_join = delim_sink->Cast<sirius_physical_delim_join>();
       current.add_dependency(delim_dependency);
       if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
-        // B.1' (#604): DELIM_SCAN is routing-only under flag ON (mirrors CTE_SCAN
-        // post-Phase A). The distinct chain top carries `_owning_delim_join`,
-        // which redirects the uniform tree-parent walk in
-        // compute_repository_wiring_tree_based to wire the merge-top into each
-        // delim_scan's consumer pipeline (inner-HJ probe partition) instead of
-        // the DELIM_JOIN itself — mirrors legacy split_delim_join_sink's
-        // retarget loop. `is_ready` overwrites this pipeline's source to
-        // operators[0] = PARTITION (the inner-HJ probe partition that `current`
-        // was created with), so we don't append anything to operators[] here.
+        // DELIM_SCAN is routing-only under flag ON (mirrors CTE_SCAN). The
+        // distinct chain top carries `_owning_delim_join`, which redirects the
+        // uniform tree-parent walk in compute_repository_wiring_tree_based to
+        // wire the merge-top into each delim_scan's consumer pipeline (inner-HJ
+        // probe partition) instead of the DELIM_JOIN itself — mirrors legacy
+        // split_delim_join_sink's retarget loop. `is_ready` overwrites this
+        // pipeline's source to operators[0] = PARTITION (the inner-HJ probe
+        // partition that `current` was created with), so we don't append
+        // anything to operators[] here.
         D_ASSERT(delim_join.distinct_root);
         (void)delim_join;
       } else {
@@ -142,12 +142,13 @@ void sirius_physical_column_data_scan::build_pipelines(
   }
   D_ASSERT(children.empty());
   if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
-    // B.2 (#604): a leaf scan whose tree parent is RIGHT_DELIM_JOIN (or PARTITION) is
-    // a pipeline sink — give it its own single-op pipeline rather than absorbing it
-    // into `current`'s operators[]. Mirrors the leaf-sink branch in
-    // sirius_physical_operator::build_pipelines; we need to replicate the check here
-    // because this override exists to handle the DELIM_SCAN/CTE_SCAN special cases
-    // above and would otherwise unconditionally add to the current pipeline.
+    // A leaf scan whose tree parent is RIGHT_DELIM_JOIN (or PARTITION) is a
+    // pipeline sink — give it its own single-op pipeline rather than absorbing
+    // it into `current`'s operators[]. Mirrors the leaf-sink branch in
+    // sirius_physical_operator::build_pipelines; we need to replicate the check
+    // here because this override exists to handle the DELIM_SCAN/CTE_SCAN
+    // special cases above and would otherwise unconditionally add to the
+    // current pipeline.
     if (is_sink()) {
       meta_pipeline.create_child_meta_pipeline(current, *this);
     } else {

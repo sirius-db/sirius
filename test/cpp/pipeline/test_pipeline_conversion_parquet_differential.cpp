@@ -82,11 +82,11 @@ TEST_CASE("TPC-H SF1 parquet: legacy and tree-based converters produce identical
 
   sirius::test::tree_pipeline_flag_guard flag_guard;
 
-  // q21 (fixed by B.7 #604): under the parquet plan shape, the inner RDJ's
+  // q21 previously diverged: under the parquet plan shape, the inner RDJ's
   // build_pipelines was called with `current` pre-populated with the outer RDJ
   // as its sink, causing build_join_pipelines to fuse the inner HJ with the
-  // outer RDJ (source:HJ,sink:RDJ). Fixed by checking `current`'s sink type
-  // in sirius_physical_right_delim_join::build_pipelines — when the sink is a
+  // outer RDJ (source:HJ,sink:RDJ). Fixed by checking `current`'s sink type in
+  // sirius_physical_right_delim_join::build_pipelines — when the sink is a
   // RIGHT_DELIM_JOIN or PARTITION (barrier ops), the inner HJ is routed into
   // its own standalone child meta pipeline instead, matching legacy's output.
   static const std::set<int> kKnownFailing = {};

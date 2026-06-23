@@ -133,9 +133,9 @@ void sirius_pipeline::is_ready()
   ready = true;
   std::reverse(operators.begin(), operators.end());
   if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD && !operators.empty()) {
-    // Phase 3.2 (#604): absorb what finalize_pipeline_structure does today —
-    // derive source/sink from operators[] so the post-finalize state is produced
-    // during build, not by a separate converter pass.
+    // Absorb what finalize_pipeline_structure does today — derive source/sink
+    // from operators[] so the post-finalize state is produced during build,
+    // not by a separate converter pass.
     source = &operators.front().get();
     sink   = &operators.back().get();
   }

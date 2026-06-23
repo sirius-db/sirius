@@ -223,17 +223,14 @@ class sirius_physical_plan_generator {
   //! (PARTITION, CONCAT, SORT_SAMPLE / SORT_PARTITION / MERGE_SORT, GROUPED_AGGREGATE_MERGE,
   //! UNGROUPED_AGGREGATE_MERGE, TOP_N_MERGE, DUCKDB/ICEBERG/PARQUET scan companions,
   //! CPU_SOURCE, etc.) so the tree contains the full execution structure before the pipeline
-  //! converter runs. Gated by `duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD` at the call site;
-  //! Sub-phase B.1 lands the skeleton (recursive walk + `wrap_child` helper) with empty
-  //! per-operator-type dispatch. Operator-specific factories land in subsequent commits.
+  //! converter runs. Gated by `duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD` at the call site.
   void insert_gpu_pipeline_operators(
     duckdb::unique_ptr<sirius::op::sirius_physical_operator>& plan);
 
   //! Walk the plan tree and fully materialize Iceberg delete data for every TABLE_SCAN whose
   //! `function.name == "iceberg_scan"`, populating `iceberg_delete_data_cache_`. Mirrors the
   //! engine's `sirius_engine::prefetch_iceberg_delete_data` for the tree-based path; the
-  //! engine still runs its own prefetch for the flag-off (legacy converter) path. Both
-  //! prefetches will be consolidated in Sub-phase E (engine cleanup).
+  //! engine still runs its own prefetch for the flag-off (legacy converter) path.
   void prefetch_iceberg_delete_data(sirius::op::sirius_physical_operator& plan);
 
   //! Resolve the on-disk path of an Iceberg table from a TABLE_SCAN. Uses

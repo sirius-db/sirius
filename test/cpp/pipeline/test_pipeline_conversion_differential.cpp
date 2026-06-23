@@ -42,9 +42,9 @@ fs::path integration_db_path()
 
 }  // namespace
 
-//! Phase 3 (#604) Sub-phase E.1 PRIMARY GATE: assert that the legacy
-//! converter (flag OFF) and the tree-based converter (flag ON) produce
-//! byte-identical `pipeline_conversion_result` for every TPC-H query at SF1.
+//! Primary differential gate for the tree-based pipeline build: assert that the legacy
+//! converter (flag OFF) and the tree-based converter (flag ON) produce byte-identical
+//! `pipeline_conversion_result` for every TPC-H query at SF1.
 //!
 //! Sources queries from `test/tpch_performance/tpch_queries/orig/q*.sql`.
 //! Uses the SF1 TPC-H schema in `test/cpp/integration/data/duckdb/integration.duckdb`
@@ -71,10 +71,9 @@ TEST_CASE("TPC-H SF1: legacy and tree-based converters produce identical pipelin
 
   sirius::test::tree_pipeline_flag_guard flag_guard;
 
-  // Differential gate for the tree-based pipeline build (#604, sub-phase E.1).
-  // Empty set means all 22 TPC-H queries produce byte-identical dumps under both
-  // flag states; E.4 (flag-default flip) is unblocked. Re-populate with the query
-  // numbers that diverge if a regression lands, then file a follow-up to clear it.
+  // Differential gate for the tree-based pipeline build. Empty set means all 22 TPC-H
+  // queries produce byte-identical dumps under both flag states. Re-populate with the
+  // query numbers that diverge if a regression lands, then file a follow-up to clear it.
   static const std::set<int> kKnownFailing = {};
 
   for (int q = 1; q <= 22; ++q) {

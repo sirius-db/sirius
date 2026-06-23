@@ -29,7 +29,7 @@ namespace op {
 void sirius_physical_grouped_aggregate::build_pipelines(
   pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
 {
-  // B.5 (#604): when this HASH_GROUP_BY is the bare DISTINCT of a RIGHT_DELIM_JOIN
+  // When this HASH_GROUP_BY is the bare DISTINCT of a RIGHT_DELIM_JOIN
   // (`delim_join.distinct`), it carries no pipeline contribution of its own —
   // RIGHT_DELIM_JOIN::sink invokes `distinct->execute(input_data, ...)` and
   // `distinct->sink(...)` inline, and the wiring `HASH_GROUP_BY (src=DELIM_JOIN)

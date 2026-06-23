@@ -60,13 +60,13 @@ struct Config {
   // Whether to use modified pipeline for the new execution model
   static bool MODIFIED_PIPELINE;
 
-  // Phase 3 (#601) gate: switch the pipeline build path from the legacy
-  // sirius_pipeline_converter (which constructs ~12 operator types at runtime) to the
-  // tree-based path where sirius_physical_plan_generator inserts all operators into the plan
-  // tree and the converter becomes a pure topology pass driven by per-operator build_pipelines
-  // overrides. Default true: the Sub-phase E.1 differential dump test confirms byte-identical
-  // pipeline state vs the legacy converter on every TPC-H SF1 plan. Set false to fall back to
-  // the legacy converter path (kept for rollback; planned for deletion in a follow-up).
+  // Switch the pipeline build path from the legacy sirius_pipeline_converter (which
+  // constructs ~12 operator types at runtime) to the tree-based path where
+  // sirius_physical_plan_generator inserts all operators into the plan tree and the
+  // converter becomes a pure topology pass driven by per-operator build_pipelines
+  // overrides. Default true: a differential dump test confirms byte-identical pipeline
+  // state vs the legacy converter on every TPC-H SF1 plan. Set false to fall back to the
+  // legacy converter path (kept for rollback; planned for deletion in a follow-up).
   static bool USE_TREE_BASED_PIPELINE_BUILD;
 
   // Whether to fall back to duckdb execution after an error is detected

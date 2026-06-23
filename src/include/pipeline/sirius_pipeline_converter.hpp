@@ -118,14 +118,13 @@ class sirius_pipeline_converter {
                              duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
                              size_t pipeline_idx);
 
-  // Phase 3: Compute plan-time wiring descriptors
-  // Runtime materialization is done by `materialize_repository_wiring()` from
-  // `pipeline/repository_wiring.hpp`.
+  // Compute plan-time wiring descriptors. Runtime materialization is done by
+  // `materialize_repository_wiring()` from `pipeline/repository_wiring.hpp`.
   void compute_repository_wiring(sirius_pipeline_build_state& state);
-  // Phase 3.2 alternative: tree-parent based wiring computation. Used under
-  // USE_TREE_BASED_PIPELINE_BUILD; assumes pipelines are in single-state form
-  // (post-`is_ready`) and that every operator has its `_parent_op` field
-  // populated by the plan generator's `set_parent_ops` post-pass.
+  // Tree-parent based wiring computation. Used under USE_TREE_BASED_PIPELINE_BUILD;
+  // assumes pipelines are in single-state form (post-`is_ready`) and that every
+  // operator has its `_parent_op` field populated by the plan generator's
+  // `set_parent_ops` post-pass.
   void compute_repository_wiring_tree_based(sirius_pipeline_build_state& state);
   static std::string_view resolve_port_id(const op::sirius_physical_operator& sink,
                                           const op::sirius_physical_operator& parent);

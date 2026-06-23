@@ -626,9 +626,7 @@ class sirius_physical_operator {
 
  private:
   //! Mutate the parent pointer. Restricted to `sirius_physical_plan_generator` so parent
-  //! pointers stay immutable once plan generation finishes. Derived constructors can still
-  //! initialize `_parent_op` directly via the protected field (legacy path, removed in
-  //! Phase 3.1).
+  //! pointers stay immutable once plan generation finishes.
   void set_parent_op(sirius_physical_operator* parent_op) noexcept { _parent_op = parent_op; }
 
   friend class ::sirius::planner::sirius_physical_plan_generator;

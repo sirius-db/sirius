@@ -403,14 +403,14 @@ void sirius_physical_hash_join::build_join_pipelines(pipeline::sirius_pipeline& 
       D_ASSERT(!build_child.children.empty());
       auto& build_meta = meta_pipeline.create_child_meta_pipeline(current, build_child);
 
-      // B.3+B.4+B.6 (#604): when `op` is the inner join of a RIGHT_DELIM_JOIN, the
-      // build subtree below CONCAT_build is synthetic scaffolding —
-      // PARTITION_build/partition_join + DUMMY_SCAN placeholder. partition_join is
-      // owned by the DELIM_JOIN and executed inline (RIGHT_DELIM_JOIN::sink), and
-      // DUMMY_SCAN never produces runtime data. Skip the recursion so PARTITION_build,
-      // DUMMY_SCAN, and (the now-absent) CPU_SOURCE don't materialize their own
-      // pipelines. build_meta still finalizes to a [CONCAT_build] single-op pipeline
-      // via is_ready, matching legacy split_delim_join_sink's [CONCAT] pipeline.
+      // When `op` is the inner join of a RIGHT_DELIM_JOIN, the build subtree below
+      // CONCAT_build is synthetic scaffolding — PARTITION_build/partition_join +
+      // DUMMY_SCAN placeholder. partition_join is owned by the DELIM_JOIN and
+      // executed inline (RIGHT_DELIM_JOIN::sink), and DUMMY_SCAN never produces
+      // runtime data. Skip the recursion so PARTITION_build, DUMMY_SCAN, and (the
+      // now-absent) CPU_SOURCE don't materialize their own pipelines. build_meta
+      // still finalizes to a [CONCAT_build] single-op pipeline via is_ready,
+      // matching legacy split_delim_join_sink's [CONCAT] pipeline.
       bool is_delim_inner = false;
       if (auto* hj = dynamic_cast<sirius_physical_hash_join*>(&op)) {
         is_delim_inner = hj->is_delim_join_inner();

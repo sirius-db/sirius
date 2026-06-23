@@ -127,13 +127,12 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_t
   info->names               = scan_op.names;
   info->table_filters       = std::move(scan_op.table_filters);
   info->partition_indices   = partition_indices;
-  // Mirror the two trailing fields the legacy `insert_parquet_scan_operator` sets
-  // (sirius_pipeline_converter.cpp:297-302). Both came in via post-B.2b upstream commits:
-  //   - `scan_output_arity` (upstream #749) drives `scan_info::make_provider`'s expected
-  //     column count. Without it, the runtime task emits only the data columns and skips
-  //     the hive-partition columns it should inject post-read, producing a 3-vs-5 column
+  // Mirror the two trailing fields the legacy `insert_parquet_scan_operator` sets:
+  //   - `scan_output_arity` drives `scan_info::make_provider`'s expected column count.
+  //     Without it, the runtime task emits only the data columns and skips the
+  //     hive-partition columns it should inject post-read, producing a 3-vs-5 column
   //     mismatch and downstream vector::_M_range_check.
-  //   - `approximate_batch_size` (upstream #792) provides the per-task scan batch sizing.
+  //   - `approximate_batch_size` provides the per-task scan batch sizing.
   info->scan_output_arity      = scan_op.types.size();
   info->approximate_batch_size = op_params.scan_task_batch_size;
   return info;
@@ -455,11 +454,10 @@ void wrap_delim_distinct(sirius::op::sirius_physical_delim_join& delim_base,
     duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate_merge>(original_agg_ptr);
   merge->children.push_back(std::move(partition));
 
-  // B.1' (#604): tag the chain top with the owning DELIM_JOIN so
+  // Tag the chain top with the owning DELIM_JOIN so
   // compute_repository_wiring_tree_based can redirect its tree-parent wiring
   // (which would otherwise emit merge_top -> DELIM_JOIN) to each delim_scan's
-  // consumer pipeline. Mirrors legacy split_delim_join_sink's retarget at
-  // sirius_pipeline_converter.cpp:849-852.
+  // consumer pipeline. Mirrors legacy split_delim_join_sink's retarget.
   merge->set_owning_delim_join(&delim_base);
 
   delim_base.distinct_root = std::move(merge);
@@ -477,8 +475,8 @@ void wrap_delim_distinct(sirius::op::sirius_physical_delim_join& delim_base,
 //!   - Recursively walks `delim->join` so source-side wraps (TABLE_SCAN/CPU_SOURCE family)
 //!     and sink-side wraps (HASH_GROUP_BY/ORDER_BY/TOP_N/UNGROUPED) inside the internal
 //!     join's subtree fire, and so the internal join (if HJ/NLJ) gets the same
-//!     CONCAT/PARTITION wraps on its probe + build that Sub-phase B.4 applies to top-level
-//!     joins. This is what plants the `partition_join` candidate node.
+//!     CONCAT/PARTITION wraps on its probe + build that `wrap_join_child` applies to
+//!     top-level joins. This is what plants the `partition_join` candidate node.
 //!   - Recursively walks the children of the original DISTINCT (via `distinct_root->children`,
 //!     because at this point `distinct_root` still holds the bare DISTINCT) so source-side
 //!     wraps below it fire. Then calls `wrap_delim_distinct` to wrap DISTINCT_MERGE +
@@ -518,12 +516,10 @@ void wrap_delim_join(
   if (slot->type == sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
     auto& right_delim = slot->Cast<sirius::op::sirius_physical_right_delim_join>();
 
-    // B.5 (#604): tag the bare DISTINCT so its `build_pipelines` becomes a no-op.
+    // Tag the bare DISTINCT so its `build_pipelines` becomes a no-op.
     // RIGHT_DELIM_JOIN::sink runs `distinct->execute` and `distinct->sink` inline,
     // so the bare DISTINCT contributes nothing to any pipeline (matches legacy's
-    // partition_distinct pipeline which has operators=[PARTITION] only). Scoped
-    // to RIGHT only — LEFT_DELIM_JOIN's distinct keeps standard sink behavior
-    // pending separate analysis for q2/q15/q17/q20.
+    // partition_distinct pipeline which has operators=[PARTITION] only).
     if (right_delim.distinct) { right_delim.distinct->set_owned_by_delim_join(true); }
 
     auto* internal_join = delim_base.join.get();
@@ -542,9 +538,9 @@ void wrap_delim_join(
   } else if (slot->type == sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
     auto& left_delim = slot->Cast<sirius::op::sirius_physical_left_delim_join>();
 
-    // LEFT_DELIM_JOIN ownership (#604, mirror of B.5 for RIGHT): tag the bare
-    // DISTINCT so its build_pipelines becomes a no-op. LEFT_DELIM_JOIN::sink
-    // runs `distinct->execute` and `distinct->sink` inline; the bare DISTINCT
+    // Same tagging as RIGHT_DELIM_JOIN above: tag the bare DISTINCT so its
+    // build_pipelines becomes a no-op. LEFT_DELIM_JOIN::sink runs
+    // `distinct->execute` and `distinct->sink` inline; the bare DISTINCT
     // contributes nothing to any pipeline.
     //
     // The cached chunk scan (`left_delim.column_data_scan`) is already recorded
@@ -585,11 +581,11 @@ void insert_gpu_pipeline_operators_recursive(
     case sirius::op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN:
     case sirius::op::SiriusPhysicalOperatorType::EMPTY_RESULT: wrap_cpu_source(*slot); break;
     case sirius::op::SiriusPhysicalOperatorType::DUMMY_SCAN: {
-      // B.3+B.4+B.6 (#604): skip the CPU_SOURCE wrap for the synthetic DUMMY_SCAN
-      // inserted as a RIGHT_DELIM_JOIN's build placeholder — it carries no runtime
-      // data flow (partition_join executes inline via DELIM_JOIN's sink) so the
-      // CPU_SOURCE leaf would only materialize a phantom pipeline. Real DUMMY_SCAN
-      // usages (constant-row subqueries) keep the wrap.
+      // Skip the CPU_SOURCE wrap for the synthetic DUMMY_SCAN inserted as a
+      // RIGHT_DELIM_JOIN's build placeholder — it carries no runtime data flow
+      // (partition_join executes inline via DELIM_JOIN's sink) so the CPU_SOURCE
+      // leaf would only materialize a phantom pipeline. Real DUMMY_SCAN usages
+      // (constant-row subqueries) keep the wrap.
       auto& dummy = slot->Cast<sirius::op::sirius_physical_dummy_scan>();
       if (!dummy.is_delim_join_placeholder()) { wrap_cpu_source(*slot); }
       break;
@@ -665,12 +661,12 @@ void sirius_physical_plan_generator::set_parent_ops(sirius::op::sirius_physical_
     if (child) { set_parent_ops(*child, &op); }
   }
   // DELIM JOIN stores its internal `join` and `distinct_root` subtrees as unique_ptr fields
-  // outside `children[]`. Descend into them so the wrapped operators inside (B.4's
-  // CONCAT/PARTITION on the join side, wrap_delim_distinct's MERGE/PARTITION on the distinct
-  // side) get their `_parent_op` set to their tree parent. PARTITION's ctor takes a
-  // `key_source` argument that is captured for key/type derivation only and never stored
-  // (separated from the tree-parent role here), so without this descent PARTITION._parent_op
-  // stays nullptr and compute_repository_wiring_tree_based can't resolve its destination.
+  // outside `children[]`. Descend into them so the wrapped operators inside (the join's
+  // CONCAT/PARTITION wraps and the distinct chain's MERGE/PARTITION) get their `_parent_op`
+  // set to their tree parent. PARTITION's ctor takes a `key_source` argument that is
+  // captured for key/type derivation only and never stored (separated from the tree-parent
+  // role here), so without this descent PARTITION._parent_op stays nullptr and
+  // compute_repository_wiring_tree_based can't resolve its destination.
   if (op.type == sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
       op.type == sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
     auto& delim = op.Cast<sirius::op::sirius_physical_delim_join>();
@@ -681,11 +677,11 @@ void sirius_physical_plan_generator::set_parent_ops(sirius::op::sirius_physical_
   // it's the engine-injected root wrapper added by `sirius_pending_statement_internal`
   // (`src/sirius_interface.cpp:166`), used by BOTH `CALL gpu_execution()` and transparent
   // execution. Without descending here the wrapped sink (e.g. MERGE_TOP_N) gets
-  // `_parent_op = nullptr` and `compute_repository_wiring_tree_based` silently skips its emit
-  // at the uniform tree-parent lookup (`sirius_pipeline_converter.cpp:1380`), leaving the
-  // RESULT_COLLECTOR pipeline with no input source — runtime hang. Not caught by the E.1
-  // differential gate because `convert_query_to_dump` builds plans by calling
-  // `physical_planner.create_plan()` directly, bypassing the wrapping path.
+  // `_parent_op = nullptr` and `compute_repository_wiring_tree_based` silently skips its
+  // emit at the uniform tree-parent lookup, leaving the RESULT_COLLECTOR pipeline with no
+  // input source — runtime hang. Not caught by the differential conversion test because
+  // `convert_query_to_dump` builds plans by calling `physical_planner.create_plan()`
+  // directly, bypassing the wrapping path.
   if (op.type == sirius::op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
     auto& rc = op.Cast<sirius::op::sirius_physical_result_collector>();
     set_parent_ops(rc.plan, &op);
@@ -733,8 +729,8 @@ void sirius_physical_plan_generator::prefetch_iceberg_delete_data(
 {
   // Walk the plan tree and fully materialize delete data for every iceberg scan, mirroring
   // `sirius_engine::prefetch_iceberg_delete_data`. The engine's variant still runs for the
-  // flag-off (legacy converter) path until Sub-phase E removes it; this variant feeds the
-  // tree-based wrap performed by `wrap_table_scan_source` later in `create_plan`.
+  // flag-off (legacy converter) path; this variant feeds the tree-based wrap performed by
+  // `wrap_table_scan_source` later in `create_plan`.
   if (plan.type != sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN) {
     if (plan.type == sirius::op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
       auto& collector = plan.Cast<sirius::op::sirius_physical_result_collector>();
@@ -873,7 +869,8 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   // off. Iceberg delete data is pre-fetched before the tree rewrite so
   // `wrap_table_scan_source` can attach `delete_data` to each `sirius_physical_iceberg_scan`
   // it constructs. `set_parent_ops` then derives every operator's `_parent_op` from the
-  // final tree, enabling Sub-phase C/D's tree-parent-lookup wiring.
+  // final tree, enabling the tree-parent-lookup wiring in `build_pipelines` and the
+  // converter.
   if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
     prefetch_iceberg_delete_data(*plan);
     insert_gpu_pipeline_operators(plan);

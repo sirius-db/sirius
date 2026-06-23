@@ -285,7 +285,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   //! Consumed by `is_sink()` (to suppress the standalone-sink behavior the base rule
   //! would otherwise give for a join with `parent_op->type == RIGHT_DELIM_JOIN`) and by
   //! `build_join_pipelines` (to gate build-side externalization for the synthetic
-  //! DUMMY_SCAN under the inner HJ's build subtree — see B.3+B.4+B.6).
+  //! DUMMY_SCAN under the inner HJ's build subtree).
   [[nodiscard]] bool is_delim_join_inner() const noexcept { return _is_delim_join_inner; }
   void set_delim_join_inner(bool value) noexcept { _is_delim_join_inner = value; }
 

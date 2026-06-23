@@ -39,10 +39,10 @@ namespace sirius::test {
 //! (IN_CLAUSE, COMPRESSED_MATERIALIZATION, STATISTICS_PROPAGATION). The
 //! pre-existing settings are saved and restored even on error.
 //!
-//! Used by Sub-phase E.1's differential dump test to compare the conversion
-//! result between `USE_TREE_BASED_PIPELINE_BUILD=false` and `=true`. The flag's
-//! state at call time is what the converter and plan generator see; tests must
-//! toggle it before each call.
+//! Used by the differential dump tests to compare the conversion result between
+//! `USE_TREE_BASED_PIPELINE_BUILD=false` and `=true`. The flag's state at call time
+//! is what the converter and plan generator see; tests must toggle it before each
+//! call.
 //!
 //! Throws on parse / bind / optimize errors. Iceberg queries are not supported
 //! (no engine-side prefetch is performed) — TPC-H queries are unaffected.
