@@ -24,4 +24,4 @@ uuid = "1"
 quent-simulator-ui = { git = "https://github.com/rapidsai/quent.git", rev = "76e99cf7ca9d531d4e56e94021b1f80d97b23c90" }
 quent-query-engine-ui = { git = "https://github.com/rapidsai/quent.git", rev = "76e99cf7ca9d531d4e56e94021b1f80d97b23c90" }
 quent-ui = { git = "https://github.com/rapidsai/quent.git", rev = "76e99cf7ca9d531d4e56e94021b1f80d97b23c90" }
-ts-rs = { version = "11", features = ["uuid-impl", "serde-json-impl"] }
+ts-rs = { version = "12", features = ["uuid-impl", "serde-json-impl"] }

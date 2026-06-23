@@ -1417,7 +1417,7 @@ dependencies = [
  "serde",
  "smallvec",
  "thiserror",
- "ts-rs",
+ "ts-rs 11.1.0",
  "uuid",
 ]
 
@@ -1428,7 +1428,7 @@ source = "git+https://github.com/rapidsai/quent.git?rev=76e99cf7ca9d531d4e56e940
 dependencies = [
  "serde",
  "thiserror",
- "ts-rs",
+ "ts-rs 11.1.0",
 ]
 
 [[package]]
@@ -1705,7 +1705,7 @@ dependencies = [
  "quent-time",
  "quent-ui",
  "serde",
- "ts-rs",
+ "ts-rs 11.1.0",
  "uuid",
 ]
 
@@ -1716,7 +1716,7 @@ source = "git+https://github.com/rapidsai/quent.git?rev=76e99cf7ca9d531d4e56e940
 dependencies = [
  "quent-analyzer",
  "serde",
- "ts-rs",
+ "ts-rs 11.1.0",
  "uuid",
 ]
 
@@ -1737,7 +1737,7 @@ source = "git+https://github.com/rapidsai/quent.git?rev=76e99cf7ca9d531d4e56e940
 dependencies = [
  "serde",
  "thiserror",
- "ts-rs",
+ "ts-rs 11.1.0",
 ]
 
 [[package]]
@@ -1748,7 +1748,7 @@ dependencies = [
  "quent-analyzer",
  "quent-time",
  "serde",
- "ts-rs",
+ "ts-rs 11.1.0",
  "uuid",
 ]
 
@@ -2073,7 +2073,7 @@ dependencies = [
  "sirius-telemetry-analyzer",
  "tokio",
  "tracing",
- "ts-rs",
+ "ts-rs 12.0.1",
  "uuid",
 ]
 
@@ -2467,7 +2467,19 @@ checksum = "4994acea2522cd2b3b85c1d9529a55991e3ad5e25cdcd3de9d505972c4379424"
 dependencies = [
  "serde_json",
  "thiserror",
- "ts-rs-macros",
+ "ts-rs-macros 11.1.0",
+ "uuid",
+]
+
+[[package]]
+name = "ts-rs"
+version = "12.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "756050066659291d47a554a9f558125db17428b073c5ffce1daf5dcb0f7231d8"
+dependencies = [
+ "serde_json",
+ "thiserror",
+ "ts-rs-macros 12.0.1",
  "uuid",
 ]
 
@@ -2476,6 +2488,18 @@ name = "ts-rs-macros"
 version = "11.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6ff59666c9cbaec3533964505d39154dc4e0a56151fdea30a09ed0301f62e2"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+ "termcolor",
+]
+
+[[package]]
+name = "ts-rs-macros"
+version = "12.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38d90eea51bc7988ef9e674bf80a85ba6804739e535e9cab48e4bb34a8b652aa"
 dependencies = [
  "proc-macro2",
  "quote",
