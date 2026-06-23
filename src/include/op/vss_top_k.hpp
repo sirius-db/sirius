@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "vss/cudf_raft_interop.hpp"
 #include "vss/vss_pattern.hpp"
 
 #include <cudf/table/table.hpp>
@@ -27,6 +28,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 
 namespace sirius {
 namespace op {
@@ -42,12 +44,14 @@ namespace op {
  * the final offset). Returns the empty output schema when `limit == 0` or
  * @p input is empty.
  */
-std::unique_ptr<cudf::table> compute_vss_top_k(cudf::table_view input,
-                                               sirius::vss::vss_top_k_pattern const& pattern,
-                                               std::size_t limit,
-                                               std::size_t offset,
-                                               rmm::cuda_stream_view stream,
-                                               rmm::device_async_resource_ref memory_resource);
+std::unique_ptr<cudf::table> compute_vss_top_k(
+  cudf::table_view input,
+  sirius::vss::vss_top_k_pattern const& pattern,
+  std::size_t limit,
+  std::size_t offset,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref memory_resource,
+  std::optional<sirius::vss::dataset_matrix_view> query = std::nullopt);
 
 /**
  * @brief Consolidate per-batch VSS candidates into the global nearest rows.
