@@ -24,15 +24,19 @@
 #include <memory>
 #include <utility>
 
-namespace sirius::scan_manager {
+namespace sirius::op::scan {
 
-/// Parquet-flavored @c sirius_io_object_metadata stored in the prefetching
-/// cache alongside an io_object.  Holds the parsed @c FileMetaData so future
+/// Parquet-flavored @c sirius_io_object_metadata stored in the ioctx metadata
+/// store alongside an io_object.  Holds the parsed @c FileMetaData so future
 /// scans of the same file can skip the footer fetch + parse and construct a
 /// @c hybrid_scan_reader directly from the cached struct.  @c footer_byte_len
 /// is the body size returned by @c fetch_footer_to_host (excludes the 8-byte
 /// trailer) — kept here so callers reassembling the footer byte range for
 /// prefetch don't have to round-trip through the datasource.
+///
+/// Lives with the parquet ingestible (its only producer/consumer): the bind
+/// path (@c sirius_scan_manager::describe_parquet) parses and parks it, and the
+/// metadata scan (@c parquet_gpu_ingestible::build_file_scan_info) reuses it.
 class parquet_metadata final : public sirius::io::sirius_io_object_metadata {
  public:
   parquet_metadata(std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata,
@@ -54,4 +58,4 @@ class parquet_metadata final : public sirius::io::sirius_io_object_metadata {
   std::size_t _footer_byte_len{0};
 };
 
-}  // namespace sirius::scan_manager
+}  // namespace sirius::op::scan
