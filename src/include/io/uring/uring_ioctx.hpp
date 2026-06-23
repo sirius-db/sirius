@@ -19,7 +19,7 @@
 #include "io/templated_ioctx.hpp"
 #include "io/uring/uring_reactor.hpp"
 
-namespace sirius::io {
+namespace sirius::io::uring {
 
 // ---------------------------------------------------------------------------
 // uring_ioctx
@@ -31,18 +31,22 @@ namespace sirius::io {
  */
 class uring_ioctx : public templated_ioctx<uring_reactor> {
  public:
-  /// @param host_ring_depth   Side-channel host ring pool depth.
-  /// @param ring_entries      SQE depth per reactor io_uring.
-  /// @param n_reactors        Number of reactor workers (each owns its own ring).
-  /// @param bounce_slot_size  Size of each pinned bounce slot.
-  /// @param numa_node         Target NUMA node for pinned bounce buffers
-  ///                          shared across all reactors. -1 disables NUMA
-  ///                          binding (legacy single-node behaviour).
-  explicit uring_ioctx(unsigned host_ring_depth = 16,
-                       unsigned ring_entries    = 64,
-                       size_t n_reactors        = 4,
-                       size_t bounce_slot_size  = 1UL * 1024 * 1024,
-                       int numa_node            = -1);
+  /// Each @c uring_reactor in the pool allocates its bounce slots from
+  /// @p mr; @p mr must outlive this ioctx.  The bounce-slot size is taken
+  /// from @c mr.get_block_size().  When @p use_odirect is false, every read
+  /// path except the BYO-device-buffer read goes through the buffered (page
+  /// cache) file handle instead of O_DIRECT.
+  uring_ioctx(size_t n_reactors,
+              cucascade::memory::fixed_size_host_memory_resource& mr,
+              bool use_odirect = true);
+
+  [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::uring; }
+
+ private:
+  /// Delegated-to target: build the reactor pool from a shared context (one
+  /// context shared across all reactors).  The public constructor assembles the
+  /// context from its arguments and forwards here.
+  uring_ioctx(const std::shared_ptr<uring_reactor::reactor_context>& ctx, size_t n_reactors);
 };
 
-}  // namespace sirius::io
+}  // namespace sirius::io::uring

@@ -16,19 +16,30 @@
 
 #include "io/uring/uring_ioctx.hpp"
 
+#include "io/uring/uring_reactor.hpp"
+
 #include <memory>
 
-namespace sirius::io {
+namespace sirius::io::uring {
 
-uring_ioctx::uring_ioctx(unsigned host_ring_depth,
-                         unsigned ring_entries,
-                         size_t n_reactors,
-                         size_t bounce_slot_size,
-                         int numa_node)
-  : templated_ioctx<uring_reactor>(n_reactors, [ring_entries, bounce_slot_size, numa_node] {
-      return std::make_unique<uring_reactor>(ring_entries, bounce_slot_size, numa_node);
-    })
+uring_ioctx::uring_ioctx(size_t n_reactors,
+                         cucascade::memory::fixed_size_host_memory_resource& mr,
+                         bool use_odirect)
+  : uring_ioctx(std::make_shared<uring_reactor::reactor_context>(
+                  uring_reactor::reactor_config_type{.bounce_size = mr.get_block_size(),
+                                                     .use_odirect = use_odirect},
+                  &mr),
+                n_reactors)
 {
 }
 
-}  // namespace sirius::io
+uring_ioctx::uring_ioctx(const std::shared_ptr<uring_reactor::reactor_context>& ctx,
+                         size_t n_reactors)
+  : templated_ioctx<uring_reactor>(
+      n_reactors, ctx->cfg(), [ctx, i = 0](const uring_reactor::reactor_config_type&) mutable {
+        return std::make_unique<uring_reactor>(ctx, fmt::format("reactor-{}", i++));
+      })
+{
+}
+
+}  // namespace sirius::io::uring
