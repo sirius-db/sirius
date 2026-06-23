@@ -32,9 +32,9 @@
 #include <cudf/types.hpp>
 
 // cucascade
-#include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
+#include <cucascade/cudf/host_table.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
-#include <cucascade/memory/host_table.hpp>
 
 // standard library
 #include <memory>

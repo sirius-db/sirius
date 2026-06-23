@@ -33,7 +33,7 @@
 
 #include <nvtx3/nvtx3.hpp>
 
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/cudf/gpu_data_representation.hpp>
 
 #include <algorithm>
 #include <memory>

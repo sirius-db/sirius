@@ -20,7 +20,7 @@
 #include "operator_type_traits.hpp"
 
 #include <catch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <duckdb/function/table_function.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/table_filter.hpp>

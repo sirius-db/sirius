@@ -29,7 +29,7 @@
 #include <op/scan/duckdb_scan_task.hpp>
 
 // cucascade
-#include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 
 // duckdb
@@ -265,7 +265,7 @@ duckdb_scan_task_local_state::column_builder::make_column_metadata(size_t num_ro
   if (type.is_varchar()) {
     // VARCHAR column: data buffer + offsets child
     column_metadata offsets_child{};
-    offsets_child.type_id          = cudf::type_id::INT32;
+    offsets_child.type_id          = static_cast<int32_t>(cudf::type_id::INT32);
     offsets_child.num_rows         = static_cast<cudf::size_type>(num_rows + 1);
     offsets_child.null_count       = 0;
     offsets_child.scale            = 0;
@@ -277,7 +277,7 @@ duckdb_scan_task_local_state::column_builder::make_column_metadata(size_t num_ro
     offsets_child.data_size        = (num_rows + 1) * sizeof(int32_t);
 
     column_metadata col{};
-    col.type_id          = cudf::type_id::STRING;
+    col.type_id          = static_cast<int32_t>(cudf::type_id::STRING);
     col.num_rows         = static_cast<cudf::size_type>(num_rows);
     col.null_count       = static_cast<cudf::size_type>(null_count);
     col.scale            = 0;
@@ -294,7 +294,7 @@ duckdb_scan_task_local_state::column_builder::make_column_metadata(size_t num_ro
     auto cudf_type = sirius::get_cudf_type(type);
 
     column_metadata col{};
-    col.type_id          = cudf_type.id();
+    col.type_id          = static_cast<int32_t>(cudf_type.id());
     col.num_rows         = static_cast<cudf::size_type>(num_rows);
     col.null_count       = static_cast<cudf::size_type>(null_count);
     col.scale            = cudf_type.scale();

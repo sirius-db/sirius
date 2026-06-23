@@ -25,6 +25,7 @@
 #include "planner/query.hpp"
 #include "sirius_context.hpp"
 
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/execution/execution_context.hpp>

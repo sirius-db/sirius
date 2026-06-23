@@ -27,7 +27,8 @@
 #include <memory/sirius_memory_reservation_manager.hpp>
 
 // cucascade
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/cudf/builtin_converters.hpp>
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_space.hpp>

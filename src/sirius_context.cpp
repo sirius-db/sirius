@@ -38,6 +38,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>

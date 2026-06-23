@@ -19,7 +19,7 @@
 #include "operator_test_utils.hpp"
 
 #include <catch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>

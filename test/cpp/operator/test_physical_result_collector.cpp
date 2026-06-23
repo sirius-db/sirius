@@ -26,7 +26,7 @@
 #include <sirius_interface.hpp>
 
 // cucascades
-#include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
 
 // cudf
 #include <cudf/column/column_factories.hpp>

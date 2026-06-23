@@ -26,9 +26,9 @@
 #include <data/data_batch_utils.hpp>
 
 // cucascade
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <helper/helper.hpp>

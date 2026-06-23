@@ -28,8 +28,8 @@
 #include <op/scan/duckdb_scan_task.hpp>
 
 // cucascade
-#include <cucascade/data/cpu_data_representation.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
 
 // cudf
 #include <cudf/null_mask.hpp>
@@ -702,7 +702,7 @@ TEST_CASE("host_table_utils - metadata offsets match packed data",
 
   auto const& string_col = cols[2];
   REQUIRE(string_col.children.size() == 1);
-  REQUIRE(string_col.children[0].type_id == cudf::type_id::INT64);
+  REQUIRE(static_cast<cudf::type_id>(string_col.children[0].type_id) == cudf::type_id::INT64);
 
   sirius::memory::multiple_blocks_allocation_accessor<int64_t> offset_accessor;
   offset_accessor.initialize(string_col.children[0].data_offset, allocation);

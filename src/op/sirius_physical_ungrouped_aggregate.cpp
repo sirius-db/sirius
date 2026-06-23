@@ -42,8 +42,8 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
 
 #include <limits>
 #include <optional>
