@@ -136,7 +136,7 @@ TEST_CASE("brute_force_knn finds exact nearest neighbours", "[vss]")
     auto neighbors = to_host(result.neighbors->view());
     auto distances = to_host_f(result.distances->view());
 
-    // q0's nearest is row 0, and its 3 neighbours are all from the origin
+    // q0's nearest is row 0, and its 3 neighbors are all from the origin
     // cluster {0,1,2}.
     REQUIRE(neighbors[0] == 0);
     REQUIRE(neighbors[1] < 3);

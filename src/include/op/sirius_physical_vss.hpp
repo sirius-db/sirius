@@ -19,8 +19,11 @@
 #include "op/sirius_physical_operator.hpp"
 #include "vss/vss_pattern.hpp"
 
+#include <rmm/device_buffer.hpp>
+
 #include <cstddef>
 #include <memory>
+#include <mutex>
 
 namespace sirius {
 namespace op {
@@ -58,6 +61,11 @@ class sirius_physical_vss : public sirius_physical_operator {
   bool is_sink() const override { return true; }
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
+
+ private:
+  // Query vector is constant across batches, H2D once and reuse for every batch
+  rmm::device_buffer query_buf;
+  std::once_flag query_uploaded;
 };
 
 }  // namespace op

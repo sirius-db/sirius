@@ -67,7 +67,8 @@ std::unique_ptr<cudf::column> make_float32_column(std::vector<float> const& vals
   return col;
 }
 
-// Sirius-style ARRAY<FLOAT>[dim] column (cudf LIST with a contiguous FLOAT32 child).
+// Build a Sirius-style ARRAY<FLOAT>[dim] column (cudf LIST with a contiguous,
+// uniform FLOAT32 values child).
 std::unique_ptr<cudf::column> make_fixed_size_float_list(std::vector<float> const& values,
                                                          cudf::size_type n_rows,
                                                          cudf::size_type dim)
@@ -132,7 +133,7 @@ TEST_CASE("compute_vss_top_k gathers passthrough columns with their distances", 
   auto stream = cudf::get_default_stream();
   auto mr     = cudf::get_current_device_resource_ref();
 
-  // Rows: (id, vec) with Euclidean distance to the origin in the comment.
+  // Rows: (id, vec) with Euclidean distance to the origin
   auto ids = make_int32_column({10, 11, 12, 13});
   auto vec = make_fixed_size_float_list(
     {

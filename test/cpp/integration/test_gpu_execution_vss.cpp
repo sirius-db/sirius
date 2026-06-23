@@ -25,8 +25,8 @@
  *
  * compare_gpu_vs_cpu() also asserts exactly one GPU execution with zero
  * fallbacks, so a silent CPU fallback fails the test. The stats cannot tell
- * "ran via VSS" apart from "ran via an ordinary GPU TopN" — both are on-GPU —
- * so these verify correctness on the GPU path; VSS-specific behaviour (distance
+ * "ran via VSS" apart from "ran via an ordinary GPU TopN" (both are on GPU)
+ * so these verify correctness on the GPU path; VSS-specific behavior (distance
  * magnitudes, the fused gather/merge) is pinned by the unit tests under
  * test/cpp/vss/. Note that `array_distance` is not supported on the generic GPU
  * TopN path, so if VSS matching regressed the query would fall back and trip the
@@ -47,7 +47,7 @@ TEST_CASE_METHOD(VssFixture,
                  "[integration][gpu_execution][array][vss]")
 {
   // vec=[i,i,i] as FLOAT[3]; distance to the origin is sqrt(3)*i, STRICTLY
-  // increasing in i, so the k nearest are rows 0..k-1 with no distance ties —
+  // increasing in i, so the k nearest are rows 0..k-1 with no distance ties:
   // GPU (cuVS L2Sqrt) and CPU (array_distance) agree on the exact row set.
   // 5000 rows (> STANDARD_VECTOR_SIZE) also forces a persistent on-disk segment.
   run_ok(
@@ -60,12 +60,12 @@ TEST_CASE_METHOD(VssFixture,
     "SELECT id FROM test_vss "
     "ORDER BY array_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 5;");
 
-  // With OFFSET — exercises the merge's offset slice.
+  // With OFFSET: exercises the merge's offset slice.
   compare_gpu_vs_cpu(
     "SELECT id FROM test_vss "
     "ORDER BY array_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 5 OFFSET 3;");
 
-  // SELECT * — the FLOAT[3] vector column is gathered by the neighbour map and
+  // SELECT *: the FLOAT[3] vector column is gathered by the neighbor map and
   // round-trips back to a DuckDB ARRAY in the result (passthrough output column).
   compare_gpu_vs_cpu(
     "SELECT * FROM test_vss "
@@ -77,7 +77,7 @@ TEST_CASE_METHOD(VssFixture,
                  "[integration][gpu_execution][array][vss]")
 {
   // Distinct directions so cosine distances to [1,0,0] rank unambiguously:
-  // id0 (same dir, 0) < id3 (45 deg) < {id1, id2} (orthogonal, tie) — the tie
+  // id0 (same dir, 0) < id3 (45 deg) < {id1, id2} (orthogonal, tie): the tie
   // sits below the LIMIT-2 boundary, so the top-2 set {0,3} is well-defined.
   run_ok("CREATE TABLE test_vss_cos (id INTEGER, vec FLOAT[3]);");
   run_ok(

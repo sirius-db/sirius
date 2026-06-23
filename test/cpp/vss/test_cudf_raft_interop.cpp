@@ -38,14 +38,12 @@
 
 namespace {
 
-// Build a Sirius-style ARRAY<FLOAT>[dim] column: a cudf LIST column whose
-// values child is a contiguous [n_rows * dim] FLOAT32 buffer with uniform
-// offsets 0, dim, 2*dim, ...
+// Build a Sirius-style ARRAY<FLOAT>[dim] column (cudf LIST with a contiguous,
+// uniform FLOAT32 values child).
 std::unique_ptr<cudf::column> make_fixed_size_float_list(std::vector<float> const& values,
                                                          cudf::size_type n_rows,
                                                          cudf::size_type dim)
 {
-  // Values child.
   auto child = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::FLOAT32}, n_rows * dim, cudf::mask_state::UNALLOCATED);
   cudaMemcpy(child->mutable_view().data<float>(),
@@ -53,7 +51,6 @@ std::unique_ptr<cudf::column> make_fixed_size_float_list(std::vector<float> cons
              sizeof(float) * values.size(),
              cudaMemcpyHostToDevice);
 
-  // Offsets child: [0, dim, 2*dim, ..., n_rows*dim].
   std::vector<int32_t> offsets(n_rows + 1);
   for (cudf::size_type i = 0; i <= n_rows; ++i) {
     offsets[i] = i * dim;

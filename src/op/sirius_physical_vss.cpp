@@ -72,12 +72,14 @@ std::unique_ptr<cudf::table> make_empty_vss_output(cudf::table_view input,
 
 }  // namespace
 
-std::unique_ptr<cudf::table> compute_vss_top_k(cudf::table_view input,
-                                               sirius::vss::vss_top_k_pattern const& pattern,
-                                               std::size_t limit,
-                                               std::size_t offset,
-                                               rmm::cuda_stream_view stream,
-                                               rmm::device_async_resource_ref memory_resource)
+std::unique_ptr<cudf::table> compute_vss_top_k(
+  cudf::table_view input,
+  sirius::vss::vss_top_k_pattern const& pattern,
+  std::size_t limit,
+  std::size_t offset,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref memory_resource,
+  std::optional<sirius::vss::dataset_matrix_view> query)
 {
   if (limit == 0 || input.num_rows() == 0) { return make_empty_vss_output(input, pattern); }
 
@@ -92,35 +94,51 @@ std::unique_ptr<cudf::table> compute_vss_top_k(cudf::table_view input,
   // Zero-copy reinterpretation from cudf LIST column into a matrix view
   auto dataset_view = sirius::vss::list_column_as_dataset_view(input.column(col_idx), pattern.dim);
 
-  // Upload the constant query vector as a [1, dim] device matrix and
-  // make sure it is resident before brute_force_knn reads it
-  rmm::device_buffer query_buf(pattern.query.size() * sizeof(float), stream, memory_resource);
-  CUDF_CUDA_TRY(cudaMemcpyAsync(query_buf.data(),
-                                pattern.query.data(),
-                                query_buf.size(),
-                                cudaMemcpyHostToDevice,
-                                stream.value()));
-  stream.synchronize();
-  auto query_view = raft::make_device_matrix_view<const float, int64_t, raft::row_major>(
-    static_cast<float const*>(query_buf.data()), int64_t{1}, pattern.dim);
+  // The query vector is constant (a [1, dim] device matrix)
+  rmm::device_buffer local_query;
+  if (!query.has_value()) {
+    local_query = rmm::device_buffer(pattern.query.size() * sizeof(float), stream, memory_resource);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(local_query.data(),
+                                  pattern.query.data(),
+                                  local_query.size(),
+                                  cudaMemcpyHostToDevice,
+                                  stream.value()));
+    stream.synchronize();
+  }
+  auto query_view = query.has_value()
+                      ? *query
+                      : raft::make_device_matrix_view<const float, int64_t, raft::row_major>(
+                          static_cast<float const*>(local_query.data()), int64_t{1}, pattern.dim);
 
   auto knn = sirius::vss::brute_force_knn(dataset_view, query_view, keep, pattern.metric);
 
   auto gathered = cudf::gather(
     input, knn.neighbors->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, memory_resource);
 
-  // Assemble the fused projection's output columns and
-  // the result is the per-batch top-k handed to VSS_MERGE
+  // Release so passthroughs are moved into the output instead of deep-copied
+  auto gathered_cols = gathered->release();
+  std::vector<int> remaining_refs(gathered_cols.size(), 0);
+  for (auto const& oc : pattern.output_columns) {
+    if (oc.which == sirius::vss::vss_output_column::kind::gather_input) {
+      // Per-column reference count
+      ++remaining_refs[oc.input_index];
+    }
+  }
+
+  // Assemble the output columns (local per-batch top-k handed to VSS_MERGE)
   std::vector<std::unique_ptr<cudf::column>> out_cols;
   out_cols.reserve(pattern.output_columns.size());
   for (auto const& oc : pattern.output_columns) {
     if (oc.which == sirius::vss::vss_output_column::kind::distance) {
       // Distance is computed from cuVS
       out_cols.push_back(std::move(knn.distances));
+    } else if (--remaining_refs[oc.input_index] == 0) {
+      // Last (or only) use of this passthrough column (steal it)
+      out_cols.push_back(std::move(gathered_cols[oc.input_index]));
     } else {
-      // Passthrough columns are copied from the gathered input
+      // Columns with more than 1 reference count need to be deep-copied
       out_cols.push_back(std::make_unique<cudf::column>(
-        gathered->view().column(oc.input_index), stream, memory_resource));
+        gathered_cols[oc.input_index]->view(), stream, memory_resource));
     }
   }
   return std::make_unique<cudf::table>(std::move(out_cols));
@@ -198,7 +216,7 @@ std::unique_ptr<operator_data> sirius_physical_vss::execute(const operator_data&
     throw internal_exception("VSS expects a single input batch per execution");
   }
 
-  // Copy holds its own shared lock; alive (with input_batches) through the call
+  // Copy holds its own shared lock; alive through the call
   auto input_batch = input_batches[0];
   auto* space      = input_batch.get_memory_space();
   if (space == nullptr) {
@@ -213,8 +231,23 @@ std::unique_ptr<operator_data> sirius_physical_vss::execute(const operator_data&
 
   auto input_table_view =
     input_batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+
+  // Upload query vector once and reuse across batches
+  std::call_once(query_uploaded, [&] {
+    query_buf = rmm::device_buffer(
+      pattern.query.size() * sizeof(float), stream, space->get_default_allocator());
+    CUDF_CUDA_TRY(cudaMemcpyAsync(query_buf.data(),
+                                  pattern.query.data(),
+                                  query_buf.size(),
+                                  cudaMemcpyHostToDevice,
+                                  stream.value()));
+    stream.synchronize();
+  });
+  auto query_view = raft::make_device_matrix_view<const float, int64_t, raft::row_major>(
+    static_cast<float const*>(query_buf.data()), int64_t{1}, pattern.dim);
+
   auto output_table = compute_vss_top_k(
-    input_table_view, pattern, limit, offset, stream, space->get_default_allocator());
+    input_table_view, pattern, limit, offset, stream, space->get_default_allocator(), query_view);
 
   std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
   // STREAM-LINEAGE: compute_vss_top_k writes the output table on stream; the
