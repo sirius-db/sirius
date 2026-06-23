@@ -22,13 +22,11 @@
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/planner.hpp"
-#include "io/s3/s3_blocking_ioctx.hpp"
-#include "io/s3/sirius_sigv4_authorizer.hpp"
-#include "io/s3/static_credentials.hpp"
 #include "log/logging.hpp"
 #include "memory/numa_small_pinned_mr.hpp"
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "memory/topology_index.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "transparent/physical_sirius_execution.hpp"
 
@@ -122,37 +120,38 @@ std::optional<std::string> find_legacy_config_file()
 /// does not count against this rlimit). Without this preflight, a low
 /// limit surfaces as -ENOMEM on a worker thread inside liburing and
 /// aborts the process with no actionable message.
-void check_memlock_budget(size_t total_reactors)
-{
-  struct rlimit rl{};
-  if (::getrlimit(RLIMIT_MEMLOCK, &rl) != 0) { return; }
-  if (rl.rlim_cur == RLIM_INFINITY) { return; }
+// void check_memlock_budget(size_t total_reactors)
+// {
+//   struct rlimit rl{};
+//   if (::getrlimit(RLIMIT_MEMLOCK, &rl) != 0) { return; }
+//   if (rl.rlim_cur == RLIM_INFINITY) { return; }
 
-  size_t const per_reactor = sirius::io::NUM_CHUNKS * sirius::io::CHUNK_SIZE;
-  size_t const required    = per_reactor * total_reactors;
-  if (rl.rlim_cur >= required) { return; }
+//   size_t const per_reactor = sirius::io::NUM_CHUNKS * sirius::io::CHUNK_SIZE;
+//   size_t const required    = per_reactor * total_reactors;
+//   if (rl.rlim_cur >= required) { return; }
 
-  // Handles RLIM_INFINITY for rl.rlim_max only — rl.rlim_cur == RLIM_INFINITY
-  // path is unreachable here (early-return above), but rlim_max may still be
-  // unlimited when soft is finite and below `required`.
-  auto format_limit = [](rlim_t limit) {
-    if (limit == RLIM_INFINITY) { return std::string("unlimited"); }
-    return std::format("{} MiB", static_cast<unsigned long long>(limit >> 20));
-  };
+//   // Handles RLIM_INFINITY for rl.rlim_max only — rl.rlim_cur == RLIM_INFINITY
+//   // path is unreachable here (early-return above), but rlim_max may still be
+//   // unlimited when soft is finite and below `required`.
+//   auto format_limit = [](rlim_t limit) {
+//     if (limit == RLIM_INFINITY) { return std::string("unlimited"); }
+//     return std::format("{} MiB", static_cast<unsigned long long>(limit >> 20));
+//   };
 
-  throw std::runtime_error(std::format(
-    "SiriusContext: insufficient RLIMIT_MEMLOCK for io_uring registered buffers. Required {} MiB "
-    "({} reactors x {} bounce slots x {} MiB); current soft/hard limit is {}/{}. Raise memlock "
-    "with `ulimit -l unlimited` for this shell (up to the hard limit), set both soft and hard "
-    "memlock in /etc/security/limits.d/ for login sessions, set systemd "
-    "`LimitMEMLOCK=infinity`, or grant CAP_IPC_LOCK.",
-    required >> 20,
-    total_reactors,
-    sirius::io::NUM_CHUNKS,
-    sirius::io::CHUNK_SIZE >> 20,
-    format_limit(rl.rlim_cur),
-    format_limit(rl.rlim_max)));
-}
+//   throw std::runtime_error(std::format(
+//     "SiriusContext: insufficient RLIMIT_MEMLOCK for io_uring registered buffers. Required {} MiB
+//     "
+//     "({} reactors x {} bounce slots x {} MiB); current soft/hard limit is {}/{}. Raise memlock "
+//     "with `ulimit -l unlimited` for this shell (up to the hard limit), set both soft and hard "
+//     "memlock in /etc/security/limits.d/ for login sessions, set systemd "
+//     "`LimitMEMLOCK=infinity`, or grant CAP_IPC_LOCK.",
+//     required >> 20,
+//     total_reactors,
+//     sirius::io::NUM_CHUNKS,
+//     sirius::io::CHUNK_SIZE >> 20,
+//     format_limit(rl.rlim_cur),
+//     format_limit(rl.rlim_max)));
+// }
 
 }  // namespace
 
@@ -521,52 +520,25 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   task_creator_->set_task_scheduler(*task_scheduler_);
   task_scheduler_->set_task_creator(*task_creator_);
 
-  // Compose the scan_manager_config: start from the engine's default
-  // (uring + prefetch knobs) and layer the S3 backend on top when the
-  // object_store_config has all the required fields. Empty fields keep
-  // the S3 backend disabled — the default scan_manager_config has
-  // s3_config == std::nullopt and the scan_manager skips s3_ioctx
-  // construction. The FSMR is passed through to uring_ioctx / buffer_pool.
+  // Compose the scan_manager_config from the engine's default (uring +
+  // prefetch knobs). The FSMR is passed through to uring_ioctx / buffer_pool.
   auto sm_config = config_.get_scan_manager_config();
   // duckdb-native scan needs sirius_ioctx for host_read; enable it whenever an
   // FSMR is available so the GPU-native scan path can read host data.
   if (host_fsmr != nullptr) { sm_config.use_sirius_datasource = true; }
-  if (!config_.object_store_config.endpoint.empty() &&
-      !config_.object_store_config.access_key.empty() &&
-      !config_.object_store_config.secret_key.empty()) {
-    auto creds = sirius::io::s3::static_credentials_from(config_.object_store_config);
-    std::shared_ptr<sirius::io::s3::s3_request_authorizer> provider;
-    if (config_.object_store_config.s3_signing_mode ==
-        sirius::io::object_store_config::signing_mode::header) {
-      provider = std::make_shared<sirius::io::s3::sirius_sigv4_header_authorizer>(
-        std::move(creds), config_.object_store_config.region, config_.object_store_config.endpoint);
-    } else {
-      provider = std::make_shared<sirius::io::s3::sirius_sigv4_presigned_authorizer>(
-        std::move(creds),
-        config_.object_store_config.region,
-        config_.object_store_config.endpoint,
-        std::chrono::minutes{5});
-    }
-    sirius::io::s3::s3_ioctx_config s3_cfg{};
-    s3_cfg.creds          = std::move(provider);
-    s3_cfg.ca_bundle_path = config_.object_store_config.ca_bundle_path;
-    s3_cfg.tls_verify     = config_.object_store_config.tls_verify;
-    sm_config.s3_config   = std::move(s3_cfg);
-    // Carry the async/blocking backend choice across to the scan_manager, which
-    // owns S3 backend construction. Without this the flag is parsed but dropped,
-    // and the manager always builds the blocking backend.
-    sm_config.s3_use_async_backend = config_.object_store_config.s3_use_async_backend;
-  }
-  // Persist the composed config back onto config_ so a later get_config()
-  // reflects the actual S3 wiring -- get_scan_manager_config() must not report
-  // s3_config == nullopt while a live S3 backend exists. The s3_ioctx_config
-  // stored here carries credentials only; async_thread_pool stays null -- the
-  // scan_manager constructor builds the chosen S3 backend (async s3_ioctx or
-  // blocking s3_blocking_ioctx, per s3_use_async_backend) and, for the blocking
-  // case, injects its own s3_thread_pool into the config copy.
   config_.set_scan_manager_config(std::move(sm_config));
+  // Scope the topology index to the GPUs Sirius actually reserved memory on,
+  // so gpu_ids() (which drives round-robin scan placement) never names a GPU
+  // without a memory space.
+  std::vector<int> gpu_device_ids;
+  for (auto const* gpu_space :
+       memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+    gpu_device_ids.push_back(gpu_space->get_device_id());
+  }
+  auto hw_topology_index = std::make_shared<const sirius::memory::topology_index>(
+    config_.get_hw_topology(), std::move(gpu_device_ids));
   scan_manager_ = std::make_unique<sirius::scan_manager::sirius_scan_manager>(
-    config_.get_scan_manager_config(), host_fsmr);
+    config_.get_scan_manager_config(), *memory_manager_, std::move(hw_topology_index));
 
   // Wire the pipeline task queue into downgrade executors now that task_scheduler_
   // has been constructed.
@@ -737,18 +709,7 @@ void SiriusContext::create_query(
     std::move(pipelines), telemetry_context_->context(), telemetry_info);
   task_scheduler_->prepare_for_query(query_);
   task_creator_->prepare_for_query(*query_);
-  // Pass per-GPU sirius_ioctx map to scan_manager so parquet_split_provider
-  // can construct sirius_datasources via ioctx->make_datasource(io_object)
-  // instead of cudf's bundled file_source factory. Also build a device_id ->
-  // GPU memory_space map for the HOST-tier cached_split_provider's
-  // host->gpu materialization at produce_split time (pin_table tier='host').
-  std::unordered_map<int, cucascade::memory::memory_space*> gpu_memory_spaces;
-  for (auto const* gpu_space :
-       memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
-    gpu_memory_spaces[gpu_space->get_device_id()] =
-      const_cast<cucascade::memory::memory_space*>(gpu_space);
-  }
-  scan_manager_->prepare_for_query(*query_, gpu_memory_spaces);
+  scan_manager_->prepare_for_query(*query_);
 }
 
 duckdb::shared_ptr<sirius::planner::query> SiriusContext::get_query()
