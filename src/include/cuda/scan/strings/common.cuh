@@ -127,7 +127,7 @@ struct prepared_fsst {
   std::vector<fsst_chunk_desc> gather_chunks;   ///< pass-1 phase-C + pass-2 (per chunk)
   std::vector<fsst_decoder_compact> decoders;   ///< symbol tables (per segment)
   std::vector<uint32_t> row_starts;             ///< prefix sum of FSST row counts
-  uint32_t total_fsst_row_count;
+  uint32_t total_fsst_row_count = 0;
 };
 
 struct prepared_dict_fsst {
