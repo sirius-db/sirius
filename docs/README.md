@@ -33,28 +33,14 @@ Running TPC-H on 1TB data, Sirius accelerates DuckDB by 5x on DGX Station (GB300
 
 ## Building and Running Sirius
 
-Clone the repository with all submodules:
+For full build instructions, alternate build types, pre-commit setup, and testing, see [DEVELOPMENT.md](DEVELOPMENT.md).
+
+Quick start:
 
 ```bash
 git clone --recurse-submodules https://github.com/sirius-db/sirius.git
 cd sirius
-```
-
-Build with Pixi (uses all available cores):
-
-```bash
 pixi run make
-```
-
-If the build exhausts memory, reduce parallelism:
-
-```bash
-CMAKE_BUILD_PARALLEL_LEVEL=8 pixi run make
-```
-
-Run the Sirius-linked DuckDB binary — the extension is statically built in and loads automatically:
-
-```bash
 ./build/release/duckdb -unsigned
 ```
 
@@ -91,21 +77,6 @@ Sirius loads its settings from a YAML config file, searched in this order:
 3. `~/.sirius/sirius.yaml`
 
 If no config file is found, built-in defaults apply (95% GPU memory, 8 GiB pinned host memory per NUMA node). See the [Configuration reference](super-sirius/configuration.md) for all options: memory tiers, thread pools, operator parameters, and runtime `SET` variables. An example config is provided at [`test/cpp/integration/integration.yaml`](../test/cpp/integration/integration.yaml).
-
-## Testing
-
-Run the full C++ unit test suite (what CI runs):
-
-```bash
-pixi run make test
-```
-
-Run tests by Catch2 tag or name:
-
-```bash
-pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[cpu_cache]"
-pixi run build/release/extension/sirius/test/cpp/sirius_unittest "test_cpu_cache_basic_string_single_col"
-```
 
 ## Logging
 Sirius uses [spdlog](https://github.com/gabime/spdlog) for logging messages during query execution. Default log directory is `log` (relative to the current working directory) and default log level is `info`.
