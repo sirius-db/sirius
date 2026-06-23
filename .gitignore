@@ -53,3 +53,4 @@ log/
 /test/cpp/integration/s3/fixtures/local/
 /test/cpp/integration/s3/fixtures/generated/
 /test/cpp/integration/s3/certs/
+*.local.md
