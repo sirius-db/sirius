@@ -47,14 +47,20 @@ jobs:
           manifest-path: experimental/starrocks/pixi.toml
           environments: cn
 
+      # Scope by package: `--all` would also reach the sibling rust/ workspace via the
+      # `sirius` path dep. Mirrors check.yml's scoped rust/ fmt check.
       - name: fmt
-        run: pixi run -e cn cargo fmt --all -- --check
+        run: pixi run -e cn cargo fmt --package sirius-starrocks-cn --package starrocks-plan-translator --package starrocks-thrift -- --check
 
+      # The CN's `sirius-engine` feature is on by default but links a Sirius build
+      # tree (C++ toolchain + RAPIDS/CUDA) that this CI env does not have, so build
+      # the pure-Rust path here. The engine path is exercised on a GPU box via
+      # `pixi run cn-build` / `cn-test`.
       - name: clippy
-        run: pixi run -e cn cargo clippy --all-targets -- -D warnings
+        run: pixi run -e cn cargo clippy --all-targets --no-default-features -- -D warnings
 
       - name: test
-        run: pixi run -e cn cargo test --workspace
+        run: pixi run -e cn cargo test --workspace --no-default-features
 
   experimental:
     name: experimental
