@@ -385,8 +385,8 @@ std::size_t estimate_decoded_bytes_budget(duckdb::idx_t row_count,
       // ARRAY: offsets (int32) + child values (array_size × child_width × row_count).
       auto const array_size  = projected_types[ci].array_size();
       auto const child_width = projected_types[ci].array_child().fixed_width_byte_size();
-      budget += static_cast<std::size_t>(row_count) *
-                (sizeof(std::int32_t) + array_size * child_width);
+      budget +=
+        static_cast<std::size_t>(row_count) * (sizeof(std::int32_t) + array_size * child_width);
     } else {
       budget += static_cast<std::size_t>(row_count) * projected_types[ci].fixed_width_byte_size();
     }
