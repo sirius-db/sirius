@@ -78,11 +78,12 @@ class mock_sirius_physical_operator : public sirius_physical_operator {
   /**
    * @brief Override to return configured hint when in custom mode.
    */
-  std::optional<task_creation_hint> get_next_task_hint() override
+  std::optional<task_creation_hint> get_next_task_hint(
+    std::optional<std::size_t> downstream_request = std::nullopt) override
   {
     if (_use_custom_hint) { return _custom_hint; }
     // Fall back to parent implementation
-    return sirius_physical_operator::get_next_task_hint();
+    return sirius_physical_operator::get_next_task_hint(downstream_request);
   }
 
  private:
@@ -372,10 +373,10 @@ TEST_CASE("get_operator_for_next_task with monostate hint and empty priority_sca
 
   // process_next_task should just return nullptr because there its not really connected to anything
   // and has no data
-  auto next_op = creator.get_operator_for_next_task(mock_op.get());
+  auto target = creator.get_operator_for_next_task(mock_op.get());
 
   // Nothing should be scheduled
-  REQUIRE(next_op == nullptr);
+  REQUIRE(target.node == nullptr);
 }
 
 TEST_CASE("get_operator_for_next_task for operator with data returns the operator",
@@ -414,9 +415,9 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
   // Call process_next_task - this should attempt to schedule with hint_op
   // Note: This will try to access hint_op->get_port("default")->dest_pipeline
   // which we've set up above
-  auto next_op = creator.get_operator_for_next_task(hint_op.get());
+  auto target = creator.get_operator_for_next_task(hint_op.get());
 
-  REQUIRE(next_op == hint_op.get());
+  REQUIRE(target.node == hint_op.get());
 
   // // Verify that schedule was called with the hint_op
   // auto scheduled_nodes = creator.get_scheduled_nodes();

@@ -27,8 +27,6 @@
 
 #include <nvtx3/nvtx3.hpp>
 
-#include <functional>
-
 namespace sirius {
 namespace op {
 
@@ -94,12 +92,16 @@ sirius_physical_sort_sample::sirius_physical_sort_sample(
 {
 }
 
-std::optional<task_creation_hint> sirius_physical_sort_sample::get_next_task_hint()
+std::optional<task_creation_hint> sirius_physical_sort_sample::get_next_task_hint(
+  std::optional<std::size_t> downstream_request)
 {
   const auto state = _boundary_state.load(std::memory_order_acquire);
 
-  // Boundaries already computed — process batches one at a time.
-  if (state == BoundaryState::DONE) { return sirius_physical_operator::get_next_task_hint(); }
+  // Boundaries already computed — sort_sample is then a pure PASSTHROUGH; forward to the base impl
+  // which combines our PASSTHROUGH relation with downstream_request.
+  if (state == BoundaryState::DONE) {
+    return sirius_physical_operator::get_next_task_hint(downstream_request);
+  }
 
   // Boundary task already scheduled; wait for it to finish before creating more tasks.
   if (state == BoundaryState::SCHEDULED) { return std::nullopt; }
@@ -113,10 +115,14 @@ std::optional<task_creation_hint> sirius_physical_sort_sample::get_next_task_hin
 
   bool upstream_finished = p->src_pipeline && p->src_pipeline->is_pipeline_finished();
   if (repo_has_enough_sample_bytes(p->repo, _sort_sample_bytes, upstream_finished)) {
-    return task_creation_hint{TaskCreationHint::READY, this};
+    return task_creation_hint{TaskCreationHint::READY, this, task_creation_hint::ALL_TASKS};
   }
 
   if (p->src_pipeline && !upstream_finished) {
+    // Sampling is byte-driven, not batch-count-driven: keep pulling upstream tasks until enough
+    // sample bytes accumulate, so request ALL_TASKS regardless of any (smaller) downstream request.
+    // After boundaries are computed sort_sample becomes PASSTHROUGH (handled in the DONE branch
+    // above, which forwards downstream_request).
     auto* producer = &(p->src_pipeline->get_operators()[0].get());
     return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
   }

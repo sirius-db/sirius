@@ -64,7 +64,8 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
                                          rmm::cuda_stream_view stream) override;
 
   //! Override to wait for enough sample bytes before returning READY
-  std::optional<task_creation_hint> get_next_task_hint() override;
+  std::optional<task_creation_hint> get_next_task_hint(
+    std::optional<std::size_t> downstream_request = std::nullopt) override;
 
   //! Override to pull sample bytes before boundary computation, then one batch at a time
   std::unique_ptr<operator_data> get_next_task_input_data() override;

@@ -82,7 +82,14 @@ class sirius_physical_partition : public sirius_physical_operator {
 
   void sink(const operator_data& input_data, rmm::cuda_stream_view stream) override;
 
-  std::optional<task_creation_hint> get_next_task_hint() override;
+  std::optional<task_creation_hint> get_next_task_hint(
+    std::optional<std::size_t> downstream_request = std::nullopt) override;
+
+  //! Partition turns one input batch into N output partitions.
+  [[nodiscard]] TaskCountRelation upstream_to_downstream_relation() const override
+  {
+    return TaskCountRelation::FAN_OUT;
+  }
 
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 

@@ -40,7 +40,8 @@ class sirius_physical_cpu_source : public sirius_physical_operator {
                              duckdb::idx_t estimated_cardinality,
                              bool produce_single_row);
 
-  std::optional<task_creation_hint> get_next_task_hint() override
+  std::optional<task_creation_hint> get_next_task_hint(
+    std::optional<std::size_t> /* downstream_request */ = std::nullopt) override
   {
     // A CPU source is single-shot: one task drains the collection. Gate task
     // creation on task_scheduled so concurrent calls from the task creator
@@ -49,7 +50,9 @@ class sirius_physical_cpu_source : public sirius_physical_operator {
     // after the task runs, leaving a window where a second task can be created.
     bool expected = false;
     if (!task_scheduled.compare_exchange_strong(expected, true)) { return std::nullopt; }
-    return task_creation_hint{TaskCreationHint::READY, this};
+    // CPU source is single-shot: exactly one task drains the collection. The downstream request
+    // is irrelevant — we cap at 1 regardless.
+    return task_creation_hint{TaskCreationHint::READY, this, 1};
   }
 
   bool is_source() const override { return true; }

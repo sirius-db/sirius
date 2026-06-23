@@ -272,9 +272,12 @@ sirius_physical_operator::get_next_ports_after_sink() const
   return next_port_after_sink;
 }
 
-std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
+std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint(
+  std::optional<std::size_t> downstream_request)
 {
   if (ports.empty()) { return std::nullopt; }
+
+  const auto relation = upstream_to_downstream_relation();
 
   // look at the input ports and see if there are any unfinished hard barriers
   auto unfinished_barrier = std::find_if(_ports_list.begin(), _ports_list.end(), [](const auto& p) {
@@ -284,7 +287,11 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
 
   if (unfinished_barrier != _ports_list.end()) {
     auto* producer = &((*unfinished_barrier)->src_pipeline->get_operators()[0].get());
-    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+    return task_creation_hint{
+      TaskCreationHint::WAITING_FOR_INPUT_DATA,
+      producer,
+      combine_upstream_request(
+        tasks_for_barrier((*unfinished_barrier)->type), relation, downstream_request)};
   }
 
   // if no unfinished barriers, then is this operator ready to create a task?
@@ -294,7 +301,13 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
                (p->type == MemoryBarrierType::FULL && p->repo->total_size() > 0 &&
                 p->src_pipeline && p->src_pipeline->is_pipeline_finished());
       })) {
-    return task_creation_hint{TaskCreationHint::READY, this};
+    // READY cap: PASSTHROUGH operators honor downstream's explicit request (so a downstream FULL
+    // barrier won't quietly become "drain everything"); other relations stick with ALL_TASKS.
+    std::size_t ready_cap = task_creation_hint::ALL_TASKS;
+    if (relation == TaskCountRelation::PASSTHROUGH && downstream_request.has_value()) {
+      ready_cap = *downstream_request;
+    }
+    return task_creation_hint{TaskCreationHint::READY, this, ready_cap};
   }
 
   // if not scan from dependent pipelines
@@ -306,7 +319,11 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
 
   if (unfinished_pipeline != _ports_list.end()) {
     auto* producer = &((*unfinished_pipeline)->src_pipeline->get_operators()[0].get());
-    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+    return task_creation_hint{
+      TaskCreationHint::WAITING_FOR_INPUT_DATA,
+      producer,
+      combine_upstream_request(
+        tasks_for_barrier((*unfinished_pipeline)->type), relation, downstream_request)};
   }
 
   // nothing to do

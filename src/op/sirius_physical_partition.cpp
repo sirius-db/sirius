@@ -261,33 +261,40 @@ void sirius_physical_partition::set_num_partitions(int num_partitions)
   _num_partitions = num_partitions;
 }
 
-std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint()
+std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint(
+  std::optional<std::size_t> downstream_request)
 {
   std::lock_guard<std::mutex> guard(lock);
   if (!_num_partitions.has_value() && !_is_build && _sibling_partition_op != nullptr) {
     // If this is a probe partition and we haven't determined the number of partitions yet, we
     // should wait for the build sibling to determine it. This is because the build side will drive
     // the partitioning and the probe side needs to know the number of partitions to create the
-    // correct number of tasks.
-    return _sibling_partition_op->get_next_task_hint();
+    // correct number of tasks. Forward the downstream request — the sibling will route it
+    // through its own relation rules.
+    return _sibling_partition_op->get_next_task_hint(downstream_request);
   } else if (_num_partitions.has_value() && !_is_build && _sibling_partition_op != nullptr) {
     // If this is part of a join and its on the probe side, and we have determined the number of
-    // partitions, we have this behave as a pipeline operator and just schedule tasks
+    // partitions, we have this behave as a pipeline operator and just schedule tasks. Partition
+    // is FAN_OUT (1 -> _num_partitions), so a downstream request does not promote upstream
+    // demand; we keep the port-barrier default.
 
     if (ports.size() != 1) {  // Ensure that it only has one port
-      throw std::runtime_error("sirius_physical_concat: there should be only one port");
+      throw std::runtime_error("sirius_physical_partition: there should be only one port");
     }
     auto port_ptr = ports.begin()->second;
     if (port_ptr->repo->total_size() > 0) {
-      return task_creation_hint{TaskCreationHint::READY, this};
+      return task_creation_hint{TaskCreationHint::READY, this, task_creation_hint::ALL_TASKS};
     } else if (port_ptr->src_pipeline && !port_ptr->src_pipeline->is_pipeline_finished()) {
+      // In pipelineable-probe mode partition can make progress one batch at a time; honor the
+      // port's barrier type so PIPELINE ports ask for 1, PARTIAL for 4, etc.
       auto* producer = &(port_ptr->src_pipeline->get_operators()[0].get());
-      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+      return task_creation_hint{
+        TaskCreationHint::WAITING_FOR_INPUT_DATA, producer, tasks_for_barrier(port_ptr->type)};
     } else {
       return std::nullopt;
     }
   } else {
-    return sirius_physical_operator::get_next_task_hint();
+    return sirius_physical_operator::get_next_task_hint(downstream_request);
   }
 }
 
