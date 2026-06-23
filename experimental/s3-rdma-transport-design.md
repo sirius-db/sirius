@@ -103,6 +103,16 @@ the stream first if a D2D was already queued).
 (`max_inflight × slot_size` per active GPU, worst case). Direct-into-RMM is a
 gated future spike (§5 Q4).
 
+**One reactor, not one per GPU.** Multi-GPU affinity lives at the **arena/slot**
+layer — a worker does `cudaSetDevice(r.device_id)` and takes a slot from *that*
+device's arena, so the slot and `r.dst` are always same-device (never a
+cross-device copy). The single reactor owns one global worker pool. A per-GPU
+reactor would make concurrency `GPUs × max_inflight` (e.g. 4×8 = 32 concurrent
+`cuObjGet`), breaking the global in-flight ceiling and risking gateway/NIC
+overload. Per-GPU / per-NIC **reactor sharding** — tighter NIC↔GPU affinity and
+per-device throttling, at the cost of global rate-limit and config complexity —
+is a deferred evolution for explicit multi-NIC/NUMA topologies, not v1.
+
 ## 4. Rollout
 
 | Phase | Scope | HW |
