@@ -20,7 +20,6 @@
 #include <data/host_parquet_representation_converters.hpp>
 #include <log/logging.hpp>
 #include <op/scan/cached_ranges.hpp>
-#include <op/scan/prefetched_data_source.hpp>
 
 // cucascade
 #include <cucascade/data/gpu_data_representation.hpp>
@@ -79,6 +78,21 @@ convert_host_parquet_to_gpu_with_prefetched_data_source(
   cucascade::memory::memory_space const* target_memory_space,
   rmm::cuda_stream_view stream)
 {
+  // STRUCTURAL GAP (io rebase): sirius::op::scan::prefetched_data_source — the
+  // in-memory cudf::io::datasource adapter that wrapped a cache_ranges and fed
+  // cudf::io::read_parquet from prefetched host blocks — was removed
+  // (prefetched_data_source.cpp deleted, the type is no longer declared) with no
+  // replacement. The cached-host-parquet -> GPU conversion below cannot be
+  // reconstructed until that adapter is reimplemented, so this path is stubbed
+  // to throw and the dependent body is disabled.
+  (void)source;
+  (void)target_memory_space;
+  (void)stream;
+  throw std::runtime_error(
+    "convert_host_parquet_to_gpu_with_prefetched_data_source: prefetched_data_source "
+    "adapter was removed in the io rebase; cached-host-parquet GPU conversion is "
+    "unavailable until it is reimplemented.");
+#if 0   // disabled: depends on the removed prefetched_data_source adapter
   auto& host_src                         = source.cast<host_parquet_representation>();
   auto const& post_filter_projection_ids = host_src.get_post_filter_projection_ids();
 
@@ -211,6 +225,7 @@ convert_host_parquet_to_gpu_with_prefetched_data_source(
     *const_cast<cucascade::memory::memory_space*>(target_memory_space),
     target_stream);
   return repr;
+#endif  // disabled: depends on the removed prefetched_data_source adapter
 }
 
 /**

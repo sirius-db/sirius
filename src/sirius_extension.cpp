@@ -64,6 +64,7 @@ extern "C" int cudaProfilerStop();
 #endif
 #include "duckdb/main/connection_manager.hpp"
 #include "log/logging.hpp"
+#include "op/scan/parquet_gpu_ingestible.hpp"
 #include "pin_table.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
@@ -1037,6 +1038,10 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   // The scan_manager must refuse cached reuse of such partial entries — see
   // pinned_entry::is_partial.
   bool const is_partial_pin = data.args.n_rows.has_value();
+  auto scan_info            = std::make_unique<sirius::op::scan::parquet_ingestible_table_info>();
+  scan_info->names          = std::move(read_column_names);
+  scan_info->resolved_file_paths = std::move(file_paths);
+  // todo(bobbi)
   if (data.args.tier == "host") {
     // entry.memory_space is metadata only; each host_chunk carries its own
     // per-GPU NUMA-local memory_space inside its host_data_representation.
@@ -1044,19 +1049,11 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     // entry still has a non-null memory_space for diagnostics.
     int const first_gpu_id          = gpu_spaces[0]->get_device_id();
     auto* representative_host_space = host_space_by_gpu.at(first_gpu_id);
-    sirius_ctx->get_scan_manager().insert_pinned_entry_host(data.args.name,
-                                                            std::move(read_column_names),
-                                                            std::move(file_paths),
-                                                            std::move(host_chunks),
-                                                            *representative_host_space,
-                                                            is_partial_pin);
+    sirius_ctx->get_scan_manager().insert_pinned_entry_host(
+      data.args.name, std::move(scan_info), std::move(host_chunks), *representative_host_space);
   } else {
-    sirius_ctx->get_scan_manager().insert_pinned_entry(data.args.name,
-                                                       std::move(read_column_names),
-                                                       std::move(file_paths),
-                                                       std::move(tables),
-                                                       std::move(chunk_memory_spaces),
-                                                       is_partial_pin);
+    sirius_ctx->get_scan_manager().insert_pinned_entry(
+      data.args.name, std::move(scan_info), std::move(tables), std::move(chunk_memory_spaces));
   }
 
   output.SetCardinality(1);

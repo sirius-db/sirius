@@ -24,6 +24,7 @@
 #include "duckdb/storage/storage_manager.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
+#include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
@@ -269,8 +270,9 @@ void sirius_pipeline_converter::insert_parquet_scan_operator(
   table_info->scan_output_arity      = scan_op.types.size();
   table_info->approximate_batch_size = op_params_.scan_task_batch_size;
 
-  auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_scan_operator>(
-    scan_op.types, scan_op.estimated_cardinality, std::move(table_info));
+  auto parquet_ingestible = op::scan::make_ingestible(std::move(table_info));
+  auto gpu_scan_op        = duckdb::make_uniq<op::scan::sirius_gpu_scan_operator>(
+    scan_op.types, scan_op.estimated_cardinality, std::move(parquet_ingestible));
 
   auto* gpu_scan_ptr = gpu_scan_op.get();
 
@@ -349,8 +351,9 @@ void sirius_pipeline_converter::insert_duckdb_native_scan_operator(
   table_info->returned_types = scan_op.returned_types;
   table_info->output_types   = scan_op.types;
 
-  auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_scan_operator>(
-    scan_op.types, scan_op.estimated_cardinality, std::move(table_info));
+  auto duckdb_native_ingestible = op::scan::make_ingestible(std::move(table_info));
+  auto gpu_scan_op              = duckdb::make_uniq<op::scan::sirius_gpu_scan_operator>(
+    scan_op.types, scan_op.estimated_cardinality, std::move(duckdb_native_ingestible));
 
   auto* gpu_scan_ptr = gpu_scan_op.get();
   current_pipeline->operators.insert(current_pipeline->operators.begin(), *gpu_scan_ptr);
