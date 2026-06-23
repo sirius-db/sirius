@@ -59,6 +59,13 @@ class mock_ioctx : public sirius_ioctx {
 
   [[nodiscard]] bool supports(std::string_view) const override { return true; }
 
+  [[nodiscard]] bool supports_device_read() const override { return true; }
+  [[nodiscard]] bool supports_vector_host_read() const override { return true; }
+  [[nodiscard]] prefetching_stage preferred_prefetching_stage() const override
+  {
+    return prefetching_stage::none;
+  }
+
   size_t host_read_io(sirius_io_object&, size_t, size_t, uint8_t*) override
   {
     throw std::logic_error("unused");
@@ -85,7 +92,7 @@ class mock_ioctx : public sirius_ioctx {
     throw std::logic_error("unused");
   }
 
-  void host_read_ranges_async_io(sirius_io_object&,
+  void host_read_ranges_async_io(const sirius_io_object&,
                                  std::vector<cudf::io::text::byte_range_info> const&,
                                  std::span<cudf::host_span<std::byte>>,
                                  io_completion_handler) override
