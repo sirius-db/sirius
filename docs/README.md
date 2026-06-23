@@ -19,13 +19,14 @@ Running TPC-H on 1TB data, Sirius accelerates DuckDB by 5x on DGX Station (GB300
 
 ![Performance](super-sirius-perf.png)
 
-## Supported OS/GPU/CUDA
-- Ubuntu >= 22.04
-- NVIDIA Volta™ or higher with compute capability 7.0+
-- CUDA >= 13.0 (requires NVIDIA driver >= 570)
-- We recommend building Sirius with at least **16 vCPUs** to ensure faster compilation.
+## Requirements
+- Linux on amd64/x86_64 or arm64/aarch64 with `glibc >= 2.28`.
+- NVIDIA Turing or newer, with compute capability 7.5+.
+- CUDA 13.x (driver 580.65.06 or newer) or CUDA 12.x (driver 525.60.13 or newer).
+- `io_uring` enabled at runtime (`CONFIG_IO_URING`, `kernel.io_uring_disabled=0` recommended). Containers must allow `io_uring_setup`, `io_uring_enter`, and `io_uring_register`.
+- Local Parquet files should be on a filesystem/block device that supports direct I/O (`O_DIRECT`).
 
-### Installing Dependencies
+### Build Requirements
 
 - Git (to clone the repo)
 - Pixi (install instructions [here](https://pixi.sh/latest/installation/))

@@ -28,6 +28,8 @@
 
 namespace sirius::io::s3 {
 
+struct s3_ioctx_config;  // defined in io/s3/s3_blocking_ioctx.hpp
+
 /**
  * @brief Production async-S3 backend (libcurl-multi reactor).
  *
@@ -60,6 +62,12 @@ class s3_ioctx : public templated_ioctx<s3_reactor> {
            std::optional<std::chrono::milliseconds> retry_jitter       = std::nullopt,
            std::optional<bool> honor_retry_after                       = std::nullopt);
 
+  /// Construct from the shared @c s3_ioctx_config (the same struct the blocking
+  /// backend and scan_manager use). Maps every field — including
+  /// @c s3_perf_instrumentation — into the reactor config. Preferred over the
+  /// multi-arg ctor for new call sites.
+  explicit s3_ioctx(s3_ioctx_config config);
+
   // -- F1: instance create_io_object (HEAD needs the authorizer) -------------
   std::shared_ptr<sirius_io_object> create_io_object(std::string path) override;
 
@@ -79,6 +87,21 @@ class s3_ioctx : public templated_ioctx<s3_reactor> {
   [[nodiscard]] std::uint64_t device_copies_total() const noexcept;
   [[nodiscard]] std::uint64_t device_stream_sync_total() const noexcept;
   [[nodiscard]] std::uint64_t device_peak_inflight() const noexcept;
+
+  // Per-chunk perf micro (gated by s3_perf_instrumentation) + always-on retry
+  // counters; each sums over the reactor(s).
+  [[nodiscard]] std::uint64_t chunk_get_ns_total() const noexcept;
+  [[nodiscard]] std::uint64_t chunk_get_ns_count() const noexcept;
+  [[nodiscard]] std::uint64_t chunk_get_ns_max() const noexcept;
+  [[nodiscard]] std::uint64_t queue_wait_ns_total() const noexcept;
+  [[nodiscard]] std::uint64_t queue_wait_ns_count() const noexcept;
+  [[nodiscard]] std::uint64_t h2d_observed_ns_total() const noexcept;
+  [[nodiscard]] std::uint64_t h2d_observed_ns_count() const noexcept;
+  [[nodiscard]] std::uint64_t h2d_observed_ns_max() const noexcept;
+  [[nodiscard]] std::uint64_t ttfb_ns() const noexcept;
+  [[nodiscard]] std::uint64_t retries_total() const noexcept;
+  [[nodiscard]] std::uint64_t terminal_failures_total() const noexcept;
+
   std::size_t head_object_size(std::string_view bucket, std::string_view key);
 
  private:
