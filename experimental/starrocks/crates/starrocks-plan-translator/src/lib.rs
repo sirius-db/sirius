@@ -284,7 +284,6 @@ impl ExtensionRegistry {
                         extension_urn_reference: urn_anchor,
                         function_anchor,
                         name: name.to_string(),
-                        ..Default::default()
                     },
                 ),
             ),

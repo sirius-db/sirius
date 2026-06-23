@@ -16,6 +16,7 @@
 
 #include "io/s3/s3_ioctx.hpp"
 
+#include "io/s3/s3_blocking_ioctx.hpp"  // s3_ioctx_config
 #include "io/uri_parser.hpp"
 
 #include <algorithm>
@@ -64,6 +65,25 @@ s3_ioctx::s3_ioctx(std::shared_ptr<s3_request_authorizer> creds,
                                   if (honor_retry_after) cfg.honor_retry_after = *honor_retry_after;
                                   return std::make_unique<s3_reactor>(std::move(cfg));
                                 })
+{
+}
+
+s3_ioctx::s3_ioctx(s3_ioctx_config config)
+  : templated_ioctx<s3_reactor>(1, [config = std::move(config)]() {
+      s3_reactor::config cfg;
+      cfg.creds                   = config.creds;
+      cfg.request_timeout_s       = config.request_timeout_s;
+      cfg.ca_bundle_path          = config.ca_bundle_path;
+      cfg.tls_verify              = config.tls_verify;
+      cfg.max_connections         = config.max_connections;
+      cfg.host_memory_resource    = config.host_memory_resource;
+      cfg.max_retry_attempts      = config.max_retry_attempts;
+      cfg.retry_backoff_base      = config.retry_backoff_base;
+      cfg.retry_jitter            = config.retry_jitter;
+      cfg.honor_retry_after       = config.honor_retry_after;
+      cfg.s3_perf_instrumentation = config.s3_perf_instrumentation;
+      return std::make_unique<s3_reactor>(std::move(cfg));
+    })
 {
 }
 
@@ -183,6 +203,71 @@ std::uint64_t s3_ioctx::device_peak_inflight() const noexcept
 std::size_t s3_ioctx::head_object_size(std::string_view bucket, std::string_view key)
 {
   return reactor().head_object_size(bucket, key);
+}
+
+// -- Perf micro + retry accessors (sum totals/counts, max the maxima) --------
+namespace {
+template <typename Reactors, typename Fn>
+std::uint64_t sum_reactors(Reactors const& reactors, Fn fn) noexcept
+{
+  std::uint64_t total = 0;
+  for (auto const& r : reactors)
+    total += fn(*r);
+  return total;
+}
+template <typename Reactors, typename Fn>
+std::uint64_t max_reactors(Reactors const& reactors, Fn fn) noexcept
+{
+  std::uint64_t hi = 0;
+  for (auto const& r : reactors)
+    hi = std::max(hi, fn(*r));
+  return hi;
+}
+}  // namespace
+
+std::uint64_t s3_ioctx::chunk_get_ns_total() const noexcept
+{
+  return sum_reactors(_reactors, [](auto const& r) { return r.chunk_get_ns_total(); });
+}
+std::uint64_t s3_ioctx::chunk_get_ns_count() const noexcept
+{
+  return sum_reactors(_reactors, [](auto const& r) { return r.chunk_get_ns_count(); });
+}
+std::uint64_t s3_ioctx::chunk_get_ns_max() const noexcept
+{
+  return max_reactors(_reactors, [](auto const& r) { return r.chunk_get_ns_max(); });
+}
+std::uint64_t s3_ioctx::queue_wait_ns_total() const noexcept
+{
+  return sum_reactors(_reactors, [](auto const& r) { return r.queue_wait_ns_total(); });
+}
+std::uint64_t s3_ioctx::queue_wait_ns_count() const noexcept
+{
+  return sum_reactors(_reactors, [](auto const& r) { return r.queue_wait_ns_count(); });
+}
+std::uint64_t s3_ioctx::h2d_observed_ns_total() const noexcept
+{
+  return sum_reactors(_reactors, [](auto const& r) { return r.h2d_observed_ns_total(); });
+}
+std::uint64_t s3_ioctx::h2d_observed_ns_count() const noexcept
+{
+  return sum_reactors(_reactors, [](auto const& r) { return r.h2d_observed_ns_count(); });
+}
+std::uint64_t s3_ioctx::h2d_observed_ns_max() const noexcept
+{
+  return max_reactors(_reactors, [](auto const& r) { return r.h2d_observed_ns_max(); });
+}
+std::uint64_t s3_ioctx::ttfb_ns() const noexcept
+{
+  return max_reactors(_reactors, [](auto const& r) { return r.ttfb_ns(); });
+}
+std::uint64_t s3_ioctx::retries_total() const noexcept
+{
+  return sum_reactors(_reactors, [](auto const& r) { return r.retries_total(); });
+}
+std::uint64_t s3_ioctx::terminal_failures_total() const noexcept
+{
+  return sum_reactors(_reactors, [](auto const& r) { return r.terminal_failures_total(); });
 }
 
 }  // namespace sirius::io::s3
