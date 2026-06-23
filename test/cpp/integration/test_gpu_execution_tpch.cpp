@@ -2999,6 +2999,68 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
   compare_gpu_vs_cpu("select n_nationkey, n_name from nation order by n_nationkey;");
 }
 
+//===----------------------------------------------------------------------===//
+// String concat tests
+//===----------------------------------------------------------------------===//
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - string concat || operator parquet",
+                 "[integration][gpu_execution][parquet][string_concat]")
+{
+  compare_gpu_vs_cpu(
+    "SELECT l_orderkey, l_returnflag || '-' || l_linestatus FROM lineitem ORDER BY l_orderkey "
+    "LIMIT 100;");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - string concat() function parquet",
+                 "[integration][gpu_execution][parquet][string_concat]")
+{
+  compare_gpu_vs_cpu(
+    "SELECT l_orderkey, concat(l_returnflag, l_linestatus) FROM lineitem ORDER BY l_orderkey LIMIT "
+    "100;");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - string concat column with longer varchar parquet",
+                 "[integration][gpu_execution][parquet][string_concat]")
+{
+  compare_gpu_vs_cpu(
+    "SELECT p_partkey, p_brand || ': ' || p_type FROM part ORDER BY p_partkey LIMIT 100;");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - string concat in WHERE clause parquet",
+                 "[integration][gpu_execution][parquet][string_concat]")
+{
+  compare_gpu_vs_cpu(
+    "SELECT l_orderkey FROM lineitem WHERE l_returnflag || l_linestatus = 'NF' ORDER BY l_orderkey "
+    "LIMIT 100;");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - string concat with nested expression parquet",
+                 "[integration][gpu_execution][parquet][string_concat]")
+{
+  // ORDER BY l_orderkey, l_linenumber for a deterministic primary-key sort —
+  // l_orderkey alone is non-unique in lineitem so LIMIT would pick different rows on GPU vs CPU.
+  compare_gpu_vs_cpu(
+    "SELECT l_orderkey, substring(l_comment, 1, 5) || '...' FROM lineitem "
+    "ORDER BY l_orderkey, l_linenumber LIMIT 100;");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - string concat NULL propagation parquet",
+                 "[integration][gpu_execution][parquet][string_concat][nulls]")
+{
+  // TPC-H has no nullable VARCHAR columns; introduce nulls via CASE so that
+  // concat's null-propagation semantics (any NULL input → NULL output) are exercised.
+  compare_gpu_vs_cpu(
+    "SELECT l_orderkey, "
+    "  CASE WHEN l_orderkey % 7 = 0 THEN NULL ELSE l_returnflag END || '-' || l_linestatus "
+    "FROM lineitem ORDER BY l_orderkey, l_linenumber LIMIT 100;");
+}
+
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - cast integer to decimal preserves scale",
                  "[integration][gpu_execution][cast][decimal]")
