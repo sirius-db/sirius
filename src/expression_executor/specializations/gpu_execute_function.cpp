@@ -34,6 +34,7 @@
 #include <cudf/datetime.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/attributes.hpp>
+#include <cudf/strings/combine.hpp>
 #include <cudf/strings/contains.hpp>
 #include <cudf/strings/find.hpp>
 #include <cudf/strings/regex/regex_program.hpp>
@@ -296,6 +297,45 @@ execute_result gpu_expression_executor::execute(sirius::ast::function_call const
 
     auto result_column = cudf::datetime::floor_datetimes(
       input.get_column_view(), freq_string_switch(freq_str), _stream, _mr);
+    return execute_result(std::move(result_column));
+  }
+
+  //----------String Concatenation----------//
+  if (resolved_id == function_id::concat) {
+    // Evaluate every argument to a materialized column or scalar.
+    std::vector<execute_result> arg_results;
+    arg_results.reserve(args.size());
+    for (auto const& arg : args) {
+      arg_results.push_back(execute(*arg, execution_mode::MATERIALIZE));
+    }
+
+    // cudf::strings::concatenate takes a table_view — scalars must be expanded
+    // to full-length columns first.
+    auto const num_rows = _input_table.num_rows();
+    std::vector<std::unique_ptr<cudf::column>> scalar_cols;
+    std::vector<cudf::column_view> col_views;
+    col_views.reserve(arg_results.size());
+    for (auto const& res : arg_results) {
+      if (res.is_scalar()) {
+        scalar_cols.push_back(
+          cudf::make_column_from_scalar(res.get_scalar(), num_rows, _stream, _mr));
+        col_views.push_back(scalar_cols.back()->view());
+      } else {
+        col_views.push_back(res.get_column_view());
+      }
+    }
+
+    // SQL concat: any NULL input produces NULL output.  cuDF achieves this with
+    // an invalid (null) narep scalar.
+    cudf::table_view concat_table(col_views);
+    auto result_column = cudf::strings::concatenate(
+      concat_table,
+      cudf::string_scalar("", true, _stream, _mr),   // empty separator between parts
+      cudf::string_scalar("", false, _stream, _mr),  // null narep → null propagation
+      cudf::strings::separator_on_nulls::YES,        // no-op: invalid narep short-circuits before
+                                                     // separator logic runs
+      _stream,
+      _mr);
     return execute_result(std::move(result_column));
   }
 
