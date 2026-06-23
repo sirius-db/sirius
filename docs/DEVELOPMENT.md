@@ -6,6 +6,70 @@ this project), which then pulls in SiriusDB as an extension. We use
 - symlinked sirius-specific `CMakePresets.json` (at `cmake/CMakePresets.json`) to version control the build config.
 - [pixi](https://pixi.prefix.dev/) to manage build dependencies.
 
+## Building Sirius
+
+Clone the repository with all submodules:
+
+```bash
+git clone --recurse-submodules https://github.com/sirius-db/sirius.git
+cd sirius
+```
+
+Build with Pixi (uses all available cores). The default target is `release` (GCC Release):
+
+```bash
+pixi run make                        # GCC Release (default)
+pixi run make clang-relwithdebinfo   # Clang RelWithDebInfo
+pixi run make clang-debug            # Clang Debug
+```
+
+If the build exhausts memory, reduce parallelism:
+
+```bash
+CMAKE_BUILD_PARALLEL_LEVEL=8 pixi run make
+```
+
+Run the Sirius-linked DuckDB binary — the extension is statically built in and loads automatically:
+
+```bash
+./build/release/duckdb
+```
+
+Alternatively, load the extension into an existing DuckDB shell:
+
+```sql
+LOAD 'build/release/extension/sirius/sirius.duckdb_extension';
+```
+
+## Pre-commit
+
+Sirius uses [pre-commit](https://pre-commit.com/) hooks to enforce formatting and linting. Install the hooks after cloning so every commit is checked automatically:
+
+```bash
+pixi run pre-commit install
+```
+
+To run all hooks manually across the whole tree:
+
+```bash
+pixi run pre-commit run -a
+```
+
+## Testing
+
+Run the full C++ unit test suite (what CI runs):
+
+```bash
+pixi run make test
+```
+
+Run tests by Catch2 tag or name:
+
+```bash
+pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[cpu_cache]"
+pixi run build/release/extension/sirius/test/cpp/sirius_unittest "test_cpu_cache_basic_string_single_col"
+```
+
 ## Using CLion for development
 
 CLion does not natively support pixi environments. One way to circumvent that is to create a custom
