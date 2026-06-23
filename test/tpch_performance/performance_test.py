@@ -108,14 +108,14 @@ def setup_benchmark_dir(
           <engine>/q<N>/result.txt  (one repr(row) per line)
           sirius/q<N>/sirius.log    (post-run split of combined log)
 
-    If `name` is provided, the benchmark dir is `<output_root>/<name>` (no
-    timestamp); otherwise the default `tpch_<ts>_<mode>_<engine>_iter<N>` is used.
+    If `name` is provided, the benchmark dir is suffixed:
+    `<output_root>/tpch_<ts>_<mode>_<engine>_iter<N>-<name>`; otherwise the
+    default `tpch_<ts>_<mode>_<engine>_iter<N>` is used.
     """
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    benchmark_name = f"tpch_{ts}_{mode}_{engine}_iter{iterations}"
     if name:
-        benchmark_name = name
-    else:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        benchmark_name = f"tpch_{ts}_{mode}_{engine}_iter{iterations}"
+        benchmark_name = f"{benchmark_name}-{name}"
     benchmark_dir = os.path.join(output_root, benchmark_name)
     csv_dir = os.path.join(benchmark_dir, "csv")
     log_dir = os.path.join(benchmark_dir, "log_dir")
@@ -308,8 +308,8 @@ def _write_result(benchmark_dir, engine_name, qnum, rows):
             f.write(repr(row) + "\n")
 
 
-def _record(writer, name, qnum, it, runtime):
-    writer.writerow([name, f"q{qnum}", it, f"{runtime:.6f}"])
+def _record(collector, name, qnum, it, runtime):
+    collector[(name, it, qnum)] = runtime
     log(f"[{name}] q{qnum} iter{it}: {runtime:.4f}s")
 
 
@@ -328,12 +328,45 @@ def _run_one(
     _write_result(benchmark_dir, name, qnum, rows)
 
 
+CSV_ENGINE_ORDER = ("sirius", "duckdb")
+
+
+def _csv_engine_sort_key(engine_name):
+    try:
+        return CSV_ENGINE_ORDER.index(engine_name)
+    except ValueError:
+        return len(CSV_ENGINE_ORDER)
+
+
+def write_runtimes_csv(path, collector, queries, engine_modes, iterations):
+    """Write wide-format runtimes CSV (one column per engine/iteration, msec)."""
+    ordered_engines = sorted(
+        (name for name, _ in engine_modes), key=_csv_engine_sort_key
+    )
+    col_keys = [(name, it) for name in ordered_engines for it in range(iterations)]
+    header = ["query"] + [f"{name}_{it}_msec" for name, it in col_keys]
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        for q in queries:
+            row = [f"q{q}"]
+            for name, it in col_keys:
+                runtime = collector.get((name, it, q))
+                row.append("" if runtime is None else f"{runtime * 1000:.3f}")
+            writer.writerow(row)
+        total_row = ["total"]
+        for name, it in col_keys:
+            total = sum(collector.get((name, it, q), 0.0) for q in queries)
+            total_row.append(f"{total * 1000:.3f}")
+        writer.writerow(total_row)
+
+
 def run_grouped(
     source,
     queries,
     engine_modes,
     iterations,
-    writer,
+    collector,
     *,
     benchmark_dir,
     parquet_dir,
@@ -379,7 +412,7 @@ def run_sequential(
     queries,
     engine_modes,
     iterations,
-    writer,
+    collector,
     *,
     benchmark_dir,
     parquet_dir,
@@ -423,7 +456,7 @@ def run_isolated(
     queries,
     engine_modes,
     iterations,
-    writer,
+    collector,
     *,
     benchmark_dir,
     parquet_dir,
@@ -671,9 +704,9 @@ def parse_args():
         type=str,
         default=None,
         help=(
-            "Name for the benchmark output subdirectory under --output. "
-            "Overrides the default 'tpch_<ts>_<mode>_<engine>_iter<N>'. "
-            "Re-runs with the same name will overwrite per-iteration outputs."
+            "Suffix appended to the default benchmark output subdirectory "
+            "name, producing 'tpch_<ts>_<mode>_<engine>_iter<N>-<name>' "
+            "under --output."
         ),
     )
     p.add_argument(
@@ -764,6 +797,7 @@ def main():
             duckdb_profiling=args.duckdb_profiling,
         )
 
+    write_runtimes_csv(runtime_csv, collector, queries, engine_modes, args.iterations)
     log("Benchmark run complete")
 
     if any(use_gpu for _, use_gpu in engine_modes):
