@@ -6,7 +6,7 @@
  */
 
 #include "catch.hpp"
-#include "io/prefetching_cache.hpp"
+#include "io/cache/prefetching_cache.hpp"
 #include "io/s3/s3_blocking_ioctx.hpp"
 #include "io/s3/s3_ioctx.hpp"
 #include "io/s3/sirius_sigv4_authorizer.hpp"

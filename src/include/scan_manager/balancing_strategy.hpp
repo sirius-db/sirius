@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <cucascade/memory/common.hpp>
+
 #include <cstddef>
 #include <variant>
 
@@ -40,12 +42,21 @@ class balancing_strategy {
   virtual ~balancing_strategy() = default;
 
   struct gpu_id_hint {
+    explicit gpu_id_hint(int id) : device_id(id) {}
     int device_id;
   };
   struct numa_id_hint {
+    explicit numa_id_hint(int id) : numa_id(id) {}
     int numa_id;
   };
   using device_id_hint = std::variant<std::monostate, gpu_id_hint, numa_id_hint>;
+
+  static device_id_hint make_target_hint(cucascade::memory::memory_space_id id)
+  {
+    if (id.tier == cucascade::memory::Tier::GPU) { return gpu_id_hint{id.device_id}; }
+    if (id.tier == cucascade::memory::Tier::HOST) { return numa_id_hint{id.device_id}; }
+    return std::monostate{};
+  }
 
   /**
    * @brief Choose a GPU for @p data and record it on @p data.
