@@ -16,8 +16,9 @@
 
 #pragma once
 
-#include <cucascade/data/cpu_data_representation.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/cudf/builtin_converters.hpp>
+#include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <data/host_parquet_representation_converters.hpp>
 #include <log/logging.hpp>

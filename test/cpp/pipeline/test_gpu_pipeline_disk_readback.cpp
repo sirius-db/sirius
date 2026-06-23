@@ -25,10 +25,10 @@
 
 #include <rmm/cuda_stream.hpp>
 
-#include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/disk_data_representation.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 
 #include <filesystem>

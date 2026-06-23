@@ -19,6 +19,7 @@
 #include <cudf/cudf_utils.hpp>
 #include <cudf/types.hpp>
 
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
