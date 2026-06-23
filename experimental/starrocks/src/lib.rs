@@ -46,6 +46,7 @@ use tracing::{debug, info, instrument, warn};
 
 mod brpc;
 mod compute_node_service;
+mod file_schema;
 mod proto;
 mod prpc;
 
