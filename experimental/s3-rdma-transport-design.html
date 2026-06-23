@@ -36,8 +36,10 @@ removing today's pinned-host staging + PCIe H2D copy. A cuObject gateway
 `RDMA_WRITE`s into a small pre-registered GPU **arena**; a GPU-local copy then
 moves it to the final RMM buffer. `s3://` URIs, SigV4 auth, and the Parquet
 scanner are unchanged — the new code is one reactor plus a thin ioctx under the
-existing `templated_ioctx`. The benchmark proves this end-to-end at line rate.
-**Please review the decisions table (§3) and the open questions (§5).**
+existing `templated_ioctx`. The benchmark proves the cuObject RDMA data path at
+line rate; the Sirius-specific arena+D2D visibility and completion discipline
+are gated by P3. **Please review the decisions table (§3) and the open
+questions (§5).**
 
 ## Why
 
@@ -74,8 +76,9 @@ The arena is a **fixed per-chunk staging window** (`max_inflight × 1 MiB`),
 **not** object-sized: `templated_ioctx` splits the read into 1 MiB chunks that
 stream through the arena in waves, each chunk D2D-copied to its offset in the
 **full-size RMM destination buffer**. So a 128 MiB (or multi-GB) read flows
-through the same ~8–16 MiB arena — exactly how `s3_reactor` streams through its
-host staging blocks today.
+through the same arena (default ~8 MiB, configurable as `max_inflight ×
+slot_size`) — exactly how `s3_reactor` streams through its host staging blocks
+today.
 
 ## 2. How one read works
 
@@ -126,7 +129,8 @@ gated future spike (§5 Q4).
 
 | Phase | Scope | HW |
 |---|---|---|
-| **P0 ✅ landed** | Standard wire protocol merged into `s3RDMA-benchmarktool` (drop 4 non-standard headers; server decodes the address from the token; `x-amz-rdma-reply`). Residual hardening tracked in the appendix | — |
+| **P0a ✅ wire migration landed** | Standard wire protocol merged into `s3RDMA-benchmarktool` (drop 4 non-standard headers; server decodes the address from the token; `x-amz-rdma-reply`) | — |
+| **P0b ⏳ gateway hardening open** | Strict descriptor-address parse, explicit short-write (`n == expected`) + capacity checks — today the client returns `size` on any 200/206 and the server only fails on `rdma_n < 0` (see appendix) | — |
 | P1 | Wire `s3_transport` through `scan_manager_config`; backend chosen at scan-manager construction; AUTO→HTTP; config tests | — |
 | P2 | `cuobj_rdma_reactor` against a **mock** client; full hardware-free test matrix | — |
 | P3 | Real cuObject path, single GPU; arena + D2D + flush + a visibility stress test | CX-6 |
