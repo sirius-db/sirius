@@ -41,7 +41,7 @@ Quick start:
 git clone --recurse-submodules https://github.com/sirius-db/sirius.git
 cd sirius
 pixi run make
-./build/release/duckdb -unsigned
+./build/release/duckdb
 ```
 
 Alternatively, load the extension into an existing DuckDB shell:

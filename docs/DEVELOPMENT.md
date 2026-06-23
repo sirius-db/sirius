@@ -32,7 +32,7 @@ CMAKE_BUILD_PARALLEL_LEVEL=8 pixi run make
 Run the Sirius-linked DuckDB binary — the extension is statically built in and loads automatically:
 
 ```bash
-./build/release/duckdb -unsigned
+./build/release/duckdb
 ```
 
 Alternatively, load the extension into an existing DuckDB shell:
