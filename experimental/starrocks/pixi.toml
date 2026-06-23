@@ -4,9 +4,10 @@ name = "sirius-starrocks"
 platforms = ["linux-64","linux-aarch64"]
 
 [environments]
-default = ["fe","cn"]
+default = ["fe","cn","client"]
 cn = ["cn"]
 fe = ["fe"]
+client = ["client"]
 
 [tasks]
 cluster = {cmd = """
@@ -30,6 +31,13 @@ cn_pid="$!"
 wait -n "${fe_pid}" "${cn_pid}"
 '
 """,cwd = ".",depends-on = ["fe-build","cn-build"],description = "Run the local StarRocks FE and Rust CN in the foreground with logs"}
+
+[feature.client.dependencies]
+# Provides the `mysql` CLI that speaks the FE's MySQL wire protocol on query_port.
+mysql-client = "*"
+
+[feature.client.tasks]
+client = {cmd = "mysql --host 127.0.0.1 --port 9030 --user root",description = "Open a MySQL client against the local FE (run `cluster` in another terminal first)"}
 
 [feature.cn.dependencies]
 # Provides protoc for prost-build in the Substrait crates on fresh CN envs.
