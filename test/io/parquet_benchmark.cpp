@@ -1,4 +1,4 @@
-#include "io/prefetching_cache.hpp"
+#include "io/cache/prefetching_cache.hpp"
 #include "io/sirius_datasource.hpp"
 #include "io/types.hpp"
 #include "io/uring/uring_ioctx.hpp"
@@ -284,31 +284,30 @@ int main(int argc, char** argv)
     // Size the buffer pool to fit the working set, plus headroom.
     constexpr uint32_t POOL_MAX_SLABS       = 20;
     constexpr size_t INFLIGHT_BUDGET_CHUNKS = 2048;
-    constexpr size_t POOL_CAPACITY          = static_cast<size_t>(POOL_MAX_SLABS) *
-                                     static_cast<size_t>(sirius::io::buffer_pool::CHUNKS_PER_SLAB) *
-                                     sirius::io::CHUNK_SIZE;
+    constexpr size_t POOL_CAPACITY =
+      static_cast<size_t>(POOL_MAX_SLABS) *
+      static_cast<size_t>(sirius::io::cache::buffer_pool::CHUNKS_PER_SLAB) * sirius::io::CHUNK_SIZE;
 
     cucascade::memory::numa_region_pinned_host_memory_resource upstream(0, /*make_portable=*/true);
     cucascade::memory::fixed_size_host_memory_resource host_mr(
-      0,                                                              // device_id
-      upstream,                                                       // upstream allocator
-      POOL_CAPACITY,                                                  // mem_limit
-      POOL_CAPACITY,                                                  // capacity
-      sirius::io::CHUNK_SIZE,                                         // block_size = 1 MiB
-      static_cast<size_t>(sirius::io::buffer_pool::CHUNKS_PER_SLAB),  // pool_size
-      1);                                                             // initial_pools
+      0,                                                                     // device_id
+      upstream,                                                              // upstream allocator
+      POOL_CAPACITY,                                                         // mem_limit
+      POOL_CAPACITY,                                                         // capacity
+      sirius::io::CHUNK_SIZE,                                                // block_size = 1 MiB
+      static_cast<size_t>(sirius::io::cache::buffer_pool::CHUNKS_PER_SLAB),  // pool_size
+      1);                                                                    // initial_pools
 
-    sirius::io::buffer_pool pool(host_mr, POOL_MAX_SLABS);
+    sirius::io::cache::buffer_pool pool(host_mr, POOL_MAX_SLABS);
 
-    auto io_ctx =
-      std::make_shared<sirius::io::uring_ioctx>(n_reactors, 2 * sirius::io::NUM_CHUNKS, host_mr);
+    auto io_ctx = std::make_shared<sirius::io::uring::uring_ioctx>(
+      n_reactors, 2 * sirius::io::NUM_CHUNKS, host_mr);
     // io_ctx->initialize_cache(pool, INFLIGHT_BUDGET_CHUNKS);
 
     std::vector<std::unique_ptr<cudf::io::datasource>> sources;
     sources.reserve(paths.size());
     for (auto const& path : paths) {
-      auto io_obj = io_ctx->create_io_object(path);
-      sources.push_back(std::make_unique<sirius::io::sirius_datasource>(io_ctx, io_obj));
+      sources.push_back(io_ctx->open_datasource(path));
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1200));
 

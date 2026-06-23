@@ -16,8 +16,8 @@
 
 #include "catch.hpp"
 #include "exec/thread_pool.hpp"
+#include "io/cache/prefetching_cache.hpp"
 #include "io/io_errors.hpp"
-#include "io/prefetching_cache.hpp"
 #include "io/s3/mock_request_authorizer.hpp"
 #include "io/s3/s3_blocking_io_object.hpp"
 #include "io/s3/s3_blocking_ioctx.hpp"

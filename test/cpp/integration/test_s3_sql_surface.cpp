@@ -6,7 +6,7 @@
  */
 
 #include "catch.hpp"
-#include "io/prefetching_cache.hpp"
+#include "io/cache/prefetching_cache.hpp"
 #include "io/s3/s3_ioctx.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
