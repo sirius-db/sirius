@@ -102,3 +102,20 @@ pixi run quent /path/to/telemetry_data  # if you used a different output_directo
 
 Then open Quent UI at `http://localhost:8080` and select the captured Sirius engine/query to explore its
 timeline.
+
+## Example Screenshots
+
+**Default view** — the query plan on the left and the per-resource execution timeline
+(executor threads, task-manager loops, task queues) on the right.
+
+![Quent standard view](quent-screenshots/standard.png)
+
+**Operator timeline** — selecting an operator or pipeline highlights it in both the plan and the
+timeline, so you can see exactly when and where it ran across the resources.
+
+![Quent operator timeline](quent-screenshots/operator-timeline.png)
+
+**Operator stats** — the Operators tab tabulates per-operator/per-pipeline statistics (e.g.
+duration), grouped and sortable, to, for example, quickly find the most expensive operators in the query.
+
+![Quent operator stats view](quent-screenshots/operator-stats-view.png)
