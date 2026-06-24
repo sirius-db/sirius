@@ -24,6 +24,7 @@
 #include <cuco/bloom_filter.cuh>
 #include <cuco/bloom_filter_policies.cuh>
 #include <cuco/hash_functions.cuh>
+#include <cuda/sirius_rmm_cuco_allocator.cuh>
 #include <cuda/std/cstddef>
 #include <cuda/stream_ref>
 
@@ -31,15 +32,17 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <stdexcept>
 
 namespace sirius::op {
 
 namespace {
-// 256-bit blocks (8 × uint32 words, the cuco default). ~16 bits/key → num_blocks ≈ keys/16, a few
-// MB even for tens of millions of keys, with a sub-percent false-positive rate. False positives are
-// safe (they only let through a few extra probe rows, which the exact join then discards); false
-// negatives never happen, so the filter never drops a true match.
+// ~16 bits/key → num_blocks ≈ keys/16, a few MB even for tens of millions of keys, with a
+// sub-percent false-positive rate. Both policies below use 256-bit blocks, so the block count is
+// the same for either. False positives are safe (they only let through a few extra probe rows,
+// which the exact join then discards); false negatives never happen, so the filter never drops a
+// true match.
 constexpr std::size_t kBitsPerBlock     = 256;
 constexpr std::size_t kTargetBitsPerKey = 16;
 
@@ -50,51 +53,54 @@ std::size_t blocks_for(std::size_t num_keys)
   return std::max<std::size_t>(blocks, 1);
 }
 
-// cuCollections allocator backed by RMM's stream-ordered pool — the same compute-stream memory
-// resource the rest of the query uses — instead of cuco's default synchronizing
-// cudaMalloc/cudaFree. cuco's allocator interface is stream-aware (allocate(n, stream)), matching
-// RMM's stream-ordered resource. This both keeps the Bloom's bit array inside the RMM pool and
-// avoids the implicit device sync of a raw cudaMalloc on the hot path.
-template <class T>
-class rmm_cuco_allocator {
- public:
-  using value_type = T;
-  explicit rmm_cuco_allocator(rmm::device_async_resource_ref mr) noexcept : _mr{mr} {}
-  template <class U>
-  rmm_cuco_allocator(rmm_cuco_allocator<U> const& other) noexcept : _mr{other.resource()}
-  {
-  }
+using bloom_alloc = sirius::rmm_cuco_allocator<cuda::std::byte>;
 
-  value_type* allocate(std::size_t n, cuda::stream_ref stream)
-  {
-    return static_cast<value_type*>(
-      _mr.allocate(rmm::cuda_stream_view{stream.get()}, n * sizeof(value_type)));
-  }
-  void deallocate(value_type* p, std::size_t n, cuda::stream_ref stream) noexcept
-  {
-    _mr.deallocate(rmm::cuda_stream_view{stream.get()}, p, n * sizeof(value_type));
-  }
-  [[nodiscard]] rmm::device_async_resource_ref resource() const noexcept { return _mr; }
+// Apache Arrow / Parquet split-block bloom filter (SBBF): 8 bits set per 256-bit block, xxhash_64 —
+// the scheme Parquet persists. It caps at max_filter_blocks (128 MiB); a filter that needs more
+// blocks uses the default cuco policy instead, which has no such cap.
+using arrow_policy   = cuco::arrow_filter_policy<std::int64_t>;
+using default_policy = cuco::default_filter_policy<cuco::xxhash_64<std::int64_t>, std::uint32_t, 8>;
 
- private:
-  rmm::device_async_resource_ref _mr;
-};
+template <class Policy>
+using bloom_filter_for = cuco::bloom_filter<std::int64_t,
+                                            cuco::extent<std::size_t>,
+                                            cuda::thread_scope_device,
+                                            Policy,
+                                            bloom_alloc>;
+using arrow_bloom   = bloom_filter_for<arrow_policy>;
+using default_bloom = bloom_filter_for<default_policy>;
 
-using bloom_policy = cuco::default_filter_policy<cuco::xxhash_64<std::int64_t>, std::uint32_t, 8>;
-using bloom_alloc  = rmm_cuco_allocator<cuda::std::byte>;
-using bloom_type   = cuco::bloom_filter<std::int64_t,
-                                        cuco::extent<std::size_t>,
-                                        cuda::thread_scope_device,
-                                        bloom_policy,
-                                        bloom_alloc>;
+// Largest block count the Arrow policy can address; above it, the default policy is used.
+constexpr std::size_t kArrowMaxBlocks = arrow_policy::max_filter_blocks;
 }  // namespace
 
+// Exactly one of these is populated, chosen by size. They are constructed in place (the cuco
+// bloom_filter owns device storage and is never moved through here). Arrow policy when the filter
+// fits its block cap (Parquet-compatible fingerprints); the default cuco policy otherwise, so a
+// build too large for Arrow still gets the full target bits/key.
 struct sirius_dynamic_bloom_filter::impl {
-  bloom_type filter;
+  std::unique_ptr<arrow_bloom> arrow;
+  std::unique_ptr<default_bloom> standard;
 
   impl(std::size_t num_blocks, rmm::device_async_resource_ref mr, cuda::stream_ref stream)
-    : filter{cuco::extent<std::size_t>{num_blocks}, {}, {}, bloom_alloc{mr}, stream}
   {
+    if (num_blocks <= kArrowMaxBlocks) {
+      arrow = std::unique_ptr<arrow_bloom>(
+        new arrow_bloom{cuco::extent<std::size_t>{num_blocks}, {}, {}, bloom_alloc{mr}, stream});
+    } else {
+      standard = std::unique_ptr<default_bloom>(
+        new default_bloom{cuco::extent<std::size_t>{num_blocks}, {}, {}, bloom_alloc{mr}, stream});
+    }
+  }
+
+  template <class Fn>
+  void with(Fn&& fn)
+  {
+    if (arrow) {
+      fn(*arrow);
+    } else {
+      fn(*standard);
+    }
   }
 };
 
@@ -124,7 +130,7 @@ sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::column_view const
   // Insert every build key. The build join keys are non-null (FK/PK); a null position would only
   // add a stray fingerprint, which costs a negligible false-positive bump, never correctness.
   auto const* d = keys.data<std::int64_t>();
-  _impl->filter.add(d, d + n, s);
+  _impl->with([&](auto& f) { f.add(d, d + n, s); });
 }
 
 sirius_dynamic_bloom_filter::~sirius_dynamic_bloom_filter() = default;
@@ -144,7 +150,7 @@ std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask(
   // true where the probe key's fingerprint is present — a superset of the true matches (false
   // positives allowed). Querying garbage at null positions is harmless; their rows are dropped via
   // the carried-over null mask below.
-  _impl->filter.contains(d, d + n, out->mutable_view().data<bool>(), s);
+  _impl->with([&](auto& f) { f.contains(d, d + n, out->mutable_view().data<bool>(), s); });
 
   if (probe.nullable() && probe.null_count() > 0) {
     out->set_null_mask(cudf::copy_bitmask(probe, stream, mr), probe.null_count());

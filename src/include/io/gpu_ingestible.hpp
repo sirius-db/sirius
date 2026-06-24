@@ -18,6 +18,7 @@
 
 // cudf
 #include <cudf/table/table.hpp>
+#include <cudf/table/table_view.hpp>
 
 // rmm
 #include <rmm/cuda_stream_view.hpp>
@@ -148,6 +149,14 @@ class scan_info {
 class post_filter_and_projection_info {
  public:
   virtual ~post_filter_and_projection_info() = default;
+
+  /// @brief Whether @ref gpu_ingestible::post_filter_and_project would do any work for this
+  /// split right now.
+  ///
+  /// Consulted by the scan operator at execute time, immediately before it commits to the
+  /// post-processing path, so implementations may answer from state that changes mid-scan.
+  /// Returning false must be safe: the operator then forwards the split's table unchanged.
+  [[nodiscard]] virtual bool has_work() const { return true; }
 };
 
 //===----------------------------------------------------------------------===//
@@ -293,6 +302,24 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
     post_filter_and_projection_info const& info,
     ::cucascade::memory::memory_space const& mem_space,
     rmm::cuda_stream_view stream) = 0;
+
+  /**
+   * @brief View-based @ref post_filter_and_project for inputs the caller does
+   *        not own — the pinned-cache path, whose batches view columns co-owned
+   *        by the cache.
+   *
+   * The default materializes @p input and delegates to the owning overload,
+   * preserving behavior for implementations that never see view inputs.
+   * @c pinned_table_gpu_ingestible overrides it to filter/assemble directly from
+   * the view, so a cached batch is only ever copied down to the rows and columns
+   * that survive. @p input's memory must stay valid for the duration of the
+   * call; the returned table never aliases it.
+   */
+  virtual std::unique_ptr<cudf::table> post_filter_and_project(
+    cudf::table_view const& input,
+    post_filter_and_projection_info const& info,
+    ::cucascade::memory::memory_space const& mem_space,
+    rmm::cuda_stream_view stream);
 
   [[nodiscard]] ingestible_table_info const& table_info() const noexcept { return *_table_info; }
 

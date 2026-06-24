@@ -84,8 +84,10 @@ class scan_operator_input : public op::operator_data {
  *
  * Carries a zero-copy data_batch view over the pinned columns and
  * (optionally) a post-decode filter/projection description. When
- * @ref filter_info is null, @c sirius_gpu_scan_operator::execute forwards
- * the batch unchanged. Otherwise it dispatches into the installed
+ * @ref filter_info is null — or reports no work to do right now
+ * (@c post_filter_and_projection_info::has_work) — @c
+ * sirius_gpu_scan_operator::execute forwards the batch unchanged. Otherwise
+ * it dispatches into the installed
  * @c io::gpu_ingestible::post_filter_and_project (the cached ingestible
  * applies the filter via @c gpu_expression_executor).
  *

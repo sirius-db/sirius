@@ -25,7 +25,10 @@
 #include "op/scan/duckdb_scan_executor.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
 #include "op/scan/parquet_scan_task.hpp"
+#include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
+#include "pipeline/sirius_pipeline.hpp"
+#include "planner/query.hpp"
 
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
@@ -33,6 +36,9 @@
 
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 namespace sirius {
 namespace pipeline {
@@ -165,6 +171,66 @@ void task_scheduler::set_scan_caching_config(sirius::op::scan::cache_level level
   _scan_executor->set_scan_caching_enabled(level);
 }
 
+namespace {
+
+/// Collect leaf scans that feed a dynamic-filter-producing hash join's BUILD port through a
+/// pure chain: every hop is a pipeline with a single input whose sink has a single output edge
+/// (scan → PARTITION → CONCAT → join.build). Such a chain has no probe-side dependence, so
+/// running it first does no work that would not run anyway — it only moves the work earlier,
+/// which lets the join's build-port publish hook (push_data_batch_partitioned) deliver its
+/// membership filter before the probe-side scan claims its splits. Without this, demand-driven
+/// task creation reaches the chain only after the probe pipeline emits output — after the probe
+/// scan has fully run — making the filter a deterministic no-op (the Q8 part→lineitem case; see
+/// docs/super-sirius/dynamic-filters.md "Q8 deep-dive findings").
+std::vector<op::sirius_physical_operator*> collect_eager_filter_build_scans(
+  planner::query const& query)
+{
+  auto const& pipelines = query.get_pipelines();
+
+  // Pipeline lookup by the operator that receives a sink's output (the downstream pipeline's
+  // first executable operator). Register every operator: fused chains keep intermediate
+  // operators inside one pipeline, and next_port_info points at the receiving operator.
+  std::unordered_map<op::sirius_physical_operator const*, sirius_pipeline*> pipeline_of;
+  for (auto const& p : pipelines) {
+    for (auto const& op_ref : p->get_operators()) {
+      pipeline_of.emplace(&op_ref.get(), p.get());
+    }
+    if (auto sink = p->get_sink()) { pipeline_of.emplace(sink.get(), p.get()); }
+  }
+
+  std::vector<op::sirius_physical_operator*> eager;
+  for (auto* scan : query.get_scan_operators()) {
+    auto it = pipeline_of.find(scan);
+    if (it == pipeline_of.end()) { continue; }
+    auto* pipeline = it->second;
+
+    // Walk single-edge hops; depth-bounded for safety (chains are scan/partition/concat-sized).
+    constexpr int k_max_chain_hops = 8;
+    for (int hop = 0; pipeline && hop < k_max_chain_hops; ++hop) {
+      auto sink = pipeline->get_sink();
+      if (!sink) { break; }
+      auto const& nexts = sink->get_next_ports_after_sink();
+      if (nexts.size() != 1 || !nexts[0].next_operator) { break; }
+      auto* next_op = nexts[0].next_operator;
+
+      if (auto* join = dynamic_cast<op::sirius_physical_hash_join*>(next_op)) {
+        if (nexts[0].next_operator_port_name == "build" && !join->probe_targets.empty()) {
+          eager.push_back(scan);
+        }
+        break;  // any join port ends the chain — probe-side edges are not eligible
+      }
+
+      // A multi-input receiver means the chain merges with another dependence — stop.
+      if (next_op->get_port_ids().size() != 1) { break; }
+      auto next_it = pipeline_of.find(next_op);
+      pipeline     = next_it != pipeline_of.end() ? next_it->second : nullptr;
+    }
+  }
+  return eager;
+}
+
+}  // namespace
+
 void task_scheduler::prepare_for_query(duckdb::shared_ptr<planner::query> query)
 {
   // Drain leftover tasks from previous query
@@ -188,6 +254,7 @@ void task_scheduler::prepare_for_query(duckdb::shared_ptr<planner::query> query)
   for (auto* scan : scans) {
     _priority_scans.push(scan);
   }
+  _eager_filter_build_scans = collect_eager_filter_build_scans(*query);
 }
 
 std::future<void> task_scheduler::start_query()
@@ -203,11 +270,32 @@ std::future<void> task_scheduler::start_query()
   }
 
   constexpr int k_initial_scans = 2;
+  // Cap on eager filter-build seeds: these chains run regardless (seeding only moves them
+  // earlier), but each adds a concurrent scan working set, and k_initial_scans exists to bound
+  // exactly that. Wired build chains are dimension-sized in practice; four covers every TPC-H
+  // shape while keeping the bound meaningful.
+  constexpr int k_eager_filter_build_scans = 4;
   std::lock_guard<std::mutex> lock(_priority_scans_mutex);
-  for (int i = 0; i < k_initial_scans && !_priority_scans.empty(); ++i) {
-    auto* scan_op = _priority_scans.front();
+
+  // Seed filter-producing build chains FIRST: their publish unblocks probe-side pruning, and
+  // they are the cheapest pipelines in the query.
+  std::unordered_set<op::sirius_physical_operator*> seeded;
+  int eager_count = 0;
+  for (auto* scan_op : _eager_filter_build_scans) {
+    if (eager_count >= k_eager_filter_build_scans) { break; }
+    if (!seeded.insert(scan_op).second) { continue; }
+    SIRIUS_LOG_INFO("[task_scheduler] eager-seeding dynamic-filter build-chain scan (op_id={}).",
+                    scan_op->get_operator_id());
     _task_creator->schedule(scan_op);
+    ++eager_count;
+  }
+
+  for (int i = 0; i < k_initial_scans && !_priority_scans.empty();) {
+    auto* scan_op = _priority_scans.front();
     _priority_scans.pop();
+    if (!seeded.insert(scan_op).second) { continue; }  // already eager-seeded — try the next scan
+    _task_creator->schedule(scan_op);
+    ++i;
   }
 
   return future;

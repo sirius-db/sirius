@@ -91,6 +91,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   //! Scans where we should push generated filters into (if any)
   duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> filter_pushdown;
 
+  //===----------------------------------------------------------------------===//
+  // Dynamic Filters
+  //===----------------------------------------------------------------------===//
   /// @brief A downstream scan that this join's build side feeds dynamic filters into. The probe
   /// target is paired with the consumer via a shared @ref sirius_dynamic_filter_set channel.
   ///
@@ -111,6 +114,19 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// row-group pruning, in addition to the membership filter. Set at plan time from
   /// operator_params::enable_dynamic_zone_map_filter. Off by default (see that flag).
   bool emit_zone_map_filters = false;
+
+  /// @brief Key-domain proxy for the publish-time selectivity gate: the largest unfiltered
+  /// base-table cardinality in the build-side logical subtree, captured from DuckDB statistics
+  /// when the probe targets were wired (0 = unknown, gate disabled). At publish time the exact
+  /// build row count divided by this approximates the probe keep ratio for FK-shaped joins; a
+  /// build covering ≥ @ref k_publish_domain_coverage_threshold of the domain is not published.
+  std::size_t build_key_domain_cardinality = 0;
+
+  /// @brief Fraction of the key-domain proxy a build may cover and still publish. This is
+  /// intentionally looser than the consumer-side measured keep threshold because the
+  /// denominator is a base-table cardinality proxy, not a proven join-key domain size.
+  static constexpr double k_publish_domain_coverage_threshold = 0.5;
+  //===----------------------------------------------------------------------===//
 
   //! The types of the join keys
   duckdb::vector<sirius::logical_type> condition_types;
@@ -224,6 +240,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
  protected:
   std::vector<key_cast_info> key_casts;
 
+  //===----------------------------------------------------------------------===//
+  // Dynamic Filters
+  //===----------------------------------------------------------------------===//
   /// @brief Compute @c (min, max) per build key over @p build_view via @c cudf::reduce and push a
   /// single-zone @ref sirius_dynamic_zone_map_filter into each entry of @ref probe_targets. Caller
   /// holds @ref op_state_mutex and must have verified @ref filter_pushdown is set and
@@ -233,27 +252,24 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   void push_build_side_dynamic_filters(cudf::table_view const& build_view,
                                        rmm::cuda_stream_view stream);
 
-  /// @brief Publish dynamic filters to the wired probe-target channels exactly once, then signal
-  /// producer-readiness on every target channel.
+  /// @brief Publish dynamic filters to the wired probe-target channels exactly once from a
+  /// materialized build table.
   ///
-  /// Called from three sites, whichever fires first winning via @ref _dynamic_filters_published:
+  /// Called from the two data-bearing sites below, whichever fires first winning via
+  /// @ref _dynamic_filters_published:
   ///   1. @ref push_data_batch_partitioned when the (single, concat-folded) build batch is
-  ///   delivered
-  ///      to the build port — the earliest point, *before* any probe batch, so the probe scan can
-  ///      prune at read;
-  ///   2. the @c BUILD_PROBE @c BUILT transition in @ref execute (fallback if (1) was skipped);
-  ///   3. @ref on_finalize_operator (final fallback — passes @c std::nullopt to publish nothing but
-  ///      still mark-ready every channel, so a consumer parked on the channel is never left
-  ///      hanging).
+  ///      delivered to the build port — the earliest point, before any probe batch, so the probe
+  ///      scan can prune at read;
+  ///   2. the @c BUILD_PROBE @c BUILT transition in @ref execute (fallback if (1) was skipped).
   ///
-  /// Caller must hold @ref op_state_mutex.
-  /// @param build_view When set, the build side to reduce (min,max) over; @c std::nullopt marks
-  ///                   readiness without computing a filter.
-  /// @param stream     CUDA stream used if filters are computed on this call.
-  void publish_dynamic_filters_locked(std::optional<cudf::table_view> build_view,
+  /// @ref on_finalize_operator does not publish filters; it only closes the publication window
+  /// before releasing BUILD_PROBE state. Caller must hold @ref op_state_mutex.
+  /// @param build_view The build side to reduce / build membership over.
+  /// @param stream     CUDA stream used for filter construction.
+  void publish_dynamic_filters_locked(cudf::table_view const& build_view,
                                       rmm::cuda_stream_view stream);
 
-  /// Guards @ref publish_dynamic_filters_locked so filters are pushed / readiness signalled once.
+  /// Guards @ref publish_dynamic_filters_locked so filters are pushed at most once.
   bool _dynamic_filters_published = false;
 
  public:
@@ -265,8 +281,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   void push_data_batch_partitioned(std::string_view port_id,
                                    std::shared_ptr<::cucascade::data_batch> batch,
                                    std::size_t partition_idx) override;
+  //===----------------------------------------------------------------------===//
 
- protected:
  public:
   // Sink Interface
   bool is_sink() const override { return true; }

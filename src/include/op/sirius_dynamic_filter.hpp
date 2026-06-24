@@ -35,6 +35,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace sirius::op {
@@ -187,9 +188,9 @@ class sirius_dynamic_zone_map_filter final : public sirius_dynamic_filter,
  * parquet reader's @c set_filter and row-group stats pruning); a filter may implement either, both,
  * or — for membership — only this one.
  */
-class sirius_apply_lowerable {
+class sirius_mask_applicable {
  public:
-  virtual ~sirius_apply_lowerable() = default;
+  virtual ~sirius_mask_applicable() = default;
 
   /**
    * @brief Compute a BOOL8 keep-mask: @c true where @p probe's value passes this filter.
@@ -210,21 +211,33 @@ class sirius_apply_lowerable {
 // sirius_dynamic_in_list_filter
 //===----------------------------------------------------------------------===//
 /**
- * @brief Exact set-membership filter: keeps rows whose key is one of the build's distinct keys.
+ * @brief Exact set-membership filter: keeps rows whose key appears on the build side.
  *
- * Built from a hash-join build's distinct join keys (one device-resident column). Where the
+ * Built from a hash-join build-key column. Where the
  * zone-map only captures the build keys' @c [min,max] range — useless when the keys are scattered
  * across the domain (e.g. a selective dimension subset) — this tests exact membership, so it prunes
  * exactly the rows the join would discard. It cannot be expressed as a cheap AST or row-group stats
- * predicate, so it rides the @ref sirius_apply_lowerable path: a row-level @c cudf::contains probe
+ * predicate, so it rides the @ref sirius_mask_applicable path: a row-level persistent-set probe
  * applied post-decode. Intended for small-to-moderate key sets; larger builds use a bloom filter.
  */
 class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
-                                            public sirius_apply_lowerable {
+                                            public sirius_mask_applicable {
  public:
-  /// @param keys The build's distinct join keys (ownership transferred). Must be non-null; its type
-  ///             must match the probe column the filter is applied to (membership compares values).
-  explicit sirius_dynamic_in_list_filter(std::unique_ptr<cudf::column> keys);
+  /// @param keys   The build keys. The view only needs to remain valid for the constructor; the
+  ///               filter eagerly builds its own persistent set and does not retain the view.
+  /// @param stream Stream to build the persistent probe structure on (the producer's stream; the
+  ///               publish path synchronizes it before fan-out, so consumer streams never observe
+  ///               a partially built set).
+  /// @param mr     Device memory resource backing the structure.
+  ///
+  /// For supported keys (currently INT64 with no nulls, the join-key common case) the constructor
+  /// builds a persistent @c cuco::static_set ONCE; every @ref compute_mask is then a single
+  /// read-only probe kernel.
+  sirius_dynamic_in_list_filter(cudf::column_view const& keys,
+                                rmm::cuda_stream_view stream,
+                                rmm::device_async_resource_ref mr);
+
+  ~sirius_dynamic_in_list_filter() override;
 
   [[nodiscard]] sirius_dynamic_filter_kind kind() const override
   {
@@ -236,18 +249,30 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) const override;
 
-  /// Number of distinct keys in the set.
+  /// Number of build keys backing the set.
   [[nodiscard]] std::size_t size() const noexcept;
 
-  /// Estimated device footprint (bytes) of the @c cuco::static_set that @c cudf::contains builds
-  /// over an IN-list of @p num_keys keys of @p key_type — the structure that must stay L2-resident
-  /// for the per-row membership probe to run at cache bandwidth (capacity ≈ num_keys / load_factor
-  /// slots, each @c sizeof(key)). Consumed by the producer's L2-fit filter-kind policy.
+  /// True when the persistent probe structure was built (INT64 fast path) — exposed for tests.
+  [[nodiscard]] bool has_persistent_set() const noexcept;
+
+  /// Whether @p keys can back the persistent exact membership set.
+  [[nodiscard]] static bool supports(cudf::column_view const& keys) noexcept;
+
+  /// Estimated device footprint (bytes) of the @c cuco::static_set built over an IN-list of
+  /// @p num_keys keys of @p key_type — the structure that must stay L2-resident for the per-row
+  /// membership probe to run at cache bandwidth (capacity ≈ num_keys / load_factor slots, each
+  /// @c sizeof(key)). Consumed by the producer's L2-fit filter-kind policy.
   [[nodiscard]] static std::size_t estimated_set_bytes(std::size_t num_keys,
                                                        cudf::data_type key_type) noexcept;
 
  private:
-  std::unique_ptr<cudf::column> _keys;
+  cudf::data_type _key_type{cudf::type_id::EMPTY};
+  std::size_t _num_keys = 0;
+
+  /// Persistent cuco::static_set over INT64 keys; PIMPL'd so cuCollections device code stays in
+  /// the .cu translation unit.
+  struct set_impl;
+  std::unique_ptr<set_impl> _set;
 };
 
 //===----------------------------------------------------------------------===//
@@ -260,13 +285,13 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
  * date-filtered @c orders, millions of keys) whose exact key set is too big to store and probe
  * cheaply. A Bloom filter is a few bits per key and answers membership with no false negatives —
  * false *positives* only let through a few extra rows, which is harmless because the join is
- * authoritative. Applied row-level (post-decode) via the @ref sirius_apply_lowerable path.
+ * authoritative. Applied row-level (post-decode) via the @ref sirius_mask_applicable path.
  *
  * Implementation (the @c cuco::bloom_filter and its kernels) is hidden behind a PIMPL so this
  * header stays compilable by the host toolchain; the definitions live in a @c .cu translation unit.
  */
 class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
-                                          public sirius_apply_lowerable {
+                                          public sirius_mask_applicable {
  public:
   /// Build a Bloom filter over the build's join keys. @p keys must be of a @ref supports type.
   /// @throws std::invalid_argument if @c keys.type() is unsupported.
@@ -308,7 +333,8 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
  *
  * Filters are keyed by the column index in the consumer's output schema. Multiple producers may
  * push filters for the same column. The set is append-only — once pushed, filters cannot be
- * removed.
+ * removed. A consumer may close the channel when its scan pipeline drains; later producer pushes
+ * are ignored because no future split can use them.
  *
  * @note A producer pushes filters for the consumer's column index — i.e. the column index in the
  *       downstream operator's output schema, not the producer's. The plan-gen layer is
@@ -326,13 +352,16 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
 class sirius_dynamic_filter_set {
  public:
   /**
-   * @brief Register a filter for column @p col_idx. No-op if @p f is null.
+   * @brief Register a filter for column @p col_idx. No-op if @p f is null or the channel is
+   * closed.
    *
    * Thread-safe; may be called concurrently from multiple producer operators. The same
    * @p f may be pushed into multiple channels and/or columns to fan-out a filter without
    * cloning it; the channels co-own the filter.
+   *
+   * @return true iff the filter was accepted by this channel.
    */
-  void push_filter(std::size_t col_idx, std::shared_ptr<sirius_dynamic_filter const> f);
+  bool push_filter(std::size_t col_idx, std::shared_ptr<sirius_dynamic_filter const> f);
 
   /**
    * @brief Snapshot of filters for @p col_idx, in insertion order.
@@ -350,6 +379,30 @@ class sirius_dynamic_filter_set {
   /// True iff no filters have been pushed for any column.
   [[nodiscard]] bool empty() const;
 
+  /// Drop filters targeting these consumer columns — @ref push_filter becomes a no-op for them.
+  /// A scan marks its hive-partition columns here: those are pruned at the file level and the
+  /// values aren't in the decoded data, so a dynamic filter on them must never reach the consumer.
+  /// Wiring-time setup — call before any producer publishes (not synchronized against push_filter).
+  void ignore_columns(std::vector<std::size_t> const& cols);
+
+  /// Mark that a producer has been wired to this channel at plan time.
+  void register_producer();
+
+  /// True iff at least one producer can publish into this channel.
+  [[nodiscard]] bool has_producers() const noexcept
+  {
+    return _producer_count.load(std::memory_order_acquire) > 0;
+  }
+
+  /// Close the channel once the consumer scan has drained; future pushes cannot prune anything.
+  void close_for_new_filters();
+
+  /// True while at least one future consumer split may still observe newly-pushed filters.
+  [[nodiscard]] bool accepting_filters() const noexcept
+  {
+    return _accepting_filters.load(std::memory_order_acquire);
+  }
+
   //===--------------------------------------------------------------------===//
   // Filter availability
   //===--------------------------------------------------------------------===//
@@ -361,13 +414,30 @@ class sirius_dynamic_filter_set {
     return _filter_count.load(std::memory_order_acquire) > 0;
   }
 
+  /// Lock-free count of filters pushed so far, across all columns. Monotonically
+  /// non-decreasing; @ref dynamic_filter_gate uses it to detect filters that published
+  /// after a disable decision and re-arm itself.
+  [[nodiscard]] std::size_t filter_count() const noexcept
+  {
+    return _filter_count.load(std::memory_order_acquire);
+  }
+
  private:
   mutable std::mutex _mu;
   std::unordered_map<std::size_t, std::vector<std::shared_ptr<sirius_dynamic_filter const>>>
     _filters;
+  /// Consumer columns whose filters are dropped on push (e.g. hive partitions); see @ref
+  /// ignore_columns.
+  std::unordered_set<std::size_t> _ignored_columns;
 
   /// Total filters pushed across all columns; backs the lock-free @ref has_filters.
   std::atomic<std::size_t> _filter_count{0};
+
+  /// Number of plan-time producers wired to this channel; zero means the consumer can be elided.
+  std::atomic<std::size_t> _producer_count{0};
+
+  /// False once the consumer has drained. Producers use this to skip late filter construction.
+  std::atomic<bool> _accepting_filters{true};
 };
 
 /// Resolves a consumer column index to an AST expression already emplaced in the tree (typically

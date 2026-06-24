@@ -178,6 +178,29 @@ TEST_CASE("has_filters reflects pushed filters and ignores null", "[dynamic_filt
   REQUIRE(set.has_filters());
 }
 
+TEST_CASE("sirius_dynamic_filter_set rejects pushes after consumer close", "[dynamic_filter]")
+{
+  sirius_dynamic_filter_set set;
+  REQUIRE(set.accepting_filters());
+
+  set.close_for_new_filters();
+
+  REQUIRE_FALSE(set.accepting_filters());
+  REQUIRE_FALSE(set.push_filter(0, make_single_zone_filter(0, 100)));
+  REQUIRE(set.empty());
+  REQUIRE_FALSE(set.has_filters());
+}
+
+TEST_CASE("sirius_dynamic_filter_set tracks wired producers", "[dynamic_filter]")
+{
+  sirius_dynamic_filter_set set;
+  REQUIRE_FALSE(set.has_producers());
+
+  set.register_producer();
+
+  REQUIRE(set.has_producers());
+}
+
 TEST_CASE("sirius_dynamic_zone_map_filter rejects empty zones", "[dynamic_filter]")
 {
   REQUIRE_THROWS_AS(sirius_dynamic_zone_map_filter(std::vector<zone_map_entry>{}),

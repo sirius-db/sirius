@@ -76,7 +76,8 @@ class parquet_ingestible_table_info : public io::ingestible_table_info {
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters;
   duckdb::vector<duckdb::HivePartitioningIndex> partition_indices;
   /// Sirius-side dynamic join filters published by a build-side hash join. Null when none are
-  /// wired; otherwise read by the ingestible to prune row groups and drop probe rows.
+  /// wired. The ingestible uses AST-capable filters for row-group pruning; the downstream
+  /// dynamic-filter operator applies membership filters post-decode.
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> sirius_dynamic_filters;
   std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
   std::size_t scan_output_arity      = 0;
@@ -219,12 +220,6 @@ class parquet_gpu_ingestible : public io::gpu_ingestible {
 
   void run_batch(file_batch const& batch, std::vector<std::unique_ptr<op::operator_data>>& out);
 
-  // Drop probe rows whose join key is absent from a build-side membership filter (IN-list / bloom),
-  // post-decode, on an output-layout @p table. No-op when no membership filter is published or the
-  // selectivity gate has disabled it. @p table is consumed; the join stays authoritative.
-  std::unique_ptr<cudf::table> apply_membership_filter(std::unique_ptr<cudf::table> table,
-                                                       rmm::cuda_stream_view stream);
-
   // Canonical scan plan — built once in the constructor, shared by every
   // emitted split via its parquet_split_info::plan member.
   std::shared_ptr<scan_plan const> _plan;
@@ -244,13 +239,10 @@ class parquet_gpu_ingestible : public io::gpu_ingestible {
   std::vector<file_batch> _batches;
   std::atomic<std::size_t> _next_batch_idx{0};
 
-  // Dynamic join filters shared with the producing hash join; null when none are wired. Consumed
-  // read-time as row-group pruning (zone-map) and post-decode as a row filter (membership).
+  // Dynamic join filters shared with the producing hash join; null when none are wired.
+  // AST-capable filters are ANDed into the parquet reader filter; membership filtering happens in
+  // the downstream dynamic-filter operator.
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> _sirius_dynamic_filters;
-  // Per-scan gates: the first split decides whether the zone-map check / membership apply pays off
-  // and disables it for the rest of the scan if it prunes too little. 0=unknown, 1=active, 2=off.
-  std::atomic<std::uint8_t> _zonemap_gate{0};
-  std::atomic<std::uint8_t> _membership_gate{0};
 };
 
 }  // namespace sirius::op::scan

@@ -200,9 +200,11 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
       throw std::runtime_error(
         "[sirius_gpu_scan_operator::execute] pinned input missing data_batch.");
     }
-    if (!pinned->filter_info) {
+    if (!pinned->filter_info || !pinned->filter_info->has_work()) {
       // Fast path: forward the cached batch unchanged. Zero-copy; pinned columns
-      // remain co-owned via shared_ptr<column> within the batch.
+      // remain co-owned via shared_ptr<column> within the batch. has_work() is the
+      // execute-time check: a wired dynamic filter that has not published (or whose
+      // gate disabled it) must not force the copying slow path below.
       std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
       batches.push_back(pinned->batch);
       return std::make_unique<pipelineable_operator_data>(std::move(batches));
@@ -214,11 +216,14 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
         "[sirius_gpu_scan_operator::execute] pinned batch has no memory_space; "
         "prepare_for_processing must have produced a GPU-resident batch.");
     }
-    auto& gpu_rep     = ro_batch.get_data()->cast<::cucascade::gpu_table_representation>();
-    auto owning_input = gpu_rep.release_table(stream);
+    auto const& gpu_rep = ro_batch.get_data()->cast<::cucascade::gpu_table_representation>();
 
+    // View-based slow path: the cached batch's columns stay where they are (co-owned by the
+    // pinned cache, alive through `ro_batch`); post_filter_and_project reads the view and
+    // materializes only what survives. release_table here would deep-copy the whole batch
+    // before a single row was filtered.
     table = _ingestible->post_filter_and_project(
-      std::move(owning_input), *pinned->filter_info, *batch_mr, stream);
+      gpu_rep.get_table_view(), *pinned->filter_info, *batch_mr, stream);
     mem_space = batch_mr;
   } else {
     throw std::runtime_error(

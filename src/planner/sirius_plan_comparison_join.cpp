@@ -265,6 +265,53 @@ static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOpe
   }
 }
 
+namespace {
+
+/// Plan-time producer-side selectivity evidence for dynamic-filter wiring, gathered from the
+/// build-side LOGICAL subtree (before create_plan moves data out of it).
+struct build_side_filter_evidence {
+  /// Any predicate anywhere in the subtree: a LOGICAL_FILTER node or GET-level table filters.
+  /// An unfiltered build is (for FK-shaped joins) the whole key domain — its filter keeps every
+  /// probe row by construction, so wiring a producer target for it only buys overhead.
+  bool subtree_filtered = false;
+
+  /// Largest UNFILTERED base-table cardinality among the subtree's GETs, from the table
+  /// function's own statistics (parquet: exact row count from metadata) — a proxy for the build
+  /// key's domain size. 0 when no GET reports statistics.
+  std::size_t domain_cardinality = 0;
+};
+
+build_side_filter_evidence inspect_build_side_for_dynamic_filters(duckdb::LogicalOperator& node,
+                                                                  duckdb::ClientContext& context)
+{
+  build_side_filter_evidence ev;
+  if (node.type == duckdb::LogicalOperatorType::LOGICAL_FILTER) { ev.subtree_filtered = true; }
+  if (node.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+    auto& get = node.Cast<duckdb::LogicalGet>();
+    if (!get.table_filters.filters.empty()) { ev.subtree_filtered = true; }
+    std::size_t card = 0;
+    if (get.function.cardinality) {
+      // The table function's own estimate is pre-filter (the optimizer-adjusted
+      // estimated_cardinality field would undercount the domain for filtered GETs).
+      auto stats = get.function.cardinality(context, get.bind_data.get());
+      if (stats && stats->has_estimated_cardinality) { card = stats->estimated_cardinality; }
+    }
+    if (card == 0) {
+      // May inlcude optimizer filter selectivity
+      card = get.estimated_cardinality;
+    }
+    ev.domain_cardinality = std::max(ev.domain_cardinality, card);
+  }
+  for (auto& child : node.children) {
+    auto child_ev         = inspect_build_side_for_dynamic_filters(*child, context);
+    ev.subtree_filtered   = ev.subtree_filtered || child_ev.subtree_filtered;
+    ev.domain_cardinality = std::max(ev.domain_cardinality, child_ev.domain_cardinality);
+  }
+  return ev;
+}
+
+}  // namespace
+
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJoin& op)
 {
@@ -272,6 +319,12 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   D_ASSERT(op.children.size() == 2);
   std::size_t lhs_cardinality = op.children[0]->EstimateCardinality(context);
   std::size_t rhs_cardinality = op.children[1]->EstimateCardinality(context);
+
+  // Inspect the build side for the dynamic-filter wiring decision BEFORE create_plan, which
+  // moves data out of the logical nodes (same constraint as prove_unique_columns below).
+  auto build_filter_evidence = op.filter_pushdown
+                                 ? inspect_build_side_for_dynamic_filters(*op.children[1], context)
+                                 : build_side_filter_evidence{};
 
   // Probe build-side uniqueness BEFORE create_plan, which moves data out of the logical nodes.
   auto build_side_unique_cols  = prove_unique_columns(*op.children[1]);
@@ -320,7 +373,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     const auto& op_params = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                               ->get_config()
                               .get_operator_params();
-    auto join = duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(
+    auto join             = duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(
       op,
       std::move(left),
       std::move(right),
@@ -338,25 +391,40 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     // --- Wire dynamic-filter producer targets ---
     // For each downstream scan DuckDB has paired with this join, look up the shared channel by
     // the DynamicTableFilterSet pointer (the route key) and stash it along with the per-key
-    // consumer column indices on the join. The producer push at finalize uses this to compute
-    // (min, max) per build key and fan it out across targets.
+    // consumer column indices on the join.
+    //
+    // Plan-time selectivity gate: an UNFILTERED build subtree is — for FK-shaped joins — the
+    // whole key domain, so its membership filter keeps every probe row by construction.
     if (hj.filter_pushdown) {
-      hj.probe_targets.reserve(hj.filter_pushdown->probe_info.size());
-      for (auto const& pi : hj.filter_pushdown->probe_info) {
-        auto channel = get_or_create_dynamic_filter_channel(pi.dynamic_filters.get());
-        if (!channel) { continue; }
-        sirius::op::sirius_physical_hash_join::probe_target tgt{std::move(channel), {}};
-        tgt.probe_col_idx.reserve(pi.columns.size());
-        for (auto const& col : pi.columns) {
-          tgt.probe_col_idx.push_back(col.probe_column_index.column_index);
-        }
-        hj.probe_targets.push_back(std::move(tgt));
-      }
-      hj.emit_zone_map_filters = op_params.enable_dynamic_zone_map_filter;
-      if (!hj.probe_targets.empty()) {
+      if (!build_filter_evidence.subtree_filtered) {
         SIRIUS_LOG_INFO(
-          "[sirius_plan_comparison_join] Wired hash join with {} dynamic-filter probe target(s).",
-          hj.probe_targets.size());
+          "[sirius_plan_comparison_join] Not wiring dynamic filter(s): build subtree is "
+          "unfiltered (build est {} rows, key-domain ~{} rows).",
+          rhs_cardinality,
+          build_filter_evidence.domain_cardinality);
+      } else {
+        hj.probe_targets.reserve(hj.filter_pushdown->probe_info.size());
+        for (auto const& pi : hj.filter_pushdown->probe_info) {
+          auto channel = get_or_create_dynamic_filter_channel(pi.dynamic_filters.get());
+          if (!channel) { continue; }
+          channel->register_producer();
+          sirius::op::sirius_physical_hash_join::probe_target tgt{std::move(channel), {}};
+          tgt.probe_col_idx.reserve(pi.columns.size());
+          for (auto const& col : pi.columns) {
+            tgt.probe_col_idx.push_back(col.probe_column_index.column_index);
+          }
+          hj.probe_targets.push_back(std::move(tgt));
+        }
+        hj.emit_zone_map_filters        = op_params.enable_dynamic_zone_map_filter;
+        hj.build_key_domain_cardinality = build_filter_evidence.domain_cardinality;
+        if (!hj.probe_targets.empty()) {
+          SIRIUS_LOG_INFO(
+            "[sirius_plan_comparison_join] Wired hash join with {} dynamic-filter probe "
+            "target(s) (build est {} rows, key-domain ~{} rows).",
+            hj.probe_targets.size(),
+            rhs_cardinality,
+            build_filter_evidence.domain_cardinality);
+        }
       }
     }
 

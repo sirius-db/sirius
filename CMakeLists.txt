@@ -78,9 +78,10 @@ find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
 
-# cuCollections (cuco): header-only, used by the dynamic Bloom filter. libcudf no longer ships its
-# bundled copy, so fetch the same commit cudf is built against. Header-only — populate the sources
-# without add_subdirectory (CCCL comes from cudf); only the include dir is consumed.
+# cuCollections (cuco): header-only, used by the dynamic Bloom filter. libcudf
+# no longer ships its bundled copy, so fetch the same commit cudf is built
+# against. Header-only — populate the sources without add_subdirectory (CCCL
+# comes from cudf); only the include dir is consumed.
 include(FetchContent)
 FetchContent_Declare(
   cuco
@@ -232,6 +233,7 @@ set(EXTENSION_SOURCES
     src/op/scan/equality_delete_filter.cpp
     src/op/scan/hive_partition.cpp
     src/op/scan/dynamic_filter_merge.cpp
+    src/op/scan/sirius_physical_dynamic_filter.cpp
     src/op/scan/iceberg_avro_reader.cpp
     src/op/scan/iceberg_delete_pipeline.cpp
     src/op/scan/iceberg_metadata_reader.cpp
@@ -326,16 +328,21 @@ set(EXTENSION_SOURCES
 # cmake-format: on
 
 # Legacy Sirius — all legacy-specific config lives in src/legacy/CMakeLists.txt.
-# cuCollections (cuco) device code — used by the dynamic Bloom filter — requires nvcc's extended
-# device lambda and relaxed constexpr support.
-string(APPEND CMAKE_CUDA_FLAGS " --expt-extended-lambda --expt-relaxed-constexpr")
+# cuCollections (cuco) device code — used by the dynamic Bloom filter — requires
+# nvcc's extended device lambda and relaxed constexpr support.
+string(APPEND CMAKE_CUDA_FLAGS
+       " --expt-extended-lambda --expt-relaxed-constexpr")
 
 # Deleting src/legacy/ cleanly removes legacy build support.
 set(CUDA_SOURCES
     src/cuda/sirius_dynamic_bloom_filter.cu
-    src/op/scan/equality_delete_mask.cu src/cuda/scan/gpu_decode_alp.cu
-    src/cuda/scan/gpu_decode_bitpacking.cu src/cuda/scan/gpu_decode_rle.cu
-    src/cuda/scan/gpu_decode_strings.cu src/cuda/scan/gpu_native_decode.cu)
+    src/cuda/sirius_dynamic_in_list_filter.cu
+    src/op/scan/equality_delete_mask.cu
+    src/cuda/scan/gpu_decode_alp.cu
+    src/cuda/scan/gpu_decode_bitpacking.cu
+    src/cuda/scan/gpu_decode_rle.cu
+    src/cuda/scan/gpu_decode_strings.cu
+    src/cuda/scan/gpu_native_decode.cu)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
   add_subdirectory(src/legacy)
   list(APPEND EXTENSION_SOURCES ${SIRIUS_LEGACY_SOURCES}

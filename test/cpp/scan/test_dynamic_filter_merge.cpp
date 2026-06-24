@@ -42,6 +42,7 @@ using sirius::op::sirius_dynamic_filter_set;
 using sirius::op::sirius_dynamic_zone_map_filter;
 using sirius::op::zone_map_entry;
 using sirius::op::scan::merge_dynamic_filters_into_ast;
+using sirius::op::scan::dynamic_filter_apply_mode;
 using sirius::op::scan::scan_plan;
 
 namespace {
@@ -235,7 +236,7 @@ TEST_CASE("merge_dynamic_filters_into_ast ignores out-of-range col_idx defensive
 }
 
 //===----------------------------------------------------------------------===//
-// apply_dynamic_filters_to_output_table — runtime apply (post-decode / cached)
+// apply_dynamic_filters_to_view — runtime apply (post-decode / cached)
 //===----------------------------------------------------------------------===//
 
 namespace {
@@ -252,73 +253,70 @@ std::unique_ptr<cudf::table> make_sequence_table(int32_t size, rmm::cuda_stream_
 }
 }  // namespace
 
-TEST_CASE("apply_dynamic_filters_to_output_table drops rows outside the zone",
+TEST_CASE("apply_dynamic_filters_to_view drops rows outside the zone",
           "[dynamic_filter][scan_merge]")
 {
   auto stream = cudf::get_default_stream();
   auto table  = make_sequence_table(10, stream);  // [0..9]
 
-  auto plan = make_data_only_plan(0, "v");
   sirius_dynamic_filter_set filters;
   filters.push_filter(0, make_zone_map(3, 6));  // inclusive [3,6] keeps 3,4,5,6
 
-  auto out = sirius::op::scan::apply_dynamic_filters_to_output_table(
-    std::move(table), filters, plan, stream);
+  auto out = sirius::op::scan::apply_dynamic_filters_to_view(table->view(), filters, stream);
   stream.synchronize();
 
+  REQUIRE(out != nullptr);
   REQUIRE(out->num_columns() == 1);
   REQUIRE(out->num_rows() == 4);
+  REQUIRE(table->num_rows() == 10);  // input untouched
 }
 
-TEST_CASE("apply_dynamic_filters_to_output_table is a no-op for an empty channel",
+TEST_CASE("apply_dynamic_filters_to_view returns nullptr for an empty channel",
           "[dynamic_filter][scan_merge]")
 {
   auto stream = cudf::get_default_stream();
   auto table  = make_sequence_table(10, stream);
 
-  auto plan = make_data_only_plan(0, "v");
   sirius_dynamic_filter_set filters;  // empty
 
-  auto out = sirius::op::scan::apply_dynamic_filters_to_output_table(
-    std::move(table), filters, plan, stream);
+  auto out = sirius::op::scan::apply_dynamic_filters_to_view(table->view(), filters, stream);
   stream.synchronize();
 
-  REQUIRE(out->num_rows() == 10);  // unchanged
+  REQUIRE(out == nullptr);
+  REQUIRE(table->num_rows() == 10);  // input untouched
 }
 
-TEST_CASE("apply_dynamic_filters_to_output_table skips hive-partition columns",
+TEST_CASE("sirius_dynamic_filter_set ignore_columns drops filters for ignored columns",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream = cudf::get_default_stream();
-  auto table  = make_sequence_table(10, stream);
-
-  auto plan = make_partition_plan(0);  // output col 0 is a partition column
+  // Wiring-time partition skip: a consumer marks its hive-partition output columns so the producer
+  // never publishes a filter the post-decode apply would have to skip.
   sirius_dynamic_filter_set filters;
-  filters.push_filter(0, make_zone_map(3, 6));  // would prune, but col is a partition → skipped
+  filters.ignore_columns({0});                  // output col 0 is a hive partition
+  filters.push_filter(0, make_zone_map(3, 6));  // dropped — column 0 is ignored
+  filters.push_filter(1, make_zone_map(3, 6));  // kept — column 1 is a data column
 
-  auto out = sirius::op::scan::apply_dynamic_filters_to_output_table(
-    std::move(table), filters, plan, stream);
-  stream.synchronize();
-
-  REQUIRE(out->num_rows() == 10);  // unchanged — partition columns are never row-filtered here
+  REQUIRE(filters.filters_for_column(0).empty());
+  REQUIRE(filters.filters_for_column(1).size() == 1);
+  REQUIRE(filters.filter_count() == 1);
 }
 
-TEST_CASE("apply_dynamic_filters_to_output_table AND-conjoins multiple zone filters on a column",
+TEST_CASE("apply_dynamic_filters_to_view AND-conjoins multiple zone filters on a column",
           "[dynamic_filter][scan_merge]")
 {
   auto stream = cudf::get_default_stream();
   auto table  = make_sequence_table(10, stream);  // [0..9]
 
-  auto plan = make_data_only_plan(0, "v");
   sirius_dynamic_filter_set filters;
   filters.push_filter(0, make_zone_map(2, 8));  // keeps 2..8
   filters.push_filter(0, make_zone_map(5, 9));  // AND keeps 5..9 → intersection 5..8
 
-  auto out = sirius::op::scan::apply_dynamic_filters_to_output_table(
-    std::move(table), filters, plan, stream);
+  auto out = sirius::op::scan::apply_dynamic_filters_to_view(table->view(), filters, stream);
   stream.synchronize();
 
+  REQUIRE(out != nullptr);
   REQUIRE(out->num_rows() == 4);  // 5,6,7,8
+  REQUIRE(table->num_rows() == 10);
 }
 
 //===----------------------------------------------------------------------===//
@@ -344,18 +342,46 @@ TEST_CASE("sirius_dynamic_in_list_filter keeps exactly the rows whose key is a b
   auto stream = cudf::get_default_stream();
   // Build key set {0,1,2,3,4}; probe table [0..9]. Exact membership keeps the first five.
   auto keys = cudf::sequence(5,
-                             cudf::numeric_scalar<int32_t>(0, true, stream),
-                             cudf::numeric_scalar<int32_t>(1, true, stream),
+                             cudf::numeric_scalar<int64_t>(0, true, stream),
+                             cudf::numeric_scalar<int64_t>(1, true, stream),
                              stream);
   sirius_dynamic_filter_set filters;
-  filters.push_filter(
-    0, std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(std::move(keys)));
+  filters.push_filter(0,
+                      std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(
+                        keys->view(), stream, cudf::get_current_device_resource_ref()));
 
-  auto plan = make_data_only_plan(0, "v");
-  auto out  = sirius::op::scan::apply_dynamic_filters_to_output_table(
-    make_sequence_table(10, stream), filters, plan, stream);
+  auto table = make_int64_sequence_table(10, stream);
+  auto out   = sirius::op::scan::apply_dynamic_filters_to_view(table->view(), filters, stream);
   stream.synchronize();
+  REQUIRE(out != nullptr);
   REQUIRE(out->num_rows() == 5);
+  REQUIRE(table->num_rows() == 10);
+}
+
+TEST_CASE("sirius_dynamic_in_list_filter INT64 path uses a persistent set and probes repeatedly",
+          "[dynamic_filter][scan_merge]")
+{
+  auto stream = cudf::get_default_stream();
+  auto keys   = cudf::sequence(5,
+                             cudf::numeric_scalar<int64_t>(0, true, stream),
+                             cudf::numeric_scalar<int64_t>(1, true, stream),
+                             stream);
+  auto filter = std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(
+    keys->view(), stream, cudf::get_current_device_resource_ref());
+  REQUIRE(filter->has_persistent_set());  // INT64, non-null keys → fast path
+
+  sirius_dynamic_filter_set filters;
+  filters.push_filter(0, filter);
+
+  // Two applies against the same persistent structure (the per-split pattern).
+  for (int i = 0; i < 2; ++i) {
+    auto table = make_int64_sequence_table(10, stream);
+    auto out   = sirius::op::scan::apply_dynamic_filters_to_view(table->view(), filters, stream);
+    stream.synchronize();
+    REQUIRE(out != nullptr);
+    REQUIRE(out->num_rows() == 5);  // exact membership: 0..4
+    REQUIRE(table->num_rows() == 10);
+  }
 }
 
 TEST_CASE("sirius_dynamic_bloom_filter never drops a true match (no false negatives)",
@@ -371,12 +397,201 @@ TEST_CASE("sirius_dynamic_bloom_filter never drops a true match (no false negati
                       std::make_shared<sirius::op::sirius_dynamic_bloom_filter>(
                         keys->view(), stream, cudf::get_current_device_resource_ref()));
 
-  auto plan = make_data_only_plan(0, "v");
-  auto out  = sirius::op::scan::apply_dynamic_filters_to_output_table(
-    make_int64_sequence_table(10, stream), filters, plan, stream);
+  auto table = make_int64_sequence_table(10, stream);
+  auto out   = sirius::op::scan::apply_dynamic_filters_to_view(table->view(), filters, stream);
   stream.synchronize();
   // All five build keys are in the probe, so every one must survive (Bloom has no false negatives).
   // False positives may keep a few extras, so the surviving count is in [5, 10].
+  REQUIRE(out != nullptr);
   REQUIRE(out->num_rows() >= 5);
   REQUIRE(out->num_rows() <= 10);
+  REQUIRE(table->num_rows() == 10);
+}
+
+//===----------------------------------------------------------------------===//
+// apply_dynamic_filters_to_view — view-based core (pinned cached path)
+//===----------------------------------------------------------------------===//
+
+namespace {
+/// IN-list filter keeping INT64 keys [0, count).
+std::shared_ptr<sirius::op::sirius_dynamic_in_list_filter> make_in_list_prefix(
+  int64_t count, rmm::cuda_stream_view stream)
+{
+  auto keys = cudf::sequence(static_cast<cudf::size_type>(count),
+                             cudf::numeric_scalar<int64_t>(0, true, stream),
+                             cudf::numeric_scalar<int64_t>(1, true, stream),
+                             stream);
+  return std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(
+    keys->view(), stream, cudf::get_current_device_resource_ref());
+}
+}  // namespace
+
+TEST_CASE("apply_dynamic_filters_to_view returns nullptr when no filter contributes",
+          "[dynamic_filter][scan_merge]")
+{
+  auto stream = cudf::get_default_stream();
+  auto table  = make_int64_sequence_table(10, stream);
+
+  sirius_dynamic_filter_set filters;  // empty
+
+  auto out = sirius::op::scan::apply_dynamic_filters_to_view(table->view(), filters, stream);
+  REQUIRE(out == nullptr);
+  REQUIRE(table->num_rows() == 10);  // input untouched, still usable
+}
+
+TEST_CASE("apply_dynamic_filters_to_view gathers survivors without consuming the input",
+          "[dynamic_filter][scan_merge]")
+{
+  auto stream = cudf::get_default_stream();
+  auto table  = make_int64_sequence_table(10, stream);  // [0..9]
+
+  sirius_dynamic_filter_set filters;
+  filters.push_filter(0, make_in_list_prefix(2, stream));  // keeps 0,1
+
+  auto out = sirius::op::scan::apply_dynamic_filters_to_view(table->view(), filters, stream);
+  stream.synchronize();
+
+  REQUIRE(out != nullptr);
+  REQUIRE(out->num_rows() == 2);
+  REQUIRE(table->num_rows() == 10);  // the view's backing table is intact
+}
+
+//===----------------------------------------------------------------------===//
+// dynamic_filter_gate — selectivity gating and re-arm on new publishes
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("dynamic_filter_gate is not applicable before any filter publishes",
+          "[dynamic_filter][scan_merge]")
+{
+  sirius::op::scan::dynamic_filter_gate gate;
+  sirius_dynamic_filter_set filters;  // empty
+  REQUIRE_FALSE(gate.applicable(filters));
+}
+
+TEST_CASE("dynamic_filter_gate disables after an unselective first split",
+          "[dynamic_filter][scan_merge]")
+{
+  auto stream = cudf::get_default_stream();
+  sirius::op::scan::dynamic_filter_gate gate;
+
+  sirius_dynamic_filter_set filters;
+  filters.push_filter(0, make_in_list_prefix(10, stream));  // covers [0..9] — keeps 100%
+  REQUIRE(gate.applicable(filters));
+
+  auto table = make_int64_sequence_table(10, stream);
+  auto out   = sirius::op::scan::apply_dynamic_filters_gated_view(
+    table->view(), filters, gate, stream, dynamic_filter_apply_mode::include_ast_row_masks);
+  stream.synchronize();
+
+  REQUIRE(out != nullptr);                  // a mask was computed (keeps everything)
+  REQUIRE(out->num_rows() == 10);           // ... so kept ratio is 1.0
+  REQUIRE_FALSE(gate.applicable(filters));  // gate disabled for subsequent splits
+
+  auto second = sirius::op::scan::apply_dynamic_filters_gated_view(
+    table->view(), filters, gate, stream, dynamic_filter_apply_mode::include_ast_row_masks);
+  REQUIRE(second == nullptr);  // gated out — no work
+}
+
+TEST_CASE("dynamic_filter_gate re-arms when a filter publishes after the disable decision",
+          "[dynamic_filter][scan_merge]")
+{
+  auto stream = cudf::get_default_stream();
+  sirius::op::scan::dynamic_filter_gate gate;
+
+  // Unselective filter publishes first and disables the gate (the Q8 supplier hazard).
+  sirius_dynamic_filter_set filters;
+  filters.push_filter(0, make_in_list_prefix(10, stream));
+  auto table = make_int64_sequence_table(10, stream);
+  (void)sirius::op::scan::apply_dynamic_filters_gated_view(
+    table->view(), filters, gate, stream, dynamic_filter_apply_mode::include_ast_row_masks);
+  stream.synchronize();
+  REQUIRE_FALSE(gate.applicable(filters));
+
+  // A selective filter lands later: the channel grew, so the gate must re-arm...
+  filters.push_filter(0, make_in_list_prefix(2, stream));
+  REQUIRE(gate.applicable(filters));
+
+  // ...and the re-measurement sees the combined mask (AND → keeps 0,1), going ACTIVE.
+  auto out = sirius::op::scan::apply_dynamic_filters_gated_view(
+    table->view(), filters, gate, stream, dynamic_filter_apply_mode::include_ast_row_masks);
+  stream.synchronize();
+  REQUIRE(out != nullptr);
+  REQUIRE(out->num_rows() == 2);
+  REQUIRE(gate.applicable(filters));  // active — stays applicable
+}
+
+TEST_CASE("dynamic_filter_gate stays active once a selective split proves the filter useful",
+          "[dynamic_filter][scan_merge]")
+{
+  auto stream = cudf::get_default_stream();
+  sirius::op::scan::dynamic_filter_gate gate;
+
+  sirius_dynamic_filter_set filters;
+  filters.push_filter(0, make_in_list_prefix(2, stream));  // selective: keeps 20%
+  auto table = make_int64_sequence_table(10, stream);
+  (void)sirius::op::scan::apply_dynamic_filters_gated_view(
+    table->view(), filters, gate, stream, dynamic_filter_apply_mode::include_ast_row_masks);
+  stream.synchronize();
+  REQUIRE(gate.applicable(filters));
+
+  // A later unselective publish must not demote an active gate.
+  filters.push_filter(0, make_in_list_prefix(10, stream));
+  auto out = sirius::op::scan::apply_dynamic_filters_gated_view(
+    table->view(), filters, gate, stream, dynamic_filter_apply_mode::include_ast_row_masks);
+  stream.synchronize();
+  REQUIRE(out != nullptr);
+  REQUIRE(out->num_rows() == 2);      // cascade of both filters == their conjunction
+  REQUIRE(gate.applicable(filters));  // still active
+}
+
+TEST_CASE("cascaded membership filters produce the conjunction of all filters",
+          "[dynamic_filter][scan_merge]")
+{
+  auto stream = cudf::get_default_stream();
+
+  sirius_dynamic_filter_set filters;
+  filters.push_filter(0, make_in_list_prefix(7, stream));  // keeps 0..6
+  filters.push_filter(0, make_in_list_prefix(4, stream));  // keeps 0..3
+
+  auto table = make_int64_sequence_table(10, stream);
+  auto out = sirius::op::scan::apply_dynamic_filters_to_view(table->view(), filters, stream);
+  stream.synchronize();
+  REQUIRE(out != nullptr);
+  REQUIRE(out->num_rows() == 4);  // 0..3 — intersection regardless of cascade order
+}
+
+TEST_CASE("per-filter gate measures marginal keep and skips a useless filter on later splits",
+          "[dynamic_filter][scan_merge]")
+{
+  auto stream = cudf::get_default_stream();
+  sirius::op::scan::dynamic_filter_gate gate;
+
+  auto useless   = make_in_list_prefix(10, stream);  // covers the whole domain — keep 1.0
+  auto selective = make_in_list_prefix(2, stream);   // keeps 20%
+  sirius_dynamic_filter_set filters;
+  filters.push_filter(0, useless);
+  filters.push_filter(0, selective);
+
+  auto table = make_int64_sequence_table(10, stream);
+  auto out   = sirius::op::scan::apply_dynamic_filters_gated_view(
+    table->view(), filters, gate, stream, dynamic_filter_apply_mode::include_ast_row_masks);
+  stream.synchronize();
+  REQUIRE(out != nullptr);
+  REQUIRE(out->num_rows() == 2);
+
+  // First split measured both marginals: the domain-covering filter is now skippable, the
+  // selective one is not.
+  auto useless_kept = gate.filter_keep_ratio(useless.get());
+  REQUIRE(useless_kept.has_value());
+  REQUIRE(sirius::op::scan::dynamic_filter_gate::filter_skippable(*useless_kept));
+  auto selective_kept = gate.filter_keep_ratio(selective.get());
+  REQUIRE(selective_kept.has_value());
+  REQUIRE_FALSE(sirius::op::scan::dynamic_filter_gate::filter_skippable(*selective_kept));
+
+  // Later splits still produce the right rows with the useless filter dropped from the cascade.
+  auto out2 = sirius::op::scan::apply_dynamic_filters_gated_view(
+    table->view(), filters, gate, stream, dynamic_filter_apply_mode::include_ast_row_masks);
+  stream.synchronize();
+  REQUIRE(out2 != nullptr);
+  REQUIRE(out2->num_rows() == 2);
 }

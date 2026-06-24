@@ -39,6 +39,7 @@
 #include <cucascade/data/representation_converter.hpp>
 
 // standard library
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <utility>
@@ -111,6 +112,13 @@ pinned_table_gpu_ingestible::pinned_table_gpu_ingestible(
 
 pinned_table_gpu_ingestible::~pinned_table_gpu_ingestible() = default;
 
+bool pinned_table_post_filter_and_projection_info::has_work() const
+{
+  // Gates only the cached batch's static filter and output assembly; membership filtering happens
+  // in the downstream dynamic-filter operator.
+  return apply_filter || apply_assembly;
+}
+
 bool pinned_table_gpu_ingestible::has_more_splits() const
 {
   return _next_batch_idx.load(std::memory_order_relaxed) < _batches.size();
@@ -122,8 +130,10 @@ pinned_table_gpu_ingestible::next_split_provider()
   auto const batch_idx = _next_batch_idx.fetch_add(1, std::memory_order_relaxed);
   if (batch_idx >= _batches.size()) { return nullptr; }
 
-  bool const apply_filter         = static_cast<bool>(_filter_expression);
-  bool const apply_assembly       = needs_output_assembly(*_plan);
+  bool const apply_filter   = static_cast<bool>(_filter_expression);
+  bool const apply_assembly = needs_output_assembly(*_plan);
+  // A split is post-processed only for a static filter or output assembly; with neither, the
+  // cached batch forwards unchanged. Membership filtering happens in the downstream operator.
   bool const need_post_processing = apply_filter || apply_assembly;
 
   return [this, batch_idx, apply_filter, apply_assembly, need_post_processing]()
@@ -194,33 +204,89 @@ io::filtered_table pinned_table_gpu_ingestible::materialize_table(
 std::unique_ptr<cudf::table> pinned_table_gpu_ingestible::post_filter_and_project(
   std::unique_ptr<cudf::table> input,
   io::post_filter_and_projection_info const& info,
+  ::cucascade::memory::memory_space const& mem_space,
+  rmm::cuda_stream_view stream)
+{
+  // The scan operator enters the cached path through the view overload below; this owning
+  // entry point remains for interface completeness. `input` backs the view through the call.
+  return post_filter_and_project(input->view(), info, mem_space, stream);
+}
+
+namespace {
+
+/// Zero-copy output-layout permutation of @p input: a table_view selecting the plan's DATA
+/// columns in output order. nullopt when the layout has any non-DATA entry (hive partitions)
+/// or an out-of-range index — callers fall back to the owning @ref assemble_scan_output,
+/// which reports those exactly as the fresh-read path would.
+std::optional<cudf::table_view> assembled_data_view(scan_plan const& plan,
+                                                    cudf::table_view const& input)
+{
+  std::vector<cudf::column_view> cols;
+  cols.reserve(plan.output_layout.size());
+  for (auto const& entry : plan.output_layout) {
+    if (entry.source != scan_plan::output_entry::DATA ||
+        entry.idx >= static_cast<std::size_t>(input.num_columns())) {
+      return std::nullopt;
+    }
+    cols.push_back(input.column(static_cast<cudf::size_type>(entry.idx)));
+  }
+  return cudf::table_view(cols);
+}
+
+}  // namespace
+
+std::unique_ptr<cudf::table> pinned_table_gpu_ingestible::post_filter_and_project(
+  cudf::table_view const& view_input,
+  io::post_filter_and_projection_info const& info,
   ::cucascade::memory::memory_space const& /*mem_space*/,
   rmm::cuda_stream_view stream)
 {
   auto const& pf = static_cast<pinned_table_post_filter_and_projection_info const&>(info);
+  auto const mr  = cudf::get_current_device_resource_ref();
+
+  // Every stage reads a view and produces a fresh table, so the cached batch is never copied
+  // wholesale: `owned` is the most recent stage's product, `current` the view to read next.
+  // Whatever is returned was materialized by a stage (or the final fallback) and never aliases
+  // the cache.
+  std::unique_ptr<cudf::table> owned;
+  cudf::table_view current = view_input;
 
   if (pf.apply_filter && _filter_expression) {
     auto sirius_filter_ast = sirius::ast::from_duckdb(*_filter_expression);
-    sirius::gpu_expression_executor exec(
-      sirius_filter_ast.get(), cudf::get_current_device_resource_ref(), stream);
-    auto src = std::move(input);
-    input    = exec.select(src->view());
+    sirius::gpu_expression_executor exec(sirius_filter_ast.get(), mr, stream);
+    owned   = exec.select(current);
+    current = owned->view();
     SIRIUS_LOG_DEBUG(
       "[pinned_table_gpu_ingestible::post_filter_and_project] Applied duckdb filter "
       "expression on cached batch.");
   }
 
   if (pf.apply_assembly) {
-    // Cached path is gated upstream against hive partitions: partition_values
-    // is always empty here, so assemble_scan_output's PARTITION branch is
-    // never exercised.
-    input = assemble_scan_output(*_plan, std::move(input), /*partition_values=*/{}, stream);
+    if (owned) {
+      // The filter stage's product is ours to reshape — moving columns costs nothing.
+      owned   = assemble_scan_output(*_plan, std::move(owned), /*partition_values=*/{}, stream);
+      current = owned->view();
+    } else if (auto assembled = assembled_data_view(*_plan, current)) {
+      // Pure permutation of the cache view; a later stage (or the final fallback)
+      // materializes only the output columns.
+      current = *assembled;
+    } else {
+      // Non-DATA layout entries — gated upstream off the cached path; materialize and
+      // delegate so the failure mode matches assemble_scan_output's.
+      owned   = assemble_scan_output(*_plan,
+                                   std::make_unique<cudf::table>(current, stream, mr),
+                                   /*partition_values=*/{},
+                                   stream);
+      current = owned->view();
+    }
     SIRIUS_LOG_DEBUG(
       "[pinned_table_gpu_ingestible::post_filter_and_project] Assembled cached batch "
       "to plan layout.");
   }
 
-  return input;
+  // No stage materialized (assembly was a pure permutation, or nothing applied): realize
+  // `current` so the emitted batch owns its memory.
+  return owned ? std::move(owned) : std::make_unique<cudf::table>(current, stream, mr);
 }
 
 }  // namespace sirius::op::scan

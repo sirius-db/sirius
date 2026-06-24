@@ -16,10 +16,29 @@
 
 #include "io/gpu_ingestible.hpp"
 
+#include <cudf/utilities/memory_resource.hpp>
+
+#include <memory>
 #include <stdexcept>
 #include <utility>
 
 namespace sirius::io {
+
+std::unique_ptr<cudf::table> gpu_ingestible::post_filter_and_project(
+  cudf::table_view const& input,
+  post_filter_and_projection_info const& info,
+  ::cucascade::memory::memory_space const& mem_space,
+  rmm::cuda_stream_view stream)
+{
+  // Default: materialize the view and delegate to the owning overload. Implementations
+  // whose inputs are views over caller-owned memory (the pinned cache) override this
+  // to avoid copying rows and columns the filter/projection would drop anyway.
+  return post_filter_and_project(
+    std::make_unique<cudf::table>(input, stream, cudf::get_current_device_resource_ref()),
+    info,
+    mem_space,
+    stream);
+}
 
 std::shared_ptr<gpu_ingestible> make_gpu_ingestible(
   std::unique_ptr<ingestible_table_info> info,

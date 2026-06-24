@@ -34,6 +34,7 @@
 // standard library
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <unordered_map>
@@ -46,6 +47,8 @@ class pinned_table_post_filter_and_projection_info : public io::post_filter_and_
  public:
   bool apply_filter   = false;
   bool apply_assembly = false;
+
+  [[nodiscard]] bool has_work() const override;
 };
 
 class pinned_table_gpu_ingestible : public io::gpu_ingestible {
@@ -83,6 +86,15 @@ class pinned_table_gpu_ingestible : public io::gpu_ingestible {
 
   std::unique_ptr<cudf::table> post_filter_and_project(
     std::unique_ptr<cudf::table> input,
+    io::post_filter_and_projection_info const& info,
+    ::cucascade::memory::memory_space const& mem_space,
+    rmm::cuda_stream_view stream) override;
+
+  /// View-based variant — the cached path's entry point. Applies the static filter and assembles
+  /// directly from @p input (a view over cache-owned pinned columns), allocating only each stage's
+  /// product rather than copying the batch wholesale.
+  std::unique_ptr<cudf::table> post_filter_and_project(
+    cudf::table_view const& input,
     io::post_filter_and_projection_info const& info,
     ::cucascade::memory::memory_space const& mem_space,
     rmm::cuda_stream_view stream) override;

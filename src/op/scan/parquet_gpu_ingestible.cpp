@@ -138,6 +138,18 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(
   _total_files            = _file_paths.size();
   _sirius_dynamic_filters = bind.sirius_dynamic_filters;
 
+  // Hive-partition columns are path-derived constants, not decoded parquet columns, so they must
+  // not receive post-decode dynamic filters.
+  if (_sirius_dynamic_filters && _plan->has_partitions()) {
+    std::vector<std::size_t> partition_cols;
+    for (std::size_t i = 0; i < _plan->output_layout.size(); ++i) {
+      if (_plan->output_layout[i].source == scan_plan::output_entry::PARTITION) {
+        partition_cols.push_back(i);
+      }
+    }
+    _sirius_dynamic_filters->ignore_columns(partition_cols);
+  }
+
   for (std::size_t start = 0; start < _total_files; start += _max_file_processed) {
     auto const end = std::min(start + _max_file_processed, _total_files);
     file_batch batch;
@@ -153,9 +165,7 @@ parquet_gpu_ingestible::~parquet_gpu_ingestible() = default;
 // split-provider interface
 //===----------------------------------------------------------------------===//
 bool parquet_gpu_ingestible::has_more_splits() const
-{
-  return _next_batch_idx.load(std::memory_order_relaxed) < _batches.size();
-}
+{ return _next_batch_idx.load(std::memory_order_relaxed) < _batches.size(); }
 
 std::function<std::vector<std::unique_ptr<op::operator_data>>()>
 parquet_gpu_ingestible::next_split_provider()
@@ -525,32 +535,6 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
 //===----------------------------------------------------------------------===//
 // materialize_table — ports read_table_from_metadata
 //===----------------------------------------------------------------------===//
-std::unique_ptr<cudf::table> parquet_gpu_ingestible::apply_membership_filter(
-  std::unique_ptr<cudf::table> table, rmm::cuda_stream_view stream)
-{
-  static constexpr std::uint8_t kGateUnknown = 0, kGateActive = 1, kGateDisabled = 2;
-  static constexpr double kKeepThreshold = 0.5;  // disable if a split keeps > 50% of its rows
-  if (!_sirius_dynamic_filters || !_sirius_dynamic_filters->has_filters() ||
-      _membership_gate.load(std::memory_order_relaxed) == kGateDisabled) {
-    return table;
-  }
-  // Zone-maps are consumed as row-group pruning at read, so this applies only the membership kind.
-  auto const rows_before = table->num_rows();
-  table                  = apply_dynamic_filters_to_output_table(
-    std::move(table), *_sirius_dynamic_filters, *_plan, stream, /*include_ast_lowerable=*/false);
-  // The first split to finish records the keep ratio and disables the rest of the scan if the
-  // filter barely prunes, so a non-selective build can't regress the whole scan.
-  if (_membership_gate.load(std::memory_order_relaxed) == kGateUnknown && rows_before > 0) {
-    auto const kept = static_cast<double>(table->num_rows()) / static_cast<double>(rows_before);
-    _membership_gate.store(kept > kKeepThreshold ? kGateDisabled : kGateActive,
-                           std::memory_order_relaxed);
-    SIRIUS_LOG_DEBUG("[parquet_gpu_ingestible] Membership selectivity gate: kept {:.3f} -> {}.",
-                     kept,
-                     kept > kKeepThreshold ? "DISABLED" : "ACTIVE");
-  }
-  return table;
-}
-
 io::filtered_table parquet_gpu_ingestible::materialize_table(
   io::scan_info const& info,
   ::cucascade::memory::memory_space const& mem_space,
@@ -618,52 +602,18 @@ io::filtered_table parquet_gpu_ingestible::materialize_table(
   }
   auto opts = *split.reader_options;
 
-  // Dynamic-filter row-group pruning: a dynamic join filter is redundant with the join that
-  // produced it, so it never removes individual rows — it only skips whole row groups whose stats
-  // rule out a join match, saving their I/O and decode. A no-op when nothing can be excluded (e.g.
-  // scattered keys), so an unprunable scan is never slowed; the static filter stays authoritative.
-  // The first split with row groups decides the gate: if it prunes nothing, the rest of the scan
-  // skips the check. has_filters() is a lock-free read of the published channel.
-  static constexpr std::uint8_t kZgUnknown = 0, kZgActive = 1, kZgDisabled = 2;
-  if (_sirius_dynamic_filters && _sirius_dynamic_filters->has_filters() &&
-      _zonemap_gate.load(std::memory_order_relaxed) != kZgDisabled) {
-    std::vector<cudf::io::parquet::FileMetaData const*> per_source_metadata;
-    per_source_metadata.reserve(split.rg_slices.size());
-    for (auto const& slice : split.rg_slices) {
-      per_source_metadata.push_back(slice.file_metadata.get());
-    }
-    std::size_t total_before = 0;
-    for (auto const& v : rg_per_src) {
-      total_before += v.size();
-    }
-    std::size_t pruned = 0;
-    rg_per_src         = prune_row_groups_by_dynamic_filters(
-      per_source_metadata, rg_per_src, opts, *_sirius_dynamic_filters, *split.plan, stream, pruned);
-    if (_zonemap_gate.load(std::memory_order_relaxed) == kZgUnknown && total_before > 0) {
-      _zonemap_gate.store(pruned > 0 ? kZgActive : kZgDisabled, std::memory_order_relaxed);
-      SIRIUS_LOG_DEBUG("[parquet_gpu_ingestible] Zone-map row-group gate: pruned {}/{} -> {}.",
-                       pruned,
-                       total_before,
-                       pruned > 0 ? "ACTIVE" : "DISABLED");
-    }
-    if (pruned > 0) {
-      SIRIUS_LOG_INFO(
-        "[parquet_gpu_ingestible] Dynamic-filter row-group pruning: {} -> {} row groups "
-        "(pruned {}).",
-        total_before,
-        total_before - pruned,
-        pruned);
-    }
-  }
-
   opts.set_row_groups(std::move(rg_per_src));
 
-  // Per-task AST translation. set_filter is gated on translation success AND on
-  // the per-batch disable_filter_pushdown flag (set when the FLBA-decimal probe
-  // failed). `sirius_filter_ast` is hoisted so the post-decode fallback can
-  // reuse it on a pushdown miss.
+  // Per-task reader filter. Translate DuckDB's static filter first, then AND any AST-capable
+  // dynamic filters (zone maps) into the same cuDF AST passed to read_parquet.
+  // `sirius_filter_ast` is hoisted so the static post-decode fallback can reuse it if translation
+  // fails or pushdown is disabled for this split.
   std::unique_ptr<sirius::ast::node> sirius_filter_ast;
   std::optional<gpu_expression_translator::translated_expression> ast_expression = std::nullopt;
+  std::optional<gpu_expression_translator::translated_expression> dynamic_ast_expression =
+    std::nullopt;
+  cudf::ast::expression const* reader_filter_root = nullptr;
+
   if (_duckdb_filter_expression) {
     sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
     if (!split.disable_filter_pushdown) {
@@ -673,9 +623,26 @@ io::filtered_table parquet_gpu_ingestible::materialize_table(
       gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
       ast_expression =
         translator.translate_expression_with_names(*sirius_filter_ast, name_resolver);
-      if (ast_expression) { opts.set_filter(ast_expression->back()); }
+      if (ast_expression) { reader_filter_root = &ast_expression->back(); }
     }
   }
+
+  if (!split.disable_filter_pushdown && _sirius_dynamic_filters &&
+      _sirius_dynamic_filters->has_filters()) {
+    if (ast_expression) {
+      reader_filter_root = merge_dynamic_filters_into_ast(
+        ast_expression->tree, reader_filter_root, *_sirius_dynamic_filters, *split.plan);
+    } else {
+      dynamic_ast_expression.emplace();
+      reader_filter_root = merge_dynamic_filters_into_ast(dynamic_ast_expression->tree,
+                                                          /*existing_root=*/nullptr,
+                                                          *_sirius_dynamic_filters,
+                                                          *split.plan);
+      if (!reader_filter_root) { dynamic_ast_expression.reset(); }
+    }
+  }
+
+  if (reader_filter_root) { opts.set_filter(*reader_filter_root); }
 
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
   auto [table, _] =
@@ -717,12 +684,8 @@ io::filtered_table parquet_gpu_ingestible::materialize_table(
       "[parquet_gpu_ingestible::materialize_table] Assembled inline on reader-side pushdown path.");
   }
 
-  // Apply the membership filter once the table is in output layout. When assembly is still pending
-  // (deferred to post_filter_and_project) this skips it and that call applies it instead.
-  if (!split.needs_assembly || state == io::filter_state::ROW_FILTERED_AND_PROJECTED) {
-    table = apply_membership_filter(std::move(table), stream);
-  }
-
+  // Batches leave in output layout; the downstream dynamic-filter operator applies membership
+  // filters. AST-capable dynamic filters, when present, already rode the reader filter above.
   return io::filtered_table{std::move(table), state};
 }
 
@@ -739,12 +702,11 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
   // The per-batch assembly call. The ingestible only emits a non-null
   // post_filter_and_projection_info when needs_output_assembly(*_plan) is true,
   // so this is unconditionally meaningful.
+  // Assembly only: reshape the decoded table to output layout. The downstream dynamic-filter
+  // operator applies any membership filters.
   auto out = assemble_scan_output(*_plan, std::move(input), pf.partition_values, stream);
   SIRIUS_LOG_DEBUG(
     "[parquet_gpu_ingestible::post_filter_and_project] Assembled scan output to plan layout.");
-  // Membership apply on the assembled output-layout table; also covers cached/pinned scans, whose
-  // final table is produced here.
-  out = apply_membership_filter(std::move(out), stream);
   return out;
 }
 
