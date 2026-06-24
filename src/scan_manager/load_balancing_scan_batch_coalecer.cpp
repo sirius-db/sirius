@@ -132,17 +132,7 @@ void load_balancing_scan_batch_coalecer::process_cached_entries(
     auto databatch = state.batch_provider->get_next_batch();
     is_closed      = databatch == nullptr;
     if (!is_closed) {
-      balancing_strategy::device_id_hint hint;
-      {
-        auto rdonly = databatch->try_to_read_only();
-        if (rdonly) {
-          auto* space = rdonly->get_memory_space();
-          if (space) { hint = balancing_strategy::make_target_hint(space->get_id()); }
-        }
-      }
       auto op_data = std::make_unique<op::scan::scan_operator_input>(std::move(databatch));
-      auto dev_id  = state.balancer->get_next_gpu(state.pipeline_id, op_data.get(), hint);
-      if (dev_id.has_value() && *dev_id >= 0) { op_data->set_preferred_device_id(dev_id.value()); }
       state.connector->push_split(std::move(op_data));
     }
   }

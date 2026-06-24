@@ -1119,42 +1119,19 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     ingestible = sirius::op::scan::make_ingestible(std::move(info));
   }
 
-  // Drive the provider + batch coalescer to materialize every batch as a
-  // GPU-resident cudf::table (with its GPU placement).
-  auto mat = sirius::materialize_all_batches(*ingestible, gpu_spaces_mut, *scan_mgr.io_ctx());
-
-  // Build the cache descriptor (table identity + column layout) from the read
+  // Build the cache descriptor (table identity + column layout) from the
   // ingestible; it is stored on the pinned entry in place of the heavyweight
   // ingestible_table_info and drives later cache-hit matching + the gather.
   auto cache_info = sirius::scan_manager::cache_entry_info::from(ingestible->table_info());
 
   if (data.args.tier == "host") {
-    // Convert each materialized GPU table to a pinned host_data_representation on a
-    // per-target-GPU stream + NUMA-local host space, then pin the host chunks. The
-    // GPU↔HOST converter uses cudaMemcpyBatchAsync which requires a real,
-    // non-default stream bound to the target GPU's context (built lazily per GPU
-    // under the device guard).
-    auto& registry = sirius::converter_registry::get();
-    std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;
-    host_chunks.reserve(mat.tables.size());
-    for (std::size_t i = 0; i < mat.tables.size(); ++i) {
-      auto* src_space  = mat.chunk_memory_spaces[i];
-      int const gpu_id = src_space->get_device_id();
-      rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{gpu_id}};
-      // Borrow a real (non-default) stream from the source GPU's memory_space pool;
-      // the GPU->HOST converter's cudaMemcpyBatchAsync rejects the legacy default
-      // stream. The pool owns the stream, so it is bound to the source GPU's context.
-      rmm::cuda_stream_view target_stream = src_space->acquire_stream();
-      auto* target_host_space             = host_space_by_gpu.at(gpu_id);
-      cucascade::gpu_table_representation gpu_repr(
-        std::move(mat.tables[i]), *src_space, target_stream);
-      auto host_repr = registry.convert<cucascade::host_data_representation>(
-        gpu_repr, target_host_space, target_stream);
-      // Sync before gpu_repr leaves scope so the async D2H copies finish before its
-      // device buffers are freed.
-      target_stream.synchronize();
-      host_chunks.emplace_back(std::move(host_repr));
-    }
+    // Stream each batch GPU->host: materialize one batch on its round-robin GPU, convert it
+    // to a pinned host_data_representation on that GPU's NUMA-local host space, then free the
+    // GPU table before materializing the next. Peak GPU residency stays at ~one batch, so the
+    // whole table never needs to fit in GPU memory. On multi-GPU the chunks land round-robin
+    // across NUMA nodes; the cached-serve path then reads each chunk back on a NUMA-local GPU.
+    auto host_chunks = sirius::materialize_pin_to_host(
+      *ingestible, gpu_spaces_mut, host_space_by_gpu, *scan_mgr.io_ctx());
     // entry.memory_space is metadata only; each host_chunk carries its own per-GPU
     // NUMA-local memory_space. Pass a representative (the first GPU's host space).
     int const first_gpu_id          = gpu_spaces_mut[0]->get_device_id();
@@ -1162,6 +1139,9 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     scan_mgr.insert_pinned_entry_host(
       data.args.name, std::move(cache_info), std::move(host_chunks), *representative_host_space);
   } else {
+    // GPU tier: materialize every batch as a GPU-resident cudf::table (with its GPU
+    // placement) and pin them in place.
+    auto mat = sirius::materialize_all_batches(*ingestible, gpu_spaces_mut, *scan_mgr.io_ctx());
     scan_mgr.insert_pinned_entry(data.args.name,
                                  std::move(cache_info),
                                  std::move(mat.tables),

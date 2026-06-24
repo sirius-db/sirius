@@ -21,6 +21,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace duckdb {
@@ -59,6 +60,10 @@ namespace cudf {
 class table;
 }  // namespace cudf
 
+namespace cucascade {
+class host_data_representation;
+}  // namespace cucascade
+
 namespace cucascade::memory {
 class memory_space;
 }  // namespace cucascade::memory
@@ -95,6 +100,27 @@ struct materialized_pin {
 materialized_pin materialize_all_batches(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
+  io::sirius_ioctx& io_ctx);
+
+/// Drive @p ingestible to completion like @ref materialize_all_batches, but stream each
+/// emitted batch straight to pinned host memory instead of collecting GPU-resident tables:
+/// materialize one batch on its round-robin GPU, convert it to a @c host_data_representation
+/// on that GPU's NUMA-local host space, then free the GPU table before the next batch. Peak
+/// GPU residency is therefore ~one batch (governed by @c scan_task_batch_size), so a host pin
+/// never needs the whole table to fit in GPU memory.
+///
+/// \param ingestible        Source ingestible (parquet or duckdb-native).
+/// \param gpu_spaces        Non-empty set of GPU memory spaces to round-robin materialization
+/// across.
+/// \param host_space_by_gpu Maps each GPU device id to the host memory_space its batches should
+///                          be pinned on (NUMA-local). Must contain an entry for every device id
+///                          in @p gpu_spaces.
+/// \param io_ctx            IO context the metadata reads run on (owned by the scan manager).
+/// \return The pinned host chunks in materialization (round-robin) order — one per emitted batch.
+std::vector<std::shared_ptr<cucascade::host_data_representation>> materialize_pin_to_host(
+  op::scan::gpu_ingestible& ingestible,
+  std::span<cucascade::memory::memory_space* const> gpu_spaces,
+  const std::unordered_map<int, cucascade::memory::memory_space*>& host_space_by_gpu,
   io::sirius_ioctx& io_ctx);
 
 }  // namespace sirius
