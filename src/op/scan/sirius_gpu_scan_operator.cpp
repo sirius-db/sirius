@@ -33,7 +33,6 @@
 
 // cucascade
 #include <cucascade/cudf/gpu_data_representation.hpp>
-#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
@@ -77,17 +76,10 @@ std::optional<task_creation_hint> sirius_gpu_scan_operator::get_next_task_hint(
   return task_creation_hint{TaskCreationHint::READY, this, cap};
 }
 
-bool sirius_gpu_scan_operator::all_ports_empty()
-{
-  // Done when the connector is closed and the ingestible has no buffered work.
-  // The unprepared path has no ingestible.
-  return _split_connector->is_closed() && (!_ingestible || _ingestible->consumer_drained());
-}
+bool sirius_gpu_scan_operator::all_ports_empty() { return _split_connector->is_closed(); }
 
 std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input_data()
 {
-  // Delegate to the ingestible. The unprepared path pulls directly from the connector.
-  if (_ingestible) { return _ingestible->consume_next_input(*_split_connector); }
   auto next = _split_connector->get_next_split();
   if (!next.has_value()) { return nullptr; }
   if (auto* scan_input = dynamic_cast<scan_operator_input*>(next->get()); scan_input) {

@@ -20,7 +20,7 @@
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <op/scan/batch_coalecer.hpp>
 #include <op/scan/gpu_ingestible_types.hpp>
 
