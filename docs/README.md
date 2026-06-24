@@ -131,7 +131,7 @@ For a full list of current limitations and ongoing work, please refer to our [Gi
 <p align="center">
   <a href="https://www.nvidia.com/"><img src="logo/nvidia-logo-horiz-blk-16x9 1.png" alt="NVIDIA" width="250" align="middle"/></a>
   &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://www.wisc.edu/"><img src="uw-madison-logo.png" alt="UW-Madison" width="250" align="middle"/></a>
+  <a href="https://www.wisc.edu/"><img src="logo/uw-madison-logo.png" alt="UW-Madison" width="250" align="middle"/></a>
 </p>
 <p align="center">
   <a href="https://duckdblabs.com/"><img src="https://duckdb.org/images/logo-dl/DuckDB_Logo-horizontal.svg" alt="DuckDB Labs" width="200" align="middle"/></a>
