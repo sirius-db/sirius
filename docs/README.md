@@ -129,7 +129,7 @@ For a full list of current limitations and ongoing work, please refer to our [Gi
 ## Contributors and Partners
 
 <p align="center">
-  <a href="https://www.nvidia.com/"><img src="https://www.nvidia.com/content/nvidiaGDC/us/en_US/about-nvidia/legal-info/logo-brand-usage/_jcr_content/root/responsivegrid/nv_container_392921705/nv_container_412055486/nv_image.coreimg.100.1290.png/1703060329095/nvidia-logo-horz.png" alt="NVIDIA" width="250" align="middle"/></a>
+  <a href="https://www.nvidia.com/"><img src="logo/nvidia-logo-horiz-blk-16x9 1.png" alt="NVIDIA" width="250" align="middle"/></a>
   &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
   <a href="https://www.wisc.edu/"><img src="uw-madison-logo.png" alt="UW-Madison" width="250" align="middle"/></a>
 </p>
