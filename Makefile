@@ -227,16 +227,19 @@ s3-test-aws-broker:
 	$(S3_TEST_BIN) "[s3][aws][broker]"
 
 # -----------------------------------------------------------------------------
-# S3 perf benchmark (Catch2 [!benchmark][perf][bench] hidden tag - not in the
-# default CI suite, and deliberately NOT tagged [s3] so the [s3] integration
-# gate does not pull the benchmark in). For the default MinIO backend the
-# harness auto-manages MinIO (SIRIUS_TEST_S3_AUTO=1) and generates/uploads the
-# SF10 lineitem fixture (SIRIUS_TEST_S3_LARGE=1); the benchmark reads
-# SIRIUS_BENCH_S3_* and falls back to the harness-published SIRIUS_TEST_S3_*.
-# Generates a JSON record under
-# build/release/extension/sirius/test/cpp/log/perf_<ts>.json for tracking.
+# S3 perf benchmarks. All S3 benchmarks share the hidden [.][s3][bench] tag
+# (real-AWS ones also [aws][live]); selected here by [s3][bench]~[aws]. The tag
+# carries [.] (out of the default `make test`) and lacks [integration] (so the
+# [s3] integration gate `make s3-test` never pulls it in). Default backend = minio
+# (read_bench_env() defaults to it — no extra env source needed): the harness
+# auto-manages MinIO (SIRIUS_TEST_S3_AUTO=1), generates/uploads the SF10 lineitem
+# fixture (SIRIUS_TEST_S3_LARGE=1), and SIRIUS_TEST_S3_STRICT=1 makes a MinIO
+# bring-up failure fail the benchmark loud instead of skipping to a false green.
+# The async JSON baseline (Family 1) sets s3_perf_instrumentation=true and emits
+# build/release/extension/sirius/test/cpp/log/perf_<ts>.json for tracking; the
+# scripted async-vs-blocking microbench (Family 2) prints console numbers.
 # Set SIRIUS_BENCH_BACKEND=aws-s3 (and the SIRIUS_BENCH_AWS_S3_* vars) to hit AWS
-# instead of MinIO; AUTO stays off in that case.
+# instead of MinIO; AUTO/STRICT stay off in that case.
 
 s3-bench:
 	@if [ ! -x $(S3_TEST_BIN) ]; then \
@@ -245,7 +248,7 @@ s3-bench:
 	fi
 	@set -e; \
 	if [ "$${SIRIUS_BENCH_BACKEND:-minio}" = "minio" ]; then \
-	  export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_LARGE=1; \
+	  export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_LARGE=1 SIRIUS_TEST_S3_STRICT=1; \
 	fi; \
 	export SIRIUS_BENCH_GIT_SHA="$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"; \
-	$(S3_TEST_BIN) "[!benchmark][perf][bench]"
+	$(S3_TEST_BIN) "[s3][bench]~[aws]"

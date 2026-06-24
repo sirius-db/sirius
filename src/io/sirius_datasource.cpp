@@ -23,7 +23,7 @@
 #include <rmm/device_buffer.hpp>
 
 #include <fcntl.h>
-#include <spdlog/spdlog.h>
+#include <log/logging.hpp>
 #include <sys/stat.h>
 
 #include <algorithm>

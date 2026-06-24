@@ -35,6 +35,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace sirius::op::scan {

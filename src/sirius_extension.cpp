@@ -29,9 +29,9 @@
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 
-#include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
@@ -1459,6 +1459,19 @@ static void SetMaxBuildHashTableBytes(ClientContext& context, SetScope scope, Va
                    params->max_build_hash_table_bytes);
 }
 
+static void SetMarkJoinBuildSwitchRatio(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  const double ratio = parameter.GetValue<double>();
+  if (ratio < 0.0) {
+    throw InvalidInputException("mark_join_build_switch_ratio must be >= 0.0, got {}", ratio);
+  }
+  params->mark_join_build_switch_ratio = ratio;
+  SIRIUS_LOG_DEBUG("Updated config MARK_JOIN_BUILD_SWITCH_RATIO to {}",
+                   params->mark_join_build_switch_ratio);
+}
+
 static void SetEnableGpuExecution(ClientContext& context, SetScope scope, Value& parameter)
 {
   SIRIUS_LOG_DEBUG("Updated gpu_execution to {}", BooleanValue::Get(parameter));
@@ -1631,6 +1644,15 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::UBIGINT,
                             Value::UBIGINT(sirius::operator_params{}.max_build_hash_table_bytes),
                             SetMaxBuildHashTableBytes);
+
+  config.AddExtensionOption(
+    "mark_join_build_switch_ratio",
+    "For STANDARD-mode MARK joins, build on the left/output side via cudf::mark_join when the "
+    "right (probe) side has at least this many times more rows than the left side (0 disables). "
+    "Hardware-dependent — recalibrate per GPU.",
+    LogicalType::DOUBLE,
+    Value::DOUBLE(sirius::operator_params{}.mark_join_build_switch_ratio),
+    SetMarkJoinBuildSwitchRatio);
 
   config.AddExtensionOption(
     "gpu_execution",

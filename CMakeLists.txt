@@ -108,6 +108,11 @@ set(CUCASCADE_BUILD_SHARED_LIBS
 set(CUCASCADE_BUILD_STATIC_LIBS
     ON
     CACHE BOOL "" FORCE)
+# Sirius consumes cucascade's cudf-coupled representations and converters (PR
+# #150 split these into the optional cucascade_cudf target), so build it.
+set(CUCASCADE_BUILD_CUDF
+    ON
+    CACHE BOOL "" FORCE)
 set(CUCASCADE_WARNINGS_AS_ERRORS
     OFF
     CACHE BOOL "" FORCE)
@@ -137,7 +142,9 @@ if(VCPKG_BUILD AND TARGET CUDA::cudart_static)
                                                       Static)
   endfunction()
 
-  foreach(_target cucascade_objects cucascade_static cucascade_shared)
+  foreach(_target
+          cucascade_objects cucascade_static cucascade_shared
+          cucascade_cudf_objects cucascade_cudf_static cucascade_cudf_shared)
     if(TARGET "${_target}")
       sirius_prefer_static_cudart("${_target}")
     endif()
@@ -166,8 +173,8 @@ set(EXTENSION_SOURCES
     src/data/host_parquet_representation_converters.cpp
     src/downgrade/downgrade_executor.cpp
     src/expression/aggregate_id.cpp
-    src/expression/ast/clone.cpp
     src/expression/ast/node.cpp
+    src/expression/ast/utils.cpp
     src/expression/from_duckdb.cpp
     src/expression/function_id.cpp
     src/expression/join_condition.cpp
@@ -265,6 +272,7 @@ set(EXTENSION_SOURCES
     src/parallel/task_executor.cpp
     src/pipeline/gpu_pipeline_executor.cpp
     src/pipeline/gpu_pipeline_task.cpp
+    src/pipeline/sirius_pipeline_itask.cpp
     src/pipeline/task_scheduler.cpp
     src/pipeline/sirius_meta_pipeline.cpp
     src/pipeline/sirius_pipeline.cpp
@@ -288,6 +296,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_limit.cpp
     src/planner/sirius_plan_order.cpp
     src/planner/sirius_plan_projection.cpp
+    src/planner/sirius_plan_projection_utils.cpp
     src/planner/sirius_plan_recursive_cte.cpp
     src/planner/sirius_plan_top_n.cpp
     src/pin_table.cpp
@@ -313,9 +322,16 @@ set(EXTENSION_SOURCES
 # Legacy Sirius — all legacy-specific config lives in src/legacy/CMakeLists.txt.
 # Deleting src/legacy/ cleanly removes legacy build support.
 set(CUDA_SOURCES
-    src/op/scan/equality_delete_mask.cu src/cuda/scan/gpu_decode_alp.cu
-    src/cuda/scan/gpu_decode_bitpacking.cu src/cuda/scan/gpu_decode_rle.cu
-    src/cuda/scan/gpu_decode_strings.cu src/cuda/scan/gpu_native_decode.cu)
+    src/op/scan/equality_delete_mask.cu
+    src/cuda/scan/gpu_decode_alp.cu
+    src/cuda/scan/gpu_decode_bitpacking.cu
+    src/cuda/scan/gpu_decode_rle.cu
+    src/cuda/scan/gpu_decode_strings.cu
+    src/cuda/scan/gpu_native_decode.cu
+    src/cuda/scan/strings/dict_fsst.cu
+    src/cuda/scan/strings/dictionary.cu
+    src/cuda/scan/strings/fsst.cu
+    src/cuda/scan/strings/uncompressed.cu)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
   add_subdirectory(src/legacy)
   list(APPEND EXTENSION_SOURCES ${SIRIUS_LEGACY_SOURCES}
@@ -362,12 +378,16 @@ foreach(_target sirius_extension sirius_loadable_extension)
                                PRIVATE ${SIRIUS_LEGACY_COMPILE_DEFINITIONS})
   endif()
 
+  # cuCascade::cucascade_cudf holds the cudf-coupled representations and
+  # converters Sirius uses; it transitively links the cudf-free core
+  # (cuCascade::cucascade) and cudf::cudf.
   target_link_libraries(
     ${_target}
     cudf::cudf
     rmm::rmm
     spdlog::spdlog
     cuCascade::cucascade
+    cuCascade::cucascade_cudf
     yaml-cpp::yaml-cpp
     telemetry_bridge)
 
@@ -429,11 +449,12 @@ endif()
 
 # Required by DuckDB's export set (duckdb_static -> sirius_extension ->
 # cucascade_static / telemetry_bridge). cucascade upstream PR #126 split
-# topology_discovery into its own static target — list it here so the export set
-# covers the dependency chain.
+# topology_discovery into its own static target, and PR #150 split the
+# cudf-coupled code into cucascade_cudf_static — list both here so the export
+# set covers the full dependency chain.
 install(
-  TARGETS sirius_extension cucascade_static cucascade_topology_discovery_static
-          telemetry_bridge
+  TARGETS sirius_extension cucascade_static cucascade_cudf_static
+          cucascade_topology_discovery_static telemetry_bridge
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
@@ -465,6 +486,7 @@ set(TEST_SOURCES
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/expression/test_ast_aggregate.cpp
     test/cpp/expression/test_ast_clone.cpp
+    test/cpp/expression/test_ast_substitute.cpp
     test/cpp/expression/test_ast_from_duckdb.cpp
     test/cpp/expression/test_ast_scaffold.cpp
     test/cpp/expression/test_ast_to_duckdb.cpp
@@ -517,6 +539,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_sirius_dynamic_filter.cpp
     test/cpp/parallel/test_task_executor.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
+    test/cpp/planner/test_projection_fold.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
     test/cpp/pipeline/test_pipeline_memory_history.cpp
@@ -527,6 +550,8 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_task_scheduler.cpp
     test/cpp/scan/bench_decode_codecs.cpp
     test/cpp/scan/test_duckdb_block_layout.cpp
+    test/cpp/scan/test_duckdb_native_batch_coalescer.cpp
+    test/cpp/scan/test_duckdb_native_gpu_ingestible.cpp
     test/cpp/scan/test_duckdb_native_walker.cpp
     test/cpp/scan/test_gpu_decode_alp.cpp
     test/cpp/scan/test_gpu_decode_bitpacking.cpp
@@ -551,6 +576,11 @@ endif()
 if(SIRIUS_BUILD_S3_TESTS)
   list(APPEND TEST_SOURCES test/cpp/utils/s3_container.cpp)
 endif()
+
+# Orphaned test files (present in the tree but missing from TEST_SOURCES) are
+# caught by the check-orphan-tests pre-commit hook
+# (scripts/check_orphan_tests.py) rather than a configure-time glob — see
+# test/cpp/orphan_test_allowlist.txt.
 
 add_executable(sirius_unittest ${TEST_SOURCES})
 
@@ -643,6 +673,7 @@ target_link_libraries(
   rmm::rmm
   spdlog::spdlog
   cuCascade::cucascade
+  cuCascade::cucascade_cudf
   PkgConfig::LIBURING
   PkgConfig::NUMA)
 link_extension_libraries(parquet_benchmark "")

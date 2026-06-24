@@ -1631,6 +1631,40 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
     "on n.n_nationkey = c.c_nationkey;");
 }
 
+//===----------------------------------------------------------------------===//
+// MARK join tests (issue #921: BUILD_PROBE mode for MARK join)
+//
+// `OR` combined with `IN (subquery)`, and `IN (subquery)` projected as a value,
+// both lower to a HASH_JOIN with "Join Type: MARK" in DuckDB. A large probe
+// (orders, 150k) over a small build/filter subquery (customer subset) drives the
+// planner into BUILD_PROBE, where one cudf::filtered_join is built on the right
+// (filter) side and reused across the streamed left probe batches.
+//===----------------------------------------------------------------------===//
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - mark join via OR + IN subquery parquet",
+                 "[integration][gpu_execution][parquet][markjoin]")
+{
+  // OR forces the IN membership to be materialized as a MARK join rather than a
+  // semi join; the customer subset is the small build side.
+  compare_gpu_vs_cpu(
+    "select count(*) as n from orders "
+    "where o_orderkey < 0 "
+    "   or o_custkey in (select c_custkey from customer where c_nationkey < 3);");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - mark join via projected IN subquery parquet",
+                 "[integration][gpu_execution][parquet][markjoin]")
+{
+  // Projecting the IN result as a boolean value produces a MARK join; grouping on
+  // the mark exercises both the matched (true) and unmatched (false) partitions.
+  compare_gpu_vs_cpu(
+    "select (o_custkey in (select c_custkey from customer where c_nationkey < 3)) as is_member, "
+    "       count(*) as n "
+    "from orders group by 1 order by 1;");
+}
+
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - basic semi join misfit 0",
                  "[integration][gpu_execution][semijoin]")
@@ -2963,6 +2997,68 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "[integration][gpu_execution][parquet][order_by][order_by_types]")
 {
   compare_gpu_vs_cpu("select n_nationkey, n_name from nation order by n_nationkey;");
+}
+
+//===----------------------------------------------------------------------===//
+// String concat tests
+//===----------------------------------------------------------------------===//
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - string concat || operator parquet",
+                 "[integration][gpu_execution][parquet][string_concat]")
+{
+  compare_gpu_vs_cpu(
+    "SELECT l_orderkey, l_returnflag || '-' || l_linestatus FROM lineitem ORDER BY l_orderkey "
+    "LIMIT 100;");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - string concat() function parquet",
+                 "[integration][gpu_execution][parquet][string_concat]")
+{
+  compare_gpu_vs_cpu(
+    "SELECT l_orderkey, concat(l_returnflag, l_linestatus) FROM lineitem ORDER BY l_orderkey LIMIT "
+    "100;");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - string concat column with longer varchar parquet",
+                 "[integration][gpu_execution][parquet][string_concat]")
+{
+  compare_gpu_vs_cpu(
+    "SELECT p_partkey, p_brand || ': ' || p_type FROM part ORDER BY p_partkey LIMIT 100;");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - string concat in WHERE clause parquet",
+                 "[integration][gpu_execution][parquet][string_concat]")
+{
+  compare_gpu_vs_cpu(
+    "SELECT l_orderkey FROM lineitem WHERE l_returnflag || l_linestatus = 'NF' ORDER BY l_orderkey "
+    "LIMIT 100;");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - string concat with nested expression parquet",
+                 "[integration][gpu_execution][parquet][string_concat]")
+{
+  // ORDER BY l_orderkey, l_linenumber for a deterministic primary-key sort —
+  // l_orderkey alone is non-unique in lineitem so LIMIT would pick different rows on GPU vs CPU.
+  compare_gpu_vs_cpu(
+    "SELECT l_orderkey, substring(l_comment, 1, 5) || '...' FROM lineitem "
+    "ORDER BY l_orderkey, l_linenumber LIMIT 100;");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - string concat NULL propagation parquet",
+                 "[integration][gpu_execution][parquet][string_concat][nulls]")
+{
+  // TPC-H has no nullable VARCHAR columns; introduce nulls via CASE so that
+  // concat's null-propagation semantics (any NULL input → NULL output) are exercised.
+  compare_gpu_vs_cpu(
+    "SELECT l_orderkey, "
+    "  CASE WHEN l_orderkey % 7 = 0 THEN NULL ELSE l_returnflag END || '-' || l_linestatus "
+    "FROM lineitem ORDER BY l_orderkey, l_linenumber LIMIT 100;");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,

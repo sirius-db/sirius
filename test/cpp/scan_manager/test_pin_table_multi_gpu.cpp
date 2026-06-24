@@ -42,6 +42,8 @@
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
+#include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb.hpp>
 #include <spdlog/spdlog.h>

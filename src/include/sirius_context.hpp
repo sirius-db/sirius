@@ -148,9 +148,10 @@ class SiriusContext : public ClientContextState {
   /// \brief Terminate the Sirius context, releasing all resources.
   void terminate();
 
-  /// \brief Log the host fixed_size_host_memory_resource stats (allocated,
-  ///        peak, free blocks) at a labeled tag — used for verifying leaks.
-  void log_host_pool_stats(std::string_view tag) const;
+  /// \brief Log host and GPU memory pool stats (allocated, peak, and
+  ///        tier-specific capacity fields) at a labeled tag — used for
+  ///        verifying that allocations return to baseline after each query.
+  void log_pool_stats(std::string_view tag) const;
 
   [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept
   {
@@ -201,7 +202,8 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] sirius::scan_manager::sirius_scan_manager& get_scan_manager();
   [[nodiscard]] const sirius::scan_manager::sirius_scan_manager& get_scan_manager() const;
 
-  [[nodiscard]] const sirius::telemetry::telemetry_context& get_telemetry_context() const;
+  [[nodiscard]] std::shared_ptr<const sirius::telemetry::telemetry_context> get_telemetry_context()
+    const;
 
   /// \brief Start a query with its pipelines.
   /// \param pipelines The ordered pipelines for the query.
@@ -305,7 +307,7 @@ class SiriusContext : public ClientContextState {
   // allocator are destroyed to prevent dangling references.
   std::optional<rmm::host_device_async_resource_ref> prev_pinned_mr_{};
   std::size_t prev_pinned_threshold_{0};
-  std::unique_ptr<sirius::telemetry::telemetry_context> telemetry_context_;
+  std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context_;
   std::unique_ptr<cucascade::shared_data_repository_manager> data_repository_manager_;
   std::unique_ptr<sirius::pipeline::task_scheduler> task_scheduler_;
   std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;

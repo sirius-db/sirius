@@ -26,13 +26,20 @@
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 #include "pipeline/task_request.hpp"
+#include "telemetry/telemetry_context.hpp"
 
 #include <rmm/cuda_device.hpp>
 
 #include <util/stream_check_wrapper.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <exception>
+#include <memory>
 #include <mutex>
+#include <string>
+#include <utility>
 namespace sirius {
 namespace pipeline {
 
@@ -40,8 +47,9 @@ gpu_pipeline_executor::gpu_pipeline_executor(
   exec::thread_pool_config config,
   cucascade::memory::memory_space* mem_space,
   exec::publisher<std::unique_ptr<task_request>> task_request_publisher,
-  sirius::parallel::downgrade_executor* downgrade_executor)
-  : sirius::parallel::itask_executor(config),
+  sirius::parallel::downgrade_executor* downgrade_executor,
+  std::shared_ptr<const telemetry::telemetry_context> telemetry_context)
+  : sirius::parallel::itask_executor(config, std::move(telemetry_context)),
     _stream_pool(rmm::cuda_device_id{mem_space->get_device_id()}, config.num_threads),
     _task_request_publisher(std::move(task_request_publisher)),
     _memory_space(mem_space),
@@ -53,8 +61,17 @@ gpu_pipeline_executor::~gpu_pipeline_executor() { stop(); }
 
 absl::AnyInvocable<void() noexcept> gpu_pipeline_executor::get_per_thread_init()
 {
-  auto device_id = _memory_space->get_device_id();
-  return [device_id]() noexcept {
+  int device_id          = _memory_space->get_device_id();
+  auto thread_id_counter = std::make_shared<std::atomic<uint32_t>>(0);
+
+  return [device_id,
+          telemetry_context = _telemetry_context,
+          thread_prefix     = _config.thread_name_prefix,
+          thread_id_counter]() mutable noexcept {
+    const int32_t thread_id = thread_id_counter->fetch_add(1, std::memory_order_relaxed);
+    telemetry::thread_local_executor_thread_telemtry_init(
+      *telemetry_context, fmt::format("{}-gpu_exec-{}", thread_prefix, thread_id));
+
     // Per-thread init runs on a worker thread just spawned by the
     // bounded_pool. cudaSetDevice pins this thread to the executor's GPU
     // context; silent failure would cause every downstream CUDA call on this
@@ -73,6 +90,9 @@ absl::AnyInvocable<void() noexcept> gpu_pipeline_executor::get_per_thread_init()
 
 void gpu_pipeline_executor::manager_loop()
 {
+  telemetry::TaskManagerLoopThreadHandleWrapper manager_thread_telemetry{
+    *_telemetry_context, fmt::format("gpu-{}-exec-manager", _memory_space->get_device_id())};
+
   rmm::cuda_set_device_raii set_device_guard(rmm::cuda_device_id{_memory_space->get_device_id()});
   sirius::util::enable_log_on_default_stream();
   while (_running.load()) {
@@ -109,6 +129,37 @@ void gpu_pipeline_executor::manager_loop()
     }
     auto reservation_info = gpu_task->get_estimated_reservation_size_info();
     auto bytes_needs      = reservation_info.reservation_size;
+    gpu_task->telemetry_handle().reserving({
+      .instance_name              = "",
+      .requested_bytes            = reservation_info.reservation_size,
+      .input_basis                = reservation_info.input_basis,
+      .peak_estimate              = reservation_info.peak_memory_estimate,
+      .bytes_to_materialize       = reservation_info.bytes_to_materialize_input,
+      .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
+    });
+    // Clamp the reservation request to what this memory space can actually
+    // grant (its reservation limit). The history-based estimate can balloon far
+    // past capacity — a small input that once drove a near-cap peak yields a
+    // huge peak/estimate ratio that extrapolates to multi-GiB estimates on a
+    // GiB-budget GPU. make_reservation() then returns only a partial reservation
+    // and the downgrade predicate below (which must reserve the *full*
+    // bytes_needs) can never succeed, so the task livelocks through the
+    // OOM-reschedule loop until the retry cap trips and the query fails. Capping
+    // at get_max_memory() keeps both the reservation and the downgrade target
+    // achievable; any per-batch overflow during execution is still handled by
+    // the OOM-reschedule + tiering path. (Telemetry above intentionally reports
+    // the pre-clamp estimate so the estimator can still be analyzed.)
+    if (auto const space_max = _memory_space->get_max_memory();
+        space_max > 0 && bytes_needs > space_max) {
+      SIRIUS_LOG_DEBUG(
+        "GPU Pipeline Executor: clamping reservation request {} -> {} bytes (space max) for "
+        "pipeline {} task {}",
+        bytes_needs,
+        space_max,
+        gpu_task->get_pipeline_id(),
+        gpu_task->get_task_id());
+      bytes_needs = space_max;
+    }
     SIRIUS_LOG_TRACE(
       "[GPU:{}] GPU Pipeline Executor: Acquiring memory reservation for pipeline {} of {} bytes "
       "for task {}. Memory available: {}, total reserved: {}, max: {}",
@@ -132,6 +183,13 @@ void gpu_pipeline_executor::manager_loop()
     } else if (reservation->size() < bytes_needs && _downgrade_executor) {
       size_t shortfall    = bytes_needs - reservation->size();
       size_t partial_size = reservation->size();
+
+      gpu_task->telemetry_handle().downgrading({
+        .instance_name              = "",
+        .shortfall_bytes            = shortfall,
+        .partial_bytes              = partial_size,
+        .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
+      });
 
       SIRIUS_LOG_DEBUG(
         "GPU Pipeline Executor: requested reservation size {} but only got {} bytes, reservation "
@@ -252,6 +310,9 @@ void gpu_pipeline_executor::manager_loop()
             return;
           }
 
+          // Sync the stream to ensure all memory is released before the reschedule.
+          exc_stream->synchronize();
+
           // Determine retry count and original task ID for this rescheduled attempt.
           auto* cur_local = dynamic_cast<gpu_pipeline_task_local_state*>(gpu_task->local_state());
           uint32_t next_retry_count = 1;
@@ -325,6 +386,14 @@ void gpu_pipeline_executor::manager_loop()
 
           // Schedule the rescheduled task. It goes back through manager_loop()
           // to acquire a fresh reservation before execution.
+          if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
+            pipeline_task->telemetry_handle().finalizing({
+              .instance_name = "",
+              .success       = false,
+            });
+            pipeline_task->telemetry_handle().exit();
+            pipeline_task->set_telemetry_finalized();
+          }
           this->schedule(std::move(new_task));
           return;
         } catch (const std::exception& e) {
@@ -337,6 +406,14 @@ void gpu_pipeline_executor::manager_loop()
           if (_task_creator) { _task_creator->stop(); }
           if (_completion_handler) { _completion_handler->report_error(std::current_exception()); }
           return;
+        }
+        if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
+          pipeline_task->telemetry_handle().finalizing({
+            .instance_name = "",
+            .success       = true,
+          });
+          pipeline_task->telemetry_handle().exit();
+          pipeline_task->set_telemetry_finalized();
         }
         task.reset();
 

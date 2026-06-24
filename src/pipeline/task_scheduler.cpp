@@ -22,6 +22,8 @@
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
+#include "pipeline/sirius_pipeline_itask.hpp"
+#include "telemetry/telemetry_context.hpp"
 
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
@@ -30,6 +32,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace sirius {
 namespace pipeline {
@@ -37,11 +40,15 @@ namespace pipeline {
 task_scheduler::task_scheduler(
   const exec::thread_pool_config& gpu_executor_config,
   sirius::memory::sirius_memory_reservation_manager& mem_mgr,
+  std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
   exec::queue_ordering task_queue_ordering,
   const cucascade::memory::system_topology_info* sys_topology,
   const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors)
-  : _task_queue(task_queue_ordering)
+  : _task_queue(task_queue_ordering), _telemetry_context(std::move(telemetry_context))
 {
+  _task_queue_telemetry = std::make_unique<telemetry::TaskQueueHandleWrapper>(
+    *_telemetry_context, "task-scheduler-gpu-queue");
+
   // Self-publisher: schedule() uses this to wake management_eventloop when a
   // new task is pushed, so the loop can re-run the matcher against any device
   // that is already in _ready_devices.
@@ -78,7 +85,8 @@ task_scheduler::task_scheduler(
       std::make_unique<gpu_pipeline_executor>(config,
                                               const_cast<cucascade::memory::memory_space*>(space),
                                               _task_request_channel.make_publisher(),
-                                              dg_exec));
+                                              dg_exec,
+                                              _telemetry_context));
   }
 }
 
@@ -86,6 +94,12 @@ task_scheduler::~task_scheduler() { stop(); }
 
 void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
+  if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
+    pipeline_task->telemetry_handle().queued({
+      .queue_resource_id      = _task_queue_telemetry->handle->uuid(),
+      .queue_capacity_entries = 1,
+    });
+  }
   [[maybe_unused]] auto _ = _task_queue.push(std::move(task));
   if (_self_publisher) {
     auto wake                 = std::make_unique<task_request>();
@@ -262,6 +276,9 @@ void task_scheduler::wait_for_completion()
 
 void task_scheduler::management_eventloop()
 {
+  telemetry::TaskManagerLoopThreadHandleWrapper manager_thread_telemetry{*_telemetry_context,
+                                                                         "task-scheduler-thread"};
+
   // Pull-signal scheduler. The loop blocks on _task_request_channel for two
   // event kinds:
   //   - device_ready  : a gpu_pipeline_executor has reserved a worker thread
@@ -334,6 +351,15 @@ void task_scheduler::management_eventloop()
       if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
         task_id = gpu_task->get_task_id();
       }
+
+      if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
+        pipeline_task->telemetry_handle().routing({
+          .instance_name              = "",
+          .preferred_device_id        = device_id,
+          .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
+        });
+      }
+
       // Log prefix "[mgpu-audit] pipeline_task dispatched to GPU N" is
       // load-bearing — verification greps depend on it.
       SIRIUS_LOG_INFO(

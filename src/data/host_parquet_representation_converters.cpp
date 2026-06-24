@@ -22,7 +22,8 @@
 #include <op/scan/cached_ranges.hpp>
 
 // cucascade
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_space.hpp>
 

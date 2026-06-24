@@ -16,7 +16,6 @@
 
 #include "scan_manager/sirius_scan_manager.hpp"
 
-#include "cucascade/data/gpu_data_representation.hpp"
 #include "data/data_batch_utils.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/cache/prefetching_cache.hpp"
@@ -31,8 +30,6 @@
 #include "op/sirius_physical_operator_type.hpp"
 #include "planner/query.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
-#include "scan_manager/split_connector.hpp"
-#include "scan_manager/split_provider.hpp"
 
 #include <cudf/column/column_view.hpp>
 #include <cudf/io/datasource.hpp>
@@ -45,13 +42,13 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/span.hpp>
 
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
 #include <cstdint>
-#include <exception>
 #include <iterator>
 #include <memory>
 #include <stdexcept>

@@ -32,13 +32,13 @@ jobs:
       run:
         working-directory: experimental/starrocks
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           submodules: false
 
-      - name: Init starrocks submodule
+      - name: Init starrocks submodules
         working-directory: ${{ github.workspace }}
-        run: git submodule update --init --depth=1 experimental/starrocks/starrocks
+        run: git submodule update --init --depth=1 experimental/starrocks/starrocks experimental/starrocks/brpc
 
       - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
         with:
@@ -47,14 +47,20 @@ jobs:
           manifest-path: experimental/starrocks/pixi.toml
           environments: cn
 
+      # Scope by package: `--all` would also reach the sibling rust/ workspace via the
+      # `sirius` path dep. Mirrors check.yml's scoped rust/ fmt check.
       - name: fmt
-        run: pixi run -e cn cargo fmt --all -- --check
+        run: pixi run -e cn cargo fmt --package sirius-starrocks-cn --package starrocks-plan-translator --package starrocks-thrift -- --check
 
+      # The CN's `sirius-engine` feature is on by default but links a Sirius build
+      # tree (C++ toolchain + RAPIDS/CUDA) that this CI env does not have, so build
+      # the pure-Rust path here. The engine path is exercised on a GPU box via
+      # `pixi run cn-build` / `cn-test`.
       - name: clippy
-        run: pixi run -e cn cargo clippy --all-targets -- -D warnings
+        run: pixi run -e cn cargo clippy --all-targets --no-default-features -- -D warnings
 
       - name: test
-        run: pixi run -e cn cargo test --workspace
+        run: pixi run -e cn cargo test --workspace --no-default-features
 
   experimental:
     name: experimental

@@ -24,9 +24,9 @@
 
 #include <nvtx3/nvtx3.hpp>
 
-#include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
+#include <cucascade/cudf/host_table.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
-#include <cucascade/memory/host_table.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <duckdb/common/types/validity_mask.hpp>
 #include <duckdb/common/types/vector.hpp>
@@ -167,7 +167,7 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
     cudf::size_type nulls = 0;
 
     cucascade::memory::column_metadata col{};
-    col.type_id  = sirius::get_cudf_type(sirius_t).id();
+    col.type_id  = static_cast<int32_t>(sirius::get_cudf_type(sirius_t).id());
     col.num_rows = num_rows;
     col.scale    = 0;
     if (sirius_t.is_decimal()) { col.scale = static_cast<int32_t>(sirius_t.decimal_scale()); }
@@ -219,7 +219,7 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
 
       // Child: offsets
       cucascade::memory::column_metadata offsets_child{};
-      offsets_child.type_id       = cudf::type_id::INT32;
+      offsets_child.type_id       = static_cast<int32_t>(cudf::type_id::INT32);
       offsets_child.num_rows      = num_rows + 1;
       offsets_child.null_count    = 0;
       offsets_child.has_null_mask = false;

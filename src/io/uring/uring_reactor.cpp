@@ -27,8 +27,8 @@
 
 #include <absl/cleanup/cleanup.h>
 #include <fcntl.h>
+#include <log/logging.hpp>
 #include <numa.h>
-#include <spdlog/spdlog.h>
 #include <sys/stat.h>
 
 #include <algorithm>

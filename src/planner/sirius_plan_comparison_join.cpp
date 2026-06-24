@@ -328,8 +328,9 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       op.estimated_cardinality,
       std::move(op.filter_pushdown),
       op_params.max_build_hash_table_bytes);
-    auto& hj      = join->Cast<sirius::op::sirius_physical_hash_join>();
-    hj.join_stats = std::move(op.join_stats);
+    auto& hj                        = join->Cast<sirius::op::sirius_physical_hash_join>();
+    hj.join_stats                   = std::move(op.join_stats);
+    hj.mark_join_build_switch_ratio = op_params.mark_join_build_switch_ratio;
 
     // --- Detect build-side key uniqueness ---
     // Gate: only for pure equal conditions (not_distinct_from needs null_equality::EQUAL).
