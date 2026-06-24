@@ -94,6 +94,29 @@ SET sirius_log_level = 'trace';
 SET sirius_log_flush_seconds = 1;
 ```
 
+## Tracing
+> **Note:** Tracing is experimental and the telemetry schema may change.
+
+Sirius instruments query execution with [Quent](https://github.com/rapidsai/quent), emitting
+per-query traces of operator and pipeline activity that Quent can render
+as an interactive browser timeline. Enable it in your YAML config file,
+
+```yaml
+sirius:
+  telemetry:
+    enable_quent: true
+    output_directory: telemetry_data
+```
+
+run queries, then visualize:
+
+```bash
+pixi run quent   # serves Quent UI at http://localhost:8080
+```
+
+See the [Quent Telemetry guide](super-sirius/quent-telemetry.md) for the full setup details: enabling the
+exporter, per-query labeling, generating telemetry (using a TPC-H helper), and visualization.
+
 ## Limitations
 
 Sirius is under active development. Notable current limitations include:
