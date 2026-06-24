@@ -177,9 +177,13 @@ to a single destination and a different drain (intermediate fragments' sinks ins
 
 The **wrapper⇄engine boundary is the channel itself** (exposed over the cxx FFI): for a source the wrapper is
 the producer and the engine operator the consumer; for a sink it is reversed. The streaming source and sink
-are ordinary Sirius **operators** that run as tasks on the existing scheduler/worker pool — there is **no
-dedicated thread pool** for them — while `nixl`'s own threads live in the **wrapper**. So each channel is a
-hand-off between wrapper threads and engine worker threads. The bounded channel is also the source's and
+are **ordinary Sirius operators** (`sirius_physical_operator` subclasses), not a separate subsystem: the sink
+is the **final operator of its pipeline** and runs inside a normal `gpu_pipeline_task` on the existing
+`gpu_pipeline_executor`, just like `RESULT_COLLECTOR` or `MERGE_GROUP_BY` terminate a pipeline today — compute
+results are pushed into a `shared_data_repository` (a port) and the sink pulls from it and pushes to the output
+channel via `publish_output()`/`sink()`. There is **no dedicated thread pool** for them; they share the
+scheduler/worker pool with all compute, while `nixl`'s own threads live in the **wrapper**. So each channel is
+a hand-off between wrapper threads and engine worker threads. The bounded channel is also the source's and
 sink's **only hand-off queue**. The partitioned sink may keep bounded per-destination coalescing state
 internally (see §4), but that state is part of the sink's accounted operator state, not a second unbounded
 queue.
@@ -338,26 +342,36 @@ sequenceDiagram
 ### Backpressure
 
 The bounded channels are not just buffers — they are the flow-control mechanism, and pressure propagates
-**backwards**, against the direction of data flow. When a downstream CN is slow, the sender's output channel
-fills; the streaming sink — the **final operator** of its pipeline, which pulls compute results from a
-`shared_data_repository` and pushes them to that channel — can no longer enqueue. Rather than block a worker
-thread, the sink task **yields** (it is re-queued, not parked) and makes no further progress while the
-channel is full; the repository between compute and sink fills, and upstream backs up via the existing port
-barriers. The input channel drains more slowly and fills; `push(stream_id, batch)` then blocks (or signals
-not-ready), so the wrapper
-stops draining `nixl` receives, which throttles the upstream sender. The result is end-to-end, cross-node
-flow control with a bounded in-flight working set.
+**backwards**, against the direction of data flow. The pivot is that **enqueuing to a channel is a
+task-creation condition**, evaluated *before* a task is scheduled, not discovered when it runs. Sirius's task
+creator only builds a task for an operator when its `get_next_task_hint()` reports `READY`
+(`task_creator::get_operator_for_next_task`); the streaming sink overrides that hint so a **full output
+channel reports not-ready** even with input waiting — the same shape as `CONCAT` gating on a byte threshold.
+So when a downstream CN is slow and the sender's output channel fills, the task creator simply **stops
+creating sink tasks** (it does not schedule one that would then block on a full channel). The repository
+between compute and sink fills, and upstream backs up via the existing port barriers. The input channel drains
+more slowly and fills; `push(stream_id, batch)` then blocks (or signals not-ready), so the wrapper stops
+draining `nixl` receives, which throttles the upstream sender. The result is end-to-end, cross-node flow
+control with a bounded in-flight working set.
+
+Because task creation is **edge-triggered** by `schedule(op)` (there is no continuous polling), the other half
+of the contract is **re-arming**: when the wrapper `pull()`s a batch and frees a channel slot, it re-schedules
+the sink so the hint is re-evaluated and task creation resumes — symmetric to how a completed task
+re-schedules its downstream consumers today. (A narrow race remains — the creation loop can emit more sink
+tasks than free channel slots — so a sink that finds the channel full at push time must keep its result in the
+repository, where it stays *idle* and spillable, and yield its worker rather than block it; that is a fallback,
+not the primary mechanism.)
 
 ```mermaid
 flowchart LR
   rxSlow["slow downstream CN (receiver)"]:::priorart
   outFull["output channel fills"]:::proposed
-  sinkStall["streaming sink can't enqueue"]:::proposed
-  schedThrottle["scheduler stops creating tasks<br/>for this pipeline"]:::exists
+  sinkHint["sink get_next_task_hint()<br/>reports not-ready"]:::proposed
+  schedThrottle["task creator stops<br/>creating sink tasks"]:::exists
   inFull["input channel fills"]:::proposed
   pushBlocks["push(stream_id) blocks / signals not-ready"]:::proposed
   nixlThrottle["wrapper stops draining nixl recv<br/>→ upstream sender backs off"]:::priorart
-  rxSlow --> outFull --> sinkStall --> schedThrottle --> inFull --> pushBlocks --> nixlThrottle
+  rxSlow --> outFull --> sinkHint --> schedThrottle --> inFull --> pushBlocks --> nixlThrottle
   classDef exists fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#1a1a1a;
   classDef proposed fill:#fff8e1,stroke:#f9a825,stroke-width:2px,stroke-dasharray:5 4,color:#1a1a1a;
   classDef priorart fill:#ede7f6,stroke:#6a1b9a,stroke-width:1.5px,stroke-dasharray:2 2,color:#1a1a1a;
@@ -600,8 +614,10 @@ adaptor in `src/memory/sirius_memory_reservation_manager.cpp`.*
   `test/sql/test_exchange_hash_function`.
 - **Deadlock / liveness.** Two hazards. *(a) Thread/queue stalls* — every worker slot parked on a full
   output channel with none left to drain inputs, or a blocked sink pinning memory that spilling needs;
-  mitigated by a blocked sink **yielding its task** (not blocking a worker thread) and keeping queued batches
-  *idle* in their repository (still spillable). *(b) Staging-lease cycle* — a logical plan DAG does **not**
+  primarily avoided by the §4 admission-control rule (no sink task is *created* while its output channel is
+  full, so a worker never parks on it), with the race fallback being a sink that keeps its result *idle* in
+  the repository (still spillable) and yields its worker rather than blocking it. *(b) Staging-lease cycle* —
+  a logical plan DAG does **not**
   rule this out: CN A's receive-staging fills with batches from B so A stops granting leases, while B holds
   pinned output waiting to send to A (and symmetrically) → mutual wait. Per-destination channels isolate slow
   receivers at the *queue* level, but a shared budget re-couples them at the *staging* level. The fix is the
