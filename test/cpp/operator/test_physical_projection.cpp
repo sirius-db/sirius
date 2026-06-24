@@ -248,7 +248,7 @@ TEST_CASE("sirius_physical_projection mixes evaluated and passthrough columns (p
     dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().at(0);
 
   // Drop every external handle to the input batch and sync the stream before validating. The
-  // output's composite owner (input read-only lock) must keep the passthrough columns' memory
+  // output's composite owner (input read-only lock) must keep the passthrough columns' data
   // alive even after the input variable disappears.
   inputs.clear();
   input_batch.reset();

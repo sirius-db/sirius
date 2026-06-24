@@ -20,15 +20,21 @@
 #include "data/data_batch_utils.hpp"
 #include "expression/ast/reference.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
+#include "log/logging.hpp"
+#include "sirius/exception.hpp"
 
-#include <cudf/types.hpp>
+#include <cudf/cudf_utils.hpp>
 
+#include <cuda_runtime.h>
 #include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
+
 #include <duckdb/common/exception.hpp>
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -45,7 +51,7 @@ enum class projection_source { passthrough, evaluated };
 /// evaluated expression (index = position within the evaluated output table).
 struct projection_column_plan {
   projection_source kind;
-  cudf::size_type index;
+  std::uint32_t index;
 };
 
 }  // namespace
@@ -58,6 +64,9 @@ sirius_physical_projection::sirius_physical_projection(
       SiriusPhysicalOperatorType::PROJECTION, std::move(types), estimated_cardinality),
     select_list(std::move(select_list))
 {
+  if (this->select_list.empty()) {
+    throw invalid_input_exception("[sirius_physical_projection] select_list must not be empty.");
+  }
 }
 
 std::unique_ptr<operator_data> sirius_physical_projection::execute(const operator_data& input_data,
@@ -78,11 +87,10 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
   for (auto const& expr : select_list) {
     if (expr->holds<sirius::ast::reference>()) {
       column_plan.push_back(
-        {projection_source::passthrough,
-         static_cast<cudf::size_type>(expr->get<sirius::ast::reference>().column_index)});
+        {projection_source::passthrough, expr->get<sirius::ast::reference>().column_index});
     } else {
       column_plan.push_back(
-        {projection_source::evaluated, static_cast<cudf::size_type>(evaluated_exprs.size())});
+        {projection_source::evaluated, static_cast<std::uint32_t>(evaluated_exprs.size())});
       evaluated_exprs.push_back(expr.get());
     }
   }
@@ -116,14 +124,16 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
     // ---- Path 2: every output column is a pure passthrough — zero device copies. ----
     if (all_passthrough) {
       std::vector<cudf::column_view> cols;
+      std::vector<cudf::size_type> referenced_indices;
       cols.reserve(column_plan.size());
+      referenced_indices.reserve(column_plan.size());
       for (auto const& p : column_plan) {
         cols.push_back(input_view.column(p.index));
+        referenced_indices.push_back(p.index);
       }
       cudf::table_view out_view(cols);
-      // We pin the whole input batch alive (its read-only lock is the owner below), so charge its
-      // full size. No new columns are allocated.
-      std::size_t const referenced_bytes = input_ro.get_data()->get_size_in_bytes();
+      std::size_t const referenced_bytes = sirius::estimate_referenced_column_bytes(
+        input_view, referenced_indices, input_ro.get_data()->get_size_in_bytes());
       // Owner = the input read-only lock: keeps the source columns alive AND pinned read-only for
       // the output batch's lifetime, so the view can never be freed/downgraded out from under us.
       output_batches.push_back(sirius::make_data_batch_from_view(
@@ -133,22 +143,30 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
 
     // ---- Path 3: mix of evaluated columns and passthroughs. ----
     auto evaluated_owned = gpu_expression_executor->execute(input_view);
-    // Charge the full input batch (pinned alive for the passthrough columns) plus the real size of
-    // the freshly-evaluated columns we just allocated.
-    std::size_t const referenced_bytes =
-      input_ro.get_data()->get_size_in_bytes() + evaluated_owned->alloc_size();
     // Move the evaluated table into a shared_ptr so it can live inside the (copy-constructible)
     // std::any owner alongside the input lock.
     std::shared_ptr<cudf::table> evaluated(std::move(evaluated_owned));
     auto eval_view = evaluated->view();
 
     std::vector<cudf::column_view> cols(column_plan.size());
+    std::vector<cudf::size_type> passthrough_indices;
     for (std::size_t i = 0; i < column_plan.size(); ++i) {
       auto const& p = column_plan[i];
-      cols[i]       = (p.kind == projection_source::passthrough) ? input_view.column(p.index)
-                                                                 : eval_view.column(p.index);
+      if (p.kind == projection_source::passthrough) {
+        cols[i] = input_view.column(p.index);
+        passthrough_indices.push_back(p.index);
+      } else {
+        cols[i] = eval_view.column(p.index);
+      }
     }
     cudf::table_view out_view(cols);
+
+    // Charge the estimated bytes of the referenced passthrough input columns plus the real size of
+    // the freshly-evaluated columns we just allocated.
+    std::size_t const referenced_bytes =
+      sirius::estimate_referenced_column_bytes(
+        input_view, passthrough_indices, input_ro.get_data()->get_size_in_bytes()) +
+      evaluated->alloc_size();
 
     // Composite owner keeps BOTH lifetimes alive: the freshly-evaluated columns (shared_ptr) and
     // the input read-only lock (for the passthrough columns). Both members are copy-constructible,
