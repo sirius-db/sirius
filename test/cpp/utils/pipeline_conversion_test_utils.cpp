@@ -159,7 +159,11 @@ std::string convert_query_to_dump(duckdb::Connection& con, const std::string& qu
   // an empty (but non-null) map keeps the legacy lookup site happy.
   static const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>
     kEmptyIcebergCache;
-  pipeline::sirius_pipeline_converter converter(build_ctx, op_params, &kEmptyIcebergCache);
+  // Pass the connection's ClientContext so the legacy (flag-OFF) converter can build the
+  // GPU-native seq_scan operator, which requires it (mirrors sirius_engine's production
+  // construction). Without it, insert_duckdb_native_scan_operator throws for any seq_scan query.
+  pipeline::sirius_pipeline_converter converter(
+    build_ctx, op_params, &kEmptyIcebergCache, &context);
   auto result = converter.convert(*root_pipeline);
 
   // Dump *here* while `sirius_plan`, `root_pipeline`, `result` are all in scope. The result's
