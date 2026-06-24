@@ -152,6 +152,43 @@ flowchart TB
 *Refs: `#841` (Substrait→DuckDB→Sirius lowering); scan operators bind a `split_connector` today; the
 streaming source/sink are net-new (#836/#837).*
 
+### Worked example — distributed GROUP BY
+
+Sirius already splits a single-node group-by into `HASH_GROUP_BY` (partial aggregation per batch) →
+`PARTITION` (hash-partition the partials by group key) → `MERGE_AGGREGATE` (finalize per partition). A
+cross-CN shuffle aggregation is the *same* shape with the **`PARTITION` step replaced by the partitioned
+exchange sink** — the redistribution that `PARTITION` does locally is exactly what the shuffle does across
+CNs:
+
+```mermaid
+flowchart LR
+  subgraph up["Upstream fragment (each data CN)"]
+    direction LR
+    sc["scan / filter ..."]:::exists
+    pa["HASH_GROUP_BY<br/>(partial agg)"]:::exists
+    psk["partitioned streaming sink — #837<br/>(GPU hash-partition by key)"]:::proposed
+    sc --> pa --> psk
+  end
+  subgraph down["Downstream fragment (each agg CN)"]
+    direction LR
+    ssrc["streaming source — #836"]:::proposed
+    ma["MERGE_AGGREGATE<br/>(final agg)"]:::exists
+    ssrc --> ma
+  end
+  psk -->|"nixl shuffle by group key"| ssrc
+  classDef exists fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#1a1a1a;
+  classDef proposed fill:#fff8e1,stroke:#f9a825,stroke-width:2px,stroke-dasharray:5 4,color:#1a1a1a;
+  classDef priorart fill:#ede7f6,stroke:#6a1b9a,stroke-width:1.5px,stroke-dasharray:2 2,color:#1a1a1a;
+```
+
+There is **no** separate local `PARTITION` before the sink (the shuffle is the partition) and **no**
+StarRocks-specific merge operator (both ends are Sirius, so the shipped partial-aggregate state is Sirius's
+own format and `MERGE_AGGREGATE` consumes it directly; `nixl` routes opaque bytes by hash). Sirius does not
+choose the aggregation phasing — StarRocks' FE planner emits the partial/final fragment structure and we map
+each fragment's operators; this is what a two-phase hash-shuffle aggregation lowers to. The lowering must keep
+the upstream partial-agg state representation consistent with what the downstream `MERGE_AGGREGATE` expects
+(see §7).
+
 ---
 
 ## §3 The public streaming API — stream session
@@ -239,6 +276,15 @@ others, and it coalesces a destination's small slices up to a size or time thres
 combined batch to that destination's channel — otherwise we ship a flood of tiny RDMA transfers. That
 coalescing state is bounded and repository-visible, so accumulated slices remain accounted and spillable
 while they wait to be concatenated/flushed. `nixl` sends each flushed output batch.
+
+**Partition and coalesce are GPU operations *inside* Sirius, not the wrapper.** The hash partition is the same
+GPU operation Sirius's existing `PARTITION` operator runs today (the SNMG partition path is also growing
+coalescing) — the partitioned sink reuses that machinery, differing only in the hash function (the
+StarRocks-compatible one below) and in routing partitions to per-destination output channels instead of local
+repositories. So all GPU compute stays under Sirius's scheduler and the shared cuCascade budget; the Rust
+**wrapper does no GPU compute** — it only moves already-partitioned, already-coalesced byte buffers over
+`nixl`. (The §0 Doris "Rust hash-partition" is the *old* model; the streaming model moves it into the engine.)
+This is why there is no second GPU scheduler to contend with.
 
 **Partition hash compatibility (correctness-critical).** The FE plans shuffle and bucket joins assuming a
 specific partition function, so the sink must reproduce StarRocks' hash **bit-exactly, per partition type** —
@@ -608,6 +654,10 @@ adaptor in `src/memory/sirius_memory_reservation_manager.cpp`.*
 - **Order-preserving (merging) exchange.** v1 emits and coalesces out of order (§4). Open: how to support
   StarRocks' merging exchange (`ORDER BY` / top-N) — disable coalescing and add a receiver-side k-way merge,
   or keep merging exchanges on the CPU/bRPC path for now.
+- **Partial-aggregate state across the exchange.** The §2 distributed-GROUP-BY shape ships `HASH_GROUP_BY`
+  partial-aggregate state upstream and feeds it to `MERGE_AGGREGATE` downstream. Open (#837/#841): pin down
+  that wire representation so the partial state produced upstream is exactly what the downstream merge
+  consumes — the same concern applies to any partial/final split the FE plans (distinct, multi-phase agg).
 - **Partition-hash parity.** §4 lists StarRocks' three regimes (fnv/xxh3 by `exchange_hash_function_version`,
   CRC32 for bucket-shuffle without bucket props, bucket-id mapping with them). Open: reproducing each
   bit-exactly on the GPU in cuDF and dispatching on partition type/version, validated against
