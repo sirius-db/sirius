@@ -24,8 +24,12 @@
 #include "io/sirius_datasource.hpp"
 #include "log/logging.hpp"
 #include "memory/topology_index.hpp"
+#include "op/scan/duckdb_native_gpu_ingestible.hpp"
+#include "op/scan/gpu_ingestible.hpp"
+#include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/parquet_metadata.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
+#include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "planner/query.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
@@ -42,6 +46,8 @@
 #include <cudf/utilities/span.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
+#include <rmm/cuda_device.hpp>
+
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -51,6 +57,7 @@
 #include <iterator>
 #include <memory>
 #include <stdexcept>
+#include <unordered_map>
 #include <utility>
 
 namespace sirius::scan_manager {
@@ -61,8 +68,8 @@ struct cached_databatch_provider : public databatch_provider {
   explicit cached_databatch_provider(pinned_entry const& entry, std::span<size_t> selected_columns)
     : _entry(entry)
   {
-    auto entry_column_names = _entry.table_info->column_names();
-    std::ranges::for_each(selected_columns, [this, entry_column_names](size_t idx) {
+    auto const& entry_column_names = _entry.cache_info.column_names();
+    std::ranges::for_each(selected_columns, [this, &entry_column_names](size_t idx) {
       _column_names.emplace_back(entry_column_names[idx]);
       _column_indices.push_back(idx);
     });
@@ -102,6 +109,7 @@ struct cached_databatch_provider : public databatch_provider {
 
   std::shared_ptr<cucascade::data_batch> get_device_databatch(std::size_t index)
   {
+    if (index >= _entry.chunk_memory_spaces.size()) { return nullptr; }
     std::vector<std::shared_ptr<cudf::column>> columns;
     std::vector<cudf::column_view> column_views;
     std::size_t alloc_size = 0;
@@ -291,9 +299,15 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
     if (scan_op->type != ::sirius::op::SiriusPhysicalOperatorType::GPU_SCAN) { continue; }
     auto* op = &scan_op->Cast<op::scan::sirius_gpu_scan_operator>();
     if (_providers_by_op.find(op) != _providers_by_op.end()) { continue; }
-    auto provider = std::make_unique<split_provider>(op->get_ingestible(), *_io_ctx);
     _metadata_processor->register_pipeline(op, round_robin);
-    try_assign_cached_entries(op);
+    // On a pinned-cache hit the coalescer serves this operator from the cached
+    // batch_provider (process_cached_entries); skip the disk-reading
+    // split_provider entirely so no read is issued for the cached scan.
+    if (try_assign_cached_entries(op)) {
+      _scan_op_order.push_back(op);
+      continue;
+    }
+    auto provider = std::make_unique<split_provider>(op->get_ingestible(), *_io_ctx);
     _providers_by_op.emplace(op, std::move(provider));
     _scan_op_order.push_back(op);
   }
@@ -342,9 +356,101 @@ void sirius_scan_manager::stop()
   _thread_pool.stop();
 }
 
+namespace {
+
+// Gather projection that lets a cache holding @p cached_ids (by primary/storage
+// index) serve a scan requesting @p requested_ids: for each requested column,
+// its position within @p cached_ids, in the requested order. Empty when any
+// requested column is absent — i.e. the cache is not a column superset.
+std::vector<std::size_t> column_superset_projection(
+  duckdb::vector<duckdb::ColumnIndex> const& cached_ids,
+  duckdb::vector<duckdb::ColumnIndex> const& requested_ids)
+{
+  std::unordered_map<duckdb::idx_t, std::size_t> pos;
+  pos.reserve(cached_ids.size());
+  for (std::size_t i = 0; i < cached_ids.size(); ++i) {
+    pos.emplace(cached_ids[i].GetPrimaryIndex(), i);
+  }
+  std::vector<std::size_t> projection;
+  projection.reserve(requested_ids.size());
+  for (auto const& c : requested_ids) {
+    auto it = pos.find(c.GetPrimaryIndex());
+    if (it == pos.end()) { return {}; }  // cache lacks a requested column
+    projection.push_back(it->second);
+  }
+  return projection;
+}
+
+// column_ids-aligned names: for each column_ids[i], the full-schema name at its
+// primary (storage) index — the keys data_batches_by_column / the gather use.
+std::vector<std::string> aligned_column_names(duckdb::vector<std::string> const& full_names,
+                                              duckdb::vector<duckdb::ColumnIndex> const& column_ids)
+{
+  std::vector<std::string> out;
+  out.reserve(column_ids.size());
+  for (auto const& c : column_ids) {
+    auto const p = static_cast<std::size_t>(c.GetPrimaryIndex());
+    out.push_back(p < full_names.size() ? full_names[p] : std::string{});
+  }
+  return out;
+}
+
+}  // namespace
+
+cache_entry_info cache_entry_info::from(const op::scan::ingestible_table_info& info)
+{
+  cache_entry_info ci;
+  if (auto const* p = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&info)) {
+    ci.resolved_file_paths = p->resolved_file_paths;
+    ci.column_ids          = p->column_ids;
+    ci.names               = aligned_column_names(p->names, p->column_ids);
+  } else if (auto const* d =
+               dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&info)) {
+    ci.catalog_name = d->catalog_name;
+    ci.schema_name  = d->schema_name;
+    ci.table_name   = d->table_name;
+    ci.column_ids   = d->column_ids;
+    ci.names        = aligned_column_names(d->names, d->column_ids);
+  }
+  return ci;
+}
+
+std::vector<std::size_t> cache_entry_info::can_serve_with_columns(
+  const op::scan::ingestible_table_info& other) const
+{
+  // A parquet pin serves a parquet scan over the same file set; a duckdb pin
+  // serves a duckdb scan over the same catalog.schema.table. A cache of one format
+  // never serves a scan of the other — the identity check below falls through (a
+  // duckdb cache has empty resolved_file_paths; a parquet cache has an empty table_name).
+  if (auto const* p = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&other)) {
+    if (resolved_file_paths.size() != p->resolved_file_paths.size()) { return {}; }
+    auto these_files = resolved_file_paths;
+    auto those_files = p->resolved_file_paths;
+    std::sort(these_files.begin(), these_files.end());
+    std::sort(those_files.begin(), those_files.end());
+    if (these_files != those_files) { return {}; }
+    return column_superset_projection(column_ids, p->column_ids);
+  }
+  if (auto const* d = dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&other)) {
+    // Same duckdb table by qualified name (catalog.schema.table), derived on both
+    // pin and query sides from the resolved DuckTableEntry — so the stored casing is
+    // the table's canonical (case-preserved) name on both sides and a byte-exact
+    // compare is correct. (If a future site ever populates these from parsed input
+    // rather than the resolved entry, switch to a case-insensitive compare.)
+    // A parquet cache has an empty table_name, so it never matches a duckdb scan.
+    if (table_name.empty()) { return {}; }
+    if (catalog_name != d->catalog_name || schema_name != d->schema_name ||
+        table_name != d->table_name) {
+      return {};
+    }
+    return column_superset_projection(column_ids, d->column_ids);
+  }
+  return {};
+}
+
 void sirius_scan_manager::insert_pinned_entry(
   const std::string& name,
-  std::unique_ptr<ingestible_table_info> table_info,
+  cache_entry_info cache_info,
   std::vector<std::unique_ptr<cudf::table>> data_tables,
   std::vector<cucascade::memory::memory_space*> chunk_memory_spaces)
 {
@@ -367,11 +473,9 @@ void sirius_scan_manager::insert_pinned_entry(
     if (table) { new_num_rows += static_cast<std::size_t>(table->num_rows()); }
   }
 
-  // Column identity for this pin lives on its table_info. The span stays valid
-  // after table_info is moved into the entry below (moving the unique_ptr does
-  // not relocate the pointed-to ingestible_table_info).
-  std::span<std::string const> column_names =
-    table_info ? table_info->column_names() : std::span<std::string const>{};
+  // Column names (aligned with the cached column_ids) key data_batches_by_column.
+  // Copied out before cache_info is moved into the entry below.
+  std::vector<std::string> column_names = cache_info.column_names();
 
   auto existing_it = _pinned_entries.find(name);
   if (existing_it != _pinned_entries.end()) {
@@ -433,7 +537,7 @@ void sirius_scan_manager::insert_pinned_entry(
             std::move(cols[i]));
         }
       }
-      // The union of pinned column names is reflected by entry.table_info; the
+      // The union of pinned column names is reflected by entry.cache_info; the
       // merged columns are keyed into data_batches_by_column above.
       return;
     }
@@ -442,7 +546,7 @@ void sirius_scan_manager::insert_pinned_entry(
   }
 
   pinned_entry entry;
-  entry.table_info          = std::move(table_info);
+  entry.cache_info          = std::move(cache_info);
   entry.chunk_memory_spaces = std::move(chunk_memory_spaces);
   entry.tier                = cucascade::memory::Tier::GPU;
   entry.num_rows            = new_num_rows;
@@ -465,7 +569,7 @@ void sirius_scan_manager::insert_pinned_entry(
 
 void sirius_scan_manager::insert_pinned_entry_host(
   const std::string& name,
-  std::unique_ptr<ingestible_table_info> table_info,
+  cache_entry_info cache_info,
   std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
   cucascade::memory::memory_space& memory_space)
 {
@@ -482,7 +586,7 @@ void sirius_scan_manager::insert_pinned_entry_host(
   }
 
   pinned_entry entry;
-  entry.table_info   = std::move(table_info);
+  entry.cache_info   = std::move(cache_info);
   entry.tier         = cucascade::memory::Tier::HOST;
   entry.memory_space = &memory_space;
   entry.num_rows     = new_num_rows;
@@ -504,20 +608,20 @@ void sirius_scan_manager::visit_pinned_entries(
   }
 }
 
-void sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_operator* op)
+bool sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_operator* op)
 {
   const auto& table_info = op->get_ingestible().table_info();
 
   try {
     for (auto const& [pinned_name, entry] : _pinned_entries) {
-      if (auto cols = entry.table_info->can_serve_with_columns(table_info); !cols.empty()) {
-        auto provider = make_provider_for_pinned_entry(entry, cols);
-        _metadata_processor->use_cached_entries_for_pipeline(op, std::move(provider));
-        spdlog::info("[sirius_scan_manager] assigned pinned entry '{}' to operator '{}'",
-                     pinned_name,
-                     op->get_operator_id());
-        break;
-      }
+      auto cols = entry.cache_info.can_serve_with_columns(table_info);
+      if (cols.empty()) { continue; }  // serve only on a real (non-empty) match
+      auto provider = make_provider_for_pinned_entry(entry, cols);
+      _metadata_processor->use_cached_entries_for_pipeline(op, std::move(provider));
+      spdlog::info("[sirius_scan_manager] assigned pinned entry '{}' to operator '{}'",
+                   pinned_name,
+                   op->get_operator_id());
+      return true;
     }
   } catch (...) {
     spdlog::error(
@@ -525,6 +629,7 @@ void sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_op
       "operator '{}'",
       op->get_operator_id());
   }
+  return false;
 }
 
 }  // namespace sirius::scan_manager

@@ -16,7 +16,9 @@
 
 #include "pipeline/sirius_pipeline_converter.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/common/shared_ptr_ipp.hpp"
 #include "duckdb/function/table/table_scan.hpp"
@@ -310,6 +312,11 @@ void sirius_pipeline_converter::insert_duckdb_native_scan_operator(
   table_info->storage = &table.GetStorage();
   table_info->context = client_context_;
   table_info->db_path = table.GetStorage().GetAttached().GetStorageManager().GetDBPath();
+  // Qualified-name identity for the pin cache — derived from the resolved
+  // DuckTableEntry so it matches the pin-side derivation (build_duckdb_pin_info) exactly.
+  table_info->catalog_name           = table.ParentCatalog().GetName();
+  table_info->schema_name            = table.ParentSchema().name;
+  table_info->table_name             = table.name;
   table_info->approximate_batch_size = op_params_.scan_task_batch_size;
 
   std::vector<std::size_t> source_ids_fallback;

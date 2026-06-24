@@ -38,7 +38,6 @@
 #include <memory>
 #include <span>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace duckdb {
@@ -68,46 +67,23 @@ class duckdb_native_ingestible_table_info : public op::scan::ingestible_table_in
   std::vector<sirius::logical_type> projected_types;
   duckdb::vector<sirius::logical_type> output_types;
   std::string db_path;
+  /// Qualified table reference (catalog / schema / table) derived from the resolved
+  /// DuckTableEntry. The pin cache (@c cache_entry_info) keys on these for
+  /// duckdb-native identity instead of the @c storage pointer, so the pin-time and
+  /// query-time derivation MUST use the same DuckTableEntry accessors.
+  std::string catalog_name;
+  std::string schema_name;
+  std::string table_name;
 
   duckdb_native_ingestible_table_info() = default;
 
-  /// db_path-as-span. The cache match in @c sirius_scan_manager never
-  /// matches duckdb-native ingestibles (pinned-cache key is parquet file
-  /// paths), so this is purely contract-keeping.
+  /// db_path-as-span (contract-keeping for the base interface). duckdb-native
+  /// cache matching keys on the catalog/schema/table name in @c cache_entry_info,
+  /// not on these paths.
   [[nodiscard]] std::span<std::string const> file_paths() const override
   {
     if (db_path.empty()) { return {}; }
     return std::span<std::string const>(&db_path, 1);
-  }
-
-  /// Can serve @p other iff it is the same duckdb table (same DataTable*) and every column @p other
-  /// requests is also read by this scan — i.e. this scan's (cached) data is a superset that can
-  /// serve @p other. Columns are matched by storage column id, not by name or position.
-  ///
-  /// Returns, for each column @p other requests (in @p other's @c column_ids order), the position
-  /// of that column within THIS scan's @c column_ids — a gather index into this scan's (cached)
-  /// materialized columns that reproduces @p other's requested layout (the index space
-  /// @c cached_databatch_provider slices). Empty when @p other is a different table or requests a
-  /// column this scan does not read.
-  [[nodiscard]] std::vector<std::size_t> can_serve_with_columns(
-    const ingestible_table_info& other) const override
-  {
-    auto const* o = dynamic_cast<duckdb_native_ingestible_table_info const*>(&other);
-    if (o == nullptr || storage != o->storage) { return {}; }
-
-    std::unordered_map<duckdb::idx_t, std::size_t> this_pos;
-    this_pos.reserve(column_ids.size());
-    for (std::size_t i = 0; i < column_ids.size(); ++i) {
-      this_pos.emplace(column_ids[i].GetPrimaryIndex(), i);
-    }
-    std::vector<std::size_t> projection;
-    projection.reserve(o->column_ids.size());
-    for (auto const& c : o->column_ids) {
-      auto it = this_pos.find(c.GetPrimaryIndex());
-      if (it == this_pos.end()) { return {}; }  // this scan lacks a requested column
-      projection.push_back(it->second);
-    }
-    return projection;
   }
 };
 

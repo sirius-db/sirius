@@ -45,18 +45,6 @@ class ingestible_table_info {
   ingestible_table_info(ingestible_table_info const&)            = delete;
   ingestible_table_info& operator=(ingestible_table_info const&) = delete;
 
-  /// True iff this (cached) table info can serve @p other — i.e. it reads a
-  /// superset of @p other's data so a pinned scan of this can feed @p other
-  /// (after the @ref column_projections gather). Implementations define the
-  /// per-format match (e.g. same files + column superset).
-  [[nodiscard]] virtual std::vector<size_t> can_serve_with_columns(
-    const ingestible_table_info& other) const
-  {
-    return {};
-  }
-
-  [[nodiscard]] virtual std::span<std::string const> column_names() const { return {}; }
-
   /**
    * @brief Resolved file paths captured at bind time.
    *
