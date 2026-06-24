@@ -479,7 +479,7 @@ sequenceDiagram
   RX->>RB: lease registered staging buffer (bump alloc)
   RX-->>SC: dest addresses
   SC-->>TX: dest addresses
-  TX->>RX: nixl transfer (create_xfer_req + post_xfer_req; GPUDirect when GPU-backed)
+  TX->>RX: nixl transfer (create_xfer_req + post_xfer_req, GPUDirect when GPU-backed)
   loop poll until done
     TX->>TX: get_xfer_status
   end
