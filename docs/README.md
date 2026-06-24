@@ -1,6 +1,6 @@
 <!-- ![Sirius](sirius-full.png) -->
 <p align="center">
-  <img src="logo/sirius_ligh_full.svg" alt="Diagram" width="500"/>
+  <img src="logo/sirius_light_full.svg" alt="Diagram" width="500"/>
   <br/>
   <a href="https://join.slack.com/t/sirius-db/shared_invite/zt-33tuwt1sk-aa2dk0EU_dNjklSjIGW3vg">
     <img src="https://img.shields.io/badge/Slack-Join%20Us-blue?logo=slack" alt="Slack"/>
