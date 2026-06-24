@@ -242,6 +242,9 @@ class sirius_scan_manager {
   /// \brief Remove the pinned entry for @p name. No-op if absent.
   void remove_pinned_entry(const std::string& name);
 
+  void visit_pinned_entries(
+    const std::function<bool(std::string_view, const pinned_entry&)>& visitor) const;
+
   parquet_bind_result describe_parquet(std::string const& uri);
 
   /// \brief Process-wide ioctx used to mint @c sirius_datasource instances.

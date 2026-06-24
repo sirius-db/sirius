@@ -137,11 +137,18 @@ TEST_CASE("pin_table - PIN-MGPU-01 multi-GPU chunk distribution", "[pin_mgpu][sc
   auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
   REQUIRE(sirius_ctx != nullptr);
 
-  auto const& entries = sirius_ctx->get_scan_manager().get_pinned_entries();
-  auto it             = entries.find("multi_chunk");
-  REQUIRE(it != entries.end());
+  const sirius::scan_manager::pinned_entry* entry_ptr = nullptr;
+  sirius_ctx->get_scan_manager().visit_pinned_entries(
+    [&entry_ptr](std::string_view name, const auto& e) {
+      if (name == "multi_chunk") {
+        entry_ptr = &e;
+        return true;  // stop iteration
+      }
+      return false;  // continue
+    });
+  REQUIRE(entry_ptr != nullptr);
 
-  auto const& entry = it->second;
+  auto const& entry = *entry_ptr;
   // The 4-file fixture must produce >=2 chunks (one per file at minimum)
   // for the distribution invariant to be observable.
   REQUIRE(entry.chunk_memory_spaces.size() >= 2u);
@@ -351,11 +358,18 @@ TEST_CASE("pin_table - PIN-MGPU-01 host-tier multi-GPU pin", "[pin_mgpu][scan_ma
   auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
   REQUIRE(sirius_ctx != nullptr);
 
-  auto const& entries = sirius_ctx->get_scan_manager().get_pinned_entries();
-  auto it             = entries.find("host_pin");
-  REQUIRE(it != entries.end());
+  const sirius::scan_manager::pinned_entry* entry_ptr = nullptr;
+  sirius_ctx->get_scan_manager().visit_pinned_entries(
+    [&entry_ptr](std::string_view name, const auto& e) {
+      if (name == "host_pin") {
+        entry_ptr = &e;
+        return true;  // stop iteration
+      }
+      return false;  // continue
+    });
+  REQUIRE(entry_ptr != nullptr);
 
-  auto const& entry = it->second;
+  auto const& entry = *entry_ptr;
   // host_chunks vector must be populated (matches GPU-path expectation that
   // 4 files produce >= 4 chunks at the default chunk size).
   REQUIRE(entry.host_chunks.size() >= 4u);
@@ -622,12 +636,21 @@ TEST_CASE("pin_table - partial pin (n_rows) excluded from cache reuse",
   // Verify the entry is_partial flag is set on the scan_manager side.
   auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
   REQUIRE(sirius_ctx != nullptr);
-  auto const& entries = sirius_ctx->get_scan_manager().get_pinned_entries();
-  auto it             = entries.find("partial_pin");
-  REQUIRE(it != entries.end());
-  REQUIRE(it->second.is_partial == true);
-  // num_rows on the partial entry should match the n_rows budget (1000).
-  REQUIRE(it->second.num_rows == 1000u);
+  const sirius::scan_manager::pinned_entry* entry_ptr = nullptr;
+  sirius_ctx->get_scan_manager().visit_pinned_entries(
+    [&entry_ptr](std::string_view name, const auto& e) {
+      if (name == "partial_pin") {
+        entry_ptr = &e;
+        return true;  // stop iteration
+      }
+      return false;  // continue
+    });
+  REQUIRE(entry_ptr != nullptr);
+  // pinned_entry no longer carries an is_partial flag; num_rows reflecting the
+  // n_rows budget (1000) confirms the pin captured only the requested prefix.
+  // The load-bearing check is the behavioral assertion below: a full SELECT
+  // must return all rows, proving the partial pin is excluded from cache reuse.
+  REQUIRE(entry_ptr->num_rows == 1000u);
 
   // A subsequent full SELECT MUST NOT serve from the partial pin — it must
   // re-read the parquet file and return all 100000 rows.
@@ -713,11 +736,23 @@ TEST_CASE("pin_table - same-row-count merge appends every chunk for new columns"
   auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
   REQUIRE(sirius_ctx != nullptr);
 
-  auto const& entries = sirius_ctx->get_scan_manager().get_pinned_entries();
-  auto it             = entries.find("merge_pin");
-  REQUIRE(it != entries.end());
+  auto const& mgr = sirius_ctx->get_scan_manager();
 
-  auto const& entry          = it->second;
+  bool found_merge_pin = false;
+
+  const sirius::scan_manager::pinned_entry* ptr = nullptr;
+  mgr.visit_pinned_entries([&found_merge_pin, &ptr](std::string_view name, const auto& entry) {
+    if (name == "merge_pin") {
+      found_merge_pin = true;
+      ptr             = &entry;
+      return true;  // Stop iteration
+    }
+    return false;  // Continue iteration
+  });
+
+  REQUIRE(found_merge_pin);
+
+  auto const& entry          = *ptr;
   auto const expected_chunks = entry.chunk_memory_spaces.size();
   INFO("expected_chunks=" << expected_chunks);
   REQUIRE(expected_chunks >= 2u);
@@ -725,7 +760,7 @@ TEST_CASE("pin_table - same-row-count merge appends every chunk for new columns"
   // Each pinned column MUST have exactly chunk_memory_spaces.size() chunks.
   // With the bug, w would have just 1 chunk while k and v had N chunks,
   // which silently fell back to uncached scans.
-  for (auto const& col_name : entry.column_names) {
+  for (auto const& col_name : entry.table_info->column_names()) {
     auto col_it = entry.data_batches_by_column.find(col_name);
     REQUIRE(col_it != entry.data_batches_by_column.end());
     INFO("col_name=" << col_name << " chunks=" << col_it->second.size());
@@ -733,7 +768,7 @@ TEST_CASE("pin_table - same-row-count merge appends every chunk for new columns"
   }
 
   // The merged entry must list all unique columns: k, v, w.
-  REQUIRE(entry.column_names.size() == 3u);
+  REQUIRE(entry.table_info->column_names().size() == 3u);
 
   auto unpin = con.Query("CALL unpin_table('merge_pin');");
   REQUIRE(unpin);

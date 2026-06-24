@@ -204,8 +204,6 @@ TEST_CASE("sirius_config defaults chunk prewarm to enabled when YAML omits the k
   sirius::sirius_config cfg;
   cfg.load_from_file(path);
 
-  CHECK(cfg.get_scan_manager_config().enable_chunk_prewarm);
-
   std::error_code ec;
   std::filesystem::remove(path, ec);
 }

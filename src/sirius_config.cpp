@@ -96,7 +96,6 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("prefetch_inflight_budget_chunks",
              opt.prefetch_inflight_budget_chunks,
              yaml::greater_than<std::size_t>{0});
-  r.optional("enable_chunk_prewarm", opt.enable_chunk_prewarm);
   r.reject_unknown();
 }
 
@@ -139,16 +138,6 @@ static void from_yaml(const YAML::Node& node, telemetry_config& opt)
   r.optional("enable_quent", opt.enable_quent);
   r.optional("output_directory", opt.output_directory);
   r.optional("engine_name", opt.engine_name);
-  r.reject_unknown();
-}
-
-static void from_yaml(const YAML::Node& node, op::scan::scan_executor_config& opt)
-{
-  yaml::reader r(node, "duckdb_scan");
-  r.optional("cache", opt.cache);
-  r.optional("num_threads", opt.thread_pool_config.num_threads, yaml::greater_than<int>{0});
-  r.optional("thread_name_prefix", opt.thread_pool_config.thread_name_prefix);
-  r.optional("cpu_affinity", opt.thread_pool_config.cpu_affinity_list);
   r.reject_unknown();
 }
 
@@ -381,7 +370,6 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
       if (auto n = er.optional_node("scan_manager")) from_yaml(*n, _scan_manager_config);
       if (auto n = er.optional_node("pipeline")) from_yaml(*n, _gpu_pipeline_executor_config);
       if (auto n = er.optional_node("downgrade")) from_yaml(*n, _downgrade_executor_config);
-      if (auto n = er.optional_node("duckdb_scan")) sirius::from_yaml(*n, _scan_executor_config);
       er.optional("task_queue_ordering", _task_queue_ordering);
       er.reject_unknown();
     }
@@ -492,11 +480,6 @@ const scan_manager::scan_manager_config& sirius_config::get_scan_manager_config(
 void sirius_config::set_scan_manager_config(scan_manager::scan_manager_config config) noexcept
 {
   _scan_manager_config = std::move(config);
-}
-
-const exec::thread_pool_config& sirius_config::get_duckdb_scan_executor_config() const noexcept
-{
-  return _scan_executor_config.thread_pool_config;
 }
 
 }  // namespace sirius

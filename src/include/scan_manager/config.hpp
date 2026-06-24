@@ -55,14 +55,6 @@ struct scan_manager_config {
   /// Maximum chunks the cache may have in flight at once (admission
   /// control).  Ignored when @c enable_prefetch_cache is false.
   std::size_t prefetch_inflight_budget_chunks{2048};
-
-  /// When true (default — current behavior), parquet_split_provider prewarms
-  /// per-row-group column-chunk byte ranges via @c cache->insert(obj,
-  /// metadata, ranges).  When false, prewarm is skipped: insert is called
-  /// with empty ranges (metadata-only, as in §24 describe_parquet).  Lets
-  /// the B1 micro-bench A/B compare prefetch overlap on SF10.  Ignored when
-  /// @c enable_prefetch_cache is false (no cache → no prewarm regardless).
-  bool enable_chunk_prewarm{true};
 };
 
 }  // namespace sirius::scan_manager

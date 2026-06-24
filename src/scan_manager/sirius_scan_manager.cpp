@@ -565,6 +565,14 @@ void sirius_scan_manager::remove_pinned_entry(const std::string& name)
   _pinned_entries.erase(name);
 }
 
+void sirius_scan_manager::visit_pinned_entries(
+  const std::function<bool(std::string_view, const pinned_entry&)>& visitor) const
+{
+  for (auto const& [name, entry] : _pinned_entries) {
+    if (!visitor(name, entry)) { break; }
+  }
+}
+
 void sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_operator* op)
 {
   const auto& table_info = op->get_ingestible().table_info();
