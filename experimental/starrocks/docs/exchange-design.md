@@ -301,6 +301,14 @@ So the sink must dispatch on partition type *and* version exactly as StarRocks d
 `test/sql/test_exchange_hash_function`). Note CRC32 here is **not** merely the Doris prior art of §0 — it is a
 live StarRocks bucket-shuffle path. (Tracked in §7.)
 
+*Could an all-Sirius topology use a different (e.g. GPU-friendlier) hash?* For **`HASH_PARTITIONED`** shuffles
+(shuffle joins/aggregations), yes — correctness needs only that every Sirius sender agree, since no external
+party re-hashes the same rows; any consistent hash co-locates equal keys. But **`BUCKET_SHUFFLE`** is anchored
+to the table's on-disk bucket layout (computed by StarRocks' CRC32 at *ingest* time, outside query control),
+so it must use CRC32 even with all-Sirius CNs. Diverging is therefore safe only when both hold: all-Sirius CNs
+*and* no native hash-bucketed tables (so no bucket-shuffle); matching StarRocks' hash stays the default since
+it also keeps mixed Sirius/native-BE exchanges correct.
+
 **Order is not preserved.** Incremental emission and per-destination coalescing both reorder rows. That is
 fine for order-insensitive consumers (hash-join build, aggregation) but **not** for StarRocks' *merging*
 exchange behind `ORDER BY` / top-N, where the receiver merges sorted runs. v1 targets order-insensitive
