@@ -23,7 +23,6 @@
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "scan_manager/split_connector.hpp"
 
-#include <cstddef>
 #include <functional>
 #include <memory>
 
@@ -126,9 +125,6 @@ class split_provider {
   op::scan::gpu_ingestible* _ingestible{nullptr};
 
   std::shared_ptr<io::sirius_ioctx> _io_ctx;
-
-  /// Pipeline this provider's scan belongs to, forwarded to the strategy.
-  std::size_t _pipeline_id{0};
 
   exec::completion_token _completion_token;
 };

@@ -44,14 +44,12 @@
 #include <io/uring/uring_ioctx.hpp>
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/spdlog.h>
-#include <sys/resource.h>  // POSIX: getrlimit(RLIMIT_MEMLOCK)
+#include <sys/resource.h>
 
-#include <algorithm>
 #include <cctype>
 #include <cstddef>
 #include <cstdlib>  // for std::getenv
 #include <filesystem>
-#include <format>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -112,46 +110,6 @@ std::optional<std::string> find_legacy_config_file()
 
   return std::nullopt;
 }
-
-/// Verify RLIMIT_MEMLOCK is large enough to register all bounce buffers
-/// across the planned io_uring reactor fleet. io_uring_register_buffers
-/// pins pages through the kernel's mlock accounting (distinct from CUDA
-/// pinned-host registration, which goes through the NVIDIA driver and
-/// does not count against this rlimit). Without this preflight, a low
-/// limit surfaces as -ENOMEM on a worker thread inside liburing and
-/// aborts the process with no actionable message.
-// void check_memlock_budget(size_t total_reactors)
-// {
-//   struct rlimit rl{};
-//   if (::getrlimit(RLIMIT_MEMLOCK, &rl) != 0) { return; }
-//   if (rl.rlim_cur == RLIM_INFINITY) { return; }
-
-//   size_t const per_reactor = sirius::io::NUM_CHUNKS * sirius::io::CHUNK_SIZE;
-//   size_t const required    = per_reactor * total_reactors;
-//   if (rl.rlim_cur >= required) { return; }
-
-//   // Handles RLIM_INFINITY for rl.rlim_max only — rl.rlim_cur == RLIM_INFINITY
-//   // path is unreachable here (early-return above), but rlim_max may still be
-//   // unlimited when soft is finite and below `required`.
-//   auto format_limit = [](rlim_t limit) {
-//     if (limit == RLIM_INFINITY) { return std::string("unlimited"); }
-//     return std::format("{} MiB", static_cast<unsigned long long>(limit >> 20));
-//   };
-
-//   throw std::runtime_error(std::format(
-//     "SiriusContext: insufficient RLIMIT_MEMLOCK for io_uring registered buffers. Required {} MiB
-//     "
-//     "({} reactors x {} bounce slots x {} MiB); current soft/hard limit is {}/{}. Raise memlock "
-//     "with `ulimit -l unlimited` for this shell (up to the hard limit), set both soft and hard "
-//     "memlock in /etc/security/limits.d/ for login sessions, set systemd "
-//     "`LimitMEMLOCK=infinity`, or grant CAP_IPC_LOCK.",
-//     required >> 20,
-//     total_reactors,
-//     sirius::io::NUM_CHUNKS,
-//     sirius::io::CHUNK_SIZE >> 20,
-//     format_limit(rl.rlim_cur),
-//     format_limit(rl.rlim_max)));
-// }
 
 }  // namespace
 

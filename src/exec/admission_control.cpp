@@ -54,16 +54,9 @@ void admission_control::release(size_t reserved) noexcept
     _in_use -= reserved;
     --_active_slots;
   }
-  // notify_all (rather than notify_one) is required: both acquire() waiters
-  // and wait_for_idle() waiters park on this same _cv, and only the latter
-  // care that _active_slots dropped to zero.
+  // notify_all (rather than notify_one) is required: a single release can free
+  // enough budget to admit several parked acquire() waiters at once.
   _cv.notify_all();
-}
-
-void admission_control::wait_for_idle()
-{
-  std::unique_lock lk(_mtx);
-  _cv.wait(lk, [&] { return _active_slots == 0; });
 }
 
 admission_control::slot::~slot()

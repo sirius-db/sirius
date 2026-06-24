@@ -221,10 +221,6 @@ set(EXTENSION_SOURCES
     src/op/scan/hive_partition.cpp
     src/op/scan/iceberg_avro_reader.cpp
     src/op/scan/iceberg_delete_pipeline.cpp
-    # iceberg_metadata_reader.cpp is stale against the new io interface and is
-    # intentionally excluded; iceberg delete-data reading is disabled (see
-    # sirius_engine::prefetch_iceberg_delete_data).
-    # src/op/scan/iceberg_metadata_reader.cpp
     src/op/scan/positional_delete_filter.cpp
     src/op/scan/puffin_reader.cpp
     src/op/scan/owning_table_view.cpp
@@ -295,7 +291,6 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_recursive_cte.cpp
     src/planner/sirius_plan_top_n.cpp
     src/pin_table.cpp
-    # src/scan_manager/gpu_ingestible_factory.cpp
     src/scan_manager/load_balancing_scan_batch_coalecer.cpp
     src/scan_manager/round_robin_strategy.cpp
     src/scan_manager/sirius_scan_manager.cpp
@@ -489,17 +484,10 @@ set(TEST_SOURCES
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/io/s3/test_sigv4.cpp
     test/cpp/io/s3/test_s3_default_visibility_guard.cpp
-    # test/cpp/io/s3/test_s3_blocking_ioctx.cpp  # stale against new io interface
-    # test/cpp/io/s3/test_s3_ioctx.cpp  # stale against new io interface
     test/cpp/io/s3/test_sirius_sigv4_authorizer.cpp
     test/cpp/io/s3/test_static_credentials.cpp
-    # test/cpp/io/test_datasource_factory.cpp
-    # test/cpp/io/test_gpu_ingestible.cpp  # stale header path (io/gpu_ingestible.hpp moved)
     test/cpp/io/test_parquet_helpers.cpp
-    # test/cpp/io/test_prefetching_cache_telemetry.cpp  # stale header path (io/prefetching_cache.hpp moved)
     test/cpp/io/test_uri_parser.cpp
-    # test/cpp/integration/test_s3_sql_surface.cpp  # stale header path (io/prefetching_cache.hpp moved)
-    # test/cpp/integration/test_s3_perf_benchmark.cpp  # stale header path (io/prefetching_cache.hpp moved)
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
     test/cpp/operator/test_physical_hash_join_mgpu.cpp
     test/cpp/operator/test_physical_order_mgpu.cpp
@@ -547,10 +535,6 @@ set(TEST_SOURCES
     test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_owning_table_view.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
-    # test/cpp/scan/test_parquet_gpu_ingestible.cpp  # stale against new io interface
-    # test/cpp/scan/test_split_connector.cpp  # stale against refactored split_provider/split_connector API
-    # test/cpp/scan_manager/test_describe_parquet_s3.cpp  # stale against new io interface
-    # test/cpp/scan_manager/test_pin_table_multi_gpu.cpp  # stale against new io interface
     test/cpp/sirius_extension/test_sirius_read_parquet_cardinality.cpp
     test/cpp/sql/test_sirius_sql_rewrite.cpp
     test/cpp/unittest.cpp

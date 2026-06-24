@@ -24,14 +24,13 @@
 namespace sirius::op::scan {
 
 /**
- * @brief Policy for placing a scan split onto a GPU.
+ * @brief Coalesces incoming scan splits into larger batches.
  *
- * Split providers consult a batch_coalecer as they emit splits, so the
- * choice of which GPU a split's task should run on is decoupled from how
- * splits are produced. Implementations pick a device and record it on the
- * split via @c op::operator_data::set_preferred_device_id; the task creator
- * later reads it back and forwards it onto the pipeline task so the scheduler
- * dispatches the task to that GPU.
+ * As a split provider emits per-split @c scan_info objects it feeds each one to
+ * a batch_coalecer. The coalescer may buffer splits and re-emit them in larger,
+ * more efficiently-sized batches: @c push accepts one split and returns whatever
+ * batches are ready as a result (possibly none), while @c flush returns any
+ * remaining buffered splits once the input is exhausted.
  */
 
 class batch_coalecer {

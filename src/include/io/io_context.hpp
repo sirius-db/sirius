@@ -54,10 +54,6 @@ class memory_reservation_manager;
 namespace sirius::io {
 
 // ---------------------------------------------------------------------------
-// prefetching_stage
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // sirius_ioctx
 // ---------------------------------------------------------------------------
 
@@ -233,7 +229,7 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   /// reactors stay alive while workers drain).
   std::unique_ptr<cache::prefetching_cache> _cache;
 
-  /// Independent of the prefetching machinery — exposed via @c metadata().
+  /// Independent of the prefetching machinery — exposed via @c metadata_store().
   cache::metadata_store _metadata_store;
 };
 

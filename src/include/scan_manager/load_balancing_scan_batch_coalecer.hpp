@@ -29,7 +29,6 @@
 
 #include <concurrentqueue.h>
 
-#include <chrono>
 #include <cstddef>
 #include <memory>
 #include <stop_token>
@@ -44,27 +43,28 @@ struct databatch_provider {
 /**
  * @brief Pipeline-ordered sequencer for @c fadvise(opportunistic) calls.
  *
- * Per-pipeline slots collect (datasource, ranges) pairs emitted by each
- * pipeline's split provider during metadata scan.  A single sequencer
- * task drains the slots in the order they were registered, calling
- * @c fadvise(opportunistic, ranges) on each entry's datasource, and
- * advances to the next slot only after the current slot signals closure
- * (a null-datasource sentinel).  This serialises the opportunistic
- * fadvise tier across pipelines so the prefetching cache receives ranges
- * in execution order rather than in metadata-scan-completion order —
- * giving the cache its longest possible lead time for the head-of-line
- * pipeline before later pipelines start competing for the buffer pool.
+ * Each pipeline registers a per-pipeline slot (a @c metadata_processing_state)
+ * holding a blocking queue its split provider feeds and the coalescer,
+ * balancer and connector used to place and forward the resulting splits.  A
+ * single sequencer task drains the slots in the order they were registered,
+ * coalescing each pipeline's splits, choosing a device, issuing the
+ * @c fadvise(opportunistic) / prefetch hints and pushing onto the connector,
+ * advancing to the next slot only after the current one signals closure.  This
+ * serialises the opportunistic fadvise tier across pipelines so the prefetching
+ * cache receives ranges in execution order rather than in
+ * metadata-scan-completion order — giving the cache its longest possible lead
+ * time for the head-of-line pipeline before later pipelines start competing for
+ * the buffer pool.
  *
  * Usage:
- *   - scan_manager calls @c add_pipeline_slot(pipeline_id) once per
- *     parquet pipeline that needs opportunistic prefetching.  The
- *     returned pointer is handed to that pipeline's split provider.
- *   - The provider pushes one @c fadvise_entry per file via the slot's
- *     queue + semaphore; it pushes a sentinel (null datasource) when
- *     all batches of its metadata scan are complete.
- *   - scan_manager calls @c register_ranges(stop, dispatcher) once, which
- *     enqueues the sequencer task on the dispatcher.  The task processes
- *     slots in insertion order until either all slots are drained or the
+ *   - scan_manager calls @c register_pipeline(scan_op, balancer) once per
+ *     pipeline that needs opportunistic prefetching; the returned slot pointer
+ *     drives that pipeline's splits.  Its split provider is wired up via
+ *     @c get_split_provider_bridge (live metadata scan) or
+ *     @c use_cached_entries_for_pipeline (cached-batch replay).
+ *   - scan_manager calls @c spawn_workers(dispatcher) once, after all slots
+ *     have been registered, to launch the sequencer task.  The task processes
+ *     slots in registration order until either all slots are drained or the
  *     stop_token fires.
  */
 class load_balancing_scan_batch_coalecer {
@@ -143,8 +143,6 @@ class load_balancing_scan_batch_coalecer {
   void process_provider_inputs(metadata_processing_state& state, std::stop_token const& stop);
 
   void process_cached_entries(metadata_processing_state& state, std::stop_token const& stop);
-
-  static constexpr auto SEQUENCER_POLL_INTERVAL = std::chrono::milliseconds(50);
 
   /// unique_ptr storage: the slot contains a semaphore and a moodycamel
   /// queue, both of which are non-movable, so we need stable addresses

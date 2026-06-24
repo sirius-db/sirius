@@ -78,14 +78,6 @@ class admission_control {
   /// If @p stop fires during the wait, returns a disengaged slot.
   [[nodiscard]] slot acquire(size_t size, std::stop_token stop = {});
 
-  /// Block until every slot handed out by @c acquire has been destroyed.
-  /// Used by callers that need to drain in-flight work before tearing
-  /// down state captured inside outstanding slot-bearing closures.  Safe
-  /// to call concurrently with @c acquire and slot destruction; the
-  /// condition is observed under the same mutex that @c release uses to
-  /// decrement @c _active_slots.
-  void wait_for_idle();
-
   [[nodiscard]] size_t budget() const noexcept { return _budget; }
 
  private:

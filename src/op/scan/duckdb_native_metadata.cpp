@@ -403,6 +403,11 @@ duckdb_native_walk_plan prepare_duckdb_native_walk(
   plan.partition_row_groups.assign(plan.n_row_groups, nullptr);
   plan.row_group_pruned_by_stats.assign(plan.n_row_groups, false);
   plan.pruned_decoded_bytes_by_row_group.assign(plan.n_row_groups, 0);
+  // PartitionStatistics is expected to carry one entry per row group; a larger
+  // count means the DuckDB layout assumption below (index i == row group i) has
+  // drifted and trailing entries would be silently dropped.
+  assert(partition_stats.size() <= plan.n_row_groups &&
+         "partition_stats count exceeds row group count — DuckDB layout drift");
   for (std::size_t i = 0; i < partition_stats.size(); ++i) {
     auto const& ps = partition_stats[i];
     if (!ps.row_start.IsValid()) {
