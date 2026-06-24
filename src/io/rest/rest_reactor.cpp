@@ -420,6 +420,11 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_rx_request(const reactor_
     n_chunks = std::min<size_t>(cfg.max_read_split, segment.size / min_chunk_size);
     n_chunks = std::max<size_t>(n_chunks, 1);
   }
+  // Keep every ranged GET piece under 4 GiB, matching the uring backend's
+  // 32-bit read-length bound, so a single very large object never produces an
+  // oversized read on either backend.
+  constexpr size_t max_piece_bytes = size_t{1} << 31;  // 2 GiB
+  n_chunks = std::max<size_t>(n_chunks, (segment.size + max_piece_bytes - 1) / max_piece_bytes);
 
   auto manager       = std::make_shared<request_manager>(segment.size, n_chunks);
   auto const obj     = file.object_ref();

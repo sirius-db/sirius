@@ -532,21 +532,30 @@ request_type_ptr uring_reactor::prep_host_rx_request(const reactor_config_type& 
 {
   if (segment.size == 0) { return rx_request::create({}); }
 
-  auto manager = std::make_shared<request_manager>(segment.size, 1);
-
   int const fd = (cfg.use_odirect && segment.is_odirect_compatible()) ? file.odirect_handle()
                                                                       : file.buffered_handle();
 
-  // The read lands directly in the caller's buffer (no bounce, no H2D copy), so
-  // a single request covers the whole range — no chunking needed.
-  auto req       = std::make_unique<chunked_rx_request>();
-  req->fd        = fd;
-  req->chunk     = segment;
-  req->file_size = file.size();
-  req->manager   = std::move(manager);
+  // The read lands directly in the caller's buffer (no bounce, no H2D copy).
+  // io_uring_prep_read/readv encode the length in a 32-bit unsigned, so a single
+  // submitted read cannot exceed 4 GiB - 1.  Split the range into
+  // <= max_host_read_chunk pieces that land contiguously in the caller's buffer.
+  // The split size is a power-of-two multiple of the largest IO block size, so
+  // each piece of an O_DIRECT-aligned segment stays block-aligned.
+  constexpr size_t max_host_read_chunk = size_t{1} << 30;  // 1 GiB
+  size_t const n_chunks = (segment.size + max_host_read_chunk - 1) / max_host_read_chunk;
+  auto manager          = std::make_shared<request_manager>(segment.size, n_chunks);
 
   std::vector<chunk_io_request_type_ptr> chunks;
-  chunks.push_back(std::move(req));
+  chunks.reserve(n_chunks);
+  for (size_t done = 0; done < segment.size; done += max_host_read_chunk) {
+    size_t const read_size = std::min(max_host_read_chunk, segment.size - done);
+    auto req               = std::make_unique<chunked_rx_request>();
+    req->fd                = fd;
+    req->chunk     = io_object_segment{segment.offset + done, read_size, segment.data() + done};
+    req->file_size = file.size();
+    req->manager   = manager;
+    chunks.push_back(std::move(req));
+  }
   return rx_request::create(std::move(chunks));
 }
 
