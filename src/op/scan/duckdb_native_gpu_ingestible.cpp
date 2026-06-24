@@ -331,6 +331,8 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
     auto sirius_filter_ast = sirius::ast::from_duckdb(*_filter_expression);
     sirius::gpu_expression_executor exec(sirius_filter_ast.get(), mr_ref, stream);
     final_table = owning_table_view{exec.select(input.table.view())};
+  } else {
+    final_table = std::move(input.table);
   }
 
   //===----------Projection----------===//

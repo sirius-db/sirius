@@ -125,8 +125,7 @@ std::future<size_t> sirius_datasource::host_read_async(size_t offset, size_t siz
   } else {
     semi = _io_ctx->host_read_async_io(*_io_object, offset, size, dst);
   }
-  return std::async(std::launch::deferred,
-                    [size, s = std::move(semi)]() mutable { return std::move(s).get(); });
+  return bridge_semi_to_std(std::move(semi));
 }
 
 std::future<std::unique_ptr<cudf::io::datasource::buffer>> sirius_datasource::host_read_async(
@@ -147,7 +146,9 @@ std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::device_read(
   size_t offset, size_t size, rmm::cuda_stream_view stream)
 {
   rmm::device_buffer buf(size, stream);
-  device_read(offset, size, reinterpret_cast<uint8_t*>(buf.data()), stream);
+  auto n = device_read(offset, size, reinterpret_cast<uint8_t*>(buf.data()), stream);
+  n      = std::min(n, size);
+  buf.resize(n, stream);
   return cudf::io::datasource::buffer::create(std::move(buf));
 }
 

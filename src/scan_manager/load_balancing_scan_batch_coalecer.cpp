@@ -103,7 +103,7 @@ void load_balancing_scan_batch_coalecer::process_provider_inputs(metadata_proces
     for (auto& batch : batches) {
       auto op_data = std::make_unique<op::scan::scan_operator_input>(std::move(batch));
       auto dev_id  = state.balancer->get_next_gpu(state.pipeline_id, op_data.get());
-      if (dev_id >= 0) { op_data->set_preferred_device_id(dev_id); }
+      if (dev_id.has_value() && *dev_id >= 0) { op_data->set_preferred_device_id(dev_id.value()); }
 
       auto fadvise_hints = op_data->get_fadvise_hints();
       if (!fadvise_hints.empty()) {
@@ -130,19 +130,19 @@ void load_balancing_scan_batch_coalecer::process_cached_entries(
   bool is_closed    = false;
   while (!is_closed) {
     auto databatch = state.batch_provider->get_next_batch();
+    is_closed      = databatch == nullptr;
     balancing_strategy::device_id_hint hint;
-    {
+    if (databatch) {
       auto rdonly = databatch->try_to_read_only();
       if (rdonly) {
         auto* space = rdonly->get_memory_space();
         if (space) { hint = balancing_strategy::make_target_hint(space->get_id()); }
       }
     }
-    is_closed = databatch == nullptr;
     if (!is_closed) {
       auto op_data = std::make_unique<op::scan::scan_operator_input>(std::move(databatch));
       auto dev_id  = state.balancer->get_next_gpu(state.pipeline_id, op_data.get(), hint);
-      if (dev_id >= 0) { op_data->set_preferred_device_id(dev_id); }
+      if (dev_id.has_value() && *dev_id >= 0) { op_data->set_preferred_device_id(dev_id.value()); }
       state.connector->push_split(std::move(op_data));
     }
   }

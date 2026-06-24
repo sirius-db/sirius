@@ -662,23 +662,29 @@ void prefetching_cache::prepare_loop(const std::stop_token& st)
       continue;
     }
 
-    for (size_t i = 0; i < n_chunks_needed; ++i) {
-      if (chunks[i]->state.mark_queued()) {
-        chunks[i]->data      = reinterpret_cast<uint8_t*>(buffers[i]);
-        chunks[i]->numa_node = numa_allocated;
-        if (!chunks[i]->state.mark_allocated()) {
+    for (auto* c : chunks) {
+      if (buffers.empty()) { break; }
+      if (c->state.mark_queued()) {
+        auto* buffer = buffers.back();
+        buffers.pop_back();
+        c->data      = reinterpret_cast<uint8_t*>(buffer);
+        c->numa_node = numa_allocated;
+        if (!c->state.mark_allocated()) {
+          buffers.push_back(buffer);  // return the buffer to the pool
           spdlog::error(
             "prefetching_cache: chunk at offset {} was marked queued but failed to mark "
             "allocated",
-            chunks[i]->offset);
+            c->offset);
         }
       }
     }
 
+    if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
+
     std::ignore = req->state->mark_allocated();
 
     if (!_io_ctx->supports_vector_host_read() ||
-        _io_ctx->preferred_prefetching_stage() == prefetching_stage::disposable) {
+        _io_ctx->preferred_prefetching_stage() == prefetching_stage::just_in_time) {
       // either the backend doesn't support scatter-gather reads or it prefers not to reuse
       // buffers for multiple reads.  In either case, we can skip the prefetching step and let the
       // read() path handle the IO directly into the caller's buffer.

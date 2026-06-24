@@ -19,6 +19,7 @@
 #include <cucascade/memory/common.hpp>
 
 #include <cstddef>
+#include <optional>
 #include <variant>
 
 namespace sirius::op {
@@ -67,13 +68,13 @@ class balancing_strategy {
    * @param data         The split's operating data; the chosen device is
    *                     stamped onto it via @c set_preferred_device_id.
    * @param hint         Optional hint for device selection, e.g., a preferred GPU or NUMA node.
-   * @return The chosen device id, or -1 when no device could be assigned (e.g.
+   * @return The chosen device id, or std::nullopt when no device could be assigned (e.g.
    *         the strategy has no GPUs to place onto), in which case @p data is
    *         left unchanged.
    */
-  virtual int get_next_gpu(std::size_t pipeline_id,
-                           const op::operator_data* data = nullptr,
-                           device_id_hint hint           = {}) = 0;
+  virtual std::optional<int> get_next_gpu(std::size_t pipeline_id,
+                                          const op::operator_data* data = nullptr,
+                                          device_id_hint hint           = {}) = 0;
 };
 
 }  // namespace sirius::scan_manager

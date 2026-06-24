@@ -580,6 +580,7 @@ void sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_op
         spdlog::info("[sirius_scan_manager] assigned pinned entry '{}' to operator '{}'",
                      pinned_name,
                      op->get_operator_id());
+        break;
       }
     }
   } catch (...) {

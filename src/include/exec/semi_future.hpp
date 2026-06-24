@@ -177,14 +177,14 @@ inline bool futex_wait_until(std::atomic<std::uint32_t>& atom,
   struct timespec ts{static_cast<time_t>(ns.count() / 1'000'000'000LL),
                      static_cast<long>(ns.count() % 1'000'000'000LL)};
   // FUTEX_WAIT_BITSET with no FUTEX_CLOCK_REALTIME → absolute CLOCK_MONOTONIC.
-  syscall(SYS_futex,
-          reinterpret_cast<std::uint32_t*>(&atom),
-          static_cast<int>(futex_wait_bitset | futex_private_flag),
-          expected,
-          &ts,
-          nullptr,
-          futex_bitset_match_any);
-  return errno != ETIMEDOUT;
+  auto r = syscall(SYS_futex,
+                   reinterpret_cast<std::uint32_t*>(&atom),
+                   static_cast<int>(futex_wait_bitset | futex_private_flag),
+                   expected,
+                   &ts,
+                   nullptr,
+                   futex_bitset_match_any);
+  return r != -1 || errno != ETIMEDOUT;
 #else
   // Non-Linux fallback: spin-yield (rare; add a platform futex port if needed).
   while (atom.load(std::memory_order_relaxed) == expected) {
@@ -556,8 +556,7 @@ class semi_future {
     return std::move(t).get();
   }
 
-  // As above but with a timeout. Throws std::future_error / TimeoutError on
-  // expiry. For minimal scope we throw std::runtime_error.
+  // As above but with a timeout. Throws std::runtime_error on expiry.
   template <class rep, class period>
   value_t get(std::chrono::duration<rep, period> const& dur) &&
   {

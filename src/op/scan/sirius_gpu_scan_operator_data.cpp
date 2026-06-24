@@ -55,13 +55,15 @@ std::size_t scan_operator_input::get_estimated_size_in_bytes() const
   if (std::holds_alternative<std::unique_ptr<scan_info>>(materialization_info)) {
     return std::get<std::unique_ptr<scan_info>>(materialization_info)->estimated_bytes();
   }
+  if (std::holds_alternative<std::shared_ptr<cucascade::data_batch>>(materialization_info)) {
+    auto batch = std::get<std::shared_ptr<cucascade::data_batch>>(materialization_info);
 
-  auto batch = std::get<std::shared_ptr<cucascade::data_batch>>(materialization_info);
-
-  auto ro          = batch->to_read_only();
-  auto const* data = ro.get_data();
-  if (!data) { return 0; }
-  return data->get_size_in_bytes();
+    auto ro          = batch->to_read_only();
+    auto const* data = ro.get_data();
+    if (!data) { return 0; }
+    return data->get_size_in_bytes();
+  }
+  return 0;
 }
 
 }  // namespace sirius::op::scan

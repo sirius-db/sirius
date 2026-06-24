@@ -298,7 +298,9 @@ class templated_ioctx : public sirius_ioctx {
                                              [[maybe_unused]] io_op_type type,
                                              [[maybe_unused]] int device_id = -1) noexcept
   {
-    size_t idx = _next.fetch_add(1, std::memory_order_relaxed) % _reactors.size();
+    assert(!_reactors.empty());
+    size_t idx =
+      _next.fetch_add(1, std::memory_order_relaxed) % std::max(_reactors.size(), size_t{1});
     return {_reactors.at(idx).get()};
   }
 
@@ -320,6 +322,7 @@ class templated_ioctx : public sirius_ioctx {
                                                size_t size,
                                                uint8_t* dst) noexcept override
   {
+    if (size == 0) return exec::make_semi_future<size_t>(0);
     try {
       auto& tobj = as_typed(obj);
       size       = std::min(size, tobj.size() > offset ? tobj.size() - offset : size_t{0});
