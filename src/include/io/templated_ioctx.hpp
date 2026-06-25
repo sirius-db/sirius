@@ -90,6 +90,11 @@ concept io_reactor_c = requires(R r,
   typename R::request_type_ptr;
   typename R::reactor_config_type;
 
+  // The reactor owns its effective config (a copy of its context's, possibly
+  // clamped at construction).  templated_ioctx sources its own _config from
+  // here rather than having it threaded in separately — see the constructors.
+  { r.get_config() } -> std::same_as<const typename R::reactor_config_type&>;
+
   {
     r.prep_host_rx_request(cfg, file, io_object_segment{offset, size, dst})
   } -> std::same_as<typename R::request_type_ptr>;

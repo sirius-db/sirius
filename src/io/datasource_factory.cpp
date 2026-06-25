@@ -16,6 +16,8 @@
 
 #include "io/datasource_factory.hpp"
 
+#include "io/io_context.hpp"
+
 #include <cudf/io/datasource.hpp>
 
 #include <cctype>
@@ -48,11 +50,41 @@ std::string to_lower_scheme(std::string_view s)
 using scheme_checker_type = io_context_registry::scheme_checker_type;
 using factory_type        = io_context_registry::factory_type;
 
+std::shared_ptr<io::sirius_ioctx> make_uring_ioctx(
+  const sirius::scan_manager::scan_manager_config& config)
+{
+  return nullptr;
+}
+
+std::shared_ptr<io::sirius_ioctx> make_rest_ioctx(
+  const sirius::scan_manager::scan_manager_config& config)
+{
+  return nullptr;
+}
+
+std::shared_ptr<io::sirius_ioctx> make_kvikio_ioctx(
+  [[maybe_unused]] const sirius::scan_manager::scan_manager_config& config)
+{
+  return nullptr;
+}
+
 // ---------------------------------------------------------------------------
 // datasource_registry
 // ---------------------------------------------------------------------------
 
-io_context_registry::io_context_registry(config_type config) : _config(std::move(config)) {}
+io_context_registry::io_context_registry(config_type config)
+  : _config(std::move(config)), _prefer_kvikio_for_file_scheme(!_config.use_sirius_datasource)
+{
+  _entries.emplace(
+    io_context_type::kvikio,
+    entry{io_context_type::kvikio, [](std::string_view url) { return true; }, make_kvikio_ioctx});
+  _entries.emplace(
+    io_context_type::uring,
+    entry{io_context_type::uring, [](std::string_view url) { return true; }, make_uring_ioctx});
+  _entries.emplace(
+    io_context_type::restful,
+    entry{io_context_type::restful, [](std::string_view url) { return true; }, make_rest_ioctx});
+}
 
 void io_context_registry::register_ioctx(io_context_type type,
                                          scheme_checker_type checker,
@@ -61,7 +93,7 @@ void io_context_registry::register_ioctx(io_context_type type,
   if (!checker) throw std::invalid_argument("datasource_registry: null scheme checker");
   if (!factory) throw std::invalid_argument("datasource_registry: null factory");
   std::lock_guard lk{_mtx};
-  _entries[type] = {std::move(checker), std::move(factory), type};
+  _entries[type] = {type, std::move(checker), std::move(factory)};
 }
 
 std::optional<io_context_type> io_context_registry::lookup(std::string_view scheme) const noexcept

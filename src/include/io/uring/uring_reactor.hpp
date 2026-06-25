@@ -20,6 +20,7 @@
 #include "io/cache/types.hpp"
 #include "io/details/slot_pool.hpp"
 #include "io/types.hpp"
+#include "io/uring/config.hpp"
 #include "io/uring/types.hpp"
 
 #include <cuda_runtime.h>
@@ -130,16 +131,6 @@ class local_io_object : public sirius_io_object {
  */
 class uring_reactor {
  public:
-  struct config {
-    std::size_t bounce_size{1UL << 20};
-    /// When false, every prep path except the BYO-device-buffer read
-    /// (prep_device_rx_request) reads through the buffered (page-cache) file
-    /// handle instead of the O_DIRECT one.  Defaults to O_DIRECT.
-    bool use_odirect{true};
-
-    std::size_t max_n_chunks{16};
-  };
-
   /// Shared, immutable services for a pool of reactors.  One instance is built
   /// by @c uring_ioctx and shared (via shared_ptr) across every reactor in the
   /// pool — the natural home for things shared rather than per-reactor: the
@@ -185,6 +176,11 @@ class uring_reactor {
 
   uring_reactor(uring_reactor const&)            = delete;
   uring_reactor& operator=(uring_reactor const&) = delete;
+
+  /// The reactor's effective config (copied from its context at construction).
+  /// templated_ioctx reads its own _config from here so the config lives in one
+  /// place — the context — rather than being passed in separately.
+  [[nodiscard]] const reactor_config_type& get_config() const noexcept { return _config; }
 
   static request_type_ptr prep_host_rx_request(const reactor_config_type& cfg,
                                                const io_object_type& file,

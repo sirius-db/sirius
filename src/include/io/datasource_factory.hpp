@@ -89,14 +89,14 @@ class io_context_registry {
 
  private:
   struct entry {
+    io_context_type type;
     scheme_checker_type checker;
     factory_type factory;
-    io_context_type type;
   };
   const config_type _config;
+  bool _prefer_kvikio_for_file_scheme{false};
   mutable std::shared_mutex _mtx;
   std::unordered_map<io_context_type, entry> _entries;
-  bool prefer_kvikio_for_file_scheme{false};  // single-GPU opt-out of sirius_datasource for file://
 };
 
 }  // namespace sirius::io

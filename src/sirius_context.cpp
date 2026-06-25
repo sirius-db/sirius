@@ -499,23 +499,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   task_creator_->set_task_scheduler(*task_scheduler_);
   task_scheduler_->set_task_creator(*task_creator_);
 
-  // Compose the scan_manager_config from the engine's default (uring +
-  // prefetch knobs). The FSMR is passed through to uring_ioctx / buffer_pool.
-  auto sm_config = config_.get_scan_manager_config();
-  // duckdb-native scan needs sirius_ioctx for host_read; enable it whenever an
-  // FSMR is available so the GPU-native scan path can read host data.
-  if (host_fsmr != nullptr) { sm_config.use_sirius_datasource = true; }
-  config_.set_scan_manager_config(std::move(sm_config));
-  // Scope the topology index to the GPUs Sirius actually reserved memory on,
-  // so gpu_ids() (which drives round-robin scan placement) never names a GPU
-  // without a memory space.
-  std::vector<int> gpu_device_ids;
-  for (auto const* gpu_space :
-       memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
-    gpu_device_ids.push_back(gpu_space->get_device_id());
-  }
   auto hw_topology_index = std::make_shared<const sirius::memory::topology_index>(
-    config_.get_hw_topology(), std::move(gpu_device_ids));
+    config_.get_hw_topology(), *memory_manager_);
   scan_manager_ = std::make_unique<sirius::scan_manager::sirius_scan_manager>(
     config_.get_scan_manager_config(), *memory_manager_, std::move(hw_topology_index));
 

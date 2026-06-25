@@ -176,7 +176,7 @@ TEST_CASE("fill_remaining_buffers resumes after a short read", "[uring_readv]")
 TEST_CASE("prep_host_rxv_request fuses contiguous same-fd segments into one readv", "[uring_readv]")
 {
   temp_file tf(1 << 20);
-  uring_reactor::config cfg;
+  sirius::io::uring::config cfg;
   cfg.use_odirect  = false;  // all segments share the buffered fd
   cfg.max_n_chunks = 16;
 
@@ -201,7 +201,7 @@ TEST_CASE("prep_host_rxv_request fuses contiguous same-fd segments into one read
 TEST_CASE("prep_host_rxv_request starts a new group at a non-contiguous boundary", "[uring_readv]")
 {
   temp_file tf(1 << 20);
-  uring_reactor::config cfg;
+  sirius::io::uring::config cfg;
   cfg.use_odirect  = false;
   cfg.max_n_chunks = 16;
 
@@ -227,7 +227,7 @@ TEST_CASE("prep_host_rxv_request starts a new group at a non-contiguous boundary
 TEST_CASE("prep_host_rxv_request caps each group at max_n_chunks", "[uring_readv]")
 {
   temp_file tf(1 << 20);
-  uring_reactor::config cfg;
+  sirius::io::uring::config cfg;
   cfg.use_odirect  = false;
   cfg.max_n_chunks = 2;  // force splitting a contiguous run
 
@@ -254,7 +254,7 @@ TEST_CASE("prep_host_rxv_request keeps a null-buffer segment standalone between 
           "[uring_readv]")
 {
   temp_file tf(1 << 20);
-  uring_reactor::config cfg;
+  sirius::io::uring::config cfg;
   cfg.use_odirect  = false;
   cfg.max_n_chunks = 16;
 
@@ -287,7 +287,7 @@ TEST_CASE("prep_host_rxv_request keeps a null-buffer segment standalone between 
 TEST_CASE("prep_host_rxv_request does not fuse segments with different fds", "[uring_readv]")
 {
   temp_file tf(1 << 20);
-  uring_reactor::config cfg;
+  sirius::io::uring::config cfg;
   cfg.use_odirect  = true;  // fd chosen per-segment by is_odirect_compatible
   cfg.max_n_chunks = 16;
 
@@ -320,7 +320,7 @@ TEST_CASE("prep_host_rxv_request clamps bytes_requested at EOF", "[uring_readv]"
 {
   // File is 6 KiB; a single 8 KiB segment over-hangs the end by 2 KiB.
   temp_file tf(6 * 1024);
-  uring_reactor::config cfg;
+  sirius::io::uring::config cfg;
   cfg.use_odirect  = false;
   cfg.max_n_chunks = 16;
 
@@ -339,7 +339,7 @@ TEST_CASE("prep_host_rxv_request clamps bytes_requested at EOF", "[uring_readv]"
 TEST_CASE("prep_host_rxv_request on empty input yields a ready zero-byte request", "[uring_readv]")
 {
   temp_file tf(4096);
-  uring_reactor::config cfg;
+  sirius::io::uring::config cfg;
   std::vector<io_object_segment> segs;
   auto req = uring_reactor::prep_host_rxv_request(cfg, *tf.obj, segs);
   REQUIRE(req != nullptr);
@@ -413,7 +413,7 @@ TEST_CASE("prep_host_to_device fuses contiguous bounce buffers into one readv wi
           "[uring_readv]")
 {
   temp_file tf(1 << 20);
-  uring_reactor::config cfg;
+  sirius::io::uring::config cfg;
   cfg.use_odirect  = false;
   cfg.max_n_chunks = 16;
 
@@ -452,7 +452,7 @@ TEST_CASE("prep_host_to_device fuses contiguous bounce buffers into one readv wi
 TEST_CASE("prep_host_to_device clips the batched copy to the request window", "[uring_readv]")
 {
   temp_file tf(1 << 20);
-  uring_reactor::config cfg;
+  sirius::io::uring::config cfg;
   cfg.use_odirect  = false;
   cfg.max_n_chunks = 16;
 
@@ -488,7 +488,7 @@ TEST_CASE("prep_host_to_device clips the batched copy to the request window", "[
 TEST_CASE("prep_host_to_device caps each readv group at max_n_chunks", "[uring_readv]")
 {
   temp_file tf(1 << 20);
-  uring_reactor::config cfg;
+  sirius::io::uring::config cfg;
   cfg.use_odirect  = false;
   cfg.max_n_chunks = 2;  // force splitting a contiguous run
 
