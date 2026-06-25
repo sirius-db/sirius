@@ -175,17 +175,20 @@ io_context_registry::io_context_registry(
     _reservation_manager(reservation_manager),
     _prefer_kvikio_for_file_scheme(!_config.use_sirius_datasource)
 {
-  _entries.emplace(io_context_type::kvikio,
-                   entry{io_context_type::kvikio,
-                         [](std::string_view url) { return true; },
-                         make_kvikio_ioctx_factory()});
+  // uring / rest claim paths via their reactor's static supports() (local
+  // files and s3:// URLs respectively).  kvikio is the universal fallback —
+  // cudf's default datasource handles any path — so it matches everything.
+  _entries.emplace(
+    io_context_type::kvikio,
+    entry{
+      io_context_type::kvikio, [](std::string_view) { return true; }, make_kvikio_ioctx_factory()});
   _entries.emplace(io_context_type::uring,
                    entry{io_context_type::uring,
-                         [](std::string_view url) { return true; },
+                         &uring::uring_reactor::supports,
                          make_uring_ioctx_factory(_reservation_manager)});
   _entries.emplace(io_context_type::restful,
                    entry{io_context_type::restful,
-                         [](std::string_view url) { return true; },
+                         &rest::rest_reactor::supports,
                          make_rest_ioctx_factory(_reservation_manager)});
 }
 
