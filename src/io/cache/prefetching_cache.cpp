@@ -107,10 +107,10 @@ class prefetching_handle::prefetch_lifecycle_manager {
 
   void activate() noexcept
   {
+    if (!_ctx) { return; }
     prefetching_handle_state expected = prefetching_handle_state::idle;
     if (_user_state->compare_exchange_strong(expected, prefetching_handle_state::active)) {
-      auto ctx = _ctx.lock();
-      if (ctx and _prefetching_state->mark_loading()) { _prefetch_queue.enqueue(std::move(ctx)); }
+      if (_ctx and _prefetching_state->mark_loading()) { _prefetch_queue.enqueue(_ctx); }
     }
   }
 
@@ -123,19 +123,17 @@ class prefetching_handle::prefetch_lifecycle_manager {
 
   [[nodiscard]] std::shared_ptr<prefetch_request_context> get_context() const noexcept
   {
-    auto ctx = _ctx.lock();
-    return ctx ? ctx : nullptr;
+    return _ctx;
   }
 
   void evict() noexcept
   {
     cancel();
-    auto ctx = _ctx.lock();
-    if (ctx) { _eviction_queue.enqueue(std::move(ctx)); }
+    if (_ctx) { _eviction_queue.enqueue(std::move(_ctx)); }
   }
 
  private:
-  std::weak_ptr<prefetch_request_context> _ctx;
+  std::shared_ptr<prefetch_request_context> _ctx;
   std::shared_ptr<std::atomic<prefetching_handle_state>> _user_state;
   std::shared_ptr<entry_state> _prefetching_state;
   prefetching_cache::request_queue_type& _eviction_queue;
@@ -373,18 +371,15 @@ bool prefetching_cache::host_read_from_cache_only(const sirius_io_object& obj,
 
   std::vector<cached_chunk*> chunks;
   if (out_handle && *out_handle) {
-    auto& requested_chunks = out_handle->get_context()->chunks;
-    chunks =
-      find_entry(requested_chunks, offset, size, coverage_policy::full, _pool->chunk_bytes());
-  } else {
-    file_entry* file = nullptr;
-    {
-      std::shared_lock lk(_map_mtx);
-      auto it = _file_cache.find(obj.raw_file_cache_id());
-      if (it != _file_cache.end()) { file = it->second.get(); }
+    if (auto ctx = out_handle->get_context()) {
+      chunks = find_entry(ctx->chunks, offset, size, coverage_policy::full, _pool->chunk_bytes());
     }
-    if (file) {
-      chunks = file->fetch_chunks(offset, size, coverage_policy::full, _pool->chunk_bytes());
+  }
+  if (chunks.empty()) {
+    std::shared_lock lk(_map_mtx);
+    auto it = _file_cache.find(obj.raw_file_cache_id());
+    if (it != _file_cache.end()) {
+      chunks = it->second->fetch_chunks(offset, size, coverage_policy::full, _pool->chunk_bytes());
     }
   }
 
@@ -460,9 +455,11 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const sirius
   std::vector<cached_chunk*> chunks;
   chunks.reserve(n_chunks);
   if (out_handle && *out_handle) {
-    auto& requested_chunks = out_handle->get_context()->chunks;
-    chunks = find_entry(requested_chunks, offset, size, policy, _pool->chunk_bytes());
-  } else {
+    if (auto ctx = out_handle->get_context()) {
+      chunks = find_entry(ctx->chunks, offset, size, policy, _pool->chunk_bytes());
+    }
+  }
+  if (chunks.empty()) {
     std::shared_lock lk(_map_mtx);
     auto it = _file_cache.find(obj.raw_file_cache_id());
     if (it != _file_cache.end()) {
