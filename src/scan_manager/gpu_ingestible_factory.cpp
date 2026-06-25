@@ -21,6 +21,7 @@
 #include "op/scan/pinned_table_gpu_ingestible.hpp"
 #include "op/scan/scan_plan.hpp"
 #include "op/scan/scan_utils.hpp"
+#include "op/sirius_dynamic_filter.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 
 #include <algorithm>
@@ -107,6 +108,13 @@ std::shared_ptr<io::gpu_ingestible> gpu_ingestible_factory::try_cached(
                                   info.scan_output_arity,
                                   info.partition_indices));
       auto const& plan = *plan_shared;
+
+      // The post-decode dynamic-filter operator filters this cached scan too; producers reference
+      // probe columns in column_ids space, so install the same column_ids → output-position
+      // translation the disk ingestible does. Idempotent with the parquet ctor on a fall-through.
+      if (info.sirius_dynamic_filters) {
+        info.sirius_dynamic_filters->set_consumer_column_remap(plan.output_position_by_column_id);
+      }
 
       // Hive partitions on a cached scan would require per-chunk file_path
       // metadata that pinned entries don't carry today. Fall through to

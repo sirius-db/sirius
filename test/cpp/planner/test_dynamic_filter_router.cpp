@@ -23,6 +23,8 @@
 
 #include "op/sirius_dynamic_filter.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "sirius_config.hpp"
+#include "sirius_context.hpp"
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -34,9 +36,26 @@ using sirius::planner::sirius_physical_plan_generator;
 namespace {
 
 /// Stand-in fixture: a real DuckDB connection so we can construct a plan generator
-/// (which requires a ClientContext) without standing up the whole query pipeline.
+/// (which requires a ClientContext) without standing up the whole query pipeline. Registers a
+/// SiriusContext on the connection so the router's enable gate reads a real config (rather than
+/// hitting the no-state fallback); the master switch defaults ON here so the channel-creation
+/// tests below exercise the enabled path explicitly.
 struct router_fixture {
-  router_fixture() : db(nullptr), con(db) {}
+  router_fixture() : db(nullptr), con(db)
+  {
+    auto sirius_ctx = duckdb::make_shared_ptr<duckdb::SiriusContext>();
+    sirius_ctx->get_config().get_operator_params().enable_dynamic_filter_pushdown = true;
+    con.context->registered_state->Insert("sirius_state", std::move(sirius_ctx));
+  }
+
+  /// Flip the dynamic-filter-pushdown master switch on the registered SiriusContext. The router
+  /// reads this live on every get_or_create_dynamic_filter_channel call.
+  void set_pushdown_enabled(bool enabled)
+  {
+    auto state = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    state->get_config().get_operator_params().enable_dynamic_filter_pushdown = enabled;
+  }
+
   duckdb::DuckDB db;
   duckdb::Connection con;
 };
@@ -109,4 +128,34 @@ TEST_CASE_METHOD(router_fixture,
   }
   REQUIRE(channel != nullptr);
   REQUIRE(channel->empty());
+}
+
+TEST_CASE_METHOD(router_fixture,
+                 "get_or_create_dynamic_filter_channel hands out no channel when pushdown is disabled",
+                 "[dynamic_filter][router]")
+{
+  set_pushdown_enabled(false);
+  sirius_physical_plan_generator gen(*con.context);
+  duckdb::DynamicTableFilterSet key;
+
+  // The off-by-default contract: with the master switch off the router wires nothing, so neither
+  // producer nor consumer attaches and there is zero overhead.
+  REQUIRE(gen.get_or_create_dynamic_filter_channel(&key) == nullptr);
+  REQUIRE(gen.dynamic_filter_channels.empty());
+}
+
+TEST_CASE_METHOD(router_fixture,
+                 "the enable gate is honored per call, not cached",
+                 "[dynamic_filter][router]")
+{
+  sirius_physical_plan_generator gen(*con.context);
+  duckdb::DynamicTableFilterSet key_off;
+  duckdb::DynamicTableFilterSet key_on;
+
+  set_pushdown_enabled(false);
+  REQUIRE(gen.get_or_create_dynamic_filter_channel(&key_off) == nullptr);
+
+  set_pushdown_enabled(true);
+  REQUIRE(gen.get_or_create_dynamic_filter_channel(&key_on) != nullptr);
+  REQUIRE(gen.dynamic_filter_channels.size() == 1);
 }

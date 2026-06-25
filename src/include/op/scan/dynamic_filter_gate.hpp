@@ -78,7 +78,7 @@ class dynamic_filter_gate {
   { return kept > k_filter_skip_keep_threshold; }
 
  private:
-  enum class state : std::uint8_t { unknown, active, disabled };
+  enum class state { unknown, active, disabled };
 
   /// Per-filter skip threshold (Vertica uses ~0.9): a filter keeping more than this fraction of
   /// the rows it sees prunes too little to repay computing its mask on every split.

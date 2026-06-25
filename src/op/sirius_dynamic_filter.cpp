@@ -175,6 +175,13 @@ bool sirius_dynamic_filter_set::push_filter(std::size_t col_idx,
   {
     std::scoped_lock lk(_mu);
     if (!_accepting_filters.load(std::memory_order_relaxed)) { return false; }
+    // Translate the producer's column_ids-space index to the consumer's output-column position.
+    // An empty remap is identity; a column_ids entry mapping to no output column is rejected.
+    if (!_consumer_col_remap.empty()) {
+      if (col_idx >= _consumer_col_remap.size()) { return false; }
+      col_idx = _consumer_col_remap[col_idx];
+      if (col_idx == static_cast<std::size_t>(-1)) { return false; }
+    }
     if (_ignored_columns.count(col_idx) != 0) { return false; }
     _filters[col_idx].push_back(std::move(f));
   }
@@ -188,6 +195,12 @@ void sirius_dynamic_filter_set::ignore_columns(std::vector<std::size_t> const& c
 {
   std::scoped_lock lk(_mu);
   _ignored_columns.insert(cols.begin(), cols.end());
+}
+
+void sirius_dynamic_filter_set::set_consumer_column_remap(std::vector<std::size_t> remap)
+{
+  std::scoped_lock lk(_mu);
+  _consumer_col_remap = std::move(remap);
 }
 
 void sirius_dynamic_filter_set::register_producer()

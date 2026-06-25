@@ -21,12 +21,16 @@
  *        column indices through scan_plan and skipping hive-partition columns.
  */
 
+#include <cudf/aggregation.hpp>
 #include <cudf/ast/expressions.hpp>
 #include <cudf/filling.hpp>
+#include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
+
+#include <cuda_runtime.h>
 
 #include <catch.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
@@ -34,6 +38,7 @@
 #include <op/sirius_dynamic_filter.hpp>
 
 #include <memory>
+#include <numeric>
 #include <vector>
 
 using sirius::op::sirius_dynamic_filter;
@@ -58,6 +63,17 @@ std::shared_ptr<sirius_dynamic_zone_map_filter> make_zone_map(int32_t lo, int32_
   std::vector<zone_map_entry> zones;
   zones.push_back({make_int32_scalar(lo), make_int32_scalar(hi)});
   return std::make_shared<sirius_dynamic_zone_map_filter>(std::move(zones));
+}
+
+/// Zone-map with explicit boundary inclusivity, so the exclusive GREATER / LESS lowering branches
+/// (sirius_dynamic_filter.cpp) get exercised — the default helper above only builds inclusive bounds.
+std::shared_ptr<sirius_dynamic_zone_map_filter>
+make_zone_map(int32_t lo, int32_t hi, bool inclusive_min, bool inclusive_max)
+{
+  std::vector<zone_map_entry> zones;
+  zones.push_back({make_int32_scalar(lo), make_int32_scalar(hi)});
+  return std::make_shared<sirius_dynamic_zone_map_filter>(
+    std::move(zones), inclusive_min, inclusive_max);
 }
 
 /// Build a minimal scan_plan with one DATA column at consumer index @p col_idx named @p name.
@@ -251,6 +267,44 @@ std::unique_ptr<cudf::table> make_sequence_table(int32_t size, rmm::cuda_stream_
   cols.push_back(std::move(col));
   return std::make_unique<cudf::table>(std::move(cols));
 }
+
+/// Copy an INT32 column's values to host. apply_boolean_mask gathers survivors in order with no
+/// nulls, so the result is directly comparable to an expected sequence.
+std::vector<int32_t> to_host_int32(cudf::column_view const& col, rmm::cuda_stream_view stream)
+{
+  std::vector<int32_t> host(static_cast<std::size_t>(col.size()));
+  cudaMemcpyAsync(host.data(),
+                  col.data<int32_t>(),
+                  host.size() * sizeof(int32_t),
+                  cudaMemcpyDeviceToHost,
+                  stream.value());
+  stream.synchronize();
+  return host;
+}
+
+/// Build a zone-map-*only* filter (no membership) the way the hash-join producer does: reduce the
+/// build column's min/max into device scalars on `stream`. A large build whose membership structure
+/// doesn't fit L2 emits exactly this — the path whose missing build-stream sync produced cross-stream
+/// false negatives (Q8/Q9/Q17 with enable_dynamic_zone_map_filter). The producer's drain-before-publish
+/// is the structural guard; this exercises the zone-map-only correctness (bounds, column, superset).
+std::shared_ptr<sirius_dynamic_zone_map_filter>
+make_zone_map_from_reduce(cudf::column_view const& build_col, rmm::cuda_stream_view stream)
+{
+  auto mr    = cudf::get_current_device_resource_ref();
+  auto min_s = cudf::reduce(build_col,
+                            *cudf::make_min_aggregation<cudf::reduce_aggregation>(),
+                            build_col.type(),
+                            stream,
+                            mr);
+  auto max_s = cudf::reduce(build_col,
+                            *cudf::make_max_aggregation<cudf::reduce_aggregation>(),
+                            build_col.type(),
+                            stream,
+                            mr);
+  std::vector<zone_map_entry> zones;
+  zones.push_back({std::move(min_s), std::move(max_s)});
+  return std::make_shared<sirius_dynamic_zone_map_filter>(std::move(zones));
+}
 }  // namespace
 
 TEST_CASE("apply_dynamic_filters_to_view drops rows outside the zone",
@@ -268,7 +322,67 @@ TEST_CASE("apply_dynamic_filters_to_view drops rows outside the zone",
   REQUIRE(out != nullptr);
   REQUIRE(out->num_columns() == 1);
   REQUIRE(out->num_rows() == 4);
+  REQUIRE(to_host_int32(out->view().column(0), stream) == std::vector<int32_t>{3, 4, 5, 6});
   REQUIRE(table->num_rows() == 10);  // input untouched
+}
+
+TEST_CASE("apply_dynamic_filters_to_view honors an exclusive upper bound [lo, hi)",
+          "[dynamic_filter][scan_merge]")
+{
+  auto stream = cudf::get_default_stream();
+  auto table  = make_sequence_table(10, stream);  // [0..9]
+
+  sirius_dynamic_filter_set filters;
+  // [3,6): inclusive_min, exclusive_max -> GREATER_EQUAL(3) AND LESS(6) -> {3,4,5}
+  filters.push_filter(0, make_zone_map(3, 6, /*inclusive_min=*/true, /*inclusive_max=*/false));
+
+  auto out = sirius::op::scan::apply_dynamic_filters_to_view(table->view(), filters, stream);
+  stream.synchronize();
+
+  REQUIRE(out != nullptr);
+  REQUIRE(to_host_int32(out->view().column(0), stream) == std::vector<int32_t>{3, 4, 5});
+}
+
+TEST_CASE("apply_dynamic_filters_to_view honors an exclusive lower bound (lo, hi]",
+          "[dynamic_filter][scan_merge]")
+{
+  auto stream = cudf::get_default_stream();
+  auto table  = make_sequence_table(10, stream);  // [0..9]
+
+  sirius_dynamic_filter_set filters;
+  // (3,6]: exclusive_min, inclusive_max -> GREATER(3) AND LESS_EQUAL(6) -> {4,5,6}
+  filters.push_filter(0, make_zone_map(3, 6, /*inclusive_min=*/false, /*inclusive_max=*/true));
+
+  auto out = sirius::op::scan::apply_dynamic_filters_to_view(table->view(), filters, stream);
+  stream.synchronize();
+
+  REQUIRE(out != nullptr);
+  REQUIRE(to_host_int32(out->view().column(0), stream) == std::vector<int32_t>{4, 5, 6});
+}
+
+TEST_CASE("zone-map-only filter from a device reduce keeps a correct superset (no false negative)",
+          "[dynamic_filter][scan_merge]")
+{
+  auto stream = cudf::get_default_stream();
+
+  // Build keys spanning [100, 200] — the producer reduces these to min=100, max=200 and, with no
+  // membership filter, publishes a zone-map alone. Probe [0..299]: only [100..200] can possibly
+  // join, and crucially every value a build key could equal must survive (no false negative).
+  auto build = cudf::sequence(101,
+                              cudf::numeric_scalar<int32_t>(100, true, stream),
+                              cudf::numeric_scalar<int32_t>(1, true, stream),
+                              stream);
+  sirius_dynamic_filter_set filters;
+  filters.push_filter(0, make_zone_map_from_reduce(build->view(), stream));
+
+  auto probe = make_sequence_table(300, stream);  // [0..299]
+  auto out   = sirius::op::scan::apply_dynamic_filters_to_view(probe->view(), filters, stream);
+  stream.synchronize();
+
+  REQUIRE(out != nullptr);
+  std::vector<int32_t> expected(101);
+  std::iota(expected.begin(), expected.end(), 100);  // {100, 101, ..., 200}, inclusive bounds
+  REQUIRE(to_host_int32(out->view().column(0), stream) == expected);
 }
 
 TEST_CASE("apply_dynamic_filters_to_view returns nullptr for an empty channel",

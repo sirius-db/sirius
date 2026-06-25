@@ -219,6 +219,13 @@ class sirius_mask_applicable {
  * exactly the rows the join would discard. It cannot be expressed as a cheap AST or row-group stats
  * predicate, so it rides the @ref sirius_mask_applicable path: a row-level persistent-set probe
  * applied post-decode. Intended for small-to-moderate key sets; larger builds use a bloom filter.
+ *
+ * @note Probe keys equal to @c std::numeric_limits<std::int64_t>::min() (INT64_MIN) are treated as
+ *       empty-slot sentinels by the underlying @c cuco::static_set and will not match, even if
+ *       INT64_MIN was inserted into the build set. This is safe — the join remains authoritative, so
+ *       a missed singleton only costs a pruning opportunity, never a false negative — but it requires
+ *       that build keys never legitimately use INT64_MIN (a precondition satisfied by TPC-H-style
+ *       surrogate-key domains).
  */
 class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
                                             public sirius_mask_applicable {
@@ -355,6 +362,15 @@ class sirius_dynamic_filter_set {
    * @brief Register a filter for column @p col_idx. No-op if @p f is null or the channel is
    * closed.
    *
+   * @p col_idx is the producer's column reference in the consumer's @b column_ids space — DuckDB
+   * hands it over as a @c LogicalGet binding's @c column_index (see @c JoinFilterPushdownColumn).
+   * When @ref set_consumer_column_remap has installed a translation, @p col_idx is mapped to the
+   * consumer's output-column position before it is stored, so every consumer-side lookup
+   * (@ref filters_for_column, @ref filtered_columns, the AST merge, the post-decode apply) keys by
+   * output position. A @p col_idx that the remap maps to no output column (pure-filter / pruned /
+   * partition) is rejected. With no remap installed the index is stored as-is (the identity case,
+   * e.g. tests and scans whose output already matches column_ids order).
+   *
    * Thread-safe; may be called concurrently from multiple producer operators. The same
    * @p f may be pushed into multiple channels and/or columns to fan-out a filter without
    * cloning it; the channels co-own the filter.
@@ -382,8 +398,18 @@ class sirius_dynamic_filter_set {
   /// Drop filters targeting these consumer columns — @ref push_filter becomes a no-op for them.
   /// A scan marks its hive-partition columns here: those are pruned at the file level and the
   /// values aren't in the decoded data, so a dynamic filter on them must never reach the consumer.
-  /// Wiring-time setup — call before any producer publishes (not synchronized against push_filter).
+  /// Indices are in the consumer's output-column space (matching what @ref push_filter stores after
+  /// remapping). Wiring-time setup — call before any producer publishes (not synchronized against
+  /// push_filter).
   void ignore_columns(std::vector<std::size_t> const& cols);
+
+  /// Install the consumer's column_ids → output-position translation applied by @ref push_filter.
+  /// @p remap is indexed by column_ids position and yields the output-column position, or
+  /// @c scan_plan::no_output_position for column_ids entries that produce no output. Typically the
+  /// scan's @c scan_plan::output_position_by_column_id. Wiring-time setup — call before any
+  /// producer publishes. An empty @p remap (the default) means identity: indices are stored
+  /// unchanged.
+  void set_consumer_column_remap(std::vector<std::size_t> remap);
 
   /// Mark that a producer has been wired to this channel at plan time.
   void register_producer();
@@ -429,6 +455,10 @@ class sirius_dynamic_filter_set {
   /// Consumer columns whose filters are dropped on push (e.g. hive partitions); see @ref
   /// ignore_columns.
   std::unordered_set<std::size_t> _ignored_columns;
+
+  /// column_ids → output-position translation applied on push; empty means identity. See
+  /// @ref set_consumer_column_remap.
+  std::vector<std::size_t> _consumer_col_remap;
 
   /// Total filters pushed across all columns; backs the lock-free @ref has_filters.
   std::atomic<std::size_t> _filter_count{0};

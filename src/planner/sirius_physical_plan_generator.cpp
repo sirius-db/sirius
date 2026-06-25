@@ -37,7 +37,7 @@ namespace {
 bool dynamic_filter_pushdown_enabled(duckdb::ClientContext& context)
 {
   auto state = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!state) { return true; }
+  if (!state) { return false; }
   return state->get_config().get_operator_params().enable_dynamic_filter_pushdown;
 }
 }  // namespace
