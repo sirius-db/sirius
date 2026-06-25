@@ -16,6 +16,7 @@
 
 #include "io/io_context.hpp"
 
+#include "io/cache/config.hpp"
 #include "io/cache/prefetching_cache.hpp"
 #include "io/sirius_datasource.hpp"
 
@@ -33,8 +34,7 @@ sirius_ioctx::~sirius_ioctx() = default;
 
 void sirius_ioctx::initialize_cache(
   cucascade::memory::memory_reservation_manager& reservation_manager,
-  size_t inflight_budget_chunks,
-  uint32_t buffer_pool_slabs,
+  io::cache::config const& cache_config,
   std::shared_ptr<const sirius::memory::topology_index> topology_index) noexcept
 {
   // One-shot.  Repeated calls are silent no-ops so callers can be
@@ -43,9 +43,10 @@ void sirius_ioctx::initialize_cache(
   try {
     _cache = std::make_unique<cache::prefetching_cache>(reservation_manager,
                                                         this,
-                                                        inflight_budget_chunks,
-                                                        buffer_pool_slabs,
-                                                        std::move(topology_index));
+                                                        cache_config.inflight_budget_chunks,
+                                                        cache_config.buffer_pool_bytes,
+                                                        std::move(topology_index),
+                                                        cache_config.dispose_after_use);
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("prefetching_cache construction failed: {}", e.what());
     _cache.reset();

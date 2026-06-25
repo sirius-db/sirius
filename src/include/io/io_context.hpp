@@ -17,6 +17,7 @@
 #pragma once
 
 #include "exec/semi_future.hpp"
+#include "io/cache/config.hpp"
 #include "io/cache/metadata_store.hpp"
 #include "io/cache/types.hpp"
 #include "io/types.hpp"
@@ -134,8 +135,7 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   /// of that distinction — it simply forwards lookups through @c cache().
   void initialize_cache(
     cucascade::memory::memory_reservation_manager& reservation_manager,
-    size_t inflight_budget_chunks,
-    uint32_t buffer_pool_slabs,
+    io::cache::config const& cache_config,
     std::shared_ptr<const sirius::memory::topology_index> topology_index) noexcept;
 
   /// Tear down the cache (drains background workers and any in-flight

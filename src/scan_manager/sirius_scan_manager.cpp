@@ -164,23 +164,11 @@ sirius_scan_manager::sirius_scan_manager(
                  _config.thread_pool.thread_name_prefix,
                  _config.thread_pool.cpu_affinity_list),
     _dispatcher(
-      std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads + 1)),
+      std::make_unique<exec::scoped_dispatcher>(_thread_pool, _thread_pool.num_threads())),
     _ioctx_registry(config, reservation_manager)
 {
   if (!_topology_index) {
     throw std::invalid_argument("[sirius_scan_manager] topology_index must be non-null");
-  }
-
-  auto host_spaces = reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
-  std::vector<cucascade::memory::fixed_size_host_memory_resource*> host_mrs;
-  std::ranges::transform(host_spaces, std::back_inserter(host_mrs), [](auto* sp) {
-    return sp->template get_memory_resource_of<cucascade::memory::Tier::HOST>();
-  });
-
-  if (host_mrs.empty()) {
-    throw std::runtime_error(
-      "[sirius_scan_manager] use_sirius_datasource is true but the reservation "
-      "manager has no HOST-tier fixed_size_host_memory_resource");
   }
 
   // scan_manager always owns an io_ctx: sirius_datasource (uring) on the
@@ -223,22 +211,7 @@ sirius_scan_manager::sirius_scan_manager(
   // unconditional and there's no "is the cache present" branch to
   // worry about in callers.
   if (_config.enable_prefetch_cache) {
-    // Total slab budget for the cache's pool; the cache builds and owns the
-    // pool from the reservation manager's HOST-tier spaces.
-    auto const slab_bytes =
-      host_mrs.front()->get_block_size() *
-      static_cast<std::size_t>(sirius::io::cache::buffer_pool::CHUNKS_PER_SLAB);
-    auto const max_slabs =
-      static_cast<uint32_t>((_config.cache.buffer_pool_bytes + slab_bytes - 1) / slab_bytes);
-    _io_ctx->initialize_cache(
-      reservation_manager, _config.cache.inflight_budget_chunks, max_slabs, _topology_index);
-  }
-
-  if (_io_ctx->cache() && _io_ctx->cache()->is_armed()) {
-    SIRIUS_LOG_DEBUG("[sirius_scan_manager] prefetch cache armed (inflight_chunks={})",
-                     _config.cache.inflight_budget_chunks);
-  } else {
-    SIRIUS_LOG_DEBUG("[sirius_scan_manager] prefetch cache unarmed");
+    _io_ctx->initialize_cache(reservation_manager, _config.cache, _topology_index);
   }
 }
 
@@ -256,34 +229,6 @@ sirius_scan_manager::~sirius_scan_manager()
   // chunks safely.
   if (_io_ctx) { _io_ctx->shutdown_cache(); }
 }
-
-namespace {
-
-// Walk @c ioctxs and return the first @c ctx whose @c supports(path) is
-// true, or nullptr. Also tries with @c "file://" prefix stripped because
-// @c uring_reactor::supports (from #740) calls @c is_regular_file on the
-// raw input — so it accepts bare absolute paths but not @c file:// URIs.
-// Stripping at the dispatch layer keeps #740's code untouched and works
-// for the both-shape inputs Sirius's parquet plans can produce.
-template <typename Container, typename Out>
-Out lookup_supporting(Container const& ioctxs,
-                      std::string_view path,
-                      Out (*get_value)(typename Container::value_type const&))
-{
-  for (auto const& ctx : ioctxs) {
-    if (ctx && ctx->supports(path)) return get_value(ctx);
-  }
-  constexpr std::string_view kFileScheme = "file://";
-  if (path.size() > kFileScheme.size() && path.substr(0, kFileScheme.size()) == kFileScheme) {
-    auto bare = path.substr(kFileScheme.size());
-    for (auto const& ctx : ioctxs) {
-      if (ctx && ctx->supports(bare)) return get_value(ctx);
-    }
-  }
-  return Out{};
-}
-
-}  // namespace
 
 parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri)
 {
@@ -340,21 +285,6 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
   auto round_robin =
     std::make_shared<round_robin_strategy>(std::vector<int>(gpu_ids.begin(), gpu_ids.end()));
 
-  // Advance the cache age so the evictor can score this query's inserts
-  // against entries left over from prior queries.
-  // refresh_cache() removed — the cache no longer has a query-epoch
-  // notion.  Per-file aging in the eviction queue handles staleness
-  // without scan_manager involvement.
-
-  SIRIUS_LOG_INFO("[sirius_scan_manager::prepare_for_query] scan_operators={}",
-                  query.get_scan_operators().size());
-
-  // Build a fresh sequencer for this query.  Slots are added by
-  // create_provider_for() whenever it chooses the parquet path; the
-  // cached path skips slot allocation since there's no IO to prefetch.
-  // The sequencer task piggy-backs on the dispatcher's injected
-  // stop_token, so reset()/request_stop on the dispatcher tears it
-  // down without a side-channel stop_source.
   _metadata_processor = std::make_unique<load_balancing_scan_batch_coalecer>();
 
   for (auto const& scan_op : query.get_scan_operators()) {
@@ -401,8 +331,7 @@ void sirius_scan_manager::reset()
   _scan_op_order.clear();
   _providers_by_op.clear();
   _metadata_processor.reset();
-  _dispatcher =
-    std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads + 1);
+  _dispatcher = std::make_unique<exec::scoped_dispatcher>(_thread_pool, _thread_pool.num_threads());
 }
 
 void sirius_scan_manager::start() {}
@@ -410,10 +339,6 @@ void sirius_scan_manager::start() {}
 void sirius_scan_manager::stop()
 {
   reset();
-  // S6: the IO backends + the S3 async pool are owned by SiriusContext, which
-  // drains (shutdown) the s3_ioctx and stops the S3 pool during its own
-  // teardown. The scan_manager only stops its scan-orchestration pool here and
-  // must NOT shut down the borrowed backends.
   _thread_pool.stop();
 }
 
