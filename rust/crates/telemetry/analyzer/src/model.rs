@@ -166,21 +166,11 @@ impl SiriusModel {
     }
 }
 
-impl
-    FsmCollection<
-        Task,
-        quent_analyzer::fsm::events::TransitionEvent<instrumentation_model::task::TaskTransition>,
-    > for SiriusModel
-{
-    fn fsms<'a>(&'a self) -> impl Iterator<Item = &'a Task> + 'a
-    where
-        Task: 'a,
-    {
-        self.tasks.values()
-    }
+impl FsmCollection for SiriusModel {
+    type Fsm = Task;
 
-    fn contains_fsm_type(&self, type_name: &str) -> bool {
-        !self.tasks.is_empty() && type_name == "task"
+    fn fsms(&self) -> impl Iterator<Item = &Task> {
+        self.tasks.values()
     }
 }
 
