@@ -289,6 +289,11 @@ prefetching_cache::~prefetching_cache()
   _preparation_stop_source.request_stop();
   _prefetch_stop_source.request_stop();
   _evictor_stop_source.request_stop();
+
+  _rate_limiter.wait_for_all();
+  _preparation_thread.join();
+  _prefetch_thread.join();
+  _evictor_thread.join();
 }
 
 // ===========================================================================
