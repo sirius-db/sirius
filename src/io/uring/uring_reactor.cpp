@@ -431,7 +431,7 @@ struct unique_ring {
     ts.tv_nsec = (timeout.count() % 1000) * 1'000'000L;
     int rc     = io_uring_wait_cqe_timeout(ring.get(), &tmp, &ts);
     if (rc < 0 && rc != -EINTR && rc != -ETIME) { return -rc; }
-    return rc;
+    return 0;
   }
 
   [[nodiscard]] int wait() const
