@@ -477,6 +477,17 @@ void sirius_scan_manager::insert_pinned_entry(
   // Copied out before cache_info is moved into the entry below.
   std::vector<std::string> column_names = cache_info.column_names();
 
+  // column_ids and names within cache_info are built aligned 1:1 by
+  // cache_entry_info::from; the merge path below indexes column_ids by the same
+  // position as the column names, so reject any misalignment loudly rather than
+  // risk an out-of-bounds access.
+  if (cache_info.column_ids.size() != column_names.size()) {
+    throw std::invalid_argument(
+      "[sirius_scan_manager::insert_pinned_entry] cache_info.column_ids.size() (" +
+      std::to_string(cache_info.column_ids.size()) + ") must equal column_names size (" +
+      std::to_string(column_names.size()) + ")");
+  }
+
   auto existing_it = _pinned_entries.find(name);
   if (existing_it != _pinned_entries.end()) {
     // Same-row-count merge only applies when the completeness contracts match.
@@ -537,8 +548,18 @@ void sirius_scan_manager::insert_pinned_entry(
             std::move(cols[i]));
         }
       }
-      // The union of pinned column names is reflected by entry.cache_info; the
-      // merged columns are keyed into data_batches_by_column above.
+      // Reflect the merged columns in cache_info so can_serve_with_columns'
+      // superset match — and the gather it drives — actually see them. Append
+      // only columns that received data above (an empty data_tables call must
+      // not list a column with no backing chunks in data_batches_by_column).
+      // column_ids and names grow together and we only append, so the projection
+      // positions already handed out for existing columns stay valid.
+      for (std::size_t i = 0; i < is_new_col.size(); ++i) {
+        if (!is_new_col[i]) { continue; }
+        if (!entry.data_batches_by_column.contains(column_names[i])) { continue; }
+        entry.cache_info.column_ids.push_back(cache_info.column_ids[i]);
+        entry.cache_info.names.push_back(column_names[i]);
+      }
       return;
     }
     // Row count or completeness contract differs → drop the stale entry and rebuild below.

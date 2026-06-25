@@ -221,56 +221,60 @@ class sirius_scan_manager {
   /// \brief Stop the worker thread pool and the driver. Idempotent.
   void stop();
 
-  /// \brief Pin the entry for a table.
+  /// \brief Pin (or extend) the GPU-tier entry for a table.
   ///
   /// Releases the columns of each input @p data_tables into the entry's per-column
-  /// map, keyed by @p column_names (the i-th column of every table is appended to
-  /// @c data_batches_by_column[column_names[i]]). Tables become empty after this
-  /// call.
+  /// map, keyed by the column names carried in @p cache_info (the i-th column of
+  /// every table is appended to @c data_batches_by_column[cache_info.column_names()[i]]).
+  /// Tables become empty after this call.
   ///
-  /// Re-insert semantics:
+  /// Re-insert semantics (keyed by @p name):
   ///   - If no entry exists for @p name, a fresh one is created.
-  ///   - If an entry exists and its @c num_rows equals the new total row count,
-  ///     only columns whose names are not already present are merged in;
-  ///     duplicates are dropped. The existing file_paths and chunk_memory_spaces
-  ///     are preserved (merge MUST verify chunk_memory_spaces alignment
-  ///     between existing and new entry).
-  ///   - If row counts differ, the existing entry is dropped and replaced.
+  ///   - If an entry exists and its @c num_rows equals the new total row count, the
+  ///     incoming columns whose names are not already present are merged in
+  ///     (duplicate columns are dropped), and the entry's @c cache_info is extended
+  ///     to the union of pinned columns so later cache-hit matching can serve them.
+  ///     The existing cache identity is preserved; the merge requires the incoming
+  ///     @p chunk_memory_spaces to be identical to the existing entry's and rejects
+  ///     any mismatch.
+  ///   - If row counts differ, the existing entry is dropped and replaced. (An
+  ///     n_rows-capped "partial" pin therefore never merges with a full pin of the
+  ///     same table, since their row counts differ.)
   ///
   /// \param name                  Table name key.
-  /// \param column_names          Column names in the order returned by the parquet read.
-  /// \param file_paths            Resolved file paths captured at pin time (used to match scan
-  /// ops).
-  /// \param data_tables           Cudf tables produced by chunked parquet reads (may be empty).
-  /// \param chunk_memory_spaces   Per-chunk memory space placement (size MUST equal total chunk
-  ///                              count across data_tables; value at index i is shared by all
-  ///                              columns at chunk i).
-  /// \param is_partial            True when the caller capped row capture below the full file
-  ///                              content (e.g. pin_table n_rows budget). Partial entries
-  ///                              must NOT serve cached reads — see pinned_entry::is_partial.
+  /// \param cache_info            Cache identity (parquet file set or duckdb
+  ///                              catalog.schema.table) plus the cached columns by
+  ///                              primary index and their @c column_ids-aligned names;
+  ///                              drives later cache-hit matching and the per-column gather.
+  /// \param data_tables           Cudf tables produced by chunked reads, one per chunk
+  ///                              (may be empty). Each table's column count MUST equal
+  ///                              the number of columns described by @p cache_info.
+  /// \param chunk_memory_spaces   Per-chunk memory space placement; size MUST equal
+  ///                              data_tables.size() (the value at index i is shared by
+  ///                              all columns at chunk i).
   void insert_pinned_entry(const std::string& name,
                            cache_entry_info cache_info,
                            std::vector<std::unique_ptr<cudf::table>> data_tables,
                            std::vector<cucascade::memory::memory_space*> chunk_memory_spaces);
 
-  /// \brief Pin the entry for a table on the host tier.
+  /// \brief Pin the host-tier entry for a table.
   ///
   /// Each entry in @p host_chunks describes one batch's worth of pinned data
   /// (covering all pinned columns) as a host_data_representation. The
   /// cached_split_provider built from this entry slices each chunk by column
-  /// index at scan time. Re-insert with a different row count drops the
-  /// existing entry; otherwise the call replaces the entry's chunks.
+  /// index at scan time. This path always REPLACES any existing entry for @p name
+  /// — there is no per-column merge analog to the GPU path because the
+  /// chunk-vs-column dimensions are flipped (each chunk already holds every column).
   ///
   /// \param name          Table name key.
-  /// \param column_names  Column names in the order the chunks were captured (i.e.
-  ///                      the i-th column in each host_data_representation
-  ///                      corresponds to @c column_names[i]).
-  /// \param file_paths    Resolved file paths captured at pin time.
+  /// \param cache_info    Cache identity plus the cached columns and their
+  ///                      @c column_ids-aligned names (the i-th column in each
+  ///                      host_data_representation corresponds to
+  ///                      @c cache_info.column_names()[i]); drives cache-hit matching.
   /// \param host_chunks   One host_data_representation per emitted batch.
-  /// \param memory_space  Host memory space the chunks reside in.
-  /// \param is_partial    True when the caller capped row capture below the full file
-  ///                      content (e.g. pin_table n_rows budget). Partial entries
-  ///                      must NOT serve cached reads — see pinned_entry::is_partial.
+  /// \param memory_space  Representative host memory space the chunks reside in
+  ///                      (metadata only; each chunk carries its own per-GPU
+  ///                      NUMA-local memory_space).
   void insert_pinned_entry_host(
     const std::string& name,
     cache_entry_info cache_info,
