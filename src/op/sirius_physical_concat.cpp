@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_concat.hpp"
 
+#include "data/data_batch_utils.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -68,12 +69,8 @@ sirius_physical_concat::sirius_physical_concat(duckdb::vector<sirius::logical_ty
   }
 }
 
-std::optional<task_creation_hint> sirius_physical_concat::get_next_task_hint(
-  std::optional<std::size_t> /* downstream_request */)
+std::optional<task_creation_hint> sirius_physical_concat::get_next_task_hint()
 {
-  // Concat is FAN_IN: combine_upstream_request ignores downstream requests for this relation, so
-  // we intentionally don't forward it. The local barrier semantics (PARTIAL vs concat-all)
-  // already encode the right upstream demand.
   std::lock_guard<std::mutex> lg(lock);
 
   if (ports.size() != 1) {
@@ -86,15 +83,13 @@ std::optional<task_creation_hint> sirius_physical_concat::get_next_task_hint(
   // If the source pipeline is done, we're ready to process whatever data remains
   if (pipeline_finished) {
     if (port_ptr->repo->total_size() > 0) {
-      return task_creation_hint{TaskCreationHint::READY, this, task_creation_hint::ALL_TASKS};
+      return task_creation_hint{TaskCreationHint::READY, this};
     }
     return std::nullopt;
   } else if (_concat_all) {
-    // if we need to concat all then we need to wait for the pipeline to be finished — concat-all
-    // requires every upstream batch before we can do anything, so request ALL_TASKS.
+    // if we need to concat all then we need to wait for the pipeline to be finished
     return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA,
-                              &(port_ptr->src_pipeline->get_operators()[0].get()),
-                              task_creation_hint::ALL_TASKS};
+                              &(port_ptr->src_pipeline->get_operators()[0].get())};
   }
 
   // Source pipeline still running — check if there is enough data to fire a task early.
@@ -113,14 +108,10 @@ std::optional<task_creation_hint> sirius_physical_concat::get_next_task_hint(
         // This batch pushes us over the threshold — the loop would stop here.
         // If we already accumulated batches (pulled_count > 0), the overflowing batch stays,
         // so there is at least one batch left after the pull.
-        if (pulled_count > 0) {
-          return task_creation_hint{TaskCreationHint::READY, this, task_creation_hint::ALL_TASKS};
-        }
+        if (pulled_count > 0) { return task_creation_hint{TaskCreationHint::READY, this}; }
         // If nothing was accumulated yet, the single oversized batch itself would be pulled,
         // and remaining data is everything after it.
-        if (batch_ids.size() > 1) {
-          return task_creation_hint{TaskCreationHint::READY, this, task_creation_hint::ALL_TASKS};
-        }
+        if (batch_ids.size() > 1) { return task_creation_hint{TaskCreationHint::READY, this}; }
         break;
       } else {
         pulled_count++;
@@ -128,11 +119,9 @@ std::optional<task_creation_hint> sirius_physical_concat::get_next_task_hint(
     }
   }
 
-  // Not enough data yet — wait for more from the source pipeline. Concat operates incrementally
-  // (PARTIAL-barrier semantics): a small batch of upstream tasks is enough to make progress.
+  // Not enough data yet — wait for more from the source pipeline
   return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA,
-                            &(port_ptr->src_pipeline->get_operators()[0].get()),
-                            task_creation_hint::PARTIAL_BARRIER_DEFAULT_TASKS};
+                            &(port_ptr->src_pipeline->get_operators()[0].get())};
 }
 
 std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data()

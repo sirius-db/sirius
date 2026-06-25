@@ -56,14 +56,10 @@ class sirius_physical_parquet_scan : public sirius_physical_operator {
                                sirius_physical_table_scan* physical_table_scan,
                                std::vector<int> gpu_device_ids = {});
 
-  std::optional<task_creation_hint> get_next_task_hint(
-    std::optional<std::size_t> downstream_request = std::nullopt) override
+  std::optional<task_creation_hint> get_next_task_hint() override
   {
     if (exhausted.load()) { return std::nullopt; }
-    // Sources have no upstream; honor an explicit downstream request when given so a downstream
-    // PIPELINE/PARTIAL barrier doesn't force the scan to drain its entire split queue.
-    std::size_t cap = downstream_request.value_or(task_creation_hint::ALL_TASKS);
-    return task_creation_hint{TaskCreationHint::READY, this, cap};
+    return task_creation_hint{TaskCreationHint::READY, this};
   }
 
   //! The table function

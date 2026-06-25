@@ -151,8 +151,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   std::unique_ptr<operator_data> get_next_task_input_data_for_build_probe();
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
-  std::optional<task_creation_hint> get_next_task_hint(
-    std::optional<std::size_t> downstream_request = std::nullopt) override;
+  std::optional<task_creation_hint> get_next_task_hint() override;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
