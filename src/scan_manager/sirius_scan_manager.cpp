@@ -45,9 +45,9 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/span.hpp>
 
-#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <rmm/cuda_device.hpp>
 
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
