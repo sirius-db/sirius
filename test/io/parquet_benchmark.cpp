@@ -152,7 +152,11 @@ int main(int argc, char** argv)
   cudaFree(nullptr);
 
   rmm::mr::cuda_async_memory_resource async_mr;
-  rmm::mr::set_current_device_resource(&async_mr);
+  // set_current_device_resource now takes an owning any_resource by value; wrap
+  // a non-owning ref to our stack resource (kept alive for the run) so we don't
+  // hand over ownership.
+  rmm::mr::set_current_device_resource(
+    cuda::mr::any_resource<cuda::mr::device_accessible>{rmm::device_async_resource_ref{async_mr}});
 
   auto time_ms = [](auto fn) -> double {
     auto t0 = std::chrono::high_resolution_clock::now();
@@ -286,7 +290,7 @@ int main(int argc, char** argv)
     constexpr size_t INFLIGHT_BUDGET_CHUNKS = 2048;
     constexpr size_t POOL_CAPACITY =
       static_cast<size_t>(POOL_MAX_SLABS) *
-      static_cast<size_t>(sirius::io::cache::buffer_pool::CHUNKS_PER_SLAB) * sirius::io::CHUNK_SIZE;
+      static_cast<size_t>(sirius::io::cache::buffer_pool::CHUNKS_PER_SLAB) * (1 << 20);
 
     cucascade::memory::numa_region_pinned_host_memory_resource upstream(0, /*make_portable=*/true);
     cucascade::memory::fixed_size_host_memory_resource host_mr(
@@ -294,11 +298,9 @@ int main(int argc, char** argv)
       upstream,                                                              // upstream allocator
       POOL_CAPACITY,                                                         // mem_limit
       POOL_CAPACITY,                                                         // capacity
-      sirius::io::CHUNK_SIZE,                                                // block_size = 1 MiB
+      1 << 20,                                                               // block_size = 1 MiB
       static_cast<size_t>(sirius::io::cache::buffer_pool::CHUNKS_PER_SLAB),  // pool_size
       1);                                                                    // initial_pools
-
-    sirius::io::cache::buffer_pool pool(host_mr, POOL_MAX_SLABS);
 
     auto uring_ctx = std::make_shared<sirius::io::uring::uring_reactor::reactor_context>(
       sirius::io::uring::uring_reactor::reactor_config_type{.bounce_size =
@@ -306,6 +308,7 @@ int main(int argc, char** argv)
       &host_mr);
     auto io_ctx =
       std::make_shared<sirius::io::uring::uring_ioctx>(n_reactors, std::move(uring_ctx));
+    io_ctx->start();
     // io_ctx->initialize_cache(pool, INFLIGHT_BUDGET_CHUNKS);
 
     std::vector<std::unique_ptr<cudf::io::datasource>> sources;
