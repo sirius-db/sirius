@@ -456,15 +456,21 @@ concept cached_chunk_pointer = requires(const P& p) {
 // (callers apply lifecycle side effects on the result).  Accepts any contiguous
 // range (vector, span, array, …) of cached_chunk pointer handles (raw / shared /
 // unique, const or not); the returned pointers preserve the handle's constness.
+//
+// @p chunk_size is the fixed chunk size the chunks were laid out with — pass
+// the backing buffer_pool's chunk_bytes() so the alignment arithmetic matches.
 template <std::ranges::contiguous_range Chunks>
   requires cached_chunk_pointer<std::ranges::range_value_t<Chunks>>
 [[nodiscard]] std::vector<
   decltype(std::to_address(std::declval<const std::ranges::range_value_t<Chunks>&>()))>
-find_entry(const Chunks& chunks, std::size_t offset, std::size_t size, coverage_policy policy)
+find_entry(const Chunks& chunks,
+           std::size_t offset,
+           std::size_t size,
+           coverage_policy policy,
+           std::size_t chunk_size)
 {
   using chunk_ptr_t =
     decltype(std::to_address(std::declval<const std::ranges::range_value_t<Chunks>&>()));
-  constexpr std::size_t chunk_size = 1 << 20;  // must match buffer_pool's chunk size
   if (size == 0) return {};
 
   auto const first        = std::ranges::begin(chunks);

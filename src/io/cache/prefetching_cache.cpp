@@ -254,11 +254,12 @@ std::vector<cached_chunk*> prefetching_cache::file_entry::update_and_get_chunks(
 
 std::vector<cached_chunk*> prefetching_cache::file_entry::fetch_chunks(std::size_t offset,
                                                                        std::size_t size,
-                                                                       coverage_policy policy) const
+                                                                       coverage_policy policy,
+                                                                       std::size_t chunk_size) const
 {
   std::shared_lock lock(mtx);
 
-  auto result = find_entry(chunks, offset, size, policy);
+  auto result = find_entry(chunks, offset, size, policy, chunk_size);
   return result;
 }
 
@@ -373,7 +374,8 @@ bool prefetching_cache::host_read_from_cache_only(const sirius_io_object& obj,
   std::vector<cached_chunk*> chunks;
   if (out_handle && *out_handle) {
     auto& requested_chunks = out_handle->get_context()->chunks;
-    chunks                 = find_entry(requested_chunks, offset, size, coverage_policy::full);
+    chunks =
+      find_entry(requested_chunks, offset, size, coverage_policy::full, _pool->chunk_bytes());
   } else {
     file_entry* file = nullptr;
     {
@@ -381,7 +383,9 @@ bool prefetching_cache::host_read_from_cache_only(const sirius_io_object& obj,
       auto it = _file_cache.find(obj.raw_file_cache_id());
       if (it != _file_cache.end()) { file = it->second.get(); }
     }
-    if (file) { chunks = file->fetch_chunks(offset, size, coverage_policy::full); }
+    if (file) {
+      chunks = file->fetch_chunks(offset, size, coverage_policy::full, _pool->chunk_bytes());
+    }
   }
 
   while (!chunks.empty()) {
@@ -457,11 +461,13 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const sirius
   chunks.reserve(n_chunks);
   if (out_handle && *out_handle) {
     auto& requested_chunks = out_handle->get_context()->chunks;
-    chunks                 = find_entry(requested_chunks, offset, size, policy);
+    chunks = find_entry(requested_chunks, offset, size, policy, _pool->chunk_bytes());
   } else {
     std::shared_lock lk(_map_mtx);
     auto it = _file_cache.find(obj.raw_file_cache_id());
-    if (it != _file_cache.end()) { chunks = it->second->fetch_chunks(offset, size, policy); }
+    if (it != _file_cache.end()) {
+      chunks = it->second->fetch_chunks(offset, size, policy, _pool->chunk_bytes());
+    }
   }
 
   while (!chunks.empty()) {

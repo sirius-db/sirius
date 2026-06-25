@@ -134,10 +134,6 @@ class load_balancing_scan_batch_coalecer {
   }
 
  private:
-  /// The sequencer body.  Walks _slots in order; for each, drains
-  /// entries (semaphore-blocked with a poll timeout so stop_token is
-  /// observed promptly) until it hits a closure sentinel (null
-  /// datasource) or stop is requested.
   void worker_loop(std::stop_token const& stop);
 
   void process_provider_inputs(metadata_processing_state& state, std::stop_token const& stop);
