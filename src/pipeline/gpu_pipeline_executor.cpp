@@ -372,6 +372,14 @@ void gpu_pipeline_executor::manager_loop()
           new_local_state->retry_count      = next_retry_count;
           new_local_state->original_task_id = orig_task_id;
 
+          // Preserve the per-task device pin across reschedule. Dropping it lets
+          // an OOM'd partition task scatter to the wrong GPU and touch a cuco
+          // table built on another device (cudaErrorInvalidValue). Only the
+          // local_state pin needs copying; a global-state pin already survives.
+          if (cur_local && cur_local->get_preferred_device_id().has_value()) {
+            new_local_state->set_preferred_device_id(cur_local->get_preferred_device_id().value());
+          }
+
           auto new_task_id =
             _task_creator ? _task_creator->get_next_task_id() : gpu_task->get_task_id();
           auto new_task =
