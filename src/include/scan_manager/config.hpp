@@ -46,6 +46,10 @@ struct scan_manager_config {
   /// Number of uring reactor worker threads for the local-disk IO path.
   std::size_t uring_n_reactors{1};
 
+  /// Number of REST reactor worker threads for the S3/object-store IO path
+  /// (each its own libcurl event loop + connection pool).
+  std::size_t rest_n_reactors{2};
+
   /// Enable the prefetching cache on the ioctx.  When false the cache is
   /// constructed but unarmed (no background IO threads).
   bool enable_prefetch_cache{false};

@@ -153,7 +153,7 @@ factory_type make_rest_ioctx_factory(
       rest_cfg.bounce_block_size = host_mr != nullptr ? host_mr->get_block_size() : 0;
       auto ctx                   = std::make_shared<rest::rest_reactor::reactor_context>(
         std::move(rest_cfg), std::move(authorizer), host_mr);
-      return std::make_shared<rest::rest_ioctx>(config.uring_n_reactors, std::move(ctx));
+      return std::make_shared<rest::rest_ioctx>(config.rest_n_reactors, std::move(ctx));
     } catch (const std::exception& e) {
       SIRIUS_LOG_ERROR("make_rest_ioctx_factory: construction failed: {}", e.what());
       return nullptr;

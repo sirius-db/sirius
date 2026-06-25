@@ -146,6 +146,7 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
   r.optional("use_sirius_datasource", opt.use_sirius_datasource);
   r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});
+  r.optional("rest_n_reactors", opt.rest_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("enable_prefetch_cache", opt.enable_prefetch_cache);
   r.optional("prefetch_buffer_pool_bytes", yaml::bytes(opt.prefetch_buffer_pool_bytes));
   if (auto n = r.optional_node("local")) sirius::from_yaml(*n, opt.local);
