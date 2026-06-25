@@ -134,7 +134,7 @@ class duckdb_native_batch_coalecer : public batch_coalecer {
   {
     auto split           = std::make_unique<duckdb_native_scan_info>();
     split->row_groups    = std::move(_acc);
-    split->datasource    = _datasource;
+    split->datasource    = _datasource->duplicate();
     split->block_manager = _block_manager;
     _acc.clear();
     _acc_bytes = 0;

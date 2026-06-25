@@ -28,11 +28,6 @@ struct config {
   bool use_odirect{true};
 
   std::size_t max_n_chunks{16};
-
-  /// io_uring submission-queue depth (entries).  0 means use the reactor's
-  /// compiled-in default.  Increasing this allows more I/O requests to be
-  /// in flight simultaneously before the kernel must be notified.
-  unsigned ring_entries{0};
 };
 
 }  // namespace sirius::io::uring

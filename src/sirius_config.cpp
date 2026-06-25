@@ -124,7 +124,6 @@ static void from_yaml(const YAML::Node& node, sirius::io::uring::config& opt)
   r.optional("bounce_size", yaml::bytes(opt.bounce_size));
   r.optional("use_odirect", opt.use_odirect);
   r.optional("max_n_chunks", opt.max_n_chunks);
-  r.optional("ring_entries", opt.ring_entries, yaml::greater_than<unsigned>{0});
   r.reject_unknown();
 }
 
