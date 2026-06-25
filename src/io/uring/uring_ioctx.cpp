@@ -22,20 +22,8 @@
 
 namespace sirius::io::uring {
 
-uring_ioctx::uring_ioctx(size_t n_reactors,
-                         cucascade::memory::fixed_size_host_memory_resource& mr,
-                         bool use_odirect)
-  : uring_ioctx(std::make_shared<uring_reactor::reactor_context>(
-                  uring_reactor::reactor_config_type{.bounce_size = mr.get_block_size(),
-                                                     .use_odirect = use_odirect},
-                  &mr),
-                n_reactors)
-{
-}
-
-uring_ioctx::uring_ioctx(const std::shared_ptr<uring_reactor::reactor_context>& ctx,
-                         size_t n_reactors)
-  : templated_ioctx<uring_reactor>(n_reactors, [ctx, i = 0]() mutable {
+uring_ioctx::uring_ioctx(size_t n_reactors, std::shared_ptr<uring_reactor::reactor_context> ctx)
+  : templated_ioctx<uring_reactor>(n_reactors, [ctx = std::move(ctx), i = 0]() mutable {
       return std::make_unique<uring_reactor>(ctx, fmt::format("reactor-{}", i++));
     })
 {

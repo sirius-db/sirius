@@ -31,22 +31,13 @@ namespace sirius::io::uring {
  */
 class uring_ioctx : public templated_ioctx<uring_reactor> {
  public:
-  /// Each @c uring_reactor in the pool allocates its bounce slots from
-  /// @p mr; @p mr must outlive this ioctx.  The bounce-slot size is taken
-  /// from @c mr.get_block_size().  When @p use_odirect is false, every read
-  /// path except the BYO-device-buffer read goes through the buffered (page
-  /// cache) file handle instead of O_DIRECT.
-  uring_ioctx(size_t n_reactors,
-              cucascade::memory::fixed_size_host_memory_resource& mr,
-              bool use_odirect = true);
+  /// Build a pool of @p n_reactors reactors, all sharing @p ctx (one context
+  /// per pool: it carries the per-reactor @c config and the pinned bounce-staging
+  /// resource, which must outlive this ioctx).  The ioctx config is sourced from
+  /// the reactors themselves — see @c templated_ioctx.
+  uring_ioctx(size_t n_reactors, std::shared_ptr<uring_reactor::reactor_context> ctx);
 
   [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::uring; }
-
- private:
-  /// Delegated-to target: build the reactor pool from a shared context (one
-  /// context shared across all reactors).  The public constructor assembles the
-  /// context from its arguments and forwards here.
-  uring_ioctx(const std::shared_ptr<uring_reactor::reactor_context>& ctx, size_t n_reactors);
 };
 
 }  // namespace sirius::io::uring

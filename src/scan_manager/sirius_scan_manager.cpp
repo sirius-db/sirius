@@ -190,8 +190,16 @@ sirius_scan_manager::sirius_scan_manager(
   // talk to.  kvikio_context wraps cudf::io::datasource so the read path
   // is identical from the caller's point of view.
   if (_config.use_sirius_datasource) {
-    _io_ctx = std::make_shared<sirius::io::uring::uring_ioctx>(
-      _config.uring_n_reactors, *host_mrs.front(), _config.local.use_odirect);
+    // One reactor_context shared by the whole pool: it carries the per-reactor
+    // config (bounce-slot size taken from the staging resource's block size)
+    // and the pinned bounce-staging resource itself, which outlives the ioctx.
+    auto* host_mr  = &*host_mrs.front();
+    auto uring_ctx = std::make_shared<sirius::io::uring::uring_reactor::reactor_context>(
+      sirius::io::uring::uring_reactor::reactor_config_type{
+        .bounce_size = host_mr->get_block_size(), .use_odirect = _config.local.use_odirect},
+      host_mr);
+    _io_ctx = std::make_shared<sirius::io::uring::uring_ioctx>(_config.uring_n_reactors,
+                                                               std::move(uring_ctx));
     SIRIUS_LOG_DEBUG("[sirius_scan_manager] sirius_datasource enabled (uring_ioctx n_reactors={})",
                      _config.uring_n_reactors);
   } else {

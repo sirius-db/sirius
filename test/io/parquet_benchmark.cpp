@@ -300,8 +300,12 @@ int main(int argc, char** argv)
 
     sirius::io::cache::buffer_pool pool(host_mr, POOL_MAX_SLABS);
 
-    auto io_ctx = std::make_shared<sirius::io::uring::uring_ioctx>(
-      n_reactors, 2 * sirius::io::NUM_CHUNKS, host_mr);
+    auto uring_ctx = std::make_shared<sirius::io::uring::uring_reactor::reactor_context>(
+      sirius::io::uring::uring_reactor::reactor_config_type{.bounce_size =
+                                                              host_mr.get_block_size()},
+      &host_mr);
+    auto io_ctx =
+      std::make_shared<sirius::io::uring::uring_ioctx>(n_reactors, std::move(uring_ctx));
     // io_ctx->initialize_cache(pool, INFLIGHT_BUDGET_CHUNKS);
 
     std::vector<std::unique_ptr<cudf::io::datasource>> sources;
