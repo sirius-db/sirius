@@ -370,9 +370,17 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
 
   // FLBA-decimal pushdown probe: cudf's row-group stats filter cannot compare a
   // fixed_point_scalar AST literal against FLBA / BYTE_ARRAY decimal stats, so
-  // pushdown is disabled for such files (the filter still applies post-decode).
+  // reader-side pushdown is disabled when such a decimal is among the columns
+  // this scan reads (the filter still applies post-decode).
+  bool const restrict_to_scanned = _plan->is_projected();
+  std::unordered_set<std::string> scanned_column_names;
+  if (restrict_to_scanned) {
+    auto const names = _plan->data_column_names();
+    scanned_column_names.insert(names.begin(), names.end());
+  }
   bool disable_filter_pushdown = false;
   for (auto const& elem : metadata.schema) {
+    if (restrict_to_scanned && !scanned_column_names.contains(elem.name)) { continue; }
     bool const is_decimal = (elem.converted_type.has_value() &&
                              *elem.converted_type == cudf::io::parquet::ConvertedType::DECIMAL) ||
                             (elem.logical_type.has_value() &&
