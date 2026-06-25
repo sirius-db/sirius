@@ -39,21 +39,30 @@
 extern "C" int cudaProfilerStart();
 extern "C" int cudaProfilerStop();
 #include "data/sirius_converter_registry.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/assert.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
+#include "duckdb/function/function_set.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension_callback_manager.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/relation.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/parser/column_list.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "duckdb/storage/storage_manager.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 // #include "from_substrait.hpp"
@@ -63,7 +72,10 @@ extern "C" int cudaProfilerStop();
 #include "gpu_physical_plan_generator.hpp"
 #endif
 #include "duckdb/main/connection_manager.hpp"
+#include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
+#include "op/scan/duckdb_native_gpu_ingestible.hpp"
+#include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "pin_table.hpp"
 #include "sirius_context.hpp"
@@ -792,6 +804,140 @@ struct PinTableFunctionData : public TableFunctionData {
   bool finished = false;
 };
 
+namespace {
+
+// Resolve the kept-column logical indices for a pin: the positions of the
+// user-requested @p cols within @p schema_names (preserving requested order), or
+// identity over all columns when @p cols is absent/empty.
+std::vector<std::size_t> resolve_pin_kept_indices(
+  std::vector<std::string> const& schema_names, std::optional<std::vector<std::string>> const& cols)
+{
+  std::vector<std::size_t> keep;
+  if (cols && !cols->empty()) {
+    std::unordered_map<std::string, std::size_t> pos;
+    pos.reserve(schema_names.size());
+    for (std::size_t i = 0; i < schema_names.size(); ++i) {
+      pos.emplace(schema_names[i], i);
+    }
+    for (auto const& c : *cols) {
+      auto it = pos.find(c);
+      if (it == pos.end()) {
+        throw InvalidInputException("pin_table: column '" + c + "' not found in table schema");
+      }
+      keep.push_back(it->second);
+    }
+  } else {
+    keep.resize(schema_names.size());
+    for (std::size_t i = 0; i < schema_names.size(); ++i) {
+      keep[i] = i;
+    }
+  }
+  return keep;
+}
+
+// Build the table_info for a parquet pin. It drives the ingestible read and is the
+// source cache_entry_info::from reads to build the pinned entry's cache descriptor:
+// it carries the FULL schema in names/returned_types (build_scan_plan indexes them
+// by primary index) plus projection_ids when a column subset is pinned, from which
+// cache_entry_info::from derives the column_ids-aligned names the gather needs.
+std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_pin_info(
+  sirius::scan_manager::sirius_scan_manager& scan_mgr,
+  std::vector<std::string> const& file_paths,
+  std::optional<std::vector<std::string>> const& cols,
+  std::size_t batch_size)
+{
+  using sirius::op::scan::parquet_ingestible_table_info;
+  auto desc = scan_mgr.describe_parquet(file_paths.front());
+  std::vector<std::string> schema_names(desc.names.begin(), desc.names.end());
+  auto keep            = resolve_pin_kept_indices(schema_names, cols);
+  bool const is_subset = cols && !cols->empty();
+
+  auto info                 = std::make_unique<parquet_ingestible_table_info>();
+  info->resolved_file_paths = file_paths;
+  info->returned_types      = sirius::from_duckdb_vec(desc.return_types);  // full schema
+  info->names               = desc.names;                                  // full schema
+  for (auto idx : keep) {
+    info->column_ids.emplace_back(duckdb::ColumnIndex(static_cast<duckdb::idx_t>(idx)));
+  }
+  if (is_subset) {
+    // Non-empty projection_ids forces scan_plan::is_projected() so the cudf reader
+    // projects to exactly the pinned columns (identity into column_ids).
+    for (std::size_t k = 0; k < keep.size(); ++k) {
+      info->projection_ids.push_back(static_cast<duckdb::idx_t>(k));
+    }
+  }
+  info->scan_output_arity      = keep.size();
+  info->approximate_batch_size = batch_size;
+  return info;
+}
+
+// Resolve an attached duckdb table from the catalog and build its table_info for a
+// pin. The .db must be ATTACHed. The pin captures the table's (catalog, schema,
+// table) name from the resolved DuckTableEntry; that name tuple must match what a
+// later query's scan derives, because it is the cache identity
+// (cache_entry_info::can_serve_with_columns) — not the DataTable* pointer. A single
+// info serves both the read and the cached entry.
+std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duckdb_pin_info(
+  ClientContext& context,
+  std::string const& table_ref,
+  std::string const& schema_override,
+  std::optional<std::vector<std::string>> const& cols,
+  std::size_t batch_size)
+{
+  using sirius::op::scan::duckdb_native_ingestible_table_info;
+
+  // 'table_ref' is the (optionally schema/catalog-qualified) table name. Resolve it
+  // through the catalog honoring the client's search path — so a bare name picks up
+  // the current/USE'd database — yielding the same DataTable* a query-time scan binds.
+  auto const qname          = duckdb::QualifiedName::Parse(table_ref);
+  std::string const catalog = qname.catalog;  // empty => search path
+  std::string const schema  = !qname.schema.empty() ? qname.schema : schema_override;
+  std::string const& table  = qname.name;
+
+  // Non-template catalog lookup + Cast (mirroring the pipeline converter). The
+  // templated Catalog::GetEntry<DuckTableEntry> would ODR-use DuckTableEntry::Name
+  // (a static constexpr inherited from TableCatalogEntry), emitting a duplicate
+  // symbol against libduckdb_static at link time.
+  auto& entry_base =
+    duckdb::Catalog::GetEntry(context, duckdb::CatalogType::TABLE_ENTRY, catalog, schema, table);
+  auto& entry         = entry_base.Cast<duckdb::DuckTableEntry>();
+  auto& storage       = entry.GetStorage();
+  auto const& columns = entry.GetColumns();
+  auto schema_names   = columns.GetColumnNames();  // logical order
+  auto schema_types   = columns.GetColumnTypes();  // logical order
+
+  auto keep            = resolve_pin_kept_indices(schema_names, cols);
+  auto const canonical = storage.GetAttached().GetStorageManager().GetDBPath();
+
+  auto info     = std::make_unique<duckdb_native_ingestible_table_info>();
+  info->storage = &storage;
+  info->context = &context;
+  info->db_path = canonical;
+  // Qualified-name identity for the pin cache — derived from the resolved
+  // DuckTableEntry so it matches the query-side derivation (the pipeline converter).
+  info->catalog_name           = entry.ParentCatalog().GetName();
+  info->schema_name            = entry.ParentSchema().name;
+  info->table_name             = entry.name;
+  info->approximate_batch_size = batch_size;
+  // Full-schema names (logical order) so column_names() can derive the
+  // column_ids-aligned view; the decoder itself ignores names.
+  info->names.assign(schema_names.begin(), schema_names.end());
+  info->returned_types = sirius::from_duckdb_vec(schema_types);
+  for (auto col : keep) {
+    info->column_ids.emplace_back(duckdb::ColumnIndex(static_cast<duckdb::idx_t>(col)));
+    sirius::op::scan::projected_column pc;
+    pc.is_rowid    = false;
+    pc.storage_idx = duckdb::StorageIndex(static_cast<duckdb::idx_t>(col));
+    info->projected_cols.push_back(pc);
+    auto t = sirius::from_duckdb(schema_types[col]);
+    info->projected_types.push_back(t);
+    info->output_types.push_back(t);
+  }
+  return info;
+}
+
+}  // namespace
+
 unique_ptr<FunctionData> SiriusExtension::PinTableBind(ClientContext& context,
                                                        TableFunctionBindInput& input,
                                                        vector<LogicalType>& return_types,
@@ -799,10 +945,11 @@ unique_ptr<FunctionData> SiriusExtension::PinTableBind(ClientContext& context,
 {
   auto result = make_uniq<PinTableFunctionData>();
 
-  if (input.inputs.empty() || input.inputs[0].IsNull()) {
-    throw BinderException("pin_table requires a non-null path argument");
+  // The positional path is optional: parquet uses it (file/glob); duckdb takes no
+  // positional (its table is named by 'name' and resolved from the catalog).
+  if (!input.inputs.empty() && !input.inputs[0].IsNull()) {
+    result->args.path = input.inputs[0].ToString();
   }
-  result->args.path = input.inputs[0].ToString();
 
   auto tier_it = input.named_parameters.find("tier");
   if (tier_it == input.named_parameters.end() || tier_it->second.IsNull()) {
@@ -832,9 +979,49 @@ unique_ptr<FunctionData> SiriusExtension::PinTableBind(ClientContext& context,
     result->args.cols = std::move(cols);
   }
 
-  auto n_rows_it = input.named_parameters.find("n_rows");
-  if (n_rows_it != input.named_parameters.end() && !n_rows_it->second.IsNull()) {
-    result->args.n_rows = n_rows_it->second.GetValue<int64_t>();
+  // Resolve the source format: an explicit 'format' parameter, else inferred from
+  // the path extension (.parquet -> parquet, .db/.duckdb -> duckdb).
+  auto to_lower = [](std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
+    return s;
+  };
+  auto ends_with = [](std::string const& s, std::string_view suffix) {
+    return s.size() >= suffix.size() &&
+           s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+  };
+  auto format_it = input.named_parameters.find("format");
+  if (format_it != input.named_parameters.end() && !format_it->second.IsNull()) {
+    result->args.format = to_lower(format_it->second.ToString());
+    if (result->args.format != "parquet" && result->args.format != "duckdb") {
+      throw BinderException("pin_table 'format' must be 'parquet' or 'duckdb', got '" +
+                            result->args.format + "'");
+    }
+  } else if (!result->args.path.empty()) {
+    auto lowered = to_lower(result->args.path);
+    if (ends_with(lowered, ".parquet")) {
+      result->args.format = "parquet";
+    } else if (ends_with(lowered, ".db") || ends_with(lowered, ".duckdb")) {
+      result->args.format = "duckdb";
+    } else {
+      throw BinderException("pin_table: cannot infer format from path '" + result->args.path +
+                            "'; pass format => 'parquet' or 'duckdb'");
+    }
+  } else {
+    throw BinderException("pin_table: provide a positional path (parquet) or format => 'duckdb'");
+  }
+
+  if (result->args.format == "parquet") {
+    if (result->args.path.empty()) {
+      throw BinderException("pin_table: format 'parquet' requires a positional path argument");
+    }
+  } else {
+    // duckdb: 'name' is the (optionally qualified) table to pin, resolved from the
+    // catalog — no path needed. 'schema' is a SQL reserved word, so the optional
+    // schema override is the 'schema_name' parameter.
+    auto schema_it = input.named_parameters.find("schema_name");
+    if (schema_it != input.named_parameters.end() && !schema_it->second.IsNull()) {
+      result->args.schema = schema_it->second.ToString();
+    }
   }
 
   return_types.emplace_back(LogicalType::BOOLEAN);
@@ -854,13 +1041,11 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     throw InvalidInputException("pin_table requires the Sirius context to be initialized");
   }
 
-  // The cudf reader places parquet chunks on whichever GPU is current at
-  // read_chunk() time; round-robin the file reads across all GPU memory spaces
-  // so multi-file pin_table calls distribute their chunks evenly. Each file's
-  // chunks all bind to the same GPU (per-file binding — see comment at
-  // chunk_idx increment below). For tier='host' we additionally convert each
-  // table to a host_data_representation (via the GPU↔HOST converter) so the
-  // pinned data lives in pinned host memory.
+  // The read is driven by sirius::materialize_all_batches (pin_table.cpp), which
+  // round-robins the materialized batches across all GPU memory spaces so a pin
+  // distributes its chunks evenly. For tier='host' each materialized GPU table is
+  // then converted to a host_data_representation (via the GPU<->HOST converter) so
+  // the pinned data lives in pinned host memory.
   auto& memory_manager = sirius_ctx->get_memory_manager();
   auto gpu_spaces      = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   if (gpu_spaces.empty()) {
@@ -898,162 +1083,69 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     }
   }
 
-  // Glob the user-supplied path into concrete files.
-  auto& fs   = FileSystem::GetFileSystem(context);
-  auto files = fs.GlobFiles(data.args.path);
-  std::vector<std::string> file_paths;
-  file_paths.reserve(files.size());
-  for (auto& f : files) {
-    file_paths.push_back(f.path);
-  }
-
-  // Only parquet files are supported. Validate by extension before reading.
-  auto has_parquet_ext = [](std::string const& p) {
-    constexpr std::string_view kExt = ".parquet";
-    if (p.size() < kExt.size()) { return false; }
-    auto tail = p.substr(p.size() - kExt.size());
-    std::transform(
-      tail.begin(), tail.end(), tail.begin(), [](unsigned char c) { return std::tolower(c); });
-    return tail == kExt;
-  };
-  for (auto const& path : file_paths) {
-    if (!has_parquet_ext(path)) {
-      throw InvalidInputException("pin_table only supports parquet files, got non-parquet path: " +
-                                  path);
-    }
-  }
-
-  std::vector<std::string> cols =
-    data.args.cols.has_value() ? *data.args.cols : std::vector<std::string>{};
-
-  // Chunk read limit (target bytes per emitted batch) comes from operator_params.
-  std::size_t const chunk_read_limit =
+  auto& scan_mgr = sirius_ctx->get_scan_manager();
+  std::size_t const batch_size =
     sirius_ctx->get_config().get_operator_params().scan_task_batch_size;
 
-  // Read each file via cudf::chunked_parquet_reader so each emitted batch stays within
-  // chunk_read_limit bytes. The optional n_rows budget caps the cumulative row count
-  // across files; once exhausted, stop early.
-  std::vector<std::unique_ptr<cudf::table>> tables;
-  // Parallel vector to tables — chunk_memory_spaces[i] is the memory_space*
-  // for the i-th cudf::table in tables. Consumed by insert_pinned_entry's
-  // precondition check (size==data_tables.size).
-  std::vector<cucascade::memory::memory_space*> chunk_memory_spaces;
-  // HOST-tier storage: one host_data_representation per chunk.
-  std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;
-  std::vector<std::string> read_column_names;  // captured from parquet metadata
-  int64_t remaining_rows = data.args.n_rows.value_or(-1);
-  // Per-call local counter (NOT std::atomic, NOT global). PinTableFunction is
-  // single-threaded; new pin_table calls restart at chunk 0 → GPU 0 for
-  // reproducibility.
-  std::size_t chunk_idx = 0;
-
-  // For tier='host' the full table may not fit in GPU memory, so each batch is downgraded
-  // to a pinned host_data_representation immediately and the GPU buffers are released
-  // before the next read_chunk(). The GPU↔HOST converter uses cudaMemcpyBatchAsync which
-  // requires a real, non-default stream. Streams are constructed lazily inside the
-  // per-file loop under the device guard so each cuda_stream binds to its target GPU's
-  // context — a single pre-created stream binds to whichever device was current when
-  // emplaced and would route D2H copies through the wrong device for round-robin files
-  // that land on GPU 1+.
-  cucascade::representation_converter_registry* registry_ptr = nullptr;
-  std::unordered_map<int, rmm::cuda_stream> pin_streams_by_gpu;
-  if (data.args.tier == "host") { registry_ptr = &sirius::converter_registry::get(); }
-
-  for (auto const& path : file_paths) {
-    if (data.args.n_rows.has_value() && remaining_rows <= 0) { break; }
-
-    // Bind device BEFORE constructing chunked_parquet_reader so the cudf
-    // allocator places footer + decompress + column buffers on the intended
-    // GPU.
-    auto* target_space =
-      const_cast<cucascade::memory::memory_space*>(gpu_spaces[chunk_idx % gpu_spaces.size()]);
-    int target_gpu_id = target_space->get_device_id();
-    rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{target_gpu_id}};
-
-    // Route the chunked_parquet_reader through the per-GPU sirius_ioctx
-    // instead of cudf's bundled file_source factory (kvikio). The string-form
-    // source_info routes reads through libkvikio's FileHandle which binds a
-    // single CUDA context per file, breaking multi-GPU residency (the columns
-    // end up on the wrong GPU under sanitizer races). Use of sirius_ioctx is
-    // mandatory whenever more than one GPU is configured — enforced upstream
-    // by sirius_config::enforce_sirius_datasource_for_multi_gpu().
-    auto& scan_mgr  = sirius_ctx->get_scan_manager();
-    auto datasource = scan_mgr.create_datasource(path);
-    if (!datasource) {
-      throw InvalidInputException("pin_table: no IO backend supports path: " + path);
-    }
-
-    auto file_opts =
-      cudf::io::parquet_reader_options::builder(cudf::io::source_info{datasource.get()}).build();
-    if (!cols.empty()) { file_opts.set_column_names(cols); }
-    if (data.args.n_rows.has_value()) { file_opts.set_num_rows(remaining_rows); }
-
-    cudf::io::chunked_parquet_reader reader(chunk_read_limit, file_opts);
-    int64_t file_rows_read = 0;
-    while (reader.has_next()) {
-      auto chunk      = reader.read_chunk();
-      auto chunk_rows = static_cast<int64_t>(chunk.tbl->num_rows());
-      if (chunk_rows == 0) { break; }
-      if (read_column_names.empty()) {
-        read_column_names.reserve(chunk.metadata.schema_info.size());
-        for (auto const& col_info : chunk.metadata.schema_info) {
-          read_column_names.push_back(col_info.name);
-        }
-      }
-      file_rows_read += chunk_rows;
-      if (data.args.tier == "host") {
-        // Per-target-GPU stream + per-target-GPU host space: each round-robin
-        // file's chunks must record their D2H copies on a stream bound to the
-        // target GPU's context, and the destination host pinning should land
-        // on the NUMA-local host memory_space for that GPU.
-        // try_emplace default-constructs the rmm::cuda_stream when the key is
-        // missing. The default ctor calls cudaStreamCreate under whatever
-        // device is current — which is target_gpu_id by virtue of the
-        // surrounding device_guard.
-        auto [stream_it, inserted] = pin_streams_by_gpu.try_emplace(target_gpu_id);
-        (void)inserted;
-        rmm::cuda_stream_view target_stream = stream_it->second.view();
-        auto* target_host_space             = host_space_by_gpu.at(target_gpu_id);
-        cucascade::gpu_table_representation gpu_repr(
-          std::move(chunk.tbl), *target_space, target_stream);
-        auto host_repr = registry_ptr->convert<cucascade::host_data_representation>(
-          gpu_repr, target_host_space, target_stream);
-        // Sync before gpu_repr leaves scope so the async D2H copies finish before its
-        // device buffers are freed.
-        target_stream.synchronize();
-        host_chunks.emplace_back(std::move(host_repr));
-      } else {
-        tables.emplace_back(std::move(chunk.tbl));
-        chunk_memory_spaces.push_back(target_space);  // parallel to tables
-      }
-    }
-    if (data.args.n_rows.has_value()) { remaining_rows -= file_rows_read; }
-    // Per-call local counter, increments per file. All chunks within a single
-    // chunked_parquet_reader stay on the same GPU (chunks-at-index-i
-    // invariant). Cross-file alternation produces the round-robin.
-    ++chunk_idx;
+  // materialize_all_batches round-robins reads across these GPUs and reports the
+  // per-batch placement; insert_pinned_entry wants non-const memory_space*.
+  std::vector<cucascade::memory::memory_space*> gpu_spaces_mut;
+  gpu_spaces_mut.reserve(gpu_spaces.size());
+  for (auto const* s : gpu_spaces) {
+    gpu_spaces_mut.push_back(const_cast<cucascade::memory::memory_space*>(s));
   }
 
-  // A user-supplied n_rows budget caps row capture below the full file content.
-  // The scan_manager must refuse cached reuse of such partial entries — see
-  // pinned_entry::is_partial.
-  bool const is_partial_pin = data.args.n_rows.has_value();
-  auto scan_info            = std::make_unique<sirius::op::scan::parquet_ingestible_table_info>();
-  scan_info->names          = std::move(read_column_names);
-  scan_info->resolved_file_paths = std::move(file_paths);
-  // todo(bobbi)
+  // Build the ingestible (drives the metadata walk + decode) from one table_info.
+  // duckdb-native has no standalone reader, so both formats go through their
+  // gpu_ingestible — one read path.
+  std::shared_ptr<sirius::op::scan::gpu_ingestible> ingestible;
+
+  if (data.args.format == "duckdb") {
+    auto info =
+      build_duckdb_pin_info(context, data.args.name, data.args.schema, data.args.cols, batch_size);
+    ingestible = sirius::op::scan::make_ingestible(std::move(info));
+  } else {  // parquet
+    auto& fs   = FileSystem::GetFileSystem(context);
+    auto files = fs.GlobFiles(data.args.path);
+    std::vector<std::string> file_paths;
+    file_paths.reserve(files.size());
+    for (auto& f : files) {
+      file_paths.push_back(f.path);
+    }
+    if (file_paths.empty()) {
+      throw InvalidInputException("pin_table: no parquet files matched path: " + data.args.path);
+    }
+    auto info  = build_parquet_pin_info(scan_mgr, file_paths, data.args.cols, batch_size);
+    ingestible = sirius::op::scan::make_ingestible(std::move(info));
+  }
+
+  // Build the cache descriptor (table identity + column layout) from the
+  // ingestible; it is stored on the pinned entry in place of the heavyweight
+  // ingestible_table_info and drives later cache-hit matching + the gather.
+  auto cache_info = sirius::scan_manager::cache_entry_info::from(ingestible->table_info());
+
   if (data.args.tier == "host") {
-    // entry.memory_space is metadata only; each host_chunk carries its own
-    // per-GPU NUMA-local memory_space inside its host_data_representation.
-    // Pass a representative (the first round-robin GPU's host space) so the
-    // entry still has a non-null memory_space for diagnostics.
-    int const first_gpu_id          = gpu_spaces[0]->get_device_id();
+    // Stream each batch GPU->host: materialize one batch on its round-robin GPU, convert it
+    // to a pinned host_data_representation on that GPU's NUMA-local host space, then free the
+    // GPU table before materializing the next. Peak GPU residency stays at ~one batch, so the
+    // whole table never needs to fit in GPU memory. On multi-GPU the chunks land round-robin
+    // across NUMA nodes; the cached-serve path then reads each chunk back on a NUMA-local GPU.
+    auto host_chunks = sirius::materialize_pin_to_host(
+      *ingestible, gpu_spaces_mut, host_space_by_gpu, *scan_mgr.io_ctx());
+    // entry.memory_space is metadata only; each host_chunk carries its own per-GPU
+    // NUMA-local memory_space. Pass a representative (the first GPU's host space).
+    int const first_gpu_id          = gpu_spaces_mut[0]->get_device_id();
     auto* representative_host_space = host_space_by_gpu.at(first_gpu_id);
-    sirius_ctx->get_scan_manager().insert_pinned_entry_host(
-      data.args.name, std::move(scan_info), std::move(host_chunks), *representative_host_space);
+    scan_mgr.insert_pinned_entry_host(
+      data.args.name, std::move(cache_info), std::move(host_chunks), *representative_host_space);
   } else {
-    sirius_ctx->get_scan_manager().insert_pinned_entry(
-      data.args.name, std::move(scan_info), std::move(tables), std::move(chunk_memory_spaces));
+    // GPU tier: materialize every batch as a GPU-resident cudf::table (with its GPU
+    // placement) and pin them in place.
+    auto mat = sirius::materialize_all_batches(*ingestible, gpu_spaces_mut, *scan_mgr.io_ctx());
+    scan_mgr.insert_pinned_entry(data.args.name,
+                                 std::move(cache_info),
+                                 std::move(mat.tables),
+                                 std::move(mat.chunk_memory_spaces));
   }
 
   output.SetCardinality(1);
@@ -1229,12 +1321,22 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   CreateTableFunctionInfo profiler_stop_info(profiler_stop);
   catalog.CreateTableFunction(transaction, profiler_stop_info);
 
-  TableFunction pin_table("pin_table", {LogicalType::VARCHAR}, PinTableFunction, PinTableBind);
-  pin_table.named_parameters["tier"]   = LogicalType::VARCHAR;
-  pin_table.named_parameters["name"]   = LogicalType::VARCHAR;
-  pin_table.named_parameters["cols"]   = LogicalType::LIST(LogicalType::VARCHAR);
-  pin_table.named_parameters["n_rows"] = LogicalType::BIGINT;
-  CreateTableFunctionInfo pin_table_info(pin_table);
+  // pin_table takes either a positional path (parquet) or no positional (duckdb,
+  // where 'name' is the catalog table reference) — register both arities as a set.
+  TableFunctionSet pin_table_set("pin_table");
+  auto add_pin_table_overload = [&](vector<LogicalType> positional_args) {
+    TableFunction pin_table(
+      "pin_table", std::move(positional_args), PinTableFunction, PinTableBind);
+    pin_table.named_parameters["tier"]        = LogicalType::VARCHAR;
+    pin_table.named_parameters["name"]        = LogicalType::VARCHAR;
+    pin_table.named_parameters["cols"]        = LogicalType::LIST(LogicalType::VARCHAR);
+    pin_table.named_parameters["format"]      = LogicalType::VARCHAR;
+    pin_table.named_parameters["schema_name"] = LogicalType::VARCHAR;
+    pin_table_set.AddFunction(std::move(pin_table));
+  };
+  add_pin_table_overload({LogicalType::VARCHAR});
+  add_pin_table_overload({});
+  CreateTableFunctionInfo pin_table_info(pin_table_set);
   catalog.CreateTableFunction(transaction, pin_table_info);
 
   TableFunction unpin_table(

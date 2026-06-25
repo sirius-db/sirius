@@ -35,13 +35,11 @@
 #include <cudf/io/parquet.hpp>
 
 // standard library
-#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <memory>
 #include <span>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace sirius::op::scan {
@@ -75,51 +73,6 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   [[nodiscard]] std::span<std::string const> file_paths() const override
   {
     return std::span<std::string const>(resolved_file_paths.data(), resolved_file_paths.size());
-  }
-
-  [[nodiscard]] std::span<std::string const> column_names() const override { return names; }
-
-  /// True (non-empty) iff @p other reads the same set of files as this scan and
-  /// every column @p other requests is also read by this scan — i.e. this scan's
-  /// (cached) data is a superset that can serve @p other. Files are matched as a
-  /// set (order-independent); columns by primary (storage) index, as in
-  /// @c duckdb_native_ingestible_table_info.
-  ///
-  /// Returns, for each column @p other requests (in @p other's @c column_ids
-  /// order), the position of that column within THIS scan's @c column_ids — a
-  /// gather index into this scan's (cached) materialized columns that reproduces
-  /// @p other's requested layout. Returns empty when this scan cannot serve
-  /// @p other (different scan type, different file set, or a missing column).
-  [[nodiscard]] std::vector<std::size_t> can_serve_with_columns(
-    const ingestible_table_info& other) const override
-  {
-    auto const* o = dynamic_cast<parquet_ingestible_table_info const*>(&other);
-    if (o == nullptr) { return {}; }
-
-    // Same set of files (order-independent equality).
-    if (resolved_file_paths.size() != o->resolved_file_paths.size()) { return {}; }
-    auto these_files = resolved_file_paths;
-    auto those_files = o->resolved_file_paths;
-    std::sort(these_files.begin(), these_files.end());
-    std::sort(those_files.begin(), those_files.end());
-    if (these_files != those_files) { return {}; }
-
-    // Map this scan's columns by primary (storage) index → position, then build
-    // the gather projection. Every column other requests must be present.
-    std::unordered_map<duckdb::idx_t, std::size_t> this_pos;
-    this_pos.reserve(column_ids.size());
-    for (std::size_t i = 0; i < column_ids.size(); ++i) {
-      this_pos.emplace(column_ids[i].GetPrimaryIndex(), i);
-    }
-
-    std::vector<std::size_t> projection;
-    projection.reserve(o->column_ids.size());
-    for (auto const& c : o->column_ids) {
-      auto it = this_pos.find(c.GetPrimaryIndex());
-      if (it == this_pos.end()) { return {}; }  // this scan lacks a requested column
-      projection.push_back(it->second);
-    }
-    return projection;
   }
 };
 

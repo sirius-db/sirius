@@ -32,6 +32,7 @@
 
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <duckdb/common/column_index.hpp>
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/vector.hpp>
 #include <io/types.hpp>
@@ -41,6 +42,7 @@ class fixed_size_host_memory_resource;
 }  // namespace cucascade::memory
 
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -63,6 +65,7 @@ class buffer_pool;
 
 namespace sirius::op::scan {
 class sirius_gpu_scan_operator;
+class gpu_ingestible;
 }  // namespace sirius::op::scan
 
 namespace sirius::scan_manager {
@@ -75,6 +78,38 @@ class query;
 
 namespace sirius::scan_manager {
 
+/// Lightweight descriptor of a pinned table's cache identity + column layout,
+/// stored on @ref pinned_entry in place of the read-side ingestible_table_info.
+/// Captures only what serving needs — the table's identity (parquet file set OR
+/// duckdb catalog/schema/table name), the cached columns (by primary/storage
+/// index), and their names (aligned with @c column_ids) for the GPU gather — and
+/// owns the match logic that @ref sirius_scan_manager::try_assign_cached_entries consults.
+class cache_entry_info {
+ public:
+  std::vector<std::string> resolved_file_paths;    ///< parquet identity (file set)
+  std::string catalog_name;                        ///< duckdb identity: catalog (attach alias)
+  std::string schema_name;                         ///< duckdb identity: schema
+  std::string table_name;                          ///< duckdb identity: table
+  duckdb::vector<duckdb::ColumnIndex> column_ids;  ///< cached columns, by primary index
+  std::vector<std::string> names;                  ///< aligned with column_ids; gather keys
+
+  /// Build the cache descriptor from a read-side ingestible_table_info (parquet
+  /// or duckdb-native): captures the format's identity, the kept @c column_ids,
+  /// and the @c column_ids-aligned column names.
+  [[nodiscard]] static cache_entry_info from(const op::scan::ingestible_table_info& info);
+
+  /// Gather projection (positions into @c column_ids) that lets this cached entry
+  /// serve @p other — matching identity (same parquet file set / same duckdb
+  /// catalog.schema.table) AND a superset of @p other's requested columns. The projection
+  /// reproduces @p other's requested column order. Empty when this entry cannot
+  /// serve @p other (different format, identity, or a missing column).
+  [[nodiscard]] std::vector<std::size_t> can_serve_with_columns(
+    const op::scan::ingestible_table_info& other) const;
+
+  /// Column names in @c column_ids order — the keys @c data_batches_by_column uses.
+  [[nodiscard]] const std::vector<std::string>& column_names() const { return names; }
+};
+
 /**
  * @brief A single pinned-table entry, keyed by table name in the scan_manager.
  *
@@ -83,7 +118,10 @@ namespace sirius::scan_manager {
  * pinned table. The vector may be empty until splits are populated.
  */
 struct pinned_entry {
-  std::unique_ptr<op::scan::ingestible_table_info> table_info;
+  /// Cache identity + column layout for this pinned table. Drives the cache-hit
+  /// match (@ref cache_entry_info::can_serve_with_columns) and the per-column
+  /// gather; replaces the heavyweight read-side ingestible_table_info.
+  cache_entry_info cache_info;
 
   /// GPU-tier storage: one chunk vector per pinned column name. Populated by
   /// @ref sirius_scan_manager::insert_pinned_entry. Empty when @ref tier is HOST.
@@ -211,7 +249,7 @@ class sirius_scan_manager {
   ///                              content (e.g. pin_table n_rows budget). Partial entries
   ///                              must NOT serve cached reads — see pinned_entry::is_partial.
   void insert_pinned_entry(const std::string& name,
-                           std::unique_ptr<ingestible_table_info> table_info,
+                           cache_entry_info cache_info,
                            std::vector<std::unique_ptr<cudf::table>> data_tables,
                            std::vector<cucascade::memory::memory_space*> chunk_memory_spaces);
 
@@ -235,7 +273,7 @@ class sirius_scan_manager {
   ///                      must NOT serve cached reads — see pinned_entry::is_partial.
   void insert_pinned_entry_host(
     const std::string& name,
-    std::unique_ptr<ingestible_table_info> table_info,
+    cache_entry_info cache_info,
     std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
     cucascade::memory::memory_space& memory_space);
 
@@ -259,7 +297,10 @@ class sirius_scan_manager {
   /// \brief Run providers sequentially: start each, wait on its future, advance.
   void start_metadata_processing();
 
-  void try_assign_cached_entries(op::scan::sirius_gpu_scan_operator* op);
+  /// \brief Attach a cached batch_provider to @p op if a pinned entry can serve
+  ///        it. Returns true when a cache hit was assigned (the caller then skips
+  ///        the disk-reading split_provider for this operator).
+  bool try_assign_cached_entries(op::scan::sirius_gpu_scan_operator* op);
 
   scan_manager_config _config;
   /// Hardware GPU/NUMA topology, shared with the prefetching cache.  Source of

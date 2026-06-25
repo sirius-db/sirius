@@ -503,6 +503,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
+    test/cpp/integration/test_pin_table_host_streaming.cpp
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/io/s3/test_sigv4.cpp
     test/cpp/io/s3/test_s3_default_visibility_guard.cpp
@@ -552,6 +553,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_repository_wiring_materializer.cpp
     test/cpp/pipeline/test_task_scheduler.cpp
     test/cpp/scan/bench_decode_codecs.cpp
+    test/cpp/scan/test_can_serve_with_columns.cpp
     test/cpp/scan/test_duckdb_block_layout.cpp
     test/cpp/scan/test_duckdb_native_batch_coalescer.cpp
     # test/cpp/scan/test_duckdb_native_gpu_ingestible.cpp  # stale against redesigned gpu_ingestible interface and removed s3 ioctx
