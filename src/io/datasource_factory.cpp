@@ -72,8 +72,11 @@ std::shared_ptr<io::sirius_ioctx> make_kvikio_ioctx(
 // datasource_registry
 // ---------------------------------------------------------------------------
 
-io_context_registry::io_context_registry(config_type config)
-  : _config(std::move(config)), _prefer_kvikio_for_file_scheme(!_config.use_sirius_datasource)
+io_context_registry::io_context_registry(
+  config_type config, cucascade::memory::memory_reservation_manager& reservation_manager)
+  : _config(std::move(config)),
+    _reservation_manager(reservation_manager),
+    _prefer_kvikio_for_file_scheme(!_config.use_sirius_datasource)
 {
   _entries.emplace(
     io_context_type::kvikio,

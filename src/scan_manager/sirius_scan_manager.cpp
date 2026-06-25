@@ -166,7 +166,7 @@ sirius_scan_manager::sirius_scan_manager(
                  _config.thread_pool.cpu_affinity_list),
     _dispatcher(
       std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads + 1)),
-    _ioctx_registry(config)
+    _ioctx_registry(config, reservation_manager)
 {
   if (!_topology_index) {
     throw std::invalid_argument("[sirius_scan_manager] topology_index must be non-null");

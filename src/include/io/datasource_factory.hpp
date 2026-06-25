@@ -31,6 +31,10 @@ namespace sirius {
 struct sirius_config;
 }
 
+namespace cucascade::memory {
+class memory_reservation_manager;
+}
+
 namespace sirius::io {
 
 // ---------------------------------------------------------------------------
@@ -57,7 +61,15 @@ class io_context_registry {
  public:
   using config_type = scan_manager::scan_manager_config;
 
-  explicit io_context_registry(config_type config);
+  /// @param config              Scan-manager configuration consumed by the
+  ///                            per-backend factories at construction time.
+  /// @param reservation_manager Source of the tier-specific memory resources the
+  ///                            backends need (e.g. the HOST-tier pinned staging
+  ///                            resource for the uring / rest reactors).  Must
+  ///                            outlive the registry — the factory closures hold
+  ///                            it by reference.
+  io_context_registry(config_type config,
+                      cucascade::memory::memory_reservation_manager& reservation_manager);
   ~io_context_registry() = default;
 
   io_context_registry(io_context_registry const&)            = delete;
@@ -94,6 +106,7 @@ class io_context_registry {
     factory_type factory;
   };
   const config_type _config;
+  cucascade::memory::memory_reservation_manager& _reservation_manager;
   bool _prefer_kvikio_for_file_scheme{false};
   mutable std::shared_mutex _mtx;
   std::unordered_map<io_context_type, entry> _entries;
