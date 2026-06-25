@@ -19,10 +19,9 @@
 #include "data/data_batch_utils.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/cache/prefetching_cache.hpp"
-#include "io/kvikio/kvikio_context.hpp"
+#include "io/io_context.hpp"
 #include "io/parquet_helpers.hpp"
 #include "io/sirius_datasource.hpp"
-#include "io/uring/uring_ioctx.hpp"
 #include "log/logging.hpp"
 #include "memory/topology_index.hpp"
 #include "op/scan/parquet_metadata.hpp"
@@ -188,18 +187,14 @@ sirius_scan_manager::sirius_scan_manager(
   // fast path, kvikio_context as the universal fallback so the rest of the
   // scan path (parquet_split_provider, scan tasks) always has an ioctx to
   // talk to.  kvikio_context wraps cudf::io::datasource so the read path
-  // is identical from the caller's point of view.
+  // is identical from the caller's point of view.  Both are built by the
+  // ioctx registry, which sources the reactor staging resource from the
+  // reservation manager it was constructed with.
   if (_config.use_sirius_datasource) {
-    // One reactor_context shared by the whole pool: it carries the per-reactor
-    // config (bounce-slot size taken from the staging resource's block size)
-    // and the pinned bounce-staging resource itself, which outlives the ioctx.
-    auto* host_mr  = &*host_mrs.front();
-    auto uring_ctx = std::make_shared<sirius::io::uring::uring_reactor::reactor_context>(
-      sirius::io::uring::uring_reactor::reactor_config_type{
-        .bounce_size = host_mr->get_block_size(), .use_odirect = _config.local.use_odirect},
-      host_mr);
-    _io_ctx = std::make_shared<sirius::io::uring::uring_ioctx>(_config.uring_n_reactors,
-                                                               std::move(uring_ctx));
+    _io_ctx = _ioctx_registry.make_ioctx(sirius::io::io_context_type::uring);
+    if (!_io_ctx) {
+      throw std::runtime_error("[sirius_scan_manager] failed to create uring io_context");
+    }
     SIRIUS_LOG_DEBUG("[sirius_scan_manager] sirius_datasource enabled (uring_ioctx n_reactors={})",
                      _config.uring_n_reactors);
   } else {
@@ -210,7 +205,10 @@ sirius_scan_manager::sirius_scan_manager(
         std::to_string(_topology_index->gpu_ids().size()) +
         " GPUs.  Enable use_sirius_datasource for multi-GPU runs.");
     }
-    _io_ctx = std::make_shared<sirius::io::kvikio_context>();
+    _io_ctx = _ioctx_registry.make_ioctx(sirius::io::io_context_type::kvikio);
+    if (!_io_ctx) {
+      throw std::runtime_error("[sirius_scan_manager] failed to create kvikio io_context");
+    }
     SIRIUS_LOG_DEBUG(
       "[sirius_scan_manager] sirius_datasource disabled — using kvikio_context fallback");
   }
