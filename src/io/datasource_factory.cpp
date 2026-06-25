@@ -94,8 +94,7 @@ std::shared_ptr<s3::s3_request_authorizer> make_s3_authorizer(const object_store
 using scheme_checker_type = io_context_registry::scheme_checker_type;
 using factory_type        = io_context_registry::factory_type;
 
-factory_type make_kvikio_ioctx_factory(
-  [[maybe_unused]] cucascade::memory::memory_reservation_manager& reservation_manager)
+factory_type make_kvikio_ioctx_factory()
 {
   return [](const scan_manager::scan_manager_config&) -> std::shared_ptr<sirius_ioctx> {
     try {
@@ -179,7 +178,7 @@ io_context_registry::io_context_registry(
   _entries.emplace(io_context_type::kvikio,
                    entry{io_context_type::kvikio,
                          [](std::string_view url) { return true; },
-                         make_kvikio_ioctx_factory(_reservation_manager)});
+                         make_kvikio_ioctx_factory()});
   _entries.emplace(io_context_type::uring,
                    entry{io_context_type::uring,
                          [](std::string_view url) { return true; },

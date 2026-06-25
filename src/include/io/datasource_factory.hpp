@@ -124,11 +124,9 @@ class io_context_registry {
 // unconfigured credentials, …) is logged and reported as a null ioctx rather
 // than thrown, matching @c io_context_registry::make_ioctx.
 
-/// kvikio fallback backend (cudf default datasource).  Ignores the reservation
-/// manager — kvikio owns no reactor staging — but takes it for a uniform
-/// factory-builder signature.
-io_context_registry::factory_type make_kvikio_ioctx_factory(
-  cucascade::memory::memory_reservation_manager& reservation_manager);
+/// kvikio fallback backend (cudf default datasource).  Takes no reservation
+/// manager — kvikio owns no reactor staging.
+io_context_registry::factory_type make_kvikio_ioctx_factory();
 
 /// io_uring local-disk backend.  Builds a @c uring_reactor::reactor_context from
 /// @c config.local (bounce-slot size taken from the HOST-tier resource's block
