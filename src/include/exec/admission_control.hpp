@@ -78,6 +78,17 @@ class admission_control {
   /// If @p stop fires during the wait, returns a disengaged slot.
   [[nodiscard]] slot acquire(size_t size, std::stop_token stop = {});
 
+  /// Block until every outstanding slot has been released (i.e. all issued
+  /// tokens are freed and the in-use budget drops back to zero).  Returns
+  /// immediately if nothing is currently reserved.  If @p stop fires first,
+  /// returns early.
+  /// @return true if all slots were freed, false if cut short by @p stop.
+  /// @note This does not prevent new acquire() calls; if acquisitions race in
+  ///       concurrently the method observes whatever momentary drain-to-zero
+  ///       occurs.  Quiesce callers (or stop them acquiring) first if a stable
+  ///       idle is required.
+  bool wait_for_all(std::stop_token stop = {});
+
   [[nodiscard]] size_t budget() const noexcept { return _budget; }
 
  private:

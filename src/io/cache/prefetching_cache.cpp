@@ -613,6 +613,8 @@ std::string prefetching_cache::summary() const
 
 void prefetching_cache::prepare_for_query(const sirius::planner::query& query) noexcept
 {
+  SIRIUS_LOG_TRACE("prefetching_cache: summary of cache performance {}", summary());
+
   _ticker.fetch_add(1, std::memory_order_relaxed);
 
   // Snapshot the counters so the next summary() can report this cycle's deltas.
@@ -640,6 +642,8 @@ void prefetching_cache::prepare_loop(const std::stop_token& st)
     if (req == nullptr) { continue; }  // spurious wakeup or shutdown
 
     if (req->is_cancelled()) { continue; }  // request was cancelled
+
+    std::ignore = req->state->mark_queued();
 
     auto& chunks = req->chunks;
 
@@ -725,14 +729,23 @@ void prefetching_cache::prefetch_loop(const std::stop_token& st)
 
     std::ignore = req->state->mark_loading();
 
-    // todo(amin): mark the cache_entries
+    auto token = _rate_limiter.acquire(segments.size());
+
+    if (req->is_cancelled() || st.stop_requested()) {
+      std::ranges::for_each(allocated_chunks,
+                            [](cached_chunk* c) { std::ignore = c->state.mark_load_failed(); });
+      continue;
+    }
+
     _io_ctx->host_read_ranges_async_io(*io_obj, segments)
       .via(&_io_cb_dispatcher)
-      .then_try([chunks = std::move(allocated_chunks)](exec::try_t<size_t>&& res) mutable {
+      .then_try([req, chunks = std::move(allocated_chunks), _ = std::move(token)](
+                  exec::try_t<size_t>&& res) mutable {
         auto transition =
-          res.has_value() ? [](cached_chunk* c) { static_cast<void>(c->state.mark_cached()); }
-                          : [](cached_chunk* c) { static_cast<void>(c->state.mark_load_failed()); };
-        std::ranges::for_each(chunks, transition);
+          res.has_value() ? &entry_state::mark_cached : &entry_state::mark_load_failed;
+        std::ignore = (*req->state.*transition)();
+        std::ranges::for_each(
+          chunks, [transition](cached_chunk* c) { std::ignore = (c->state.*transition)(); });
       });
   }
 }

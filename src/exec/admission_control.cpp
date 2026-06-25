@@ -47,6 +47,14 @@ admission_control::slot admission_control::acquire(size_t size, std::stop_token 
   return slot{this, reserved};
 }
 
+bool admission_control::wait_for_all(std::stop_token stop)
+{
+  std::unique_lock lk(_mtx);
+  // release() notify_all's on every slot teardown, so we re-check _active_slots
+  // on each wakeup until no tokens remain outstanding.
+  return _cv.wait(lk, stop, [&] { return _active_slots == 0; });
+}
+
 void admission_control::release(size_t reserved) noexcept
 {
   {
