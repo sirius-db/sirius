@@ -151,7 +151,12 @@ factory_type make_rest_ioctx_factory(
       auto* host_mr              = first_host_resource(reservation_manager);
       auto rest_cfg              = config.rest;
       rest_cfg.bounce_block_size = host_mr != nullptr ? host_mr->get_block_size() : 0;
-      auto ctx                   = std::make_shared<rest::rest_reactor::reactor_context>(
+      // The object store owns the endpoint and its TLS trust; the reactor's
+      // curl GETs must verify against the same CA bundle / policy the authorizer
+      // presigns for, so source these from object_store rather than rest config.
+      rest_cfg.ca_bundle_path = config.object_store.ca_bundle_path;
+      rest_cfg.tls_verify     = config.object_store.tls_verify;
+      auto ctx                = std::make_shared<rest::rest_reactor::reactor_context>(
         std::move(rest_cfg), std::move(authorizer), host_mr);
       return std::make_shared<rest::rest_ioctx>(config.rest_n_reactors, std::move(ctx));
     } catch (const std::exception& e) {
