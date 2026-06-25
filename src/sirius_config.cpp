@@ -135,6 +135,7 @@ static void from_yaml(const YAML::Node& node, sirius::io::cache::config& opt)
     "inflight_budget_chunks", opt.inflight_budget_chunks, yaml::greater_than<std::size_t>{0});
   r.optional("initial_pool_reservation", opt.initial_pool_reservation);
   r.optional("dispose_after_use", opt.dispose_after_use);
+  r.optional("buffer_pool_bytes", yaml::bytes(opt.buffer_pool_bytes));
   r.reject_unknown();
 }
 
@@ -148,7 +149,6 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("rest_n_reactors", opt.rest_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("enable_prefetch_cache", opt.enable_prefetch_cache);
-  r.optional("prefetch_buffer_pool_bytes", yaml::bytes(opt.prefetch_buffer_pool_bytes));
   if (auto n = r.optional_node("local")) sirius::from_yaml(*n, opt.local);
   if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
   if (auto n = r.optional_node("cache")) sirius::from_yaml(*n, opt.cache);

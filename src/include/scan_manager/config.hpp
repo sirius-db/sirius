@@ -54,11 +54,6 @@ struct scan_manager_config {
   /// constructed but unarmed (no background IO threads).
   bool enable_prefetch_cache{false};
 
-  /// Total pinned-memory budget for the prefetch buffer pool (bytes).
-  /// Divided by the slab size to derive @c max_slabs passed to
-  /// @c initialize_cache.
-  std::size_t prefetch_buffer_pool_bytes{256UL << 20};
-
   /// Local (uring) reactor configuration — bounce-slot size, O_DIRECT,
   /// ring depth, etc.
   io::uring::config local{};

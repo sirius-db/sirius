@@ -24,6 +24,11 @@ struct config {
   size_t inflight_budget_chunks   = 2048;
   size_t initial_pool_reservation = 10;
   bool dispose_after_use          = false;
+
+  /// Total pinned-memory budget for the prefetch buffer pool (bytes).  Divided
+  /// by the slab size to derive the max-slabs count passed to
+  /// @c sirius_ioctx::initialize_cache.
+  size_t buffer_pool_bytes = 256UL << 20;
 };
 
 }  // namespace sirius::io::cache

@@ -229,7 +229,7 @@ sirius_scan_manager::sirius_scan_manager(
       host_mrs.front()->get_block_size() *
       static_cast<std::size_t>(sirius::io::cache::buffer_pool::CHUNKS_PER_SLAB);
     auto const max_slabs =
-      static_cast<uint32_t>((_config.prefetch_buffer_pool_bytes + slab_bytes - 1) / slab_bytes);
+      static_cast<uint32_t>((_config.cache.buffer_pool_bytes + slab_bytes - 1) / slab_bytes);
     _io_ctx->initialize_cache(
       reservation_manager, _config.cache.inflight_budget_chunks, max_slabs, _topology_index);
   }
