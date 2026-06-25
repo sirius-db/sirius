@@ -16,6 +16,7 @@
 
 #include "scan_manager/load_balancing_scan_batch_coalecer.hpp"
 
+#include "exec/try.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 
 #include <stop_token>
@@ -70,7 +71,7 @@ void load_balancing_scan_batch_coalecer::worker_loop([[maybe_unused]] std::stop_
 {
   for (auto pipeline_id : _pipeline_order) {
     if (stop.stop_requested()) { break; }
-    auto& state = *_slots[pipeline_id];
+    auto& state = *_slots.at(pipeline_id);
     if (state.batch_provider) {
       process_cached_entries(state, stop);
     } else {
@@ -82,7 +83,9 @@ void load_balancing_scan_batch_coalecer::worker_loop([[maybe_unused]] std::stop_
 void load_balancing_scan_batch_coalecer::process_provider_inputs(metadata_processing_state& state,
                                                                  std::stop_token const& stop)
 {
-  std::stop_callback stop_cb(stop, [&state] { state.queue.enqueue(nullptr); });
+  std::stop_callback stop_cb(stop, [&state] {
+    state.queue.enqueue(exec::make_empty_try<std::unique_ptr<op::scan::scan_info>>());
+  });
   auto& batch_queue = state.queue;
   bool is_closed    = false;
   while (!is_closed && !stop.stop_requested()) {

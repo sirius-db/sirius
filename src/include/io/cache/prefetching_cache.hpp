@@ -192,7 +192,8 @@ class prefetching_cache {
 
     std::vector<cached_chunk*> fetch_chunks(std::size_t offset,
                                             std::size_t size,
-                                            coverage_policy policy) const;
+                                            coverage_policy policy,
+                                            std::size_t chunk_size) const;
 
     mutable std::shared_mutex mtx;
     std::shared_ptr<const sirius_io_object> io_obj;
