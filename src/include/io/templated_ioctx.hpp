@@ -200,23 +200,27 @@ class templated_ioctx : public sirius_ioctx {
 
   enum class io_op_type { host, host_async, device_async, host_vector_async };
 
-  /// Construct with a pre-built vector of reactors (most flexible).
-  explicit templated_ioctx(const reactor_config_type& cfg,
-                           std::vector<std::unique_ptr<Reactor>> reactors)
-    : _config(cfg), _reactors(std::move(reactors))
+  /// Construct with a pre-built vector of reactors (most flexible).  The ioctx
+  /// config is sourced from the first reactor's get_config() — every reactor in
+  /// a pool shares the same config, so the first is representative.
+  explicit templated_ioctx(std::vector<std::unique_ptr<Reactor>> reactors)
+    : _reactors(std::move(reactors))
   {
+    if (!_reactors.empty()) { _config = _reactors.front()->get_config(); }
   }
 
-  /// Construct by invoking @p factory @p n_reactors times to build the pool.
+  /// Construct by invoking @p factory @p n_reactors times to build the pool,
+  /// then sourcing the ioctx config from the first reactor's get_config() (the
+  /// factory already wires each reactor's config through its context).
   template <class Factory>
-    requires std::invocable<Factory&, const reactor_config_type&> &&
-             std::convertible_to<std::invoke_result_t<Factory&, const reactor_config_type&>,
-                                 std::unique_ptr<Reactor>>
-  templated_ioctx(size_t n_reactors, const reactor_config_type& cfg, Factory factory) : _config(cfg)
+    requires std::invocable<Factory&> &&
+             std::convertible_to<std::invoke_result_t<Factory&>, std::unique_ptr<Reactor>>
+  templated_ioctx(size_t n_reactors, Factory factory)
   {
     _reactors.reserve(n_reactors);
     for (size_t i = 0; i < n_reactors; ++i)
-      _reactors.emplace_back(factory(_config));
+      _reactors.emplace_back(factory());
+    if (!_reactors.empty()) { _config = _reactors.front()->get_config(); }
   }
 
   ~templated_ioctx() override
@@ -461,7 +465,7 @@ class templated_ioctx : public sirius_ioctx {
     return std::shared_ptr<sirius_io_object>(Reactor::create_io_object(std::move(path)));
   }
 
-  reactor_config_type _config;
+  reactor_config_type _config{};
   std::vector<std::unique_ptr<Reactor>> _reactors;
   std::atomic<size_t> _next{0};
   bool _started{false};

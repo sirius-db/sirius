@@ -87,10 +87,9 @@ rest_ioctx::rest_ioctx(std::shared_ptr<s3::s3_request_authorizer> authorizer,
 
 rest_ioctx::rest_ioctx(const std::shared_ptr<rest_reactor::reactor_context>& ctx,
                        std::size_t n_reactors)
-  : templated_ioctx<rest_reactor>(
-      n_reactors, ctx->cfg(), [ctx, i = 0](const rest_reactor::reactor_config_type&) mutable {
-        return std::make_unique<rest_reactor>(ctx, fmt::format("rest-{}", i++));
-      })
+  : templated_ioctx<rest_reactor>(n_reactors, [ctx, i = 0]() mutable {
+      return std::make_unique<rest_reactor>(ctx, fmt::format("rest-{}", i++));
+    })
 {
 }
 

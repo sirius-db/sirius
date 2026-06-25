@@ -35,10 +35,9 @@ uring_ioctx::uring_ioctx(size_t n_reactors,
 
 uring_ioctx::uring_ioctx(const std::shared_ptr<uring_reactor::reactor_context>& ctx,
                          size_t n_reactors)
-  : templated_ioctx<uring_reactor>(
-      n_reactors, ctx->cfg(), [ctx, i = 0](const uring_reactor::reactor_config_type&) mutable {
-        return std::make_unique<uring_reactor>(ctx, fmt::format("reactor-{}", i++));
-      })
+  : templated_ioctx<uring_reactor>(n_reactors, [ctx, i = 0]() mutable {
+      return std::make_unique<uring_reactor>(ctx, fmt::format("reactor-{}", i++));
+    })
 {
 }
 
