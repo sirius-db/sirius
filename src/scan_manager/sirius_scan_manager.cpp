@@ -209,10 +209,6 @@ sirius_scan_manager::sirius_scan_manager(
       "[sirius_scan_manager] sirius_datasource disabled — using kvikio_context fallback");
   }
 
-  // Reactors are built parked; start() launches their worker threads and
-  // allocates per-reactor staging.  No-op for the kvikio fallback (no reactors).
-  _io_ctx->start();
-
   // Build the prefetching cache on the ioctx.  Budget=0 keeps the
   // cache unarmed (no background threads); we pass that whenever the
   // user has disabled prefetching so the construction is always
@@ -221,6 +217,10 @@ sirius_scan_manager::sirius_scan_manager(
   if (_config.enable_prefetch_cache) {
     _io_ctx->initialize_cache(reservation_manager, _config.cache, _topology_index);
   }
+
+  // Reactors are built parked; start() launches their worker threads and
+  // allocates per-reactor staging.  No-op for the kvikio fallback (no reactors).
+  _io_ctx->start();
 }
 
 sirius_scan_manager::~sirius_scan_manager()

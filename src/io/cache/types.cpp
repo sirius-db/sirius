@@ -34,20 +34,20 @@ using multiple_blocks_allocation =
 buffer_pool::buffer_pool(cucascade::memory::memory_reservation_manager& reservation_manager,
                          uint32_t initial_slabs)
 {
-  auto host_buffers = reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
-  if (host_buffers.empty()) {
+  auto host_mrs = reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  if (host_mrs.empty()) {
     throw std::invalid_argument("buffer_pool: no host memory resources provided");
   }
 
   // Chunk size is the host MR's block size; resolve it before sizing the
   // per-arena reservations below (which are expressed in chunks).
   _chunk_bytes =
-    host_buffers.front()->get_memory_resource_of<cucascade::memory::Tier::HOST>()->get_block_size();
+    host_mrs.front()->get_memory_resource_of<cucascade::memory::Tier::HOST>()->get_block_size();
 
-  auto const n_arenas         = static_cast<uint32_t>(host_buffers.size());
+  auto const n_arenas         = static_cast<uint32_t>(host_mrs.size());
   auto const slabs_per_arena  = std::max(n_arenas, initial_slabs) / n_arenas;
   auto const chunks_per_arena = static_cast<size_t>(slabs_per_arena) * CHUNKS_PER_SLAB;
-  std::for_each(host_buffers.begin(), host_buffers.end(), [&](auto* mr) {
+  std::for_each(host_mrs.begin(), host_mrs.end(), [&](auto* mr) {
     auto* mmr        = const_cast<cucascade::memory::memory_space*>(mr);
     auto reservation = mmr->make_reservation_upto(chunks_per_arena * _chunk_bytes);
     _numa_to_arena_index[mr->get_device_id()] = _host_arenas.size();

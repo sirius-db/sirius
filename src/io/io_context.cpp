@@ -39,12 +39,21 @@ void sirius_ioctx::initialize_cache(
 {
   // One-shot.  Repeated calls are silent no-ops so callers can be
   // robust to multiple wiring sites.
-  if (_cache) return;
+  if (_cache) {
+    SIRIUS_LOG_WARN(
+      "sirius_ioctx::initialize_cache() called but prefetching_cache already present");
+    return;
+  }
+  if (!can_use_prefetching_cache()) {
+    SIRIUS_LOG_WARN(
+      "sirius_ioctx::initialize_cache() called but backend does not support vector host read");
+    return;
+  }
   try {
     _cache = std::make_unique<cache::prefetching_cache>(reservation_manager,
                                                         this,
                                                         cache_config.inflight_budget_chunks,
-                                                        cache_config.buffer_pool_bytes,
+                                                        cache_config.initial_pool_reservation,
                                                         std::move(topology_index),
                                                         cache_config.dispose_after_use);
   } catch (const std::exception& e) {

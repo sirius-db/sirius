@@ -164,7 +164,7 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   /// @ref initialize_cache / @ref shutdown_cache transitions.
   [[nodiscard]] inline bool uses_prefetching_cache() const noexcept
   {
-    return _cache != nullptr && supports_vector_host_read();
+    return can_use_prefetching_cache() && _cache;
   }
 
   /// Per-file metadata cache that lives independently of the prefetching
@@ -215,6 +215,11 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
 
   virtual exec::semi_future<size_t> host_read_ranges_async_io(
     const sirius_io_object& obj, std::span<io_object_segment> segments) noexcept = 0;
+
+  bool can_use_prefetching_cache() const noexcept
+  {
+    return supports_vector_host_read() || supports_host_to_device_read();
+  }
 
  protected:
   /// Backend hook: open native handles / resolve metadata for @p path and

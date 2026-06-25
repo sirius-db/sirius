@@ -13,8 +13,6 @@ sirius:
         downgrade_trigger_fraction: 0.8
         downgrade_stop_fraction: 0.7
         memory_capacity: 1073741824
-        block_size: 67108864
-        pool_size: 128
         initial_number_pools: 2
     disk:
       - disk_id: 0

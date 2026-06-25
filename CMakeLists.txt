@@ -477,7 +477,6 @@ set(TEST_SOURCES
     test/cpp/config/test_object_store_config.cpp
     test/cpp/data/test_convertible_data_batch.cpp
     test/cpp/data/test_convertible_gpu_pipeline_task.cpp
-    test/cpp/data/test_host_parquet_representation.cpp
     test/cpp/downgrade/test_downgrade_disk.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp

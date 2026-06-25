@@ -41,7 +41,7 @@ namespace sirius::scan_manager {
  */
 struct scan_manager_config {
   exec::thread_pool_config thread_pool{.num_threads = 8, .thread_name_prefix = "scan_manager"};
-  bool use_sirius_datasource{false};
+  bool use_sirius_datasource{true};
 
   /// Number of uring reactor worker threads for the local-disk IO path.
   std::size_t uring_n_reactors{1};
